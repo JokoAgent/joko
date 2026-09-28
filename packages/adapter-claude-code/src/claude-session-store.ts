@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
 import { isAbsolute, join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type { SessionKey, SessionStore, SessionStoreEntry } from "@anthropic-ai/claude-agent-sdk";
@@ -471,6 +471,50 @@ export function claimClaudeSessionStoreSession(
     workspaceAuthority: input.workspaceAuthority,
     sessionId: input.sessionId
   });
+}
+
+/** Read-only exact-owner check; opening a missing namespace must not create it. */
+export function inspectClaudeSessionStoreSession(
+  authority: ClaudeSessionStoreAuthority,
+  input: { readonly workspaceAuthority: string; readonly sessionId: string }
+): "present" | "absent" | "unknown" {
+  try {
+    const normalized = normalizeAuthority(authority);
+    validateGenerationAndSessionAccess({ generation: normalized.generation, ...input });
+    const directory = join(normalized.rootDirectory, STORE_DIRECTORY);
+    const digest = hashText(normalized.namespace);
+    const databasePath = join(directory, `${digest}.sqlite`);
+    const markerPath = join(directory, `${digest}.initialized`);
+    for (const path of [directory, databasePath, markerPath]) {
+      const info = lstatSync(path);
+      if (info.isSymbolicLink() || realpathSync(path) !== path) return "unknown";
+      if (path === directory ? !info.isDirectory() : !info.isFile()) return "unknown";
+    }
+    verifyInitializationMarker(markerPath, `${STORE_SCHEMA_BASELINE}\n${digest}\n`);
+    const database = new DatabaseSync(databasePath, {
+      readOnly: true,
+      allowExtension: false,
+      enableForeignKeyConstraints: true,
+      enableDoubleQuotedStringLiterals: false,
+      timeout: 5_000,
+      readBigInts: true,
+      defensive: true
+    });
+    try {
+      verifyExistingSchema(database, normalized.namespace);
+      return readTransaction(database, () => {
+        const session = findSession(database, input.workspaceAuthority, input.sessionId);
+        if (session === null) return "absent";
+        if (session.lifecycle !== "adopted" || session.writerGeneration > normalized.generation) return "unknown";
+        assertSessionIntegrity(database, session);
+        return "present";
+      });
+    } finally {
+      database.close();
+    }
+  } catch {
+    return "unknown";
+  }
 }
 
 /**
@@ -1848,6 +1892,10 @@ function initializeOrVerifySchema(database: DatabaseSync, namespace: string, may
       `).run(STORE_SCHEMA_VERSION, STORE_SCHEMA_BASELINE, namespace, digest);
     });
   }
+  verifyExistingSchema(database, namespace);
+}
+
+function verifyExistingSchema(database: DatabaseSync, namespace: string): void {
   const quick = database.prepare("PRAGMA quick_check").get() as Record<string, unknown> | undefined;
   if (quick === undefined || quick["quick_check"] !== "ok") throw failure("CORRUPT");
   const foreignKeyViolations = database.prepare("PRAGMA foreign_key_check").all();

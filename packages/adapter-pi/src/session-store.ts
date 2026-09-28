@@ -629,6 +629,32 @@ export class PiSessionStore {
     }
   }
 
+  /** Read-only proof for one previously dispatched, keyed native trash move. */
+  async inspectTrashMove(binding: NativeSessionBinding, recoveryKey: string): Promise<"present" | "absent" | "unknown"> {
+    if (!/^[a-f0-9]{64}$/u.test(recoveryKey) || binding.nativeSessionId === undefined) return "unknown";
+    const safePath = await this.assertManagedSessionReference(binding.opaqueRef, { requireExists: false });
+    const trashInfo = await lstat(this.trashRoot);
+    if (!trashInfo.isDirectory() || trashInfo.isSymbolicLink()
+      || !samePath(await realpath(this.trashRoot), this.trashRoot)) return "unknown";
+    const trashPath = join(this.trashRoot, `${recoveryKey}-${basename(safePath)}`);
+    const absentIfMissing = async (path: string): Promise<Awaited<ReturnType<typeof lstat>> | undefined> =>
+      lstat(path).catch((error: NodeJS.ErrnoException) => {
+        if (error.code === "ENOENT") return undefined;
+        throw error;
+      });
+    const [source, trash] = await Promise.all([absentIfMissing(safePath), absentIfMissing(trashPath)]);
+    if (source !== undefined && trash !== undefined) return "unknown";
+    if (source !== undefined) {
+      const inspected = await this.binding(safePath, binding.generation);
+      return inspected.nativeSessionId === binding.nativeSessionId ? "present" : "unknown";
+    }
+    if (trash === undefined) return "absent";
+    if (!trash.isFile() || trash.isSymbolicLink()
+      || !samePath(await realpath(trashPath), trashPath)) return "unknown";
+    const inspected = await inspectSessionFile(trashPath);
+    return inspected.state === "ready" && inspected.id === binding.nativeSessionId ? "absent" : "unknown";
+  }
+
   async assertManagedSession(path: string): Promise<string> {
     return this.assertManagedSessionReference(path, { requireExists: true });
   }

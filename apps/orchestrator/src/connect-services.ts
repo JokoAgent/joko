@@ -2710,6 +2710,38 @@ export function createConnectServices(application: OrchestratorApplication): Con
           ? {}
           : { activationError: mapErrorToProto(result.activationError) })
       };
+    },
+    getPortableReplacementCleanup: (request, context) => {
+      const connection = authenticate(context);
+      const cleanup = dependencies.sessionHost.getPortableReplacementCleanup({
+        connection: stableConnection(connection),
+        importedSessionId: nonBlankRequest(request.importedSessionId, "imported_session_id")
+      });
+      return cleanup === undefined ? {} : { cleanup: protoPortableReplacementCleanup(cleanup) };
+    },
+    reconcilePortableReplacementCleanup: async (request, context) => {
+      const connection = authenticate(context);
+      const result = await dependencies.sessionHost.reconcilePortableReplacementCleanupForUser({
+        connection: stableConnection(connection),
+        importedSessionId: nonBlankRequest(request.importedSessionId, "imported_session_id")
+      });
+      return {
+        cleanup: protoPortableReplacementCleanup(result.cleanup),
+        inspection: protoPortableReplacementInspection(result.inspection)
+      };
+    },
+    retryPortableReplacementCleanup: async (request, context) => {
+      const connection = authenticate(context);
+      const result = await dependencies.sessionHost.retryPortableReplacementCleanup({
+        connection: stableConnection(connection),
+        importedSessionId: nonBlankRequest(request.importedSessionId, "imported_session_id"),
+        expectedRevision: request.expectedRevision,
+        confirmNativeDelete: request.confirmNativeDelete
+      });
+      return {
+        cleanup: protoPortableReplacementCleanup(result.cleanup),
+        inspection: protoPortableReplacementInspection(result.inspection)
+      };
     }
   } satisfies ServiceImpl<typeof contract.PortableSessionService>;
 
@@ -22813,6 +22845,35 @@ function protoPortableSessionImportStatus(
   return value === "ready"
     ? contract.PortableSessionImportStatus.READY
     : contract.PortableSessionImportStatus.IMPORTED_ACTIVATION_FAILED;
+}
+
+function protoPortableReplacementCleanup(
+  value: import("./session-host.js").PortableReplacementCleanupStatus
+): contract.PortableReplacementCleanup {
+  const nativeState = value.nativeState === "pending"
+    ? contract.PortableReplacementNativeState.PENDING
+    : value.nativeState === "dispatched"
+      ? contract.PortableReplacementNativeState.DISPATCHED
+      : value.nativeState === "unknown"
+        ? contract.PortableReplacementNativeState.UNKNOWN
+        : contract.PortableReplacementNativeState.COMPLETED;
+  return create(contract.PortableReplacementCleanupSchema, {
+    importedSessionId: value.importedSessionId,
+    nativeState,
+    worktreeState: value.worktreeState === "pending"
+      ? contract.PortableReplacementWorktreeState.PENDING
+      : contract.PortableReplacementWorktreeState.COMPLETED,
+    revision: value.revision,
+    updatedAt: toProtoTimestamp(value.updatedAt)
+  });
+}
+
+function protoPortableReplacementInspection(
+  value: "present" | "absent" | "unknown"
+): contract.PortableReplacementInspection {
+  if (value === "present") return contract.PortableReplacementInspection.PRESENT;
+  if (value === "absent") return contract.PortableReplacementInspection.ABSENT;
+  return contract.PortableReplacementInspection.UNKNOWN;
 }
 
 function protoPortableSessionImportDraft(

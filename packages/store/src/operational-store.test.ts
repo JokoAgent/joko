@@ -2298,7 +2298,34 @@ describe("OperationalStore", () => {
     expect(store.getPortableReplacementCleanup(claim.operation.id)).toMatchObject({
       nativeState: "unknown", failureCode: "native_delete_unknown"
     });
+    expect(() => store.prepareSessionLifecycleCleanup({
+      operationId: "archive-before-portable-cleanup",
+      sessionId: "portable-imported-session",
+      disposition: "archive"
+    })).toThrow(StoreError);
     expect(() => store.claimPortableReplacementNativeCleanup(claim.operation.id)).toThrow(StoreError);
+    expect(store.findPortableReplacementCleanupForImportedSession("portable-imported-session")?.operationId)
+      .toBe(claim.operation.id);
+    const inspected = store.getPortableReplacementCleanup(claim.operation.id);
+    const exactOwner = {
+      operationId: claim.operation.id,
+      importedSessionId: "portable-imported-session",
+      cleanupRevision: inspected.revision,
+      replacedSessionRevision: store.getSession("session-1").revision,
+      targetRevision: store.getTarget("target-1").revision,
+      backendInstanceGeneration: store.getBackend("pi").descriptor.instanceGeneration
+    };
+    expect(() => store.claimPortableReplacementNativeRetry({ ...exactOwner, cleanupRevision: 0n }))
+      .toThrow(StoreError);
+    expect(() => store.confirmPortableReplacementNativeAbsence({ ...exactOwner, importedSessionId: "other" }))
+      .toThrow(StoreError);
+    expect(store.claimPortableReplacementNativeRetry(exactOwner).nativeState).toBe("dispatched");
+    expect(() => store.claimPortableReplacementNativeRetry(exactOwner)).toThrow(StoreError);
+    expect(store.markPortableReplacementNativeUnknown(claim.operation.id).nativeState).toBe("unknown");
+    expect(store.confirmPortableReplacementNativeAbsence({
+      ...exactOwner,
+      cleanupRevision: store.getPortableReplacementCleanup(claim.operation.id).revision
+    }).nativeState).toBe("completed");
     expect(store.getSession("portable-imported-session").descriptor.deletedAt).toBeUndefined();
     expect(store.getOperation(claim.operation.id).status).toBe("completed");
   });

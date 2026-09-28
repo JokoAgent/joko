@@ -185,6 +185,9 @@ import {
   PortableSessionFidelity,
   PortableSessionImportStatus,
   PortableSessionService,
+  PortableReplacementNativeState,
+  PortableReplacementWorktreeState,
+  PortableReplacementInspection,
   PiQueueMode,
   PolicySettingsSchema,
   ProviderConfigurationSchema,
@@ -682,6 +685,8 @@ import type {
   PortableSessionFidelityView,
   PortableSessionImportDraftView,
   PortableSessionImportResultView,
+  PortableReplacementCleanupView,
+  PortableReplacementCleanupResolutionView,
   ProviderDraft,
   BackendSettingsUpdate,
   ProviderRuntimeView,
@@ -2494,6 +2499,44 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
         code: "PORTABLE_SESSION_ACTIVATION_FAILED"
       });
     }
+  }
+
+  async getPortableReplacementCleanup(importedSessionId: string): Promise<PortableReplacementCleanupView | undefined> {
+    const client = createClient(PortableSessionService, this.requireTransport());
+    const response = await client.getPortableReplacementCleanup(
+      { importedSessionId },
+      this.#abort === undefined ? undefined : { signal: this.#abort.signal }
+    );
+    return response.cleanup === undefined ? undefined : mapPortableReplacementCleanup(response.cleanup, importedSessionId);
+  }
+
+  async reconcilePortableReplacementCleanup(importedSessionId: string): Promise<PortableReplacementCleanupResolutionView> {
+    const client = createClient(PortableSessionService, this.requireTransport());
+    const response = await client.reconcilePortableReplacementCleanup(
+      { importedSessionId },
+      this.#abort === undefined ? undefined : { signal: this.#abort.signal }
+    );
+    if (response.cleanup === undefined) throw new GatewayError("Portable replacement cleanup response is missing.");
+    return {
+      cleanup: mapPortableReplacementCleanup(response.cleanup, importedSessionId),
+      inspection: mapPortableReplacementInspection(response.inspection)
+    };
+  }
+
+  async retryPortableReplacementCleanup(
+    importedSessionId: string,
+    expectedRevision: bigint
+  ): Promise<PortableReplacementCleanupResolutionView> {
+    const client = createClient(PortableSessionService, this.requireTransport());
+    const response = await client.retryPortableReplacementCleanup(
+      { importedSessionId, expectedRevision, confirmNativeDelete: true },
+      this.#abort === undefined ? undefined : { signal: this.#abort.signal }
+    );
+    if (response.cleanup === undefined) throw new GatewayError("Portable replacement cleanup response is missing.");
+    return {
+      cleanup: mapPortableReplacementCleanup(response.cleanup, importedSessionId),
+      inspection: mapPortableReplacementInspection(response.inspection)
+    };
   }
 
   async executeUserShell(sessionId: string, command: string, excludeFromContext: boolean): Promise<void> {
@@ -19774,6 +19817,37 @@ function mapPortableSessionImportStatus(
   if (value === PortableSessionImportStatus.READY) return "ready";
   if (value === PortableSessionImportStatus.IMPORTED_ACTIVATION_FAILED) return "imported_activation_failed";
   throw new GatewayError("Orchestrator returned an unknown portable task activation status.");
+}
+
+function mapPortableReplacementCleanup(
+  value: import("@joko/contracts").PortableReplacementCleanup,
+  importedSessionId: string
+): PortableReplacementCleanupView {
+  if (value.importedSessionId !== importedSessionId || value.revision <= 0n) {
+    throw new GatewayError("Orchestrator returned portable cleanup for a different task or revision.");
+  }
+  const updatedAt = timestampMs(value.updatedAt);
+  if (value.updatedAt === undefined || !Number.isSafeInteger(updatedAt) || updatedAt < 0) {
+    throw new GatewayError("Orchestrator returned an invalid portable cleanup time.");
+  }
+  const nativeState = value.nativeState === PortableReplacementNativeState.PENDING ? "pending"
+    : value.nativeState === PortableReplacementNativeState.DISPATCHED ? "dispatched"
+      : value.nativeState === PortableReplacementNativeState.UNKNOWN ? "unknown"
+        : value.nativeState === PortableReplacementNativeState.COMPLETED ? "completed"
+          : undefined;
+  const worktreeState = value.worktreeState === PortableReplacementWorktreeState.PENDING ? "pending"
+    : value.worktreeState === PortableReplacementWorktreeState.COMPLETED ? "completed" : undefined;
+  if (nativeState === undefined || worktreeState === undefined) {
+    throw new GatewayError("Orchestrator returned an unknown portable cleanup state.");
+  }
+  return { importedSessionId, nativeState, worktreeState, revision: value.revision, updatedAt };
+}
+
+function mapPortableReplacementInspection(value: PortableReplacementInspection): "present" | "absent" | "unknown" {
+  if (value === PortableReplacementInspection.PRESENT) return "present";
+  if (value === PortableReplacementInspection.ABSENT) return "absent";
+  if (value === PortableReplacementInspection.UNKNOWN) return "unknown";
+  throw new GatewayError("Orchestrator returned an unknown portable cleanup inspection.");
 }
 
 function mapPortableSessionImportDraft(

@@ -5273,6 +5273,19 @@ export interface PortableSessionActivationResultView {
   readonly activationError?: ErrorView;
 }
 
+export interface PortableReplacementCleanupView {
+  readonly importedSessionId: string;
+  readonly nativeState: "pending" | "dispatched" | "unknown" | "completed";
+  readonly worktreeState: "pending" | "completed";
+  readonly revision: bigint;
+  readonly updatedAt: number;
+}
+
+export interface PortableReplacementCleanupResolutionView {
+  readonly cleanup: PortableReplacementCleanupView;
+  readonly inspection: "present" | "absent" | "unknown";
+}
+
 export type PortableSessionExportOutcomeView =
   | { readonly status: "exported"; readonly fidelity: PortableSessionFidelityView }
   | { readonly status: "oversize"; readonly mediaBytes: number; readonly limitBytes: number }
@@ -5606,6 +5619,9 @@ export interface OperationApi {
     readonly refreshWorktreeRemote?: boolean;
   }): Promise<PortableSessionImportResultView>;
   retryPortableSessionActivation(sessionId: string): Promise<PortableSessionActivationResultView>;
+  getPortableReplacementCleanup(importedSessionId: string): Promise<PortableReplacementCleanupView | undefined>;
+  reconcilePortableReplacementCleanup(importedSessionId: string): Promise<PortableReplacementCleanupResolutionView>;
+  retryPortableReplacementCleanup(importedSessionId: string, expectedRevision: bigint): Promise<PortableReplacementCleanupResolutionView>;
   executeUserShell(sessionId: string, command: string, excludeFromContext: boolean): Promise<void>;
   abortUserShell(sessionId: string): Promise<void>;
   getSessionStatistics(sessionId: string, signal?: AbortSignal): Promise<SessionStatisticsView>;

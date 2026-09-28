@@ -1371,6 +1371,33 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     return stateFromThread(bindingFromReference(binding.opaqueRef, context.generation), thread);
   }
 
+  async inspectNativeSessionDeletion(
+    binding: NativeSessionBinding,
+    context: AdapterContext
+  ): Promise<"present" | "absent" | "unknown"> {
+    try {
+      this.#assertOpen();
+      this.#assertContextTarget(context, context.target);
+      if (binding.generation !== context.generation
+        || context.binding?.opaqueRef !== binding.opaqueRef
+        || context.binding.generation !== binding.generation
+        || context.binding.nativeSessionId !== binding.nativeSessionId) return "unknown";
+      const reference = parseNativeReference(binding.opaqueRef);
+      await this.#readValidatedNativeThread(
+        reference.threadId,
+        context.target,
+        "probe",
+        context.signal,
+        reference.profileKey
+      );
+      return "present";
+    } catch {
+      // A missing app-server thread is not proof that its durable profile data
+      // was deleted; the thread may simply not be materialized in this host.
+      return "unknown";
+    }
+  }
+
   async resolveNativeSessionReference(
     nativeReference: string,
     target: TargetDescriptor,

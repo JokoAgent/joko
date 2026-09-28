@@ -4672,6 +4672,23 @@ describe("ClaudeCodeAdapter", () => {
     expect(runtime.sessions.has(binding.nativeSessionId!)).toBe(false);
   });
 
+  test("classifies an exact detached native Session without claiming or deleting it", async () => {
+    const runtime = new FakeSdkRuntime();
+    const adapter = adapterFor(runtime);
+    const binding = await adapter.createSession(createInput(), contextFor().context);
+    const bound = contextFor(binding).context;
+    await adapter.detachSession(binding, bound);
+    expect(await adapter.inspectNativeSessionDeletion(binding, bound)).toBe("present");
+    expect(runtime.deleted).toEqual([]);
+    runtime.sessions.delete(binding.nativeSessionId!);
+    expect(await adapter.inspectNativeSessionDeletion(binding, bound)).toBe("unknown");
+    expect(await adapter.inspectNativeSessionDeletion(binding, {
+      ...bound, binding: { ...binding, generation: binding.generation + 1 }
+    })).toBe("unknown");
+    expect(runtime.deleted).toEqual([]);
+    await adapter.dispose();
+  });
+
   test.each(["wrong-cwd", "missing", "cancelled", "new-owner"] as const)("fences %s detached deletion after metadata lookup before the SDK mutation", async (boundary) => {
     const runtime = new FakeSdkRuntime();
     const adapter = adapterFor(runtime);

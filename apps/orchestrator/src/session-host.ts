@@ -68,6 +68,7 @@ import type {
   OperationalStore,
   PendingContextRebuild,
   PersistedEvent,
+  PortableReplacementCleanupRecord,
   QueueItemRecord,
   ScheduleRecord,
   StoredTarget,
@@ -590,6 +591,19 @@ export interface RetryPortableSessionActivationResult {
   readonly sessionId: string;
   readonly status: "ready" | "imported_activation_failed";
   readonly activationError?: PublicError;
+}
+
+export interface PortableReplacementCleanupStatus {
+  readonly importedSessionId: string;
+  readonly nativeState: PortableReplacementCleanupRecord["nativeState"];
+  readonly worktreeState: PortableReplacementCleanupRecord["worktreeState"];
+  readonly revision: bigint;
+  readonly updatedAt: number;
+}
+
+export interface PortableReplacementCleanupResolution {
+  readonly cleanup: PortableReplacementCleanupStatus;
+  readonly inspection: "present" | "absent" | "unknown";
 }
 
 export interface PortableSessionImportPreview {
@@ -6610,6 +6624,113 @@ export class SessionHost {
     return portableActivationResult(input.sessionId, activation);
   }
 
+  getPortableReplacementCleanup(input: {
+    readonly connection: ConnectionRecord;
+    readonly importedSessionId: string;
+  }): PortableReplacementCleanupStatus | undefined {
+    this.#assertOpen();
+    this.#store.authorizeConnection(input.connection.id, input.connection.authKeyDigest);
+    this.#store.getSession(input.importedSessionId);
+    const cleanup = this.#store.findPortableReplacementCleanupForImportedSession(input.importedSessionId);
+    return cleanup === undefined ? undefined : portableReplacementCleanupStatus(cleanup);
+  }
+
+  async reconcilePortableReplacementCleanupForUser(input: {
+    readonly connection: ConnectionRecord;
+    readonly importedSessionId: string;
+  }): Promise<PortableReplacementCleanupResolution> {
+    return this.resolvePortableReplacementCleanupForUser(input);
+  }
+
+  async retryPortableReplacementCleanup(input: {
+    readonly connection: ConnectionRecord;
+    readonly importedSessionId: string;
+    readonly expectedRevision: bigint;
+    readonly confirmNativeDelete: boolean;
+  }): Promise<PortableReplacementCleanupResolution> {
+    if (!input.confirmNativeDelete) throw new StoreError("Native deletion requires explicit confirmation.");
+    return this.resolvePortableReplacementCleanupForUser(input);
+  }
+
+  private async resolvePortableReplacementCleanupForUser(input: {
+    readonly connection: ConnectionRecord;
+    readonly importedSessionId: string;
+    readonly expectedRevision?: bigint;
+  }): Promise<PortableReplacementCleanupResolution> {
+    this.#assertOpen();
+    this.#store.authorizeConnection(input.connection.id, input.connection.authKeyDigest);
+    this.#store.getSession(input.importedSessionId);
+    const initial = this.#store.findPortableReplacementCleanupForImportedSession(input.importedSessionId);
+    if (initial === undefined) throw new StoreError("This task has no portable replacement cleanup.");
+    if (input.expectedRevision !== undefined && initial.revision !== input.expectedRevision) {
+      throw new StoreError("Portable replacement cleanup changed; refresh before confirming deletion.");
+    }
+    if (initial.nativeState === "pending" || initial.nativeState === "completed") {
+      await this.reconcilePortableReplacementCleanup(initial.operationId).catch(() => undefined);
+      return {
+        cleanup: portableReplacementCleanupStatus(this.#store.getPortableReplacementCleanup(initial.operationId)),
+        inspection: "unknown"
+      };
+    }
+    if (initial.nativeState !== "unknown") {
+      return { cleanup: portableReplacementCleanupStatus(initial), inspection: "unknown" };
+    }
+    const replaced = this.#store.getSession(initial.replacedSessionId);
+    const imported = this.#store.getSession(initial.importedSessionId);
+    if (replaced.descriptor.deletedAt === undefined || imported.descriptor.deletedAt !== undefined
+      || replaced.descriptor.backendId !== imported.descriptor.backendId
+      || replaced.descriptor.targetId !== imported.descriptor.targetId) {
+      return { cleanup: portableReplacementCleanupStatus(initial), inspection: "unknown" };
+    }
+    let inspection: "present" | "absent" | "unknown" = "unknown";
+    let advanceWorktree = false;
+    let releaseAdmission: (() => void) | undefined;
+    try {
+      const adapter = this.requireAdapter(replaced.descriptor.backendId);
+      const generation = this.requireAdapterGeneration(replaced.descriptor.backendId, adapter);
+      const targetRevision = this.#store.getTarget(replaced.descriptor.targetId).revision;
+      releaseAdmission = this.beginBackendAdmissionEffect(replaced.descriptor.backendId);
+      const context = this.contextFor(replaced, undefined, undefined, initial.operationId, undefined, generation);
+      this.assertCurrentAdapterGeneration(replaced.descriptor.backendId, adapter, generation);
+      inspection = await adapter.inspectNativeSessionDeletion?.(replaced.descriptor.binding, context) ?? "unknown";
+      this.assertCurrentAdapterGeneration(replaced.descriptor.backendId, adapter, generation);
+      const expected = {
+        operationId: initial.operationId,
+        importedSessionId: input.importedSessionId,
+        cleanupRevision: initial.revision,
+        replacedSessionRevision: replaced.revision,
+        targetRevision,
+        backendInstanceGeneration: generation
+      };
+      if (inspection === "absent") {
+        this.#store.confirmPortableReplacementNativeAbsence(expected);
+        advanceWorktree = true;
+      } else if (inspection === "present" && input.expectedRevision !== undefined) {
+        this.#store.claimPortableReplacementNativeRetry(expected);
+        try {
+          await adapter.deleteSession(replaced.descriptor.binding, context);
+          this.assertCurrentAdapterGeneration(replaced.descriptor.backendId, adapter, generation);
+          this.#store.confirmPortableReplacementNativeCleanup(initial.operationId);
+          advanceWorktree = true;
+        } catch {
+          this.#store.markPortableReplacementNativeUnknown(initial.operationId);
+          inspection = "unknown";
+        }
+      }
+    } catch {
+      inspection = "unknown";
+    } finally {
+      releaseAdmission?.();
+    }
+    if (advanceWorktree) {
+      await this.reconcilePortableReplacementCleanup(initial.operationId).catch(() => undefined);
+    }
+    return {
+      cleanup: portableReplacementCleanupStatus(this.#store.getPortableReplacementCleanup(initial.operationId)),
+      inspection
+    };
+  }
+
   private importPortableSessionPrepared(
     input: ImportPortableSessionInput,
     prepared?: PreparedPortableSessionImport
@@ -9242,7 +9363,10 @@ export class SessionHost {
   }
 
   private assertPortableReplacementIdle(sessionId: string): void {
-    if (this.hasDurableSessionWork(sessionId)
+    const earlierCleanup = this.#store.findPortableReplacementCleanupForImportedSession(sessionId);
+    if ((earlierCleanup !== undefined && (earlierCleanup.nativeState !== "completed"
+      || earlierCleanup.worktreeState !== "completed"))
+      || this.hasDurableSessionWork(sessionId)
       || this.#store.listInteractions({ sessionId, status: "open", limit: 1 }).length > 0
       || this.#store.hasActiveSessionBackgroundTasks(sessionId)
       || [...this.#pendingInteractions.values()].some((interaction) => interaction.sessionId === sessionId)
@@ -14322,6 +14446,18 @@ function portableActivationResult(
     sessionId,
     status: record.status,
     ...(record.error === undefined ? {} : { activationError: record.error })
+  };
+}
+
+function portableReplacementCleanupStatus(
+  record: PortableReplacementCleanupRecord
+): PortableReplacementCleanupStatus {
+  return {
+    importedSessionId: record.importedSessionId,
+    nativeState: record.nativeState,
+    worktreeState: record.worktreeState,
+    revision: record.revision,
+    updatedAt: record.updatedAt
   };
 }
 

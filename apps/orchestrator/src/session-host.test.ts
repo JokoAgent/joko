@@ -55,6 +55,7 @@ import {
   type FakeAdapterProfile
 } from "@joko/testkit";
 import {
+  AuthorizationError,
   InvalidStateTransitionError,
   OperationalStore,
   OperationConflictError,
@@ -3391,6 +3392,40 @@ describe("SessionHost", () => {
     expect(fixture.store.getPortableReplacementCleanup("portable-cleanup-second"))
       .toMatchObject({ nativeState: "unknown", worktreeState: "completed" });
     expect(nativeDelete).toHaveBeenCalledTimes(1);
+    const inspection = vi.fn(async (): Promise<"present" | "absent" | "unknown"> => "unknown");
+    Object.assign(adapter, { inspectNativeSessionDeletion: inspection });
+    const status = fixture.host.getPortableReplacementCleanup({
+      connection: fixture.connection, importedSessionId: second.value.sessionId
+    });
+    expect(status).toMatchObject({ nativeState: "unknown", worktreeState: "completed" });
+    await expect(fixture.host.reconcilePortableReplacementCleanupForUser({
+      connection: { ...fixture.connection, authKeyDigest: "wrong" }, importedSessionId: second.value.sessionId
+    })).rejects.toBeInstanceOf(AuthorizationError);
+    expect((await fixture.host.reconcilePortableReplacementCleanupForUser({
+      connection: fixture.connection, importedSessionId: second.value.sessionId
+    })).inspection).toBe("unknown");
+    expect(nativeDelete).toHaveBeenCalledTimes(1);
+    const blockedCreation = vi.spyOn(adapter, "createSession");
+    await expect(fixture.host.importPortableSession({
+      ...base, operationId: "portable-cleanup-blocked-chain", overwrite: true
+    })).rejects.toThrow();
+    expect(blockedCreation).not.toHaveBeenCalled();
+    blockedCreation.mockRestore();
+    inspection.mockResolvedValue("present");
+    expect((await fixture.host.reconcilePortableReplacementCleanupForUser({
+      connection: fixture.connection, importedSessionId: second.value.sessionId
+    })).inspection).toBe("present");
+    expect(nativeDelete).toHaveBeenCalledTimes(1);
+    await expect(fixture.host.retryPortableReplacementCleanup({
+      connection: fixture.connection, importedSessionId: second.value.sessionId,
+      expectedRevision: status!.revision, confirmNativeDelete: false
+    })).rejects.toBeInstanceOf(StoreError);
+    expect(await fixture.host.retryPortableReplacementCleanup({
+      connection: fixture.connection, importedSessionId: second.value.sessionId,
+      expectedRevision: status!.revision, confirmNativeDelete: true
+    })).toMatchObject({ cleanup: { nativeState: "completed" }, inspection: "present" });
+    expect(nativeDelete).toHaveBeenCalledTimes(2);
+    expect(fixture.store.getOperation("portable-cleanup-second").status).toBe("completed");
     nativeDelete.mockRestore();
 
     const claim = vi.spyOn(fixture.store, "claimPortableReplacementNativeCleanup")
@@ -3409,15 +3444,29 @@ describe("SessionHost", () => {
     await restartedHost.initialize();
     expect(restartedDelete).toHaveBeenCalledTimes(1);
     expect(restartedDelete.mock.calls[0]?.[1].sessionId).toBe(second.value.sessionId);
-    expect(fixture.store.getPortableReplacementCleanup("portable-cleanup-second").nativeState).toBe("unknown");
+    expect(fixture.store.getPortableReplacementCleanup("portable-cleanup-second").nativeState).toBe("completed");
     expect(fixture.store.getPortableReplacementCleanup("portable-cleanup-third").nativeState).toBe("completed");
     expect(fixture.store.getSession(third.value.sessionId).descriptor.deletedAt).toBeUndefined();
+    restartedDelete.mockRejectedValueOnce(new Error("native delete result was lost"));
+    const fourth = await restartedHost.importPortableSession({
+      ...base, operationId: "portable-cleanup-fourth", overwrite: true
+    });
+    expect(fourth.value.replacedSessionIds).toEqual([third.value.sessionId]);
+    expect(fixture.store.getPortableReplacementCleanup("portable-cleanup-fourth").nativeState).toBe("unknown");
+    const deletionsBeforeAbsenceProof = restartedDelete.mock.calls.length;
+    Object.assign(restartedAdapter, {
+      inspectNativeSessionDeletion: vi.fn(async (): Promise<"present" | "absent" | "unknown"> => "absent")
+    });
+    expect(await restartedHost.reconcilePortableReplacementCleanupForUser({
+      connection: fixture.connection, importedSessionId: fourth.value.sessionId
+    })).toMatchObject({ cleanup: { nativeState: "completed" }, inspection: "absent" });
+    expect(restartedDelete).toHaveBeenCalledTimes(deletionsBeforeAbsenceProof);
     await restartedHost.dispose();
     const again = new SessionHost(fixture.store, fixture.artifacts, [new FakeBackendAdapter(PI_LIKE_PROFILE)]);
     cleanups.push(() => again.dispose());
     await again.initialize();
     expect(fixture.store.listPendingPortableReplacementCleanups().map((entry) => entry.operationId))
-      .toEqual(["portable-cleanup-second"]);
+      .toEqual([]);
   });
 
   it("rejects a product-only portable import before creating a disabled model route", async () => {

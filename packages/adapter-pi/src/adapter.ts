@@ -1052,6 +1052,26 @@ export class PiBackendAdapter implements
     await this.#stopRuntime(context.sessionId, context.generation);
   }
 
+  async inspectNativeSessionDeletion(
+    binding: NativeSessionBinding,
+    context: AdapterContext
+  ): Promise<"present" | "absent" | "unknown"> {
+    if (context.target.remoteWorkspace !== undefined
+      || context.target.backendId !== this.id
+      || context.binding?.opaqueRef !== binding.opaqueRef
+      || context.binding.generation !== binding.generation
+      || context.binding.nativeSessionId !== binding.nativeSessionId
+      || context.generation !== binding.generation) return "unknown";
+    const recoveryKey = localSessionTrashRecoveryKey(binding, context);
+    if (recoveryKey === undefined) return "unknown";
+    try {
+      await this.validateTarget(context.target);
+      return await this.#sessionStore.inspectTrashMove(binding, recoveryKey);
+    } catch {
+      return "unknown";
+    }
+  }
+
   async deleteSession(binding: NativeSessionBinding, context: AdapterContext): Promise<void> {
     if (context.target.remoteWorkspace !== undefined && context.runtimePolicy === "review_read_only") {
       throw piError(

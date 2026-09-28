@@ -117,6 +117,9 @@ service PortableSessionService {
   rpc CancelPortableSessionImport(CancelPortableSessionImportRequest) returns (CancelPortableSessionImportResponse);
   rpc CommitPortableSessionImport(CommitPortableSessionImportRequest) returns (CommitPortableSessionImportResponse);
   rpc RetryPortableSessionActivation(RetryPortableSessionActivationRequest) returns (RetryPortableSessionActivationResponse);
+  rpc GetPortableReplacementCleanup(GetPortableReplacementCleanupRequest) returns (GetPortableReplacementCleanupResponse);
+  rpc ReconcilePortableReplacementCleanup(ReconcilePortableReplacementCleanupRequest) returns (ReconcilePortableReplacementCleanupResponse);
+  rpc RetryPortableReplacementCleanup(RetryPortableReplacementCleanupRequest) returns (RetryPortableReplacementCleanupResponse);
 }
 
 service RunService {

@@ -451,6 +451,16 @@ export interface BackendAdapter {
   createSession(input: CreateNativeSessionInput, context: AdapterContext): Promise<NativeSessionBinding>;
   resumeSession(binding: NativeSessionBinding, context: AdapterContext): Promise<NativeSessionState>;
   inspectSession(binding: NativeSessionBinding, context: AdapterContext): Promise<NativeSessionState>;
+  /**
+   * Side-effect-free check of one exact old native binding before reconciling an
+   * uncertain delete. `absent` must be backed by the adapter's own storage
+   * authority; an unavailable runtime, changed owner, or ambiguous response is
+   * `unknown`, never evidence of deletion.
+   */
+  inspectNativeSessionDeletion?(
+    binding: NativeSessionBinding,
+    context: AdapterContext
+  ): Promise<"present" | "absent" | "unknown">;
   detachSession?(binding: NativeSessionBinding, context: AdapterContext): Promise<void>;
   closeSession(binding: NativeSessionBinding, context: AdapterContext): Promise<void>;
   deleteSession(binding: NativeSessionBinding, context: AdapterContext): Promise<void>;

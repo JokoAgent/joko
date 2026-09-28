@@ -356,6 +356,11 @@ export interface ClaudeSdkRuntime {
 }
 
 export interface ClaudeSdkStoredSessionRuntime {
+  /** Optional for remote runtimes that cannot provide a read-only exact Store proof. */
+  inspectDeletion?(input: {
+    readonly workspaceAuthority: string;
+    readonly sessionId: string;
+  }): Promise<"present" | "absent" | "unknown">;
   prepareImport(input: {
     readonly operationId: string;
     readonly sourceWorkspaceAuthority: string;
@@ -815,6 +820,7 @@ export class DefaultClaudeSdkRuntime implements ClaudeSdkRuntime {
 
 function storedSessionRuntime(owner: SessionSdkOwner): ClaudeSdkStoredSessionRuntime {
   const runtime: ClaudeSdkStoredSessionRuntime = {
+    inspectDeletion: async (input) => owner.inspectStoredSession(input),
     prepareImport: async (input) => owner.prepareSessionImport(input),
     prepareDerivation: async (input) => owner.prepareStoredSessionDerivation(input),
     readOperation: async (access) => owner.readStoredSessionOperation(access),

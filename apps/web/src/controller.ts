@@ -2228,6 +2228,10 @@ export function useAppController(): AppController {
     cancelPortableSessionImport: (draftId) => gateway().cancelPortableSessionImport(draftId),
     commitPortableSessionImport: (input) => gateway().commitPortableSessionImport(input),
     retryPortableSessionActivation: (sessionId) => gateway().retryPortableSessionActivation(sessionId),
+    getPortableReplacementCleanup: (importedSessionId) => gateway().getPortableReplacementCleanup(importedSessionId),
+    reconcilePortableReplacementCleanup: (importedSessionId) => gateway().reconcilePortableReplacementCleanup(importedSessionId),
+    retryPortableReplacementCleanup: (importedSessionId, expectedRevision) =>
+      gateway().retryPortableReplacementCleanup(importedSessionId, expectedRevision),
     executeUserShell: (sessionId, command, excludeFromContext) => gateway().executeUserShell(sessionId, command, excludeFromContext),
     abortUserShell: (sessionId) => gateway().abortUserShell(sessionId),
     getSessionStatistics: (sessionId, signal) => gateway().getSessionStatistics(sessionId, signal),

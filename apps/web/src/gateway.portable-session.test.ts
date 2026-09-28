@@ -7,10 +7,16 @@ import {
   CompleteBlobUploadResponseSchema,
   ExportPortableSessionResponseSchema,
   GetBlobDownloadTicketResponseSchema,
+  GetPortableReplacementCleanupResponseSchema,
   GetSnapshotResponseSchema,
   InspectPortableSessionImportResponseSchema,
   PortableSessionFidelity,
   PortableSessionImportStatus,
+  PortableReplacementNativeState,
+  PortableReplacementWorktreeState,
+  PortableReplacementInspection,
+  ReconcilePortableReplacementCleanupResponseSchema,
+  RetryPortableReplacementCleanupResponseSchema,
   RetryPortableSessionActivationResponseSchema,
   SnapshotSchema,
   TransferDirection,
@@ -275,6 +281,56 @@ describe("portable task package gateway", () => {
     expectedOverwrite = true;
     await gateway.commitPortableSessionImport({ ...commit, overwrite: true });
     expect(importOperationIds[4]).not.toBe(importOperationIds[0]);
+    gateway.disconnect();
+  });
+
+  it("maps only the exact task cleanup receipt and carries its revision into a confirmed retry", async () => {
+    let wrongOwner = false;
+    let missingTime = false;
+    const cleanup = () => ({
+      importedSessionId: wrongOwner ? "other-task" : "imported",
+      nativeState: PortableReplacementNativeState.UNKNOWN,
+      worktreeState: PortableReplacementWorktreeState.PENDING,
+      revision: 9n,
+      ...(missingTime ? {} : { updatedAt: { seconds: 1_800_000_000n, nanos: 0 } })
+    });
+    const transport = portableTransport(async (method, input) => {
+      if (method.localName === "getPortableReplacementCleanup") {
+        expect(input).toEqual({ importedSessionId: "imported" });
+        return response(method, create(GetPortableReplacementCleanupResponseSchema, { cleanup: cleanup() }));
+      }
+      if (method.localName === "reconcilePortableReplacementCleanup") {
+        expect(input).toEqual({ importedSessionId: "imported" });
+        return response(method, create(ReconcilePortableReplacementCleanupResponseSchema, {
+          cleanup: cleanup(), inspection: PortableReplacementInspection.PRESENT
+        }));
+      }
+      if (method.localName === "retryPortableReplacementCleanup") {
+        expect(input).toEqual({ importedSessionId: "imported", expectedRevision: 9n, confirmNativeDelete: true });
+        return response(method, create(RetryPortableReplacementCleanupResponseSchema, {
+          cleanup: {
+            ...cleanup(), nativeState: PortableReplacementNativeState.COMPLETED,
+            worktreeState: PortableReplacementWorktreeState.COMPLETED, revision: 10n
+          },
+          inspection: PortableReplacementInspection.PRESENT
+        }));
+      }
+      throw new Error(`Unexpected RPC ${method.localName}`);
+    });
+    const gateway = createGateway(transport);
+    await gateway.connect();
+    expect(await gateway.getPortableReplacementCleanup("imported")).toMatchObject({
+      importedSessionId: "imported", nativeState: "unknown", worktreeState: "pending", revision: 9n
+    });
+    expect((await gateway.reconcilePortableReplacementCleanup("imported")).inspection).toBe("present");
+    expect(await gateway.retryPortableReplacementCleanup("imported", 9n)).toMatchObject({
+      cleanup: { nativeState: "completed", worktreeState: "completed", revision: 10n }, inspection: "present"
+    });
+    wrongOwner = true;
+    await expect(gateway.getPortableReplacementCleanup("imported")).rejects.toBeInstanceOf(GatewayError);
+    wrongOwner = false;
+    missingTime = true;
+    await expect(gateway.getPortableReplacementCleanup("imported")).rejects.toBeInstanceOf(GatewayError);
     gateway.disconnect();
   });
 });

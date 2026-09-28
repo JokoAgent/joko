@@ -1345,6 +1345,49 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     };
   }
 
+  async inspectNativeSessionDeletion(
+    binding: NativeSessionBinding,
+    context: AdapterContext
+  ): Promise<"present" | "absent" | "unknown"> {
+    try {
+      assertStandardReviewContext(context, "inspect native Session deletion");
+      await this.validateTarget(context.target);
+      this.#assertBindingContext(binding, context);
+      if (context.binding?.opaqueRef !== binding.opaqueRef
+        || context.binding.generation !== binding.generation
+        || context.binding.nativeSessionId !== binding.nativeSessionId) return "unknown";
+      const route = parseBindingRoute(binding);
+      const scoped = await this.#targetRuntime(context.target, context.signal);
+      scoped.assertCurrent();
+      if (route.kind === "stored") {
+        if (route.workspaceAuthority !== claudeWorkspaceAuthority(context.target)
+          || scoped.runtime.storedSessions?.inspectDeletion === undefined) return "unknown";
+        const result = await scoped.runtime.storedSessions.inspectDeletion({
+          workspaceAuthority: route.workspaceAuthority,
+          sessionId: route.nativeSessionId
+        });
+        scoped.assertCurrent();
+        await this.validateTarget(context.target);
+        this.#assertBindingContext(binding, context);
+        return result;
+      }
+      const info = await scoped.runtime.getSessionInfo(route.nativeSessionId, {
+        dir: scoped.workspaceRoot,
+        signal: context.signal
+      });
+      scoped.assertCurrent();
+      await this.validateTarget(context.target);
+      this.#assertBindingContext(binding, context);
+      // The ordinary SDK lookup has no durable profile identity in this
+      // binding. A missing result could be a changed profile, not deletion.
+      if (info === undefined) return "unknown";
+      assertSessionInfo(info, route.nativeSessionId, scoped.workspaceRoot, scoped.remote);
+      return "present";
+    } catch {
+      return "unknown";
+    }
+  }
+
   async getNativeHistoryProjection(context: AdapterContext): Promise<NativeHistoryProjection> {
     this.#assertUsable();
     assertStandardReviewContext(context, "read persisted native history");
@@ -1472,6 +1515,9 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     assertStandardReviewContext(context, "delete native Session state");
     await this.validateTarget(context.target);
     this.#assertBindingContext(binding, context);
+    if (context.binding?.opaqueRef !== binding.opaqueRef
+      || context.binding.generation !== binding.generation
+      || context.binding.nativeSessionId !== binding.nativeSessionId) throw continuityGap();
     const route = parseBindingRoute(binding);
     const nativeSessionId = route.nativeSessionId;
     const targetRuntime = await this.#targetRuntime(context.target, context.signal);

@@ -2491,6 +2491,21 @@ describe("CodexBackendAdapter", () => {
     expect(otherProfile.fake.transport?.requests.some((entry) => entry.method === "thread/delete") ?? false).toBe(false);
   });
 
+  it("reads an exact previous thread without treating an unmaterialized thread as deleted", async () => {
+    const setup = await createSetup();
+    const binding = await setup.adapter.createSession(
+      sessionInput(setup.target), context(setup.target, [], { backendInstanceGeneration: 7 })
+    );
+    const bound = context(setup.target, [], { binding, backendInstanceGeneration: 7 });
+    expect(await setup.adapter.inspectNativeSessionDeletion(binding, bound)).toBe("present");
+    expect(await setup.adapter.inspectNativeSessionDeletion(binding, {
+      ...bound, binding: { ...binding, generation: binding.generation + 1 }
+    })).toBe("unknown");
+    setup.fake.threads.delete(binding.nativeSessionId!);
+    expect(await setup.adapter.inspectNativeSessionDeletion(binding, bound)).toBe("unknown");
+    expect(setup.fake.transport?.requests.filter((entry) => entry.method === "thread/delete")).toEqual([]);
+  });
+
   it("keeps the steer target selected at entry when native turns change before the first continuation", async () => {
     const setup = await createSetup();
     const events: EventPayload[] = [];

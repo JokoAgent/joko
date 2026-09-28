@@ -13815,6 +13815,15 @@ export class OperationalStore {
     return record;
   }
 
+  findPortableReplacementCleanupForImportedSession(importedSessionId: string): PortableReplacementCleanupRecord | undefined {
+    this.assertOpen();
+    const rows = this.database.prepare(`
+      SELECT * FROM portable_replacement_cleanups WHERE imported_session_id = ? LIMIT 2
+    `).all(nonBlank(importedSessionId, "Imported Session ID")) as Row[];
+    if (rows.length > 1) throw new StoreError("Imported Session has ambiguous portable replacement cleanup ownership.");
+    return rows[0] === undefined ? undefined : portableReplacementCleanupFromRow(rows[0]);
+  }
+
   listPendingPortableReplacementCleanups(): PortableReplacementCleanupRecord[] {
     this.assertOpen();
     return (this.database.prepare(`
@@ -13844,6 +13853,85 @@ export class OperationalStore {
       `).run(at, asSqlInteger(this.requireActiveRevision()), operationId);
       return this.getPortableReplacementCleanup(operationId);
     });
+  }
+
+  /** An explicit retry is fenced by the exact receipt and old/new owner observed before inspection. */
+  claimPortableReplacementNativeRetry(input: {
+    readonly operationId: string;
+    readonly importedSessionId: string;
+    readonly cleanupRevision: bigint;
+    readonly replacedSessionRevision: bigint;
+    readonly targetRevision: bigint;
+    readonly backendInstanceGeneration: number;
+    readonly at?: number;
+  }): PortableReplacementCleanupRecord {
+    const at = input.at ?? this.now();
+    if (!Number.isSafeInteger(at) || at < 0) throw new StoreError("Portable replacement time is invalid.");
+    return this.write(() => {
+      const current = this.getPortableReplacementCleanup(input.operationId);
+      this.assertPortableReplacementInspectionOwner(current, input);
+      if (current.nativeState !== "unknown") throw new StoreError("Portable replacement native cleanup is not awaiting verification.");
+      const changed = this.database.prepare(`
+        UPDATE portable_replacement_cleanups
+        SET native_state = 'dispatched', failure_code = NULL, updated_at = ?, revision = ?
+        WHERE operation_id = ? AND native_state = 'unknown' AND revision = ?
+      `).run(at, asSqlInteger(this.requireActiveRevision()), input.operationId, asSqlInteger(input.cleanupRevision));
+      if (changed.changes !== 1) throw new StoreError("Portable replacement cleanup changed during inspection.");
+      return this.getPortableReplacementCleanup(input.operationId);
+    });
+  }
+
+  /** Confirm only an independently proven absence; no native effect is dispatched. */
+  confirmPortableReplacementNativeAbsence(input: {
+    readonly operationId: string;
+    readonly importedSessionId: string;
+    readonly cleanupRevision: bigint;
+    readonly replacedSessionRevision: bigint;
+    readonly targetRevision: bigint;
+    readonly backendInstanceGeneration: number;
+    readonly at?: number;
+  }): PortableReplacementCleanupRecord {
+    const at = input.at ?? this.now();
+    if (!Number.isSafeInteger(at) || at < 0) throw new StoreError("Portable replacement time is invalid.");
+    return this.write(() => {
+      const current = this.getPortableReplacementCleanup(input.operationId);
+      this.assertPortableReplacementInspectionOwner(current, input);
+      if (current.nativeState !== "unknown") throw new StoreError("Portable replacement native cleanup is not awaiting verification.");
+      const changed = this.database.prepare(`
+        UPDATE portable_replacement_cleanups
+        SET native_state = 'completed', failure_code = NULL, updated_at = ?, revision = ?
+        WHERE operation_id = ? AND native_state = 'unknown' AND revision = ?
+      `).run(at, asSqlInteger(this.requireActiveRevision()), input.operationId, asSqlInteger(input.cleanupRevision));
+      if (changed.changes !== 1) throw new StoreError("Portable replacement cleanup changed during inspection.");
+      return this.getPortableReplacementCleanup(input.operationId);
+    });
+  }
+
+  private assertPortableReplacementInspectionOwner(
+    current: PortableReplacementCleanupRecord,
+    expected: {
+      readonly importedSessionId: string;
+      readonly cleanupRevision: bigint;
+      readonly replacedSessionRevision: bigint;
+      readonly targetRevision: bigint;
+      readonly backendInstanceGeneration: number;
+    }
+  ): void {
+    const imported = this.getSession(current.importedSessionId);
+    const replaced = this.getSession(current.replacedSessionId);
+    if (current.importedSessionId !== expected.importedSessionId
+      || current.revision !== expected.cleanupRevision
+      || replaced.revision !== expected.replacedSessionRevision
+      || replaced.descriptor.deletedAt === undefined
+      || imported.descriptor.deletedAt !== undefined
+      || imported.descriptor.backendId !== replaced.descriptor.backendId
+      || imported.descriptor.targetId !== replaced.descriptor.targetId
+      || imported.descriptor.binding.opaqueRef.toLowerCase() === replaced.descriptor.binding.opaqueRef.toLowerCase()
+      || this.findLiveSessionByNativeBinding(replaced.descriptor.backendId, replaced.descriptor.binding.opaqueRef) !== undefined
+      || this.getTarget(replaced.descriptor.targetId).revision !== expected.targetRevision
+      || this.getBackend(replaced.descriptor.backendId).descriptor.instanceGeneration !== expected.backendInstanceGeneration) {
+      throw new StoreError("Portable replacement cleanup lost its exact inspected owner.");
+    }
   }
 
   confirmPortableReplacementNativeCleanup(operationId: string, at = this.now()): PortableReplacementCleanupRecord {
@@ -13940,6 +14028,11 @@ export class OperationalStore {
         return existing;
       }
       this.getSession(sessionId);
+      const portableCleanup = this.findPortableReplacementCleanupForImportedSession(sessionId);
+      if (portableCleanup !== undefined && (portableCleanup.nativeState !== "completed"
+        || portableCleanup.worktreeState !== "completed")) {
+        throw new StoreError("Resolve the previous portable task cleanup before archiving or deleting this task.");
+      }
       const pending = this.findPendingSessionLifecycleCleanup(sessionId);
       if (pending !== undefined) throw new OperationInProgressError(pending.operationId);
       const scheduleDeletion = this.findPendingScheduleDeletionCleanupForSession(sessionId);

@@ -79,6 +79,7 @@ import {
 } from "./backend-control-capabilities.js";
 import { sessionDerivationOriginRoute } from "./session-derivation-origin.js";
 import { CollaborationGoalPanel } from "./CollaborationGoalPanel.js";
+import { PortableReplacementCleanupNotice } from "./PortableReplacementCleanupNotice.js";
 
 // First-stage contracts do not expose a durable dismissal mutation. Keep this bounded and
 // client-local so route switches/remounts are stable without pretending to persist remotely.
@@ -1800,6 +1801,7 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
       </header>}
 
       {session.worktree?.state === "preserved" && <div className="session-worktree-warning" role="alert"><GitBranch aria-hidden="true" /><span><strong>{t("worktree.preservedTitle")}</strong><small>{t("worktree.preservedDescription", { branch: session.worktree.branch })}</small></span></div>}
+      {!reviewReadOnly && <PortableReplacementCleanupNotice controller={controller} sessionId={session.id} t={t} />}
 
       <CollaborationGoalPanel
         controller={controller}
