@@ -266,6 +266,101 @@ describe("TaskImportSettings", () => {
     expect(container.querySelector(".task-import-footer")?.textContent).toContain("settings.sessionImport.selected:1");
     expect(container.querySelector(".task-import-row--direct")?.textContent).toContain("settings.sessionImport.item.error");
   });
+
+  it("keeps partial import results when refresh fails and retries only failed tasks", async () => {
+    const scanNativeSessionCatalog = vi.fn<AppController["scanNativeSessionCatalog"]>(async () => catalog([
+      entry({ id: "ready", reference: "native://ready", title: "Ready task", placement: "dialogue" }),
+      entry({ id: "broken", reference: "native://broken", title: "Broken task", placement: "dialogue" })
+    ]));
+    let brokenFailuresRemaining = 1;
+    const createSession = vi.fn<AppController["createSession"]>(async (draft) => {
+      if (draft.name === "Broken task" && brokenFailuresRemaining-- > 0) throw new Error("native import failed");
+      return { sessionId: `session:${draft.name}`, generation: 1n };
+    });
+    const refresh = vi.fn<AppController["refresh"]>()
+      .mockRejectedValueOnce(new Error("snapshot refresh failed"))
+      .mockResolvedValue(undefined);
+    const archiveTarget = vi.fn<AppController["archiveTarget"]>()
+      .mockRejectedValueOnce(new Error("temporary target cleanup failed"))
+      .mockResolvedValue(undefined);
+    const onSuccess = vi.fn();
+    let actionPromise: Promise<void> | undefined;
+    const runAction: RunAction = (_key, action) => {
+      actionPromise = action();
+      void actionPromise.catch(() => undefined);
+    };
+    const container = await renderSettings(controller({
+      scanNativeSessionCatalog,
+      createTarget: vi.fn(async () => "target-shared"),
+      createSession,
+      refresh,
+      archiveTarget
+    }), makeSnapshot([backend("partial", true, "Partial Runtime")]), runAction, onSuccess);
+    await waitFor(() => container.querySelectorAll(".task-import-row--direct").length === 2);
+    await act(async () => container.querySelector<HTMLInputElement>(".task-import-select-all input")?.click());
+    await act(async () => buttonWithText(container, "settings.sessionImport.importSelected").click());
+    await waitFor(() => actionPromise !== undefined);
+    let firstError: unknown;
+    await act(async () => {
+      try { await actionPromise; } catch (error) { firstError = error; }
+    });
+
+    expect((firstError as Error).message).toContain("native import failed");
+    expect((firstError as Error).message).toContain("temporary target cleanup failed");
+    expect((firstError as Error).message).toContain("snapshot refresh failed");
+    expect(onSuccess).toHaveBeenCalledExactlyOnceWith("settings.sessionImport.importComplete");
+    expect(container.querySelector(".task-import-footer")?.textContent).toContain("settings.sessionImport.selected:1");
+    const rows = [...container.querySelectorAll<HTMLElement>(".task-import-row--direct")];
+    expect(rows.find((row) => row.textContent?.includes("Ready task"))?.textContent).toContain("settings.sessionImport.item.success");
+    expect(rows.find((row) => row.textContent?.includes("Broken task"))?.textContent).toContain("settings.sessionImport.item.error");
+
+    await act(async () => buttonWithText(container, "settings.sessionImport.importSelected").click());
+    await act(async () => { await actionPromise; });
+    expect(createSession.mock.calls.map(([draft]) => draft.name)).toEqual(["Ready task", "Broken task", "Broken task"]);
+    expect(container.querySelector(".task-import-footer")?.textContent).toContain("settings.sessionImport.selected:0");
+  });
+
+  it("stops an in-flight import before another mutation after the profile changes", async () => {
+    const target = deferred<string>();
+    const createTarget = vi.fn<AppController["createTarget"]>(() => target.promise);
+    const createSession = vi.fn<AppController["createSession"]>();
+    const refresh = vi.fn<AppController["refresh"]>();
+    const archiveTarget = vi.fn<AppController["archiveTarget"]>();
+    let actionPromise: Promise<void> | undefined;
+    const runAction: RunAction = (_key, action) => {
+      actionPromise = action();
+      void actionPromise.catch(() => undefined);
+    };
+    const currentController = controller({
+      scanNativeSessionCatalog: async () => catalog([
+        entry({ id: "first", reference: "native://first", title: "First", placement: "dialogue" }),
+        entry({ id: "second", reference: "native://second", title: "Second", placement: "dialogue" })
+      ]),
+      createTarget,
+      createSession,
+      refresh,
+      archiveTarget
+    });
+    const container = await renderSettings(currentController, makeSnapshot([backend("owner", true, "Owner Runtime")]), runAction);
+    await waitFor(() => container.querySelectorAll(".task-import-row--direct").length === 2);
+    await act(async () => container.querySelector<HTMLInputElement>(".task-import-select-all input")?.click());
+    await act(async () => buttonWithText(container, "settings.sessionImport.importSelected").click());
+    await waitFor(() => createTarget.mock.calls.length === 1);
+    (currentController.state as unknown as { activeProfile?: { id: string; serverId: string } }).activeProfile = {
+      id: "another-profile", serverId: "another-server"
+    };
+    target.resolve("target-old-profile");
+    let actionError: unknown;
+    await act(async () => {
+      try { await actionPromise; } catch (error) { actionError = error; }
+    });
+
+    expect((actionError as Error).message).toContain("settings.sessionImport.ownerChanged");
+    expect(createSession).not.toHaveBeenCalled();
+    expect(createTarget).toHaveBeenCalledOnce();
+    expect(archiveTarget).not.toHaveBeenCalled();
+    expect(refresh).not.toHaveBeenCalled();
+  });
 });
 
 async function renderSettings(

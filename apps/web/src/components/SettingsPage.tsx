@@ -1065,17 +1065,43 @@ export function TaskImportSettings({ controller, snapshot, onImportPortable, run
   };
   const importSelected = (): void => {
     if (selectedItems.length === 0 || importing) return;
+    const batchController = controllerRef.current;
+    const batchProfile = batchController.state.activeProfile;
+    const batchConnectionGeneration = batchController.state.connectionGeneration;
+    const batchConnectionState = batchController.state.connectionState;
+    const batchBackendGenerations = new Map(selectedItems.map((item) => [
+      item.backendId,
+      snapshotRef.current.backends.find((backend) => backend.id === item.backendId)?.instanceGeneration
+    ] as const));
+    const isCurrentBatchOwner = (): boolean => {
+      const currentProfile = batchController.state.activeProfile;
+      return controllerRef.current === batchController
+        && currentProfile?.id === batchProfile?.id
+        && currentProfile?.serverId === batchProfile?.serverId
+        && batchController.state.connectionGeneration === batchConnectionGeneration
+        && batchController.state.connectionState === batchConnectionState
+        && [...batchBackendGenerations].every(([backendId, generation]) => {
+          const backend = snapshotRef.current.backends.find((item) => item.id === backendId);
+          return backend !== undefined
+            && backend.instanceGeneration === generation
+            && backend.capabilities.get("session.catalog")?.supported === true;
+        });
+    };
+    const assertBatchOwner = (): void => {
+      if (!isCurrentBatchOwner()) throw new Error(tRef.current("settings.sessionImport.ownerChanged"));
+    };
     setImporting(true);
     setItemStates(new Map(selectedItems.map((item) => [item.key, "importing"] as const)));
     runAction("import-native-sessions", async () => {
       try {
+        assertBatchOwner();
         const pending = [...selectedItems];
         const preflightResults = new Map<string, NativeSessionCatalogView | Error>();
         await Promise.all([...new Set(selectedItems.map((item) => item.backendId))].map(async (backendId) => {
           try {
             preflightResults.set(
               backendId,
-              await controllerRef.current.scanNativeSessionCatalog(backendId, { force: true })
+              await batchController.scanNativeSessionCatalog(backendId, { force: true })
             );
           } catch (error) {
             preflightResults.set(
@@ -1086,6 +1112,7 @@ export function TaskImportSettings({ controller, snapshot, onImportPortable, run
         }));
         const failures = new Set<string>();
         const failureMessages = new Map<string, string>();
+        const outcomes = new Map<string, "success" | "error">();
         let importedCount = 0;
         let updatedCount = 0;
         const targetPromises = new Map<string, Promise<{ readonly targetId: string; readonly created: boolean }>>();
@@ -1100,8 +1127,9 @@ export function TaskImportSettings({ controller, snapshot, onImportPortable, run
           const promise = existingTargetId !== undefined
             ? Promise.resolve({ targetId: existingTargetId, created: false })
             : (async () => {
+                assertBatchOwner();
                 if (path === undefined || path.trim() === "") throw new Error(tRef.current("settings.sessionImport.missingWorkspace"));
-                const targetId = await controllerRef.current.createTarget({
+                const targetId = await batchController.createTarget({
                   backendId,
                   name: nativeImportWorkspaceName(path),
                   workspaceKind: "userProject",
@@ -1116,6 +1144,7 @@ export function TaskImportSettings({ controller, snapshot, onImportPortable, run
         };
         const worker = async (): Promise<void> => {
           while (pending.length > 0) {
+            if (!isCurrentBatchOwner()) return;
             const item = pending.shift();
             if (item === undefined) return;
             let createdSessionId: string | undefined;
@@ -1137,7 +1166,8 @@ export function TaskImportSettings({ controller, snapshot, onImportPortable, run
                   );
                   visibleProjectTargetId = projectTarget.targetId;
                 }
-                await controllerRef.current.moveSessionProject(
+                assertBatchOwner();
+                await batchController.moveSessionProject(
                   candidate.existingSessionId,
                   visibleProjectTargetId,
                   {
@@ -1148,7 +1178,8 @@ export function TaskImportSettings({ controller, snapshot, onImportPortable, run
                 );
                 if (visibleProjectTargetId !== undefined) visibleProjectTargetIds.add(visibleProjectTargetId);
                 updatedCount += 1;
-                setItemStates((current) => new Map(current).set(item.key, "success"));
+                outcomes.set(item.key, "success");
+                if (isCurrentBatchOwner()) setItemStates((current) => new Map(current).set(item.key, "success"));
                 continue;
               }
               const runtimeTarget = await resolveTarget(item.backendId, candidate.workingDirectory, candidate.targetId);
@@ -1164,7 +1195,8 @@ export function TaskImportSettings({ controller, snapshot, onImportPortable, run
               const defaults = activeSnapshot.settings.backendSettings.find((candidate) => candidate.backendId === backend?.id);
               const execution = resolveNewSessionExecutionOptions(backend, activeSnapshot.models, "");
               const desiredPermission = defaults?.permissionMode ?? activeSnapshot.settings.policy.defaultMode;
-              const { sessionId } = await controllerRef.current.createSession({
+              assertBatchOwner();
+              const { sessionId } = await batchController.createSession({
                 targetId: runtimeTarget.targetId,
                 name: candidate.title?.trim() || candidate.id,
                 nativeStart: { kind: "attach", reference: candidate.reference },
@@ -1186,46 +1218,68 @@ export function TaskImportSettings({ controller, snapshot, onImportPortable, run
               visibleProjectTargetId = projectTarget?.targetId;
               if (visibleProjectTargetId !== undefined) visibleProjectTargetIds.add(visibleProjectTargetId);
               importedCount += 1;
-              setItemStates((current) => new Map(current).set(item.key, "success"));
+              outcomes.set(item.key, "success");
+              if (isCurrentBatchOwner()) setItemStates((current) => new Map(current).set(item.key, "success"));
             } catch (error) {
               let message = nativeImportErrorMessage(error, tRef.current("error.unexpected"));
-              if (createdSessionId !== undefined) {
+              if (createdSessionId !== undefined && isCurrentBatchOwner()) {
                 try {
-                  await controllerRef.current.deleteSession(createdSessionId, false);
+                  await batchController.deleteSession(createdSessionId, false);
                 } catch (cleanupFailure) {
                   message = `${message} ${nativeImportErrorMessage(cleanupFailure, tRef.current("error.unexpected"))}`;
                 }
               }
               failures.add(item.key);
               failureMessages.set(item.key, message);
-              setItemStates((current) => new Map(current).set(item.key, "error"));
+              outcomes.set(item.key, "error");
+              if (isCurrentBatchOwner()) setItemStates((current) => new Map(current).set(item.key, "error"));
             }
           }
         };
         await Promise.all(Array.from({ length: Math.min(3, selectedItems.length) }, () => worker()));
+        let ownerChanged = !isCurrentBatchOwner();
         let cleanupError: unknown;
         try {
+          if (ownerChanged) throw new Error(tRef.current("settings.sessionImport.ownerChanged"));
           await Promise.all([...createdTargetIds]
             .filter((targetId) => !visibleProjectTargetIds.has(targetId))
-            .map((targetId) => controllerRef.current.archiveTarget(targetId, true)));
+            .map((targetId) => {
+              assertBatchOwner();
+              return batchController.archiveTarget(targetId, true);
+            }));
         } catch (error) {
           cleanupError = error;
         }
-        await controllerRef.current.refresh();
-        await runScan(true);
-        if (failures.size > 0) {
-          setSelected(failures);
-          setItemStates(new Map([...failures].map((key) => [key, "error"] as const)));
+        ownerChanged ||= !isCurrentBatchOwner();
+        let refreshError: unknown;
+        if (!ownerChanged) {
+          try {
+            assertBatchOwner();
+            await batchController.refresh();
+            assertBatchOwner();
+            await runScan(true);
+          } catch (error) {
+            refreshError = error;
+          }
         }
-        if (importedCount > 0 || updatedCount > 0) {
+        ownerChanged ||= !isCurrentBatchOwner();
+        if (isCurrentBatchOwner()) {
+          setSelected(failures);
+          setItemStates(outcomes);
+        }
+        if (!ownerChanged && (importedCount > 0 || updatedCount > 0)) {
           onSuccess(tRef.current("settings.sessionImport.importComplete", { imported: importedCount, updated: updatedCount }));
         }
-        if (failures.size > 0) {
-          const details = [...new Set(failureMessages.values())];
-          if (cleanupError !== undefined) details.push(nativeImportErrorMessage(cleanupError, tRef.current("error.unexpected")));
-          throw new Error(`${tRef.current("settings.sessionImport.importFailed", { count: failures.size })} ${details.join(" ")}`.trim());
+        const details = [...new Set(failureMessages.values())];
+        if (cleanupError !== undefined) details.push(nativeImportErrorMessage(cleanupError, tRef.current("error.unexpected")));
+        if (refreshError !== undefined) details.push(nativeImportErrorMessage(refreshError, tRef.current("error.unexpected")));
+        if (ownerChanged) details.push(tRef.current("settings.sessionImport.ownerChanged"));
+        if (ownerChanged || failures.size > 0 || cleanupError !== undefined || refreshError !== undefined) {
+          const summary = failures.size > 0
+            ? tRef.current("settings.sessionImport.importFailed", { count: failures.size })
+            : tRef.current("settings.sessionImport.followupFailed");
+          throw new Error(`${summary} ${[...new Set(details)].join(" ")}`.trim());
         }
-        if (cleanupError !== undefined) throw cleanupError;
       } finally {
         setImporting(false);
       }
