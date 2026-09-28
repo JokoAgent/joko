@@ -1,9 +1,11 @@
 import { create } from "@bufbuild/protobuf";
 import type { Transport } from "@connectrpc/connect";
 import {
-  ArtifactStorageCleanupOutcome,
+  ArtifactStorageCleanupStatus,
+  ArtifactStorageCleanupPhase,
   CapabilitySupport,
-  CleanupArtifactStorageResponseSchema,
+  BeginArtifactStorageCleanupResponseSchema,
+  GetArtifactStorageCleanupResponseSchema,
   GetArtifactStorageStatsResponseSchema,
   GetSnapshotResponseSchema,
   ReconcileArtifactStorageResponseSchema,
@@ -42,11 +44,14 @@ describe("Artifact storage gateway", () => {
       if (method.localName === "reconcileArtifactStorage") {
         return create(ReconcileArtifactStorageResponseSchema, { result: { healthy: true } });
       }
-      if (method.localName === "cleanupArtifactStorage") {
-        return create(CleanupArtifactStorageResponseSchema, {
-          outcome: ArtifactStorageCleanupOutcome.COMPLETED,
-          result: { expiredReferencesDeleted: 2n, freedBytes: 10n }
-        });
+      if (method.localName === "beginArtifactStorageCleanup" || method.localName === "getArtifactStorageCleanup") {
+        const progress = { maintenanceId: token, status: ArtifactStorageCleanupStatus.COMPLETED,
+          phase: ArtifactStorageCleanupPhase.RECONCILING, percent: 100,
+          updatedAt: { seconds: 1n, nanos: 0 },
+          result: { expiredReferencesDeleted: 2n, freedBytes: 10n } };
+        return method.localName === "beginArtifactStorageCleanup"
+          ? create(BeginArtifactStorageCleanupResponseSchema, { progress })
+          : create(GetArtifactStorageCleanupResponseSchema, { progress });
       }
       throw new Error(`Unexpected method ${method.localName}`);
     });
@@ -74,21 +79,24 @@ describe("Artifact storage gateway", () => {
       orphanBlobCount: 0,
       unsafeEntryCount: 0
     });
-    await expect(gateway.cleanupArtifactStorage(token, [digest])).resolves.toMatchObject({
-      outcome: "completed",
-      expiredReferencesDeleted: 2,
-      freedBytes: 10
+    await expect(gateway.beginArtifactStorageCleanup(token, [digest])).resolves.toMatchObject({
+      status: "completed", result: { expiredReferencesDeleted: 2, freedBytes: 10 }
     });
+    await expect(gateway.getArtifactStorageCleanup(token)).resolves.toMatchObject({ status: "completed" });
     expect(calls.filter((call) => call.method.includes("ArtifactStorage")).every((call) =>
-      call.input.protectedSha256?.[0] === digest
+      call.method === "getArtifactStorageCleanup" || call.input.protectedSha256?.[0] === digest
     )).toBe(true);
     gateway.disconnect();
   });
 
   it("returns typed stale-scan outcomes", async () => {
     const transport = artifactTransport((method) => {
-      if (method.localName === "cleanupArtifactStorage") {
-        return create(CleanupArtifactStorageResponseSchema, { outcome: ArtifactStorageCleanupOutcome.SCAN_EXPIRED });
+      if (method.localName === "beginArtifactStorageCleanup") {
+        return create(BeginArtifactStorageCleanupResponseSchema, { progress: {
+          maintenanceId: "c".repeat(64), status: ArtifactStorageCleanupStatus.SCAN_EXPIRED,
+          phase: ArtifactStorageCleanupPhase.PREPARING, percent: 0,
+          updatedAt: { seconds: 1n, nanos: 0 }
+        } });
       }
       throw new Error(`Unexpected method ${method.localName}`);
     });
@@ -99,7 +107,7 @@ describe("Artifact storage gateway", () => {
       () => transport
     );
     await gateway.connect();
-    await expect(gateway.cleanupArtifactStorage("c".repeat(64))).resolves.toEqual({ outcome: "scanExpired" });
+    await expect(gateway.beginArtifactStorageCleanup("c".repeat(64))).resolves.toMatchObject({ status: "scanExpired" });
     gateway.disconnect();
   });
 });

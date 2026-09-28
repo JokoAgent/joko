@@ -12,7 +12,8 @@ import {
   AudioArtifactKind,
   type AudioArtifactMetadata,
   ArtifactService,
-  ArtifactStorageCleanupOutcome,
+  ArtifactStorageCleanupStatus,
+  ArtifactStorageCleanupPhase,
   AndroidAdbPathSource,
   AndroidAutomationIssue,
   AndroidAutomationRuntimeState,
@@ -508,6 +509,7 @@ import {
   type RuntimeToolCatalog,
   type TaskHistoryCleanupResult,
   type TaskHistoryMaintenanceProgress,
+  type ArtifactStorageCleanupProgress,
   type WorkspaceDescriptor,
   type WorkspaceLocation,
   type WorkspaceEntry,
@@ -1347,29 +1349,26 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     };
   }
 
-  async cleanupArtifactStorage(
+  async beginArtifactStorageCleanup(
     scanToken: string,
     protectedSha256: readonly string[] = []
   ): Promise<ArtifactStorageCleanupView> {
     if (!/^[a-f0-9]{64}$/u.test(scanToken)) throw new GatewayError("Artifact storage scan token is invalid.");
     const client = createClient(ArtifactService, this.requireTransport());
-    const response = await client.cleanupArtifactStorage({
+    const response = await client.beginArtifactStorageCleanup({
       scanToken,
       protectedSha256: artifactProtectedSha256(protectedSha256)
     });
-    if (response.outcome === ArtifactStorageCleanupOutcome.SCAN_EXPIRED) return { outcome: "scanExpired" };
-    if (response.outcome === ArtifactStorageCleanupOutcome.STORAGE_CHANGED) return { outcome: "storageChanged" };
-    if (response.outcome !== ArtifactStorageCleanupOutcome.COMPLETED || response.result === undefined) {
-      throw new GatewayError("Orchestrator returned an invalid Artifact storage cleanup result.");
-    }
-    return {
-      outcome: "completed",
-      expiredReferencesDeleted: artifactStorageCount(response.result.expiredReferencesDeleted),
-      blobsRemoved: artifactStorageCount(response.result.blobsRemoved),
-      temporaryFilesRemoved: artifactStorageCount(response.result.temporaryFilesRemoved),
-      freedBytes: artifactStorageCount(response.result.freedBytes),
-      skipped: artifactStorageCount(response.result.skipped)
-    };
+    if (response.progress === undefined) throw new GatewayError("Orchestrator returned no Artifact storage cleanup progress.");
+    return artifactCleanupProgress(response.progress);
+  }
+
+  async getArtifactStorageCleanup(maintenanceId: string): Promise<ArtifactStorageCleanupView> {
+    if (!/^[a-f0-9]{64}$/u.test(maintenanceId)) throw new GatewayError("Artifact storage maintenance ID is invalid.");
+    const client = createClient(ArtifactService, this.requireTransport());
+    const response = await client.getArtifactStorageCleanup({ maintenanceId });
+    if (response.progress === undefined) throw new GatewayError("Orchestrator returned no Artifact storage cleanup progress.");
+    return artifactCleanupProgress(response.progress);
   }
 
   async getTaskHistoryMaintenanceSupport(): Promise<TaskHistoryMaintenanceSupportView> {
@@ -11074,6 +11073,40 @@ function taskHistoryCleanupProgress(value: TaskHistoryMaintenanceProgress): Task
       return { ...common, status: "failed", cancellable: false };
     default:
       throw new GatewayError("Orchestrator returned an invalid task history cleanup status.");
+  }
+}
+
+function artifactCleanupProgress(value: ArtifactStorageCleanupProgress): ArtifactStorageCleanupView {
+  if (!/^[a-f0-9]{64}$/u.test(value.maintenanceId)
+    || !Number.isSafeInteger(value.percent) || value.percent < 0 || value.percent > 100) {
+    throw new GatewayError("Orchestrator returned invalid Artifact storage cleanup progress.");
+  }
+  const phase = (() => {
+    switch (value.phase) {
+      case ArtifactStorageCleanupPhase.PREPARING: return "preparing" as const;
+      case ArtifactStorageCleanupPhase.QUARANTINING: return "quarantining" as const;
+      case ArtifactStorageCleanupPhase.DELETING: return "deleting" as const;
+      case ArtifactStorageCleanupPhase.RECONCILING: return "reconciling" as const;
+      default: throw new GatewayError("Orchestrator returned an invalid Artifact storage cleanup phase.");
+    }
+  })();
+  const common = { maintenanceId: value.maintenanceId, phase, percent: value.percent,
+    updatedAt: timestampMs(value.updatedAt) };
+  switch (value.status) {
+    case ArtifactStorageCleanupStatus.RUNNING: return { ...common, status: "running" };
+    case ArtifactStorageCleanupStatus.COMPLETED:
+      if (value.result === undefined) throw new GatewayError("Orchestrator returned no completed Artifact storage cleanup result.");
+      return { ...common, status: "completed", result: {
+        expiredReferencesDeleted: artifactStorageCount(value.result.expiredReferencesDeleted),
+        blobsRemoved: artifactStorageCount(value.result.blobsRemoved),
+        temporaryFilesRemoved: artifactStorageCount(value.result.temporaryFilesRemoved),
+        freedBytes: artifactStorageCount(value.result.freedBytes),
+        skipped: artifactStorageCount(value.result.skipped)
+      } };
+    case ArtifactStorageCleanupStatus.SCAN_EXPIRED: return { ...common, status: "scanExpired" };
+    case ArtifactStorageCleanupStatus.STORAGE_CHANGED: return { ...common, status: "storageChanged" };
+    case ArtifactStorageCleanupStatus.FAILED: return { ...common, status: "failed" };
+    default: throw new GatewayError("Orchestrator returned an invalid Artifact storage cleanup status.");
   }
 }
 

@@ -91,7 +91,8 @@ import { readWorkspaceHtmlSnapshot } from "./workspace-html-snapshot.js";
 import {
   ArtifactMaintenanceScanChangedError,
   ArtifactMaintenanceScanExpiredError,
-  type ArtifactMaintenance
+  type ArtifactMaintenance,
+  type ArtifactCleanupJob
 } from "./artifact-maintenance.js";
 import { NATIVE_PI_SETTINGS_DEFAULTS, type OrchestratorApplication, type SessionContextDefaultsResolver } from "./application.js";
 import { projectBackgroundTaskHistory } from "./background-task-history.js";
@@ -676,6 +677,40 @@ function toProtoTaskHistoryProgress(progress: HistoryMaintenanceJob) {
     cancellable: progress.cancellable,
     updatedAt: toProtoTimestamp(progress.updatedAt),
     ...(progress.result === undefined ? {} : { result: toProtoTaskHistoryResult(progress.result) })
+  };
+}
+
+function toProtoArtifactCleanupProgress(progress: ArtifactCleanupJob) {
+  const status = (() => {
+    switch (progress.status) {
+      case "running": return contract.ArtifactStorageCleanupStatus.RUNNING;
+      case "completed": return contract.ArtifactStorageCleanupStatus.COMPLETED;
+      case "scan-expired": return contract.ArtifactStorageCleanupStatus.SCAN_EXPIRED;
+      case "storage-changed": return contract.ArtifactStorageCleanupStatus.STORAGE_CHANGED;
+      case "failed": return contract.ArtifactStorageCleanupStatus.FAILED;
+    }
+  })();
+  const phase = (() => {
+    switch (progress.phase) {
+      case "preparing": return contract.ArtifactStorageCleanupPhase.PREPARING;
+      case "quarantining": return contract.ArtifactStorageCleanupPhase.QUARANTINING;
+      case "deleting": return contract.ArtifactStorageCleanupPhase.DELETING;
+      case "reconciling": return contract.ArtifactStorageCleanupPhase.RECONCILING;
+    }
+  })();
+  return {
+    maintenanceId: progress.maintenanceId,
+    status,
+    phase,
+    percent: progress.percent,
+    updatedAt: toProtoTimestamp(progress.updatedAt),
+    ...(progress.result === undefined ? {} : { result: {
+      expiredReferencesDeleted: BigInt(progress.result.expiredReferencesDeleted),
+      blobsRemoved: BigInt(progress.result.blobsRemoved),
+      temporaryFilesRemoved: BigInt(progress.result.temporaryFilesRemoved),
+      freedBytes: BigInt(progress.result.freedBytes),
+      skipped: BigInt(progress.result.skipped)
+    } })
   };
 }
 
@@ -3486,34 +3521,35 @@ export function createConnectServices(application: OrchestratorApplication): Con
         }
       };
     },
-    cleanupArtifactStorage: async (request, context) => {
+    beginArtifactStorageCleanup: async (request, context) => {
       authenticate(context);
       if (dependencies.artifactMaintenance === undefined) throw new ConnectError("Artifact storage maintenance is unavailable.", Code.Unimplemented);
       if (!/^[a-f0-9]{64}$/u.test(request.scanToken)) throw invalidArgument("scan_token is invalid");
       try {
-        const result = await dependencies.artifactMaintenance.cleanup(
+        const progress = await dependencies.artifactMaintenance.beginCleanup(
           request.scanToken,
           artifactProtectedSha256(request.protectedSha256)
         );
-        return {
-          outcome: contract.ArtifactStorageCleanupOutcome.COMPLETED,
-          result: {
-            expiredReferencesDeleted: BigInt(result.expiredReferencesDeleted),
-            blobsRemoved: BigInt(result.blobsRemoved),
-            temporaryFilesRemoved: BigInt(result.temporaryFilesRemoved),
-            freedBytes: BigInt(result.freedBytes),
-            skipped: BigInt(result.skipped)
-          }
-        };
+        return { progress: toProtoArtifactCleanupProgress(progress) };
       } catch (error) {
         if (error instanceof ArtifactMaintenanceScanExpiredError) {
-          return { outcome: contract.ArtifactStorageCleanupOutcome.SCAN_EXPIRED };
+          return { progress: toProtoArtifactCleanupProgress({ maintenanceId: request.scanToken,
+            status: "scan-expired", phase: "preparing", percent: 0, updatedAt: Date.now() }) };
         }
         if (error instanceof ArtifactMaintenanceScanChangedError) {
-          return { outcome: contract.ArtifactStorageCleanupOutcome.STORAGE_CHANGED };
+          return { progress: toProtoArtifactCleanupProgress({ maintenanceId: request.scanToken,
+            status: "storage-changed", phase: "preparing", percent: 0, updatedAt: Date.now() }) };
         }
         throw new ConnectError("Artifact storage cleanup failed.", Code.Internal);
       }
+    },
+    getArtifactStorageCleanup: (request, context) => {
+      authenticate(context);
+      if (dependencies.artifactMaintenance === undefined) throw new ConnectError("Artifact storage maintenance is unavailable.", Code.Unimplemented);
+      if (!/^[a-f0-9]{64}$/u.test(request.maintenanceId)) throw invalidArgument("maintenance_id is invalid");
+      const progress = dependencies.artifactMaintenance.getCleanup(request.maintenanceId);
+      if (progress === undefined) throw new ConnectError("Artifact storage cleanup not found.", Code.NotFound);
+      return { progress: toProtoArtifactCleanupProgress(progress) };
     }
   } satisfies ServiceImpl<typeof contract.ArtifactService>;
 

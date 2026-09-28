@@ -33,6 +33,83 @@ afterEach(() => {
 });
 
 describe("OperationalStore", () => {
+  it("persists maintenance scan, job, and effect receipts without invalidating the product revision fence", async () => {
+    const fixture = createFixture();
+    const filePath = fixture.store.filePath;
+    fixture.store.createMaintenanceScan({
+      id: "history-scan-1",
+      kind: "history",
+      payload: { projection: "frozen" },
+      expiresAt: 10_000,
+      createdAt: 100
+    });
+    fixture.store.transaction((store) => {
+      expect(store.claimMaintenanceScan("history", "history-scan-1", 101)?.state).toBe("claimed");
+      store.createMaintenanceJob<{ installationPrepared: boolean }, { reclaimedBytes: number }>({
+        id: "history-scan-1",
+        kind: "history",
+        scanId: "history-scan-1",
+        phase: "preparing",
+        percent: 1,
+        cancellable: true,
+        payload: { installationPrepared: false },
+        effects: [{
+          id: "binding-1",
+          kind: "history_binding",
+          payload: { operationId: "reset-1" }
+        }],
+        createdAt: 101
+      });
+    });
+    const expectedRevision = fixture.store.health().revision;
+    fixture.store.updateMaintenanceJob({
+      kind: "history",
+      id: "history-scan-1",
+      status: "running",
+      phase: "copying",
+      percent: 20,
+      cancellable: true,
+      cancelRequested: false,
+      payload: { installationPrepared: false },
+      updatedAt: 102
+    });
+    fixture.store.updateMaintenanceEffect({
+      jobId: "history-scan-1",
+      id: "binding-1",
+      state: "prepared",
+      payload: { operationId: "reset-1", replacement: "native/new.jsonl" },
+      updatedAt: 102
+    });
+    expect(fixture.store.health().revision).toBe(expectedRevision);
+
+    const workingPath = `${filePath}.history-maintenance.work`;
+    await expect(fixture.store.createHistoryMaintenanceCopy({ workingPath, expectedRevision })).resolves.toBe(true);
+    fixture.store.prepareHistoryMaintenanceCopyReceipt({
+      workingPath,
+      jobId: "history-scan-1",
+      phase: "installing",
+      percent: 96,
+      payload: { installationPrepared: true },
+      effectUpdates: [{
+        id: "binding-1",
+        state: "prepared",
+        payload: { operationId: "reset-1", replacement: "native/new.jsonl" }
+      }],
+      updatedAt: 103
+    });
+    fixture.store.installHistoryMaintenanceCopy({ workingPath, expectedRevision, backupEnabled: false });
+    fixture.store.close();
+
+    const reopened = new OperationalStore(filePath);
+    fixture.replaceStore(reopened);
+    expect(reopened.getMaintenanceScan("history", "history-scan-1")).toMatchObject({ state: "claimed" });
+    expect(reopened.getMaintenanceJob<{ installationPrepared: boolean }>("history", "history-scan-1"))
+      .toMatchObject({ status: "running", phase: "installing", percent: 96, payload: { installationPrepared: true } });
+    expect(reopened.listMaintenanceEffects("history-scan-1")).toEqual([
+      expect.objectContaining({ id: "binding-1", state: "prepared" })
+    ]);
+  });
+
   it("atomically installs a verified maintenance copy and preserves the prior database as the latest backup", async () => {
     const fixture = createFixture();
     const expectedRevision = fixture.store.health().revision;

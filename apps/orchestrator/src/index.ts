@@ -45,6 +45,7 @@ export * from "./event-hub.js";
 export * from "./extension-catalog.js";
 export * from "./extension-package-publisher.js";
 export * from "./history-maintenance.js";
+export { cleanHistoryMaintenanceCopy } from "./history-maintenance-worker.js";
 export * from "./lan-discovery.js";
 export * from "./local-model-runtime-coordinator.js";
 export * from "./local-model-runtime-persistence.js";

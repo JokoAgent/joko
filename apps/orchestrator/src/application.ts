@@ -1409,6 +1409,7 @@ export async function createOrchestratorApplication(
   }
   let startupSessionHost: SessionHost | undefined;
   let startupSessionWorktrees: SessionWorktreeCoordinator | undefined;
+  let startupHistoryMaintenance: HistoryMaintenance | undefined;
   let startupCleanupHandled = false;
   let startupBackendCleanup: Promise<readonly unknown[]> | undefined;
   const cleanupStartupBackendOwners = (): Promise<readonly unknown[]> => {
@@ -1817,10 +1818,13 @@ export async function createOrchestratorApplication(
       } catch { /* The Store may already be closed. */ }
     }
   };
-  const historyMaintenance = new HistoryMaintenance({
+  const historyMaintenance = startupHistoryMaintenance = new HistoryMaintenance({
     store,
     activeSessions: {
-      prepare: (sessionIds) => sessionHost.prepareHistoryMaintenanceBindings(sessionIds),
+      prepare: (requests) => sessionHost.prepareHistoryMaintenanceBindings(requests),
+      recover: (request) => sessionHost.recoverHistoryMaintenanceBinding(request),
+      discard: (replacements) => sessionHost.discardHistoryMaintenanceBindings(replacements),
+      finalize: (replacements) => sessionHost.finalizeHistoryMaintenanceBindings(replacements),
       release: (sessionIds) => sessionHost.releaseHistoryMaintenanceSessions(sessionIds)
     },
     externalRecords: workspaceChanges
@@ -2156,6 +2160,7 @@ export async function createOrchestratorApplication(
     await reviewCoordinator.reconcileStartup();
     await sessionWorktrees.initialize();
     await sessionHost.initialize();
+    await historyMaintenance.initialize();
     await skillLearning.initialize();
     for (const registration of backendTargets) {
       if (backendInstances.adapter(registration.backendId) === undefined) continue;
@@ -2589,6 +2594,8 @@ export async function createOrchestratorApplication(
         await backendLifecycleTail.catch(() => undefined);
         // Keep the remote transports alive while terminals attempt confirmed process cleanup.
         await attempt(() => terminals.dispose());
+        await attempt(() => artifactMaintenance.close());
+        await attempt(() => historyMaintenance.close());
         await attempt(() => sessionHost.dispose());
         await attempt(() => backendInstances.disposeRetainedCleanups());
         await attempt(() => managedProviderProxy.close());
@@ -2654,6 +2661,7 @@ export async function createOrchestratorApplication(
     await attempt(() => simulatorControl?.dispose());
     await attempt(() => providerAuth.beginShutdown());
     await attempt(() => providerAccountUsage.invalidate());
+    await attempt(() => startupHistoryMaintenance?.close());
     cleanupErrors.push(...await cleanupStartupBackendOwners());
     await attempt(() => startupSessionWorktrees?.dispose());
     await attempt(() => generationGcTail.catch(() => undefined));

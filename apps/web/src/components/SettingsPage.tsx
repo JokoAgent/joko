@@ -1655,10 +1655,39 @@ export function ArtifactStorageSettingsCard({ controller, snapshot, t }: {
   const [busy, setBusy] = useState<"stats" | "scan" | "reconcile" | "cleanup">("stats");
   const [error, setError] = useState<string>();
   const activeOperation = useRef(false);
+  const progressGenerationRef = useRef(0);
+  const confirmRef = useRef<HTMLButtonElement>(null);
   const controllerRef = useRef(controller);
   const snapshotRef = useRef(snapshot);
   controllerRef.current = controller;
   snapshotRef.current = snapshot;
+
+  const pollCleanup = async (first: ArtifactStorageCleanupView): Promise<void> => {
+    const generation = ++progressGenerationRef.current;
+    let next = first;
+    while (generation === progressGenerationRef.current) {
+      setCleanup(next);
+      if (next.status !== "running") {
+        try { window.sessionStorage.removeItem("joko.artifact-storage.maintenance-id"); } catch { /* Storage may be unavailable. */ }
+        if (next.status === "completed") await loadStats();
+        if (next.status === "scanExpired") setError(t("settings.artifactStorageScanExpired"));
+        if (next.status === "storageChanged") setError(t("settings.artifactStorageChanged"));
+        if (next.status === "failed") setError(t("settings.artifactStorageCleanupFailed"));
+        return;
+      }
+      await new Promise<void>((resolveDelay) => window.setTimeout(resolveDelay, 250));
+      if (generation !== progressGenerationRef.current) return;
+      next = await controllerRef.current.getArtifactStorageCleanup(next.maintenanceId);
+    }
+  };
+
+  const resumeCleanup = async (): Promise<boolean> => {
+    let maintenanceId: string | null = null;
+    try { maintenanceId = window.sessionStorage.getItem("joko.artifact-storage.maintenance-id"); } catch { /* Storage may be unavailable. */ }
+    if (maintenanceId === null || !/^[a-f0-9]{64}$/u.test(maintenanceId)) return false;
+    await pollCleanup(await controllerRef.current.getArtifactStorageCleanup(maintenanceId));
+    return true;
+  };
 
   const loadStats = async (): Promise<void> => {
     setBusy("stats");
@@ -1687,6 +1716,11 @@ export function ArtifactStorageSettingsCard({ controller, snapshot, t }: {
       }
     })();
     return () => { mounted = false; };
+  }, [t]);
+
+  useEffect(() => {
+    void resumeCleanup().catch(() => setError(t("settings.artifactStorageCleanupFailed")));
+    return () => { progressGenerationRef.current += 1; };
   }, [t]);
 
   useEffect(() => {
@@ -1743,14 +1777,16 @@ export function ArtifactStorageSettingsCard({ controller, snapshot, t }: {
     void runExclusive(async () => {
       try {
         const protectedSha256 = await activeDraftAttachmentSha256(controllerRef.current, snapshotRef.current);
-        const result = await controllerRef.current.cleanupArtifactStorage(accepted.token, protectedSha256);
+        try { window.sessionStorage.setItem("joko.artifact-storage.maintenance-id", accepted.token); } catch { /* Storage may be unavailable. */ }
+        const result = await controllerRef.current.beginArtifactStorageCleanup(accepted.token, protectedSha256);
         setScan(undefined);
-        setCleanup(result);
-        if (result.outcome === "scanExpired") setError(t("settings.artifactStorageScanExpired"));
-        if (result.outcome === "storageChanged") setError(t("settings.artifactStorageChanged"));
-        if (result.outcome === "completed") await loadStats();
+        await pollCleanup(result);
       } catch {
-        setError(t("settings.artifactStorageCleanupFailed"));
+        try {
+          if (!await resumeCleanup()) setError(t("settings.artifactStorageCleanupFailed"));
+        } catch {
+          setError(t("settings.artifactStorageCleanupFailed"));
+        }
       }
     });
   };
@@ -1759,7 +1795,10 @@ export function ArtifactStorageSettingsCard({ controller, snapshot, t }: {
   const stats = capability?.stats;
   return <>
     <SettingsSectionHeading title={t("settings.artifactStorageTitle")} body={t("settings.artifactStorageBody")} />
-    {error !== undefined && <ErrorBanner message={error} onRetry={() => { void loadStats(); }} onClose={() => setError(undefined)} />}
+    {error !== undefined && <ErrorBanner message={error} onRetry={() => {
+      void resumeCleanup().then((resumed) => { if (!resumed) void loadStats(); })
+        .catch(() => setError(t("settings.artifactStorageCleanupFailed")));
+    }} onClose={() => setError(undefined)} />}
     <section className="settings-card artifact-storage-card">
       <div className="setting-row">
         <div><strong><Database aria-hidden="true" />{t("settings.artifactStorageUsage")}</strong><span>{stats === undefined
@@ -1783,39 +1822,56 @@ export function ArtifactStorageSettingsCard({ controller, snapshot, t }: {
           unsafe: reconcile.unsafeEntryCount
         })}</span>}
       </div>}
-      {scan !== undefined && <div className="artifact-storage-report" role="status">
-        <strong>{t("settings.artifactStorageConfirmTitle")}</strong>
-        <span>{t("settings.artifactStorageScanSummary", {
-          bytes: formatArtifactBytes(scan.cleanableBytes),
-          references: scan.expiredReferenceCount,
-          blobs: scan.orphanBlobCount,
-          temporary: scan.temporaryFileCount
-        })}</span>
-        {scan.protectedReferenceCount > 0 && <span>{t("settings.artifactStorageProtected", { count: scan.protectedReferenceCount })}</span>}
-        {(scan.missingBlobCount > 0 || scan.unsafeEntryCount > 0) && <span className="artifact-storage-warning">{t("settings.artifactStorageScanWarnings", {
-          missing: scan.missingBlobCount,
-          unsafe: scan.unsafeEntryCount
-        })}</span>}
-        <div className="artifact-storage-confirm-actions">
-          <Button onClick={() => setScan(undefined)}>{t("common.cancel")}</Button>
-          <Button tone="primary" onClick={confirmCleanup}>{t("settings.artifactStorageConfirmCleanup", { bytes: formatArtifactBytes(scan.cleanableBytes) })}</Button>
-        </div>
-      </div>}
-      {cleanup?.outcome === "completed" && <div className="artifact-storage-report is-healthy" role="status">
+      {cleanup?.status === "completed" && cleanup.result !== undefined && <div className="artifact-storage-report is-healthy" role="status">
         <strong>{t("settings.artifactStorageCleanupComplete")}</strong>
         <span>{t("settings.artifactStorageCleanupSummary", {
-          bytes: formatArtifactBytes(cleanup.freedBytes),
-          references: cleanup.expiredReferencesDeleted,
-          blobs: cleanup.blobsRemoved,
-          temporary: cleanup.temporaryFilesRemoved,
-          skipped: cleanup.skipped
+          bytes: formatArtifactBytes(cleanup.result.freedBytes),
+          references: cleanup.result.expiredReferencesDeleted,
+          blobs: cleanup.result.blobsRemoved,
+          temporary: cleanup.result.temporaryFilesRemoved,
+          skipped: cleanup.result.skipped
         })}</span>
       </div>}
       <div className="settings-toolbar artifact-storage-actions">
-        <Button disabled={!supported} onClick={runReconcile}>{t("settings.artifactStorageReconcile")}</Button>
-        <Button tone="primary" disabled={!supported} onClick={startScan}>{t("settings.artifactStorageScan")}</Button>
+        <Button disabled={!supported || cleanup?.status === "running"} onClick={runReconcile}>{t("settings.artifactStorageReconcile")}</Button>
+        <Button tone="primary" disabled={!supported || cleanup?.status === "running"} onClick={startScan}>{t("settings.artifactStorageScan")}</Button>
       </div>
     </section>
+    <Modal
+      key={cleanup?.status === "running" ? `cleanup:${cleanup.maintenanceId}` : `scan:${scan?.token ?? ""}`}
+      open={scan !== undefined || cleanup?.status === "running"}
+      title={cleanup?.status === "running" ? t("settings.artifactStorageExecuting") : t("settings.artifactStorageConfirmTitle")}
+      description={cleanup?.status === "running" ? undefined : t("settings.artifactStorageConfirmBody")}
+      onClose={() => { if (cleanup?.status !== "running") setScan(undefined); }}
+      dialogRole="alertdialog"
+      dismissOnBackdrop={cleanup?.status !== "running"}
+      size="medium"
+      initialFocus={() => confirmRef.current}
+    >
+      {scan !== undefined && cleanup?.status !== "running" && <>
+        <div className="artifact-storage-report" role="status">
+          <span>{t("settings.artifactStorageScanSummary", {
+            bytes: formatArtifactBytes(scan.cleanableBytes), references: scan.expiredReferenceCount,
+            blobs: scan.orphanBlobCount, temporary: scan.temporaryFileCount
+          })}</span>
+          {scan.protectedReferenceCount > 0 && <span>{t("settings.artifactStorageProtected", { count: scan.protectedReferenceCount })}</span>}
+          {(scan.missingBlobCount > 0 || scan.unsafeEntryCount > 0) && <span className="artifact-storage-warning">{t("settings.artifactStorageScanWarnings", {
+            missing: scan.missingBlobCount, unsafe: scan.unsafeEntryCount
+          })}</span>}
+        </div>
+        <div className="modal__actions">
+          <Button onClick={() => setScan(undefined)}>{t("common.cancel")}</Button>
+          <button ref={confirmRef} type="button" className="button button--danger"
+            disabled={scan.missingBlobCount > 0 || scan.unsafeEntryCount > 0}
+            onClick={confirmCleanup}>{t("settings.artifactStorageConfirmCleanup", { bytes: formatArtifactBytes(scan.cleanableBytes) })}</button>
+        </div>
+      </>}
+      {cleanup?.status === "running" && <div className="task-history-busy" role="status" aria-live="polite">
+        <Spinner label={t("settings.artifactStorageExecuting")} />
+        <span>{t(`settings.artifactStoragePhase.${cleanup.phase}`)} · {cleanup.percent}%</span>
+        <progress max={100} value={cleanup.percent} aria-label={`${cleanup.percent}%`} />
+      </div>}
+    </Modal>
   </>;
 }
 

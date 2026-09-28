@@ -18,6 +18,7 @@ beforeEach(() => {
 
 afterEach(async () => {
   for (const root of roots.splice(0).reverse()) await act(async () => root.unmount());
+  window.sessionStorage.clear();
   document.body.replaceChildren();
   Reflect.deleteProperty(globalThis, "IS_REACT_ACT_ENVIRONMENT");
 });
@@ -95,7 +96,7 @@ describe("ArtifactStorageSettingsCard", () => {
       })),
       scanArtifactStorage: scanStorage,
       reconcileArtifactStorage: vi.fn(),
-      cleanupArtifactStorage: cleanup
+      beginArtifactStorageCleanup: cleanup
     } as unknown as AppController;
     const snapshot = { ...emptySnapshot(), sessions: [{ id: "session-1" }] } as unknown as ReturnType<typeof emptySnapshot>;
     const container = await render(controller, snapshot);
@@ -145,13 +146,13 @@ describe("ArtifactStorageSettingsCard", () => {
       })),
       scanArtifactStorage: scanStorage,
       reconcileArtifactStorage: vi.fn(),
-      cleanupArtifactStorage: cleanup
+      beginArtifactStorageCleanup: cleanup
     } as unknown as AppController;
     const container = await render(controller);
 
     await act(async () => vi.waitFor(() => expect(controller.getArtifactStorageStats).toHaveBeenCalledWith([])));
     await clickButton(container, "Scan for cleanup");
-    await act(async () => vi.waitFor(() => expect(container.textContent).toContain("Confirm storage cleanup")));
+    await act(async () => vi.waitFor(() => expect(document.body.textContent).toContain("Confirm storage cleanup")));
     await clickButton(container, "Clean up 11 B");
     await act(async () => vi.waitFor(() => expect(container.textContent).toContain("Artifact storage cleanup failed without a confirmed result.")));
 
@@ -166,14 +167,10 @@ describe("ArtifactStorageSettingsCard", () => {
       value: async () => new TextEncoder().encode("draft bytes").buffer
     });
     const digest = await sha256Hex(await file.arrayBuffer());
-    const cleanup = vi.fn(async () => ({
-      outcome: "completed" as const,
-      expiredReferencesDeleted: 1,
-      blobsRemoved: 1,
-      temporaryFilesRemoved: 0,
-      freedBytes: 11,
-      skipped: 0
-    }));
+    const cleanup = vi.fn(async () => ({ maintenanceId: "a".repeat(64), status: "completed" as const,
+      phase: "reconciling" as const, percent: 100, updatedAt: Date.now(), result: {
+        expiredReferencesDeleted: 1, blobsRemoved: 1, temporaryFilesRemoved: 0, freedBytes: 11, skipped: 0
+      } }));
     const getStats = vi.fn(async () => ({
       support: "supported" as const,
       stats: {
@@ -205,7 +202,8 @@ describe("ArtifactStorageSettingsCard", () => {
       getArtifactStorageStats: getStats,
       scanArtifactStorage: scanStorage,
       reconcileArtifactStorage: vi.fn(),
-      cleanupArtifactStorage: cleanup
+      beginArtifactStorageCleanup: cleanup,
+      getArtifactStorageCleanup: vi.fn()
     } as unknown as AppController;
     const container = await render(controller);
 
@@ -213,15 +211,47 @@ describe("ArtifactStorageSettingsCard", () => {
     expect([...container.querySelectorAll("button")].find((candidate) => candidate.textContent === "Scan for cleanup")?.disabled).toBe(false);
     await clickButton(container, "Scan for cleanup");
     await act(async () => vi.waitFor(() => expect(scanStorage).toHaveBeenCalledWith([digest])));
-    await act(async () => vi.waitFor(() => expect(container.textContent).toContain("Confirm storage cleanup")));
-    expect(container.textContent).toContain("Confirm storage cleanup");
-    expect(container.textContent).toContain("Protected 1 references");
+    await act(async () => vi.waitFor(() => expect(document.body.textContent).toContain("Confirm storage cleanup")));
+    expect(document.body.textContent).toContain("Confirm storage cleanup");
+    expect(document.body.textContent).toContain("Protected 1 references");
     expect(cleanup).not.toHaveBeenCalled();
 
     await clickButton(container, "Clean up 11 B");
     await act(async () => vi.waitFor(() => expect(cleanup).toHaveBeenCalled()));
     expect(cleanup).toHaveBeenCalledWith("a".repeat(64), [digest]);
     expect(container.textContent).toContain("Cleanup completed");
+  });
+
+  it("recovers the durable cleanup ID when the begin reply is lost", async () => {
+    const token = "d".repeat(64);
+    const begin = vi.fn(async () => { throw new Error("reply lost"); });
+    const get = vi.fn(async () => ({ maintenanceId: token, status: "completed" as const,
+      phase: "reconciling" as const, percent: 100, updatedAt: Date.now(), result: {
+        expiredReferencesDeleted: 0, blobsRemoved: 1, temporaryFilesRemoved: 0, freedBytes: 8, skipped: 0
+      } }));
+    const controller = {
+      readDraft: vi.fn(async () => undefined),
+      readNewSessionDraft: vi.fn(async () => undefined),
+      getArtifactStorageStats: vi.fn(async () => ({ support: "supported" as const, stats: {
+        referenceCount: 0, uniqueBlobCount: 0, totalBytes: 0, cacheReferenceCount: 0,
+        cacheBytes: 0, temporaryFileCount: 0, temporaryBytes: 0
+      } })),
+      scanArtifactStorage: vi.fn(async () => ({ token, expiresAt: Date.now() + 60_000,
+        protectedReferenceCount: 0, expiredReferenceCount: 0, orphanBlobCount: 1,
+        orphanBlobBytes: 8, temporaryFileCount: 0, temporaryBytes: 0,
+        missingBlobCount: 0, unsafeEntryCount: 0, cleanableBytes: 8 })),
+      beginArtifactStorageCleanup: begin,
+      getArtifactStorageCleanup: get
+    } as unknown as AppController;
+    const container = await render(controller);
+    await act(async () => vi.waitFor(() => expect(controller.getArtifactStorageStats).toHaveBeenCalled()));
+    await clickButton(container, "Scan for cleanup");
+    await act(async () => vi.waitFor(() => expect(document.body.textContent).toContain("Confirm storage cleanup")));
+    await clickButton(container, "Clean up 8 B");
+    await act(async () => vi.waitFor(() => expect(container.textContent).toContain("Cleanup completed")));
+    expect(begin).toHaveBeenCalledWith(token, []);
+    expect(get).toHaveBeenCalledWith(token);
+    expect(window.sessionStorage.getItem("joko.artifact-storage.maintenance-id")).toBeNull();
   });
 });
 
@@ -241,8 +271,8 @@ async function render(
   return container;
 }
 
-async function clickButton(container: HTMLElement, label: string): Promise<void> {
-  const button = [...container.querySelectorAll("button")].find((candidate) => candidate.textContent === label);
+async function clickButton(_container: HTMLElement, label: string): Promise<void> {
+  const button = [...document.body.querySelectorAll("button")].find((candidate) => candidate.textContent === label);
   if (button === undefined) throw new Error(`Button not found: ${label}`);
   await act(async () => button.click());
 }

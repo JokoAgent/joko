@@ -56,6 +56,64 @@ export interface OperationalHistoryMaintenanceInspection {
   readonly estimatedHistoryBytes: number;
 }
 
+export type MaintenanceKind = "history" | "artifact";
+export type MaintenanceScanState = "available" | "claimed" | "expired";
+export type MaintenanceJobStatus =
+  | "running"
+  | "completed"
+  | "scan_expired"
+  | "storage_changed"
+  | "cancelled"
+  | "failed";
+export type MaintenanceEffectKind =
+  | "history_binding"
+  | "history_external"
+  | "artifact_blob"
+  | "artifact_temporary";
+export type MaintenanceEffectState =
+  | "pending"
+  | "claimed"
+  | "prepared"
+  | "quarantined"
+  | "completed"
+  | "skipped"
+  | "unknown";
+
+export interface MaintenanceScanRecord<T = unknown> {
+  readonly id: string;
+  readonly kind: MaintenanceKind;
+  readonly fingerprint?: string;
+  readonly state: MaintenanceScanState;
+  readonly payload: T;
+  readonly expiresAt: UnixMillis;
+  readonly createdAt: UnixMillis;
+  readonly updatedAt: UnixMillis;
+}
+
+export interface MaintenanceJobRecord<TPayload = unknown, TResult = unknown> {
+  readonly id: string;
+  readonly kind: MaintenanceKind;
+  readonly scanId: string;
+  readonly status: MaintenanceJobStatus;
+  readonly phase: string;
+  readonly percent: number;
+  readonly cancellable: boolean;
+  readonly cancelRequested: boolean;
+  readonly payload: TPayload;
+  readonly result?: TResult;
+  readonly createdAt: UnixMillis;
+  readonly updatedAt: UnixMillis;
+}
+
+export interface MaintenanceEffectRecord<T = unknown> {
+  readonly jobId: string;
+  readonly id: string;
+  readonly kind: MaintenanceEffectKind;
+  readonly state: MaintenanceEffectState;
+  readonly payload: T;
+  readonly updatedAt: UnixMillis;
+}
+
 export interface ConnectionRecord {
   readonly id: ConnectionId;
   readonly deviceId: string;

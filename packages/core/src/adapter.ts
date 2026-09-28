@@ -553,6 +553,16 @@ export interface BackendAdapter {
    * content into the new native session.
    */
   resetContext?(context: AdapterContext): Promise<NativeSessionBinding>;
+  /** Recover an idempotent reset whose native identity was durably reserved but
+   * whose Product binding has not yet been committed. Absence is authoritative
+   * only for Adapters that implement this hook. */
+  recoverResetContext?(context: AdapterContext): Promise<NativeSessionBinding | undefined>;
+  /** Remove an uncommitted reset replacement and its durable Adapter receipt.
+   * The operation must be idempotent for the exact operationId and binding. */
+  discardResetContext?(binding: NativeSessionBinding, context: AdapterContext): Promise<void>;
+  /** Retire the Adapter receipt after Product truth has adopted the replacement.
+   * The operation must be idempotent for the exact operationId and binding. */
+  finalizeResetContext?(binding: NativeSessionBinding, context: AdapterContext): Promise<void>;
   setName(name: string, context: AdapterContext): Promise<void>;
   getCommands(context: AdapterContext): Promise<readonly RuntimeCommand[]>;
   /** Observe the exact dynamic registry of a capability-compatible live runtime. */

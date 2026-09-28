@@ -173,7 +173,8 @@ service ArtifactService {
   rpc GetArtifactStorageStats(GetArtifactStorageStatsRequest) returns (GetArtifactStorageStatsResponse);
   rpc ScanArtifactStorage(ScanArtifactStorageRequest) returns (ScanArtifactStorageResponse);
   rpc ReconcileArtifactStorage(ReconcileArtifactStorageRequest) returns (ReconcileArtifactStorageResponse);
-  rpc CleanupArtifactStorage(CleanupArtifactStorageRequest) returns (CleanupArtifactStorageResponse);
+  rpc BeginArtifactStorageCleanup(BeginArtifactStorageCleanupRequest) returns (BeginArtifactStorageCleanupResponse);
+  rpc GetArtifactStorageCleanup(GetArtifactStorageCleanupRequest) returns (GetArtifactStorageCleanupResponse);
 }
 
 service HistoryMaintenanceService {
@@ -1641,16 +1642,26 @@ message ReconcileArtifactStorageResponse {
   ArtifactStorageReconcileResult result = 1;
 }
 
-message CleanupArtifactStorageRequest {
+message BeginArtifactStorageCleanupRequest {
   string scan_token = 1;
   repeated string protected_sha256 = 2;
 }
 
-enum ArtifactStorageCleanupOutcome {
-  ARTIFACT_STORAGE_CLEANUP_OUTCOME_UNSPECIFIED = 0;
-  ARTIFACT_STORAGE_CLEANUP_OUTCOME_COMPLETED = 1;
-  ARTIFACT_STORAGE_CLEANUP_OUTCOME_SCAN_EXPIRED = 2;
-  ARTIFACT_STORAGE_CLEANUP_OUTCOME_STORAGE_CHANGED = 3;
+enum ArtifactStorageCleanupStatus {
+  ARTIFACT_STORAGE_CLEANUP_STATUS_UNSPECIFIED = 0;
+  ARTIFACT_STORAGE_CLEANUP_STATUS_RUNNING = 1;
+  ARTIFACT_STORAGE_CLEANUP_STATUS_COMPLETED = 2;
+  ARTIFACT_STORAGE_CLEANUP_STATUS_SCAN_EXPIRED = 3;
+  ARTIFACT_STORAGE_CLEANUP_STATUS_STORAGE_CHANGED = 4;
+  ARTIFACT_STORAGE_CLEANUP_STATUS_FAILED = 5;
+}
+
+enum ArtifactStorageCleanupPhase {
+  ARTIFACT_STORAGE_CLEANUP_PHASE_UNSPECIFIED = 0;
+  ARTIFACT_STORAGE_CLEANUP_PHASE_PREPARING = 1;
+  ARTIFACT_STORAGE_CLEANUP_PHASE_QUARANTINING = 2;
+  ARTIFACT_STORAGE_CLEANUP_PHASE_DELETING = 3;
+  ARTIFACT_STORAGE_CLEANUP_PHASE_RECONCILING = 4;
 }
 
 message ArtifactStorageCleanupResult {
@@ -1661,9 +1672,25 @@ message ArtifactStorageCleanupResult {
   uint64 skipped = 5;
 }
 
-message CleanupArtifactStorageResponse {
-  ArtifactStorageCleanupOutcome outcome = 1;
-  ArtifactStorageCleanupResult result = 2;
+message ArtifactStorageCleanupProgress {
+  string maintenance_id = 1;
+  ArtifactStorageCleanupStatus status = 2;
+  ArtifactStorageCleanupPhase phase = 3;
+  uint32 percent = 4;
+  google.protobuf.Timestamp updated_at = 5;
+  ArtifactStorageCleanupResult result = 6;
+}
+
+message BeginArtifactStorageCleanupResponse {
+  ArtifactStorageCleanupProgress progress = 1;
+}
+
+message GetArtifactStorageCleanupRequest {
+  string maintenance_id = 1;
+}
+
+message GetArtifactStorageCleanupResponse {
+  ArtifactStorageCleanupProgress progress = 1;
 }
 
 enum TaskHistoryRetention {

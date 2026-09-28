@@ -1854,6 +1854,62 @@ CREATE UNIQUE INDEX session_worktrees_remote_manifest_idx
         ON session_worktrees(remote_target_id, remote_manifest_id)
         WHERE remote_manifest_id IS NOT NULL;
 
+CREATE TABLE maintenance_scans (
+        id TEXT PRIMARY KEY CHECK (length(trim(id)) BETWEEN 1 AND 256),
+        kind TEXT NOT NULL CHECK (kind IN ('history', 'artifact')),
+        fingerprint TEXT,
+        state TEXT NOT NULL CHECK (state IN ('available', 'claimed', 'expired')),
+        payload_json TEXT NOT NULL,
+        expires_at INTEGER NOT NULL CHECK (expires_at >= 0),
+        created_at INTEGER NOT NULL CHECK (created_at >= 0),
+        updated_at INTEGER NOT NULL CHECK (updated_at >= created_at),
+        CHECK (fingerprint IS NULL OR length(trim(fingerprint)) BETWEEN 1 AND 256)
+      ) STRICT;
+
+CREATE INDEX maintenance_scans_expiry_idx
+        ON maintenance_scans(kind, state, expires_at);
+
+CREATE TABLE maintenance_jobs (
+        id TEXT PRIMARY KEY CHECK (length(trim(id)) BETWEEN 1 AND 256),
+        kind TEXT NOT NULL CHECK (kind IN ('history', 'artifact')),
+        scan_id TEXT NOT NULL REFERENCES maintenance_scans(id) ON DELETE RESTRICT,
+        status TEXT NOT NULL CHECK (status IN (
+          'running', 'completed', 'scan_expired', 'storage_changed', 'cancelled', 'failed'
+        )),
+        phase TEXT NOT NULL CHECK (length(trim(phase)) BETWEEN 1 AND 64),
+        percent INTEGER NOT NULL CHECK (percent BETWEEN 0 AND 100),
+        cancellable INTEGER NOT NULL CHECK (cancellable IN (0, 1)),
+        cancel_requested INTEGER NOT NULL CHECK (cancel_requested IN (0, 1)),
+        payload_json TEXT NOT NULL,
+        result_json TEXT,
+        created_at INTEGER NOT NULL CHECK (created_at >= 0),
+        updated_at INTEGER NOT NULL CHECK (updated_at >= created_at),
+        UNIQUE(kind, scan_id)
+      ) STRICT;
+
+CREATE UNIQUE INDEX maintenance_one_running_job_idx
+        ON maintenance_jobs(status) WHERE status = 'running';
+
+CREATE INDEX maintenance_jobs_kind_updated_idx
+        ON maintenance_jobs(kind, updated_at DESC, id);
+
+CREATE TABLE maintenance_effects (
+        job_id TEXT NOT NULL REFERENCES maintenance_jobs(id) ON DELETE CASCADE,
+        id TEXT NOT NULL CHECK (length(trim(id)) BETWEEN 1 AND 256),
+        kind TEXT NOT NULL CHECK (kind IN (
+          'history_binding', 'history_external', 'artifact_blob', 'artifact_temporary'
+        )),
+        state TEXT NOT NULL CHECK (state IN (
+          'pending', 'claimed', 'prepared', 'quarantined', 'completed', 'skipped', 'unknown'
+        )),
+        payload_json TEXT NOT NULL,
+        updated_at INTEGER NOT NULL CHECK (updated_at >= 0),
+        PRIMARY KEY(job_id, id)
+      ) STRICT;
+
+CREATE INDEX maintenance_effects_state_idx
+        ON maintenance_effects(job_id, state, id);
+
 CREATE TABLE settings (
         scope_type TEXT NOT NULL CHECK (scope_type IN ('service', 'connection', 'backend', 'target', 'session')),
         scope_id TEXT NOT NULL,

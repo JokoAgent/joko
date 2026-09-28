@@ -15,6 +15,7 @@ import {
   LanDiscoveryService,
   DurableWorkspaceRunCapture,
   HistoryMaintenance,
+  cleanHistoryMaintenanceCopy,
   OperationalWorkspaceSnapshotRepository,
   OperationalArtifactRepository,
   DurableReviewEvidenceProvider,
@@ -300,9 +301,16 @@ export class OrchestratorE2eFixture {
       store,
       activeSessions: {
         prepare: (sessionIds) => sessionHost.prepareHistoryMaintenanceBindings(sessionIds),
+        recover: (request) => sessionHost.recoverHistoryMaintenanceBinding(request),
+        discard: (replacements) => sessionHost.discardHistoryMaintenanceBindings(replacements),
+        finalize: (replacements) => sessionHost.finalizeHistoryMaintenanceBindings(replacements),
         release: (sessionIds) => sessionHost.releaseHistoryMaintenanceSessions(sessionIds)
       },
-      externalRecords: workspaceChanges
+      externalRecords: workspaceChanges,
+      workDatabase: async (input, controls) => cleanHistoryMaintenanceCopy(input, (phase, percent) => {
+        controls?.signal?.throwIfAborted();
+        controls?.onProgress?.(phase, percent);
+      })
     });
     const targets = new Map<string, string>();
     for (const factory of factories) {
@@ -317,6 +325,7 @@ export class OrchestratorE2eFixture {
         trusted: true
       }, { workspaceId: "workspace-main" });
     }
+    await historyMaintenance.initialize();
     const scheduler = new ScheduleCoordinator(store, sessionHost, { tickMs: 25 });
     scheduler.start();
 
@@ -436,6 +445,8 @@ export class OrchestratorE2eFixture {
         // Keep native transports and remote dependencies alive until exact
         // current and retained process cleanup has settled.
         await attempt(() => options.terminals?.dispose());
+        await attempt(() => artifactMaintenance.close());
+        await attempt(() => historyMaintenance.close());
         await attempt(() => sessionHost.dispose());
         await attempt(() => backendInstances.disposeRetainedCleanups());
         await attempt(() => auxiliaryServices?.mcpRouter?.dispose());

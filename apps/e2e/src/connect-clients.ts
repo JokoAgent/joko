@@ -9,6 +9,7 @@ import {
   ContactService,
   DevicePeerService,
   EventService,
+  HistoryMaintenanceService,
   ExtensionService,
   InteractionService,
   MessagingService,
@@ -53,6 +54,7 @@ export interface E2eClients {
   readonly messaging: Client<typeof MessagingService>;
   readonly workspace: Client<typeof WorkspaceContractService>;
   readonly artifact: Client<typeof ArtifactService>;
+  readonly historyMaintenance: Client<typeof HistoryMaintenanceService>;
   readonly tool: Client<typeof ToolService>;
   readonly voiceInput: Client<typeof VoiceInputService>;
   readonly browser: Client<typeof BrowserService>;
@@ -105,6 +107,7 @@ export function createE2eClients(baseUrl: string, authKey?: string, timeoutMs = 
     messaging: createClient(MessagingService, transport),
     workspace: createClient(WorkspaceContractService, transport),
     artifact: createClient(ArtifactService, transport),
+    historyMaintenance: createClient(HistoryMaintenanceService, transport),
     tool: createClient(ToolService, transport),
     voiceInput: createClient(VoiceInputService, transport),
     browser: createClient(BrowserService, transport),

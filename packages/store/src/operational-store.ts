@@ -142,6 +142,13 @@ import type {
   LocalRuntimeOwnerRecord,
   LocalRuntimeOwnerScope,
   LocalRuntimeProviderBindingRecord,
+  MaintenanceEffectKind,
+  MaintenanceEffectRecord,
+  MaintenanceEffectState,
+  MaintenanceJobRecord,
+  MaintenanceJobStatus,
+  MaintenanceKind,
+  MaintenanceScanRecord,
   MakerMemoryEntry,
   MakerMemoryKind,
   MakerMemorySearchHit,
@@ -805,6 +812,263 @@ export class OperationalStore {
     };
   }
 
+  createMaintenanceScan<T>(input: {
+    readonly id: string;
+    readonly kind: MaintenanceKind;
+    readonly fingerprint?: string;
+    readonly payload: T;
+    readonly expiresAt: number;
+    readonly createdAt?: number;
+  }): MaintenanceScanRecord<T> {
+    const id = maintenanceIdentity(input.id, "Maintenance scan ID");
+    const kind = maintenanceKind(input.kind);
+    const fingerprint = input.fingerprint === undefined
+      ? undefined
+      : maintenanceIdentity(input.fingerprint, "Maintenance scan fingerprint");
+    const createdAt = safeNonNegativeInteger(input.createdAt ?? this.now(), "Maintenance scan creation time");
+    const expiresAt = safeNonNegativeInteger(input.expiresAt, "Maintenance scan expiration time");
+    if (expiresAt <= createdAt) throw new StoreError("Maintenance scan expiration must follow creation.");
+    return this.write(() => {
+      this.database.prepare(`
+        INSERT INTO maintenance_scans(
+          id, kind, fingerprint, state, payload_json, expires_at, created_at, updated_at
+        ) VALUES (?, ?, ?, 'available', ?, ?, ?, ?)
+      `).run(
+        id,
+        kind,
+        fingerprint ?? null,
+        serializeJson(input.payload),
+        expiresAt,
+        createdAt,
+        createdAt
+      );
+      return this.getMaintenanceScan<T>(kind, id);
+    });
+  }
+
+  getMaintenanceScan<T = unknown>(kind: MaintenanceKind, id: string): MaintenanceScanRecord<T> {
+    const record = this.findMaintenanceScan<T>(kind, id);
+    if (record === undefined) throw new NotFoundError("Maintenance scan", id);
+    return record;
+  }
+
+  findMaintenanceScan<T = unknown>(kind: MaintenanceKind, id: string): MaintenanceScanRecord<T> | undefined {
+    this.assertOpen();
+    const row = this.database.prepare(`
+      SELECT * FROM maintenance_scans WHERE kind = ? AND id = ?
+    `).get(maintenanceKind(kind), maintenanceIdentity(id, "Maintenance scan ID")) as Row | undefined;
+    return row === undefined ? undefined : maintenanceScanFromRow<T>(row);
+  }
+
+  claimMaintenanceScan<T = unknown>(kind: MaintenanceKind, id: string, at = this.now()): MaintenanceScanRecord<T> | undefined {
+    const normalizedKind = maintenanceKind(kind);
+    const normalizedId = maintenanceIdentity(id, "Maintenance scan ID");
+    const claimedAt = safeNonNegativeInteger(at, "Maintenance scan claim time");
+    return this.write(() => {
+      const current = this.findMaintenanceScan<T>(normalizedKind, normalizedId);
+      if (current === undefined) return undefined;
+      if (current.state === "claimed") return current;
+      if (current.state !== "available" || current.expiresAt <= claimedAt) {
+        this.database.prepare(`
+          UPDATE maintenance_scans SET state = 'expired', updated_at = ?
+          WHERE kind = ? AND id = ? AND state = 'available'
+        `).run(claimedAt, normalizedKind, normalizedId);
+        return undefined;
+      }
+      this.database.prepare(`
+        UPDATE maintenance_scans SET state = 'claimed', updated_at = ?
+        WHERE kind = ? AND id = ? AND state = 'available'
+      `).run(claimedAt, normalizedKind, normalizedId);
+      return this.getMaintenanceScan<T>(normalizedKind, normalizedId);
+    });
+  }
+
+  createMaintenanceJob<TPayload, TResult = unknown>(input: {
+    readonly id: string;
+    readonly kind: MaintenanceKind;
+    readonly scanId: string;
+    readonly phase: string;
+    readonly percent: number;
+    readonly cancellable: boolean;
+    readonly payload: TPayload;
+    readonly effects?: readonly {
+      readonly id: string;
+      readonly kind: MaintenanceEffectKind;
+      readonly state?: MaintenanceEffectState;
+      readonly payload: unknown;
+    }[];
+    readonly createdAt?: number;
+  }): MaintenanceJobRecord<TPayload, TResult> {
+    const id = maintenanceIdentity(input.id, "Maintenance job ID");
+    const kind = maintenanceKind(input.kind);
+    const scanId = maintenanceIdentity(input.scanId, "Maintenance scan ID");
+    const phase = maintenancePhase(input.phase);
+    const percent = maintenancePercent(input.percent);
+    const createdAt = safeNonNegativeInteger(input.createdAt ?? this.now(), "Maintenance job creation time");
+    return this.write(() => {
+      const scan = this.getMaintenanceScan(kind, scanId);
+      if (scan.state !== "claimed") throw new StoreError("Maintenance job requires a claimed scan.");
+      this.database.prepare(`
+        INSERT INTO maintenance_jobs(
+          id, kind, scan_id, status, phase, percent, cancellable, cancel_requested,
+          payload_json, result_json, created_at, updated_at
+        ) VALUES (?, ?, ?, 'running', ?, ?, ?, 0, ?, NULL, ?, ?)
+      `).run(
+        id,
+        kind,
+        scanId,
+        phase,
+        percent,
+        input.cancellable ? 1 : 0,
+        serializeJson(input.payload),
+        createdAt,
+        createdAt
+      );
+      for (const effect of input.effects ?? []) {
+        this.database.prepare(`
+          INSERT INTO maintenance_effects(job_id, id, kind, state, payload_json, updated_at)
+          VALUES (?, ?, ?, ?, ?, ?)
+        `).run(
+          id,
+          maintenanceIdentity(effect.id, "Maintenance effect ID"),
+          maintenanceEffectKind(effect.kind),
+          maintenanceEffectState(effect.state ?? "pending"),
+          serializeJson(effect.payload),
+          createdAt
+        );
+      }
+      return this.getMaintenanceJob<TPayload, TResult>(kind, id);
+    });
+  }
+
+  getMaintenanceJob<TPayload = unknown, TResult = unknown>(
+    kind: MaintenanceKind,
+    id: string
+  ): MaintenanceJobRecord<TPayload, TResult> {
+    const record = this.findMaintenanceJob<TPayload, TResult>(kind, id);
+    if (record === undefined) throw new NotFoundError("Maintenance job", id);
+    return record;
+  }
+
+  findMaintenanceJob<TPayload = unknown, TResult = unknown>(
+    kind: MaintenanceKind,
+    id: string
+  ): MaintenanceJobRecord<TPayload, TResult> | undefined {
+    this.assertOpen();
+    const row = this.database.prepare(`
+      SELECT * FROM maintenance_jobs WHERE kind = ? AND id = ?
+    `).get(maintenanceKind(kind), maintenanceIdentity(id, "Maintenance job ID")) as Row | undefined;
+    return row === undefined ? undefined : maintenanceJobFromRow<TPayload, TResult>(row);
+  }
+
+  listMaintenanceJobs<TPayload = unknown, TResult = unknown>(input: {
+    readonly kind: MaintenanceKind;
+    readonly statuses?: readonly MaintenanceJobStatus[];
+    readonly limit?: number;
+  }): MaintenanceJobRecord<TPayload, TResult>[] {
+    this.assertOpen();
+    const kind = maintenanceKind(input.kind);
+    const statuses = input.statuses?.map(maintenanceJobStatus);
+    if (statuses?.length === 0) return [];
+    const limit = boundedLimit(input.limit ?? 32, 1, 256, "Maintenance job limit");
+    const where = statuses === undefined ? "kind = ?" : `kind = ? AND status IN (${statuses.map(() => "?").join(", ")})`;
+    return (this.database.prepare(`
+      SELECT * FROM maintenance_jobs WHERE ${where}
+      ORDER BY updated_at DESC, id LIMIT ?
+    `).all(kind, ...(statuses ?? []), limit) as Row[]).map(maintenanceJobFromRow<TPayload, TResult>);
+  }
+
+  updateMaintenanceJob<TPayload = unknown, TResult = unknown>(input: {
+    readonly kind: MaintenanceKind;
+    readonly id: string;
+    readonly status: MaintenanceJobStatus;
+    readonly phase: string;
+    readonly percent: number;
+    readonly cancellable: boolean;
+    readonly cancelRequested: boolean;
+    readonly payload: TPayload;
+    readonly result?: TResult;
+    readonly updatedAt?: number;
+  }): MaintenanceJobRecord<TPayload, TResult> {
+    const kind = maintenanceKind(input.kind);
+    const id = maintenanceIdentity(input.id, "Maintenance job ID");
+    const status = maintenanceJobStatus(input.status);
+    const phase = maintenancePhase(input.phase);
+    const percent = maintenancePercent(input.percent);
+    const updatedAt = safeNonNegativeInteger(input.updatedAt ?? this.now(), "Maintenance job update time");
+    return this.maintenanceWrite(() => {
+      const current = this.getMaintenanceJob(kind, id);
+      if (updatedAt < current.createdAt) throw new StoreError("Maintenance job update precedes creation.");
+      this.database.prepare(`
+        UPDATE maintenance_jobs
+        SET status = ?, phase = ?, percent = ?, cancellable = ?, cancel_requested = ?,
+            payload_json = ?, result_json = ?, updated_at = ?
+        WHERE kind = ? AND id = ?
+      `).run(
+        status,
+        phase,
+        percent,
+        input.cancellable ? 1 : 0,
+        input.cancelRequested ? 1 : 0,
+        serializeJson(input.payload),
+        input.result === undefined ? null : serializeJson(input.result),
+        updatedAt,
+        kind,
+        id
+      );
+      return this.getMaintenanceJob<TPayload, TResult>(kind, id);
+    });
+  }
+
+  requestMaintenanceCancellation(kind: MaintenanceKind, id: string, at = this.now()): MaintenanceJobRecord {
+    const normalizedKind = maintenanceKind(kind);
+    const normalizedId = maintenanceIdentity(id, "Maintenance job ID");
+    const updatedAt = safeNonNegativeInteger(at, "Maintenance cancellation time");
+    return this.maintenanceWrite(() => {
+      this.getMaintenanceJob(normalizedKind, normalizedId);
+      this.database.prepare(`
+        UPDATE maintenance_jobs SET cancel_requested = 1, updated_at = ?
+        WHERE kind = ? AND id = ? AND status = 'running' AND cancellable = 1
+      `).run(updatedAt, normalizedKind, normalizedId);
+      return this.getMaintenanceJob(normalizedKind, normalizedId);
+    });
+  }
+
+  listMaintenanceEffects<T = unknown>(jobId: string): MaintenanceEffectRecord<T>[] {
+    this.assertOpen();
+    const id = maintenanceIdentity(jobId, "Maintenance job ID");
+    return (this.database.prepare(`
+      SELECT * FROM maintenance_effects WHERE job_id = ? ORDER BY id
+    `).all(id) as Row[]).map(maintenanceEffectFromRow<T>);
+  }
+
+  updateMaintenanceEffect<T>(input: {
+    readonly jobId: string;
+    readonly id: string;
+    readonly state: MaintenanceEffectState;
+    readonly payload: T;
+    readonly updatedAt?: number;
+  }): MaintenanceEffectRecord<T> {
+    const jobId = maintenanceIdentity(input.jobId, "Maintenance job ID");
+    const id = maintenanceIdentity(input.id, "Maintenance effect ID");
+    const state = maintenanceEffectState(input.state);
+    const updatedAt = safeNonNegativeInteger(input.updatedAt ?? this.now(), "Maintenance effect update time");
+    return this.maintenanceWrite(() => {
+      const current = this.database.prepare(`
+        SELECT * FROM maintenance_effects WHERE job_id = ? AND id = ?
+      `).get(jobId, id) as Row | undefined;
+      if (current === undefined) throw new NotFoundError("Maintenance effect", id);
+      this.database.prepare(`
+        UPDATE maintenance_effects SET state = ?, payload_json = ?, updated_at = ?
+        WHERE job_id = ? AND id = ?
+      `).run(state, serializeJson(input.payload), updatedAt, jobId, id);
+      const row = this.database.prepare(`
+        SELECT * FROM maintenance_effects WHERE job_id = ? AND id = ?
+      `).get(jobId, id) as Row;
+      return maintenanceEffectFromRow<T>(row);
+    });
+  }
+
   async createHistoryMaintenanceCopy(input: {
     readonly workingPath: string;
     readonly expectedRevision: bigint;
@@ -826,6 +1090,65 @@ export class OperationalStore {
     if (this.readRevision() === input.expectedRevision) return true;
     rmSync(paths.work, { force: true });
     return false;
+  }
+
+  prepareHistoryMaintenanceCopyReceipt<TPayload>(input: {
+    readonly workingPath: string;
+    readonly jobId: string;
+    readonly phase: string;
+    readonly percent: number;
+    readonly payload: TPayload;
+    readonly effectUpdates?: readonly {
+      readonly id: string;
+      readonly state: MaintenanceEffectState;
+      readonly payload: unknown;
+    }[];
+    readonly updatedAt?: number;
+  }): void {
+    this.assertOpen();
+    if (this.filePath === ":memory:" || this.filePath.startsWith("file:")) {
+      throw new StoreError("History maintenance requires a file-backed operational store.");
+    }
+    const paths = historyMaintenancePaths(path.resolve(this.filePath));
+    if (path.resolve(input.workingPath) !== paths.work) {
+      throw new StoreError("History maintenance working copy is outside the managed database boundary.");
+    }
+    const jobId = maintenanceIdentity(input.jobId, "Maintenance job ID");
+    const phase = maintenancePhase(input.phase);
+    const percent = maintenancePercent(input.percent);
+    const updatedAt = safeNonNegativeInteger(input.updatedAt ?? this.now(), "Maintenance receipt update time");
+    const database = new DatabaseSync(paths.work);
+    try {
+      database.exec("PRAGMA foreign_keys = ON; PRAGMA journal_mode = DELETE; PRAGMA synchronous = FULL");
+      database.exec("BEGIN IMMEDIATE");
+      const changed = database.prepare(`
+        UPDATE maintenance_jobs
+        SET status = 'running', phase = ?, percent = ?, cancellable = 0,
+            payload_json = ?, updated_at = ?
+        WHERE kind = 'history' AND id = ? AND status = 'running'
+      `).run(phase, percent, serializeJson(input.payload), updatedAt, jobId).changes;
+      if (changed !== 1) throw new StoreError("History maintenance working copy lacks its durable job receipt.");
+      for (const effect of input.effectUpdates ?? []) {
+        const effectChanged = database.prepare(`
+          UPDATE maintenance_effects SET state = ?, payload_json = ?, updated_at = ?
+          WHERE job_id = ? AND id = ?
+        `).run(
+          maintenanceEffectState(effect.state),
+          serializeJson(effect.payload),
+          updatedAt,
+          jobId,
+          maintenanceIdentity(effect.id, "Maintenance effect ID")
+        ).changes;
+        if (effectChanged !== 1) throw new StoreError("History maintenance working copy lacks an effect receipt.");
+      }
+      database.exec("COMMIT");
+      verifyOpenOperationalDatabase(database);
+    } catch (error) {
+      try { database.exec("ROLLBACK"); } catch { /* The receipt transaction may already be closed. */ }
+      throw error;
+    } finally {
+      database.close();
+    }
   }
 
   /**
@@ -15637,6 +15960,25 @@ export class OperationalStore {
     return this.transactionFrames.length === 0 ? this.transaction(callback) : callback();
   }
 
+  /** Maintenance progress and effect receipts must survive a process loss, but
+   * they are not product data revisions. Keeping these updates outside the
+   * global revision lets an online database copy retain its original product
+   * fence while progress is reported from the owning process. */
+  private maintenanceWrite<T>(callback: () => T): T {
+    this.assertOpen();
+    if (this.transactionFrames.length !== 0) return callback();
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const result = callback();
+      if (isPromiseLike(result)) throw new AsyncTransactionError();
+      this.database.exec("COMMIT");
+      return result;
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
   /**
    * Converts one cumulative native observation into an additive, attributed
    * delta. Each capability-neutral source cursor is deliberately independent
@@ -20599,6 +20941,115 @@ function messagingBoundedInteger(value: number, minimum: number, maximum: number
     throw new StoreError(`Messaging ${label} must be an integer between ${minimum} and ${maximum}.`);
   }
   return value;
+}
+
+function maintenanceIdentity(value: string, label: string): string {
+  if (
+    typeof value !== "string"
+    || value.trim() !== value
+    || value.length < 1
+    || value.length > 256
+    || /[\u0000\r\n]/u.test(value)
+  ) throw new StoreError(`${label} is invalid.`);
+  return value;
+}
+
+function maintenanceKind(value: MaintenanceKind): MaintenanceKind {
+  if (value !== "history" && value !== "artifact") throw new StoreError("Maintenance kind is invalid.");
+  return value;
+}
+
+function maintenanceJobStatus(value: MaintenanceJobStatus): MaintenanceJobStatus {
+  if (!["running", "completed", "scan_expired", "storage_changed", "cancelled", "failed"].includes(value)) {
+    throw new StoreError("Maintenance job status is invalid.");
+  }
+  return value;
+}
+
+function maintenanceEffectKind(value: MaintenanceEffectKind): MaintenanceEffectKind {
+  if (!["history_binding", "history_external", "artifact_blob", "artifact_temporary"].includes(value)) {
+    throw new StoreError("Maintenance effect kind is invalid.");
+  }
+  return value;
+}
+
+function maintenanceEffectState(value: MaintenanceEffectState): MaintenanceEffectState {
+  if (!["pending", "claimed", "prepared", "quarantined", "completed", "skipped", "unknown"].includes(value)) {
+    throw new StoreError("Maintenance effect state is invalid.");
+  }
+  return value;
+}
+
+function maintenancePhase(value: string): string {
+  if (
+    typeof value !== "string"
+    || value.trim() !== value
+    || value.length < 1
+    || value.length > 64
+    || /[\u0000\r\n]/u.test(value)
+  ) throw new StoreError("Maintenance phase is invalid.");
+  return value;
+}
+
+function maintenancePercent(value: number): number {
+  if (!Number.isSafeInteger(value) || value < 0 || value > 100) {
+    throw new StoreError("Maintenance progress must be an integer between 0 and 100.");
+  }
+  return value;
+}
+
+function maintenanceScanFromRow<T>(row: Row): MaintenanceScanRecord<T> {
+  const fingerprint = row["fingerprint"];
+  return {
+    id: maintenanceIdentity(stringValue(row["id"]), "Maintenance scan ID"),
+    kind: maintenanceKind(enumValue(row["kind"], ["history", "artifact"] as const)),
+    ...(fingerprint === null || fingerprint === undefined
+      ? {}
+      : { fingerprint: maintenanceIdentity(stringValue(fingerprint), "Maintenance scan fingerprint") }),
+    state: enumValue(row["state"], ["available", "claimed", "expired"] as const),
+    payload: parseJson<T>(stringValue(row["payload_json"])),
+    expiresAt: numberValue(row["expires_at"]),
+    createdAt: numberValue(row["created_at"]),
+    updatedAt: numberValue(row["updated_at"])
+  };
+}
+
+function maintenanceJobFromRow<TPayload, TResult>(row: Row): MaintenanceJobRecord<TPayload, TResult> {
+  const result = row["result_json"];
+  return {
+    id: maintenanceIdentity(stringValue(row["id"]), "Maintenance job ID"),
+    kind: maintenanceKind(enumValue(row["kind"], ["history", "artifact"] as const)),
+    scanId: maintenanceIdentity(stringValue(row["scan_id"]), "Maintenance scan ID"),
+    status: maintenanceJobStatus(enumValue(
+      row["status"],
+      ["running", "completed", "scan_expired", "storage_changed", "cancelled", "failed"] as const
+    )),
+    phase: maintenancePhase(stringValue(row["phase"])),
+    percent: maintenancePercent(numberValue(row["percent"])),
+    cancellable: booleanValue(row["cancellable"]),
+    cancelRequested: booleanValue(row["cancel_requested"]),
+    payload: parseJson<TPayload>(stringValue(row["payload_json"])),
+    ...(result === null || result === undefined ? {} : { result: parseJson<TResult>(stringValue(result)) }),
+    createdAt: numberValue(row["created_at"]),
+    updatedAt: numberValue(row["updated_at"])
+  };
+}
+
+function maintenanceEffectFromRow<T>(row: Row): MaintenanceEffectRecord<T> {
+  return {
+    jobId: maintenanceIdentity(stringValue(row["job_id"]), "Maintenance job ID"),
+    id: maintenanceIdentity(stringValue(row["id"]), "Maintenance effect ID"),
+    kind: maintenanceEffectKind(enumValue(
+      row["kind"],
+      ["history_binding", "history_external", "artifact_blob", "artifact_temporary"] as const
+    )),
+    state: maintenanceEffectState(enumValue(
+      row["state"],
+      ["pending", "claimed", "prepared", "quarantined", "completed", "skipped", "unknown"] as const
+    )),
+    payload: parseJson<T>(stringValue(row["payload_json"])),
+    updatedAt: numberValue(row["updated_at"])
+  };
 }
 
 function boundedLimit(value: number, minimum: number, maximum: number, label: string): number {

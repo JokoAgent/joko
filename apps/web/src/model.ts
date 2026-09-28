@@ -154,16 +154,22 @@ export interface ArtifactStorageReconcileView {
   readonly unsafeEntryCount: number;
 }
 
-export type ArtifactStorageCleanupView =
-  | { readonly outcome: "scanExpired" | "storageChanged" }
-  | {
-      readonly outcome: "completed";
+export interface ArtifactStorageCleanupResultView {
       readonly expiredReferencesDeleted: number;
       readonly blobsRemoved: number;
       readonly temporaryFilesRemoved: number;
       readonly freedBytes: number;
       readonly skipped: number;
-    };
+}
+
+export interface ArtifactStorageCleanupView {
+  readonly maintenanceId: string;
+  readonly status: "running" | "completed" | "scanExpired" | "storageChanged" | "failed";
+  readonly phase: "preparing" | "quarantining" | "deleting" | "reconciling";
+  readonly percent: number;
+  readonly updatedAt: number;
+  readonly result?: ArtifactStorageCleanupResultView;
+}
 
 export type TaskHistoryRetentionView = "7-days" | "1-month" | "3-months" | "6-months";
 
@@ -5505,7 +5511,8 @@ export interface OperationApi {
   readSessionArtifact(sessionId: string, artifactId: string, signal: AbortSignal): Promise<ArtifactView>;
   scanArtifactStorage(protectedSha256?: readonly string[]): Promise<ArtifactStorageScanView>;
   reconcileArtifactStorage(protectedSha256?: readonly string[]): Promise<ArtifactStorageReconcileView>;
-  cleanupArtifactStorage(scanToken: string, protectedSha256?: readonly string[]): Promise<ArtifactStorageCleanupView>;
+  beginArtifactStorageCleanup(scanToken: string, protectedSha256?: readonly string[]): Promise<ArtifactStorageCleanupView>;
+  getArtifactStorageCleanup(maintenanceId: string): Promise<ArtifactStorageCleanupView>;
   getTaskHistoryMaintenanceSupport(): Promise<TaskHistoryMaintenanceSupportView>;
   scanTaskHistory(retention: TaskHistoryRetentionView, includeActiveTasks: boolean): Promise<TaskHistoryScanView>;
   beginTaskHistoryCleanup(scanId: string, backupEnabled: boolean): Promise<TaskHistoryCleanupProgressView>;

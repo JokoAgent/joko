@@ -3775,6 +3775,76 @@ describe("PiBackendAdapter", () => {
     await adapter.dispose();
   });
 
+  it("recovers and retires durable native reset receipts without starting a runtime", async () => {
+    const agentHome = await mkdtemp(join(tmpdir(), "joko-pi-context-reset-receipt-home-"));
+    const workspaceRoot = await mkdtemp(join(tmpdir(), "joko-pi-context-reset-receipt-workspace-"));
+    const sessionsRoot = join(agentHome, "sessions");
+    const receiptRoot = join(agentHome, "maintenance", "reset-context");
+    await mkdir(sessionsRoot, { recursive: true });
+    await mkdir(receiptRoot, { recursive: true });
+    const adapter = createPiAdapter({
+      agentHome,
+      sessionRoot: agentHome,
+      versionProbe: async () => "pi 99.99.99-context-reset-receipt-test"
+    });
+    const target: TargetDescriptor = {
+      id: "target-context-reset-receipt",
+      backendId: "pi",
+      displayName: "Context reset receipt",
+      workspaceRoot,
+      managed: true,
+      trusted: true
+    };
+    const source: NativeSessionBinding = {
+      opaqueRef: join(sessionsRoot, "source.jsonl"),
+      nativeSessionId: "source-native",
+      generation: 4
+    };
+    const operationId = "history-reset-receipt-operation";
+    const context: AdapterContext = { ...makeContext(target, []), generation: 4, binding: source, operationId };
+    const writeReceipt = async (name: string, nativeSessionId: string): Promise<NativeSessionBinding> => {
+      const replacement: NativeSessionBinding = {
+        opaqueRef: join(sessionsRoot, `${name}.jsonl`),
+        nativeSessionId,
+        generation: 5
+      };
+      await writeFile(replacement.opaqueRef, `${JSON.stringify({
+        type: "session",
+        version: 3,
+        id: nativeSessionId,
+        timestamp: new Date().toISOString(),
+        cwd: workspaceRoot
+      })}\n`, { mode: 0o600 });
+      await writeFile(join(
+        receiptRoot,
+        `${createHash("sha256").update(operationId).digest("hex")}.json`
+      ), `${JSON.stringify({
+        version: 1,
+        operationId,
+        sessionId: context.sessionId,
+        targetId: target.id,
+        source,
+        replacement
+      })}\n`, { mode: 0o600 });
+      return replacement;
+    };
+
+    const adopted = await writeReceipt("adopted", "adopted-native");
+    await expect(adapter.recoverResetContext!(context)).resolves.toEqual(adopted);
+    await adapter.finalizeResetContext!(adopted, context);
+    await expect(access(adopted.opaqueRef)).resolves.toBeUndefined();
+    await expect(access(join(
+      receiptRoot,
+      `${createHash("sha256").update(operationId).digest("hex")}.json`
+    ))).rejects.toMatchObject({ code: "ENOENT" });
+
+    const discarded = await writeReceipt("discarded", "discarded-native");
+    await adapter.discardResetContext!(discarded, context);
+    await expect(access(discarded.opaqueRef)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(adapter.recoverResetContext!(context)).resolves.toBeUndefined();
+    await adapter.dispose();
+  });
+
   it("projects each model's Pi thinking metadata without leaking the current model's RPC levels", async () => {
     const agentHome = await mkdtemp(join(tmpdir(), "joko-pi-thinking-levels-home-"));
     const workspace = await mkdtemp(join(tmpdir(), "joko-pi-thinking-levels-workspace-"));

@@ -2827,15 +2827,31 @@ export class SessionHost {
    * that hides every prior projection. Native I/O completes before Store truth
    * changes, so uncertain failures never expose a half-cleared Product Session.
    */
-  async prepareHistoryMaintenanceBindings(sessionIds: readonly string[]): Promise<readonly {
+  async prepareHistoryMaintenanceBindings(requests: readonly {
     readonly sessionId: string;
+    readonly operationId: string;
+    readonly source: NativeSessionBinding;
+  }[]): Promise<readonly {
+    readonly sessionId: string;
+    readonly operationId: string;
     readonly source: NativeSessionBinding;
     readonly replacement: NativeSessionBinding;
   }[]> {
     this.#assertOpen();
-    const ids = [...new Set(sessionIds.map((sessionId) => sessionId.trim()))]
-      .filter((sessionId) => sessionId !== "")
-      .sort((left, right) => left.localeCompare(right, "en"));
+    const requestsBySession = new Map<string, (typeof requests)[number]>();
+    for (const request of requests) {
+      const sessionId = request.sessionId.trim();
+      if (sessionId === "" || request.operationId.trim() === "") {
+        throw new StoreError("Task history binding preparation requires stable identities.");
+      }
+      const existing = requestsBySession.get(sessionId);
+      if (existing !== undefined && (
+        existing.operationId !== request.operationId
+        || !sameNativeBinding(existing.source, request.source)
+      )) throw new StoreError("Task history binding preparation contains conflicting receipts.");
+      requestsBySession.set(sessionId, { ...request, sessionId });
+    }
+    const ids = [...requestsBySession.keys()].sort((left, right) => left.localeCompare(right, "en"));
     for (const sessionId of ids) {
       if (this.#sessionResetLocks.has(sessionId) || this.#messageDeletionLocks.has(sessionId)) {
         throw sessionResetError(
@@ -2846,6 +2862,27 @@ export class SessionHost {
       }
       this.assertSessionResetSupported(sessionId, this.#store);
       this.assertSessionResetIdle(sessionId, this.#store);
+      const request = requestsBySession.get(sessionId)!;
+      const stored = this.#store.getSession(sessionId);
+      if (!sameNativeBinding(stored.descriptor.binding, request.source)) {
+        throw sessionResetError(
+          "SESSION_RESET_BINDING_CHANGED",
+          "The native task changed after task history was scanned.",
+          "Scan task history again after the task is idle."
+        );
+      }
+      const adapter = this.requireAdapter(stored.descriptor.backendId);
+      if (
+        adapter.recoverResetContext === undefined
+        || adapter.discardResetContext === undefined
+        || adapter.finalizeResetContext === undefined
+      ) {
+        throw sessionResetError(
+          "SESSION_RESET_RECOVERY_UNSUPPORTED",
+          "The selected Backend cannot durably reconcile a task-history context replacement.",
+          "Use a Backend that supports recoverable context reset."
+        );
+      }
     }
     for (const sessionId of ids) {
       this.#clearSessionRuntimeRecovery(sessionId);
@@ -2854,16 +2891,26 @@ export class SessionHost {
 
     const replacements: Array<{
       readonly sessionId: string;
+      readonly operationId: string;
       readonly source: NativeSessionBinding;
       readonly replacement: NativeSessionBinding;
     }> = [];
     try {
       for (const sessionId of ids) {
+        const request = requestsBySession.get(sessionId)!;
         const prepared = await this.prepareSessionReset(sessionId);
+        if (!sameNativeBinding(prepared.sourceBinding, request.source)) {
+          throw sessionResetError(
+            "SESSION_RESET_BINDING_CHANGED",
+            "The native task changed while task history cleanup was preparing it.",
+            "Scan task history again after the task is idle."
+          );
+        }
         let replacement: NativeSessionBinding | undefined;
         try {
           replacement = await prepared.active.adapter.resetContext!({
             ...prepared.context,
+            operationId: request.operationId,
             emit: async () => undefined
           });
           if (
@@ -2884,6 +2931,7 @@ export class SessionHost {
           });
           replacements.push({
             sessionId,
+            operationId: request.operationId,
             source: prepared.sourceBinding,
             replacement
           });
@@ -2915,6 +2963,97 @@ export class SessionHost {
     } catch (error) {
       this.releaseHistoryMaintenanceSessions(ids);
       throw error;
+    }
+  }
+
+  async recoverHistoryMaintenanceBinding(request: {
+    readonly sessionId: string;
+    readonly operationId: string;
+    readonly source: NativeSessionBinding;
+  }): Promise<{
+    readonly sessionId: string;
+    readonly operationId: string;
+    readonly source: NativeSessionBinding;
+    readonly replacement: NativeSessionBinding;
+  } | undefined> {
+    this.#assertOpen();
+    const stored = this.#store.getSession(request.sessionId);
+    if (!sameNativeBinding(stored.descriptor.binding, request.source)) {
+      throw sessionResetError(
+        "SESSION_RESET_BINDING_CHANGED",
+        "The native task no longer matches its task-history replacement receipt.",
+        "Do not retry cleanup until the recorded maintenance job is reconciled."
+      );
+    }
+    const adapter = this.requireAdapter(stored.descriptor.backendId);
+    if (adapter.recoverResetContext === undefined) {
+      throw sessionResetError(
+        "SESSION_RESET_RECOVERY_UNSUPPORTED",
+        "The selected Backend cannot recover a task-history context replacement.",
+        "Keep the maintenance job unchanged until the Backend recovery capability is restored."
+      );
+    }
+    const replacement = await adapter.recoverResetContext({
+      ...this.contextFor(stored),
+      operationId: request.operationId,
+      emit: async () => undefined
+    });
+    if (replacement === undefined) return undefined;
+    if (replacement.opaqueRef === request.source.opaqueRef || replacement.generation <= request.source.generation) {
+      throw sessionResetError(
+        "SESSION_RESET_RECOVERY_MISMATCH",
+        "The Backend returned an invalid task-history context replacement receipt.",
+        "Keep the maintenance job unchanged and repair the Backend receipt."
+      );
+    }
+    return { ...request, replacement };
+  }
+
+  async discardHistoryMaintenanceBindings(replacements: readonly {
+    readonly sessionId: string;
+    readonly operationId: string;
+    readonly source: NativeSessionBinding;
+    readonly replacement: NativeSessionBinding;
+  }[]): Promise<void> {
+    for (const replacement of replacements) {
+      const stored = this.#store.getSession(replacement.sessionId);
+      if (!sameNativeBinding(stored.descriptor.binding, replacement.source)) {
+        throw new StoreError("Task history replacement source changed before discard.");
+      }
+      const adapter = this.requireAdapter(stored.descriptor.backendId);
+      if (adapter.discardResetContext === undefined) {
+        throw new StoreError("Backend cannot discard a task history replacement receipt.");
+      }
+      await adapter.discardResetContext(replacement.replacement, {
+        ...this.contextFor(stored),
+        operationId: replacement.operationId,
+        emit: async () => undefined
+      });
+    }
+  }
+
+  async finalizeHistoryMaintenanceBindings(replacements: readonly {
+    readonly sessionId: string;
+    readonly operationId: string;
+    readonly source: NativeSessionBinding;
+    readonly replacement: NativeSessionBinding;
+  }[]): Promise<void> {
+    for (const replacement of replacements) {
+      const stored = this.#store.getSession(replacement.sessionId);
+      if (!sameNativeBinding(stored.descriptor.binding, replacement.replacement)) {
+        throw new StoreError("Task history replacement was not adopted before receipt finalization.");
+      }
+      const adapter = this.requireAdapter(stored.descriptor.backendId);
+      if (adapter.finalizeResetContext === undefined) {
+        throw new StoreError("Backend cannot finalize a task history replacement receipt.");
+      }
+      await adapter.finalizeResetContext(replacement.replacement, {
+        ...this.contextFor(stored),
+        operationId: replacement.operationId,
+        binding: replacement.source,
+        generation: replacement.source.generation,
+        emit: async () => undefined
+      });
     }
   }
 

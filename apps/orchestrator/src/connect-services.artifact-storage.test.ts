@@ -1,9 +1,10 @@
 import { create } from "@bufbuild/protobuf";
 import { Code, ConnectError } from "@connectrpc/connect";
 import {
-  ArtifactStorageCleanupOutcome,
+  ArtifactStorageCleanupStatus,
   CapabilitySupport,
-  CleanupArtifactStorageRequestSchema,
+  BeginArtifactStorageCleanupRequestSchema,
+  GetArtifactStorageCleanupRequestSchema,
   GetArtifactStorageStatsRequestSchema,
   ScanArtifactStorageRequestSchema
 } from "@joko/contracts";
@@ -15,13 +16,10 @@ import { createConnectServices } from "./connect-services.js";
 
 describe("Artifact storage Connect service", () => {
   it("projects path-free reports and keeps the protected digest on destructive confirmation", async () => {
-    const cleanup = vi.fn(async () => ({
-      expiredReferencesDeleted: 2,
-      blobsRemoved: 1,
-      temporaryFilesRemoved: 0,
-      freedBytes: 12,
-      skipped: 0
-    }));
+    const cleanup = vi.fn(async () => ({ maintenanceId: "a".repeat(64), status: "completed", phase: "reconciling",
+      percent: 100, updatedAt: 1_000, result: {
+        expiredReferencesDeleted: 2, blobsRemoved: 1, temporaryFilesRemoved: 0, freedBytes: 12, skipped: 0
+      } }));
     const maintenance = {
       stats: vi.fn(async () => ({
         referenceCount: 3,
@@ -46,7 +44,11 @@ describe("Artifact storage Connect service", () => {
         cleanableBytes: 12
       })),
       reconcile: vi.fn(async () => ({ healthy: true, missingBlobCount: 0, orphanBlobCount: 0, unsafeEntryCount: 0 })),
-      cleanup
+      beginCleanup: cleanup,
+      getCleanup: vi.fn(() => ({ maintenanceId: "a".repeat(64), status: "completed", phase: "reconciling",
+        percent: 100, updatedAt: 1_000, result: {
+          expiredReferencesDeleted: 2, blobsRemoved: 1, temporaryFilesRemoved: 0, freedBytes: 12, skipped: 0
+        } }))
     };
     const services = createConnectServices(application(maintenance));
     const digest = "b".repeat(64);
@@ -57,8 +59,10 @@ describe("Artifact storage Connect service", () => {
     expect(maintenance.stats).toHaveBeenCalledWith([digest]);
     const scan = await services.artifact.scanArtifactStorage(create(ScanArtifactStorageRequestSchema, { protectedSha256: [digest] }), handlerContext);
     expect(scan.scan).toMatchObject({ token: "a".repeat(64), protectedReferenceCount: 1n, cleanableBytes: 12n });
-    const result = await services.artifact.cleanupArtifactStorage(create(CleanupArtifactStorageRequestSchema, { scanToken: "a".repeat(64), protectedSha256: [digest] }), handlerContext);
-    expect(result).toMatchObject({ outcome: ArtifactStorageCleanupOutcome.COMPLETED, result: { freedBytes: 12n } });
+    const result = await services.artifact.beginArtifactStorageCleanup(create(BeginArtifactStorageCleanupRequestSchema, { scanToken: "a".repeat(64), protectedSha256: [digest] }), handlerContext);
+    expect(result).toMatchObject({ progress: { status: ArtifactStorageCleanupStatus.COMPLETED, result: { freedBytes: 12n } } });
+    expect(services.artifact.getArtifactStorageCleanup(create(GetArtifactStorageCleanupRequestSchema, { maintenanceId: "a".repeat(64) }), handlerContext))
+      .toMatchObject({ progress: { maintenanceId: "a".repeat(64), status: ArtifactStorageCleanupStatus.COMPLETED } });
     expect(cleanup).toHaveBeenCalledWith("a".repeat(64), [digest]);
     expect(JSON.stringify({ stats, scan, result }, (_key, value) => typeof value === "bigint" ? value.toString() : value))
       .not.toMatch(/[A-Z]:\\|\/var\/|storagePath/iu);
@@ -69,11 +73,11 @@ describe("Artifact storage Connect service", () => {
       stats: vi.fn(),
       scan: vi.fn(),
       reconcile: vi.fn(),
-      cleanup: vi.fn(async () => { throw new ArtifactMaintenanceScanExpiredError(); })
+      beginCleanup: vi.fn(async () => { throw new ArtifactMaintenanceScanExpiredError(); })
     };
     const services = createConnectServices(application(maintenance));
-    await expect(services.artifact.cleanupArtifactStorage(create(CleanupArtifactStorageRequestSchema, { scanToken: "c".repeat(64), protectedSha256: [] }), context()))
-      .resolves.toEqual({ outcome: ArtifactStorageCleanupOutcome.SCAN_EXPIRED });
+    await expect(services.artifact.beginArtifactStorageCleanup(create(BeginArtifactStorageCleanupRequestSchema, { scanToken: "c".repeat(64), protectedSha256: [] }), context()))
+      .resolves.toMatchObject({ progress: { status: ArtifactStorageCleanupStatus.SCAN_EXPIRED } });
   });
 
   it("redacts service paths from maintenance failures", async () => {
@@ -81,7 +85,7 @@ describe("Artifact storage Connect service", () => {
       stats: vi.fn(),
       scan: vi.fn(async () => { throw new Error("EACCES D:\\private\\artifact-store"); }),
       reconcile: vi.fn(),
-      cleanup: vi.fn()
+      beginCleanup: vi.fn()
     };
     const services = createConnectServices(application(maintenance));
     const failure = await Promise.resolve(services.artifact.scanArtifactStorage(
