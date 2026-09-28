@@ -102,7 +102,7 @@ export class VisualRemoteHostFixture {
   saveCredential: AppController["saveCredential"] = async () => { throw new Error("The visual fixture accepts no private keys."); };
   listSshKeys: AppController["listSshKeys"] = async (signal) => {
     await Promise.resolve(); signal.throwIfAborted();
-    return { keys: [...this.#keys.values()], agentState: "ready", generationSupported: true };
+    return { keys: [...this.#keys.values()], agentState: "ready", generationSupported: true, servicePlatform: "unknown" };
   };
   generateSshKey: AppController["generateSshKey"] = async (draft, signal) => {
     await Promise.resolve(); signal.throwIfAborted();

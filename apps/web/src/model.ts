@@ -411,6 +411,7 @@ export interface SshKeyCatalogView {
   readonly keys: readonly SshKeyView[];
   readonly agentState: "ready" | "unavailable" | "failed";
   readonly generationSupported: boolean;
+  readonly servicePlatform: "windows" | "macos" | "linux" | "unknown";
 }
 
 export interface SshKeyGenerateDraft {

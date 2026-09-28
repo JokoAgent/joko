@@ -6,7 +6,21 @@ import * as contract from "@joko/contracts";
 import { SshKeyError, SshKeyManager } from "@joko/remote-ssh";
 import { expect, it, vi } from "vitest";
 import { mkdtemp } from "./test-paths.js";
-import { createSshKeyConnectService } from "./ssh-key-connect-service.js";
+import { createSshKeyConnectService, sshAgentHostPlatform } from "./ssh-key-connect-service.js";
+
+it("publishes the authenticated service node platform with the SSH agent catalog", async () => {
+  expect(sshAgentHostPlatform("win32")).toBe(contract.SshAgentHostPlatform.WINDOWS);
+  expect(sshAgentHostPlatform("darwin")).toBe(contract.SshAgentHostPlatform.MACOS);
+  expect(sshAgentHostPlatform("linux")).toBe(contract.SshAgentHostPlatform.LINUX);
+  expect(sshAgentHostPlatform("freebsd")).toBe(contract.SshAgentHostPlatform.UNSPECIFIED);
+  const keys = new SshKeyManager({ directory: await mkdtemp(join(tmpdir(), "joko-ssh-platform-")) });
+  vi.spyOn(keys, "list").mockResolvedValue({ keys: [], agentState: "unavailable", generationSupported: true });
+  const service = createSshKeyConnectService({ keys, authenticate: () => ({ connectionId: "a" }), onRevoked: () => () => undefined });
+  const response = await service.listSshKeys(create(contract.ListSshKeysRequestSchema), { signal: new AbortController().signal } as HandlerContext);
+  expect(response.agentHostPlatform).toBe(sshAgentHostPlatform(process.platform));
+  expect(response.agentState).toBe(contract.SshAgentState.UNAVAILABLE);
+  keys.close();
+});
 
 it("authenticates unavailable capability and fences late key observations on connection revocation", async () => {
   const context = { signal: new AbortController().signal } as HandlerContext;

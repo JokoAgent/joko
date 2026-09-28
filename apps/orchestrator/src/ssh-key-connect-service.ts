@@ -7,6 +7,12 @@ import type { CredentialManager } from "./credential-manager.js";
 import { fromProtoRevision, toProtoTimestamp } from "./proto-mapper.js";
 import type { RemoteHostRegistry } from "./remote-host-registry.js";
 
+export function sshAgentHostPlatform(platform: NodeJS.Platform): contract.SshAgentHostPlatform {
+  return platform === "win32" ? contract.SshAgentHostPlatform.WINDOWS
+    : platform === "darwin" ? contract.SshAgentHostPlatform.MACOS
+      : platform === "linux" ? contract.SshAgentHostPlatform.LINUX : contract.SshAgentHostPlatform.UNSPECIFIED;
+}
+
 export function createSshKeyConnectService(options: {
   readonly keys?: SshKeyManager;
   readonly credentials?: CredentialManager;
@@ -53,6 +59,7 @@ export function createSshKeyConnectService(options: {
       const result = await keys.list(signal);
       return create(contract.ListSshKeysResponseSchema, {
         keys: result.keys.map(toProtoKey), generationSupported: result.generationSupported,
+        agentHostPlatform: sshAgentHostPlatform(process.platform),
         agentState: result.agentState === "ready" ? contract.SshAgentState.READY
           : result.agentState === "unavailable" ? contract.SshAgentState.UNAVAILABLE : contract.SshAgentState.FAILED
       });

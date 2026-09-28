@@ -2,7 +2,7 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } fr
 import type { JSX } from "react";
 import type { RemoteHostDraft, SshKeyCatalogView, SshKeyView } from "../model.js";
 import { sshKeyFailure, sshKeyOutcomeUncertain, type SshKeyFailure } from "../ssh-key-error.js";
-import { SshCopyButton, SshKeyMutationDialog, type Dialog, type KeyApi, type Scope } from "./SshKeySettings.js";
+import { SshAgentRecovery, SshCopyButton, SshKeyMutationDialog, type Dialog, type KeyApi, type Scope } from "./SshKeySettings.js";
 import type { Translator } from "./types.js";
 import { Button, Pill, SelectControl } from "./ui.js";
 
@@ -83,6 +83,7 @@ export function RemoteHostKeySetup({ api, signal: parentSignal, ownerDocument, d
     {feedback && <p role="status">{t(feedback)}</p>}
     {needsRefresh && <p role="status">{t(refreshReason === "unsafe_permissions" ? "sshKeys.permissionsBeforeRetry" : "sshKeys.inspectBeforeRetry")}</p>}
     {value && <><p role="status">{t(`sshKeys.agent.${value.agentState}`)}</p>{value.keys.length === 0 && <p>{t("sshKeys.empty")}</p>}
+      <SshAgentRecovery platform={value.servicePlatform} show={value.agentState !== "ready" || failure === "agent_unavailable" || failure === "agent_failed"} t={t} />
       <p>{t("sshKeys.permissionsHint")}</p>
       <div className="ssh-key-list" role="list">{value.keys.map(key => <div className="ssh-key-row" key={key.id} role="listitem">
         <button ref={element => { if (element) buttons.current.set(key.id, element); else buttons.current.delete(key.id); }} type="button" className="ssh-key-choice" disabled={!ready} aria-disabled={needsRefresh || undefined} aria-pressed={selected === key} onClick={() => { if (current() && ready && !needsRefresh) onSelect(key); }}><span><strong>{key.name}</strong><small>{key.algorithm}</small><code>{key.sha256Fingerprint}</code></span></button>
@@ -90,7 +91,7 @@ export function RemoteHostKeySetup({ api, signal: parentSignal, ownerDocument, d
       </div>)}</div></>}
     {draft.nodeKey && !selected && !loading && <p role="alert">{t("sshKeys.selectedUnavailable")} <code>{draft.nodeKey.id} · {draft.nodeKey.expectedFingerprint}</code></p>}
     {selected && <><p>{t(selected.inAgent ? "sshKeys.selectedAgentOnly" : "sshKeys.loadBeforeConnect")}</p><DraftKeyRecipe key={JSON.stringify([selected.id, selected.sha256Fingerprint, catalog?.read])} scope={scope} selected={selected} draft={draft} disabled={!ready || needsRefresh} onReadFailure={onReadFailure} t={t} /></>}
-    {dialog?.scope === scope && !scope.abort.signal.aborted && <SshKeyMutationDialog dialog={dialog} valid={dialog.key === undefined || value?.keys.some(key => key.id === dialog.key?.id && key.sha256Fingerprint === dialog.key.sha256Fingerprint) === true} t={t}
+    {dialog?.scope === scope && !scope.abort.signal.aborted && <SshKeyMutationDialog dialog={dialog} valid={dialog.key === undefined || value?.keys.some(key => key.id === dialog.key?.id && key.sha256Fingerprint === dialog.key.sha256Fingerprint) === true} servicePlatform={value?.servicePlatform ?? "unknown"} t={t}
       onClose={() => setDialog(undefined)} onStart={() => { setNeedsRefresh(true); setRefreshReason(undefined); setFeedback(undefined); setFailure(undefined); }} onGenerated={retainGenerated}
       onFailure={error => { if (current()) { setNeedsRefresh(observe(error)); setRefreshReason(error); } }}
       onSuccess={(result, origin) => {

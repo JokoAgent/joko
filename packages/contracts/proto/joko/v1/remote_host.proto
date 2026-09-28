@@ -24,6 +24,13 @@ enum SshAgentState {
   SSH_AGENT_STATE_FAILED = 3;
 }
 
+enum SshAgentHostPlatform {
+  SSH_AGENT_HOST_PLATFORM_UNSPECIFIED = 0;
+  SSH_AGENT_HOST_PLATFORM_WINDOWS = 1;
+  SSH_AGENT_HOST_PLATFORM_MACOS = 2;
+  SSH_AGENT_HOST_PLATFORM_LINUX = 3;
+}
+
 enum SshKeyPassphrasePurpose {
   SSH_KEY_PASSPHRASE_PURPOSE_UNSPECIFIED = 0;
   SSH_KEY_PASSPHRASE_PURPOSE_GENERATE = 1;
@@ -50,6 +57,8 @@ message ListSshKeysResponse {
   repeated SshKey keys = 1;
   SshAgentState agent_state = 2;
   bool generation_supported = 3;
+  // The authenticated service node, not the browser or remote SSH host.
+  SshAgentHostPlatform agent_host_platform = 4;
 }
 message BeginSshKeyPassphraseUploadRequest {
   SshKeyPassphrasePurpose purpose = 1;

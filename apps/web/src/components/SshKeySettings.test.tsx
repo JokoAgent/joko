@@ -81,10 +81,23 @@ it.each(["agent_failed", "outcome_unknown"] as const)("preserves generation succ
   expect(document.querySelector('[role="dialog"]')).toBeNull();
   expect(document.querySelector('.ssh-key-choice[aria-pressed="true"]')?.textContent).toContain("created");
   expect(document.body.textContent).toContain("Key generated. Loading it into the SSH agent was not confirmed.");
+  expect(document.body.textContent.includes("Windows service node")).toBe(failure === "agent_failed");
   expect(button("Generate key").disabled).toBe(failure === "outcome_unknown");
   await act(async () => button("Refresh").click());
+  expect(document.body.textContent).not.toContain("Windows service node");
   expect(button("Generate key").disabled).toBe(false);
   expect(fixture.generate).toHaveBeenCalledOnce(); expect(fixture.add).toHaveBeenCalledOnce();
+});
+
+it("gives platform-specific recovery for a typed agent action failure without replaying the action", async () => {
+  const fixture = await mount({ keys: [key()], agentState: "ready", generationSupported: true, servicePlatform: "linux" });
+  fixture.add.mockRejectedValueOnce(new ConnectError("ssh_key.agent_unavailable", Code.FailedPrecondition));
+  await act(async () => button("Add to agent").click());
+  await change(input("Passphrase"), "one-action-secret"); await submitTwice();
+  expect(document.querySelector('[role="dialog"]')?.textContent).toContain("Linux service node");
+  expect(document.querySelector('[role="dialog"]')?.textContent).toContain("SSH_AUTH_SOCK");
+  expect(fixture.add).toHaveBeenCalledOnce();
+  expect(fixture.list).toHaveBeenCalledOnce();
 });
 
 it("retires the agent step on close without replaying the completed generation", async () => {
@@ -117,7 +130,7 @@ it.each(["stay", "moveDuringMutation", "moveDuringRefresh", "changeOwner"] as co
   await act(async () => mutation.resolve(undefined));
   const external = document.body.appendChild(document.createElement("button")); external.textContent = "Other action";
   if (transition === "moveDuringRefresh" || transition === "changeOwner") await act(async () => external.focus());
-  if (transition === "changeOwner") await fixture.render({ ...fixture.controller, listSshKeys: vi.fn(async (): Promise<SshKeyCatalogView> => ({ keys: [], agentState: "ready", generationSupported: true })) });
+  if (transition === "changeOwner") await fixture.render({ ...fixture.controller, listSshKeys: vi.fn(async (): Promise<SshKeyCatalogView> => ({ keys: [], agentState: "ready", generationSupported: true, servicePlatform: "unknown" })) });
   await act(async () => observed.resolve({ ...fixture.catalog, keys: [{ ...key(), inAgent: true }] }));
   const selected = document.querySelector('.ssh-key-choice[aria-pressed="true"]');
   if (transition === "stay") {
@@ -128,7 +141,7 @@ it.each(["stay", "moveDuringMutation", "moveDuringRefresh", "changeOwner"] as co
 });
 
 it("requires an explicit unprotected choice and keeps empty, failed and unavailable states actionable", async () => {
-  const fixture = await mount({ keys: [], agentState: "unavailable", generationSupported: true });
+  const fixture = await mount({ keys: [], agentState: "unavailable", generationSupported: true, servicePlatform: "windows" });
   expect(document.body.textContent).toContain("has no SSH keys");
   expect(document.body.textContent).toContain("SSH agent is unavailable");
   await act(async () => button("Generate key").click());
@@ -201,7 +214,7 @@ it.each(["api", "disconnect", "pagehide", "close"] as const)("retires a pending 
   await act(async () => button("Generate key").click());
   const secret = input("Passphrase"); await change(secret, "test-secret"); await change(input("Confirm passphrase"), "test-secret");
   await submitTwice(); const signal = fixture.generate.mock.calls[0]![1];
-  if (retirement === "api") await fixture.render({ ...fixture.controller, listSshKeys: vi.fn(async (): Promise<SshKeyCatalogView> => ({ keys: [], agentState: "ready", generationSupported: true })) });
+  if (retirement === "api") await fixture.render({ ...fixture.controller, listSshKeys: vi.fn(async (): Promise<SshKeyCatalogView> => ({ keys: [], agentState: "ready", generationSupported: true, servicePlatform: "unknown" })) });
   else if (retirement === "disconnect") await fixture.render({ ...fixture.controller, state: { ...fixture.controller.state, connectionState: "disconnected" } });
   else await act(async () => retirement === "pagehide" ? window.dispatchEvent(new Event("pagehide")) : button("Close", document.querySelector('[role="dialog"]')!).click());
   expect(signal.aborted).toBe(true); expect(secret.value).toBe(""); expect(document.querySelector('[role="dialog"]')).toBeNull();
@@ -215,15 +228,26 @@ it.each(["api", "disconnect", "pagehide", "close"] as const)("retires a pending 
 });
 
 it("uses fresh scopes after StrictMode and hides cross-service keys immediately", async () => {
-  const fixture = await mount(undefined, true);
+  const fixture = await mount({ keys: [key()], agentState: "unavailable", generationSupported: true, servicePlatform: "windows" }, true);
   expect(button("Generate key").disabled).toBe(false);
+  expect(document.body.textContent).toContain("Windows service node");
   const pending = deferred<SshKeyCatalogView>();
   await fixture.render({ ...fixture.controller, listSshKeys: vi.fn(() => pending.promise) });
   expect(document.body.textContent).not.toContain("SHA256:key-one");
+  expect(document.body.textContent).not.toContain("Windows service node");
   expect(button("Generate key").disabled).toBe(true);
-  await act(async () => pending.resolve({ keys: [], agentState: "failed", generationSupported: false }));
+  await act(async () => pending.resolve({ keys: [], agentState: "failed", generationSupported: false, servicePlatform: "unknown" }));
   expect(document.body.textContent).toContain("does not support key generation");
   expect(document.body.textContent).toContain("agent could not be read");
+  expect(document.body.textContent).toContain("On the service node, manually check");
+});
+
+it.each(["windows", "macos", "linux", "unknown"] as const)("shows %s agent recovery for the service node in both languages", async (platform) => {
+  await mount({ keys: [key()], agentState: "failed", generationSupported: true, servicePlatform: platform });
+  expect(document.body.textContent).toContain(translate("en", `sshKeys.recovery.${platform}`));
+  expect(translate("zh-CN", `sshKeys.recovery.${platform}`)).not.toBe(`sshKeys.recovery.${platform}`);
+  expect(document.body.textContent).toContain("explicitly add that key");
+  expect(document.body.textContent).not.toContain("Keychain");
 });
 
 it("fences copied public keys and installation commands by the selected key, live host revision and component lifetime", async () => {
@@ -252,7 +276,7 @@ it("fences copied public keys and installation commands by the selected key, liv
 function key(id = "key-one"): SshKeyView { return { id, name: id, algorithm: "ssh-ed25519", comment: "Work key", sha256Fingerprint: `SHA256:${id}`, modifiedAt: 1000, inAgent: false }; }
 function host(): RemoteHostView { return { id: "build-box", targetId: "project", hostname: "build.internal", port: 22, user: "joko", source: "manual", authentication: "systemAgent", status: { state: "disconnected", changedAt: 1 }, revision: 1n }; }
 function deferred<T>() { let resolve!: (value: T) => void; const promise = new Promise<T>((yes) => { resolve = yes; }); return { resolve, promise }; }
-async function mount(initial: SshKeyCatalogView = { keys: [key()], agentState: "ready", generationSupported: true }, strict = false) {
+async function mount(initial: SshKeyCatalogView = { keys: [key()], agentState: "ready", generationSupported: true, servicePlatform: "windows" }, strict = false) {
   const root = createRoot(document.body.appendChild(document.createElement("div"))); roots.push(root);
   let deliver!: (values: readonly RemoteHostView[]) => void;
   const watchRemoteHosts = vi.fn((_targetId: string, signal: AbortSignal) => ({

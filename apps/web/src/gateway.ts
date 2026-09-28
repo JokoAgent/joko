@@ -4,7 +4,7 @@ import { createConnectTransport } from "@connectrpc/connect-web";
 import { createTerminalGateway } from "./terminal-gateway.js";
 import { createSimulatorViewerGateway } from "./simulator-viewer-gateway.js";
 import { UsageReportGroup } from "@joko/contracts";
-import { SshKeyService, SshAgentState, SshKeyPassphrasePurpose, SshInstallShell, type SshKey, type CredentialUploadTicket } from "@joko/contracts";
+import { SshKeyService, SshAgentState, SshAgentHostPlatform, SshKeyPassphrasePurpose, SshInstallShell, type SshKey, type CredentialUploadTicket } from "@joko/contracts";
 import type { SshKeyView, SshKeyCatalogView, SshKeyGenerateDraft, SshKeyInstallCommandDraft } from "./model.js";
 import type { UsageReportQueryView, UsageReportView } from "./model.js";
 import {
@@ -7622,6 +7622,9 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     const response = await createClient(SshKeyService, scope.transport).listSshKeys({}, { signal: scope.signal });
     scope.signal.throwIfAborted();
     return { keys: response.keys.map(mapSshKey), generationSupported: response.generationSupported,
+      servicePlatform: response.agentHostPlatform === SshAgentHostPlatform.WINDOWS ? "windows"
+        : response.agentHostPlatform === SshAgentHostPlatform.MACOS ? "macos"
+          : response.agentHostPlatform === SshAgentHostPlatform.LINUX ? "linux" : "unknown",
       agentState: response.agentState === SshAgentState.READY ? "ready" : response.agentState === SshAgentState.UNAVAILABLE ? "unavailable" : "failed" };
   }
 
