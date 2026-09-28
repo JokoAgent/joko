@@ -49,6 +49,7 @@ export { cleanHistoryMaintenanceCopy } from "./history-maintenance-worker.js";
 export * from "./lan-discovery.js";
 export * from "./local-model-runtime-coordinator.js";
 export * from "./local-model-runtime-persistence.js";
+export * from "./message-search-embedding.js";
 export * from "./managed-model-runtime-connect-service.js";
 export * from "./managed-model-runtime-controller.js";
 export * from "./managed-model-runtime-system.js";

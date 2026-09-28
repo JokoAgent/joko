@@ -48,6 +48,7 @@ export type { E2eClients, PairedClient } from "./connect-clients.js";
 type FixtureAuxiliaryServices = Pick<OrchestratorApplication,
   "auxiliaryText" | "subagentModels" | "sessionNavigation" | "providers" | "providerAuth"
   | "refreshPiGeneration" | "mcpRouter" | "sshKeys" | "credentials" | "remoteHosts" | "browser"
+  | "messageSearch"
   | "browserSettings" | "browserState" | "voiceInput" | "diagnosticsBundles">;
 
 export interface FixtureOptions {
@@ -442,6 +443,7 @@ export class OrchestratorE2eFixture {
         await attempt(() => auxiliaryServices?.sessionNavigation?.dispose());
         await attempt(() => auxiliaryServices?.auxiliaryText?.dispose());
         await attempt(() => auxiliaryServices?.providerAuth?.beginShutdown());
+        await attempt(() => auxiliaryServices?.messageSearch?.stop());
         // Keep native transports and remote dependencies alive until exact
         // current and retained process cleanup has settled.
         await attempt(() => options.terminals?.dispose());

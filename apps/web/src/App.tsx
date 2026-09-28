@@ -791,7 +791,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
   }
   const nativeTaskStatusVisibleSessionIds = useMemo(() => {
     if (state.route.kind !== "session" && state.route.kind !== "files") return [];
-    if (state.route.kind === "session" && sessionSplitLayout.root !== undefined) {
+    if (state.route.kind === "session" && sessionSplitLayout.root !== undefined && activeSession?.archived !== true) {
       return Object.freeze(sessionSplitPanes(sessionSplitLayout.root).map((pane) => pane.sessionId));
     }
     return Object.freeze(activeSession === undefined ? [] : [activeSession.id]);
@@ -861,15 +861,16 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
   }, [auxiliaryApplicationWindow, splitOwnerId]);
   useEffect(() => {
     if (splitOwnerId === undefined || state.connectionState !== "connected" || state.snapshot.revision === 0n) return;
-    const existing = new Set(state.snapshot.sessions.filter((session) => !session.archived).map((session) => session.id));
-    const next = reconcileSessionSplit(sessionSplitLayout, existing);
+    const activeIds = new Set(state.snapshot.sessions.filter((session) => !session.archived).map((session) => session.id));
+    const knownIds = new Set(state.snapshot.sessions.map((session) => session.id));
+    const next = reconcileSessionSplit(sessionSplitLayout, activeIds);
     if (next !== sessionSplitLayout) commitSessionSplitLayout(next);
     const routeSessionId = state.route.kind === "session" ? state.route.sessionId : undefined;
-    const focusedExists = focusedSplitSessionId === undefined || existing.has(focusedSplitSessionId);
-    const routeExists = routeSessionId === undefined || existing.has(routeSessionId);
+    const focusedExists = focusedSplitSessionId === undefined || activeIds.has(focusedSplitSessionId);
+    const routeExists = routeSessionId === undefined || knownIds.has(routeSessionId);
     if (focusedExists && routeExists) return;
     const replacement = sessionSplitPanes(sessionSplitLayout.root)
-      .find((pane) => existing.has(pane.sessionId))?.sessionId;
+      .find((pane) => activeIds.has(pane.sessionId))?.sessionId;
     setFocusedSplitSessionId(replacement);
     if (!routeExists) controller.navigate(replacement === undefined
       ? { kind: "session" }
@@ -888,6 +889,10 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
   const lastSplitRouteSessionIdRef = useRef<string | undefined>(undefined);
   useEffect(() => {
     if (state.route.kind !== "session" || activeSession === undefined) {
+      lastSplitRouteSessionIdRef.current = undefined;
+      return;
+    }
+    if (activeSession.archived) {
       lastSplitRouteSessionIdRef.current = undefined;
       return;
     }
@@ -2284,7 +2289,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
                   onNewTask={() => controller.navigate({ kind: "newSession" })}
                 />
           ) : <SessionSplitView
-            layout={sessionSplitLayout}
+            layout={activeSession.archived ? {} : sessionSplitLayout}
             currentSessionId={activeSession.id}
             focusedSessionId={focusedSplitSessionId ?? activeSession.id}
             sessions={state.snapshot.sessions}
