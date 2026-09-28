@@ -3238,7 +3238,7 @@ describe("SessionHost", () => {
       }
     });
 
-    const imported = await fixture.host.commitPortableSessionImport({
+    const commitRequest = {
       operationId: request.operationId,
       connection: request.connection,
       draftId: draft.draftId,
@@ -3248,7 +3248,8 @@ describe("SessionHost", () => {
       permissionMode: request.permissionMode,
       planMode: request.planMode,
       overwrite: request.overwrite
-    });
+    };
+    const imported = await fixture.host.commitPortableSessionImport(commitRequest);
     expect(imported).toMatchObject({
       replayed: false,
       value: {
@@ -3279,10 +3280,20 @@ describe("SessionHost", () => {
       ]);
     expect(JSON.stringify(fixture.store.getOperation(request.operationId).body)).not.toContain(request.password);
 
-    await expect(fixture.host.importPortableSession(request)).resolves.toMatchObject({
+    const readPackage = vi.spyOn(fixture.artifacts, "readBlob").mockRejectedValue(new Error("package unavailable"));
+    await expect(fixture.host.commitPortableSessionImport(commitRequest)).resolves.toMatchObject({
       replayed: true,
       value: { sessionId: imported.value.sessionId }
     });
+    await expect(fixture.host.importPortableSession({ ...request, draftId: draft.draftId })).resolves.toMatchObject({
+      replayed: true,
+      value: { sessionId: imported.value.sessionId }
+    });
+    await expect(fixture.host.commitPortableSessionImport({
+      ...commitRequest,
+      draftId: "another-draft"
+    })).rejects.toBeInstanceOf(OperationConflictError);
+    readPackage.mockRestore();
     expect(adapter.importedNativeText).toHaveLength(1);
 
     await expect(fixture.host.importPortableSession({
@@ -3362,6 +3373,52 @@ describe("SessionHost", () => {
     expect(createNative).not.toHaveBeenCalled();
   });
 
+  it("marks a product-only portable task ready only after post-commit runtime registration", async () => {
+    const fixture = await createFixture(new FakeBackendAdapter(PI_LIKE_PROFILE));
+    const encoded = encodePortableSessionPackage({
+      manifest: createPortableSessionManifest({
+        exportedAt: new Date(1_800_000_000_000).toISOString(),
+        applicationVersion: "test",
+        title: "Product-only task",
+        workspaceKind: "dialogue",
+        backendCapability: "product-history",
+        fidelity: "product_only",
+        messageCount: 0,
+        mediaCount: 0
+      }),
+      entries: [{
+        path: "projection/messages.json",
+        kind: "projection",
+        mediaType: "application/json",
+        bytes: encodePortableSessionProjection({ format: 1, messages: [], artifacts: [] })
+      }]
+    });
+    const portablePackage = await fixture.artifacts.ingestBytes(encoded, {
+      fileName: "product-only.joko-session",
+      mimeType: "application/octet-stream"
+    });
+    const request = {
+      operationId: "import-product-only-post-commit",
+      connection: fixture.connection,
+      targetId: "target-one",
+      package: portablePackage,
+      providerId: "test",
+      modelId: "text",
+      fastMode: false,
+      permissionMode: "ask" as const,
+      planMode: false,
+      overwrite: false
+    };
+
+    const imported = await fixture.host.importPortableSession(request);
+    expect(imported.value.status).toBe("ready");
+    expect(fixture.store.getOperation(request.operationId).status).toBe("completed");
+    await expect(fixture.host.importPortableSession(request)).resolves.toMatchObject({
+      replayed: true,
+      value: { sessionId: imported.value.sessionId, status: "ready" }
+    });
+  });
+
   it("persists a native import activation failure and retries activation without creating another task", async () => {
     const adapter = new PortableFakeAdapter();
     const fixture = await createFixture(adapter);
@@ -3411,6 +3468,66 @@ describe("SessionHost", () => {
       value: { sessionId: importedSessionId, status: "ready" }
     });
     expect(adapter.importedNativeText).toHaveLength(1);
+  });
+
+  it("keeps a committed portable task when its activation receipt cannot be updated", async () => {
+    const adapter = new PortableFakeAdapter();
+    const fixture = await createFixture(adapter);
+    const sourceSessionId = (await fixture.host.createSession({
+      operationId: "create-portable-post-commit-source",
+      connection: fixture.connection,
+      targetId: "target-one",
+      title: "Portable post-commit source",
+      fastMode: false,
+      permissionMode: "ask",
+      planMode: false
+    })).value.sessionId;
+    const exported = await fixture.host.exportPortableSession({ sessionId: sourceSessionId });
+    const request = {
+      operationId: "import-portable-post-commit",
+      connection: fixture.connection,
+      targetId: "target-one",
+      package: exported.artifact,
+      fastMode: false,
+      permissionMode: "ask" as const,
+      planMode: false,
+      overwrite: false
+    };
+    const deleteNative = vi.spyOn(adapter, "deleteSession");
+    const writeSetting = fixture.store.setSetting.bind(fixture.store);
+    let activationWrites = 0;
+    const settingSpy = vi.spyOn(fixture.store, "setSetting").mockImplementation((...args) => {
+      if (args[2] === "portable.import.activation" && ++activationWrites > 1) {
+        throw new Error("activation receipt unavailable");
+      }
+      return writeSetting(...args);
+    });
+    const diagnosticSpy = vi.spyOn(fixture.store, "appendDiagnostic").mockImplementation(() => {
+      throw new Error("diagnostics unavailable");
+    });
+
+    const imported = await fixture.host.importPortableSession(request);
+    expect(imported.value).toMatchObject({
+      status: "imported_activation_failed",
+      activationError: { code: "PORTABLE_SESSION_ACTIVATION_FAILED" }
+    });
+    expect(fixture.store.getSession(imported.value.sessionId).descriptor.deletedAt).toBeUndefined();
+    expect(fixture.store.getOperation(request.operationId).status).toBe("completed");
+    expect(adapter.importedNativeText).toHaveLength(1);
+    expect(deleteNative).not.toHaveBeenCalled();
+
+    await expect(fixture.host.importPortableSession(request)).resolves.toMatchObject({
+      replayed: true,
+      value: { sessionId: imported.value.sessionId, status: "imported_activation_failed" }
+    });
+    expect(adapter.importedNativeText).toHaveLength(1);
+    settingSpy.mockRestore();
+    diagnosticSpy.mockRestore();
+    await expect(fixture.host.retryPortableSessionActivation({
+      connection: fixture.connection,
+      sessionId: imported.value.sessionId
+    })).resolves.toEqual({ sessionId: imported.value.sessionId, status: "ready" });
+    expect(deleteNative).not.toHaveBeenCalled();
   });
 
   it("executes user shell capability without Backend identity branches and fences concurrent generations", async () => {

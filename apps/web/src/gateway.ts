@@ -2401,11 +2401,29 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     readonly refreshWorktreeRemote?: boolean;
   }): Promise<PortableSessionImportResultView> {
     const client = createClient(PortableSessionService, this.requireTransport());
+    const options = this.#abort === undefined ? undefined : { signal: this.#abort.signal };
     const hasModel = input.execution.providerId !== undefined && input.execution.providerId !== ""
       && input.execution.modelId !== undefined && input.execution.modelId !== "";
+    const intent = JSON.stringify([
+      "portable-session-import",
+      input.draftId,
+      input.targetId,
+      hasModel ? input.execution.providerId : null,
+      hasModel ? input.execution.modelId : null,
+      hasModel ? input.execution.effort ?? null : null,
+      hasModel ? input.execution.fastMode : false,
+      input.execution.permissionMode,
+      input.execution.planMode,
+      input.overwrite,
+      input.useWorktree,
+      input.useWorktree ? input.worktreeSourceRef ?? null : null,
+      input.useWorktree && input.refreshWorktreeRemote === true
+    ]);
+    const digest = await sha256Hex(new TextEncoder().encode(intent).buffer as ArrayBuffer);
+    const operationId = `${digest.slice(0, 8)}-${digest.slice(8, 12)}-${digest.slice(12, 16)}-${digest.slice(16, 20)}-${digest.slice(20, 32)}`;
     try {
       const response = await client.commitPortableSessionImport({
-        operationId: randomUuid(),
+        operationId,
         draftId: input.draftId,
         targetId: input.targetId,
         ...(hasModel ? {
@@ -2426,7 +2444,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
           ? { worktreeSourceRef: input.worktreeSourceRef }
           : {}),
         refreshWorktreeRemote: input.useWorktree && input.refreshWorktreeRemote === true
-      }, this.#abort === undefined ? undefined : { signal: this.#abort.signal });
+      }, options);
       const result = response.result;
       if (result === undefined || result.sessionId.trim() === "") {
         throw new GatewayError("Orchestrator completed portable task import without a task result.");

@@ -106,6 +106,9 @@ describe("portable task package gateway", () => {
     }));
     let wrongPassword = true;
     let conflict = false;
+    let lostReply = false;
+    let expectedOverwrite = false;
+    const importOperationIds: string[] = [];
     const transport = portableTransport(async (method, input) => {
       if (method.localName === "beginBlobUpload") {
         calls.push("begin");
@@ -171,12 +174,14 @@ describe("portable task package gateway", () => {
             fastMode: true
           },
           planMode: true,
-          overwrite: false,
+          overwrite: expectedOverwrite,
           useWorktree: true,
           worktreeSourceRef: "refs/heads/main",
           refreshWorktreeRemote: true
         });
         expect(input.operationId).toMatch(/^[0-9a-f-]{36}$/);
+        importOperationIds.push(input.operationId);
+        if (lostReply) throw new ConnectError("The reply was lost.", Code.Unavailable);
         if (conflict) throw new ConnectError("An imported task already exists.", Code.AlreadyExists);
         return response(method, create(CommitPortableSessionImportResponseSchema, {
           result: {
@@ -256,10 +261,20 @@ describe("portable task package gateway", () => {
       sessionId: "session-imported",
       status: "ready"
     });
+    lostReply = true;
+    await expect(gateway.commitPortableSessionImport(commit)).rejects.toBeInstanceOf(GatewayError);
+    lostReply = false;
+    await gateway.commitPortableSessionImport(commit);
+    expect(importOperationIds.slice(0, 3)).toEqual([importOperationIds[0], importOperationIds[0], importOperationIds[0]]);
     conflict = true;
     await expect(gateway.commitPortableSessionImport(commit)).rejects.toMatchObject({
       code: "PORTABLE_SESSION_IMPORT_CONFLICT"
     } satisfies Partial<GatewayError>);
+    expect(importOperationIds[3]).toBe(importOperationIds[0]);
+    conflict = false;
+    expectedOverwrite = true;
+    await gateway.commitPortableSessionImport({ ...commit, overwrite: true });
+    expect(importOperationIds[4]).not.toBe(importOperationIds[0]);
     gateway.disconnect();
   });
 });

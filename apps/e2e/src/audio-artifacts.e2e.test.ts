@@ -89,8 +89,12 @@ it("publishes inline and resource-linked MCP tracks with one cover through HTTP 
     const exported = await paired.clients.portableSession.exportPortableSession({ sessionId });
     expect(exported.mediaCount).toBe(3n);
     const inspected = await paired.clients.portableSession.inspectPortableSessionImport({ package: exported.artifact });
-    const imported = await paired.clients.portableSession.commitPortableSessionImport({ operationId: randomUUID(), draftId: inspected.draft!.draftId, targetId, title: "Imported tracks", permissionMode: PermissionMode.ASK });
+    const importRequest = { operationId: randomUUID(), draftId: inspected.draft!.draftId, targetId, title: "Imported tracks", permissionMode: PermissionMode.ASK };
+    const imported = await paired.clients.portableSession.commitPortableSessionImport(importRequest);
     const importedId = imported.result!.sessionId;
+    const replay = await paired.clients.portableSession.commitPortableSessionImport(importRequest);
+    expect(replay.replayed).toBe(true);
+    expect(replay.result?.sessionId).toBe(importedId);
     const restored = (await paired.clients.artifact.listArtifacts({ sessionId: importedId })).artifacts.filter((artifact) => artifact.audioMetadata !== undefined).sort((a, b) => a.title.localeCompare(b.title));
     expect(restored.map((artifact) => artifact.description)).toEqual(["Quiet melody", "Piano and strings"]);
     expect(restored[0]!.artifactId).not.toBe(tracks[0]!.artifactId);

@@ -560,6 +560,8 @@ export interface ImportPortableSessionInput {
   readonly connection: ConnectionRecord;
   readonly targetId: string;
   readonly package: BlobRef;
+  /** Present only for a reviewed import draft; binds replay to that exact preview. */
+  readonly draftId?: string;
   /** Transient secret. It is excluded from the canonical Operation body. */
   readonly password?: string;
   readonly title?: string;
@@ -6512,6 +6514,44 @@ export class SessionHost {
     input: CommitPortableSessionDraftInput
   ): Promise<OperationExecution<ImportPortableSessionResult>> {
     this.#assertOpen();
+    this.#store.authorizeConnection(input.connection.id, input.connection.authKeyDigest);
+    const existing = this.#store.findOperation<ImportPortableSessionResult>(input.operationId);
+    if (existing !== undefined) {
+      if (existing.connectionId !== input.connection.id) {
+        throw new AuthorizationError("The operation belongs to a different connection.");
+      }
+      if (existing.kind !== "import_portable_session") {
+        throw new StoreError("The operation belongs to a different mutation.");
+      }
+      const storedBody = existing.body;
+      if (!isRecord(storedBody) || !isRecord(storedBody["package"])) {
+        throw new StoreError("The portable import operation has no valid package identity.");
+      }
+      const replayBody = portableImportOperationBody({
+        ...input,
+        package: storedBody["package"] as unknown as BlobRef
+      });
+      const inFlight = this.#portableImportLocks.get(input.operationId);
+      if (inFlight !== undefined
+        && inFlight.connectionId === input.connection.id
+        && inFlight.authKeyDigest === input.connection.authKeyDigest
+        && inFlight.bodyHash === operationBodyHash(replayBody)) {
+        return inFlight.task;
+      }
+      const replay = this.#store.claimAuthorizedDeferredEffectOperation<ImportPortableSessionResult>(
+        input.connection.id,
+        input.connection.authKeyDigest,
+        { id: input.operationId, kind: "import_portable_session", body: replayBody }
+      );
+      if (!replay.claimed) {
+        return this.portableImportExecutionWithActivation({
+          replayed: true,
+          value: replay.value,
+          operation: replay.operation
+        });
+      }
+      throw new StoreError("The portable import operation changed during replay.");
+    }
     const draft = this.requirePortableImportDraft(input.connection, input.draftId);
     if (draft.prepared === undefined) {
       throw new JokoError({
@@ -6528,6 +6568,7 @@ export class SessionHost {
       connection: input.connection,
       targetId: input.targetId,
       package: draft.package,
+      draftId: draft.id,
       ...(input.title === undefined ? {} : { title: input.title }),
       ...(input.providerId === undefined ? {} : { providerId: input.providerId }),
       ...(input.modelId === undefined ? {} : { modelId: input.modelId }),
@@ -8693,6 +8734,22 @@ export class SessionHost {
     input: ImportPortableSessionInput,
     preparedDraft?: PreparedPortableSessionImport
   ): Promise<OperationExecution<ImportPortableSessionResult>> {
+    const logicalBody = portableImportOperationBody(input);
+    if (this.#store.findOperation<ImportPortableSessionResult>(input.operationId) !== undefined) {
+      const replay = this.#store.claimAuthorizedDeferredEffectOperation<ImportPortableSessionResult>(
+        input.connection.id,
+        input.connection.authKeyDigest,
+        { id: input.operationId, kind: "import_portable_session", body: logicalBody }
+      );
+      if (!replay.claimed) {
+        return this.portableImportExecutionWithActivation({
+          replayed: true,
+          value: replay.value,
+          operation: replay.operation
+        });
+      }
+      throw new StoreError("The portable import operation changed during replay.");
+    }
     const prepared = preparedDraft ?? preparePortableSessionImport(
       (await this.#artifactStore.readBlob(input.package)).data,
       {
@@ -8701,7 +8758,6 @@ export class SessionHost {
       }
     );
     const importTitle = portableImportTitle(input.title, prepared.manifest.title);
-    const logicalBody = portableImportOperationBody(input);
     const claim = this.#store.claimAuthorizedDeferredEffectOperation<ImportPortableSessionResult>(
       input.connection.id,
       input.connection.authKeyDigest,
@@ -8732,6 +8788,15 @@ export class SessionHost {
     let resourceCatalogEpoch: bigint | undefined;
     let releaseBackendAdmission: (() => void) | undefined;
     let releasePortableReplacementFence: (() => void) | undefined;
+    let committedResult: OperationExecution<ImportPortableSessionResult> | undefined;
+    let activationSettled = false;
+    const recordPostCommitFailure = (component: string, error: unknown): void => {
+      try {
+        this.recordFailure(component, error);
+      } catch {
+        // Diagnostics cannot replace an already committed import response.
+      }
+    };
     try {
       const target = this.assertTargetAcceptsSessionCreation(this.#store, input.targetId);
       let providerId = input.providerId;
@@ -8958,9 +9023,10 @@ export class SessionHost {
             packageSha256: input.package.sha256,
             importedAt: now
           }, now);
-          const initialActivation = prepared.nativeSession === undefined
-            ? portableActivationReadyRecord(now)
-            : portableActivationFailedRecord(new Error("Native task activation has not completed."), now);
+          const initialActivation = portableActivationFailedRecord(
+            new Error("Native task activation has not completed."),
+            now
+          );
           store.setSetting(
             "session",
             sessionId,
@@ -9045,6 +9111,7 @@ export class SessionHost {
           };
         }
       );
+      committedResult = result;
       acquiredWorktree = false;
       createdBinding = undefined;
       cleanupContext = undefined;
@@ -9053,9 +9120,11 @@ export class SessionHost {
           sessionId,
           this.activeSession(adapter, sessionId, backendInstanceGeneration, resourceCatalogEpoch)
         );
+        this.persistPortableImportActivation(sessionId, portableActivationReadyRecord());
       } else {
         await this.tryPortableSessionActivation(sessionId);
       }
+      activationSettled = true;
       if (replaced !== undefined) {
         const replacedContext = this.contextFor(replaced);
         await adapter.deleteSession(replaced.descriptor.binding, replacedContext)
@@ -9067,6 +9136,30 @@ export class SessionHost {
       }
       return this.portableImportExecutionWithActivation(result);
     } catch (error) {
+      if (committedResult !== undefined) {
+        recordPostCommitFailure("portable_import_post_commit", error);
+        if (!activationSettled) {
+          try {
+            this.persistPortableImportActivation(sessionId, portableActivationFailedRecord(error));
+          } catch (persistError) {
+            recordPostCommitFailure("portable_import_activation_receipt", persistError);
+          }
+        }
+        try {
+          return this.portableImportExecutionWithActivation(committedResult);
+        } catch (readError) {
+          recordPostCommitFailure("portable_import_activation_projection", readError);
+          const failed = portableActivationFailedRecord(readError);
+          return {
+            ...committedResult,
+            value: {
+              ...committedResult.value,
+              status: failed.status,
+              activationError: failed.error
+            }
+          };
+        }
+      }
       if (createdBinding !== undefined && cleanupContext !== undefined && adapterForCleanup !== undefined) {
         await adapterForCleanup.deleteSession(createdBinding, cleanupContext).catch(() => undefined);
       }
@@ -9075,7 +9168,11 @@ export class SessionHost {
       }
       return this.failClaimedEffect("import_portable_session", claim.operation.id, claim.operation.bodyHash, error);
     } finally {
-      this.#store.releaseArtifactStaging(stagedPortableArtifacts);
+      try {
+        this.#store.releaseArtifactStaging(stagedPortableArtifacts);
+      } catch (error) {
+        recordPostCommitFailure("portable_import_staging_release", error);
+      }
       releaseBackendAdmission?.();
       releasePortableReplacementFence?.();
     }
@@ -14193,6 +14290,7 @@ function importedSubagentState(
 function portableImportOperationBody(input: ImportPortableSessionInput): unknown {
   return {
     targetId: input.targetId,
+    ...(input.draftId === undefined ? {} : { draftId: input.draftId }),
     package: {
       id: input.package.id,
       sha256: input.package.sha256,
