@@ -2087,6 +2087,19 @@ CREATE TABLE schedule_deletion_cleanups (
         )
       ) STRICT;
 
+CREATE TABLE portable_replacement_cleanups (
+        operation_id TEXT PRIMARY KEY REFERENCES operations(id) ON DELETE RESTRICT,
+        imported_session_id TEXT NOT NULL REFERENCES product_sessions(id) ON DELETE RESTRICT,
+        replaced_session_id TEXT NOT NULL UNIQUE REFERENCES product_sessions(id) ON DELETE RESTRICT,
+        native_state TEXT NOT NULL CHECK (native_state IN ('pending', 'dispatched', 'unknown', 'completed')),
+        worktree_state TEXT NOT NULL CHECK (worktree_state IN ('pending', 'completed')),
+        failure_code TEXT,
+        created_at INTEGER NOT NULL CHECK (created_at >= 0),
+        updated_at INTEGER NOT NULL CHECK (updated_at >= created_at),
+        revision INTEGER NOT NULL CHECK (revision >= 1),
+        CHECK (imported_session_id <> replaced_session_id)
+      ) STRICT;
+
 CREATE TABLE session_lifecycle_cleanups (
         operation_id TEXT PRIMARY KEY CHECK (
           length(trim(operation_id)) BETWEEN 1 AND 256

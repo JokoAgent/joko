@@ -237,6 +237,7 @@ import type {
   SetMessagingConnectionEnabledInput,
   SessionLifecycleCleanupPhase,
   SessionLifecycleCleanupRecord,
+  PortableReplacementCleanupRecord,
   SessionSnapshot,
   SessionAttentionRecord,
   SessionRuntimePolicyRecord,
@@ -13756,6 +13757,161 @@ export class OperationalStore {
     return scheduleRunFromRow(row);
   }
 
+  preparePortableReplacementCleanup(input: {
+    readonly operationId: string;
+    readonly importedSessionId: string;
+    readonly replacedSessionId: string;
+    readonly at?: number;
+  }): PortableReplacementCleanupRecord {
+    const operationId = nonBlank(input.operationId, "Portable replacement operation ID");
+    const importedSessionId = nonBlank(input.importedSessionId, "Imported Session ID");
+    const replacedSessionId = nonBlank(input.replacedSessionId, "Replaced Session ID");
+    const at = input.at ?? this.now();
+    if (!Number.isSafeInteger(at) || at < 0) throw new StoreError("Portable replacement time is invalid.");
+    return this.write(() => {
+      const operation = this.getOperation(operationId);
+      if (operation.kind !== "import_portable_session" || operation.status !== "started") {
+        throw new StoreError("Portable replacement requires its started import operation.");
+      }
+      const imported = this.getSession(importedSessionId).descriptor;
+      const replaced = this.getSession(replacedSessionId).descriptor;
+      if (imported.deletedAt !== undefined || replaced.deletedAt === undefined
+        || imported.targetId !== replaced.targetId || imported.backendId !== replaced.backendId
+        || imported.binding.opaqueRef.toLowerCase() === replaced.binding.opaqueRef.toLowerCase()
+        || (imported.binding.nativeSessionId !== undefined
+          && imported.binding.nativeSessionId === replaced.binding.nativeSessionId)) {
+        throw new StoreError("Portable replacement does not own distinct old and new native Sessions.");
+      }
+      const existing = this.findPortableReplacementCleanup(operationId);
+      if (existing !== undefined) throw new StoreError("Portable replacement cleanup already exists.");
+      this.database.prepare(`
+        INSERT INTO portable_replacement_cleanups(
+          operation_id, imported_session_id, replaced_session_id, native_state,
+          worktree_state, failure_code, created_at, updated_at, revision
+        ) VALUES (?, ?, ?, 'pending', ?, NULL, ?, ?, ?)
+      `).run(
+        operationId,
+        importedSessionId,
+        replacedSessionId,
+        replaced.worktree === undefined ? "completed" : "pending",
+        at,
+        at,
+        asSqlInteger(this.requireActiveRevision())
+      );
+      return this.getPortableReplacementCleanup(operationId);
+    });
+  }
+
+  findPortableReplacementCleanup(operationId: string): PortableReplacementCleanupRecord | undefined {
+    this.assertOpen();
+    const row = this.database.prepare("SELECT * FROM portable_replacement_cleanups WHERE operation_id = ?")
+      .get(nonBlank(operationId, "Portable replacement operation ID")) as Row | undefined;
+    return row === undefined ? undefined : portableReplacementCleanupFromRow(row);
+  }
+
+  getPortableReplacementCleanup(operationId: string): PortableReplacementCleanupRecord {
+    const record = this.findPortableReplacementCleanup(operationId);
+    if (record === undefined) throw new NotFoundError("Portable replacement cleanup", operationId);
+    return record;
+  }
+
+  listPendingPortableReplacementCleanups(): PortableReplacementCleanupRecord[] {
+    this.assertOpen();
+    return (this.database.prepare(`
+      SELECT * FROM portable_replacement_cleanups
+      WHERE native_state <> 'completed' OR worktree_state <> 'completed'
+      ORDER BY created_at, operation_id
+    `).all() as Row[]).map(portableReplacementCleanupFromRow);
+  }
+
+  claimPortableReplacementNativeCleanup(operationId: string, at = this.now()): PortableReplacementCleanupRecord {
+    if (!Number.isSafeInteger(at) || at < 0) throw new StoreError("Portable replacement time is invalid.");
+    return this.write(() => {
+      const current = this.getPortableReplacementCleanup(operationId);
+      if (current.nativeState !== "pending") throw new StoreError("Portable replacement native cleanup is not pending.");
+      const imported = this.getSession(current.importedSessionId).descriptor;
+      const replaced = this.getSession(current.replacedSessionId).descriptor;
+      if (imported.deletedAt !== undefined || replaced.deletedAt === undefined
+        || imported.backendId !== replaced.backendId || imported.targetId !== replaced.targetId
+        || imported.binding.opaqueRef.toLowerCase() === replaced.binding.opaqueRef.toLowerCase()
+        || this.findLiveSessionByNativeBinding(replaced.backendId, replaced.binding.opaqueRef) !== undefined) {
+        throw new StoreError("Portable replacement native cleanup lost its exact owner.");
+      }
+      this.database.prepare(`
+        UPDATE portable_replacement_cleanups
+        SET native_state = 'dispatched', updated_at = ?, revision = ?
+        WHERE operation_id = ? AND native_state = 'pending'
+      `).run(at, asSqlInteger(this.requireActiveRevision()), operationId);
+      return this.getPortableReplacementCleanup(operationId);
+    });
+  }
+
+  confirmPortableReplacementNativeCleanup(operationId: string, at = this.now()): PortableReplacementCleanupRecord {
+    if (!Number.isSafeInteger(at) || at < 0) throw new StoreError("Portable replacement time is invalid.");
+    return this.write(() => {
+      const current = this.getPortableReplacementCleanup(operationId);
+      if (current.nativeState !== "dispatched") throw new StoreError("Portable replacement native deletion is not claimed.");
+      this.database.prepare(`
+        UPDATE portable_replacement_cleanups
+        SET native_state = 'completed', failure_code = NULL, updated_at = ?, revision = ?
+        WHERE operation_id = ? AND native_state = 'dispatched'
+      `).run(at, asSqlInteger(this.requireActiveRevision()), operationId);
+      return this.getPortableReplacementCleanup(operationId);
+    });
+  }
+
+  markPortableReplacementNativeUnknown(operationId: string, at = this.now()): PortableReplacementCleanupRecord {
+    if (!Number.isSafeInteger(at) || at < 0) throw new StoreError("Portable replacement time is invalid.");
+    return this.write(() => {
+      const current = this.getPortableReplacementCleanup(operationId);
+      if (current.nativeState !== "dispatched") return current;
+      this.database.prepare(`
+        UPDATE portable_replacement_cleanups
+        SET native_state = 'unknown', failure_code = 'native_delete_unknown', updated_at = ?, revision = ?
+        WHERE operation_id = ? AND native_state = 'dispatched'
+      `).run(at, asSqlInteger(this.requireActiveRevision()), operationId);
+      return this.getPortableReplacementCleanup(operationId);
+    });
+  }
+
+  recoverPortableReplacementCleanupClaims(at = this.now()): number {
+    if (!Number.isSafeInteger(at) || at < 0) throw new StoreError("Portable replacement time is invalid.");
+    return this.write(() => Number(this.database.prepare(`
+      UPDATE portable_replacement_cleanups
+      SET native_state = 'unknown', failure_code = 'native_delete_unknown', updated_at = ?, revision = ?
+      WHERE native_state = 'dispatched'
+    `).run(at, asSqlInteger(this.requireActiveRevision())).changes));
+  }
+
+  confirmPortableReplacementWorktreeCleanup(operationId: string, at = this.now()): PortableReplacementCleanupRecord {
+    if (!Number.isSafeInteger(at) || at < 0) throw new StoreError("Portable replacement time is invalid.");
+    return this.write(() => {
+      const current = this.getPortableReplacementCleanup(operationId);
+      if (current.nativeState !== "completed") throw new StoreError("Portable replacement native cleanup is not confirmed.");
+      if (current.worktreeState === "completed") return current;
+      this.database.prepare(`
+        UPDATE portable_replacement_cleanups
+        SET worktree_state = 'completed', failure_code = NULL, updated_at = ?, revision = ?
+        WHERE operation_id = ? AND worktree_state = 'pending'
+      `).run(at, asSqlInteger(this.requireActiveRevision()), operationId);
+      return this.getPortableReplacementCleanup(operationId);
+    });
+  }
+
+  markPortableReplacementWorktreePending(operationId: string, at = this.now()): PortableReplacementCleanupRecord {
+    if (!Number.isSafeInteger(at) || at < 0) throw new StoreError("Portable replacement time is invalid.");
+    return this.write(() => {
+      const current = this.getPortableReplacementCleanup(operationId);
+      if (current.nativeState !== "completed" || current.worktreeState !== "pending") return current;
+      this.database.prepare(`
+        UPDATE portable_replacement_cleanups
+        SET failure_code = 'worktree_release_pending', updated_at = ?, revision = ?
+        WHERE operation_id = ? AND native_state = 'completed' AND worktree_state = 'pending'
+      `).run(at, asSqlInteger(this.requireActiveRevision()), operationId);
+      return this.getPortableReplacementCleanup(operationId);
+    });
+  }
+
   prepareSessionLifecycleCleanup(input: {
     readonly operationId: string;
     readonly sessionId: string;
@@ -19864,6 +20020,21 @@ function scheduleDeletionCleanupFromRow(row: Row): ScheduleDeletionCleanupRecord
     failures,
     ...(projectTargetId === undefined ? {} : { projectTargetId }),
     ...(projectConfigId === undefined ? {} : { projectConfigId }),
+    createdAt: numberValue(row["created_at"]),
+    updatedAt: numberValue(row["updated_at"]),
+    revision: toBigInt(row["revision"])
+  };
+}
+
+function portableReplacementCleanupFromRow(row: Row): PortableReplacementCleanupRecord {
+  const failureCode = row["failure_code"] === null ? undefined : stringValue(row["failure_code"]);
+  return {
+    operationId: stringValue(row["operation_id"]),
+    importedSessionId: stringValue(row["imported_session_id"]),
+    replacedSessionId: stringValue(row["replaced_session_id"]),
+    nativeState: enumValue(row["native_state"], ["pending", "dispatched", "unknown", "completed"] as const),
+    worktreeState: enumValue(row["worktree_state"], ["pending", "completed"] as const),
+    ...(failureCode === undefined ? {} : { failureCode }),
     createdAt: numberValue(row["created_at"]),
     updatedAt: numberValue(row["updated_at"]),
     revision: toBigInt(row["revision"])

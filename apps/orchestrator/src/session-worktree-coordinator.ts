@@ -104,6 +104,16 @@ export class SessionWorktreeCoordinator {
     const pendingDerivationSessionIds = this.#store.listUnadoptedNativeSessionDerivations()
       .filter((record) => record.worktree?.remote === undefined && record.remoteWorktreePlan === undefined)
       .map((record) => record.sessionId);
+    const pendingReplacementSessions = this.#store.listPendingPortableReplacementCleanups()
+      .filter((record) => record.worktreeState === "pending")
+      .map((record) => this.#store.getSession(record.replacedSessionId))
+      .filter((session) => session.descriptor.worktree?.remote === undefined);
+    const pendingReplacementActiveSessionIds = pendingReplacementSessions
+      .filter((session) => session.descriptor.worktree?.state === "active")
+      .map((session) => session.descriptor.id);
+    const pendingReplacementPreservedSessionIds = pendingReplacementSessions
+      .filter((session) => session.descriptor.worktree?.state === "preserved")
+      .map((session) => session.descriptor.id);
     const liveSessionIds = localSessions
       .filter((session) => !session.descriptor.archived)
       .map((session) => session.descriptor.id);
@@ -115,9 +125,10 @@ export class SessionWorktreeCoordinator {
       retainSessionIds: [...new Set([
         ...liveSessionIds,
         ...scheduledOwnerSessionIds.filter((sessionId) => !archivedSessionIdSet.has(sessionId)),
-        ...pendingDerivationSessionIds
+        ...pendingDerivationSessionIds,
+        ...pendingReplacementActiveSessionIds
       ])],
-      preserveSessionIds: archivedSessionIds
+      preserveSessionIds: [...archivedSessionIds, ...pendingReplacementPreservedSessionIds]
     });
     if (!initialized.ok) throw new SessionWorktreeCoordinatorError(initialized.error.code);
     const active = new Map(this.#service.snapshot().active.map((lease) => [lease.sessionId, lease]));
@@ -559,6 +570,42 @@ export class SessionWorktreeCoordinator {
       && samePersistedBinding(persistedBinding, binding)
       && persistedBinding.state !== "preserved") {
       this.#store.updateSessionWorktreeState(sessionId, "preserved");
+    }
+  }
+
+  /** A deleted portable source retains its exact lease until native deletion is confirmed. */
+  async releasePortableReplacement(operationId: string): Promise<void> {
+    this.#requireInitialized();
+    const receipt = this.#store.getPortableReplacementCleanup(operationId);
+    if (receipt.nativeState !== "completed" || receipt.worktreeState !== "pending") {
+      throw new SessionWorktreeCoordinatorError("SESSION_CONFLICT");
+    }
+    const session = this.#store.getSession(receipt.replacedSessionId);
+    const binding = session.descriptor.worktree;
+    if (session.descriptor.deletedAt === undefined || binding === undefined || binding.remote !== undefined) {
+      throw new SessionWorktreeCoordinatorError("SESSION_CONFLICT");
+    }
+    const result = await this.#service.releaseExact({
+      sessionId: receipt.replacedSessionId,
+      leaseId: binding.leaseId,
+      path: binding.path,
+      repositoryRoot: binding.repositoryRoot,
+      branch: binding.branch,
+      source: {
+        ref: binding.sourceRef,
+        commit: binding.sourceCommit,
+        strategy: binding.sourceStrategy,
+        refreshed: binding.sourceRefreshed,
+        ...(binding.sourceRemote === undefined ? {} : { remote: binding.sourceRemote })
+      },
+      acquiredAt: binding.acquiredAt
+    });
+    if (!result.ok) throw new SessionWorktreeCoordinatorError(result.error.code);
+    if (result.value.status === "preserved") throw new SessionWorktreeCoordinatorError("SESSION_CONFLICT");
+    this.#activeBindings.delete(receipt.replacedSessionId);
+    this.#workspaces.unregister(binding.workspaceId);
+    if (binding.state !== "preserved") {
+      this.#store.updateSessionWorktreeState(receipt.replacedSessionId, "preserved");
     }
   }
 

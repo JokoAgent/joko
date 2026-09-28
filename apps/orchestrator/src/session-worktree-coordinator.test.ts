@@ -32,6 +32,108 @@ afterEach(async () => {
 });
 
 describe("SessionWorktreeCoordinator lifecycle", () => {
+  test("retains a deleted portable source until native cleanup and replays its exact worktree release", { timeout: 30_000 }, async () => {
+    const root = await mkdtemp(join(tmpdir(), "joko-portable-worktree-cleanup-"));
+    const repositoryRoot = await createRepository(join(root, "project"));
+    const store = new OperationalStore(join(root, "store.db"));
+    const artifacts = new ArtifactStore({
+      rootDirectory: join(root, "artifacts"),
+      repository: new OperationalArtifactRepository(store),
+      ingestRoots: [root]
+    });
+    await artifacts.initialize();
+    const workspaces = new WorkspaceService();
+    const storageRoot = join(root, "isolated");
+    const originalWorktrees = new SessionWorktreeCoordinator({ store, workspaces, storageRoot });
+    const adapter = new TargetCaptureAdapter();
+    const host = new SessionHost(store, artifacts, [adapter], { worktrees: originalWorktrees });
+    await originalWorktrees.initialize();
+    await host.initialize();
+    await host.registerTarget({
+      id: "target-one", backendId: adapter.id, displayName: "Project",
+      workspaceRoot: repositoryRoot, managed: false, trusted: true
+    });
+    const connection = store.createConnection({ id: "connection-one", name: "Test device", authKeyDigest: "digest" });
+    cleanups.push(async () => {
+      await host.dispose().catch(() => undefined);
+      originalWorktrees.dispose();
+      await workspaces.close().catch(() => undefined);
+      store.close();
+      await rm(root, { recursive: true, force: true, maxRetries: 3 });
+    });
+    const oldSessionId = (await host.createSession({
+      operationId: "create-portable-old-worktree", connection, targetId: "target-one",
+      title: "Old task", fastMode: false, permissionMode: "ask", planMode: false,
+      worktree: { sourceRef: "refs/heads/main", refreshRemote: false }
+    })).value.sessionId;
+    await host.close(oldSessionId);
+    const old = store.getSession(oldSessionId);
+    const oldWorktree = old.descriptor.worktree;
+    if (oldWorktree === undefined) throw new Error("Expected an isolated old task.");
+    const claim = store.claimAuthorizedDeferredEffectOperation(
+      connection.id, connection.authKeyDigest,
+      { id: "portable-worktree-replacement", kind: "import_portable_session", body: { targetId: "target-one" } }
+    );
+    if (!claim.claimed) throw new Error("Expected a new import operation.");
+    const now = Date.now();
+    store.completeAuthorizedDeferredEffectOperation(
+      connection.id, connection.authKeyDigest, claim.operation.id, claim.operation.bodyHash,
+      (transaction) => {
+        const { worktree: _oldWorktree, ...descriptor } = old.descriptor;
+        transaction.updateSession(oldSessionId, { archived: true, deletedAt: now }, old.revision, now);
+        transaction.createSession({
+          ...descriptor, id: "portable-new-session", title: "New task",
+          binding: { opaqueRef: "native/new-portable-session", generation: 1 },
+          archived: false, deletedAt: undefined, createdAt: now, updatedAt: now
+        });
+        transaction.preparePortableReplacementCleanup({
+          operationId: claim.operation.id,
+          importedSessionId: "portable-new-session",
+          replacedSessionId: oldSessionId,
+          at: now
+        });
+        return { sessionId: "portable-new-session" };
+      }
+    );
+    originalWorktrees.dispose();
+    const restartedWorkspaces = new WorkspaceService();
+    const restartedWorktrees = new SessionWorktreeCoordinator({ store, workspaces: restartedWorkspaces, storageRoot });
+    cleanups.push(async () => {
+      restartedWorktrees.dispose();
+      await restartedWorkspaces.close().catch(() => undefined);
+    });
+    await restartedWorktrees.initialize();
+    expect((await lstat(oldWorktree.path)).isDirectory()).toBe(true);
+    expect(store.getPortableReplacementCleanup(claim.operation.id))
+      .toMatchObject({ nativeState: "pending", worktreeState: "pending" });
+    store.claimPortableReplacementNativeCleanup(claim.operation.id);
+    store.confirmPortableReplacementNativeCleanup(claim.operation.id);
+    await host.dispose();
+    const receipt = vi.spyOn(store, "confirmPortableReplacementWorktreeCleanup")
+      .mockImplementationOnce(() => { throw new Error("worktree release acknowledgement was lost"); });
+    const recoveryHost = new SessionHost(store, artifacts, [new TargetCaptureAdapter()], { worktrees: restartedWorktrees });
+    cleanups.push(() => recoveryHost.dispose());
+    await recoveryHost.initialize();
+    receipt.mockRestore();
+    await expect(lstat(oldWorktree.path)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(store.getPortableReplacementCleanup(claim.operation.id))
+      .toMatchObject({ worktreeState: "pending", failureCode: "worktree_release_pending" });
+    await recoveryHost.dispose();
+    restartedWorktrees.dispose();
+    const finalWorkspaces = new WorkspaceService();
+    const finalWorktrees = new SessionWorktreeCoordinator({ store, workspaces: finalWorkspaces, storageRoot });
+    cleanups.push(async () => {
+      finalWorktrees.dispose();
+      await finalWorkspaces.close().catch(() => undefined);
+    });
+    await finalWorktrees.initialize();
+    const finalHost = new SessionHost(store, artifacts, [new TargetCaptureAdapter()], { worktrees: finalWorktrees });
+    cleanups.push(() => finalHost.dispose());
+    await finalHost.initialize();
+    expect(store.listPendingPortableReplacementCleanups()).toEqual([]);
+    expect(store.getSession("portable-new-session").descriptor.deletedAt).toBeUndefined();
+  });
+
   test("archives, restores, and dispatches the next prompt from the same isolated checkout", { timeout: 30_000 }, async () => {
     const root = await mkdtemp(join(tmpdir(), "joko-session-worktree-"));
     const repositoryRoot = await createRepository(join(root, "project"));

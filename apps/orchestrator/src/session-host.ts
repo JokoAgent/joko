@@ -1075,6 +1075,7 @@ export class SessionHost {
   async initialize(): Promise<void> {
     this.#assertOpen();
     this.#store.recoverStartup();
+    this.#store.recoverPortableReplacementCleanupClaims();
     this.#store.recoverPendingContextRebuilds();
     for (const descriptor of this.#initialBackendDescriptors.values()) {
       if (!this.#initialBackendDescriptorsAlreadyPublished) {
@@ -1159,6 +1160,11 @@ export class SessionHost {
     }
     await Promise.all(detachedSubagentRecoveries);
     await this.reconcileScheduledWorktrees();
+    for (const cleanup of this.#store.listPendingPortableReplacementCleanups()) {
+      await this.reconcilePortableReplacementCleanup(cleanup.operationId).catch((error: unknown) => {
+        this.recordFailure("portable_import_replacement_recovery", error);
+      });
+    }
   }
 
   async registerTarget(target: TargetDescriptor, metadata: unknown = {}): Promise<void> {
@@ -9017,6 +9023,14 @@ export class SessionHost {
             updatedAt: now
           };
           store.createSession(descriptor);
+          if (replaced !== undefined) {
+            store.preparePortableReplacementCleanup({
+              operationId: input.operationId,
+              importedSessionId: sessionId,
+              replacedSessionId: replaced.descriptor.id,
+              at: now
+            });
+          }
           store.setSetting("session", sessionId, PORTABLE_IMPORT_SOURCE_SETTING_KEY, {
             format: 1,
             targetId: input.targetId,
@@ -9126,13 +9140,8 @@ export class SessionHost {
       }
       activationSettled = true;
       if (replaced !== undefined) {
-        const replacedContext = this.contextFor(replaced);
-        await adapter.deleteSession(replaced.descriptor.binding, replacedContext)
-          .catch((error: unknown) => this.recordFailure("portable_import_replaced_native_cleanup", error));
-        if (replaced.descriptor.worktree !== undefined && this.#worktrees !== undefined) {
-          await this.#worktrees.release(replaced.descriptor.id)
-            .catch((error: unknown) => this.recordFailure("portable_import_replaced_worktree_cleanup", error));
-        }
+        await this.reconcilePortableReplacementCleanup(input.operationId)
+          .catch((error: unknown) => recordPostCommitFailure("portable_import_replacement_cleanup", error));
       }
       return this.portableImportExecutionWithActivation(result);
     } catch (error) {
@@ -9144,6 +9153,10 @@ export class SessionHost {
           } catch (persistError) {
             recordPostCommitFailure("portable_import_activation_receipt", persistError);
           }
+        }
+        if (replaced !== undefined) {
+          await this.reconcilePortableReplacementCleanup(input.operationId)
+            .catch((cleanupError: unknown) => recordPostCommitFailure("portable_import_replacement_cleanup", cleanupError));
         }
         try {
           return this.portableImportExecutionWithActivation(committedResult);
@@ -9161,7 +9174,16 @@ export class SessionHost {
         }
       }
       if (createdBinding !== undefined && cleanupContext !== undefined && adapterForCleanup !== undefined) {
-        await adapterForCleanup.deleteSession(createdBinding, cleanupContext).catch(() => undefined);
+        const unadoptedBinding = createdBinding;
+        const unadoptedContext = cleanupContext;
+        const adoptedElsewhere = this.#store.listSessions({ includeArchived: true }).some((session) =>
+          session.descriptor.backendId === unadoptedContext.target.backendId
+          && (session.descriptor.binding.opaqueRef.toLowerCase() === unadoptedBinding.opaqueRef.toLowerCase()
+            || (unadoptedBinding.nativeSessionId !== undefined
+              && session.descriptor.binding.nativeSessionId === unadoptedBinding.nativeSessionId)));
+        if (!adoptedElsewhere) {
+          await adapterForCleanup.deleteSession(unadoptedBinding, unadoptedContext).catch(() => undefined);
+        }
       }
       if (acquiredWorktree && this.#worktrees !== undefined) {
         await this.#worktrees.release(sessionId).catch(() => undefined);
@@ -9175,6 +9197,47 @@ export class SessionHost {
       }
       releaseBackendAdmission?.();
       releasePortableReplacementFence?.();
+    }
+  }
+
+  private async reconcilePortableReplacementCleanup(operationId: string): Promise<void> {
+    let cleanup = this.#store.getPortableReplacementCleanup(operationId);
+    if (cleanup.nativeState === "unknown") return;
+    if (cleanup.nativeState === "pending") {
+      const replaced = this.#store.getSession(cleanup.replacedSessionId);
+      const imported = this.#store.getSession(cleanup.importedSessionId);
+      if (replaced.descriptor.deletedAt === undefined || imported.descriptor.deletedAt !== undefined
+        || replaced.descriptor.backendId !== imported.descriptor.backendId
+        || replaced.descriptor.targetId !== imported.descriptor.targetId) {
+        throw new StoreError("Portable replacement cleanup lost its old or new Session owner.");
+      }
+      const adapter = this.requireAdapter(replaced.descriptor.backendId);
+      const generation = this.requireAdapterGeneration(replaced.descriptor.backendId, adapter);
+      const release = this.beginBackendAdmissionEffect(replaced.descriptor.backendId);
+      try {
+        const context = this.contextFor(replaced, undefined, undefined, operationId, undefined, generation);
+        this.assertCurrentAdapterGeneration(replaced.descriptor.backendId, adapter, generation);
+        cleanup = this.#store.claimPortableReplacementNativeCleanup(operationId);
+        try {
+          await adapter.deleteSession(replaced.descriptor.binding, context);
+          this.assertCurrentAdapterGeneration(replaced.descriptor.backendId, adapter, generation);
+          cleanup = this.#store.confirmPortableReplacementNativeCleanup(operationId);
+        } catch (error) {
+          this.#store.markPortableReplacementNativeUnknown(operationId);
+          throw error;
+        }
+      } finally {
+        release();
+      }
+    }
+    if (cleanup.nativeState !== "completed" || cleanup.worktreeState !== "pending") return;
+    if (this.#worktrees === undefined) throw new StoreError("Portable replacement worktree cleanup is unavailable.");
+    try {
+      await this.#worktrees.releasePortableReplacement(operationId);
+      this.#store.confirmPortableReplacementWorktreeCleanup(operationId);
+    } catch (error) {
+      this.#store.markPortableReplacementWorktreePending(operationId);
+      throw error;
     }
   }
 

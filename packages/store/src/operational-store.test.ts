@@ -2241,6 +2241,68 @@ describe("OperationalStore", () => {
     expect(commits).toBe(1);
   });
 
+  it("atomically adopts portable replacement cleanup and fences an unconfirmed native delete", () => {
+    const fixture = createFixture();
+    const store = fixture.store;
+    const connection = store.createConnection({
+      id: "portable-replacement-connection",
+      name: "Portable replacement client",
+      authKeyDigest: "portable-replacement-digest"
+    });
+    const claim = store.claimAuthorizedDeferredEffectOperation(
+      connection.id,
+      connection.authKeyDigest,
+      { id: "portable-replacement-operation", kind: "import_portable_session", body: { targetId: "target-1" } }
+    );
+    if (!claim.claimed) throw new Error("Expected a new portable import claim.");
+    const adopt = (transaction: OperationalStore) => {
+      const old = transaction.getSession("session-1");
+      transaction.updateSession("session-1", { deletedAt: 10, archived: true }, old.revision, 10);
+      transaction.createSession({
+        ...old.descriptor,
+        id: "portable-imported-session",
+        title: "Imported task",
+        binding: { opaqueRef: "native/imported.jsonl", generation: 1 },
+        archived: false,
+        deletedAt: undefined,
+        createdAt: 10,
+        updatedAt: 10
+      });
+      transaction.preparePortableReplacementCleanup({
+        operationId: claim.operation.id,
+        importedSessionId: "portable-imported-session",
+        replacedSessionId: "session-1",
+        at: 10
+      });
+      return { sessionId: "portable-imported-session" };
+    };
+    expect(() => store.completeAuthorizedDeferredEffectOperation(
+      connection.id, connection.authKeyDigest, claim.operation.id, claim.operation.bodyHash,
+      (transaction) => { adopt(transaction); throw new Error("finalizer failed"); }
+    )).toThrow("finalizer failed");
+    expect(store.getSession("session-1").descriptor.deletedAt).toBeUndefined();
+    expect(store.listSessions({ includeDeleted: true }).some((session) => session.descriptor.id === "portable-imported-session"))
+      .toBe(false);
+    expect(store.findPortableReplacementCleanup(claim.operation.id)).toBeUndefined();
+    expect(store.getOperation(claim.operation.id).status).toBe("started");
+
+    const completed = store.completeAuthorizedDeferredEffectOperation(
+      connection.id, connection.authKeyDigest, claim.operation.id, claim.operation.bodyHash, adopt
+    );
+    expect(completed.operation.status).toBe("completed");
+    expect(store.getPortableReplacementCleanup(claim.operation.id)).toMatchObject({
+      nativeState: "pending", worktreeState: "completed", replacedSessionId: "session-1"
+    });
+    expect(store.claimPortableReplacementNativeCleanup(claim.operation.id).nativeState).toBe("dispatched");
+    expect(store.recoverPortableReplacementCleanupClaims()).toBe(1);
+    expect(store.getPortableReplacementCleanup(claim.operation.id)).toMatchObject({
+      nativeState: "unknown", failureCode: "native_delete_unknown"
+    });
+    expect(() => store.claimPortableReplacementNativeCleanup(claim.operation.id)).toThrow(StoreError);
+    expect(store.getSession("portable-imported-session").descriptor.deletedAt).toBeUndefined();
+    expect(store.getOperation(claim.operation.id).status).toBe("completed");
+  });
+
   it("rolls back a failed deferred finalizer and leaves the claim available for a failure tombstone", () => {
     const store = createStore();
     const connection = store.createConnection({

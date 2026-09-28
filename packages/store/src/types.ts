@@ -1625,6 +1625,19 @@ export interface ScheduleDeletionCleanupRecord {
 
 export type SessionLifecycleCleanupPhase = "close" | "native" | "worktree" | "git_safety";
 
+/** Exact old-owner cleanup adopted atomically with a portable replacement. */
+export interface PortableReplacementCleanupRecord {
+  readonly operationId: string;
+  readonly importedSessionId: SessionId;
+  readonly replacedSessionId: SessionId;
+  readonly nativeState: "pending" | "dispatched" | "unknown" | "completed";
+  readonly worktreeState: "pending" | "completed";
+  readonly failureCode?: string;
+  readonly createdAt: UnixMillis;
+  readonly updatedAt: UnixMillis;
+  readonly revision: bigint;
+}
+
 /** Durable, replayable external-effect ledger for an ordinary task archive/delete. */
 export interface SessionLifecycleCleanupRecord {
   readonly operationId: string;

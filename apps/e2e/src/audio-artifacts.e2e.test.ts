@@ -110,6 +110,21 @@ it("publishes inline and resource-linked MCP tracks with one cover through HTTP 
       const blob = fixture.application.store.getArtifact(artifact.artifactId).blob;
       expect((await fixture.application.artifacts.readBlob(blob)).data).toEqual(wave());
     }
+    const replacementDraft = await paired.clients.portableSession.inspectPortableSessionImport({ package: exported.artifact });
+    const replacementOperationId = randomUUID();
+    const replaced = await paired.clients.portableSession.commitPortableSessionImport({
+      operationId: replacementOperationId,
+      draftId: replacementDraft.draft!.draftId,
+      targetId,
+      title: "Replaced tracks",
+      permissionMode: PermissionMode.ASK,
+      overwrite: true
+    });
+    expect(replaced.result!.replacedSessionIds).toEqual([importedId]);
+    expect(fixture.application.store.getSession(importedId).descriptor.deletedAt).toEqual(expect.any(Number));
+    expect(fixture.application.store.getSession(replaced.result!.sessionId).descriptor.deletedAt).toBeUndefined();
+    expect(fixture.application.store.getPortableReplacementCleanup(replacementOperationId))
+      .toMatchObject({ nativeState: "completed", worktreeState: "completed" });
   } finally {
     await internal?.close();
     await fixture?.close(); await protocol.close();
