@@ -30,7 +30,7 @@ import {
 import type { DelayedNewSessionDraft } from "../new-session-flow.js";
 import { NewSessionPage } from "./NewSessionPage.js";
 
-let latestEditorProps: { readonly knownWorkspacePaths?: readonly string[]; readonly document?: JSONContent; readonly onDocumentChange?: (document: JSONContent, isComposing: boolean, mapRanges?: (ranges: readonly ComposerInlineMentionRange[]) => readonly ComposerInlineMentionRange[]) => void } | undefined;
+let latestEditorProps: { readonly knownWorkspacePaths?: readonly string[]; readonly document?: JSONContent; readonly editable?: boolean; readonly onDocumentChange?: (document: JSONContent, isComposing: boolean, mapRanges?: (ranges: readonly ComposerInlineMentionRange[]) => readonly ComposerInlineMentionRange[]) => void } | undefined;
 let renderVoiceSelection = false;
 const voiceCaptures: Array<{
   emit(update: VoiceMediaSessionUpdate): void;
@@ -54,7 +54,7 @@ vi.mock("../voice-input-media.js", async (importOriginal) => ({
 }));
 
 vi.mock("./ComposerRichTextEditor.js", () => ({
-  ComposerRichTextEditor: forwardRef(function Editor(props: { readonly knownWorkspacePaths?: readonly string[]; readonly document: JSONContent }, ref) {
+  ComposerRichTextEditor: forwardRef(function Editor(props: { readonly knownWorkspacePaths?: readonly string[]; readonly document: JSONContent; readonly editable: boolean }, ref) {
     latestEditorProps = props;
     useImperativeHandle(ref, () => ({
       focus: vi.fn(),
@@ -64,7 +64,7 @@ vi.mock("./ComposerRichTextEditor.js", () => ({
       insertText: vi.fn(),
       editPastedText: vi.fn()
     }));
-    return <div data-testid="editor" className={renderVoiceSelection ? "composer-rich-editor__content" : undefined}>{renderVoiceSelection ? composerDocumentPlainText(props.document) : null}</div>;
+    return <div data-testid="editor" data-editable={props.editable} className={renderVoiceSelection ? "composer-rich-editor__content" : undefined}>{renderVoiceSelection ? composerDocumentPlainText(props.document) : null}</div>;
   })
 }));
 vi.mock("./ModelPicker.js", () => ({ ModelPicker: () => <div data-testid="model-picker" /> }));
@@ -99,6 +99,71 @@ afterEach(async () => {
 });
 
 describe("new-task native draft recovery", () => {
+  it("keeps the editor read-only until the active Profile draft has hydrated", async () => {
+    const pending = deferred<NewSessionLocalDraft | undefined>();
+    const api = controller({ discover: async () => [], snapshotValue: emptySnapshot(), profile: connectionProfile("profile", "server") });
+    api.readNewSessionDraft = vi.fn(() => pending.promise);
+    const { container } = await renderPage(api, vi.fn(async () => undefined));
+    expect(container.querySelector("[data-testid='editor']")?.getAttribute("data-editable")).toBe("false");
+    await act(async () => pending.resolve({
+      ...restoredDraft(), selection: { kind: "unselected" }, nativeStart: { kind: "fresh" }
+    }));
+    await vi.waitFor(() => expect(container.querySelector("[data-testid='editor']")?.getAttribute("data-editable")).toBe("true"));
+  });
+
+  it("does not save one Profile's draft into another while the next Profile hydrates", async () => {
+    const firstDraft = { ...restoredDraft(), selection: { kind: "unselected" as const }, nativeStart: { kind: "fresh" as const },
+      text: "First Profile", editorDocument: plainTextToComposerDocument("First Profile") };
+    const nextDraft = { ...firstDraft, text: "Next Profile", editorDocument: plainTextToComposerDocument("Next Profile") };
+    const pending = deferred<NewSessionLocalDraft | undefined>();
+    const first = controller({ discover: async () => [], draft: firstDraft, snapshotValue: emptySnapshot(), profile: connectionProfile("first", "server") });
+    const nextSave = vi.fn(async () => undefined);
+    const next = controller({ discover: async () => [], saveDraft: nextSave, snapshotValue: emptySnapshot(), profile: connectionProfile("next", "server") });
+    next.readNewSessionDraft = vi.fn(() => pending.promise);
+    const page = await renderPage(first, vi.fn(async () => undefined));
+    await vi.waitFor(() => expect(page.container.querySelector("[data-testid='editor']")?.getAttribute("data-editable")).toBe("true"));
+    await page.rerender(next);
+    expect(page.container.querySelector("[data-testid='editor']")?.getAttribute("data-editable")).toBe("false");
+    await act(async () => { await new Promise((resolve) => window.setTimeout(resolve, 500)); });
+    expect(nextSave).not.toHaveBeenCalled();
+    await act(async () => pending.resolve(nextDraft));
+    await vi.waitFor(() => expect(page.container.querySelector("[data-testid='editor']")?.getAttribute("data-editable")).toBe("true"));
+    expect(composerDocumentPlainText(required(latestEditorProps?.document))).toBe("Next Profile");
+    await vi.waitFor(() => expect(nextSave).toHaveBeenCalledWith(expect.objectContaining({ text: "Next Profile" })));
+    expect(nextSave).not.toHaveBeenCalledWith(expect.objectContaining({ text: "First Profile" }));
+  });
+
+  it("persists and rehydrates input without an available Backend or Target", async () => {
+    let persisted: NewSessionLocalDraft = {
+      ...restoredDraft(),
+      selection: { kind: "unselected" },
+      nativeStart: { kind: "fresh" },
+      text: "Before choosing a Backend",
+      editorDocument: plainTextToComposerDocument("Before choosing a Backend")
+    };
+    const saveDraft = vi.fn(async (draft: NewSessionLocalDraft) => { persisted = draft; });
+    const makeController = () => controller({
+      discover: async () => [],
+      draft: persisted,
+      saveDraft,
+      snapshotValue: emptySnapshot(),
+      profile: connectionProfile("profile", "server")
+    });
+    const initial = await renderPage(makeController(), vi.fn(async () => undefined));
+    await flush();
+    expect(composerDocumentPlainText(required(latestEditorProps?.document))).toBe("Before choosing a Backend");
+    expect(sendButton(initial.container).disabled).toBe(true);
+    await act(async () => latestEditorProps?.onDocumentChange?.(plainTextToComposerDocument("Still here"), false));
+    await vi.waitFor(() => expect(saveDraft).toHaveBeenCalledWith(expect.objectContaining({
+      selection: { kind: "unselected" }, text: "Still here"
+    })));
+    await unmountPage(initial.root);
+    const reopened = await renderPage(makeController(), vi.fn(async () => undefined));
+    await flush();
+    expect(composerDocumentPlainText(required(latestEditorProps?.document))).toBe("Still here");
+    expect(sendButton(reopened.container).disabled).toBe(true);
+  });
+
   it("preserves an unavailable draft project and retries its exact workspace without losing input", async () => {
     const prepareWorkspace = vi.fn()
       .mockRejectedValueOnce(new Error("Directory missing"))

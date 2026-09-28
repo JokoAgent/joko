@@ -8,32 +8,35 @@ describe("durable composer mention inventory", () => {
   it("atomically rejects stale replacement and rollback writes even when the draft text returns to its previous value", async () => {
     const state = memoryLocalState();
     const draft = { text: "Original", deliveryMode: "prompt" as const, mentions: [], attachments: [] };
-    expect(await state.readDraftSnapshot("server", "session")).toEqual({ revision: 0 });
-    await state.saveDraft("server", "session", draft);
-    const initial = await state.readDraftSnapshot("server", "session");
-    const replacement = await state.saveDraftIfRevision("server", "session", { ...draft, text: "Edited" }, initial.revision);
+    expect(await state.readDraftSnapshot("server", "profile", "session")).toEqual({ revision: 0 });
+    await state.saveDraft("server", "profile", "session", draft);
+    const initial = await state.readDraftSnapshot("server", "profile", "session");
+    const replacement = await state.saveDraftIfRevision("server", "profile", "session", { ...draft, text: "Edited" }, initial.revision);
     expect(replacement).toBe(2);
-    await state.saveDraft("server", "session", { ...draft, text: "New user draft" });
-    expect(await state.saveDraftIfRevision("server", "session", draft, replacement!)).toBeUndefined();
-    expect((await state.readDraft("server", "session"))?.text).toBe("New user draft");
-    await state.saveDraft("server", "session", draft);
-    expect(await state.saveDraftIfRevision("server", "session", { ...draft, text: "Stale" }, initial.revision)).toBeUndefined();
-    const current = await state.readDraftSnapshot("server", "session");
-    const writes = await Promise.all([state.saveDraftIfRevision("server", "session", draft, current.revision), state.saveDraftIfRevision("server", "session", draft, current.revision)]);
+    await state.saveDraft("server", "profile", "session", { ...draft, text: "New user draft" });
+    expect(await state.saveDraftIfRevision("server", "profile", "session", draft, replacement!)).toBeUndefined();
+    expect((await state.readDraft("server", "profile", "session"))?.text).toBe("New user draft");
+    await state.saveDraft("server", "profile", "session", draft);
+    expect(await state.saveDraftIfRevision("server", "profile", "session", { ...draft, text: "Stale" }, initial.revision)).toBeUndefined();
+    const current = await state.readDraftSnapshot("server", "profile", "session");
+    const writes = await Promise.all([state.saveDraftIfRevision("server", "profile", "session", draft, current.revision), state.saveDraftIfRevision("server", "profile", "session", draft, current.revision)]);
     expect(writes.filter((value) => value !== undefined)).toHaveLength(1);
   });
 
-  it("isolates equal task IDs on different servers and preserves each server's draft", async () => {
+  it("isolates equal task IDs across servers and profiles", async () => {
     const state = memoryLocalState();
     const mentions: ComposerMentionDraft[] = [{ id: "artifact:one", kind: "artifact", sourceSessionId: "source-one", reference: "one", label: "Report", token: "@Report" }];
     const draft = { text: "First server @Report", deliveryMode: "prompt" as const, mentions, attachments: [],
       inlineMentionRanges: [{ mentionId: "artifact:one", from: 13, to: 20 }] };
-    await state.saveDraft("server-one", "same-session", draft);
-    expect(await state.readDraft("server-two", "same-session")).toBeUndefined();
-    await state.saveDraft("server-two", "same-session", { ...draft, text: "Second server", mentions: [], inlineMentionRanges: [] });
-    expect((await state.readDraft("server-one", "same-session"))?.text).toBe("First server @Report");
-    expect((await state.readDraft("server-one", "same-session"))?.mentions).toEqual(mentions);
-    expect((await state.readDraft("server-two", "same-session"))?.text).toBe("Second server");
+    await state.saveDraft("server-one", "profile-one", "same-session", draft);
+    expect(await state.readDraft("server-two", "profile-one", "same-session")).toBeUndefined();
+    expect(await state.readDraft("server-one", "profile-two", "same-session")).toBeUndefined();
+    await state.saveDraft("server-two", "profile-one", "same-session", { ...draft, text: "Second server", mentions: [], inlineMentionRanges: [] });
+    await state.saveDraft("server-one", "profile-two", "same-session", { ...draft, text: "Second profile", mentions: [], inlineMentionRanges: [] });
+    expect((await state.readDraft("server-one", "profile-one", "same-session"))?.text).toBe("First server @Report");
+    expect((await state.readDraft("server-one", "profile-one", "same-session"))?.mentions).toEqual(mentions);
+    expect((await state.readDraft("server-two", "profile-one", "same-session"))?.text).toBe("Second server");
+    expect((await state.readDraft("server-one", "profile-two", "same-session"))?.text).toBe("Second profile");
   });
 
   it("round-trips more than 500 workspace and message mentions without losing send semantics", async () => {
@@ -65,14 +68,14 @@ describe("durable composer mention inventory", () => {
       return range;
     });
 
-    await state.saveDraft("server", "session", {
+    await state.saveDraft("server", "profile", "session", {
       text,
       deliveryMode: "prompt",
       mentions,
       inlineMentionRanges,
       attachments: []
     });
-    const restored = await state.readDraft("server", "session");
+    const restored = await state.readDraft("server", "profile", "session");
 
     expect(restored?.mentions).toEqual(mentions);
     const ranges = restored?.inlineMentionRanges ?? [];
@@ -84,9 +87,9 @@ describe("durable composer mention inventory", () => {
   it("persists exact repeated same-name identities independently of inventory order in task and delayed-create drafts", async () => {
     const state = memoryLocalState();
     const draft = occurrenceDraft();
-    await state.saveDraft("server", "session", draft);
-    expect((await state.readDraft("server", "session"))?.inlineMentionRanges).toEqual(draft.inlineMentionRanges);
-    expect((await state.readDraft("server", "session"))?.mentions).toEqual(draft.mentions);
+    await state.saveDraft("server", "profile", "session", draft);
+    expect((await state.readDraft("server", "profile", "session"))?.inlineMentionRanges).toEqual(draft.inlineMentionRanges);
+    expect((await state.readDraft("server", "profile", "session"))?.mentions).toEqual(draft.mentions);
     const newDraft: NewSessionLocalDraft = { ...draft, editorDocument: plainTextToComposerDocument(draft.text),
       selection: { kind: "dialogue", backendId: "backend" }, nativeStart: { kind: "fresh" }, providerId: "", modelId: "",
       fastMode: false, planMode: false, permissionMode: "ask", browserComments: [{
@@ -116,21 +119,21 @@ describe("durable composer mention inventory", () => {
     const records = new Map<IDBValidKey, unknown>();
     const state = memoryLocalState(records);
     const draft = occurrenceDraft();
-    await state.saveDraft("server", "session", draft);
+    await state.saveDraft("server", "profile", "session", draft);
     const invalid = { ...draft, inlineMentionRanges } as ComposerDraft;
-    await expect(state.saveDraft("server", "session", invalid)).rejects.toThrow("mention occurrences");
-    expect((await state.readDraft("server", "session"))?.inlineMentionRanges).toEqual(draft.inlineMentionRanges);
-    records.set(JSON.stringify(["server", "session"]), { revision: 1, draft: invalid });
-    await expect(state.readDraft("server", "session")).rejects.toThrow("mention occurrences");
+    await expect(state.saveDraft("server", "profile", "session", invalid)).rejects.toThrow("mention occurrences");
+    expect((await state.readDraft("server", "profile", "session"))?.inlineMentionRanges).toEqual(draft.inlineMentionRanges);
+    records.set(JSON.stringify(["server", "profile", "session"]), { revision: 1, draft: invalid });
+    await expect(state.readDraft("server", "profile", "session")).rejects.toThrow("mention occurrences");
   });
 
   it("rejects duplicated identity records and treats unselected token spelling as ordinary prose", async () => {
     const state = memoryLocalState();
     const draft = occurrenceDraft();
-    await expect(state.saveDraft("server", "session", { ...draft, mentions: [...draft.mentions, draft.mentions[0]!] })).rejects.toThrow("mention identities");
-    await state.saveDraft("server", "session", { ...draft, mentions: draft.mentions.filter((mention) => mention.kind === "message"), inlineMentionRanges: undefined });
-    expect((await state.readDraft("server", "session"))?.text).toBe(draft.text);
-    expect((await state.readDraft("server", "session"))?.inlineMentionRanges).toBeUndefined();
+    await expect(state.saveDraft("server", "profile", "session", { ...draft, mentions: [...draft.mentions, draft.mentions[0]!] })).rejects.toThrow("mention identities");
+    await state.saveDraft("server", "profile", "session", { ...draft, mentions: draft.mentions.filter((mention) => mention.kind === "message"), inlineMentionRanges: undefined });
+    expect((await state.readDraft("server", "profile", "session"))?.text).toBe(draft.text);
+    expect((await state.readDraft("server", "profile", "session"))?.inlineMentionRanges).toBeUndefined();
   });
 });
 

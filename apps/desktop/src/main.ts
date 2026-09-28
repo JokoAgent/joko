@@ -408,7 +408,7 @@ const sourceDirectory = resolve(fileURLToPath(new URL(".", import.meta.url)));
 const developmentUrl = process.env["JOKO_WEB_DEV_URL"];
 const packagedSmoke = process.env["JOKO_DESKTOP_PACKAGED_SMOKE"] === "1";
 const packagedSmokeScope = process.env["JOKO_DESKTOP_SMOKE_SCOPE"] ?? "full";
-if (packagedSmoke && packagedSmokeScope !== "full" && packagedSmokeScope !== "inspector") {
+if (packagedSmoke && packagedSmokeScope !== "full" && packagedSmokeScope !== "inspector" && packagedSmokeScope !== "draft") {
   throw new Error(`Unsupported packaged smoke scope: ${packagedSmokeScope}`);
 }
 const packagedSmokeTimeoutCandidate = Number(process.env["JOKO_DESKTOP_SMOKE_TIMEOUT_MS"]);
@@ -1365,15 +1365,20 @@ function createWindow(): void {
         if (rendered !== true) {
           throw new Error("The packaged product renderer did not return its exact ready marker.");
         }
-        if (nativeTaskStatusSupported) await verifyPackagedSmokeNativeTaskStatus(window);
-        if (packagedSmokeScope === "full") {
-          await verifyPackagedSmokeRuntimeProcessMonitor(window);
-          if (process.platform === "win32" || process.platform === "darwin") await verifyPackagedSmokeFullscreen(window);
-          await verifyPackagedSmokeSessionWindow(window);
+        if (packagedSmokeScope === "draft") {
+          await verifyPackagedSmokeNewTaskDraftCrash(window);
         } else {
-          recordPackagedSmokeProgress("inspector_scope_selected");
+          if (nativeTaskStatusSupported) await verifyPackagedSmokeNativeTaskStatus(window);
+          if (packagedSmokeScope === "full") {
+            await verifyPackagedSmokeRuntimeProcessMonitor(window);
+            if (process.platform === "win32" || process.platform === "darwin") await verifyPackagedSmokeFullscreen(window);
+            await verifyPackagedSmokeSessionWindow(window);
+            await verifyPackagedSmokeNewTaskDraftCrash(window);
+          } else {
+            recordPackagedSmokeProgress("inspector_scope_selected");
+          }
+          await verifyPackagedSmokeInspectorWindow(window);
         }
-        await verifyPackagedSmokeInspectorWindow(window);
       }).then(() => {
         clearTimeout(timeout);
         process.stdout.write("JOKO_DESKTOP_SMOKE_OK\n");
@@ -2099,6 +2104,8 @@ async function verifyPackagedSmokeSessionWindow(owner: BrowserWindow): Promise<v
   }
   recordPackagedSmokeProgress("task_windows_concurrent_exact_owners");
 
+  const crashDraftText = "Joko task draft survives renderer recovery";
+  await writePackagedSmokeTaskDraft(taskWindow, connection, task.sessionId, crashDraftText);
   const rendererLost = new Promise<void>((resolveLoss) => taskContents.once("render-process-gone", () => resolveLoss()));
   const rendererReloaded = new Promise<void>((resolveLoad) => taskContents.once("did-finish-load", () => resolveLoad()));
   taskContents.forcefullyCrashRenderer();
@@ -2108,9 +2115,11 @@ async function verifyPackagedSmokeSessionWindow(owner: BrowserWindow): Promise<v
     waitForPackagedSmokeTaskPresentation(taskWindow, task, taskOwner),
     waitForPackagedSmokeTaskPresentation(concurrentWindow, concurrentTask, concurrentOwner)
   ]);
+  await waitForPackagedSmokeTaskDraft(taskWindow, crashDraftText, false);
   assertPackagedSmokeTaskWindowOwner(taskWindow, taskOwner);
   assertPackagedSmokeTaskWindowOwner(concurrentWindow, concurrentOwner);
   recordPackagedSmokeProgress("task_window_crash_recovered_exact_owner");
+  recordPackagedSmokeProgress("task_draft_recovered_after_renderer_crash");
 
   await closePackagedSmokeTaskWindow(taskWindow, taskOwner);
   await waitForPackagedSmokeTaskPresentation(concurrentWindow, concurrentTask, concurrentOwner);
@@ -2727,6 +2736,154 @@ async function focusPackagedSmokeTaskWindow(
     throw new Error("Packaged smoke Task-window focus returned an invalid result.");
   }
   return value;
+}
+
+async function writePackagedSmokeTaskDraft(
+  window: BrowserWindow,
+  connection: DesktopManagedOrchestratorConnection,
+  sessionId: string,
+  text: string
+): Promise<void> {
+  const deadline = Date.now() + 20_000;
+  while (Date.now() < deadline) {
+    const ready = await window.webContents.executeJavaScript(
+      "Boolean(document.querySelector('.session-pane .composer-rich-editor__content[contenteditable=\"true\"]'))",
+      true
+    ) as unknown;
+    if (ready === true) break;
+    await waitForPackagedSmokePoll();
+  }
+  const inserted = await window.webContents.executeJavaScript([
+    "(() => {",
+    "  const editor = document.querySelector('.session-pane .composer-rich-editor__content[contenteditable=\"true\"]');",
+    "  if (!(editor instanceof HTMLElement) || editor.textContent?.trim()) return false;",
+    "  editor.focus();",
+    "  const selection = window.getSelection();",
+    "  selection?.selectAllChildren(editor);",
+    "  selection?.collapseToEnd();",
+    `  return document.execCommand('insertText', false, ${JSON.stringify(text)});`,
+    "})()"
+  ].join("\n"), true) as unknown;
+  if (inserted !== true) throw new Error("Packaged smoke could not edit the Task composer.");
+  await waitForPackagedSmokeTaskDraft(window, text, true);
+  await waitForPackagedSmokeIndexedDraft(
+    window,
+    JSON.stringify([connection.serverId, connection.profileId, sessionId]),
+    text,
+    "task"
+  );
+}
+
+async function waitForPackagedSmokeTaskDraft(window: BrowserWindow, text: string, requireSaved: boolean): Promise<void> {
+  const deadline = Date.now() + 20_000;
+  while (Date.now() < deadline) {
+    const observation = await window.webContents.executeJavaScript([
+      "(() => {",
+      "  const pane = document.querySelector('.session-pane');",
+      "  const editor = pane?.querySelector('.composer-rich-editor__content');",
+      "  return { text: editor?.textContent ?? '', saved: Boolean(pane?.querySelector('.draft-saved')) };",
+      "})()"
+    ].join("\n"), true) as unknown;
+    if (typeof observation === "object" && observation !== null && !Array.isArray(observation)) {
+      const result = observation as { readonly text?: unknown; readonly saved?: unknown };
+      if (result.text === text && (!requireSaved || result.saved === true)) return;
+    }
+    await waitForPackagedSmokePoll();
+  }
+  throw new Error(requireSaved
+    ? "Packaged smoke Task draft was not confirmed durable before the renderer crash."
+    : "Packaged smoke Task draft was not restored after the renderer crash.");
+}
+
+async function waitForPackagedSmokeIndexedDraft(
+  window: BrowserWindow,
+  key: string,
+  text: string,
+  kind: "task" | "new-task"
+): Promise<void> {
+  const deadline = Date.now() + 20_000;
+  while (Date.now() < deadline) {
+    const durable = await window.webContents.executeJavaScript([
+      "(async () => {",
+      "  const database = await new Promise((resolve, reject) => {",
+      "    const request = indexedDB.open('joko-ui', 1);",
+      "    request.onsuccess = () => resolve(request.result);",
+      "    request.onerror = () => reject(request.error);",
+      "  });",
+      "  try {",
+      "    return await new Promise((resolve, reject) => {",
+      "      const request = database.transaction('drafts', 'readonly').objectStore('drafts')",
+      `        .get(${JSON.stringify(key)});`,
+      `      request.onsuccess = () => resolve(${kind === "task" ? "request.result?.draft?.text" : "request.result?.text"} === ${JSON.stringify(text)});`,
+      "      request.onerror = () => reject(request.error);",
+      "    });",
+      "  } finally { database.close(); }",
+      "})()"
+    ].join("\n"), true) === true;
+    if (durable) return;
+    await waitForPackagedSmokePoll();
+  }
+  throw new Error(`Packaged smoke ${kind} draft was not durable before the renderer crash.`);
+}
+
+async function verifyPackagedSmokeNewTaskDraftCrash(window: BrowserWindow): Promise<void> {
+  const connection = await window.webContents.executeJavaScript(
+    "window.jokoDesktop.managedOrchestrator.getConnection()",
+    true
+  ) as unknown;
+  if (typeof connection !== "object" || connection === null || Array.isArray(connection)
+    || typeof (connection as Record<string, unknown>)["serverId"] !== "string"
+    || typeof (connection as Record<string, unknown>)["profileId"] !== "string") {
+    throw new Error("Packaged smoke new-task draft has no managed connection owner.");
+  }
+  const { serverId, profileId } = connection as DesktopManagedOrchestratorConnection;
+  const draftKey = `new-session\u0000${serverId}\u0000${profileId}`;
+  const draftText = "Joko new-task draft survives renderer recovery";
+  await window.webContents.executeJavaScript("location.hash = '#/tasks/new'; true", true);
+  const readyDeadline = Date.now() + 20_000;
+  let editorReady = false;
+  while (Date.now() < readyDeadline) {
+    editorReady = await window.webContents.executeJavaScript(
+      "Boolean(document.querySelector('.new-task-page .composer-rich-editor__content[contenteditable=\"true\"]'))",
+      true
+    ) === true;
+    if (editorReady) break;
+    await waitForPackagedSmokePoll();
+  }
+  if (!editorReady) throw new Error("Packaged smoke new-task composer did not become editable.");
+  const inserted = await window.webContents.executeJavaScript([
+    "(() => {",
+    "  const editor = document.querySelector('.new-task-page .composer-rich-editor__content[contenteditable=\"true\"]');",
+    "  if (!(editor instanceof HTMLElement) || editor.textContent?.trim()) return false;",
+    "  editor.focus();",
+    "  const selection = window.getSelection();",
+    "  selection?.selectAllChildren(editor);",
+    "  selection?.collapseToEnd();",
+    `  return document.execCommand('insertText', false, ${JSON.stringify(draftText)});`,
+    "})()"
+  ].join("\n"), true) as unknown;
+  if (inserted !== true) throw new Error("Packaged smoke could not edit the new-task composer.");
+  await waitForPackagedSmokeIndexedDraft(window, draftKey, draftText, "new-task");
+  const contents = window.webContents;
+  const lost = new Promise<void>((resolveLoss) => contents.once("render-process-gone", () => resolveLoss()));
+  contents.forcefullyCrashRenderer();
+  await waitForPackagedSmokeDeadline(lost, 10_000, "new-task renderer crash");
+  await waitForPackagedSmokeOwnerDocument(window, "new-task crash reload", () => window.reload());
+  const restoreDeadline = Date.now() + 20_000;
+  while (Date.now() < restoreDeadline) {
+    const restored = await window.webContents.executeJavaScript([
+      "(() => {",
+      "  const editor = document.querySelector('.new-task-page .composer-rich-editor__content');",
+      `  return editor?.textContent === ${JSON.stringify(draftText)};`,
+      "})()"
+    ].join("\n"), true) as unknown;
+    if (restored === true) {
+      recordPackagedSmokeProgress("new_task_draft_recovered_after_renderer_crash");
+      return;
+    }
+    await waitForPackagedSmokePoll();
+  }
+  throw new Error("Packaged smoke new-task draft was not restored after the renderer crash.");
 }
 
 async function waitForPackagedSmokeTaskPresentation(

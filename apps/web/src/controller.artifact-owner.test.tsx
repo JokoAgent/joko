@@ -291,17 +291,17 @@ it("keeps resource and auxiliary operations bound to the controller snapshot's g
   const capturedDraft = { text: "Captured", attachments: [], mentions: [], deliveryMode: "prompt" as const };
   await firstController.readDraft("shared-session");
   await firstController.saveDraft("shared-session", capturedDraft);
-  expect(readDraft).toHaveBeenLastCalledWith(first.serverId, "shared-session");
-  expect(saveDraft).toHaveBeenLastCalledWith(first.serverId, "shared-session", capturedDraft);
+  expect(readDraft).toHaveBeenLastCalledWith(first.serverId, first.id, "shared-session");
+  expect(saveDraft).toHaveBeenLastCalledWith(first.serverId, first.id, "shared-session", capturedDraft);
   await secondController.saveDraft("shared-session", capturedDraft);
-  expect(saveDraft).toHaveBeenLastCalledWith(second.serverId, "shared-session", capturedDraft);
+  expect(saveDraft).toHaveBeenLastCalledWith(second.serverId, second.id, "shared-session", capturedDraft);
   await firstController.readDraftSnapshot("shared-session");
   await firstController.saveDraftIfRevision("shared-session", capturedDraft, 0);
-  expect(readDraftSnapshot).toHaveBeenLastCalledWith(first.serverId, "shared-session");
-  expect(saveDraftIfRevision).toHaveBeenLastCalledWith(first.serverId, "shared-session", capturedDraft, 0);
+  expect(readDraftSnapshot).toHaveBeenLastCalledWith(first.serverId, first.id, "shared-session");
+  expect(saveDraftIfRevision).toHaveBeenLastCalledWith(first.serverId, first.id, "shared-session", capturedDraft, 0);
   await act(async () => firstController.restoreFirstInputDraft("shared-session", capturedDraft));
-  expect(readDraftSnapshot).toHaveBeenLastCalledWith(first.serverId, "shared-session");
-  expect(saveDraftIfRevision).toHaveBeenLastCalledWith(first.serverId, "shared-session", expect.objectContaining({
+  expect(readDraftSnapshot).toHaveBeenLastCalledWith(first.serverId, first.id, "shared-session");
+  expect(saveDraftIfRevision).toHaveBeenLastCalledWith(first.serverId, first.id, "shared-session", expect.objectContaining({
     text: "Captured",
     deliveryMode: "prompt"
   }), 0);

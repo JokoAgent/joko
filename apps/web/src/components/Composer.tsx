@@ -79,6 +79,7 @@ interface ComposerWorkspaceMentionIndex {
 interface PendingComposerDraftSave {
   readonly ownerKey: string;
   readonly serverId: string | undefined;
+  readonly profileId: string | undefined;
   readonly surface: object;
   readonly ownerDocument: Document;
   readonly sessionId: string;
@@ -538,9 +539,9 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
     setBrowserComments((current) => { revokeBrowserCommentPreviews(current); return []; });
     const sourceController = controllerRef.current;
     const sourceDocument = composerStackRef.current?.ownerDocument;
-    void pendingComposerDraftSave(sourceController.state.activeProfile?.serverId, session.id)
+    void pendingComposerDraftSave(sourceController.state.activeProfile?.serverId, sourceController.state.activeProfile?.id, session.id)
       .then(async () => {
-        const failed = sourceDocument === undefined ? undefined : failedComposerDraftSave(sourceController.state.activeProfile?.serverId, session.id, voiceDictionaryOwnerKey, sourceDocument);
+        const failed = sourceDocument === undefined ? undefined : failedComposerDraftSave(sourceController.state.activeProfile?.serverId, sourceController.state.activeProfile?.id, session.id, voiceDictionaryOwnerKey, sourceDocument);
         try {
           const stored = await sourceController.readDraftSnapshot(session.id);
           return { draft: failed?.draft ?? stored.draft, revision: stored.revision, failure: failed?.error };
@@ -817,6 +818,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
     const pending: PendingComposerDraftSave = {
       ownerKey: voiceDictionaryOwnerKey,
       serverId: controller.state.activeProfile?.serverId,
+      profileId: controller.state.activeProfile?.id,
       surface,
       ownerDocument,
       sessionId: session.id,
@@ -2540,23 +2542,23 @@ const failedComposerDraftSaves = new Map<string, {
   readonly error: unknown;
 }>();
 
-function composerDraftSaveKey(serverId: string | undefined, sessionId: string): string {
-  return JSON.stringify([serverId, sessionId]);
+function composerDraftSaveKey(serverId: string | undefined, profileId: string | undefined, sessionId: string): string {
+  return JSON.stringify([serverId, profileId, sessionId]);
 }
 
 function rememberFailedComposerDraftSave(pending: PendingComposerDraftSave, error: unknown): void {
-  failedComposerDraftSaves.set(composerDraftSaveKey(pending.serverId, pending.sessionId), {
+  failedComposerDraftSaves.set(composerDraftSaveKey(pending.serverId, pending.profileId, pending.sessionId), {
     ownerKey: pending.ownerKey, ownerDocument: pending.ownerDocument, draft: pending.draft, error
   });
 }
 
-function failedComposerDraftSave(serverId: string | undefined, sessionId: string, ownerKey: string, ownerDocument: Document) {
-  const failed = failedComposerDraftSaves.get(composerDraftSaveKey(serverId, sessionId));
+function failedComposerDraftSave(serverId: string | undefined, profileId: string | undefined, sessionId: string, ownerKey: string, ownerDocument: Document) {
+  const failed = failedComposerDraftSaves.get(composerDraftSaveKey(serverId, profileId, sessionId));
   return failed?.ownerKey === ownerKey && failed.ownerDocument === ownerDocument ? failed : undefined;
 }
 
-function pendingComposerDraftSave(serverId: string | undefined, sessionId: string): Promise<void> {
-  return pendingComposerDraftSaves.get(composerDraftSaveKey(serverId, sessionId)) ?? Promise.resolve();
+function pendingComposerDraftSave(serverId: string | undefined, profileId: string | undefined, sessionId: string): Promise<void> {
+  return pendingComposerDraftSaves.get(composerDraftSaveKey(serverId, profileId, sessionId)) ?? Promise.resolve();
 }
 
 function enqueueDraftSave(
@@ -2568,8 +2570,9 @@ function enqueueDraftSave(
 ): Promise<void> {
   const saveDraft = controllerRef.current.saveDraft;
   const serverId = controllerRef.current.state.activeProfile?.serverId;
-  const key = composerDraftSaveKey(serverId, sessionId);
-  const operation = Promise.all([chainRef.current, pendingComposerDraftSave(serverId, sessionId)])
+  const profileId = controllerRef.current.state.activeProfile?.id;
+  const key = composerDraftSaveKey(serverId, profileId, sessionId);
+  const operation = Promise.all([chainRef.current, pendingComposerDraftSave(serverId, profileId, sessionId)])
     .then(() => saveDraft(sessionId, draft))
     .then(() => { failedComposerDraftSaves.delete(key); });
   const recorded = operation.catch((error: unknown) => {

@@ -4991,7 +4991,7 @@ export type NewSessionDraftSelection =
  * opaque approved-record IDs and is revalidated against the current snapshot
  * before it is shown or sent; server paths are never copied into this record. */
 export interface NewSessionLocalDraft {
-  readonly selection: NewSessionDraftSelection;
+  readonly selection: NewSessionDraftSelection | { readonly kind: "unselected" };
   readonly nativeStart: { readonly kind: "fresh" } | { readonly kind: "attach"; readonly reference: string };
   readonly providerId: string;
   readonly modelId: string;

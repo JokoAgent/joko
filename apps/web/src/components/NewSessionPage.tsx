@@ -982,9 +982,11 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
       const restoredSelection = draft === undefined
         ? requestedSelection ?? defaultNewSessionSelection(activeTargets, eligibleDialogueBackends)
         : requestedSelection
-          ?? (draft.selection.kind === "target"
-            ? draft.selection
-            : parseNewSessionSelection(newSessionSelectionValue(draft.selection), projectTargets, eligibleDialogueBackends))
+          ?? (draft.selection.kind === "unselected"
+            ? undefined
+            : draft.selection.kind === "target"
+              ? draft.selection
+              : parseNewSessionSelection(newSessionSelectionValue(draft.selection), projectTargets, eligibleDialogueBackends))
           ?? defaultNewSessionSelection(activeTargets, eligibleDialogueBackends);
       const restored = draft === undefined || restoredSelection === undefined
         ? undefined
@@ -1081,7 +1083,8 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
   useEffect(() => {
     if (backend === undefined || selection === undefined) return;
     const restored = restoredExecutionRef.current;
-    if (restored !== undefined && newSessionSelectionValue(restored.selection) === selectionKey) {
+    if (restored !== undefined && restored.selection.kind !== "unselected"
+      && newSessionSelectionValue(restored.selection) === selectionKey) {
       restoredExecutionRef.current = undefined;
       const restoredModelKey = restored.providerId.length > 0 && restored.modelId.length > 0
         ? modelKeyFor(restored.providerId, restored.modelId)
@@ -1245,9 +1248,9 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
   }, [modelKey, selectedModel?.modelId, selectedModel?.providerId]);
 
   useEffect(() => {
-    if (!hydrated || selection === undefined || submitting) return;
+    if (!hydrated || hydratedProfileScope !== profileScope || submitting) return;
     const draft: NewSessionLocalDraft = {
-      selection,
+      selection: selection ?? { kind: "unselected" },
       nativeStart: startKind === "attach" && selected !== undefined && nativeReference.length > 0
         ? { kind: "attach", reference: nativeReference }
         : { kind: "fresh" },
@@ -1277,7 +1280,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
       void enqueueNewSessionDraftSave(draftSaveChainRef, sourceControllerRef, draft).then(() => { if (!cancelled) setDraftError(undefined); }).catch((error: unknown) => { if (!cancelled) setDraftError(messageOf(error)); });
     }, 420);
     return () => { cancelled = true; window.clearTimeout(timer); };
-  }, [controller.saveNewSessionDraft, attachments, browserComments, canSelectExtraDirectories, editorDocument, effort, execution.effortSupported, execution.fastModeSupported, execution.permissionModes, execution.planModeSupported, extraDirectoryIds, fastMode, hydrated, mentions, inlineMentionRanges, modelKey, nativeReference, permissionMode, planMode, refreshWorktreeRemote, selected?.id, selectedModel?.efforts, selectedModel?.supportsFast, selectionKey, startKind, submitting, text, worktreeEnabled, worktreeSourceRef]);
+  }, [controller.saveNewSessionDraft, attachments, browserComments, canSelectExtraDirectories, editorDocument, effort, execution.effortSupported, execution.fastModeSupported, execution.permissionModes, execution.planModeSupported, extraDirectoryIds, fastMode, hydrated, hydratedProfileScope, mentions, inlineMentionRanges, modelKey, nativeReference, permissionMode, planMode, profileScope, refreshWorktreeRemote, selected?.id, selectedModel?.efforts, selectedModel?.supportsFast, selectionKey, startKind, submitting, text, worktreeEnabled, worktreeSourceRef]);
 
   const draftMedia = [...attachments, ...browserComments.map((item) => item.screenshot)];
   const attachmentsAllowed = draftAttachmentsAllowed(draftMedia, attachmentPolicy);
@@ -2196,7 +2199,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
             <ComposerRichTextEditor
               ref={richEditorRef}
               document={editorDocument}
-              editable={!submitting && !voice.active}
+              editable={hydrated && hydratedProfileScope === profileScope && !submitting && !voice.active}
               disabled={false}
               placeholder={t("composer.placeholder")}
               onDocumentChange={updateDocument}

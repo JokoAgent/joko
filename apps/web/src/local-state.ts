@@ -386,11 +386,12 @@ function currentDraftRecord(value: unknown): ComposerDraftRecord | undefined {
   return value as ComposerDraftRecord;
 }
 
-function sessionDraftKey(serverId: string, sessionId: string): string {
-  if (!validConnectionIdentity(serverId, 512) || !validConnectionIdentity(sessionId, 512)) {
-    throw new Error("A task draft requires a valid server and session identity.");
+function sessionDraftKey(serverId: string, profileId: string, sessionId: string): string {
+  if (!validConnectionIdentity(serverId, 512) || !validConnectionIdentity(profileId, 512)
+    || !validConnectionIdentity(sessionId, 512)) {
+    throw new Error("A task draft requires a valid server, profile and session identity.");
   }
-  return JSON.stringify([serverId, sessionId]);
+  return JSON.stringify([serverId, profileId, sessionId]);
 }
 
 export class LocalState {
@@ -502,16 +503,16 @@ export class LocalState {
     await transactionDone(transaction);
   }
 
-  async saveDraft(serverId: string, sessionId: string, draft: ComposerDraft): Promise<void> {
-    await this.writeDraft(serverId, sessionId, draft);
+  async saveDraft(serverId: string, profileId: string, sessionId: string, draft: ComposerDraft): Promise<void> {
+    await this.writeDraft(serverId, profileId, sessionId, draft);
   }
 
-  async saveDraftIfRevision(serverId: string, sessionId: string, draft: ComposerDraft, expectedRevision: number): Promise<number | undefined> {
+  async saveDraftIfRevision(serverId: string, profileId: string, sessionId: string, draft: ComposerDraft, expectedRevision: number): Promise<number | undefined> {
     if (!Number.isSafeInteger(expectedRevision) || expectedRevision < 0) throw new Error("The task draft revision is invalid.");
-    return this.writeDraft(serverId, sessionId, draft, expectedRevision);
+    return this.writeDraft(serverId, profileId, sessionId, draft, expectedRevision);
   }
 
-  private async writeDraft(serverId: string, sessionId: string, draft: ComposerDraft, expectedRevision?: number): Promise<number | undefined> {
+  private async writeDraft(serverId: string, profileId: string, sessionId: string, draft: ComposerDraft, expectedRevision?: number): Promise<number | undefined> {
     const browserComments = normalizeLiveBrowserComments(draft.browserComments);
     const extraDirectoryIds = normalizeExtraDirectoryIds(draft.extraDirectoryIds);
     const mentions = normalizeDraftMentions(draft.mentions);
@@ -529,7 +530,7 @@ export class LocalState {
       attachments: draft.attachments.map(persistAttachment),
       browserComments: browserComments.map((item) => ({ ...item, screenshot: persistAttachment(item.screenshot) }))
     };
-    const key = sessionDraftKey(serverId, sessionId);
+    const key = sessionDraftKey(serverId, profileId, sessionId);
     const transaction = this.#database.transaction(DRAFT_STORE, "readwrite");
     const objectStore = transaction.objectStore(DRAFT_STORE);
     return new Promise((resolve, reject) => {
@@ -555,12 +556,12 @@ export class LocalState {
     });
   }
 
-  async readDraft(serverId: string, sessionId: string): Promise<ComposerDraft | undefined> {
-    return (await this.readDraftSnapshot(serverId, sessionId)).draft;
+  async readDraft(serverId: string, profileId: string, sessionId: string): Promise<ComposerDraft | undefined> {
+    return (await this.readDraftSnapshot(serverId, profileId, sessionId)).draft;
   }
 
-  async readDraftSnapshot(serverId: string, sessionId: string): Promise<ComposerDraftSnapshot> {
-    const record = currentDraftRecord(await this.get<unknown>(DRAFT_STORE, sessionDraftKey(serverId, sessionId)));
+  async readDraftSnapshot(serverId: string, profileId: string, sessionId: string): Promise<ComposerDraftSnapshot> {
+    const record = currentDraftRecord(await this.get<unknown>(DRAFT_STORE, sessionDraftKey(serverId, profileId, sessionId)));
     if (record === undefined) return { revision: 0 };
     const persisted = record.draft;
     const attachments = restorePersistedAttachments(persisted.attachments);
@@ -771,7 +772,9 @@ export function normalizeNewSessionLocalDraft(value: unknown): NewSessionLocalDr
   const rawSelection = record["selection"];
   if (rawSelection === null || typeof rawSelection !== "object" || Array.isArray(rawSelection)) return undefined;
   const selectionRecord = rawSelection as Record<string, unknown>;
-  const selection = selectionRecord["kind"] === "target" && validId(selectionRecord["targetId"])
+  const selection = selectionRecord["kind"] === "unselected" && Object.keys(selectionRecord).length === 1
+    ? { kind: "unselected" as const }
+    : selectionRecord["kind"] === "target" && validId(selectionRecord["targetId"])
     ? { kind: "target" as const, targetId: selectionRecord["targetId"] }
     : selectionRecord["kind"] === "dialogue" && validId(selectionRecord["backendId"])
       ? { kind: "dialogue" as const, backendId: selectionRecord["backendId"] }

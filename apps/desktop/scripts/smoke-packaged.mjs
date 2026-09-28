@@ -45,7 +45,7 @@ const appRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const releaseRoot = resolve(appRoot, "release");
 const smokeOptions = parseArguments(process.argv.slice(2));
 const useUnpackedArtifact = smokeOptions.unpacked;
-const smokeScope = smokeOptions.inspector ? "inspector" : "full";
+const smokeScope = smokeOptions.draft ? "draft" : smokeOptions.inspector ? "inspector" : "full";
 const executable = useUnpackedArtifact ? resolveUnpackedExecutable(releaseRoot) : require("electron");
 if (useUnpackedArtifact) assertUnpackedArtifactFresh(executable);
 const dedicatedHardwareUtilityEntry = resolveDedicatedHardwareUtilityEntry(executable, useUnpackedArtifact);
@@ -114,7 +114,7 @@ async function runSmokeJourney() {
   process.stdout.write(`${JSON.stringify({ event: "JOKO_DESKTOP_NATIVE_RUNTIME_SMOKE_OK", dedicatedHardwareUtilityEntry, sqliteVec: sqliteVecSmoke, extensionLibrary: extensionLibrarySmoke, terminal: terminalSmoke, claudeSession: claudeSessionSmoke })}\n`);
 
   const connectSmoke = await createConnectSmokeServer();
-  const requiredSystemHandoffProgress = smokeScope === "full" ? [
+  const requiredSmokeProgress = smokeScope === "full" ? [
     "system_handoff_cold_argv_ingress",
     "system_handoff_cancelled_navigation_preserved",
     "system_handoff_failed_document_request_injected",
@@ -127,7 +127,7 @@ async function runSmokeJourney() {
     "system_handoff_primary_surfaces_verified",
     "system_handoff_auxiliary_owner_fenced",
     "system_handoff_tray_reopened"
-  ] : [];
+  ] : smokeScope === "draft" ? ["new_task_draft_recovered_after_renderer_crash"] : [];
   let providerSmoke;
   let child;
   let secondInstance;
@@ -209,7 +209,7 @@ async function runSmokeJourney() {
         progress: existsSync(progressPath)
           ? readFileSync(progressPath, "utf8").trim().split(/\r?\n/gu).filter(Boolean)
           : [],
-        requiredProgress: requiredSystemHandoffProgress,
+        requiredProgress: requiredSmokeProgress,
         abortController: journeyAbort
       });
       if (decision.ownsAbort) {
@@ -361,7 +361,7 @@ async function runSmokeJourney() {
   const marker = existsSync(markerPath) ? readFileSync(markerPath, "utf8").trim() : "";
   const progressPath = `${markerPath}.progress`;
   const progress = existsSync(progressPath) ? readFileSync(progressPath, "utf8").trim().replace(/\r?\n/gu, " -> ") : "";
-  const missingSystemHandoffProgress = requiredSystemHandoffProgress.filter((step) =>
+  const missingSmokeProgress = requiredSmokeProgress.filter((step) =>
     !progress.split(" -> ").includes(step)
   );
   const managedOrchestratorStopped = managedConnection !== undefined &&
@@ -373,7 +373,7 @@ async function runSmokeJourney() {
     connectSmoke.observations.requestBody !== "{}" ||
     connectSmoke.observations.publicRequestSeen ||
     providerSmoke?.observations.unexpectedRequests.length > 0 ||
-    missingSystemHandoffProgress.length > 0 ||
+    missingSmokeProgress.length > 0 ||
     managedConnectionError !== undefined ||
     managedRuntimeProcessError !== undefined ||
     managedRuntimeWasLiveAtCleanup ||
@@ -382,15 +382,15 @@ async function runSmokeJourney() {
   );
   if (failed) {
     throw new Error(
-      `Packaged desktop smoke failed (platform=${process.platform}, timeoutMs=${timeoutMs}, code=${String(result.code)}, signal=${String(result.signal)}, marker=${marker}, progress=${progress}, missingSystemHandoffProgress=${JSON.stringify(missingSystemHandoffProgress)}, managedConnectionError=${managedConnectionError?.message ?? "none"}, managedRuntimeProcessError=${managedRuntimeProcessError?.message ?? "none"}, managedRuntimeEndpointState=${managedRuntimeEndpointState}, managedRuntimeWasLiveAtCleanup=${String(managedRuntimeWasLiveAtCleanup)}, managedRuntimeProcessStopped=${String(managedRuntimeProcessStopped)}, managedOrchestratorStopped=${String(managedOrchestratorStopped)}, sqliteVec=${sqliteVecSmoke.version}, extensionLibrary=${extensionLibrarySmoke.version}, connect=${JSON.stringify(connectSmoke.observations)}, provider=${JSON.stringify(providerSmoke?.observations)}, orchestrationError=${orchestrationError?.message ?? "none"}): ${stderr.slice(-1_000)}`,
+      `Packaged desktop smoke failed (platform=${process.platform}, timeoutMs=${timeoutMs}, code=${String(result.code)}, signal=${String(result.signal)}, marker=${marker}, progress=${progress}, missingSmokeProgress=${JSON.stringify(missingSmokeProgress)}, managedConnectionError=${managedConnectionError?.message ?? "none"}, managedRuntimeProcessError=${managedRuntimeProcessError?.message ?? "none"}, managedRuntimeEndpointState=${managedRuntimeEndpointState}, managedRuntimeWasLiveAtCleanup=${String(managedRuntimeWasLiveAtCleanup)}, managedRuntimeProcessStopped=${String(managedRuntimeProcessStopped)}, managedOrchestratorStopped=${String(managedOrchestratorStopped)}, sqliteVec=${sqliteVecSmoke.version}, extensionLibrary=${extensionLibrarySmoke.version}, connect=${JSON.stringify(connectSmoke.observations)}, provider=${JSON.stringify(providerSmoke?.observations)}, orchestrationError=${orchestrationError?.message ?? "none"}): ${stderr.slice(-1_000)}`,
       orchestrationError === undefined ? undefined : { cause: orchestrationError }
     );
   }
   return {
-    event: smokeScope === "full" ? "JOKO_DESKTOP_SYSTEM_HANDOFF_SMOKE_OK" : "JOKO_DESKTOP_INSPECTOR_SMOKE_OK",
+    event: smokeScope === "full" ? "JOKO_DESKTOP_SYSTEM_HANDOFF_SMOKE_OK" : smokeScope === "draft" ? "JOKO_DESKTOP_DRAFT_SMOKE_OK" : "JOKO_DESKTOP_INSPECTOR_SMOKE_OK",
     scope: smokeScope,
     ingress: smokeScope === "full" ? ["cold-argv", "second-instance"] : [],
-    progress: requiredSystemHandoffProgress
+    progress: requiredSmokeProgress
   };
 }
 
@@ -956,10 +956,11 @@ function boundedTimeout(value) {
 
 function parseArguments(arguments_) {
   const values = new Set(arguments_);
-  if (values.size !== arguments_.length || [...values].some((value) => value !== "--unpacked" && value !== "--inspector")) {
-    throw new Error("Usage: node scripts/smoke-packaged.mjs [--unpacked] [--inspector]");
+  if (values.size !== arguments_.length || [...values].some((value) => value !== "--unpacked" && value !== "--inspector" && value !== "--draft")
+    || values.has("--inspector") && values.has("--draft")) {
+    throw new Error("Usage: node scripts/smoke-packaged.mjs [--unpacked] [--inspector|--draft]");
   }
-  return { unpacked: values.has("--unpacked"), inspector: values.has("--inspector") };
+  return { unpacked: values.has("--unpacked"), inspector: values.has("--inspector"), draft: values.has("--draft") };
 }
 
 function desktopLaunchArguments(applicationRoot, useUnpacked, openIntent) {

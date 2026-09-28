@@ -682,6 +682,7 @@ export function useAppController(): AppController {
         }
         applyExtensionUiEffect(effect, localRef.current, setState, {
           serverId: profile.serverId,
+          profileId: profile.id,
           activeSessionId,
           isCurrent: () => gatewayGenerationRef.current === generation,
           isLatestEditorEffect: () => latestExtensionEditorEffectRef.current.get(editorScope) === effect.eventId
@@ -1767,6 +1768,7 @@ export function useAppController(): AppController {
   const openWorkspaceHtml = useCallback<AppController["openWorkspaceHtml"]>((sessionId, workspaceId, path, options) => openLink({ workspaceId, path }, { ...options, sessionId }), [openLink]);
   const draftStore = localRef.current;
   const draftServerId = state.activeProfile?.serverId;
+  const draftProfileId = state.activeProfile?.id;
   const newTaskDraftScope = state.activeProfile === undefined ? undefined : newSessionDraftScope(state.activeProfile);
   const newTaskDraftOperationTailsRef = useRef(new Map<string, Promise<void>>());
   const newTaskDraftApi = useMemo(() => {
@@ -1809,38 +1811,37 @@ export function useAppController(): AppController {
     };
   }, [draftStore, newTaskDraftScope, artifactGateway]);
   const readDraft = useCallback<AppController["readDraft"]>((sessionId) => {
-    if (draftServerId === undefined) return Promise.reject(new Error("Connect to Joko before reading a task draft."));
-    return requireLocal(draftStore).readDraft(draftServerId, sessionId);
-  }, [draftStore, draftServerId, artifactGateway]);
+    if (draftServerId === undefined || draftProfileId === undefined) return Promise.reject(new Error("Connect to Joko before reading a task draft."));
+    return requireLocal(draftStore).readDraft(draftServerId, draftProfileId, sessionId);
+  }, [draftStore, draftServerId, draftProfileId, artifactGateway]);
   const saveDraft = useCallback<AppController["saveDraft"]>((sessionId, draft) => {
-    if (draftServerId === undefined) return Promise.reject(new Error("Connect to Joko before saving a task draft."));
-    return requireLocal(draftStore).saveDraft(draftServerId, sessionId, draft);
-  }, [draftStore, draftServerId, artifactGateway]);
+    if (draftServerId === undefined || draftProfileId === undefined) return Promise.reject(new Error("Connect to Joko before saving a task draft."));
+    return requireLocal(draftStore).saveDraft(draftServerId, draftProfileId, sessionId, draft);
+  }, [draftStore, draftServerId, draftProfileId, artifactGateway]);
   const navigateSessionBranch = useCallback<AppController["navigateSessionBranch"]>((sessionId, target, options) => {
     if (artifactGateway === undefined) return Promise.reject(new Error("Connect to Joko before navigating a task."));
     return artifactGateway.navigateSessionBranch(sessionId, target, options);
   }, [artifactGateway]);
   const readDraftSnapshot = useCallback<AppController["readDraftSnapshot"]>((sessionId) => {
-    if (draftServerId === undefined) return Promise.reject(new Error("Connect to Joko before reading a task draft."));
-    return requireLocal(draftStore).readDraftSnapshot(draftServerId, sessionId);
-  }, [draftStore, draftServerId, artifactGateway]);
+    if (draftServerId === undefined || draftProfileId === undefined) return Promise.reject(new Error("Connect to Joko before reading a task draft."));
+    return requireLocal(draftStore).readDraftSnapshot(draftServerId, draftProfileId, sessionId);
+  }, [draftStore, draftServerId, draftProfileId, artifactGateway]);
   const saveDraftIfRevision = useCallback<AppController["saveDraftIfRevision"]>((sessionId, draft, revision) => {
-    if (draftServerId === undefined) return Promise.reject(new Error("Connect to Joko before saving a task draft."));
-    return requireLocal(draftStore).saveDraftIfRevision(draftServerId, sessionId, draft, revision);
-  }, [draftStore, draftServerId, artifactGateway]);
+    if (draftServerId === undefined || draftProfileId === undefined) return Promise.reject(new Error("Connect to Joko before saving a task draft."));
+    return requireLocal(draftStore).saveDraftIfRevision(draftServerId, draftProfileId, sessionId, draft, revision);
+  }, [draftStore, draftServerId, draftProfileId, artifactGateway]);
   const rejectedFirstInputRecoverySequenceRef = useRef(0);
   const restoreFirstInputDraft = useCallback<AppController["restoreFirstInputDraft"]>(async (sessionId, input) => {
-    if (draftServerId === undefined) throw new Error("Connect to Joko before restoring a task draft.");
-    const profileId = state.activeProfile?.id;
+    if (draftServerId === undefined || draftProfileId === undefined) throw new Error("Connect to Joko before restoring a task draft.");
     const recovered = await restoreRejectedComposerDraft({ readDraftSnapshot, saveDraftIfRevision }, sessionId, input);
     const eventId = ++rejectedFirstInputRecoverySequenceRef.current;
     setState((current) => current.activeProfile?.serverId === draftServerId
-      && current.activeProfile.id === profileId
+      && current.activeProfile.id === draftProfileId
       && (current.route.kind === "session" || current.route.kind === "files")
       && current.route.sessionId === sessionId
       ? { ...current, rejectedFirstInputRecovery: { eventId, sessionId, input, ...recovered } }
       : current);
-  }, [draftServerId, readDraftSnapshot, saveDraftIfRevision, state.activeProfile?.id]);
+  }, [draftServerId, draftProfileId, readDraftSnapshot, saveDraftIfRevision]);
   const listWorkspaceChangeSets = useCallback<AppController["listWorkspaceChangeSets"]>((workspaceId, sessionId) => {
     if (artifactGateway === undefined) return Promise.reject(new Error("Connect to Joko before reading workspace changes."));
     return artifactGateway.listWorkspaceChangeSets(workspaceId, sessionId);
@@ -3300,6 +3301,7 @@ export function applyExtensionUiEffect(
   setState: (update: (current: ControllerState) => ControllerState) => void,
   options: {
     readonly serverId?: string;
+    readonly profileId?: string;
     readonly activeSessionId?: string;
     readonly isCurrent?: () => boolean;
     readonly isLatestEditorEffect?: () => boolean;
@@ -3343,11 +3345,12 @@ export function applyExtensionUiEffect(
       text: effect.text
     }
   }) : current);
-  if (local !== undefined && options.serverId !== undefined) {
+  if (local !== undefined && options.serverId !== undefined && options.profileId !== undefined) {
     const serverId = options.serverId;
-    void local.readDraft(serverId, effect.sessionId).then((draft) => {
+    const profileId = options.profileId;
+    void local.readDraft(serverId, profileId, effect.sessionId).then((draft) => {
       if (!isCurrent() || options.isLatestEditorEffect?.() === false) return undefined;
-      return local.saveDraft(serverId, effect.sessionId, composerDraftWithEditorText(effect.text, draft));
+      return local.saveDraft(serverId, profileId, effect.sessionId, composerDraftWithEditorText(effect.text, draft));
     })
       .catch(() => {
         if (!isCurrent() || options.isLatestEditorEffect?.() === false) return;
