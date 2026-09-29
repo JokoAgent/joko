@@ -136,7 +136,7 @@ describe("mobile voice ephemeral requests", () => {
       existingCandidates: [{ term: "Candidate", evidenceCount: 3, aliases: [] }]
     });
     expect(mobileVoiceNetworkTesting.startRequest("request", "audio/pcm", "en-US", {
-      instructions: "Keep commands verbatim.", dictionaryTerms: ["VoiceKit", "Joko"]
+      instructions: "Keep commands verbatim."
     })).toEqual({
       requestId: "request", mimeType: "audio/pcm", locale: "en-US",
       refinementInstructions: "Keep commands verbatim."

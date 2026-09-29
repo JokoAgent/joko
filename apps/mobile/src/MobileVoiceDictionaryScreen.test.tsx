@@ -5,7 +5,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MobileVoiceDictionaryScreen, type MobileVoiceDictionaryScreenProps } from "./MobileVoiceDictionaryScreen";
 import { mobileMessage } from "./mobile-messages";
 import type { MobileSupportedLocale } from "./mobile-locale-preference";
-import type { MobileVoiceDictionaryStoreState } from "./mobile-voice-dictionary-store";
+import type { MobileVoicePreferencesStoreState } from "./mobile-voice-preferences-store";
+import type { MobileVoiceDictionaryControllerState } from "./mobile-voice-dictionary-controller";
 
 const native = vi.hoisted(() => ({ alert: vi.fn() }));
 
@@ -64,7 +65,7 @@ const colors = {
   accent: "#f90", negative: "#b00", brandBackground: "#fff0d0"
 };
 
-function voiceState(status: MobileVoiceDictionaryStoreState["status"] = "ready"): MobileVoiceDictionaryStoreState {
+function voiceState(status: MobileVoicePreferencesStoreState["status"] = "ready"): MobileVoicePreferencesStoreState {
   return {
     status,
     saving: false,
@@ -72,10 +73,19 @@ function voiceState(status: MobileVoiceDictionaryStoreState["status"] = "ready")
     document: {
       version: 1,
       revision: 3,
-      dictionaryRevision: 3,
+      preferencesRevision: 3,
       refinementInstructions: "Keep commands verbatim.",
       autoLearningEnabled: true,
-      dictionary: {
+      usage: { voiceStarts: 4, correctionObservations: 2, lastVoiceStartedAt: 30, lastCorrectionAt: 25 },
+      history: []
+    }
+  };
+}
+
+function nodeDictionary(revision = 8n): MobileVoiceDictionaryControllerState {
+  return {
+    status: "ready", ownerKey: "node-a", saving: false,
+    snapshot: { revision, syncEnabled: true, dictionary: {
         entries: [
           { id: "source", text: "Variant", source: "automatic", frequency: 3,
             aliases: [{ text: "variant old", count: 2, lastSeenAt: 20 }], createdAt: 10, updatedAt: 20 },
@@ -85,10 +95,7 @@ function voiceState(status: MobileVoiceDictionaryStoreState["status"] = "ready")
         candidates: [{ text: "VoiceKit", evidenceCount: 2,
           aliases: [{ text: "voice kit", count: 2, lastSeenAt: 22 }], createdAt: 8, updatedAt: 22 }],
         suppressedAutomaticTexts: []
-      },
-      usage: { voiceStarts: 4, correctionObservations: 2, lastVoiceStartedAt: 30, lastCorrectionAt: 25 },
-      history: []
-    }
+      }, refinementTerms: ["Canonical", "Variant"] }
   };
 }
 
@@ -116,6 +123,9 @@ function render(locale: MobileSupportedLocale, overrides: Partial<MobileVoiceDic
     colors,
     locale,
     state: voiceState(),
+    dictionary: nodeDictionary(),
+    onRefreshDictionary: vi.fn(async () => undefined),
+    onSetSyncEnabled: vi.fn(async () => undefined),
     onBack: vi.fn(),
     onRetry: vi.fn(async () => undefined),
     onReset: vi.fn(async () => undefined),
@@ -146,13 +156,14 @@ function change(label: string, value: string): void {
 }
 
 describe("MobileVoiceDictionaryScreen", () => {
-  it.each(["en", "zh-CN", "zh-TW", "ja", "ko"] as const)("renders the complete local surface in %s", (locale) => {
+  it.each(["en", "zh-CN", "zh-TW", "ja", "ko"] as const)("renders node dictionary and private preferences in %s", (locale) => {
     render(locale);
     expect(container.textContent).toContain(mobileMessage(locale, "settings.voice.title"));
     expect(container.textContent).toContain(mobileMessage(locale, "settings.voice.privacy"));
     expect(container.textContent).toContain(mobileMessage(locale, "settings.voice.entries"));
     expect(container.textContent).toContain(mobileMessage(locale, "settings.voice.candidates"));
     expect(container.textContent).toContain(mobileMessage(locale, "settings.voice.localActivity"));
+    expect(container.textContent).toContain(mobileMessage(locale, "settings.voice.syncHint"));
     expect(button(mobileMessage(locale, "settings.voice.confirmCandidate", { term: "VoiceKit" }))).toBeTruthy();
   });
 
@@ -166,9 +177,38 @@ describe("MobileVoiceDictionaryScreen", () => {
     expect((container.querySelector(`[aria-label="${mobileMessage("ja", "settings.voice.term")}"]`) as HTMLInputElement).value)
       .toBe("Canonical");
     await act(async () => button(mobileMessage("ja", "settings.voice.saveEntry")).click());
-    expect(onEditEntry).toHaveBeenCalledWith("source", "Canonical", "variant old");
+    expect(onEditEntry).toHaveBeenCalledWith("source", "Canonical", "variant old", 8n);
     expect(container.textContent).toContain(mobileMessage("ja", "settings.voice.merged"));
     expect(document.activeElement?.getAttribute("aria-label")).toBe(mobileMessage("ja", "settings.voice.term"));
+  });
+
+  it("keeps a conflicting editor draft and its frozen revision until the user explicitly reviews the latest version", async () => {
+    const onEditEntry = vi.fn(async () => "updated" as const).mockRejectedValueOnce(new Error("revision conflict"));
+    render("en", { onEditEntry });
+    act(() => button(mobileMessage("en", "settings.voice.edit", { term: "Variant" })).click());
+    change(mobileMessage("en", "settings.voice.term"), "Canonical");
+    await act(async () => button(mobileMessage("en", "settings.voice.saveEntry")).click());
+    render("en", { onEditEntry, dictionary: nodeDictionary(9n) });
+    expect((container.querySelector(`[aria-label="${mobileMessage("en", "settings.voice.term")}"]`) as HTMLInputElement).value).toBe("Canonical");
+    expect(container.textContent).toContain(mobileMessage("en", "settings.voice.conflict"));
+    expect(onEditEntry).toHaveBeenCalledWith("source", "Canonical", "variant old", 8n);
+    act(() => button(mobileMessage("en", "settings.voice.reviewLatest")).click());
+    await act(async () => button(mobileMessage("en", "settings.voice.saveEntry")).click());
+    expect(onEditEntry).toHaveBeenLastCalledWith("source", "Canonical", "variant old", 9n);
+  });
+
+  it("disables unavailable node edits while keeping private instructions editable", () => {
+    render("en", { dictionary: { status: "unavailable", saving: false } });
+    expect(container.textContent).toContain(mobileMessage("en", "settings.voice.nodeUnavailable"));
+    expect((container.querySelector(`[aria-label="${mobileMessage("en", "settings.voice.instructions")}"]`) as HTMLInputElement).disabled).toBe(false);
+    expect(button(mobileMessage("en", "settings.voice.addTerm")).disabled).toBe(true);
+    expect((container.querySelector(`[aria-label="${mobileMessage("en", "settings.voice.sync")}"]`) as HTMLInputElement).disabled).toBe(true);
+  });
+
+  it("distinguishes failed private history from the node dictionary result", () => {
+    render("en", { state: { ...voiceState(), error: "local disk unavailable" } });
+    expect(container.textContent).toContain(mobileMessage("en", "settings.voice.localSaveError"));
+    expect(container.textContent).not.toContain(mobileMessage("en", "settings.voice.saveError"));
   });
 
   it("offers retry and explicit reset recovery for a damaged strict-v1 record", async () => {

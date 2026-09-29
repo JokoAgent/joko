@@ -119,48 +119,9 @@ export function normalizeMobileVoiceDictionary(value: unknown): MobileVoiceDicti
   );
   if (!suppressedAutomaticTexts || suppressedAutomaticTexts.some((text) => {
     const key = mobileVoiceDictionaryTermKey(text);
-    return entryKeys.has(key) || candidateKeys.has(key);
+    return entries.some((entry) => entry.source === "automatic" && mobileVoiceDictionaryTermKey(entry.text) === key) || candidateKeys.has(key);
   })) return undefined;
   return freezeDictionary({ entries, candidates, suppressedAutomaticTexts });
-}
-
-export function addManualMobileVoiceDictionaryTerm(
-  current: MobileVoiceDictionary,
-  text: string,
-  now: number,
-  createId: () => string
-): MobileVoiceDictionary | undefined {
-  const normalized = normalizeMobileVoiceDictionaryTerm(text);
-  if (!normalized) return undefined;
-  const key = mobileVoiceDictionaryTermKey(normalized);
-  const existing = current.entries.find((entry) => mobileVoiceDictionaryTermKey(entry.text) === key);
-  const candidate = current.candidates.find((item) => mobileVoiceDictionaryTermKey(item.text) === key);
-  const suppressed = current.suppressedAutomaticTexts.some((item) => mobileVoiceDictionaryTermKey(item) === key);
-  if (existing?.source === "manual" && existing.text === normalized && !candidate && !suppressed) return current;
-  let entries: readonly MobileVoiceDictionaryEntry[];
-  if (existing) {
-    entries = current.entries.map((entry) => entry.id !== existing.id ? entry : Object.freeze({
-      ...entry,
-      text: normalized,
-      source: "manual" as const,
-      updatedAt: now
-    }));
-  } else {
-    if (current.entries.length >= MAXIMUM_MOBILE_VOICE_DICTIONARY_ENTRIES) return undefined;
-    entries = [...current.entries, Object.freeze({
-      ...createEntry(normalized, "manual", now, createId, new Set(current.entries.map((entry) => entry.id))),
-      frequency: candidate?.evidenceCount ?? 1,
-      aliases: candidate?.aliases ?? Object.freeze([]),
-      createdAt: Math.min(now, candidate?.createdAt ?? now)
-    })];
-  }
-  return freezeDictionary({
-    entries,
-    candidates: current.candidates.filter((item) => mobileVoiceDictionaryTermKey(item.text) !== key),
-    suppressedAutomaticTexts: current.suppressedAutomaticTexts.filter(
-      (item) => mobileVoiceDictionaryTermKey(item) !== key
-    )
-  });
 }
 
 export function previewMobileVoiceDictionaryEdit(
@@ -179,145 +140,6 @@ export function previewMobileVoiceDictionaryEdit(
   return candidate
     ? { kind: "mergeCandidate", targetText: candidate.text, evidenceCount: candidate.evidenceCount }
     : { kind: "update" };
-}
-
-export function editMobileVoiceDictionaryEntry(
-  current: MobileVoiceDictionary,
-  id: string,
-  text: string,
-  aliasDraft: string,
-  now: number
-): MobileVoiceDictionary | undefined {
-  if (text.trim() === "") return deleteMobileVoiceDictionaryEntry(current, id);
-  const normalized = normalizeMobileVoiceDictionaryTerm(text);
-  if (!normalized) return undefined;
-  const index = current.entries.findIndex((entry) => entry.id === id);
-  if (index < 0) return current;
-  const entry = current.entries[index]!;
-  const targetKey = mobileVoiceDictionaryTermKey(normalized);
-  const target = current.entries.find((item, candidateIndex) => candidateIndex !== index
-    && mobileVoiceDictionaryTermKey(item.text) === targetKey);
-  const candidate = current.candidates.find((item) => mobileVoiceDictionaryTermKey(item.text) === targetKey);
-  const aliases: MobileVoiceDictionaryAlias[] = [];
-  const seen = new Set([targetKey]);
-  for (const line of aliasDraft.replace(/\r\n?/gu, "\n").split("\n")) {
-    if (line.trim() === "") continue;
-    const aliasText = normalizeMobileVoiceDictionaryTerm(line);
-    if (!aliasText) return undefined;
-    const key = mobileVoiceDictionaryTermKey(aliasText);
-    if (seen.has(key)) continue;
-    seen.add(key);
-    const existing = entry.aliases.find((alias) => mobileVoiceDictionaryTermKey(alias.text) === key);
-    aliases.push(Object.freeze(existing ? { ...existing, text: aliasText }
-      : { text: aliasText, count: 1, lastSeenAt: now }));
-    if (aliases.length === MAXIMUM_MOBILE_VOICE_DICTIONARY_ALIASES) break;
-  }
-  const targetAliases = target?.aliases ?? candidate?.aliases;
-  const merged = Object.freeze({
-    ...entry,
-    id: target?.id ?? entry.id,
-    text: normalized,
-    source: "manual" as const,
-    frequency: boundedAdd(entry.frequency, target?.frequency ?? candidate?.evidenceCount ?? 0),
-    aliases: targetAliases ? combineAliasEvidence(aliases, targetAliases, targetKey) : Object.freeze(aliases),
-    createdAt: Math.min(entry.createdAt, target?.createdAt ?? candidate?.createdAt ?? entry.createdAt),
-    updatedAt: Math.max(now, entry.updatedAt, target?.updatedAt ?? candidate?.updatedAt ?? 0)
-  });
-  return freezeDictionary({
-    entries: current.entries.flatMap((item) => item.id === merged.id ? [merged] : item.id === id ? [] : [item]),
-    candidates: current.candidates.filter((item) => mobileVoiceDictionaryTermKey(item.text) !== targetKey),
-    suppressedAutomaticTexts: current.suppressedAutomaticTexts.filter(
-      (item) => mobileVoiceDictionaryTermKey(item) !== targetKey
-    )
-  });
-}
-
-export function deleteMobileVoiceDictionaryEntry(
-  current: MobileVoiceDictionary,
-  id: string
-): MobileVoiceDictionary {
-  const entry = current.entries.find((item) => item.id === id);
-  if (!entry) return current;
-  const key = mobileVoiceDictionaryTermKey(entry.text);
-  const suppressed = new Set(current.suppressedAutomaticTexts.map(mobileVoiceDictionaryTermKey));
-  const suppressedAutomaticTexts = [...current.suppressedAutomaticTexts];
-  if (entry.source === "automatic" && !suppressed.has(key)) suppressedAutomaticTexts.push(entry.text);
-  return freezeDictionary({
-    entries: current.entries.filter((item) => item.id !== id),
-    candidates: current.candidates.filter((item) => mobileVoiceDictionaryTermKey(item.text) !== key),
-    suppressedAutomaticTexts
-  });
-}
-
-export function applyMobileVoiceDictionaryAdvice(
-  current: MobileVoiceDictionary,
-  actions: readonly MobileVoiceDictionaryLearningAction[],
-  now: number,
-  createId: () => string
-): MobileVoiceDictionary {
-  let entries = [...current.entries];
-  let candidates = [...current.candidates];
-  const suppressed = new Set(current.suppressedAutomaticTexts.map(mobileVoiceDictionaryTermKey));
-  let changed = false;
-  for (const action of actions.slice(0, 3)) {
-    const text = normalizeMobileVoiceDictionaryTerm(action.term);
-    const rawAliases = normalizeTermList(action.aliases, MAXIMUM_MOBILE_VOICE_DICTIONARY_ALIASES);
-    if (!text || !rawAliases?.length) continue;
-    const key = mobileVoiceDictionaryTermKey(text);
-    const aliases = rawAliases.filter((alias) => mobileVoiceDictionaryTermKey(alias) !== key);
-    if (aliases.length === 0) continue;
-    const entryIndex = entries.findIndex((entry) => mobileVoiceDictionaryTermKey(entry.text) === key);
-    const candidateIndex = candidates.findIndex((candidate) => mobileVoiceDictionaryTermKey(candidate.text) === key);
-    const candidate = candidateIndex < 0 ? undefined : candidates[candidateIndex];
-    if (entryIndex >= 0 || action.action === "addEntry" || action.action === "updateEntry") {
-      if (entryIndex >= 0) {
-        const entry = entries[entryIndex]!;
-        entries[entryIndex] = Object.freeze({
-          ...entry,
-          frequency: boundedAdd(entry.frequency, 1),
-          aliases: mergeAliases(entry.aliases, aliases, now),
-          updatedAt: now
-        });
-      } else {
-        if (suppressed.has(key) || entries.length >= MAXIMUM_MOBILE_VOICE_DICTIONARY_ENTRIES) continue;
-        entries.push(Object.freeze({
-          ...createEntry(text, "automatic", now, createId, new Set(entries.map((entry) => entry.id))),
-          frequency: boundedAdd(candidate?.evidenceCount ?? 0, 1),
-          aliases: mergeAliases(candidate?.aliases ?? [], aliases, now)
-        }));
-      }
-      if (candidateIndex >= 0) candidates.splice(candidateIndex, 1);
-      changed = true;
-    } else if (!suppressed.has(key)) {
-      if (candidateIndex >= 0) {
-        const existing = candidates[candidateIndex]!;
-        candidates[candidateIndex] = Object.freeze({
-          ...existing,
-          evidenceCount: boundedAdd(existing.evidenceCount, 1),
-          aliases: mergeAliases(existing.aliases, aliases, now),
-          updatedAt: now
-        });
-      } else {
-        if (candidates.length >= MAXIMUM_MOBILE_VOICE_DICTIONARY_CANDIDATES) {
-          candidates.sort((left, right) => right.evidenceCount - left.evidenceCount || right.updatedAt - left.updatedAt);
-          candidates.length = MAXIMUM_MOBILE_VOICE_DICTIONARY_CANDIDATES - 1;
-        }
-        candidates.push(Object.freeze({
-          text,
-          evidenceCount: 1,
-          aliases: mergeAliases([], aliases, now),
-          createdAt: now,
-          updatedAt: now
-        }));
-      }
-      changed = true;
-    }
-  }
-  return changed ? freezeDictionary({
-    entries,
-    candidates,
-    suppressedAutomaticTexts: current.suppressedAutomaticTexts
-  }) : current;
 }
 
 export function mobileVoiceDictionaryAdviceDraft(
@@ -349,24 +171,6 @@ export function mobileVoiceDictionaryAdviceDraft(
         aliases: Object.freeze(candidate.aliases.map((alias) => Object.freeze({ text: alias.text, count: alias.count })))
       })))
   });
-}
-
-export function mobileVoiceDictionaryTermsForRefinement(
-  dictionary: MobileVoiceDictionary
-): readonly string[] {
-  const entries = dictionary.entries.slice().sort((left, right) => {
-    if (left.source !== right.source) return left.source === "manual" ? -1 : 1;
-    return right.frequency - left.frequency || right.updatedAt - left.updatedAt;
-  });
-  const terms: string[] = [];
-  let characters = 0;
-  for (const entry of entries) {
-    if (terms.length >= MAXIMUM_MOBILE_VOICE_REFINEMENT_TERMS
-      || characters + entry.text.length > MAXIMUM_MOBILE_VOICE_REFINEMENT_CHARACTERS) break;
-    terms.push(entry.text);
-    characters += entry.text.length;
-  }
-  return Object.freeze(terms);
 }
 
 export function normalizeMobileVoiceDictionaryTerm(value: unknown): string | undefined {
@@ -449,62 +253,6 @@ function normalizeTermList(value: unknown, maximum: number): readonly string[] |
   return Object.freeze(terms);
 }
 
-function combineAliasEvidence(
-  edited: readonly MobileVoiceDictionaryAlias[],
-  target: readonly MobileVoiceDictionaryAlias[],
-  primaryKey: string
-): readonly MobileVoiceDictionaryAlias[] {
-  const combined = new Map<string, MobileVoiceDictionaryAlias>();
-  for (const alias of [...target, ...edited]) {
-    const key = mobileVoiceDictionaryTermKey(alias.text);
-    if (key === primaryKey) continue;
-    const existing = combined.get(key);
-    combined.set(key, existing ? Object.freeze({
-      text: alias.lastSeenAt >= existing.lastSeenAt ? alias.text : existing.text,
-      count: boundedAdd(existing.count, alias.count),
-      lastSeenAt: Math.max(existing.lastSeenAt, alias.lastSeenAt)
-    }) : alias);
-  }
-  return Object.freeze([...combined.values()]
-    .sort((left, right) => right.count - left.count || right.lastSeenAt - left.lastSeenAt)
-    .slice(0, MAXIMUM_MOBILE_VOICE_DICTIONARY_ALIASES));
-}
-
-function mergeAliases(
-  current: readonly MobileVoiceDictionaryAlias[],
-  aliases: readonly string[],
-  now: number
-): readonly MobileVoiceDictionaryAlias[] {
-  const next = [...current];
-  for (const text of aliases) {
-    const key = mobileVoiceDictionaryTermKey(text);
-    const index = next.findIndex((alias) => mobileVoiceDictionaryTermKey(alias.text) === key);
-    if (index >= 0) {
-      const alias = next[index]!;
-      next[index] = Object.freeze({ ...alias, count: boundedAdd(alias.count, 1), lastSeenAt: now });
-    } else {
-      next.push(Object.freeze({ text, count: 1, lastSeenAt: now }));
-    }
-  }
-  return Object.freeze(next.sort((left, right) => right.count - left.count || right.lastSeenAt - left.lastSeenAt)
-    .slice(0, MAXIMUM_MOBILE_VOICE_DICTIONARY_ALIASES));
-}
-
-function createEntry(
-  text: string,
-  source: MobileVoiceDictionaryEntrySource,
-  now: number,
-  createId: () => string,
-  occupiedIds: ReadonlySet<string>
-): MobileVoiceDictionaryEntry {
-  const candidateId = createId();
-  const base = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u.test(candidateId) && !occupiedIds.has(candidateId)
-    ? candidateId : `dictionary-${Math.max(0, Math.floor(now)).toString(36)}`;
-  let id = base;
-  for (let suffix = 1; occupiedIds.has(id); suffix += 1) id = `${base}-${suffix}`;
-  return Object.freeze({ id, text, source, frequency: 1, aliases: Object.freeze([]), createdAt: now, updatedAt: now });
-}
-
 function freezeDictionary(value: MobileVoiceDictionary): MobileVoiceDictionary {
   return Object.freeze({
     entries: Object.freeze([...value.entries]),
@@ -520,10 +268,6 @@ function positiveInteger(value: unknown): number | undefined {
 function timestamp(value: unknown): number | undefined {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 && value <= MAXIMUM_STORED_TIMESTAMP
     ? value : undefined;
-}
-
-function boundedAdd(left: number, right: number): number {
-  return Math.min(Number.MAX_SAFE_INTEGER, left + right);
 }
 
 function isRecord(value: unknown): value is Readonly<Record<string, unknown>> {

@@ -8,8 +8,9 @@ import type {
   MobileVoiceSession,
   MobileVoiceTransport
 } from "./mobile-voice-input";
-import { MobileVoiceDictionaryStore } from "./mobile-voice-dictionary-store";
+import { MobileVoicePreferencesStore } from "./mobile-voice-preferences-store";
 import { useMobileVoiceInput, type MobileVoiceInputBinding } from "./use-mobile-voice-input";
+import { EMPTY_MOBILE_VOICE_DICTIONARY } from "./mobile-voice-dictionary";
 
 vi.mock("react-native", () => ({
   AppState: {
@@ -22,7 +23,7 @@ vi.mock("./mobile-realtime-audio", () => ({
   prewarmMobileRealtimeAudio: () => undefined
 }));
 vi.mock("./mobile-voice-cue", () => ({ playMobileVoiceInputEndCue: () => undefined }));
-vi.mock("./storage", () => ({ mobileVoiceDictionary: undefined }));
+vi.mock("./storage", () => ({ mobileVoicePreferences: undefined }));
 
 function session(patch: Partial<MobileVoiceSession> = {}): MobileVoiceSession {
   return {
@@ -39,10 +40,10 @@ function session(patch: Partial<MobileVoiceSession> = {}): MobileVoiceSession {
   };
 }
 
-function dictionaryStore() {
+function preferencesStore() {
   let raw: string | null = null;
   let id = 0;
-  return new MobileVoiceDictionaryStore({
+  return new MobileVoicePreferencesStore({
     getItem: async () => raw,
     setItem: async (_key, value) => { raw = value; }
   }, () => 100 + id, () => `id-${++id}`);
@@ -63,11 +64,10 @@ afterEach(async () => {
 });
 
 describe("useMobileVoiceInput dictionary integration", () => {
-  it("passes current local refinement and learns only from the kept insertion correction", async () => {
-    const store = dictionaryStore();
+  it("passes only local instructions and learns against the node revision from the kept insertion correction", async () => {
+    const store = preferencesStore();
     await store.hydrate();
     await store.setRefinementInstructions("Keep commands verbatim.");
-    await store.addManualTerm("ExistingTerm");
     const advice = vi.fn(async () => ({ actions: [{
       action: "addEntry" as const,
       term: "VoiceKit",
@@ -79,6 +79,8 @@ describe("useMobileVoiceInput dictionary integration", () => {
       profileId: "profile",
       surfaceOwnerKey: "owner",
       isCurrent: () => true,
+      getVoiceInputDictionary: vi.fn(async () => ({ revision: 5n, syncEnabled: true, dictionary: EMPTY_MOBILE_VOICE_DICTIONARY, refinementTerms: [] })),
+      applyVoiceInputDictionaryLearning: vi.fn(async () => ({ revision: 6n, syncEnabled: true, dictionary: EMPTY_MOBILE_VOICE_DICTIONARY, refinementTerms: [] })),
       getCapabilities: vi.fn(async () => ({
         support: "supported" as const,
         limits: {
@@ -136,7 +138,7 @@ describe("useMobileVoiceInput dictionary integration", () => {
         requestId: () => "request-one",
         capture,
         locale: "en-US",
-        dictionaryStore: store
+        preferencesStore: store
       });
       return null;
     }
@@ -145,14 +147,15 @@ describe("useMobileVoiceInput dictionary integration", () => {
     await vi.waitFor(() => expect(binding?.available).toBe(true));
     await act(async () => binding!.start());
     expect(transport.start).toHaveBeenCalledWith("request-one", "audio/pcm", "en-US", {
-      instructions: "Keep commands verbatim.", dictionaryTerms: ["ExistingTerm"]
+      instructions: "Keep commands verbatim."
     }, expect.any(AbortSignal));
     await act(async () => binding!.stop());
     expect(currentDraft.text).toBe("voice kit");
     act(() => editDraft!("VoiceKit"));
     await act(async () => vi.advanceTimersByTimeAsync(1_200));
-    await vi.waitFor(() => expect(store.snapshot.document.dictionary.entries.map((entry) => entry.text))
-      .toEqual(["ExistingTerm", "VoiceKit"]));
+    await vi.waitFor(() => expect(store.snapshot.document.usage.correctionObservations).toBe(1));
+    expect(transport.applyVoiceInputDictionaryLearning).toHaveBeenCalledWith(5n, expect.any(Array), expect.any(AbortSignal));
+    expect(store.snapshot.document).not.toHaveProperty("dictionary");
     expect(advice).toHaveBeenCalledWith(expect.objectContaining({
       beforeText: "voice kit", afterText: "VoiceKit", rawTranscriptText: "voice kid", locale: "en-US"
     }), expect.any(AbortSignal));

@@ -25,7 +25,7 @@ import type { MobileThemePreferenceState } from "./mobile-theme-preference";
 import type { MobileDiagnosticsState } from "./mobile-diagnostics";
 import type { MobileLocalePreferenceState } from "./mobile-locale-preference";
 import { EMPTY_MOBILE_VOICE_DICTIONARY } from "./mobile-voice-dictionary";
-import type { MobileVoiceDictionaryStoreState } from "./mobile-voice-dictionary-store";
+import type { MobileVoicePreferencesStoreState } from "./mobile-voice-preferences-store";
 import type { MobileUpdateControllerState } from "./mobile-update-controller";
 import type { MobilePushControllerState } from "./mobile-push-controller";
 
@@ -219,16 +219,15 @@ const readyDiagnostics: MobileDiagnosticsState = {
   exporting: false,
   eventCount: 0
 };
-const readyVoiceDictionary: MobileVoiceDictionaryStoreState = {
+const readyVoiceDictionary: MobileVoicePreferencesStoreState = {
   status: "ready",
   saving: false,
   document: {
     version: 1,
     revision: 0,
-    dictionaryRevision: 0,
+    preferencesRevision: 0,
     refinementInstructions: "",
     autoLearningEnabled: true,
-    dictionary: EMPTY_MOBILE_VOICE_DICTIONARY,
     usage: { voiceStarts: 0, correctionObservations: 0, lastVoiceStartedAt: null, lastCorrectionAt: null },
     history: []
   }
@@ -277,7 +276,7 @@ function mount(options: {
   theme?: MobileThemePreferenceState;
   locale?: MobileLocalePreferenceState;
   diagnostics?: MobileDiagnosticsState;
-  voiceDictionary?: MobileVoiceDictionaryStoreState;
+  voiceDictionary?: MobileVoicePreferencesStoreState;
   updates?: MobileUpdateControllerState;
   push?: MobilePushControllerState;
   client?: MobileSettingsClient;
@@ -312,6 +311,8 @@ function mount(options: {
     locale,
     diagnostics,
     voiceDictionary,
+    nodeDictionary: { status: "ready", ownerKey: "node", saving: false,
+      snapshot: { revision: 1n, syncEnabled: false, dictionary: EMPTY_MOBILE_VOICE_DICTIONARY, refinementTerms: [] } },
     updates,
     push,
     updateActions: { onChannelChange, onCheck, onReset },
@@ -326,6 +327,8 @@ function mount(options: {
     onVoiceDictionaryReset: vi.fn(async () => undefined),
     onVoiceInstructionsChange: vi.fn(async () => undefined),
     onVoiceAutoLearningChange: vi.fn(async () => undefined),
+    onVoiceDictionaryRefresh: vi.fn(async () => undefined),
+    onVoiceDictionarySyncChange: vi.fn(async () => undefined),
     onVoiceDictionaryAdd: vi.fn(async () => undefined),
     onVoiceDictionaryEdit: vi.fn(async () => "updated" as const),
     onVoiceDictionaryDelete: vi.fn(async () => undefined),
@@ -353,7 +356,7 @@ function mount(options: {
     onDevices,
     rerender: (next: { state?: MobileState; foreground?: boolean; theme?: MobileThemePreferenceState;
       locale?: MobileLocalePreferenceState;
-      diagnostics?: MobileDiagnosticsState; voiceDictionary?: MobileVoiceDictionaryStoreState;
+      diagnostics?: MobileDiagnosticsState; voiceDictionary?: MobileVoicePreferencesStoreState;
       updates?: MobileUpdateControllerState; push?: MobilePushControllerState }) => {
       state = next.state ?? state;
       foreground = next.foreground ?? foreground;
@@ -403,7 +406,7 @@ describe("MobileSettingsScreen", () => {
     expect(mounted.container.textContent).toContain("0.1.0-test");
 
     act(() => button(mounted.container, "Voice input").click());
-    expect(mounted.container.textContent).toContain("These instructions, entries, correction evidence");
+    expect(mounted.container.textContent).toContain("The node stores dictionary terms and vocabulary evidence.");
     act(() => button(mounted.container, "Back to Voice input").click());
     expect(mounted.container.textContent).toContain("Settings");
 

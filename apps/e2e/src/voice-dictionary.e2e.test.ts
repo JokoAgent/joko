@@ -2,6 +2,7 @@ import { create } from "@bufbuild/protobuf";
 import { Code } from "@connectrpc/connect";
 import {
   AddVoiceInputDictionaryTermsRequestSchema,
+  DeviceKind,
   ApplyVoiceInputDictionaryLearningRequestSchema,
   EditVoiceInputDictionaryEntryRequestSchema,
   GetVoiceInputDictionaryRequestSchema,
@@ -61,5 +62,51 @@ describe("durable voice dictionary through authenticated generated RPCs", () => 
       entryId: committed.entries.find((value) => value.text === "Joko Core")!.entryId,
       text: "Joko Core", aliases: []
     }))).resolves.toMatchObject({ dictionary: { revision: committed.revision + 1n, syncEnabled: true } });
+  });
+
+  it("uses the production MobileNetwork projection through real HTTP and restores node data without a local dictionary", async () => {
+    // Load the portable production gateway at runtime, not a second wire mapper.
+    const { mobileNetwork } = await import(new URL("../../mobile/src/network.ts", import.meta.url).href);
+    const { MobileVoiceDictionaryController } = await import(new URL("../../mobile/src/mobile-voice-dictionary-controller.ts", import.meta.url).href);
+    const { MobileVoicePreferencesStore } = await import(new URL("../../mobile/src/mobile-voice-preferences-store.ts", import.meta.url).href);
+    fixture = await OrchestratorE2eFixture.start({ keepRoot: true });
+    const begun = await fixture.anonymous.connection.beginPairing({ deviceDisplayName: "Dictionary phone", deviceKind: DeviceKind.MOBILE, platform: "android", appVersion: "0.1.0" });
+    const challengeId = begun.challenge!.challengeId;
+    const paired = (await fixture.anonymous.connection.completePairing({ challengeId, humanCode: fixture.pairingCode(challengeId),
+      deviceDisplayName: "Dictionary phone", deviceKind: DeviceKind.MOBILE, platform: "android", appVersion: "0.1.0" })).result!;
+    const identity = await mobileNetwork.inspect(fixture.baseUrl);
+    const credential = { profileId: "dictionary-phone", origin: fixture.baseUrl, serverId: identity.serverId,
+      connectionId: paired.connection!.connectionId, deviceId: paired.device!.deviceId, displayName: "Dictionary phone", authKey: paired.authKey };
+    let privateData: string | null = null;
+    const preferences = new MobileVoicePreferencesStore({ getItem: async () => privateData,
+      setItem: async (_key: string, value: string) => { privateData = value; } }, () => 1_900_000_000_000, () => "history");
+    await preferences.hydrate();
+    await preferences.setRefinementInstructions("Preserve commands.");
+    const controller = new MobileVoiceDictionaryController(preferences);
+    controller.setTransport({ ownerKey: "phone-node", isCurrent: () => true,
+      getVoiceInputDictionary: () => mobileNetwork.getVoiceInputDictionary(credential),
+      setVoiceInputDictionarySyncEnabled: (revision: bigint, enabled: boolean) => mobileNetwork.setVoiceInputDictionarySyncEnabled(credential, revision, enabled),
+      addVoiceInputDictionaryTerms: (revision: bigint, terms: readonly string[]) => mobileNetwork.addVoiceInputDictionaryTerms(credential, revision, terms),
+      editVoiceInputDictionaryEntry: (revision: bigint, id: string, text: string, aliases: readonly string[]) => mobileNetwork.editVoiceInputDictionaryEntry(credential, revision, id, text, aliases),
+      deleteVoiceInputDictionaryEntry: (revision: bigint, id: string) => mobileNetwork.deleteVoiceInputDictionaryEntry(credential, revision, id),
+      applyVoiceInputDictionaryLearning: () => { throw new Error("Learning belongs to the voice owner."); }
+    });
+    await controller.refresh();
+    await controller.addTerm("VoiceKit");
+    const before = controller.snapshot.snapshot;
+    expect(before.dictionary.entries).toMatchObject([{ text: "VoiceKit", source: "manual" }]);
+    await controller.editEntry(before.dictionary.entries[0].id, "VoiceKit Core", "voice kit", before.revision);
+    const committed = controller.snapshot.snapshot;
+    expect(JSON.parse(privateData!)).not.toHaveProperty("dictionary");
+    expect(preferences.snapshot.document.history).toMatchObject([{ kind: "manualAdd" }, { kind: "manualEdit" }]);
+    const rootDirectory = fixture.rootDirectory;
+    await fixture.close({ removeRoot: false });
+    fixture = await OrchestratorE2eFixture.start({ rootDirectory });
+    const restored = await mobileNetwork.getVoiceInputDictionary({ ...credential, origin: fixture.baseUrl });
+    expect(restored).toEqual(committed);
+    await expect(mobileNetwork.deleteVoiceInputDictionaryEntry({ ...credential, origin: fixture.baseUrl }, before.revision,
+      committed.dictionary.entries[0].id)).rejects.toMatchObject({ code: Code.Aborted });
+    expect(await mobileNetwork.getVoiceInputDictionary({ ...credential, origin: fixture.baseUrl })).toEqual(committed);
+    controller.setTransport(undefined);
   });
 });

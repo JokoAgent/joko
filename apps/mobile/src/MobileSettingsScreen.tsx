@@ -27,11 +27,12 @@ import { mobileMessage, type MobileMessageKey } from "./mobile-messages";
 import { MobileVoiceDictionaryScreen } from "./MobileVoiceDictionaryScreen";
 import type {
   MobileVoiceDictionaryEditOutcome,
-  MobileVoiceDictionaryStoreState
-} from "./mobile-voice-dictionary-store";
+  MobileVoicePreferencesStoreState
+} from "./mobile-voice-preferences-store";
 import { MobileUpdateSettingsSection, type MobileUpdateActions } from "./MobileUpdateSurface";
 import type { MobileUpdateControllerState } from "./mobile-update-controller";
 import type { MobilePushControllerState } from "./mobile-push-controller";
+import type { MobileVoiceDictionaryControllerState } from "./mobile-voice-dictionary-controller";
 
 export interface MobileSettingsColors {
   readonly background: string;
@@ -54,7 +55,8 @@ export interface MobileSettingsScreenProps {
   readonly theme: MobileThemePreferenceState;
   readonly locale: MobileLocalePreferenceState;
   readonly diagnostics: MobileDiagnosticsState;
-  readonly voiceDictionary: MobileVoiceDictionaryStoreState;
+  readonly voiceDictionary: MobileVoicePreferencesStoreState;
+  readonly nodeDictionary: MobileVoiceDictionaryControllerState;
   readonly updates: MobileUpdateControllerState;
   readonly push: MobilePushControllerState;
   readonly updateActions: Pick<MobileUpdateActions, "onChannelChange" | "onCheck" | "onReset">;
@@ -69,9 +71,11 @@ export interface MobileSettingsScreenProps {
   readonly onVoiceDictionaryReset: () => Promise<void>;
   readonly onVoiceInstructionsChange: (value: string) => Promise<void>;
   readonly onVoiceAutoLearningChange: (enabled: boolean) => Promise<void>;
+  readonly onVoiceDictionaryRefresh: () => Promise<void>;
+  readonly onVoiceDictionarySyncChange: (enabled: boolean) => Promise<void>;
   readonly onVoiceDictionaryAdd: (value: string) => Promise<void>;
-  readonly onVoiceDictionaryEdit: (id: string, text: string, aliases: string) => Promise<MobileVoiceDictionaryEditOutcome>;
-  readonly onVoiceDictionaryDelete: (id: string) => Promise<void>;
+  readonly onVoiceDictionaryEdit: (id: string, text: string, aliases: string, revision: bigint) => Promise<MobileVoiceDictionaryEditOutcome>;
+  readonly onVoiceDictionaryDelete: (id: string, revision: bigint) => Promise<void>;
   readonly onBack: () => void;
   readonly onConnections: () => void;
   readonly onDevices: () => void;
@@ -108,11 +112,12 @@ export function resolveMobileSettingsCurrentDevice(state: MobileState): MobileSe
   };
 }
 
-export function MobileSettingsScreen({ colors, state, foreground, theme, locale, diagnostics, voiceDictionary, client, onThemeChange,
+export function MobileSettingsScreen(props: MobileSettingsScreenProps) {
+  const { colors, state, foreground, theme, locale, diagnostics, voiceDictionary, client, onThemeChange,
   onLocaleChange, onPushEnabledChange, onDiagnosticsEnabledChange, onDiagnosticsClear, onDiagnosticsExport, onBack,
   onVoiceDictionaryRetry, onVoiceDictionaryReset, onVoiceInstructionsChange, onVoiceAutoLearningChange, onVoiceDictionaryAdd,
   onVoiceDictionaryEdit, onVoiceDictionaryDelete, onConnections, onDevices, updates, updateActions, push,
-  appVersion }: MobileSettingsScreenProps) {
+  appVersion } = props;
   const current = resolveMobileSettingsCurrentDevice(state);
   const t = (key: MobileMessageKey, variables?: Readonly<Record<string, string | number>>): string =>
     mobileMessage(locale.effectiveLocale, key, variables);
@@ -255,10 +260,12 @@ export function MobileSettingsScreen({ colors, state, foreground, theme, locale,
     }
   };
 
-  if (voiceOpen) return <MobileVoiceDictionaryScreen colors={colors} locale={locale.effectiveLocale}
-    state={voiceDictionary} onBack={() => setVoiceOpen(false)} onRetry={onVoiceDictionaryRetry}
+  if (voiceOpen) return <MobileVoiceDictionaryScreen key={props.nodeDictionary.ownerKey ?? "unavailable"}
+    colors={colors} locale={locale.effectiveLocale}
+    state={voiceDictionary} dictionary={props.nodeDictionary} onBack={() => setVoiceOpen(false)} onRetry={onVoiceDictionaryRetry}
     onReset={onVoiceDictionaryReset}
     onSetInstructions={onVoiceInstructionsChange} onSetAutoLearning={onVoiceAutoLearningChange}
+    onRefreshDictionary={props.onVoiceDictionaryRefresh} onSetSyncEnabled={props.onVoiceDictionarySyncChange}
     onAddTerm={onVoiceDictionaryAdd} onEditEntry={onVoiceDictionaryEdit}
     onDeleteEntry={onVoiceDictionaryDelete} />;
 

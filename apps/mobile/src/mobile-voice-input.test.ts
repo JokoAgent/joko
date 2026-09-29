@@ -127,7 +127,7 @@ describe("MobileVoiceInputRun", () => {
   });
 
   it("sends bounded refinement context only when the exact capability supports it", async () => {
-    const refinement = { instructions: "Keep commands verbatim.", dictionaryTerms: ["VoiceKit"] };
+    const refinement = { instructions: "Keep commands verbatim." };
     const supported = fakeTransport();
     const supportedRun = new MobileVoiceInputRun({
       transport: supported,
@@ -536,6 +536,8 @@ function fakeTransport(isCurrent: () => boolean = () => true): FakeVoiceTranspor
     surfaceOwnerKey: "owner-one",
     isCurrent,
     getCapabilities: vi.fn(async () => capability),
+    getVoiceInputDictionary: vi.fn(async () => { throw new Error("No dictionary read was requested by this capture fixture."); }),
+    applyVoiceInputDictionaryLearning: vi.fn(async () => { throw new Error("No dictionary learning was requested by this capture fixture."); }),
     adviseVoiceInputDictionaryEdit: vi.fn(async () => ({ actions: [] })),
     start: vi.fn(async () => voiceSession()),
     append: vi.fn(),

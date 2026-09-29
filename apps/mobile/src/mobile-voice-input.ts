@@ -11,6 +11,7 @@ import type {
   MobileVoiceDictionaryAdviceDraft,
   MobileVoiceDictionaryLearningAction
 } from "./mobile-voice-dictionary";
+import type { MobileVoiceDictionaryApi } from "./mobile-voice-dictionary-service";
 
 const TERMINAL_POLL_INTERVAL_MS = 180;
 const IDENTIFIER_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
@@ -66,10 +67,9 @@ export interface MobileVoiceSession {
 
 export interface MobileVoiceRefinementContext {
   readonly instructions?: string;
-  readonly dictionaryTerms: readonly string[];
 }
 
-export interface MobileVoiceTransport {
+export interface MobileVoiceTransport extends Pick<MobileVoiceDictionaryApi, "getVoiceInputDictionary" | "applyVoiceInputDictionaryLearning"> {
   readonly profileId: string;
   readonly surfaceOwnerKey: string;
   isCurrent(): boolean;

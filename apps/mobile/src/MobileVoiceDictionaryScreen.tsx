@@ -18,25 +18,32 @@ import {
 } from "./mobile-voice-dictionary";
 import type {
   MobileVoiceDictionaryEditOutcome,
-  MobileVoiceDictionaryStoreState
-} from "./mobile-voice-dictionary-store";
+  MobileVoicePreferencesStoreState
+} from "./mobile-voice-preferences-store";
 import type { MobileSettingsColors } from "./MobileSettingsScreen";
+import type { MobileVoiceDictionaryControllerState } from "./mobile-voice-dictionary-controller";
+import { EMPTY_MOBILE_VOICE_DICTIONARY, type MobileVoiceDictionary } from "./mobile-voice-dictionary";
 
 export interface MobileVoiceDictionaryScreenProps {
   readonly colors: MobileSettingsColors;
   readonly locale: MobileSupportedLocale;
-  readonly state: MobileVoiceDictionaryStoreState;
+  readonly state: MobileVoicePreferencesStoreState;
+  readonly dictionary: MobileVoiceDictionaryControllerState;
   readonly onBack: () => void;
   readonly onRetry: () => Promise<void>;
   readonly onReset: () => Promise<void>;
   readonly onSetInstructions: (value: string) => Promise<void>;
   readonly onSetAutoLearning: (enabled: boolean) => Promise<void>;
+  readonly onRefreshDictionary: () => Promise<void>;
+  readonly onSetSyncEnabled: (enabled: boolean) => Promise<void>;
   readonly onAddTerm: (value: string) => Promise<void>;
-  readonly onEditEntry: (id: string, text: string, aliases: string) => Promise<MobileVoiceDictionaryEditOutcome>;
-  readonly onDeleteEntry: (id: string) => Promise<void>;
+  readonly onEditEntry: (id: string, text: string, aliases: string, revision: bigint) => Promise<MobileVoiceDictionaryEditOutcome>;
+  readonly onDeleteEntry: (id: string, revision: bigint) => Promise<void>;
 }
 
 interface Editor {
+  readonly revision: bigint;
+  readonly dictionary: MobileVoiceDictionary;
   readonly id: string;
   readonly originalTerm: string;
   readonly term: string;
@@ -44,7 +51,9 @@ interface Editor {
 }
 
 export function MobileVoiceDictionaryScreen(props: MobileVoiceDictionaryScreenProps) {
-  const { colors, locale, state } = props;
+  const { colors, locale, state, dictionary } = props;
+  const projection = dictionary.snapshot?.dictionary ?? EMPTY_MOBILE_VOICE_DICTIONARY;
+  const dictionaryReady = dictionary.status === "ready" && dictionary.snapshot !== undefined;
   const t = (key: Parameters<typeof mobileMessage>[1], variables?: Readonly<Record<string, string | number>>) =>
     mobileMessage(locale, key, variables);
   const [instructions, setInstructions] = useState(state.document.refinementInstructions);
@@ -57,6 +66,9 @@ export function MobileVoiceDictionaryScreen(props: MobileVoiceDictionaryScreenPr
   const [focusAdd, setFocusAdd] = useState(false);
   const addInputRef = useRef<TextInput>(null);
   const editInputRef = useRef<TextInput>(null);
+  const busyRef = useRef(false);
+  const mounted = useRef(true);
+  useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
 
   useEffect(() => {
     if (!instructionDirty) setInstructions(state.document.refinementInstructions);
@@ -70,51 +82,57 @@ export function MobileVoiceDictionaryScreen(props: MobileVoiceDictionaryScreenPr
 
   useEffect(() => {
     const subscription = BackHandler.addEventListener("hardwareBackPress", () => {
-      if (busy || state.saving) return true;
+      if (busy || state.saving || dictionary.saving) return true;
       if (editor) setEditor(undefined);
       else props.onBack();
       return true;
     });
     return () => subscription.remove();
-  }, [busy, editor, props.onBack, state.saving]);
+  }, [busy, editor, props.onBack, state.saving, dictionary.saving]);
 
   const run = async (action: () => Promise<void>, success?: string): Promise<boolean> => {
-    if (busy || state.saving) return false;
+    if (busyRef.current || state.saving || dictionary.saving) return false;
+    busyRef.current = true;
     setBusy(true);
     setError("");
     setNotice("");
     try {
       await action();
+      if (!mounted.current) return false;
       if (success) setNotice(success);
       return true;
     } catch {
-      setError(t("settings.voice.saveError"));
+      if (mounted.current) setError(t("settings.voice.saveError"));
       return false;
     } finally {
-      setBusy(false);
+      busyRef.current = false;
+      if (mounted.current) setBusy(false);
     }
   };
 
   if (editor) {
-    const source = state.document.dictionary.entries.find((entry) => entry.id === editor.id);
-    const preview = previewMobileVoiceDictionaryEdit(state.document.dictionary, editor.id, editor.term);
-    const disabled = busy || state.saving || state.status !== "ready" || source === undefined;
+    const source = projection.entries.find((entry) => entry.id === editor.id);
+    const preview = previewMobileVoiceDictionaryEdit(editor.dictionary, editor.id, editor.term);
+    const disabled = busy || state.saving || dictionary.saving || !dictionaryReady || source === undefined;
     const save = async (): Promise<void> => {
-      if (disabled) return;
+      if (disabled || busyRef.current) return;
+      busyRef.current = true;
       setBusy(true);
       setError("");
       setNotice("");
       try {
-        const outcome = await props.onEditEntry(editor.id, editor.term, editor.aliases);
+        const outcome = await props.onEditEntry(editor.id, editor.term, editor.aliases, editor.revision);
+        if (!mounted.current) return;
         setEditor(undefined);
         setFocusAdd(true);
         setNotice(t(outcome === "deleted" ? "settings.voice.deleted"
           : outcome === "mergedEntry" || outcome === "mergedCandidate" ? "settings.voice.merged"
             : "settings.voice.updated"));
       } catch {
-        setError(t("settings.voice.saveError"));
+        if (mounted.current) setError(t("settings.voice.saveError"));
       } finally {
-        setBusy(false);
+        busyRef.current = false;
+        if (mounted.current) setBusy(false);
       }
     };
     const requestDelete = (): void => {
@@ -122,7 +140,7 @@ export function MobileVoiceDictionaryScreen(props: MobileVoiceDictionaryScreenPr
       Alert.alert(t("settings.voice.deleteTitle", { term: source.text }), t("settings.voice.deleteBody"), [
         { text: t("common.cancel"), style: "cancel" },
         { text: t("settings.voice.deleteEntry"), style: "destructive", onPress: () => {
-          void run(() => props.onDeleteEntry(source.id)).then((deleted) => {
+          void run(() => props.onDeleteEntry(source.id, editor.revision)).then((deleted) => {
             if (!deleted) return;
             setEditor(undefined);
             setFocusAdd(true);
@@ -151,6 +169,12 @@ export function MobileVoiceDictionaryScreen(props: MobileVoiceDictionaryScreenPr
         text={t("settings.voice.mergeEntry", { term: preview.targetText })} />}
       {preview?.kind === "mergeCandidate" && <Notice colors={colors}
         text={t("settings.voice.mergeCandidate", { term: preview.targetText, count: preview.evidenceCount })} />}
+      {dictionary.snapshot?.revision !== editor.revision && <>
+        <Notice colors={colors} text={t("settings.voice.conflict")} />
+        <Button label={t("settings.voice.reviewLatest")} colors={colors} disabled={disabled}
+          onPress={() => setEditor({ ...editor, revision: dictionary.snapshot!.revision, dictionary: projection })} />
+      </>}
+      {!dictionaryReady && <Notice colors={colors} text={t("settings.voice.nodeUnavailable")} />}
       {error && <ErrorNotice colors={colors} text={error} />}
       <View style={styles.actionRow}>
         <Button label={t("common.cancel")} colors={colors} disabled={busy || state.saving}
@@ -188,10 +212,10 @@ export function MobileVoiceDictionaryScreen(props: MobileVoiceDictionaryScreenPr
   </ScrollView>;
 
   const document = state.document;
-  const entries = document.dictionary.entries.slice().sort((left, right) =>
+  const entries = projection.entries.slice().sort((left, right) =>
     Number(left.source === "automatic") - Number(right.source === "automatic")
       || right.frequency - left.frequency || left.text.localeCompare(right.text));
-  const candidates = document.dictionary.candidates.slice().sort((left, right) =>
+  const candidates = projection.candidates.slice().sort((left, right) =>
     right.evidenceCount - left.evidenceCount || left.text.localeCompare(right.text));
   return <ScrollView contentContainerStyle={[styles.screen, { backgroundColor: colors.background }]}
     keyboardShouldPersistTaps="handled">
@@ -226,21 +250,37 @@ export function MobileVoiceDictionaryScreen(props: MobileVoiceDictionaryScreenPr
     </View>
 
     <Text style={[styles.section, { color: colors.muted }]}>{t("settings.voice.entries")}</Text>
+    <View style={[styles.toggleRow, { backgroundColor: colors.surface, borderColor: colors.border }]}>
+      <View style={styles.fill}>
+        <Text style={[styles.label, { color: colors.ink }]}>{t("settings.voice.sync")}</Text>
+        <Text style={[styles.caption, { color: colors.muted }]}>{t("settings.voice.syncHint")}</Text>
+      </View>
+      <Switch accessibilityLabel={t("settings.voice.sync")} value={dictionary.snapshot?.syncEnabled ?? false}
+        disabled={busy || dictionary.saving || !dictionaryReady}
+        trackColor={{ false: colors.border, true: colors.accent }}
+        onValueChange={(enabled) => void run(() => props.onSetSyncEnabled(enabled))} />
+    </View>
+    {dictionary.status === "loading" && <Notice colors={colors} text={t("settings.voice.loading")} />}
+    {dictionary.status === "unavailable" && <Notice colors={colors} text={t("settings.voice.nodeUnavailable")} />}
+    {dictionary.status === "error" && <ErrorNotice colors={colors} text={t("settings.voice.nodeError")} />}
+    <Button label={t("settings.voice.refresh")} colors={colors} disabled={busy || dictionary.saving || dictionary.status === "unavailable"}
+      onPress={() => void run(props.onRefreshDictionary)} />
     <View style={styles.addRow}>
       <TextInput ref={addInputRef} accessibilityLabel={t("settings.voice.term")} value={termDraft}
-        editable={!busy && !state.saving} maxLength={120} autoCorrect={false} onSubmitEditing={() => {
+        editable={!busy && !dictionary.saving && dictionaryReady} maxLength={120} autoCorrect={false} onSubmitEditing={() => {
           if (termDraft.trim()) void addTerm();
         }} onChangeText={setTermDraft} placeholder={t("settings.voice.termPlaceholder")}
         placeholderTextColor={colors.muted}
         style={[styles.input, styles.fill, { color: colors.ink, backgroundColor: colors.surface, borderColor: colors.border }]} />
       <Button label={t("settings.voice.addTerm")} colors={colors}
-        disabled={busy || state.saving || !termDraft.trim()} onPress={() => void addTerm()} />
+        disabled={busy || dictionary.saving || !dictionaryReady || !termDraft.trim()} onPress={() => void addTerm()} />
     </View>
     {entries.length === 0 ? <Notice colors={colors} text={t("settings.voice.entriesEmpty")} />
       : entries.map((entry) => <DictionaryEntry key={entry.id} entry={entry} colors={colors} locale={locale}
-        disabled={busy || state.saving} onPress={() => {
+        disabled={busy || dictionary.saving || !dictionaryReady} onPress={() => {
           setError(""); setNotice("");
-          setEditor({ id: entry.id, originalTerm: entry.text, term: entry.text,
+          setEditor({ revision: dictionary.snapshot!.revision, dictionary: projection,
+            id: entry.id, originalTerm: entry.text, term: entry.text,
             aliases: entry.aliases.map((alias) => alias.text).join("\n") });
         }} />)}
 
@@ -255,7 +295,7 @@ export function MobileVoiceDictionaryScreen(props: MobileVoiceDictionaryScreenPr
           </Text>
         </View>
         <Button label={t("settings.voice.confirmCandidate", { term: candidate.text })} colors={colors}
-          disabled={busy || state.saving} onPress={() => void run(
+          disabled={busy || dictionary.saving || !dictionaryReady} onPress={() => void run(
             () => props.onAddTerm(candidate.text), t("settings.voice.added")
           )} />
       </View>)}
@@ -266,7 +306,7 @@ export function MobileVoiceDictionaryScreen(props: MobileVoiceDictionaryScreenPr
       <Stat label={t("settings.voice.corrections")} value={document.usage.correctionObservations} colors={colors} />
       <Stat label={t("settings.voice.history")} value={document.history.length} colors={colors} />
     </View>
-    {(error || state.error) && <ErrorNotice colors={colors} text={error || t("settings.voice.saveError")} />}
+    {(error || state.error) && <ErrorNotice colors={colors} text={error || t("settings.voice.localSaveError")} />}
     {notice && <Text accessibilityLiveRegion="polite" style={[styles.noticeText, { color: colors.ink }]}>{notice}</Text>}
   </ScrollView>;
 

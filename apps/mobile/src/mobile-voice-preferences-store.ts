@@ -1,17 +1,5 @@
 import type { MobilePlainStorageDriver } from "./connection-storage";
-import {
-  EMPTY_MOBILE_VOICE_DICTIONARY,
-  addManualMobileVoiceDictionaryTerm,
-  applyMobileVoiceDictionaryAdvice,
-  deleteMobileVoiceDictionaryEntry,
-  editMobileVoiceDictionaryEntry,
-  normalizeMobileVoiceDictionary,
-  normalizeMobileVoiceDictionaryTerm,
-  previewMobileVoiceDictionaryEdit,
-  type MobileVoiceDictionary,
-  type MobileVoiceDictionaryEditPreview,
-  type MobileVoiceDictionaryLearningAction
-} from "./mobile-voice-dictionary";
+import { normalizeMobileVoiceDictionaryTerm } from "./mobile-voice-dictionary";
 
 export const MAXIMUM_MOBILE_VOICE_REFINEMENT_INSTRUCTION_CHARACTERS = 1_000;
 export const MAXIMUM_MOBILE_VOICE_DICTIONARY_HISTORY = 100;
@@ -33,20 +21,19 @@ export interface MobileVoiceDictionaryUsage {
   readonly lastCorrectionAt: number | null;
 }
 
-export interface MobileVoiceDictionaryDocument {
+export interface MobileVoicePreferencesDocument {
   readonly version: 1;
   readonly revision: number;
-  readonly dictionaryRevision: number;
+  readonly preferencesRevision: number;
   readonly refinementInstructions: string;
   readonly autoLearningEnabled: boolean;
-  readonly dictionary: MobileVoiceDictionary;
   readonly usage: MobileVoiceDictionaryUsage;
   readonly history: readonly MobileVoiceDictionaryHistoryEntry[];
 }
 
-export interface MobileVoiceDictionaryStoreState {
+export interface MobileVoicePreferencesStoreState {
   readonly status: "loading" | "ready" | "error";
-  readonly document: MobileVoiceDictionaryDocument;
+  readonly document: MobileVoicePreferencesDocument;
   readonly saving: boolean;
   readonly error?: string;
 }
@@ -56,8 +43,8 @@ export type MobileVoiceDictionaryEditOutcome = "updated" | "mergedEntry" | "merg
 const STORAGE_KEY = "joko.mobile.voiceDictionary.v1";
 const MAXIMUM_STORED_TIMESTAMP = 8_640_000_000_000_000;
 
-export class MobileVoiceDictionaryStore {
-  #state: MobileVoiceDictionaryStoreState = {
+export class MobileVoicePreferencesStore {
+  #state: MobileVoicePreferencesStoreState = {
     status: "loading",
     document: emptyDocument(),
     saving: false
@@ -72,7 +59,7 @@ export class MobileVoiceDictionaryStore {
     private readonly createId: () => string
   ) {}
 
-  get snapshot(): MobileVoiceDictionaryStoreState { return this.#state; }
+  get snapshot(): MobileVoicePreferencesStoreState { return this.#state; }
 
   subscribe(listener: () => void): () => void {
     this.#listeners.add(listener);
@@ -100,7 +87,7 @@ export class MobileVoiceDictionaryStore {
         await this.storage.setItem(STORAGE_KEY, JSON.stringify(document));
         this.#publish({ status: "ready", document, saving: false });
       } catch (cause) {
-        const error = storageError("The device-local voice dictionary could not be reset", cause);
+        const error = storageError("The device-local voice preferences could not be reset", cause);
         this.#publish({ ...this.#state, saving: false, error });
         throw new Error(error);
       }
@@ -113,7 +100,7 @@ export class MobileVoiceDictionaryStore {
     return this.#mutate((current) => current.refinementInstructions === instructions ? current : Object.freeze({
       ...current,
       revision: current.revision + 1,
-      dictionaryRevision: current.dictionaryRevision + 1,
+      preferencesRevision: current.preferencesRevision + 1,
       refinementInstructions: instructions
     }));
   }
@@ -123,55 +110,9 @@ export class MobileVoiceDictionaryStore {
     return this.#mutate((current) => current.autoLearningEnabled === enabled ? current : Object.freeze({
       ...current,
       revision: current.revision + 1,
-      dictionaryRevision: current.dictionaryRevision + 1,
+      preferencesRevision: current.preferencesRevision + 1,
       autoLearningEnabled: enabled
     }));
-  }
-
-  addManualTerm(text: string): Promise<void> {
-    return this.#mutate((current) => {
-      const now = this.#now();
-      const next = addManualMobileVoiceDictionaryTerm(current.dictionary, text, now, this.createId);
-      if (!next) throw new Error("The dictionary term is invalid or the dictionary is full.");
-      if (next === current.dictionary) return current;
-      return this.#withDictionary(current, next, "manualAdd", [normalizeMobileVoiceDictionaryTerm(text)!], now);
-    });
-  }
-
-  editEntry(id: string, text: string, aliasDraft: string): Promise<MobileVoiceDictionaryEditOutcome> {
-    let outcome: MobileVoiceDictionaryEditOutcome = "unchanged";
-    return this.#mutate((current) => {
-      const source = current.dictionary.entries.find((entry) => entry.id === id);
-      if (!source) return current;
-      const preview = previewMobileVoiceDictionaryEdit(current.dictionary, id, text);
-      const now = this.#now();
-      const next = editMobileVoiceDictionaryEntry(current.dictionary, id, text, aliasDraft, now);
-      if (!next) throw new Error("The dictionary edit is invalid.");
-      if (next === current.dictionary) return current;
-      outcome = text.trim() === "" ? "deleted"
-        : preview?.kind === "mergeEntry" ? "mergedEntry"
-          : preview?.kind === "mergeCandidate" ? "mergedCandidate" : "updated";
-      const term = normalizeMobileVoiceDictionaryTerm(text) ?? source.text;
-      return this.#withDictionary(current, next,
-        outcome === "deleted" ? "manualDelete"
-          : outcome === "mergedEntry" || outcome === "mergedCandidate" ? "manualMerge" : "manualEdit",
-        [term], now);
-    }).then(() => outcome);
-  }
-
-  deleteEntry(id: string): Promise<void> {
-    return this.#mutate((current) => {
-      const source = current.dictionary.entries.find((entry) => entry.id === id);
-      if (!source) return current;
-      const now = this.#now();
-      return this.#withDictionary(
-        current,
-        deleteMobileVoiceDictionaryEntry(current.dictionary, id),
-        "manualDelete",
-        [source.text],
-        now
-      );
-    });
   }
 
   recordVoiceStart(): Promise<void> {
@@ -189,50 +130,32 @@ export class MobileVoiceDictionaryStore {
     });
   }
 
-  applyAdvice(
-    actions: readonly MobileVoiceDictionaryLearningAction[],
-    expectedDictionaryRevision: number,
-    guard: () => boolean
-  ): Promise<boolean> {
-    let accepted = false;
-    let changed = false;
+  /** Metadata only: call after a confirmed service mutation, never to replay it. */
+  recordDictionaryChange(
+    kind: MobileVoiceDictionaryHistoryKind,
+    terms: readonly string[],
+    guard?: () => boolean
+  ): Promise<void> {
+    const normalized = terms.map(normalizeMobileVoiceDictionaryTerm);
+    if (!isHistoryKind(kind) || terms.length < 1 || terms.length > 3
+      || normalized.some((term) => term === undefined)) return Promise.reject(new Error("The voice history record is invalid."));
     return this.#mutate((current) => {
-      if (!guard() || !current.autoLearningEnabled || current.dictionaryRevision !== expectedDictionaryRevision) {
-        return current;
-      }
-      accepted = true;
-      if (actions.length === 0) return current;
       const now = this.#now();
-      const dictionary = applyMobileVoiceDictionaryAdvice(current.dictionary, actions, now, this.createId);
-      if (dictionary === current.dictionary) return current;
-      const terms = actions.slice(0, 3)
-        .map((action) => normalizeMobileVoiceDictionaryTerm(action.term))
-        .filter((term): term is string => term !== undefined);
-      const history = appendHistory(current.history, {
-        id: this.#id(),
-        kind: "automaticLearning",
-        terms,
-        occurredAt: now
-      });
-      changed = true;
       return Object.freeze({
         ...current,
         revision: current.revision + 1,
-        dictionaryRevision: current.dictionaryRevision + 1,
-        dictionary,
-        usage: Object.freeze({
-          ...current.usage,
-          correctionObservations: boundedIncrement(current.usage.correctionObservations),
-          lastCorrectionAt: now
+        history: appendHistory(current.history, {
+          id: this.#id(), kind, terms: normalized as string[], occurredAt: now
         }),
-        history
+        ...(kind === "automaticLearning" ? {
+          usage: Object.freeze({
+            ...current.usage,
+            correctionObservations: boundedIncrement(current.usage.correctionObservations),
+            lastCorrectionAt: now
+          })
+        } : {})
       });
-    }, guard).then(() => accepted && (!changed || this.#state.status === "ready"
-      && this.#state.document.dictionaryRevision === expectedDictionaryRevision + 1));
-  }
-
-  previewEdit(id: string, text: string): MobileVoiceDictionaryEditPreview | undefined {
-    return previewMobileVoiceDictionaryEdit(this.#state.document.dictionary, id, text);
+    }, guard);
   }
 
   async #read(): Promise<void> {
@@ -245,22 +168,23 @@ export class MobileVoiceDictionaryStore {
         status: "error",
         document: emptyDocument(),
         saving: false,
-        error: storageError("The saved device-local voice dictionary is unavailable", cause)
+        error: storageError("The saved device-local voice preferences are unavailable", cause)
       });
     }
   }
 
   #mutate(
-    update: (current: MobileVoiceDictionaryDocument) => MobileVoiceDictionaryDocument,
+    update: (current: MobileVoicePreferencesDocument) => MobileVoicePreferencesDocument,
     guard?: () => boolean
   ): Promise<void> {
     return this.#enqueue(async () => {
       if (this.#state.status === "loading") await this.hydrate();
-      if (this.#state.status !== "ready") throw new Error("The device-local voice dictionary is unavailable.");
+      if (this.#state.status !== "ready") throw new Error("The device-local voice preferences are unavailable.");
       const previous = this.#state.document;
       if (guard && !guard()) return;
       const next = update(previous);
       if (next === previous) return;
+      if (!Number.isSafeInteger(next.revision) || !Number.isSafeInteger(next.preferencesRevision)) throw new Error("The voice preferences revision is exhausted.");
       this.#publish({ status: "ready", document: previous, saving: true });
       try {
         await this.storage.setItem(STORAGE_KEY, JSON.stringify(next));
@@ -271,26 +195,10 @@ export class MobileVoiceDictionaryStore {
         }
         this.#publish({ status: "ready", document: next, saving: false });
       } catch (cause) {
-        const error = storageError("The device-local voice dictionary could not be saved", cause);
+        const error = storageError("The device-local voice preferences could not be saved", cause);
         this.#publish({ status: "ready", document: previous, saving: false, error });
         throw new Error(error);
       }
-    });
-  }
-
-  #withDictionary(
-    current: MobileVoiceDictionaryDocument,
-    dictionary: MobileVoiceDictionary,
-    kind: MobileVoiceDictionaryHistoryKind,
-    terms: readonly string[],
-    now: number
-  ): MobileVoiceDictionaryDocument {
-    return Object.freeze({
-      ...current,
-      revision: current.revision + 1,
-      dictionaryRevision: current.dictionaryRevision + 1,
-      dictionary,
-      history: appendHistory(current.history, { id: this.#id(), kind, terms, occurredAt: now })
     });
   }
 
@@ -311,20 +219,19 @@ export class MobileVoiceDictionaryStore {
     return result;
   }
 
-  #publish(state: MobileVoiceDictionaryStoreState): void {
+  #publish(state: MobileVoicePreferencesStoreState): void {
     this.#state = state;
     for (const listener of this.#listeners) listener();
   }
 }
 
-function emptyDocument(revision = 0): MobileVoiceDictionaryDocument {
+function emptyDocument(revision = 0): MobileVoicePreferencesDocument {
   return Object.freeze({
     version: 1,
     revision,
-    dictionaryRevision: revision,
+    preferencesRevision: revision,
     refinementInstructions: "",
     autoLearningEnabled: true,
-    dictionary: EMPTY_MOBILE_VOICE_DICTIONARY,
     usage: Object.freeze({
       voiceStarts: 0,
       correctionObservations: 0,
@@ -335,27 +242,25 @@ function emptyDocument(revision = 0): MobileVoiceDictionaryDocument {
   });
 }
 
-function parseDocument(raw: string): MobileVoiceDictionaryDocument {
+function parseDocument(raw: string): MobileVoicePreferencesDocument {
   const value: unknown = JSON.parse(raw);
   if (!isRecord(value) || !hasExactKeys(value, [
-    "autoLearningEnabled", "dictionary", "dictionaryRevision", "history", "refinementInstructions",
+    "autoLearningEnabled", "history", "preferencesRevision", "refinementInstructions",
     "revision", "usage", "version"
   ]) || value.version !== 1 || typeof value.autoLearningEnabled !== "boolean") throw new Error("invalid current-v1 record");
   const revision = nonNegativeInteger(value.revision);
-  const dictionaryRevision = nonNegativeInteger(value.dictionaryRevision);
+  const preferencesRevision = nonNegativeInteger(value.preferencesRevision);
   const refinementInstructions = normalizeInstructions(value.refinementInstructions);
-  const dictionary = normalizeMobileVoiceDictionary(value.dictionary);
   const usage = normalizeUsage(value.usage);
   const history = normalizeHistory(value.history);
-  if (revision === undefined || dictionaryRevision === undefined || dictionaryRevision > revision
-    || refinementInstructions === undefined || !dictionary || !usage || !history) throw new Error("invalid current-v1 record");
+  if (revision === undefined || preferencesRevision === undefined || preferencesRevision > revision
+    || refinementInstructions === undefined || !usage || !history) throw new Error("invalid current-v1 record");
   return Object.freeze({
     version: 1,
     revision,
-    dictionaryRevision,
+    preferencesRevision,
     refinementInstructions,
     autoLearningEnabled: value.autoLearningEnabled,
-    dictionary,
     usage,
     history
   });
@@ -439,4 +344,4 @@ function storageError(prefix: string, cause: unknown): string {
   return `${prefix}: ${cause instanceof Error && cause.message ? cause.message : "storage failed"}`;
 }
 
-export const mobileVoiceDictionaryStoreTesting = { storageKey: STORAGE_KEY, parseDocument };
+export const mobileVoicePreferencesStoreTesting = { storageKey: STORAGE_KEY, parseDocument };

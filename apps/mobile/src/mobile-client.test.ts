@@ -39,6 +39,7 @@ import type { Event, Operation, Schedule, ScheduleInput, SessionMessageSearchMat
 import type { MobileInteractionDraftIdentity } from "./interaction-draft-store";
 import { MobileComposerDraftStore } from "./composer-draft-store";
 import { MobileNewTaskDraftStore } from "./new-task-draft-store";
+import { EMPTY_MOBILE_VOICE_DICTIONARY } from "./mobile-voice-dictionary";
 import { MobileAttachmentFiles, type MobileAttachmentFileDriver } from "./mobile-attachment-files";
 import {
   MobileMediaPreviewFiles,
@@ -2235,7 +2236,7 @@ describe("native mobile connection and operation ownership", () => {
     expect(newTaskVoice).toBeDefined();
     expect(newTaskVoice?.isCurrent()).toBe(true);
     await expect(newTaskVoice!.getCapabilities()).resolves.toBe(voiceCapability);
-    const refinement = { instructions: "Keep commands verbatim.", dictionaryTerms: ["VoiceKit"] };
+    const refinement = { instructions: "Keep commands verbatim." };
     await expect(newTaskVoice!.start("request-one", "audio/pcm", "en-US", refinement)).resolves.toBe(voiceSession);
     expect(network.startVoiceInput).toHaveBeenCalledWith(
       credential,
@@ -2253,6 +2254,13 @@ describe("native mobile connection and operation ownership", () => {
     };
     await expect(newTaskVoice!.adviseVoiceInputDictionaryEdit(adviceDraft)).resolves.toEqual({ actions: [] });
     expect(network.adviseVoiceInputDictionaryEdit).toHaveBeenCalledWith(credential, adviceDraft, undefined);
+    const dictionary = { revision: 3n, syncEnabled: true, dictionary: EMPTY_MOBILE_VOICE_DICTIONARY, refinementTerms: [] };
+    vi.mocked(network.getVoiceInputDictionary).mockResolvedValue(dictionary);
+    vi.mocked(network.applyVoiceInputDictionaryLearning).mockResolvedValue({ ...dictionary, revision: 4n });
+    await expect(newTaskVoice!.getVoiceInputDictionary()).resolves.toBe(dictionary);
+    await newTaskVoice!.applyVoiceInputDictionaryLearning(3n, []);
+    expect(network.getVoiceInputDictionary).toHaveBeenCalledWith(credential, undefined);
+    expect(network.applyVoiceInputDictionaryLearning).toHaveBeenCalledWith(credential, 3n, [], undefined);
 
     await app.select("session");
     const taskVoice = app.taskVoiceTransport();
@@ -2260,6 +2268,8 @@ describe("native mobile connection and operation ownership", () => {
     expect(taskVoice?.surfaceOwnerKey).not.toBe(newTaskVoice?.surfaceOwnerKey);
     app.setForeground(false);
     expect(taskVoice?.isCurrent()).toBe(false);
+    await expect(taskVoice!.applyVoiceInputDictionaryLearning(3n, [])).rejects.toThrow(/authority changed/i);
+    expect(network.applyVoiceInputDictionaryLearning).toHaveBeenCalledTimes(1);
     await expect(taskVoice!.get("voice-one")).rejects.toThrow(/authority changed/i);
     await expect(taskVoice!.cancel("voice-one")).resolves.toMatchObject({ outcome: "cancelled" });
     expect(network.getVoiceInputSession).not.toHaveBeenCalled();

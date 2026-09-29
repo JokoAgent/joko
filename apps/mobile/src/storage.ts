@@ -12,7 +12,7 @@ import { MobileOfflineCache } from "./mobile-offline-cache";
 import { MobileThemePreferenceStore } from "./mobile-theme-preference";
 import { MobileDiagnosticsStore } from "./mobile-diagnostics";
 import { MobileLocalePreferenceStore } from "./mobile-locale-preference";
-import { MobileVoiceDictionaryStore } from "./mobile-voice-dictionary-store";
+import { MobileVoicePreferencesStore } from "./mobile-voice-preferences-store";
 import { MobileUpdateDeviceStore } from "./mobile-update-device-store";
 import { MobileUpdateController } from "./mobile-update-controller";
 import { createMobileUpdateRuntimeEnvironment } from "./mobile-update-runtime";
@@ -45,7 +45,7 @@ export const mobileOfflineCache = new MobileOfflineCache(mobilePlainStorage, Dat
 export const mobileThemePreferences = new MobileThemePreferenceStore(mobilePlainStorage);
 export const mobileDiagnostics = new MobileDiagnosticsStore(mobilePlainStorage, undefined, Date.now, randomUUID);
 export const mobileLocalePreferences = new MobileLocalePreferenceStore(mobilePlainStorage);
-export const mobileVoiceDictionary = new MobileVoiceDictionaryStore(mobilePlainStorage, Date.now, randomUUID);
+export const mobileVoicePreferences = new MobileVoicePreferencesStore(mobilePlainStorage, Date.now, randomUUID);
 const mobileUpdateRuntime = createMobileUpdateRuntimeEnvironment();
 export const mobileUpdates = new MobileUpdateController({
   ...mobileUpdateRuntime,

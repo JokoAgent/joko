@@ -7400,6 +7400,9 @@ export class MobileClient {
       isCurrent,
       waitUntilCurrent,
       getCapabilities: (signal) => owned(() => this.network.getVoiceInputCapabilities(credential, signal)),
+      getVoiceInputDictionary: (signal) => owned(() => this.network.getVoiceInputDictionary(credential, signal)),
+      applyVoiceInputDictionaryLearning: (revision, actions, signal) => owned(() =>
+        this.network.applyVoiceInputDictionaryLearning(credential, revision, actions, signal)),
       adviseVoiceInputDictionaryEdit: (draft, signal) => owned(() =>
         this.network.adviseVoiceInputDictionaryEdit(credential, draft, signal)),
       start: (requestId, mimeType, locale, refinement, signal) => owned(() =>
