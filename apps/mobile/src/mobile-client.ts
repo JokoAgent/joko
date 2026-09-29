@@ -219,6 +219,7 @@ import {
   type MobileRemoteAppCommandInvocation
 } from "./mobile-app-commands";
 import type { MobileVoiceTransport } from "./mobile-voice-input";
+import type { MobileVoiceDictionaryTransport } from "./mobile-voice-dictionary-service";
 import {
   assertMobileNativeTreeNavigation,
   projectMobileNativeTree,
@@ -6137,6 +6138,38 @@ export class MobileClient {
     } catch {
       return false;
     }
+  }
+
+  voiceDictionaryTransport(): MobileVoiceDictionaryTransport | undefined {
+    const credential = this.#credential;
+    const authorityKey = this.#automationOwnerKey();
+    if (!credential || !authorityKey || this.#disposed) return undefined;
+    const connectionEpoch = this.#connectionAttemptEpoch;
+    const ownerKey = `${authorityKey}\u001f${connectionEpoch}\u001fvoice-dictionary`;
+    let retired = false;
+    const isCurrent = (): boolean => !retired && !this.#disposed && this.#credential === credential
+      && this.#connectionAttemptEpoch === connectionEpoch && this.#automationOwnerKey() === authorityKey;
+    const owned = async <T>(signal: AbortSignal | undefined, effect: () => Promise<T>): Promise<T> => {
+      const assertCurrent = (): void => {
+        if (signal?.aborted || !isCurrent()) throw new Error("Voice dictionary authority changed or the request was cancelled.");
+      };
+      assertCurrent();
+      const unsubscribe = this.subscribe(() => { if (!isCurrent()) retired = true; });
+      try {
+        const result = await effect();
+        assertCurrent();
+        return result;
+      } finally { unsubscribe(); }
+    };
+    return {
+      ownerKey, isCurrent,
+      getVoiceInputDictionary: (signal) => owned(signal, () => this.network.getVoiceInputDictionary(credential, signal)),
+      setVoiceInputDictionarySyncEnabled: (revision, enabled, signal) => owned(signal, () => this.network.setVoiceInputDictionarySyncEnabled(credential, revision, enabled, signal)),
+      addVoiceInputDictionaryTerms: (revision, terms, signal) => owned(signal, () => this.network.addVoiceInputDictionaryTerms(credential, revision, terms, signal)),
+      editVoiceInputDictionaryEntry: (revision, id, text, aliases, signal) => owned(signal, () => this.network.editVoiceInputDictionaryEntry(credential, revision, id, text, aliases, signal)),
+      deleteVoiceInputDictionaryEntry: (revision, id, signal) => owned(signal, () => this.network.deleteVoiceInputDictionaryEntry(credential, revision, id, signal)),
+      applyVoiceInputDictionaryLearning: (revision, actions, signal) => owned(signal, () => this.network.applyVoiceInputDictionaryLearning(credential, revision, actions, signal))
+    };
   }
 
   taskVoiceTransport(): MobileVoiceTransport | undefined {

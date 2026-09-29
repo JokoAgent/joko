@@ -37,6 +37,11 @@ import {
 } from "./mobile-voice-dictionary";
 import type { MobileVoiceRefinementContext } from "./mobile-voice-input";
 import {
+  mobileVoiceDictionaryLearningRequest,
+  projectMobileVoiceDictionarySnapshot,
+  type MobileVoiceDictionarySnapshot
+} from "./mobile-voice-dictionary-service";
+import {
   projectMobilePartners, projectMobilePrivateDetail, projectMobilePrivateReadResponse,
   projectMobilePrivateThreads, validMobilePartnerId,
   type MobilePartner, type MobilePrivateDetail, type MobilePrivateReadState,
@@ -137,6 +142,12 @@ export interface MobileNetwork {
   authorizeBlobDownload(credential: PairedCredential, blob: BlobRef, signal?: AbortSignal): Promise<AuthorizedBlobDownload>;
   uploadBlob(credential: PairedCredential, source: MobileBlobUploadSource, signal?: AbortSignal): Promise<BlobRef>;
   getVoiceInputCapabilities(credential: PairedCredential, signal?: AbortSignal): Promise<MobileVoiceCapability>;
+  getVoiceInputDictionary(credential: PairedCredential, signal?: AbortSignal): Promise<MobileVoiceDictionarySnapshot>;
+  setVoiceInputDictionarySyncEnabled(credential: PairedCredential, expectedRevision: bigint, enabled: boolean, signal?: AbortSignal): Promise<MobileVoiceDictionarySnapshot>;
+  addVoiceInputDictionaryTerms(credential: PairedCredential, expectedRevision: bigint, terms: readonly string[], signal?: AbortSignal): Promise<MobileVoiceDictionarySnapshot>;
+  editVoiceInputDictionaryEntry(credential: PairedCredential, expectedRevision: bigint, entryId: string, text: string, aliases: readonly string[], signal?: AbortSignal): Promise<MobileVoiceDictionarySnapshot>;
+  deleteVoiceInputDictionaryEntry(credential: PairedCredential, expectedRevision: bigint, entryId: string, signal?: AbortSignal): Promise<MobileVoiceDictionarySnapshot>;
+  applyVoiceInputDictionaryLearning(credential: PairedCredential, expectedRevision: bigint, actions: readonly MobileVoiceDictionaryLearningAction[], signal?: AbortSignal): Promise<MobileVoiceDictionarySnapshot>;
   adviseVoiceInputDictionaryEdit(credential: PairedCredential, draft: MobileVoiceDictionaryAdviceDraft,
     signal?: AbortSignal): Promise<{ readonly actions: readonly MobileVoiceDictionaryLearningAction[] }>;
   startVoiceInput(credential: PairedCredential, requestId: string, mimeType: string, locale?: string,
@@ -1433,6 +1444,36 @@ export const mobileNetwork: MobileNetwork = {
     const response = await createClient(VoiceInputService, transport(credential.origin, credential.authKey))
       .getVoiceInputCapabilities({}, options(signal));
     return projectMobileVoiceCapability(response.profile);
+  },
+  async getVoiceInputDictionary(credential, signal) {
+    const response = await createClient(VoiceInputService, transport(credential.origin, credential.authKey))
+      .getVoiceInputDictionary({}, options(signal));
+    return projectMobileVoiceDictionarySnapshot(response.dictionary);
+  },
+  async setVoiceInputDictionarySyncEnabled(credential, expectedRevision, enabled, signal) {
+    const response = await createClient(VoiceInputService, transport(credential.origin, credential.authKey))
+      .setVoiceInputDictionarySyncEnabled({ expectedRevision, enabled }, options(signal));
+    return projectMobileVoiceDictionarySnapshot(response.dictionary);
+  },
+  async addVoiceInputDictionaryTerms(credential, expectedRevision, terms, signal) {
+    const response = await createClient(VoiceInputService, transport(credential.origin, credential.authKey))
+      .addVoiceInputDictionaryTerms({ expectedRevision, terms: [...terms] }, options(signal));
+    return projectMobileVoiceDictionarySnapshot(response.dictionary);
+  },
+  async editVoiceInputDictionaryEntry(credential, expectedRevision, entryId, text, aliases, signal) {
+    const response = await createClient(VoiceInputService, transport(credential.origin, credential.authKey))
+      .editVoiceInputDictionaryEntry({ expectedRevision, entryId, text, aliases: [...aliases] }, options(signal));
+    return projectMobileVoiceDictionarySnapshot(response.dictionary);
+  },
+  async deleteVoiceInputDictionaryEntry(credential, expectedRevision, entryId, signal) {
+    const response = await createClient(VoiceInputService, transport(credential.origin, credential.authKey))
+      .deleteVoiceInputDictionaryEntry({ expectedRevision, entryId }, options(signal));
+    return projectMobileVoiceDictionarySnapshot(response.dictionary);
+  },
+  async applyVoiceInputDictionaryLearning(credential, expectedRevision, actions, signal) {
+    const response = await createClient(VoiceInputService, transport(credential.origin, credential.authKey))
+      .applyVoiceInputDictionaryLearning({ expectedRevision, actions: mobileVoiceDictionaryLearningRequest(actions) }, options(signal));
+    return projectMobileVoiceDictionarySnapshot(response.dictionary);
   },
   async adviseVoiceInputDictionaryEdit(credential, draft, signal) {
     const response = await createClient(VoiceInputService, transport(credential.origin, credential.authKey))

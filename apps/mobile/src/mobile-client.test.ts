@@ -990,6 +990,12 @@ function fakeNetwork(): MobileNetwork {
     authorizeBlobDownload: vi.fn(async () => { throw new Error("No Blob authorization fixture was configured."); }),
     uploadBlob: vi.fn(async () => { throw new Error("No Blob upload fixture was configured."); }),
     getVoiceInputCapabilities: vi.fn(async () => { throw new Error("No Voice capability fixture was configured."); }),
+    getVoiceInputDictionary: vi.fn(async () => { throw new Error("No Voice dictionary fixture was configured."); }),
+    setVoiceInputDictionarySyncEnabled: vi.fn(async () => { throw new Error("No Voice dictionary fixture was configured."); }),
+    addVoiceInputDictionaryTerms: vi.fn(async () => { throw new Error("No Voice dictionary fixture was configured."); }),
+    editVoiceInputDictionaryEntry: vi.fn(async () => { throw new Error("No Voice dictionary fixture was configured."); }),
+    deleteVoiceInputDictionaryEntry: vi.fn(async () => { throw new Error("No Voice dictionary fixture was configured."); }),
+    applyVoiceInputDictionaryLearning: vi.fn(async () => { throw new Error("No Voice dictionary fixture was configured."); }),
     adviseVoiceInputDictionaryEdit: vi.fn(async () => ({ actions: [] })),
     startVoiceInput: vi.fn(async () => { throw new Error("No Voice session fixture was configured."); }),
     appendVoiceAudio: vi.fn(async () => { throw new Error("No Voice session fixture was configured."); }),
@@ -2121,6 +2127,69 @@ describe("native mobile Automation ownership and recovery", () => {
 });
 
 describe("native mobile connection and operation ownership", () => {
+  it("binds dictionary reads and semantic mutations to a node owner independently of the selected task", async () => {
+    const network = fakeNetwork();
+    const app = client(network, memoryStorage(credential).storage);
+    const dictionary = { revision: 4n, syncEnabled: true, dictionary: { entries: [], candidates: [], suppressedAutomaticTexts: [] }, refinementTerms: [] };
+    const methods = ["getVoiceInputDictionary", "setVoiceInputDictionarySyncEnabled", "addVoiceInputDictionaryTerms",
+      "editVoiceInputDictionaryEntry", "deleteVoiceInputDictionaryEntry", "applyVoiceInputDictionaryLearning"] as const;
+    for (const method of methods) vi.mocked(network[method]).mockResolvedValue(dictionary);
+    expect(app.voiceDictionaryTransport()).toBeUndefined();
+    await app.start();
+    const api = app.voiceDictionaryTransport()!;
+    expect(api.ownerKey).not.toContain(credential.authKey);
+    const request = new AbortController();
+    await expect(api.getVoiceInputDictionary(request.signal)).resolves.toBe(dictionary);
+    await app.select("session");
+    expect(api.isCurrent()).toBe(true);
+    await api.setVoiceInputDictionarySyncEnabled(4n, false, request.signal);
+    await api.addVoiceInputDictionaryTerms(4n, ["Joko"], request.signal);
+    await api.editVoiceInputDictionaryEntry(4n, "dictionary-one", "Joko Core", ["jo ko"], request.signal);
+    await api.deleteVoiceInputDictionaryEntry(4n, "dictionary-one", request.signal);
+    const actions = [{ action: "addCandidate", term: "VoiceKit", aliases: ["voice kit"], type: "productName", confidence: "high" }] as const;
+    await api.applyVoiceInputDictionaryLearning(4n, actions, request.signal);
+    expect(network.getVoiceInputDictionary).toHaveBeenCalledExactlyOnceWith(credential, request.signal);
+    expect(network.setVoiceInputDictionarySyncEnabled).toHaveBeenCalledExactlyOnceWith(credential, 4n, false, request.signal);
+    expect(network.addVoiceInputDictionaryTerms).toHaveBeenCalledExactlyOnceWith(credential, 4n, ["Joko"], request.signal);
+    expect(network.editVoiceInputDictionaryEntry).toHaveBeenCalledExactlyOnceWith(credential, 4n, "dictionary-one", "Joko Core", ["jo ko"], request.signal);
+    expect(network.deleteVoiceInputDictionaryEntry).toHaveBeenCalledExactlyOnceWith(credential, 4n, "dictionary-one", request.signal);
+    expect(network.applyVoiceInputDictionaryLearning).toHaveBeenCalledExactlyOnceWith(credential, 4n, actions, request.signal);
+    app.setForeground(false);
+    expect(api.isCurrent()).toBe(false);
+    await expect(api.addVoiceInputDictionaryTerms(4n, ["RetiredTerm"])).rejects.toThrow(/authority changed/u);
+    expect(network.addVoiceInputDictionaryTerms).toHaveBeenCalledOnce();
+    app.setForeground(true);
+    await vi.waitFor(() => expect(app.voiceDictionaryTransport()?.isCurrent()).toBe(true));
+    expect(api.isCurrent()).toBe(false);
+  });
+
+  it.each(["cancel", "generation", "revocation"] as const)("rejects a late dictionary projection after %s", async (change) => {
+    const network = fakeNetwork();
+    const app = client(network, memoryStorage(credential).storage);
+    await app.start();
+    const api = app.voiceDictionaryTransport()!;
+    let finish!: (value: Awaited<ReturnType<MobileNetwork["getVoiceInputDictionary"]>>) => void;
+    vi.mocked(network.getVoiceInputDictionary).mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+    const request = new AbortController();
+    const result = api.getVoiceInputDictionary(request.signal);
+    if (change === "cancel") request.abort();
+    else {
+      const current = app.state.owner!;
+      const updatedDevice = create(DeviceSchema, { ...device, revoked: change === "revocation" });
+      const updated = create(SnapshotSchema, { ...current, generation: change === "generation" ? current.generation + 1n : current.generation,
+        devices: [updatedDevice] });
+      vi.mocked(network.readOwner).mockResolvedValue({ connection, device: updatedDevice, snapshot: updated });
+      vi.mocked(network.readSession).mockResolvedValue(updated);
+      await app.refresh();
+    }
+    finish({ revision: 4n, syncEnabled: true, dictionary: { entries: [], candidates: [], suppressedAutomaticTexts: [] }, refinementTerms: [] });
+    await expect(result).rejects.toThrow(/authority changed|cancelled/u);
+    if (change !== "cancel") {
+      await expect(api.deleteVoiceInputDictionaryEntry(4n, "retired")).rejects.toThrow(/authority changed/u);
+      expect(network.deleteVoiceInputDictionaryEntry).not.toHaveBeenCalled();
+    }
+  });
+
   it("binds Voice Input RPCs to the exact live surface and retains only exact-session cleanup after retirement", async () => {
     const network = fakeNetwork();
     const saved = memoryStorage(credential);
