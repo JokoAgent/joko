@@ -12,30 +12,35 @@ import {
   type KeyObject
 } from "node:crypto";
 
-const ENCRYPTION_INFO = "joko:contacts-device-sync:v1";
-const LAN_AUTH_INFO = "joko:contacts-device-sync:lan-auth:v1";
+export type NodeSyncPurpose = "contacts" | "voice-dictionary";
+
+export function nodeSyncDomain(purpose: NodeSyncPurpose): { readonly encryption: string; readonly lanAuth: string; readonly magic: string; readonly multicastPort: number } {
+  if (purpose !== "contacts" && purpose !== "voice-dictionary") throw new TypeError("Node sync purpose is invalid.");
+  return { encryption: `joko:${purpose}-device-sync:v1`, lanAuth: `joko:${purpose}-device-sync:lan-auth:v1`,
+    magic: `joko-${purpose}-sync`, multicastPort: purpose === "contacts" ? 53_547 : 53_548 };
+}
 const IV_BYTES = 12;
 const TAG_BYTES = 16;
 
-export interface ContactSyncExportedIdentity {
+export interface NodeSyncExportedIdentity {
   readonly publicKey: string;
   readonly privateKey: string;
 }
 
-export interface ContactSyncEncryptedBytes {
+export interface NodeSyncEncryptedBytes {
   readonly iv: string;
   readonly tag: string;
   readonly ciphertext: Buffer;
 }
 
-export interface ContactSyncEncryptionContext {
+export interface NodeSyncEncryptionContext {
   readonly sourceNodeId: string;
   readonly destinationNodeId: string;
   readonly transferId: string;
   readonly totalChunks: number;
 }
 
-export interface ContactSyncLanAuthContext {
+export interface NodeSyncLanAuthContext {
   readonly kind: "request" | "ack";
   readonly sourceNodeId: string;
   readonly destinationNodeId: string;
@@ -49,16 +54,16 @@ export interface ContactSyncLanAuthContext {
   readonly data: string;
 }
 
-export function generateContactSyncIdentity(): ContactSyncExportedIdentity {
+export function generateNodeSyncIdentity(): NodeSyncExportedIdentity {
   const { publicKey, privateKey } = generateKeyPairSync("x25519");
   return { publicKey: exportPublicKey(publicKey), privateKey: exportPrivateKey(privateKey) };
 }
 
-export function contactSyncPublicKeyFromPrivate(privateKey: string): string {
+export function nodeSyncPublicKeyFromPrivate(privateKey: string): string {
   return exportPublicKey(createPublicKey(importPrivateKey(privateKey)));
 }
 
-export function isValidContactSyncPublicKey(value: unknown): value is string {
+export function isValidNodeSyncPublicKey(value: unknown): value is string {
   if (typeof value !== "string" || value.length < 32 || value.length > 256) return false;
   try {
     const key = importPublicKey(value);
@@ -68,7 +73,7 @@ export function isValidContactSyncPublicKey(value: unknown): value is string {
   }
 }
 
-export function isValidContactSyncPrivateKey(value: unknown): value is string {
+export function isValidNodeSyncPrivateKey(value: unknown): value is string {
   if (typeof value !== "string" || value.length < 32 || value.length > 256) return false;
   try {
     const key = importPrivateKey(value);
@@ -78,56 +83,60 @@ export function isValidContactSyncPrivateKey(value: unknown): value is string {
   }
 }
 
-export function encryptContactSyncBytes(
+export function encryptNodeSyncBytes(
+  purpose: NodeSyncPurpose,
   plaintext: Uint8Array,
   ownPrivateKey: string,
   peerPublicKey: string,
-  context: ContactSyncEncryptionContext
-): ContactSyncEncryptedBytes {
+  context: NodeSyncEncryptionContext
+): NodeSyncEncryptedBytes {
   validateEncryptionContext(context);
-  const key = deriveEncryptionKey(ownPrivateKey, peerPublicKey, context);
+  const key = deriveEncryptionKey(purpose, ownPrivateKey, peerPublicKey, context);
   const iv = randomBytes(IV_BYTES);
   const cipher = createCipheriv("aes-256-gcm", key, iv, { authTagLength: TAG_BYTES });
-  cipher.setAAD(buildEncryptionAad(context));
+  cipher.setAAD(buildEncryptionAad(purpose, context));
   const ciphertext = Buffer.concat([cipher.update(plaintext), cipher.final()]);
   return { iv: iv.toString("base64"), tag: cipher.getAuthTag().toString("base64"), ciphertext };
 }
 
-export function decryptContactSyncBytes(
-  encrypted: ContactSyncEncryptedBytes,
+export function decryptNodeSyncBytes(
+  purpose: NodeSyncPurpose,
+  encrypted: NodeSyncEncryptedBytes,
   ownPrivateKey: string,
   peerPublicKey: string,
-  context: ContactSyncEncryptionContext
+  context: NodeSyncEncryptionContext
 ): Buffer {
   validateEncryptionContext(context);
-  const iv = decodeExactBase64(encrypted.iv, IV_BYTES, "Contacts sync IV");
-  const tag = decodeExactBase64(encrypted.tag, TAG_BYTES, "Contacts sync tag");
-  const key = deriveEncryptionKey(ownPrivateKey, peerPublicKey, context);
+  const iv = decodeExactBase64(encrypted.iv, IV_BYTES, "Node sync IV");
+  const tag = decodeExactBase64(encrypted.tag, TAG_BYTES, "Node sync tag");
+  const key = deriveEncryptionKey(purpose, ownPrivateKey, peerPublicKey, context);
   const decipher = createDecipheriv("aes-256-gcm", key, iv, { authTagLength: TAG_BYTES });
-  decipher.setAAD(buildEncryptionAad(context));
+  decipher.setAAD(buildEncryptionAad(purpose, context));
   decipher.setAuthTag(tag);
   return Buffer.concat([decipher.update(encrypted.ciphertext), decipher.final()]);
 }
 
-export function createContactSyncLanProof(
+export function createNodeSyncLanProof(
+  purpose: NodeSyncPurpose,
   ownPrivateKey: string,
   peerPublicKey: string,
-  context: ContactSyncLanAuthContext
+  context: NodeSyncLanAuthContext
 ): string {
   validateLanContext(context);
-  const key = deriveSharedKey(ownPrivateKey, peerPublicKey, LAN_AUTH_INFO);
-  return createHmac("sha256", key).update(buildLanAuthMessage(context)).digest("base64");
+  const key = deriveSharedKey(ownPrivateKey, peerPublicKey, nodeSyncDomain(purpose).lanAuth);
+  return createHmac("sha256", key).update(buildLanAuthMessage(purpose, context)).digest("base64");
 }
 
-export function verifyContactSyncLanProof(
+export function verifyNodeSyncLanProof(
+  purpose: NodeSyncPurpose,
   proof: string,
   ownPrivateKey: string,
   peerPublicKey: string,
-  context: ContactSyncLanAuthContext
+  context: NodeSyncLanAuthContext
 ): boolean {
   try {
-    const supplied = decodeExactBase64(proof, 32, "Contacts sync LAN proof");
-    const expected = Buffer.from(createContactSyncLanProof(ownPrivateKey, peerPublicKey, context), "base64");
+    const supplied = decodeExactBase64(proof, 32, "Node sync LAN proof");
+    const expected = Buffer.from(createNodeSyncLanProof(purpose, ownPrivateKey, peerPublicKey, context), "base64");
     return timingSafeEqual(supplied, expected);
   } catch {
     return false;
@@ -135,12 +144,13 @@ export function verifyContactSyncLanProof(
 }
 
 function deriveEncryptionKey(
+  purpose: NodeSyncPurpose,
   ownPrivateKey: string,
   peerPublicKey: string,
-  context: ContactSyncEncryptionContext
+  context: NodeSyncEncryptionContext
 ): Buffer {
   const nodePair = [context.sourceNodeId, context.destinationNodeId].sort().join("\u0000");
-  return deriveSharedKey(ownPrivateKey, peerPublicKey, `${ENCRYPTION_INFO}\u0000${nodePair}`);
+  return deriveSharedKey(ownPrivateKey, peerPublicKey, `${nodeSyncDomain(purpose).encryption}\u0000${nodePair}`);
 }
 
 function deriveSharedKey(ownPrivateKey: string, peerPublicKey: string, info: string): Buffer {
@@ -148,9 +158,9 @@ function deriveSharedKey(ownPrivateKey: string, peerPublicKey: string, info: str
   return Buffer.from(hkdfSync("sha256", shared, Buffer.alloc(0), Buffer.from(info, "utf8"), 32));
 }
 
-function buildEncryptionAad(context: ContactSyncEncryptionContext): Buffer {
+function buildEncryptionAad(purpose: NodeSyncPurpose, context: NodeSyncEncryptionContext): Buffer {
   return Buffer.from([
-    ENCRYPTION_INFO,
+    nodeSyncDomain(purpose).encryption,
     context.sourceNodeId,
     context.destinationNodeId,
     context.transferId,
@@ -158,9 +168,9 @@ function buildEncryptionAad(context: ContactSyncEncryptionContext): Buffer {
   ].join("\u0000"), "utf8");
 }
 
-function buildLanAuthMessage(context: ContactSyncLanAuthContext): Buffer {
+function buildLanAuthMessage(purpose: NodeSyncPurpose, context: NodeSyncLanAuthContext): Buffer {
   return Buffer.from([
-    LAN_AUTH_INFO,
+    nodeSyncDomain(purpose).lanAuth,
     context.kind,
     context.sourceNodeId,
     context.destinationNodeId,
@@ -175,35 +185,35 @@ function buildLanAuthMessage(context: ContactSyncLanAuthContext): Buffer {
   ].join("\u0000"), "utf8");
 }
 
-function validateEncryptionContext(context: ContactSyncEncryptionContext): void {
+function validateEncryptionContext(context: NodeSyncEncryptionContext): void {
   if (!isNodeId(context.sourceNodeId) || !isNodeId(context.destinationNodeId) ||
     !isTransferId(context.transferId) || !Number.isSafeInteger(context.totalChunks) ||
     context.totalChunks < 1 || context.totalChunks > 128) {
-    throw new Error("Contacts sync encryption context is invalid.");
+    throw new Error("Node sync encryption context is invalid.");
   }
 }
 
-function validateLanContext(context: ContactSyncLanAuthContext): void {
+function validateLanContext(context: NodeSyncLanAuthContext): void {
   if ((context.kind !== "request" && context.kind !== "ack") || !isNodeId(context.sourceNodeId) ||
     !isNodeId(context.destinationNodeId) || !isTransferId(context.transferId) ||
-    !isValidContactSyncPublicKey(context.senderPublicKey) || !isCanonicalBase64(context.challenge, 24) ||
+    !isValidNodeSyncPublicKey(context.senderPublicKey) || !isCanonicalBase64(context.challenge, 24) ||
     !Number.isSafeInteger(context.index) || context.index < 0 || !Number.isSafeInteger(context.total) ||
     context.total < 1 || context.total > 128 || context.index >= context.total ||
     !isCanonicalBase64(context.iv, IV_BYTES) || !isCanonicalBase64(context.tag, TAG_BYTES) ||
     typeof context.data !== "string" || context.data.length > 400_000) {
-    throw new Error("Contacts sync LAN authentication context is invalid.");
+    throw new Error("Node sync LAN authentication context is invalid.");
   }
 }
 
 function importPublicKey(value: string): KeyObject {
-  const key = createPublicKey({ key: decodeBase64(value, "Contacts sync public key"), format: "der", type: "spki" });
-  if (key.asymmetricKeyType !== "x25519") throw new Error("Contacts sync public key is not X25519.");
+  const key = createPublicKey({ key: decodeBase64(value, "Node sync public key"), format: "der", type: "spki" });
+  if (key.asymmetricKeyType !== "x25519") throw new Error("Node sync public key is not X25519.");
   return key;
 }
 
 function importPrivateKey(value: string): KeyObject {
-  const key = createPrivateKey({ key: decodeBase64(value, "Contacts sync private key"), format: "der", type: "pkcs8" });
-  if (key.asymmetricKeyType !== "x25519") throw new Error("Contacts sync private key is not X25519.");
+  const key = createPrivateKey({ key: decodeBase64(value, "Node sync private key"), format: "der", type: "pkcs8" });
+  if (key.asymmetricKeyType !== "x25519") throw new Error("Node sync private key is not X25519.");
   return key;
 }
 

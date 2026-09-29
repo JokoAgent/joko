@@ -13,20 +13,12 @@ import {
 import { afterEach, describe, expect, it } from "vitest";
 
 import { ContactSyncWorkerCodec } from "./contact-sync-codec.js";
-import {
-  createContactSyncLanProof,
-  decryptContactSyncBytes,
-  encryptContactSyncBytes,
-  generateContactSyncIdentity,
-  verifyContactSyncLanProof
-} from "./contact-sync-crypto.js";
-import { ContactSyncLanTransport } from "./contact-sync-lan.js";
+import { generateNodeSyncIdentity, NodeSyncLanTransport, type NodeSyncCipherChunkFrame } from "@joko/node-sync";
 import { ContactSyncManager } from "./contact-sync-manager.js";
 import {
   ContactSyncWireDecoder,
   encodeContactSyncMessageInProcess,
-  inProcessContactSyncCodec,
-  type ContactSyncCipherChunkFrame
+  inProcessContactSyncCodec
 } from "./contact-sync-wire.js";
 import { CredentialVault } from "./credential-vault.js";
 
@@ -37,45 +29,9 @@ afterEach(async () => {
 });
 
 describe("Contacts sync authenticated codec", () => {
-  it("binds ciphertext and LAN proofs to both nodes and every frame field", () => {
-    const first = generateContactSyncIdentity();
-    const second = generateContactSyncIdentity();
-    const context = {
-      sourceNodeId: "node-first",
-      destinationNodeId: "node-second",
-      transferId: "transfer-1",
-      totalChunks: 1
-    };
-    const encrypted = encryptContactSyncBytes(Buffer.from("private contacts state"), first.privateKey, second.publicKey, context);
-    expect(decryptContactSyncBytes(encrypted, second.privateKey, first.publicKey, context).toString("utf8"))
-      .toBe("private contacts state");
-    expect(() => decryptContactSyncBytes(encrypted, second.privateKey, first.publicKey, {
-      ...context,
-      destinationNodeId: "node-third"
-    })).toThrow();
-
-    const auth = {
-      kind: "request" as const,
-      sourceNodeId: "node-first",
-      destinationNodeId: "node-second",
-      challenge: Buffer.alloc(24, 3).toString("base64"),
-      senderPublicKey: first.publicKey,
-      transferId: "transfer-1",
-      index: 0,
-      total: 1,
-      iv: encrypted.iv,
-      tag: encrypted.tag,
-      data: encrypted.ciphertext.toString("base64")
-    };
-    const proof = createContactSyncLanProof(first.privateKey, second.publicKey, auth);
-    expect(verifyContactSyncLanProof(proof, second.privateKey, first.publicKey, auth)).toBe(true);
-    expect(verifyContactSyncLanProof(proof, second.privateKey, first.publicKey, { ...auth, kind: "ack" })).toBe(false);
-    expect(verifyContactSyncLanProof(proof, second.privateKey, first.publicKey, { ...auth, index: 1 })).toBe(false);
-  });
-
   it("assembles out-of-order chunks once and rejects changed transfer metadata", async () => {
-    const first = generateContactSyncIdentity();
-    const second = generateContactSyncIdentity();
+    const first = generateNodeSyncIdentity();
+    const second = generateNodeSyncIdentity();
     const state = multiChunkState();
     const frames = encodeContactSyncMessageInProcess({
       message: { version: 1, type: "state", state, requestReply: true },
@@ -119,8 +75,8 @@ describe("Contacts sync authenticated codec", () => {
   });
 
   it("executes gzip and cryptography in the bounded worker", async () => {
-    const first = generateContactSyncIdentity();
-    const second = generateContactSyncIdentity();
+    const first = generateNodeSyncIdentity();
+    const second = generateNodeSyncIdentity();
     const codec = new ContactSyncWorkerCodec({ timeoutMilliseconds: 10_000 });
     cleanups.push(() => codec.close());
     const state = populatedState(2_048);
@@ -152,7 +108,7 @@ describe("Contacts sync node lifecycle", () => {
     const directory = mkdtempSync(join(tmpdir(), "joko-contact-sync-identity-"));
     const store = new ContactStore(join(directory, "contacts.db"));
     const vault = await CredentialVault.open(join(directory, "master.key"));
-    const identity = generateContactSyncIdentity();
+    const identity = generateNodeSyncIdentity();
     store.initializeContactSyncConfiguration({
       nodeId: "node-identity",
       publicKey: identity.publicKey,
@@ -324,7 +280,7 @@ async function managerFixture(name: string, multicastPort: number): Promise<{
     nodeId: `node-${name}`,
     displayName: `${name} computer`,
     codec: inProcessContactSyncCodec,
-    transportFactory: (options) => new ContactSyncLanTransport({
+    transportFactory: (options) => new NodeSyncLanTransport({
       ...options,
       multicastPort,
       beaconIntervalMilliseconds: 150,

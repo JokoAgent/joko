@@ -4,11 +4,13 @@ import { gunzipSync, gzipSync } from "node:zlib";
 import { isValidContactSyncState, type ContactSyncState } from "@joko/store";
 
 import {
-  decryptContactSyncBytes,
-  encryptContactSyncBytes,
-  isValidContactSyncPrivateKey,
-  isValidContactSyncPublicKey
-} from "./contact-sync-crypto.js";
+  decryptNodeSyncBytes,
+  encryptNodeSyncBytes,
+  isValidNodeSyncPrivateKey,
+  isValidNodeSyncPublicKey,
+  isNodeSyncCipherChunkFrame,
+  type NodeSyncCipherChunkFrame
+} from "@joko/node-sync";
 
 export const CONTACT_SYNC_WIRE_VERSION = 1;
 export const CONTACT_SYNC_CHANNEL = "joko:contacts:sync:v1";
@@ -19,19 +21,6 @@ export const CONTACT_SYNC_MAX_DECOMPRESSED_BYTES = 128 * 1024 * 1024;
 
 const MAX_ACTIVE_TRANSFERS_PER_PEER = 4;
 const TRANSFER_TTL_MILLISECONDS = 2 * 60 * 1_000;
-
-export interface ContactSyncCipherChunkFrame {
-  readonly version: typeof CONTACT_SYNC_WIRE_VERSION;
-  readonly type: "cipher-chunk";
-  readonly senderPublicKey: string;
-  readonly transferId: string;
-  readonly index: number;
-  readonly total: number;
-  readonly iv: string;
-  readonly tag: string;
-  readonly compression: "gzip";
-  readonly data: string;
-}
 
 export interface ContactSyncStateMessage {
   readonly version: 1;
@@ -62,7 +51,7 @@ export interface ContactSyncDecodeOptions {
 }
 
 export interface ContactSyncCodec {
-  encode(options: ContactSyncEncodeOptions, signal?: AbortSignal): Promise<readonly ContactSyncCipherChunkFrame[]>;
+  encode(options: ContactSyncEncodeOptions, signal?: AbortSignal): Promise<readonly NodeSyncCipherChunkFrame[]>;
   decode(options: ContactSyncDecodeOptions, signal?: AbortSignal): Promise<ContactSyncStateMessage>;
 }
 
@@ -76,7 +65,7 @@ interface PendingTransfer {
   totalBytes: number;
 }
 
-export function encodeContactSyncMessageInProcess(options: ContactSyncEncodeOptions): readonly ContactSyncCipherChunkFrame[] {
+export function encodeContactSyncMessageInProcess(options: ContactSyncEncodeOptions): readonly NodeSyncCipherChunkFrame[] {
   validateEncodeOptions(options);
   const json = Buffer.from(JSON.stringify(options.message), "utf8");
   if (json.byteLength > CONTACT_SYNC_MAX_DECOMPRESSED_BYTES) {
@@ -88,13 +77,13 @@ export function encodeContactSyncMessageInProcess(options: ContactSyncEncodeOpti
   }
   const transferId = randomUUID();
   const total = Math.max(1, Math.ceil(compressed.byteLength / CONTACT_SYNC_CHUNK_BYTES));
-  const encrypted = encryptContactSyncBytes(compressed, options.ownPrivateKey, options.peerPublicKey, {
+  const encrypted = encryptNodeSyncBytes("contacts", compressed, options.ownPrivateKey, options.peerPublicKey, {
     sourceNodeId: options.sourceNodeId,
     destinationNodeId: options.destinationNodeId,
     transferId,
     totalChunks: total
   });
-  const frames: ContactSyncCipherChunkFrame[] = [];
+  const frames: NodeSyncCipherChunkFrame[] = [];
   for (let index = 0; index < total; index += 1) {
     frames.push({
       version: CONTACT_SYNC_WIRE_VERSION,
@@ -118,7 +107,7 @@ export function decodeContactSyncMessageInProcess(options: ContactSyncDecodeOpti
   if (options.ciphertext.byteLength > CONTACT_SYNC_MAX_COMPRESSED_BYTES) {
     throw new Error("Contacts sync transfer exceeds the compressed size limit.");
   }
-  const compressed = decryptContactSyncBytes({
+  const compressed = decryptNodeSyncBytes("contacts", {
     iv: options.iv,
     tag: options.tag,
     ciphertext: Buffer.from(options.ciphertext)
@@ -156,23 +145,6 @@ export function isContactSyncStateMessage(value: unknown): value is ContactSyncS
   return value.requestReply === undefined || typeof value.requestReply === "boolean";
 }
 
-export function isContactSyncCipherChunkFrame(value: unknown): value is ContactSyncCipherChunkFrame {
-  if (!isRecord(value) || !hasOnlyKeys(value, [
-    "version", "type", "senderPublicKey", "transferId", "index", "total", "iv", "tag", "compression", "data"
-  ]) || value.version !== CONTACT_SYNC_WIRE_VERSION || value.type !== "cipher-chunk" ||
-    !isValidContactSyncPublicKey(value.senderPublicKey) || !isTransferId(value.transferId) ||
-    !Number.isSafeInteger(value.index) || !Number.isSafeInteger(value.total) ||
-    (value.index as number) < 0 || (value.total as number) < 1 ||
-    (value.total as number) > CONTACT_SYNC_MAX_CHUNKS || (value.index as number) >= (value.total as number) ||
-    !isCanonicalBase64(value.iv, 12) || !isCanonicalBase64(value.tag, 16) || value.compression !== "gzip" ||
-    typeof value.data !== "string" || value.data.length > Math.ceil(CONTACT_SYNC_CHUNK_BYTES / 3) * 4 + 4) return false;
-  try {
-    return decodeCanonicalBase64(value.data).byteLength <= CONTACT_SYNC_CHUNK_BYTES;
-  } catch {
-    return false;
-  }
-}
-
 export class ContactSyncWireDecoder {
   readonly #pending = new Map<string, PendingTransfer>();
   readonly #decoding = new Map<string, symbol>();
@@ -184,12 +156,12 @@ export class ContactSyncWireDecoder {
   async accept(options: {
     readonly sourceNodeId: string;
     readonly destinationNodeId: string;
-    readonly frame: ContactSyncCipherChunkFrame;
+    readonly frame: NodeSyncCipherChunkFrame;
     readonly ownPrivateKey: string;
     readonly expectedPeerPublicKey: string;
     readonly now?: number;
   }): Promise<ContactSyncStateMessage | null> {
-    if (!isContactSyncCipherChunkFrame(options.frame)) throw new Error("Contacts sync frame is invalid.");
+    if (!isNodeSyncCipherChunkFrame(options.frame)) throw new Error("Contacts sync frame is invalid.");
     const now = options.now ?? Date.now();
     this.#prune(now);
     const frame = options.frame;
@@ -275,16 +247,16 @@ export class ContactSyncWireDecoder {
 }
 
 function validateEncodeOptions(options: ContactSyncEncodeOptions): void {
-  if (!isContactSyncStateMessage(options.message) || !isValidContactSyncPrivateKey(options.ownPrivateKey) ||
-    !isValidContactSyncPublicKey(options.ownPublicKey) || !isValidContactSyncPublicKey(options.peerPublicKey) ||
+  if (!isContactSyncStateMessage(options.message) || !isValidNodeSyncPrivateKey(options.ownPrivateKey) ||
+    !isValidNodeSyncPublicKey(options.ownPublicKey) || !isValidNodeSyncPublicKey(options.peerPublicKey) ||
     !isNodeId(options.sourceNodeId) || !isNodeId(options.destinationNodeId)) {
     throw new Error("Contacts sync encode options are invalid.");
   }
 }
 
 function validateDecodeOptions(options: ContactSyncDecodeOptions): void {
-  if (!(options.ciphertext instanceof Uint8Array) || !isValidContactSyncPrivateKey(options.ownPrivateKey) ||
-    !isValidContactSyncPublicKey(options.expectedPeerPublicKey) || !isNodeId(options.sourceNodeId) ||
+  if (!(options.ciphertext instanceof Uint8Array) || !isValidNodeSyncPrivateKey(options.ownPrivateKey) ||
+    !isValidNodeSyncPublicKey(options.expectedPeerPublicKey) || !isNodeId(options.sourceNodeId) ||
     !isNodeId(options.destinationNodeId) || !isTransferId(options.transferId) ||
     !Number.isSafeInteger(options.totalChunks) || options.totalChunks < 1 || options.totalChunks > CONTACT_SYNC_MAX_CHUNKS ||
     !isCanonicalBase64(options.iv, 12) || !isCanonicalBase64(options.tag, 16)) {
