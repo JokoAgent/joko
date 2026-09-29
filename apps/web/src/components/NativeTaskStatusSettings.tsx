@@ -12,50 +12,92 @@ export function NativeTaskStatusSettings({ t, showHeading = true }: { readonly t
   const [error, setError] = useState<string>();
   const [saving, setSaving] = useState(false);
   const loadGenerationRef = useRef(0);
+  const settingsEventVersionRef = useRef(0);
+  const settingsRef = useRef<JokoDesktopNativeTaskStatusSettings | undefined>(undefined);
+  const savingRef = useRef(false);
+  const acceptSettings = useCallback((next: JokoDesktopNativeTaskStatusSettings): void => {
+    settingsRef.current = next;
+    setSettings(next);
+  }, []);
 
   useEffect(() => {
     if (!supported || desktop === undefined) return;
     const generation = ++loadGenerationRef.current;
+    const eventVersion = settingsEventVersionRef.current;
     void Promise.all([
       desktop.nativeTaskStatus.getSettings(),
       desktop.nativeTaskStatus.getDisplays()
     ]).then(([nextSettings, nextDisplays]) => {
       if (loadGenerationRef.current !== generation) return;
-      setSettings(nextSettings);
+      if (settingsEventVersionRef.current === eventVersion) acceptSettings(nextSettings);
       setDisplays(nextDisplays);
       setError(undefined);
     }).catch(() => {
-      if (loadGenerationRef.current === generation) setError(t("settings.nativeTaskStatus.loadFailed"));
+      if (loadGenerationRef.current === generation && settingsEventVersionRef.current === eventVersion) {
+        setError(t("settings.nativeTaskStatus.loadFailed"));
+      }
     });
     const unsubscribe = desktop.nativeTaskStatus.onSettingsChanged((next) => {
-      if (loadGenerationRef.current === generation) setSettings(next);
+      if (loadGenerationRef.current !== generation) return;
+      settingsEventVersionRef.current += 1;
+      acceptSettings(next);
+      setError(undefined);
     });
     return () => {
       loadGenerationRef.current += 1;
       unsubscribe();
     };
-  }, [desktop, supported, t]);
+  }, [acceptSettings, desktop, supported, t]);
 
   const save = useCallback((next: JokoDesktopNativeTaskStatusSettings): void => {
-    if (desktop === undefined || saving) return;
+    if (desktop === undefined || savingRef.current) return;
+    savingRef.current = true;
+    const generation = loadGenerationRef.current;
+    const eventVersion = settingsEventVersionRef.current;
     setSaving(true);
     setError(undefined);
-    void desktop.nativeTaskStatus.setSettings(next).then(setSettings).catch(() => {
-      setError(t("settings.nativeTaskStatus.saveFailed"));
-    }).finally(() => setSaving(false));
-  }, [desktop, saving, t]);
+    void desktop.nativeTaskStatus.setSettings(next).then((committed) => {
+      if (loadGenerationRef.current === generation && settingsEventVersionRef.current === eventVersion) {
+        acceptSettings(committed);
+      }
+    }).catch(() => {
+      if (loadGenerationRef.current === generation) setError(t("settings.nativeTaskStatus.saveFailed"));
+    }).finally(() => {
+      savingRef.current = false;
+      if (loadGenerationRef.current === generation) setSaving(false);
+    });
+  }, [acceptSettings, desktop, t]);
 
   const selectCustomSound = useCallback((event: NativeSoundEvent): void => {
-    if (desktop === undefined || settings === undefined || saving) return;
+    if (desktop === undefined || settingsRef.current === undefined || savingRef.current) return;
+    savingRef.current = true;
+    const generation = loadGenerationRef.current;
+    let selected = false;
+    setSaving(true);
     setError(undefined);
-    void desktop.nativeTaskStatus.selectSoundFile().then((selection) => {
+    void desktop.nativeTaskStatus.selectSoundFile().then(async (selection) => {
+      if (loadGenerationRef.current !== generation) return;
       if (selection.path === null || selection.name === null) return;
-      save({
-        ...settings,
-        sounds: { ...settings.sounds, sounds: { ...settings.sounds.sounds, [event]: { type: "custom", path: selection.path, name: selection.name } } }
+      selected = true;
+      const current = settingsRef.current;
+      if (current === undefined) return;
+      const eventVersion = settingsEventVersionRef.current;
+      const committed = await desktop.nativeTaskStatus.setSettings({
+        ...current,
+        sounds: { ...current.sounds, sounds: { ...current.sounds.sounds, [event]: { type: "custom", path: selection.path, name: selection.name } } }
       });
-    }).catch(() => setError(t("settings.nativeTaskStatus.selectSoundFailed")));
-  }, [desktop, save, saving, settings, t]);
+      if (loadGenerationRef.current === generation && settingsEventVersionRef.current === eventVersion) {
+        acceptSettings(committed);
+      }
+    }).catch(() => {
+      if (loadGenerationRef.current === generation) {
+        setError(t(selected ? "settings.nativeTaskStatus.saveFailed" : "settings.nativeTaskStatus.selectSoundFailed"));
+      }
+    }).finally(() => {
+      savingRef.current = false;
+      if (loadGenerationRef.current === generation) setSaving(false);
+    });
+  }, [acceptSettings, desktop, t]);
 
   if (!supported) return null;
   const selectedDisplayId = settings?.display.mode === "display" ? settings.display.displayId : undefined;
@@ -69,14 +111,14 @@ export function NativeTaskStatusSettings({ t, showHeading = true }: { readonly t
     </header>}
     {error !== undefined && <p className="settings-inline-error" role="alert">{error}</p>}
     {settings !== undefined && <>
-      <div className="setting-row"><div><strong>{t("settings.nativeTaskStatus.enabled")}</strong><span>{t("settings.nativeTaskStatus.enabledBody")}</span></div><SwitchControl checked={settings.enabled} disabled={saving} onChange={(event) => save({ ...settings, enabled: event.target.checked })} /></div>
-      <div className="setting-row"><div><strong>{t("settings.nativeTaskStatus.display")}</strong></div><SelectControl value={selectedDisplay} disabled={saving} onChange={(event) => save({ ...settings, display: nativeTaskStatusDisplayTarget(event.target.value, displays) })}>
+      <div className="setting-row"><div><strong>{t("settings.nativeTaskStatus.enabled")}</strong><span>{t("settings.nativeTaskStatus.enabledBody")}</span></div><SwitchControl aria-label={t("settings.nativeTaskStatus.enabled")} checked={settings.enabled} disabled={saving} onChange={(event) => save({ ...settings, enabled: event.target.checked })} /></div>
+      <div className="setting-row"><div><strong>{t("settings.nativeTaskStatus.display")}</strong></div><SelectControl aria-label={t("settings.nativeTaskStatus.display")} value={selectedDisplay} disabled={saving} onChange={(event) => save({ ...settings, display: nativeTaskStatusDisplayTarget(event.target.value, displays) })}>
         <option value="all">{t("settings.nativeTaskStatus.allDisplays")}</option>
         {!selectedDisplayAvailable && settings.display.mode === "display" && <option value={settings.display.displayId}>{t("settings.nativeTaskStatus.unavailableDisplay", { id: settings.display.displayId })}</option>}
         {displays.map((display) => <option value={display.id} key={display.id}>{display.name}{display.primary ? ` · ${t("settings.nativeTaskStatus.primary")}` : ""}</option>)}
       </SelectControl></div>
-      <div className="setting-row"><div><strong>{t("settings.nativeTaskStatus.layout")}</strong></div><SelectControl value={settings.layout} disabled={saving} onChange={(event) => save({ ...settings, layout: event.target.value === "compact" ? "compact" : "normal" })}><option value="compact">{t("settings.nativeTaskStatus.layoutCompact")}</option><option value="normal">{t("settings.nativeTaskStatus.layoutNormal")}</option></SelectControl></div>
-      <div className="setting-row setting-row--stacked native-task-status-sound-setting"><div className="native-task-status-sound-heading"><div><strong>{t("settings.nativeTaskStatus.sounds")}</strong><span>{t("settings.nativeTaskStatus.soundsBody")}</span></div><div className="native-task-status-sound-actions"><IconButton label={t("settings.restoreDefault")} disabled={saving || sameSoundSettings(settings.sounds, DEFAULT_SOUND_SETTINGS)} disabledReason={saving ? t("common.working") : t("settings.restoreDefault")} onClick={() => save({ ...settings, sounds: DEFAULT_SOUND_SETTINGS })}><RotateCcw aria-hidden="true" /></IconButton><SwitchControl checked={settings.sounds.enabled} disabled={saving} onChange={(input) => save({ ...settings, sounds: { ...settings.sounds, enabled: input.target.checked } })} /></div></div>
+      <div className="setting-row"><div><strong>{t("settings.nativeTaskStatus.layout")}</strong></div><SelectControl aria-label={t("settings.nativeTaskStatus.layout")} value={settings.layout} disabled={saving} onChange={(event) => save({ ...settings, layout: event.target.value === "compact" ? "compact" : "normal" })}><option value="compact">{t("settings.nativeTaskStatus.layoutCompact")}</option><option value="normal">{t("settings.nativeTaskStatus.layoutNormal")}</option></SelectControl></div>
+      <div className="setting-row setting-row--stacked native-task-status-sound-setting"><div className="native-task-status-sound-heading"><div><strong>{t("settings.nativeTaskStatus.sounds")}</strong><span>{t("settings.nativeTaskStatus.soundsBody")}</span></div><div className="native-task-status-sound-actions"><IconButton label={t("settings.restoreDefault")} disabled={saving || sameSoundSettings(settings.sounds, DEFAULT_SOUND_SETTINGS)} disabledReason={saving ? t("common.working") : t("settings.restoreDefault")} onClick={() => save({ ...settings, sounds: DEFAULT_SOUND_SETTINGS })}><RotateCcw aria-hidden="true" /></IconButton><SwitchControl aria-label={t("settings.nativeTaskStatus.sounds")} checked={settings.sounds.enabled} disabled={saving} onChange={(input) => save({ ...settings, sounds: { ...settings.sounds, enabled: input.target.checked } })} /></div></div>
         {settings.sounds.enabled && <div className="native-task-status-sounds">{SOUND_EVENTS.map((event) => {
           const sound = settings.sounds.sounds[event];
           const value = sound.type === "builtin" ? sound.id : CUSTOM_SOUND_VALUE;

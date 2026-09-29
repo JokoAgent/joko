@@ -27,7 +27,7 @@ describe("global voice overlay actions", () => {
     const container = document.createElement("div");
     document.body.append(container);
     root = createRoot(container);
-    await act(async () => root?.render(<GlobalVoiceOverlay initialStatus={{ state: "error", errorKind: "service" }} />));
+    await act(async () => root?.render(<GlobalVoiceOverlay initialStatus={{ state: "error", generation: "1", errorKind: "service" }} />));
 
     const retry = required(document.querySelector<HTMLButtonElement>('button[aria-label="Try again"]'));
     const cancel = required(document.querySelector<HTMLButtonElement>('button[aria-label="Cancel"]'));

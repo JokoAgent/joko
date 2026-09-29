@@ -9,6 +9,7 @@ import {
   createClaudeSessionStoreAuthority,
   createClaudeSessionStoreSessionAccess,
   discardClaudeSessionStoreImport,
+  inspectClaudeSessionStoreSession,
   prepareClaudeSessionStoreDerivation,
   prepareClaudeSessionStoreImport,
   readClaudeSessionStoreOperation,
@@ -173,6 +174,13 @@ export class SessionSdkOwner {
     readonly sessionId: string;
   }): ClaudeSessionStoreSessionAccess {
     return claimClaudeSessionStoreSession(this.#requireSessionStoreAuthority(), input);
+  }
+
+  inspectStoredSession(input: { readonly workspaceAuthority: string; readonly sessionId: string }): "present" | "absent" | "unknown" {
+    if (this.#closed || this.ownsSession(input.sessionId)
+      || [...this.#flights].some((flight) => flight.request.kind === "deleteStoredSession"
+        && flight.request.sessionId === input.sessionId)) return "unknown";
+    return inspectClaudeSessionStoreSession(this.#requireSessionStoreAuthority(), input);
   }
 
   rebindStoredSession(input: {

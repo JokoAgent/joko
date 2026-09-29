@@ -2,6 +2,7 @@ import type { MobileSupportedLocale } from "./mobile-locale-preference";
 import { mobileAutomationMessages } from "./mobile-automation-messages";
 import { mobilePushMessages } from "./mobile-push-messages";
 import { mobileNativeIntentMessages } from "./mobile-native-intent-messages";
+import { mobilePartnerMessages } from "./mobile-partner-messages";
 import { mobileTaskMessages } from "./mobile-task-messages";
 import { mobileUpdateMessages } from "./mobile-update-messages";
 import { mobileVoiceMessages } from "./mobile-voice-messages";
@@ -314,6 +315,7 @@ const en = {
   ...mobileTaskMessages.en,
   ...mobileAutomationMessages.en,
   ...mobileNativeIntentMessages.en,
+  ...mobilePartnerMessages.en,
   ...mobilePushMessages.en,
   ...mobileUpdateMessages.en,
   ...mobileVoiceMessages.en
@@ -630,6 +632,7 @@ const zhCN: MobileMessageCatalog = {
   ...mobileTaskMessages["zh-CN"],
   ...mobileAutomationMessages["zh-CN"],
   ...mobileNativeIntentMessages["zh-CN"],
+  ...mobilePartnerMessages["zh-CN"],
   ...mobilePushMessages["zh-CN"],
   ...mobileUpdateMessages["zh-CN"],
   ...mobileVoiceMessages["zh-CN"]
@@ -943,6 +946,7 @@ const zhTW: MobileMessageCatalog = {
   ...mobileTaskMessages["zh-TW"],
   ...mobileAutomationMessages["zh-TW"],
   ...mobileNativeIntentMessages["zh-TW"],
+  ...mobilePartnerMessages["zh-TW"],
   ...mobilePushMessages["zh-TW"],
   ...mobileUpdateMessages["zh-TW"],
   ...mobileVoiceMessages["zh-TW"]
@@ -1256,6 +1260,7 @@ const ja: MobileMessageCatalog = {
   ...mobileTaskMessages.ja,
   ...mobileAutomationMessages.ja,
   ...mobileNativeIntentMessages.ja,
+  ...mobilePartnerMessages.ja,
   ...mobilePushMessages.ja,
   ...mobileUpdateMessages.ja,
   ...mobileVoiceMessages.ja
@@ -1569,6 +1574,7 @@ const ko: MobileMessageCatalog = {
   ...mobileTaskMessages.ko,
   ...mobileAutomationMessages.ko,
   ...mobileNativeIntentMessages.ko,
+  ...mobilePartnerMessages.ko,
   ...mobilePushMessages.ko,
   ...mobileUpdateMessages.ko,
   ...mobileVoiceMessages.ko

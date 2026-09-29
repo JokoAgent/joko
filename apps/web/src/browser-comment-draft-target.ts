@@ -32,7 +32,8 @@ export function newSessionBrowserCommentDraftTarget(
   const target = selectedTargetId === undefined
     ? undefined
     : snapshot.targets.find((candidate) => candidate.id === selectedTargetId && !candidate.archived);
-  const backendId = draft.selection.kind === "target" ? target?.backendId : draft.selection.backendId;
+  const backendId = draft.selection.kind === "target" ? target?.backendId
+    : draft.selection.kind === "dialogue" ? draft.selection.backendId : undefined;
   const backend = snapshot.backends.find((candidate) => candidate.id === backendId);
   const model = snapshot.models.find((candidate) => candidate.backendId === backend?.id
     && candidate.providerId === draft.providerId

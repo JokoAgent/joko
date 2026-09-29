@@ -1,0 +1,629 @@
+syntax = "proto3";
+
+package joko.v1;
+
+import "google/protobuf/timestamp.proto";
+import "joko/v1/common.proto";
+import "joko/v1/runtime.proto";
+
+// Authenticated controller-facing catalog and filesystem projection, plus the
+// target-side reverse route. Controller identity is always derived from the
+// authenticated Connection and is never accepted as a request field.
+service DevicePeerService {
+  rpc ListDevicePeers(ListDevicePeersRequest) returns (ListDevicePeersResponse);
+  rpc ListDevicePeerRecentDirectories(ListDevicePeerRecentDirectoriesRequest) returns (ListDevicePeerRecentDirectoriesResponse);
+  rpc ListDevicePeerDirectories(ListDevicePeerDirectoriesRequest) returns (ListDevicePeerDirectoriesResponse);
+  rpc InspectDevicePeerDirectory(InspectDevicePeerDirectoryRequest) returns (InspectDevicePeerDirectoryResponse);
+  rpc OpenDevicePeerAgentRoute(stream OpenDevicePeerAgentRouteRequest) returns (stream OpenDevicePeerAgentRouteResponse);
+  // HTTP/1.1 production path: these two continuous streams form one
+  // full-duplex route without polling. The bidi RPC remains available to
+  // HTTP/2 clients.
+  rpc OpenDevicePeerAgentCommandRoute(OpenDevicePeerAgentCommandRouteRequest) returns (stream OpenDevicePeerAgentCommandRouteResponse);
+  rpc PublishDevicePeerAgentRoute(stream PublishDevicePeerAgentRouteRequest) returns (PublishDevicePeerAgentRouteResponse);
+}
+
+enum DevicePeerCapabilityKind {
+  DEVICE_PEER_CAPABILITY_KIND_UNSPECIFIED = 0;
+  DEVICE_PEER_CAPABILITY_KIND_FILES = 1;
+  DEVICE_PEER_CAPABILITY_KIND_PROCESS = 2;
+  DEVICE_PEER_CAPABILITY_KIND_TERMINAL = 3;
+  DEVICE_PEER_CAPABILITY_KIND_FORWARDING = 4;
+}
+
+// Exact authority snapshot selected by a controller. All unary peer requests
+// fail closed if the relation or route has advanced.
+message DevicePeerRouteIdentity {
+  string target_device_id = 1;
+  string relation_id = 2;
+  Revision target_device_revision = 3;
+  Revision relation_revision = 4;
+  uint64 route_generation = 5;
+}
+
+message DevicePeerDescriptor {
+  DevicePeerRouteIdentity route = 1;
+  string display_name = 2;
+  DeviceKind kind = 3;
+  string platform = 4;
+  DevicePresenceState presence = 5;
+  repeated DevicePeerCapabilityKind capabilities = 6;
+}
+
+message ListDevicePeersRequest {
+  PageRequest page = 1;
+}
+
+message ListDevicePeersResponse {
+  repeated DevicePeerDescriptor peers = 1;
+  PageInfo page = 2;
+}
+
+enum DevicePeerDirectoryAvailability {
+  DEVICE_PEER_DIRECTORY_AVAILABILITY_UNSPECIFIED = 0;
+  DEVICE_PEER_DIRECTORY_AVAILABILITY_EXISTS = 1;
+  DEVICE_PEER_DIRECTORY_AVAILABILITY_MISSING = 2;
+}
+
+message DevicePeerRecentDirectory {
+  string name = 1;
+  string path = 2;
+  DevicePeerDirectoryAvailability availability = 3;
+  google.protobuf.Timestamp last_used_at = 4;
+}
+
+message ListDevicePeerRecentDirectoriesRequest {
+  DevicePeerRouteIdentity peer = 1;
+  PageRequest page = 2;
+}
+
+message ListDevicePeerRecentDirectoriesResponse {
+  DevicePeerRouteIdentity peer = 1;
+  repeated DevicePeerRecentDirectory directories = 2;
+  PageInfo page = 3;
+}
+
+message DevicePeerDirectoryEntry {
+  string name = 1;
+  string path = 2;
+}
+
+message ListDevicePeerDirectoriesRequest {
+  DevicePeerRouteIdentity peer = 1;
+  // Empty starts at the target Device account's home directory.
+  string path = 2;
+}
+
+message ListDevicePeerDirectoriesResponse {
+  DevicePeerRouteIdentity peer = 1;
+  string path = 2;
+  string parent_path = 3;
+  repeated DevicePeerDirectoryEntry directories = 4;
+  bool truncated = 5;
+}
+
+enum DevicePeerDirectoryKind {
+  DEVICE_PEER_DIRECTORY_KIND_UNSPECIFIED = 0;
+  DEVICE_PEER_DIRECTORY_KIND_DIRECTORY = 1;
+  DEVICE_PEER_DIRECTORY_KIND_FILE = 2;
+  DEVICE_PEER_DIRECTORY_KIND_MISSING = 3;
+}
+
+message InspectDevicePeerDirectoryRequest {
+  DevicePeerRouteIdentity peer = 1;
+  string path = 2;
+}
+
+message InspectDevicePeerDirectoryResponse {
+  DevicePeerRouteIdentity peer = 1;
+  string path = 2;
+  DevicePeerDirectoryKind kind = 3;
+}
+
+enum DevicePeerEffectKind {
+  DEVICE_PEER_EFFECT_KIND_UNSPECIFIED = 0;
+  DEVICE_PEER_EFFECT_KIND_READ_ONLY = 1;
+  DEVICE_PEER_EFFECT_KIND_SIDE_EFFECT = 2;
+}
+
+// ACCEPTED means the target has admitted the command and may begin its
+// effect. Once a SIDE_EFFECT command is ACCEPTED or STARTED, loss of the
+// route before a terminal phase must be surfaced as OUTCOME_UNKNOWN and must
+// never be retried automatically.
+enum DevicePeerResponsePhase {
+  DEVICE_PEER_RESPONSE_PHASE_UNSPECIFIED = 0;
+  DEVICE_PEER_RESPONSE_PHASE_ACCEPTED = 1;
+  DEVICE_PEER_RESPONSE_PHASE_STARTED = 2;
+  DEVICE_PEER_RESPONSE_PHASE_COMPLETED = 3;
+  DEVICE_PEER_RESPONSE_PHASE_FAILED = 4;
+  DEVICE_PEER_RESPONSE_PHASE_ABORTED = 5;
+  // The target observed a possible effect but cannot prove its terminal state.
+  DEVICE_PEER_RESPONSE_PHASE_OUTCOME_UNKNOWN = 6;
+}
+
+enum DevicePeerFailureCode {
+  DEVICE_PEER_FAILURE_CODE_UNSPECIFIED = 0;
+  DEVICE_PEER_FAILURE_CODE_INVALID_REQUEST = 1;
+  DEVICE_PEER_FAILURE_CODE_NOT_FOUND = 2;
+  DEVICE_PEER_FAILURE_CODE_NOT_DIRECTORY = 3;
+  DEVICE_PEER_FAILURE_CODE_PERMISSION_DENIED = 4;
+  DEVICE_PEER_FAILURE_CODE_CAPABILITY_UNAVAILABLE = 5;
+  DEVICE_PEER_FAILURE_CODE_CONFLICT = 6;
+  DEVICE_PEER_FAILURE_CODE_CANCELLED = 7;
+  DEVICE_PEER_FAILURE_CODE_TIMEOUT = 8;
+  DEVICE_PEER_FAILURE_CODE_PROCESS_FAILED = 9;
+  DEVICE_PEER_FAILURE_CODE_UNAVAILABLE = 10;
+  DEVICE_PEER_FAILURE_CODE_INTERNAL = 11;
+}
+
+message DevicePeerFailure {
+  DevicePeerFailureCode code = 1;
+  bool retryable = 2;
+}
+
+message DevicePeerAgentHello {
+  repeated DevicePeerCapabilityKind capabilities = 1;
+}
+
+// After Hello, an otherwise-idle agent sends this marker at a bounded
+// interval with the exact accepted target_device_id, route_generation, and a
+// fresh request_id in the enclosing frame. The service re-fences the same
+// authenticated Connection and refreshes its liveness only; a heartbeat must
+// never advance Device, relation, route, or other content revisions.
+message DevicePeerAgentHeartbeat {}
+
+message DevicePeerAgentRouteAccepted {
+  repeated DevicePeerCapabilityKind capabilities = 1;
+}
+
+// First frame on the split-route upstream. The enclosing target, generation,
+// and request identities must match the accepted command stream exactly.
+message DevicePeerAgentRouteAttachment {}
+
+message DevicePeerListRecentDirectoriesAction {
+  uint32 maximum_entries = 1;
+}
+
+message DevicePeerListDirectoriesAction {
+  string path = 1;
+  uint32 maximum_entries = 2;
+}
+
+message DevicePeerInspectDirectoryAction {
+  string path = 1;
+}
+
+message DevicePeerCreateDirectoryAction {
+  string path = 1;
+  bool recursive = 2;
+  optional uint32 mode = 3;
+}
+
+message DevicePeerRealpathAction {
+  string path = 1;
+}
+
+message DevicePeerStatFileAction {
+  string path = 1;
+}
+
+message DevicePeerListFilesAction {
+  string path = 1;
+}
+
+message DevicePeerReadFileAction {
+  string path = 1;
+  uint64 maximum_bytes = 2;
+  bool allow_truncated = 3;
+}
+
+message DevicePeerWriteFileAction {
+  string path = 1;
+  bytes content = 2;
+  optional uint32 mode = 3;
+  bool create_parents = 4;
+  bool atomic = 5;
+}
+
+message DevicePeerRenameFileAction {
+  string source_path = 1;
+  string destination_path = 2;
+}
+
+message DevicePeerRemoveFileAction {
+  string path = 1;
+  bool recursive = 2;
+}
+
+message DevicePeerProcessEnvironmentVariable {
+  string name = 1;
+  bytes utf8_value = 2;
+}
+
+// The route boundary enforces fixed counts and byte budgets for executable,
+// arguments, environment, input, and output. Values are ephemeral and must
+// never be copied into catalog, Operation, Event, Session, logs, or diagnostics.
+message DevicePeerStartProcessAction {
+  string executable = 1;
+  repeated string arguments = 2;
+  string working_directory = 3;
+  repeated DevicePeerProcessEnvironmentVariable environment = 4;
+  bytes initial_standard_input = 5;
+}
+
+message DevicePeerWriteProcessAction {
+  string process_id = 1;
+  bytes standard_input = 2;
+  bool close_standard_input = 3;
+}
+
+enum DevicePeerProcessSignal {
+  DEVICE_PEER_PROCESS_SIGNAL_UNSPECIFIED = 0;
+  DEVICE_PEER_PROCESS_SIGNAL_INTERRUPT = 1;
+  DEVICE_PEER_PROCESS_SIGNAL_TERMINATE = 2;
+  DEVICE_PEER_PROCESS_SIGNAL_KILL = 3;
+}
+
+message DevicePeerSignalProcessAction {
+  string process_id = 1;
+  DevicePeerProcessSignal signal = 2;
+}
+
+message DevicePeerOpenTerminalAction {
+  string executable = 1;
+  repeated string arguments = 2;
+  string working_directory = 3;
+  uint32 columns = 4;
+  uint32 rows = 5;
+}
+
+message DevicePeerWriteTerminalAction {
+  string terminal_id = 1;
+  bytes data = 2;
+}
+
+message DevicePeerResizeTerminalAction {
+  string terminal_id = 1;
+  uint32 columns = 2;
+  uint32 rows = 3;
+}
+
+message DevicePeerKillTerminalAction {
+  string terminal_id = 1;
+}
+
+message DevicePeerPauseTerminalAction {
+  string terminal_id = 1;
+}
+
+message DevicePeerResumeTerminalAction {
+  string terminal_id = 1;
+}
+
+enum DevicePeerLoopbackHost {
+  DEVICE_PEER_LOOPBACK_HOST_UNSPECIFIED = 0;
+  DEVICE_PEER_LOOPBACK_HOST_IPV4 = 1;
+  DEVICE_PEER_LOOPBACK_HOST_IPV6 = 2;
+  DEVICE_PEER_LOOPBACK_HOST_LOCALHOST = 3;
+}
+
+// Forward targets are always loopback on the peer Device. Arbitrary hosts are
+// intentionally not representable.
+message DevicePeerOpenLoopbackForwardAction {
+  DevicePeerLoopbackHost destination_host = 1;
+  uint32 destination_port = 2;
+}
+
+message DevicePeerWriteLoopbackForwardAction {
+  string forward_id = 1;
+  bytes data = 2;
+  bool close_write = 3;
+}
+
+message DevicePeerCloseLoopbackForwardAction {
+  string forward_id = 1;
+}
+
+// Opens a loopback-only listener on the peer. peer_listen_port may be zero;
+// the accepted result returns the actual port. Connections are multiplexed by
+// listener_id plus connection_id and terminate at service-node loopback only.
+message DevicePeerListenLoopbackForwardAction {
+  DevicePeerLoopbackHost service_destination_host = 1;
+  uint32 service_destination_port = 2;
+  DevicePeerLoopbackHost peer_listen_host = 3;
+  uint32 peer_listen_port = 4;
+}
+
+message DevicePeerWriteReverseForwardAction {
+  string listener_id = 1;
+  string connection_id = 2;
+  bytes data = 3;
+  bool close_write = 4;
+}
+
+message DevicePeerCloseReverseForwardConnectionAction {
+  string listener_id = 1;
+  string connection_id = 2;
+}
+
+message DevicePeerCloseLoopbackListenerAction {
+  string listener_id = 1;
+}
+
+message DevicePeerCommand {
+  DevicePeerCapabilityKind capability = 1;
+  DevicePeerEffectKind effect = 2;
+  oneof action {
+    DevicePeerListRecentDirectoriesAction list_recent_directories = 10;
+    DevicePeerListDirectoriesAction list_directories = 11;
+    DevicePeerInspectDirectoryAction inspect_directory = 12;
+    DevicePeerCreateDirectoryAction create_directory = 13;
+    DevicePeerRealpathAction realpath = 14;
+    DevicePeerStatFileAction stat_file = 15;
+    DevicePeerListFilesAction list_files = 16;
+    DevicePeerReadFileAction read_file = 17;
+    DevicePeerWriteFileAction write_file = 18;
+    DevicePeerRenameFileAction rename_file = 19;
+    DevicePeerRemoveFileAction remove_file = 23;
+    DevicePeerStartProcessAction start_process = 20;
+    DevicePeerWriteProcessAction write_process = 21;
+    DevicePeerSignalProcessAction signal_process = 22;
+    DevicePeerOpenTerminalAction open_terminal = 30;
+    DevicePeerWriteTerminalAction write_terminal = 31;
+    DevicePeerResizeTerminalAction resize_terminal = 32;
+    DevicePeerKillTerminalAction kill_terminal = 33;
+    DevicePeerPauseTerminalAction pause_terminal = 34;
+    DevicePeerResumeTerminalAction resume_terminal = 35;
+    DevicePeerOpenLoopbackForwardAction open_loopback_forward = 40;
+    DevicePeerWriteLoopbackForwardAction write_loopback_forward = 41;
+    DevicePeerCloseLoopbackForwardAction close_loopback_forward = 42;
+    DevicePeerListenLoopbackForwardAction listen_loopback_forward = 43;
+    DevicePeerWriteReverseForwardAction write_reverse_forward = 44;
+    DevicePeerCloseReverseForwardConnectionAction close_reverse_forward_connection = 45;
+    DevicePeerCloseLoopbackListenerAction close_loopback_listener = 46;
+  }
+}
+
+message DevicePeerRecentDirectoriesResult {
+  repeated DevicePeerRecentDirectory directories = 1;
+  bool truncated = 2;
+}
+
+message DevicePeerDirectoriesResult {
+  string path = 1;
+  string parent_path = 2;
+  repeated DevicePeerDirectoryEntry directories = 3;
+  bool truncated = 4;
+}
+
+message DevicePeerDirectoryInspectionResult {
+  string path = 1;
+  DevicePeerDirectoryKind kind = 2;
+}
+
+message DevicePeerDirectoryCreatedResult {
+  string path = 1;
+}
+
+enum DevicePeerFileKind {
+  DEVICE_PEER_FILE_KIND_UNSPECIFIED = 0;
+  DEVICE_PEER_FILE_KIND_FILE = 1;
+  DEVICE_PEER_FILE_KIND_DIRECTORY = 2;
+  DEVICE_PEER_FILE_KIND_SYMBOLIC_LINK = 3;
+  DEVICE_PEER_FILE_KIND_OTHER = 4;
+}
+
+message DevicePeerRealpathResult {
+  string path = 1;
+}
+
+message DevicePeerFileStatResult {
+  DevicePeerFileKind kind = 1;
+  uint64 size = 2;
+  google.protobuf.Timestamp modified_at = 3;
+  uint32 mode = 4;
+}
+
+message DevicePeerFileEntry {
+  string name = 1;
+  DevicePeerFileKind kind = 2;
+}
+
+message DevicePeerFileListResult {
+  repeated DevicePeerFileEntry entries = 1;
+}
+
+message DevicePeerFileReadResult {
+  bytes content = 1;
+  bool truncated = 2;
+}
+
+message DevicePeerFileMutationResult {}
+
+message DevicePeerProcessStartedResult {
+  string process_id = 1;
+}
+
+enum DevicePeerProcessOutputStream {
+  DEVICE_PEER_PROCESS_OUTPUT_STREAM_UNSPECIFIED = 0;
+  DEVICE_PEER_PROCESS_OUTPUT_STREAM_STANDARD_OUTPUT = 1;
+  DEVICE_PEER_PROCESS_OUTPUT_STREAM_STANDARD_ERROR = 2;
+}
+
+message DevicePeerProcessOutputResult {
+  string process_id = 1;
+  DevicePeerProcessOutputStream stream = 2;
+  bytes data = 3;
+}
+
+message DevicePeerProcessExitedResult {
+  string process_id = 1;
+  optional int32 exit_code = 2;
+  optional string signal_name = 3;
+}
+
+message DevicePeerTerminalOpenedResult {
+  string terminal_id = 1;
+}
+
+message DevicePeerTerminalOutputResult {
+  string terminal_id = 1;
+  bytes data = 2;
+}
+
+message DevicePeerTerminalExitedResult {
+  string terminal_id = 1;
+  optional int32 exit_code = 2;
+  optional int32 signal = 3;
+}
+
+message DevicePeerLoopbackForwardOpenedResult {
+  string forward_id = 1;
+}
+
+message DevicePeerLoopbackForwardDataResult {
+  string forward_id = 1;
+  bytes data = 2;
+}
+
+message DevicePeerLoopbackForwardClosedResult {
+  string forward_id = 1;
+}
+
+message DevicePeerLoopbackListenerOpenedResult {
+  string listener_id = 1;
+  DevicePeerLoopbackHost peer_listen_host = 2;
+  uint32 peer_listen_port = 3;
+}
+
+message DevicePeerReverseForwardConnectionOpenedResult {
+  string listener_id = 1;
+  string connection_id = 2;
+}
+
+message DevicePeerReverseForwardDataResult {
+  string listener_id = 1;
+  string connection_id = 2;
+  bytes data = 3;
+}
+
+message DevicePeerReverseForwardConnectionClosedResult {
+  string listener_id = 1;
+  string connection_id = 2;
+}
+
+message DevicePeerLoopbackListenerClosedResult {
+  string listener_id = 1;
+}
+
+message DevicePeerAcknowledgement {}
+
+// Sequence starts at one and increases strictly for every frame with the same
+// request_id. Output/data payloads are progress frames and are valid only with
+// STARTED; they never establish a terminal completion. COMPLETED, FAILED,
+// ABORTED, and OUTCOME_UNKNOWN are the only terminal phases.
+message DevicePeerAgentResult {
+  DevicePeerResponsePhase phase = 1;
+  uint64 sequence = 2;
+  oneof payload {
+    DevicePeerAcknowledgement acknowledgement = 10;
+    DevicePeerRecentDirectoriesResult recent_directories = 11;
+    DevicePeerDirectoriesResult directories = 12;
+    DevicePeerDirectoryInspectionResult directory_inspection = 13;
+    DevicePeerDirectoryCreatedResult directory_created = 14;
+    DevicePeerRealpathResult realpath = 15;
+    DevicePeerFileStatResult file_stat = 16;
+    DevicePeerFileListResult file_list = 17;
+    DevicePeerFileReadResult file_read = 18;
+    DevicePeerFileMutationResult file_mutation = 19;
+    DevicePeerProcessStartedResult process_started = 20;
+    DevicePeerProcessOutputResult process_output = 21;
+    DevicePeerProcessExitedResult process_exited = 22;
+    DevicePeerTerminalOpenedResult terminal_opened = 23;
+    DevicePeerTerminalOutputResult terminal_output = 24;
+    DevicePeerTerminalExitedResult terminal_exited = 25;
+    DevicePeerLoopbackForwardOpenedResult loopback_forward_opened = 26;
+    DevicePeerLoopbackForwardDataResult loopback_forward_data = 27;
+    DevicePeerLoopbackForwardClosedResult loopback_forward_closed = 28;
+    DevicePeerLoopbackListenerOpenedResult loopback_listener_opened = 31;
+    DevicePeerReverseForwardConnectionOpenedResult reverse_forward_connection_opened = 32;
+    DevicePeerReverseForwardDataResult reverse_forward_data = 33;
+    DevicePeerReverseForwardConnectionClosedResult reverse_forward_connection_closed = 34;
+    DevicePeerLoopbackListenerClosedResult loopback_listener_closed = 35;
+    DevicePeerFailure failure = 30;
+  }
+}
+
+// The enclosing request_id is the command to abort.
+message DevicePeerAbortCommand {}
+
+enum DevicePeerRetireReason {
+  DEVICE_PEER_RETIRE_REASON_UNSPECIFIED = 0;
+  DEVICE_PEER_RETIRE_REASON_REPLACED = 1;
+  DEVICE_PEER_RETIRE_REASON_DEVICE_REVOKED = 2;
+  DEVICE_PEER_RETIRE_REASON_CONNECTION_RETIRED = 3;
+  DEVICE_PEER_RETIRE_REASON_PROTOCOL_VIOLATION = 4;
+  DEVICE_PEER_RETIRE_REASON_SERVICE_SHUTDOWN = 5;
+}
+
+message DevicePeerRetireRoute {
+  DevicePeerRetireReason reason = 1;
+}
+
+// Hello uses route_generation=0. The accepted response echoes request_id and
+// assigns the only generation valid for subsequent frames on this stream.
+message OpenDevicePeerAgentRouteRequest {
+  string target_device_id = 1;
+  uint64 route_generation = 2;
+  string request_id = 3;
+  oneof payload {
+    DevicePeerAgentHello hello = 10;
+    DevicePeerAgentResult result = 11;
+    DevicePeerAgentHeartbeat heartbeat = 12;
+  }
+}
+
+message OpenDevicePeerAgentCommandRouteRequest {
+  string target_device_id = 1;
+  uint64 route_generation = 2;
+  string request_id = 3;
+  oneof payload {
+    DevicePeerAgentHello hello = 10;
+  }
+}
+
+message PublishDevicePeerAgentRouteRequest {
+  string target_device_id = 1;
+  uint64 route_generation = 2;
+  string request_id = 3;
+  oneof payload {
+    DevicePeerAgentResult result = 11;
+    DevicePeerAgentHeartbeat heartbeat = 12;
+    DevicePeerAgentRouteAttachment attachment = 13;
+  }
+}
+
+message PublishDevicePeerAgentRouteResponse {}
+
+message OpenDevicePeerAgentRouteResponse {
+  string target_device_id = 1;
+  uint64 route_generation = 2;
+  string request_id = 3;
+  oneof payload {
+    DevicePeerAgentRouteAccepted accepted = 10;
+    DevicePeerCommand command = 11;
+    DevicePeerAbortCommand abort = 12;
+    DevicePeerRetireRoute retire = 13;
+  }
+}
+
+message OpenDevicePeerAgentCommandRouteResponse {
+  string target_device_id = 1;
+  uint64 route_generation = 2;
+  string request_id = 3;
+  oneof payload {
+    DevicePeerAgentRouteAccepted accepted = 10;
+    DevicePeerCommand command = 11;
+    DevicePeerAbortCommand abort = 12;
+    DevicePeerRetireRoute retire = 13;
+  }
+}

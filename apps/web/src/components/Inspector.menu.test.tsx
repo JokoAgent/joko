@@ -280,7 +280,7 @@ describe("Inspector menus", () => {
     const focused = vi.spyOn(document, "hasFocus").mockReturnValue(true);
     const pane = document.body.appendChild(document.createElement("main"));
     pane.className = "session-pane";
-    pane.dataset.gamepadSessionId = "session-one";
+    pane.dataset.inputSessionId = "session-one";
     const taskButton = pane.appendChild(document.createElement("button"));
     taskButton.focus();
     const host = document.body.appendChild(document.createElement("div"));

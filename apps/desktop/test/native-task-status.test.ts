@@ -6,6 +6,7 @@ import type {
 } from "../src/channels.js";
 import {
   defaultDesktopNativeTaskStatusSettings,
+  deliverDesktopNativeTaskStatusAction,
   isNativeTaskStatusAvailable,
   isNativeTaskStatusSupported,
   parseDesktopNativeTaskStatusSettings,
@@ -129,6 +130,32 @@ describe("native task-status contract", () => {
       packaged: true,
       developmentPreviewRequested: false
     })).toBe(true);
+  });
+
+  it("reveals and reacquires the main window before dispatching a task focus action", () => {
+    const calls: string[] = [];
+    const hidden = { id: "hidden" };
+    const revealed = { id: "revealed" };
+    let current = hidden;
+
+    expect(deliverDesktopNativeTaskStatusAction({ kind: "focus", sessionId: "task" }, {
+      revealMainWindow: () => {
+        calls.push("reveal");
+        current = revealed;
+        return true;
+      },
+      currentMainWindow: () => {
+        calls.push("current");
+        return current;
+      },
+      isWindowAvailable: (window) => {
+        calls.push(`available:${window.id}`);
+        return true;
+      },
+      dispatch: (window) => { calls.push(`dispatch:${window.id}`); }
+    })).toBe(true);
+
+    expect(calls).toEqual(["reveal", "current", "available:revealed", "dispatch:revealed"]);
   });
 
   it("validates a bounded unique visibility report independently from task snapshots", () => {

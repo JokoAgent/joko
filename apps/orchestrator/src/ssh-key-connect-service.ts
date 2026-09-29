@@ -7,6 +7,12 @@ import type { CredentialManager } from "./credential-manager.js";
 import { fromProtoRevision, toProtoTimestamp } from "./proto-mapper.js";
 import type { RemoteHostRegistry } from "./remote-host-registry.js";
 
+export function sshAgentHostPlatform(platform: NodeJS.Platform): contract.SshAgentHostPlatform {
+  return platform === "win32" ? contract.SshAgentHostPlatform.WINDOWS
+    : platform === "darwin" ? contract.SshAgentHostPlatform.MACOS
+      : platform === "linux" ? contract.SshAgentHostPlatform.LINUX : contract.SshAgentHostPlatform.UNSPECIFIED;
+}
+
 export function createSshKeyConnectService(options: {
   readonly keys?: SshKeyManager;
   readonly credentials?: CredentialManager;
@@ -53,6 +59,7 @@ export function createSshKeyConnectService(options: {
       const result = await keys.list(signal);
       return create(contract.ListSshKeysResponseSchema, {
         keys: result.keys.map(toProtoKey), generationSupported: result.generationSupported,
+        agentHostPlatform: sshAgentHostPlatform(process.platform),
         agentState: result.agentState === "ready" ? contract.SshAgentState.READY
           : result.agentState === "unavailable" ? contract.SshAgentState.UNAVAILABLE : contract.SshAgentState.FAILED
       });
@@ -110,7 +117,7 @@ function mapError(error: unknown): ConnectError {
   if (!(error instanceof SshKeyError)) return new ConnectError("ssh_key.io_failed", Code.Internal);
   const code = error.code === "invalid_name" || error.code === "invalid_key" || error.code === "bad_passphrase" ? Code.InvalidArgument
     : error.code === "key_changed" ? Code.Aborted : error.code === "not_found" ? Code.NotFound
-      : error.code === "agent_unavailable" ? Code.Unavailable : error.code === "agent_failed" || error.code === "outcome_unknown" ? Code.FailedPrecondition
+      : error.code === "agent_unavailable" ? Code.Unavailable : error.code === "agent_failed" || error.code === "outcome_unknown" || error.code === "unsafe_permissions" ? Code.FailedPrecondition
         : error.code === "busy" ? Code.ResourceExhausted : error.code === "aborted" ? Code.Canceled : Code.Internal;
   return new ConnectError(error.message, code);
 }

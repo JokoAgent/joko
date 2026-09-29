@@ -5,12 +5,33 @@ import { join } from "node:path";
 import { create } from "@bufbuild/protobuf";
 import { Code } from "@connectrpc/connect";
 import { OperationMutationSchema, OperationState, SessionTitleSuggestionStatus, type ModelRouteRef } from "@joko/contracts";
+import type { BackendDescriptor } from "@joko/core";
 import { AuxiliaryTextRouting, CredentialManager, CredentialVault, ProviderCatalogManager, SessionNavigationCoordinator, createModelRouteCatalog } from "@joko/orchestrator";
 import { PI_LIKE_PROFILE } from "@joko/testkit";
 import { afterEach, expect, it } from "vitest";
 
-import { OrchestratorE2eFixture } from "./fixture.js";
+import { InstrumentedFakeAdapter, OrchestratorE2eFixture } from "./fixture.js";
 import { createSessionMutation, sessionIdFrom, submit } from "./operations.js";
+
+class AuxiliaryTextAdapter extends InstrumentedFakeAdapter {
+  override async describe(): Promise<BackendDescriptor> {
+    const descriptor = await super.describe();
+    return {
+      ...descriptor,
+      providers: PI_LIKE_PROFILE.models.map((model) => ({
+        providerId: model.providerId,
+        displayName: model.providerId,
+        api: model.api,
+        authenticationState: "not_required",
+        loginMethods: [],
+        supportsLogin: false,
+        supportsLogout: false,
+        supportsRefresh: false,
+        supportsModelRefresh: false
+      }))
+    };
+  }
+}
 
 let fixture: OrchestratorE2eFixture | undefined;
 let inferenceServer: Server | undefined;
@@ -47,6 +68,7 @@ it("persists an independent auxiliary chain across clients and uses its fallback
   };
   fixture = await OrchestratorE2eFixture.start({
     profiles: [profile],
+    createAdapter: (adapterProfile) => new AuxiliaryTextAdapter(adapterProfile),
     createAuxiliaryServices: async (store, dataDirectory) => {
       const vault = await CredentialVault.open(join(dataDirectory, "auxiliary-vault.key"));
       const credentials = new CredentialManager({ vault, storagePath: join(dataDirectory, "auxiliary-credentials.json") });

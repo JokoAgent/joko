@@ -32,6 +32,108 @@ afterEach(async () => {
 });
 
 describe("SessionWorktreeCoordinator lifecycle", () => {
+  test("retains a deleted portable source until native cleanup and replays its exact worktree release", { timeout: 30_000 }, async () => {
+    const root = await mkdtemp(join(tmpdir(), "joko-portable-worktree-cleanup-"));
+    const repositoryRoot = await createRepository(join(root, "project"));
+    const store = new OperationalStore(join(root, "store.db"));
+    const artifacts = new ArtifactStore({
+      rootDirectory: join(root, "artifacts"),
+      repository: new OperationalArtifactRepository(store),
+      ingestRoots: [root]
+    });
+    await artifacts.initialize();
+    const workspaces = new WorkspaceService();
+    const storageRoot = join(root, "isolated");
+    const originalWorktrees = new SessionWorktreeCoordinator({ store, workspaces, storageRoot });
+    const adapter = new TargetCaptureAdapter();
+    const host = new SessionHost(store, artifacts, [adapter], { worktrees: originalWorktrees });
+    await originalWorktrees.initialize();
+    await host.initialize();
+    await host.registerTarget({
+      id: "target-one", backendId: adapter.id, displayName: "Project",
+      workspaceRoot: repositoryRoot, managed: false, trusted: true
+    });
+    const connection = store.createConnection({ id: "connection-one", name: "Test device", authKeyDigest: "digest" });
+    cleanups.push(async () => {
+      await host.dispose().catch(() => undefined);
+      originalWorktrees.dispose();
+      await workspaces.close().catch(() => undefined);
+      store.close();
+      await rm(root, { recursive: true, force: true, maxRetries: 3 });
+    });
+    const oldSessionId = (await host.createSession({
+      operationId: "create-portable-old-worktree", connection, targetId: "target-one",
+      title: "Old task", fastMode: false, permissionMode: "ask", planMode: false,
+      worktree: { sourceRef: "refs/heads/main", refreshRemote: false }
+    })).value.sessionId;
+    await host.close(oldSessionId);
+    const old = store.getSession(oldSessionId);
+    const oldWorktree = old.descriptor.worktree;
+    if (oldWorktree === undefined) throw new Error("Expected an isolated old task.");
+    const claim = store.claimAuthorizedDeferredEffectOperation(
+      connection.id, connection.authKeyDigest,
+      { id: "portable-worktree-replacement", kind: "import_portable_session", body: { targetId: "target-one" } }
+    );
+    if (!claim.claimed) throw new Error("Expected a new import operation.");
+    const now = Date.now();
+    store.completeAuthorizedDeferredEffectOperation(
+      connection.id, connection.authKeyDigest, claim.operation.id, claim.operation.bodyHash,
+      (transaction) => {
+        const { worktree: _oldWorktree, ...descriptor } = old.descriptor;
+        transaction.updateSession(oldSessionId, { archived: true, deletedAt: now }, old.revision, now);
+        transaction.createSession({
+          ...descriptor, id: "portable-new-session", title: "New task",
+          binding: { opaqueRef: "native/new-portable-session", generation: 1 },
+          archived: false, deletedAt: undefined, createdAt: now, updatedAt: now
+        });
+        transaction.preparePortableReplacementCleanup({
+          operationId: claim.operation.id,
+          importedSessionId: "portable-new-session",
+          replacedSessionId: oldSessionId,
+          at: now
+        });
+        return { sessionId: "portable-new-session" };
+      }
+    );
+    originalWorktrees.dispose();
+    const restartedWorkspaces = new WorkspaceService();
+    const restartedWorktrees = new SessionWorktreeCoordinator({ store, workspaces: restartedWorkspaces, storageRoot });
+    cleanups.push(async () => {
+      restartedWorktrees.dispose();
+      await restartedWorkspaces.close().catch(() => undefined);
+    });
+    await restartedWorktrees.initialize();
+    expect((await lstat(oldWorktree.path)).isDirectory()).toBe(true);
+    expect(store.getPortableReplacementCleanup(claim.operation.id))
+      .toMatchObject({ nativeState: "pending", worktreeState: "pending" });
+    store.claimPortableReplacementNativeCleanup(claim.operation.id);
+    store.confirmPortableReplacementNativeCleanup(claim.operation.id);
+    await host.dispose();
+    const receipt = vi.spyOn(store, "confirmPortableReplacementWorktreeCleanup")
+      .mockImplementationOnce(() => { throw new Error("worktree release acknowledgement was lost"); });
+    const recoveryHost = new SessionHost(store, artifacts, [new TargetCaptureAdapter()], { worktrees: restartedWorktrees });
+    cleanups.push(() => recoveryHost.dispose());
+    await recoveryHost.initialize();
+    receipt.mockRestore();
+    await expect(lstat(oldWorktree.path)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(store.getPortableReplacementCleanup(claim.operation.id))
+      .toMatchObject({ worktreeState: "pending", failureCode: "worktree_release_pending" });
+    await recoveryHost.dispose();
+    restartedWorktrees.dispose();
+    const finalWorkspaces = new WorkspaceService();
+    const finalWorktrees = new SessionWorktreeCoordinator({ store, workspaces: finalWorkspaces, storageRoot });
+    cleanups.push(async () => {
+      finalWorktrees.dispose();
+      await finalWorkspaces.close().catch(() => undefined);
+    });
+    await finalWorktrees.initialize();
+    const finalHost = new SessionHost(store, artifacts, [new TargetCaptureAdapter()], { worktrees: finalWorktrees });
+    cleanups.push(() => finalHost.dispose());
+    await finalHost.initialize();
+    expect(store.listPendingPortableReplacementCleanups()).toEqual([]);
+    expect(store.getSession("portable-new-session").descriptor.deletedAt).toBeUndefined();
+  });
+
   test("archives, restores, and dispatches the next prompt from the same isolated checkout", { timeout: 30_000 }, async () => {
     const root = await mkdtemp(join(tmpdir(), "joko-session-worktree-"));
     const repositoryRoot = await createRepository(join(root, "project"));
@@ -519,7 +621,10 @@ describe("remote checkout coordination", () => {
     expect(f.workspaces.listRegistrations()).toContainEqual(expect.objectContaining({
       id: f.plan.workspaceId,
       root: f.plan.path,
-      remote: expect.objectContaining({ workspaceRoot: f.plan.path, targetId: "remote-target" })
+      remote: {
+        targetId: "remote-target",
+        binding: { ...f.plan.remote.binding, workspaceRoot: f.plan.path }
+      }
     }));
     expect(f.worktrees.effectiveTarget(f.store.getSession("child")).remoteWorkspace?.workspaceRoot)
       .toBe(f.plan.path);
@@ -566,10 +671,17 @@ describe("remote checkout coordination", () => {
     });
 
     const binding = await f.worktrees.acquirePlannedRemoteDerivation(f.plan);
-    expect(binding).toEqual(remoteBindingFromLease(f.plan.workspaceId, f.lease));
+    expect(binding).toEqual({
+      ...remoteBindingFromLease(f.plan.workspaceId, f.lease),
+      updatedAt: binding.updatedAt
+    });
+    expect(binding.updatedAt).toEqual(expect.any(Number));
     expect(f.workspaces.listRegistrations()).toContainEqual(expect.objectContaining({
       id: f.plan.workspaceId, root: f.plan.path,
-      remote: expect.objectContaining({ workspaceRoot: f.plan.path })
+      remote: {
+        targetId: "remote-target",
+        binding: { ...f.plan.remote.binding, workspaceRoot: f.plan.path }
+      }
     }));
     expect(await f.worktrees.inspectPlannedRemoteDerivation(f.plan)).toEqual({ status: "active", lease: f.lease });
     f.owner.releaseExact.mockResolvedValueOnce("preserved");
@@ -587,7 +699,7 @@ async function remoteFixture() {
   store.upsertBackend({ id: "remote-backend", adapterKind: "fixture", displayName: "Remote",
     version: "1", instanceGeneration: 0, health: "healthy", installationState: "installed",
     authenticationState: "not_required", capabilities: new Map(), models: [], tools: [], diagnostics: [] });
-  const remoteWorkspace = { hostTargetId: "remote-target", hostId: "ssh", workspaceRoot: "/srv/project" };
+  const remoteWorkspace = { kind: "ssh" as const, hostTargetId: "remote-target", hostId: "ssh", workspaceRoot: "/srv/project" };
   store.upsertTarget({ id: "remote-target", backendId: "remote-backend", displayName: "Remote project",
     workspaceRoot: join(root, "placeholder"), managed: true, trusted: true, remoteWorkspace });
   let host = store.createRemoteHost({ ownerId: "owner", targetId: "remote-target", id: "ssh",
@@ -609,10 +721,14 @@ async function remoteFixture() {
   const manifestId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
   const sourceCommit = "c".repeat(40);
   const authority = {
-    hostOwnerId: host.ownerId, hostTargetId: host.targetId, hostId: host.id,
-    hostIdentity: `sha256:${"b".repeat(64)}`, targetId: "remote-target",
+    targetId: "remote-target",
+    binding: remoteWorkspace,
+    executionIdentity: JSON.stringify({
+      kind: "ssh", hostTargetId: remoteWorkspace.hostTargetId, hostId: remoteWorkspace.hostId,
+      ownerId: host.ownerId, hostname: host.hostname, port: host.port, user: host.user,
+      algorithm: host.trust!.algorithm, fingerprint: host.trust!.fingerprint
+    }),
     targetRevision: store.getTarget("remote-target").revision.toString(),
-    hostRevision: host.revision.toString()
   };
   const plan: RemoteGitCheckoutPlan = {
     format: 1, leaseId, manifestId, sessionId: "child", sourceSessionId: "source",

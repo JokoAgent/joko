@@ -11,13 +11,16 @@ import {
   BlobTransferCoordinator,
   ConnectionManager,
   ContactManager,
+  DevicePeerOwner,
   LanDiscoveryService,
   DurableWorkspaceRunCapture,
   HistoryMaintenance,
+  cleanHistoryMaintenanceCopy,
   OperationalWorkspaceSnapshotRepository,
   OperationalArtifactRepository,
   DurableReviewEvidenceProvider,
   ReviewCoordinator,
+  RemoteExecutionRouter,
   RemoteWorkspaceService,
   ScheduleCoordinator,
   SessionHost,
@@ -45,6 +48,7 @@ export type { E2eClients, PairedClient } from "./connect-clients.js";
 type FixtureAuxiliaryServices = Pick<OrchestratorApplication,
   "auxiliaryText" | "subagentModels" | "sessionNavigation" | "providers" | "providerAuth"
   | "refreshPiGeneration" | "mcpRouter" | "sshKeys" | "credentials" | "remoteHosts" | "browser"
+  | "messageSearch"
   | "browserSettings" | "browserState" | "voiceInput" | "diagnosticsBundles">;
 
 export interface FixtureOptions {
@@ -248,9 +252,13 @@ export class OrchestratorE2eFixture {
     for (const adapter of backendInstances.availableAdapters()) {
       if (adapter instanceof InstrumentedFakeAdapter) adapters.set(adapter.id, adapter);
     }
-    const workspaces = new WorkspaceService(auxiliaryServices?.remoteHosts === undefined
+    const devicePeers = new DevicePeerOwner({ store });
+    const remoteExecution = auxiliaryServices?.remoteHosts === undefined
       ? undefined
-      : { remoteDelegate: new RemoteWorkspaceService(auxiliaryServices.remoteHosts) });
+      : new RemoteExecutionRouter({ hosts: auxiliaryServices.remoteHosts, peers: devicePeers });
+    const workspaces = new WorkspaceService(remoteExecution === undefined
+      ? undefined
+      : { remoteDelegate: new RemoteWorkspaceService(remoteExecution) });
     await workspaces.register({
       id: "workspace-main",
       root: workspaceDirectory,
@@ -294,9 +302,16 @@ export class OrchestratorE2eFixture {
       store,
       activeSessions: {
         prepare: (sessionIds) => sessionHost.prepareHistoryMaintenanceBindings(sessionIds),
+        recover: (request) => sessionHost.recoverHistoryMaintenanceBinding(request),
+        discard: (replacements) => sessionHost.discardHistoryMaintenanceBindings(replacements),
+        finalize: (replacements) => sessionHost.finalizeHistoryMaintenanceBindings(replacements),
         release: (sessionIds) => sessionHost.releaseHistoryMaintenanceSessions(sessionIds)
       },
-      externalRecords: workspaceChanges
+      externalRecords: workspaceChanges,
+      workDatabase: async (input, controls) => cleanHistoryMaintenanceCopy(input, (phase, percent) => {
+        controls?.signal?.throwIfAborted();
+        controls?.onProgress?.(phase, percent);
+      })
     });
     const targets = new Map<string, string>();
     for (const factory of factories) {
@@ -311,6 +326,7 @@ export class OrchestratorE2eFixture {
         trusted: true
       }, { workspaceId: "workspace-main" });
     }
+    await historyMaintenance.initialize();
     const scheduler = new ScheduleCoordinator(store, sessionHost, { tickMs: 25 });
     scheduler.start();
 
@@ -391,6 +407,8 @@ export class OrchestratorE2eFixture {
       config,
       store,
       connections,
+      devicePeers,
+      ...(remoteExecution === undefined ? {} : { remoteExecution }),
       serverId,
       lanDiscovery,
       artifacts,
@@ -425,9 +443,12 @@ export class OrchestratorE2eFixture {
         await attempt(() => auxiliaryServices?.sessionNavigation?.dispose());
         await attempt(() => auxiliaryServices?.auxiliaryText?.dispose());
         await attempt(() => auxiliaryServices?.providerAuth?.beginShutdown());
+        await attempt(() => auxiliaryServices?.messageSearch?.stop());
         // Keep native transports and remote dependencies alive until exact
         // current and retained process cleanup has settled.
         await attempt(() => options.terminals?.dispose());
+        await attempt(() => artifactMaintenance.close());
+        await attempt(() => historyMaintenance.close());
         await attempt(() => sessionHost.dispose());
         await attempt(() => backendInstances.disposeRetainedCleanups());
         await attempt(() => auxiliaryServices?.mcpRouter?.dispose());
@@ -440,6 +461,7 @@ export class OrchestratorE2eFixture {
         await attempt(() => contacts.close());
         await attempt(() => contactStore.close());
         await attempt(() => sessionWorktrees.dispose());
+        await attempt(() => devicePeers.shutdown());
         await attempt(() => store.close());
         if (failures.length > 0) throw new AggregateError(failures, "The E2E application did not close cleanly.");
       }

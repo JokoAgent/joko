@@ -201,11 +201,12 @@ export function RemoteHostsSettings({ controller, snapshot, activeTargetId, show
           {targets.map((candidate) => <option key={candidate.id} value={candidate.id}>{candidate.name}</option>)}
         </SelectControl>
       </label>
-      {target !== undefined && <RemoteWorkspaceBinding
+      {target !== undefined && target.remoteWorkspace?.kind !== "device_peer" && <RemoteWorkspaceBinding
         key={scope.id}
         api={api}
         target={target}
-        sourceTargetName={targets.find((candidate) => candidate.id === target.remoteWorkspace?.hostTargetId)?.name}
+        sourceTargetName={targets.find((candidate) => target.remoteWorkspace?.kind === "ssh"
+          && candidate.id === target.remoteWorkspace.hostTargetId)?.name}
         hosts={hosts}
         capabilities={capabilities}
         ready={ready}
@@ -263,7 +264,8 @@ export function RemoteHostsSettings({ controller, snapshot, activeTargetId, show
           {capabilities.management && <IconButton
             label={t("common.delete")}
             disabled={!ready || scope.pending.has(host.id) || targets.some((candidate) =>
-              candidate.remoteWorkspace?.hostTargetId === targetId && candidate.remoteWorkspace.hostId === host.id)}
+              candidate.remoteWorkspace?.kind === "ssh"
+              && candidate.remoteWorkspace.hostTargetId === targetId && candidate.remoteWorkspace.hostId === host.id)}
             onClick={() => perform(host.id, () => api.deleteRemoteHost(targetId, host.id, host.revision))}
           ><Trash2 aria-hidden="true" /></IconButton>}
         </div>
@@ -482,10 +484,11 @@ function RemoteWorkspaceBinding({ api, target, sourceTargetName, hosts, capabili
   readonly t: Translator;
 }): JSX.Element {
   const bindable = useMemo(() => hosts.filter((host) => host.status.state === "ready" && host.trust !== undefined), [hosts]);
-  const externalBinding = target.remoteWorkspace !== undefined && target.remoteWorkspace.hostTargetId !== target.id;
+  const sshBinding = target.remoteWorkspace?.kind === "ssh" ? target.remoteWorkspace : undefined;
+  const externalBinding = sshBinding !== undefined && sshBinding.hostTargetId !== target.id;
   const baseline = (): BindingDraft => ({ baseRevision: target.revision,
-    hostId: externalBinding ? "" : target.remoteWorkspace?.hostId ?? bindable[0]?.id ?? "",
-    workspaceRoot: target.remoteWorkspace?.workspaceRoot ?? "", dirty: false });
+    hostId: externalBinding ? "" : sshBinding?.hostId ?? bindable[0]?.id ?? "",
+    workspaceRoot: sshBinding?.workspaceRoot ?? "", dirty: false });
   const [draft, setDraft] = useState<BindingDraft>(() => drafts.get(target.id) ?? baseline());
   const updateDraft = (next: BindingDraft): void => { drafts.set(target.id, next); setDraft(next); };
   const { hostId, workspaceRoot } = draft;
@@ -505,11 +508,11 @@ function RemoteWorkspaceBinding({ api, target, sourceTargetName, hosts, capabili
   useEffect(() => {
     const applied = draft.submitted !== undefined && target.revision !== draft.baseRevision && (draft.submitted.kind === "serviceNode"
       ? target.remoteWorkspace === undefined
-      : target.remoteWorkspace?.hostTargetId === target.id && target.remoteWorkspace.hostId === draft.submitted.hostId
-        && target.remoteWorkspace.workspaceRoot === draft.submitted.workspaceRoot);
+      : sshBinding?.hostTargetId === target.id && sshBinding.hostId === draft.submitted.hostId
+        && sshBinding.workspaceRoot === draft.submitted.workspaceRoot);
     if ((!draft.dirty && target.revision !== draft.baseRevision) || applied) updateDraft(baseline());
     else if (!draft.dirty && !externalBinding && draft.hostId === "" && bindable[0] !== undefined) updateDraft({ ...draft, hostId: bindable[0].id });
-  }, [target.revision, target.remoteWorkspace?.hostTargetId, target.remoteWorkspace?.hostId, target.remoteWorkspace?.workspaceRoot, bindable, draft]);
+  }, [target.revision, sshBinding?.hostTargetId, sshBinding?.hostId, sshBinding?.workspaceRoot, bindable, draft]);
   const transportsReady = capabilities.processStreaming && capabilities.fileTransfer;
   const conflict = draft.dirty && target.revision !== draft.baseRevision;
   const selectedReady = bindable.some(host => host.id === hostId);
@@ -550,10 +553,10 @@ function RemoteWorkspaceBinding({ api, target, sourceTargetName, hosts, capabili
   };
   return <div ref={browserRef} className="remote-workspace-binding">
     <div className="remote-workspace-binding__heading">
-      <span><strong>{t("settings.remoteHosts.workspace")}</strong><small>{target.remoteWorkspace === undefined ? t("settings.remoteHosts.serviceNodeActive")
-        : externalBinding ? t("settings.remoteHosts.externalBinding", { host: target.remoteWorkspace.hostId,
-          project: sourceTargetName ?? target.remoteWorkspace.hostTargetId }) : t("settings.remoteHosts.remoteActive")}</small></span>
-      {target.remoteWorkspace !== undefined && <Button disabled={!ready || busy || conflict} onClick={() => submit({ kind: "serviceNode" })}>{t("settings.remoteHosts.useServiceNode")}</Button>}
+      <span><strong>{t("settings.remoteHosts.workspace")}</strong><small>{sshBinding === undefined ? t("settings.remoteHosts.serviceNodeActive")
+        : externalBinding ? t("settings.remoteHosts.externalBinding", { host: sshBinding.hostId,
+          project: sourceTargetName ?? sshBinding.hostTargetId }) : t("settings.remoteHosts.remoteActive")}</small></span>
+      {sshBinding !== undefined && <Button disabled={!ready || busy || conflict} onClick={() => submit({ kind: "serviceNode" })}>{t("settings.remoteHosts.useServiceNode")}</Button>}
     </div>
     <div className="remote-workspace-binding__fields">
       <label className="field"><span>{t("settings.remoteHosts.host")}</span><SelectControl disabled={busy} value={hostId} onChange={(event) => updateDraft({ ...draft, hostId: event.target.value, dirty: true, submitted: undefined })}><option value="">{t("settings.remoteHosts.selectHost")}</option>{hostId !== "" && !selectedReady && <option value={hostId} disabled>{hostId} · {t("settings.remoteHosts.hostUnavailable")}</option>}{bindable.map((host) => <option key={host.id} value={host.id}>{host.id}</option>)}</SelectControl></label>

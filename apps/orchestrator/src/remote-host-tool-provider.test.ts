@@ -36,6 +36,119 @@ describe("RemoteHostToolBridgeProvider", () => {
     expect(fixture.provider.includeForTarget("missing")).toBe(false);
   });
 
+  it("accepts exact tagged SSH scope while fencing stale SSH and Device peer scopes", async () => {
+    const fixture = createFixture();
+    fixture.registry.create({
+      targetId: "target-a",
+      id: "bound",
+      hostname: "bound.example.test",
+      user: "maker",
+      source: "manual"
+    });
+    const remoteWorkspace = {
+      kind: "ssh" as const,
+      hostTargetId: "target-a",
+      hostId: "bound",
+      workspaceRoot: "/srv/project"
+    };
+    fixture.store.upsertTarget({
+      id: "target-ssh",
+      backendId: "pi",
+      displayName: "target-ssh",
+      workspaceRoot: join("D:/workspace", "target-ssh"),
+      managed: false,
+      trusted: true,
+      remoteWorkspace
+    });
+    fixture.store.createSession({
+      id: "session-ssh",
+      backendId: "pi",
+      targetId: "target-ssh",
+      title: "session-ssh",
+      binding: { opaqueRef: "session-ssh.jsonl", generation: 7 },
+      pinned: false,
+      archived: false,
+      permissionMode: "ask",
+      planMode: false,
+      fastMode: false,
+      remoteWorkspace,
+      createdAt: 1_000,
+      updatedAt: 1_000
+    });
+
+    expect(resultData(await call(
+      fixture.provider,
+      "remote_host_list_hosts",
+      {},
+      { sessionId: "session-ssh", targetId: "target-ssh", generation: 7 }
+    ))).toEqual({
+      hosts: [expect.objectContaining({ id: "bound", hostname: "bound.example.test" })]
+    });
+
+    fixture.store.upsertTarget({
+      ...fixture.store.getTarget("target-ssh").descriptor,
+      remoteWorkspace: { ...remoteWorkspace, workspaceRoot: "/srv/rebound" }
+    });
+    expect(errorData(await call(
+      fixture.provider,
+      "remote_host_list_hosts",
+      {},
+      { sessionId: "session-ssh", targetId: "target-ssh", generation: 7 }
+    ))).toMatchObject({ errorCode: "STALE_SCOPE" });
+
+    fixture.store.createDevice({
+      id: "controller-device",
+      name: "Controller",
+      kind: "web",
+      platform: "web",
+      appVersion: "test"
+    });
+    fixture.store.createDevice({
+      id: "peer-device",
+      name: "Peer",
+      kind: "desktop",
+      platform: "win32",
+      appVersion: "test"
+    });
+    const peerWorkspace = {
+      kind: "device_peer" as const,
+      controllerDeviceId: "controller-device",
+      targetDeviceId: "peer-device",
+      workspaceRoot: "D:\\peer\\project"
+    };
+    fixture.store.upsertTarget({
+      id: "target-peer",
+      backendId: "pi",
+      displayName: "target-peer",
+      workspaceRoot: join("D:/workspace", "target-peer"),
+      managed: false,
+      trusted: true,
+      remoteWorkspace: peerWorkspace
+    });
+    fixture.store.createSession({
+      id: "session-peer",
+      backendId: "pi",
+      targetId: "target-peer",
+      title: "session-peer",
+      binding: { opaqueRef: "session-peer.jsonl", generation: 7 },
+      pinned: false,
+      archived: false,
+      permissionMode: "ask",
+      planMode: false,
+      fastMode: false,
+      remoteWorkspace: peerWorkspace,
+      createdAt: 1_000,
+      updatedAt: 1_000
+    });
+    expect(fixture.provider.includeForTarget("target-peer")).toBe(false);
+    expect(errorData(await call(
+      fixture.provider,
+      "remote_host_list_hosts",
+      {},
+      { sessionId: "session-peer", targetId: "target-peer", generation: 7 }
+    ))).toMatchObject({ errorCode: "STALE_SCOPE" });
+  });
+
   it("lists and resolves only the authenticated target without credential references", async () => {
     const fixture = createFixture();
     fixture.registry.create({

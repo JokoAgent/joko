@@ -185,6 +185,20 @@ describe("owner-scoped delayed-create drafts", () => {
     })).toBeUndefined();
   });
 
+  it("retains an editable new-task draft before any Backend or Target is selected", () => {
+    const draft = {
+      selection: { kind: "unselected" },
+      nativeStart: { kind: "fresh" },
+      text: "Keep this while disconnected",
+      editorDocument: plainTextToComposerDocument("Keep this while disconnected"),
+      mentions: [],
+      attachments: []
+    };
+    expect(normalizeNewSessionLocalDraft(draft)?.selection).toEqual({ kind: "unselected" });
+    expect(normalizeNewSessionLocalDraft(draft)?.text).toBe(draft.text);
+    expect(normalizeNewSessionLocalDraft({ ...draft, selection: { kind: "unselected", targetId: "other" } })).toBeUndefined();
+  });
+
   it("requires and normalizes the structured first-message document", () => {
     const common = {
       selection: { kind: "target", targetId: "target-1" },

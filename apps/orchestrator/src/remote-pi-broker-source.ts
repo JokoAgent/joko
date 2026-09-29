@@ -2,12 +2,15 @@ import { createHash } from "node:crypto";
 
 export const REMOTE_PI_BROKER_PROTOCOL_VERSION = 1;
 export const REMOTE_PI_BROKER_SOURCE = String.raw`
-import { spawn } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { constants } from "node:fs";
 import { chmod, lstat, mkdir, open, readFile, readdir, realpath, rename, rm, writeFile } from "node:fs/promises";
 import { createConnection, createServer } from "node:net";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { promisify } from "node:util";
+
+const execFileAsync = promisify(execFile);
 
 const VERSION = ${REMOTE_PI_BROKER_PROTOCOL_VERSION};
 const SOURCE_HASH = process.env.JOKO_REMOTE_BROKER_SOURCE_HASH || "";
@@ -84,19 +87,29 @@ function contained(parent, child) {
   const childPath = relative(parent, child);
   return childPath !== "" && !childPath.startsWith("..") && !isAbsolute(childPath);
 }
+function sameNativePath(left, right) {
+  const leftPath = resolve(left);
+  const rightPath = resolve(right);
+  return process.platform === "win32"
+    ? leftPath.toLowerCase() === rightPath.toLowerCase()
+    : leftPath === rightPath;
+}
+function privateMode(info) {
+  return process.platform === "win32" || (info.mode & 0o077) === 0;
+}
 async function secureDirectory(path) {
   await mkdir(path, { recursive: true, mode: 0o700 });
   const info = await lstat(path);
   if (!info.isDirectory() || info.isSymbolicLink()) fail();
-  await chmod(path, 0o700);
+  if (process.platform !== "win32") await chmod(path, 0o700);
   const canonical = await realpath(path);
-  if (canonical !== resolve(path)) fail();
+  if (!sameNativePath(canonical, path)) fail();
   return canonical;
 }
 async function atomicJson(path, value) {
   const temporary = path + "." + randomUUID() + ".tmp";
   await writeFile(temporary, JSON.stringify(value), { mode: 0o600, flag: "wx" });
-  await chmod(temporary, 0o600);
+  if (process.platform !== "win32") await chmod(temporary, 0o600);
   await rename(temporary, path);
 }
 async function acquireProcessLock(lockPath, value) {
@@ -111,6 +124,10 @@ async function acquireProcessLock(lockPath, value) {
       return true;
     } catch (error) {
       if (error && ["EEXIST", "ENOTEMPTY"].includes(error.code)) return false;
+      if (process.platform === "win32" && error?.code === "EPERM") {
+        const existing = await lstat(lockPath).catch(() => undefined);
+        if (existing?.isDirectory() && !existing.isSymbolicLink()) return false;
+      }
       throw error;
     }
   } finally {
@@ -127,16 +144,14 @@ async function releaseProcessLock(lockPath, expectedPid) {
 async function processMatches(pid, mode, root) {
   if (!Number.isSafeInteger(pid) || pid < 1) return false;
   try { process.kill(pid, 0); } catch { return false; }
-  try {
-    const commandLine = await readFile("/proc/" + pid + "/cmdline");
-    if (commandLine.byteLength > 64 * 1024) return true;
-    const fields = commandLine.toString("utf8").split("\0");
-    return fields.includes(resolve(process.argv[1])) && fields.includes(mode) && fields.includes(root);
-  } catch {
+  const fingerprint = await processFingerprint(pid);
+  if (fingerprint === undefined) {
     // Without a trustworthy process-start identity, preserve the lock. PID
     // reuse must never authorize destructive recovery.
     return true;
   }
+  return fingerprint.args.includes(resolve(process.argv[1]))
+    && fingerprint.args.includes(mode) && fingerprint.args.includes(root);
 }
 async function reclaimStaleLock(lockPath, mode, root) {
   let owner;
@@ -276,7 +291,7 @@ function normalizeRecovery(value) {
   const record = {
     format: 1,
     targetId: boundedText(value.targetId, 512),
-    hostId: boundedText(value.hostId, 512),
+    routeIdentity: boundedText(value.routeIdentity, 512),
     recoveryIdentity: launchHash(value.recoveryIdentity),
     spawnIdentity: launchHash(value.spawnIdentity),
     runtimeGeneration: Number.isSafeInteger(value.runtimeGeneration) && value.runtimeGeneration >= 0 ? value.runtimeGeneration : fail(),
@@ -301,7 +316,7 @@ function normalizeAuthority(value, processLaunchHash) {
   return {
     format: 1,
     targetId: boundedText(value.targetId, 512),
-    hostId: boundedText(value.hostId, 512),
+    routeIdentity: boundedText(value.routeIdentity, 512),
     recoveryIdentity: launchHash(value.recoveryIdentity),
     spawnIdentity: launchHash(value.spawnIdentity),
     runtimeGeneration: Number.isSafeInteger(value.runtimeGeneration) && value.runtimeGeneration >= 0 ? value.runtimeGeneration : fail(),
@@ -439,7 +454,9 @@ function fingerprintIdentity(value) {
   })).digest("hex");
 }
 async function processFingerprint(pid) {
-  if (process.platform !== "linux" || !Number.isSafeInteger(pid) || pid < 1) return undefined;
+  if (!Number.isSafeInteger(pid) || pid < 1) return undefined;
+  if (process.platform === "win32") return windowsProcessFingerprint(pid);
+  if (process.platform !== "linux") return undefined;
   try {
     const processInfo = await lstat("/proc/" + pid);
     const processStat = await readFile("/proc/" + pid + "/stat");
@@ -468,7 +485,111 @@ async function processFingerprint(pid) {
     return undefined;
   }
 }
+async function trustedWindowsPowerShell() {
+  const systemRoot = process.env.SystemRoot || process.env.WINDIR;
+  if (typeof systemRoot !== "string" || !isAbsolute(systemRoot)) return undefined;
+  const candidate = join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+  try {
+    const [information, canonical] = await Promise.all([lstat(candidate), realpath(candidate)]);
+    if (!information.isFile() || information.isSymbolicLink() || !sameNativePath(canonical, candidate)) return undefined;
+    return canonical;
+  } catch {
+    return undefined;
+  }
+}
+function parseWindowsCommandLine(commandLine) {
+  const argv = [];
+  let offset = 0;
+  while (offset < commandLine.length) {
+    while (offset < commandLine.length && /\s/.test(commandLine[offset])) offset += 1;
+    if (offset >= commandLine.length) break;
+    let value = "";
+    let quoted = false;
+    while (offset < commandLine.length) {
+      let slashes = 0;
+      while (commandLine[offset] === "\\") {
+        slashes += 1;
+        offset += 1;
+      }
+      if (commandLine[offset] === '"') {
+        value += "\\".repeat(Math.floor(slashes / 2));
+        if (slashes % 2 === 1) {
+          value += '"';
+          offset += 1;
+          continue;
+        }
+        if (quoted && commandLine[offset + 1] === '"') {
+          value += '"';
+          offset += 2;
+          continue;
+        }
+        quoted = !quoted;
+        offset += 1;
+        continue;
+      }
+      value += "\\".repeat(slashes);
+      if (offset >= commandLine.length || (!quoted && /\s/.test(commandLine[offset]))) break;
+      value += commandLine[offset];
+      offset += 1;
+    }
+    if (quoted) return [];
+    argv.push(value);
+    while (offset < commandLine.length && /\s/.test(commandLine[offset])) offset += 1;
+  }
+  return argv;
+}
+async function windowsProcessQuery(pid) {
+  const powershell = await trustedWindowsPowerShell();
+  if (powershell === undefined) return undefined;
+  const script = [
+    '$ErrorActionPreference = "Stop"',
+    '$p = Get-CimInstance Win32_Process -Filter "ProcessId = ' + pid + '"',
+    'if ($null -eq $p) { exit 3 }',
+    '$created = if ($null -eq $p.CreationDate) { "" } else { $p.CreationDate.ToUniversalTime().Ticks }',
+    '[pscustomobject]@{ ExecutablePath = [string]$p.ExecutablePath; CommandLine = [string]$p.CommandLine; CreationDate = [string]$created } | ConvertTo-Json -Compress'
+  ].join("\n");
+  try {
+    const result = await execFileAsync(powershell, ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], {
+      encoding: "utf8",
+      windowsHide: true,
+      timeout: 5_000,
+      maxBuffer: 256 * 1024
+    });
+    const value = JSON.parse(result.stdout);
+    if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+    if (
+      typeof value.ExecutablePath !== "string" || value.ExecutablePath.length === 0
+      || typeof value.CommandLine !== "string" || value.CommandLine.length === 0
+      || typeof value.CreationDate !== "string" || !/^[0-9]+$/.test(value.CreationDate)
+    ) return undefined;
+    return value;
+  } catch {
+    return undefined;
+  }
+}
+async function windowsProcessFingerprint(pid) {
+  const value = await windowsProcessQuery(pid);
+  if (value === undefined) return undefined;
+  try {
+    const executable = await realpath(value.ExecutablePath);
+    const args = parseWindowsCommandLine(value.CommandLine);
+    if (args.length === 0 || args.some((entry) => entry.includes("\0"))) return undefined;
+    const commandLine = Buffer.from(args.join("\0") + "\0", "utf8");
+    return {
+      pid,
+      startTicks: value.CreationDate,
+      commandHash: createHash("sha256").update(commandLine).digest("hex"),
+      executableHash: createHash("sha256").update(executable).digest("hex"),
+      executable,
+      uid: 0,
+      args
+    };
+  } catch {
+    return undefined;
+  }
+}
 async function processHasSpawnIdentity(pid, expected) {
+  if (process.platform === "win32") return true;
   try {
     const content = await readFile("/proc/" + pid + "/environ");
     if (content.byteLength > 2 * 1024 * 1024) return false;
@@ -479,11 +600,12 @@ async function processHasSpawnIdentity(pid, expected) {
 }
 async function bootstrapChildMatches(fingerprint, record) {
   if (
-    fingerprint === undefined || fingerprint.uid !== process.getuid?.()
+    fingerprint === undefined || !sameFingerprintOwner(fingerprint)
     || fingerprint.commandHash !== record.childCommandHash
     || fingerprint.executableHash !== record.childExecutableHash
   ) return false;
   try {
+    if (process.platform === "win32") return true;
     const cwd = await realpath("/proc/" + fingerprint.pid + "/cwd");
     return digestBytes(Buffer.from(cwd)) === record.childCwdHash
       && await processHasSpawnIdentity(fingerprint.pid, record.spawnIdentity);
@@ -500,18 +622,18 @@ async function bootstrapOwnerProcess(root, record) {
     const current = await processFingerprint(record.owner.pid);
     if (current === undefined) return undefined;
     if (
-      !fingerprintsMatch(current, record.owner) || current.uid !== process.getuid?.()
+      !fingerprintsMatch(current, record.owner) || !sameFingerprintOwner(current)
       || current.args.length !== expected.length
       || !current.args.every((entry, index) => entry === expected[index])
     ) return undefined;
     return current;
   }
   let found;
-  for (const entry of await readdir("/proc")) {
+  for (const entry of await processIdCandidates()) {
     if (!/^[0-9]+$/.test(entry)) continue;
     const candidate = await processFingerprint(Number(entry));
     if (
-      candidate?.uid === process.getuid?.() && candidate.args.length === expected.length
+      candidate !== undefined && sameFingerprintOwner(candidate) && candidate.args.length === expected.length
       && candidate.args.every((value, index) => value === expected[index])
     ) {
       if (found !== undefined) fail();
@@ -528,7 +650,7 @@ async function bootstrapChildProcess(record) {
     return current;
   }
   let found;
-  for (const entry of await readdir("/proc")) {
+  for (const entry of await processIdCandidates()) {
     if (!/^[0-9]+$/.test(entry)) continue;
     const candidate = await processFingerprint(Number(entry));
     if (await bootstrapChildMatches(candidate, record)) {
@@ -537,6 +659,23 @@ async function bootstrapChildProcess(record) {
     }
   }
   return found;
+}
+async function processIdCandidates() {
+  if (process.platform === "linux") return readdir("/proc");
+  if (process.platform !== "win32") return [];
+  const powershell = await trustedWindowsPowerShell();
+  if (powershell === undefined) return [];
+  try {
+    const result = await execFileAsync(powershell, [
+      "-NoLogo", "-NoProfile", "-NonInteractive", "-Command",
+      "@(Get-CimInstance Win32_Process | ForEach-Object { [string]$_.ProcessId }) | ConvertTo-Json -Compress"
+    ], { encoding: "utf8", windowsHide: true, timeout: 10_000, maxBuffer: 1024 * 1024 });
+    const value = JSON.parse(result.stdout);
+    const entries = Array.isArray(value) ? value : [value];
+    return entries.filter((entry) => typeof entry === "string" && /^[0-9]+$/.test(entry));
+  } catch {
+    return [];
+  }
 }
 async function waitForFingerprint(pid, deadline = Date.now() + START_TIMEOUT_MS) {
   while (Date.now() < deadline) {
@@ -577,10 +716,15 @@ async function closeListeningServer(server) {
 function sameOwner(info) {
   return typeof process.getuid !== "function" || info.uid === process.getuid();
 }
+function sameFingerprintOwner(fingerprint) {
+  return process.platform === "win32"
+    || typeof process.getuid !== "function"
+    || fingerprint.uid === process.getuid();
+}
 async function privateDirectory(path) {
   const info = await lstat(path);
-  if (!info.isDirectory() || info.isSymbolicLink() || (info.mode & 0o077) !== 0 || !sameOwner(info)) fail();
-  if (await realpath(path) !== resolve(path)) fail();
+  if (!info.isDirectory() || info.isSymbolicLink() || !privateMode(info) || !sameOwner(info)) fail();
+  if (!sameNativePath(await realpath(path), path)) fail();
   return resolve(path);
 }
 function sameRegularFileSnapshot(left, right) {
@@ -601,8 +745,8 @@ async function privateRegularFile(path, maximumBytes) {
     if (
       !before.isFile() || !pathBefore.isFile() || pathBefore.isSymbolicLink()
       || !sameRegularFileSnapshot(before, pathBefore) || before.nlink !== 1
-      || (before.mode & 0o077) !== 0 || !sameOwner(before) || before.size > maximumBytes
-      || canonicalBefore !== resolve(path)
+      || !privateMode(before) || !sameOwner(before) || before.size > maximumBytes
+      || !sameNativePath(canonicalBefore, path)
     ) fail();
     const content = await handle.readFile();
     const [after, pathAfter, canonicalAfter] = await Promise.all([handle.stat(), lstat(path), realpath(path)]);
@@ -611,9 +755,9 @@ async function privateRegularFile(path, maximumBytes) {
       || !sameRegularFileSnapshot(before, after)
       || !sameRegularFileSnapshot(pathBefore, pathAfter)
       || !sameRegularFileSnapshot(after, pathAfter)
-      || after.nlink !== 1 || (after.mode & 0o077) !== 0 || !sameOwner(after)
+      || after.nlink !== 1 || !privateMode(after) || !sameOwner(after)
       || after.size > maximumBytes || content.byteLength !== after.size
-      || canonicalAfter !== canonicalBefore || canonicalAfter !== resolve(path)
+      || !sameNativePath(canonicalAfter, canonicalBefore) || !sameNativePath(canonicalAfter, path)
     ) fail();
     return content;
   } finally {
@@ -624,8 +768,8 @@ function safePrivateRegularSnapshot(info, pathInfo, canonical, path, maximumByte
   if (
     !info.isFile() || !pathInfo.isFile() || pathInfo.isSymbolicLink()
     || !sameRegularFileSnapshot(info, pathInfo) || info.nlink !== 1
-    || (info.mode & 0o077) !== 0 || !sameOwner(info) || info.size > maximumBytes
-    || canonical !== resolve(path)
+    || !privateMode(info) || !sameOwner(info) || info.size > maximumBytes
+    || !sameNativePath(canonical, path)
   ) fail();
 }
 async function privateRegularFileSlice(path, maximumFileBytes, offset, maximumReadBytes) {
@@ -647,7 +791,7 @@ async function privateRegularFileSlice(path, maximumFileBytes, offset, maximumRe
     if (
       !sameRegularFileSnapshot(before, after)
       || !sameRegularFileSnapshot(pathBefore, pathAfter)
-      || canonicalAfter !== canonicalBefore
+      || !sameNativePath(canonicalAfter, canonicalBefore)
     ) fail();
     return { content, size: after.size };
   } finally {
@@ -686,7 +830,7 @@ async function privateRegularFileSnapshot(path, maximumFileBytes) {
     if (
       !sameRegularFileSnapshot(before, after)
       || !sameRegularFileSnapshot(pathBefore, pathAfter)
-      || canonicalAfter !== canonicalBefore
+      || !sameNativePath(canonicalAfter, canonicalBefore)
     ) fail();
     return {
       present: true,
@@ -709,9 +853,13 @@ async function privateRegularFileSnapshot(path, maximumFileBytes) {
   }
 }
 async function privateSocket(path) {
+  if (process.platform === "win32") {
+    if (!/^\\\\\.\\pipe\\joko-pi-[a-f0-9]{64}$/.test(path)) fail();
+    return;
+  }
   const info = await lstat(path);
   if (!info.isSocket() || info.isSymbolicLink() || (info.mode & 0o077) !== 0 || !sameOwner(info)) fail();
-  if (await realpath(path) !== resolve(path)) fail();
+  if (!sameNativePath(await realpath(path), path)) fail();
 }
 function sessionPaths(root, sessionIdentity) {
   const sessionsRoot = resolve(join(root, "sessions"));
@@ -730,6 +878,9 @@ function sessionPaths(root, sessionIdentity) {
   };
 }
 function unixSocketPath(parent, name) {
+  if (process.platform === "win32") {
+    return "\\\\.\\pipe\\joko-pi-" + digestBytes(Buffer.from(parent + "\0" + name));
+  }
   const path = join(parent, name);
   if (process.platform === "linux" && Buffer.byteLength(path) > MAX_LINUX_UNIX_SOCKET_PATH_BYTES) fail();
   return path;
@@ -897,7 +1048,7 @@ function authorityBody(session, values = {}) {
   return {
     format: 1,
     targetId: values.targetId === undefined ? session.authority.targetId : values.targetId,
-    hostId: values.hostId === undefined ? session.authority.hostId : values.hostId,
+    routeIdentity: values.routeIdentity === undefined ? session.authority.routeIdentity : values.routeIdentity,
     recoveryIdentity: values.recoveryIdentity === undefined ? session.authority.recoveryIdentity : values.recoveryIdentity,
     spawnIdentity: values.spawnIdentity === undefined ? session.authority.spawnIdentity : values.spawnIdentity,
     runtimeGeneration: values.runtimeGeneration === undefined ? session.authority.runtimeGeneration : values.runtimeGeneration,
@@ -925,7 +1076,7 @@ function currentAuthority(session, values = {}) {
 function sameAuthority(left, right) {
   if (left === undefined || right === undefined) return false;
   for (const name of [
-    "format", "targetId", "hostId", "recoveryIdentity", "spawnIdentity", "runtimeGeneration",
+    "format", "targetId", "routeIdentity", "recoveryIdentity", "spawnIdentity", "runtimeGeneration",
     "compatibilityHash", "trustedRunnerScriptSha256", "identity", "launchHash", "childProcessLaunchHash", "pid",
     "processStartIdentity", "startedAt", "epoch", "issuedAt", "attestation"
   ]) {
@@ -955,7 +1106,7 @@ function verifyManagedRemovalRecovery(session, recovery) {
 }
 function authorityScopeMatches(session, next) {
   return next.targetId === session.authority.targetId
-    && next.hostId === session.authority.hostId
+    && next.routeIdentity === session.authority.routeIdentity
     && next.recoveryIdentity === session.authority.recoveryIdentity
     && next.compatibilityHash === session.authority.compatibilityHash
     && next.trustedRunnerScriptSha256 === session.authority.trustedRunnerScriptSha256;
@@ -984,16 +1135,23 @@ function exactOwnerCommand(fingerprint, root, record) {
     record.ownerLaunchHash,
     record.ownerIdentity
   ];
-  return fingerprint.args.length === expected.length && fingerprint.args.every((entry, index) => entry === expected[index]);
+  return exactProcessArguments(fingerprint.args, expected);
 }
 function exactChildCommand(fingerprint, request, executable = request.executable) {
   const expected = [executable, ...request.args];
-  return fingerprint.args.length === expected.length && fingerprint.args.every((entry, index) => entry === expected[index]);
+  return exactProcessArguments(fingerprint.args, expected);
 }
 function exactJanitorCommand(fingerprint, root, record) {
   const expected = [resolve(process.execPath), ...janitorArguments(root, record)];
-  return fingerprint.args.length === expected.length
-    && fingerprint.args.every((entry, index) => entry === expected[index]);
+  return exactProcessArguments(fingerprint.args, expected);
+}
+function exactProcessArguments(actual, expected) {
+  return actual.length === expected.length && actual.every((entry, index) => {
+    const wanted = expected[index];
+    return process.platform === "win32" && index < 2 && isAbsolute(entry) && isAbsolute(wanted)
+      ? sameNativePath(entry, wanted)
+      : entry === wanted;
+  });
 }
 async function inspectLiveOwner(root, sessionIdentity) {
   const paths = sessionPaths(root, sessionIdentity);
@@ -1258,7 +1416,7 @@ function janitorArguments(root, record) {
 }
 function safeDaemonEnvironment() {
   const environment = { JOKO_REMOTE_BROKER_SOURCE_HASH: SOURCE_HASH };
-  for (const name of ["PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LC_ALL", "TMPDIR", "TMP", "TEMP"]) {
+  for (const name of ["PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LC_ALL", "TMPDIR", "TMP", "TEMP", "SystemRoot", "WINDIR"]) {
     if (typeof process.env[name] === "string") environment[name] = process.env[name];
   }
   return environment;
@@ -1293,7 +1451,7 @@ async function removeManagedRuntime(root, runtimeRoot) {
   if (!contained(dirname(root), runtimeRoot)) fail();
   const info = await lstat(runtimeRoot);
   if (!info.isDirectory() || info.isSymbolicLink() || !sameOwner(info)) fail();
-  if (await realpath(runtimeRoot) !== resolve(runtimeRoot)) fail();
+  if (!sameNativePath(await realpath(runtimeRoot), runtimeRoot)) fail();
   await rm(runtimeRoot, { recursive: true });
 }
 async function recoverDeadOwner(root, sessionIdentity) {
@@ -1363,7 +1521,7 @@ async function spawnBootstrapSentinel(root, record) {
 }
 async function runBootstrapSentinel(root, expectedIdentity, expectedHash, expectedOwnerIdentity) {
   const canonicalRoot = await secureDirectory(root);
-  if (process.platform !== "linux") fail();
+  if (!(["linux", "win32"].includes(process.platform))) fail();
   const paths = sessionPaths(canonicalRoot, expectedIdentity);
   for (;;) {
     const record = await readBootstrapRecord(paths, expectedIdentity);
@@ -1531,10 +1689,11 @@ function hasNativeAuthReferences(session) {
   return session.nativeAuthGenerations.size > 0 || session.nativeAuthReservations.size > 0;
 }
 async function trustedExecutable(path) {
-  if (typeof path !== "string" || !isAbsolute(path) || resolve(path) !== path) fail();
+  if (typeof path !== "string" || !isAbsolute(path) || !sameNativePath(resolve(path), path)) fail();
   const info = await lstat(path);
-  if (!info.isFile() || info.isSymbolicLink() || await realpath(path) !== path) fail();
-  return path;
+  const canonical = await realpath(path);
+  if (!info.isFile() || info.isSymbolicLink() || !sameNativePath(canonical, path)) fail();
+  return canonical;
 }
 async function managedChildExecutable(value) {
   const nodeExecutable = await trustedExecutable(await realpath(process.execPath));
@@ -1545,7 +1704,7 @@ async function managedChildExecutable(value) {
   return executable;
 }
 async function remoteRunnerAttestation(session, value, action, routeGeneration, runnerPid, currentBearer) {
-  if (process.platform !== "linux") fail();
+  if (!(["linux", "win32"].includes(process.platform))) fail();
   const productSessionId = boundedText(session.env.JOKO_PI_PRODUCT_SESSION_ID, 512);
   const targetId = boundedText(value.targetId, 512);
   const providerId = boundedText(value.providerId, 128);
@@ -1613,16 +1772,19 @@ async function remoteRunnerAttestation(session, value, action, routeGeneration, 
   const fingerprint = await processFingerprint(runnerPid);
   const expectedArgs = [nodeExecutable, runnerScript, configPath];
   if (
-    fingerprint === undefined || fingerprint.uid !== process.getuid?.() || fingerprint.executable !== nodeExecutable
+    fingerprint === undefined || !sameFingerprintOwner(fingerprint) || !sameNativePath(fingerprint.executable, nodeExecutable)
     || fingerprint.args.length !== expectedArgs.length
-    || !fingerprint.args.every((entry, index) => entry === expectedArgs[index])
+    || !fingerprint.args.every((entry, index) => index === 0
+      ? sameNativePath(entry, expectedArgs[index]) : entry === expectedArgs[index])
   ) fail();
-  const bootId = (await readFile("/proc/sys/kernel/random/boot_id", "utf8")).trim();
-  if (!exactUuid(bootId)) fail();
+  const bootId = process.platform === "linux"
+    ? (await readFile("/proc/sys/kernel/random/boot_id", "utf8")).trim()
+    : "windows-process-creation-ticks";
+  if (process.platform === "linux" && !exactUuid(bootId)) fail();
   const confirmed = await processFingerprint(runnerPid);
-  if (!fingerprintsMatch(confirmed, fingerprint) || confirmed.executable !== nodeExecutable) fail();
+  if (!fingerprintsMatch(confirmed, fingerprint) || !sameNativePath(confirmed.executable, nodeExecutable)) fail();
   const processIdentity = digestBytes(Buffer.from(JSON.stringify([
-    "linux", bootId, runnerPid, fingerprint.startTicks, nodeExecutable
+    process.platform, bootId, runnerPid, fingerprint.startTicks, nodeExecutable
   ])));
   const bindingDigest = digestBytes(Buffer.from(JSON.stringify([
     "joko.pi-native-auth.remote-runner.binding.v1",
@@ -1874,9 +2036,10 @@ async function inspectManagedRun(session, sessionId, runId) {
     if (candidate !== undefined) {
       const expectedArgs = [session.nodeExecutable, runnerScript, configPath];
       if (
-        candidate.uid !== process.getuid?.() || candidate.executable !== session.nodeExecutable
+        !sameFingerprintOwner(candidate) || !sameNativePath(candidate.executable, session.nodeExecutable)
         || candidate.args.length !== expectedArgs.length
-        || !candidate.args.every((entry, index) => entry === expectedArgs[index])
+        || !candidate.args.every((entry, index) => index === 0
+          ? sameNativePath(entry, expectedArgs[index]) : entry === expectedArgs[index])
       ) fail();
       const confirmed = await processFingerprint(status.runnerPid);
       if (!fingerprintsMatch(confirmed, candidate)) fail();
@@ -2045,9 +2208,9 @@ async function readManagedArtifactSnapshot(snapshot, offset, maximumReadBytes) {
     if (
       !before.isFile() || !pathBefore.isFile() || pathBefore.isSymbolicLink()
       || !sameOpenFileIdentity(before, snapshot) || !sameOpenFileIdentity(pathBefore, snapshot)
-      || before.nlink !== 1 || (before.mode & 0o077) !== 0 || !sameOwner(before)
+      || before.nlink !== 1 || !privateMode(before) || !sameOwner(before)
       || before.size < snapshot.size || before.size > snapshot.maximumFileBytes
-      || canonicalBefore !== resolve(snapshot.path) || offset > snapshot.size
+      || !sameNativePath(canonicalBefore, snapshot.path) || offset > snapshot.size
     ) fail();
     const length = Math.min(maximumReadBytes, snapshot.size - offset);
     const content = Buffer.allocUnsafe(length);
@@ -2081,9 +2244,9 @@ async function readManagedArtifactSnapshot(snapshot, offset, maximumReadBytes) {
     if (
       !after.isFile() || !pathAfter.isFile() || pathAfter.isSymbolicLink()
       || !sameOpenFileIdentity(after, snapshot) || !sameOpenFileIdentity(pathAfter, snapshot)
-      || after.nlink !== 1 || (after.mode & 0o077) !== 0 || !sameOwner(after)
+      || after.nlink !== 1 || !privateMode(after) || !sameOwner(after)
       || after.size < snapshot.size || after.size > snapshot.maximumFileBytes
-      || canonicalAfter !== canonicalBefore || canonicalAfter !== resolve(snapshot.path)
+      || !sameNativePath(canonicalAfter, canonicalBefore) || !sameNativePath(canonicalAfter, snapshot.path)
     ) fail();
     return { content, size: snapshot.size };
   } finally {
@@ -2583,7 +2746,7 @@ async function rewrittenRelayRequest(parsed, body, session, relayAuthority) {
           routeGeneration = value.generation;
         }
         outboundGeneration = routeGeneration;
-        const attestation = process.platform === "linux"
+        const attestation = process.platform === "linux" || process.platform === "win32"
           ? await remoteRunnerAttestation(
               session,
               value,
@@ -3046,12 +3209,12 @@ async function runSessionOwner(root, request, ownerIdentity) {
       socketServer.once("error", rejectListen);
       socketServer.listen(paths.socketPath, resolveListen);
     });
-    await chmod(paths.socketPath, 0o600);
+    if (process.platform !== "win32") await chmod(paths.socketPath, 0o600);
     await new Promise((resolveListen, rejectListen) => {
       controlServer.once("error", rejectListen);
       controlServer.listen(paths.controlSocketPath, resolveListen);
     });
-    await chmod(paths.controlSocketPath, 0o600);
+    if (process.platform !== "win32") await chmod(paths.controlSocketPath, 0o600);
     const ownerFingerprintFull = await waitForFingerprint(process.pid);
     const ownerFingerprint = {
       pid: ownerFingerprintFull.pid,
@@ -3312,7 +3475,7 @@ async function runSessionOwner(root, request, ownerIdentity) {
     if (
       replacement.identity !== session.identity
       || replacement.authority.targetId !== session.authority.targetId
-      || replacement.authority.hostId !== session.authority.hostId
+      || replacement.authority.routeIdentity !== session.authority.routeIdentity
       || replacement.authority.recoveryIdentity !== session.authority.recoveryIdentity
       || replacement.authority.compatibilityHash !== session.authority.compatibilityHash
       || replacement.authority.trustedRunnerScriptSha256 !== session.authority.trustedRunnerScriptSha256
@@ -3629,7 +3792,7 @@ async function runSessionOwner(root, request, ownerIdentity) {
             const issuedAt = Date.now();
             const values = {
               targetId: nextAuthority.targetId,
-              hostId: nextAuthority.hostId,
+              routeIdentity: nextAuthority.routeIdentity,
               recoveryIdentity: nextAuthority.recoveryIdentity,
               spawnIdentity: nextAuthority.spawnIdentity,
               runtimeGeneration: nextAuthority.runtimeGeneration,
@@ -3831,7 +3994,7 @@ async function reapManagedRunnersAfterOwnerLoss(record) {
 }
 async function runJanitor(root, expectedIdentity, expectedHash, expectedOwnerIdentity, values) {
   const canonicalRoot = await secureDirectory(root);
-  if (process.platform !== "linux" || values.length !== 14) fail();
+  if (!(["linux", "win32"].includes(process.platform)) || values.length !== 14) fail();
   const paths = sessionPaths(canonicalRoot, expectedIdentity);
   const owner = {
     pid: positiveInteger(Number(values[0])),
@@ -3906,7 +4069,7 @@ async function runJanitor(root, expectedIdentity, expectedHash, expectedOwnerIde
 }
 async function runBootstrapReaper(root, expectedIdentity, expectedHash, expectedOwnerIdentity, values) {
   const canonicalRoot = await secureDirectory(root);
-  if (process.platform !== "linux" || values.length !== 4) fail();
+  if (!(["linux", "win32"].includes(process.platform)) || values.length !== 4) fail();
   const paths = sessionPaths(canonicalRoot, expectedIdentity);
   const record = await readBootstrapRecord(paths, expectedIdentity);
   if (record.launchHash !== expectedHash || record.ownerIdentity !== expectedOwnerIdentity) fail();
@@ -3923,9 +4086,7 @@ async function runBootstrapReaper(root, expectedIdentity, expectedHash, expected
   if (!(await stopExactProcess(child, "SIGTERM"))) fail();
 }
 async function spawnOwner(root, request, rawRequest) {
-  if (process.platform !== "linux") {
-    throw new Error("Remote Pi crash recovery requires Linux process identity.");
-  }
+  if (!(["linux", "win32"].includes(process.platform))) fail();
   const paths = sessionPaths(root, request.identity);
   await mkdir(paths.sessionRoot, { mode: 0o700 });
   await privateDirectory(paths.sessionRoot);
@@ -3993,12 +4154,14 @@ async function runDaemon(managedRoot) {
     if (!(await reclaimStaleLock(daemonLock, "daemon", root)) || !(await acquireProcessLock(daemonLock, daemonOwner))) fail();
   }
   await secureDirectory(join(root, "sessions"));
-  try {
-    const info = await lstat(managerSocket);
-    if (!info.isSocket() || info.isSymbolicLink()) fail();
-    await rm(managerSocket);
-  } catch (error) {
-    if (!error || error.code !== "ENOENT") throw error;
+  if (process.platform !== "win32") {
+    try {
+      const info = await lstat(managerSocket);
+      if (!info.isSocket() || info.isSymbolicLink()) fail();
+      await rm(managerSocket);
+    } catch (error) {
+      if (!error || error.code !== "ENOENT") throw error;
+    }
   }
   const operations = new Map();
   const serialize = (key, operation) => {
@@ -4179,7 +4342,7 @@ async function runDaemon(managedRoot) {
     manager.once("error", rejectListen);
     manager.listen(managerSocket, resolveListen);
   });
-  await chmod(managerSocket, 0o600);
+  if (process.platform !== "win32") await chmod(managerSocket, 0o600);
   await atomicJson(join(root, "broker.json"), {
     version: VERSION,
     sourceHash: SOURCE_HASH,
@@ -4213,7 +4376,7 @@ async function connectManager(root, recoveryAttempt = 0) {
     }
     if (ownsLock) {
       const daemonEnvironment = { JOKO_REMOTE_BROKER_SOURCE_HASH: SOURCE_HASH };
-      for (const name of ["PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LC_ALL", "TMPDIR", "TMP", "TEMP"]) {
+      for (const name of ["PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LC_ALL", "TMPDIR", "TMP", "TEMP", "SystemRoot", "WINDIR"]) {
         if (typeof process.env[name] === "string") daemonEnvironment[name] = process.env[name];
       }
       const child = spawn(process.execPath, [process.argv[1], "daemon", root], { detached: true, stdio: "ignore", env: daemonEnvironment });

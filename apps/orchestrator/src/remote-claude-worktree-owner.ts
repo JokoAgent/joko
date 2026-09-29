@@ -1,32 +1,35 @@
-import { createHash } from "node:crypto";
-import { posix as remotePath } from "node:path";
+import { posix, win32 } from "node:path";
 
 import type { SessionWorktreeBinding } from "@joko/core";
+import { DEVICE_PEER_RUNTIME_EXECUTABLES } from "@joko/device-peer";
 import {
   RemoteGitCheckoutError,
   RemoteGitCheckoutService,
   type RemoteGitCheckoutAuthority,
+  type RemoteGitCheckoutExecutionOptions,
   type RemoteGitCheckoutInspection,
   type RemoteGitCheckoutLease,
-  type RemoteGitCheckoutPlan
+  type RemoteGitCheckoutPlan,
+  type RemoteProcessTransportPort,
+  type RemoteSshExecutionResult
 } from "@joko/remote-ssh";
-import type { OperationalStore, RemoteHostRecord, StoredTarget } from "@joko/store";
+import type { OperationalStore, StoredTarget } from "@joko/store";
 
-import { probeRemoteClaudeInstallation } from "./remote-claude-installation.js";
-import type { RemoteHostRegistry } from "./remote-host-registry.js";
+import { devicePeerClaudeInstallation, probeRemoteClaudeInstallation } from "./remote-claude-installation.js";
+import type { RemoteExecutionRouter } from "./remote-execution-router.js";
 
 /** Adapter-side remote checkout owner. The Target retains its source remote
  * binding; a Session worktree carries the effective POSIX cwd separately. */
 export class RemoteClaudeWorktreeOwner {
   readonly #store: Pick<OperationalStore, "getTarget">;
-  readonly #registry: Pick<RemoteHostRegistry, "captureProcessAuthority" | "execute">;
+  readonly #remoteExecution: Pick<RemoteExecutionRouter, "processes">;
 
   constructor(options: {
     readonly store: Pick<OperationalStore, "getTarget">;
-    readonly registry: Pick<RemoteHostRegistry, "captureProcessAuthority" | "execute">;
+    readonly remoteExecution: Pick<RemoteExecutionRouter, "processes">;
   }) {
     this.#store = options.store;
-    this.#registry = options.registry;
+    this.#remoteExecution = options.remoteExecution;
   }
 
   async plan(input: {
@@ -58,9 +61,6 @@ export class RemoteClaudeWorktreeOwner {
 
   async derive(plan: RemoteGitCheckoutPlan, signal?: AbortSignal): Promise<RemoteGitCheckoutLease> {
     const captured = await this.#captureFor(plan.remote, signal);
-    if (captured.authority.hostRevision !== plan.authority.hostRevision) {
-      throw new RemoteGitCheckoutError("AUTHORITY_CHANGED");
-    }
     return captured.service.derive(plan, signal);
   }
 
@@ -103,48 +103,40 @@ export class RemoteClaudeWorktreeOwner {
     if (remote === undefined || !target.descriptor.trusted || !target.descriptor.managed) {
       throw new RemoteGitCheckoutError("AUTHORITY_CHANGED");
     }
-    const captured = await this.#registry.captureProcessAuthority(remote.hostTargetId, remote.hostId, signal);
+    const captured = await this.#remoteExecution.processes(remote, signal);
     captured.assertCurrent();
-    if (captured.host.status.state !== "ready" || captured.host.trust === undefined
-      || captured.host.ownerId.length === 0 || captured.host.targetId !== remote.hostTargetId) {
-      throw new RemoteGitCheckoutError("AUTHORITY_CHANGED");
-    }
-    const processes = captured.lease.processes;
-    if (captured.lease.capabilities.processStreaming !== true || processes === undefined) {
-      throw new RemoteGitCheckoutError("UNAVAILABLE");
-    }
-    const installation = await probeRemoteClaudeInstallation(
-      processes, remote.workspaceRoot, captured.assertCurrent, signal
-    );
+    const remotePath = captured.pathStyle === "win32" ? win32 : posix;
+    const processes = captured.processes;
+    const installation = captured.kind === "device_peer"
+      ? await devicePeerClaudeInstallation(remote.workspaceRoot, captured.pathStyle)
+      : await probeRemoteClaudeInstallation(processes, remote.workspaceRoot, captured.assertCurrent, signal);
     captured.assertCurrent();
     if (installation.state !== "ready" || installation.workspaceRoot !== remote.workspaceRoot) {
       throw new RemoteGitCheckoutError("UNAVAILABLE");
     }
-    const identity = hostIdentity(captured.host);
     const authority: RemoteGitCheckoutAuthority = Object.freeze({
-      hostOwnerId: captured.host.ownerId,
-      hostTargetId: remote.hostTargetId,
-      hostId: remote.hostId,
-      hostIdentity: identity,
       targetId: target.descriptor.id,
-      targetRevision: target.revision.toString(),
-      hostRevision: captured.hostRevision.toString()
+      binding: remote,
+      executionIdentity: captured.executionIdentity,
+      targetRevision: target.revision.toString()
     });
     const assertCurrent = (): void => {
       captured.assertCurrent();
       const current = this.#store.getTarget(target.descriptor.id);
+      const currentRemote = current.descriptor.remoteWorkspace;
       if (current.revision !== target.revision
         || current.descriptor.backendId !== target.descriptor.backendId
-        || current.descriptor.remoteWorkspace?.hostTargetId !== remote.hostTargetId
-        || current.descriptor.remoteWorkspace?.hostId !== remote.hostId
-        || current.descriptor.remoteWorkspace?.workspaceRoot !== remote.workspaceRoot) {
+        || currentRemote === undefined || !sameBinding(currentRemote, remote)) {
         throw new RemoteGitCheckoutError("AUTHORITY_CHANGED");
       }
     };
     assertCurrent();
     const service = new RemoteGitCheckoutService({
       storageRoot: remotePath.join(installation.runtimeRoot, "worktrees"),
-      nodeExecutable: installation.nodeExecutable,
+      nodeExecutable: installation.runtimeEntrypoint === "device_peer"
+        ? DEVICE_PEER_RUNTIME_EXECUTABLES.node
+        : installation.nodeExecutable,
+      pathStyle: captured.pathStyle,
       assertCurrent: (expected) => {
         assertCurrent();
         if (!sameStableAuthority(authority, expected)
@@ -154,12 +146,9 @@ export class RemoteClaudeWorktreeOwner {
       },
       execute: async (options) => {
         assertCurrent();
-        const outcome = await this.#registry.execute(remote.hostTargetId, remote.hostId, options);
+        const outcome = await executeRemoteProcess(processes, remote.workspaceRoot, options);
         assertCurrent();
-        if (hostIdentity(outcome.host) !== identity || outcome.host.ownerId !== authority.hostOwnerId) {
-          throw new RemoteGitCheckoutError("AUTHORITY_CHANGED", true);
-        }
-        return outcome.result;
+        return outcome;
       }
     });
     return { authority, service };
@@ -208,20 +197,71 @@ export function remoteBindingFromLease(workspaceId: string, lease: RemoteGitChec
 }
 
 function sameStableAuthority(left: RemoteGitCheckoutAuthority, right: RemoteGitCheckoutAuthority): boolean {
-  return left.hostOwnerId === right.hostOwnerId
-    && left.hostTargetId === right.hostTargetId
-    && left.hostId === right.hostId
-    && left.hostIdentity === right.hostIdentity
-    && left.targetId === right.targetId;
+  return left.targetId === right.targetId
+    && left.executionIdentity === right.executionIdentity
+    && sameBinding(left.binding, right.binding);
 }
 
-function hostIdentity(host: RemoteHostRecord): string {
-  if (host.trust === undefined) throw new RemoteGitCheckoutError("AUTHORITY_CHANGED");
-  return `sha256:${createHash("sha256").update(JSON.stringify({
-    hostname: host.hostname,
-    port: host.port,
-    user: host.user,
-    algorithm: host.trust.algorithm,
-    fingerprint: host.trust.fingerprint
-  }), "utf8").digest("hex")}`;
+function sameBinding(
+  left: RemoteGitCheckoutAuthority["binding"],
+  right: RemoteGitCheckoutAuthority["binding"]
+): boolean {
+  return left.kind === right.kind && JSON.stringify(left) === JSON.stringify(right);
+}
+
+async function executeRemoteProcess(
+  processes: RemoteProcessTransportPort,
+  workspaceRoot: string,
+  options: RemoteGitCheckoutExecutionOptions
+): Promise<RemoteSshExecutionResult> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), options.timeoutMs ?? 120_000);
+  timeout.unref?.();
+  const abort = (): void => controller.abort();
+  options.signal?.addEventListener("abort", abort, { once: true });
+  try {
+    const handle = await processes.open({
+      executable: options.executable,
+      args: [...options.args],
+      cwd: options.cwd ?? workspaceRoot,
+      signal: controller.signal
+    });
+    const stdout: Buffer[] = [];
+    const stderr: Buffer[] = [];
+    let stdoutBytes = 0;
+    let stderrBytes = 0;
+    let outputCapped = false;
+    const maximumBytes = 1024 * 1024;
+    const collect = (target: Buffer[], stream: "stdout" | "stderr") => (chunk: Buffer | string): void => {
+      const value = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk, "utf8");
+      const current = stream === "stdout" ? stdoutBytes : stderrBytes;
+      const accepted = Math.max(0, Math.min(value.byteLength, maximumBytes - current));
+      if (accepted > 0) target.push(value.subarray(0, accepted));
+      if (stream === "stdout") stdoutBytes += accepted;
+      else stderrBytes += accepted;
+      if (accepted < value.byteLength) {
+        outputCapped = true;
+        controller.abort();
+        handle.kill("SIGKILL");
+      }
+    };
+    handle.stdout.on("data", collect(stdout, "stdout"));
+    handle.stderr.on("data", collect(stderr, "stderr"));
+    return await new Promise<RemoteSshExecutionResult>((resolve, reject) => {
+      const fail = (error: Error): void => reject(error);
+      handle.once("error", fail);
+      handle.once("exit", (code, signalCode) => resolve({
+        stdout: Buffer.concat(stdout).toString("utf8"),
+        stderr: Buffer.concat(stderr).toString("utf8"),
+        exitCode: code,
+        ...(signalCode === null ? {} : { signal: signalCode }),
+        outputCapped
+      }));
+      if (options.input === undefined) handle.stdin.end();
+      else handle.stdin.end(options.input, "utf8");
+    });
+  } finally {
+    clearTimeout(timeout);
+    options.signal?.removeEventListener("abort", abort);
+  }
 }

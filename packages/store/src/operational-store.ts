@@ -9,7 +9,7 @@ import {
   statSync,
   writeFileSync
 } from "node:fs";
-import path from "node:path";
+import path, { type PlatformPath } from "node:path";
 import { backup, DatabaseSync } from "node:sqlite";
 import * as sqliteVec from "sqlite-vec";
 
@@ -23,6 +23,7 @@ import type {
   PromptInput,
   PublicError,
   QueueState,
+  RemoteWorkspaceBinding,
   RunDescriptor,
   RunState,
   NativeSessionBinding,
@@ -141,6 +142,13 @@ import type {
   LocalRuntimeOwnerRecord,
   LocalRuntimeOwnerScope,
   LocalRuntimeProviderBindingRecord,
+  MaintenanceEffectKind,
+  MaintenanceEffectRecord,
+  MaintenanceEffectState,
+  MaintenanceJobRecord,
+  MaintenanceJobStatus,
+  MaintenanceKind,
+  MaintenanceScanRecord,
   MakerMemoryEntry,
   MakerMemoryKind,
   MakerMemorySearchHit,
@@ -229,6 +237,8 @@ import type {
   SetMessagingConnectionEnabledInput,
   SessionLifecycleCleanupPhase,
   SessionLifecycleCleanupRecord,
+  NativeCatalogAdoptionRecord,
+  PortableReplacementCleanupRecord,
   SessionSnapshot,
   SessionAttentionRecord,
   SessionRuntimePolicyRecord,
@@ -804,6 +814,263 @@ export class OperationalStore {
     };
   }
 
+  createMaintenanceScan<T>(input: {
+    readonly id: string;
+    readonly kind: MaintenanceKind;
+    readonly fingerprint?: string;
+    readonly payload: T;
+    readonly expiresAt: number;
+    readonly createdAt?: number;
+  }): MaintenanceScanRecord<T> {
+    const id = maintenanceIdentity(input.id, "Maintenance scan ID");
+    const kind = maintenanceKind(input.kind);
+    const fingerprint = input.fingerprint === undefined
+      ? undefined
+      : maintenanceIdentity(input.fingerprint, "Maintenance scan fingerprint");
+    const createdAt = safeNonNegativeInteger(input.createdAt ?? this.now(), "Maintenance scan creation time");
+    const expiresAt = safeNonNegativeInteger(input.expiresAt, "Maintenance scan expiration time");
+    if (expiresAt <= createdAt) throw new StoreError("Maintenance scan expiration must follow creation.");
+    return this.write(() => {
+      this.database.prepare(`
+        INSERT INTO maintenance_scans(
+          id, kind, fingerprint, state, payload_json, expires_at, created_at, updated_at
+        ) VALUES (?, ?, ?, 'available', ?, ?, ?, ?)
+      `).run(
+        id,
+        kind,
+        fingerprint ?? null,
+        serializeJson(input.payload),
+        expiresAt,
+        createdAt,
+        createdAt
+      );
+      return this.getMaintenanceScan<T>(kind, id);
+    });
+  }
+
+  getMaintenanceScan<T = unknown>(kind: MaintenanceKind, id: string): MaintenanceScanRecord<T> {
+    const record = this.findMaintenanceScan<T>(kind, id);
+    if (record === undefined) throw new NotFoundError("Maintenance scan", id);
+    return record;
+  }
+
+  findMaintenanceScan<T = unknown>(kind: MaintenanceKind, id: string): MaintenanceScanRecord<T> | undefined {
+    this.assertOpen();
+    const row = this.database.prepare(`
+      SELECT * FROM maintenance_scans WHERE kind = ? AND id = ?
+    `).get(maintenanceKind(kind), maintenanceIdentity(id, "Maintenance scan ID")) as Row | undefined;
+    return row === undefined ? undefined : maintenanceScanFromRow<T>(row);
+  }
+
+  claimMaintenanceScan<T = unknown>(kind: MaintenanceKind, id: string, at = this.now()): MaintenanceScanRecord<T> | undefined {
+    const normalizedKind = maintenanceKind(kind);
+    const normalizedId = maintenanceIdentity(id, "Maintenance scan ID");
+    const claimedAt = safeNonNegativeInteger(at, "Maintenance scan claim time");
+    return this.write(() => {
+      const current = this.findMaintenanceScan<T>(normalizedKind, normalizedId);
+      if (current === undefined) return undefined;
+      if (current.state === "claimed") return current;
+      if (current.state !== "available" || current.expiresAt <= claimedAt) {
+        this.database.prepare(`
+          UPDATE maintenance_scans SET state = 'expired', updated_at = ?
+          WHERE kind = ? AND id = ? AND state = 'available'
+        `).run(claimedAt, normalizedKind, normalizedId);
+        return undefined;
+      }
+      this.database.prepare(`
+        UPDATE maintenance_scans SET state = 'claimed', updated_at = ?
+        WHERE kind = ? AND id = ? AND state = 'available'
+      `).run(claimedAt, normalizedKind, normalizedId);
+      return this.getMaintenanceScan<T>(normalizedKind, normalizedId);
+    });
+  }
+
+  createMaintenanceJob<TPayload, TResult = unknown>(input: {
+    readonly id: string;
+    readonly kind: MaintenanceKind;
+    readonly scanId: string;
+    readonly phase: string;
+    readonly percent: number;
+    readonly cancellable: boolean;
+    readonly payload: TPayload;
+    readonly effects?: readonly {
+      readonly id: string;
+      readonly kind: MaintenanceEffectKind;
+      readonly state?: MaintenanceEffectState;
+      readonly payload: unknown;
+    }[];
+    readonly createdAt?: number;
+  }): MaintenanceJobRecord<TPayload, TResult> {
+    const id = maintenanceIdentity(input.id, "Maintenance job ID");
+    const kind = maintenanceKind(input.kind);
+    const scanId = maintenanceIdentity(input.scanId, "Maintenance scan ID");
+    const phase = maintenancePhase(input.phase);
+    const percent = maintenancePercent(input.percent);
+    const createdAt = safeNonNegativeInteger(input.createdAt ?? this.now(), "Maintenance job creation time");
+    return this.write(() => {
+      const scan = this.getMaintenanceScan(kind, scanId);
+      if (scan.state !== "claimed") throw new StoreError("Maintenance job requires a claimed scan.");
+      this.database.prepare(`
+        INSERT INTO maintenance_jobs(
+          id, kind, scan_id, status, phase, percent, cancellable, cancel_requested,
+          payload_json, result_json, created_at, updated_at
+        ) VALUES (?, ?, ?, 'running', ?, ?, ?, 0, ?, NULL, ?, ?)
+      `).run(
+        id,
+        kind,
+        scanId,
+        phase,
+        percent,
+        input.cancellable ? 1 : 0,
+        serializeJson(input.payload),
+        createdAt,
+        createdAt
+      );
+      for (const effect of input.effects ?? []) {
+        this.database.prepare(`
+          INSERT INTO maintenance_effects(job_id, id, kind, state, payload_json, updated_at)
+          VALUES (?, ?, ?, ?, ?, ?)
+        `).run(
+          id,
+          maintenanceIdentity(effect.id, "Maintenance effect ID"),
+          maintenanceEffectKind(effect.kind),
+          maintenanceEffectState(effect.state ?? "pending"),
+          serializeJson(effect.payload),
+          createdAt
+        );
+      }
+      return this.getMaintenanceJob<TPayload, TResult>(kind, id);
+    });
+  }
+
+  getMaintenanceJob<TPayload = unknown, TResult = unknown>(
+    kind: MaintenanceKind,
+    id: string
+  ): MaintenanceJobRecord<TPayload, TResult> {
+    const record = this.findMaintenanceJob<TPayload, TResult>(kind, id);
+    if (record === undefined) throw new NotFoundError("Maintenance job", id);
+    return record;
+  }
+
+  findMaintenanceJob<TPayload = unknown, TResult = unknown>(
+    kind: MaintenanceKind,
+    id: string
+  ): MaintenanceJobRecord<TPayload, TResult> | undefined {
+    this.assertOpen();
+    const row = this.database.prepare(`
+      SELECT * FROM maintenance_jobs WHERE kind = ? AND id = ?
+    `).get(maintenanceKind(kind), maintenanceIdentity(id, "Maintenance job ID")) as Row | undefined;
+    return row === undefined ? undefined : maintenanceJobFromRow<TPayload, TResult>(row);
+  }
+
+  listMaintenanceJobs<TPayload = unknown, TResult = unknown>(input: {
+    readonly kind: MaintenanceKind;
+    readonly statuses?: readonly MaintenanceJobStatus[];
+    readonly limit?: number;
+  }): MaintenanceJobRecord<TPayload, TResult>[] {
+    this.assertOpen();
+    const kind = maintenanceKind(input.kind);
+    const statuses = input.statuses?.map(maintenanceJobStatus);
+    if (statuses?.length === 0) return [];
+    const limit = boundedLimit(input.limit ?? 32, 1, 256, "Maintenance job limit");
+    const where = statuses === undefined ? "kind = ?" : `kind = ? AND status IN (${statuses.map(() => "?").join(", ")})`;
+    return (this.database.prepare(`
+      SELECT * FROM maintenance_jobs WHERE ${where}
+      ORDER BY updated_at DESC, id LIMIT ?
+    `).all(kind, ...(statuses ?? []), limit) as Row[]).map(maintenanceJobFromRow<TPayload, TResult>);
+  }
+
+  updateMaintenanceJob<TPayload = unknown, TResult = unknown>(input: {
+    readonly kind: MaintenanceKind;
+    readonly id: string;
+    readonly status: MaintenanceJobStatus;
+    readonly phase: string;
+    readonly percent: number;
+    readonly cancellable: boolean;
+    readonly cancelRequested: boolean;
+    readonly payload: TPayload;
+    readonly result?: TResult;
+    readonly updatedAt?: number;
+  }): MaintenanceJobRecord<TPayload, TResult> {
+    const kind = maintenanceKind(input.kind);
+    const id = maintenanceIdentity(input.id, "Maintenance job ID");
+    const status = maintenanceJobStatus(input.status);
+    const phase = maintenancePhase(input.phase);
+    const percent = maintenancePercent(input.percent);
+    const updatedAt = safeNonNegativeInteger(input.updatedAt ?? this.now(), "Maintenance job update time");
+    return this.maintenanceWrite(() => {
+      const current = this.getMaintenanceJob(kind, id);
+      if (updatedAt < current.createdAt) throw new StoreError("Maintenance job update precedes creation.");
+      this.database.prepare(`
+        UPDATE maintenance_jobs
+        SET status = ?, phase = ?, percent = ?, cancellable = ?, cancel_requested = ?,
+            payload_json = ?, result_json = ?, updated_at = ?
+        WHERE kind = ? AND id = ?
+      `).run(
+        status,
+        phase,
+        percent,
+        input.cancellable ? 1 : 0,
+        input.cancelRequested ? 1 : 0,
+        serializeJson(input.payload),
+        input.result === undefined ? null : serializeJson(input.result),
+        updatedAt,
+        kind,
+        id
+      );
+      return this.getMaintenanceJob<TPayload, TResult>(kind, id);
+    });
+  }
+
+  requestMaintenanceCancellation(kind: MaintenanceKind, id: string, at = this.now()): MaintenanceJobRecord {
+    const normalizedKind = maintenanceKind(kind);
+    const normalizedId = maintenanceIdentity(id, "Maintenance job ID");
+    const updatedAt = safeNonNegativeInteger(at, "Maintenance cancellation time");
+    return this.maintenanceWrite(() => {
+      this.getMaintenanceJob(normalizedKind, normalizedId);
+      this.database.prepare(`
+        UPDATE maintenance_jobs SET cancel_requested = 1, updated_at = ?
+        WHERE kind = ? AND id = ? AND status = 'running' AND cancellable = 1
+      `).run(updatedAt, normalizedKind, normalizedId);
+      return this.getMaintenanceJob(normalizedKind, normalizedId);
+    });
+  }
+
+  listMaintenanceEffects<T = unknown>(jobId: string): MaintenanceEffectRecord<T>[] {
+    this.assertOpen();
+    const id = maintenanceIdentity(jobId, "Maintenance job ID");
+    return (this.database.prepare(`
+      SELECT * FROM maintenance_effects WHERE job_id = ? ORDER BY id
+    `).all(id) as Row[]).map(maintenanceEffectFromRow<T>);
+  }
+
+  updateMaintenanceEffect<T>(input: {
+    readonly jobId: string;
+    readonly id: string;
+    readonly state: MaintenanceEffectState;
+    readonly payload: T;
+    readonly updatedAt?: number;
+  }): MaintenanceEffectRecord<T> {
+    const jobId = maintenanceIdentity(input.jobId, "Maintenance job ID");
+    const id = maintenanceIdentity(input.id, "Maintenance effect ID");
+    const state = maintenanceEffectState(input.state);
+    const updatedAt = safeNonNegativeInteger(input.updatedAt ?? this.now(), "Maintenance effect update time");
+    return this.maintenanceWrite(() => {
+      const current = this.database.prepare(`
+        SELECT * FROM maintenance_effects WHERE job_id = ? AND id = ?
+      `).get(jobId, id) as Row | undefined;
+      if (current === undefined) throw new NotFoundError("Maintenance effect", id);
+      this.database.prepare(`
+        UPDATE maintenance_effects SET state = ?, payload_json = ?, updated_at = ?
+        WHERE job_id = ? AND id = ?
+      `).run(state, serializeJson(input.payload), updatedAt, jobId, id);
+      const row = this.database.prepare(`
+        SELECT * FROM maintenance_effects WHERE job_id = ? AND id = ?
+      `).get(jobId, id) as Row;
+      return maintenanceEffectFromRow<T>(row);
+    });
+  }
+
   async createHistoryMaintenanceCopy(input: {
     readonly workingPath: string;
     readonly expectedRevision: bigint;
@@ -825,6 +1092,65 @@ export class OperationalStore {
     if (this.readRevision() === input.expectedRevision) return true;
     rmSync(paths.work, { force: true });
     return false;
+  }
+
+  prepareHistoryMaintenanceCopyReceipt<TPayload>(input: {
+    readonly workingPath: string;
+    readonly jobId: string;
+    readonly phase: string;
+    readonly percent: number;
+    readonly payload: TPayload;
+    readonly effectUpdates?: readonly {
+      readonly id: string;
+      readonly state: MaintenanceEffectState;
+      readonly payload: unknown;
+    }[];
+    readonly updatedAt?: number;
+  }): void {
+    this.assertOpen();
+    if (this.filePath === ":memory:" || this.filePath.startsWith("file:")) {
+      throw new StoreError("History maintenance requires a file-backed operational store.");
+    }
+    const paths = historyMaintenancePaths(path.resolve(this.filePath));
+    if (path.resolve(input.workingPath) !== paths.work) {
+      throw new StoreError("History maintenance working copy is outside the managed database boundary.");
+    }
+    const jobId = maintenanceIdentity(input.jobId, "Maintenance job ID");
+    const phase = maintenancePhase(input.phase);
+    const percent = maintenancePercent(input.percent);
+    const updatedAt = safeNonNegativeInteger(input.updatedAt ?? this.now(), "Maintenance receipt update time");
+    const database = new DatabaseSync(paths.work);
+    try {
+      database.exec("PRAGMA foreign_keys = ON; PRAGMA journal_mode = DELETE; PRAGMA synchronous = FULL");
+      database.exec("BEGIN IMMEDIATE");
+      const changed = database.prepare(`
+        UPDATE maintenance_jobs
+        SET status = 'running', phase = ?, percent = ?, cancellable = 0,
+            payload_json = ?, updated_at = ?
+        WHERE kind = 'history' AND id = ? AND status = 'running'
+      `).run(phase, percent, serializeJson(input.payload), updatedAt, jobId).changes;
+      if (changed !== 1) throw new StoreError("History maintenance working copy lacks its durable job receipt.");
+      for (const effect of input.effectUpdates ?? []) {
+        const effectChanged = database.prepare(`
+          UPDATE maintenance_effects SET state = ?, payload_json = ?, updated_at = ?
+          WHERE job_id = ? AND id = ?
+        `).run(
+          maintenanceEffectState(effect.state),
+          serializeJson(effect.payload),
+          updatedAt,
+          jobId,
+          maintenanceIdentity(effect.id, "Maintenance effect ID")
+        ).changes;
+        if (effectChanged !== 1) throw new StoreError("History maintenance working copy lacks an effect receipt.");
+      }
+      database.exec("COMMIT");
+      verifyOpenOperationalDatabase(database);
+    } catch (error) {
+      try { database.exec("ROLLBACK"); } catch { /* The receipt transaction may already be closed. */ }
+      throw error;
+    } finally {
+      database.close();
+    }
   }
 
   /**
@@ -1559,6 +1885,16 @@ export class OperationalStore {
     const row = this.database.prepare(
       "SELECT * FROM desktop_host_authorizations WHERE connection_id = ?"
     ).get(nonBlank(connectionId, "Desktop host Connection ID")) as Row | undefined;
+    return row === undefined ? undefined : desktopHostAuthorizationFromRow(row);
+  }
+
+  findDesktopHostAuthorizationByAuthKeyDigest(
+    authKeyDigest: string
+  ): DesktopHostAuthorizationRecord | undefined {
+    this.assertOpen();
+    const row = this.database.prepare(
+      "SELECT * FROM desktop_host_authorizations WHERE auth_key_digest = ?"
+    ).get(normalizedPrivateDigest(authKeyDigest, "Desktop host authorization digest")) as Row | undefined;
     return row === undefined ? undefined : desktopHostAuthorizationFromRow(row);
   }
 
@@ -2372,22 +2708,29 @@ export class OperationalStore {
   upsertTarget(descriptor: TargetDescriptor, metadata: unknown = {}, now = this.now()): StoredTarget {
     return this.write(() => {
       this.getBackend(descriptor.backendId);
-      const remoteWorkspace = descriptor.remoteWorkspace === undefined
-        ? undefined
-        : {
-            hostTargetId: remoteHostIdentity(descriptor.remoteWorkspace.hostTargetId, "host target id", 256),
-            hostId: remoteHostAlias(descriptor.remoteWorkspace.hostId),
-            workspaceRoot: remoteWorkspaceRoot(descriptor.remoteWorkspace.workspaceRoot)
-          };
-      if (remoteWorkspace !== undefined && remoteWorkspace.hostTargetId !== descriptor.id) {
+      const remoteWorkspace = normalizeRemoteWorkspace(descriptor.remoteWorkspace);
+      const existingRow = this.database.prepare("SELECT * FROM targets WHERE id = ?").get(descriptor.id) as Row | undefined;
+      if (existingRow !== undefined) {
+        const existingRemoteWorkspace = remoteWorkspaceFromRow(existingRow, "Target");
+        if ((existingRemoteWorkspace?.kind === "device_peer" || remoteWorkspace?.kind === "device_peer")
+          && !sameRemoteWorkspace(existingRemoteWorkspace, remoteWorkspace)) {
+          throw new StoreError("A Device peer Target workspace binding is immutable.");
+        }
+      }
+      if (remoteWorkspace?.kind === "ssh" && remoteWorkspace.hostTargetId !== descriptor.id) {
         this.getTarget(remoteWorkspace.hostTargetId);
+      }
+      if (remoteWorkspace?.kind === "device_peer") {
+        this.getDevice(remoteWorkspace.controllerDeviceId);
+        this.getDevice(remoteWorkspace.targetDeviceId);
       }
       this.database.prepare(`
         INSERT INTO targets(
           id, backend_id, display_name, workspace_root, managed, trusted,
-          metadata_json, remote_host_target_id, remote_host_id, remote_workspace_root,
+          metadata_json, remote_location_kind, remote_host_target_id, remote_host_id,
+          remote_controller_device_id, remote_target_device_id, remote_workspace_root,
           created_at, updated_at, revision
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
           backend_id = excluded.backend_id,
           display_name = excluded.display_name,
@@ -2395,8 +2738,11 @@ export class OperationalStore {
           managed = excluded.managed,
           trusted = excluded.trusted,
           metadata_json = excluded.metadata_json,
+          remote_location_kind = excluded.remote_location_kind,
           remote_host_target_id = excluded.remote_host_target_id,
           remote_host_id = excluded.remote_host_id,
+          remote_controller_device_id = excluded.remote_controller_device_id,
+          remote_target_device_id = excluded.remote_target_device_id,
           remote_workspace_root = excluded.remote_workspace_root,
           updated_at = excluded.updated_at,
           revision = excluded.revision
@@ -2408,8 +2754,11 @@ export class OperationalStore {
         boolInt(descriptor.managed),
         boolInt(descriptor.trusted),
         serializeJson(metadata),
-        remoteWorkspace?.hostTargetId ?? null,
-        remoteWorkspace?.hostId ?? null,
+        remoteWorkspace?.kind ?? null,
+        remoteWorkspace?.kind === "ssh" ? remoteWorkspace.hostTargetId : null,
+        remoteWorkspace?.kind === "ssh" ? remoteWorkspace.hostId : null,
+        remoteWorkspace?.kind === "device_peer" ? remoteWorkspace.controllerDeviceId : null,
+        remoteWorkspace?.kind === "device_peer" ? remoteWorkspace.targetDeviceId : null,
         remoteWorkspace?.workspaceRoot ?? null,
         now,
         now,
@@ -2879,9 +3228,18 @@ export class OperationalStore {
 
   createSession(
     descriptor: SessionDescriptor,
-    options: { readonly nativeSessionBlank?: boolean; readonly derivationOperationId?: string } = {}
+    options: {
+      readonly nativeSessionBlank?: boolean;
+      readonly derivationOperationId?: string;
+      readonly nativeCatalogAdoptionOperationId?: string;
+    } = {}
   ): StoredSession {
     return this.write(() => {
+      const pendingCatalog = this.findPendingNativeCatalogAdoptionForBinding(descriptor.backendId, descriptor.binding.opaqueRef);
+      if (pendingCatalog !== undefined && (pendingCatalog.operationId !== options.nativeCatalogAdoptionOperationId
+        || pendingCatalog.sessionId !== descriptor.id)) {
+        throw new StoreError("The native task belongs to an unfinished catalog adoption.");
+      }
       const derivation = this.assertNativeBindingAdoptionAllowed(descriptor, options.derivationOperationId);
       const target = this.getTarget(descriptor.targetId);
       if (target.descriptor.backendId !== descriptor.backendId) {
@@ -2889,13 +3247,7 @@ export class OperationalStore {
       }
       const projectId = descriptor.projectId ?? descriptor.targetId;
       this.getTarget(projectId);
-      const remoteWorkspace = descriptor.remoteWorkspace === undefined
-        ? undefined
-        : {
-            hostTargetId: remoteHostIdentity(descriptor.remoteWorkspace.hostTargetId, "host target id", 256),
-            hostId: remoteHostAlias(descriptor.remoteWorkspace.hostId),
-            workspaceRoot: remoteWorkspaceRoot(descriptor.remoteWorkspace.workspaceRoot)
-          };
+      const remoteWorkspace = normalizeRemoteWorkspace(descriptor.remoteWorkspace);
       if (!sameRemoteWorkspace(remoteWorkspace, target.descriptor.remoteWorkspace)) {
         throw new StoreError("Session Remote workspace must match its target at creation time.");
       }
@@ -2957,10 +3309,11 @@ export class OperationalStore {
           summary_source_cursor, summary_updated_at, native_opaque_ref, native_binding_fingerprint, native_session_id,
           generation, pinned, archived, deleted_at, permission_mode, plan_mode,
           provider_id, model_id, effort, fast_mode, append_system_prompt,
-          remote_host_target_id, remote_host_id, remote_workspace_root, automation_schedule_id, automation_schedule_name,
+          remote_location_kind, remote_host_target_id, remote_host_id, remote_controller_device_id,
+          remote_target_device_id, remote_workspace_root, automation_schedule_id, automation_schedule_name,
           automation_run_id, derivation_kind, derivation_source_session_id,
           derivation_source_message_id, derivation_source_event_id, created_at, updated_at, revision
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         descriptor.id,
         descriptor.backendId,
@@ -2985,8 +3338,11 @@ export class OperationalStore {
         descriptor.effort ?? null,
         boolInt(descriptor.fastMode),
         descriptor.appendSystemPrompt ?? null,
-        remoteWorkspace?.hostTargetId ?? null,
-        remoteWorkspace?.hostId ?? null,
+        remoteWorkspace?.kind ?? null,
+        remoteWorkspace?.kind === "ssh" ? remoteWorkspace.hostTargetId : null,
+        remoteWorkspace?.kind === "ssh" ? remoteWorkspace.hostId : null,
+        remoteWorkspace?.kind === "device_peer" ? remoteWorkspace.controllerDeviceId : null,
+        remoteWorkspace?.kind === "device_peer" ? remoteWorkspace.targetDeviceId : null,
         remoteWorkspace?.workspaceRoot ?? null,
         automationOrigin?.scheduleId ?? null,
         automationOrigin?.scheduleName ?? null,
@@ -3011,10 +3367,9 @@ export class OperationalStore {
           INSERT INTO session_worktrees(
             session_id, lease_id, workspace_id, working_path, repository_root,
             branch, source_ref, source_commit, source_strategy, source_refreshed,
-            source_remote, remote_host_owner_id, remote_host_target_id, remote_host_id,
-            remote_host_identity, remote_target_id, remote_target_revision, remote_host_revision,
+            source_remote, remote_authority_json, remote_target_id, remote_target_revision,
             remote_manifest_id, state, acquired_at, updated_at, revision
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `).run(
           descriptor.id,
           worktree.leaseId,
@@ -3027,13 +3382,9 @@ export class OperationalStore {
           worktree.sourceStrategy,
           boolInt(worktree.sourceRefreshed),
           worktree.sourceRemote ?? null,
-          worktree.remote?.hostOwnerId ?? null,
-          worktree.remote?.hostTargetId ?? null,
-          worktree.remote?.hostId ?? null,
-          worktree.remote?.hostIdentity ?? null,
+          worktree.remote === undefined ? null : JSON.stringify(worktree.remote),
           worktree.remote?.targetId ?? null,
           worktree.remote === undefined ? null : asSqlInteger(BigInt(worktree.remote.targetRevision)),
-          worktree.remote === undefined ? null : asSqlInteger(BigInt(worktree.remote.hostRevision)),
           worktree.remote?.manifestId ?? null,
           worktree.state,
           worktree.acquiredAt,
@@ -6526,9 +6877,10 @@ export class OperationalStore {
           target_id, source_session_revision, target_revision, derived_worktree_json, derived_worktree_digest,
           remote_worktree_plan_json, remote_worktree_plan_digest,
           external_lifecycle, source_native_opaque_ref, source_native_session_id, source_generation,
-          effective_workspace_root, remote_host_target_id, remote_host_id, remote_workspace_root,
+          effective_workspace_root, remote_location_kind, remote_host_target_id, remote_host_id,
+          remote_controller_device_id, remote_target_device_id, remote_workspace_root,
           native_opaque_ref, native_session_id, generation, state, created_at, updated_at, revision
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, 'prepared', ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, 'prepared', ?, ?, ?)
       `).run(
         normalized.operationId, normalized.expectedBodyHash, normalized.sourceSessionId, normalized.sessionId,
         normalized.backendId, normalized.backendInstanceGeneration, normalized.backendInstanceGeneration,
@@ -6538,8 +6890,12 @@ export class OperationalStore {
         remoteWorktreePlan?.json ?? null, remoteWorktreePlan?.digest ?? null,
         normalized.sourceBinding.opaqueRef, normalized.sourceBinding.nativeSessionId ?? null,
         normalized.sourceBinding.generation, normalized.effectiveWorkspaceRoot,
-        normalized.remoteWorkspace?.hostTargetId ?? null,
-        normalized.remoteWorkspace?.hostId ?? null, normalized.remoteWorkspace?.workspaceRoot ?? null,
+        normalized.remoteWorkspace?.kind ?? null,
+        normalized.remoteWorkspace?.kind === "ssh" ? normalized.remoteWorkspace.hostTargetId : null,
+        normalized.remoteWorkspace?.kind === "ssh" ? normalized.remoteWorkspace.hostId : null,
+        normalized.remoteWorkspace?.kind === "device_peer" ? normalized.remoteWorkspace.controllerDeviceId : null,
+        normalized.remoteWorkspace?.kind === "device_peer" ? normalized.remoteWorkspace.targetDeviceId : null,
+        normalized.remoteWorkspace?.workspaceRoot ?? null,
         at, at, asSqlInteger(this.requireActiveRevision())
       );
       return this.findNativeSessionDerivation(normalized.operationId)!;
@@ -6586,7 +6942,7 @@ export class OperationalStore {
         || !sameRemoteWorkspace(target.descriptor.remoteWorkspace, record.remoteWorkspace)) {
         throw new StoreError("The remote derivation checkout source authority changed.");
       }
-      this.assertNativeDerivationRemoteWorktreeOwner(record.remoteWorktreePlan, source, target, false);
+      this.assertNativeDerivationRemoteWorktreeOwner(record.remoteWorktreePlan, source, target);
       const encoded = encodeNativeDerivationWorktree(worktree);
       const changed = this.database.prepare(`
         UPDATE native_session_derivations
@@ -6605,8 +6961,7 @@ export class OperationalStore {
   private assertNativeDerivationRemoteWorktreeOwner(
     plan: RemoteNativeDerivationWorktreePlan,
     source: StoredSession,
-    target: StoredTarget,
-    requireAcquisitionRevision = true
+    target: StoredTarget
   ): void {
     const remote = plan.remote;
     if (!target.descriptor.trusted || remote.targetId !== target.descriptor.id
@@ -6633,13 +6988,26 @@ export class OperationalStore {
       || !sameStableRemoteWorktreeAuthority(sourceWorktree.remote, plan.sourceLease.remote))) {
       throw new StoreError("The remote derivation source checkout authority changed.");
     }
-    const hostTarget = this.getTarget(remote.hostTargetId);
-    if (!hostTarget.descriptor.trusted) throw new StoreError("The remote derivation Host Target is not trusted.");
-    const host = this.getRemoteHost(remote.hostOwnerId, remote.hostTargetId, remote.hostId);
-    if ((requireAcquisitionRevision && host.revision.toString() !== remote.hostRevision)
-      || host.status.state !== "ready"
-      || host.trust === undefined) {
-      throw new StoreError("The remote derivation Host authority changed.");
+    if (remote.binding.kind === "ssh") {
+      const hostTarget = this.getTarget(remote.binding.hostTargetId);
+      if (!hostTarget.descriptor.trusted) throw new StoreError("The remote derivation Host Target is not trusted.");
+      const execution = parseRemoteWorktreeExecutionIdentity(remote.executionIdentity, "ssh");
+      const host = this.getRemoteHost(execution.ownerId, remote.binding.hostTargetId, remote.binding.hostId);
+      if (host.status.state !== "ready" || host.trust === undefined
+        || remote.executionIdentity !== remoteSshWorktreeExecutionIdentity(remote.binding, host)) {
+        throw new StoreError("The remote derivation Host authority changed.");
+      }
+      return;
+    }
+    const execution = parseRemoteWorktreeExecutionIdentity(remote.executionIdentity, "device_peer");
+    const controller = this.getDevice(remote.binding.controllerDeviceId);
+    const device = this.getDevice(remote.binding.targetDeviceId);
+    const relation = this.getDeviceControlRelation(controller.id, device.id);
+    if (execution.controllerDeviceId !== controller.id || execution.targetDeviceId !== device.id
+      || controller.state !== "active" || device.state !== "active"
+      || (device.kind !== "desktop" && device.kind !== "service") || !device.remoteControlEnabled
+      || !relation.outboundEnabled || !relation.inboundAllowed) {
+      throw new StoreError("The remote derivation Device peer authority changed.");
     }
   }
 
@@ -6729,9 +7097,11 @@ export class OperationalStore {
           target_id, source_session_revision, target_revision, derived_worktree_json, derived_worktree_digest,
           remote_worktree_plan_json, remote_worktree_plan_digest,
           external_lifecycle, source_native_opaque_ref, source_native_session_id, source_generation,
-          effective_workspace_root, remote_host_target_id, remote_host_id, remote_workspace_root, native_opaque_ref, native_session_id,
+          effective_workspace_root, remote_location_kind, remote_host_target_id, remote_host_id,
+          remote_controller_device_id, remote_target_device_id, remote_workspace_root,
+          native_opaque_ref, native_session_id,
           generation, state, created_at, updated_at, revision
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, NULL, NULL, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'recorded', ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, NULL, NULL, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'recorded', ?, ?, ?)
       `).run(
         normalized.operationId, normalized.expectedBodyHash, normalized.sourceSessionId, normalized.sessionId,
         normalized.backendId, normalized.backendInstanceGeneration, normalized.backendInstanceGeneration,
@@ -6739,8 +7109,12 @@ export class OperationalStore {
         worktree?.json ?? null, worktree?.digest ?? null,
         normalized.sourceBinding.opaqueRef, normalized.sourceBinding.nativeSessionId ?? null,
         normalized.sourceBinding.generation, normalized.effectiveWorkspaceRoot,
-        normalized.remoteWorkspace?.hostTargetId ?? null,
-        normalized.remoteWorkspace?.hostId ?? null, normalized.remoteWorkspace?.workspaceRoot ?? null,
+        normalized.remoteWorkspace?.kind ?? null,
+        normalized.remoteWorkspace?.kind === "ssh" ? normalized.remoteWorkspace.hostTargetId : null,
+        normalized.remoteWorkspace?.kind === "ssh" ? normalized.remoteWorkspace.hostId : null,
+        normalized.remoteWorkspace?.kind === "device_peer" ? normalized.remoteWorkspace.controllerDeviceId : null,
+        normalized.remoteWorkspace?.kind === "device_peer" ? normalized.remoteWorkspace.targetDeviceId : null,
+        normalized.remoteWorkspace?.workspaceRoot ?? null,
         normalized.binding.opaqueRef, normalized.binding.nativeSessionId ?? null, normalized.binding.generation,
         at, at, asSqlInteger(this.requireActiveRevision())
       );
@@ -7374,7 +7748,8 @@ export class OperationalStore {
         );
       }
       if (
-        nativeBindingChanged || patch.title !== undefined || patch.pinned !== undefined || patch.archived !== undefined ||
+        nativeBindingChanged || binding.generation !== descriptor.binding.generation ||
+        patch.title !== undefined || patch.pinned !== undefined || patch.archived !== undefined ||
         patch.deletedAt !== undefined
       ) this.appendSessionProjectionEvent(updated, `session-update:${id}:${updated.revision.toString(10)}`);
       return updated;
@@ -8074,6 +8449,21 @@ export class OperationalStore {
        ORDER BY run.created_at DESC, run.id LIMIT ? OFFSET ?`
     ).all(...filter.params, normalizeLimit(options.limit, 500), normalizeOffset(options.offset)) as Row[])
       .map(runFromRow);
+  }
+
+  findLatestRunForSessionGeneration(sessionId: string, generation: number): StoredRun | undefined {
+    this.assertOpen();
+    if (!Number.isSafeInteger(generation) || generation < 0) {
+      throw new StoreError("Run Session generation is invalid.");
+    }
+    const filter = runSqlFilter({ sessionId });
+    const row = this.database.prepare(`
+      SELECT run.* FROM runs AS run
+      JOIN attempts AS attempt ON attempt.id = run.active_attempt_id
+      ${filter.where} AND attempt.generation = ?
+      ORDER BY run.rowid DESC LIMIT 1
+    `).get(...filter.params, generation) as Row | undefined;
+    return row === undefined ? undefined : runFromRow(row);
   }
 
   countRuns(options: Omit<RunListOptions, "limit" | "offset"> = {}): number {
@@ -10030,6 +10420,29 @@ export class OperationalStore {
        LEFT JOIN message_event_tombstones AS tombstone ON tombstone.event_id = event.id
        ${where} ORDER BY event.global_cursor ${order} LIMIT ?`
     ).all(...params, limit) as Row[]).map(eventFromRow);
+  }
+
+  /**
+   * Returns the latest surviving user-authored message time for a Session.
+   * Automatic service continuations are control traffic, not user activity.
+   */
+  findLatestVisibleUserMessageAt(sessionId: string): number | undefined {
+    this.assertOpen();
+    const normalizedSessionId = nonBlank(sessionId, "User message activity Session ID");
+    this.getSession(normalizedSessionId);
+    const row = this.database.prepare(`
+      SELECT event.emitted_at
+      FROM events AS event
+      LEFT JOIN message_event_tombstones AS tombstone ON tombstone.event_id = event.id
+      WHERE event.session_id = ?
+        AND tombstone.event_id IS NULL
+        AND json_extract(event.payload_json, '$.payload.type') = 'message_complete'
+        AND json_extract(event.payload_json, '$.payload.role') = 'user'
+        AND json_extract(event.payload_json, '$.payload.automaticContinuation') IS NULL
+      ORDER BY event.global_cursor DESC
+      LIMIT 1
+    `).get(normalizedSessionId) as Row | undefined;
+    return row === undefined ? undefined : numberValue(row["emitted_at"]);
   }
 
   /**
@@ -12066,6 +12479,11 @@ export class OperationalStore {
             SELECT 1 FROM session_lifecycle_cleanups AS cleanup
             WHERE cleanup.operation_id = operation.id AND cleanup.state = 'pending'
           )
+          AND NOT EXISTS (
+            SELECT 1 FROM native_catalog_adoptions AS adoption
+            WHERE (adoption.operation_id = operation.id AND adoption.state IN ('claimed', 'unknown'))
+              OR (adoption.request_operation_id = operation.id AND adoption.state IN ('claimed', 'unknown', 'adopted'))
+          )
         ORDER BY created_at, id
       `).all() as Row[];
       const effectError = effectOutcomeUnknownError();
@@ -13370,6 +13788,435 @@ export class OperationalStore {
     return scheduleRunFromRow(row);
   }
 
+  preparePortableReplacementCleanup(input: {
+    readonly operationId: string;
+    readonly importedSessionId: string;
+    readonly replacedSessionId: string;
+    readonly at?: number;
+  }): PortableReplacementCleanupRecord {
+    const operationId = nonBlank(input.operationId, "Portable replacement operation ID");
+    const importedSessionId = nonBlank(input.importedSessionId, "Imported Session ID");
+    const replacedSessionId = nonBlank(input.replacedSessionId, "Replaced Session ID");
+    const at = input.at ?? this.now();
+    if (!Number.isSafeInteger(at) || at < 0) throw new StoreError("Portable replacement time is invalid.");
+    return this.write(() => {
+      const operation = this.getOperation(operationId);
+      if (operation.kind !== "import_portable_session" || operation.status !== "started") {
+        throw new StoreError("Portable replacement requires its started import operation.");
+      }
+      const imported = this.getSession(importedSessionId).descriptor;
+      const replaced = this.getSession(replacedSessionId).descriptor;
+      if (imported.deletedAt !== undefined || replaced.deletedAt === undefined
+        || imported.targetId !== replaced.targetId || imported.backendId !== replaced.backendId
+        || imported.binding.opaqueRef.toLowerCase() === replaced.binding.opaqueRef.toLowerCase()
+        || (imported.binding.nativeSessionId !== undefined
+          && imported.binding.nativeSessionId === replaced.binding.nativeSessionId)) {
+        throw new StoreError("Portable replacement does not own distinct old and new native Sessions.");
+      }
+      const existing = this.findPortableReplacementCleanup(operationId);
+      if (existing !== undefined) throw new StoreError("Portable replacement cleanup already exists.");
+      this.database.prepare(`
+        INSERT INTO portable_replacement_cleanups(
+          operation_id, imported_session_id, replaced_session_id, native_state,
+          worktree_state, failure_code, created_at, updated_at, revision
+        ) VALUES (?, ?, ?, 'pending', ?, NULL, ?, ?, ?)
+      `).run(
+        operationId,
+        importedSessionId,
+        replacedSessionId,
+        replaced.worktree === undefined ? "completed" : "pending",
+        at,
+        at,
+        asSqlInteger(this.requireActiveRevision())
+      );
+      return this.getPortableReplacementCleanup(operationId);
+    });
+  }
+
+  findPortableReplacementCleanup(operationId: string): PortableReplacementCleanupRecord | undefined {
+    this.assertOpen();
+    const row = this.database.prepare("SELECT * FROM portable_replacement_cleanups WHERE operation_id = ?")
+      .get(nonBlank(operationId, "Portable replacement operation ID")) as Row | undefined;
+    return row === undefined ? undefined : portableReplacementCleanupFromRow(row);
+  }
+
+  getPortableReplacementCleanup(operationId: string): PortableReplacementCleanupRecord {
+    const record = this.findPortableReplacementCleanup(operationId);
+    if (record === undefined) throw new NotFoundError("Portable replacement cleanup", operationId);
+    return record;
+  }
+
+  findPortableReplacementCleanupForImportedSession(importedSessionId: string): PortableReplacementCleanupRecord | undefined {
+    this.assertOpen();
+    const rows = this.database.prepare(`
+      SELECT * FROM portable_replacement_cleanups WHERE imported_session_id = ? LIMIT 2
+    `).all(nonBlank(importedSessionId, "Imported Session ID")) as Row[];
+    if (rows.length > 1) throw new StoreError("Imported Session has ambiguous portable replacement cleanup ownership.");
+    return rows[0] === undefined ? undefined : portableReplacementCleanupFromRow(rows[0]);
+  }
+
+  claimNativeCatalogAdoption(input: {
+    readonly operationId: string;
+    readonly requestOperationId?: string;
+    readonly operationBodyHash: string;
+    readonly connectionId: string;
+    readonly authKeyDigest: string;
+    readonly sessionId: string;
+    readonly backendId: string;
+    readonly targetId: string;
+    readonly projectId?: string;
+    readonly projectRevision?: bigint;
+    readonly targetRevision: bigint;
+    readonly backendGeneration: number;
+    readonly binding: NativeSessionBinding;
+    readonly entry: NativeCatalogAdoptionRecord["entry"];
+    readonly recoveryReference: string;
+    readonly at?: number;
+  }): NativeCatalogAdoptionRecord {
+    const at = input.at ?? this.now();
+    if (!Number.isSafeInteger(at) || at < 0) throw new StoreError("Native catalog adoption time is invalid.");
+    return this.write(() => {
+      this.authorizeConnection(input.connectionId, input.authKeyDigest);
+      const operation = this.getOperation(input.operationId);
+      if (operation.connectionId !== input.connectionId || operation.kind !== "create_session"
+        || operation.bodyHash !== input.operationBodyHash || operation.status !== "started") {
+        throw new StoreError("Native catalog adoption lost its original Operation.");
+      }
+      if (input.requestOperationId !== undefined) {
+        const request = this.getOperation(input.requestOperationId);
+        if (request.connectionId !== input.connectionId || request.kind !== "createSession"
+          || request.status !== "started" || request.id === operation.id) {
+          throw new StoreError("Native catalog adoption lost its requesting Operation.");
+        }
+      }
+      const target = this.getTarget(input.targetId);
+      const project = input.projectId === undefined ? undefined : this.getTarget(input.projectId);
+      if (target.revision !== input.targetRevision || target.descriptor.backendId !== input.backendId
+        || (project === undefined ? input.projectRevision !== undefined
+          : project.revision !== input.projectRevision || project.descriptor.backendId !== input.backendId)
+        || this.getBackend(input.backendId).descriptor.instanceGeneration !== input.backendGeneration
+        || input.binding.generation < 1 || input.binding.nativeSessionId === undefined
+        || input.entry.nativeSessionId !== input.binding.nativeSessionId
+        || input.binding.opaqueRef.trim().length === 0 || input.recoveryReference.trim().length === 0
+        || this.findLiveSessionByNativeBinding(input.backendId, input.binding.opaqueRef) !== undefined) {
+        throw new StoreError("Native catalog adoption lost its exact Backend, Target, or native identity.");
+      }
+      const existing = this.findNativeCatalogAdoption(input.operationId);
+      if (existing !== undefined) throw new StoreError("Native catalog adoption was already claimed.");
+      const pending = this.database.prepare(`
+        SELECT operation_id FROM native_catalog_adoptions
+        WHERE backend_id = ? AND native_reference = ? AND state IN ('claimed', 'unknown') LIMIT 1
+      `).get(input.backendId, input.binding.opaqueRef) as Row | undefined;
+      if (pending !== undefined) throw new StoreError("The native task already has a pending catalog adoption.");
+      this.database.prepare(`
+        INSERT INTO native_catalog_adoptions(
+          operation_id, request_operation_id, session_id, backend_id, target_id, project_id, project_revision, target_revision,
+          backend_generation, binding_json, entry_json, recovery_json,
+          native_reference, state, created_at, updated_at, revision
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'claimed', ?, ?, ?)
+      `).run(
+        input.operationId, input.requestOperationId ?? null, input.sessionId, input.backendId, input.targetId,
+        input.projectId ?? null, input.projectRevision === undefined ? null : asSqlInteger(input.projectRevision),
+        asSqlInteger(input.targetRevision), input.backendGeneration,
+        serializeJson(input.binding), serializeJson(input.entry), serializeJson(input.recoveryReference),
+        input.binding.opaqueRef, at, at, asSqlInteger(this.requireActiveRevision())
+      );
+      return this.getNativeCatalogAdoption(input.operationId);
+    });
+  }
+
+  findNativeCatalogAdoption(operationId: string): NativeCatalogAdoptionRecord | undefined {
+    this.assertOpen();
+    const row = this.database.prepare("SELECT * FROM native_catalog_adoptions WHERE operation_id = ?")
+      .get(nonBlank(operationId, "Operation ID")) as Row | undefined;
+    return row === undefined ? undefined : nativeCatalogAdoptionFromRow(row);
+  }
+
+  findNativeCatalogAdoptionForRequest(operationId: string): NativeCatalogAdoptionRecord | undefined {
+    this.assertOpen();
+    const row = this.database.prepare("SELECT * FROM native_catalog_adoptions WHERE request_operation_id = ?")
+      .get(nonBlank(operationId, "Request Operation ID")) as Row | undefined;
+    return row === undefined ? undefined : nativeCatalogAdoptionFromRow(row);
+  }
+
+  getNativeCatalogAdoption(operationId: string): NativeCatalogAdoptionRecord {
+    const record = this.findNativeCatalogAdoption(operationId);
+    if (record === undefined) throw new NotFoundError("Native catalog adoption", operationId);
+    return record;
+  }
+
+  findPendingNativeCatalogAdoptionForBinding(backendId: string, opaqueRef: string): NativeCatalogAdoptionRecord | undefined {
+    this.assertOpen();
+    const row = this.database.prepare(`
+      SELECT * FROM native_catalog_adoptions
+      WHERE backend_id = ? AND native_reference = ? AND state IN ('claimed', 'unknown') LIMIT 1
+    `).get(nonBlank(backendId, "Backend ID"), nonBlank(opaqueRef, "Native reference")) as Row | undefined;
+    return row === undefined ? undefined : nativeCatalogAdoptionFromRow(row);
+  }
+
+  listPendingNativeCatalogAdoptions(connectionId?: string, limit = 100, offset = 0): NativeCatalogAdoptionRecord[] {
+    this.assertOpen();
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 500) throw new StoreError("Native catalog adoption page size is invalid.");
+    if (!Number.isSafeInteger(offset) || offset < 0) throw new StoreError("Native catalog adoption page offset is invalid.");
+    return (this.database.prepare(`
+      SELECT adoption.* FROM native_catalog_adoptions AS adoption
+      JOIN operations AS operation ON operation.id = adoption.operation_id
+      WHERE adoption.state IN ('claimed', 'unknown')
+        AND (? IS NULL OR operation.connection_id = ?)
+      ORDER BY adoption.created_at, adoption.operation_id LIMIT ? OFFSET ?
+    `).all(connectionId ?? null, connectionId ?? null, limit, offset) as Row[]).map(nativeCatalogAdoptionFromRow);
+  }
+
+  countPendingNativeCatalogAdoptions(connectionId?: string): number {
+    this.assertOpen();
+    const row = this.database.prepare(`
+      SELECT COUNT(*) AS count FROM native_catalog_adoptions AS adoption
+      JOIN operations AS operation ON operation.id = adoption.operation_id
+      WHERE adoption.state IN ('claimed', 'unknown')
+        AND (? IS NULL OR operation.connection_id = ?)
+    `).get(connectionId ?? null, connectionId ?? null) as Row;
+    return numberValue(row["count"]);
+  }
+
+  markNativeCatalogAdoptionUnknown(operationId: string, at = this.now()): NativeCatalogAdoptionRecord {
+    if (!Number.isSafeInteger(at) || at < 0) throw new StoreError("Native catalog adoption time is invalid.");
+    return this.write(() => {
+      const current = this.getNativeCatalogAdoption(operationId);
+      if (current.state !== "claimed") return current;
+      this.database.prepare(`
+        UPDATE native_catalog_adoptions SET state = 'unknown', updated_at = ?, revision = ?
+        WHERE operation_id = ? AND state IN ('claimed', 'unknown')
+      `).run(at, asSqlInteger(this.requireActiveRevision()), operationId);
+      return this.getNativeCatalogAdoption(operationId);
+    });
+  }
+
+  confirmNativeCatalogAdoptionState(
+    operationId: string,
+    expectedRevision: bigint,
+    state: "adopted" | "absent",
+    at = this.now()
+  ): NativeCatalogAdoptionRecord {
+    if (!Number.isSafeInteger(at) || at < 0) throw new StoreError("Native catalog adoption time is invalid.");
+    return this.write(() => {
+      const current = this.getNativeCatalogAdoption(operationId);
+      if ((current.state !== "claimed" && current.state !== "unknown")
+        || current.revision !== expectedRevision) throw new StoreError("Native catalog adoption changed during reconciliation.");
+      const operation = this.getOperation(operationId);
+      const target = this.getTarget(current.targetId);
+      const request = current.requestOperationId === undefined
+        ? undefined : this.getOperation(current.requestOperationId);
+      if (operation.kind !== "create_session" || operation.status !== "started"
+        || (request !== undefined && (request.kind !== "createSession" || request.status !== "started"
+          || request.connectionId !== operation.connectionId))
+        || target.revision !== current.targetRevision || target.descriptor.backendId !== current.backendId
+        || this.getBackend(current.backendId).descriptor.instanceGeneration !== current.backendGeneration
+        || (current.projectId === undefined ? current.projectRevision !== undefined
+          : this.getTarget(current.projectId).revision !== current.projectRevision
+            || this.getTarget(current.projectId).descriptor.backendId !== current.backendId)) {
+        throw new StoreError("Native catalog adoption lost its exact Operation or owner.");
+      }
+      const sessionRow = this.database.prepare("SELECT id FROM product_sessions WHERE id = ?")
+        .get(current.sessionId) as Row | undefined;
+      if (state === "absent") {
+        if (sessionRow !== undefined
+          || this.findLiveSessionByNativeBinding(current.backendId, current.binding.opaqueRef) !== undefined) {
+          throw new StoreError("Native catalog adoption cannot be declared absent after product adoption.");
+        }
+      } else {
+        if (sessionRow === undefined) throw new StoreError("Native catalog adoption has no product Session.");
+        const adopted = this.getSession(current.sessionId).descriptor;
+        if (adopted.backendId !== current.backendId || adopted.targetId !== current.targetId
+          || adopted.binding.opaqueRef !== current.binding.opaqueRef
+          || adopted.binding.generation !== current.binding.generation) {
+          throw new StoreError("Native catalog adoption lost its exact product Session.");
+        }
+      }
+      const changed = this.database.prepare(`
+        UPDATE native_catalog_adoptions SET state = ?, updated_at = ?, revision = ?
+        WHERE operation_id = ? AND state IN ('claimed', 'unknown') AND revision = ?
+      `).run(state, at, asSqlInteger(this.requireActiveRevision()), operationId, asSqlInteger(expectedRevision));
+      if (changed.changes !== 1) throw new StoreError("Native catalog adoption changed during reconciliation.");
+      return this.getNativeCatalogAdoption(operationId);
+    });
+  }
+
+  listPendingPortableReplacementCleanups(): PortableReplacementCleanupRecord[] {
+    this.assertOpen();
+    return (this.database.prepare(`
+      SELECT * FROM portable_replacement_cleanups
+      WHERE native_state <> 'completed' OR worktree_state <> 'completed'
+      ORDER BY created_at, operation_id
+    `).all() as Row[]).map(portableReplacementCleanupFromRow);
+  }
+
+  claimPortableReplacementNativeCleanup(operationId: string, at = this.now()): PortableReplacementCleanupRecord {
+    if (!Number.isSafeInteger(at) || at < 0) throw new StoreError("Portable replacement time is invalid.");
+    return this.write(() => {
+      const current = this.getPortableReplacementCleanup(operationId);
+      if (current.nativeState !== "pending") throw new StoreError("Portable replacement native cleanup is not pending.");
+      const imported = this.getSession(current.importedSessionId).descriptor;
+      const replaced = this.getSession(current.replacedSessionId).descriptor;
+      if (imported.deletedAt !== undefined || replaced.deletedAt === undefined
+        || imported.backendId !== replaced.backendId || imported.targetId !== replaced.targetId
+        || imported.binding.opaqueRef.toLowerCase() === replaced.binding.opaqueRef.toLowerCase()
+        || this.findLiveSessionByNativeBinding(replaced.backendId, replaced.binding.opaqueRef) !== undefined) {
+        throw new StoreError("Portable replacement native cleanup lost its exact owner.");
+      }
+      this.database.prepare(`
+        UPDATE portable_replacement_cleanups
+        SET native_state = 'dispatched', updated_at = ?, revision = ?
+        WHERE operation_id = ? AND native_state = 'pending'
+      `).run(at, asSqlInteger(this.requireActiveRevision()), operationId);
+      return this.getPortableReplacementCleanup(operationId);
+    });
+  }
+
+  /** An explicit retry is fenced by the exact receipt and old/new owner observed before inspection. */
+  claimPortableReplacementNativeRetry(input: {
+    readonly operationId: string;
+    readonly importedSessionId: string;
+    readonly cleanupRevision: bigint;
+    readonly replacedSessionRevision: bigint;
+    readonly targetRevision: bigint;
+    readonly backendInstanceGeneration: number;
+    readonly at?: number;
+  }): PortableReplacementCleanupRecord {
+    const at = input.at ?? this.now();
+    if (!Number.isSafeInteger(at) || at < 0) throw new StoreError("Portable replacement time is invalid.");
+    return this.write(() => {
+      const current = this.getPortableReplacementCleanup(input.operationId);
+      this.assertPortableReplacementInspectionOwner(current, input);
+      if (current.nativeState !== "unknown") throw new StoreError("Portable replacement native cleanup is not awaiting verification.");
+      const changed = this.database.prepare(`
+        UPDATE portable_replacement_cleanups
+        SET native_state = 'dispatched', failure_code = NULL, updated_at = ?, revision = ?
+        WHERE operation_id = ? AND native_state = 'unknown' AND revision = ?
+      `).run(at, asSqlInteger(this.requireActiveRevision()), input.operationId, asSqlInteger(input.cleanupRevision));
+      if (changed.changes !== 1) throw new StoreError("Portable replacement cleanup changed during inspection.");
+      return this.getPortableReplacementCleanup(input.operationId);
+    });
+  }
+
+  /** Confirm only an independently proven absence; no native effect is dispatched. */
+  confirmPortableReplacementNativeAbsence(input: {
+    readonly operationId: string;
+    readonly importedSessionId: string;
+    readonly cleanupRevision: bigint;
+    readonly replacedSessionRevision: bigint;
+    readonly targetRevision: bigint;
+    readonly backendInstanceGeneration: number;
+    readonly at?: number;
+  }): PortableReplacementCleanupRecord {
+    const at = input.at ?? this.now();
+    if (!Number.isSafeInteger(at) || at < 0) throw new StoreError("Portable replacement time is invalid.");
+    return this.write(() => {
+      const current = this.getPortableReplacementCleanup(input.operationId);
+      this.assertPortableReplacementInspectionOwner(current, input);
+      if (current.nativeState !== "unknown") throw new StoreError("Portable replacement native cleanup is not awaiting verification.");
+      const changed = this.database.prepare(`
+        UPDATE portable_replacement_cleanups
+        SET native_state = 'completed', failure_code = NULL, updated_at = ?, revision = ?
+        WHERE operation_id = ? AND native_state = 'unknown' AND revision = ?
+      `).run(at, asSqlInteger(this.requireActiveRevision()), input.operationId, asSqlInteger(input.cleanupRevision));
+      if (changed.changes !== 1) throw new StoreError("Portable replacement cleanup changed during inspection.");
+      return this.getPortableReplacementCleanup(input.operationId);
+    });
+  }
+
+  private assertPortableReplacementInspectionOwner(
+    current: PortableReplacementCleanupRecord,
+    expected: {
+      readonly importedSessionId: string;
+      readonly cleanupRevision: bigint;
+      readonly replacedSessionRevision: bigint;
+      readonly targetRevision: bigint;
+      readonly backendInstanceGeneration: number;
+    }
+  ): void {
+    const imported = this.getSession(current.importedSessionId);
+    const replaced = this.getSession(current.replacedSessionId);
+    if (current.importedSessionId !== expected.importedSessionId
+      || current.revision !== expected.cleanupRevision
+      || replaced.revision !== expected.replacedSessionRevision
+      || replaced.descriptor.deletedAt === undefined
+      || imported.descriptor.deletedAt !== undefined
+      || imported.descriptor.backendId !== replaced.descriptor.backendId
+      || imported.descriptor.targetId !== replaced.descriptor.targetId
+      || imported.descriptor.binding.opaqueRef.toLowerCase() === replaced.descriptor.binding.opaqueRef.toLowerCase()
+      || this.findLiveSessionByNativeBinding(replaced.descriptor.backendId, replaced.descriptor.binding.opaqueRef) !== undefined
+      || this.getTarget(replaced.descriptor.targetId).revision !== expected.targetRevision
+      || this.getBackend(replaced.descriptor.backendId).descriptor.instanceGeneration !== expected.backendInstanceGeneration) {
+      throw new StoreError("Portable replacement cleanup lost its exact inspected owner.");
+    }
+  }
+
+  confirmPortableReplacementNativeCleanup(operationId: string, at = this.now()): PortableReplacementCleanupRecord {
+    if (!Number.isSafeInteger(at) || at < 0) throw new StoreError("Portable replacement time is invalid.");
+    return this.write(() => {
+      const current = this.getPortableReplacementCleanup(operationId);
+      if (current.nativeState !== "dispatched") throw new StoreError("Portable replacement native deletion is not claimed.");
+      this.database.prepare(`
+        UPDATE portable_replacement_cleanups
+        SET native_state = 'completed', failure_code = NULL, updated_at = ?, revision = ?
+        WHERE operation_id = ? AND native_state = 'dispatched'
+      `).run(at, asSqlInteger(this.requireActiveRevision()), operationId);
+      return this.getPortableReplacementCleanup(operationId);
+    });
+  }
+
+  markPortableReplacementNativeUnknown(operationId: string, at = this.now()): PortableReplacementCleanupRecord {
+    if (!Number.isSafeInteger(at) || at < 0) throw new StoreError("Portable replacement time is invalid.");
+    return this.write(() => {
+      const current = this.getPortableReplacementCleanup(operationId);
+      if (current.nativeState !== "dispatched") return current;
+      this.database.prepare(`
+        UPDATE portable_replacement_cleanups
+        SET native_state = 'unknown', failure_code = 'native_delete_unknown', updated_at = ?, revision = ?
+        WHERE operation_id = ? AND native_state = 'dispatched'
+      `).run(at, asSqlInteger(this.requireActiveRevision()), operationId);
+      return this.getPortableReplacementCleanup(operationId);
+    });
+  }
+
+  recoverPortableReplacementCleanupClaims(at = this.now()): number {
+    if (!Number.isSafeInteger(at) || at < 0) throw new StoreError("Portable replacement time is invalid.");
+    return this.write(() => Number(this.database.prepare(`
+      UPDATE portable_replacement_cleanups
+      SET native_state = 'unknown', failure_code = 'native_delete_unknown', updated_at = ?, revision = ?
+      WHERE native_state = 'dispatched'
+    `).run(at, asSqlInteger(this.requireActiveRevision())).changes));
+  }
+
+  confirmPortableReplacementWorktreeCleanup(operationId: string, at = this.now()): PortableReplacementCleanupRecord {
+    if (!Number.isSafeInteger(at) || at < 0) throw new StoreError("Portable replacement time is invalid.");
+    return this.write(() => {
+      const current = this.getPortableReplacementCleanup(operationId);
+      if (current.nativeState !== "completed") throw new StoreError("Portable replacement native cleanup is not confirmed.");
+      if (current.worktreeState === "completed") return current;
+      this.database.prepare(`
+        UPDATE portable_replacement_cleanups
+        SET worktree_state = 'completed', failure_code = NULL, updated_at = ?, revision = ?
+        WHERE operation_id = ? AND worktree_state = 'pending'
+      `).run(at, asSqlInteger(this.requireActiveRevision()), operationId);
+      return this.getPortableReplacementCleanup(operationId);
+    });
+  }
+
+  markPortableReplacementWorktreePending(operationId: string, at = this.now()): PortableReplacementCleanupRecord {
+    if (!Number.isSafeInteger(at) || at < 0) throw new StoreError("Portable replacement time is invalid.");
+    return this.write(() => {
+      const current = this.getPortableReplacementCleanup(operationId);
+      if (current.nativeState !== "completed" || current.worktreeState !== "pending") return current;
+      this.database.prepare(`
+        UPDATE portable_replacement_cleanups
+        SET failure_code = 'worktree_release_pending', updated_at = ?, revision = ?
+        WHERE operation_id = ? AND native_state = 'completed' AND worktree_state = 'pending'
+      `).run(at, asSqlInteger(this.requireActiveRevision()), operationId);
+      return this.getPortableReplacementCleanup(operationId);
+    });
+  }
+
   prepareSessionLifecycleCleanup(input: {
     readonly operationId: string;
     readonly sessionId: string;
@@ -13398,6 +14245,11 @@ export class OperationalStore {
         return existing;
       }
       this.getSession(sessionId);
+      const portableCleanup = this.findPortableReplacementCleanupForImportedSession(sessionId);
+      if (portableCleanup !== undefined && (portableCleanup.nativeState !== "completed"
+        || portableCleanup.worktreeState !== "completed")) {
+        throw new StoreError("Resolve the previous portable task cleanup before archiving or deleting this task.");
+      }
       const pending = this.findPendingSessionLifecycleCleanup(sessionId);
       if (pending !== undefined) throw new OperationInProgressError(pending.operationId);
       const scheduleDeletion = this.findPendingScheduleDeletionCleanupForSession(sessionId);
@@ -15574,6 +16426,25 @@ export class OperationalStore {
     return this.transactionFrames.length === 0 ? this.transaction(callback) : callback();
   }
 
+  /** Maintenance progress and effect receipts must survive a process loss, but
+   * they are not product data revisions. Keeping these updates outside the
+   * global revision lets an online database copy retain its original product
+   * fence while progress is reported from the owning process. */
+  private maintenanceWrite<T>(callback: () => T): T {
+    this.assertOpen();
+    if (this.transactionFrames.length !== 0) return callback();
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const result = callback();
+      if (isPromiseLike(result)) throw new AsyncTransactionError();
+      this.database.exec("COMMIT");
+      return result;
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
   /**
    * Converts one cumulative native observation into an additive, attributed
    * delta. Each capability-neutral source cursor is deliberately independent
@@ -17286,13 +18157,7 @@ function backendFromRow(row: Row): StoredBackend {
 }
 
 function targetFromRow(row: Row): StoredTarget {
-  const remoteHostTargetId = optionalString("hostTargetId", row["remote_host_target_id"]).hostTargetId;
-  const remoteHostId = optionalString("hostId", row["remote_host_id"]).hostId;
-  const remoteRoot = optionalString("workspaceRoot", row["remote_workspace_root"]).workspaceRoot;
-  if ((remoteHostTargetId === undefined) !== (remoteHostId === undefined)
-    || (remoteHostId === undefined) !== (remoteRoot === undefined)) {
-    throw new StoreError("Stored Target Remote workspace binding is incomplete.");
-  }
+  const remoteWorkspace = remoteWorkspaceFromRow(row, "Target");
   return {
     descriptor: {
       id: stringValue(row["id"]),
@@ -17301,15 +18166,7 @@ function targetFromRow(row: Row): StoredTarget {
       workspaceRoot: stringValue(row["workspace_root"]),
       managed: booleanValue(row["managed"]),
       trusted: booleanValue(row["trusted"]),
-      ...(remoteHostTargetId === undefined || remoteHostId === undefined || remoteRoot === undefined
-        ? {}
-        : {
-            remoteWorkspace: {
-              hostTargetId: remoteHostIdentity(remoteHostTargetId, "host target id", 256),
-              hostId: remoteHostAlias(remoteHostId),
-              workspaceRoot: remoteWorkspaceRoot(remoteRoot)
-            }
-          })
+      ...(remoteWorkspace === undefined ? {} : { remoteWorkspace })
     },
     metadata: parseJson(stringValue(row["metadata_json"])),
     createdAt: numberValue(row["created_at"]),
@@ -17410,9 +18267,7 @@ function remoteHostFromRow(row: Row): RemoteHostRecord {
 }
 
 function sessionFromRow(row: Row): StoredSession {
-  const remoteHostTargetId = optionalString("hostTargetId", row["remote_host_target_id"]).hostTargetId;
-  const remoteHostId = optionalString("hostId", row["remote_host_id"]).hostId;
-  const remoteRoot = optionalString("workspaceRoot", row["remote_workspace_root"]).workspaceRoot;
+  const remoteWorkspace = remoteWorkspaceFromRow(row, "Session");
   const automationScheduleId = optionalString("scheduleId", row["automation_schedule_id"]).scheduleId;
   const automationScheduleName = optionalString("scheduleName", row["automation_schedule_name"]).scheduleName;
   const automationRunId = optionalString("runId", row["automation_run_id"]).runId;
@@ -17429,10 +18284,6 @@ function sessionFromRow(row: Row): StoredSession {
     "sourceEventId",
     row["derivation_source_event_id"]
   ).sourceEventId;
-  if ((remoteHostTargetId === undefined) !== (remoteHostId === undefined)
-    || (remoteHostId === undefined) !== (remoteRoot === undefined)) {
-    throw new StoreError("Stored Session Remote workspace binding is incomplete.");
-  }
   if ((automationScheduleId === undefined) !== (automationRunId === undefined) ||
     (automationScheduleId === undefined && automationScheduleName !== undefined)) {
     throw new StoreError("Stored Session automation origin is incomplete.");
@@ -17497,15 +18348,7 @@ function sessionFromRow(row: Row): StoredSession {
       ...optionalString("effort", row["effort"]),
       fastMode: booleanValue(row["fast_mode"]),
       ...optionalString("appendSystemPrompt", row["append_system_prompt"]),
-      ...(remoteHostTargetId === undefined || remoteHostId === undefined || remoteRoot === undefined
-        ? {}
-        : {
-            remoteWorkspace: {
-              hostTargetId: remoteHostIdentity(remoteHostTargetId, "host target id", 256),
-              hostId: remoteHostAlias(remoteHostId),
-              workspaceRoot: remoteWorkspaceRoot(remoteRoot)
-            }
-          }),
+      ...(remoteWorkspace === undefined ? {} : { remoteWorkspace }),
       createdAt: numberValue(row["created_at"]),
       updatedAt: numberValue(row["updated_at"])
     },
@@ -17876,16 +18719,11 @@ function sessionWorktreeFromRow(row: Row): SessionWorktreeBinding {
     ] as const),
     sourceRefreshed: booleanValue(row["source_refreshed"]),
     ...optionalString("sourceRemote", row["source_remote"]),
-    ...(row["remote_host_owner_id"] === null ? {} : { remote: normalizeRemoteWorktreeAuthority({
-      hostOwnerId: stringValue(row["remote_host_owner_id"]),
-      hostTargetId: stringValue(row["remote_host_target_id"]),
-      hostId: stringValue(row["remote_host_id"]),
-      hostIdentity: stringValue(row["remote_host_identity"]),
-      targetId: stringValue(row["remote_target_id"]),
-      targetRevision: toBigInt(row["remote_target_revision"]).toString(),
-      hostRevision: toBigInt(row["remote_host_revision"]).toString(),
-      manifestId: stringValue(row["remote_manifest_id"])
-    }) }),
+    ...(row["remote_authority_json"] === null ? {} : {
+      remote: normalizeRemoteWorktreeAuthority(
+        parseJson<NonNullable<SessionWorktreeBinding["remote"]>>(stringValue(row["remote_authority_json"]))
+      )
+    }),
     state: enumValue(row["state"], ["active", "preserved"] as const),
     acquiredAt: numberValue(row["acquired_at"]),
     updatedAt: numberValue(row["updated_at"])
@@ -18063,6 +18901,7 @@ function normalizeNativeSessionDerivationCommon(input: Omit<RecordNativeSessionD
     throw new StoreError("Native derivation backend generation is invalid.");
   }
   if (!/^sha256:[a-f0-9]{64}$/u.test(input.expectedBodyHash)) throw new StoreError("Native derivation body hash is invalid.");
+  const remoteWorkspace = normalizeRemoteWorkspace(input.remoteWorkspace);
   return {
     operationId: nativeDerivationIdentity(input.operationId, "Operation ID"),
     expectedBodyHash: input.expectedBodyHash,
@@ -18072,14 +18911,12 @@ function normalizeNativeSessionDerivationCommon(input: Omit<RecordNativeSessionD
     backendId: nativeDerivationIdentity(input.backendId, "Backend ID"),
     backendInstanceGeneration: input.backendInstanceGeneration,
     targetId: nativeDerivationIdentity(input.targetId, "Target ID"),
-    effectiveWorkspaceRoot: input.remoteWorkspace === undefined
+    effectiveWorkspaceRoot: remoteWorkspace === undefined
       ? nativeBindingReference(input.effectiveWorkspaceRoot)
-      : remoteWorkspaceRoot(input.effectiveWorkspaceRoot),
-    ...(input.remoteWorkspace === undefined ? {} : { remoteWorkspace: {
-      hostTargetId: remoteHostIdentity(input.remoteWorkspace.hostTargetId, "host target id", 256),
-      hostId: remoteHostAlias(input.remoteWorkspace.hostId),
-      workspaceRoot: remoteWorkspaceRoot(input.remoteWorkspace.workspaceRoot)
-    } })
+      : remoteWorkspace.kind === "ssh"
+        ? remoteWorkspaceRoot(input.effectiveWorkspaceRoot)
+        : devicePeerWorkspaceRoot(input.effectiveWorkspaceRoot),
+    ...(remoteWorkspace === undefined ? {} : { remoteWorkspace })
   };
 }
 
@@ -18155,15 +18992,16 @@ function normalizeNativeDerivationWorktree(value: SessionWorktreeBinding): Sessi
     ? undefined
     : nativeDerivationWorktreeText(value.sourceRemote, "source remote", 1_024);
   const remote = value.remote === undefined ? undefined : normalizeRemoteWorktreeAuthority(value.remote);
+  const remotePaths = remote === undefined ? undefined : remoteWorktreePaths(remote.binding);
   return {
     leaseId: nativeDerivationWorktreeText(value.leaseId, "lease ID", 256),
     workspaceId: nativeDerivationWorktreeText(value.workspaceId, "workspace ID", 256),
     path: remote === undefined
       ? nativeDerivationWorktreeText(value.path, "path", 32_768)
-      : remoteWorkspaceRoot(value.path),
+      : remoteNativePath(value.path, remotePaths!),
     repositoryRoot: remote === undefined
       ? nativeDerivationWorktreeText(value.repositoryRoot, "repository root", 32_768)
-      : remoteWorkspaceRoot(value.repositoryRoot),
+      : remoteNativePath(value.repositoryRoot, remotePaths!),
     branch: nativeDerivationWorktreeText(value.branch, "branch", 4_096),
     sourceRef: nativeDerivationWorktreeText(value.sourceRef, "source ref", 4_096),
     sourceCommit: nativeDerivationWorktreeText(value.sourceCommit, "source commit", 256),
@@ -18181,25 +19019,18 @@ function normalizeRemoteWorktreeAuthority(
   value: NonNullable<SessionWorktreeBinding["remote"]>
 ): NonNullable<SessionWorktreeBinding["remote"]> {
   if (!isRecord(value) || Object.keys(value).some((key) => ![
-    "hostOwnerId", "hostTargetId", "hostId", "hostIdentity", "targetId",
-    "targetRevision", "hostRevision", "manifestId"
+    "targetId", "binding", "executionIdentity", "targetRevision", "manifestId"
   ].includes(key))) {
     throw new StoreError("Native derivation remote worktree authority is invalid.");
   }
-  const hostIdentity = value.hostIdentity;
-  if (typeof hostIdentity !== "string" || !/^sha256:[a-f0-9]{64}$/u.test(hostIdentity)) {
-    throw new StoreError("Native derivation remote Host identity is invalid.");
-  }
   const targetRevision = canonicalPositiveRevision(value.targetRevision);
-  const hostRevision = canonicalPositiveRevision(value.hostRevision);
+  const binding = normalizeRemoteWorkspace(value.binding);
+  if (binding === undefined) throw new StoreError("Native derivation remote worktree binding is invalid.");
   return {
-    hostOwnerId: nativeDerivationIdentity(value.hostOwnerId, "Remote Host owner ID"),
-    hostTargetId: remoteHostIdentity(value.hostTargetId, "host target id", 256),
-    hostId: remoteHostAlias(value.hostId),
-    hostIdentity,
     targetId: nativeDerivationIdentity(value.targetId, "Remote Target ID"),
+    binding,
+    executionIdentity: nativeDerivationWorktreeText(value.executionIdentity, "execution identity", 4_096),
     targetRevision,
-    hostRevision,
     manifestId: nativeDerivationIdentity(value.manifestId, "Remote checkout manifest ID")
   };
 }
@@ -18209,6 +19040,52 @@ function canonicalPositiveRevision(value: unknown): string {
     throw new StoreError("Native derivation remote worktree revision is invalid.");
   }
   return value;
+}
+
+function parseRemoteWorktreeExecutionIdentity(value: string, kind: "ssh"): {
+  readonly ownerId: string;
+};
+function parseRemoteWorktreeExecutionIdentity(value: string, kind: "device_peer"): {
+  readonly controllerDeviceId: string;
+  readonly targetDeviceId: string;
+};
+function parseRemoteWorktreeExecutionIdentity(
+  value: string,
+  kind: RemoteWorkspaceBinding["kind"]
+): { readonly ownerId: string } | { readonly controllerDeviceId: string; readonly targetDeviceId: string } {
+  const parsed = parseJson<unknown>(value);
+  if (!isRecord(parsed) || parsed["kind"] !== kind) {
+    throw new StoreError("Native derivation remote execution identity is invalid.");
+  }
+  if (kind === "ssh") {
+    assertExactRemoteWorkspaceKeys(parsed, [
+      "algorithm", "fingerprint", "hostId", "hostTargetId", "hostname", "kind", "ownerId", "port", "user"
+    ]);
+    return { ownerId: nativeDerivationIdentity(parsed["ownerId"] as string, "Remote Host owner ID") };
+  }
+  assertExactRemoteWorkspaceKeys(parsed, ["controllerDeviceId", "kind", "targetDeviceId"]);
+  return {
+    controllerDeviceId: devicePeerIdentity(parsed["controllerDeviceId"] as string, "controller"),
+    targetDeviceId: devicePeerIdentity(parsed["targetDeviceId"] as string, "target")
+  };
+}
+
+function remoteSshWorktreeExecutionIdentity(
+  binding: Extract<RemoteWorkspaceBinding, { readonly kind: "ssh" }>,
+  host: RemoteHostRecord
+): string {
+  if (host.trust === undefined) throw new StoreError("The remote derivation Host authority changed.");
+  return JSON.stringify({
+    kind: "ssh",
+    hostTargetId: binding.hostTargetId,
+    hostId: binding.hostId,
+    ownerId: host.ownerId,
+    hostname: host.hostname,
+    port: host.port,
+    user: host.user,
+    algorithm: host.trust.algorithm,
+    fingerprint: host.trust.fingerprint
+  });
 }
 
 function normalizeRemoteNativeDerivationWorktreePlan(
@@ -18240,24 +19117,25 @@ function normalizeRemoteNativeDerivationWorktreePlan(
   const manifestId = nativeDerivationUuid(value.manifestId, "remote checkout manifest ID");
   const sessionId = nativeDerivationIdentity(value.sessionId, "Derived Session ID");
   const sourceSessionId = nativeDerivationIdentity(value.sourceSessionId, "Source Session ID");
-  const sourceCwd = remoteWorkspaceRoot(value.sourceCwd);
+  const remotePaths = remoteWorktreePaths(normalized.remote.binding);
+  const sourceCwd = remoteNativePath(value.sourceCwd, remotePaths);
   if (typeof value.sourceSnapshot !== "string" || !/^sha256:[a-f0-9]{64}$/u.test(value.sourceSnapshot)) {
     throw new StoreError("Native derivation remote source snapshot is invalid.");
   }
   const sourceSnapshot = value.sourceSnapshot;
-  const storageRoot = remoteWorkspaceRoot(value.storageRoot);
+  const storageRoot = remoteNativePath(value.storageRoot, remotePaths);
   if (value.format !== 1 || sessionId === sourceSessionId
     || normalized.remote.manifestId !== manifestId
-    || normalized.path !== path.posix.join(storageRoot, "checkouts", leaseId)
+    || normalized.path !== remotePaths.join(storageRoot, "checkouts", leaseId)
     || normalized.branch !== `joko/remote-${createHash("sha256").update(sessionId).digest("hex").slice(0, 12)}-${leaseId.slice(0, 8)}`
     || normalized.sourceRef !== normalized.sourceCommit || normalized.sourceStrategy !== "explicit"
     || normalized.sourceRefreshed !== false || !/^[a-f0-9]{40,64}$/u.test(normalized.sourceCommit)) {
     throw new StoreError("Native derivation remote worktree plan identity is invalid.");
   }
   if (!isRecord(value.authority) || Object.keys(value.authority).some((key) => ![
-    "hostOwnerId", "hostTargetId", "hostId", "hostIdentity", "targetId", "targetRevision", "hostRevision"
+    "targetId", "binding", "executionIdentity", "targetRevision"
   ].includes(key))) {
-    throw new StoreError("Native derivation remote worktree plan Host authority is invalid.");
+    throw new StoreError("Native derivation remote worktree plan authority is invalid.");
   }
   const authorityWithManifest = normalizeRemoteWorktreeAuthority({
     ...value.authority, manifestId
@@ -18267,7 +19145,7 @@ function normalizeRemoteNativeDerivationWorktreePlan(
   }
   const { manifestId: _manifestId, ...authority } = authorityWithManifest;
   const sourceLease = value.sourceLease === undefined
-    ? undefined : normalizeRemoteNativeDerivationSourceLease(value.sourceLease);
+    ? undefined : normalizeRemoteNativeDerivationSourceLease(value.sourceLease, remotePaths);
   if (sourceLease !== undefined && (sourceLease.sessionId !== sourceSessionId || sourceLease.path !== sourceCwd
     || !sameStableRemoteWorktreeAuthority(sourceLease.remote, normalized.remote))) {
     throw new StoreError("Native derivation remote source checkout does not match its plan.");
@@ -18304,7 +19182,8 @@ function nativeDerivationUuid(value: string, label: string): string {
 }
 
 function normalizeRemoteNativeDerivationSourceLease(
-  value: NonNullable<RemoteNativeDerivationWorktreePlan["sourceLease"]>
+  value: NonNullable<RemoteNativeDerivationWorktreePlan["sourceLease"]>,
+  paths: PlatformPath
 ): NonNullable<RemoteNativeDerivationWorktreePlan["sourceLease"]> {
   if (!isRecord(value) || Object.keys(value).some((key) => ![
     "id", "sessionId", "path", "repositoryRoot", "branch", "source", "acquiredAt", "remote"
@@ -18316,11 +19195,15 @@ function normalizeRemoteNativeDerivationSourceLease(
     || !Number.isSafeInteger(value.acquiredAt) || value.acquiredAt < 0) {
     throw new StoreError("Native derivation remote source checkout is invalid.");
   }
+  const remote = normalizeRemoteWorktreeAuthority(value.remote);
+  if (remoteWorktreePaths(remote.binding) !== paths) {
+    throw new StoreError("Native derivation remote source checkout uses another path style.");
+  }
   return {
     id: nativeDerivationUuid(value.id, "source checkout lease ID"),
     sessionId: nativeDerivationIdentity(value.sessionId, "Source Session ID"),
-    path: remoteWorkspaceRoot(value.path),
-    repositoryRoot: remoteWorkspaceRoot(value.repositoryRoot),
+    path: remoteNativePath(value.path, paths),
+    repositoryRoot: remoteNativePath(value.repositoryRoot, paths),
     branch: nativeDerivationWorktreeText(value.branch, "source branch", 4_096),
     source: {
       ref: value.source.ref,
@@ -18329,7 +19212,7 @@ function normalizeRemoteNativeDerivationSourceLease(
       strategy: "explicit"
     },
     acquiredAt: value.acquiredAt,
-    remote: normalizeRemoteWorktreeAuthority(value.remote)
+    remote
   };
 }
 
@@ -18337,9 +19220,9 @@ function sameStableRemoteWorktreeAuthority(
   left: NonNullable<SessionWorktreeBinding["remote"]>,
   right: NonNullable<SessionWorktreeBinding["remote"]>
 ): boolean {
-  return left.hostOwnerId === right.hostOwnerId
-    && left.hostTargetId === right.hostTargetId && left.hostId === right.hostId
-    && left.hostIdentity === right.hostIdentity && left.targetId === right.targetId;
+  return left.targetId === right.targetId
+    && left.executionIdentity === right.executionIdentity
+    && sameRemoteWorkspace(left.binding, right.binding);
 }
 
 function remoteDerivationWorktreeMatches(
@@ -18349,8 +19232,7 @@ function remoteDerivationWorktreeMatches(
   if (workspace === undefined || worktree.remote === undefined) {
     return workspace === undefined && worktree.remote === undefined;
   }
-  return workspace.hostTargetId === worktree.remote.hostTargetId
-    && workspace.hostId === worktree.remote.hostId;
+  return sameRemoteWorkspace(workspace, worktree.remote.binding);
 }
 
 function sameRemoteWorktreePlan(
@@ -18515,6 +19397,7 @@ function nativeSessionDerivationFromRow(row: Row): NativeSessionDerivationRecord
   }
   const worktree = decodeNativeDerivationWorktree(row);
   const remoteWorktreePlan = decodeRemoteNativeDerivationWorktreePlan(row);
+  const remoteWorkspace = remoteWorkspaceFromRow(row, "native derivation");
   return {
     operationId: stringValue(row["operation_id"]),
     expectedBodyHash: stringValue(row["body_hash"]),
@@ -18534,10 +19417,7 @@ function nativeSessionDerivationFromRow(row: Row): NativeSessionDerivationRecord
       : { sourceSessionRevision: toBigInt(row["source_session_revision"]) }),
     ...(row["target_revision"] === null ? {} : { targetRevision: toBigInt(row["target_revision"]) }),
     effectiveWorkspaceRoot: stringValue(row["effective_workspace_root"]),
-    ...(row["remote_host_id"] === null ? {} : { remoteWorkspace: {
-      hostTargetId: remoteHostIdentity(stringValue(row["remote_host_target_id"]), "host target id", 256),
-      hostId: stringValue(row["remote_host_id"]), workspaceRoot: stringValue(row["remote_workspace_root"])
-    } }),
+    ...(remoteWorkspace === undefined ? {} : { remoteWorkspace }),
     ...(worktree === undefined ? {} : { worktree }),
     ...(remoteWorktreePlan === undefined ? {} : { remoteWorktreePlan }),
     externalLifecycle: booleanValue(row["external_lifecycle"]),
@@ -19456,6 +20336,60 @@ function scheduleDeletionCleanupFromRow(row: Row): ScheduleDeletionCleanupRecord
   };
 }
 
+function portableReplacementCleanupFromRow(row: Row): PortableReplacementCleanupRecord {
+  const failureCode = row["failure_code"] === null ? undefined : stringValue(row["failure_code"]);
+  return {
+    operationId: stringValue(row["operation_id"]),
+    importedSessionId: stringValue(row["imported_session_id"]),
+    replacedSessionId: stringValue(row["replaced_session_id"]),
+    nativeState: enumValue(row["native_state"], ["pending", "dispatched", "unknown", "completed"] as const),
+    worktreeState: enumValue(row["worktree_state"], ["pending", "completed"] as const),
+    ...(failureCode === undefined ? {} : { failureCode }),
+    createdAt: numberValue(row["created_at"]),
+    updatedAt: numberValue(row["updated_at"]),
+    revision: toBigInt(row["revision"])
+  };
+}
+
+function nativeCatalogAdoptionFromRow(row: Row): NativeCatalogAdoptionRecord {
+  const rawBinding = parseJson<unknown>(stringValue(row["binding_json"]));
+  const rawEntry = parseJson<unknown>(stringValue(row["entry_json"]));
+  const recoveryReference = parseJson<unknown>(stringValue(row["recovery_json"]));
+  if (!isRecord(rawBinding) || typeof rawBinding["opaqueRef"] !== "string"
+    || typeof rawBinding["nativeSessionId"] !== "string"
+    || !Number.isSafeInteger(rawBinding["generation"]) || Number(rawBinding["generation"]) < 1
+    || !isRecord(rawEntry) || typeof rawEntry["nativeReference"] !== "string"
+    || rawEntry["nativeSessionId"] !== rawBinding["nativeSessionId"]
+    || typeof rawEntry["createdAt"] !== "number" || !Number.isSafeInteger(rawEntry["createdAt"])
+    || typeof rawEntry["modifiedAt"] !== "number" || !Number.isSafeInteger(rawEntry["modifiedAt"])
+    || typeof rawEntry["archived"] !== "boolean"
+    || (rawEntry["placement"] !== "project" && rawEntry["placement"] !== "dialogue")
+    || (rawEntry["existingMatch"] !== "binding" && rawEntry["existingMatch"] !== "binding_and_placement")
+    || !["title", "workingDirectory", "projectDirectory"].every((key) => rawEntry[key] === undefined || typeof rawEntry[key] === "string")
+    || typeof recoveryReference !== "string" || recoveryReference.trim().length === 0
+    || stringValue(row["native_reference"]) !== rawBinding["opaqueRef"]) {
+    throw new StoreError("Native catalog adoption receipt is invalid.");
+  }
+  return {
+    operationId: stringValue(row["operation_id"]),
+    ...(row["request_operation_id"] === null ? {} : { requestOperationId: stringValue(row["request_operation_id"]) }),
+    sessionId: stringValue(row["session_id"]),
+    backendId: stringValue(row["backend_id"]),
+    targetId: stringValue(row["target_id"]),
+    ...(row["project_id"] === null ? {} : { projectId: stringValue(row["project_id"]) }),
+    ...(row["project_revision"] === null ? {} : { projectRevision: toBigInt(row["project_revision"]) }),
+    targetRevision: toBigInt(row["target_revision"]),
+    backendGeneration: numberValue(row["backend_generation"]),
+    binding: rawBinding as unknown as NativeSessionBinding,
+    entry: rawEntry as unknown as NativeCatalogAdoptionRecord["entry"],
+    recoveryReference,
+    state: enumValue(row["state"], ["claimed", "unknown", "adopted", "absent"] as const),
+    createdAt: numberValue(row["created_at"]),
+    updatedAt: numberValue(row["updated_at"]),
+    revision: toBigInt(row["revision"])
+  };
+}
+
 function sessionLifecycleCleanupFromRow(row: Row): SessionLifecycleCleanupRecord {
   const failureValue = row["failure_json"] === null
     ? undefined
@@ -19848,13 +20782,157 @@ function remoteWorkspaceRoot(value: string): string {
   return value;
 }
 
+function remoteWorktreePaths(binding: RemoteWorkspaceBinding): PlatformPath {
+  if (binding.kind === "ssh" || binding.workspaceRoot.startsWith("/")) return path.posix;
+  return path.win32;
+}
+
+function remoteNativePath(value: string, paths: PlatformPath): string {
+  if (
+    typeof value !== "string" ||
+    value.length < 2 ||
+    value.length > 32_768 ||
+    value !== value.trim() ||
+    value.includes("\0") ||
+    /[\r\n]/u.test(value) ||
+    !strictHostAbsolute(value, paths) ||
+    paths.normalize(value) !== value ||
+    paths.parse(value).root === value
+  ) {
+    throw new StoreError("Remote worktree path must be an absolute normalized host-native path.");
+  }
+  return value;
+}
+
+function devicePeerWorkspaceRoot(value: string): string {
+  const paths = value.startsWith("/") ? path.posix : path.win32;
+  if (
+    typeof value !== "string" ||
+    value.length === 0 ||
+    value.length > 16_384 ||
+    value !== value.trim() ||
+    value.includes("\0") ||
+    /[\r\n]/u.test(value) ||
+    !strictHostAbsolute(value, paths) ||
+    paths.normalize(value) !== value
+  ) {
+    throw new StoreError("Device peer workspace root must be an absolute host-native path.");
+  }
+  return value;
+}
+
+function strictHostAbsolute(value: string, paths: PlatformPath): boolean {
+  if (!paths.isAbsolute(value)) return false;
+  if (paths !== path.win32) return true;
+  const root = path.win32.parse(value).root;
+  return root !== "\\" && root !== "/" && root.length > 1;
+}
+
+function devicePeerIdentity(value: string, label: "controller" | "target"): string {
+  if (
+    typeof value !== "string" ||
+    value.length === 0 ||
+    value.length > 256 ||
+    value !== value.trim() ||
+    /[\u0000-\u001f\u007f]/u.test(value)
+  ) {
+    throw new StoreError(`Device peer ${label} Device identity is invalid.`);
+  }
+  return value;
+}
+
+function normalizeRemoteWorkspace(
+  value: TargetDescriptor["remoteWorkspace"]
+): RemoteWorkspaceBinding | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new StoreError("Remote workspace binding is invalid.");
+  }
+  if (value.kind === "ssh") {
+    assertExactRemoteWorkspaceKeys(value, ["hostId", "hostTargetId", "kind", "workspaceRoot"]);
+    return {
+      kind: "ssh",
+      hostTargetId: remoteHostIdentity(value.hostTargetId, "host target id", 256),
+      hostId: remoteHostAlias(value.hostId),
+      workspaceRoot: remoteWorkspaceRoot(value.workspaceRoot)
+    };
+  }
+  if (value.kind === "device_peer") {
+    assertExactRemoteWorkspaceKeys(value, ["controllerDeviceId", "kind", "targetDeviceId", "workspaceRoot"]);
+    const controllerDeviceId = devicePeerIdentity(value.controllerDeviceId, "controller");
+    const targetDeviceId = devicePeerIdentity(value.targetDeviceId, "target");
+    if (controllerDeviceId === targetDeviceId) {
+      throw new StoreError("A Device peer controller cannot target itself.");
+    }
+    return {
+      kind: "device_peer",
+      controllerDeviceId,
+      targetDeviceId,
+      workspaceRoot: devicePeerWorkspaceRoot(value.workspaceRoot)
+    };
+  }
+  throw new StoreError("Remote workspace binding kind is invalid.");
+}
+
+function assertExactRemoteWorkspaceKeys(value: object, expected: readonly string[]): void {
+  const keys = Object.keys(value).sort();
+  if (keys.length !== expected.length || keys.some((key, index) => key !== expected[index])) {
+    throw new StoreError("Remote workspace binding fields do not match its kind.");
+  }
+}
+
+function remoteWorkspaceFromRow(row: Row, owner: string): RemoteWorkspaceBinding | undefined {
+  const kind = row["remote_location_kind"];
+  const hostTargetId = row["remote_host_target_id"];
+  const hostId = row["remote_host_id"];
+  const controllerDeviceId = row["remote_controller_device_id"];
+  const targetDeviceId = row["remote_target_device_id"];
+  const workspaceRoot = row["remote_workspace_root"];
+  if (kind === null) {
+    if (hostTargetId !== null || hostId !== null || controllerDeviceId !== null
+      || targetDeviceId !== null || workspaceRoot !== null) {
+      throw new StoreError(`Stored ${owner} Remote workspace binding is incomplete.`);
+    }
+    return undefined;
+  }
+  if (kind === "ssh") {
+    if (hostTargetId === null || hostId === null || controllerDeviceId !== null
+      || targetDeviceId !== null || workspaceRoot === null) {
+      throw new StoreError(`Stored ${owner} Remote workspace binding is incomplete.`);
+    }
+    return normalizeRemoteWorkspace({
+      kind: "ssh",
+      hostTargetId: stringValue(hostTargetId),
+      hostId: stringValue(hostId),
+      workspaceRoot: stringValue(workspaceRoot)
+    });
+  }
+  if (kind === "device_peer") {
+    if (hostTargetId !== null || hostId !== null || controllerDeviceId === null
+      || targetDeviceId === null || workspaceRoot === null) {
+      throw new StoreError(`Stored ${owner} Remote workspace binding is incomplete.`);
+    }
+    return normalizeRemoteWorkspace({
+      kind: "device_peer",
+      controllerDeviceId: stringValue(controllerDeviceId),
+      targetDeviceId: stringValue(targetDeviceId),
+      workspaceRoot: stringValue(workspaceRoot)
+    });
+  }
+  throw new StoreError(`Stored ${owner} Remote workspace binding kind is invalid.`);
+}
+
 function sameRemoteWorkspace(
   left: TargetDescriptor["remoteWorkspace"],
   right: TargetDescriptor["remoteWorkspace"]
 ): boolean {
   if (left === undefined || right === undefined) return left === right;
-  return left.hostTargetId === right.hostTargetId
-    && left.hostId === right.hostId && left.workspaceRoot === right.workspaceRoot;
+  if (left.kind !== right.kind || left.workspaceRoot !== right.workspaceRoot) return false;
+  return left.kind === "ssh" && right.kind === "ssh"
+    ? left.hostTargetId === right.hostTargetId && left.hostId === right.hostId
+    : left.kind === "device_peer" && right.kind === "device_peer"
+      && left.controllerDeviceId === right.controllerDeviceId
+      && left.targetDeviceId === right.targetDeviceId;
 }
 
 function remoteHostCredentialReference(value: string): string {
@@ -20383,6 +21461,115 @@ function messagingBoundedInteger(value: number, minimum: number, maximum: number
     throw new StoreError(`Messaging ${label} must be an integer between ${minimum} and ${maximum}.`);
   }
   return value;
+}
+
+function maintenanceIdentity(value: string, label: string): string {
+  if (
+    typeof value !== "string"
+    || value.trim() !== value
+    || value.length < 1
+    || value.length > 256
+    || /[\u0000\r\n]/u.test(value)
+  ) throw new StoreError(`${label} is invalid.`);
+  return value;
+}
+
+function maintenanceKind(value: MaintenanceKind): MaintenanceKind {
+  if (value !== "history" && value !== "artifact") throw new StoreError("Maintenance kind is invalid.");
+  return value;
+}
+
+function maintenanceJobStatus(value: MaintenanceJobStatus): MaintenanceJobStatus {
+  if (!["running", "completed", "scan_expired", "storage_changed", "cancelled", "failed"].includes(value)) {
+    throw new StoreError("Maintenance job status is invalid.");
+  }
+  return value;
+}
+
+function maintenanceEffectKind(value: MaintenanceEffectKind): MaintenanceEffectKind {
+  if (!["history_binding", "history_external", "artifact_blob", "artifact_temporary"].includes(value)) {
+    throw new StoreError("Maintenance effect kind is invalid.");
+  }
+  return value;
+}
+
+function maintenanceEffectState(value: MaintenanceEffectState): MaintenanceEffectState {
+  if (!["pending", "claimed", "prepared", "quarantined", "completed", "skipped", "unknown"].includes(value)) {
+    throw new StoreError("Maintenance effect state is invalid.");
+  }
+  return value;
+}
+
+function maintenancePhase(value: string): string {
+  if (
+    typeof value !== "string"
+    || value.trim() !== value
+    || value.length < 1
+    || value.length > 64
+    || /[\u0000\r\n]/u.test(value)
+  ) throw new StoreError("Maintenance phase is invalid.");
+  return value;
+}
+
+function maintenancePercent(value: number): number {
+  if (!Number.isSafeInteger(value) || value < 0 || value > 100) {
+    throw new StoreError("Maintenance progress must be an integer between 0 and 100.");
+  }
+  return value;
+}
+
+function maintenanceScanFromRow<T>(row: Row): MaintenanceScanRecord<T> {
+  const fingerprint = row["fingerprint"];
+  return {
+    id: maintenanceIdentity(stringValue(row["id"]), "Maintenance scan ID"),
+    kind: maintenanceKind(enumValue(row["kind"], ["history", "artifact"] as const)),
+    ...(fingerprint === null || fingerprint === undefined
+      ? {}
+      : { fingerprint: maintenanceIdentity(stringValue(fingerprint), "Maintenance scan fingerprint") }),
+    state: enumValue(row["state"], ["available", "claimed", "expired"] as const),
+    payload: parseJson<T>(stringValue(row["payload_json"])),
+    expiresAt: numberValue(row["expires_at"]),
+    createdAt: numberValue(row["created_at"]),
+    updatedAt: numberValue(row["updated_at"])
+  };
+}
+
+function maintenanceJobFromRow<TPayload, TResult>(row: Row): MaintenanceJobRecord<TPayload, TResult> {
+  const result = row["result_json"];
+  return {
+    id: maintenanceIdentity(stringValue(row["id"]), "Maintenance job ID"),
+    kind: maintenanceKind(enumValue(row["kind"], ["history", "artifact"] as const)),
+    scanId: maintenanceIdentity(stringValue(row["scan_id"]), "Maintenance scan ID"),
+    status: maintenanceJobStatus(enumValue(
+      row["status"],
+      ["running", "completed", "scan_expired", "storage_changed", "cancelled", "failed"] as const
+    )),
+    phase: maintenancePhase(stringValue(row["phase"])),
+    percent: maintenancePercent(numberValue(row["percent"])),
+    cancellable: booleanValue(row["cancellable"]),
+    cancelRequested: booleanValue(row["cancel_requested"]),
+    payload: parseJson<TPayload>(stringValue(row["payload_json"])),
+    ...(result === null || result === undefined ? {} : { result: parseJson<TResult>(stringValue(result)) }),
+    createdAt: numberValue(row["created_at"]),
+    updatedAt: numberValue(row["updated_at"])
+  };
+}
+
+function maintenanceEffectFromRow<T>(row: Row): MaintenanceEffectRecord<T> {
+  return {
+    jobId: maintenanceIdentity(stringValue(row["job_id"]), "Maintenance job ID"),
+    id: maintenanceIdentity(stringValue(row["id"]), "Maintenance effect ID"),
+    kind: maintenanceEffectKind(enumValue(
+      row["kind"],
+      ["history_binding", "history_external", "artifact_blob", "artifact_temporary"] as const
+    )),
+    state: maintenanceEffectState(enumValue(
+      row["state"],
+      ["pending", "claimed", "prepared", "quarantined", "completed", "skipped", "unknown"] as const
+    )),
+    payload: parseJson<T>(stringValue(row["payload_json"])),
+    updatedAt: numberValue(row["updated_at"])
+  };
 }
 
 function boundedLimit(value: number, minimum: number, maximum: number, label: string): number {

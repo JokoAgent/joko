@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
 import { chmod, lstat, mkdir, readFile, readdir, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, posix as posixPath, relative, resolve, sep, win32 as win32Path } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import {
@@ -152,8 +152,8 @@ import {
 import { PiRpcTransport, spawnPiProcess, type PiProcessFactory, type PiProcessSpec } from "./transport.js";
 import { PiEventTranslator } from "./translator.js";
 import {
-  createDefaultPiManagedProcessSupervisor,
-  type PiManagedProcessSupervisor
+  createDefaultManagedProcessSupervisor,
+  type ManagedProcessSupervisor
 } from "./runtime-process.js";
 
 const execFileAsync = promisify(execFile);
@@ -174,6 +174,8 @@ const PI_USER_SHELL_RPC_TIMEOUT_MS = 30 * 60_000;
 const MAXIMUM_REFERENCED_RESOURCE_TEXT_BYTES = 256 * 1024;
 const BUNDLED_PI_CLI = join(dirname(fileURLToPath(import.meta.resolve("@earendil-works/pi-coding-agent"))), "cli.js");
 const EXTERNAL_SESSION_REFERENCE_PREFIX = "pi-external-session:";
+const RESET_CONTEXT_RECEIPT_VERSION = 1;
+const MAXIMUM_RESET_CONTEXT_RECEIPT_BYTES = 64 * 1024;
 const DEFAULT_APPEND_SYSTEM_PROMPT =
   "You are running inside Joko. Preserve Pi's native coding behavior. Treat Orchestrator interactions, workspace boundaries, and explicit permission decisions as authoritative host controls. " +
   "Use the dedicated grep tool for content search, the find tool for file discovery, the ls tool for directory listings, and the read tool for examining files. " +
@@ -336,7 +338,7 @@ export interface PiAdapterOptions {
   /** Host-owned validation for capability-neutral Remote workspaces. */
   readonly validateRemoteWorkspace?: (target: TargetDescriptor, signal?: AbortSignal) => Promise<void>;
   /** OS process birth-identity supervisor. Custom process factories opt in explicitly. */
-  readonly processSupervisor?: PiManagedProcessSupervisor;
+  readonly processSupervisor?: ManagedProcessSupervisor;
   /** Service-node global command gate shared by every local Session runtime. */
   readonly commandConcurrencyGate?: CommandConcurrencyGate;
   /** Hot read for local spawn and command admission policy. */
@@ -476,6 +478,24 @@ interface SessionSpawnProfile {
   readonly initialPlanMode: boolean;
   readonly initialFastMode: boolean;
   readonly runtimePolicy: "standard" | "review_read_only";
+}
+
+interface PiResetContextReceipt {
+  readonly version: typeof RESET_CONTEXT_RECEIPT_VERSION;
+  readonly operationId: string;
+  readonly sessionId: string;
+  readonly targetId: string;
+  readonly source: NativeSessionBinding;
+  readonly replacement: NativeSessionBinding;
+}
+
+interface PiResetContextDescriptor {
+  readonly version: typeof RESET_CONTEXT_RECEIPT_VERSION;
+  readonly operationId: string;
+  readonly sessionId: string;
+  readonly targetId: string;
+  readonly source: NativeSessionBinding;
+  readonly replacementGeneration: number;
 }
 
 function restoredSpawnProfile(context: AdapterContext): SessionSpawnProfile {
@@ -674,7 +694,7 @@ export class PiBackendAdapter implements
   readonly #processFactory: PiProcessFactory;
   readonly #usesDefaultProcessFactory: boolean;
   readonly #usesBundledCommand: boolean;
-  readonly #processSupervisor: PiManagedProcessSupervisor | undefined;
+  readonly #processSupervisor: ManagedProcessSupervisor | undefined;
   readonly #sessionStore: PiSessionStore;
   readonly #externalSessionRoots: readonly string[];
   readonly #externalSessionReferences = new Map<string, PiExternalSessionSource>();
@@ -732,7 +752,7 @@ export class PiBackendAdapter implements
     this.#usesDefaultProcessFactory = options.processFactory === undefined;
     this.#usesBundledCommand = options.command === undefined;
     this.#processSupervisor = options.processSupervisor ?? (options.processFactory === undefined
-      ? createDefaultPiManagedProcessSupervisor()
+      ? createDefaultManagedProcessSupervisor()
       : undefined);
     this.#sessionStore = new PiSessionStore(sessionRoot);
     if (options.mcpBridge && !options.mcpBridge.token) {
@@ -794,11 +814,26 @@ export class PiBackendAdapter implements
     this.#assertNotDisposed();
     if (target.backendId !== this.id) throw piError("PI_TARGET_BACKEND_MISMATCH", "Target is not assigned to the Pi adapter", "provision");
     if (target.remoteWorkspace !== undefined) {
-      if (!normalizedPosixAbsolutePath(target.remoteWorkspace.workspaceRoot)) {
-        throw piError("PI_REMOTE_WORKSPACE_INVALID", "Remote workspace root must be a normalized absolute POSIX path", "provision");
+      const pathStyle = remoteBindingPathStyle(target.remoteWorkspace);
+      if (!validRemoteWorkspaceIdentity(target.remoteWorkspace)
+        || pathStyle === undefined
+        || !normalizedRemoteAbsolutePath(target.remoteWorkspace.workspaceRoot, pathStyle)
+        || (target.workspaceRoot === target.remoteWorkspace.workspaceRoot
+          ? !normalizedRemoteAbsolutePath(target.workspaceRoot, pathStyle)
+          : !isAbsolute(target.workspaceRoot) || resolve(target.workspaceRoot) !== target.workspaceRoot)) {
+        throw piError("PI_REMOTE_WORKSPACE_INVALID", "Remote workspace roots and execution identity must be canonical for the bound target platform", "provision");
       }
       if (this.#options.validateRemoteWorkspace === undefined) {
         throw piError("PI_REMOTE_WORKSPACE_UNAVAILABLE", "Remote workspace validation is unavailable", "provision");
+      }
+      if (target.workspaceRoot !== target.remoteWorkspace.workspaceRoot) {
+        const info = await lstat(target.workspaceRoot).catch((error) => {
+          throw piError("PI_WORKSPACE_UNAVAILABLE", `Pi fallback workspace '${target.workspaceRoot}' is unavailable`, "provision", { cause: error });
+        });
+        if (!info.isDirectory() || info.isSymbolicLink()
+          || !samePath(await realpath(target.workspaceRoot), target.workspaceRoot)) {
+          throw piError("PI_WORKSPACE_UNSAFE", "Pi fallback workspace must be a canonical regular directory", "provision");
+        }
       }
       await this.#options.validateRemoteWorkspace(target);
       return;
@@ -1015,6 +1050,26 @@ export class PiBackendAdapter implements
     const runtime = this.#runtimes.get(context.sessionId);
     if (runtime === undefined || !samePath(runtime.binding.opaqueRef, _binding.opaqueRef)) return;
     await this.#stopRuntime(context.sessionId, context.generation);
+  }
+
+  async inspectNativeSessionDeletion(
+    binding: NativeSessionBinding,
+    context: AdapterContext
+  ): Promise<"present" | "absent" | "unknown"> {
+    if (context.target.remoteWorkspace !== undefined
+      || context.target.backendId !== this.id
+      || context.binding?.opaqueRef !== binding.opaqueRef
+      || context.binding.generation !== binding.generation
+      || context.binding.nativeSessionId !== binding.nativeSessionId
+      || context.generation !== binding.generation) return "unknown";
+    const recoveryKey = localSessionTrashRecoveryKey(binding, context);
+    if (recoveryKey === undefined) return "unknown";
+    try {
+      await this.validateTarget(context.target);
+      return await this.#sessionStore.inspectTrashMove(binding, recoveryKey);
+    } catch {
+      return "unknown";
+    }
   }
 
   async deleteSession(binding: NativeSessionBinding, context: AdapterContext): Promise<void> {
@@ -2847,6 +2902,12 @@ export class PiBackendAdapter implements
   }
 
   async resetContext(context: AdapterContext): Promise<NativeSessionBinding> {
+    const recovered = await this.recoverResetContext(context);
+    if (recovered !== undefined) {
+      const active = this.#runtimes.get(context.sessionId);
+      if (active !== undefined) await this.#stopRuntime(context.sessionId, active.transport.generation);
+      return recovered;
+    }
     const runtime = this.#runtime(context);
     const state = await this.#requestState(runtime, context);
     if (
@@ -2867,13 +2928,44 @@ export class PiBackendAdapter implements
     await this.#removeManagedSubagentLineage(runtime, context);
     const previousOpaqueRef = runtime.binding.opaqueRef;
     try {
+      if (context.operationId === undefined) {
+        await requestPiPromptAcceptance(
+          runtime,
+          { type: "prompt", message: "/joko-reset-context" },
+          context.signal
+        );
+        const refreshed = await this.#refreshBinding(runtime, false);
+        if (samePath(previousOpaqueRef, refreshed.opaqueRef)) {
+          throw piError(
+            "PI_CONTEXT_RESET_IDENTITY_UNCHANGED",
+            "Pi did not replace the native session during context reset",
+            "session",
+            { stateMayHaveChanged: true, recovery: "Retry only after reconciling the native session identity." }
+          );
+        }
+        return { ...refreshed, generation: Math.max(context.generation + 1, refreshed.generation + 1) };
+      }
+      const nextGeneration = Math.max(context.generation + 1, runtime.binding.generation + 1);
+      const descriptor = resetContextDescriptor(context, runtime.binding, nextGeneration);
       await requestPiPromptAcceptance(
         runtime,
-        { type: "prompt", message: "/joko-reset-context" },
+        {
+          type: "prompt",
+          message: `/joko-reset-context ${Buffer.from(JSON.stringify(descriptor), "utf8").toString("base64url")}`
+        },
         context.signal
       );
-      const refreshed = await this.#refreshBinding(runtime, false);
-      if (samePath(previousOpaqueRef, refreshed.opaqueRef)) {
+      const receipt = await this.#readResetContextReceipt(context.operationId!);
+      if (receipt === undefined) {
+        throw piError(
+          "PI_CONTEXT_RESET_RECEIPT_MISSING",
+          "Pi replaced native context without publishing its durable reset receipt",
+          "session",
+          { stateMayHaveChanged: true, recovery: "Reconcile the exact reset operation receipt before retrying." }
+        );
+      }
+      const replacement = await this.#validatedResetContextReceipt(receipt, context);
+      if (samePath(previousOpaqueRef, replacement.opaqueRef)) {
         throw piError(
           "PI_CONTEXT_RESET_IDENTITY_UNCHANGED",
           "Pi did not replace the native session during context reset",
@@ -2881,13 +2973,64 @@ export class PiBackendAdapter implements
           { stateMayHaveChanged: true, recovery: "Retry only after reconciling the native session identity." }
         );
       }
-      return { ...refreshed, generation: Math.max(context.generation + 1, refreshed.generation + 1) };
+      return replacement;
     } finally {
       // Store is the only authority allowed to publish the new identity. Stop
       // the runtime even after uncertain transport failure so no native work
       // can continue under an uncommitted binding.
       await this.#stopRuntime(context.sessionId, runtime.transport.generation);
     }
+  }
+
+  async recoverResetContext(context: AdapterContext): Promise<NativeSessionBinding | undefined> {
+    if (context.operationId === undefined) return undefined;
+    const receipt = await this.#readResetContextReceipt(context.operationId);
+    return receipt === undefined ? undefined : this.#validatedResetContextReceipt(receipt, context);
+  }
+
+  async discardResetContext(binding: NativeSessionBinding, context: AdapterContext): Promise<void> {
+    const operationId = requiredResetOperationId(context.operationId);
+    const recovered = await this.recoverResetContext(context);
+    if (recovered !== undefined && !sameNativeBinding(recovered, binding)) {
+      throw piError(
+        "PI_CONTEXT_RESET_RECEIPT_MISMATCH",
+        "The native reset receipt does not identify the replacement selected for discard",
+        "session",
+        { stateMayHaveChanged: true, recovery: "Keep the Product maintenance receipt unchanged and inspect the Adapter receipt." }
+      );
+    }
+    const safePath = await this.#sessionStore.assertManagedSessionReference(binding.opaqueRef, { requireExists: false });
+    const recoveryKey = createHash("sha256").update(`reset-context\0${operationId}`).digest("hex");
+    const trashPath = join(this.#sessionStore.trashRoot, `${recoveryKey}-${basename(safePath)}`);
+    const [sourceInfo, trashInfo] = await Promise.all([
+      lstat(safePath).catch((error: NodeJS.ErrnoException) => {
+        if (error.code === "ENOENT") return undefined;
+        throw error;
+      }),
+      lstat(trashPath).catch((error: NodeJS.ErrnoException) => {
+        if (error.code === "ENOENT") return undefined;
+        throw error;
+      })
+    ]);
+    if (sourceInfo !== undefined || trashInfo !== undefined) {
+      const moved = await this.#sessionStore.moveToTrash(safePath, recoveryKey);
+      await rm(moved, { force: true });
+    }
+    await this.#clearResetContextReceipt(operationId);
+  }
+
+  async finalizeResetContext(binding: NativeSessionBinding, context: AdapterContext): Promise<void> {
+    const operationId = requiredResetOperationId(context.operationId);
+    const recovered = await this.recoverResetContext(context);
+    if (recovered !== undefined && !sameNativeBinding(recovered, binding)) {
+      throw piError(
+        "PI_CONTEXT_RESET_RECEIPT_MISMATCH",
+        "The native reset receipt does not identify the adopted replacement",
+        "session",
+        { stateMayHaveChanged: true, recovery: "Keep the Product maintenance receipt unchanged and inspect the Adapter receipt." }
+      );
+    }
+    await this.#clearResetContextReceipt(operationId);
   }
 
   async setName(name: string, context: AdapterContext): Promise<void> {
@@ -3323,6 +3466,7 @@ export class PiBackendAdapter implements
           || runtime.transport.closed
         ) return [];
         return [{
+          role: "task-host" as const,
           sessionId: runtime.key,
           generation: runtime.transport.generation,
           pid,
@@ -4213,6 +4357,7 @@ export class PiBackendAdapter implements
     const controlPath = join(runtimeDirectory, "control.json");
     const silentEncryptedRetryControlPath = join(runtimeDirectory, "silent-encrypted-retry.json");
     const artifactDirectory = join(runtimeDirectory, "artifacts");
+    const resetContextReceiptRoot = await this.#prepareResetContextReceiptRoot();
     const control: PiRuntimeControl = {
       generation: context.generation,
       policyGeneration: 0,
@@ -4360,15 +4505,16 @@ export class PiBackendAdapter implements
       JOKO_PI_CONTROL_FILE: controlPath,
       [SILENT_ENCRYPTED_RETRY_CONTROL_ENV]: silentEncryptedRetryControlPath,
       JOKO_PI_WORKSPACE_ROOT: runtimeWorkspaceRoot(context.target),
+      JOKO_PI_PRODUCT_SESSION_ID: context.sessionId,
       JOKO_PI_TARGET_ID: context.target.id,
       JOKO_PI_GENERATION: String(context.generation),
       JOKO_PI_SPAWN_IDENTITY: spawnIdentity,
+      JOKO_PI_RESET_RECEIPT_ROOT: resetContextReceiptRoot,
       ...(context.target.remoteWorkspace === undefined ? {} : {
         JOKO_PI_REMOTE_RECOVERY_IDENTITY: stableRemoteRecoveryIdentity(
           context.sessionId,
           context.target.id,
-          context.target.remoteWorkspace.hostTargetId,
-          context.target.remoteWorkspace.hostId
+          context.target.remoteWorkspace
         )
       }),
       JOKO_PI_RUNTIME_POLICY: profile.runtimePolicy,
@@ -5335,6 +5481,114 @@ export class PiBackendAdapter implements
         recovery: "Ensure the service account owns the managed Pi runtime directory and retry."
       });
     }
+  }
+
+  #resetContextReceiptRoot(): string {
+    const root = join(this.#sessionStore.root, "maintenance", "reset-context");
+    assertContained(this.#sessionStore.root, root, "reset context receipt root");
+    return root;
+  }
+
+  async #prepareResetContextReceiptRoot(): Promise<string> {
+    const root = this.#resetContextReceiptRoot();
+    await mkdir(root, { recursive: true, mode: 0o700 });
+    await chmod(root, 0o700);
+    const info = await lstat(root);
+    if (!info.isDirectory() || info.isSymbolicLink() || !samePath(await realpath(root), root)) {
+      throw piError(
+        "PI_CONTEXT_RESET_RECEIPT_ROOT_UNSAFE",
+        "Managed context reset receipt storage is not a canonical directory",
+        "session",
+        { recovery: "Restore the Adapter-owned receipt directory before retrying task history cleanup." }
+      );
+    }
+    return root;
+  }
+
+  #resetContextReceiptPath(operationId: string): string {
+    const identity = requiredResetOperationId(operationId);
+    return join(
+      this.#resetContextReceiptRoot(),
+      `${createHash("sha256").update(identity).digest("hex")}.json`
+    );
+  }
+
+  async #readResetContextReceipt(operationId: string): Promise<PiResetContextReceipt | undefined> {
+    const root = await this.#prepareResetContextReceiptRoot();
+    const receiptPath = this.#resetContextReceiptPath(operationId);
+    const info = await lstat(receiptPath).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") return undefined;
+      throw error;
+    });
+    if (info === undefined) return undefined;
+    if (
+      !info.isFile()
+      || info.isSymbolicLink()
+      || info.size <= 0
+      || info.size > MAXIMUM_RESET_CONTEXT_RECEIPT_BYTES
+      || !samePath(await realpath(receiptPath), receiptPath)
+      || !samePath(await realpath(dirname(receiptPath)), root)
+    ) {
+      throw piError(
+        "PI_CONTEXT_RESET_RECEIPT_UNSAFE",
+        "Managed context reset receipt storage is unsafe",
+        "session",
+        { stateMayHaveChanged: true, recovery: "Inspect the exact Adapter receipt before retrying maintenance." }
+      );
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(await readFile(receiptPath, "utf8"));
+    } catch (error) {
+      throw piError(
+        "PI_CONTEXT_RESET_RECEIPT_INVALID",
+        "Managed context reset receipt is not valid JSON",
+        "session",
+        { stateMayHaveChanged: true, recovery: "Inspect the exact Adapter receipt before retrying maintenance.", cause: error }
+      );
+    }
+    return parseResetContextReceipt(parsed);
+  }
+
+  async #validatedResetContextReceipt(
+    receipt: PiResetContextReceipt,
+    context: AdapterContext
+  ): Promise<NativeSessionBinding> {
+    const operationId = requiredResetOperationId(context.operationId);
+    if (
+      receipt.operationId !== operationId
+      || receipt.sessionId !== context.sessionId
+      || receipt.targetId !== context.target.id
+      || context.binding === undefined
+      || !sameNativeBinding(receipt.source, context.binding)
+      || receipt.replacement.generation <= receipt.source.generation
+      || samePath(receipt.replacement.opaqueRef, receipt.source.opaqueRef)
+    ) {
+      throw piError(
+        "PI_CONTEXT_RESET_RECEIPT_MISMATCH",
+        "Managed context reset receipt does not match the fenced Product operation",
+        "session",
+        { stateMayHaveChanged: true, recovery: "Keep the maintenance job unchanged and inspect the exact Adapter receipt." }
+      );
+    }
+    const managed = await this.#sessionStore.binding(
+      receipt.replacement.opaqueRef,
+      receipt.replacement.generation
+    );
+    if (!sameNativeBinding(managed, receipt.replacement)) {
+      throw piError(
+        "PI_CONTEXT_RESET_RECEIPT_IDENTITY_CHANGED",
+        "The native context identified by the reset receipt changed on disk",
+        "session",
+        { stateMayHaveChanged: true, recovery: "Restore the exact native Session or reconcile the maintenance receipt manually." }
+      );
+    }
+    return managed;
+  }
+
+  async #clearResetContextReceipt(operationId: string): Promise<void> {
+    await this.#prepareResetContextReceiptRoot();
+    await rm(this.#resetContextReceiptPath(operationId), { force: true });
   }
 
   async #prepareGenerationRuntimeRoot(agentHome: string, options: PiAdapterOptions): Promise<void> {
@@ -6657,9 +6911,20 @@ function stableSpawnIdentity(agentHome: string, sessionsRoot: string, sessionKey
     .digest("hex");
 }
 
-function stableRemoteRecoveryIdentity(sessionId: string, targetId: string, hostTargetId: string, hostId: string): string {
+function stableRemoteRecoveryIdentity(
+  sessionId: string,
+  targetId: string,
+  binding: NonNullable<TargetDescriptor["remoteWorkspace"]>
+): string {
+  const routeIdentity = binding.kind === "ssh"
+    ? JSON.stringify({ kind: binding.kind, hostTargetId: binding.hostTargetId, hostId: binding.hostId })
+    : JSON.stringify({
+        kind: binding.kind,
+        controllerDeviceId: binding.controllerDeviceId,
+        targetDeviceId: binding.targetDeviceId
+      });
   return createHash("sha256")
-    .update([sessionId, targetId, hostTargetId, hostId].join("\0"))
+    .update([sessionId, targetId, routeIdentity].join("\0"))
     .digest("hex");
 }
 
@@ -6911,6 +7176,82 @@ function parseRuntimeOwnerManifest(raw: string): PiRuntimeOwnerManifest {
   return value as unknown as PiRuntimeOwnerManifest;
 }
 
+function requiredResetOperationId(value: string | undefined): string {
+  if (
+    value === undefined
+    || value.length < 1
+    || value.length > 1_024
+    || value.includes("\0")
+    || /[\r\n]/u.test(value)
+  ) {
+    throw piError(
+      "PI_CONTEXT_RESET_OPERATION_INVALID",
+      "Context reset requires a valid stable operation identity",
+      "session"
+    );
+  }
+  return value;
+}
+
+function resetContextDescriptor(
+  context: AdapterContext,
+  source: NativeSessionBinding,
+  replacementGeneration: number
+): PiResetContextDescriptor {
+  const operationId = requiredResetOperationId(context.operationId);
+  if (!Number.isSafeInteger(replacementGeneration) || replacementGeneration <= source.generation) {
+    throw piError("PI_CONTEXT_RESET_GENERATION_INVALID", "Context reset replacement generation is invalid", "session");
+  }
+  return {
+    version: RESET_CONTEXT_RECEIPT_VERSION,
+    operationId,
+    sessionId: context.sessionId,
+    targetId: context.target.id,
+    source,
+    replacementGeneration
+  };
+}
+
+function parseResetContextReceipt(value: unknown): PiResetContextReceipt {
+  if (
+    !isRecord(value)
+    || value.version !== RESET_CONTEXT_RECEIPT_VERSION
+    || typeof value.operationId !== "string"
+    || requiredResetOperationId(value.operationId) !== value.operationId
+    || typeof value.sessionId !== "string"
+    || value.sessionId.trim() === ""
+    || typeof value.targetId !== "string"
+    || value.targetId.trim() === ""
+    || !validResetBinding(value.source)
+    || !validResetBinding(value.replacement)
+    || value.replacement.generation <= value.source.generation
+  ) {
+    throw piError(
+      "PI_CONTEXT_RESET_RECEIPT_INVALID",
+      "Managed context reset receipt failed its schema fence",
+      "session",
+      { stateMayHaveChanged: true, recovery: "Inspect the exact Adapter receipt before retrying maintenance." }
+    );
+  }
+  return value as unknown as PiResetContextReceipt;
+}
+
+function validResetBinding(value: unknown): value is NativeSessionBinding {
+  return isRecord(value)
+    && typeof value.opaqueRef === "string"
+    && value.opaqueRef.trim() !== ""
+    && (value.nativeSessionId === undefined
+      || (typeof value.nativeSessionId === "string" && value.nativeSessionId.trim() !== ""))
+    && Number.isSafeInteger(value.generation)
+    && (value.generation as number) >= 0;
+}
+
+function sameNativeBinding(left: NativeSessionBinding, right: NativeSessionBinding): boolean {
+  return samePath(left.opaqueRef, right.opaqueRef)
+    && left.nativeSessionId === right.nativeSessionId
+    && left.generation === right.generation;
+}
+
 function stableNativeSessionId(sessionId: string, generation: number): string {
   return `joko-${stableSessionKey(sessionId)}-g${generation}`;
 }
@@ -7017,7 +7358,14 @@ function sameRemoteWorkspace(
   right: TargetDescriptor["remoteWorkspace"]
 ): boolean {
   if (left === undefined || right === undefined) return left === right;
-  return left.hostId === right.hostId && left.workspaceRoot === right.workspaceRoot;
+  if (left.kind !== right.kind) return false;
+  return left.kind === "ssh" && right.kind === "ssh"
+    ? left.hostTargetId === right.hostTargetId
+      && left.hostId === right.hostId
+      && left.workspaceRoot === right.workspaceRoot
+    : left.kind === "device_peer" && right.kind === "device_peer"
+      && left.controllerDeviceId === right.controllerDeviceId
+      && left.targetDeviceId === right.targetDeviceId && left.workspaceRoot === right.workspaceRoot;
 }
 
 function normalizedPosixAbsolutePath(value: string): boolean {
@@ -7065,13 +7413,43 @@ export function isRuntimeResourceProvenLoaded(
   );
 }
 
+function normalizedWin32AbsolutePath(value: string): boolean {
+  return value.length > 0
+    && value.length <= 16_384
+    && value === value.trim()
+    && !/[\u0000-\u001f\u007f]/u.test(value)
+    && win32Path.isAbsolute(value)
+    && win32Path.normalize(value) === value;
+}
+
+function normalizedRemoteAbsolutePath(value: string, pathStyle: "posix" | "win32"): boolean {
+  return pathStyle === "posix" ? normalizedPosixAbsolutePath(value) : normalizedWin32AbsolutePath(value);
+}
+
+function remoteBindingPathStyle(binding: NonNullable<TargetDescriptor["remoteWorkspace"]>): "posix" | "win32" | undefined {
+  if (binding.kind === "ssh") return "posix";
+  if (normalizedPosixAbsolutePath(binding.workspaceRoot)) return "posix";
+  if (normalizedWin32AbsolutePath(binding.workspaceRoot)) return "win32";
+  return undefined;
+}
+
+function validRemoteWorkspaceIdentity(binding: NonNullable<TargetDescriptor["remoteWorkspace"]>): boolean {
+  const bounded = (value: string): boolean => value.length > 0
+    && value.length <= 256
+    && !/[\u0000-\u001f\u007f]/u.test(value);
+  return binding.kind === "ssh"
+    ? bounded(binding.hostTargetId) && bounded(binding.hostId)
+    : bounded(binding.controllerDeviceId)
+      && bounded(binding.targetDeviceId)
+      && binding.controllerDeviceId !== binding.targetDeviceId;
+}
+
 function assertPiDerivationTarget(context: AdapterContext, derivation: NativeSessionDerivation): void {
   const source = context.target;
   const target = derivation.target;
   const sameWorkspace = source.remoteWorkspace === undefined
     ? target.remoteWorkspace === undefined && samePath(source.workspaceRoot, target.workspaceRoot)
-    : target.remoteWorkspace?.hostId === source.remoteWorkspace.hostId
-      && target.remoteWorkspace.workspaceRoot === source.remoteWorkspace.workspaceRoot
+    : sameRemoteWorkspace(target.remoteWorkspace, source.remoteWorkspace)
       && target.workspaceRoot === source.workspaceRoot;
   if (target.id === source.id
     && target.backendId === source.backendId

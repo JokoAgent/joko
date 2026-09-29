@@ -15,7 +15,9 @@ describe("portable session UI policy", () => {
     const snapshot = fixture();
     const local = session({ backendId: "capable" });
     expect(portableSessionExportSupported(local, snapshot)).toBe(true);
-    expect(portableSessionExportSupported({ ...local, remoteWorkspace: true }, snapshot)).toBe(false);
+    expect(portableSessionExportSupported({ ...local, remoteWorkspace: {
+      kind: "ssh", hostTargetId: "target", hostId: "host", workspaceRoot: "/srv/project"
+    } }, snapshot)).toBe(false);
     expect(portableSessionExportSupported(session({ backendId: "limited" }), snapshot)).toBe(false);
     expect(portableSessionTargetOptions(snapshot, new Set(["project-target"]))).toEqual([
       { id: "project-target", label: "Project · Workspace", worktreeSupported: true },

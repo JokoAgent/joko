@@ -49,7 +49,7 @@ it("keeps a source Host undeletable while another project is bound to it", async
   const ready = { ...host(), trust: { algorithm: "ssh-ed25519", sha256Fingerprint: "SHA256:test", pinnedAt: 1 },
     status: { state: "ready" as const, changedAt: 2 } };
   fixture.snapshot = { ...fixture.snapshot, targets: fixture.snapshot.targets.map((target) => target.id === "target-two"
-    ? { ...target, remoteWorkspace: { hostTargetId: "target-one", hostId: "build-box", workspaceRoot: "/srv/other" } }
+    ? { ...target, remoteWorkspace: { kind: "ssh", hostTargetId: "target-one", hostId: "build-box", workspaceRoot: "/srv/other" } }
     : target) };
   await fixture.render(fixture.controller);
   await fixture.publish([ready]);
@@ -137,7 +137,7 @@ it("preserves a binding draft on concurrent project change until explicitly relo
   const fixture = await mountSettings();
   await fixture.publish([{ ...host(), trust: { algorithm: "ssh-ed25519", sha256Fingerprint: "SHA256:test", pinnedAt: 1 }, status: { state: "ready", changedAt: 2 } }]);
   await change(input("Remote workspace path"), "/home/joko/local-edit");
-  fixture.snapshot = { ...fixture.snapshot, targets: fixture.snapshot.targets.map(target => ({ ...target, revision: 2n, remoteWorkspace: { hostTargetId: target.id, hostId: "build-box", workspaceRoot: "/home/joko/other-window" } })) };
+  fixture.snapshot = { ...fixture.snapshot, targets: fixture.snapshot.targets.map(target => ({ ...target, revision: 2n, remoteWorkspace: { kind: "ssh", hostTargetId: target.id, hostId: "build-box", workspaceRoot: "/home/joko/other-window" } })) };
   await fixture.render(fixture.controller);
   expect(input("Remote workspace path").value).toBe("/home/joko/local-edit");
   expect(button("Use remote workspace").disabled).toBe(true);
@@ -400,6 +400,21 @@ it("keeps the exact node key in a Host draft, fences draft recipes, and retries 
   expect(fixture.controller.updateRemoteHost).toHaveBeenCalledTimes(2);
 });
 
+it("shows the service-node agent recovery path in an unsaved Host and removes it after refresh", async () => {
+  const fixture = await mountSettings();
+  await fixture.publish([host()]);
+  await act(async () => button("Edit").click());
+  vi.mocked(fixture.controller.listSshKeys).mockResolvedValueOnce({ keys: [], agentState: "unavailable", generationSupported: true, servicePlatform: "macos" });
+  await selectNodeAuthentication();
+  expect(document.body.textContent).toContain("macOS service node");
+  expect(document.body.textContent).toContain("SSH_AUTH_SOCK");
+  expect(document.body.textContent).toContain("explicitly add that key");
+  vi.mocked(fixture.controller.listSshKeys).mockResolvedValueOnce({ keys: [], agentState: "ready", generationSupported: true, servicePlatform: "macos" });
+  await act(async () => button("Refresh").click());
+  expect(document.body.textContent).not.toContain("macOS service node");
+  expect(fixture.controller.addSshKeyToAgent).not.toHaveBeenCalled();
+});
+
 it("retains generated identity after uncertain agent loading, refreshes explicitly and never submits the surrounding Host form", async () => {
   const fixture = await mountSettings({ strict: true });
   await fixture.publish([host()]);
@@ -425,6 +440,44 @@ it("retains generated identity after uncertain agent loading, refreshes explicit
   expect(vi.mocked(fixture.controller.updateRemoteHost).mock.calls[0]![3].nodeKey).toEqual({ id: "generated", expectedFingerprint: "SHA256:generated" });
   expect(fixture.controller.generateSshKey).toHaveBeenCalledOnce();
   expect(fixture.controller.saveCredential).not.toHaveBeenCalled();
+});
+
+it("keeps an unsafe generated key out of a Host draft until manual correction and a fresh catalog", async () => {
+  const fixture = await mountSettings();
+  await fixture.publish([host()]);
+  await act(async () => button("Edit").click());
+  await selectNodeAuthentication();
+  vi.mocked(fixture.controller.addSshKeyToAgent).mockRejectedValueOnce(new ConnectError("ssh_key.unsafe_permissions", Code.FailedPrecondition));
+  await act(async () => button("Generate key").click());
+  const form = document.querySelector<HTMLFormElement>(".ssh-key-form")!;
+  await act(async () => form.querySelector<HTMLInputElement>('input[type="checkbox"]')!.click());
+  await act(async () => form.querySelector<HTMLButtonElement>('button[type="submit"]')!.click());
+  expect(document.body.textContent).toContain("Correct the key permissions on the service host");
+  expect(document.body.textContent).not.toContain("ssh_key.unsafe_permissions");
+  expect(button("Save").disabled).toBe(true);
+  expect(fixture.controller.updateRemoteHost).not.toHaveBeenCalled();
+  vi.mocked(fixture.controller.listSshKeys).mockResolvedValueOnce({ keys: [{ id: "work", name: "Work key", algorithm: "ssh-ed25519", comment: "", sha256Fingerprint: "SHA256:work", modifiedAt: 1, inAgent: true }], agentState: "ready", generationSupported: true, servicePlatform: "windows" });
+  await act(async () => button("Refresh").click());
+  expect(document.body.textContent).toContain("selected key is missing or changed");
+  expect(button("Save").disabled).toBe(true);
+});
+
+it("rechecks the same Host key after manual permission correction and shows the connection recovery path", async () => {
+  const fixture = await mountSettings();
+  await fixture.publish([{ ...host(), authentication: "nodeKey", credentialReferenceId: undefined,
+    nodeKey: { id: "work", expectedFingerprint: "SHA256:work" },
+    status: { state: "failed", changedAt: 2, failure: { code: "nodeKeyUnavailable", retryable: false } } }]);
+  expect(document.body.textContent).toContain("check its directory and private-file permissions");
+  expect(translate("zh-CN", "settings.remoteHosts.failure.nodeKeyUnavailable")).toContain("私钥文件权限");
+  vi.mocked(fixture.controller.readSshPublicKey).mockRejectedValueOnce(new ConnectError("ssh_key.unsafe_permissions", Code.FailedPrecondition));
+  await act(async () => button("Edit").click());
+  expect(document.body.textContent).toContain("ownership or permissions are unsafe");
+  expect(button("Save").disabled).toBe(true);
+  await act(async () => button("Refresh").click());
+  expect(fixture.controller.readSshPublicKey).toHaveBeenCalledTimes(2);
+  expect(document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Public key"]')?.value).toBe("ssh-ed25519 fixture-public");
+  expect(document.body.textContent).not.toContain("ownership or permissions are unsafe");
+  expect(button("Save").disabled).toBe(false);
 });
 
 async function selectNodeAuthentication(): Promise<void> {
@@ -460,7 +513,7 @@ async function mountSettings(options: {
     })
   }));
   const controller = {
-    listSshKeys: vi.fn(async () => ({ keys: [...keys], agentState: "ready", generationSupported: true })),
+    listSshKeys: vi.fn(async () => ({ keys: [...keys], agentState: "ready", generationSupported: true, servicePlatform: "windows" })),
     generateSshKey: vi.fn(async () => { const key: SshKeyView = { id: "generated", name: "Generated key", algorithm: "ssh-ed25519", comment: "", sha256Fingerprint: "SHA256:generated", modifiedAt: 2, inAgent: false }; keys.push(key); return key; }),
     addSshKeyToAgent: vi.fn(async () => undefined),
     readSshPublicKey: vi.fn(async () => "ssh-ed25519 fixture-public"),

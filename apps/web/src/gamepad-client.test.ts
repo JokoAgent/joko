@@ -165,6 +165,33 @@ describe("gamepad UI target ownership", () => {
     vi.spyOn(document, "hasFocus").mockReturnValue(false); press();
     expect(navigate).toHaveBeenCalledTimes(1);
   });
+  it("routes feedback once only from the visible focused host boundary", () => {
+    const navigate = vi.fn();
+    const input = createGamepadDomInput(document, navigate);
+    const send = (phase: "press" | "release" = "press"): void => input({ kind: "action", action: "feedback", phase });
+    send("release"); send();
+    expect(navigate).toHaveBeenCalledExactlyOnceWith("feedback");
+    document.body.classList.add("modal-open"); send(); document.body.classList.remove("modal-open");
+    const preview = document.body.appendChild(document.createElement("div")); preview.dataset.gamepadPreview = "true";
+    send(); preview.remove();
+    document.body.dataset.appShortcutRecording = "1"; send(); delete document.body.dataset.appShortcutRecording;
+    const listbox = document.body.appendChild(document.createElement("div")); listbox.setAttribute("role", "listbox");
+    send(); listbox.remove();
+    const menu = document.body.appendChild(document.createElement("button")); menu.setAttribute("role", "menu"); menu.focus();
+    send(); menu.remove();
+    const dialog = document.body.appendChild(document.createElement("div")); dialog.setAttribute("role", "dialog"); dialog.tabIndex = -1; dialog.focus();
+    send(); dialog.remove();
+    const embedded = document.body.appendChild(document.createElement("iframe"));
+    const embeddedDocument = embedded.contentDocument!;
+    vi.spyOn(embeddedDocument, "hasFocus").mockReturnValue(true);
+    vi.spyOn(embeddedDocument, "visibilityState", "get").mockReturnValue("visible");
+    createGamepadDomInput(embeddedDocument, navigate)({ kind: "action", action: "feedback", phase: "press" });
+    embedded.remove();
+    const frame = document.body.appendChild(document.createElement("iframe")); frame.focus(); send(); frame.remove();
+    const visibility = vi.spyOn(document, "visibilityState", "get").mockReturnValue("hidden"); send(); visibility.mockRestore();
+    vi.spyOn(document, "hasFocus").mockReturnValue(false); send();
+    expect(navigate).toHaveBeenCalledTimes(1);
+  });
   it("admits page history only from the visible focused host outside modal, preview and shortcut recording", () => {
     const navigate = vi.fn();
     const input = createGamepadDomInput(document, navigate);

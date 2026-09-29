@@ -345,11 +345,15 @@ describe("RemoteHostRegistry credential and lifecycle boundary", () => {
     const changed = await registry.connect(host.targetId, host.id, disconnected.revision);
     expect(changed.failure).toEqual({ code: "node_key_changed", retryable: false });
     expect(connect).toHaveBeenCalledOnce();
+    readPublic.mockRejectedValueOnce(new SshKeyError("unsafe_permissions"));
+    const unsafe = await registry.connect(host.targetId, host.id, changed.host.revision);
+    expect(unsafe.failure).toEqual({ code: "node_key_unavailable", retryable: false });
+    expect(connect).toHaveBeenCalledOnce();
     let release!: (value: string) => void;
     readPublic.mockImplementationOnce(() => new Promise<string>(resolve => { release = resolve; }));
     const abort = new AbortController();
-    const pending = registry.connect(host.targetId, host.id, changed.host.revision, abort.signal);
-    await vi.waitFor(() => expect(readPublic).toHaveBeenCalledTimes(3));
+    const pending = registry.connect(host.targetId, host.id, unsafe.host.revision, abort.signal);
+    await vi.waitFor(() => expect(readPublic).toHaveBeenCalledTimes(4));
     abort.abort(); release("public identity");
     expect((await pending).failure?.code).toBe("aborted");
     expect(connect).toHaveBeenCalledOnce();

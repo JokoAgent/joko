@@ -32,8 +32,8 @@ if (new URLSearchParams(window.location.search).get("globalVoiceOverlay") === "1
 }
 
 function globalVoiceOverlayFixture(value: string | null): JokoDesktopGlobalVoiceStatus | undefined {
-  if (value === "listening") return { state: "listening", transcript: "This transcription stays on one line while the active application keeps focus." };
-  if (value === "submitting") return { state: "submitting", transcript: "Finishing the current transcription…" };
-  if (value === "error") return { state: "error", errorKind: "insertion" };
+  if (value === "listening") return { state: "listening", generation: "1", transcript: "This transcription stays on one line while the active application keeps focus." };
+  if (value === "submitting") return { state: "submitting", generation: "1", transcript: "Finishing the current transcription…" };
+  if (value === "error") return { state: "error", generation: "1", errorKind: "insertion" };
   return undefined;
 }

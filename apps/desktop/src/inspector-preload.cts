@@ -6,6 +6,7 @@ const { contextBridge, ipcRenderer } = require("electron") as typeof import("ele
 // main renderer. The selection callback is receive-only and carries no text;
 // the portal re-reads and validates the live selection in this document.
 const INSPECTOR_WINDOW_CHANNELS = {
+  identity: "joko:inspector-window:identity",
   ready: "joko:inspector-window:ready",
   minimize: "joko:inspector-window:minimize",
   toggleMaximize: "joko:inspector-window:toggle-maximize",
@@ -16,10 +17,14 @@ const INSPECTOR_WINDOW_CHANNELS = {
 contextBridge.exposeInMainWorld("jokoInspectorDesktop", Object.freeze({
   platform: process.platform,
   window: Object.freeze({
+    identity: (): Promise<string> => ipcRenderer.invoke(INSPECTOR_WINDOW_CHANNELS.identity),
     ready: (): Promise<void> => ipcRenderer.invoke(INSPECTOR_WINDOW_CHANNELS.ready),
     minimize: (): Promise<void> => ipcRenderer.invoke(INSPECTOR_WINDOW_CHANNELS.minimize),
     toggleMaximize: (): Promise<boolean> => ipcRenderer.invoke(INSPECTOR_WINDOW_CHANNELS.toggleMaximize),
-    close: (): Promise<void> => ipcRenderer.invoke(INSPECTOR_WINDOW_CHANNELS.close)
+    close: (kind: "user" | "passive"): Promise<void> => {
+      if (kind !== "user" && kind !== "passive") return Promise.reject(new TypeError("Inspector close kind is invalid."));
+      return ipcRenderer.invoke(INSPECTOR_WINDOW_CHANNELS.close, kind);
+    }
   }),
   selectionContextMenu: Object.freeze({
     onAddToChat: (listener: () => void): (() => void) => {

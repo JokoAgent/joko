@@ -4,6 +4,8 @@ import type {
   DesktopApplicationMenuCommand,
   DesktopApplicationMenuConfigurationPatch,
   DesktopDiscoveredNode,
+  DesktopDeepLinkAcknowledgement,
+  DesktopDeepLinkDelivery,
   DesktopExtensionWindowOpenResult,
   DesktopExtensionLibraryBeginSaveRequest,
   DesktopExtensionLibraryClipboardRequest,
@@ -52,6 +54,13 @@ import type {
   DesktopRevealArtifactSourceRequest,
   DesktopRevealArtifactSourceResult,
   DesktopRuntimeProcessMonitorOpenResult,
+  DesktopRuntimeProcessMonitorBackend,
+  DesktopRuntimeProcessMonitorOwner,
+  DesktopRuntimeProcessMonitorProcess,
+  DesktopRuntimeProcessMonitorRequest,
+  DesktopRuntimeProcessMonitorResponse,
+  DesktopRuntimeProcessMonitorSession,
+  DesktopRuntimeProcessSample,
   DesktopSessionDragPreviewRequest,
   DesktopSessionWindowDropResult,
   DesktopSessionWindowOwner,
@@ -92,6 +101,15 @@ const DESKTOP_CHANNELS = {
   sessionDragPreviewEnd: "joko:session-drag-preview:end",
   sessionWindowOpenIfDroppedOutside: "joko:session-window:open-if-dropped-outside",
   runtimeProcessMonitorOpen: "joko:runtime-process-monitor:open",
+  runtimeProcessMonitorRequest: "joko:runtime-process-monitor:request",
+  runtimeProcessMonitorRespond: "joko:runtime-process-monitor:respond",
+  runtimeProcessMonitorRetire: "joko:runtime-process-monitor:retire",
+  runtimeProcessMonitorSampleDesktop: "joko:runtime-process-monitor:sample-desktop",
+  runtimeProcessDiagnosticsGetOwner: "joko:runtime-process-diagnostics:owner:get",
+  runtimeProcessDiagnosticsRequest: "joko:runtime-process-diagnostics:request",
+  runtimeProcessDiagnosticsResponse: "joko:runtime-process-diagnostics:response",
+  runtimeProcessDiagnosticsRetired: "joko:runtime-process-diagnostics:retired",
+  runtimeProcessDiagnosticsRetiredAcknowledge: "joko:runtime-process-diagnostics:retired:acknowledge",
   layoutReset: "joko:layout:reset",
   layoutResetBroadcast: "joko:layout:reset-broadcast",
   windowInteractionGet: "joko:window-interaction:get",
@@ -109,15 +127,17 @@ const DESKTOP_CHANNELS = {
   selectionContextMenuAddToChat: "joko:selection-context-menu:add-to-chat",
   selectionContextMenuSetLocale: "joko:selection-context-menu:set-locale",
   inspectorWindowReady: "joko:inspector-window:ready",
+  inspectorWindowIdentity: "joko:inspector-window:identity",
+  inspectorWindowActivate: "joko:inspector-window:activate",
   inspectorWindowMinimize: "joko:inspector-window:minimize",
   inspectorWindowToggleMaximize: "joko:inspector-window:toggle-maximize",
   inspectorWindowClose: "joko:inspector-window:close",
   inspectorWindowClosed: "joko:inspector-window:closed",
   traySetIcon: "joko:tray:set-icon",
   notify: "joko:notify",
-  notificationFocusSession: "joko:notification:focus-session",
   attentionMark: "joko:attention:mark",
   attentionClear: "joko:attention:clear",
+  mainDocumentOccurrenceGet: "joko:main-document:occurrence:get",
   nativeTaskStatusGetAvailability: "joko:native-task-status:availability:get",
   nativeTaskStatusGetSettings: "joko:native-task-status:settings:get",
   nativeTaskStatusSetSettings: "joko:native-task-status:settings:set",
@@ -152,9 +172,22 @@ const DESKTOP_CHANNELS = {
   globalVoiceOpenAccessibility: "joko:global-voice:accessibility:open",
   globalVoiceGetInputMonitoring: "joko:global-voice:input-monitoring:get",
   globalVoiceOpenInputMonitoring: "joko:global-voice:input-monitoring:open",
+  dedicatedHardwareGetState: "joko:hardware-input:state:get",
+  dedicatedHardwareSetSettings: "joko:hardware-input:settings:set",
+  dedicatedHardwareResetSettings: "joko:hardware-input:settings:reset",
+  dedicatedHardwareProbe: "joko:hardware-input:probe",
+  dedicatedHardwareRecoverKeymap: "joko:hardware-input:keymap:recover",
+  dedicatedHardwareOpenInputSettings: "joko:hardware-input:input-settings:open",
+  dedicatedHardwarePublishTasks: "joko:hardware-input:tasks:publish",
+  dedicatedHardwareAcknowledgeTaskFocus: "joko:hardware-input:task-focus:acknowledge",
+  dedicatedHardwareSetPreview: "joko:hardware-input:preview:set",
+  dedicatedHardwareStateChanged: "joko:hardware-input:state:changed",
+  dedicatedHardwareAction: "joko:hardware-input:action",
+  dedicatedHardwarePreviewInput: "joko:hardware-input:preview:input",
   chooseFiles: "joko:files:choose",
   choosePortableSessionFile: "joko:portable-session:choose",
   deepLinkTakePending: "joko:deep-link:take-pending",
+  deepLinkAcknowledge: "joko:deep-link:acknowledge",
   deepLinkNavigate: "joko:deep-link:navigate",
   saveFile: "joko:files:save",
   copyFile: "joko:files:copy",
@@ -190,10 +223,28 @@ const DESKTOP_CHANNELS = {
   updateChannelRelaunch: "joko:update:channel:relaunch"
 } as const satisfies typeof import("./channels.js").DESKTOP_CHANNELS;
 
+const mainDocumentPreloadClaim = createMainDocumentPreloadClaim();
+const mainDocumentOccurrenceValue: unknown = ipcRenderer.sendSync(
+  DESKTOP_CHANNELS.mainDocumentOccurrenceGet,
+  mainDocumentPreloadClaim
+);
+const mainDocumentOccurrence = isDesktopDeepLinkOccurrence(mainDocumentOccurrenceValue)
+  ? mainDocumentOccurrenceValue
+  : undefined;
+
+function createMainDocumentPreloadClaim(): string {
+  if (typeof globalThis.crypto.randomUUID === "function") return globalThis.crypto.randomUUID();
+  const bytes = globalThis.crypto.getRandomValues(new Uint8Array(16));
+  bytes[6] = (bytes[6]! & 0x0f) | 0x40;
+  bytes[8] = (bytes[8]! & 0x3f) | 0x80;
+  const hexadecimal = Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+  return `${hexadecimal.slice(0, 8)}-${hexadecimal.slice(8, 12)}-${hexadecimal.slice(12, 16)}-${hexadecimal.slice(16, 20)}-${hexadecimal.slice(20)}`;
+}
 const nativeTaskStatusSupported = ipcRenderer.sendSync(
   DESKTOP_CHANNELS.nativeTaskStatusGetAvailability
 ) === true;
-const attentionBadgeSupported = process.platform === "darwin" || process.platform === "win32";
+const attentionBadgeSupported = process.platform === "darwin" || process.platform === "win32"
+  || process.platform === "linux";
 const desktopCapabilities = Object.freeze([
   "app.info",
   "navigation.deepLinks",
@@ -204,6 +255,7 @@ const desktopCapabilities = Object.freeze([
   ...((process.platform === "win32" || process.platform === "darwin") ? ["files.copy" as const] : []),
   "files.open",
   "files.revealSource",
+  "hardware.dedicatedInput",
   "layout.reset",
   ...((process.platform === "win32" || process.platform === "linux") ? ["window.mainCloseBehavior" as const] : []),
   "microphone.lifecycle",
@@ -214,6 +266,7 @@ const desktopCapabilities = Object.freeze([
   ...(nativeTaskStatusSupported ? ["native.taskStatus" as const] : []),
   "power.keepAwake",
   "selection.quote.contextMenu",
+  "runtime.desktopProcessUsage",
   "runtime.processMonitorWindow",
   "session.windows",
   "extension.windows",
@@ -308,9 +361,29 @@ const desktopApi = Object.freeze({
     }
   }),
   runtimeProcessMonitor: Object.freeze({
-    open: (): Promise<DesktopRuntimeProcessMonitorOpenResult> =>
-      ipcRenderer.invoke(DESKTOP_CHANNELS.runtimeProcessMonitorOpen)
-        .then(parseDesktopRuntimeProcessMonitorOpenResult)
+    sampleDesktop: (): Promise<DesktopRuntimeProcessSample> =>
+      ipcRenderer.invoke(DESKTOP_CHANNELS.runtimeProcessMonitorSampleDesktop).then(parseDesktopRuntimeProcessSample),
+    open: (owner: DesktopRuntimeProcessMonitorOwner): Promise<DesktopRuntimeProcessMonitorOpenResult> => {
+      const parsed = parseDesktopRuntimeProcessMonitorOwner(owner);
+      return ipcRenderer.invoke(DESKTOP_CHANNELS.runtimeProcessMonitorOpen, parsed)
+        .then(parseDesktopRuntimeProcessMonitorOpenResult);
+    },
+    onRequest: (listener: (request: DesktopRuntimeProcessMonitorRequest) => void): (() => void) => {
+      if (typeof listener !== "function") throw new TypeError("Runtime process monitor request listener is invalid.");
+      const wrapped = (_event: IpcRendererEvent, value: unknown): void => {
+        try { listener(parseDesktopRuntimeProcessMonitorRequest(value)); } catch { /* Main remains authoritative. */ }
+      };
+      ipcRenderer.on(DESKTOP_CHANNELS.runtimeProcessMonitorRequest, wrapped);
+      return () => ipcRenderer.removeListener(DESKTOP_CHANNELS.runtimeProcessMonitorRequest, wrapped);
+    },
+    respond: (response: DesktopRuntimeProcessMonitorResponse): Promise<void> => {
+      const parsed = parseDesktopRuntimeProcessMonitorResponse(response);
+      return ipcRenderer.invoke(DESKTOP_CHANNELS.runtimeProcessMonitorRespond, parsed).then(() => undefined);
+    },
+    retire: (owner: DesktopRuntimeProcessMonitorOwner): Promise<void> => {
+      const parsed = parseDesktopRuntimeProcessMonitorOwner(owner);
+      return ipcRenderer.invoke(DESKTOP_CHANNELS.runtimeProcessMonitorRetire, parsed).then(() => undefined);
+    }
   }),
   layout: Object.freeze({
     reset: (): Promise<void> => ipcRenderer.invoke(DESKTOP_CHANNELS.layoutReset),
@@ -395,9 +468,17 @@ const desktopApi = Object.freeze({
     }
   }),
   inspectorWindow: Object.freeze({
-    onClosed: (listener: () => void): (() => void) => {
+    activate: (): Promise<boolean> => ipcRenderer.invoke(DESKTOP_CHANNELS.inspectorWindowActivate),
+    onClosed: (listener: (event: { readonly occurrence: string; readonly reason: "user" | "child-failure" }) => void): (() => void) => {
       if (typeof listener !== "function") throw new TypeError("Inspector window listener must be a function.");
-      const wrapped = (): void => listener();
+      const wrapped = (_event: IpcRendererEvent, value: unknown): void => {
+        if (typeof value !== "object" || value === null) return;
+        const occurrence = Reflect.get(value, "occurrence");
+        const reason = Reflect.get(value, "reason");
+        if (typeof occurrence !== "string" || occurrence.length === 0 || occurrence.length > 128 ||
+          (reason !== "user" && reason !== "child-failure")) return;
+        listener({ occurrence, reason });
+      };
       ipcRenderer.on(DESKTOP_CHANNELS.inspectorWindowClosed, wrapped);
       return () => ipcRenderer.removeListener(DESKTOP_CHANNELS.inspectorWindowClosed, wrapped);
     }
@@ -412,18 +493,10 @@ const desktopApi = Object.freeze({
       return () => ipcRenderer.removeListener(DESKTOP_CHANNELS.selectionContextMenuAddToChat, wrapped);
     }
   }),
-  setTrayIcon: (dataUrl: string): Promise<void> => ipcRenderer.invoke(DESKTOP_CHANNELS.traySetIcon, dataUrl),
-  notify: (notification: DesktopNotification): Promise<void> => ipcRenderer.invoke(DESKTOP_CHANNELS.notify, notification),
-  notifications: Object.freeze({
-    onFocusSession: (listener: (sessionId: string) => void): (() => void) => {
-      if (typeof listener !== "function") throw new TypeError("Desktop notification focus listener must be a function.");
-      const wrapped = (_event: IpcRendererEvent, value: unknown): void => {
-        if (isDesktopNotificationSessionId(value)) listener(value);
-      };
-      ipcRenderer.on(DESKTOP_CHANNELS.notificationFocusSession, wrapped);
-      return () => ipcRenderer.removeListener(DESKTOP_CHANNELS.notificationFocusSession, wrapped);
-    }
-  }),
+  setTrayIcon: (dataUrl: string): Promise<void> =>
+    ipcRenderer.invoke(DESKTOP_CHANNELS.traySetIcon, mainDocumentOccurrence, dataUrl),
+  notify: (notification: DesktopNotification): Promise<void> =>
+    ipcRenderer.invoke(DESKTOP_CHANNELS.notify, mainDocumentOccurrence, notification),
   attention: Object.freeze({
     mark: (key: DesktopAttentionKey): Promise<void> => invokeDesktopAttention(
       DESKTOP_CHANNELS.attentionMark,
@@ -616,20 +689,66 @@ const desktopApi = Object.freeze({
       return () => ipcRenderer.removeListener(DESKTOP_CHANNELS.globalVoiceCommand, wrapped);
     }
   }),
+  dedicatedHardware: Object.freeze({
+    getDedicatedHardwareState: (): Promise<unknown> =>
+      ipcRenderer.invoke(DESKTOP_CHANNELS.dedicatedHardwareGetState),
+    setDedicatedHardwareSettings: (model: string, settings: unknown): Promise<unknown> =>
+      ipcRenderer.invoke(DESKTOP_CHANNELS.dedicatedHardwareSetSettings, { model, settings }),
+    resetDedicatedHardwareSettings: (model: string, scope: "layout" | "all"): Promise<unknown> =>
+      ipcRenderer.invoke(DESKTOP_CHANNELS.dedicatedHardwareResetSettings, { model, scope }),
+    probeDedicatedHardware: (model: string): Promise<unknown> =>
+      ipcRenderer.invoke(DESKTOP_CHANNELS.dedicatedHardwareProbe, { model }),
+    recoverDedicatedHardwareKeymap: (model: string): Promise<unknown> =>
+      ipcRenderer.invoke(DESKTOP_CHANNELS.dedicatedHardwareRecoverKeymap, { model }),
+    setDedicatedHardwarePreview: (model: string, enabled: boolean): Promise<void> =>
+      ipcRenderer.invoke(DESKTOP_CHANNELS.dedicatedHardwareSetPreview, { model, enabled }).then(() => undefined),
+    publishDedicatedHardwareTasks: (catalog: unknown): Promise<void> =>
+      ipcRenderer.invoke(DESKTOP_CHANNELS.dedicatedHardwarePublishTasks, catalog).then(() => undefined),
+    acknowledgeDedicatedHardwareTaskFocus: (acknowledgement: unknown): Promise<boolean> =>
+      ipcRenderer.invoke(DESKTOP_CHANNELS.dedicatedHardwareAcknowledgeTaskFocus, acknowledgement).then(parseDesktopBoolean),
+    openDedicatedHardwareInputSettings: (): Promise<boolean> =>
+      ipcRenderer.invoke(DESKTOP_CHANNELS.dedicatedHardwareOpenInputSettings).then(parseDesktopBoolean),
+    onDedicatedHardwareStateChanged: (listener: (state: unknown) => void): (() => void) => {
+      if (typeof listener !== "function") throw new TypeError("Dedicated hardware state listener must be a function.");
+      const wrapped = (_event: IpcRendererEvent, value: unknown): void => listener(value);
+      ipcRenderer.on(DESKTOP_CHANNELS.dedicatedHardwareStateChanged, wrapped);
+      return () => ipcRenderer.removeListener(DESKTOP_CHANNELS.dedicatedHardwareStateChanged, wrapped);
+    },
+    onDedicatedHardwareAction: (listener: (action: unknown) => void): (() => void) => {
+      if (typeof listener !== "function") throw new TypeError("Dedicated hardware action listener must be a function.");
+      const wrapped = (_event: IpcRendererEvent, value: unknown): void => listener(value);
+      ipcRenderer.on(DESKTOP_CHANNELS.dedicatedHardwareAction, wrapped);
+      return () => ipcRenderer.removeListener(DESKTOP_CHANNELS.dedicatedHardwareAction, wrapped);
+    },
+    onDedicatedHardwarePreviewInput: (listener: (input: unknown) => void): (() => void) => {
+      if (typeof listener !== "function") throw new TypeError("Dedicated hardware preview listener must be a function.");
+      const wrapped = (_event: IpcRendererEvent, value: unknown): void => listener(value);
+      ipcRenderer.on(DESKTOP_CHANNELS.dedicatedHardwarePreviewInput, wrapped);
+      return () => ipcRenderer.removeListener(DESKTOP_CHANNELS.dedicatedHardwarePreviewInput, wrapped);
+    }
+  }),
   chooseFiles: (): Promise<readonly DesktopFile[]> => ipcRenderer.invoke(DESKTOP_CHANNELS.chooseFiles),
   choosePortableSessionFile: (): Promise<DesktopFile | undefined> =>
     ipcRenderer.invoke(DESKTOP_CHANNELS.choosePortableSessionFile),
   deepLinks: Object.freeze({
-    takePending: (): Promise<DesktopDeepLinkNavigation | undefined> =>
-      ipcRenderer.invoke(DESKTOP_CHANNELS.deepLinkTakePending).then((value: unknown) =>
-        value === undefined ? undefined : parseDesktopDeepLinkNavigation(value)),
-    onNavigate: (listener: (navigation: DesktopDeepLinkNavigation) => void): (() => void) => {
+    takePending: (): Promise<DesktopDeepLinkDelivery | undefined> =>
+      ipcRenderer.invoke(DESKTOP_CHANNELS.deepLinkTakePending, mainDocumentOccurrence).then((value: unknown) =>
+        value === undefined ? undefined : requireCurrentDesktopDeepLinkDelivery(value)),
+    acknowledge: (acknowledgement: DesktopDeepLinkAcknowledgement): Promise<boolean> => {
+      const parsed = parseDesktopDeepLinkAcknowledgement(acknowledgement);
+      if (mainDocumentOccurrence === undefined || parsed.documentOccurrence !== mainDocumentOccurrence) {
+        return Promise.reject(new TypeError("Desktop deep-link acknowledgement crossed its Document occurrence."));
+      }
+      return ipcRenderer.invoke(DESKTOP_CHANNELS.deepLinkAcknowledge, parsed).then(parseDesktopBoolean);
+    },
+    onNavigate: (listener: (delivery: DesktopDeepLinkDelivery) => void): (() => void) => {
       if (typeof listener !== "function") throw new TypeError("Desktop deep-link listener must be a function.");
       const wrapped = (_event: IpcRendererEvent, value: unknown): void => {
         try {
-          listener(parseDesktopDeepLinkNavigation(value));
+          listener(requireCurrentDesktopDeepLinkDelivery(value));
         } catch {
-          // Ignore malformed host messages; the pending pull remains authoritative after a reload.
+          // Ignore malformed or retired-Document host messages; the current
+          // occurrence's pending pull remains authoritative after a reload.
         }
       };
       ipcRenderer.on(DESKTOP_CHANNELS.deepLinkNavigate, wrapped);
@@ -877,6 +996,46 @@ function parseDesktopDeepLinkNavigation(value: unknown): DesktopDeepLinkNavigati
   throw new TypeError("Desktop deep-link navigation kind is invalid.");
 }
 
+function parseDesktopDeepLinkDelivery(value: unknown): DesktopDeepLinkDelivery {
+  if (!nativeRecord(value) || nativeKeys(value) !== "deliveryOccurrence,documentOccurrence,navigation"
+    || !isDesktopDeepLinkOccurrence(value["documentOccurrence"])
+    || !Number.isSafeInteger(value["deliveryOccurrence"])
+    || (value["deliveryOccurrence"] as number) < 1) {
+    throw new TypeError("Desktop deep-link delivery is invalid.");
+  }
+  return Object.freeze({
+    documentOccurrence: value["documentOccurrence"],
+    deliveryOccurrence: value["deliveryOccurrence"] as number,
+    navigation: parseDesktopDeepLinkNavigation(value["navigation"])
+  });
+}
+
+function parseDesktopDeepLinkAcknowledgement(value: unknown): DesktopDeepLinkAcknowledgement {
+  if (!nativeRecord(value) || nativeKeys(value) !== "deliveryOccurrence,documentOccurrence"
+    || !isDesktopDeepLinkOccurrence(value["documentOccurrence"])
+    || !Number.isSafeInteger(value["deliveryOccurrence"])
+    || (value["deliveryOccurrence"] as number) < 1) {
+    throw new TypeError("Desktop deep-link acknowledgement is invalid.");
+  }
+  return Object.freeze({
+    documentOccurrence: value["documentOccurrence"],
+    deliveryOccurrence: value["deliveryOccurrence"] as number
+  });
+}
+
+function requireCurrentDesktopDeepLinkDelivery(value: unknown): DesktopDeepLinkDelivery {
+  const delivery = parseDesktopDeepLinkDelivery(value);
+  if (mainDocumentOccurrence === undefined || delivery.documentOccurrence !== mainDocumentOccurrence) {
+    throw new TypeError("Desktop deep-link delivery crossed its Document occurrence.");
+  }
+  return delivery;
+}
+
+function isDesktopDeepLinkOccurrence(value: unknown): value is string {
+  return typeof value === "string" && value.length >= 1 && value.length <= 256
+    && value.trim() === value && !/[\u0000-\u001f\u007f]/u.test(value);
+}
+
 function invokeDesktopAttention(channel: string, key: DesktopAttentionKey): Promise<void> {
   let parsed: DesktopAttentionKey;
   try {
@@ -884,7 +1043,7 @@ function invokeDesktopAttention(channel: string, key: DesktopAttentionKey): Prom
   } catch (error) {
     return Promise.reject(error);
   }
-  return ipcRenderer.invoke(channel, parsed);
+  return ipcRenderer.invoke(channel, mainDocumentOccurrence, parsed);
 }
 
 function parseDesktopAttentionKey(value: unknown): DesktopAttentionKey {
@@ -1168,12 +1327,231 @@ function parseDesktopSessionWindowDropResult(value: unknown): DesktopSessionWind
 }
 
 function parseDesktopRuntimeProcessMonitorOpenResult(value: unknown): DesktopRuntimeProcessMonitorOpenResult {
-  if (typeof value !== "object" || value === null || Array.isArray(value) ||
-    Object.keys(value).join(",") !== "focusedExisting" ||
-    typeof (value as Record<string, unknown>)["focusedExisting"] !== "boolean") {
+  if (!runtimeProcessRecord(value, ["version", "focusedExisting"]) || value["version"] !== 1 ||
+    typeof value["focusedExisting"] !== "boolean") {
     throw new TypeError("Runtime process monitor result is invalid.");
   }
-  return Object.freeze({ focusedExisting: (value as DesktopRuntimeProcessMonitorOpenResult).focusedExisting });
+  return Object.freeze({ version: 1, focusedExisting: value["focusedExisting"] });
+}
+
+function parseDesktopRuntimeProcessSample(value: unknown): DesktopRuntimeProcessSample {
+  if (!runtimeProcessRecord(value, ["version", "capturedAt", "processes"]) || value["version"] !== 1 ||
+    !Number.isSafeInteger(value["capturedAt"]) || (value["capturedAt"] as number) < 0 ||
+    !Array.isArray(value["processes"]) || value["processes"].length > 512) {
+    throw new TypeError("Desktop runtime process sample is invalid.");
+  }
+  const processes = value["processes"].map((process) => {
+    if (!runtimeProcessRecord(process, ["role", "pid", "label", "cpuPercent", "memoryKb", "processCount"]) ||
+      (process["role"] !== "main" && process["role"] !== "renderer" && process["role"] !== "gpu" && process["role"] !== "utility") ||
+      !runtimeProcessPositiveInteger(process["pid"]) ||
+      !(process["label"] === null || runtimeProcessBoundedText(process["label"], 512)) ||
+      typeof process["cpuPercent"] !== "number" || !Number.isFinite(process["cpuPercent"]) || process["cpuPercent"] < 0 ||
+      !Number.isSafeInteger(process["memoryKb"]) || (process["memoryKb"] as number) < 0 || process["processCount"] !== 1) {
+      throw new TypeError("Desktop runtime process metric is invalid.");
+    }
+    return Object.freeze({
+      role: process["role"], pid: process["pid"], label: process["label"], cpuPercent: process["cpuPercent"],
+      memoryKb: process["memoryKb"] as number, processCount: 1 as const
+    });
+  });
+  if (new Set(processes.map((process) => process.pid)).size !== processes.length) {
+    throw new TypeError("Desktop runtime process identities must be unique.");
+  }
+  return Object.freeze({
+    version: 1,
+    capturedAt: value["capturedAt"] as number,
+    processes: Object.freeze(processes)
+  });
+}
+
+function parseDesktopRuntimeProcessMonitorOwner(value: unknown): DesktopRuntimeProcessMonitorOwner {
+  if (!runtimeProcessRecord(value, ["version", "profileId", "serverId", "connectionGeneration", "snapshotGeneration"]) ||
+    value["version"] !== 1 || !runtimeProcessIdentity(value["profileId"]) || !runtimeProcessIdentity(value["serverId"]) ||
+    !runtimeProcessSafeGeneration(value["connectionGeneration"]) || !runtimeProcessUint64Generation(value["snapshotGeneration"])) {
+    throw new TypeError("Runtime process monitor owner is invalid.");
+  }
+  return Object.freeze({
+    version: 1,
+    profileId: value["profileId"],
+    serverId: value["serverId"],
+    connectionGeneration: value["connectionGeneration"],
+    snapshotGeneration: value["snapshotGeneration"]
+  });
+}
+
+function parseDesktopRuntimeProcessMonitorRequest(value: unknown): DesktopRuntimeProcessMonitorRequest {
+  if (!runtimeProcessRecord(value, ["version", "requestId", "owner", "action"]) || value["version"] !== 1 ||
+    !runtimeProcessUuid(value["requestId"])) throw new TypeError("Runtime process monitor request is invalid.");
+  const owner = parseDesktopRuntimeProcessMonitorOwner(value["owner"]);
+  const action = value["action"];
+  if (runtimeProcessRecord(action, ["kind"]) && action["kind"] === "refresh") {
+    return Object.freeze({ version: 1, requestId: value["requestId"], owner, action: Object.freeze({ kind: "refresh" }) });
+  }
+  if (runtimeProcessRecord(action, ["kind", "backendGeneration", "process"]) && action["kind"] === "terminate" &&
+    runtimeProcessSafeGeneration(action["backendGeneration"])) {
+    const process = parseRuntimeProcess(action["process"]);
+    if (process.role !== "task-host" || !process.terminable || process.processInstanceId === undefined) {
+      throw new TypeError("Runtime process monitor termination fence is invalid.");
+    }
+    return Object.freeze({
+      version: 1,
+      requestId: value["requestId"],
+      owner,
+      action: Object.freeze({
+        kind: "terminate",
+        backendGeneration: action["backendGeneration"],
+        process
+      })
+    });
+  }
+  throw new TypeError("Runtime process monitor action is invalid.");
+}
+
+function parseDesktopRuntimeProcessMonitorResponse(value: unknown): DesktopRuntimeProcessMonitorResponse {
+  if (!runtimeProcessRecord(value, ["version", "requestId", "owner", "result"]) || value["version"] !== 1 ||
+    !runtimeProcessUuid(value["requestId"])) throw new TypeError("Runtime process monitor response is invalid.");
+  const owner = parseDesktopRuntimeProcessMonitorOwner(value["owner"]);
+  const result = value["result"];
+  if (runtimeProcessRecord(result, ["kind"]) && result["kind"] === "terminated") {
+    return Object.freeze({ version: 1, requestId: value["requestId"], owner, result: Object.freeze({ kind: "terminated" }) });
+  }
+  if (runtimeProcessRecord(result, ["kind", "message"]) && result["kind"] === "error" &&
+    runtimeProcessBoundedText(result["message"], 2_048)) {
+    return Object.freeze({
+      version: 1,
+      requestId: value["requestId"],
+      owner,
+      result: Object.freeze({ kind: "error", message: result["message"] })
+    });
+  }
+  if (!runtimeProcessRecord(result, ["kind", "locale", "backends", "sessions"]) || result["kind"] !== "snapshot" ||
+    (result["locale"] !== "en" && result["locale"] !== "zh-CN" && result["locale"] !== "en-XA") ||
+    !Array.isArray(result["backends"]) || result["backends"].length > 128 ||
+    !Array.isArray(result["sessions"]) || result["sessions"].length > 4_096) {
+    throw new TypeError("Runtime process monitor snapshot is invalid.");
+  }
+  const backends = result["backends"].map(parseRuntimeProcessBackend);
+  const sessions = result["sessions"].map(parseRuntimeProcessSession);
+  const backendIds = new Set(backends.map((backend) => backend.backendId));
+  const sessionKeys = new Set(sessions.map((session) => `${session.backendId}\u0000${session.sessionId}`));
+  if (backendIds.size !== backends.length || sessionKeys.size !== sessions.length ||
+    sessions.some((session) => !backendIds.has(session.backendId)) ||
+    backends.some((backend) => backend.state === "ready" && backend.processes.some((process) =>
+      process.backendId !== backend.backendId || (process.role === "task-host" &&
+        !sessionKeys.has(`${process.backendId}\u0000${process.sessionId}`))))) {
+    throw new TypeError("Runtime process monitor snapshot ownership is invalid.");
+  }
+  return Object.freeze({
+    version: 1,
+    requestId: value["requestId"],
+    owner,
+    result: Object.freeze({
+      kind: "snapshot",
+      locale: result["locale"],
+      backends: Object.freeze(backends),
+      sessions: Object.freeze(sessions)
+    })
+  });
+}
+
+function parseRuntimeProcessBackend(value: unknown): DesktopRuntimeProcessMonitorBackend {
+  if (runtimeProcessRecord(value, ["backendId", "backendGeneration", "backendName", "usageSupported", "terminateSupported", "state", "capturedAt", "processes"]) &&
+    runtimeProcessIdentity(value["backendId"]) && runtimeProcessSafeGeneration(value["backendGeneration"]) && runtimeProcessDisplayText(value["backendName"]) &&
+    typeof value["usageSupported"] === "boolean" && typeof value["terminateSupported"] === "boolean" && value["state"] === "ready" &&
+    Number.isSafeInteger(value["capturedAt"]) && (value["capturedAt"] as number) >= 0 &&
+    Array.isArray(value["processes"]) && value["processes"].length <= 512) {
+    return Object.freeze({
+      backendId: value["backendId"], backendGeneration: value["backendGeneration"], backendName: value["backendName"], usageSupported: value["usageSupported"],
+      terminateSupported: value["terminateSupported"], state: "ready", capturedAt: value["capturedAt"] as number,
+      processes: Object.freeze(value["processes"].map(parseRuntimeProcess))
+    });
+  }
+  if (runtimeProcessRecord(value, ["backendId", "backendGeneration", "backendName", "usageSupported", "terminateSupported", "state", "error"]) &&
+    runtimeProcessIdentity(value["backendId"]) && runtimeProcessSafeGeneration(value["backendGeneration"]) && runtimeProcessDisplayText(value["backendName"]) &&
+    typeof value["usageSupported"] === "boolean" && typeof value["terminateSupported"] === "boolean" && value["state"] === "error" &&
+    runtimeProcessBoundedText(value["error"], 2_048)) {
+    return Object.freeze({
+      backendId: value["backendId"], backendGeneration: value["backendGeneration"], backendName: value["backendName"], usageSupported: value["usageSupported"],
+      terminateSupported: value["terminateSupported"], state: "error", error: value["error"]
+    });
+  }
+  throw new TypeError("Runtime process monitor Backend is invalid.");
+}
+
+function parseRuntimeProcessSession(value: unknown): DesktopRuntimeProcessMonitorSession {
+  if (!runtimeProcessRecord(value, ["sessionId", "backendId", "sessionName", "generation"]) ||
+    !runtimeProcessIdentity(value["sessionId"]) || !runtimeProcessIdentity(value["backendId"]) ||
+    !runtimeProcessDisplayText(value["sessionName"]) || !runtimeProcessUint64Generation(value["generation"])) {
+    throw new TypeError("Runtime process monitor Session is invalid.");
+  }
+  return Object.freeze({ sessionId: value["sessionId"], backendId: value["backendId"], sessionName: value["sessionName"], generation: value["generation"] });
+}
+
+function parseRuntimeProcess(value: unknown): DesktopRuntimeProcessMonitorProcess {
+  const base = ["backendId", "role", "pid", "cpuPercent", "memoryKb", "processCount", "terminable"];
+  if (!runtimeProcessRecord(value, base) || value["role"] !== "control-plane" || value["terminable"] !== false ||
+    !runtimeProcessIdentity(value["backendId"]) || !runtimeProcessPositiveInteger(value["pid"]) ||
+    typeof value["cpuPercent"] !== "number" || !Number.isFinite(value["cpuPercent"]) || value["cpuPercent"] < 0 ||
+    !Number.isSafeInteger(value["memoryKb"]) || (value["memoryKb"] as number) < 0 ||
+    !runtimeProcessPositiveInteger(value["processCount"])) {
+    const task = [...base, "sessionId", "generation"];
+    const hasInstance = runtimeProcessRecord(value, [...task, "processInstanceId"]);
+    if ((!hasInstance && !runtimeProcessRecord(value, task)) || value["role"] !== "task-host" ||
+      !runtimeProcessIdentity(value["backendId"]) || !runtimeProcessIdentity(value["sessionId"]) ||
+      !runtimeProcessPositiveInteger(value["generation"]) || !runtimeProcessPositiveInteger(value["pid"]) ||
+      typeof value["cpuPercent"] !== "number" || !Number.isFinite(value["cpuPercent"]) || value["cpuPercent"] < 0 ||
+      !Number.isSafeInteger(value["memoryKb"]) || (value["memoryKb"] as number) < 0 ||
+      !runtimeProcessPositiveInteger(value["processCount"]) || typeof value["terminable"] !== "boolean" ||
+      value["terminable"] !== hasInstance || (hasInstance && !runtimeProcessUuid(value["processInstanceId"]))) {
+      throw new TypeError("Runtime process monitor process is invalid.");
+    }
+    return Object.freeze({
+      backendId: value["backendId"], role: "task-host", sessionId: value["sessionId"], generation: value["generation"], pid: value["pid"],
+      cpuPercent: value["cpuPercent"], memoryKb: value["memoryKb"] as number, processCount: value["processCount"],
+      terminable: value["terminable"], ...(hasInstance ? { processInstanceId: value["processInstanceId"] as string } : {})
+    });
+  }
+  return Object.freeze({
+    backendId: value["backendId"], role: "control-plane", pid: value["pid"],
+    cpuPercent: value["cpuPercent"], memoryKb: value["memoryKb"] as number, processCount: value["processCount"],
+    terminable: false
+  });
+}
+
+function runtimeProcessRecord(value: unknown, keys: readonly string[]): value is Record<string, unknown> {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const actual = Object.keys(value);
+  return actual.length === keys.length && keys.every((key) => Object.prototype.hasOwnProperty.call(value, key));
+}
+
+function runtimeProcessIdentity(value: unknown): value is string {
+  return runtimeProcessBoundedText(value, 512);
+}
+
+function runtimeProcessDisplayText(value: unknown): value is string {
+  return typeof value === "string" && value.length <= 512 && !/[\u0000\u0008\u000b\u000c\u000e-\u001f\u007f]/u.test(value);
+}
+
+function runtimeProcessBoundedText(value: unknown, maximum: number): value is string {
+  return typeof value === "string" && value.length >= 1 && value.length <= maximum && value.trim() === value &&
+    !/[\u0000-\u001f\u007f]/u.test(value);
+}
+
+function runtimeProcessSafeGeneration(value: unknown): value is string {
+  return typeof value === "string" && /^[1-9][0-9]{0,15}$/u.test(value) && BigInt(value) <= BigInt(Number.MAX_SAFE_INTEGER);
+}
+
+function runtimeProcessUint64Generation(value: unknown): value is string {
+  return typeof value === "string" && /^[1-9][0-9]{0,19}$/u.test(value) &&
+    BigInt(value) <= 18_446_744_073_709_551_615n;
+}
+
+function runtimeProcessUuid(value: unknown): value is string {
+  return typeof value === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u.test(value);
+}
+
+function runtimeProcessPositiveInteger(value: unknown): value is number {
+  return Number.isSafeInteger(value) && (value as number) > 0;
 }
 
 function parseDesktopKeepAwakeSettings(value: unknown): DesktopKeepAwakeSettings {
@@ -1622,11 +2000,13 @@ function parseDesktopGlobalVoiceShortcutResult(value: unknown): DesktopGlobalVoi
 }
 
 function parseDesktopGlobalVoiceCommand(value: unknown): DesktopGlobalVoiceCommand | undefined {
-  if (typeof value !== "object" || value === null || Array.isArray(value)
-    || Object.keys(value).join(",") !== "type") return undefined;
-  const type = (value as Record<string, unknown>)["type"];
+  if (!isExactGlobalVoiceRecord(value, ["type", "generation"])) return undefined;
+  const type = value["type"];
+  const generation = value["generation"];
   return type === "start" || type === "submit" || type === "cancel" || type === "retry"
-    ? Object.freeze({ type })
+    ? (isDesktopGlobalVoiceGeneration(generation)
+      ? Object.freeze({ type, generation })
+      : undefined)
     : undefined;
 }
 
@@ -1636,38 +2016,70 @@ function parseDesktopGlobalVoiceStatus(value: unknown): DesktopGlobalVoiceStatus
   }
   const candidate = value as Record<string, unknown>;
   const state = candidate["state"];
-  if ((state === "idle" || state === "starting") && Object.keys(candidate).join(",") === "state") {
-    return Object.freeze({ state });
+  const generation = candidate["generation"];
+  if (!isDesktopGlobalVoiceGeneration(generation, true) || (generation === "0" && state !== "idle")) {
+    throw new TypeError("Global voice status is invalid.");
+  }
+  if ((state === "idle" || state === "starting")
+    && hasExactGlobalVoiceKeys(candidate, ["state", "generation"])) {
+    return Object.freeze({ state, generation });
   }
   if (state === "listening" || state === "submitting") {
-    if (Object.keys(candidate).sort().join(",") !== "state,transcript"
+    if (!hasExactGlobalVoiceKeys(candidate, ["state", "generation", "transcript"])
       || typeof candidate["transcript"] !== "string"
       || candidate["transcript"].length > 4_096
       || /\u0000/u.test(candidate["transcript"])) {
       throw new TypeError("Global voice status is invalid.");
     }
-    return Object.freeze({ state, transcript: candidate["transcript"] });
+    return Object.freeze({ state, generation, transcript: candidate["transcript"] });
   }
   const errorKind = candidate["errorKind"];
   if (state === "error"
-    && Object.keys(candidate).sort().join(",") === "errorKind,state"
+    && hasExactGlobalVoiceKeys(candidate, ["state", "generation", "errorKind"])
     && (errorKind === "unsupported" || errorKind === "permission" || errorKind === "microphone"
       || errorKind === "service" || errorKind === "empty" || errorKind === "insertion")) {
-    return Object.freeze({ state, errorKind });
+    return Object.freeze({ state, generation, errorKind });
   }
   throw new TypeError("Global voice status is invalid.");
 }
 
 function parseDesktopGlobalVoiceCommitRequest(value: unknown): DesktopGlobalVoiceCommitRequest {
-  if (typeof value !== "object" || value === null || Array.isArray(value)
-    || Object.keys(value).join(",") !== "text") {
+  if (!isExactGlobalVoiceRecord(value, ["generation", "text"])) {
     throw new TypeError("Global voice result is invalid.");
   }
-  const text = (value as Record<string, unknown>)["text"];
-  if (typeof text !== "string" || text.length === 0 || text.length > 64 * 1024 || /\u0000/u.test(text)) {
+  const generation = value["generation"];
+  const text = value["text"];
+  if (!isDesktopGlobalVoiceGeneration(generation)
+    || typeof text !== "string" || text.length === 0 || text.length > 64 * 1024 || /\u0000/u.test(text)) {
     throw new TypeError("Global voice result is invalid.");
   }
-  return Object.freeze({ text });
+  return Object.freeze({ generation, text });
+}
+
+function isDesktopGlobalVoiceGeneration(value: unknown, allowIdle = false): value is string {
+  if (typeof value !== "string" || value.length === 0 || value.length > 16
+    || !/^(?:0|[1-9][0-9]*)$/u.test(value)) return false;
+  if (!allowIdle && value === "0") return false;
+  return BigInt(value) <= BigInt(Number.MAX_SAFE_INTEGER);
+}
+
+function hasExactGlobalVoiceKeys(
+  value: Record<string, unknown>,
+  keys: readonly string[]
+): boolean {
+  const actual = Object.keys(value);
+  return actual.length === keys.length
+    && keys.every((key) => Object.prototype.hasOwnProperty.call(value, key));
+}
+
+function isExactGlobalVoiceRecord(
+  value: unknown,
+  keys: readonly string[]
+): value is Record<string, unknown> {
+  return typeof value === "object"
+    && value !== null
+    && !Array.isArray(value)
+    && hasExactGlobalVoiceKeys(value as Record<string, unknown>, keys);
 }
 
 function parseDesktopGlobalVoiceAccessibilitySnapshot(value: unknown): DesktopGlobalVoiceAccessibilitySnapshot {

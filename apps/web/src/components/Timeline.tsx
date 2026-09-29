@@ -94,6 +94,7 @@ import { useTimelineArtifactUrlCache } from "./timeline-artifact-url-cache.js";
 import { AudioArtworkContext } from "./AudioArtwork.js";
 import { timelineErrorCopy } from "../timeline-error-copy.js";
 import { GAMEPAD_SCROLL_EVENT } from "../gamepad-client.js";
+import { useAppInputTimelineOwner } from "../app-input-owners.js";
 import {
   TIMELINE_HISTORY_NAVIGATION_KEYS,
   TIMELINE_TOUCH_UP_INTENT_THRESHOLD_PX,
@@ -706,6 +707,14 @@ export function Timeline({ ownerKey, sessionId, sessionName, workspaceId, onRead
     if (followingRef.current && shouldUnpinTimelineOnWheel({ deltaX, deltaY, scrollHeight: node.scrollHeight, clientHeight: node.clientHeight })) setTimelineFollowing(false);
     if (historyError === undefined && shouldLoadEarlierTimeline({ scrollTop: node.scrollTop, hasEarlier, loading: historyLoading })) requestEarlier();
   };
+
+  useAppInputTimelineOwner(scrollRef, ownerKey, (deltaY) => {
+    const node = scrollRef.current;
+    if (node === null) return;
+    const y = Math.max(-240, Math.min(240, deltaY));
+    handleTimelineWheelIntent(y, 0, node);
+    node.scrollBy({ left: 0, top: y, behavior: "instant" });
+  });
 
   useEffect(() => {
     const node = scrollRef.current;

@@ -1,11 +1,12 @@
 import { createHash } from "node:crypto";
-import { posix as remotePath } from "node:path";
+import { posix as remotePath, win32 } from "node:path";
 import { TextDecoder } from "node:util";
 
 import {
   CLAUDE_AGENT_SDK_VERSION,
   loadClaudeRemoteManagerSource
 } from "@joko/adapter-claude-code";
+import { DEVICE_PEER_RUNTIME_EXECUTABLES } from "@joko/device-peer";
 import type { RemoteProcessHandle, RemoteProcessTransportPort } from "@joko/remote-ssh";
 
 export const REMOTE_CLAUDE_NODE_VERSION = "22.13.0";
@@ -41,6 +42,35 @@ export interface RemoteClaudeInstallationProbe {
   readonly claudeExecutable: string;
   readonly socketPath: string;
   readonly installedVersion?: string;
+  /** Process-local target resolver; never persisted in a Target or Session. */
+  readonly runtimeEntrypoint?: "device_peer";
+}
+
+export async function devicePeerClaudeInstallation(
+  workspaceRoot: string,
+  pathStyle: "posix" | "win32"
+): Promise<RemoteClaudeInstallationProbe> {
+  const paths = pathStyle === "win32" ? win32 : remotePath;
+  if (!paths.isAbsolute(workspaceRoot) || paths.normalize(workspaceRoot) !== workspaceRoot) {
+    throw installationFault("The Device peer Claude workspace path is invalid.");
+  }
+  const bundle = await managerBundle();
+  const runtimeRoot = paths.join(workspaceRoot, ".joko", "runtime", "v1", "claude-code");
+  const socketPath = pathStyle === "win32"
+    ? `\\\\.\\pipe\\joko-claude-${createHash("sha256").update(runtimeRoot.toLowerCase()).digest("hex").slice(0, 32)}`
+    : paths.join(runtimeRoot, "run", "manager.sock");
+  return Object.freeze({
+    state: "ready" as const,
+    workspaceRoot,
+    runtimeRoot,
+    nodeExecutable: DEVICE_PEER_RUNTIME_EXECUTABLES.claude,
+    managerModule: DEVICE_PEER_RUNTIME_EXECUTABLES.claude,
+    managerSha256: bundle.sha256,
+    claudeExecutable: DEVICE_PEER_RUNTIME_EXECUTABLES.claude,
+    socketPath,
+    installedVersion: REMOTE_CLAUDE_EXPECTED_VERSION,
+    runtimeEntrypoint: "device_peer" as const
+  });
 }
 
 export class RemoteClaudeInstallationError extends Error {

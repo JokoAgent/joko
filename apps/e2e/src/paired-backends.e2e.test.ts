@@ -13,7 +13,7 @@ import {
 import { createCodexAdapter, AppServerHost, CODEX_MANAGED_PROVIDER_SUPPORT } from "@joko/adapter-codex";
 import { FakeCodexAppServer, ScriptedRpcTransport } from "@joko/adapter-codex/testing";
 import {
-  createDefaultPiManagedProcessSupervisor,
+  createDefaultManagedProcessSupervisor,
   createPiAdapter,
   PiBackendAdapter,
   type PiManagedProvider
@@ -3612,7 +3612,7 @@ async function startPairedFixture(
           }),
           ...(options.controlPiFault === true ? {
             processFactory: piProcesses.create,
-            processSupervisor: createDefaultPiManagedProcessSupervisor(),
+            processSupervisor: createDefaultManagedProcessSupervisor(),
             onUnexpectedRuntimeExit: (sessionId: string, runtimeGeneration: number) => {
               unexpectedPiRuntimeExits.push({
                 sessionId,

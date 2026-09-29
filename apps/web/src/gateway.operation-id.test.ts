@@ -40,14 +40,21 @@ describe("operation ID lifecycle", () => {
         targetId: "runtime-target",
         projectId: "navigation-project",
         displayName: "Movable task",
-        remoteWorkspace: { hostTargetId: "runtime-target", hostId: "host-1", workspaceRootDisplay: "/srv/work" }
+        location: { kind: { case: "sshHost", value: {
+          hostTargetId: "runtime-target", hostId: "host-1", workspaceRootDisplay: "/srv/work"
+        } } }
       }]
     }));
     expect(snapshot.sessions[0]).toMatchObject({
       id: "session-1",
       targetId: "runtime-target",
       projectId: "navigation-project",
-      remoteWorkspace: true
+      remoteWorkspace: {
+        kind: "ssh",
+        hostTargetId: "runtime-target",
+        hostId: "host-1",
+        workspaceRoot: "/srv/work"
+      }
     });
   });
 
@@ -119,7 +126,8 @@ describe("operation ID lifecycle", () => {
         sessionId: "session-existing",
         backendId: "pi",
         targetId: "target-1",
-        displayName: "Existing task"
+        displayName: "Existing task",
+        location: { kind: { case: "serviceNode", value: {} } }
       }])
     );
     await gateway.connect();
@@ -135,6 +143,37 @@ describe("operation ID lifecycle", () => {
     expect(operationIds).toHaveLength(3);
     expect(operationIds[1]).toBe(operationIds[0]);
     expect(operationIds[2]).not.toBe(operationIds[1]);
+    gateway.disconnect();
+  });
+
+  it("refreshes a committed managed Target past a stale in-flight snapshot before creating its task", async () => {
+    let snapshotReads = 0;
+    const createdTarget = { ...targetDescriptor(false), targetId: "target-created", workspaceId: "workspace-created" };
+    const gateway = createOrchestratorGateway(
+      { id: "connection-1", deviceId: "device-test", name: "Desktop", origin: "https://orchestrator.example", serverId: "server-test" },
+      "secret",
+      {},
+      () => operationTransport(async (method, input) => input.mutation.payload.case === "createTarget"
+        ? response(method, create(SubmitOperationResponseSchema, {
+          operation: {
+            operationId: input.operationId,
+            connectionId: input.connectionId,
+            state: OperationState.SUCCEEDED,
+            result: { payload: { case: "target", value: { targetId: createdTarget.targetId } } }
+          }
+        }))
+        : successfulSessionResponse(method, input, "session-created"), [],
+      () => ++snapshotReads < 3 ? [targetDescriptor(false)] : [targetDescriptor(false), createdTarget])
+    );
+    await gateway.connect();
+
+    const targetId = await gateway.createTarget({
+      backendId: "pi", name: "Managed dialogue", workspaceKind: "managedDialogue",
+      serverPath: "", createIfMissing: true
+    });
+    expect(targetId).toBe("target-created");
+    expect(snapshotReads).toBeGreaterThanOrEqual(3);
+    await expect(gateway.createSession({ ...DRAFT, targetId })).resolves.toMatchObject({ sessionId: "session-created" });
     gateway.disconnect();
   });
 
@@ -472,6 +511,7 @@ function operationTransport(
             targetId: input.targetId,
             displayName: "Local workspace",
             serverPathDisplay: "D:\\workspace",
+            location: { kind: { case: "serviceNode", value: {} } },
             version: { revision: input.expectedTargetRevision }
           }
         }));
@@ -490,6 +530,7 @@ function targetDescriptor(archived: boolean, revision = 1n): any {
     displayName: "Local workspace",
     workspaceId: "workspace-1",
     archived,
+    location: { kind: { case: "serviceNode", value: {} } },
     version: { revision: { value: revision } }
   };
 }
@@ -508,6 +549,7 @@ function successfulSessionResponse(method: any, input: any, sessionId: string): 
             backendId: "pi",
             targetId: "target-1",
             displayName: "New task",
+            location: { kind: { case: "serviceNode", value: {} } },
             nativeBinding: { runtimeGeneration: 7n }
           }
         }

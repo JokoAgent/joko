@@ -65,6 +65,8 @@
           "enabled": true,
           "appGroupId": "group.app.joko.mobile",
           "activationRule": {
+            "supportsText": true,
+            "supportsWebUrlWithMaxCount": 20,
             "supportsImageWithMaxCount": 20,
             "supportsFileWithMaxCount": 20
           }

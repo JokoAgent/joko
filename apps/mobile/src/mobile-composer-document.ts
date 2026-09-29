@@ -197,7 +197,7 @@ export const mobileComposerNativeInputMaximumCharacters = maximumDraftCharacters
 export const mobileSelectionQuoteMaximumCharacters = 4_000;
 export const mobileSelectionQuoteMarker = "<!-- joko-selection-quote -->";
 export const mobileSelectionQuoteMarkerLine = `> ${mobileSelectionQuoteMarker}`;
-const maximumComposerAtoms = 1_024;
+export const mobileComposerMaximumAtoms = 1_024;
 const maximumSlashCommandMarks = 1_024;
 const maximumSlashCommandCharacters = 257;
 const maximumSelectionQuotes = 32;
@@ -227,8 +227,8 @@ export function normalizeMobileComposerDraft(value: MobileComposerDraft): Mobile
   if (value.mentions.filter((mention) => mention?.kind === "session").length > maximumSessionMentions) {
     throw new Error("A task message can reference at most 8 other tasks.");
   }
-  if (value.atoms.length > maximumComposerAtoms) {
-    throw new Error(`A task message can contain at most ${maximumComposerAtoms} structured message items.`);
+  if (value.atoms.length > mobileComposerMaximumAtoms) {
+    throw new Error(`A task message can contain at most ${mobileComposerMaximumAtoms} structured message items.`);
   }
   if (value.slashCommands.length > maximumSlashCommandMarks) {
     throw new Error(`A task message can contain at most ${maximumSlashCommandMarks} selected slash commands.`);
@@ -702,8 +702,8 @@ export function insertMobileRouteReferencePaste(
   }
   replacement.push(suffix);
   const result = replaceMobileComposerRange(current, range, replacement.join(""));
-  if (result.draft.atoms.length + occurrences.length > maximumComposerAtoms) {
-    throw new Error(`A task message can contain at most ${maximumComposerAtoms} structured message items.`);
+  if (result.draft.atoms.length + occurrences.length > mobileComposerMaximumAtoms) {
+    throw new Error(`A task message can contain at most ${mobileComposerMaximumAtoms} structured message items.`);
   }
   const atoms = [...result.draft.atoms, ...occurrences]
     .sort((left, right) => left.start - right.start || left.end - right.end);
@@ -1098,8 +1098,8 @@ function insertMobileComposerAtom(
   if (atomId === undefined) throw new Error("The Joko composer atom occurrence is invalid.");
   const token = mobileComposerAtomToken(atom);
   const result = replaceMobileComposerRange(draft, range, `${prefix}${token}${suffix}`);
-  if (result.draft.atoms.length >= maximumComposerAtoms) {
-    throw new Error(`A task message can contain at most ${maximumComposerAtoms} structured message items.`);
+  if (result.draft.atoms.length >= mobileComposerMaximumAtoms) {
+    throw new Error(`A task message can contain at most ${mobileComposerMaximumAtoms} structured message items.`);
   }
   const start = range.start + prefix.length;
   const occurrence = { ...atom, atomId, start, end: start + token.length } as MobileComposerAtom;
@@ -1727,7 +1727,7 @@ function isUtf16Boundary(text: string, offset: number): boolean {
 
 export const mobileComposerDocumentTesting = {
   maximumDraftCharacters,
-  maximumComposerAtoms,
+  maximumComposerAtoms: mobileComposerMaximumAtoms,
   maximumSelectionQuotes,
   maximumSerializedCharacters,
   maximumSessionMentions,

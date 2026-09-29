@@ -1,11 +1,12 @@
 import { createHash, randomUUID } from "node:crypto";
-import { posix as remotePath } from "node:path";
+import { posix, win32 } from "node:path";
 import { TextDecoder } from "node:util";
 import { AjvJsonSchemaValidator } from "@modelcontextprotocol/sdk/validation/ajv";
 
 import {
   CLAUDE_AGENT_SDK_VERSION,
   ClaudeSessionStoreError,
+  claudeWorkspaceAuthority,
   type ClaudeCanUseToolOptions,
   type ClaudePermissionResult,
   type ClaudeRemoteRuntimePort,
@@ -37,22 +38,23 @@ import type {
   ClaudeSessionStoreOperationSnapshot,
   ClaudeSessionStoreSessionAccess
 } from "@joko/adapter-claude-code";
-import type { TargetDescriptor } from "@joko/core";
+import type { RemoteWorkspaceBinding, TargetDescriptor } from "@joko/core";
 import type {
+  RemoteForwardingTransportPort,
   RemoteProcessHandle,
   RemoteProcessTransportPort,
-  RemoteReverseForwardHandle,
-  RemoteSshTransportLease
+  RemoteReverseForwardHandle
 } from "@joko/remote-ssh";
-import type { OperationalStore, RemoteHostRecord, StoredTarget } from "@joko/store";
+import type { OperationalStore, StoredTarget } from "@joko/store";
 import {
   REMOTE_CLAUDE_EXPECTED_VERSION,
   REMOTE_CLAUDE_MANAGER_VERSION,
   REMOTE_CLAUDE_PROTOCOL_VERSION,
+  devicePeerClaudeInstallation,
   probeRemoteClaudeInstallation,
   type RemoteClaudeInstallationProbe
 } from "./remote-claude-installation.js";
-import type { RemoteHostRegistry } from "./remote-host-registry.js";
+import type { RemoteExecutionRouter, RemoteProcessAuthority } from "./remote-execution-router.js";
 
 const MAXIMUM_LINE_BYTES = 32 * 1024 * 1024;
 const MAXIMUM_BUFFER_BYTES = MAXIMUM_LINE_BYTES + 64 * 1024;
@@ -81,15 +83,13 @@ interface RemoteClaudeStoreAuthority {
   readonly generation: number;
 }
 
-type ProcessAuthority = Awaited<ReturnType<RemoteHostRegistry["captureProcessAuthority"]>>;
-
 interface ResolverEntry {
   readonly key: string;
   readonly targetId: string;
   readonly targetRevision: bigint;
   readonly targetSignature: string;
   readonly storedSignature: string;
-  readonly authority: ProcessAuthority;
+  readonly authority: RemoteProcessAuthority;
   readonly runtime: RemoteClaudeSdkRuntime;
   readonly binding: ClaudeTargetRuntime;
 }
@@ -103,7 +103,7 @@ export interface RemoteClaudeDerivedWorkspaceAuthority {
 
 export interface RemoteClaudeRuntimeResolverOptions {
   readonly store: Pick<OperationalStore, "getTarget">;
-  readonly registry: Pick<RemoteHostRegistry, "captureProcessAuthority">;
+  readonly remoteExecution: Pick<RemoteExecutionRouter, "processes">;
   /** Persisted monotonic Backend instance generation, shared by its source and derived runtimes. */
   readonly storeGeneration: number;
   readonly authorizeDerivedWorkspace?: (
@@ -116,7 +116,7 @@ export interface RemoteClaudeRuntimeResolverOptions {
 /** Target-, Host-, SSH-, installation-, and manager-generation-bound Claude runtime owner. */
 export class RemoteClaudeRuntimeResolver implements ClaudeRemoteRuntimePort {
   readonly #store: Pick<OperationalStore, "getTarget">;
-  readonly #registry: Pick<RemoteHostRegistry, "captureProcessAuthority">;
+  readonly #remoteExecution: Pick<RemoteExecutionRouter, "processes">;
   readonly #authorizeDerivedWorkspace: RemoteClaudeRuntimeResolverOptions["authorizeDerivedWorkspace"];
   readonly #storeGeneration: number;
   readonly #entries = new Map<string, ResolverEntry>();
@@ -129,7 +129,7 @@ export class RemoteClaudeRuntimeResolver implements ClaudeRemoteRuntimePort {
       throw runtimeFault("store_generation_invalid", false);
     }
     this.#store = options.store;
-    this.#registry = options.registry;
+    this.#remoteExecution = options.remoteExecution;
     this.#storeGeneration = options.storeGeneration;
     this.#authorizeDerivedWorkspace = options.authorizeDerivedWorkspace;
   }
@@ -139,11 +139,14 @@ export class RemoteClaudeRuntimeResolver implements ClaudeRemoteRuntimePort {
     if (signal?.aborted) throw runtimeFault("cancelled", false);
     const stored = this.#storedTarget(target);
     const derived = target.workspaceRoot !== stored.descriptor.workspaceRoot;
+    const effectiveWorkspaceRoot = derived
+      ? target.workspaceRoot
+      : requireRemoteBinding(target).workspaceRoot;
     const directoryAuthority = derived
       ? await this.#authorizeDerivedWorkspace!(target, stored, signal)
       : undefined;
     await directoryAuthority?.verifyExact(signal);
-    const key = JSON.stringify([target.id, target.workspaceRoot]);
+    const key = JSON.stringify([target.id, effectiveWorkspaceRoot]);
     const signature = targetSignature(target);
     const existing = this.#entries.get(key);
     if (existing !== undefined
@@ -160,7 +163,9 @@ export class RemoteClaudeRuntimeResolver implements ClaudeRemoteRuntimePort {
     }
     const active = this.#flights.get(key);
     if (active !== undefined) return active;
-    const flight = this.#resolveFresh(target, stored, signature, key, directoryAuthority, signal);
+    const flight = this.#resolveFresh(
+      target, stored, signature, key, effectiveWorkspaceRoot, directoryAuthority, signal
+    );
     this.#flights.set(key, flight);
     try { return await flight; }
     finally { if (this.#flights.get(key) === flight) this.#flights.delete(key); }
@@ -188,26 +193,28 @@ export class RemoteClaudeRuntimeResolver implements ClaudeRemoteRuntimePort {
     stored: StoredTarget,
     signature: string,
     key: string,
+    effectiveWorkspaceRoot: string,
     directoryAuthority: RemoteClaudeDerivedWorkspaceAuthority | undefined,
     signal?: AbortSignal
   ): Promise<ClaudeTargetRuntime> {
     const remote = requireRemoteBinding(stored.descriptor);
-    const authority = await this.#registry.captureProcessAuthority(remote.hostTargetId, remote.hostId, signal);
-    const processes = requireProcesses(authority.lease);
+    const authority = await this.#remoteExecution.processes(remote, signal);
+    const processes = authority.processes;
     authority.assertCurrent();
-    const installation = await probeRemoteClaudeInstallation(processes, remote.workspaceRoot, authority.assertCurrent, signal);
+    const installation = authority.kind === "device_peer"
+      ? await devicePeerClaudeInstallation(remote.workspaceRoot, authority.pathStyle)
+      : await probeRemoteClaudeInstallation(processes, remote.workspaceRoot, authority.assertCurrent, signal);
     authority.assertCurrent();
     if (installation.state !== "ready") throw runtimeFault("runtime_unavailable", false);
     if (installation.workspaceRoot !== remote.workspaceRoot) throw runtimeFault("workspace_alias", false);
     const ownerKey = createHash("sha256").update(JSON.stringify({
       kind: "joko-remote-claude-owner-v1",
-      ownerId: authority.host.ownerId,
       targetId: target.id,
-      host: executionHostIdentity(authority.host),
+      executionIdentity: authority.executionIdentity,
       runtimeRoot: installation.runtimeRoot,
-      ...(directoryAuthority === undefined ? {} : { workspaceRoot: target.workspaceRoot })
+      ...(directoryAuthority === undefined ? {} : { workspaceRoot: effectiveWorkspaceRoot })
     }), "utf8").digest("hex");
-    const ownerGeneration = `${stored.revision}:${authority.hostRevision}:${authority.leaseGeneration}:${randomUUID()}`;
+    const ownerGeneration = `${stored.revision}:${authority.authorityIdentity}:${randomUUID()}`;
     const storeAuthority: RemoteClaudeStoreAuthority = Object.freeze({
       schemaVersion: 1,
       namespace: `backend-${createHash("sha256").update(JSON.stringify({
@@ -215,8 +222,7 @@ export class RemoteClaudeRuntimeResolver implements ClaudeRemoteRuntimePort {
         backendId: target.backendId,
         targetId: target.id,
         primaryWorkspaceRoot: remote.workspaceRoot,
-        ownerId: authority.host.ownerId,
-        host: executionHostIdentity(authority.host),
+        executionIdentity: authority.executionIdentity,
         runtimeRoot: installation.runtimeRoot
       }), "utf8").digest("hex")}`,
       generation: this.#storeGeneration
@@ -241,13 +247,13 @@ export class RemoteClaudeRuntimeResolver implements ClaudeRemoteRuntimePort {
     };
     runtime = new RemoteClaudeSdkRuntime({
       processes,
-      lease: authority.lease,
+      forwarding: authority.forwarding,
       installation,
       ownerKey,
       ownerGeneration,
       storeAuthority,
       workspaceAuthority,
-      authorizedWorkspaceRoot: target.workspaceRoot,
+      authorizedWorkspaceRoot: effectiveWorkspaceRoot,
       ...(directoryAuthority === undefined ? {} : { verifyWorkspace: directoryAuthority.verifyExact }),
       assertCurrent,
       assertAuthorityCurrent,
@@ -255,7 +261,7 @@ export class RemoteClaudeRuntimeResolver implements ClaudeRemoteRuntimePort {
     });
     const binding: ClaudeTargetRuntime = Object.freeze({
       runtime,
-      workspaceRoot: target.workspaceRoot,
+      workspaceRoot: effectiveWorkspaceRoot,
       remote: true,
       assertCurrent
     });
@@ -321,7 +327,7 @@ export class RemoteClaudeRuntimeResolver implements ClaudeRemoteRuntimePort {
 
 interface RemoteClaudeSdkRuntimeOptions {
   readonly processes: RemoteProcessTransportPort;
-  readonly lease: RemoteSshTransportLease;
+  readonly forwarding?: RemoteForwardingTransportPort;
   readonly installation: RemoteClaudeInstallationProbe;
   readonly ownerKey: string;
   readonly ownerGeneration: string;
@@ -762,8 +768,8 @@ class RemoteClaudeSdkRuntime implements ClaudeSdkRuntime {
     try { url = new URL(raw); }
     catch { throw runtimeFault("provider_route_invalid", false); }
     if (!["127.0.0.1", "::1", "localhost"].includes(url.hostname)) return { params };
-    const forwarding = this.#options.lease.forwarding;
-    if (this.#options.lease.capabilities.tcpForwarding !== true || forwarding === undefined) {
+    const forwarding = this.#options.forwarding;
+    if (forwarding === undefined) {
       throw runtimeFault("provider_forwarding_unavailable", false);
     }
     const port = url.port.length > 0 ? Number.parseInt(url.port, 10) : url.protocol === "https:" ? 443 : 80;
@@ -1341,11 +1347,11 @@ class RemoteClaudeManagerChannel {
     const processHandle = await options.processes.open({
       executable: options.installation.nodeExecutable,
       args: [
-        options.installation.managerModule,
+        ...(options.installation.runtimeEntrypoint === "device_peer" ? [] : [options.installation.managerModule]),
         "bridge",
         options.installation.socketPath,
         options.installation.runtimeRoot,
-        options.installation.claudeExecutable
+        ...(options.installation.runtimeEntrypoint === "device_peer" ? [] : [options.installation.claudeExecutable])
       ],
       cwd: options.installation.workspaceRoot,
       env: managerEnvironment(options.installation),
@@ -1913,27 +1919,6 @@ function exactKeys(value: Readonly<Record<string, unknown>>, keys: readonly stri
   return Object.keys(value).length === keys.length && Object.keys(value).every((key) => keys.includes(key));
 }
 
-/** The Adapter's Target-scoped Store key; effective cwd is intentionally part of remote identity. */
-function claudeWorkspaceAuthority(target: TargetDescriptor): string {
-  const remote = requireRemoteBinding(target);
-  if (!normalizedAbsoluteRemotePath(target.workspaceRoot)) throw runtimeFault("remote_target_invalid", false);
-  const hash = createHash("sha256")
-    .update("joko-claude-workspace\0", "utf8")
-    .update(target.backendId, "utf8")
-    .update("\0", "utf8")
-    .update(target.id, "utf8")
-    .update("\0", "utf8")
-    .update("remote\0", "utf8")
-    .update(remote.hostTargetId, "utf8")
-    .update("\0", "utf8")
-    .update(remote.hostId, "utf8")
-    .update("\0", "utf8")
-    .update(remote.workspaceRoot, "utf8")
-    .update("\0", "utf8")
-    .update(target.workspaceRoot, "utf8");
-  return `workspace-${hash.digest("hex")}`;
-}
-
 function targetSignature(target: TargetDescriptor): string {
   return JSON.stringify({
     id: target.id,
@@ -1946,43 +1931,45 @@ function targetSignature(target: TargetDescriptor): string {
   });
 }
 
-function requireRemoteBinding(target: TargetDescriptor): NonNullable<TargetDescriptor["remoteWorkspace"]> {
+function requireRemoteBinding(target: TargetDescriptor): RemoteWorkspaceBinding {
   const binding = target.remoteWorkspace;
-  if (binding === undefined || binding.hostId.length === 0 || binding.hostId.length > 256
+  if (binding === undefined || !validRemoteBindingIdentity(binding)
     || !normalizedAbsoluteRemotePath(binding.workspaceRoot)) throw runtimeFault("remote_target_invalid", false);
   return binding;
 }
 
-function requireProcesses(lease: RemoteSshTransportLease): RemoteProcessTransportPort {
-  if (lease.capabilities.processStreaming !== true || lease.processes === undefined) throw runtimeFault("process_transport_unavailable", false);
-  return lease.processes;
+function validRemoteBindingIdentity(binding: RemoteWorkspaceBinding): boolean {
+  return binding.kind === "ssh"
+    ? boundedIdentity(binding.hostTargetId) && boundedIdentity(binding.hostId)
+    : boundedIdentity(binding.controllerDeviceId)
+      && boundedIdentity(binding.targetDeviceId)
+      && binding.controllerDeviceId !== binding.targetDeviceId;
 }
 
-function executionHostIdentity(host: RemoteHostRecord): Readonly<Record<string, unknown>> {
-  if (host.trust === undefined || host.user.length === 0) throw runtimeFault("host_unpinned", false);
-  return {
-    hostname: host.hostname,
-    port: host.port,
-    user: host.user,
-    algorithm: host.trust.algorithm,
-    fingerprint: host.trust.fingerprint
-  };
+function boundedIdentity(value: string): boolean {
+  return value.length > 0 && value.length <= 512 && value === value.trim()
+    && !/[\u0000-\u001f\u007f]/u.test(value);
 }
 
 function normalizedAbsoluteRemotePath(value: string): boolean {
+  const remotePath = value.startsWith("/") ? posix : win32;
   return value.length > 0
     && value.length <= 16_384
-    && !/[\u0000-\u001f\u007f\\]/u.test(value)
+    && !/[\u0000-\u001f\u007f]/u.test(value)
     && remotePath.isAbsolute(value)
     && remotePath.normalize(value) === value;
 }
 
 function managerEnvironment(installation: RemoteClaudeInstallationProbe): Readonly<Record<string, string>> {
+  const remotePath = installation.runtimeEntrypoint === "device_peer"
+    && !installation.runtimeRoot.startsWith("/") ? win32 : posix;
   const profile = remotePath.join(installation.runtimeRoot, "profile");
   const temporary = remotePath.join(installation.runtimeRoot, "tmp");
   return Object.freeze({
     HOME: profile,
-    PATH: `${remotePath.dirname(installation.nodeExecutable)}:/usr/local/bin:/usr/bin:/bin`,
+    ...(installation.runtimeEntrypoint === "device_peer" ? {} : {
+      PATH: `${remotePath.dirname(installation.nodeExecutable)}:/usr/local/bin:/usr/bin:/bin`
+    }),
     TMPDIR: temporary,
     TMP: temporary,
     TEMP: temporary,

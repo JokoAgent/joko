@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import type { Dirent, Stats } from "node:fs";
 import { mkdtemp, readFile, readdir, realpath, rm, stat } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
-import { basename, isAbsolute, join, normalize, posix as posixPath, relative, resolve, sep } from "node:path";
+import { basename, isAbsolute, join, normalize, posix as posixPath, relative, resolve, sep, win32 as win32Path } from "node:path";
 import {
   CAPABILITIES,
   CapabilityDrivenBackendAdapter,
@@ -39,6 +39,7 @@ import {
   type PermissionMode,
   type PromptInput,
   type ProviderModel,
+  type RuntimeProcessUsageSnapshot,
   type TargetDescriptor
 } from "@joko/core";
 import { AppServerHost, type AppServerHostOptions, type HostSubscription } from "./host.js";
@@ -66,6 +67,7 @@ import {
 } from "./protocol.js";
 import { projectCodexNativeHistory } from "./native-history.js";
 import {
+  inspectCodexCatalogMaterialization,
   materializeCodexCatalogSession,
   validateCodexCatalogSource
 } from "./session-materialization.js";
@@ -289,6 +291,7 @@ interface CodexReadScope {
   readonly workspaceRoot: string;
   readonly profileKey: string;
   readonly remote: boolean;
+  readonly pathStyle: "posix" | "win32";
   readonly openMcpBridge?: CodexRemoteRuntime["openMcpBridge"];
   readonly assertAuthorityCurrent: () => void;
   readonly assertCurrent: () => void;
@@ -613,6 +616,33 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       authenticationState,
       diagnostics
     });
+  }
+
+  async getRuntimeProcessUsage(): Promise<RuntimeProcessUsageSnapshot> {
+    this.#assertOpen();
+    const host = this.#host;
+    if (!host.processInspectionSupported) {
+      throw adapterError({
+        code: "CODEX_RUNTIME_PROCESS_USAGE_UNAVAILABLE",
+        message: "The local Codex control-plane process cannot be inspected.",
+        phase: "probe",
+        retryable: true,
+        recovery: "Use a service node with exact local process inspection support."
+      });
+    }
+    const usage = await host.inspectProcessUsage();
+    if (host !== this.#host) return { capturedAt: this.#now(), processes: [] };
+    return {
+      capturedAt: this.#now(),
+      processes: usage.map((process) => ({
+        role: "control-plane" as const,
+        pid: process.pid,
+        cpuPercent: process.cpuPercent,
+        memoryKb: process.memoryKb,
+        processCount: process.processCount,
+        terminable: false as const
+      }))
+    };
   }
 
   /**
@@ -1342,6 +1372,33 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     return stateFromThread(bindingFromReference(binding.opaqueRef, context.generation), thread);
   }
 
+  async inspectNativeSessionDeletion(
+    binding: NativeSessionBinding,
+    context: AdapterContext
+  ): Promise<"present" | "absent" | "unknown"> {
+    try {
+      this.#assertOpen();
+      this.#assertContextTarget(context, context.target);
+      if (binding.generation !== context.generation
+        || context.binding?.opaqueRef !== binding.opaqueRef
+        || context.binding.generation !== binding.generation
+        || context.binding.nativeSessionId !== binding.nativeSessionId) return "unknown";
+      const reference = parseNativeReference(binding.opaqueRef);
+      await this.#readValidatedNativeThread(
+        reference.threadId,
+        context.target,
+        "probe",
+        context.signal,
+        reference.profileKey
+      );
+      return "present";
+    } catch {
+      // A missing app-server thread is not proof that its durable profile data
+      // was deleted; the thread may simply not be materialized in this host.
+      return "unknown";
+    }
+  }
+
   async resolveNativeSessionReference(
     nativeReference: string,
     target: TargetDescriptor,
@@ -1461,7 +1518,11 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
 
   async bindCatalogSession(
     entry: NativeSessionCatalogEntry,
-    generation: number
+    generation: number,
+    claimMaterialization: (claim: {
+      readonly binding: NativeSessionBinding;
+      readonly recoveryReference: string;
+    }) => Promise<void>
   ): Promise<NativeSessionBinding> {
     this.#assertOpen();
     const activeProfileKey = await this.#activeProfileKey;
@@ -1483,12 +1544,31 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       || parsed.sourceFingerprint !== source.fingerprint) {
       throw expiredCatalogReference();
     }
+    const binding = bindingForThread(parsed.threadId, generation, activeProfileKey);
     await this.#withCatalogMaterializationLock(() => materializeCodexCatalogSession({
       activeProfileDirectory: this.#profileDirectory,
       source,
-      entry
+      entry,
+      claim: async (recoveryReference) => claimMaterialization({ binding, recoveryReference })
     }));
-    return bindingForThread(parsed.threadId, generation, activeProfileKey);
+    return binding;
+  }
+
+  async inspectCatalogSessionMaterialization(
+    binding: NativeSessionBinding,
+    recoveryReference: string
+  ): Promise<"present" | "absent" | "unknown"> {
+    try {
+      this.#assertOpen();
+      const parsed = parseNativeReference(binding.opaqueRef);
+      if (binding.nativeSessionId !== parsed.threadId
+        || parsed.profileKey !== await this.#activeProfileKey) return "unknown";
+      return await inspectCodexCatalogMaterialization(
+        recoveryReference, this.#profileDirectory, parsed.threadId
+      );
+    } catch {
+      return "unknown";
+    }
   }
 
   async getNativeHistoryProjection(context: AdapterContext): Promise<NativeHistoryProjection> {
@@ -2599,6 +2679,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
         workspaceRoot: await realpath(target.workspaceRoot),
         profileKey: await this.#activeProfileKey,
         remote: false,
+        pathStyle: nativeRuntimePathStyle(this.#host),
         ...(this.#localMcpBridge === undefined ? {} : { openMcpBridge: this.#localMcpBridge }),
         assertAuthorityCurrent: () => {
           this.#assertOpen();
@@ -2610,10 +2691,16 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
         }
       };
     }
-    if (!isNormalizedAbsolutePosixPath(target.remoteWorkspace.workspaceRoot)) {
+    const pathStyle = remoteWorkspacePathStyle(target.remoteWorkspace);
+    if (!validRemoteWorkspaceIdentity(target.remoteWorkspace)
+      || pathStyle === undefined
+      || !isNormalizedAbsoluteRemotePath(target.remoteWorkspace.workspaceRoot, pathStyle)
+      || (target.workspaceRoot === target.remoteWorkspace.workspaceRoot
+        ? !isNormalizedAbsoluteRemotePath(target.workspaceRoot, pathStyle)
+        : !isNormalizedAbsoluteLocalPath(target.workspaceRoot))) {
       throw adapterError({
         code: "CODEX_REMOTE_TARGET_PATH_INVALID",
-        message: "The remote Target workspace root must be a normalized absolute POSIX path.",
+        message: "The remote Target workspace binding must contain an exact execution identity and canonical native paths.",
         phase: "provision",
         recovery: "Repair the remote Target workspace binding."
       });
@@ -2629,7 +2716,8 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     try {
       if (signal?.aborted) throw remoteRuntimeCancelled();
       const runtime = await this.#remoteRuntimes.resolve(target, signal);
-      if (!isNormalizedAbsolutePosixPath(runtime.workspaceRoot)
+      if (!isNormalizedAbsoluteRemotePath(runtime.workspaceRoot, pathStyle)
+        || runtime.workspaceRoot !== target.remoteWorkspace.workspaceRoot
         || !validReferenceDigest(runtime.profileKey)
         || !validExecutionDomain(runtime.executionDomain)) {
         throw new ProtocolShapeError("remote Codex runtime scope is invalid");
@@ -2652,6 +2740,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
         workspaceRoot: runtime.workspaceRoot,
         profileKey: runtime.profileKey,
         remote: true,
+        pathStyle,
         ...(runtime.openMcpBridge === undefined ? {} : { openMcpBridge: runtime.openMcpBridge }),
         assertAuthorityCurrent: () => {
           this.#assertOpen();
@@ -2726,6 +2815,9 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       workspaceRoot: runtime.targetWorkspaceRoot,
       profileKey: runtime.profileKey,
       remote: runtime.remote,
+      pathStyle: runtime.remote
+        ? remoteWorkspacePathStyle(runtime.context.target.remoteWorkspace) ?? "posix"
+        : nativeRuntimePathStyle(runtime.host),
       ...(!runtime.remote && this.#localMcpBridge !== undefined ? { openMcpBridge: this.#localMcpBridge } : {}),
       assertAuthorityCurrent,
       assertCurrent: () => {
@@ -3524,9 +3616,9 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     // authority is registered from live notifications or the first exact
     // collab_spawn request while an operation lease is active.
     const nativeMemoryDirectory = input.context.runtimePolicy === "review_read_only"
-      || !supportsNativeMemoryRuntime(input.scope.host)
+      || !supportsNativeMemoryRuntime(input.scope.host, input.scope.pathStyle)
       ? undefined
-      : codexNativeMemoryDirectory(input.scope.host);
+      : codexNativeMemoryDirectory(input.scope.host, input.scope.pathStyle);
     const runtime: SessionRuntime = {
       host: input.scope.host,
       profileKey: input.scope.profileKey,
@@ -4543,6 +4635,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     if (this.#account?.supportsLogin === true) supported.add("provider.login");
     if (this.#account?.supportsLogout === true) supported.add("provider.logout");
     if (this.#resolvers.readBlob !== undefined) supported.add("input.image");
+    if (this.#host.processInspectionSupported) supported.add("runtime.process_usage");
     const isolatedReviewSupported = supportsIsolatedReview(this.#host.initializeResult?.userAgent);
     if (isolatedReviewSupported) supported.add("review.isolated");
     const nativeCollaborationSupported = supportsNativeCollaboration(this.#host.initializeResult?.userAgent);
@@ -4571,6 +4664,8 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
           : key === "memory.native" && this.#resolveNativeMemoryEnabled !== undefined
               && !supportsNativeMemoryRuntime(this.#host)
             ? { reason: "upstream_missing" as const }
+          : key === "runtime.process_usage" && !this.#host.processInspectionSupported
+            ? { reason: "platform_limited" as const }
           : (key === "plan_mode"
               || key === "interaction.plan_review"
               || key === "background.tasks"
@@ -5948,8 +6043,7 @@ function assertCodexDerivationTarget(source: TargetDescriptor, derived: TargetDe
     || source.backendId !== derived.backendId
     || source.managed !== derived.managed
     || source.trusted !== derived.trusted
-    || source.remoteWorkspace?.hostId !== derived.remoteWorkspace?.hostId
-    || source.remoteWorkspace?.workspaceRoot !== derived.remoteWorkspace?.workspaceRoot) {
+    || !sameRemoteWorkspace(source.remoteWorkspace, derived.remoteWorkspace)) {
     throw adapterError({
       code: "CODEX_SESSION_DERIVATION_TARGET_MISMATCH",
       message: "The derived workspace does not preserve the source Target identity.",
@@ -6030,22 +6124,73 @@ function isNormalizedAbsolutePosixPath(value: string): boolean {
     && posixPath.normalize(value) === value;
 }
 
-function codexNativeMemoryDirectory(host: AppServerHost): string | undefined {
+function isNormalizedAbsoluteWin32Path(value: string): boolean {
+  return value.length > 0
+    && value.length <= 16_384
+    && !/[\u0000-\u001f\u007f]/u.test(value)
+    && win32Path.isAbsolute(value)
+    && win32Path.normalize(value) === value;
+}
+
+function isNormalizedAbsoluteRemotePath(value: string, pathStyle: "posix" | "win32"): boolean {
+  return pathStyle === "posix" ? isNormalizedAbsolutePosixPath(value) : isNormalizedAbsoluteWin32Path(value);
+}
+
+function isNormalizedAbsoluteLocalPath(value: string): boolean {
+  return value.length > 0
+    && value.length <= 16_384
+    && !/[\u0000-\u001f\u007f]/u.test(value)
+    && isAbsolute(value)
+    && normalize(value) === value;
+}
+
+function remoteWorkspacePathStyle(
+  binding: TargetDescriptor["remoteWorkspace"]
+): "posix" | "win32" | undefined {
+  if (binding === undefined) return process.platform === "win32" ? "win32" : "posix";
+  if (binding.kind === "ssh") return "posix";
+  if (isNormalizedAbsolutePosixPath(binding.workspaceRoot)) return "posix";
+  if (isNormalizedAbsoluteWin32Path(binding.workspaceRoot)) return "win32";
+  return undefined;
+}
+
+function validRemoteWorkspaceIdentity(binding: NonNullable<TargetDescriptor["remoteWorkspace"]>): boolean {
+  const bounded = (value: string): boolean => value.length > 0
+    && value.length <= 256
+    && !/[\u0000-\u001f\u007f]/u.test(value);
+  return binding.kind === "ssh"
+    ? bounded(binding.hostTargetId) && bounded(binding.hostId)
+    : bounded(binding.controllerDeviceId)
+      && bounded(binding.targetDeviceId)
+      && binding.controllerDeviceId !== binding.targetDeviceId;
+}
+
+function codexNativeMemoryDirectory(
+  host: AppServerHost,
+  pathStyle: "posix" | "win32" = nativeRuntimePathStyle(host)
+): string | undefined {
   const codexHome = host.initializeResult?.codexHome;
   if (codexHome === undefined
     || codexHome.length > 16_384
     || /[\u0000-\u001f\u007f]/u.test(codexHome)) return undefined;
-  if (codexHome.startsWith("/")) {
-    return isNormalizedAbsolutePosixPath(codexHome)
-      ? posixPath.join(codexHome, "memories")
-      : undefined;
-  }
-  return isAbsolute(codexHome) ? join(resolve(codexHome), "memories") : undefined;
+  const paths = pathStyle === "win32" ? win32Path : posixPath;
+  return isNormalizedAbsoluteRemotePath(codexHome, pathStyle)
+    ? paths.join(codexHome, "memories")
+    : undefined;
 }
 
-function supportsNativeMemoryRuntime(host: AppServerHost): boolean {
+function supportsNativeMemoryRuntime(
+  host: AppServerHost,
+  pathStyle: "posix" | "win32" = nativeRuntimePathStyle(host)
+): boolean {
   return versionFromUserAgent(host.initializeResult?.userAgent) === AUDITED_APP_SERVER_VERSION
-    && codexNativeMemoryDirectory(host) !== undefined;
+    && codexNativeMemoryDirectory(host, pathStyle) !== undefined;
+}
+
+function nativeRuntimePathStyle(host: AppServerHost): "posix" | "win32" {
+  return host.initializeResult?.platformFamily.toLocaleLowerCase("en-US") === "windows"
+    ? "win32"
+    : "posix";
 }
 
 function validExecutionDomain(value: string): boolean {
@@ -6073,9 +6218,15 @@ function sameRemoteWorkspace(
   left: TargetDescriptor["remoteWorkspace"],
   right: TargetDescriptor["remoteWorkspace"]
 ): boolean {
-  return left === undefined
-    ? right === undefined
-    : right !== undefined && left.hostId === right.hostId && left.workspaceRoot === right.workspaceRoot;
+  if (left === undefined || right === undefined) return left === right;
+  if (left.kind !== right.kind) return false;
+  return left.kind === "ssh" && right.kind === "ssh"
+    ? left.hostTargetId === right.hostTargetId
+      && left.hostId === right.hostId
+      && left.workspaceRoot === right.workspaceRoot
+    : left.kind === "device_peer" && right.kind === "device_peer"
+      && left.controllerDeviceId === right.controllerDeviceId
+      && left.targetDeviceId === right.targetDeviceId && left.workspaceRoot === right.workspaceRoot;
 }
 
 function remoteMutationUnsupported(operation: string) {

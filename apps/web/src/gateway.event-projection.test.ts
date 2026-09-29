@@ -67,6 +67,8 @@ import {
 } from "./sidebar-layout.js";
 import { Code, ConnectError } from "@connectrpc/connect";
 
+const serviceNodeLocation = { kind: { case: "serviceNode" as const, value: {} } } as const;
+
 describe("event continuity", () => {
   const eventAt = (sequence: bigint, generation = 7n): Event => create(EventSchema, {
     eventId: `event-${sequence}`,
@@ -305,11 +307,13 @@ describe("incremental event projection", () => {
         sessionId: "session-background",
         backendId: "pi",
         targetId: "target",
+        location: serviceNodeLocation,
         state: SessionState.IDLE
       }, {
         sessionId: "session-other",
         backendId: "pi",
         targetId: "target",
+        location: serviceNodeLocation,
         state: SessionState.IDLE
       }],
       backgroundTasks: [{
@@ -384,6 +388,7 @@ describe("incremental event projection", () => {
         sessionId: "session-attention",
         backendId: "pi",
         targetId: "target",
+        location: serviceNodeLocation,
         state: SessionState.IDLE,
         attention: {
           kind: SessionAttentionKind.ERROR,
@@ -436,6 +441,7 @@ describe("incremental event projection", () => {
         sessionId: "session-queue-attention",
         backendId: "pi",
         targetId: "target",
+        location: serviceNodeLocation,
         state: SessionState.IDLE,
         attention: {
           kind: SessionAttentionKind.DONE,
@@ -722,8 +728,8 @@ describe("incremental event projection", () => {
       generation: 4n,
       resumeCursor: { generation: 4n, sequence: 2n },
       sessions: [
-        { sessionId: "session-clear", backendId: "pi", targetId: "target", state: SessionState.IDLE },
-        { sessionId: "session-keep", backendId: "pi", targetId: "target", state: SessionState.IDLE }
+        { sessionId: "session-clear", backendId: "pi", targetId: "target", location: serviceNodeLocation, state: SessionState.IDLE },
+        { sessionId: "session-keep", backendId: "pi", targetId: "target", location: serviceNodeLocation, state: SessionState.IDLE }
       ],
       runtimeCommands: [
         { commandId: "clear-old", sessionId: "session-clear", name: "old", source: RuntimeCommandSource.EXTENSION, loaded: true },
@@ -758,8 +764,8 @@ describe("incremental event projection", () => {
       generation: 4n,
       resumeCursor: { generation: 4n, sequence: 2n },
       sessions: [
-        { sessionId: "session-pruned", backendId: "pi", targetId: "target", state: SessionState.IDLE },
-        { sessionId: "session-retained", backendId: "pi", targetId: "target", state: SessionState.IDLE }
+        { sessionId: "session-pruned", backendId: "pi", targetId: "target", location: serviceNodeLocation, state: SessionState.IDLE },
+        { sessionId: "session-retained", backendId: "pi", targetId: "target", location: serviceNodeLocation, state: SessionState.IDLE }
       ],
       runtimeCommands: [
         { commandId: "pruned-command", sessionId: "session-pruned", name: "old", source: RuntimeCommandSource.EXTENSION, loaded: true },
@@ -861,6 +867,7 @@ describe("incremental event projection", () => {
         sessionId: "session-context",
         backendId: "pi",
         targetId: "target",
+        location: serviceNodeLocation,
         state: SessionState.IDLE,
         context: {
           usedTokens: 90n,
@@ -889,6 +896,7 @@ describe("incremental event projection", () => {
         sessionId: "session-retry",
         backendId: "pi",
         targetId: "target",
+        location: serviceNodeLocation,
         displayName: "Retry task",
         state: SessionState.RUNNING
       }],
@@ -1028,6 +1036,7 @@ describe("incremental event projection", () => {
         sessionId: "session-tool-stream",
         backendId: "backend-1",
         targetId: "target-1",
+        location: serviceNodeLocation,
         state: SessionState.RUNNING
       }]
     });
@@ -1267,6 +1276,7 @@ describe("incremental event projection", () => {
         sessionId: "session-1",
         backendId: "backend-1",
         targetId: "target-1",
+        location: serviceNodeLocation,
         displayName: "Initial",
         state: SessionState.IDLE,
         permissionMode: 1,
@@ -1437,6 +1447,7 @@ describe("incremental event projection", () => {
         sessionId: "session-1",
         backendId: "backend-1",
         targetId: "target-1",
+        location: serviceNodeLocation,
         displayName: "Renamed",
         automationOrigin: {
           scheduleId: "schedule-1",
@@ -1726,6 +1737,7 @@ describe("incremental event projection", () => {
         sessionId: "session-1",
         backendId: "backend-1",
         targetId: "target-1",
+        location: serviceNodeLocation,
         state: SessionState.IDLE,
         ...(compacting === undefined ? {} : { contextState: { compacting } })
       }],
@@ -1747,7 +1759,14 @@ describe("incremental event projection", () => {
     const raw = create(SnapshotSchema, {
       generation: 4n,
       resumeCursor: { generation: 4n, sequence: 0n },
-      sessions: [{ sessionId: "session-1", backendId: "backend-1", targetId: "target-1", state: SessionState.IDLE, contextState: { compacting: false } }],
+      sessions: [{
+        sessionId: "session-1",
+        backendId: "backend-1",
+        targetId: "target-1",
+        location: serviceNodeLocation,
+        state: SessionState.IDLE,
+        contextState: { compacting: false }
+      }],
       pi: { sessions: [{
         backendId: "backend-1",
         targetId: "target-1",
@@ -2334,6 +2353,7 @@ describe("provider and model projection", () => {
       sessions: [{
         sessionId: "session-b",
         backendId: "backend-b",
+        location: serviceNodeLocation,
         model: { model: { providerId: "shared", modelId: "same" } }
       }]
     }));
@@ -2356,6 +2376,7 @@ describe("provider and model projection", () => {
       sessions: [{
         sessionId: "session-a",
         backendId: "backend-a",
+        location: serviceNodeLocation,
         model: { model: { providerId: "provider-a", modelId: "model-a" } }
       }]
     }));

@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { lstat, realpath } from "node:fs/promises";
 import { homedir } from "node:os";
-import { isAbsolute, join, normalize, posix as remotePath, relative, resolve, sep } from "node:path";
+import { isAbsolute, join, normalize, posix as remotePath, relative, resolve, sep, win32 as win32Path } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import {
   createChildRuntimeEnvironment,
@@ -49,9 +49,11 @@ import {
   type PromptInput,
   type ProviderModel,
   type PublicError,
+  type RuntimeProcessUsageSnapshot,
   type RuntimeResource,
   type SubagentControlInput,
   type TargetDescriptor,
+  type TerminateRuntimeProcessInput,
   type UsageSnapshot
 } from "@joko/core";
 import { AsyncInputGate, deferred, type Deferred } from "./async-input-gate.js";
@@ -546,6 +548,7 @@ interface NativeRuntime {
   readonly toolNames: Map<string, string>;
   consumer: Promise<void>;
   closed: boolean;
+  externalTermination: boolean;
   retirementConfirmed: boolean;
   nativeTaskProjectionEnabled: boolean;
   steerEnabled: boolean;
@@ -847,6 +850,8 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
         this.#resolveNativeMemoryEnabled !== undefined,
         catalogModels,
         this.#managedModels().some((model) => model.thinkingLevels.length > 0),
+        this.#runtime.processInspectionSupported === true && this.#runtime.inspectQueryProcesses !== undefined,
+        this.#runtime.processInspectionSupported === true && this.#runtime.terminateQueryProcess !== undefined,
         this.#hostCapabilities,
         supportsLogin,
         supportsLogout,
@@ -980,6 +985,111 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     await this.#retireAuthorizedRuntimes();
   }
 
+  async getRuntimeProcessUsage(): Promise<RuntimeProcessUsageSnapshot> {
+    const inspect = this.#runtime.inspectQueryProcesses;
+    if (this.#runtime.processInspectionSupported !== true || inspect === undefined) {
+      throw claudeCodeError(
+        "CLAUDE_RUNTIME_PROCESS_USAGE_UNAVAILABLE",
+        "Local Claude task-host processes cannot be inspected.",
+        "resource",
+        { retryable: true, recovery: "Use a service node with exact local process inspection support." }
+      );
+    }
+    const runtimes = [...this.#sessions.values()].filter((runtime) =>
+      !runtime.closed
+      && !runtime.externalTermination
+      && !runtime.remote
+      && runtime.sdkRuntime === this.#runtime
+      && runtime.backendInstanceGeneration === this.#instanceGeneration);
+    let sampled: readonly { readonly runtime: NativeRuntime; readonly query: ClaudeSdkQuery; readonly processes: Awaited<ReturnType<typeof inspect>> }[];
+    try {
+      sampled = (await Promise.all(runtimes.flatMap((runtime) => runtimeQueries(runtime).map(async (query) => ({
+        runtime,
+        query,
+        processes: await inspect.call(this.#runtime, query)
+      })))));
+    } catch (error) {
+      throw claudeCodeError(
+        "CLAUDE_RUNTIME_PROCESS_USAGE_FAILED",
+        "Local Claude task-host process usage could not be inspected.",
+        "resource",
+        { retryable: true, recovery: "Retry after checking service-node process inspection support." }
+      );
+    }
+    const identities = new Set<string>();
+    const processes = sampled.flatMap(({ runtime, query, processes: usage }) => {
+      if (this.#sessions.get(runtime.productSessionId) !== runtime || runtime.closed || runtime.externalTermination
+        || runtime.sdkRuntime !== this.#runtime || !runtimeQueries(runtime).includes(query)) return [];
+      return usage.map((process) => {
+        const identity = `${process.ownerToken}\u0000${process.pid}`;
+        if (identities.has(identity)) {
+          throw claudeCodeError(
+            "CLAUDE_RUNTIME_PROCESS_USAGE_INVALID",
+            "The local Claude process owner returned a duplicate task-host root.",
+            "resource"
+          );
+        }
+        identities.add(identity);
+        return {
+          role: "task-host" as const,
+          sessionId: runtime.productSessionId,
+          generation: runtime.sessionGeneration,
+          pid: process.pid,
+          cpuPercent: process.cpuPercent,
+          memoryKb: process.memoryKb,
+          processCount: process.processCount,
+          terminable: true,
+          processInstanceId: process.ownerToken
+        };
+      });
+    });
+    return { capturedAt: this.#now(), processes };
+  }
+
+  async terminateRuntimeProcess(input: TerminateRuntimeProcessInput): Promise<void> {
+    const runtime = this.#sessions.get(input.sessionId);
+    const inspect = this.#runtime.inspectQueryProcesses;
+    const terminate = this.#runtime.terminateQueryProcess;
+    if (runtime === undefined || runtime.closed || runtime.externalTermination || runtime.remote || runtime.sdkRuntime !== this.#runtime
+      || runtime.sessionGeneration !== input.generation
+      || runtime.backendInstanceGeneration !== this.#instanceGeneration
+      || this.#runtime.processInspectionSupported !== true || inspect === undefined || terminate === undefined) {
+      throw runtimeProcessFenceMismatch();
+    }
+    let owner: ClaudeSdkQuery | undefined;
+    for (const query of runtimeQueries(runtime)) {
+      const usage = await inspect.call(this.#runtime, query).catch(() => []);
+      if (usage.some((process) => process.pid === input.pid && process.ownerToken === input.processInstanceId)) {
+        if (owner !== undefined) throw runtimeProcessFenceMismatch();
+        owner = query;
+      }
+    }
+    if (owner === undefined || this.#sessions.get(input.sessionId) !== runtime || runtime.closed || runtime.externalTermination
+      || runtime.sessionGeneration !== input.generation || !runtimeQueries(runtime).includes(owner)) {
+      throw runtimeProcessFenceMismatch();
+    }
+    runtime.externalTermination = true;
+    try {
+      await terminate.call(this.#runtime, owner, {
+        pid: input.pid,
+        processInstanceId: input.processInstanceId
+      }, this.#teardownTimeoutMs);
+    } catch {
+      await this.#retireRuntime(runtime, false).catch(() => undefined);
+      throw claudeCodeError(
+        "CLAUDE_RUNTIME_PROCESS_EXIT_UNCONFIRMED",
+        "The exact local Claude task-host process did not confirm retirement.",
+        "shutdown",
+        {
+          retryable: true,
+          stateMayHaveChanged: true,
+          recovery: "Keep this Session generation fenced and refresh process usage before retrying."
+        }
+      );
+    }
+    await this.#retireRuntime(runtime, false);
+  }
+
   async listModels(): Promise<readonly ProviderModel[]> {
     return (await this.describe()).models;
   }
@@ -995,6 +1105,12 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
       return;
     }
     validateRemoteTarget(target);
+    if (target.workspaceRoot !== target.remoteWorkspace.workspaceRoot) {
+      const pathStyle = remoteBindingPathStyle(target.remoteWorkspace)!;
+      if (!normalizedAbsoluteRemotePath(target.workspaceRoot, pathStyle)) {
+        await validateCanonicalDirectory(target.workspaceRoot, "Target fallback workspace");
+      }
+    }
     const scoped = await this.#targetRuntime(target);
     scoped.assertCurrent();
   }
@@ -1229,6 +1345,49 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     };
   }
 
+  async inspectNativeSessionDeletion(
+    binding: NativeSessionBinding,
+    context: AdapterContext
+  ): Promise<"present" | "absent" | "unknown"> {
+    try {
+      assertStandardReviewContext(context, "inspect native Session deletion");
+      await this.validateTarget(context.target);
+      this.#assertBindingContext(binding, context);
+      if (context.binding?.opaqueRef !== binding.opaqueRef
+        || context.binding.generation !== binding.generation
+        || context.binding.nativeSessionId !== binding.nativeSessionId) return "unknown";
+      const route = parseBindingRoute(binding);
+      const scoped = await this.#targetRuntime(context.target, context.signal);
+      scoped.assertCurrent();
+      if (route.kind === "stored") {
+        if (route.workspaceAuthority !== claudeWorkspaceAuthority(context.target)
+          || scoped.runtime.storedSessions?.inspectDeletion === undefined) return "unknown";
+        const result = await scoped.runtime.storedSessions.inspectDeletion({
+          workspaceAuthority: route.workspaceAuthority,
+          sessionId: route.nativeSessionId
+        });
+        scoped.assertCurrent();
+        await this.validateTarget(context.target);
+        this.#assertBindingContext(binding, context);
+        return result;
+      }
+      const info = await scoped.runtime.getSessionInfo(route.nativeSessionId, {
+        dir: scoped.workspaceRoot,
+        signal: context.signal
+      });
+      scoped.assertCurrent();
+      await this.validateTarget(context.target);
+      this.#assertBindingContext(binding, context);
+      // The ordinary SDK lookup has no durable profile identity in this
+      // binding. A missing result could be a changed profile, not deletion.
+      if (info === undefined) return "unknown";
+      assertSessionInfo(info, route.nativeSessionId, scoped.workspaceRoot, scoped.remote);
+      return "present";
+    } catch {
+      return "unknown";
+    }
+  }
+
   async getNativeHistoryProjection(context: AdapterContext): Promise<NativeHistoryProjection> {
     this.#assertUsable();
     assertStandardReviewContext(context, "read persisted native history");
@@ -1356,6 +1515,9 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     assertStandardReviewContext(context, "delete native Session state");
     await this.validateTarget(context.target);
     this.#assertBindingContext(binding, context);
+    if (context.binding?.opaqueRef !== binding.opaqueRef
+      || context.binding.generation !== binding.generation
+      || context.binding.nativeSessionId !== binding.nativeSessionId) throw continuityGap();
     const route = parseBindingRoute(binding);
     const nativeSessionId = route.nativeSessionId;
     const targetRuntime = await this.#targetRuntime(context.target, context.signal);
@@ -1792,9 +1954,10 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
       || lifecycle.sourceTarget.backendId !== lifecycle.target.backendId
       || lifecycle.sourceTarget.managed !== lifecycle.target.managed
       || lifecycle.sourceTarget.trusted !== lifecycle.target.trusted
-      || lifecycle.sourceTarget.remoteWorkspace?.hostTargetId !== lifecycle.target.remoteWorkspace?.hostTargetId
-      || lifecycle.sourceTarget.remoteWorkspace?.hostId !== lifecycle.target.remoteWorkspace?.hostId
-      || lifecycle.sourceTarget.remoteWorkspace?.workspaceRoot !== lifecycle.target.remoteWorkspace?.workspaceRoot) return false;
+      || !sameClaudeRemoteExecutionBinding(
+        lifecycle.sourceTarget.remoteWorkspace,
+        lifecycle.target.remoteWorkspace
+      )) return false;
     const source = parseBindingRoute(lifecycle.sourceBinding);
     if (source.kind === "stored") {
       return source.workspaceAuthority === claudeWorkspaceAuthority(lifecycle.sourceTarget);
@@ -2921,6 +3084,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
         toolNames: new Map(),
         consumer: Promise.resolve(),
         closed: false,
+        externalTermination: false,
         retirementConfirmed: false,
         nativeTaskProjectionEnabled: false,
         steerEnabled: false,
@@ -4548,8 +4712,9 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
       throw new Error("The delegated working directory is invalid.");
     }
     if (runtime.remote) {
-      const normalized = remotePath.normalize(requested);
-      if (!remotePath.isAbsolute(requested) || normalized !== requested
+      const paths = normalizedAbsoluteRemotePath(runtime.runtimeWorkspaceRoot, "posix") ? remotePath : win32Path;
+      const normalized = paths.normalize(requested);
+      if (!paths.isAbsolute(requested) || normalized !== requested
         || !managedPathWithin(requested, [runtime.runtimeWorkspaceRoot], true)) {
         throw new Error("The delegated working directory is outside the remote Target.");
       }
@@ -5316,7 +5481,12 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
       signal?.throwIfAborted();
       const scoped = await this.#remoteRuntimes.resolve(target, signal);
       signal?.throwIfAborted();
-      if (!scoped.remote || scoped.workspaceRoot !== target.workspaceRoot) {
+      const pathStyle = remoteBindingPathStyle(target.remoteWorkspace)!;
+      const expectedRemoteRoot = scoped.workspaceRoot === target.remoteWorkspace.workspaceRoot
+        || normalizedAbsoluteRemotePath(target.workspaceRoot, pathStyle)
+          && scoped.workspaceRoot === target.workspaceRoot;
+      if (!scoped.remote || !expectedRemoteRoot
+        || !normalizedAbsoluteRemotePath(scoped.workspaceRoot, pathStyle)) {
         throw new Error("The remote runtime returned a different workspace authority.");
       }
       scoped.assertCurrent();
@@ -5527,7 +5697,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
   }
 
   #isRuntimeCurrent(runtime: NativeRuntime): boolean {
-    if (runtime.closed || this.#sessions.get(runtime.productSessionId) !== runtime) return false;
+    if (runtime.closed || runtime.externalTermination || this.#sessions.get(runtime.productSessionId) !== runtime) return false;
     try {
       runtime.assertRuntimeCurrent();
       return true;
@@ -6240,6 +6410,8 @@ function capabilityManifest(
   nativeMemoryConfigured: boolean,
   models: readonly ClaudeSdkModelInfo[],
   managedEffortSupported: boolean,
+  processInspectionSupported: boolean,
+  processTerminationSupported: boolean,
   hostCapabilities: ReadonlySet<HostComposedCapability>,
   supportsLogin: boolean,
   supportsLogout: boolean,
@@ -6291,6 +6463,8 @@ function capabilityManifest(
   if (steerSupported) supported.add("turn.steer");
   if (subagentDefaultModelSupported && subagentDefaultModelConfigured) supported.add("subagents.default_model");
   if (nativeMemoryConfigured) supported.add("memory.native");
+  if (processInspectionSupported) supported.add("runtime.process_usage");
+  if (processInspectionSupported && processTerminationSupported) supported.add("runtime.process_terminate");
   if (managedEffortSupported || models.some((model) => model.supportsEffort === true)) supported.add("model.effort");
   if (models.some((model) => model.supportsFastMode === true)) supported.add("model.fast_mode");
   for (const capability of hostCapabilities) supported.add(capability);
@@ -6325,6 +6499,9 @@ function capabilityManifest(
         : key === "turn.steer" && !steerSupported ? { reason: "upstream_missing" as const }
         : key === "subagents.default_model" && !subagentDefaultModelSupported ? { reason: "upstream_missing" as const }
         : key === "subagents.default_model" && !subagentDefaultModelConfigured ? { reason: "not_implemented" as const }
+        : (key === "runtime.process_usage" && !processInspectionSupported)
+          || (key === "runtime.process_terminate" && (!processInspectionSupported || !processTerminationSupported))
+          ? { reason: "platform_limited" as const }
         : (key === "background.tasks"
           || key === "background.tasks.cancel"
           || key.startsWith("subagents.")) && !nativeTasksSupported
@@ -6334,6 +6511,28 @@ function capabilityManifest(
       ...(options === undefined ? {} : { options })
     }];
   }));
+}
+
+function runtimeQueries(runtime: NativeRuntime): readonly ClaudeSdkQuery[] {
+  const queries = new Set<ClaudeSdkQuery>([runtime.query]);
+  for (const child of runtime.managedChildren.values()) {
+    if (child.query !== undefined) queries.add(child.query);
+  }
+  for (const owner of runtime.childNativeTaskOwners.values()) queries.add(owner.query);
+  return [...queries];
+}
+
+function runtimeProcessFenceMismatch(): JokoError {
+  return claudeCodeError(
+    "CLAUDE_RUNTIME_PROCESS_FENCE_MISMATCH",
+    "The selected local Claude task-host process is no longer current.",
+    "shutdown",
+    {
+      retryable: true,
+      stateMayHaveChanged: false,
+      recovery: "Refresh runtime process usage before attempting termination again."
+    }
+  );
 }
 
 function nativeState(runtime: NativeRuntime): NativeSessionState {
@@ -6406,7 +6605,7 @@ function parseBindingRoute(binding: NativeSessionBinding): ParsedBindingRoute {
   return route;
 }
 
-function claudeWorkspaceAuthority(target: TargetDescriptor): string {
+export function claudeWorkspaceAuthority(target: TargetDescriptor): string {
   const hash = createHash("sha256")
     .update("joko-claude-workspace\0", "utf8")
     .update(target.backendId, "utf8")
@@ -6417,14 +6616,26 @@ function claudeWorkspaceAuthority(target: TargetDescriptor): string {
     hash.update("local\0", "utf8").update(canonicalPathKey(target.workspaceRoot), "utf8");
   } else {
     validateRemoteTarget(target);
-    hash.update("remote\0", "utf8")
-      .update(target.remoteWorkspace.hostTargetId, "utf8")
-      .update("\0", "utf8")
-      .update(target.remoteWorkspace.hostId, "utf8")
-      .update("\0", "utf8")
-      .update(target.remoteWorkspace.workspaceRoot, "utf8")
-      .update("\0", "utf8")
-      .update(target.workspaceRoot, "utf8");
+    hash.update(`remote:${target.remoteWorkspace.kind}\0`, "utf8");
+    if (target.remoteWorkspace.kind === "ssh") {
+      hash.update(target.remoteWorkspace.hostTargetId, "utf8")
+        .update("\0", "utf8")
+        .update(target.remoteWorkspace.hostId, "utf8");
+    } else {
+      hash.update(target.remoteWorkspace.controllerDeviceId, "utf8")
+        .update("\0", "utf8")
+        .update(target.remoteWorkspace.targetDeviceId, "utf8");
+    }
+    // The durable remote binding keeps the checkout root used to acquire the
+    // worktree, while an active derived Session is resumed with that exact
+    // worktree as its current remote root. Both representations identify the
+    // same execution route and effective workspace, so authority is scoped by
+    // the stable remote peer identity plus the effective Target workspace.
+    const pathStyle = remoteBindingPathStyle(target.remoteWorkspace)!;
+    const effectiveWorkspaceRoot = normalizedAbsoluteRemotePath(target.workspaceRoot, pathStyle)
+      ? target.workspaceRoot
+      : target.remoteWorkspace.workspaceRoot;
+    hash.update("\0", "utf8").update(effectiveWorkspaceRoot, "utf8");
   }
   const digest = hash.digest("hex");
   return `workspace-${digest}`;
@@ -6825,8 +7036,7 @@ function assertClaudeDerivationTarget(
     || source.backendId !== derived.backendId
     || source.managed !== derived.managed
     || source.trusted !== derived.trusted
-    || source.remoteWorkspace?.hostId !== derived.remoteWorkspace?.hostId
-    || source.remoteWorkspace?.workspaceRoot !== derived.remoteWorkspace?.workspaceRoot
+    || !sameClaudeRemoteExecutionBinding(source.remoteWorkspace, derived.remoteWorkspace)
     || (!workspaceDerivationSupported
       && canonicalPathKey(source.workspaceRoot) !== canonicalPathKey(derived.workspaceRoot))) {
     throw claudeCodeError(
@@ -6855,7 +7065,10 @@ function assertSessionInfoIdentity(info: ClaudeSdkSessionInfo, expectedSessionId
 function assertSessionTarget(observedCwd: string | undefined, expectedCwd: string, remote = false): void {
   if (observedCwd === undefined) throw continuityGap();
   if (remote) {
-    if (!normalizedAbsoluteRemotePath(observedCwd) || observedCwd !== expectedCwd) throw continuityGap();
+    const pathStyle = normalizedAbsoluteRemotePath(expectedCwd, "posix") ? "posix" : "win32";
+    if (!normalizedAbsoluteRemotePath(expectedCwd, pathStyle)
+      || !normalizedAbsoluteRemotePath(observedCwd, pathStyle)
+      || observedCwd !== expectedCwd) throw continuityGap();
     return;
   }
   if (!isAbsolute(observedCwd) || canonicalPathKey(observedCwd) !== canonicalPathKey(expectedCwd)) throw continuityGap();
@@ -6915,29 +7128,46 @@ function findModel(models: readonly ClaudeSdkModelInfo[], modelId: string): Clau
   return models.find((model) => model.value === modelId || model.resolvedModel === modelId);
 }
 
-function validateRemoteTarget(target: TargetDescriptor): void {
+function validateRemoteTarget(target: TargetDescriptor): asserts target is TargetDescriptor & {
+  readonly remoteWorkspace: NonNullable<TargetDescriptor["remoteWorkspace"]>;
+} {
   const binding = target.remoteWorkspace;
-  if (binding === undefined
-    || binding.hostTargetId.length === 0
-    || binding.hostTargetId.length > 256
-    || /[\u0000-\u001f\u007f]/u.test(binding.hostTargetId)
-    || binding.hostId.length === 0
-    || binding.hostId.length > 256
-    || /[\u0000-\u001f\u007f]/u.test(binding.hostId)
-    || !normalizedAbsoluteRemotePath(binding.workspaceRoot)
-    || !normalizedAbsoluteRemotePath(target.workspaceRoot)) {
+  const validIdentity = binding !== undefined && (binding.kind === "ssh"
+    ? boundedRemoteIdentity(binding.hostTargetId) && boundedRemoteIdentity(binding.hostId)
+    : boundedRemoteIdentity(binding.controllerDeviceId)
+      && boundedRemoteIdentity(binding.targetDeviceId)
+      && binding.controllerDeviceId !== binding.targetDeviceId);
+  const pathStyle = binding === undefined ? undefined : remoteBindingPathStyle(binding);
+  if (!validIdentity
+    || pathStyle === undefined
+    || !normalizedAbsoluteRemotePath(binding.workspaceRoot, pathStyle)
+    || (target.workspaceRoot === binding.workspaceRoot
+      && !normalizedAbsoluteRemotePath(target.workspaceRoot, pathStyle))) {
     throw claudeCodeError("REMOTE_TARGET_INVALID", "The remote Claude Code Target binding is invalid.", "target", {
-      recovery: "Select a canonical absolute workspace on a ready Remote Host."
+      recovery: "Select a canonical absolute workspace on the exact ready remote execution target."
     });
   }
 }
 
-function normalizedAbsoluteRemotePath(value: string): boolean {
+function boundedRemoteIdentity(value: string): boolean {
+  return value.length > 0 && value.length <= 256 && !/[\u0000-\u001f\u007f]/u.test(value);
+}
+
+function remoteBindingPathStyle(binding: NonNullable<TargetDescriptor["remoteWorkspace"]>): "posix" | "win32" | undefined {
+  if (binding.kind === "ssh") return "posix";
+  if (normalizedAbsoluteRemotePath(binding.workspaceRoot, "posix")) return "posix";
+  if (normalizedAbsoluteRemotePath(binding.workspaceRoot, "win32")) return "win32";
+  return undefined;
+}
+
+function normalizedAbsoluteRemotePath(value: string, pathStyle: "posix" | "win32"): boolean {
+  const paths = pathStyle === "win32" ? win32Path : remotePath;
   return value.length > 0
     && value.length <= 16_384
-    && !/[\u0000-\u001f\u007f\\]/u.test(value)
-    && remotePath.isAbsolute(value)
-    && remotePath.normalize(value) === value;
+    && !/[\u0000-\u001f\u007f]/u.test(value)
+    && (pathStyle === "win32" || !value.includes("\\"))
+    && paths.isAbsolute(value)
+    && paths.normalize(value) === value;
 }
 
 function effectiveTargetWorkspace(target: TargetDescriptor): string {
@@ -6948,6 +7178,7 @@ function sameEffectiveTargetWorkspace(left: TargetDescriptor, right: TargetDescr
   if (left.remoteWorkspace !== undefined || right.remoteWorkspace !== undefined) {
     return left.remoteWorkspace !== undefined
       && right.remoteWorkspace !== undefined
+      && sameClaudeRemoteExecutionBinding(left.remoteWorkspace, right.remoteWorkspace)
       && left.workspaceRoot === right.workspaceRoot;
   }
   return canonicalPathKey(left.workspaceRoot) === canonicalPathKey(right.workspaceRoot);
@@ -6960,8 +7191,36 @@ function sameTargetWorkspace(left: TargetDescriptor, right: TargetDescriptor): b
       && canonicalPathKey(left.workspaceRoot) === canonicalPathKey(right.workspaceRoot);
   }
   return left.workspaceRoot === right.workspaceRoot
-    && left.remoteWorkspace.hostId === right.remoteWorkspace.hostId
-    && left.remoteWorkspace.workspaceRoot === right.remoteWorkspace.workspaceRoot;
+    && sameClaudeRemoteWorkspace(left.remoteWorkspace, right.remoteWorkspace);
+}
+
+function sameClaudeRemoteWorkspace(
+  left: TargetDescriptor["remoteWorkspace"],
+  right: TargetDescriptor["remoteWorkspace"]
+): boolean {
+  if (left === undefined || right === undefined) return left === right;
+  if (left.kind !== right.kind) return false;
+  return left.kind === "ssh" && right.kind === "ssh"
+    ? left.hostTargetId === right.hostTargetId
+      && left.hostId === right.hostId
+      && left.workspaceRoot === right.workspaceRoot
+    : left.kind === "device_peer" && right.kind === "device_peer"
+      && left.controllerDeviceId === right.controllerDeviceId
+      && left.targetDeviceId === right.targetDeviceId
+      && left.workspaceRoot === right.workspaceRoot;
+}
+
+function sameClaudeRemoteExecutionBinding(
+  left: TargetDescriptor["remoteWorkspace"],
+  right: TargetDescriptor["remoteWorkspace"]
+): boolean {
+  if (left === undefined || right === undefined) return left === right;
+  if (left.kind !== right.kind) return false;
+  return left.kind === "ssh" && right.kind === "ssh"
+    ? left.hostTargetId === right.hostTargetId && left.hostId === right.hostId
+    : left.kind === "device_peer" && right.kind === "device_peer"
+      && left.controllerDeviceId === right.controllerDeviceId
+      && left.targetDeviceId === right.targetDeviceId;
 }
 
 function targetRuntimeOf(runtime: NativeRuntime): ClaudeTargetRuntime {

@@ -29,7 +29,12 @@ describe("input preparation and admission", () => {
         let message: unknown;
         switch (method.localName) {
           case "getSnapshot": message = create(GetSnapshotResponseSchema, { snapshot: create(SnapshotSchema, {
-            generation: 1n, sessions: [{ sessionId: "task", nativeBinding: { runtimeGeneration: generation } }]
+            generation: 1n,
+            sessions: [{
+              sessionId: "task",
+              location: { kind: { case: "serviceNode", value: {} } },
+              nativeBinding: { runtimeGeneration: generation }
+            }]
           }) }); break;
           case "listManagedModelRuntimes": message = create(ListManagedModelRuntimesResponseSchema); break;
           case "beginBlobUpload": message = create(BeginBlobUploadResponseSchema, {

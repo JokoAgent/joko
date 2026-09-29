@@ -24,6 +24,7 @@ import {
   type Snapshot
 } from "@joko/contracts";
 import { emptyMobileFilesState } from "./workspace-files";
+import { emptyMobilePartnerPrivateState } from "./mobile-partner-private";
 import type { MobileState } from "./mobile-client";
 import type { MobileSupportedLocale } from "./mobile-locale-preference";
 import type {
@@ -236,6 +237,7 @@ function authoringOwner(): Snapshot {
     })],
     targets: [create(TargetSchema, {
       targetId: "target", backendId: "backend", workspaceId: "workspace", displayName: "Project",
+      location: { kind: { case: "serviceNode", value: {} } },
       state: TargetState.ACTIVE, version: { revision: { value: 2n } }
     })],
     workspaces: [create(WorkspaceDescriptorSchema, {
@@ -278,6 +280,7 @@ function mobileState(automationPatch: Partial<MobileAutomationsState> = {}, stat
     homeSearchSessionIds: [],
     files: emptyMobileFilesState(),
     automations: automations(automationPatch),
+    partnerPrivate: emptyMobilePartnerPrivateState(),
     ...statePatch
   };
 }

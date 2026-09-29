@@ -12,11 +12,15 @@ const runtimePackageRoots = [
   "packages/adapter-pi",
   "packages/adapter-transcription-openai",
   "packages/adapter-transcription-realtime",
+  "packages/adapter-transcription-scribe",
+  "packages/adapter-transcription-sauc",
   "packages/code-host",
   "packages/contracts",
   "packages/core",
+  "packages/device-peer",
   "packages/git-safety",
   "packages/local-model-runtime",
+  "packages/messaging",
   "packages/outbound-network",
   "packages/remote-ssh",
   "packages/runtime-governance",
@@ -27,6 +31,7 @@ const runtimePackageRoots = [
   "packages/tool-document",
   "packages/tool-ios-simulator",
   "packages/tool-lsp",
+  "packages/tool-terminal",
   "packages/voice-input",
   "packages/worktree"
 ];

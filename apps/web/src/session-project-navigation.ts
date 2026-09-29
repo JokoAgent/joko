@@ -10,7 +10,7 @@ export interface ProjectNavigationSession {
 export interface ProjectMoveSession extends ProjectNavigationSession {
   readonly archived: boolean;
   readonly state: "idle" | "running" | "waiting" | "retrying" | "error" | "closed";
-  readonly remoteWorkspace?: boolean;
+  readonly remoteWorkspace?: unknown;
   readonly runtimeAttached?: boolean;
 }
 
@@ -18,7 +18,7 @@ export type SessionProjectMoveBlock = "archived" | "remote" | "busy" | "attached
 
 export function sessionProjectMoveBlock(session: ProjectMoveSession): SessionProjectMoveBlock | undefined {
   if (session.archived) return "archived";
-  if (session.remoteWorkspace === true) return "remote";
+  if (session.remoteWorkspace !== undefined) return "remote";
   if (session.runtimeAttached === true) return "attached";
   if (session.state === "running" || session.state === "waiting" || session.state === "retrying") {
     return "busy";

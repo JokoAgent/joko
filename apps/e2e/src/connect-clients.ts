@@ -7,7 +7,9 @@ import {
   CollaborationService,
   ConnectionService,
   ContactService,
+  DevicePeerService,
   EventService,
+  HistoryMaintenanceService,
   ExtensionService,
   InteractionService,
   MessagingService,
@@ -34,6 +36,7 @@ export interface E2eClients {
   readonly connection: Client<typeof ConnectionService>;
   readonly collaboration: Client<typeof CollaborationService>;
   readonly contact: Client<typeof ContactService>;
+  readonly devicePeer: Client<typeof DevicePeerService>;
   readonly event: Client<typeof EventService>;
   readonly extension: Client<typeof ExtensionService>;
   readonly operation: Client<typeof OperationService>;
@@ -51,6 +54,7 @@ export interface E2eClients {
   readonly messaging: Client<typeof MessagingService>;
   readonly workspace: Client<typeof WorkspaceContractService>;
   readonly artifact: Client<typeof ArtifactService>;
+  readonly historyMaintenance: Client<typeof HistoryMaintenanceService>;
   readonly tool: Client<typeof ToolService>;
   readonly voiceInput: Client<typeof VoiceInputService>;
   readonly browser: Client<typeof BrowserService>;
@@ -85,6 +89,7 @@ export function createE2eClients(baseUrl: string, authKey?: string, timeoutMs = 
     connection: createClient(ConnectionService, transport),
     collaboration: createClient(CollaborationService, transport),
     contact: createClient(ContactService, transport),
+    devicePeer: createClient(DevicePeerService, transport),
     event: createClient(EventService, transport),
     extension: createClient(ExtensionService, transport),
     operation: createClient(OperationService, transport),
@@ -102,6 +107,7 @@ export function createE2eClients(baseUrl: string, authKey?: string, timeoutMs = 
     messaging: createClient(MessagingService, transport),
     workspace: createClient(WorkspaceContractService, transport),
     artifact: createClient(ArtifactService, transport),
+    historyMaintenance: createClient(HistoryMaintenanceService, transport),
     tool: createClient(ToolService, transport),
     voiceInput: createClient(VoiceInputService, transport),
     browser: createClient(BrowserService, transport),

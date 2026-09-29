@@ -212,6 +212,7 @@ type JokoDesktopCapability =
   | "files.copy"
   | "files.open"
   | "files.revealSource"
+  | "hardware.dedicatedInput"
   | "app.info"
   | "app.update"
   | "attention.badge"
@@ -230,6 +231,7 @@ type JokoDesktopCapability =
   | "page.search"
   | "power.keepAwake"
   | "provider.modelCatalogLifecycle"
+  | "runtime.desktopProcessUsage"
   | "runtime.processMonitorWindow"
   | "selection.quote.contextMenu"
   | "session.windows"
@@ -261,6 +263,17 @@ type JokoDesktopDeepLinkNavigation =
   | { readonly kind: "settings"; readonly section: JokoDesktopDeepLinkSettingsSection }
   | { readonly kind: "portable"; readonly file?: JokoDesktopFile };
 
+interface JokoDesktopDeepLinkDelivery {
+  readonly documentOccurrence: string;
+  readonly deliveryOccurrence: number;
+  readonly navigation: JokoDesktopDeepLinkNavigation;
+}
+
+interface JokoDesktopDeepLinkAcknowledgement {
+  readonly documentOccurrence: string;
+  readonly deliveryOccurrence: number;
+}
+
 interface JokoDesktopSessionDragPreviewRequest {
   readonly gestureId: string;
   readonly profileId: string;
@@ -285,12 +298,133 @@ interface JokoDesktopGlobalVoiceShortcut {
   readonly fn: boolean;
 }
 
+type JokoDesktopGlobalVoiceGeneration = string;
+
+type JokoDesktopGlobalVoiceCommand =
+  | { readonly type: "start"; readonly generation: JokoDesktopGlobalVoiceGeneration }
+  | { readonly type: "submit"; readonly generation: JokoDesktopGlobalVoiceGeneration }
+  | { readonly type: "cancel"; readonly generation: JokoDesktopGlobalVoiceGeneration }
+  | { readonly type: "retry"; readonly generation: JokoDesktopGlobalVoiceGeneration };
+
 type JokoDesktopGlobalVoiceStatus =
-  | { readonly state: "idle" }
-  | { readonly state: "starting" }
-  | { readonly state: "listening"; readonly transcript: string }
-  | { readonly state: "submitting"; readonly transcript: string }
-  | { readonly state: "error"; readonly errorKind: "unsupported" | "permission" | "microphone" | "service" | "empty" | "insertion" };
+  | { readonly state: "idle"; readonly generation: JokoDesktopGlobalVoiceGeneration }
+  | { readonly state: "starting"; readonly generation: JokoDesktopGlobalVoiceGeneration }
+  | { readonly state: "listening"; readonly generation: JokoDesktopGlobalVoiceGeneration; readonly transcript: string }
+  | { readonly state: "submitting"; readonly generation: JokoDesktopGlobalVoiceGeneration; readonly transcript: string }
+  | { readonly state: "error"; readonly generation: JokoDesktopGlobalVoiceGeneration; readonly errorKind: "unsupported" | "permission" | "microphone" | "service" | "empty" | "insertion" };
+
+interface DesktopRuntimeProcessMonitorOwner {
+  readonly version: 1;
+  readonly profileId: string;
+  readonly serverId: string;
+  readonly connectionGeneration: string;
+  readonly snapshotGeneration: string;
+}
+
+interface DesktopRuntimeProcessMonitorProcessBase {
+  readonly backendId: string;
+  readonly pid: number;
+  readonly cpuPercent: number;
+  readonly memoryKb: number;
+  readonly processCount: number;
+}
+
+interface DesktopRuntimeProcessMonitorControlPlaneProcess extends DesktopRuntimeProcessMonitorProcessBase {
+  readonly role: "control-plane";
+  readonly terminable: false;
+  readonly sessionId?: never;
+  readonly generation?: never;
+  readonly processInstanceId?: never;
+}
+
+interface DesktopRuntimeProcessMonitorTaskHostProcess extends DesktopRuntimeProcessMonitorProcessBase {
+  readonly role: "task-host";
+  readonly sessionId: string;
+  readonly generation: number;
+  readonly terminable: boolean;
+  readonly processInstanceId?: string;
+}
+
+type DesktopRuntimeProcessMonitorProcess =
+  | DesktopRuntimeProcessMonitorControlPlaneProcess
+  | DesktopRuntimeProcessMonitorTaskHostProcess;
+
+type DesktopRuntimeProcessRole = "main" | "renderer" | "gpu" | "utility";
+
+interface DesktopRuntimeProcessMetric {
+  readonly role: DesktopRuntimeProcessRole;
+  readonly pid: number;
+  readonly label: string | null;
+  readonly cpuPercent: number;
+  readonly memoryKb: number;
+  readonly processCount: 1;
+}
+
+interface DesktopRuntimeProcessSample {
+  readonly version: 1;
+  readonly capturedAt: number;
+  readonly processes: readonly DesktopRuntimeProcessMetric[];
+}
+
+interface DesktopRuntimeProcessMonitorBackendBase {
+  readonly backendId: string;
+  readonly backendGeneration: string;
+  readonly backendName: string;
+  readonly usageSupported: boolean;
+  readonly terminateSupported: boolean;
+}
+
+interface DesktopRuntimeProcessMonitorReadyBackend extends DesktopRuntimeProcessMonitorBackendBase {
+  readonly state: "ready";
+  readonly capturedAt: number;
+  readonly error?: never;
+  readonly processes: readonly DesktopRuntimeProcessMonitorProcess[];
+}
+
+interface DesktopRuntimeProcessMonitorErrorBackend extends DesktopRuntimeProcessMonitorBackendBase {
+  readonly state: "error";
+  readonly capturedAt?: never;
+  readonly error: string;
+  readonly processes?: never;
+}
+
+type DesktopRuntimeProcessMonitorBackend =
+  | DesktopRuntimeProcessMonitorReadyBackend
+  | DesktopRuntimeProcessMonitorErrorBackend;
+
+interface DesktopRuntimeProcessMonitorSession {
+  readonly sessionId: string;
+  readonly backendId: string;
+  readonly sessionName: string;
+  readonly generation: string;
+}
+
+interface DesktopRuntimeProcessMonitorSnapshot {
+  readonly locale: "en" | "zh-CN" | "en-XA";
+  readonly backends: readonly DesktopRuntimeProcessMonitorBackend[];
+  readonly sessions: readonly DesktopRuntimeProcessMonitorSession[];
+}
+
+type DesktopRuntimeProcessMonitorRequest = {
+  readonly version: 1;
+  readonly requestId: string;
+  readonly owner: DesktopRuntimeProcessMonitorOwner;
+  readonly action: { readonly kind: "refresh" } | {
+    readonly kind: "terminate";
+    readonly backendGeneration: string;
+    readonly process: DesktopRuntimeProcessMonitorProcess;
+  };
+};
+
+type DesktopRuntimeProcessMonitorResponse = {
+  readonly version: 1;
+  readonly requestId: string;
+  readonly owner: DesktopRuntimeProcessMonitorOwner;
+  readonly result:
+    | ({ readonly kind: "snapshot" } & DesktopRuntimeProcessMonitorSnapshot)
+    | { readonly kind: "terminated" }
+    | { readonly kind: "error"; readonly message: string };
+};
 
 interface JokoDesktopApi {
   readonly platform: string;
@@ -315,7 +449,11 @@ interface JokoDesktopApi {
     >;
   };
   readonly runtimeProcessMonitor: {
-    open(): Promise<{ readonly focusedExisting: boolean }>;
+    sampleDesktop(): Promise<DesktopRuntimeProcessSample>;
+    open(owner: DesktopRuntimeProcessMonitorOwner): Promise<{ readonly version: 1; readonly focusedExisting: boolean }>;
+    retire(owner: DesktopRuntimeProcessMonitorOwner): Promise<void>;
+    onRequest(listener: (request: DesktopRuntimeProcessMonitorRequest) => void): () => void;
+    respond(response: DesktopRuntimeProcessMonitorResponse): Promise<void>;
   };
   readonly layout: {
     reset(): Promise<void>;
@@ -380,17 +518,19 @@ interface JokoDesktopApi {
     onCommand(listener: (command: "open-about" | "new-session" | "open-settings" | "open-task-status-settings" | "check-for-updates" | "toggle-sidebar" | "zoom-reset" | "zoom-in" | "zoom-out") => void): () => void;
   };
   readonly inspectorWindow: {
-    onClosed(listener: () => void): () => void;
+    activate(): Promise<boolean>;
+    onClosed(listener: (event: { readonly occurrence: string; readonly reason: "user" | "child-failure" }) => void): () => void;
   };
   readonly selectionContextMenu: {
     setLocale(locale: "en" | "zh-CN" | "en-XA"): Promise<void>;
     onAddToChat(listener: () => void): () => void;
   };
   setTrayIcon(dataUrl: string): Promise<void>;
-  notify(value: { readonly title: string; readonly body: string; readonly sessionId?: string }): Promise<void>;
-  readonly notifications: {
-    onFocusSession(listener: (sessionId: string) => void): () => void;
-  };
+  notify(value: {
+    readonly title: string;
+    readonly body: string;
+    readonly navigation?: { readonly kind: "session"; readonly profileId: string; readonly sessionId: string };
+  }): Promise<void>;
   readonly attention: {
     mark(key: JokoDesktopAttentionKey): Promise<void>;
     clear(key: JokoDesktopAttentionKey): Promise<void>;
@@ -433,18 +573,20 @@ interface JokoDesktopApi {
     consumeShortcutRecoveryFailure(): Promise<{ readonly failed: boolean }>;
     setMuteSystemAudio(enabled: boolean): Promise<void>;
     publishStatus(status: JokoDesktopGlobalVoiceStatus): Promise<void>;
-    commit(request: { readonly text: string }): Promise<boolean>;
+    commit(request: { readonly generation: JokoDesktopGlobalVoiceGeneration; readonly text: string }): Promise<boolean>;
     getAccessibility(): Promise<{ readonly status: "granted" | "denied" | "not-required" | "unknown" }>;
     openAccessibility(): Promise<boolean>;
     getInputMonitoring(): Promise<{ readonly status: "granted" | "denied" | "not-required" | "unknown" }>;
     openInputMonitoring(): Promise<boolean>;
-    onCommand(listener: (command: { readonly type: "start" | "submit" | "cancel" | "retry" }) => void): () => void;
+    onCommand(listener: (command: JokoDesktopGlobalVoiceCommand) => void): () => void;
   };
+  readonly dedicatedHardware: import("./dedicated-hardware.js").DedicatedHardwareBridge;
   chooseFiles(): Promise<readonly JokoDesktopFile[]>;
   choosePortableSessionFile(): Promise<JokoDesktopFile | undefined>;
   readonly deepLinks: {
-    takePending(): Promise<JokoDesktopDeepLinkNavigation | undefined>;
-    onNavigate(listener: (navigation: JokoDesktopDeepLinkNavigation) => void): () => void;
+    takePending(): Promise<JokoDesktopDeepLinkDelivery | undefined>;
+    acknowledge(acknowledgement: JokoDesktopDeepLinkAcknowledgement): Promise<boolean>;
+    onNavigate(listener: (delivery: JokoDesktopDeepLinkDelivery) => void): () => void;
   };
   saveFile(file: JokoDesktopFile): Promise<boolean>;
   copyFile(request: { readonly requestId: string; readonly file: JokoDesktopFile }): Promise<JokoDesktopCopyFileResult>;
@@ -498,10 +640,11 @@ interface JokoDesktopApi {
 interface JokoInspectorDesktopApi {
   readonly platform: string;
   readonly window: {
+    identity(): Promise<string>;
     ready(): Promise<void>;
     minimize(): Promise<void>;
     toggleMaximize(): Promise<boolean>;
-    close(): Promise<void>;
+    close(kind: "user" | "passive"): Promise<void>;
   };
   readonly selectionContextMenu: {
     onAddToChat(listener: () => void): () => void;
@@ -515,8 +658,25 @@ interface JokoVoiceOverlayApi {
   retry(): Promise<void>;
 }
 
+interface JokoRuntimeProcessDiagnosticsApi {
+  readonly version: 1;
+  readonly platform: string;
+  readonly window: {
+    minimize(): Promise<void>;
+    toggleMaximize(): Promise<boolean>;
+    setZoomFactor(zoomFactor: number): Promise<void>;
+    close(): Promise<void>;
+  };
+  getOwner(): Promise<DesktopRuntimeProcessMonitorOwner>;
+  sampleDesktop(): Promise<DesktopRuntimeProcessSample>;
+  request(request: DesktopRuntimeProcessMonitorRequest): Promise<void>;
+  onResponse(listener: (response: DesktopRuntimeProcessMonitorResponse) => void): () => void;
+  onRetired(listener: () => void): () => void;
+}
+
 interface Window {
   readonly jokoDesktop?: JokoDesktopApi;
   readonly jokoInspectorDesktop?: JokoInspectorDesktopApi;
   readonly jokoVoiceOverlay?: JokoVoiceOverlayApi;
+  readonly jokoRuntimeProcessDiagnostics?: JokoRuntimeProcessDiagnosticsApi;
 }

@@ -1,6 +1,6 @@
 import { randomInt } from "node:crypto";
 import { lstat, realpath } from "node:fs/promises";
-import { isAbsolute, posix, relative, resolve, sep } from "node:path";
+import { isAbsolute, posix, relative, resolve, sep, win32 } from "node:path";
 import Xterm from "@xterm/headless";
 import XtermSerialize from "@xterm/addon-serialize";
 import type { IPtyForkOptions, IWindowsPtyForkOptions } from "node-pty";
@@ -169,7 +169,7 @@ export class TerminalProvider {
     this.#assertOpen();
     signal?.throwIfAborted();
     if (scope !== undefined) validateScope(scope);
-    const runtime = scope?.remoteHostId === undefined ? this.#localRuntime() : await this.#runtime(scope, signal);
+    const runtime = scope?.remoteWorkspace === undefined ? this.#localRuntime() : await this.#runtime(scope, signal);
     const result = await (signal === undefined ? runtime.discoverShells() : abortable(runtime.discoverShells(), signal));
     this.#assertOpen();
     return result.map((shell) => ({ ...shell, args: [...shell.args] }));
@@ -194,7 +194,7 @@ export class TerminalProvider {
     }
     const requestedShell = input.shellId === undefined || input.shellId === "" ? "auto" : input.shellId;
     identity(requestedShell, "Shell identity");
-    const key = JSON.stringify([input.sessionId, input.targetId, input.remoteHostTargetId ?? null, input.remoteHostId ?? null, paths.resolve(input.workspaceRoot), paths.resolve(input.workspaceRoot, cwd), requestedShell, input.fallbackToDefaultShell === true, cols, rows, initialPalette]);
+    const key = JSON.stringify([input.sessionId, input.targetId, input.remoteWorkspace ?? null, paths.resolve(input.workspaceRoot), paths.resolve(input.workspaceRoot, cwd), requestedShell, input.fallbackToDefaultShell === true, cols, rows, initialPalette]);
     const existing = this.#records.get(input.id);
     if (existing !== undefined) {
       this.#assertScope(existing, input);
@@ -216,7 +216,7 @@ export class TerminalProvider {
     const abort = new AbortController();
     const combined = signal === undefined ? abort.signal : AbortSignal.any([signal, abort.signal]);
     const scope: TerminalScope = { sessionId: input.sessionId, targetId: input.targetId, workspaceRoot: paths.resolve(input.workspaceRoot),
-      ...(input.remoteHostId === undefined ? {} : { remoteHostId: input.remoteHostId, remoteHostTargetId: input.remoteHostTargetId }) };
+      ...(input.remoteWorkspace === undefined ? {} : { remoteWorkspace: input.remoteWorkspace }) };
     const result = this.#create(scope, input.id, key, cwd, requestedShell, input.fallbackToDefaultShell === true, cols, rows, initialPalette, combined, beforeSpawn);
     this.#creating.set(input.id, { key, scope, abort, result });
     this.#activity();
@@ -377,7 +377,7 @@ export class TerminalProvider {
       signal.throwIfAborted();
       const checkpoint = this.#serialize(old);
       const runtime = await this.#runtime(old.scope, signal);
-      const shell = old.scope.remoteHostId === undefined ? old.shell : await this.#selectShell(runtime, old.shell.id, signal);
+      const shell = old.scope.remoteWorkspace === undefined ? old.shell : await this.#selectShell(runtime, old.shell.id, signal);
       const directory = await abortable(runtime.canonicalDirectory(old.scope.workspaceRoot, scopePaths(old.scope).relative(old.scope.workspaceRoot, old.descriptor.cwd)), signal);
       signal.throwIfAborted();
       this.#require(reference);
@@ -506,7 +506,7 @@ export class TerminalProvider {
 
   async #runtime(scope: TerminalScope, signal?: AbortSignal): Promise<TerminalRuntime> {
     signal?.throwIfAborted();
-    if (scope.remoteHostId === undefined) return this.#localRuntime();
+    if (scope.remoteWorkspace === undefined) return this.#localRuntime();
     if (this.#resolveRemoteRuntime === undefined) throw new TerminalError("RUNTIME_UNAVAILABLE", "No terminal runtime is configured for this remote host.");
     const result = this.#resolveRemoteRuntime({ ...scope }, signal);
     const runtime = await (signal === undefined ? result : abortable(result, signal));
@@ -799,20 +799,44 @@ function identity(value: string, label: string): void {
 function validateScope(scope: TerminalScope): void {
   identity(scope.sessionId, "Session identity");
   identity(scope.targetId, "Target identity");
-  if (scope.remoteHostId !== undefined) identity(scope.remoteHostId, "Remote host identity");
-  if (scope.remoteHostTargetId !== undefined) identity(scope.remoteHostTargetId, "Remote host Target identity");
-  if (scope.remoteHostId === undefined && scope.remoteHostTargetId !== undefined) throw new TerminalError("INVALID_ARGUMENT", "Remote Host Target requires a Remote Host.");
+  if (scope.remoteWorkspace !== undefined) {
+    if (scope.remoteWorkspace.kind === "ssh") {
+      identity(scope.remoteWorkspace.hostId, "Remote host identity");
+      identity(scope.remoteWorkspace.hostTargetId, "Remote host Target identity");
+    } else {
+      identity(scope.remoteWorkspace.controllerDeviceId, "Controller Device identity");
+      identity(scope.remoteWorkspace.targetDeviceId, "Target Device identity");
+    }
+    if (scope.remoteWorkspace.workspaceRoot !== scope.workspaceRoot) {
+      throw new TerminalError("WORKSPACE_PATH_DENIED", "Remote terminal scope must use its exact workspace binding.");
+    }
+  }
   if (typeof scope.workspaceRoot !== "string" || !scopePaths(scope).isAbsolute(scope.workspaceRoot) || scope.workspaceRoot.includes("\0")) throw new TerminalError("WORKSPACE_PATH_DENIED", "A canonical workspace root is required.");
 }
 
 function sameScope(left: TerminalScope, right: TerminalScope): boolean {
   return left.sessionId === right.sessionId && left.targetId === right.targetId
-    && left.remoteHostTargetId === right.remoteHostTargetId && left.remoteHostId === right.remoteHostId
+    && sameRemoteWorkspace(left.remoteWorkspace, right.remoteWorkspace)
     && scopePaths(left).relative(left.workspaceRoot, right.workspaceRoot) === "";
 }
 
 function scopePaths(scope: TerminalScope): Pick<typeof posix, "resolve" | "relative" | "isAbsolute"> {
-  return scope.remoteHostId === undefined ? { resolve, relative, isAbsolute } : posix;
+  if (scope.remoteWorkspace === undefined) return { resolve, relative, isAbsolute };
+  if (scope.remoteWorkspace.kind === "ssh") return posix;
+  return /^[A-Za-z]:[\\/]/u.test(scope.workspaceRoot) || scope.workspaceRoot.startsWith("\\\\") ? win32 : posix;
+}
+
+function sameRemoteWorkspace(
+  left: TerminalScope["remoteWorkspace"],
+  right: TerminalScope["remoteWorkspace"]
+): boolean {
+  if (left === undefined || right === undefined) return left === right;
+  if (left.kind !== right.kind || left.workspaceRoot !== right.workspaceRoot) return false;
+  return left.kind === "ssh" && right.kind === "ssh"
+    ? left.hostTargetId === right.hostTargetId && left.hostId === right.hostId
+    : left.kind === "device_peer" && right.kind === "device_peer"
+      && left.controllerDeviceId === right.controllerDeviceId
+      && left.targetDeviceId === right.targetDeviceId;
 }
 
 async function canonicalDirectory(root: string, cwd: string): Promise<string> {

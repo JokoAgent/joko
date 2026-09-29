@@ -80,6 +80,18 @@ export class MobileComposerDraftStore {
     }
   }
 
+  async readDurable(identity: MobileComposerDraftIdentity): Promise<MobileComposerDraft | null> {
+    const exact = normalizeIdentity(identity);
+    try {
+      const stored = await this.driver.getItem(storageKey(exact));
+      return stored === null ? null : cloneMobileComposerDraft(readRecord(stored, exact));
+    } catch (cause) {
+      const error = storageError("read", cause);
+      this.#notify(exact, error);
+      throw error;
+    }
+  }
+
   save(identity: MobileComposerDraftIdentity, draft: MobileComposerDraft): void {
     const exact = normalizeIdentity(identity);
     const value = normalizeMobileComposerDraft(draft);

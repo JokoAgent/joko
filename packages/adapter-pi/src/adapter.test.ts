@@ -564,6 +564,44 @@ class ScriptedPiProcess extends EventEmitter {
 }
 
 describe("PiBackendAdapter", () => {
+  it("validates canonical Windows device-peer Targets without treating them as POSIX or SSH", async () => {
+    const validateRemoteWorkspace = vi.fn(async () => undefined);
+    const adapter = createPiAdapter({
+      agentHome: process.cwd(),
+      sessionRoot: process.cwd(),
+      versionProbe: async () => "pi 99.1.0",
+      providers: [],
+      validateRemoteWorkspace
+    });
+    const peerTarget: TargetDescriptor = {
+      id: "pi-peer-win32",
+      backendId: "pi",
+      displayName: "Windows peer",
+      workspaceRoot: process.cwd(),
+      managed: false,
+      trusted: true,
+      remoteWorkspace: {
+        kind: "device_peer",
+        controllerDeviceId: "controller-device",
+        targetDeviceId: "windows-device",
+        workspaceRoot: "C:\\Joko\\Workspace"
+      }
+    };
+    const peerBinding = peerTarget.remoteWorkspace;
+    if (peerBinding?.kind !== "device_peer") throw new Error("Expected the device-peer test binding.");
+    await expect(adapter.validateTarget(peerTarget)).resolves.toBeUndefined();
+    expect(validateRemoteWorkspace).toHaveBeenCalledWith(peerTarget);
+    await expect(adapter.validateTarget({
+      ...peerTarget,
+      remoteWorkspace: { ...peerBinding, workspaceRoot: "C:/Joko/Workspace" }
+    })).rejects.toMatchObject({ publicError: { code: "PI_REMOTE_WORKSPACE_INVALID" } });
+    await expect(adapter.validateTarget({
+      ...peerTarget,
+      remoteWorkspace: { ...peerBinding, controllerDeviceId: "windows-device" }
+    })).rejects.toMatchObject({ publicError: { code: "PI_REMOTE_WORKSPACE_INVALID" } });
+    expect(validateRemoteWorkspace).toHaveBeenCalledTimes(1);
+    await adapter.dispose();
+  });
   it("rejects unsupported start navigation and structured workspace references without spawning a runtime", async () => {
     const directory = await mkdtemp(join(tmpdir(), "joko-pi-start-boundary-"));
     const processFactory = vi.fn((): PiProcessHandle => { throw new Error("No native runtime should start"); });
@@ -835,7 +873,7 @@ describe("PiBackendAdapter", () => {
       workspaceRoot: workspace,
       managed: true,
       trusted: false,
-      remoteWorkspace: { hostTargetId: "remote-lineage-target", hostId: "fixture-host", workspaceRoot: "/workspace" }
+      remoteWorkspace: { kind: "ssh", hostTargetId: "remote-lineage-target", hostId: "fixture-host", workspaceRoot: "/workspace" }
     };
     const context = makeContext(target, []);
     const initial = createPiAdapter(options);
@@ -925,7 +963,7 @@ describe("PiBackendAdapter", () => {
       workspaceRoot: workspace,
       managed: true,
       trusted: false,
-      remoteWorkspace: { hostTargetId: "remote-deletion-journal-target", hostId: "fixture-host", workspaceRoot: "/workspace" }
+      remoteWorkspace: { kind: "ssh", hostTargetId: "remote-deletion-journal-target", hostId: "fixture-host", workspaceRoot: "/workspace" }
     };
     const binding: NativeSessionBinding = {
       opaqueRef: join(agentHome, "native-session.jsonl"),
@@ -1327,7 +1365,7 @@ describe("PiBackendAdapter", () => {
       workspaceRoot: workspace,
       managed: false,
       trusted: false,
-      remoteWorkspace: { hostTargetId: "target-native-fence", hostId: "test-host", workspaceRoot: "/workspace" }
+      remoteWorkspace: { kind: "ssh", hostTargetId: "target-native-fence", hostId: "test-host", workspaceRoot: "/workspace" }
     };
     const events: EventPayload[] = [];
     const context = makeContext(target, events);
@@ -3734,6 +3772,76 @@ describe("PiBackendAdapter", () => {
     await new Promise((resolveDelay) => setTimeout(resolveDelay, 650));
     expect(events.filter((event) => event.type === "subagent_transcript")).toHaveLength(transcriptCountAfterReset);
     expect(scripted.exitCode).toBe(0);
+    await adapter.dispose();
+  });
+
+  it("recovers and retires durable native reset receipts without starting a runtime", async () => {
+    const agentHome = await mkdtemp(join(tmpdir(), "joko-pi-context-reset-receipt-home-"));
+    const workspaceRoot = await mkdtemp(join(tmpdir(), "joko-pi-context-reset-receipt-workspace-"));
+    const sessionsRoot = join(agentHome, "sessions");
+    const receiptRoot = join(agentHome, "maintenance", "reset-context");
+    await mkdir(sessionsRoot, { recursive: true });
+    await mkdir(receiptRoot, { recursive: true });
+    const adapter = createPiAdapter({
+      agentHome,
+      sessionRoot: agentHome,
+      versionProbe: async () => "pi 99.99.99-context-reset-receipt-test"
+    });
+    const target: TargetDescriptor = {
+      id: "target-context-reset-receipt",
+      backendId: "pi",
+      displayName: "Context reset receipt",
+      workspaceRoot,
+      managed: true,
+      trusted: true
+    };
+    const source: NativeSessionBinding = {
+      opaqueRef: join(sessionsRoot, "source.jsonl"),
+      nativeSessionId: "source-native",
+      generation: 4
+    };
+    const operationId = "history-reset-receipt-operation";
+    const context: AdapterContext = { ...makeContext(target, []), generation: 4, binding: source, operationId };
+    const writeReceipt = async (name: string, nativeSessionId: string): Promise<NativeSessionBinding> => {
+      const replacement: NativeSessionBinding = {
+        opaqueRef: join(sessionsRoot, `${name}.jsonl`),
+        nativeSessionId,
+        generation: 5
+      };
+      await writeFile(replacement.opaqueRef, `${JSON.stringify({
+        type: "session",
+        version: 3,
+        id: nativeSessionId,
+        timestamp: new Date().toISOString(),
+        cwd: workspaceRoot
+      })}\n`, { mode: 0o600 });
+      await writeFile(join(
+        receiptRoot,
+        `${createHash("sha256").update(operationId).digest("hex")}.json`
+      ), `${JSON.stringify({
+        version: 1,
+        operationId,
+        sessionId: context.sessionId,
+        targetId: target.id,
+        source,
+        replacement
+      })}\n`, { mode: 0o600 });
+      return replacement;
+    };
+
+    const adopted = await writeReceipt("adopted", "adopted-native");
+    await expect(adapter.recoverResetContext!(context)).resolves.toEqual(adopted);
+    await adapter.finalizeResetContext!(adopted, context);
+    await expect(access(adopted.opaqueRef)).resolves.toBeUndefined();
+    await expect(access(join(
+      receiptRoot,
+      `${createHash("sha256").update(operationId).digest("hex")}.json`
+    ))).rejects.toMatchObject({ code: "ENOENT" });
+
+    const discarded = await writeReceipt("discarded", "discarded-native");
+    await adapter.discardResetContext!(discarded, context);
+    await expect(access(discarded.opaqueRef)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(adapter.recoverResetContext!(context)).resolves.toBeUndefined();
     await adapter.dispose();
   });
 
@@ -6523,6 +6631,7 @@ describe("PiBackendAdapter", () => {
       managed: true,
       trusted: false,
       remoteWorkspace: {
+        kind: "ssh",
         hostTargetId: "target-remote-auth-revoke",
         hostId: "fixture-host",
         workspaceRoot: "/workspace"
@@ -6590,6 +6699,7 @@ describe("PiBackendAdapter", () => {
       managed: true,
       trusted: false,
       remoteWorkspace: {
+        kind: "ssh",
         hostTargetId: "target-remote-auth-owner",
         hostId: "fixture-host",
         workspaceRoot: "/workspace"

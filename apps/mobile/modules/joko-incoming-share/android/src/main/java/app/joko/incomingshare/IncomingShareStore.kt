@@ -19,6 +19,7 @@ import java.io.InputStream
 import java.nio.charset.StandardCharsets
 import java.security.MessageDigest
 import java.text.Normalizer
+import java.net.URI
 import java.util.Locale
 import java.util.UUID
 import org.json.JSONArray
@@ -34,6 +35,7 @@ private data class IncomingShareManifestItem(
   val itemId: String,
   val ordinal: Int,
   val state: String,
+  val kind: String? = null,
   val fileName: String? = null,
   val mediaType: String? = null,
   val byteSize: Long? = null,
@@ -60,11 +62,23 @@ private data class IncomingShareClaim(
   val batchId: String,
   val claimId: String,
   val profileId: String,
+  val destinationKind: String,
+  val sessionId: String?,
   val targetId: String,
   val surfaceOwnerKey: String,
   val policyKey: String,
   val acceptedItemIds: List<String>,
+  val acceptedItemProofs: List<IncomingShareItemProof>,
   val claimedAtUnixMs: Long
+)
+
+private data class IncomingShareItemProof(
+  val itemId: String,
+  val kind: String,
+  val byteSize: Long,
+  val sha256Hex: String,
+  val fileName: String?,
+  val mediaType: String?
 )
 
 private data class ValidatedIncomingShareBatch(
@@ -77,6 +91,7 @@ private data class ValidatedIncomingShareBatch(
 
 private sealed interface IncomingIntentItem {
   data class Stream(val uri: Uri) : IncomingIntentItem
+  data class Text(val value: String) : IncomingIntentItem
   data class Rejected(val reason: String) : IncomingIntentItem
 }
 
@@ -96,6 +111,9 @@ internal object IncomingShareStore {
   private const val ORDER_KEY = "lastOrderMicros"
   private const val MAXIMUM_ITEMS = 20
   private const val MAXIMUM_ITEM_BYTES = 30L * 1024L * 1024L
+  private const val MAXIMUM_TEXT_ITEM_BYTES = 32 * 1024
+  private const val MAXIMUM_URL_ITEM_BYTES = 8 * 1024
+  private const val MAXIMUM_TEXT_BATCH_BYTES = 128 * 1024
   private const val MAXIMUM_MANIFEST_BYTES = 256 * 1024
   private const val STAGING_LIFETIME_MS = 24L * 60L * 60L * 1000L
 
@@ -153,20 +171,36 @@ internal object IncomingShareStore {
     try {
       val declaredMediaType = declaredIntentMediaType(intent.type)
       val entries = collectIntentItems(intent)
-      require(entries.isNotEmpty()) { "No file or image stream was shared with Joko." }
+      require(entries.isNotEmpty()) { "No supported content was shared with Joko." }
+      var totalTextBytes = 0
+      val generatedIds = mutableSetOf<String>()
       val manifestItems = entries.take(MAXIMUM_ITEMS).mapIndexed { ordinal, entry ->
         val itemId = UUID.randomUUID().toString().lowercase(Locale.US)
-        when (entry) {
+        require(generatedIds.add(itemId)) { "The Android incoming-share item identity is duplicated." }
+        val result = when (entry) {
           is IncomingIntentItem.Rejected -> rejectedItem(itemId, ordinal, entry.reason)
           is IncomingIntentItem.Stream -> storeIntentItem(
             context,
             entry.uri,
             declaredMediaType,
+            intent.flags and Intent.FLAG_GRANT_READ_URI_PERMISSION != 0,
             stagingDirectory,
             itemId,
             ordinal
           )
+          is IncomingIntentItem.Text -> storeTextItem(
+            entry.value,
+            declaredMediaType,
+            stagingDirectory,
+            itemId,
+            ordinal,
+            MAXIMUM_TEXT_BATCH_BYTES - totalTextBytes
+          )
         }
+        if (result.state == "ready" && (result.kind == "text" || result.kind == "url")) {
+          totalTextBytes += result.byteSize!!.toInt()
+        }
+        result
       }
       val manifest = IncomingShareManifest(
         batchId = reservation.batchId,
@@ -241,6 +275,8 @@ internal object IncomingShareStore {
     context: Context,
     batchId: String,
     profileId: String,
+    destinationKind: String,
+    sessionId: String?,
     targetId: String,
     surfaceOwnerKey: String,
     policyKey: String,
@@ -248,21 +284,24 @@ internal object IncomingShareStore {
   ): Map<String, Any?> {
     assertUuid(batchId, "incoming share")
     assertProfileId(profileId)
+    assertDestination(destinationKind, sessionId)
     assertTargetId(targetId)
-    assertOpaqueText(surfaceOwnerKey, allowUnitSeparator = true)
-    assertOpaqueText(policyKey, allowUnitSeparator = false)
+    assertOpaqueText(surfaceOwnerKey, allowOwnerSeparators = true)
+    assertOpaqueText(policyKey, allowOwnerSeparators = false)
     val directory = requiredBatchDirectory(context, batchId)
     val current = validateBatch(context, directory)
     require(current.binding?.profileId == profileId) {
       "The incoming share is not bound to this Joko connection profile."
     }
-    val readyIds = current.manifest.items.sortedBy { it.ordinal }
-      .filter { it.state == "ready" }.map { it.itemId }
+    val readyItems = current.manifest.items.sortedBy { it.ordinal }.filter { it.state == "ready" }
+    val readyIds = readyItems.map { it.itemId }
     validateAcceptedItemIds(acceptedItemIds, readyIds)
+    val acceptedProofs = readyItems.filter { acceptedItemIds.contains(it.itemId) }.map(::itemProof)
     current.claim?.let { claim ->
-      require(claim.profileId == profileId && claim.targetId == targetId
+      require(claim.profileId == profileId && claim.destinationKind == destinationKind
+        && claim.sessionId == sessionId && claim.targetId == targetId
         && claim.surfaceOwnerKey == surfaceOwnerKey && claim.policyKey == policyKey
-        && claim.acceptedItemIds == acceptedItemIds) {
+        && claim.acceptedItemIds == acceptedItemIds && claim.acceptedItemProofs == acceptedProofs) {
         "This incoming share is already claimed by another project or model authority."
       }
       return batchDictionary(current)
@@ -272,10 +311,13 @@ internal object IncomingShareStore {
       .put("batchId", batchId)
       .put("claimId", UUID.randomUUID().toString().lowercase(Locale.US))
       .put("profileId", profileId)
+      .put("destinationKind", destinationKind)
+      .apply { sessionId?.let { put("sessionId", it) } }
       .put("targetId", targetId)
       .put("surfaceOwnerKey", surfaceOwnerKey)
       .put("policyKey", policyKey)
       .put("acceptedItemIds", JSONArray(acceptedItemIds))
+      .put("acceptedItemProofs", JSONArray(acceptedProofs.map(::proofJson)))
       .put("claimedAtUnixMs", maxOf(1L, System.currentTimeMillis()))
     writeNewFileAtomically(File(directory, CLAIM_NAME), claim.toString().toByteArray(StandardCharsets.UTF_8))
     return batchDictionary(validateBatch(context, directory))
@@ -310,9 +352,6 @@ internal object IncomingShareStore {
     require(intent.action == Intent.ACTION_SEND || intent.action == Intent.ACTION_SEND_MULTIPLE) {
       "The Android incoming-share action is invalid."
     }
-    require(intent.flags and Intent.FLAG_GRANT_READ_URI_PERMISSION != 0) {
-      "The shared Android content did not include read permission."
-    }
     val extraUris: List<Uri> = when (intent.action) {
       Intent.ACTION_SEND -> listOfNotNull(intent.getParcelableExtraCompat<Uri>(Intent.EXTRA_STREAM))
       Intent.ACTION_SEND_MULTIPLE -> intent.getParcelableArrayListExtraCompat<Uri>(Intent.EXTRA_STREAM)
@@ -320,22 +359,50 @@ internal object IncomingShareStore {
       else -> emptyList()
     }
     val entries = mutableListOf<IncomingIntentItem>()
-    val extraKeys = mutableSetOf<String>()
-    for (uri in extraUris) {
-      val key = uri.toString()
-      if (extraKeys.add(key)) entries.add(IncomingIntentItem.Stream(uri))
-      else entries.add(IncomingIntentItem.Rejected("The same Android content URI was shared more than once."))
-    }
-    val clipSeen = mutableSetOf<String>()
+    val clipUriKeys = mutableSetOf<String>()
+    val clipTextCounts = mutableMapOf<String, Int>()
     val clipData: ClipData? = intent.clipData
     if (clipData != null) {
       for (index in 0 until clipData.itemCount) {
-        val uri = clipData.getItemAt(index).uri ?: continue
-        val key = uri.toString()
-        if (extraKeys.contains(key)) continue
-        if (clipSeen.add(key)) entries.add(IncomingIntentItem.Stream(uri))
-        else entries.add(IncomingIntentItem.Rejected("The same Android content URI was shared more than once."))
+        val item = clipData.getItemAt(index)
+        item.uri?.let { uri ->
+          if (clipUriKeys.add(uri.toString())) entries.add(IncomingIntentItem.Stream(uri))
+          else entries.add(IncomingIntentItem.Rejected("The same Android content URI was shared more than once."))
+        }
+        item.text?.toString()?.let { value ->
+          entries.add(IncomingIntentItem.Text(value))
+          clipTextCounts[value] = (clipTextCounts[value] ?: 0) + 1
+        }
       }
+    }
+    val extraKeys = mutableSetOf<String>()
+    for (uri in extraUris) {
+      val key = uri.toString()
+      if (!extraKeys.add(key)) {
+        entries.add(IncomingIntentItem.Rejected("The same Android content URI was shared more than once."))
+      } else if (!clipUriKeys.contains(key)) {
+        entries.add(IncomingIntentItem.Stream(uri))
+      }
+    }
+    val rawText = intent.extras?.get(Intent.EXTRA_TEXT)
+    val extraTexts: List<IncomingIntentItem> = when (rawText) {
+      null -> emptyList()
+      is CharSequence -> listOf(IncomingIntentItem.Text(rawText.toString()))
+      is ArrayList<*> -> rawText.map { value ->
+        if (value is CharSequence) IncomingIntentItem.Text(value.toString())
+        else IncomingIntentItem.Rejected("The shared Android text value is invalid.")
+      }
+      else -> listOf(IncomingIntentItem.Rejected("The shared Android text value is invalid."))
+    }
+    for (entry in extraTexts) {
+      if (entry !is IncomingIntentItem.Text) {
+        entries.add(entry)
+        continue
+      }
+      val value = entry.value
+      val mirroredCount = clipTextCounts[value] ?: 0
+      if (mirroredCount > 0) clipTextCounts[value] = mirroredCount - 1
+      else entries.add(entry)
     }
     return entries
   }
@@ -344,6 +411,7 @@ internal object IncomingShareStore {
     context: Context,
     uri: Uri,
     declaredMediaType: String,
+    hasReadGrant: Boolean,
     stagingDirectory: File,
     itemId: String,
     ordinal: Int
@@ -351,6 +419,7 @@ internal object IncomingShareStore {
     var safeName: String? = null
     val itemDirectory = File(File(stagingDirectory, "items"), itemId)
     return try {
+      require(hasReadGrant) { "The shared Android content did not include read permission." }
       require(uri.scheme == ContentResolver.SCHEME_CONTENT) {
         "Only granted Android content streams can enter the Joko inbox."
       }
@@ -376,10 +445,13 @@ internal object IncomingShareStore {
         mediaType,
         expectedSize
       )
+      syncDirectory(itemDirectory.parentFile
+        ?: throw IncomingShareException("The Android incoming-share item parent is unavailable."))
       IncomingShareManifestItem(
         itemId = itemId,
         ordinal = ordinal,
         state = "ready",
+        kind = "file",
         fileName = stored.fileName,
         mediaType = stored.mediaType,
         byteSize = stored.byteSize,
@@ -395,6 +467,70 @@ internal object IncomingShareStore {
         safeName
       )
     }
+  }
+
+  private fun storeTextItem(
+    value: String,
+    declaredMediaType: String,
+    stagingDirectory: File,
+    itemId: String,
+    ordinal: Int,
+    remainingBatchBytes: Int
+  ): IncomingShareManifestItem {
+    val itemDirectory = File(File(stagingDirectory, "items"), itemId)
+    return try {
+      val bytes = value.toByteArray(StandardCharsets.UTF_8)
+      require(bytes.size <= MAXIMUM_TEXT_ITEM_BYTES) {
+        "The shared Android text exceeds its 32 KB limit."
+      }
+      val validUrl = isHttpUrl(value)
+      val kind = if (declaredMediaType == "text/uri-list" || validUrl) "url" else "text"
+      if (declaredMediaType == "text/uri-list") require(validUrl) {
+        "The shared Android URL is invalid."
+      }
+      require(value.isNotEmpty() && value.trim().isNotEmpty() && !value.contains('\u0000')
+        && String(bytes, StandardCharsets.UTF_8) == value) {
+        "The shared Android text is invalid."
+      }
+      val itemLimit = if (kind == "url") MAXIMUM_URL_ITEM_BYTES else MAXIMUM_TEXT_ITEM_BYTES
+      require(bytes.size <= itemLimit) {
+        if (kind == "url") "The shared Android URL exceeds its 8 KB limit."
+        else "The shared Android text exceeds its 32 KB limit."
+      }
+      require(bytes.size <= remainingBatchBytes) {
+        "The shared Android text batch exceeds its 128 KB limit."
+      }
+      require(itemDirectory.mkdirs()) { "The Android incoming-share text directory could not be created." }
+      val payload = File(itemDirectory, "payload.txt")
+      writeNewFileAtomically(payload, bytes)
+      require(readBoundedRegularFile(payload, stagingDirectory, itemLimit).contentEquals(bytes)) {
+        "The shared Android text failed local readback."
+      }
+      syncDirectory(itemDirectory.parentFile
+        ?: throw IncomingShareException("The Android incoming-share text parent is unavailable."))
+      IncomingShareManifestItem(
+        itemId = itemId,
+        ordinal = ordinal,
+        state = "ready",
+        kind = kind,
+        byteSize = bytes.size.toLong(),
+        sha256Hex = MessageDigest.getInstance("SHA-256").digest(bytes).toHex(),
+        relativePath = "items/$itemId/payload.txt"
+      )
+    } catch (error: Exception) {
+      if (itemDirectory.exists()) runCatching { deleteTreeWithoutFollowingLinks(itemDirectory, stagingDirectory) }
+      rejectedItem(itemId, ordinal, exposedMessage(error, "The shared Android text could not be copied into the protected inbox."))
+    }
+  }
+
+  private fun isHttpUrl(value: String): Boolean {
+    if (!value.startsWith("http://") && !value.startsWith("https://")) return false
+    if (value.any { it.isWhitespace() || it.code < 32 || it.code == 127 }) return false
+    return runCatching {
+      val uri = URI(value)
+      (uri.scheme == "http" || uri.scheme == "https")
+        && !uri.host.isNullOrEmpty()
+    }.getOrDefault(false)
   }
 
   private fun queryMetadata(resolver: ContentResolver, uri: Uri): Pair<String?, Long?> {
@@ -493,6 +629,7 @@ internal object IncomingShareStore {
     val ordinals = mutableSetOf<Int>()
     val manifestItems = mutableListOf<IncomingShareManifestItem>()
     val publicItems = mutableListOf<Map<String, Any?>>()
+    var totalTextBytes = 0L
     for (index in 0 until rawItems.length()) {
       val raw = rawItems.optJSONObject(index)
         ?: throw IncomingShareException("An Android incoming-share item is malformed.")
@@ -504,7 +641,7 @@ internal object IncomingShareStore {
       }
       val state = requiredText(raw, "state", 16)
       if (state == "rejected") {
-        require(!raw.has("mediaType") && !raw.has("byteSize") && !raw.has("sha256Hex")
+        require(!raw.has("kind") && !raw.has("mediaType") && !raw.has("byteSize") && !raw.has("sha256Hex")
           && !raw.has("relativePath")) {
           "An Android incoming-share rejection record is invalid."
         }
@@ -529,44 +666,81 @@ internal object IncomingShareStore {
       require(state == "ready" && !raw.has("reason")) {
         "An Android incoming-share item state is invalid."
       }
-      val fileName = safeFileName(requiredText(raw, "fileName", 512))
-      val mediaType = safeMediaType(requiredText(raw, "mediaType", 255))
-      val byteSize = requiredInteger(raw, "byteSize", 1L, MAXIMUM_ITEM_BYTES)
+      val kind = requiredText(raw, "kind", 8)
+      require(kind == "file" || kind == "text" || kind == "url") {
+        "An Android incoming-share item kind is invalid."
+      }
+      val byteSize = requiredInteger(raw, "byteSize", 1L,
+        if (kind == "file") MAXIMUM_ITEM_BYTES else if (kind == "url")
+          MAXIMUM_URL_ITEM_BYTES.toLong() else MAXIMUM_TEXT_ITEM_BYTES.toLong())
       val sha256Hex = requiredText(raw, "sha256Hex", 64)
       require(sha256Hex.matches(Regex("^[0-9a-f]{64}$"))) {
         "An Android incoming-share SHA-256 is invalid."
       }
       val relativePath = requiredText(raw, "relativePath", 1_024)
-      require(relativePath == "items/$itemId/$fileName") {
-        "An Android incoming-share item path is invalid."
+      val fileName: String?
+      val mediaType: String?
+      if (kind == "file") {
+        val exactFileName = safeFileName(requiredText(raw, "fileName", 512))
+        val exactMediaType = safeMediaType(requiredText(raw, "mediaType", 255))
+        require(relativePath == "items/$itemId/$exactFileName") {
+          "An Android incoming-share item path is invalid."
+        }
+        validateFileNameAndMediaType(exactFileName, exactMediaType)
+        fileName = exactFileName
+        mediaType = exactMediaType
+      } else {
+        require(!raw.has("fileName") && !raw.has("mediaType")
+          && relativePath == "items/$itemId/payload.txt") {
+          "An Android incoming-share text record is invalid."
+        }
+        fileName = null
+        mediaType = null
+        totalTextBytes += byteSize
+        require(totalTextBytes <= MAXIMUM_TEXT_BATCH_BYTES) {
+          "The Android incoming-share text batch exceeds its 128 KB limit."
+        }
       }
-      validateFileNameAndMediaType(fileName, mediaType)
       val file = File(directory, relativePath)
-      val bytes = readBoundedRegularFile(file, directory, MAXIMUM_ITEM_BYTES.toInt())
+      val bytes = readBoundedRegularFile(file, directory, if (kind == "file")
+        MAXIMUM_ITEM_BYTES.toInt() else if (kind == "url") MAXIMUM_URL_ITEM_BYTES else MAXIMUM_TEXT_ITEM_BYTES)
       require(bytes.size.toLong() == byteSize && MessageDigest.getInstance("SHA-256")
         .digest(bytes).toHex() == sha256Hex) {
-        "An Android incoming-share file failed size or SHA-256 validation."
+        "An Android incoming-share item failed size or SHA-256 validation."
+      }
+      val text = if (kind == "file") null else String(bytes, StandardCharsets.UTF_8).also { decoded ->
+        require(decoded.isNotEmpty() && decoded.trim().isNotEmpty() && !decoded.contains('\u0000')
+          && decoded.toByteArray(StandardCharsets.UTF_8).contentEquals(bytes)
+          && (kind != "url" || isHttpUrl(decoded))) {
+          "An Android incoming-share text item is invalid."
+        }
       }
       manifestItems.add(IncomingShareManifestItem(
         itemId = itemId,
         ordinal = ordinal,
         state = state,
+        kind = kind,
         fileName = fileName,
         mediaType = mediaType,
         byteSize = byteSize,
         sha256Hex = sha256Hex,
         relativePath = relativePath
       ))
-      publicItems.add(mapOf(
-        "state" to "ready",
-        "itemId" to itemId,
-        "ordinal" to ordinal,
-        "fileName" to fileName,
-        "mediaType" to mediaType,
-        "byteSize" to byteSize,
-        "sha256Hex" to sha256Hex,
-        "uri" to Uri.fromFile(file).toString()
-      ))
+      publicItems.add(buildMap {
+        put("state", "ready")
+        put("kind", kind)
+        put("itemId", itemId)
+        put("ordinal", ordinal)
+        put("byteSize", byteSize)
+        put("sha256Hex", sha256Hex)
+        if (kind == "file") {
+          put("fileName", fileName)
+          put("mediaType", mediaType)
+          put("uri", Uri.fromFile(file).toString())
+        } else {
+          put("text", text)
+        }
+      })
     }
     val manifest = IncomingShareManifest(
       batchId,
@@ -613,13 +787,16 @@ internal object IncomingShareStore {
     val batchId = requiredText(value, "batchId", 36)
     val claimId = requiredText(value, "claimId", 36)
     val profileId = requiredText(value, "profileId", 128)
+    val destinationKind = requiredText(value, "destinationKind", 16)
+    val sessionId = if (value.has("sessionId")) requiredText(value, "sessionId", 128) else null
     val targetId = requiredText(value, "targetId", 128)
-    val surfaceOwnerKey = requiredOpaqueText(value, "surfaceOwnerKey", allowUnitSeparator = true)
-    val policyKey = requiredOpaqueText(value, "policyKey", allowUnitSeparator = false)
+    val surfaceOwnerKey = requiredOpaqueText(value, "surfaceOwnerKey", allowOwnerSeparators = true)
+    val policyKey = requiredOpaqueText(value, "policyKey", allowOwnerSeparators = false)
     val claimedAt = requiredInteger(value, "claimedAtUnixMs", 1L, Long.MAX_VALUE)
     assertUuid(batchId, "incoming share")
     assertUuid(claimId, "incoming-share claim")
     assertProfileId(profileId)
+    assertDestination(destinationKind, sessionId)
     assertTargetId(targetId)
     require(batchId == manifest.batchId && profileId == binding.profileId) {
       "The Android incoming-share claim identity is invalid."
@@ -636,14 +813,48 @@ internal object IncomingShareStore {
     }
     val readyIds = manifest.items.sortedBy { it.ordinal }.filter { it.state == "ready" }.map { it.itemId }
     validateAcceptedItemIds(acceptedIds, readyIds)
+    val proofs = value.optJSONArray("acceptedItemProofs")
+      ?: throw IncomingShareException("The Android incoming-share accepted item proofs are invalid.")
+    require(proofs.length() == acceptedIds.size) {
+      "The Android incoming-share accepted item proofs are invalid."
+    }
+    val acceptedProofs = (0 until proofs.length()).map { index ->
+      val raw = proofs.optJSONObject(index)
+        ?: throw IncomingShareException("An Android incoming-share item proof is malformed.")
+      val itemId = requiredText(raw, "itemId", 36)
+      assertUuid(itemId, "incoming-share proof item")
+      val kind = requiredText(raw, "kind", 8)
+      require(kind == "file" || kind == "text" || kind == "url") {
+        "An Android incoming-share item proof kind is invalid."
+      }
+      val byteSize = requiredInteger(raw, "byteSize", 1L, MAXIMUM_ITEM_BYTES)
+      val sha256Hex = requiredText(raw, "sha256Hex", 64)
+      require(sha256Hex.matches(Regex("^[0-9a-f]{64}$"))) {
+        "An Android incoming-share item proof SHA-256 is invalid."
+      }
+      val fileName = if (kind == "file") safeFileName(requiredText(raw, "fileName", 512)) else null
+      val mediaType = if (kind == "file") safeMediaType(requiredText(raw, "mediaType", 255)) else null
+      require(kind == "file" || (!raw.has("fileName") && !raw.has("mediaType"))) {
+        "An Android incoming-share text proof is invalid."
+      }
+      IncomingShareItemProof(itemId, kind, byteSize, sha256Hex, fileName, mediaType)
+    }
+    val expectedProofs = manifest.items.sortedBy { it.ordinal }
+      .filter { acceptedIds.contains(it.itemId) }.map(::itemProof)
+    require(acceptedProofs == expectedProofs) {
+      "The Android incoming-share claim content changed after it was selected."
+    }
     return IncomingShareClaim(
       batchId,
       claimId,
       profileId,
+      destinationKind,
+      sessionId,
       targetId,
       surfaceOwnerKey,
       policyKey,
       acceptedIds,
+      acceptedProofs,
       claimedAt
     )
   }
@@ -657,13 +868,16 @@ internal object IncomingShareStore {
     put("items", batch.items)
     batch.binding?.let { put("boundProfileId", it.profileId) }
     batch.claim?.let { claim ->
-      put("claim", mapOf(
-        "claimId" to claim.claimId,
-        "targetId" to claim.targetId,
-        "surfaceOwnerKey" to claim.surfaceOwnerKey,
-        "policyKey" to claim.policyKey,
-        "acceptedItemIds" to claim.acceptedItemIds
-      ))
+      put("claim", buildMap {
+        put("claimId", claim.claimId)
+        put("destinationKind", claim.destinationKind)
+        claim.sessionId?.let { put("sessionId", it) }
+        put("targetId", claim.targetId)
+        put("surfaceOwnerKey", claim.surfaceOwnerKey)
+        put("policyKey", claim.policyKey)
+        put("acceptedItemIds", claim.acceptedItemIds)
+        put("acceptedItemProofs", claim.acceptedItemProofs.map(::proofDictionary))
+      })
     }
   }
 
@@ -679,6 +893,7 @@ internal object IncomingShareStore {
         .put("ordinal", item.ordinal)
         .put("state", item.state)
         .apply {
+          item.kind?.let { put("kind", it) }
           item.fileName?.let { put("fileName", it) }
           item.mediaType?.let { put("mediaType", it) }
           item.byteSize?.let { put("byteSize", it) }
@@ -700,6 +915,37 @@ internal object IncomingShareStore {
     fileName = fileName,
     reason = boundedReason(reason)
   )
+
+  private fun itemProof(item: IncomingShareManifestItem): IncomingShareItemProof {
+    require(item.state == "ready") { "An Android incoming-share item proof requires ready content." }
+    return IncomingShareItemProof(
+      item.itemId,
+      item.kind ?: throw IncomingShareException("An Android incoming-share item kind is missing."),
+      item.byteSize ?: throw IncomingShareException("An Android incoming-share item size is missing."),
+      item.sha256Hex ?: throw IncomingShareException("An Android incoming-share item digest is missing."),
+      item.fileName,
+      item.mediaType
+    )
+  }
+
+  private fun proofJson(proof: IncomingShareItemProof): JSONObject = JSONObject()
+    .put("itemId", proof.itemId)
+    .put("kind", proof.kind)
+    .put("byteSize", proof.byteSize)
+    .put("sha256Hex", proof.sha256Hex)
+    .apply {
+      proof.fileName?.let { put("fileName", it) }
+      proof.mediaType?.let { put("mediaType", it) }
+    }
+
+  private fun proofDictionary(proof: IncomingShareItemProof): Map<String, Any> = buildMap {
+    put("itemId", proof.itemId)
+    put("kind", proof.kind)
+    put("byteSize", proof.byteSize)
+    put("sha256Hex", proof.sha256Hex)
+    proof.fileName?.let { put("fileName", it) }
+    proof.mediaType?.let { put("mediaType", it) }
+  }
 
   private fun resolvedMediaType(resolverValue: String?, declaredValue: String, fileName: String?): String {
     val declared = declaredValue.lowercase(Locale.US)
@@ -979,10 +1225,10 @@ internal object IncomingShareStore {
     return requiredText(value, name, maximum)
   }
 
-  private fun requiredOpaqueText(value: JSONObject, name: String, allowUnitSeparator: Boolean): String {
+  private fun requiredOpaqueText(value: JSONObject, name: String, allowOwnerSeparators: Boolean): String {
     val raw = value.opt(name)
     require(raw is String) { "The Android incoming-share $name is invalid." }
-    assertOpaqueText(raw, allowUnitSeparator)
+    assertOpaqueText(raw, allowOwnerSeparators)
     return raw
   }
 
@@ -1028,10 +1274,22 @@ internal object IncomingShareStore {
     require(profilePattern.matches(value)) { "The Joko project identity is invalid." }
   }
 
-  private fun assertOpaqueText(value: String, allowUnitSeparator: Boolean) {
+  private fun assertDestination(destinationKind: String, sessionId: String?) {
+    require(destinationKind == "new_task" || destinationKind == "existing_task") {
+      "The incoming share destination kind is invalid."
+    }
+    if (destinationKind == "new_task") require(sessionId == null) {
+      "A new-task share cannot claim an existing task."
+    } else require(sessionId != null && profilePattern.matches(sessionId)) {
+      "The existing Joko task identity is invalid."
+    }
+  }
+
+  private fun assertOpaqueText(value: String, allowOwnerSeparators: Boolean) {
     require(value.isNotEmpty() && value.toByteArray(StandardCharsets.UTF_8).size <= 16_384
       && value.none { character ->
-        (character.code < 32 && (!allowUnitSeparator || character.code != 31)) || character.code == 127
+        (character.code < 32 && (!allowOwnerSeparators ||
+          (character.code != 30 && character.code != 31))) || character.code == 127
       }) {
       "The incoming share authority claim is invalid."
     }

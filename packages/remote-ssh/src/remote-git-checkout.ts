@@ -1,18 +1,17 @@
 import { createHash, randomUUID } from "node:crypto";
-import { posix } from "node:path";
+import { posix, win32, type PlatformPath } from "node:path";
 
-import type { RemoteSshExecutionOptions, RemoteSshExecutionResult } from "./types.js";
+import type { RemoteWorkspaceBinding } from "@joko/core";
+
+import type { RemoteSshExecutionResult } from "./types.js";
 
 /** Stable remote ownership. Revisions record acquisition evidence; a reconnect
  * recaptures transport authority and verifies the stable identity again. */
 export interface RemoteGitCheckoutAuthority {
-  readonly hostOwnerId: string;
-  readonly hostTargetId: string;
-  readonly hostId: string;
-  readonly hostIdentity: string;
   readonly targetId: string;
+  readonly binding: RemoteWorkspaceBinding;
+  readonly executionIdentity: string;
   readonly targetRevision: string;
-  readonly hostRevision: string;
 }
 
 export interface RemoteGitCheckoutPlan {
@@ -71,10 +70,11 @@ export class RemoteGitCheckoutError extends Error {
 }
 
 export interface RemoteGitCheckoutServiceOptions {
-  /** Canonical absolute POSIX root owned by this service, separate from source repositories. */
+  /** Canonical absolute native root owned by this service, separate from source repositories. */
   readonly storageRoot: string;
-  /** Exact authenticated SSH execution. The caller captures one transport generation. */
-  readonly execute: (options: RemoteSshExecutionOptions) => Promise<RemoteSshExecutionResult>;
+  readonly pathStyle: "posix" | "win32";
+  /** Exact authenticated process execution. The caller captures one transport generation. */
+  readonly execute: (options: RemoteGitCheckoutExecutionOptions) => Promise<RemoteSshExecutionResult>;
   /** Revalidate Target, Host, runtime and SSH generation before and after every effect.
    * Recovery operations recapture a fresh generation and compare stable identity. */
   readonly assertCurrent: (
@@ -85,15 +85,28 @@ export interface RemoteGitCheckoutServiceOptions {
   readonly nodeExecutable: string;
 }
 
+export interface RemoteGitCheckoutExecutionOptions {
+  readonly executable: string;
+  readonly args: readonly string[];
+  readonly cwd?: string;
+  readonly input?: string;
+  readonly timeoutMs?: number;
+  readonly signal?: AbortSignal;
+}
+
 export class RemoteGitCheckoutService {
   readonly #storageRoot: string;
   readonly #execute: RemoteGitCheckoutServiceOptions["execute"];
   readonly #assertCurrent: RemoteGitCheckoutServiceOptions["assertCurrent"];
   readonly #nodeExecutable: string;
+  readonly #paths: PlatformPath;
+  readonly #pathStyle: "posix" | "win32";
 
   constructor(options: RemoteGitCheckoutServiceOptions) {
-    this.#storageRoot = posixAbsolute(options.storageRoot, "storageRoot");
-    this.#nodeExecutable = posixAbsolute(options.nodeExecutable, "nodeExecutable");
+    this.#pathStyle = options.pathStyle;
+    this.#paths = options.pathStyle === "win32" ? win32 : posix;
+    this.#storageRoot = nativeAbsolute(options.storageRoot, "storageRoot", this.#paths);
+    this.#nodeExecutable = nativeAbsolute(options.nodeExecutable, "nodeExecutable", this.#paths);
     if (typeof options.execute !== "function" || typeof options.assertCurrent !== "function") {
       throw new RemoteGitCheckoutError("INVALID_ARGUMENT");
     }
@@ -115,10 +128,10 @@ export class RemoteGitCheckoutService {
     const sourceSessionId = identifier(input.sourceSessionId);
     const workspaceId = identifier(input.workspaceId);
     if (sessionId === sourceSessionId) throw new RemoteGitCheckoutError("INVALID_ARGUMENT");
-    const sourceCwd = posixAbsolute(input.sourceCwd, "sourceCwd");
-    const authority = validateAuthority(input.authority);
+    const sourceCwd = nativeAbsolute(input.sourceCwd, "sourceCwd", this.#paths);
+    const authority = validateAuthority(input.authority, this.#paths);
     if (input.sourceLease !== undefined) {
-      validateLease(input.sourceLease);
+      validateLease(input.sourceLease, this.#paths);
       if (input.sourceLease.sessionId !== sourceSessionId || input.sourceLease.path !== sourceCwd ||
         !sameStableAuthority(input.sourceLease.remote, authority)) {
         throw new RemoteGitCheckoutError("INVALID_ARGUMENT");
@@ -130,7 +143,7 @@ export class RemoteGitCheckoutService {
       typeof probe.sourceSnapshot !== "string" || !/^sha256:[a-f0-9]{64}$/u.test(probe.sourceSnapshot)) {
       throw new RemoteGitCheckoutError("REMOTE_FAILED");
     }
-    const repositoryRoot = posixAbsolute(probe.repositoryRoot, "repositoryRoot");
+    const repositoryRoot = nativeAbsolute(probe.repositoryRoot, "repositoryRoot", this.#paths);
     const leaseId = randomUUID();
     const manifestId = randomUUID();
     const branch = `joko/remote-${createHash("sha256").update(sessionId).digest("hex").slice(0, 12)}-${leaseId.slice(0, 8)}`;
@@ -143,7 +156,7 @@ export class RemoteGitCheckoutService {
       workspaceId,
       sourceCwd,
       ...(input.sourceLease === undefined ? {} : { sourceLease: input.sourceLease }),
-      path: posix.join(this.#storageRoot, "checkouts", leaseId),
+      path: this.#paths.join(this.#storageRoot, "checkouts", leaseId),
       repositoryRoot,
       branch,
       sourceRef: probe.sourceCommit,
@@ -163,7 +176,7 @@ export class RemoteGitCheckoutService {
     if (response.status !== "active" || response.lease === undefined) {
       throw new RemoteGitCheckoutError("OUTCOME_UNKNOWN", true);
     }
-    const lease = validateLease(response.lease);
+    const lease = validateLease(response.lease, this.#paths);
     this.#assertLeaseMatchesPlan(lease, plan);
     return lease;
   }
@@ -172,7 +185,7 @@ export class RemoteGitCheckoutService {
     this.#validatePlan(plan);
     const response = await this.#invoke("inspect", plan, false, signal);
     if (response.status === "active" && response.lease !== undefined) {
-      const lease = validateLease(response.lease);
+      const lease = validateLease(response.lease, this.#paths);
       this.#assertLeaseMatchesPlan(lease, plan);
       return { status: "active", lease };
     }
@@ -183,10 +196,10 @@ export class RemoteGitCheckoutService {
   }
 
   async assertExact(lease: RemoteGitCheckoutLease, signal?: AbortSignal): Promise<void> {
-    validateLease(lease);
+    validateLease(lease, this.#paths);
     const response = await this.#invoke("assert", lease, false, signal);
     if (response.status !== "active" || response.lease === undefined ||
-      !sameLease(lease, validateLease(response.lease))) {
+      !sameLease(lease, validateLease(response.lease, this.#paths))) {
       throw new RemoteGitCheckoutError("LEASE_CONFLICT");
     }
   }
@@ -203,7 +216,7 @@ export class RemoteGitCheckoutService {
 
   /** A dirty or uncertain checkout retains its exact lease and branch. */
   async releaseExact(lease: RemoteGitCheckoutLease, signal?: AbortSignal): Promise<"released" | "preserved"> {
-    validateLease(lease);
+    validateLease(lease, this.#paths);
     const response = await this.#invoke("release", lease, true, signal);
     if (response.status === "released" || response.status === "preserved") return response.status;
     throw new RemoteGitCheckoutError("OUTCOME_UNKNOWN", true);
@@ -212,25 +225,24 @@ export class RemoteGitCheckoutService {
   #validatePlan(plan: RemoteGitCheckoutPlan): void {
     if (plan?.format !== 1 || !isUuid(plan.leaseId) || !isUuid(plan.manifestId) ||
       identifier(plan.sessionId) === identifier(plan.sourceSessionId) || !identifier(plan.workspaceId) ||
-      posixAbsolute(plan.sourceCwd, "sourceCwd") !== plan.sourceCwd ||
-      posixAbsolute(plan.repositoryRoot, "repositoryRoot") !== plan.repositoryRoot ||
+      nativeAbsolute(plan.sourceCwd, "sourceCwd", this.#paths) !== plan.sourceCwd ||
+      nativeAbsolute(plan.repositoryRoot, "repositoryRoot", this.#paths) !== plan.repositoryRoot ||
       plan.sourceRef !== plan.sourceCommit || plan.sourceStrategy !== "explicit" ||
       plan.sourceRefreshed !== false || !/^[a-f0-9]{40,64}$/u.test(plan.sourceCommit) ||
       !/^sha256:[a-f0-9]{64}$/u.test(plan.sourceSnapshot) ||
-      posixAbsolute(plan.storageRoot, "storageRoot") !== this.#storageRoot ||
-      plan.path !== posix.join(this.#storageRoot, "checkouts", plan.leaseId) ||
+      nativeAbsolute(plan.storageRoot, "storageRoot", this.#paths) !== this.#storageRoot ||
+      plan.path !== this.#paths.join(this.#storageRoot, "checkouts", plan.leaseId) ||
       plan.branch !== `joko/remote-${createHash("sha256").update(plan.sessionId).digest("hex").slice(0, 12)}-${plan.leaseId.slice(0, 8)}`) {
       throw new RemoteGitCheckoutError("INVALID_ARGUMENT");
     }
-    validateAuthority(plan.authority);
+    validateAuthority(plan.authority, this.#paths);
     if (plan.remote?.manifestId !== plan.manifestId ||
       !sameStableAuthority(plan.remote, plan.authority) ||
-      plan.remote.targetRevision !== plan.authority.targetRevision ||
-      plan.remote.hostRevision !== plan.authority.hostRevision) {
+      plan.remote.targetRevision !== plan.authority.targetRevision) {
       throw new RemoteGitCheckoutError("INVALID_ARGUMENT");
     }
     if (plan.sourceLease !== undefined) {
-      validateLease(plan.sourceLease);
+      validateLease(plan.sourceLease, this.#paths);
       if (plan.sourceLease.path !== plan.sourceCwd ||
         plan.sourceLease.sessionId !== plan.sourceSessionId ||
         !sameStableAuthority(plan.sourceLease.remote, plan.authority)) {
@@ -245,7 +257,6 @@ export class RemoteGitCheckoutService {
       lease.repositoryRoot !== plan.repositoryRoot || lease.source.commit !== plan.sourceCommit ||
       lease.remote.manifestId !== plan.manifestId ||
       lease.remote.targetRevision !== plan.remote.targetRevision ||
-      lease.remote.hostRevision !== plan.remote.hostRevision ||
       !sameStableAuthority(lease.remote, plan.authority)) {
       throw new RemoteGitCheckoutError("LEASE_CONFLICT");
     }
@@ -270,8 +281,9 @@ export class RemoteGitCheckoutService {
     let result: RemoteSshExecutionResult;
     try {
       result = await this.#execute({
-        command: `${shellQuote(this.#nodeExecutable)} -e ${shellQuote(REMOTE_HELPER)}`,
-        input: JSON.stringify({ operation, data, storageRoot: this.#storageRoot }),
+        executable: this.#nodeExecutable,
+        args: ["-e", REMOTE_HELPER],
+        input: JSON.stringify({ operation, data, storageRoot: this.#storageRoot, pathStyle: this.#pathStyle }),
         timeoutMs: 120_000,
         ...(signal === undefined ? {} : { signal })
       });
@@ -317,41 +329,49 @@ function identifier(value: string): string {
   return value;
 }
 
-function posixAbsolute(value: string, _name: string): string {
+function nativeAbsolute(value: string, _name: string, paths: PlatformPath): string {
   if (typeof value !== "string" || value.length < 2 || value.length > 4_096 ||
-    !value.startsWith("/") || value.includes("\0") || /[\r\n]/u.test(value) ||
-    posix.normalize(value) !== value || value === "/") throw new RemoteGitCheckoutError("INVALID_ARGUMENT");
+    !paths.isAbsolute(value) || value.includes("\0") || /[\r\n]/u.test(value) ||
+    paths.normalize(value) !== value || paths.parse(value).root === value) throw new RemoteGitCheckoutError("INVALID_ARGUMENT");
   return value;
 }
 
-function validateAuthority(value: RemoteGitCheckoutAuthority): RemoteGitCheckoutAuthority {
+function validateAuthority(value: RemoteGitCheckoutAuthority, paths: PlatformPath): RemoteGitCheckoutAuthority {
   if (value === null || typeof value !== "object") throw new RemoteGitCheckoutError("INVALID_ARGUMENT");
-  for (const field of ["hostOwnerId", "hostTargetId", "hostId", "hostIdentity", "targetId"] as const) identifier(value[field]);
-  if (!/^sha256:[a-f0-9]{64}$/u.test(value.hostIdentity) ||
-    typeof value.targetRevision !== "string" || !/^[1-9][0-9]*$/u.test(value.targetRevision) ||
-    typeof value.hostRevision !== "string" || !/^[1-9][0-9]*$/u.test(value.hostRevision)) {
+  identifier(value.targetId);
+  boundedIdentity(value.executionIdentity, 4_096);
+  if (!validBinding(value.binding, paths) ||
+    typeof value.targetRevision !== "string" || !/^[1-9][0-9]*$/u.test(value.targetRevision)) {
     throw new RemoteGitCheckoutError("INVALID_ARGUMENT");
   }
   return value;
 }
 
-function validateLease(value: RemoteGitCheckoutLease): RemoteGitCheckoutLease {
+function boundedIdentity(value: string, maximumLength: number): string {
+  if (typeof value !== "string" || value.length < 1 || value.length > maximumLength
+    || value !== value.trim() || /[\u0000-\u001f\u007f]/u.test(value)) {
+    throw new RemoteGitCheckoutError("INVALID_ARGUMENT");
+  }
+  return value;
+}
+
+function validateLease(value: RemoteGitCheckoutLease, paths: PlatformPath): RemoteGitCheckoutLease {
   if (value === null || typeof value !== "object" || !isUuid(value.id) ||
     !isUuid(value.remote?.manifestId) || typeof value.sessionId !== "string" ||
-    posixAbsolute(value.path, "path") !== value.path ||
-    posixAbsolute(value.repositoryRoot, "repositoryRoot") !== value.repositoryRoot ||
+    nativeAbsolute(value.path, "path", paths) !== value.path ||
+    nativeAbsolute(value.repositoryRoot, "repositoryRoot", paths) !== value.repositoryRoot ||
     typeof value.branch !== "string" || !/^joko\/remote-[a-f0-9]{12}-[a-f0-9]{8}$/u.test(value.branch) ||
     value.source?.strategy !== "explicit" || value.source.refreshed !== false ||
     !/^[a-f0-9]{40,64}$/u.test(value.source.commit) || value.source.ref !== value.source.commit ||
     !Number.isSafeInteger(value.acquiredAt) || value.acquiredAt < 0) throw new RemoteGitCheckoutError("INVALID_ARGUMENT");
   identifier(value.sessionId);
-  validateAuthority(value.remote);
+  validateAuthority(value.remote, paths);
   return value;
 }
 
 function sameStableAuthority(left: RemoteGitCheckoutAuthority, right: RemoteGitCheckoutAuthority): boolean {
-  return left.hostOwnerId === right.hostOwnerId && left.hostTargetId === right.hostTargetId &&
-    left.hostId === right.hostId && left.hostIdentity === right.hostIdentity && left.targetId === right.targetId;
+  return left.targetId === right.targetId && left.executionIdentity === right.executionIdentity &&
+    sameBinding(left.binding, right.binding);
 }
 
 function sameLease(left: RemoteGitCheckoutLease, right: RemoteGitCheckoutLease): boolean {
@@ -362,15 +382,32 @@ function sameLease(left: RemoteGitCheckoutLease, right: RemoteGitCheckoutLease):
     left.source.strategy === right.source.strategy && left.acquiredAt === right.acquiredAt &&
     left.remote.manifestId === right.remote.manifestId &&
     sameStableAuthority(left.remote, right.remote) &&
-    left.remote.targetRevision === right.remote.targetRevision &&
-    left.remote.hostRevision === right.remote.hostRevision;
+    left.remote.targetRevision === right.remote.targetRevision;
+}
+
+function validBinding(value: RemoteWorkspaceBinding, paths: PlatformPath): boolean {
+  if (value === null || typeof value !== "object" || typeof value.workspaceRoot !== "string"
+    || nativeAbsolute(value.workspaceRoot, "workspaceRoot", paths) !== value.workspaceRoot) return false;
+  if (value.kind === "ssh") {
+    identifier(value.hostTargetId);
+    identifier(value.hostId);
+    return true;
+  }
+  if (value.kind === "device_peer") {
+    identifier(value.controllerDeviceId);
+    identifier(value.targetDeviceId);
+    return true;
+  }
+  return false;
+}
+
+function sameBinding(left: RemoteWorkspaceBinding, right: RemoteWorkspaceBinding): boolean {
+  return left.kind === right.kind && JSON.stringify(left) === JSON.stringify(right);
 }
 
 function isUuid(value: unknown): value is string {
   return typeof value === "string" && /^[a-f0-9]{8}-[a-f0-9]{4}-[1-8][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/iu.test(value);
 }
-
-function shellQuote(value: string): string { return `'${value.replaceAll("'", "'\\''")}'`; }
 
 function remoteErrorCode(value: unknown): RemoteGitCheckoutError["code"] {
   if (value === "NOT_GIT_REPOSITORY" || value === "SOURCE_UNSAFE" || value === "SOURCE_CHANGED" || value === "LEASE_CONFLICT" ||
@@ -378,23 +415,32 @@ function remoteErrorCode(value: unknown): RemoteGitCheckoutError["code"] {
   return "REMOTE_FAILED";
 }
 
-/** Runs only on the authenticated POSIX host. All untrusted values arrive as
+/** Runs only on the authenticated target. All untrusted values arrive as
  * JSON on stdin, never as shell fragments or Git options. */
 const REMOTE_HELPER = String.raw`
 const fs = require('node:fs');
-const path = require('node:path').posix;
+const hostPath = require('node:path');
 const crypto = require('node:crypto');
 const cp = require('node:child_process');
 const read = () => fs.readFileSync(0, 'utf8');
 const respond = (value) => process.stdout.write(JSON.stringify({format:1,...value}));
 class Stop extends Error { constructor(code, changed=false) { super(code); this.code=code; this.changed=changed; } }
 const fail = (code, changed=false) => { throw new Stop(code,changed); };
-const ordinary = (p) => { try { const s=fs.lstatSync(p); if (!s.isDirectory() || s.isSymbolicLink() || fs.realpathSync(p)!==p) fail('CHECKOUT_UNSAFE'); } catch(e) { if(e instanceof Stop) throw e; fail('CHECKOUT_UNSAFE'); } };
-const inside = (root,p) => p.startsWith(root+'/');
-const absolute = (p) => typeof p==='string' && p.length>1 && p.length<=4096 && p[0]==='/' && path.normalize(p)===p && !p.includes('\0');
+let path;
+const samePath = (a,b) => process.platform==='win32' ? a.toLowerCase()===b.toLowerCase() : a===b;
+const ordinary = (p) => { try { const s=fs.lstatSync(p); if (!s.isDirectory() || s.isSymbolicLink() || !samePath(fs.realpathSync(p),p)) fail('CHECKOUT_UNSAFE'); } catch(e) { if(e instanceof Stop) throw e; fail('CHECKOUT_UNSAFE'); } };
+const inside = (root,p) => { const rel=path.relative(root,p); return rel!==''&&!rel.startsWith('..'+path.sep)&&rel!=='..'&&!path.isAbsolute(rel); };
+const absolute = (p) => typeof p==='string' && p.length>1 && p.length<=4096 && path.isAbsolute(p) && path.normalize(p)===p && !samePath(path.parse(p).root,p) && !p.includes('\0');
+const gitPath = (cwd,value,existing=true) => {
+  if(typeof value!=='string'||value.length<2||value.length>4096||value.includes('\0')) fail('SOURCE_UNSAFE');
+  const normalized=path.normalize(path.resolve(cwd,value));
+  if(!path.isAbsolute(normalized)) fail('SOURCE_UNSAFE');
+  if(!existing) return normalized;
+  try { return path.normalize(fs.realpathSync(normalized)); } catch { fail('SOURCE_UNSAFE'); }
+};
 const hash = (v) => crypto.createHash('sha256').update(v).digest('hex');
 const utf8 = (v) => { try { return new TextDecoder('utf-8',{fatal:true}).decode(v); } catch { fail('SOURCE_UNSAFE'); } };
-const gitEnv = {PATH:process.env.PATH||'/usr/bin:/bin',HOME:process.env.HOME||'/',LC_ALL:'C',
+const gitEnv = {PATH:process.env.PATH||'',HOME:process.env.HOME||process.env.USERPROFILE||process.cwd(),LC_ALL:'C',
   GIT_TERMINAL_PROMPT:'0',GCM_INTERACTIVE:'Never',GIT_OPTIONAL_LOCKS:'0',
   GIT_CONFIG_COUNT:'2',GIT_CONFIG_KEY_0:'core.fsmonitor',GIT_CONFIG_VALUE_0:'false',
   GIT_CONFIG_KEY_1:'core.untrackedCache',GIT_CONFIG_VALUE_1:'false',
@@ -418,18 +464,18 @@ function metadata(cwd) {
     let at=cwd, found=false;
     while(true) {
       if(fs.existsSync(path.join(at,'.git'))) { found=true; break; }
-      if(at==='/') break;
+      if(path.dirname(at)===at) break;
       at=path.dirname(at);
     }
     fail(found?'SOURCE_UNSAFE':'NOT_GIT_REPOSITORY');
   }
-  const root=probe.stdout.trim();
-  const common=fs.realpathSync(path.resolve(cwd,out(cwd,['rev-parse','--git-common-dir'])));
-  const dir=fs.realpathSync(path.resolve(cwd,out(cwd,['rev-parse','--git-dir'])));
+  const root=gitPath(cwd,probe.stdout.trim());
+  const common=gitPath(cwd,out(cwd,['rev-parse','--git-common-dir']));
+  const dir=gitPath(cwd,out(cwd,['rev-parse','--git-dir']));
   const commonStat=fs.statSync(common,{bigint:true}),dirStat=fs.statSync(dir,{bigint:true});
   if(!commonStat.isDirectory()||!dirStat.isDirectory()) fail('SOURCE_UNSAFE');
   const head=out(cwd,['rev-parse','--verify','HEAD^{commit}']);
-  if(!absolute(root)||!oid(head)||(!inside(root,cwd)&&cwd!==root)) fail('SOURCE_UNSAFE');
+  if(!absolute(root)||!oid(head)||(!inside(root,cwd)&&!samePath(cwd,root))) fail('SOURCE_UNSAFE');
   ordinary(root);
   return {root,common,dir,commonDev:String(commonStat.dev),commonIno:String(commonStat.ino),
     dirDev:String(dirStat.dev),dirIno:String(dirStat.ino),head,branch:optional(cwd,['symbolic-ref','--quiet','--short','HEAD'])};
@@ -555,12 +601,12 @@ function saveManifest(root,m,exclusive=false) {
   try {
     if(exclusive) { fs.linkSync(tmp,p); fs.unlinkSync(tmp); }
     else fs.renameSync(tmp,p);
-    const dir=fs.openSync(path.dirname(p),'r'); try { fs.fsyncSync(dir); } finally { fs.closeSync(dir); }
+    syncDirectory(path.dirname(p));
   } finally { if(fs.existsSync(tmp)) fs.unlinkSync(tmp); }
 }
 function sameOwner(a,b) {
-  return a.hostOwnerId===b.hostOwnerId&&a.hostTargetId===b.hostTargetId&&a.hostId===b.hostId&&
-    a.hostIdentity===b.hostIdentity&&a.targetId===b.targetId;
+  return a.targetId===b.targetId&&a.executionIdentity===b.executionIdentity&&
+    JSON.stringify(a.binding)===JSON.stringify(b.binding);
 }
 function samePlan(a,b) { return a.leaseId===b.leaseId&&a.manifestId===b.manifestId&&a.sessionId===b.sessionId&&
   a.sourceSessionId===b.sourceSessionId&&a.workspaceId===b.workspaceId&&a.sourceCwd===b.sourceCwd&&
@@ -568,39 +614,43 @@ function samePlan(a,b) { return a.leaseId===b.leaseId&&a.manifestId===b.manifest
   a.sourceRef===b.sourceRef&&a.sourceCommit===b.sourceCommit&&a.sourceStrategy===b.sourceStrategy&&
   a.sourceRefreshed===b.sourceRefreshed&&a.sourceSnapshot===b.sourceSnapshot&&
   a.storageRoot===b.storageRoot&&sameOwner(a.authority,b.authority)&&
-  a.authority.targetRevision===b.authority.targetRevision&&a.authority.hostRevision===b.authority.hostRevision&&
+  a.authority.targetRevision===b.authority.targetRevision&&
   ((!a.sourceLease&&!b.sourceLease)||(a.sourceLease&&b.sourceLease&&sameLease(a.sourceLease,b.sourceLease))); }
 function sameLease(a,b) { return a.id===b.id&&a.sessionId===b.sessionId&&a.path===b.path&&
   a.repositoryRoot===b.repositoryRoot&&a.branch===b.branch&&a.source.ref===b.source.ref&&
   a.source.commit===b.source.commit&&a.source.refreshed===b.source.refreshed&&
   a.source.strategy===b.source.strategy&&a.acquiredAt===b.acquiredAt&&
   a.remote.manifestId===b.remote.manifestId&&sameOwner(a.remote,b.remote)&&
-  a.remote.targetRevision===b.remote.targetRevision&&a.remote.hostRevision===b.remote.hostRevision; }
+  a.remote.targetRevision===b.remote.targetRevision; }
 function checkLayout(root,p) {
-  if(!absolute(root)||!absolute(p)||!inside(path.join(root,'checkouts'),p)||path.dirname(p)!==path.join(root,'checkouts')) fail('CHECKOUT_UNSAFE');
+  if(!absolute(root)||!absolute(p)||!inside(path.join(root,'checkouts'),p)||!samePath(path.dirname(p),path.join(root,'checkouts'))) fail('CHECKOUT_UNSAFE');
   ordinary(root); ordinary(path.join(root,'checkouts')); ordinary(path.join(root,'leases'));
 }
 function verifyActive(root,m) {
   if((m.phase!=='active'&&m.phase!=='releasing')||!m.lease) fail('LEASE_CONFLICT');
   const l=m.lease; checkLayout(root,l.path); ordinary(l.path);
   const meta=metadata(l.path); const source=metadata(l.repositoryRoot);
-  if(meta.root!==l.path||meta.dir===meta.common||meta.common!==source.common||source.dir!==source.common||
-    source.root!==l.repositoryRoot||meta.branch!==l.branch||
-    source.common!==m.repositoryCommon||source.commonDev!==m.repositoryCommonDev||
-    source.commonIno!==m.repositoryCommonIno||meta.dir!==m.checkoutGitDirectory||
+  if(!samePath(meta.root,l.path)||samePath(meta.dir,meta.common)||!samePath(meta.common,source.common)||!samePath(source.dir,source.common)||
+    !samePath(source.root,l.repositoryRoot)||meta.branch!==l.branch||
+    !samePath(source.common,m.repositoryCommon)||source.commonDev!==m.repositoryCommonDev||
+    source.commonIno!==m.repositoryCommonIno||!samePath(meta.dir,m.checkoutGitDirectory)||
     meta.dirDev!==m.checkoutGitDevice||meta.dirIno!==m.checkoutGitInode) fail('LEASE_CONFLICT');
   if(!sameOwner(l.remote,m.plan.authority)||l.remote.manifestId!==m.plan.manifestId||
     l.id!==m.plan.leaseId||l.path!==m.plan.path||l.branch!==m.plan.branch||l.sessionId!==m.plan.sessionId) fail('LEASE_CONFLICT');
   return l;
 }
+function syncDirectory(dir) {
+  if(process.platform==='win32') return;
+  const handle=fs.openSync(dir,'r'); try { fs.fsyncSync(handle); } finally { fs.closeSync(handle); }
+}
 function ensureRoot(root) {
   if(!absolute(root)) fail('CHECKOUT_UNSAFE');
-  let at='/';
-  for(const segment of root.slice(1).split('/')) {
+  let at=path.parse(root).root;
+  for(const segment of path.relative(at,root).split(path.sep).filter(Boolean)) {
     at=path.join(at,segment);
     if(!fs.existsSync(at)) {
       fs.mkdirSync(at,{mode:0o700});
-      const parent=fs.openSync(path.dirname(at),'r'); try { fs.fsyncSync(parent); } finally { fs.closeSync(parent); }
+      syncDirectory(path.dirname(at));
     }
     ordinary(at);
   }
@@ -608,7 +658,7 @@ function ensureRoot(root) {
     const dir=path.join(root,part);
     if(!fs.existsSync(dir)) {
       fs.mkdirSync(dir,{mode:0o700});
-      const parent=fs.openSync(root,'r'); try { fs.fsyncSync(parent); } finally { fs.closeSync(parent); }
+      syncDirectory(root);
     }
     ordinary(dir);
   }
@@ -640,20 +690,20 @@ function probeSource(input,root) {
   if(input.sourceLease) {
     const prior=readManifest(root,input.sourceLease.id);
     if(!prior||prior.phase!=='active'||JSON.stringify(verifyActive(root,prior))!==JSON.stringify(input.sourceLease)||
-      current.root!==input.sourceLease.path||current.dir===current.common||current.branch!==input.sourceLease.branch) fail('SOURCE_CHANGED');
-  } else if(current.dir!==current.common) fail('SOURCE_UNSAFE');
-  if(root===current.root||inside(root,current.root)||inside(current.root,root)) fail('SOURCE_UNSAFE');
+      !samePath(current.root,input.sourceLease.path)||samePath(current.dir,current.common)||current.branch!==input.sourceLease.branch) fail('SOURCE_CHANGED');
+  } else if(!samePath(current.dir,current.common)) fail('SOURCE_UNSAFE');
+  if(samePath(root,current.root)||inside(root,current.root)||inside(current.root,root)) fail('SOURCE_UNSAFE');
   return current;
 }
 function prepareSource(plan,root) {
   const current=probeSource(plan,root);
-  if(current.root!==plan.repositoryRoot||current.head!==plan.sourceCommit||plan.sourceRef!==current.head) fail('SOURCE_CHANGED');
+  if(!samePath(current.root,plan.repositoryRoot)||current.head!==plan.sourceCommit||plan.sourceRef!==current.head) fail('SOURCE_CHANGED');
   if(sourceSnapshot(current)!==plan.sourceSnapshot) fail('SOURCE_CHANGED');
   return capture(current.root);
 }
 function registered(root,checkout) {
   const listing=out(root,['worktree','list','--porcelain']).split('\n');
-  return listing.some(line=>line==='worktree '+checkout);
+  return listing.some(line=>line.startsWith('worktree ')&&samePath(gitPath(root,line.slice(9),false),checkout));
 }
 function branchPresent(root,branch) {
   const result=cp.spawnSync('git',['show-ref','--verify','--quiet','refs/heads/'+branch],{
@@ -683,7 +733,7 @@ function derive(root,plan) {
     ensureChildParent(plan.path,file.name);
     if(fs.existsSync(to)) fail('CHECKOUT_UNSAFE',true);
     const fd=fs.openSync(to,'wx',file.mode);
-    try { fs.writeFileSync(fd,bytes); fs.fchmodSync(fd,file.mode); fs.fsyncSync(fd); }
+    try { fs.writeFileSync(fd,bytes); if(process.platform!=='win32') fs.fchmodSync(fd,file.mode); fs.fsyncSync(fd); }
     finally { fs.closeSync(fd); }
   }
   if(!equalCapture(source,capture(source.root))) fail('SOURCE_CHANGED',true);
@@ -710,9 +760,9 @@ function cleanup(root,plan) {
   }
   checkLayout(root,plan.path); ordinary(plan.path);
   const meta=metadata(plan.path), source=metadata(m.repositoryRoot);
-  if(meta.root!==plan.path||meta.dir===meta.common||meta.common!==source.common||
-    source.root!==m.repositoryRoot||meta.branch!==plan.branch||meta.head!==m.sourceHead||
-    source.common!==m.repositoryCommon||source.commonDev!==m.repositoryCommonDev||
+  if(!samePath(meta.root,plan.path)||samePath(meta.dir,meta.common)||!samePath(meta.common,source.common)||
+    !samePath(source.root,m.repositoryRoot)||meta.branch!==plan.branch||meta.head!==m.sourceHead||
+    !samePath(source.common,m.repositoryCommon)||source.commonDev!==m.repositoryCommonDev||
     source.commonIno!==m.repositoryCommonIno) return 'preserved';
   const state=git(plan.path,['status','--porcelain=v2','-z','--untracked-files=all','--ignored=matching']).toString('utf8');
   if(state.length>0) return 'preserved';
@@ -739,7 +789,10 @@ function release(root,lease) {
   return 'released';
 }
 try {
-  const request=JSON.parse(read()); const root=request.storageRoot;
+  const request=JSON.parse(read());
+  if((request.pathStyle==='win32')!==(process.platform==='win32')) fail('CHECKOUT_UNSAFE');
+  path=request.pathStyle==='win32'?hostPath.win32:hostPath.posix;
+  const root=request.storageRoot;
   if(!absolute(root)) fail('CHECKOUT_UNSAFE');
   if(request.operation==='probe') {
     const source=probeSource(request.data,root);
@@ -749,7 +802,7 @@ try {
     respond({status:'source',repositoryRoot:repeated.root,sourceCommit:repeated.head,sourceSnapshot:snapshot});
   } else if(request.operation==='derive') {
     const plan=request.data;
-    if(plan.storageRoot!==root||plan.path!==path.join(root,'checkouts',plan.leaseId)) fail('CHECKOUT_UNSAFE');
+    if(!samePath(plan.storageRoot,root)||!samePath(plan.path,path.join(root,'checkouts',plan.leaseId))) fail('CHECKOUT_UNSAFE');
     respond({status:'active',lease:derive(root,plan)});
   } else if(request.operation==='inspect') {
     if(fs.existsSync(root)) ordinary(root);

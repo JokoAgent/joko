@@ -28,6 +28,7 @@ import { DesktopPageSearchBar } from "./components/DesktopPageSearchBar.js";
 import { StartupUpdateOverlay } from "./components/StartupUpdateOverlay.js";
 import { NativeTaskStatusBridge } from "./components/NativeTaskStatusBridge.js";
 import { DesktopGlobalVoiceBridge } from "./components/DesktopGlobalVoiceBridge.js";
+import { RuntimeProcessMonitorBroker } from "./components/RuntimeProcessMonitorBroker.js";
 import { RuntimeProcessMonitorWindow } from "./components/RuntimeProcessMonitorWindow.js";
 import { VisionBridgeToasts } from "./components/VisionBridgeToasts.js";
 import { Sidebar } from "./components/Sidebar.js";
@@ -36,6 +37,7 @@ import { PortableSessionDropTarget } from "./components/PortableSessionDropTarge
 import { SessionSplitView } from "./components/SessionSplitView.js";
 import { WorkspaceFilesRoute } from "./components/WorkspaceFilesRoute.js";
 import { createInspectorTurnReviewRequest, type InspectorTurnReviewRequest } from "./components/inspector-review-focus.js";
+import { activateDetachedInspectorWindow } from "./components/inspector-detach.js";
 import { requestWorkspaceDocumentLeave } from "./workspace-document-lifecycle.js";
 import { useNewSessionSubmission } from "./use-new-session-submission.js";
 import { currentAppShortcutPlatform, type AppShortcutId, type AppShortcutOverrides } from "./app-shortcuts.js";
@@ -47,7 +49,7 @@ import {
   type DesktopApplicationMenuPreferenceView
 } from "./desktop-application-menu.js";
 import { useAppShortcut } from "./use-app-shortcut.js";
-import { useGamepadInput } from "./gamepad-client.js";
+import { GAMEPAD_PANEL_EVENT, useGamepadInput } from "./gamepad-client.js";
 import { toggleGamepadFullscreen } from "./gamepad-fullscreen.js";
 import { currentGamepadTaskRoot, isGamepadInspectorAction, type GamepadInspectorRequest } from "./gamepad-actions.js";
 import { isStartupUpdateInteractionBlocked } from "./startup-update-interaction.js";
@@ -57,6 +59,7 @@ import { useDocumentForeground } from "./document-foreground.js";
 import { deleteScheduleWithGeneratedSessions, prepareScheduleDeletion } from "./schedule-deletion.js";
 import { SessionNotificationTracker, shouldDispatchSessionNotifications } from "./session-notifications.js";
 import { ScheduleNotificationTracker } from "./schedule-notifications.js";
+import { projectDesktopNotificationTitle } from "./desktop-notification-projection.js";
 import {
   reconcileSessionAttentionBadgeProjection,
   type SessionAttentionBadgeKey
@@ -88,7 +91,12 @@ import {
   type SessionSplitSide
 } from "./session-split-layout.js";
 import { desktopSessionTaskLink, isSessionApplicationWindow, openSessionWindowFallback, sessionTaskLink } from "./session-window-navigation.js";
-import { desktopDeepLinkRouteHash } from "./desktop-deep-link-navigation.js";
+import {
+  DesktopDeepLinkDeliveryOrder,
+  desktopDeepLinkAppRoute,
+  desktopDeepLinkNavigationMatchesRoute,
+  desktopDeepLinkRouteHash
+} from "./desktop-deep-link-navigation.js";
 import { isExtensionApplicationWindow, openExtensionWindowFallback } from "./extension-window-navigation.js";
 import { CLIENT_LAYOUT_RESET_EVENT } from "./client-layout-reset.js";
 import {
@@ -103,6 +111,13 @@ import { isRuntimeProcessMonitorWindow } from "./runtime-process-monitor-window.
 import { ExtensionMainViewPage } from "./components/ExtensionMainViewPage.js";
 import { createProviderModelRefreshLifecycle } from "./provider-model-refresh-lifecycle.js";
 import type { NewSessionProjectPickerRequest } from "./components/NewSessionPage.js";
+import type { DedicatedHardwareCommand, DedicatedHardwareTaskCatalog } from "./dedicated-hardware.js";
+import {
+  createDedicatedHardwareTaskCatalog,
+  useDedicatedHardwareInput,
+  useDedicatedHardwareTaskCatalogPublisher,
+  visibleDedicatedHardwareTaskOrder
+} from "./dedicated-hardware-app.js";
 import {
   prefetchWorktreeRemovalPreflight,
   summarizeWorktreeRemovalPreflights,
@@ -110,6 +125,22 @@ import {
 } from "./worktree-removal-preflight.js";
 
 const SessionPane = lazy(async () => ({ default: (await import("./components/SessionPane.js")).SessionPane }));
+
+type PendingDesktopDeepLinkDelivery =
+  | {
+    readonly kind: "route";
+    readonly delivery: JokoDesktopDeepLinkDelivery;
+    readonly navigation: Exclude<JokoDesktopDeepLinkNavigation, { readonly kind: "portable" }>;
+    readonly expectedHash: string;
+    readonly sourceNavigationRevision: number;
+    readonly rendererOccurrence: object;
+  }
+  | {
+    readonly kind: "portable";
+    readonly delivery: JokoDesktopDeepLinkDelivery;
+    readonly requestId: number;
+    readonly rendererOccurrence: object;
+  };
 const Inspector = lazy(async () => ({ default: (await import("./components/Inspector.js")).Inspector }));
 const SchedulesPage = lazy(async () => ({ default: (await import("./components/SchedulesPage.js")).SchedulesPage }));
 const ProjectsPage = lazy(async () => ({ default: (await import("./components/ProjectsPage.js")).ProjectsPage }));
@@ -118,15 +149,26 @@ const SettingsPage = lazy(async () => ({ default: (await import("./components/Se
 const StandaloneAboutPage = lazy(async () => ({ default: (await import("./components/SettingsPage.js")).StandaloneAboutPage }));
 const ToolsPage = lazy(async () => ({ default: (await import("./components/ToolsPage.js")).ToolsPage }));
 const EMPTY_TIMELINE: readonly TimelineItemView[] = [];
+const MAXIMUM_MESSAGE_DEEP_LINK_HISTORY_PAGES = 256;
+const JOKO_PRODUCT_FEEDBACK_URL = "https://github.com/JokoAgent/joko/issues/new";
+const JOKO_DOCUMENTATION_URL = "https://github.com/JokoAgent/joko";
 
 interface ActiveTimelineHistory {
   readonly sessionId: string;
   readonly generation: bigint;
+  readonly historyRevision: bigint;
   readonly items: readonly TimelineItemView[];
   readonly nextBeforeCursor?: TimelineHistoryCursorView;
   readonly initialized: boolean;
   readonly loading: boolean;
   readonly error?: string;
+}
+
+interface MessageDeepLinkHistorySearch {
+  readonly key: string;
+  readonly seenCursors: Set<string>;
+  pageRequests: number;
+  lastCursor?: TimelineHistoryCursorView;
 }
 
 interface NavigationDragState {
@@ -169,14 +211,18 @@ export function App(): JSX.Element {
 }
 
 function AppControllerRoot(): JSX.Element {
+  const runtimeProcessMonitor = typeof window !== "undefined" && isRuntimeProcessMonitorWindow(window.location);
+  if (runtimeProcessMonitor) return <RuntimeProcessMonitorWindow />;
+  return <ConnectedAppControllerRoot />;
+}
+
+function ConnectedAppControllerRoot(): JSX.Element {
   const controller = useAppController();
   const t = useCallback((key: Parameters<typeof translate>[1], values?: Parameters<typeof translate>[2]) => translate(controller.state.preferences.locale, key, values), [controller.state.preferences.locale]);
-  const runtimeProcessMonitor = typeof window !== "undefined" && isRuntimeProcessMonitorWindow(window.location);
-  if (runtimeProcessMonitor) return <><RuntimeProcessMonitorWindow controller={controller} t={t} /><DesktopWindowControls t={t} /></>;
   const applicationWindowOwner = typeof window !== "undefined"
     && !isSessionApplicationWindow(window.location)
     && !isExtensionApplicationWindow(window.location);
-  return <><StartupUpdateOverlay t={t} />{applicationWindowOwner && <DesktopGlobalVoiceBridge controller={controller} />}<AppWithController controller={controller} /><DesktopWindowControls t={t} /></>;
+  return <><RuntimeProcessMonitorBroker controller={controller} /><StartupUpdateOverlay t={t} />{applicationWindowOwner && <DesktopGlobalVoiceBridge controller={controller} />}<AppWithController controller={controller} /><DesktopWindowControls t={t} /></>;
 }
 
 /** Injectable application shell used by deterministic development harnesses. */
@@ -189,6 +235,10 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
   const sessionApplicationWindow = typeof window !== "undefined" && isSessionApplicationWindow(window.location);
   const extensionApplicationWindow = typeof window !== "undefined" && isExtensionApplicationWindow(window.location);
   const auxiliaryApplicationWindow = sessionApplicationWindow || extensionApplicationWindow;
+  const dedicatedHardwareBridge = typeof window !== "undefined"
+    && window.jokoDesktop?.capabilities.includes("hardware.dedicatedInput") === true
+    ? window.jokoDesktop.dedicatedHardware
+    : undefined;
   const bootSessionId = sessionApplicationWindow
     ? new URLSearchParams(window.location.search).get("bootSession") ?? undefined
     : undefined;
@@ -197,6 +247,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
   const [archiveRemoval, setArchiveRemoval] = useState<SessionRemovalDialogRequest>();
   const [deleteRemoval, setDeleteRemoval] = useState<SessionRemovalDialogRequest>();
   const [actionError, setActionError] = useState<string>();
+  const [retryableMessageDeepLinkKey, setRetryableMessageDeepLinkKey] = useState<string>();
   const [applicationMenuNotice, setApplicationMenuNotice] = useState<(DesktopUpdateCheckNotice & { readonly id: number })>();
   const [busyAction, setBusyAction] = useState<string>();
   const [layoutNotice, setLayoutNotice] = useState<string>();
@@ -209,6 +260,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
   const [bootConnectionProfileId, setBootConnectionProfileId] = useState<string>();
   const [portableExportSession, setPortableExportSession] = useState<SessionView>();
   const [portableImportRequest, setPortableImportRequest] = useState<PortableSessionImportRequest>();
+  const [pendingDesktopDeepLinkDelivery, setPendingDesktopDeepLinkDelivery] = useState<PendingDesktopDeepLinkDelivery>();
   const [portableWorktreeTargetIds, setPortableWorktreeTargetIds] = useState<ReadonlySet<string>>(() => new Set());
   const [sessionWindowNavigation, setSessionWindowNavigation] = useState(() => ({
     mode: "hidden" as NavigationMode,
@@ -231,7 +283,13 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
   const effectiveNavigationOpen = auxiliaryApplicationWindow
     ? sessionWindowNavigation.mode !== "hidden"
     : state.preferences.navigationOpen;
-  const [searchTimelineWindow, setSearchTimelineWindow] = useState<{ readonly sessionId: string; readonly items: readonly TimelineItemView[] }>();
+  const [searchTimelineWindow, setSearchTimelineWindow] = useState<{
+    readonly profileId: string | undefined;
+    readonly sessionId: string;
+    readonly generation: bigint;
+    readonly historyRevision: bigint;
+    readonly items: readonly TimelineItemView[];
+  }>();
   const [timelineHistory, setTimelineHistory] = useState<ActiveTimelineHistory>();
   const promptRecommendationOwnerRef = useRef<{ readonly initialized: boolean; readonly key?: string }>({ initialized: false });
   const promptRecommendationConnectionOwner = state.activeProfile === undefined ? undefined : JSON.stringify([state.activeProfile.serverId, state.activeProfile.id]);
@@ -272,7 +330,14 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
     promptRecommendationStore.reset();
     visionBridgeToastStore.reset();
   }, []);
-  const [timelineFocusRequest, setTimelineFocusRequest] = useState<{ readonly sessionId: string; readonly itemId: string; readonly requestId: number }>();
+  const [timelineFocusRequest, setTimelineFocusRequest] = useState<{
+    readonly profileId: string | undefined;
+    readonly sessionId: string;
+    readonly generation: bigint;
+    readonly historyRevision: bigint;
+    readonly itemId: string;
+    readonly requestId: number;
+  }>();
   const [inspectorSubagentFocusRequest, setInspectorSubagentFocusRequest] = useState(initialInspectorSubagentFocusRequest);
   const [inspectorTurnReviewFocusRequest, setInspectorTurnReviewFocusRequest] = useState<InspectorTurnReviewRequest>();
   const [inspectorGamepadRequest, setInspectorGamepadRequest] = useState<GamepadInspectorRequest>();
@@ -294,8 +359,11 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
   const messageJumpGenerationRef = useRef(0);
   const handledMessageDeepLinkRef = useRef<string | undefined>(undefined);
   const loadingMessageDeepLinkRef = useRef<string | undefined>(undefined);
+  const failedMessageDeepLinkRef = useRef<string | undefined>(undefined);
   const currentMessageDeepLinkRef = useRef<string | undefined>(undefined);
+  const messageDeepLinkHistorySearchRef = useRef<MessageDeepLinkHistorySearch | undefined>(undefined);
   const portableImportRequestIdRef = useRef(0);
+  const desktopDeepLinkRequestAbortRef = useRef<AbortController | undefined>(undefined);
   const removalRequestGenerationRef = useRef(0);
   const searchInputRef = useRef<HTMLInputElement>(null);
   const controllerRef = useRef(controller);
@@ -439,6 +507,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
   const sessionNotificationTrackerRef = useRef(new SessionNotificationTracker());
   const scheduleNotificationTrackerRef = useRef(new ScheduleNotificationTracker());
   const notificationOwnerId = state.activeProfile?.serverId;
+  const notificationProfileId = state.activeProfile?.id;
   const attentionBadgeProjectionRef = useRef<ReadonlyMap<string, SessionAttentionBadgeKey>>(new Map());
   const attentionBadgeSyncRef = useRef<Promise<void>>(Promise.resolve());
   useEffect(() => {
@@ -505,20 +574,27 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
       windowFocused: document.hasFocus()
     }) || desktop === undefined) return;
     for (const notification of notifications) {
-      const title = notification.title.trim() || t("session.unnamed");
+      const title = projectDesktopNotificationTitle(notification.title, t("session.unnamed"));
       const body = notification.kind === "done"
         ? t("desktop.sessionNotification.done")
         : notification.kind === "awaiting"
           ? t("desktop.sessionNotification.awaiting")
           : t("desktop.sessionNotification.error");
       void desktop.notify({
-        title: `${t("app.name")} · ${title}`,
+        title,
         body,
-        ...(notification.sessionId === undefined ? {} : { sessionId: notification.sessionId })
+        ...(notification.sessionId === undefined || notificationProfileId === undefined ? {} : {
+          navigation: {
+            kind: "session" as const,
+            profileId: notificationProfileId,
+            sessionId: notification.sessionId
+          }
+        })
       }).catch(() => undefined);
     }
   }, [
     notificationOwnerId,
+    notificationProfileId,
     state.connectionState,
     state.preferences.sessionNotificationsEnabled,
     state.snapshot.revision,
@@ -527,12 +603,6 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
     auxiliaryApplicationWindow,
     t
   ]);
-  useEffect(() => {
-    const unsubscribe = window.jokoDesktop?.notifications?.onFocusSession((sessionId) => {
-      controllerRef.current.navigate({ kind: "session", sessionId });
-    });
-    return unsubscribe;
-  }, []);
   const applicationMenuTargetRef = useRef<DesktopApplicationMenuActionTarget | undefined>(undefined);
   const applicationMenuCommandQueue = useMemo(() => {
     const target = (): DesktopApplicationMenuActionTarget => {
@@ -606,42 +676,113 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
       setActionError(messageOf(error, t("portable.importFailed")));
     }
   }, [openPortableSessionImportFile, portableImportTargets.length, t]);
+  const desktopDeepLinkDeliveryOrderRef = useRef(new DesktopDeepLinkDeliveryOrder());
+  const desktopDeepLinkRendererOccurrenceRef = useRef<object | undefined>(undefined);
   useEffect(() => {
     if (auxiliaryApplicationWindow) return;
     const api = window.jokoDesktop?.deepLinks;
     if (api === undefined) return;
     let active = true;
-    const navigate = (navigation: JokoDesktopDeepLinkNavigation): void => {
-      if (!active) return;
+    const navigate = (
+      delivery: JokoDesktopDeepLinkDelivery,
+      navigation: JokoDesktopDeepLinkNavigation,
+      rendererOccurrence: object,
+      signal: AbortSignal
+    ): void => {
       if (navigation.kind === "portable") {
         setActionError(undefined);
+        const requestId = ++portableImportRequestIdRef.current;
+        setPendingDesktopDeepLinkDelivery({ kind: "portable", delivery, requestId, rendererOccurrence });
         setPortableImportRequest({
-          id: ++portableImportRequestIdRef.current,
+          id: requestId,
           ...(navigation.file === undefined ? {} : { file: browserFileFromDesktopFile(navigation.file) })
         });
         return;
       }
-      window.location.hash = desktopDeepLinkRouteHash(navigation);
+      setPortableImportRequest(undefined);
+      const expectedHash = desktopDeepLinkRouteHash(navigation);
+      const route = desktopDeepLinkAppRoute(navigation);
+      const sourceNavigationRevision = controllerRef.current.state.navigationRevision ?? 0;
+      setPendingDesktopDeepLinkDelivery({
+        kind: "route",
+        delivery,
+        navigation,
+        expectedHash,
+        sourceNavigationRevision,
+        rendererOccurrence
+      });
+      controllerRef.current.navigate(route, {
+        exactHash: expectedHash,
+        signal,
+        isCurrent: () => active
+          && desktopDeepLinkRendererOccurrenceRef.current === rendererOccurrence
+          && (controllerRef.current.state.navigationRevision ?? 0) === sourceNavigationRevision
+      });
     };
-    const unsubscribe = api.onNavigate(navigate);
-    void api.takePending().then((navigation) => {
-      if (navigation !== undefined) navigate(navigation);
+    const deliver = (delivery: JokoDesktopDeepLinkDelivery): void => {
+      if (!active) return;
+      const navigation = desktopDeepLinkDeliveryOrderRef.current.accept(delivery);
+      if (navigation === undefined) return;
+      desktopDeepLinkRequestAbortRef.current?.abort();
+      const requestAbort = new AbortController();
+      desktopDeepLinkRequestAbortRef.current = requestAbort;
+      const rendererOccurrence = Object.freeze({});
+      desktopDeepLinkRendererOccurrenceRef.current = rendererOccurrence;
+      navigate(delivery, navigation, rendererOccurrence, requestAbort.signal);
+    };
+    const unsubscribe = api.onNavigate(deliver);
+    void api.takePending().then((delivery) => {
+      if (delivery !== undefined) deliver(delivery);
     }).catch(() => undefined);
     return () => {
       active = false;
+      desktopDeepLinkRequestAbortRef.current?.abort();
+      desktopDeepLinkRequestAbortRef.current = undefined;
+      desktopDeepLinkRendererOccurrenceRef.current = undefined;
       unsubscribe();
     };
   }, [auxiliaryApplicationWindow]);
+  useEffect(() => {
+    const pending = pendingDesktopDeepLinkDelivery;
+    if (pending === undefined) return;
+    if (desktopDeepLinkRendererOccurrenceRef.current !== pending.rendererOccurrence) return;
+    if (pending.kind === "portable") {
+      if (portableImportRequest?.id !== pending.requestId) return;
+    } else {
+      if ((state.navigationRevision ?? 0) <= pending.sourceNavigationRevision
+        || window.location.hash !== pending.expectedHash
+        || !desktopDeepLinkNavigationMatchesRoute(pending.navigation, state.route)) return;
+    }
+    const api = window.jokoDesktop?.deepLinks;
+    if (api === undefined) return;
+    setPendingDesktopDeepLinkDelivery((current) => current?.delivery.documentOccurrence === pending.delivery.documentOccurrence
+      && current.delivery.deliveryOccurrence === pending.delivery.deliveryOccurrence
+      ? undefined
+      : current);
+    void api.acknowledge({
+      documentOccurrence: pending.delivery.documentOccurrence,
+      deliveryOccurrence: pending.delivery.deliveryOccurrence
+    }).catch(() => false);
+  }, [pendingDesktopDeepLinkDelivery, portableImportRequest?.id, state.navigationRevision, state.route]);
 
   const describeSubmissionError = useCallback((error: unknown) => messageOf(error, t("error.unexpected")), [t]);
   const submitNewSession = useNewSessionSubmission(controller, setActionError, setBusyAction, describeSubmissionError);
 
   const activeSession = useMemo(() => {
     if (state.route.kind !== "session" && state.route.kind !== "files") return undefined;
+    if (state.connectionState === "connecting") return undefined;
+    if (state.route.kind === "session" && state.route.profileId !== undefined
+      && state.route.profileId !== state.activeProfile?.id) return undefined;
     const sessionId = state.route.sessionId;
     if (sessionId !== undefined) return state.snapshot.sessions.find((session) => session.id === sessionId);
     return [...state.snapshot.sessions].filter((session) => !session.archived).sort((a, b) => Number(b.pinned) - Number(a.pinned) || b.updatedAt - a.updatedAt)[0];
-  }, [state.route, state.snapshot.sessions]);
+  }, [state.activeProfile?.id, state.connectionState, state.route, state.snapshot.sessions]);
+  const explicitSessionOwnerPending = state.route.kind === "session"
+    && state.route.sessionId !== undefined
+    && state.route.profileId !== undefined
+    && state.error === undefined
+    && (state.route.profileId !== state.activeProfile?.id
+      || state.connectionState !== "connected");
   const lastRuntimeSessionIdRef = useRef<string | undefined>(activeSession?.id);
   if (activeSession !== undefined) lastRuntimeSessionIdRef.current = activeSession.id;
   else if (lastRuntimeSessionIdRef.current !== undefined
@@ -650,7 +791,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
   }
   const nativeTaskStatusVisibleSessionIds = useMemo(() => {
     if (state.route.kind !== "session" && state.route.kind !== "files") return [];
-    if (state.route.kind === "session" && sessionSplitLayout.root !== undefined) {
+    if (state.route.kind === "session" && sessionSplitLayout.root !== undefined && activeSession?.archived !== true) {
       return Object.freeze(sessionSplitPanes(sessionSplitLayout.root).map((pane) => pane.sessionId));
     }
     return Object.freeze(activeSession === undefined ? [] : [activeSession.id]);
@@ -659,6 +800,41 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
     const sessions = applySessionProjectOverrides(state.snapshot.sessions, sessionProjectOverrides);
     return sessions === state.snapshot.sessions ? state.snapshot : { ...state.snapshot, sessions };
   }, [sessionProjectOverrides, state.snapshot]);
+  const [dedicatedHardwareSidebarOrder, setDedicatedHardwareSidebarOrder] = useState<readonly string[]>([]);
+  useLayoutEffect(() => {
+    const next = auxiliaryApplicationWindow ? [] : visibleDedicatedHardwareTaskOrder(document);
+    setDedicatedHardwareSidebarOrder((current) => current.length === next.length
+      && current.every((id, index) => id === next[index]) ? current : next);
+  });
+  const dedicatedHardwareTaskCatalog = useMemo<DedicatedHardwareTaskCatalog | undefined>(() => {
+    const profile = state.activeProfile;
+    if (dedicatedHardwareBridge === undefined || auxiliaryApplicationWindow || profile === undefined) return undefined;
+    try {
+      return createDedicatedHardwareTaskCatalog({
+        profileId: profile.id,
+        serverId: profile.serverId,
+        connectionGeneration: state.snapshot.generation,
+        snapshotRevision: state.snapshot.revision,
+        sessions: state.ready && state.connectionState === "connected" ? state.snapshot.sessions : [],
+        sidebarSessionIds: dedicatedHardwareSidebarOrder,
+        ...(activeSession === undefined ? {} : { viewedSessionId: activeSession.id })
+      });
+    } catch {
+      return undefined;
+    }
+  }, [
+    activeSession?.id,
+    auxiliaryApplicationWindow,
+    dedicatedHardwareBridge,
+    dedicatedHardwareSidebarOrder,
+    state.activeProfile,
+    state.connectionState,
+    state.ready,
+    state.snapshot.generation,
+    state.snapshot.revision,
+    state.snapshot.sessions
+  ]);
+  useDedicatedHardwareTaskCatalogPublisher(dedicatedHardwareBridge, dedicatedHardwareTaskCatalog);
   useEffect(() => {
     setSessionProjectOverrides((current) => reconcileSessionProjectOverrides(current, state.snapshot.sessions));
   }, [state.snapshot.sessions]);
@@ -685,15 +861,16 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
   }, [auxiliaryApplicationWindow, splitOwnerId]);
   useEffect(() => {
     if (splitOwnerId === undefined || state.connectionState !== "connected" || state.snapshot.revision === 0n) return;
-    const existing = new Set(state.snapshot.sessions.filter((session) => !session.archived).map((session) => session.id));
-    const next = reconcileSessionSplit(sessionSplitLayout, existing);
+    const activeIds = new Set(state.snapshot.sessions.filter((session) => !session.archived).map((session) => session.id));
+    const knownIds = new Set(state.snapshot.sessions.map((session) => session.id));
+    const next = reconcileSessionSplit(sessionSplitLayout, activeIds);
     if (next !== sessionSplitLayout) commitSessionSplitLayout(next);
     const routeSessionId = state.route.kind === "session" ? state.route.sessionId : undefined;
-    const focusedExists = focusedSplitSessionId === undefined || existing.has(focusedSplitSessionId);
-    const routeExists = routeSessionId === undefined || existing.has(routeSessionId);
+    const focusedExists = focusedSplitSessionId === undefined || activeIds.has(focusedSplitSessionId);
+    const routeExists = routeSessionId === undefined || knownIds.has(routeSessionId);
     if (focusedExists && routeExists) return;
     const replacement = sessionSplitPanes(sessionSplitLayout.root)
-      .find((pane) => existing.has(pane.sessionId))?.sessionId;
+      .find((pane) => activeIds.has(pane.sessionId))?.sessionId;
     setFocusedSplitSessionId(replacement);
     if (!routeExists) controller.navigate(replacement === undefined
       ? { kind: "session" }
@@ -712,6 +889,10 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
   const lastSplitRouteSessionIdRef = useRef<string | undefined>(undefined);
   useEffect(() => {
     if (state.route.kind !== "session" || activeSession === undefined) {
+      lastSplitRouteSessionIdRef.current = undefined;
+      return;
+    }
+    if (activeSession.archived) {
       lastSplitRouteSessionIdRef.current = undefined;
       return;
     }
@@ -854,15 +1035,18 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
   const requestTimelineHistoryPage = useCallback(async (
     sessionId: string,
     generation: bigint,
+    historyRevision: bigint,
     beforeCursor: TimelineHistoryCursorView | undefined,
     reset: boolean
   ): Promise<void> => {
     const requestId = ++timelineHistoryRequestIdRef.current;
     setTimelineHistory((current) => reset || current?.sessionId !== sessionId || current.generation !== generation
-      ? { sessionId, generation, items: [], initialized: false, loading: true }
+      || current.historyRevision !== historyRevision
+      ? { sessionId, generation, historyRevision, items: [], initialized: false, loading: true }
       : {
           sessionId,
           generation,
+          historyRevision,
           items: current.items,
           ...(current.nextBeforeCursor === undefined ? {} : { nextBeforeCursor: current.nextBeforeCursor }),
           initialized: current.initialized,
@@ -872,10 +1056,12 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
       const page = await controllerRef.current.loadSessionTimelinePage(sessionId, beforeCursor, 240);
       if (timelineHistoryRequestIdRef.current !== requestId) return;
       setTimelineHistory((current) => {
-        if (current?.sessionId !== sessionId || current.generation !== generation) return current;
+        if (current?.sessionId !== sessionId || current.generation !== generation
+          || current.historyRevision !== historyRevision) return current;
         return {
           sessionId,
           generation,
+          historyRevision,
           items: reset ? page.items : mergeTimelineWindows(current.items, page.items),
           ...(page.nextBeforeCursor === undefined ? {} : { nextBeforeCursor: page.nextBeforeCursor }),
           initialized: true,
@@ -885,6 +1071,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
     } catch (error) {
       if (timelineHistoryRequestIdRef.current !== requestId) return;
       setTimelineHistory((current) => current?.sessionId !== sessionId || current.generation !== generation
+        || current.historyRevision !== historyRevision
         ? current
         : { ...current, loading: false, error: messageOf(error, "Unable to load task history.") });
     }
@@ -897,11 +1084,13 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
       return;
     }
     if (state.connectionState !== "connected") return;
-    void requestTimelineHistoryPage(activeSession.id, state.snapshot.generation, undefined, true);
+    void requestTimelineHistoryPage(activeSession.id, state.snapshot.generation, activeTimelineHistoryRevision, undefined, true);
   }, [activeSession?.id, activeTimelineHistoryRevision, requestTimelineHistoryPage, state.connectionState, state.snapshot.generation]);
 
   const recentActiveTimeline = activeSession === undefined ? EMPTY_TIMELINE : state.snapshot.timelineBySession.get(activeSession.id) ?? EMPTY_TIMELINE;
-  const activeHistory = activeSession !== undefined && timelineHistory?.sessionId === activeSession.id && timelineHistory.generation === state.snapshot.generation
+  const activeHistory = activeSession !== undefined && timelineHistory?.sessionId === activeSession.id
+    && timelineHistory.generation === state.snapshot.generation
+    && timelineHistory.historyRevision === activeTimelineHistoryRevision
     ? timelineHistory
     : undefined;
   const activeHistoryItems = activeHistory?.items;
@@ -912,10 +1101,15 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
     [activeHistoryItems, recentActiveTimeline]
   );
   const activeTimeline = useMemo(
-    () => activeSession === undefined || searchTimelineWindow?.sessionId !== activeSession.id
+    () => activeSession === undefined
+      || searchTimelineWindow === undefined
+      || searchTimelineWindow.profileId !== state.activeProfile?.id
+      || searchTimelineWindow.sessionId !== activeSession.id
+      || searchTimelineWindow.generation !== state.snapshot.generation
+      || searchTimelineWindow.historyRevision !== activeTimelineHistoryRevision
       ? recentAndHistoricalTimeline
       : mergeTimelineWindows(recentAndHistoricalTimeline, searchTimelineWindow.items),
-    [activeSession, recentAndHistoricalTimeline, searchTimelineWindow]
+    [activeSession, activeTimelineHistoryRevision, recentAndHistoricalTimeline, searchTimelineWindow, state.activeProfile?.id, state.snapshot.generation]
   );
   const loadEarlierTimeline = useCallback(async (): Promise<void> => {
     if (activeSession === undefined || activeHistory?.loading === true) return;
@@ -923,10 +1117,11 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
     await requestTimelineHistoryPage(
       activeSession.id,
       state.snapshot.generation,
+      activeTimelineHistoryRevision,
       activeHistory?.nextBeforeCursor,
       activeHistory?.initialized !== true
     );
-  }, [activeHistory, activeSession, requestTimelineHistoryPage, state.snapshot.generation]);
+  }, [activeHistory, activeSession, activeTimelineHistoryRevision, requestTimelineHistoryPage, state.snapshot.generation]);
 
   useEffect(() => {
     const messageId = state.route.kind === "session" ? state.route.messageId : undefined;
@@ -936,26 +1131,47 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
       currentMessageDeepLinkRef.current = undefined;
       handledMessageDeepLinkRef.current = undefined;
       loadingMessageDeepLinkRef.current = undefined;
+      failedMessageDeepLinkRef.current = undefined;
+      messageDeepLinkHistorySearchRef.current = undefined;
+      setRetryableMessageDeepLinkKey(undefined);
       return;
     }
-    const deepLinkKey = `${activeSession.id}\u0000${messageEventId ?? ""}\u0000${messageId}\u0000${state.snapshot.generation}\u0000${state.navigationRevision ?? 0}`;
+    const deepLinkKey = `${state.activeProfile?.id ?? ""}\u0000${activeSession.id}\u0000${messageEventId ?? ""}\u0000${messageId}\u0000${state.snapshot.generation}\u0000${activeTimelineHistoryRevision}\u0000${state.navigationRevision ?? 0}`;
     if (currentMessageDeepLinkRef.current !== deepLinkKey) {
       messageJumpGenerationRef.current += 1;
       currentMessageDeepLinkRef.current = deepLinkKey;
       handledMessageDeepLinkRef.current = undefined;
       loadingMessageDeepLinkRef.current = undefined;
+      failedMessageDeepLinkRef.current = undefined;
+      setRetryableMessageDeepLinkKey(undefined);
+      messageDeepLinkHistorySearchRef.current = {
+        key: deepLinkKey,
+        seenCursors: new Set(),
+        pageRequests: 0
+      };
     }
     if (activeTimeline.some((item) => item.id === messageId)) {
       if (handledMessageDeepLinkRef.current === deepLinkKey) return;
       handledMessageDeepLinkRef.current = deepLinkKey;
+      messageDeepLinkHistorySearchRef.current = undefined;
+      setRetryableMessageDeepLinkKey(undefined);
       setActionError(undefined);
       setTimelineFocusRequest({
+        profileId: state.activeProfile?.id,
         sessionId: activeSession.id,
+        generation: state.snapshot.generation,
+        historyRevision: activeTimelineHistoryRevision,
         itemId: messageId,
         requestId: ++timelineFocusRequestIdRef.current
       });
       return;
     }
+    if (failedMessageDeepLinkRef.current === deepLinkKey) return;
+    const failMessageLink = (retryable = false): void => {
+      failedMessageDeepLinkRef.current = deepLinkKey;
+      setRetryableMessageDeepLinkKey(retryable ? deepLinkKey : undefined);
+      setActionError(t(retryable ? "nav.messageSearchFailed" : "nav.messageJumpUnavailable"));
+    };
     if (state.connectionState !== "connected") return;
     if (messageEventId !== undefined) {
       if (loadingMessageDeepLinkRef.current === deepLinkKey || handledMessageDeepLinkRef.current === deepLinkKey) return;
@@ -967,14 +1183,24 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
         if (messageJumpGenerationRef.current !== jumpGeneration || currentMessageDeepLinkRef.current !== deepLinkKey) return;
         if (!items.some((item) => item.id === messageId)) throw new Error(t("nav.messageJumpUnavailable"));
         handledMessageDeepLinkRef.current = deepLinkKey;
-        setSearchTimelineWindow({ sessionId: activeSession.id, items });
-        setTimelineFocusRequest({
+        setSearchTimelineWindow({
+          profileId: state.activeProfile?.id,
           sessionId: activeSession.id,
+          generation: state.snapshot.generation,
+          historyRevision: activeTimelineHistoryRevision,
+          items
+        });
+        setTimelineFocusRequest({
+          profileId: state.activeProfile?.id,
+          sessionId: activeSession.id,
+          generation: state.snapshot.generation,
+          historyRevision: activeTimelineHistoryRevision,
           itemId: messageId,
           requestId: ++timelineFocusRequestIdRef.current
         });
       }).catch((error: unknown) => {
         if (messageJumpGenerationRef.current === jumpGeneration && currentMessageDeepLinkRef.current === deepLinkKey) {
+          failedMessageDeepLinkRef.current = deepLinkKey;
           setActionError(messageOf(error, t("nav.messageJumpUnavailable")));
         }
       }).finally(() => {
@@ -983,13 +1209,24 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
       });
       return;
     }
-    if (
-      activeHistory?.initialized !== true
-      || activeHistory.loading
-      || activeHistory.nextBeforeCursor === undefined
-    ) return;
-    void requestTimelineHistoryPage(activeSession.id, state.snapshot.generation, activeHistory.nextBeforeCursor, false);
-  }, [activeHistory, activeSession, activeTimeline, requestTimelineHistoryPage, state.connectionState, state.navigationRevision, state.route, state.snapshot.generation, t]);
+    if (activeHistory?.error !== undefined) {
+      failMessageLink(true);
+      return;
+    }
+    if (activeHistory?.initialized !== true || activeHistory.loading) return;
+    if (activeHistory.nextBeforeCursor === undefined) {
+      failMessageLink();
+      return;
+    }
+    const search = messageDeepLinkHistorySearchRef.current;
+    const nextCursor = activeHistory.nextBeforeCursor;
+    if (search === undefined || search.key !== deepLinkKey
+      || !reserveMessageDeepLinkHistoryPage(search, nextCursor)) {
+      failMessageLink();
+      return;
+    }
+    void requestTimelineHistoryPage(activeSession.id, state.snapshot.generation, activeTimelineHistoryRevision, activeHistory.nextBeforeCursor, false);
+  }, [activeHistory, activeSession, activeTimeline, activeTimelineHistoryRevision, requestTimelineHistoryPage, state.activeProfile?.id, state.connectionState, state.navigationRevision, state.route, state.snapshot.generation, t]);
   const activeExtensionWidgets = activeSession === undefined ? [] : state.snapshot.extensionWidgetsBySession.get(activeSession.id) ?? [];
   const activeExtensionStatuses = activeSession === undefined ? [] : state.snapshot.extensionStatusesBySession.get(activeSession.id) ?? [];
   const interactions = useMemo(() => [...state.snapshot.interactions].sort((a, b) =>
@@ -1077,12 +1314,16 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
     navigateFromShortcut({ kind: "newSession" });
     return true;
   });
-  useGamepadInput(`${state.activeProfile?.id ?? ""}:${state.connectionState}:${appRouteHash(state.route)}:${focusedSplitSessionId ?? activeSession?.id ?? ""}:${activeSession?.generation ?? ""}`, (action) => {
+  const dispatchApplicationInputCommand = (action: DedicatedHardwareCommand): void => {
     if (!state.ready || document.body.classList.contains("modal-open")) return;
+    if (action === "previous-panel" || action === "next-panel") {
+      window.dispatchEvent(new CustomEvent(GAMEPAD_PANEL_EVENT, { detail: action === "previous-panel" ? -1 : 1 }));
+      return;
+    }
     if (isGamepadInspectorAction(action)) {
       if (state.connectionState !== "connected" || state.route.kind !== "session" || state.activeProfile === undefined) return;
       const root = currentGamepadTaskRoot(document);
-      const sessionId = root?.dataset.gamepadSessionId;
+      const sessionId = root?.dataset.inputSessionId;
       const owner = state.snapshot.sessions.find((candidate) => candidate.id === sessionId);
       if (owner === undefined || owner.archived || reviewRunForReviewerSession(state.snapshot.reviewRuns, owner.id) !== undefined) return;
       const request: GamepadInspectorRequest = {
@@ -1146,6 +1387,10 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
       runAction("gamepad-fullscreen", () => toggleGamepadFullscreen(document, window.jokoDesktop, t("settings.gamepad.fullscreenUnavailable")));
       return;
     }
+    if (action === "feedback") {
+      runAction("gamepad-feedback", () => controller.openHttpLink(JOKO_PRODUCT_FEEDBACK_URL, { forceExternal: true }));
+      return;
+    }
     if (action === "toggle-sidebar") { setWindowNavigationOpen(!effectiveNavigationOpen); return; }
     if (action === "toggle-inspector") {
       if (state.route.kind === "session" && activeSession !== undefined && activeReviewerRun === undefined) runAction("gamepad-inspector", () => controller.setInspectorOpen(!inspectorOpen));
@@ -1161,6 +1406,74 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
     const index = selected === undefined ? -1 : ids.indexOf(selected);
     const sessionId = ids[index === -1 ? 0 : (index + (action === "previous-task" ? -1 : 1) + ids.length) % ids.length];
     if (sessionId !== undefined && sessionId !== selected) navigateFromShortcut({ kind: "session", sessionId });
+  };
+  useGamepadInput(`${state.activeProfile?.id ?? ""}:${state.connectionState}:${appRouteHash(state.route)}:${focusedSplitSessionId ?? activeSession?.id ?? ""}:${activeSession?.generation ?? ""}`, (action) => {
+    if (action !== "none" && action !== "voice") dispatchApplicationInputCommand(action);
+  });
+  useDedicatedHardwareInput(dedicatedHardwareBridge, {
+    command: (action) => {
+      dispatchApplicationInputCommand(action);
+      return true;
+    },
+    task: ({ task, focusRequestId }) => {
+      if (auxiliaryApplicationWindow || document.body.classList.contains("modal-open")) return false;
+      if (task.focusWindow && focusRequestId === null) return false;
+      const source = controllerRef.current.state;
+      const profile = source.activeProfile;
+      const session = source.snapshot.sessions.find((candidate) => candidate.id === task.sessionId);
+      if (!source.ready || source.connectionState !== "connected" || profile?.id !== task.profileId
+        || profile.serverId !== task.serverId
+        || source.snapshot.generation.toString(10) !== task.connectionGeneration
+        || source.snapshot.revision.toString(10) !== task.snapshotRevision
+        || session === undefined || session.archived
+        || session.generation.toString(10) !== task.sessionGeneration || session.targetId !== task.targetId) return false;
+      const owner = {
+        profileId: task.profileId,
+        serverId: profile.serverId,
+        connectionGeneration: source.snapshot.generation,
+        snapshotRevision: source.snapshot.revision,
+        sessionGeneration: session.generation,
+        targetId: session.targetId,
+        navigationRevision: source.navigationRevision ?? 0,
+        ownerDocument: document
+      };
+      const ownsTaskFence = (): boolean => {
+        const current = controllerRef.current.state;
+        const currentSession = current.snapshot.sessions.find((candidate) => candidate.id === task.sessionId);
+        const ownerWindow = owner.ownerDocument.defaultView;
+        return ownerWindow !== null && !ownerWindow.closed
+          && ownerWindow.top === ownerWindow
+          && !owner.ownerDocument.body.classList.contains("modal-open")
+          && owner.ownerDocument.body.dataset.appShortcutRecording !== "1"
+          && owner.ownerDocument.querySelector("[data-gamepad-preview], [data-dedicated-hardware-preview]") === null
+          && owner.ownerDocument.querySelector("[aria-modal='true'], [role='dialog'], [role='listbox'], [role='menu'], [role='combobox'][aria-expanded='true'], [data-morph-side]:not([inert])") === null
+          && !isStartupUpdateInteractionBlocked()
+          && current.ready && current.connectionState === "connected"
+          && current.activeProfile?.id === owner.profileId && current.activeProfile.serverId === owner.serverId
+          && current.snapshot.generation === owner.connectionGeneration
+          && current.snapshot.revision === owner.snapshotRevision
+          && currentSession?.generation === owner.sessionGeneration && currentSession.targetId === owner.targetId
+          && !currentSession.archived;
+      };
+      const ownsNavigation = (): boolean => ownsTaskFence()
+        && (controllerRef.current.state.navigationRevision ?? 0) === owner.navigationRevision;
+      void navigateFromApplicationMenu({ kind: "session", sessionId: task.sessionId }, ownsNavigation)
+        .then((navigated) => {
+          if (!navigated || !task.focusWindow || focusRequestId === null || !ownsTaskFence()) return;
+          void dedicatedHardwareBridge?.acknowledgeDedicatedHardwareTaskFocus({
+            version: 1,
+            focusRequestId,
+            task
+          }).catch(() => undefined);
+        })
+        .catch((error: unknown) => setActionError(messageOf(error, t("error.unexpected"))));
+      return true;
+    },
+    fixedLink: (linkId) => {
+      const url = linkId === "product-feedback" ? JOKO_PRODUCT_FEEDBACK_URL : JOKO_DOCUMENTATION_URL;
+      runAction(`dedicated-hardware-link:${linkId}`, () => controller.openHttpLink(url, { forceExternal: true }));
+      return true;
+    }
   });
   useAppShortcut("toggle-sidebar", shortcutOverrides, (event) => {
     if (shortcutBlocked(event)) return false;
@@ -1216,6 +1529,42 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
       </div>
     </div>
   );
+  const retryMessageDeepLink = retryableMessageDeepLinkKey !== undefined
+    && retryableMessageDeepLinkKey === currentMessageDeepLinkRef.current
+    && activeSession !== undefined
+    && state.route.kind === "session"
+    && state.route.messageId !== undefined
+    && state.route.messageEventId === undefined
+    ? (): void => {
+        failedMessageDeepLinkRef.current = undefined;
+        setRetryableMessageDeepLinkKey(undefined);
+        setActionError(undefined);
+        messageDeepLinkHistorySearchRef.current = {
+          key: retryableMessageDeepLinkKey,
+          seenCursors: new Set(),
+          pageRequests: 0
+        };
+        void requestTimelineHistoryPage(
+          activeSession.id,
+          state.snapshot.generation,
+          activeTimelineHistoryRevision,
+          undefined,
+          true
+        );
+      }
+    : undefined;
+  const actionErrorFeedback = actionError === undefined ? null : (
+    <ErrorBanner
+      message={actionError}
+      retryLabel={t("common.retry")}
+      dismissLabel={t("common.dismiss")}
+      onRetry={retryMessageDeepLink}
+      onClose={() => {
+        setRetryableMessageDeepLinkKey(undefined);
+        setActionError(undefined);
+      }}
+    />
+  );
   const aboutRequested = typeof window !== "undefined" && /^#\/settings\/about(?:[/?#]|$)/u.test(window.location.hash);
   const standaloneAboutRequested = aboutRequested && (
     !state.ready
@@ -1227,6 +1576,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
 
   if (standaloneAboutRequested) return <>
     {applicationMenuFeedback}
+    {actionErrorFeedback !== null && <div className="app-banners">{actionErrorFeedback}</div>}
     <AppErrorBoundary
       scope="route"
       resetKey={routeErrorBoundaryKey("settings")}
@@ -1236,10 +1586,10 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
       <Suspense fallback={<RouteLoading label={t("common.loading")} />}><StandaloneAboutPage snapshot={state.snapshot} t={t} /></Suspense>
     </AppErrorBoundary>
   </>;
-  if (!state.ready) return <>{applicationMenuFeedback}<LoadingScreen label={t("common.loading")} body={t("app.openingState")} /></>;
-  if (state.activeProfile === undefined || state.connectionState === "disconnected") return <>{applicationMenuFeedback}<ConnectionScreen controller={controller} t={t} /></>;
-  if (state.connectionState === "connecting" && state.snapshot.revision === 0n) return <>{applicationMenuFeedback}<ConnectingScreen controller={controller} t={t} /></>;
-  if (state.snapshot.revision === 0n && state.connectionState !== "connected") return <>{applicationMenuFeedback}<UnavailableScreen controller={controller} t={t} error={state.error} /></>;
+  if (!state.ready) return <>{applicationMenuFeedback}{actionErrorFeedback !== null && <div className="app-banners">{actionErrorFeedback}</div>}<LoadingScreen label={t("common.loading")} body={t("app.openingState")} /></>;
+  if (state.activeProfile === undefined || state.connectionState === "disconnected") return <>{applicationMenuFeedback}{actionErrorFeedback !== null && <div className="app-banners">{actionErrorFeedback}</div>}<ConnectionScreen controller={controller} t={t} /></>;
+  if (state.connectionState === "connecting" && state.snapshot.revision === 0n) return <>{applicationMenuFeedback}{actionErrorFeedback !== null && <div className="app-banners">{actionErrorFeedback}</div>}<ConnectingScreen controller={controller} t={t} /></>;
+  if (state.snapshot.revision === 0n && state.connectionState !== "connected") return <>{applicationMenuFeedback}{actionErrorFeedback !== null && <div className="app-banners">{actionErrorFeedback}</div>}<UnavailableScreen controller={controller} t={t} error={state.error} /></>;
 
   const preferredNavigation = auxiliaryApplicationWindow ? sessionWindowNavigation : {
     mode: state.preferences.navigationMode,
@@ -1253,6 +1603,17 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
   const creatingNewSession = state.route.kind === "newSession";
   const inspectorOpen = state.preferences.inspectorOpen && state.route.kind === "session" && activeSession !== undefined && activeReviewerRun === undefined;
   const inspectorAttached = inspectorOpen && !inspectorDetached;
+  const openInspector = (): void => {
+    if (!inspectorDetached) {
+      void controller.setInspectorOpen(true);
+      return;
+    }
+    runAction("inspector-activate", async () => {
+      if (!await activateDetachedInspectorWindow(window.jokoDesktop)) {
+        throw new Error(t("inspector.detachUnavailable"));
+      }
+    });
+  };
   const closeNavigation = (): void => { if (window.matchMedia("(max-width: 980px)").matches) setWindowNavigationOpen(false); };
   const setNavigationMode = (mode: NavigationMode): void => {
     setWindowNavigationLayout({ mode, width: preferredNavigation.width });
@@ -1347,7 +1708,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
       {state.connectionState === "offline" && <div className="offline-banner" role="status"><AlertTriangle aria-hidden="true" /><span>{t("error.offline")}</span><Button tone="ghost" onClick={() => runAction("refresh", controller.refresh)}><RefreshCcw aria-hidden="true" />{t("common.refresh")}</Button></div>}
       {state.snapshot.server.health === "degraded" && <div className="degraded-banner" role="status"><ServerCrash aria-hidden="true" /><span>{t("app.degraded")}</span></div>}
       {state.error !== undefined && <ErrorBanner message={state.error} retryLabel={t("common.retry")} onRetry={() => runAction("refresh", controller.refresh)} />}
-      {actionError !== undefined && <ErrorBanner message={actionError} dismissLabel={t("common.dismiss")} onClose={() => setActionError(undefined)} />}
+      {actionErrorFeedback}
       {backgroundInteraction !== undefined && <div className="pending-interaction-banner" role="status"><Bell aria-hidden="true" /><span>{t("interaction.pendingElsewhere")}</span><Button tone="ghost" onClick={() => controller.navigate({ kind: "session", sessionId: backgroundInteraction.sessionId })}>{t("interaction.openTask")}</Button></div>}
       {busyAction !== undefined && <div className="action-progress" role="status"><Spinner label={t("common.working")} /><span>{t("app.applyingChange")}</span></div>}
     </div>
@@ -1367,7 +1728,13 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
       timelineHistoryLoading={activeHistory?.loading ?? state.connectionState === "connected"}
       timelineHistoryError={activeHistory?.error}
       onLoadEarlierTimeline={loadEarlierTimeline}
-      timelineFocusRequest={timelineFocusRequest?.sessionId === activeSession.id ? timelineFocusRequest : undefined}
+      timelineFocusRequest={timelineFocusRequest !== undefined
+        && timelineFocusRequest.profileId === state.activeProfile?.id
+        && timelineFocusRequest.sessionId === activeSession.id
+        && timelineFocusRequest.generation === state.snapshot.generation
+        && timelineFocusRequest.historyRevision === activeTimelineHistoryRevision
+        ? timelineFocusRequest
+        : undefined}
       extensionWidgets={activeExtensionWidgets}
       extensionStatuses={activeExtensionStatuses}
       queue={state.snapshot.queue}
@@ -1379,17 +1746,17 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
       interaction={activeInteractions[0]}
       remainingInteractions={Math.max(0, activeInteractions.length - 1)}
       navigationOpen={embeddedInFiles || navigationOpen}
-      inspectorOpen={embeddedInFiles ? false : inspectorOpen}
+      inspectorOpen={embeddedInFiles ? false : inspectorAttached}
       inspectorAvailable={!embeddedInFiles}
       selectionQuoteInsertion={fileSelectionQuoteInsertion?.sessionId === activeSession.id ? fileSelectionQuoteInsertion : undefined}
       attachmentInsertion={fileAttachmentInsertion?.sessionId === activeSession.id ? fileAttachmentInsertion : undefined}
       t={t}
       runAction={runAction}
       onOpenNavigation={() => { if (!embeddedInFiles) setWindowNavigationOpen(true); }}
-      onOpenInspector={() => { if (!embeddedInFiles && activeReviewerRun === undefined) void controller.setInspectorOpen(true); }}
+      onOpenInspector={() => { if (!embeddedInFiles && activeReviewerRun === undefined) openInspector(); }}
       onOpenSubagent={embeddedInFiles || activeReviewerRun !== undefined ? undefined : (runId) => {
         setInspectorSubagentFocusRequest({ sessionId: activeSession.id, runId, requestId: ++inspectorSubagentFocusRequestIdRef.current });
-        void controller.setInspectorOpen(true);
+        openInspector();
       }}
       onOpenTurnReview={embeddedInFiles || activeReviewerRun !== undefined ? undefined : (changeSetId, selectedPath) => {
         setInspectorTurnReviewFocusRequest(createInspectorTurnReviewRequest(
@@ -1398,7 +1765,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
           changeSetId,
           selectedPath
         ));
-        void controller.setInspectorOpen(true);
+        openInspector();
       }}
       onRename={() => setRenameSession(activeSession)}
       onPin={() => runAction(`pin:${activeSession.id}`, () => controller.pinSession(activeSession.id, !activeSession.pinned))}
@@ -1907,9 +2274,22 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
             onSubmit={submitNewSession}
           /> : <>
           {state.route.kind === "session" && (activeSession === undefined ? (
-            <EmptySessionPage navigationOpen={navigationOpen} t={t} onOpenNavigation={() => setWindowNavigationOpen(true)} onNewTask={() => controller.navigate({ kind: "newSession" })} />
+            explicitSessionOwnerPending || state.connectionState === "connecting"
+              ? <RouteLoading label={t("connection.connecting")} />
+              : <EmptySessionPage
+                  navigationOpen={navigationOpen}
+                  linkedSessionRecoveryBody={state.route.sessionId === undefined
+                    ? undefined
+                    : state.route.profileId === undefined
+                      ? t("nav.linkedTaskRecovery")
+                      : state.error ?? t("nav.linkedTaskUnavailable")}
+                  t={t}
+                  onOpenNavigation={() => setWindowNavigationOpen(true)}
+                  onOpenConnections={() => { window.location.hash = "#/settings/connections"; }}
+                  onNewTask={() => controller.navigate({ kind: "newSession" })}
+                />
           ) : <SessionSplitView
-            layout={sessionSplitLayout}
+            layout={activeSession.archived ? {} : sessionSplitLayout}
             currentSessionId={activeSession.id}
             focusedSessionId={focusedSplitSessionId ?? activeSession.id}
             sessions={state.snapshot.sessions}
@@ -2099,15 +2479,18 @@ function SplitSessionPaneHost({ controller, sessionId, navigationOpen, t, runAct
   const requestPage = useCallback(async (beforeCursor: TimelineHistoryCursorView | undefined, reset: boolean): Promise<void> => {
     const generation = snapshot.generation;
     setHistory((current) => reset || current?.sessionId !== sessionId || current.generation !== generation
-      ? { sessionId, generation, items: [], initialized: false, loading: true }
+      || current.historyRevision !== historyRevision
+      ? { sessionId, generation, historyRevision, items: [], initialized: false, loading: true }
       : { ...current, loading: true });
     try {
       const page = await controllerRef.current.loadSessionTimelinePage(sessionId, beforeCursor, 240);
       setHistory((current) => {
-        if (current?.sessionId !== sessionId || current.generation !== generation) return current;
+        if (current?.sessionId !== sessionId || current.generation !== generation
+          || current.historyRevision !== historyRevision) return current;
         return {
           sessionId,
           generation,
+          historyRevision,
           items: reset ? page.items : mergeTimelineWindows(current.items, page.items),
           ...(page.nextBeforeCursor === undefined ? {} : { nextBeforeCursor: page.nextBeforeCursor }),
           initialized: true,
@@ -2116,17 +2499,22 @@ function SplitSessionPaneHost({ controller, sessionId, navigationOpen, t, runAct
       });
     } catch (error) {
       setHistory((current) => current?.sessionId !== sessionId || current.generation !== generation
+        || current.historyRevision !== historyRevision
         ? current
         : { ...current, loading: false, error: messageOf(error, t("error.unexpected")) });
     }
-  }, [sessionId, snapshot.generation, t]);
+  }, [historyRevision, sessionId, snapshot.generation, t]);
   useEffect(() => {
     if (session === undefined || connectionState !== "connected") return;
     void requestPage(undefined, true);
   }, [connectionState, historyRevision, requestPage, session?.id]);
   if (session === undefined) return null;
   const recent = snapshot.timelineBySession.get(sessionId) ?? EMPTY_TIMELINE;
-  const currentHistory = history?.sessionId === sessionId && history.generation === snapshot.generation ? history : undefined;
+  const currentHistory = history?.sessionId === sessionId
+    && history.generation === snapshot.generation
+    && history.historyRevision === historyRevision
+    ? history
+    : undefined;
   const timeline = currentHistory?.items === undefined ? recent : mergeTimelineWindows(recent, currentHistory.items);
   const target = snapshot.targets.find((candidate) => candidate.id === session.targetId);
   const backend = snapshot.backends.find((candidate) => candidate.id === session.backendId);
@@ -2205,8 +2593,29 @@ function UnavailableScreen({ controller, t, error }: { readonly controller: Retu
   return <main className="full-state"><div className="full-state__error"><ServerCrash aria-hidden="true" /></div><h1>{t("connection.failed")}</h1><p>{error ?? t("error.snapshotUnavailable")}</p><div className="full-state__actions">{profile !== undefined && <Button tone="primary" onClick={() => void controller.connect(profile)}><RefreshCcw aria-hidden="true" />{t("connection.reconnect")}</Button>}<Button onClick={() => void controller.disconnect()}>{t("common.back")}</Button></div></main>;
 }
 
-function EmptySessionPage({ navigationOpen, t, onOpenNavigation, onNewTask }: { readonly navigationOpen: boolean; readonly t: (key: Parameters<typeof translate>[1]) => string; readonly onOpenNavigation: () => void; readonly onNewTask: () => void }): JSX.Element {
-  return <main className="empty-session-page"><header>{!navigationOpen && <IconButton label={t("a11y.openNavigation")} onClick={onOpenNavigation}><Menu aria-hidden="true" /></IconButton>}</header><EmptyState icon={<Sparkles />} title={t("session.emptyTitle")} body={t("session.emptyBody")} action={<Button tone="primary" onClick={onNewTask}><CirclePlus aria-hidden="true" />{t("nav.newTask")}</Button>} /></main>;
+function EmptySessionPage({ navigationOpen, linkedSessionRecoveryBody, t, onOpenNavigation, onOpenConnections, onNewTask }: { readonly navigationOpen: boolean; readonly linkedSessionRecoveryBody?: string; readonly t: (key: Parameters<typeof translate>[1]) => string; readonly onOpenNavigation: () => void; readonly onOpenConnections: () => void; readonly onNewTask: () => void }): JSX.Element {
+  return <main className="empty-session-page"><header>{!navigationOpen && <IconButton label={t("a11y.openNavigation")} onClick={onOpenNavigation}><Menu aria-hidden="true" /></IconButton>}</header>{linkedSessionRecoveryBody !== undefined ? <EmptyState icon={<AlertTriangle />} title={t("nav.linkedTaskUnavailable")} body={linkedSessionRecoveryBody} action={<div className="full-state__actions"><Button tone="primary" onClick={onOpenNavigation}>{t("a11y.openNavigation")}</Button><Button onClick={onOpenConnections}>{t("settings.connections")}</Button></div>} /> : <EmptyState icon={<Sparkles />} title={t("session.emptyTitle")} body={t("session.emptyBody")} action={<Button tone="primary" onClick={onNewTask}><CirclePlus aria-hidden="true" />{t("nav.newTask")}</Button>} />}</main>;
+}
+
+function timelineHistoryCursorKey(cursor: TimelineHistoryCursorView): string {
+  return `${cursor.generation}:${cursor.sequence}:${cursor.opaqueToken}`;
+}
+
+export function reserveMessageDeepLinkHistoryPage(
+  search: MessageDeepLinkHistorySearch,
+  nextCursor: TimelineHistoryCursorView
+): boolean {
+  const cursorKey = timelineHistoryCursorKey(nextCursor);
+  if (search.pageRequests >= MAXIMUM_MESSAGE_DEEP_LINK_HISTORY_PAGES
+    || search.seenCursors.has(cursorKey)
+    || search.lastCursor !== undefined && (
+      nextCursor.generation !== search.lastCursor.generation
+      || nextCursor.sequence >= search.lastCursor.sequence
+    )) return false;
+  search.pageRequests += 1;
+  search.seenCursors.add(cursorKey);
+  search.lastCursor = nextCursor;
+  return true;
 }
 
 function uniqueSessions(sessions: readonly SessionView[]): readonly SessionView[] {

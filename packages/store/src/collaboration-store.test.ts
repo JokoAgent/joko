@@ -20,6 +20,32 @@ afterEach(() => {
 });
 
 describe("OperationalStore collaboration", () => {
+  it("finds the latest Run in one Session generation when timestamps tie", () => {
+    const fixture = createFixture();
+    fixture.store.createRun({
+      id: "a-old-run", sessionId: "lead-session", source: "system", state: "completed",
+      createdAt: 30, endedAt: 30
+    });
+    fixture.store.createAttempt({
+      id: "old-attempt", runId: "a-old-run", ordinal: 1, generation: 0, startedAt: 30, endedAt: 30
+    });
+    const session = fixture.store.getSession("lead-session");
+    fixture.store.updateSession("lead-session", {
+      binding: { ...session.descriptor.binding, generation: 1 }
+    }, session.revision, 30);
+    fixture.store.createRun({
+      id: "z-new-run", sessionId: "lead-session", source: "system", state: "completed",
+      createdAt: 30, endedAt: 30
+    });
+    fixture.store.createAttempt({
+      id: "new-attempt", runId: "z-new-run", ordinal: 1, generation: 1, startedAt: 30, endedAt: 30
+    });
+    expect(fixture.store.findLatestRunForSessionGeneration("lead-session", 0)?.descriptor.id).toBe("a-old-run");
+    expect(fixture.store.findLatestRunForSessionGeneration("lead-session", 1)?.descriptor.id).toBe("z-new-run");
+    fixture.reopen();
+    expect(fixture.store.findLatestRunForSessionGeneration("lead-session", 1)?.descriptor.id).toBe("z-new-run");
+  });
+
   it("persists a fenced Goal tree, follows Session generations, and rejects capacity or lifecycle bypasses", () => {
     const fixture = createFixture();
     const goal = fixture.store.createCollaborationGoal({

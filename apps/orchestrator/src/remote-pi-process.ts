@@ -14,8 +14,7 @@ import {
   rm,
   writeFile
 } from "node:fs/promises";
-import { basename, dirname, isAbsolute, relative, resolve, sep } from "node:path";
-import { posix as remotePath } from "node:path";
+import { basename, dirname, isAbsolute, posix as remotePath, relative, resolve, sep, win32, type PlatformPath } from "node:path";
 import { PassThrough, Transform, type Readable, type TransformCallback, type Writable } from "node:stream";
 import { StringDecoder } from "node:string_decoder";
 
@@ -31,15 +30,18 @@ import {
   type PiProcessHandle,
   type PiProcessSpec
 } from "@joko/adapter-pi";
+import type { RemoteWorkspaceBinding } from "@joko/core";
+import { DEVICE_PEER_RUNTIME_EXECUTABLES } from "@joko/device-peer";
 import type {
   RemoteFileTransportPort,
+  RemoteForwardingTransportPort,
   RemoteProcessHandle,
   RemoteProcessTransportPort,
-  RemoteReverseForwardHandle,
-  RemoteSshTransportLease
+  RemoteReverseForwardHandle
 } from "@joko/remote-ssh";
+import type { OperationalStore } from "@joko/store";
 
-import type { RemoteHostRegistry } from "./remote-host-registry.js";
+import type { RemoteExecutionRouter, RemoteWorkspaceAuthority } from "./remote-execution-router.js";
 import {
   REMOTE_PI_BROKER_PROTOCOL_VERSION,
   REMOTE_PI_BROKER_SOURCE,
@@ -75,19 +77,20 @@ const NATIVE_AUTH_RESERVATION_TOKEN_ENV = "JOKO_PI_NATIVE_AUTH_RESERVATION_TOKEN
 const NATIVE_AUTH_RESERVATION_LAUNCH_MARKER = "<joko-broker-native-auth-reservation>";
 
 export interface RemotePiProcessFactoryOptions {
-  readonly registry: RemoteHostRegistry;
+  readonly remoteExecution: Pick<RemoteExecutionRouter, "workspace">;
+  readonly store: Pick<OperationalStore, "getTarget">;
   readonly localFactory?: PiProcessFactory;
   readonly authorityRoot: string;
 }
 
 interface RemoteAuthorityScope {
   readonly targetId: string;
-  readonly hostId: string;
+  readonly routeIdentity: string;
   readonly recoveryIdentity: string;
 }
 
 interface RemoteManagedStoreScope extends RemoteAuthorityScope {
-  readonly hostTargetId: string;
+  readonly binding: RemoteWorkspaceBinding;
   readonly sessionId: string;
   readonly identity: string;
 }
@@ -164,14 +167,16 @@ type RemoteAuthorityControl = {
  * cross this boundary.
  */
 export class RemotePiProcessFactory implements PiManagedDurableStoreRegistry {
-  readonly #registry: RemoteHostRegistry;
+  readonly #remoteExecution: Pick<RemoteExecutionRouter, "workspace">;
+  readonly #store: Pick<OperationalStore, "getTarget">;
   readonly #localFactory: PiProcessFactory;
   readonly #authorityStore: RemotePiAuthorityStore;
   readonly #managedStoreScopes = new Map<string, RemoteManagedStoreScope>();
   readonly #managedStores = new Map<string, PiManagedDurableStore>();
 
   constructor(options: RemotePiProcessFactoryOptions) {
-    this.#registry = options.registry;
+    this.#remoteExecution = options.remoteExecution;
+    this.#store = options.store;
     this.#localFactory = options.localFactory ?? spawnPiProcess;
     this.#authorityStore = new RemotePiAuthorityStore(options.authorityRoot);
   }
@@ -193,31 +198,20 @@ export class RemotePiProcessFactory implements PiManagedDurableStoreRegistry {
     nonnegativeSafeInteger(input.generation, "managed runtime generation");
     const key = managedStoreKey(sessionId, targetId);
     let scope = this.#managedStoreScopes.get(key);
-    const boundHost = this.#registry.boundHost(targetId);
-    if (scope !== undefined && (boundHost === undefined || scope.hostTargetId !== boundHost.targetId
-      || scope.hostId !== boundHost.id)) {
+    const binding = this.#store.getTarget(targetId).descriptor.remoteWorkspace;
+    if (scope !== undefined && (binding === undefined || !sameRemoteBinding(scope.binding, binding))) {
       this.#managedStoreScopes.delete(key);
       this.#managedStores.delete(key);
       scope = undefined;
     }
     if (scope === undefined) {
-      const candidates: RemoteManagedStoreScope[] = [];
-      for (const host of boundHost === undefined ? this.#registry.list(targetId) : [boundHost]) {
-        const recoveryIdentity = remoteRecoveryIdentity(sessionId, targetId, host.targetId, host.id);
-        const identity = stableIdentity(targetId, host.targetId, host.id, recoveryIdentity);
-        const authority = await this.#authorityStore.read(identity, {
-          targetId,
-          hostId: host.id,
-          recoveryIdentity
-        });
-        if (authority === undefined || authority.authority.trustedRunnerScriptSha256 === "0".repeat(64)) continue;
-        candidates.push({ sessionId, targetId, hostTargetId: host.targetId, hostId: host.id, recoveryIdentity, identity });
-      }
-      if (candidates.length === 0) return undefined;
-      if (candidates.length !== 1) {
-        throw new Error("Remote managed durable store identity is ambiguous across hosts.");
-      }
-      scope = candidates[0]!;
+      if (binding === undefined) return undefined;
+      const routeIdentity = remoteRouteIdentity(binding);
+      const recoveryIdentity = remoteRecoveryIdentity(sessionId, targetId, binding);
+      const identity = stableIdentity(targetId, routeIdentity, recoveryIdentity);
+      const authority = await this.#authorityStore.read(identity, { targetId, routeIdentity, recoveryIdentity });
+      if (authority === undefined || authority.authority.trustedRunnerScriptSha256 === "0".repeat(64)) return undefined;
+      scope = { sessionId, targetId, binding, routeIdentity, recoveryIdentity, identity };
       this.#managedStoreScopes.set(key, scope);
     }
     const currentAuthority = await this.#authorityStore.read(scope.identity, scope);
@@ -229,7 +223,7 @@ export class RemotePiProcessFactory implements PiManagedDurableStoreRegistry {
     if (store === undefined) {
       store = new RemotePiManagedDurableStore({
         scope,
-        registry: this.#registry,
+        remoteExecution: this.#remoteExecution,
         authorityStore: this.#authorityStore
       });
       this.#managedStores.set(key, store);
@@ -237,21 +231,23 @@ export class RemotePiProcessFactory implements PiManagedDurableStoreRegistry {
     return store;
   }
 
-  async validate(targetId: string, hostId: string, workspaceRoot: string, signal?: AbortSignal): Promise<void> {
-    const { lease } = await this.#registry.transports(targetId, hostId, signal);
-    const files = requireFiles(lease);
-    requireProcesses(lease);
-    const canonical = await files.realpath(workspaceRoot, signal);
-    if (canonical !== workspaceRoot) throw new Error("Remote workspace root is not canonical.");
-    const info = await files.stat(canonical, signal);
+  async validate(binding: RemoteWorkspaceBinding, signal?: AbortSignal): Promise<void> {
+    const authority = await this.#remoteExecution.workspace(binding, signal);
+    const canonical = await authority.files.realpath(binding.workspaceRoot, signal);
+    if (canonical !== binding.workspaceRoot) throw new Error("Remote workspace root is not canonical.");
+    const info = await authority.files.stat(canonical, signal);
     if (info.kind !== "directory") throw new Error("Remote workspace root is not a directory.");
+    authority.assertCurrent();
   }
 
   async #createRemote(spec: PiProcessSpec): Promise<PiProcessHandle> {
-    const binding = spec.remoteWorkspace!;
+    const binding = spec.remoteWorkspace;
+    if (binding === undefined) throw new Error("Remote Pi requires a remote workspace binding.");
     const targetId = requiredEnvironment(spec.env, "JOKO_PI_TARGET_ID");
-    const { lease } = await this.#registry.transports(binding.hostTargetId, binding.hostId);
-    const files = requireFiles(lease);
+    const initialAuthority = await this.#remoteExecution.workspace(binding);
+    const targetPaths = remotePlatformPaths(initialAuthority.pathStyle);
+    const remoteNodeExecutable = remoteNodeExecutableFor(binding);
+    const files = initialAuthority.files;
     const canonicalWorkspace = await files.realpath(binding.workspaceRoot);
     if (canonicalWorkspace !== binding.workspaceRoot) throw new Error("Remote workspace root is not canonical.");
     if ((await files.stat(canonicalWorkspace)).kind !== "directory") {
@@ -259,14 +255,16 @@ export class RemotePiProcessFactory implements PiManagedDurableStoreRegistry {
     }
 
     const home = await files.realpath(".");
+    const controlCwd = binding.kind === "device_peer" ? canonicalWorkspace : home;
     const spawnIdentity = exactDigestEnvironment(spec.env, "JOKO_PI_SPAWN_IDENTITY");
     const recoveryIdentity = exactDigestEnvironment(spec.env, "JOKO_PI_REMOTE_RECOVERY_IDENTITY");
     const runtimeGeneration = exactRuntimeGeneration(spec.env);
     const currentNativeAuthReservationToken = optionalNativeAuthReservationToken(
       spec.env[NATIVE_AUTH_RESERVATION_TOKEN_ENV]
     );
-    const identity = stableIdentity(targetId, binding.hostTargetId, binding.hostId, recoveryIdentity);
-    const authorityScope: RemoteAuthorityScope = { targetId, hostId: binding.hostId, recoveryIdentity };
+    const routeIdentity = remoteRouteIdentity(binding);
+    const identity = stableIdentity(targetId, routeIdentity, recoveryIdentity);
+    const authorityScope: RemoteAuthorityScope = { targetId, routeIdentity, recoveryIdentity };
     let existingAuthority = await this.#authorityStore.read(identity, authorityScope);
     if (existingAuthority?.deletion !== undefined) {
       // A verified deletion receipt proves that the previous owner/child
@@ -275,27 +273,29 @@ export class RemotePiProcessFactory implements PiManagedDurableStoreRegistry {
       await this.#authorityStore.remove(identity);
       existingAuthority = undefined;
     }
-    const managedRoot = remotePath.join(home, ".joko", "pi-broker");
-    const remoteRuntime = remotePath.join(home, ".joko", "runtime", identity);
-    const remoteSessions = remotePath.join(home, ".joko", "sessions", stableIdentity(targetId, binding.hostTargetId, binding.hostId));
+    const managedRoot = targetPaths.join(home, ".joko", "pi-broker");
+    const remoteRuntime = targetPaths.join(home, ".joko", "runtime", identity);
+    const remoteSessions = targetPaths.join(home, ".joko", "sessions", stableIdentity(targetId, routeIdentity));
     const localManagedRunRoot = spec.env["JOKO_PI_SUBAGENT_RUN_ROOT"];
     const remoteManagedRunRoot = localManagedRunRoot === undefined
       ? undefined
-      : remotePath.join(home, ".joko", "subagent-runs", identity);
-    await provisionRemoteBroker(files, managedRoot);
-    await ensureRemotePrivateDirectory(files, remoteRuntime);
-    await ensureRemotePrivateDirectory(files, remoteSessions);
-    if (remoteManagedRunRoot !== undefined) await ensureRemotePrivateDirectory(files, remoteManagedRunRoot);
+      : targetPaths.join(home, ".joko", "subagent-runs", identity);
+    await provisionRemoteBroker(files, managedRoot, initialAuthority.pathStyle);
+    await ensureRemotePrivateDirectory(files, remoteRuntime, initialAuthority.pathStyle);
+    await ensureRemotePrivateDirectory(files, remoteSessions, initialAuthority.pathStyle);
+    if (remoteManagedRunRoot !== undefined) {
+      await ensureRemotePrivateDirectory(files, remoteManagedRunRoot, initialAuthority.pathStyle);
+    }
     if (localManagedRunRoot !== undefined) {
       const productSessionId = requiredEnvironment(spec.env, MANAGED_SUBAGENT_PRODUCT_SESSION_ENV);
-      if (remoteRecoveryIdentity(productSessionId, targetId, binding.hostTargetId, binding.hostId) !== recoveryIdentity) {
+      if (remoteRecoveryIdentity(productSessionId, targetId, binding) !== recoveryIdentity) {
         throw new Error("Remote managed durable store crossed its recovery identity fence.");
       }
       this.#managedStoreScopes.set(managedStoreKey(productSessionId, targetId), {
         sessionId: productSessionId,
         targetId,
-        hostTargetId: binding.hostTargetId,
-        hostId: binding.hostId,
+        binding,
+        routeIdentity,
         recoveryIdentity,
         identity
       });
@@ -401,7 +401,7 @@ export class RemotePiProcessFactory implements PiManagedDurableStoreRegistry {
       if (assetSnapshot === undefined) {
         assetSnapshot = await snapshotAsset(value);
       }
-      const remoteAsset = remotePath.join(
+      const remoteAsset = targetPaths.join(
         remoteRuntime,
         "assets",
         `${assetSnapshot.digest}-${safeRemoteName(basename(value))}`
@@ -415,9 +415,11 @@ export class RemotePiProcessFactory implements PiManagedDurableStoreRegistry {
     if (localAgentHome !== undefined) {
       const normalizedAgentHome = resolve(localAgentHome);
       const remoteAgentHome = rewriteLocalPath(normalizedAgentHome, pathMap);
+      const remoteAgentChild = targetPaths.relative(remoteRuntime, remoteAgentHome);
       if (
         remoteAgentHome === normalizedAgentHome ||
-        remoteAgentHome !== remoteRuntime && !remoteAgentHome.startsWith(`${remoteRuntime}/`)
+        remoteAgentHome !== remoteRuntime
+          && (remoteAgentChild === "" || remoteAgentChild.startsWith("..") || targetPaths.isAbsolute(remoteAgentChild))
       ) throw new Error("Remote Pi Agent Home escaped its staged runtime tree.");
       for (const name of ["models.json", "settings.json"] as const) {
         const local = resolve(normalizedAgentHome, name);
@@ -426,7 +428,7 @@ export class RemotePiProcessFactory implements PiManagedDurableStoreRegistry {
         }
         const snapshot = await snapshotAsset(local);
         compatibilityAssets.push({ role: `agent-home:${name}`, name, digest: snapshot.digest });
-        stagingPlans.push({ local, remote: remotePath.join(remoteAgentHome, name), snapshot });
+        stagingPlans.push({ local, remote: targetPaths.join(remoteAgentHome, name), snapshot });
       }
     }
 
@@ -474,14 +476,18 @@ export class RemotePiProcessFactory implements PiManagedDurableStoreRegistry {
       assets: compatibilityAssets
     });
     if (existingAuthority === undefined) await stageRemoteRuntime(files, stagingPlans);
-    const sourcePath = remotePath.join(managedRoot, `broker-${REMOTE_PI_BROKER_SOURCE_SHA256}.mjs`);
-    const openAttachment = async (selectedLease: RemoteSshTransportLease): Promise<RemoteBridgeAttachment> => {
-      const selectedFiles = requireFiles(selectedLease);
-      await provisionRemoteBroker(selectedFiles, managedRoot);
-      await ensureRemotePrivateDirectory(selectedFiles, remoteRuntime);
-      await ensureRemotePrivateDirectory(selectedFiles, remoteSessions);
+    const sourcePath = targetPaths.join(managedRoot, `broker-${REMOTE_PI_BROKER_SOURCE_SHA256}.mjs`);
+    const openAttachment = async (selectedAuthority: RemoteWorkspaceAuthority): Promise<RemoteBridgeAttachment> => {
+      selectedAuthority.assertCurrent();
+      if (selectedAuthority.pathStyle !== initialAuthority.pathStyle) {
+        throw new Error("Remote Pi target path style changed during execution.");
+      }
+      const selectedFiles = selectedAuthority.files;
+      await provisionRemoteBroker(selectedFiles, managedRoot, selectedAuthority.pathStyle);
+      await ensureRemotePrivateDirectory(selectedFiles, remoteRuntime, selectedAuthority.pathStyle);
+      await ensureRemotePrivateDirectory(selectedFiles, remoteSessions, selectedAuthority.pathStyle);
       if (remoteManagedRunRoot !== undefined) {
-        await ensureRemotePrivateDirectory(selectedFiles, remoteManagedRunRoot);
+        await ensureRemotePrivateDirectory(selectedFiles, remoteManagedRunRoot, selectedAuthority.pathStyle);
       }
       const previous = await this.#authorityStore.read(identity, authorityScope);
       await refreshRuntimeFiles(
@@ -491,18 +497,21 @@ export class RemotePiProcessFactory implements PiManagedDurableStoreRegistry {
         previous?.authority.runtimeGeneration
       );
       const bridgeOptions: OpenRemoteBrokerBridgeOptions = {
-        lease: selectedLease,
+        processes: selectedAuthority.processes,
+        forwarding: selectedAuthority.forwarding,
         files: selectedFiles,
-        home,
+        controlCwd,
         managedRoot,
         sourcePath,
+        nodeExecutable: remoteNodeExecutable,
+        pathStyle: selectedAuthority.pathStyle,
         identity,
         launchHash,
         candidateProcessLaunchHash,
         trustedRunnerScriptSha256: trustedRunnerDigest,
         compatibilityHash,
         targetId,
-        hostId: binding.hostId,
+        routeIdentity,
         recoveryIdentity,
         spawnIdentity,
         runtimeGeneration,
@@ -527,9 +536,12 @@ export class RemotePiProcessFactory implements PiManagedDurableStoreRegistry {
         ) throw error;
         if (error.reason === "launch_mismatch") {
           await requestRemoteBrokerKill({
-            processes: requireProcesses(selectedLease),
+            processes: selectedAuthority.processes,
             sourcePath,
             managedRoot,
+            nodeExecutable: remoteNodeExecutable,
+            pathStyle: selectedAuthority.pathStyle,
+            controlCwd,
             identity,
             signal: "SIGKILL",
             authority: previous.authority
@@ -542,12 +554,12 @@ export class RemotePiProcessFactory implements PiManagedDurableStoreRegistry {
         return openRemoteBrokerBridge(freshBridgeOptions);
       }
     };
-    const initialAttachment = await openAttachment(lease);
+    const initialAttachment = await openAttachment(initialAuthority);
     return new MappedRemotePiProcess({
       initialAttachment,
       reattach: async () => {
-        const next = await this.#registry.transports(binding.hostTargetId, binding.hostId);
-        return openAttachment(next.lease);
+        const next = await this.#remoteExecution.workspace(binding);
+        return openAttachment(next);
       },
       localSessionRoot: resolve(localSessionRoot),
       localRuntime: resolve(localRuntime),
@@ -560,16 +572,16 @@ export class RemotePiProcessFactory implements PiManagedDurableStoreRegistry {
 
 class RemotePiManagedDurableStore implements PiManagedDurableStore {
   readonly #scope: RemoteManagedStoreScope;
-  readonly #registry: RemoteHostRegistry;
+  readonly #remoteExecution: Pick<RemoteExecutionRouter, "workspace">;
   readonly #authorityStore: RemotePiAuthorityStore;
 
   constructor(options: {
     readonly scope: RemoteManagedStoreScope;
-    readonly registry: RemoteHostRegistry;
+    readonly remoteExecution: Pick<RemoteExecutionRouter, "workspace">;
     readonly authorityStore: RemotePiAuthorityStore;
   }) {
     this.#scope = options.scope;
-    this.#registry = options.registry;
+    this.#remoteExecution = options.remoteExecution;
     this.#authorityStore = options.authorityStore;
   }
 
@@ -821,12 +833,21 @@ class RemotePiManagedDurableStore implements PiManagedDurableStore {
   }
 
   async #request(operation: Readonly<Record<string, unknown>>): Promise<Record<string, unknown>> {
-    const { lease } = await this.#registry.transports(this.#scope.hostTargetId, this.#scope.hostId);
-    const files = requireFiles(lease);
-    const processes = requireProcesses(lease);
+    const executionAuthority = await this.#remoteExecution.workspace(this.#scope.binding);
+    const targetPaths = remotePlatformPaths(executionAuthority.pathStyle);
+    const files = executionAuthority.files;
+    const processes = executionAuthority.processes;
     const home = await files.realpath(".");
-    const managedRoot = remotePath.join(home, ".joko", "pi-broker");
-    await provisionRemoteBroker(files, managedRoot);
+    const canonicalWorkspace = await files.realpath(this.#scope.binding.workspaceRoot);
+    if (canonicalWorkspace !== this.#scope.binding.workspaceRoot) {
+      throw new Error("Remote managed durable store workspace root is not canonical.");
+    }
+    if ((await files.stat(canonicalWorkspace)).kind !== "directory") {
+      throw new Error("Remote managed durable store workspace root is not a directory.");
+    }
+    const controlCwd = this.#scope.binding.kind === "device_peer" ? canonicalWorkspace : home;
+    const managedRoot = targetPaths.join(home, ".joko", "pi-broker");
+    await provisionRemoteBroker(files, managedRoot, executionAuthority.pathStyle);
     const authority = await this.#authorityStore.read(this.#scope.identity, this.#scope);
     if (authority === undefined) {
       throw new Error("Remote managed durable store authority is unavailable.");
@@ -834,11 +855,11 @@ class RemotePiManagedDurableStore implements PiManagedDurableStore {
     if (authority.deletion !== undefined && operation["operation"] !== "finalize-deletion") {
       throw new Error("Remote managed durable store is finalized for deletion.");
     }
-    const sourcePath = remotePath.join(managedRoot, `broker-${REMOTE_PI_BROKER_SOURCE_SHA256}.mjs`);
+    const sourcePath = targetPaths.join(managedRoot, `broker-${REMOTE_PI_BROKER_SOURCE_SHA256}.mjs`);
     const request = await processes.open({
-      executable: "node",
+      executable: remoteNodeExecutableFor(this.#scope.binding),
       args: [sourcePath, "store", managedRoot],
-      cwd: home,
+      cwd: controlCwd,
       env: { JOKO_REMOTE_BROKER_SOURCE_HASH: REMOTE_PI_BROKER_SOURCE_SHA256 }
     });
     const body = Buffer.from(`${JSON.stringify({
@@ -898,6 +919,9 @@ interface RemoteBridgeAttachment {
   readonly reverseForward?: RemoteReverseForwardHandle;
   readonly brokerSourcePath: string;
   readonly brokerRoot: string;
+  readonly controlCwd: string;
+  readonly nodeExecutable: string;
+  readonly pathStyle: "posix" | "win32";
   readonly identity: string;
   readonly terminalFence: string;
   readonly authority?: RemoteAuthorityEnvelope;
@@ -906,18 +930,21 @@ interface RemoteBridgeAttachment {
 }
 
 interface OpenRemoteBrokerBridgeOptions {
-  readonly lease: RemoteSshTransportLease;
+  readonly processes: RemoteProcessTransportPort;
+  readonly forwarding?: RemoteForwardingTransportPort;
   readonly files: RemoteFileTransportPort;
-  readonly home: string;
+  readonly controlCwd: string;
   readonly managedRoot: string;
   readonly sourcePath: string;
+  readonly nodeExecutable: string;
+  readonly pathStyle: "posix" | "win32";
   readonly identity: string;
   readonly launchHash: string;
   readonly candidateProcessLaunchHash: string;
   readonly trustedRunnerScriptSha256: string;
   readonly compatibilityHash: string;
   readonly targetId: string;
-  readonly hostId: string;
+  readonly routeIdentity: string;
   readonly recoveryIdentity: string;
   readonly spawnIdentity: string;
   readonly runtimeGeneration: number;
@@ -935,13 +962,13 @@ interface OpenRemoteBrokerBridgeOptions {
 }
 
 async function openRemoteBrokerBridge(options: OpenRemoteBrokerBridgeOptions): Promise<RemoteBridgeAttachment> {
-  const processes = requireProcesses(options.lease);
+  const processes = options.processes;
   let reverseForward: RemoteReverseForwardHandle | undefined;
   let remoteProcess: RemoteProcessHandle | undefined;
   let relay: RemoteBrokerBootstrap["relay"];
   try {
     if (options.localDescriptor !== undefined) {
-      if (options.lease.forwarding === undefined || options.lease.capabilities.tcpForwarding !== true) {
+      if (options.forwarding === undefined) {
         throw new Error("Remote Pi requires loopback TCP forwarding for its managed tool bridge.");
       }
       const descriptor = JSON.parse(await readFile(options.localDescriptor, "utf8")) as Record<string, unknown>;
@@ -950,7 +977,7 @@ async function openRemoteBrokerBridge(options: OpenRemoteBrokerBridgeOptions): P
         throw new Error("Managed tool bridge must use a service-node loopback endpoint.");
       }
       const localPort = Number(endpoint.port || (endpoint.protocol === "https:" ? 443 : 80));
-      reverseForward = await options.lease.forwarding.listen({
+      reverseForward = await options.forwarding.listen({
         localDestinationHost: normalizeLoopback(endpoint.hostname),
         localDestinationPort: localPort
       });
@@ -980,7 +1007,7 @@ async function openRemoteBrokerBridge(options: OpenRemoteBrokerBridgeOptions): P
 
     const terminalFence = randomUUID();
     remoteProcess = await processes.open({
-      executable: "node",
+      executable: options.nodeExecutable,
       args: [
         options.sourcePath,
         "bridge",
@@ -989,7 +1016,7 @@ async function openRemoteBrokerBridge(options: OpenRemoteBrokerBridgeOptions): P
         options.launchHash,
         terminalFence
       ],
-      cwd: options.home,
+      cwd: options.controlCwd,
       env: { JOKO_REMOTE_BROKER_SOURCE_HASH: REMOTE_PI_BROKER_SOURCE_SHA256 }
     });
     const bootstrap: RemoteBrokerBootstrap = {
@@ -1009,7 +1036,7 @@ async function openRemoteBrokerBridge(options: OpenRemoteBrokerBridgeOptions): P
       authority: {
         format: 1,
         targetId: options.targetId,
-        hostId: options.hostId,
+        routeIdentity: options.routeIdentity,
         recoveryIdentity: options.recoveryIdentity,
         spawnIdentity: options.spawnIdentity,
         runtimeGeneration: options.runtimeGeneration,
@@ -1078,6 +1105,9 @@ async function openRemoteBrokerBridge(options: OpenRemoteBrokerBridgeOptions): P
       ...(reverseForward === undefined ? {} : { reverseForward }),
       brokerSourcePath: options.sourcePath,
       brokerRoot: options.managedRoot,
+      controlCwd: options.controlCwd,
+      nodeExecutable: options.nodeExecutable,
+      pathStyle: options.pathStyle,
       identity: options.identity,
       terminalFence,
       authority,
@@ -1253,7 +1283,7 @@ function parseRemoteAuthorityCommitAcknowledgement(body: Buffer): RemoteAuthorit
 function parseRemoteAuthorityEnvelope(value: unknown): RemoteAuthorityEnvelope {
   if (!isPlainRecord(value)) throw new Error("Remote Pi authority envelope failed its schema fence.");
   assertExactKeys(value, [
-    "format", "targetId", "hostId", "recoveryIdentity", "spawnIdentity", "runtimeGeneration",
+    "format", "targetId", "routeIdentity", "recoveryIdentity", "spawnIdentity", "runtimeGeneration",
     "compatibilityHash", "childProcessLaunchHash", "trustedRunnerScriptSha256", "identity", "launchHash", "pid",
     "processStartIdentity", "startedAt", "epoch", "issuedAt", "attestation"
   ]);
@@ -1267,7 +1297,7 @@ function parseRemoteAuthorityEnvelope(value: unknown): RemoteAuthorityEnvelope {
   return {
     format: 1,
     targetId: exactBoundedText(value["targetId"], 512, "target identity"),
-    hostId: exactBoundedText(value["hostId"], 512, "host identity"),
+    routeIdentity: exactBoundedText(value["routeIdentity"], 512, "remote route identity"),
     recoveryIdentity: exactDigest(value["recoveryIdentity"], "recovery identity"),
     spawnIdentity: exactDigest(value["spawnIdentity"], "spawn identity"),
     runtimeGeneration: nonnegativeSafeInteger(value["runtimeGeneration"], "runtime generation"),
@@ -1290,7 +1320,7 @@ function assertAuthorityMatchesRequest(
   options: OpenRemoteBrokerBridgeOptions
 ): void {
   if (
-    authority.targetId !== options.targetId || authority.hostId !== options.hostId ||
+    authority.targetId !== options.targetId || authority.routeIdentity !== options.routeIdentity ||
     authority.recoveryIdentity !== options.recoveryIdentity || authority.identity !== options.identity ||
     authority.spawnIdentity !== options.spawnIdentity || authority.runtimeGeneration !== options.runtimeGeneration ||
     authority.compatibilityHash !== options.compatibilityHash ||
@@ -1324,6 +1354,9 @@ interface RemoteBrokerKillOptions {
   readonly processes: RemoteProcessTransportPort;
   readonly sourcePath: string;
   readonly managedRoot: string;
+  readonly nodeExecutable: string;
+  readonly pathStyle: "posix" | "win32";
+  readonly controlCwd: string;
   readonly identity: string;
   readonly signal: "SIGKILL" | "SIGTERM";
   readonly authority: RemoteAuthorityEnvelope;
@@ -1331,9 +1364,9 @@ interface RemoteBrokerKillOptions {
 
 async function requestRemoteBrokerKill(options: RemoteBrokerKillOptions): Promise<void> {
   const request = await options.processes.open({
-    executable: "node",
+    executable: options.nodeExecutable,
     args: [options.sourcePath, "kill", options.managedRoot],
-    cwd: remotePath.dirname(options.managedRoot),
+    cwd: options.controlCwd,
     env: { JOKO_REMOTE_BROKER_SOURCE_HASH: REMOTE_PI_BROKER_SOURCE_SHA256 }
   });
   const body = Buffer.from(`${JSON.stringify({
@@ -1452,7 +1485,7 @@ class RemotePiAuthorityStore {
         return undefined;
       }
       if (
-        record.authority.targetId !== scope.targetId || record.authority.hostId !== scope.hostId ||
+        record.authority.targetId !== scope.targetId || record.authority.routeIdentity !== scope.routeIdentity ||
         record.authority.recoveryIdentity !== scope.recoveryIdentity || record.authority.identity !== identity
       ) throw new Error("Remote Pi authority metadata crossed its local identity scope.");
       return record;
@@ -1810,8 +1843,22 @@ function managedSessionKey(sessionId: string): string {
   return createHash("sha256").update(sessionId).digest("hex").slice(0, 40);
 }
 
-function remoteRecoveryIdentity(sessionId: string, targetId: string, hostTargetId: string, hostId: string): string {
-  return createHash("sha256").update([sessionId, targetId, hostTargetId, hostId].join("\0")).digest("hex");
+function remoteRecoveryIdentity(sessionId: string, targetId: string, binding: RemoteWorkspaceBinding): string {
+  return createHash("sha256").update([sessionId, targetId, remoteRouteIdentity(binding)].join("\0")).digest("hex");
+}
+
+function remoteRouteIdentity(binding: RemoteWorkspaceBinding): string {
+  return binding.kind === "ssh"
+    ? JSON.stringify({ kind: binding.kind, hostTargetId: binding.hostTargetId, hostId: binding.hostId })
+    : JSON.stringify({
+        kind: binding.kind,
+        controllerDeviceId: binding.controllerDeviceId,
+        targetDeviceId: binding.targetDeviceId
+      });
+}
+
+function sameRemoteBinding(left: RemoteWorkspaceBinding, right: RemoteWorkspaceBinding): boolean {
+  return remoteRouteIdentity(left) === remoteRouteIdentity(right) && left.workspaceRoot === right.workspaceRoot;
 }
 
 function assertStableLocalFile(left: Stats, right: Stats): void {
@@ -1877,7 +1924,7 @@ class MappedRemotePiProcess extends EventEmitter implements PiProcessHandle {
       if (line.includes(options.remoteSessionRoot)) {
         await syncRemoteSessions(files, options.remoteSessionRoot, options.localSessionRoot);
       }
-      const remoteArtifacts = remotePath.join(options.remoteRuntime, "artifacts");
+      const remoteArtifacts = remotePathsFor(options.remoteRuntime).join(options.remoteRuntime, "artifacts");
       if (line.includes(remoteArtifacts)) {
         await syncRemoteArtifacts(files, remoteArtifacts, resolve(options.localRuntime, "artifacts"));
       }
@@ -2058,6 +2105,9 @@ class MappedRemotePiProcess extends EventEmitter implements PiProcessHandle {
           processes: attachment.processes,
           sourcePath: attachment.brokerSourcePath,
           managedRoot: attachment.brokerRoot,
+          nodeExecutable: attachment.nodeExecutable,
+          pathStyle: attachment.pathStyle,
+          controlCwd: attachment.controlCwd,
           identity: attachment.identity,
           signal,
           authority: attachment.authority
@@ -2065,7 +2115,7 @@ class MappedRemotePiProcess extends EventEmitter implements PiProcessHandle {
         return;
       }
       const request = await attachment.processes.open({
-        executable: "node",
+        executable: attachment.nodeExecutable,
         args: [
           attachment.brokerSourcePath,
           "kill",
@@ -2073,7 +2123,7 @@ class MappedRemotePiProcess extends EventEmitter implements PiProcessHandle {
           attachment.identity,
           signal
         ],
-        cwd: remotePath.dirname(attachment.brokerRoot),
+        cwd: attachment.controlCwd,
         env: { JOKO_REMOTE_BROKER_SOURCE_HASH: REMOTE_PI_BROKER_SOURCE_SHA256 }
       });
       request.stdin.end();
@@ -2282,15 +2332,21 @@ function reconnectDelay(delayMs: number): Promise<void> {
   });
 }
 
-async function provisionRemoteBroker(files: RemoteFileTransportPort, managedRoot: string): Promise<void> {
-  await ensureRemotePrivateDirectory(files, managedRoot);
-  const sourcePath = remotePath.join(managedRoot, `broker-${REMOTE_PI_BROKER_SOURCE_SHA256}.mjs`);
+async function provisionRemoteBroker(
+  files: RemoteFileTransportPort,
+  managedRoot: string,
+  pathStyle: "posix" | "win32"
+): Promise<void> {
+  await ensureRemotePrivateDirectory(files, managedRoot, pathStyle);
+  const sourcePath = remotePlatformPaths(pathStyle).join(
+    managedRoot, `broker-${REMOTE_PI_BROKER_SOURCE_SHA256}.mjs`
+  );
   try {
     const existing = await files.stat(sourcePath);
     if (existing.kind !== "file") throw new Error("Remote Pi broker source path is unsafe.");
     const content = await files.read({ path: sourcePath, maximumBytes: Buffer.byteLength(REMOTE_PI_BROKER_SOURCE) + 1 });
     if (
-      (existing.mode & 0o077) === 0 &&
+      (pathStyle === "win32" || (existing.mode & 0o077) === 0) &&
       createHash("sha256").update(content).digest("hex") === REMOTE_PI_BROKER_SOURCE_SHA256
     ) return;
   } catch (error) {
@@ -2309,10 +2365,14 @@ async function provisionRemoteBroker(files: RemoteFileTransportPort, managedRoot
   }
 }
 
-async function ensureRemotePrivateDirectory(files: RemoteFileTransportPort, path: string): Promise<void> {
+async function ensureRemotePrivateDirectory(
+  files: RemoteFileTransportPort,
+  path: string,
+  pathStyle: "posix" | "win32"
+): Promise<void> {
   await files.mkdir(path, { recursive: true, mode: 0o700 });
   const info = await files.stat(path);
-  if (info.kind !== "directory" || (info.mode & 0o077) !== 0) {
+  if (info.kind !== "directory" || pathStyle === "posix" && (info.mode & 0o077) !== 0) {
     throw new Error("Remote Pi managed directory is not private.");
   }
   if (await files.realpath(path) !== path) throw new Error("Remote Pi managed directory is not canonical.");
@@ -2378,20 +2438,6 @@ class LineRewriteTransform extends Transform {
   }
 }
 
-function requireFiles(lease: RemoteSshTransportLease): RemoteFileTransportPort {
-  if (lease.capabilities.fileTransfer !== true || lease.files === undefined) {
-    throw new Error("Remote file transport is unavailable.");
-  }
-  return lease.files;
-}
-
-function requireProcesses(lease: RemoteSshTransportLease): NonNullable<RemoteSshTransportLease["processes"]> {
-  if (lease.capabilities.processStreaming !== true || lease.processes === undefined) {
-    throw new Error("Remote process transport is unavailable.");
-  }
-  return lease.processes;
-}
-
 async function syncLocalTree(
   files: RemoteFileTransportPort,
   local: string,
@@ -2407,7 +2453,12 @@ async function syncLocalTree(
     const entries = await readdir(local, { withFileTypes: true });
     entries.sort((left, right) => left.name.localeCompare(right.name));
     for (const entry of entries) {
-      await syncLocalTree(files, resolve(local, entry.name), remotePath.join(remote, entry.name), budget);
+      await syncLocalTree(
+        files,
+        resolve(local, entry.name),
+        remotePathsFor(remote).join(remote, entry.name),
+        budget
+      );
     }
     const after = await lstat(local);
     if (
@@ -2492,7 +2543,7 @@ async function stageLocalAssetSnapshot(
   for (const entry of snapshot.entries) {
     const destination = entry.path === ""
       ? remote
-      : remotePath.join(remote, ...entry.path.split("/"));
+      : remotePathsFor(remote).join(remote, ...entry.path.split("/"));
     if (entry.kind === "directory") {
       await files.mkdir(destination, { recursive: true, mode: entry.mode & 0o777 });
       continue;
@@ -2524,7 +2575,7 @@ async function verifyRemoteAssetSnapshot(
   for (const entry of snapshot.entries) {
     const destination = entry.path === ""
       ? remote
-      : remotePath.join(remote, ...entry.path.split("/"));
+      : remotePathsFor(remote).join(remote, ...entry.path.split("/"));
     const info = await files.stat(destination);
     if (info.kind !== entry.kind) {
       throw new Error("Remote runtime resource failed its staged type fence.");
@@ -2621,7 +2672,7 @@ async function syncRemoteSessions(
     const entries = await files.list(remoteDirectory);
     for (const entry of entries) {
       if (!/^[^/\\\0]+$/u.test(entry.name)) throw new Error("Remote session entry name is invalid.");
-      const remote = remotePath.join(remoteDirectory, entry.name);
+      const remote = remotePathsFor(remoteDirectory).join(remoteDirectory, entry.name);
       const local = resolve(localDirectory, entry.name);
       if (entry.kind === "directory") {
         await mkdir(local, { recursive: true });
@@ -2652,7 +2703,7 @@ async function syncRemoteArtifacts(
   }
   for (const entry of entries) {
     if (entry.kind !== "file" || !/^[^/\\\0]+$/u.test(entry.name)) continue;
-    const remote = remotePath.join(remoteRoot, entry.name);
+    const remote = remotePathsFor(remoteRoot).join(remoteRoot, entry.name);
     const local = resolve(localRoot, entry.name);
     const content = await files.read({ path: remote, maximumBytes: MAXIMUM_SYNC_FILE_BYTES });
     const temporary = `${local}.${randomUUID()}.tmp`;
@@ -2674,7 +2725,7 @@ function remoteCommand(
   if (executableName.toLowerCase() === "electron") return "node";
   if (!isAbsolute(localCommand)) return localCommand;
   if (executableName.toLowerCase() === "node") return "node";
-  const remote = remotePath.join(remoteRuntime, "bin", safeRemoteName(executableName));
+  const remote = remotePathsFor(remoteRuntime).join(remoteRuntime, "bin", safeRemoteName(executableName));
   stagingPlans.push({
     local: resolve(localCommand),
     remote,
@@ -2717,7 +2768,7 @@ function rewriteLocalPath(value: string, pathMap: ReadonlyMap<string, string>): 
     if (absolute === local) return remote;
     const child = relative(local, absolute);
     if (child !== "" && !child.startsWith("..") && !isAbsolute(child)) {
-      return remotePath.join(remote, ...child.split(sep));
+      return remotePathsFor(remote).join(remote, ...child.split(sep));
     }
   }
   return value;
@@ -2772,7 +2823,7 @@ function rewriteExactMappedPath(value: string, pathMap: ReadonlyMap<string, stri
     if (comparable === comparableFrom) return to;
     if (!comparable.startsWith(`${comparableFrom}/`)) continue;
     const suffix = comparable.slice(comparableFrom.length + 1).split("/");
-    return to.startsWith("/") ? remotePath.join(to, ...suffix) : resolve(to, ...suffix);
+    return remotePathsFor(to).join(to, ...suffix);
   }
   return undefined;
 }
@@ -3006,6 +3057,18 @@ function normalizedBrokerLaunchEnvironment(
 
 function stableIdentity(...values: readonly string[]): string {
   return createHash("sha256").update(values.join("\0")).digest("hex").slice(0, 32);
+}
+
+function remotePlatformPaths(pathStyle: "posix" | "win32"): PlatformPath {
+  return pathStyle === "win32" ? win32 : remotePath;
+}
+
+function remotePathsFor(path: string): PlatformPath {
+  return path.startsWith("/") ? remotePath : win32;
+}
+
+function remoteNodeExecutableFor(binding: RemoteWorkspaceBinding): string {
+  return binding.kind === "device_peer" ? DEVICE_PEER_RUNTIME_EXECUTABLES.node : "node";
 }
 
 function safeRemoteName(value: string): string {

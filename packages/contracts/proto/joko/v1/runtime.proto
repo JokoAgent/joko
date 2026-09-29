@@ -190,9 +190,9 @@ message Target {
   google.protobuf.Timestamp last_activity_at = 8;
   EntityVersion version = 9;
   ErrorInfo error = 10;
-  // Present only when process and file capabilities are routed through an
-  // authenticated Remote Host rather than the service node.
-  RemoteWorkspaceBinding remote_workspace = 11;
+  // Required strict location. Clients must reject an absent/unspecified kind
+  // rather than infer service-node execution from missing remote fields.
+  WorkspaceLocation location = 11;
 }
 
 enum SessionState {
@@ -312,9 +312,9 @@ message Session {
   ErrorInfo error = 17;
   SessionAttention attention = 18;
   SessionWorktree worktree = 19;
-  // Immutable creation-time snapshot. A later Target rebind cannot retarget
+  // Immutable creation-time location. A later Target rebind cannot retarget
   // an already-created task or its native runtime.
-  RemoteWorkspaceBinding remote_workspace = 20;
+  WorkspaceLocation location = 20;
   // Bounded generated navigation aid. Empty means no current summary.
   string task_summary = 21;
   // Navigation-only project placement. Absence means the dialogue group;
@@ -333,6 +333,10 @@ message Session {
   // Session-owner-bound references. A projection with observed=false has been
   // extracted safely but has no configured capability-owned provider snapshot.
   repeated CodeHostPullRequestProjection code_host_pull_requests = 26;
+  // Latest visible user-authored message accepted into the durable product
+  // timeline. Service-owned automatic continuations are deliberately excluded.
+  // Absence means the Session has no surviving user input.
+  google.protobuf.Timestamp last_user_input_at = 27;
 }
 
 message SessionContextState {
@@ -953,16 +957,25 @@ message SessionResource {
 // Command lines, executable paths, native references, and environment values
 // are deliberately not representable. The opaque instance id is a spawn fence,
 // not an OS birth identity.
+enum RuntimeProcessRole {
+  RUNTIME_PROCESS_ROLE_UNSPECIFIED = 0;
+  RUNTIME_PROCESS_ROLE_CONTROL_PLANE = 1;
+  RUNTIME_PROCESS_ROLE_TASK_HOST = 2;
+}
+
 message RuntimeProcessUsage {
   string backend_id = 1;
-  string session_id = 2;
-  uint64 runtime_generation = 3;
+  // Present only for TASK_HOST. Shared control-plane services must not invent
+  // a product Session owner.
+  optional string session_id = 2;
+  optional uint64 runtime_generation = 3;
   uint64 process_id = 4;
   double cpu_percent = 5;
   uint64 memory_kb = 6;
   uint32 process_count = 7;
   bool terminable = 8;
   optional string process_instance_id = 9;
+  RuntimeProcessRole role = 10;
 }
 
 enum RuntimeCommandSource {

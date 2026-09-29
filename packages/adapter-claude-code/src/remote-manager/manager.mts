@@ -3,7 +3,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { lstatSync, readFileSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { chmod, lstat, mkdir, open, readFile, readdir, realpath, unlink } from "node:fs/promises";
 import net from "node:net";
-import { dirname, join, posix as remotePath, resolve } from "node:path";
+import { delimiter, dirname, isAbsolute, join, posix, relative, resolve, sep, win32 } from "node:path";
 import { pipeline } from "node:stream/promises";
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
@@ -1316,7 +1316,26 @@ function processFingerprintSync(pid) {
       };
     } catch { return undefined; }
   }
-  if (process.platform === "win32") return undefined;
+  if (process.platform === "win32") {
+    const script = `$p=Get-CimInstance Win32_Process -Filter 'ProcessId=${pid}'; if($null -eq $p){exit 3}; [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); [Console]::Out.Write(($p | Select-Object ProcessId,CreationDate,ExecutablePath,CommandLine | ConvertTo-Json -Compress))`;
+    const observed = spawnSync("powershell.exe", [
+      "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script
+    ], { encoding: "utf8", windowsHide: true, timeout: 5_000, maxBuffer: 128 * 1024 });
+    if (observed.status !== 0 || typeof observed.stdout !== "string" || observed.stdout.length === 0) return undefined;
+    try {
+      const value = JSON.parse(observed.stdout);
+      const executable = absolutePath(value.ExecutablePath);
+      const commandLine = boundedString(value.CommandLine, "process command", 64 * 1024);
+      const birth = boundedString(value.CreationDate, "process birth", 512);
+      return {
+        pid,
+        birth: `win32:${birth}`,
+        commandHash: createHash("sha256").update(commandLine).digest("hex"),
+        executableHash: createHash("sha256").update(executable.toLowerCase()).digest("hex"),
+        uid: 0
+      };
+    } catch { return undefined; }
+  }
   const started = spawnSync("/bin/ps", ["-p", String(pid), "-o", "lstart="], { encoding: "utf8" });
   const command = spawnSync("/bin/ps", ["-ww", "-p", String(pid), "-o", "command="], { encoding: "utf8" });
   const executable = spawnSync("/bin/ps", ["-p", String(pid), "-o", "comm="], { encoding: "utf8" });
@@ -1367,9 +1386,9 @@ function ownerIdentity(value) {
 function requirePrivateDirectorySync(path) {
   try {
     const info = lstatSync(path);
-    if (!info.isDirectory() || info.isSymbolicLink() || (info.mode & 0o077) !== 0
+    if (!info.isDirectory() || info.isSymbolicLink() || (process.platform !== "win32" && (info.mode & 0o077) !== 0)
       || (typeof process.getuid === "function" && info.uid !== process.getuid())
-      || realpathSync(path) !== resolve(path)) throw fault("process_manifest_invalid", true);
+      || !samePath(realpathSync(path), resolve(path))) throw fault("process_manifest_invalid", true);
   } catch (error) {
     if (error?.code === "process_manifest_invalid") throw error;
     throw fault("process_manifest_invalid", true);
@@ -1379,9 +1398,9 @@ function requirePrivateDirectorySync(path) {
 async function requirePrivateDirectory(path) {
   try {
     const info = await lstat(path);
-    if (!info.isDirectory() || info.isSymbolicLink() || (info.mode & 0o077) !== 0
+    if (!info.isDirectory() || info.isSymbolicLink() || (process.platform !== "win32" && (info.mode & 0o077) !== 0)
       || (typeof process.getuid === "function" && info.uid !== process.getuid())
-      || await realpath(path) !== resolve(path)) throw fault("process_manifest_invalid", true);
+      || !samePath(await realpath(path), resolve(path))) throw fault("process_manifest_invalid", true);
   } catch (error) {
     if (error?.code === "process_manifest_invalid") throw error;
     throw fault("process_manifest_invalid", true);
@@ -1576,10 +1595,24 @@ function uuid(value) {
 }
 
 function absolutePath(value) {
-  if (typeof value !== "string" || value.length === 0 || value.length > 16_384 || value.includes("\0") || !value.startsWith("/") || remotePath.resolve(value) !== value) {
+  const paths = process.env.JOKO_CLAUDE_LOCATOR_MODE === "device-peer" && process.platform === "win32"
+    ? win32
+    : posix;
+  if (typeof value !== "string" || value.length === 0 || value.length > 16_384 || value.includes("\0")
+    || !paths.isAbsolute(value) || paths.resolve(value) !== value) {
     throw fault("invalid_path", false);
   }
   return value;
+}
+
+function samePath(left, right) {
+  return process.platform === "win32" ? left.toLowerCase() === right.toLowerCase() : left === right;
+}
+
+function runtimeSocketPath(runtimeRoot) {
+  return process.platform === "win32"
+    ? `\\\\.\\pipe\\joko-claude-${createHash("sha256").update(runtimeRoot.toLowerCase()).digest("hex").slice(0, 32)}`
+    : join(runtimeRoot, "run", "manager.sock");
 }
 
 function boundedString(value, label, maximumBytes) {
@@ -1633,7 +1666,8 @@ function normalizeFault(error) {
 async function readManagerLock(path) {
   try {
     const info = await lstat(path);
-    if (!info.isFile() || info.isSymbolicLink() || info.nlink !== 1 || (info.mode & 0o077) !== 0
+    if (!info.isFile() || info.isSymbolicLink() || info.nlink !== 1
+      || (process.platform !== "win32" && (info.mode & 0o077) !== 0)
       || (typeof process.getuid === "function" && info.uid !== process.getuid()) || info.size < 2 || info.size > 4096) {
       throw fault("manager_lock_invalid", true);
     }
@@ -1642,7 +1676,8 @@ async function readManagerLock(path) {
       || !Number.isSafeInteger(value.pid) || value.pid < 1
       || typeof value.birth !== "string" || value.birth.length === 0 || value.birth.length > 512
       || !sha256(value.commandHash) || !sha256(value.executableHash)
-      || !Number.isSafeInteger(value.uid) || value.uid < 0 || value.uid !== info.uid) {
+      || !Number.isSafeInteger(value.uid) || value.uid < 0
+      || (process.platform !== "win32" && value.uid !== info.uid)) {
       throw fault("manager_lock_invalid", true);
     }
     return manifestFingerprint(value);
@@ -1660,15 +1695,24 @@ async function removeManagerLock(path, expected) {
 
 async function runDaemon(socketPath, runtimeRoot, executable) {
   runtimeRoot = absolutePath(runtimeRoot);
-  socketPath = absolutePath(socketPath);
   executable = absolutePath(executable);
-  const expectedNode = join(runtimeRoot, "current", "node", "bin", "node");
+  const locatorMode = process.env.JOKO_CLAUDE_LOCATOR_MODE === "device-peer";
+  const expectedSocket = runtimeSocketPath(runtimeRoot);
+  if (socketPath !== expectedSocket) throw fault("runtime_layout_invalid", false);
+  const expectedNode = process.platform === "win32"
+    ? join(runtimeRoot, "current", "node", "node.exe")
+    : join(runtimeRoot, "current", "node", "bin", "node");
   const expectedManager = join(runtimeRoot, "current", "manager.mjs");
-  const executableRoot = `${join(runtimeRoot, "current", "node_modules", "@anthropic-ai")}/`;
-  if (socketPath !== join(runtimeRoot, "run", "manager.sock")
-    || resolve(process.execPath) !== resolve(expectedNode)
-    || resolve(fileURLToPath(import.meta.url)) !== resolve(expectedManager)
-    || !executable.startsWith(executableRoot) || !executable.endsWith("/claude")) {
+  const executableRoot = join(runtimeRoot, "current", "node_modules", "@anthropic-ai");
+  const executableRelative = relative(executableRoot, executable);
+  if (locatorMode
+    ? process.env.JOKO_CLAUDE_EXECUTABLE === undefined
+      || !samePath(executable, absolutePath(process.env.JOKO_CLAUDE_EXECUTABLE))
+    : !samePath(resolve(process.execPath), resolve(expectedNode))
+      || !samePath(resolve(fileURLToPath(import.meta.url)), resolve(expectedManager))
+      || executableRelative === "" || executableRelative === ".."
+      || executableRelative.startsWith(`..${sep}`) || isAbsolute(executableRelative)
+      || !["claude", "claude.exe"].includes(executable.slice(executable.lastIndexOf(sep) + 1).toLowerCase())) {
     throw fault("runtime_layout_invalid", false);
   }
   process.env.JOKO_CLAUDE_RUNTIME_ROOT = runtimeRoot;
@@ -1679,7 +1723,12 @@ async function runDaemon(socketPath, runtimeRoot, executable) {
     || process.env.CLAUDE_CODE_TMPDIR !== temporaryRoot || process.env.TMPDIR !== temporaryRoot) {
     throw fault("runtime_environment_invalid", false);
   }
-  const runRoot = dirname(socketPath);
+  const runRoot = join(runtimeRoot, "run");
+  if (locatorMode) {
+    for (const directory of [runtimeRoot, profileRoot, temporaryRoot, runRoot]) {
+      await mkdir(directory, { recursive: true, mode: 0o700 });
+    }
+  }
   await requirePrivateDirectory(runtimeRoot);
   await requirePrivateDirectory(profileRoot);
   await requirePrivateDirectory(temporaryRoot);
@@ -1711,12 +1760,12 @@ async function runDaemon(socketPath, runtimeRoot, executable) {
   }
   await lock.writeFile(`${JSON.stringify({ schema: 1, managerSha256: MANAGER_SHA256, ...managerFingerprint })}\n`, "utf8");
   await lock.close();
-  await unlink(socketPath).catch(() => undefined);
+  if (process.platform !== "win32") await unlink(socketPath).catch(() => undefined);
   const managerState = createManagerState();
   const server = net.createServer((socket) => new ManagerConnection(socket, managerState));
   const finish = async () => {
     server.close();
-    await unlink(socketPath).catch(() => undefined);
+    if (process.platform !== "win32") await unlink(socketPath).catch(() => undefined);
     await removeManagerLock(lockPath, managerFingerprint).catch(() => undefined);
   };
   process.once("SIGTERM", () => void finish().finally(() => process.exit(0)));
@@ -1725,7 +1774,7 @@ async function runDaemon(socketPath, runtimeRoot, executable) {
     server.once("error", reject);
     server.listen(socketPath, () => resolvePromise());
   });
-  await chmod(socketPath, 0o600);
+  if (process.platform !== "win32") await chmod(socketPath, 0o600);
 }
 
 async function connectSocket(socketPath) {
@@ -1765,7 +1814,13 @@ function daemonEnvironment(runtimeRoot, executable) {
     CLAUDE_CONFIG_DIR: profile,
     CLAUDE_CODE_TMPDIR: temporary,
     JOKO_CLAUDE_RUNTIME_ROOT: runtimeRoot,
-    JOKO_CLAUDE_EXECUTABLE: executable
+    JOKO_CLAUDE_EXECUTABLE: executable,
+    ...(process.env.JOKO_CLAUDE_LOCATOR_MODE === "device-peer"
+      ? { JOKO_CLAUDE_LOCATOR_MODE: "device-peer" }
+      : {}),
+    ...(process.env.ELECTRON_RUN_AS_NODE === undefined
+      ? {}
+      : { ELECTRON_RUN_AS_NODE: process.env.ELECTRON_RUN_AS_NODE })
   };
   for (const name of ["LANG", "LC_ALL", "LC_CTYPE", "TERM", "TZ"]) {
     const item = process.env[name];
@@ -1777,7 +1832,7 @@ function daemonEnvironment(runtimeRoot, executable) {
 function fixedRuntimePath() {
   const nodeDirectory = dirname(process.execPath);
   const inherited = typeof process.env.PATH === "string" ? process.env.PATH : "/usr/local/bin:/usr/bin:/bin";
-  return `${nodeDirectory}:${inherited}`;
+  return `${nodeDirectory}${delimiter}${inherited}`;
 }
 
 async function runBridge(socketPath, runtimeRoot, executable) {
@@ -1799,8 +1854,10 @@ if (process.argv[1] !== undefined && resolve(process.argv[1]) === resolve(fileUR
     })}\n`);
   } else if (command === "daemon" && args.length === 3) {
     await runDaemon(args[0], args[1], args[2]);
-  } else if (command === "bridge" && args.length === 3) {
-    await runBridge(args[0], args[1], args[2]);
+  } else if (command === "bridge" && (args.length === 3 || args.length === 2
+    && process.env.JOKO_CLAUDE_LOCATOR_MODE === "device-peer"
+    && process.env.JOKO_CLAUDE_EXECUTABLE !== undefined)) {
+    await runBridge(args[0], args[1], args[2] ?? process.env.JOKO_CLAUDE_EXECUTABLE);
   } else {
     process.exitCode = 64;
   }

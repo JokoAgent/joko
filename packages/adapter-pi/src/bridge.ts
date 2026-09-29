@@ -44,7 +44,7 @@ export async function provisionManagedBridge(agentHome: string): Promise<string>
  */
 export const MANAGED_BRIDGE_SOURCE = String.raw`
 import { createHash } from "node:crypto";
-import { lstatSync, readFileSync, realpathSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { closeSync, fsyncSync, lstatSync, openSync, readFileSync, realpathSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import { createRequire } from "node:module";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -62,6 +62,9 @@ type PolicyObservation = { subjectKind: PolicySubjectKind; risk: PolicyRisk; wor
 type McpTool = { serverId: string; name: string; runtimeName?: string; policySubject?: PolicySubjectKind; description: string; inputSchema: Record<string, unknown>; outputSchema?: Record<string, unknown>; requiresPermission: boolean };
 type McpDescriptor = { endpoint: string; generation: number; sessionId: string; targetId: string; tools: McpTool[] };
 type McpBridgeErrorCode = "resource_exhausted" | "artifact_unavailable" | "invalid_result";
+type NativeBinding = { opaqueRef: string; nativeSessionId?: string; generation: number };
+type ResetDescriptor = { version: 1; operationId: string; sessionId: string; targetId: string; source: NativeBinding; replacementGeneration: number };
+type ResetReceipt = { version: 1; operationId: string; sessionId: string; targetId: string; source: NativeBinding; replacement: NativeBinding };
 const DEFAULT_BASH_TIMEOUT_SECONDS = 300;
 const MAX_BASH_TIMEOUT_SECONDS = 1800;
 const MAX_MCP_BRIDGE_RESPONSE_BYTES = ${MAXIMUM_MANAGED_MCP_BRIDGE_RESPONSE_BYTES};
@@ -77,6 +80,9 @@ const mcpDescriptorPath = process.env.JOKO_PI_MCP_DESCRIPTOR_FILE;
 const workspaceRoot = process.env.JOKO_PI_WORKSPACE_ROOT ? realpathSync(process.env.JOKO_PI_WORKSPACE_ROOT) : process.cwd();
 const runtimeGeneration = Number(process.env.JOKO_PI_GENERATION);
 const mcpToken = process.env.JOKO_PI_MCP_TOKEN;
+const resetReceiptRoot = process.env.JOKO_PI_RESET_RECEIPT_ROOT;
+const productSessionId = process.env.JOKO_PI_PRODUCT_SESSION_ID;
+const targetId = process.env.JOKO_PI_TARGET_ID;
 let secretEnvironmentNames: string[] = [];
 try {
   const parsed = JSON.parse(process.env.JOKO_PI_SECRET_ENV_NAMES ?? "[]");
@@ -137,6 +143,99 @@ function writeControl(control: Control): void {
   const temporary = controlPath + "." + process.pid + ".tmp";
   writeFileSync(temporary, JSON.stringify({ ...control, writtenAt: new Date().toISOString() }, null, 2) + "\n", { mode: 0o600 });
   renameSync(temporary, controlPath);
+}
+
+function validNativeBinding(value: unknown): value is NativeBinding {
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as Record<string, unknown>;
+  return typeof candidate.opaqueRef === "string" && candidate.opaqueRef.length > 0
+    && (candidate.nativeSessionId === undefined || (typeof candidate.nativeSessionId === "string" && candidate.nativeSessionId.length > 0))
+    && Number.isSafeInteger(candidate.generation) && Number(candidate.generation) >= 0;
+}
+
+function resetDescriptor(value: string): ResetDescriptor {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(Buffer.from(value, "base64url").toString("utf8"));
+  } catch {
+    throw new Error("Invalid context reset descriptor");
+  }
+  if (!parsed || typeof parsed !== "object") throw new Error("Invalid context reset descriptor");
+  const descriptor = parsed as Record<string, unknown>;
+  if (descriptor.version !== 1
+      || typeof descriptor.operationId !== "string" || descriptor.operationId.length < 1 || descriptor.operationId.length > 1024
+      || descriptor.operationId.includes("\0") || /[\r\n]/u.test(descriptor.operationId)
+      || typeof descriptor.sessionId !== "string" || descriptor.sessionId.length < 1
+      || typeof descriptor.targetId !== "string" || descriptor.targetId.length < 1
+      || !validNativeBinding(descriptor.source)
+      || !Number.isSafeInteger(descriptor.replacementGeneration)
+      || Number(descriptor.replacementGeneration) <= descriptor.source.generation) {
+    throw new Error("Invalid context reset descriptor");
+  }
+  return descriptor as unknown as ResetDescriptor;
+}
+
+function resetReceiptPath(operationId: string): { root: string; path: string } {
+  if (!resetReceiptRoot || !isAbsolute(resetReceiptRoot)) throw new Error("Context reset receipt storage is unavailable");
+  const root = realpathSync(resetReceiptRoot);
+  if (resolve(root) !== resolve(resetReceiptRoot)) throw new Error("Context reset receipt storage is unsafe");
+  return { root, path: join(root, createHash("sha256").update(operationId).digest("hex") + ".json") };
+}
+
+function sameBinding(left: NativeBinding, right: NativeBinding): boolean {
+  return resolve(left.opaqueRef) === resolve(right.opaqueRef)
+    && left.nativeSessionId === right.nativeSessionId
+    && left.generation === right.generation;
+}
+
+function writeResetReceipt(descriptor: ResetDescriptor, sessionManager: any): void {
+  if (descriptor.sessionId !== productSessionId || descriptor.targetId !== targetId || descriptor.source.generation !== runtimeGeneration) {
+    throw new Error("Context reset descriptor fence mismatch");
+  }
+  const sessionFile = sessionManager?.getSessionFile?.();
+  const sessionId = sessionManager?.getSessionId?.();
+  if (typeof sessionFile !== "string" || !isAbsolute(sessionFile) || typeof sessionId !== "string" || sessionId.length < 1) {
+    throw new Error("Native context reset identity is unavailable");
+  }
+  const receipt: ResetReceipt = {
+    version: 1,
+    operationId: descriptor.operationId,
+    sessionId: descriptor.sessionId,
+    targetId: descriptor.targetId,
+    source: descriptor.source,
+    replacement: {
+      opaqueRef: resolve(sessionFile),
+      nativeSessionId: sessionId,
+      generation: descriptor.replacementGeneration,
+    },
+  };
+  const location = resetReceiptPath(descriptor.operationId);
+  try {
+    const info = lstatSync(location.path);
+    if (!info.isFile() || info.isSymbolicLink() || realpathSync(location.path) !== location.path) {
+      throw new Error("Context reset receipt is unsafe");
+    }
+    const existing = JSON.parse(readFileSync(location.path, "utf8")) as ResetReceipt;
+    if (JSON.stringify(existing) !== JSON.stringify(receipt)) throw new Error("Context reset receipt conflicts with this operation");
+    return;
+  } catch (error: any) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+  const temporary = location.path + "." + process.pid + ".tmp";
+  try { unlinkSync(temporary); } catch (error: any) { if (error?.code !== "ENOENT") throw error; }
+  const descriptorBytes = JSON.stringify(receipt) + "\n";
+  const file = openSync(temporary, "wx", 0o600);
+  try {
+    writeFileSync(file, descriptorBytes, "utf8");
+    fsyncSync(file);
+  } finally {
+    closeSync(file);
+  }
+  renameSync(temporary, location.path);
+  try {
+    const directory = openSync(location.root, "r");
+    try { fsyncSync(directory); } finally { closeSync(directory); }
+  } catch {}
 }
 
 function sanitizeEnvironment(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
@@ -846,10 +945,24 @@ export default async function jokoManagedBridge(pi: ExtensionAPI): Promise<void>
 
   pi.registerCommand("joko-reset-context", {
     description: "Replace native context with an empty Pi session through the Joko host",
-    handler: async (_args, ctx) => {
+    handler: async (args, ctx) => {
       // Deliberately omit setup/parentSession. The clear command must create a truly
       // empty JSONL rather than smuggling prior transcript content into context.
-      const result = await ctx.newSession();
+      const encoded = args.trim();
+      const descriptor = encoded === "" ? undefined : resetDescriptor(encoded);
+      const current = (ctx as any).sessionManager;
+      if (descriptor !== undefined && current !== undefined) {
+        const currentFile = current.getSessionFile?.();
+        const currentId = current.getSessionId?.();
+        if (typeof currentFile !== "string"
+            || resolve(currentFile) !== resolve(descriptor.source.opaqueRef)
+            || currentId !== descriptor.source.nativeSessionId) {
+          throw new Error("Context reset source identity changed");
+        }
+      }
+      const result = await ctx.newSession(descriptor === undefined ? undefined : {
+        setup: async (sessionManager) => writeResetReceipt(descriptor, sessionManager),
+      });
       if (result.cancelled) throw new Error("Native context reset was cancelled");
     },
   });

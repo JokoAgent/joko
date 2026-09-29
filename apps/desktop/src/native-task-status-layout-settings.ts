@@ -73,13 +73,14 @@ export function createDesktopNativeTaskStatusLayoutSettingsStore(
         } else {
           next.push(preference);
         }
-        value = Object.freeze(next.slice(-MAXIMUM_LAYOUT_PREFERENCES));
-        const bytes = Buffer.from(`${JSON.stringify({ version: 1, preferences: value })}\n`, "utf8");
+        const committed = Object.freeze(next.slice(-MAXIMUM_LAYOUT_PREFERENCES));
+        const bytes = Buffer.from(`${JSON.stringify({ version: 1, preferences: committed })}\n`, "utf8");
         try {
           await atomicWritePrivateFile(path, bytes);
         } finally {
           bytes.fill(0);
         }
+        value = committed;
         return value;
       });
     }

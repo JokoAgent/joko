@@ -49,21 +49,29 @@ describe("HistoryMaintenance", () => {
       createdAt: OLD
     });
 
-    const replacement: HistoryBindingReplacement = {
-      sessionId: "active-old",
-      source: fixture.store.getSession("active-old").descriptor.binding,
-      replacement: {
-        opaqueRef: "native/active-old-empty.jsonl",
-        nativeSessionId: "native-active-old-empty",
-        generation: 1
-      }
-    };
-    const prepare = vi.fn(async () => [replacement]);
+    const sourceBinding = fixture.store.getSession("active-old").descriptor.binding;
+    let replacement: HistoryBindingReplacement | undefined;
+    const prepareBindings = vi.fn(async (requests: readonly {
+      readonly sessionId: string;
+      readonly operationId: string;
+      readonly source: SessionDescriptor["binding"];
+    }[]) => {
+      const request = requests[0]!;
+      replacement = {
+        ...request,
+        replacement: {
+          opaqueRef: "native/active-old-empty.jsonl",
+          nativeSessionId: "native-active-old-empty",
+          generation: 1
+        }
+      };
+      return [replacement];
+    });
     const release = vi.fn();
     const removeSessionHistory = vi.fn(async () => undefined);
     const maintenance = new HistoryMaintenance({
       store: fixture.store,
-      activeSessions: { prepare, release },
+      activeSessions: { prepare: prepareBindings, release },
       externalRecords: { removeSessionHistory },
       now: () => NOW,
       workDatabase: async (input) => cleanHistoryMaintenanceCopy(input)
@@ -89,12 +97,16 @@ describe("HistoryMaintenance", () => {
         skippedTaskCount: 0
       }
     });
-    expect(prepare).toHaveBeenCalledWith(["active-old"]);
+    expect(prepareBindings).toHaveBeenCalledWith([expect.objectContaining({
+      sessionId: "active-old",
+      source: sourceBinding
+    })]);
     expect(release).toHaveBeenCalledWith(["active-old"]);
     expect(release).toHaveBeenCalledTimes(1);
-    expect(removeSessionHistory).toHaveBeenCalledWith(["active-old"]);
+    expect(removeSessionHistory).toHaveBeenCalledWith(["active-old", "archived-old", "deleted-old"]);
     expect(existsSync(`${fixture.filePath}.history-backup`)).toBe(true);
 
+    if (replacement === undefined) throw new Error("Expected the active binding replacement.");
     expect(fixture.store.getSession("active-old").descriptor.binding).toEqual(replacement.replacement);
     expect(fixture.store.getSession("archived-old").descriptor.archived).toBe(true);
     expect(fixture.store.getSession("deleted-old").descriptor.deletedAt).toBeDefined();
@@ -180,14 +192,14 @@ describe("HistoryMaintenance", () => {
     const maintenance = new HistoryMaintenance({
       store: fixture.store,
       activeSessions: {
-        prepare: async () => [{ sessionId: "active-old", source, replacement }],
+        prepare: async (requests) => [{ ...requests[0]!, sessionId: "active-old", source, replacement }],
         release: () => undefined
       },
       now: () => NOW,
       workDatabase: async (input) => cleanHistoryMaintenanceCopy(input)
     });
     const scan = maintenance.scan({ retention: "7-days", includeActiveTasks: true });
-    await expect(maintenance.cleanup(scan.scanId, false)).rejects.toThrow("belongs to an unresolved derivation");
+    await expect(maintenance.cleanup(scan.scanId, false)).rejects.toThrow("Task history maintenance failed.");
     expect(fixture.store.getSession("active-old").descriptor.binding).toEqual(source);
     expect(fixture.store.searchSessionMessages({ scope: { sessionId: "active-old" }, query: "retain this source history" }).matches)
       .toHaveLength(1);
@@ -201,9 +213,9 @@ describe("HistoryMaintenance", () => {
     const maintenance = new HistoryMaintenance({
       store: fixture.store,
       activeSessions: {
-        prepare: async () => [{
-          sessionId: "active-old",
-          source,
+        prepare: async (requests) => [{
+          ...requests[0]!,
+          sessionId: "active-old", source,
           replacement: { opaqueRef: "native/empty.jsonl", generation: 1 }
         }],
         release: () => undefined
@@ -216,6 +228,53 @@ describe("HistoryMaintenance", () => {
     const scan = maintenance.scan({ retention: "7-days", includeActiveTasks: true });
     await expect(maintenance.cleanup(scan.scanId, false)).resolves.toMatchObject({ outcome: "completed" });
     expect(fixture.store.listEvents({ sessionId: "active-old" }).map((event) => event.payload.type))
+      .toEqual(["history_pruned"]);
+  });
+
+  it("recovers a lost begin response and reconciles a committed external cleanup after restart", async () => {
+    const fixture = createFixture();
+    createTask(fixture.store, "archived-old", "archived", OLD, visible("history to reconcile"));
+    let continueWork!: () => void;
+    const workGate = new Promise<void>((resolve) => { continueWork = resolve; });
+    const firstExternal = vi.fn(async () => { throw new Error("cache unavailable"); });
+    const first = new HistoryMaintenance({
+      store: fixture.store,
+      activeSessions: { prepare: async () => [], release: () => undefined },
+      externalRecords: { removeSessionHistory: firstExternal },
+      now: () => NOW,
+      workDatabase: async (input) => {
+        await workGate;
+        return cleanHistoryMaintenanceCopy(input);
+      }
+    });
+    const scan = first.scan({ retention: "7-days", includeActiveTasks: false });
+    const started = first.beginCleanup(scan.scanId, false);
+    const replayed = first.beginCleanup(scan.scanId, false);
+    expect(replayed.maintenanceId).toBe(started.maintenanceId);
+    continueWork();
+    await vi.waitFor(() => expect(first.getCleanup(started.maintenanceId)?.status).toBe("completed"));
+    expect(firstExternal).toHaveBeenCalledWith(["archived-old"]);
+    expect(fixture.store.listMaintenanceEffects(started.maintenanceId))
+      .toContainEqual(expect.objectContaining({ id: "external-cache", state: "unknown" }));
+
+    const filePath = fixture.filePath;
+    fixture.store.close();
+    const reopened = new OperationalStore(filePath, { now: () => OLD });
+    fixture.replaceStore(reopened);
+    const recoveredExternal = vi.fn(async () => undefined);
+    const recovered = new HistoryMaintenance({
+      store: reopened,
+      activeSessions: { prepare: async () => [], release: () => undefined },
+      externalRecords: { removeSessionHistory: recoveredExternal },
+      now: () => NOW,
+      workDatabase: async (input) => cleanHistoryMaintenanceCopy(input)
+    });
+    await recovered.initialize();
+
+    expect(recoveredExternal).toHaveBeenCalledWith(["archived-old"]);
+    expect(reopened.listMaintenanceEffects(started.maintenanceId))
+      .toContainEqual(expect.objectContaining({ id: "external-cache", state: "completed" }));
+    expect(reopened.listEvents({ sessionId: "archived-old" }).map((event) => event.payload.type))
       .toEqual(["history_pruned"]);
   });
 
@@ -259,11 +318,15 @@ describe("HistoryMaintenance", () => {
   });
 });
 
-function createFixture(): { readonly store: OperationalStore; readonly filePath: string } {
+function createFixture(): {
+  readonly store: OperationalStore;
+  readonly filePath: string;
+  readonly replaceStore: (replacement: OperationalStore) => void;
+} {
   const directory = mkdtempSync(path.join(tmpdir(), "joko-history-maintenance-"));
   const filePath = path.join(directory, "operational.sqlite");
   let nextId = 0;
-  const store = new OperationalStore(filePath, { now: () => OLD, idFactory: () => `generated-${++nextId}` });
+  let store = new OperationalStore(filePath, { now: () => OLD, idFactory: () => `generated-${++nextId}` });
   store.upsertBackend({
     id: "runtime",
     displayName: "Runtime",
@@ -287,10 +350,14 @@ function createFixture(): { readonly store: OperationalStore; readonly filePath:
     trusted: true
   });
   cleanups.push(() => {
-    store.close();
+    try { store.close(); } catch { /* A restart test may already have closed the prior handle. */ }
     rmSync(directory, { recursive: true, force: true });
   });
-  return { store, filePath };
+  return {
+    get store() { return store; },
+    filePath,
+    replaceStore(replacement: OperationalStore) { store = replacement; }
+  };
 }
 
 function createTask(

@@ -4,7 +4,7 @@ import type { Stats } from "node:fs";
 import { type FileHandle, lstat, mkdir, open, readdir, readFile, realpath, rename, rm, stat, unlink } from "node:fs/promises";
 import { basename, dirname, extname, isAbsolute, relative, resolve, sep } from "node:path";
 import { reviewImageRasterMimeByExtension, workspaceEntryAbsentRevision } from "@joko/contracts";
-import { JokoError } from "@joko/core";
+import { JokoError, type RemoteWorkspaceBinding } from "@joko/core";
 import { isWithin } from "@joko/core/policy";
 import createIgnore from "ignore";
 
@@ -71,9 +71,7 @@ export interface WorkspaceRegistration {
   readonly trusted: boolean;
   readonly remote?: {
     readonly targetId: string;
-    readonly hostTargetId: string;
-    readonly hostId: string;
-    readonly workspaceRoot: string;
+    readonly binding: RemoteWorkspaceBinding;
   };
 }
 

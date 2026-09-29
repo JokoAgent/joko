@@ -79,6 +79,7 @@ import {
 } from "./backend-control-capabilities.js";
 import { sessionDerivationOriginRoute } from "./session-derivation-origin.js";
 import { CollaborationGoalPanel } from "./CollaborationGoalPanel.js";
+import { PortableReplacementCleanupNotice } from "./PortableReplacementCleanupNotice.js";
 
 // First-stage contracts do not expose a durable dismissal mutation. Keep this bounded and
 // client-local so route switches/remounts are stable without pretending to persist remotely.
@@ -1690,7 +1691,7 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
   );
 
   return (
-    <main ref={paneRef} className={cx("session-pane", presentation === "filesRail" && "session-pane--files-rail")} data-gamepad-session-id={session.id} aria-label={session.name} onKeyDownCapture={(event) => {
+    <main ref={paneRef} className={cx("session-pane", presentation === "filesRail" && "session-pane--files-rail")} data-input-session-id={session.id} data-input-session-generation={session.generation.toString()} aria-label={session.name} onKeyDownCapture={(event) => {
       const modalOpen = document.body.classList.contains("modal-open");
       const retryEscapeInput: RetryEscapeInput = {
         key: event.key,
@@ -1800,6 +1801,7 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
       </header>}
 
       {session.worktree?.state === "preserved" && <div className="session-worktree-warning" role="alert"><GitBranch aria-hidden="true" /><span><strong>{t("worktree.preservedTitle")}</strong><small>{t("worktree.preservedDescription", { branch: session.worktree.branch })}</small></span></div>}
+      {!reviewReadOnly && <PortableReplacementCleanupNotice controller={controller} sessionId={session.id} t={t} />}
 
       <CollaborationGoalPanel
         controller={controller}
@@ -2024,7 +2026,9 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
         showClose={false}
         dismissOnBackdrop={false}
         initialFocus={() => paneRef.current?.querySelector<HTMLElement>("[data-compact-cancel='true']") ?? null}
-        restoreFocusFallback={() => paneRef.current?.querySelector<HTMLElement>("[data-composer-editor='true']:not(:disabled)") ?? null}
+        restoreFocusFallback={() => paneRef.current?.querySelector<HTMLElement>("button.context-capacity-ring--button:not(:disabled)")
+          ?? paneRef.current?.querySelector<HTMLElement>("[data-composer-editor='true'] [contenteditable='true']")
+          ?? null}
         onClose={releaseCompactConfirmation}
       >
         <div className="modal__actions compact-confirmation__actions">

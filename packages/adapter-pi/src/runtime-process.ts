@@ -6,14 +6,14 @@ import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
 
-export type PiManagedProcessTermination = "not_running" | "terminated" | "identity_mismatch" | "unconfirmed";
+export type ManagedProcessTermination = "not_running" | "terminated" | "identity_mismatch" | "unconfirmed";
 
-export interface PiManagedProcessRoot {
+export interface ManagedProcessRoot {
   readonly pid: number;
   readonly expectedIdentity: string;
 }
 
-export interface PiManagedProcessUsage {
+export interface ManagedProcessUsage {
   readonly pid: number;
   readonly cpuPercent: number;
   readonly memoryKb: number;
@@ -21,7 +21,7 @@ export interface PiManagedProcessUsage {
 }
 
 /** Internal process-table row. Paths and command lines never leave the Adapter. */
-export interface PiProcessTableRow {
+export interface ProcessTableRow {
   readonly pid: number;
   readonly ppid: number;
   readonly state: string | null;
@@ -32,8 +32,8 @@ export interface PiProcessTableRow {
   readonly startIdentity: string | null;
 }
 
-export interface PiProcessTableSnapshot {
-  readonly rows: readonly PiProcessTableRow[];
+export interface ProcessTableSnapshot {
+  readonly rows: readonly ProcessTableRow[];
   readonly childrenByParent: ReadonlyMap<number, readonly number[]>;
 }
 
@@ -41,29 +41,29 @@ export interface PiProcessTableSnapshot {
  * Captures an OS process birth identity, samples only registered roots, and
  * terminates only the exact process instance named by the caller's fence.
  */
-export interface PiManagedProcessSupervisor {
+export interface ManagedProcessSupervisor {
   capture(pid: number): Promise<string | undefined>;
   /** Synchronous birth proof for custom spawners before a child handle escapes. */
   captureSync(pid: number): string | undefined;
-  inspect?(roots: readonly PiManagedProcessRoot[]): Promise<readonly PiManagedProcessUsage[]>;
-  terminate(pid: number, expectedIdentity: string, timeoutMs: number): Promise<PiManagedProcessTermination>;
+  inspect?(roots: readonly ManagedProcessRoot[]): Promise<readonly ManagedProcessUsage[]>;
+  terminate(pid: number, expectedIdentity: string, timeoutMs: number): Promise<ManagedProcessTermination>;
 }
 
-export interface PiManagedProcessSupervisorOptions {
+export interface ManagedProcessSupervisorOptions {
   readonly platform?: NodeJS.Platform;
   readonly captureIdentity?: (pid: number) => Promise<string | undefined>;
   readonly captureIdentitySync?: (pid: number) => string | undefined;
-  readonly scan?: () => Promise<PiProcessTableSnapshot>;
-  readonly scanSync?: () => PiProcessTableSnapshot;
+  readonly scan?: () => Promise<ProcessTableSnapshot>;
+  readonly scanSync?: () => ProcessTableSnapshot;
   readonly signal?: (pid: number, signal: NodeJS.Signals) => void;
   readonly killWindowsTree?: (pid: number, timeoutMs: number) => boolean;
   readonly now?: () => number;
   readonly scanIntervalMs?: number;
 }
 
-export function createDefaultPiManagedProcessSupervisor(
-  options: PiManagedProcessSupervisorOptions = {}
-): PiManagedProcessSupervisor {
+export function createDefaultManagedProcessSupervisor(
+  options: ManagedProcessSupervisorOptions = {}
+): ManagedProcessSupervisor {
   const platform = options.platform ?? process.platform;
   const capture = options.captureIdentity ?? ((pid) => captureProcessIdentity(pid, platform));
   const captureSync = options.captureIdentitySync ?? ((pid) => captureProcessIdentitySync(pid, platform));
@@ -93,11 +93,11 @@ export function createDefaultPiManagedProcessSupervisor(
     readonly startIdentity: string | null;
   }>();
   const computedCpuPercent = new Map<number, number>();
-  let cachedSnapshot: PiProcessTableSnapshot | undefined;
+  let cachedSnapshot: ProcessTableSnapshot | undefined;
   let cachedAt = Number.NEGATIVE_INFINITY;
-  let scanInFlight: Promise<PiProcessTableSnapshot> | undefined;
+  let scanInFlight: Promise<ProcessTableSnapshot> | undefined;
 
-  const refreshSnapshot = async (): Promise<PiProcessTableSnapshot> => {
+  const refreshSnapshot = async (): Promise<ProcessTableSnapshot> => {
     if (cachedSnapshot !== undefined && now() - cachedAt < scanIntervalMs) return cachedSnapshot;
     scanInFlight ??= scan().then((snapshot) => {
       const capturedAt = now();
@@ -149,7 +149,7 @@ export function createDefaultPiManagedProcessSupervisor(
       const snapshot = await refreshSnapshot();
       const rowByPid = new Map(snapshot.rows.map((row) => [row.pid, row] as const));
 
-      const result: PiManagedProcessUsage[] = [];
+      const result: ManagedProcessUsage[] = [];
       for (const root of roots) {
         const currentIdentity = await capture(root.pid).catch(() => undefined);
         if (currentIdentity === undefined || currentIdentity !== root.expectedIdentity) continue;
@@ -196,7 +196,7 @@ export function createDefaultPiManagedProcessSupervisor(
           return afterFailure === expectedIdentity ? "unconfirmed" : "identity_mismatch";
         }
       } else {
-        let outcome: PiManagedProcessTermination;
+        let outcome: ManagedProcessTermination;
         try {
           outcome = terminateFrozenPosixTree({
             rootPid: pid,
@@ -224,7 +224,7 @@ interface FrozenPosixOptions {
   readonly rootPid: number;
   readonly expectedIdentity: string;
   readonly captureIdentitySync: (pid: number) => string | undefined;
-  readonly scan: () => PiProcessTableSnapshot;
+  readonly scan: () => ProcessTableSnapshot;
   readonly signal: (pid: number, signal: NodeJS.Signals) => void;
 }
 
@@ -236,7 +236,7 @@ interface FrozenIdentity {
 }
 
 /** Freeze parent-to-child, then kill child-to-parent without a PID-reuse gap. */
-export function terminateFrozenPosixTree(options: FrozenPosixOptions): PiManagedProcessTermination {
+export function terminateFrozenPosixTree(options: FrozenPosixOptions): ManagedProcessTermination {
   const first = options.scan();
   const firstRoot = first.rows.find((row) => row.pid === options.rootPid);
   if (firstRoot === undefined || firstRoot.startIdentity === null) return "not_running";
@@ -337,8 +337,8 @@ export function terminateFrozenPosixTree(options: FrozenPosixOptions): PiManaged
   }
 }
 
-export function parsePosixProcessTable(output: string): PiProcessTableSnapshot {
-  const rows: PiProcessTableRow[] = [];
+export function parsePosixProcessTable(output: string): ProcessTableSnapshot {
+  const rows: ProcessTableRow[] = [];
   const pattern = /^(\d+)\s+(\d+)\s+(\S+)\s+([\d.]+)\s+(\d+)\s+(\S+\s+\S+\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}\s+\d{4})\s+(.+)$/u;
   for (const raw of output.split(/\r?\n/u)) {
     const match = raw.trim().match(pattern);
@@ -362,8 +362,8 @@ export function parsePosixProcessTable(output: string): PiProcessTableSnapshot {
   return snapshotOf(rows);
 }
 
-export function parseWindowsProcessTable(output: string): PiProcessTableSnapshot {
-  const rows: PiProcessTableRow[] = [];
+export function parseWindowsProcessTable(output: string): ProcessTableSnapshot {
+  const rows: ProcessTableRow[] = [];
   for (const raw of output.split(/\r?\n/u)) {
     const fields = raw.trim().split("|");
     if (fields.length < 6) continue;
@@ -386,7 +386,7 @@ export function parseWindowsProcessTable(output: string): PiProcessTableSnapshot
   return snapshotOf(rows);
 }
 
-function snapshotOf(rows: readonly PiProcessTableRow[]): PiProcessTableSnapshot {
+function snapshotOf(rows: readonly ProcessTableRow[]): ProcessTableSnapshot {
   const childrenByParent = new Map<number, number[]>();
   for (const row of rows) {
     const children = childrenByParent.get(row.ppid);
@@ -423,7 +423,7 @@ const WINDOWS_SCAN_SCRIPT = [
   "}"
 ].join("\n");
 
-async function scanProcessTable(platform: NodeJS.Platform): Promise<PiProcessTableSnapshot> {
+async function scanProcessTable(platform: NodeJS.Platform): Promise<ProcessTableSnapshot> {
   if (platform === "win32") {
     const { stdout } = await execFileAsync("powershell.exe", [
       "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", WINDOWS_SCAN_SCRIPT
@@ -440,7 +440,7 @@ async function scanProcessTable(platform: NodeJS.Platform): Promise<PiProcessTab
   return parsePosixProcessTable(stdout);
 }
 
-function scanProcessTableSync(platform: NodeJS.Platform): PiProcessTableSnapshot {
+function scanProcessTableSync(platform: NodeJS.Platform): ProcessTableSnapshot {
   if (platform === "win32") {
     const stdout = execFileSync("powershell.exe", [
       "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", WINDOWS_SCAN_SCRIPT
