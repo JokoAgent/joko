@@ -238,6 +238,7 @@ import {
   VoiceInputCoordinator,
   type VoiceInputProviderFactory
 } from "./voice-input-coordinator.js";
+import { VoiceDictionarySyncRepository } from "./voice-dictionary-sync-repository.js";
 import { VoiceInputSettingsController } from "./voice-input-settings.js";
 import { WorkspaceChangeSetService } from "./workspace-change-set.js";
 import { OperationalWorkspaceChangeJournal } from "./workspace-change-stream.js";
@@ -370,6 +371,8 @@ export interface OrchestratorApplication {
   readonly simulatorViewer?: SimulatorViewerServiceOwner;
   readonly voiceInput?: VoiceInputCoordinator;
   readonly voiceInputSettings?: VoiceInputSettingsController;
+  /** Durable current-v1 convergence authority for the node's Voice dictionary replica. */
+  readonly voiceDictionary?: VoiceDictionarySyncRepository;
   readonly mobilePush?: MobilePushCoordinator;
   /** Point-in-time projection of current Backend process instances. */
   readonly adapters: readonly BackendAdapter[];
@@ -714,6 +717,7 @@ export async function createOrchestratorApplication(
   providers.initialize();
   const modelRoutes = createModelRouteCatalog(store, providers);
   const voiceInputSettings = new VoiceInputSettingsController({ store, credentials, providers });
+  const voiceDictionary = new VoiceDictionarySyncRepository({ store });
   const voiceInput = new VoiceInputCoordinator({
     provider: dependencies.voiceInputProvider ?? voiceInputSettings
   });
@@ -2491,6 +2495,7 @@ export async function createOrchestratorApplication(
     simulatorViewer,
     voiceInput,
     voiceInputSettings,
+    voiceDictionary,
     mobilePush,
     get adapters() {
       return backendInstances.availableAdapters();
