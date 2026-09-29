@@ -1,9 +1,11 @@
 import { OperationalStore } from "@joko/store";
 import {
   addManualEntry,
+  DEFAULT_MATERIALIZE_LIMITS,
   createEmptySyncState,
   createHlcClock,
   formatHlc,
+  materializeDictionary,
   recordLearningEvent
 } from "@joko/voice-input";
 import { tmpdir } from "node:os";
@@ -325,6 +327,55 @@ describe("VoiceDictionarySyncRepository", () => {
     expect(repository.snapshot()).toEqual(learned);
     store.close();
   });
+  it("edits source aliases before merging into a destination with independent alias evidence", async () => {
+    const { store } = await fixture();
+    try {
+      const repository = new VoiceDictionarySyncRepository({ store });
+      let current = repository.setEnabled(1, true);
+      current = repository.addManualTerms(current.revision, ["Source", "Destination"]);
+      current = repository.learn(current.revision, { text: "Source", aliases: ["source kept", "source removed"], stage: "entry" });
+      current = repository.learn(current.revision, { text: "Destination", aliases: ["destination alias"], stage: "entry" });
+      const source = current.dictionary.entries.find((entry) => entry.text === "Source")!;
+      const stale = repository.stateForSync();
+      const edited = repository.editEntry(current.revision, { entryId: source.id, text: "Destination", aliases: ["source kept"] });
+      expect(edited.revision).toBe(current.revision + 1);
+      expect(edited.dictionary.entries).toMatchObject([{ text: "Destination", frequency: 4 }]);
+      expect(edited.dictionary.entries[0]!.aliases.map((alias) => alias.text).sort()).toEqual(["destination alias", "source kept"]);
+      expect(repository.mergeRemote(stale).dictionary.entries[0]!.aliases.map((alias) => alias.text).sort()).toEqual(["destination alias", "source kept"]);
+    } finally { store.close(); }
+  });
+
+  it("preserves unseen aliases on unchanged saves and renames, but honors an explicit replacement under stale replay", async () => {
+    const { store } = await fixture();
+    try {
+      let now = 1_900_000_000_000;
+      const repository = new VoiceDictionarySyncRepository({ store, now: () => now });
+      let current = repository.setEnabled(1, true);
+      current = repository.addManualTerm(current.revision, "Canonical");
+      const allAliases = Array.from({ length: 9 }, (_value, index) => `alias ${index}`);
+      current = repository.learn(current.revision, { text: "Canonical", aliases: allAliases.slice(0, 8), stage: "entry" });
+      now += 1;
+      current = repository.learn(current.revision, { text: "Canonical", aliases: allAliases.slice(8), stage: "entry" });
+      const entry = current.dictionary.entries[0]!;
+      expect(entry.aliases).toHaveLength(8);
+      const visible = entry.aliases.map((alias) => alias.text);
+      const fullAliases = () => materializeDictionary(repository.stateForSync(), {
+        ...DEFAULT_MATERIALIZE_LIMITS, maxAliases: Number.MAX_SAFE_INTEGER
+      }).entries[0]!.aliases.map((alias) => alias.text).sort();
+      expect(fullAliases()).toEqual(allAliases);
+      const saved = repository.editEntry(current.revision, { entryId: entry.id, text: entry.text, aliases: visible });
+      expect(saved.revision).toBe(current.revision);
+      expect(fullAliases()).toEqual(allAliases);
+      const renamed = repository.editEntry(saved.revision, { entryId: entry.id, text: "Renamed", aliases: visible });
+      expect(fullAliases()).toEqual(allAliases);
+      const stale = repository.stateForSync();
+      const replaced = repository.editEntry(renamed.revision, { entryId: renamed.dictionary.entries[0]!.id, text: "Renamed", aliases: ["new alias"] });
+      expect(replaced.dictionary.entries[0]!.aliases.map((alias) => alias.text)).toEqual(["new alias"]);
+      repository.mergeRemote(stale);
+      expect(fullAliases()).toEqual(["new alias"]);
+    } finally { store.close(); }
+  });
+
   it("rejects a manual batch that would hide entries beyond the service projection limit", async () => {
     const { store } = await fixture();
     try {

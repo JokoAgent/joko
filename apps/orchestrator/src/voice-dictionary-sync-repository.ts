@@ -264,17 +264,31 @@ export class VoiceDictionarySyncRepository {
     return this.#mutateState(expectedRevision, (state, clock, nowMs) => {
       const sourceKey = termKeyFromMaterializedId(state, normalizedId);
       if (sourceKey === null) return { state, clock, changed: false };
-      const renamed = renameTerm(state, clock, { termKey: sourceKey, nextText: text, nowMs });
       const targetKey = dictionaryTermKey(text);
-      const replaced = replaceTermAliases(renamed.state, renamed.clock, {
-        termKey: targetKey,
+      const visibleEntry = materializeDictionary(state).entries.find((entry) => entry.id === normalizedId);
+      const visibleAliasKeys = new Set(visibleEntry?.aliases.map((alias) => dictionaryTermKey(alias.text)) ?? []);
+      const submittedAliasKeys = new Set(aliases.map(dictionaryTermKey));
+      const visibleAliasesUnchanged = visibleAliasKeys.size === submittedAliasKeys.size
+        && [...submittedAliasKeys].every((key) => visibleAliasKeys.has(key));
+      // Unchanged visible aliases are not permission to remove unseen evidence.
+      // A changed set remains the user's complete replacement intent.
+      const hiddenAliases = visibleAliasesUnchanged
+        ? materializeDictionary(state, { ...DEFAULT_MATERIALIZE_LIMITS, maxAliases: Number.MAX_SAFE_INTEGER })
+          .entries.find((entry) => entry.id === normalizedId)?.aliases
+          .filter((alias) => !visibleAliasKeys.has(dictionaryTermKey(alias.text))).map((alias) => alias.text) ?? []
+        : [];
+      const nextAliases = [...aliases, ...hiddenAliases].filter((alias) => dictionaryTermKey(alias) !== targetKey);
+      // Edit the source first: a destination's independent aliases survive merge.
+      const replaced = replaceTermAliases(state, clock, {
+        termKey: sourceKey,
         primaryText: text,
-        aliases: [...aliases],
+        aliases: nextAliases,
         nowMs
       });
+      const renamed = renameTerm(replaced.state, replaced.clock, { termKey: sourceKey, nextText: text, nowMs });
       return {
-        state: replaced.state,
-        clock: replaced.clock,
+        state: renamed.state,
+        clock: renamed.clock,
         changed: renamed.changed || replaced.changed
       };
     });
