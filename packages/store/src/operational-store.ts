@@ -8451,6 +8451,21 @@ export class OperationalStore {
       .map(runFromRow);
   }
 
+  findLatestRunForSessionGeneration(sessionId: string, generation: number): StoredRun | undefined {
+    this.assertOpen();
+    if (!Number.isSafeInteger(generation) || generation < 0) {
+      throw new StoreError("Run Session generation is invalid.");
+    }
+    const filter = runSqlFilter({ sessionId });
+    const row = this.database.prepare(`
+      SELECT run.* FROM runs AS run
+      JOIN attempts AS attempt ON attempt.id = run.active_attempt_id
+      ${filter.where} AND attempt.generation = ?
+      ORDER BY run.rowid DESC LIMIT 1
+    `).get(...filter.params, generation) as Row | undefined;
+    return row === undefined ? undefined : runFromRow(row);
+  }
+
   countRuns(options: Omit<RunListOptions, "limit" | "offset"> = {}): number {
     this.assertOpen();
     const filter = runSqlFilter(options);
