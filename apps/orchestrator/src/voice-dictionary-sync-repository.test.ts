@@ -70,7 +70,8 @@ describe("VoiceDictionarySyncRepository", () => {
       revision: 1,
       replicaId: "voice-replica-a",
       enabled: false,
-      dictionary: { entries: [], candidates: [], suppressedAutomaticTexts: [] }
+      dictionary: { entries: [], candidates: [], suppressedAutomaticTexts: [] },
+      refinementTerms: []
     });
     expect(Object.keys(stored(store)).sort()).toEqual([
       "enabled", "format", "payload", "revision"
@@ -285,5 +286,54 @@ describe("VoiceDictionarySyncRepository", () => {
     expect(deleted.dictionary.suppressedAutomaticTexts).toEqual([]);
     expect(repository.deleteEntry(deleted.revision, entry.id)).toEqual(deleted);
     store.close();
+  });
+
+  it("commits bounded manual imports and learning actions once and projects refinement terms", async () => {
+    const { store } = await fixture();
+    let now = 1_900_000_000_000;
+    const published = vi.fn();
+    const repository = new VoiceDictionarySyncRepository({
+      store,
+      now: () => now,
+      createReplicaId: () => "voice-replica-batch",
+      onChanged: published
+    });
+    const imported = repository.addManualTerms(repository.snapshot().revision, ["Joko", "Orchestrator", "joko"]);
+    expect(imported.revision).toBe(2);
+    expect(imported.dictionary.entries.map((entry) => entry.text).sort()).toEqual(["Joko", "Orchestrator"]);
+    expect(imported.refinementTerms).toEqual(expect.arrayContaining(["Joko", "Orchestrator"]));
+
+    now += 1;
+    const learned = repository.applyLearning(imported.revision, [{
+      text: "VoiceKit",
+      aliases: ["voice kit"],
+      stage: "candidate"
+    }, {
+      text: "Joko",
+      aliases: ["jo ko"],
+      stage: "entry"
+    }]);
+    expect(learned.revision).toBe(3);
+    expect(learned.dictionary.candidates).toMatchObject([{ text: "VoiceKit", evidenceCount: 1 }]);
+    expect(learned.dictionary.entries.find((entry) => entry.text === "Joko")).toMatchObject({ frequency: 2 });
+    expect(published).toHaveBeenCalledTimes(2);
+    expect(() => repository.applyLearning(learned.revision, Array.from({ length: 4 }, () => ({
+      text: "overflow",
+      aliases: ["over flow"],
+      stage: "candidate" as const
+    })))).toThrow(expect.objectContaining<Partial<VoiceDictionarySyncRepositoryError>>({ code: "INVALID" }));
+    expect(repository.snapshot()).toEqual(learned);
+    store.close();
+  });
+  it("rejects a manual batch that would hide entries beyond the service projection limit", async () => {
+    const { store } = await fixture();
+    try {
+      const repository = new VoiceDictionarySyncRepository({ store });
+      const full = repository.addManualTerms(1, Array.from({ length: 1_000 }, (_value, index) => `Term ${index}`));
+      expect(full.dictionary.entries).toHaveLength(1_000);
+      expect(() => repository.addManualTerms(full.revision, ["Term 0", "Overflow"]))
+        .toThrow(expect.objectContaining<Partial<VoiceDictionarySyncRepositoryError>>({ code: "INVALID" }));
+      expect(repository.snapshot()).toEqual(full);
+    } finally { store.close(); }
   });
 });

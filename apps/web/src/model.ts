@@ -4555,7 +4555,6 @@ export type MessagingConnectionTestResultView =
 
 export interface VoiceInputRefinementContextView {
   readonly instructions?: string;
-  readonly dictionaryTerms: readonly string[];
 }
 
 export interface SettingsView {
@@ -5197,6 +5196,39 @@ export interface VoiceInputDictionaryAdviceView {
   readonly actions: readonly VoiceInputDictionaryLearningActionView[];
 }
 
+export interface VoiceInputDictionaryAliasView {
+  readonly text: string;
+  readonly count: number;
+  readonly lastSeenAt: number;
+}
+
+export interface VoiceInputDictionaryEntryView {
+  readonly id: string;
+  readonly text: string;
+  readonly source: "manual" | "automatic";
+  readonly frequency: number;
+  readonly aliases: readonly VoiceInputDictionaryAliasView[];
+  readonly createdAt: number;
+  readonly updatedAt: number;
+}
+
+export interface VoiceInputDictionaryCandidateView {
+  readonly text: string;
+  readonly evidenceCount: number;
+  readonly aliases: readonly VoiceInputDictionaryAliasView[];
+  readonly createdAt: number;
+  readonly updatedAt: number;
+}
+
+export interface VoiceInputDictionarySnapshotView {
+  readonly revision: bigint;
+  readonly syncEnabled: boolean;
+  readonly entries: readonly VoiceInputDictionaryEntryView[];
+  readonly candidates: readonly VoiceInputDictionaryCandidateView[];
+  readonly suppressedAutomaticTerms: readonly string[];
+  readonly refinementTerms: readonly string[];
+}
+
 export type VoiceInputStateView = "idle" | "listening" | "submitting" | "refining" | "done" | "error";
 export type VoiceInputOutcomeView = "success" | "noSpeech" | "failed" | "cancelled";
 export type VoiceInputTextSourceView = "partial" | "stable";
@@ -5550,6 +5582,12 @@ export interface OperationApi {
   cancelTaskHistoryCleanup(maintenanceId: string): Promise<TaskHistoryCleanupProgressView>;
   getVoiceInputCapabilities(signal?: AbortSignal): Promise<VoiceInputCapabilityView>;
   testVoiceInputConnection(signal?: AbortSignal): Promise<VoiceInputConnectionTestResultView>;
+  getVoiceInputDictionary(signal?: AbortSignal): Promise<VoiceInputDictionarySnapshotView>;
+  setVoiceInputDictionarySyncEnabled(expectedRevision: bigint, enabled: boolean, signal?: AbortSignal): Promise<VoiceInputDictionarySnapshotView>;
+  addVoiceInputDictionaryTerms(expectedRevision: bigint, terms: readonly string[], signal?: AbortSignal): Promise<VoiceInputDictionarySnapshotView>;
+  editVoiceInputDictionaryEntry(expectedRevision: bigint, entryId: string, text: string, aliases: readonly string[], signal?: AbortSignal): Promise<VoiceInputDictionarySnapshotView>;
+  deleteVoiceInputDictionaryEntry(expectedRevision: bigint, entryId: string, signal?: AbortSignal): Promise<VoiceInputDictionarySnapshotView>;
+  applyVoiceInputDictionaryLearning(expectedRevision: bigint, actions: readonly VoiceInputDictionaryLearningActionView[], signal?: AbortSignal): Promise<VoiceInputDictionarySnapshotView>;
   adviseVoiceInputDictionaryEdit(draft: VoiceInputDictionaryAdviceDraft, signal?: AbortSignal): Promise<VoiceInputDictionaryAdviceView>;
   startVoiceInput(
     requestId: string,

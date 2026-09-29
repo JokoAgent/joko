@@ -11,6 +11,11 @@ import {
   type VoiceInputSessionSnapshot
 } from "./voice-input-coordinator.js";
 import type { VoiceInputConnectionTestResult, VoiceInputSettingsController } from "./voice-input-settings.js";
+import {
+  VoiceDictionarySyncRepositoryError,
+  type VoiceDictionarySyncRepository,
+  type VoiceDictionarySyncSnapshot
+} from "./voice-dictionary-sync-repository.js";
 
 export interface VoiceInputRpcOwner {
   readonly connectionId: string;
@@ -19,6 +24,8 @@ export interface VoiceInputRpcOwner {
 export function createVoiceInputConnectService(
   coordinator: VoiceInputCoordinator | undefined,
   settings: Pick<VoiceInputSettingsController, "adviseDictionaryEdit" | "testConnection"> | undefined,
+  dictionary: Pick<VoiceDictionarySyncRepository,
+    "addManualTerms" | "applyLearning" | "deleteEntry" | "editEntry" | "setEnabled" | "snapshot"> | undefined,
   authenticate: (context: HandlerContext) => VoiceInputRpcOwner
 ): ServiceImpl<typeof contract.VoiceInputService> {
   return {
@@ -34,6 +41,69 @@ export function createVoiceInputConnectService(
       return create(contract.TestVoiceInputConnectionResponseSchema, {
         ok: result.ok,
         failure: toProtoConnectionTestFailure(result)
+      });
+    }),
+    getVoiceInputDictionary: async (_request, context) => voiceRpc(async () => {
+      authenticate(context);
+      return create(contract.GetVoiceInputDictionaryResponseSchema, {
+        dictionary: toProtoDictionarySnapshot(requireDictionary(dictionary).snapshot())
+      });
+    }),
+    setVoiceInputDictionarySyncEnabled: async (request, context) => voiceRpc(async () => {
+      authenticate(context);
+      requireActiveMutation(context);
+      const snapshot = requireDictionary(dictionary).setEnabled(requireRevision(request.expectedRevision), request.enabled);
+      return create(contract.SetVoiceInputDictionarySyncEnabledResponseSchema, {
+        dictionary: toProtoDictionarySnapshot(snapshot)
+      });
+    }),
+    addVoiceInputDictionaryTerms: async (request, context) => voiceRpc(async () => {
+      authenticate(context);
+      requireActiveMutation(context);
+      const snapshot = requireDictionary(dictionary).addManualTerms(
+        requireRevision(request.expectedRevision),
+        request.terms
+      );
+      return create(contract.AddVoiceInputDictionaryTermsResponseSchema, {
+        dictionary: toProtoDictionarySnapshot(snapshot)
+      });
+    }),
+    editVoiceInputDictionaryEntry: async (request, context) => voiceRpc(async () => {
+      authenticate(context);
+      requireActiveMutation(context);
+      const snapshot = requireDictionary(dictionary).editEntry(requireRevision(request.expectedRevision), {
+        entryId: request.entryId,
+        text: request.text,
+        aliases: request.aliases
+      });
+      return create(contract.EditVoiceInputDictionaryEntryResponseSchema, {
+        dictionary: toProtoDictionarySnapshot(snapshot)
+      });
+    }),
+    deleteVoiceInputDictionaryEntry: async (request, context) => voiceRpc(async () => {
+      authenticate(context);
+      requireActiveMutation(context);
+      const snapshot = requireDictionary(dictionary).deleteEntry(
+        requireRevision(request.expectedRevision),
+        request.entryId
+      );
+      return create(contract.DeleteVoiceInputDictionaryEntryResponseSchema, {
+        dictionary: toProtoDictionarySnapshot(snapshot)
+      });
+    }),
+    applyVoiceInputDictionaryLearning: async (request, context) => voiceRpc(async () => {
+      authenticate(context);
+      requireActiveMutation(context);
+      const snapshot = requireDictionary(dictionary).applyLearning(
+        requireRevision(request.expectedRevision),
+        request.actions.map((action) => ({
+          text: action.term,
+          aliases: action.aliases,
+          stage: fromProtoDictionaryLearningStage(action.action)
+        }))
+      );
+      return create(contract.ApplyVoiceInputDictionaryLearningResponseSchema, {
+        dictionary: toProtoDictionarySnapshot(snapshot)
       });
     }),
     adviseVoiceInputDictionaryEdit: async (request, context) => voiceRpc(async () => {
@@ -69,13 +139,15 @@ export function createVoiceInputConnectService(
     }),
     startVoiceInput: async (request, context) => voiceRpc(async () => {
       const owner = authenticate(context);
-      const session = await requireCoordinator(coordinator).start({
+      const runtime = requireCoordinator(coordinator);
+      const dictionaryTerms = requireDictionary(dictionary).snapshot().refinementTerms;
+      const session = await runtime.start({
         ownerConnectionId: owner.connectionId,
         requestId: request.requestId,
         mimeType: request.mimeType,
         ...(request.locale === undefined ? {} : { locale: request.locale }),
         ...(request.refinementInstructions === undefined ? {} : { refinementInstructions: request.refinementInstructions }),
-        dictionaryTerms: request.dictionaryTerms
+        dictionaryTerms
       });
       return create(contract.StartVoiceInputResponseSchema, { session: toProtoSession(session) });
     }),
@@ -117,6 +189,41 @@ export function createVoiceInputConnectService(
       return create(contract.GetVoiceInputSessionResponseSchema, { session: toProtoSession(session) });
     })
   } satisfies ServiceImpl<typeof contract.VoiceInputService>;
+}
+
+function toProtoDictionarySnapshot(value: VoiceDictionarySyncSnapshot): contract.VoiceInputDictionarySnapshot {
+  return create(contract.VoiceInputDictionarySnapshotSchema, {
+    revision: BigInt(value.revision),
+    syncEnabled: value.enabled,
+    entries: value.dictionary.entries.map((entry) => create(contract.VoiceInputDictionarySnapshotEntrySchema, {
+      entryId: entry.id,
+      text: entry.text,
+      source: entry.source === "automatic"
+        ? contract.VoiceInputDictionaryEntrySource.AUTOMATIC
+        : contract.VoiceInputDictionaryEntrySource.MANUAL,
+      frequency: BigInt(entry.frequency),
+      aliases: entry.aliases.map((alias) => create(contract.VoiceInputDictionarySnapshotAliasSchema, {
+        text: alias.text,
+        count: BigInt(alias.count),
+        lastSeenAt: toProtoTimestamp(alias.lastSeenAt)
+      })),
+      createdAt: toProtoTimestamp(entry.createdAt),
+      updatedAt: toProtoTimestamp(entry.updatedAt)
+    })),
+    candidates: value.dictionary.candidates.map((candidate) => create(contract.VoiceInputDictionarySnapshotCandidateSchema, {
+      text: candidate.text,
+      evidenceCount: BigInt(candidate.evidenceCount),
+      aliases: candidate.aliases.map((alias) => create(contract.VoiceInputDictionarySnapshotAliasSchema, {
+        text: alias.text,
+        count: BigInt(alias.count),
+        lastSeenAt: toProtoTimestamp(alias.lastSeenAt)
+      })),
+      createdAt: toProtoTimestamp(candidate.createdAt),
+      updatedAt: toProtoTimestamp(candidate.updatedAt)
+    })),
+    suppressedAutomaticTerms: [...value.dictionary.suppressedAutomaticTexts],
+    refinementTerms: [...value.refinementTerms]
+  });
 }
 
 function toProtoCapability(value: VoiceInputCapabilitySnapshot): contract.VoiceInputCapabilityProfile {
@@ -261,6 +368,40 @@ function requireSettings(
   return value;
 }
 
+function requireDictionary(
+  value: Pick<VoiceDictionarySyncRepository,
+    "addManualTerms" | "applyLearning" | "deleteEntry" | "editEntry" | "setEnabled" | "snapshot"> | undefined
+): Pick<VoiceDictionarySyncRepository,
+  "addManualTerms" | "applyLearning" | "deleteEntry" | "editEntry" | "setEnabled" | "snapshot"> {
+  if (value === undefined) throw new VoiceInputControlError("not_supported");
+  return value;
+}
+
+function requireRevision(value: bigint): number {
+  const revision = Number(value);
+  if (!Number.isSafeInteger(revision) || revision <= 0) {
+    throw new ConnectError("Voice dictionary revision is invalid.", Code.InvalidArgument);
+  }
+  return revision;
+}
+
+function requireActiveMutation(context: HandlerContext): void {
+  if (context.signal.aborted) throw new ConnectError("Voice dictionary mutation was cancelled.", Code.Canceled);
+}
+
+function fromProtoDictionaryLearningStage(
+  value: contract.VoiceInputDictionaryLearningActionType
+): "candidate" | "entry" {
+  switch (value) {
+    case contract.VoiceInputDictionaryLearningActionType.ADD_CANDIDATE: return "candidate";
+    case contract.VoiceInputDictionaryLearningActionType.ADD_ENTRY:
+    case contract.VoiceInputDictionaryLearningActionType.UPDATE_ENTRY: return "entry";
+    case contract.VoiceInputDictionaryLearningActionType.UNSPECIFIED:
+    default:
+      throw new ConnectError("Voice dictionary learning action is invalid.", Code.InvalidArgument);
+  }
+}
+
 function toProtoDictionaryAction(
   value: "add_candidate" | "add_entry" | "update_entry"
 ): contract.VoiceInputDictionaryLearningActionType {
@@ -305,6 +446,12 @@ async function voiceRpc<T>(callback: () => Promise<T>): Promise<T> {
   try {
     return await callback();
   } catch (error) {
+    if (error instanceof VoiceDictionarySyncRepositoryError) {
+      const code = error.code === "INVALID" ? Code.InvalidArgument
+        : error.code === "CONFLICT" ? Code.Aborted
+          : Code.Unavailable;
+      throw new ConnectError(error.message, code);
+    }
     if (!(error instanceof VoiceInputControlError)) throw error;
     const code = error.code === "invalid_argument" ? Code.InvalidArgument
       : error.code === "not_found" ? Code.NotFound

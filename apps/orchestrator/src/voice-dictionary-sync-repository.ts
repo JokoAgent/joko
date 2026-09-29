@@ -1,5 +1,6 @@
 import {
   DEFAULT_TOMBSTONE_TTL_MS,
+  DEFAULT_MATERIALIZE_LIMITS,
   MAX_AUTOMATIC_CANDIDATE_RECORDS,
   addManualEntry,
   createEmptySyncState,
@@ -36,6 +37,10 @@ const SETTING_SCOPE_TYPE = "service" as const;
 const SETTING_SCOPE_ID = "orchestrator";
 const STORED_FORMAT = 1;
 const MAXIMUM_EDIT_ALIASES = 8;
+const MAXIMUM_MANUAL_TERMS_PER_MUTATION = 1_000;
+const MAXIMUM_LEARNING_ACTIONS_PER_MUTATION = 3;
+const MAXIMUM_REFINEMENT_TERMS = 200;
+const MAXIMUM_REFINEMENT_CHARACTERS = 8_000;
 const MAXIMUM_STORED_PAYLOAD_CHARACTERS = 3_700_000;
 
 interface StoredVoiceDictionarySyncEnvelope {
@@ -63,6 +68,13 @@ export interface VoiceDictionarySyncSnapshot {
   readonly replicaId: string;
   readonly enabled: boolean;
   readonly dictionary: MaterializedDictionary;
+  readonly refinementTerms: readonly string[];
+}
+
+export interface VoiceDictionaryLearningMutation {
+  readonly text: string;
+  readonly aliases: readonly string[];
+  readonly stage: "candidate" | "entry";
 }
 
 export type VoiceDictionarySyncRepositoryErrorCode = "INVALID" | "CONFLICT" | "UNAVAILABLE";
@@ -173,9 +185,26 @@ export class VoiceDictionarySyncRepository {
   }
 
   addManualTerm(expectedRevision: number, text: string): VoiceDictionarySyncSnapshot {
-    const normalized = requireTerm(text);
-    return this.#mutateState(expectedRevision, (state, clock, nowMs) =>
-      addManualEntry(state, clock, { text: normalized, nowMs }));
+    return this.addManualTerms(expectedRevision, [text]);
+  }
+
+  addManualTerms(expectedRevision: number, terms: readonly string[]): VoiceDictionarySyncSnapshot {
+    if (!Array.isArray(terms) || terms.length === 0 || terms.length > MAXIMUM_MANUAL_TERMS_PER_MUTATION) {
+      throw invalid("Voice dictionary manual terms are invalid.");
+    }
+    const normalized = requireDistinctTerms(terms);
+    return this.#mutateState(expectedRevision, (state, clock, nowMs) => {
+      const keys = new Set(materializeDictionary(state, {
+        ...DEFAULT_MATERIALIZE_LIMITS, maxEntries: Number.MAX_SAFE_INTEGER
+      }).entries.map((entry) => dictionaryTermKey(entry.text)));
+      for (const text of normalized) keys.add(dictionaryTermKey(text));
+      if (keys.size > DEFAULT_MATERIALIZE_LIMITS.maxEntries) throw invalid("The Voice dictionary entry limit was reached.");
+      let result: MutationResult = { state, clock, changed: false };
+      for (const text of normalized) {
+        result = combineMutation(result, addManualEntry(result.state, result.clock, { text, nowMs }));
+      }
+      return result;
+    });
   }
 
   learn(
@@ -189,6 +218,38 @@ export class VoiceDictionarySyncRepository {
     }
     return this.#mutateState(expectedRevision, (state, clock, nowMs) =>
       recordLearningEvent(state, clock, { text, aliases: [...aliases], stage: input.stage, nowMs }));
+  }
+
+  applyLearning(
+    expectedRevision: number,
+    actions: readonly VoiceDictionaryLearningMutation[]
+  ): VoiceDictionarySyncSnapshot {
+    if (!Array.isArray(actions) || actions.length === 0
+      || actions.length > MAXIMUM_LEARNING_ACTIONS_PER_MUTATION) {
+      throw invalid("Voice dictionary learning actions are invalid.");
+    }
+    const normalized = actions.map((action) => {
+      if (action.stage !== "candidate" && action.stage !== "entry") {
+        throw invalid("Voice dictionary learning stage is invalid.");
+      }
+      return {
+        text: requireTerm(action.text),
+        aliases: requireAliases(action.aliases),
+        stage: action.stage
+      } satisfies VoiceDictionaryLearningMutation;
+    });
+    return this.#mutateState(expectedRevision, (state, clock, nowMs) => {
+      let result: MutationResult = { state, clock, changed: false };
+      for (const action of normalized) {
+        result = combineMutation(result, recordLearningEvent(result.state, result.clock, {
+          text: action.text,
+          aliases: [...action.aliases],
+          stage: action.stage,
+          nowMs
+        }));
+      }
+      return result;
+    });
   }
 
   editEntry(
@@ -357,12 +418,38 @@ function maintainState(result: MutationResult, nowMs: number): MutationResult {
 }
 
 function snapshotOf(document: VoiceDictionarySyncDocument): VoiceDictionarySyncSnapshot {
+  const dictionary = materializeDictionary(document.state);
   return Object.freeze({
     revision: document.revision,
     replicaId: document.replicaId,
     enabled: document.enabled,
-    dictionary: materializeDictionary(document.state)
+    dictionary,
+    refinementTerms: refinementTerms(dictionary)
   });
+}
+
+function combineMutation(previous: MutationResult, next: MutationResult): MutationResult {
+  return {
+    state: next.state,
+    clock: next.clock,
+    changed: previous.changed || next.changed
+  };
+}
+
+function refinementTerms(dictionary: MaterializedDictionary): readonly string[] {
+  const ordered = dictionary.entries.slice().sort((left, right) => {
+    if (left.source !== right.source) return left.source === "manual" ? -1 : 1;
+    return right.frequency - left.frequency || right.updatedAt - left.updatedAt;
+  });
+  const terms: string[] = [];
+  let characters = 0;
+  for (const entry of ordered) {
+    if (terms.length >= MAXIMUM_REFINEMENT_TERMS
+      || characters + entry.text.length > MAXIMUM_REFINEMENT_CHARACTERS) break;
+    terms.push(entry.text);
+    characters += entry.text.length;
+  }
+  return Object.freeze(terms);
 }
 
 function sameSyncState(left: VoiceDictionarySyncState, right: VoiceDictionarySyncState): boolean {
@@ -494,6 +581,20 @@ function requireAliases(values: readonly string[]): readonly string[] {
     aliases.push(text);
   }
   return aliases;
+}
+
+function requireDistinctTerms(values: readonly string[]): readonly string[] {
+  const terms: string[] = [];
+  const seen = new Set<string>();
+  for (const value of values) {
+    const text = requireTerm(value);
+    const key = dictionaryTermKey(text);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    terms.push(text);
+  }
+  if (terms.length === 0) throw invalid("Voice dictionary manual terms are empty.");
+  return terms;
 }
 
 function assertExpectedRevision(value: number): void {

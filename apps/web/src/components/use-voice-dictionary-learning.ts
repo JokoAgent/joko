@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef } from "react";
 import type { AppController } from "../controller.js";
-import { applyVoiceDictionaryAdvice, voiceDictionaryAdviceDraft } from "../voice-input-dictionary.js";
-import { readVoiceInputPreferences, subscribeVoiceInputPreferences, voiceInputLocale, writeVoiceInputPreferences } from "../voice-input-preferences.js";
+import { voiceDictionaryAdviceDraft } from "../voice-input-dictionary.js";
+import { readVoiceInputPreferences, subscribeVoiceInputPreferences, voiceInputLocale } from "../voice-input-preferences.js";
 import { inspectVoiceInsertedEdit, type VoiceInsertedEditTracker } from "./voice-inserted-edit.js";
 
 interface VoiceDictionaryLearningOptions {
@@ -13,6 +13,7 @@ interface VoiceDictionaryLearningOptions {
 interface PendingVoiceDictionaryEdit {
   readonly tracker: VoiceInsertedEditTracker;
   readonly ownerKey: string;
+  readonly source: AppController["getVoiceInputDictionary"];
   timer?: number;
   request?: AbortController;
   evidenceKey?: string;
@@ -30,13 +31,14 @@ export function useVoiceDictionaryLearning(options: VoiceDictionaryLearningOptio
     if (pending?.timer !== undefined) window.clearTimeout(pending.timer);
     pending?.request?.abort();
   }, []);
-  useEffect(() => clear, [clear, connected, options.enabled, options.ownerKey]);
+  useEffect(() => clear, [clear, connected, options.enabled, options.ownerKey, options.controller.getVoiceInputDictionary]);
   useEffect(() => subscribeVoiceInputPreferences((preferences) => {
     if (!preferences.autoDictionaryEnabled) clear();
   }), [clear]);
 
   const current = (pending: PendingVoiceDictionaryEdit): boolean => pendingRef.current === pending
     && pending.ownerKey === latest.current.ownerKey
+    && pending.source === latest.current.controller.getVoiceInputDictionary
     && latest.current.controller.state.connectionState === "connected"
     && latest.current.enabled
     && readVoiceInputPreferences().autoDictionaryEnabled;
@@ -46,7 +48,7 @@ export function useVoiceDictionaryLearning(options: VoiceDictionaryLearningOptio
     clear();
     if (latest.current.controller.state.connectionState !== "connected"
       || !latest.current.enabled || !readVoiceInputPreferences().autoDictionaryEnabled) return;
-    pendingRef.current = { tracker, ownerKey };
+    pendingRef.current = { tracker, ownerKey, source: latest.current.controller.getVoiceInputDictionary };
   };
 
   const observe = (nextText: string, isComposing: boolean): void => {
@@ -78,16 +80,22 @@ export function useVoiceDictionaryLearning(options: VoiceDictionaryLearningOptio
       const request = new AbortController();
       pending.request = request;
       const locale = voiceInputLocale(preferences);
-      void latest.current.controller.adviseVoiceInputDictionaryEdit(voiceDictionaryAdviceDraft(preferences.dictionary, {
-        beforeText: inspection.beforeText,
-        afterText: inspection.afterText,
-        ...(inspection.rawTranscriptText === undefined ? {} : { rawTranscriptText: inspection.rawTranscriptText }),
-        ...(locale === undefined ? {} : { locale })
-      }), request.signal).then((advice) => {
+      const controller = latest.current.controller;
+      void controller.getVoiceInputDictionary(request.signal).then(async (dictionary) => {
         if (request.signal.aborted || !current(pending) || pending.evidenceKey !== evidenceKey) return;
-        const preferences = readVoiceInputPreferences();
-        const dictionary = applyVoiceDictionaryAdvice(preferences.dictionary, advice.actions);
-        if (dictionary !== preferences.dictionary) writeVoiceInputPreferences({ dictionary });
+        const advice = await controller.adviseVoiceInputDictionaryEdit(voiceDictionaryAdviceDraft(dictionary, {
+          beforeText: inspection.beforeText,
+          afterText: inspection.afterText,
+          ...(inspection.rawTranscriptText === undefined ? {} : { rawTranscriptText: inspection.rawTranscriptText }),
+          ...(locale === undefined ? {} : { locale })
+        }), request.signal);
+        if (request.signal.aborted || !current(pending) || pending.evidenceKey !== evidenceKey
+          || advice.actions.length === 0) return;
+        await controller.applyVoiceInputDictionaryLearning(
+          dictionary.revision,
+          advice.actions,
+          request.signal
+        );
       }).catch(() => undefined).finally(() => {
         if (pendingRef.current === pending && pending.request === request) pendingRef.current = undefined;
       });

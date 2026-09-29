@@ -136,6 +136,42 @@ message VoiceInputDictionaryLearningAction {
   VoiceInputDictionaryLearningConfidence confidence = 5;
 }
 
+// Bounded materialized projection of the service-owned current-v1 dictionary
+// replica. Convergence state and replica identity never cross the UI contract.
+message VoiceInputDictionarySnapshotAlias {
+  string text = 1;
+  uint64 count = 2;
+  google.protobuf.Timestamp last_seen_at = 3;
+}
+
+message VoiceInputDictionarySnapshotEntry {
+  string entry_id = 1;
+  string text = 2;
+  VoiceInputDictionaryEntrySource source = 3;
+  uint64 frequency = 4;
+  repeated VoiceInputDictionarySnapshotAlias aliases = 5;
+  google.protobuf.Timestamp created_at = 6;
+  google.protobuf.Timestamp updated_at = 7;
+}
+
+message VoiceInputDictionarySnapshotCandidate {
+  string text = 1;
+  uint64 evidence_count = 2;
+  repeated VoiceInputDictionarySnapshotAlias aliases = 3;
+  google.protobuf.Timestamp created_at = 4;
+  google.protobuf.Timestamp updated_at = 5;
+}
+
+message VoiceInputDictionarySnapshot {
+  uint64 revision = 1;
+  bool sync_enabled = 2;
+  repeated VoiceInputDictionarySnapshotEntry entries = 3;
+  repeated VoiceInputDictionarySnapshotCandidate candidates = 4;
+  repeated string suppressed_automatic_terms = 5;
+  // Exact bounded terms the service will inject into a refinement request.
+  repeated string refinement_terms = 6;
+}
+
 // Failure projection is intentionally closed and content-free. Provider error
 // text, audio, credentials, and transcripts are not representable here.
 message VoiceInputFailure {

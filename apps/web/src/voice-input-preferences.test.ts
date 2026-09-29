@@ -27,8 +27,6 @@ describe("voice input preferences", () => {
       deviceId: "device-a",
       shortcut,
       refinementInstructions: "",
-      dictionary: { entries: [], candidates: [], suppressedAutomaticTexts: [] },
-      dictionaryTerms: [],
       autoDictionaryEnabled: true,
       playInteractionSound: true,
       fastActivationEnabled: false,
@@ -40,9 +38,9 @@ describe("voice input preferences", () => {
 
   it("rejects malformed or noncanonical stored values as a whole", () => {
     expect(parseVoiceInputPreferences({ locale: "not_a_locale", deviceId: "bad\0device", shortcut: "unexpected" }))
-      .toEqual({ locale: "auto", shortcut: defaultVoiceInputShortcut(), refinementInstructions: "", dictionary: { entries: [], candidates: [], suppressedAutomaticTexts: [] }, dictionaryTerms: [], autoDictionaryEnabled: true, playInteractionSound: true, fastActivationEnabled: false, muteOtherSounds: true });
+      .toEqual({ locale: "auto", shortcut: defaultVoiceInputShortcut(), refinementInstructions: "", autoDictionaryEnabled: true, playInteractionSound: true, fastActivationEnabled: false, muteOtherSounds: true });
     expect(parseVoiceInputPreferences({ locale: "en-us" }))
-      .toEqual({ locale: "auto", shortcut: defaultVoiceInputShortcut(), refinementInstructions: "", dictionary: { entries: [], candidates: [], suppressedAutomaticTexts: [] }, dictionaryTerms: [], autoDictionaryEnabled: true, playInteractionSound: true, fastActivationEnabled: false, muteOtherSounds: true });
+      .toEqual({ locale: "auto", shortcut: defaultVoiceInputShortcut(), refinementInstructions: "", autoDictionaryEnabled: true, playInteractionSound: true, fastActivationEnabled: false, muteOtherSounds: true });
     const current = writeVoiceInputPreferences({}, undefined);
     const { muteOtherSounds: _missingBoolean, ...incompletePreferences } = current;
     expect(parseVoiceInputPreferences(incompletePreferences)).toEqual(parseVoiceInputPreferences(undefined));
@@ -106,17 +104,18 @@ describe("voice input preferences", () => {
     expect(parseVoiceDictionaryCsv('"unterminated')).toEqual({ ok: false, reason: "invalid" });
   });
 
-  it("persists bounded refinement instructions and dictionary terms", () => {
+  it("persists bounded refinement instructions without accepting a local dictionary authority", () => {
     const saved = writeVoiceInputPreferences({
       refinementInstructions: "Keep shell commands verbatim.",
-      dictionaryTerms: ["Joko", "Orchestrator", "joko"],
       playInteractionSound: false
     }, undefined);
     expect(saved).toMatchObject({
       refinementInstructions: "Keep shell commands verbatim.",
-      dictionaryTerms: ["Joko", "Orchestrator"],
       playInteractionSound: false
     });
     expect(writeVoiceInputPreferences({ muteOtherSounds: false }, undefined).muteOtherSounds).toBe(false);
+    const current = writeVoiceInputPreferences({}, undefined);
+    expect(parseVoiceInputPreferences({ ...current, dictionary: { entries: [] }, dictionaryTerms: [] }))
+      .toEqual(parseVoiceInputPreferences(undefined));
   });
 });

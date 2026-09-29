@@ -68,10 +68,10 @@ describe("mobile voice ephemeral requests", () => {
       instructions: "Keep commands verbatim.", dictionaryTerms: ["VoiceKit", "Joko"]
     })).toEqual({
       requestId: "request", mimeType: "audio/pcm", locale: "en-US",
-      refinementInstructions: "Keep commands verbatim.", dictionaryTerms: ["VoiceKit", "Joko"]
+      refinementInstructions: "Keep commands verbatim."
     });
     expect(mobileVoiceNetworkTesting.startRequest("request", "audio/pcm", undefined, undefined))
-      .toEqual({ requestId: "request", mimeType: "audio/pcm", dictionaryTerms: [] });
+      .toEqual({ requestId: "request", mimeType: "audio/pcm" });
   });
 
   it("fails closed on malformed or unspecified advisor actions", () => {

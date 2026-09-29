@@ -23,6 +23,7 @@ import type {
   ModelRouteRefView,
   VoiceInputCapabilityView,
   VoiceInputConnectionTestFailureView,
+  VoiceInputDictionarySnapshotView,
   VoiceInputTranscriptionProtocolView
 } from "../model.js";
 import { supportsVoiceMediaCapture } from "../voice-input-media.js";
@@ -51,12 +52,9 @@ import {
   type VoiceInputShortcutCombo,
 } from "../voice-input-preferences.js";
 import {
-  addManualVoiceDictionaryTerm,
-  deleteVoiceDictionaryEntry,
-  mergeManualVoiceDictionaryTerms,
-  editVoiceDictionaryEntry,
-  voiceDictionaryTermKey,
-  type VoiceInputDictionaryState
+  normalizeVoiceDictionaryTerm,
+  parseVoiceDictionaryAliasDraft,
+  voiceDictionaryTermKey
 } from "../voice-input-dictionary.js";
 import type { Translator } from "./types.js";
 import { Button, ErrorBanner, Pill, CheckboxControl, SelectControl, SwitchControl } from "./ui.js";
@@ -65,6 +63,11 @@ type CapabilityState =
   | { readonly kind: "loading" }
   | { readonly kind: "ready"; readonly value: VoiceInputCapabilityView }
   | { readonly kind: "error" };
+
+type DictionaryState = { readonly source?: AppController["getVoiceInputDictionary"] } & (
+  | { readonly kind: "loading" }
+  | { readonly kind: "ready"; readonly value: VoiceInputDictionarySnapshotView }
+  | { readonly kind: "error" });
 
 type MicrophonePermissionState = "granted" | "denied" | "prompt" | "unknown";
 
@@ -123,6 +126,12 @@ export function VoiceInputSettings({ controller, t }: {
   const [editingDictionaryDraft, setEditingDictionaryDraft] = useState("");
   const [editingDictionaryAliasesDraft, setEditingDictionaryAliasesDraft] = useState("");
   const [dictionaryMessage, setDictionaryMessage] = useState<{ readonly error: boolean; readonly text: string }>();
+  const [dictionaryState, setDictionaryState] = useState<DictionaryState>({ kind: "loading" });
+  const [dictionaryBusy, setDictionaryBusy] = useState(false);
+  const dictionaryRequestRef = useRef(0);
+  const dictionaryAbortRef = useRef<AbortController | undefined>(undefined);
+  const dictionarySourceRef = useRef(controller.getVoiceInputDictionary);
+  dictionarySourceRef.current = controller.getVoiceInputDictionary;
   const dictionaryListRef = useRef<HTMLDivElement>(null);
   const dictionarySearchRef = useRef<HTMLInputElement>(null);
   const dictionaryFocusRef = useRef<string | undefined>(undefined);
@@ -146,6 +155,34 @@ export function VoiceInputSettings({ controller, t }: {
   useEffect(() => subscribeVoiceInputPreferences(setPreferences), []);
   useEffect(() => subscribeVoiceInputUsage(setUsage), []);
   useEffect(() => () => { connectionTestRequestRef.current += 1; }, []);
+  const loadDictionary = useCallback((): void => {
+    const source = controller.getVoiceInputDictionary;
+    const sequence = ++dictionaryRequestRef.current;
+    dictionaryAbortRef.current?.abort();
+    const request = new AbortController();
+    dictionaryAbortRef.current = request;
+    setDictionaryBusy(false);
+    setEditingDictionaryEntryId(undefined);
+    setDictionaryState({ kind: "loading", source });
+    setDictionaryMessage(undefined);
+    void source(request.signal).then((value) => {
+      if (dictionaryRequestRef.current === sequence && dictionarySourceRef.current === source && !request.signal.aborted) {
+        setDictionaryState({ kind: "ready", source, value });
+      }
+    }).catch(() => {
+      if (dictionaryRequestRef.current === sequence && dictionarySourceRef.current === source && !request.signal.aborted) {
+        setDictionaryState({ kind: "error", source });
+      }
+    });
+  }, [controller.getVoiceInputDictionary]);
+  useEffect(() => {
+    if (!refinementEnabled) return;
+    loadDictionary();
+    return () => {
+      dictionaryRequestRef.current += 1;
+      dictionaryAbortRef.current?.abort();
+    };
+  }, [loadDictionary, refinementEnabled]);
   useEffect(() => {
     const id = dictionaryFocusRef.current;
     if (id === undefined) return;
@@ -153,7 +190,7 @@ export function VoiceInputSettings({ controller, t }: {
     const entry = [...(dictionaryListRef.current?.querySelectorAll<HTMLElement>("article") ?? [])]
       .find((item) => item.dataset["dictionaryEntryId"] === id);
     (entry?.querySelector<HTMLButtonElement>("[data-dictionary-edit]") ?? dictionarySearchRef.current)?.focus();
-  }, [preferences.dictionary, editingDictionaryEntryId]);
+  }, [dictionaryState, editingDictionaryEntryId]);
 
   const saveShortcutPreference = useCallback((shortcut: VoiceInputShortcutCombo | "disabled"): void => {
     setShortcutError(undefined);
@@ -452,53 +489,113 @@ export function VoiceInputSettings({ controller, t }: {
     || refinementEnabled !== service.refinementEnabled
     || selectedRefinementModel !== refinementModelKey(service.refinerModel)
     || selectedRefinementFallbackModel !== refinementModelKey(service.refinerFallbackModel);
-  const dictionaryCounts = preferences.dictionary.entries.reduce((counts, entry) => ({
+  const visibleDictionaryState = dictionaryState.source === controller.getVoiceInputDictionary
+    ? dictionaryState : { kind: "loading" as const };
+  const dictionary = visibleDictionaryState.kind === "ready" ? visibleDictionaryState.value : undefined;
+  const dictionaryEntries = dictionary?.entries ?? [];
+  const dictionaryCounts = dictionaryEntries.reduce((counts, entry) => ({
     all: counts.all + 1,
     manual: counts.manual + (entry.source === "manual" ? 1 : 0),
     automatic: counts.automatic + (entry.source === "automatic" ? 1 : 0)
   }), { all: 0, manual: 0, automatic: 0 });
   const normalizedDictionarySearch = voiceDictionaryTermKey(dictionarySearch);
-  const visibleDictionaryEntries = preferences.dictionary.entries.filter((entry) =>
+  const visibleDictionaryEntries = dictionaryEntries.filter((entry) =>
     (dictionaryFilter === "all" || entry.source === dictionaryFilter)
     && (normalizedDictionarySearch === ""
       || voiceDictionaryTermKey(entry.text).includes(normalizedDictionarySearch)
       || entry.aliases.some((alias) => voiceDictionaryTermKey(alias.text).includes(normalizedDictionarySearch))));
 
-  const persistDictionary = (dictionary: VoiceInputDictionaryState, message: string): void => {
-    const saved = writeVoiceInputPreferences({ dictionary });
-    setPreferences(saved);
-    setDictionaryMessage({ error: false, text: message });
+  const commitDictionary = async (
+    mutation: (current: VoiceInputDictionarySnapshotView, signal: AbortSignal) => Promise<VoiceInputDictionarySnapshotView>,
+    successMessage: string,
+    onCommitted?: (previous: VoiceInputDictionarySnapshotView, next: VoiceInputDictionarySnapshotView) => void
+  ): Promise<void> => {
+    const source = controller.getVoiceInputDictionary;
+    if (dictionary === undefined || dictionaryBusy || dictionarySourceRef.current !== source) return;
+    const previous = dictionary;
+    const sequence = ++dictionaryRequestRef.current;
+    dictionaryAbortRef.current?.abort();
+    const request = new AbortController();
+    dictionaryAbortRef.current = request;
+    const isCurrent = (): boolean => dictionaryRequestRef.current === sequence
+      && dictionarySourceRef.current === source && !request.signal.aborted;
+    setDictionaryBusy(true);
+    setDictionaryMessage(undefined);
+    try {
+      const next = await mutation(previous, request.signal);
+      if (!isCurrent()) return;
+      setDictionaryState({ kind: "ready", source, value: next });
+      setDictionaryMessage({ error: false, text: successMessage });
+      onCommitted?.(previous, next);
+    } catch {
+      if (!isCurrent()) return;
+      try {
+        const current = await source(request.signal);
+        if (isCurrent()) setDictionaryState({ kind: "ready", source, value: current });
+      } catch {
+        if (isCurrent()) setDictionaryState({ kind: "error", source });
+      }
+      if (isCurrent()) {
+        setDictionaryMessage({ error: true, text: t("settings.voiceInputDictionarySaveFailed") });
+      }
+    } finally {
+      if (dictionaryRequestRef.current === sequence) setDictionaryBusy(false);
+    }
   };
 
   const addDictionaryEntry = (): void => {
-    const next = addManualVoiceDictionaryTerm(preferences.dictionary, dictionaryDraft);
-    if (next === undefined) {
-      setDictionaryMessage({ error: true, text: t(dictionaryDraft.trim().length > MAXIMUM_VOICE_DICTIONARY_TERM_CHARACTERS
-        ? "settings.voiceInputDictionaryInvalid"
-        : "settings.voiceInputDictionaryTooLarge") });
+    const term = normalizeVoiceDictionaryTerm(dictionaryDraft);
+    if (term === undefined) {
+      setDictionaryMessage({ error: true, text: t("settings.voiceInputDictionaryInvalid") });
       return;
     }
-    persistDictionary(next, t("settings.voiceInputDictionaryAdded"));
-    setDictionaryDraft("");
+    if (dictionary === undefined) return;
+    if (dictionary.entries.length >= 1_000
+      && !dictionary.entries.some((entry) => voiceDictionaryTermKey(entry.text) === voiceDictionaryTermKey(term))) {
+      setDictionaryMessage({ error: true, text: t("settings.voiceInputDictionaryTooLarge") });
+      return;
+    }
+    void commitDictionary(
+      (current, signal) => controller.addVoiceInputDictionaryTerms(current.revision, [term], signal),
+      t("settings.voiceInputDictionaryAdded"),
+      () => setDictionaryDraft("")
+    );
   };
 
   const saveDictionaryEdit = (entryId: string): void => {
-    const next = editVoiceDictionaryEntry(preferences.dictionary, entryId, editingDictionaryDraft, editingDictionaryAliasesDraft);
-    if (next === undefined) {
+    if (dictionary === undefined) return;
+    const deleted = editingDictionaryDraft.trim() === "";
+    const term = deleted ? undefined : normalizeVoiceDictionaryTerm(editingDictionaryDraft);
+    const parsedAliases = deleted ? [] : parseVoiceDictionaryAliasDraft(editingDictionaryAliasesDraft);
+    if (!deleted && (term === undefined || parsedAliases === undefined)) {
       setDictionaryMessage({ error: true, text: t("settings.voiceInputDictionaryEditInvalid") });
       return;
     }
-    const deleted = editingDictionaryDraft.trim() === "";
-    dictionaryFocusRef.current = deleted ? entryId
-      : next.entries.find((entry) => voiceDictionaryTermKey(entry.text) === voiceDictionaryTermKey(editingDictionaryDraft))?.id;
-    persistDictionary(next, t(deleted ? "settings.voiceInputDictionaryDeleted"
-      : next.entries.length < preferences.dictionary.entries.length ? "settings.voiceInputDictionaryMerged" : "settings.voiceInputDictionaryUpdated"));
-    setEditingDictionaryEntryId(undefined);
-    setEditingDictionaryDraft("");
+    const aliases = term === undefined ? [] : parsedAliases!.filter((alias) =>
+      voiceDictionaryTermKey(alias) !== voiceDictionaryTermKey(term));
+    const merged = term !== undefined && dictionary.entries.some((entry) => entry.id !== entryId
+      && voiceDictionaryTermKey(entry.text) === voiceDictionaryTermKey(term));
+    void commitDictionary(
+      deleted
+        ? (current, signal) => controller.deleteVoiceInputDictionaryEntry(current.revision, entryId, signal)
+        : (current, signal) => controller.editVoiceInputDictionaryEntry(current.revision, entryId, term!, aliases, signal),
+      t(deleted ? "settings.voiceInputDictionaryDeleted"
+        : merged ? "settings.voiceInputDictionaryMerged" : "settings.voiceInputDictionaryUpdated"),
+      (_previous, next) => {
+        dictionaryFocusRef.current = deleted ? entryId
+          : next.entries.find((entry) => voiceDictionaryTermKey(entry.text) === voiceDictionaryTermKey(term!))?.id;
+        setEditingDictionaryEntryId(undefined);
+        setEditingDictionaryDraft("");
+        setEditingDictionaryAliasesDraft("");
+      }
+    );
   };
 
   const importDictionary = async (file: File | undefined): Promise<void> => {
-    if (file === undefined) return;
+    if (file === undefined || dictionary === undefined || dictionaryBusy) return;
+    const source = controller.getVoiceInputDictionary;
+    const sequence = dictionaryRequestRef.current;
+    const isCurrent = (): boolean => dictionarySourceRef.current === source && dictionaryRequestRef.current === sequence;
     if (file.size > MAXIMUM_VOICE_DICTIONARY_CSV_BYTES) {
       setDictionaryMessage({ error: true, text: t("settings.voiceInputDictionaryImportTooLarge") });
       return;
@@ -506,23 +603,25 @@ export function VoiceInputSettings({ controller, t }: {
     let text: string;
     try { text = await file.text(); }
     catch {
-      setDictionaryMessage({ error: true, text: t("settings.voiceInputDictionaryImportFailed") });
+      if (isCurrent()) setDictionaryMessage({ error: true, text: t("settings.voiceInputDictionaryImportFailed") });
       return;
     }
+    if (!isCurrent()) return;
     const parsed = parseVoiceDictionaryCsv(text);
     if (!parsed.ok) {
       setDictionaryMessage({ error: true, text: t("settings.voiceInputDictionaryImportFailed") });
       return;
     }
-    const existingManual = preferences.dictionary.entries
-      .filter((entry) => entry.source === "manual")
-      .map((entry) => entry.text);
-    const imported = mergeManualVoiceDictionaryTerms(preferences.dictionary, [...existingManual, ...parsed.terms]);
-    if (imported === undefined) {
+    const entryKeys = new Set(dictionary.entries.map((entry) => voiceDictionaryTermKey(entry.text)));
+    for (const term of parsed.terms) entryKeys.add(voiceDictionaryTermKey(term));
+    if (entryKeys.size > 1_000) {
       setDictionaryMessage({ error: true, text: t("settings.voiceInputDictionaryTooLarge") });
       return;
     }
-    persistDictionary(imported, t("settings.voiceInputDictionaryImported", { count: parsed.terms.length }));
+    await commitDictionary(
+      (current, signal) => controller.addVoiceInputDictionaryTerms(current.revision, parsed.terms, signal),
+      t("settings.voiceInputDictionaryImported", { count: parsed.terms.length })
+    );
   };
 
   const saveService = async (): Promise<void> => {
@@ -881,6 +980,21 @@ export function VoiceInputSettings({ controller, t }: {
           <div><strong>{t("settings.voiceInputAutoDictionary")}</strong><span>{t("settings.voiceInputAutoDictionaryHint")}</span></div>
           <SwitchControl checked={preferences.autoDictionaryEnabled} aria-label={t("settings.voiceInputAutoDictionary")} onChange={(event) => setPreferences(writeVoiceInputPreferences({ autoDictionaryEnabled: event.target.checked }))} />
         </div>
+        <div className="setting-row">
+          <div><strong>{t("settings.voiceInputDictionarySync")}</strong><span>{t("settings.voiceInputDictionarySyncHint")}</span></div>
+          <SwitchControl
+            checked={dictionary?.syncEnabled === true}
+            disabled={dictionary === undefined || dictionaryBusy}
+            aria-label={t("settings.voiceInputDictionarySync")}
+            onChange={(event) => {
+              const enabled = event.target.checked;
+              void commitDictionary(
+                (current, signal) => controller.setVoiceInputDictionarySyncEnabled(current.revision, enabled, signal),
+                t(enabled ? "settings.voiceInputDictionarySyncEnabled" : "settings.voiceInputDictionarySyncDisabled")
+              );
+            }}
+          />
+        </div>
         <div className="voice-input-setting-stack">
           <div><strong>{t("settings.voiceInputDictionary")}</strong><span>{t("settings.voiceInputDictionaryHint")}</span></div>
           <div className="voice-input-dictionary-add">
@@ -889,6 +1003,7 @@ export function VoiceInputSettings({ controller, t }: {
               maxLength={MAXIMUM_VOICE_DICTIONARY_TERM_CHARACTERS}
               aria-label={t("settings.voiceInputDictionaryNewTerm")}
               placeholder={t("settings.voiceInputDictionaryPlaceholder")}
+              disabled={dictionary === undefined || dictionaryBusy}
               onChange={(event) => {
                 setDictionaryDraft(event.target.value);
                 setDictionaryMessage(undefined);
@@ -899,7 +1014,7 @@ export function VoiceInputSettings({ controller, t }: {
                 addDictionaryEntry();
               }}
             />
-            <Button tone="primary" disabled={dictionaryDraft.trim() === ""} onClick={addDictionaryEntry}>{t("settings.voiceInputDictionaryAdd")}</Button>
+            <Button tone="primary" disabled={dictionary === undefined || dictionaryBusy || dictionaryDraft.trim() === ""} onClick={addDictionaryEntry}>{t("settings.voiceInputDictionaryAdd")}</Button>
           </div>
           <div className="voice-input-dictionary-toolbar">
             <input
@@ -917,13 +1032,18 @@ export function VoiceInputSettings({ controller, t }: {
             </SelectControl>
           </div>
           <div className="voice-input-dictionary-actions">
-            <span className={dictionaryMessage?.error === true ? "is-error" : undefined} role={dictionaryMessage?.error === true ? "alert" : "status"}>{dictionaryMessage?.text ?? t("settings.voiceInputDictionaryCountRich", { entries: dictionaryCounts.all, candidates: preferences.dictionary.candidates.length })}</span>
-            <label className="button button--ghost" htmlFor="voice-input-dictionary-import">{t("settings.voiceInputDictionaryImport")}</label>
+            <span className={dictionaryMessage?.error === true || visibleDictionaryState.kind === "error" ? "is-error" : undefined} role={dictionaryMessage?.error === true || visibleDictionaryState.kind === "error" ? "alert" : "status"}>{dictionaryMessage?.text
+              ?? (visibleDictionaryState.kind === "loading" ? t("settings.voiceInputDictionaryLoading")
+                : visibleDictionaryState.kind === "error" ? t("settings.voiceInputDictionaryLoadFailed")
+                  : t("settings.voiceInputDictionaryCountRich", { entries: dictionaryCounts.all, candidates: dictionary?.candidates.length ?? 0 }))}</span>
+            {visibleDictionaryState.kind === "error" && <Button tone="ghost" onClick={loadDictionary}>{t("common.retry")}</Button>}
+            <label className="button button--ghost" aria-disabled={dictionary === undefined || dictionaryBusy} htmlFor="voice-input-dictionary-import">{t("settings.voiceInputDictionaryImport")}</label>
             <input
               id="voice-input-dictionary-import"
               className="sr-only"
               type="file"
               accept=".csv,text/csv"
+              disabled={dictionary === undefined || dictionaryBusy}
               onChange={(event) => {
                 const file = event.target.files?.[0];
                 event.target.value = "";
@@ -932,7 +1052,11 @@ export function VoiceInputSettings({ controller, t }: {
             />
           </div>
           <div className="voice-input-dictionary-list" ref={dictionaryListRef}>
-            {visibleDictionaryEntries.length === 0
+            {visibleDictionaryState.kind !== "ready"
+              ? <p className="voice-input-dictionary-empty">{t(visibleDictionaryState.kind === "loading"
+                  ? "settings.voiceInputDictionaryLoading"
+                  : "settings.voiceInputDictionaryLoadFailed")}</p>
+              : visibleDictionaryEntries.length === 0
               ? <p className="voice-input-dictionary-empty">{t(normalizedDictionarySearch === "" && dictionaryFilter === "all"
                   ? "settings.voiceInputDictionaryEmpty"
                   : "settings.voiceInputDictionaryNoMatches")}</p>
@@ -942,6 +1066,7 @@ export function VoiceInputSettings({ controller, t }: {
                       ? <><input
                           autoFocus
                           value={editingDictionaryDraft}
+                          disabled={dictionaryBusy}
                           maxLength={MAXIMUM_VOICE_DICTIONARY_TERM_CHARACTERS}
                           aria-label={t("settings.voiceInputDictionaryEditTerm")}
                           onChange={(event) => setEditingDictionaryDraft(event.target.value)}
@@ -954,13 +1079,14 @@ export function VoiceInputSettings({ controller, t }: {
                               saveDictionaryEdit(entry.id);
                             }
                           }}
-                        />{preferences.dictionary.entries.some((candidate) => candidate.id !== entry.id
+                        />{dictionaryEntries.some((candidate) => candidate.id !== entry.id
                           && voiceDictionaryTermKey(candidate.text) === voiceDictionaryTermKey(editingDictionaryDraft))
                           && <small role="status">{t("settings.voiceInputDictionaryMergeHint")}</small>}<label className="field">
                           <span>{t("settings.voiceInputDictionaryEditAliases")}</span>
                           <textarea
                             rows={3}
                             value={editingDictionaryAliasesDraft}
+                            disabled={dictionaryBusy}
                             aria-label={t("settings.voiceInputDictionaryEditAliases")}
                             onChange={(event) => setEditingDictionaryAliasesDraft(event.target.value)}
                             onKeyDown={(event) => {
@@ -982,23 +1108,26 @@ export function VoiceInputSettings({ controller, t }: {
                   <div className="voice-input-dictionary-entry-actions">
                     {editingDictionaryEntryId === entry.id
                       ? <>
-                          <Button tone="primary" onClick={() => saveDictionaryEdit(entry.id)}>{t("common.save")}</Button>
-                          <Button tone="ghost" onClick={() => {
+                          <Button tone="primary" disabled={dictionaryBusy} onClick={() => saveDictionaryEdit(entry.id)}>{t("common.save")}</Button>
+                          <Button tone="ghost" disabled={dictionaryBusy} onClick={() => {
                             setEditingDictionaryEntryId(undefined);
                             setEditingDictionaryDraft("");
                             setEditingDictionaryAliasesDraft("");
                           }}>{t("common.cancel")}</Button>
                         </>
                       : <>
-                          <Button tone="ghost" data-dictionary-edit onClick={() => {
+                          <Button tone="ghost" disabled={dictionaryBusy} data-dictionary-edit onClick={() => {
                             setEditingDictionaryEntryId(entry.id);
                             setEditingDictionaryDraft(entry.text);
                             setEditingDictionaryAliasesDraft(entry.aliases.map((alias) => alias.text).join("\n"));
                             setDictionaryMessage(undefined);
                           }}>{t("common.edit")}</Button>
-                          <Button tone="ghost" onClick={() => {
-                            persistDictionary(deleteVoiceDictionaryEntry(preferences.dictionary, entry.id), t("settings.voiceInputDictionaryDeleted"));
-                            if (editingDictionaryEntryId === entry.id) setEditingDictionaryEntryId(undefined);
+                          <Button tone="ghost" disabled={dictionaryBusy} onClick={() => {
+                            void commitDictionary(
+                              (current, signal) => controller.deleteVoiceInputDictionaryEntry(current.revision, entry.id, signal),
+                              t("settings.voiceInputDictionaryDeleted"),
+                              () => { if (editingDictionaryEntryId === entry.id) setEditingDictionaryEntryId(undefined); }
+                            );
                           }}>{t("common.delete")}</Button>
                         </>}
                   </div>

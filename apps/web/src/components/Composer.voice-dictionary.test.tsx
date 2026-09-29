@@ -8,7 +8,6 @@ import { composerDocumentPlainText, plainTextToComposerDocument } from "../compo
 import { DEFAULT_UI_PREFERENCES } from "../local-state.js";
 import { emptySnapshot, type BackendView, type SessionView, type VoiceInputDictionaryAdviceView } from "../model.js";
 import type { VoiceMediaSessionUpdate } from "../voice-input-media.js";
-import { readVoiceInputPreferences } from "../voice-input-preferences.js";
 import { Composer } from "./Composer.js";
 
 vi.mock("./ComposerRichTextEditor.js", () => ({
@@ -130,7 +129,7 @@ describe("composer voice dictionary observation", () => {
   it("cancels a correction that is undone and ignores its late advice", async () => {
     let finish: ((value: VoiceInputDictionaryAdviceView) => void) | undefined;
     const advice = vi.fn((_input: unknown, _signal?: AbortSignal) => new Promise<VoiceInputDictionaryAdviceView>((resolve) => { finish = resolve; }));
-    const { edit } = await mount("", advice);
+    const { edit, controller } = await mount("", advice);
     await edit("VoiceKit");
     await act(async () => { await vi.advanceTimersByTimeAsync(1_200); });
     expect(advice).toHaveBeenCalledOnce();
@@ -139,7 +138,7 @@ describe("composer voice dictionary observation", () => {
     await act(async () => finish?.({ actions: [{
       action: "addEntry", term: "VoiceKit", aliases: ["voice kit"], type: "productName", confidence: "high"
     }] }));
-    expect(readVoiceInputPreferences().dictionary.entries).toEqual([]);
+    expect(controller.applyVoiceInputDictionaryLearning).not.toHaveBeenCalled();
   });
 });
 
@@ -161,6 +160,8 @@ async function mount(initialText: string, advice: AppController["adviseVoiceInpu
     saveDraft: vi.fn(async () => undefined),
     send: vi.fn(async () => undefined),
     getVoiceInputCapabilities: vi.fn(async () => ({})),
+    getVoiceInputDictionary: vi.fn(async () => ({ revision: 7n, syncEnabled: false, entries: [], candidates: [], suppressedAutomaticTerms: [], refinementTerms: [] })),
+    applyVoiceInputDictionaryLearning: vi.fn(),
     adviseVoiceInputDictionaryEdit: advice
   } as unknown as AppController;
   const host = document.body.appendChild(document.createElement("div"));

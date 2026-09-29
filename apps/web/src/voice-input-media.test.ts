@@ -104,7 +104,6 @@ describe("VoiceInputMediaSession", () => {
       api,
       preferences: {
         refinementInstructions: "Keep commands verbatim.",
-        dictionaryTerms: ["Joko", "Orchestrator"],
         playInteractionSound: false
       },
       mediaDevices: { getUserMedia },
@@ -122,7 +121,7 @@ describe("VoiceInputMediaSession", () => {
       expect.any(String),
       "audio/webm",
       undefined,
-      { instructions: "Keep commands verbatim.", dictionaryTerms: ["Joko", "Orchestrator"] },
+      { instructions: "Keep commands verbatim." },
       expect.any(AbortSignal)
     );
     expect(api.appendVoiceAudio).toHaveBeenCalledWith("voice-one", 1n, new Uint8Array([1, 2, 3]), 250, false);
@@ -255,7 +254,7 @@ describe("VoiceInputMediaSession", () => {
     await vi.waitFor(() => expect(api.appendVoiceAudio).toHaveBeenCalledOnce());
     await media.stop();
 
-    expect(api.startVoiceInput).toHaveBeenCalledWith(expect.any(String), "audio/pcm", undefined, expect.any(Object), expect.any(AbortSignal));
+    expect(api.startVoiceInput).toHaveBeenCalledWith(expect.any(String), "audio/pcm", undefined, undefined, expect.any(AbortSignal));
     expect(api.appendVoiceAudio).toHaveBeenCalledWith("voice-one", 1n, new Uint8Array([1, 0, 2, 0]), 20, true);
     expect(capture.stop).toHaveBeenCalledOnce();
     expect(track.stop).toHaveBeenCalledOnce();

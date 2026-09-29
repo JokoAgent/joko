@@ -142,7 +142,7 @@ export function useDraftVoiceInput<T>(options: DraftVoiceInputOptions<T>) {
         preferences: {
           ...(locale === undefined ? {} : { locale }), ...(preferences.deviceId === undefined ? {} : { deviceId: preferences.deviceId }),
           ...(preferences.refinementInstructions === "" ? {} : { refinementInstructions: preferences.refinementInstructions }),
-          dictionaryTerms: preferences.dictionaryTerms, playInteractionSound: preferences.playInteractionSound
+          playInteractionSound: preferences.playInteractionSound
         },
         prewarmedStream: prewarmerRef.current?.checkout(),
         onUpdate: (next) => {

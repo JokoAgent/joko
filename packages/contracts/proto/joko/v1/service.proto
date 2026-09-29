@@ -479,6 +479,12 @@ service SubagentService {
 service VoiceInputService {
   rpc GetVoiceInputCapabilities(GetVoiceInputCapabilitiesRequest) returns (GetVoiceInputCapabilitiesResponse);
   rpc TestVoiceInputConnection(TestVoiceInputConnectionRequest) returns (TestVoiceInputConnectionResponse);
+  rpc GetVoiceInputDictionary(GetVoiceInputDictionaryRequest) returns (GetVoiceInputDictionaryResponse);
+  rpc SetVoiceInputDictionarySyncEnabled(SetVoiceInputDictionarySyncEnabledRequest) returns (SetVoiceInputDictionarySyncEnabledResponse);
+  rpc AddVoiceInputDictionaryTerms(AddVoiceInputDictionaryTermsRequest) returns (AddVoiceInputDictionaryTermsResponse);
+  rpc EditVoiceInputDictionaryEntry(EditVoiceInputDictionaryEntryRequest) returns (EditVoiceInputDictionaryEntryResponse);
+  rpc DeleteVoiceInputDictionaryEntry(DeleteVoiceInputDictionaryEntryRequest) returns (DeleteVoiceInputDictionaryEntryResponse);
+  rpc ApplyVoiceInputDictionaryLearning(ApplyVoiceInputDictionaryLearningRequest) returns (ApplyVoiceInputDictionaryLearningResponse);
   rpc AdviseVoiceInputDictionaryEdit(AdviseVoiceInputDictionaryEditRequest) returns (AdviseVoiceInputDictionaryEditResponse);
   rpc StartVoiceInput(StartVoiceInputRequest) returns (StartVoiceInputResponse);
   rpc AppendVoiceAudio(AppendVoiceAudioRequest) returns (AppendVoiceAudioResponse);
@@ -519,6 +525,59 @@ message TestVoiceInputConnectionResponse {
   VoiceInputConnectionTestFailure failure = 2;
 }
 
+message GetVoiceInputDictionaryRequest {}
+
+message GetVoiceInputDictionaryResponse {
+  VoiceInputDictionarySnapshot dictionary = 1;
+}
+
+message SetVoiceInputDictionarySyncEnabledRequest {
+  uint64 expected_revision = 1;
+  bool enabled = 2;
+}
+
+message SetVoiceInputDictionarySyncEnabledResponse {
+  VoiceInputDictionarySnapshot dictionary = 1;
+}
+
+message AddVoiceInputDictionaryTermsRequest {
+  uint64 expected_revision = 1;
+  repeated string terms = 2;
+}
+
+message AddVoiceInputDictionaryTermsResponse {
+  VoiceInputDictionarySnapshot dictionary = 1;
+}
+
+message EditVoiceInputDictionaryEntryRequest {
+  uint64 expected_revision = 1;
+  string entry_id = 2;
+  string text = 3;
+  repeated string aliases = 4;
+}
+
+message EditVoiceInputDictionaryEntryResponse {
+  VoiceInputDictionarySnapshot dictionary = 1;
+}
+
+message DeleteVoiceInputDictionaryEntryRequest {
+  uint64 expected_revision = 1;
+  string entry_id = 2;
+}
+
+message DeleteVoiceInputDictionaryEntryResponse {
+  VoiceInputDictionarySnapshot dictionary = 1;
+}
+
+message ApplyVoiceInputDictionaryLearningRequest {
+  uint64 expected_revision = 1;
+  repeated VoiceInputDictionaryLearningAction actions = 2;
+}
+
+message ApplyVoiceInputDictionaryLearningResponse {
+  VoiceInputDictionarySnapshot dictionary = 1;
+}
+
 // Text is processed only for this authenticated request and is never written
 // to Operation, Event, Snapshot, Session, diagnostics, or logs.
 message AdviseVoiceInputDictionaryEditRequest {
@@ -552,7 +611,8 @@ message StartVoiceInputRequest {
   // Ephemeral cleanup preferences. These fields are bounded at the service
   // edge and never enter Operation, Event, Snapshot, Session, or log storage.
   optional string refinement_instructions = 4;
-  repeated string dictionary_terms = 5;
+  reserved 5;
+  reserved "dictionary_terms";
 }
 
 message StartVoiceInputResponse {

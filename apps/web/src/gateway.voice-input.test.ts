@@ -8,6 +8,7 @@ import {
   CancelVoiceInputResponseSchema,
   GetSnapshotResponseSchema,
   GetVoiceInputCapabilitiesResponseSchema,
+  GetVoiceInputDictionaryResponseSchema,
   GetVoiceInputSessionResponseSchema,
   TestVoiceInputConnectionResponseSchema,
   OperationState,
@@ -17,11 +18,17 @@ import {
   SubmitOperationResponseSchema,
   VoiceInputState,
   VoiceInputConnectionTestFailure,
+  VoiceInputDictionaryEntrySource,
   VoiceInputDictionaryLearningActionType,
   VoiceInputDictionaryLearningConfidence,
   VoiceInputDictionaryTermType,
   VoiceInputTerminalOutcome,
   VoiceInputTextSource,
+  SetVoiceInputDictionarySyncEnabledResponseSchema,
+  AddVoiceInputDictionaryTermsResponseSchema,
+  EditVoiceInputDictionaryEntryResponseSchema,
+  DeleteVoiceInputDictionaryEntryResponseSchema,
+  ApplyVoiceInputDictionaryLearningResponseSchema,
   VoiceInputTranscriptionProtocol
 } from "@joko/contracts";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -55,6 +62,16 @@ describe("voice input gateway", () => {
         });
       }
       if (method === "testVoiceInputConnection") return create(TestVoiceInputConnectionResponseSchema, { ok: true });
+      if (method === "getVoiceInputDictionary") return create(GetVoiceInputDictionaryResponseSchema, {
+        dictionary: dictionaryMessage()
+      });
+      switch (method) {
+        case "setVoiceInputDictionarySyncEnabled": return create(SetVoiceInputDictionarySyncEnabledResponseSchema, { dictionary: dictionaryMessage(5n) });
+        case "addVoiceInputDictionaryTerms": return create(AddVoiceInputDictionaryTermsResponseSchema, { dictionary: dictionaryMessage(5n) });
+        case "editVoiceInputDictionaryEntry": return create(EditVoiceInputDictionaryEntryResponseSchema, { dictionary: dictionaryMessage(5n) });
+        case "deleteVoiceInputDictionaryEntry": return create(DeleteVoiceInputDictionaryEntryResponseSchema, { dictionary: dictionaryMessage(5n) });
+        case "applyVoiceInputDictionaryLearning": return create(ApplyVoiceInputDictionaryLearningResponseSchema, { dictionary: dictionaryMessage(5n) });
+      }
       if (method === "adviseVoiceInputDictionaryEdit") return create(AdviseVoiceInputDictionaryEditResponseSchema, {
         actions: [{
           action: VoiceInputDictionaryLearningActionType.ADD_ENTRY,
@@ -107,9 +124,26 @@ describe("voice input gateway", () => {
       type: "productName",
       confidence: "high"
     }] });
+    await expect(gateway.getVoiceInputDictionary()).resolves.toMatchObject({
+      revision: 4n,
+      syncEnabled: true,
+      entries: [{ id: "dict-sync-entry", text: "Joko", source: "manual", frequency: 2 }],
+      candidates: [{ text: "VoiceKit", evidenceCount: 1 }],
+      refinementTerms: ["Joko"]
+    });
+    await gateway.setVoiceInputDictionarySyncEnabled(4n, false);
+    await gateway.addVoiceInputDictionaryTerms(4n, ["Orchestrator"]);
+    await gateway.editVoiceInputDictionaryEntry(4n, "dict-sync-entry", "Joko Core", ["Joko"]);
+    await gateway.deleteVoiceInputDictionaryEntry(4n, "dict-sync-entry");
+    await gateway.applyVoiceInputDictionaryLearning(4n, [{
+      action: "addCandidate",
+      term: "VoiceKit",
+      aliases: ["voice kit"],
+      type: "productName",
+      confidence: "high"
+    }]);
     await gateway.startVoiceInput("request-one", "audio/webm", "en-US", {
-      instructions: "Keep commands verbatim.",
-      dictionaryTerms: ["Joko", "Orchestrator"]
+      instructions: "Keep commands verbatim."
     });
     await gateway.appendVoiceAudio("voice-one", 1n, new Uint8Array([1, 2, 3]), 250, true);
     const result = await gateway.stopVoiceInput("voice-one", 2n);
@@ -120,13 +154,43 @@ describe("voice input gateway", () => {
       requestId: "request-one",
       mimeType: "audio/webm",
       locale: "en-US",
-      refinementInstructions: "Keep commands verbatim.",
-      dictionaryTerms: ["Joko", "Orchestrator"]
+      refinementInstructions: "Keep commands verbatim."
     });
+    expect("dictionaryTerms" in requests.find((request) => request.method === "startVoiceInput")!.input).toBe(false);
+    expect(requests.find((request) => request.method === "setVoiceInputDictionarySyncEnabled")?.input)
+      .toMatchObject({ expectedRevision: 4n, enabled: false });
+    expect(requests.find((request) => request.method === "addVoiceInputDictionaryTerms")?.input)
+      .toMatchObject({ expectedRevision: 4n, terms: ["Orchestrator"] });
+    expect(requests.find((request) => request.method === "applyVoiceInputDictionaryLearning")?.input)
+      .toMatchObject({ expectedRevision: 4n, actions: [{ action: VoiceInputDictionaryLearningActionType.ADD_CANDIDATE }] });
     expect(requests.find((request) => request.method === "appendVoiceAudio")?.input).toMatchObject({ voiceInputId: "voice-one", chunkSequence: 1n, audio: new Uint8Array([1, 2, 3]), durationMs: 250, voiced: true });
     expect(requests.find((request) => request.method === "stopVoiceInput")?.input).toMatchObject({ voiceInputId: "voice-one", expectedNextChunkSequence: 2n });
     expect(result).toMatchObject({ state: "done", outcome: "success", result: { text: "final words", source: "stable", salvaged: false, rawTranscriptText: "final word" } });
     gateway.disconnect();
+  });
+
+  it.each(["missing", "unsafe revision", "unsafe count", "unspecified source"] as const)("rejects a dictionary projection with %s", async (invalid) => {
+    const dictionary = dictionaryMessage();
+    if (invalid === "unsafe revision") dictionary.revision = BigInt(Number.MAX_SAFE_INTEGER) + 1n;
+    if (invalid === "unsafe count") dictionary.entries[0].frequency = BigInt(Number.MAX_SAFE_INTEGER) + 1n;
+    if (invalid === "unspecified source") dictionary.entries[0].source = VoiceInputDictionaryEntrySource.UNSPECIFIED;
+    const transport = voiceTransport(() => create(GetVoiceInputDictionaryResponseSchema, {
+      ...(invalid === "missing" ? {} : { dictionary })
+    }));
+    const gateway = createOrchestratorGateway({ id: "dictionary-invalid", deviceId: "device-test", name: "Browser", origin: "https://orchestrator.example", serverId: "server-test" }, "secret", {}, () => transport);
+    await gateway.connect();
+    try { await expect(gateway.getVoiceInputDictionary()).rejects.toThrow(/dictionary/u); }
+    finally { gateway.disconnect(); }
+  });
+
+  it("retains manual intent when a concurrent automatic suppression is present", async () => {
+    const transport = voiceTransport(() => create(GetVoiceInputDictionaryResponseSchema, {
+      dictionary: { ...dictionaryMessage(), suppressedAutomaticTerms: ["Joko"] }
+    }));
+    const gateway = createOrchestratorGateway({ id: "dictionary-manual", deviceId: "device-test", name: "Browser", origin: "https://orchestrator.example", serverId: "server-test" }, "secret", {}, () => transport);
+    await gateway.connect();
+    try { await expect(gateway.getVoiceInputDictionary()).resolves.toMatchObject({ entries: [{ text: "Joko", source: "manual" }], suppressedAutomaticTerms: ["Joko"] }); }
+    finally { gateway.disconnect(); }
   });
 
   it("maps a content-free connection test failure", async () => {
@@ -258,6 +322,31 @@ function sessionMessage(patch: Record<string, unknown> = {}): any {
     recoveryAttempts: 0,
     stallWarning: false,
     ...patch
+  };
+}
+
+function dictionaryMessage(revision = 4n): any {
+  return {
+    revision,
+    syncEnabled: true,
+    entries: [{
+      entryId: "dict-sync-entry",
+      text: "Joko",
+      source: VoiceInputDictionaryEntrySource.MANUAL,
+      frequency: 2n,
+      aliases: [{ text: "jo ko", count: 1n, lastSeenAt: { seconds: 1n, nanos: 0 } }],
+      createdAt: { seconds: 1n, nanos: 0 },
+      updatedAt: { seconds: 2n, nanos: 0 }
+    }],
+    candidates: [{
+      text: "VoiceKit",
+      evidenceCount: 1n,
+      aliases: [{ text: "voice kit", count: 1n, lastSeenAt: { seconds: 2n, nanos: 0 } }],
+      createdAt: { seconds: 2n, nanos: 0 },
+      updatedAt: { seconds: 2n, nanos: 0 }
+    }],
+    suppressedAutomaticTerms: [],
+    refinementTerms: ["Joko"]
   };
 }
 

@@ -1585,8 +1585,7 @@ function mobileVoiceStartRequest(
     requestId,
     mimeType,
     ...(locale === undefined ? {} : { locale }),
-    ...(refinement?.instructions === undefined ? {} : { refinementInstructions: refinement.instructions }),
-    dictionaryTerms: [...(refinement?.dictionaryTerms ?? [])]
+    ...(refinement?.instructions === undefined ? {} : { refinementInstructions: refinement.instructions })
   };
 }
 

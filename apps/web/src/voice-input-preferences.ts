@@ -8,15 +8,6 @@ import {
   type AppShortcutCombo,
   type AppShortcutPlatform
 } from "./app-shortcuts.js";
-import {
-  EMPTY_VOICE_INPUT_DICTIONARY,
-  MAXIMUM_VOICE_DICTIONARY_ENTRIES,
-  MAXIMUM_VOICE_DICTIONARY_TERM_CHARACTERS,
-  mergeManualVoiceDictionaryTerms,
-  normalizeVoiceInputDictionaryState,
-  voiceDictionaryTermsForRefinement,
-  type VoiceInputDictionaryState
-} from "./voice-input-dictionary.js";
 
 export interface VoiceInputShortcutCombo extends AppShortcutCombo {
   readonly fn: boolean;
@@ -52,8 +43,6 @@ export interface VoiceInputPreferences {
   readonly deviceId?: string;
   readonly shortcut: VoiceInputShortcutPreference;
   readonly refinementInstructions: string;
-  readonly dictionary: VoiceInputDictionaryState;
-  readonly dictionaryTerms: readonly string[];
   readonly autoDictionaryEnabled: boolean;
   readonly playInteractionSound: boolean;
   readonly fastActivationEnabled: boolean;
@@ -64,8 +53,6 @@ export const DEFAULT_VOICE_INPUT_PREFERENCES: VoiceInputPreferences = Object.fre
   locale: "auto",
   shortcut: defaultVoiceInputShortcut(),
   refinementInstructions: "",
-  dictionary: EMPTY_VOICE_INPUT_DICTIONARY,
-  dictionaryTerms: Object.freeze([]),
   autoDictionaryEnabled: true,
   playInteractionSound: true,
   fastActivationEnabled: false,
@@ -73,9 +60,8 @@ export const DEFAULT_VOICE_INPUT_PREFERENCES: VoiceInputPreferences = Object.fre
 });
 
 export const MAXIMUM_VOICE_REFINEMENT_INSTRUCTIONS_CHARACTERS = 1_000;
-export { MAXIMUM_VOICE_DICTIONARY_TERM_CHARACTERS };
-export const MAXIMUM_VOICE_DICTIONARY_TERMS = MAXIMUM_VOICE_DICTIONARY_ENTRIES;
-export const MAXIMUM_VOICE_DICTIONARY_CHARACTERS = MAXIMUM_VOICE_DICTIONARY_ENTRIES * MAXIMUM_VOICE_DICTIONARY_TERM_CHARACTERS;
+export const MAXIMUM_VOICE_DICTIONARY_TERM_CHARACTERS = 120;
+export const MAXIMUM_VOICE_DICTIONARY_TERMS = 1_000;
 export const MAXIMUM_VOICE_DICTIONARY_CSV_BYTES = 5 * 1024 * 1024;
 export const VOICE_INPUT_LOCALES = Object.freeze(["zh-CN", "zh-TW", "en", "ja", "ko"] as const);
 
@@ -101,12 +87,7 @@ export function writeVoiceInputPreferences(
   storage: Pick<Storage, "getItem" | "setItem"> | undefined = browserStorage()
 ): VoiceInputPreferences {
   const current = readVoiceInputPreferences(storage);
-  let merged: Partial<VoiceInputPreferences> = { ...current, ...patch };
-  if (patch.dictionaryTerms !== undefined && patch.dictionary === undefined) {
-    const dictionary = mergeManualVoiceDictionaryTerms(current.dictionary, patch.dictionaryTerms);
-    if (dictionary !== undefined) merged = { ...merged, dictionary };
-  }
-  const next = normalizeWritableVoiceInputPreferences(merged);
+  const next = normalizeWritableVoiceInputPreferences({ ...current, ...patch });
   if (storage !== undefined) storage.setItem(STORAGE_KEY, JSON.stringify(next));
   if (typeof window !== "undefined") window.dispatchEvent(new CustomEvent(CHANGE_EVENT, { detail: next }));
   return next;
@@ -220,8 +201,8 @@ export function parseVoiceInputPreferences(value: unknown): VoiceInputPreference
   const candidate = value as Record<string, unknown>;
   const keys = Object.keys(candidate).sort().join(",");
   if (
-    (keys !== "autoDictionaryEnabled,dictionary,dictionaryTerms,fastActivationEnabled,locale,muteOtherSounds,playInteractionSound,refinementInstructions,shortcut"
-      && keys !== "autoDictionaryEnabled,deviceId,dictionary,dictionaryTerms,fastActivationEnabled,locale,muteOtherSounds,playInteractionSound,refinementInstructions,shortcut")
+    (keys !== "autoDictionaryEnabled,fastActivationEnabled,locale,muteOtherSounds,playInteractionSound,refinementInstructions,shortcut"
+      && keys !== "autoDictionaryEnabled,deviceId,fastActivationEnabled,locale,muteOtherSounds,playInteractionSound,refinementInstructions,shortcut")
     || typeof candidate["autoDictionaryEnabled"] !== "boolean"
     || typeof candidate["playInteractionSound"] !== "boolean"
     || typeof candidate["fastActivationEnabled"] !== "boolean"
@@ -232,27 +213,17 @@ export function parseVoiceInputPreferences(value: unknown): VoiceInputPreference
   const shortcut = normalizeVoiceInputShortcut(candidate["shortcut"]);
   const deviceId = normalizeDeviceId(candidate["deviceId"]);
   const refinementInstructions = normalizeRefinementInstructions(candidate["refinementInstructions"]);
-  const dictionaryTerms = normalizeDictionaryTerms(candidate["dictionaryTerms"]);
-  const dictionary = normalizeVoiceInputDictionaryState(candidate["dictionary"]);
-  const currentDictionaryTerms = dictionary === undefined ? undefined : voiceDictionaryTermsForRefinement(dictionary);
   if (
     locale !== candidate["locale"]
     || shortcut === undefined
     || (Object.hasOwn(candidate, "deviceId") && deviceId !== candidate["deviceId"])
     || (Object.hasOwn(candidate, "refinementInstructions") && refinementInstructions !== candidate["refinementInstructions"])
-    || dictionaryTerms === undefined
-    || dictionary === undefined
-    || currentDictionaryTerms === undefined
-    || dictionaryTerms.length !== currentDictionaryTerms.length
-    || dictionaryTerms.some((term, index) => term !== currentDictionaryTerms[index])
   ) return DEFAULT_VOICE_INPUT_PREFERENCES;
   return Object.freeze({
     locale,
     shortcut,
     ...(deviceId === undefined ? {} : { deviceId }),
     refinementInstructions,
-    dictionary,
-    dictionaryTerms: currentDictionaryTerms,
     autoDictionaryEnabled: candidate["autoDictionaryEnabled"],
     playInteractionSound: candidate["playInteractionSound"],
     fastActivationEnabled: candidate["fastActivationEnabled"],
@@ -265,8 +236,6 @@ function normalizeWritableVoiceInputPreferences(value: Partial<VoiceInputPrefere
   const shortcut = normalizeVoiceInputShortcut(value.shortcut) ?? defaultVoiceInputShortcut();
   const deviceId = normalizeDeviceId(value.deviceId);
   const refinementInstructions = normalizeRefinementInstructions(value.refinementInstructions);
-  const dictionary = normalizeVoiceInputDictionaryState(value.dictionary)
-    ?? EMPTY_VOICE_INPUT_DICTIONARY;
   const playInteractionSound = value.playInteractionSound !== false;
   const fastActivationEnabled = value.fastActivationEnabled === true;
   const muteOtherSounds = value.muteOtherSounds !== false;
@@ -275,8 +244,6 @@ function normalizeWritableVoiceInputPreferences(value: Partial<VoiceInputPrefere
     shortcut,
     ...(deviceId === undefined ? {} : { deviceId }),
     refinementInstructions,
-    dictionary,
-    dictionaryTerms: voiceDictionaryTermsForRefinement(dictionary),
     autoDictionaryEnabled: value.autoDictionaryEnabled !== false,
     playInteractionSound,
     fastActivationEnabled,
@@ -380,27 +347,6 @@ function normalizeRefinementInstructions(value: unknown): string {
   const normalized = value.replace(/\r\n?/gu, "\n");
   if (normalized.length > MAXIMUM_VOICE_REFINEMENT_INSTRUCTIONS_CHARACTERS || /\u0000/u.test(normalized)) return "";
   return normalized;
-}
-
-function normalizeDictionaryTerms(value: unknown): readonly string[] | undefined {
-  if (value === undefined) return Object.freeze([]);
-  if (!Array.isArray(value) || value.length > MAXIMUM_VOICE_DICTIONARY_TERMS) return undefined;
-  const terms: string[] = [];
-  const seen = new Set<string>();
-  let characters = 0;
-  for (const item of value) {
-    if (typeof item !== "string") return undefined;
-    const term = item.replace(/\s+/gu, " ").trim();
-    if (term.length === 0) continue;
-    if (term.length > MAXIMUM_VOICE_DICTIONARY_TERM_CHARACTERS || /[\u0000-\u001f\u007f]/u.test(term)) return undefined;
-    const key = term.toLocaleLowerCase();
-    if (seen.has(key)) continue;
-    characters += term.length;
-    if (characters > MAXIMUM_VOICE_DICTIONARY_CHARACTERS) return undefined;
-    seen.add(key);
-    terms.push(term);
-  }
-  return Object.freeze(terms);
 }
 
 export function parseVoiceDictionaryCsv(value: string): VoiceDictionaryCsvParseResult {

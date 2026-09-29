@@ -1922,6 +1922,13 @@ export function useAppController(): AppController {
     const original = () => { if (artifactGateway === undefined) throw new Error("Connect to Joko before using voice input."); return artifactGateway; };
     return {
       getVoiceInputCapabilities: (...args: Parameters<OperationApi["getVoiceInputCapabilities"]>) => original().getVoiceInputCapabilities(...args),
+      getVoiceInputDictionary: (...args: Parameters<OperationApi["getVoiceInputDictionary"]>) => original().getVoiceInputDictionary(...args),
+      setVoiceInputDictionarySyncEnabled: (...args: Parameters<OperationApi["setVoiceInputDictionarySyncEnabled"]>) => original().setVoiceInputDictionarySyncEnabled(...args),
+      addVoiceInputDictionaryTerms: (...args: Parameters<OperationApi["addVoiceInputDictionaryTerms"]>) => original().addVoiceInputDictionaryTerms(...args),
+      editVoiceInputDictionaryEntry: (...args: Parameters<OperationApi["editVoiceInputDictionaryEntry"]>) => original().editVoiceInputDictionaryEntry(...args),
+      deleteVoiceInputDictionaryEntry: (...args: Parameters<OperationApi["deleteVoiceInputDictionaryEntry"]>) => original().deleteVoiceInputDictionaryEntry(...args),
+      applyVoiceInputDictionaryLearning: (...args: Parameters<OperationApi["applyVoiceInputDictionaryLearning"]>) => original().applyVoiceInputDictionaryLearning(...args),
+      adviseVoiceInputDictionaryEdit: (...args: Parameters<OperationApi["adviseVoiceInputDictionaryEdit"]>) => original().adviseVoiceInputDictionaryEdit(...args),
       startVoiceInput: (...args: Parameters<OperationApi["startVoiceInput"]>) => original().startVoiceInput(...args),
       appendVoiceAudio: (...args: Parameters<OperationApi["appendVoiceAudio"]>) => original().appendVoiceAudio(...args),
       stopVoiceInput: (...args: Parameters<OperationApi["stopVoiceInput"]>) => original().stopVoiceInput(...args),
@@ -2192,7 +2199,6 @@ export function useAppController(): AppController {
     ...terminalApi,
     ...simulatorViewerApi,
     testVoiceInputConnection: (signal) => gateway().testVoiceInputConnection(signal),
-    adviseVoiceInputDictionaryEdit: (draft, signal) => gateway().adviseVoiceInputDictionaryEdit(draft, signal),
     startReview: (sourceSessionId, focus, attachments) => gateway().startReview(sourceSessionId, focus, attachments),
     reobserveReview: (reviewRunId) => gateway().reobserveReview(reviewRunId),
     abort: (runId) => gateway().abort(runId),

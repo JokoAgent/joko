@@ -48,7 +48,6 @@ export interface VoiceMediaPreferences {
   readonly locale?: string;
   readonly deviceId?: string;
   readonly refinementInstructions?: string;
-  readonly dictionaryTerms?: readonly string[];
   readonly playInteractionSound?: boolean;
 }
 
@@ -184,12 +183,9 @@ export class VoiceInputMediaSession {
         randomUuid(),
         mimeType,
         capability.supportsLocale ? this.preferences.locale : undefined,
-        {
-          ...(this.preferences.refinementInstructions === undefined
-            ? {}
-            : { instructions: this.preferences.refinementInstructions }),
-          dictionaryTerms: this.preferences.dictionaryTerms ?? []
-        },
+        this.preferences.refinementInstructions === undefined
+          ? undefined
+          : { instructions: this.preferences.refinementInstructions },
         startAbort.signal
       );
       if (!this.isCurrent(generation) || startAbort.signal.aborted) {

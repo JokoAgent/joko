@@ -426,6 +426,7 @@ import type { RemoteHostRegistry } from "./remote-host-registry.js";
 import type { RemoteBackendRuntimeSetupManager } from "./remote-backend-runtime-setup.js";
 import { createVoiceInputConnectService } from "./voice-input-connect-service.js";
 import type { VoiceInputCoordinator } from "./voice-input-coordinator.js";
+import type { VoiceDictionarySyncRepository } from "./voice-dictionary-sync-repository.js";
 import {
   VoiceInputSettingsError,
   type VoiceInputSettingsController
@@ -533,6 +534,7 @@ interface ConnectServiceDependencies {
   readonly terminals?: TerminalProvider;
   readonly voiceInput?: VoiceInputCoordinator;
   readonly voiceInputSettings?: VoiceInputSettingsController;
+  readonly voiceDictionary?: VoiceDictionarySyncRepository;
   readonly mobilePush?: MobilePushCoordinator;
   readonly refreshPiGeneration?: () => Promise<void>;
   readonly resolveSessionContextDefaults?: SessionContextDefaultsResolver;
@@ -1255,6 +1257,7 @@ export function createConnectServices(application: OrchestratorApplication): Con
     ...(application.terminals === undefined ? {} : { terminals: application.terminals }),
     ...(application.voiceInput === undefined ? {} : { voiceInput: application.voiceInput }),
     ...(application.voiceInputSettings === undefined ? {} : { voiceInputSettings: application.voiceInputSettings }),
+    ...(application.voiceDictionary === undefined ? {} : { voiceDictionary: application.voiceDictionary }),
     ...(application.mobilePush === undefined ? {} : { mobilePush: application.mobilePush }),
     ...(application.refreshPiGeneration === undefined ? {} : { refreshPiGeneration: application.refreshPiGeneration }),
     ...(application.resolveSessionContextDefaults === undefined
@@ -1371,7 +1374,7 @@ export function createConnectServices(application: OrchestratorApplication): Con
     connections: dependencies.connections,
     store: dependencies.store
   });
-  const voiceInput = createVoiceInputConnectService(dependencies.voiceInput, dependencies.voiceInputSettings, (context) => ({
+  const voiceInput = createVoiceInputConnectService(dependencies.voiceInput, dependencies.voiceInputSettings, dependencies.voiceDictionary, (context) => ({
     connectionId: authenticate(context).id
   }));
   const managedModelRuntime = createManagedModelRuntimeConnectService(

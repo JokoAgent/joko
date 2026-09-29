@@ -266,7 +266,6 @@ export function createDesktopGlobalVoiceSession(
       ...(locale === undefined ? {} : { locale }),
       ...(preferences.deviceId === undefined ? {} : { deviceId: preferences.deviceId }),
       ...(preferences.refinementInstructions === "" ? {} : { refinementInstructions: preferences.refinementInstructions }),
-      dictionaryTerms: preferences.dictionaryTerms,
       playInteractionSound: preferences.playInteractionSound
     },
     onUpdate

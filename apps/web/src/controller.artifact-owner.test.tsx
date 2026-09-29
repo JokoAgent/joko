@@ -80,7 +80,7 @@ it("keeps resource and auxiliary operations bound to the controller snapshot's g
   const sshCalls = new Map<string, Record<typeof sshMethods[number], ReturnType<typeof vi.fn>>>();
   const remoteMethods = ["getRemoteHostCapabilities", "listRemoteHosts", "listRemoteHostDirectories", "refreshRemoteHostCatalog", "createRemoteHost", "updateRemoteHost", "deleteRemoteHost", "connectRemoteHost", "disconnectRemoteHost", "testRemoteHostConnection", "clearRemoteHostTrust", "saveCredential", "saveProvider", "updateTarget"] as const;
   const remoteCalls = new Map<string, Record<typeof remoteMethods[number], ReturnType<typeof vi.fn>>>();
-  const voiceMethods = ["getVoiceInputCapabilities", "startVoiceInput", "appendVoiceAudio", "stopVoiceInput", "cancelVoiceInput", "getVoiceInputSession"] as const;
+    const voiceMethods = ["getVoiceInputCapabilities", "getVoiceInputDictionary", "setVoiceInputDictionarySyncEnabled", "addVoiceInputDictionaryTerms", "editVoiceInputDictionaryEntry", "deleteVoiceInputDictionaryEntry", "applyVoiceInputDictionaryLearning", "adviseVoiceInputDictionaryEdit", "startVoiceInput", "appendVoiceAudio", "stopVoiceInput", "cancelVoiceInput", "getVoiceInputSession"] as const;
   const publishSnapshot = new Map<string, (snapshot?: AppSnapshot) => void>();
   vi.mocked(createOrchestratorGateway).mockImplementation((owner, _key, callbacks) => {
     let disposed = false;
@@ -349,7 +349,8 @@ it("keeps resource and auxiliary operations bound to the controller snapshot's g
   }
   for (const method of voiceMethods) expect(secondController[method]).not.toBe(firstController[method]);
   await expect(firstController.getVoiceInputCapabilities()).rejects.toThrow("Voice owner disconnected");
-  await expect(firstController.startVoiceInput("request", "audio/webm", undefined, { dictionaryTerms: [] })).rejects.toThrow("Voice owner disconnected");
+  await expect(firstController.getVoiceInputDictionary()).rejects.toThrow("Voice owner disconnected");
+  await expect(firstController.startVoiceInput("request", "audio/webm")).rejects.toThrow("Voice owner disconnected");
   await expect(firstController.appendVoiceAudio("shared", 1n, new Uint8Array([1]), 10, false)).rejects.toThrow("Voice owner disconnected");
   await expect(firstController.stopVoiceInput("shared", 1n)).rejects.toThrow("Voice owner disconnected");
   await expect(firstController.cancelVoiceInput("shared")).rejects.toThrow("Voice owner disconnected");

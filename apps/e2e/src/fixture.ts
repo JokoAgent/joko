@@ -29,6 +29,7 @@ import {
   SessionWorktreeCoordinator,
   WorkspaceChangeSetService,
   WorkspaceService,
+  VoiceDictionarySyncRepository,
   createPublicServer,
   type OrchestratorApplication,
   type BackendInstanceFactory,
@@ -434,6 +435,7 @@ export class OrchestratorE2eFixture {
       contacts,
       ...(options.terminals === undefined ? {} : { terminals: options.terminals }),
       ...auxiliaryServices,
+      voiceDictionary: new VoiceDictionarySyncRepository({ store }),
       async close() {
         const failures: unknown[] = [];
         const attempt = async (cleanup: () => unknown): Promise<void> => {
