@@ -1,18 +1,29 @@
 import { randomUUID } from "node:crypto";
+import { readFile, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import { create } from "@bufbuild/protobuf";
 import {
+  AddResourceMutationSchema,
+  ApproveResourceMutationSchema,
   BackendHealth,
   CompactSessionOutcome,
   CompactionState,
   InstallationState,
+  InstallResourceMutationSchema,
+  OperationMutationSchema,
   OperationState,
   OwnerSnapshotScopeSchema,
   PiMessageRole,
+  QueueDeliveryMode,
+  ResourceAcquisitionSourceSchema,
+  ResourceKind,
+  ResourceScope,
   ResourceUsageAction,
   ResourceUsageActivity,
   ResourceUsageSource,
   RunState,
   RuntimeCommandSource,
+  SetResourceEnabledMutationSchema,
   SessionSnapshotScopeSchema,
   SessionState,
   SnapshotScopeSchema
@@ -38,8 +49,11 @@ import { installLocalSkill } from "./skill-system-fixture.js";
 
 describe("latest npm Pi through production Orchestrator and binary Connect", () => {
   let fixture: RealPiSystemFixture | undefined;
+  let releaseCompactionGate: (() => void) | undefined;
 
   afterEach(async () => {
+    releaseCompactionGate?.();
+    releaseCompactionGate = undefined;
     await fixture?.close();
     fixture = undefined;
   });
@@ -629,6 +643,115 @@ describe("latest npm Pi through production Orchestrator and binary Connect", () 
     ]));
   });
 
+  it("runs a catalogued installed-Pi extension during automatic compaction while ordinary input stays queued", { timeout: 90_000 }, async () => {
+    let releaseSummary: (() => void) | undefined;
+    const summaryGate = new Promise<void>((resolve) => { releaseSummary = resolve; });
+    releaseCompactionGate = releaseSummary;
+    fixture = await RealPiSystemFixture.start({
+      piSettings: { compaction: { enabled: true, thresholdPercent: 50, keepRecentTokens: 1 } },
+      providerUsage: { promptTokens: 10_000, completionTokens: 3 },
+      providerResponder: async ({ request, requestNumber }) => {
+        if (JSON.stringify(request.body).includes("You are a context summarization assistant")) await summaryGate;
+        return { kind: "text", text: `Real Pi compaction bypass reply ${requestNumber}` };
+      }
+    });
+    const paired = await fixture.pair("Real Pi compaction extension E2E");
+    const marker = join(fixture.rootDirectory, "compaction-extension-executed.txt");
+    const extensionPath = join(fixture.rootDirectory, "compaction-extension.js");
+    await writeFile(extensionPath, [
+      "import { writeFile } from 'node:fs/promises';",
+      "export default function register(pi) {",
+      "  pi.registerCommand('during-compact', {",
+      "    description: 'Runs during automatic compaction',",
+      `    handler: async () => { await writeFile(${JSON.stringify(marker)}, 'executed'); }`,
+      "  });",
+      "}",
+      ""
+    ].join("\n"));
+    const resourceMutation = (payload: NonNullable<Parameters<typeof create<typeof OperationMutationSchema>>[1]>["payload"]) =>
+      create(OperationMutationSchema, { payload });
+    const added = await submit(paired.clients.operation, paired.connectionId, resourceMutation({
+      case: "addResource",
+      value: create(AddResourceMutationSchema, {
+        backendId: "pi", kind: ResourceKind.EXTENSION, scope: ResourceScope.MANAGED,
+        acquisition: create(ResourceAcquisitionSourceSchema, {
+          source: { case: "local", value: { serverPath: extensionPath } }
+        }),
+        name: "during-compact"
+      })
+    }));
+    expect(added.state).toBe(OperationState.SUCCEEDED);
+    const resource = (await paired.clients.pi.listPiResources({
+      backendId: "pi", kind: ResourceKind.EXTENSION, page: { pageSize: 500 }
+    })).resources.find((candidate) => candidate.name === "during-compact");
+    if (resource === undefined) throw new Error("The installed Pi Extension Resource was not discovered.");
+    for (const payload of [
+      { case: "approveResource" as const, value: create(ApproveResourceMutationSchema, {
+        resourceId: resource.resourceId, discoveredRevision: resource.discoveredRevision
+      }) },
+      { case: "installResource" as const, value: create(InstallResourceMutationSchema, {
+        resourceId: resource.resourceId
+      }) },
+      { case: "setResourceEnabled" as const, value: create(SetResourceEnabledMutationSchema, {
+        resourceId: resource.resourceId, enabled: true
+      }) }
+    ]) {
+      const result = await submit(paired.clients.operation, paired.connectionId, resourceMutation(payload));
+      expect(result.state, `${payload.case}: ${result.error?.message ?? "no error"}`).toBe(OperationState.SUCCEEDED);
+    }
+    await fixture.application.refreshPiGeneration?.();
+
+    const sessionId = sessionIdFrom(await submit(paired.clients.operation, paired.connectionId,
+      createSessionMutation({
+        backendId: "pi", targetId: "workspace-real-pi", displayName: "Compaction extension bypass",
+        providerId: REAL_PI_PROVIDER_ID, modelId: REAL_PI_MODEL_ID, effortId: "off"
+      })));
+    const commands = await paired.clients.session.listRuntimeCommands({ sessionId });
+    expect(commands.commands).toEqual(expect.arrayContaining([
+      expect.objectContaining({ name: "during-compact", source: RuntimeCommandSource.EXTENSION, loaded: true })
+    ]));
+    const send = async (text: string, mode = QueueDeliveryMode.PROMPT) => {
+      const generation = BigInt(fixture!.application.store.getSession(sessionId).descriptor.binding.generation);
+      const accepted = await submit(paired.clients.operation, paired.connectionId,
+        sendInputMutation(sessionId, generation, text, mode));
+      expect(accepted.state).toBe(OperationState.SUCCEEDED);
+      return queueRunIdFrom(accepted);
+    };
+    const firstRunId = await send("Start context and cross the automatic compaction threshold.");
+    await waitForRealSystem(() => Promise.resolve(fixture!.providerRequests.length),
+      (count) => count >= 2, "automatic Pi summarization request", 30_000);
+    expect(fixture.providerRequests.some((request) =>
+      JSON.stringify(request.body).includes("You are a context summarization assistant"))).toBe(true);
+    const ordinaryRunId = await send("Ordinary input must wait for compaction.", QueueDeliveryMode.FOLLOW_UP);
+    const extensionRunId = await send("/during-compact now", QueueDeliveryMode.FOLLOW_UP);
+    await waitForRealSystem(() => readFile(marker, "utf8").catch(() => ""),
+      (content) => content === "executed", "installed Pi extension bypass effect", 15_000)
+      .catch(async (error: unknown) => {
+        const runs = await Promise.all([firstRunId, ordinaryRunId, extensionRunId]
+          .map((runId) => paired.clients.run.getRun({ runId })));
+        const state = await paired.clients.pi.getPiSessionState({ sessionId });
+        throw new Error(`Installed Pi extension did not bypass: ${JSON.stringify({
+          runs: runs.map((run) => ({ state: run.run?.state, error: run.run?.error?.code })),
+          compacting: state.state?.compacting,
+          queue: fixture!.application.store.listQueueItems({ sessionId, limit: 20 })
+            .map((item) => ({ state: item.state, disposition: item.disposition, position: item.position,
+              runId: item.runId })),
+          requests: fixture!.providerRequests.length
+        }, (_key, value: unknown) => typeof value === "bigint" ? value.toString() : value)}`, { cause: error });
+      });
+    await waitForRealSystem(() => paired.clients.run.getRun({ runId: extensionRunId }),
+      (response) => response.run?.state === RunState.SUCCEEDED, "extension bypass Run", 30_000);
+    expect((await paired.clients.run.getRun({ runId: firstRunId })).run?.state).not.toBe(RunState.SUCCEEDED);
+    expect((await paired.clients.run.getRun({ runId: ordinaryRunId })).run?.state).not.toBe(RunState.SUCCEEDED);
+    releaseSummary?.();
+    releaseCompactionGate = undefined;
+    for (const runId of [firstRunId, ordinaryRunId]) {
+      await waitForRealSystem(() => paired.clients.run.getRun({ runId }),
+        (response) => response.run?.state === RunState.SUCCEEDED, "post-compaction ordinary Run", 30_000);
+    }
+    expect(await readFile(marker, "utf8")).toBe("executed");
+  });
+
   it("recovers an installed-Pi context overflow through compaction and one retry", { timeout: 90_000 }, async () => {
     fixture = await RealPiSystemFixture.start({
       piSettings: { compaction: { enabled: true, thresholdPercent: 95, keepRecentTokens: 1 } },
@@ -655,30 +778,69 @@ describe("latest npm Pi through production Orchestrator and binary Connect", () 
       }
     });
 
-    for (const prompt of [
-      "Establish history before the context overflow.",
-      "Recover this turn after one simulated context overflow."
-    ]) {
-      const queued = await submit(
-        paired.clients.operation,
-        paired.connectionId,
-        sendInputMutation(sessionId, BigInt(fixture!.application.store.getSession(sessionId).descriptor.binding.generation), prompt)
-      );
-      const runId = queueRunIdFrom(queued);
-      await waitForRealSystem(
-        () => paired.clients.run.getRun({ runId }),
-        (response) => response.run?.state === RunState.SUCCEEDED,
-        "real Pi overflow recovery turn",
-        30_000
-      );
+    const prepared = await submit(
+      paired.clients.operation,
+      paired.connectionId,
+      sendInputMutation(sessionId, BigInt(fixture.application.store.getSession(sessionId).descriptor.binding.generation),
+        "Establish history before the context overflow.")
+    );
+    const preparedRunId = queueRunIdFrom(prepared);
+    await waitForRealSystem(
+      () => paired.clients.run.getRun({ runId: preparedRunId }),
+      (response) => response.run?.state === RunState.SUCCEEDED,
+      "real Pi pre-overflow turn",
+      30_000
+    );
+
+    const beforeOverflow = await paired.clients.event.getSnapshot({ scope: sessionScope });
+    if (beforeOverflow.snapshot === undefined) throw new Error("Orchestrator returned no overflow baseline Snapshot.");
+    const overflowAbort = new AbortController();
+    const overflowIterator = paired.clients.event.streamEvents(
+      { scope: sessionScope, afterCursor: beforeOverflow.snapshot.resumeCursor },
+      { signal: overflowAbort.signal }
+    )[Symbol.asyncIterator]();
+    const firstOverflowEvent = overflowIterator.next();
+    const queued = await submit(
+      paired.clients.operation,
+      paired.connectionId,
+      sendInputMutation(sessionId, BigInt(fixture.application.store.getSession(sessionId).descriptor.binding.generation),
+        "Recover this turn after one simulated context overflow.")
+    );
+    const runId = queueRunIdFrom(queued);
+    await waitForRealSystem(
+      () => paired.clients.run.getRun({ runId }),
+      (response) => response.run?.state === RunState.SUCCEEDED,
+      "real Pi overflow recovery turn",
+      30_000
+    );
+    const liveOverflowEvents: ReturnType<typeof compactionEvents> = [];
+    const overflowTimer = setTimeout(() => overflowAbort.abort(), 30_000);
+    try {
+      let next = await firstOverflowEvent;
+      while (!next.done) {
+        const event = next.value.event;
+        if (event?.payload?.kind.case === "compactionChanged" && event.payload.kind.value.reason === "overflow") {
+          liveOverflowEvents.push(event.payload.kind.value);
+          if (event.payload.kind.value.state === CompactionState.COMPLETED) break;
+        }
+        next = await overflowIterator.next();
+      }
+    } finally {
+      clearTimeout(overflowTimer);
+      overflowAbort.abort();
+      await overflowIterator.return?.();
     }
+    expect(liveOverflowEvents.map((event) => event.state)).toEqual([
+      CompactionState.STARTED,
+      CompactionState.COMPLETED
+    ]);
+    expect(new Set(liveOverflowEvents.map((event) => event.compactionId))).toHaveLength(1);
 
     const snapshot = await paired.clients.event.getSnapshot({ scope: sessionScope });
     const events = compactionEvents(snapshot.snapshot?.timeline ?? []);
-    // Stock Pi persists the resulting native compaction entry but does not
-    // retain its live overflow trigger on disk. The successful Run plus the
-    // deterministic Provider sequence proves compact-and-retry; the external
-    // Live-trigger execution remains a separate evidence gate.
+    // Stock Pi persists the resulting native compaction entry without its
+    // trigger reason. The live Event stream above is the reason authority;
+    // a later native-history reconciliation must not invent that reason.
     expect(events).toEqual(expect.arrayContaining([
       expect.objectContaining({ state: CompactionState.COMPLETED, reason: "native_history" })
     ]));

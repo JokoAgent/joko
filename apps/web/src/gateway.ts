@@ -1915,6 +1915,11 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     if (payload?.case !== "target" || payload.value.targetId.length === 0) {
       throw new GatewayError("Orchestrator completed project creation without a typed project result.");
     }
+    // The mutation's background refresh may have captured a pre-commit owner
+    // snapshot. A managed dialogue immediately creates a task against this
+    // Target, so project the committed revision before returning its ID.
+    await this.#refreshPromise?.catch(() => undefined);
+    await this.refresh();
     return payload.value.targetId;
   }
 

@@ -7748,7 +7748,8 @@ export class OperationalStore {
         );
       }
       if (
-        nativeBindingChanged || patch.title !== undefined || patch.pinned !== undefined || patch.archived !== undefined ||
+        nativeBindingChanged || binding.generation !== descriptor.binding.generation ||
+        patch.title !== undefined || patch.pinned !== undefined || patch.archived !== undefined ||
         patch.deletedAt !== undefined
       ) this.appendSessionProjectionEvent(updated, `session-update:${id}:${updated.revision.toString(10)}`);
       return updated;

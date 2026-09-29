@@ -1989,6 +1989,21 @@ describe("OperationalStore", () => {
     )?.descriptor.id).toBe("session-1");
   });
 
+  it("publishes a Session projection when native recovery advances only its generation", () => {
+    const { store } = createFixture();
+    const current = store.getSession("session-1");
+    const priorEvents = store.listEvents({ sessionId: "session-1" }).length;
+    const updated = store.updateSession("session-1", {
+      binding: { ...current.descriptor.binding, generation: current.descriptor.binding.generation + 1 }
+    }, current.revision);
+
+    expect(updated.descriptor.binding.opaqueRef).toBe(current.descriptor.binding.opaqueRef);
+    expect(store.listEvents({ sessionId: "session-1" }).slice(priorEvents)).toMatchObject([{
+      generation: updated.descriptor.binding.generation,
+      payload: { type: "session_changed" }
+    }]);
+  });
+
   it("distinguishes an omitted effort patch from an explicit effort clear", () => {
     const { store } = createFixture();
     const selected = store.updateSession("session-1", { effort: "medium" });

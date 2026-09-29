@@ -406,9 +406,12 @@ import {
 // sees the same path shape in the real Electron entry as it does in tests.
 const sourceDirectory = resolve(fileURLToPath(new URL(".", import.meta.url)));
 const developmentUrl = process.env["JOKO_WEB_DEV_URL"];
-const packagedSmoke = process.env["JOKO_DESKTOP_PACKAGED_SMOKE"] === "1";
+const packagedSmokeRequested = process.env["JOKO_DESKTOP_PACKAGED_SMOKE"] === "1";
 const packagedSmokeScope = process.env["JOKO_DESKTOP_SMOKE_SCOPE"] ?? "full";
-if (packagedSmoke && packagedSmokeScope !== "full" && packagedSmokeScope !== "inspector" && packagedSmokeScope !== "draft") {
+const externalPackagedE2e = packagedSmokeRequested && packagedSmokeScope === "external";
+const packagedSmoke = packagedSmokeRequested && !externalPackagedE2e;
+if (packagedSmokeRequested && packagedSmokeScope !== "full" && packagedSmokeScope !== "inspector"
+  && packagedSmokeScope !== "draft" && packagedSmokeScope !== "external") {
   throw new Error(`Unsupported packaged smoke scope: ${packagedSmokeScope}`);
 }
 const packagedSmokeTimeoutCandidate = Number(process.env["JOKO_DESKTOP_SMOKE_TIMEOUT_MS"]);
@@ -427,6 +430,10 @@ const packagedSmokePublicHttpOrigin = process.env["JOKO_DESKTOP_SMOKE_PUBLIC_HTT
 const packagedSmokeProviderOrigin = process.env["JOKO_DESKTOP_SMOKE_PROVIDER_ORIGIN"];
 const packagedSmokeResultPath = process.env["JOKO_DESKTOP_SMOKE_RESULT"];
 const packagedSmokeUserData = process.env["JOKO_DESKTOP_SMOKE_USER_DATA"];
+if (externalPackagedE2e && (packagedSmokeUserData === undefined
+  || !isAbsolute(packagedSmokeUserData) || resolve(packagedSmokeUserData) !== packagedSmokeUserData)) {
+  throw new Error("Packaged Desktop E2E requires an isolated user-data directory.");
+}
 let packagedSmokeFailNextMainDocumentRequest = false;
 let resolvePackagedSmokeFailedMainDocumentRequest: (() => void) | undefined;
 const PACKAGED_SMOKE_FAILED_DOCUMENT_HEADER = "x-joko-packaged-smoke-failed-document";
@@ -455,6 +462,7 @@ const nativeTaskStatusSupported = isNativeTaskStatusAvailable({
 const desktopAttentionBadgeSupported = process.platform === "darwin" || process.platform === "win32"
   || process.platform === "linux";
 let mainWindow: BrowserWindow | undefined;
+const mainWindowContentsByWindow = new WeakMap<BrowserWindow, WebContents>();
 const mainWindowDocuments = new DesktopMainDocumentOccurrenceAuthority<WebContents>(() => randomUUID());
 const desktopDeepLinkDelivery = new DesktopDeepLinkDeliveryBuffer();
 const desktopInboundOpenIntentFence = new DesktopInboundOpenIntentFence();
@@ -730,7 +738,7 @@ protocol.registerSchemesAsPrivileged([{
 const desktopUserDataDirectory = resolveDesktopUserDataDirectory({
   packaged: app.isPackaged,
   appDataDirectory: app.getPath("appData"),
-  packagedSmoke,
+  packagedSmoke: packagedSmokeRequested,
   ...(packagedSmokeUserData === undefined ? {} : {
     packagedSmokeDirectory: packagedSmokeUserData
   })
@@ -976,6 +984,7 @@ function createWindow(): void {
       mainWindow = undefined;
     }
   });
+  mainWindowContentsByWindow.set(window, windowContents);
   const attentionSourceId = windowContents.id;
   mainWindow = window;
   let mainUiLoadRecovery: Promise<void> | undefined;
@@ -4916,7 +4925,7 @@ function registerPackagedAppProtocol(): void {
 }
 
 function registerDesktopDeepLinkProtocolClient(): void {
-  if (packagedSmoke) return;
+  if (packagedSmokeRequested) return;
   try {
     if (process.defaultApp && process.argv[1] !== undefined) {
       app.setAsDefaultProtocolClient(DESKTOP_DEEP_LINK_SCHEME, process.execPath, [resolve(process.argv[1])]);
@@ -4946,7 +4955,9 @@ function captureMainWindowDocument(contents: WebContents, claim: string): string
 }
 
 function retireMainWindowDocument(window: BrowserWindow, contents: WebContents): void {
-  if (mainWindow !== window || window.webContents !== contents) return;
+  // The captured endpoint remains exact after BrowserWindow.closed, when
+  // Electron's webContents getter itself throws Object has been destroyed.
+  if (mainWindow !== window || mainWindowContentsByWindow.get(window) !== contents) return;
   const retired = mainWindowDocuments.retire(contents);
   if (retired !== undefined) desktopNotifications.retireOwner(retired.endpoint, retired.occurrence);
   desktopDeepLinkDelivery.resetRenderer();

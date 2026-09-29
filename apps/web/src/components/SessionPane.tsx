@@ -1691,7 +1691,7 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
   );
 
   return (
-    <main ref={paneRef} className={cx("session-pane", presentation === "filesRail" && "session-pane--files-rail")} data-input-session-id={session.id} aria-label={session.name} onKeyDownCapture={(event) => {
+    <main ref={paneRef} className={cx("session-pane", presentation === "filesRail" && "session-pane--files-rail")} data-input-session-id={session.id} data-input-session-generation={session.generation.toString()} aria-label={session.name} onKeyDownCapture={(event) => {
       const modalOpen = document.body.classList.contains("modal-open");
       const retryEscapeInput: RetryEscapeInput = {
         key: event.key,
@@ -2026,7 +2026,9 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
         showClose={false}
         dismissOnBackdrop={false}
         initialFocus={() => paneRef.current?.querySelector<HTMLElement>("[data-compact-cancel='true']") ?? null}
-        restoreFocusFallback={() => paneRef.current?.querySelector<HTMLElement>("[data-composer-editor='true']:not(:disabled)") ?? null}
+        restoreFocusFallback={() => paneRef.current?.querySelector<HTMLElement>("button.context-capacity-ring--button:not(:disabled)")
+          ?? paneRef.current?.querySelector<HTMLElement>("[data-composer-editor='true'] [contenteditable='true']")
+          ?? null}
         onClose={releaseCompactConfirmation}
       >
         <div className="modal__actions compact-confirmation__actions">

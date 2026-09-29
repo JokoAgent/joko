@@ -11749,19 +11749,33 @@ export class SessionHost {
               recovery: "Retry after Backend instance replacement finishes."
             });
           }
-          // Resource authority is live and process-scoped. Re-observe the
-          // complete catalog after activation so this accepted turn can bind
-          // both loaded exposure and any typed mention to the exact runtime
-          // generation. Review runtimes deliberately have no Resource surface.
+          // Resource authority is live and process-scoped. Ordinary turns
+          // re-observe the complete catalog after activation so both loaded
+          // exposure and typed mentions bind to the exact runtime generation.
+          // Review runtimes deliberately have no Resource surface.
           const resourceCapability = this.#store.getBackend(
             this.#store.getSession(sessionId).descriptor.backendId
           ).descriptor.capabilities.get("runtime.resources");
           const dispatchResources: readonly RuntimeResource[] = reviewReadOnly || resourceCapability?.supported !== true
             ? []
-            : await this.getResources(
-                sessionId,
-                this.effectiveQueueProviderId(item, this.#store.getSession(sessionId))
-              );
+            : bypassesCompaction
+              ? (() => {
+                  // The catalogued command was admitted by this live runtime. A
+                  // second catalog RPC can wait behind its active compaction,
+                  // defeating the only dispatch that may safely bypass it.
+                  const cached = this.#activeResourceCatalogs.get(sessionId);
+                  if (cached?.active !== active || !this.activeResourceCatalogIsCurrent(active)) {
+                    throw inputCapabilityError(
+                      "INPUT_RESOURCE_CATALOG_STALE",
+                      "The task resource catalog changed during Pi compaction."
+                    );
+                  }
+                  return cached.resources.map((resource) => ({ ...resource }));
+                })()
+              : await this.getResources(
+                  sessionId,
+                  this.effectiveQueueProviderId(item, this.#store.getSession(sessionId))
+                );
           this.assertSessionNotPendingScheduleDeletion(sessionId);
           const stored = this.#store.getSession(sessionId);
           this.assertQueueProviderAuthentication(item, stored);

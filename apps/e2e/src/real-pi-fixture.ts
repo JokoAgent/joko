@@ -33,6 +33,7 @@ export interface CapturedProviderRequest {
 
 export type RealPiProviderReply =
   | { readonly kind: "text"; readonly text: string }
+  | { readonly kind: "contextOverflow" }
   | {
       readonly kind: "tool";
       readonly name: string;
@@ -403,6 +404,17 @@ export async function startLocalProvider(
       } catch (error) {
         response.writeHead(500, { "content-type": "application/json; charset=utf-8" });
         response.end(JSON.stringify({ error: { message: error instanceof Error ? error.message : "Provider responder failed." } }));
+        return;
+      }
+      if (reply.kind === "contextOverflow") {
+        response.writeHead(400, { "content-type": "application/json; charset=utf-8" });
+        response.end(JSON.stringify({
+          error: {
+            message: "Requested token count exceeds the model's maximum context length of 16384 tokens",
+            type: "invalid_request_error",
+            code: "context_length_exceeded"
+          }
+        }));
         return;
       }
       response.writeHead(200, {

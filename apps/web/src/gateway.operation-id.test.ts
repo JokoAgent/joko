@@ -146,6 +146,37 @@ describe("operation ID lifecycle", () => {
     gateway.disconnect();
   });
 
+  it("refreshes a committed managed Target past a stale in-flight snapshot before creating its task", async () => {
+    let snapshotReads = 0;
+    const createdTarget = { ...targetDescriptor(false), targetId: "target-created", workspaceId: "workspace-created" };
+    const gateway = createOrchestratorGateway(
+      { id: "connection-1", deviceId: "device-test", name: "Desktop", origin: "https://orchestrator.example", serverId: "server-test" },
+      "secret",
+      {},
+      () => operationTransport(async (method, input) => input.mutation.payload.case === "createTarget"
+        ? response(method, create(SubmitOperationResponseSchema, {
+          operation: {
+            operationId: input.operationId,
+            connectionId: input.connectionId,
+            state: OperationState.SUCCEEDED,
+            result: { payload: { case: "target", value: { targetId: createdTarget.targetId } } }
+          }
+        }))
+        : successfulSessionResponse(method, input, "session-created"), [],
+      () => ++snapshotReads < 3 ? [targetDescriptor(false)] : [targetDescriptor(false), createdTarget])
+    );
+    await gateway.connect();
+
+    const targetId = await gateway.createTarget({
+      backendId: "pi", name: "Managed dialogue", workspaceKind: "managedDialogue",
+      serverPath: "", createIfMissing: true
+    });
+    expect(targetId).toBe("target-created");
+    expect(snapshotReads).toBeGreaterThanOrEqual(3);
+    await expect(gateway.createSession({ ...DRAFT, targetId })).resolves.toMatchObject({ sessionId: "session-created" });
+    gateway.disconnect();
+  });
+
   it("mints a fresh operation ID for a new user attempt after a confirmed failure", async () => {
     const operationIds: string[] = [];
     let submissions = 0;
