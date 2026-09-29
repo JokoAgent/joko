@@ -2,9 +2,11 @@ import { mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises"
 import { mkdtemp } from "./test-paths.js";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 
 import { CodexBackendAdapter } from "@joko/adapter-codex";
 import { PiBackendAdapter } from "@joko/adapter-pi";
+import { VoiceDictionaryPeerStore } from "@joko/store";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
@@ -18,6 +20,7 @@ import { BackendInstanceRegistry } from "./backend-instance-registry.js";
 import type { OrchestratorConfig } from "./config.js";
 import { ManagedProviderProxy } from "./managed-provider-proxy.js";
 import { createInternalServer, createPublicServer } from "./server.js";
+import { VoiceDictionaryPeerManager } from "./voice-dictionary-peer-manager.js";
 
 const cleanups: Array<() => Promise<void>> = [];
 
@@ -202,6 +205,8 @@ describe("Orchestrator application composition", () => {
     const forceDisposeCandidate = vi.spyOn(CodexBackendAdapter.prototype, "forceDispose")
       .mockRejectedValue(new Error("controlled candidate force-dispose failure"));
     const closeProviderProxy = vi.spyOn(ManagedProviderProxy.prototype, "close");
+    const closeDictionaryPeers = vi.spyOn(VoiceDictionaryPeerManager.prototype, "close");
+    const closeDictionaryPeerStore = vi.spyOn(VoiceDictionaryPeerStore.prototype, "close");
 
     try {
       await expect(createOrchestratorApplication(config))
@@ -209,13 +214,70 @@ describe("Orchestrator application composition", () => {
       expect(disposeCandidate).toHaveBeenCalledTimes(4);
       expect(forceDisposeCandidate).toHaveBeenCalledTimes(4);
       expect(closeProviderProxy).toHaveBeenCalledOnce();
+      expect(closeDictionaryPeers).toHaveBeenCalled();
+      expect(closeDictionaryPeerStore).toHaveBeenCalled();
+      expect(closeDictionaryPeers.mock.invocationCallOrder[0])
+        .toBeLessThan(closeDictionaryPeerStore.mock.invocationCallOrder[0]!);
     } finally {
       probeCandidate.mockRestore();
       disposeCandidate.mockRestore();
       forceDisposeCandidate.mockRestore();
       closeProviderProxy.mockRestore();
+      closeDictionaryPeers.mockRestore();
+      closeDictionaryPeerStore.mockRestore();
       await rm(root, { recursive: true, force: true, maxRetries: 3 });
     }
+  }, 20_000);
+
+  it("composes a private dictionary peer identity, preserves its sole dictionary owner across restart, and closes its transport before SQLite", async () => {
+    const root = await mkdtemp(join(tmpdir(), "joko-application-dictionary-peers-"));
+    const workspace = join(root, "workspace");
+    const dataDirectory = join(root, "data");
+    await mkdir(workspace, { recursive: true });
+    const config: OrchestratorConfig = {
+      host: "127.0.0.1", port: 4328, internalPort: 4327,
+      publicOrigin: "http://127.0.0.1:4328", internalOrigin: "http://127.0.0.1:4327",
+      dataDirectory, databasePath: join(dataDirectory, "orchestrator.db"),
+      allowInsecureLoopback: true, allowInsecureLan: false, lanDiscoveryEnabled: false,
+      codexExecutable: join(root, "missing-codex"), piAgentHome: join(dataDirectory, "pi"),
+      workspace: { id: "workspace-dictionary-peers", root: workspace, displayName: "Dictionary", trusted: true },
+      artifactDirectory: join(dataDirectory, "artifacts"), webDirectory: join(root, "no-web-build"), corsOrigins: []
+    };
+    let application = await createOrchestratorApplication(config);
+    cleanups.push(async () => { await application.close(); await rm(root, { recursive: true, force: true, maxRetries: 3 }); });
+    const manager = application.voiceDictionaryPeers!;
+    const dictionary = application.voiceDictionary!;
+    expect(manager.status()).toMatchObject({ available: true, enabled: false, nodeId: application.serverId, phase: "off" });
+    expect(manager.status().fingerprint).not.toBe(application.contactSync?.status().fingerprint);
+    const fingerprint = manager.status().fingerprint;
+    const reader = new DatabaseSync(join(dataDirectory, "voice-dictionary-peers.db"), { readOnly: true });
+    let sealed: string;
+    try {
+      const identity = reader.prepare("SELECT sealed_key_json FROM dictionary_peer_identity").get()!;
+      sealed = identity["sealed_key_json"] as string;
+      expect(JSON.parse(sealed)).toMatchObject({ algorithm: "aes-256-gcm", ciphertext: expect.any(String) });
+    } finally { reader.close(); }
+    const exposed = JSON.stringify({ settings: application.store.listSettings(), diagnostics: application.store.listDiagnostics(), status: manager.status() },
+      (_key, value: unknown) => typeof value === "bigint" ? value.toString() : value);
+    expect(exposed).not.toContain(JSON.parse(sealed)["ciphertext"]);
+    dictionary.setEnabled(dictionary.snapshot().revision, true);
+    await manager.syncNow();
+    dictionary.addManualTerm(dictionary.snapshot().revision, "Durable application term");
+    const snapshot = dictionary.snapshot();
+    const closeManager = vi.spyOn(manager, "close");
+    const closePrivateStore = vi.spyOn(VoiceDictionaryPeerStore.prototype, "close");
+    const closeOperationalStore = vi.spyOn(application.store, "close");
+    try {
+      await application.close();
+      expect(closeManager).toHaveBeenCalledOnce();
+      expect(closePrivateStore).toHaveBeenCalledOnce();
+      expect(closeManager.mock.invocationCallOrder[0]).toBeLessThan(closePrivateStore.mock.invocationCallOrder[0]!);
+      expect(closePrivateStore.mock.invocationCallOrder[0]).toBeLessThan(closeOperationalStore.mock.invocationCallOrder[0]!);
+    } finally { closeManager.mockRestore(); closePrivateStore.mockRestore(); closeOperationalStore.mockRestore(); }
+    application = await createOrchestratorApplication(config);
+    expect(application.voiceDictionaryPeers!.status()).toMatchObject({ available: true, enabled: true, fingerprint });
+    expect(application.voiceDictionary!.snapshot()).toEqual(snapshot);
+    await application.voiceDictionaryPeers!.syncNow();
   }, 20_000);
 
   it("finalizes retained Backend cleanup owners after current Adapters and before native dependencies", async () => {

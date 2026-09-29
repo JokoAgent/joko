@@ -149,6 +149,30 @@ describe("authenticated node LAN lifetime", () => {
     await waitUntil(() => sender.onlinePeerIds().includes(second.nodeId));
     expect(await sender.send(second.nodeId, encryptedFrame(first, second, "voice-dictionary"))).toBe(true);
   });
+
+  it("keeps a failed route in cooldown but immediately permits a new route for the same pinned identity", { timeout: 15_000 }, async () => {
+    const port = randomInt(42_000, 48_000);
+    const first = identity("first");
+    const second = identity("second");
+    let accept = false;
+    const sender = transport(port, "voice-dictionary", first, second, () => undefined);
+    const receiver = transport(port, "voice-dictionary", second, first, () => {
+      if (!accept) throw new Error("Controlled receiver failure.");
+    });
+    await Promise.all([sender.start(), receiver.start()]);
+    await waitUntil(() => sender.onlinePeerIds().includes(second.nodeId));
+    const oldPort = sender.candidates()[0]!.port;
+    expect(await sender.send(second.nodeId, encryptedFrame(first, second, "voice-dictionary"))).toBe(false);
+    await waitUntil(() => sender.candidates().some((candidate) => candidate.port === oldPort));
+    expect(sender.onlinePeerIds()).toEqual([]);
+    accept = true;
+    expect(await sender.send(second.nodeId, encryptedFrame(first, second, "voice-dictionary"))).toBe(false);
+    receiver.stop();
+    await receiver.start();
+    await waitUntil(() => sender.candidates().some((candidate) => candidate.port !== oldPort));
+    expect(sender.onlinePeerIds()).toEqual([second.nodeId]);
+    expect(await sender.send(second.nodeId, encryptedFrame(first, second, "voice-dictionary"))).toBe(true);
+  });
 });
 
 function identity(name: string): NodeSyncLanIdentity { return { ...generateNodeSyncIdentity(), nodeId: `node-${name}`, displayName: `${name} computer` }; }

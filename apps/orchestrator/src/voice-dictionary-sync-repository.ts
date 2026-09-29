@@ -107,6 +107,7 @@ export class VoiceDictionarySyncRepository {
   readonly #store: OperationalStore;
   readonly #now: () => number;
   readonly #onChanged: (snapshot: VoiceDictionarySyncSnapshot) => void;
+  readonly #listeners = new Set<() => void>();
   #document: VoiceDictionarySyncDocument;
   #mutating = false;
   #unavailable = false;
@@ -160,6 +161,12 @@ export class VoiceDictionarySyncRepository {
   snapshot(): VoiceDictionarySyncSnapshot {
     this.#assertAvailable();
     return snapshotOf(this.#document);
+  }
+
+  subscribe(listener: () => void): () => void {
+    this.#assertAvailable();
+    this.#listeners.add(listener);
+    return () => this.#listeners.delete(listener);
   }
 
   /** Returns a detached, revalidated state suitable for an authenticated peer frame. */
@@ -396,6 +403,7 @@ export class VoiceDictionarySyncRepository {
     } catch {
       // Observers never own the durable commit and cannot roll it back.
     }
+    for (const listener of this.#listeners) { try { listener(); } catch {} }
     return snapshot;
   }
 

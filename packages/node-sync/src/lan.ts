@@ -106,7 +106,7 @@ export class NodeSyncLanTransport {
     "multicastGroup" | "multicastPort" | "beaconIntervalMilliseconds" | "endpointTtlMilliseconds" |
     "connectTimeoutMilliseconds" | "multicastLoopback">> & NodeSyncLanTransportOptions;
   readonly #endpoints = new Map<string, PeerEndpoint>();
-  readonly #retryAfter = new Map<string, number>();
+  readonly #retryAfter = new Map<string, { readonly until: number; readonly endpoint: PeerEndpoint }>();
   readonly #activeSockets = new Set<Socket>();
   #tcpServer?: Server;
   #udpSocket?: DgramSocket;
@@ -198,7 +198,7 @@ export class NodeSyncLanTransport {
   onlinePeerIds(now = Date.now()): readonly string[] {
     this.#prune(now);
     return [...this.#endpoints.entries()].filter(([nodeId, endpoint]) =>
-      this.#options.isPeerAllowed(nodeId, endpoint.publicKey)).map(([nodeId]) => nodeId).sort();
+      this.#options.isPeerAllowed(nodeId, endpoint.publicKey) && !this.#retryAfter.has(nodeId)).map(([nodeId]) => nodeId).sort();
   }
 
   async send(nodeId: string, frame: NodeSyncCipherChunkFrame): Promise<boolean> {
@@ -207,7 +207,7 @@ export class NodeSyncLanTransport {
     const generation = this.#generation;
     const now = Date.now();
     const retryAfter = this.#retryAfter.get(nodeId);
-    if (retryAfter !== undefined && retryAfter > now) return false;
+    if (retryAfter !== undefined && retryAfter.until > now) return false;
     if (retryAfter !== undefined) this.#retryAfter.delete(nodeId);
     const endpoint = this.#endpoints.get(nodeId);
     if (self === undefined || endpoint === undefined || frame.senderPublicKey !== self.publicKey ||
@@ -245,10 +245,10 @@ export class NodeSyncLanTransport {
         if (current && sent) this.#retryAfter.delete(nodeId);
         else if (current) {
           const latest = this.#endpoints.get(nodeId);
-          if (latest?.publicKey === endpoint.publicKey && latest.address === endpoint.address && latest.port === endpoint.port) {
+          if (latest === undefined || sameRoute(latest, endpoint)) {
             this.#endpoints.delete(nodeId);
+            this.#retryAfter.set(nodeId, { until: Date.now() + DIRECT_RETRY_COOLDOWN_MILLISECONDS, endpoint });
           }
-          this.#retryAfter.set(nodeId, Date.now() + DIRECT_RETRY_COOLDOWN_MILLISECONDS);
           this.#options.onPresenceChanged?.();
         }
         resolve(current && sent);
@@ -356,7 +356,9 @@ export class NodeSyncLanTransport {
     };
     this.#endpoints.set(parsed.nodeId, endpoint);
     const retryAfter = this.#retryAfter.get(parsed.nodeId);
-    if (retryAfter !== undefined && retryAfter <= endpoint.seenAt) this.#retryAfter.delete(parsed.nodeId);
+    if (retryAfter !== undefined && (retryAfter.until <= endpoint.seenAt ||
+      (retryAfter.endpoint.publicKey === endpoint.publicKey && !sameRoute(retryAfter.endpoint, endpoint) &&
+        this.#options.isPeerAllowed(parsed.nodeId, endpoint.publicKey)))) this.#retryAfter.delete(parsed.nodeId);
     this.#options.onCandidate({
       nodeId: parsed.nodeId,
       displayName: parsed.displayName,
@@ -431,7 +433,10 @@ export class NodeSyncLanTransport {
         changed = true;
       }
     }
-    for (const [nodeId, until] of this.#retryAfter) if (until <= now) this.#retryAfter.delete(nodeId);
+    for (const [nodeId, retry] of this.#retryAfter) if (retry.until <= now) {
+      this.#retryAfter.delete(nodeId);
+      changed = true;
+    }
     if (changed) this.#options.onPresenceChanged?.();
   }
 
@@ -458,6 +463,10 @@ function authContext(kind: NodeSyncLanAuthContext["kind"], sourceNodeId: string,
     tag: frame.tag,
     data: frame.data
   };
+}
+
+function sameRoute(first: PeerEndpoint, second: PeerEndpoint): boolean {
+  return first.publicKey === second.publicKey && first.address === second.address && first.port === second.port;
 }
 
 function isBeacon(value: unknown, purpose: NodeSyncPurpose): value is NodeSyncLanBeacon {
