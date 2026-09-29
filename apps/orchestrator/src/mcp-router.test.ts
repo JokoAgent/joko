@@ -20,6 +20,10 @@ import { ArtifactStore } from "./artifact-store.js";
 import { CredentialManager } from "./credential-manager.js";
 import { CredentialVault } from "./credential-vault.js";
 import {
+  MCP_AUDIO_RESULT_MAPPING_META_KEY,
+  type McpAudioResultDownloader
+} from "./mcp-audio-result-mapping.js";
+import {
   McpRouter,
   type BridgeToolProvider,
   type McpClientConnection,
@@ -63,6 +67,7 @@ class FakeMcpFactory implements McpClientFactory {
   readResourceHandler: ((uri: string, signal: AbortSignal) => Promise<{ readonly contents: readonly unknown[] }>) | undefined;
   toolDescription = "Return the fenced generation";
   toolOutputSchema: Readonly<Record<string, unknown>> | undefined;
+  toolMeta: Readonly<Record<string, unknown>> | undefined;
   listToolsHandler: ((cursor: string | undefined, signal: AbortSignal) => Promise<McpToolListPage>) | undefined;
 
   async connect(input: McpClientFactoryInput): Promise<McpClientConnection> {
@@ -80,6 +85,7 @@ class FakeMcpFactory implements McpClientFactory {
           description: owner.toolDescription,
           inputSchema: { type: "object", properties: { value: { type: "string" } } },
           ...(owner.toolOutputSchema === undefined ? {} : { outputSchema: owner.toolOutputSchema }),
+          ...(owner.toolMeta === undefined ? {} : { _meta: owner.toolMeta }),
           annotations: { readOnlyHint: true }
         }] };
       },
@@ -100,6 +106,7 @@ class FakeMcpFactory implements McpClientFactory {
 
 interface FixtureOptions extends Partial<Pick<McpRouterOptions, "now" | "bridgeGrantTtlMs" | "nativeAuthLeaseTtlMs" | "nativeAuth" | "nativeAuthRecovery" | "trustedManagedRunnerScriptSha256" | "toolDiscoveryPolicy">> {
   readonly maximumBlobBytes?: number;
+  readonly audioResultDownloader?: McpAudioResultDownloader;
 }
 
 async function fixture(options: FixtureOptions = {}) {
@@ -215,6 +222,7 @@ async function fixture(options: FixtureOptions = {}) {
     credentials,
     clientFactory: factory,
     resultArtifacts: artifacts,
+    ...(options.audioResultDownloader === undefined ? {} : { audioResultDownloader: options.audioResultDownloader }),
     ...(options.now === undefined ? {} : { now: options.now }),
     ...(options.bridgeGrantTtlMs === undefined ? {} : { bridgeGrantTtlMs: options.bridgeGrantTtlMs }),
     ...(options.nativeAuthLeaseTtlMs === undefined ? {} : { nativeAuthLeaseTtlMs: options.nativeAuthLeaseTtlMs }),
@@ -305,6 +313,173 @@ describe("McpRouter", () => {
       expect(factory.resourceReads).toHaveLength(3);
       expect(factory.calledTools).toHaveLength(1);
     } finally { await router.dispose(); store.close(); await rm(root, { recursive: true, force: true }); }
+  });
+
+  it("maps declared supplier structured audio URLs into canonical tracks without retaining source identities", async () => {
+    const trackOne = "https://media.example.test/private/one.wav?signature=track-one";
+    const trackTwo = "https://cdn.example.test/private/two.wav?signature=track-two";
+    const coverOne = "https://media.example.test/private/cover.png?signature=cover-one";
+    const brokenCover = "https://cdn.example.test/private/broken.png?signature=cover-two";
+    let durableStore: OperationalStore | undefined;
+    const downloads = vi.fn<McpAudioResultDownloader>(async (input) => {
+      expect(durableStore?.listOperations().some((operation) =>
+        operation.kind === "audio_artifact_publication" && operation.status === "started")).toBe(true);
+      input.guard();
+      if (input.url === brokenCover) throw new Error("supplier cover failed");
+      return input.url === coverOne
+        ? Buffer.from(AUDIO_ARTWORK_PNG, "base64")
+        : audioWave();
+    });
+    const { root, store, router, factory, artifacts } = await fixture({ audioResultDownloader: downloads });
+    durableStore = store;
+    try {
+      factory.toolMeta = {
+        [MCP_AUDIO_RESULT_MAPPING_META_KEY]: {
+          version: 1,
+          tracks: [{
+            trackPath: ["payload", "tracks", "*"],
+            audio: {
+              path: ["audioUrl"],
+              encoding: "url",
+              mimeType: "audio/wav",
+              allowedUrlHosts: ["media.example.test", "cdn.example.test"]
+            },
+            kind: "music",
+            titlePath: ["title"],
+            descriptionPath: ["description"],
+            durationSecondsPath: ["durationSeconds"],
+            artwork: {
+              path: ["coverUrl"],
+              encoding: "url",
+              mimeType: "image/png",
+              allowedUrlHosts: ["media.example.test", "cdn.example.test"],
+              altPath: ["coverAlt"]
+            }
+          }]
+        }
+      };
+      await router.upsert({ id: "supplier-audio", displayName: "Supplier audio", enabled: true, transport: "streamable_http", endpoint: "http://127.0.0.1:4321/mcp", credentialBindings: [] });
+      const snapshot = router.createPiBridgeSnapshot({ endpoint: "http://127.0.0.1:4318/internal/mcp", sessionId: "session-1", targetId: "target-1", expectedPiGeneration: 1 });
+      expect(snapshot.mcpBridge.tools.find((tool) => tool.serverId === "supplier-audio" && tool.name === "echo"))
+        .toMatchObject({ requiresPermission: true });
+      const visibleMapping = router.get("supplier-audio").tools[0]!.audioResultMapping as unknown as {
+        tracks: { audio: { allowedUrlHosts: string[] } }[];
+      };
+      visibleMapping.tracks[0]!.audio.allowedUrlHosts[0] = "mutated.example.test";
+      factory.toolMeta = undefined;
+      await router.upsert({ id: "supplier-audio", displayName: "Supplier audio", enabled: true, transport: "streamable_http", endpoint: "http://127.0.0.1:4322/mcp", credentialBindings: [] });
+      const request = { authorization: `Bearer ${snapshot.mcpBridge.token}`, requestId: "mapped-supplier-audio", generation: 1, sessionId: "session-1", targetId: "target-1", serverId: "supplier-audio", toolName: "echo" };
+      factory.result = {
+        content: [{ type: "text", text: `Created ${trackOne} and ${brokenCover}` }],
+        structuredContent: {
+          payload: {
+            tracks: [{
+              audioUrl: trackOne,
+              title: "First track",
+              description: "Supplier-authored description",
+              durationSeconds: 12.5,
+              coverUrl: coverOne,
+              coverAlt: "First cover"
+            }, {
+              audioUrl: trackTwo,
+              title: "Second track",
+              description: "Cover may fail independently",
+              durationSeconds: 8,
+              coverUrl: brokenCover,
+              coverAlt: "Broken cover"
+            }]
+          }
+        },
+        isError: false
+      };
+
+      const first = await router.executeBridgeCall(request);
+      expect(first).toMatchObject({ isError: false });
+      expect(JSON.stringify(first)).not.toContain("signature=");
+      expect(JSON.stringify(first)).not.toContain("jokoAudioArtifacts");
+      const records = store.listArtifacts({ sessionId: "session-1" });
+      expect(records).toHaveLength(3);
+      const tracks = records.filter((entry) => (entry.metadata as { audio?: unknown }).audio !== undefined);
+      expect(tracks).toHaveLength(2);
+      expect(tracks.map((entry) => entry.metadata)).toEqual(expect.arrayContaining([
+        { audio: expect.objectContaining({ kind: "music", title: "First track", description: "Supplier-authored description", durationSeconds: 12.5, artwork: expect.objectContaining({ alt: "First cover", width: 2, height: 2 }) }) },
+        { audio: { kind: "music", title: "Second track", description: "Cover may fail independently", durationSeconds: 8 } }
+      ]));
+      for (const track of tracks) expect((await artifacts.readBlob(track.blob)).data).toEqual(audioWave());
+      const durable = JSON.stringify({
+        operations: store.listOperations(),
+        events: store.listEvents({ sessionId: "session-1" }),
+        records
+      }, (_key, value: unknown) => typeof value === "bigint" ? value.toString() : value);
+      for (const identity of [trackOne, trackTwo, coverOne, brokenCover]) expect(durable).not.toContain(identity);
+      expect(downloads).toHaveBeenCalledTimes(4);
+      expect(factory.calledTools).toHaveLength(1);
+
+      expect(await router.executeBridgeCall(request)).toEqual(first);
+      expect(downloads).toHaveBeenCalledTimes(4);
+      expect(factory.calledTools).toHaveLength(1);
+
+      factory.result = {
+        content: [],
+        structuredContent: { payload: { tracks: [{ audioUrl: "https://media.example.test/private/bad.wav" }] } },
+        isError: false
+      };
+      downloads.mockImplementationOnce(async () => Buffer.from("not audio"));
+      expect(await router.executeBridgeCall({ ...request, requestId: "mapped-bad-audio" }))
+        .toMatchObject({ isError: true, errorCode: "invalid_result" });
+      expect(store.listArtifacts({ sessionId: "session-1" })).toHaveLength(3);
+    } finally { await router.dispose(); store.close(); await rm(root, { recursive: true, force: true }); }
+  });
+
+  it.each(["cancel", "revoke"] as const)("fences supplier audio URL materialization on %s", async (boundary) => {
+    const started = deferred<void>();
+    const downloaded = deferred<Uint8Array>();
+    const download: McpAudioResultDownloader = async () => {
+      started.resolve();
+      return downloaded.promise;
+    };
+    const { root, store, router, factory } = await fixture({ audioResultDownloader: download });
+    try {
+      factory.toolMeta = {
+        [MCP_AUDIO_RESULT_MAPPING_META_KEY]: {
+          version: 1,
+          tracks: [{
+            trackPath: ["track"],
+            audio: { path: ["url"], encoding: "url", mimeType: "audio/wav", allowedUrlHosts: ["media.example.test"] },
+            kind: "generic"
+          }]
+        }
+      };
+      await router.upsert({ id: "supplier-fence", displayName: "Supplier fence", enabled: true, transport: "streamable_http", endpoint: "http://127.0.0.1:4321/mcp", credentialBindings: [] });
+      const snapshot = router.createPiBridgeSnapshot({ endpoint: "http://127.0.0.1:4318/internal/mcp", sessionId: "session-1", targetId: "target-1", expectedPiGeneration: 1 });
+      factory.result = {
+        content: [],
+        structuredContent: { track: { url: "https://media.example.test/private/track.wav" } },
+        isError: false
+      };
+      const controller = new AbortController();
+      const call = router.executeBridgeCall({
+        authorization: `Bearer ${snapshot.mcpBridge.token}`,
+        requestId: `supplier-${boundary}`,
+        generation: 1,
+        sessionId: "session-1",
+        targetId: "target-1",
+        serverId: "supplier-fence",
+        toolName: "echo",
+        signal: controller.signal
+      });
+      await started.promise;
+      if (boundary === "cancel") controller.abort(); else snapshot.revoke();
+      downloaded.resolve(audioWave());
+      expect(await call).toMatchObject({ isError: true, content: [] });
+      expect(store.listArtifacts({ sessionId: "session-1" })).toHaveLength(0);
+      expect(store.listEvents({ sessionId: "session-1" }).filter((event) => event.payload.type === "artifact")).toHaveLength(0);
+    } finally {
+      downloaded.resolve(audioWave());
+      await router.dispose();
+      store.close();
+      await rm(root, { recursive: true, force: true });
+    }
   });
 
   it.each(["cancel", "retire", "timeout"] as const)("fences a %s during resource reading and never moves a late result to another runtime", async (boundary) => {
@@ -439,6 +614,21 @@ describe("McpRouter", () => {
         requiresPermission: true
       }, {
         serverId: "joko_audio_provider",
+        name: "custom_audio",
+        description: "Return explicitly mapped supplier audio",
+        inputSchema: { type: "object", properties: {}, additionalProperties: false },
+        audioResultMapping: {
+          version: 1,
+          tracks: [{
+            trackPath: ["result"],
+            audio: { path: ["encodedAudio"], encoding: "base64", mimeType: "audio/wav" },
+            kind: "sound_effect",
+            titlePath: ["title"]
+          }]
+        },
+        requiresPermission: true
+      }, {
+        serverId: "joko_audio_provider",
         name: "linked_audio",
         description: "Return an unavailable resource link",
         inputSchema: { type: "object", properties: {}, additionalProperties: false },
@@ -448,6 +638,13 @@ describe("McpRouter", () => {
         calls += 1;
         if (name === "linked_audio") return {
           content: [{ type: "resource_link", uri: "asset://provider-track", name: "track", mimeType: "audio/wav" }],
+          isError: false
+        };
+        if (name === "custom_audio") return {
+          content: [{ type: "text", text: "Created a mapped sound effect" }],
+          structuredContent: {
+            result: { encodedAudio: wav.toString("base64"), title: "Mapped effect" }
+          },
           isError: false
         };
         return {
@@ -514,9 +711,22 @@ describe("McpRouter", () => {
       expect(store.listArtifacts({ sessionId: "session-1" })).toHaveLength(2);
       expect(store.listEvents({ sessionId: "session-1" }).filter((event) => event.payload.type === "artifact")).toHaveLength(1);
 
+      const mapped = await router.executeBridgeCall({
+        ...request,
+        requestId: "provider-custom",
+        toolName: "custom_audio"
+      });
+      expect(mapped).toMatchObject({ isError: false });
+      expect(JSON.stringify(mapped)).not.toContain(wav.toString("base64"));
+      expect(store.listArtifacts({ sessionId: "session-1" })).toHaveLength(3);
+      expect(store.listArtifacts({ sessionId: "session-1" })
+        .find((entry) => (entry.metadata as { audio?: { title?: string } }).audio?.title === "Mapped effect")?.metadata)
+        .toEqual({ audio: { kind: "sound_effect", title: "Mapped effect", description: "" } });
+      expect(store.listEvents({ sessionId: "session-1" }).filter((event) => event.payload.type === "artifact")).toHaveLength(2);
+
       expect(await router.executeBridgeCall({ ...request, requestId: "provider-linked", toolName: "linked_audio" }))
         .toMatchObject({ isError: true, errorCode: "invalid_result" });
-      expect(store.listArtifacts({ sessionId: "session-1" })).toHaveLength(2);
+      expect(store.listArtifacts({ sessionId: "session-1" })).toHaveLength(3);
       snapshot.revoke();
     } finally { await router.dispose(); store.close(); await rm(root, { recursive: true, force: true }); }
   });
@@ -2294,6 +2504,30 @@ describe("McpRouter", () => {
       }],
       callTool: async () => ({ content: [], isError: false })
     })).toThrow(/output schema/u);
+    expect(() => router.registerBridgeToolProvider({
+      id: "invalid-provider-audio-network",
+      generation: 1,
+      available: true,
+      tools: [{
+        serverId: "invalid-provider-audio-network",
+        name: "invalid",
+        description: "URL mapping without permission",
+        inputSchema: { type: "object" },
+        audioResultMapping: {
+          version: 1,
+          tracks: [{
+            trackPath: ["track"],
+            audio: {
+              path: ["url"], encoding: "url", mimeType: "audio/wav",
+              allowedUrlHosts: ["media.example.test"]
+            },
+            kind: "generic"
+          }]
+        },
+        requiresPermission: false
+      }],
+      callTool: async () => ({ content: [], isError: false })
+    })).toThrow(/requires permission/u);
     await router.dispose();
     store.close();
   });

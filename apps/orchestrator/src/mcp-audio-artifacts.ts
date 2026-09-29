@@ -5,6 +5,7 @@ import {
 } from "@joko/core";
 import { operationBodyHash, type OperationalStore } from "@joko/store";
 import type { BridgeToolCallContext, McpCallResult, McpResultArtifactStore } from "./mcp-router.js";
+import type { PreparedMcpAudioResult } from "./mcp-audio-result-mapping.js";
 import { decodeAudioArtwork, inspectAudioArtifact } from "./audio-artifact-media.js";
 import { nativeBindingFingerprint } from "./native-state-observation.js";
 
@@ -35,7 +36,7 @@ export class McpAudioArtifacts {
     return operation.response;
   }
 
-  async publish(result: McpCallResult, context: AudioPublicationContext, guard: () => void, redact: (value: string) => string, normalize: (value: McpCallResult) => McpCallResult, resources: AudioResultResources): Promise<McpCallResult> {
+  async publish(result: McpCallResult, context: AudioPublicationContext, guard: () => void, redact: (value: string) => string, normalize: (value: McpCallResult) => McpCallResult, resources: AudioResultResources, prepared?: PreparedMcpAudioResult): Promise<McpCallResult> {
     const rawDeclarations = result.structuredContent?.["jokoAudioArtifacts"];
     const indices = result.content.flatMap((part, index) => mediaType(part, "audio") ? [index] : []);
     if (rawDeclarations === undefined && indices.length === 0) return result;
@@ -50,8 +51,6 @@ export class McpAudioArtifacts {
         declarations.set(Number(item["audioContentIndex"]), item);
       }
     }
-    const claim = this.store.claimDeferredEffectOperation<McpCallResult>({ id: this.operationId(context), kind: "audio_artifact_publication", body: this.body(context) }, guard);
-    if (!claim.claimed) return claim.value;
     const staged: BlobRef[] = [];
     const covers = new Map<number, AudioArtifactMetadata["artwork"]>();
     const consumed = new Set(indices);
@@ -62,6 +61,20 @@ export class McpAudioArtifacts {
         if (mediaType(result.content[index], "image")) consumed.add(index);
       }
     }
+    if (prepared !== undefined) {
+      for (const [index, media] of prepared.media) {
+        if (!Number.isSafeInteger(index) || !consumed.has(index)
+          || media.type !== (indices.includes(index) ? "audio" : "image")
+          || !mediaType(result.content[index], media.type)
+          || typeof media.load !== "function"
+          || typeof media.mimeType !== "string"
+          || media.mimeType !== (record(result.content[index]) ? result.content[index]["mimeType"] : undefined)) {
+          throw new McpAudioResultError();
+        }
+      }
+    }
+    const claim = this.store.claimDeferredEffectOperation<McpCallResult>({ id: this.operationId(context), kind: "audio_artifact_publication", body: this.body(context) }, guard);
+    if (!claim.claimed) return claim.value;
     // Adopted resources become private input identities. Providers may repeat
     // their signed URI anywhere in ordinary result text or structured data.
     const privateUris = [...new Set([...consumed].flatMap((index) => {
@@ -69,7 +82,9 @@ export class McpAudioArtifacts {
       if (!record(part)) return [];
       const source = part["type"] === "resource_link" ? part : part["type"] === "resource" && record(part["resource"]) ? part["resource"] : undefined;
       return typeof source?.["uri"] === "string" && source["uri"].length > 0 ? [source["uri"]] : [];
-    }))].sort((left, right) => right.length - left.length);
+    }).concat(prepared?.privateIdentities ?? []))]
+      .filter((identity) => typeof identity === "string" && identity.length > 0)
+      .sort((left, right) => right.length - left.length);
     const redactIdentities = (value: string): string => {
       let safe = value;
       for (const uri of privateUris) safe = safe.replaceAll(uri, "[private resource]");
@@ -78,9 +93,24 @@ export class McpAudioArtifacts {
     const redactPrivate = (value: string): string => redact(redactIdentities(value));
     const tracks: { blob: BlobRef; metadata: AudioArtifactMetadata }[] = [];
     let resultBytes = Buffer.byteLength(JSON.stringify(result), "utf8");
-    const receive = async (value: unknown, type: "audio" | "image", maximum: number): Promise<{ bytes: Buffer; mimeType: string }> => {
+    const receive = async (value: unknown, type: "audio" | "image", maximum: number, index: number): Promise<{ bytes: Buffer; mimeType: string }> => {
       guard();
       if (!record(value)) throw new McpAudioResultError();
+      const ready = prepared?.media.get(index);
+      if (ready !== undefined) {
+        if (ready.type !== type
+          || value["type"] !== type || value["mimeType"] !== ready.mimeType) throw new McpAudioResultError();
+        let loaded: Uint8Array;
+        try { loaded = await ready.load(); } catch { throw new McpAudioResultError(); }
+        guard();
+        if (!ArrayBuffer.isView(loaded) || loaded.byteLength < 1 || loaded.byteLength > maximum) {
+          throw new McpAudioResultError();
+        }
+        return {
+          bytes: Buffer.from(loaded.buffer, loaded.byteOffset, loaded.byteLength),
+          mimeType: ready.mimeType
+        };
+      }
       if (value["type"] === type) return binary(value, type, maximum);
       let resource: unknown;
       if (value["type"] === "resource") resource = value["resource"];
@@ -123,7 +153,7 @@ export class McpAudioArtifacts {
           ...(declaration?.["durationSeconds"] === undefined ? {} : { durationSeconds: declaration["durationSeconds"] })
         };
         try { assertAudioArtifactMetadata(metadata); } catch { throw new McpAudioResultError(); }
-        const audio = await receive(part, "audio", this.artifacts.maximumBlobBytes);
+        const audio = await receive(part, "audio", this.artifacts.maximumBlobBytes, index);
         const detected = await inspectAudioArtifact(audio.bytes, audio.mimeType).catch(() => { throw new McpAudioResultError(); });
         guard();
         let artwork: AudioArtifactMetadata["artwork"];
@@ -135,7 +165,7 @@ export class McpAudioArtifacts {
           if (validArtwork && covers.has(imageIndex)) artwork = covers.get(imageIndex);
           else if (validArtwork) {
             try {
-              const image = await receive(result.content[imageIndex], "image", AUDIO_ARTWORK_MAXIMUM_BYTES);
+              const image = await receive(result.content[imageIndex], "image", AUDIO_ARTWORK_MAXIMUM_BYTES, imageIndex);
               const info = await decodeAudioArtwork(image.bytes, image.mimeType);
               guard();
               const blob = await stage(image.bytes, image.mimeType, `audio-artwork-${imageIndex}.${info.format}`);

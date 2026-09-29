@@ -54,6 +54,7 @@ export * from "./managed-model-runtime-connect-service.js";
 export * from "./managed-model-runtime-controller.js";
 export * from "./managed-model-runtime-system.js";
 export * from "./maker-memory.js";
+export * from "./mcp-audio-result-mapping.js";
 export * from "./mcp-router.js";
 export * from "./operational-workspace-snapshots.js";
 export * from "./operational-browser-state.js";

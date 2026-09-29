@@ -14,6 +14,14 @@ import { operationBodyHash, type OperationalStore } from "@joko/store";
 
 import type { CredentialManager } from "./credential-manager.js";
 import { McpAudioArtifacts } from "./mcp-audio-artifacts.js";
+import {
+  McpAudioResultMapper,
+  audioResultMappingFromMeta,
+  mcpAudioResultMappingUsesNetwork,
+  parseMcpAudioResultMapping,
+  type McpAudioResultDownloader,
+  type McpAudioResultMapping
+} from "./mcp-audio-result-mapping.js";
 import type {
   NativeAuthRecoveryPort,
   NativeAuthRecoverySignedRunnerEvidence,
@@ -99,6 +107,8 @@ export interface McpToolDescriptor {
   readonly description: string;
   readonly inputSchema: Readonly<Record<string, unknown>>;
   readonly outputSchema?: Readonly<Record<string, unknown>>;
+  /** Host-only explicit mapping for supplier-owned structured audio fields. */
+  readonly audioResultMapping?: McpAudioResultMapping;
   readonly requiresPermission: boolean;
 }
 
@@ -154,6 +164,7 @@ export interface McpListedTool {
     readonly description?: string;
     readonly inputSchema: Readonly<Record<string, unknown>>;
     readonly outputSchema?: Readonly<Record<string, unknown>>;
+    readonly _meta?: Readonly<Record<string, unknown>>;
     readonly annotations?: { readonly readOnlyHint?: boolean; readonly destructiveHint?: boolean };
 }
 
@@ -268,6 +279,7 @@ interface BridgeGrant {
   readonly authorityDigest: Buffer;
   readonly serverGenerations: ReadonlyMap<string, number>;
   readonly tools: readonly PiMcpToolDescriptor[];
+  readonly audioResultMappings: ReadonlyMap<string, McpAudioResultMapping>;
   readonly expectedPiGeneration?: number;
   readonly productScope?: {
     readonly sessionId: string;
@@ -364,6 +376,7 @@ export interface McpRouterOptions {
   readonly store: OperationalStore;
   readonly credentials: CredentialManager;
   readonly resultArtifacts?: McpResultArtifactStore;
+  readonly audioResultDownloader?: McpAudioResultDownloader;
   readonly clientFactory?: McpClientFactory;
   readonly scopeId?: string;
   readonly now?: () => number;
@@ -473,6 +486,7 @@ export class McpRouter {
   readonly #credentials: CredentialManager;
   readonly #resultArtifacts: McpResultArtifactStore | undefined;
   readonly #audioArtifacts: McpAudioArtifacts | undefined;
+  readonly #audioResultMapper: McpAudioResultMapper | undefined;
   readonly #factory: McpClientFactory;
   readonly #scopeId: string;
   readonly #now: () => number;
@@ -514,6 +528,9 @@ export class McpRouter {
     this.#credentials = options.credentials;
     this.#resultArtifacts = options.resultArtifacts;
     this.#audioArtifacts = options.resultArtifacts === undefined ? undefined : new McpAudioArtifacts(options.store, options.resultArtifacts);
+    this.#audioResultMapper = options.resultArtifacts === undefined
+      ? undefined
+      : new McpAudioResultMapper(options.resultArtifacts.maximumBlobBytes, options.audioResultDownloader);
     this.#factory = options.clientFactory ?? new SdkMcpClientFactory();
     this.#scopeId = options.scopeId ?? "orchestrator";
     this.#now = options.now ?? Date.now;
@@ -598,6 +615,12 @@ export class McpRouter {
           throw new Error("Bridge Tool output schema is invalid.");
         }
         assertBoundedJson(tool.outputSchema, 1024 * 1024, "Bridge Tool output schema");
+      }
+      if (tool.audioResultMapping !== undefined) {
+        const mapping = parseMcpAudioResultMapping(tool.audioResultMapping);
+        if (mcpAudioResultMappingUsesNetwork(mapping) && !tool.requiresPermission) {
+          throw new Error("Bridge Tool URL result mapping requires permission.");
+        }
       }
     }
     const duplicate = duplicateToolName(provider.tools);
@@ -798,20 +821,32 @@ export class McpRouter {
     }
     const serverGenerations = new Map<string, number>();
     const tools: PiMcpToolDescriptor[] = [];
+    const audioResultMappings = new Map<string, McpAudioResultMapping>();
     for (const server of this.#servers.values()) {
       if (!server.input.enabled) continue;
       const runtime = this.#runtime(server.input.id, server.generation);
       if (runtime === undefined || runtime.state !== "connected") continue;
       serverGenerations.set(server.input.id, server.generation);
-      for (const tool of runtime.tools) tools.push({
-        serverId: tool.serverId,
-        name: tool.name,
-        policySubject: "mcp",
-        description: tool.description,
-        inputSchema: tool.inputSchema,
-        ...(tool.outputSchema === undefined ? {} : { outputSchema: tool.outputSchema }),
-        requiresPermission: tool.requiresPermission
-      });
+      for (const tool of runtime.tools) {
+        tools.push({
+          serverId: tool.serverId,
+          name: tool.name,
+          policySubject: "mcp",
+          description: tool.description,
+          inputSchema: tool.inputSchema,
+          ...(tool.outputSchema === undefined ? {} : { outputSchema: tool.outputSchema }),
+          requiresPermission: tool.requiresPermission
+        });
+        if (tool.audioResultMapping !== undefined) {
+          // The catalog descriptor is observable through list/get. Re-parse it
+          // into a detached value so later consumer mutation cannot retarget an
+          // already-issued grant without changing its authority digest.
+          audioResultMappings.set(
+            audioResultMappingKey(tool.serverId, tool.name),
+            parseMcpAudioResultMapping(tool.audioResultMapping)
+          );
+        }
+      }
     }
     for (const provider of this.#bridgeToolProviders.values()) {
       if (!provider.available || provider.includeInSnapshot === false) continue;
@@ -826,16 +861,24 @@ export class McpRouter {
         throw new Error("Bridge Tool Provider generation is invalid.");
       }
       serverGenerations.set(provider.id, provider.generation);
-      for (const tool of provider.tools) tools.push({
-        serverId: tool.serverId,
-        name: tool.name,
-        ...(tool.runtimeName === undefined ? {} : { runtimeName: tool.runtimeName }),
-        policySubject: provider.policySubject ?? "mcp",
-        description: tool.description,
-        inputSchema: tool.inputSchema,
-        ...(tool.outputSchema === undefined ? {} : { outputSchema: tool.outputSchema }),
-        requiresPermission: tool.requiresPermission
-      });
+      for (const tool of provider.tools) {
+        tools.push({
+          serverId: tool.serverId,
+          name: tool.name,
+          ...(tool.runtimeName === undefined ? {} : { runtimeName: tool.runtimeName }),
+          policySubject: provider.policySubject ?? "mcp",
+          description: tool.description,
+          inputSchema: tool.inputSchema,
+          ...(tool.outputSchema === undefined ? {} : { outputSchema: tool.outputSchema }),
+          requiresPermission: tool.requiresPermission
+        });
+        if (tool.audioResultMapping !== undefined) {
+          audioResultMappings.set(
+            audioResultMappingKey(tool.serverId, tool.name),
+            parseMcpAudioResultMapping(tool.audioResultMapping)
+          );
+        }
+      }
     }
     tools.sort((left, right) => left.serverId.localeCompare(right.serverId, "en") || left.name.localeCompare(right.name, "en"));
     const token = randomBytes(32).toString("base64url");
@@ -852,6 +895,7 @@ export class McpRouter {
       productScope,
       serverGenerations,
       tools,
+      audioResultMappings,
       nativeAuth
     });
     const grant: BridgeGrant = {
@@ -859,6 +903,7 @@ export class McpRouter {
       authorityDigest,
       serverGenerations,
       tools,
+      audioResultMappings,
       ...(input.expectedPiGeneration === undefined ? {} : { expectedPiGeneration: input.expectedPiGeneration }),
       ...(productScope === undefined ? {} : { productScope }),
       ...(nativeAuth === undefined ? {} : { nativeAuth }),
@@ -940,6 +985,9 @@ export class McpRouter {
     if (!grant.tools.some((tool) => tool.serverId === input.serverId && tool.name === input.toolName)) {
       throw new Error("MCP tool is not present in this Pi runtime snapshot.");
     }
+    const audioResultMapping = grant.audioResultMappings.get(
+      audioResultMappingKey(input.serverId, input.toolName)
+    );
     try {
       const bridgeProvider = this.#bridgeToolProviders.get(input.serverId);
       if (bridgeProvider?.policySubject === "browser" && grant.productScope === undefined) {
@@ -978,10 +1026,20 @@ export class McpRouter {
           const raw = await runtime.connection.callTool(input.toolName, input.arguments ?? {}, input.signal);
           guard();
           if (Buffer.byteLength(JSON.stringify(raw), "utf8") > this.#resultCapacityBytes) throw new McpResultResourceExhaustedError();
-          result = this.#audioArtifacts === undefined ? raw : await this.#audioArtifacts.publish(
-            raw, context, guard, (value) => this.#redactText(value), (value) => this.#normalizeResult(value, "MCP audio result").value,
-            { read: (uri, signal) => runtime.connection.readResource(uri, signal), ...(input.signal === undefined ? {} : { signal: input.signal }) }
-          );
+          if (this.#audioArtifacts === undefined) result = raw;
+          else {
+            const mapped = audioResultMapping === undefined || this.#audioResultMapper === undefined
+              ? { result: raw }
+              : await this.#audioResultMapper.adapt(raw, audioResultMapping, {
+                guard,
+                ...(input.signal === undefined ? {} : { signal: input.signal })
+              });
+            result = await this.#audioArtifacts.publish(
+              mapped.result, context, guard, (value) => this.#redactText(value), (value) => this.#normalizeResult(value, "MCP audio result").value,
+              { read: (uri, signal) => runtime.connection.readResource(uri, signal), ...(input.signal === undefined ? {} : { signal: input.signal }) },
+              mapped.prepared
+            );
+          }
           guard();
         }
       } else {
@@ -1027,19 +1085,30 @@ export class McpRouter {
         hostImages = execution.hostImages;
         hostArtifacts = execution.hostArtifacts;
         const replay = this.#audioArtifacts?.replay(context);
-        result = replay ?? (this.#audioArtifacts === undefined ? execution.result : await this.#audioArtifacts.publish(
-          execution.result,
-          context,
-          guard,
-          (value) => this.#redactText(value),
-          (value) => this.#normalizeResult(value, "Bridge Tool audio result").value,
-          {
-            // A service-owned Provider has no MCP resources/read authority.
-            // It must return standard inline or embedded bytes instead of a link.
-            read: async () => { throw new Error("Bridge Tool resources/read is unavailable."); },
-            ...(input.signal === undefined ? {} : { signal: input.signal })
-          }
-        ));
+        if (replay !== undefined) result = replay;
+        else if (this.#audioArtifacts === undefined) result = execution.result;
+        else {
+          const mapped = audioResultMapping === undefined || this.#audioResultMapper === undefined
+            ? { result: execution.result }
+            : await this.#audioResultMapper.adapt(execution.result, audioResultMapping, {
+              guard,
+              ...(input.signal === undefined ? {} : { signal: input.signal })
+            });
+          result = await this.#audioArtifacts.publish(
+            mapped.result,
+            context,
+            guard,
+            (value) => this.#redactText(value),
+            (value) => this.#normalizeResult(value, "Bridge Tool audio result").value,
+            {
+              // A service-owned Provider has no arbitrary MCP resource reader.
+              // Only a frozen structured-result mapping may materialize a declared HTTPS URL.
+              read: async () => { throw new Error("Bridge Tool resources/read is unavailable."); },
+              ...(input.signal === undefined ? {} : { signal: input.signal })
+            },
+            mapped.prepared
+          );
+        }
         guard();
       }
       return await this.#projectBridgeResult(result, input.serverId, input.toolName, hostImages, hostArtifacts);
@@ -2460,13 +2529,16 @@ function normalizeTool(serverId: string, tool: McpListedTool): McpToolDescriptor
     }
     assertBoundedJson(tool.outputSchema, 1024 * 1024, "MCP tool output schema");
   }
+  const audioResultMapping = audioResultMappingFromMeta(tool._meta);
   return {
     serverId,
     name: tool.name,
     description: tool.description ?? tool.name,
     inputSchema: tool.inputSchema,
     ...(tool.outputSchema === undefined ? {} : { outputSchema: tool.outputSchema }),
-    requiresPermission: tool.annotations?.readOnlyHint !== true || tool.annotations.destructiveHint === true
+    ...(audioResultMapping === undefined ? {} : { audioResultMapping }),
+    requiresPermission: audioResultMapping !== undefined && mcpAudioResultMappingUsesNetwork(audioResultMapping)
+      || tool.annotations?.readOnlyHint !== true || tool.annotations.destructiveHint === true
   };
 }
 
@@ -2614,6 +2686,7 @@ function bridgeGrantAuthorityDigest(input: {
   readonly productScope?: BridgeGrant["productScope"];
   readonly serverGenerations: ReadonlyMap<string, number>;
   readonly tools: readonly PiMcpToolDescriptor[];
+  readonly audioResultMappings: ReadonlyMap<string, McpAudioResultMapping>;
   readonly nativeAuth?: BridgeGrant["nativeAuth"];
 }): Buffer {
   const hash = operationBodyHash({
@@ -2633,6 +2706,9 @@ function bridgeGrantAuthorityDigest(input: {
       ...(tool.outputSchema === undefined ? {} : { outputSchema: tool.outputSchema }),
       requiresPermission: tool.requiresPermission
     })),
+    audioResultMappings: [...input.audioResultMappings]
+      .sort(([left], [right]) => left.localeCompare(right, "en"))
+      .map(([tool, mapping]) => ({ tool, mapping })),
     ...(input.nativeAuth === undefined ? {} : {
       nativeAuth: {
         catalogGeneration: input.nativeAuth.catalogGeneration,
@@ -2643,6 +2719,10 @@ function bridgeGrantAuthorityDigest(input: {
     })
   });
   return Buffer.from(hash.slice("sha256:".length), "hex");
+}
+
+function audioResultMappingKey(serverId: string, toolName: string): string {
+  return `${serverId}\u0000${toolName}`;
 }
 
 function bridgeRequestIdentity(grantDigest: Uint8Array, requestId: string): string {
