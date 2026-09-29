@@ -1376,7 +1376,7 @@ export class CollaborationGoalManager {
     let worker = this.#store.getCollaborationWorker(workerId);
     if (worker.status === "dispatch_unknown" && worker.lastError !== undefined
       && unresolvedWorkerEffectCode(worker.lastError.code)) return worker;
-    if (worker.sessionId === undefined || worker.runtimeReleased || [
+    if (worker.sessionId === undefined || worker.sessionGeneration === undefined || worker.runtimeReleased || [
       "provisioning", "stopping", "stopped", "archived"
     ].includes(worker.status)) return worker;
     const queues = this.#store.listQueueItems({
@@ -1399,13 +1399,19 @@ export class CollaborationGoalManager {
     } else if (queued) {
       status = "queued";
     } else {
-      const latest = this.#store.listRuns({ sessionId: worker.sessionId, limit: 1 })[0];
-      status = latest?.descriptor.state === "completed"
+      // Wake advances the Session generation without creating a Run. A settled
+      // Run from the released generation must not turn the newly idle worker
+      // back into completed/failed or invalidate the revision returned by wake.
+      const currentRun = this.#store.findLatestRunForSessionGeneration(
+        worker.sessionId,
+        worker.sessionGeneration
+      );
+      status = currentRun?.descriptor.state === "completed"
         ? "completed"
-        : latest?.descriptor.state === "failed"
+        : currentRun?.descriptor.state === "failed"
           ? "failed"
           : "idle";
-      error = latest?.descriptor.state === "failed" ? latest.descriptor.error ?? null : null;
+      error = currentRun?.descriptor.state === "failed" ? currentRun.descriptor.error ?? null : null;
     }
     const settled = status === "idle" || status === "completed" || status === "failed";
     if (worker.status !== status || (settled && worker.idleSince === undefined) ||

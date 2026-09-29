@@ -55,6 +55,7 @@ import {
   type FakeAdapterProfile
 } from "@joko/testkit";
 import {
+  AuthorizationError,
   InvalidStateTransitionError,
   OperationalStore,
   OperationConflictError,
@@ -1875,7 +1876,7 @@ describe("SessionHost", () => {
         backendId: "pi",
         displayName: "Remote target",
         workspaceRoot: "/workspace",
-        remoteWorkspace: { hostTargetId: "remote-target", hostId: "host-a", workspaceRoot: "/workspace" },
+        remoteWorkspace: { kind: "ssh", hostTargetId: "remote-target", hostId: "host-a", workspaceRoot: "/workspace" },
         managed: true,
         trusted: true
       } as const;
@@ -2038,7 +2039,7 @@ describe("SessionHost", () => {
         backendId: "pi",
         displayName: "Remote target",
         workspaceRoot: "/workspace",
-        remoteWorkspace: { hostTargetId: "remote-target", hostId: "host-a", workspaceRoot: "/workspace" },
+        remoteWorkspace: { kind: "ssh", hostTargetId: "remote-target", hostId: "host-a", workspaceRoot: "/workspace" },
         managed: true,
         trusted: true
       } as const;
@@ -3238,7 +3239,7 @@ describe("SessionHost", () => {
       }
     });
 
-    const imported = await fixture.host.commitPortableSessionImport({
+    const commitRequest = {
       operationId: request.operationId,
       connection: request.connection,
       draftId: draft.draftId,
@@ -3248,7 +3249,8 @@ describe("SessionHost", () => {
       permissionMode: request.permissionMode,
       planMode: request.planMode,
       overwrite: request.overwrite
-    });
+    };
+    const imported = await fixture.host.commitPortableSessionImport(commitRequest);
     expect(imported).toMatchObject({
       replayed: false,
       value: {
@@ -3279,16 +3281,40 @@ describe("SessionHost", () => {
       ]);
     expect(JSON.stringify(fixture.store.getOperation(request.operationId).body)).not.toContain(request.password);
 
-    await expect(fixture.host.importPortableSession(request)).resolves.toMatchObject({
+    const readPackage = vi.spyOn(fixture.artifacts, "readBlob").mockRejectedValue(new Error("package unavailable"));
+    await expect(fixture.host.commitPortableSessionImport(commitRequest)).resolves.toMatchObject({
       replayed: true,
       value: { sessionId: imported.value.sessionId }
     });
+    await expect(fixture.host.importPortableSession({ ...request, draftId: draft.draftId })).resolves.toMatchObject({
+      replayed: true,
+      value: { sessionId: imported.value.sessionId }
+    });
+    await expect(fixture.host.commitPortableSessionImport({
+      ...commitRequest,
+      draftId: "another-draft"
+    })).rejects.toBeInstanceOf(OperationConflictError);
+    readPackage.mockRestore();
     expect(adapter.importedNativeText).toHaveLength(1);
 
     await expect(fixture.host.importPortableSession({
       ...request,
       operationId: "import-portable-task-duplicate"
     })).rejects.toMatchObject({ publicError: { code: "PORTABLE_SESSION_IMPORT_CONFLICT" } });
+
+    const collidingImport = vi.spyOn(adapter, "importPortableNativeSession")
+      .mockResolvedValueOnce(importedSession.binding);
+    const protectedDelete = vi.spyOn(adapter, "deleteSession");
+    await expect(fixture.host.importPortableSession({
+      ...request,
+      operationId: "import-portable-task-colliding-native",
+      overwrite: true
+    })).rejects.toThrow();
+    expect(protectedDelete).not.toHaveBeenCalled();
+    expect(fixture.store.getSession(imported.value.sessionId).descriptor.deletedAt).toBeUndefined();
+    expect(fixture.store.findPortableReplacementCleanup("import-portable-task-colliding-native")).toBeUndefined();
+    collidingImport.mockRestore();
+    protectedDelete.mockRestore();
 
     terminalCleanupFails = true;
     await expect(fixture.host.importPortableSession({
@@ -3318,6 +3344,129 @@ describe("SessionHost", () => {
     expect(adapter.importedNativeText).toHaveLength(2);
     expect(closeSessionTerminals).toHaveBeenLastCalledWith(imported.value.sessionId);
     expect(cleanupOrder).toEqual(["terminal", "native"]);
+    expect(fixture.store.getPortableReplacementCleanup("import-portable-task-replacement"))
+      .toMatchObject({ nativeState: "completed", worktreeState: "completed" });
+  });
+
+  it("keeps portable replacement cleanup durable without blindly repeating an unknown native delete", async () => {
+    const adapter = new FakeBackendAdapter(PI_LIKE_PROFILE);
+    const fixture = await createFixture(adapter);
+    const encoded = encodePortableSessionPackage({
+      manifest: createPortableSessionManifest({
+        exportedAt: new Date(1_800_000_000_000).toISOString(),
+        applicationVersion: "test",
+        title: "Portable cleanup task",
+        workspaceKind: "dialogue",
+        backendCapability: "product-history",
+        fidelity: "product_only",
+        messageCount: 0,
+        mediaCount: 0
+      }),
+      entries: [{
+        path: "projection/messages.json",
+        kind: "projection",
+        mediaType: "application/json",
+        bytes: encodePortableSessionProjection({ format: 1, messages: [], artifacts: [] })
+      }]
+    });
+    const portablePackage = await fixture.artifacts.ingestBytes(encoded, {
+      fileName: "portable-cleanup.joko-session",
+      mimeType: "application/octet-stream"
+    });
+    const base = {
+      connection: fixture.connection,
+      targetId: "target-one",
+      package: portablePackage,
+      providerId: "test",
+      modelId: "text",
+      fastMode: false,
+      permissionMode: "ask" as const,
+      planMode: false
+    };
+    const first = await fixture.host.importPortableSession({ ...base, operationId: "portable-cleanup-first", overwrite: false });
+    const nativeDelete = vi.spyOn(adapter, "deleteSession").mockRejectedValueOnce(new Error("native delete may have happened"));
+    const second = await fixture.host.importPortableSession({ ...base, operationId: "portable-cleanup-second", overwrite: true });
+    expect(second.value.replacedSessionIds).toEqual([first.value.sessionId]);
+    expect(fixture.store.getOperation("portable-cleanup-second").status).toBe("completed");
+    expect(fixture.store.getSession(second.value.sessionId).descriptor.deletedAt).toBeUndefined();
+    expect(fixture.store.getPortableReplacementCleanup("portable-cleanup-second"))
+      .toMatchObject({ nativeState: "unknown", worktreeState: "completed" });
+    expect(nativeDelete).toHaveBeenCalledTimes(1);
+    const inspection = vi.fn(async (): Promise<"present" | "absent" | "unknown"> => "unknown");
+    Object.assign(adapter, { inspectNativeSessionDeletion: inspection });
+    const status = fixture.host.getPortableReplacementCleanup({
+      connection: fixture.connection, importedSessionId: second.value.sessionId
+    });
+    expect(status).toMatchObject({ nativeState: "unknown", worktreeState: "completed" });
+    await expect(fixture.host.reconcilePortableReplacementCleanupForUser({
+      connection: { ...fixture.connection, authKeyDigest: "wrong" }, importedSessionId: second.value.sessionId
+    })).rejects.toBeInstanceOf(AuthorizationError);
+    expect((await fixture.host.reconcilePortableReplacementCleanupForUser({
+      connection: fixture.connection, importedSessionId: second.value.sessionId
+    })).inspection).toBe("unknown");
+    expect(nativeDelete).toHaveBeenCalledTimes(1);
+    const blockedCreation = vi.spyOn(adapter, "createSession");
+    await expect(fixture.host.importPortableSession({
+      ...base, operationId: "portable-cleanup-blocked-chain", overwrite: true
+    })).rejects.toThrow();
+    expect(blockedCreation).not.toHaveBeenCalled();
+    blockedCreation.mockRestore();
+    inspection.mockResolvedValue("present");
+    expect((await fixture.host.reconcilePortableReplacementCleanupForUser({
+      connection: fixture.connection, importedSessionId: second.value.sessionId
+    })).inspection).toBe("present");
+    expect(nativeDelete).toHaveBeenCalledTimes(1);
+    await expect(fixture.host.retryPortableReplacementCleanup({
+      connection: fixture.connection, importedSessionId: second.value.sessionId,
+      expectedRevision: status!.revision, confirmNativeDelete: false
+    })).rejects.toBeInstanceOf(StoreError);
+    expect(await fixture.host.retryPortableReplacementCleanup({
+      connection: fixture.connection, importedSessionId: second.value.sessionId,
+      expectedRevision: status!.revision, confirmNativeDelete: true
+    })).toMatchObject({ cleanup: { nativeState: "completed" }, inspection: "present" });
+    expect(nativeDelete).toHaveBeenCalledTimes(2);
+    expect(fixture.store.getOperation("portable-cleanup-second").status).toBe("completed");
+    nativeDelete.mockRestore();
+
+    const claim = vi.spyOn(fixture.store, "claimPortableReplacementNativeCleanup")
+      .mockImplementationOnce(() => { throw new Error("native cleanup was not dispatched"); });
+    const third = await fixture.host.importPortableSession({ ...base, operationId: "portable-cleanup-third", overwrite: true });
+    claim.mockRestore();
+    expect(third.value.replacedSessionIds).toEqual([second.value.sessionId]);
+    expect(fixture.store.getPortableReplacementCleanup("portable-cleanup-third"))
+      .toMatchObject({ nativeState: "pending", worktreeState: "completed" });
+    await fixture.host.dispose();
+
+    const restartedAdapter = new FakeBackendAdapter(PI_LIKE_PROFILE);
+    const restartedDelete = vi.spyOn(restartedAdapter, "deleteSession");
+    const restartedHost = new SessionHost(fixture.store, fixture.artifacts, [restartedAdapter]);
+    cleanups.push(() => restartedHost.dispose());
+    await restartedHost.initialize();
+    expect(restartedDelete).toHaveBeenCalledTimes(1);
+    expect(restartedDelete.mock.calls[0]?.[1].sessionId).toBe(second.value.sessionId);
+    expect(fixture.store.getPortableReplacementCleanup("portable-cleanup-second").nativeState).toBe("completed");
+    expect(fixture.store.getPortableReplacementCleanup("portable-cleanup-third").nativeState).toBe("completed");
+    expect(fixture.store.getSession(third.value.sessionId).descriptor.deletedAt).toBeUndefined();
+    restartedDelete.mockRejectedValueOnce(new Error("native delete result was lost"));
+    const fourth = await restartedHost.importPortableSession({
+      ...base, operationId: "portable-cleanup-fourth", overwrite: true
+    });
+    expect(fourth.value.replacedSessionIds).toEqual([third.value.sessionId]);
+    expect(fixture.store.getPortableReplacementCleanup("portable-cleanup-fourth").nativeState).toBe("unknown");
+    const deletionsBeforeAbsenceProof = restartedDelete.mock.calls.length;
+    Object.assign(restartedAdapter, {
+      inspectNativeSessionDeletion: vi.fn(async (): Promise<"present" | "absent" | "unknown"> => "absent")
+    });
+    expect(await restartedHost.reconcilePortableReplacementCleanupForUser({
+      connection: fixture.connection, importedSessionId: fourth.value.sessionId
+    })).toMatchObject({ cleanup: { nativeState: "completed" }, inspection: "absent" });
+    expect(restartedDelete).toHaveBeenCalledTimes(deletionsBeforeAbsenceProof);
+    await restartedHost.dispose();
+    const again = new SessionHost(fixture.store, fixture.artifacts, [new FakeBackendAdapter(PI_LIKE_PROFILE)]);
+    cleanups.push(() => again.dispose());
+    await again.initialize();
+    expect(fixture.store.listPendingPortableReplacementCleanups().map((entry) => entry.operationId))
+      .toEqual([]);
   });
 
   it("rejects a product-only portable import before creating a disabled model route", async () => {
@@ -3360,6 +3509,52 @@ describe("SessionHost", () => {
       overwrite: false
     })).rejects.toMatchObject({ storedError: { code: "MODEL_ACCESS_DISABLED", stateMayHaveChanged: false } });
     expect(createNative).not.toHaveBeenCalled();
+  });
+
+  it("marks a product-only portable task ready only after post-commit runtime registration", async () => {
+    const fixture = await createFixture(new FakeBackendAdapter(PI_LIKE_PROFILE));
+    const encoded = encodePortableSessionPackage({
+      manifest: createPortableSessionManifest({
+        exportedAt: new Date(1_800_000_000_000).toISOString(),
+        applicationVersion: "test",
+        title: "Product-only task",
+        workspaceKind: "dialogue",
+        backendCapability: "product-history",
+        fidelity: "product_only",
+        messageCount: 0,
+        mediaCount: 0
+      }),
+      entries: [{
+        path: "projection/messages.json",
+        kind: "projection",
+        mediaType: "application/json",
+        bytes: encodePortableSessionProjection({ format: 1, messages: [], artifacts: [] })
+      }]
+    });
+    const portablePackage = await fixture.artifacts.ingestBytes(encoded, {
+      fileName: "product-only.joko-session",
+      mimeType: "application/octet-stream"
+    });
+    const request = {
+      operationId: "import-product-only-post-commit",
+      connection: fixture.connection,
+      targetId: "target-one",
+      package: portablePackage,
+      providerId: "test",
+      modelId: "text",
+      fastMode: false,
+      permissionMode: "ask" as const,
+      planMode: false,
+      overwrite: false
+    };
+
+    const imported = await fixture.host.importPortableSession(request);
+    expect(imported.value.status).toBe("ready");
+    expect(fixture.store.getOperation(request.operationId).status).toBe("completed");
+    await expect(fixture.host.importPortableSession(request)).resolves.toMatchObject({
+      replayed: true,
+      value: { sessionId: imported.value.sessionId, status: "ready" }
+    });
   });
 
   it("persists a native import activation failure and retries activation without creating another task", async () => {
@@ -3411,6 +3606,66 @@ describe("SessionHost", () => {
       value: { sessionId: importedSessionId, status: "ready" }
     });
     expect(adapter.importedNativeText).toHaveLength(1);
+  });
+
+  it("keeps a committed portable task when its activation receipt cannot be updated", async () => {
+    const adapter = new PortableFakeAdapter();
+    const fixture = await createFixture(adapter);
+    const sourceSessionId = (await fixture.host.createSession({
+      operationId: "create-portable-post-commit-source",
+      connection: fixture.connection,
+      targetId: "target-one",
+      title: "Portable post-commit source",
+      fastMode: false,
+      permissionMode: "ask",
+      planMode: false
+    })).value.sessionId;
+    const exported = await fixture.host.exportPortableSession({ sessionId: sourceSessionId });
+    const request = {
+      operationId: "import-portable-post-commit",
+      connection: fixture.connection,
+      targetId: "target-one",
+      package: exported.artifact,
+      fastMode: false,
+      permissionMode: "ask" as const,
+      planMode: false,
+      overwrite: false
+    };
+    const deleteNative = vi.spyOn(adapter, "deleteSession");
+    const writeSetting = fixture.store.setSetting.bind(fixture.store);
+    let activationWrites = 0;
+    const settingSpy = vi.spyOn(fixture.store, "setSetting").mockImplementation((...args) => {
+      if (args[2] === "portable.import.activation" && ++activationWrites > 1) {
+        throw new Error("activation receipt unavailable");
+      }
+      return writeSetting(...args);
+    });
+    const diagnosticSpy = vi.spyOn(fixture.store, "appendDiagnostic").mockImplementation(() => {
+      throw new Error("diagnostics unavailable");
+    });
+
+    const imported = await fixture.host.importPortableSession(request);
+    expect(imported.value).toMatchObject({
+      status: "imported_activation_failed",
+      activationError: { code: "PORTABLE_SESSION_ACTIVATION_FAILED" }
+    });
+    expect(fixture.store.getSession(imported.value.sessionId).descriptor.deletedAt).toBeUndefined();
+    expect(fixture.store.getOperation(request.operationId).status).toBe("completed");
+    expect(adapter.importedNativeText).toHaveLength(1);
+    expect(deleteNative).not.toHaveBeenCalled();
+
+    await expect(fixture.host.importPortableSession(request)).resolves.toMatchObject({
+      replayed: true,
+      value: { sessionId: imported.value.sessionId, status: "imported_activation_failed" }
+    });
+    expect(adapter.importedNativeText).toHaveLength(1);
+    settingSpy.mockRestore();
+    diagnosticSpy.mockRestore();
+    await expect(fixture.host.retryPortableSessionActivation({
+      connection: fixture.connection,
+      sessionId: imported.value.sessionId
+    })).resolves.toEqual({ sessionId: imported.value.sessionId, status: "ready" });
+    expect(deleteNative).not.toHaveBeenCalled();
   });
 
   it("executes user shell capability without Backend identity branches and fences concurrent generations", async () => {
@@ -10377,7 +10632,7 @@ describe("SessionHost", () => {
       backendId: adapter.id,
       displayName: "Remote source",
       workspaceRoot: "/workspace",
-      remoteWorkspace: { hostTargetId: "target-one", hostId: "host-a", workspaceRoot: "/workspace" },
+      remoteWorkspace: { kind: "ssh", hostTargetId: "target-one", hostId: "host-a", workspaceRoot: "/workspace" },
       managed: true,
       trusted: true
     });
@@ -10394,6 +10649,124 @@ describe("SessionHost", () => {
       publicError: { code: "SESSION_DERIVATION_WORKTREE_UNSUPPORTED", stateMayHaveChanged: false }
     });
     expect(cloneNative).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    {
+      label: "SSH",
+      binding: {
+        kind: "ssh" as const,
+        hostTargetId: "remote-resume-target",
+        hostId: "host-a",
+        workspaceRoot: "/srv/project"
+      },
+      derivedRoot: "/srv/checkouts/resumed"
+    },
+    {
+      label: "Device peer",
+      binding: {
+        kind: "device_peer" as const,
+        controllerDeviceId: "controller-a",
+        targetDeviceId: "desktop-a",
+        workspaceRoot: "C:\\work\\project"
+      },
+      derivedRoot: "C:\\work\\checkouts\\resumed"
+    }
+  ])("resumes an active remote $label worktree with snapshotted identity and its authorized derived root", async ({ binding, derivedRoot }) => {
+    const adapter = new FakeBackendAdapter(PI_LIKE_PROFILE);
+    let fixture!: Awaited<ReturnType<typeof createFixture>>;
+    const worktrees = {
+      effectiveTarget: (session: Parameters<SessionWorktreeCoordinator["effectiveTarget"]>[0]) => {
+        const target = fixture.store.getTarget(session.descriptor.targetId).descriptor;
+        const worktree = session.descriptor.worktree;
+        if (worktree === undefined) return target;
+        return {
+          ...target,
+          workspaceRoot: worktree.path,
+          remoteWorkspace: { ...target.remoteWorkspace!, workspaceRoot: worktree.path }
+        };
+      }
+    } as unknown as SessionWorktreeCoordinator;
+    fixture = await createFixture(adapter, { worktrees });
+    if (binding.kind === "device_peer") {
+      fixture.store.createConnection({
+        id: "remote-resume-controller-connection",
+        deviceId: binding.controllerDeviceId,
+        device: { name: "Controller", kind: "web", platform: "web" },
+        name: "Controller",
+        authKeyDigest: "controller-digest"
+      });
+      fixture.store.createConnection({
+        id: "remote-resume-target-connection",
+        deviceId: binding.targetDeviceId,
+        device: { name: "Target", kind: "desktop", platform: "windows" },
+        name: "Target",
+        authKeyDigest: "target-digest"
+      });
+      fixture.store.setDeviceRemoteControlEnabled(binding.targetDeviceId, true);
+    }
+    await fixture.host.registerTarget({
+      id: "remote-resume-target",
+      backendId: adapter.id,
+      displayName: "Remote resume target",
+      workspaceRoot: fixture.directory,
+      remoteWorkspace: binding,
+      managed: true,
+      trusted: true
+    });
+    const sourceId = (await fixture.host.createSession({
+      operationId: `remote-resume-source-${binding.kind}`,
+      connection: fixture.connection,
+      targetId: "remote-resume-target",
+      title: "Remote source",
+      fastMode: false,
+      permissionMode: "ask",
+      planMode: false
+    })).value.sessionId;
+    await fixture.host.closeIfActive(sourceId);
+    const source = fixture.store.getSession(sourceId).descriptor;
+    const targetRevision = fixture.store.getTarget(source.targetId).revision.toString();
+    const resumed = fixture.store.createSession({
+      ...source,
+      id: `remote-resumed-${binding.kind}`,
+      title: "Remote resumed worktree",
+      binding: { ...source.binding, opaqueRef: `fake://remote-resumed/${binding.kind}` },
+      worktree: {
+        leaseId: `lease-${binding.kind}`,
+        workspaceId: `workspace-${binding.kind}`,
+        path: derivedRoot,
+        repositoryRoot: binding.workspaceRoot,
+        branch: "task-branch",
+        sourceRef: "main",
+        sourceCommit: "a".repeat(40),
+        sourceStrategy: "explicit",
+        sourceRefreshed: false,
+        remote: {
+          targetId: source.targetId,
+          binding,
+          executionIdentity: `execution-${binding.kind}`,
+          targetRevision,
+          manifestId: `manifest-${binding.kind}`
+        },
+        state: "active",
+        acquiredAt: 1,
+        updatedAt: 1
+      }
+    });
+    let resumedTarget: AdapterContext["target"] | undefined;
+    const resumeSession = adapter.resumeSession.bind(adapter);
+    vi.spyOn(adapter, "resumeSession").mockImplementation(async (nativeBinding, context) => {
+      resumedTarget = context.target;
+      return resumeSession(nativeBinding, context);
+    });
+
+    await fixture.host.resume(resumed.descriptor.id);
+
+    expect(resumedTarget).toMatchObject({
+      workspaceRoot: derivedRoot,
+      remoteWorkspace: { ...binding, workspaceRoot: derivedRoot }
+    });
+    expect(fixture.store.getSession(resumed.descriptor.id).descriptor.remoteWorkspace).toEqual(binding);
   });
 
   it("snapshots a private append prompt and safely advances a service-owned runtime identity", async () => {
@@ -10787,6 +11160,122 @@ describe("SessionHost", () => {
     });
     expect(replacement.catalogBindingCalls).toBe(0);
   });
+
+  it("resumes a claimed native catalog placement through the original Operation after Host restart", async () => {
+    const native = { state: "absent" as "present" | "absent" | "unknown", binds: 0 };
+    const adapter = new ClaimedCatalogImportFakeAdapter(native);
+    const fixture = await createFixture(adapter);
+    const catalogWorkspace = resolve("C:/catalog-recovery-workspace");
+    await fixture.host.registerTarget({
+      id: "target-catalog-recovery", backendId: adapter.id, displayName: "Catalog recovery",
+      workspaceRoot: catalogWorkspace, managed: false, trusted: true
+    });
+    adapter.catalogEntry = {
+      nativeReference: "managed://source/catalog-recovery",
+      nativeSessionId: "catalog-recovery-native", title: "Recovered task",
+      workingDirectory: catalogWorkspace, createdAt: 23, modifiedAt: 123,
+      archived: false, placement: "dialogue", existingMatch: "binding_and_placement"
+    };
+    const snapshot = await fixture.host.scanNativeSessionCatalogSnapshot(adapter.id, true);
+    const operationId = "catalog-recovery-operation";
+    await expect(fixture.host.createSession({
+      operationId, connection: fixture.connection, targetId: "target-catalog-recovery",
+      title: "Recovered task", fastMode: false, permissionMode: "ask", planMode: false,
+      initialPlacement: "dialogue",
+      catalogImport: { archived: false, createdAt: 23, modifiedAt: 123, snapshotToken: snapshot.token },
+      nativeStart: { kind: "attach", nativeReference: adapter.catalogEntry.nativeReference }
+    })).rejects.toThrow();
+    const receipt = fixture.store.getNativeCatalogAdoption(operationId);
+    expect(receipt).toMatchObject({ state: "unknown", backendId: adapter.id });
+    expect(fixture.store.getOperation(operationId).status).toBe("started");
+    expect(native.binds).toBe(1);
+    expect(fixture.store.listSessions({ includeDeleted: true }).some((item) => item.descriptor.id === receipt.sessionId))
+      .toBe(false);
+    const stranger = fixture.store.createConnection({
+      id: "catalog-recovery-stranger", name: "Another device", authKeyDigest: "other-digest"
+    });
+    expect(fixture.host.listNativeCatalogAdoptionsForUser({ connection: stranger, limit: 10, offset: 0 }).adoptions)
+      .toEqual([]);
+    await expect(fixture.host.reconcileNativeCatalogAdoptionForUser({ connection: stranger, operationId }))
+      .rejects.toBeInstanceOf(AuthorizationError);
+
+    await fixture.host.dispose();
+    const resumedAdapter = new ClaimedCatalogImportFakeAdapter(native);
+    const resumed = new SessionHost(fixture.store, fixture.artifacts, [resumedAdapter]);
+    cleanups.push(() => resumed.dispose());
+    await resumed.initialize();
+    const result = await resumed.reconcileNativeCatalogAdoptionForUser({
+      connection: fixture.connection, operationId
+    });
+    expect(result).toMatchObject({ inspection: "present", adoption: { state: "adopted", sessionId: receipt.sessionId } });
+    expect(fixture.store.getOperation(operationId).status).toBe("completed");
+    expect(fixture.store.getSession(receipt.sessionId).descriptor.binding).toEqual(receipt.binding);
+    expect(native.binds).toBe(1);
+    expect(resumed.listNativeCatalogAdoptionsForUser({ connection: fixture.connection, limit: 10, offset: 0 }).adoptions)
+      .toEqual([]);
+  });
+
+  it.each(["absent", "unknown", "owner_drift"] as const)(
+    "keeps a claimed native catalog placement safe when reconciliation is %s",
+    async (scenario) => {
+      const native = {
+        state: "absent" as "present" | "absent" | "unknown",
+        binds: 0,
+        materializeOnBind: scenario !== "absent"
+      };
+      const adapter = new ClaimedCatalogImportFakeAdapter(native);
+      const fixture = await createFixture(adapter);
+      const workspace = resolve("C:/catalog-recovery-branches");
+      await fixture.host.registerTarget({
+        id: "target-catalog-branches", backendId: adapter.id, displayName: "Catalog recovery",
+        workspaceRoot: workspace, managed: false, trusted: true
+      });
+      adapter.catalogEntry = {
+        nativeReference: "managed://source/catalog-branches",
+        nativeSessionId: "catalog-branches-native", title: "Recovered task",
+        workingDirectory: workspace, createdAt: 23, modifiedAt: 123,
+        archived: false, placement: "dialogue", existingMatch: "binding_and_placement"
+      };
+      const snapshot = await fixture.host.scanNativeSessionCatalogSnapshot(adapter.id, true);
+      const operationId = `catalog-${scenario}-operation`;
+      await expect(fixture.host.createSession({
+        operationId, connection: fixture.connection, targetId: "target-catalog-branches",
+        title: "Recovered task", fastMode: false, permissionMode: "ask", planMode: false,
+        initialPlacement: "dialogue",
+        catalogImport: { archived: false, createdAt: 23, modifiedAt: 123, snapshotToken: snapshot.token },
+        nativeStart: { kind: "attach", nativeReference: adapter.catalogEntry.nativeReference }
+      })).rejects.toThrow();
+      const receipt = fixture.store.getNativeCatalogAdoption(operationId);
+      if (scenario === "unknown") native.state = "unknown";
+      if (scenario === "owner_drift") {
+        fixture.store.upsertTarget({
+          ...fixture.store.getTarget(receipt.targetId).descriptor,
+          displayName: "Changed Target"
+        });
+      }
+      await fixture.host.dispose();
+      const resumed = new SessionHost(fixture.store, fixture.artifacts, [new ClaimedCatalogImportFakeAdapter(native)]);
+      cleanups.push(() => resumed.dispose());
+      await resumed.initialize();
+      const result = await resumed.reconcileNativeCatalogAdoptionForUser({
+        connection: fixture.connection, operationId
+      });
+      expect(native.binds).toBe(1);
+      expect(fixture.store.listSessions({ includeDeleted: true }).some((item) => item.descriptor.id === receipt.sessionId))
+        .toBe(false);
+      if (scenario === "absent") {
+        expect(result).toMatchObject({ inspection: "absent", adoption: { state: "absent" } });
+        expect(fixture.store.getOperation(operationId).status).toBe("failed");
+        expect(resumed.listNativeCatalogAdoptionsForUser({ connection: fixture.connection, limit: 10, offset: 0 }).adoptions)
+          .toEqual([]);
+      } else {
+        expect(result).toMatchObject({ inspection: "unknown", adoption: { state: "pending" } });
+        expect(fixture.store.getOperation(operationId).status).toBe("started");
+        expect(resumed.listNativeCatalogAdoptionsForUser({ connection: fixture.connection, limit: 10, offset: 0 }).adoptions)
+          .toHaveLength(1);
+      }
+    }
+  );
 
   it("authoritatively validates catalog reclassification without overwriting newer local presentation", async () => {
     const adapter = new CatalogImportFakeAdapter();
@@ -12149,7 +12638,7 @@ describe("SessionHost", () => {
       workspaceRoot: directory,
       managed: false,
       trusted: true,
-      remoteWorkspace: { hostTargetId: "codex-remote-target", hostId: "remote-host", workspaceRoot: "/srv/joko-project" }
+      remoteWorkspace: { kind: "ssh", hostTargetId: "codex-remote-target", hostId: "remote-host", workspaceRoot: "/srv/joko-project" }
     } as const;
     await host.registerTarget(target);
     const nativeSessionId = remoteFake.seedThread(target.remoteWorkspace.workspaceRoot);
@@ -16047,7 +16536,11 @@ class CatalogImportFakeAdapter extends ObservedAttachFakeAdapter {
 
   async bindCatalogSession(
     entry: NativeSessionCatalogEntry,
-    generation: number
+    generation: number,
+    _claimMaterialization: (claim: {
+      readonly binding: NativeSessionBinding;
+      readonly recoveryReference: string;
+    }) => Promise<void>
   ): Promise<NativeSessionBinding> {
     this.catalogBindingCalls += 1;
     return {
@@ -16055,6 +16548,39 @@ class CatalogImportFakeAdapter extends ObservedAttachFakeAdapter {
       ...(entry.nativeSessionId === undefined ? {} : { nativeSessionId: entry.nativeSessionId }),
       generation
     };
+  }
+}
+
+class ClaimedCatalogImportFakeAdapter extends CatalogImportFakeAdapter {
+  constructor(private readonly native: {
+    state: "present" | "absent" | "unknown";
+    binds: number;
+    materializeOnBind?: boolean;
+  }) {
+    super();
+  }
+
+  override async bindCatalogSession(
+    entry: NativeSessionCatalogEntry,
+    generation: number,
+    claimMaterialization: (claim: {
+      readonly binding: NativeSessionBinding;
+      readonly recoveryReference: string;
+    }) => Promise<void>
+  ): Promise<NativeSessionBinding> {
+    this.native.binds += 1;
+    const binding = {
+      opaqueRef: `managed://active/${entry.nativeSessionId}`,
+      nativeSessionId: entry.nativeSessionId,
+      generation
+    };
+    await claimMaterialization({ binding, recoveryReference: JSON.stringify({ version: 1, owner: entry.nativeReference }) });
+    if (this.native.materializeOnBind !== false) this.native.state = "present";
+    throw new Error("The native placement completed but its reply was lost.");
+  }
+
+  async inspectCatalogSessionMaterialization(): Promise<"present" | "absent" | "unknown"> {
+    return this.native.state;
   }
 }
 

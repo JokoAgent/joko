@@ -1,7 +1,12 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { createHash } from "node:crypto";
 
 vi.mock("react-native", () => ({ Platform: { OS: "ios" } }));
 vi.mock("expo", () => ({ requireOptionalNativeModule: vi.fn(() => null) }));
+vi.mock("expo-crypto", () => ({
+  CryptoDigestAlgorithm: { SHA256: "SHA-256" },
+  digestStringAsync: async (_algorithm: string, value: string) => createHash("sha256").update(value).digest("hex")
+}));
 
 import {
   MobileIncomingShareInbox,
@@ -14,7 +19,8 @@ import {
   type MobileIncomingShareReadyBatch
 } from "./mobile-incoming-share";
 import { MobileNewTaskDraftStore } from "./new-task-draft-store";
-import { emptyMobileComposerDraft } from "./mobile-composer-document";
+import { MobileComposerDraftStore } from "./composer-draft-store";
+import { emptyMobileComposerDraft, mobileComposerInput, plainTextMobileComposerDraft } from "./mobile-composer-document";
 import type {
   MobileAttachmentControls,
   MobileAttachmentPolicy,
@@ -63,14 +69,14 @@ describe("mobile incoming-share native inbox", () => {
     const claimed = await inbox.claim(
       batchOne,
       profileId,
-      "target-one",
+      { kind: "new_task", targetId: "target-one" },
       controls,
       planMobileIncomingShare(bound, [], controls.policy)
     );
     await expect(inbox.claim(
       batchOne,
       profileId,
-      "target-two",
+      { kind: "new_task", targetId: "target-two" },
       controls,
       planMobileIncomingShare(bound, [], controls.policy)
     )).rejects.toThrow(/another project or model/u);
@@ -104,7 +110,7 @@ describe("mobile incoming-share native inbox", () => {
     const claimed = await inbox.claim(
       batchOne,
       profileId,
-      "target-one",
+      { kind: "new_task", targetId: "target-one" },
       controls,
       planMobileIncomingShare(bound, [], controls.policy)
     );
@@ -144,6 +150,27 @@ describe("mobile incoming-share native inbox", () => {
       boundProfileId: profileId,
       items: [readyItem(itemOne, 0), readyItem(itemTwo, 1)]
     }, [itemTwo, itemOne]))).toThrow(/accepted item order/u);
+    const claimed = withClaim({ ...rawBatch(batchOne), boundProfileId: profileId }, [itemOne]);
+    expect(() => mobileIncomingShareTesting.normalizeBatch({
+      ...claimed, items: [{ ...readyItem(itemOne, 0), sha256Hex: "b".repeat(64) }]
+    })).toThrow(/content proof changed/u);
+  });
+
+  it("accepts bounded text and HTTP(S) URL content without consuming file capacity", () => {
+    const batch = normalizedBatch({
+      ...rawBatch(batchOne),
+      items: [textItem(itemOne, 0, "One", "text"), readyItem(itemTwo, 1),
+        textItem(itemThree, 2, "https://example.test/path?q=1", "url")]
+    });
+    const plan = planMobileIncomingShare(batch, [], {
+      images: false, files: false, maximumItems: 0, maximumBytes: 0,
+      imageMediaTypes: [], fileMediaTypes: []
+    });
+    expect(plan.accepted.map((item) => item.kind)).toEqual(["text", "url"]);
+    expect(plan.rejected).toMatchObject([{ itemId: itemTwo }]);
+    expect(() => mobileIncomingShareTesting.normalizeBatch({
+      ...rawBatch(batchOne), items: [textItem(itemOne, 0, "file:///private", "url")]
+    })).toThrow(/URL/u);
   });
 });
 
@@ -154,7 +181,7 @@ describe("mobile incoming-share plan and durable commit", () => {
       items: [readyItem(itemOne, 0), readyItem(itemTwo, 1)]
     });
     const plan = planMobileIncomingShare(batch, [], controls.policy);
-    expect(plan.accepted.map((item) => item.fileName)).toEqual(["same-name.png", "same-name.png"]);
+    expect(plan.accepted.map((item) => item.kind === "file" ? item.fileName : undefined)).toEqual(["same-name.png", "same-name.png"]);
     expect(new Set(plan.accepted.map((item) => item.storageId)).size).toBe(2);
     expect(plan.accepted.map((item) => item.ordinal)).toEqual([0, 1]);
   });
@@ -186,7 +213,7 @@ describe("mobile incoming-share plan and durable commit", () => {
     const imageOnly: MobileAttachmentPolicy = { ...controls.policy, files: false, fileMediaTypes: [] };
     const plan = planMobileIncomingShare(batch, [], imageOnly);
 
-    expect(plan.accepted.map((item) => item.fileName)).toEqual(["same-name.png"]);
+    expect(plan.accepted.map((item) => item.kind === "file" ? item.fileName : undefined)).toEqual(["same-name.png"]);
     expect(plan.rejected.map((item) => item.reason)).toEqual([
       "Audio and video are not supported.",
       "2 additional shared items were rejected because one share can contain at most 20 items."
@@ -208,15 +235,18 @@ describe("mobile incoming-share plan and durable commit", () => {
     const result = await commitMobileIncomingShare({
       batch,
       profileId,
-      targetId: "target-one",
+      destination: { kind: "new_task", targetId: "target-one" },
       controls,
-      draftStore: storeBoundary(store),
+      newTaskDraftStore: storeBoundary(store),
+      composerDraftStore: composerStoreBoundary(),
       attachmentFiles: files,
       validateAuthority: vi.fn(async () => controls),
-      acknowledge
+      acknowledge,
+      allowFreshClaim: true
     });
 
     expect(result.replayed).toBe(false);
+    if (result.destinationKind !== "new_task") throw new Error("expected new task result");
     expect(result.draft.input.attachments).toHaveLength(1);
     expect(files.stageCandidates).toHaveBeenCalledTimes(1);
     expect(acknowledge).toHaveBeenCalledTimes(1);
@@ -234,12 +264,14 @@ describe("mobile incoming-share plan and durable commit", () => {
     const result = await commitMobileIncomingShare({
       batch,
       profileId,
-      targetId: "target-one",
+      destination: { kind: "new_task", targetId: "target-one" },
       controls,
-      draftStore: storeBoundary(store),
+      newTaskDraftStore: storeBoundary(store),
+      composerDraftStore: composerStoreBoundary(),
       attachmentFiles: files,
       validateAuthority: vi.fn(async () => controls),
-      acknowledge
+      acknowledge,
+      allowFreshClaim: false
     });
 
     expect(result.replayed).toBe(true);
@@ -257,9 +289,9 @@ describe("mobile incoming-share plan and durable commit", () => {
     });
     const acknowledge = vi.fn(async () => undefined);
     await expect(commitMobileIncomingShare({
-      batch, profileId, targetId: "target-one", controls,
-      draftStore: storeBoundary(store), attachmentFiles: files,
-      validateAuthority: vi.fn(async () => controls), acknowledge
+      batch, profileId, destination: { kind: "new_task", targetId: "target-one" }, controls,
+      newTaskDraftStore: storeBoundary(store), composerDraftStore: composerStoreBoundary(), attachmentFiles: files,
+      validateAuthority: vi.fn(async () => controls), acknowledge, allowFreshClaim: true
     })).rejects.toThrow(/draft changed/u);
     expect(files.removeOwnedBytes).toHaveBeenCalledWith(
       profileId,
@@ -270,11 +302,11 @@ describe("mobile incoming-share plan and durable commit", () => {
     const authorityStore = await draftStore();
     const authorityFiles = attachmentFiles();
     await expect(commitMobileIncomingShare({
-      batch, profileId, targetId: "target-one", controls,
-      draftStore: storeBoundary(authorityStore), attachmentFiles: authorityFiles,
-      validateAuthority: vi.fn(async () => ({ ...controls, surfaceOwnerKey: "retired" })), acknowledge
+      batch, profileId, destination: { kind: "new_task", targetId: "target-one" }, controls,
+      newTaskDraftStore: storeBoundary(authorityStore), composerDraftStore: composerStoreBoundary(), attachmentFiles: authorityFiles,
+      validateAuthority: vi.fn(async () => ({ ...controls, surfaceOwnerKey: "retired" })), acknowledge, allowFreshClaim: true
     })).rejects.toThrow(/authority changed/u);
-    expect(authorityFiles.removeOwnedBytes).toHaveBeenCalled();
+    expect(authorityFiles.removeOwnedBytes).not.toHaveBeenCalled();
     expect(acknowledge).not.toHaveBeenCalled();
   });
 
@@ -284,9 +316,9 @@ describe("mobile incoming-share plan and durable commit", () => {
     const hashFiles = attachmentFiles({ shaOverride: "b".repeat(64) });
     const acknowledge = vi.fn(async () => undefined);
     await expect(commitMobileIncomingShare({
-      batch, profileId, targetId: "target-one", controls,
-      draftStore: storeBoundary(hashStore), attachmentFiles: hashFiles,
-      validateAuthority: vi.fn(async () => controls), acknowledge
+      batch, profileId, destination: { kind: "new_task", targetId: "target-one" }, controls,
+      newTaskDraftStore: storeBoundary(hashStore), composerDraftStore: composerStoreBoundary(), attachmentFiles: hashFiles,
+      validateAuthority: vi.fn(async () => controls), acknowledge, allowFreshClaim: true
     })).rejects.toThrow(/changed while it was copied/u);
     expect(acknowledge).not.toHaveBeenCalled();
 
@@ -298,9 +330,9 @@ describe("mobile incoming-share plan and durable commit", () => {
       removeFailureAt: 2
     });
     await expect(commitMobileIncomingShare({
-      batch, profileId, targetId: "target-one", controls,
-      draftStore: storeBoundary(cleanupStore), attachmentFiles: cleanupFiles,
-      validateAuthority: vi.fn(async () => controls), acknowledge
+      batch, profileId, destination: { kind: "new_task", targetId: "target-one" }, controls,
+      newTaskDraftStore: storeBoundary(cleanupStore), composerDraftStore: composerStoreBoundary(), attachmentFiles: cleanupFiles,
+      validateAuthority: vi.fn(async () => controls), acknowledge, allowFreshClaim: true
     })).rejects.toThrow(/copy could not be removed/u);
     expect(acknowledge).not.toHaveBeenCalled();
   });
@@ -319,9 +351,9 @@ describe("mobile incoming-share plan and durable commit", () => {
     const files = attachmentFiles();
     const acknowledge = vi.fn(async () => undefined);
     const result = await commitMobileIncomingShare({
-      batch, profileId, targetId: "target-one", controls,
-      draftStore: storeBoundary(store), attachmentFiles: files,
-      validateAuthority: vi.fn(async () => controls), acknowledge
+      batch, profileId, destination: { kind: "new_task", targetId: "target-one" }, controls,
+      newTaskDraftStore: storeBoundary(store), composerDraftStore: composerStoreBoundary(), attachmentFiles: files,
+      validateAuthority: vi.fn(async () => controls), acknowledge, allowFreshClaim: true
     });
     const after = await store.store.readSnapshot({ profileId });
     expect(result.plan).toMatchObject({ accepted: [], rejected: [{ fileName: "movie.mov" }] });
@@ -337,9 +369,9 @@ describe("mobile incoming-share plan and durable commit", () => {
     const boundary = storeBoundary(store);
     const flush = vi.fn(async () => { throw new Error("disk unavailable"); });
     await expect(commitMobileIncomingShare({
-      batch, profileId, targetId: "target-one", controls,
-      draftStore: { ...boundary, flush }, attachmentFiles: files,
-      validateAuthority: vi.fn(async () => controls), acknowledge: vi.fn()
+      batch, profileId, destination: { kind: "new_task", targetId: "target-one" }, controls,
+      newTaskDraftStore: { ...boundary, flush }, composerDraftStore: composerStoreBoundary(), attachmentFiles: files,
+      validateAuthority: vi.fn(async () => controls), acknowledge: vi.fn(), allowFreshClaim: true
     })).rejects.toThrow(/disk unavailable/u);
     expect(files.removeOwnedBytes).toHaveBeenCalledTimes(1);
     expect(store.store.readSync({ profileId })?.input.attachments).toHaveLength(1);
@@ -347,10 +379,10 @@ describe("mobile incoming-share plan and durable commit", () => {
     const secondStore = await draftStore();
     const secondFiles = attachmentFiles();
     await expect(commitMobileIncomingShare({
-      batch, profileId, targetId: "target-one", controls,
-      draftStore: storeBoundary(secondStore), attachmentFiles: secondFiles,
+      batch, profileId, destination: { kind: "new_task", targetId: "target-one" }, controls,
+      newTaskDraftStore: storeBoundary(secondStore), composerDraftStore: composerStoreBoundary(), attachmentFiles: secondFiles,
       validateAuthority: vi.fn(async () => controls),
-      acknowledge: vi.fn(async () => { throw new Error("native cleanup failed"); })
+      acknowledge: vi.fn(async () => { throw new Error("native cleanup failed"); }), allowFreshClaim: true
     })).rejects.toThrow(/native cleanup failed/u);
     expect(secondFiles.removeOwnedBytes).toHaveBeenCalledTimes(1);
     expect(secondStore.store.readSync({ profileId })?.input.attachments).toHaveLength(1);
@@ -361,9 +393,10 @@ describe("mobile incoming-share plan and durable commit", () => {
     const files = attachmentFiles();
     const acknowledge = vi.fn();
     await expect(commitMobileIncomingShare({
-      batch: claimedBatch(batchOne), profileId: "profile-two", targetId: "target-one",
-      controls, draftStore: storeBoundary(store), attachmentFiles: files,
-      validateAuthority: vi.fn(async () => controls), acknowledge
+      batch: claimedBatch(batchOne), profileId: "profile-two",
+      destination: { kind: "new_task", targetId: "target-one" },
+      controls, newTaskDraftStore: storeBoundary(store), composerDraftStore: composerStoreBoundary(), attachmentFiles: files,
+      validateAuthority: vi.fn(async () => controls), acknowledge, allowFreshClaim: true
     })).rejects.toThrow(/not bound/u);
     expect(files.stageCandidates).not.toHaveBeenCalled();
     expect(acknowledge).not.toHaveBeenCalled();
@@ -373,12 +406,95 @@ describe("mobile incoming-share plan and durable commit", () => {
     const store = await draftStore();
     const files = attachmentFiles();
     await expect(commitMobileIncomingShare({
-      batch: claimedBatch(batchOne), profileId, targetId: "target-one",
+      batch: claimedBatch(batchOne), profileId, destination: { kind: "new_task", targetId: "target-one" },
       controls: { ...controls, surfaceOwnerKey: "different-model" },
-      draftStore: storeBoundary(store), attachmentFiles: files,
-      validateAuthority: vi.fn(async () => controls), acknowledge: vi.fn()
-    })).rejects.toThrow(/changed after it was claimed/u);
+      newTaskDraftStore: storeBoundary(store), composerDraftStore: composerStoreBoundary(), attachmentFiles: files,
+      validateAuthority: vi.fn(async () => controls), acknowledge: vi.fn(), allowFreshClaim: true
+    })).rejects.toThrow(/authority changed/u);
     expect(files.stageCandidates).not.toHaveBeenCalled();
+  });
+
+  it("imports mixed text, URL, and file into an existing task in order, then replays an uncertain acknowledgement", async () => {
+    const items = [textItem(itemOne, 0, "Please inspect this", "text"), readyItem(itemTwo, 1),
+      textItem(itemThree, 2, "https://example.test/report", "url")];
+    const batch = normalizedBatch(withClaim({ ...rawBatch(batchOne), boundProfileId: profileId, items },
+      [itemOne, itemTwo, itemThree], { kind: "existing_task", targetId: "target-one", sessionId: "session-one" }));
+    const composerDraftStore = composerStoreBoundary();
+    const identity = { profileId, sessionId: "session-one" };
+    composerDraftStore.save(identity, plainTextMobileComposerDraft("Existing message"));
+    await composerDraftStore.flush(identity);
+    const store = await draftStore();
+    const files = attachmentFiles();
+    const request = {
+      batch, profileId, destination: { kind: "existing_task" as const, targetId: "target-one", sessionId: "session-one" },
+      controls, newTaskDraftStore: storeBoundary(store), composerDraftStore, attachmentFiles: files,
+      validateAuthority: vi.fn(async () => controls), allowFreshClaim: true,
+      acknowledge: vi.fn(async () => { throw new Error("native acknowledgement uncertain"); })
+    };
+    await expect(commitMobileIncomingShare(request)).rejects.toThrow(/acknowledgement uncertain/u);
+    const durable = await composerDraftStore.readDurable(identity);
+    expect(durable?.atoms.map((atom) => atom.kind === "pasted-text" ? atom.text : "")).toEqual([
+      "Please inspect this", "https://example.test/report"
+    ]);
+    expect(durable?.attachments).toHaveLength(1);
+    expect(durable?.text.startsWith("Existing message\n\n")).toBe(true);
+    expect(files.stageCandidates).toHaveBeenCalledTimes(1);
+    const replay = await commitMobileIncomingShare({ ...request, allowFreshClaim: false,
+      acknowledge: vi.fn(async () => undefined) });
+    expect(replay.destinationKind).toBe("existing_task");
+    expect(replay.replayed).toBe(true);
+    expect(files.stageCandidates).toHaveBeenCalledTimes(1);
+    expect((await composerDraftStore.readDurable(identity))?.atoms).toHaveLength(2);
+  });
+
+  it("fails closed after a claimed text import was removed during an uncertain acknowledgement", async () => {
+    const items = [textItem(itemOne, 0, "Do not duplicate", "text")];
+    const batch = normalizedBatch(withClaim({ ...rawBatch(batchOne), boundProfileId: profileId, items }, [itemOne]));
+    const store = await draftStore();
+    const files = attachmentFiles();
+    const request = {
+      batch, profileId, destination: { kind: "new_task" as const, targetId: "target-one" }, controls,
+      newTaskDraftStore: storeBoundary(store), composerDraftStore: composerStoreBoundary(), attachmentFiles: files,
+      validateAuthority: vi.fn(async () => controls), allowFreshClaim: true,
+      acknowledge: vi.fn(async () => { throw new Error("native acknowledgement uncertain"); })
+    };
+    await expect(commitMobileIncomingShare(request)).rejects.toThrow(/acknowledgement uncertain/u);
+    const imported = store.store.readSync({ profileId });
+    if (!imported) throw new Error("expected imported text");
+    expect(mobileComposerInput(imported.input).parts[0]?.content).toMatchObject({
+      case: "text", value: "Do not duplicate"
+    });
+    store.store.save({ profileId }, { targetId: "target-one", name: "New task", input: emptyMobileComposerDraft() });
+    await store.store.flush({ profileId });
+    await expect(commitMobileIncomingShare({ ...request, allowFreshClaim: false,
+      acknowledge: vi.fn(async () => undefined) })).rejects.toThrow(/prior shared-content write is uncertain/u);
+    expect((await store.store.readDurable({ profileId }))?.input.text).toBe("");
+  });
+
+  it("requires the native text digest and a durable draft readback before acknowledgement", async () => {
+    const corruptedText = normalizedBatch(withClaim({
+      ...rawBatch(batchOne), boundProfileId: profileId,
+      items: [textItem(itemOne, 0, "Unverified", "text", "b".repeat(64))]
+    }, [itemOne]));
+    const store = await draftStore();
+    const files = attachmentFiles();
+    const acknowledge = vi.fn(async () => undefined);
+    const base = {
+      profileId, destination: { kind: "new_task" as const, targetId: "target-one" }, controls,
+      newTaskDraftStore: storeBoundary(store), composerDraftStore: composerStoreBoundary(), attachmentFiles: files,
+      validateAuthority: vi.fn(async () => controls), acknowledge, allowFreshClaim: true
+    };
+    await expect(commitMobileIncomingShare({ ...base, batch: corruptedText })).rejects.toThrow(/text changed/u);
+    expect(files.stageCandidates).not.toHaveBeenCalled();
+    expect(acknowledge).not.toHaveBeenCalled();
+
+    const fileBatch = claimedBatch(batchOne);
+    await expect(commitMobileIncomingShare({
+      ...base, batch: fileBatch,
+      newTaskDraftStore: { ...storeBoundary(store), readDurable: async () => null }
+    })).rejects.toThrow(/could not be confirmed/u);
+    expect(store.store.readSync({ profileId })?.input.attachments).toHaveLength(1);
+    expect(acknowledge).not.toHaveBeenCalled();
   });
 });
 
@@ -396,6 +512,7 @@ function rawBatch(batchId: string): Record<string, unknown> {
 function readyItem(itemId: string, ordinal: number): Record<string, unknown> {
   return {
     state: "ready",
+    kind: "file",
     itemId,
     ordinal,
     uri: `file:///app-group/items/${itemId}/same-name.png`,
@@ -404,6 +521,11 @@ function readyItem(itemId: string, ordinal: number): Record<string, unknown> {
     byteSize: 4,
     sha256Hex: "a".repeat(64)
   };
+}
+
+function textItem(itemId: string, ordinal: number, text: string, kind: "text" | "url", sha256Hex?: string): Record<string, unknown> {
+  return { state: "ready", kind, itemId, ordinal, text, byteSize: new TextEncoder().encode(text).byteLength,
+    sha256Hex: sha256Hex ?? createHash("sha256").update(text).digest("hex") };
 }
 
 function normalizedBatch(raw: Record<string, unknown>): MobileIncomingShareReadyBatch {
@@ -420,15 +542,29 @@ function claimedBatch(batchId: string): MobileIncomingShareReadyBatch {
   return normalizedBatch(withClaim({ ...rawBatch(batchId), boundProfileId: profileId }, [itemOne]));
 }
 
-function withClaim(raw: Record<string, unknown>, acceptedItemIds: readonly string[]): Record<string, unknown> {
+function withClaim(
+  raw: Record<string, unknown>, acceptedItemIds: readonly string[],
+  destination: { readonly kind: "new_task"; readonly targetId: string } |
+    { readonly kind: "existing_task"; readonly targetId: string; readonly sessionId: string } =
+    { kind: "new_task", targetId: "target-one" }
+): Record<string, unknown> {
+  const items = raw.items as Record<string, unknown>[];
   return {
     ...raw,
     claim: {
       claimId: claimOne,
-      targetId: "target-one",
+      destinationKind: destination.kind,
+      ...(destination.kind === "existing_task" ? { sessionId: destination.sessionId } : {}),
+      targetId: destination.targetId,
       surfaceOwnerKey: controls.surfaceOwnerKey,
       policyKey: mobileIncomingSharePolicyKey(controls.policy),
-      acceptedItemIds: [...acceptedItemIds]
+      acceptedItemIds: [...acceptedItemIds],
+      acceptedItemProofs: acceptedItemIds.map((itemId) => {
+        const item = items.find((candidate) => candidate.itemId === itemId);
+        if (!item) throw new Error("missing test item");
+        return { itemId, kind: item.kind, byteSize: item.byteSize, sha256Hex: item.sha256Hex,
+          ...(item.kind === "file" ? { fileName: item.fileName, mediaType: item.mediaType } : {}) };
+      })
     }
   };
 }
@@ -449,6 +585,8 @@ function nativeDriver(
     claimBatch: vi.fn(async (
       batchId: string,
       boundProfileId: string,
+      destinationKind: "new_task" | "existing_task",
+      sessionId: string | null,
       targetId: string,
       surfaceOwnerKey: string,
       policyKey: string,
@@ -456,7 +594,16 @@ function nativeDriver(
     ) => {
       if ((queue[0]?.batchId as string | undefined) !== batchId
         || (queue[0]?.boundProfileId as string | undefined) !== boundProfileId) throw new Error("changed");
-      const nextClaim = { claimId: claimOne, targetId, surfaceOwnerKey, policyKey, acceptedItemIds: [...acceptedItemIds] };
+      const items = queue[0]?.items as Record<string, unknown>[];
+      const nextClaim = { claimId: claimOne, destinationKind,
+        ...(sessionId === null ? {} : { sessionId }), targetId, surfaceOwnerKey, policyKey,
+        acceptedItemIds: [...acceptedItemIds],
+        acceptedItemProofs: acceptedItemIds.map((itemId) => {
+          const item = items.find((candidate) => candidate.itemId === itemId);
+          if (!item) throw new Error("missing test item");
+          return { itemId, kind: item.kind, byteSize: item.byteSize, sha256Hex: item.sha256Hex,
+            ...(item.kind === "file" ? { fileName: item.fileName, mediaType: item.mediaType } : {}) };
+        }) };
       const existing = queue[0]?.claim;
       if (existing !== undefined && JSON.stringify(existing) !== JSON.stringify(nextClaim)) {
         throw new Error("This incoming share is already claimed by another project or model authority.");
@@ -513,8 +660,17 @@ function storeBoundary(value: Awaited<ReturnType<typeof draftStore>>) {
     saveIfRevision: (identity: { readonly profileId: string }, draft: Parameters<MobileNewTaskDraftStore["saveIfRevision"]>[1], revision: number) =>
       value.store.saveIfRevision(identity, draft, revision),
     flush: (identity: { readonly profileId: string }) => value.store.flush(identity),
-    readSync: (identity: { readonly profileId: string }) => value.store.readSync(identity)
+    readDurable: (identity: { readonly profileId: string }) => value.store.readDurable(identity)
   };
+}
+
+function composerStoreBoundary(): MobileComposerDraftStore {
+  const memory = new Map<string, string>();
+  return new MobileComposerDraftStore({
+    getItem: async (key) => memory.get(key) ?? null,
+    setItem: async (key, value) => { memory.set(key, value); },
+    removeItem: async (key) => { memory.delete(key); }
+  });
 }
 
 function attachmentFiles(options: {

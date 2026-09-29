@@ -30,7 +30,7 @@ import { upsertComposerMention } from "../message-reference.js";
 import { normalizeSelectionQuoteDrafts } from "../selection-quote.js";
 import { randomUuid } from "../web-crypto.js";
 import { promptRecommendationStore } from "../prompt-recommendation-store.js";
-import { ComposerOperationGuard, currentComposerPlatform, getComposerSendShortcutLabel, resolveComposerAttachmentPolicy, resolveComposerEnterIntent, resolveComposerEscapeIntent, resolveComposerHistoryKey, resolveComposerPaletteKey, resolveUserShellDraft, type ComposerSubmissionKind } from "./composer-behavior.js";
+import { ComposerOperationGuard, currentComposerPlatform, getComposerSendShortcutLabel, resolveComposerAttachmentPolicy, resolveComposerEnterIntent, resolveComposerEscapeIntent, resolveComposerHistoryKey, resolveComposerPaletteKey, resolveUserShellDraft, type ComposerOwnershipToken, type ComposerSubmissionKind } from "./composer-behavior.js";
 import { QueueStrip, deliveryLabel } from "./QueueStrip.js";
 import { composerBuiltInCommand, composerCommandItems, detectComposerCommandActivation, filterComposerPaletteItems, replaceComposerCommandRun, type ComposerCommandActivation, type ComposerPaletteItem } from "./composer-palette.js";
 import { ComposerInlineMentionPanel } from "./composer-inline-mention-panel.js";
@@ -55,6 +55,7 @@ import { useHeldVoiceInput } from "./use-held-voice-input.js";
 import { GAMEPAD_SKILL_EVENT, useGamepadVoiceInput } from "../gamepad-client.js";
 import { currentGamepadTaskRoot, useGamepadActions } from "../gamepad-actions.js";
 import { isGamepadSkillBinding, type GamepadSkillBinding } from "../gamepad-input.js";
+import { useAppInputComposerOwner, type AppInputSkillIdentity } from "../app-input-owners.js";
 import { VoiceInputButton } from "./VoiceInputButton.js";
 import { VoiceInputOverlay } from "./VoiceInputOverlay.js";
 import { applyVoiceDraftResult, createVoiceDraftFence } from "./voice-draft-fence.js";
@@ -73,6 +74,20 @@ interface ComposerWorkspaceMentionIndex {
   readonly paths: readonly string[];
   readonly truncated: boolean;
   readonly error?: string;
+}
+
+interface PendingComposerDraftSave {
+  readonly ownerKey: string;
+  readonly serverId: string | undefined;
+  readonly profileId: string | undefined;
+  readonly surface: object;
+  readonly ownerDocument: Document;
+  readonly sessionId: string;
+  readonly controller: AppController;
+  readonly guard: ComposerOperationGuard;
+  readonly token: ComposerOwnershipToken;
+  readonly draft: ComposerDraft;
+  queued: boolean;
 }
 
 export function Composer({ controller, session, backend, sessionUsage, readOnly = false, autoFocus = true, focusRequest = 0, queue, queueControl, workspace, extraDirectories, resources, artifacts, sessions, commands, messageHistory, controls, runningStatus, messageMentionInsertion, selectionQuoteInsertion, attachmentInsertion, draftReplacement, t, runAction, onLocalSend, onDraftMutation, onStop, stopInFlight = false, onCompact }: {
@@ -167,6 +182,15 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
     onDraftMutation?.();
   };
   const draftSaveChainRef = useRef<Promise<void>>(Promise.resolve());
+  const composerMountedRef = useRef(false);
+  const pendingDraftSaveRef = useRef<PendingComposerDraftSave | undefined>(undefined);
+  const draftSaveSurfaceRef = useRef<object | undefined>(undefined);
+  const savedDraftTimerRef = useRef<number | undefined>(undefined);
+  const hydratedDraftOwnerRef = useRef<string | undefined>(undefined);
+  useLayoutEffect(() => {
+    composerMountedRef.current = true;
+    return () => { composerMountedRef.current = false; };
+  }, []);
   const textRef = useRef(text);
   textRef.current = text;
   const editorDocumentRef = useRef(editorDocument);
@@ -354,6 +378,31 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
   }, [canMention, palette]);
 
   const voiceDictionaryOwnerKey = JSON.stringify([controller.state.activeProfile?.serverId, controller.state.activeProfile?.id, session.id, String(session.generation)]);
+  const currentDraftOwnerRef = useRef({ key: voiceDictionaryOwnerKey, serverId: controller.state.activeProfile?.serverId, sessionId: session.id });
+  currentDraftOwnerRef.current = { key: voiceDictionaryOwnerKey, serverId: controller.state.activeProfile?.serverId, sessionId: session.id };
+  const queuePendingDraftSave = (pending: PendingComposerDraftSave): void => {
+    if (pending.queued || !pending.guard.draftUnchanged(pending.token)) return;
+    pending.queued = true;
+    void enqueueDraftSave(draftSaveChainRef, { current: pending.controller }, pending.sessionId, pending.draft, (error) => {
+      if (pending.guard.draftUnchanged(pending.token)) rememberFailedComposerDraftSave(pending, error);
+    }).then(() => {
+      if (pendingDraftSaveRef.current === pending) pendingDraftSaveRef.current = undefined;
+      if (draftSaveSurfaceRef.current !== pending.surface || !pending.guard.ownsActivation(pending.token) || !pending.guard.draftUnchanged(pending.token)) return;
+      setSaved(true);
+      if (savedDraftTimerRef.current !== undefined) pending.ownerDocument.defaultView?.clearTimeout(savedDraftTimerRef.current);
+      savedDraftTimerRef.current = pending.ownerDocument.defaultView?.setTimeout(() => {
+        savedDraftTimerRef.current = undefined;
+        if (draftSaveSurfaceRef.current === pending.surface && pending.guard.ownsActivation(pending.token)) setSaved(false);
+      }, 1200);
+    }).catch((error: unknown) => {
+      pending.queued = false;
+      if (draftSaveSurfaceRef.current === pending.surface && pending.guard.ownsActivation(pending.token) && pending.guard.draftUnchanged(pending.token)) setAttachmentError(messageOf(error));
+    });
+  };
+  const flushPendingDraftSave = (ownerKey: string): void => {
+    const pending = pendingDraftSaveRef.current;
+    if (pending?.ownerKey === ownerKey) queuePendingDraftSave(pending);
+  };
   const voiceDictionaryLearning = useVoiceDictionaryLearning({
     controller, ownerKey: voiceDictionaryOwnerKey,
     enabled: !readOnly && controller.state.snapshot.settings.voiceInput.refinementEnabled
@@ -408,8 +457,8 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
   const sendRouteKey = JSON.stringify([session.backendId, session.targetId, session.model?.providerId, session.model?.modelId]);
   const sendOwner = useMemo(() => ({}), [voiceDictionaryOwnerKey, controller.getArtifactUrl, controller.state.snapshot.generation, sendRouteKey]);
   const gamepadSkillFlight = useRef<{ readonly owner: object } | undefined>(undefined);
-  const gamepadSkillState = useRef({ owner: sendOwner, locked: composerLocked, bashMode: effectiveBashMode, connected: controller.state.connectionState === "connected", serverId: controller.state.activeProfile?.serverId });
-  gamepadSkillState.current = { owner: sendOwner, locked: composerLocked, bashMode: effectiveBashMode, connected: controller.state.connectionState === "connected", serverId: controller.state.activeProfile?.serverId };
+  const gamepadSkillState = useRef({ owner: sendOwner, locked: composerLocked, bashMode: effectiveBashMode, connected: controller.state.connectionState === "connected", serverId: controller.state.activeProfile?.serverId, resources });
+  gamepadSkillState.current = { owner: sendOwner, locked: composerLocked, bashMode: effectiveBashMode, connected: controller.state.connectionState === "connected", serverId: controller.state.activeProfile?.serverId, resources };
   useLayoutEffect(() => { setGamepadSkillError(undefined); }, [sendOwner]);
   const sendEpochRef = useRef<object | undefined>(undefined);
   useLayoutEffect(() => {
@@ -461,6 +510,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
     editorRevisionRef.current += 1;
     clearVoiceDictionaryEdit();
     setHydratedSession(undefined);
+    hydratedDraftOwnerRef.current = undefined;
     hydratedDraftRevisionRef.current = 0;
     textRef.current = "";
     setText("");
@@ -487,7 +537,19 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
     hydratedHistoryDraftRef.current = undefined;
     setAttachments((current) => { revokeAttachments(current); return []; });
     setBrowserComments((current) => { revokeBrowserCommentPreviews(current); return []; });
-    void controllerRef.current.readDraftSnapshot(session.id).then(({ draft, revision }) => {
+    const sourceController = controllerRef.current;
+    const sourceDocument = composerStackRef.current?.ownerDocument;
+    void pendingComposerDraftSave(sourceController.state.activeProfile?.serverId, sourceController.state.activeProfile?.id, session.id)
+      .then(async () => {
+        const failed = sourceDocument === undefined ? undefined : failedComposerDraftSave(sourceController.state.activeProfile?.serverId, sourceController.state.activeProfile?.id, session.id, voiceDictionaryOwnerKey, sourceDocument);
+        try {
+          const stored = await sourceController.readDraftSnapshot(session.id);
+          return { draft: failed?.draft ?? stored.draft, revision: stored.revision, failure: failed?.error };
+        } catch (error) {
+          if (failed === undefined) throw error;
+          return { draft: failed.draft, revision: 0, failure: error };
+        }
+      }).then(({ draft, revision, failure }) => {
       if (cancelled || !operationGuardRef.current.ownsActivation(owner)) return;
       hydratedDraftRevisionRef.current = revision;
       if (operationGuardRef.current.draftUnchanged(owner)) {
@@ -506,6 +568,8 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
         setBrowserComments((draft?.browserComments ?? []).map(withBrowserCommentPreview));
         setDeliveryMode(draft !== undefined && supportedModes.includes(draft.deliveryMode) ? draft.deliveryMode : supportedModes[0] ?? "prompt");
       }
+      if (failure !== undefined) setAttachmentError(messageOf(failure));
+      hydratedDraftOwnerRef.current = voiceDictionaryOwnerKey;
       setHydratedSession(session.id);
     }).catch((error: unknown) => {
       if (!cancelled && operationGuardRef.current.ownsActivation(owner)) {
@@ -514,7 +578,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
       }
     });
     return () => { cancelled = true; };
-  }, [controller.readDraftSnapshot, session.id, session.generation]); // Delivery capability updates are reconciled without re-reading storage.
+  }, [controller.readDraftSnapshot, session.id, session.generation, voiceDictionaryOwnerKey]); // Delivery capability updates are reconciled without re-reading storage.
 
   useEffect(() => {
     const container = composerStackRef.current;
@@ -712,11 +776,35 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
     if (!supportedModes.includes(deliveryMode)) setDeliveryMode(supportedModes[0] ?? "prompt");
   }, [deliveryMode, supportedModes]);
 
-  useEffect(() => {
-    if (readOnly || hydratedSession !== session.id || (submissionKind !== undefined && submissionKind !== "send")) return;
+  useLayoutEffect(() => {
+    const ownerKey = voiceDictionaryOwnerKey;
     const ownerWindow = composerStackRef.current?.ownerDocument.defaultView;
     if (ownerWindow === null || ownerWindow === undefined) return;
-    const owner = operationGuardRef.current.capture(session.id);
+    const surface = {};
+    draftSaveSurfaceRef.current = surface;
+    const flush = (): void => flushPendingDraftSave(ownerKey);
+    ownerWindow.addEventListener("pagehide", flush);
+    ownerWindow.addEventListener("pageshow", flush);
+    return () => {
+      flush();
+      if (draftSaveSurfaceRef.current === surface) draftSaveSurfaceRef.current = undefined;
+      ownerWindow.removeEventListener("pagehide", flush);
+      ownerWindow.removeEventListener("pageshow", flush);
+      if (savedDraftTimerRef.current !== undefined) {
+        ownerWindow.clearTimeout(savedDraftTimerRef.current);
+        savedDraftTimerRef.current = undefined;
+      }
+    };
+  }, [controller.saveDraft, session.id, session.generation, voiceDictionaryOwnerKey, voiceRoot?.ownerDocument]);
+
+  useLayoutEffect(() => {
+    if (readOnly || hydratedSession !== session.id || hydratedDraftOwnerRef.current !== voiceDictionaryOwnerKey || (submissionKind !== undefined && submissionKind !== "send")) return;
+    const ownerDocument = composerStackRef.current?.ownerDocument;
+    const ownerWindow = ownerDocument?.defaultView;
+    const surface = draftSaveSurfaceRef.current;
+    if (ownerDocument === undefined || ownerWindow === null || ownerWindow === undefined || surface === undefined) return;
+    const guard = operationGuardRef.current;
+    const owner = guard.capture(session.id);
     const draft = {
       text,
       editorDocument,
@@ -727,27 +815,27 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
       browserComments,
       ...(extraDirectoriesSupported && extraDirectoryIds !== undefined ? { extraDirectoryIds } : {})
     } satisfies ComposerDraft;
-    const sourceControllerRef = { current: controllerRef.current };
-    let cancelled = false;
-    let savedTimer: number | undefined;
+    const pending: PendingComposerDraftSave = {
+      ownerKey: voiceDictionaryOwnerKey,
+      serverId: controller.state.activeProfile?.serverId,
+      profileId: controller.state.activeProfile?.id,
+      surface,
+      ownerDocument,
+      sessionId: session.id,
+      controller: controllerRef.current,
+      guard,
+      token: owner,
+      draft,
+      queued: false
+    };
+    pendingDraftSaveRef.current = pending;
     const timer = ownerWindow.setTimeout(() => {
-      if (cancelled || !operationGuardRef.current.ownsActivation(owner) || !operationGuardRef.current.draftUnchanged(owner)) return;
-      void enqueueDraftSave(draftSaveChainRef, sourceControllerRef, session.id, draft).then(() => {
-        if (cancelled || !operationGuardRef.current.ownsActivation(owner) || !operationGuardRef.current.draftUnchanged(owner)) return;
-        setSaved(true);
-        savedTimer = ownerWindow.setTimeout(() => {
-          if (!cancelled && operationGuardRef.current.ownsActivation(owner)) setSaved(false);
-        }, 1200);
-      }).catch((error: unknown) => {
-        if (!cancelled && operationGuardRef.current.ownsActivation(owner)) setAttachmentError(messageOf(error));
-      });
+      if (pendingDraftSaveRef.current === pending && guard.ownsActivation(owner)) queuePendingDraftSave(pending);
     }, 420);
     return () => {
-      cancelled = true;
       ownerWindow.clearTimeout(timer);
-      if (savedTimer !== undefined) ownerWindow.clearTimeout(savedTimer);
     };
-  }, [controller.saveDraft, attachments, browserComments, deliveryMode, editorDocument, extraDirectoriesSupported, extraDirectoryIds, hydratedSession, mentions, inlineMentionRanges, readOnly, session.id, submissionKind, text]);
+  }, [controller.saveDraft, attachments, browserComments, deliveryMode, editorDocument, extraDirectoriesSupported, extraDirectoryIds, hydratedSession, mentions, inlineMentionRanges, readOnly, session.id, submissionKind, text, voiceDictionaryOwnerKey]);
 
   useEffect(() => () => {
     revokeAttachments(attachmentsRef.current);
@@ -984,13 +1072,24 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
     requestComposerFrame(() => richEditorRef.current?.focus("end"));
   }, [attachmentInsertion, readOnly, session.id]);
 
-  const finishSubmission = (sessionId: string, kind: ComposerSubmissionKind): void => {
-    operationGuardRef.current.finishSubmission(sessionId, kind);
-    if (operationGuardRef.current.activeSessionId === sessionId) setSubmissionKind(operationGuardRef.current.activeSubmission(sessionId));
+  const finishSubmission = (sessionId: string, kind: ComposerSubmissionKind, guard = operationGuardRef.current): void => {
+    guard.finishSubmission(sessionId, kind);
+    if (operationGuardRef.current === guard && guard.activeSessionId === sessionId) setSubmissionKind(guard.activeSubmission(sessionId));
   };
 
   const sendDraft = (modeOverride?: DeliveryMode, completedDocument?: JSONContent): void => {
     if (readOnly) return;
+    const sourceController = controllerRef.current;
+    const sourceControllerRef = { current: sourceController };
+    const sourceGuard = operationGuardRef.current;
+    const sourceOwnerKey = voiceDictionaryOwnerKey;
+    const sourceServerId = sourceController.state.activeProfile?.serverId;
+    const sourceDraftStillClearable = (sessionId: string, token: ComposerOwnershipToken): boolean => {
+      if (!composerMountedRef.current) return false;
+      const current = currentDraftOwnerRef.current;
+      if (current.serverId !== sourceServerId || current.sessionId !== sessionId) return true;
+      return current.key === sourceOwnerKey && operationGuardRef.current === sourceGuard && sourceGuard.ownsActivation(token);
+    };
     const recommendationAtSend = completedDocument === undefined && recommendationVisible !== undefined && composerDocumentIsEmpty(editorDocument)
       ? recommendationVisible
       : undefined;
@@ -1008,18 +1107,19 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
       const command = shellDraft?.command ?? "";
       if (!bashPermitted || command.length === 0 || attachments.length > 0) return;
       const sourceSessionId = session.id;
-      const owner = operationGuardRef.current.capture(sourceSessionId);
-      if (!operationGuardRef.current.beginSubmission(sourceSessionId, "bash")) return;
+      const owner = sourceGuard.capture(sourceSessionId);
+      if (!sourceGuard.beginSubmission(sourceSessionId, "bash")) return;
       promptRecommendationStore.dismiss(sourceSessionId);
       const sourceDeliveryMode = deliveryMode;
       const retainedQuoteDocument = composerDocumentKeepingQuotes(editorDocument);
       setSubmissionKind("bash");
       runAction(`user-shell:${sourceSessionId}`, async () => {
         try {
-          await controllerRef.current.executeUserShell(sourceSessionId, command, shellDraft?.excludeFromContext ?? bashExcluded);
-          if (operationGuardRef.current.ownsActivation(owner)) onLocalSend(sourceSessionId);
-          if (!operationGuardRef.current.draftUnchanged(owner)) return;
-          if (operationGuardRef.current.ownsActivation(owner)) {
+          await sourceController.executeUserShell(sourceSessionId, command, shellDraft?.excludeFromContext ?? bashExcluded);
+          if (operationGuardRef.current === sourceGuard && sourceGuard.ownsActivation(owner)) onLocalSend(sourceSessionId);
+          if (!sourceGuard.consumeUnchangedDraft(owner)) return;
+          if (!sourceDraftStillClearable(sourceSessionId, owner)) return;
+          if (operationGuardRef.current === sourceGuard && sourceGuard.ownsActivation(owner)) {
             resetHistoryNavigation();
             closePalette();
             textRef.current = "";
@@ -1029,9 +1129,9 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
             replaceInlineMentionRanges([]);
             setBashMode(false);
           }
-          await enqueueDraftSave(draftSaveChainRef, controllerRef, sourceSessionId, { text: "", editorDocument: retainedQuoteDocument, deliveryMode: sourceDeliveryMode, mentions: [], attachments: [] });
+          await enqueueDraftSave(draftSaveChainRef, sourceControllerRef, sourceSessionId, { text: "", editorDocument: retainedQuoteDocument, deliveryMode: sourceDeliveryMode, mentions: [], attachments: [] });
         } finally {
-          finishSubmission(sourceSessionId, "bash");
+          finishSubmission(sourceSessionId, "bash", sourceGuard);
         }
       });
       return;
@@ -1048,17 +1148,18 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
       }
       if (attachments.length > 0 || selectionQuotes.length > 0 || mentions.length > 0) return;
       const sourceSessionId = session.id;
-      const owner = operationGuardRef.current.capture(sourceSessionId);
-      if (!operationGuardRef.current.beginSubmission(sourceSessionId, "bash")) return;
+      const owner = sourceGuard.capture(sourceSessionId);
+      if (!sourceGuard.beginSubmission(sourceSessionId, "bash")) return;
       promptRecommendationStore.dismiss(sourceSessionId);
       const sourceDeliveryMode = deliveryMode;
       setSubmissionKind("bash");
       runAction(`user-shell:${sourceSessionId}`, async () => {
         try {
-          await controllerRef.current.executeUserShell(sourceSessionId, builtInCommand.command, false);
-          if (operationGuardRef.current.ownsActivation(owner)) onLocalSend(sourceSessionId);
-          if (!operationGuardRef.current.draftUnchanged(owner)) return;
-          if (operationGuardRef.current.ownsActivation(owner)) {
+          await sourceController.executeUserShell(sourceSessionId, builtInCommand.command, false);
+          if (operationGuardRef.current === sourceGuard && sourceGuard.ownsActivation(owner)) onLocalSend(sourceSessionId);
+          if (!sourceGuard.consumeUnchangedDraft(owner)) return;
+          if (!sourceDraftStillClearable(sourceSessionId, owner)) return;
+          if (operationGuardRef.current === sourceGuard && sourceGuard.ownsActivation(owner)) {
             resetHistoryNavigation();
             closePalette();
             textRef.current = "";
@@ -1070,7 +1171,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
             setAttachmentError(undefined);
             requestComposerFrame(() => richEditorRef.current?.focus());
           }
-          await enqueueDraftSave(draftSaveChainRef, controllerRef, sourceSessionId, {
+          await enqueueDraftSave(draftSaveChainRef, sourceControllerRef, sourceSessionId, {
             text: "",
             editorDocument: emptyComposerDocument(),
             deliveryMode: sourceDeliveryMode,
@@ -1078,15 +1179,15 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
             attachments: []
           });
         } finally {
-          finishSubmission(sourceSessionId, "bash");
+          finishSubmission(sourceSessionId, "bash", sourceGuard);
         }
       });
       return;
     }
     if (builtInCommand?.kind === "help") {
       const sourceSessionId = session.id;
-      const owner = operationGuardRef.current.capture(sourceSessionId);
-      if (!operationGuardRef.current.beginSubmission(sourceSessionId, "send")) return;
+      const owner = sourceGuard.capture(sourceSessionId);
+      if (!sourceGuard.beginSubmission(sourceSessionId, "send")) return;
       const sourceDeliveryMode = deliveryMode;
       const retainedQuoteDocument = composerDocumentKeepingQuotes(draftDocument);
       const sourceAttachments = attachments;
@@ -1094,9 +1195,9 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
       setCommandHelpOpen(true);
       runAction(`command-help:${sourceSessionId}`, async () => {
         try {
-          if (!operationGuardRef.current.draftUnchanged(owner)) return;
-          operationGuardRef.current.consumeUnchangedDraft(owner);
-          if (operationGuardRef.current.ownsActivation(owner)) {
+          if (!sourceGuard.consumeUnchangedDraft(owner)) return;
+          if (!sourceDraftStillClearable(sourceSessionId, owner)) return;
+          if (operationGuardRef.current === sourceGuard && sourceGuard.ownsActivation(owner)) {
             resetHistoryNavigation();
             closePalette();
             textRef.current = "";
@@ -1106,7 +1207,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
             replaceInlineMentionRanges([]);
             requestComposerFrame(() => richEditorRef.current?.focus());
           }
-          await enqueueDraftSave(draftSaveChainRef, controllerRef, sourceSessionId, {
+          await enqueueDraftSave(draftSaveChainRef, sourceControllerRef, sourceSessionId, {
             text: "",
             editorDocument: retainedQuoteDocument,
             deliveryMode: sourceDeliveryMode,
@@ -1114,7 +1215,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
             attachments: sourceAttachments
           });
         } finally {
-          finishSubmission(sourceSessionId, "send");
+          finishSubmission(sourceSessionId, "send", sourceGuard);
         }
       });
       return;
@@ -1126,7 +1227,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
         });
         return;
       }
-      const targetExists = controllerRef.current.state.snapshot.sessions.some((candidate) =>
+      const targetExists = sourceController.state.snapshot.sessions.some((candidate) =>
         candidate.id === builtInCommand.sessionId);
       if (!targetExists) {
         runAction(`jump-session-missing:${session.id}`, async () => {
@@ -1136,25 +1237,25 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
       }
       if (attachments.length > 0 || selectionQuotes.length > 0 || mentions.length > 0) return;
       const sourceSessionId = session.id;
-      const owner = operationGuardRef.current.capture(sourceSessionId);
-      if (!operationGuardRef.current.beginSubmission(sourceSessionId, "send")) return;
+      const owner = sourceGuard.capture(sourceSessionId);
+      if (!sourceGuard.beginSubmission(sourceSessionId, "send")) return;
       const sourceDeliveryMode = deliveryMode;
       setSubmissionKind("send");
       runAction(`jump-session:${builtInCommand.sessionId}`, async () => {
         try {
-          if (!operationGuardRef.current.draftUnchanged(owner)) return;
-          operationGuardRef.current.consumeUnchangedDraft(owner);
-          await enqueueDraftSave(draftSaveChainRef, controllerRef, sourceSessionId, {
+          if (!sourceGuard.consumeUnchangedDraft(owner)) return;
+          if (!sourceDraftStillClearable(sourceSessionId, owner)) return;
+          await enqueueDraftSave(draftSaveChainRef, sourceControllerRef, sourceSessionId, {
             text: "",
             editorDocument: emptyComposerDocument(),
             deliveryMode: sourceDeliveryMode,
             mentions: [],
             attachments: []
           });
-          if (!operationGuardRef.current.ownsActivation(owner)) return;
-          controllerRef.current.navigate({ kind: "session", sessionId: builtInCommand.sessionId });
+          if (operationGuardRef.current !== sourceGuard || !sourceGuard.ownsActivation(owner)) return;
+          sourceController.navigate({ kind: "session", sessionId: builtInCommand.sessionId });
         } finally {
-          finishSubmission(sourceSessionId, "send");
+          finishSubmission(sourceSessionId, "send", sourceGuard);
         }
       });
       return;
@@ -1162,8 +1263,8 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
     if (builtInCommand?.kind === "review") {
       if (!attachmentsAllowed(attachments, attachmentPolicy)) return;
       const sourceSessionId = session.id;
-      const owner = operationGuardRef.current.capture(sourceSessionId);
-      if (!operationGuardRef.current.beginSubmission(sourceSessionId, "review")) return;
+      const owner = sourceGuard.capture(sourceSessionId);
+      if (!sourceGuard.beginSubmission(sourceSessionId, "review")) return;
       promptRecommendationStore.dismiss(sourceSessionId);
       const sourceDeliveryMode = deliveryMode;
       const sourceAttachments = [...attachments];
@@ -1171,7 +1272,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
       runAction(`review:${sourceSessionId}`, async () => {
         try {
           try {
-            await controllerRef.current.startReview(sourceSessionId, builtInCommand.focus, sourceAttachments);
+            await sourceController.startReview(sourceSessionId, builtInCommand.focus, sourceAttachments);
           } catch (error: unknown) {
             // Never expose typed Main/Service Review failures as raw
             // internal messages. The accepted=false path leaves this draft
@@ -1179,11 +1280,12 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
             if (isCodedReviewDispatchFailure(error)) throw new Error(t("review.startFailed"), { cause: error });
             throw error;
           }
-          if (operationGuardRef.current.activeSessionId === sourceSessionId) onLocalSend(sourceSessionId);
+          if (operationGuardRef.current === sourceGuard && sourceGuard.ownsActivation(owner)) onLocalSend(sourceSessionId);
           // An accepted /review consumes exactly the invocation snapshot. If
           // the user typed while acceptance was pending, retain the new draft.
-          if (!operationGuardRef.current.consumeUnchangedDraft(owner)) return;
-          if (operationGuardRef.current.activeSessionId === sourceSessionId) {
+          if (!sourceGuard.consumeUnchangedDraft(owner)) return;
+          if (!sourceDraftStillClearable(sourceSessionId, owner)) return;
+          if (operationGuardRef.current === sourceGuard && sourceGuard.ownsActivation(owner)) {
             resetHistoryNavigation();
             closePalette();
             textRef.current = "";
@@ -1200,7 +1302,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
             requestComposerFrame(() => richEditorRef.current?.focus());
           }
           revokeAttachments(sourceAttachments);
-          await enqueueDraftSave(draftSaveChainRef, controllerRef, sourceSessionId, {
+          await enqueueDraftSave(draftSaveChainRef, sourceControllerRef, sourceSessionId, {
             text: "",
             editorDocument: emptyComposerDocument(),
             deliveryMode: sourceDeliveryMode,
@@ -1208,25 +1310,26 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
             attachments: []
           });
         } finally {
-          finishSubmission(sourceSessionId, "review");
+          finishSubmission(sourceSessionId, "review", sourceGuard);
         }
       });
       return;
     }
     if (builtInCommand?.kind === "sessionReset") {
       const sourceSessionId = session.id;
-      const owner = operationGuardRef.current.capture(sourceSessionId);
-      if (!operationGuardRef.current.beginSubmission(sourceSessionId, "reset")) return;
+      const owner = sourceGuard.capture(sourceSessionId);
+      if (!sourceGuard.beginSubmission(sourceSessionId, "reset")) return;
       promptRecommendationStore.dismiss(sourceSessionId);
       const sourceDeliveryMode = deliveryMode;
       const sourceAttachments = attachments;
       setSubmissionKind("reset");
       runAction(`reset-session:${sourceSessionId}`, async () => {
         try {
-          await controllerRef.current.resetSession(sourceSessionId);
-          if (operationGuardRef.current.ownsActivation(owner)) onLocalSend(sourceSessionId);
-          if (!operationGuardRef.current.draftUnchanged(owner)) return;
-          if (operationGuardRef.current.ownsActivation(owner)) {
+          await sourceController.resetSession(sourceSessionId);
+          if (operationGuardRef.current === sourceGuard && sourceGuard.ownsActivation(owner)) onLocalSend(sourceSessionId);
+          if (!sourceGuard.consumeUnchangedDraft(owner)) return;
+          if (!sourceDraftStillClearable(sourceSessionId, owner)) return;
+          if (operationGuardRef.current === sourceGuard && sourceGuard.ownsActivation(owner)) {
             resetHistoryNavigation();
             closePalette();
             textRef.current = "";
@@ -1240,7 +1343,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
             requestComposerFrame(() => richEditorRef.current?.focus());
           }
           revokeAttachments(sourceAttachments);
-          await enqueueDraftSave(draftSaveChainRef, controllerRef, sourceSessionId, {
+          await enqueueDraftSave(draftSaveChainRef, sourceControllerRef, sourceSessionId, {
             text: "",
             editorDocument: emptyComposerDocument(),
             deliveryMode: sourceDeliveryMode,
@@ -1248,16 +1351,13 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
             attachments: []
           });
         } finally {
-          finishSubmission(sourceSessionId, "reset");
+          finishSubmission(sourceSessionId, "reset", sourceGuard);
         }
       });
       return;
     }
-    const sourceController = controllerRef.current;
-    const sourceControllerRef = { current: sourceController };
     const sourceSend = sourceController.send;
     const sourceGeneration = session.generation;
-    const sourceGuard = operationGuardRef.current;
     const sourceSendOwner = sendOwner;
     const sourceRoute = sendRouteKey;
     const sourceEpoch = sendEpochRef.current;
@@ -1520,7 +1620,28 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
   };
   const insertSkillRef = useRef(insert);
   insertSkillRef.current = insert;
-  const receiveGamepadSkillRef = useRef<(binding: GamepadSkillBinding) => void>(() => undefined);
+  const insertAppTextRef = useRef<(value: string) => boolean>(() => false);
+  insertAppTextRef.current = (value) => {
+    if (composerLocked || effectiveBashMode) return false;
+    markDraftEdited(session.id);
+    resetHistoryNavigation();
+    const prefix = composerDocumentIsEmpty(editorDocumentRef.current) || composerDocumentEndsWithWhitespace(editorDocumentRef.current) ? "" : " ";
+    const nextDocument = appendTextToComposerDocument(editorDocumentRef.current, `${prefix}${value}`);
+    const nextText = composerDocumentPlainText(nextDocument);
+    const nextRanges = remapComposerInlineMentionRanges(textRef.current, nextText, inlineMentionRangesRef.current);
+    const nextMentions = composerMentionsFromRanges(mentionsRef.current, nextRanges);
+    editorDocumentRef.current = nextDocument;
+    textRef.current = nextText;
+    mentionsRef.current = nextMentions;
+    setEditorDocument(nextDocument);
+    setText(nextText);
+    replaceInlineMentionRanges(nextRanges);
+    setMentions(nextMentions);
+    closePalette();
+    requestComposerFrame(() => richEditorRef.current?.focus("end"));
+    return true;
+  };
+  const receiveGamepadSkillRef = useRef<(binding: GamepadSkillBinding | AppInputSkillIdentity) => boolean>(() => false);
   receiveGamepadSkillRef.current = (binding) => {
     const source = gamepadSkillState.current;
     const ownerDocument = voiceRoot?.ownerDocument;
@@ -1530,9 +1651,15 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
       || ownerDocument.body.classList.contains("modal-open")
       || (taskRoot !== null && taskRoot !== undefined && currentGamepadTaskRoot(ownerDocument) !== taskRoot)) {
       setGamepadSkillError(t("settings.gamepad.skillInputUnavailable"));
-      return;
+      return false;
     }
-    if (gamepadSkillFlight.current?.owner === source.owner) return;
+    const matchingResources = source.resources.filter((resource) => resource.kind === "skill"
+      && resource.id === binding.resourceId && resource.name === binding.name && resource.sessionId === session.id);
+    if (matchingResources.length !== 1) {
+      setGamepadSkillError(t("settings.gamepad.skillInputUnavailable"));
+      return false;
+    }
+    if (gamepadSkillFlight.current?.owner === source.owner) return false;
     const operation = { owner: source.owner };
     gamepadSkillFlight.current = operation;
     setGamepadSkillError(undefined);
@@ -1541,6 +1668,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
       && gamepadSkillState.current.owner === source.owner
       && !gamepadSkillState.current.locked && !gamepadSkillState.current.bashMode
       && gamepadSkillState.current.connected && gamepadSkillState.current.serverId === binding.serverId
+      && gamepadSkillState.current.resources === source.resources
       && voiceRoot?.isConnected === true && voiceRoot.ownerDocument === ownerDocument
       && editorDocumentRef.current === sourceDraftDocument
       && !ownerDocument.body.classList.contains("modal-open")
@@ -1558,6 +1686,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
     }).finally(() => {
       if (gamepadSkillFlight.current === operation) gamepadSkillFlight.current = undefined;
     });
+    return true;
   };
   useLayoutEffect(() => {
     if (voiceRoot === undefined) return;
@@ -1571,6 +1700,24 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
       delete voiceRoot.dataset.gamepadSkill;
     };
   }, [voiceRoot, sendOwner]);
+
+  useAppInputComposerOwner(voiceRoot, sendOwner, {
+    focus: () => {
+      if (composerLocked) return false;
+      richEditorRef.current?.focus();
+      return true;
+    },
+    insertText: (value) => insertAppTextRef.current(value),
+    insertSkill: (binding) => receiveGamepadSkillRef.current(binding),
+    voice: {
+      enabled: voice.supported && !readOnly && submissionKind === undefined && !effectiveBashMode && hydratedSession === session.id,
+      isActive: voice.isActive,
+      getCaptureIdentity: voice.getCaptureIdentity,
+      start: voice.start,
+      finish: voice.finish,
+      cancel: voice.cancel
+    }
+  });
 
   const openInlineMentionPalette = (): void => {
     if (composerLocked || !canMention) return;
@@ -1813,6 +1960,10 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
       <div
         ref={bindComposer}
         className={cx("composer-stack", showQueue && "composer-stack--with-queue")}
+        onBlurCapture={(event) => {
+          const target = ownedEventElement(event.target, event.currentTarget.ownerDocument);
+          if (target !== null && target.closest(".composer-rich-editor__content") !== null) flushPendingDraftSave(voiceDictionaryOwnerKey);
+        }}
         onKeyDownCapture={(event) => {
           const eventTarget = ownedEventElement(event.target, event.currentTarget.ownerDocument);
           if (event.key === "Escape" && eventTarget !== null && eventTarget.closest(".queue-strip__editor") !== null) return;
@@ -2383,16 +2534,58 @@ function handleComposerKey(
   return true;
 }
 
+const pendingComposerDraftSaves = new Map<string, Promise<void>>();
+const failedComposerDraftSaves = new Map<string, {
+  readonly ownerKey: string;
+  readonly ownerDocument: Document;
+  readonly draft: ComposerDraft;
+  readonly error: unknown;
+}>();
+
+function composerDraftSaveKey(serverId: string | undefined, profileId: string | undefined, sessionId: string): string {
+  return JSON.stringify([serverId, profileId, sessionId]);
+}
+
+function rememberFailedComposerDraftSave(pending: PendingComposerDraftSave, error: unknown): void {
+  failedComposerDraftSaves.set(composerDraftSaveKey(pending.serverId, pending.profileId, pending.sessionId), {
+    ownerKey: pending.ownerKey, ownerDocument: pending.ownerDocument, draft: pending.draft, error
+  });
+}
+
+function failedComposerDraftSave(serverId: string | undefined, profileId: string | undefined, sessionId: string, ownerKey: string, ownerDocument: Document) {
+  const failed = failedComposerDraftSaves.get(composerDraftSaveKey(serverId, profileId, sessionId));
+  return failed?.ownerKey === ownerKey && failed.ownerDocument === ownerDocument ? failed : undefined;
+}
+
+function pendingComposerDraftSave(serverId: string | undefined, profileId: string | undefined, sessionId: string): Promise<void> {
+  return pendingComposerDraftSaves.get(composerDraftSaveKey(serverId, profileId, sessionId)) ?? Promise.resolve();
+}
+
 function enqueueDraftSave(
   chainRef: { current: Promise<void> },
   controllerRef: { current: AppController },
   sessionId: string,
-  draft: ComposerDraft
+  draft: ComposerDraft,
+  onFailure?: (error: unknown) => void
 ): Promise<void> {
   const saveDraft = controllerRef.current.saveDraft;
-  const operation = chainRef.current.then(() => saveDraft(sessionId, draft));
-  chainRef.current = operation.catch(() => undefined);
-  return operation;
+  const serverId = controllerRef.current.state.activeProfile?.serverId;
+  const profileId = controllerRef.current.state.activeProfile?.id;
+  const key = composerDraftSaveKey(serverId, profileId, sessionId);
+  const operation = Promise.all([chainRef.current, pendingComposerDraftSave(serverId, profileId, sessionId)])
+    .then(() => saveDraft(sessionId, draft))
+    .then(() => { failedComposerDraftSaves.delete(key); });
+  const recorded = operation.catch((error: unknown) => {
+    onFailure?.(error);
+    throw error;
+  });
+  const settled = recorded.catch(() => undefined);
+  chainRef.current = settled;
+  pendingComposerDraftSaves.set(key, settled);
+  void settled.then(() => {
+    if (pendingComposerDraftSaves.get(key) === settled) pendingComposerDraftSaves.delete(key);
+  });
+  return recorded;
 }
 
 function preventDrag(event: DragEvent): void {

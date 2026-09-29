@@ -20,6 +20,10 @@ import {
 import { needsLocalPairingRecovery } from "./local-pairing-recovery.js";
 import { createInternalServer, createPublicServer } from "./server.js";
 import { OrchestratorServiceLifecycle, OrchestratorStartupInterruptedError } from "./service-lifecycle.js";
+import {
+  createServiceDevicePeerRuntimeExecutables,
+  ServiceDevicePeerAgent
+} from "./service-device-peer-agent.js";
 
 async function main(): Promise<void> {
   const desktopHostedPersistent = process.argv.includes("--desktop-hosted");
@@ -33,6 +37,9 @@ async function main(): Promise<void> {
   let application;
   try {
     config = loadConfig();
+    if (desktopHosted && config.devicePeerAgent !== undefined) {
+      throw new Error("A Desktop-hosted Orchestrator cannot own a Service Device peer identity.");
+    }
     const resolveOutboundProxy = createManagedOutboundProxyResolver(
       process.env[MANAGED_OUTBOUND_PROXY_SNAPSHOT_ENV]
     );
@@ -93,6 +100,18 @@ async function main(): Promise<void> {
     lifecycle.assertStartupActive();
     await internalServer.listen({ host: "127.0.0.1", port: config.internalPort });
     lifecycle.assertStartupActive();
+    if (config.devicePeerAgent !== undefined) {
+      const serviceDevicePeerAgent = new ServiceDevicePeerAgent({
+        config: config.devicePeerAgent,
+        runtimeExecutables: await createServiceDevicePeerRuntimeExecutables(config)
+      });
+      const unregister = application.registerServiceCleanup?.(() => serviceDevicePeerAgent.close());
+      if (unregister === undefined) {
+        throw new Error("The Service Device peer lifecycle owner is unavailable.");
+      }
+      await serviceDevicePeerAgent.start();
+      lifecycle.assertStartupActive();
+    }
     if (desktopBootstrap !== undefined) {
       const bootstrap = desktopBootstrap;
       const response = bootstrap.grant.exchange({

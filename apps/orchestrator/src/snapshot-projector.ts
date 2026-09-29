@@ -164,6 +164,7 @@ export function sessionProjectionContext(
         ...(autoCompaction === undefined ? {} : { autoCompaction }),
         ...(autoRetry === undefined ? {} : { autoRetry })
       };
+  const lastUserInputAt = store.findLatestVisibleUserMessageAt(session.descriptor.id);
   return {
     ...(options.activeRun === undefined ? {} : { activeRun: options.activeRun }),
     ...(options.runtimeAttached === undefined ? {} : { runtimeAttached: options.runtimeAttached }),
@@ -175,6 +176,7 @@ export function sessionProjectionContext(
     ...(runtimeState?.activeNativeEntryId === undefined
       ? {}
       : { activeNativeEntryId: runtimeState.activeNativeEntryId }),
+    ...(lastUserInputAt === undefined ? {} : { lastUserInputAt }),
     ...(session.descriptor.derivationOrigin === undefined
       ? {}
       : {

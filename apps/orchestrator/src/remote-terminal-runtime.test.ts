@@ -1,11 +1,12 @@
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 import { RemoteSshError, type RemoteProcessHandle, type RemoteSshTransportLease, type RemoteTerminalHandle } from "@joko/remote-ssh";
-import type { RemoteHostRecord } from "@joko/store";
 import { describe, expect, it, vi } from "vitest";
+import { RemoteExecutionUnavailableError, type RemoteExecutionRouter } from "./remote-execution-router.js";
 import { RemoteTerminalRuntimeResolver } from "./remote-terminal-runtime.js";
 
-const scope = { sessionId: "remote-task", targetId: "remote-target", remoteHostId: "host-one", workspaceRoot: "/work/project" };
+const binding = { kind: "ssh" as const, hostTargetId: "remote-target", hostId: "host-one", workspaceRoot: "/work/project" };
+const scope = { sessionId: "remote-task", targetId: "remote-target", remoteWorkspace: binding, workspaceRoot: "/work/project" };
 
 describe("remote terminal connection and workspace authority", () => {
   it("uses one remote lease for the user's shell catalog, canonical directory and PTY without forwarding local environment", async () => {
@@ -19,7 +20,7 @@ describe("remote terminal connection and workspace authority", () => {
     ]);
     expect(await runtime.canonicalDirectory(scope.workspaceRoot, "src")).toBe("/work/project/src");
     expect(await runtime.spawn(shells[0]!, { cwd: "/work/project/src", cols: 90, rows: 30 }, signal)).toBe(f.pty);
-    expect(f.transports).toHaveBeenCalledExactlyOnceWith("remote-target", "host-one", signal);
+    expect(f.terminal).toHaveBeenCalledExactlyOnceWith(binding, signal);
     expect(f.openTerminal).toHaveBeenCalledExactlyOnceWith({ executable: "/usr/bin/zsh", args: ["-i"], cwd: "/work/project/src", cols: 90, rows: 30, signal });
     expect(f.openProcess.mock.calls[0]![0]).toMatchObject({ executable: "/bin/sh", cwd: "/work/project" });
     expect(f.openProcess.mock.calls[0]![0]).not.toHaveProperty("env");
@@ -27,7 +28,7 @@ describe("remote terminal connection and workspace authority", () => {
 
   it("rejects missing capability, escaped directories and symlinked workspace roots before a PTY can start", async () => {
     const f = fixture();
-    f.transports.mockResolvedValueOnce({ host: {} as RemoteHostRecord, lease: { ...f.lease, capabilities: { ...f.lease.capabilities, interactiveTerminal: false } } });
+    f.terminal.mockRejectedValueOnce(new RemoteExecutionUnavailableError("terminal"));
     await expect(f.resolver.resolve(scope)).rejects.toMatchObject({ code: "RUNTIME_UNAVAILABLE", stateMayHaveChanged: false });
     const runtime = await f.resolver.resolve(scope);
     for (const cwd of ["../elsewhere", "/outside", "../../work/project-two"]) {
@@ -126,7 +127,17 @@ function fixture() {
     files: { realpath, stat: async () => ({ kind: "directory", size: 0, modifiedAt: 0, mode: 0o755 }),
       list: async () => [], read: async () => new Uint8Array(), write: async () => {}, mkdir: async () => {}, rename: async () => {}, remove: async () => {} }
   };
-  const transports = vi.fn(async (_targetId: string, _hostId: string, _signal?: AbortSignal) => ({ host: {} as RemoteHostRecord, lease }));
-  return { resolver: new RemoteTerminalRuntimeResolver({ transports }), transports, lease, openTerminal, openProcess, realpath, pty, probes,
+  const terminal = vi.fn(async () => ({
+    kind: "ssh" as const,
+    binding,
+    executionIdentity: "ssh",
+    authorityIdentity: "1",
+    pathStyle: "posix" as const,
+    terminals: lease.terminals!,
+    processes: lease.processes!,
+    files: lease.files!,
+    assertCurrent: () => undefined
+  }));
+  return { resolver: new RemoteTerminalRuntimeResolver({ terminal } as unknown as RemoteExecutionRouter), terminal, lease, openTerminal, openProcess, realpath, pty, probes,
     setOutput(value: string | undefined) { output = value; } };
 }

@@ -170,6 +170,124 @@ test("remote-host public projections exclude raw authority and private diagnosti
   ]);
 });
 
+test("device-peer contracts fence exact authority and keep workspace locations disjoint", () => {
+  const methods = [...contract.DevicePeerService.methods];
+  assert.deepEqual(methods.map((method) => [method.localName, method.methodKind]), [
+    ["listDevicePeers", "unary"],
+    ["listDevicePeerRecentDirectories", "unary"],
+    ["listDevicePeerDirectories", "unary"],
+    ["inspectDevicePeerDirectory", "unary"],
+    ["openDevicePeerAgentRoute", "bidi_streaming"],
+    ["openDevicePeerAgentCommandRoute", "server_streaming"],
+    ["publishDevicePeerAgentRoute", "client_streaming"]
+  ]);
+
+  assert.deepEqual(oneofMembers(contract.WorkspaceLocationSchema, "kind"), [
+    "service_node", "ssh_host", "device_peer"
+  ]);
+  assert.equal(fields(contract.ServiceNodeWorkspaceLocationSchema).length, 0);
+  assert.deepEqual([...fieldNames(contract.SshHostWorkspaceLocationSchema)], [
+    "host_target_id", "host_id", "workspace_root_display"
+  ]);
+  assert.deepEqual([...fieldNames(contract.DevicePeerWorkspaceLocationSchema)], [
+    "controller_device_id", "target_device_id", "workspace_root_display"
+  ]);
+  assert.equal("RemoteWorkspaceBindingSchema" in contract, false);
+  for (const schema of [contract.TargetSchema, contract.SessionSchema, contract.WorkspaceDescriptorSchema]) {
+    assert.equal(fieldNames(schema).has("location"), true, `${schema.typeName} must expose location`);
+    assert.equal(fieldNames(schema).has("remote_workspace"), false, `${schema.typeName} keeps a retired shape`);
+  }
+
+  assert.deepEqual([...fieldNames(contract.DevicePeerRouteIdentitySchema)], [
+    "target_device_id", "relation_id", "target_device_revision", "relation_revision", "route_generation"
+  ]);
+  for (const schema of [
+    contract.ListDevicePeerRecentDirectoriesRequestSchema,
+    contract.ListDevicePeerDirectoriesRequestSchema,
+    contract.InspectDevicePeerDirectoryRequestSchema,
+    contract.ListDevicePeerRecentDirectoriesResponseSchema,
+    contract.ListDevicePeerDirectoriesResponseSchema,
+    contract.InspectDevicePeerDirectoryResponseSchema
+  ]) assert.equal(fieldNames(schema).has("peer"), true, `${schema.typeName} must echo exact peer authority`);
+  assertNoFields([
+    contract.ListDevicePeersRequestSchema,
+    contract.DevicePeerDescriptorSchema,
+    contract.DevicePeerRecentDirectorySchema,
+    contract.DevicePeerDirectoryEntrySchema
+  ], ["controller_device_id", "credential", "password", "private_key", "route_token", "raw_error"]);
+  assertNoFields([contract.DevicePeerWorkspaceLocationSchema], [
+    "connection_id", "relation_id", "target_device_revision", "relation_revision", "route_generation",
+    "credential", "password", "private_key", "route_token", "raw_error"
+  ]);
+
+  assert.deepEqual(oneofMembers(contract.DevicePeerCommandSchema, "action"), [
+    "list_recent_directories", "list_directories", "inspect_directory", "create_directory",
+    "realpath", "stat_file", "list_files", "read_file", "write_file", "rename_file", "remove_file",
+    "start_process", "write_process", "signal_process",
+    "open_terminal", "write_terminal", "resize_terminal", "kill_terminal", "pause_terminal", "resume_terminal",
+    "open_loopback_forward", "write_loopback_forward", "close_loopback_forward", "listen_loopback_forward",
+    "write_reverse_forward", "close_reverse_forward_connection", "close_loopback_listener"
+  ]);
+  assert.deepEqual(oneofMembers(contract.DevicePeerAgentResultSchema, "payload"), [
+    "acknowledgement", "recent_directories", "directories", "directory_inspection", "directory_created",
+    "realpath", "file_stat", "file_list", "file_read", "file_mutation",
+    "process_started", "process_output", "process_exited",
+    "terminal_opened", "terminal_output", "terminal_exited",
+    "loopback_forward_opened", "loopback_forward_data", "loopback_forward_closed",
+    "loopback_listener_opened", "reverse_forward_connection_opened", "reverse_forward_data",
+    "reverse_forward_connection_closed", "loopback_listener_closed", "failure"
+  ]);
+  assert.deepEqual([...fieldNames(contract.OpenDevicePeerAgentRouteRequestSchema)], [
+    "target_device_id", "route_generation", "request_id", "hello", "result", "heartbeat"
+  ]);
+  assert.deepEqual(oneofMembers(contract.OpenDevicePeerAgentRouteRequestSchema, "payload"), [
+    "hello", "result", "heartbeat"
+  ]);
+  assert.deepEqual([...fieldNames(contract.OpenDevicePeerAgentCommandRouteRequestSchema)], [
+    "target_device_id", "route_generation", "request_id", "hello"
+  ]);
+  assert.deepEqual(oneofMembers(contract.OpenDevicePeerAgentCommandRouteRequestSchema, "payload"), ["hello"]);
+  assert.deepEqual([...fieldNames(contract.PublishDevicePeerAgentRouteRequestSchema)], [
+    "target_device_id", "route_generation", "request_id", "result", "heartbeat", "attachment"
+  ]);
+  assert.deepEqual(oneofMembers(contract.PublishDevicePeerAgentRouteRequestSchema, "payload"), [
+    "result", "heartbeat", "attachment"
+  ]);
+  assert.equal(fields(contract.PublishDevicePeerAgentRouteResponseSchema).length, 0);
+  assert.equal(fields(contract.DevicePeerAgentHeartbeatSchema).length, 0);
+  assert.deepEqual([...fieldNames(contract.OpenDevicePeerAgentRouteResponseSchema)], [
+    "target_device_id", "route_generation", "request_id", "accepted", "command", "abort", "retire"
+  ]);
+  assert.equal(fieldNames(contract.DevicePeerAgentResultSchema).has("sequence"), true);
+  assert.deepEqual([
+    contract.DevicePeerCapabilityKind.FILES,
+    contract.DevicePeerCapabilityKind.PROCESS,
+    contract.DevicePeerCapabilityKind.TERMINAL,
+    contract.DevicePeerCapabilityKind.FORWARDING
+  ], [1, 2, 3, 4]);
+
+  assert.equal(field(contract.OperationMutationSchema, "create_device_peer_target").number, 216);
+  const mutation = roundTrip(contract.OperationMutationSchema, {
+    payload: { case: "createDevicePeerTarget", value: {
+      backendId: "backend-a",
+      displayName: "Peer project",
+      peer: {
+        targetDeviceId: "device-target",
+        relationId: "relation-a",
+        targetDeviceRevision: { value: 11n, etag: "device:11" },
+        relationRevision: { value: 12n, etag: "relation:12" },
+        routeGeneration: 13n
+      },
+      workspacePath: "D:/work/project",
+      createIfMissing: true
+    } }
+  });
+  assert.equal(mutation.payload.case, "createDevicePeerTarget");
+  assert.equal(mutation.payload.value.peer.targetDeviceRevision.value, 11n);
+  assert.equal(mutation.payload.value.peer.relationRevision.value, 12n);
+  assert.equal(mutation.payload.value.peer.routeGeneration, 13n);
+});
+
 test("voice input remains an ephemeral capability surface", () => {
   assertNoFields([contract.VoiceInputSessionSchema, contract.VoiceInputFailureSchema], [
     "audio", "credential", "provider_id", "backend_id", "message"

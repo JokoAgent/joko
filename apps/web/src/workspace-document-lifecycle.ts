@@ -10,6 +10,8 @@ export interface WorkspaceFilesRouteLike {
 export interface WorkspaceDocumentLeaveGateRequest {
   readonly reason: WorkspaceLeaveReason;
   readonly matches?: (identity: WorkspaceDocumentIdentity) => boolean;
+  /** Exact request owner; aborting it must close any prompt without mutation. */
+  readonly signal?: AbortSignal;
 }
 
 export type WorkspaceDocumentLeaveGate = (request: WorkspaceDocumentLeaveGateRequest) => Promise<boolean>;
@@ -25,14 +27,20 @@ export function registerWorkspaceDocumentLeaveGate(gate: WorkspaceDocumentLeaveG
 }
 
 export async function requestWorkspaceDocumentLeave(request: WorkspaceDocumentLeaveGateRequest): Promise<boolean> {
+  if (workspaceLeaveAborted(request.signal)) return false;
   if (!workspaceDocumentController.shouldPreventUnload(request.matches)) return true;
   // Dirty state without its owning prompt UI must fail closed.
   if (activeGate === undefined) return false;
   try {
-    return await activeGate(request);
+    const accepted = await activeGate(request);
+    return workspaceLeaveAborted(request.signal) ? false : accepted;
   } catch {
     return false;
   }
+}
+
+function workspaceLeaveAborted(signal: AbortSignal | undefined): boolean {
+  return signal?.aborted ?? false;
 }
 
 export function workspaceRouteLeaveRequest(

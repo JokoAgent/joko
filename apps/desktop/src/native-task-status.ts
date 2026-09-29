@@ -1,5 +1,6 @@
 import type {
   DesktopLocale,
+  DesktopNativeTaskStatusAction,
   DesktopNativeTaskStatusDecision,
   DesktopNativeTaskStatusDisplay,
   DesktopNativeTaskStatusPermission,
@@ -191,6 +192,22 @@ export function sameNativeTaskStatusSnapshotFence(
   right: Pick<DesktopNativeTaskStatusSnapshot, "ownerId" | "revision">
 ): boolean {
   return left.ownerId === right.ownerId && left.revision === right.revision;
+}
+
+export function deliverDesktopNativeTaskStatusAction<TWindow>(
+  action: DesktopNativeTaskStatusAction,
+  target: {
+    readonly revealMainWindow: () => boolean;
+    readonly currentMainWindow: () => TWindow | undefined;
+    readonly isWindowAvailable: (window: TWindow) => boolean;
+    readonly dispatch: (window: TWindow, action: DesktopNativeTaskStatusAction) => void;
+  }
+): boolean {
+  if (action.kind === "focus" && !target.revealMainWindow()) return false;
+  const window = target.currentMainWindow();
+  if (window === undefined || !target.isWindowAvailable(window)) return false;
+  target.dispatch(window, action);
+  return true;
 }
 
 export function isNewerNativeTaskStatusSnapshot(

@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { PassThrough, Writable } from "node:stream";
 import type { TargetDescriptor } from "@joko/core";
+import { DEVICE_PEER_RUNTIME_EXECUTABLES } from "@joko/device-peer";
 import type {
   RemoteProcessHandle,
   RemoteProcessStartRequest,
@@ -12,7 +13,7 @@ import type {
 import type { RemoteHostRecord, StoredTarget } from "@joko/store";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { RemoteCodexRuntimeResolver } from "./remote-codex-read-runtime.js";
-import type { RemoteHostRegistry } from "./remote-host-registry.js";
+import type { RemoteExecutionRouter } from "./remote-execution-router.js";
 import type { CodexMcpBridgeManager } from "./remote-codex-mcp-bridge.js";
 
 const cleanups: Array<() => Promise<void>> = [];
@@ -22,6 +23,66 @@ afterEach(async () => {
 });
 
 describe("RemoteCodexRuntimeResolver", () => {
+  it("runs the audited Codex locator on a Win32 Device peer without PATH probing", async () => {
+    const fixture = createFixture({ peerWin32: true });
+    cleanups.push(() => fixture.resolver.forceShutdown());
+
+    const runtime = await fixture.resolver.resolve(fixture.target);
+    expect(runtime.workspaceRoot).toBe("C:\\work\\project");
+    expect(fixture.processes.requests).toEqual([]);
+    await runtime.host.ensureStarted();
+
+    expect(fixture.processes.requests).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        executable: DEVICE_PEER_RUNTIME_EXECUTABLES.codex,
+        cwd: "C:\\work\\project",
+        env: { CODEX_HOME: "C:\\work\\project\\.joko\\runtime\\v1\\codex-home" }
+      })
+    ]));
+    expect(fixture.processes.requests.some((request) => request.executable === "/bin/sh")).toBe(false);
+  });
+
+  it("runs the audited Codex locator on a POSIX Device peer without an SSH shell probe", async () => {
+    const fixture = createFixture({ peerPosix: true });
+    cleanups.push(() => fixture.resolver.forceShutdown());
+
+    const runtime = await fixture.resolver.resolve(fixture.target);
+    expect(runtime.workspaceRoot).toBe("/work/project");
+    expect(fixture.processes.requests).toEqual([]);
+    await runtime.host.ensureStarted();
+
+    expect(fixture.processes.requests).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        executable: DEVICE_PEER_RUNTIME_EXECUTABLES.codex,
+        cwd: "/work/project",
+        env: { CODEX_HOME: "/work/project/.joko/runtime/v1/codex-home" }
+      })
+    ]));
+    expect(fixture.processes.requests.some((request) => request.executable === "/bin/sh")).toBe(false);
+  });
+
+  it.each([
+    { label: "SSH", options: {} as FixtureOptions, roots: ["/srv/worktree-a", "/srv/worktree-b"] as const },
+    { label: "Device peer", options: { peerWin32: true } as FixtureOptions,
+      roots: ["C:\\work\\worktree-a", "C:\\work\\worktree-b"] as const }
+  ])("keeps two concurrent derived $label workspaces independently current", async ({ options, roots }) => {
+    const fixture = createFixture(options);
+    cleanups.push(() => fixture.resolver.forceShutdown());
+    const derived = roots.map((workspaceRoot) => ({
+      ...fixture.target,
+      workspaceRoot,
+      remoteWorkspace: { ...fixture.target.remoteWorkspace!, workspaceRoot }
+    }));
+
+    const [first, second] = await Promise.all(derived.map(async (target) => fixture.resolver.resolve(target)));
+    expect(first).not.toBe(second);
+    expect(first!.workspaceRoot).toBe(roots[0]);
+    expect(second!.workspaceRoot).toBe(roots[1]);
+    expect(() => first!.assertCurrent()).not.toThrow();
+    expect(() => second!.assertCurrent()).not.toThrow();
+    expect(fixture.capture).toHaveBeenCalledTimes(2);
+  });
+
   it("uses the fixed isolated runtime, bootstraps the daemon, and carries JSON-RPC over its bounded WebSocket proxy", async () => {
     const fixture = createFixture({ daemonInitiallyReady: false });
     cleanups.push(() => fixture.resolver.forceShutdown());
@@ -141,6 +202,8 @@ describe("RemoteCodexRuntimeResolver", () => {
 });
 
 interface FixtureOptions {
+  readonly peerWin32?: boolean;
+  readonly peerPosix?: boolean;
   readonly daemonInitiallyReady?: boolean;
   readonly probeVersion?: string;
   readonly stderr?: string;
@@ -149,6 +212,11 @@ interface FixtureOptions {
 }
 
 function createFixture(options: FixtureOptions) {
+  const remoteWorkspace = options.peerWin32 === true
+    ? { kind: "device_peer" as const, controllerDeviceId: "controller-a", targetDeviceId: "desktop-win", workspaceRoot: "C:\\work\\project" }
+    : options.peerPosix === true
+      ? { kind: "device_peer" as const, controllerDeviceId: "controller-a", targetDeviceId: "desktop-posix", workspaceRoot: "/work/project" }
+    : { kind: "ssh" as const, hostTargetId: "target-codex", hostId: "host-a", workspaceRoot: "/srv/project" };
   const target: TargetDescriptor = {
     id: "target-codex",
     backendId: "codex",
@@ -156,7 +224,7 @@ function createFixture(options: FixtureOptions) {
     workspaceRoot: "D:\\service-owned-placeholder",
     managed: false,
     trusted: true,
-    remoteWorkspace: { hostTargetId: "target-codex", hostId: "host-a", workspaceRoot: "/srv/project" }
+    remoteWorkspace
   };
   const host: RemoteHostRecord = {
     ownerId: "owner-a",
@@ -203,17 +271,22 @@ function createFixture(options: FixtureOptions) {
     authorityCurrent: true,
     capture: vi.fn()
   };
-  fixture.capture.mockImplementation(async () => ({
-    host,
-    hostRevision: host.revision,
-    leaseGeneration: 3,
-    lease,
+  fixture.capture.mockImplementation(async (binding) => ({
+    kind: remoteWorkspace.kind,
+    binding,
+    executionIdentity: remoteWorkspace.kind === "device_peer"
+      ? JSON.stringify({ kind: "device_peer", controllerDeviceId: "controller-a", targetDeviceId: remoteWorkspace.targetDeviceId })
+      : JSON.stringify({ ownerId: host.ownerId, hostId: host.id }),
+    authorityIdentity: `${host.revision}:3`,
+    pathStyle: options.peerWin32 === true ? "win32" as const : "posix" as const,
+    processes,
+    forwarding,
     assertCurrent: () => { if (!fixture.authorityCurrent) throw new Error("SSH authority changed"); },
     assertForwardingCurrent: () => { if (!fixture.authorityCurrent) throw new Error("SSH forwarding authority changed"); }
   }));
   const resolver = new RemoteCodexRuntimeResolver({
     store: { getTarget: () => fixture.stored },
-    registry: { captureProcessAuthority: fixture.capture } as unknown as Pick<RemoteHostRegistry, "captureProcessAuthority">,
+    remoteExecution: { processes: fixture.capture } as unknown as Pick<RemoteExecutionRouter, "processes">,
     ...(options.mcpBridge === undefined ? {} : { mcpBridge: options.mcpBridge })
   });
   return Object.assign(fixture, { resolver });
@@ -226,12 +299,14 @@ class FakeRemoteProcesses implements RemoteProcessTransportPort {
   readonly #probeVersion: string;
   readonly #stderr: string;
   readonly #disconnectOnMethod: string | undefined;
+  readonly #peerWin32: boolean;
 
   constructor(options: FixtureOptions) {
     this.#daemonReady = options.daemonInitiallyReady ?? true;
     this.#probeVersion = options.probeVersion ?? "codex-cli 0.153.4";
     this.#stderr = options.stderr ?? "";
     this.#disconnectOnMethod = options.disconnectOnMethod;
+    this.#peerWin32 = options.peerWin32 === true;
   }
 
   async open(request: RemoteProcessStartRequest): Promise<RemoteProcessHandle> {
@@ -244,8 +319,9 @@ class FakeRemoteProcesses implements RemoteProcessTransportPort {
       const processHandle = new FakeRemoteProcess();
       setImmediate(() => {
         if (this.#stderr.length > 0) processHandle.stderr.write(this.#stderr);
+        const canonicalWorkspace = request.cwd === "/srv/project" ? "/srv/project-real" : request.cwd;
         processHandle.stdout.write(Buffer.from([
-          "/srv/project-real",
+          canonicalWorkspace,
           "/home/test/.joko/runtime/v1/codex-home",
           "/home/test/.joko/runtime/v1/codex-home/packages/standalone/current/codex",
           this.#probeVersion,
@@ -266,7 +342,9 @@ class FakeRemoteProcesses implements RemoteProcessTransportPort {
           return;
         }
         processHandle.stdout.write(JSON.stringify({
-          socketPath: "/home/test/.joko/runtime/v1/codex-home/app-server-control/app-server-control.sock"
+          socketPath: this.#peerWin32
+            ? "\\\\.\\pipe\\joko-codex-app-server"
+            : `${request.env?.CODEX_HOME ?? "/home/test/.joko/runtime/v1/codex-home"}/app-server-control/app-server-control.sock`
         }));
         processHandle.finish(0);
       });

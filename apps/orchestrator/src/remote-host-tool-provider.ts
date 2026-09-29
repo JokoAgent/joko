@@ -122,7 +122,8 @@ export class RemoteHostToolBridgeProvider implements BridgeToolProvider {
 
   includeForTarget(targetId: string): boolean {
     try {
-      return this.#store.getTarget(targetId).descriptor.trusted;
+      const target = this.#store.getTarget(targetId).descriptor;
+      return target.trusted && target.remoteWorkspace?.kind !== "device_peer";
     } catch {
       return false;
     }
@@ -185,12 +186,12 @@ export class RemoteHostToolBridgeProvider implements BridgeToolProvider {
     if (!target.trusted) {
       throw new RemoteHostToolError("PERMISSION_DENIED", "Remote Host tools require a trusted target.");
     }
+    const sessionRemote = session.remoteWorkspace;
+    const targetRemote = target.remoteWorkspace;
     if (
       session.targetId !== context.targetId ||
       session.backendId !== target.backendId ||
-      session.remoteWorkspace?.hostTargetId !== target.remoteWorkspace?.hostTargetId ||
-      session.remoteWorkspace?.hostId !== target.remoteWorkspace?.hostId ||
-      session.remoteWorkspace?.workspaceRoot !== target.remoteWorkspace?.workspaceRoot ||
+      !sameRemoteHostToolScope(sessionRemote, targetRemote) ||
       session.binding.generation !== context.generation ||
       session.deletedAt !== undefined ||
       session.archived
@@ -199,6 +200,17 @@ export class RemoteHostToolBridgeProvider implements BridgeToolProvider {
     }
     return session;
   }
+}
+
+function sameRemoteHostToolScope(
+  session: SessionDescriptor["remoteWorkspace"],
+  target: SessionDescriptor["remoteWorkspace"]
+): boolean {
+  if (session === undefined || target === undefined) return session === target;
+  return session.kind === "ssh" && target.kind === "ssh"
+    && session.hostTargetId === target.hostTargetId
+    && session.hostId === target.hostId
+    && session.workspaceRoot === target.workspaceRoot;
 }
 
 function resolveHost(registry: RemoteHostRegistry, targetId: string, value: string): RemoteHostRecord {

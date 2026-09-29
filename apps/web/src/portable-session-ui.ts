@@ -14,7 +14,7 @@ export function portableSessionExportSupported(
   session: SessionView,
   snapshot: Pick<AppSnapshot, "backends">
 ): boolean {
-  if (session.remoteWorkspace === true) return false;
+  if (session.remoteWorkspace !== undefined) return false;
   return snapshot.backends
     .find((backend) => backend.id === session.backendId)
     ?.capabilities.get("session.portable_transfer")?.supported === true;

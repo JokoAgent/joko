@@ -1,4 +1,4 @@
-import { readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -79,6 +79,30 @@ describe("native task-status layout settings store", () => {
         await writeFile(path, value, { mode: 0o600 });
         await expect(createDesktopNativeTaskStatusLayoutSettingsStore(path).initialize()).resolves.toEqual([]);
       }
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("retains the last committed layout when atomic replacement fails", async () => {
+    const root = await mkdtemp(join(tmpdir(), "joko-native-task-layout-failure-"));
+    const path = join(root, "layout.json");
+    const committed = {
+      displayId: 7,
+      displayName: "Studio",
+      displayIndex: 0,
+      displayBounds: { x: 0, y: 0, width: 1600, height: 900 },
+      centerXRatio: 0.5,
+      compactWidth: 420,
+      expandedWidth: 620
+    };
+    try {
+      const store = createDesktopNativeTaskStatusLayoutSettingsStore(path);
+      await store.set(committed);
+      await rm(path);
+      await mkdir(path);
+      await expect(store.set({ ...committed, compactWidth: 700 })).rejects.toThrow();
+      expect(store.get()).toEqual([committed]);
     } finally {
       await rm(root, { recursive: true, force: true });
     }

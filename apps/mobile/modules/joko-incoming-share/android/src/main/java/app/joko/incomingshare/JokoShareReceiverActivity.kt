@@ -82,7 +82,7 @@ class JokoShareReceiverActivity : Activity() {
   private fun finishWithFailure() {
     Toast.makeText(
       applicationContext,
-      "The shared files could not be copied into the protected Joko inbox.",
+      "The shared content could not be copied into the protected Joko inbox.",
       Toast.LENGTH_LONG
     ).show()
     finish()

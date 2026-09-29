@@ -33,6 +33,83 @@ afterEach(() => {
 });
 
 describe("OperationalStore", () => {
+  it("persists maintenance scan, job, and effect receipts without invalidating the product revision fence", async () => {
+    const fixture = createFixture();
+    const filePath = fixture.store.filePath;
+    fixture.store.createMaintenanceScan({
+      id: "history-scan-1",
+      kind: "history",
+      payload: { projection: "frozen" },
+      expiresAt: 10_000,
+      createdAt: 100
+    });
+    fixture.store.transaction((store) => {
+      expect(store.claimMaintenanceScan("history", "history-scan-1", 101)?.state).toBe("claimed");
+      store.createMaintenanceJob<{ installationPrepared: boolean }, { reclaimedBytes: number }>({
+        id: "history-scan-1",
+        kind: "history",
+        scanId: "history-scan-1",
+        phase: "preparing",
+        percent: 1,
+        cancellable: true,
+        payload: { installationPrepared: false },
+        effects: [{
+          id: "binding-1",
+          kind: "history_binding",
+          payload: { operationId: "reset-1" }
+        }],
+        createdAt: 101
+      });
+    });
+    const expectedRevision = fixture.store.health().revision;
+    fixture.store.updateMaintenanceJob({
+      kind: "history",
+      id: "history-scan-1",
+      status: "running",
+      phase: "copying",
+      percent: 20,
+      cancellable: true,
+      cancelRequested: false,
+      payload: { installationPrepared: false },
+      updatedAt: 102
+    });
+    fixture.store.updateMaintenanceEffect({
+      jobId: "history-scan-1",
+      id: "binding-1",
+      state: "prepared",
+      payload: { operationId: "reset-1", replacement: "native/new.jsonl" },
+      updatedAt: 102
+    });
+    expect(fixture.store.health().revision).toBe(expectedRevision);
+
+    const workingPath = `${filePath}.history-maintenance.work`;
+    await expect(fixture.store.createHistoryMaintenanceCopy({ workingPath, expectedRevision })).resolves.toBe(true);
+    fixture.store.prepareHistoryMaintenanceCopyReceipt({
+      workingPath,
+      jobId: "history-scan-1",
+      phase: "installing",
+      percent: 96,
+      payload: { installationPrepared: true },
+      effectUpdates: [{
+        id: "binding-1",
+        state: "prepared",
+        payload: { operationId: "reset-1", replacement: "native/new.jsonl" }
+      }],
+      updatedAt: 103
+    });
+    fixture.store.installHistoryMaintenanceCopy({ workingPath, expectedRevision, backupEnabled: false });
+    fixture.store.close();
+
+    const reopened = new OperationalStore(filePath);
+    fixture.replaceStore(reopened);
+    expect(reopened.getMaintenanceScan("history", "history-scan-1")).toMatchObject({ state: "claimed" });
+    expect(reopened.getMaintenanceJob<{ installationPrepared: boolean }>("history", "history-scan-1"))
+      .toMatchObject({ status: "running", phase: "installing", percent: 96, payload: { installationPrepared: true } });
+    expect(reopened.listMaintenanceEffects("history-scan-1")).toEqual([
+      expect.objectContaining({ id: "binding-1", state: "prepared" })
+    ]);
+  });
+
   it("atomically installs a verified maintenance copy and preserves the prior database as the latest backup", async () => {
     const fixture = createFixture();
     const expectedRevision = fixture.store.health().revision;
@@ -1912,6 +1989,21 @@ describe("OperationalStore", () => {
     )?.descriptor.id).toBe("session-1");
   });
 
+  it("publishes a Session projection when native recovery advances only its generation", () => {
+    const { store } = createFixture();
+    const current = store.getSession("session-1");
+    const priorEvents = store.listEvents({ sessionId: "session-1" }).length;
+    const updated = store.updateSession("session-1", {
+      binding: { ...current.descriptor.binding, generation: current.descriptor.binding.generation + 1 }
+    }, current.revision);
+
+    expect(updated.descriptor.binding.opaqueRef).toBe(current.descriptor.binding.opaqueRef);
+    expect(store.listEvents({ sessionId: "session-1" }).slice(priorEvents)).toMatchObject([{
+      generation: updated.descriptor.binding.generation,
+      payload: { type: "session_changed" }
+    }]);
+  });
+
   it("distinguishes an omitted effort patch from an explicit effort clear", () => {
     const { store } = createFixture();
     const selected = store.updateSession("session-1", { effort: "medium" });
@@ -2162,6 +2254,159 @@ describe("OperationalStore", () => {
     expect(replay).toMatchObject({ claimed: false, replayed: true, value: { title: "After" } });
     expect(validations).toBe(1);
     expect(commits).toBe(1);
+  });
+
+  it("atomically adopts portable replacement cleanup and fences an unconfirmed native delete", () => {
+    const fixture = createFixture();
+    const store = fixture.store;
+    const connection = store.createConnection({
+      id: "portable-replacement-connection",
+      name: "Portable replacement client",
+      authKeyDigest: "portable-replacement-digest"
+    });
+    const claim = store.claimAuthorizedDeferredEffectOperation(
+      connection.id,
+      connection.authKeyDigest,
+      { id: "portable-replacement-operation", kind: "import_portable_session", body: { targetId: "target-1" } }
+    );
+    if (!claim.claimed) throw new Error("Expected a new portable import claim.");
+    const adopt = (transaction: OperationalStore) => {
+      const old = transaction.getSession("session-1");
+      transaction.updateSession("session-1", { deletedAt: 10, archived: true }, old.revision, 10);
+      transaction.createSession({
+        ...old.descriptor,
+        id: "portable-imported-session",
+        title: "Imported task",
+        binding: { opaqueRef: "native/imported.jsonl", generation: 1 },
+        archived: false,
+        deletedAt: undefined,
+        createdAt: 10,
+        updatedAt: 10
+      });
+      transaction.preparePortableReplacementCleanup({
+        operationId: claim.operation.id,
+        importedSessionId: "portable-imported-session",
+        replacedSessionId: "session-1",
+        at: 10
+      });
+      return { sessionId: "portable-imported-session" };
+    };
+    expect(() => store.completeAuthorizedDeferredEffectOperation(
+      connection.id, connection.authKeyDigest, claim.operation.id, claim.operation.bodyHash,
+      (transaction) => { adopt(transaction); throw new Error("finalizer failed"); }
+    )).toThrow("finalizer failed");
+    expect(store.getSession("session-1").descriptor.deletedAt).toBeUndefined();
+    expect(store.listSessions({ includeDeleted: true }).some((session) => session.descriptor.id === "portable-imported-session"))
+      .toBe(false);
+    expect(store.findPortableReplacementCleanup(claim.operation.id)).toBeUndefined();
+    expect(store.getOperation(claim.operation.id).status).toBe("started");
+
+    const completed = store.completeAuthorizedDeferredEffectOperation(
+      connection.id, connection.authKeyDigest, claim.operation.id, claim.operation.bodyHash, adopt
+    );
+    expect(completed.operation.status).toBe("completed");
+    expect(store.getPortableReplacementCleanup(claim.operation.id)).toMatchObject({
+      nativeState: "pending", worktreeState: "completed", replacedSessionId: "session-1"
+    });
+    expect(store.claimPortableReplacementNativeCleanup(claim.operation.id).nativeState).toBe("dispatched");
+    expect(store.recoverPortableReplacementCleanupClaims()).toBe(1);
+    expect(store.getPortableReplacementCleanup(claim.operation.id)).toMatchObject({
+      nativeState: "unknown", failureCode: "native_delete_unknown"
+    });
+    expect(() => store.prepareSessionLifecycleCleanup({
+      operationId: "archive-before-portable-cleanup",
+      sessionId: "portable-imported-session",
+      disposition: "archive"
+    })).toThrow(StoreError);
+    expect(() => store.claimPortableReplacementNativeCleanup(claim.operation.id)).toThrow(StoreError);
+    expect(store.findPortableReplacementCleanupForImportedSession("portable-imported-session")?.operationId)
+      .toBe(claim.operation.id);
+    const inspected = store.getPortableReplacementCleanup(claim.operation.id);
+    const exactOwner = {
+      operationId: claim.operation.id,
+      importedSessionId: "portable-imported-session",
+      cleanupRevision: inspected.revision,
+      replacedSessionRevision: store.getSession("session-1").revision,
+      targetRevision: store.getTarget("target-1").revision,
+      backendInstanceGeneration: store.getBackend("pi").descriptor.instanceGeneration
+    };
+    expect(() => store.claimPortableReplacementNativeRetry({ ...exactOwner, cleanupRevision: 0n }))
+      .toThrow(StoreError);
+    expect(() => store.confirmPortableReplacementNativeAbsence({ ...exactOwner, importedSessionId: "other" }))
+      .toThrow(StoreError);
+    expect(store.claimPortableReplacementNativeRetry(exactOwner).nativeState).toBe("dispatched");
+    expect(() => store.claimPortableReplacementNativeRetry(exactOwner)).toThrow(StoreError);
+    expect(store.markPortableReplacementNativeUnknown(claim.operation.id).nativeState).toBe("unknown");
+    expect(store.confirmPortableReplacementNativeAbsence({
+      ...exactOwner,
+      cleanupRevision: store.getPortableReplacementCleanup(claim.operation.id).revision
+    }).nativeState).toBe("completed");
+    expect(store.getSession("portable-imported-session").descriptor.deletedAt).toBeUndefined();
+    expect(store.getOperation(claim.operation.id).status).toBe("completed");
+  });
+
+  it("persists an exact native catalog adoption owner before cross-profile materialization", () => {
+    const fixture = createFixture();
+    const store = fixture.store;
+    const connection = store.createConnection({
+      id: "catalog-adoption-connection", name: "Catalog adoption client", authKeyDigest: "catalog-adoption-digest"
+    });
+    const claim = store.claimAuthorizedDeferredEffectOperation(
+      connection.id, connection.authKeyDigest,
+      { id: "catalog-adoption-operation", kind: "create_session", body: { targetId: "target-1" } }
+    );
+    if (!claim.claimed) throw new Error("Expected a catalog import Operation claim.");
+    const input = {
+      operationId: claim.operation.id,
+      operationBodyHash: claim.operation.bodyHash,
+      connectionId: connection.id,
+      authKeyDigest: connection.authKeyDigest,
+      sessionId: "catalog-adoption-session",
+      backendId: "pi",
+      targetId: "target-1",
+      targetRevision: store.getTarget("target-1").revision,
+      backendGeneration: store.getBackend("pi").descriptor.instanceGeneration,
+      binding: { opaqueRef: "native://active/exact", nativeSessionId: "native-exact", generation: 1 },
+      entry: {
+        nativeReference: "native://source/exact", nativeSessionId: "native-exact", title: "Source task",
+        workingDirectory: store.getTarget("target-1").descriptor.workspaceRoot,
+        createdAt: 1, modifiedAt: 2, archived: false,
+        placement: "project" as const, existingMatch: "binding_and_placement" as const
+      },
+      recoveryReference: JSON.stringify({ version: 1, source: "exact" })
+    };
+    expect(() => store.claimNativeCatalogAdoption({ ...input, targetRevision: 0n })).toThrow(StoreError);
+    const recorded = store.claimNativeCatalogAdoption(input);
+    expect(recorded).toMatchObject({ state: "claimed", sessionId: input.sessionId, binding: input.binding });
+    expect(() => store.claimNativeCatalogAdoption(input)).toThrow(StoreError);
+    expect(() => store.createSession({
+      ...store.getSession("session-1").descriptor,
+      id: "catalog-adoption-duplicate",
+      binding: input.binding
+    })).toThrow(StoreError);
+    const other = store.claimAuthorizedDeferredEffectOperation(
+      connection.id, connection.authKeyDigest,
+      { id: "catalog-adoption-other", kind: "create_session", body: { targetId: "target-1" } }
+    );
+    if (!other.claimed) throw new Error("Expected another catalog import Operation claim.");
+    expect(() => store.claimNativeCatalogAdoption({
+      ...input, operationId: other.operation.id, operationBodyHash: other.operation.bodyHash,
+      sessionId: "catalog-adoption-other-session"
+    })).toThrow(StoreError);
+    const filePath = store.filePath;
+    store.close();
+    const reopened = new OperationalStore(filePath);
+    cleanups.push(() => reopened.close());
+    expect(reopened.listPendingNativeCatalogAdoptions()).toHaveLength(1);
+    expect(reopened.getOperation(claim.operation.id).status).toBe("started");
+    const unknown = reopened.markNativeCatalogAdoptionUnknown(claim.operation.id);
+    expect(unknown.state).toBe("unknown");
+    expect(() => reopened.confirmNativeCatalogAdoptionState(claim.operation.id, recorded.revision, "absent"))
+      .toThrow(StoreError);
+    expect(reopened.confirmNativeCatalogAdoptionState(claim.operation.id, unknown.revision, "absent").state)
+      .toBe("absent");
+    expect(reopened.listPendingNativeCatalogAdoptions()).toHaveLength(0);
+    expect(reopened.getOperation(claim.operation.id).status).toBe("started");
   });
 
   it("rolls back a failed deferred finalizer and leaves the claim available for a failure tombstone", () => {
@@ -3120,6 +3365,57 @@ describe("OperationalStore", () => {
       afterCursor: first.globalCursor,
       beforeCursor: third.globalCursor
     })).toThrow("cannot page after and before a cursor at the same time");
+  });
+
+  it("projects latest visible user activity without counting automatic continuations", () => {
+    const { store } = createFixture();
+    expect(store.findLatestVisibleUserMessageAt("session-1")).toBeUndefined();
+
+    store.appendEvent({
+      id: "assistant-before-user-activity",
+      backendId: "pi",
+      targetId: "target-1",
+      sessionId: "session-1",
+      generation: 0,
+      emittedAt: 100,
+      traceId: "user-activity:assistant",
+      payload: {
+        type: "message_complete",
+        role: "assistant",
+        blocks: [{ kind: "text", text: "Ready" }]
+      }
+    });
+    store.appendEvent({
+      id: "user-activity",
+      backendId: "pi",
+      targetId: "target-1",
+      sessionId: "session-1",
+      generation: 0,
+      emittedAt: 200,
+      traceId: "user-activity:user",
+      payload: {
+        type: "message_complete",
+        role: "user",
+        blocks: [{ kind: "text", text: "Ship it" }]
+      }
+    });
+    store.appendEvent({
+      id: "automatic-continuation-after-user-activity",
+      backendId: "pi",
+      targetId: "target-1",
+      sessionId: "session-1",
+      generation: 0,
+      emittedAt: 300,
+      traceId: "user-activity:continuation",
+      payload: {
+        type: "message_complete",
+        role: "user",
+        blocks: [{ kind: "text", text: "Continue" }],
+        automaticContinuation: { recoveryId: "user-activity-recovery" }
+      }
+    });
+
+    expect(store.findLatestVisibleUserMessageAt("session-1")).toBe(200);
   });
 
   it("uses optimistic revisions and active-state checks to fence revoke races", () => {

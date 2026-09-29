@@ -90,13 +90,23 @@ export interface TargetView {
   readonly trusted: boolean;
   readonly pinned: boolean;
   readonly archived: boolean;
-  readonly remoteWorkspace?: {
-    readonly hostTargetId: string;
-    readonly hostId: string;
-    readonly workspaceRoot: string;
-  };
+  readonly remoteWorkspace?: RemoteWorkspaceView;
   readonly error?: string;
 }
+
+export type RemoteWorkspaceView =
+  | {
+      readonly kind: "ssh";
+      readonly hostTargetId: string;
+      readonly hostId: string;
+      readonly workspaceRoot: string;
+    }
+  | {
+      readonly kind: "device_peer";
+      readonly controllerDeviceId: string;
+      readonly targetDeviceId: string;
+      readonly workspaceRoot: string;
+    };
 
 export type ArtifactStorageMaintenanceSupportView =
   | "supported"
@@ -144,16 +154,22 @@ export interface ArtifactStorageReconcileView {
   readonly unsafeEntryCount: number;
 }
 
-export type ArtifactStorageCleanupView =
-  | { readonly outcome: "scanExpired" | "storageChanged" }
-  | {
-      readonly outcome: "completed";
+export interface ArtifactStorageCleanupResultView {
       readonly expiredReferencesDeleted: number;
       readonly blobsRemoved: number;
       readonly temporaryFilesRemoved: number;
       readonly freedBytes: number;
       readonly skipped: number;
-    };
+}
+
+export interface ArtifactStorageCleanupView {
+  readonly maintenanceId: string;
+  readonly status: "running" | "completed" | "scanExpired" | "storageChanged" | "failed";
+  readonly phase: "preparing" | "quarantining" | "deleting" | "reconciling";
+  readonly percent: number;
+  readonly updatedAt: number;
+  readonly result?: ArtifactStorageCleanupResultView;
+}
 
 export type TaskHistoryRetentionView = "7-days" | "1-month" | "3-months" | "6-months";
 
@@ -238,6 +254,52 @@ export interface RemoteTargetDraft {
   readonly hostId: string;
   readonly expectedHostTargetRevision: bigint;
   readonly expectedHostRevision: bigint;
+  readonly workspacePath: string;
+  readonly createIfMissing: boolean;
+}
+
+/** Exact, short-lived authority for one controller-to-target Device route. */
+export interface DevicePeerRouteIdentityView {
+  readonly targetDeviceId: string;
+  readonly relationId: string;
+  readonly targetDeviceRevision: bigint;
+  readonly relationRevision: bigint;
+  readonly routeGeneration: bigint;
+}
+
+export interface DevicePeerView {
+  readonly route: DevicePeerRouteIdentityView;
+  readonly name: string;
+  readonly kind: "desktop" | "service";
+  readonly platform: string;
+  readonly capabilities: readonly ("files" | "process" | "terminal" | "forwarding")[];
+}
+
+export interface DevicePeerRecentDirectoryView {
+  readonly name: string;
+  readonly path: string;
+  readonly availability: "exists" | "missing";
+  readonly lastUsedAt: number;
+}
+
+export interface DevicePeerDirectoryListingView {
+  readonly peer: DevicePeerRouteIdentityView;
+  readonly path: string;
+  readonly parentPath: string;
+  readonly directories: readonly { readonly name: string; readonly path: string }[];
+  readonly truncated: boolean;
+}
+
+export interface DevicePeerDirectoryInspectionView {
+  readonly peer: DevicePeerRouteIdentityView;
+  readonly path: string;
+  readonly kind: "directory" | "file" | "missing";
+}
+
+export interface DevicePeerTargetDraft {
+  readonly backendId: string;
+  readonly name: string;
+  readonly peer: DevicePeerRouteIdentityView;
   readonly workspacePath: string;
   readonly createIfMissing: boolean;
 }
@@ -349,6 +411,7 @@ export interface SshKeyCatalogView {
   readonly keys: readonly SshKeyView[];
   readonly agentState: "ready" | "unavailable" | "failed";
   readonly generationSupported: boolean;
+  readonly servicePlatform: "windows" | "macos" | "linux" | "unknown";
 }
 
 export interface SshKeyGenerateDraft {
@@ -988,19 +1051,34 @@ export interface RemoteBackendRuntimeInstallEventView {
   readonly observedAt: number;
 }
 
-/** Content-free resource usage for one Adapter-owned service-node runtime. */
-export interface RuntimeProcessUsageView {
+interface RuntimeProcessUsageViewBase {
   readonly backendId: string;
-  readonly sessionId: string;
-  readonly generation: number;
   readonly pid: number;
   readonly cpuPercent: number;
   readonly memoryKb: number;
   readonly processCount: number;
+}
+
+/** Shared Backend infrastructure with no product Session owner. */
+export interface RuntimeControlPlaneProcessUsageView extends RuntimeProcessUsageViewBase {
+  readonly role: "control-plane";
+  readonly terminable: false;
+  readonly sessionId?: never;
+  readonly generation?: never;
+  readonly processInstanceId?: never;
+}
+
+/** Content-free resource usage for one exact Session task host. */
+export interface RuntimeTaskHostProcessUsageView extends RuntimeProcessUsageViewBase {
+  readonly role: "task-host";
+  readonly sessionId: string;
+  readonly generation: number;
   readonly terminable: boolean;
   /** Opaque spawn-instance action fence; never an executable or command. */
   readonly processInstanceId?: string;
 }
+
+export type RuntimeProcessUsageView = RuntimeControlPlaneProcessUsageView | RuntimeTaskHostProcessUsageView;
 
 export interface RuntimeProcessUsageSnapshotView {
   readonly capturedAt: number;
@@ -1144,7 +1222,7 @@ export interface SessionView {
   readonly targetId: string;
   /** Navigation-only project placement; absence places the task in Dialogue. */
   readonly projectId?: string;
-  readonly remoteWorkspace?: boolean;
+  readonly remoteWorkspace?: RemoteWorkspaceView;
   readonly runtimeAttached?: boolean;
   readonly name: string;
   readonly summary?: string;
@@ -1161,6 +1239,8 @@ export interface SessionView {
   readonly attention?: SessionAttentionView;
   readonly createdAt?: number;
   readonly updatedAt: number;
+  /** Latest durable user-authored message; service continuations are excluded. */
+  readonly lastUserInputAt?: number;
   /** Lifetime accounting reported for this task; never a context-capacity proxy. */
   readonly usage?: UsageTokensView;
   readonly context?: ContextView;
@@ -1925,6 +2005,7 @@ export interface WorkspaceView {
   readonly kind: "userProject" | "managedDialogue";
   readonly serverPath: string;
   readonly trusted: boolean;
+  readonly remoteWorkspace?: RemoteWorkspaceView;
   readonly branch?: string;
   readonly head?: string;
   readonly detachedHead?: boolean;
@@ -4833,6 +4914,22 @@ export interface NativeSessionCatalogView {
   readonly snapshotToken: string;
 }
 
+export interface NativeCatalogAdoptionView {
+  readonly operationId: string;
+  readonly backendId: string;
+  readonly targetId: string;
+  readonly title: string;
+  readonly state: "pending" | "adopted" | "absent";
+  readonly revision: bigint;
+  readonly updatedAt: number;
+  readonly sessionId?: string;
+}
+
+export interface NativeCatalogAdoptionResolutionView {
+  readonly adoption: NativeCatalogAdoptionView;
+  readonly inspection: "present" | "absent" | "unknown";
+}
+
 export interface NewSessionDraft {
   readonly targetId: string;
   /** Exact Target revision whose workspace was prepared for this creation. */
@@ -4895,7 +4992,7 @@ export type NewSessionDraftSelection =
  * opaque approved-record IDs and is revalidated against the current snapshot
  * before it is shown or sent; server paths are never copied into this record. */
 export interface NewSessionLocalDraft {
-  readonly selection: NewSessionDraftSelection;
+  readonly selection: NewSessionDraftSelection | { readonly kind: "unselected" };
   readonly nativeStart: { readonly kind: "fresh" } | { readonly kind: "attach"; readonly reference: string };
   readonly providerId: string;
   readonly modelId: string;
@@ -5193,6 +5290,19 @@ export interface PortableSessionActivationResultView {
   readonly activationError?: ErrorView;
 }
 
+export interface PortableReplacementCleanupView {
+  readonly importedSessionId: string;
+  readonly nativeState: "pending" | "dispatched" | "unknown" | "completed";
+  readonly worktreeState: "pending" | "completed";
+  readonly revision: bigint;
+  readonly updatedAt: number;
+}
+
+export interface PortableReplacementCleanupResolutionView {
+  readonly cleanup: PortableReplacementCleanupView;
+  readonly inspection: "present" | "absent" | "unknown";
+}
+
 export type PortableSessionExportOutcomeView =
   | { readonly status: "exported"; readonly fidelity: PortableSessionFidelityView }
   | { readonly status: "oversize"; readonly mediaBytes: number; readonly limitBytes: number }
@@ -5431,7 +5541,8 @@ export interface OperationApi {
   readSessionArtifact(sessionId: string, artifactId: string, signal: AbortSignal): Promise<ArtifactView>;
   scanArtifactStorage(protectedSha256?: readonly string[]): Promise<ArtifactStorageScanView>;
   reconcileArtifactStorage(protectedSha256?: readonly string[]): Promise<ArtifactStorageReconcileView>;
-  cleanupArtifactStorage(scanToken: string, protectedSha256?: readonly string[]): Promise<ArtifactStorageCleanupView>;
+  beginArtifactStorageCleanup(scanToken: string, protectedSha256?: readonly string[]): Promise<ArtifactStorageCleanupView>;
+  getArtifactStorageCleanup(maintenanceId: string): Promise<ArtifactStorageCleanupView>;
   getTaskHistoryMaintenanceSupport(): Promise<TaskHistoryMaintenanceSupportView>;
   scanTaskHistory(retention: TaskHistoryRetentionView, includeActiveTasks: boolean): Promise<TaskHistoryScanView>;
   beginTaskHistoryCleanup(scanId: string, backupEnabled: boolean): Promise<TaskHistoryCleanupProgressView>;
@@ -5480,8 +5591,15 @@ export interface OperationApi {
     backendId: string,
     options?: { readonly signal?: AbortSignal; readonly force?: boolean }
   ): Promise<NativeSessionCatalogView>;
+  listNativeCatalogAdoptions(signal?: AbortSignal): Promise<readonly NativeCatalogAdoptionView[]>;
+  reconcileNativeCatalogAdoption(operationId: string): Promise<NativeCatalogAdoptionResolutionView>;
   createTarget(draft: TargetDraft): Promise<string>;
   createRemoteTarget(draft: RemoteTargetDraft): Promise<string>;
+  createDevicePeerTarget(draft: DevicePeerTargetDraft): Promise<string>;
+  listDevicePeers(signal?: AbortSignal): Promise<readonly DevicePeerView[]>;
+  listDevicePeerRecentDirectories(peer: DevicePeerRouteIdentityView, signal?: AbortSignal): Promise<readonly DevicePeerRecentDirectoryView[]>;
+  listDevicePeerDirectories(peer: DevicePeerRouteIdentityView, path: string, signal?: AbortSignal): Promise<DevicePeerDirectoryListingView>;
+  inspectDevicePeerDirectory(peer: DevicePeerRouteIdentityView, path: string, signal?: AbortSignal): Promise<DevicePeerDirectoryInspectionView>;
   listProjectDirectories(path: string, signal?: AbortSignal): Promise<ProjectDirectoryListingView>;
   prepareTargetWorkspace(targetId: string, expectedRevision: bigint, signal?: AbortSignal): Promise<void>;
   updateTarget(targetId: string, patch: {
@@ -5520,6 +5638,9 @@ export interface OperationApi {
     readonly refreshWorktreeRemote?: boolean;
   }): Promise<PortableSessionImportResultView>;
   retryPortableSessionActivation(sessionId: string): Promise<PortableSessionActivationResultView>;
+  getPortableReplacementCleanup(importedSessionId: string): Promise<PortableReplacementCleanupView | undefined>;
+  reconcilePortableReplacementCleanup(importedSessionId: string): Promise<PortableReplacementCleanupResolutionView>;
+  retryPortableReplacementCleanup(importedSessionId: string, expectedRevision: bigint): Promise<PortableReplacementCleanupResolutionView>;
   executeUserShell(sessionId: string, command: string, excludeFromContext: boolean): Promise<void>;
   abortUserShell(sessionId: string): Promise<void>;
   getSessionStatistics(sessionId: string, signal?: AbortSignal): Promise<SessionStatisticsView>;

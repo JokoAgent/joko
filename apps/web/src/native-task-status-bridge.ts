@@ -11,6 +11,13 @@ export interface NativeTaskStatusProjectionInput {
   readonly timelineBySession: ReadonlyMap<string, readonly TimelineItemView[]>;
 }
 
+export function nativeTaskStatusProjectionOwner(
+  profile: { readonly id: string; readonly serverId: string },
+  generation: bigint
+): string {
+  return `${profile.id}/${profile.serverId}/${generation}`;
+}
+
 export function projectNativeTaskStatusSnapshot(
   input: NativeTaskStatusProjectionInput
 ): JokoDesktopNativeTaskStatusSnapshot {

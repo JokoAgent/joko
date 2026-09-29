@@ -45,6 +45,59 @@ describe("schedule notification tracker", () => {
     expect(tracker.observe("owner-b", [schedule(run("same", "failed", { finishedAt: 40 }))]).notifications)
       .toEqual([]);
   });
+
+  it("does not replay terminal runs that remain in an authoritative snapshot larger than the legacy cap", () => {
+    const tracker = new ScheduleNotificationTracker();
+    const schedules = Array.from({ length: 4_097 }, (_, index) => schedule(
+      run(`run-${index}`, "failed", { finishedAt: 50 + index }),
+      { id: `schedule-${index}` }
+    ));
+
+    expect(tracker.observe("owner", schedules).notifications).toEqual([]);
+    expect(tracker.observe("owner", schedules).notifications).toEqual([]);
+  });
+
+  it("does not replay a terminal run that temporarily left the authoritative snapshot", () => {
+    const tracker = new ScheduleNotificationTracker();
+    const terminal = schedule(run("returning", "failed", { finishedAt: 60 }));
+
+    expect(tracker.observe("owner", [terminal]).notifications).toEqual([]);
+    expect(tracker.observe("owner", []).notifications).toEqual([]);
+    expect(tracker.observe("owner", [terminal]).notifications).toEqual([]);
+    expect(tracker.observe("owner", [terminal]).notifications).toEqual([]);
+  });
+
+  it("does not notify when an older terminal run first enters a bounded history window", () => {
+    const tracker = new ScheduleNotificationTracker();
+    const newest = run("200", "failed", { triggeredAt: 200, finishedAt: 210 });
+    const older = run("100", "failed", { triggeredAt: 100, finishedAt: 110 });
+
+    expect(tracker.observe("owner", [schedule(newest)]).notifications).toEqual([]);
+    expect(tracker.observe("owner", [schedule(newest, { history: [newest, older] })]).notifications).toEqual([]);
+  });
+
+  it("notifies a genuinely newer coalesced terminal run once", () => {
+    const tracker = new ScheduleNotificationTracker();
+    const baseline = run("9007199254740992", "failed", { triggeredAt: 100, finishedAt: 110 });
+    const newer = run("9007199254740993", "completed", { triggeredAt: 100, finishedAt: 120 });
+
+    expect(tracker.observe("owner", [schedule(baseline)]).notifications).toEqual([]);
+    expect(tracker.observe("owner", [schedule(newer, { history: [newer, baseline] })]).notifications).toEqual([
+      { title: "Daily check", kind: "done", sessionId: "session-one" }
+    ]);
+    expect(tracker.observe("owner", [schedule(newer, { history: [newer, baseline] })]).notifications).toEqual([]);
+  });
+
+  it("seeds a schedule first observed after global hydration without replaying its terminal history", () => {
+    const tracker = new ScheduleNotificationTracker();
+    tracker.observe("owner", [schedule(run("run-a", "running"))]);
+    const historical = run("run-z", "failed", { triggeredAt: 50, finishedAt: 60 });
+
+    expect(tracker.observe("owner", [
+      schedule(run("run-a", "running")),
+      schedule(historical, { id: "schedule-later" })
+    ]).notifications).toEqual([]);
+  });
 });
 
 function run(

@@ -1,6 +1,6 @@
 import { create } from "@bufbuild/protobuf";
 import { ConnectError, Code, type Transport } from "@connectrpc/connect";
-import { SshAgentState, SshInstallShell, SshKeyPassphrasePurpose } from "@joko/contracts";
+import { SshAgentState, SshAgentHostPlatform, SshInstallShell, SshKeyPassphrasePurpose } from "@joko/contracts";
 import { afterEach, expect, it, vi } from "vitest";
 import { createOrchestratorGateway } from "./gateway.js";
 
@@ -14,7 +14,7 @@ it("sends SSH passphrases only over the ticket upload channel and preserves key 
     return new Response(undefined, { status: 204 });
   }); vi.stubGlobal("fetch", fetch);
   const signal = new AbortController().signal;
-  await expect(fixture.gateway.listSshKeys(signal)).resolves.toEqual({ keys: [{ id: "opaque-key", name: "work-key", algorithm: "ssh-ed25519", comment: "Work", sha256Fingerprint: "SHA256:observed", modifiedAt: 2500, inAgent: true }], generationSupported: true, agentState: "ready" });
+  await expect(fixture.gateway.listSshKeys(signal)).resolves.toEqual({ keys: [{ id: "opaque-key", name: "work-key", algorithm: "ssh-ed25519", comment: "Work", sha256Fingerprint: "SHA256:observed", modifiedAt: 2500, inAgent: true }], generationSupported: true, agentState: "ready", servicePlatform: "windows" });
   await fixture.gateway.generateSshKey({ name: "", comment: "new-key", passphrase: "generation-test-secret" }, signal);
   await fixture.gateway.addSshKeyToAgent("opaque-key", "SHA256:observed", "agent-test-secret", signal);
   await expect(fixture.gateway.readSshPublicKey("opaque-key", "SHA256:observed", signal)).resolves.toBe("ssh-ed25519 AAAA Work");
@@ -46,6 +46,15 @@ it("does not allocate an upload for explicit unencrypted actions or replay a rej
   fixture.gateway.disconnect();
 });
 
+it.each([
+  [SshAgentHostPlatform.WINDOWS, "windows"], [SshAgentHostPlatform.MACOS, "macos"],
+  [SshAgentHostPlatform.LINUX, "linux"], [SshAgentHostPlatform.UNSPECIFIED, "unknown"]
+] as const)("maps service-node platform %s without consulting the browser OS", async (platform, expected) => {
+  const fixture = await mount(); fixture.agentHostPlatform = platform;
+  await expect(fixture.gateway.listSshKeys(new AbortController().signal)).resolves.toMatchObject({ servicePlatform: expected });
+  fixture.gateway.disconnect();
+});
+
 it.each(["generate:ticket", "generate:put", "generate:mutation", "agent:ticket", "agent:put", "agent:mutation"] as const)("retires the entire original connection chain during %s", async (scenario) => {
   const [action, stage] = scenario.split(":"); const entered = deferred(); const release = deferred();
   const fixture = await mount(); const calls: string[] = [];
@@ -72,7 +81,7 @@ async function mount() {
       requests.push({ method: method.localName, signal, input }); let value: object;
       switch (method.localName) {
         case "getSnapshot": value = { snapshot: {} }; break;
-        case "listSshKeys": value = { keys: [key], generationSupported: true, agentState: SshAgentState.READY }; break;
+        case "listSshKeys": value = { keys: [key], generationSupported: true, agentState: SshAgentState.READY, agentHostPlatform: fixture.agentHostPlatform }; break;
         case "readSshPublicKey": value = { publicKey: "ssh-ed25519 AAAA Work" }; break;
         case "getSshKeyInstallCommand": value = { command: "fixture-command" }; break;
         case "beginSshKeyPassphraseUpload": await fixture.pause?.("ticket"); value = { ticket: { ticketId: "ssh-ticket", relativeEndpoint: "/v1/credential-uploads/ssh-ticket", maximumBytes: 1024n } }; break;
@@ -86,7 +95,7 @@ async function mount() {
     stream: vi.fn(async (method: any) => response(method, idleStream(), true))
   } as unknown as Transport;
   const gateway = createOrchestratorGateway({ id: "profile", deviceId: "device", name: "Node", origin: "https://service.example", serverId: "node" }, "fixture-auth", {}, () => transport);
-  const fixture = { gateway, requests, pause: undefined as undefined | ((step: string) => Promise<void>), failure: undefined as ConnectError | undefined };
+  const fixture = { gateway, requests, pause: undefined as undefined | ((step: string) => Promise<void>), failure: undefined as ConnectError | undefined, agentHostPlatform: SshAgentHostPlatform.WINDOWS };
   await gateway.connect(); return fixture;
 }
 function deferred() { let resolve!: () => void; const promise = new Promise<void>((yes) => { resolve = yes; }); return { promise, resolve }; }

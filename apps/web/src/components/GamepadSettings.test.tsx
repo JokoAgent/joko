@@ -122,6 +122,21 @@ describe("gamepad settings", () => {
     await act(async () => option?.click());
     expect(readGamepadPreferences().preferences.buttons[0]).toBe("open-folder");
   });
+  it("offers product feedback for persistent button and stick-direction bindings", async () => {
+    const container = await renderSettings();
+    const binding = control(container, "Action for South face button");
+    await act(async () => binding.click());
+    const option = [...document.querySelectorAll<HTMLElement>("[role='option']")].find((candidate) => candidate.textContent === "Send feedback");
+    expect(option).toBeDefined();
+    await act(async () => option?.click());
+    expect(readGamepadPreferences().preferences.buttons[0]).toBe("feedback");
+    const direction = control(container, "Action for Left stick · Up");
+    await act(async () => direction.click());
+    const directionOption = [...document.querySelectorAll<HTMLElement>("[role='option']")].find((candidate) => candidate.textContent === "Send feedback");
+    expect(directionOption).toBeDefined();
+    await act(async () => directionOption?.click());
+    expect(readGamepadPreferences().preferences.leftStick.directions.up).toBe("feedback");
+  });
 
   it("offers photos and files as independent persistent actions", async () => {
     const container = await renderSettings();

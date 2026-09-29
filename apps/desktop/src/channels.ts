@@ -18,6 +18,15 @@ export const DESKTOP_CHANNELS = {
   sessionDragPreviewEnd: "joko:session-drag-preview:end",
   sessionWindowOpenIfDroppedOutside: "joko:session-window:open-if-dropped-outside",
   runtimeProcessMonitorOpen: "joko:runtime-process-monitor:open",
+  runtimeProcessMonitorRequest: "joko:runtime-process-monitor:request",
+  runtimeProcessMonitorRespond: "joko:runtime-process-monitor:respond",
+  runtimeProcessMonitorRetire: "joko:runtime-process-monitor:retire",
+  runtimeProcessMonitorSampleDesktop: "joko:runtime-process-monitor:sample-desktop",
+  runtimeProcessDiagnosticsGetOwner: "joko:runtime-process-diagnostics:owner:get",
+  runtimeProcessDiagnosticsRequest: "joko:runtime-process-diagnostics:request",
+  runtimeProcessDiagnosticsResponse: "joko:runtime-process-diagnostics:response",
+  runtimeProcessDiagnosticsRetired: "joko:runtime-process-diagnostics:retired",
+  runtimeProcessDiagnosticsRetiredAcknowledge: "joko:runtime-process-diagnostics:retired:acknowledge",
   layoutReset: "joko:layout:reset",
   layoutResetBroadcast: "joko:layout:reset-broadcast",
   windowInteractionGet: "joko:window-interaction:get",
@@ -35,15 +44,17 @@ export const DESKTOP_CHANNELS = {
   selectionContextMenuAddToChat: "joko:selection-context-menu:add-to-chat",
   selectionContextMenuSetLocale: "joko:selection-context-menu:set-locale",
   inspectorWindowReady: "joko:inspector-window:ready",
+  inspectorWindowIdentity: "joko:inspector-window:identity",
+  inspectorWindowActivate: "joko:inspector-window:activate",
   inspectorWindowMinimize: "joko:inspector-window:minimize",
   inspectorWindowToggleMaximize: "joko:inspector-window:toggle-maximize",
   inspectorWindowClose: "joko:inspector-window:close",
   inspectorWindowClosed: "joko:inspector-window:closed",
   traySetIcon: "joko:tray:set-icon",
   notify: "joko:notify",
-  notificationFocusSession: "joko:notification:focus-session",
   attentionMark: "joko:attention:mark",
   attentionClear: "joko:attention:clear",
+  mainDocumentOccurrenceGet: "joko:main-document:occurrence:get",
   nativeTaskStatusGetAvailability: "joko:native-task-status:availability:get",
   nativeTaskStatusGetSettings: "joko:native-task-status:settings:get",
   nativeTaskStatusSetSettings: "joko:native-task-status:settings:set",
@@ -78,9 +89,22 @@ export const DESKTOP_CHANNELS = {
   globalVoiceOpenAccessibility: "joko:global-voice:accessibility:open",
   globalVoiceGetInputMonitoring: "joko:global-voice:input-monitoring:get",
   globalVoiceOpenInputMonitoring: "joko:global-voice:input-monitoring:open",
+  dedicatedHardwareGetState: "joko:hardware-input:state:get",
+  dedicatedHardwareSetSettings: "joko:hardware-input:settings:set",
+  dedicatedHardwareResetSettings: "joko:hardware-input:settings:reset",
+  dedicatedHardwareProbe: "joko:hardware-input:probe",
+  dedicatedHardwareRecoverKeymap: "joko:hardware-input:keymap:recover",
+  dedicatedHardwareOpenInputSettings: "joko:hardware-input:input-settings:open",
+  dedicatedHardwarePublishTasks: "joko:hardware-input:tasks:publish",
+  dedicatedHardwareAcknowledgeTaskFocus: "joko:hardware-input:task-focus:acknowledge",
+  dedicatedHardwareSetPreview: "joko:hardware-input:preview:set",
+  dedicatedHardwareStateChanged: "joko:hardware-input:state:changed",
+  dedicatedHardwareAction: "joko:hardware-input:action",
+  dedicatedHardwarePreviewInput: "joko:hardware-input:preview:input",
   chooseFiles: "joko:files:choose",
   choosePortableSessionFile: "joko:portable-session:choose",
   deepLinkTakePending: "joko:deep-link:take-pending",
+  deepLinkAcknowledge: "joko:deep-link:acknowledge",
   deepLinkNavigate: "joko:deep-link:navigate",
   saveFile: "joko:files:save",
   copyFile: "joko:files:copy",
@@ -420,10 +444,6 @@ function plainRecordWithKeys(value: unknown, keys: readonly string[]): value is 
   return actual.length === keys.length && keys.every((key) => Object.prototype.hasOwnProperty.call(value, key));
 }
 
-export interface DesktopRuntimeProcessMonitorOpenResult {
-  readonly focusedExisting: boolean;
-}
-
 export function isDesktopApplicationMenuCommand(value: unknown): value is DesktopApplicationMenuCommand {
   return value === "open-about"
     || value === "new-session"
@@ -473,6 +493,29 @@ export type DesktopDeepLinkNavigation =
   | { readonly kind: "settings"; readonly section: DesktopDeepLinkSettingsSection }
   | { readonly kind: "portable"; readonly file?: DesktopFile };
 
+export interface DesktopDeepLinkDelivery {
+  readonly documentOccurrence: string;
+  readonly deliveryOccurrence: number;
+  readonly navigation: DesktopDeepLinkNavigation;
+}
+
+export interface DesktopDeepLinkAcknowledgement {
+  readonly documentOccurrence: string;
+  readonly deliveryOccurrence: number;
+}
+
+export function requireCurrentDesktopMainDocumentOccurrence(
+  captured: unknown,
+  current: string | undefined
+): string {
+  if (!isDesktopMainDocumentOccurrence(captured)
+    || !isDesktopMainDocumentOccurrence(current)
+    || captured !== current) {
+    throw new Error("Desktop IPC did not originate from the current main application Document occurrence.");
+  }
+  return captured;
+}
+
 export interface DesktopSaveFileRequest {
   readonly name: string;
   readonly mediaType: string;
@@ -482,12 +525,21 @@ export interface DesktopSaveFileRequest {
 export interface DesktopNotification {
   readonly title: string;
   readonly body: string;
-  readonly sessionId?: string;
+  readonly navigation?: {
+    readonly kind: "session";
+    readonly profileId: string;
+    readonly sessionId: string;
+  };
 }
 
 export interface DesktopAttentionKey {
   readonly ownerId: string;
   readonly sessionId: string;
+}
+
+function isDesktopMainDocumentOccurrence(value: unknown): value is string {
+  return typeof value === "string" && value.length >= 1 && value.length <= 256
+    && value.trim() === value && !/[\u0000-\u001f\u007f]/u.test(value);
 }
 
 export type DesktopNativeTaskStatusPhase = "running" | "interaction" | "completed" | "error";
@@ -619,6 +671,22 @@ export interface DesktopWindowInteractionSettings {
   readonly swallowActivationClick: boolean;
 }
 
+export type {
+  DesktopRuntimeProcessMetric,
+  DesktopRuntimeProcessMonitorAction,
+  DesktopRuntimeProcessMonitorBackend,
+  DesktopRuntimeProcessMonitorOpenResult,
+  DesktopRuntimeProcessMonitorOwner,
+  DesktopRuntimeProcessMonitorProcess,
+  DesktopRuntimeProcessMonitorRequest,
+  DesktopRuntimeProcessMonitorResponse,
+  DesktopRuntimeProcessMonitorResult,
+  DesktopRuntimeProcessMonitorSession,
+  DesktopRuntimeProcessMonitorSnapshot,
+  DesktopRuntimeProcessRole,
+  DesktopRuntimeProcessSample
+} from "./runtime-process-monitor.js";
+
 export interface DesktopCopyFileRequest {
   readonly requestId: string;
   readonly file: DesktopFile;
@@ -684,11 +752,13 @@ export type DesktopGlobalVoiceShortcutResult =
   | { readonly accepted: true; readonly activation: "hold" | "toggle" }
   | { readonly accepted: false; readonly reason: "unsupported" | "in-use" | "permission" };
 
+export type DesktopGlobalVoiceGeneration = string;
+
 export type DesktopGlobalVoiceCommand =
-  | { readonly type: "start" }
-  | { readonly type: "submit" }
-  | { readonly type: "cancel" }
-  | { readonly type: "retry" };
+  | { readonly type: "start"; readonly generation: DesktopGlobalVoiceGeneration }
+  | { readonly type: "submit"; readonly generation: DesktopGlobalVoiceGeneration }
+  | { readonly type: "cancel"; readonly generation: DesktopGlobalVoiceGeneration }
+  | { readonly type: "retry"; readonly generation: DesktopGlobalVoiceGeneration };
 
 export type DesktopGlobalVoiceErrorKind =
   | "unsupported"
@@ -699,14 +769,110 @@ export type DesktopGlobalVoiceErrorKind =
   | "insertion";
 
 export type DesktopGlobalVoiceStatus =
-  | { readonly state: "idle" }
-  | { readonly state: "starting" }
-  | { readonly state: "listening"; readonly transcript: string }
-  | { readonly state: "submitting"; readonly transcript: string }
-  | { readonly state: "error"; readonly errorKind: DesktopGlobalVoiceErrorKind };
+  | { readonly state: "idle"; readonly generation: DesktopGlobalVoiceGeneration }
+  | { readonly state: "starting"; readonly generation: DesktopGlobalVoiceGeneration }
+  | {
+    readonly state: "listening";
+    readonly generation: DesktopGlobalVoiceGeneration;
+    readonly transcript: string;
+  }
+  | {
+    readonly state: "submitting";
+    readonly generation: DesktopGlobalVoiceGeneration;
+    readonly transcript: string;
+  }
+  | {
+    readonly state: "error";
+    readonly generation: DesktopGlobalVoiceGeneration;
+    readonly errorKind: DesktopGlobalVoiceErrorKind;
+  };
 
 export interface DesktopGlobalVoiceCommitRequest {
+  readonly generation: DesktopGlobalVoiceGeneration;
   readonly text: string;
+}
+
+function hasExactGlobalVoiceKeys(
+  value: Record<string, unknown>,
+  keys: readonly string[]
+): boolean {
+  const actual = Object.keys(value);
+  return actual.length === keys.length && keys.every((key) => Object.hasOwn(value, key));
+}
+
+function isExactGlobalVoiceRecord(
+  value: unknown,
+  keys: readonly string[]
+): value is Record<string, unknown> {
+  return typeof value === "object"
+    && value !== null
+    && !Array.isArray(value)
+    && hasExactGlobalVoiceKeys(value as Record<string, unknown>, keys);
+}
+
+function isDesktopGlobalVoiceErrorKind(value: unknown): value is DesktopGlobalVoiceErrorKind {
+  return value === "unsupported"
+    || value === "permission"
+    || value === "microphone"
+    || value === "service"
+    || value === "empty"
+    || value === "insertion";
+}
+
+function invalidGlobalVoiceProtocol(): TypeError {
+  return new TypeError("Global voice protocol value is invalid.");
+}
+
+export function isDesktopGlobalVoiceGeneration(value: unknown, allowIdle = false): value is string {
+  if (typeof value !== "string" || value.length === 0 || value.length > 16
+    || !/^(?:0|[1-9][0-9]*)$/u.test(value)) return false;
+  if (!allowIdle && value === "0") return false;
+  return BigInt(value) <= BigInt(Number.MAX_SAFE_INTEGER);
+}
+
+export function parseDesktopGlobalVoiceCommand(value: unknown): DesktopGlobalVoiceCommand {
+  if (!isExactGlobalVoiceRecord(value, ["type", "generation"])) throw invalidGlobalVoiceProtocol();
+  const type = value.type;
+  if ((type !== "start" && type !== "submit" && type !== "cancel" && type !== "retry")
+    || !isDesktopGlobalVoiceGeneration(value.generation)) throw invalidGlobalVoiceProtocol();
+  return Object.freeze({ type, generation: value.generation });
+}
+
+export function parseDesktopGlobalVoiceStatus(value: unknown): DesktopGlobalVoiceStatus {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) throw invalidGlobalVoiceProtocol();
+  const candidate = value as Record<string, unknown>;
+  const state = candidate["state"];
+  const generation = candidate["generation"];
+  if (!isDesktopGlobalVoiceGeneration(generation, true)) throw invalidGlobalVoiceProtocol();
+  if (generation === "0" && state !== "idle") throw invalidGlobalVoiceProtocol();
+  if ((state === "idle" || state === "starting")
+    && hasExactGlobalVoiceKeys(candidate, ["state", "generation"])) {
+    return Object.freeze({ state, generation });
+  }
+  if ((state === "listening" || state === "submitting")
+    && hasExactGlobalVoiceKeys(candidate, ["state", "generation", "transcript"])
+    && typeof candidate["transcript"] === "string"
+    && candidate["transcript"].length <= 4_096
+    && !/\u0000/u.test(candidate["transcript"])) {
+    return Object.freeze({ state, generation, transcript: candidate["transcript"] });
+  }
+  const errorKind = candidate["errorKind"];
+  if (state === "error"
+    && hasExactGlobalVoiceKeys(candidate, ["state", "generation", "errorKind"])
+    && isDesktopGlobalVoiceErrorKind(errorKind)) {
+    return Object.freeze({ state, generation, errorKind });
+  }
+  throw invalidGlobalVoiceProtocol();
+}
+
+export function parseDesktopGlobalVoiceCommitRequest(value: unknown): DesktopGlobalVoiceCommitRequest {
+  if (!isExactGlobalVoiceRecord(value, ["generation", "text"])
+    || !isDesktopGlobalVoiceGeneration(value.generation)
+    || typeof value.text !== "string"
+    || value.text.length === 0
+    || value.text.length > 64 * 1024
+    || /\u0000/u.test(value.text)) throw invalidGlobalVoiceProtocol();
+  return Object.freeze({ generation: value.generation, text: value.text });
 }
 
 export interface DesktopGlobalVoiceAccessibilitySnapshot {

@@ -39,6 +39,53 @@ afterEach(async () => {
 });
 
 describe("CodexBackendAdapter", () => {
+  it("projects the shared local app-server as a read-only control-plane process", async () => {
+    const fake = new FakeCodexAppServer();
+    const inspectProcessUsage = vi.fn(async () => [{
+      ownerToken: "10000000-0000-4000-8000-000000000001",
+      pid: 91,
+      cpuPercent: 4.5,
+      memoryKb: 8_192,
+      processCount: 2
+    }]);
+    const host = new AppServerHost({
+      transportFactory: () => {
+        const transport = fake.createTransport();
+        Object.defineProperties(transport, {
+          processInspectionSupported: { value: true },
+          inspectProcessUsage: { value: inspectProcessUsage }
+        });
+        return transport;
+      }
+    });
+    const adapter = new CodexBackendAdapter({
+      id: "codex-test",
+      instanceGeneration: 7,
+      host,
+      now: () => 1_000
+    });
+    cleanups.push(async () => {
+      await adapter.dispose();
+      await host.shutdown();
+    });
+
+    const descriptor = await adapter.describe();
+    expect(descriptor.capabilities.get("runtime.process_usage")?.supported).toBe(true);
+    expect(descriptor.capabilities.get("runtime.process_terminate")?.supported).toBe(false);
+    await expect(adapter.getRuntimeProcessUsage()).resolves.toEqual({
+      capturedAt: 1_000,
+      processes: [{
+        role: "control-plane",
+        pid: 91,
+        cpuPercent: 4.5,
+        memoryKb: 8_192,
+        processCount: 2,
+        terminable: false
+      }]
+    });
+    expect(inspectProcessUsage).toHaveBeenCalledOnce();
+  });
+
   it("keeps managed routes on the original thread, authorizes only the active operation, and adopts revisions before new input", async () => {
     let revision = "1";
     let enabled = true;
@@ -1099,8 +1146,16 @@ describe("CodexBackendAdapter", () => {
       placement: "dialogue"
     });
 
-    const first = await adapter.bindCatalogSession(entry, 3);
-    const second = await adapter.bindCatalogSession(entry, 3);
+    let claimCount = 0;
+    const claim = vi.fn(async (value: { readonly binding: NativeSessionBinding; readonly recoveryReference: string }) => {
+      claimCount += 1;
+      expect(value.binding.nativeSessionId).toBe(fixture.nativeSessionId);
+      if (claimCount === 1) expect(readCatalogThread(fixture.active, fixture.nativeSessionId)).toBeUndefined();
+      expect(JSON.parse(value.recoveryReference)).toMatchObject({ version: 1 });
+    });
+    const first = await adapter.bindCatalogSession(entry, 3, claim);
+    const second = await adapter.bindCatalogSession(entry, 3, claim);
+    expect(claim).toHaveBeenCalledTimes(2);
     expect(second).toEqual(first);
     expect(first.nativeSessionId).toBe(fixture.nativeSessionId);
     expect(first.opaqueRef).not.toBe(entry.nativeReference);
@@ -1119,6 +1174,32 @@ describe("CodexBackendAdapter", () => {
     expect(rescanned.entries[0]?.nativeReference).toBe(first.opaqueRef);
   });
 
+  it("classifies a claimed cross-profile placement without repeating or creating native state", async () => {
+    const fixture = await catalogProfileFixture("77777777-7777-4777-8777-777777777777", false);
+    const adapter = catalogOnlyAdapter(fixture.active, fixture.source);
+    cleanups.push(() => adapter.dispose());
+    const entry = (await adapter.scanNativeSessionCatalog()).entries[0]!;
+    let claimed: { readonly binding: NativeSessionBinding; readonly recoveryReference: string } | undefined;
+    await expect(adapter.bindCatalogSession(entry, 2, async (value) => {
+      claimed = value;
+      throw new Error("The durable claim was rejected.");
+    })).rejects.toThrow("The durable claim was rejected.");
+    if (claimed === undefined) throw new Error("Expected a pre-effect claim.");
+    expect(readCatalogThread(fixture.active, fixture.nativeSessionId)).toBeUndefined();
+    expect(await adapter.inspectCatalogSessionMaterialization(claimed.binding, claimed.recoveryReference))
+      .toBe("absent");
+    const binding = await adapter.bindCatalogSession(entry, 2, async () => undefined);
+    expect(binding).toEqual(claimed.binding);
+    expect(await adapter.inspectCatalogSessionMaterialization(binding, claimed.recoveryReference))
+      .toBe("present");
+    const row = readCatalogThread(fixture.active, fixture.nativeSessionId);
+    await writeFile(String(row?.["rollout_path"]), "external replacement\n", "utf8");
+    expect(await adapter.inspectCatalogSessionMaterialization(binding, claimed.recoveryReference))
+      .toBe("unknown");
+    expect(await adapter.inspectCatalogSessionMaterialization({ ...binding, nativeSessionId: "other" }, claimed.recoveryReference))
+      .toBe("unknown");
+  });
+
   it("fails closed when an external rollout changes after scanning", async () => {
     const fixture = await catalogProfileFixture("22222222-2222-4222-8222-222222222222", false);
     const adapter = catalogOnlyAdapter(fixture.active, fixture.source);
@@ -1127,7 +1208,7 @@ describe("CodexBackendAdapter", () => {
 
     await writeFile(fixture.sourceRollout, `${fixture.rolloutContent}changed\n`, "utf8");
 
-    await expect(adapter.bindCatalogSession(entry, 2)).rejects.toMatchObject({
+    await expect(adapter.bindCatalogSession(entry, 2, async () => undefined)).rejects.toMatchObject({
       publicError: { code: "CODEX_CATALOG_SOURCE_CHANGED" }
     });
   });
@@ -1166,7 +1247,7 @@ describe("CodexBackendAdapter", () => {
       }
 
       await expect(adapter.scanNativeSessionCatalog()).resolves.toMatchObject({ entries: [{}] });
-      await expect(adapter.bindCatalogSession(entry, 2)).rejects.toMatchObject({
+      await expect(adapter.bindCatalogSession(entry, 2, async () => undefined)).rejects.toMatchObject({
         publicError: { code: "CODEX_CATALOG_SOURCE_CHANGED" }
       });
     }
@@ -1189,7 +1270,7 @@ describe("CodexBackendAdapter", () => {
       modifiedAt: 2_000
     });
 
-    await expect(adapter.bindCatalogSession(entry, 2)).rejects.toMatchObject({
+    await expect(adapter.bindCatalogSession(entry, 2, async () => undefined)).rejects.toMatchObject({
       publicError: { code: "CODEX_CATALOG_TARGET_CONFLICT" }
     });
     await expect(readFile(conflictingRollout, "utf8")).resolves.toBe("conflict\n");
@@ -1212,7 +1293,7 @@ describe("CodexBackendAdapter", () => {
     }
     if (!linked) return;
     try {
-      await expect(adapter.bindCatalogSession(entry, 2)).rejects.toMatchObject({
+      await expect(adapter.bindCatalogSession(entry, 2, async () => undefined)).rejects.toMatchObject({
         publicError: { code: "CODEX_CATALOG_TARGET_CONFLICT" }
       });
       await expect(readdir(outside)).resolves.toEqual([]);
@@ -1239,7 +1320,7 @@ describe("CodexBackendAdapter", () => {
       database.close();
     }
 
-    await expect(adapter.bindCatalogSession(entry, 2)).rejects.toMatchObject({
+    await expect(adapter.bindCatalogSession(entry, 2, async () => undefined)).rejects.toMatchObject({
       publicError: { code: "CODEX_CATALOG_MATERIALIZATION_UNAVAILABLE" }
     });
     const published = await readdir(join(fixture.active, "sessions", "catalog-imports"), {
@@ -1859,6 +1940,42 @@ describe("CodexBackendAdapter", () => {
     expect(setup.remoteFake.threads.has(nativeSessionId)).toBe(true);
   });
 
+  it("validates a canonical Windows device-peer Target and fences same-name SSH hosts by source Target", async () => {
+    const peerBinding: NonNullable<TargetDescriptor["remoteWorkspace"]> = {
+      kind: "device_peer",
+      controllerDeviceId: "controller-device",
+      targetDeviceId: "windows-device",
+      workspaceRoot: "C:\\Joko\\Workspace"
+    };
+    const peer = await createRemoteSetup({
+      targetWorkspaceRoot: peerBinding.workspaceRoot,
+      remoteWorkspace: peerBinding
+    });
+    await expect(peer.adapter.validateTarget(peer.target)).resolves.toBeUndefined();
+    expect(peer.resolveRemote).toHaveBeenCalledWith(peer.target, undefined);
+    await expect(peer.adapter.validateTarget({ ...peer.target, workspaceRoot: "C:/Joko/Workspace" }))
+      .rejects.toMatchObject({ publicError: { code: "CODEX_REMOTE_TARGET_PATH_INVALID" } });
+
+    const ssh = await createRemoteSetup();
+    const nativeSessionId = ssh.remoteFake.seedThread(ssh.target.remoteWorkspace!.workspaceRoot);
+    const candidate = (await ssh.adapter.listNativeSessions(ssh.target))[0]!;
+    const binding = await ssh.adapter.resolveNativeSessionReference(candidate.nativeReference, ssh.target, 1);
+    const bound = context(ssh.target, [], { binding, backendInstanceGeneration: 7 });
+    await ssh.adapter.resumeSession(binding, bound);
+    const sshWorkspace = ssh.target.remoteWorkspace;
+    if (sshWorkspace?.kind !== "ssh") throw new Error("Expected the remote Codex fixture to use an SSH workspace.");
+    const reboundTarget: TargetDescriptor = {
+      ...ssh.target,
+      remoteWorkspace: { ...sshWorkspace, hostTargetId: "other-source-target" }
+    };
+    await expect(ssh.adapter.send(prompt("must not cross source Target authority"), {
+      ...bound,
+      target: reboundTarget,
+      operationId: "cross-source-host-name"
+    })).rejects.toMatchObject({ publicError: { code: "CODEX_REMOTE_TARGET_UNAVAILABLE" } });
+    expect(ssh.remoteFake.threads.get(nativeSessionId)?.turns).toHaveLength(0);
+  });
+
   it("never resends uncertain remote input and rejects authority drift at the final pre-write fence", async () => {
     const setup = await createRemoteSetup();
     const nativeSessionId = setup.remoteFake.seedThread("/srv/joko-project");
@@ -2406,6 +2523,21 @@ describe("CodexBackendAdapter", () => {
       .rejects.toMatchObject({ publicError: { code: "CODEX_NATIVE_REFERENCE_INVALID", stateMayHaveChanged: false } });
     expect(setup.fake.transport!.requests.some((entry) => entry.method === "thread/delete")).toBe(false);
     expect(otherProfile.fake.transport?.requests.some((entry) => entry.method === "thread/delete") ?? false).toBe(false);
+  });
+
+  it("reads an exact previous thread without treating an unmaterialized thread as deleted", async () => {
+    const setup = await createSetup();
+    const binding = await setup.adapter.createSession(
+      sessionInput(setup.target), context(setup.target, [], { backendInstanceGeneration: 7 })
+    );
+    const bound = context(setup.target, [], { binding, backendInstanceGeneration: 7 });
+    expect(await setup.adapter.inspectNativeSessionDeletion(binding, bound)).toBe("present");
+    expect(await setup.adapter.inspectNativeSessionDeletion(binding, {
+      ...bound, binding: { ...binding, generation: binding.generation + 1 }
+    })).toBe("unknown");
+    setup.fake.threads.delete(binding.nativeSessionId!);
+    expect(await setup.adapter.inspectNativeSessionDeletion(binding, bound)).toBe("unknown");
+    expect(setup.fake.transport?.requests.filter((entry) => entry.method === "thread/delete")).toEqual([]);
   });
 
   it("keeps the steer target selected at entry when native turns change before the first continuation", async () => {
@@ -4593,6 +4725,8 @@ async function createSmartAuthenticationSetup(includeNativeRoute: boolean) {
 async function createRemoteSetup(options: {
   readonly openMcpBridge?: CodexRemoteRuntime["openMcpBridge"];
   readonly resolveNativeMemoryEnabled?: CodexAdapterOptions["resolveNativeMemoryEnabled"];
+  readonly targetWorkspaceRoot?: string;
+  readonly remoteWorkspace?: NonNullable<TargetDescriptor["remoteWorkspace"]>;
 } = {}) {
   const serviceRoot = await realpath(await mkdtemp(join(tmpdir(), "joko-codex-remote-target-")));
   const localFake = new FakeCodexAppServer();
@@ -4600,15 +4734,27 @@ async function createRemoteSetup(options: {
   const localHost = new AppServerHost({ transportFactory: () => localFake.createTransport() });
   const remoteHost = new AppServerHost({ transportFactory: () => remoteFake.createTransport() });
   const profileKey = "a".repeat(64);
+  const targetWorkspaceRoot = options.targetWorkspaceRoot ?? "/srv/joko-project";
+  const remoteWorkspace = options.remoteWorkspace ?? {
+    kind: "ssh" as const,
+    hostTargetId: "target-codex",
+    hostId: "remote-host",
+    workspaceRoot: targetWorkspaceRoot
+  };
   let current = true;
-  const resolveRemote = vi.fn(async () => ({
-    host: remoteHost,
-    workspaceRoot: "/srv/joko-project",
-    profileKey,
-    executionDomain: "ssh-codex-profile-fixture",
-    assertCurrent: () => { if (!current) throw new Error("remote authority changed"); },
-    ...(options.openMcpBridge === undefined ? {} : { openMcpBridge: options.openMcpBridge })
-  }));
+  const resolveRemote = vi.fn(async (selected: TargetDescriptor) => {
+    if (JSON.stringify(selected.remoteWorkspace) !== JSON.stringify(remoteWorkspace)) {
+      throw new Error("remote binding changed");
+    }
+    return {
+      host: remoteHost,
+      workspaceRoot: targetWorkspaceRoot,
+      profileKey,
+      executionDomain: "ssh-codex-profile-fixture",
+      assertCurrent: () => { if (!current) throw new Error("remote authority changed"); },
+      ...(options.openMcpBridge === undefined ? {} : { openMcpBridge: options.openMcpBridge })
+    };
+  });
   const adapter = new CodexBackendAdapter({
     id: "codex-test",
     instanceGeneration: 7,
@@ -4629,7 +4775,7 @@ async function createRemoteSetup(options: {
     workspaceRoot: serviceRoot,
     managed: false,
     trusted: true,
-    remoteWorkspace: { hostTargetId: "target-codex", hostId: "remote-host", workspaceRoot: "/srv/joko-project" }
+    remoteWorkspace
   };
   cleanups.push(async () => {
     await adapter.dispose();

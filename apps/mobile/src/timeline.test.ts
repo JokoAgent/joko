@@ -1,5 +1,5 @@
 import { create } from "@bufbuild/protobuf";
-import { EventSchema, MessageRole } from "@joko/contracts";
+import { EventSchema, MessageRole, ToolCallState } from "@joko/contracts";
 import { describe, expect, it } from "vitest";
 import { timelineRows } from "./timeline";
 
@@ -75,5 +75,104 @@ describe("mobile Timeline quote source", () => {
       { contentIndex: 1, title: "Large image" }
     ]);
     expect(row?.artifacts?.every((artifact) => artifact.previewKind === undefined)).toBe(true);
+  });
+});
+
+const privateToolName = "mcp__joko_partners__send_private_message";
+const privateResult = {
+  thread_id: "thread-one",
+  message_id: "message-one",
+  target_partner: { id: "partner-two", display_name: "Nova", avatar: "orbit", status: "active", ready: true },
+  delivery_status: "delivered",
+  remaining_messages: 11,
+  conversation_ended: false
+};
+
+function toolStarted(name = privateToolName, input: unknown = {
+  target_partner_id: "partner-two", message: "Please verify the recovery boundary."
+}) {
+  return create(EventSchema, {
+    eventId: "tool-start",
+    identity: { sessionId: "session-one" },
+    cursor: { generation: 1n, sequence: 1n },
+    payload: { kind: { case: "toolCallStarted", value: { toolCall: {
+      toolCallId: "call-one", toolId: name, sessionId: "session-one", runId: "run-one", attemptId: "attempt-one",
+      state: ToolCallState.RUNNING,
+      arguments: [{ fieldPath: "$", value: { case: "text", value: JSON.stringify(input) } }]
+    } } } }
+  });
+}
+
+function toolCompleted(options: {
+  name?: string;
+  result?: unknown;
+  state?: ToolCallState;
+  providerId?: string;
+  truncated?: boolean;
+  parts?: { content: { case: "text"; value: string } }[];
+} = {}) {
+  return create(EventSchema, {
+    eventId: "tool-completed",
+    identity: { sessionId: "session-one" },
+    cursor: { generation: 1n, sequence: 2n },
+    payload: { kind: { case: "toolCallCompleted", value: { toolCall: {
+      toolCallId: "call-one", toolId: options.name ?? privateToolName,
+      toolProviderId: options.providerId ?? "",
+      sessionId: "session-one", runId: "run-one", attemptId: "attempt-one",
+      state: options.state ?? ToolCallState.SUCCEEDED,
+      result: { parts: options.parts ?? [{ content: { case: "text", value: JSON.stringify(options.result ?? privateResult) } }],
+        truncated: options.truncated ?? false }
+    } } } }
+  });
+}
+
+describe("mobile Partner private message Timeline preview", () => {
+  it("projects only a successful current Partner tool result and uses matching call input for optional preview", () => {
+    const rows = timelineRows([toolCompleted(), toolStarted()]);
+    expect(rows).toHaveLength(2);
+    expect(rows[1]).toMatchObject({ kind: "tool", completed: true,
+      partnerPrivatePreview: { threadId: "thread-one", targetPartnerId: "partner-two", targetName: "Nova",
+        preview: "Please verify the recovery boundary." } });
+    expect(timelineRows([toolCompleted()])[0]?.partnerPrivatePreview).toEqual({
+      threadId: "thread-one", targetPartnerId: "partner-two", targetName: "Nova"
+    });
+    expect(timelineRows([toolStarted(privateToolName, {
+      target_partner_id: "partner-three", message: "Different target"
+    }), toolCompleted()])[1]?.partnerPrivatePreview).toEqual({
+      threadId: "thread-one", targetPartnerId: "partner-two", targetName: "Nova"
+    });
+  });
+
+  it("recognizes the exact owned provider alias and leaves foreign or failed calls generic", () => {
+    const ownedAlias = "mcp__joko_28e1bfbb33986d6789e0c720__send_private_message";
+    expect(timelineRows([toolCompleted({ name: ownedAlias })])[0]?.partnerPrivatePreview?.threadId)
+      .toBe("thread-one");
+    for (const options of [
+      { name: "mcp__other__send_private_message" },
+      { name: "send_private_message" },
+      { name: "mcp__joko_000000000000000000000000__send_private_message" },
+      { providerId: "other" },
+      { state: ToolCallState.FAILED }
+    ]) {
+      const row = timelineRows([toolCompleted(options)])[0];
+      expect(row).toMatchObject({ kind: "tool", completed: true });
+      expect(row?.partnerPrivatePreview).toBeUndefined();
+    }
+  });
+
+  it("keeps malformed or incomplete result envelopes as generic tool rows", () => {
+    for (const options of [
+      { result: { ...privateResult, target_partner: { ...privateResult.target_partner, id: "bad id" } } },
+      { result: { ...privateResult, target_partner: { ...privateResult.target_partner, display_name: "\u202eNova" } } },
+      { result: { ...privateResult, thread_id: "" } },
+      { result: { ...privateResult, delivery_status: "failed" } },
+      { result: { ...privateResult, extra: "unexpected" } },
+      { truncated: true },
+      { parts: [{ content: { case: "text" as const, value: "not JSON" } }] }
+    ]) {
+      const row = timelineRows([toolCompleted(options)])[0];
+      expect(row).toMatchObject({ kind: "tool", completed: true });
+      expect(row?.partnerPrivatePreview).toBeUndefined();
+    }
   });
 });

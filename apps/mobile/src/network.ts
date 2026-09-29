@@ -3,7 +3,7 @@ import { createConnectTransport } from "@connectrpc/connect-web";
 import {
   ArtifactKind, ArtifactService, BlobDisposition, ConnectionService, DeviceKind, EventService, FileKind,
   MobilePushEnvironment as WireMobilePushEnvironment, MobilePushLocale as WireMobilePushLocale,
-  MobilePushProvider, OperationService, OperationState,
+  MobilePushProvider, OperationService, OperationState, PartnerService,
   ResourceKind, SchedulerService, SessionService, TargetService, VoiceInputService,
   VoiceInputDictionaryEntrySource, VoiceInputDictionaryLearningActionType,
   VoiceInputDictionaryLearningConfidence, VoiceInputDictionaryTermType,
@@ -15,7 +15,7 @@ import {
   type Event, type EventCursor, type FilePreview, type FileRevision, type Operation, type OperationMutation,
   type NativeSessionTree, type PendingBlobUpload, type RuntimeCommand, type Schedule, type ScheduleRunHistory,
   type SchedulerRuntimeSnapshot, type SessionMessageSearchMatch, type SessionResource, type Snapshot, type Target,
-  type WorkspaceEntry, type WorkspaceFileChange,
+  type WorkspaceEntry, type WorkspaceFileChange, type ListPartnerSessionsResponse,
   type WorkspaceSearchMatch
 } from "@joko/contracts";
 import {
@@ -36,6 +36,12 @@ import {
   type MobileVoiceDictionaryLearningAction
 } from "./mobile-voice-dictionary";
 import type { MobileVoiceRefinementContext } from "./mobile-voice-input";
+import {
+  projectMobilePartners, projectMobilePrivateDetail, projectMobilePrivateReadResponse,
+  projectMobilePrivateThreads, validMobilePartnerId,
+  type MobilePartner, type MobilePrivateDetail, type MobilePrivateReadState,
+  type MobilePrivateThread
+} from "./mobile-partner-private";
 
 export interface PairedCredential {
   readonly profileId: string;
@@ -95,6 +101,12 @@ export interface MobileNetwork {
   requestPairing(origin: string, deviceName: string, platform: string, signal?: AbortSignal): Promise<{ identity: NodeIdentity; challengeId: string }>;
   completePairing(origin: string, challengeId: string, code: string, deviceName: string, platform: string, signal?: AbortSignal): Promise<{ credential: PairedCredential; identity: NodeIdentity }>;
   readOwner(credential: PairedCredential, signal?: AbortSignal): Promise<{ connection: Connection; device: Device; snapshot: Snapshot }>;
+  listPartners(credential: PairedCredential, signal?: AbortSignal): Promise<readonly MobilePartner[]>;
+  listPartnerSessions(credential: PairedCredential, partnerId: string, signal?: AbortSignal): Promise<ListPartnerSessionsResponse>;
+  listPartnerPrivateThreads(credential: PairedCredential, partnerId: string, signal?: AbortSignal): Promise<readonly MobilePrivateThread[]>;
+  getPartnerPrivateThread(credential: PairedCredential, partnerId: string, threadId: string, signal?: AbortSignal): Promise<MobilePrivateDetail>;
+  markPartnerPrivateThreadRead(credential: PairedCredential, partnerId: string, threadId: string,
+    throughSequence: number, maximumSequence: number, signal?: AbortSignal): Promise<MobilePrivateReadState>;
   getMobilePushCapability(origin: string, signal?: AbortSignal): Promise<MobilePushCapabilityResult>;
   registerMobilePush(credential: PairedCredential, input: MobilePushRegistrationInput,
     signal?: AbortSignal): Promise<MobilePushRegistrationResult>;
@@ -1010,6 +1022,40 @@ export const mobileNetwork: MobileNetwork = {
     ]);
     if (!connection.connection || !device.device || !snapshot.snapshot) throw new Error("The Joko node returned an incomplete owner snapshot.");
     return { connection: connection.connection, device: device.device, snapshot: snapshot.snapshot };
+  },
+  async listPartners(credential, signal) {
+    const response = await createClient(PartnerService, transport(credential.origin, credential.authKey))
+      .listPartners({}, options(signal));
+    return projectMobilePartners(response);
+  },
+  async listPartnerSessions(credential, partnerId, signal) {
+    if (!validMobilePartnerId(partnerId)) throw new Error("A valid Partner is required.");
+    return createClient(PartnerService, transport(credential.origin, credential.authKey))
+      .listPartnerSessions({ partnerId }, options(signal));
+  },
+  async listPartnerPrivateThreads(credential, partnerId, signal) {
+    if (!validMobilePartnerId(partnerId)) throw new Error("A valid Partner is required.");
+    const response = await createClient(PartnerService, transport(credential.origin, credential.authKey))
+      .listPartnerPrivateThreads({ partnerId }, options(signal));
+    return projectMobilePrivateThreads(partnerId, response);
+  },
+  async getPartnerPrivateThread(credential, partnerId, threadId, signal) {
+    if (!validMobilePartnerId(partnerId) || !validMobilePartnerId(threadId)) {
+      throw new Error("A valid Partner and private thread are required.");
+    }
+    const response = await createClient(PartnerService, transport(credential.origin, credential.authKey))
+      .getPartnerPrivateThread({ partnerId, threadId }, options(signal));
+    return projectMobilePrivateDetail(partnerId, threadId, response);
+  },
+  async markPartnerPrivateThreadRead(credential, partnerId, threadId, throughSequence, maximumSequence, signal) {
+    if (!validMobilePartnerId(partnerId) || !validMobilePartnerId(threadId)
+      || !Number.isSafeInteger(throughSequence) || throughSequence < 1
+      || !Number.isSafeInteger(maximumSequence) || throughSequence > maximumSequence) {
+      throw new Error("A visible private message is required before marking it read.");
+    }
+    const response = await createClient(PartnerService, transport(credential.origin, credential.authKey))
+      .markPartnerPrivateThreadRead({ partnerId, threadId, throughSequence: BigInt(throughSequence) }, options(signal));
+    return projectMobilePrivateReadResponse(partnerId, threadId, response, throughSequence, maximumSequence);
   },
   async getMobilePushCapability(rawOrigin, signal) {
     const origin = normalizeNodeOrigin(rawOrigin);

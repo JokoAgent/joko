@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdir, rm, stat, utimes, writeFile } from "node:fs/promises";
+import { mkdir, rename, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { mkdtemp } from "./test-paths.js";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -47,7 +47,7 @@ describe("ArtifactMaintenance", () => {
       cleanableBytes: 9,
       missingBlobCount: 0
     });
-    const result = await fixture.maintenance.cleanup(scan.token);
+    const result = await completedCleanup(fixture.maintenance, scan.token);
     expect(result).toEqual({
       expiredReferencesDeleted: 1,
       blobsRemoved: 1,
@@ -82,7 +82,7 @@ describe("ArtifactMaintenance", () => {
     });
     expect(JSON.stringify(scan)).not.toContain(fixture.root);
 
-    const result = await fixture.maintenance.cleanup(scan.token);
+    const result = await completedCleanup(fixture.maintenance, scan.token);
     expect(result).toMatchObject({ blobsRemoved: 1, temporaryFilesRemoved: 1, freedBytes: 22 });
     await expect(stat(orphan)).rejects.toMatchObject({ code: "ENOENT" });
     await expect(stat(incoming)).rejects.toMatchObject({ code: "ENOENT" });
@@ -98,19 +98,21 @@ describe("ArtifactMaintenance", () => {
     const scan = await fixture.maintenance.scan();
 
     await writeFile(orphan, "candidate changed");
-    await expect(fixture.maintenance.cleanup(scan.token)).rejects.toThrow(/changed after the scan/u);
+    await expect(fixture.maintenance.beginCleanup(scan.token)).rejects.toThrow(/changed after the scan/u);
     await expect(stat(orphan)).resolves.toMatchObject({ size: 17 });
   });
 
-  it("expires confirmation tokens and consumes them after one cleanup", async () => {
+  it("expires confirmation tokens and returns the same durable job after a lost reply", async () => {
     const fixture = await createFixture(100_000, 1_000);
     const scan = await fixture.maintenance.scan();
     fixture.setNow(scan.expiresAt);
-    await expect(fixture.maintenance.cleanup(scan.token)).rejects.toBeInstanceOf(ArtifactMaintenanceScanExpiredError);
+    await expect(fixture.maintenance.beginCleanup(scan.token)).rejects.toBeInstanceOf(ArtifactMaintenanceScanExpiredError);
 
     const fresh = await fixture.maintenance.scan();
-    await expect(fixture.maintenance.cleanup(fresh.token)).resolves.toMatchObject({ freedBytes: 0 });
-    await expect(fixture.maintenance.cleanup(fresh.token)).rejects.toBeInstanceOf(ArtifactMaintenanceScanExpiredError);
+    await expect(completedCleanup(fixture.maintenance, fresh.token)).resolves.toMatchObject({ freedBytes: 0 });
+    await expect(fixture.maintenance.beginCleanup(fresh.token)).resolves.toMatchObject({
+      maintenanceId: fresh.token, status: "completed"
+    });
   });
 
   it("protects expired references whose content is still present in a client draft", async () => {
@@ -121,7 +123,8 @@ describe("ArtifactMaintenance", () => {
     const scan = await fixture.maintenance.scan([artifact.sha256]);
     expect(scan).toMatchObject({ expiredReferenceCount: 0, protectedReferenceCount: 1, cleanableBytes: 0 });
     await expect(fixture.maintenance.stats([artifact.sha256])).resolves.toMatchObject({ referenceCount: 1, uniqueBlobCount: 1 });
-    await expect(fixture.maintenance.cleanup(scan.token, [artifact.sha256])).resolves.toMatchObject({ expiredReferencesDeleted: 0 });
+    await expect(completedCleanup(fixture.maintenance, scan.token, [artifact.sha256]))
+      .resolves.toMatchObject({ expiredReferencesDeleted: 0 });
     expect(fixture.store.findArtifact(artifact.id)).toBeDefined();
     await expect(stat(artifact.storagePath)).resolves.toMatchObject({ size: 16 });
   });
@@ -140,6 +143,62 @@ describe("ArtifactMaintenance", () => {
       unsafeEntryCount: 1
     });
     await expect(stat(unsafe)).resolves.toMatchObject({ size: 4 });
+  });
+
+  it("fails closed when an unrecognized quarantine entry is present", async () => {
+    const fixture = await createFixture(100_000);
+    const unknown = join(fixture.root, ".maintenance-trash", "unknown-file");
+    await writeFile(unknown, "unverified bytes");
+    const scan = await fixture.maintenance.scan();
+    expect(scan.unsafeEntryCount).toBe(1);
+    await expect(fixture.maintenance.beginCleanup(scan.token)).rejects.toThrow(/changed after the scan/u);
+    await expect(stat(unknown)).resolves.toMatchObject({ size: 16 });
+  });
+
+  it("resumes a claimed quarantine receipt after reopening the file-backed Store", async () => {
+    const fixture = await createFixture(100_000);
+    const bytes = Buffer.from("recover orphan");
+    const digest = createHash("sha256").update(bytes).digest("hex");
+    const orphan = join(fixture.root, "blobs", digest.slice(0, 2), digest.slice(2, 4), digest);
+    await mkdir(dirname(orphan), { recursive: true });
+    await writeFile(orphan, bytes);
+    const { token, quarantine } = await stageQuarantinedCleanup(fixture.maintenance, fixture.store, fixture.root, orphan);
+    fixture.store.close();
+
+    const reopened = new OperationalStore(fixture.store.filePath, { now: () => 100_000 });
+    openStores.push(reopened);
+    const recovered = new ArtifactMaintenance({ store: reopened, rootDirectory: fixture.root,
+      now: () => 100_000, temporaryFileMinimumAgeMs: 60_000 });
+    await recovered.initialize();
+
+    expect(recovered.getCleanup(token)).toMatchObject({ status: "completed", result: { blobsRemoved: 1, freedBytes: bytes.length } });
+    await expect(stat(orphan)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(stat(quarantine)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(recovered.reconcile()).resolves.toMatchObject({ healthy: true, unsafeEntryCount: 0 });
+  });
+
+  it("restores a quarantined blob when a live reference appears before final deletion", async () => {
+    const fixture = await createFixture(100_000);
+    const bytes = Buffer.from("late live reference");
+    const digest = createHash("sha256").update(bytes).digest("hex");
+    const orphan = join(fixture.root, "blobs", digest.slice(0, 2), digest.slice(2, 4), digest);
+    await mkdir(dirname(orphan), { recursive: true });
+    await writeFile(orphan, bytes);
+    const { token, quarantine } = await stageQuarantinedCleanup(fixture.maintenance, fixture.store, fixture.root, orphan);
+    fixture.store.putArtifact({ id: "late-reference", sha256: digest, byteLength: bytes.length,
+      mimeType: "application/octet-stream", storageKey: orphan });
+    fixture.store.close();
+
+    const reopened = new OperationalStore(fixture.store.filePath, { now: () => 100_000 });
+    openStores.push(reopened);
+    const recovered = new ArtifactMaintenance({ store: reopened, rootDirectory: fixture.root,
+      now: () => 100_000, temporaryFileMinimumAgeMs: 60_000 });
+    await recovered.initialize();
+
+    expect(recovered.getCleanup(token)).toMatchObject({ status: "completed", result: { blobsRemoved: 0, skipped: 1 } });
+    expect(reopened.hasLiveArtifactStorageKey(orphan)).toBe(true);
+    await expect(stat(orphan)).resolves.toMatchObject({ size: bytes.length });
+    await expect(stat(quarantine)).rejects.toMatchObject({ code: "ENOENT" });
   });
 
   it("keeps references beyond the first storage page live during maintenance scans", async () => {
@@ -182,13 +241,51 @@ describe("ArtifactMaintenance", () => {
       uniqueBlobCount: 2,
       totalBytes: 19
     });
-    await expect(maintenance.scan()).resolves.toMatchObject({
-      orphanBlobCount: 0,
-      missingBlobCount: 0
-    });
+    await expect(maintenance.reconcile()).resolves.toMatchObject({ orphanBlobCount: 0, missingBlobCount: 0 });
     expect(pageOffsets).toEqual([0, 100_000, 0, 100_000]);
   });
 });
+
+async function stageQuarantinedCleanup(
+  maintenance: ArtifactMaintenance,
+  store: OperationalStore,
+  root: string,
+  orphan: string
+): Promise<{ readonly token: string; readonly quarantine: string }> {
+  const scan = await maintenance.scan();
+  const durable = store.getMaintenanceScan<{ readonly orphanBlobs: readonly { readonly path: string; readonly relativePath: string }[] }>("artifact", scan.token);
+  const identity = durable.payload.orphanBlobs[0];
+  if (identity === undefined) throw new Error("Expected an orphan candidate.");
+  const effectId = createHash("sha256").update(identity.relativePath).digest("hex");
+  const quarantineRelativePath = join(".maintenance-trash", scan.token, effectId);
+  const quarantine = join(root, quarantineRelativePath);
+  store.transaction((transaction) => {
+    transaction.claimMaintenanceScan("artifact", scan.token, 100_000);
+    transaction.createMaintenanceJob({ id: scan.token, kind: "artifact", scanId: scan.token,
+      phase: "quarantining", percent: 10, cancellable: false,
+      payload: { expiredReferencesDeleted: 0 }, createdAt: 100_000,
+      effects: [{ id: effectId, kind: "artifact_blob", state: "claimed",
+        payload: { identity, quarantineRelativePath } }] });
+  });
+  await mkdir(dirname(quarantine), { recursive: true });
+  await rename(orphan, quarantine);
+  return { token: scan.token, quarantine };
+}
+
+async function completedCleanup(
+  maintenance: ArtifactMaintenance,
+  token: string,
+  protectedSha256: readonly string[] = []
+) {
+  await maintenance.beginCleanup(token, protectedSha256);
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    const job = maintenance.getCleanup(token);
+    if (job?.status === "completed" && job.result !== undefined) return job.result;
+    if (job?.status !== "running") throw new Error(`Artifact cleanup failed: ${job?.status ?? "missing"}`);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error("Artifact cleanup did not finish.");
+}
 
 function artifactRecord(id: string, sha256: string, byteLength: number, storageKey: string): ArtifactRecord {
   return {

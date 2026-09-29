@@ -1,14 +1,14 @@
 import { describe, expect, it, vi } from "vitest";
 import {
-  createDefaultPiManagedProcessSupervisor,
+  createDefaultManagedProcessSupervisor,
   parsePosixProcessTable,
   parseWindowsProcessTable,
   terminateFrozenPosixTree,
-  type PiProcessTableRow,
-  type PiProcessTableSnapshot
+  type ProcessTableRow,
+  type ProcessTableSnapshot
 } from "./runtime-process.js";
 
-function row(input: Partial<PiProcessTableRow> & Pick<PiProcessTableRow, "pid" | "ppid">): PiProcessTableRow {
+function row(input: Partial<ProcessTableRow> & Pick<ProcessTableRow, "pid" | "ppid">): ProcessTableRow {
   return {
     pid: input.pid,
     ppid: input.ppid,
@@ -21,7 +21,7 @@ function row(input: Partial<PiProcessTableRow> & Pick<PiProcessTableRow, "pid" |
   };
 }
 
-function snapshot(rows: readonly PiProcessTableRow[]): PiProcessTableSnapshot {
+function snapshot(rows: readonly ProcessTableRow[]): ProcessTableSnapshot {
   const childrenByParent = new Map<number, number[]>();
   for (const process of rows) {
     const children = childrenByParent.get(process.ppid);
@@ -35,7 +35,7 @@ describe("managed runtime process supervision", () => {
   it.runIf(process.platform === "win32")(
     "treats a missing Windows process as confirmed absent for capture and recovery",
     async () => {
-      const supervisor = createDefaultPiManagedProcessSupervisor();
+      const supervisor = createDefaultManagedProcessSupervisor();
       const missingPid = 2_147_483_647;
 
       await expect(supervisor.capture(missingPid)).resolves.toBeUndefined();
@@ -81,7 +81,7 @@ describe("managed runtime process supervision", () => {
       }),
       row({ pid: 900, ppid: 1, cpuPercent: 99, memoryKb: 999 })
     ]);
-    const supervisor = createDefaultPiManagedProcessSupervisor({
+    const supervisor = createDefaultManagedProcessSupervisor({
       platform: "linux",
       captureIdentity: async (pid) => pid === 100 ? "owned-birth" : undefined,
       captureIdentitySync: () => undefined,
@@ -107,7 +107,7 @@ describe("managed runtime process supervision", () => {
       cpuTimeMs: 1_000,
       startIdentity: "birth-a"
     })]);
-    const supervisor = createDefaultPiManagedProcessSupervisor({
+    const supervisor = createDefaultManagedProcessSupervisor({
       platform: "win32",
       now: () => at,
       captureIdentity: async () => "private-fence",
@@ -221,7 +221,7 @@ describe("managed runtime process supervision", () => {
 
   it("rechecks Windows birth identity synchronously before terminating the tree", async () => {
     const killWindowsTree = vi.fn(() => true);
-    const reused = createDefaultPiManagedProcessSupervisor({
+    const reused = createDefaultManagedProcessSupervisor({
       platform: "win32",
       captureIdentity: async () => "replacement-fence",
       captureIdentitySync: () => "replacement-fence",
@@ -233,7 +233,7 @@ describe("managed runtime process supervision", () => {
     expect(killWindowsTree).not.toHaveBeenCalled();
 
     const identities = ["private-fence", "private-fence"];
-    const owned = createDefaultPiManagedProcessSupervisor({
+    const owned = createDefaultManagedProcessSupervisor({
       platform: "win32",
       captureIdentity: async () => undefined,
       captureIdentitySync: () => identities.shift(),

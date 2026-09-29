@@ -18,6 +18,7 @@ import {
   createClaudeSessionStoreSessionAccess,
   createClaudeSessionStoreWorkspaceAccess,
   discardClaudeSessionStoreImport,
+  inspectClaudeSessionStoreSession,
   prepareClaudeSessionStoreDerivation,
   prepareClaudeSessionStoreImport,
   readClaudeSessionStoreOperation,
@@ -37,6 +38,25 @@ afterEach(async () => {
 });
 
 describe("ClaudeDurableSessionStore", () => {
+  it("inspects exact stored deletion without creating a namespace or rebinding its writer", async () => {
+    const fixture = await createFixture();
+    const missing = { workspaceAuthority: "workspace.inspect", sessionId: randomUUID() };
+    expect(inspectClaudeSessionStoreSession(fixture.authority, missing)).toBe("unknown");
+    expect(await readdir(fixture.root)).toEqual([]);
+    const child = await createAdoptedChild(fixture, missing.workspaceAuthority, "project-inspect");
+    const owner = { workspaceAuthority: child.access.workspaceAuthority, sessionId: child.sessionId };
+    const nextAuthority = createClaudeSessionStoreAuthority({
+      rootDirectory: fixture.root, namespace: "test-owner", generation: 2
+    });
+    expect(inspectClaudeSessionStoreSession(nextAuthority, owner)).toBe("present");
+    expect(inspectClaudeSessionStoreSession(nextAuthority, missing)).toBe("absent");
+    expect(claimClaudeSessionStoreSession(fixture.authority, owner).generation).toBe(1);
+    const store = createClaudeDurableSessionStore(fixture.authority, child.access);
+    await store.delete({ projectKey: "project-inspect", sessionId: child.sessionId });
+    store.close();
+    expect(inspectClaudeSessionStoreSession(nextAuthority, owner)).toBe("absent");
+  });
+
   it("constructs exact access discriminants even from untrusted serializable objects", () => {
     const sessionId = randomUUID();
     const session = createClaudeSessionStoreSessionAccess({

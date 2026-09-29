@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -78,6 +78,25 @@ describe("PiSessionStore", () => {
 
     expect(retried).toBe(first);
     expect(await readFile(retried, "utf8")).toContain('"recoverable"');
+  });
+
+  it("classifies an exact keyed native deletion without changing managed files", async () => {
+    const home = await mkdtemp(join(tmpdir(), "joko-pi-trash-inspection-"));
+    const store = new PiSessionStore(home);
+    await store.initialize();
+    const path = join(store.sessionsRoot, "old.jsonl");
+    await writeFile(path, `${JSON.stringify({ type: "session", version: 3, id: "old-native", cwd: home })}\n`);
+    const binding = { opaqueRef: path, nativeSessionId: "old-native", generation: 2 };
+    const recoveryKey = createHash("sha256").update("exact portable replacement").digest("hex");
+    expect(await store.inspectTrashMove(binding, recoveryKey)).toBe("present");
+    expect(await store.inspectTrashMove({ ...binding, nativeSessionId: "different" }, recoveryKey)).toBe("unknown");
+    const trashPath = await store.moveToTrash(path, recoveryKey);
+    expect(await store.inspectTrashMove(binding, recoveryKey)).toBe("absent");
+    await writeFile(path, `${JSON.stringify({ type: "session", version: 3, id: "new-native", cwd: home })}\n`);
+    expect(await store.inspectTrashMove(binding, recoveryKey)).toBe("unknown");
+    await unlink(path);
+    await unlink(trashPath);
+    expect(await store.inspectTrashMove(binding, recoveryKey)).toBe("absent");
   });
 
   it("exports an identity-fenced native Session and imports a workspace-rebound copy", async () => {

@@ -128,3 +128,60 @@ message RetryPortableSessionActivationResponse {
   PortableSessionImportStatus status = 2;
   optional ErrorInfo activation_error = 3;
 }
+
+enum PortableReplacementNativeState {
+  PORTABLE_REPLACEMENT_NATIVE_STATE_UNSPECIFIED = 0;
+  PORTABLE_REPLACEMENT_NATIVE_STATE_PENDING = 1;
+  PORTABLE_REPLACEMENT_NATIVE_STATE_DISPATCHED = 2;
+  PORTABLE_REPLACEMENT_NATIVE_STATE_UNKNOWN = 3;
+  PORTABLE_REPLACEMENT_NATIVE_STATE_COMPLETED = 4;
+}
+
+enum PortableReplacementWorktreeState {
+  PORTABLE_REPLACEMENT_WORKTREE_STATE_UNSPECIFIED = 0;
+  PORTABLE_REPLACEMENT_WORKTREE_STATE_PENDING = 1;
+  PORTABLE_REPLACEMENT_WORKTREE_STATE_COMPLETED = 2;
+}
+
+enum PortableReplacementInspection {
+  PORTABLE_REPLACEMENT_INSPECTION_UNSPECIFIED = 0;
+  PORTABLE_REPLACEMENT_INSPECTION_PRESENT = 1;
+  PORTABLE_REPLACEMENT_INSPECTION_ABSENT = 2;
+  PORTABLE_REPLACEMENT_INSPECTION_UNKNOWN = 3;
+}
+
+message PortableReplacementCleanup {
+  string imported_session_id = 1;
+  PortableReplacementNativeState native_state = 2;
+  PortableReplacementWorktreeState worktree_state = 3;
+  uint64 revision = 4;
+  google.protobuf.Timestamp updated_at = 5;
+}
+
+message GetPortableReplacementCleanupRequest {
+  string imported_session_id = 1;
+}
+
+message GetPortableReplacementCleanupResponse {
+  optional PortableReplacementCleanup cleanup = 1;
+}
+
+message ReconcilePortableReplacementCleanupRequest {
+  string imported_session_id = 1;
+}
+
+message ReconcilePortableReplacementCleanupResponse {
+  PortableReplacementCleanup cleanup = 1;
+  PortableReplacementInspection inspection = 2;
+}
+
+message RetryPortableReplacementCleanupRequest {
+  string imported_session_id = 1;
+  uint64 expected_revision = 2;
+  bool confirm_native_delete = 3;
+}
+
+message RetryPortableReplacementCleanupResponse {
+  PortableReplacementCleanup cleanup = 1;
+  PortableReplacementInspection inspection = 2;
+}

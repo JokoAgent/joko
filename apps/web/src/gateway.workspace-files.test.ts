@@ -760,6 +760,7 @@ function snapshotWithWorkspace(): ReturnType<typeof create<typeof SnapshotSchema
       workspaceId: "workspace-1",
       targetId: "target-1",
       displayName: "Workspace",
+      location: { kind: { case: "serviceNode", value: {} } },
       git: {
         changes: [{
           relativePath: "src/generated",

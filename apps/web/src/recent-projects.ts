@@ -39,13 +39,14 @@ export function subscribeRecentProjectsChange(owner: string, onChange: () => voi
 export function recentProjectForTarget(snapshot: AppSnapshot, targetId: string, at = Date.now()): RecentProject | undefined {
   const target = snapshot.targets.find((candidate) => candidate.id === targetId && !candidate.archived);
   const workspace = snapshot.workspaces.find((candidate) => candidate.id === target?.workspaceId && candidate.targetId === targetId);
-  if (target === undefined || workspace?.kind !== "userProject") return undefined;
+  if (target === undefined || workspace?.kind !== "userProject" || target.remoteWorkspace?.kind === "device_peer") return undefined;
+  const sshWorkspace = target.remoteWorkspace;
   const entry: RecentProject = {
     targetId, workspaceId: workspace.id, name: target.name, serverPath: workspace.serverPath,
-    ...(target.remoteWorkspace === undefined ? {} : {
-      remoteHostTargetId: target.remoteWorkspace.hostTargetId,
-      remoteHostId: target.remoteWorkspace.hostId,
-      remoteWorkspaceRoot: target.remoteWorkspace.workspaceRoot
+    ...(sshWorkspace === undefined ? {} : {
+      remoteHostTargetId: sshWorkspace.hostTargetId,
+      remoteHostId: sshWorkspace.hostId,
+      remoteWorkspaceRoot: sshWorkspace.workspaceRoot
     }),
     lastUsedAt: at
   };
@@ -58,6 +59,7 @@ export function resolveRecentProject(entry: RecentProject, snapshot: AppSnapshot
   const workspace = snapshot.workspaces.find((candidate) => candidate.id === entry.workspaceId
     && candidate.targetId === entry.targetId && candidate.kind === "userProject");
   if (target === undefined || workspace === undefined || normalizePath(workspace.serverPath) !== normalizePath(entry.serverPath)) return undefined;
+  if (target.remoteWorkspace?.kind === "device_peer") return undefined;
   if (target.remoteWorkspace?.hostTargetId !== entry.remoteHostTargetId
     || target.remoteWorkspace?.hostId !== entry.remoteHostId
     || target.remoteWorkspace?.workspaceRoot !== entry.remoteWorkspaceRoot) return undefined;

@@ -48,6 +48,15 @@ export interface OrchestratorConfig {
       readonly topic: string;
     };
   };
+  /** Optional standalone Service-device outbound agent authority. */
+  readonly devicePeerAgent?: {
+    readonly controllerOrigin: string;
+    readonly controllerServerId: string;
+    readonly connectionId: string;
+    readonly deviceId: string;
+    readonly credentialPath: string;
+    readonly stateDirectory: string;
+  };
   readonly corsOrigins: readonly string[];
 }
 
@@ -113,6 +122,7 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): Orches
     throw new Error("JOKO_DESKTOP_RESOURCES_PATH must be an existing absolute directory.");
   }
   const mobilePush = readMobilePushConfig(environment);
+  const devicePeerAgent = readDevicePeerAgentConfig(environment, dataDirectory, allowInsecureLan);
   return {
     host,
     port,
@@ -162,7 +172,58 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): Orches
       nativeH264Path: join(simulatorResources, "native-simulator-h264", "joko-simulator-h264")
     } }),
     ...(mobilePush === undefined ? {} : { mobilePush }),
+    ...(devicePeerAgent === undefined ? {} : { devicePeerAgent }),
     corsOrigins
+  };
+}
+
+function readDevicePeerAgentConfig(
+  environment: NodeJS.ProcessEnv,
+  dataDirectory: string,
+  allowInsecureLan: boolean
+): OrchestratorConfig["devicePeerAgent"] {
+  const values = {
+    controllerOrigin: environment.JOKO_DEVICE_PEER_CONTROLLER_ORIGIN?.trim(),
+    controllerServerId: environment.JOKO_DEVICE_PEER_CONTROLLER_SERVER_ID?.trim(),
+    connectionId: environment.JOKO_DEVICE_PEER_CONNECTION_ID?.trim(),
+    deviceId: environment.JOKO_DEVICE_PEER_DEVICE_ID?.trim()
+  };
+  const configured = Object.values(values).filter((value) => value !== undefined && value !== "");
+  const credentialSetting = environment.JOKO_DEVICE_PEER_AUTH_KEY_FILE?.trim();
+  if (configured.length === 0 && (credentialSetting === undefined || credentialSetting === "")) return undefined;
+  if (configured.length !== Object.keys(values).length) {
+    throw new Error(
+      "JOKO_DEVICE_PEER_CONTROLLER_ORIGIN, JOKO_DEVICE_PEER_CONTROLLER_SERVER_ID, " +
+      "JOKO_DEVICE_PEER_CONNECTION_ID, and JOKO_DEVICE_PEER_DEVICE_ID must be configured together."
+    );
+  }
+  const credentialPath = credentialSetting === undefined || credentialSetting === ""
+    ? resolve(dataDirectory, "device-peer-agent", "auth-key")
+    : credentialSetting;
+  if (!isAbsolute(credentialPath) || resolve(credentialPath) !== credentialPath) {
+    throw new Error("JOKO_DEVICE_PEER_AUTH_KEY_FILE must be a normalized absolute path.");
+  }
+  try {
+    const credentialInfo = lstatSync(credentialPath);
+    const getuid = process.geteuid;
+    if (!credentialInfo.isFile() || credentialInfo.isSymbolicLink()
+      || pathComparisonKey(realpathSync.native(credentialPath)) !== pathComparisonKey(credentialPath)
+      || (process.platform !== "win32" && (credentialInfo.mode & 0o077) !== 0)
+      || (process.platform !== "win32" && getuid !== undefined && credentialInfo.uid !== getuid())) {
+      throw new Error("unsafe");
+    }
+  } catch {
+    // Keep deployment paths out of configuration errors. The Service owner
+    // repeats the check through an open handle, including the Windows ACL.
+    throw new Error("JOKO_DEVICE_PEER_AUTH_KEY_FILE is unavailable or unsafe.");
+  }
+  return {
+    controllerOrigin: validatePeerControllerOrigin(values.controllerOrigin!, allowInsecureLan),
+    controllerServerId: devicePeerIdentifier(values.controllerServerId!, "controller server"),
+    connectionId: devicePeerIdentifier(values.connectionId!, "Connection"),
+    deviceId: devicePeerIdentifier(values.deviceId!, "Device"),
+    credentialPath,
+    stateDirectory: resolve(dataDirectory, "device-peer-agent")
   };
 }
 
@@ -345,6 +406,27 @@ function validateServiceOrigin(
     }
   }
   return origin.origin;
+}
+
+function validatePeerControllerOrigin(value: string, allowInsecureLan: boolean): string {
+  const origin = parseBareOrigin(value, "JOKO_DEVICE_PEER_CONTROLLER_ORIGIN");
+  if (origin.protocol === "http:") {
+    if (!isPrivateLanHost(origin.hostname)) {
+      throw new Error("JOKO_DEVICE_PEER_CONTROLLER_ORIGIN may use HTTP only for a loopback or private-LAN host.");
+    }
+    if (!isLoopbackHost(origin.hostname) && !allowInsecureLan) {
+      throw new Error("Private-LAN Device peer HTTP requires JOKO_ALLOW_INSECURE_LAN=1.");
+    }
+  }
+  return origin.origin;
+}
+
+function devicePeerIdentifier(value: string, label: string): string {
+  if (value.length < 1 || value.length > 256 || value.trim() !== value
+    || /[\u0000-\u001f\u007f]/u.test(value)) {
+    throw new Error(`The Device peer ${label} identity is invalid.`);
+  }
+  return value;
 }
 
 function validateCorsOrigin(value: string, allowInsecureLan: boolean): string {

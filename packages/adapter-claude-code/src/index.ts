@@ -1,6 +1,7 @@
 export {
   ClaudeCodeAdapter,
   CLAUDE_MANAGED_PROVIDER_SUPPORT,
+  claudeWorkspaceAuthority,
   createClaudeCodeAdapter,
   type ClaudeCodeAdapterOptions,
   type ProviderAuthenticationRevocation
@@ -63,6 +64,12 @@ export {
   type ClaudeCodeRuntimeAuthorization
 } from "./oauth-account.js";
 export { loadClaudeRemoteManagerSource } from "./remote-manager-source.js";
+export {
+  claudeNativeRuntimePackageCandidates,
+  locateClaudeNativeRuntime,
+  type ClaudeNativeRuntimeLocation,
+  type ClaudeNativeRuntimeLocatorOptions
+} from "./native-runtime-locator.js";
 export {
   type ClaudeMcpBridgePort,
   type ClaudeMcpRuntimeLease,

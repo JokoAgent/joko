@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { DEFAULT_COLLABORATION_SETTINGS, WorkerHardLimitError } from "@joko/runtime-governance";
-import { OperationalStore, operationBodyHash } from "@joko/store";
+import { OperationalStore, RevisionConflictError, operationBodyHash } from "@joko/store";
 import { FakeBackendAdapter, PI_LIKE_PROFILE } from "@joko/testkit";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -328,6 +328,12 @@ describe("CollaborationGoalManager", () => {
     expect(worker.sessionGeneration).toBe(
       fixture.store.getSession(worker.sessionId!).descriptor.binding.generation
     );
+    const afterWakeTree = fixture.manager.getTree(goal.id);
+    expect(afterWakeTree.workers[0]).toMatchObject({
+      status: "idle",
+      sessionGeneration: worker.sessionGeneration,
+      revision: worker.revision
+    });
 
     const sent = await fixture.manager.sendMessage({
       operationId: "worker-after-wake-send",
@@ -342,6 +348,20 @@ describe("CollaborationGoalManager", () => {
     await vi.waitFor(() => {
       expect(fixture.store.listRuns({ sessionId: worker.sessionId!, activeOnly: true })).toHaveLength(0);
     });
+    expect(fixture.manager.getTree(goal.id).workers[0]).toMatchObject({
+      status: "completed",
+      sessionGeneration: worker.sessionGeneration
+    });
+    await expect(fixture.manager.sendMessage({
+      operationId: "worker-stale-after-wake",
+      goalId: goal.id,
+      workerId: worker.id,
+      callerLeadSessionId: fixture.leadSessionId,
+      expectedWorkerRevision: worker.revision,
+      expectedSessionGeneration: worker.sessionGeneration!,
+      message: "This stale message must not be admitted."
+    })).rejects.toBeInstanceOf(RevisionConflictError);
+    expect(fixture.store.findOperation("worker-stale-after-wake")).toBeUndefined();
 
     worker = fixture.store.getCollaborationWorker(worker.id);
     worker = (await fixture.manager.stopWorker({

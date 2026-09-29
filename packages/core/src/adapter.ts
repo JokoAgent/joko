@@ -342,17 +342,33 @@ export interface RuntimeResource {
  * the service node. Command lines, executable paths, environment values, and
  * native Session references are deliberately not representable here.
  */
-export interface RuntimeProcessUsage {
-  readonly sessionId: SessionId;
-  readonly generation: number;
+interface RuntimeProcessUsageBase {
   readonly pid: number;
   readonly cpuPercent: number;
   readonly memoryKb: number;
   readonly processCount: number;
+}
+
+/** Shared Backend infrastructure with no truthful product Session owner. */
+export interface RuntimeControlPlaneProcessUsage extends RuntimeProcessUsageBase {
+  readonly role: "control-plane";
+  readonly terminable: false;
+  readonly sessionId?: never;
+  readonly generation?: never;
+  readonly processInstanceId?: never;
+}
+
+/** Process root owned by one exact product Session runtime generation. */
+export interface RuntimeTaskHostProcessUsage extends RuntimeProcessUsageBase {
+  readonly role: "task-host";
+  readonly sessionId: SessionId;
+  readonly generation: number;
   readonly terminable: boolean;
   /** Opaque spawn-instance fence. It contains no OS path or command content. */
   readonly processInstanceId?: string;
 }
+
+export type RuntimeProcessUsage = RuntimeControlPlaneProcessUsage | RuntimeTaskHostProcessUsage;
 
 export interface RuntimeProcessUsageSnapshot {
   readonly capturedAt: number;
@@ -430,11 +446,31 @@ export interface BackendAdapter {
   /** Convert an entry returned by the Adapter's catalog into a dormant binding without starting a runtime. */
   bindCatalogSession?(
     entry: NativeSessionCatalogEntry,
-    generation: number
+    generation: number,
+    /** Persist this exact effect owner before any native profile write; unused by read-only binds. */
+    claimMaterialization: (claim: {
+      readonly binding: NativeSessionBinding;
+      readonly recoveryReference: string;
+    }) => Promise<void>
   ): Promise<NativeSessionBinding>;
+  /** Read-only proof for one persisted, pre-adoption catalog materialization owner. */
+  inspectCatalogSessionMaterialization?(
+    binding: NativeSessionBinding,
+    recoveryReference: string
+  ): Promise<"present" | "absent" | "unknown">;
   createSession(input: CreateNativeSessionInput, context: AdapterContext): Promise<NativeSessionBinding>;
   resumeSession(binding: NativeSessionBinding, context: AdapterContext): Promise<NativeSessionState>;
   inspectSession(binding: NativeSessionBinding, context: AdapterContext): Promise<NativeSessionState>;
+  /**
+   * Side-effect-free check of one exact old native binding before reconciling an
+   * uncertain delete. `absent` must be backed by the adapter's own storage
+   * authority; an unavailable runtime, changed owner, or ambiguous response is
+   * `unknown`, never evidence of deletion.
+   */
+  inspectNativeSessionDeletion?(
+    binding: NativeSessionBinding,
+    context: AdapterContext
+  ): Promise<"present" | "absent" | "unknown">;
   detachSession?(binding: NativeSessionBinding, context: AdapterContext): Promise<void>;
   closeSession(binding: NativeSessionBinding, context: AdapterContext): Promise<void>;
   deleteSession(binding: NativeSessionBinding, context: AdapterContext): Promise<void>;
@@ -537,6 +573,16 @@ export interface BackendAdapter {
    * content into the new native session.
    */
   resetContext?(context: AdapterContext): Promise<NativeSessionBinding>;
+  /** Recover an idempotent reset whose native identity was durably reserved but
+   * whose Product binding has not yet been committed. Absence is authoritative
+   * only for Adapters that implement this hook. */
+  recoverResetContext?(context: AdapterContext): Promise<NativeSessionBinding | undefined>;
+  /** Remove an uncommitted reset replacement and its durable Adapter receipt.
+   * The operation must be idempotent for the exact operationId and binding. */
+  discardResetContext?(binding: NativeSessionBinding, context: AdapterContext): Promise<void>;
+  /** Retire the Adapter receipt after Product truth has adopted the replacement.
+   * The operation must be idempotent for the exact operationId and binding. */
+  finalizeResetContext?(binding: NativeSessionBinding, context: AdapterContext): Promise<void>;
   setName(name: string, context: AdapterContext): Promise<void>;
   getCommands(context: AdapterContext): Promise<readonly RuntimeCommand[]>;
   /** Observe the exact dynamic registry of a capability-compatible live runtime. */

@@ -136,6 +136,12 @@ const INSPECTOR_WORKSPACE_SEARCH_PAGE_SIZE = 500;
 const INSPECTOR_WORKSPACE_SEARCH_MAX_PAGES = 10_000;
 
 type InspectorMenu = "add" | "more";
+interface DetachedInspectorFocusScope {
+  readonly host: DetachedInspectorHost;
+  readonly occurrence: string;
+  readonly owner: string;
+  readonly returnFocus: HTMLElement | null;
+}
 const InteractiveTerminalPanel = lazy(() => import("./InteractiveTerminalPanel.js").then((module) => ({ default: module.InteractiveTerminalPanel })));
 
 export function Inspector({ controller, snapshot, session, workspace, timeline, open, subagentFocusRequest, turnReviewFocusRequest, browserFocusRequest, gamepadRequest, onGamepadRequestConsumed, t, runAction, onClose, onDetachedChange, onSelectionQuote }: {
@@ -166,8 +172,13 @@ export function Inspector({ controller, snapshot, session, workspace, timeline, 
   const menuPopoverRef = useRef<HTMLDivElement>(null);
   const [detachedHost, setDetachedHost] = useState<DetachedInspectorHost>();
   const detachedHostRef = useRef<DetachedInspectorHost | undefined>(undefined);
+  const detachedOpenPendingRef = useRef(false);
+  const detachedFocusScopeRef = useRef<DetachedInspectorFocusScope | undefined>(undefined);
+  const pendingMainFocusRestoreRef = useRef<Pick<DetachedInspectorFocusScope, "owner" | "returnFocus"> | undefined>(undefined);
   const onDetachedChangeRef = useRef(onDetachedChange);
   onDetachedChangeRef.current = onDetachedChange;
+  const openRef = useRef(open);
+  openRef.current = open;
   const inspectorRef = useRef<HTMLElement>(null);
   const inspectorBodyRef = useRef<HTMLDivElement>(null);
   const tabListRef = useRef<HTMLDivElement>(null);
@@ -199,6 +210,9 @@ export function Inspector({ controller, snapshot, session, workspace, timeline, 
   const terminalOwner = `${controller.state.activeProfile?.serverId ?? ""}\u0000${controller.state.activeProfile?.id ?? ""}\u0000${session.id}`;
   const terminalOwnerRef = useRef<string | undefined>(terminalOwner);
   terminalOwnerRef.current = terminalOwner;
+  const inspectorOwner = `${terminalOwner}\u0000${session.backendId}\u0000${session.targetId}\u0000${session.generation.toString()}`;
+  const inspectorOwnerRef = useRef<string | undefined>(inspectorOwner);
+  inspectorOwnerRef.current = inspectorOwner;
   const terminalCapabilities = terminalCatalog?.owner === terminalOwner ? terminalCatalog.value : undefined;
   const canTerminal = terminalCapabilities?.support === "supported";
   const inspectorControllerRef = useRef(controller);
@@ -250,7 +264,10 @@ export function Inspector({ controller, snapshot, session, workspace, timeline, 
   ).images ? [session] : [];
   useEffect(() => { setGamepadBrowserFocusRequest(undefined); }, [browserFocusRequest?.requestId, session.id]);
   const canDetach = !isSessionApplicationWindow(window.location) && inspectorDetachAvailable(window.jokoDesktop);
-  const activeDetachedHost = detachedInspectorHostAlive(detachedHost) ? detachedHost : undefined;
+  const liveDetachedHost = detachedInspectorHostAlive(detachedHost) ? detachedHost : undefined;
+  const detachedOwner = detachedFocusScopeRef.current;
+  const activeDetachedHost = open && liveDetachedHost !== undefined && detachedOwner?.host === liveDetachedHost &&
+    detachedOwner.owner === inspectorOwner ? liveDetachedHost : undefined;
   const detached = activeDetachedHost !== undefined;
   const availableKinds = useMemo(() => new Set<InspectorTabKind>([
     "context",
@@ -267,6 +284,8 @@ export function Inspector({ controller, snapshot, session, workspace, timeline, 
   ]), [canBackgroundTasks, canBrowser, canDiff, canFiles, canRewind, canSubagents, canTree, canUserShell]);
   const storedBucket = tabBuckets[session.id] ?? createInitialInspectorTabBucket();
   const bucket = useMemo(() => projectInspectorTabBucket(storedBucket, availableKinds), [availableKinds, storedBucket]);
+  const activeTabIdRef = useRef(bucket.activeTabId);
+  activeTabIdRef.current = bucket.activeTabId;
   const activeTab = bucket.tabs.find((tab) => tab.id === bucket.activeTabId);
   const storedBucketRef = useRef(storedBucket);
   storedBucketRef.current = storedBucket;
@@ -437,40 +456,74 @@ export function Inspector({ controller, snapshot, session, workspace, timeline, 
   }, [tabBuckets]);
 
   const clearDetachedHost = useCallback((): void => {
-    if (detachedHostRef.current === undefined) return;
+    const host = detachedHostRef.current;
+    if (host === undefined) return;
+    const focusScope = detachedFocusScopeRef.current;
+    detachedFocusScopeRef.current = undefined;
+    pendingMainFocusRestoreRef.current = focusScope?.host === host
+      && focusScope.owner === inspectorOwnerRef.current
+      && openRef.current
+      && !hasSafeDocumentFocus(document)
+      ? { owner: focusScope.owner, returnFocus: focusScope.returnFocus }
+      : undefined;
     detachedHostRef.current = undefined;
     setDetachedHost(undefined);
     onDetachedChangeRef.current?.(false);
   }, []);
 
+  const clearExpectedDetachedHost = useCallback((host: DetachedInspectorHost, restoreFocus: boolean): boolean => {
+    if (detachedHostRef.current !== host) return false;
+    if (!restoreFocus) {
+      detachedFocusScopeRef.current = undefined;
+      pendingMainFocusRestoreRef.current = undefined;
+    }
+    clearDetachedHost();
+    return true;
+  }, [clearDetachedHost]);
+
+  const closeDetachedHostWindow = useCallback((host: DetachedInspectorHost, kind: "user" | "passive"): void => {
+    if (host.window.closed) return;
+    const api = host.window.jokoInspectorDesktop;
+    if (api === undefined) {
+      host.window.close();
+      return;
+    }
+    void api.window.close(kind).catch(() => host.window.close());
+  }, []);
+
+  const retireDetachedHost = useCallback((host: DetachedInspectorHost): void => {
+    clearExpectedDetachedHost(host, false);
+    closeDetachedHostWindow(host, "passive");
+  }, [clearExpectedDetachedHost, closeDetachedHostWindow]);
+
   useEffect(() => {
     const desktop = window.jokoDesktop;
     if (desktop === undefined || !inspectorDetachAvailable(desktop)) return;
-    return desktop.inspectorWindow.onClosed(clearDetachedHost);
-  }, [clearDetachedHost]);
+    return desktop.inspectorWindow.onClosed((event) => {
+      const focusScope = detachedFocusScopeRef.current;
+      if (focusScope === undefined || focusScope.occurrence !== event.occurrence) return;
+      clearExpectedDetachedHost(focusScope.host, event.reason === "user");
+    });
+  }, [clearExpectedDetachedHost]);
 
   useEffect(() => {
     return () => {
+      openRef.current = false;
+      detachedFocusScopeRef.current = undefined;
+      pendingMainFocusRestoreRef.current = undefined;
       const host = detachedHostRef.current;
       detachedHostRef.current = undefined;
       onDetachedChangeRef.current?.(false);
-      if (host !== undefined && !host.window.closed) {
-        void host.window.jokoInspectorDesktop?.window.close().catch(() => undefined);
-      }
+      if (host !== undefined) closeDetachedHostWindow(host, "passive");
     };
-  }, []);
+  }, [closeDetachedHostWindow]);
 
   useEffect(() => {
-    if (open || activeDetachedHost === undefined) return;
-    void activeDetachedHost.window.jokoInspectorDesktop?.window.close().catch(clearDetachedHost);
-  }, [activeDetachedHost, clearDetachedHost, detached, open]);
-
-  useEffect(() => {
-    if (activeDetachedHost === undefined) return;
-    const closed = (): void => clearDetachedHost();
-    activeDetachedHost.window.addEventListener("pagehide", closed, { once: true });
-    return () => activeDetachedHost.window.removeEventListener("pagehide", closed);
-  }, [activeDetachedHost, clearDetachedHost]);
+    if (liveDetachedHost === undefined) return;
+    const focusScope = detachedFocusScopeRef.current;
+    if (open && focusScope?.host === liveDetachedHost && focusScope.owner === inspectorOwner) return;
+    retireDetachedHost(liveDetachedHost);
+  }, [inspectorOwner, liveDetachedHost, open, retireDetachedHost]);
 
   useEffect(() => {
     if (activeDetachedHost === undefined) return;
@@ -482,6 +535,22 @@ export function Inspector({ controller, snapshot, session, workspace, timeline, 
     syncDetachedInspectorDocument(activeDetachedHost.window, document);
     activeDetachedHost.window.document.title = t("inspector.windowTitle");
   });
+
+  useLayoutEffect(() => {
+    if (activeDetachedHost !== undefined) return;
+    const pending = pendingMainFocusRestoreRef.current;
+    if (pending === undefined) return;
+    pendingMainFocusRestoreRef.current = undefined;
+    if (!open || pending.owner !== inspectorOwnerRef.current || hasSafeDocumentFocus(document)) return;
+    focusInspectorOwnerDocument(
+      document,
+      undefined,
+      pending.returnFocus,
+      moreMenuTriggerRef.current,
+      addMenuTriggerRef.current,
+      inspectorRef.current
+    );
+  }, [activeDetachedHost, open, terminalOwner]);
 
   useEffect(() => {
     try { window.localStorage.setItem(INSPECTOR_SIDE_KEY, panelSide); } catch { /* Client storage can be unavailable. */ }
@@ -732,7 +801,7 @@ export function Inspector({ controller, snapshot, session, workspace, timeline, 
     if (ownerWindow === activeDetachedHost?.window) {
       const api = activeDetachedHost.window.jokoInspectorDesktop;
       if (api === undefined) return false;
-      void api.window.close().catch(() => undefined);
+      void api.window.close("user").catch(() => undefined);
       return true;
     }
     const desktop = window.jokoDesktop;
@@ -859,31 +928,74 @@ export function Inspector({ controller, snapshot, session, workspace, timeline, 
 
   const detachInspector = (): void => {
     runAction("inspector-detach", async () => {
-      if (!canDetach || detachedHostRef.current !== undefined) return;
-      const child = openDetachedInspectorWindow();
-      if (child === null) throw new Error(t("inspector.detachUnavailable"));
-      let host: DetachedInspectorHost;
+      if (!canDetach || detachedOpenPendingRef.current || detachedHostRef.current !== undefined) return;
+      detachedOpenPendingRef.current = true;
       try {
-        host = initializeDetachedInspectorHost(child, document, t("inspector.windowTitle"));
-      } catch (error) {
-        void child.jokoInspectorDesktop?.window.close().catch(() => child.close());
-        throw error;
-      }
-      detachedHostRef.current = host;
-      setDetachedHost(host);
-      setMaximized(false);
-      setMenu(undefined);
-      onDetachedChangeRef.current?.(true);
-      try {
-        // A visible main-window animation frame is the commit boundary for the
-        // portal. Only then let Electron reveal the initially hidden child.
-        await new Promise<void>((resolve) => window.requestAnimationFrame(() => resolve()));
-        if (detachedHostRef.current !== host) return;
-        await host.window.jokoInspectorDesktop?.window.ready();
-      } catch (error) {
-        clearDetachedHost();
-        void host.window.jokoInspectorDesktop?.window.close().catch(() => host.window.close());
-        throw error;
+        const child = openDetachedInspectorWindow();
+        if (child === null) throw new Error(t("inspector.detachUnavailable"));
+        let host: DetachedInspectorHost;
+        try {
+          host = initializeDetachedInspectorHost(child, document, t("inspector.windowTitle"));
+        } catch (error) {
+          const api = child.jokoInspectorDesktop;
+          if (api === undefined) child.close();
+          else void api.window.close("passive").catch(() => child.close());
+          throw error;
+        }
+        let occurrence: string;
+        try {
+          occurrence = await host.window.jokoInspectorDesktop!.window.identity();
+          if (occurrence.length === 0 || occurrence.length > 128) throw new Error("Detached Inspector identity is invalid.");
+        } catch (error) {
+          closeDetachedHostWindow(host, "passive");
+          throw error;
+        }
+        if (inspectorOwnerRef.current !== inspectorOwner || !openRef.current || detachedHostRef.current !== undefined) {
+          closeDetachedHostWindow(host, "passive");
+          return;
+        }
+        detachedHostRef.current = host;
+        detachedFocusScopeRef.current = {
+          host,
+          occurrence,
+          owner: inspectorOwner,
+          returnFocus: moreMenuTriggerRef.current
+        };
+        pendingMainFocusRestoreRef.current = undefined;
+        setDetachedHost(host);
+        setMaximized(false);
+        setMenu(undefined);
+        onDetachedChangeRef.current?.(true);
+        try {
+          // A visible main-window animation frame is the commit boundary for the
+          // portal. Only then let Electron reveal the initially hidden child.
+          await new Promise<void>((resolve) => window.requestAnimationFrame(() => resolve()));
+          if (detachedHostRef.current !== host || detachedFocusScopeRef.current?.owner !== inspectorOwner
+            || inspectorOwnerRef.current !== inspectorOwner || !openRef.current) {
+            retireDetachedHost(host);
+            return;
+          }
+          await host.window.jokoInspectorDesktop?.window.ready();
+          if (detachedHostRef.current !== host || detachedFocusScopeRef.current?.owner !== inspectorOwner
+            || inspectorOwnerRef.current !== inspectorOwner || !openRef.current) {
+            retireDetachedHost(host);
+            return;
+          }
+          focusInspectorOwnerDocument(
+            host.window.document,
+            activeTabIdRef.current,
+            undefined,
+            addMenuTriggerRef.current,
+            moreMenuTriggerRef.current,
+            inspectorRef.current
+          );
+        } catch (error) {
+          clearExpectedDetachedHost(host, false);
+          closeDetachedHostWindow(host, "passive");
+          throw error;
+        }
+      } finally {
+        detachedOpenPendingRef.current = false;
       }
     });
   };
@@ -897,7 +1009,7 @@ export function Inspector({ controller, snapshot, session, workspace, timeline, 
         clearDetachedHost();
         return;
       }
-      await api.window.close();
+      await api.window.close("user");
     });
   };
 
@@ -1134,6 +1246,35 @@ function trackInspectorShortcutTerritory(
 function eventElementInWindow(ownerWindow: Window, target: EventTarget | null): Element | null {
   const ElementConstructor = (ownerWindow as Window & typeof globalThis).Element;
   return typeof ElementConstructor === "function" && target instanceof ElementConstructor ? target : null;
+}
+
+function hasSafeDocumentFocus(ownerDocument: Document): boolean {
+  return isSafeFocusTarget(ownerDocument, ownerDocument.activeElement);
+}
+
+function focusInspectorOwnerDocument(
+  ownerDocument: Document,
+  activeTabId: string | undefined,
+  ...fallbacks: readonly (HTMLElement | null | undefined)[]
+): void {
+  const activeTab = activeTabId === undefined ? undefined : ownerDocument.getElementById(`inspector-tab-${activeTabId}`);
+  for (const candidate of [activeTab, ...fallbacks]) {
+    if (!isSafeFocusTarget(ownerDocument, candidate)) continue;
+    candidate.focus({ preventScroll: true });
+    return;
+  }
+}
+
+function isSafeFocusTarget(ownerDocument: Document, candidate: Element | null | undefined): candidate is HTMLElement {
+  const HTMLElementConstructor = ownerDocument.defaultView?.HTMLElement;
+  return HTMLElementConstructor !== undefined
+    && candidate instanceof HTMLElementConstructor
+    && candidate !== ownerDocument.body
+    && candidate !== ownerDocument.documentElement
+    && candidate.ownerDocument === ownerDocument
+    && candidate.isConnected
+    && !candidate.matches(":disabled")
+    && candidate.closest("[hidden], [aria-hidden='true'], [inert]") === null;
 }
 
 function ContextPanel({ controller, backend, session, queue, tasks, t, runAction }: { readonly controller: AppController; readonly backend?: BackendView; readonly session: SessionView; readonly queue: readonly QueueItemView[]; readonly tasks: readonly NonNullable<TimelineItemView["background"]>[]; readonly t: Translator; readonly runAction: RunAction }): JSX.Element {

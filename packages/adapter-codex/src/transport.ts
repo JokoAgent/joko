@@ -5,7 +5,8 @@ import {
   createChildRuntimeEnvironment,
   DurableProcessOwner,
   type DurableProcessLease,
-  type DurableProcessOwnerOptions
+  type DurableProcessOwnerOptions,
+  type DurableProcessUsage
 } from "@joko/runtime-governance";
 import {
   isJsonObject,
@@ -36,6 +37,8 @@ export interface RpcRequestOptions {
 
 export interface RpcTransport {
   readonly running: boolean;
+  readonly processInspectionSupported?: boolean;
+  inspectProcessUsage?(): Promise<readonly DurableProcessUsage[]>;
   start(handlers: RpcTransportHandlers): Promise<void>;
   request(method: string, params: JsonValue | undefined, options?: RpcRequestOptions): Promise<JsonValue>;
   notify(method: string, params?: JsonValue): Promise<void>;
@@ -183,6 +186,18 @@ export class StdioJsonRpcTransport implements RpcTransport {
 
   get running(): boolean {
     return (this.#child !== undefined || this.#channel?.running === true) && !this.#fatal && !this.#closing;
+  }
+
+  get processInspectionSupported(): boolean {
+    return this.#processOwner?.inspectionSupported === true;
+  }
+
+  async inspectProcessUsage(): Promise<readonly DurableProcessUsage[]> {
+    const owner = this.#processOwner;
+    const lease = this.#processLease;
+    if (!this.running || owner === undefined || lease === undefined || !owner.inspectionSupported) return [];
+    const usage = await owner.inspect([lease]);
+    return this.running && this.#processLease === lease ? usage : [];
   }
 
   async start(handlers: RpcTransportHandlers): Promise<void> {

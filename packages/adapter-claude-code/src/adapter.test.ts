@@ -16,8 +16,9 @@ import {
   type ProviderModel,
   type TargetDescriptor
 } from "@joko/core";
+import type { DurableProcessUsage } from "@joko/runtime-governance";
 import { describe, expect, test, vi } from "vitest";
-import { ClaudeCodeAdapter, type ClaudeCodeAdapterOptions } from "./adapter.js";
+import { ClaudeCodeAdapter, claudeWorkspaceAuthority, type ClaudeCodeAdapterOptions } from "./adapter.js";
 import {
   ClaudeSessionStoreError,
   type ClaudeSessionStoreOperationAccess,
@@ -56,6 +57,87 @@ const target: TargetDescriptor = {
 };
 
 describe("ClaudeCodeAdapter", () => {
+  test("binds exact local Query process usage to the real product Session and fences termination", async () => {
+    const sdk = new FakeSdkRuntime({ processInspectionSupported: true });
+    const adapter = adapterFor(sdk);
+    await adapter.createSession(createInput(), contextFor().context);
+    const descriptor = await adapter.describe();
+    expect(descriptor.capabilities.get("runtime.process_usage")?.supported).toBe(true);
+    expect(descriptor.capabilities.get("runtime.process_terminate")?.supported).toBe(true);
+
+    const snapshot = await adapter.getRuntimeProcessUsage();
+    expect(snapshot.processes).toEqual([{
+      role: "task-host",
+      sessionId: "product-session",
+      generation: 1,
+      pid: 701,
+      cpuPercent: 7.5,
+      memoryKb: 8_192,
+      processCount: 2,
+      terminable: true,
+      processInstanceId: "10000000-0000-4000-8000-000000000701"
+    }]);
+    await expect(adapter.terminateRuntimeProcess({
+      sessionId: "product-session",
+      generation: 2,
+      pid: 701,
+      processInstanceId: "10000000-0000-4000-8000-000000000701"
+    })).rejects.toMatchObject({ publicError: { code: "CLAUDE_RUNTIME_PROCESS_FENCE_MISMATCH" } });
+    expect(sdk.terminatedQueryProcesses).toEqual([]);
+
+    await adapter.terminateRuntimeProcess({
+      sessionId: "product-session",
+      generation: 1,
+      pid: 701,
+      processInstanceId: "10000000-0000-4000-8000-000000000701"
+    });
+    expect(sdk.terminatedQueryProcesses).toEqual([{
+      query: sdk.queries[0],
+      pid: 701,
+      processInstanceId: "10000000-0000-4000-8000-000000000701"
+    }]);
+    expect(sdk.queries[0]!.closeCalls).toBe(1);
+    await expect(adapter.getRuntimeProcessUsage()).resolves.toMatchObject({ processes: [] });
+    await expect(adapter.terminateRuntimeProcess({
+      sessionId: "product-session",
+      generation: 1,
+      pid: 701,
+      processInstanceId: "10000000-0000-4000-8000-000000000701"
+    })).rejects.toMatchObject({ publicError: { code: "CLAUDE_RUNTIME_PROCESS_FENCE_MISMATCH" } });
+    await adapter.dispose();
+  });
+
+  test("keeps a Session generation fenced when exact Query termination is unconfirmed", async () => {
+    const sdk = new FakeSdkRuntime({ processInspectionSupported: true });
+    sdk.processTerminationFailure = true;
+    const adapter = adapterFor(sdk);
+    await adapter.createSession(createInput(), contextFor().context);
+    const process = (await adapter.getRuntimeProcessUsage()).processes[0]!;
+    if (process.role !== "task-host" || process.processInstanceId === undefined) {
+      throw new Error("Expected a terminable task-host process fixture.");
+    }
+    const fence = {
+      sessionId: process.sessionId,
+      generation: process.generation,
+      pid: process.pid,
+      processInstanceId: process.processInstanceId
+    };
+
+    await expect(adapter.terminateRuntimeProcess(fence)).rejects.toMatchObject({
+      publicError: {
+        code: "CLAUDE_RUNTIME_PROCESS_EXIT_UNCONFIRMED",
+        stateMayHaveChanged: true
+      }
+    });
+    expect(sdk.queries[0]!.closeCalls).toBe(1);
+    await expect(adapter.getRuntimeProcessUsage()).resolves.toMatchObject({ processes: [] });
+    await expect(adapter.terminateRuntimeProcess(fence)).rejects.toMatchObject({
+      publicError: { code: "CLAUDE_RUNTIME_PROCESS_FENCE_MISMATCH" }
+    });
+    expect(sdk.terminatedQueryProcesses).toEqual([]);
+    await adapter.dispose();
+  });
+
   test("isolates precommit MCP and binds a committed local root turn to a frozen product catalog", async () => {
     const sdk = new FakeSdkRuntime();
     let committed = false;
@@ -108,7 +190,7 @@ describe("ClaudeCodeAdapter", () => {
   test("binds a remote standard Query after durable Session identity and fences its root callback", async () => {
     const remoteTarget: TargetDescriptor = {
       ...target, id: "remote-mcp-target", workspaceRoot: "/srv/project",
-      remoteWorkspace: { hostTargetId: "remote-mcp-target", hostId: "host-a", workspaceRoot: "/srv/project" }
+      remoteWorkspace: { kind: "ssh", hostTargetId: "remote-mcp-target", hostId: "host-a", workspaceRoot: "/srv/project" }
     };
     const sdk = new FakeSdkRuntime({ initialFrameOverrides: { cwd: "/srv/project" } });
     const calls = vi.fn(async () => ({
@@ -168,7 +250,7 @@ describe("ClaudeCodeAdapter", () => {
     const remote = location === "remote";
     const selectedTarget: TargetDescriptor = remote ? {
       ...target, id: "remote-no-tool", workspaceRoot: "/srv/project",
-      remoteWorkspace: { hostTargetId: "remote-no-tool", hostId: "host-a", workspaceRoot: "/srv/project" }
+      remoteWorkspace: { kind: "ssh", hostTargetId: "remote-no-tool", hostId: "host-a", workspaceRoot: "/srv/project" }
     } : target;
     const sdk = new FakeSdkRuntime(remote ? { initialFrameOverrides: { cwd: "/srv/project" } } : {});
     let toolsAvailable = false;
@@ -279,7 +361,7 @@ describe("ClaudeCodeAdapter", () => {
           ...target,
           id: "target-remote-managed-effort",
           workspaceRoot: "/srv/effort",
-          remoteWorkspace: { hostTargetId: "target-remote-managed-effort", hostId: "host-effort", workspaceRoot: "/srv/effort" }
+          remoteWorkspace: { kind: "ssh", hostTargetId: "target-remote-managed-effort", hostId: "host-effort", workspaceRoot: "/srv/effort" }
         }
       : target;
     const adapter = adapterFor(remote ? new FakeSdkRuntime() : runtime, {
@@ -948,7 +1030,7 @@ describe("ClaudeCodeAdapter", () => {
       ...target,
       id: "target-remote-managed-limits",
       workspaceRoot: "/srv/project",
-      remoteWorkspace: { hostTargetId: "target-remote-managed-limits", hostId: "host-a", workspaceRoot: "/srv/project" }
+      remoteWorkspace: { kind: "ssh", hostTargetId: "target-remote-managed-limits", hostId: "host-a", workspaceRoot: "/srv/project" }
     };
     const remoteRuntime = new FakeSdkRuntime({ initialFrameOverrides: { cwd: "/srv/project", model: "configured-model" } });
     const close = vi.fn(async () => undefined);
@@ -3101,7 +3183,7 @@ describe("ClaudeCodeAdapter", () => {
       ...target,
       id: "target-remote",
       workspaceRoot: "/srv/project",
-      remoteWorkspace: { hostTargetId: "target-remote", hostId: "host-a", workspaceRoot: "/srv/project" }
+      remoteWorkspace: { kind: "ssh", hostTargetId: "target-remote", hostId: "host-a", workspaceRoot: "/srv/project" }
     };
     const localRuntime = new FakeSdkRuntime();
     const remoteRuntime = new FakeSdkRuntime({ initialFrameOverrides: { cwd: "/srv/project" } });
@@ -3174,6 +3256,73 @@ describe("ClaudeCodeAdapter", () => {
     expect(close).toHaveBeenCalledOnce();
   });
 
+  test("validates and resolves an exact Windows device-peer runtime without SSH identity fields", async () => {
+    const peerTarget: TargetDescriptor = {
+      ...target,
+      id: "target-peer-win32",
+      workspaceRoot: process.cwd(),
+      remoteWorkspace: {
+        kind: "device_peer",
+        controllerDeviceId: "controller-device",
+        targetDeviceId: "windows-device",
+        workspaceRoot: "C:\\Joko\\Workspace"
+      }
+    };
+    const peerRuntime = new FakeSdkRuntime({ initialFrameOverrides: { cwd: peerTarget.remoteWorkspace!.workspaceRoot } });
+    const resolve = vi.fn(async () => ({
+      runtime: peerRuntime,
+      workspaceRoot: peerTarget.remoteWorkspace!.workspaceRoot,
+      remote: true,
+      assertCurrent: () => undefined
+    }));
+    const adapter = adapterFor(new FakeSdkRuntime(), {
+      remoteRuntimes: { resolve, close: async () => undefined }
+    });
+
+    await expect(adapter.validateTarget(peerTarget)).resolves.toBeUndefined();
+    expect(resolve).toHaveBeenCalledWith(peerTarget, undefined);
+    await expect(adapter.validateTarget({
+      ...peerTarget,
+      remoteWorkspace: {
+        kind: "device_peer",
+        controllerDeviceId: "controller-device",
+        targetDeviceId: "controller-device",
+        workspaceRoot: "C:\\Joko\\Workspace"
+      }
+    })).rejects.toMatchObject({ publicError: { code: "REMOTE_TARGET_INVALID" } });
+    expect(resolve).toHaveBeenCalledTimes(1);
+
+    const sourceTarget: TargetDescriptor = {
+      ...peerTarget,
+      id: "same-target",
+      workspaceRoot: "/srv/source",
+      remoteWorkspace: {
+        kind: "ssh", hostTargetId: "source-a", hostId: "same-host-name", workspaceRoot: "/srv"
+      }
+    };
+    const targetWithOtherSource: TargetDescriptor = {
+      ...sourceTarget,
+      workspaceRoot: "/srv/derived",
+      remoteWorkspace: {
+        kind: "ssh",
+        hostTargetId: "source-b",
+        hostId: "same-host-name",
+        workspaceRoot: "/srv"
+      }
+    };
+    const lifecycle: NativeSessionDerivationLifecycle = {
+      operationId: "peer-authority-source-fence",
+      kind: "clone",
+      sourceSessionId: "source-session",
+      sourceBinding: { opaqueRef: `claude-code:session:${randomUUID()}`, generation: 1 },
+      sessionId: "derived-session",
+      sourceTarget,
+      target: targetWithOtherSource
+    };
+    expect(adapter.ownsNativeSessionDerivationLifecycle(lifecycle)).toBe(false);
+    await adapter.dispose();
+  });
+
   test("closes the remote runtime owner even when an SDK cleanup boundary fails", async () => {
     const runtime = new FakeSdkRuntime();
     runtime.closeSessionOperationsFailure = true;
@@ -3197,7 +3346,7 @@ describe("ClaudeCodeAdapter", () => {
       ...target,
       id: "target-remote-manager-replacement",
       workspaceRoot: "/srv/project",
-      remoteWorkspace: { hostTargetId: "target-remote-manager-replacement", hostId: "host-a", workspaceRoot: "/srv/project" }
+      remoteWorkspace: { kind: "ssh", hostTargetId: "target-remote-manager-replacement", hostId: "host-a", workspaceRoot: "/srv/project" }
     };
     const runtime = new FakeSdkRuntime();
     runtime.queryFailure = Object.assign(new Error("manager generation changed"), {
@@ -4523,6 +4672,23 @@ describe("ClaudeCodeAdapter", () => {
     expect(runtime.sessions.has(binding.nativeSessionId!)).toBe(false);
   });
 
+  test("classifies an exact detached native Session without claiming or deleting it", async () => {
+    const runtime = new FakeSdkRuntime();
+    const adapter = adapterFor(runtime);
+    const binding = await adapter.createSession(createInput(), contextFor().context);
+    const bound = contextFor(binding).context;
+    await adapter.detachSession(binding, bound);
+    expect(await adapter.inspectNativeSessionDeletion(binding, bound)).toBe("present");
+    expect(runtime.deleted).toEqual([]);
+    runtime.sessions.delete(binding.nativeSessionId!);
+    expect(await adapter.inspectNativeSessionDeletion(binding, bound)).toBe("unknown");
+    expect(await adapter.inspectNativeSessionDeletion(binding, {
+      ...bound, binding: { ...binding, generation: binding.generation + 1 }
+    })).toBe("unknown");
+    expect(runtime.deleted).toEqual([]);
+    await adapter.dispose();
+  });
+
   test.each(["wrong-cwd", "missing", "cancelled", "new-owner"] as const)("fences %s detached deletion after metadata lookup before the SDK mutation", async (boundary) => {
     const runtime = new FakeSdkRuntime();
     const adapter = adapterFor(runtime);
@@ -4669,6 +4835,7 @@ describe("ClaudeCodeAdapter", () => {
         target: {
           ...derivedTarget,
           remoteWorkspace: {
+            kind: "ssh",
             hostTargetId: derivedTarget.id,
             hostId: "remote-host",
             workspaceRoot: "/srv/project"
@@ -4763,6 +4930,7 @@ describe("ClaudeCodeAdapter", () => {
       id: "remote-stored-target",
       workspaceRoot: "/srv/source",
       remoteWorkspace: {
+        kind: "ssh",
         hostTargetId: "remote-stored-target",
         hostId: "remote-store-host",
         workspaceRoot: "/srv/source"
@@ -4825,8 +4993,21 @@ describe("ClaudeCodeAdapter", () => {
     };
     expect(adapter.ownsNativeSessionDerivationLifecycle(lifecycle)).toBe(true);
     await adapter.adoptNativeSessionDerivation(lifecycle, new AbortController().signal);
+    const resumedDerivedTarget: TargetDescriptor = {
+      ...derivedTarget,
+      remoteWorkspace: {
+        ...derivedTarget.remoteWorkspace!,
+        workspaceRoot: derivedTarget.workspaceRoot
+      }
+    };
+    expect(claudeWorkspaceAuthority(resumedDerivedTarget)).toBe(claudeWorkspaceAuthority(derivedTarget));
+    expect(claudeWorkspaceAuthority(resumedDerivedTarget)).not.toBe(claudeWorkspaceAuthority(sourceTarget));
+    expect(claudeWorkspaceAuthority({
+      ...sourceTarget,
+      workspaceRoot: "C:\\service-owned-fallback"
+    })).toBe(claudeWorkspaceAuthority(sourceTarget));
     const derivedContext = {
-      ...contextFor(binding, { target: derivedTarget }).context,
+      ...contextFor(binding, { target: resumedDerivedTarget }).context,
       sessionId: "remote-stored-product"
     };
     await adapter.resumeSession(binding, derivedContext);
@@ -5448,6 +5629,7 @@ describe("ClaudeCodeAdapter", () => {
       id: "native-oauth-remote-target",
       workspaceRoot: "/srv/auth",
       remoteWorkspace: {
+        kind: "ssh",
         hostTargetId: "native-oauth-remote-target",
         hostId: "host-auth",
         workspaceRoot: "/srv/auth"
@@ -5665,6 +5847,7 @@ interface FakeRuntimeOptions {
   readonly leaveOutputOpenOnClose?: boolean;
   readonly probeDiagnostic?: string;
   readonly probeInstalled?: boolean;
+  readonly processInspectionSupported?: boolean;
 }
 
 function managedProviderFixture(
@@ -5742,11 +5925,37 @@ class FakeSdkRuntime implements ClaudeSdkRuntime {
   supportsWorkspaceDerivation = true;
   storedSessions: ClaudeSdkStoredSessionRuntime | undefined;
   readonly queries: FakeQuery[] = [];
+  get processInspectionSupported(): boolean { return this.options.processInspectionSupported === true; }
+  readonly queryProcessUsage = new Map<ClaudeSdkQuery, readonly DurableProcessUsage[]>();
+  readonly terminatedQueryProcesses: Array<{
+    readonly query: ClaudeSdkQuery;
+    readonly pid: number;
+    readonly processInstanceId: string;
+  }> = [];
+  processTerminationFailure = false;
   retirementFailure = false;
   readonly retiredQueries: ClaudeSdkQuery[] = [];
   async retireQuery(query: ClaudeSdkQuery): Promise<void> {
     this.retiredQueries.push(query);
     if (this.retirementFailure) throw new Error("The controlled Query has not confirmed exit.");
+  }
+  inspectQueryProcesses(query: ClaudeSdkQuery): Promise<readonly DurableProcessUsage[]> {
+    return Promise.resolve(this.queryProcessUsage.get(query) ?? []);
+  }
+  terminateQueryProcess(
+    query: ClaudeSdkQuery,
+    input: { readonly pid: number; readonly processInstanceId: string }
+  ): Promise<void> {
+    if (this.processTerminationFailure) {
+      return Promise.reject(new Error("The fake Query process exit is unconfirmed."));
+    }
+    const usage = this.queryProcessUsage.get(query);
+    if (usage?.some((process) => process.pid === input.pid && process.ownerToken === input.processInstanceId) !== true) {
+      return Promise.reject(new Error("The fake Query process fence is stale."));
+    }
+    this.terminatedQueryProcesses.push({ query, ...input });
+    this.queryProcessUsage.delete(query);
+    return Promise.resolve();
   }
   readonly sessions = new Map<string, ClaudeSdkSessionInfo>();
   readonly messages = new Map<string, readonly ClaudeSdkSessionMessage[]>();
@@ -5798,6 +6007,16 @@ class FakeSdkRuntime implements ClaudeSdkRuntime {
     const query = new FakeQuery(params, this.queryInitialization, this.options.leaveOutputOpenOnClose ?? false,
       this.options.pauseAfterFirstInput ?? false);
     this.queries.push(query);
+    if (this.processInspectionSupported) {
+      const ordinal = this.queries.length;
+      this.queryProcessUsage.set(query, [{
+        ownerToken: `10000000-0000-4000-8000-${String(700 + ordinal).padStart(12, "0")}`,
+        pid: 700 + ordinal,
+        cpuPercent: 7.5,
+        memoryKb: 8_192,
+        processCount: 2
+      }]);
+    }
     if (params.options.sessionId !== undefined) this.sessions.set(nativeSessionId, sessionInfo(nativeSessionId));
     if (params.options.sessionStoreAccess !== undefined) {
       queueMicrotask(() => query.push({

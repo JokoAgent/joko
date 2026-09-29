@@ -9,6 +9,9 @@ private let incomingShareBindingName = "binding.json"
 private let incomingShareClaimName = "claim.json"
 private let incomingShareMaximumItems = 20
 private let incomingShareMaximumBytes = 30 * 1024 * 1024
+private let incomingShareMaximumTextItemBytes = 32 * 1024
+private let incomingShareMaximumURLItemBytes = 8 * 1024
+private let incomingShareMaximumTextBatchBytes = 128 * 1024
 private let incomingShareMaximumManifestBytes = 256 * 1024
 private let incomingShareStagingLifetime: TimeInterval = 24 * 60 * 60
 
@@ -25,11 +28,13 @@ private struct IncomingShareManifestItem: Codable {
   let itemId: String
   let ordinal: Int
   let state: String
+  let kind: String?
   let fileName: String?
   let mediaType: String?
   let byteSize: Int?
   let sha256Hex: String?
   let relativePath: String?
+  let text: String?
   let reason: String?
 }
 
@@ -45,11 +50,23 @@ private struct IncomingShareClaim: Codable, Equatable {
   let batchId: String
   let claimId: String
   let profileId: String
+  let destinationKind: String
+  let sessionId: String?
   let targetId: String
   let surfaceOwnerKey: String
   let policyKey: String
   let acceptedItemIds: [String]
+  let acceptedItemProofs: [IncomingShareAcceptedItemProof]
   let claimedAtUnixMs: Int64
+}
+
+private struct IncomingShareAcceptedItemProof: Codable, Equatable {
+  let itemId: String
+  let kind: String
+  let byteSize: Int
+  let sha256Hex: String
+  let fileName: String?
+  let mediaType: String?
 }
 
 private struct ValidatedIncomingShareBatch {
@@ -76,6 +93,8 @@ public final class JokoIncomingShareModule: Module {
       (
         batchId: String,
         profileId: String,
+        destinationKind: String,
+        sessionId: String?,
         targetId: String,
         surfaceOwnerKey: String,
         policyKey: String,
@@ -85,6 +104,8 @@ public final class JokoIncomingShareModule: Module {
         return try self.claimBatch(
           batchId: batchId,
           profileId: profileId,
+          destinationKind: destinationKind,
+          sessionId: sessionId,
           targetId: targetId,
           surfaceOwnerKey: surfaceOwnerKey,
           policyKey: policyKey,
@@ -160,6 +181,8 @@ public final class JokoIncomingShareModule: Module {
   private func claimBatch(
     batchId: String,
     profileId: String,
+    destinationKind: String,
+    sessionId: String?,
     targetId: String,
     surfaceOwnerKey: String,
     policyKey: String,
@@ -167,9 +190,10 @@ public final class JokoIncomingShareModule: Module {
   ) throws -> [String: Any] {
     try assertBatchId(batchId)
     try assertProfileId(profileId)
+    try assertDestination(destinationKind, sessionId: sessionId)
     try assertTargetId(targetId)
-    try assertOpaqueText(surfaceOwnerKey, maximumBytes: 16_384, allowUnitSeparator: true)
-    try assertOpaqueText(policyKey, maximumBytes: 16_384, allowUnitSeparator: false)
+    try assertOpaqueText(surfaceOwnerKey, maximumBytes: 16_384, allowOwnerSeparators: true)
+    try assertOpaqueText(policyKey, maximumBytes: 16_384, allowOwnerSeparators: false)
     let directory = try requiredBatchDirectory(batchId: batchId)
     let current = try validateBatch(directory)
     guard current.binding?.profileId == profileId else {
@@ -185,7 +209,8 @@ public final class JokoIncomingShareModule: Module {
     }
     for itemId in acceptedItemIds { try assertBatchId(itemId) }
     if let claim = current.claim {
-      guard claim.profileId == profileId, claim.targetId == targetId,
+      guard claim.profileId == profileId, claim.destinationKind == destinationKind,
+            claim.sessionId == sessionId, claim.targetId == targetId,
             claim.surfaceOwnerKey == surfaceOwnerKey, claim.policyKey == policyKey,
             claim.acceptedItemIds == acceptedItemIds else {
         throw incomingShareError("This incoming share is already claimed by another project or model authority.")
@@ -197,10 +222,13 @@ public final class JokoIncomingShareModule: Module {
       batchId: batchId,
       claimId: UUID().uuidString.lowercased(),
       profileId: profileId,
+      destinationKind: destinationKind,
+      sessionId: sessionId,
       targetId: targetId,
       surfaceOwnerKey: surfaceOwnerKey,
       policyKey: policyKey,
       acceptedItemIds: acceptedItemIds,
+      acceptedItemProofs: try acceptedProofs(manifest: current.manifest, acceptedItemIds: acceptedItemIds),
       claimedAtUnixMs: Int64((Date().timeIntervalSince1970 * 1_000).rounded(.down))
     )
     let data = try JSONEncoder().encode(claim)
@@ -238,13 +266,27 @@ public final class JokoIncomingShareModule: Module {
     ]
     if let binding = batch.binding { value["boundProfileId"] = binding.profileId }
     if let claim = batch.claim {
-      value["claim"] = [
+      var claimValue: [String: Any] = [
         "claimId": claim.claimId,
+        "destinationKind": claim.destinationKind,
         "targetId": claim.targetId,
         "surfaceOwnerKey": claim.surfaceOwnerKey,
         "policyKey": claim.policyKey,
-        "acceptedItemIds": claim.acceptedItemIds
+        "acceptedItemIds": claim.acceptedItemIds,
+        "acceptedItemProofs": claim.acceptedItemProofs.map { proof in
+          var value: [String: Any] = [
+            "itemId": proof.itemId,
+            "kind": proof.kind,
+            "byteSize": proof.byteSize,
+            "sha256Hex": proof.sha256Hex
+          ]
+          if let fileName = proof.fileName { value["fileName"] = fileName }
+          if let mediaType = proof.mediaType { value["mediaType"] = mediaType }
+          return value
+        }
       ]
+      if let sessionId = claim.sessionId { claimValue["sessionId"] = sessionId }
+      value["claim"] = claimValue
     }
     return value
   }
@@ -274,6 +316,7 @@ public final class JokoIncomingShareModule: Module {
     var itemIds = Set<String>()
     var ordinals = Set<Int>()
     var items: [[String: Any]] = []
+    var textBatchBytes = 0
     for item in manifest.items.sorted(by: { $0.ordinal < $1.ordinal }) {
       try assertBatchId(item.itemId)
       guard itemIds.insert(item.itemId).inserted,
@@ -282,8 +325,9 @@ public final class JokoIncomingShareModule: Module {
         throw incomingShareError("The incoming share contains a duplicate item identity or order.")
       }
       if item.state == "rejected" {
-        guard item.mediaType == nil, item.byteSize == nil, item.sha256Hex == nil,
-              item.relativePath == nil, let reason = item.reason,
+        guard item.kind == nil, item.mediaType == nil, item.byteSize == nil,
+              item.sha256Hex == nil, item.relativePath == nil, item.text == nil,
+              let reason = item.reason,
               !boundedMessage(reason).isEmpty, reason.count <= 512 else {
           throw incomingShareError("An incoming share rejection record is invalid.")
         }
@@ -298,10 +342,47 @@ public final class JokoIncomingShareModule: Module {
         continue
       }
       guard item.state == "ready", item.reason == nil,
-            let fileNameValue = item.fileName,
-            let mediaTypeValue = item.mediaType,
+            let kind = item.kind,
             let byteSize = item.byteSize,
             let sha256Hex = item.sha256Hex,
+            isSha256(sha256Hex) else {
+        throw incomingShareError("An incoming share item record is incomplete.")
+      }
+      if kind == "text" || kind == "url" {
+        guard item.fileName == nil, item.mediaType == nil, item.relativePath == nil,
+              let text = item.text else {
+          throw incomingShareError("An incoming share text record is invalid.")
+        }
+        let bytes = Data(text.utf8)
+        let itemLimit = kind == "url" ? incomingShareMaximumURLItemBytes : incomingShareMaximumTextItemBytes
+        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              bytes.count == byteSize, byteSize <= itemLimit,
+              !text.unicodeScalars.contains(where: { $0.value == 0 }) else {
+          throw incomingShareError("An incoming share text item changed or exceeds its limit.")
+        }
+        textBatchBytes += byteSize
+        guard textBatchBytes <= incomingShareMaximumTextBatchBytes else {
+          throw incomingShareError("An incoming share text batch exceeds its limit.")
+        }
+        if kind == "url" { try assertWebURL(text) }
+        let digest = SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
+        guard digest == sha256Hex else {
+          throw incomingShareError("An incoming share text item failed its SHA-256 check.")
+        }
+        items.append([
+          "state": "ready",
+          "kind": kind,
+          "itemId": item.itemId,
+          "ordinal": item.ordinal,
+          "text": text,
+          "byteSize": byteSize,
+          "sha256Hex": sha256Hex
+        ])
+        continue
+      }
+      guard kind == "file", item.text == nil,
+            let fileNameValue = item.fileName,
+            let mediaTypeValue = item.mediaType,
             let relativePath = item.relativePath else {
         throw incomingShareError("An incoming share item record is incomplete.")
       }
@@ -320,6 +401,7 @@ public final class JokoIncomingShareModule: Module {
       try assertMediaType(mediaType, matches: fileURL)
       items.append([
         "state": "ready",
+        "kind": "file",
         "itemId": item.itemId,
         "ordinal": item.ordinal,
         "fileName": fileName,
@@ -378,9 +460,10 @@ public final class JokoIncomingShareModule: Module {
     }
     try assertBatchId(claim.claimId)
     try assertProfileId(claim.profileId)
+    try assertDestination(claim.destinationKind, sessionId: claim.sessionId)
     try assertTargetId(claim.targetId)
-    try assertOpaqueText(claim.surfaceOwnerKey, maximumBytes: 16_384, allowUnitSeparator: true)
-    try assertOpaqueText(claim.policyKey, maximumBytes: 16_384, allowUnitSeparator: false)
+    try assertOpaqueText(claim.surfaceOwnerKey, maximumBytes: 16_384, allowOwnerSeparators: true)
+    try assertOpaqueText(claim.policyKey, maximumBytes: 16_384, allowOwnerSeparators: false)
     let readyIds = manifest.items.sorted(by: { $0.ordinal < $1.ordinal })
       .filter { $0.state == "ready" }.map(\.itemId)
     guard claim.acceptedItemIds.count <= readyIds.count,
@@ -390,7 +473,36 @@ public final class JokoIncomingShareModule: Module {
       throw incomingShareError("The incoming share target claim item order is invalid.")
     }
     for itemId in claim.acceptedItemIds { try assertBatchId(itemId) }
+    guard claim.acceptedItemProofs == (try acceptedProofs(
+      manifest: manifest,
+      acceptedItemIds: claim.acceptedItemIds
+    )) else {
+      throw incomingShareError("The incoming share claimed content changed.")
+    }
     return claim
+  }
+
+  private func acceptedProofs(
+    manifest: IncomingShareManifest,
+    acceptedItemIds: [String]
+  ) throws -> [IncomingShareAcceptedItemProof] {
+    let accepted = Set(acceptedItemIds)
+    return try manifest.items.sorted(by: { $0.ordinal < $1.ordinal })
+      .filter { accepted.contains($0.itemId) }
+      .map { item in
+        guard item.state == "ready", let kind = item.kind,
+              let byteSize = item.byteSize, let sha256Hex = item.sha256Hex else {
+          throw incomingShareError("The incoming share claimed item is not ready.")
+        }
+        return IncomingShareAcceptedItemProof(
+          itemId: item.itemId,
+          kind: kind,
+          byteSize: byteSize,
+          sha256Hex: sha256Hex,
+          fileName: kind == "file" ? item.fileName : nil,
+          mediaType: kind == "file" ? item.mediaType : nil
+        )
+      }
   }
 
   private func assertMediaType(_ mediaType: String, matches fileURL: URL) throws {
@@ -561,16 +673,41 @@ private func assertTargetId(_ value: String) throws {
   }
 }
 
+private func assertDestination(_ kind: String, sessionId: String?) throws {
+  if kind == "new_task" {
+    guard sessionId == nil else {
+      throw incomingShareError("The incoming share new-task destination cannot name a session.")
+    }
+    return
+  }
+  guard kind == "existing_task", let sessionId,
+        sessionId.range(of: "^[A-Za-z0-9_-]{1,128}$", options: .regularExpression) != nil else {
+    throw incomingShareError("The incoming share existing-task destination is invalid.")
+  }
+}
+
+private func assertWebURL(_ value: String) throws {
+  guard value.hasPrefix("http://") || value.hasPrefix("https://"),
+        !value.unicodeScalars.contains(where: { $0.value <= 0x20 || $0.value == 0x7f }) else {
+    throw incomingShareError("An incoming share web URL is invalid.")
+  }
+  guard let components = URLComponents(string: value),
+        let scheme = components.scheme, ["http", "https"].contains(scheme),
+        let host = components.host, !host.isEmpty, components.url != nil else {
+    throw incomingShareError("An incoming share web URL is invalid.")
+  }
+}
+
 private func assertOpaqueText(
   _ value: String,
   maximumBytes: Int,
-  allowUnitSeparator: Bool
+  allowOwnerSeparators: Bool
 ) throws {
   guard !value.isEmpty, let data = value.data(using: .utf8), data.count <= maximumBytes else {
     throw incomingShareError("The incoming share authority claim is invalid.")
   }
   let disallowed = CharacterSet.controlCharacters.subtracting(
-    allowUnitSeparator ? CharacterSet(charactersIn: "\u{001f}") : CharacterSet()
+    allowOwnerSeparators ? CharacterSet(charactersIn: "\u{001e}\u{001f}") : CharacterSet()
   )
   guard !value.unicodeScalars.contains(where: { disallowed.contains($0) }) else {
     throw incomingShareError("The incoming share authority claim contains invalid control characters.")

@@ -53,7 +53,7 @@ it("keeps a remote Claude checkout and stored fork exact through dispatch, resta
     const target = application.store.listTargets().find((item) => item.descriptor.backendId === BACKEND_ID);
     if (target === undefined) throw new Error("The production Claude Target is unavailable.");
     const targetId = "remote-workspace:claude-code";
-    const remoteWorkspace = { hostTargetId: targetId, hostId: "host-a", workspaceRoot: REMOTE_ROOT };
+    const remoteWorkspace = { kind: "ssh" as const, hostTargetId: targetId, hostId: "host-a", workspaceRoot: REMOTE_ROOT };
     application.store.upsertTarget({
       ...target.descriptor, id: targetId, displayName: "Remote Claude workspace",
       workspaceRoot: REMOTE_ROOT, managed: true, trusted: true, remoteWorkspace
@@ -119,7 +119,7 @@ it("keeps a remote Claude checkout and stored fork exact through dispatch, resta
     if (first.state !== OperationState.SUCCEEDED) {
       throw new Error(`Remote fork failed: ${JSON.stringify({ first,
         diagnostics: application.store.listDiagnostics().slice(-10), managerCalls: remote.managerCalls,
-        deriveCount: remote.deriveCount, lastPlan: remote.lastPlan },
+        checkoutCalls: remote.checkoutCalls, deriveCount: remote.deriveCount, lastPlan: remote.lastPlan },
       (_key, value: unknown) => typeof value === "bigint" ? String(value) : value)}`);
     }
     const derivedId = sessionIdFrom(first);
@@ -130,7 +130,7 @@ it("keeps a remote Claude checkout and stored fork exact through dispatch, resta
     expect(derived.remoteWorkspace).toEqual(remoteWorkspace);
     expect(derived.worktree).toMatchObject({
       state: "active", repositoryRoot: REMOTE_ROOT, remote: {
-        targetId, hostTargetId: targetId, hostId: "host-a", manifestId: expect.any(String)
+        targetId, binding: remoteWorkspace, manifestId: expect.any(String)
       }
     });
     expect(derived.worktree.path).toMatch(/^\/home\/fixture\/\.joko\/runtime\/v1\/claude-code\/worktrees\/checkouts\//u);
@@ -180,7 +180,12 @@ it("keeps a remote Claude checkout and stored fork exact through dispatch, resta
       restoredAssistant.payload.kind.value.nativeIdentity.entryId);
     const second = await submit(restartedClients.operation, paired.connection.id,
       forkMutation(derivedId, restoredAssistant.payload.kind.value.nativeIdentity.entryId, reforkAnchor));
-    expect(second.state).toBe(OperationState.SUCCEEDED);
+    if (second.state !== OperationState.SUCCEEDED) {
+      throw new Error(`Remote refork failed: ${JSON.stringify({ second,
+        diagnostics: restarted.store.listDiagnostics().slice(-10), managerCalls: remote.managerCalls,
+        checkoutCalls: remote.checkoutCalls, deriveCount: remote.deriveCount, lastPlan: remote.lastPlan },
+      (_key, value: unknown) => typeof value === "bigint" ? String(value) : value)}`);
+    }
     const reforkId = sessionIdFrom(second);
     const refork = restarted.store.getSession(reforkId).descriptor;
     if (refork.worktree === undefined) throw new Error("The remote refork has no checkout.");
@@ -257,6 +262,7 @@ class ControlledRemoteClaude {
   readonly #operations = new Map<string, { access: Record<string, unknown>; childId?: string; cleaned: boolean }>();
   readonly queryInputs: Array<{ sessionId: string; content: string; consumedInitCwd?: string }> = [];
   readonly managerCalls: string[] = [];
+  readonly checkoutCalls: string[] = [];
   readonly releasedPaths: string[] = [];
   readonly connector: RemoteConnector;
   managerSha256 = "";
@@ -301,6 +307,7 @@ class ControlledRemoteClaude {
 
   execute(input: string) {
     const request = JSON.parse(input) as { operation: string; data: unknown };
+    this.checkoutCalls.push(request.operation);
     const respond = (value: object) => ({
       stdout: JSON.stringify({ format: 1, ...value }), stderr: "", exitCode: 0, outputCapped: false
     });
@@ -499,6 +506,14 @@ class ControlledProcesses implements RemoteProcessTransportPort {
         process.finish(0);
       });
     }
+    if (request.args[0] === "-e") {
+      return new ControlledProcess(undefined, (process, input) => {
+        const result = this.#remote.execute(input);
+        process.stdout.write(result.stdout);
+        process.stderr.write(result.stderr);
+        process.finish(result.exitCode);
+      });
+    }
     return new ControlledProcess((frame, process) => {
       if (frame.kind === "callback_result") {
         const pending = process.pendingReservation;
@@ -533,7 +548,7 @@ class ControlledProcess extends EventEmitter implements RemoteProcessHandle {
 
   constructor(
     onFrame?: (frame: Record<string, unknown>, process: ControlledProcess) => void,
-    onEnd?: (process: ControlledProcess) => void
+    onEnd?: (process: ControlledProcess, input: string) => void
   ) {
     super();
     this.stdin = new Writable({
@@ -550,7 +565,7 @@ class ControlledProcess extends EventEmitter implements RemoteProcessHandle {
           callback();
         } catch (error) { callback(error as Error); }
       },
-      final: (callback) => { onEnd?.(this); queueMicrotask(() => this.finish(this.exitCode ?? 0)); callback(); }
+      final: (callback) => { onEnd?.(this, this.#buffer); queueMicrotask(() => this.finish(this.exitCode ?? 0)); callback(); }
     });
   }
 

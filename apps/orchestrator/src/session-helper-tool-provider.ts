@@ -1444,7 +1444,7 @@ export class SessionHelperToolBridgeProvider implements BridgeToolProvider {
       assertAgentKindMatches(agentKind, target.descriptor.backendId);
       const turn = activeTurn(this.#store, targetSessionId);
       const wasActive = host.isSessionActive(targetSessionId);
-      const lastUserSendAt = latestUserMessageAt(this.#store, targetSessionId);
+      const lastUserSendAt = this.#store.findLatestVisibleUserMessageAt(targetSessionId);
       const queued = host.enqueueServiceInput({
         operationId: randomUUID(),
         sessionId: targetSessionId,
@@ -1888,27 +1888,6 @@ function runtimePhase(
   if (latestState === "completed" || latestState === "aborted") return "completed";
   if (latestState === "queued") return "queued";
   return "idle";
-}
-
-function latestUserMessageAt(store: OperationalStore, sessionId: string): number | undefined {
-  let before: bigint | undefined;
-  while (true) {
-    const page = store.listEvents({
-      sessionId,
-      ...(before === undefined ? {} : { beforeCursor: before }),
-      order: "desc",
-      limit: HISTORY_SCAN_PAGE_SIZE
-    });
-    for (const event of page) {
-      if (
-        event.payload.type === "message_complete"
-        && event.payload.role === "user"
-        && event.payload.automaticContinuation === undefined
-      ) return event.emittedAt;
-    }
-    if (page.length < HISTORY_SCAN_PAGE_SIZE) return undefined;
-    before = page.at(-1)!.globalCursor;
-  }
 }
 
 function countConversationMessages(store: OperationalStore, sessionId: string): number {

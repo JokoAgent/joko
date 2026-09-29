@@ -1,12 +1,12 @@
 import { createHash, randomUUID } from "node:crypto";
-import { lstat, mkdir, readdir, rename, rm, rmdir } from "node:fs/promises";
+import { lstat, mkdir, readdir, realpath, rename, rmdir } from "node:fs/promises";
+import { existsSync, lstatSync, renameSync, rmSync, type Stats } from "node:fs";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 
-import type { ArtifactRecord, OperationalStore } from "@joko/store";
+import type { ArtifactRecord, MaintenanceEffectRecord, MaintenanceJobRecord, OperationalStore } from "@joko/store";
 
 const ARTIFACT_ROW_PAGE_SIZE = 100_000;
 const MAXIMUM_PROTECTED_DIGESTS = 1_000;
-const MAXIMUM_ISSUED_SCANS = 256;
 const DEFAULT_TEMPORARY_FILE_MINIMUM_AGE_MS = 7 * 24 * 60 * 60 * 1_000;
 const DEFAULT_SCAN_TOKEN_TTL_MS = 5 * 60 * 1_000;
 const SHA256_PATTERN = /^[a-f0-9]{64}$/u;
@@ -52,6 +52,17 @@ export interface ArtifactCleanupResult {
   readonly skipped: number;
 }
 
+export type ArtifactCleanupStatus = "running" | "completed" | "scan-expired" | "storage-changed" | "failed";
+export type ArtifactCleanupPhase = "preparing" | "quarantining" | "deleting" | "reconciling";
+export interface ArtifactCleanupJob {
+  readonly maintenanceId: string;
+  readonly status: ArtifactCleanupStatus;
+  readonly phase: ArtifactCleanupPhase;
+  readonly percent: number;
+  readonly updatedAt: number;
+  readonly result?: ArtifactCleanupResult;
+}
+
 export interface ArtifactMaintenanceOptions {
   readonly store: OperationalStore;
   readonly rootDirectory: string;
@@ -79,10 +90,21 @@ interface ScanState {
   readonly temporaryFiles: readonly FileIdentity[];
 }
 
-interface IssuedScan {
+interface DurableArtifactScan {
   readonly fingerprint: string;
-  readonly expiresAt: number;
   readonly protectedDigestsKey: string;
+  readonly expired: readonly { readonly id: string; readonly revision: string }[];
+  readonly orphanBlobs: readonly FileIdentity[];
+  readonly temporaryFiles: readonly FileIdentity[];
+}
+
+interface DurableArtifactJob {
+  readonly expiredReferencesDeleted: number;
+}
+
+interface DurableArtifactEffect {
+  readonly identity: FileIdentity;
+  readonly quarantineRelativePath: string;
 }
 
 export class ArtifactMaintenanceScanExpiredError extends Error {
@@ -115,8 +137,9 @@ export class ArtifactMaintenance {
   readonly #now: () => number;
   readonly #temporaryFileMinimumAgeMs: number;
   readonly #scanTokenTtlMs: number;
-  readonly #issuedScans = new Map<string, IssuedScan>();
+  readonly #running = new Map<string, Promise<void>>();
   #mutationTail: Promise<void> = Promise.resolve();
+  #closing = false;
 
   constructor(options: ArtifactMaintenanceOptions) {
     if (!isAbsolute(options.rootDirectory) || resolve(options.rootDirectory) !== options.rootDirectory) {
@@ -142,15 +165,37 @@ export class ArtifactMaintenance {
   }
 
   async initialize(): Promise<void> {
+    await this.#ensureDirectories();
+    for (const job of this.#store.listMaintenanceJobs({ kind: "artifact", statuses: ["running"], limit: 256 })) {
+      this.#launch(job.id);
+    }
+    await Promise.allSettled([...this.#running.values()]);
+  }
+
+  async close(): Promise<void> {
+    this.#closing = true;
+    await Promise.allSettled([...this.#running.values()]);
+  }
+
+  async #ensureDirectories(): Promise<void> {
+    await mkdir(this.#rootDirectory, { recursive: true, mode: 0o700 });
+    const rootInfo = await lstat(this.#rootDirectory);
+    if (!rootInfo.isDirectory() || rootInfo.isSymbolicLink()) {
+      throw new Error("Artifact maintenance root is unsafe.");
+    }
     await Promise.all([
       mkdir(this.#blobsDirectory, { recursive: true, mode: 0o700 }),
       mkdir(this.#incomingDirectory, { recursive: true, mode: 0o700 }),
       mkdir(this.#trashDirectory, { recursive: true, mode: 0o700 })
     ]);
+    for (const directory of [this.#rootDirectory, this.#blobsDirectory, this.#incomingDirectory, this.#trashDirectory]) {
+      const info = await lstat(directory);
+      if (!info.isDirectory() || info.isSymbolicLink()) throw new Error("Artifact maintenance directory is unsafe.");
+    }
   }
 
   async stats(protectedSha256: readonly string[] = []): Promise<ArtifactStorageStats> {
-    await this.initialize();
+    await this.#ensureDirectories();
     const now = this.#now();
     const protectedDigests = new Set(normalizeProtectedDigests(protectedSha256));
     const records = this.#liveRecords().filter((record) =>
@@ -173,20 +218,18 @@ export class ArtifactMaintenance {
     const protectedDigests = normalizeProtectedDigests(protectedSha256);
     const state = await this.#scanState(protectedDigests);
     const expiresAt = this.#now() + this.#scanTokenTtlMs;
-    this.#purgeExpiredScans();
-    while (this.#issuedScans.size >= MAXIMUM_ISSUED_SCANS) {
-      const oldest = this.#issuedScans.keys().next().value as string | undefined;
-      if (oldest === undefined) break;
-      this.#issuedScans.delete(oldest);
-    }
     const token = createHash("sha256")
       .update(`${randomUUID()}\0${state.fingerprint}\0${expiresAt.toString(10)}`)
       .digest("hex");
-    this.#issuedScans.set(token, {
+    const payload: DurableArtifactScan = {
       fingerprint: state.fingerprint,
-      expiresAt,
-      protectedDigestsKey: protectedDigests.join("\0")
-    });
+      protectedDigestsKey: protectedDigests.join("\0"),
+      expired: state.expired.map((record) => ({ id: record.blob.id, revision: record.revision.toString() })),
+      orphanBlobs: state.orphanBlobs,
+      temporaryFiles: state.temporaryFiles
+    };
+    this.#store.createMaintenanceScan({ id: token, kind: "artifact", fingerprint: state.fingerprint,
+      payload, expiresAt, createdAt: this.#now() });
     return { ...state.report, token, expiresAt };
   }
 
@@ -202,65 +245,67 @@ export class ArtifactMaintenance {
     };
   }
 
-  cleanup(token: string, protectedSha256: readonly string[] = []): Promise<ArtifactCleanupResult> {
-    if (!/^[a-f0-9]{64}$/u.test(token)) {
-      return Promise.reject(new Error("Artifact cleanup scan token is invalid."));
-    }
+  beginCleanup(token: string, protectedSha256: readonly string[] = []): Promise<ArtifactCleanupJob> {
+    if (!SHA256_PATTERN.test(token)) return Promise.reject(new Error("Artifact cleanup scan token is invalid."));
     return this.#serializeMutation(async () => {
       const protectedDigests = normalizeProtectedDigests(protectedSha256);
-      this.#purgeExpiredScans();
-      const issued = this.#issuedScans.get(token);
-      if (issued === undefined || issued.expiresAt <= this.#now()) throw new ArtifactMaintenanceScanExpiredError();
-      if (issued.protectedDigestsKey !== protectedDigests.join("\0")) throw new ArtifactMaintenanceScanChangedError();
+      const existing = this.#store.findMaintenanceJob<DurableArtifactJob, ArtifactCleanupResult>("artifact", token);
+      if (existing !== undefined) return toCleanupJob(existing);
+      const issued = this.#store.findMaintenanceScan<DurableArtifactScan>("artifact", token);
+      if (issued === undefined || issued.state !== "available" || issued.expiresAt <= this.#now()) {
+        throw new ArtifactMaintenanceScanExpiredError();
+      }
+      if (issued.payload.protectedDigestsKey !== protectedDigests.join("\0")) {
+        throw new ArtifactMaintenanceScanChangedError();
+      }
+      const revision = this.#store.health().revision;
       const scan = await this.#scanState(protectedDigests);
-      if (scan.fingerprint !== issued.fingerprint) throw new ArtifactMaintenanceScanChangedError();
-      this.#issuedScans.delete(token);
-
-      this.#store.transaction((store) => {
-        for (const record of scan.expired) store.deleteArtifact(record.blob.id, this.#now());
+      if (this.#store.health().revision !== revision || scan.fingerprint !== issued.payload.fingerprint
+        || scan.report.unsafeEntryCount !== 0 || scan.report.missingBlobCount !== 0) {
+        throw new ArtifactMaintenanceScanChangedError();
+      }
+      const now = this.#now();
+      if (issued.expiresAt <= now) throw new ArtifactMaintenanceScanExpiredError();
+      if (this.#store.health().revision !== revision) throw new ArtifactMaintenanceScanChangedError();
+      const candidates = [
+        ...scan.orphanBlobs.map((identity) => ({ identity, kind: "artifact_blob" as const })),
+        ...scan.temporaryFiles.map((identity) => ({ identity, kind: "artifact_temporary" as const }))
+      ];
+      const created = this.#store.transaction((store) => {
+        const claimed = store.claimMaintenanceScan("artifact", token, now);
+        if (claimed?.state !== "claimed") throw new ArtifactMaintenanceScanExpiredError();
+        const job = store.createMaintenanceJob<DurableArtifactJob, ArtifactCleanupResult>({
+          id: token, kind: "artifact", scanId: token, phase: "preparing", percent: 1,
+          cancellable: false, payload: { expiredReferencesDeleted: scan.expired.length },
+          effects: candidates.map(({ identity, kind }) => {
+            const id = createHash("sha256").update(identity.relativePath).digest("hex");
+            return { id, kind, payload: {
+              identity, quarantineRelativePath: join(".maintenance-trash", token, id)
+            } satisfies DurableArtifactEffect };
+          }), createdAt: now
+        });
+        for (const record of scan.expired) {
+          const current = store.getArtifact(record.blob.id, true);
+          if (current.revision !== record.revision || !isExpired(current, now)) {
+            throw new ArtifactMaintenanceScanChangedError();
+          }
+          store.deleteArtifact(record.blob.id, now);
+        }
+        return job;
       });
-
-      const liveStorageKeys = new Set(this.#liveRecords()
-        .filter((record) => !isExpired(record, this.#now()))
-        .map((record) => resolve(record.storageKey)));
-      let blobsRemoved = 0;
-      let temporaryFilesRemoved = 0;
-      let freedBytes = 0;
-      let skipped = 0;
-
-      for (const candidate of scan.orphanBlobs) {
-        if (liveStorageKeys.has(resolve(candidate.path))) {
-          skipped += 1;
-          continue;
-        }
-        if (await this.#quarantineAndRemove(candidate)) {
-          blobsRemoved += 1;
-          freedBytes += candidate.byteLength;
-        } else {
-          skipped += 1;
-        }
-      }
-      for (const candidate of scan.temporaryFiles) {
-        if (await this.#quarantineAndRemove(candidate)) {
-          temporaryFilesRemoved += 1;
-          freedBytes += candidate.byteLength;
-        } else {
-          skipped += 1;
-        }
-      }
-      await this.#removeEmptyHashDirectories();
-      return {
-        expiredReferencesDeleted: scan.expired.length,
-        blobsRemoved,
-        temporaryFilesRemoved,
-        freedBytes,
-        skipped
-      };
+      this.#launch(token);
+      return toCleanupJob(created);
     });
   }
 
+  getCleanup(id: string): ArtifactCleanupJob | undefined {
+    if (!SHA256_PATTERN.test(id)) return undefined;
+    const job = this.#store.findMaintenanceJob<DurableArtifactJob, ArtifactCleanupResult>("artifact", id);
+    return job === undefined ? undefined : toCleanupJob(job);
+  }
+
   async #scanState(protectedDigests: readonly string[]): Promise<ScanState> {
-    await this.initialize();
+    await this.#ensureDirectories();
     const now = this.#now();
     const records = this.#liveRecords();
     const protectedSet = new Set(protectedDigests);
@@ -271,6 +316,7 @@ export class ArtifactMaintenance {
     const blobWalk = await this.#blobFiles(activeStorageKeys);
     const temporary = await this.#temporaryFiles(now, true);
     const missingBlobCount = await countMissingStorageKeys(activeStorageKeys, this.#blobsDirectory);
+    const trashUnsafeEntryCount = await this.#trashUnsafeEntryCount();
 
     const tokenMaterial = [
       ...expired.map((record) => `expired\0${record.blob.id}\0${record.revision.toString(10)}`),
@@ -278,7 +324,7 @@ export class ArtifactMaintenance {
       ...blobWalk.orphans.map(identityToken),
       ...temporary.files.map(identityToken),
       `missing\0${missingBlobCount}`,
-      `unsafe\0${blobWalk.unsafeEntryCount + temporary.unsafeEntryCount}`
+      `unsafe\0${blobWalk.unsafeEntryCount + temporary.unsafeEntryCount + trashUnsafeEntryCount}`
     ].sort().join("\n");
     const fingerprint = createHash("sha256").update(tokenMaterial).digest("hex");
     const orphanBlobBytes = sumFileBytes(blobWalk.orphans);
@@ -292,7 +338,7 @@ export class ArtifactMaintenance {
         temporaryFileCount: temporary.files.length,
         temporaryBytes,
         missingBlobCount,
-        unsafeEntryCount: blobWalk.unsafeEntryCount + temporary.unsafeEntryCount,
+        unsafeEntryCount: blobWalk.unsafeEntryCount + temporary.unsafeEntryCount + trashUnsafeEntryCount,
         cleanableBytes: orphanBlobBytes + temporaryBytes
       },
       fingerprint,
@@ -300,13 +346,6 @@ export class ArtifactMaintenance {
       orphanBlobs: blobWalk.orphans,
       temporaryFiles: temporary.files
     };
-  }
-
-  #purgeExpiredScans(): void {
-    const now = this.#now();
-    for (const [token, scan] of this.#issuedScans) {
-      if (scan.expiresAt <= now) this.#issuedScans.delete(token);
-    }
   }
 
   #liveRecords(): ArtifactRecord[] {
@@ -382,18 +421,152 @@ export class ArtifactMaintenance {
     return { files: files.sort(compareIdentity), unsafeEntryCount };
   }
 
-  async #quarantineAndRemove(expected: FileIdentity): Promise<boolean> {
-    const current = await safeFileIdentity(expected.path, this.#rootDirectory).catch(() => undefined);
-    if (current === undefined || !sameIdentity(expected, current)) return false;
-    const quarantine = join(this.#trashDirectory, randomUUID());
-    try {
-      await rename(expected.path, quarantine);
-      await rm(quarantine, { force: true });
-      return true;
-    } catch {
-      await rename(quarantine, expected.path).catch(() => undefined);
-      return false;
+  async #trashUnsafeEntryCount(): Promise<number> {
+    let unsafe = 0;
+    for (const directory of await readdir(this.#trashDirectory, { withFileTypes: true })) {
+      if (!directory.isDirectory() || directory.isSymbolicLink() || !SHA256_PATTERN.test(directory.name)) {
+        unsafe += 1;
+        continue;
+      }
+      const job = this.#store.findMaintenanceJob("artifact", directory.name);
+      const effects = job === undefined ? new Map<string, MaintenanceEffectRecord<DurableArtifactEffect>>()
+        : new Map(this.#store.listMaintenanceEffects<DurableArtifactEffect>(job.id).map((effect) => [effect.id, effect]));
+      for (const entry of await readdir(join(this.#trashDirectory, directory.name), { withFileTypes: true })) {
+        const effect = effects.get(entry.name);
+        if (!entry.isFile() || entry.isSymbolicLink() || effect === undefined
+          || !["claimed", "quarantined", "prepared"].includes(effect.state)
+          || effect.payload.quarantineRelativePath !== join(".maintenance-trash", directory.name, entry.name)) {
+          unsafe += 1;
+        }
+      }
     }
+    return unsafe;
+  }
+
+  #launch(id: string): void {
+    if (this.#running.has(id) || this.#closing) return;
+    const completion = this.#execute(id).catch((error: unknown) => {
+      const job = this.#store.getMaintenanceJob<DurableArtifactJob, ArtifactCleanupResult>("artifact", id);
+      if (job.status !== "running") return;
+      this.#store.updateMaintenanceJob({ kind: "artifact", id, status: error instanceof ArtifactMaintenanceScanChangedError
+        ? "storage_changed" : "failed", phase: "reconciling", percent: job.percent,
+      cancellable: false, cancelRequested: false, payload: job.payload, updatedAt: this.#now() });
+    }).finally(() => { this.#running.delete(id); });
+    this.#running.set(id, completion);
+  }
+
+  async #execute(id: string): Promise<void> {
+    const job = this.#store.getMaintenanceJob<DurableArtifactJob, ArtifactCleanupResult>("artifact", id);
+    if (job.status !== "running") return;
+    const effects = this.#store.listMaintenanceEffects<DurableArtifactEffect>(id);
+    for (let index = 0; index < effects.length; index += 1) {
+      const effect = effects[index];
+      if (effect === undefined) continue;
+      this.#updateJob(id, "quarantining", Math.max(1, Math.floor(5 + index * 85 / Math.max(effects.length, 1))));
+      await this.#processEffect(effect);
+    }
+    await this.#removeEmptyHashDirectories();
+    await rmdir(join(this.#trashDirectory, id)).catch(() => undefined);
+    const finalEffects = this.#store.listMaintenanceEffects<DurableArtifactEffect>(id);
+    if (finalEffects.some((effect) => effect.state === "unknown")) throw new ArtifactMaintenanceScanChangedError();
+    const result: ArtifactCleanupResult = {
+      expiredReferencesDeleted: job.payload.expiredReferencesDeleted,
+      blobsRemoved: finalEffects.filter((effect) => effect.kind === "artifact_blob" && effect.state === "completed").length,
+      temporaryFilesRemoved: finalEffects.filter((effect) => effect.kind === "artifact_temporary" && effect.state === "completed").length,
+      freedBytes: finalEffects.filter((effect) => effect.state === "completed")
+        .reduce((total, effect) => total + effect.payload.identity.byteLength, 0),
+      skipped: finalEffects.filter((effect) => effect.state === "skipped").length
+    };
+    this.#store.updateMaintenanceJob({ kind: "artifact", id, status: "completed", phase: "reconciling",
+      percent: 100, cancellable: false, cancelRequested: false, payload: job.payload, result,
+      updatedAt: this.#now() });
+  }
+
+  #updateJob(id: string, phase: ArtifactCleanupPhase, percent: number): void {
+    const job = this.#store.getMaintenanceJob<DurableArtifactJob, ArtifactCleanupResult>("artifact", id);
+    this.#store.updateMaintenanceJob({ kind: "artifact", id, status: "running", phase, percent,
+      cancellable: false, cancelRequested: false, payload: job.payload, updatedAt: this.#now() });
+  }
+
+  async #processEffect(effect: MaintenanceEffectRecord<DurableArtifactEffect>): Promise<void> {
+    if (effect.state === "completed" || effect.state === "skipped") return;
+    if (effect.state === "unknown") throw new ArtifactMaintenanceScanChangedError();
+    const { identity, quarantineRelativePath } = effect.payload;
+    const expectedId = createHash("sha256").update(identity.relativePath).digest("hex");
+    if (expectedId !== effect.id || identity.path !== resolve(this.#rootDirectory, identity.relativePath)
+      || quarantineRelativePath !== join(".maintenance-trash", effect.jobId, effect.id)
+      || !["artifact_blob", "artifact_temporary"].includes(effect.kind)) {
+      throw new ArtifactMaintenanceScanChangedError();
+    }
+    const quarantine = join(this.#rootDirectory, quarantineRelativePath);
+    await mkdir(join(this.#trashDirectory, effect.jobId), { recursive: true, mode: 0o700 });
+    const original = await safeFileIdentity(identity.path, this.#rootDirectory);
+    const held = await safeFileIdentity(quarantine, this.#rootDirectory);
+    if ((original === undefined && await lstat(identity.path).catch(() => undefined) !== undefined)
+      || (held === undefined && await lstat(quarantine).catch(() => undefined) !== undefined)) {
+      this.#recordEffect(effect, "unknown");
+      throw new ArtifactMaintenanceScanChangedError();
+    }
+    if (held !== undefined && !samePhysicalIdentity(identity, held)) {
+      this.#recordEffect(effect, "unknown");
+      throw new ArtifactMaintenanceScanChangedError();
+    }
+    if (held === undefined && original === undefined) {
+      if (effect.state === "prepared") {
+        this.#recordEffect(effect, "completed");
+        return;
+      }
+      this.#recordEffect(effect, "unknown");
+      throw new ArtifactMaintenanceScanChangedError();
+    }
+    if (held === undefined) {
+      if (original === undefined || !sameIdentity(identity, original)) {
+        this.#recordEffect(effect, "unknown");
+        throw new ArtifactMaintenanceScanChangedError();
+      }
+      if (effect.kind === "artifact_blob" && this.#store.hasLiveArtifactStorageKey(identity.path)) {
+        this.#recordEffect(effect, "skipped");
+        return;
+      }
+      this.#recordEffect(effect, "claimed");
+      await rename(identity.path, quarantine);
+      this.#recordEffect(effect, "quarantined");
+    }
+    this.#updateJob(effect.jobId, "deleting", this.#store.getMaintenanceJob("artifact", effect.jobId).percent);
+    if (effect.kind === "artifact_blob" && this.#store.hasLiveArtifactStorageKey(identity.path)) {
+      if (!existsSync(identity.path)) {
+        const current = await safeFileIdentity(quarantine, this.#rootDirectory);
+        if (current === undefined || !samePhysicalIdentity(identity, current)) {
+          this.#recordEffect(effect, "unknown");
+          throw new ArtifactMaintenanceScanChangedError();
+        }
+        renameSync(quarantine, identity.path);
+        this.#recordEffect(effect, "skipped");
+        return;
+      }
+    }
+    const finalInfo = lstatSync(quarantine, { throwIfNoEntry: false });
+    const parentInfo = lstatSync(join(this.#trashDirectory, effect.jobId), { throwIfNoEntry: false });
+    if (finalInfo === undefined || !finalInfo.isFile() || finalInfo.isSymbolicLink() || finalInfo.nlink !== 1
+      || !samePhysicalStat(identity, finalInfo) || parentInfo === undefined
+      || !parentInfo.isDirectory() || parentInfo.isSymbolicLink()) {
+      this.#recordEffect(effect, "unknown");
+      throw new ArtifactMaintenanceScanChangedError();
+    }
+    if (effect.kind === "artifact_blob" && this.#store.hasLiveArtifactStorageKey(identity.path)
+      && !existsSync(identity.path)) {
+      renameSync(quarantine, identity.path);
+      this.#recordEffect(effect, "skipped");
+      return;
+    }
+    this.#recordEffect(effect, "prepared");
+    rmSync(quarantine);
+    this.#recordEffect(effect, "completed");
+  }
+
+  #recordEffect(effect: MaintenanceEffectRecord<DurableArtifactEffect>, state: MaintenanceEffectRecord["state"]): void {
+    this.#store.updateMaintenanceEffect({ jobId: effect.jobId, id: effect.id, state,
+      payload: effect.payload, updatedAt: this.#now() });
   }
 
   async #removeEmptyHashDirectories(): Promise<void> {
@@ -462,6 +635,10 @@ async function safeFileIdentity(path: string, root: string): Promise<FileIdentit
   if (normalized === normalizedRoot || !normalized.startsWith(`${normalizedRoot}${sep}`)) return undefined;
   const info = await lstat(normalized).catch(() => undefined);
   if (info === undefined || !info.isFile() || info.isSymbolicLink() || info.nlink !== 1) return undefined;
+  const canonicalRoot = await realpath(normalizedRoot).catch(() => undefined);
+  const canonicalPath = await realpath(normalized).catch(() => undefined);
+  if (canonicalRoot === undefined || canonicalPath === undefined
+    || canonicalPath !== resolve(canonicalRoot, relative(normalizedRoot, normalized))) return undefined;
   return {
     path: normalized,
     relativePath: relative(normalizedRoot, normalized).replace(/\\/gu, "/"),
@@ -487,6 +664,32 @@ function sameIdentity(left: FileIdentity, right: FileIdentity): boolean {
     && left.birthtimeMs === right.birthtimeMs
     && left.mtimeMs === right.mtimeMs
     && left.ctimeMs === right.ctimeMs;
+}
+
+function samePhysicalIdentity(left: FileIdentity, right: FileIdentity): boolean {
+  return left.byteLength === right.byteLength && left.device === right.device
+    && left.inode === right.inode && left.birthtimeMs === right.birthtimeMs
+    && left.mtimeMs === right.mtimeMs;
+}
+
+function samePhysicalStat(left: FileIdentity, right: Stats): boolean {
+  return left.byteLength === right.size && left.device === right.dev
+    && left.inode === right.ino && left.birthtimeMs === right.birthtimeMs
+    && left.mtimeMs === right.mtimeMs;
+}
+
+function toCleanupJob(job: MaintenanceJobRecord<DurableArtifactJob, ArtifactCleanupResult>): ArtifactCleanupJob {
+  const status: ArtifactCleanupStatus = job.status === "scan_expired" ? "scan-expired"
+    : job.status === "storage_changed" ? "storage-changed"
+    : job.status === "cancelled" ? "failed" : job.status;
+  return {
+    maintenanceId: job.id,
+    status,
+    phase: job.phase as ArtifactCleanupPhase,
+    percent: job.percent,
+    updatedAt: job.updatedAt,
+    ...(job.result === undefined ? {} : { result: job.result })
+  };
 }
 
 function compareIdentity(left: FileIdentity, right: FileIdentity): number {

@@ -28,6 +28,7 @@ describe("isolated-workspace gateway", () => {
           targetId: returnedTargetId,
           displayName: "Workspace",
           serverPathDisplay: "D:\\workspace",
+          location: { kind: { case: "serviceNode", value: {} } },
           version: { revision: { value: 1n } }
         }
       }));
@@ -163,6 +164,7 @@ describe("isolated-workspace gateway", () => {
             targetId: input.targetId,
             displayName: "Workspace",
             serverPathDisplay: "D:\\workspace",
+            location: { kind: { case: "serviceNode", value: {} } },
             version: { revision: input.expectedTargetRevision }
           }
         }));
@@ -177,7 +179,14 @@ describe("isolated-workspace gateway", () => {
           result: {
             payload: {
               case: "session",
-              value: { sessionId: "session-isolated", backendId: "pi", targetId: "target-1", displayName: "Isolated", nativeBinding: { runtimeGeneration: 1n } }
+              value: {
+                sessionId: "session-isolated",
+                backendId: "pi",
+                targetId: "target-1",
+                displayName: "Isolated",
+                location: { kind: { case: "serviceNode", value: {} } },
+                nativeBinding: { runtimeGeneration: 1n }
+              }
             }
           }
         }
@@ -241,7 +250,14 @@ function transportWithSnapshot(
           snapshot: create(SnapshotSchema, {
             generation: 1n,
             resumeCursor: { generation: 1n, sequence: 0n },
-            targets: [{ targetId: "target-1", backendId: "pi", displayName: "Workspace", workspaceId: "workspace-1", version: { revision: { value: 1n } } }]
+            targets: [{
+              targetId: "target-1",
+              backendId: "pi",
+              displayName: "Workspace",
+              workspaceId: "workspace-1",
+              location: { kind: { case: "serviceNode", value: {} } },
+              version: { revision: { value: 1n } }
+            }]
           })
         }));
       }

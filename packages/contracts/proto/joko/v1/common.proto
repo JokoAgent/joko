@@ -11,13 +11,37 @@ message NativeNavigationTarget {
 
 message SessionStartTarget {}
 
-// Capability-neutral execution/filesystem location. Host credentials and
-// presented keys are intentionally not representable.
-message RemoteWorkspaceBinding {
-  string host_id = 1;
-  string workspace_root_display = 2;
-  // The Target that owns the one Host record; may differ from this binding's Target.
-  string host_target_id = 3;
+// Capability-neutral execution/filesystem location. Every public Target,
+// Session, and Workspace carries exactly one variant. Credentials, live
+// leases, and route generations are intentionally not representable here.
+message WorkspaceLocation {
+  oneof kind {
+    ServiceNodeWorkspaceLocation service_node = 1;
+    SshHostWorkspaceLocation ssh_host = 2;
+    DevicePeerWorkspaceLocation device_peer = 3;
+  }
+}
+
+// Marker only. Service-node absolute paths remain confined to the existing
+// WorkspaceDescriptor.server_path_display projection.
+message ServiceNodeWorkspaceLocation {}
+
+message SshHostWorkspaceLocation {
+  // The Target that owns the one SSH Host record; may differ from the Target
+  // whose WorkspaceLocation contains this value.
+  string host_target_id = 1;
+  string host_id = 2;
+  string workspace_root_display = 3;
+}
+
+message DevicePeerWorkspaceLocation {
+  // Stable controller and target Device identities freeze the exact control
+  // relation that admitted this Target. Live Connection, relation revision,
+  // and route generation are re-resolved at each effect boundary and are
+  // never persisted here.
+  string controller_device_id = 1;
+  string target_device_id = 2;
+  string workspace_root_display = 3;
 }
 
 import "google/protobuf/duration.proto";

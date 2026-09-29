@@ -496,7 +496,7 @@ export function resolvePermissionMutation(input: {
 
 export function sessionIdFrom(operation: Operation): string {
   if (operation.result?.payload.case !== "session") {
-    throw new Error(`Expected Session result, received ${String(operation.result?.payload.case)}.`);
+    throw new Error(`Expected Session result, received ${unexpectedOperationResult(operation)}.`);
   }
   return operation.result.payload.value.sessionId;
 }

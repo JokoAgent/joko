@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ArtifactDownloadButton } from "./ArtifactDownloadButton.js";
 import { UsageHistorySection } from "./UsageHistorySection.js";
+import { NativeCatalogAdoptionRecovery } from "./NativeCatalogAdoptionRecovery.js";
 import type { CSSProperties, JSX, KeyboardEvent as ReactKeyboardEvent, ReactNode } from "react";
 import { capabilityNames } from "@joko/contracts";
 import {
@@ -60,6 +61,7 @@ import { ProviderEditor } from "./ProviderEditor.js";
 import { ProviderFlowBackButton, ProviderFlowFooter, ProviderWizardProgress } from "./ProviderFlow.js";
 import { AppShortcutsSettings } from "./AppShortcutsSettings.js";
 import { GamepadSettings } from "./GamepadSettings.js";
+import { DedicatedHardwareSettings } from "./DedicatedHardwareSettings.js";
 import { DesktopAutoRelaunchSetting } from "./DesktopAutoRelaunchSetting.js";
 import { DesktopMainWindowCloseSetting } from "./DesktopMainWindowCloseSetting.js";
 import { DesktopBetaChannelSetting } from "./DesktopBetaChannelSetting.js";
@@ -170,6 +172,10 @@ export function SettingsPage({ controller, snapshot, activeTargetId, locale, t, 
   readonly onImportPortableSession?: () => void;
 }): JSX.Element {
   const nativeTaskStatusVisible = typeof window !== "undefined" && window.jokoDesktop?.capabilities.includes("native.taskStatus") === true;
+  const dedicatedHardwareBridge = typeof window !== "undefined"
+    && window.jokoDesktop?.capabilities.includes("hardware.dedicatedInput") === true
+    ? window.jokoDesktop.dedicatedHardware
+    : undefined;
   const [location, setLocation] = useState<SettingsLocation>(() => availableSettingsLocationFromHash(
     typeof window === "undefined" ? "" : window.location.hash,
     nativeTaskStatusVisible
@@ -292,7 +298,7 @@ export function SettingsPage({ controller, snapshot, activeTargetId, locale, t, 
                 <SettingsPageSection id="policy"><SettingsSectionHeading title={t("settings.policy")} body={t("settings.policyBody")} /><PolicySettings controller={controller} snapshot={snapshot} runAction={runAction} showHeading={false} t={t} /></SettingsPageSection>
               </>)}
             {section === "personalization" && <PersonalizationSettings controller={controller} snapshot={snapshot} runAction={personalizationRunAction} onSuccess={showSuccess} t={t} />}
-            {section === "shortcuts" && <><AppShortcutsSettings controller={controller} overrides={controller.state.preferences.appShortcutOverrides} t={t} /><GamepadSettings t={t} listSkills={controller.listSkills} serverId={controller.state.activeProfile?.serverId} connected={controller.state.connectionState === "connected"} /></>}
+            {section === "shortcuts" && <><AppShortcutsSettings controller={controller} overrides={controller.state.preferences.appShortcutOverrides} t={t} /><DedicatedHardwareSettings t={t} bridge={dedicatedHardwareBridge} listSkills={controller.listSkills} serverId={controller.state.activeProfile?.serverId} connected={controller.state.connectionState === "connected"} /><GamepadSettings t={t} listSkills={controller.listSkills} serverId={controller.state.activeProfile?.serverId} connected={controller.state.connectionState === "connected"} /></>}
             {section === "voice" && <VoiceInputSettings controller={controller} t={t} />}
             {section === "taskStatus" && <><SettingsHeading title={t("settings.nativeTaskStatus.title")} body={t("settings.nativeTaskStatus.body")} /><NativeTaskStatusSettings t={t} showHeading={false} /></>}
             {section === "connections" && <><SettingsHeading title={t("settings.connections")} body={t("settings.connectionsBody")} /><SettingsPageSection id="connections"><ConnectionSettings controller={controller} snapshot={snapshot} locale={locale} t={t} runAction={runAction} showHeading={false} /></SettingsPageSection><SettingsPageSection id="remoteHosts"><RemoteHostsSettings controller={controller} snapshot={snapshot} activeTargetId={activeTargetId} runAction={runAction} t={t} /></SettingsPageSection><SshKeySettings controller={controller} t={t} /></>}
@@ -967,6 +973,7 @@ export function TaskImportSettings({ controller, snapshot, onImportPortable, run
   const [selected, setSelected] = useState<ReadonlySet<string>>(() => new Set());
   const [expandedGroups, setExpandedGroups] = useState<ReadonlySet<string>>(() => new Set());
   const [importing, setImporting] = useState(false);
+  const [adoptionRefresh, setAdoptionRefresh] = useState(0);
   const [itemStates, setItemStates] = useState<ReadonlyMap<string, "importing" | "success" | "error">>(() => new Map());
   const scanGeneration = useRef(0);
 
@@ -1060,17 +1067,43 @@ export function TaskImportSettings({ controller, snapshot, onImportPortable, run
   };
   const importSelected = (): void => {
     if (selectedItems.length === 0 || importing) return;
+    const batchController = controllerRef.current;
+    const batchProfile = batchController.state.activeProfile;
+    const batchConnectionGeneration = batchController.state.connectionGeneration;
+    const batchConnectionState = batchController.state.connectionState;
+    const batchBackendGenerations = new Map(selectedItems.map((item) => [
+      item.backendId,
+      snapshotRef.current.backends.find((backend) => backend.id === item.backendId)?.instanceGeneration
+    ] as const));
+    const isCurrentBatchOwner = (): boolean => {
+      const currentProfile = batchController.state.activeProfile;
+      return controllerRef.current === batchController
+        && currentProfile?.id === batchProfile?.id
+        && currentProfile?.serverId === batchProfile?.serverId
+        && batchController.state.connectionGeneration === batchConnectionGeneration
+        && batchController.state.connectionState === batchConnectionState
+        && [...batchBackendGenerations].every(([backendId, generation]) => {
+          const backend = snapshotRef.current.backends.find((item) => item.id === backendId);
+          return backend !== undefined
+            && backend.instanceGeneration === generation
+            && backend.capabilities.get("session.catalog")?.supported === true;
+        });
+    };
+    const assertBatchOwner = (): void => {
+      if (!isCurrentBatchOwner()) throw new Error(tRef.current("settings.sessionImport.ownerChanged"));
+    };
     setImporting(true);
     setItemStates(new Map(selectedItems.map((item) => [item.key, "importing"] as const)));
     runAction("import-native-sessions", async () => {
       try {
+        assertBatchOwner();
         const pending = [...selectedItems];
         const preflightResults = new Map<string, NativeSessionCatalogView | Error>();
         await Promise.all([...new Set(selectedItems.map((item) => item.backendId))].map(async (backendId) => {
           try {
             preflightResults.set(
               backendId,
-              await controllerRef.current.scanNativeSessionCatalog(backendId, { force: true })
+              await batchController.scanNativeSessionCatalog(backendId, { force: true })
             );
           } catch (error) {
             preflightResults.set(
@@ -1081,6 +1114,7 @@ export function TaskImportSettings({ controller, snapshot, onImportPortable, run
         }));
         const failures = new Set<string>();
         const failureMessages = new Map<string, string>();
+        const outcomes = new Map<string, "success" | "error">();
         let importedCount = 0;
         let updatedCount = 0;
         const targetPromises = new Map<string, Promise<{ readonly targetId: string; readonly created: boolean }>>();
@@ -1095,8 +1129,9 @@ export function TaskImportSettings({ controller, snapshot, onImportPortable, run
           const promise = existingTargetId !== undefined
             ? Promise.resolve({ targetId: existingTargetId, created: false })
             : (async () => {
+                assertBatchOwner();
                 if (path === undefined || path.trim() === "") throw new Error(tRef.current("settings.sessionImport.missingWorkspace"));
-                const targetId = await controllerRef.current.createTarget({
+                const targetId = await batchController.createTarget({
                   backendId,
                   name: nativeImportWorkspaceName(path),
                   workspaceKind: "userProject",
@@ -1111,6 +1146,7 @@ export function TaskImportSettings({ controller, snapshot, onImportPortable, run
         };
         const worker = async (): Promise<void> => {
           while (pending.length > 0) {
+            if (!isCurrentBatchOwner()) return;
             const item = pending.shift();
             if (item === undefined) return;
             let createdSessionId: string | undefined;
@@ -1132,7 +1168,8 @@ export function TaskImportSettings({ controller, snapshot, onImportPortable, run
                   );
                   visibleProjectTargetId = projectTarget.targetId;
                 }
-                await controllerRef.current.moveSessionProject(
+                assertBatchOwner();
+                await batchController.moveSessionProject(
                   candidate.existingSessionId,
                   visibleProjectTargetId,
                   {
@@ -1143,7 +1180,8 @@ export function TaskImportSettings({ controller, snapshot, onImportPortable, run
                 );
                 if (visibleProjectTargetId !== undefined) visibleProjectTargetIds.add(visibleProjectTargetId);
                 updatedCount += 1;
-                setItemStates((current) => new Map(current).set(item.key, "success"));
+                outcomes.set(item.key, "success");
+                if (isCurrentBatchOwner()) setItemStates((current) => new Map(current).set(item.key, "success"));
                 continue;
               }
               const runtimeTarget = await resolveTarget(item.backendId, candidate.workingDirectory, candidate.targetId);
@@ -1159,7 +1197,8 @@ export function TaskImportSettings({ controller, snapshot, onImportPortable, run
               const defaults = activeSnapshot.settings.backendSettings.find((candidate) => candidate.backendId === backend?.id);
               const execution = resolveNewSessionExecutionOptions(backend, activeSnapshot.models, "");
               const desiredPermission = defaults?.permissionMode ?? activeSnapshot.settings.policy.defaultMode;
-              const { sessionId } = await controllerRef.current.createSession({
+              assertBatchOwner();
+              const { sessionId } = await batchController.createSession({
                 targetId: runtimeTarget.targetId,
                 name: candidate.title?.trim() || candidate.id,
                 nativeStart: { kind: "attach", reference: candidate.reference },
@@ -1181,48 +1220,71 @@ export function TaskImportSettings({ controller, snapshot, onImportPortable, run
               visibleProjectTargetId = projectTarget?.targetId;
               if (visibleProjectTargetId !== undefined) visibleProjectTargetIds.add(visibleProjectTargetId);
               importedCount += 1;
-              setItemStates((current) => new Map(current).set(item.key, "success"));
+              outcomes.set(item.key, "success");
+              if (isCurrentBatchOwner()) setItemStates((current) => new Map(current).set(item.key, "success"));
             } catch (error) {
               let message = nativeImportErrorMessage(error, tRef.current("error.unexpected"));
-              if (createdSessionId !== undefined) {
+              if (createdSessionId !== undefined && isCurrentBatchOwner()) {
                 try {
-                  await controllerRef.current.deleteSession(createdSessionId, false);
+                  await batchController.deleteSession(createdSessionId, false);
                 } catch (cleanupFailure) {
                   message = `${message} ${nativeImportErrorMessage(cleanupFailure, tRef.current("error.unexpected"))}`;
                 }
               }
               failures.add(item.key);
               failureMessages.set(item.key, message);
-              setItemStates((current) => new Map(current).set(item.key, "error"));
+              outcomes.set(item.key, "error");
+              if (isCurrentBatchOwner()) setItemStates((current) => new Map(current).set(item.key, "error"));
             }
           }
         };
         await Promise.all(Array.from({ length: Math.min(3, selectedItems.length) }, () => worker()));
+        let ownerChanged = !isCurrentBatchOwner();
         let cleanupError: unknown;
         try {
+          if (ownerChanged) throw new Error(tRef.current("settings.sessionImport.ownerChanged"));
           await Promise.all([...createdTargetIds]
             .filter((targetId) => !visibleProjectTargetIds.has(targetId))
-            .map((targetId) => controllerRef.current.archiveTarget(targetId, true)));
+            .map((targetId) => {
+              assertBatchOwner();
+              return batchController.archiveTarget(targetId, true);
+            }));
         } catch (error) {
           cleanupError = error;
         }
-        await controllerRef.current.refresh();
-        await runScan(true);
-        if (failures.size > 0) {
-          setSelected(failures);
-          setItemStates(new Map([...failures].map((key) => [key, "error"] as const)));
+        ownerChanged ||= !isCurrentBatchOwner();
+        let refreshError: unknown;
+        if (!ownerChanged) {
+          try {
+            assertBatchOwner();
+            await batchController.refresh();
+            assertBatchOwner();
+            await runScan(true);
+          } catch (error) {
+            refreshError = error;
+          }
         }
-        if (importedCount > 0 || updatedCount > 0) {
+        ownerChanged ||= !isCurrentBatchOwner();
+        if (isCurrentBatchOwner()) {
+          setSelected(failures);
+          setItemStates(outcomes);
+        }
+        if (!ownerChanged && (importedCount > 0 || updatedCount > 0)) {
           onSuccess(tRef.current("settings.sessionImport.importComplete", { imported: importedCount, updated: updatedCount }));
         }
-        if (failures.size > 0) {
-          const details = [...new Set(failureMessages.values())];
-          if (cleanupError !== undefined) details.push(nativeImportErrorMessage(cleanupError, tRef.current("error.unexpected")));
-          throw new Error(`${tRef.current("settings.sessionImport.importFailed", { count: failures.size })} ${details.join(" ")}`.trim());
+        const details = [...new Set(failureMessages.values())];
+        if (cleanupError !== undefined) details.push(nativeImportErrorMessage(cleanupError, tRef.current("error.unexpected")));
+        if (refreshError !== undefined) details.push(nativeImportErrorMessage(refreshError, tRef.current("error.unexpected")));
+        if (ownerChanged) details.push(tRef.current("settings.sessionImport.ownerChanged"));
+        if (ownerChanged || failures.size > 0 || cleanupError !== undefined || refreshError !== undefined) {
+          const summary = failures.size > 0
+            ? tRef.current("settings.sessionImport.importFailed", { count: failures.size })
+            : tRef.current("settings.sessionImport.followupFailed");
+          throw new Error(`${summary} ${[...new Set(details)].join(" ")}`.trim());
         }
-        if (cleanupError !== undefined) throw cleanupError;
       } finally {
         setImporting(false);
+        setAdoptionRefresh((value) => value + 1);
       }
     });
   };
@@ -1237,6 +1299,10 @@ export function TaskImportSettings({ controller, snapshot, onImportPortable, run
         <Button tone="primary" disabled={scanning || sources.length === 0} onClick={() => void runScan(true)}><RefreshCw className={cx(scanning && "is-spinning")} aria-hidden="true" />{scanning ? t("settings.sessionImport.scanning") : t("settings.sessionImport.scan")}</Button>
       </div>
     </header>
+    <NativeCatalogAdoptionRecovery controller={controller} t={t} refreshKey={adoptionRefresh} onResolved={() => {
+      void controller.refresh().catch(() => undefined);
+      void runScan(true).catch(() => undefined);
+    }} />
     <section className="task-import-surface" aria-busy={scanning}>
       {sources.length === 0 ? <div className="task-import-empty"><FileInput aria-hidden="true" /><strong>{t("settings.sessionImport.unavailableTitle")}</strong><p>{t("settings.sessionImport.unavailableBody")}</p></div>
         : scan === undefined ? <div className="task-import-empty"><FileInput aria-hidden="true" /><strong>{t("settings.sessionImport.emptyTitle")}</strong><p>{t("settings.sessionImport.emptyBody")}</p></div>
@@ -1650,10 +1716,39 @@ export function ArtifactStorageSettingsCard({ controller, snapshot, t }: {
   const [busy, setBusy] = useState<"stats" | "scan" | "reconcile" | "cleanup">("stats");
   const [error, setError] = useState<string>();
   const activeOperation = useRef(false);
+  const progressGenerationRef = useRef(0);
+  const confirmRef = useRef<HTMLButtonElement>(null);
   const controllerRef = useRef(controller);
   const snapshotRef = useRef(snapshot);
   controllerRef.current = controller;
   snapshotRef.current = snapshot;
+
+  const pollCleanup = async (first: ArtifactStorageCleanupView): Promise<void> => {
+    const generation = ++progressGenerationRef.current;
+    let next = first;
+    while (generation === progressGenerationRef.current) {
+      setCleanup(next);
+      if (next.status !== "running") {
+        try { window.sessionStorage.removeItem("joko.artifact-storage.maintenance-id"); } catch { /* Storage may be unavailable. */ }
+        if (next.status === "completed") await loadStats();
+        if (next.status === "scanExpired") setError(t("settings.artifactStorageScanExpired"));
+        if (next.status === "storageChanged") setError(t("settings.artifactStorageChanged"));
+        if (next.status === "failed") setError(t("settings.artifactStorageCleanupFailed"));
+        return;
+      }
+      await new Promise<void>((resolveDelay) => window.setTimeout(resolveDelay, 250));
+      if (generation !== progressGenerationRef.current) return;
+      next = await controllerRef.current.getArtifactStorageCleanup(next.maintenanceId);
+    }
+  };
+
+  const resumeCleanup = async (): Promise<boolean> => {
+    let maintenanceId: string | null = null;
+    try { maintenanceId = window.sessionStorage.getItem("joko.artifact-storage.maintenance-id"); } catch { /* Storage may be unavailable. */ }
+    if (maintenanceId === null || !/^[a-f0-9]{64}$/u.test(maintenanceId)) return false;
+    await pollCleanup(await controllerRef.current.getArtifactStorageCleanup(maintenanceId));
+    return true;
+  };
 
   const loadStats = async (): Promise<void> => {
     setBusy("stats");
@@ -1682,6 +1777,11 @@ export function ArtifactStorageSettingsCard({ controller, snapshot, t }: {
       }
     })();
     return () => { mounted = false; };
+  }, [t]);
+
+  useEffect(() => {
+    void resumeCleanup().catch(() => setError(t("settings.artifactStorageCleanupFailed")));
+    return () => { progressGenerationRef.current += 1; };
   }, [t]);
 
   useEffect(() => {
@@ -1738,14 +1838,16 @@ export function ArtifactStorageSettingsCard({ controller, snapshot, t }: {
     void runExclusive(async () => {
       try {
         const protectedSha256 = await activeDraftAttachmentSha256(controllerRef.current, snapshotRef.current);
-        const result = await controllerRef.current.cleanupArtifactStorage(accepted.token, protectedSha256);
+        try { window.sessionStorage.setItem("joko.artifact-storage.maintenance-id", accepted.token); } catch { /* Storage may be unavailable. */ }
+        const result = await controllerRef.current.beginArtifactStorageCleanup(accepted.token, protectedSha256);
         setScan(undefined);
-        setCleanup(result);
-        if (result.outcome === "scanExpired") setError(t("settings.artifactStorageScanExpired"));
-        if (result.outcome === "storageChanged") setError(t("settings.artifactStorageChanged"));
-        if (result.outcome === "completed") await loadStats();
+        await pollCleanup(result);
       } catch {
-        setError(t("settings.artifactStorageCleanupFailed"));
+        try {
+          if (!await resumeCleanup()) setError(t("settings.artifactStorageCleanupFailed"));
+        } catch {
+          setError(t("settings.artifactStorageCleanupFailed"));
+        }
       }
     });
   };
@@ -1754,7 +1856,10 @@ export function ArtifactStorageSettingsCard({ controller, snapshot, t }: {
   const stats = capability?.stats;
   return <>
     <SettingsSectionHeading title={t("settings.artifactStorageTitle")} body={t("settings.artifactStorageBody")} />
-    {error !== undefined && <ErrorBanner message={error} onRetry={() => { void loadStats(); }} onClose={() => setError(undefined)} />}
+    {error !== undefined && <ErrorBanner message={error} onRetry={() => {
+      void resumeCleanup().then((resumed) => { if (!resumed) void loadStats(); })
+        .catch(() => setError(t("settings.artifactStorageCleanupFailed")));
+    }} onClose={() => setError(undefined)} />}
     <section className="settings-card artifact-storage-card">
       <div className="setting-row">
         <div><strong><Database aria-hidden="true" />{t("settings.artifactStorageUsage")}</strong><span>{stats === undefined
@@ -1778,39 +1883,56 @@ export function ArtifactStorageSettingsCard({ controller, snapshot, t }: {
           unsafe: reconcile.unsafeEntryCount
         })}</span>}
       </div>}
-      {scan !== undefined && <div className="artifact-storage-report" role="status">
-        <strong>{t("settings.artifactStorageConfirmTitle")}</strong>
-        <span>{t("settings.artifactStorageScanSummary", {
-          bytes: formatArtifactBytes(scan.cleanableBytes),
-          references: scan.expiredReferenceCount,
-          blobs: scan.orphanBlobCount,
-          temporary: scan.temporaryFileCount
-        })}</span>
-        {scan.protectedReferenceCount > 0 && <span>{t("settings.artifactStorageProtected", { count: scan.protectedReferenceCount })}</span>}
-        {(scan.missingBlobCount > 0 || scan.unsafeEntryCount > 0) && <span className="artifact-storage-warning">{t("settings.artifactStorageScanWarnings", {
-          missing: scan.missingBlobCount,
-          unsafe: scan.unsafeEntryCount
-        })}</span>}
-        <div className="artifact-storage-confirm-actions">
-          <Button onClick={() => setScan(undefined)}>{t("common.cancel")}</Button>
-          <Button tone="primary" onClick={confirmCleanup}>{t("settings.artifactStorageConfirmCleanup", { bytes: formatArtifactBytes(scan.cleanableBytes) })}</Button>
-        </div>
-      </div>}
-      {cleanup?.outcome === "completed" && <div className="artifact-storage-report is-healthy" role="status">
+      {cleanup?.status === "completed" && cleanup.result !== undefined && <div className="artifact-storage-report is-healthy" role="status">
         <strong>{t("settings.artifactStorageCleanupComplete")}</strong>
         <span>{t("settings.artifactStorageCleanupSummary", {
-          bytes: formatArtifactBytes(cleanup.freedBytes),
-          references: cleanup.expiredReferencesDeleted,
-          blobs: cleanup.blobsRemoved,
-          temporary: cleanup.temporaryFilesRemoved,
-          skipped: cleanup.skipped
+          bytes: formatArtifactBytes(cleanup.result.freedBytes),
+          references: cleanup.result.expiredReferencesDeleted,
+          blobs: cleanup.result.blobsRemoved,
+          temporary: cleanup.result.temporaryFilesRemoved,
+          skipped: cleanup.result.skipped
         })}</span>
       </div>}
       <div className="settings-toolbar artifact-storage-actions">
-        <Button disabled={!supported} onClick={runReconcile}>{t("settings.artifactStorageReconcile")}</Button>
-        <Button tone="primary" disabled={!supported} onClick={startScan}>{t("settings.artifactStorageScan")}</Button>
+        <Button disabled={!supported || cleanup?.status === "running"} onClick={runReconcile}>{t("settings.artifactStorageReconcile")}</Button>
+        <Button tone="primary" disabled={!supported || cleanup?.status === "running"} onClick={startScan}>{t("settings.artifactStorageScan")}</Button>
       </div>
     </section>
+    <Modal
+      key={cleanup?.status === "running" ? `cleanup:${cleanup.maintenanceId}` : `scan:${scan?.token ?? ""}`}
+      open={scan !== undefined || cleanup?.status === "running"}
+      title={cleanup?.status === "running" ? t("settings.artifactStorageExecuting") : t("settings.artifactStorageConfirmTitle")}
+      description={cleanup?.status === "running" ? undefined : t("settings.artifactStorageConfirmBody")}
+      onClose={() => { if (cleanup?.status !== "running") setScan(undefined); }}
+      dialogRole="alertdialog"
+      dismissOnBackdrop={cleanup?.status !== "running"}
+      size="medium"
+      initialFocus={() => confirmRef.current}
+    >
+      {scan !== undefined && cleanup?.status !== "running" && <>
+        <div className="artifact-storage-report" role="status">
+          <span>{t("settings.artifactStorageScanSummary", {
+            bytes: formatArtifactBytes(scan.cleanableBytes), references: scan.expiredReferenceCount,
+            blobs: scan.orphanBlobCount, temporary: scan.temporaryFileCount
+          })}</span>
+          {scan.protectedReferenceCount > 0 && <span>{t("settings.artifactStorageProtected", { count: scan.protectedReferenceCount })}</span>}
+          {(scan.missingBlobCount > 0 || scan.unsafeEntryCount > 0) && <span className="artifact-storage-warning">{t("settings.artifactStorageScanWarnings", {
+            missing: scan.missingBlobCount, unsafe: scan.unsafeEntryCount
+          })}</span>}
+        </div>
+        <div className="modal__actions">
+          <Button onClick={() => setScan(undefined)}>{t("common.cancel")}</Button>
+          <button ref={confirmRef} type="button" className="button button--danger"
+            disabled={scan.missingBlobCount > 0 || scan.unsafeEntryCount > 0}
+            onClick={confirmCleanup}>{t("settings.artifactStorageConfirmCleanup", { bytes: formatArtifactBytes(scan.cleanableBytes) })}</button>
+        </div>
+      </>}
+      {cleanup?.status === "running" && <div className="task-history-busy" role="status" aria-live="polite">
+        <Spinner label={t("settings.artifactStorageExecuting")} />
+        <span>{t(`settings.artifactStoragePhase.${cleanup.phase}`)} · {cleanup.percent}%</span>
+        <progress max={100} value={cleanup.percent} aria-label={`${cleanup.percent}%`} />
+      </div>}
+    </Modal>
   </>;
 }
 

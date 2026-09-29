@@ -4,7 +4,7 @@ import { createConnectTransport } from "@connectrpc/connect-web";
 import { createTerminalGateway } from "./terminal-gateway.js";
 import { createSimulatorViewerGateway } from "./simulator-viewer-gateway.js";
 import { UsageReportGroup } from "@joko/contracts";
-import { SshKeyService, SshAgentState, SshKeyPassphrasePurpose, SshInstallShell, type SshKey, type CredentialUploadTicket } from "@joko/contracts";
+import { SshKeyService, SshAgentState, SshAgentHostPlatform, SshKeyPassphrasePurpose, SshInstallShell, type SshKey, type CredentialUploadTicket } from "@joko/contracts";
 import type { SshKeyView, SshKeyCatalogView, SshKeyGenerateDraft, SshKeyInstallCommandDraft } from "./model.js";
 import type { UsageReportQueryView, UsageReportView } from "./model.js";
 import {
@@ -12,7 +12,8 @@ import {
   AudioArtifactKind,
   type AudioArtifactMetadata,
   ArtifactService,
-  ArtifactStorageCleanupOutcome,
+  ArtifactStorageCleanupStatus,
+  ArtifactStorageCleanupPhase,
   AndroidAdbPathSource,
   AndroidAutomationIssue,
   AndroidAutomationRuntimeState,
@@ -93,6 +94,10 @@ import {
   PartnerService,
   CredentialKind,
   CredentialService,
+  DevicePeerCapabilityKind,
+  DevicePeerDirectoryAvailability,
+  DevicePeerDirectoryKind,
+  DevicePeerService,
   DeviceKind,
   DevicePresenceState,
   ConnectionState,
@@ -180,6 +185,11 @@ import {
   PortableSessionFidelity,
   PortableSessionImportStatus,
   PortableSessionService,
+  PortableReplacementNativeState,
+  PortableReplacementWorktreeState,
+  PortableReplacementInspection,
+  NativeCatalogAdoptionState,
+  NativeCatalogAdoptionInspection,
   PiQueueMode,
   PolicySettingsSchema,
   ProviderConfigurationSchema,
@@ -234,6 +244,7 @@ import {
   RemoteHostStatus,
   RetryState,
   RuntimeRecoveryState,
+  RuntimeProcessRole,
   TaskHistoryMaintenancePhase,
   TaskHistoryMaintenanceStatus,
   TaskHistoryRetention,
@@ -338,6 +349,7 @@ import {
   WorktreeSourceStrategy,
   WorkspaceService,
   WorkspaceKind,
+  WorkspaceLocationSchema,
   type Artifact,
   type BackgroundTask as ProtoBackgroundTask,
   type BackendDescriptor,
@@ -379,6 +391,8 @@ import {
   type CredentialDescriptor,
   type Device,
   type DeviceControlRelation,
+  type DevicePeerDescriptor as ProtoDevicePeerDescriptor,
+  type DevicePeerRouteIdentity as ProtoDevicePeerRouteIdentity,
   type DisplayArgument,
   type ErrorInfo,
   type Event,
@@ -500,7 +514,9 @@ import {
   type RuntimeToolCatalog,
   type TaskHistoryCleanupResult,
   type TaskHistoryMaintenanceProgress,
+  type ArtifactStorageCleanupProgress,
   type WorkspaceDescriptor,
+  type WorkspaceLocation,
   type WorkspaceEntry,
   type WorkspaceFileChange,
   type WorkspaceSearchMatch,
@@ -671,6 +687,8 @@ import type {
   PortableSessionFidelityView,
   PortableSessionImportDraftView,
   PortableSessionImportResultView,
+  PortableReplacementCleanupView,
+  PortableReplacementCleanupResolutionView,
   ProviderDraft,
   BackendSettingsUpdate,
   ProviderRuntimeView,
@@ -693,6 +711,12 @@ import type {
   RuntimeToolCatalogView,
   RuntimeToolFieldTypeView,
   RemoteConnectionView,
+  DevicePeerDirectoryInspectionView,
+  DevicePeerDirectoryListingView,
+  DevicePeerRecentDirectoryView,
+  DevicePeerRouteIdentityView,
+  DevicePeerTargetDraft,
+  DevicePeerView,
   RemoteBackendRuntimeFailureCodeView,
   RemoteBackendRuntimeInstallEventView,
   RemoteBackendRuntimeView,
@@ -701,6 +725,7 @@ import type {
   RemoteHostDirectoryListingView,
   RemoteHostDraft,
   RemoteHostView,
+  RemoteWorkspaceView,
   ScheduleView,
   ScheduleDraft,
   ScheduleHistoryPageView,
@@ -829,6 +854,8 @@ import type {
   NativeSessionCandidateView,
   NativeSessionCatalogEntryView,
   NativeSessionCatalogView,
+  NativeCatalogAdoptionView,
+  NativeCatalogAdoptionResolutionView,
   NewSessionDraft,
   McpServerView,
   NativeSessionTreeNodeView,
@@ -1331,29 +1358,26 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     };
   }
 
-  async cleanupArtifactStorage(
+  async beginArtifactStorageCleanup(
     scanToken: string,
     protectedSha256: readonly string[] = []
   ): Promise<ArtifactStorageCleanupView> {
     if (!/^[a-f0-9]{64}$/u.test(scanToken)) throw new GatewayError("Artifact storage scan token is invalid.");
     const client = createClient(ArtifactService, this.requireTransport());
-    const response = await client.cleanupArtifactStorage({
+    const response = await client.beginArtifactStorageCleanup({
       scanToken,
       protectedSha256: artifactProtectedSha256(protectedSha256)
     });
-    if (response.outcome === ArtifactStorageCleanupOutcome.SCAN_EXPIRED) return { outcome: "scanExpired" };
-    if (response.outcome === ArtifactStorageCleanupOutcome.STORAGE_CHANGED) return { outcome: "storageChanged" };
-    if (response.outcome !== ArtifactStorageCleanupOutcome.COMPLETED || response.result === undefined) {
-      throw new GatewayError("Orchestrator returned an invalid Artifact storage cleanup result.");
-    }
-    return {
-      outcome: "completed",
-      expiredReferencesDeleted: artifactStorageCount(response.result.expiredReferencesDeleted),
-      blobsRemoved: artifactStorageCount(response.result.blobsRemoved),
-      temporaryFilesRemoved: artifactStorageCount(response.result.temporaryFilesRemoved),
-      freedBytes: artifactStorageCount(response.result.freedBytes),
-      skipped: artifactStorageCount(response.result.skipped)
-    };
+    if (response.progress === undefined) throw new GatewayError("Orchestrator returned no Artifact storage cleanup progress.");
+    return artifactCleanupProgress(response.progress);
+  }
+
+  async getArtifactStorageCleanup(maintenanceId: string): Promise<ArtifactStorageCleanupView> {
+    if (!/^[a-f0-9]{64}$/u.test(maintenanceId)) throw new GatewayError("Artifact storage maintenance ID is invalid.");
+    const client = createClient(ArtifactService, this.requireTransport());
+    const response = await client.getArtifactStorageCleanup({ maintenanceId });
+    if (response.progress === undefined) throw new GatewayError("Orchestrator returned no Artifact storage cleanup progress.");
+    return artifactCleanupProgress(response.progress);
   }
 
   async getTaskHistoryMaintenanceSupport(): Promise<TaskHistoryMaintenanceSupportView> {
@@ -1891,6 +1915,11 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     if (payload?.case !== "target" || payload.value.targetId.length === 0) {
       throw new GatewayError("Orchestrator completed project creation without a typed project result.");
     }
+    // The mutation's background refresh may have captured a pre-commit owner
+    // snapshot. A managed dialogue immediately creates a task against this
+    // Target, so project the committed revision before returning its ID.
+    await this.#refreshPromise?.catch(() => undefined);
+    await this.refresh();
     return payload.value.targetId;
   }
 
@@ -1913,6 +1942,28 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     const payload = operation.result?.payload;
     if (payload?.case !== "target" || payload.value.targetId.length === 0) {
       throw new GatewayError("Orchestrator completed remote project creation without a typed project result.");
+    }
+    return payload.value.targetId;
+  }
+
+  async createDevicePeerTarget(draft: DevicePeerTargetDraft): Promise<string> {
+    if (draft.name.trim() === "" || draft.backendId.trim() === ""
+      || !validDevicePeerRoute(draft.peer) || !absoluteDevicePeerPath(draft.workspacePath)) {
+      throw new GatewayError("A current Backend, Device peer route and absolute project directory are required.");
+    }
+    const operation = await this.submit({
+      case: "createDevicePeerTarget",
+      value: {
+        backendId: draft.backendId,
+        displayName: draft.name.trim(),
+        peer: devicePeerRouteMessage(draft.peer),
+        workspacePath: draft.workspacePath,
+        createIfMissing: draft.createIfMissing
+      }
+    }, true);
+    const payload = operation.result?.payload;
+    if (payload?.case !== "target" || payload.value.targetId.length === 0) {
+      throw new GatewayError("Orchestrator completed Device project creation without a typed project result.");
     }
     return payload.value.targetId;
   }
@@ -1968,16 +2019,18 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     if (remoteWorkspaceRoot === "") {
       throw new GatewayError("A remote workspace root is required.");
     }
-    const workspaceLocationUpdate = patch.workspaceLocation === undefined
-      ? { case: undefined }
+    const location: MessageInitShape<typeof WorkspaceLocationSchema> | undefined = patch.workspaceLocation === undefined
+      ? undefined
       : patch.workspaceLocation.kind === "serviceNode"
-        ? { case: "serviceNodeWorkspace" as const, value: true }
+        ? { kind: { case: "serviceNode" as const, value: {} } }
         : {
-            case: "remoteWorkspace" as const,
-            value: {
-              hostTargetId: targetId,
-              hostId: patch.workspaceLocation.hostId,
-              workspaceRootDisplay: remoteWorkspaceRoot!
+            kind: {
+              case: "sshHost" as const,
+              value: {
+                hostTargetId: targetId,
+                hostId: patch.workspaceLocation.hostId,
+                workspaceRootDisplay: remoteWorkspaceRoot!
+              }
             }
           };
     await this.submit({
@@ -1986,7 +2039,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
         targetId,
         ...(patch.name === undefined ? {} : { displayName: patch.name.trim() }),
         ...(patch.pinned === undefined ? {} : { pinned: patch.pinned }),
-        workspaceLocationUpdate
+        ...(location === undefined ? {} : { location })
       }
     }, true, [{ entity: { kind: EntityKind.TARGET, id: targetId }, expectedRevision: { value: expectedRevision } }]);
   }
@@ -2141,6 +2194,65 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
       existingCount: numberValue(response.existingCount),
       snapshotToken: response.snapshotToken
     };
+  }
+
+  async listNativeCatalogAdoptions(signal?: AbortSignal): Promise<readonly NativeCatalogAdoptionView[]> {
+    const client = createClient(SessionService, this.requireTransport());
+    const values: NativeCatalogAdoptionView[] = [];
+    const seenIds = new Set<string>();
+    const consumedTokens = new Set<string>();
+    let pageToken = "";
+    let total: bigint | undefined;
+    for (let page = 0; page < 100; page += 1) {
+      const response = await client.listNativeCatalogAdoptions(
+        { page: { pageSize: 500, pageToken } },
+        { signal: signal ?? this.#abort?.signal }
+      );
+      const pageTotal = response.page?.totalSize;
+      if (pageTotal === undefined || pageTotal < 0n || pageTotal > 50_000n
+        || (total !== undefined && total !== pageTotal)) {
+        throw new GatewayError("Orchestrator returned an inconsistent native adoption directory.");
+      }
+      total = pageTotal;
+      for (const record of response.adoptions) {
+        const mapped = mapNativeCatalogAdoption(record);
+        if (seenIds.has(mapped.operationId)) {
+          throw new GatewayError("Orchestrator repeated a native adoption Operation.");
+        }
+        seenIds.add(mapped.operationId);
+        values.push(mapped);
+      }
+      const next = response.page?.nextPageToken ?? "";
+      if (next === "") {
+        if (BigInt(values.length) !== total) {
+          throw new GatewayError("Orchestrator returned an incomplete native adoption directory.");
+        }
+        return values;
+      }
+      if (next === pageToken || consumedTokens.has(next) || response.adoptions.length === 0) {
+        throw new GatewayError("Orchestrator returned a cyclic native adoption page.");
+      }
+      consumedTokens.add(next);
+      pageToken = next;
+    }
+    throw new GatewayError("Native adoption directory exceeded the safe pagination limit.");
+  }
+
+  async reconcileNativeCatalogAdoption(operationId: string): Promise<NativeCatalogAdoptionResolutionView> {
+    if (!validSessionMentionId(operationId)) throw new GatewayError("Native adoption Operation ID is invalid.");
+    const client = createClient(SessionService, this.requireTransport());
+    const response = await client.reconcileNativeCatalogAdoption(
+      { operationId },
+      this.#abort === undefined ? undefined : { signal: this.#abort.signal }
+    );
+    if (response.adoption === undefined) throw new GatewayError("Orchestrator omitted the native adoption receipt.");
+    const adoption = mapNativeCatalogAdoption(response.adoption);
+    if (adoption.operationId !== operationId) throw new GatewayError("Orchestrator returned another native adoption Operation.");
+    const inspection = response.inspection === NativeCatalogAdoptionInspection.PRESENT ? "present"
+      : response.inspection === NativeCatalogAdoptionInspection.ABSENT ? "absent"
+        : response.inspection === NativeCatalogAdoptionInspection.UNKNOWN ? "unknown" : undefined;
+    if (inspection === undefined) throw new GatewayError("Orchestrator returned an unknown native adoption inspection.");
+    return { adoption, inspection };
   }
 
   async setModel(sessionId: string, providerId: string, modelId: string, effort: string | undefined, fastMode: boolean): Promise<void> {
@@ -2362,11 +2474,29 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     readonly refreshWorktreeRemote?: boolean;
   }): Promise<PortableSessionImportResultView> {
     const client = createClient(PortableSessionService, this.requireTransport());
+    const options = this.#abort === undefined ? undefined : { signal: this.#abort.signal };
     const hasModel = input.execution.providerId !== undefined && input.execution.providerId !== ""
       && input.execution.modelId !== undefined && input.execution.modelId !== "";
+    const intent = JSON.stringify([
+      "portable-session-import",
+      input.draftId,
+      input.targetId,
+      hasModel ? input.execution.providerId : null,
+      hasModel ? input.execution.modelId : null,
+      hasModel ? input.execution.effort ?? null : null,
+      hasModel ? input.execution.fastMode : false,
+      input.execution.permissionMode,
+      input.execution.planMode,
+      input.overwrite,
+      input.useWorktree,
+      input.useWorktree ? input.worktreeSourceRef ?? null : null,
+      input.useWorktree && input.refreshWorktreeRemote === true
+    ]);
+    const digest = await sha256Hex(new TextEncoder().encode(intent).buffer as ArrayBuffer);
+    const operationId = `${digest.slice(0, 8)}-${digest.slice(8, 12)}-${digest.slice(12, 16)}-${digest.slice(16, 20)}-${digest.slice(20, 32)}`;
     try {
       const response = await client.commitPortableSessionImport({
-        operationId: randomUuid(),
+        operationId,
         draftId: input.draftId,
         targetId: input.targetId,
         ...(hasModel ? {
@@ -2387,7 +2517,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
           ? { worktreeSourceRef: input.worktreeSourceRef }
           : {}),
         refreshWorktreeRemote: input.useWorktree && input.refreshWorktreeRemote === true
-      }, this.#abort === undefined ? undefined : { signal: this.#abort.signal });
+      }, options);
       const result = response.result;
       if (result === undefined || result.sessionId.trim() === "") {
         throw new GatewayError("Orchestrator completed portable task import without a task result.");
@@ -2437,6 +2567,44 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
         code: "PORTABLE_SESSION_ACTIVATION_FAILED"
       });
     }
+  }
+
+  async getPortableReplacementCleanup(importedSessionId: string): Promise<PortableReplacementCleanupView | undefined> {
+    const client = createClient(PortableSessionService, this.requireTransport());
+    const response = await client.getPortableReplacementCleanup(
+      { importedSessionId },
+      this.#abort === undefined ? undefined : { signal: this.#abort.signal }
+    );
+    return response.cleanup === undefined ? undefined : mapPortableReplacementCleanup(response.cleanup, importedSessionId);
+  }
+
+  async reconcilePortableReplacementCleanup(importedSessionId: string): Promise<PortableReplacementCleanupResolutionView> {
+    const client = createClient(PortableSessionService, this.requireTransport());
+    const response = await client.reconcilePortableReplacementCleanup(
+      { importedSessionId },
+      this.#abort === undefined ? undefined : { signal: this.#abort.signal }
+    );
+    if (response.cleanup === undefined) throw new GatewayError("Portable replacement cleanup response is missing.");
+    return {
+      cleanup: mapPortableReplacementCleanup(response.cleanup, importedSessionId),
+      inspection: mapPortableReplacementInspection(response.inspection)
+    };
+  }
+
+  async retryPortableReplacementCleanup(
+    importedSessionId: string,
+    expectedRevision: bigint
+  ): Promise<PortableReplacementCleanupResolutionView> {
+    const client = createClient(PortableSessionService, this.requireTransport());
+    const response = await client.retryPortableReplacementCleanup(
+      { importedSessionId, expectedRevision, confirmNativeDelete: true },
+      this.#abort === undefined ? undefined : { signal: this.#abort.signal }
+    );
+    if (response.cleanup === undefined) throw new GatewayError("Portable replacement cleanup response is missing.");
+    return {
+      cleanup: mapPortableReplacementCleanup(response.cleanup, importedSessionId),
+      inspection: mapPortableReplacementInspection(response.inspection)
+    };
   }
 
   async executeUserShell(sessionId: string, command: string, excludeFromContext: boolean): Promise<void> {
@@ -4084,16 +4252,12 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
       throw new GatewayError("Orchestrator returned an invalid runtime-process capture time.");
     }
     const processes = response.processes.map((process): RuntimeProcessUsageView => {
-      const generation = exactSafeUnsignedNumber(process.runtimeGeneration);
       const pid = exactSafeUnsignedNumber(process.processId);
       const memoryKb = exactSafeUnsignedNumber(process.memoryKb);
       const processCount = exactSafeUnsignedNumber(BigInt(process.processCount));
       const processInstanceId = process.processInstanceId?.trim();
       if (
         process.backendId !== backendId
-        || process.sessionId.trim() === ""
-        || generation === undefined
-        || generation < 1
         || pid === undefined
         || pid < 1
         || memoryKb === undefined
@@ -4104,14 +4268,34 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
         || (process.terminable && !isRuntimeProcessInstanceId(processInstanceId))
         || (!process.terminable && processInstanceId !== undefined)
       ) throw new GatewayError("Orchestrator returned an invalid runtime-process fence or metric.");
-      return {
+      const metrics = {
         backendId: process.backendId,
-        sessionId: process.sessionId,
-        generation,
         pid,
         cpuPercent: process.cpuPercent,
         memoryKb,
-        processCount,
+        processCount
+      } as const;
+      if (process.role === RuntimeProcessRole.CONTROL_PLANE) {
+        if (process.sessionId !== undefined || process.runtimeGeneration !== undefined || process.terminable) {
+          throw new GatewayError("Orchestrator returned an invalid control-plane process scope.");
+        }
+        return { ...metrics, role: "control-plane", terminable: false };
+      }
+      const generation = process.runtimeGeneration === undefined
+        ? undefined
+        : exactSafeUnsignedNumber(process.runtimeGeneration);
+      if (
+        process.role !== RuntimeProcessRole.TASK_HOST
+        || process.sessionId === undefined
+        || process.sessionId.trim() === ""
+        || generation === undefined
+        || generation < 1
+      ) throw new GatewayError("Orchestrator returned an invalid task-host process scope.");
+      return {
+        ...metrics,
+        role: "task-host",
+        sessionId: process.sessionId,
+        generation,
         terminable: process.terminable,
         ...(processInstanceId === undefined ? {} : { processInstanceId })
       };
@@ -4208,6 +4392,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
   async terminateRuntimeProcess(process: RuntimeProcessUsageView): Promise<void> {
     if (
       process.backendId.trim() === ""
+      || process.role !== "task-host"
       || process.sessionId.trim() === ""
       || !Number.isSafeInteger(process.generation)
       || process.generation < 1
@@ -7442,6 +7627,9 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     const response = await createClient(SshKeyService, scope.transport).listSshKeys({}, { signal: scope.signal });
     scope.signal.throwIfAborted();
     return { keys: response.keys.map(mapSshKey), generationSupported: response.generationSupported,
+      servicePlatform: response.agentHostPlatform === SshAgentHostPlatform.WINDOWS ? "windows"
+        : response.agentHostPlatform === SshAgentHostPlatform.MACOS ? "macos"
+          : response.agentHostPlatform === SshAgentHostPlatform.LINUX ? "linux" : "unknown",
       agentState: response.agentState === SshAgentState.READY ? "ready" : response.agentState === SshAgentState.UNAVAILABLE ? "unavailable" : "failed" };
   }
 
@@ -7491,6 +7679,133 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     const response = await createClient(SshKeyService, scope.transport).beginSshKeyPassphraseUpload({ purpose, ...key }, { signal: scope.signal });
     scope.signal.throwIfAborted();
     return this.uploadCredentialTicket(secret, response.ticket, scope);
+  }
+
+  async listDevicePeers(signal?: AbortSignal): Promise<readonly DevicePeerView[]> {
+    const scope = this.captureActionScope(signal);
+    const client = createClient(DevicePeerService, scope.transport);
+    const peers: DevicePeerView[] = [];
+    const consumedTokens = new Set<string>();
+    const identities = new Set<string>();
+    let pageToken = "";
+    for (let page = 0; page < MAX_COMPLETE_MESSAGE_SEARCH_PAGES; page += 1) {
+      const response = await client.listDevicePeers(
+        { page: { pageSize: 500, pageToken } },
+        { signal: scope.signal }
+      );
+      scope.signal.throwIfAborted();
+      for (const descriptor of response.peers) {
+        const peer = mapDevicePeer(descriptor);
+        const key = devicePeerRouteKey(peer.route);
+        if (identities.has(key)) throw new GatewayError("Orchestrator returned a duplicate Device peer route.");
+        identities.add(key);
+        peers.push(peer);
+      }
+      const nextPageToken = response.page?.nextPageToken ?? "";
+      if (nextPageToken === "") return peers.sort(compareDevicePeers);
+      if (nextPageToken === pageToken || consumedTokens.has(nextPageToken)) {
+        throw new GatewayError("Orchestrator returned a cyclic Device peer catalog page token.");
+      }
+      consumedTokens.add(nextPageToken);
+      pageToken = nextPageToken;
+    }
+    throw new GatewayError("Device peer catalog pagination exceeded its safety limit.");
+  }
+
+  async listDevicePeerRecentDirectories(
+    peer: DevicePeerRouteIdentityView,
+    signal?: AbortSignal
+  ): Promise<readonly DevicePeerRecentDirectoryView[]> {
+    if (!validDevicePeerRoute(peer)) throw new GatewayError("A current Device peer route is required.");
+    const scope = this.captureActionScope(signal);
+    const client = createClient(DevicePeerService, scope.transport);
+    const directories: DevicePeerRecentDirectoryView[] = [];
+    const consumedTokens = new Set<string>();
+    const paths = new Set<string>();
+    let pageToken = "";
+    for (let page = 0; page < MAX_COMPLETE_MESSAGE_SEARCH_PAGES; page += 1) {
+      const response = await client.listDevicePeerRecentDirectories({
+        peer: devicePeerRouteMessage(peer),
+        page: { pageSize: 200, pageToken }
+      }, { signal: scope.signal });
+      scope.signal.throwIfAborted();
+      if (!sameDevicePeerRoute(response.peer, peer)) {
+        throw new GatewayError("Orchestrator returned recent directories for another Device peer route.");
+      }
+      for (const directory of response.directories) {
+        if (directory.name.trim() === "" || !absoluteDevicePeerPath(directory.path)
+          || paths.has(directory.path) || directory.lastUsedAt === undefined
+          || (directory.availability !== DevicePeerDirectoryAvailability.EXISTS
+            && directory.availability !== DevicePeerDirectoryAvailability.MISSING)) {
+          throw new GatewayError("Orchestrator returned an invalid Device peer recent directory.");
+        }
+        paths.add(directory.path);
+        directories.push({
+          name: directory.name,
+          path: directory.path,
+          availability: directory.availability === DevicePeerDirectoryAvailability.EXISTS ? "exists" : "missing",
+          lastUsedAt: timestampMs(directory.lastUsedAt)
+        });
+      }
+      const nextPageToken = response.page?.nextPageToken ?? "";
+      if (nextPageToken === "") return directories;
+      if (nextPageToken === pageToken || consumedTokens.has(nextPageToken)) {
+        throw new GatewayError("Orchestrator returned a cyclic Device peer recent-directory page token.");
+      }
+      consumedTokens.add(nextPageToken);
+      pageToken = nextPageToken;
+    }
+    throw new GatewayError("Device peer recent-directory pagination exceeded its safety limit.");
+  }
+
+  async listDevicePeerDirectories(
+    peer: DevicePeerRouteIdentityView,
+    path: string,
+    signal?: AbortSignal
+  ): Promise<DevicePeerDirectoryListingView> {
+    if (!validDevicePeerRoute(peer) || (path !== "" && !absoluteDevicePeerPath(path))) {
+      throw new GatewayError("A current Device peer route and host-native absolute directory are required.");
+    }
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(DevicePeerService, scope.transport).listDevicePeerDirectories({
+      peer: devicePeerRouteMessage(peer), path
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    if (!sameDevicePeerRoute(response.peer, peer) || !absoluteDevicePeerPath(response.path)
+      || !absoluteDevicePeerPath(response.parentPath) || response.directories.length > 200
+      || response.directories.some((entry) => entry.name.trim() === "" || !absoluteDevicePeerPath(entry.path))) {
+      throw new GatewayError("Orchestrator returned a directory listing for another Device peer route or path.");
+    }
+    return {
+      peer: { ...peer },
+      path: response.path,
+      parentPath: response.parentPath,
+      directories: response.directories.map((entry) => ({ name: entry.name, path: entry.path })),
+      truncated: response.truncated
+    };
+  }
+
+  async inspectDevicePeerDirectory(
+    peer: DevicePeerRouteIdentityView,
+    path: string,
+    signal?: AbortSignal
+  ): Promise<DevicePeerDirectoryInspectionView> {
+    if (!validDevicePeerRoute(peer) || !absoluteDevicePeerPath(path)) {
+      throw new GatewayError("A current Device peer route and host-native absolute project directory are required.");
+    }
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(DevicePeerService, scope.transport).inspectDevicePeerDirectory({
+      peer: devicePeerRouteMessage(peer), path
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    if (!sameDevicePeerRoute(response.peer, peer) || !absoluteDevicePeerPath(response.path)) {
+      throw new GatewayError("Orchestrator inspected another Device peer route or path.");
+    }
+    const kind = response.kind === DevicePeerDirectoryKind.DIRECTORY ? "directory" as const
+      : response.kind === DevicePeerDirectoryKind.FILE ? "file" as const
+        : response.kind === DevicePeerDirectoryKind.MISSING ? "missing" as const : undefined;
+    if (kind === undefined) throw new GatewayError("Orchestrator returned an unknown Device peer directory kind.");
+    return { peer: { ...peer }, path: response.path, kind };
   }
 
   async listRemoteHosts(targetId: string, signal?: AbortSignal): Promise<readonly RemoteHostView[]> {
@@ -9425,10 +9740,7 @@ function remapSessionProjection(raw: Snapshot, snapshot: AppSnapshot, sessionId:
 function mapTargetView(target: Snapshot["targets"][number], workspaces: readonly WorkspaceDescriptor[]): AppSnapshot["targets"][number] {
   const revision = target.version?.revision?.value;
   if (revision === undefined || revision < 1n) throw new GatewayError("Orchestrator returned a Target without a current revision.");
-  if (target.remoteWorkspace !== undefined && (target.remoteWorkspace.hostTargetId.trim() === ""
-    || target.remoteWorkspace.hostId.trim() === "" || !target.remoteWorkspace.workspaceRootDisplay.startsWith("/"))) {
-    throw new GatewayError("Orchestrator returned a Target with an incomplete remote workspace binding.");
-  }
+  const remoteWorkspace = mapRemoteWorkspaceLocation(target.location, "Target");
   const workspace = workspaces.find((candidate) => candidate.workspaceId === target.workspaceId);
   return {
     id: target.targetId,
@@ -9440,13 +9752,7 @@ function mapTargetView(target: Snapshot["targets"][number], workspaces: readonly
     trusted: workspace?.trusted ?? false,
     pinned: target.pinned,
     archived: target.state === 2,
-    ...(target.remoteWorkspace === undefined ? {} : {
-      remoteWorkspace: {
-        hostTargetId: target.remoteWorkspace.hostTargetId,
-        hostId: target.remoteWorkspace.hostId,
-        workspaceRoot: target.remoteWorkspace.workspaceRootDisplay
-      }
-    }),
+    ...(remoteWorkspace === undefined ? {} : { remoteWorkspace }),
     ...(target.error?.message ? { error: presentJokoServiceTerminology(target.error.message) } : {})
   };
 }
@@ -10902,6 +11208,40 @@ function taskHistoryCleanupProgress(value: TaskHistoryMaintenanceProgress): Task
   }
 }
 
+function artifactCleanupProgress(value: ArtifactStorageCleanupProgress): ArtifactStorageCleanupView {
+  if (!/^[a-f0-9]{64}$/u.test(value.maintenanceId)
+    || !Number.isSafeInteger(value.percent) || value.percent < 0 || value.percent > 100) {
+    throw new GatewayError("Orchestrator returned invalid Artifact storage cleanup progress.");
+  }
+  const phase = (() => {
+    switch (value.phase) {
+      case ArtifactStorageCleanupPhase.PREPARING: return "preparing" as const;
+      case ArtifactStorageCleanupPhase.QUARANTINING: return "quarantining" as const;
+      case ArtifactStorageCleanupPhase.DELETING: return "deleting" as const;
+      case ArtifactStorageCleanupPhase.RECONCILING: return "reconciling" as const;
+      default: throw new GatewayError("Orchestrator returned an invalid Artifact storage cleanup phase.");
+    }
+  })();
+  const common = { maintenanceId: value.maintenanceId, phase, percent: value.percent,
+    updatedAt: timestampMs(value.updatedAt) };
+  switch (value.status) {
+    case ArtifactStorageCleanupStatus.RUNNING: return { ...common, status: "running" };
+    case ArtifactStorageCleanupStatus.COMPLETED:
+      if (value.result === undefined) throw new GatewayError("Orchestrator returned no completed Artifact storage cleanup result.");
+      return { ...common, status: "completed", result: {
+        expiredReferencesDeleted: artifactStorageCount(value.result.expiredReferencesDeleted),
+        blobsRemoved: artifactStorageCount(value.result.blobsRemoved),
+        temporaryFilesRemoved: artifactStorageCount(value.result.temporaryFilesRemoved),
+        freedBytes: artifactStorageCount(value.result.freedBytes),
+        skipped: artifactStorageCount(value.result.skipped)
+      } };
+    case ArtifactStorageCleanupStatus.SCAN_EXPIRED: return { ...common, status: "scanExpired" };
+    case ArtifactStorageCleanupStatus.STORAGE_CHANGED: return { ...common, status: "storageChanged" };
+    case ArtifactStorageCleanupStatus.FAILED: return { ...common, status: "failed" };
+    default: throw new GatewayError("Orchestrator returned an invalid Artifact storage cleanup status.");
+  }
+}
+
 function voiceInputState(value: VoiceInputState): VoiceInputStateView {
   switch (value) {
     case VoiceInputState.IDLE: return "idle";
@@ -11158,6 +11498,7 @@ function mapSession(
   const contextState = session.contextState;
   const compacting = compactingOverride ?? contextState?.compacting;
   const attention = session.attention;
+  const remoteWorkspace = mapRemoteWorkspaceLocation(session.location, "Session");
   const attentionKind = attention?.kind === SessionAttentionKind.DONE
     ? "done" as const
     : attention?.kind === SessionAttentionKind.AWAITING
@@ -11183,7 +11524,7 @@ function mapSession(
       : {
           derivationOrigin: mapSessionDerivationOrigin(session.derivationOrigin)
         }),
-    ...(session.remoteWorkspace === undefined ? {} : { remoteWorkspace: true }),
+    ...(remoteWorkspace === undefined ? {} : { remoteWorkspace }),
     name: session.displayName || "Untitled task",
     ...(session.taskSummary === "" ? {} : { summary: session.taskSummary }),
     state: sessionViewState(session.state, activeRun?.state),
@@ -11233,6 +11574,9 @@ function mapSession(
     codeHostPullRequests: session.codeHostPullRequests.map(mapCodeHostPullRequest),
     createdAt: timestampMs(session.createdAt),
     updatedAt: timestampMs(session.lastActivityAt) || timestampMs(session.createdAt),
+    ...(session.lastUserInputAt === undefined
+      ? {}
+      : { lastUserInputAt: timestampMs(session.lastUserInputAt) }),
     ...(cumulativeUsage === undefined ? {} : { usage: mapUsageTokens(cumulativeUsage) }),
     ...(context === undefined ? {} : {
       context: {
@@ -11558,6 +11902,44 @@ function unavailableSessionModel(
     outputCostMicrosPerMillion: 0,
     currencyCode: "USD"
   };
+}
+
+function mapRemoteWorkspaceLocation(
+  location: WorkspaceLocation | undefined,
+  owner: "Target" | "Session" | "Workspace"
+): RemoteWorkspaceView | undefined {
+  if (location === undefined || location.kind.case === undefined) {
+    throw new GatewayError(`Orchestrator returned a ${owner} without an explicit workspace location.`);
+  }
+  if (location.kind.case === "serviceNode") return undefined;
+  if (location.kind.case === "sshHost") {
+    const value = location.kind.value;
+    if (value.hostTargetId.trim() === "" || value.hostId.trim() === ""
+      || !absoluteRemoteWorkspaceRoot(value.workspaceRootDisplay)) {
+      throw new GatewayError(`Orchestrator returned a ${owner} with an incomplete SSH workspace location.`);
+    }
+    return {
+      kind: "ssh",
+      hostTargetId: value.hostTargetId,
+      hostId: value.hostId,
+      workspaceRoot: value.workspaceRootDisplay
+    };
+  }
+  const value = location.kind.value;
+  if (value.controllerDeviceId.trim() === "" || value.targetDeviceId.trim() === ""
+    || !absoluteDevicePeerPath(value.workspaceRootDisplay)) {
+    throw new GatewayError(`Orchestrator returned a ${owner} with an incomplete Device workspace location.`);
+  }
+  return {
+    kind: "device_peer",
+    controllerDeviceId: value.controllerDeviceId,
+    targetDeviceId: value.targetDeviceId,
+    workspaceRoot: value.workspaceRootDisplay
+  };
+}
+
+function absoluteRemoteWorkspaceRoot(value: string): boolean {
+  return value.startsWith("/") && !value.includes("\0");
 }
 
 function modelRouteEnabled(
@@ -12241,6 +12623,7 @@ function mapQuestionChoice(choice: QuestionChoice): InteractionView["options"][n
 
 function mapWorkspace(workspace: WorkspaceDescriptor, entries: readonly WorkspaceEntry[]): WorkspaceView {
   const statuses = workspaceStatusMap(workspace);
+  const remoteWorkspace = mapRemoteWorkspaceLocation(workspace.location, "Workspace");
   return {
     id: workspace.workspaceId,
     targetId: workspace.targetId,
@@ -12248,6 +12631,7 @@ function mapWorkspace(workspace: WorkspaceDescriptor, entries: readonly Workspac
     kind: workspace.kind === WorkspaceKind.MANAGED_DIALOGUE ? "managedDialogue" : "userProject",
     serverPath: workspace.serverPathDisplay,
     trusted: workspace.trusted,
+    ...(remoteWorkspace === undefined ? {} : { remoteWorkspace }),
     ...(workspace.git?.branchName ? { branch: workspace.git.branchName } : {}),
     ...(workspace.git?.headCommit ? { head: workspace.git.headCommit } : {}),
     detachedHead: workspace.git?.detachedHead === true,
@@ -15606,6 +15990,35 @@ function mapNativeSessionCatalogEntry(entry: NativeSessionCatalogEntry): NativeS
   };
 }
 
+function mapNativeCatalogAdoption(
+  value: import("@joko/contracts").NativeCatalogAdoption
+): NativeCatalogAdoptionView {
+  const state = value.state === NativeCatalogAdoptionState.PENDING ? "pending"
+    : value.state === NativeCatalogAdoptionState.ADOPTED ? "adopted"
+      : value.state === NativeCatalogAdoptionState.ABSENT ? "absent" : undefined;
+  const updatedAt = timestampMs(value.updatedAt);
+  if (state === undefined || !validSessionMentionId(value.operationId)
+    || !validSessionMentionId(value.backendId) || !validSessionMentionId(value.targetId)
+    || value.title.trim().length === 0 || value.title.length > 1_024
+    || /[\u0000-\u001f\u007f]/u.test(value.title)
+    || value.revision <= 0n || value.updatedAt === undefined
+    || !Number.isSafeInteger(updatedAt) || updatedAt < 0
+    || (state === "adopted" ? !validSessionMentionId(value.sessionId)
+      : value.sessionId !== undefined)) {
+    throw new GatewayError("Orchestrator returned an invalid native adoption receipt.");
+  }
+  return {
+    operationId: value.operationId,
+    backendId: value.backendId,
+    targetId: value.targetId,
+    title: value.title,
+    state,
+    revision: value.revision,
+    updatedAt,
+    ...(value.sessionId === undefined ? {} : { sessionId: value.sessionId })
+  };
+}
+
 function runtimeCommandSource(value: number): RuntimeCommandView["source"] {
   if (value === 1) return "extension";
   if (value === 2) return "prompt";
@@ -16254,6 +16667,94 @@ function nativeTreeNodeView(
     active: node.active,
     children
   };
+}
+
+function mapDevicePeer(descriptor: ProtoDevicePeerDescriptor): DevicePeerView {
+  const route = mapDevicePeerRoute(descriptor.route);
+  if (descriptor.displayName.trim() === "" || descriptor.platform.trim() === ""
+    || descriptor.presence !== DevicePresenceState.ONLINE
+    || (descriptor.kind !== DeviceKind.DESKTOP && descriptor.kind !== DeviceKind.SERVICE)) {
+    throw new GatewayError("Orchestrator returned an ineligible Device peer.");
+  }
+  const capabilities: DevicePeerView["capabilities"][number][] = [];
+  const seen = new Set<DevicePeerCapabilityKind>();
+  for (const capability of descriptor.capabilities) {
+    if (seen.has(capability)) throw new GatewayError("Orchestrator returned duplicate Device peer capabilities.");
+    seen.add(capability);
+    if (capability === DevicePeerCapabilityKind.FILES) capabilities.push("files");
+    else if (capability === DevicePeerCapabilityKind.PROCESS) capabilities.push("process");
+    else if (capability === DevicePeerCapabilityKind.TERMINAL) capabilities.push("terminal");
+    else if (capability === DevicePeerCapabilityKind.FORWARDING) capabilities.push("forwarding");
+    else throw new GatewayError("Orchestrator returned an unknown Device peer capability.");
+  }
+  if (!seen.has(DevicePeerCapabilityKind.FILES) || !seen.has(DevicePeerCapabilityKind.PROCESS)) {
+    throw new GatewayError("Orchestrator returned a Device peer without files and process capabilities.");
+  }
+  return {
+    route,
+    name: descriptor.displayName,
+    kind: descriptor.kind === DeviceKind.DESKTOP ? "desktop" : "service",
+    platform: descriptor.platform,
+    capabilities
+  };
+}
+
+function mapDevicePeerRoute(route: ProtoDevicePeerRouteIdentity | undefined): DevicePeerRouteIdentityView {
+  const mapped = {
+    targetDeviceId: route?.targetDeviceId ?? "",
+    relationId: route?.relationId ?? "",
+    targetDeviceRevision: route?.targetDeviceRevision?.value ?? 0n,
+    relationRevision: route?.relationRevision?.value ?? 0n,
+    routeGeneration: route?.routeGeneration ?? 0n
+  };
+  if (!validDevicePeerRoute(mapped)) throw new GatewayError("Orchestrator returned an incomplete Device peer route.");
+  return mapped;
+}
+
+function validDevicePeerRoute(route: DevicePeerRouteIdentityView): boolean {
+  return route.targetDeviceId.trim() !== "" && !route.targetDeviceId.includes("\0")
+    && route.relationId.trim() !== "" && !route.relationId.includes("\0")
+    && route.targetDeviceRevision > 0n && route.relationRevision >= 0n && route.routeGeneration > 0n;
+}
+
+function devicePeerRouteMessage(route: DevicePeerRouteIdentityView): MessageInitShape<typeof import("@joko/contracts").DevicePeerRouteIdentitySchema> {
+  return {
+    targetDeviceId: route.targetDeviceId,
+    relationId: route.relationId,
+    targetDeviceRevision: { value: route.targetDeviceRevision },
+    relationRevision: { value: route.relationRevision },
+    routeGeneration: route.routeGeneration
+  };
+}
+
+function sameDevicePeerRoute(
+  actual: ProtoDevicePeerRouteIdentity | undefined,
+  expected: DevicePeerRouteIdentityView
+): boolean {
+  return actual?.targetDeviceId === expected.targetDeviceId
+    && actual.relationId === expected.relationId
+    && actual.targetDeviceRevision?.value === expected.targetDeviceRevision
+    && actual.relationRevision?.value === expected.relationRevision
+    && actual.routeGeneration === expected.routeGeneration;
+}
+
+function devicePeerRouteKey(route: DevicePeerRouteIdentityView): string {
+  return JSON.stringify([
+    route.targetDeviceId,
+    route.relationId,
+    route.targetDeviceRevision.toString(),
+    route.relationRevision.toString(),
+    route.routeGeneration.toString()
+  ]);
+}
+
+function compareDevicePeers(left: DevicePeerView, right: DevicePeerView): number {
+  return left.name.localeCompare(right.name) || left.route.targetDeviceId.localeCompare(right.route.targetDeviceId);
+}
+
+function absoluteDevicePeerPath(value: string): boolean {
+  return value.length > 0 && !/[\p{Cc}]/u.test(value)
+    && (value.startsWith("/") || /^[A-Za-z]:[\\/]/u.test(value) || /^\\\\[^\\/]+[\\/][^\\/]+/u.test(value));
 }
 
 function requireRemoteHost(host: ProtoRemoteHost | undefined): RemoteHostView {
@@ -19416,6 +19917,37 @@ function mapPortableSessionImportStatus(
   if (value === PortableSessionImportStatus.READY) return "ready";
   if (value === PortableSessionImportStatus.IMPORTED_ACTIVATION_FAILED) return "imported_activation_failed";
   throw new GatewayError("Orchestrator returned an unknown portable task activation status.");
+}
+
+function mapPortableReplacementCleanup(
+  value: import("@joko/contracts").PortableReplacementCleanup,
+  importedSessionId: string
+): PortableReplacementCleanupView {
+  if (value.importedSessionId !== importedSessionId || value.revision <= 0n) {
+    throw new GatewayError("Orchestrator returned portable cleanup for a different task or revision.");
+  }
+  const updatedAt = timestampMs(value.updatedAt);
+  if (value.updatedAt === undefined || !Number.isSafeInteger(updatedAt) || updatedAt < 0) {
+    throw new GatewayError("Orchestrator returned an invalid portable cleanup time.");
+  }
+  const nativeState = value.nativeState === PortableReplacementNativeState.PENDING ? "pending"
+    : value.nativeState === PortableReplacementNativeState.DISPATCHED ? "dispatched"
+      : value.nativeState === PortableReplacementNativeState.UNKNOWN ? "unknown"
+        : value.nativeState === PortableReplacementNativeState.COMPLETED ? "completed"
+          : undefined;
+  const worktreeState = value.worktreeState === PortableReplacementWorktreeState.PENDING ? "pending"
+    : value.worktreeState === PortableReplacementWorktreeState.COMPLETED ? "completed" : undefined;
+  if (nativeState === undefined || worktreeState === undefined) {
+    throw new GatewayError("Orchestrator returned an unknown portable cleanup state.");
+  }
+  return { importedSessionId, nativeState, worktreeState, revision: value.revision, updatedAt };
+}
+
+function mapPortableReplacementInspection(value: PortableReplacementInspection): "present" | "absent" | "unknown" {
+  if (value === PortableReplacementInspection.PRESENT) return "present";
+  if (value === PortableReplacementInspection.ABSENT) return "absent";
+  if (value === PortableReplacementInspection.UNKNOWN) return "unknown";
+  throw new GatewayError("Orchestrator returned an unknown portable cleanup inspection.");
 }
 
 function mapPortableSessionImportDraft(

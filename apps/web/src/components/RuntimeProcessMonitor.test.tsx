@@ -5,13 +5,20 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AppController } from "../controller.js";
 import { translate } from "../i18n.js";
-import { emptySnapshot, type AppSnapshot, type RuntimeProcessUsageView } from "../model.js";
+import { emptySnapshot, type AppSnapshot, type RuntimeProcessUsageView, type RuntimeTaskHostProcessUsageView } from "../model.js";
+import { terminateRuntimeProcessWithCurrentFence, type RuntimeProcessDiagnosticsSnapshot } from "../runtime-process-diagnostics.js";
 import {
   formatRuntimeProcessCpu,
   formatRuntimeProcessMemory,
+  mergeDesktopRuntimeProcessDisplay,
+  mergeRuntimeProcessDiagnosticsDisplay,
   nextRuntimeProcessSort,
   RuntimeProcessMonitor,
-  sortRuntimeProcesses
+  RuntimeProcessMonitorSurface,
+  sortRuntimeProcesses,
+  staleRuntimeProcessDiagnosticsDisplay,
+  staleDesktopRuntimeProcessDisplay,
+  type RuntimeProcessDiagnosticsDisplay
 } from "./RuntimeProcessMonitor.js";
 
 const roots: Root[] = [];
@@ -39,6 +46,36 @@ describe("RuntimeProcessMonitor", () => {
       .map((item) => item.sessionId)).toEqual(["alpha", "beta"]);
   });
 
+  it("renders a shared Backend control plane as read-only without a Session label", async () => {
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    roots.push(root);
+    const value = display("owner-one", "ready", [{
+      backendId: "backend-local",
+      role: "control-plane",
+      pid: 91,
+      cpuPercent: 4.5,
+      memoryKb: 8_192,
+      processCount: 2,
+      terminable: false
+    }], 100);
+    await act(async () => root.render(<RuntimeProcessMonitorSurface
+      display={value}
+      runAction={(_key, work) => { void work(); }}
+      t={(key, values) => translate("en", key, values)}
+      onRefresh={async () => undefined}
+      onTerminate={async () => { throw new Error("control plane must remain read-only"); }}
+    />));
+
+    const row = container.querySelector<HTMLElement>('[role="row"][tabindex="0"]')!;
+    expect(row.textContent).toContain("Backend control plane · 2 processes");
+    expect(row.textContent).not.toContain("Alpha task");
+    await act(async () => row.click());
+    expect(container.querySelector<HTMLButtonElement>(".runtime-process-footer .button")?.disabled).toBe(true);
+    expect(container.querySelector(".runtime-process-hint")?.textContent).toBe("This process is read-only.");
+  });
+
   it("loads only capability-advertised roots and submits the complete selected spawn fence", async () => {
     let terminated = false;
     const rows = [process("beta", 10, 3), process("alpha", 11, 20)];
@@ -56,8 +93,8 @@ describe("RuntimeProcessMonitor", () => {
     await vi.waitFor(() => expect(container.querySelectorAll('[role="row"][tabindex="0"]')).toHaveLength(2));
     expect(listRuntimeProcesses).toHaveBeenCalledWith("backend-local", expect.any(AbortSignal));
     expect([...container.querySelectorAll(".runtime-process-details > span:first-child")].map((item) => item.textContent)).toEqual([
-      "Alpha task · 3 processes",
-      "Beta task · 3 processes"
+      "Session task host · Alpha task · 3 processes",
+      "Session task host · Beta task · 3 processes"
     ]);
     expect(container.querySelector('[aria-sort="descending"]')?.textContent).toContain("CPU");
 
@@ -87,8 +124,43 @@ describe("RuntimeProcessMonitor", () => {
     expect(listRuntimeProcesses).not.toHaveBeenCalled();
   });
 
+  it("shows Main-owned application roles as read-only rows without entering Backend termination", async () => {
+    const sampleDesktop = vi.fn(async (): Promise<DesktopRuntimeProcessSample> => ({
+      version: 1,
+      capturedAt: 500,
+      processes: [
+        { role: "main", pid: 100, label: null, cpuPercent: 3, memoryKb: 10_240, processCount: 1 },
+        { role: "renderer", pid: 101, label: "Settings", cpuPercent: 2, memoryKb: 8_192, processCount: 1 },
+        { role: "utility", pid: 102, label: "network.mojom.NetworkService", cpuPercent: 1, memoryKb: 4_096, processCount: 1 }
+      ]
+    }));
+    Object.defineProperty(window, "jokoDesktop", {
+      configurable: true,
+      value: {
+        capabilities: ["runtime.processMonitorWindow", "runtime.desktopProcessUsage"],
+        runtimeProcessMonitor: { sampleDesktop }
+      } as unknown as JokoDesktopApi
+    });
+    const terminateRuntimeProcess = vi.fn(async () => undefined);
+    const container = await render({
+      listRuntimeProcesses: vi.fn(async () => ({ capturedAt: 500, processes: [] })),
+      terminateRuntimeProcess
+    } as unknown as AppController, snapshot(false));
+
+    await vi.waitFor(() => expect(container.querySelectorAll('[data-process-source="desktop"] [role="row"]')).toHaveLength(3));
+    expect(sampleDesktop).toHaveBeenCalledOnce();
+    expect(container.textContent).toContain("Joko application");
+    expect(container.textContent).toContain("Settings");
+    expect(container.textContent).toContain("Network service");
+    const settings = [...container.querySelectorAll<HTMLElement>('[data-process-source="desktop"] [role="row"]')]
+      .find((row) => row.textContent?.includes("Settings"));
+    await act(async () => settings?.click());
+    expect(container.querySelector<HTMLButtonElement>(".runtime-process-footer .button")?.disabled).toBe(true);
+    expect(terminateRuntimeProcess).not.toHaveBeenCalled();
+  });
+
   it("opens the capability-advertised standalone Desktop monitor from the empty state", async () => {
-    const open = vi.fn(async () => ({ focusedExisting: false }));
+    const open = vi.fn(async () => ({ version: 1 as const, focusedExisting: false }));
     Object.defineProperty(window, "jokoDesktop", {
       configurable: true,
       value: {
@@ -105,6 +177,113 @@ describe("RuntimeProcessMonitor", () => {
     expect(button).toBeDefined();
     await act(async () => button?.click());
     await vi.waitFor(() => expect(open).toHaveBeenCalledOnce());
+    expect(open).toHaveBeenCalledWith(owner());
+  });
+
+  it("retains only same-owner Backend data when a later sample partially fails", () => {
+    const previous = display("owner-one", "ready", [process("alpha", 11, 20)], 100);
+    const partial: RuntimeProcessDiagnosticsSnapshot = {
+      locale: "en",
+      backends: [{
+        backendId: "backend-local",
+        backendGeneration: "1",
+        backendName: "Local runtime",
+        usageSupported: true,
+        terminateSupported: true,
+        state: "error",
+        error: "sample failed",
+        processes: []
+      }],
+      sessions: previous.sessions
+    };
+
+    const stale = mergeRuntimeProcessDiagnosticsDisplay(previous, "owner-one", partial);
+    expect(stale.backends[0]).toMatchObject({ state: "stale", capturedAt: 100, error: "sample failed" });
+    expect(stale.backends[0]?.processes).toHaveLength(1);
+
+    const differentOwner = mergeRuntimeProcessDiagnosticsDisplay(previous, "owner-two", partial);
+    expect(differentOwner.backends[0]).toMatchObject({ state: "error", error: "sample failed" });
+    expect(differentOwner.backends[0]?.processes).toHaveLength(0);
+
+    const replacementBackend = mergeRuntimeProcessDiagnosticsDisplay(previous, "owner-one", {
+      ...partial,
+      backends: [{ ...partial.backends[0]!, backendGeneration: "2" }]
+    });
+    expect(replacementBackend.backends[0]).toMatchObject({ state: "error", backendGeneration: "2" });
+    expect(replacementBackend.backends[0]?.processes).toHaveLength(0);
+
+    const loadingFailure = staleRuntimeProcessDiagnosticsDisplay({
+      ...previous,
+      loaded: false,
+      backends: [{ ...previous.backends[0]!, state: "loading", capturedAt: undefined, processes: [] }]
+    }, "owner-one", "invalid Backend occurrence");
+    expect(loadingFailure).toMatchObject({ loaded: true });
+    expect(loadingFailure.backends[0]).toMatchObject({
+      state: "error",
+      error: "invalid Backend occurrence",
+      processes: []
+    });
+  });
+
+  it("retains only the last same-owner Desktop sample when that source fails", () => {
+    const initial = mergeDesktopRuntimeProcessDisplay({
+      ownerKey: "owner-one",
+      loaded: true,
+      backends: [],
+      sessions: [],
+      desktop: { state: "loading", processes: [] }
+    }, "owner-one", {
+      version: 1,
+      capturedAt: 100,
+      processes: [{ role: "main", pid: 100, label: null, cpuPercent: 1, memoryKb: 1_024, processCount: 1 }]
+    });
+    expect(staleDesktopRuntimeProcessDisplay(initial, "owner-one", "sample failed").desktop).toMatchObject({
+      state: "stale",
+      capturedAt: 100,
+      error: "sample failed",
+      processes: [{ pid: 100 }]
+    });
+    expect(staleDesktopRuntimeProcessDisplay(initial, "owner-two", "sample failed")).toBe(initial);
+  });
+
+  it("clears selection and confirmation state when the Backend occurrence changes", async () => {
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    roots.push(root);
+    const renderSurface = async (value: RuntimeProcessDiagnosticsDisplay): Promise<void> => {
+      await act(async () => root.render(<RuntimeProcessMonitorSurface
+        display={value}
+        runAction={(_key, work) => { void work(); }}
+        t={(key, values) => translate("en", key, values)}
+        onRefresh={async () => undefined}
+        onTerminate={async () => undefined}
+      />));
+    };
+    await renderSurface(display("owner-one", "ready", [process("alpha", 11, 20)], 100));
+    await act(async () => container.querySelector<HTMLElement>('[role="row"][tabindex="0"]')?.click());
+    await act(async () => container.querySelector<HTMLButtonElement>(".runtime-process-footer .button")?.click());
+    expect(document.body.querySelector('[role="alertdialog"]')).not.toBeNull();
+
+    await renderSurface(display("owner-one", "ready", [process("beta", 10, 3)], 200, "2"));
+    expect(document.body.querySelector('[role="alertdialog"]')).toBeNull();
+    expect(container.querySelector('[aria-selected="true"]')).toBeNull();
+  });
+
+  it("re-reads the exact process instance fence before dispatching termination", async () => {
+    const original = process("alpha", 11, 20);
+    const replacement = { ...original, processInstanceId: "20000000-0000-4000-8000-000000000011" };
+    const terminateRuntimeProcess = vi.fn(async () => undefined);
+    await expect(terminateRuntimeProcessWithCurrentFence(
+      {
+        listRuntimeProcesses: vi.fn(async () => ({ capturedAt: 200, processes: [replacement] })),
+        terminateRuntimeProcess
+      },
+      snapshot(true),
+      original,
+      "1"
+    )).rejects.toThrow("no longer current");
+    expect(terminateRuntimeProcess).not.toHaveBeenCalled();
   });
 });
 
@@ -113,8 +292,19 @@ async function render(controller: AppController, value: AppSnapshot): Promise<HT
   document.body.append(container);
   const root = createRoot(container);
   roots.push(root);
+  const connectedController = {
+    ...controller,
+    state: {
+      ready: true,
+      connectionState: "connected",
+      connectionGeneration: 1,
+      activeProfile: { id: "profile-local", deviceId: "device-local", serverId: "server-local", name: "Local", origin: "http://127.0.0.1" },
+      preferences: { locale: "en" },
+      snapshot: value
+    }
+  } as unknown as AppController;
   await act(async () => root.render(<RuntimeProcessMonitor
-    controller={controller}
+    controller={connectedController}
     snapshot={value}
     runAction={(_key, work) => { void work(); }}
     t={(key, values) => translate("en", key, values)}
@@ -130,7 +320,9 @@ function snapshot(capable: boolean): AppSnapshot {
   ]);
   return {
     ...base,
-    backends: [{ id: "backend-local", name: "Local runtime", version: "1", health: "healthy", capabilities }],
+    revision: 1n,
+    generation: 1n,
+    backends: [{ id: "backend-local", name: "Local runtime", version: "1", health: "healthy", instanceGeneration: 1, capabilities }],
     sessions: [
       { id: "alpha", backendId: "backend-local", targetId: "target", name: "Alpha task", state: "idle", pinned: false, archived: false, generation: 4n, fastMode: false, permissionMode: "ask", planMode: false, updatedAt: 1 },
       { id: "beta", backendId: "backend-local", targetId: "target", name: "Beta task", state: "idle", pinned: false, archived: false, generation: 4n, fastMode: false, permissionMode: "ask", planMode: false, updatedAt: 1 }
@@ -138,9 +330,47 @@ function snapshot(capable: boolean): AppSnapshot {
   };
 }
 
-function process(sessionId: string, pid: number, cpuPercent: number): RuntimeProcessUsageView {
+function owner(): DesktopRuntimeProcessMonitorOwner {
+  return {
+    version: 1,
+    profileId: "profile-local",
+    serverId: "server-local",
+    connectionGeneration: "1",
+    snapshotGeneration: "1"
+  };
+}
+
+function display(
+  ownerKey: string,
+  state: "ready" | "stale",
+  processes: readonly RuntimeProcessUsageView[],
+  capturedAt: number,
+  backendGeneration = "1"
+): RuntimeProcessDiagnosticsDisplay {
+  return {
+    ownerKey,
+    loaded: true,
+    backends: [{
+      backendId: "backend-local",
+      backendGeneration,
+      backendName: "Local runtime",
+      usageSupported: true,
+      terminateSupported: true,
+      state,
+      capturedAt,
+      processes
+    }],
+    sessions: [
+      { sessionId: "alpha", backendId: "backend-local", sessionName: "Alpha task", generation: "4" },
+      { sessionId: "beta", backendId: "backend-local", sessionName: "Beta task", generation: "4" }
+    ]
+  };
+}
+
+function process(sessionId: string, pid: number, cpuPercent: number): RuntimeTaskHostProcessUsageView {
   return {
     backendId: "backend-local",
+    role: "task-host",
     sessionId,
     generation: 4,
     pid,

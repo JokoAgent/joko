@@ -17,7 +17,7 @@ import {
 } from "@joko/adapter-codex";
 import {
   createPiAdapter,
-  createDefaultPiManagedProcessSupervisor,
+  createDefaultManagedProcessSupervisor,
   createManagedSubagentRunnerProcessInspector,
   MANAGED_SUBAGENT_RUNNER_SOURCE,
   managedSubagentRunRoot,
@@ -204,7 +204,9 @@ import { ContactSyncManager } from "./contact-sync-manager.js";
 import { ContactToolBridgeProvider } from "./contact-tool-provider.js";
 import { PartnerManager, partnerSessionRuntimeFallback } from "./partner-manager.js";
 import { PartnerToolBridgeProvider } from "./partner-tool-provider.js";
+import { DevicePeerOwner } from "./device-peer-owner.js";
 import { RemoteHostRegistry } from "./remote-host-registry.js";
+import { RemoteExecutionRouter } from "./remote-execution-router.js";
 import {
   RemoteBackendRuntimeSetupManager,
   createRemoteClaudeRuntimeSetupProvider,
@@ -357,6 +359,10 @@ export interface OrchestratorApplication {
   readonly gitSafety?: GitSafetyCoordinator;
   readonly scheduler: ScheduleCoordinator;
   readonly reviewCoordinator?: ReviewCoordinator;
+  /** Authenticated reverse routes for exact controller-to-Device execution. */
+  readonly devicePeers?: DevicePeerOwner;
+  /** Capability-neutral location switch shared by every remote runtime owner. */
+  readonly remoteExecution?: RemoteExecutionRouter;
   readonly remoteHosts?: RemoteHostRegistry;
   readonly remoteBackendRuntimeSetup?: RemoteBackendRuntimeSetupManager;
   readonly sshKeys?: SshKeyManager;
@@ -684,12 +690,15 @@ export async function createOrchestratorApplication(
     defaultSshUser: dependencies.defaultSshUser ?? userInfo().username,
     connector: dependencies.remoteSshConnector ?? new Ssh2ResolvedAgentAuthConnector()
   });
+  const devicePeers = new DevicePeerOwner({ store });
+  const remoteExecution = new RemoteExecutionRouter({ hosts: remoteHosts, peers: devicePeers });
   const remotePiProcesses = new RemotePiProcessFactory({
-    registry: remoteHosts,
+    remoteExecution,
+    store,
     authorityRoot: join(config.dataDirectory, "remote-pi-authority")
   });
-  const remoteWorkspaceFiles = new RemoteWorkspaceService(remoteHosts);
-  const remoteTerminals = new RemoteTerminalRuntimeResolver(remoteHosts);
+  const remoteWorkspaceFiles = new RemoteWorkspaceService(remoteExecution);
+  const remoteTerminals = new RemoteTerminalRuntimeResolver(remoteExecution);
   const terminals = new TerminalProvider({
     onActivity: () => runtimeActivity.markBlockingActivity(),
     resolveRemoteRuntime: (scope, signal) => remoteTerminals.resolve(scope, signal)
@@ -1096,11 +1105,11 @@ export async function createOrchestratorApplication(
       mcpRouter.fenceNativeAuthProvider(providerId),
     reconcileManagedSubagentProviderAuthentication: (providerId, routeToken) =>
       mcpRouter.reconcileNativeAuthProvider(providerId, routeToken),
-    processSupervisor: createDefaultPiManagedProcessSupervisor(),
+    processSupervisor: createDefaultManagedProcessSupervisor(),
     validateRemoteWorkspace: async (target, signal) => {
       const binding = target.remoteWorkspace;
       if (binding === undefined) throw new Error("Remote workspace binding is missing.");
-      await remotePiProcesses.validate(binding.hostTargetId, binding.hostId, binding.workspaceRoot, signal);
+      await remotePiProcesses.validate(binding, signal);
     },
     providers: providerSnapshot.providers,
     nativeModels: providerAuth.listNativeModels().filter((model) =>
@@ -1254,7 +1263,7 @@ export async function createOrchestratorApplication(
             localMcpBridge: (input) => mcpBridge!.openLocal(input),
             remoteRuntimes: new RemoteCodexRuntimeResolver({
               store,
-              registry: remoteHosts,
+              remoteExecution,
               mcpBridge
             }),
             resolveNativeMemoryEnabled: () => makerMemory.nativeEnabledForBackend(instanceId, false),
@@ -1269,7 +1278,7 @@ export async function createOrchestratorApplication(
                   instanceId,
                   generation,
                   recoverStale: backendInstances.adapter(instanceId) === undefined,
-                  supervisor: createDefaultPiManagedProcessSupervisor()
+                  supervisor: createDefaultManagedProcessSupervisor()
                 }
               }
             },
@@ -1327,7 +1336,7 @@ export async function createOrchestratorApplication(
         }),
         remoteRuntimes: new RemoteClaudeRuntimeResolver({
           store,
-          registry: remoteHosts,
+          remoteExecution,
           storeGeneration: generation,
           authorizeDerivedWorkspace: createRemoteClaudeDerivedWorkspaceAuthorizer({
             store,
@@ -1363,7 +1372,7 @@ export async function createOrchestratorApplication(
           instanceId,
           generation,
           recoverStale: backendInstances.adapter(instanceId) === undefined,
-          supervisor: createDefaultPiManagedProcessSupervisor()
+          supervisor: createDefaultManagedProcessSupervisor()
         },
         sessionStoreRootDirectory: join(config.dataDirectory, "backend-session-store", instanceId),
         ...(config.claudeCodeExecutable === undefined
@@ -1400,6 +1409,7 @@ export async function createOrchestratorApplication(
   }
   let startupSessionHost: SessionHost | undefined;
   let startupSessionWorktrees: SessionWorktreeCoordinator | undefined;
+  let startupHistoryMaintenance: HistoryMaintenance | undefined;
   let startupCleanupHandled = false;
   let startupBackendCleanup: Promise<readonly unknown[]> | undefined;
   const cleanupStartupBackendOwners = (): Promise<readonly unknown[]> => {
@@ -1459,7 +1469,7 @@ export async function createOrchestratorApplication(
     store,
     workspaces,
     storageRoot: join(config.dataDirectory, "worktrees"),
-    remoteOwner: new RemoteClaudeWorktreeOwner({ store, registry: remoteHosts })
+    remoteOwner: new RemoteClaudeWorktreeOwner({ store, remoteExecution })
   });
   const workspaceCapture = new DurableWorkspaceRunCapture(store, workspaceChanges, workspaces, gitSafety);
   let androidRuntimeForSessionCleanup: AndroidRuntimeSupervisor | undefined;
@@ -1808,10 +1818,13 @@ export async function createOrchestratorApplication(
       } catch { /* The Store may already be closed. */ }
     }
   };
-  const historyMaintenance = new HistoryMaintenance({
+  const historyMaintenance = startupHistoryMaintenance = new HistoryMaintenance({
     store,
     activeSessions: {
-      prepare: (sessionIds) => sessionHost.prepareHistoryMaintenanceBindings(sessionIds),
+      prepare: (requests) => sessionHost.prepareHistoryMaintenanceBindings(requests),
+      recover: (request) => sessionHost.recoverHistoryMaintenanceBinding(request),
+      discard: (replacements) => sessionHost.discardHistoryMaintenanceBindings(replacements),
+      finalize: (replacements) => sessionHost.finalizeHistoryMaintenanceBindings(replacements),
       release: (sessionIds) => sessionHost.releaseHistoryMaintenanceSessions(sessionIds)
     },
     externalRecords: workspaceChanges
@@ -2115,7 +2128,7 @@ export async function createOrchestratorApplication(
       displayName: configuredTarget.descriptor.displayName,
       trusted: configuredTarget.descriptor.trusted,
       ...(configuredBinding === undefined ? {} : {
-        remote: { targetId: configuredTarget.descriptor.id, hostTargetId: configuredBinding.hostTargetId, hostId: configuredBinding.hostId, workspaceRoot: configuredBinding.workspaceRoot }
+        remote: { targetId: configuredTarget.descriptor.id, binding: configuredBinding }
       })
     });
     for (const storedTarget of store.listTargets()) {
@@ -2130,12 +2143,7 @@ export async function createOrchestratorApplication(
           displayName: storedTarget.descriptor.displayName,
           trusted: storedTarget.descriptor.trusted,
           ...(binding === undefined ? {} : {
-            remote: {
-              targetId: storedTarget.descriptor.id,
-              hostTargetId: binding.hostTargetId,
-              hostId: binding.hostId,
-              workspaceRoot: binding.workspaceRoot
-            }
+            remote: { targetId: storedTarget.descriptor.id, binding }
           })
         });
       } catch {
@@ -2152,6 +2160,7 @@ export async function createOrchestratorApplication(
     await reviewCoordinator.reconcileStartup();
     await sessionWorktrees.initialize();
     await sessionHost.initialize();
+    await historyMaintenance.initialize();
     await skillLearning.initialize();
     for (const registration of backendTargets) {
       if (backendInstances.adapter(registration.backendId) === undefined) continue;
@@ -2433,6 +2442,8 @@ export async function createOrchestratorApplication(
     await attempt(() => mcpRouter.dispose());
     await attempt(() => voiceInput.close());
     await attempt(() => sshKeys.close());
+    await attempt(() => workspaces.close());
+    await attempt(() => devicePeers.shutdown());
     await attempt(() => remoteBackendRuntimeSetup.close());
     await attempt(() => remoteHosts.close());
     await attempt(() => runtimeActivity.close());
@@ -2471,6 +2482,8 @@ export async function createOrchestratorApplication(
     gitSafety,
     scheduler,
     reviewCoordinator,
+    devicePeers,
+    remoteExecution,
     remoteHosts,
     remoteBackendRuntimeSetup,
     sshKeys,
@@ -2581,6 +2594,8 @@ export async function createOrchestratorApplication(
         await backendLifecycleTail.catch(() => undefined);
         // Keep the remote transports alive while terminals attempt confirmed process cleanup.
         await attempt(() => terminals.dispose());
+        await attempt(() => artifactMaintenance.close());
+        await attempt(() => historyMaintenance.close());
         await attempt(() => sessionHost.dispose());
         await attempt(() => backendInstances.disposeRetainedCleanups());
         await attempt(() => managedProviderProxy.close());
@@ -2617,9 +2632,10 @@ export async function createOrchestratorApplication(
         await attempt(() => mcpRouter.dispose());
         await attempt(() => voiceInput.close());
         sshKeys.close();
+        await attempt(() => workspaces.close());
+        await attempt(() => devicePeers.shutdown());
         await attempt(() => remoteBackendRuntimeSetup.close());
         await attempt(() => remoteHosts.close());
-        await attempt(() => workspaces.close());
         await attempt(() => runtimeActivity.close());
         await attempt(() => contactSync.close());
         await attempt(() => contacts.close());
@@ -2645,12 +2661,14 @@ export async function createOrchestratorApplication(
     await attempt(() => simulatorControl?.dispose());
     await attempt(() => providerAuth.beginShutdown());
     await attempt(() => providerAccountUsage.invalidate());
+    await attempt(() => startupHistoryMaintenance?.close());
     cleanupErrors.push(...await cleanupStartupBackendOwners());
     await attempt(() => startupSessionWorktrees?.dispose());
     await attempt(() => generationGcTail.catch(() => undefined));
     await attempt(() => providerAuth.close());
     await attempt(() => mcpRouter.dispose());
     await attempt(() => voiceInput.close());
+    await attempt(() => devicePeers.shutdown());
     await attempt(() => remoteBackendRuntimeSetup.close());
     await attempt(() => remoteHosts.close());
     await attempt(() => mobilePush.close());

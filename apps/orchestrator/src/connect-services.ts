@@ -91,7 +91,8 @@ import { readWorkspaceHtmlSnapshot } from "./workspace-html-snapshot.js";
 import {
   ArtifactMaintenanceScanChangedError,
   ArtifactMaintenanceScanExpiredError,
-  type ArtifactMaintenance
+  type ArtifactMaintenance,
+  type ArtifactCleanupJob
 } from "./artifact-maintenance.js";
 import { NATIVE_PI_SETTINGS_DEFAULTS, type OrchestratorApplication, type SessionContextDefaultsResolver } from "./application.js";
 import { projectBackgroundTaskHistory } from "./background-task-history.js";
@@ -210,7 +211,7 @@ import {
   fromProtoInputContent,
   fromProtoRevision,
   fromProtoNativeNavigationTarget,
-  fromProtoRemoteWorkspace,
+  fromProtoWorkspaceLocation,
   fromProtoTimestamp,
   mapErrorToProto,
   toProtoArtifact,
@@ -244,7 +245,8 @@ import {
   toProtoTimestamp,
   toProtoToolLease,
   toProtoUsage,
-  toProtoWorkspace
+  toProtoWorkspace,
+  toProtoWorkspaceLocation
 } from "./proto-mapper.js";
 import { ProtoMappingError } from "./proto-mapper.js";
 import { TIMED_EXTENSION_INTERACTION_EXPIRED_REASON } from "./interaction-expiry.js";
@@ -396,6 +398,9 @@ import {
 } from "./session-project-placement.js";
 import { ReviewStartError, type ReviewCoordinator } from "./review-coordinator.js";
 import type { RuntimeActivityTracker } from "./runtime-activity-tracker.js";
+import { createDevicePeerCapabilityPorts, DevicePeerExecutionError } from "./device-peer-capability-ports.js";
+import { createDevicePeerConnectService, fromProtoRouteIdentity } from "./device-peer-connect-service.js";
+import { DevicePeerAuthorityError, DevicePeerOwner } from "./device-peer-owner.js";
 import { createRemoteHostConnectService } from "./remote-host-connect-service.js";
 import { createSshKeyConnectService } from "./ssh-key-connect-service.js";
 import { createTerminalConnectService } from "./terminal-connect-service.js";
@@ -521,6 +526,7 @@ interface ConnectServiceDependencies {
   readonly refreshSubagentSmartRouting?: (backendId: string) => Promise<void>;
   readonly sessionNavigation?: SessionNavigationCoordinator;
   readonly reviewCoordinator?: ReviewCoordinator;
+  readonly devicePeers: DevicePeerOwner;
   readonly remoteHosts?: RemoteHostRegistry;
   readonly remoteBackendRuntimeSetup?: RemoteBackendRuntimeSetupManager;
   readonly sshKeys?: OrchestratorApplication["sshKeys"];
@@ -674,6 +680,40 @@ function toProtoTaskHistoryProgress(progress: HistoryMaintenanceJob) {
   };
 }
 
+function toProtoArtifactCleanupProgress(progress: ArtifactCleanupJob) {
+  const status = (() => {
+    switch (progress.status) {
+      case "running": return contract.ArtifactStorageCleanupStatus.RUNNING;
+      case "completed": return contract.ArtifactStorageCleanupStatus.COMPLETED;
+      case "scan-expired": return contract.ArtifactStorageCleanupStatus.SCAN_EXPIRED;
+      case "storage-changed": return contract.ArtifactStorageCleanupStatus.STORAGE_CHANGED;
+      case "failed": return contract.ArtifactStorageCleanupStatus.FAILED;
+    }
+  })();
+  const phase = (() => {
+    switch (progress.phase) {
+      case "preparing": return contract.ArtifactStorageCleanupPhase.PREPARING;
+      case "quarantining": return contract.ArtifactStorageCleanupPhase.QUARANTINING;
+      case "deleting": return contract.ArtifactStorageCleanupPhase.DELETING;
+      case "reconciling": return contract.ArtifactStorageCleanupPhase.RECONCILING;
+    }
+  })();
+  return {
+    maintenanceId: progress.maintenanceId,
+    status,
+    phase,
+    percent: progress.percent,
+    updatedAt: toProtoTimestamp(progress.updatedAt),
+    ...(progress.result === undefined ? {} : { result: {
+      expiredReferencesDeleted: BigInt(progress.result.expiredReferencesDeleted),
+      blobsRemoved: BigInt(progress.result.blobsRemoved),
+      temporaryFilesRemoved: BigInt(progress.result.temporaryFilesRemoved),
+      freedBytes: BigInt(progress.result.freedBytes),
+      skipped: BigInt(progress.result.skipped)
+    } })
+  };
+}
+
 export interface ConnectServiceSet {
   readonly connection: ServiceImpl<typeof contract.ConnectionService>;
   readonly event: ServiceImpl<typeof contract.EventService>;
@@ -704,6 +744,7 @@ export interface ConnectServiceSet {
   readonly skill: ServiceImpl<typeof contract.SkillService>;
   readonly browser: ServiceImpl<typeof contract.BrowserService>;
   readonly remoteHost: ServiceImpl<typeof contract.RemoteHostService>;
+  readonly devicePeer: ServiceImpl<typeof contract.DevicePeerService>;
   readonly sshKey: ServiceImpl<typeof contract.SshKeyService>;
   readonly voiceInput: ServiceImpl<typeof contract.VoiceInputService>;
   readonly terminal: ServiceImpl<typeof contract.TerminalService>;
@@ -876,6 +917,23 @@ function toConnectError(error: unknown): ConnectError {
     const code = error.code.startsWith("PAIRING_") ? Code.PermissionDenied : Code.Unauthenticated;
     return new ConnectError(error.code.startsWith("PAIRING_") ? "Pairing failed." : error.message, code);
   }
+  if (error instanceof DevicePeerAuthorityError) {
+    const code = error.code === "invalid_identity" ? Code.InvalidArgument
+      : error.code === "stale_authority" ? Code.Aborted
+        : error.code === "route_unavailable" ? Code.Unavailable
+          : error.code === "access_revoked" ? Code.PermissionDenied
+            : Code.FailedPrecondition;
+    return new ConnectError(error.message, code);
+  }
+  if (error instanceof DevicePeerExecutionError) {
+    const code = error.stateMayHaveChanged ? Code.Aborted
+      : error.code === "not_found" ? Code.NotFound
+        : error.code === "permission_denied" ? Code.PermissionDenied
+          : error.code === "invalid_request" || error.code === "protocol_error" ? Code.InvalidArgument
+            : error.code === "unavailable" || error.code === "route_closed" ? Code.Unavailable
+              : Code.FailedPrecondition;
+    return new ConnectError(error.message, code);
+  }
   if (error instanceof JokoError) {
     return new ConnectError(
       redactSecrets(error.publicError.message),
@@ -948,6 +1006,18 @@ interface OperationOutcome {
 interface PresentedOperation {
   readonly record: OperationRecord<unknown>;
   readonly outcome: OperationOutcome;
+}
+
+interface DevicePeerTargetOperationBody {
+  readonly version: 1;
+  readonly kind: "createDevicePeerTarget";
+  readonly controllerDeviceId: string;
+  readonly targetDeviceId: string;
+  readonly backendId: string;
+  readonly displayName: string;
+  readonly workspacePath: string;
+  readonly createIfMissing: boolean;
+  readonly preconditions: readonly contract.OperationPrecondition[];
 }
 
 interface HostMutationInput<T> {
@@ -1088,6 +1158,7 @@ export function registerConnectServices(router: ConnectRouter, application: Orch
   router.service(contract.SkillService, withConnectErrors(services.skill));
   router.service(contract.BrowserService, withConnectErrors(services.browser));
   router.service(contract.RemoteHostService, withConnectErrors(services.remoteHost));
+  router.service(contract.DevicePeerService, withConnectErrors(services.devicePeer));
   router.service(contract.SshKeyService, withConnectErrors(services.sshKey));
   router.service(contract.VoiceInputService, withConnectErrors(services.voiceInput));
   router.service(contract.TerminalService, withConnectErrors(services.terminal));
@@ -1105,9 +1176,14 @@ export function createConnectServices(application: OrchestratorApplication): Con
   const nativeMemoryStatuses = new Map<string, NativeMemoryStatusObservation>();
   const nativeMemoryStatusEpochs = new Map<string, bigint>();
   const projectAutomations = new ProjectAutomationConfigController({ store: application.store });
+  const devicePeers = application.devicePeers ?? new DevicePeerOwner({ store: application.store });
+  if (application.devicePeers === undefined) {
+    application.registerServiceCleanup?.(() => devicePeers.shutdown());
+  }
   const dependencies: ConnectServiceDependencies = {
     connections: application.connections,
     store: application.store,
+    devicePeers,
     adapters: () => application.adapters,
     restartBackend: application.restartBackend,
     refreshBackendDescriptor: application.refreshBackendDescriptor,
@@ -1290,6 +1366,11 @@ export function createConnectServices(application: OrchestratorApplication): Con
     now,
     dependencies.remoteBackendRuntimeSetup
   );
+  const devicePeer = createDevicePeerConnectService({
+    owner: dependencies.devicePeers,
+    connections: dependencies.connections,
+    store: dependencies.store
+  });
   const voiceInput = createVoiceInputConnectService(dependencies.voiceInput, dependencies.voiceInputSettings, (context) => ({
     connectionId: authenticate(context).id
   }));
@@ -1652,7 +1733,7 @@ export function createConnectServices(application: OrchestratorApplication): Con
         if (existing.connectionId !== authenticated.id) {
           throw new AuthorizationError("The operation belongs to a different connection.");
         }
-        const presentedHash = operationBodyHash(request.mutation);
+        const presentedHash = operationBodyHash(durableOperationBody(authenticated, request.mutation));
         if (existing.bodyHash !== presentedHash) {
           throw new OperationConflictError(request.operationId, existing.bodyHash, presentedHash);
         }
@@ -1797,8 +1878,12 @@ export function createConnectServices(application: OrchestratorApplication): Con
         capturedAt: toProtoTimestamp(snapshot.capturedAt),
         processes: snapshot.processes.map((process) => create(contract.RuntimeProcessUsageSchema, {
           backendId: process.backendId,
-          sessionId: process.sessionId,
-          runtimeGeneration: BigInt(process.generation),
+          role: process.role === "control-plane"
+            ? contract.RuntimeProcessRole.CONTROL_PLANE
+            : contract.RuntimeProcessRole.TASK_HOST,
+          ...(process.role === "task-host"
+            ? { sessionId: process.sessionId, runtimeGeneration: BigInt(process.generation) }
+            : {}),
           processId: BigInt(process.pid),
           cpuPercent: process.cpuPercent,
           memoryKb: BigInt(process.memoryKb),
@@ -2288,6 +2373,37 @@ export function createConnectServices(application: OrchestratorApplication): Con
         snapshotToken: snapshot.token
       };
     },
+    listNativeCatalogAdoptions: (request, context) => {
+      const connection = authenticate(context);
+      const page = storePageWindow(request.page);
+      const result = dependencies.sessionHost.listNativeCatalogAdoptionsForUser({
+        connection: stableConnection(connection),
+        ...page
+      });
+      const next = page.offset + result.adoptions.length;
+      return {
+        adoptions: result.adoptions.map(protoNativeCatalogAdoption),
+        page: create(contract.PageInfoSchema, {
+          nextPageToken: next < result.total ? encodePageToken(next) : "",
+          totalSize: BigInt(result.total)
+        })
+      };
+    },
+    reconcileNativeCatalogAdoption: async (request, context) => {
+      const connection = authenticate(context);
+      const result = await dependencies.sessionHost.reconcileNativeCatalogAdoptionForUser({
+        connection: stableConnection(connection),
+        operationId: nonBlankRequest(request.operationId, "operation_id")
+      });
+      return {
+        adoption: protoNativeCatalogAdoption(result.adoption),
+        inspection: result.inspection === "present"
+          ? contract.NativeCatalogAdoptionInspection.PRESENT
+          : result.inspection === "absent"
+            ? contract.NativeCatalogAdoptionInspection.ABSENT
+            : contract.NativeCatalogAdoptionInspection.UNKNOWN
+      };
+    },
     getNativeSessionTree: async (request, context) => {
       authenticate(context);
       const stored = dependencies.store.getSession(request.sessionId);
@@ -2624,6 +2740,38 @@ export function createConnectServices(application: OrchestratorApplication): Con
         ...(result.activationError === undefined
           ? {}
           : { activationError: mapErrorToProto(result.activationError) })
+      };
+    },
+    getPortableReplacementCleanup: (request, context) => {
+      const connection = authenticate(context);
+      const cleanup = dependencies.sessionHost.getPortableReplacementCleanup({
+        connection: stableConnection(connection),
+        importedSessionId: nonBlankRequest(request.importedSessionId, "imported_session_id")
+      });
+      return cleanup === undefined ? {} : { cleanup: protoPortableReplacementCleanup(cleanup) };
+    },
+    reconcilePortableReplacementCleanup: async (request, context) => {
+      const connection = authenticate(context);
+      const result = await dependencies.sessionHost.reconcilePortableReplacementCleanupForUser({
+        connection: stableConnection(connection),
+        importedSessionId: nonBlankRequest(request.importedSessionId, "imported_session_id")
+      });
+      return {
+        cleanup: protoPortableReplacementCleanup(result.cleanup),
+        inspection: protoPortableReplacementInspection(result.inspection)
+      };
+    },
+    retryPortableReplacementCleanup: async (request, context) => {
+      const connection = authenticate(context);
+      const result = await dependencies.sessionHost.retryPortableReplacementCleanup({
+        connection: stableConnection(connection),
+        importedSessionId: nonBlankRequest(request.importedSessionId, "imported_session_id"),
+        expectedRevision: request.expectedRevision,
+        confirmNativeDelete: request.confirmNativeDelete
+      });
+      return {
+        cleanup: protoPortableReplacementCleanup(result.cleanup),
+        inspection: protoPortableReplacementInspection(result.inspection)
       };
     }
   } satisfies ServiceImpl<typeof contract.PortableSessionService>;
@@ -3436,34 +3584,35 @@ export function createConnectServices(application: OrchestratorApplication): Con
         }
       };
     },
-    cleanupArtifactStorage: async (request, context) => {
+    beginArtifactStorageCleanup: async (request, context) => {
       authenticate(context);
       if (dependencies.artifactMaintenance === undefined) throw new ConnectError("Artifact storage maintenance is unavailable.", Code.Unimplemented);
       if (!/^[a-f0-9]{64}$/u.test(request.scanToken)) throw invalidArgument("scan_token is invalid");
       try {
-        const result = await dependencies.artifactMaintenance.cleanup(
+        const progress = await dependencies.artifactMaintenance.beginCleanup(
           request.scanToken,
           artifactProtectedSha256(request.protectedSha256)
         );
-        return {
-          outcome: contract.ArtifactStorageCleanupOutcome.COMPLETED,
-          result: {
-            expiredReferencesDeleted: BigInt(result.expiredReferencesDeleted),
-            blobsRemoved: BigInt(result.blobsRemoved),
-            temporaryFilesRemoved: BigInt(result.temporaryFilesRemoved),
-            freedBytes: BigInt(result.freedBytes),
-            skipped: BigInt(result.skipped)
-          }
-        };
+        return { progress: toProtoArtifactCleanupProgress(progress) };
       } catch (error) {
         if (error instanceof ArtifactMaintenanceScanExpiredError) {
-          return { outcome: contract.ArtifactStorageCleanupOutcome.SCAN_EXPIRED };
+          return { progress: toProtoArtifactCleanupProgress({ maintenanceId: request.scanToken,
+            status: "scan-expired", phase: "preparing", percent: 0, updatedAt: Date.now() }) };
         }
         if (error instanceof ArtifactMaintenanceScanChangedError) {
-          return { outcome: contract.ArtifactStorageCleanupOutcome.STORAGE_CHANGED };
+          return { progress: toProtoArtifactCleanupProgress({ maintenanceId: request.scanToken,
+            status: "storage-changed", phase: "preparing", percent: 0, updatedAt: Date.now() }) };
         }
         throw new ConnectError("Artifact storage cleanup failed.", Code.Internal);
       }
+    },
+    getArtifactStorageCleanup: (request, context) => {
+      authenticate(context);
+      if (dependencies.artifactMaintenance === undefined) throw new ConnectError("Artifact storage maintenance is unavailable.", Code.Unimplemented);
+      if (!/^[a-f0-9]{64}$/u.test(request.maintenanceId)) throw invalidArgument("maintenance_id is invalid");
+      const progress = dependencies.artifactMaintenance.getCleanup(request.maintenanceId);
+      if (progress === undefined) throw new ConnectError("Artifact storage cleanup not found.", Code.NotFound);
+      return { progress: toProtoArtifactCleanupProgress(progress) };
     }
   } satisfies ServiceImpl<typeof contract.ArtifactService>;
 
@@ -5036,7 +5185,7 @@ export function createConnectServices(application: OrchestratorApplication): Con
     }
   } satisfies ServiceImpl<typeof contract.PiService>;
 
-  return { connection, event, operation, backend, target, session, portableSession, run, subagent, review, queue, scheduler, interaction, workspace, worktree, artifact, historyMaintenance, credential, settings, messaging, contact, partner, collaborationGoal, managedModelRuntime, tool, extension, skill, browser, remoteHost, sshKey, voiceInput, terminal, simulatorViewer, pi };
+  return { connection, event, operation, backend, target, session, portableSession, run, subagent, review, queue, scheduler, interaction, workspace, worktree, artifact, historyMaintenance, credential, settings, messaging, contact, partner, collaborationGoal, managedModelRuntime, tool, extension, skill, browser, remoteHost, devicePeer, sshKey, voiceInput, terminal, simulatorViewer, pi };
 }
 
 function requireAuthentication(dependencies: ConnectServiceDependencies, context: HandlerContext): ConnectionRecord {
@@ -6244,6 +6393,32 @@ function decodeArtifactPageToken(token: string): ArtifactPageCursor | undefined 
   }
 }
 
+/**
+ * Device-peer route identity is an execution fence, not durable Operation
+ * intent. Persist only the stable controller/target project request so a
+ * successful Operation can replay after route/relation rotation without
+ * leaking a short-lived route snapshot into the Store.
+ */
+function durableOperationBody(
+  connection: Pick<ConnectionRecord, "deviceId">,
+  mutation: contract.OperationMutation
+): unknown {
+  if (mutation.payload.case !== "createDevicePeerTarget") return mutation;
+  const input = mutation.payload.value;
+  const peer = fromProtoRouteIdentity(input.peer);
+  return Object.freeze({
+    version: 1,
+    kind: "createDevicePeerTarget",
+    controllerDeviceId: connection.deviceId,
+    targetDeviceId: peer.targetDeviceId,
+    backendId: input.backendId,
+    displayName: input.displayName.trim(),
+    workspacePath: input.workspacePath,
+    createIfMissing: input.createIfMissing,
+    preconditions: Object.freeze([...mutation.preconditions])
+  } satisfies DevicePeerTargetOperationBody);
+}
+
 function mutationFromRecord(store: OperationalStore, record: OperationRecord<unknown>): contract.OperationMutation {
   const body = asRecord(record.body);
   const storedPayload = asRecord(body["payload"]);
@@ -6254,6 +6429,21 @@ function mutationFromRecord(store: OperationalStore, record: OperationRecord<unk
     });
   }
   const empty = (): contract.OperationMutation => create(contract.OperationMutationSchema, { preconditions: [], payload: { case: undefined } });
+  if (record.kind === "createDevicePeerTarget" && body["version"] === 1
+    && body["kind"] === "createDevicePeerTarget") {
+    return create(contract.OperationMutationSchema, {
+      preconditions: restoreOperationPreconditions(body["preconditions"]),
+      payload: {
+        case: "createDevicePeerTarget",
+        value: create(contract.CreateDevicePeerTargetMutationSchema, {
+          backendId: stringValue(body["backendId"]) ?? "",
+          displayName: stringValue(body["displayName"]) ?? "",
+          workspacePath: stringValue(body["workspacePath"]) ?? "",
+          createIfMissing: booleanValue(body["createIfMissing"]) ?? false
+        })
+      }
+    });
+  }
   if (record.kind === "create_session") {
     const targetId = stringValue(body["targetId"]) ?? "";
     let backendId = "";
@@ -7181,6 +7371,25 @@ function mapNativeSessionCatalogEntry(
   });
 }
 
+function protoNativeCatalogAdoption(
+  value: import("./session-host.js").NativeCatalogAdoptionStatus
+): contract.NativeCatalogAdoption {
+  return create(contract.NativeCatalogAdoptionSchema, {
+    operationId: value.operationId,
+    backendId: value.backendId,
+    targetId: value.targetId,
+    title: value.title,
+    state: value.state === "pending"
+      ? contract.NativeCatalogAdoptionState.PENDING
+      : value.state === "adopted"
+        ? contract.NativeCatalogAdoptionState.ADOPTED
+        : contract.NativeCatalogAdoptionState.ABSENT,
+    revision: value.revision,
+    updatedAt: toProtoTimestamp(value.updatedAt),
+    ...(value.sessionId === undefined ? {} : { sessionId: value.sessionId })
+  });
+}
+
 function nativeSessionCatalogTargetIds(targets: readonly StoredTarget[]): ReadonlyMap<string, string> {
   const targetIds = new Map<string, string>();
   for (const target of targets) {
@@ -7443,6 +7652,7 @@ async function mapWorkspace(dependencies: ConnectServiceDependencies, registrati
     serverPathDisplay: registration.root,
     trusted: registration.trusted,
     git: mapGitState(await dependencies.workspaceService.gitState(registration.id)),
+    location: toProtoWorkspaceLocation(target?.descriptor.remoteWorkspace),
     version: toProtoEntityVersion(revision, 0, target?.updatedAt ?? Date.now())
   });
 }
@@ -8194,12 +8404,7 @@ function targetWorkspaceRegistration(target: StoredTarget): WorkspaceRegistratio
     displayName: target.descriptor.displayName,
     trusted: target.descriptor.trusted,
     ...(binding === undefined ? {} : {
-      remote: {
-        targetId: target.descriptor.id,
-        hostTargetId: binding.hostTargetId,
-        hostId: binding.hostId,
-        workspaceRoot: binding.workspaceRoot
-      }
+      remote: { targetId: target.descriptor.id, binding }
     })
   };
 }
@@ -15318,6 +15523,143 @@ async function dispatchMutation(
       });
       return presented(execution);
     }
+    case "createDevicePeerTarget": {
+      if (dependencies.managedWorkspaceRoot === undefined) {
+        return unsupportedOperation(
+          dependencies,
+          operationId,
+          connection,
+          mutation,
+          payload.case,
+          "Device peer project creation is unavailable on this service node."
+        );
+      }
+      const input = payload.value;
+      const peer = fromProtoRouteIdentity(input.peer);
+      if (input.backendId.trim() === "" || input.displayName.trim() === ""
+        || input.displayName.length > 120) {
+        throw invalidArgument("A Backend, project name and exact Device are required.");
+      }
+      if (input.workspacePath.length < 1 || input.workspacePath !== input.workspacePath.trim()
+        || input.workspacePath.length > 32_768 || /[\u0000-\u001f\u007f]/u.test(input.workspacePath)) {
+        throw invalidArgument("A canonical Device project directory is required.");
+      }
+      const id = stableId("target", operationId);
+      const workspaceId = stableId("workspace", operationId);
+      const fallbackRoot = resolve(dependencies.managedWorkspaceRoot, id);
+      let descriptor: import("@joko/core").TargetDescriptor | undefined;
+      let workspaceRegistered = false;
+      let fallbackCreated = false;
+      const currentController = (store: OperationalStore): ConnectionRecord => {
+        const current = store.getConnection(connection.id);
+        if (current.state !== "active" || current.deviceId !== connection.deviceId
+          || current.authKeyDigest !== connection.authKeyDigest) {
+          throw new AuthorizationError("The Device peer controller credential is no longer authorized.");
+        }
+        return current;
+      };
+      const assertSourceCurrent = (store: OperationalStore): void => {
+        store.getBackend(input.backendId);
+        dependencies.devicePeers.capture(currentController(store), peer, ["files", "process"]);
+      };
+      let execution: OperationExecution<OperationOutcome>;
+      try {
+        execution = await host.mutate({
+          operationId,
+          connection,
+          kind: payload.case,
+          body: durableOperationBody(connection, mutation),
+          precondition: assertSourceCurrent,
+          effect: async () => {
+            const controller = currentController(dependencies.store);
+            const authority = dependencies.devicePeers.capture(controller, peer, ["files", "process"]);
+            const files = createDevicePeerCapabilityPorts({ owner: dependencies.devicePeers, authority }).files;
+            if (files === undefined) {
+              throw new ConnectError("The selected Device file capability is unavailable.", Code.FailedPrecondition);
+            }
+            const signal = new AbortController().signal;
+            let canonical: string | undefined;
+            try {
+              const information = await files.stat(input.workspacePath, signal);
+              authority.assertCurrent(["files", "process"]);
+              if (information.kind !== "directory") {
+                throw new ConnectError("The Device project path is not a directory.", Code.FailedPrecondition);
+              }
+              canonical = await files.realpath(input.workspacePath, signal);
+            } catch (error) {
+              if (!(error instanceof DevicePeerExecutionError) || error.code !== "not_found") throw error;
+              if (!input.createIfMissing) {
+                throw new ConnectError("The Device project directory does not exist.", Code.NotFound);
+              }
+              await files.mkdir(input.workspacePath, { recursive: true, mode: 0o700, signal });
+              authority.assertCurrent(["files", "process"]);
+              const information = await files.stat(input.workspacePath, signal);
+              if (information.kind !== "directory") {
+                throw new ConnectError("The Device project directory could not be verified after creation.", Code.FailedPrecondition);
+              }
+              canonical = await files.realpath(input.workspacePath, signal);
+            }
+            authority.assertCurrent(["files", "process"]);
+            if (canonical.length < 1 || canonical !== canonical.trim()
+              || canonical.length > 32_768 || /[\u0000-\u001f\u007f]/u.test(canonical)) {
+              throw new ConnectError("The Device returned an invalid canonical project directory.", Code.FailedPrecondition);
+            }
+            const fallbackExisted = await pathExists(fallbackRoot);
+            await mkdir(fallbackRoot, { recursive: true, mode: 0o700 });
+            fallbackCreated = !fallbackExisted;
+            const localRoot = await requireExistingDirectory(fallbackRoot, "device peer project fallback");
+            if (localRoot !== fallbackRoot) {
+              throw new ConnectError("The service-owned project directory changed.", Code.FailedPrecondition);
+            }
+            const binding = {
+              kind: "device_peer" as const,
+              controllerDeviceId: controller.deviceId,
+              targetDeviceId: peer.targetDeviceId,
+              workspaceRoot: canonical
+            };
+            descriptor = {
+              id,
+              backendId: input.backendId,
+              displayName: input.displayName.trim(),
+              workspaceRoot: localRoot,
+              managed: false,
+              trusted: false,
+              remoteWorkspace: binding
+            };
+            await host.validateTarget(descriptor);
+            authority.assertCurrent(["files", "process"]);
+            await dependencies.workspaceService.register({
+              id: workspaceId,
+              root: canonical,
+              displayName: descriptor.displayName,
+              trusted: false,
+              remote: { targetId: id, binding }
+            });
+            workspaceRegistered = true;
+            authority.assertCurrent(["files", "process"]);
+          },
+          commit: (store) => {
+            if (descriptor === undefined) {
+              throw new Error("Device peer project preparation completed without a Target.");
+            }
+            store.upsertTarget(descriptor, { workspaceId });
+            return { accepted: true, resultCase: "target", entityId: id } satisfies OperationOutcome;
+          }
+        });
+      } catch (error) {
+        if (workspaceRegistered) dependencies.workspaceService.unregister(workspaceId);
+        if (fallbackCreated) {
+          await moveManagedWorkspaceToTrash({
+            managedRoot: resolve(dependencies.managedWorkspaceRoot),
+            workspaceRoot: fallbackRoot,
+            targetId: id,
+            operationId
+          }).catch(() => undefined);
+        }
+        throw error;
+      }
+      return presented(execution);
+    }
     case "createRemoteTarget": {
       const remoteHosts = dependencies.remoteHosts;
       if (remoteHosts === undefined || dependencies.managedWorkspaceRoot === undefined) {
@@ -15381,13 +15723,13 @@ async function dispatchMutation(
             descriptor = {
               id, backendId: input.backendId, displayName: input.displayName.trim(),
               workspaceRoot: localRoot, managed: false, trusted: false,
-              remoteWorkspace: { hostTargetId: sourceTargetId, hostId, workspaceRoot: canonical }
+              remoteWorkspace: { kind: "ssh", hostTargetId: sourceTargetId, hostId, workspaceRoot: canonical }
             };
             await host.validateTarget(descriptor);
             authority.assertCurrent();
             await dependencies.workspaceService.register({
               id: workspaceId, root: canonical, displayName: descriptor.displayName, trusted: false,
-              remote: { targetId: id, hostTargetId: sourceTargetId, hostId, workspaceRoot: canonical }
+              remote: { targetId: id, binding: descriptor.remoteWorkspace! }
             });
             workspaceRegistered = true;
             authority.assertCurrent();
@@ -15416,13 +15758,24 @@ async function dispatchMutation(
         const existing = dependencies.store.getTarget(payload.value.targetId);
         const metadata = asRecord(existing.metadata);
         const { remoteWorkspace: _previousRemoteWorkspace, ...serviceNodeDescriptor } = existing.descriptor;
-        let descriptor: import("@joko/core").TargetDescriptor;
-        switch (payload.value.workspaceLocationUpdate.case) {
-          case "remoteWorkspace": {
+        let descriptor: import("@joko/core").TargetDescriptor = existing.descriptor;
+        if (payload.value.location !== undefined) {
+          if (existing.descriptor.remoteWorkspace?.kind === "device_peer") {
+            throw new ConnectError(
+              "Device peer workspace bindings are immutable; create another project for a different location.",
+              Code.FailedPrecondition
+            );
+          }
+          const remoteWorkspace = fromProtoWorkspaceLocation(payload.value.location);
+          if (remoteWorkspace?.kind === "device_peer") {
+            throw new ConnectError("Device peer workspace binding is unavailable.", Code.Unimplemented);
+          }
+          if (remoteWorkspace === undefined) {
+            descriptor = serviceNodeDescriptor;
+          } else {
             if (dependencies.remoteHosts === undefined) {
               throw new ConnectError("Remote workspace binding is unavailable.", Code.Unimplemented);
             }
-            const remoteWorkspace = fromProtoRemoteWorkspace(payload.value.workspaceLocationUpdate.value);
             const remoteHost = dependencies.remoteHosts.get(remoteWorkspace.hostTargetId, remoteWorkspace.hostId);
             if (remoteHost.status.state !== "ready" || remoteHost.trust === undefined) {
               throw new ConnectError(
@@ -15431,16 +15784,7 @@ async function dispatchMutation(
               );
             }
             descriptor = { ...serviceNodeDescriptor, remoteWorkspace };
-            break;
           }
-          case "serviceNodeWorkspace":
-            if (!payload.value.workspaceLocationUpdate.value) {
-              throw new ConnectError("service_node_workspace must be true.", Code.InvalidArgument);
-            }
-            descriptor = serviceNodeDescriptor;
-            break;
-          default:
-            descriptor = existing.descriptor;
         }
         if (payload.value.displayName !== undefined) {
           descriptor = { ...descriptor, displayName: payload.value.displayName };
@@ -15723,36 +16067,52 @@ async function dispatchMutation(
         body: mutation,
         precondition: (store) => validatePreconditions(store, mutation),
         commit: () => outcome,
+        preserveClaimOnEffectFailure: () => {
+          const adoption = dependencies.store.findNativeCatalogAdoptionForRequest(operationId);
+          return adoption?.state === "claimed" || adoption?.state === "unknown";
+        },
         effect: async () => {
-          const nested = await dependencies.sessionHost.createSession({
-            operationId: nestedId,
-            connection,
-            targetId: payload.value.targetId,
-            title: payload.value.displayName || "New task",
-            ...(model?.model?.providerId === undefined ? {} : { providerId: model.model.providerId }),
-            ...(model?.model?.modelId === undefined ? {} : { modelId: model.model.modelId }),
-            ...(model?.effortId === undefined || model.effortId === "" ? {} : { effort: model.effortId }),
-            fastMode: model?.fastMode ?? false,
-            permissionMode: corePermission(payload.value.permissionMode),
-            planMode: payload.value.planMode,
-            initialPlacement,
-            ...(catalogImport === undefined ? {} : { catalogImport }),
-            ...(payload.value.useWorktree ? {
-              worktree: {
-                ...(worktreeSourceRef === undefined ? {} : { sourceRef: worktreeSourceRef }),
-                refreshRemote: payload.value.refreshWorktreeRemote
-              }
-            } : {}),
-            ...(appendSystemPrompt === undefined ? {} : { appendSystemPrompt }),
-            nativeStart: nativeStart?.case === "attach"
-              ? { kind: "attach", nativeReference: nativeStart.value.opaqueNativeReference }
-              : {
-                  kind: "new",
-                  ...(nativeStart?.case === "newSession" && nativeStart.value.parentNativeReference !== ""
-                    ? { parentNativeReference: nativeStart.value.parentNativeReference }
-                    : {})
+          let nested: Awaited<ReturnType<typeof dependencies.sessionHost.createSession>>;
+          try {
+            nested = await dependencies.sessionHost.createSession({
+              operationId: nestedId,
+              ...(catalogImport === undefined ? {} : { requestOperationId: operationId }),
+              connection,
+              targetId: payload.value.targetId,
+              title: payload.value.displayName || "New task",
+              ...(model?.model?.providerId === undefined ? {} : { providerId: model.model.providerId }),
+              ...(model?.model?.modelId === undefined ? {} : { modelId: model.model.modelId }),
+              ...(model?.effortId === undefined || model.effortId === "" ? {} : { effort: model.effortId }),
+              fastMode: model?.fastMode ?? false,
+              permissionMode: corePermission(payload.value.permissionMode),
+              planMode: payload.value.planMode,
+              initialPlacement,
+              ...(catalogImport === undefined ? {} : { catalogImport }),
+              ...(payload.value.useWorktree ? {
+                worktree: {
+                  ...(worktreeSourceRef === undefined ? {} : { sourceRef: worktreeSourceRef }),
+                  refreshRemote: payload.value.refreshWorktreeRemote
                 }
-          });
+              } : {}),
+              ...(appendSystemPrompt === undefined ? {} : { appendSystemPrompt }),
+              nativeStart: nativeStart?.case === "attach"
+                ? { kind: "attach", nativeReference: nativeStart.value.opaqueNativeReference }
+                : {
+                    kind: "new",
+                    ...(nativeStart?.case === "newSession" && nativeStart.value.parentNativeReference !== ""
+                      ? { parentNativeReference: nativeStart.value.parentNativeReference }
+                      : {})
+                  }
+            });
+          } catch (error) {
+            const adoption = dependencies.store.findNativeCatalogAdoptionForRequest(operationId);
+            if (error instanceof OperationInProgressError
+              && adoption !== undefined
+              && (adoption.state === "claimed" || adoption.state === "unknown")) {
+              throw new OperationInProgressError(operationId);
+            }
+            throw error;
+          }
           if (nested.value.sessionId !== sessionId) throw new Error("CreateSession returned a non-deterministic Session ID.");
         }
       });
@@ -22551,6 +22911,35 @@ function protoPortableSessionImportStatus(
   return value === "ready"
     ? contract.PortableSessionImportStatus.READY
     : contract.PortableSessionImportStatus.IMPORTED_ACTIVATION_FAILED;
+}
+
+function protoPortableReplacementCleanup(
+  value: import("./session-host.js").PortableReplacementCleanupStatus
+): contract.PortableReplacementCleanup {
+  const nativeState = value.nativeState === "pending"
+    ? contract.PortableReplacementNativeState.PENDING
+    : value.nativeState === "dispatched"
+      ? contract.PortableReplacementNativeState.DISPATCHED
+      : value.nativeState === "unknown"
+        ? contract.PortableReplacementNativeState.UNKNOWN
+        : contract.PortableReplacementNativeState.COMPLETED;
+  return create(contract.PortableReplacementCleanupSchema, {
+    importedSessionId: value.importedSessionId,
+    nativeState,
+    worktreeState: value.worktreeState === "pending"
+      ? contract.PortableReplacementWorktreeState.PENDING
+      : contract.PortableReplacementWorktreeState.COMPLETED,
+    revision: value.revision,
+    updatedAt: toProtoTimestamp(value.updatedAt)
+  });
+}
+
+function protoPortableReplacementInspection(
+  value: "present" | "absent" | "unknown"
+): contract.PortableReplacementInspection {
+  if (value === "present") return contract.PortableReplacementInspection.PRESENT;
+  if (value === "absent") return contract.PortableReplacementInspection.ABSENT;
+  return contract.PortableReplacementInspection.UNKNOWN;
 }
 
 function protoPortableSessionImportDraft(

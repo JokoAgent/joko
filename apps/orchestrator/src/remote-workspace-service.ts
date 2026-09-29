@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { open, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import path, { posix as remotePath } from "node:path";
+import path, { posix, win32, type PlatformPath } from "node:path";
 
 import { workspaceEntryAbsentRevision } from "@joko/contracts";
 import type {
@@ -12,7 +12,7 @@ import type {
   RemoteProcessTransportPort
 } from "@joko/remote-ssh";
 
-import type { RemoteHostRegistry } from "./remote-host-registry.js";
+import type { RemoteExecutionRouter } from "./remote-execution-router.js";
 import {
   WORKSPACE_GIT_COMMIT_MESSAGE_MAXIMUM_BYTES,
   WORKSPACE_GIT_IMAGE_MAXIMUM_BYTES,
@@ -58,26 +58,21 @@ const MAXIMUM_TREE_ENTRIES = 100_000;
 const MAXIMUM_COPY_BYTES = 256 * 1024 * 1024;
 
 export class RemoteWorkspaceService implements RemoteWorkspaceDelegate {
-  readonly #registry: RemoteHostRegistry;
+  readonly #remoteExecution: RemoteExecutionRouter;
   readonly #registrations = new Map<string, WorkspaceRegistration>();
   #closed = false;
 
-  constructor(registry: RemoteHostRegistry) {
-    this.#registry = registry;
+  constructor(remoteExecution: RemoteExecutionRouter) {
+    this.#remoteExecution = remoteExecution;
   }
 
   async register(input: WorkspaceRegistration): Promise<WorkspaceRegistration> {
     this.#assertOpen();
     const remote = input.remote;
-    if (remote === undefined || remote.workspaceRoot !== input.root) {
+    if (remote === undefined || remote.binding.workspaceRoot !== input.root) {
       throw new Error("Remote workspace registration is incomplete.");
     }
-    const transports = await this.#transports(input);
-    const canonical = await transports.files.realpath(remote.workspaceRoot);
-    if (canonical !== remote.workspaceRoot || (await transports.files.stat(canonical)).kind !== "directory") {
-      throw new Error("Remote workspace root must be a canonical directory.");
-    }
-    const registration = Object.freeze({ ...input, root: canonical });
+    const registration = Object.freeze({ ...input });
     this.#registrations.set(input.id, registration);
     return registration;
   }
@@ -96,15 +91,18 @@ export class RemoteWorkspaceService implements RemoteWorkspaceDelegate {
     this.#assertOpen();
     const registration = this.#require(workspaceId);
     const remote = registration.remote!;
-    const authority = await this.#registry.captureTransportAuthority(remote.hostTargetId, remote.hostId, signal);
+    const authority = await this.#remoteExecution.files(remote.binding, signal);
     signal?.throwIfAborted();
+    await validateCapturedWorkspaceRoot(registration, authority.files, authority.assertCurrent, signal);
     const assertCurrent = (): void => {
       signal?.throwIfAborted(); this.#assertOpen(); authority.assertCurrent();
       if (this.#registrations.get(workspaceId) !== registration) throw new WorkspaceFilePreviewError("The remote workspace read authority changed. Open the source again.", "stale");
     };
     assertCurrent();
-    const files = authority.lease.files!;
-    const identity = createHash("sha256").update(JSON.stringify([workspacePreviewRegistrationIdentity(registration), authority.hostRevision.toString(), authority.leaseGeneration])).digest("hex");
+    const files = authority.files;
+    const identity = createHash("sha256").update(JSON.stringify([
+      workspacePreviewRegistrationIdentity(registration), authority.authorityIdentity
+    ])).digest("hex");
     return { identity, assertCurrent, preview: async (path, maximumBytes = WORKSPACE_TEXT_FILE_MAXIMUM_BYTES, maximumFileBytes, readSignal) => {
       const currentSignal = signal === undefined ? readSignal : readSignal === undefined ? signal : AbortSignal.any([signal, readSignal]);
       assertCurrent(); currentSignal?.throwIfAborted();
@@ -131,7 +129,7 @@ export class RemoteWorkspaceService implements RemoteWorkspaceDelegate {
       case "copyEntry": result = await this.#copyEntry(registration, transports.files, args[0] as { sourcePath: string; destinationPath: string; expectedRevision: string }); break;
       case "search": result = (await this.#searchPage(registration, transports, args[0] as string, args[1] as WorkspaceSearchOptions | undefined)).matches; break;
       case "searchPage": result = await this.#searchPage(registration, transports, args[0] as string, args[1] as WorkspaceSearchOptions | undefined); break;
-      case "gitState": result = await this.#gitState(registration, transports.processes); break;
+      case "gitState": result = await this.#gitState(registration, transports); break;
       case "gitDiff": result = await this.#gitDiff(registration, transports.processes, args[0] as readonly string[], args[1] as Record<string, unknown>); break;
       case "gitReviewDiff": result = await this.#gitReviewDiff(registration, transports.processes, args[0] as WorkspaceGitReviewDiffInput); break;
       case "readGitDiffFile": result = await this.#readGitDiffFile(registration, transports, args[0] as RemoteGitDiffFileInput); break;
@@ -143,6 +141,7 @@ export class RemoteWorkspaceService implements RemoteWorkspaceDelegate {
       case "pushGitReview": result = await this.#push(registration, transports.processes, args[0] as RemoteGitPushInput); break;
       default: throw new Error("Remote workspace operation is unavailable.");
     }
+    transports.assertCurrent();
     return result as Result;
   }
 
@@ -187,7 +186,7 @@ export class RemoteWorkspaceService implements RemoteWorkspaceDelegate {
     directory = "",
     options?: WorkspaceEntryListingOptions
   ): Promise<readonly WorkspaceEntryRecord[]> {
-    const start = remoteWorkspacePath(registration.root, directory, true);
+    const start = remoteWorkspacePath(registration, directory, true);
     const maximum = Math.min(Math.max(options?.maximumEntries ?? 10_000, 1), MAXIMUM_TREE_ENTRIES);
     const output: WorkspaceEntryRecord[] = [];
     const visit = async (absolute: string, prefix: string, depth: number): Promise<void> => {
@@ -197,7 +196,7 @@ export class RemoteWorkspaceService implements RemoteWorkspaceDelegate {
         if (!safeEntryName(entry.name) || entry.kind === "symbolic_link" || entry.kind === "other") continue;
         if (entry.name === ".git") continue;
         const relativePath = prefix === "" ? entry.name : `${prefix}/${entry.name}`;
-        const path = remotePath.join(absolute, entry.name);
+        const path = pathApi(registration).join(absolute, entry.name);
         const info = await files.stat(path);
         if (info.kind !== "file" && info.kind !== "directory") continue;
         if (output.length >= maximum) throw new WorkspaceScanError("Remote workspace listing exceeded its limit.", "limit");
@@ -217,7 +216,7 @@ export class RemoteWorkspaceService implements RemoteWorkspaceDelegate {
     maximumFileBytes?: number,
     signal?: AbortSignal
   ): Promise<WorkspaceFilePreview> {
-    const path = remoteWorkspacePath(registration.root, relativePath, false);
+    const path = remoteWorkspacePath(registration, relativePath, false);
     signal?.throwIfAborted();
     if (await files.realpath(path, signal) !== path) throw new WorkspaceFilePreviewError("Remote preview path is not canonical.", "invalid");
     signal?.throwIfAborted();
@@ -282,7 +281,7 @@ export class RemoteWorkspaceService implements RemoteWorkspaceDelegate {
       AbortSignal | undefined
     ];
     signal?.throwIfAborted();
-    const path = remoteWorkspacePath(registration.root, relativePath, false);
+    const path = remoteWorkspacePath(registration, relativePath, false);
     const before = await files.stat(path, signal);
     if (before.kind !== "file" || before.size > 64 * 1024 * 1024) {
       throw new WorkspaceFilePreviewError("Remote download requires a bounded regular file.", "unsupported");
@@ -325,7 +324,7 @@ export class RemoteWorkspaceService implements RemoteWorkspaceDelegate {
     files: RemoteFileTransportPort,
     input: WorkspaceTextFileWriteInput
   ): Promise<WorkspaceTextFileWriteResult> {
-    const path = remoteWorkspacePath(registration.root, input.path, false);
+    const path = remoteWorkspacePath(registration, input.path, false);
     const beforeInfo = await files.stat(path);
     if (beforeInfo.kind !== "file") throw new WorkspaceTextFileWriteError("Remote text save requires a regular file.", "unsupported");
     const before = Buffer.from(await files.read({ path, maximumBytes: Math.max(beforeInfo.size, 1) }));
@@ -360,7 +359,7 @@ export class RemoteWorkspaceService implements RemoteWorkspaceDelegate {
     if (input.expectedRevision !== workspaceEntryAbsentRevision) {
       throw new WorkspaceEntryMutationError("Remote creation requires an absent revision fence.", "invalid");
     }
-    const path = remoteWorkspacePath(registration.root, input.path, false);
+    const path = remoteWorkspacePath(registration, input.path, false);
     await expectMissing(files, path);
     if (input.kind === "directory") await files.mkdir(path, { recursive: false, mode: 0o755 });
     else await files.write({ path, content: new Uint8Array(), mode: 0o644, atomic: true });
@@ -372,8 +371,8 @@ export class RemoteWorkspaceService implements RemoteWorkspaceDelegate {
     files: RemoteFileTransportPort,
     input: { sourcePath: string; destinationPath: string; expectedRevision: string }
   ): Promise<WorkspaceEntryMutationResult> {
-    const source = remoteWorkspacePath(registration.root, input.sourcePath, false);
-    const destination = remoteWorkspacePath(registration.root, input.destinationPath, false);
+    const source = remoteWorkspacePath(registration, input.sourcePath, false);
+    const destination = remoteWorkspacePath(registration, input.destinationPath, false);
     const before = await files.stat(source);
     assertRemoteRevision(before, input.expectedRevision);
     await expectMissing(files, destination);
@@ -386,7 +385,7 @@ export class RemoteWorkspaceService implements RemoteWorkspaceDelegate {
     files: RemoteFileTransportPort,
     input: { path: string; expectedRevision: string; confirmRecursive: boolean }
   ): Promise<void> {
-    const path = remoteWorkspacePath(registration.root, input.path, false);
+    const path = remoteWorkspacePath(registration, input.path, false);
     const before = await files.stat(path);
     assertRemoteRevision(before, input.expectedRevision);
     if (before.kind === "directory" && !input.confirmRecursive) {
@@ -400,13 +399,13 @@ export class RemoteWorkspaceService implements RemoteWorkspaceDelegate {
     files: RemoteFileTransportPort,
     input: { sourcePath: string; destinationPath: string; expectedRevision: string }
   ): Promise<WorkspaceEntryMutationResult> {
-    const source = remoteWorkspacePath(registration.root, input.sourcePath, false);
-    const destination = remoteWorkspacePath(registration.root, input.destinationPath, false);
+    const source = remoteWorkspacePath(registration, input.sourcePath, false);
+    const destination = remoteWorkspacePath(registration, input.destinationPath, false);
     const before = await files.stat(source);
     assertRemoteRevision(before, input.expectedRevision);
     await expectMissing(files, destination);
     const budget = { entries: 0, bytes: 0 };
-    await copyRemoteTree(files, source, destination, budget);
+    await copyRemoteTree(files, pathApi(registration), source, destination, budget);
     const current = await files.stat(source);
     if (remoteRevision(current) !== remoteRevision(before)) {
       await files.remove(destination, { recursive: true }).catch(() => undefined);
@@ -450,14 +449,20 @@ export class RemoteWorkspaceService implements RemoteWorkspaceDelegate {
     };
   }
 
-  async #gitState(registration: WorkspaceRegistration, processes: RemoteProcessTransportPort): Promise<GitState> {
+  async #gitState(registration: WorkspaceRegistration, transports: RemoteTransports): Promise<GitState> {
+    const processes = transports.processes;
     const result = await runRemote(processes, "git", ["status", "--porcelain=v1", "-z", "--branch"], registration.root, 20_000, 4 * 1024 * 1024);
     const records = result.stdout.split("\0").filter(Boolean);
     const branchLine = records.shift() ?? "";
     const changes = records.map(parseGitStatus).filter((value): value is NonNullable<typeof value> => value !== undefined);
     const branchMatch = /^## (.+?)(?:\.\.\.|$)/u.exec(branchLine)?.[1];
     const head = await gitOptional(processes, registration.root, ["rev-parse", "HEAD"]);
-    const operationInProgress = await gitOperationInProgress(processes, registration.root);
+    const operationInProgress = await gitOperationInProgress(
+      processes,
+      transports.files,
+      pathApi(registration),
+      registration.root
+    );
     return {
       repository: true,
       ...(branchMatch === undefined || branchMatch === "HEAD (no branch)" ? {} : { branch: branchMatch }),
@@ -530,7 +535,7 @@ export class RemoteWorkspaceService implements RemoteWorkspaceDelegate {
     const path = canonicalRelative(input.path);
     let bytes: Buffer;
     if (input.source === "workingTree") {
-      const absolute = remoteWorkspacePath(registration.root, path, false);
+      const absolute = remoteWorkspacePath(registration, path, false);
       const info = await transports.files.stat(absolute);
       bytes = Buffer.from(await transports.files.read({
         path: absolute,
@@ -580,7 +585,7 @@ export class RemoteWorkspaceService implements RemoteWorkspaceDelegate {
     const oldImage = await read(`${tree}:${input.oldPath ?? input.path}`);
     let newImage: WorkspaceGitImageSide;
     if (input.source === "unstaged") {
-      const absolute = remoteWorkspacePath(registration.root, input.path, false);
+      const absolute = remoteWorkspacePath(registration, input.path, false);
       try {
         const info = await transports.files.stat(absolute);
         const bytes = Buffer.from(await transports.files.read({
@@ -665,11 +670,14 @@ export class RemoteWorkspaceService implements RemoteWorkspaceDelegate {
 
   async #transports(registration: WorkspaceRegistration): Promise<RemoteTransports> {
     const remote = registration.remote!;
-    const { lease } = await this.#registry.transports(remote.hostTargetId, remote.hostId);
-    if (lease.files === undefined || lease.processes === undefined || !lease.capabilities.fileTransfer || !lease.capabilities.processStreaming) {
-      throw new Error("Remote workspace transports are unavailable.");
-    }
-    return { files: lease.files, processes: lease.processes };
+    const authority = await this.#remoteExecution.workspace(remote.binding);
+    await validateCapturedWorkspaceRoot(registration, authority.files, authority.assertCurrent);
+    return {
+      files: authority.files,
+      processes: authority.processes,
+      assertCurrent: authority.assertCurrent,
+      pathStyle: authority.pathStyle
+    };
   }
 
   #assertOpen(): void {
@@ -680,6 +688,25 @@ export class RemoteWorkspaceService implements RemoteWorkspaceDelegate {
 interface RemoteTransports {
   readonly files: RemoteFileTransportPort;
   readonly processes: RemoteProcessTransportPort;
+  readonly pathStyle: "posix" | "win32";
+  readonly assertCurrent: () => void;
+}
+
+async function validateCapturedWorkspaceRoot(
+  registration: WorkspaceRegistration,
+  files: RemoteFileTransportPort,
+  assertCurrent: () => void,
+  signal?: AbortSignal
+): Promise<void> {
+  signal?.throwIfAborted();
+  assertCurrent();
+  const canonical = await files.realpath(registration.root, signal);
+  signal?.throwIfAborted();
+  if (canonical !== registration.root || (await files.stat(canonical, signal)).kind !== "directory") {
+    throw new Error("Remote workspace root must be a canonical directory.");
+  }
+  signal?.throwIfAborted();
+  assertCurrent();
 }
 
 interface RemoteGitDiffFileInput {
@@ -728,11 +755,21 @@ function canonicalRelative(value: string, allowEmpty = false): string {
   return normalized;
 }
 
-function remoteWorkspacePath(root: string, relativePath: string, allowRoot: boolean): string {
+function remoteWorkspacePath(registration: WorkspaceRegistration, relativePath: string, allowRoot: boolean): string {
+  const root = registration.root;
+  const paths = pathApi(registration);
   const relative = canonicalRelative(relativePath, allowRoot);
-  const value = relative === "" ? root : remotePath.join(root, relative);
-  if (value !== root && !value.startsWith(`${root}/`)) throw new Error("Remote workspace path escapes its root.");
+  const value = relative === "" ? root : paths.join(root, ...relative.split("/"));
+  const fromRoot = paths.relative(root, value);
+  if (fromRoot === ".." || fromRoot.startsWith(`..${paths.sep}`) || paths.isAbsolute(fromRoot)) {
+    throw new Error("Remote workspace path escapes its root.");
+  }
   return value;
+}
+
+function pathApi(registration: WorkspaceRegistration): PlatformPath {
+  const root = registration.remote?.binding.workspaceRoot ?? registration.root;
+  return /^[A-Za-z]:[\\/]/u.test(root) || root.startsWith("\\\\") ? win32 : posix;
 }
 
 function safeEntryName(value: string): boolean {
@@ -776,7 +813,13 @@ function assertRemoteRevision(info: RemoteFileStat, expected: string): void {
   if (remoteRevision(info) !== expected) throw new WorkspaceEntryMutationError("Remote entry changed; refresh and retry.", "stale");
 }
 
-async function copyRemoteTree(files: RemoteFileTransportPort, source: string, destination: string, budget: { entries: number; bytes: number }): Promise<void> {
+async function copyRemoteTree(
+  files: RemoteFileTransportPort,
+  paths: PlatformPath,
+  source: string,
+  destination: string,
+  budget: { entries: number; bytes: number }
+): Promise<void> {
   const info = await files.stat(source);
   if (++budget.entries > MAXIMUM_TREE_ENTRIES) throw new WorkspaceEntryMutationError("Remote copy is too large.", "too_large");
   if (info.kind === "symbolic_link" || info.kind === "other") throw new WorkspaceEntryMutationError("Remote symbolic links cannot be copied.", "unsupported");
@@ -790,7 +833,7 @@ async function copyRemoteTree(files: RemoteFileTransportPort, source: string, de
   await files.mkdir(destination, { recursive: false, mode: info.mode & 0o777 });
   for (const entry of await files.list(source)) {
     if (!safeEntryName(entry.name)) throw new WorkspaceEntryMutationError("Remote entry name is unsafe.", "unsafe");
-    await copyRemoteTree(files, remotePath.join(source, entry.name), remotePath.join(destination, entry.name), budget);
+    await copyRemoteTree(files, paths, paths.join(source, entry.name), paths.join(destination, entry.name), budget);
   }
 }
 
@@ -904,11 +947,27 @@ async function gitOptional(processes: RemoteProcessTransportPort, cwd: string, a
   } catch { return undefined; }
 }
 
-async function gitOperationInProgress(processes: RemoteProcessTransportPort, cwd: string): Promise<boolean> {
-  const gitDir = await gitOptional(processes, cwd, ["rev-parse", "--git-dir"]);
+async function gitOperationInProgress(
+  processes: RemoteProcessTransportPort,
+  files: RemoteFileTransportPort,
+  paths: PlatformPath,
+  cwd: string
+): Promise<boolean> {
+  const gitDirValue = await gitOptional(processes, cwd, ["rev-parse", "--absolute-git-dir"]);
+  const gitDir = gitDirValue === undefined
+    ? undefined
+    : paths.isAbsolute(gitDirValue) ? paths.normalize(gitDirValue) : paths.resolve(cwd, gitDirValue);
   if (gitDir === undefined) return false;
-  const result = await runRemote(processes, "sh", ["-c", "test -d \"$1/rebase-merge\" -o -d \"$1/rebase-apply\" -o -f \"$1/MERGE_HEAD\" -o -f \"$1/CHERRY_PICK_HEAD\"", "sh", gitDir], cwd, 10_000, 1024, undefined, new Set([0, 1]));
-  return result.exitCode === 0;
+  for (const marker of ["rebase-merge", "rebase-apply", "MERGE_HEAD", "CHERRY_PICK_HEAD"] as const) {
+    try {
+      await files.stat(paths.join(gitDir, marker));
+      return true;
+    } catch {
+      // Missing markers are the ordinary idle state. The enclosing Git probe
+      // remains authoritative and avoids host-shell quoting entirely.
+    }
+  }
+  return false;
 }
 
 function immutableRevision(value: string): boolean { return /^[0-9a-f]{40,64}$/iu.test(value); }
@@ -923,7 +982,7 @@ function mutableGitSource(source: WorkspaceGitHunkMutation["source"]): "unstaged
 }
 
 function inferRemoteMediaType(value: string): string {
-  const extension = remotePath.extname(value).toLowerCase();
+  const extension = path.extname(value).toLowerCase();
   if ([".md", ".markdown", ".mdx"].includes(extension)) return "text/markdown";
   if ([".html", ".htm"].includes(extension)) return "text/html";
   if ([".json", ".jsonc"].includes(extension)) return "application/json";

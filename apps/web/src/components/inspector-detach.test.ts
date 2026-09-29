@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import {
+  activateDetachedInspectorWindow,
   INSPECTOR_DETACH_CAPABILITY,
   INSPECTOR_WINDOW_FEATURES,
   INSPECTOR_WINDOW_FRAME_NAME,
@@ -11,7 +12,7 @@ import {
 function desktop(capabilities: readonly string[]): JokoDesktopApi {
   return {
     capabilities,
-    inspectorWindow: { onClosed: () => () => undefined }
+    inspectorWindow: { activate: async () => true, onClosed: () => () => undefined }
   } as unknown as JokoDesktopApi;
 }
 
@@ -31,5 +32,14 @@ describe("detached Inspector renderer contract", () => {
       INSPECTOR_WINDOW_FRAME_NAME,
       INSPECTOR_WINDOW_FEATURES
     );
+  });
+
+  it("activates only through the advertised current-v1 Desktop bridge", async () => {
+    const available = desktop([INSPECTOR_DETACH_CAPABILITY]);
+    const activate = vi.spyOn(available.inspectorWindow, "activate");
+    await expect(activateDetachedInspectorWindow(available)).resolves.toBe(true);
+    expect(activate).toHaveBeenCalledOnce();
+    await expect(activateDetachedInspectorWindow(undefined)).resolves.toBe(false);
+    await expect(activateDetachedInspectorWindow(desktop([]))).resolves.toBe(false);
   });
 });

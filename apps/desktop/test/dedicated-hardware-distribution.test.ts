@@ -1,0 +1,244 @@
+/// <reference types="node" />
+
+import { createHash } from "node:crypto";
+import { mkdirSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { createRequire } from "node:module";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
+
+import { afterEach, describe, expect, it } from "vitest";
+
+import {
+  createDedicatedHardwareSdkDirectoryIntegrity as createRuntimeDirectoryIntegrity,
+  createDedicatedHardwareSdkManifestIntegrity as createRuntimeManifestIntegrity,
+  parseDedicatedHardwareSdkLock
+} from "../src/dedicated-hardware-sdk.js";
+import { mkdtempSync } from "./test-paths.js";
+
+interface DedicatedHardwareSdkLock {
+  readonly version: 1;
+  readonly packageName: "@worklouder/device-kit-oai";
+  readonly packageVersion: string;
+  readonly redistributionGrantId: string;
+  readonly license: Readonly<{ readonly relativePath: string; readonly integrity: string }>;
+  readonly target: DedicatedHardwareSdkRuntimeTarget;
+  readonly entry: Readonly<{ readonly relativePath: string; readonly integrity: string }>;
+  readonly nativeAddons: readonly Readonly<{
+    readonly identity: string;
+    readonly relativePath: string;
+    readonly integrity: string;
+    readonly abi: "electron-modules" | "node-api";
+  }>[];
+  readonly files: readonly Readonly<{ readonly relativePath: string; readonly size: number; readonly integrity: string }>[];
+  readonly directoryIntegrity: string;
+  readonly manifestIntegrity: string;
+}
+
+interface DedicatedHardwareSdkRuntimeTarget {
+  readonly platform: "win32" | "darwin" | "linux";
+  readonly architecture: "x64" | "arm64";
+  readonly electronModulesAbi: number;
+  readonly nodeApiVersion: number;
+}
+
+type AuditDedicatedHardwareSdkDirectory = (
+  root: string,
+  approvedArtifacts?: readonly DedicatedHardwareSdkLock[],
+  runtimeTarget?: DedicatedHardwareSdkRuntimeTarget
+) => Promise<
+  | Readonly<{ status: "unavailable" }>
+  | Readonly<{
+    status: "locked";
+    packageVersion: string;
+    manifestIntegrity: string;
+    directoryIntegrity: string;
+    redistributionGrantId: string;
+  }>
+>;
+
+const require = createRequire(import.meta.url);
+const packagedAudit = require("../scripts/audit-packaged.cjs") as {
+  readonly auditDedicatedHardwareSdkDirectory: AuditDedicatedHardwareSdkDirectory;
+  readonly createDedicatedHardwareSdkDirectoryIntegrity: (entries: readonly Readonly<{
+    relativePath: string; size: number; integrity: string; bytes: Uint8Array;
+  }>[]) => string;
+  readonly createDedicatedHardwareSdkManifestIntegrity: (value: Omit<DedicatedHardwareSdkLock, "manifestIntegrity">) => string;
+  readonly dedicatedHardwareSdkHandshakeBytes: (
+    sdk: unknown,
+    keymapBackupDirectory?: string
+  ) => number;
+  readonly assertDedicatedHardwareSdkHandshakeBudget: (sdk: unknown) => number;
+};
+const auditDedicatedHardwareSdkDirectory = packagedAudit.auditDedicatedHardwareSdkDirectory;
+const cleanups: string[] = [];
+const runtimeTarget: DedicatedHardwareSdkRuntimeTarget = {
+  platform: process.platform as DedicatedHardwareSdkRuntimeTarget["platform"],
+  architecture: process.arch as DedicatedHardwareSdkRuntimeTarget["architecture"],
+  electronModulesAbi: Number(process.versions.modules),
+  nodeApiVersion: Number(process.versions.napi)
+};
+
+afterEach(() => {
+  for (const path of cleanups.splice(0).reverse()) rmSync(path, { recursive: true, force: true });
+});
+
+describe("packaged dedicated hardware SDK audit", () => {
+  it("uses the same canonical manifest and directory identity as the runtime resolver", () => {
+    const staged = stageLockedSdk();
+    const { manifestIntegrity: _manifestIntegrity, ...withoutManifestIntegrity } = staged.lock;
+    const directoryEntries = staged.lock.files.map((file) => ({
+      ...file,
+      bytes: readFileSync(resolve(staged.root, ...file.relativePath.split("/")))
+    }));
+    expect(parseDedicatedHardwareSdkLock(staged.lock)).toEqual(staged.lock);
+    expect(createRuntimeManifestIntegrity(withoutManifestIntegrity)).toBe(staged.lock.manifestIntegrity);
+    expect(createRuntimeDirectoryIntegrity(directoryEntries)).toBe(staged.lock.directoryIntegrity);
+  });
+
+  it("budgets the complete handshake including a worst-case UTF-8 keymap backup path", () => {
+    const staged = stageLockedSdk();
+    const sdk = { kind: "staged", stagingDirectory: staged.root, manifest: staged.lock };
+    const shortHandshake = packagedAudit.dedicatedHardwareSdkHandshakeBytes(sdk, "/k");
+    const reservedHandshake = packagedAudit.dedicatedHardwareSdkHandshakeBytes(sdk);
+    expect(reservedHandshake - shortHandshake).toBe((3 * 4_095 + 1) - 2);
+
+    const empty = { kind: "staged", stagingDirectory: staged.root, manifest: { padding: "" } };
+    const fixedBytes = packagedAudit.dedicatedHardwareSdkHandshakeBytes(empty);
+    const exactBoundary = {
+      ...empty,
+      manifest: { padding: "x".repeat(72 * 1024 - fixedBytes) }
+    };
+    expect(packagedAudit.assertDedicatedHardwareSdkHandshakeBudget(exactBoundary)).toBe(72 * 1024);
+    expect(() => packagedAudit.assertDedicatedHardwareSdkHandshakeBudget({
+      ...exactBoundary,
+      manifest: { padding: `${exactBoundary.manifest.padding}x` }
+    })).toThrow("exceeds the utility handshake boundary");
+  });
+
+  it("treats the missing fixed resources directory as unavailable without discovering sibling inputs", async () => {
+    const root = temporaryDirectory();
+    const privateSibling = resolve(root, "installed-application-private-sdk");
+    mkdirSync(privateSibling);
+    writeFileSync(resolve(privateSibling, "adapter.mjs"), "private candidate must not be discovered\n");
+
+    await expect(auditDedicatedHardwareSdkDirectory(
+      resolve(root, "dedicated-hardware-sdk")
+    )).resolves.toEqual({ status: "unavailable" });
+  });
+
+  it("rejects a self-asserted grant unless the exact complete artifact is independently allowlisted", async () => {
+    const staged = stageLockedSdk();
+    await expect(auditDedicatedHardwareSdkDirectory(staged.root, [], runtimeTarget))
+      .rejects.toThrow("No exact dedicated hardware SDK artifact is approved for redistribution");
+    await expect(auditDedicatedHardwareSdkDirectory(staged.root, [staged.lock], runtimeTarget)).resolves.toEqual({
+      status: "locked",
+      packageVersion: staged.lock.packageVersion,
+      manifestIntegrity: staged.lock.manifestIntegrity,
+      directoryIntegrity: staged.lock.directoryIntegrity,
+      redistributionGrantId: staged.lock.redistributionGrantId
+    });
+  });
+
+  it("rejects content drift, extra or missing files, and non-v1 lock keys", async () => {
+    const staged = stageLockedSdk();
+    writeFileSync(resolve(staged.root, "unexpected.node"), "not admitted\n");
+    await expect(auditDedicatedHardwareSdkDirectory(staged.root, [staged.lock], runtimeTarget))
+      .rejects.toThrow("contains unexpected files");
+
+    rmSync(resolve(staged.root, "unexpected.node"));
+    writeFileSync(resolve(staged.root, staged.lock.entry.relativePath), "tampered\n");
+    await expect(auditDedicatedHardwareSdkDirectory(staged.root, [staged.lock], runtimeTarget))
+      .rejects.toThrow("file failed integrity verification");
+
+    const missing = stageLockedSdk();
+    rmSync(resolve(missing.root, missing.lock.license.relativePath));
+    await expect(auditDedicatedHardwareSdkDirectory(missing.root, [missing.lock], runtimeTarget))
+      .rejects.toThrow("contains unexpected files");
+
+    const extraKey = stageLockedSdk({ extra: true });
+    await expect(auditDedicatedHardwareSdkDirectory(extraKey.root, [extraKey.lock], runtimeTarget))
+      .rejects.toThrow("does not match the strict v1 shape");
+  });
+
+  it("rejects redirected tree entries and target, Electron ABI, or Node-API drift", async () => {
+    const redirected = stageLockedSdk();
+    const nativeDirectory = resolve(redirected.root, "native");
+    const realNativeDirectory = resolve(redirected.parent, "native-real");
+    renameSync(nativeDirectory, realNativeDirectory);
+    symlinkSync(realNativeDirectory, nativeDirectory, "junction");
+    await expect(auditDedicatedHardwareSdkDirectory(redirected.root, [redirected.lock], runtimeTarget))
+      .rejects.toThrow("redirected entry");
+
+    const staged = stageLockedSdk();
+    await expect(auditDedicatedHardwareSdkDirectory(staged.root, [staged.lock], {
+      ...runtimeTarget,
+      electronModulesAbi: runtimeTarget.electronModulesAbi + 1
+    })).rejects.toThrow("target or ABI does not match");
+    await expect(auditDedicatedHardwareSdkDirectory(staged.root, [staged.lock], {
+      ...runtimeTarget,
+      nodeApiVersion: runtimeTarget.nodeApiVersion + 1
+    })).rejects.toThrow("target or ABI does not match");
+  });
+});
+
+function temporaryDirectory(): string {
+  const path = mkdtempSync(join(tmpdir(), "joko-hardware-sdk-audit-"));
+  cleanups.push(path);
+  return path;
+}
+
+function stageLockedSdk(lockExtension: Record<string, unknown> = {}): {
+  readonly parent: string;
+  readonly root: string;
+  readonly lock: DedicatedHardwareSdkLock;
+} {
+  const parent = temporaryDirectory();
+  const root = resolve(parent, "dedicated-hardware-sdk");
+  mkdirSync(resolve(root, "native"), { recursive: true });
+  const payloads = [
+    { relativePath: "LICENSE.vendor.txt", bytes: Buffer.from("licensed fixture\n", "utf8") },
+    { relativePath: "adapter.mjs", bytes: Buffer.from("export const adapterGeneration = 1;\n", "utf8") },
+    { relativePath: "native/device.node", bytes: Buffer.from("native fixture bytes\n", "utf8") }
+  ].sort((left, right) => left.relativePath < right.relativePath ? -1 : left.relativePath > right.relativePath ? 1 : 0);
+  for (const payload of payloads) {
+    writeFileSync(resolve(root, ...payload.relativePath.split("/")), payload.bytes);
+  }
+  const files = payloads.map((payload) => ({
+    relativePath: payload.relativePath,
+    size: payload.bytes.byteLength,
+    integrity: integrity(payload.bytes)
+  }));
+  const file = (relativePath: string) => files.find((candidate) => candidate.relativePath === relativePath)!;
+  const withoutManifestIntegrity = {
+    version: 1 as const,
+    packageName: "@worklouder/device-kit-oai" as const,
+    packageVersion: "0.2.1",
+    redistributionGrantId: "distribution-review-2026-001",
+    license: { relativePath: "LICENSE.vendor.txt", integrity: file("LICENSE.vendor.txt").integrity },
+    target: runtimeTarget,
+    entry: { relativePath: "adapter.mjs", integrity: file("adapter.mjs").integrity },
+    nativeAddons: [{
+      identity: "@vendor/device-native@0.2.1",
+      relativePath: "native/device.node",
+      integrity: file("native/device.node").integrity,
+      abi: "electron-modules" as const
+    }],
+    files,
+    directoryIntegrity: packagedAudit.createDedicatedHardwareSdkDirectoryIntegrity(
+      payloads.map((payload, index) => ({ ...files[index]!, bytes: payload.bytes }))
+    )
+  };
+  const lock: DedicatedHardwareSdkLock = Object.freeze({
+    ...withoutManifestIntegrity,
+    manifestIntegrity: packagedAudit.createDedicatedHardwareSdkManifestIntegrity(withoutManifestIntegrity)
+  });
+  writeFileSync(resolve(root, "joko-dedicated-hardware-sdk.lock.json"), JSON.stringify({
+    ...lock,
+    ...lockExtension
+  }));
+  return { parent, root, lock };
+}
+
+function integrity(bytes: Uint8Array): string {
+  return `sha512-${createHash("sha512").update(bytes).digest("base64")}`;
+}

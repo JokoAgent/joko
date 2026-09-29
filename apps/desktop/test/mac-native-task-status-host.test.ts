@@ -184,6 +184,72 @@ describe("macOS native task-status host", () => {
     expect(html).toContain("Content-Security-Policy");
   });
 
+  it("restores an unexpectedly closed ambient window with bounded retry and stops after opt-out", () => {
+    const clock = new FakeClock();
+    const windows: FakeWindow[] = [];
+    const host = createMacNativeTaskStatusHost({
+      supported: true,
+      getDisplays: () => [{ id: 1, name: "Primary", primary: true, bounds: { x: 0, y: 0, width: 1200, height: 800 } }],
+      createWindow: (bounds) => { const window = new FakeWindow(bounds); windows.push(window); return window; },
+      onAction: () => undefined,
+      onNewTask: () => undefined,
+      onOpenSettings: () => undefined,
+      onToggleSounds: () => undefined,
+      playSound: () => undefined,
+      now: clock.now,
+      setTimer: clock.setTimer,
+      clearTimer: clock.clearTimer
+    });
+    const enabled = { enabled: true, display: { mode: "all" as const }, layout: "normal" as const, sounds: SOUND_SETTINGS };
+    host.setSettings(enabled);
+    host.publish(parseDesktopNativeTaskStatusSnapshot({ ownerId: "owner", revision: "1", locale: "en", sessions: [] }));
+    expect(windows).toHaveLength(1);
+    windows[0]?.destroy();
+    clock.advance(249);
+    expect(windows).toHaveLength(1);
+    clock.advance(1);
+    expect(windows).toHaveLength(2);
+    windows[1]?.destroy();
+    clock.advance(499);
+    expect(windows).toHaveLength(2);
+    clock.advance(1);
+    expect(windows).toHaveLength(3);
+    host.setSettings({ ...enabled, enabled: false });
+    expect(windows[2]?.destroyed).toBe(true);
+    expect(clock.pending()).toBe(0);
+  });
+
+  it("does not retire the current window for an earlier document load failure", async () => {
+    const windows: FakeWindow[] = [];
+    let rejectEarlier!: (error: Error) => void;
+    const earlier = new Promise<void>((_resolve, reject) => { rejectEarlier = reject; });
+    let loads = 0;
+    const host = createMacNativeTaskStatusHost({
+      supported: true,
+      getDisplays: () => [{ id: 1, name: "Primary", primary: true, bounds: { x: 0, y: 0, width: 1200, height: 800 } }],
+      createWindow: (bounds) => {
+        const window = new FakeWindow(bounds);
+        window.loadDocument = async () => { if (++loads === 1) await earlier; };
+        windows.push(window);
+        return window;
+      },
+      onAction: () => undefined,
+      onNewTask: () => undefined,
+      onOpenSettings: () => undefined,
+      onToggleSounds: () => undefined,
+      playSound: () => undefined
+    });
+    host.setSettings({ enabled: true, display: { mode: "all" }, layout: "normal", sounds: SOUND_SETTINGS });
+    host.publish(parseDesktopNativeTaskStatusSnapshot({ ownerId: "owner", revision: "1", locale: "en", sessions: [] }));
+    host.publish(parseDesktopNativeTaskStatusSnapshot({ ownerId: "owner", revision: "2", locale: "en", sessions: [] }));
+    rejectEarlier(new Error("older document failed"));
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(loads).toBe(2);
+    expect(windows).toHaveLength(1);
+    expect(windows[0]?.destroyed).toBe(false);
+    host.dispose();
+  });
+
   it("labels each supported interaction kind with the matching waiting state", () => {
     const snapshot = parseDesktopNativeTaskStatusSnapshot({
       ownerId: "owner",
@@ -447,6 +513,44 @@ describe("macOS native task-status host", () => {
       compactWidth: 600,
       expandedWidth: 750
     }));
+  });
+
+  it("restores the committed window placement when a layout write fails", async () => {
+    const windows: FakeWindow[] = [];
+    let writes = 0;
+    const display = { id: 11, name: "Studio", primary: true, bounds: { x: 0, y: 0, width: 1600, height: 900 } };
+    const committed = {
+      displayId: 11,
+      displayName: "Studio",
+      displayIndex: 0,
+      displayBounds: display.bounds,
+      centerXRatio: 0.5,
+      compactWidth: 420,
+      expandedWidth: 620
+    };
+    const host = createMacNativeTaskStatusHost({
+      supported: true,
+      getDisplays: () => [display],
+      getLayoutPreferences: () => [committed],
+      onLayoutPreference: async () => { writes += 1; throw new Error("disk unavailable"); },
+      createWindow: (bounds) => { const window = new FakeWindow(bounds); windows.push(window); return window; },
+      onAction: () => undefined,
+      onNewTask: () => undefined,
+      onOpenSettings: () => undefined,
+      onToggleSounds: () => undefined,
+      playSound: () => undefined
+    });
+    host.setSettings({ enabled: true, display: { mode: "all" }, layout: "normal", sounds: SOUND_SETTINGS });
+    host.publish(parseDesktopNativeTaskStatusSnapshot({
+      ownerId: "owner", revision: "1", locale: "en", sessions: []
+    }));
+    expect(windows[0]?.bounds).toMatchObject({ x: 590, width: 420 });
+    windows[0]?.changeBounds({ x: 300, y: 200, width: 600, height: 200 });
+    expect(windows[0]?.bounds).toMatchObject({ x: 300, width: 600 });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(writes).toBe(1);
+    expect(windows[0]?.bounds).toMatchObject({ x: 590, width: 420 });
+    host.dispose();
   });
 
   it("reveals errors for twelve seconds and completions for eight while retaining unread terminal tasks", () => {

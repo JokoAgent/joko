@@ -477,6 +477,21 @@ describe("Orchestrator application composition", () => {
     expect(desktopPreflight.statusCode).toBe(204);
     expect(desktopPreflight.headers["access-control-allow-origin"]).toBe("joko://app");
     expect(desktopPreflight.headers["access-control-allow-credentials"]).toBeUndefined();
+    const desktopConnectPreflight = await server.inject({
+      method: "OPTIONS",
+      url: "/joko.v1.WorkspaceService/ListWorkspaceEntries",
+      headers: {
+        origin: "joko://app",
+        "access-control-request-method": "POST",
+        "access-control-request-headers": "authorization,connect-protocol-version,content-type,x-joko-client-version"
+      }
+    });
+    expect(desktopConnectPreflight.statusCode).toBe(204);
+    expect(desktopConnectPreflight.headers["access-control-allow-origin"]).toBe("joko://app");
+    expect(desktopConnectPreflight.headers["access-control-allow-methods"]).toContain("POST");
+    expect(desktopConnectPreflight.headers["access-control-allow-headers"]).toBe(
+      "authorization, content-type, connect-protocol-version, connect-timeout-ms, x-joko-client-version"
+    );
     const disabledLanCors = await server.inject({
       method: "OPTIONS",
       url: "/healthz",

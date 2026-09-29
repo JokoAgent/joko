@@ -91,8 +91,8 @@ describe("gamepad action owner routing", () => {
     window.dispatchEvent(new Event("pageshow")); dispatchGamepadOwnedAction(document, "submit"); expect(replacement).toHaveBeenCalledTimes(2);
     await act(async () => root.render(<Task name="Input" scope={3} handlers={{}} />));
     expect(dispatchGamepadOwnedAction(document, "submit")).toBe(false);
-    const previous = document.querySelector("[data-gamepad-actions='composer']")!;
+    const previous = document.querySelector("[data-input-actions='composer']")!;
     await act(async () => root.render(null)); document.body.append(previous);
-    expect(previous.hasAttribute("data-gamepad-actions")).toBe(false);
+    expect(previous.hasAttribute("data-input-actions")).toBe(false);
   });
 });

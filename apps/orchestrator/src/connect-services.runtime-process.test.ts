@@ -21,6 +21,7 @@ describe("Connect runtime process surface", () => {
     const getRuntimeProcessUsage = vi.fn(async () => ({
       capturedAt: 2_000,
       processes: [{
+        role: "task-host" as const,
         sessionId: "session-1",
         generation: 4,
         pid: 42,
@@ -40,6 +41,7 @@ describe("Connect runtime process surface", () => {
     expect(getRuntimeProcessUsage).toHaveBeenCalledOnce();
     expect(response.processes).toEqual([expect.objectContaining({
       backendId: "backend-1",
+      role: contract.RuntimeProcessRole.TASK_HOST,
       sessionId: "session-1",
       runtimeGeneration: 4n,
       processId: 42n,
@@ -50,6 +52,32 @@ describe("Connect runtime process surface", () => {
       processInstanceId: PROCESS_INSTANCE
     })]);
     expect(Object.keys(response.processes[0] ?? {}).join(" ")).not.toMatch(/command|executable|environment|credential/iu);
+  });
+
+  it("keeps a shared control-plane service free of synthetic Session fields", async () => {
+    const app = application(adapter({
+      getRuntimeProcessUsage: async () => ({
+        capturedAt: 2_000,
+        processes: [{
+          role: "control-plane",
+          pid: 84,
+          cpuPercent: 1.5,
+          memoryKb: 2_048,
+          processCount: 2,
+          terminable: false
+        }]
+      })
+    }), 4);
+
+    const response = await callBackendList(app);
+    expect(response.processes).toEqual([expect.objectContaining({
+      backendId: "backend-1",
+      role: contract.RuntimeProcessRole.CONTROL_PLANE,
+      processId: 84n,
+      terminable: false
+    })]);
+    expect(response.processes[0]?.sessionId).toBeUndefined();
+    expect(response.processes[0]?.runtimeGeneration).toBeUndefined();
   });
 
   it("persists the Operation claim before dispatching the complete termination fence", async () => {

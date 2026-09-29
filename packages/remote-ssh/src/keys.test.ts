@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { link, mkdir, mkdtemp, open, readFile, readdir, realpath, rename, rm, stat, symlink, writeFile, type FileHandle } from "node:fs/promises";
+import { chmod, link, mkdir, mkdtemp, open, readFile, readdir, realpath, rename, rm, stat, symlink, writeFile, type FileHandle } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -8,6 +8,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { SshKeyError, SshKeyManager, sshKeyInstallCommand, type SshAgentCommand } from "./keys.js";
 import { encodeAgentPrivateKey } from "./agent-private-key.js";
 import { createPrivateFile } from "./create-private-file.js";
+import * as keyPermissions from "./key-permissions.js";
 
 const roots: string[] = [];
 const managers: SshKeyManager[] = [];
@@ -16,12 +17,26 @@ afterEach(async () => {
   managers.splice(0).forEach(manager => manager.close());
   for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true });
 });
-async function fixture(agentCommand: SshAgentCommand = async () => ({ code: 2, stdout: "" })) {
+async function fixture(agentCommand: SshAgentCommand = async () => ({ code: 2, stdout: "" }), prepareDirectory = true, platform?: NodeJS.Platform) {
   const root = await realpath(await mkdtemp(join(tmpdir(), "joko-ssh-keys-")));
   roots.push(root);
   const directory = join(root, "identity");
-  const manager = new SshKeyManager({ directory, agentCommand }); managers.push(manager);
+  if (process.platform === "win32") {
+    await promisify(execFile)("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", "$sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User; $acl = New-Object System.Security.AccessControl.DirectorySecurity; $acl.SetOwner($sid); $acl.SetAccessRuleProtection($true, $false); $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($sid, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow'))); [System.IO.Directory]::SetAccessControl($env:JOKO_ACL_FIXTURE, $acl)"], { windowsHide: true, env: { ...process.env, JOKO_ACL_FIXTURE: root } });
+    if (prepareDirectory) await mkdir(directory);
+  }
+  const manager = new SshKeyManager({ directory, agentCommand, ...(platform === undefined ? {} : { platform }) }); managers.push(manager);
   return { manager, root, directory };
+}
+async function allowEveryone(path: string, rights: "Read" | "CreateFiles", directory: boolean): Promise<void> {
+  await promisify(execFile)("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", "$acl = if ($env:JOKO_ACL_DIRECTORY -eq '1') { [System.IO.Directory]::GetAccessControl($env:JOKO_ACL_FIXTURE) } else { [System.IO.File]::GetAccessControl($env:JOKO_ACL_FIXTURE) }; $sid = New-Object System.Security.Principal.SecurityIdentifier('S-1-1-0'); $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($sid, $env:JOKO_ACL_RIGHTS, 'None', 'None', 'Allow'))); if ($env:JOKO_ACL_DIRECTORY -eq '1') { [System.IO.Directory]::SetAccessControl($env:JOKO_ACL_FIXTURE, $acl) } else { [System.IO.File]::SetAccessControl($env:JOKO_ACL_FIXTURE, $acl) }"], {
+    windowsHide: true, env: { ...process.env, JOKO_ACL_FIXTURE: path, JOKO_ACL_RIGHTS: rights, JOKO_ACL_DIRECTORY: directory ? "1" : "0" }
+  });
+}
+async function toggleDirectoryArchive(path: string): Promise<void> {
+  await promisify(execFile)("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", "$before = [System.IO.File]::GetAttributes($env:JOKO_ACL_FIXTURE); $after = [System.IO.FileAttributes]([int]$before -bxor [int][System.IO.FileAttributes]::Archive); [System.IO.File]::SetAttributes($env:JOKO_ACL_FIXTURE, $after); if ([System.IO.File]::GetAttributes($env:JOKO_ACL_FIXTURE) -ne $after) { exit 4 }"], {
+    windowsHide: true, env: { ...process.env, JOKO_ACL_FIXTURE: path }
+  });
 }
 
 describe("node SSH keys", () => {
@@ -82,11 +97,16 @@ describe("node SSH keys", () => {
     }
   });
 
-  it("creates encrypted Ed25519 identities exclusively and adds only verified plaintext through stdin", async () => {
+  it("creates encrypted Ed25519 identities exclusively and loads only the selected identity through private stdin", async () => {
     let publicKey = "";
     let inputKey = "";
     const agent = vi.fn<SshAgentCommand>(async (args, input) => {
       if (args[0] === "-L") return { code: 0, stdout: publicKey };
+      if (process.platform === "darwin") {
+        expect(args).toEqual(["--apple-use-keychain", "-k", expect.stringMatching(/id_joko$/u)]);
+        expect(input!.toString()).toBe("a sample passphrase\n");
+        return { code: 0, stdout: "" };
+      }
       expect(args).toEqual(["-"]);
       inputKey = input!.toString();
       expect(inputKey).not.toContain("a sample passphrase");
@@ -105,22 +125,95 @@ describe("node SSH keys", () => {
     await expect(manager.addToAgent(first.id, first.sha256Fingerprint, "incorrect", signal())).rejects.toMatchObject({ code: "bad_passphrase" });
     expect(agent).not.toHaveBeenCalled();
     await manager.addToAgent(first.id, first.sha256Fingerprint, "a sample passphrase", signal());
-    const parsed = ssh2.utils.parseKey(inputKey);
-    expect(parsed).not.toBeInstanceOf(Error);
-    if (!(parsed instanceof Error)) {
-      expect(parsed.isPrivateKey()).toBe(true);
-      expect(parsed.comment).toBe("Work key");
+    if (process.platform !== "darwin") {
+      const parsed = ssh2.utils.parseKey(inputKey);
+      expect(parsed).not.toBeInstanceOf(Error);
+      if (!(parsed instanceof Error)) {
+        expect(parsed.isPrivateKey()).toBe(true);
+        expect(parsed.comment).toBe("Work key");
+      }
     }
     const catalog = await manager.list(signal());
     expect(catalog.agentState).toBe("ready");
     expect(catalog.keys.find(key => key.id === first.id)).toMatchObject({ inAgent: true, comment: "Work key", algorithm: "ssh-ed25519" });
     expect(JSON.stringify(catalog)).not.toContain("PRIVATE KEY");
     expect(JSON.stringify(catalog)).not.toContain(directory);
-  });
+  }, 20_000);
+
+  it("fences native keychain loading by exact agent identity, one-line secret input, file ownership and confirmed completion", async () => {
+    const directoryPermissions = vi.spyOn(keyPermissions, "inspectKeyDirectoryPermissions").mockResolvedValue(undefined);
+    const privatePermissions = vi.spyOn(keyPermissions, "inspectPrivateKeyPermissions").mockResolvedValue({
+      verifyFinal: async () => undefined, close: async () => undefined
+    });
+    try {
+    let publicKey = "";
+    let agentKey = "";
+    let privatePath = "";
+    let publicPath = "";
+    let action: "success" | "missing" | "failure" | "unavailable" | "cancel" | "change" = "success";
+    let canceled: AbortController | undefined;
+    const nativeInputs: Buffer[] = [];
+    let loads = 0;
+    const agent = vi.fn<SshAgentCommand>(async (args, input) => {
+      if (args[0] === "-L") return agentKey === ""
+        ? { code: 1, stdout: "The agent has no identities.\n" } : { code: 0, stdout: agentKey };
+      expect(args).toEqual(["--apple-use-keychain", "-k", privatePath]);
+      if (input !== undefined) {
+        expect(input.toString()).toBe("native passphrase\n");
+        nativeInputs.push(input);
+      }
+      loads += 1;
+      if (action === "change") await writeFile(publicPath, ssh2.utils.generateKeyPairSync("ed25519").public);
+      if (action === "cancel") canceled!.abort();
+      if (action === "success") agentKey = publicKey;
+      return { code: action === "unavailable" ? 2 : action === "failure" ? 1 : 0, stdout: "" };
+    });
+    const { manager, directory } = await fixture(agent, true, "darwin");
+    const key = await manager.generate({ name: "id_joko", comment: "", passphrase: "native passphrase" }, signal());
+    privatePath = join(directory, key.id);
+    publicPath = `${privatePath}.pub`;
+    publicKey = await manager.readPublic(key.id, key.sha256Fingerprint, signal());
+    await manager.addToAgent(key.id, key.sha256Fingerprint, "native passphrase", signal());
+    expect(loads).toBe(1);
+    expect(nativeInputs[0]!.every(byte => byte === 0)).toBe(true);
+
+    agentKey = "";
+    await manager.addToAgent(key.id, key.sha256Fingerprint, undefined, signal());
+    expect(loads).toBe(2);
+    await manager.addToAgent(key.id, key.sha256Fingerprint, undefined, signal());
+    expect(loads).toBe(2);
+
+    agent.mockClear();
+    for (const invalid of ["line\nfeed", "carriage\rreturn", "a".repeat(1024), "界".repeat(342)]) {
+      await expect(manager.addToAgent(key.id, key.sha256Fingerprint, invalid, signal())).rejects.toMatchObject({ code: "bad_passphrase" });
+    }
+    expect(agent).not.toHaveBeenCalled();
+
+    agentKey = "";
+    action = "missing";
+    await expect(manager.addToAgent(key.id, key.sha256Fingerprint, undefined, signal())).rejects.toMatchObject({ code: "outcome_unknown" });
+    expect(loads).toBe(3);
+    action = "failure";
+    await expect(manager.addToAgent(key.id, key.sha256Fingerprint, "native passphrase", signal())).rejects.toMatchObject({ code: "outcome_unknown" });
+    expect(loads).toBe(4);
+    action = "cancel";
+    canceled = new AbortController();
+    await expect(manager.addToAgent(key.id, key.sha256Fingerprint, "native passphrase", canceled.signal)).rejects.toMatchObject({ code: "outcome_unknown" });
+    expect(loads).toBe(5);
+    action = "change";
+    await expect(manager.addToAgent(key.id, key.sha256Fingerprint, "native passphrase", signal())).rejects.toMatchObject({ code: "outcome_unknown" });
+    expect(loads).toBe(6);
+    await writeFile(publicPath, publicKey);
+    action = "unavailable";
+    await expect(manager.addToAgent(key.id, key.sha256Fingerprint, "native passphrase", signal())).rejects.toMatchObject({ code: "agent_unavailable" });
+    expect(loads).toBe(7);
+    expect(nativeInputs.every(input => input.every(byte => byte === 0))).toBe(true);
+    } finally { directoryPermissions.mockRestore(); privatePermissions.mockRestore(); }
+  }, 30_000);
 
   it("preserves public-only collisions, rejects changed pairs and omits hard-linked identities", async () => {
     const { manager, directory } = await fixture();
-    await mkdir(directory);
+    await mkdir(directory, { recursive: true });
     await writeFile(join(directory, "id_joko.pub"), "reserved public file");
     const key = await manager.generate({ name: "id_joko", comment: "" }, signal());
     expect(key.id).toBe("id_joko_1");
@@ -133,10 +226,99 @@ describe("node SSH keys", () => {
     await expect(manager.addToAgent(key.id, replacementKey.sha256Fingerprint, undefined, signal())).rejects.toMatchObject({ code: "key_changed" });
     await link(join(directory, key.id), join(directory, "other-private"));
     expect((await manager.list(signal())).keys).toEqual([]);
+  }, 25_000);
+
+  it.skipIf(process.platform !== "win32")("rejects a private key whose DACL admits other users before reading or dispatching it", async () => {
+    const agent = vi.fn<SshAgentCommand>(async () => ({ code: 0, stdout: "" }));
+    const { manager, directory } = await fixture(agent);
+    const key = await manager.generate({ name: "id_joko", comment: "" }, signal());
+    await allowEveryone(join(directory, key.id), "Read", false);
+    const sample = await open(join(directory, key.id), "r");
+    const read = vi.spyOn(Object.getPrototypeOf(sample) as FileHandle, "read");
+    await sample.close();
+    try {
+      expect((await manager.list(signal())).keys).toEqual([]);
+      await expect(manager.readPublic(key.id, key.sha256Fingerprint, signal())).rejects.toMatchObject({ code: "unsafe_permissions" });
+      await expect(manager.addToAgent(key.id, key.sha256Fingerprint, "incorrect", signal())).rejects.toMatchObject({ code: "unsafe_permissions" });
+      // Each operation reads its public file once; the rejected private file is never read.
+      expect(read).toHaveBeenCalledTimes(3);
+      expect(agent).toHaveBeenCalledTimes(1);
+      expect(agent).toHaveBeenCalledWith(["-L"], undefined, expect.any(AbortSignal));
+    } finally { read.mockRestore(); }
+  }, 25_000);
+
+  it.skipIf(process.platform !== "win32")("rejects a writable SSH directory for catalog reads and generation", async () => {
+    const { manager, directory } = await fixture();
+    const key = await manager.generate({ name: "id_joko", comment: "" }, signal());
+    await allowEveryone(directory, "CreateFiles", true);
+    await expect(manager.list(signal())).rejects.toMatchObject({ code: "unsafe_permissions" });
+    await expect(manager.readPublic(key.id, key.sha256Fingerprint, signal())).rejects.toMatchObject({ code: "unsafe_permissions" });
+    await expect(manager.generate({ name: "another", comment: "" }, signal())).rejects.toMatchObject({ code: "unsafe_permissions" });
+    expect(await readdir(directory)).not.toContain("another");
+  }, 25_000);
+
+  it.skipIf(process.platform !== "win32")("rechecks a directory DACL widened after reading the private key but before agent dispatch", async () => {
+    const agent = vi.fn<SshAgentCommand>(async () => ({ code: 0, stdout: "" }));
+    const { manager, directory } = await fixture(agent);
+    const key = await manager.generate({ name: "id_joko", comment: "" }, signal());
+    const sample = await open(join(directory, key.id), "r");
+    const prototype = Object.getPrototypeOf(sample) as FileHandle;
+    const originalRead = prototype.read;
+    await sample.close();
+    let reads = 0;
+    const interception = vi.spyOn(prototype, "read").mockImplementation(function (this: FileHandle, ...args) {
+      reads += 1;
+      if (reads === 3) return allowEveryone(directory, "CreateFiles", true).then(() => Reflect.apply(originalRead, this, args));
+      return Reflect.apply(originalRead, this, args);
+    });
+    try {
+      await expect(manager.addToAgent(key.id, key.sha256Fingerprint, undefined, signal())).rejects.toMatchObject({ code: "unsafe_permissions" });
+      expect(reads).toBe(3);
+      expect(agent).not.toHaveBeenCalled();
+    } finally { interception.mockRestore(); }
+  }, 25_000);
+
+  it.skipIf(process.platform !== "win32")("does not mistake an ordinary directory attribute update for an identity replacement", async () => {
+    const agent = vi.fn<SshAgentCommand>(async () => ({ code: 0, stdout: "" }));
+    const { manager, directory } = await fixture(agent);
+    const key = await manager.generate({ name: "id_joko", comment: "" }, signal());
+    const sample = await open(join(directory, key.id), "r");
+    const prototype = Object.getPrototypeOf(sample) as FileHandle;
+    const originalRead = prototype.read;
+    await sample.close();
+    let reads = 0;
+    const interception = vi.spyOn(prototype, "read").mockImplementation(function (this: FileHandle, ...args) {
+      reads += 1;
+      if (reads === 3) return toggleDirectoryArchive(directory).then(() => Reflect.apply(originalRead, this, args));
+      return Reflect.apply(originalRead, this, args);
+    });
+    try {
+      await manager.addToAgent(key.id, key.sha256Fingerprint, undefined, signal());
+      expect(reads).toBe(3);
+      expect(agent).toHaveBeenCalledOnce();
+      expect(agent).toHaveBeenCalledWith(["-"], expect.any(Buffer), expect.any(AbortSignal));
+    } finally { interception.mockRestore(); }
+  }, 25_000);
+
+  it.skipIf(process.platform === "win32")("accepts ordinary POSIX directory read access but rejects writable directories and readable private keys", async () => {
+    const agent = vi.fn<SshAgentCommand>(async () => ({ code: 2, stdout: "" }));
+    const { manager, directory } = await fixture(agent);
+    const key = await manager.generate({ name: "id_joko", comment: "" }, signal());
+    await chmod(directory, 0o755);
+    expect(await manager.readPublic(key.id, key.sha256Fingerprint, signal())).toMatch(/^ssh-ed25519 /u);
+    await chmod(join(directory, key.id), 0o644);
+    expect((await manager.list(signal())).keys).toEqual([]);
+    await expect(manager.readPublic(key.id, key.sha256Fingerprint, signal())).rejects.toMatchObject({ code: "unsafe_permissions" });
+    await expect(manager.addToAgent(key.id, key.sha256Fingerprint, undefined, signal())).rejects.toMatchObject({ code: "unsafe_permissions" });
+    expect(agent).toHaveBeenCalledTimes(1);
+    await chmod(join(directory, key.id), 0o600);
+    await chmod(directory, 0o775);
+    await expect(manager.list(signal())).rejects.toMatchObject({ code: "unsafe_permissions" });
+    await expect(manager.generate({ name: "another", comment: "" }, signal())).rejects.toMatchObject({ code: "unsafe_permissions" });
   });
 
   it("rejects linked roots and traversal before opening a key", async () => {
-    const { manager, directory, root } = await fixture();
+    const { manager, directory, root } = await fixture(undefined, false);
     for (const name of ["../outside", "..", "C:\\key", "key.pub", "NUL", "CON.txt"]) {
       await expect(manager.generate({ name, comment: "" }, signal())).rejects.toMatchObject({ code: "invalid_name" });
     }
@@ -181,12 +363,13 @@ describe("node SSH keys", () => {
       const { manager } = await fixture(async () => ({ code, stdout }));
       expect(await manager.list(signal())).toEqual({ keys: [], agentState: state, generationSupported: true });
     }
-  });
+  }, 15_000);
 
   it("does not queue concurrent changes and retires an in-flight agent call when the node closes", async () => {
     let started!: () => void;
     const ready = new Promise<void>(resolve => { started = resolve; });
-    const agent: SshAgentCommand = async (_args, _input, active) => new Promise((_, reject) => {
+    const agent: SshAgentCommand = async (args, _input, active) => args[0] === "-L"
+      ? { code: 1, stdout: "The agent has no identities.\n" } : new Promise((_, reject) => {
       started();
       active.addEventListener("abort", () => reject(new SshKeyError("aborted")), { once: true });
     });

@@ -746,7 +746,9 @@ CREATE TABLE product_sessions (
         CHECK (
           append_system_prompt IS NULL
           OR (length(append_system_prompt) <= 8000 AND instr(append_system_prompt, char(0)) = 0)
-        ), remote_host_target_id TEXT REFERENCES targets(id) ON DELETE RESTRICT, remote_host_id TEXT CHECK (
+        ), remote_location_kind TEXT CHECK (
+        remote_location_kind IS NULL OR remote_location_kind IN ('ssh', 'device_peer')
+      ), remote_host_target_id TEXT REFERENCES targets(id) ON DELETE RESTRICT, remote_host_id TEXT CHECK (
         remote_host_id IS NULL OR (
           length(trim(remote_host_id)) BETWEEN 1 AND 256
           AND instr(remote_host_id, char(0)) = 0
@@ -754,11 +756,13 @@ CREATE TABLE product_sessions (
           AND instr(remote_host_id, '?') = 0
           AND substr(remote_host_id, 1, 1) <> '!'
         )
-      ), remote_workspace_root TEXT CHECK (
+      ), remote_controller_device_id TEXT REFERENCES devices(id) ON DELETE RESTRICT,
+      remote_target_device_id TEXT REFERENCES devices(id) ON DELETE RESTRICT, remote_workspace_root TEXT CHECK (
         remote_workspace_root IS NULL OR (
           length(remote_workspace_root) BETWEEN 1 AND 16384
-          AND substr(remote_workspace_root, 1, 1) = '/'
           AND instr(remote_workspace_root, char(0)) = 0
+          AND instr(remote_workspace_root, char(10)) = 0
+          AND instr(remote_workspace_root, char(13)) = 0
         )
       ), title_source TEXT NOT NULL
         CHECK (title_source IN ('draft', 'attachment', 'placeholder', 'automatic', 'manual')), task_summary TEXT CHECK (
@@ -1825,22 +1829,11 @@ CREATE TABLE session_worktrees (
             AND source_remote NOT GLOB '*[^A-Za-z0-9._-]*'
           )
         ),
-        remote_host_owner_id TEXT CHECK (
-          remote_host_owner_id IS NULL OR length(remote_host_owner_id) BETWEEN 1 AND 256
-        ),
-        remote_host_target_id TEXT REFERENCES targets(id) ON DELETE RESTRICT,
-        remote_host_id TEXT CHECK (
-          remote_host_id IS NULL OR length(remote_host_id) BETWEEN 1 AND 256
-        ),
-        remote_host_identity TEXT CHECK (
-          remote_host_identity IS NULL OR (
-            length(remote_host_identity) = 71 AND substr(remote_host_identity, 1, 7) = 'sha256:'
-            AND substr(remote_host_identity, 8) NOT GLOB '*[^0-9a-f]*'
-          )
+        remote_authority_json TEXT CHECK (
+          remote_authority_json IS NULL OR length(remote_authority_json) BETWEEN 2 AND 32768
         ),
         remote_target_id TEXT REFERENCES targets(id) ON DELETE RESTRICT,
         remote_target_revision INTEGER CHECK (remote_target_revision IS NULL OR remote_target_revision >= 1),
-        remote_host_revision INTEGER CHECK (remote_host_revision IS NULL OR remote_host_revision >= 1),
         remote_manifest_id TEXT CHECK (
           remote_manifest_id IS NULL OR length(remote_manifest_id) BETWEEN 1 AND 256
         ),
@@ -1849,21 +1842,73 @@ CREATE TABLE session_worktrees (
         updated_at INTEGER NOT NULL CHECK (updated_at >= acquired_at),
         revision INTEGER NOT NULL CHECK (revision >= 1),
         CHECK (
-          (remote_host_owner_id IS NULL AND remote_host_target_id IS NULL AND remote_host_id IS NULL
-            AND remote_host_identity IS NULL AND remote_target_id IS NULL AND remote_target_revision IS NULL
-            AND remote_host_revision IS NULL AND remote_manifest_id IS NULL)
+          (remote_authority_json IS NULL AND remote_target_id IS NULL
+            AND remote_target_revision IS NULL AND remote_manifest_id IS NULL)
           OR
-          (remote_host_owner_id IS NOT NULL AND remote_host_target_id IS NOT NULL AND remote_host_id IS NOT NULL
-            AND remote_host_identity IS NOT NULL AND remote_target_id IS NOT NULL AND remote_target_revision IS NOT NULL
-            AND remote_host_revision IS NOT NULL AND remote_manifest_id IS NOT NULL)
-        ),
-        FOREIGN KEY(remote_host_owner_id, remote_host_target_id, remote_host_id)
-          REFERENCES remote_hosts(owner_id, target_id, host_id) ON DELETE RESTRICT
+          (remote_authority_json IS NOT NULL AND remote_target_id IS NOT NULL
+            AND remote_target_revision IS NOT NULL AND remote_manifest_id IS NOT NULL)
+        )
       ) STRICT;
 
 CREATE UNIQUE INDEX session_worktrees_remote_manifest_idx
-        ON session_worktrees(remote_host_owner_id, remote_host_target_id, remote_host_id, remote_manifest_id)
+        ON session_worktrees(remote_target_id, remote_manifest_id)
         WHERE remote_manifest_id IS NOT NULL;
+
+CREATE TABLE maintenance_scans (
+        id TEXT PRIMARY KEY CHECK (length(trim(id)) BETWEEN 1 AND 256),
+        kind TEXT NOT NULL CHECK (kind IN ('history', 'artifact')),
+        fingerprint TEXT,
+        state TEXT NOT NULL CHECK (state IN ('available', 'claimed', 'expired')),
+        payload_json TEXT NOT NULL,
+        expires_at INTEGER NOT NULL CHECK (expires_at >= 0),
+        created_at INTEGER NOT NULL CHECK (created_at >= 0),
+        updated_at INTEGER NOT NULL CHECK (updated_at >= created_at),
+        CHECK (fingerprint IS NULL OR length(trim(fingerprint)) BETWEEN 1 AND 256)
+      ) STRICT;
+
+CREATE INDEX maintenance_scans_expiry_idx
+        ON maintenance_scans(kind, state, expires_at);
+
+CREATE TABLE maintenance_jobs (
+        id TEXT PRIMARY KEY CHECK (length(trim(id)) BETWEEN 1 AND 256),
+        kind TEXT NOT NULL CHECK (kind IN ('history', 'artifact')),
+        scan_id TEXT NOT NULL REFERENCES maintenance_scans(id) ON DELETE RESTRICT,
+        status TEXT NOT NULL CHECK (status IN (
+          'running', 'completed', 'scan_expired', 'storage_changed', 'cancelled', 'failed'
+        )),
+        phase TEXT NOT NULL CHECK (length(trim(phase)) BETWEEN 1 AND 64),
+        percent INTEGER NOT NULL CHECK (percent BETWEEN 0 AND 100),
+        cancellable INTEGER NOT NULL CHECK (cancellable IN (0, 1)),
+        cancel_requested INTEGER NOT NULL CHECK (cancel_requested IN (0, 1)),
+        payload_json TEXT NOT NULL,
+        result_json TEXT,
+        created_at INTEGER NOT NULL CHECK (created_at >= 0),
+        updated_at INTEGER NOT NULL CHECK (updated_at >= created_at),
+        UNIQUE(kind, scan_id)
+      ) STRICT;
+
+CREATE UNIQUE INDEX maintenance_one_running_job_idx
+        ON maintenance_jobs(status) WHERE status = 'running';
+
+CREATE INDEX maintenance_jobs_kind_updated_idx
+        ON maintenance_jobs(kind, updated_at DESC, id);
+
+CREATE TABLE maintenance_effects (
+        job_id TEXT NOT NULL REFERENCES maintenance_jobs(id) ON DELETE CASCADE,
+        id TEXT NOT NULL CHECK (length(trim(id)) BETWEEN 1 AND 256),
+        kind TEXT NOT NULL CHECK (kind IN (
+          'history_binding', 'history_external', 'artifact_blob', 'artifact_temporary'
+        )),
+        state TEXT NOT NULL CHECK (state IN (
+          'pending', 'claimed', 'prepared', 'quarantined', 'completed', 'skipped', 'unknown'
+        )),
+        payload_json TEXT NOT NULL,
+        updated_at INTEGER NOT NULL CHECK (updated_at >= 0),
+        PRIMARY KEY(job_id, id)
+      ) STRICT;
+
+CREATE INDEX maintenance_effects_state_idx
+        ON maintenance_effects(job_id, state, id);
 
 CREATE TABLE settings (
         scope_type TEXT NOT NULL CHECK (scope_type IN ('service', 'connection', 'backend', 'target', 'session')),
@@ -1891,7 +1936,9 @@ CREATE TABLE targets (
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL,
         revision INTEGER NOT NULL CHECK (revision >= 1)
-      , remote_host_target_id TEXT REFERENCES targets(id) ON DELETE RESTRICT, remote_host_id TEXT CHECK (
+      , remote_location_kind TEXT CHECK (
+        remote_location_kind IS NULL OR remote_location_kind IN ('ssh', 'device_peer')
+      ), remote_host_target_id TEXT REFERENCES targets(id) ON DELETE RESTRICT, remote_host_id TEXT CHECK (
         remote_host_id IS NULL OR (
           length(trim(remote_host_id)) BETWEEN 1 AND 256
           AND instr(remote_host_id, char(0)) = 0
@@ -1899,11 +1946,13 @@ CREATE TABLE targets (
           AND instr(remote_host_id, '?') = 0
           AND substr(remote_host_id, 1, 1) <> '!'
         )
-      ), remote_workspace_root TEXT CHECK (
+      ), remote_controller_device_id TEXT REFERENCES devices(id) ON DELETE RESTRICT,
+      remote_target_device_id TEXT REFERENCES devices(id) ON DELETE RESTRICT, remote_workspace_root TEXT CHECK (
         remote_workspace_root IS NULL OR (
           length(remote_workspace_root) BETWEEN 1 AND 16384
-          AND substr(remote_workspace_root, 1, 1) = '/'
           AND instr(remote_workspace_root, char(0)) = 0
+          AND instr(remote_workspace_root, char(10)) = 0
+          AND instr(remote_workspace_root, char(13)) = 0
         )
       )) STRICT;
 
@@ -2038,6 +2087,44 @@ CREATE TABLE schedule_deletion_cleanups (
         )
       ) STRICT;
 
+CREATE TABLE portable_replacement_cleanups (
+        operation_id TEXT PRIMARY KEY REFERENCES operations(id) ON DELETE RESTRICT,
+        imported_session_id TEXT NOT NULL REFERENCES product_sessions(id) ON DELETE RESTRICT,
+        replaced_session_id TEXT NOT NULL UNIQUE REFERENCES product_sessions(id) ON DELETE RESTRICT,
+        native_state TEXT NOT NULL CHECK (native_state IN ('pending', 'dispatched', 'unknown', 'completed')),
+        worktree_state TEXT NOT NULL CHECK (worktree_state IN ('pending', 'completed')),
+        failure_code TEXT,
+        created_at INTEGER NOT NULL CHECK (created_at >= 0),
+        updated_at INTEGER NOT NULL CHECK (updated_at >= created_at),
+        revision INTEGER NOT NULL CHECK (revision >= 1),
+        CHECK (imported_session_id <> replaced_session_id)
+      ) STRICT;
+
+CREATE TABLE native_catalog_adoptions (
+        operation_id TEXT PRIMARY KEY REFERENCES operations(id) ON DELETE RESTRICT,
+          request_operation_id TEXT UNIQUE REFERENCES operations(id) ON DELETE RESTRICT,
+        session_id TEXT NOT NULL UNIQUE,
+        backend_id TEXT NOT NULL REFERENCES backends(id) ON DELETE RESTRICT,
+        target_id TEXT NOT NULL REFERENCES targets(id) ON DELETE RESTRICT,
+        project_id TEXT REFERENCES targets(id) ON DELETE RESTRICT,
+        project_revision INTEGER CHECK (project_revision >= 1),
+        target_revision INTEGER NOT NULL CHECK (target_revision >= 1),
+        backend_generation INTEGER NOT NULL CHECK (backend_generation >= 0),
+        binding_json TEXT NOT NULL CHECK (json_valid(binding_json)),
+        entry_json TEXT NOT NULL CHECK (json_valid(entry_json)),
+        recovery_json TEXT NOT NULL CHECK (json_valid(recovery_json)),
+        native_reference TEXT NOT NULL,
+        state TEXT NOT NULL CHECK (state IN ('claimed', 'unknown', 'adopted', 'absent')),
+        created_at INTEGER NOT NULL CHECK (created_at >= 0),
+        updated_at INTEGER NOT NULL CHECK (updated_at >= created_at),
+        revision INTEGER NOT NULL CHECK (revision >= 1),
+        CHECK ((project_id IS NULL) = (project_revision IS NULL))
+      ) STRICT;
+
+CREATE UNIQUE INDEX native_catalog_adoptions_pending_reference
+        ON native_catalog_adoptions(backend_id, native_reference)
+        WHERE state IN ('claimed', 'unknown');
+
 CREATE TABLE session_lifecycle_cleanups (
         operation_id TEXT PRIMARY KEY CHECK (
           length(trim(operation_id)) BETWEEN 1 AND 256
@@ -2107,8 +2194,13 @@ CREATE TABLE native_session_derivations (
           length(effective_workspace_root) BETWEEN 1 AND 32768
           AND instr(effective_workspace_root, char(0)) = 0
         ),
+        remote_location_kind TEXT CHECK (
+          remote_location_kind IS NULL OR remote_location_kind IN ('ssh', 'device_peer')
+        ),
         remote_host_target_id TEXT REFERENCES targets(id) ON DELETE RESTRICT,
         remote_host_id TEXT,
+        remote_controller_device_id TEXT REFERENCES devices(id) ON DELETE RESTRICT,
+        remote_target_device_id TEXT REFERENCES devices(id) ON DELETE RESTRICT,
         remote_workspace_root TEXT,
         native_opaque_ref TEXT COLLATE NOCASE,
         native_session_id TEXT,
@@ -2127,12 +2219,31 @@ CREATE TABLE native_session_derivations (
         updated_at INTEGER NOT NULL CHECK (updated_at >= created_at),
         revision INTEGER NOT NULL CHECK (revision >= 1),
         UNIQUE(backend_id, native_opaque_ref),
-        CHECK ((remote_host_target_id IS NULL) = (remote_host_id IS NULL)),
-        CHECK ((remote_host_id IS NULL) = (remote_workspace_root IS NULL)),
+        CHECK (
+          (remote_location_kind IS NULL AND remote_host_target_id IS NULL AND remote_host_id IS NULL
+            AND remote_controller_device_id IS NULL AND remote_target_device_id IS NULL
+            AND remote_workspace_root IS NULL)
+          OR
+          (remote_location_kind = 'ssh' AND remote_host_target_id IS NOT NULL AND remote_host_id IS NOT NULL
+            AND remote_controller_device_id IS NULL AND remote_target_device_id IS NULL
+            AND remote_workspace_root IS NOT NULL
+            AND substr(remote_workspace_root, 1, 1) = '/')
+          OR
+          (remote_location_kind = 'device_peer' AND remote_host_target_id IS NULL AND remote_host_id IS NULL
+            AND remote_controller_device_id IS NOT NULL AND remote_target_device_id IS NOT NULL
+            AND remote_controller_device_id <> remote_target_device_id AND remote_workspace_root IS NOT NULL)
+        ),
         CHECK ((source_session_revision IS NULL) = (target_revision IS NULL)),
         CHECK ((derived_worktree_json IS NULL) = (derived_worktree_digest IS NULL)),
         CHECK ((remote_worktree_plan_json IS NULL) = (remote_worktree_plan_digest IS NULL)),
-        CHECK (remote_worktree_plan_json IS NULL OR (external_lifecycle = 1 AND remote_host_id IS NOT NULL)),
+        CHECK (remote_worktree_plan_json IS NULL OR (
+          external_lifecycle = 1 AND (
+            (remote_location_kind = 'ssh' AND remote_host_id IS NOT NULL)
+            OR
+            (remote_location_kind = 'device_peer' AND remote_controller_device_id IS NOT NULL
+              AND remote_target_device_id IS NOT NULL)
+          )
+        )),
         CHECK ((external_lifecycle = 1) = (source_session_revision IS NOT NULL)),
         CHECK ((native_opaque_ref IS NULL) = (generation IS NULL)),
         CHECK (native_opaque_ref IS NOT NULL OR native_session_id IS NULL),
@@ -2376,7 +2487,11 @@ CREATE INDEX sessions_project_idx
 
 CREATE INDEX sessions_remote_host_idx
         ON product_sessions(remote_host_target_id, remote_host_id, updated_at DESC)
-        WHERE remote_host_id IS NOT NULL;
+        WHERE remote_location_kind = 'ssh';
+
+CREATE INDEX sessions_remote_device_idx
+        ON product_sessions(remote_controller_device_id, remote_target_device_id, updated_at DESC)
+        WHERE remote_location_kind = 'device_peer';
 
 CREATE INDEX sessions_target_idx ON product_sessions(target_id, updated_at DESC);
 
@@ -2389,7 +2504,10 @@ CREATE INDEX native_history_marker_cursor_idx
 CREATE INDEX targets_backend_idx ON targets(backend_id);
 
 CREATE INDEX targets_remote_host_idx ON targets(remote_host_target_id, remote_host_id)
-        WHERE remote_host_id IS NOT NULL;
+        WHERE remote_location_kind = 'ssh';
+
+CREATE INDEX targets_remote_device_idx ON targets(remote_controller_device_id, remote_target_device_id)
+        WHERE remote_location_kind = 'device_peer';
 
 CREATE INDEX tool_leases_active_idx ON tool_leases(tool_id, expires_at) WHERE state = 'active';
 
@@ -2730,32 +2848,106 @@ CREATE TRIGGER messaging_inbound_queue_update
 
 CREATE TRIGGER sessions_remote_binding_insert
       BEFORE INSERT ON product_sessions
-      WHEN (NEW.remote_host_target_id IS NULL) <> (NEW.remote_host_id IS NULL)
-        OR (NEW.remote_host_id IS NULL) <> (NEW.remote_workspace_root IS NULL)
+      WHEN CASE NEW.remote_location_kind
+        WHEN 'ssh' THEN NOT (
+          NEW.remote_host_target_id IS NOT NULL AND NEW.remote_host_id IS NOT NULL
+          AND NEW.remote_controller_device_id IS NULL AND NEW.remote_target_device_id IS NULL
+          AND NEW.remote_workspace_root IS NOT NULL
+          AND substr(NEW.remote_workspace_root, 1, 1) = '/'
+        )
+        WHEN 'device_peer' THEN NOT (
+          NEW.remote_host_target_id IS NULL AND NEW.remote_host_id IS NULL
+          AND NEW.remote_controller_device_id IS NOT NULL AND NEW.remote_target_device_id IS NOT NULL
+          AND NEW.remote_controller_device_id <> NEW.remote_target_device_id
+          AND NEW.remote_workspace_root IS NOT NULL
+        )
+        ELSE NOT (
+          NEW.remote_location_kind IS NULL AND NEW.remote_host_target_id IS NULL
+          AND NEW.remote_host_id IS NULL AND NEW.remote_controller_device_id IS NULL
+          AND NEW.remote_target_device_id IS NULL
+          AND NEW.remote_workspace_root IS NULL
+        )
+      END
       BEGIN
         SELECT RAISE(ABORT, 'session remote workspace binding is incomplete');
       END;
 
 CREATE TRIGGER sessions_remote_binding_update
-      BEFORE UPDATE OF remote_host_target_id, remote_host_id, remote_workspace_root ON product_sessions
-      WHEN (NEW.remote_host_target_id IS NULL) <> (NEW.remote_host_id IS NULL)
-        OR (NEW.remote_host_id IS NULL) <> (NEW.remote_workspace_root IS NULL)
+      BEFORE UPDATE OF remote_location_kind, remote_host_target_id, remote_host_id,
+        remote_controller_device_id, remote_target_device_id, remote_workspace_root ON product_sessions
+      WHEN CASE NEW.remote_location_kind
+        WHEN 'ssh' THEN NOT (
+          NEW.remote_host_target_id IS NOT NULL AND NEW.remote_host_id IS NOT NULL
+          AND NEW.remote_controller_device_id IS NULL AND NEW.remote_target_device_id IS NULL
+          AND NEW.remote_workspace_root IS NOT NULL
+          AND substr(NEW.remote_workspace_root, 1, 1) = '/'
+        )
+        WHEN 'device_peer' THEN NOT (
+          NEW.remote_host_target_id IS NULL AND NEW.remote_host_id IS NULL
+          AND NEW.remote_controller_device_id IS NOT NULL AND NEW.remote_target_device_id IS NOT NULL
+          AND NEW.remote_controller_device_id <> NEW.remote_target_device_id
+          AND NEW.remote_workspace_root IS NOT NULL
+        )
+        ELSE NOT (
+          NEW.remote_location_kind IS NULL AND NEW.remote_host_target_id IS NULL
+          AND NEW.remote_host_id IS NULL AND NEW.remote_controller_device_id IS NULL
+          AND NEW.remote_target_device_id IS NULL
+          AND NEW.remote_workspace_root IS NULL
+        )
+      END
       BEGIN
         SELECT RAISE(ABORT, 'session remote workspace binding is incomplete');
       END;
 
 CREATE TRIGGER targets_remote_binding_insert
       BEFORE INSERT ON targets
-      WHEN (NEW.remote_host_target_id IS NULL) <> (NEW.remote_host_id IS NULL)
-        OR (NEW.remote_host_id IS NULL) <> (NEW.remote_workspace_root IS NULL)
+      WHEN CASE NEW.remote_location_kind
+        WHEN 'ssh' THEN NOT (
+          NEW.remote_host_target_id IS NOT NULL AND NEW.remote_host_id IS NOT NULL
+          AND NEW.remote_controller_device_id IS NULL AND NEW.remote_target_device_id IS NULL
+          AND NEW.remote_workspace_root IS NOT NULL
+          AND substr(NEW.remote_workspace_root, 1, 1) = '/'
+        )
+        WHEN 'device_peer' THEN NOT (
+          NEW.remote_host_target_id IS NULL AND NEW.remote_host_id IS NULL
+          AND NEW.remote_controller_device_id IS NOT NULL AND NEW.remote_target_device_id IS NOT NULL
+          AND NEW.remote_controller_device_id <> NEW.remote_target_device_id
+          AND NEW.remote_workspace_root IS NOT NULL
+        )
+        ELSE NOT (
+          NEW.remote_location_kind IS NULL AND NEW.remote_host_target_id IS NULL
+          AND NEW.remote_host_id IS NULL AND NEW.remote_controller_device_id IS NULL
+          AND NEW.remote_target_device_id IS NULL
+          AND NEW.remote_workspace_root IS NULL
+        )
+      END
       BEGIN
         SELECT RAISE(ABORT, 'target remote workspace binding is incomplete');
       END;
 
 CREATE TRIGGER targets_remote_binding_update
-      BEFORE UPDATE OF remote_host_target_id, remote_host_id, remote_workspace_root ON targets
-      WHEN (NEW.remote_host_target_id IS NULL) <> (NEW.remote_host_id IS NULL)
-        OR (NEW.remote_host_id IS NULL) <> (NEW.remote_workspace_root IS NULL)
+      BEFORE UPDATE OF remote_location_kind, remote_host_target_id, remote_host_id,
+        remote_controller_device_id, remote_target_device_id, remote_workspace_root ON targets
+      WHEN CASE NEW.remote_location_kind
+        WHEN 'ssh' THEN NOT (
+          NEW.remote_host_target_id IS NOT NULL AND NEW.remote_host_id IS NOT NULL
+          AND NEW.remote_controller_device_id IS NULL AND NEW.remote_target_device_id IS NULL
+          AND NEW.remote_workspace_root IS NOT NULL
+          AND substr(NEW.remote_workspace_root, 1, 1) = '/'
+        )
+        WHEN 'device_peer' THEN NOT (
+          NEW.remote_host_target_id IS NULL AND NEW.remote_host_id IS NULL
+          AND NEW.remote_controller_device_id IS NOT NULL AND NEW.remote_target_device_id IS NOT NULL
+          AND NEW.remote_controller_device_id <> NEW.remote_target_device_id
+          AND NEW.remote_workspace_root IS NOT NULL
+        )
+        ELSE NOT (
+          NEW.remote_location_kind IS NULL AND NEW.remote_host_target_id IS NULL
+          AND NEW.remote_host_id IS NULL AND NEW.remote_controller_device_id IS NULL
+          AND NEW.remote_target_device_id IS NULL
+          AND NEW.remote_workspace_root IS NULL
+        )
+      END
       BEGIN
         SELECT RAISE(ABORT, 'target remote workspace binding is incomplete');
       END;

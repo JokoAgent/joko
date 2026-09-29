@@ -20,7 +20,7 @@ import type { Message } from "@bufbuild/protobuf";
  * Describes the file joko/v1/portable_session.proto.
  */
 export const file_joko_v1_portable_session: GenFile = /*@__PURE__*/
-  fileDesc("Ch5qb2tvL3YxL3BvcnRhYmxlX3Nlc3Npb24ucHJvdG8SB2pva28udjEi7QIKHFBvcnRhYmxlU2Vzc2lvbkltcG9ydFByZXZpZXcSDQoFdGl0bGUYASABKAkSLgoOd29ya3NwYWNlX2tpbmQYAiABKA4yFi5qb2tvLnYxLldvcmtzcGFjZUtpbmQSLwoLZXhwb3J0ZWRfYXQYAyABKAsyGi5nb29nbGUucHJvdG9idWYuVGltZXN0YW1wEhsKE2FwcGxpY2F0aW9uX3ZlcnNpb24YBCABKAkSFgoOZm9ybWF0X3ZlcnNpb24YBSABKA0SGgoSYmFja2VuZF9jYXBhYmlsaXR5GAYgASgJEjIKCGZpZGVsaXR5GAcgASgOMiAuam9rby52MS5Qb3J0YWJsZVNlc3Npb25GaWRlbGl0eRIVCg1tZXNzYWdlX2NvdW50GAggASgEEhMKC21lZGlhX2NvdW50GAkgASgEEhQKDHdvcmtlcl9jb3VudBgKIAEoBBIWCg5uYXRpdmVfaGlzdG9yeRgLIAEoCCLVAQoaUG9ydGFibGVTZXNzaW9uSW1wb3J0RHJhZnQSEAoIZHJhZnRfaWQYASABKAkSLgoKZXhwaXJlc19hdBgCIAEoCzIaLmdvb2dsZS5wcm90b2J1Zi5UaW1lc3RhbXASEQoJZW5jcnlwdGVkGAMgASgIEhkKEXBhc3N3b3JkX3JlcXVpcmVkGAQgASgIEjsKB3ByZXZpZXcYBSABKAsyJS5qb2tvLnYxLlBvcnRhYmxlU2Vzc2lvbkltcG9ydFByZXZpZXdIAIgBAUIKCghfcHJldmlldyJtChxFeHBvcnRQb3J0YWJsZVNlc3Npb25SZXF1ZXN0EhIKCnNlc3Npb25faWQYASABKAkSFQoIcGFzc3dvcmQYAiABKAlIAIgBARIVCg1leGNsdWRlX21lZGlhGAMgASgIQgsKCV9wYXNzd29yZCLrAQodRXhwb3J0UG9ydGFibGVTZXNzaW9uUmVzcG9uc2USIgoIYXJ0aWZhY3QYASABKAsyEC5qb2tvLnYxLkJsb2JSZWYSMgoIZmlkZWxpdHkYAiABKA4yIC5qb2tvLnYxLlBvcnRhYmxlU2Vzc2lvbkZpZGVsaXR5EhUKDW1lc3NhZ2VfY291bnQYAyABKAQSEwoLbWVkaWFfY291bnQYBCABKAQSGwoTbWlzc2luZ19tZWRpYV9jb3VudBgFIAEoBBIUCgx3b3JrZXJfY291bnQYBiABKAQSEwoLbWVkaWFfYnl0ZXMYByABKAQiSAojSW5zcGVjdFBvcnRhYmxlU2Vzc2lvbkltcG9ydFJlcXVlc3QSIQoHcGFja2FnZRgBIAEoCzIQLmpva28udjEuQmxvYlJlZiJaCiRJbnNwZWN0UG9ydGFibGVTZXNzaW9uSW1wb3J0UmVzcG9uc2USMgoFZHJhZnQYASABKAsyIy5qb2tvLnYxLlBvcnRhYmxlU2Vzc2lvbkltcG9ydERyYWZ0IkgKIlVubG9ja1BvcnRhYmxlU2Vzc2lvbkltcG9ydFJlcXVlc3QSEAoIZHJhZnRfaWQYASABKAkSEAoIcGFzc3dvcmQYAiABKAkiWQojVW5sb2NrUG9ydGFibGVTZXNzaW9uSW1wb3J0UmVzcG9uc2USMgoFZHJhZnQYASABKAsyIy5qb2tvLnYxLlBvcnRhYmxlU2Vzc2lvbkltcG9ydERyYWZ0IjYKIkNhbmNlbFBvcnRhYmxlU2Vzc2lvbkltcG9ydFJlcXVlc3QSEAoIZHJhZnRfaWQYASABKAkiOAojQ2FuY2VsUG9ydGFibGVTZXNzaW9uSW1wb3J0UmVzcG9uc2USEQoJY2FuY2VsbGVkGAEgASgIIv0CCiJDb21taXRQb3J0YWJsZVNlc3Npb25JbXBvcnRSZXF1ZXN0EhQKDG9wZXJhdGlvbl9pZBgBIAEoCRIQCghkcmFmdF9pZBgCIAEoCRIRCgl0YXJnZXRfaWQYAyABKAkSEgoFdGl0bGUYBCABKAlIAIgBARIrCgVtb2RlbBgFIAEoCzIXLmpva28udjEuTW9kZWxTZWxlY3Rpb25IAYgBARIwCg9wZXJtaXNzaW9uX21vZGUYBiABKA4yFy5qb2tvLnYxLlBlcm1pc3Npb25Nb2RlEhEKCXBsYW5fbW9kZRgHIAEoCBIRCglvdmVyd3JpdGUYCCABKAgSFAoMdXNlX3dvcmt0cmVlGAkgASgIEiAKE3dvcmt0cmVlX3NvdXJjZV9yZWYYCiABKAlIAogBARIfChdyZWZyZXNoX3dvcmt0cmVlX3JlbW90ZRgLIAEoCEIICgZfdGl0bGVCCAoGX21vZGVsQhYKFF93b3JrdHJlZV9zb3VyY2VfcmVmIsMCChtQb3J0YWJsZVNlc3Npb25JbXBvcnRSZXN1bHQSEgoKc2Vzc2lvbl9pZBgBIAEoCRIyCghmaWRlbGl0eRgCIAEoDjIgLmpva28udjEuUG9ydGFibGVTZXNzaW9uRmlkZWxpdHkSFQoNbWVzc2FnZV9jb3VudBgDIAEoBBITCgttZWRpYV9jb3VudBgEIAEoBBIUCgx3b3JrZXJfY291bnQYBSABKAQSHAoUcmVwbGFjZWRfc2Vzc2lvbl9pZHMYBiADKAkSNAoGc3RhdHVzGAcgASgOMiQuam9rby52MS5Qb3J0YWJsZVNlc3Npb25JbXBvcnRTdGF0dXMSMQoQYWN0aXZhdGlvbl9lcnJvchgIIAEoCzISLmpva28udjEuRXJyb3JJbmZvSACIAQFCEwoRX2FjdGl2YXRpb25fZXJyb3IibQojQ29tbWl0UG9ydGFibGVTZXNzaW9uSW1wb3J0UmVzcG9uc2USNAoGcmVzdWx0GAEgASgLMiQuam9rby52MS5Qb3J0YWJsZVNlc3Npb25JbXBvcnRSZXN1bHQSEAoIcmVwbGF5ZWQYAiABKAgiOwolUmV0cnlQb3J0YWJsZVNlc3Npb25BY3RpdmF0aW9uUmVxdWVzdBISCgpzZXNzaW9uX2lkGAEgASgJIroBCiZSZXRyeVBvcnRhYmxlU2Vzc2lvbkFjdGl2YXRpb25SZXNwb25zZRISCgpzZXNzaW9uX2lkGAEgASgJEjQKBnN0YXR1cxgCIAEoDjIkLmpva28udjEuUG9ydGFibGVTZXNzaW9uSW1wb3J0U3RhdHVzEjEKEGFjdGl2YXRpb25fZXJyb3IYAyABKAsyEi5qb2tvLnYxLkVycm9ySW5mb0gAiAEBQhMKEV9hY3RpdmF0aW9uX2Vycm9yKrsBChdQb3J0YWJsZVNlc3Npb25GaWRlbGl0eRIpCiVQT1JUQUJMRV9TRVNTSU9OX0ZJREVMSVRZX1VOU1BFQ0lGSUVEEAASIgoeUE9SVEFCTEVfU0VTU0lPTl9GSURFTElUWV9GVUxMEAESJQohUE9SVEFCTEVfU0VTU0lPTl9GSURFTElUWV9QQVJUSUFMEAISKgomUE9SVEFCTEVfU0VTU0lPTl9GSURFTElUWV9QUk9EVUNUX09OTFkQAyq2AQobUG9ydGFibGVTZXNzaW9uSW1wb3J0U3RhdHVzEi4KKlBPUlRBQkxFX1NFU1NJT05fSU1QT1JUX1NUQVRVU19VTlNQRUNJRklFRBAAEigKJFBPUlRBQkxFX1NFU1NJT05fSU1QT1JUX1NUQVRVU19SRUFEWRABEj0KOVBPUlRBQkxFX1NFU1NJT05fSU1QT1JUX1NUQVRVU19JTVBPUlRFRF9BQ1RJVkFUSU9OX0ZBSUxFRBACYgZwcm90bzM", [file_google_protobuf_timestamp, file_joko_v1_capability, file_joko_v1_common, file_joko_v1_model, file_joko_v1_workspace]);
+  fileDesc("Ch5qb2tvL3YxL3BvcnRhYmxlX3Nlc3Npb24ucHJvdG8SB2pva28udjEi7QIKHFBvcnRhYmxlU2Vzc2lvbkltcG9ydFByZXZpZXcSDQoFdGl0bGUYASABKAkSLgoOd29ya3NwYWNlX2tpbmQYAiABKA4yFi5qb2tvLnYxLldvcmtzcGFjZUtpbmQSLwoLZXhwb3J0ZWRfYXQYAyABKAsyGi5nb29nbGUucHJvdG9idWYuVGltZXN0YW1wEhsKE2FwcGxpY2F0aW9uX3ZlcnNpb24YBCABKAkSFgoOZm9ybWF0X3ZlcnNpb24YBSABKA0SGgoSYmFja2VuZF9jYXBhYmlsaXR5GAYgASgJEjIKCGZpZGVsaXR5GAcgASgOMiAuam9rby52MS5Qb3J0YWJsZVNlc3Npb25GaWRlbGl0eRIVCg1tZXNzYWdlX2NvdW50GAggASgEEhMKC21lZGlhX2NvdW50GAkgASgEEhQKDHdvcmtlcl9jb3VudBgKIAEoBBIWCg5uYXRpdmVfaGlzdG9yeRgLIAEoCCLVAQoaUG9ydGFibGVTZXNzaW9uSW1wb3J0RHJhZnQSEAoIZHJhZnRfaWQYASABKAkSLgoKZXhwaXJlc19hdBgCIAEoCzIaLmdvb2dsZS5wcm90b2J1Zi5UaW1lc3RhbXASEQoJZW5jcnlwdGVkGAMgASgIEhkKEXBhc3N3b3JkX3JlcXVpcmVkGAQgASgIEjsKB3ByZXZpZXcYBSABKAsyJS5qb2tvLnYxLlBvcnRhYmxlU2Vzc2lvbkltcG9ydFByZXZpZXdIAIgBAUIKCghfcHJldmlldyJtChxFeHBvcnRQb3J0YWJsZVNlc3Npb25SZXF1ZXN0EhIKCnNlc3Npb25faWQYASABKAkSFQoIcGFzc3dvcmQYAiABKAlIAIgBARIVCg1leGNsdWRlX21lZGlhGAMgASgIQgsKCV9wYXNzd29yZCLrAQodRXhwb3J0UG9ydGFibGVTZXNzaW9uUmVzcG9uc2USIgoIYXJ0aWZhY3QYASABKAsyEC5qb2tvLnYxLkJsb2JSZWYSMgoIZmlkZWxpdHkYAiABKA4yIC5qb2tvLnYxLlBvcnRhYmxlU2Vzc2lvbkZpZGVsaXR5EhUKDW1lc3NhZ2VfY291bnQYAyABKAQSEwoLbWVkaWFfY291bnQYBCABKAQSGwoTbWlzc2luZ19tZWRpYV9jb3VudBgFIAEoBBIUCgx3b3JrZXJfY291bnQYBiABKAQSEwoLbWVkaWFfYnl0ZXMYByABKAQiSAojSW5zcGVjdFBvcnRhYmxlU2Vzc2lvbkltcG9ydFJlcXVlc3QSIQoHcGFja2FnZRgBIAEoCzIQLmpva28udjEuQmxvYlJlZiJaCiRJbnNwZWN0UG9ydGFibGVTZXNzaW9uSW1wb3J0UmVzcG9uc2USMgoFZHJhZnQYASABKAsyIy5qb2tvLnYxLlBvcnRhYmxlU2Vzc2lvbkltcG9ydERyYWZ0IkgKIlVubG9ja1BvcnRhYmxlU2Vzc2lvbkltcG9ydFJlcXVlc3QSEAoIZHJhZnRfaWQYASABKAkSEAoIcGFzc3dvcmQYAiABKAkiWQojVW5sb2NrUG9ydGFibGVTZXNzaW9uSW1wb3J0UmVzcG9uc2USMgoFZHJhZnQYASABKAsyIy5qb2tvLnYxLlBvcnRhYmxlU2Vzc2lvbkltcG9ydERyYWZ0IjYKIkNhbmNlbFBvcnRhYmxlU2Vzc2lvbkltcG9ydFJlcXVlc3QSEAoIZHJhZnRfaWQYASABKAkiOAojQ2FuY2VsUG9ydGFibGVTZXNzaW9uSW1wb3J0UmVzcG9uc2USEQoJY2FuY2VsbGVkGAEgASgIIv0CCiJDb21taXRQb3J0YWJsZVNlc3Npb25JbXBvcnRSZXF1ZXN0EhQKDG9wZXJhdGlvbl9pZBgBIAEoCRIQCghkcmFmdF9pZBgCIAEoCRIRCgl0YXJnZXRfaWQYAyABKAkSEgoFdGl0bGUYBCABKAlIAIgBARIrCgVtb2RlbBgFIAEoCzIXLmpva28udjEuTW9kZWxTZWxlY3Rpb25IAYgBARIwCg9wZXJtaXNzaW9uX21vZGUYBiABKA4yFy5qb2tvLnYxLlBlcm1pc3Npb25Nb2RlEhEKCXBsYW5fbW9kZRgHIAEoCBIRCglvdmVyd3JpdGUYCCABKAgSFAoMdXNlX3dvcmt0cmVlGAkgASgIEiAKE3dvcmt0cmVlX3NvdXJjZV9yZWYYCiABKAlIAogBARIfChdyZWZyZXNoX3dvcmt0cmVlX3JlbW90ZRgLIAEoCEIICgZfdGl0bGVCCAoGX21vZGVsQhYKFF93b3JrdHJlZV9zb3VyY2VfcmVmIsMCChtQb3J0YWJsZVNlc3Npb25JbXBvcnRSZXN1bHQSEgoKc2Vzc2lvbl9pZBgBIAEoCRIyCghmaWRlbGl0eRgCIAEoDjIgLmpva28udjEuUG9ydGFibGVTZXNzaW9uRmlkZWxpdHkSFQoNbWVzc2FnZV9jb3VudBgDIAEoBBITCgttZWRpYV9jb3VudBgEIAEoBBIUCgx3b3JrZXJfY291bnQYBSABKAQSHAoUcmVwbGFjZWRfc2Vzc2lvbl9pZHMYBiADKAkSNAoGc3RhdHVzGAcgASgOMiQuam9rby52MS5Qb3J0YWJsZVNlc3Npb25JbXBvcnRTdGF0dXMSMQoQYWN0aXZhdGlvbl9lcnJvchgIIAEoCzISLmpva28udjEuRXJyb3JJbmZvSACIAQFCEwoRX2FjdGl2YXRpb25fZXJyb3IibQojQ29tbWl0UG9ydGFibGVTZXNzaW9uSW1wb3J0UmVzcG9uc2USNAoGcmVzdWx0GAEgASgLMiQuam9rby52MS5Qb3J0YWJsZVNlc3Npb25JbXBvcnRSZXN1bHQSEAoIcmVwbGF5ZWQYAiABKAgiOwolUmV0cnlQb3J0YWJsZVNlc3Npb25BY3RpdmF0aW9uUmVxdWVzdBISCgpzZXNzaW9uX2lkGAEgASgJIroBCiZSZXRyeVBvcnRhYmxlU2Vzc2lvbkFjdGl2YXRpb25SZXNwb25zZRISCgpzZXNzaW9uX2lkGAEgASgJEjQKBnN0YXR1cxgCIAEoDjIkLmpva28udjEuUG9ydGFibGVTZXNzaW9uSW1wb3J0U3RhdHVzEjEKEGFjdGl2YXRpb25fZXJyb3IYAyABKAsyEi5qb2tvLnYxLkVycm9ySW5mb0gAiAEBQhMKEV9hY3RpdmF0aW9uX2Vycm9yIv0BChpQb3J0YWJsZVJlcGxhY2VtZW50Q2xlYW51cBIbChNpbXBvcnRlZF9zZXNzaW9uX2lkGAEgASgJEj0KDG5hdGl2ZV9zdGF0ZRgCIAEoDjInLmpva28udjEuUG9ydGFibGVSZXBsYWNlbWVudE5hdGl2ZVN0YXRlEkEKDndvcmt0cmVlX3N0YXRlGAMgASgOMikuam9rby52MS5Qb3J0YWJsZVJlcGxhY2VtZW50V29ya3RyZWVTdGF0ZRIQCghyZXZpc2lvbhgEIAEoBBIuCgp1cGRhdGVkX2F0GAUgASgLMhouZ29vZ2xlLnByb3RvYnVmLlRpbWVzdGFtcCJDCiRHZXRQb3J0YWJsZVJlcGxhY2VtZW50Q2xlYW51cFJlcXVlc3QSGwoTaW1wb3J0ZWRfc2Vzc2lvbl9pZBgBIAEoCSJuCiVHZXRQb3J0YWJsZVJlcGxhY2VtZW50Q2xlYW51cFJlc3BvbnNlEjkKB2NsZWFudXAYASABKAsyIy5qb2tvLnYxLlBvcnRhYmxlUmVwbGFjZW1lbnRDbGVhbnVwSACIAQFCCgoIX2NsZWFudXAiSQoqUmVjb25jaWxlUG9ydGFibGVSZXBsYWNlbWVudENsZWFudXBSZXF1ZXN0EhsKE2ltcG9ydGVkX3Nlc3Npb25faWQYASABKAkinwEKK1JlY29uY2lsZVBvcnRhYmxlUmVwbGFjZW1lbnRDbGVhbnVwUmVzcG9uc2USNAoHY2xlYW51cBgBIAEoCzIjLmpva28udjEuUG9ydGFibGVSZXBsYWNlbWVudENsZWFudXASOgoKaW5zcGVjdGlvbhgCIAEoDjImLmpva28udjEuUG9ydGFibGVSZXBsYWNlbWVudEluc3BlY3Rpb24ifwomUmV0cnlQb3J0YWJsZVJlcGxhY2VtZW50Q2xlYW51cFJlcXVlc3QSGwoTaW1wb3J0ZWRfc2Vzc2lvbl9pZBgBIAEoCRIZChFleHBlY3RlZF9yZXZpc2lvbhgCIAEoBBIdChVjb25maXJtX25hdGl2ZV9kZWxldGUYAyABKAgimwEKJ1JldHJ5UG9ydGFibGVSZXBsYWNlbWVudENsZWFudXBSZXNwb25zZRI0CgdjbGVhbnVwGAEgASgLMiMuam9rby52MS5Qb3J0YWJsZVJlcGxhY2VtZW50Q2xlYW51cBI6CgppbnNwZWN0aW9uGAIgASgOMiYuam9rby52MS5Qb3J0YWJsZVJlcGxhY2VtZW50SW5zcGVjdGlvbiq7AQoXUG9ydGFibGVTZXNzaW9uRmlkZWxpdHkSKQolUE9SVEFCTEVfU0VTU0lPTl9GSURFTElUWV9VTlNQRUNJRklFRBAAEiIKHlBPUlRBQkxFX1NFU1NJT05fRklERUxJVFlfRlVMTBABEiUKIVBPUlRBQkxFX1NFU1NJT05fRklERUxJVFlfUEFSVElBTBACEioKJlBPUlRBQkxFX1NFU1NJT05fRklERUxJVFlfUFJPRFVDVF9PTkxZEAMqtgEKG1BvcnRhYmxlU2Vzc2lvbkltcG9ydFN0YXR1cxIuCipQT1JUQUJMRV9TRVNTSU9OX0lNUE9SVF9TVEFUVVNfVU5TUEVDSUZJRUQQABIoCiRQT1JUQUJMRV9TRVNTSU9OX0lNUE9SVF9TVEFUVVNfUkVBRFkQARI9CjlQT1JUQUJMRV9TRVNTSU9OX0lNUE9SVF9TVEFUVVNfSU1QT1JURURfQUNUSVZBVElPTl9GQUlMRUQQAiqUAgoeUG9ydGFibGVSZXBsYWNlbWVudE5hdGl2ZVN0YXRlEjEKLVBPUlRBQkxFX1JFUExBQ0VNRU5UX05BVElWRV9TVEFURV9VTlNQRUNJRklFRBAAEi0KKVBPUlRBQkxFX1JFUExBQ0VNRU5UX05BVElWRV9TVEFURV9QRU5ESU5HEAESMAosUE9SVEFCTEVfUkVQTEFDRU1FTlRfTkFUSVZFX1NUQVRFX0RJU1BBVENIRUQQAhItCilQT1JUQUJMRV9SRVBMQUNFTUVOVF9OQVRJVkVfU1RBVEVfVU5LTk9XThADEi8KK1BPUlRBQkxFX1JFUExBQ0VNRU5UX05BVElWRV9TVEFURV9DT01QTEVURUQQBCq7AQogUG9ydGFibGVSZXBsYWNlbWVudFdvcmt0cmVlU3RhdGUSMwovUE9SVEFCTEVfUkVQTEFDRU1FTlRfV09SS1RSRUVfU1RBVEVfVU5TUEVDSUZJRUQQABIvCitQT1JUQUJMRV9SRVBMQUNFTUVOVF9XT1JLVFJFRV9TVEFURV9QRU5ESU5HEAESMQotUE9SVEFCTEVfUkVQTEFDRU1FTlRfV09SS1RSRUVfU1RBVEVfQ09NUExFVEVEEAIq1gEKHVBvcnRhYmxlUmVwbGFjZW1lbnRJbnNwZWN0aW9uEi8KK1BPUlRBQkxFX1JFUExBQ0VNRU5UX0lOU1BFQ1RJT05fVU5TUEVDSUZJRUQQABIrCidQT1JUQUJMRV9SRVBMQUNFTUVOVF9JTlNQRUNUSU9OX1BSRVNFTlQQARIqCiZQT1JUQUJMRV9SRVBMQUNFTUVOVF9JTlNQRUNUSU9OX0FCU0VOVBACEisKJ1BPUlRBQkxFX1JFUExBQ0VNRU5UX0lOU1BFQ1RJT05fVU5LTk9XThADYgZwcm90bzM", [file_google_protobuf_timestamp, file_joko_v1_capability, file_joko_v1_common, file_joko_v1_model, file_joko_v1_workspace]);
 
 /**
  * @generated from message joko.v1.PortableSessionImportPreview
@@ -501,6 +501,165 @@ export const RetryPortableSessionActivationResponseSchema: GenMessage<RetryPorta
   messageDesc(file_joko_v1_portable_session, 14);
 
 /**
+ * @generated from message joko.v1.PortableReplacementCleanup
+ */
+export type PortableReplacementCleanup = Message<"joko.v1.PortableReplacementCleanup"> & {
+  /**
+   * @generated from field: string imported_session_id = 1;
+   */
+  importedSessionId: string;
+
+  /**
+   * @generated from field: joko.v1.PortableReplacementNativeState native_state = 2;
+   */
+  nativeState: PortableReplacementNativeState;
+
+  /**
+   * @generated from field: joko.v1.PortableReplacementWorktreeState worktree_state = 3;
+   */
+  worktreeState: PortableReplacementWorktreeState;
+
+  /**
+   * @generated from field: uint64 revision = 4;
+   */
+  revision: bigint;
+
+  /**
+   * @generated from field: google.protobuf.Timestamp updated_at = 5;
+   */
+  updatedAt?: Timestamp | undefined;
+};
+
+/**
+ * Describes the message joko.v1.PortableReplacementCleanup.
+ * Use `create(PortableReplacementCleanupSchema)` to create a new message.
+ */
+export const PortableReplacementCleanupSchema: GenMessage<PortableReplacementCleanup> = /*@__PURE__*/
+  messageDesc(file_joko_v1_portable_session, 15);
+
+/**
+ * @generated from message joko.v1.GetPortableReplacementCleanupRequest
+ */
+export type GetPortableReplacementCleanupRequest = Message<"joko.v1.GetPortableReplacementCleanupRequest"> & {
+  /**
+   * @generated from field: string imported_session_id = 1;
+   */
+  importedSessionId: string;
+};
+
+/**
+ * Describes the message joko.v1.GetPortableReplacementCleanupRequest.
+ * Use `create(GetPortableReplacementCleanupRequestSchema)` to create a new message.
+ */
+export const GetPortableReplacementCleanupRequestSchema: GenMessage<GetPortableReplacementCleanupRequest> = /*@__PURE__*/
+  messageDesc(file_joko_v1_portable_session, 16);
+
+/**
+ * @generated from message joko.v1.GetPortableReplacementCleanupResponse
+ */
+export type GetPortableReplacementCleanupResponse = Message<"joko.v1.GetPortableReplacementCleanupResponse"> & {
+  /**
+   * @generated from field: optional joko.v1.PortableReplacementCleanup cleanup = 1;
+   */
+  cleanup?: PortableReplacementCleanup | undefined;
+};
+
+/**
+ * Describes the message joko.v1.GetPortableReplacementCleanupResponse.
+ * Use `create(GetPortableReplacementCleanupResponseSchema)` to create a new message.
+ */
+export const GetPortableReplacementCleanupResponseSchema: GenMessage<GetPortableReplacementCleanupResponse> = /*@__PURE__*/
+  messageDesc(file_joko_v1_portable_session, 17);
+
+/**
+ * @generated from message joko.v1.ReconcilePortableReplacementCleanupRequest
+ */
+export type ReconcilePortableReplacementCleanupRequest = Message<"joko.v1.ReconcilePortableReplacementCleanupRequest"> & {
+  /**
+   * @generated from field: string imported_session_id = 1;
+   */
+  importedSessionId: string;
+};
+
+/**
+ * Describes the message joko.v1.ReconcilePortableReplacementCleanupRequest.
+ * Use `create(ReconcilePortableReplacementCleanupRequestSchema)` to create a new message.
+ */
+export const ReconcilePortableReplacementCleanupRequestSchema: GenMessage<ReconcilePortableReplacementCleanupRequest> = /*@__PURE__*/
+  messageDesc(file_joko_v1_portable_session, 18);
+
+/**
+ * @generated from message joko.v1.ReconcilePortableReplacementCleanupResponse
+ */
+export type ReconcilePortableReplacementCleanupResponse = Message<"joko.v1.ReconcilePortableReplacementCleanupResponse"> & {
+  /**
+   * @generated from field: joko.v1.PortableReplacementCleanup cleanup = 1;
+   */
+  cleanup?: PortableReplacementCleanup | undefined;
+
+  /**
+   * @generated from field: joko.v1.PortableReplacementInspection inspection = 2;
+   */
+  inspection: PortableReplacementInspection;
+};
+
+/**
+ * Describes the message joko.v1.ReconcilePortableReplacementCleanupResponse.
+ * Use `create(ReconcilePortableReplacementCleanupResponseSchema)` to create a new message.
+ */
+export const ReconcilePortableReplacementCleanupResponseSchema: GenMessage<ReconcilePortableReplacementCleanupResponse> = /*@__PURE__*/
+  messageDesc(file_joko_v1_portable_session, 19);
+
+/**
+ * @generated from message joko.v1.RetryPortableReplacementCleanupRequest
+ */
+export type RetryPortableReplacementCleanupRequest = Message<"joko.v1.RetryPortableReplacementCleanupRequest"> & {
+  /**
+   * @generated from field: string imported_session_id = 1;
+   */
+  importedSessionId: string;
+
+  /**
+   * @generated from field: uint64 expected_revision = 2;
+   */
+  expectedRevision: bigint;
+
+  /**
+   * @generated from field: bool confirm_native_delete = 3;
+   */
+  confirmNativeDelete: boolean;
+};
+
+/**
+ * Describes the message joko.v1.RetryPortableReplacementCleanupRequest.
+ * Use `create(RetryPortableReplacementCleanupRequestSchema)` to create a new message.
+ */
+export const RetryPortableReplacementCleanupRequestSchema: GenMessage<RetryPortableReplacementCleanupRequest> = /*@__PURE__*/
+  messageDesc(file_joko_v1_portable_session, 20);
+
+/**
+ * @generated from message joko.v1.RetryPortableReplacementCleanupResponse
+ */
+export type RetryPortableReplacementCleanupResponse = Message<"joko.v1.RetryPortableReplacementCleanupResponse"> & {
+  /**
+   * @generated from field: joko.v1.PortableReplacementCleanup cleanup = 1;
+   */
+  cleanup?: PortableReplacementCleanup | undefined;
+
+  /**
+   * @generated from field: joko.v1.PortableReplacementInspection inspection = 2;
+   */
+  inspection: PortableReplacementInspection;
+};
+
+/**
+ * Describes the message joko.v1.RetryPortableReplacementCleanupResponse.
+ * Use `create(RetryPortableReplacementCleanupResponseSchema)` to create a new message.
+ */
+export const RetryPortableReplacementCleanupResponseSchema: GenMessage<RetryPortableReplacementCleanupResponse> = /*@__PURE__*/
+  messageDesc(file_joko_v1_portable_session, 21);
+
+/**
  * @generated from enum joko.v1.PortableSessionFidelity
  */
 export enum PortableSessionFidelity {
@@ -556,4 +715,97 @@ export enum PortableSessionImportStatus {
  */
 export const PortableSessionImportStatusSchema: GenEnum<PortableSessionImportStatus> = /*@__PURE__*/
   enumDesc(file_joko_v1_portable_session, 1);
+
+/**
+ * @generated from enum joko.v1.PortableReplacementNativeState
+ */
+export enum PortableReplacementNativeState {
+  /**
+   * @generated from enum value: PORTABLE_REPLACEMENT_NATIVE_STATE_UNSPECIFIED = 0;
+   */
+  UNSPECIFIED = 0,
+
+  /**
+   * @generated from enum value: PORTABLE_REPLACEMENT_NATIVE_STATE_PENDING = 1;
+   */
+  PENDING = 1,
+
+  /**
+   * @generated from enum value: PORTABLE_REPLACEMENT_NATIVE_STATE_DISPATCHED = 2;
+   */
+  DISPATCHED = 2,
+
+  /**
+   * @generated from enum value: PORTABLE_REPLACEMENT_NATIVE_STATE_UNKNOWN = 3;
+   */
+  UNKNOWN = 3,
+
+  /**
+   * @generated from enum value: PORTABLE_REPLACEMENT_NATIVE_STATE_COMPLETED = 4;
+   */
+  COMPLETED = 4,
+}
+
+/**
+ * Describes the enum joko.v1.PortableReplacementNativeState.
+ */
+export const PortableReplacementNativeStateSchema: GenEnum<PortableReplacementNativeState> = /*@__PURE__*/
+  enumDesc(file_joko_v1_portable_session, 2);
+
+/**
+ * @generated from enum joko.v1.PortableReplacementWorktreeState
+ */
+export enum PortableReplacementWorktreeState {
+  /**
+   * @generated from enum value: PORTABLE_REPLACEMENT_WORKTREE_STATE_UNSPECIFIED = 0;
+   */
+  UNSPECIFIED = 0,
+
+  /**
+   * @generated from enum value: PORTABLE_REPLACEMENT_WORKTREE_STATE_PENDING = 1;
+   */
+  PENDING = 1,
+
+  /**
+   * @generated from enum value: PORTABLE_REPLACEMENT_WORKTREE_STATE_COMPLETED = 2;
+   */
+  COMPLETED = 2,
+}
+
+/**
+ * Describes the enum joko.v1.PortableReplacementWorktreeState.
+ */
+export const PortableReplacementWorktreeStateSchema: GenEnum<PortableReplacementWorktreeState> = /*@__PURE__*/
+  enumDesc(file_joko_v1_portable_session, 3);
+
+/**
+ * @generated from enum joko.v1.PortableReplacementInspection
+ */
+export enum PortableReplacementInspection {
+  /**
+   * @generated from enum value: PORTABLE_REPLACEMENT_INSPECTION_UNSPECIFIED = 0;
+   */
+  UNSPECIFIED = 0,
+
+  /**
+   * @generated from enum value: PORTABLE_REPLACEMENT_INSPECTION_PRESENT = 1;
+   */
+  PRESENT = 1,
+
+  /**
+   * @generated from enum value: PORTABLE_REPLACEMENT_INSPECTION_ABSENT = 2;
+   */
+  ABSENT = 2,
+
+  /**
+   * @generated from enum value: PORTABLE_REPLACEMENT_INSPECTION_UNKNOWN = 3;
+   */
+  UNKNOWN = 3,
+}
+
+/**
+ * Describes the enum joko.v1.PortableReplacementInspection.
+ */
+export const PortableReplacementInspectionSchema: GenEnum<PortableReplacementInspection> = /*@__PURE__*/
+  enumDesc(file_joko_v1_portable_session, 4);
 

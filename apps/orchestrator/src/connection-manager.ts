@@ -412,6 +412,49 @@ export class ConnectionManager {
     }
   }
 
+  /**
+   * Authenticate the host-private Device-peer route purpose. Service hosts use
+   * their ACL-protected, deployment-owned Connection key; Desktop hosts use
+   * the independent bootstrap-derived authorization and can never substitute
+   * the renderer-readable Connection bearer.
+   */
+  authenticateDevicePeerAgent(authorization: string | undefined): ConnectionRecord {
+    const token = parseBearer(authorization);
+    if (token === undefined) {
+      throw new ConnectionAuthenticationError("AUTH_REQUIRED", "Device peer agent authorization is required.");
+    }
+    const keyDigest = digestAuthKey(token);
+    const serviceConnection = this.#store.findConnectionByAuthKeyDigest(keyDigest);
+    if (serviceConnection !== undefined) {
+      try {
+        const current = this.#store.authorizeConnection(
+          serviceConnection.id,
+          keyDigest,
+          { touch: true, seenAt: this.#now() }
+        );
+        const device = this.#store.getDevice(current.deviceId);
+        if (device.kind === "service" && device.state === "active") return current;
+      } catch {
+        // Collapse every wrong-purpose, stale, and revoked route proof below.
+      }
+    }
+    const desktopHost = this.#store.findDesktopHostAuthorizationByAuthKeyDigest(keyDigest);
+    if (desktopHost !== undefined) {
+      try {
+        return this.authenticateDesktopHost(
+          this.#store.getConnection(desktopHost.connectionId),
+          authorization
+        );
+      } catch {
+        // Collapse every wrong-purpose, stale, and revoked route proof below.
+      }
+    }
+    throw new ConnectionAuthenticationError(
+      "AUTH_REVOKED",
+      "Device peer agent authorization is invalid or revoked."
+    );
+  }
+
   /** Pure, no-touch authorization fence used immediately before streaming output. */
   fence(connection: Pick<ConnectionRecord, "id" | "authKeyDigest">): ConnectionRecord {
     try {

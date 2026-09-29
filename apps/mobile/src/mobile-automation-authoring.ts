@@ -232,7 +232,8 @@ export function mobileAutomationTargetOptions(owner: Snapshot | undefined): read
       workspaceId: target.workspaceId,
       displayName: target.displayName,
       workspaceKind: workspace.kind === WorkspaceKind.USER_PROJECT ? "project" : "dialogue",
-      projectAutomationEligible: workspace.kind === WorkspaceKind.USER_PROJECT && target.remoteWorkspace === undefined
+      projectAutomationEligible: workspace.kind === WorkspaceKind.USER_PROJECT
+        && target.location?.kind.case === "serviceNode"
     });
   }
   return options.sort((left, right) => compareText(left.displayName, right.displayName)

@@ -16,7 +16,20 @@ export interface Dialog { readonly scope: Scope; readonly kind: "generate" | "ag
 export interface MutationResult { readonly key?: SshKeyView; readonly agentAdded?: boolean; readonly agentFailure?: SshKeyFailure }
 interface FocusContinuation { readonly scope: Scope; readonly key: SshKeyView; readonly origin: Element; readonly trigger: HTMLButtonElement; readonly read: number; anchored: boolean }
 function needsObservation(failure: SshKeyFailure): boolean {
-  return sshKeyOutcomeUncertain(failure) || failure === "key_changed" || failure === "not_found";
+  return sshKeyOutcomeUncertain(failure) || failure === "key_changed" || failure === "not_found" || failure === "unsafe_permissions";
+}
+function agentFailure(failure: SshKeyFailure | undefined): boolean {
+  return failure === "agent_unavailable" || failure === "agent_failed";
+}
+
+export function SshAgentRecovery({ platform, show, t }: {
+  readonly platform: SshKeyCatalogView["servicePlatform"]; readonly show: boolean; readonly t: Translator;
+}): JSX.Element | null {
+  if (!show) return null;
+  return <div className="ssh-key-agent-recovery">
+    <p>{t(`sshKeys.recovery.${platform}`)}</p>
+    <p>{t("sshKeys.recovery.resume")}</p>
+  </div>;
 }
 
 export function SshKeySettings({ controller, t }: { readonly controller: AppController; readonly t: Translator }): JSX.Element {
@@ -44,10 +57,11 @@ function SshKeySettingsOwner({ api, connected, nodeName, targets, t }: {
   const [selectedId, setSelectedId] = useState("");
   const [dialog, setDialog] = useState<Dialog>();
   const [needsRefresh, setNeedsRefresh] = useState(false);
+  const [refreshReason, setRefreshReason] = useState<SshKeyFailure>();
   const [feedback, setFeedback] = useState<"generated" | "generatedAndAdded" | "generatedAgentUnconfirmed" | "added">();
   const [agentWarning, setAgentWarning] = useState<SshKeyFailure>();
   const [retired, setRetired] = useState(false);
-  const value = catalog?.scope.api === api ? catalog.value : undefined;
+  const value = catalog?.scope === scope ? catalog.value : undefined;
   const current = (): boolean => active.current === scope && !scope.abort.signal.aborted && connected
     && root.current?.isConnected === true && root.current.ownerDocument === scope.document && scope.document?.defaultView?.document === scope.document;
   const refresh = async (allowChanges = true): Promise<void> => {
@@ -58,13 +72,18 @@ function SshKeySettingsOwner({ api, connected, nodeName, targets, t }: {
       const next = await api.listSshKeys(scope.abort.signal);
       if (!current() || read !== scope.read) return;
       setCatalog({ scope, value: next }); setNeedsRefresh(!allowChanges);
-    } catch (cause) { if (current() && read === scope.read) setError(sshKeyFailure(cause)); }
+      if (allowChanges) setRefreshReason(undefined);
+    } catch (cause) { if (current() && read === scope.read) {
+      const failure = sshKeyFailure(cause);
+      setError(failure);
+      if (failure === "unsafe_permissions") { setNeedsRefresh(true); setRefreshReason(failure); }
+    } }
     finally { if (current() && read === scope.read) setLoading(false); }
   };
   useLayoutEffect(() => {
     if (scope.abort.signal.aborted) { setEpoch((value) => value + 1); return; }
     scope.document = root.current?.ownerDocument; active.current = scope;
-    setDialog(undefined); setError(undefined); setFeedback(undefined); setAgentWarning(undefined); setRetired(false);
+    setDialog(undefined); setError(undefined); setFeedback(undefined); setAgentWarning(undefined); setNeedsRefresh(false); setRefreshReason(undefined); setRetired(false);
     const win = scope.document?.defaultView;
     const trackFocus = (event: FocusEvent): void => {
       const continuation = focusContinuation.current;
@@ -102,24 +121,27 @@ function SshKeySettingsOwner({ api, connected, nodeName, targets, t }: {
     }
     setFeedback(kind === "added" ? kind : result.agentFailure !== undefined ? "generatedAgentUnconfirmed" : result.agentAdded ? "generatedAndAdded" : "generated");
     setAgentWarning(result.agentFailure); setDialog(undefined);
+    setRefreshReason(result.agentFailure);
     if (resultingKey !== undefined) setSelectedId(resultingKey.id);
     void refresh(result.agentFailure === undefined || !needsObservation(result.agentFailure));
   };
   return <section ref={root} className="ssh-key-settings" aria-label={t("sshKeys.title")} tabIndex={-1}>
     <header><div><h2>{t("sshKeys.title")}</h2><p>{t("sshKeys.ownership", { name: nodeName })}</p></div><div className="ssh-key-actions">
-      <Button disabled={!connected || retired || loading} onClick={() => { void refresh(); }}><RefreshCw aria-hidden="true" />{t("common.refresh")}</Button>
+      <Button disabled={!connected || retired || loading} onClick={() => { setAgentWarning(undefined); void refresh(); }}><RefreshCw aria-hidden="true" />{t("common.refresh")}</Button>
       <Button tone="primary" disabled={!ready || value?.generationSupported !== true || needsRefresh} onClick={(event) => setDialog({ scope, kind: "generate", trigger: event.currentTarget, offerAgentLoad: value?.agentState === "ready" })}><Plus aria-hidden="true" />{t("sshKeys.generate")}</Button>
     </div></header>
     {!connected && <p role="status">{t("sshKeys.disconnected")}</p>}
     {loading && <p role="status">{t("common.loading")}</p>}
     {error !== undefined && <p role="alert">{t(`sshKeys.error.${error}`)}</p>}
-    {needsRefresh && <p role="status">{t("sshKeys.inspectBeforeRetry")}</p>}
+    {needsRefresh && <p role="status">{t(refreshReason === "unsafe_permissions" ? "sshKeys.permissionsBeforeRetry" : "sshKeys.inspectBeforeRetry")}</p>}
     {feedback !== undefined && <p role="status">{t(`sshKeys.${feedback}`)}</p>}
     {agentWarning !== undefined && <p role="alert">{t(`sshKeys.error.${agentWarning}`)}</p>}
     {value !== undefined && <>
       <p className="ssh-key-agent-state" role="status">{t(`sshKeys.agent.${value.agentState}`)}</p>
+      <SshAgentRecovery platform={value.servicePlatform} show={value.agentState !== "ready" || agentFailure(agentWarning)} t={t} />
       {!value.generationSupported && <p>{t("sshKeys.generationUnavailable")}</p>}
       {value.keys.length === 0 && <p>{t("sshKeys.empty")}</p>}
+      <p>{t("sshKeys.permissionsHint")}</p>
       <div className="ssh-key-list" role="list">{value.keys.map((key) => <div className="ssh-key-row" role="listitem" key={key.id}>
         <button ref={(element) => { if (element === null) keyButtons.current.delete(key.id); else keyButtons.current.set(key.id, element); }} type="button" className="ssh-key-choice" aria-pressed={selectedId === key.id} disabled={!ready} onClick={() => setSelectedId(key.id)}>
           <KeyRound aria-hidden="true" /><span><strong>{key.name}</strong><small>{key.algorithm}{key.comment === "" ? "" : ` · ${key.comment}`}</small><code>{key.sha256Fingerprint}</code></span>
@@ -129,25 +151,26 @@ function SshKeySettingsOwner({ api, connected, nodeName, targets, t }: {
       </div>)}</div>
       {selected !== undefined && ready && <SshKeyDetails key={JSON.stringify([selected.id, selected.sha256Fingerprint, epoch])} scope={scope} selected={selected} targets={targets} t={t} />}
     </>}
-    {dialog?.scope === scope && !scope.abort.signal.aborted && <SshKeyMutationDialog key={dialog.kind + (dialog.key?.sha256Fingerprint ?? "")} dialog={dialog} valid={!changedDialogKey} t={t}
-      onClose={() => setDialog(undefined)} onStart={() => { setNeedsRefresh(true); setFeedback(undefined); setAgentWarning(undefined); }}
+    {dialog?.scope === scope && !scope.abort.signal.aborted && <SshKeyMutationDialog key={dialog.kind + (dialog.key?.sha256Fingerprint ?? "")} dialog={dialog} valid={!changedDialogKey} servicePlatform={value?.servicePlatform ?? "unknown"} t={t}
+      onClose={() => setDialog(undefined)} onStart={() => { setNeedsRefresh(true); setRefreshReason(undefined); setFeedback(undefined); setAgentWarning(undefined); }}
       onGenerated={(key) => {
         if (!current()) return;
         setSelectedId(key.id); setFeedback("generated");
         setCatalog((previous) => previous?.scope === scope ? { scope, value: { ...previous.value, keys: [...previous.value.keys.filter((item) => item.id !== key.id), key] } } : previous);
       }}
-      onFailure={(failure) => { if (current()) setNeedsRefresh(needsObservation(failure)); }}
+      onFailure={(failure) => { if (current()) { setNeedsRefresh(needsObservation(failure)); setRefreshReason(failure); } }}
       onSuccess={(result, focusOrigin) => success(dialog.kind === "generate" ? "generated" : "added", result, focusOrigin)} />}
   </section>;
 }
 
-export function SshKeyMutationDialog({ dialog, valid, t, onClose, onStart, onGenerated, onFailure, onSuccess }: {
-  readonly dialog: Dialog; readonly valid: boolean; readonly t: Translator; readonly onClose: () => void;
+export function SshKeyMutationDialog({ dialog, valid, servicePlatform, t, onClose, onStart, onGenerated, onFailure, onSuccess }: {
+  readonly dialog: Dialog; readonly valid: boolean; readonly servicePlatform: SshKeyCatalogView["servicePlatform"]; readonly t: Translator; readonly onClose: () => void;
   readonly onStart: () => void; readonly onFailure: (failure: SshKeyFailure) => void; readonly onSuccess: (result: MutationResult, focusOrigin: Element | undefined) => void;
   readonly onGenerated: (key: SshKeyView) => void;
 }): JSX.Element {
   const [name, setName] = useState(""); const [comment, setComment] = useState("");
-  const [encrypted, setEncrypted] = useState(true); const [passphrase, setPassphrase] = useState("");
+  const nativeKeychain = servicePlatform === "macos";
+  const [encrypted, setEncrypted] = useState(dialog.kind === "generate" || !nativeKeychain); const [passphrase, setPassphrase] = useState("");
   const [confirmation, setConfirmation] = useState(""); const [pending, setPending] = useState(false);
   const [loadAfterGeneration, setLoadAfterGeneration] = useState(dialog.offerAgentLoad === true);
   const [addingGeneratedKey, setAddingGeneratedKey] = useState(false);
@@ -209,16 +232,18 @@ export function SshKeyMutationDialog({ dialog, valid, t, onClose, onStart, onGen
       {generate ? <><label className="field"><span>{t("sshKeys.name")}</span><input value={name} maxLength={100} placeholder="id_joko_ed25519" disabled={pending} onChange={(event) => setName(event.target.value)} /></label>
         <label className="field"><span>{t("sshKeys.comment")}</span><input value={comment} maxLength={240} disabled={pending} onChange={(event) => setComment(event.target.value)} /></label></>
         : <div><strong>{dialog.key!.name}</strong><p className="ssh-key-fingerprint">{dialog.key!.sha256Fingerprint}</p></div>}
-      <label className="check-row"><CheckboxControl checked={encrypted} disabled={pending} onChange={(event) => { setEncrypted(event.target.checked); setPassphrase(""); setConfirmation(""); }} /><span>{t(generate ? "sshKeys.encrypt" : "sshKeys.hasPassphrase")}</span></label>
+      {nativeKeychain && (!generate || loadAfterGeneration) && <p>{t("sshKeys.keychainBody")}</p>}
+      <label className="check-row"><CheckboxControl checked={encrypted} disabled={pending} onChange={(event) => { setEncrypted(event.target.checked); setPassphrase(""); setConfirmation(""); }} /><span>{t(generate ? "sshKeys.encrypt" : nativeKeychain ? "sshKeys.keychainPassphrase" : "sshKeys.hasPassphrase")}</span></label>
       {encrypted ? <><label className="field"><span>{t("sshKeys.passphrase")}</span><input type="password" autoComplete="new-password" value={passphrase} disabled={pending || !valid} onChange={(event) => setPassphrase(event.target.value)} /></label>
         {generate && <label className="field"><span>{t("sshKeys.confirmPassphrase")}</span><input type="password" autoComplete="new-password" value={confirmation} disabled={pending || !valid} onChange={(event) => setConfirmation(event.target.value)} /></label>}</>
-        : <p>{t(generate ? "sshKeys.unencrypted" : "sshKeys.noPassphrase")}</p>}
+        : <p>{t(generate ? "sshKeys.unencrypted" : nativeKeychain ? "sshKeys.keychainReuse" : "sshKeys.noPassphrase")}</p>}
       {generate && <label className="check-row"><CheckboxControl checked={loadAfterGeneration} disabled={pending || !dialog.offerAgentLoad} onChange={(event) => setLoadAfterGeneration(event.target.checked)} /><span>{t("sshKeys.loadAfterGeneration")}</span></label>}
       {generate && !dialog.offerAgentLoad && <p>{t("sshKeys.loadLater")}</p>}
       {addingGeneratedKey && <p role="status">{t("sshKeys.addingGeneratedKey")}</p>}
       {!valid && <p role="alert">{t("sshKeys.error.key_changed")}</p>}
       {error !== undefined && <p role="alert">{t(`sshKeys.error.${error}`)}</p>}
-      {error !== undefined && needsObservation(error) && <p>{t("sshKeys.inspectBeforeRetry")}</p>}
+      <SshAgentRecovery platform={servicePlatform} show={agentFailure(error)} t={t} />
+      {error !== undefined && needsObservation(error) && <p>{t(error === "unsafe_permissions" ? "sshKeys.permissionsBeforeRetry" : "sshKeys.inspectBeforeRetry")}</p>}
       <div className="ssh-key-actions"><Button onClick={onClose}>{t("common.close")}</Button><Button type="submit" tone="primary" disabled={pending || !valid || !passphraseValid || error !== undefined && needsObservation(error)}>{t(pending ? "common.working" : generate ? "sshKeys.generate" : "sshKeys.addToAgent")}</Button></div>
     </form>
   </Modal>;

@@ -22,11 +22,12 @@ export const WORKSPACE_DEPENDENCY_ALLOWLIST: Readonly<Record<string, ReadonlySet
   "@joko/contracts": new Set(),
   "@joko/code-host": new Set(),
   "@joko/core": new Set(),
+  "@joko/device-peer": new Set(["@joko/contracts"]),
   "@joko/git-safety": new Set(),
   "@joko/outbound-network": new Set(),
   "@joko/local-model-runtime": new Set(),
   "@joko/messaging": new Set(),
-  "@joko/remote-ssh": new Set(),
+  "@joko/remote-ssh": new Set(["@joko/core"]),
   "@joko/runtime-governance": new Set(),
   "@joko/store": new Set(["@joko/core"]),
   "@joko/adapter-claude-code": new Set(["@joko/core", "@joko/runtime-governance"]),
@@ -43,15 +44,15 @@ export const WORKSPACE_DEPENDENCY_ALLOWLIST: Readonly<Record<string, ReadonlySet
   "@joko/tool-document": new Set(),
   "@joko/tool-ios-simulator": new Set(),
   "@joko/tool-lsp": new Set(),
-  "@joko/tool-terminal": new Set(),
+  "@joko/tool-terminal": new Set(["@joko/core"]),
   "@joko/voice-input": new Set(),
   "@joko/worktree": new Set(),
   "@joko/testkit": new Set(["@joko/contracts", "@joko/core", "@joko/store"]),
-  "@joko/e2e": new Set(["@joko/adapter-claude-code", "@joko/adapter-codex", "@joko/adapter-pi", "@joko/contracts", "@joko/core", "@joko/messaging", "@joko/orchestrator", "@joko/remote-ssh", "@joko/store", "@joko/testkit", "@joko/tool-browser", "@joko/tool-terminal"]),
-  "@joko/orchestrator": new Set(["@joko/code-host", "@joko/contracts", "@joko/core", "@joko/git-safety", "@joko/local-model-runtime", "@joko/messaging", "@joko/outbound-network", "@joko/remote-ssh", "@joko/runtime-governance", "@joko/store", "@joko/adapter-claude-code", "@joko/adapter-codex", "@joko/adapter-dictation-refinement", "@joko/adapter-pi", "@joko/adapter-transcription-openai", "@joko/adapter-transcription-realtime", "@joko/adapter-transcription-scribe", "@joko/adapter-transcription-sauc", "@joko/tool-android", "@joko/tool-browser", "@joko/tool-computer", "@joko/tool-document", "@joko/tool-ios-simulator", "@joko/tool-lsp", "@joko/tool-terminal", "@joko/voice-input", "@joko/worktree", "@joko/testkit"]),
+  "@joko/e2e": new Set(["@joko/adapter-claude-code", "@joko/adapter-codex", "@joko/adapter-pi", "@joko/contracts", "@joko/core", "@joko/device-peer", "@joko/messaging", "@joko/orchestrator", "@joko/remote-ssh", "@joko/store", "@joko/testkit", "@joko/tool-browser", "@joko/tool-terminal"]),
+  "@joko/orchestrator": new Set(["@joko/code-host", "@joko/contracts", "@joko/core", "@joko/device-peer", "@joko/git-safety", "@joko/local-model-runtime", "@joko/messaging", "@joko/outbound-network", "@joko/remote-ssh", "@joko/runtime-governance", "@joko/store", "@joko/adapter-claude-code", "@joko/adapter-codex", "@joko/adapter-dictation-refinement", "@joko/adapter-pi", "@joko/adapter-transcription-openai", "@joko/adapter-transcription-realtime", "@joko/adapter-transcription-scribe", "@joko/adapter-transcription-sauc", "@joko/tool-android", "@joko/tool-browser", "@joko/tool-computer", "@joko/tool-document", "@joko/tool-ios-simulator", "@joko/tool-lsp", "@joko/tool-terminal", "@joko/voice-input", "@joko/worktree", "@joko/testkit"]),
   "@joko/web": new Set(["@joko/brand-assets", "@joko/contracts"]),
   "@joko/mobile": new Set(["@joko/brand-assets", "@joko/contracts"]),
-  "@joko/desktop": new Set(["@joko/brand-assets", "@joko/contracts", "@joko/web"])
+  "@joko/desktop": new Set(["@joko/brand-assets", "@joko/contracts", "@joko/device-peer", "@joko/web"])
 };
 
 export interface BoundaryCheckOptions {

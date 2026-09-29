@@ -13,6 +13,7 @@ import type {
   InteractionDecision,
   InteractionId,
   InteractionPayload,
+  NativeSessionCatalogEntry,
   OperationId,
   PiEventMetadata,
   PromptInput,
@@ -54,6 +55,64 @@ export interface OperationalHistoryMaintenanceInspection {
   readonly candidates: readonly OperationalHistoryMaintenanceCandidate[];
   readonly messageCount: number;
   readonly estimatedHistoryBytes: number;
+}
+
+export type MaintenanceKind = "history" | "artifact";
+export type MaintenanceScanState = "available" | "claimed" | "expired";
+export type MaintenanceJobStatus =
+  | "running"
+  | "completed"
+  | "scan_expired"
+  | "storage_changed"
+  | "cancelled"
+  | "failed";
+export type MaintenanceEffectKind =
+  | "history_binding"
+  | "history_external"
+  | "artifact_blob"
+  | "artifact_temporary";
+export type MaintenanceEffectState =
+  | "pending"
+  | "claimed"
+  | "prepared"
+  | "quarantined"
+  | "completed"
+  | "skipped"
+  | "unknown";
+
+export interface MaintenanceScanRecord<T = unknown> {
+  readonly id: string;
+  readonly kind: MaintenanceKind;
+  readonly fingerprint?: string;
+  readonly state: MaintenanceScanState;
+  readonly payload: T;
+  readonly expiresAt: UnixMillis;
+  readonly createdAt: UnixMillis;
+  readonly updatedAt: UnixMillis;
+}
+
+export interface MaintenanceJobRecord<TPayload = unknown, TResult = unknown> {
+  readonly id: string;
+  readonly kind: MaintenanceKind;
+  readonly scanId: string;
+  readonly status: MaintenanceJobStatus;
+  readonly phase: string;
+  readonly percent: number;
+  readonly cancellable: boolean;
+  readonly cancelRequested: boolean;
+  readonly payload: TPayload;
+  readonly result?: TResult;
+  readonly createdAt: UnixMillis;
+  readonly updatedAt: UnixMillis;
+}
+
+export interface MaintenanceEffectRecord<T = unknown> {
+  readonly jobId: string;
+  readonly id: string;
+  readonly kind: MaintenanceEffectKind;
+  readonly state: MaintenanceEffectState;
+  readonly payload: T;
+  readonly updatedAt: UnixMillis;
 }
 
 export interface ConnectionRecord {
@@ -1566,6 +1625,39 @@ export interface ScheduleDeletionCleanupRecord {
 }
 
 export type SessionLifecycleCleanupPhase = "close" | "native" | "worktree" | "git_safety";
+
+/** Exact old-owner cleanup adopted atomically with a portable replacement. */
+export interface PortableReplacementCleanupRecord {
+  readonly operationId: string;
+  readonly importedSessionId: SessionId;
+  readonly replacedSessionId: SessionId;
+  readonly nativeState: "pending" | "dispatched" | "unknown" | "completed";
+  readonly worktreeState: "pending" | "completed";
+  readonly failureCode?: string;
+  readonly createdAt: UnixMillis;
+  readonly updatedAt: UnixMillis;
+  readonly revision: bigint;
+}
+
+/** Pre-effect owner of a cross-profile native catalog placement awaiting product adoption. */
+export interface NativeCatalogAdoptionRecord {
+  readonly operationId: OperationId;
+    readonly requestOperationId?: OperationId;
+  readonly sessionId: SessionId;
+  readonly backendId: BackendId;
+  readonly targetId: TargetId;
+  readonly projectId?: TargetId;
+  readonly projectRevision?: bigint;
+  readonly targetRevision: bigint;
+  readonly backendGeneration: number;
+  readonly binding: SessionDescriptor["binding"];
+  readonly entry: NativeSessionCatalogEntry;
+  readonly recoveryReference: string;
+  readonly state: "claimed" | "unknown" | "adopted" | "absent";
+  readonly createdAt: UnixMillis;
+  readonly updatedAt: UnixMillis;
+  readonly revision: bigint;
+}
 
 /** Durable, replayable external-effect ledger for an ordinary task archive/delete. */
 export interface SessionLifecycleCleanupRecord {
