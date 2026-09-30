@@ -85,6 +85,7 @@ export * from "./tool-call-projector.js";
 export * from "./voice-input-connect-service.js";
 export * from "./voice-input-coordinator.js";
 export * from "./voice-dictionary-sync-repository.js";
+export * from "./voice-dictionary-peer-manager.js";
 export * from "./voice-input-settings.js";
 export * from "./workspace-change-set.js";
 export * from "./workspace-run-capture.js";

@@ -2,6 +2,7 @@ import { create } from "@bufbuild/protobuf";
 import { Code, ConnectError, type HandlerContext, type ServiceImpl } from "@connectrpc/connect";
 import * as contract from "@joko/contracts";
 import type { VoiceInputFailureCode as NativeFailureCode } from "@joko/voice-input";
+import { VoiceDictionaryPeerStoreError } from "@joko/store";
 import { toProtoDuration, toProtoTimestamp } from "./proto-mapper.js";
 import {
   VOICE_INPUT_LIMITS,
@@ -16,6 +17,7 @@ import {
   type VoiceDictionarySyncRepository,
   type VoiceDictionarySyncSnapshot
 } from "./voice-dictionary-sync-repository.js";
+import { VoiceDictionaryPeerManagerError, type VoiceDictionaryPeerManager, type VoiceDictionaryPeerStatus } from "./voice-dictionary-peer-manager.js";
 
 export interface VoiceInputRpcOwner {
   readonly connectionId: string;
@@ -26,7 +28,8 @@ export function createVoiceInputConnectService(
   settings: Pick<VoiceInputSettingsController, "adviseDictionaryEdit" | "testConnection"> | undefined,
   dictionary: Pick<VoiceDictionarySyncRepository,
     "addManualTerms" | "applyLearning" | "deleteEntry" | "editEntry" | "setEnabled" | "snapshot"> | undefined,
-  authenticate: (context: HandlerContext) => VoiceInputRpcOwner
+  authenticate: (context: HandlerContext) => VoiceInputRpcOwner,
+  peers?: Pick<VoiceDictionaryPeerManager, "status" | "grantCandidate" | "revokePeer" | "syncNow">
 ): ServiceImpl<typeof contract.VoiceInputService> {
   return {
     getVoiceInputCapabilities: async (_request, context) => voiceRpc(async () => {
@@ -49,10 +52,38 @@ export function createVoiceInputConnectService(
         dictionary: toProtoDictionarySnapshot(requireDictionary(dictionary).snapshot())
       });
     }),
+    getVoiceInputDictionaryPeerStatus: async (_request, context) => voiceRpc(async () => {
+      authenticate(context);
+      return create(contract.GetVoiceInputDictionaryPeerStatusResponseSchema, { status: toProtoPeerStatus(requirePeers(peers).status()) });
+    }),
+    grantVoiceInputDictionaryPeer: async (request, context) => voiceRpc(async () => {
+      authenticate(context);
+      requireActiveMutation(context);
+      const status = requirePeers(peers).grantCandidate(requirePeerRevision(request.expectedConfigurationRevision),
+        requirePeerId(request.peerId), requireFingerprint(request.expectedFingerprint));
+      return create(contract.GrantVoiceInputDictionaryPeerResponseSchema, { status: toProtoPeerStatus(status) });
+    }),
+    revokeVoiceInputDictionaryPeer: async (request, context) => voiceRpc(async () => {
+      authenticate(context);
+      requireActiveMutation(context);
+      const status = requirePeers(peers).revokePeer(requirePeerId(request.peerId), requirePeerRevision(request.expectedGrantRevision));
+      return create(contract.RevokeVoiceInputDictionaryPeerResponseSchema, { status: toProtoPeerStatus(status) });
+    }),
+    syncVoiceInputDictionaryNow: async (request, context) => voiceRpc(async () => {
+      authenticate(context);
+      requireActiveMutation(context);
+      const runtime = requirePeers(peers);
+      if (runtime.status().configurationRevision !== requirePeerRevision(request.expectedConfigurationRevision)) throw new ConnectError("Dictionary peer authority changed.", Code.Aborted);
+      await runtime.syncNow(request.peerId === undefined ? undefined : requirePeerId(request.peerId));
+      requireActiveMutation(context);
+      authenticate(context);
+      return create(contract.SyncVoiceInputDictionaryNowResponseSchema, { status: toProtoPeerStatus(runtime.status()) });
+    }),
     setVoiceInputDictionarySyncEnabled: async (request, context) => voiceRpc(async () => {
       authenticate(context);
       requireActiveMutation(context);
       const snapshot = requireDictionary(dictionary).setEnabled(requireRevision(request.expectedRevision), request.enabled);
+      if (request.enabled && peers !== undefined) void peers.syncNow().catch(() => undefined);
       return create(contract.SetVoiceInputDictionarySyncEnabledResponseSchema, {
         dictionary: toProtoDictionarySnapshot(snapshot)
       });
@@ -446,6 +477,11 @@ async function voiceRpc<T>(callback: () => Promise<T>): Promise<T> {
   try {
     return await callback();
   } catch (error) {
+    if (error instanceof VoiceDictionaryPeerStoreError || error instanceof VoiceDictionaryPeerManagerError) {
+      const code = error.code === "INVALID" ? Code.InvalidArgument : error.code === "CONFLICT" ? Code.Aborted
+        : error.code === "DISABLED" ? Code.FailedPrecondition : Code.Unavailable;
+      throw new ConnectError("The dictionary peer operation could not be completed.", code);
+    }
     if (error instanceof VoiceDictionarySyncRepositoryError) {
       const code = error.code === "INVALID" ? Code.InvalidArgument
         : error.code === "CONFLICT" ? Code.Aborted
@@ -461,4 +497,38 @@ async function voiceRpc<T>(callback: () => Promise<T>): Promise<T> {
               : Code.Aborted;
     throw new ConnectError(error.message, code);
   }
+}
+
+function requirePeers<T>(peers: T | undefined): T {
+  if (peers === undefined) throw new ConnectError("Dictionary sharing is unavailable.", Code.Unimplemented);
+  return peers;
+}
+function requirePeerRevision(value: bigint): bigint {
+  if (value < 1n || value > BigInt(Number.MAX_SAFE_INTEGER)) throw new ConnectError("Dictionary peer revision is invalid.", Code.InvalidArgument);
+  return value;
+}
+function requirePeerId(value: string): string {
+  if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/u.test(value)) throw new ConnectError("Dictionary peer identity is invalid.", Code.InvalidArgument);
+  return value;
+}
+function requireFingerprint(value: string): string {
+  if (!/^[a-f0-9]{64}$/u.test(value)) throw new ConnectError("Dictionary peer fingerprint is invalid.", Code.InvalidArgument);
+  return value;
+}
+function toProtoPeerStatus(value: VoiceDictionaryPeerStatus): contract.VoiceInputDictionaryPeerStatus {
+  const phase = { off: contract.VoiceInputDictionaryPeerPhase.OFF, waiting: contract.VoiceInputDictionaryPeerPhase.WAITING,
+    syncing: contract.VoiceInputDictionaryPeerPhase.SYNCING, up_to_date: contract.VoiceInputDictionaryPeerPhase.UP_TO_DATE,
+    error: contract.VoiceInputDictionaryPeerPhase.ERROR }[value.phase];
+  const errorCode = value.errorCode === undefined ? undefined : {
+    identity_unavailable: contract.VoiceInputDictionaryPeerErrorCode.IDENTITY_UNAVAILABLE,
+    dictionary_unavailable: contract.VoiceInputDictionaryPeerErrorCode.DICTIONARY_UNAVAILABLE,
+    sync_failed: contract.VoiceInputDictionaryPeerErrorCode.SYNC_FAILED }[value.errorCode];
+  return create(contract.VoiceInputDictionaryPeerStatusSchema, {
+    available: value.available, configurationRevision: value.configurationRevision, nodeId: value.nodeId,
+    fingerprint: value.fingerprint, enabled: value.enabled, phase, ...(errorCode === undefined ? {} : { errorCode }),
+    peers: value.peers.map((peer) => create(contract.VoiceInputDictionaryPeerSchema, { ...peer,
+      grantedAt: toProtoTimestamp(peer.grantedAt), lastSyncAt: peer.lastSyncAt === undefined ? undefined : toProtoTimestamp(peer.lastSyncAt) })),
+    candidates: value.candidates.map((candidate) => create(contract.VoiceInputDictionaryPeerCandidateSchema, { ...candidate,
+      seenAt: toProtoTimestamp(candidate.seenAt) }))
+  });
 }

@@ -6164,6 +6164,10 @@ export class MobileClient {
     return {
       ownerKey, isCurrent,
       getVoiceInputDictionary: (signal) => owned(signal, () => this.network.getVoiceInputDictionary(credential, signal)),
+      getVoiceInputDictionaryPeerStatus: (signal) => owned(signal, () => this.network.getVoiceInputDictionaryPeerStatus(credential, signal)),
+      grantVoiceInputDictionaryPeer: (revision, id, fingerprint, signal) => owned(signal, () => this.network.grantVoiceInputDictionaryPeer(credential, revision, id, fingerprint, signal)),
+      revokeVoiceInputDictionaryPeer: (id, revision, signal) => owned(signal, () => this.network.revokeVoiceInputDictionaryPeer(credential, id, revision, signal)),
+      syncVoiceInputDictionaryNow: (revision, id, signal) => owned(signal, () => this.network.syncVoiceInputDictionaryNow(credential, revision, id, signal)),
       setVoiceInputDictionarySyncEnabled: (revision, enabled, signal) => owned(signal, () => this.network.setVoiceInputDictionarySyncEnabled(credential, revision, enabled, signal)),
       addVoiceInputDictionaryTerms: (revision, terms, signal) => owned(signal, () => this.network.addVoiceInputDictionaryTerms(credential, revision, terms, signal)),
       editVoiceInputDictionaryEntry: (revision, id, text, aliases, signal) => owned(signal, () => this.network.editVoiceInputDictionaryEntry(credential, revision, id, text, aliases, signal)),

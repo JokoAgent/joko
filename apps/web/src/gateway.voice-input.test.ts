@@ -9,6 +9,11 @@ import {
   GetSnapshotResponseSchema,
   GetVoiceInputCapabilitiesResponseSchema,
   GetVoiceInputDictionaryResponseSchema,
+  GetVoiceInputDictionaryPeerStatusResponseSchema,
+  GrantVoiceInputDictionaryPeerResponseSchema,
+  RevokeVoiceInputDictionaryPeerResponseSchema,
+  SyncVoiceInputDictionaryNowResponseSchema,
+  VoiceInputDictionaryPeerPhase,
   GetVoiceInputSessionResponseSchema,
   TestVoiceInputConnectionResponseSchema,
   OperationState,
@@ -167,6 +172,41 @@ describe("voice input gateway", () => {
     expect(requests.find((request) => request.method === "stopVoiceInput")?.input).toMatchObject({ voiceInputId: "voice-one", expectedNextChunkSequence: 2n });
     expect(result).toMatchObject({ state: "done", outcome: "success", result: { text: "final words", source: "stable", salvaged: false, rawTranscriptText: "final word" } });
     gateway.disconnect();
+  });
+
+  it("uses independent configuration and grant revisions for the four generated sharing operations", async () => {
+    const calls: Array<{ method: string; input: any }> = [];
+    const status = { available: true, configurationRevision: 4n, nodeId: "node-a", fingerprint: "a".repeat(64),
+      enabled: true, phase: VoiceInputDictionaryPeerPhase.WAITING,
+      peers: [{ peerId: "node-b", revision: 2n, displayName: "Office", fingerprint: "b".repeat(64),
+        grantedAt: { seconds: 1n, nanos: 0 } }] };
+    const transport = voiceTransport((method, input) => {
+      calls.push({ method, input });
+      switch (method) {
+        case "getVoiceInputDictionaryPeerStatus": return create(GetVoiceInputDictionaryPeerStatusResponseSchema, { status });
+        case "grantVoiceInputDictionaryPeer": return create(GrantVoiceInputDictionaryPeerResponseSchema, { status });
+        case "revokeVoiceInputDictionaryPeer": return create(RevokeVoiceInputDictionaryPeerResponseSchema, { status });
+        case "syncVoiceInputDictionaryNow": return create(SyncVoiceInputDictionaryNowResponseSchema, { status });
+      }
+      throw new Error(`Unexpected method: ${method}`);
+    });
+    const gateway = createOrchestratorGateway({ id: "sharing", deviceId: "device-test", name: "Browser",
+      origin: "https://orchestrator.example", serverId: "server-test" }, "secret", {}, () => transport);
+    await gateway.connect();
+    calls.length = 0;
+    try {
+      await expect(gateway.getVoiceInputDictionaryPeerStatus()).resolves.toMatchObject({ configurationRevision: 4n,
+        phase: "waiting", peers: [{ revision: 2n, grantedAt: 1_000 }] });
+      await gateway.grantVoiceInputDictionaryPeer(4n, "node-c", "c".repeat(64));
+      await gateway.revokeVoiceInputDictionaryPeer("node-b", 2n);
+      await gateway.syncVoiceInputDictionaryNow(4n, "node-b");
+      expect(calls).toMatchObject([
+        { method: "getVoiceInputDictionaryPeerStatus", input: {} },
+        { method: "grantVoiceInputDictionaryPeer", input: { expectedConfigurationRevision: 4n, peerId: "node-c", expectedFingerprint: "c".repeat(64) } },
+        { method: "revokeVoiceInputDictionaryPeer", input: { peerId: "node-b", expectedGrantRevision: 2n } },
+        { method: "syncVoiceInputDictionaryNow", input: { expectedConfigurationRevision: 4n, peerId: "node-b" } }
+      ]);
+    } finally { gateway.disconnect(); }
   });
 
   it.each(["missing", "unsafe revision", "unsafe count", "unspecified source"] as const)("rejects a dictionary projection with %s", async (invalid) => {

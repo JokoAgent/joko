@@ -33,6 +33,7 @@ import { MobileUpdateSettingsSection, type MobileUpdateActions } from "./MobileU
 import type { MobileUpdateControllerState } from "./mobile-update-controller";
 import type { MobilePushControllerState } from "./mobile-push-controller";
 import type { MobileVoiceDictionaryControllerState } from "./mobile-voice-dictionary-controller";
+import type { MobileVoiceDictionaryTransport } from "./mobile-voice-dictionary-service";
 
 export interface MobileSettingsColors {
   readonly background: string;
@@ -57,6 +58,7 @@ export interface MobileSettingsScreenProps {
   readonly diagnostics: MobileDiagnosticsState;
   readonly voiceDictionary: MobileVoicePreferencesStoreState;
   readonly nodeDictionary: MobileVoiceDictionaryControllerState;
+  readonly voicePeerTransport?: MobileVoiceDictionaryTransport;
   readonly updates: MobileUpdateControllerState;
   readonly push: MobilePushControllerState;
   readonly updateActions: Pick<MobileUpdateActions, "onChannelChange" | "onCheck" | "onReset">;
@@ -262,7 +264,7 @@ export function MobileSettingsScreen(props: MobileSettingsScreenProps) {
 
   if (voiceOpen) return <MobileVoiceDictionaryScreen key={props.nodeDictionary.ownerKey ?? "unavailable"}
     colors={colors} locale={locale.effectiveLocale}
-    state={voiceDictionary} dictionary={props.nodeDictionary} onBack={() => setVoiceOpen(false)} onRetry={onVoiceDictionaryRetry}
+    state={voiceDictionary} dictionary={props.nodeDictionary} peerTransport={foreground ? props.voicePeerTransport : undefined} onBack={() => setVoiceOpen(false)} onRetry={onVoiceDictionaryRetry}
     onReset={onVoiceDictionaryReset}
     onSetInstructions={onVoiceInstructionsChange} onSetAutoLearning={onVoiceAutoLearningChange}
     onRefreshDictionary={props.onVoiceDictionaryRefresh} onSetSyncEnabled={props.onVoiceDictionarySyncChange}

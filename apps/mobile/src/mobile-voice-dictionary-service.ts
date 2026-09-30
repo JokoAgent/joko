@@ -1,3 +1,4 @@
+import type { VoiceDictionaryPeerApi } from "@joko/contracts";
 import {
   VoiceInputDictionaryEntrySource,
   VoiceInputDictionaryLearningActionType,
@@ -20,7 +21,7 @@ export interface MobileVoiceDictionarySnapshot {
   readonly refinementTerms: readonly string[];
 }
 
-export interface MobileVoiceDictionaryApi {
+export interface MobileVoiceDictionaryApi extends VoiceDictionaryPeerApi {
   getVoiceInputDictionary(signal?: AbortSignal): Promise<MobileVoiceDictionarySnapshot>;
   setVoiceInputDictionarySyncEnabled(expectedRevision: bigint, enabled: boolean, signal?: AbortSignal): Promise<MobileVoiceDictionarySnapshot>;
   addVoiceInputDictionaryTerms(expectedRevision: bigint, terms: readonly string[], signal?: AbortSignal): Promise<MobileVoiceDictionarySnapshot>;

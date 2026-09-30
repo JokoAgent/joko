@@ -4,6 +4,7 @@ import * as contract from "@joko/contracts";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AsrEvent, AsrProvider, AsrStartRequest, AudioChunk } from "@joko/voice-input";
 import { createVoiceInputConnectService } from "./voice-input-connect-service.js";
+import { VoiceDictionaryPeerManagerError, type VoiceDictionaryPeerStatus } from "./voice-dictionary-peer-manager.js";
 import { VoiceInputCoordinator } from "./voice-input-coordinator.js";
 import { VoiceDictionarySyncRepositoryError, type VoiceDictionarySyncSnapshot } from "./voice-dictionary-sync-repository.js";
 
@@ -212,6 +213,60 @@ describe("VoiceInputService", () => {
     await expect(service.setVoiceInputDictionarySyncEnabled(create(contract.SetVoiceInputDictionarySyncEnabledRequestSchema, {
       expectedRevision: 3n, enabled: true
     }), context)).rejects.toMatchObject({ code: Code.Aborted });
+  });
+});
+
+describe("authenticated dictionary peer contract", () => {
+  const status: VoiceDictionaryPeerStatus = { available: true, configurationRevision: 5n, nodeId: "node-rpc", fingerprint: "a".repeat(64), enabled: true,
+    phase: "waiting", peers: [{ peerId: "node-peer", revision: 4n, displayName: "Peer", fingerprint: "b".repeat(64), online: false, grantedAt: 1_000 }], candidates: [] };
+  const context = { signal: new AbortController().signal } as HandlerContext;
+  const peers = () => ({ status: vi.fn(() => status), grantCandidate: vi.fn(() => status), revokePeer: vi.fn(() => status), syncNow: vi.fn(async (): Promise<void> => undefined) });
+  it("maps the separate configuration and grant revisions and never exposes private values", async () => {
+    const owner = peers();
+    const service = createVoiceInputConnectService(undefined, undefined, undefined, () => ({ connectionId: "paired" }), owner);
+    const projected = create(contract.GetVoiceInputDictionaryPeerStatusResponseSchema,
+      await service.getVoiceInputDictionaryPeerStatus(create(contract.GetVoiceInputDictionaryPeerStatusRequestSchema), context)).status;
+    expect(contract.projectVoiceDictionaryPeerStatus(projected)).toEqual(status);
+    await service.grantVoiceInputDictionaryPeer(create(contract.GrantVoiceInputDictionaryPeerRequestSchema, {
+      expectedConfigurationRevision: 5n, peerId: "node-candidate", expectedFingerprint: "c".repeat(64) }), context);
+    expect(owner.grantCandidate).toHaveBeenCalledWith(5n, "node-candidate", "c".repeat(64));
+    await service.revokeVoiceInputDictionaryPeer(create(contract.RevokeVoiceInputDictionaryPeerRequestSchema, { peerId: "node-peer", expectedGrantRevision: 4n }), context);
+    expect(owner.revokePeer).toHaveBeenCalledWith("node-peer", 4n);
+    await service.syncVoiceInputDictionaryNow(create(contract.SyncVoiceInputDictionaryNowRequestSchema, { expectedConfigurationRevision: 5n }), context);
+    expect(owner.syncNow).toHaveBeenCalledWith(undefined);
+  });
+  it("rejects unauthenticated, cancelled, invalid, stale and unavailable peer operations before dispatch", async () => {
+    const owner = peers();
+    const service = createVoiceInputConnectService(undefined, undefined, undefined, () => ({ connectionId: "paired" }), owner);
+    const rejected = createVoiceInputConnectService(undefined, undefined, undefined, () => { throw new ConnectError("Pair first.", Code.Unauthenticated); }, owner);
+    const grant = create(contract.GrantVoiceInputDictionaryPeerRequestSchema, { expectedConfigurationRevision: 5n, peerId: "node-peer", expectedFingerprint: "b".repeat(64) });
+    await expect(rejected.grantVoiceInputDictionaryPeer(grant, context)).rejects.toMatchObject({ code: Code.Unauthenticated });
+    const abort = new AbortController(); abort.abort();
+    await expect(service.grantVoiceInputDictionaryPeer(grant, { signal: abort.signal } as HandlerContext)).rejects.toMatchObject({ code: Code.Canceled });
+    for (const patch of [{ expectedConfigurationRevision: 0n }, { peerId: "../private" }, { expectedFingerprint: "raw-key" }]) {
+      await expect(service.grantVoiceInputDictionaryPeer({ ...grant, ...patch }, context)).rejects.toMatchObject({ code: Code.InvalidArgument });
+    }
+    await expect(service.syncVoiceInputDictionaryNow(create(contract.SyncVoiceInputDictionaryNowRequestSchema, { expectedConfigurationRevision: 4n }), context)).rejects.toMatchObject({ code: Code.Aborted });
+    expect(owner.grantCandidate).not.toHaveBeenCalled(); expect(owner.syncNow).not.toHaveBeenCalled();
+    owner.revokePeer.mockImplementationOnce(() => { throw new VoiceDictionaryPeerManagerError("CONFLICT", "Private detail must not escape."); });
+    await expect(service.revokeVoiceInputDictionaryPeer(create(contract.RevokeVoiceInputDictionaryPeerRequestSchema, { peerId: "node-peer", expectedGrantRevision: 4n }), context))
+      .rejects.toMatchObject({ code: Code.Aborted, rawMessage: "The dictionary peer operation could not be completed." });
+    const absent = createVoiceInputConnectService(undefined, undefined, undefined, () => ({ connectionId: "paired" }));
+    await expect(absent.getVoiceInputDictionaryPeerStatus(create(contract.GetVoiceInputDictionaryPeerStatusRequestSchema), context)).rejects.toMatchObject({ code: Code.Unimplemented });
+  });
+  it("rechecks client authority and cancellation before adopting an asynchronous sync result", async () => {
+    const owner = peers();
+    let resolve!: () => void;
+    owner.syncNow.mockImplementationOnce(() => new Promise<void>((done) => { resolve = done; }));
+    let authenticated = true;
+    const service = createVoiceInputConnectService(undefined, undefined, undefined, () => {
+      if (!authenticated) throw new ConnectError("Revoked.", Code.Unauthenticated);
+      return { connectionId: "paired" };
+    }, owner);
+    const syncing = service.syncVoiceInputDictionaryNow(create(contract.SyncVoiceInputDictionaryNowRequestSchema, { expectedConfigurationRevision: 5n }), context);
+    const rejected = expect(syncing).rejects.toMatchObject({ code: Code.Unauthenticated });
+    authenticated = false; resolve(); await rejected;
+    expect(owner.status).toHaveBeenCalledOnce();
   });
 });
 

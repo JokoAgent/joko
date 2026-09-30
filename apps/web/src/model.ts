@@ -1,4 +1,5 @@
 import type { JSONContent } from "@tiptap/core";
+import type { VoiceDictionaryPeerApi } from "@joko/contracts";
 
 export type Locale = "en" | "zh-CN" | "en-XA";
 export type Theme = "system" | "light" | "dark";
@@ -5535,7 +5536,7 @@ export interface SimulatorViewerVideoPreferenceView {
   readonly clientFallbackReason?: "decode_failed";
 }
 
-export interface OperationApi {
+export interface OperationApi extends VoiceDictionaryPeerApi {
   getSimulatorViewerState(sessionId: string, signal?: AbortSignal): Promise<SimulatorViewerStateView>;
   controlSimulatorInstance(sessionId: string, requestId: string, input: SimulatorViewerControlView, signal?: AbortSignal): Promise<SimulatorViewerControlResultView>;
   controlSimulatorViewerInput(sessionId: string, requestId: string, route: SimulatorViewerRouteView,

@@ -1376,7 +1376,7 @@ export function createConnectServices(application: OrchestratorApplication): Con
   });
   const voiceInput = createVoiceInputConnectService(dependencies.voiceInput, dependencies.voiceInputSettings, dependencies.voiceDictionary, (context) => ({
     connectionId: authenticate(context).id
-  }));
+  }), application.voiceDictionaryPeers);
   const managedModelRuntime = createManagedModelRuntimeConnectService(
     dependencies.managedModelRuntime,
     (context) => authenticate(context)

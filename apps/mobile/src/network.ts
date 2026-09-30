@@ -7,6 +7,7 @@ import {
   ResourceKind, SchedulerService, SessionService, TargetService, VoiceInputService,
   VoiceInputDictionaryEntrySource, VoiceInputDictionaryLearningActionType,
   VoiceInputDictionaryLearningConfidence, VoiceInputDictionaryTermType,
+  projectVoiceDictionaryPeerStatus, type VoiceDictionaryPeerStatusView,
   WorktreeEligibility, WorktreeService,
   TransferDirection, WorkspaceEntryListingPolicy, WorkspaceFileChangeKind, WorkspaceService,
   JOKO_API_VERSION, SessionMessageSearchSemanticMode, SessionMessageSearchSessionStatus,
@@ -143,6 +144,10 @@ export interface MobileNetwork {
   uploadBlob(credential: PairedCredential, source: MobileBlobUploadSource, signal?: AbortSignal): Promise<BlobRef>;
   getVoiceInputCapabilities(credential: PairedCredential, signal?: AbortSignal): Promise<MobileVoiceCapability>;
   getVoiceInputDictionary(credential: PairedCredential, signal?: AbortSignal): Promise<MobileVoiceDictionarySnapshot>;
+  getVoiceInputDictionaryPeerStatus(credential: PairedCredential, signal?: AbortSignal): Promise<VoiceDictionaryPeerStatusView>;
+  grantVoiceInputDictionaryPeer(credential: PairedCredential, expectedConfigurationRevision: bigint, peerId: string, expectedFingerprint: string, signal?: AbortSignal): Promise<VoiceDictionaryPeerStatusView>;
+  revokeVoiceInputDictionaryPeer(credential: PairedCredential, peerId: string, expectedGrantRevision: bigint, signal?: AbortSignal): Promise<VoiceDictionaryPeerStatusView>;
+  syncVoiceInputDictionaryNow(credential: PairedCredential, expectedConfigurationRevision: bigint, peerId: string | undefined, signal?: AbortSignal): Promise<VoiceDictionaryPeerStatusView>;
   setVoiceInputDictionarySyncEnabled(credential: PairedCredential, expectedRevision: bigint, enabled: boolean, signal?: AbortSignal): Promise<MobileVoiceDictionarySnapshot>;
   addVoiceInputDictionaryTerms(credential: PairedCredential, expectedRevision: bigint, terms: readonly string[], signal?: AbortSignal): Promise<MobileVoiceDictionarySnapshot>;
   editVoiceInputDictionaryEntry(credential: PairedCredential, expectedRevision: bigint, entryId: string, text: string, aliases: readonly string[], signal?: AbortSignal): Promise<MobileVoiceDictionarySnapshot>;
@@ -1449,6 +1454,22 @@ export const mobileNetwork: MobileNetwork = {
     const response = await createClient(VoiceInputService, transport(credential.origin, credential.authKey))
       .getVoiceInputDictionary({}, options(signal));
     return projectMobileVoiceDictionarySnapshot(response.dictionary);
+  },
+  async getVoiceInputDictionaryPeerStatus(credential, signal) {
+    const response = await createClient(VoiceInputService, transport(credential.origin, credential.authKey)).getVoiceInputDictionaryPeerStatus({}, options(signal));
+    return projectVoiceDictionaryPeerStatus(response.status);
+  },
+  async grantVoiceInputDictionaryPeer(credential, expectedConfigurationRevision, peerId, expectedFingerprint, signal) {
+    const response = await createClient(VoiceInputService, transport(credential.origin, credential.authKey)).grantVoiceInputDictionaryPeer({ expectedConfigurationRevision, peerId, expectedFingerprint }, options(signal));
+    return projectVoiceDictionaryPeerStatus(response.status);
+  },
+  async revokeVoiceInputDictionaryPeer(credential, peerId, expectedGrantRevision, signal) {
+    const response = await createClient(VoiceInputService, transport(credential.origin, credential.authKey)).revokeVoiceInputDictionaryPeer({ peerId, expectedGrantRevision }, options(signal));
+    return projectVoiceDictionaryPeerStatus(response.status);
+  },
+  async syncVoiceInputDictionaryNow(credential, expectedConfigurationRevision, peerId, signal) {
+    const response = await createClient(VoiceInputService, transport(credential.origin, credential.authKey)).syncVoiceInputDictionaryNow({ expectedConfigurationRevision, ...(peerId === undefined ? {} : { peerId }) }, options(signal));
+    return projectVoiceDictionaryPeerStatus(response.status);
   },
   async setVoiceInputDictionarySyncEnabled(credential, expectedRevision, enabled, signal) {
     const response = await createClient(VoiceInputService, transport(credential.origin, credential.authKey))

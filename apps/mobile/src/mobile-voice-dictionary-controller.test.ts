@@ -9,6 +9,10 @@ function fixture(ownerKey = "node-a") {
   const commit = vi.fn(async () => (snapshot = { ...snapshot, revision: snapshot.revision + 1n }));
   const transport: MobileVoiceDictionaryTransport = {
     ownerKey, isCurrent: () => current,
+    getVoiceInputDictionaryPeerStatus: vi.fn(async () => { throw new Error("Sharing is not part of this dictionary-content fixture."); }),
+    grantVoiceInputDictionaryPeer: vi.fn(async () => { throw new Error("Sharing is not part of this dictionary-content fixture."); }),
+    revokeVoiceInputDictionaryPeer: vi.fn(async () => { throw new Error("Sharing is not part of this dictionary-content fixture."); }),
+    syncVoiceInputDictionaryNow: vi.fn(async () => { throw new Error("Sharing is not part of this dictionary-content fixture."); }),
     getVoiceInputDictionary: vi.fn(async () => snapshot),
     setVoiceInputDictionarySyncEnabled: commit, addVoiceInputDictionaryTerms: commit,
     editVoiceInputDictionaryEntry: commit, deleteVoiceInputDictionaryEntry: commit, applyVoiceInputDictionaryLearning: commit

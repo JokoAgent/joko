@@ -172,6 +172,55 @@ message VoiceInputDictionarySnapshot {
   repeated string refinement_terms = 6;
 }
 
+enum VoiceInputDictionaryPeerPhase {
+  VOICE_INPUT_DICTIONARY_PEER_PHASE_UNSPECIFIED = 0;
+  VOICE_INPUT_DICTIONARY_PEER_PHASE_OFF = 1;
+  VOICE_INPUT_DICTIONARY_PEER_PHASE_WAITING = 2;
+  VOICE_INPUT_DICTIONARY_PEER_PHASE_SYNCING = 3;
+  VOICE_INPUT_DICTIONARY_PEER_PHASE_UP_TO_DATE = 4;
+  VOICE_INPUT_DICTIONARY_PEER_PHASE_ERROR = 5;
+}
+
+enum VoiceInputDictionaryPeerErrorCode {
+  VOICE_INPUT_DICTIONARY_PEER_ERROR_CODE_UNSPECIFIED = 0;
+  VOICE_INPUT_DICTIONARY_PEER_ERROR_CODE_IDENTITY_UNAVAILABLE = 1;
+  VOICE_INPUT_DICTIONARY_PEER_ERROR_CODE_DICTIONARY_UNAVAILABLE = 2;
+  VOICE_INPUT_DICTIONARY_PEER_ERROR_CODE_SYNC_FAILED = 3;
+}
+
+message VoiceInputDictionaryPeer {
+  string peer_id = 1;
+  uint64 revision = 2;
+  string display_name = 3;
+  string fingerprint = 4;
+  bool online = 5;
+  google.protobuf.Timestamp granted_at = 6;
+  google.protobuf.Timestamp last_sync_at = 7;
+}
+
+message VoiceInputDictionaryPeerCandidate {
+  string node_id = 1;
+  string display_name = 2;
+  string fingerprint = 3;
+  google.protobuf.Timestamp seen_at = 4;
+  bool granted = 5;
+  bool key_changed = 6;
+}
+
+// Independent dictionary-sharing authority. Keys, endpoints, ciphertext,
+// proof and convergence state are not representable in the public contract.
+message VoiceInputDictionaryPeerStatus {
+  bool available = 1;
+  uint64 configuration_revision = 2;
+  string node_id = 3;
+  string fingerprint = 4;
+  bool enabled = 5;
+  VoiceInputDictionaryPeerPhase phase = 6;
+  optional VoiceInputDictionaryPeerErrorCode error_code = 7;
+  repeated VoiceInputDictionaryPeer peers = 8;
+  repeated VoiceInputDictionaryPeerCandidate candidates = 9;
+}
+
 // Failure projection is intentionally closed and content-free. Provider error
 // text, audio, credentials, and transcripts are not representable here.
 message VoiceInputFailure {

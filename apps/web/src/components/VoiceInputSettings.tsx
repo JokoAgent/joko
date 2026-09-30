@@ -58,6 +58,7 @@ import {
 } from "../voice-input-dictionary.js";
 import type { Translator } from "./types.js";
 import { Button, ErrorBanner, Pill, CheckboxControl, SelectControl, SwitchControl } from "./ui.js";
+import { VoiceDictionaryPeers } from "./VoiceDictionaryPeers.js";
 
 type CapabilityState =
   | { readonly kind: "loading" }
@@ -996,6 +997,7 @@ export function VoiceInputSettings({ controller, t }: {
           />
         </div>
         <div className="voice-input-setting-stack">
+          <VoiceDictionaryPeers api={controller} t={t} enabled={dictionary?.syncEnabled ?? false} />
           <div><strong>{t("settings.voiceInputDictionary")}</strong><span>{t("settings.voiceInputDictionaryHint")}</span></div>
           <div className="voice-input-dictionary-add">
             <input

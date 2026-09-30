@@ -6,15 +6,22 @@ import {
   ApplyVoiceInputDictionaryLearningRequestSchema,
   EditVoiceInputDictionaryEntryRequestSchema,
   GetVoiceInputDictionaryRequestSchema,
+  GetVoiceInputDictionaryPeerStatusRequestSchema,
+  GrantVoiceInputDictionaryPeerRequestSchema,
+  SyncVoiceInputDictionaryNowRequestSchema,
   SetVoiceInputDictionarySyncEnabledRequestSchema,
   VoiceInputDictionaryLearningActionType
 } from "@joko/contracts";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { OrchestratorE2eFixture } from "./fixture.js";
 
 describe("durable voice dictionary through authenticated generated RPCs", () => {
   let fixture: OrchestratorE2eFixture | undefined;
-  afterEach(async () => { await fixture?.close({ removeRoot: true }); fixture = undefined; });
+  let peerFixture: OrchestratorE2eFixture | undefined;
+  afterEach(async () => {
+    await peerFixture?.close({ removeRoot: true }); peerFixture = undefined;
+    await fixture?.close({ removeRoot: true }); fixture = undefined;
+  });
 
   it("shares one service revision between clients, rejects late learning and restores the same projection after restart", async () => {
     fixture = await OrchestratorE2eFixture.start({ keepRoot: true });
@@ -89,7 +96,11 @@ describe("durable voice dictionary through authenticated generated RPCs", () => 
       addVoiceInputDictionaryTerms: (revision: bigint, terms: readonly string[]) => mobileNetwork.addVoiceInputDictionaryTerms(credential, revision, terms),
       editVoiceInputDictionaryEntry: (revision: bigint, id: string, text: string, aliases: readonly string[]) => mobileNetwork.editVoiceInputDictionaryEntry(credential, revision, id, text, aliases),
       deleteVoiceInputDictionaryEntry: (revision: bigint, id: string) => mobileNetwork.deleteVoiceInputDictionaryEntry(credential, revision, id),
-      applyVoiceInputDictionaryLearning: () => { throw new Error("Learning belongs to the voice owner."); }
+      applyVoiceInputDictionaryLearning: () => { throw new Error("Learning belongs to the voice owner."); },
+      getVoiceInputDictionaryPeerStatus: (signal?: AbortSignal) => mobileNetwork.getVoiceInputDictionaryPeerStatus(credential, signal),
+      grantVoiceInputDictionaryPeer: (revision: bigint, id: string, fingerprint: string, signal?: AbortSignal) => mobileNetwork.grantVoiceInputDictionaryPeer(credential, revision, id, fingerprint, signal),
+      revokeVoiceInputDictionaryPeer: (id: string, revision: bigint, signal?: AbortSignal) => mobileNetwork.revokeVoiceInputDictionaryPeer(credential, id, revision, signal),
+      syncVoiceInputDictionaryNow: (revision: bigint, id?: string, signal?: AbortSignal) => mobileNetwork.syncVoiceInputDictionaryNow(credential, revision, id, signal)
     });
     await controller.refresh();
     await controller.addTerm("VoiceKit");
@@ -109,4 +120,64 @@ describe("durable voice dictionary through authenticated generated RPCs", () => 
     expect(await mobileNetwork.getVoiceInputDictionary({ ...credential, origin: fixture.baseUrl })).toEqual(committed);
     controller.setTransport(undefined);
   });
+
+  it("requires bilateral fingerprint grants through real HTTP and restores sharing authority without changing node identity", async () => {
+    const { mobileNetwork } = await import(new URL("../../mobile/src/network.ts", import.meta.url).href);
+    fixture = await OrchestratorE2eFixture.start({ dictionaryPeerNodeId: "e2e-dictionary-first", keepRoot: true });
+    peerFixture = await OrchestratorE2eFixture.start({ dictionaryPeerNodeId: "e2e-dictionary-second", keepRoot: true });
+    const statusRequest = create(GetVoiceInputDictionaryPeerStatusRequestSchema);
+    await expect(fixture.anonymous.voiceInput.getVoiceInputDictionaryPeerStatus(statusRequest)).rejects.toMatchObject({ code: Code.Unauthenticated });
+    const firstPair = await fixture.pair("Sharing editor");
+    const secondPair = await peerFixture.pair("Sharing phone");
+    const first = firstPair.clients.voiceInput;
+    const credential = { profileId: "sharing-phone", origin: peerFixture.baseUrl, serverId: peerFixture.application.serverId,
+      connectionId: secondPair.connectionId, deviceId: secondPair.deviceId, displayName: "Sharing phone", authKey: secondPair.authKey };
+    const dictionaryRequest = create(GetVoiceInputDictionaryRequestSchema);
+    for (const [api, term] of [[first, "OfficeTerm"], [secondPair.clients.voiceInput, "PhoneTerm"]] as const) {
+      const initial = (await api.getVoiceInputDictionary(dictionaryRequest)).dictionary!;
+      const added = (await api.addVoiceInputDictionaryTerms({ expectedRevision: initial.revision, terms: [term] })).dictionary!;
+      await api.setVoiceInputDictionarySyncEnabled({ expectedRevision: added.revision, enabled: true });
+    }
+    await vi.waitFor(async () => {
+      const a = (await first.getVoiceInputDictionaryPeerStatus(statusRequest)).status!;
+      const b = await mobileNetwork.getVoiceInputDictionaryPeerStatus(credential);
+      expect(a.candidates.some((candidate) => candidate.nodeId === credential.serverId)).toBe(true);
+      expect(b.candidates.some((candidate: { nodeId: string }) => candidate.nodeId === fixture!.application.serverId)).toBe(true);
+    }, { timeout: 8_000, interval: 100 });
+    const a = (await first.getVoiceInputDictionaryPeerStatus(statusRequest)).status!;
+    const b = await mobileNetwork.getVoiceInputDictionaryPeerStatus(credential);
+    await expect(first.grantVoiceInputDictionaryPeer(create(GrantVoiceInputDictionaryPeerRequestSchema, {
+      expectedConfigurationRevision: a.configurationRevision, peerId: b.nodeId, expectedFingerprint: "0".repeat(64)
+    }))).rejects.toMatchObject({ code: Code.Aborted });
+    const grantedA = (await first.grantVoiceInputDictionaryPeer({ expectedConfigurationRevision: a.configurationRevision,
+      peerId: b.nodeId, expectedFingerprint: b.fingerprint })).status!;
+    await expect(first.syncVoiceInputDictionaryNow(create(SyncVoiceInputDictionaryNowRequestSchema, {
+      expectedConfigurationRevision: grantedA.configurationRevision, peerId: b.nodeId
+    }))).rejects.toMatchObject({ code: Code.Unavailable });
+    expect((await mobileNetwork.getVoiceInputDictionary(credential)).dictionary.entries.map((entry: { text: string }) => entry.text)).toEqual(["PhoneTerm"]);
+    const grantedB = await mobileNetwork.grantVoiceInputDictionaryPeer(credential, b.configurationRevision, a.nodeId, a.fingerprint);
+    await vi.waitFor(async () => {
+      expect((await first.getVoiceInputDictionary(dictionaryRequest)).dictionary!.refinementTerms.slice().sort()).toEqual(["OfficeTerm", "PhoneTerm"]);
+      expect((await mobileNetwork.getVoiceInputDictionary(credential)).refinementTerms.slice().sort()).toEqual(["OfficeTerm", "PhoneTerm"]);
+    }, { timeout: 8_000, interval: 100 });
+    await expect(mobileNetwork.syncVoiceInputDictionaryNow(credential, b.configurationRevision, undefined)).rejects.toMatchObject({ code: Code.Aborted });
+    await expect(mobileNetwork.syncVoiceInputDictionaryNow(credential, grantedB.configurationRevision, undefined)).resolves.toMatchObject({
+      fingerprint: b.fingerprint, peers: [{ fingerprint: a.fingerprint }]
+    });
+    const rootDirectory = peerFixture.rootDirectory;
+    await peerFixture.close({ removeRoot: false });
+    peerFixture = await OrchestratorE2eFixture.start({ rootDirectory, dictionaryPeerNodeId: "e2e-dictionary-second" });
+    const restoredCredential = { ...credential, origin: peerFixture.baseUrl };
+    const restored = await mobileNetwork.getVoiceInputDictionaryPeerStatus(restoredCredential);
+    expect(restored).toMatchObject({ nodeId: b.nodeId, fingerprint: b.fingerprint,
+      configurationRevision: grantedB.configurationRevision, enabled: true,
+      peers: [{ peerId: a.nodeId, revision: grantedB.peers[0].revision, fingerprint: a.fingerprint }] });
+    expect((await mobileNetwork.getVoiceInputDictionary(restoredCredential)).refinementTerms.slice().sort()).toEqual(["OfficeTerm", "PhoneTerm"]);
+    await expect(mobileNetwork.revokeVoiceInputDictionaryPeer(restoredCredential, a.nodeId, restored.peers[0].revision + 1n)).rejects.toMatchObject({ code: Code.Aborted });
+    const revoked = await mobileNetwork.revokeVoiceInputDictionaryPeer(restoredCredential, a.nodeId, restored.peers[0].revision);
+    expect(revoked.peers).toEqual([]);
+    expect(revoked.configurationRevision).toBe(restored.configurationRevision + 1n);
+    expect((await mobileNetwork.getVoiceInputDictionary(restoredCredential)).refinementTerms.slice().sort()).toEqual(["OfficeTerm", "PhoneTerm"]);
+    await expect(mobileNetwork.syncVoiceInputDictionaryNow(restoredCredential, revoked.configurationRevision, a.nodeId)).rejects.toMatchObject({ code: Code.Unavailable });
+  }, 40_000);
 });

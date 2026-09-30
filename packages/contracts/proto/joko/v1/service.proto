@@ -480,6 +480,10 @@ service VoiceInputService {
   rpc GetVoiceInputCapabilities(GetVoiceInputCapabilitiesRequest) returns (GetVoiceInputCapabilitiesResponse);
   rpc TestVoiceInputConnection(TestVoiceInputConnectionRequest) returns (TestVoiceInputConnectionResponse);
   rpc GetVoiceInputDictionary(GetVoiceInputDictionaryRequest) returns (GetVoiceInputDictionaryResponse);
+  rpc GetVoiceInputDictionaryPeerStatus(GetVoiceInputDictionaryPeerStatusRequest) returns (GetVoiceInputDictionaryPeerStatusResponse);
+  rpc GrantVoiceInputDictionaryPeer(GrantVoiceInputDictionaryPeerRequest) returns (GrantVoiceInputDictionaryPeerResponse);
+  rpc RevokeVoiceInputDictionaryPeer(RevokeVoiceInputDictionaryPeerRequest) returns (RevokeVoiceInputDictionaryPeerResponse);
+  rpc SyncVoiceInputDictionaryNow(SyncVoiceInputDictionaryNowRequest) returns (SyncVoiceInputDictionaryNowResponse);
   rpc SetVoiceInputDictionarySyncEnabled(SetVoiceInputDictionarySyncEnabledRequest) returns (SetVoiceInputDictionarySyncEnabledResponse);
   rpc AddVoiceInputDictionaryTerms(AddVoiceInputDictionaryTermsRequest) returns (AddVoiceInputDictionaryTermsResponse);
   rpc EditVoiceInputDictionaryEntry(EditVoiceInputDictionaryEntryRequest) returns (EditVoiceInputDictionaryEntryResponse);
@@ -534,6 +538,40 @@ message GetVoiceInputDictionaryResponse {
 message SetVoiceInputDictionarySyncEnabledRequest {
   uint64 expected_revision = 1;
   bool enabled = 2;
+}
+
+message GetVoiceInputDictionaryPeerStatusRequest {}
+
+message GetVoiceInputDictionaryPeerStatusResponse {
+  VoiceInputDictionaryPeerStatus status = 1;
+}
+
+message GrantVoiceInputDictionaryPeerRequest {
+  uint64 expected_configuration_revision = 1;
+  string peer_id = 2;
+  string expected_fingerprint = 3;
+}
+
+message GrantVoiceInputDictionaryPeerResponse {
+  VoiceInputDictionaryPeerStatus status = 1;
+}
+
+message RevokeVoiceInputDictionaryPeerRequest {
+  string peer_id = 1;
+  uint64 expected_grant_revision = 2;
+}
+
+message RevokeVoiceInputDictionaryPeerResponse {
+  VoiceInputDictionaryPeerStatus status = 1;
+}
+
+message SyncVoiceInputDictionaryNowRequest {
+  uint64 expected_configuration_revision = 1;
+  optional string peer_id = 2;
+}
+
+message SyncVoiceInputDictionaryNowResponse {
+  VoiceInputDictionaryPeerStatus status = 1;
 }
 
 message SetVoiceInputDictionarySyncEnabledResponse {

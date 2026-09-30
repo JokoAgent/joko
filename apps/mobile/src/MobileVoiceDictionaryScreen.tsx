@@ -23,12 +23,15 @@ import type {
 import type { MobileSettingsColors } from "./MobileSettingsScreen";
 import type { MobileVoiceDictionaryControllerState } from "./mobile-voice-dictionary-controller";
 import { EMPTY_MOBILE_VOICE_DICTIONARY, type MobileVoiceDictionary } from "./mobile-voice-dictionary";
+import { MobileVoiceDictionaryPeers } from "./MobileVoiceDictionaryPeers";
+import type { MobileVoiceDictionaryTransport } from "./mobile-voice-dictionary-service";
 
 export interface MobileVoiceDictionaryScreenProps {
   readonly colors: MobileSettingsColors;
   readonly locale: MobileSupportedLocale;
   readonly state: MobileVoicePreferencesStoreState;
   readonly dictionary: MobileVoiceDictionaryControllerState;
+  readonly peerTransport?: MobileVoiceDictionaryTransport;
   readonly onBack: () => void;
   readonly onRetry: () => Promise<void>;
   readonly onReset: () => Promise<void>;
@@ -260,6 +263,7 @@ export function MobileVoiceDictionaryScreen(props: MobileVoiceDictionaryScreenPr
         trackColor={{ false: colors.border, true: colors.accent }}
         onValueChange={(enabled) => void run(() => props.onSetSyncEnabled(enabled))} />
     </View>
+    <MobileVoiceDictionaryPeers transport={props.peerTransport} colors={colors} locale={locale} />
     {dictionary.status === "loading" && <Notice colors={colors} text={t("settings.voice.loading")} />}
     {dictionary.status === "unavailable" && <Notice colors={colors} text={t("settings.voice.nodeUnavailable")} />}
     {dictionary.status === "error" && <ErrorNotice colors={colors} text={t("settings.voice.nodeError")} />}

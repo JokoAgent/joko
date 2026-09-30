@@ -1923,6 +1923,10 @@ export function useAppController(): AppController {
     return {
       getVoiceInputCapabilities: (...args: Parameters<OperationApi["getVoiceInputCapabilities"]>) => original().getVoiceInputCapabilities(...args),
       getVoiceInputDictionary: (...args: Parameters<OperationApi["getVoiceInputDictionary"]>) => original().getVoiceInputDictionary(...args),
+      getVoiceInputDictionaryPeerStatus: (...args: Parameters<OperationApi["getVoiceInputDictionaryPeerStatus"]>) => original().getVoiceInputDictionaryPeerStatus(...args),
+      grantVoiceInputDictionaryPeer: (...args: Parameters<OperationApi["grantVoiceInputDictionaryPeer"]>) => original().grantVoiceInputDictionaryPeer(...args),
+      revokeVoiceInputDictionaryPeer: (...args: Parameters<OperationApi["revokeVoiceInputDictionaryPeer"]>) => original().revokeVoiceInputDictionaryPeer(...args),
+      syncVoiceInputDictionaryNow: (...args: Parameters<OperationApi["syncVoiceInputDictionaryNow"]>) => original().syncVoiceInputDictionaryNow(...args),
       setVoiceInputDictionarySyncEnabled: (...args: Parameters<OperationApi["setVoiceInputDictionarySyncEnabled"]>) => original().setVoiceInputDictionarySyncEnabled(...args),
       addVoiceInputDictionaryTerms: (...args: Parameters<OperationApi["addVoiceInputDictionaryTerms"]>) => original().addVoiceInputDictionaryTerms(...args),
       editVoiceInputDictionaryEntry: (...args: Parameters<OperationApi["editVoiceInputDictionaryEntry"]>) => original().editVoiceInputDictionaryEntry(...args),

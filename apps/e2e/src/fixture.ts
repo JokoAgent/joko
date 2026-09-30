@@ -30,12 +30,14 @@ import {
   WorkspaceChangeSetService,
   WorkspaceService,
   VoiceDictionarySyncRepository,
+  VoiceDictionaryPeerManager,
+  CredentialVault,
   createPublicServer,
   type OrchestratorApplication,
   type BackendInstanceFactory,
   type OrchestratorConfig
 } from "@joko/orchestrator";
-import { ContactStore, OperationalStore } from "@joko/store";
+import { ContactStore, OperationalStore, VoiceDictionaryPeerStore } from "@joko/store";
 import {
   FakeBackendAdapter,
   PI_LIKE_PROFILE,
@@ -59,6 +61,7 @@ export interface FixtureOptions {
   readonly createAdapter?: (profile: FakeAdapterProfile) => InstrumentedFakeAdapter;
   readonly backendFactories?: readonly BackendInstanceFactory[];
   readonly keepRoot?: boolean;
+  readonly dictionaryPeerNodeId?: string;
   readonly terminals?: OrchestratorApplication["terminals"];
   readonly createAuxiliaryServices?: (
     store: OperationalStore,
@@ -356,7 +359,7 @@ export class OrchestratorE2eFixture {
     };
     const connections = new RecordingConnectionManager(store);
     connections.openPairingWindow();
-    const serverId = "orchestrator-e2e";
+    const serverId = options.dictionaryPeerNodeId ?? "orchestrator-e2e";
     const lanDiscovery = new LanDiscoveryService({
       self: () => ({
         serverId,
@@ -404,6 +407,13 @@ export class OrchestratorE2eFixture {
     };
     const contactStore = new ContactStore(join(dataDirectory, "contacts.db"));
     const contacts = new ContactManager(contactStore);
+    const voiceDictionary = new VoiceDictionarySyncRepository({ store });
+    const dictionaryPeerStore = options.dictionaryPeerNodeId === undefined ? undefined : new VoiceDictionaryPeerStore(join(dataDirectory, "voice-dictionary-peers.db"));
+    const voiceDictionaryPeers = dictionaryPeerStore === undefined ? undefined : new VoiceDictionaryPeerManager({
+      store: dictionaryPeerStore, dictionary: voiceDictionary, nodeId: serverId, displayName: serverId,
+      vault: await CredentialVault.open(join(dataDirectory, "credentials", "master.key"))
+    });
+    await voiceDictionaryPeers?.initialize();
     const application: OrchestratorApplication = {
       config,
       store,
@@ -435,7 +445,8 @@ export class OrchestratorE2eFixture {
       contacts,
       ...(options.terminals === undefined ? {} : { terminals: options.terminals }),
       ...auxiliaryServices,
-      voiceDictionary: new VoiceDictionarySyncRepository({ store }),
+      voiceDictionary,
+      ...(voiceDictionaryPeers === undefined ? {} : { voiceDictionaryPeers }),
       async close() {
         const failures: unknown[] = [];
         const attempt = async (cleanup: () => unknown): Promise<void> => {
@@ -461,6 +472,8 @@ export class OrchestratorE2eFixture {
         await attempt(() => lanDiscovery.stop());
         await attempt(() => auxiliaryServices?.sshKeys?.close());
         await attempt(() => contacts.close());
+        await attempt(() => voiceDictionaryPeers?.close());
+        await attempt(() => dictionaryPeerStore?.close());
         await attempt(() => contactStore.close());
         await attempt(() => sessionWorktrees.dispose());
         await attempt(() => devicePeers.shutdown());

@@ -992,6 +992,10 @@ function fakeNetwork(): MobileNetwork {
     uploadBlob: vi.fn(async () => { throw new Error("No Blob upload fixture was configured."); }),
     getVoiceInputCapabilities: vi.fn(async () => { throw new Error("No Voice capability fixture was configured."); }),
     getVoiceInputDictionary: vi.fn(async () => { throw new Error("No Voice dictionary fixture was configured."); }),
+    getVoiceInputDictionaryPeerStatus: vi.fn(async () => { throw new Error("No dictionary sharing fixture was configured."); }),
+    grantVoiceInputDictionaryPeer: vi.fn(async () => { throw new Error("No dictionary sharing fixture was configured."); }),
+    revokeVoiceInputDictionaryPeer: vi.fn(async () => { throw new Error("No dictionary sharing fixture was configured."); }),
+    syncVoiceInputDictionaryNow: vi.fn(async () => { throw new Error("No dictionary sharing fixture was configured."); }),
     setVoiceInputDictionarySyncEnabled: vi.fn(async () => { throw new Error("No Voice dictionary fixture was configured."); }),
     addVoiceInputDictionaryTerms: vi.fn(async () => { throw new Error("No Voice dictionary fixture was configured."); }),
     editVoiceInputDictionaryEntry: vi.fn(async () => { throw new Error("No Voice dictionary fixture was configured."); }),
@@ -2135,6 +2139,10 @@ describe("native mobile connection and operation ownership", () => {
     const methods = ["getVoiceInputDictionary", "setVoiceInputDictionarySyncEnabled", "addVoiceInputDictionaryTerms",
       "editVoiceInputDictionaryEntry", "deleteVoiceInputDictionaryEntry", "applyVoiceInputDictionaryLearning"] as const;
     for (const method of methods) vi.mocked(network[method]).mockResolvedValue(dictionary);
+    const sharing = { available: true, configurationRevision: 3n, nodeId: "node-a", fingerprint: "a".repeat(64),
+      enabled: true, phase: "waiting" as const, peers: [], candidates: [] };
+    const sharingMethods = ["getVoiceInputDictionaryPeerStatus", "grantVoiceInputDictionaryPeer", "revokeVoiceInputDictionaryPeer", "syncVoiceInputDictionaryNow"] as const;
+    for (const method of sharingMethods) vi.mocked(network[method]).mockResolvedValue(sharing);
     expect(app.voiceDictionaryTransport()).toBeUndefined();
     await app.start();
     const api = app.voiceDictionaryTransport()!;
@@ -2155,10 +2163,20 @@ describe("native mobile connection and operation ownership", () => {
     expect(network.editVoiceInputDictionaryEntry).toHaveBeenCalledExactlyOnceWith(credential, 4n, "dictionary-one", "Joko Core", ["jo ko"], request.signal);
     expect(network.deleteVoiceInputDictionaryEntry).toHaveBeenCalledExactlyOnceWith(credential, 4n, "dictionary-one", request.signal);
     expect(network.applyVoiceInputDictionaryLearning).toHaveBeenCalledExactlyOnceWith(credential, 4n, actions, request.signal);
+    await expect(api.getVoiceInputDictionaryPeerStatus(request.signal)).resolves.toBe(sharing);
+    await api.grantVoiceInputDictionaryPeer(3n, "node-b", "b".repeat(64), request.signal);
+    await api.revokeVoiceInputDictionaryPeer("node-b", 2n, request.signal);
+    await api.syncVoiceInputDictionaryNow(3n, "node-b", request.signal);
+    expect(network.getVoiceInputDictionaryPeerStatus).toHaveBeenCalledExactlyOnceWith(credential, request.signal);
+    expect(network.grantVoiceInputDictionaryPeer).toHaveBeenCalledExactlyOnceWith(credential, 3n, "node-b", "b".repeat(64), request.signal);
+    expect(network.revokeVoiceInputDictionaryPeer).toHaveBeenCalledExactlyOnceWith(credential, "node-b", 2n, request.signal);
+    expect(network.syncVoiceInputDictionaryNow).toHaveBeenCalledExactlyOnceWith(credential, 3n, "node-b", request.signal);
     app.setForeground(false);
     expect(api.isCurrent()).toBe(false);
     await expect(api.addVoiceInputDictionaryTerms(4n, ["RetiredTerm"])).rejects.toThrow(/authority changed/u);
     expect(network.addVoiceInputDictionaryTerms).toHaveBeenCalledOnce();
+    await expect(api.grantVoiceInputDictionaryPeer(3n, "retired", "c".repeat(64))).rejects.toThrow(/authority changed/u);
+    expect(network.grantVoiceInputDictionaryPeer).toHaveBeenCalledOnce();
     app.setForeground(true);
     await vi.waitFor(() => expect(app.voiceDictionaryTransport()?.isCurrent()).toBe(true));
     expect(api.isCurrent()).toBe(false);
