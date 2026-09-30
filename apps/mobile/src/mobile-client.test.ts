@@ -40,6 +40,7 @@ import type { MobileInteractionDraftIdentity } from "./interaction-draft-store";
 import { MobileComposerDraftStore } from "./composer-draft-store";
 import { MobileNewTaskDraftStore } from "./new-task-draft-store";
 import { EMPTY_MOBILE_VOICE_DICTIONARY } from "./mobile-voice-dictionary";
+import { dictionaryWatchFixture, idleDictionaryWatch } from "./test/voice-dictionary-watch";
 import { MobileAttachmentFiles, type MobileAttachmentFileDriver } from "./mobile-attachment-files";
 import {
   MobileMediaPreviewFiles,
@@ -992,7 +993,9 @@ function fakeNetwork(): MobileNetwork {
     uploadBlob: vi.fn(async () => { throw new Error("No Blob upload fixture was configured."); }),
     getVoiceInputCapabilities: vi.fn(async () => { throw new Error("No Voice capability fixture was configured."); }),
     getVoiceInputDictionary: vi.fn(async () => { throw new Error("No Voice dictionary fixture was configured."); }),
+    watchVoiceInputDictionary: vi.fn((_credential: PairedCredential, signal: AbortSignal) => idleDictionaryWatch(signal)),
     getVoiceInputDictionaryPeerStatus: vi.fn(async () => { throw new Error("No dictionary sharing fixture was configured."); }),
+    watchVoiceInputDictionaryPeerStatus: vi.fn((_credential: PairedCredential, signal: AbortSignal) => idleDictionaryWatch(signal)),
     grantVoiceInputDictionaryPeer: vi.fn(async () => { throw new Error("No dictionary sharing fixture was configured."); }),
     revokeVoiceInputDictionaryPeer: vi.fn(async () => { throw new Error("No dictionary sharing fixture was configured."); }),
     syncVoiceInputDictionaryNow: vi.fn(async () => { throw new Error("No dictionary sharing fixture was configured."); }),
@@ -2132,6 +2135,40 @@ describe("native mobile Automation ownership and recovery", () => {
 });
 
 describe("native mobile connection and operation ownership", () => {
+  it("binds both dictionary streams to their original credential and cancels an idle stream on foreground retirement", async () => {
+    const network = fakeNetwork();
+    const app = client(network, memoryStorage(credential).storage);
+    const content = dictionaryWatchFixture<Awaited<ReturnType<MobileNetwork["getVoiceInputDictionary"]>>>();
+    const peers = dictionaryWatchFixture<Awaited<ReturnType<MobileNetwork["getVoiceInputDictionaryPeerStatus"]>>>();
+    vi.mocked(network.watchVoiceInputDictionary).mockImplementation((_credential, signal) => content.watch(signal));
+    vi.mocked(network.watchVoiceInputDictionaryPeerStatus).mockImplementation((_credential, signal) => peers.watch(signal));
+    await app.start();
+    const api = app.voiceDictionaryTransport()!;
+    const request = new AbortController();
+    const dictionary = api.watchVoiceInputDictionary(request.signal)[Symbol.asyncIterator]();
+    const sharing = api.watchVoiceInputDictionaryPeerStatus(request.signal)[Symbol.asyncIterator]();
+    const firstDictionary = dictionary.next(); const firstSharing = sharing.next();
+    const value = { revision: 4n, syncEnabled: true, dictionary: EMPTY_MOBILE_VOICE_DICTIONARY, refinementTerms: [] };
+    const status = { available: true, configurationRevision: 3n, nodeId: "node-a", fingerprint: "a".repeat(64), enabled: true,
+      phase: "waiting" as const, peers: [], candidates: [] };
+    content.push(value); peers.push(status);
+    await expect(firstDictionary).resolves.toEqual({ done: false, value });
+    await expect(firstSharing).resolves.toEqual({ done: false, value: status });
+    expect(network.watchVoiceInputDictionary).toHaveBeenCalledExactlyOnceWith(credential, expect.any(AbortSignal));
+    expect(network.watchVoiceInputDictionaryPeerStatus).toHaveBeenCalledExactlyOnceWith(credential, expect.any(AbortSignal));
+    const waitingDictionary = dictionary.next(); const rejectedDictionary = expect(waitingDictionary).rejects.toThrow(/authority changed|cancelled/u);
+    const waitingSharing = sharing.next(); const rejectedSharing = expect(waitingSharing).rejects.toThrow(/authority changed|cancelled/u);
+    app.setForeground(false);
+    expect(vi.mocked(network.watchVoiceInputDictionary).mock.calls[0]![1]!.aborted).toBe(true);
+    expect(vi.mocked(network.watchVoiceInputDictionaryPeerStatus).mock.calls[0]![1]!.aborted).toBe(true);
+    await rejectedDictionary; await rejectedSharing;
+    expect(content.count).toBe(0); expect(peers.count).toBe(0);
+    app.setForeground(true);
+    await vi.waitFor(() => expect(app.voiceDictionaryTransport()?.isCurrent()).toBe(true));
+    expect(api.isCurrent()).toBe(false);
+    await expect(api.watchVoiceInputDictionary(new AbortController().signal)[Symbol.asyncIterator]().next()).rejects.toThrow(/authority changed/u);
+    expect(network.watchVoiceInputDictionary).toHaveBeenCalledOnce();
+  });
   it("binds dictionary reads and semantic mutations to a node owner independently of the selected task", async () => {
     const network = fakeNetwork();
     const app = client(network, memoryStorage(credential).storage);

@@ -23,6 +23,7 @@ export interface MobileVoiceDictionarySnapshot {
 
 export interface MobileVoiceDictionaryApi extends VoiceDictionaryPeerApi {
   getVoiceInputDictionary(signal?: AbortSignal): Promise<MobileVoiceDictionarySnapshot>;
+  watchVoiceInputDictionary(signal: AbortSignal): AsyncIterable<MobileVoiceDictionarySnapshot>;
   setVoiceInputDictionarySyncEnabled(expectedRevision: bigint, enabled: boolean, signal?: AbortSignal): Promise<MobileVoiceDictionarySnapshot>;
   addVoiceInputDictionaryTerms(expectedRevision: bigint, terms: readonly string[], signal?: AbortSignal): Promise<MobileVoiceDictionarySnapshot>;
   editVoiceInputDictionaryEntry(expectedRevision: bigint, entryId: string, text: string, aliases: readonly string[], signal?: AbortSignal): Promise<MobileVoiceDictionarySnapshot>;

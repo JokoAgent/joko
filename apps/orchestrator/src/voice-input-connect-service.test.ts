@@ -39,6 +39,7 @@ describe("VoiceInputService", () => {
     };
     let dictionarySnapshot = voiceDictionarySnapshot();
     const dictionary = {
+      subscribe: vi.fn(() => () => undefined),
       snapshot: vi.fn(() => dictionarySnapshot),
       setEnabled: vi.fn((_revision: number, enabled: boolean) => (dictionarySnapshot = { ...dictionarySnapshot, revision: dictionarySnapshot.revision + 1, enabled })),
       addManualTerms: vi.fn(() => (dictionarySnapshot = { ...dictionarySnapshot, revision: dictionarySnapshot.revision + 1 })),
@@ -173,6 +174,7 @@ describe("VoiceInputService", () => {
     const unavailable = new VoiceDictionarySyncRepositoryError("UNAVAILABLE", "Dictionary storage unavailable.");
     const method = vi.fn(() => { throw unavailable; });
     const dictionary = {
+      subscribe: vi.fn(() => () => undefined),
       snapshot: method,
       setEnabled: method,
       addManualTerms: method,
@@ -189,7 +191,7 @@ describe("VoiceInputService", () => {
 
   it("fences unauthenticated, cancelled, malformed and stale dictionary mutations", async () => {
     const method = vi.fn(() => voiceDictionarySnapshot());
-    const dictionary = { snapshot: method, setEnabled: method, addManualTerms: method, editEntry: method, deleteEntry: method, applyLearning: method };
+    const dictionary = { subscribe: vi.fn(() => () => undefined), snapshot: method, setEnabled: method, addManualTerms: method, editEntry: method, deleteEntry: method, applyLearning: method };
     const context = { signal: new AbortController().signal } as HandlerContext;
     const rejected = createVoiceInputConnectService(undefined, undefined, dictionary, () => { throw new ConnectError("Pair first.", Code.Unauthenticated); });
     await expect(rejected.applyVoiceInputDictionaryLearning(create(contract.ApplyVoiceInputDictionaryLearningRequestSchema, {
@@ -220,7 +222,7 @@ describe("authenticated dictionary peer contract", () => {
   const status: VoiceDictionaryPeerStatus = { available: true, configurationRevision: 5n, nodeId: "node-rpc", fingerprint: "a".repeat(64), enabled: true,
     phase: "waiting", peers: [{ peerId: "node-peer", revision: 4n, displayName: "Peer", fingerprint: "b".repeat(64), online: false, grantedAt: 1_000 }], candidates: [] };
   const context = { signal: new AbortController().signal } as HandlerContext;
-  const peers = () => ({ status: vi.fn(() => status), grantCandidate: vi.fn(() => status), revokePeer: vi.fn(() => status), syncNow: vi.fn(async (): Promise<void> => undefined) });
+  const peers = () => ({ subscribe: vi.fn((_listener: () => void) => () => undefined), status: vi.fn(() => status), grantCandidate: vi.fn(() => status), revokePeer: vi.fn(() => status), syncNow: vi.fn(async (): Promise<void> => undefined) });
   it("maps the separate configuration and grant revisions and never exposes private values", async () => {
     const owner = peers();
     const service = createVoiceInputConnectService(undefined, undefined, undefined, () => ({ connectionId: "paired" }), owner);
@@ -267,6 +269,62 @@ describe("authenticated dictionary peer contract", () => {
     const rejected = expect(syncing).rejects.toMatchObject({ code: Code.Unauthenticated });
     authenticated = false; resolve(); await rejected;
     expect(owner.status).toHaveBeenCalledOnce();
+  });
+
+  it("subscribes before the initial full projection, coalesces a burst and retires an idle cancelled watch", async () => {
+    let value = voiceDictionarySnapshot();
+    let changed = (): void => undefined;
+    const unsubscribe = vi.fn();
+    const unused = vi.fn(() => value);
+    const dictionary = { snapshot: () => value, setEnabled: unused, addManualTerms: unused, editEntry: unused,
+      deleteEntry: unused, applyLearning: unused, subscribe: vi.fn((listener: () => void) => {
+        changed = listener;
+        value = { ...value, revision: 5 }; // A change at subscribe must be part of the initial read.
+        return unsubscribe;
+      }) };
+    const abort = new AbortController();
+    const service = createVoiceInputConnectService(undefined, undefined, dictionary, () => ({ connectionId: "paired" }));
+    const watch = service.watchVoiceInputDictionary(create(contract.WatchVoiceInputDictionaryRequestSchema), { signal: abort.signal } as HandlerContext)[Symbol.asyncIterator]();
+    expect((await watch.next()).value).toMatchObject({ sequence: 1n, dictionary: { revision: 5n } });
+    for (let revision = 6; revision <= 30; revision += 1) { value = { ...value, revision }; changed(); }
+    expect((await watch.next()).value).toMatchObject({ sequence: 2n, dictionary: { revision: 30n } });
+    const waiting = watch.next();
+    abort.abort();
+    expect(await waiting).toMatchObject({ done: true });
+    expect(unsubscribe).toHaveBeenCalledOnce();
+    const shutdown = new AbortController();
+    const live = createVoiceInputConnectService(undefined, undefined, dictionary, () => ({ connectionId: "paired" }), undefined, undefined, shutdown.signal)
+      .watchVoiceInputDictionary(create(contract.WatchVoiceInputDictionaryRequestSchema), context)[Symbol.asyncIterator]();
+    await live.next();
+    const draining = live.next(); shutdown.abort();
+    expect(await draining).toMatchObject({ done: true });
+    expect(context.signal.aborted).toBe(false);
+    expect(unsubscribe).toHaveBeenCalledTimes(2);
+  });
+
+  it("closes an idle peer watch on revocation and checks authority again before every published status", async () => {
+    const owner = peers();
+    let changed = (): void => undefined;
+    const unsubscribe = vi.fn();
+    owner.subscribe.mockImplementation((listener) => { changed = listener; return unsubscribe; });
+    let revoked = (): void => undefined;
+    const stopRevocation = vi.fn();
+    const onRevoked = vi.fn((_id: string, listener: () => void) => { revoked = listener; return stopRevocation; });
+    let authenticated = true;
+    const authenticate = () => { if (!authenticated) throw new ConnectError("Revoked.", Code.Unauthenticated); return { connectionId: "paired" }; };
+    const service = createVoiceInputConnectService(undefined, undefined, undefined, authenticate, owner, onRevoked);
+    const first = service.watchVoiceInputDictionaryPeerStatus(create(contract.WatchVoiceInputDictionaryPeerStatusRequestSchema), context)[Symbol.asyncIterator]();
+    expect((await first.next()).value).toMatchObject({ sequence: 1n, status: { configurationRevision: 5n } });
+    const waiting = first.next(); revoked();
+    expect(await waiting).toMatchObject({ done: true });
+    expect(unsubscribe).toHaveBeenCalledOnce(); expect(stopRevocation).toHaveBeenCalledOnce();
+    const second = service.watchVoiceInputDictionaryPeerStatus(create(contract.WatchVoiceInputDictionaryPeerStatusRequestSchema), context)[Symbol.asyncIterator]();
+    await second.next();
+    authenticated = false; changed();
+    await expect(second.next()).rejects.toMatchObject({ code: Code.Unauthenticated });
+    expect(unsubscribe).toHaveBeenCalledTimes(2);
+    await expect(service.watchVoiceInputDictionary(create(contract.WatchVoiceInputDictionaryRequestSchema), context)[Symbol.asyncIterator]().next())
+      .rejects.toMatchObject({ code: Code.Unauthenticated });
   });
 });
 

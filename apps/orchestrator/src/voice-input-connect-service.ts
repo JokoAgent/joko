@@ -18,6 +18,7 @@ import {
   type VoiceDictionarySyncSnapshot
 } from "./voice-dictionary-sync-repository.js";
 import { VoiceDictionaryPeerManagerError, type VoiceDictionaryPeerManager, type VoiceDictionaryPeerStatus } from "./voice-dictionary-peer-manager.js";
+import { watchVoiceDictionaryProjection } from "./voice-dictionary-projection-watch.js";
 
 export interface VoiceInputRpcOwner {
   readonly connectionId: string;
@@ -27,9 +28,11 @@ export function createVoiceInputConnectService(
   coordinator: VoiceInputCoordinator | undefined,
   settings: Pick<VoiceInputSettingsController, "adviseDictionaryEdit" | "testConnection"> | undefined,
   dictionary: Pick<VoiceDictionarySyncRepository,
-    "addManualTerms" | "applyLearning" | "deleteEntry" | "editEntry" | "setEnabled" | "snapshot"> | undefined,
+    "addManualTerms" | "applyLearning" | "deleteEntry" | "editEntry" | "setEnabled" | "snapshot" | "subscribe"> | undefined,
   authenticate: (context: HandlerContext) => VoiceInputRpcOwner,
-  peers?: Pick<VoiceDictionaryPeerManager, "status" | "grantCandidate" | "revokePeer" | "syncNow">
+  peers?: Pick<VoiceDictionaryPeerManager, "status" | "grantCandidate" | "revokePeer" | "syncNow" | "subscribe">,
+  onRevoked?: (connectionId: string, listener: () => void) => () => void,
+  shutdownSignal?: AbortSignal
 ): ServiceImpl<typeof contract.VoiceInputService> {
   return {
     getVoiceInputCapabilities: async (_request, context) => voiceRpc(async () => {
@@ -52,6 +55,22 @@ export function createVoiceInputConnectService(
         dictionary: toProtoDictionarySnapshot(requireDictionary(dictionary).snapshot())
       });
     }),
+    watchVoiceInputDictionary: async function* (_request, context) {
+      authenticate(context);
+      const runtime = requireDictionary(dictionary);
+      for await (const update of watchVoiceDictionaryProjection({ context, authenticate, onRevoked, shutdownSignal,
+        subscribe: (listener) => runtime.subscribe(listener), read: () => toProtoDictionarySnapshot(runtime.snapshot()) })) {
+        yield create(contract.WatchVoiceInputDictionaryResponseSchema, { sequence: update.sequence, dictionary: update.value });
+      }
+    },
+    watchVoiceInputDictionaryPeerStatus: async function* (_request, context) {
+      authenticate(context);
+      const runtime = requirePeers(peers);
+      for await (const update of watchVoiceDictionaryProjection({ context, authenticate, onRevoked, shutdownSignal,
+        subscribe: (listener) => runtime.subscribe(listener), read: () => toProtoPeerStatus(runtime.status()) })) {
+        yield create(contract.WatchVoiceInputDictionaryPeerStatusResponseSchema, { sequence: update.sequence, status: update.value });
+      }
+    },
     getVoiceInputDictionaryPeerStatus: async (_request, context) => voiceRpc(async () => {
       authenticate(context);
       return create(contract.GetVoiceInputDictionaryPeerStatusResponseSchema, { status: toProtoPeerStatus(requirePeers(peers).status()) });
@@ -401,9 +420,9 @@ function requireSettings(
 
 function requireDictionary(
   value: Pick<VoiceDictionarySyncRepository,
-    "addManualTerms" | "applyLearning" | "deleteEntry" | "editEntry" | "setEnabled" | "snapshot"> | undefined
+    "addManualTerms" | "applyLearning" | "deleteEntry" | "editEntry" | "setEnabled" | "snapshot" | "subscribe"> | undefined
 ): Pick<VoiceDictionarySyncRepository,
-  "addManualTerms" | "applyLearning" | "deleteEntry" | "editEntry" | "setEnabled" | "snapshot"> {
+  "addManualTerms" | "applyLearning" | "deleteEntry" | "editEntry" | "setEnabled" | "snapshot" | "subscribe"> {
   if (value === undefined) throw new VoiceInputControlError("not_supported");
   return value;
 }

@@ -1,7 +1,7 @@
 import { create } from "@bufbuild/protobuf";
 import { describe, expect, it } from "vitest";
 import { VoiceInputDictionaryPeerStatusSchema, VoiceInputDictionaryPeerPhase, VoiceInputDictionaryPeerErrorCode } from "./gen/joko/v1/voice_pb.js";
-import { projectVoiceDictionaryPeerStatus } from "./voice-dictionary-peer-status.js";
+import { nextVoiceDictionaryWatchSequence, projectVoiceDictionaryPeerStatus } from "./voice-dictionary-peer-status.js";
 
 function status() {
   return create(VoiceInputDictionaryPeerStatusSchema, {
@@ -14,6 +14,14 @@ function status() {
   });
 }
 describe("strict dictionary sharing projection", () => {
+  it("accepts only contiguous safe watch sequences from the first full projection", () => {
+    expect(nextVoiceDictionaryWatchSequence(1n, 0n)).toBe(1n);
+    expect(nextVoiceDictionaryWatchSequence(2n, 1n)).toBe(2n);
+    for (const [value, previous] of [[0n, 0n], [2n, 0n], [1n, 1n], [3n, 1n],
+      [BigInt(Number.MAX_SAFE_INTEGER) + 1n, BigInt(Number.MAX_SAFE_INTEGER)]]) {
+      expect(() => nextVoiceDictionaryWatchSequence(value!, previous!)).toThrow(/invalid/u);
+    }
+  });
   it("projects only bounded public values and keeps changed candidate keys separate from grants", () => {
     const wire = status();
     const result = projectVoiceDictionaryPeerStatus(wire);

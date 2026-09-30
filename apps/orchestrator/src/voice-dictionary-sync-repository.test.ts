@@ -26,6 +26,20 @@ async function fixture(now = 1_900_000_000_000) {
   return { path, store };
 }
 
+it("retires subscribers before its store closes and rejects every later projection or mutation", async () => {
+  const { store } = await fixture();
+  const repository = new VoiceDictionarySyncRepository({ store });
+  const changed = vi.fn(() => { expect(() => repository.snapshot()).toThrow(VoiceDictionarySyncRepositoryError); });
+  repository.subscribe(changed);
+  repository.close();
+  repository.close();
+  expect(changed).toHaveBeenCalledOnce();
+  store.close();
+  expect(() => repository.snapshot()).toThrow(VoiceDictionarySyncRepositoryError);
+  expect(() => repository.addManualTerms(1, ["Retired"])).toThrow(VoiceDictionarySyncRepositoryError);
+  expect(() => repository.subscribe(changed)).toThrow(VoiceDictionarySyncRepositoryError);
+});
+
 function stored(store: OperationalStore): Record<string, unknown> {
   return store.getSetting<Record<string, unknown>>(
     "service",

@@ -169,6 +169,14 @@ export class VoiceDictionarySyncRepository {
     return () => this.#listeners.delete(listener);
   }
 
+  close(): void {
+    if (!this.#unavailable) {
+      this.#unavailable = true;
+      this.#notifySubscribers();
+    }
+    this.#listeners.clear();
+  }
+
   /** Returns a detached, revalidated state suitable for an authenticated peer frame. */
   stateForSync(): VoiceDictionarySyncState {
     this.#assertAvailable();
@@ -386,10 +394,12 @@ export class VoiceDictionarySyncRepository {
         readBack = decodeStoredDocument(persisted.value);
       } catch (error) {
         this.#unavailable = true;
+        this.#notifySubscribers();
         throw error;
       }
       if (!sameDocument(readBack, next)) {
         this.#unavailable = true;
+        this.#notifySubscribers();
         throw new Error("Voice dictionary persistence readback did not match the committed state.");
       }
     } catch (error) {
@@ -403,8 +413,12 @@ export class VoiceDictionarySyncRepository {
     } catch {
       // Observers never own the durable commit and cannot roll it back.
     }
-    for (const listener of this.#listeners) { try { listener(); } catch {} }
+    this.#notifySubscribers();
     return snapshot;
+  }
+
+  #notifySubscribers(): void {
+    for (const listener of this.#listeners) { try { listener(); } catch {} }
   }
 
   #exclusive<T>(run: () => T): T {

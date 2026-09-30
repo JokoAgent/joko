@@ -21,8 +21,7 @@ export function MobileVoiceDictionaryPeers({ transport, colors, locale }: {
   useEffect(() => {
     authorityEpoch.current += 1;
     mounted.current = true; setNotice(undefined); controller.setTransport(transport);
-    const timer = transport ? setInterval(() => { void controller.refresh().catch(() => undefined); }, 5_000) : undefined;
-    return () => { authorityEpoch.current += 1; mounted.current = false; controller.setTransport(undefined); if (timer !== undefined) clearInterval(timer); };
+    return () => { authorityEpoch.current += 1; mounted.current = false; controller.setTransport(undefined); };
   }, [controller, transport?.ownerKey]);
   const owned = transport?.isCurrent() && transport.ownerKey === snapshot.ownerKey;
   const value = owned ? snapshot.value : undefined;

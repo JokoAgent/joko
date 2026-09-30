@@ -9,6 +9,7 @@ import type { MobileVoicePreferencesStoreState } from "./mobile-voice-preference
 import type { MobileVoiceDictionaryControllerState } from "./mobile-voice-dictionary-controller";
 import type { VoiceDictionaryPeerStatusView } from "@joko/contracts";
 import type { MobileVoiceDictionaryTransport } from "./mobile-voice-dictionary-service";
+import { dictionaryWatchFixture, idleDictionaryWatch } from "./test/voice-dictionary-watch";
 
 const native = vi.hoisted(() => ({ alert: vi.fn() }));
 
@@ -111,6 +112,8 @@ function peerStatus(): VoiceDictionaryPeerStatusView {
 function peerTransport(): MobileVoiceDictionaryTransport {
   const unrelated = async () => { throw new Error("Content is controlled by the screen fixture."); };
   return { ownerKey: "owner-a", isCurrent: () => true,
+    watchVoiceInputDictionary: vi.fn(idleDictionaryWatch),
+    watchVoiceInputDictionaryPeerStatus: vi.fn(idleDictionaryWatch),
     getVoiceInputDictionary: unrelated, setVoiceInputDictionarySyncEnabled: unrelated, addVoiceInputDictionaryTerms: unrelated,
     editVoiceInputDictionaryEntry: unrelated, deleteVoiceInputDictionaryEntry: unrelated, applyVoiceInputDictionaryLearning: unrelated,
     getVoiceInputDictionaryPeerStatus: vi.fn(async () => peerStatus()),
@@ -253,12 +256,15 @@ describe("MobileVoiceDictionaryScreen", () => {
     expect(onReset).toHaveBeenCalledOnce();
   });
 
-  it("requires a native confirmation with the full fingerprint before granting the frozen node revision", async () => {
+  it("requires a native confirmation with the full fingerprint and never rebases its frozen revision on a live update", async () => {
     const peer = peerTransport();
+    const updates = dictionaryWatchFixture<VoiceDictionaryPeerStatusView>();
+    vi.mocked(peer.watchVoiceInputDictionaryPeerStatus).mockImplementation(updates.watch);
     await act(async () => { render("en", { peerTransport: peer }); });
     act(() => button(mobileMessage("en", "settings.voicePeers.allow")).click());
     expect(native.alert).toHaveBeenCalledWith(expect.any(String), expect.stringContaining(peerFingerprint), expect.any(Array));
     expect(peer.grantVoiceInputDictionaryPeer).not.toHaveBeenCalled();
+    await act(async () => { updates.push({ ...peerStatus(), configurationRevision: 4n }); });
     await act(async () => { confirmPeerAlert(); });
     expect(peer.grantVoiceInputDictionaryPeer).toHaveBeenCalledExactlyOnceWith(3n, "node-b", peerFingerprint, expect.any(AbortSignal));
     expect(container.textContent).toContain(mobileMessage("en", "settings.voicePeers.saved"));

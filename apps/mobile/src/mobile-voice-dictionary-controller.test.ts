@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { MobileVoiceDictionaryController } from "./mobile-voice-dictionary-controller";
 import { EMPTY_MOBILE_VOICE_DICTIONARY } from "./mobile-voice-dictionary";
 import type { MobileVoiceDictionarySnapshot, MobileVoiceDictionaryTransport } from "./mobile-voice-dictionary-service";
+import { dictionaryWatchFixture, idleDictionaryWatch } from "./test/voice-dictionary-watch";
 
 function fixture(ownerKey = "node-a") {
   let current = true;
@@ -9,6 +10,8 @@ function fixture(ownerKey = "node-a") {
   const commit = vi.fn(async () => (snapshot = { ...snapshot, revision: snapshot.revision + 1n }));
   const transport: MobileVoiceDictionaryTransport = {
     ownerKey, isCurrent: () => current,
+    watchVoiceInputDictionary: vi.fn(idleDictionaryWatch),
+    watchVoiceInputDictionaryPeerStatus: vi.fn(idleDictionaryWatch),
     getVoiceInputDictionaryPeerStatus: vi.fn(async () => { throw new Error("Sharing is not part of this dictionary-content fixture."); }),
     grantVoiceInputDictionaryPeer: vi.fn(async () => { throw new Error("Sharing is not part of this dictionary-content fixture."); }),
     revokeVoiceInputDictionaryPeer: vi.fn(async () => { throw new Error("Sharing is not part of this dictionary-content fixture."); }),
@@ -23,6 +26,38 @@ function fixture(ownerKey = "node-a") {
 }
 
 describe("mobile node dictionary projection owner", () => {
+  it("adopts live snapshots without rolling back to late RPCs, and keeps a disconnected projection readonly until explicit reconnect", async () => {
+    const f = fixture();
+    const updates = dictionaryWatchFixture<MobileVoiceDictionarySnapshot>();
+    vi.mocked(f.transport.watchVoiceInputDictionary).mockImplementation(updates.watch);
+    f.controller.setTransport(f.transport);
+    await vi.waitFor(() => expect(f.controller.snapshot.status).toBe("ready"));
+    let finish!: (value: MobileVoiceDictionarySnapshot) => void;
+    f.commit.mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+    const pending = f.controller.addTerm("Added");
+    updates.push({ ...f.controller.snapshot.snapshot!, revision: 5n });
+    await vi.waitFor(() => expect(f.controller.snapshot).toMatchObject({ saving: true, snapshot: { revision: 5n } }));
+    finish({ ...f.controller.snapshot.snapshot!, revision: 3n });
+    await pending;
+    expect(f.controller.snapshot).toMatchObject({ status: "ready", saving: false, snapshot: { revision: 5n } });
+    expect(f.commit).toHaveBeenCalledExactlyOnceWith(1n, ["Added"], expect.any(AbortSignal));
+    updates.end();
+    await vi.waitFor(() => expect(f.controller.snapshot.status).toBe("error"));
+    await expect(f.controller.addTerm("MustNotDispatch")).rejects.toThrow(/unavailable/u);
+    f.setSnapshot({ ...f.controller.snapshot.snapshot!, revision: 4n });
+    await f.controller.refresh();
+    expect(f.controller.snapshot).toMatchObject({ status: "error", snapshot: { revision: 5n } });
+    updates.push({ ...f.controller.snapshot.snapshot!, revision: 7n });
+    await vi.waitFor(() => expect(f.controller.snapshot).toMatchObject({ status: "ready", snapshot: { revision: 7n } }));
+    const other = fixture("node-b");
+    f.controller.setTransport(other.transport);
+    await vi.waitFor(() => expect(updates.count).toBe(0));
+    expect(vi.mocked(f.transport.watchVoiceInputDictionary).mock.calls[1]![0].aborted).toBe(true);
+    updates.push({ ...f.controller.snapshot.snapshot!, revision: 99n });
+    await vi.waitFor(() => expect(f.controller.snapshot.ownerKey).toBe("node-b"));
+    expect(f.controller.snapshot.snapshot?.revision).toBe(1n);
+    f.controller.setTransport(undefined);
+  });
   it("waits for a service commit, rejects duplicate dispatch and never replays for failed private history", async () => {
     const f = fixture();
     f.controller.setTransport(f.transport);

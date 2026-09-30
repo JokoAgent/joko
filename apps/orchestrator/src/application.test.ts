@@ -265,15 +265,19 @@ describe("Orchestrator application composition", () => {
     dictionary.addManualTerm(dictionary.snapshot().revision, "Durable application term");
     const snapshot = dictionary.snapshot();
     const closeManager = vi.spyOn(manager, "close");
+    const closeDictionary = vi.spyOn(dictionary, "close");
     const closePrivateStore = vi.spyOn(VoiceDictionaryPeerStore.prototype, "close");
     const closeOperationalStore = vi.spyOn(application.store, "close");
     try {
       await application.close();
       expect(closeManager).toHaveBeenCalledOnce();
+      expect(closeDictionary).toHaveBeenCalledOnce();
       expect(closePrivateStore).toHaveBeenCalledOnce();
       expect(closeManager.mock.invocationCallOrder[0]).toBeLessThan(closePrivateStore.mock.invocationCallOrder[0]!);
+      expect(closeManager.mock.invocationCallOrder[0]).toBeLessThan(closeDictionary.mock.invocationCallOrder[0]!);
+      expect(closeDictionary.mock.invocationCallOrder[0]).toBeLessThan(closePrivateStore.mock.invocationCallOrder[0]!);
       expect(closePrivateStore.mock.invocationCallOrder[0]).toBeLessThan(closeOperationalStore.mock.invocationCallOrder[0]!);
-    } finally { closeManager.mockRestore(); closePrivateStore.mockRestore(); closeOperationalStore.mockRestore(); }
+    } finally { closeManager.mockRestore(); closeDictionary.mockRestore(); closePrivateStore.mockRestore(); closeOperationalStore.mockRestore(); }
     application = await createOrchestratorApplication(config);
     expect(application.voiceDictionaryPeers!.status()).toMatchObject({ available: true, enabled: true, fingerprint });
     expect(application.voiceDictionary!.snapshot()).toEqual(snapshot);

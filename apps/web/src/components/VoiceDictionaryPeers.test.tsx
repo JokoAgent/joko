@@ -4,6 +4,7 @@ import { createRoot, type Root } from "react-dom/client";
 import type { VoiceDictionaryPeerApi, VoiceDictionaryPeerStatusView } from "@joko/contracts";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { translate } from "../i18n.js";
+import { dictionaryWatchFixture } from "../voice-dictionary.test-support.js";
 import { VoiceDictionaryPeers } from "./VoiceDictionaryPeers.js";
 
 let root: Root;
@@ -21,9 +22,11 @@ function status(patch: Partial<VoiceDictionaryPeerStatusView> = {}): VoiceDictio
 }
 function fixture() {
   let value = status();
+  const updates = dictionaryWatchFixture<VoiceDictionaryPeerStatusView>();
   const api = { getVoiceInputDictionaryPeerStatus: vi.fn(async () => value), grantVoiceInputDictionaryPeer: vi.fn(async () => value),
+    watchVoiceInputDictionaryPeerStatus: vi.fn(updates.watch),
     revokeVoiceInputDictionaryPeer: vi.fn(async () => value), syncVoiceInputDictionaryNow: vi.fn(async () => value) };
-  return { api, set: (next: VoiceDictionaryPeerStatusView) => { value = next; } };
+  return { api, updates, set: (next: VoiceDictionaryPeerStatusView) => { value = next; } };
 }
 const t = (key: Parameters<typeof translate>[1], values?: Readonly<Record<string, string | number>>) => translate("en", key, values);
 async function render(api: VoiceDictionaryPeerApi, enabled = true): Promise<void> { await act(async () => root.render(<VoiceDictionaryPeers api={api} t={t} enabled={enabled} />)); }
@@ -32,6 +35,36 @@ async function click(text: string): Promise<void> { await act(async () => button
 function deferred<T>() { let resolve!: (value: T) => void; return { promise: new Promise<T>((done) => { resolve = done; }), resolve: (value: T) => resolve(value) }; }
 
 describe("dictionary sharing settings", () => {
+  it("keeps live authority and equal-revision metadata ahead of late RPCs, and reconnects explicitly after disconnect", async () => {
+    const f = fixture();
+    const read = deferred<VoiceDictionaryPeerStatusView>();
+    f.api.getVoiceInputDictionaryPeerStatus.mockImplementationOnce(() => read.promise);
+    await render(f.api);
+    await act(async () => f.updates.push(status({ configurationRevision: 6n, phase: "syncing" })));
+    await act(async () => read.resolve(status()));
+    expect(container.textContent).toContain(t("settings.voicePeers.syncing"));
+    await click("Authorize dictionary sharing");
+    await act(async () => f.updates.push(status({ configurationRevision: 7n })));
+    expect(button("Confirm").disabled).toBe(true);
+    expect(f.api.grantVoiceInputDictionaryPeer).not.toHaveBeenCalled();
+    await click("Cancel");
+    const mutation = deferred<VoiceDictionaryPeerStatusView>();
+    f.api.syncVoiceInputDictionaryNow.mockImplementationOnce(() => mutation.promise);
+    await click("Sync now");
+    expect(f.api.syncVoiceInputDictionaryNow).toHaveBeenCalledExactlyOnceWith(7n, undefined, expect.any(AbortSignal));
+    await act(async () => f.updates.push(status({ configurationRevision: 7n, phase: "syncing" })));
+    await act(async () => mutation.resolve(status({ configurationRevision: 7n })));
+    expect(container.textContent).toContain(t("settings.voicePeers.syncing"));
+    await act(async () => f.updates.end());
+    expect(button("Sync now").disabled).toBe(true);
+    expect(container.querySelector('[role="alert"]')).not.toBeNull();
+    f.set(status({ configurationRevision: 7n }));
+    await click(t("settings.voicePeers.refresh"));
+    expect(f.api.watchVoiceInputDictionaryPeerStatus).toHaveBeenCalledTimes(2);
+    expect(button("Sync now").disabled).toBe(true);
+    await act(async () => f.updates.push(status({ configurationRevision: 7n })));
+    expect(button("Sync now").disabled).toBe(false);
+  });
   it("requires the full fingerprint confirmation, freezes revisions, and waits for a single grant before publishing", async () => {
     const f = fixture(); await render(f.api);
     await click("Authorize dictionary sharing");

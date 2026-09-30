@@ -18,6 +18,9 @@ export class MobileVoiceDictionaryController {
   #state: MobileVoiceDictionaryControllerState = { status: "unavailable", saving: false };
   #transport?: MobileVoiceDictionaryTransport;
   #request?: AbortController;
+  #watchRequest?: AbortController;
+  #watchEpoch = 0;
+  #streamFailed = false;
   #epoch = 0;
   #listeners = new Set<() => void>();
 
@@ -32,7 +35,10 @@ export class MobileVoiceDictionaryController {
   setTransport(transport: MobileVoiceDictionaryTransport | undefined): void {
     if (transport?.ownerKey === this.#transport?.ownerKey && this.#transport?.isCurrent()) return;
     this.#request?.abort();
+    this.#watchRequest?.abort();
+    this.#watchEpoch += 1;
     this.#epoch += 1;
+    this.#streamFailed = false;
     this.#transport = transport?.isCurrent() ? transport : undefined;
     this.#publish(this.#transport
       ? { status: "loading", ownerKey: this.#transport.ownerKey, saving: false }
@@ -43,17 +49,43 @@ export class MobileVoiceDictionaryController {
   async refresh(): Promise<void> {
     const transport = this.#transport;
     if (!transport?.isCurrent() || this.#state.saving) return;
+    this.#startWatch(transport);
     this.#request?.abort();
     const request = new AbortController();
     const epoch = ++this.#epoch;
     this.#request = request;
     try {
       const snapshot = await transport.getVoiceInputDictionary(request.signal);
-      if (this.#current(transport, epoch, request)) this.#publish({ status: "ready", ownerKey: transport.ownerKey, snapshot, saving: false });
+      if (this.#current(transport, epoch, request)) this.#adopt(snapshot, false);
     } catch (error) {
       if (this.#current(transport, epoch, request)) this.#publish({ ...this.#state, status: "error", saving: false });
       throw error;
     }
+  }
+
+  #startWatch(transport: MobileVoiceDictionaryTransport): void {
+    this.#watchRequest?.abort();
+    const epoch = ++this.#watchEpoch;
+    const request = this.#watchRequest = new AbortController();
+    const current = (): boolean => epoch === this.#watchEpoch && transport === this.#transport && transport.isCurrent() && !request.signal.aborted;
+    void (async () => {
+      try {
+        for await (const snapshot of transport.watchVoiceInputDictionary(request.signal)) {
+          if (!current()) return;
+          this.#streamFailed = false;
+          this.#adopt(snapshot, this.#state.saving);
+        }
+        if (current()) throw new Error("Dictionary updates disconnected.");
+      } catch {
+        if (current()) { this.#streamFailed = true; this.#publish({ ...this.#state, status: "error" }); }
+      }
+    })();
+  }
+
+  #adopt(snapshot: MobileVoiceDictionarySnapshot, saving: boolean): void {
+    const value = this.#state.snapshot;
+    this.#publish({ status: this.#streamFailed ? "error" : "ready", ownerKey: this.#transport!.ownerKey,
+      snapshot: value && value.revision > snapshot.revision ? value : snapshot, saving });
   }
 
   setSyncEnabled(enabled: boolean): Promise<void> {
@@ -104,7 +136,7 @@ export class MobileVoiceDictionaryController {
   ): Promise<void> {
     const transport = this.#transport;
     const before = this.#state.snapshot;
-    if (!transport?.isCurrent() || !before || this.#state.saving) throw new Error("The dictionary is unavailable or busy.");
+    if (!transport?.isCurrent() || !before || this.#state.status !== "ready" || this.#state.saving) throw new Error("The dictionary is unavailable or busy.");
     this.#request?.abort();
     const request = new AbortController();
     const epoch = ++this.#epoch;
@@ -113,7 +145,7 @@ export class MobileVoiceDictionaryController {
     try {
       const snapshot = await effect(transport, expectedRevision ?? before.revision, request.signal);
       if (!this.#current(transport, epoch, request)) throw new Error("The dictionary owner changed.");
-      this.#publish({ status: "ready", ownerKey: transport.ownerKey, snapshot, saving: true });
+      this.#adopt(snapshot, true);
       if (historyKind && snapshot.revision !== before.revision) {
         // The remote commit remains successful even if private metadata fails.
         await this.preferences.recordDictionaryChange(historyKind, terms,
@@ -124,7 +156,7 @@ export class MobileVoiceDictionaryController {
         // Refresh authority after conflict/unknown, without rebasing an editor's revision.
         try {
           const snapshot = await transport.getVoiceInputDictionary(request.signal);
-          if (this.#current(transport, epoch, request)) this.#publish({ status: "ready", ownerKey: transport.ownerKey, snapshot, saving: true });
+          if (this.#current(transport, epoch, request)) this.#adopt(snapshot, true);
         } catch {
           if (this.#current(transport, epoch, request)) this.#publish({ ...this.#state, status: "error" });
         }

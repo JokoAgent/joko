@@ -4,7 +4,7 @@ import { createConnectTransport } from "@connectrpc/connect-web";
 import { createTerminalGateway } from "./terminal-gateway.js";
 import { createSimulatorViewerGateway } from "./simulator-viewer-gateway.js";
 import { UsageReportGroup } from "@joko/contracts";
-import { projectVoiceDictionaryPeerStatus, type VoiceDictionaryPeerStatusView } from "@joko/contracts";
+import { nextVoiceDictionaryWatchSequence, projectVoiceDictionaryPeerStatus, type VoiceDictionaryPeerStatusView } from "@joko/contracts";
 import { SshKeyService, SshAgentState, SshAgentHostPlatform, SshKeyPassphrasePurpose, SshInstallShell, type SshKey, type CredentialUploadTicket } from "@joko/contracts";
 import type { SshKeyView, SshKeyCatalogView, SshKeyGenerateDraft, SshKeyInstallCommandDraft } from "./model.js";
 import type { UsageReportQueryView, UsageReportView } from "./model.js";
@@ -1506,6 +1506,32 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
   async getVoiceInputDictionaryPeerStatus(signal?: AbortSignal): Promise<VoiceDictionaryPeerStatusView> {
     const response = await createClient(VoiceInputService, this.requireTransport()).getVoiceInputDictionaryPeerStatus({}, voiceRpcOptions(this.#abort?.signal, signal));
     return projectVoiceDictionaryPeerStatus(response.status);
+  }
+  async *watchVoiceInputDictionary(signal: AbortSignal): AsyncIterable<VoiceInputDictionarySnapshotView> {
+    let sequence = 0n;
+    const request = new AbortController();
+    const options = voiceRpcOptions(this.#abort?.signal, AbortSignal.any([signal, request.signal]))!;
+    try {
+      const stream = createClient(VoiceInputService, this.requireTransport()).watchVoiceInputDictionary({}, options);
+      for await (const response of stream) {
+        options.signal.throwIfAborted();
+        sequence = nextVoiceDictionaryWatchSequence(response.sequence, sequence);
+        yield requireVoiceInputDictionary(response.dictionary);
+      }
+    } finally { request.abort(); }
+  }
+  async *watchVoiceInputDictionaryPeerStatus(signal: AbortSignal): AsyncIterable<VoiceDictionaryPeerStatusView> {
+    let sequence = 0n;
+    const request = new AbortController();
+    const options = voiceRpcOptions(this.#abort?.signal, AbortSignal.any([signal, request.signal]))!;
+    try {
+      const stream = createClient(VoiceInputService, this.requireTransport()).watchVoiceInputDictionaryPeerStatus({}, options);
+      for await (const response of stream) {
+        options.signal.throwIfAborted();
+        sequence = nextVoiceDictionaryWatchSequence(response.sequence, sequence);
+        yield projectVoiceDictionaryPeerStatus(response.status);
+      }
+    } finally { request.abort(); }
   }
   async grantVoiceInputDictionaryPeer(expectedConfigurationRevision: bigint, peerId: string, expectedFingerprint: string, signal?: AbortSignal): Promise<VoiceDictionaryPeerStatusView> {
     const response = await createClient(VoiceInputService, this.requireTransport()).grantVoiceInputDictionaryPeer({ expectedConfigurationRevision, peerId, expectedFingerprint }, voiceRpcOptions(this.#abort?.signal, signal));

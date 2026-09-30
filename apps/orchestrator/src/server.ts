@@ -208,8 +208,11 @@ export async function createPublicServer(application: OrchestratorApplication): 
     }
   );
 
+  const projectionShutdown = new AbortController();
+  // Idle projections must not hold the graceful request drain open.
+  server.addHook("preClose", async () => { projectionShutdown.abort(); });
   await server.register(fastifyConnectPlugin, {
-    routes: (router) => registerConnectServices(router, application),
+    routes: (router) => registerConnectServices(router, application, projectionShutdown.signal),
     grpc: tls !== undefined,
     grpcWeb: true,
     connect: true,

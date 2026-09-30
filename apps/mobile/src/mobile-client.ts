@@ -6161,10 +6161,27 @@ export class MobileClient {
         return result;
       } finally { unsubscribe(); }
     };
+    const subscribe = this.subscribe.bind(this);
+    const ownedStream = <T>(signal: AbortSignal, effect: (signal: AbortSignal) => AsyncIterable<T>): AsyncIterable<T> => (async function* () {
+      const request = new AbortController();
+      const cancel = (): void => request.abort();
+      const assertCurrent = (): void => {
+        if (signal.aborted || request.signal.aborted || !isCurrent()) throw new Error("Voice dictionary authority changed or the request was cancelled.");
+      };
+      assertCurrent();
+      signal.addEventListener("abort", cancel, { once: true });
+      const unsubscribe = subscribe(() => { if (!isCurrent()) { retired = true; request.abort(); } });
+      try {
+        for await (const value of effect(request.signal)) { assertCurrent(); yield value; }
+        assertCurrent();
+      } finally { request.abort(); unsubscribe(); signal.removeEventListener("abort", cancel); }
+    })();
     return {
       ownerKey, isCurrent,
       getVoiceInputDictionary: (signal) => owned(signal, () => this.network.getVoiceInputDictionary(credential, signal)),
+      watchVoiceInputDictionary: (signal) => ownedStream(signal, (current) => this.network.watchVoiceInputDictionary(credential, current)),
       getVoiceInputDictionaryPeerStatus: (signal) => owned(signal, () => this.network.getVoiceInputDictionaryPeerStatus(credential, signal)),
+      watchVoiceInputDictionaryPeerStatus: (signal) => ownedStream(signal, (current) => this.network.watchVoiceInputDictionaryPeerStatus(credential, current)),
       grantVoiceInputDictionaryPeer: (revision, id, fingerprint, signal) => owned(signal, () => this.network.grantVoiceInputDictionaryPeer(credential, revision, id, fingerprint, signal)),
       revokeVoiceInputDictionaryPeer: (id, revision, signal) => owned(signal, () => this.network.revokeVoiceInputDictionaryPeer(credential, id, revision, signal)),
       syncVoiceInputDictionaryNow: (revision, id, signal) => owned(signal, () => this.network.syncVoiceInputDictionaryNow(credential, revision, id, signal)),

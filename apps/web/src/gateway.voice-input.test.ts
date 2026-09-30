@@ -10,6 +10,8 @@ import {
   GetVoiceInputCapabilitiesResponseSchema,
   GetVoiceInputDictionaryResponseSchema,
   GetVoiceInputDictionaryPeerStatusResponseSchema,
+  WatchVoiceInputDictionaryResponseSchema,
+  WatchVoiceInputDictionaryPeerStatusResponseSchema,
   GrantVoiceInputDictionaryPeerResponseSchema,
   RevokeVoiceInputDictionaryPeerResponseSchema,
   SyncVoiceInputDictionaryNowResponseSchema,
@@ -38,9 +40,52 @@ import {
 } from "@joko/contracts";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createOrchestratorGateway } from "./gateway.js";
+import { dictionaryWatchFixture } from "./voice-dictionary.test-support.js";
 
 describe("voice input gateway", () => {
   afterEach(() => vi.unstubAllGlobals());
+
+  it.each(["content", "sharing"] as const)("validates every %s watch sequence and passes caller and gateway cancellation to the original stream", async (kind) => {
+    const updates = dictionaryWatchFixture<unknown>();
+    let streamSignal!: AbortSignal;
+    const transport = { ...voiceTransport(() => undefined), stream: vi.fn(async (method: any, signal: AbortSignal) => {
+      if (method.localName === (kind === "content" ? "watchVoiceInputDictionary" : "watchVoiceInputDictionaryPeerStatus")) {
+        streamSignal = signal; return response(method, updates.watch(signal), true);
+      }
+      return response(method, idleStream(), true);
+    }) } as unknown as Transport;
+    const gateway = createOrchestratorGateway({ id: "voice-connection", deviceId: "device-test", name: "Browser", origin: "https://orchestrator.example", serverId: "server-test" }, "secret", {}, () => transport);
+    await gateway.connect();
+    const value = (sequence: bigint) => kind === "content"
+      ? create(WatchVoiceInputDictionaryResponseSchema, { sequence, dictionary: dictionaryMessage() })
+      : create(WatchVoiceInputDictionaryPeerStatusResponseSchema, { sequence, status: { available: true, configurationRevision: 5n,
+        nodeId: "node-self", fingerprint: "a".repeat(64), enabled: true, phase: VoiceInputDictionaryPeerPhase.WAITING } });
+    const watch = (signal: AbortSignal) => kind === "content" ? gateway.watchVoiceInputDictionary(signal) : gateway.watchVoiceInputDictionaryPeerStatus(signal);
+    const request = new AbortController();
+    try {
+      const stream = watch(request.signal)[Symbol.asyncIterator]();
+      const first = stream.next();
+      await vi.waitFor(() => expect(updates.count).toBe(1));
+      updates.push(value(1n));
+      await expect(first).resolves.toMatchObject({ done: false, value: kind === "content" ? { revision: 4n } : { configurationRevision: 5n } });
+      const duplicate = stream.next(); const rejected = expect(duplicate).rejects.toThrow(/invalid/u);
+      updates.push(value(1n)); await rejected;
+      expect(streamSignal.aborted).toBe(true);
+      const resumed = watch(request.signal)[Symbol.asyncIterator]();
+      const resumedFirst = resumed.next();
+      await vi.waitFor(() => expect(updates.count).toBe(1));
+      updates.push(value(1n)); await resumedFirst;
+      request.abort();
+      expect(streamSignal.aborted).toBe(true);
+      await resumed.return?.();
+      const last = watch(new AbortController().signal)[Symbol.asyncIterator]();
+      const lastFirst = last.next();
+      await vi.waitFor(() => expect(updates.count).toBe(1));
+      updates.push(value(1n)); await lastFirst;
+      gateway.disconnect(); expect(streamSignal.aborted).toBe(true);
+      await last.return?.();
+    } finally { request.abort(); gateway.disconnect(); updates.end(); }
+  });
 
   it("maps capabilities and transports ephemeral audio with strict sequencing", async () => {
     const requests: Array<{ readonly method: string; readonly input: any }> = [];

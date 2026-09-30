@@ -24,9 +24,16 @@ export interface VoiceDictionaryPeerStatusView {
 
 export interface VoiceDictionaryPeerApi {
   getVoiceInputDictionaryPeerStatus(signal?: AbortSignal): Promise<VoiceDictionaryPeerStatusView>;
+  watchVoiceInputDictionaryPeerStatus(signal: AbortSignal): AsyncIterable<VoiceDictionaryPeerStatusView>;
   grantVoiceInputDictionaryPeer(expectedConfigurationRevision: bigint, peerId: string, expectedFingerprint: string, signal?: AbortSignal): Promise<VoiceDictionaryPeerStatusView>;
   revokeVoiceInputDictionaryPeer(peerId: string, expectedGrantRevision: bigint, signal?: AbortSignal): Promise<VoiceDictionaryPeerStatusView>;
   syncVoiceInputDictionaryNow(expectedConfigurationRevision: bigint, peerId?: string, signal?: AbortSignal): Promise<VoiceDictionaryPeerStatusView>;
+}
+
+/** Every new stream occurrence starts at one and rejects duplicate, gap or unsafe sequence. */
+export function nextVoiceDictionaryWatchSequence(value: bigint, previous: bigint): bigint {
+  if (value !== previous + 1n || value > BigInt(Number.MAX_SAFE_INTEGER)) throw invalid();
+  return value;
 }
 
 /** Shared strict client projection; no key, route or convergence state is exposed. */

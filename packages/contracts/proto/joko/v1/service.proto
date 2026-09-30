@@ -480,7 +480,9 @@ service VoiceInputService {
   rpc GetVoiceInputCapabilities(GetVoiceInputCapabilitiesRequest) returns (GetVoiceInputCapabilitiesResponse);
   rpc TestVoiceInputConnection(TestVoiceInputConnectionRequest) returns (TestVoiceInputConnectionResponse);
   rpc GetVoiceInputDictionary(GetVoiceInputDictionaryRequest) returns (GetVoiceInputDictionaryResponse);
+  rpc WatchVoiceInputDictionary(WatchVoiceInputDictionaryRequest) returns (stream WatchVoiceInputDictionaryResponse);
   rpc GetVoiceInputDictionaryPeerStatus(GetVoiceInputDictionaryPeerStatusRequest) returns (GetVoiceInputDictionaryPeerStatusResponse);
+  rpc WatchVoiceInputDictionaryPeerStatus(WatchVoiceInputDictionaryPeerStatusRequest) returns (stream WatchVoiceInputDictionaryPeerStatusResponse);
   rpc GrantVoiceInputDictionaryPeer(GrantVoiceInputDictionaryPeerRequest) returns (GrantVoiceInputDictionaryPeerResponse);
   rpc RevokeVoiceInputDictionaryPeer(RevokeVoiceInputDictionaryPeerRequest) returns (RevokeVoiceInputDictionaryPeerResponse);
   rpc SyncVoiceInputDictionaryNow(SyncVoiceInputDictionaryNowRequest) returns (SyncVoiceInputDictionaryNowResponse);
@@ -533,6 +535,20 @@ message GetVoiceInputDictionaryRequest {}
 
 message GetVoiceInputDictionaryResponse {
   VoiceInputDictionarySnapshot dictionary = 1;
+}
+
+message WatchVoiceInputDictionaryRequest {}
+
+message WatchVoiceInputDictionaryResponse {
+  uint64 sequence = 1;
+  VoiceInputDictionarySnapshot dictionary = 2;
+}
+
+message WatchVoiceInputDictionaryPeerStatusRequest {}
+
+message WatchVoiceInputDictionaryPeerStatusResponse {
+  uint64 sequence = 1;
+  VoiceInputDictionaryPeerStatus status = 2;
 }
 
 message SetVoiceInputDictionarySyncEnabledRequest {

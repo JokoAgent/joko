@@ -5584,6 +5584,7 @@ export interface OperationApi extends VoiceDictionaryPeerApi {
   getVoiceInputCapabilities(signal?: AbortSignal): Promise<VoiceInputCapabilityView>;
   testVoiceInputConnection(signal?: AbortSignal): Promise<VoiceInputConnectionTestResultView>;
   getVoiceInputDictionary(signal?: AbortSignal): Promise<VoiceInputDictionarySnapshotView>;
+  watchVoiceInputDictionary(signal: AbortSignal): AsyncIterable<VoiceInputDictionarySnapshotView>;
   setVoiceInputDictionarySyncEnabled(expectedRevision: bigint, enabled: boolean, signal?: AbortSignal): Promise<VoiceInputDictionarySnapshotView>;
   addVoiceInputDictionaryTerms(expectedRevision: bigint, terms: readonly string[], signal?: AbortSignal): Promise<VoiceInputDictionarySnapshotView>;
   editVoiceInputDictionaryEntry(expectedRevision: bigint, entryId: string, text: string, aliases: readonly string[], signal?: AbortSignal): Promise<VoiceInputDictionarySnapshotView>;

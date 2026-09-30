@@ -2684,6 +2684,7 @@ export async function createOrchestratorApplication(
         await attempt(() => remoteHosts.close());
         await attempt(() => runtimeActivity.close());
         await attempt(() => voiceDictionaryPeers.close());
+        await attempt(() => voiceDictionary.close());
         await attempt(() => voiceDictionaryPeerStore.close());
         await attempt(() => contactSync.close());
         await attempt(() => contacts.close());

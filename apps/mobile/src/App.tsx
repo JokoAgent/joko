@@ -574,11 +574,6 @@ export function App() {
     dictionaryController.setTransport(dictionaryOwnerKey ? dictionaryTransport : undefined);
     return () => dictionaryController.setTransport(undefined);
   }, [dictionaryController, dictionaryOwnerKey]);
-  useEffect(() => {
-    if (!dictionaryOwnerKey) return;
-    const timer = setInterval(() => { void dictionaryController.refresh().catch(() => undefined); }, 5_000);
-    return () => clearInterval(timer);
-  }, [dictionaryController, dictionaryOwnerKey]);
   const homeMenuButtonRef = useRef<View>(null);
   const pendingHomeMenuActionRef = useRef<(() => void) | undefined>(undefined);
   const openedIncomingShareRef = useRef<string | undefined>(undefined);

@@ -7,7 +7,7 @@ import {
   ResourceKind, SchedulerService, SessionService, TargetService, VoiceInputService,
   VoiceInputDictionaryEntrySource, VoiceInputDictionaryLearningActionType,
   VoiceInputDictionaryLearningConfidence, VoiceInputDictionaryTermType,
-  projectVoiceDictionaryPeerStatus, type VoiceDictionaryPeerStatusView,
+  nextVoiceDictionaryWatchSequence, projectVoiceDictionaryPeerStatus, type VoiceDictionaryPeerStatusView,
   WorktreeEligibility, WorktreeService,
   TransferDirection, WorkspaceEntryListingPolicy, WorkspaceFileChangeKind, WorkspaceService,
   JOKO_API_VERSION, SessionMessageSearchSemanticMode, SessionMessageSearchSessionStatus,
@@ -145,6 +145,8 @@ export interface MobileNetwork {
   getVoiceInputCapabilities(credential: PairedCredential, signal?: AbortSignal): Promise<MobileVoiceCapability>;
   getVoiceInputDictionary(credential: PairedCredential, signal?: AbortSignal): Promise<MobileVoiceDictionarySnapshot>;
   getVoiceInputDictionaryPeerStatus(credential: PairedCredential, signal?: AbortSignal): Promise<VoiceDictionaryPeerStatusView>;
+  watchVoiceInputDictionary(credential: PairedCredential, signal: AbortSignal): AsyncIterable<MobileVoiceDictionarySnapshot>;
+  watchVoiceInputDictionaryPeerStatus(credential: PairedCredential, signal: AbortSignal): AsyncIterable<VoiceDictionaryPeerStatusView>;
   grantVoiceInputDictionaryPeer(credential: PairedCredential, expectedConfigurationRevision: bigint, peerId: string, expectedFingerprint: string, signal?: AbortSignal): Promise<VoiceDictionaryPeerStatusView>;
   revokeVoiceInputDictionaryPeer(credential: PairedCredential, peerId: string, expectedGrantRevision: bigint, signal?: AbortSignal): Promise<VoiceDictionaryPeerStatusView>;
   syncVoiceInputDictionaryNow(credential: PairedCredential, expectedConfigurationRevision: bigint, peerId: string | undefined, signal?: AbortSignal): Promise<VoiceDictionaryPeerStatusView>;
@@ -1462,6 +1464,34 @@ export const mobileNetwork: MobileNetwork = {
   async grantVoiceInputDictionaryPeer(credential, expectedConfigurationRevision, peerId, expectedFingerprint, signal) {
     const response = await createClient(VoiceInputService, transport(credential.origin, credential.authKey)).grantVoiceInputDictionaryPeer({ expectedConfigurationRevision, peerId, expectedFingerprint }, options(signal));
     return projectVoiceDictionaryPeerStatus(response.status);
+  },
+  async *watchVoiceInputDictionary(credential, signal) {
+    let sequence = 0n;
+    const request = new AbortController();
+    const cancel = (): void => request.abort();
+    if (signal.aborted) cancel(); else signal.addEventListener("abort", cancel, { once: true });
+    try {
+      const stream = createClient(VoiceInputService, transport(credential.origin, credential.authKey)).watchVoiceInputDictionary({}, options(request.signal));
+      for await (const response of stream) {
+        request.signal.throwIfAborted();
+        sequence = nextVoiceDictionaryWatchSequence(response.sequence, sequence);
+        yield projectMobileVoiceDictionarySnapshot(response.dictionary);
+      }
+    } finally { cancel(); signal.removeEventListener("abort", cancel); }
+  },
+  async *watchVoiceInputDictionaryPeerStatus(credential, signal) {
+    let sequence = 0n;
+    const request = new AbortController();
+    const cancel = (): void => request.abort();
+    if (signal.aborted) cancel(); else signal.addEventListener("abort", cancel, { once: true });
+    try {
+      const stream = createClient(VoiceInputService, transport(credential.origin, credential.authKey)).watchVoiceInputDictionaryPeerStatus({}, options(request.signal));
+      for await (const response of stream) {
+        request.signal.throwIfAborted();
+        sequence = nextVoiceDictionaryWatchSequence(response.sequence, sequence);
+        yield projectVoiceDictionaryPeerStatus(response.status);
+      }
+    } finally { cancel(); signal.removeEventListener("abort", cancel); }
   },
   async revokeVoiceInputDictionaryPeer(credential, peerId, expectedGrantRevision, signal) {
     const response = await createClient(VoiceInputService, transport(credential.origin, credential.authKey)).revokeVoiceInputDictionaryPeer({ peerId, expectedGrantRevision }, options(signal));

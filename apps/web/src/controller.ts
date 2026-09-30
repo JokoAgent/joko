@@ -1923,7 +1923,9 @@ export function useAppController(): AppController {
     return {
       getVoiceInputCapabilities: (...args: Parameters<OperationApi["getVoiceInputCapabilities"]>) => original().getVoiceInputCapabilities(...args),
       getVoiceInputDictionary: (...args: Parameters<OperationApi["getVoiceInputDictionary"]>) => original().getVoiceInputDictionary(...args),
+      watchVoiceInputDictionary: (...args: Parameters<OperationApi["watchVoiceInputDictionary"]>) => original().watchVoiceInputDictionary(...args),
       getVoiceInputDictionaryPeerStatus: (...args: Parameters<OperationApi["getVoiceInputDictionaryPeerStatus"]>) => original().getVoiceInputDictionaryPeerStatus(...args),
+      watchVoiceInputDictionaryPeerStatus: (...args: Parameters<OperationApi["watchVoiceInputDictionaryPeerStatus"]>) => original().watchVoiceInputDictionaryPeerStatus(...args),
       grantVoiceInputDictionaryPeer: (...args: Parameters<OperationApi["grantVoiceInputDictionaryPeer"]>) => original().grantVoiceInputDictionaryPeer(...args),
       revokeVoiceInputDictionaryPeer: (...args: Parameters<OperationApi["revokeVoiceInputDictionaryPeer"]>) => original().revokeVoiceInputDictionaryPeer(...args),
       syncVoiceInputDictionaryNow: (...args: Parameters<OperationApi["syncVoiceInputDictionaryNow"]>) => original().syncVoiceInputDictionaryNow(...args),

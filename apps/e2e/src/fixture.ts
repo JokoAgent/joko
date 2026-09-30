@@ -473,6 +473,7 @@ export class OrchestratorE2eFixture {
         await attempt(() => auxiliaryServices?.sshKeys?.close());
         await attempt(() => contacts.close());
         await attempt(() => voiceDictionaryPeers?.close());
+        await attempt(() => voiceDictionary.close());
         await attempt(() => dictionaryPeerStore?.close());
         await attempt(() => contactStore.close());
         await attempt(() => sessionWorktrees.dispose());

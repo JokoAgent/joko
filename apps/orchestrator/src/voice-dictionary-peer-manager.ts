@@ -64,6 +64,7 @@ export class VoiceDictionaryPeerManager {
   readonly #debounce: number;
   readonly #fallback: number;
   readonly #unsubscribe: Array<() => void> = [];
+  readonly #listeners = new Set<() => void>();
   readonly #peerKnown = new Map<string, string>();
   readonly #online = new Map<string, string>();
   readonly #sending = new Map<string, Promise<void>>();
@@ -128,6 +129,7 @@ export class VoiceDictionaryPeerManager {
   }
 
   status(): VoiceDictionaryPeerStatus {
+    if (this.#closed) throw unavailable();
     const identity = this.#store.identity();
     const grants = this.#store.peers();
     let enabled = false;
@@ -160,6 +162,12 @@ export class VoiceDictionaryPeerManager {
     return this.status();
   }
 
+  subscribe(listener: () => void): () => void {
+    if (this.#closed) throw unavailable();
+    this.#listeners.add(listener);
+    return () => this.#listeners.delete(listener);
+  }
+
   revokePeer(peerId: string, expectedRevision: bigint): VoiceDictionaryPeerStatus {
     this.#assertReady();
     this.#store.revokePeer(peerId, expectedRevision);
@@ -189,6 +197,8 @@ export class VoiceDictionaryPeerManager {
     this.#retire();
     this.#codec.close?.();
     this.#privateKey = undefined;
+    this.#emit();
+    this.#listeners.clear();
   }
 
   #dictionaryChanged(): void {
@@ -376,7 +386,10 @@ export class VoiceDictionaryPeerManager {
   }
   #failed(): void { this.#errorCode = "sync_failed"; this.#report(); }
   #report(): void { this.#logger.warn("Dictionary peer operation failed.", { code: this.#errorCode }); this.#emit(); }
-  #emit(): void { try { this.#onChanged(); } catch {} }
+  #emit(): void {
+    try { this.#onChanged(); } catch {}
+    for (const listener of this.#listeners) { try { listener(); } catch {} }
+  }
   #association(): string { return `joko:voice-dictionary-device-sync:x25519-private-key:v1:${this.#nodeId}`; }
 }
 

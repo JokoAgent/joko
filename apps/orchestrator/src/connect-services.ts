@@ -1129,8 +1129,8 @@ const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3
 const RUNTIME_GENERATION = BigInt(Date.now());
 
 /** Register all public v1 services. Every descriptor method receives a concrete handler. */
-export function registerConnectServices(router: ConnectRouter, application: OrchestratorApplication): void {
-  const services = createConnectServices(application);
+export function registerConnectServices(router: ConnectRouter, application: OrchestratorApplication, projectionShutdownSignal?: AbortSignal): void {
+  const services = createConnectServices(application, projectionShutdownSignal);
   router.service(contract.ConnectionService, withConnectErrors(services.connection));
   router.service(contract.EventService, withConnectErrors(services.event));
   router.service(contract.OperationService, withConnectErrors(services.operation));
@@ -1168,7 +1168,7 @@ export function registerConnectServices(router: ConnectRouter, application: Orch
   router.service(contract.PiService, withConnectErrors(services.pi));
 }
 
-export function createConnectServices(application: OrchestratorApplication): ConnectServiceSet {
+export function createConnectServices(application: OrchestratorApplication, projectionShutdownSignal?: AbortSignal): ConnectServiceSet {
   const providerLoginFlows = new Map<string, NativeProviderLoginFlow>();
   const providerLoginEvidence = new Map<string, BackendProviderAuthenticationEvidence>();
   const backendProviderLoginFlows = new Map<string, BackendProviderLoginFlow>();
@@ -1376,7 +1376,7 @@ export function createConnectServices(application: OrchestratorApplication): Con
   });
   const voiceInput = createVoiceInputConnectService(dependencies.voiceInput, dependencies.voiceInputSettings, dependencies.voiceDictionary, (context) => ({
     connectionId: authenticate(context).id
-  }), application.voiceDictionaryPeers);
+  }), application.voiceDictionaryPeers, (connectionId, listener) => dependencies.connections.onRevoked(connectionId, listener), projectionShutdownSignal);
   const managedModelRuntime = createManagedModelRuntimeConnectService(
     dependencies.managedModelRuntime,
     (context) => authenticate(context)

@@ -25,6 +25,23 @@ const inProcessCodec: VoiceDictionaryPeerCodec = {
 };
 
 describe("Voice dictionary peer authority and exchange", () => {
+  it("notifies projection subscribers after durable changes and retires them before its private store closes", async () => {
+    const fixture = await localFixture("projection");
+    const manager = new VoiceDictionaryPeerManager(fixture.options);
+    cleanups.push(() => manager.close());
+    await manager.initialize();
+    const observed: Array<number | "closed"> = [];
+    manager.subscribe(() => {
+      try { manager.status(); observed.push(fixture.dictionary.snapshot().revision); }
+      catch { observed.push("closed"); }
+    });
+    fixture.dictionary.addManualTerm(fixture.dictionary.snapshot().revision, "Durable projection");
+    expect(observed).toEqual([fixture.dictionary.snapshot().revision]);
+    manager.close(); manager.close();
+    expect(observed.at(-1)).toBe("closed");
+    expect(() => manager.status()).toThrow(/unavailable/u);
+    expect(() => manager.subscribe(() => undefined)).toThrow(/unavailable/u);
+  });
   it("converges full state through two durable LAN owners, forces reconnect replies, and retains identity across restart", { timeout: 25_000 }, async () => {
     const port = randomInt(54_000, 60_000);
     const first = await lanFixture("first", port);

@@ -2,6 +2,7 @@ import type { VoiceDictionaryPeerStatusView } from "@joko/contracts";
 import { describe, expect, it, vi } from "vitest";
 import { MobileVoiceDictionaryPeerController } from "./mobile-voice-dictionary-peer-controller";
 import type { MobileVoiceDictionaryTransport } from "./mobile-voice-dictionary-service";
+import { dictionaryWatchFixture, idleDictionaryWatch } from "./test/voice-dictionary-watch";
 
 const fingerprint = "b".repeat(64);
 function status(configurationRevision = 3n): VoiceDictionaryPeerStatusView {
@@ -12,6 +13,8 @@ function status(configurationRevision = 3n): VoiceDictionaryPeerStatusView {
 function transport(ownerKey: string): MobileVoiceDictionaryTransport {
   const unrelated = async () => { throw new Error("Dictionary content is not owned by this fixture."); };
   return { ownerKey, isCurrent: () => true,
+    watchVoiceInputDictionary: vi.fn(idleDictionaryWatch),
+    watchVoiceInputDictionaryPeerStatus: vi.fn(idleDictionaryWatch),
     getVoiceInputDictionary: unrelated, setVoiceInputDictionarySyncEnabled: unrelated, addVoiceInputDictionaryTerms: unrelated,
     editVoiceInputDictionaryEntry: unrelated, deleteVoiceInputDictionaryEntry: unrelated, applyVoiceInputDictionaryLearning: unrelated,
     getVoiceInputDictionaryPeerStatus: vi.fn(async () => status()),
@@ -21,6 +24,37 @@ function transport(ownerKey: string): MobileVoiceDictionaryTransport {
 }
 
 describe("native dictionary sharing authority", () => {
+  it("protects pushed configuration and equal-revision status from late reads or mutations, and makes a disconnected stream readonly", async () => {
+    const controller = new MobileVoiceDictionaryPeerController();
+    const api = transport("owner-a");
+    const updates = dictionaryWatchFixture<VoiceDictionaryPeerStatusView>();
+    vi.mocked(api.watchVoiceInputDictionaryPeerStatus).mockImplementation(updates.watch);
+    let read!: (value: VoiceDictionaryPeerStatusView) => void;
+    vi.mocked(api.getVoiceInputDictionaryPeerStatus).mockImplementationOnce(() => new Promise((resolve) => { read = resolve; }));
+    controller.setTransport(api);
+    updates.push(status(5n));
+    await vi.waitFor(() => expect(controller.snapshot.value?.configurationRevision).toBe(5n));
+    read(status());
+    await vi.waitFor(() => expect(controller.snapshot.status).toBe("ready"));
+    expect(controller.snapshot.value?.configurationRevision).toBe(5n);
+    let finish!: (value: VoiceDictionaryPeerStatusView) => void;
+    vi.mocked(api.syncVoiceInputDictionaryNow).mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+    const pending = controller.syncNow("owner-a", 5n);
+    updates.push({ ...status(5n), phase: "syncing" });
+    await vi.waitFor(() => expect(controller.snapshot).toMatchObject({ busy: true, value: { phase: "syncing" } }));
+    finish(status(5n)); await pending;
+    expect(controller.snapshot.value?.phase).toBe("syncing");
+    updates.end();
+    await vi.waitFor(() => expect(controller.snapshot.status).toBe("error"));
+    await expect(controller.grant("owner-a", 5n, "node-b", fingerprint)).rejects.toThrow(/unavailable/u);
+    await controller.refresh();
+    expect(controller.snapshot.status).toBe("error");
+    updates.push(status(6n));
+    await vi.waitFor(() => expect(controller.snapshot).toMatchObject({ status: "ready", value: { configurationRevision: 6n } }));
+    controller.setTransport(undefined);
+    await vi.waitFor(() => expect(updates.count).toBe(0));
+    expect(api.grantVoiceInputDictionaryPeer).not.toHaveBeenCalled();
+  });
   it("keeps a single frozen mutation and does not replay it after refreshing a conflict", async () => {
     const controller = new MobileVoiceDictionaryPeerController();
     const api = transport("owner-a");
