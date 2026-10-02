@@ -266,6 +266,85 @@ describe("Voice dictionary peer authority and exchange", () => {
       expect(messages).toHaveLength(2);
     } finally { vi.useRealTimers(); }
   });
+
+  it.each((["explicit", "fallback"] as const).flatMap((trigger) =>
+    (["complete", "revoke", "disable", "close"] as const).map((retirement) => ({ trigger, retirement }))
+  ))("attempts every peer after an earlier failure on $trigger and fences $retirement", async ({ trigger, retirement }) => {
+    vi.useFakeTimers();
+    try {
+      const fixture = await localFixture(`fanout-${trigger}-${retirement}`);
+      const failedIdentity = generateNodeSyncIdentity();
+      const healthyIdentity = generateNodeSyncIdentity();
+      const attempts: string[] = [];
+      const messages: Array<{ peerId: string; message: VoiceDictionaryPeerMessage }> = [];
+      const started = deferred<void>();
+      const ack = deferred<boolean>();
+      let online = false;
+      let failFirst = true;
+      const manager = new VoiceDictionaryPeerManager({ ...fixture.options, fallbackMilliseconds: 30 * 60_000,
+        codec: { ...inProcessCodec, encode: async (options) => {
+          messages.push({ peerId: options.destinationNodeId, message: options.message });
+          return encodeVoiceDictionaryPeerMessage(options);
+        } },
+        transportFactory: () => ({ ...emptyTransport(), onlinePeerIds: () => online ? ["node-failed", "node-healthy"] : [],
+          send: async (peerId) => {
+            attempts.push(peerId);
+            if (peerId !== "node-failed" || !failFirst) return true;
+            started.resolve();
+            return retirement === "complete" ? false : ack.promise;
+          } })
+      });
+      cleanups.push(() => manager.close());
+      await manager.initialize();
+      fixture.dictionary.setEnabled(fixture.dictionary.snapshot().revision, true);
+      const failedPeer = fixture.peers.grantPeer({ expectedRevision: fixture.peers.configurationRevision(), peerId: "node-failed",
+        displayName: "Failed", publicKey: failedIdentity.publicKey, fingerprint: keyFingerprint(failedIdentity.publicKey) });
+      fixture.peers.grantPeer({ expectedRevision: fixture.peers.configurationRevision(), peerId: "node-healthy",
+        displayName: "Healthy", publicKey: healthyIdentity.publicKey, fingerprint: keyFingerprint(healthyIdentity.publicKey) });
+      await manager.syncNow();
+      online = true;
+      const rejected = trigger === "explicit"
+        ? expect(manager.syncNow()).rejects.toMatchObject({ code: retirement === "complete" ? "OFFLINE" : "UNAVAILABLE" })
+        : undefined;
+      if (trigger === "fallback") await vi.advanceTimersByTimeAsync(30 * 60_000);
+      await started.promise;
+
+      if (retirement === "complete") {
+        await rejected;
+        expect(attempts).toEqual(["node-failed", "node-healthy"]);
+        expect(messages.map(({ peerId, message }) => ({ peerId, requestReply: message.requestReply }))).toEqual([
+          { peerId: "node-failed", requestReply: true }, { peerId: "node-healthy", requestReply: true }
+        ]);
+        expect(fixture.peers.peer("node-failed")?.lastSyncAt).toBeUndefined();
+        expect(fixture.peers.peer("node-healthy")?.lastSyncAt).toBeDefined();
+        expect(manager.status()).toMatchObject({ phase: "error", errorCode: "sync_failed" });
+        failFirst = false;
+        await manager.syncNow();
+        expect(manager.status()).toMatchObject({ phase: "up_to_date" });
+        expect(manager.status().errorCode).toBeUndefined();
+      } else {
+        online = false;
+        if (retirement === "revoke") {
+          manager.revokePeer(failedPeer.peerId, failedPeer.revision);
+          fixture.peers.grantPeer({ expectedRevision: fixture.peers.configurationRevision(), peerId: failedPeer.peerId,
+            displayName: "Failed", publicKey: failedIdentity.publicKey, fingerprint: keyFingerprint(failedIdentity.publicKey) });
+          await manager.syncNow();
+        } else if (retirement === "disable") {
+          await manager.setEnabled(fixture.dictionary.snapshot().revision, false);
+        } else manager.close();
+        ack.resolve(false);
+        await rejected;
+        await vi.advanceTimersByTimeAsync(0);
+        expect(attempts).toEqual(["node-failed"]);
+        expect(fixture.peers.peer("node-healthy")?.lastSyncAt).toBeUndefined();
+        if (retirement === "close") expect(() => manager.status()).toThrow(/unavailable/u);
+        else {
+          expect(manager.status()).toMatchObject({ phase: retirement === "disable" ? "off" : "waiting" });
+          expect(manager.status().errorCode).toBeUndefined();
+        }
+      }
+    } finally { vi.useRealTimers(); }
+  });
 });
 
 async function localFixture(name: string) {

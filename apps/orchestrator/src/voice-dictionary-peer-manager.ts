@@ -183,11 +183,26 @@ export class VoiceDictionaryPeerManager {
   async syncNow(peerId?: string): Promise<void> {
     this.#assertReady();
     if (!this.#dictionary.snapshot().enabled) throw new VoiceDictionaryPeerManagerError("DISABLED", "Dictionary sharing is disabled.");
+    const generation = this.#generation;
     await this.#ensureTransport();
+    this.#assertSyncCurrent(generation);
     const online = this.#transport?.onlinePeerIds() ?? [];
     const peers = peerId === undefined ? this.#store.peers().filter((peer) => online.includes(peer.peerId)) : [this.#store.peer(peerId)];
     if (peerId !== undefined && (peers[0] === undefined || !online.includes(peerId))) throw offline();
-    for (const peer of peers) if (peer !== undefined) await this.#send(peer, true, true);
+    let failure: unknown;
+    let failed = false;
+    for (const peer of peers) if (peer !== undefined) {
+      this.#assertSyncCurrent(generation);
+      try { await this.#send(peer, true, true); }
+      catch (error) {
+        this.#assertSyncCurrent(generation);
+        if (peerId !== undefined) throw error;
+        if (!failed) failure = error;
+        failed = true;
+      }
+      this.#assertSyncCurrent(generation);
+    }
+    if (failed) { this.#failed(); throw failure; }
   }
 
   close(): void {
@@ -370,6 +385,10 @@ export class VoiceDictionaryPeerManager {
     return this.#dictionary.snapshot().enabled && current?.revision === peer.revision && current.publicKey === peer.publicKey;
   }
   #assertPeer(generation: number, peer: VoiceDictionaryPeerGrant): void { if (!this.#isCurrent(generation, peer)) throw unavailable(); }
+  #assertSyncCurrent(generation: number): void {
+    this.#assertReady();
+    if (generation !== this.#generation || !this.#enabled || !this.#dictionary.snapshot().enabled) throw unavailable();
+  }
   #assertReady(): void { if (this.#closed || !this.#initialized || this.#privateKey === undefined) throw unavailable(); }
   #retire(): void {
     this.#generation += 1;

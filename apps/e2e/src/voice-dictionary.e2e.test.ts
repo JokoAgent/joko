@@ -1,3 +1,7 @@
+import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
 import { create } from "@bufbuild/protobuf";
 import { Code } from "@connectrpc/connect";
 import {
@@ -10,9 +14,15 @@ import {
   GrantVoiceInputDictionaryPeerRequestSchema,
   SyncVoiceInputDictionaryNowRequestSchema,
   SetVoiceInputDictionarySyncEnabledRequestSchema,
-  VoiceInputDictionaryLearningActionType
+  VoiceInputDictionaryEntrySource,
+  VoiceInputDictionaryLearningActionType,
+  projectVoiceDictionaryReadOnly,
+  type VoiceDictionaryPeerStatusView,
+  type VoiceDictionaryReadOnlyView
 } from "@joko/contracts";
+import { createOrchestratorApplication, createPublicServer, type OrchestratorApplication, type OrchestratorConfig } from "@joko/orchestrator";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { createE2eClients, type E2eClients, type PairedClient } from "./connect-clients.js";
 import { OrchestratorE2eFixture } from "./fixture.js";
 
 describe("durable voice dictionary through authenticated generated RPCs", () => {
@@ -336,6 +346,241 @@ describe("durable voice dictionary through authenticated generated RPCs", () => 
     expect(phone.app.state.status).toBe("revoked");
   }, 60_000);
 
+  it("converges the production three-node bridge through offline conflicts, disable and renewed bilateral grants", async () => {
+    const { mobileNetwork } = await import(new URL("../../mobile/src/network.ts", import.meta.url).href);
+    const root = await mkdtemp(join(tmpdir(), "joko-dictionary-product-chain-"));
+    const running = new Set<ProductionDictionaryNode>();
+    const observations: ReturnType<typeof observeProductionDictionary>[] = [];
+    const phoneAbort = new AbortController();
+    const phoneStreams: Promise<void>[] = [];
+    let journeyFailed = false;
+    let journeyError: unknown;
+    const start = async (name: string) => {
+      const node = await ProductionDictionaryNode.start(join(root, name));
+      running.add(node);
+      return node;
+    };
+    try {
+      const a = await start("a");
+      let b = await start("b");
+      const c = await start("c");
+      const pairedA = await a.pair("Dictionary editor A");
+      const pairedB = await b.pair("Dictionary bridge B");
+      const pairedC = await c.pair("Dictionary phone C");
+      const apiA = pairedA.clients.voiceInput;
+      let apiB = pairedB.clients.voiceInput;
+      const credentialC = { profileId: "product-dictionary-c", origin: c.baseUrl, serverId: c.application.serverId,
+        connectionId: pairedC.connectionId, deviceId: pairedC.deviceId, displayName: "Dictionary phone C", authKey: pairedC.authKey };
+      const readA = async () => (await apiA.getVoiceInputDictionary({})).dictionary!;
+      const readB = async () => (await apiB.getVoiceInputDictionary({})).dictionary!;
+      const readC = () => mobileNetwork.getVoiceInputDictionary(credentialC);
+      const phoneContent = observedProjection<{ readonly revision: bigint; readonly refinementTerms: readonly string[] }>(
+        mobileNetwork.watchVoiceInputDictionary(credentialC, phoneAbort.signal), phoneAbort.signal);
+      const phoneReadonly = observedProjection<VoiceDictionaryReadOnlyView>(
+        mobileNetwork.watchVoiceInputDictionaryReadOnly(credentialC, phoneAbort.signal), phoneAbort.signal);
+      const phonePeers = observedProjection<VoiceDictionaryPeerStatusView>(
+        mobileNetwork.watchVoiceInputDictionaryPeerStatus(credentialC, phoneAbort.signal), phoneAbort.signal);
+      phoneStreams.push(phoneContent.done, phoneReadonly.done, phonePeers.done);
+      let bridgeObservation = observeProductionDictionary(apiB);
+      observations.push(bridgeObservation);
+
+      const initialA = (await apiA.addVoiceInputDictionaryTerms({ expectedRevision: (await readA()).revision,
+        terms: ["OfficeTerm", "DeleteMe", "Editable"] })).dictionary!;
+      await apiA.setVoiceInputDictionarySyncEnabled({ expectedRevision: initialA.revision, enabled: true });
+      await apiB.setVoiceInputDictionarySyncEnabled({ expectedRevision: (await readB()).revision, enabled: true });
+      const initialC = await mobileNetwork.addVoiceInputDictionaryTerms(credentialC, (await readC()).revision, ["PhoneTerm"]);
+      await mobileNetwork.setVoiceInputDictionarySyncEnabled(credentialC, initialC.revision, true);
+      await vi.waitFor(async () => {
+        const statuses = await Promise.all([apiA.getVoiceInputDictionaryPeerStatus({}), apiB.getVoiceInputDictionaryPeerStatus({})]);
+        const peersC = await mobileNetwork.getVoiceInputDictionaryPeerStatus(credentialC);
+        expect(statuses[0].status!.candidates.some((candidate) => candidate.nodeId === b.application.serverId)).toBe(true);
+        expect(statuses[1].status!.candidates.map((candidate) => candidate.nodeId)).toEqual(expect.arrayContaining([a.application.serverId, c.application.serverId]));
+        expect(peersC.candidates.some((candidate: { nodeId: string }) => candidate.nodeId === b.application.serverId)).toBe(true);
+      }, { timeout: 12_000, interval: 100 });
+      const identityA = (await apiA.getVoiceInputDictionaryPeerStatus({})).status!;
+      const identityB = (await apiB.getVoiceInputDictionaryPeerStatus({})).status!;
+      const identityC = await mobileNetwork.getVoiceInputDictionaryPeerStatus(credentialC);
+      const grant = async (api: E2eClients["voiceInput"], peerId: string, expectedFingerprint: string) => {
+        await vi.waitFor(async () => {
+          const current = (await api.getVoiceInputDictionaryPeerStatus({})).status!;
+          expect(current.candidates.some((candidate) => candidate.nodeId === peerId && candidate.fingerprint === expectedFingerprint)).toBe(true);
+        }, { timeout: 12_000, interval: 100 });
+        return api.grantVoiceInputDictionaryPeer({ expectedConfigurationRevision: (await api.getVoiceInputDictionaryPeerStatus({})).status!.configurationRevision,
+          peerId, expectedFingerprint });
+      };
+      const grantC = async () => {
+        await vi.waitFor(async () => {
+          const current = await mobileNetwork.getVoiceInputDictionaryPeerStatus(credentialC);
+          expect(current.candidates.some((candidate: { nodeId: string; fingerprint: string }) =>
+            candidate.nodeId === identityB.nodeId && candidate.fingerprint === identityB.fingerprint)).toBe(true);
+        }, { timeout: 12_000, interval: 100 });
+        const current = await mobileNetwork.getVoiceInputDictionaryPeerStatus(credentialC);
+        return mobileNetwork.grantVoiceInputDictionaryPeer(credentialC, current.configurationRevision, identityB.nodeId, identityB.fingerprint);
+      };
+      await grant(apiA, identityB.nodeId, identityB.fingerprint);
+      await grant(apiB, identityA.nodeId, identityA.fingerprint);
+      await grant(apiB, identityC.nodeId, identityC.fingerprint);
+      await grantC();
+
+      const converge = async (terms: readonly string[], evidence?: number) => {
+        await vi.waitFor(async () => {
+          const [dictionaryA, dictionaryB, dictionaryC] = await Promise.all([readA(), readB(), readC()]);
+          for (const dictionary of [dictionaryA, dictionaryB, dictionaryC]) expect(dictionary.refinementTerms.slice().sort()).toEqual(terms.slice().sort());
+          expect(a.application.voiceDictionary!.stateForSync()).toEqual(b.application.voiceDictionary!.stateForSync());
+          expect(c.application.voiceDictionary!.stateForSync()).toEqual(b.application.voiceDictionary!.stateForSync());
+          const readonlyA = projectVoiceDictionaryReadOnly((await apiA.getVoiceInputDictionaryReadOnly({})).dictionary);
+          const readonlyB = projectVoiceDictionaryReadOnly((await apiB.getVoiceInputDictionaryReadOnly({})).dictionary);
+          const readonlyC = await mobileNetwork.getVoiceInputDictionaryReadOnly(credentialC);
+          expect(readonlyA.entries).toEqual(readonlyB.entries); expect(readonlyC.entries).toEqual(readonlyB.entries);
+          expect(readonlyA.stateVector).toEqual(readonlyB.stateVector); expect(readonlyC.stateVector).toEqual(readonlyB.stateVector);
+          expect(phoneContent.latest).toEqual(dictionaryC); expect(phoneReadonly.latest).toEqual(readonlyC);
+          expect(bridgeObservation.content.latest?.dictionary).toEqual(dictionaryB);
+          expect(bridgeObservation.readonly.latest?.dictionary?.revision).toBe(dictionaryB.revision);
+          expect(phoneContent.error).toBeUndefined(); expect(phoneReadonly.error).toBeUndefined(); expect(phonePeers.error).toBeUndefined();
+          expect(bridgeObservation.content.error).toBeUndefined(); expect(bridgeObservation.readonly.error).toBeUndefined(); expect(bridgeObservation.peers.error).toBeUndefined();
+          if (evidence !== undefined) {
+            // The durable owner promotes two independent learning events to an automatic entry.
+            for (const dictionary of [dictionaryA, dictionaryB]) {
+              expect(dictionary.entries.find((entry) => entry.text === "Concurrent candidate")).toMatchObject({
+                source: VoiceInputDictionaryEntrySource.AUTOMATIC, frequency: BigInt(evidence),
+                aliases: [{ text: "concurrent spoken", count: BigInt(evidence) }]
+              });
+              expect(dictionary.candidates.some((candidate) => candidate.text === "Concurrent candidate")).toBe(false);
+            }
+            expect(dictionaryC.dictionary.entries.find((entry: { text: string }) => entry.text === "Concurrent candidate")).toMatchObject({
+              source: "automatic", frequency: evidence, aliases: [{ text: "concurrent spoken", count: evidence }]
+            });
+            expect(dictionaryC.dictionary.candidates.some((candidate: { text: string }) => candidate.text === "Concurrent candidate")).toBe(false);
+            expect(readonlyC.entries.find((entry: { text: string }) => entry.text === "Concurrent candidate")).toMatchObject({
+              frequency: evidence, aliases: [{ text: "concurrent spoken", count: evidence }]
+            });
+          }
+          const peersA = (await apiA.getVoiceInputDictionaryPeerStatus({})).status!;
+          const peersB = (await apiB.getVoiceInputDictionaryPeerStatus({})).status!;
+          const peersC = await mobileNetwork.getVoiceInputDictionaryPeerStatus(credentialC);
+          expect(peersA.peers.map((peer) => peer.peerId)).toEqual([identityB.nodeId]);
+          expect(peersB.peers.map((peer) => peer.peerId).sort()).toEqual([identityA.nodeId, identityC.nodeId].sort());
+          expect(peersC.peers.map((peer: { peerId: string }) => peer.peerId)).toEqual([identityB.nodeId]);
+          expect(phonePeers.latest?.configurationRevision).toBe(peersC.configurationRevision);
+          expect(bridgeObservation.peers.latest?.status?.configurationRevision).toBe(peersB.configurationRevision);
+        }, { timeout: 24_000, interval: 100 });
+      };
+      await converge(["DeleteMe", "Editable", "OfficeTerm", "PhoneTerm"]);
+      const autoForwarded = (await apiA.addVoiceInputDictionaryTerms({ expectedRevision: (await readA()).revision, terms: ["Across bridge"] })).dictionary!;
+      // No explicit sync: both A -> B and B -> C use the production eight-second debounce.
+      await converge(["Across bridge", "DeleteMe", "Editable", "OfficeTerm", "PhoneTerm"]);
+      expect((await readA()).revision).toBe(autoForwarded.revision);
+
+      const bridgeAuthority = (await apiB.getVoiceInputDictionaryPeerStatus({})).status!;
+      await b.close(); running.delete(b);
+      await dictionaryDeadline(bridgeObservation.done, 5_000);
+      expect(bridgeObservation.content.error).toBeUndefined(); expect(bridgeObservation.readonly.error).toBeUndefined(); expect(bridgeObservation.peers.error).toBeUndefined();
+      await expect(apiB.getVoiceInputDictionary({})).rejects.toMatchObject({ code: Code.Unavailable });
+      const [offlineA, offlineC] = await Promise.all([readA(), readC()]);
+      await Promise.all([
+        (async () => {
+          const deleted = (await apiA.deleteVoiceInputDictionaryEntry({ expectedRevision: offlineA.revision,
+            entryId: offlineA.entries.find((entry) => entry.text === "DeleteMe")!.entryId })).dictionary!;
+          await apiA.applyVoiceInputDictionaryLearning({ expectedRevision: deleted.revision,
+            actions: [{ action: VoiceInputDictionaryLearningActionType.ADD_CANDIDATE, term: "Concurrent candidate", aliases: ["concurrent spoken"] }] });
+        })(),
+        (async () => {
+          const edited = await mobileNetwork.editVoiceInputDictionaryEntry(credentialC, offlineC.revision,
+            offlineC.dictionary.entries.find((entry: { text: string }) => entry.text === "Editable")!.id, "Edited offline", ["offline alias"]);
+          await mobileNetwork.applyVoiceInputDictionaryLearning(credentialC, edited.revision, [
+            { action: "addEntry", term: "DeleteMe", aliases: [], type: "technicalTerm", confidence: "high" },
+            { action: "addCandidate", term: "Concurrent candidate", aliases: ["concurrent spoken"], type: "technicalTerm", confidence: "high" }
+          ]);
+        })()
+      ]);
+      expect((await readA()).refinementTerms).not.toContain("DeleteMe");
+      expect((await readC()).refinementTerms).toContain("DeleteMe");
+      b = await start("b"); apiB = b.clients(pairedB.authKey).voiceInput;
+      bridgeObservation = observeProductionDictionary(apiB); observations.push(bridgeObservation);
+      const restoredAuthority = (await apiB.getVoiceInputDictionaryPeerStatus({})).status!;
+      expect(restoredAuthority).toMatchObject({ nodeId: bridgeAuthority.nodeId, fingerprint: bridgeAuthority.fingerprint,
+        configurationRevision: bridgeAuthority.configurationRevision, enabled: true });
+      expect(restoredAuthority.peers.map(({ peerId, revision, fingerprint }) => ({ peerId, revision, fingerprint }))).toEqual(
+        bridgeAuthority.peers.map(({ peerId, revision, fingerprint }) => ({ peerId, revision, fingerprint })));
+      expect((await readB()).refinementTerms).toEqual(expect.arrayContaining(["Across bridge", "OfficeTerm", "PhoneTerm"]));
+      const mergedTerms = ["Across bridge", "Concurrent candidate", "Edited offline", "OfficeTerm", "PhoneTerm"];
+      await converge(mergedTerms, 2);
+      expect((await readC()).dictionary.entries.find((entry: { text: string }) => entry.text === "Edited offline").aliases).toMatchObject([{ text: "offline alias" }]);
+
+      const beforeDisable = await readB();
+      const disabled = (await apiB.setVoiceInputDictionarySyncEnabled({ expectedRevision: beforeDisable.revision, enabled: false })).dictionary!;
+      const disabledAuthority = (await apiB.getVoiceInputDictionaryPeerStatus({})).status!;
+      expect(disabledAuthority.peers.map((peer) => peer.peerId).sort()).toEqual([identityA.nodeId, identityC.nodeId].sort());
+      expect(disabled.entries).toEqual(beforeDisable.entries); expect(disabled.candidates).toEqual(beforeDisable.candidates);
+      await vi.waitFor(() => {
+        expect(bridgeObservation.content.latest?.dictionary).toEqual(disabled);
+        expect(bridgeObservation.readonly.latest?.dictionary).toMatchObject({ revision: disabled.revision, syncEnabled: false, entries: [] });
+        expect(bridgeObservation.peers.latest?.status).toMatchObject({ enabled: false, peers: expect.any(Array) });
+      });
+      const retained = (await apiB.addVoiceInputDictionaryTerms({ expectedRevision: disabled.revision, terms: ["Bridge while disabled"] })).dictionary!;
+      const endpointsBefore = [a.application.voiceDictionary!.stateForSync(), c.application.voiceDictionary!.stateForSync()];
+      await dictionaryIsolationWindow(() => {
+        expect(a.application.voiceDictionary!.stateForSync()).toEqual(endpointsBefore[0]);
+        expect(c.application.voiceDictionary!.stateForSync()).toEqual(endpointsBefore[1]);
+        expect(b.application.voiceDictionary!.snapshot().revision).toBe(Number(retained.revision));
+      });
+      await expect(apiB.syncVoiceInputDictionaryNow({ expectedConfigurationRevision: disabledAuthority.configurationRevision })).rejects.toMatchObject({ code: Code.FailedPrecondition });
+      await apiB.setVoiceInputDictionarySyncEnabled({ expectedRevision: retained.revision, enabled: true });
+      const enabledTerms = [...mergedTerms, "Bridge while disabled"];
+      await converge(enabledTerms, 2);
+
+      const beforeRevoke = (await apiB.getVoiceInputDictionaryPeerStatus({})).status!;
+      const oldGrant = beforeRevoke.peers.find((peer) => peer.peerId === identityC.nodeId)!;
+      const revoked = (await apiB.revokeVoiceInputDictionaryPeer({ peerId: identityC.nodeId, expectedGrantRevision: oldGrant.revision })).status!;
+      expect((await readB()).refinementTerms.slice().sort()).toEqual(enabledTerms.slice().sort());
+      const isolatedBridgeState = b.application.voiceDictionary!.stateForSync();
+      await mobileNetwork.addVoiceInputDictionaryTerms(credentialC, (await readC()).revision, ["Phone after revoke"]);
+      await dictionaryIsolationWindow(() => {
+        expect(b.application.voiceDictionary!.stateForSync()).toEqual(isolatedBridgeState);
+        expect((a.application.voiceDictionary!.snapshot().dictionary.entries).some((entry) => entry.text === "Phone after revoke")).toBe(false);
+      });
+      const statusC = await mobileNetwork.getVoiceInputDictionaryPeerStatus(credentialC);
+      await expect(mobileNetwork.syncVoiceInputDictionaryNow(credentialC, statusC.configurationRevision, identityB.nodeId)).rejects.toMatchObject({ code: Code.Unavailable });
+      await mobileNetwork.revokeVoiceInputDictionaryPeer(credentialC, identityB.nodeId, statusC.peers[0].revision);
+      await vi.waitFor(async () => {
+        const peersB = (await apiB.getVoiceInputDictionaryPeerStatus({})).status!;
+        const peersC = await mobileNetwork.getVoiceInputDictionaryPeerStatus(credentialC);
+        expect(peersB.candidates.some((candidate) => candidate.nodeId === identityC.nodeId)).toBe(true);
+        expect(peersC.candidates.some((candidate: { nodeId: string }) => candidate.nodeId === identityB.nodeId)).toBe(true);
+      }, { timeout: 12_000, interval: 100 });
+      const renewedB = (await grant(apiB, identityC.nodeId, identityC.fingerprint)).status!;
+      await grantC();
+      expect(renewedB.peers.find((peer) => peer.peerId === identityC.nodeId)!.revision).toBeGreaterThan(oldGrant.revision);
+      await expect(apiB.revokeVoiceInputDictionaryPeer({ peerId: identityC.nodeId, expectedGrantRevision: oldGrant.revision })).rejects.toMatchObject({ code: Code.Aborted });
+      await expect(apiB.syncVoiceInputDictionaryNow({ expectedConfigurationRevision: revoked.configurationRevision })).rejects.toMatchObject({ code: Code.Aborted });
+      const finalTerms = [...enabledTerms, "Phone after revoke"];
+      await converge(finalTerms, 2);
+      const stable = await Promise.all([readA(), readB(), readC()]);
+      for (let replay = 0; replay < 2; replay += 1) {
+        await apiB.syncVoiceInputDictionaryNow({ expectedConfigurationRevision: renewedB.configurationRevision });
+        const currentC = await mobileNetwork.getVoiceInputDictionaryPeerStatus(credentialC);
+        await mobileNetwork.syncVoiceInputDictionaryNow(credentialC, currentC.configurationRevision);
+      }
+      await converge(finalTerms, 2);
+      expect((await readA()).revision).toBe(stable[0].revision); expect((await readB()).revision).toBe(stable[1].revision);
+      expect((await readC()).revision).toBe(stable[2].revision);
+    } catch (error) {
+      journeyFailed = true; journeyError = error;
+      throw error;
+    } finally {
+      phoneAbort.abort();
+      const streams = await Promise.allSettled([dictionaryDeadline(Promise.all(phoneStreams), 5_000), ...observations.map((observation) => observation.close())]);
+      const closed = await Promise.allSettled([...running].map((node) => node.close()));
+      const removed = await Promise.allSettled([rm(root, { recursive: true, force: true, maxRetries: 3 })]);
+      const failures = [...streams, ...closed, ...removed].filter((result) => result.status === "rejected").map((result) => result.reason);
+      if (failures.length > 0) {
+        if (journeyFailed) throw new AggregateError([journeyError, ...failures],
+          `Production dictionary journey failed: ${journeyError instanceof Error ? journeyError.message : String(journeyError)}; cleanup also failed.`, { cause: journeyError });
+        throw new AggregateError(failures, "Production dictionary cleanup failed.");
+      }
+    }
+  }, 150_000);
+
   it("drains both idle dictionary projections immediately on public server shutdown", async () => {
     fixture = await OrchestratorE2eFixture.start({ dictionaryPeerNodeId: "e2e-dictionary-shutdown", keepRoot: true });
     const paired = await fixture.pair("Live dictionary observer");
@@ -363,4 +608,109 @@ function observedProjection<T>(stream: AsyncIterable<T>, signal: AbortSignal) {
     catch (cause) { if (!signal.aborted) error = cause; }
   })();
   return { done, get first() { return first; }, get latest() { return latest; }, get error() { return error; } };
+}
+
+function observeProductionDictionary(api: E2eClients["voiceInput"]) {
+  const abort = new AbortController();
+  const content = observedProjection(api.watchVoiceInputDictionary({}, { signal: abort.signal, timeoutMs: 0 }), abort.signal);
+  const readOnly = observedProjection(api.watchVoiceInputDictionaryReadOnly({}, { signal: abort.signal, timeoutMs: 0 }), abort.signal);
+  const peers = observedProjection(api.watchVoiceInputDictionaryPeerStatus({}, { signal: abort.signal, timeoutMs: 0 }), abort.signal);
+  const done = Promise.all([content.done, readOnly.done, peers.done]);
+  return { content, readonly: readOnly, peers, done,
+    close: async () => { abort.abort(); await dictionaryDeadline(done, 5_000); } };
+}
+
+async function dictionaryIsolationWindow(assertUnchanged: () => void): Promise<void> {
+  const begun = Date.now();
+  await vi.waitFor(() => {
+    assertUnchanged();
+    expect(Date.now() - begun).toBeGreaterThanOrEqual(8_500);
+  }, { timeout: 10_000, interval: 100 });
+}
+
+async function dictionaryDeadline<T>(operation: Promise<T>, milliseconds: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([operation, new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => reject(new Error("Production dictionary cleanup exceeded its deadline.")), milliseconds);
+    })]);
+  } finally { if (timer !== undefined) clearTimeout(timer); }
+}
+
+/** Starts the actual application composition; dictionary timing, codec and transport are never substituted. */
+class ProductionDictionaryNode {
+  readonly application: OrchestratorApplication;
+  readonly baseUrl: string;
+  readonly #server: Awaited<ReturnType<typeof createPublicServer>>;
+  readonly #pairingCodes: ReadonlyMap<string, string>;
+  readonly #removePairingListener: () => void;
+  #closing?: Promise<void>;
+
+  private constructor(input: { application: OrchestratorApplication; baseUrl: string;
+    server: Awaited<ReturnType<typeof createPublicServer>>; pairingCodes: ReadonlyMap<string, string>; removePairingListener: () => void }) {
+    this.application = input.application; this.baseUrl = input.baseUrl; this.#server = input.server;
+    this.#pairingCodes = input.pairingCodes; this.#removePairingListener = input.removePairingListener;
+  }
+
+  static async start(root: string): Promise<ProductionDictionaryNode> {
+    const workspace = join(root, "workspace");
+    const dataDirectory = join(root, "data");
+    await mkdir(workspace, { recursive: true });
+    const config: OrchestratorConfig = {
+      host: "127.0.0.1", port: 0, internalPort: 4317,
+      publicOrigin: "http://127.0.0.1", internalOrigin: "http://127.0.0.1:4317",
+      dataDirectory, databasePath: join(dataDirectory, "orchestrator.db"),
+      allowInsecureLoopback: true, allowInsecureLan: false, lanDiscoveryEnabled: false,
+      piExecutable: join(root, "missing-pi"), codexExecutable: join(root, "missing-codex"), claudeCodeExecutable: join(root, "missing-claude"),
+      piAgentHome: join(dataDirectory, "pi-agent-home"),
+      workspace: { id: "workspace-dictionary-product", root: workspace, displayName: "Dictionary product", trusted: true },
+      artifactDirectory: join(dataDirectory, "artifacts"), webDirectory: join(root, "unused-web"), corsOrigins: []
+    };
+    let application: OrchestratorApplication | undefined;
+    let server: Awaited<ReturnType<typeof createPublicServer>> | undefined;
+    let removePairingListener: (() => void) | undefined;
+    try {
+      application = await createOrchestratorApplication(config);
+      const pairingCodes = new Map<string, string>();
+      removePairingListener = application.connections.onPairingIssued((challenge) => pairingCodes.set(challenge.id, challenge.code));
+      application.connections.openPairingWindow();
+      server = await createPublicServer(application);
+      server.log.level = "silent";
+      const baseUrl = await server.listen({ host: "127.0.0.1", port: 0 });
+      return new ProductionDictionaryNode({ application, baseUrl, server, pairingCodes, removePairingListener });
+    } catch (error) {
+      removePairingListener?.();
+      await server?.close().catch(() => undefined);
+      await application?.close().catch(() => undefined);
+      throw error;
+    }
+  }
+
+  clients(authKey: string): E2eClients { return createE2eClients(this.baseUrl, authKey, 15_000); }
+
+  async pair(displayName: string): Promise<PairedClient> {
+    const anonymous = createE2eClients(this.baseUrl);
+    const begun = await anonymous.connection.beginPairing({ deviceDisplayName: displayName, deviceKind: DeviceKind.MOBILE,
+      platform: "android", appVersion: "dictionary-product-e2e" });
+    const challengeId = begun.challenge?.challengeId;
+    const humanCode = challengeId === undefined ? undefined : this.#pairingCodes.get(challengeId);
+    if (challengeId === undefined || humanCode === undefined) throw new Error("Production dictionary pairing did not issue its trusted challenge.");
+    const completed = await anonymous.connection.completePairing({ challengeId, humanCode, deviceDisplayName: displayName,
+      deviceKind: DeviceKind.MOBILE, platform: "android", appVersion: "dictionary-product-e2e" });
+    const authKey = completed.result?.authKey;
+    const connectionId = completed.result?.connection?.connectionId;
+    const deviceId = completed.result?.device?.deviceId;
+    if (!authKey || !connectionId || !deviceId) throw new Error("Production dictionary pairing returned no Connection authority.");
+    return { authKey, connectionId, deviceId, clients: this.clients(authKey) };
+  }
+
+  close(): Promise<void> {
+    if (this.#closing !== undefined) return this.#closing;
+    this.#removePairingListener();
+    this.#closing = (async () => {
+      try { await dictionaryDeadline(this.#server.close(), 8_000); }
+      finally { await dictionaryDeadline(this.application.close(), 8_000); }
+    })();
+    return this.#closing;
+  }
 }
