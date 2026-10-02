@@ -220,6 +220,8 @@ import {
 } from "./mobile-app-commands";
 import type { MobileVoiceTransport } from "./mobile-voice-input";
 import type { MobileVoiceDictionaryTransport } from "./mobile-voice-dictionary-service";
+import { mobileReadOnlyDictionaryScope, type MobileReadOnlyDictionaryTransport } from "./mobile-voice-dictionary-readonly";
+import type { MobileVoiceDictionaryReadOnlyCache } from "./mobile-voice-dictionary-readonly-cache";
 import {
   assertMobileNativeTreeNavigation,
   projectMobileNativeTree,
@@ -659,7 +661,8 @@ export class MobileClient {
     private readonly pdfPreviewFiles?: MobilePdfPreviewFiles,
     private readonly modelPreviewFiles?: MobileModelPreviewFiles,
     private readonly fileShare?: Pick<MobileFileShare, "perform">,
-    private readonly offlineCache?: Pick<MobileOfflineCache, "load" | "save" | "clear">
+    private readonly offlineCache?: Pick<MobileOfflineCache, "load" | "save" | "clear">,
+    private readonly readOnlyDictionaryCache?: Pick<MobileVoiceDictionaryReadOnlyCache, "clear">
   ) {}
 
   get state(): MobileState { return this.#state; }
@@ -1322,9 +1325,10 @@ export class MobileClient {
   }
 
   async #clearOfflineCache(profileId: string): Promise<string | undefined> {
-    if (!this.offlineCache) return undefined;
     try {
-      await this.offlineCache.clear(profileId);
+      const results = await Promise.allSettled([this.offlineCache?.clear(profileId), this.readOnlyDictionaryCache?.clear(profileId)]);
+      const failed = results.find((result) => result.status === "rejected");
+      if (failed?.status === "rejected") throw failed.reason;
       return undefined;
     } catch (error) {
       return `The saved offline content could not be cleared: ${message(error)}`;
@@ -6138,6 +6142,107 @@ export class MobileClient {
     } catch {
       return false;
     }
+  }
+
+  async voiceDictionaryReadOnlyTransport(profileId: string, signal: AbortSignal): Promise<MobileReadOnlyDictionaryTransport> {
+    const profile = this.#profiles.find((candidate) => candidate.profileId === profileId);
+    if (!profile) throw new Error("The saved dictionary source is no longer available.");
+    const scope = mobileReadOnlyDictionaryScope(profile);
+    const connectionEpoch = this.#connectionAttemptEpoch;
+    let retired = false;
+    const isCurrent = (): boolean => !retired && !signal.aborted && !this.#disposed && this.#foreground
+      && this.#connectionAttemptEpoch === connectionEpoch
+      && this.#profiles.some((candidate) => mobileReadOnlyDictionaryScope(candidate) === scope)
+      && !this.#state.saved.some((candidate) => candidate.profileId === profileId
+        && ["missing", "unreadable", "identity-conflict"].includes(candidate.credentialState));
+    const assertCurrent = (): void => { if (!isCurrent()) throw new Error("The read-only dictionary source changed or was cancelled."); };
+    const owned = async <T>(caller: AbortSignal | undefined, effect: (request: AbortSignal) => Promise<T>): Promise<T> => {
+      const request = new AbortController();
+      const cancel = (): void => request.abort();
+      assertCurrent();
+      if (caller?.aborted) cancel(); else caller?.addEventListener("abort", cancel, { once: true });
+      signal.addEventListener("abort", cancel, { once: true });
+      const unsubscribe = this.subscribe(() => { if (!isCurrent()) { retired = true; cancel(); } });
+      try { request.signal.throwIfAborted(); const value = await effect(request.signal); request.signal.throwIfAborted(); assertCurrent(); return value; }
+      finally { cancel(); unsubscribe(); signal.removeEventListener("abort", cancel); caller?.removeEventListener("abort", cancel); }
+    };
+    const invalidate = async (error: unknown): Promise<void> => {
+      if (!isCurrent() || (!isRevoked(error) && !(error instanceof CredentialIdentityError))) return;
+      if (this.#activeProfileId === profileId && this.#credential) {
+        if (isRevoked(error)) await this.#invalidateCredential(this.#epoch, profileId, "The dictionary source connection was revoked.");
+        else await this.#identityConflict(this.#epoch, profileId, "The saved dictionary source identity changed.");
+        return;
+      }
+      const cleanup = await this.#clearOfflineCache(profileId);
+      if (!isCurrent()) return;
+      let credentialFailure: string | undefined;
+      if (isRevoked(error)) {
+        try { await this.storage.deleteCredential(profileId); }
+        catch { credentialFailure = "The retired dictionary credential could not be cleared."; }
+      }
+      if (!isCurrent()) return;
+      const detail = ["The saved dictionary source must be paired again.", cleanup, credentialFailure].filter(Boolean).join(" ");
+      this.#set({ saved: this.#savedViews(profileId, isRevoked(error) ? credentialFailure ? "unavailable" : "missing" : "identity-conflict", detail) });
+      retired = true;
+    };
+    let node: NodeIdentity;
+    let credential: PairedCredential;
+    let generation: bigint;
+    try {
+      const proven = await owned(signal, async (request) => {
+        const observed = await this.network.inspect(profile.origin, request);
+        assertCurrent();
+        if (observed.serverId !== profile.serverId) throw new CredentialIdentityError();
+        const saved = await this.storage.loadCredential(profileId);
+        request.throwIfAborted(); assertCurrent();
+        if (!saved || !credentialMatchesProfile(saved, profile)) throw new CredentialIdentityError();
+        const owner = await this.network.readOwner(saved, request);
+        assertCurrent(); this.#assertOwner(saved, owner, observed);
+        if (owner.snapshot.connections.filter((item) => item.connectionId === saved.connectionId).length !== 1
+          || owner.snapshot.devices.filter((item) => item.deviceId === saved.deviceId).length !== 1
+          || !owner.device.connectionIds.includes(saved.connectionId)
+          || !owner.snapshot.devices.find((item) => item.deviceId === saved.deviceId)!.connectionIds.includes(saved.connectionId)
+          || owner.snapshot.generation < 1n) throw new CredentialIdentityError();
+        return { node: observed, credential: Object.freeze({ profileId: saved.profileId, origin: saved.origin,
+          serverId: saved.serverId, connectionId: saved.connectionId, deviceId: saved.deviceId,
+          displayName: saved.displayName, authKey: saved.authKey }), generation: owner.snapshot.generation };
+      });
+      ({ node, credential, generation } = proven);
+    } catch (error) { await invalidate(error); throw error; }
+    const subscribe = this.subscribe.bind(this);
+    const network = this.network;
+    const recheck = async (request: AbortSignal): Promise<void> => {
+      const owner = await network.readOwner(credential, request);
+      assertCurrent(); this.#assertOwner(credential, owner, node);
+      if (owner.snapshot.generation !== generation) throw new Error("The dictionary source generation changed. Refresh to revalidate it.");
+    };
+    return {
+      profile: { profileId: profile.profileId, origin: profile.origin, serverId: profile.serverId,
+        connectionId: profile.connectionId, deviceId: profile.deviceId, displayName: node.displayName },
+      ownerKey: `${scope}\u001f${generation}\u001f${connectionEpoch}\u001fread-only-dictionary`, isCurrent,
+      getVoiceInputDictionaryReadOnly: async (caller) => {
+        try { return await owned(caller, (request) => network.getVoiceInputDictionaryReadOnly(credential, request)); }
+        catch (error) { await invalidate(error); throw error; }
+      },
+      watchVoiceInputDictionaryReadOnly: (caller) => (async function* () {
+        const request = new AbortController();
+        const cancel = (): void => request.abort();
+        assertCurrent();
+        if (caller.aborted) cancel(); else caller.addEventListener("abort", cancel, { once: true });
+        signal.addEventListener("abort", cancel, { once: true });
+        const unsubscribe = subscribe(() => { if (!isCurrent()) { retired = true; cancel(); } });
+        try {
+          for await (const value of network.watchVoiceInputDictionaryReadOnly(credential, request.signal)) {
+            request.signal.throwIfAborted(); assertCurrent(); yield value;
+          }
+          request.signal.throwIfAborted(); assertCurrent();
+          // A revoked idle Watch may close normally. Prove its original owner before retaining a cache.
+          await recheck(request.signal);
+          throw new Error("The read-only dictionary stream ended.");
+        } catch (error) { await invalidate(error); throw error; }
+        finally { cancel(); unsubscribe(); caller.removeEventListener("abort", cancel); signal.removeEventListener("abort", cancel); }
+      })()
+    };
   }
 
   voiceDictionaryTransport(): MobileVoiceDictionaryTransport | undefined {

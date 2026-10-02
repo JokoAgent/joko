@@ -62,6 +62,8 @@ export interface FixtureOptions {
   readonly backendFactories?: readonly BackendInstanceFactory[];
   readonly keepRoot?: boolean;
   readonly dictionaryPeerNodeId?: string;
+  /** Rebind the same public address for paired-client restart and offline-cache journeys. */
+  readonly publicPort?: number;
   readonly terminals?: OrchestratorApplication["terminals"];
   readonly createAuxiliaryServices?: (
     store: OperationalStore,
@@ -484,7 +486,9 @@ export class OrchestratorE2eFixture {
     };
     const server = await createPublicServer(application);
     server.log.level = "silent";
-    await server.listen({ host: "127.0.0.1", port: 0 });
+    const publicPort = options.publicPort ?? 0;
+    if (!Number.isInteger(publicPort) || publicPort < 0 || publicPort > 65_535) throw new Error("Invalid fixture public port.");
+    await server.listen({ host: "127.0.0.1", port: publicPort });
     const address = server.server.address();
     if (address === null || typeof address === "string") throw new Error("Fastify did not expose an ephemeral TCP port.");
     const baseUrl = `http://127.0.0.1:${address.port}`;

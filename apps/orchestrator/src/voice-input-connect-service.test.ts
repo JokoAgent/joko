@@ -41,6 +41,7 @@ describe("VoiceInputService", () => {
     const dictionary = {
       subscribe: vi.fn(() => () => undefined),
       snapshot: vi.fn(() => dictionarySnapshot),
+      readOnlySnapshot: vi.fn(() => readOnlyVoiceSnapshot(dictionarySnapshot)),
       setEnabled: vi.fn((_revision: number, enabled: boolean) => (dictionarySnapshot = { ...dictionarySnapshot, revision: dictionarySnapshot.revision + 1, enabled })),
       addManualTerms: vi.fn(() => (dictionarySnapshot = { ...dictionarySnapshot, revision: dictionarySnapshot.revision + 1 })),
       editEntry: vi.fn(() => (dictionarySnapshot = { ...dictionarySnapshot, revision: dictionarySnapshot.revision + 1 })),
@@ -176,6 +177,7 @@ describe("VoiceInputService", () => {
     const dictionary = {
       subscribe: vi.fn(() => () => undefined),
       snapshot: method,
+      readOnlySnapshot: method,
       setEnabled: method,
       addManualTerms: method,
       editEntry: method,
@@ -191,7 +193,7 @@ describe("VoiceInputService", () => {
 
   it("fences unauthenticated, cancelled, malformed and stale dictionary mutations", async () => {
     const method = vi.fn(() => voiceDictionarySnapshot());
-    const dictionary = { subscribe: vi.fn(() => () => undefined), snapshot: method, setEnabled: method, addManualTerms: method, editEntry: method, deleteEntry: method, applyLearning: method };
+    const dictionary = { subscribe: vi.fn(() => () => undefined), snapshot: method, readOnlySnapshot: () => readOnlyVoiceSnapshot(voiceDictionarySnapshot()), setEnabled: method, addManualTerms: method, editEntry: method, deleteEntry: method, applyLearning: method };
     const context = { signal: new AbortController().signal } as HandlerContext;
     const rejected = createVoiceInputConnectService(undefined, undefined, dictionary, () => { throw new ConnectError("Pair first.", Code.Unauthenticated); });
     await expect(rejected.applyVoiceInputDictionaryLearning(create(contract.ApplyVoiceInputDictionaryLearningRequestSchema, {
@@ -276,7 +278,7 @@ describe("authenticated dictionary peer contract", () => {
     let changed = (): void => undefined;
     const unsubscribe = vi.fn();
     const unused = vi.fn(() => value);
-    const dictionary = { snapshot: () => value, setEnabled: unused, addManualTerms: unused, editEntry: unused,
+    const dictionary = { snapshot: () => value, readOnlySnapshot: () => readOnlyVoiceSnapshot(value), setEnabled: unused, addManualTerms: unused, editEntry: unused,
       deleteEntry: unused, applyLearning: unused, subscribe: vi.fn((listener: () => void) => {
         changed = listener;
         value = { ...value, revision: 5 }; // A change at subscribe must be part of the initial read.
@@ -300,6 +302,18 @@ describe("authenticated dictionary peer contract", () => {
     expect(await draining).toMatchObject({ done: true });
     expect(context.signal.aborted).toBe(false);
     expect(unsubscribe).toHaveBeenCalledTimes(2);
+    const readonlyAbort = new AbortController();
+    const readonlyWatch = service.watchVoiceInputDictionaryReadOnly(create(contract.WatchVoiceInputDictionaryReadOnlyRequestSchema),
+      { signal: readonlyAbort.signal } as HandlerContext)[Symbol.asyncIterator]();
+    const initial = create(contract.WatchVoiceInputDictionaryReadOnlyResponseSchema, (await readonlyWatch.next()).value).dictionary;
+    expect(contract.projectVoiceDictionaryReadOnly(initial)).toMatchObject({ revision: 5n, syncEnabled: true, entries: [{ text: "Joko" }] });
+    value = { ...value, revision: 31, enabled: false }; changed();
+    const off = create(contract.WatchVoiceInputDictionaryReadOnlyResponseSchema, (await readonlyWatch.next()).value).dictionary;
+    expect(contract.projectVoiceDictionaryReadOnly(off)).toMatchObject({ revision: 31n, syncEnabled: false, entries: [], stateVector: { "voice-replica-rpc": "0000000000.0001.voice-replica-rpc" } });
+    await expect(service.getVoiceInputDictionaryReadOnly(create(contract.GetVoiceInputDictionaryReadOnlyRequestSchema), context))
+      .resolves.toMatchObject({ dictionary: { revision: 31n, entries: [] } });
+    readonlyAbort.abort(); await readonlyWatch.next();
+    expect(unsubscribe).toHaveBeenCalledTimes(3);
   });
 
   it("closes an idle peer watch on revocation and checks authority again before every published status", async () => {
@@ -327,6 +341,11 @@ describe("authenticated dictionary peer contract", () => {
       .rejects.toMatchObject({ code: Code.Unauthenticated });
   });
 });
+
+function readOnlyVoiceSnapshot(value: VoiceDictionarySyncSnapshot) {
+  return { revision: value.revision, enabled: value.enabled, entries: value.enabled ? value.dictionary.entries : [],
+    stateVector: { "voice-replica-rpc": "0000000000.0001.voice-replica-rpc" } };
+}
 
 function voiceDictionarySnapshot(): VoiceDictionarySyncSnapshot {
   return {

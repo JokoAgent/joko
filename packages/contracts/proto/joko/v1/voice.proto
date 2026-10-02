@@ -172,6 +172,35 @@ message VoiceInputDictionarySnapshot {
   repeated string refinement_terms = 6;
 }
 
+// Read-only sharing projection, distinct from the editable node dictionary.
+// Disabling sharing empties entries, not the causal vector or durable revision.
+message VoiceInputDictionaryReadOnlyAlias {
+  string text = 1;
+  uint64 count = 2;
+}
+
+message VoiceInputDictionaryReadOnlyEntry {
+  string text = 1;
+  uint64 frequency = 2;
+  repeated VoiceInputDictionaryReadOnlyAlias aliases = 3;
+}
+
+message VoiceInputDictionaryStateVersion {
+  string node_id = 1;
+  string stamp = 2;
+}
+
+message VoiceInputDictionaryStateVector {
+  repeated VoiceInputDictionaryStateVersion versions = 1;
+}
+
+message VoiceInputDictionaryReadOnlySnapshot {
+  uint64 revision = 1;
+  bool sync_enabled = 2;
+  repeated VoiceInputDictionaryReadOnlyEntry entries = 3;
+  VoiceInputDictionaryStateVector state_vector = 4;
+}
+
 enum VoiceInputDictionaryPeerPhase {
   VOICE_INPUT_DICTIONARY_PEER_PHASE_UNSPECIFIED = 0;
   VOICE_INPUT_DICTIONARY_PEER_PHASE_OFF = 1;

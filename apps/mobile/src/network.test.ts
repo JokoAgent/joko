@@ -25,6 +25,7 @@ import {
   GetVoiceInputDictionaryResponseSchema,
   WatchVoiceInputDictionaryResponseSchema,
   WatchVoiceInputDictionaryPeerStatusResponseSchema,
+  WatchVoiceInputDictionaryReadOnlyResponseSchema,
   VoiceInputDictionaryPeerPhase,
   SetVoiceInputDictionarySyncEnabledResponseSchema,
   AddVoiceInputDictionaryTermsResponseSchema,
@@ -61,29 +62,37 @@ import {
 import { projectMobileVoiceDictionarySnapshot, mobileVoiceDictionaryLearningRequest } from "./mobile-voice-dictionary-service";
 
 describe("mobile voice ephemeral requests", () => {
-  it.each(["content", "sharing"] as const)("decodes the generated %s stream and cancels its HTTP owner after a duplicate sequence or consumer return", async (kind) => {
+  it.each(["content", "sharing", "readonly"] as const)("decodes the generated %s stream and cancels its HTTP owner after a duplicate sequence or consumer return", async (kind) => {
     const signals: AbortSignal[] = [];
     const credential: PairedCredential = { profileId: "voice-profile", origin: "https://node.example", serverId: "voice-server", connectionId: "voice-connection", deviceId: "voice-device", displayName: "Voice phone", authKey: "voice-test-key" };
     const content = create(WatchVoiceInputDictionaryResponseSchema, { sequence: 1n, dictionary: dictionaryWireSnapshot() });
     const sharing = create(WatchVoiceInputDictionaryPeerStatusResponseSchema, { sequence: 1n, status: { available: true,
       configurationRevision: 3n, nodeId: "voice-server", fingerprint: "a".repeat(64), enabled: true, phase: VoiceInputDictionaryPeerPhase.WAITING } });
-    const message = kind === "content" ? toBinary(WatchVoiceInputDictionaryResponseSchema, content) : toBinary(WatchVoiceInputDictionaryPeerStatusResponseSchema, sharing);
+    const readonly = create(WatchVoiceInputDictionaryReadOnlyResponseSchema, { sequence: 1n, dictionary: {
+      revision: 4n, syncEnabled: false, entries: [], stateVector: { versions: [{ nodeId: "a", stamp: "0000000001.0000.a" }] }
+    } });
+    const message = kind === "content" ? toBinary(WatchVoiceInputDictionaryResponseSchema, content)
+      : kind === "sharing" ? toBinary(WatchVoiceInputDictionaryPeerStatusResponseSchema, sharing)
+        : toBinary(WatchVoiceInputDictionaryReadOnlyResponseSchema, readonly);
     const frame = new Uint8Array(5 + message.byteLength);
     new DataView(frame.buffer).setUint32(1, message.byteLength); frame.set(message, 5);
     const fetch = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
       const request = new Request(input, init); signals.push(request.signal);
       expect(request.headers.get("authorization")).toBe("Bearer voice-test-key");
-      expect(request.url).toMatch(kind === "content" ? /\/WatchVoiceInputDictionary$/u : /\/WatchVoiceInputDictionaryPeerStatus$/u);
+      expect(request.url).toMatch(kind === "content" ? /\/WatchVoiceInputDictionary$/u
+        : kind === "sharing" ? /\/WatchVoiceInputDictionaryPeerStatus$/u : /\/WatchVoiceInputDictionaryReadOnly$/u);
       return new Response(new ReadableStream<Uint8Array>({ start(controller) {
         controller.enqueue(frame); controller.enqueue(frame);
         request.signal.addEventListener("abort", () => controller.close(), { once: true });
       } }), { status: 200, headers: { "content-type": "application/connect+proto" } });
     });
     const request = new AbortController();
-    const watch = () => kind === "content" ? mobileNetwork.watchVoiceInputDictionary(credential, request.signal) : mobileNetwork.watchVoiceInputDictionaryPeerStatus(credential, request.signal);
+    const watch = () => kind === "content" ? mobileNetwork.watchVoiceInputDictionary(credential, request.signal)
+      : kind === "sharing" ? mobileNetwork.watchVoiceInputDictionaryPeerStatus(credential, request.signal)
+        : mobileNetwork.watchVoiceInputDictionaryReadOnly(credential, request.signal);
     try {
       const stream = watch()[Symbol.asyncIterator]();
-      await expect(stream.next()).resolves.toMatchObject({ done: false, value: kind === "content" ? { revision: 4n } : { configurationRevision: 3n } });
+      await expect(stream.next()).resolves.toMatchObject({ done: false, value: kind === "sharing" ? { configurationRevision: 3n } : { revision: 4n } });
       await expect(stream.next()).rejects.toThrow(/invalid/u);
       expect(signals[0]!.aborted).toBe(true);
       const resumed = watch()[Symbol.asyncIterator]();

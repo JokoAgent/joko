@@ -42,6 +42,7 @@ export interface MobileVoiceDictionaryScreenProps {
   readonly onAddTerm: (value: string) => Promise<void>;
   readonly onEditEntry: (id: string, text: string, aliases: string, revision: bigint) => Promise<MobileVoiceDictionaryEditOutcome>;
   readonly onDeleteEntry: (id: string, revision: bigint) => Promise<void>;
+  readonly onReadOnlyDictionary?: () => void;
 }
 
 interface Editor {
@@ -226,6 +227,8 @@ export function MobileVoiceDictionaryScreen(props: MobileVoiceDictionaryScreenPr
     <Text style={[styles.title, { color: colors.ink }]}>{t("settings.voice.title")}</Text>
     <Text style={[styles.description, { color: colors.muted }]}>{t("settings.voice.description")}</Text>
     <Notice colors={colors} text={t("settings.voice.privacy")} />
+    {props.onReadOnlyDictionary && <Button label={t("settings.voiceReadonly.title")} colors={colors}
+      onPress={props.onReadOnlyDictionary} />}
 
     <Text style={[styles.section, { color: colors.muted }]}>{t("settings.voice.instructions")}</Text>
     <Text style={[styles.caption, { color: colors.muted }]}>{t("settings.voice.instructionsHint")}</Text>

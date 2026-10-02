@@ -3,6 +3,7 @@ import {
   DEFAULT_MATERIALIZE_LIMITS,
   MAX_AUTOMATIC_CANDIDATE_RECORDS,
   addManualEntry,
+  buildStateVersionVector,
   createEmptySyncState,
   createHlcClock,
   deleteTerms,
@@ -75,6 +76,17 @@ export interface VoiceDictionaryLearningMutation {
   readonly text: string;
   readonly aliases: readonly string[];
   readonly stage: "candidate" | "entry";
+}
+
+export interface VoiceDictionaryReadOnlySnapshot {
+  readonly revision: number;
+  readonly enabled: boolean;
+  readonly entries: readonly {
+    readonly text: string;
+    readonly frequency: number;
+    readonly aliases: readonly { readonly text: string; readonly count: number }[];
+  }[];
+  readonly stateVector: Readonly<Record<string, string>>;
 }
 
 export type VoiceDictionarySyncRepositoryErrorCode = "INVALID" | "CONFLICT" | "UNAVAILABLE";
@@ -161,6 +173,20 @@ export class VoiceDictionarySyncRepository {
   snapshot(): VoiceDictionarySyncSnapshot {
     this.#assertAvailable();
     return snapshotOf(this.#document);
+  }
+
+  readOnlySnapshot(): VoiceDictionaryReadOnlySnapshot {
+    this.#assertAvailable();
+    const document = this.#document;
+    return {
+      revision: document.revision,
+      enabled: document.enabled,
+      entries: document.enabled ? materializeDictionary(document.state).entries.map((entry) => ({
+        text: entry.text, frequency: entry.frequency,
+        aliases: entry.aliases.map((alias) => ({ text: alias.text, count: alias.count }))
+      })) : [],
+      stateVector: buildStateVersionVector(document.state)
+    };
   }
 
   subscribe(listener: () => void): () => void {

@@ -41,6 +41,7 @@ import { MobileComposerDraftStore } from "./composer-draft-store";
 import { MobileNewTaskDraftStore } from "./new-task-draft-store";
 import { EMPTY_MOBILE_VOICE_DICTIONARY } from "./mobile-voice-dictionary";
 import { dictionaryWatchFixture, idleDictionaryWatch } from "./test/voice-dictionary-watch";
+import { readOnlyValue } from "./test/voice-dictionary-readonly";
 import { MobileAttachmentFiles, type MobileAttachmentFileDriver } from "./mobile-attachment-files";
 import {
   MobileMediaPreviewFiles,
@@ -993,6 +994,8 @@ function fakeNetwork(): MobileNetwork {
     uploadBlob: vi.fn(async () => { throw new Error("No Blob upload fixture was configured."); }),
     getVoiceInputCapabilities: vi.fn(async () => { throw new Error("No Voice capability fixture was configured."); }),
     getVoiceInputDictionary: vi.fn(async () => { throw new Error("No Voice dictionary fixture was configured."); }),
+    getVoiceInputDictionaryReadOnly: vi.fn(async () => { throw new Error("No read-only dictionary fixture was configured."); }),
+    watchVoiceInputDictionaryReadOnly: vi.fn((_credential: PairedCredential, signal: AbortSignal) => idleDictionaryWatch(signal)),
     watchVoiceInputDictionary: vi.fn((_credential: PairedCredential, signal: AbortSignal) => idleDictionaryWatch(signal)),
     getVoiceInputDictionaryPeerStatus: vi.fn(async () => { throw new Error("No dictionary sharing fixture was configured."); }),
     watchVoiceInputDictionaryPeerStatus: vi.fn((_credential: PairedCredential, signal: AbortSignal) => idleDictionaryWatch(signal)),
@@ -1617,11 +1620,12 @@ function client(
   pdfPreviewFiles?: MobilePdfPreviewFiles,
   modelPreviewFiles?: MobileModelPreviewFiles,
   fileShare?: Pick<MobileFileShare, "perform">,
-  offlineCache?: Pick<MobileOfflineCache, "load" | "save" | "clear">
+  offlineCache?: Pick<MobileOfflineCache, "load" | "save" | "clear">,
+  readOnlyDictionaryCache?: { clear(profileId: string): Promise<void> }
 ) {
   const instance = new MobileClient(network, storage, discovery ?? { scan: vi.fn(async () => []) }, newId, "android", now,
     clearInteractionDraft, drafts.newTask, drafts.composer, attachmentFiles, mediaPreviewFiles, pdfPreviewFiles,
-    modelPreviewFiles, fileShare, offlineCache);
+    modelPreviewFiles, fileShare, offlineCache, readOnlyDictionaryCache);
   clients.push(instance);
   return instance;
 }
@@ -2135,6 +2139,77 @@ describe("native mobile Automation ownership and recovery", () => {
 });
 
 describe("native mobile connection and operation ownership", () => {
+  it("reads a second paired dictionary with its exact proof and credential without replacing the active task, then cancels on background", async () => {
+    const network = fakeNetwork();
+    const remote = { ...otherCredential, origin: "http://192.168.1.21:4318", serverId: "node-2" };
+    const saved = memoryStorage([credential, remote]);
+    const remoteNode = { ...node, serverId: remote.serverId, displayName: "Office" };
+    const remoteOwner = { connection: otherConnection, device: otherDevice,
+      snapshot: create(SnapshotSchema, { ...snapshot, server: { ...snapshot.server!, serverId: remote.serverId },
+        connections: [otherConnection], devices: [otherDevice] }) };
+    vi.mocked(network.inspect).mockImplementation(async (origin) => origin === remote.origin ? remoteNode : node);
+    vi.mocked(network.readOwner).mockImplementation(async (value) => value.serverId === remote.serverId ? remoteOwner : { connection, device, snapshot });
+    vi.mocked(network.getVoiceInputDictionaryReadOnly).mockResolvedValue(readOnlyValue());
+    const updates = dictionaryWatchFixture<ReturnType<typeof readOnlyValue>>();
+    vi.mocked(network.watchVoiceInputDictionaryReadOnly).mockImplementation((_credential, signal) => updates.watch(signal));
+    const app = client(network, saved.storage); await app.start();
+    const active = app.state.owner; const selected = app.state.selectedId;
+    const request = new AbortController();
+    const transport = await app.voiceDictionaryReadOnlyTransport(remote.profileId, request.signal);
+    expect(transport.profile.displayName).toBe("Office");
+    expect(vi.mocked(network.inspect).mock.invocationCallOrder.at(-1)!).toBeLessThan(vi.mocked(saved.storage.loadCredential).mock.invocationCallOrder.at(-1)!);
+    await expect(transport.getVoiceInputDictionaryReadOnly()).resolves.toEqual(readOnlyValue());
+    expect(network.getVoiceInputDictionaryReadOnly).toHaveBeenCalledWith(remote, expect.any(AbortSignal));
+    expect(app.state.owner).toBe(active); expect(app.state.selectedId).toBe(selected); expect(app.state.activeProfileId).toBe(credential.profileId);
+    const iterator = transport.watchVoiceInputDictionaryReadOnly(request.signal)[Symbol.asyncIterator]();
+    const initial = iterator.next(); updates.push(readOnlyValue()); await initial;
+    const waiting = iterator.next(); const stopped = expect(waiting).rejects.toMatchObject({ name: "AbortError" });
+    app.setForeground(false);
+    expect(vi.mocked(network.watchVoiceInputDictionaryReadOnly).mock.calls[0]![1].aborted).toBe(true);
+    await stopped; expect(updates.count).toBe(0); expect(transport.isCurrent()).toBe(false);
+  });
+
+  it("rejects an identity-drift dictionary source before protected reads and clears only that source cache", async () => {
+    const network = fakeNetwork(); const saved = memoryStorage(credential, false);
+    const clear = vi.fn(async (_profileId: string) => undefined);
+    const app = client(network, saved.storage, undefined, undefined, undefined, undefined, undefined,
+      undefined, undefined, undefined, undefined, undefined, undefined, { clear });
+    await app.start(); vi.mocked(saved.storage.loadCredential).mockClear();
+    vi.mocked(network.inspect).mockResolvedValue({ ...node, serverId: "drift" });
+    await expect(app.voiceDictionaryReadOnlyTransport(credential.profileId, new AbortController().signal)).rejects.toThrow();
+    expect(saved.storage.loadCredential).not.toHaveBeenCalled(); expect(network.getVoiceInputDictionaryReadOnly).not.toHaveBeenCalled();
+    expect(clear).toHaveBeenCalledExactlyOnceWith(credential.profileId);
+    expect(app.state.saved[0]?.credentialState).toBe("identity-conflict"); expect(saved.key()).toEqual(credential);
+  });
+
+  it("rechecks a normally ended idle readonly stream, clears a revoked pair and retires a late GET without touching the active node", async () => {
+    const network = fakeNetwork(); const saved = memoryStorage([credential, otherCredential]);
+    const clear = vi.fn(async (_profileId: string) => undefined);
+    const app = client(network, saved.storage, undefined, undefined, undefined, undefined, undefined,
+      undefined, undefined, undefined, undefined, undefined, undefined, { clear });
+    await app.start(); const active = app.state.owner;
+    const updates = dictionaryWatchFixture<ReturnType<typeof readOnlyValue>>();
+    vi.mocked(network.watchVoiceInputDictionaryReadOnly).mockImplementation((_credential, signal) => updates.watch(signal));
+    vi.mocked(network.readOwner).mockImplementation(async (value) => value.profileId === otherCredential.profileId
+      ? { connection: otherConnection, device: otherDevice, snapshot: create(SnapshotSchema, { ...snapshot, connections: [otherConnection], devices: [otherDevice] }) }
+      : { connection, device, snapshot });
+    const transport = await app.voiceDictionaryReadOnlyTransport(otherCredential.profileId, new AbortController().signal);
+    let finish!: (value: ReturnType<typeof readOnlyValue>) => void;
+    vi.mocked(network.getVoiceInputDictionaryReadOnly).mockImplementation(async () => await new Promise((resolve) => { finish = resolve; }));
+    const reading = transport.getVoiceInputDictionaryReadOnly(); const rejected = expect(reading).rejects.toMatchObject({ name: "AbortError" });
+    const iterator = transport.watchVoiceInputDictionaryReadOnly(new AbortController().signal)[Symbol.asyncIterator]();
+    const initial = iterator.next(); updates.push(readOnlyValue()); await initial;
+    vi.mocked(network.readOwner).mockImplementation(async (value) => {
+      if (value.profileId === otherCredential.profileId) throw { code: Code.Unauthenticated };
+      return { connection, device, snapshot };
+    });
+    const ended = iterator.next(); const revoked = expect(ended).rejects.toMatchObject({ code: Code.Unauthenticated });
+    updates.end(); await revoked;
+    finish(readOnlyValue(99n)); await rejected;
+    expect(clear).toHaveBeenCalledExactlyOnceWith(otherCredential.profileId); expect(saved.key(otherCredential.profileId)).toBeUndefined();
+    expect(saved.key()).toEqual(credential); expect(app.state.owner).toBe(active); expect(app.state.status).toBe("connected");
+  });
+
   it("binds both dictionary streams to their original credential and cancels an idle stream on foreground retirement", async () => {
     const network = fakeNetwork();
     const app = client(network, memoryStorage(credential).storage);

@@ -25,6 +25,8 @@ import {
 } from "./mobile-locale-preference";
 import { mobileMessage, type MobileMessageKey } from "./mobile-messages";
 import { MobileVoiceDictionaryScreen } from "./MobileVoiceDictionaryScreen";
+import { MobileVoiceDictionaryReadOnlyScreen } from "./MobileVoiceDictionaryReadOnlyScreen";
+import type { MobileVoiceDictionaryReadOnlyController } from "./mobile-voice-dictionary-readonly-controller";
 import type {
   MobileVoiceDictionaryEditOutcome,
   MobileVoicePreferencesStoreState
@@ -59,6 +61,7 @@ export interface MobileSettingsScreenProps {
   readonly voiceDictionary: MobileVoicePreferencesStoreState;
   readonly nodeDictionary: MobileVoiceDictionaryControllerState;
   readonly voicePeerTransport?: MobileVoiceDictionaryTransport;
+  readonly readOnlyDictionary: MobileVoiceDictionaryReadOnlyController;
   readonly updates: MobileUpdateControllerState;
   readonly push: MobilePushControllerState;
   readonly updateActions: Pick<MobileUpdateActions, "onChannelChange" | "onCheck" | "onReset">;
@@ -131,6 +134,7 @@ export function MobileSettingsScreen(props: MobileSettingsScreenProps) {
   const [notice, setNotice] = useState("");
   const [diagnosticsExpanded, setDiagnosticsExpanded] = useState(false);
   const [voiceOpen, setVoiceOpen] = useState(false);
+  const [readOnlyOpen, setReadOnlyOpen] = useState(false);
   const saveGeneration = useRef(0);
   const unknownReceiptSeen = useRef(false);
   const currentOwnerKey = current?.ownerKey;
@@ -262,6 +266,10 @@ export function MobileSettingsScreen(props: MobileSettingsScreenProps) {
     }
   };
 
+  if (readOnlyOpen) return <MobileVoiceDictionaryReadOnlyScreen colors={colors} locale={locale.effectiveLocale}
+    foreground={foreground} controller={props.readOnlyDictionary} backLabel={t(voiceOpen ? "settings.voice.title" : "settings.title")}
+    onBack={() => setReadOnlyOpen(false)} />;
+
   if (voiceOpen) return <MobileVoiceDictionaryScreen key={props.nodeDictionary.ownerKey ?? "unavailable"}
     colors={colors} locale={locale.effectiveLocale}
     state={voiceDictionary} dictionary={props.nodeDictionary} peerTransport={foreground ? props.voicePeerTransport : undefined} onBack={() => setVoiceOpen(false)} onRetry={onVoiceDictionaryRetry}
@@ -269,7 +277,7 @@ export function MobileSettingsScreen(props: MobileSettingsScreenProps) {
     onSetInstructions={onVoiceInstructionsChange} onSetAutoLearning={onVoiceAutoLearningChange}
     onRefreshDictionary={props.onVoiceDictionaryRefresh} onSetSyncEnabled={props.onVoiceDictionarySyncChange}
     onAddTerm={onVoiceDictionaryAdd} onEditEntry={onVoiceDictionaryEdit}
-    onDeleteEntry={onVoiceDictionaryDelete} />;
+    onDeleteEntry={onVoiceDictionaryDelete} onReadOnlyDictionary={() => setReadOnlyOpen(true)} />;
 
   if (editor) {
     const editable = canRename && editor.ownerKey === currentOwnerKey;
@@ -329,6 +337,8 @@ export function MobileSettingsScreen(props: MobileSettingsScreenProps) {
     <Text style={[styles.section, { color: colors.muted }]}>{t("settings.voice.title")}</Text>
     <NavigationRow label={t("settings.voice.title")} description={t("settings.voice.navigation")}
       colors={colors} onPress={() => { setLocalError(""); setNotice(""); setVoiceOpen(true); }} />
+    <NavigationRow label={t("settings.voiceReadonly.title")} description={t("settings.voiceReadonly.navigation")}
+      colors={colors} onPress={() => { setLocalError(""); setNotice(""); setReadOnlyOpen(true); }} />
 
     <Text style={[styles.section, { color: colors.muted }]}>{t("settings.currentNode")}</Text>
     <View style={[styles.card, { backgroundColor: colors.surface, borderColor: colors.border }]}>

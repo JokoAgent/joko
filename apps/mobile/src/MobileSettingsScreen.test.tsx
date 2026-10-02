@@ -25,6 +25,8 @@ import type { MobileThemePreferenceState } from "./mobile-theme-preference";
 import type { MobileDiagnosticsState } from "./mobile-diagnostics";
 import type { MobileLocalePreferenceState } from "./mobile-locale-preference";
 import { EMPTY_MOBILE_VOICE_DICTIONARY } from "./mobile-voice-dictionary";
+import { MobileVoiceDictionaryReadOnlyCache } from "./mobile-voice-dictionary-readonly-cache";
+import { MobileVoiceDictionaryReadOnlyController } from "./mobile-voice-dictionary-readonly-controller";
 import type { MobileVoicePreferencesStoreState } from "./mobile-voice-preferences-store";
 import type { MobileUpdateControllerState } from "./mobile-update-controller";
 import type { MobilePushControllerState } from "./mobile-push-controller";
@@ -71,6 +73,8 @@ vi.mock("react-native", async () => {
     Platform: { OS: "android" },
     Pressable: element("button"),
     ScrollView: element("div"),
+    FlatList: ({ ListHeaderComponent, ListEmptyComponent }: { ListHeaderComponent: React.ReactNode; ListEmptyComponent: React.ReactNode }) =>
+      React.createElement("div", {}, ListHeaderComponent, ListEmptyComponent),
     Switch: ({ accessibilityLabel, value, onValueChange, disabled }: {
       accessibilityLabel?: string;
       value?: boolean;
@@ -293,6 +297,9 @@ function mount(options: {
   const onCheck = vi.fn(async () => undefined);
   const onReset = vi.fn(async () => undefined);
   const onBack = vi.fn();
+  const readOnlyDictionary = new MobileVoiceDictionaryReadOnlyController(new MobileVoiceDictionaryReadOnlyCache({
+    getItem: async () => null, setItem: async () => undefined, removeItem: async () => undefined, getAllKeys: async () => []
+  }), async () => { throw new Error("No read-only source fixture."); });
   const onConnections = vi.fn();
   const onDevices = vi.fn();
   let state = options.state ?? mobileState();
@@ -311,6 +318,7 @@ function mount(options: {
     locale,
     diagnostics,
     voiceDictionary,
+    readOnlyDictionary,
     nodeDictionary: { status: "ready", ownerKey: "node", saving: false,
       snapshot: { revision: 1n, syncEnabled: false, dictionary: EMPTY_MOBILE_VOICE_DICTIONARY, refinementTerms: [] } },
     updates,
@@ -395,6 +403,18 @@ function deferred<T>() {
 }
 
 describe("MobileSettingsScreen", () => {
+  it("opens the readonly shared dictionary from Settings and voice preferences, and returns to the initiating surface", async () => {
+    const mounted = mount();
+    await act(async () => button(mounted.container, "Shared dictionary · read only").click());
+    expect(mounted.container.textContent).toContain("No paired dictionary sources.");
+    act(() => button(mounted.container, "Back to Settings").click());
+    act(() => button(mounted.container, "Voice input").click());
+    await act(async () => button(mounted.container, "Shared dictionary · read only").click());
+    act(() => { expect(native.hardwareBack?.()).toBe(true); });
+    expect(mounted.container.textContent).toContain("Refinement instructions");
+    expect(mounted.onBack).not.toHaveBeenCalled();
+  });
+
   it("renders exact node/device/about identity, changes theme, copies ID, and navigates", async () => {
     const mounted = mount();
 

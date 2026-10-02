@@ -15,6 +15,7 @@ import type { VoiceInputConnectionTestResult, VoiceInputSettingsController } fro
 import {
   VoiceDictionarySyncRepositoryError,
   type VoiceDictionarySyncRepository,
+  type VoiceDictionaryReadOnlySnapshot,
   type VoiceDictionarySyncSnapshot
 } from "./voice-dictionary-sync-repository.js";
 import { VoiceDictionaryPeerManagerError, type VoiceDictionaryPeerManager, type VoiceDictionaryPeerStatus } from "./voice-dictionary-peer-manager.js";
@@ -28,7 +29,7 @@ export function createVoiceInputConnectService(
   coordinator: VoiceInputCoordinator | undefined,
   settings: Pick<VoiceInputSettingsController, "adviseDictionaryEdit" | "testConnection"> | undefined,
   dictionary: Pick<VoiceDictionarySyncRepository,
-    "addManualTerms" | "applyLearning" | "deleteEntry" | "editEntry" | "setEnabled" | "snapshot" | "subscribe"> | undefined,
+    "addManualTerms" | "applyLearning" | "deleteEntry" | "editEntry" | "setEnabled" | "snapshot" | "readOnlySnapshot" | "subscribe"> | undefined,
   authenticate: (context: HandlerContext) => VoiceInputRpcOwner,
   peers?: Pick<VoiceDictionaryPeerManager, "status" | "grantCandidate" | "revokePeer" | "syncNow" | "subscribe">,
   onRevoked?: (connectionId: string, listener: () => void) => () => void,
@@ -61,6 +62,20 @@ export function createVoiceInputConnectService(
       for await (const update of watchVoiceDictionaryProjection({ context, authenticate, onRevoked, shutdownSignal,
         subscribe: (listener) => runtime.subscribe(listener), read: () => toProtoDictionarySnapshot(runtime.snapshot()) })) {
         yield create(contract.WatchVoiceInputDictionaryResponseSchema, { sequence: update.sequence, dictionary: update.value });
+      }
+    },
+    getVoiceInputDictionaryReadOnly: async (_request, context) => voiceRpc(async () => {
+      authenticate(context);
+      return create(contract.GetVoiceInputDictionaryReadOnlyResponseSchema, {
+        dictionary: toProtoReadOnlySnapshot(requireDictionary(dictionary).readOnlySnapshot())
+      });
+    }),
+    watchVoiceInputDictionaryReadOnly: async function* (_request, context) {
+      authenticate(context);
+      const runtime = requireDictionary(dictionary);
+      for await (const update of watchVoiceDictionaryProjection({ context, authenticate, onRevoked, shutdownSignal,
+        subscribe: (listener) => runtime.subscribe(listener), read: () => toProtoReadOnlySnapshot(runtime.readOnlySnapshot()) })) {
+        yield create(contract.WatchVoiceInputDictionaryReadOnlyResponseSchema, { sequence: update.sequence, dictionary: update.value });
       }
     },
     watchVoiceInputDictionaryPeerStatus: async function* (_request, context) {
@@ -239,6 +254,16 @@ export function createVoiceInputConnectService(
       return create(contract.GetVoiceInputSessionResponseSchema, { session: toProtoSession(session) });
     })
   } satisfies ServiceImpl<typeof contract.VoiceInputService>;
+}
+
+function toProtoReadOnlySnapshot(value: VoiceDictionaryReadOnlySnapshot): contract.VoiceInputDictionaryReadOnlySnapshot {
+  return create(contract.VoiceInputDictionaryReadOnlySnapshotSchema, {
+    revision: BigInt(value.revision), syncEnabled: value.enabled,
+    entries: value.entries.map((entry) => ({ text: entry.text, frequency: BigInt(entry.frequency),
+      aliases: entry.aliases.map((alias) => ({ text: alias.text, count: BigInt(alias.count) })) })),
+    stateVector: { versions: Object.entries(value.stateVector).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0)
+      .map(([nodeId, stamp]) => ({ nodeId, stamp })) }
+  });
 }
 
 function toProtoDictionarySnapshot(value: VoiceDictionarySyncSnapshot): contract.VoiceInputDictionarySnapshot {
@@ -420,9 +445,9 @@ function requireSettings(
 
 function requireDictionary(
   value: Pick<VoiceDictionarySyncRepository,
-    "addManualTerms" | "applyLearning" | "deleteEntry" | "editEntry" | "setEnabled" | "snapshot" | "subscribe"> | undefined
+    "addManualTerms" | "applyLearning" | "deleteEntry" | "editEntry" | "setEnabled" | "snapshot" | "readOnlySnapshot" | "subscribe"> | undefined
 ): Pick<VoiceDictionarySyncRepository,
-  "addManualTerms" | "applyLearning" | "deleteEntry" | "editEntry" | "setEnabled" | "snapshot" | "subscribe"> {
+  "addManualTerms" | "applyLearning" | "deleteEntry" | "editEntry" | "setEnabled" | "snapshot" | "readOnlySnapshot" | "subscribe"> {
   if (value === undefined) throw new VoiceInputControlError("not_supported");
   return value;
 }

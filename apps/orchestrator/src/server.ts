@@ -1,4 +1,5 @@
 import { stat } from "node:fs/promises";
+import type { Socket } from "node:net";
 import type { Readable } from "node:stream";
 
 import cors from "@fastify/cors";
@@ -43,6 +44,27 @@ export async function createPublicServer(application: OrchestratorApplication): 
     trustProxy: false,
     bodyLimit: 16 * 1024 * 1024,
     ...(tls === undefined ? {} : { https: tls })
+  });
+
+  // HTTP's idle-connection drain does not own TCP preconnections with no bytes.
+  // Retire only those; requests that have started keep their graceful drain.
+  const unstartedConnections = new Set<Socket>();
+  let closing = false;
+  server.server.on("connection", (socket: Socket) => {
+    if (closing) { socket.destroy(); return; }
+    unstartedConnections.add(socket);
+    const startedOrClosed = (): void => { unstartedConnections.delete(socket); };
+    socket.once("data", startedOrClosed);
+    socket.once("close", startedOrClosed);
+  });
+  server.server.on("request", (_request, response) => {
+    // A request may finish after the initial idle sweep, leaving keep-alive open.
+    response.once("finish", () => { if (closing) server.server.closeIdleConnections(); });
+  });
+  server.addHook("preClose", async () => {
+    closing = true;
+    for (const socket of unstartedConnections) socket.destroy();
+    unstartedConnections.clear();
   });
 
   server.addContentTypeParser("application/octet-stream", (request, payload, done) => {

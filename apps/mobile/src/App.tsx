@@ -59,6 +59,7 @@ import {
   mobileInteractionDrafts,
   mobileNewTaskDrafts,
   mobileOfflineCache,
+  mobileReadOnlyDictionaryCache,
   mobileDiagnostics,
   mobileLocalePreferences,
   mobilePushDeviceStore,
@@ -249,6 +250,8 @@ import { MobileAutomationsScreen } from "./MobileAutomationsScreen";
 import { MobilePartnersScreen } from "./MobilePartnersScreen";
 import { MobileFilesToolbar } from "./MobileFilesToolbar";
 import { MobileSettingsScreen } from "./MobileSettingsScreen";
+import { MobileVoiceDictionaryReadOnlyController } from "./mobile-voice-dictionary-readonly-controller";
+import { mobileReadOnlyDictionarySources } from "./mobile-voice-dictionary-readonly";
 import {
   MobileForcedUpdateGate,
   MobileUpdatePrompt,
@@ -283,8 +286,11 @@ const client = new MobileClient(
   mobilePdfPreviewFiles,
   mobileModelPreviewFiles,
   mobileFileShare,
-  mobileOfflineCache
+  mobileOfflineCache,
+  mobileReadOnlyDictionaryCache
 );
+const readOnlyDictionary = new MobileVoiceDictionaryReadOnlyController(mobileReadOnlyDictionaryCache,
+  (profileId, signal) => client.voiceDictionaryReadOnlyTransport(profileId, signal));
 const mobilePush = new MobilePushController({
   platform: Platform.OS,
   environment: __DEV__ ? "sandbox" : "production",
@@ -569,6 +575,9 @@ export function App() {
   const [deviceId, setDeviceId] = useState<string>();
   const [foreground, setForeground] = useState(AppState.currentState === "active");
   const dictionaryTransport = client.voiceDictionaryTransport();
+  useEffect(() => {
+    readOnlyDictionary.setSources(mobileReadOnlyDictionarySources(state.saved));
+  }, [state.saved]);
   const dictionaryOwnerKey = foreground && page === "settings" ? dictionaryTransport?.ownerKey : undefined;
   useEffect(() => {
     dictionaryController.setTransport(dictionaryOwnerKey ? dictionaryTransport : undefined);
@@ -891,6 +900,7 @@ export function App() {
                   }} /> :
                 page === "settings" ? <MobileSettingsScreen colors={colors} state={state} foreground={foreground}
                   theme={theme} locale={locale} diagnostics={diagnostics} voiceDictionary={voiceDictionary}
+                  readOnlyDictionary={readOnlyDictionary}
                   updates={updates} updateActions={mobileUpdateActions} push={push} client={client}
                   onThemeChange={(preference) => mobileThemePreferences.setPreference(preference)}
                   onLocaleChange={(preference) => mobileLocalePreferences.setPreference(preference)}

@@ -8,6 +8,7 @@ import {
   VoiceInputDictionaryEntrySource, VoiceInputDictionaryLearningActionType,
   VoiceInputDictionaryLearningConfidence, VoiceInputDictionaryTermType,
   nextVoiceDictionaryWatchSequence, projectVoiceDictionaryPeerStatus, type VoiceDictionaryPeerStatusView,
+  projectVoiceDictionaryReadOnly, type VoiceDictionaryReadOnlyView,
   WorktreeEligibility, WorktreeService,
   TransferDirection, WorkspaceEntryListingPolicy, WorkspaceFileChangeKind, WorkspaceService,
   JOKO_API_VERSION, SessionMessageSearchSemanticMode, SessionMessageSearchSessionStatus,
@@ -144,6 +145,8 @@ export interface MobileNetwork {
   uploadBlob(credential: PairedCredential, source: MobileBlobUploadSource, signal?: AbortSignal): Promise<BlobRef>;
   getVoiceInputCapabilities(credential: PairedCredential, signal?: AbortSignal): Promise<MobileVoiceCapability>;
   getVoiceInputDictionary(credential: PairedCredential, signal?: AbortSignal): Promise<MobileVoiceDictionarySnapshot>;
+  getVoiceInputDictionaryReadOnly(credential: PairedCredential, signal?: AbortSignal): Promise<VoiceDictionaryReadOnlyView>;
+  watchVoiceInputDictionaryReadOnly(credential: PairedCredential, signal: AbortSignal): AsyncIterable<VoiceDictionaryReadOnlyView>;
   getVoiceInputDictionaryPeerStatus(credential: PairedCredential, signal?: AbortSignal): Promise<VoiceDictionaryPeerStatusView>;
   watchVoiceInputDictionary(credential: PairedCredential, signal: AbortSignal): AsyncIterable<MobileVoiceDictionarySnapshot>;
   watchVoiceInputDictionaryPeerStatus(credential: PairedCredential, signal: AbortSignal): AsyncIterable<VoiceDictionaryPeerStatusView>;
@@ -1460,6 +1463,25 @@ export const mobileNetwork: MobileNetwork = {
   async getVoiceInputDictionaryPeerStatus(credential, signal) {
     const response = await createClient(VoiceInputService, transport(credential.origin, credential.authKey)).getVoiceInputDictionaryPeerStatus({}, options(signal));
     return projectVoiceDictionaryPeerStatus(response.status);
+  },
+  async getVoiceInputDictionaryReadOnly(credential, signal) {
+    const response = await createClient(VoiceInputService, transport(credential.origin, credential.authKey))
+      .getVoiceInputDictionaryReadOnly({}, options(signal));
+    return projectVoiceDictionaryReadOnly(response.dictionary);
+  },
+  async *watchVoiceInputDictionaryReadOnly(credential, signal) {
+    let sequence = 0n;
+    const request = new AbortController();
+    const cancel = (): void => request.abort();
+    if (signal.aborted) cancel(); else signal.addEventListener("abort", cancel, { once: true });
+    try {
+      const stream = createClient(VoiceInputService, transport(credential.origin, credential.authKey)).watchVoiceInputDictionaryReadOnly({}, options(request.signal));
+      for await (const response of stream) {
+        request.signal.throwIfAborted();
+        sequence = nextVoiceDictionaryWatchSequence(response.sequence, sequence);
+        yield projectVoiceDictionaryReadOnly(response.dictionary);
+      }
+    } finally { cancel(); signal.removeEventListener("abort", cancel); }
   },
   async grantVoiceInputDictionaryPeer(credential, expectedConfigurationRevision, peerId, expectedFingerprint, signal) {
     const response = await createClient(VoiceInputService, transport(credential.origin, credential.authKey)).grantVoiceInputDictionaryPeer({ expectedConfigurationRevision, peerId, expectedFingerprint }, options(signal));

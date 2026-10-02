@@ -1,9 +1,37 @@
-import { describe, expect, it } from "vitest";
+import { createConnection } from "node:net";
+import { describe, expect, it, vi } from "vitest";
 
-import { createInternalServer, isExtensionMainViewRequest, ORCHESTRATOR_WEB_CONTENT_SECURITY_POLICY } from "./server.js";
+import { createInternalServer, createPublicServer, isExtensionMainViewRequest, ORCHESTRATOR_WEB_CONTENT_SECURITY_POLICY } from "./server.js";
 import type { OrchestratorApplication } from "./application.js";
 
 describe("Orchestrator Web content security policy", () => {
+  it("closes unstarted public TCP connections without aborting an in-flight HTTP request", async () => {
+    const application = { config: { publicOrigin: "http://127.0.0.1", webDirectory: "unused-server-test-web" },
+      store: {}, connections: {}, artifacts: {}, blobTransfers: {}, artifactRepository: {}, workspaces: {},
+      workspaceChanges: {}, scheduler: {}, adapters: [], browserActivity: [], sessionHost: {}
+    } as unknown as OrchestratorApplication;
+    const server = await createPublicServer(application); server.log.level = "silent";
+    let entered!: () => void; let release!: () => void;
+    const started = new Promise<void>((resolve) => { entered = resolve; });
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    server.post("/in-flight-owner-test", async () => { entered(); await held; return { completed: true }; });
+    const url = await server.listen({ host: "127.0.0.1", port: 0 });
+    const idle = createConnection({ host: "127.0.0.1", port: Number(new URL(url).port) });
+    let closed = false;
+    try {
+      await new Promise<void>((resolve, reject) => { idle.once("connect", resolve); idle.once("error", reject); });
+      const response = fetch(`${url}/in-flight-owner-test`, { method: "POST" });
+      await started;
+      const closing = server.close().then(() => { closed = true; });
+      await vi.waitFor(() => expect(idle.destroyed).toBe(true), { timeout: 2_000 });
+      expect(closed).toBe(false);
+      release();
+      expect(await (await response).json()).toEqual({ completed: true });
+      await vi.waitFor(() => expect(closed).toBe(true), { timeout: 2_000 });
+      await closing;
+    } finally { idle.destroy(); release(); await server.close(); }
+  });
+
   it("cancels an in-flight internal MCP call when its HTTP owner disconnects", async () => {
     let entered!: () => void;
     let cancelled!: () => void;

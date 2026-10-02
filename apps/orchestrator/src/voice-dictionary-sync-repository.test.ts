@@ -40,6 +40,34 @@ it("retires subscribers before its store closes and rejects every later projecti
   expect(() => repository.subscribe(changed)).toThrow(VoiceDictionarySyncRepositoryError);
 });
 
+it("persists disabled empty sharing projections and their causal baseline across restart and clock rollback", async () => {
+  const { path, store } = await fixture();
+  const repository = new VoiceDictionarySyncRepository({ store, createReplicaId: () => "dictionary-source", now: () => 1_900_000_000_000 });
+  expect(repository.readOnlySnapshot()).toEqual({ revision: 1, enabled: false, entries: [], stateVector: {} });
+  repository.addManualTerm(1, "Joko");
+  repository.learn(2, { text: "Joko", aliases: ["jo ko"], stage: "entry" });
+  repository.setEnabled(3, true);
+  const shared = repository.readOnlySnapshot();
+  expect(shared.entries).toMatchObject([{ text: "Joko", frequency: 2, aliases: [{ text: "jo ko", count: 1 }] }]);
+  repository.setEnabled(4, false);
+  const off = repository.readOnlySnapshot();
+  expect(off).toEqual({ ...shared, revision: 5, enabled: false, entries: [] });
+  repository.close(); store.close();
+  const reopened = new OperationalStore(path);
+  try {
+    const restored = new VoiceDictionarySyncRepository({ store: reopened, now: () => 100,
+      createReplicaId: () => { throw new Error("Must retain the durable replica."); } });
+    expect(restored.readOnlySnapshot()).toEqual(off);
+    expect(restored.snapshot().dictionary.entries).toMatchObject([{ text: "Joko" }]);
+    restored.addManualTerm(5, "OfflineTerm");
+    expect(restored.readOnlySnapshot()).toMatchObject({ revision: 6, enabled: false, entries: [] });
+    expect(restored.readOnlySnapshot().stateVector["dictionary-source"]! > off.stateVector["dictionary-source"]!).toBe(true);
+    restored.setEnabled(6, true);
+    expect(restored.readOnlySnapshot().entries.map((entry) => entry.text).sort()).toEqual(["Joko", "OfflineTerm"]);
+    restored.close();
+  } finally { reopened.close(); }
+});
+
 function stored(store: OperationalStore): Record<string, unknown> {
   return store.getSetting<Record<string, unknown>>(
     "service",

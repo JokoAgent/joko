@@ -222,6 +222,120 @@ describe("durable voice dictionary through authenticated generated RPCs", () => 
     expect(firstContent.error).toBeUndefined(); expect(firstSharing.error).toBeUndefined();
   }, 40_000);
 
+  it("uses exact paired multi-node readonly projections through disable, actual offline restart, reconnect and client revocation", async () => {
+    const { mobileNetwork } = await import(new URL("../../mobile/src/network.ts", import.meta.url).href);
+    const { MobileClient } = await import(new URL("../../mobile/src/mobile-client.ts", import.meta.url).href);
+    const { MobileVoiceDictionaryReadOnlyCache } = await import(new URL("../../mobile/src/mobile-voice-dictionary-readonly-cache.ts", import.meta.url).href);
+    const { MobileVoiceDictionaryReadOnlyController } = await import(new URL("../../mobile/src/mobile-voice-dictionary-readonly-controller.ts", import.meta.url).href);
+    const { MobileOfflineCache } = await import(new URL("../../mobile/src/mobile-offline-cache.ts", import.meta.url).href);
+    const { mobileReadOnlyDictionarySources } = await import(new URL("../../mobile/src/mobile-voice-dictionary-readonly.ts", import.meta.url).href);
+    const { profileFromCredential } = await import(new URL("../../mobile/src/connection-storage.ts", import.meta.url).href);
+    fixture = await OrchestratorE2eFixture.start({ dictionaryPeerNodeId: "readonly-node-a", keepRoot: true });
+    peerFixture = await OrchestratorE2eFixture.start({ dictionaryPeerNodeId: "readonly-node-b", keepRoot: true });
+    const originalFetch = globalThis.fetch;
+    const streamSignals: Array<{ method: string; signal: AbortSignal }> = [];
+    const fetchProbe = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const url = input instanceof Request ? input.url : String(input);
+      const signal = init?.signal ?? (input instanceof Request ? input.signal : undefined);
+      if (signal && (url.endsWith("/StreamEvents") || url.endsWith("/WatchVoiceInputDictionaryReadOnly"))) {
+        streamSignals.push({ method: new URL(url).pathname.split("/").at(-1)!, signal });
+      }
+      return originalFetch(input, init);
+    });
+    streamCleanups.push(async () => { fetchProbe.mockRestore(); });
+    await expect(fixture.anonymous.voiceInput.getVoiceInputDictionaryReadOnly({})).rejects.toMatchObject({ code: Code.Unauthenticated });
+    const pairPhone = async (source: OrchestratorE2eFixture) => {
+      const begun = await mobileNetwork.requestPairing(source.baseUrl, "Readonly phone", "android");
+      return (await mobileNetwork.completePairing(source.baseUrl, begun.challengeId, source.pairingCode(begun.challengeId), "Readonly phone", "android")).credential;
+    };
+    const a = await pairPhone(fixture); const b = await pairPhone(peerFixture);
+    for (const [credential, terms] of [[a, ["OfficeTerm", "DeleteMe"]], [b, ["PhoneTerm"]]] as const) {
+      const initial = await mobileNetwork.getVoiceInputDictionary(credential);
+      const added = await mobileNetwork.addVoiceInputDictionaryTerms(credential, initial.revision, terms);
+      await mobileNetwork.setVoiceInputDictionarySyncEnabled(credential, added.revision, true);
+    }
+    await vi.waitFor(async () => {
+      expect((await mobileNetwork.getVoiceInputDictionaryPeerStatus(a)).candidates.some((candidate: { nodeId: string }) => candidate.nodeId === b.serverId)).toBe(true);
+      expect((await mobileNetwork.getVoiceInputDictionaryPeerStatus(b)).candidates.some((candidate: { nodeId: string }) => candidate.nodeId === a.serverId)).toBe(true);
+    }, { timeout: 8_000, interval: 100 });
+    const authorityA = await mobileNetwork.getVoiceInputDictionaryPeerStatus(a);
+    const authorityB = await mobileNetwork.getVoiceInputDictionaryPeerStatus(b);
+    await mobileNetwork.grantVoiceInputDictionaryPeer(a, authorityA.configurationRevision, b.serverId, authorityB.fingerprint);
+    await mobileNetwork.grantVoiceInputDictionaryPeer(b, authorityB.configurationRevision, a.serverId, authorityA.fingerprint);
+    await vi.waitFor(async () => {
+      expect((await mobileNetwork.getVoiceInputDictionary(a)).refinementTerms.slice().sort()).toEqual(["DeleteMe", "OfficeTerm", "PhoneTerm"]);
+      expect((await mobileNetwork.getVoiceInputDictionary(b)).refinementTerms.slice().sort()).toEqual(["DeleteMe", "OfficeTerm", "PhoneTerm"]);
+    }, { timeout: 8_000, interval: 100 });
+    const plain = new Map<string, string>();
+    const driver = { getItem: async (key: string) => plain.get(key) ?? null,
+      setItem: async (key: string, value: string) => { plain.set(key, value); },
+      removeItem: async (key: string) => { plain.delete(key); }, getAllKeys: async () => [...plain.keys()],
+      multiRemove: async (keys: readonly string[]) => { for (const key of keys) plain.delete(key); } };
+    const credentials = new Map([[a.profileId, a], [b.profileId, b]]);
+    const profiles = [profileFromCredential(a), profileFromCredential(b)];
+    const storage = { loadConnectionIndex: async () => ({ profiles, automaticProfileId: a.profileId }),
+      loadCredential: async (id: string) => credentials.get(id),
+      saveConnection: async () => undefined, deleteCredential: async (id: string) => { credentials.delete(id); },
+      deleteConnection: async () => undefined, saveAutomaticProfile: async () => undefined,
+      loadPending: async () => [], savePending: async () => undefined,
+      loadSelection: async () => undefined, saveSelection: async () => undefined };
+    let sequence = 0;
+    const createPhone = () => {
+      const cache = new MobileVoiceDictionaryReadOnlyCache(driver);
+      const offline = new MobileOfflineCache(driver, Date.now, () => `readonly-cache-${++sequence}`);
+      const app = new MobileClient(mobileNetwork, storage, { scan: async () => [] }, () => `readonly-operation-${++sequence}`, "android", Date.now,
+        undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, offline, cache);
+      const controller = new MobileVoiceDictionaryReadOnlyController(cache, (id: string, signal: AbortSignal) => app.voiceDictionaryReadOnlyTransport(id, signal));
+      const unsubscribe = app.subscribe((state: { saved: Parameters<typeof mobileReadOnlyDictionarySources>[0] }) => controller.setSources(mobileReadOnlyDictionarySources(state.saved)));
+      streamCleanups.push(async () => { controller.setVisible(false); unsubscribe(); app.dispose(); });
+      return { cache, app, controller, stop: () => { controller.setVisible(false); unsubscribe(); app.dispose(); } };
+    };
+    let phone = createPhone(); await phone.app.start(); phone.controller.setVisible(true);
+    await vi.waitFor(() => {
+      expect(phone.controller.state.hosts.map((host: { status: string }) => host.status)).toEqual(["ready", "ready"]);
+      expect(phone.controller.state.selected?.snapshot.entries.map((entry: { text: string }) => entry.text).sort()).toEqual(["DeleteMe", "OfficeTerm", "PhoneTerm"]);
+    });
+    expect(phone.app.state.activeProfileId).toBe(a.profileId);
+    const grantedB = await mobileNetwork.getVoiceInputDictionaryPeerStatus(b);
+    await mobileNetwork.revokeVoiceInputDictionaryPeer(b, a.serverId, grantedB.peers[0]!.revision);
+    const basis = await mobileNetwork.getVoiceInputDictionary(a);
+    const deleted = await mobileNetwork.deleteVoiceInputDictionaryEntry(a, basis.revision, basis.dictionary.entries.find((entry: { text: string }) => entry.text === "DeleteMe")!.id);
+    await vi.waitFor(() => expect(phone.controller.state.selected?.snapshot.entries.map((entry: { text: string }) => entry.text).sort()).toEqual(["OfficeTerm", "PhoneTerm"]));
+    expect(phone.cache.read(profiles[1]!)!.snapshot.entries.some((entry: { text: string }) => entry.text === "DeleteMe")).toBe(true);
+    const disabled = await mobileNetwork.setVoiceInputDictionarySyncEnabled(a, deleted.revision, false);
+    await vi.waitFor(() => expect(phone.controller.state.selected?.snapshot).toMatchObject({ revision: disabled.revision, syncEnabled: false, entries: [] }));
+    const disabledSnapshot = phone.cache.read(profiles[0]!)!.snapshot;
+    expect((await mobileNetwork.getVoiceInputDictionary(a)).refinementTerms.slice().sort()).toEqual(["OfficeTerm", "PhoneTerm"]);
+    expect((await mobileNetwork.getVoiceInputDictionaryPeerStatus(a)).peers).toHaveLength(1);
+    await phone.controller.refresh(); expect(phone.controller.state.selected?.snapshot).toEqual(disabledSnapshot);
+    for (const credential of [a, b]) expect([...plain.values()].join("")).not.toContain(credential.authKey);
+    const rootA = fixture.rootDirectory; const rootB = peerFixture.rootDirectory;
+    const portA = Number(new URL(fixture.baseUrl).port); const portB = Number(new URL(peerFixture.baseUrl).port);
+    phone.stop();
+    expect(streamSignals.length).toBeGreaterThan(2);
+    expect(streamSignals.every((request) => request.signal.aborted)).toBe(true);
+    await peerFixture.close({ removeRoot: false });
+    let closed = false;
+    void fixture.close({ removeRoot: false }).then(() => { closed = true; });
+    await vi.waitFor(() => expect(closed).toBe(true), { timeout: 5_000 });
+    phone = createPhone(); await phone.app.start(); phone.controller.setVisible(true);
+    await vi.waitFor(() => { expect(phone.controller.state.refreshing).toBe(false); expect(phone.controller.state.hosts.map((host: { status: string }) => host.status)).toEqual(["offline", "offline"]); });
+    expect(phone.app.state.status).toBe("offline"); expect(phone.controller.state.selected?.snapshot).toEqual(disabledSnapshot);
+    expect(credentials.has(a.profileId)).toBe(true); expect(credentials.has(b.profileId)).toBe(true);
+    fixture = await OrchestratorE2eFixture.start({ rootDirectory: rootA, dictionaryPeerNodeId: "readonly-node-a", publicPort: portA });
+    peerFixture = await OrchestratorE2eFixture.start({ rootDirectory: rootB, dictionaryPeerNodeId: "readonly-node-b", publicPort: portB });
+    expect((await mobileNetwork.getVoiceInputDictionaryReadOnly(a))).toEqual(disabledSnapshot);
+    phone.controller.setVisible(false); await phone.app.connectSaved(a.profileId); phone.controller.setVisible(true);
+    await vi.waitFor(() => expect(phone.controller.state.hosts.map((host: { status: string }) => host.status)).toEqual(["ready", "ready"]));
+    const enabled = await mobileNetwork.setVoiceInputDictionarySyncEnabled(a, disabled.revision, true);
+    await vi.waitFor(() => expect(phone.controller.state.selected?.snapshot).toMatchObject({ revision: enabled.revision, syncEnabled: true,
+      entries: expect.arrayContaining([{ text: "OfficeTerm", frequency: 1, aliases: [] }, { text: "PhoneTerm", frequency: 1, aliases: [] }]) }));
+    fixture.application.connections.revoke(a.connectionId);
+    await vi.waitFor(() => { expect(phone.cache.read(profiles[0]!)).toBeUndefined(); expect(credentials.has(a.profileId)).toBe(false); });
+    expect(phone.cache.read(profiles[1]!)).toBeDefined(); expect(credentials.has(b.profileId)).toBe(true);
+    expect(phone.app.state.status).toBe("revoked");
+  }, 60_000);
+
   it("drains both idle dictionary projections immediately on public server shutdown", async () => {
     fixture = await OrchestratorE2eFixture.start({ dictionaryPeerNodeId: "e2e-dictionary-shutdown", keepRoot: true });
     const paired = await fixture.pair("Live dictionary observer");
