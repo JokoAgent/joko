@@ -20,7 +20,9 @@ function transport(ownerKey: string): MobileVoiceDictionaryTransport {
     getVoiceInputDictionaryPeerStatus: vi.fn(async () => status()),
     grantVoiceInputDictionaryPeer: vi.fn(async () => status(4n)),
     revokeVoiceInputDictionaryPeer: vi.fn(async () => status(5n)),
-    syncVoiceInputDictionaryNow: vi.fn(async () => status()) };
+    syncVoiceInputDictionaryNow: vi.fn(async () => status()),
+    configureVoiceInputDictionaryListener: vi.fn(async () => status(4n)), getVoiceInputDictionaryPeerInvitation: unrelated,
+    grantVoiceInputDictionaryDirectPeer: vi.fn(async () => status(5n)), clearVoiceInputDictionaryPeerRoute: vi.fn(async () => status(6n)) };
 }
 
 describe("native dictionary sharing authority", () => {

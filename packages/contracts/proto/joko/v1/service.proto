@@ -488,6 +488,10 @@ service VoiceInputService {
   rpc GrantVoiceInputDictionaryPeer(GrantVoiceInputDictionaryPeerRequest) returns (GrantVoiceInputDictionaryPeerResponse);
   rpc RevokeVoiceInputDictionaryPeer(RevokeVoiceInputDictionaryPeerRequest) returns (RevokeVoiceInputDictionaryPeerResponse);
   rpc SyncVoiceInputDictionaryNow(SyncVoiceInputDictionaryNowRequest) returns (SyncVoiceInputDictionaryNowResponse);
+  rpc ConfigureVoiceInputDictionaryListener(ConfigureVoiceInputDictionaryListenerRequest) returns (ConfigureVoiceInputDictionaryListenerResponse);
+  rpc GetVoiceInputDictionaryPeerInvitation(GetVoiceInputDictionaryPeerInvitationRequest) returns (GetVoiceInputDictionaryPeerInvitationResponse);
+  rpc GrantVoiceInputDictionaryDirectPeer(GrantVoiceInputDictionaryDirectPeerRequest) returns (GrantVoiceInputDictionaryDirectPeerResponse);
+  rpc ClearVoiceInputDictionaryPeerRoute(ClearVoiceInputDictionaryPeerRouteRequest) returns (ClearVoiceInputDictionaryPeerRouteResponse);
   rpc SetVoiceInputDictionarySyncEnabled(SetVoiceInputDictionarySyncEnabledRequest) returns (SetVoiceInputDictionarySyncEnabledResponse);
   rpc AddVoiceInputDictionaryTerms(AddVoiceInputDictionaryTermsRequest) returns (AddVoiceInputDictionaryTermsResponse);
   rpc EditVoiceInputDictionaryEntry(EditVoiceInputDictionaryEntryRequest) returns (EditVoiceInputDictionaryEntryResponse);
@@ -602,6 +606,40 @@ message SyncVoiceInputDictionaryNowRequest {
 }
 
 message SyncVoiceInputDictionaryNowResponse {
+  VoiceInputDictionaryPeerStatus status = 1;
+}
+
+message ConfigureVoiceInputDictionaryListenerRequest {
+  uint64 expected_configuration_revision = 1;
+  optional VoiceInputDictionaryListener listener = 2;
+}
+
+message ConfigureVoiceInputDictionaryListenerResponse {
+  VoiceInputDictionaryPeerStatus status = 1;
+}
+
+message GetVoiceInputDictionaryPeerInvitationRequest {}
+
+message GetVoiceInputDictionaryPeerInvitationResponse {
+  string invitation = 1;
+}
+
+message GrantVoiceInputDictionaryDirectPeerRequest {
+  uint64 expected_configuration_revision = 1;
+  string invitation = 2;
+  string expected_fingerprint = 3;
+}
+
+message GrantVoiceInputDictionaryDirectPeerResponse {
+  VoiceInputDictionaryPeerStatus status = 1;
+}
+
+message ClearVoiceInputDictionaryPeerRouteRequest {
+  uint64 expected_configuration_revision = 1;
+  string peer_id = 2;
+}
+
+message ClearVoiceInputDictionaryPeerRouteResponse {
   VoiceInputDictionaryPeerStatus status = 1;
 }
 

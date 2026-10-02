@@ -739,6 +739,7 @@ export async function createOrchestratorApplication(
     vault: credentialVault,
     nodeId: serverId,
     displayName: contactSyncDisplayName(),
+    enableLan: config.voiceDictionaryLanDiscoveryEnabled ?? true,
     logger: {
       debug: () => undefined,
       warn: () => {

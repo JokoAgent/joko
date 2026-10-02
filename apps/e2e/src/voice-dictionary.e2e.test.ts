@@ -1,4 +1,5 @@
 import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import net from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -17,6 +18,7 @@ import {
   VoiceInputDictionaryEntrySource,
   VoiceInputDictionaryLearningActionType,
   projectVoiceDictionaryReadOnly,
+  readVoiceDictionaryPeerInvitation,
   type VoiceDictionaryPeerStatusView,
   type VoiceDictionaryReadOnlyView
 } from "@joko/contracts";
@@ -346,7 +348,8 @@ describe("durable voice dictionary through authenticated generated RPCs", () => 
     expect(phone.app.state.status).toBe("revoked");
   }, 60_000);
 
-  it("converges the production three-node bridge through offline conflicts, disable and renewed bilateral grants", async () => {
+  it.each([{ route: "LAN discovery", direct: false }, { route: "explicit routes without multicast", direct: true }])(
+    "converges the production three-node bridge through $route, offline conflicts, disable and renewed bilateral grants", async ({ direct }) => {
     const { mobileNetwork } = await import(new URL("../../mobile/src/network.ts", import.meta.url).href);
     const root = await mkdtemp(join(tmpdir(), "joko-dictionary-product-chain-"));
     const running = new Set<ProductionDictionaryNode>();
@@ -356,7 +359,7 @@ describe("durable voice dictionary through authenticated generated RPCs", () => 
     let journeyFailed = false;
     let journeyError: unknown;
     const start = async (name: string) => {
-      const node = await ProductionDictionaryNode.start(join(root, name));
+      const node = await ProductionDictionaryNode.start(join(root, name), { directOnly: direct });
       running.add(node);
       return node;
     };
@@ -390,7 +393,30 @@ describe("durable voice dictionary through authenticated generated RPCs", () => 
       await apiB.setVoiceInputDictionarySyncEnabled({ expectedRevision: (await readB()).revision, enabled: true });
       const initialC = await mobileNetwork.addVoiceInputDictionaryTerms(credentialC, (await readC()).revision, ["PhoneTerm"]);
       await mobileNetwork.setVoiceInputDictionarySyncEnabled(credentialC, initialC.revision, true);
-      await vi.waitFor(async () => {
+      const invitations = new Map<string, string>();
+      if (direct) {
+        for (const api of [apiA, apiB]) {
+          const status = (await api.getVoiceInputDictionaryPeerStatus({})).status!;
+          expect(status.candidates).toEqual([]); expect(status.peers).toEqual([]);
+          const port = await dictionaryListenerPort();
+          await api.configureVoiceInputDictionaryListener({ expectedConfigurationRevision: status.configurationRevision,
+            listener: { listenPort: port, host: "127.0.0.1", port } });
+          const raw = (await api.getVoiceInputDictionaryPeerInvitation({})).invitation;
+          const invitation = readVoiceDictionaryPeerInvitation(raw);
+          expect(invitation).toMatchObject({ nodeId: status.nodeId, fingerprint: status.fingerprint, host: "127.0.0.1", port });
+          invitations.set(invitation.nodeId, raw);
+          expect((await api.getVoiceInputDictionaryPeerStatus({})).status!.candidates).toEqual([]);
+        }
+        const statusC = await mobileNetwork.getVoiceInputDictionaryPeerStatus(credentialC);
+        expect(statusC.candidates).toEqual([]); expect(statusC.peers).toEqual([]);
+        const portC = await dictionaryListenerPort();
+        await mobileNetwork.configureVoiceInputDictionaryListener(credentialC, statusC.configurationRevision,
+          { listenPort: portC, host: "127.0.0.1", port: portC });
+        const rawC = await mobileNetwork.getVoiceInputDictionaryPeerInvitation(credentialC);
+        expect(readVoiceDictionaryPeerInvitation(rawC)).toMatchObject({ nodeId: statusC.nodeId, fingerprint: statusC.fingerprint,
+          host: "127.0.0.1", port: portC });
+        invitations.set(statusC.nodeId, rawC);
+      } else await vi.waitFor(async () => {
         const statuses = await Promise.all([apiA.getVoiceInputDictionaryPeerStatus({}), apiB.getVoiceInputDictionaryPeerStatus({})]);
         const peersC = await mobileNetwork.getVoiceInputDictionaryPeerStatus(credentialC);
         expect(statuses[0].status!.candidates.some((candidate) => candidate.nodeId === b.application.serverId)).toBe(true);
@@ -401,6 +427,10 @@ describe("durable voice dictionary through authenticated generated RPCs", () => 
       const identityB = (await apiB.getVoiceInputDictionaryPeerStatus({})).status!;
       const identityC = await mobileNetwork.getVoiceInputDictionaryPeerStatus(credentialC);
       const grant = async (api: E2eClients["voiceInput"], peerId: string, expectedFingerprint: string) => {
+        if (direct) return api.grantVoiceInputDictionaryDirectPeer({
+          expectedConfigurationRevision: (await api.getVoiceInputDictionaryPeerStatus({})).status!.configurationRevision,
+          invitation: invitations.get(peerId)!, expectedFingerprint
+        });
         await vi.waitFor(async () => {
           const current = (await api.getVoiceInputDictionaryPeerStatus({})).status!;
           expect(current.candidates.some((candidate) => candidate.nodeId === peerId && candidate.fingerprint === expectedFingerprint)).toBe(true);
@@ -409,6 +439,11 @@ describe("durable voice dictionary through authenticated generated RPCs", () => 
           peerId, expectedFingerprint });
       };
       const grantC = async () => {
+        if (direct) {
+          const current = await mobileNetwork.getVoiceInputDictionaryPeerStatus(credentialC);
+          return mobileNetwork.grantVoiceInputDictionaryDirectPeer(credentialC, current.configurationRevision,
+            invitations.get(identityB.nodeId)!, identityB.fingerprint);
+        }
         await vi.waitFor(async () => {
           const current = await mobileNetwork.getVoiceInputDictionaryPeerStatus(credentialC);
           expect(current.candidates.some((candidate: { nodeId: string; fingerprint: string }) =>
@@ -417,7 +452,19 @@ describe("durable voice dictionary through authenticated generated RPCs", () => 
         const current = await mobileNetwork.getVoiceInputDictionaryPeerStatus(credentialC);
         return mobileNetwork.grantVoiceInputDictionaryPeer(credentialC, current.configurationRevision, identityB.nodeId, identityB.fingerprint);
       };
-      await grant(apiA, identityB.nodeId, identityB.fingerprint);
+      if (direct) {
+        await expect(apiA.grantVoiceInputDictionaryDirectPeer({ expectedConfigurationRevision: identityA.configurationRevision,
+          invitation: invitations.get(identityB.nodeId)!, expectedFingerprint: "0".repeat(64) })).rejects.toMatchObject({ code: Code.InvalidArgument });
+        await expect(apiA.grantVoiceInputDictionaryDirectPeer({ expectedConfigurationRevision: identityA.configurationRevision - 1n,
+          invitation: invitations.get(identityB.nodeId)!, expectedFingerprint: identityB.fingerprint })).rejects.toMatchObject({ code: Code.Aborted });
+      }
+      const grantedA = (await grant(apiA, identityB.nodeId, identityB.fingerprint)).status!;
+      if (direct) {
+        expect(grantedA.peers).toMatchObject([{ peerId: identityB.nodeId, online: false,
+          route: { host: "127.0.0.1", port: readVoiceDictionaryPeerInvitation(invitations.get(identityB.nodeId)!).port } }]);
+        await expect(apiA.syncVoiceInputDictionaryNow({ expectedConfigurationRevision: grantedA.configurationRevision,
+          peerId: identityB.nodeId })).rejects.toMatchObject({ code: Code.Unavailable });
+      }
       await grant(apiB, identityA.nodeId, identityA.fingerprint);
       await grant(apiB, identityC.nodeId, identityC.fingerprint);
       await grantC();
@@ -461,6 +508,15 @@ describe("durable voice dictionary through authenticated generated RPCs", () => 
           expect(peersA.peers.map((peer) => peer.peerId)).toEqual([identityB.nodeId]);
           expect(peersB.peers.map((peer) => peer.peerId).sort()).toEqual([identityA.nodeId, identityC.nodeId].sort());
           expect(peersC.peers.map((peer: { peerId: string }) => peer.peerId)).toEqual([identityB.nodeId]);
+          if (direct) {
+            for (const status of [peersA, peersB, peersC]) for (const peer of status.peers) {
+              expect(peer.online).toBe(true);
+              const invitation = readVoiceDictionaryPeerInvitation(invitations.get(peer.peerId)!);
+              expect(peer.route).toMatchObject({ host: invitation.host, port: invitation.port });
+            }
+            expect(peersA.candidates.some((candidate) => candidate.nodeId === identityC.nodeId)).toBe(false);
+            expect(peersC.candidates.some((candidate: { nodeId: string }) => candidate.nodeId === identityA.nodeId)).toBe(false);
+          }
           expect(phonePeers.latest?.configurationRevision).toBe(peersC.configurationRevision);
           expect(bridgeObservation.peers.latest?.status?.configurationRevision).toBe(peersB.configurationRevision);
         }, { timeout: 24_000, interval: 100 });
@@ -502,6 +558,12 @@ describe("durable voice dictionary through authenticated generated RPCs", () => 
         configurationRevision: bridgeAuthority.configurationRevision, enabled: true });
       expect(restoredAuthority.peers.map(({ peerId, revision, fingerprint }) => ({ peerId, revision, fingerprint }))).toEqual(
         bridgeAuthority.peers.map(({ peerId, revision, fingerprint }) => ({ peerId, revision, fingerprint })));
+      if (direct) {
+        expect(restoredAuthority.listener).toEqual(bridgeAuthority.listener);
+        expect(restoredAuthority.peers.map(({ peerId, route }) => ({ peerId, route }))).toEqual(
+          bridgeAuthority.peers.map(({ peerId, route }) => ({ peerId, route })));
+        expect((await apiB.getVoiceInputDictionaryPeerInvitation({})).invitation).toBe(invitations.get(identityB.nodeId));
+      }
       expect((await readB()).refinementTerms).toEqual(expect.arrayContaining(["Across bridge", "OfficeTerm", "PhoneTerm"]));
       const mergedTerms = ["Across bridge", "Concurrent candidate", "Edited offline", "OfficeTerm", "PhoneTerm"];
       await converge(mergedTerms, 2);
@@ -542,7 +604,7 @@ describe("durable voice dictionary through authenticated generated RPCs", () => 
       const statusC = await mobileNetwork.getVoiceInputDictionaryPeerStatus(credentialC);
       await expect(mobileNetwork.syncVoiceInputDictionaryNow(credentialC, statusC.configurationRevision, identityB.nodeId)).rejects.toMatchObject({ code: Code.Unavailable });
       await mobileNetwork.revokeVoiceInputDictionaryPeer(credentialC, identityB.nodeId, statusC.peers[0].revision);
-      await vi.waitFor(async () => {
+      if (!direct) await vi.waitFor(async () => {
         const peersB = (await apiB.getVoiceInputDictionaryPeerStatus({})).status!;
         const peersC = await mobileNetwork.getVoiceInputDictionaryPeerStatus(credentialC);
         expect(peersB.candidates.some((candidate) => candidate.nodeId === identityC.nodeId)).toBe(true);
@@ -555,9 +617,36 @@ describe("durable voice dictionary through authenticated generated RPCs", () => 
       await expect(apiB.syncVoiceInputDictionaryNow({ expectedConfigurationRevision: revoked.configurationRevision })).rejects.toMatchObject({ code: Code.Aborted });
       const finalTerms = [...enabledTerms, "Phone after revoke"];
       await converge(finalTerms, 2);
+      let finalAuthorityB = renewedB;
+      if (direct) {
+        const authorityB = (await apiB.getVoiceInputDictionaryPeerStatus({})).status!;
+        const authorityC = await mobileNetwork.getVoiceInputDictionaryPeerStatus(credentialC);
+        const retainedGrant = authorityB.peers.find((peer) => peer.peerId === identityC.nodeId)!;
+        const clearedB = (await apiB.clearVoiceInputDictionaryPeerRoute({ expectedConfigurationRevision: authorityB.configurationRevision,
+          peerId: identityC.nodeId })).status!;
+        const clearedC = await mobileNetwork.clearVoiceInputDictionaryPeerRoute(credentialC, authorityC.configurationRevision, identityB.nodeId);
+        expect(clearedB.peers.find((peer) => peer.peerId === identityC.nodeId)).toMatchObject({ revision: retainedGrant.revision, online: false });
+        expect(clearedB.peers.find((peer) => peer.peerId === identityC.nodeId)!.route).toBeUndefined();
+        expect(clearedC.peers[0].route).toBeUndefined();
+        await expect(apiB.clearVoiceInputDictionaryPeerRoute({ expectedConfigurationRevision: authorityB.configurationRevision,
+          peerId: identityC.nodeId })).rejects.toMatchObject({ code: Code.Aborted });
+        await expect(mobileNetwork.syncVoiceInputDictionaryNow(credentialC, clearedC.configurationRevision,
+          identityB.nodeId)).rejects.toMatchObject({ code: Code.Unavailable });
+        const isolatedState = b.application.voiceDictionary!.stateForSync();
+        await mobileNetwork.addVoiceInputDictionaryTerms(credentialC, (await readC()).revision, ["Phone after route clear"]);
+        await dictionaryIsolationWindow(() => {
+          expect(b.application.voiceDictionary!.stateForSync()).toEqual(isolatedState);
+          expect(a.application.voiceDictionary!.snapshot().dictionary.entries.some((entry) => entry.text === "Phone after route clear")).toBe(false);
+        });
+        finalAuthorityB = (await grant(apiB, identityC.nodeId, identityC.fingerprint)).status!;
+        await grantC();
+        expect(finalAuthorityB.peers.find((peer) => peer.peerId === identityC.nodeId)!.revision).toBe(retainedGrant.revision);
+        finalTerms.push("Phone after route clear");
+        await converge(finalTerms, 2);
+      }
       const stable = await Promise.all([readA(), readB(), readC()]);
       for (let replay = 0; replay < 2; replay += 1) {
-        await apiB.syncVoiceInputDictionaryNow({ expectedConfigurationRevision: renewedB.configurationRevision });
+        await apiB.syncVoiceInputDictionaryNow({ expectedConfigurationRevision: finalAuthorityB.configurationRevision });
         const currentC = await mobileNetwork.getVoiceInputDictionaryPeerStatus(credentialC);
         await mobileNetwork.syncVoiceInputDictionaryNow(credentialC, currentC.configurationRevision);
       }
@@ -652,7 +741,7 @@ class ProductionDictionaryNode {
     this.#pairingCodes = input.pairingCodes; this.#removePairingListener = input.removePairingListener;
   }
 
-  static async start(root: string): Promise<ProductionDictionaryNode> {
+  static async start(root: string, options: { readonly directOnly?: boolean } = {}): Promise<ProductionDictionaryNode> {
     const workspace = join(root, "workspace");
     const dataDirectory = join(root, "data");
     await mkdir(workspace, { recursive: true });
@@ -661,6 +750,7 @@ class ProductionDictionaryNode {
       publicOrigin: "http://127.0.0.1", internalOrigin: "http://127.0.0.1:4317",
       dataDirectory, databasePath: join(dataDirectory, "orchestrator.db"),
       allowInsecureLoopback: true, allowInsecureLan: false, lanDiscoveryEnabled: false,
+      ...(options.directOnly ? { voiceDictionaryLanDiscoveryEnabled: false } : {}),
       piExecutable: join(root, "missing-pi"), codexExecutable: join(root, "missing-codex"), claudeCodeExecutable: join(root, "missing-claude"),
       piAgentHome: join(dataDirectory, "pi-agent-home"),
       workspace: { id: "workspace-dictionary-product", root: workspace, displayName: "Dictionary product", trusted: true },
@@ -713,4 +803,14 @@ class ProductionDictionaryNode {
     })();
     return this.#closing;
   }
+}
+
+async function dictionaryListenerPort(): Promise<number> {
+  const server = net.createServer();
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject); server.listen({ host: "127.0.0.1", port: 0 }, resolve);
+  });
+  const port = (server.address() as net.AddressInfo).port;
+  await new Promise<void>((resolve, reject) => server.close((error) => error === undefined ? resolve() : reject(error)));
+  return port;
 }

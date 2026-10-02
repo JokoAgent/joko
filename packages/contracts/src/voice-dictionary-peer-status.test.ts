@@ -1,7 +1,7 @@
 import { create } from "@bufbuild/protobuf";
 import { describe, expect, it } from "vitest";
 import { VoiceInputDictionaryPeerStatusSchema, VoiceInputDictionaryPeerPhase, VoiceInputDictionaryPeerErrorCode } from "./gen/joko/v1/voice_pb.js";
-import { nextVoiceDictionaryWatchSequence, projectVoiceDictionaryPeerStatus } from "./voice-dictionary-peer-status.js";
+import { nextVoiceDictionaryWatchSequence, projectVoiceDictionaryPeerStatus, readVoiceDictionaryPeerInvitation, readVoiceDictionaryPeerListener } from "./voice-dictionary-peer-status.js";
 
 function status() {
   return create(VoiceInputDictionaryPeerStatusSchema, {
@@ -14,6 +14,25 @@ function status() {
   });
 }
 describe("strict dictionary sharing projection", () => {
+  it("previews only complete public invitations and distinguishes configured routes from online presence", () => {
+    const invitation = { version: 1, nodeId: "node-direct", displayName: "Direct peer", publicKey: "MCowBQYDK2VuAyEA" + "A".repeat(43) + "=",
+      fingerprint: "d".repeat(64), host: "peer.example", port: 43_121 };
+    expect(readVoiceDictionaryPeerInvitation(JSON.stringify(invitation))).toEqual(invitation);
+    expect(readVoiceDictionaryPeerInvitation(JSON.stringify({ ...invitation, host: "::1" })).host).toBe("::1");
+    for (const patch of [{ version: 2 }, { publicKey: "A".repeat(60) }, { fingerprint: "D".repeat(64) }, { authKey: "private" },
+      { host: "https://peer.example/path" }, { host: "peer.example:443" }, { host: "127.1" }, { port: 0 }, { port: 65_536 }]) {
+      expect(() => readVoiceDictionaryPeerInvitation(JSON.stringify({ ...invitation, ...patch }))).toThrow(/invalid/u);
+    }
+    expect(() => readVoiceDictionaryPeerInvitation(JSON.stringify({ ...invitation, fingerprint: undefined }))).toThrow(/invalid/u);
+    expect(() => readVoiceDictionaryPeerListener({ listenPort: 0, host: "peer.example", port: 43_121 })).toThrow(/invalid/u);
+    const wire = status(); wire.phase = VoiceInputDictionaryPeerPhase.WAITING; wire.peers[0]!.online = false;
+    wire.peers[0]!.route = { $typeName: "joko.v1.VoiceInputDictionaryPeerEndpoint", host: "peer.example", port: 43_121 };
+    wire.listener = { $typeName: "joko.v1.VoiceInputDictionaryListener", listenPort: 43_121, host: "self.example", port: 44_121 };
+    expect(projectVoiceDictionaryPeerStatus(wire)).toMatchObject({ listener: { listenPort: 43_121, host: "self.example", port: 44_121 },
+      peers: [{ online: false, route: { host: "peer.example", port: 43_121 } }] });
+    wire.peers[0]!.route.port = 0;
+    expect(() => projectVoiceDictionaryPeerStatus(wire)).toThrow(/invalid/u);
+  });
   it("accepts only contiguous safe watch sequences from the first full projection", () => {
     expect(nextVoiceDictionaryWatchSequence(1n, 0n)).toBe(1n);
     expect(nextVoiceDictionaryWatchSequence(2n, 1n)).toBe(2n);

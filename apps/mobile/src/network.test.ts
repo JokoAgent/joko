@@ -34,6 +34,13 @@ import {
   ApplyVoiceInputDictionaryLearningResponseSchema,
   AddVoiceInputDictionaryTermsRequestSchema,
   ApplyVoiceInputDictionaryLearningRequestSchema,
+  ConfigureVoiceInputDictionaryListenerResponseSchema,
+  ConfigureVoiceInputDictionaryListenerRequestSchema,
+  GetVoiceInputDictionaryPeerInvitationResponseSchema,
+  GrantVoiceInputDictionaryDirectPeerResponseSchema,
+  GrantVoiceInputDictionaryDirectPeerRequestSchema,
+  ClearVoiceInputDictionaryPeerRouteResponseSchema,
+  ClearVoiceInputDictionaryPeerRouteRequestSchema,
   WorkspaceEntrySchema,
   WorkspaceSearchMatchSchema
 } from "@joko/contracts";
@@ -62,6 +69,46 @@ import {
 import { projectMobileVoiceDictionarySnapshot, mobileVoiceDictionaryLearningRequest } from "./mobile-voice-dictionary-service";
 
 describe("mobile voice ephemeral requests", () => {
+  it("uses generated direct-route requests with separate revision and fingerprint confirmation and validates the public invitation", async () => {
+    const listener = { listenPort: 43_121, host: "self.example", port: 44_121 };
+    const status = { available: true, configurationRevision: 4n, nodeId: "node-a", fingerprint: "a".repeat(64), enabled: true,
+      phase: VoiceInputDictionaryPeerPhase.WAITING, listener,
+      peers: [{ peerId: "node-b", revision: 3n, displayName: "Peer", fingerprint: "b".repeat(64), online: false,
+        grantedAt: { seconds: 1n }, route: { host: "peer.example", port: 43_121 } }] };
+    let invitation = JSON.stringify({ version: 1, nodeId: "node-a", displayName: "Node", publicKey: "MCowBQYDK2VuAyEA" + "A".repeat(43) + "=",
+      fingerprint: "a".repeat(64), host: listener.host, port: listener.port });
+    const calls: Array<{ method: string; body: Uint8Array }> = [];
+    const credential: PairedCredential = { profileId: "direct-profile", origin: "https://node.example", serverId: "node-a", connectionId: "direct-connection",
+      deviceId: "direct-phone", displayName: "Phone", authKey: "direct-test-key" };
+    const fetch = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const request = new Request(input, init);
+      expect(request.headers.get("authorization")).toBe("Bearer direct-test-key");
+      const method = request.url.slice(request.url.lastIndexOf("/") + 1);
+      calls.push({ method, body: new Uint8Array(await request.arrayBuffer()) });
+      const responses = {
+        ConfigureVoiceInputDictionaryListener: toBinary(ConfigureVoiceInputDictionaryListenerResponseSchema, create(ConfigureVoiceInputDictionaryListenerResponseSchema, { status })),
+        GetVoiceInputDictionaryPeerInvitation: toBinary(GetVoiceInputDictionaryPeerInvitationResponseSchema, create(GetVoiceInputDictionaryPeerInvitationResponseSchema, { invitation })),
+        GrantVoiceInputDictionaryDirectPeer: toBinary(GrantVoiceInputDictionaryDirectPeerResponseSchema, create(GrantVoiceInputDictionaryDirectPeerResponseSchema, { status })),
+        ClearVoiceInputDictionaryPeerRoute: toBinary(ClearVoiceInputDictionaryPeerRouteResponseSchema, create(ClearVoiceInputDictionaryPeerRouteResponseSchema, { status }))
+      };
+      const bytes = responses[method as keyof typeof responses];
+      if (!bytes) throw new Error("Unexpected direct dictionary RPC.");
+      return new Response(bytes, { status: 200, headers: { "content-type": "application/proto" } });
+    });
+    try {
+      await expect(mobileNetwork.configureVoiceInputDictionaryListener(credential, 3n, listener)).resolves.toMatchObject({ listener, peers: [{ online: false, route: { host: "peer.example", port: 43_121 } }] });
+      await expect(mobileNetwork.getVoiceInputDictionaryPeerInvitation(credential)).resolves.toBe(invitation);
+      await mobileNetwork.grantVoiceInputDictionaryDirectPeer(credential, 4n, invitation, "a".repeat(64));
+      await mobileNetwork.clearVoiceInputDictionaryPeerRoute(credential, 4n, "node-b");
+      await mobileNetwork.configureVoiceInputDictionaryListener(credential, 4n, undefined);
+      expect(fromBinary(ConfigureVoiceInputDictionaryListenerRequestSchema, calls[0]!.body)).toMatchObject({ expectedConfigurationRevision: 3n, listener });
+      expect(fromBinary(GrantVoiceInputDictionaryDirectPeerRequestSchema, calls[2]!.body)).toMatchObject({ expectedConfigurationRevision: 4n, invitation, expectedFingerprint: "a".repeat(64) });
+      expect(fromBinary(ClearVoiceInputDictionaryPeerRouteRequestSchema, calls[3]!.body)).toMatchObject({ expectedConfigurationRevision: 4n, peerId: "node-b" });
+      expect(fromBinary(ConfigureVoiceInputDictionaryListenerRequestSchema, calls[4]!.body).listener).toBeUndefined();
+      invitation = JSON.stringify({ version: 1, authKey: "private" });
+      await expect(mobileNetwork.getVoiceInputDictionaryPeerInvitation(credential)).rejects.toThrow(/invalid/u);
+    } finally { fetch.mockRestore(); }
+  });
   it.each(["content", "sharing", "readonly"] as const)("decodes the generated %s stream and cancels its HTTP owner after a duplicate sequence or consumer return", async (kind) => {
     const signals: AbortSignal[] = [];
     const credential: PairedCredential = { profileId: "voice-profile", origin: "https://node.example", serverId: "voice-server", connectionId: "voice-connection", deviceId: "voice-device", displayName: "Voice phone", authKey: "voice-test-key" };

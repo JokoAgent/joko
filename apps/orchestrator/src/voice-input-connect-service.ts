@@ -31,7 +31,8 @@ export function createVoiceInputConnectService(
   dictionary: Pick<VoiceDictionarySyncRepository,
     "addManualTerms" | "applyLearning" | "deleteEntry" | "editEntry" | "setEnabled" | "snapshot" | "readOnlySnapshot" | "subscribe"> | undefined,
   authenticate: (context: HandlerContext) => VoiceInputRpcOwner,
-  peers?: Pick<VoiceDictionaryPeerManager, "status" | "grantCandidate" | "revokePeer" | "syncNow" | "subscribe">,
+  peers?: Pick<VoiceDictionaryPeerManager, "status" | "grantCandidate" | "revokePeer" | "syncNow" | "subscribe" |
+    "configureListener" | "invitation" | "grantDirectPeer" | "clearPeerRoute">,
   onRevoked?: (connectionId: string, listener: () => void) => () => void,
   shutdownSignal?: AbortSignal
 ): ServiceImpl<typeof contract.VoiceInputService> {
@@ -90,6 +91,37 @@ export function createVoiceInputConnectService(
       authenticate(context);
       return create(contract.GetVoiceInputDictionaryPeerStatusResponseSchema, { status: toProtoPeerStatus(requirePeers(peers).status()) });
     }),
+    configureVoiceInputDictionaryListener: async (request, context) => voiceRpc(async () => {
+      authenticate(context);
+      requireActiveMutation(context);
+      let listener: contract.VoiceDictionaryPeerListener | undefined;
+      try { listener = request.listener === undefined ? undefined : contract.readVoiceDictionaryPeerListener({
+        host: request.listener.host, port: request.listener.port, listenPort: request.listener.listenPort }); }
+      catch { throw new ConnectError("Dictionary listener is invalid.", Code.InvalidArgument); }
+      const status = requirePeers(peers).configureListener(requirePeerRevision(request.expectedConfigurationRevision), listener);
+      return create(contract.ConfigureVoiceInputDictionaryListenerResponseSchema, { status: toProtoPeerStatus(status) });
+    }),
+    getVoiceInputDictionaryPeerInvitation: async (_request, context) => voiceRpc(async () => {
+      authenticate(context);
+      requireActiveMutation(context);
+      const invitation = await requirePeers(peers).invitation();
+      requireActiveMutation(context);
+      authenticate(context);
+      return create(contract.GetVoiceInputDictionaryPeerInvitationResponseSchema, { invitation });
+    }),
+    grantVoiceInputDictionaryDirectPeer: async (request, context) => voiceRpc(async () => {
+      authenticate(context);
+      requireActiveMutation(context);
+      const status = requirePeers(peers).grantDirectPeer(requirePeerRevision(request.expectedConfigurationRevision),
+        request.invitation, requireFingerprint(request.expectedFingerprint));
+      return create(contract.GrantVoiceInputDictionaryDirectPeerResponseSchema, { status: toProtoPeerStatus(status) });
+    }),
+    clearVoiceInputDictionaryPeerRoute: async (request, context) => voiceRpc(async () => {
+      authenticate(context);
+      requireActiveMutation(context);
+      const status = requirePeers(peers).clearPeerRoute(requirePeerRevision(request.expectedConfigurationRevision), requirePeerId(request.peerId));
+      return create(contract.ClearVoiceInputDictionaryPeerRouteResponseSchema, { status: toProtoPeerStatus(status) });
+    }),
     grantVoiceInputDictionaryPeer: async (request, context) => voiceRpc(async () => {
       authenticate(context);
       requireActiveMutation(context);
@@ -104,11 +136,20 @@ export function createVoiceInputConnectService(
       return create(contract.RevokeVoiceInputDictionaryPeerResponseSchema, { status: toProtoPeerStatus(status) });
     }),
     syncVoiceInputDictionaryNow: async (request, context) => voiceRpc(async () => {
-      authenticate(context);
+      const owner = authenticate(context);
       requireActiveMutation(context);
       const runtime = requirePeers(peers);
       if (runtime.status().configurationRevision !== requirePeerRevision(request.expectedConfigurationRevision)) throw new ConnectError("Dictionary peer authority changed.", Code.Aborted);
-      await runtime.syncNow(request.peerId === undefined ? undefined : requirePeerId(request.peerId));
+      const revoked = new AbortController();
+      const unsubscribe = onRevoked?.(owner.connectionId, () => revoked.abort());
+      const signal = onRevoked === undefined ? context.signal : AbortSignal.any([context.signal, revoked.signal]);
+      const delivery = { signal, isCurrent: () => {
+        if (signal.aborted) return false;
+        try { authenticate(context); return true; } catch { return false; }
+      } };
+      try { await runtime.syncNow(request.peerId === undefined ? undefined : requirePeerId(request.peerId), delivery); }
+      catch (error) { requireActiveMutation(context); authenticate(context); throw error; }
+      finally { unsubscribe?.(); }
       requireActiveMutation(context);
       authenticate(context);
       return create(contract.SyncVoiceInputDictionaryNowResponseSchema, { status: toProtoPeerStatus(runtime.status()) });
@@ -570,7 +611,9 @@ function toProtoPeerStatus(value: VoiceDictionaryPeerStatus): contract.VoiceInpu
   return create(contract.VoiceInputDictionaryPeerStatusSchema, {
     available: value.available, configurationRevision: value.configurationRevision, nodeId: value.nodeId,
     fingerprint: value.fingerprint, enabled: value.enabled, phase, ...(errorCode === undefined ? {} : { errorCode }),
+    ...(value.listener === undefined ? {} : { listener: create(contract.VoiceInputDictionaryListenerSchema, value.listener) }),
     peers: value.peers.map((peer) => create(contract.VoiceInputDictionaryPeerSchema, { ...peer,
+      ...(peer.route === undefined ? {} : { route: create(contract.VoiceInputDictionaryPeerEndpointSchema, peer.route) }),
       grantedAt: toProtoTimestamp(peer.grantedAt), lastSyncAt: peer.lastSyncAt === undefined ? undefined : toProtoTimestamp(peer.lastSyncAt) })),
     candidates: value.candidates.map((candidate) => create(contract.VoiceInputDictionaryPeerCandidateSchema, { ...candidate,
       seenAt: toProtoTimestamp(candidate.seenAt) }))

@@ -54,6 +54,15 @@ export interface NodeSyncLanAuthContext {
   readonly data: string;
 }
 
+export interface NodeSyncProbeAuthContext {
+  readonly kind: "probe-request" | "probe-ack";
+  readonly sourceNodeId: string;
+  readonly destinationNodeId: string;
+  readonly challenge: string;
+  readonly requesterPublicKey: string;
+  readonly responderPublicKey: string;
+}
+
 export function generateNodeSyncIdentity(): NodeSyncExportedIdentity {
   const { publicKey, privateKey } = generateKeyPairSync("x25519");
   return { publicKey: exportPublicKey(publicKey), privateKey: exportPrivateKey(privateKey) };
@@ -141,6 +150,38 @@ export function verifyNodeSyncLanProof(
   } catch {
     return false;
   }
+}
+
+export function createNodeSyncProbeProof(
+  purpose: NodeSyncPurpose,
+  ownPrivateKey: string,
+  peerPublicKey: string,
+  context: NodeSyncProbeAuthContext
+): string {
+  if ((context.kind !== "probe-request" && context.kind !== "probe-ack") || !isNodeId(context.sourceNodeId) ||
+    !isNodeId(context.destinationNodeId) || !isCanonicalBase64(context.challenge, 24) ||
+    !isValidNodeSyncPublicKey(context.requesterPublicKey) || !isValidNodeSyncPublicKey(context.responderPublicKey)) {
+    throw new Error("Node sync probe authentication context is invalid.");
+  }
+  const domain = nodeSyncDomain(purpose).lanAuth;
+  const key = deriveSharedKey(ownPrivateKey, peerPublicKey, domain);
+  const message = [domain, context.kind, context.sourceNodeId, context.destinationNodeId, context.challenge,
+    context.requesterPublicKey, context.responderPublicKey].join("\u0000");
+  return createHmac("sha256", key).update(Buffer.from(message, "utf8")).digest("base64");
+}
+
+export function verifyNodeSyncProbeProof(
+  purpose: NodeSyncPurpose,
+  proof: string,
+  ownPrivateKey: string,
+  peerPublicKey: string,
+  context: NodeSyncProbeAuthContext
+): boolean {
+  try {
+    const supplied = decodeExactBase64(proof, 32, "Node sync probe proof");
+    const expected = Buffer.from(createNodeSyncProbeProof(purpose, ownPrivateKey, peerPublicKey, context), "base64");
+    return timingSafeEqual(supplied, expected);
+  } catch { return false; }
 }
 
 function deriveEncryptionKey(

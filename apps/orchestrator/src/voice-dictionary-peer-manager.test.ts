@@ -1,5 +1,6 @@
 import { createHash, randomInt } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
+import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -25,6 +26,83 @@ const inProcessCodec: VoiceDictionaryPeerCodec = {
 };
 
 describe("Voice dictionary peer authority and exchange", () => {
+  it("pins a public invitation and its route atomically, rejects mismatched fingerprints and retires a pending direct probe on client cancellation", async () => {
+    const fixture = await localFixture("direct-authority");
+    const peer = generateNodeSyncIdentity();
+    const probed = deferred<void>();
+    const result = deferred<boolean>();
+    const send = vi.fn(async () => true);
+    let probeDelivery: { readonly signal: AbortSignal; readonly isCurrent: () => boolean } | undefined;
+    const manager = new VoiceDictionaryPeerManager({ ...fixture.options, codec: inProcessCodec,
+      transportFactory: () => ({ ...emptyTransport(), listenerPort: () => fixture.peers.listener()?.listenPort,
+        eligiblePeerIds: () => fixture.peers.peers().map((value) => value.peerId),
+        probe: async (_peerId, delivery) => { probeDelivery = delivery; probed.resolve(); return result.promise; }, send }) });
+    cleanups.push(() => manager.close());
+    await manager.initialize();
+    fixture.dictionary.setEnabled(fixture.dictionary.snapshot().revision, true);
+    const listener = { listenPort: 57500, host: "dictionary.example.test", port: 44380 };
+    manager.configureListener(manager.status().configurationRevision, listener);
+    const exported = JSON.parse(await manager.invitation());
+    expect(exported).toEqual({ version: 1, nodeId: fixture.options.nodeId, displayName: fixture.options.displayName,
+      publicKey: fixture.peers.identity()!.publicKey, fingerprint: manager.status().fingerprint, host: listener.host, port: listener.port });
+    const invitation = JSON.stringify({ ...exported, nodeId: "node-direct", displayName: "Direct peer",
+      publicKey: peer.publicKey, fingerprint: keyFingerprint(peer.publicKey), host: "2001:db8::1", port: 57501 });
+    const revision = manager.status().configurationRevision;
+    expect(() => manager.grantDirectPeer(revision, invitation, "0".repeat(64))).toThrow(/invalid/u);
+    expect(() => manager.grantDirectPeer(revision, JSON.stringify({ ...JSON.parse(invitation), extra: true }), keyFingerprint(peer.publicKey))).toThrow(/invalid/u);
+    expect(fixture.peers.peers()).toEqual([]);
+    const status = manager.grantDirectPeer(revision, invitation, keyFingerprint(peer.publicKey));
+    expect(status.peers[0]).toMatchObject({ route: { host: "2001:db8::1", port: 57501 }, online: false });
+    await manager.invitation();
+    const abort = new AbortController();
+    const syncing = manager.syncNow("node-direct", { signal: abort.signal, isCurrent: () => !abort.signal.aborted });
+    const rejected = expect(syncing).rejects.toThrow(/unavailable/u);
+    await probed.promise;
+    abort.abort(); result.resolve(true); await rejected;
+    expect(probeDelivery?.signal.aborted).toBe(true);
+    expect(probeDelivery?.isCurrent()).toBe(false);
+    expect(send).not.toHaveBeenCalled();
+    expect(fixture.peers.peer("node-direct")?.lastSyncAt).toBeUndefined();
+    expect(manager.status().errorCode).toBeUndefined();
+    await manager.syncNow("node-direct");
+    expect(send).toHaveBeenCalled();
+    expect(fixture.peers.peer("node-direct")?.lastSyncAt).toBeDefined();
+    const grantRevision = fixture.peers.peer("node-direct")!.revision;
+    manager.clearPeerRoute(manager.status().configurationRevision, "node-direct");
+    expect(fixture.peers.peer("node-direct")?.revision).toBe(grantRevision);
+    expect(fixture.peers.peer("node-direct")?.route).toBeUndefined();
+  });
+
+  it("retires a cancelled foreground ACK while preserving a coalesced independent exchange and its real failure", async () => {
+    const fixture = await localFixture("foreground-exchange");
+    const peer = generateNodeSyncIdentity();
+    const sent = deferred<void>();
+    const ack = deferred<boolean>();
+    let online = false;
+    let attempts = 0;
+    const manager = new VoiceDictionaryPeerManager({ ...fixture.options, codec: inProcessCodec,
+      transportFactory: () => ({ ...emptyTransport(), onlinePeerIds: () => online ? ["node-remote"] : [],
+        send: async () => { attempts += 1; if (attempts === 1) { sent.resolve(); return ack.promise; } return false; } }) });
+    cleanups.push(() => manager.close());
+    await manager.initialize();
+    fixture.dictionary.setEnabled(fixture.dictionary.snapshot().revision, true);
+    fixture.peers.grantPeer({ expectedRevision: fixture.peers.configurationRevision(), peerId: "node-remote",
+      displayName: "Remote", publicKey: peer.publicKey, fingerprint: keyFingerprint(peer.publicKey) });
+    online = true;
+    const abort = new AbortController();
+    const foreground = manager.syncNow("node-remote", { signal: abort.signal, isCurrent: () => !abort.signal.aborted });
+    const foregroundRejected = expect(foreground).rejects.toThrow(/unavailable/u);
+    await sent.promise;
+    const background = manager.syncNow("node-remote");
+    const backgroundRejected = expect(background).rejects.toThrow(/reachable/u);
+    await Promise.resolve();
+    abort.abort(); ack.resolve(true);
+    await foregroundRejected; await backgroundRejected;
+    expect(attempts).toBe(2);
+    expect(fixture.peers.peer("node-remote")?.lastSyncAt).toBeUndefined();
+    expect(manager.status().errorCode).toBe("sync_failed");
+  });
+
   it("notifies projection subscribers after durable changes and retires them before its private store closes", async () => {
     const fixture = await localFixture("projection");
     const manager = new VoiceDictionaryPeerManager(fixture.options);
@@ -42,6 +120,111 @@ describe("Voice dictionary peer authority and exchange", () => {
     expect(() => manager.status()).toThrow(/unavailable/u);
     expect(() => manager.subscribe(() => undefined)).toThrow(/unavailable/u);
   });
+
+  it("coalesces concurrent durable exchanges when LAN and direct routes coexist and retains LAN sharing after clearing direct routes", { timeout: 25_000 }, async () => {
+    const first = await localFixture("coexisting-first");
+    const second = await localFixture("coexisting-second");
+    const [firstPort, secondPort] = await temporaryListenerPorts();
+    const encoding = new Map<string, { active: number; maximum: number; calls: number }>();
+    const release = deferred<void>();
+    let holdNextFirstEncode = false;
+    let firstEncodeHeld = false;
+    const codec: VoiceDictionaryPeerCodec = { ...inProcessCodec, encode: async (options) => {
+      const key = `${options.sourceNodeId}->${options.destinationNodeId}`;
+      const count = encoding.get(key) ?? { active: 0, maximum: 0, calls: 0 };
+      encoding.set(key, count);
+      count.active += 1; count.calls += 1;
+      count.maximum = Math.max(count.maximum, count.active);
+      try {
+        if (holdNextFirstEncode && options.sourceNodeId === first.options.nodeId) {
+          holdNextFirstEncode = false;
+          firstEncodeHeld = true;
+          await release.promise;
+        }
+        return encodeVoiceDictionaryPeerMessage(options);
+      } finally { count.active -= 1; }
+    } };
+    const firstManager = new VoiceDictionaryPeerManager({ ...first.options, codec, enableLan: true, debounceMilliseconds: 30 });
+    const secondManager = new VoiceDictionaryPeerManager({ ...second.options, codec, enableLan: true, debounceMilliseconds: 30 });
+    cleanups.push(() => firstManager.close(), () => secondManager.close(), () => release.resolve());
+    await firstManager.initialize();
+    await secondManager.initialize();
+    firstManager.configureListener(firstManager.status().configurationRevision, { listenPort: firstPort, host: "127.0.0.1", port: firstPort });
+    secondManager.configureListener(secondManager.status().configurationRevision, { listenPort: secondPort, host: "127.0.0.1", port: secondPort });
+    first.dictionary.addManualTerm(first.dictionary.snapshot().revision, "Initial shared state");
+    await firstManager.setEnabled(first.dictionary.snapshot().revision, true);
+    await secondManager.setEnabled(second.dictionary.snapshot().revision, true);
+    // Neither owner has an explicit peer route yet, so these candidates come from real default LAN discovery.
+    await waitUntil(() => firstManager.status().candidates.some((value) => value.nodeId === second.options.nodeId) &&
+      secondManager.status().candidates.some((value) => value.nodeId === first.options.nodeId), 7_000);
+    const firstInvitation = await firstManager.invitation();
+    const secondInvitation = await secondManager.invitation();
+    firstManager.grantDirectPeer(firstManager.status().configurationRevision, secondInvitation, secondManager.status().fingerprint);
+    secondManager.grantDirectPeer(secondManager.status().configurationRevision, firstInvitation, firstManager.status().fingerprint);
+    await firstManager.invitation();
+    await secondManager.invitation();
+    expect(firstManager.status().peers[0]?.route).toEqual({ host: "127.0.0.1", port: secondPort });
+    expect(secondManager.status().peers[0]?.route).toEqual({ host: "127.0.0.1", port: firstPort });
+    await waitUntil(() => second.dictionary.snapshot().dictionary.entries.some((value) => value.text === "Initial shared state"));
+    first.dictionary.learn(first.dictionary.snapshot().revision, { text: "Learned across routes", aliases: ["spoken across routes"], stage: "entry" });
+    await waitUntil(() => second.dictionary.readOnlySnapshot().entries.some((value) => value.text === "Learned across routes") &&
+      firstManager.status().phase !== "syncing" && secondManager.status().phase !== "syncing");
+
+    holdNextFirstEncode = true;
+    const firstSync = firstManager.syncNow(second.options.nodeId);
+    await waitUntil(() => firstEncodeHeld);
+    const coalescedSync = firstManager.syncNow(second.options.nodeId);
+    first.dictionary.learn(first.dictionary.snapshot().revision, { text: "Learned across routes", aliases: ["spoken across routes"], stage: "entry" });
+    second.dictionary.addManualTerm(second.dictionary.snapshot().revision, "Concurrent shared state");
+    const reverseSync = secondManager.syncNow(first.options.nodeId);
+    const overlapping = Promise.allSettled([firstSync, coalescedSync, reverseSync]);
+    await waitUntil(() => first.dictionary.snapshot().dictionary.entries.some((value) => value.text === "Concurrent shared state"));
+    expect(encoding.get(`${first.options.nodeId}->${second.options.nodeId}`)?.active).toBe(1);
+    release.resolve();
+    expect((await overlapping).map((value) => value.status)).toEqual(["fulfilled", "fulfilled", "fulfilled"]);
+    await waitUntil(() => JSON.stringify(first.dictionary.stateForSync()) === JSON.stringify(second.dictionary.stateForSync()) &&
+      firstManager.status().phase !== "syncing" && secondManager.status().phase !== "syncing");
+    expect(first.dictionary.readOnlySnapshot().entries).toContainEqual({ text: "Learned across routes", frequency: 2,
+      aliases: [{ text: "spoken across routes", count: 2 }] });
+    expect(first.dictionary.stateForSync()).toEqual(second.dictionary.stateForSync());
+    expect(first.dictionary.readOnlySnapshot().stateVector).toEqual(second.dictionary.readOnlySnapshot().stateVector);
+    const stable = [first.dictionary.readOnlySnapshot(), second.dictionary.readOnlySnapshot()];
+    await Promise.all([firstManager.syncNow(second.options.nodeId), secondManager.syncNow(first.options.nodeId)]);
+    await waitUntil(() => firstManager.status().phase !== "syncing" && secondManager.status().phase !== "syncing");
+    expect([first.dictionary.readOnlySnapshot(), second.dictionary.readOnlySnapshot()]).toEqual(stable);
+    expect([...encoding.values()]).toHaveLength(2);
+    for (const count of encoding.values()) {
+      expect(count.calls).toBeGreaterThan(1);
+      expect(count.maximum).toBe(1);
+    }
+
+    const authority = (manager: VoiceDictionaryPeerManager) => manager.status().peers.map(({ peerId, revision, fingerprint, grantedAt }) =>
+      ({ peerId, revision, fingerprint, grantedAt }));
+    const grants = [authority(firstManager), authority(secondManager)];
+    firstManager.clearPeerRoute(firstManager.status().configurationRevision, second.options.nodeId);
+    secondManager.clearPeerRoute(secondManager.status().configurationRevision, first.options.nodeId);
+    await firstManager.invitation();
+    await secondManager.invitation();
+    expect([authority(firstManager), authority(secondManager)]).toEqual(grants);
+    expect(firstManager.status().peers[0]?.route).toBeUndefined();
+    expect(secondManager.status().peers[0]?.route).toBeUndefined();
+    await waitUntil(() => firstManager.status().peers[0]?.online === true && secondManager.status().peers[0]?.online === true, 7_000);
+    first.dictionary.learn(first.dictionary.snapshot().revision, { text: "Learned across routes", aliases: ["spoken across routes"], stage: "entry" });
+    second.dictionary.addManualTerm(second.dictionary.snapshot().revision, "LAN remains available");
+    await waitUntil(() => first.dictionary.snapshot().dictionary.entries.some((value) => value.text === "LAN remains available") &&
+      second.dictionary.readOnlySnapshot().entries.some((value) => value.text === "Learned across routes" && value.frequency === 3));
+    expect(first.dictionary.stateForSync()).toEqual(second.dictionary.stateForSync());
+    expect(first.dictionary.readOnlySnapshot().entries).toContainEqual({ text: "Learned across routes", frequency: 3,
+      aliases: [{ text: "spoken across routes", count: 3 }] });
+    await waitUntil(() => firstManager.status().phase !== "syncing" && secondManager.status().phase !== "syncing");
+    const lanStable = [first.dictionary.readOnlySnapshot(), second.dictionary.readOnlySnapshot()];
+    await Promise.all([firstManager.syncNow(second.options.nodeId), secondManager.syncNow(first.options.nodeId)]);
+    await waitUntil(() => firstManager.status().phase !== "syncing" && secondManager.status().phase !== "syncing");
+    expect([first.dictionary.readOnlySnapshot(), second.dictionary.readOnlySnapshot()]).toEqual(lanStable);
+    expect([authority(firstManager), authority(secondManager)]).toEqual(grants);
+    for (const count of encoding.values()) expect(count.maximum).toBe(1);
+  });
+
   it("converges full state through two durable LAN owners, forces reconnect replies, and retains identity across restart", { timeout: 25_000 }, async () => {
     const port = randomInt(54_000, 60_000);
     const first = await lanFixture("first", port);
@@ -355,6 +538,27 @@ async function localFixture(name: string) {
   const vault = await CredentialVault.open(join(directory, "master.key"));
   cleanups.push(() => { peers.close(); store.close(); rmSync(directory, { recursive: true, force: true }); });
   return { directory, store, peers, dictionary, options: { store: peers, dictionary, vault, nodeId: `node-${name}`, displayName: `${name} computer` } };
+}
+
+async function temporaryListenerPorts(): Promise<readonly [number, number]> {
+  const servers = [createServer(), createServer()];
+  try {
+    const ports = await Promise.all(servers.map((server) => new Promise<number>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", () => {
+        server.off("error", reject);
+        const address = server.address();
+        if (address === null || typeof address === "string") reject(new Error("A temporary TCP listener did not expose its port."));
+        else resolve(address.port);
+      });
+    })));
+    return [ports[0]!, ports[1]!];
+  } finally {
+    await Promise.all(servers.map((server) => new Promise<void>((resolve, reject) => {
+      if (!server.listening) { resolve(); return; }
+      server.close((error) => { if (error === undefined) resolve(); else reject(error); });
+    })));
+  }
 }
 
 async function lanFixture(name: string, multicastPort: number) {

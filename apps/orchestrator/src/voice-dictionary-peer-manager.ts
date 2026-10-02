@@ -1,32 +1,28 @@
 import { createHash } from "node:crypto";
 
 import {
-  generateNodeSyncIdentity, isValidNodeSyncPrivateKey, nodeSyncPublicKeyFromPrivate, NodeSyncLanTransport,
-  type NodeSyncCipherChunkFrame, type NodeSyncDeliveryContext, type NodeSyncLanCandidate,
+  generateNodeSyncIdentity, isValidNodeSyncPrivateKey, isValidNodeSyncPublicKey, nodeSyncPublicKeyFromPrivate,
+  type NodeSyncCipherChunkFrame, type NodeSyncDeliveryContext,
   type NodeSyncLanLogger, type NodeSyncLanTransportOptions
 } from "@joko/node-sync";
-import { VoiceDictionaryPeerStore, type VoiceDictionaryPeerGrant } from "@joko/store";
+import { VoiceDictionaryPeerStore, type VoiceDictionaryPeerGrant, type VoiceDictionaryPeerListener } from "@joko/store";
+import { readVoiceDictionaryPeerInvitation } from "@joko/contracts";
 import { buildStateVersionVector, type VoiceDictionarySyncState } from "@joko/voice-input";
 
 import { CredentialVault } from "./credential-vault.js";
 import { VoiceDictionaryPeerWorkerCodec } from "./voice-dictionary-sync-codec.js";
 import { VoiceDictionarySyncRepository } from "./voice-dictionary-sync-repository.js";
 import { VoiceDictionaryPeerWireDecoder, type VoiceDictionaryPeerCodec } from "./voice-dictionary-sync-wire.js";
+import { createVoiceDictionaryPeerTransport, type VoiceDictionaryPeerTransport as PeerTransport } from "./voice-dictionary-peer-transport.js";
 
-interface PeerTransport {
-  start(): Promise<void>;
-  stop(): void;
-  send(peerId: string, frame: NodeSyncCipherChunkFrame): Promise<boolean>;
-  candidates(now?: number): readonly NodeSyncLanCandidate[];
-  onlinePeerIds(now?: number): readonly string[];
-}
 interface ManagedCodec extends VoiceDictionaryPeerCodec { reset?(): void; close?(): void; }
 interface PendingExchange {
   readonly requestReply: boolean;
   readonly force: boolean;
+  readonly delivery?: NodeSyncDeliveryContext;
 }
 export class VoiceDictionaryPeerManagerError extends Error {
-  constructor(readonly code: "UNAVAILABLE" | "DISABLED" | "CONFLICT" | "OFFLINE", message: string) {
+  constructor(readonly code: "INVALID" | "UNAVAILABLE" | "DISABLED" | "CONFLICT" | "OFFLINE", message: string) {
     super(message);
     this.name = "VoiceDictionaryPeerManagerError";
   }
@@ -39,9 +35,11 @@ export interface VoiceDictionaryPeerStatus {
   readonly enabled: boolean;
   readonly phase: "off" | "waiting" | "syncing" | "up_to_date" | "error";
   readonly errorCode?: "identity_unavailable" | "dictionary_unavailable" | "sync_failed";
+  readonly listener?: VoiceDictionaryPeerListener;
   readonly peers: readonly {
     readonly peerId: string; readonly revision: bigint; readonly displayName: string;
     readonly fingerprint: string; readonly online: boolean; readonly grantedAt: number; readonly lastSyncAt?: number;
+    readonly route?: { readonly host: string; readonly port: number };
   }[];
   readonly candidates: readonly {
     readonly nodeId: string; readonly displayName: string; readonly fingerprint: string;
@@ -87,6 +85,7 @@ export class VoiceDictionaryPeerManager {
     readonly codec?: ManagedCodec; readonly transportFactory?: (options: NodeSyncLanTransportOptions) => PeerTransport;
     readonly logger?: NodeSyncLanLogger; readonly onChanged?: () => void;
     readonly debounceMilliseconds?: number; readonly fallbackMilliseconds?: number;
+    readonly enableLan?: boolean;
   }) {
     if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/u.test(options.nodeId) || options.displayName !== options.displayName.trim() ||
       options.displayName.length < 1 || options.displayName.length > 100 || /[\u0000-\u001f\u007f]/u.test(options.displayName)) throw new TypeError("Dictionary peer node metadata is invalid.");
@@ -94,7 +93,7 @@ export class VoiceDictionaryPeerManager {
     this.#nodeId = options.nodeId; this.#displayName = options.displayName;
     this.#codec = options.codec ?? new VoiceDictionaryPeerWorkerCodec();
     this.#decoder = new VoiceDictionaryPeerWireDecoder(this.#codec);
-    this.#transportFactory = options.transportFactory ?? ((value) => new NodeSyncLanTransport(value));
+    this.#transportFactory = options.transportFactory ?? ((value) => createVoiceDictionaryPeerTransport(value, this.#store, options.enableLan ?? true));
     this.#logger = options.logger ?? { debug: () => undefined, warn: () => undefined };
     this.#onChanged = options.onChanged ?? (() => undefined);
     this.#debounce = options.debounceMilliseconds ?? 8_000;
@@ -139,10 +138,12 @@ export class VoiceDictionaryPeerManager {
     const online = new Set(this.#transport?.onlinePeerIds() ?? []);
     const peers = grants.map((peer) => ({ peerId: peer.peerId, revision: peer.revision, displayName: peer.displayName,
       fingerprint: peer.fingerprint, online: online.has(peer.peerId), grantedAt: peer.grantedAt,
+      ...(peer.route === undefined ? {} : { route: peer.route }),
       ...(peer.lastSyncAt === undefined ? {} : { lastSyncAt: peer.lastSyncAt }) }));
     return { available: !this.#closed && this.#initialized && this.#privateKey !== undefined && dictionaryAvailable,
       configurationRevision: this.#store.configurationRevision(), nodeId: this.#nodeId,
       fingerprint: identity === undefined ? "" : fingerprint(identity.publicKey), enabled,
+      ...(this.#store.listener() === undefined ? {} : { listener: this.#store.listener() }),
       phase: !enabled ? "off" : errorCode !== undefined ? "error" : this.#sending.size > 0 ? "syncing"
         : peers.some((peer) => peer.online && peer.lastSyncAt !== undefined) ? "up_to_date" : "waiting",
       ...(errorCode === undefined ? {} : { errorCode }), peers,
@@ -159,6 +160,43 @@ export class VoiceDictionaryPeerManager {
     const candidate = this.#transport?.candidates().find((value) => value.nodeId === peerId);
     if (candidate === undefined || candidate.fingerprint !== expectedFingerprint) throw new VoiceDictionaryPeerManagerError("CONFLICT", "The dictionary peer candidate identity is no longer current.");
     this.#store.grantPeer({ expectedRevision, peerId, displayName: candidate.displayName, publicKey: candidate.publicKey, fingerprint: expectedFingerprint });
+    return this.status();
+  }
+
+  configureListener(expectedRevision: bigint, listener: VoiceDictionaryPeerListener | undefined): VoiceDictionaryPeerStatus {
+    this.#assertReady();
+    this.#store.configureListener(expectedRevision, listener);
+    return this.status();
+  }
+
+  async invitation(): Promise<string> {
+    this.#assertReady();
+    if (!this.#enabled) throw new VoiceDictionaryPeerManagerError("DISABLED", "Dictionary sharing is disabled.");
+    const generation = this.#generation;
+    await this.#ensureTransport();
+    this.#assertSyncCurrent(generation);
+    const listener = this.#store.listener();
+    const identity = this.#store.identity()!;
+    if (listener === undefined || this.#transport?.listenerPort?.() !== listener.listenPort) throw unavailable();
+    return JSON.stringify({ version: 1, nodeId: this.#nodeId, displayName: this.#displayName,
+      publicKey: identity.publicKey, fingerprint: fingerprint(identity.publicKey), host: listener.host, port: listener.port });
+  }
+
+  grantDirectPeer(expectedRevision: bigint, raw: string, expectedFingerprint: string): VoiceDictionaryPeerStatus {
+    this.#assertReady();
+    let invitation: ReturnType<typeof readVoiceDictionaryPeerInvitation>;
+    try { invitation = readVoiceDictionaryPeerInvitation(raw); }
+    catch { throw new VoiceDictionaryPeerManagerError("INVALID", "The dictionary peer invitation is invalid."); }
+    if (!isValidNodeSyncPublicKey(invitation.publicKey) || fingerprint(invitation.publicKey) !== invitation.fingerprint ||
+      expectedFingerprint !== invitation.fingerprint) throw new VoiceDictionaryPeerManagerError("INVALID", "The dictionary peer invitation is invalid.");
+    this.#store.grantDirectPeer({ expectedRevision, peerId: invitation.nodeId, displayName: invitation.displayName,
+      publicKey: invitation.publicKey, fingerprint: expectedFingerprint, route: { host: invitation.host, port: invitation.port } });
+    return this.status();
+  }
+
+  clearPeerRoute(expectedRevision: bigint, peerId: string): VoiceDictionaryPeerStatus {
+    this.#assertReady();
+    this.#store.clearPeerRoute(expectedRevision, peerId);
     return this.status();
   }
 
@@ -180,27 +218,37 @@ export class VoiceDictionaryPeerManager {
     if (enabled) { await this.#ensureTransport(); await this.syncNow(); }
   }
 
-  async syncNow(peerId?: string): Promise<void> {
+  async syncNow(peerId?: string, delivery?: NodeSyncDeliveryContext): Promise<void> {
     this.#assertReady();
     if (!this.#dictionary.snapshot().enabled) throw new VoiceDictionaryPeerManagerError("DISABLED", "Dictionary sharing is disabled.");
     const generation = this.#generation;
+    assertDelivery(delivery);
     await this.#ensureTransport();
     this.#assertSyncCurrent(generation);
-    const online = this.#transport?.onlinePeerIds() ?? [];
-    const peers = peerId === undefined ? this.#store.peers().filter((peer) => online.includes(peer.peerId)) : [this.#store.peer(peerId)];
-    if (peerId !== undefined && (peers[0] === undefined || !online.includes(peerId))) throw offline();
+    assertDelivery(delivery);
+    const eligible = this.#transport?.eligiblePeerIds?.() ?? this.#transport?.onlinePeerIds() ?? [];
+    const peers = peerId === undefined ? this.#store.peers().filter((peer) => eligible.includes(peer.peerId)) : [this.#store.peer(peerId)];
+    if (peerId !== undefined && (peers[0] === undefined || !eligible.includes(peerId))) throw offline();
     let failure: unknown;
     let failed = false;
     for (const peer of peers) if (peer !== undefined) {
       this.#assertSyncCurrent(generation);
-      try { await this.#send(peer, true, true); }
+      assertDelivery(delivery);
+      try {
+        if (this.#transport?.probe !== undefined && !await this.#transport.probe(peer.peerId, delivery)) throw offline();
+        this.#assertSyncCurrent(generation);
+        assertDelivery(delivery);
+        await this.#send(peer, true, true, delivery);
+      }
       catch (error) {
         this.#assertSyncCurrent(generation);
+        assertDelivery(delivery);
         if (peerId !== undefined) throw error;
         if (!failed) failure = error;
         failed = true;
       }
       this.#assertSyncCurrent(generation);
+      assertDelivery(delivery);
     }
     if (failed) { this.#failed(); throw failure; }
   }
@@ -259,7 +307,7 @@ export class VoiceDictionaryPeerManager {
       this.#presenceChanged();
     }).catch((error: unknown) => {
       if (this.#transport === transport) { this.#transport = undefined; transport.stop(); }
-      throw error;
+      throw unavailable();
     }).finally(() => { if (this.#starting === starting) this.#starting = undefined; });
     this.#starting = starting;
     return starting;
@@ -300,22 +348,26 @@ export class VoiceDictionaryPeerManager {
     this.#changeTimer.unref?.();
   }
 
-  #send(peer: VoiceDictionaryPeerGrant, requestReply: boolean, force: boolean): Promise<void> {
+  #send(peer: VoiceDictionaryPeerGrant, requestReply: boolean, force: boolean, delivery?: NodeSyncDeliveryContext): Promise<void> {
     const existing = this.#sending.get(peer.peerId);
     if (existing !== undefined) {
       const pending = this.#pendingExchange.get(peer.peerId);
+      const pendingDelivery = pending === undefined ? delivery
+        : pending.delivery === undefined || delivery === undefined ? undefined : delivery;
       this.#pendingExchange.set(peer.peerId, { requestReply: requestReply || pending?.requestReply === true,
-        force: force || pending?.force === true });
+        force: force || pending?.force === true,
+        ...(pendingDelivery === undefined ? {} : { delivery: pendingDelivery }) });
       return existing;
     }
     const generation = this.#generation;
     const promise = (async () => {
-      let exchange: PendingExchange | undefined = { requestReply, force };
+      let exchange: PendingExchange | undefined = { requestReply, force, ...(delivery === undefined ? {} : { delivery }) };
       while (exchange !== undefined) {
         try { await this.#exchange(peer, generation, exchange); }
         catch (error) {
           this.#assertPeer(generation, peer);
-          if (!this.#pendingExchange.has(peer.peerId)) throw error;
+          const pending = this.#pendingExchange.get(peer.peerId);
+          if (deliveryCurrent(exchange.delivery) && (pending === undefined || !deliveryCurrent(pending.delivery))) throw error;
         }
         this.#assertPeer(generation, peer);
         exchange = this.#pendingExchange.get(peer.peerId);
@@ -338,6 +390,7 @@ export class VoiceDictionaryPeerManager {
 
   async #exchange(peer: VoiceDictionaryPeerGrant, generation: number, exchange: PendingExchange): Promise<void> {
     this.#assertPeer(generation, peer);
+    assertDelivery(exchange.delivery);
     const state = this.#dictionary.stateForSync();
     const marker = stateMarker(state);
     if (!exchange.force && this.#peerKnown.get(peer.peerId) === marker) return;
@@ -348,9 +401,11 @@ export class VoiceDictionaryPeerManager {
       ownPrivateKey: this.#privateKey!, ownPublicKey: identity.publicKey, peerPublicKey: peer.publicKey,
       sourceNodeId: this.#nodeId, destinationNodeId: peer.peerId }, this.#abortController.signal);
     this.#assertPeer(generation, peer);
+    assertDelivery(exchange.delivery);
     for (const frame of frames) {
-      if (!await transport.send(peer.peerId, frame)) throw offline();
+      if (!await transport.send(peer.peerId, frame, exchange.delivery)) throw offline();
       this.#assertPeer(generation, peer);
+      assertDelivery(exchange.delivery);
     }
     if (!this.#store.recordSuccess(peer.peerId, peer.revision, Date.now())) throw unavailable();
     this.#peerKnown.set(peer.peerId, marker);
@@ -416,3 +471,7 @@ function fingerprint(key: string): string { return createHash("sha256").update(B
 function stateMarker(state: VoiceDictionarySyncState): string { return JSON.stringify(Object.entries(buildStateVersionVector(state)).sort(([a], [b]) => a.localeCompare(b, "en-US"))); }
 function unavailable(): VoiceDictionaryPeerManagerError { return new VoiceDictionaryPeerManagerError("UNAVAILABLE", "Dictionary peer authority is unavailable."); }
 function offline(): VoiceDictionaryPeerManagerError { return new VoiceDictionaryPeerManagerError("OFFLINE", "The authorized dictionary peer is not reachable."); }
+function deliveryCurrent(delivery: NodeSyncDeliveryContext | undefined): boolean {
+  return delivery === undefined || (!delivery.signal.aborted && delivery.isCurrent());
+}
+function assertDelivery(delivery: NodeSyncDeliveryContext | undefined): void { if (!deliveryCurrent(delivery)) throw unavailable(); }

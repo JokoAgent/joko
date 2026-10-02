@@ -217,6 +217,17 @@ enum VoiceInputDictionaryPeerErrorCode {
   VOICE_INPUT_DICTIONARY_PEER_ERROR_CODE_SYNC_FAILED = 3;
 }
 
+message VoiceInputDictionaryPeerEndpoint {
+  string host = 1;
+  uint32 port = 2;
+}
+
+message VoiceInputDictionaryListener {
+  uint32 listen_port = 1;
+  string host = 2;
+  uint32 port = 3;
+}
+
 message VoiceInputDictionaryPeer {
   string peer_id = 1;
   uint64 revision = 2;
@@ -225,6 +236,7 @@ message VoiceInputDictionaryPeer {
   bool online = 5;
   google.protobuf.Timestamp granted_at = 6;
   google.protobuf.Timestamp last_sync_at = 7;
+  VoiceInputDictionaryPeerEndpoint route = 8;
 }
 
 message VoiceInputDictionaryPeerCandidate {
@@ -236,8 +248,8 @@ message VoiceInputDictionaryPeerCandidate {
   bool key_changed = 6;
 }
 
-// Independent dictionary-sharing authority. Keys, endpoints, ciphertext,
-// proof and convergence state are not representable in the public contract.
+// Independent dictionary-sharing authority. Configured public endpoints are
+// visible; keys, ciphertext, proof and convergence state remain private.
 message VoiceInputDictionaryPeerStatus {
   bool available = 1;
   uint64 configuration_revision = 2;
@@ -248,6 +260,7 @@ message VoiceInputDictionaryPeerStatus {
   optional VoiceInputDictionaryPeerErrorCode error_code = 7;
   repeated VoiceInputDictionaryPeer peers = 8;
   repeated VoiceInputDictionaryPeerCandidate candidates = 9;
+  VoiceInputDictionaryListener listener = 10;
 }
 
 // Failure projection is intentionally closed and content-free. Provider error

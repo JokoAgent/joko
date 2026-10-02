@@ -224,7 +224,44 @@ describe("authenticated dictionary peer contract", () => {
   const status: VoiceDictionaryPeerStatus = { available: true, configurationRevision: 5n, nodeId: "node-rpc", fingerprint: "a".repeat(64), enabled: true,
     phase: "waiting", peers: [{ peerId: "node-peer", revision: 4n, displayName: "Peer", fingerprint: "b".repeat(64), online: false, grantedAt: 1_000 }], candidates: [] };
   const context = { signal: new AbortController().signal } as HandlerContext;
-  const peers = () => ({ subscribe: vi.fn((_listener: () => void) => () => undefined), status: vi.fn(() => status), grantCandidate: vi.fn(() => status), revokePeer: vi.fn(() => status), syncNow: vi.fn(async (): Promise<void> => undefined) });
+  const peers = () => ({ subscribe: vi.fn((_listener: () => void) => () => undefined), status: vi.fn(() => status),
+    grantCandidate: vi.fn(() => status), revokePeer: vi.fn(() => status), syncNow: vi.fn(async (): Promise<void> => undefined),
+    configureListener: vi.fn(() => status), invitation: vi.fn(async () => "public-invitation"),
+    grantDirectPeer: vi.fn(() => status), clearPeerRoute: vi.fn(() => status) });
+  it("dispatches listener, invitation and direct grants only for the current client and exposes only deliberate public route data", async () => {
+    const owner = peers();
+    const listener = { host: "dictionary.example.test", port: 44380, listenPort: 57480 };
+    owner.status.mockReturnValue({ ...status, listener, peers: status.peers.map((peer) => ({ ...peer, route: { host: "2001:db8::1", port: 57481 } })) });
+    let current = true;
+    const service = createVoiceInputConnectService(undefined, undefined, undefined, () => {
+      if (!current) throw new ConnectError("Revoked.", Code.Unauthenticated);
+      return { connectionId: "paired" };
+    }, owner);
+    const projected = create(contract.GetVoiceInputDictionaryPeerStatusResponseSchema,
+      await service.getVoiceInputDictionaryPeerStatus(create(contract.GetVoiceInputDictionaryPeerStatusRequestSchema), context)).status;
+    expect(contract.projectVoiceDictionaryPeerStatus(projected)).toMatchObject({ listener, peers: [{ route: { host: "2001:db8::1", port: 57481 } }] });
+    await service.configureVoiceInputDictionaryListener(create(contract.ConfigureVoiceInputDictionaryListenerRequestSchema, { expectedConfigurationRevision: 5n, listener }), context);
+    expect(owner.configureListener).toHaveBeenCalledWith(5n, listener);
+    await service.configureVoiceInputDictionaryListener(create(contract.ConfigureVoiceInputDictionaryListenerRequestSchema, { expectedConfigurationRevision: 5n }), context);
+    expect(owner.configureListener).toHaveBeenLastCalledWith(5n, undefined);
+    await service.grantVoiceInputDictionaryDirectPeer(create(contract.GrantVoiceInputDictionaryDirectPeerRequestSchema, {
+      expectedConfigurationRevision: 5n, invitation: "public-only", expectedFingerprint: "b".repeat(64) }), context);
+    expect(owner.grantDirectPeer).toHaveBeenCalledWith(5n, "public-only", "b".repeat(64));
+    await service.clearVoiceInputDictionaryPeerRoute(create(contract.ClearVoiceInputDictionaryPeerRouteRequestSchema, { expectedConfigurationRevision: 5n, peerId: "node-peer" }), context);
+    expect(owner.clearPeerRoute).toHaveBeenCalledWith(5n, "node-peer");
+    await expect(service.configureVoiceInputDictionaryListener(create(contract.ConfigureVoiceInputDictionaryListenerRequestSchema, {
+      expectedConfigurationRevision: 5n, listener: { ...listener, host: "http://host/private" } }), context)).rejects.toMatchObject({ code: Code.InvalidArgument });
+    let finish!: (value: string) => void;
+    owner.invitation.mockImplementationOnce(() => new Promise<string>((resolve) => { finish = resolve; }));
+    const exporting = service.getVoiceInputDictionaryPeerInvitation(create(contract.GetVoiceInputDictionaryPeerInvitationRequestSchema), context);
+    const rejected = expect(exporting).rejects.toMatchObject({ code: Code.Unauthenticated });
+    current = false; finish("public-invitation"); await rejected;
+    const abort = new AbortController(); abort.abort(); current = true;
+    owner.grantDirectPeer.mockClear();
+    await expect(service.grantVoiceInputDictionaryDirectPeer(create(contract.GrantVoiceInputDictionaryDirectPeerRequestSchema, {
+      expectedConfigurationRevision: 5n, invitation: "public-only", expectedFingerprint: "b".repeat(64) }), { signal: abort.signal } as HandlerContext)).rejects.toMatchObject({ code: Code.Canceled });
+    expect(owner.grantDirectPeer).not.toHaveBeenCalled();
+  });
   it("maps the separate configuration and grant revisions and never exposes private values", async () => {
     const owner = peers();
     const service = createVoiceInputConnectService(undefined, undefined, undefined, () => ({ connectionId: "paired" }), owner);
@@ -237,7 +274,7 @@ describe("authenticated dictionary peer contract", () => {
     await service.revokeVoiceInputDictionaryPeer(create(contract.RevokeVoiceInputDictionaryPeerRequestSchema, { peerId: "node-peer", expectedGrantRevision: 4n }), context);
     expect(owner.revokePeer).toHaveBeenCalledWith("node-peer", 4n);
     await service.syncVoiceInputDictionaryNow(create(contract.SyncVoiceInputDictionaryNowRequestSchema, { expectedConfigurationRevision: 5n }), context);
-    expect(owner.syncNow).toHaveBeenCalledWith(undefined);
+    expect(owner.syncNow).toHaveBeenCalledWith(undefined, expect.objectContaining({ signal: context.signal, isCurrent: expect.any(Function) }));
   });
   it("rejects unauthenticated, cancelled, invalid, stale and unavailable peer operations before dispatch", async () => {
     const owner = peers();
@@ -271,6 +308,28 @@ describe("authenticated dictionary peer contract", () => {
     const rejected = expect(syncing).rejects.toMatchObject({ code: Code.Unauthenticated });
     authenticated = false; resolve(); await rejected;
     expect(owner.status).toHaveBeenCalledOnce();
+  });
+
+  it("aborts only the original peer exchange when its Connection is revoked and removes the idle revoke subscription", async () => {
+    const owner = peers();
+    let revoke!: () => void;
+    const unsubscribe = vi.fn();
+    let authenticated = true;
+    owner.syncNow.mockImplementationOnce(async (...args: unknown[]) => {
+      const delivery = args[1] as { signal: AbortSignal; isCurrent(): boolean };
+      authenticated = false; revoke();
+      expect(delivery.signal.aborted).toBe(true);
+      expect(delivery.isCurrent()).toBe(false);
+      throw new VoiceDictionaryPeerManagerError("UNAVAILABLE", "Original exchange retired.");
+    });
+    const service = createVoiceInputConnectService(undefined, undefined, undefined, () => {
+      if (!authenticated) throw new ConnectError("Revoked.", Code.Unauthenticated);
+      return { connectionId: "original" };
+    }, owner, (connectionId, listener) => { expect(connectionId).toBe("original"); revoke = listener; return unsubscribe; });
+    await expect(service.syncVoiceInputDictionaryNow(create(contract.SyncVoiceInputDictionaryNowRequestSchema, { expectedConfigurationRevision: 5n }), context))
+      .rejects.toMatchObject({ code: Code.Unauthenticated });
+    expect(unsubscribe).toHaveBeenCalledOnce();
+    expect(context.signal.aborted).toBe(false);
   });
 
   it("subscribes before the initial full projection, coalesces a burst and retires an idle cancelled watch", async () => {

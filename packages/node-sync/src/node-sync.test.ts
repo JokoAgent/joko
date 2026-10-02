@@ -1,14 +1,15 @@
-import { createPrivateKey, createPublicKey, diffieHellman, hkdfSync, createDecipheriv, randomInt } from "node:crypto";
+import { createPrivateKey, createPublicKey, diffieHellman, hkdfSync, createDecipheriv, createHmac, randomInt } from "node:crypto";
 import net from "node:net";
 
 import { afterEach, describe, expect, it } from "vitest";
 
 import {
   createNodeSyncLanProof, decryptNodeSyncBytes, encryptNodeSyncBytes, generateNodeSyncIdentity,
-  nodeSyncDomain, verifyNodeSyncLanProof, type NodeSyncPurpose
+  nodeSyncDomain, verifyNodeSyncLanProof, createNodeSyncProbeProof, verifyNodeSyncProbeProof, type NodeSyncPurpose
 } from "./crypto.js";
 import { isNodeSyncCipherChunkFrame, NODE_SYNC_CHUNK_BYTES, type NodeSyncCipherChunkFrame } from "./frames.js";
 import { NodeSyncLanTransport, type NodeSyncDeliveryContext, type NodeSyncLanIdentity, type NodeSyncLanTransportOptions } from "./lan.js";
+import { NodeSyncTcpTransport, validNodeSyncEndpoint } from "./tcp.js";
 
 const cleanups: Array<() => void> = [];
 afterEach(() => { for (const cleanup of cleanups.splice(0).reverse()) cleanup(); });
@@ -52,11 +53,76 @@ describe("purpose-isolated node encryption", () => {
     decipher.setAAD(Buffer.from(["joko:contacts-device-sync:v1", "node-first", "node-second", frame.transferId, "1"].join("\u0000")));
     decipher.setAuthTag(Buffer.from(frame.tag, "base64"));
     expect(Buffer.concat([decipher.update(Buffer.from(frame.data, "base64")), decipher.final()]).toString()).toBe("private document");
+    const authKey = Buffer.from(hkdfSync("sha256", shared, Buffer.alloc(0), Buffer.from("joko:contacts-device-sync:lan-auth:v1"), 32));
+    for (const kind of ["request", "ack"] as const) {
+      const challenge = Buffer.alloc(24, 5).toString("base64");
+      const message = ["joko:contacts-device-sync:lan-auth:v1", kind, "node-first", "node-second", challenge, first.publicKey,
+        frame.transferId, String(frame.index), String(frame.total), frame.iv, frame.tag, frame.data].join("\u0000");
+      expect(createNodeSyncLanProof("contacts", first.privateKey, second.publicKey, { kind, sourceNodeId: "node-first",
+        destinationNodeId: "node-second", challenge, senderPublicKey: first.publicKey, transferId: frame.transferId,
+        index: frame.index, total: frame.total, iv: frame.iv, tag: frame.tag, data: frame.data }))
+        .toBe(createHmac("sha256", authKey).update(Buffer.from(message, "utf8")).digest("base64"));
+    }
     expect(isNodeSyncCipherChunkFrame(frame)).toBe(true);
     for (const mutation of [{ version: 0 }, { extra: true }, { index: 1 }, { total: 129 }, { compression: "raw" },
       { data: "AB==" }, { data: Buffer.alloc(NODE_SYNC_CHUNK_BYTES + 1).toString("base64") }]) {
       expect(isNodeSyncCipherChunkFrame({ ...frame, ...mutation })).toBe(false);
     }
+  });
+
+  it.each(["contacts", "voice-dictionary"] as const)("binds %s probes to both pinned identities, challenge and the original request direction", (purpose) => {
+    const first = generateNodeSyncIdentity();
+    const second = generateNodeSyncIdentity();
+    const context = { kind: "probe-request" as const, sourceNodeId: "node-first", destinationNodeId: "node-second",
+      challenge: Buffer.alloc(24, 6).toString("base64"), requesterPublicKey: first.publicKey, responderPublicKey: second.publicKey };
+    const proof = createNodeSyncProbeProof(purpose, first.privateKey, second.publicKey, context);
+    expect(verifyNodeSyncProbeProof(purpose, proof, second.privateKey, first.publicKey, context)).toBe(true);
+    expect(verifyNodeSyncProbeProof(purpose === "contacts" ? "voice-dictionary" : "contacts", proof, second.privateKey, first.publicKey, context)).toBe(false);
+    for (const mutation of [{ kind: "probe-ack" as const }, { sourceNodeId: "node-other" }, { destinationNodeId: "node-other" },
+      { challenge: Buffer.alloc(24, 7).toString("base64") }, { requesterPublicKey: second.publicKey }, { responderPublicKey: first.publicKey }]) {
+      expect(verifyNodeSyncProbeProof(purpose, proof, second.privateKey, first.publicKey, { ...context, ...mutation })).toBe(false);
+    }
+    const ack = createNodeSyncProbeProof(purpose, second.privateKey, first.publicKey, { ...context, kind: "probe-ack" });
+    expect(verifyNodeSyncProbeProof(purpose, ack, first.privateKey, second.publicKey, { ...context, kind: "probe-ack" })).toBe(true);
+  });
+});
+
+describe("authenticated node TCP probe ingress", () => {
+  it("accepts only exact probe packets without delivering frames and validates explicit endpoint syntax", async () => {
+    const first = identity("first");
+    const second = identity("second");
+    let frames = 0;
+    const sender = new NodeSyncTcpTransport({ purpose: "voice-dictionary", getSelf: () => first,
+      isPeerAllowed: (nodeId, key) => nodeId === second.nodeId && key === second.publicKey,
+      onFrame: () => undefined, logger: { debug: () => undefined, warn: () => undefined }, listenHost: "127.0.0.1" });
+    const receiver = new NodeSyncTcpTransport({ purpose: "voice-dictionary", getSelf: () => second,
+      isPeerAllowed: (nodeId, key) => nodeId === first.nodeId && key === first.publicKey,
+      onFrame: () => { frames += 1; }, logger: { debug: () => undefined, warn: () => undefined }, listenHost: "127.0.0.1" });
+    cleanups.push(() => sender.stop(), () => receiver.stop());
+    await Promise.all([sender.start(), receiver.start()]);
+    const endpoint = { address: "127.0.0.1", port: receiver.listenerPort()! };
+    const challenge = Buffer.alloc(24, 8).toString("base64");
+    const auth = { kind: "probe-request" as const, sourceNodeId: first.nodeId, destinationNodeId: second.nodeId,
+      challenge, requesterPublicKey: first.publicKey, responderPublicKey: second.publicKey };
+    const request = { version: 1, type: "probe", sourceNodeId: first.nodeId, destinationNodeId: second.nodeId,
+      senderPublicKey: first.publicKey, challenge, proof: createNodeSyncProbeProof("voice-dictionary", first.privateKey, second.publicKey, auth) };
+    expect(await packetGetsAck(endpoint, Buffer.from(JSON.stringify(request)))).toBe(true);
+    for (const mutation of [{ version: 2 }, { type: "probe-ack" }, { type: "unknown" }, { extra: true },
+      { proof: Buffer.alloc(32, 1).toString("base64") }, { frame: encryptedFrame(first, second, "voice-dictionary") }]) {
+      expect(await packetGetsAck(endpoint, Buffer.from(JSON.stringify({ ...request, ...mutation })))).toBe(false);
+    }
+    expect(await sender.probe({ host: endpoint.address, port: endpoint.port, publicKey: second.publicKey }, second.nodeId)).toBe(true);
+    expect(frames).toBe(0);
+    for (const host of ["127.0.0.1", "::1", "peer.example", "peer.example."]) expect(validNodeSyncEndpoint(host, 1234)).toBe(true);
+    for (const host of ["127.1", "2130706433", "0x7f000001", "0x7f.1", "fe80::1%eth0", "http://peer", "peer/path", " peer", "peer:443"]) {
+      expect(validNodeSyncEndpoint(host, 1234)).toBe(false);
+    }
+    receiver.stop();
+    const starting = receiver.start();
+    receiver.stop();
+    await expect(starting).rejects.toThrow("superseded");
+    await receiver.start();
+    expect(await sender.probe({ host: endpoint.address, port: receiver.listenerPort()!, publicKey: second.publicKey }, second.nodeId)).toBe(true);
   });
 });
 

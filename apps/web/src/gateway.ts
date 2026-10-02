@@ -4,7 +4,7 @@ import { createConnectTransport } from "@connectrpc/connect-web";
 import { createTerminalGateway } from "./terminal-gateway.js";
 import { createSimulatorViewerGateway } from "./simulator-viewer-gateway.js";
 import { UsageReportGroup } from "@joko/contracts";
-import { nextVoiceDictionaryWatchSequence, projectVoiceDictionaryPeerStatus, type VoiceDictionaryPeerStatusView } from "@joko/contracts";
+import { nextVoiceDictionaryWatchSequence, projectVoiceDictionaryPeerStatus, readVoiceDictionaryPeerInvitation, type VoiceDictionaryPeerListener, type VoiceDictionaryPeerStatusView } from "@joko/contracts";
 import { SshKeyService, SshAgentState, SshAgentHostPlatform, SshKeyPassphrasePurpose, SshInstallShell, type SshKey, type CredentialUploadTicket } from "@joko/contracts";
 import type { SshKeyView, SshKeyCatalogView, SshKeyGenerateDraft, SshKeyInstallCommandDraft } from "./model.js";
 import type { UsageReportQueryView, UsageReportView } from "./model.js";
@@ -1543,6 +1543,23 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
   }
   async syncVoiceInputDictionaryNow(expectedConfigurationRevision: bigint, peerId?: string, signal?: AbortSignal): Promise<VoiceDictionaryPeerStatusView> {
     const response = await createClient(VoiceInputService, this.requireTransport()).syncVoiceInputDictionaryNow({ expectedConfigurationRevision, ...(peerId === undefined ? {} : { peerId }) }, voiceRpcOptions(this.#abort?.signal, signal));
+    return projectVoiceDictionaryPeerStatus(response.status);
+  }
+  async configureVoiceInputDictionaryListener(expectedConfigurationRevision: bigint, listener: VoiceDictionaryPeerListener | undefined, signal?: AbortSignal): Promise<VoiceDictionaryPeerStatusView> {
+    const response = await createClient(VoiceInputService, this.requireTransport()).configureVoiceInputDictionaryListener({ expectedConfigurationRevision, listener }, voiceRpcOptions(this.#abort?.signal, signal));
+    return projectVoiceDictionaryPeerStatus(response.status);
+  }
+  async getVoiceInputDictionaryPeerInvitation(signal?: AbortSignal): Promise<string> {
+    const response = await createClient(VoiceInputService, this.requireTransport()).getVoiceInputDictionaryPeerInvitation({}, voiceRpcOptions(this.#abort?.signal, signal));
+    readVoiceDictionaryPeerInvitation(response.invitation);
+    return response.invitation;
+  }
+  async grantVoiceInputDictionaryDirectPeer(expectedConfigurationRevision: bigint, invitation: string, expectedFingerprint: string, signal?: AbortSignal): Promise<VoiceDictionaryPeerStatusView> {
+    const response = await createClient(VoiceInputService, this.requireTransport()).grantVoiceInputDictionaryDirectPeer({ expectedConfigurationRevision, invitation, expectedFingerprint }, voiceRpcOptions(this.#abort?.signal, signal));
+    return projectVoiceDictionaryPeerStatus(response.status);
+  }
+  async clearVoiceInputDictionaryPeerRoute(expectedConfigurationRevision: bigint, peerId: string, signal?: AbortSignal): Promise<VoiceDictionaryPeerStatusView> {
+    const response = await createClient(VoiceInputService, this.requireTransport()).clearVoiceInputDictionaryPeerRoute({ expectedConfigurationRevision, peerId }, voiceRpcOptions(this.#abort?.signal, signal));
     return projectVoiceDictionaryPeerStatus(response.status);
   }
 

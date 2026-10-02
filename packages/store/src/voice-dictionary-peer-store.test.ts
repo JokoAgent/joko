@@ -12,6 +12,53 @@ const cleanups: Array<() => void> = [];
 afterEach(() => { for (const cleanup of cleanups.splice(0).reverse()) cleanup(); });
 
 describe("dictionary peer durable authority", () => {
+  it("atomically persists explicit listener and pinned routes, fences route CAS and keeps grant lifetime through route changes and restart", () => {
+    const fixture = database();
+    let store = fixture.open();
+    const identity = store.initializeIdentity(storedIdentity());
+    const listener = { listenPort: 57480, host: "dictionary.example.test", port: 44380 };
+    store.configureListener(store.configurationRevision(), listener);
+    const peer = peerInput("direct-peer");
+    const route = { host: "2001:db8::1", port: 57481 };
+    let publication: unknown;
+    store.subscribe(() => {
+      const reader = fixture.open();
+      publication = { revision: reader.configurationRevision(), peer: reader.peer(peer.peerId), listener: reader.listener() };
+      reader.close();
+    });
+    const before = store.configurationRevision();
+    const granted = store.grantDirectPeer({ ...peer, route, expectedRevision: before });
+    expect(granted).toMatchObject({ route, revision: before + 1n });
+    expect(publication).toEqual({ revision: before + 1n, peer: granted, listener });
+    store.recordSuccess(peer.peerId, granted.revision, 2_000);
+    expect(() => store.grantDirectPeer({ ...peer, route: { ...route, port: 57482 }, expectedRevision: before })).toThrow(/concurrently/iu);
+    expect(() => store.grantDirectPeer({ ...peerInput(peer.peerId), route, expectedRevision: store.configurationRevision() })).toThrow(/concurrently/iu);
+    for (const host of ["http://host", " host", "host/path", "host@other", "127.1", "2130706433", "host..test", "fe80::1%eth0"]) {
+      expect(() => store.grantDirectPeer({ ...peer, route: { host, port: 57482 }, expectedRevision: store.configurationRevision() })).toThrow(/invalid/iu);
+    }
+    const stable = store.configurationRevision();
+    store.configureListener(stable, listener);
+    store.grantDirectPeer({ ...peer, route, expectedRevision: stable });
+    expect(store.configurationRevision()).toBe(stable);
+    const changed = store.grantDirectPeer({ ...peer, route: { host: "192.168.1.2", port: 57482 }, expectedRevision: stable });
+    expect(changed).toMatchObject({ revision: granted.revision, lastSyncAt: 2_000 });
+    expect(store.configurationRevision()).toBe(stable + 1n);
+    const configuration = store.configurationRevision();
+    store.close(); store = fixture.open();
+    expect(store.identity()).toEqual(identity);
+    expect(store.listener()).toEqual(listener);
+    expect(store.peer(peer.peerId)).toEqual(changed);
+    expect(() => store.configureListener(configuration - 1n, undefined)).toThrow(/concurrently/iu);
+    store.clearPeerRoute(configuration, peer.peerId);
+    expect(store.peer(peer.peerId)).toMatchObject({ revision: granted.revision, lastSyncAt: 2_000 });
+    expect(store.peer(peer.peerId)?.route).toBeUndefined();
+    store.grantDirectPeer({ ...peer, route, expectedRevision: store.configurationRevision() });
+    store.revokePeer(peer.peerId, granted.revision);
+    expect(store.peer(peer.peerId)).toBeUndefined();
+    store.configureListener(store.configurationRevision(), undefined);
+    expect(store.listener()).toBeUndefined();
+  });
+
   it("publishes grants only after the real SQLite commit and preserves identity, grant lifetime and success across reopen", () => {
     const fixture = database();
     const identity = storedIdentity();

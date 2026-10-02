@@ -15,6 +15,10 @@ import {
   GrantVoiceInputDictionaryPeerResponseSchema,
   RevokeVoiceInputDictionaryPeerResponseSchema,
   SyncVoiceInputDictionaryNowResponseSchema,
+  ConfigureVoiceInputDictionaryListenerResponseSchema,
+  GetVoiceInputDictionaryPeerInvitationResponseSchema,
+  GrantVoiceInputDictionaryDirectPeerResponseSchema,
+  ClearVoiceInputDictionaryPeerRouteResponseSchema,
   VoiceInputDictionaryPeerPhase,
   GetVoiceInputSessionResponseSchema,
   TestVoiceInputConnectionResponseSchema,
@@ -219,7 +223,7 @@ describe("voice input gateway", () => {
     gateway.disconnect();
   });
 
-  it("uses independent configuration and grant revisions for the four generated sharing operations", async () => {
+  it("uses independent configuration and grant revisions for the generated sharing and direct route operations", async () => {
     const calls: Array<{ method: string; input: any }> = [];
     const status = { available: true, configurationRevision: 4n, nodeId: "node-a", fingerprint: "a".repeat(64),
       enabled: true, phase: VoiceInputDictionaryPeerPhase.WAITING,
@@ -232,9 +236,15 @@ describe("voice input gateway", () => {
         case "grantVoiceInputDictionaryPeer": return create(GrantVoiceInputDictionaryPeerResponseSchema, { status });
         case "revokeVoiceInputDictionaryPeer": return create(RevokeVoiceInputDictionaryPeerResponseSchema, { status });
         case "syncVoiceInputDictionaryNow": return create(SyncVoiceInputDictionaryNowResponseSchema, { status });
+        case "configureVoiceInputDictionaryListener": return create(ConfigureVoiceInputDictionaryListenerResponseSchema, { status });
+        case "getVoiceInputDictionaryPeerInvitation": return create(GetVoiceInputDictionaryPeerInvitationResponseSchema, { invitation });
+        case "grantVoiceInputDictionaryDirectPeer": return create(GrantVoiceInputDictionaryDirectPeerResponseSchema, { status });
+        case "clearVoiceInputDictionaryPeerRoute": return create(ClearVoiceInputDictionaryPeerRouteResponseSchema, { status });
       }
       throw new Error(`Unexpected method: ${method}`);
     });
+    const invitation = JSON.stringify({ version: 1, nodeId: "node-b", displayName: "Peer", publicKey: "MCowBQYDK2VuAyEA" + "A".repeat(43) + "=",
+      fingerprint: "b".repeat(64), host: "peer.example", port: 43_121 });
     const gateway = createOrchestratorGateway({ id: "sharing", deviceId: "device-test", name: "Browser",
       origin: "https://orchestrator.example", serverId: "server-test" }, "secret", {}, () => transport);
     await gateway.connect();
@@ -245,11 +255,21 @@ describe("voice input gateway", () => {
       await gateway.grantVoiceInputDictionaryPeer(4n, "node-c", "c".repeat(64));
       await gateway.revokeVoiceInputDictionaryPeer("node-b", 2n);
       await gateway.syncVoiceInputDictionaryNow(4n, "node-b");
+      await gateway.configureVoiceInputDictionaryListener(4n, { listenPort: 43_121, host: "self.example", port: 44_121 });
+      await expect(gateway.getVoiceInputDictionaryPeerInvitation()).resolves.toBe(invitation);
+      await gateway.grantVoiceInputDictionaryDirectPeer(4n, invitation, "b".repeat(64));
+      await gateway.clearVoiceInputDictionaryPeerRoute(4n, "node-b");
+      await gateway.configureVoiceInputDictionaryListener(4n, undefined);
       expect(calls).toMatchObject([
         { method: "getVoiceInputDictionaryPeerStatus", input: {} },
         { method: "grantVoiceInputDictionaryPeer", input: { expectedConfigurationRevision: 4n, peerId: "node-c", expectedFingerprint: "c".repeat(64) } },
         { method: "revokeVoiceInputDictionaryPeer", input: { peerId: "node-b", expectedGrantRevision: 2n } },
-        { method: "syncVoiceInputDictionaryNow", input: { expectedConfigurationRevision: 4n, peerId: "node-b" } }
+        { method: "syncVoiceInputDictionaryNow", input: { expectedConfigurationRevision: 4n, peerId: "node-b" } },
+        { method: "configureVoiceInputDictionaryListener", input: { expectedConfigurationRevision: 4n, listener: { listenPort: 43_121, host: "self.example", port: 44_121 } } },
+        { method: "getVoiceInputDictionaryPeerInvitation", input: {} },
+        { method: "grantVoiceInputDictionaryDirectPeer", input: { expectedConfigurationRevision: 4n, invitation, expectedFingerprint: "b".repeat(64) } },
+        { method: "clearVoiceInputDictionaryPeerRoute", input: { expectedConfigurationRevision: 4n, peerId: "node-b" } },
+        { method: "configureVoiceInputDictionaryListener", input: { expectedConfigurationRevision: 4n, listener: undefined } }
       ]);
     } finally { gateway.disconnect(); }
   });

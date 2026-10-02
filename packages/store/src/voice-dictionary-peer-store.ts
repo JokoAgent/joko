@@ -1,6 +1,7 @@
 import { createHash, createPublicKey } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
+import { isIP } from "node:net";
 import { DatabaseSync } from "node:sqlite";
 
 const MAX_PEERS = 128;
@@ -25,7 +26,17 @@ CREATE TABLE dictionary_peer_grants (
   public_key TEXT NOT NULL UNIQUE,
   fingerprint TEXT NOT NULL CHECK(length(fingerprint) = 64),
   granted_at INTEGER NOT NULL CHECK(granted_at >= 0),
-  last_sync_at INTEGER CHECK(last_sync_at >= granted_at)
+  last_sync_at INTEGER CHECK(last_sync_at >= granted_at),
+  route_host TEXT,
+  route_port INTEGER,
+  CHECK((route_host IS NULL AND route_port IS NULL) OR
+    (route_host IS NOT NULL AND route_port BETWEEN 1 AND 65535))
+) STRICT;
+CREATE TABLE dictionary_peer_listener (
+  singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+  listen_port INTEGER NOT NULL CHECK(listen_port BETWEEN 1 AND 65535),
+  advertised_host TEXT NOT NULL,
+  advertised_port INTEGER NOT NULL CHECK(advertised_port BETWEEN 1 AND 65535)
 ) STRICT;
 `;
 const BASELINE_ID = createHash("sha256").update(SCHEMA + "sealed-key:aes-256-gcm/nonce/ciphertext/tag:v1").digest("hex");
@@ -52,6 +63,13 @@ export interface VoiceDictionaryPeerGrant {
   readonly fingerprint: string;
   readonly grantedAt: number;
   readonly lastSyncAt?: number;
+  readonly route?: VoiceDictionaryPeerEndpoint;
+}
+export interface VoiceDictionaryPeerEndpoint { readonly host: string; readonly port: number; }
+export interface VoiceDictionaryPeerListener extends VoiceDictionaryPeerEndpoint { readonly listenPort: number; }
+interface GrantInput {
+  readonly expectedRevision: bigint; readonly peerId: string; readonly displayName: string;
+  readonly publicKey: string; readonly fingerprint: string;
 }
 export class VoiceDictionaryPeerStoreError extends Error {
   constructor(readonly code: "INVALID" | "CONFLICT" | "UNAVAILABLE", message: string, options?: ErrorOptions) {
@@ -78,7 +96,8 @@ export class VoiceDictionaryPeerStore {
       this.#initialize();
       const identity = this.identity();
       const peers = this.peers();
-      if ((identity === undefined && peers.length > 0) || peers.some((peer) => peer.peerId === identity?.nodeId ||
+      const listener = this.listener();
+      if ((identity === undefined && (peers.length > 0 || listener !== undefined)) || peers.some((peer) => peer.peerId === identity?.nodeId ||
         peer.publicKey === identity?.publicKey || peer.revision > this.configurationRevision())) throw unavailable();
     } catch (error) {
       this.#closed = true;
@@ -140,19 +159,67 @@ export class VoiceDictionaryPeerStore {
     return row === undefined ? undefined : peerFromRow(row);
   }
 
-  grantPeer(input: {
-    readonly expectedRevision: bigint;
-    readonly peerId: string;
-    readonly displayName: string;
-    readonly publicKey: string;
-    readonly fingerprint: string;
-  }): VoiceDictionaryPeerGrant {
+  listener(): VoiceDictionaryPeerListener | undefined {
+    this.#assertOpen();
+    const row = this.#database.prepare("SELECT listen_port, advertised_host, advertised_port FROM dictionary_peer_listener WHERE singleton = 1").get() as Row | undefined;
+    return row === undefined ? undefined : { ...endpoint(row.advertised_host, row.advertised_port), listenPort: port(row.listen_port) };
+  }
+
+  configureListener(expectedRevision: bigint, value: VoiceDictionaryPeerListener | undefined): void {
+    const listener = value === undefined ? undefined : { ...endpoint(value.host, value.port), listenPort: port(value.listenPort) };
+    this.#write(() => {
+      this.#assertRevision(expectedRevision);
+      if (this.identity() === undefined) throw unavailable();
+      if (JSON.stringify(this.listener()) === JSON.stringify(listener)) return;
+      this.#database.prepare("DELETE FROM dictionary_peer_listener WHERE singleton = 1").run();
+      if (listener !== undefined) this.#database.prepare("INSERT INTO dictionary_peer_listener(singleton, listen_port, advertised_host, advertised_port) VALUES(1, ?, ?, ?)")
+        .run(listener.listenPort, listener.host, listener.port);
+      this.#advanceRevision();
+    });
+  }
+
+  grantPeer(input: GrantInput): VoiceDictionaryPeerGrant {
+    const normalized = this.#normalizeGrant(input);
+    return this.#write(() => { this.#assertRevision(input.expectedRevision); return this.#grant(normalized); });
+  }
+
+  /** Route and independent grant become visible in the same durable transaction. */
+  grantDirectPeer(input: GrantInput & { readonly route: VoiceDictionaryPeerEndpoint }): VoiceDictionaryPeerGrant {
+    const normalized = this.#normalizeGrant(input);
+    const route = endpoint(input.route.host, input.route.port);
+    return this.#write(() => {
+      this.#assertRevision(input.expectedRevision);
+      const granted = this.#grant(normalized);
+      if (granted.route?.host !== route.host || granted.route.port !== route.port) {
+        this.#database.prepare("UPDATE dictionary_peer_grants SET route_host = ?, route_port = ? WHERE peer_id = ?")
+          .run(route.host, route.port, granted.peerId);
+        if (this.configurationRevision() === input.expectedRevision) this.#advanceRevision();
+      }
+      return this.peer(granted.peerId)!;
+    });
+  }
+
+  clearPeerRoute(expectedRevision: bigint, peerId: string): void {
+    this.#write(() => {
+      this.#assertRevision(expectedRevision);
+      const peer = this.peer(peerId);
+      if (peer === undefined) throw conflict();
+      if (peer.route === undefined) return;
+      this.#database.prepare("UPDATE dictionary_peer_grants SET route_host = NULL, route_port = NULL WHERE peer_id = ?").run(peer.peerId);
+      this.#advanceRevision();
+    });
+  }
+
+  #normalizeGrant(input: GrantInput): Omit<GrantInput, "expectedRevision"> {
     const peerId = nodeId(input.peerId);
     const key = publicKey(input.publicKey);
     const name = displayName(input.displayName);
     if (input.fingerprint !== fingerprint(key)) throw invalid();
-    return this.#write(() => {
-      this.#assertRevision(input.expectedRevision);
+    return { peerId, publicKey: key, displayName: name, fingerprint: input.fingerprint };
+  }
+
+  #grant(input: Omit<GrantInput, "expectedRevision">): VoiceDictionaryPeerGrant {
+      const { peerId, publicKey: key, displayName: name } = input;
       const self = this.identity();
       if (self === undefined) throw unavailable();
       if (self.nodeId === peerId || self.publicKey === key) throw invalid();
@@ -166,7 +233,6 @@ export class VoiceDictionaryPeerStore {
       this.#database.prepare("INSERT INTO dictionary_peer_grants(peer_id, revision, display_name, public_key, fingerprint, granted_at) VALUES(?, ?, ?, ?, ?, ?)")
         .run(peerId, revision, name, key, fingerprint(key), timestamp(this.#now()));
       return this.peer(peerId)!;
-    });
   }
 
   revokePeer(peerId: string, expectedRevision: bigint): void {
@@ -262,8 +328,17 @@ function peerFromRow(row: Row): VoiceDictionaryPeerGrant {
   const grantedAt = timestamp(row.granted_at);
   const lastSyncAt = row.last_sync_at === null ? undefined : timestamp(row.last_sync_at);
   if (row.fingerprint !== fingerprint(key) || (lastSyncAt !== undefined && lastSyncAt < grantedAt)) throw unavailable();
+  const route = row.route_host === null && row.route_port === null ? undefined : endpoint(row.route_host, row.route_port);
   return { peerId: nodeId(row.peer_id), revision: BigInt(integer(row.revision, 1)), displayName: displayName(row.display_name),
-    publicKey: key, fingerprint: fingerprint(key), grantedAt, ...(lastSyncAt === undefined ? {} : { lastSyncAt }) };
+    publicKey: key, fingerprint: fingerprint(key), grantedAt, ...(lastSyncAt === undefined ? {} : { lastSyncAt }),
+    ...(route === undefined ? {} : { route }) };
+}
+function port(value: unknown): number { const result = integer(value, 1); if (result > 65535) throw invalid(); return result; }
+function endpoint(host: unknown, value: unknown): VoiceDictionaryPeerEndpoint {
+  if (typeof host !== "string" || host.length < 1 || host.length > 253 || host !== host.trim() || host.includes("%") ||
+    (isIP(host) === 0 && (!/^[A-Za-z0-9.-]+$/u.test(host) || /^[0-9.]+$/u.test(host) ||
+      !host.split(".").every((label) => /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$/u.test(label))))) throw invalid();
+  return { host, port: port(value) };
 }
 function publicKey(value: unknown): string {
   const bytes = base64(value, 32, 128);

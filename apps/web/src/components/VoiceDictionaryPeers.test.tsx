@@ -25,7 +25,9 @@ function fixture() {
   const updates = dictionaryWatchFixture<VoiceDictionaryPeerStatusView>();
   const api = { getVoiceInputDictionaryPeerStatus: vi.fn(async () => value), grantVoiceInputDictionaryPeer: vi.fn(async () => value),
     watchVoiceInputDictionaryPeerStatus: vi.fn(updates.watch),
-    revokeVoiceInputDictionaryPeer: vi.fn(async () => value), syncVoiceInputDictionaryNow: vi.fn(async () => value) };
+    revokeVoiceInputDictionaryPeer: vi.fn(async () => value), syncVoiceInputDictionaryNow: vi.fn(async () => value),
+    configureVoiceInputDictionaryListener: vi.fn(async () => value), getVoiceInputDictionaryPeerInvitation: vi.fn(async () => invitation("node-self", "a")),
+    grantVoiceInputDictionaryDirectPeer: vi.fn(async (_revision: bigint, _invitation: string, _fingerprint: string, _signal?: AbortSignal) => value), clearVoiceInputDictionaryPeerRoute: vi.fn(async () => value) };
   return { api, updates, set: (next: VoiceDictionaryPeerStatusView) => { value = next; } };
 }
 const t = (key: Parameters<typeof translate>[1], values?: Readonly<Record<string, string | number>>) => translate("en", key, values);
@@ -33,8 +35,56 @@ async function render(api: VoiceDictionaryPeerApi, enabled = true): Promise<void
 function button(text: string): HTMLButtonElement { return [...container.querySelectorAll<HTMLButtonElement>("button")].find((item) => item.textContent === text)!; }
 async function click(text: string): Promise<void> { await act(async () => button(text).click()); }
 function deferred<T>() { let resolve!: (value: T) => void; return { promise: new Promise<T>((done) => { resolve = done; }), resolve: (value: T) => resolve(value) }; }
+function invitation(nodeId = "node-peer", fingerprint = "b") { return JSON.stringify({ version: 1, nodeId, displayName: "Direct peer",
+  publicKey: "MCowBQYDK2VuAyEA" + "A".repeat(43) + "=", fingerprint: fingerprint.repeat(64), host: "peer.example", port: 43_121 }); }
+async function fill(label: string, value: string): Promise<void> {
+  const field = [...container.querySelectorAll("label")].find((item) => item.textContent === label)!.querySelector("input,textarea")!;
+  const prototype = field instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+  await act(async () => { Object.getOwnPropertyDescriptor(prototype, "value")!.set!.call(field, value); field.dispatchEvent(new Event("input", { bubbles: true })); });
+}
 
 describe("dictionary sharing settings", () => {
+  it("keeps the listener draft revision, exports a selectable invitation and clears only the saved route", async () => {
+    const f = fixture(); f.set(status({ listener: { listenPort: 43_121, host: "peer.example", port: 43_121 }, peers: [
+      { peerId: "node-peer", revision: 3n, displayName: "Peer", fingerprint: "b".repeat(64), online: false, grantedAt: 1_000, route: { host: "peer.example", port: 43_121 } }
+    ], candidates: [] }));
+    await render(f.api);
+    expect(container.textContent).toContain("Saved address: peer.example:43121");
+    expect(container.textContent).toContain("Offline");
+    await fill("Reachable host", "updated.example");
+    await act(async () => f.updates.push(status({ configurationRevision: 6n, listener: { listenPort: 43_121, host: "peer.example", port: 43_121 } })));
+    expect(button("Save listening address").disabled).toBe(true);
+    expect((container.querySelectorAll("input")[1] as HTMLInputElement).value).toBe("updated.example");
+    await click("Review current listening address");
+    await fill("Reachable host", "peer.example");
+    f.set(status({ configurationRevision: 7n, listener: { listenPort: 43_121, host: "peer.example", port: 43_121 }, peers: [
+      { peerId: "node-peer", revision: 3n, displayName: "Peer", fingerprint: "b".repeat(64), online: false, grantedAt: 1_000, route: { host: "peer.example", port: 43_121 } }
+    ], candidates: [] }));
+    await click("Save listening address");
+    expect(f.api.configureVoiceInputDictionaryListener).toHaveBeenCalledWith(6n, { listenPort: 43_121, host: "peer.example", port: 43_121 }, expect.any(AbortSignal));
+    await click("Show this node’s invitation");
+    expect(container.querySelector<HTMLTextAreaElement>("textarea[readonly]")?.value).toBe(invitation("node-self", "a"));
+    await click("Remove saved peer address");
+    expect(f.api.clearVoiceInputDictionaryPeerRoute).toHaveBeenCalledExactlyOnceWith(7n, "node-peer", expect.any(AbortSignal));
+    expect(f.api.revokeVoiceInputDictionaryPeer).not.toHaveBeenCalled();
+  });
+  it("previews a direct invitation and freezes the exact bytes, fingerprint and configuration through live changes", async () => {
+    const f = fixture(); await render(f.api);
+    await fill("Other node’s invitation", invitation()); await click("Review invitation and fingerprint");
+    expect(container.querySelector('[role="alertdialog"]')!.textContent).toContain("b".repeat(64));
+    expect(container.querySelector('[role="alertdialog"]')!.textContent).toContain("peer.example:43121");
+    await act(async () => f.updates.push(status({ configurationRevision: 6n })));
+    expect(button("Confirm").disabled).toBe(true); expect(f.api.grantVoiceInputDictionaryDirectPeer).not.toHaveBeenCalled();
+    await click("Cancel"); await click("Review invitation and fingerprint");
+    const gate = deferred<VoiceDictionaryPeerStatusView>(); f.api.grantVoiceInputDictionaryDirectPeer.mockImplementationOnce(() => gate.promise);
+    await click("Confirm");
+    expect(f.api.grantVoiceInputDictionaryDirectPeer).toHaveBeenCalledExactlyOnceWith(6n, invitation(), "b".repeat(64), expect.any(AbortSignal));
+    Object.defineProperty(document, "visibilityState", { configurable: true, value: "hidden" });
+    await act(async () => document.dispatchEvent(new Event("visibilitychange")));
+    expect(f.api.grantVoiceInputDictionaryDirectPeer.mock.calls[0]![3]!.aborted).toBe(true);
+    await act(async () => gate.resolve(status({ configurationRevision: 7n })));
+    expect(container.textContent).not.toContain("The sharing request completed.");
+  });
   it("keeps live authority and equal-revision metadata ahead of late RPCs, and reconnects explicitly after disconnect", async () => {
     const f = fixture();
     const read = deferred<VoiceDictionaryPeerStatusView>();

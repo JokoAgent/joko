@@ -1,4 +1,4 @@
-import type { VoiceDictionaryPeerStatusView } from "@joko/contracts";
+import { readVoiceDictionaryPeerInvitation, type VoiceDictionaryPeerListener, type VoiceDictionaryPeerStatusView } from "@joko/contracts";
 import type { MobileVoiceDictionaryTransport } from "./mobile-voice-dictionary-service";
 
 export interface MobileVoiceDictionaryPeerState {
@@ -84,7 +84,37 @@ export class MobileVoiceDictionaryPeerController {
   syncNow(ownerKey: string, revision: bigint): Promise<void> {
     return this.#mutate(ownerKey, (transport, signal) => transport.syncVoiceInputDictionaryNow(revision, undefined, signal));
   }
+  async configureListener(ownerKey: string, revision: bigint, listener: VoiceDictionaryPeerListener | undefined): Promise<void> {
+    this.#assertRevision(ownerKey, revision);
+    return this.#mutate(ownerKey, (transport, signal) => transport.configureVoiceInputDictionaryListener(revision, listener, signal));
+  }
+  async grantDirect(ownerKey: string, revision: bigint, invitation: string, fingerprint: string): Promise<void> {
+    this.#assertRevision(ownerKey, revision);
+    const preview = readVoiceDictionaryPeerInvitation(invitation);
+    if (preview.fingerprint !== fingerprint || preview.nodeId === this.#state.value!.nodeId ||
+      this.#state.value!.peers.some((peer) => peer.peerId === preview.nodeId && peer.fingerprint !== fingerprint)) throw new Error("Dictionary peer identity changed.");
+    return this.#mutate(ownerKey, (transport, signal) => transport.grantVoiceInputDictionaryDirectPeer(revision, invitation, fingerprint, signal));
+  }
+  async clearRoute(ownerKey: string, revision: bigint, peerId: string): Promise<void> {
+    this.#assertRevision(ownerKey, revision);
+    return this.#mutate(ownerKey, (transport, signal) => transport.clearVoiceInputDictionaryPeerRoute(revision, peerId, signal));
+  }
+  async invitation(ownerKey: string, revision: bigint): Promise<string> {
+    this.#assertRevision(ownerKey, revision);
+    const expected = this.#state.value!;
+    const result = await this.#execute(ownerKey, (transport, signal) => transport.getVoiceInputDictionaryPeerInvitation(signal));
+    const preview = readVoiceDictionaryPeerInvitation(result);
+    if (this.#state.value?.configurationRevision !== revision || preview.nodeId !== expected.nodeId || preview.fingerprint !== expected.fingerprint ||
+      preview.host !== expected.listener?.host || preview.port !== expected.listener?.port) throw new Error("Dictionary invitation authority changed.");
+    return result;
+  }
+  #assertRevision(ownerKey: string, revision: bigint): void {
+    if (this.#state.ownerKey !== ownerKey || this.#state.value?.configurationRevision !== revision) throw new Error("Dictionary sharing revision or owner changed.");
+  }
   async #mutate(ownerKey: string, effect: (transport: MobileVoiceDictionaryTransport, signal: AbortSignal) => Promise<VoiceDictionaryPeerStatusView>): Promise<void> {
+    await this.#execute(ownerKey, effect);
+  }
+  async #execute<T extends VoiceDictionaryPeerStatusView | string>(ownerKey: string, effect: (transport: MobileVoiceDictionaryTransport, signal: AbortSignal) => Promise<T>): Promise<T> {
     const transport = this.#transport;
     if (!transport?.isCurrent() || transport.ownerKey !== ownerKey || this.#state.status !== "ready" || this.#state.busy || !this.#state.value?.available) throw new Error("Dictionary sharing is unavailable or its owner changed.");
     const epoch = ++this.#epoch;
@@ -95,7 +125,9 @@ export class MobileVoiceDictionaryPeerController {
     try {
       const value = await effect(transport, request.signal);
       if (!this.#current(transport, epoch, request)) throw new Error("Dictionary sharing authority changed.");
-      this.#adopt(value, pushEpoch);
+      if (typeof value === "string") { readVoiceDictionaryPeerInvitation(value); this.#publish({ ...this.#state, busy: false }); }
+      else this.#adopt(value, pushEpoch);
+      return value;
     } catch (error) {
       if (this.#current(transport, epoch, request)) {
         this.#publish({ ...this.#state, status: "error", busy: false });

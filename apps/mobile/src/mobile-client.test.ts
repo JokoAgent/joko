@@ -1002,6 +1002,10 @@ function fakeNetwork(): MobileNetwork {
     grantVoiceInputDictionaryPeer: vi.fn(async () => { throw new Error("No dictionary sharing fixture was configured."); }),
     revokeVoiceInputDictionaryPeer: vi.fn(async () => { throw new Error("No dictionary sharing fixture was configured."); }),
     syncVoiceInputDictionaryNow: vi.fn(async () => { throw new Error("No dictionary sharing fixture was configured."); }),
+    configureVoiceInputDictionaryListener: vi.fn(async () => { throw new Error("No dictionary sharing fixture was configured."); }),
+    getVoiceInputDictionaryPeerInvitation: vi.fn(async () => { throw new Error("No dictionary sharing fixture was configured."); }),
+    grantVoiceInputDictionaryDirectPeer: vi.fn(async () => { throw new Error("No dictionary sharing fixture was configured."); }),
+    clearVoiceInputDictionaryPeerRoute: vi.fn(async () => { throw new Error("No dictionary sharing fixture was configured."); }),
     setVoiceInputDictionarySyncEnabled: vi.fn(async () => { throw new Error("No Voice dictionary fixture was configured."); }),
     addVoiceInputDictionaryTerms: vi.fn(async () => { throw new Error("No Voice dictionary fixture was configured."); }),
     editVoiceInputDictionaryEntry: vi.fn(async () => { throw new Error("No Voice dictionary fixture was configured."); }),
@@ -2253,8 +2257,12 @@ describe("native mobile connection and operation ownership", () => {
     for (const method of methods) vi.mocked(network[method]).mockResolvedValue(dictionary);
     const sharing = { available: true, configurationRevision: 3n, nodeId: "node-a", fingerprint: "a".repeat(64),
       enabled: true, phase: "waiting" as const, peers: [], candidates: [] };
-    const sharingMethods = ["getVoiceInputDictionaryPeerStatus", "grantVoiceInputDictionaryPeer", "revokeVoiceInputDictionaryPeer", "syncVoiceInputDictionaryNow"] as const;
+    const sharingMethods = ["getVoiceInputDictionaryPeerStatus", "grantVoiceInputDictionaryPeer", "revokeVoiceInputDictionaryPeer", "syncVoiceInputDictionaryNow",
+      "configureVoiceInputDictionaryListener", "grantVoiceInputDictionaryDirectPeer", "clearVoiceInputDictionaryPeerRoute"] as const;
     for (const method of sharingMethods) vi.mocked(network[method]).mockResolvedValue(sharing);
+    const invitation = JSON.stringify({ version: 1, nodeId: "node-b", displayName: "Peer", publicKey: "MCowBQYDK2VuAyEA" + "A".repeat(43) + "=",
+      fingerprint: "b".repeat(64), host: "peer.example", port: 43_121 });
+    vi.mocked(network.getVoiceInputDictionaryPeerInvitation).mockResolvedValue(invitation);
     expect(app.voiceDictionaryTransport()).toBeUndefined();
     await app.start();
     const api = app.voiceDictionaryTransport()!;
@@ -2279,16 +2287,26 @@ describe("native mobile connection and operation ownership", () => {
     await api.grantVoiceInputDictionaryPeer(3n, "node-b", "b".repeat(64), request.signal);
     await api.revokeVoiceInputDictionaryPeer("node-b", 2n, request.signal);
     await api.syncVoiceInputDictionaryNow(3n, "node-b", request.signal);
+    await api.configureVoiceInputDictionaryListener(3n, { listenPort: 43_121, host: "self.example", port: 44_121 }, request.signal);
+    await expect(api.getVoiceInputDictionaryPeerInvitation(request.signal)).resolves.toBe(invitation);
+    await api.grantVoiceInputDictionaryDirectPeer(3n, invitation, "b".repeat(64), request.signal);
+    await api.clearVoiceInputDictionaryPeerRoute(3n, "node-b", request.signal);
     expect(network.getVoiceInputDictionaryPeerStatus).toHaveBeenCalledExactlyOnceWith(credential, request.signal);
     expect(network.grantVoiceInputDictionaryPeer).toHaveBeenCalledExactlyOnceWith(credential, 3n, "node-b", "b".repeat(64), request.signal);
     expect(network.revokeVoiceInputDictionaryPeer).toHaveBeenCalledExactlyOnceWith(credential, "node-b", 2n, request.signal);
     expect(network.syncVoiceInputDictionaryNow).toHaveBeenCalledExactlyOnceWith(credential, 3n, "node-b", request.signal);
+    expect(network.configureVoiceInputDictionaryListener).toHaveBeenCalledExactlyOnceWith(credential, 3n, { listenPort: 43_121, host: "self.example", port: 44_121 }, request.signal);
+    expect(network.getVoiceInputDictionaryPeerInvitation).toHaveBeenCalledExactlyOnceWith(credential, request.signal);
+    expect(network.grantVoiceInputDictionaryDirectPeer).toHaveBeenCalledExactlyOnceWith(credential, 3n, invitation, "b".repeat(64), request.signal);
+    expect(network.clearVoiceInputDictionaryPeerRoute).toHaveBeenCalledExactlyOnceWith(credential, 3n, "node-b", request.signal);
     app.setForeground(false);
     expect(api.isCurrent()).toBe(false);
     await expect(api.addVoiceInputDictionaryTerms(4n, ["RetiredTerm"])).rejects.toThrow(/authority changed/u);
     expect(network.addVoiceInputDictionaryTerms).toHaveBeenCalledOnce();
     await expect(api.grantVoiceInputDictionaryPeer(3n, "retired", "c".repeat(64))).rejects.toThrow(/authority changed/u);
     expect(network.grantVoiceInputDictionaryPeer).toHaveBeenCalledOnce();
+    await expect(api.clearVoiceInputDictionaryPeerRoute(3n, "node-b")).rejects.toThrow(/authority changed/u);
+    expect(network.clearVoiceInputDictionaryPeerRoute).toHaveBeenCalledOnce();
     app.setForeground(true);
     await vi.waitFor(() => expect(app.voiceDictionaryTransport()?.isCurrent()).toBe(true));
     expect(api.isCurrent()).toBe(false);

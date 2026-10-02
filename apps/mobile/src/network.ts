@@ -7,7 +7,7 @@ import {
   ResourceKind, SchedulerService, SessionService, TargetService, VoiceInputService,
   VoiceInputDictionaryEntrySource, VoiceInputDictionaryLearningActionType,
   VoiceInputDictionaryLearningConfidence, VoiceInputDictionaryTermType,
-  nextVoiceDictionaryWatchSequence, projectVoiceDictionaryPeerStatus, type VoiceDictionaryPeerStatusView,
+  nextVoiceDictionaryWatchSequence, projectVoiceDictionaryPeerStatus, readVoiceDictionaryPeerInvitation, type VoiceDictionaryPeerListener, type VoiceDictionaryPeerStatusView,
   projectVoiceDictionaryReadOnly, type VoiceDictionaryReadOnlyView,
   WorktreeEligibility, WorktreeService,
   TransferDirection, WorkspaceEntryListingPolicy, WorkspaceFileChangeKind, WorkspaceService,
@@ -153,6 +153,10 @@ export interface MobileNetwork {
   grantVoiceInputDictionaryPeer(credential: PairedCredential, expectedConfigurationRevision: bigint, peerId: string, expectedFingerprint: string, signal?: AbortSignal): Promise<VoiceDictionaryPeerStatusView>;
   revokeVoiceInputDictionaryPeer(credential: PairedCredential, peerId: string, expectedGrantRevision: bigint, signal?: AbortSignal): Promise<VoiceDictionaryPeerStatusView>;
   syncVoiceInputDictionaryNow(credential: PairedCredential, expectedConfigurationRevision: bigint, peerId: string | undefined, signal?: AbortSignal): Promise<VoiceDictionaryPeerStatusView>;
+  configureVoiceInputDictionaryListener(credential: PairedCredential, expectedConfigurationRevision: bigint, listener: VoiceDictionaryPeerListener | undefined, signal?: AbortSignal): Promise<VoiceDictionaryPeerStatusView>;
+  getVoiceInputDictionaryPeerInvitation(credential: PairedCredential, signal?: AbortSignal): Promise<string>;
+  grantVoiceInputDictionaryDirectPeer(credential: PairedCredential, expectedConfigurationRevision: bigint, invitation: string, expectedFingerprint: string, signal?: AbortSignal): Promise<VoiceDictionaryPeerStatusView>;
+  clearVoiceInputDictionaryPeerRoute(credential: PairedCredential, expectedConfigurationRevision: bigint, peerId: string, signal?: AbortSignal): Promise<VoiceDictionaryPeerStatusView>;
   setVoiceInputDictionarySyncEnabled(credential: PairedCredential, expectedRevision: bigint, enabled: boolean, signal?: AbortSignal): Promise<MobileVoiceDictionarySnapshot>;
   addVoiceInputDictionaryTerms(credential: PairedCredential, expectedRevision: bigint, terms: readonly string[], signal?: AbortSignal): Promise<MobileVoiceDictionarySnapshot>;
   editVoiceInputDictionaryEntry(credential: PairedCredential, expectedRevision: bigint, entryId: string, text: string, aliases: readonly string[], signal?: AbortSignal): Promise<MobileVoiceDictionarySnapshot>;
@@ -1521,6 +1525,23 @@ export const mobileNetwork: MobileNetwork = {
   },
   async syncVoiceInputDictionaryNow(credential, expectedConfigurationRevision, peerId, signal) {
     const response = await createClient(VoiceInputService, transport(credential.origin, credential.authKey)).syncVoiceInputDictionaryNow({ expectedConfigurationRevision, ...(peerId === undefined ? {} : { peerId }) }, options(signal));
+    return projectVoiceDictionaryPeerStatus(response.status);
+  },
+  async configureVoiceInputDictionaryListener(credential, expectedConfigurationRevision, listener, signal) {
+    const response = await createClient(VoiceInputService, transport(credential.origin, credential.authKey)).configureVoiceInputDictionaryListener({ expectedConfigurationRevision, listener }, options(signal));
+    return projectVoiceDictionaryPeerStatus(response.status);
+  },
+  async getVoiceInputDictionaryPeerInvitation(credential, signal) {
+    const response = await createClient(VoiceInputService, transport(credential.origin, credential.authKey)).getVoiceInputDictionaryPeerInvitation({}, options(signal));
+    readVoiceDictionaryPeerInvitation(response.invitation);
+    return response.invitation;
+  },
+  async grantVoiceInputDictionaryDirectPeer(credential, expectedConfigurationRevision, invitation, expectedFingerprint, signal) {
+    const response = await createClient(VoiceInputService, transport(credential.origin, credential.authKey)).grantVoiceInputDictionaryDirectPeer({ expectedConfigurationRevision, invitation, expectedFingerprint }, options(signal));
+    return projectVoiceDictionaryPeerStatus(response.status);
+  },
+  async clearVoiceInputDictionaryPeerRoute(credential, expectedConfigurationRevision, peerId, signal) {
+    const response = await createClient(VoiceInputService, transport(credential.origin, credential.authKey)).clearVoiceInputDictionaryPeerRoute({ expectedConfigurationRevision, peerId }, options(signal));
     return projectVoiceDictionaryPeerStatus(response.status);
   },
   async setVoiceInputDictionarySyncEnabled(credential, expectedRevision, enabled, signal) {

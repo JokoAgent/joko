@@ -16,6 +16,10 @@ function fixture(ownerKey = "node-a") {
     grantVoiceInputDictionaryPeer: vi.fn(async () => { throw new Error("Sharing is not part of this dictionary-content fixture."); }),
     revokeVoiceInputDictionaryPeer: vi.fn(async () => { throw new Error("Sharing is not part of this dictionary-content fixture."); }),
     syncVoiceInputDictionaryNow: vi.fn(async () => { throw new Error("Sharing is not part of this dictionary-content fixture."); }),
+    configureVoiceInputDictionaryListener: vi.fn(async () => { throw new Error("Sharing is not part of this dictionary-content fixture."); }),
+    getVoiceInputDictionaryPeerInvitation: vi.fn(async () => { throw new Error("Sharing is not part of this dictionary-content fixture."); }),
+    grantVoiceInputDictionaryDirectPeer: vi.fn(async () => { throw new Error("Sharing is not part of this dictionary-content fixture."); }),
+    clearVoiceInputDictionaryPeerRoute: vi.fn(async () => { throw new Error("Sharing is not part of this dictionary-content fixture."); }),
     getVoiceInputDictionary: vi.fn(async () => snapshot),
     setVoiceInputDictionarySyncEnabled: commit, addVoiceInputDictionaryTerms: commit,
     editVoiceInputDictionaryEntry: commit, deleteVoiceInputDictionaryEntry: commit, applyVoiceInputDictionaryLearning: commit
