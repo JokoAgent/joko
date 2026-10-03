@@ -44,6 +44,8 @@ function runner(overrides: Partial<SystemFrontmostInputRunner> = {}): SystemFron
   };
 }
 
+const PURE_X11_SESSION = Object.freeze({ sessionType: "x11", waylandDisplay: undefined });
+
 describe("platform system frontmost input", () => {
   it.each(["win32", "darwin", "linux"] as const)("requires the %s native helper", (platform) => {
     expect(createPlatformSystemFrontmostInput({
@@ -62,6 +64,7 @@ describe("platform system frontmost input", () => {
     const resolved = createPlatformSystemFrontmostInput({
       platform,
       ...(platform === "win32" ? { windowsHelper: helper } : { linuxHelper: helper }),
+      ...(platform === "linux" ? { linuxSession: PURE_X11_SESSION } : {}),
       currentProcessId: 77
     });
     if (resolved.status !== "available") throw new Error("Expected native input support.");
@@ -104,7 +107,8 @@ describe("platform system frontmost input", () => {
       postScroll: vi.fn(async () => undefined)
     } satisfies NativeSystemFrontmostInputHelper;
     const resolved = createPlatformSystemFrontmostInput({
-      platform, ...(platform === "win32" ? { windowsHelper: helper } : { linuxHelper: helper }), currentProcessId: 77
+      platform, ...(platform === "win32" ? { windowsHelper: helper } : { linuxHelper: helper }),
+      ...(platform === "linux" ? { linuxSession: PURE_X11_SESSION } : {}), currentProcessId: 77
     });
     if (resolved.status !== "available") throw new Error("Expected native input support.");
     expect(() => resolved.runner.captureTarget()).toThrow();
@@ -126,7 +130,8 @@ describe("platform system frontmost input", () => {
       postScroll: vi.fn<NativeSystemFrontmostInputHelper["postScroll"]>(revalidate)
     };
     const resolved = createPlatformSystemFrontmostInput({
-      platform, ...(platform === "win32" ? { windowsHelper: helper } : { linuxHelper: helper }), currentProcessId: 77
+      platform, ...(platform === "win32" ? { windowsHelper: helper } : { linuxHelper: helper }),
+      ...(platform === "linux" ? { linuxSession: PURE_X11_SESSION } : {}), currentProcessId: 77
     });
     if (resolved.status !== "available") throw new Error("Expected native input support.");
     const target = resolved.runner.captureTarget();
@@ -148,7 +153,9 @@ describe("platform system frontmost input", () => {
       postPaste: vi.fn(async () => undefined),
       postScroll: vi.fn(async () => undefined)
     } satisfies NativeSystemFrontmostInputHelper;
-    const resolved = createPlatformSystemFrontmostInput({ platform: "linux", linuxHelper: helper, currentProcessId: 77 });
+    const resolved = createPlatformSystemFrontmostInput({
+      platform: "linux", linuxHelper: helper, linuxSession: PURE_X11_SESSION, currentProcessId: 77
+    });
     if (resolved.status !== "available") throw new Error("Expected Linux input support.");
     const failures: unknown[] = [];
     const controller = new SystemFrontmostInputController(resolved.runner, { onFailure: (error) => failures.push(error) });
@@ -160,6 +167,39 @@ describe("platform system frontmost input", () => {
     expect(helper.postPaste).not.toHaveBeenCalled();
     expect(helper.postScroll).not.toHaveBeenCalled();
     expect(failures).toEqual([failure]);
+  });
+
+  it.each([
+    { sessionType: undefined, waylandDisplay: undefined },
+    { sessionType: "wayland", waylandDisplay: "wayland-0" },
+    { sessionType: "x11", waylandDisplay: "wayland-0" }
+  ])("does not advertise global Linux targeting outside a pure X11 session: $sessionType/$waylandDisplay", (linuxSession) => {
+    const helper = {
+      captureTarget: vi.fn(() => ({ nativeId: "314", processId: 999 })),
+      postReturn: vi.fn(async () => undefined),
+      postPaste: vi.fn(async () => undefined),
+      postScroll: vi.fn(async () => undefined)
+    } satisfies NativeSystemFrontmostInputHelper;
+    expect(createPlatformSystemFrontmostInput({
+      platform: "linux", linuxHelper: helper, linuxSession, currentProcessId: 77
+    })).toEqual({ status: "unsupported", reason: "session-unsupported" });
+    expect(helper.captureTarget).not.toHaveBeenCalled();
+  });
+
+  it("admits a pure X11 session when WAYLAND_DISPLAY is explicitly empty", () => {
+    const helper = {
+      captureTarget: vi.fn(() => ({ nativeId: "314", processId: 999 })),
+      postReturn: vi.fn(async () => undefined),
+      postPaste: vi.fn(async () => undefined),
+      postScroll: vi.fn(async () => undefined)
+    } satisfies NativeSystemFrontmostInputHelper;
+    expect(createPlatformSystemFrontmostInput({
+      platform: "linux",
+      linuxHelper: helper,
+      linuxSession: { sessionType: "x11", waylandDisplay: "" },
+      currentProcessId: 77
+    }).status).toBe("available");
+    expect(helper.captureTarget).not.toHaveBeenCalled();
   });
 
   it("requires an injected macOS helper with explicit atomic/captured-target semantics", async () => {

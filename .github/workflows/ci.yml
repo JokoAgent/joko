@@ -49,7 +49,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install --no-install-recommends --yes ripgrep xvfb
+          sudo apt-get install --no-install-recommends --yes build-essential pkg-config libxcb1-dev libxcb-res0-dev libxcb-xkb-dev ripgrep xauth xvfb
 
       - name: Install Windows test dependencies
         if: runner.os == 'Windows'
@@ -91,6 +91,8 @@ jobs:
         run: xvfb-run --auto-servernum --server-args="-screen 0 1280x1024x24" pnpm test:desktop:host
         env:
           JOKO_DESKTOP_SMOKE_NO_SANDBOX: "1"
+          XDG_SESSION_TYPE: x11
+          WAYLAND_DISPLAY: ""
 
       - name: Run Electron development-host smoke (Windows/macOS)
         if: ${{ !cancelled() && steps.desktop_runtime.outcome == 'success' && runner.os != 'Linux' }}
