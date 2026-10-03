@@ -185,7 +185,7 @@ describe("isolated Orchestrator runtime staging", () => {
     expect(result.stderr).toMatch(/node-pty|conpty|pty.node/iu);
   });
 
-  it("runs the relocated published Session SDK Worker under Electron-Node and requires its built entry", async () => {
+  it("runs the relocated published Session SDK Worker under Electron-Node and requires its exact built Owner bundle", async () => {
     const fixture = await claudeSessionRuntimeFixture();
     const inspected = await auditClaudeSessionRuntimeAssets(fixture.runtimeRoot);
     const result = runNativeProbe(fixture);
@@ -198,6 +198,7 @@ describe("isolated Orchestrator runtime staging", () => {
       version: "0.3.259",
       electronVersion: "43.6.0",
       workerEntry: inspected.workerEntry,
+      freshContextOwnerEntry: inspected.freshContextOwnerEntry,
       managerEntry: inspected.managerEntry,
       assets: expect.arrayContaining([
         {
@@ -207,12 +208,25 @@ describe("isolated Orchestrator runtime staging", () => {
         {
           path: inspected.managerEntry,
           sha256: createHash("sha256").update(readFileSync(inspected.managerEntry)).digest("hex")
+        },
+        {
+          path: inspected.freshContextOwnerEntry,
+          sha256: createHash("sha256").update(readFileSync(inspected.freshContextOwnerEntry)).digest("hex")
         }
       ]),
       missingSession: true,
       workerRetired: true,
       isolatedProfileUnchanged: true
     });
+    const ownerSource = readFileSync(inspected.freshContextOwnerEntry);
+    writeFileSync(inspected.freshContextOwnerEntry, Buffer.concat([ownerSource, Buffer.from("\n// Another Owner build.\n")]));
+    await expect(auditClaudeSessionRuntimeAssets(fixture.runtimeRoot)).rejects.toThrow(
+      "The Session SDK Device peer manager bundle is not from this adapter build."
+    );
+    writeFileSync(inspected.freshContextOwnerEntry, ownerSource);
+    rmSync(inspected.freshContextOwnerEntry);
+    await expect(auditClaudeSessionRuntimeAssets(fixture.runtimeRoot)).rejects.toThrow();
+    writeFileSync(inspected.freshContextOwnerEntry, ownerSource);
     rmSync(inspected.workerEntry);
     await expect(auditClaudeSessionRuntimeAssets(fixture.runtimeRoot)).rejects.toThrow();
   }, 50_000);
