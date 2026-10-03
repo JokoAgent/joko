@@ -171,6 +171,74 @@ describe("projectTimelineRenderItems", () => {
     expect(contiguous).toHaveLength(1);
   });
 
+  it.each([
+    {
+      name: "a long tool followed immediately by more work",
+      source: [
+        timelineItem("long-tool", "toolResult", 0, { endedAt: 40 * 60_000 }),
+        timelineItem("next-tool", "tool", 41 * 60_000)
+      ],
+      keys: ["long-tool"],
+      gaps: []
+    },
+    {
+      name: "parallel tools settling out of source order",
+      source: [
+        timelineItem("long-tool", "toolResult", 0, { endedAt: 60 * 60_000 }),
+        timelineItem("short-tool", "toolResult", 10 * 60_000, { endedAt: 11 * 60_000 }),
+        timelineItem("next-thinking", "thinking", 61 * 60_000)
+      ],
+      keys: ["long-tool"],
+      gaps: []
+    },
+    {
+      name: "a real interval after the latest parallel completion",
+      source: [
+        timelineItem("long-tool", "toolResult", 0, { endedAt: 40 * 60_000 }),
+        timelineItem("short-tool", "toolResult", 10 * 60_000, { endedAt: 11 * 60_000 }),
+        timelineItem("next-tool", "tool", 71 * 60_000)
+      ],
+      keys: ["long-tool", "next-tool"],
+      gaps: [{ previousItemId: "long-tool", nextItemId: "next-tool", durationMs: 31 * 60_000 }]
+    },
+    {
+      name: "a new user boundary resetting the previous turn's completion",
+      source: [
+        timelineItem("long-tool", "toolResult", 0, { endedAt: 100 * 60_000 }),
+        timelineItem("new-user", "user", 20 * 60_000),
+        timelineItem("next-tool", "tool", 51 * 60_000)
+      ],
+      keys: ["long-tool", "new-user", "next-tool"],
+      gaps: [{ previousItemId: "new-user", nextItemId: "next-tool", durationMs: 31 * 60_000 }]
+    },
+    {
+      name: "a new user boundary with no usable timestamp retiring the old anchor",
+      source: [
+        timelineItem("long-tool", "toolResult", 0, { endedAt: 100 * 60_000 }),
+        timelineItem("new-user", "user", 20 * 60_000, { createdAt: Number.NaN }),
+        timelineItem("next-tool", "tool", 51 * 60_000)
+      ],
+      keys: ["long-tool", "new-user", "next-tool"],
+      gaps: []
+    },
+    {
+      name: "an invalid completion falling back to the known start",
+      source: [
+        timelineItem("tool-without-end", "toolResult", 0, { endedAt: Number.NaN }),
+        timelineItem("next-tool", "tool", 41 * 60_000)
+      ],
+      keys: ["tool-without-end", "next-tool"],
+      gaps: [{ previousItemId: "tool-without-end", nextItemId: "next-tool", durationMs: 41 * 60_000 }]
+    }
+  ])("uses known completion times for $name", ({ source, keys, gaps }) => {
+    const projected = projectTimelineRenderItems(source);
+
+    expect(projected.map((item) => item.key)).toEqual(keys);
+    expect(projected.flatMap((item) => item.historyGapBefore === undefined ? [] : [item.historyGapBefore]))
+      .toEqual(gaps);
+    expect(projected.flatMap((item) => item.childIds)).toEqual(source.map((item) => item.id));
+  });
+
   it("recovers child anchors after prepended history changes the group key", () => {
     const beforePrepend = projectTimelineRenderItems([
       timelineItem("old-anchor", "thinking", 2),

@@ -1338,6 +1338,8 @@ export interface TimelineItemView {
     | "review"
     | "status";
   readonly createdAt: number;
+  /** Exact activity completion supplied by the owning tool-call contract. */
+  readonly endedAt?: number;
   readonly title?: string;
   readonly text?: string;
   readonly streaming?: boolean;

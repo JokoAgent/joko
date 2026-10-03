@@ -17699,6 +17699,7 @@ function mapToolItem(
   outputMode: "preserve" | "append" | "replace"
 ): TimelineItemView {
   const attachments = toolResultAttachments(result);
+  const endedAt = call.endedAt === undefined ? existing?.endedAt : timestampMs(call.endedAt);
   const name = call.toolId || existing?.tool?.name || "tool";
   const currentInput = displayArguments(call.arguments);
   const outputChunk = toolResultText(result);
@@ -17723,6 +17724,7 @@ function mapToolItem(
     sequence,
     kind: call.state === ToolCallState.SUCCEEDED || call.state === ToolCallState.FAILED ? "toolResult" : "tool",
     createdAt,
+    ...(endedAt === undefined ? {} : { endedAt }),
     title: name,
     tool: {
       id: call.toolCallId,

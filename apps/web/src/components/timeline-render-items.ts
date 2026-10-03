@@ -144,11 +144,18 @@ export function projectTimelineRenderItems(
       pendingGapBefore = undefined;
     }
 
-    if (timestamp !== undefined) {
-      // Preserve the latest known wall-clock anchor when provider events settle
-      // out of order; otherwise a later row can manufacture a false gap.
-      if (previousTimestamp === undefined || timestamp >= previousTimestamp || userBoundary) {
-        previousTimestamp = timestamp;
+    const endedAt = finiteTimestamp(item.endedAt);
+    const endTimestamp = timestamp === undefined
+      ? endedAt
+      : endedAt === undefined ? timestamp : Math.max(timestamp, endedAt);
+    if (userBoundary) {
+      previousTimestamp = timestamp;
+      previousTimestampItemId = timestamp === undefined ? undefined : item.id;
+    } else if (endTimestamp !== undefined) {
+      // Long tools and parallel work settle after their source-ordered starts.
+      // Keep the latest known end so continuous work cannot manufacture a gap.
+      if (previousTimestamp === undefined || endTimestamp >= previousTimestamp) {
+        previousTimestamp = endTimestamp;
         previousTimestampItemId = item.id;
       }
     }
@@ -216,8 +223,8 @@ export function timelineRenderChildIndex(
   return index;
 }
 
-function finiteTimestamp(value: number): number | undefined {
-  return Number.isFinite(value) ? value : undefined;
+function finiteTimestamp(value: number | undefined): number | undefined {
+  return value !== undefined && Number.isFinite(value) ? value : undefined;
 }
 
 function renderItemLastTimestamp(item: TimelineRenderItem): number {

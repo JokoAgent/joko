@@ -1124,6 +1124,83 @@ describe("incremental event projection", () => {
     });
   });
 
+  it("keeps exact tool completion times through live updates and rebuilt history", () => {
+    let raw = create(SnapshotSchema, {
+      generation: 3n,
+      resumeCursor: { generation: 3n, sequence: 0n }
+    });
+    let snapshot = mapSnapshot(raw);
+    let sequence = 0n;
+    const apply = (seconds: bigint, payload: Event["payload"]): void => {
+      sequence += 1n;
+      const projected = projectSnapshotEvent(raw, snapshot, create(EventSchema, {
+        eventId: `tool-time-${sequence}`,
+        cursor: { generation: 3n, sequence },
+        identity: { sessionId: "session-tool-time", runId: "run-1" },
+        occurredAt: { seconds },
+        payload
+      }));
+      expect(projected.refresh).toBe("none");
+      raw = projected.rawSnapshot;
+      snapshot = projected.snapshot;
+    };
+    const toolItem = () => snapshot.timelineBySession.get("session-tool-time")
+      ?.find((item) => item.id === "long-tool");
+
+    apply(0n, create(EventPayloadSchema, { kind: { case: "toolCallStarted", value: { toolCall: {
+      toolCallId: "long-tool",
+      toolId: "shell",
+      state: ToolCallState.RUNNING
+    } } } }));
+    expect(toolItem()?.endedAt).toBeUndefined();
+
+    apply(2_460n, create(EventPayloadSchema, { kind: { case: "toolCallCompleted", value: { toolCall: {
+      toolCallId: "long-tool",
+      toolId: "shell",
+      state: ToolCallState.SUCCEEDED,
+      endedAt: { seconds: 2_400n, nanos: 125_000_000 },
+      result: { parts: [{ content: { case: "text", value: "finished" } }] }
+    } } } }));
+    expect(toolItem()).toMatchObject({
+      id: "long-tool",
+      sequence: 1n,
+      createdAt: 0,
+      endedAt: 2_400_125,
+      kind: "toolResult"
+    });
+
+    apply(2_520n, create(EventPayloadSchema, { kind: { case: "toolCallCompleted", value: { toolCall: {
+      toolCallId: "long-tool",
+      toolId: "shell",
+      state: ToolCallState.SUCCEEDED,
+      result: { parts: [{ content: { case: "text", value: "authoritative final result" } }] }
+    } } } }));
+    expect(toolItem()).toMatchObject({
+      sequence: 1n,
+      createdAt: 0,
+      endedAt: 2_400_125,
+      tool: { output: "authoritative final result" }
+    });
+
+    apply(2_580n, create(EventPayloadSchema, { kind: { case: "toolCallCompleted", value: { toolCall: {
+      toolCallId: "other-tool",
+      toolId: "read",
+      state: ToolCallState.SUCCEEDED
+    } } } }));
+    const otherTool = snapshot.timelineBySession.get("session-tool-time")?.find((item) => item.id === "other-tool");
+    expect(otherTool?.createdAt).toBe(2_580_000);
+    expect(otherTool?.endedAt).toBeUndefined();
+
+    apply(2_640n, create(EventPayloadSchema, { kind: { case: "messageCompleted", value: {
+      messageId: "answer",
+      role: MessageRole.ASSISTANT,
+      blocks: [{ content: { case: "text", value: "Completed the work." } }]
+    } } }));
+    expect(toolItem()).toMatchObject({ createdAt: 0, endedAt: 2_400_125, sequence: 1n });
+    expect(mapSnapshot(raw).timelineBySession.get("session-tool-time"))
+      .toEqual(snapshot.timelineBySession.get("session-tool-time"));
+  });
+
   it("creates a generic assistant message with text and image from completion alone", () => {
     const raw = create(SnapshotSchema, {
       generation: 1n,
