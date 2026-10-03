@@ -133,6 +133,8 @@ interface VoiceInputRecord {
   nextChunkSequence: bigint;
   acceptedAudioBytes: number;
   acceptedAudioDurationMs: number;
+  drainDeadlineAt?: number;
+  drainTimer?: ReturnType<typeof setTimeout>;
   updatedAt: number;
   recoveryAttempts: number;
   stallWarning: boolean;
@@ -355,6 +357,9 @@ export class VoiceInputCoordinator {
     if (input.expectedNextChunkSequence !== record.nextChunkSequence) {
       throw new VoiceInputControlError("conflict");
     }
+    if (record.outcome === undefined && record.state === "listening" && record.drainDeadlineAt === undefined) {
+      this.beginDrainDeadline(record);
+    }
     await record.controller?.stop();
     return snapshot(record);
   }
@@ -386,6 +391,7 @@ export class VoiceInputCoordinator {
     if (this.closed) return;
     this.closed = true;
     const records = [...this.sessions.values()];
+    for (const record of records) this.clearDrainTimer(record);
     await Promise.all(records.map((record) => record.controller?.cancel().catch(() => undefined)));
     for (const record of records) record.controller?.detach();
     this.sessions.clear();
@@ -506,6 +512,7 @@ export class VoiceInputCoordinator {
         onStateChanged: (state, outcome) => {
           record.state = state;
           if (outcome !== undefined) {
+            this.clearDrainTimer(record);
             record.disposeOwner?.();
             delete record.disposeOwner;
             record.outcome = outcome;
@@ -602,15 +609,40 @@ export class VoiceInputCoordinator {
   private sweepExpired(): void {
     const at = this.now();
     for (const record of [...this.sessions.values()]) {
-      const maximumAge = record.outcome === undefined ? this.maximumSessionAgeMs : this.terminalRetentionMs;
-      const reference = record.outcome === undefined ? record.createdAt : record.updatedAt;
-      if (at - reference < maximumAge) continue;
+      const expiresAt = record.outcome === undefined
+        ? record.drainDeadlineAt ?? record.createdAt + this.maximumSessionAgeMs
+        : record.updatedAt + this.terminalRetentionMs;
+      if (at < expiresAt) continue;
       if (record.outcome === undefined) void record.controller?.cancel().catch(() => undefined);
       this.remove(record);
     }
   }
 
+  private beginDrainDeadline(record: VoiceInputRecord): void {
+    const budgetMs = Math.max(record.acceptedAudioDurationMs, Math.ceil(record.acceptedAudioBytes / 32)) + 90_000;
+    const deadline = this.now() + budgetMs;
+    record.drainDeadlineAt = deadline;
+    const expire = (): void => {
+      if (this.sessions.get(record.id) !== record || record.drainDeadlineAt !== deadline || record.outcome !== undefined) return;
+      const remainingMs = deadline - this.now();
+      if (remainingMs > 0) {
+        record.drainTimer = setTimeout(expire, remainingMs);
+        return;
+      }
+      void record.controller?.cancel().catch(() => undefined);
+      this.remove(record);
+    };
+    record.drainTimer = setTimeout(expire, budgetMs);
+  }
+
+  private clearDrainTimer(record: VoiceInputRecord): void {
+    if (record.drainTimer === undefined) return;
+    clearTimeout(record.drainTimer);
+    delete record.drainTimer;
+  }
+
   private remove(record: VoiceInputRecord): void {
+    this.clearDrainTimer(record);
     record.disposeOwner?.();
     delete record.disposeOwner;
     record.controller?.detach();

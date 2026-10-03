@@ -3,13 +3,17 @@ import { createServer, type IncomingMessage } from "node:http";
 import { gzipSync, gunzipSync } from "node:zlib";
 import { WebSocketServer, type WebSocket } from "ws";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { AsrEvent } from "@joko/voice-input";
+import { MAXIMUM_AUDIO_BYTES, type AsrEvent } from "@joko/voice-input";
 import { SAUC_SUPPORTED_LOCALES, SaucTranscriptionProvider, probeSaucTranscriptionRoute, validateSaucLocale,
   validateSaucTranscriptionConfiguration, validateSaucTranscriptionRoute, type SaucAuthentication,
   type SaucTranscriptionMode, type SaucTranscriptionRoute } from "./provider.js";
 
 const cleanups: Array<() => Promise<void>> = [];
-afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); });
+afterEach(async () => {
+  vi.useRealTimers();
+  vi.restoreAllMocks();
+  for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
+});
 
 type Packet = { type: number; sequence?: number; data: Buffer };
 function decode(data: Buffer): Packet {
@@ -174,9 +178,12 @@ describe("SAUC native transcription", () => {
       { type: "stable", text: "" }, { type: "partial", text: "withdrawn final draft" }, { type: "stable", text: "" }]);
   });
 
-  it("replays the complete bounded capture on the same route, shields old stable text, and drains a stop during recovery", async () => {
+  it("replays capture beyond sixty seconds from one owner, replaces the old recognition, and drains a stop during recovery", async () => {
     const sockets: WebSocket[] = []; const captures: Packet[][] = []; const headers: IncomingMessage["headers"][] = [];
-    const initial = await fixture((socket, request, _index, packets) => { sockets.push(socket); captures.push(packets); headers.push(request.headers); });
+    const initial = await fixture((socket, request, index, packets) => {
+      sockets.push(socket); captures.push(packets); headers.push(request.headers);
+      if (index === 0) socket.once("message", () => socket.send(response({})));
+    }, false);
     const recognitionContext = { hotwords: ["VoiceKit"], contextData: [{ text: "Frozen recording context." }] };
     const route: SaucTranscriptionRoute = { ...initial, authentication: { type: "accessToken", appId: "original-application", accessToken: "original-token" }, recognitionContext };
     const { instance, events } = provider(route);
@@ -184,7 +191,14 @@ describe("SAUC native transcription", () => {
     recognitionContext.hotwords[0] = "changed-hotword";
     recognitionContext.contextData[0]!.text = "Changed recording context.";
     await instance.start({ runId: "run", mimeType: "audio/pcm" });
-    instance.appendAudio(audio(200, 1));
+    const expected: Buffer[] = [];
+    for (let index = 0; index < 6; index += 1) {
+      const captured = audio(10_000, index + 1);
+      instance.appendAudio(captured);
+      expected.push(Buffer.alloc(320_000, index + 1));
+      new Uint8Array(captured.data).fill(254);
+    }
+    instance.appendAudio(audio(1_000, 7)); expected.push(Buffer.alloc(32_000, 7));
     await vi.waitFor(() => expect(captures[0]).toHaveLength(2));
     sockets[0]!.send(response(result("hello"), 2));
     await vi.waitFor(() => expect(events.at(-1)).toEqual({ type: "stable", text: "hello" }));
@@ -192,25 +206,29 @@ describe("SAUC native transcription", () => {
     await vi.waitFor(() => expect(events.at(-1)).toEqual({ type: "partial", text: "hello withdrawn" }));
     sockets[0]!.terminate();
     await vi.waitFor(() => expect(events.at(-1)).toEqual({ type: "disconnected", recoverable: true }));
-    instance.appendAudio(audio(100, 2));
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
     const recovering = instance.recover();
     expect(instance.recover()).toBe(recovering);
-    await vi.waitFor(() => expect(captures[1]?.length).toBeGreaterThanOrEqual(2));
-    instance.appendAudio(audio(100, 3));
-    const stopping = instance.flushAudio();
-    sockets[1]!.send(response(result("hel", 0), 2));
+    await vi.waitFor(() => expect(captures[1]).toHaveLength(1));
+    expect(events.at(-1)).toEqual({ type: "stable", text: "" });
+    instance.appendAudio(audio(100, 8)); expected.push(Buffer.alloc(3_200, 8));
+    let stopped = false;
+    const stopping = instance.flushAudio().then(() => { stopped = true; });
+    sockets[1]!.send(response({}));
     await roundTrip(sockets[1]!);
-    expect(events.filter((event) => event.type === "partial")).toEqual([{ type: "partial", text: "hello withdrawn" }]);
-    sockets[1]!.send(response(result("hello", 0), 3));
+    sockets[1]!.send(response(result("revised draft", 7), 2));
     await roundTrip(sockets[1]!);
-    expect(events.filter((event) => event.type === "partial")).toEqual([{ type: "partial", text: "hello withdrawn" }]);
-    sockets[1]!.send(response(result("hello"), 4));
-    await vi.waitFor(() => expect(events.at(-1)).toEqual({ type: "stable", text: "hello" }));
-    sockets[1]!.send(response(result("hello new", 5), 3));
+    expect(events.at(-1)).toEqual({ type: "partial", text: "revised draft" });
+    for (let tick = 0; captures[1]!.at(-1)?.sequence! >= 0 && tick < 310; tick += 1) {
+      await vi.advanceTimersByTimeAsync(200);
+      await roundTrip(sockets[1]!);
+    }
     await recovering;
-    await vi.waitFor(() => expect(captures[1]!.at(-1)?.sequence).toBeLessThan(0));
+    expect(captures[1]!.at(-1)?.sequence).toBeLessThan(0);
+    expect(stopped).toBe(false);
     const replay = captures[1]!.slice(1);
-    expect(Buffer.concat(replay.map((packet) => packet.data))).toEqual(Buffer.concat([Buffer.alloc(6_400, 1), Buffer.alloc(3_200, 2), Buffer.alloc(3_200, 3)]));
+    expect(Buffer.concat(replay.map((packet) => packet.data))).toEqual(Buffer.concat(expected));
+    expect(replay.every((packet) => packet.data.length <= 6_400)).toBe(true);
     expect(headers.map((header) => header["x-api-app-key"])).toEqual(["original-application", "original-application"]);
     expect(headers.map((header) => header["x-api-access-key"])).toEqual(["original-token", "original-token"]);
     expect(headers.every((header) => header["x-api-key"] === undefined)).toBe(true);
@@ -219,13 +237,13 @@ describe("SAUC native transcription", () => {
       hotwords: [{ word: "VoiceKit" }], context_type: "dialog_ctx", context_data: [{ text: "Frozen recording context." }]
     }));
     expect(headers[1]!["x-api-connect-id"]).not.toBe(headers[0]!["x-api-connect-id"]);
-    sockets[1]!.send(response(result("hello new"), Math.abs(replay.at(-1)!.sequence!), true));
+    sockets[1]!.send(response(result("revised complete recording"), Math.abs(replay.at(-1)!.sequence!), true));
     await stopping;
     expect(events.filter((event) => event.type === "stable")).toEqual([{ type: "stable", text: "hello" },
-      { type: "stable", text: "hello" }, { type: "stable", text: "hello new" }]);
-  });
+      { type: "stable", text: "" }, { type: "stable", text: "revised" }, { type: "stable", text: "revised complete recording" }]);
+  }, 15_000);
 
-  it("rejects a divergent confirmed replay instead of joining guessed transcript overlap", async () => {
+  it("allows a new recognition to revise the old prefix and rejects divergent stable text within that generation", async () => {
     const sockets: WebSocket[] = [];
     const route = await fixture((socket) => sockets.push(socket));
     const { instance, events } = provider(route);
@@ -235,13 +253,44 @@ describe("SAUC native transcription", () => {
     await vi.waitFor(() => expect(events.at(-1)).toEqual({ type: "stable", text: "known" }));
     sockets[0]!.terminate();
     await vi.waitFor(() => expect(events.at(-1)?.type).toBe("disconnected"));
-    const recovery = expect(instance.recover()).rejects.toMatchObject({ code: "protocol" });
+    const recovery = instance.recover();
     await vi.waitFor(() => expect(sockets).toHaveLength(2));
     await roundTrip(sockets[1]!);
     sockets[1]!.send(response(result("different"), 2));
     await recovery;
-    expect(events.filter((event) => event.type === "stable")).toEqual([{ type: "stable", text: "known" }]);
+    await roundTrip(sockets[1]!);
+    expect(events.filter((event) => event.type === "stable")).toEqual([{ type: "stable", text: "known" },
+      { type: "stable", text: "" }, { type: "stable", text: "different" }]);
+    sockets[1]!.send(response(result("conflicting"), 3));
+    await vi.waitFor(() => expect(events.at(-1)?.type).toBe("error"));
     expect(events.at(-1)).toEqual({ type: "error", category: "protocol", recoverable: false });
+  });
+
+  it("allocates PCM only for capture, retains one private owner across recovery, and zeroes it on terminal receipt", async () => {
+    const allocate = Buffer.alloc;
+    const owners: Buffer[] = [];
+    vi.spyOn(Buffer, "alloc").mockImplementation((size, fill, encoding) => {
+      const buffer = allocate(size, fill, encoding);
+      if (size >= 1024 * 1024) owners.push(buffer);
+      return buffer;
+    });
+    const sockets: WebSocket[] = []; const sent: Packet[][] = [];
+    const route = await fixture((socket, _request, _index, packets) => { sockets.push(socket); sent.push(packets); });
+    const unused = provider(route);
+    const { instance, events } = provider(route);
+    expect(await probeSaucTranscriptionRoute(route)).toEqual({ ok: true });
+    await instance.start({ runId: "run", mimeType: "audio/pcm" });
+    expect(owners.length).toBe(0);
+    instance.appendAudio(audio(200, 9));
+    expect(owners).toHaveLength(1);
+    expect(owners[0]).toHaveLength(MAXIMUM_AUDIO_BYTES);
+    sockets[1]!.terminate();
+    await vi.waitFor(() => expect(events.at(-1)?.type).toBe("disconnected"));
+    await instance.recover();
+    expect(owners).toHaveLength(1);
+    await flushWithResult(instance, sent[2]!, sockets[2]!, "complete");
+    expect(owners[0]!.every(byte => byte === 0)).toBe(true);
+    await unused.instance.stop();
   });
 
   it("caps recovery attempts without crossing to another connection or leaving sockets alive", async () => {
@@ -260,24 +309,13 @@ describe("SAUC native transcription", () => {
     expect(sockets).toHaveLength(4);
   });
 
-  it("disables recovery when total capture exceeds 60 seconds, instead of retaining only a recent tail", async () => {
-    let socket!: WebSocket;
-    const route = await fixture((connected) => { socket = connected; });
-    const { instance, events } = provider(route);
-    await instance.start({ runId: "run", mimeType: "audio/pcm" });
-    for (let index = 0; index < 6; index += 1) instance.appendAudio(audio(10_000));
-    instance.appendAudio(audio(100));
-    expect(events).toEqual([{ type: "connected" }]);
-    socket.terminate();
-    await vi.waitFor(() => expect(events.at(-1)).toEqual({ type: "disconnected", recoverable: false }));
-    await expect(instance.recover()).rejects.toMatchObject({ code: "network" });
-  });
-
-  it("fails bounded startup audio backlog and rejects forged PCM duration", async () => {
+  it("fails cumulative capture overflow and rejects forged PCM duration", async () => {
     const route = await fixture(() => {}, false);
     const { instance, events } = provider(route);
     const started = expect(instance.start({ runId: "run", mimeType: "audio/pcm" })).rejects.toMatchObject({ code: "protocol" });
-    for (let index = 0; index < 7; index += 1) instance.appendAudio(audio(10_000));
+    for (let index = 0; index < 60; index += 1) instance.appendAudio(audio(10_000));
+    expect(events).toEqual([]);
+    instance.appendAudio(audio(10_000));
     await started;
     expect(events.at(-1)).toEqual({ type: "error", category: "protocol", recoverable: false });
     const second = provider(await fixture(() => {}));
@@ -289,15 +327,25 @@ describe("SAUC native transcription", () => {
   it.each((["startup", "flush", "recovery"] as const).flatMap((stage) =>
     (["stop", "retire"] as const).map((action) => ({ stage, action }))
   ))("$action during $stage fences late provider results", async ({ stage, action }) => {
+    const allocate = Buffer.alloc;
+    let capture: Buffer | undefined;
+    vi.spyOn(Buffer, "alloc").mockImplementation((size, fill, encoding) => {
+      const buffer = allocate(size, fill, encoding);
+      if (size === MAXIMUM_AUDIO_BYTES) capture = buffer;
+      return buffer;
+    });
     const sockets: WebSocket[] = []; const sent: Packet[][] = [];
     const route = await fixture((socket, _request, _index, packets) => { sockets.push(socket); sent.push(packets); }, stage !== "startup");
     let current = true;
     const { instance, events } = provider({ ...route, isCurrent: () => current });
     let pending: Promise<void>;
-    if (stage === "startup") pending = instance.start({ runId: "run", mimeType: "audio/pcm" });
+    if (stage === "startup") {
+      pending = instance.start({ runId: "run", mimeType: "audio/pcm" });
+      instance.appendAudio(audio(200));
+    }
     else {
       await instance.start({ runId: "run", mimeType: "audio/pcm" });
-      instance.appendAudio(audio(200));
+      instance.appendAudio(audio(stage === "recovery" ? 400 : 200));
       if (stage === "recovery") {
         sockets[0]!.send(response(result("known"), 2));
         await vi.waitFor(() => expect(events.at(-1)?.type).toBe("stable"));
@@ -317,6 +365,7 @@ describe("SAUC native transcription", () => {
     sockets.at(-1)!.send(response(result("late"), 10, true));
     if (action === "stop") await instance.stop();
     await rejected;
+    expect(capture?.subarray(0, 400 * 32).every(byte => byte === 0)).toBe(true);
     await vi.waitFor(() => expect(sockets.every((socket) => socket.readyState === 3)).toBe(true));
     expect(events).toEqual(before);
     expect(sockets).toHaveLength(stage === "recovery" ? 2 : 1);

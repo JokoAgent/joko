@@ -1,13 +1,12 @@
 import { randomUUID } from "node:crypto";
 import { WebSocket, type RawData } from "ws";
-import { normalizeRecognitionContext, validateAudioChunk, type AsrEvent, type AsrProvider, type AsrRecognitionContext,
+import { MAXIMUM_AUDIO_BYTES, normalizeRecognitionContext, validateAudioChunk, type AsrEvent, type AsrProvider, type AsrRecognitionContext,
   type AsrStartRequest, type AudioChunk } from "@joko/voice-input";
 import { audioFrame, configurationFrame, MAXIMUM_MESSAGE_BYTES, serverMessage, type ServerMessage } from "./protocol.js";
 
 const PCM_BYTES_PER_MS = 32;
 const PACKET_MS = 200;
 const PACKET_BYTES = PACKET_MS * PCM_BYTES_PER_MS;
-const REPLAY_BYTES = 60_000 * PCM_BYTES_PER_MS;
 const MAXIMUM_SOCKET_BYTES = 4 * 1024 * 1024;
 const RESOURCES = new Set(["volc.bigasr.sauc.duration", "volc.bigasr.sauc.concurrent", "volc.seedasr.sauc.duration", "volc.seedasr.sauc.concurrent"]);
 const MODE_PATHS = { asyncTwoPass: "/api/v3/sauc/bigmodel_async", bidirectional: "/api/v3/sauc/bigmodel",
@@ -51,7 +50,6 @@ export type SaucTranscriptionProbeResult = { readonly ok: true } | {
   readonly ok: false;
   readonly reason: "authenticationFailed" | "timeout" | "network" | "routeUnavailable" | "serviceError";
 };
-type PendingAudio = { data: Buffer; offset: number };
 type Waiter = { check: () => boolean; finish: (error?: SaucTranscriptionError) => void };
 
 /** Owns one ephemeral capture and the native SAUC v1 binary WebSocket protocol. */
@@ -63,10 +61,8 @@ export class SaucTranscriptionProvider implements AsrProvider {
   #locale: SaucSupportedLocale | undefined;
   readonly #listeners = new Set<(event: AsrEvent) => void>();
   readonly #waiters = new Set<Waiter>();
-  readonly #pending: PendingAudio[] = [];
-  #pendingBytes = 0;
-  #replay: Buffer | undefined = Buffer.alloc(REPLAY_BYTES);
-  #replayBytes = 0;
+  #capture: Buffer | undefined;
+  #captureBytes = 0;
   #totals = { bytes: 0, durationMs: 0 };
   #state: "idle" | "starting" | "ready" | "disconnected" | "finished" | "failed" | "stopped" = "idle";
   #socket: WebSocket | undefined;
@@ -77,7 +73,6 @@ export class SaucTranscriptionProvider implements AsrProvider {
   #stable = "";
   #text = "";
   #publishedText = "";
-  #recoveryPrefix = "";
   #connectReject: ((error: SaucTranscriptionError) => void) | undefined;
   #pumpTimer: ReturnType<typeof setTimeout> | undefined;
   #heartbeat: ReturnType<typeof setInterval> | undefined;
@@ -110,28 +105,16 @@ export class SaucTranscriptionProvider implements AsrProvider {
     if (!this.#ensureCurrent()) return;
     if (this.#flushing || !["starting", "ready", "disconnected"].includes(this.#state)) return;
     try {
-      this.#totals = validateAudioChunk(chunk, this.#totals);
+      const totals = validateAudioChunk(chunk, this.#totals);
       if (chunk.data.byteLength % 2 !== 0 || Math.abs(chunk.data.byteLength / PCM_BYTES_PER_MS - chunk.durationMs) > 1) {
         throw new SaucTranscriptionError("protocol");
       }
-      const data = Buffer.from(new Uint8Array(chunk.data));
-      if (this.#replay !== undefined) {
-        if (this.#replayBytes + data.length <= REPLAY_BYTES) {
-          data.copy(this.#replay, this.#replayBytes);
-          this.#replayBytes += data.length;
-        } else {
-          this.#replay.fill(0);
-          this.#replay = undefined;
-          this.#replayBytes = 0;
-        }
-      }
-      if (this.#pendingBytes + data.length > REPLAY_BYTES || this.#pending.length >= 4_096) {
-        data.fill(0);
-        this.#fail("protocol");
-        return;
-      }
-      this.#pending.push({ data, offset: 0 });
-      this.#pendingBytes += data.length;
+      // A single private owner serves capture, pending send, and full recovery.
+      // The view aliases the caller only during this synchronous copy.
+      this.#capture ??= Buffer.alloc(MAXIMUM_AUDIO_BYTES);
+      this.#capture.set(new Uint8Array(chunk.data), this.#captureBytes);
+      this.#captureBytes = totals.bytes;
+      this.#totals = totals;
       this.#pump();
     } catch { this.#fail("protocol"); }
   }
@@ -149,7 +132,8 @@ export class SaucTranscriptionProvider implements AsrProvider {
     if (this.#state !== "ready") throw new SaucTranscriptionError("network");
     // No audio was captured, so there is no remote recognition to finalize.
     if (this.#totals.bytes === 0) return;
-    const completion = this.#wait(() => this.#state === "finished", this.#pendingBytes / PCM_BYTES_PER_MS + this.#route.flushTimeoutMs);
+    const completion = this.#wait(() => this.#state === "finished",
+      (this.#captureBytes - this.#sentBytes) / PCM_BYTES_PER_MS + PACKET_MS + this.#route.flushTimeoutMs);
     this.#pump();
     await completion;
   }
@@ -157,11 +141,12 @@ export class SaucTranscriptionProvider implements AsrProvider {
   recover(): Promise<void> {
     if (!this.#ensureCurrent()) return Promise.reject(new SaucTranscriptionError("stopped"));
     if (this.#recoveryTask !== undefined) return this.#recoveryTask;
-    if (this.#state !== "disconnected" || this.#replay === undefined || this.#recoveries >= 3 || this.#flushing) {
+    if (this.#state !== "disconnected" || this.#recoveries >= 3 || this.#flushing) {
       return Promise.reject(new SaucTranscriptionError("network"));
     }
     this.#recoveries += 1;
-    const task = this.#recover();
+    // Register the operation before its withdrawal event can reenter Stop.
+    const task = Promise.resolve().then(() => this.#recover());
     this.#recoveryTask = task;
     const clear = (): void => { if (this.#recoveryTask === task) this.#recoveryTask = undefined; };
     void task.then(clear, clear);
@@ -169,18 +154,18 @@ export class SaucTranscriptionProvider implements AsrProvider {
   }
 
   async #recover(): Promise<void> {
-    this.#recoveryPrefix = this.#stable;
+    if (!this.#ensureCurrent() || this.#state === "stopped") throw new SaucTranscriptionError("stopped");
+    if (this.#state !== "disconnected") throw new SaucTranscriptionError("network");
+    const withdraw = this.#publishedText !== "" || this.#stable !== "" || this.#text !== "";
+    this.#stable = "";
     this.#text = "";
+    this.#publishedText = "";
     this.#sentBytes = 0;
-    this.#recoveryTarget = this.#replayBytes;
-    this.#clearPending();
-    if (this.#replayBytes > 0) {
-      this.#pending.push({ data: Buffer.from(this.#replay!.subarray(0, this.#replayBytes)), offset: 0 });
-      this.#pendingBytes = this.#replayBytes;
-    }
+    this.#recoveryTarget = this.#captureBytes;
+    if (withdraw) this.#emit({ type: "stable", text: "" });
     await this.#connect();
-    await this.#wait(() => this.#sentBytes >= this.#recoveryTarget && this.#recoveryPrefix === "",
-      this.#recoveryTarget / PCM_BYTES_PER_MS + this.#route.connectTimeoutMs);
+    await this.#wait(() => this.#sentBytes >= this.#recoveryTarget,
+      this.#recoveryTarget / PCM_BYTES_PER_MS + PACKET_MS + this.#route.connectTimeoutMs);
   }
 
   async stop(): Promise<void> {
@@ -190,12 +175,9 @@ export class SaucTranscriptionProvider implements AsrProvider {
     this.#authentication = undefined;
     this.#recognitionContext = undefined;
     this.#locale = undefined;
-    this.#replay?.fill(0);
-    this.#replay = undefined;
-    this.#replayBytes = 0;
+    this.#clearCapture();
     this.#stable = "";
     this.#text = "";
-    this.#recoveryPrefix = "";
     this.#publishedText = "";
     this.#listeners.clear();
   }
@@ -275,35 +257,32 @@ export class SaucTranscriptionProvider implements AsrProvider {
 
   #result(message: Extract<ServerMessage, { type: "result" }>): void {
     if (this.#state !== "ready" || (message.last && !this.#lastSent)) { this.#fail("protocol"); return; }
+    const generation = this.#generation;
     if (message.text === undefined) {
       if (message.last && this.#text !== "") { this.#fail("protocol"); return; }
     } else {
       const text = message.text;
       const stable = message.stable!;
       const previousText = this.#publishedText;
-      if (this.#recoveryPrefix !== "") {
-        if (stable.startsWith(this.#recoveryPrefix)) this.#recoveryPrefix = "";
-        else if (!this.#recoveryPrefix.startsWith(stable) || message.last) { this.#fail("protocol"); return; }
-      }
       this.#text = text;
-      if (this.#recoveryPrefix === "") {
-        if (!stable.startsWith(this.#stable) || !text.startsWith(this.#stable)) { this.#fail("protocol"); return; }
-        if (stable !== this.#stable || (text === stable && text !== previousText)) {
-          this.#stable = stable;
-          this.#publishedText = stable;
-          this.#emit({ type: "stable", text: stable });
-        }
-        if (text !== stable) {
-          this.#publishedText = text;
-          this.#emit({ type: "partial", text });
-        }
+      if (!stable.startsWith(this.#stable) || !text.startsWith(this.#stable)) { this.#fail("protocol"); return; }
+      if (stable !== this.#stable || (text === stable && text !== previousText)) {
+        this.#stable = stable;
+        this.#publishedText = stable;
+        this.#emit({ type: "stable", text: stable });
+        if (this.#generation !== generation || this.#state !== "ready" || !this.#ensureCurrent()) return;
+      }
+      if (text !== stable) {
+        this.#publishedText = text;
+        this.#emit({ type: "partial", text });
+        if (this.#generation !== generation || this.#state !== "ready" || !this.#ensureCurrent()) return;
       }
     }
     if (message.last) {
-      if (this.#recoveryPrefix !== "") { this.#fail("protocol"); return; }
       this.#state = "finished";
       this.#settleWaiters();
       this.#retire(new SaucTranscriptionError("stopped"));
+      this.#clearCapture();
     } else this.#settleWaiters();
   }
 
@@ -312,26 +291,16 @@ export class SaucTranscriptionProvider implements AsrProvider {
     if (this.#state !== "ready" || this.#pumpTimer !== undefined || this.#lastSent) return;
     // Normal capture packets are 200 ms. Flush and recovery also send their short tail.
     const drainTail = this.#flushing || this.#sentBytes < this.#recoveryTarget;
-    if (this.#pendingBytes < PACKET_BYTES && !drainTail) return;
-    if (this.#pendingBytes === 0 && (!this.#flushing || this.#recoveryTask !== undefined)) { this.#settleWaiters(); return; }
-    const size = Math.min(PACKET_BYTES, this.#pendingBytes);
-    const data = Buffer.alloc(size);
-    let offset = 0;
-    while (offset < size) {
-      const next = this.#pending[0]!;
-      const length = Math.min(size - offset, next.data.length - next.offset);
-      next.data.copy(data, offset, next.offset, next.offset + length);
-      next.offset += length;
-      offset += length;
-      this.#pendingBytes -= length;
-      if (next.offset === next.data.length) { this.#pending.shift(); next.data.fill(0); }
-    }
+    const pendingBytes = this.#captureBytes - this.#sentBytes;
+    if (pendingBytes < PACKET_BYTES && !drainTail) return;
+    if (pendingBytes === 0 && (!this.#flushing || this.#recoveryTask !== undefined)) { this.#settleWaiters(); return; }
+    const size = Math.min(PACKET_BYTES, pendingBytes);
+    const data = this.#capture?.subarray(this.#sentBytes, this.#sentBytes + size) ?? Buffer.alloc(0);
     this.#sentBytes += size;
-    const last = this.#flushing && this.#pendingBytes === 0 && this.#recoveryTask === undefined;
+    const last = this.#flushing && this.#sentBytes === this.#captureBytes && this.#recoveryTask === undefined;
     this.#sequence += 1;
     this.#lastSent = last;
     const sent = this.#send(audioFrame(data, last ? -this.#sequence : this.#sequence));
-    data.fill(0);
     if (!sent) return;
     this.#settleWaiters();
     if (!last) this.#pumpTimer = setTimeout(() => {
@@ -378,10 +347,11 @@ export class SaucTranscriptionProvider implements AsrProvider {
   #fail(code: FailureCode, disconnected = false): void {
     if (["failed", "finished", "stopped"].includes(this.#state)) return;
     const wasReady = this.#state === "ready";
-    const recoverable = wasReady && !this.#flushing && this.#replay !== undefined && this.#recoveries < 3
+    const recoverable = wasReady && !this.#flushing && this.#recoveries < 3
       && (code === "network" || code === "timeout" || code === "route");
     this.#state = recoverable ? "disconnected" : "failed";
     this.#retire(new SaucTranscriptionError(code));
+    if (!recoverable) this.#clearCapture();
     this.#emit(disconnected && wasReady ? { type: "disconnected", recoverable }
       : { type: "error", category: code === "authentication" ? "authentication" : code === "quota" ? "quota"
         : code === "protocol" ? "protocol" : "transport", recoverable });
@@ -396,21 +366,21 @@ export class SaucTranscriptionProvider implements AsrProvider {
     this.#heartbeat = undefined;
     clearTimeout(this.#pongTimer);
     this.#pongTimer = undefined;
-    this.#clearPending();
     const socket = this.#socket;
     this.#socket = undefined;
     // The fenced error listener remains while ws retires asynchronously.
     socket?.terminate();
   }
-  #clearPending(): void {
-    for (const item of this.#pending) item.data.fill(0);
-    this.#pending.length = 0;
-    this.#pendingBytes = 0;
+  #clearCapture(): void {
+    this.#capture?.fill(0);
+    this.#capture = undefined;
+    this.#captureBytes = 0;
   }
   #emit(event: AsrEvent): void {
     if (this.#state !== "stopped" && this.#ensureCurrent()) {
+      const generation = this.#generation;
       for (const listener of [...this.#listeners]) {
-        if (!this.#ensureCurrent()) break;
+        if (this.#generation !== generation || !this.#ensureCurrent()) break;
         listener(event);
       }
     }

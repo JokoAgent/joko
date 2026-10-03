@@ -441,6 +441,240 @@ it("recovers a Scribe recording longer than sixty seconds from exact unconfirmed
   if (cleanupFailures.length > 0) throw new AggregateError(cleanupFailures, "Scribe journey cleanup failed.");
 }, 90_000);
 
+it("replays a complete long SAUC capture into a new recognition generation before finishing production stop", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "joko-sauc-replay-product-"));
+  const gateway = new WebSocketServer({ host: "127.0.0.1", port: 0 });
+  const sessions: GatewaySession[] = [];
+  const oldStable = "Previously recognized opening.";
+  const oldPartial = `${oldStable} An old uncertain ending.`;
+  const newStable = "A corrected opening from the complete recording.";
+  const newPartial = `${newStable} The new uncertain ending.`;
+  const newFinal = `${newStable} The complete final ending.`;
+  let fixtureFailure: unknown;
+  gateway.on("connection", (socket, request) => {
+    const session: GatewaySession = { socket, request, packets: [] };
+    sessions.push(session);
+    if (sessions.length > 2) {
+      fixtureFailure = new Error("SAUC opened more than one recovery connection.");
+      socket.terminate(); return;
+    }
+    socket.on("message", (raw, binary) => {
+      try {
+        if (!binary) throw new Error("SAUC received an unexpected text request.");
+        const bytes = Buffer.from(raw as Buffer);
+        const offset = (bytes[1]! & 1) === 1 ? 8 : 4;
+        const packet: SaucPacket = { type: bytes[1]! >> 4, data: gunzipSync(bytes.subarray(offset + 4)),
+          ...(offset === 8 ? { sequence: bytes.readInt32BE(4) } : {}) };
+        session.packets.push(packet);
+        const audioPacketCount = session.packets.filter(value => value.type === 2).length;
+        if (packet.type === 1) {
+          if (sessions[0] === session) socket.send(saucResponse({}));
+          // The recovered full response is explicitly released after append and Stop.
+        } else if (packet.type === 2 && sessions[0] === session && audioPacketCount === 1) {
+          socket.send(saucResponse({ result: { text: oldStable,
+            utterances: [{ text: oldStable, start_time: 0, end_time: 100, definite: true }] } }));
+        } else if (packet.type === 2 && sessions[0] === session && audioPacketCount === 2) {
+          socket.send(saucResponse({ result: { text: oldPartial, utterances: [
+            { text: oldStable, start_time: 0, end_time: 100, definite: true },
+            { text: " An old uncertain ending.", start_time: 100, end_time: 200, definite: false }
+          ] } }, 3));
+        } else if (packet.type === 2 && sessions[1] === session && audioPacketCount === 1) {
+          socket.send(saucResponse({ result: { text: newPartial, utterances: [
+            { text: newStable, start_time: 0, end_time: 100, definite: true },
+            { text: " The new uncertain ending.", start_time: 100, end_time: 200, definite: false }
+          ] } }));
+        }
+      } catch (error) { fixtureFailure = error; socket.terminate(); }
+    });
+  });
+  let host: Awaited<ReturnType<typeof startVoiceHost>> | undefined;
+  const stopRequest = new AbortController();
+  let pendingStop: Promise<void> | undefined;
+  let journeyFailure: unknown;
+  let journeyFailed = false;
+  const cleanupFailures: unknown[] = [];
+  try {
+    await voiceDeadline(once(gateway, "listening"), 5_000);
+    const address = gateway.address();
+    if (typeof address === "string" || address === null) throw new Error("SAUC replay listener has no address.");
+    const endpoint = `ws://127.0.0.1:${address.port}/api/v3/sauc/bigmodel_async`;
+    const secret = "sauc-complete-replay-access-token-fixture";
+    const contextText = "Explicit private context for the entire recovered recording.";
+    host = await startVoiceHost(directory);
+    const paired = await host.pair();
+    const clients = paired.clients;
+    const initial = (await clients.settings.getSettings({})).settings!.voiceInput!;
+    const credentialApi = createClient(CredentialService, createConnectTransport({ baseUrl: host.baseUrl, httpVersion: "1.1",
+      interceptors: [next => request => { request.header.set("authorization", `Bearer ${paired.authKey}`); return next(request); }] }));
+    const ticket = (await credentialApi.beginCredentialUpload({ kind: CredentialKind.API_KEY, providerId: "" })).ticket!;
+    expect((await fetch(new URL(ticket.relativeEndpoint, host.baseUrl), { method: "PUT", headers: {
+      authorization: `Bearer ${paired.authKey}`, "content-type": "application/octet-stream"
+    }, body: Buffer.from(secret) })).ok).toBe(true);
+    const saved = await submit(clients.operation, paired.connectionId, create(OperationMutationSchema, {
+      payload: { case: "updateVoiceInputServiceSettings", value: { patch: {
+        enabled: true, protocol: VoiceInputTranscriptionProtocol.VOLCENGINE_SAUC,
+        endpoint, model: "", resourceId: "volc.seedasr.sauc.duration", keyless: false,
+        credentialUploadTicketId: ticket.ticketId, expectedRevision: initial.version!.revision,
+        refinementEnabled: false, fallbackEnabled: false,
+        sauc: { $typeName: "joko.v1.VoiceInputSaucSettings", mode: VoiceInputSaucMode.ASYNC_TWO_PASS,
+          authentication: VoiceInputSaucAuthentication.ACCESS_TOKEN, appId: "full-replay-application", useDictionaryHotwords: true,
+          boostingTableName: "", boostingTableId: "complete-replay-table", correctTableName: "Complete corrections", correctTableId: "" }
+      } } }
+    }));
+    expect(saved.state).toBe(OperationState.SUCCEEDED);
+    const publicSettings = (await clients.settings.getSettings({})).settings!.voiceInput!;
+    expect(publicSettings).toMatchObject({ protocol: VoiceInputTranscriptionProtocol.VOLCENGINE_SAUC,
+      credentialConfigured: true, fallbackEnabled: false, endpoint,
+      sauc: { mode: VoiceInputSaucMode.ASYNC_TWO_PASS, authentication: VoiceInputSaucAuthentication.ACCESS_TOKEN } });
+    const dictionary = (await clients.voiceInput.getVoiceInputDictionary({})).dictionary!;
+    await clients.voiceInput.addVoiceInputDictionaryTerms({ expectedRevision: dictionary.revision, terms: ["Complete replay product term"] });
+    const limits = (await clients.voiceInput.getVoiceInputCapabilities({})).profile!.limits!;
+    const maximumChunkDurationMs = Number(limits.maximumAudioChunkDuration!.seconds) * 1_000 + limits.maximumAudioChunkDuration!.nanos / 1_000_000;
+    const maximumDurationMs = Number(limits.maximumAudioDuration!.seconds) * 1_000 + limits.maximumAudioDuration!.nanos / 1_000_000;
+    expect(maximumChunkDurationMs).toBeGreaterThanOrEqual(200);
+    expect(limits.maximumAudioChunkBytes).toBeGreaterThanOrEqual(6_400n);
+    expect(maximumDurationMs).toBeGreaterThanOrEqual(62_400);
+    expect(limits.maximumAudioBytes).toBeGreaterThanOrEqual(62_400n * 32n);
+    const input = { requestId: randomUUID(), mimeType: "audio/pcm", recognitionContext: { contextData: [{ text: contextText }] } };
+    const started = (await clients.voiceInput.startVoiceInput(input)).session!;
+    expect(started.state).toBe(VoiceInputState.LISTENING);
+    expect(sessions).toHaveLength(1);
+    const original = sessions[0]!;
+    const frozenConfiguration = configuration(original);
+    expect(recognitionContext(original)).toEqual({ hotwords: [{ word: "Complete replay product term" }],
+      context_type: "dialog_ctx", context_data: [{ text: contextText }] });
+    const captured: Buffer[] = [];
+    let nextSequence = started.nextChunkSequence;
+    let totalDurationMs = 0;
+    let totalBytes = 0n;
+    const append = async (chunks: number): Promise<void> => {
+      for (let index = 0; index < chunks; index += 1) {
+        const audio = Buffer.alloc(6_400, Number(nextSequence % 251n) + 1);
+        audio.writeUInt32LE(Number(nextSequence), 0);
+        captured.push(Buffer.from(audio));
+        const session = (await clients.voiceInput.appendVoiceAudio({ voiceInputId: started.voiceInputId,
+          chunkSequence: nextSequence, audio, durationMs: 200, voiced: true })).session!;
+        nextSequence += 1n; totalDurationMs += 200; totalBytes += BigInt(audio.byteLength);
+        expect(session).toMatchObject({ state: VoiceInputState.LISTENING, nextChunkSequence: nextSequence, acceptedAudioBytes: totalBytes });
+        expect(Number(session.acceptedAudioDuration!.seconds) * 1_000 + session.acceptedAudioDuration!.nanos / 1_000_000).toBe(totalDurationMs);
+        expect(fixtureFailure).toBeUndefined();
+      }
+    };
+    await append(2);
+    await vi.waitFor(async () => expect((await clients.voiceInput.getVoiceInputSession({ voiceInputId: started.voiceInputId })).session!.draft?.text)
+      .toBe(oldPartial), { timeout: 3_000 });
+    await append(308);
+    expect(totalDurationMs).toBe(62_000);
+    const originalAudio = original.packets.filter(packet => packet.type === 2);
+    expect(originalAudio.length).toBeGreaterThanOrEqual(2);
+    expect(originalAudio.every(packet => packet.sequence! > 0)).toBe(true);
+    expect(Buffer.concat(originalAudio.map(packet => packet.data)))
+      .toEqual(Buffer.concat(captured).subarray(0, originalAudio.reduce((length, packet) => length + packet.data.byteLength, 0)));
+    original.socket.terminate();
+    await vi.waitFor(async () => {
+      expect(sessions).toHaveLength(2);
+      expect(sessions[1]!.packets.filter(packet => packet.type === 1)).toHaveLength(1);
+      const session = (await clients.voiceInput.getVoiceInputSession({ voiceInputId: started.voiceInputId })).session!;
+      expect(session).toMatchObject({ state: VoiceInputState.LISTENING, recoveryAttempts: 1,
+        nextChunkSequence: nextSequence, acceptedAudioBytes: totalBytes });
+      expect(session.draft?.text ?? "").toBe("");
+    }, { timeout: 3_000 });
+    const recovered = sessions[1]!;
+    for (const session of [original, recovered]) {
+      expect(session.request.url).toBe("/api/v3/sauc/bigmodel_async");
+      expect(session.request.headers["x-api-app-key"]).toBe("full-replay-application");
+      expect(session.request.headers["x-api-access-key"]).toBe(secret);
+      expect(session.request.headers["x-api-resource-id"]).toBe("volc.seedasr.sauc.duration");
+      expect(session.request.headers["x-api-key"]).toBeUndefined();
+      expect(session.request.headers["authorization"]).toBeUndefined();
+      expect(configuration(session)).toEqual(frozenConfiguration);
+    }
+    input.recognitionContext.contextData[0]!.text = "Changed caller context during recovery.";
+    await append(2);
+    expect(totalDurationMs).toBe(62_400);
+    expect(nextSequence).toBe(313n);
+    expect(recovered.packets.map(packet => packet.type)).toEqual([1]);
+    let stopSettled = false;
+    let stopFailure: unknown;
+    let stopped: VoiceInputSession | undefined;
+    pendingStop = clients.voiceInput.stopVoiceInput({ voiceInputId: started.voiceInputId, expectedNextChunkSequence: nextSequence },
+      { signal: stopRequest.signal, timeoutMs: 180_000 })
+      .then(response => { stopped = response.session; stopSettled = true; }, error => { stopFailure = error; stopSettled = true; });
+    await vi.waitFor(async () => expect((await clients.voiceInput.getVoiceInputSession({ voiceInputId: started.voiceInputId })).session!.state)
+      .toBe(VoiceInputState.SUBMITTING), { timeout: 3_000 });
+    expect(stopSettled).toBe(false);
+    await saucReplaySend(recovered.socket, saucResponse({}));
+    await vi.waitFor(() => expect(recovered.packets.filter(packet => packet.type === 2).length).toBeGreaterThanOrEqual(2), { timeout: 3_000 });
+    expect(stopFailure).toBeUndefined(); expect(stopSettled).toBe(false);
+    const draining = (await clients.voiceInput.getVoiceInputSession({ voiceInputId: started.voiceInputId })).session!;
+    expect(draining).toMatchObject({ state: VoiceInputState.SUBMITTING, nextChunkSequence: 313n,
+      acceptedAudioBytes: totalBytes, recoveryAttempts: 1 });
+    expect(draining.acceptedAudioDuration).toEqual({ $typeName: "google.protobuf.Duration", seconds: 62n, nanos: 400_000_000 });
+    await vi.waitFor(() => {
+      expect(fixtureFailure).toBeUndefined(); expect(stopFailure).toBeUndefined();
+      expect(recovered.packets.filter(packet => packet.type === 2).at(-1)?.sequence).toBeLessThan(0);
+    }, { timeout: 90_000, interval: 200 });
+    expect(stopSettled).toBe(false);
+    const replayed = recovered.packets.filter(packet => packet.type === 2);
+    const finalPacket = replayed.at(-1)!;
+    expect(Buffer.concat(replayed.map(packet => packet.data))).toEqual(Buffer.concat(captured));
+    expect(replayed.filter(packet => packet.data.byteLength > 0).map(packet => packet.data)).toEqual(captured);
+    const firstAudioSequence = replayed[0]!.sequence!;
+    expect(firstAudioSequence).toBeGreaterThan(0);
+    expect(replayed.map(packet => Math.abs(packet.sequence!))).toEqual(Array.from({ length: replayed.length }, (_value, index) => firstAudioSequence + index));
+    expect(replayed.filter(packet => packet.sequence! < 0)).toHaveLength(1);
+    expect(replayed.slice(0, -1).every(packet => packet.sequence! > 0 && packet.data.byteLength === 6_400)).toBe(true);
+    await saucReplaySend(recovered.socket, saucResponse({ result: { text: newFinal,
+      utterances: [{ text: newFinal, start_time: 0, end_time: 100, definite: true }] } }, Math.abs(finalPacket.sequence!), true));
+    await voiceDeadline(pendingStop, 10_000);
+    expect(stopFailure).toBeUndefined(); expect(fixtureFailure).toBeUndefined();
+    expect(stopped).toMatchObject({ state: VoiceInputState.DONE, outcome: VoiceInputTerminalOutcome.SUCCESS,
+      nextChunkSequence: 313n, acceptedAudioBytes: totalBytes, recoveryAttempts: 1, result: { text: newFinal } });
+    expect(stopped!.acceptedAudioDuration).toEqual(draining.acceptedAudioDuration);
+    expect(stopped!.result!.text).not.toContain(oldStable);
+    expect(stopped!.result!.text).not.toContain(oldPartial);
+    await vi.waitFor(() => expect(recovered.socket.readyState).toBe(3), { timeout: 3_000 });
+    const terminal = (await clients.voiceInput.getVoiceInputSession({ voiceInputId: started.voiceInputId })).session!;
+    expect(terminal).toEqual(stopped);
+    expect((await clients.voiceInput.stopVoiceInput({ voiceInputId: started.voiceInputId, expectedNextChunkSequence: 313n })).session).toEqual(stopped);
+    expect(sessions).toHaveLength(2);
+    expect(recovered.packets.filter(packet => packet.type === 1)).toHaveLength(1);
+    expect(recovered.packets.filter(packet => packet.type === 2)).toEqual(replayed);
+    const privateValues = [secret, contextText, oldStable, oldPartial, newStable, newPartial, newFinal,
+      captured[0]!.toString("base64"), captured.at(-1)!.toString("base64")];
+    assertPrivateDataAbsent(host.application.store, [saved], privateValues);
+    const publicSnapshot = await clients.event.getSnapshot({ scope: { kind: { case: "owner", value: {} } } });
+    const publicJson = JSON.stringify({ settings: publicSettings, snapshot: publicSnapshot }, (_key, value) => typeof value === "bigint" ? value.toString() : value);
+    for (const value of privateValues) expect(publicJson).not.toContain(value);
+    const sessionJson = JSON.stringify(terminal, (_key, value) => typeof value === "bigint" ? value.toString() : value);
+    for (const value of [secret, contextText, captured[0]!.toString("base64")]) expect(sessionJson).not.toContain(value);
+    await host.close(); host = undefined;
+    expect(await readFile(join(directory, "data", "credentials", "records.json"), "utf8")).not.toContain(secret);
+  } catch (error) { journeyFailure = error; journeyFailed = true; }
+  finally {
+    stopRequest.abort();
+    if (pendingStop !== undefined) try { await voiceDeadline(pendingStop, 5_000); } catch (error) { cleanupFailures.push(error); }
+    try { await host?.close(); } catch (error) { cleanupFailures.push(error); }
+    for (const socket of gateway.clients) socket.terminate();
+    try { await voiceDeadline(new Promise<void>((resolve, reject) => gateway.close(error => error ? reject(error) : resolve())), 5_000); }
+    catch (error) { cleanupFailures.push(error); }
+    try {
+      const target = resolve(directory);
+      if (dirname(target) !== resolve(tmpdir()) || !basename(target).startsWith("joko-sauc-replay-product-")) throw new Error("Unexpected SAUC replay test directory.");
+      await rm(target, { recursive: true, force: true });
+    } catch (error) { cleanupFailures.push(error); }
+  }
+  if (journeyFailed) {
+    if (cleanupFailures.length > 0) throw new AggregateError([journeyFailure, ...cleanupFailures], "SAUC replay journey and cleanup failed.", { cause: journeyFailure });
+    throw journeyFailure;
+  }
+  if (cleanupFailures.length > 0) throw new AggregateError(cleanupFailures, "SAUC replay journey cleanup failed.");
+}, 240_000);
+
+async function saucReplaySend(socket: WebSocket, frame: Buffer): Promise<void> {
+  await voiceDeadline(new Promise<void>((resolve, reject) => socket.send(frame, error => error ? reject(error) : resolve())), 2_000);
+}
+
 function scribeReady(): string {
   return JSON.stringify({ message_type: "session_started", config: { model_id: "scribe_v2_realtime",
     audio_format: "pcm_16000", sample_rate: 16_000, commit_strategy: "manual" } });

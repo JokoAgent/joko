@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AsrEvent, AsrProvider, AsrRecognitionContext, AsrStartRequest, AudioChunk } from "@joko/voice-input";
 import {
   VoiceInputControlError,
@@ -294,13 +294,139 @@ describe("VoiceInputCoordinator", () => {
     await expect(starting).rejects.toMatchObject({ code: "provider_unavailable" });
     expect(provider.stopCalls).toBe(1);
   });
+
+  it.each([
+    { name: "actual audio bytes", bytes: 320_000, durationMs: 100, chunks: 9, budgetMs: 180_000 },
+    { name: "declared audio duration", bytes: 32, durationMs: 10_000, chunks: 9, budgetMs: 180_000 },
+    { name: "rounded audio bytes", bytes: 321, durationMs: 1, chunks: 1, budgetMs: 90_011 }
+  ])("keeps a fixed Stop drain deadline from $name past the capture lifetime", async ({ bytes, durationMs, chunks, budgetMs }) => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const provider = new FakeAsrProvider();
+    const flush = deferred<void>();
+    provider.flushImpl = () => flush.promise;
+    provider.stopImpl = async () => { flush.reject(new Error("Retired capture")); };
+    let retireOwner: (() => void) | undefined;
+    const disposeOwner = vi.fn(() => { retireOwner = undefined; });
+    const coordinator = createCoordinator(factory(provider), {
+      onOwnerRetired: (_owner, listener) => { retireOwner = listener; return disposeOwner; }
+    });
+    try {
+      const started = await coordinator.start({ ownerConnectionId: "drain-owner", requestId: "drain-request", mimeType: "audio/webm" });
+      const owner = { ownerConnectionId: "drain-owner", voiceInputId: started.id };
+      for (let index = 0; index < chunks; index += 1) {
+        coordinator.append({ ...owner, chunkSequence: BigInt(index + 1), audio: new Uint8Array(bytes), durationMs, voiced: true });
+      }
+      vi.setSystemTime(719_000);
+      await expect(coordinator.stop({ ...owner, expectedNextChunkSequence: 0n })).rejects.toMatchObject({ code: "conflict" });
+      expect(provider.flushCalls).toBe(0);
+      expect(vi.getTimerCount()).toBe(1);
+      const stopInput = { ...owner, expectedNextChunkSequence: BigInt(chunks + 1) };
+      const stopping = coordinator.stop(stopInput);
+      let returned = false;
+      void stopping.then(() => { returned = true; });
+      expect(provider.flushCalls).toBe(1);
+      await vi.advanceTimersByTimeAsync(1_001);
+      expect(coordinator.get(owner)).toMatchObject({ state: "submitting", acceptedAudioBytes: bytes * chunks, acceptedAudioDurationMs: durationMs * chunks });
+      const repeated = coordinator.stop(stopInput);
+      provider.emit({ type: "partial", text: "Private late draft" });
+      await vi.advanceTimersByTimeAsync(budgetMs - 1_002);
+      expect(returned).toBe(false);
+      expect(coordinator.get(owner).outcome).toBeUndefined();
+      expect(retireOwner).toBeDefined();
+      expect(provider.flushCalls).toBe(1);
+      await vi.advanceTimersByTimeAsync(1);
+      const stopped = await stopping;
+      const repeatedResult = await repeated;
+      expect(stopped).toMatchObject({ state: "done", outcome: "cancelled" });
+      expect(repeatedResult.outcome).toBe("cancelled");
+      expect(stopped.result).toBeUndefined();
+      expect(repeatedResult.result).toBeUndefined();
+      expect(provider.stopCalls).toBe(1);
+      expect(disposeOwner).toHaveBeenCalledTimes(1);
+      expect(retireOwner).toBeUndefined();
+      expect(vi.getTimerCount()).toBe(0);
+      provider.emit({ type: "stable", text: "Late terminal text" });
+      expect(() => coordinator.get(owner)).toThrowError(expect.objectContaining({ code: "not_found" }));
+    } finally {
+      await coordinator.close();
+      vi.useRealTimers();
+    }
+  });
+
+  it.each(["success", "cancel", "Connection", "configuration", "close"] as const)(
+    "clears a pending Stop drain timer after %s retirement", async (retirement) => {
+      vi.useFakeTimers();
+      vi.setSystemTime(0);
+      const provider = new FakeAsrProvider();
+      const flush = deferred<void>();
+      provider.flushImpl = () => flush.promise;
+      provider.stopImpl = async () => { flush.reject(new Error("Retired capture")); };
+      let retireOwner: (() => void) | undefined;
+      const disposeOwner = vi.fn(() => { retireOwner = undefined; });
+      const coordinator = createCoordinator(factory(provider), {
+        onOwnerRetired: (_owner, listener) => { retireOwner = listener; return disposeOwner; }
+      });
+      try {
+        const started = await coordinator.start({ ownerConnectionId: "cleanup-owner", requestId: "cleanup-request", mimeType: "audio/webm" });
+        const owner = { ownerConnectionId: "cleanup-owner", voiceInputId: started.id };
+        coordinator.append({ ...owner, chunkSequence: 1n, audio: new Uint8Array(320), durationMs: 10, voiced: true });
+        const stopping = coordinator.stop({ ...owner, expectedNextChunkSequence: 2n });
+        expect(vi.getTimerCount()).toBe(1);
+        if (retirement === "success") {
+          provider.emit({ type: "stable", text: "Confirmed text" });
+          flush.resolve();
+        } else if (retirement === "cancel") await coordinator.cancel(owner);
+        else if (retirement === "Connection") retireOwner!();
+        else if (retirement === "configuration") await coordinator.retireProviderConfiguration();
+        else await coordinator.close();
+        expect(await stopping).toMatchObject({ state: "done", outcome: retirement === "success" ? "success" : "cancelled" });
+        expect(disposeOwner).toHaveBeenCalledTimes(1);
+        expect(retireOwner).toBeUndefined();
+        expect(vi.getTimerCount()).toBe(0);
+        await vi.advanceTimersByTimeAsync(90_010);
+        provider.emit({ type: "stable", text: "Late replacement text" });
+        expect(provider.stopCalls).toBe(1);
+        if (retirement !== "close") {
+          expect(coordinator.get(owner).result?.text).toBe(retirement === "success" ? "Confirmed text" : undefined);
+        }
+      } finally {
+        await coordinator.close();
+        vi.useRealTimers();
+      }
+    }
+  );
+
+  it("keeps the capture lifetime fixed when drafts and reads change", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const provider = new FakeAsrProvider();
+    const coordinator = createCoordinator(factory(provider));
+    try {
+      const started = await coordinator.start({ ownerConnectionId: "capture-owner", requestId: "capture-request", mimeType: "audio/webm" });
+      const owner = { ownerConnectionId: "capture-owner", voiceInputId: started.id };
+      vi.setSystemTime(719_999);
+      provider.emit({ type: "partial", text: "Current capture" });
+      expect(coordinator.get(owner).state).toBe("listening");
+      vi.setSystemTime(720_000);
+      expect(() => coordinator.get(owner)).toThrowError(expect.objectContaining({ code: "not_found" }));
+      await settlePromises();
+      expect(provider.stopCalls).toBe(1);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      await coordinator.close();
+      vi.useRealTimers();
+    }
+  });
 });
 
 class FakeAsrProvider implements AsrProvider {
   startRequests: AsrStartRequest[] = [];
   appendCalls: AudioChunk[] = [];
   stopCalls = 0;
+  flushCalls = 0;
   flushImpl: () => Promise<void> = async () => undefined;
+  stopImpl: () => Promise<void> = async () => undefined;
   private listener: ((event: AsrEvent) => void) | undefined;
 
   async start(request: AsrStartRequest): Promise<void> {
@@ -312,11 +438,13 @@ class FakeAsrProvider implements AsrProvider {
   }
 
   flushAudio(): Promise<void> {
+    this.flushCalls += 1;
     return this.flushImpl();
   }
 
   async stop(): Promise<void> {
     this.stopCalls += 1;
+    await this.stopImpl();
   }
 
   async recover(): Promise<void> {}
@@ -362,10 +490,11 @@ function createCoordinator(
   return coordinator;
 }
 
-function deferred<T>(): { readonly promise: Promise<T>; readonly resolve: (value: T) => void } {
+function deferred<T>(): { readonly promise: Promise<T>; readonly resolve: (value: T) => void; readonly reject: (error: Error) => void } {
   let resolve!: (value: T) => void;
-  const promise = new Promise<T>((resolvePromise) => { resolve = resolvePromise; });
-  return { promise, resolve };
+  let reject!: (error: Error) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => { resolve = resolvePromise; reject = rejectPromise; });
+  return { promise, resolve, reject };
 }
 
 async function settlePromises(): Promise<void> {
