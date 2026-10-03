@@ -61,8 +61,8 @@ import { SentPastedTextInline } from "./SentPastedTextInline.js";
 import { buildSentPastedTextMessageSegments, projectSentPastedTextMessageBody } from "./sent-pasted-text.js";
 import { messageDialogueRewindTarget } from "./message-rewind-behavior.js";
 import { shareSelectionPinnedRenderIndexes } from "./share-selection-behavior.js";
-import { ShareMessageImageEmptyError, ShareMessageImageTooLargeError, buildShareMessageImagePng, deliverShareMessageImage, shareMessageImageFilename } from "./share-message-image.js";
-import { MAXIMUM_RENDERED_SHARE_MESSAGES } from "./share-rendered-message-image.js";
+import { ShareMessageImageEmptyError, ShareMessageImageTooLargeError, deliverShareMessageImage, shareMessageImageFilename } from "./share-message-image.js";
+import { MAXIMUM_RENDERED_SHARE_MESSAGES, ShareRenderedMessageImageUnavailableError, ShareRenderedMessageNotMountedError, buildRenderedShareMessageImagePng, queryRenderedShareMessageIds } from "./share-rendered-message-image.js";
 import { RENDERED_SHARE_CONTENT_PENDING_ATTRIBUTE, RENDERED_SHARE_EXCLUDE_ATTRIBUTE, RENDERED_SHARE_MESSAGE_ATTRIBUTE, RenderedShareSelectionContext, useRenderedShareSelection } from "./rendered-share-dom.js";
 import { projectInlinePlanTimeline, projectPinnedPlan } from "./pinned-plan-behavior.js";
 import { collectTimelineGalleryImages, moveTimelineGalleryIndex, timelineArtifactGalleryId, timelineMessageAttachmentGalleryId, type TimelineGalleryImage } from "./timeline-image-gallery.js";
@@ -1463,12 +1463,11 @@ export function MessageActions({ ownerKey, sessionId, sessionName, item, text, a
   };
   const shareContent = {
     sessionName,
-    role: align === "right" ? "user" as const : "assistant" as const,
-    roleLabel: align === "right" ? t("timeline.you") : t("timeline.agent"),
-    text,
-    attachmentNames: item.attachments?.map((attachment) => attachment.fileName || attachment.title),
-    attachmentsLabel: t("timeline.attachments"),
-    createdAtLabel: formatDateTime(item.createdAt, locale)
+    messages: [{
+      id: item.id,
+      text,
+      attachmentNames: item.attachments?.map((attachment) => attachment.fileName || attachment.title) ?? []
+    }]
   };
   const actionOwnerKey = JSON.stringify([ownerKey, sessionId, item.id, item.sourceEventId, item.createdAt, shareContent]);
   const retireActions = (): void => {
@@ -1536,20 +1535,35 @@ export function MessageActions({ ownerKey, sessionId, sessionName, item, text, a
     if (!shareable || shareRequestRef.current !== undefined) return;
     const owner = ownerRef.current;
     if (owner === undefined || owner.document !== trigger.ownerDocument) return;
+    const intent = {};
+    feedbackIntentRef.current = intent;
+    clearFeedbackTimer();
+    setShareFeedback(undefined);
+    const sourceMessage = actionsRef.current?.closest<HTMLElement>(`[${RENDERED_SHARE_MESSAGE_ATTRIBUTE}]`);
+    const timelineRoot = sourceMessage?.closest<HTMLElement>("[data-timeline-session-id]");
+    if (
+      sourceMessage === null || sourceMessage === undefined || sourceMessage.getAttribute(RENDERED_SHARE_MESSAGE_ATTRIBUTE) !== item.id
+      || timelineRoot === null || timelineRoot === undefined || !timelineRoot.isConnected || timelineRoot.ownerDocument !== trigger.ownerDocument
+      || timelineRoot.dataset.timelineSessionId !== sessionId
+    ) {
+      reportShareFeedback(intent, "error", t("timeline.shareNotReady"));
+      return;
+    }
+    const orderedTimelineMessageIds = queryRenderedShareMessageIds(timelineRoot);
     const request = new AbortController();
     const action: BrowserActionContext = { ownerDocument: trigger.ownerDocument, signal: request.signal };
     shareRequestRef.current = request;
     const current = (): boolean => ownerRef.current === owner && shareRequestRef.current === request && !request.signal.aborted
       && actionsRef.current?.isConnected === true && actionsRef.current.ownerDocument === action.ownerDocument
+      && sourceMessage.isConnected && sourceMessage.getAttribute(RENDERED_SHARE_MESSAGE_ATTRIBUTE) === item.id
+      && sourceMessage.closest<HTMLElement>("[data-timeline-session-id]") === timelineRoot
+      && timelineRoot.isConnected && timelineRoot.ownerDocument === action.ownerDocument
+      && timelineRoot.dataset.timelineSessionId === sessionId
       && action.ownerDocument.defaultView?.document === action.ownerDocument && !action.ownerDocument.defaultView.closed;
-    const intent = {};
-    feedbackIntentRef.current = intent;
-    clearFeedbackTimer();
     setSharing(true);
-    setShareFeedback(undefined);
     try {
       assertBrowserActionCurrent(action);
-      const blob = await buildShareMessageImagePng(shareContent, action);
+      const blob = await buildRenderedShareMessageImagePng({ timelineRoot, sessionId, orderedTimelineMessageIds, content: shareContent, action });
       if (!current()) return;
       assertBrowserActionCurrent(action);
       const delivery = await deliverShareMessageImage(blob, shareMessageImageFilename(sessionName, item.createdAt), sessionName, action);
@@ -1560,6 +1574,8 @@ export function MessageActions({ ownerKey, sessionId, sessionName, item, text, a
       if (!current()) return;
       reportShareFeedback(intent, "error", error instanceof ShareMessageImageTooLargeError
         ? t("timeline.shareTooLarge")
+        : error instanceof ShareRenderedMessageNotMountedError || error instanceof ShareRenderedMessageImageUnavailableError
+          ? t("timeline.shareNotReady")
         : error instanceof ShareMessageImageEmptyError
           ? t("timeline.shareEmpty")
           : t("timeline.shareFailed"));

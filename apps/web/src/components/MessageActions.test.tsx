@@ -8,7 +8,8 @@ import type { Translator } from "./types.js";
 import type { BrowserActionContext } from "../browser-action.js";
 
 const sharing = vi.hoisted(() => ({ build: vi.fn(), deliver: vi.fn() }));
-vi.mock("./share-message-image.js", async (original) => ({ ...await original<typeof import("./share-message-image.js")>(), buildShareMessageImagePng: sharing.build, deliverShareMessageImage: sharing.deliver }));
+vi.mock("./share-rendered-message-image.js", async (original) => ({ ...await original<typeof import("./share-rendered-message-image.js")>(), buildRenderedShareMessageImagePng: sharing.build }));
+vi.mock("./share-message-image.js", async (original) => ({ ...await original<typeof import("./share-message-image.js")>(), deliverShareMessageImage: sharing.deliver }));
 
 const roots: Root[] = [];
 const t: Translator = (key) => key;
@@ -69,9 +70,9 @@ describe("message clipboard actions", () => {
     const closing = deferred();
     const writeText = vi.fn<(value: string) => Promise<void>>().mockImplementationOnce(() => old.promise).mockResolvedValueOnce(undefined).mockImplementationOnce(() => closing.promise);
     Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText } });
-    const { host, root } = mount();
+    const { host, root, render } = mount();
     await act(async () => host.querySelector<HTMLButtonElement>('button[aria-label="timeline.copy"]')!.click());
-    await act(async () => root.render(actions("task", "Message text", "another-profile")));
+    await act(async () => render(actions("task", "Message text", "another-profile")));
     expect(host.querySelector('[role="alert"]')).toBeNull();
     const copy = host.querySelector<HTMLButtonElement>('button[aria-label="timeline.copy"]')!;
     expect(copy.disabled).toBe(false);
@@ -140,15 +141,15 @@ describe("message clipboard actions", () => {
     const old = deferredValue<Blob>();
     const next = deferredValue<Blob>();
     sharing.build.mockReturnValueOnce(old.promise).mockReturnValueOnce(next.promise);
-    const { host, root } = mount();
+    const { host, root, render } = mount();
     const share = host.querySelector<HTMLButtonElement>('button[aria-label="timeline.shareAsImage"]')!;
     await act(async () => { share.click(); share.click(); });
     expect(sharing.build).toHaveBeenCalledOnce();
-    const oldAction = sharing.build.mock.calls[0]![1] as BrowserActionContext;
-    await act(async () => root.render(actions()));
+    const oldAction = shareBuildActionAt(0);
+    await act(async () => render(actions()));
     expect(oldAction.signal.aborted).toBe(false);
-    await act(async () => root.render(actions("task", "Message text", "other-profile")));
-    await act(async () => root.render(actions()));
+    await act(async () => render(actions("task", "Message text", "other-profile")));
+    await act(async () => render(actions()));
     expect(oldAction.signal.aborted).toBe(true);
     await act(async () => host.querySelector<HTMLButtonElement>('button[aria-label="timeline.shareAsImage"]')!.click());
     await act(async () => old.resolve(new Blob(["old"])));
@@ -166,7 +167,7 @@ describe("message clipboard actions", () => {
     const owner = frame.contentWindow!;
     const { host, root } = mount(owner.document);
     await act(async () => host.querySelector<HTMLButtonElement>('button[aria-label="timeline.shareAsImage"]')!.click());
-    const action = sharing.build.mock.calls[0]![1] as BrowserActionContext;
+    const action = shareBuildActionAt(0);
     expect(action.ownerDocument).toBe(owner.document);
     await act(async () => owner.dispatchEvent(new Event("pagehide")));
     expect(action.signal.aborted).toBe(true);
@@ -179,12 +180,68 @@ describe("message clipboard actions", () => {
     const closing = deferredValue<Blob>();
     sharing.build.mockReturnValueOnce(closing.promise);
     await act(async () => host.querySelector<HTMLButtonElement>('button[aria-label="timeline.shareAsImage"]')!.click());
-    const closeAction = sharing.build.mock.calls[2]![1] as BrowserActionContext;
+    const closeAction = shareBuildActionAt(2);
     await act(async () => root.unmount());
     roots.splice(roots.indexOf(root), 1);
     expect(closeAction.signal.aborted).toBe(true);
     await act(async () => closing.resolve(new Blob(["late"])));
     expect(sharing.deliver).toHaveBeenCalledOnce();
+  });
+
+  it("captures the exact Timeline root, rendered order and one-message content", async () => {
+    const { host } = mount();
+    const timelineRoot = host.querySelector<HTMLElement>('[data-timeline-session-id="task"]')!;
+    await act(async () => host.querySelector<HTMLButtonElement>('button[aria-label="timeline.shareAsImage"]')!.click());
+
+    expect(sharing.build).toHaveBeenCalledOnce();
+    const request = sharing.build.mock.calls[0]![0] as {
+      readonly timelineRoot: HTMLElement;
+      readonly sessionId: string;
+      readonly orderedTimelineMessageIds: readonly string[];
+      readonly content: unknown;
+      readonly action: BrowserActionContext;
+    };
+    expect(request.timelineRoot).toBe(timelineRoot);
+    expect(request.sessionId).toBe("task");
+    expect(request.orderedTimelineMessageIds).toEqual(["before", "message", "after"]);
+    expect(request.content).toEqual({
+      sessionName: "Task",
+      messages: [{ id: "message", text: "Message text", attachmentNames: [] }]
+    });
+    expect(request.action.ownerDocument).toBe(document);
+    expect(request.action.signal.aborted).toBe(false);
+    expect(sharing.deliver).toHaveBeenCalledOnce();
+  });
+
+  it("fails closed when the exact rendered message or Timeline root is missing", async () => {
+    const missingMessage = mount(document, { messageId: "different-message" });
+    await act(async () => missingMessage.host.querySelector<HTMLButtonElement>('button[aria-label="timeline.shareAsImage"]')!.click());
+    expect(sharing.build).not.toHaveBeenCalled();
+    expect(sharing.deliver).not.toHaveBeenCalled();
+
+    await act(async () => missingMessage.root.unmount());
+    roots.splice(roots.indexOf(missingMessage.root), 1);
+    sharing.build.mockClear();
+    sharing.deliver.mockClear();
+
+    const missingRoot = mount(document, { includeTimelineRoot: false });
+    await act(async () => missingRoot.host.querySelector<HTMLButtonElement>('button[aria-label="timeline.shareAsImage"]')!.click());
+    expect(sharing.build).not.toHaveBeenCalled();
+    expect(sharing.deliver).not.toHaveBeenCalled();
+  });
+
+  it("treats native cancellation and an unknown native outcome as one external effect each", async () => {
+    sharing.deliver.mockResolvedValueOnce("cancelled").mockRejectedValueOnce(new Error("unknown native outcome"));
+    const { host } = mount();
+    const share = host.querySelector<HTMLButtonElement>('button[aria-label="timeline.shareAsImage"]')!;
+
+    await act(async () => share.click());
+    expect(sharing.deliver).toHaveBeenCalledOnce();
+    expect(host.querySelector(".message-share-feedback")).toBeNull();
+
+    await act(async () => host.querySelector<HTMLButtonElement>('button[aria-label="timeline.shareAsImage"]')!.click());
+    expect(sharing.deliver).toHaveBeenCalledTimes(2);
+    expect(host.querySelector('[role="alert"]')?.textContent).toBe("timeline.shareFailed");
   });
 });
 
@@ -192,12 +249,32 @@ function actions(sessionId = "task", text = "Message text", ownerKey = "profile"
   return <MessageActions ownerKey={ownerKey} sessionId={sessionId} sessionName="Task" item={{ id: "message", sourceEventId: "event", kind: "assistant", sequence: 1n, createdAt: 0, text }} text={text} align="left" locale="en" t={t} forking={false} editable={false} />;
 }
 
-function mount(ownerDocument: Document = document) {
+function renderedActions(
+  component = actions(),
+  { includeTimelineRoot = true, messageId = "message" }: { readonly includeTimelineRoot?: boolean; readonly messageId?: string } = {}
+) {
+  const message = <article data-rendered-share-message-id={messageId}>{component}</article>;
+  if (!includeTimelineRoot) return message;
+  return (
+    <section data-timeline-session-id="task">
+      <article data-rendered-share-message-id="before" />
+      {message}
+      <article data-rendered-share-message-id="after" />
+    </section>
+  );
+}
+
+function mount(ownerDocument: Document = document, options: { readonly includeTimelineRoot?: boolean; readonly messageId?: string } = {}) {
   const host = ownerDocument.body.appendChild(ownerDocument.createElement("div"));
   const root = createRoot(host);
   roots.push(root);
-  act(() => root.render(actions()));
-  return { host, root };
+  const render = (component = actions()): void => root.render(renderedActions(component, options));
+  act(() => render());
+  return { host, root, render };
+}
+
+function shareBuildActionAt(index: number): BrowserActionContext {
+  return (sharing.build.mock.calls[index]![0] as { readonly action: BrowserActionContext }).action;
 }
 
 function deferred() {

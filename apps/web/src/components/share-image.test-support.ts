@@ -5,7 +5,6 @@ interface ShareImageTestSurface {
   readonly action: BrowserActionContext;
   readonly abort: AbortController;
   readonly document: { createElement: Mock<(tag: string) => unknown> };
-  readonly canvas: { width: number; height: number; getContext: () => CanvasRenderingContext2D; toBlob: Mock<(callback: BlobCallback, type?: string) => void> };
   readonly click: Mock<() => void>;
   readonly share: Mock<(data: ShareData) => Promise<void>>;
   readonly write: Mock<(items: ClipboardItems) => Promise<void>>;
@@ -26,13 +25,7 @@ export function shareImageTestSurface(): ShareImageTestSurface {
   const share = vi.fn<(data: ShareData) => Promise<void>>().mockResolvedValue(undefined);
   const write = vi.fn<(items: ClipboardItems) => Promise<void>>().mockResolvedValue(undefined);
   const navigator = { share, canShare: vi.fn(() => true), userActivation: { isActive: true }, clipboard: { write } };
-  const canvasContext = new Proxy({ measureText: (value: string) => ({ width: value.length * 8 }) } as unknown as CanvasRenderingContext2D, {
-    get: (target, property) => property in target ? Reflect.get(target, property) : vi.fn(),
-    set: (target, property, value) => Reflect.set(target, property, value)
-  });
-  const toBlob: Mock<(callback: BlobCallback, type?: string) => void> = vi.fn((callback) => callback(pngBlob()));
-  const canvas = { width: 0, height: 0, getContext: () => canvasContext, toBlob };
-  const document = { createElement: vi.fn((tag: string) => tag === "canvas" ? canvas : { click }) };
+  const document = { createElement: vi.fn(() => ({ click })) };
   const window = Object.assign(new EventTarget(), {
     document,
     closed: false,
@@ -46,14 +39,12 @@ export function shareImageTestSurface(): ShareImageTestSurface {
   Object.assign(document, { defaultView: window });
   const abort = new AbortController();
   const action: BrowserActionContext = { ownerDocument: document as unknown as Document, signal: abort.signal };
-  return { action, abort, document, window, canvas, click, share, write };
+  return { action, abort, document, window, click, share, write };
 }
 
 export function pngBlob(): Blob {
   return new Blob([new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10, 1])], { type: "image/png" });
 }
-
-export const shareImageTestPalette = { background: "white", surface: "white", text: "black", secondaryText: "gray", line: "gray", accent: "orange", accentInk: "black", fontFamily: "sans-serif" };
 
 export function deferredShareValue<T>() {
   let resolve!: (value: T) => void;

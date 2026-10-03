@@ -8,7 +8,7 @@ import { copyShareSelectionImagePng, deliverShareSelectionImagePng, downloadShar
 import { ShareMessageImageEmptyError, ShareMessageImageTooLargeError } from "./share-message-image.js";
 import { ShareRenderedMessageImageUnavailableError, ShareRenderedMessageNotMountedError, buildRenderedShareMessageImagePng } from "./share-rendered-message-image.js";
 import type { Translator } from "./types.js";
-import { Button, Spinner, cx, formatDateTime } from "./ui.js";
+import { Button, Spinner, cx } from "./ui.js";
 
 type BusyKind = "copy" | "download" | "share";
 
@@ -36,13 +36,10 @@ export function ShareSelectionBar({ ownerKey, sessionId, sessionName, messages, 
 
   const content = {
     sessionName,
-    messages: shareSelectionImageMessages(messages, selectedMessages, {
-      user: t("timeline.you"),
-      assistant: t("timeline.agent"),
-      attachments: t("timeline.attachments")
-    }, (createdAt) => formatDateTime(createdAt, locale))
+    messages: shareSelectionImageMessages(selectedMessages)
   };
   const sourceKey = JSON.stringify([
+    locale,
     content,
     messages.map((message) => [message.id, message.sourceEventId, message.createdAt])
   ]);

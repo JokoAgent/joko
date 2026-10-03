@@ -2,6 +2,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { pngBlob } from "./share-image.test-support.js";
 import {
+  MAXIMUM_RENDERED_SHARE_ATTACHMENTS,
+  MAXIMUM_RENDERED_SHARE_DOM_ATTRIBUTE_CHARACTERS,
+  MAXIMUM_RENDERED_SHARE_DOM_NODES,
+  MAXIMUM_RENDERED_SHARE_IMAGES,
+  MAXIMUM_RENDERED_SHARE_IMAGE_EDGE_PIXELS,
+  MAXIMUM_RENDERED_SHARE_MESSAGES,
   ShareRenderedMessageImageUnavailableError,
   ShareRenderedMessageNotMountedError,
   assertRenderedShareReadableSize,
@@ -15,7 +21,7 @@ import {
   type RenderedShareImageContent
 } from "./share-rendered-message-image.js";
 import { RENDERED_SHARE_CONTENT_PENDING_ATTRIBUTE, RENDERED_SHARE_EXCLUDE_ATTRIBUTE, RENDERED_SHARE_MESSAGE_ATTRIBUTE } from "./rendered-share-dom.js";
-import { ShareMessageImageTooLargeError } from "./share-message-image.js";
+import { MAXIMUM_SHARE_IMAGE_PIXELS, MAXIMUM_SHARE_MESSAGE_CHARACTERS, ShareMessageImageEmptyError, ShareMessageImageTooLargeError } from "./share-message-image.js";
 import { timelineDomToPng } from "./timeline-image-export.js";
 
 vi.mock("./timeline-image-export.js", async (importOriginal) => {
@@ -24,6 +30,7 @@ vi.mock("./timeline-image-export.js", async (importOriginal) => {
 });
 
 beforeEach(() => {
+  vi.clearAllMocks();
   vi.mocked(timelineDomToPng).mockResolvedValue(validatedPngBlob());
   vi.spyOn(HTMLElement.prototype, "scrollWidth", "get").mockReturnValue(900);
   vi.spyOn(HTMLElement.prototype, "scrollHeight", "get").mockReturnValue(600);
@@ -57,6 +64,82 @@ describe("rendered share selection identity", () => {
   });
 });
 
+describe("rendered share budgets", () => {
+  it("rejects empty, over-count, over-character, and over-attachment content before rasterization", async () => {
+    const root = timelineRoot("session-budget");
+    root.append(message("selected"));
+    const overMessages = Array.from({ length: MAXIMUM_RENDERED_SHARE_MESSAGES + 1 }, (_, index) => ({ id: `message-${index}`, text: "", attachmentNames: [] }));
+    const cases: readonly { readonly content: RenderedShareImageContent; readonly error: typeof ShareMessageImageEmptyError | typeof ShareMessageImageTooLargeError }[] = [
+      { content: { sessionName: "Task", messages: [] }, error: ShareMessageImageEmptyError },
+      { content: { sessionName: "Task", messages: overMessages }, error: ShareMessageImageTooLargeError },
+      { content: { sessionName: "Task", messages: [{ id: "selected", text: "x".repeat(MAXIMUM_SHARE_MESSAGE_CHARACTERS + 1), attachmentNames: [] }] }, error: ShareMessageImageTooLargeError },
+      { content: { sessionName: "Task", messages: [{ id: "selected", text: "", attachmentNames: Array.from({ length: MAXIMUM_RENDERED_SHARE_ATTACHMENTS + 1 }, () => "") }] }, error: ShareMessageImageTooLargeError }
+    ];
+
+    for (const entry of cases) await expect(build(root, "session-budget", entry.content)).rejects.toBeInstanceOf(entry.error);
+    expect(timelineDomToPng).not.toHaveBeenCalled();
+  });
+
+  it("accepts the exact message, character, and attachment caps", async () => {
+    const root = timelineRoot("session-exact-budget");
+    const messages = Array.from({ length: MAXIMUM_RENDERED_SHARE_MESSAGES }, (_, index) => message(`message-${index}`));
+    root.append(...messages);
+    const cappedContent: RenderedShareImageContent = {
+      sessionName: "Task",
+      messages: messages.map((node, index) => ({
+        id: node.getAttribute(RENDERED_SHARE_MESSAGE_ATTRIBUTE)!,
+        text: index === 0 ? "x".repeat(MAXIMUM_SHARE_MESSAGE_CHARACTERS) : "",
+        attachmentNames: index === 0 ? Array.from({ length: MAXIMUM_RENDERED_SHARE_ATTACHMENTS }, () => "") : []
+      }))
+    };
+
+    await expect(build(root, "session-exact-budget", cappedContent)).resolves.toMatchObject({ type: "image/png" });
+    expect(timelineDomToPng).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    ["attribute characters", (selected: HTMLElement) => { selected.dataset.payload = "x".repeat(MAXIMUM_RENDERED_SHARE_DOM_ATTRIBUTE_CHARACTERS + 1); }],
+    ["DOM nodes", (selected: HTMLElement) => {
+      const fragment = document.createDocumentFragment();
+      for (let index = 0; index < MAXIMUM_RENDERED_SHARE_DOM_NODES; index += 1) fragment.append(document.createElement("span"));
+      selected.append(fragment);
+    }],
+    ["images", (selected: HTMLElement) => {
+      selected.append(...Array.from({ length: MAXIMUM_RENDERED_SHARE_IMAGES + 1 }, () => document.createElement("img")));
+    }]
+  ] as const)("rejects excessive source %s before cloning", async (_name, prepare) => {
+    const root = timelineRoot("session-source-budget");
+    const selected = message("selected");
+    prepare(selected);
+    root.append(selected);
+    const clone = vi.spyOn(selected, "cloneNode");
+
+    await expect(build(root, "session-source-budget", content("selected"))).rejects.toBeInstanceOf(ShareMessageImageTooLargeError);
+    expect(clone).not.toHaveBeenCalled();
+    expect(timelineDomToPng).not.toHaveBeenCalled();
+  });
+
+  it("bounds cumulative frozen image pixels before rasterizing the composed share", async () => {
+    vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue({ drawImage: vi.fn() } as unknown as CanvasRenderingContext2D);
+    vi.spyOn(HTMLCanvasElement.prototype, "toDataURL").mockReturnValue("data:image/png;base64,ZmFrZQ==");
+    const root = timelineRoot("session-image-budget");
+    const selected = message("selected");
+    for (let index = 0; index < 5; index += 1) {
+      const image = selected.appendChild(document.createElement("img"));
+      image.src = `blob:image-${index}`;
+      Object.defineProperties(image, {
+        complete: { configurable: true, value: true },
+        naturalWidth: { configurable: true, value: 4_096 },
+        naturalHeight: { configurable: true, value: 4_096 }
+      });
+    }
+    root.append(selected);
+
+    await expect(build(root, "session-image-budget", content("selected"))).rejects.toBeInstanceOf(ShareMessageImageTooLargeError);
+    expect(timelineDomToPng).not.toHaveBeenCalled();
+  });
+});
+
 describe("rendered share clone preparation", () => {
   it("redacts a credential split across highlighted spans without flattening its structure", () => {
     const root = document.createElement("article");
@@ -66,12 +149,26 @@ describe("rendered share clone preparation", () => {
 
     redactRenderedShareTextNodes(root);
 
-    expect(root.textContent).toBe("Use [REDACTED_TOKEN] today");
+    expect(root.textContent).toBe("Use [REDACTED] today");
     expect(root.textContent).not.toContain("supersecret123456");
     expect(root.querySelector("mark")).toBe(mark);
     expect(root.querySelector("span")).toBe(span);
     expect(mark.dataset.highlight).toBe("one");
     expect(span.dataset.highlight).toBe("two");
+  });
+
+  it("redacts JSON and Basic authorization values split across rendered spans", () => {
+    const root = document.createElement("article");
+    root.innerHTML = '<p>{"password":"<mark>hunter</mark><span>2</span>","Authorization":"Basic <em>dXNlcjpw</em><strong>YXNz</strong>","safe":"visible"}</p>';
+
+    redactRenderedShareTextNodes(root);
+
+    expect(root.textContent).toContain('"password":"[REDACTED]"');
+    expect(root.textContent).toContain('"Authorization":"[REDACTED]"');
+    expect(root.textContent).toContain('"safe":"visible"');
+    expect(root.textContent).not.toContain("hunter2");
+    expect(root.textContent).not.toContain("dXNlcjpwYXNz");
+    expect(root.querySelector("mark, span, em, strong")).not.toBeNull();
   });
 
   it("removes controls and clone anchors while expanding collapsed and selection-only wrappers", () => {
@@ -141,6 +238,18 @@ describe("rendered share clone preparation", () => {
       scrollHeight: { configurable: true, value: 10_000 }
     });
     expect(() => assertRenderedShareReadableSize(root)).toThrow(ShareMessageImageTooLargeError);
+    Object.defineProperties(root, {
+      scrollWidth: { configurable: true, value: MAXIMUM_RENDERED_SHARE_IMAGE_EDGE_PIXELS },
+      scrollHeight: { configurable: true, value: 1 }
+    });
+    expect(() => assertRenderedShareReadableSize(root)).not.toThrow();
+    Object.defineProperty(root, "scrollWidth", { configurable: true, value: MAXIMUM_RENDERED_SHARE_IMAGE_EDGE_PIXELS + 1 });
+    expect(() => assertRenderedShareReadableSize(root)).toThrow(ShareMessageImageTooLargeError);
+    Object.defineProperties(root, {
+      scrollWidth: { configurable: true, value: Math.sqrt(MAXIMUM_SHARE_IMAGE_PIXELS) },
+      scrollHeight: { configurable: true, value: Math.sqrt(MAXIMUM_SHARE_IMAGE_PIXELS) }
+    });
+    expect(() => assertRenderedShareReadableSize(root)).not.toThrow();
   });
 
   it("fails closed while a selected rich image has no capturable source", async () => {
@@ -224,7 +333,11 @@ it("passes an ordered rich, redacted snapshot with explicit gaps to rasterizatio
   vi.mocked(timelineDomToPng).mockImplementation(async (node, action, options) => {
     expect(node.isConnected).toBe(true);
     expect(action.ownerDocument).toBe(document);
-    expect(options).toEqual(expect.objectContaining({ desiredScale: 2 }));
+    expect(options).toEqual({
+      desiredScale: 2,
+      maximumEdgePixels: MAXIMUM_RENDERED_SHARE_IMAGE_EDGE_PIXELS,
+      maximumPixels: MAXIMUM_SHARE_IMAGE_PIXELS
+    });
     snapshot = node.cloneNode(true) as HTMLElement;
     return validatedPngBlob();
   });

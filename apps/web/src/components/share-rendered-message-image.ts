@@ -6,20 +6,21 @@ import {
   ShareMessageImageEmptyError,
   ShareMessageImageEncodingError,
   ShareMessageImageTooLargeError,
-  assertPngBlob,
-  redactShareMessageText
+  assertPngBlob
 } from "./share-message-image.js";
+import { redactShareMessageText } from "./share-redaction.js";
 import { TIMELINE_FROZEN_IMAGE_ATTRIBUTE, rewriteTimelineSnapshotIds, timelineDomToPng, timelineExportScale } from "./timeline-image-export.js";
 import { RENDERED_SHARE_CONTENT_PENDING_ATTRIBUTE, RENDERED_SHARE_EXCLUDE_ATTRIBUTE, RENDERED_SHARE_MESSAGE_ATTRIBUTE } from "./rendered-share-dom.js";
 
 export const MAXIMUM_RENDERED_SHARE_MESSAGES = 80;
 export const MAXIMUM_RENDERED_SHARE_ATTACHMENTS = 64;
 export const MAXIMUM_RENDERED_SHARE_IMAGE_EDGE_PIXELS = 16_384;
+export const MAXIMUM_RENDERED_SHARE_IMAGES = 64;
+export const MAXIMUM_RENDERED_SHARE_DOM_NODES = 20_000;
+export const MAXIMUM_RENDERED_SHARE_DOM_ATTRIBUTE_CHARACTERS = 262_144;
 
-const MAXIMUM_RENDERED_SHARE_IMAGES = 64;
-const MAXIMUM_RENDERED_SHARE_SOURCE_IMAGE_PIXELS = MAXIMUM_SHARE_IMAGE_PIXELS * 4;
-const MAXIMUM_RENDERED_SHARE_DOM_NODES = 20_000;
-const MAXIMUM_RENDERED_SHARE_DOM_CHARACTERS = MAXIMUM_SHARE_MESSAGE_CHARACTERS * 4;
+const MAXIMUM_RENDERED_SHARE_FROZEN_IMAGE_PIXELS = MAXIMUM_SHARE_IMAGE_PIXELS * 4;
+const MAXIMUM_RENDERED_SHARE_DOM_TEXT_CHARACTERS = MAXIMUM_SHARE_MESSAGE_CHARACTERS * 4;
 const MAXIMUM_SHARE_CONTENT_CSS_WIDTH = 914;
 const RENDERED_SHARE_IMAGE_INDEX_ATTRIBUTE = "data-rendered-share-image-index";
 let renderedShareSnapshotSequence = 0;
@@ -231,6 +232,7 @@ export async function buildRenderedShareMessageImagePng({
   const gaps = renderedShareSelectionGaps(orderedTimelineMessageIds, content.messages.map((message) => message.id));
   assertTimelineSourceCurrent(timelineRoot, sessionId, action);
   const sourceNodes = exactRenderedShareMessageNodes(timelineRoot, content.messages.map((message) => message.id));
+  assertRenderedShareDomBudget(sourceNodes);
   if (sourceNodes.some((node) => node.hasAttribute(RENDERED_SHARE_CONTENT_PENDING_ATTRIBUTE)
     || node.querySelector(`[${RENDERED_SHARE_CONTENT_PENDING_ATTRIBUTE}]`) !== null)) {
     throw new ShareRenderedMessageImageUnavailableError();
@@ -245,10 +247,12 @@ export async function buildRenderedShareMessageImagePng({
     expandRenderedShareCollapsedContent(clone);
     stripRenderedShareCloneAnchors(clone);
     redactRenderedShareTextNodes(clone);
-    pendingImages.push(...captureRenderedImages(source, clone, action, frozenImages));
     return clone;
   });
   assertRenderedShareDomBudget(clones);
+  sourceNodes.forEach((source, index) => {
+    pendingImages.push(...captureRenderedImages(source, clones[index]!, action, frozenImages));
+  });
 
   const host = ownerDocument.createElement("div");
   host.setAttribute("aria-hidden", "true");
@@ -366,15 +370,31 @@ function renderedShareSelectionGaps(
   });
 }
 
-function assertRenderedShareDomBudget(clones: readonly HTMLElement[]): void {
+export function assertRenderedShareDomBudget(roots: readonly HTMLElement[]): void {
   let nodes = 0;
-  let characters = 0;
-  for (const clone of clones) {
-    nodes += 1 + clone.querySelectorAll("*").length;
-    characters += clone.textContent?.length ?? 0;
-  }
-  if (nodes > MAXIMUM_RENDERED_SHARE_DOM_NODES || characters > MAXIMUM_RENDERED_SHARE_DOM_CHARACTERS) {
-    throw new ShareMessageImageTooLargeError();
+  let textCharacters = 0;
+  let attributeCharacters = 0;
+  let images = 0;
+  const pending: Node[] = [...roots];
+  while (pending.length > 0) {
+    const node = pending.pop()!;
+    nodes += 1;
+    if (node.nodeType === 1) {
+      const element = node as Element;
+      if (element.localName === "img") images += 1;
+      for (const attribute of element.attributes) {
+        attributeCharacters += attribute.name.length + attribute.value.length;
+      }
+    } else if (node.nodeType === 3 || node.nodeType === 4 || node.nodeType === 8) {
+      textCharacters += node.nodeValue?.length ?? 0;
+    }
+    for (let child = node.lastChild; child !== null; child = child.previousSibling) pending.push(child);
+    if (
+      nodes > MAXIMUM_RENDERED_SHARE_DOM_NODES
+      || textCharacters > MAXIMUM_RENDERED_SHARE_DOM_TEXT_CHARACTERS
+      || attributeCharacters > MAXIMUM_RENDERED_SHARE_DOM_ATTRIBUTE_CHARACTERS
+      || images > MAXIMUM_RENDERED_SHARE_IMAGES
+    ) throw new ShareMessageImageTooLargeError();
   }
 }
 
@@ -485,7 +505,7 @@ function freezeRenderedImage(
   const width = Math.max(1, Math.floor(image.naturalWidth * scale));
   const height = Math.max(1, Math.floor(image.naturalHeight * scale));
   budget.pixels += width * height;
-  if (budget.pixels > MAXIMUM_RENDERED_SHARE_SOURCE_IMAGE_PIXELS) throw new ShareMessageImageTooLargeError();
+  if (budget.pixels > MAXIMUM_RENDERED_SHARE_FROZEN_IMAGE_PIXELS) throw new ShareMessageImageTooLargeError();
   const canvas = action.ownerDocument.createElement("canvas");
   try {
     canvas.width = width;
