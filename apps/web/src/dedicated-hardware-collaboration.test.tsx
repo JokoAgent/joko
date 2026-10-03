@@ -192,20 +192,98 @@ describe("dedicated hardware collaboration activity", () => {
     expect(get).toHaveBeenCalledTimes(1);
   });
 
-  it("rotates the per-round RPC budget across all visible leads", async () => {
+  it("finishes all visible leads in bounded continuation rounds before returning to idle refresh", async () => {
     vi.useFakeTimers();
-    const leads = Array.from({ length: 100 }, (_, index) => session(`lead-${index}`, "idle"));
+    const leads = Array.from({ length: 65 }, (_, index) => session(`lead-${String(index).padStart(2, "0")}`, "idle"));
+    const workers = leads.map((lead) => session(`worker-${lead.id}`, "running"));
     const seen = new Set<string>();
     const list = vi.fn(async (id: string) => { seen.add(id); return [goal(leads.find((lead) => lead.id === id)!)]; });
-    const get = vi.fn(async (_id: string, leadId: string) => ({ goal: goal(leads.find((lead) => lead.id === leadId)!), workers: [], queue: [] }));
-    const controller = owner(leads, list, get);
-    await mount(<Harness controller={controller} source={catalog(leads)} receive={() => undefined} />);
+    const get = vi.fn(async (_id: string, leadId: string) => {
+      const index = leads.findIndex((lead) => lead.id === leadId);
+      return tree(leads[index]!, workers[index]!);
+    });
+    const controller = owner([...leads, ...workers], list, get);
+    let value: DedicatedHardwareTaskCatalog | undefined;
+    await mount(<Harness controller={controller} source={catalog(leads)} receive={(next) => { value = next; }} />);
+    await act(async () => { await vi.advanceTimersByTimeAsync(251); });
+    expect(seen.size).toBe(65);
+    expect(list).toHaveBeenCalledTimes(65);
+    expect(get).toHaveBeenCalledTimes(65);
+    expect(value?.tasks.every((task) => task.activity.phase === "running")).toBe(true);
+    await act(async () => { await vi.advanceTimersByTimeAsync(9_999); });
+    expect(list).toHaveBeenCalledTimes(65);
+    expect(get).toHaveBeenCalledTimes(65);
+  });
+
+  it("finishes every active goal for a lead before returning to idle refresh", async () => {
+    vi.useFakeTimers();
+    const lead = session("lead", "idle");
+    const worker = session("worker", "running");
+    const goals = Array.from({ length: 130 }, (_, index) => ({ ...goal(lead), id: `goal-${String(index).padStart(3, "0")}` }));
+    const list = vi.fn(async () => goals);
+    let inFlight = 0;
+    let maximumInFlight = 0;
+    const get = vi.fn(async (id: string) => {
+      inFlight += 1;
+      maximumInFlight = Math.max(maximumInFlight, inFlight);
+      await Promise.resolve();
+      inFlight -= 1;
+      const base = tree(lead, worker);
+      return { ...base, goal: goals.find((item) => item.id === id)!,
+        workers: id === goals.at(-1)!.id ? base.workers.map((item) => ({ ...item, goalId: id })) : [] };
+    });
+    let value: DedicatedHardwareTaskCatalog | undefined;
+    await mount(<Harness controller={owner([lead, worker], list, get)} source={catalog([lead])} receive={(next) => { value = next; }} />);
     await act(async () => { await vi.advanceTimersByTimeAsync(250); });
     expect(list.mock.calls.length + get.mock.calls.length).toBe(128);
-    expect(seen.size).toBe(64);
-    await act(async () => { await vi.advanceTimersByTimeAsync(10_000); });
-    expect(list.mock.calls.length + get.mock.calls.length).toBe(256);
-    expect(seen.size).toBe(100);
+    expect(maximumInFlight).toBe(4);
+    expect(value?.tasks[0]?.activity.phase).toBeNull();
+    await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+    expect(new Set(get.mock.calls.map(([id]) => id)).size).toBe(130);
+    expect(get).toHaveBeenCalledTimes(130);
+    expect(value?.tasks[0]?.activity.phase).toBe("running");
+    const calls = list.mock.calls.length + get.mock.calls.length;
+    await act(async () => { await vi.advanceTimersByTimeAsync(9_999); });
+    expect(list.mock.calls.length + get.mock.calls.length).toBe(calls);
+  });
+
+  it("keeps the pending activity debounce while continuing an unfinished pass", async () => {
+    vi.useFakeTimers();
+    const lead = session("lead", "idle");
+    const worker = session("worker", "idle");
+    const goals = Array.from({ length: 130 }, (_, index) => ({ ...goal(lead), id: `goal-${String(index).padStart(3, "0")}` }));
+    let resolve: ((value: CollaborationGoalTreeView) => void) | undefined;
+    const list = vi.fn(async () => goals);
+    const get = vi.fn((id: string) => {
+      const value = { goal: goals.find((item) => item.id === id)!, workers: [], queue: [] };
+      return get.mock.calls.length === 1 ? new Promise<CollaborationGoalTreeView>((done) => { resolve = done; }) : Promise.resolve(value);
+    });
+    const initial = owner([lead, worker], list, get);
+    let state = initial.state;
+    const controller = { ...initial, get state() { return state; } };
+    const root = await mount(<Harness controller={controller} source={catalog([lead])} receive={() => undefined} />);
+    await act(async () => { await vi.advanceTimersByTimeAsync(250); });
+    expect(get).toHaveBeenCalledTimes(127);
+    state = { ...state, snapshot: { ...state.snapshot, sessions: [lead, { ...worker, state: "running" }] } };
+    await act(async () => root.render(<Harness controller={controller} source={catalog([lead])} receive={() => undefined} />));
+    await act(async () => { resolve?.({ goal: goals[0]!, workers: [], queue: [] }); });
+    await act(async () => { await vi.advanceTimersByTimeAsync(249); });
+    expect(list).toHaveBeenCalledTimes(1);
+    expect(get).toHaveBeenCalledTimes(130);
+    await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+    expect(list).toHaveBeenCalledTimes(2);
+  });
+
+  it("retires an unstarted continuation after pagehide", async () => {
+    vi.useFakeTimers();
+    const leads = Array.from({ length: 65 }, (_, index) => session(`lead-${index}`, "idle"));
+    const list = vi.fn(async (id: string) => [goal(leads.find((lead) => lead.id === id)!)]);
+    const get = vi.fn(async (_id: string, leadId: string) => ({ goal: goal(leads.find((lead) => lead.id === leadId)!), workers: [], queue: [] }));
+    await mount(<Harness controller={owner(leads, list, get)} source={catalog(leads)} receive={() => undefined} />);
+    await act(async () => { await vi.advanceTimersByTimeAsync(250); });
+    expect(list.mock.calls.length + get.mock.calls.length).toBe(128);
+    await act(async () => { window.dispatchEvent(new Event("pagehide")); await vi.advanceTimersByTimeAsync(20_000); });
+    expect(list.mock.calls.length + get.mock.calls.length).toBe(128);
   });
 
   it("advances by actually attempted leads when the round deadline aborts slow queries", async () => {
@@ -215,8 +293,32 @@ describe("dedicated hardware collaboration activity", () => {
     await mount(<Harness controller={owner(leads, list, vi.fn(async () => tree(leads[0]!, leads[1]!)))} source={catalog(leads)} receive={() => undefined} />);
     await act(async () => { await vi.advanceTimersByTimeAsync(250); });
     expect(list.mock.calls.map(([id]) => id)).toEqual(leads.slice(0, 4).map((lead) => lead.id));
-    await act(async () => { await vi.advanceTimersByTimeAsync(15_000); });
+    await act(async () => { await vi.advanceTimersByTimeAsync(5_001); });
     expect(list.mock.calls.map(([id]) => id)).toEqual(leads.slice(0, 8).map((lead) => lead.id));
+  });
+
+  it("consumes failed relationship requests once per pass and waits for idle refresh before retrying", async () => {
+    vi.useFakeTimers();
+    const lead = session("lead", "idle");
+    const worker = session("worker", "running");
+    let fails = false;
+    const list = vi.fn(async () => [goal(lead)]);
+    const get = vi.fn(async () => {
+      if (fails) throw new Error("Relationship unavailable.");
+      return tree(lead, worker);
+    });
+    let value: DedicatedHardwareTaskCatalog | undefined;
+    await mount(<Harness controller={owner([lead, worker], list, get)} source={catalog([lead])} receive={(next) => { value = next; }} />);
+    await act(async () => { await vi.advanceTimersByTimeAsync(250); });
+    expect(value?.tasks[0]?.activity.phase).toBe("running");
+    fails = true;
+    await act(async () => { await vi.advanceTimersByTimeAsync(10_000); });
+    expect(value?.tasks[0]?.activity.phase).toBeNull();
+    expect(list).toHaveBeenCalledTimes(2);
+    expect(get).toHaveBeenCalledTimes(2);
+    await act(async () => { await vi.advanceTimersByTimeAsync(9_999); });
+    expect(list).toHaveBeenCalledTimes(2);
+    expect(get).toHaveBeenCalledTimes(2);
   });
 
   it("retires an old source instance even when all connection identities are unchanged", async () => {

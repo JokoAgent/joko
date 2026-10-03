@@ -114,8 +114,14 @@ export function useDedicatedHardwareCollaborationCatalog(
     const abort = new AbortController();
     const cache = new Map<string, CachedLead>();
     const expectedConnection = state.connectionGeneration;
+    type RelationQuery = { readonly kind: "lead"; readonly lead: typeof leads[number]; readonly index: number }
+      | { readonly kind: "goal"; readonly lead: typeof leads[number]; readonly goal: CollaborationGoalView;
+        readonly retained: CachedLead; readonly nextGoal: number };
+    interface RefreshPass { readonly queries: RelationQuery[]; nextQuery: number }
     let nextLead = 0;
+    let pass: RefreshPass | undefined;
     let timer: number | undefined;
+    let continuationTimer: number | undefined;
     let timerIsActivity = false;
     let refreshInFlight = false;
     let refreshQueued = false;
@@ -138,7 +144,7 @@ export function useDedicatedHardwareCollaborationCatalog(
         lead: lead.lead, workers: [...new Map([...lead.goals.values()].flatMap((goal) => goal.workers).map((worker) => [worker.sessionId, worker])).values()]
       })) });
     };
-    const loadLead = async (lead: typeof leads[number], goalBudget: number, signal: AbortSignal): Promise<void> => {
+    const loadLead = async (lead: typeof leads[number], refreshPass: RefreshPass, signal: AbortSignal): Promise<void> => {
       if (!currentLead(lead) || signal.aborted) return;
       const identity = { sessionId: lead.sessionId, sessionGeneration: lead.sessionGeneration };
       try {
@@ -153,39 +159,43 @@ export function useDedicatedHardwareCollaborationCatalog(
         }
         cache.set(lead.sessionId, retained);
         publishCache();
-        const count = Math.min(goalBudget, goals.length);
-        let queried = 0;
-        for (let index = 0; index < count && currentLead(lead) && !signal.aborted; index += 1) {
-          const goal = goals[(retained.nextGoal + index) % goals.length]!;
-          queried += 1;
-          try {
-            const tree = await boundedQuery(signal, (querySignal) => latest.current.controller.getCollaborationGoal(goal.id, lead.sessionId, querySignal));
-            if (!currentLead(lead)) return;
-            if (tree.goal.id !== goal.id || !goalMatches(tree.goal, lead) || tree.goal.revision < goal.revision) {
-              retained.goals.delete(goal.id); publishCache(); continue;
-            }
-            const sessions = new Map(latest.current.controller.state.snapshot.sessions.map((session) => [session.id, session]));
-            const workers = new Map<string, SessionIdentity>();
-            for (const worker of tree.workers) {
-              if (worker.goalId !== goal.id || worker.sessionId === undefined || worker.sessionGeneration === undefined
-                || worker.sessionId === lead.sessionId) continue;
-              const session = sessions.get(worker.sessionId);
-              if (session === undefined || session.archived || session.state === "closed" || session.generation !== worker.sessionGeneration
-                || session.targetId !== worker.route.targetId || session.backendId !== worker.route.backendId) continue;
-              workers.set(session.id, { sessionId: session.id, sessionGeneration: session.generation.toString(10) });
-            }
-            retained.goals.set(goal.id, { revision: tree.goal.revision, workers: [...workers.values()] });
-            publishCache();
-          } catch { retained.goals.delete(goal.id); publishCache(); }
+        for (let index = 0; index < goals.length; index += 1) {
+          const goalIndex = (retained.nextGoal + index) % goals.length;
+          refreshPass.queries.push({ kind: "goal", lead, goal: goals[goalIndex]!, retained, nextGoal: (goalIndex + 1) % goals.length });
         }
-        retained.nextGoal = goals.length === 0 ? 0 : (retained.nextGoal + queried) % goals.length;
-        if (currentLead(lead)) cache.set(lead.sessionId, retained);
+        if (goals.length === 0) retained.nextGoal = 0;
       } catch { if (currentLead(lead)) { cache.delete(lead.sessionId); publishCache(); } }
+    };
+    const loadGoal = async (query: Extract<RelationQuery, { readonly kind: "goal" }>, signal: AbortSignal): Promise<void> => {
+      const { lead, goal, retained } = query;
+      try {
+        const tree = await boundedQuery(signal, (querySignal) => latest.current.controller.getCollaborationGoal(goal.id, lead.sessionId, querySignal));
+        if (!currentLead(lead)) return;
+        if (tree.goal.id !== goal.id || !goalMatches(tree.goal, lead) || tree.goal.revision < goal.revision) {
+          retained.goals.delete(goal.id); publishCache(); return;
+        }
+        const sessions = new Map(latest.current.controller.state.snapshot.sessions.map((session) => [session.id, session]));
+        const workers = new Map<string, SessionIdentity>();
+        for (const worker of tree.workers) {
+          if (worker.goalId !== goal.id || worker.sessionId === undefined || worker.sessionGeneration === undefined
+            || worker.sessionId === lead.sessionId) continue;
+          const session = sessions.get(worker.sessionId);
+          if (session === undefined || session.archived || session.state === "closed" || session.generation !== worker.sessionGeneration
+            || session.targetId !== worker.route.targetId || session.backendId !== worker.route.backendId) continue;
+          workers.set(session.id, { sessionId: session.id, sessionGeneration: session.generation.toString(10) });
+        }
+        retained.goals.set(goal.id, { revision: tree.goal.revision, workers: [...workers.values()] });
+        publishCache();
+      } catch { retained.goals.delete(goal.id); publishCache(); }
     };
     const clearRefreshTimer = (): void => {
       if (timer !== undefined) window.clearTimeout(timer);
       timer = undefined;
       timerIsActivity = false;
+    };
+    const clearContinuationTimer = (): void => {
+      if (continuationTimer !== undefined) window.clearTimeout(continuationTimer);
+      continuationTimer = undefined;
     };
     const scheduleRefresh = (delayMs: number, activity: boolean): void => {
       timerIsActivity = activity;
@@ -195,29 +205,45 @@ export function useDedicatedHardwareCollaborationCatalog(
         void refresh();
       }, delayMs);
     };
-    const refresh = async (): Promise<void> => {
+    const refresh = async (continuePass = false): Promise<void> => {
       if (!current()) return;
-      if (refreshInFlight) { refreshQueued = true; return; }
+      if (refreshInFlight) { if (!continuePass) refreshQueued = true; return; }
+      clearContinuationTimer();
+      if (!continuePass || pass === undefined) {
+        pass = { nextQuery: 0, queries: Array.from({ length: leads.length }, (_, index) => {
+          const leadIndex = (nextLead + index) % leads.length;
+          return { kind: "lead", lead: leads[leadIndex]!, index: leadIndex };
+        }) };
+      }
+      const refreshPass = pass;
       refreshInFlight = true;
       try {
-        const leadCount = Math.min(leads.length, ROUND_REQUEST_BUDGET / 2);
-        const firstLead = nextLead;
-        const selected = Array.from({ length: leadCount }, (_, index) => leads[(firstLead + index) % leads.length]!);
-        const goalBudget = Math.max(1, Math.floor(ROUND_REQUEST_BUDGET / leadCount) - 1);
-        let pending = 0;
         const round = new AbortController();
         const cancelRound = (): void => round.abort();
         abort.signal.addEventListener("abort", cancelRound, { once: true });
         const roundTimer = window.setTimeout(cancelRound, ROUND_TIMEOUT_MS);
         try {
-          await Promise.all(Array.from({ length: Math.min(CONCURRENCY, leadCount) }, async () => {
-            while (pending < selected.length && current() && !round.signal.aborted) {
-              const lead = selected[pending++]!;
-              await loadLead(lead, goalBudget, round.signal);
-            }
-          }));
+          await new Promise<void>((resolve) => {
+            let requests = 0;
+            let inFlight = 0;
+            const pump = (): void => {
+              while (inFlight < CONCURRENCY && requests < ROUND_REQUEST_BUDGET && current() && !round.signal.aborted
+                && refreshPass.nextQuery < refreshPass.queries.length) {
+                const query = refreshPass.queries[refreshPass.nextQuery++]!;
+                if (!currentLead(query.lead)) continue;
+                requests += 1;
+                inFlight += 1;
+                if (query.kind === "lead") nextLead = (query.index + 1) % leads.length;
+                else query.retained.nextGoal = query.nextGoal;
+                const settled = (): void => { inFlight -= 1; pump(); };
+                void (query.kind === "lead" ? loadLead(query.lead, refreshPass, round.signal) : loadGoal(query, round.signal))
+                  .then(settled, settled);
+              }
+              if (inFlight === 0) resolve();
+            };
+            pump();
+          });
         } finally {
-          nextLead = (firstLead + pending) % leads.length;
           window.clearTimeout(roundTimer);
           abort.signal.removeEventListener("abort", cancelRound);
         }
@@ -228,10 +254,14 @@ export function useDedicatedHardwareCollaborationCatalog(
           if (refreshQueued) {
             refreshQueued = false;
             void refresh();
+          } else if (refreshPass.nextQuery < refreshPass.queries.length) {
+            continuationTimer = window.setTimeout(() => { continuationTimer = undefined; void refresh(true); }, 0);
           } else if (timer === undefined) {
+            pass = undefined;
             scheduleRefresh(REFRESH_MS, false);
           }
         } else {
+          pass = undefined;
           refreshQueued = false;
         }
       }
@@ -246,6 +276,8 @@ export function useDedicatedHardwareCollaborationCatalog(
       pageRetired.current = true;
       abort.abort();
       clearRefreshTimer();
+      clearContinuationTimer();
+      pass = undefined;
       refreshQueued = false;
       if (activityRefresh.current === scheduleActivityRefresh) activityRefresh.current = undefined;
       setSnapshot(undefined);
@@ -255,6 +287,8 @@ export function useDedicatedHardwareCollaborationCatalog(
     return () => {
       abort.abort();
       clearRefreshTimer();
+      clearContinuationTimer();
+      pass = undefined;
       refreshQueued = false;
       if (activityRefresh.current === scheduleActivityRefresh) activityRefresh.current = undefined;
       window.removeEventListener("pagehide", retire);
