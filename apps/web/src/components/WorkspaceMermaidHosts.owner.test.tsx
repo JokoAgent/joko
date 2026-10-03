@@ -144,6 +144,107 @@ it("fences lightbox copies and close timers, ignores IME Escape and restores onl
   expect(doc.activeElement).toBe(trigger);
 });
 
+it("pinches around two touch points, continues one-finger pan and retires every captured pointer", async () => {
+  const trigger = document.body.appendChild(document.createElement("button"));
+  const host = document.body.appendChild(document.createElement("div"));
+  const root = createRoot(host); roots.push(root);
+  let lifetime = new AbortController();
+  let detail: WorkspaceMermaidOpenDetail = { svg, source: "A", returnFocus: trigger, signal: lifetime.signal, isCurrent: () => true };
+  const render = () => act(async () => root.render(<WorkspaceMermaidLightbox ownerKey="task" detail={detail} labels={labels} annotationLabels={annotationLabels} onClose={() => undefined} />));
+  await render();
+  const surface = mermaidGestureSurface();
+
+  pointer(surface.stage, "pointerdown", 1, 150, 150);
+  pointer(surface.stage, "pointerdown", 2, 250, 150);
+  expect(surface.captured).toEqual(new Set([1, 2]));
+  pointer(surface.stage, "pointerdown", 3, 320, 180);
+  pointer(surface.stage, "pointermove", 3, 390, 240);
+  expect(surface.captured).toEqual(new Set([1, 2]));
+  expect(surface.card.style.transform).toBe("translate(0px, 0px) scale(1)");
+
+  pointer(surface.stage, "pointermove", 2, 350, 150);
+  expect(surface.card.style.transform).toBe("translate(50px, 0px) scale(2)");
+  act(() => surface.stage.dispatchEvent(new MouseEvent("dblclick", { bubbles: true })));
+  expect(surface.card.style.transform).toBe("translate(50px, 0px) scale(2)");
+  pointer(surface.stage, "pointerup", 2, 350, 150);
+  pointer(surface.stage, "pointermove", 1, 170, 160);
+  expect(surface.card.style.transform).toBe("translate(70px, 10px) scale(2)");
+  pointer(surface.stage, "pointercancel", 1, 170, 160);
+  pointer(surface.stage, "pointermove", 1, 300, 260);
+  expect(surface.card.style.transform).toBe("translate(70px, 10px) scale(2)");
+  expect(surface.captured.size).toBe(0);
+
+  pointer(surface.stage, "pointerdown", 4, 140, 150);
+  pointer(surface.stage, "pointerdown", 5, 240, 150);
+  expect(surface.captured).toEqual(new Set([4, 5]));
+  pointer(surface.stage, "lostpointercapture", 4, 140, 150);
+  expect(surface.captured.size).toBe(0);
+  pointer(surface.stage, "pointermove", 5, 340, 150);
+  expect(surface.card.style.transform).toBe("translate(70px, 10px) scale(2)");
+
+  pointer(surface.stage, "pointerdown", 6, 140, 150);
+  pointer(surface.stage, "pointerdown", 7, 240, 150);
+  lifetime = new AbortController();
+  detail = { ...detail, source: "B", signal: lifetime.signal };
+  await render();
+  expect(surface.captured.size).toBe(0);
+  expect(surface.card.style.transform).toBe("translate(0px, 0px) scale(1)");
+  pointer(surface.stage, "pointermove", 7, 340, 150);
+  expect(surface.card.style.transform).toBe("translate(0px, 0px) scale(1)");
+});
+
+it("traps focus and closes only a stationary bare-backdrop gesture with explicit focus restoration", async () => {
+  vi.useFakeTimers();
+  Object.defineProperty(window, "requestAnimationFrame", { configurable: true, writable: true, value: vi.fn((callback: FrameRequestCallback) => { callback(0); return 1; }) });
+  const trigger = document.body.appendChild(document.createElement("button"));
+  const outside = document.body.appendChild(document.createElement("button"));
+  const host = document.body.appendChild(document.createElement("div"));
+  const root = createRoot(host); roots.push(root);
+  const onClose = vi.fn();
+  let lifetime = new AbortController();
+  let detail: WorkspaceMermaidOpenDetail = { svg, source: "A", returnFocus: trigger, signal: lifetime.signal, isCurrent: () => true };
+  const render = () => act(async () => root.render(<WorkspaceMermaidLightbox ownerKey="task" detail={detail} labels={labels} annotationLabels={annotationLabels} onClose={onClose} />));
+  trigger.focus();
+  await render();
+  const dialog = document.querySelector<HTMLElement>('[role="dialog"]')!;
+  expect(document.activeElement).toBe(dialog);
+  await act(async () => dialog.dispatchEvent(new KeyboardEvent("keydown", { key: "Tab", bubbles: true })));
+  expect(document.activeElement).toBe(document.querySelector<HTMLButtonElement>('button[aria-label="Zoom out"]'));
+  await act(async () => document.activeElement!.dispatchEvent(new KeyboardEvent("keydown", { key: "Tab", shiftKey: true, bubbles: true })));
+  expect(document.activeElement).toBe(document.querySelector<HTMLButtonElement>('button[aria-label="Close"]'));
+
+  const surface = mermaidGestureSurface();
+  pointer(surface.stage, "pointerdown", 1, 100, 100);
+  pointer(surface.stage, "pointerup", 1, 100, 100);
+  pointer(surface.stage, "pointerdown", 2, 10, 10);
+  pointer(surface.stage, "pointermove", 2, 30, 10);
+  pointer(surface.stage, "pointerup", 2, 30, 10);
+  pointer(surface.stage, "pointerdown", 3, 10, 20);
+  pointer(surface.stage, "pointerdown", 4, 30, 20);
+  pointer(surface.stage, "pointerup", 4, 30, 20);
+  pointer(surface.stage, "pointerup", 3, 10, 20);
+  await act(async () => vi.advanceTimersByTime(250));
+  expect(onClose).not.toHaveBeenCalled();
+
+  const beforeClose = surface.card.style.transform;
+  pointer(surface.stage, "pointerdown", 5, 10, 10);
+  pointer(surface.stage, "pointerup", 5, 10, 10);
+  expect(surface.captured.size).toBe(0);
+  act(() => surface.stage.dispatchEvent(new MouseEvent("dblclick", { bubbles: true })));
+  expect(surface.card.style.transform).toBe(beforeClose);
+  await act(async () => vi.advanceTimersByTime(250));
+  expect(onClose).toHaveBeenCalledOnce();
+  expect(document.activeElement).toBe(trigger);
+
+  lifetime = new AbortController();
+  detail = { ...detail, source: "B", signal: lifetime.signal };
+  await render();
+  outside.focus();
+  await act(async () => lifetime.abort());
+  expect(onClose).toHaveBeenCalledTimes(2);
+  expect(document.activeElement).toBe(outside);
+});
+
 it("hands a prepared diagram to one annotation surface and retires the owned image URL on close", async () => {
   const url = vi.fn(() => "blob:diagram-preview");
   const revoke = vi.fn();
@@ -168,5 +269,23 @@ function prepareWindow(win: Window & typeof globalThis): void {
   Object.defineProperty(win, "matchMedia", { configurable: true, value: vi.fn(() => ({ matches: false, addEventListener() {}, removeEventListener() {} })) });
   Object.defineProperty(win, "requestAnimationFrame", { configurable: true, writable: true, value: vi.fn(() => 1) });
   Object.defineProperty(win, "cancelAnimationFrame", { configurable: true, writable: true, value: vi.fn() });
+}
+function mermaidGestureSurface(ownerDocument: Document = document): { readonly stage: HTMLDivElement; readonly card: HTMLDivElement; readonly captured: Set<number> } {
+  const stage = ownerDocument.querySelector<HTMLDivElement>(".workspace-mermaid-lightbox__stage")!;
+  const card = ownerDocument.querySelector<HTMLDivElement>(".workspace-mermaid-lightbox__card")!;
+  const stageRect = { left: 0, top: 0, width: 400, height: 300, right: 400, bottom: 300, x: 0, y: 0, toJSON() { return {}; } };
+  const cardRect = { left: 50, top: 50, width: 300, height: 200, right: 350, bottom: 250, x: 50, y: 50, toJSON() { return {}; } };
+  vi.spyOn(stage, "getBoundingClientRect").mockReturnValue(stageRect);
+  vi.spyOn(card, "getBoundingClientRect").mockReturnValue(cardRect);
+  const captured = new Set<number>();
+  stage.setPointerCapture = (pointerId) => { captured.add(pointerId); };
+  stage.hasPointerCapture = (pointerId) => captured.has(pointerId);
+  stage.releasePointerCapture = (pointerId) => { captured.delete(pointerId); };
+  return { stage, card, captured };
+}
+function pointer(target: HTMLElement, type: string, pointerId: number, clientX: number, clientY: number, pointerType = "touch"): void {
+  const event = new target.ownerDocument.defaultView!.Event(type, { bubbles: true, cancelable: true });
+  Object.defineProperties(event, { pointerId: { value: pointerId }, pointerType: { value: pointerType }, button: { value: 0 }, clientX: { value: clientX }, clientY: { value: clientY } });
+  act(() => target.dispatchEvent(event));
 }
 function deferred<T>() { let resolve!: (value: T) => void; const promise = new Promise<T>((accept) => { resolve = accept; }); return { promise, resolve }; }
