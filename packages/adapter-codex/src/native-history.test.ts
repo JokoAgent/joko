@@ -135,6 +135,107 @@ describe("Codex native history projection", () => {
     expect(serialized).not.toContain("C:\\\\private\\\\image.png");
   });
 
+  it("keeps yielded execution boundaries non-terminal until the persisted wait chain settles", () => {
+    const privateOne = `joko-internal-yield:v1:${"a".repeat(64)}:1`;
+    const privateTwo = `joko-internal-yield:v1:${"b".repeat(64)}:2`;
+    const thread: NativeThread = { id: "yield-chain", turns: [
+      { id: "yield-origin", status: "completed", items: [
+        { id: "origin-user", type: "userMessage", clientId: "public-operation", content: [{ type: "text", text: "check" }] },
+        {
+          id: "origin-exec",
+          type: "commandExecution",
+          command: "pnpm check",
+          status: "completed",
+          aggregatedOutput: [
+            "Script running with cell ID 11\nWall time 1.0 seconds\nOutput:\n",
+            "Script running with cell ID 12\nWall time 1.0 seconds\nOutput:\n"
+          ].join("\n")
+        },
+        {
+          id: "origin-wait-11",
+          type: "function_call",
+          name: "wait",
+          arguments: JSON.stringify({ cell_id: "11" }),
+          content: [{ type: "output_text", text: "Script completed\nWall time 0.1 seconds\nOutput:\n" }]
+        },
+        { id: "origin-answer", type: "agentMessage", text: "waiting" }
+      ] },
+      { id: "yield-alive", status: "completed", items: [
+        { id: "private-user-one", type: "userMessage", clientId: privateOne, content: [{ type: "text", text: "private" }] },
+        {
+          id: "alive-wait-12",
+          type: "function_call",
+          name: "wait",
+          arguments: JSON.stringify({ cell_id: "12" }),
+          content: [{ type: "output_text", text: "Script running with cell ID 12\nWall time 2.0 seconds\nOutput:\n" }]
+        },
+        { id: "alive-answer", type: "agentMessage", text: "still waiting" }
+      ] },
+      { id: "yield-settled", status: "completed", items: [
+        { id: "private-user-two", type: "userMessage", clientId: privateTwo, content: [{ type: "text", text: "private" }] },
+        {
+          id: "settled-wait-12",
+          type: "function_call",
+          name: "wait",
+          arguments: JSON.stringify({ cell_id: "12" }),
+          content: [{ type: "output_text", text: "Script completed\nWall time 0.1 seconds\nOutput:\n" }]
+        },
+        { id: "settled-answer", type: "agentMessage", text: "done" }
+      ] },
+      { id: "near-prefix-turn", status: "completed", items: [
+        {
+          id: "near-prefix-user",
+          type: "userMessage",
+          clientId: `joko-internal-yield:v1:${"c".repeat(64)}:3`,
+          content: [{ type: "text", text: "ordinary user" }]
+        },
+        { id: "near-prefix-answer", type: "agentMessage", text: "ordinary answer" }
+      ] }
+    ] };
+
+    const projection = projectCodexNativeHistory(thread, { maximumEvents: 64 });
+    for (const entryId of ["origin-answer", "alive-answer"]) {
+      expect(projection.events.find((event) => event.nativeEntryId === entryId)?.metadata?.fields ?? {})
+        .not.toHaveProperty("nativeTerminalOutcome");
+    }
+    expect(projection.events.some((event) =>
+      event.projectionKind === "turn_status"
+      && (event.metadata?.fields as { turnId?: string } | undefined)?.turnId === "yield-origin")).toBe(false);
+    expect(projection.events.some((event) =>
+      event.projectionKind === "turn_status"
+      && (event.metadata?.fields as { turnId?: string } | undefined)?.turnId === "yield-alive")).toBe(false);
+    expect(projection.events.find((event) => event.nativeEntryId === "settled-answer")?.metadata?.fields)
+      .toMatchObject({ nativeTerminalOutcome: "completed" });
+    expect((projection.activeLineage ?? []).map((entry) => entry.entryId)).toEqual(expect.arrayContaining([
+      "private-user-one",
+      "private-user-two"
+    ]));
+    expect(projection.events.some((event) =>
+      event.nativeEntryId === "private-user-one" || event.nativeEntryId === "private-user-two")).toBe(false);
+    expect(projection.events.find((event) => event.nativeEntryId === "near-prefix-user")?.payload)
+      .toMatchObject({ type: "message_complete", role: "user" });
+  });
+
+  it("does not recover a completed product terminal from an origin turn whose yielded cell has no next turn", () => {
+    const projection = projectCodexNativeHistory({ id: "yield-crash-window", turns: [{
+      id: "crash-origin",
+      status: "completed",
+      items: [
+        {
+          id: "crash-command",
+          type: "commandExecution",
+          status: "completed",
+          aggregatedOutput: "Script running with cell ID 226\nWall time 1.0 seconds\nOutput:\n"
+        },
+        { id: "crash-answer", type: "agentMessage", text: "waiting" }
+      ]
+    }] }, { maximumEvents: 16 });
+
+    expect(projection.events.find((event) => event.nativeEntryId === "crash-answer")?.metadata?.fields ?? {})
+      .not.toHaveProperty("nativeTerminalOutcome");
+    expect(projection.events.some((event) => event.projectionKind === "turn_status")).toBe(false);
+  });
+
   it("fails closed on duplicate native identities or an event-bound overflow", () => {
     const duplicate: NativeThread = {
       id: "thread-duplicate",

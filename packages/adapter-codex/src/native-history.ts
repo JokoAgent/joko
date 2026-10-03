@@ -16,6 +16,12 @@ import {
 } from "./protocol.js";
 import { safeIdentifier, safeJson, safePath, safeText, toolIdentity } from "./translator.js";
 import { CODEX_FILE_CHANGE_FALLBACK, projectCodexFileChanges } from "./file-change.js";
+import {
+  extractAliveYieldCellsFromCodexItem,
+  extractSettledYieldCellIdsFromCodexItem,
+  extractYieldedExecCellsFromCodexItem,
+  isYieldContinuationClientId
+} from "./yielded-exec-cell.js";
 
 export interface CodexNativeHistoryProjectionOptions {
   readonly maximumEvents: number;
@@ -38,21 +44,31 @@ export function projectCodexNativeHistory(
   const events: NativeHistoryProjectedEvent[] = [];
   const activeLineage: { entryId: string; parentEntryId?: string }[] = [];
   const seenEntries = new Set<string>();
+  const intermediateYieldTurnIds = intermediateYieldTurns(thread);
   let parentEntryId: string | undefined;
 
   for (const turn of thread.turns) {
     assertHistoryIdentity(turn.id);
+    const intermediateYieldTurn = intermediateYieldTurnIds.has(turn.id);
     if (turn.items.length === 0) {
       appendLineage(turn.id);
-      appendEvents(turn.id, parentEntryId, turn, "turn", [turnStatusProjection(turn)]);
+      appendEvents(
+        turn.id,
+        parentEntryId,
+        turn,
+        "turn",
+        intermediateYieldTurn ? [] : [turnStatusProjection(turn)]
+      );
       parentEntryId = turn.id;
       continue;
     }
     for (const [index, item] of turn.items.entries()) {
       assertHistoryIdentity(item.id);
       appendLineage(item.id);
-      const projections = [...projectItem(item, turn)];
-      if (index === turn.items.length - 1) projections.push(turnStatusProjection(turn));
+      const projections = [...projectItem(item, turn, !intermediateYieldTurn)];
+      if (index === turn.items.length - 1 && !intermediateYieldTurn) {
+        projections.push(turnStatusProjection(turn));
+      }
       appendEvents(item.id, parentEntryId, turn, item.type, projections);
       parentEntryId = item.id;
     }
@@ -115,9 +131,14 @@ export function projectCodexNativeHistory(
   }
 }
 
-function projectItem(item: NativeThreadItem, turn: NativeTurn): readonly ItemProjection[] {
+function projectItem(
+  item: NativeThreadItem,
+  turn: NativeTurn,
+  terminalOutcomeAllowed: boolean
+): readonly ItemProjection[] {
   switch (item.type) {
     case "userMessage": {
+      if (isYieldContinuationClientId(item["clientId"])) return [];
       const blocks = userMessageBlocks(item);
       return [{
         kind: "message_user",
@@ -127,9 +148,9 @@ function projectItem(item: NativeThreadItem, turn: NativeTurn): readonly ItemPro
       }];
     }
     case "agentMessage":
-      return [assistantProjection(item, turn, "message_assistant")];
+      return [assistantProjection(item, turn, "message_assistant", terminalOutcomeAllowed)];
     case "plan":
-      return [assistantProjection(item, turn, "message_plan")];
+      return [assistantProjection(item, turn, "message_plan", terminalOutcomeAllowed)];
     case "reasoning":
       return reasoningProjections(item);
     case "functionCallOutput":
@@ -195,15 +216,40 @@ function projectItem(item: NativeThreadItem, turn: NativeTurn): readonly ItemPro
   }
 }
 
-function assistantProjection(item: NativeThreadItem, turn: NativeTurn, kind: string): ItemProjection {
+function assistantProjection(
+  item: NativeThreadItem,
+  turn: NativeTurn,
+  kind: string,
+  terminalOutcomeAllowed: boolean
+): ItemProjection {
   const text = safeTextValue(item["text"], "[Codex assistant message unavailable]", 1024 * 1024);
-  const outcome = terminalOutcome(turn.status);
+  const outcome = terminalOutcomeAllowed ? terminalOutcome(turn.status) : undefined;
   return {
     kind,
     contentIndex: 0,
     payload: { type: "message_complete", role: "assistant", blocks: [{ kind: "text", text }] },
     ...(outcome === undefined ? {} : { fields: { nativeTerminalOutcome: outcome } })
   };
+}
+
+function intermediateYieldTurns(thread: NativeThread): ReadonlySet<string> {
+  const result = new Set<string>();
+  const outstanding = new Map<string, { readonly cellId: string; readonly command?: string }>();
+  for (const turn of thread.turns) {
+    const hasPublicUserBoundary = turn.items.some((item) =>
+      item.type === "userMessage" && !isYieldContinuationClientId(item["clientId"]));
+    if (hasPublicUserBoundary && outstanding.size > 0) outstanding.clear();
+    for (const item of turn.items) {
+      for (const cell of [
+        ...extractYieldedExecCellsFromCodexItem(item),
+        ...extractAliveYieldCellsFromCodexItem(item)
+      ]) outstanding.set(cell.cellId, cell);
+      for (const cellId of extractSettledYieldCellIdsFromCodexItem(item)) outstanding.delete(cellId);
+    }
+    if (turn.status === "completed" && outstanding.size > 0) result.add(turn.id);
+    if (turn.status === "failed" || turn.status === "interrupted") outstanding.clear();
+  }
+  return result;
 }
 
 function reasoningProjections(item: NativeThreadItem): readonly ItemProjection[] {

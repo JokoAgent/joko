@@ -668,6 +668,490 @@ describe("CodexBackendAdapter", () => {
     expect(events.at(-1)).toEqual({ type: "done", outcome: "completed" });
   });
 
+  it("continues an existing yielded exec cell without publishing an intermediate product terminal", async () => {
+    const setup = await createSetup();
+    await setup.adapter.describe();
+    const events: EventPayload[] = [];
+    const binding = await setup.adapter.createSession(
+      sessionInput(setup.target),
+      context(setup.target, events, { backendInstanceGeneration: 7 })
+    );
+    const owner = context(setup.target, events, {
+      binding,
+      backendInstanceGeneration: 7,
+      operationId: "yield-owner"
+    });
+    await setup.adapter.send(prompt("run the check"), owner);
+    const thread = setup.fake.threads.get(binding.nativeSessionId!)!;
+    const origin = thread.turns.at(-1)!;
+    const originTurnId = String(origin["id"]);
+    const yielded = {
+      id: "yielded-command",
+      type: "commandExecution",
+      command: "pnpm check",
+      status: "completed",
+      aggregatedOutput: "Script running with cell ID 226\nWall time 10.0 seconds\nOutput:\n"
+    };
+    (origin["items"] as JsonObject[]).push(yielded);
+    await setup.fake.transport!.emitNotification("item/completed", {
+      threadId: binding.nativeSessionId!, turnId: originTurnId, item: yielded
+    });
+    origin["status"] = "completed";
+    thread.status = { type: "idle" };
+    await setup.fake.transport!.emitNotification("turn/completed", {
+      threadId: binding.nativeSessionId!, turn: origin
+    });
+
+    await vi.waitFor(() => expect(setup.fake.transport!.requests
+      .filter((request) => request.method === "turn/start")).toHaveLength(2));
+    expect(events.filter((event) => event.type === "done")).toEqual([]);
+    const continuationRequest = setup.fake.transport!.requests
+      .filter((request) => request.method === "turn/start").at(-1)!;
+    expect((continuationRequest.params as JsonObject)["clientUserMessageId"])
+      .toMatch(/^joko-internal-yield:v1:[0-9a-f]{64}:1$/);
+    expect((continuationRequest.params as JsonObject)["clientUserMessageId"]).not.toBe("yield-owner");
+    expect(JSON.stringify((continuationRequest.params as JsonObject)["input"]))
+      .toContain("Do not rerun the command");
+
+    const continuation = thread.turns.at(-1)!;
+    const continuationTurnId = String(continuation["id"]);
+    const settled = {
+      id: "wait-for-yielded-command",
+      type: "function_call",
+      name: "wait",
+      arguments: JSON.stringify({ cell_id: "226" }),
+      content: [{ type: "output_text", text: "Script completed\nWall time 0.1 seconds\nOutput:\n" }]
+    };
+    (continuation["items"] as JsonObject[]).push(settled);
+    await setup.fake.transport!.emitNotification("item/completed", {
+      threadId: binding.nativeSessionId!, turnId: continuationTurnId, item: settled
+    });
+    continuation["status"] = "completed";
+    thread.status = { type: "idle" };
+    await setup.fake.transport!.emitNotification("turn/completed", {
+      threadId: binding.nativeSessionId!, turn: continuation
+    });
+
+    expect(events.filter((event) => event.type === "done")).toEqual([
+      { type: "done", outcome: "completed" }
+    ]);
+    await expect(setup.adapter.inspectSession(binding, owner)).resolves.toMatchObject({ streaming: false });
+  });
+
+  it("keeps the yielded-product gap busy and preserves the originating execution controls", async () => {
+    const setup = await createSetup();
+    await setup.adapter.describe();
+    const events: EventPayload[] = [];
+    const binding = await setup.adapter.createSession(
+      sessionInput(setup.target),
+      context(setup.target, events, { backendInstanceGeneration: 7 })
+    );
+    const owner = context(setup.target, events, {
+      binding,
+      backendInstanceGeneration: 7,
+      operationId: "yield-controls-owner"
+    });
+    await setup.adapter.setPlanMode(true, { ...owner, operationId: "enable-plan-before-yield" });
+    await setup.adapter.send(prompt("run in the fixed mode"), owner);
+    await completeCurrentTurnWithYield(setup.fake, binding.nativeSessionId!);
+    await vi.waitFor(() => expect(setup.fake.transport!.requests
+      .filter((request) => request.method === "turn/start")).toHaveLength(2));
+
+    const busy = { publicError: { code: "CODEX_YIELD_CONTINUATION_ACTIVE", stateMayHaveChanged: false } };
+    await expect(setup.adapter.send(prompt("replacement"), {
+      ...owner,
+      operationId: "replacement-during-yield"
+    })).rejects.toMatchObject(busy);
+    await expect(setup.adapter.send({ ...prompt("steer"), disposition: "steer" }, {
+      ...owner,
+      operationId: "steer-during-yield"
+    })).rejects.toMatchObject(busy);
+    await expect(setup.adapter.setModel("openai", "gpt-test", {
+      ...owner,
+      operationId: "model-during-yield"
+    })).rejects.toMatchObject(busy);
+    await expect(setup.adapter.setPermissionMode("bypassPermissions", {
+      ...owner,
+      operationId: "permission-during-yield"
+    })).rejects.toMatchObject(busy);
+    await expect(setup.adapter.setPlanMode(false, {
+      ...owner,
+      operationId: "plan-during-yield"
+    })).rejects.toMatchObject(busy);
+
+    const continuation = setup.fake.transport!.requests
+      .filter((request) => request.method === "turn/start").at(-1)!;
+    expect(continuation.params).toMatchObject({
+      model: "gpt-test",
+      collaborationMode: { mode: "plan" },
+      sandboxPolicy: { type: "workspaceWrite" }
+    });
+    await completeCurrentYieldWait(setup.fake, binding.nativeSessionId!);
+    expect(events.filter((event) => event.type === "done")).toEqual([
+      { type: "done", outcome: "completed" }
+    ]);
+  });
+
+  it("reserves only the exact adapter-private continuation operation identity", async () => {
+    const setup = await createSetup();
+    const events: EventPayload[] = [];
+    const binding = await setup.adapter.createSession(
+      sessionInput(setup.target),
+      context(setup.target, events, { backendInstanceGeneration: 7 })
+    );
+    const exact = `joko-internal-yield:v1:${"a".repeat(64)}:1`;
+    await expect(setup.adapter.send(prompt("must stay public"), context(setup.target, events, {
+      binding,
+      backendInstanceGeneration: 7,
+      operationId: exact
+    }))).rejects.toMatchObject({ publicError: { code: "CODEX_OPERATION_ID_RESERVED" } });
+    expect(setup.fake.transport!.requests.filter((request) => request.method === "turn/start")).toEqual([]);
+
+    const nearPrefix = `joko-internal-yield:v1:${"b".repeat(64)}:3`;
+    await setup.adapter.send(prompt("ordinary operation"), context(setup.target, events, {
+      binding,
+      backendInstanceGeneration: 7,
+      operationId: nearPrefix
+    }));
+    expect(setup.fake.transport!.requests.find((request) => request.method === "turn/start")?.params)
+      .toMatchObject({ clientUserMessageId: nearPrefix });
+    await setup.fake.completeTurn(binding.nativeSessionId!);
+  });
+
+  it("does not let foreign root notifications take ownership from a starting yield continuation", async () => {
+    const setup = await createSetup();
+    const events: EventPayload[] = [];
+    const binding = await setup.adapter.createSession(
+      sessionInput(setup.target),
+      context(setup.target, events, { backendInstanceGeneration: 7 })
+    );
+    const owner = context(setup.target, events, {
+      binding,
+      backendInstanceGeneration: 7,
+      operationId: "yield-foreign-owner"
+    });
+    await setup.adapter.send(prompt("run once"), owner);
+    const transport = setup.fake.transport!;
+    const nativeRequest = transport.request.bind(transport);
+    let releaseContinuation!: () => void;
+    let markContinuationEntered!: () => void;
+    const continuationRelease = new Promise<void>((resolve) => { releaseContinuation = resolve; });
+    const continuationEntered = new Promise<void>((resolve) => { markContinuationEntered = resolve; });
+    vi.spyOn(transport, "request").mockImplementation(async (method, params, options) => {
+      const clientId = (params as JsonObject | undefined)?.["clientUserMessageId"];
+      if (method === "turn/start" && typeof clientId === "string" && clientId.startsWith("joko-internal-yield:v1:")) {
+        markContinuationEntered();
+        await continuationRelease;
+      }
+      return nativeRequest(method, params, options);
+    });
+
+    await completeCurrentTurnWithYield(setup.fake, binding.nativeSessionId!);
+    await continuationEntered;
+    await transport.emitNotification("turn/started", {
+      threadId: binding.nativeSessionId!,
+      turn: { id: "foreign-turn", status: "inProgress", items: [], error: null }
+    });
+    await transport.emitNotification("turn/completed", {
+      threadId: binding.nativeSessionId!,
+      turn: {
+        id: "foreign-turn",
+        status: "completed",
+        items: [{ id: "foreign-user", type: "userMessage", clientId: "foreign-operation", content: [] }],
+        error: null
+      }
+    });
+    expect(events.filter((event) => event.type === "done")).toEqual([]);
+
+    releaseContinuation();
+    await vi.waitFor(() => expect(transport.requests
+      .filter((request) => request.method === "turn/start")).toHaveLength(2));
+    await completeCurrentYieldWait(setup.fake, binding.nativeSessionId!);
+    expect(events.filter((event) => event.type === "done")).toEqual([
+      { type: "done", outcome: "completed" }
+    ]);
+  });
+
+  it("settles a private completion before its start response and schedules the bounded alive retry", async () => {
+    const setup = await createSetup();
+    const events: EventPayload[] = [];
+    const binding = await setup.adapter.createSession(
+      sessionInput(setup.target),
+      context(setup.target, events, { backendInstanceGeneration: 7 })
+    );
+    const owner = context(setup.target, events, {
+      binding,
+      backendInstanceGeneration: 7,
+      operationId: "yield-early-terminal-owner"
+    });
+    await setup.adapter.send(prompt("run once"), owner);
+    const transport = setup.fake.transport!;
+    const nativeRequest = transport.request.bind(transport);
+    let intercepted = false;
+    vi.spyOn(transport, "request").mockImplementation(async (method, params, options) => {
+      const record = params as JsonObject | undefined;
+      const clientId = record?.["clientUserMessageId"];
+      if (!intercepted && method === "turn/start" && typeof clientId === "string"
+        && clientId.startsWith("joko-internal-yield:v1:")) {
+        intercepted = true;
+        const requestOptions = options ?? {};
+        requestOptions.beforeDispatch?.();
+        transport.requests.push({ method, params, options: requestOptions });
+        const thread = setup.fake.threads.get(binding.nativeSessionId!)!;
+        const turn: JsonObject = {
+          id: "private-completed-before-response",
+          status: "completed",
+          items: [
+            { id: "private-early-user", type: "userMessage", clientId, content: record?.["input"] ?? [] },
+            {
+              id: "private-early-wait",
+              type: "function_call",
+              name: "wait",
+              arguments: JSON.stringify({ cell_id: "226" }),
+              content: [{
+                type: "output_text",
+                text: "Script running with cell ID 226\nWall time 2.0 seconds\nOutput:\n"
+              }]
+            }
+          ],
+          error: null
+        };
+        thread.turns.push(turn);
+        thread.status = { type: "idle" };
+        await transport.emitNotification("turn/completed", { threadId: thread.id, turn });
+        return { turn };
+      }
+      return nativeRequest(method, params, options);
+    });
+
+    await completeCurrentTurnWithYield(setup.fake, binding.nativeSessionId!);
+    await vi.waitFor(() => expect(transport.requests
+      .filter((request) => request.method === "turn/start")).toHaveLength(3));
+    const privateIds = transport.requests
+      .filter((request) => request.method === "turn/start")
+      .map((request) => (request.params as JsonObject)["clientUserMessageId"])
+      .filter((value): value is string => typeof value === "string" && value.startsWith("joko-internal-yield:v1:"));
+    expect(privateIds).toEqual([
+      expect.stringMatching(/:1$/),
+      expect.stringMatching(/:2$/)
+    ]);
+    expect(events.filter((event) => event.type === "done")).toEqual([]);
+    await completeCurrentYieldWait(setup.fake, binding.nativeSessionId!);
+    expect(events.filter((event) => event.type === "done")).toEqual([
+      { type: "done", outcome: "completed" }
+    ]);
+  });
+
+  it("stops an active yielded continuation with one authoritative aborted terminal", async () => {
+    const setup = await createSetup();
+    const events: EventPayload[] = [];
+    const binding = await setup.adapter.createSession(
+      sessionInput(setup.target),
+      context(setup.target, events, { backendInstanceGeneration: 7 })
+    );
+    const owner = context(setup.target, events, {
+      binding,
+      backendInstanceGeneration: 7,
+      operationId: "yield-stop-owner"
+    });
+    await setup.adapter.send(prompt("run once"), owner);
+    await completeCurrentTurnWithYield(setup.fake, binding.nativeSessionId!);
+    await vi.waitFor(() => expect(setup.fake.transport!.requests
+      .filter((request) => request.method === "turn/start")).toHaveLength(2));
+    const continuation = setup.fake.threads.get(binding.nativeSessionId!)!.turns.at(-1)!;
+    const continuationTurnId = String(continuation["id"]);
+
+    await setup.adapter.abort(owner);
+    expect(setup.fake.transport!.requests.findLast((request) => request.method === "turn/interrupt")?.params)
+      .toMatchObject({ threadId: binding.nativeSessionId, turnId: continuationTurnId });
+    expect(events.filter((event) => event.type === "done")).toEqual([
+      { type: "done", outcome: "aborted" }
+    ]);
+
+    continuation["status"] = "interrupted";
+    await setup.fake.transport!.emitNotification("turn/completed", {
+      threadId: binding.nativeSessionId!,
+      turn: continuation
+    });
+    expect(events.filter((event) => event.type === "done")).toEqual([
+      { type: "done", outcome: "aborted" }
+    ]);
+  });
+
+  it("does not schedule another yielded attempt while Stop awaits the interrupt acknowledgement", async () => {
+    const setup = await createSetup();
+    const events: EventPayload[] = [];
+    const binding = await setup.adapter.createSession(
+      sessionInput(setup.target),
+      context(setup.target, events, { backendInstanceGeneration: 7 })
+    );
+    const owner = context(setup.target, events, {
+      binding,
+      backendInstanceGeneration: 7,
+      operationId: "yield-stop-ack-race-owner"
+    });
+    await setup.adapter.send(prompt("run once"), owner);
+    await completeCurrentTurnWithYield(setup.fake, binding.nativeSessionId!);
+    await vi.waitFor(() => expect(setup.fake.transport!.requests
+      .filter((request) => request.method === "turn/start")).toHaveLength(2));
+
+    const transport = setup.fake.transport!;
+    const nativeRequest = transport.request.bind(transport);
+    let markInterruptEntered!: () => void;
+    let releaseInterrupt!: () => void;
+    const interruptEntered = new Promise<void>((resolve) => { markInterruptEntered = resolve; });
+    const interruptRelease = new Promise<void>((resolve) => { releaseInterrupt = resolve; });
+    vi.spyOn(transport, "request").mockImplementation(async (method, params, options) => {
+      if (method === "turn/interrupt") {
+        markInterruptEntered();
+        await interruptRelease;
+      }
+      return nativeRequest(method, params, options);
+    });
+
+    const stopping = setup.adapter.abort(owner);
+    await interruptEntered;
+    await completeCurrentYieldWait(setup.fake, binding.nativeSessionId!, "226", true);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(transport.requests.filter((request) => request.method === "turn/start")).toHaveLength(2);
+    expect(events.filter((event) => event.type === "done")).toEqual([]);
+
+    releaseInterrupt();
+    await stopping;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(transport.requests.filter((request) => request.method === "turn/start")).toHaveLength(2);
+    expect(events.filter((event) => event.type === "done")).toEqual([
+      { type: "done", outcome: "aborted" }
+    ]);
+  });
+
+  it("waits for an accepted continuation start identity before completing Stop", async () => {
+    const setup = await createSetup();
+    const events: EventPayload[] = [];
+    const binding = await setup.adapter.createSession(
+      sessionInput(setup.target),
+      context(setup.target, events, { backendInstanceGeneration: 7 })
+    );
+    const owner = context(setup.target, events, {
+      binding,
+      backendInstanceGeneration: 7,
+      operationId: "yield-stop-starting-owner"
+    });
+    await setup.adapter.send(prompt("run once"), owner);
+    const transport = setup.fake.transport!;
+    const nativeRequest = transport.request.bind(transport);
+    let releaseStart!: () => void;
+    let markStartEntered!: () => void;
+    const startRelease = new Promise<void>((resolve) => { releaseStart = resolve; });
+    const startEntered = new Promise<void>((resolve) => { markStartEntered = resolve; });
+    vi.spyOn(transport, "request").mockImplementation(async (method, params, options) => {
+      const clientId = (params as JsonObject | undefined)?.["clientUserMessageId"];
+      if (method === "turn/start" && typeof clientId === "string" && clientId.startsWith("joko-internal-yield:v1:")) {
+        markStartEntered();
+        await startRelease;
+      }
+      return nativeRequest(method, params, options);
+    });
+
+    await completeCurrentTurnWithYield(setup.fake, binding.nativeSessionId!);
+    await startEntered;
+    const stopping = setup.adapter.abort(owner);
+    expect(events.filter((event) => event.type === "done")).toEqual([]);
+    releaseStart();
+    await stopping;
+    expect(setup.fake.transport!.requests.findLast((request) => request.method === "turn/interrupt")?.params)
+      .toMatchObject({ threadId: binding.nativeSessionId, turnId: "turn-2" });
+    expect(events.filter((event) => event.type === "done")).toEqual([
+      { type: "done", outcome: "aborted" }
+    ]);
+  });
+
+  it("fails closed without an aborted terminal when a yielded Stop acknowledgement is unknown", async () => {
+    const setup = await createSetup();
+    const events: EventPayload[] = [];
+    const binding = await setup.adapter.createSession(
+      sessionInput(setup.target),
+      context(setup.target, events, { backendInstanceGeneration: 7 })
+    );
+    const owner = context(setup.target, events, {
+      binding,
+      backendInstanceGeneration: 7,
+      operationId: "yield-stop-unknown-owner"
+    });
+    await setup.adapter.send(prompt("run once"), owner);
+    await completeCurrentTurnWithYield(setup.fake, binding.nativeSessionId!);
+    await vi.waitFor(() => expect(setup.fake.transport!.requests
+      .filter((request) => request.method === "turn/start")).toHaveLength(2));
+    const transport = setup.fake.transport!;
+    const nativeRequest = transport.request.bind(transport);
+    vi.spyOn(transport, "request").mockImplementation(async (method, params, options) => {
+      if (method === "turn/interrupt") {
+        options?.beforeDispatch?.();
+        transport.requests.push({ method, params, options: options ?? {} });
+        throw new TransportFault("request_timeout", "interrupt acknowledgement lost", {
+          stateMayHaveChanged: true
+        });
+      }
+      return nativeRequest(method, params, options);
+    });
+
+    await expect(setup.adapter.abort(owner)).rejects.toMatchObject({
+      publicError: { code: "CODEX_YIELD_CONTINUATION_STOP_UNKNOWN", stateMayHaveChanged: true }
+    });
+    expect(events.filter((event) => event.type === "done")).toEqual([
+      { type: "done", outcome: "failed" }
+    ]);
+    expect(events.filter((event) => event.type === "error" && event.terminal)).toEqual([
+      expect.objectContaining({ error: expect.objectContaining({ code: "CODEX_YIELD_CONTINUATION_STOP_UNKNOWN" }) })
+    ]);
+  });
+
+  it("retires an awaiting yielded gap exactly once when native authentication is revoked", async () => {
+    const setup = await createSetup();
+    const events: EventPayload[] = [];
+    const binding = await setup.adapter.createSession(
+      sessionInput(setup.target),
+      context(setup.target, events, { backendInstanceGeneration: 7 })
+    );
+    const owner = context(setup.target, events, {
+      binding,
+      backendInstanceGeneration: 7,
+      operationId: "yield-auth-gap-owner"
+    });
+    await setup.adapter.send(prompt("run once"), owner);
+    const thread = setup.fake.threads.get(binding.nativeSessionId!)!;
+    const turn = thread.turns.at(-1)!;
+    const turnId = String(turn["id"]);
+    const yielded = {
+      id: "yield-auth-gap-command",
+      type: "commandExecution",
+      status: "completed",
+      aggregatedOutput: "Script running with cell ID 226\nWall time 1.0 seconds\nOutput:\n"
+    };
+    (turn["items"] as JsonObject[]).push(yielded);
+    await setup.fake.transport!.emitNotification("item/completed", {
+      threadId: binding.nativeSessionId!, turnId, item: yielded
+    });
+    turn["status"] = "completed";
+    thread.status = { type: "idle" };
+    await setup.fake.transport!.emitNotification("turn/completed", {
+      threadId: binding.nativeSessionId!, turn
+    });
+    await setup.adapter.revokeProviderAuthentication("openai");
+
+    expect(events.filter((event) => event.type === "error" && event.terminal)).toEqual([
+      expect.objectContaining({ error: expect.objectContaining({ code: "CODEX_PROVIDER_AUTHENTICATION_REVOKED" }) })
+    ]);
+    expect(events.filter((event) => event.type === "done")).toEqual([
+      { type: "done", outcome: "failed" }
+    ]);
+    expect(setup.fake.transport!.requests.filter((request) => {
+      const clientId = (request.params as JsonObject | undefined)?.["clientUserMessageId"];
+      return request.method === "turn/start" && typeof clientId === "string"
+        && clientId.startsWith("joko-internal-yield:v1:");
+    })).toEqual([]);
+  });
+
   it("reconciles a lost turn/start response by clientUserMessageId without retrying", async () => {
     const setup = await createSetup();
     await setup.adapter.describe();
@@ -4806,6 +5290,55 @@ async function createRewindSetup(adapterOptions: Omit<CodexAdapterOptions, "id" 
 
 function historyTurn(index: number, text = "answer"): JsonObject {
   return { id: `history-turn-${index}`, status: "completed", items: [{ type: "agentMessage", id: `history-item-${index}`, text }], error: null };
+}
+
+async function completeCurrentTurnWithYield(
+  fake: FakeCodexAppServer,
+  threadId: string,
+  cellId = "226"
+): Promise<{ readonly turn: JsonObject; readonly turnId: string }> {
+  const thread = fake.threads.get(threadId)!;
+  const turn = thread.turns.at(-1)!;
+  const turnId = String(turn["id"]);
+  const item = {
+    id: `yielded-${turnId}-${cellId}`,
+    type: "commandExecution",
+    command: "pnpm check",
+    status: "completed",
+    aggregatedOutput: `Script running with cell ID ${cellId}\nWall time 1.0 seconds\nOutput:\n`
+  };
+  (turn["items"] as JsonObject[]).push(item);
+  await fake.transport!.emitNotification("item/completed", { threadId, turnId, item });
+  turn["status"] = "completed";
+  thread.status = { type: "idle" };
+  await fake.transport!.emitNotification("turn/completed", { threadId, turn });
+  return { turn, turnId };
+}
+
+async function completeCurrentYieldWait(
+  fake: FakeCodexAppServer,
+  threadId: string,
+  cellId = "226",
+  alive = false
+): Promise<{ readonly turn: JsonObject; readonly turnId: string }> {
+  const thread = fake.threads.get(threadId)!;
+  const turn = thread.turns.at(-1)!;
+  const turnId = String(turn["id"]);
+  const item = {
+    id: `wait-${turnId}-${cellId}`,
+    type: "function_call",
+    name: "wait",
+    arguments: JSON.stringify({ cell_id: cellId }),
+    content: [{ type: "output_text", text: alive
+      ? `Script running with cell ID ${cellId}\nWall time 2.0 seconds\nOutput:\n`
+      : "Script completed\nWall time 0.1 seconds\nOutput:\n" }]
+  };
+  (turn["items"] as JsonObject[]).push(item);
+  await fake.transport!.emitNotification("item/completed", { threadId, turnId, item });
+  turn["status"] = "completed";
+  thread.status = { type: "idle" };
+  await fake.transport!.emitNotification("turn/completed", { threadId, turn });
+  return { turn, turnId };
 }
 
 function sessionInput(target: TargetDescriptor): CreateNativeSessionInput {
