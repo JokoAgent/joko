@@ -12,7 +12,7 @@ import {
   type PiProcessHandle,
   type PiProcessSpec
 } from "@joko/adapter-pi";
-import type { RemoteWorkspaceBinding } from "@joko/core";
+import type { AdapterContext, NativeSessionDerivationLifecycle, RemoteWorkspaceBinding } from "@joko/core";
 import { DEVICE_PEER_RUNTIME_EXECUTABLES } from "@joko/device-peer";
 import type {
   RemoteDirectoryEntry,
@@ -47,6 +47,79 @@ afterEach(async () => {
 });
 
 describe("RemotePiProcessFactory", () => {
+  it.each(["cleanup", "unknown", "adopt"] as const)("keeps the exact remote navigation receipt across restart for %s", async (outcome) => {
+    const fixture = await mkdtemp(join(tmpdir(), "joko-remote-pi-navigation-"));
+    temporaryDirectories.push(fixture);
+    const sessions = join(fixture, "sessions");
+    const runtime = join(fixture, "runtime");
+    await Promise.all([mkdir(sessions), mkdir(runtime)]);
+    const files = new PiMemoryRemoteFiles();
+    await files.mkdir("/workspace", { recursive: true });
+    await files.mkdir("/home/maker", { recursive: true });
+    await seedRemoteNativeSession(files, testNativeSession());
+    const bridge = new ManualRemoteProcess();
+    const processRequests: RemoteProcessStartRequest[] = [];
+    const registry = { transports: async () => ({ host: {}, lease: {
+      capabilities: { commandExecution: true, processStreaming: true, fileTransfer: true, tcpForwarding: false, interactiveTerminal: false },
+      files, processes: { open: async (request: RemoteProcessStartRequest) => {
+        processRequests.push(request);
+        return request.args[1] === "kill" ? new ManualRemoteProcess() : bridge;
+      } }
+    } }) } as unknown as RemoteHostRegistry;
+    const operationId = `navigation-${outcome}`;
+    const sourceBinding = { opaqueRef: join(sessions, "native.jsonl"), nativeSessionId: "native", generation: 1 };
+    const binding = { opaqueRef: join(sessions, "replacement.jsonl"), nativeSessionId: "replacement", generation: 2 };
+    const shadowSessionId = `navigate-shadow-${createHash("sha256").update(operationId).digest("hex")}`;
+    const target = { id: "target-a", backendId: "pi", workspaceRoot: "/workspace", remoteWorkspace: TEST_REMOTE_WORKSPACE,
+      displayName: "Remote", trusted: true, managed: true };
+    const context = { operationId, sessionId: "source-session", target, signal: new AbortController().signal } as AdapterContext;
+    const lifecycle: NativeSessionDerivationLifecycle & { binding: typeof binding } = { operationId, kind: "navigate",
+      sourceSessionId: context.sessionId, sessionId: context.sessionId, sourceBinding, binding, sourceTarget: target, target };
+    const authorityRoot = join(fixture, "authority");
+    const factory = remoteFactory(registry, authorityRoot);
+    await factory.navigationOwner.prepare({ context, binding, sourceBinding, shadowSessionId, localSessionsRoot: sessions });
+    await expect(factory.navigationOwner.prepare({ context, binding, sourceBinding, shadowSessionId, localSessionsRoot: sessions })).rejects.toThrow("cannot be replayed");
+    const receiptPath = join(authorityRoot, "navigation", `${createHash("sha256").update(operationId).digest("hex")}.json`);
+    const receipt = JSON.parse(await readFile(receiptPath, "utf8")) as Record<string, any>;
+    expect(receipt).toMatchObject({ operationId, sourceBinding, binding, shadowSessionId, state: "prepared", shadowStarted: false });
+    expect(files.text(receipt.remoteSessionPath)).toContain('"id":"replacement"');
+    let mapped: PiProcessHandle | undefined;
+    if (outcome !== "cleanup") {
+      await factory.navigationOwner.beginShadow(context);
+      if (outcome === "adopt") {
+        const cli = join(fixture, "pi-cli.mjs");
+        const control = join(runtime, "control.json");
+        await Promise.all([writeFile(cli, "export {};"), writeFile(control, '{"generation":2}'),
+          writeFile(binding.opaqueRef, `${JSON.stringify({ type: "session", version: 3, id: "replacement", timestamp: new Date(0).toISOString(), cwd: "/workspace" })}\n`)]);
+        mapped = await factory.create({ command: process.execPath, args: [cli, "--session", binding.opaqueRef], cwd: "/workspace",
+          env: { JOKO_PI_TARGET_ID: "target-a", JOKO_PI_SPAWN_IDENTITY: "a".repeat(64),
+            JOKO_PI_REMOTE_RECOVERY_IDENTITY: testRecoveryIdentity(shadowSessionId, "target-a", TEST_REMOTE_WORKSPACE),
+            JOKO_PI_GENERATION: "2", JOKO_PI_CONTROL_FILE: control, PI_CODING_AGENT_SESSION_DIR: sessions }, remoteWorkspace: TEST_REMOTE_WORKSPACE });
+      }
+    }
+    const restarted = remoteFactory(registry, authorityRoot);
+    if (outcome === "unknown") {
+      await expect(restarted.navigationOwner.cleanup(lifecycle, context.signal)).rejects.toThrow("retirement is uncertain");
+      expect(files.has(receipt.remoteSessionPath)).toBe(true);
+      expect(processRequests).toHaveLength(0);
+    } else {
+      if (outcome === "adopt") {
+        await restarted.navigationOwner.adopt(lifecycle, context.signal);
+        expect(processRequests.filter((request) => request.args[1] === "kill")).toHaveLength(1);
+        expect(files.has(receipt.remoteSessionPath)).toBe(true);
+        await restarted.navigationOwner.adopt(lifecycle, context.signal);
+        expect(processRequests.filter((request) => request.args[1] === "kill")).toHaveLength(1);
+        const terminal = new Promise<void>((resolveExit) => mapped!.once("exit", () => resolveExit()));
+        bridge.stdout.write(testFrame(4, 1, terminalContent(0, null))); bridge.complete(0); await terminal;
+      } else {
+        await restarted.navigationOwner.cleanup(lifecycle, context.signal);
+        await restarted.navigationOwner.cleanup(lifecycle, context.signal);
+        expect(files.has(receipt.remoteSessionPath)).toBe(false);
+      }
+      expect(JSON.parse(await readFile(receiptPath, "utf8")).state).toBe(outcome === "adopt" ? "adopted" : "cleaned");
+    }
+    expect(files.text(files.paths.join(receipt.remoteSessionsRoot, "native.jsonl"))).toBe(testNativeSession());
+  });
   it("routes a Win32 Device-peer Pi broker through the reserved Node locator with native target paths", async () => {
     const fixture = await mkdtemp(join(tmpdir(), "joko-remote-pi-peer-win32-"));
     temporaryDirectories.push(fixture);
@@ -485,7 +558,7 @@ describe("RemotePiProcessFactory", () => {
     await Promise.all([
       writeFile(control, JSON.stringify({ generation: 1 }), { mode: 0o600 }),
       writeFile(cli, "export const snapshot = 'original';\n", { mode: 0o600 }),
-      writeFile(nativeSession, '{"type":"session","snapshot":"original"}\n', { mode: 0o600 })
+      writeFile(nativeSession, testNativeSession("original"), { mode: 0o600 })
     ]);
     let mutated = false;
     const files = new PiMemoryRemoteFiles(async (request) => {
@@ -493,11 +566,12 @@ describe("RemotePiProcessFactory", () => {
       mutated = true;
       await Promise.all([
         writeFile(cli, "export const snapshot = 'mutated';\n", { mode: 0o600 }),
-        writeFile(nativeSession, '{"type":"session","snapshot":"mutated"}\n', { mode: 0o600 })
+        writeFile(nativeSession, testNativeSession("mutated"), { mode: 0o600 })
       ]);
     });
     await files.mkdir("/workspace", { recursive: true });
     await files.mkdir("/home/maker", { recursive: true });
+    await seedRemoteNativeSession(files, testNativeSession("original"));
     const bridge = new ManualRemoteProcess();
     const lease: RemoteSshTransportLease = {
       capabilities: {
@@ -533,7 +607,7 @@ describe("RemotePiProcessFactory", () => {
     expect(mutated).toBe(true);
     expect(files.text(bootstrap.args[0])).toBe("export const snapshot = 'original';\n");
     expect(files.text(bootstrap.args[sessionIndex + 1])).toBe(
-      '{"type":"session","snapshot":"original"}\n'
+      testNativeSession("original")
     );
     expect(files.readPaths).toContain(bootstrap.args[0]);
     expect(files.readPaths).toContain(bootstrap.args[sessionIndex + 1]);
@@ -690,7 +764,7 @@ describe("RemotePiProcessFactory", () => {
       writeFile(controlOne, JSON.stringify({ generation: 1 }), { mode: 0o600 }),
       writeFile(controlTwo, JSON.stringify({ generation: 2 }), { mode: 0o600 }),
       writeFile(cli, "export {};", { mode: 0o600 }),
-      writeFile(nativeSession, '{"type":"session"}\n', { mode: 0o600 }),
+      writeFile(nativeSession, testNativeSession(), { mode: 0o600 }),
       ...[agentHomeOne, agentHomeTwo].flatMap((agentHome) => [
         writeFile(join(agentHome, "models.json"), '{"providers":[]}\n', { mode: 0o600 }),
         writeFile(join(agentHome, "settings.json"), '{"theme":"dark"}\n', { mode: 0o600 })
@@ -756,7 +830,8 @@ describe("RemotePiProcessFactory", () => {
     await waitUntil(() => firstBridge.input.some((entry, index) =>
       index > 0 && decodeTestFrame(entry).type === 1));
     firstBridge.stdout.write(testFrame(7, 1));
-    await writeFile(nativeSession, '{"type":"session"}\n{"type":"message"}\n', { mode: 0o600 });
+    await writeFile(nativeSession, `${testNativeSession()}{"type":"message"}\n`, { mode: 0o600 });
+    await seedRemoteNativeSession(files, `${testNativeSession()}{"type":"message"}\n`);
 
     const secondSpec: PiProcessSpec = {
       command: process.execPath,
@@ -872,7 +947,7 @@ describe("RemotePiProcessFactory", () => {
       writeFile(controlOne, JSON.stringify({ generation: 1 }), { mode: 0o600 }),
       writeFile(controlTwo, JSON.stringify({ generation: 2 }), { mode: 0o600 }),
       writeFile(cli, "export {};", { mode: 0o600 }),
-      writeFile(nativeSession, '{"type":"session"}\n', { mode: 0o600 })
+      writeFile(nativeSession, testNativeSession(), { mode: 0o600 })
     ]);
 
     const files = new PiMemoryRemoteFiles();
@@ -922,6 +997,7 @@ describe("RemotePiProcessFactory", () => {
       remoteWorkspace: { kind: "ssh", hostTargetId: "target-a", hostId: "host-a", workspaceRoot: "/workspace" }
     });
 
+    await seedRemoteNativeSession(files, `${testNativeSession()}{"type":"message","id":"remote-later"}\n`);
     const second = await remoteFactory(registry, authorityRoot).create({
       command: process.execPath,
       args: [cli, "--mode", "rpc", "--session", nativeSession],
@@ -943,6 +1019,7 @@ describe("RemotePiProcessFactory", () => {
     const fresh = JSON.parse(freshBridge.input[0]!.toString("utf8")) as Record<string, any>;
     expect(rejected.authority.recovery).toMatchObject({ runtimeGeneration: 1, pid: 4242 });
     expect(fresh.authority).not.toHaveProperty("recovery");
+    expect(files.text(fresh.args[fresh.args.indexOf("--session") + 1])).toContain("remote-later");
     const [authorityFile] = await readdir(authorityRoot);
     expect(JSON.parse(await readFile(join(authorityRoot, authorityFile!), "utf8"))).toMatchObject({
       authority: { runtimeGeneration: 2, epoch: 1, pid: 4242 }
@@ -1114,6 +1191,7 @@ describe("RemotePiProcessFactory", () => {
       "kill",
       "/home/maker/.joko/pi-broker"
     ]);
+    await waitUntil(() => auxiliary.input.length > 0);
     expect(JSON.parse(auxiliary.input[0]!.toString("utf8"))).toMatchObject({
       action: "kill",
       signal: "SIGKILL",
@@ -1677,7 +1755,8 @@ function remoteFactory(registry: Pick<RemoteHostRegistry, "transports">, authori
           authorityIdentity: "ssh-test-authority",
           pathStyle: "posix",
           files: lease.files,
-          processes: lease.processes,
+          processes: { open: async (request) => request.args[0]?.includes("/session-")
+            ? new SessionFileRemoteProcess(lease.files!) : lease.processes!.open(request) },
           ...(lease.capabilities.tcpForwarding && lease.forwarding !== undefined
             ? { forwarding: lease.forwarding }
             : {}),
@@ -1687,6 +1766,55 @@ function remoteFactory(registry: Pick<RemoteHostRegistry, "transports">, authori
       }
     }
   });
+}
+
+function testNativeSession(snapshot?: string): string {
+  return `${JSON.stringify({ type: "session", version: 3, id: "native", timestamp: new Date(0).toISOString(), cwd: "/workspace", ...(snapshot === undefined ? {} : { snapshot }) })}\n`;
+}
+
+async function seedRemoteNativeSession(files: PiMemoryRemoteFiles, content: string): Promise<void> {
+  const root = remotePath.join("/home/maker", ".joko", "sessions", createHash("sha256").update([
+    "target-a", JSON.stringify({ kind: "ssh", hostTargetId: "target-a", hostId: "host-a" })
+  ].join("\0")).digest("hex").slice(0, 32));
+  await files.write({ path: remotePath.join(root, "native.jsonl"), content: Buffer.from(content), createParents: true, mode: 0o600 });
+}
+
+class SessionFileRemoteProcess extends EventEmitter implements RemoteProcessHandle {
+  readonly stdin = new PassThrough();
+  readonly stdout = new PassThrough();
+  readonly stderr = new PassThrough();
+  exitCode: number | null = null;
+  signalCode: NodeJS.Signals | null = null;
+  constructor(files: RemoteFileTransportPort) {
+    super();
+    const chunks: Buffer[] = [];
+    this.stdin.on("data", (chunk: Buffer) => chunks.push(Buffer.from(chunk)));
+    this.stdin.on("end", () => { void (async () => {
+      try {
+        const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, any>;
+        let existing: Buffer | undefined;
+        try { existing = Buffer.from(await files.read({ path: body.path, maximumBytes: 64 * 1024 * 1024 })); } catch { /* Missing fixture native storage. */ }
+        if (existing !== undefined) {
+          const header = JSON.parse(existing.toString("utf8").split("\n")[0]!);
+          if (header.type !== "session" || header.version !== 3 || header.id !== body.nativeSessionId || header.cwd !== body.cwd) throw new Error("Identity mismatch");
+        }
+        if (body.action === "remove") {
+          if (existing !== undefined) await files.remove(body.path);
+          this.stdout.end(JSON.stringify({ ok: true, removed: existing !== undefined }));
+        } else {
+          if (existing === undefined) {
+            if (body.action === "confirm") throw new Error("Missing Session");
+            await files.write({ path: body.path, content: Buffer.from(body.content, "base64"), mode: 0o600 });
+          }
+          this.stdout.end(JSON.stringify({ ok: true, created: existing === undefined }));
+        }
+        this.exitCode = 0;
+      } catch { this.stdout.end(); this.exitCode = 1; }
+      this.stderr.end();
+      this.emit("exit", this.exitCode, null);
+    })(); });
+  }
+  kill(): boolean { this.signalCode = "SIGKILL"; this.stdout.end(); this.stderr.end(); this.emit("exit", null, "SIGKILL"); return true; }
 }
 
 function testRecoveryIdentity(
