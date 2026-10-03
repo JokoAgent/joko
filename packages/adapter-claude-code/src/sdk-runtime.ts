@@ -13,6 +13,7 @@ import {
   type DurableProcessUsage
 } from "@joko/runtime-governance";
 import { z } from "zod";
+import { ClaudeFreshContextOwner } from "./fresh-context-owner.js";
 import type { ClaudeMcpCallResult, ClaudeMcpTool } from "./mcp-bridge.js";
 import {
   CLAUDE_SESSION_STORE_LIMITS,
@@ -329,6 +330,10 @@ export interface ClaudeSdkRuntime {
    * the Adapter must not advertise workspace derivation until Host adoption,
    * recovery and live-cwd proof are also configured. */
   readonly storedSessions?: ClaudeSdkStoredSessionRuntime;
+  /** Joko-owned empty-context reservations, separate from opaque SDK entries. */
+  readonly freshContexts?: ClaudeFreshContextOwner;
+  /** Retire stale exact processes before claiming a durable empty context. */
+  prepareFreshContextRecovery?(): Promise<void>;
   /** True only for exact local Query roots owned by this runtime. */
   readonly processInspectionSupported?: boolean;
   probe(input: ClaudeSdkProbeInput): Promise<ClaudeSdkProbe>;
@@ -490,6 +495,7 @@ export class DefaultClaudeSdkRuntime implements ClaudeSdkRuntime {
   readonly bundledCliVersion = CLAUDE_AGENT_SDK_CLI_VERSION;
   readonly supportsWorkspaceDerivation: boolean;
   readonly storedSessions: ClaudeSdkStoredSessionRuntime | undefined;
+  readonly freshContexts: ClaudeFreshContextOwner | undefined;
   readonly #processOwner: DurableProcessOwner | undefined;
   readonly #retirementTimeoutMs: number;
   readonly #sessionOwner: SessionSdkOwner;
@@ -532,6 +538,11 @@ export class DefaultClaudeSdkRuntime implements ClaudeSdkRuntime {
           generation: options.processOwner.generation
         });
     this.#sessionStoreAuthority = sessionStoreAuthority;
+    this.freshContexts = sessionStoreAuthority === undefined ? undefined : new ClaudeFreshContextOwner({
+      rootDirectory: sessionStoreAuthority.rootDirectory,
+      namespace: sessionStoreAuthority.namespace,
+      generation: sessionStoreAuthority.generation
+    });
     this.supportsWorkspaceDerivation = sessionStoreAuthority !== undefined;
     this.#sessionOwner = new SessionSdkOwner({
       environment: options.environment ?? process.env,
@@ -546,6 +557,13 @@ export class DefaultClaudeSdkRuntime implements ClaudeSdkRuntime {
 
   get processInspectionSupported(): boolean {
     return this.#processOwner?.inspectionSupported === true;
+  }
+
+  async prepareFreshContextRecovery(): Promise<void> {
+    if (this.#processOwner === undefined || this.freshContexts === undefined) {
+      throw new Error("The durable fresh context process authority is unavailable.");
+    }
+    await this.#processOwner.prepare(this.#retirementTimeoutMs);
   }
 
   async probe(input: ClaudeSdkProbeInput): Promise<ClaudeSdkProbe> {
