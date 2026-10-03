@@ -363,6 +363,13 @@ export interface MobileState {
   readonly error?: string;
 }
 
+export interface MobileTaskSendObserver {
+  /** Caller-owned durable Operation identity, allocated before dispatch. */
+  readonly operationId?: string;
+  /** Presentation-only notification after validation/upload and immediately before durable submit. */
+  readonly onDispatch?: (draft: MobileComposerDraft) => void;
+}
+
 export interface MobilePushAuthority {
   readonly key: string;
   readonly profileId: string;
@@ -5092,7 +5099,7 @@ export class MobileClient {
     return { sessionId: submission.sessionId, created: true, sent: true, definitive: true };
   }
 
-  async send(draft: MobileComposerDraft): Promise<boolean> {
+  async send(draft: MobileComposerDraft, observer: MobileTaskSendObserver = {}): Promise<boolean> {
     const exactDraft = normalizeMobileComposerDraft(draft);
     const sessionId = this.#state.selectedId;
     const session = this.#state.detail?.sessions.find((item) => item.sessionId === sessionId);
@@ -5205,6 +5212,7 @@ export class MobileClient {
         credential,
         generation
       );
+      observer.onDispatch?.(sendDraft);
       const accepted = await this.#submit(create(OperationMutationSchema, {
         preconditions: [create(OperationPreconditionSchema, {
           entity: create(EntityRefSchema, { kind: EntityKind.SESSION, id: sessionId }), expectedGeneration: generation
@@ -5214,7 +5222,7 @@ export class MobileClient {
           input: mobileComposerInput(sendDraft),
           deliveryMode: QueueDeliveryMode.PROMPT
         }) }
-      }), { kind: "send", sessionId });
+      }), { kind: "send", sessionId }, observer.operationId);
       if (accepted) {
         try {
           if (await this.composerDrafts.clearIfEqual(draftIdentity, sendDraft)) {
@@ -5417,6 +5425,26 @@ export class MobileClient {
 
   taskQueueItems(): readonly QueueItem[] {
     return acceptedQueueItems(this.#state.detail?.queueItems ?? [], this.#state.selectedId);
+  }
+
+  /** Stable page-local owner occurrence; excludes normal entity revision advancement. */
+  taskPresentationOwnerKey(): string | undefined {
+    if (!this.#taskAuthorityKey()) return undefined;
+    const credential = this.#credential!;
+    const owner = this.#state.owner!;
+    const session = this.#selectedSession()!;
+    const generation = session.nativeBinding!.runtimeGeneration!;
+    return [
+      credential.profileId,
+      credential.connectionId,
+      credential.deviceId,
+      credential.serverId,
+      owner.generation.toString(10),
+      session.sessionId,
+      session.backendId,
+      session.targetId,
+      generation.toString(10)
+    ].join("\u001f");
   }
 
   taskQueueCapabilities() {
@@ -9323,9 +9351,10 @@ export class MobileClient {
 
   async #submit(
     mutation: OperationMutation,
-    identity: Pick<PendingOperation, "kind" | "sessionId" | "eventId" | "queueItemId" | "interactionId" | "interactionGeneration" | "interactionRevision" | "interactionDraftKind" | "targetConnectionId" | "targetDeviceId" | "scheduleId" | "triggerId" | "targetId">
+    identity: Pick<PendingOperation, "kind" | "sessionId" | "eventId" | "queueItemId" | "interactionId" | "interactionGeneration" | "interactionRevision" | "interactionDraftKind" | "targetConnectionId" | "targetDeviceId" | "scheduleId" | "triggerId" | "targetId">,
+    operationId?: string
   ): Promise<boolean> {
-    return (await this.#submitTracked(mutation, identity, false)).accepted;
+    return (await this.#submitTracked(mutation, identity, false, operationId)).accepted;
   }
 
   async #submitTerminal(
