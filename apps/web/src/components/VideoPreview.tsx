@@ -4,6 +4,7 @@ import { createPortal } from "react-dom";
 
 import { registerExclusiveMediaPlayback } from "../media-playback.js";
 import { IconButton, Spinner } from "./ui.js";
+import { RENDERED_SHARE_CONTENT_PENDING_ATTRIBUTE } from "./rendered-share-dom.js";
 import "./video-preview.css";
 
 export interface VideoPreviewLabels {
@@ -48,7 +49,7 @@ function VideoPreviewContent({ src, labels, onError, actions }: VideoPreviewProp
     return () => releaseVideoSource(cover);
   }, [src]);
 
-  return <div className="video-preview">
+  return <div {...(!loaded && !failed ? { [RENDERED_SHARE_CONTENT_PENDING_ATTRIBUTE]: "" } : {})} className="video-preview">
     {failed ? <div className="video-preview__unavailable" role="alert"><VideoOff aria-hidden="true" /><span>{labels.unavailable}</span></div> : <button
       type="button"
       className="video-preview__open"

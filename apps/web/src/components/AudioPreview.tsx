@@ -5,6 +5,7 @@ import { registerExclusiveMediaPlayback } from "../media-playback.js";
 import type { AudioArtifactMetadataView } from "../model.js";
 import { AudioArtwork } from "./AudioArtwork.js";
 import { Spinner } from "./ui.js";
+import { RENDERED_SHARE_CONTENT_PENDING_ATTRIBUTE, RENDERED_SHARE_EXCLUDE_ATTRIBUTE } from "./rendered-share-dom.js";
 import "./audio-preview.css";
 
 export interface AudioPreviewLabels {
@@ -139,7 +140,7 @@ function AudioPreviewContent({ src, ownerKey, name, description, metadata, label
     }
   };
 
-  return <div className="audio-preview">
+  return <div {...(loading && !failed ? { [RENDERED_SHARE_CONTENT_PENDING_ATTRIBUTE]: "" } : {})} className="audio-preview">
     <div className="audio-preview__heading">
       <AudioArtwork ownerKey={ownerKey} artwork={metadata?.kind === "sound_effect" ? undefined : metadata?.artwork} />
       <div className="audio-preview__details">
@@ -147,6 +148,7 @@ function AudioPreviewContent({ src, ownerKey, name, description, metadata, label
         {copyText !== "" && <p className="audio-preview__description" title={copyText}>{copyText}</p>}
       </div>
       {copyText !== "" && <button
+        {...{ [RENDERED_SHARE_EXCLUDE_ATTRIBUTE]: "" }}
         type="button"
         className="icon-button audio-preview__copy"
         aria-label={labels.copyDescription}
@@ -160,7 +162,7 @@ function AudioPreviewContent({ src, ownerKey, name, description, metadata, label
     {(duration ?? metadata?.durationSeconds) !== undefined && <span className="audio-preview__duration">{formatDuration(duration ?? metadata!.durationSeconds!)}</span>}
     {failed ? <div className="audio-preview__feedback is-error" role="alert"><AlertCircle aria-hidden="true" /><span>{labels.unavailable}</span></div>
       : loading ? <div className="audio-preview__feedback"><Spinner label={labels.loading} /></div> : null}
-    {copyState !== "idle" && <span className="audio-preview__feedback" role={copyState === "failed" ? "alert" : "status"}>
+    {copyState !== "idle" && <span {...{ [RENDERED_SHARE_EXCLUDE_ATTRIBUTE]: "" }} className="audio-preview__feedback" role={copyState === "failed" ? "alert" : "status"}>
       {copyState === "pending" ? labels.copying : copyState === "copied" ? labels.copied : labels.copyFailed}
     </span>}
   </div>;

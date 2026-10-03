@@ -2,7 +2,7 @@ import { createContext, isValidElement, memo, useCallback, useContext, useEffect
 import type { ComponentProps, CSSProperties, JSX, ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { assertBrowserActionCurrent, type BrowserActionContext, type HttpLinkOpenOptions } from "../browser-action.js";
-import { useVirtualizer } from "@tanstack/react-virtual";
+import { defaultRangeExtractor, useVirtualizer } from "@tanstack/react-virtual";
 import {
   AlertCircle,
   ArrowRight,
@@ -60,7 +60,10 @@ import { SelectionQuoteChip } from "./SelectionQuoteChip.js";
 import { SentPastedTextInline } from "./SentPastedTextInline.js";
 import { buildSentPastedTextMessageSegments, projectSentPastedTextMessageBody } from "./sent-pasted-text.js";
 import { messageDialogueRewindTarget } from "./message-rewind-behavior.js";
-import { ShareMessageImageEmptyError, ShareMessageImageTooLargeError, buildShareMessageImagePng, deliverShareMessageImage, shareMessageImageFilename } from "./share-message-image.js";
+import { shareSelectionPinnedRenderIndexes } from "./share-selection-behavior.js";
+import { ShareMessageImageEmptyError, ShareMessageImageTooLargeError, deliverShareMessageImage, shareMessageImageFilename } from "./share-message-image.js";
+import { MAXIMUM_RENDERED_SHARE_MESSAGES, ShareRenderedMessageImageUnavailableError, ShareRenderedMessageNotMountedError, buildRenderedShareMessageImagePng, queryRenderedShareMessageIds } from "./share-rendered-message-image.js";
+import { RENDERED_SHARE_CONTENT_PENDING_ATTRIBUTE, RENDERED_SHARE_EXCLUDE_ATTRIBUTE, RENDERED_SHARE_MESSAGE_ATTRIBUTE, RenderedShareSelectionContext, useRenderedShareSelection } from "./rendered-share-dom.js";
 import { projectInlinePlanTimeline, projectPinnedPlan } from "./pinned-plan-behavior.js";
 import { collectTimelineGalleryImages, moveTimelineGalleryIndex, timelineArtifactGalleryId, timelineMessageAttachmentGalleryId, type TimelineGalleryImage } from "./timeline-image-gallery.js";
 import { findTimelineRenderItemIndex, insertTimelineDerivationOrigin, projectTimelineRenderItems, timelineRenderChildIndex, type TimelineRenderItem, type TimelineWorkRenderItem } from "./timeline-render-items.js";
@@ -188,7 +191,7 @@ export interface TimelineShareSelection {
   readonly selectedIds: ReadonlySet<string>;
 }
 
-export function Timeline({ ownerKey, viewportOwnerKey, sessionId, sessionName, workspaceId, onReadArtifact, items, sessionActive, derivationOrigin, sessionCreatedAt, onOpenDerivationOrigin, messageNavRailEnabled, streamFadeEnabled, onOpenHttpLink, onOpenWorkspaceHtml, onLoadWorkspaceAsset, onWorkspaceImageToComposer, subagentRuns, subagentRunDetails, onOpenSubagent, onStopSubagent, onGetPartnerDelegation, onCancelPartnerDelegation, onOpenPartnerSession, hasEarlier, historyLoading, historyError, onLoadEarlier, followLatestSignal = 0, focusRequest, bottomInset = 0, retryRunId, locale, t, onRetry, onRecovery, recoveryContext, onArtifactUrl, onArtifactUrlRelease, onArtifactDownload, onWorkspaceRewind, onOpenGeneratedFile, onOpenTurnReview, onReobserveReview, onAddMessageToComposer, onAddSelectionToComposer, onForkMessage, forkingMessageId, shareSelection, onStartShareSelection, onToggleShareMessage, editableMessageId, onMoveEditedMessageToComposer, onPreviewMessageRewind, rewindToStartSupported, onDeleteMessage, messageDeleteBlockedReason, messageActionResetSignal, onInlinePlanVisibilityChange }: {
+export function Timeline({ ownerKey, viewportOwnerKey, sessionId, sessionName, workspaceId, onReadArtifact, items, sessionActive, derivationOrigin, sessionCreatedAt, onOpenDerivationOrigin, messageNavRailEnabled, streamFadeEnabled, onOpenHttpLink, onOpenWorkspaceHtml, onLoadWorkspaceAsset, onWorkspaceImageToComposer, subagentRuns, subagentRunDetails, onOpenSubagent, onStopSubagent, onGetPartnerDelegation, onCancelPartnerDelegation, onOpenPartnerSession, hasEarlier, historyLoading, historyError, onLoadEarlier, followLatestSignal = 0, focusRequest, bottomInset = 0, retryRunId, locale, t, onRetry, onRecovery, recoveryContext, onArtifactUrl, onArtifactUrlRelease, onArtifactDownload, onWorkspaceRewind, onOpenGeneratedFile, onOpenTurnReview, onReobserveReview, onAddMessageToComposer, onAddSelectionToComposer, onForkMessage, forkingMessageId, shareSelection, onStartShareSelection, onToggleShareMessage, editableMessageId, onMoveEditedMessageToComposer, onPreviewMessageRewind, rewindToStartSupported, onDeleteMessage, messageDeleteBlockedReason, messageActionResetSignal, onInlinePlanVisibilityChange, onRootChange }: {
   readonly ownerKey: string;
   readonly viewportOwnerKey: string;
   readonly sessionId: string;
@@ -247,6 +250,7 @@ export function Timeline({ ownerKey, viewportOwnerKey, sessionId, sessionName, w
   readonly messageDeleteBlockedReason?: string;
   readonly messageActionResetSignal?: number;
   readonly onInlinePlanVisibilityChange?: (visibility: InlinePlanVisibility | null) => void;
+  readonly onRootChange?: (root: HTMLDivElement | null) => void;
 }): JSX.Element {
   const planTimelineItems = useMemo(() => projectInlinePlanTimeline(items), [items]);
   const currentPlan = useMemo(() => projectPinnedPlan(items), [items]);
@@ -287,6 +291,10 @@ export function Timeline({ ownerKey, viewportOwnerKey, sessionId, sessionName, w
   const restoredViewport = restoredViewportRef.current.viewport;
   const viewportOwnerRef = useRef(viewportOwnerKey);
   const scrollRef = useRef<HTMLDivElement>(null);
+  const bindScrollRoot = useCallback((root: HTMLDivElement | null): void => {
+    scrollRef.current = root;
+    onRootChange?.(root);
+  }, [onRootChange]);
   const contentRef = useRef<HTMLDivElement>(null);
   const previousMessageJump = usePreviousUserMessageJump({ scrollRef, userMessageIds, resetKey: viewportOwnerKey });
   const [followingState, setFollowingState] = useState({ ownerKey: viewportOwnerKey, value: restoredViewport.following });
@@ -368,12 +376,21 @@ export function Timeline({ ownerKey, viewportOwnerKey, sessionId, sessionName, w
     ...(onCancelPartnerDelegation === undefined ? {} : { cancel: onCancelPartnerDelegation }),
     ...(onOpenPartnerSession === undefined ? {} : { openSession: onOpenPartnerSession })
   }), [onCancelPartnerDelegation, onGetPartnerDelegation, onOpenPartnerSession]);
+  const pinnedShareRows = useMemo(() => {
+    if (shareSelection === undefined) return [];
+    return shareSelectionPinnedRenderIndexes(shareSelection.selectedIds, renderIndexByChildId, MAXIMUM_RENDERED_SHARE_MESSAGES);
+  }, [renderIndexByChildId, shareSelection]);
+  const extractTimelineRange = useCallback((range: Parameters<typeof defaultRangeExtractor>[0]): number[] => {
+    if (pinnedShareRows.length === 0) return defaultRangeExtractor(range);
+    return [...new Set([...defaultRangeExtractor(range), ...pinnedShareRows])].sort((left, right) => left - right);
+  }, [pinnedShareRows]);
   const virtualizer = useVirtualizer({
     count: renderItems.length,
     getScrollElement: () => scrollRef.current,
     estimateSize: (index) => estimateRenderHeight(renderItems[index]),
     overscan: 8,
-    getItemKey: (index) => renderItems[index]?.key ?? index
+    getItemKey: (index) => renderItems[index]?.key ?? index,
+    rangeExtractor: extractTimelineRange
   });
   const positionVirtualRow = useCallback((index: number, align: "start" | "center"): void => {
     if (!navigationDocumentActiveRef.current) return;
@@ -995,7 +1012,7 @@ export function Timeline({ ownerKey, viewportOwnerKey, sessionId, sessionName, w
   if (items.length === 0) {
     return (
       <div className="timeline-shell" style={{ "--timeline-bottom-inset": `${Math.max(0, bottomInset)}px` } as CSSProperties}>
-        <div ref={scrollRef} className="timeline timeline--empty" data-timeline-session-id={sessionId} data-selection-quote-context="" aria-busy={historyLoading || undefined} aria-label={t("timeline.label")} tabIndex={0}>
+        <div ref={bindScrollRoot} className="timeline timeline--empty" data-timeline-session-id={sessionId} data-selection-quote-context="" aria-busy={historyLoading || undefined} aria-label={t("timeline.label")} tabIndex={0}>
           {derivationOrigin !== undefined && <SessionDerivationMarker origin={derivationOrigin} onOpen={onOpenDerivationOrigin} t={t} />}
           <div className="timeline-welcome">
             <div className="timeline-welcome__mark">{historyError === undefined ? <Sparkles aria-hidden="true" /> : <AlertCircle aria-hidden="true" />}</div>
@@ -1031,7 +1048,7 @@ export function Timeline({ ownerKey, viewportOwnerKey, sessionId, sessionName, w
         </div>
       )}
       <div
-        ref={scrollRef}
+        ref={bindScrollRoot}
         className="timeline"
         data-timeline-session-id={sessionId}
         data-selection-quote-context=""
@@ -1352,6 +1369,7 @@ function MessageBlock({ sessionId, sessionName, item, role, locale, reducedMotio
   const roleLabel = role === "user" ? t("timeline.you") : t("timeline.agent");
   const selectionActive = shareSelection !== undefined;
   const shareable = item.streaming !== true && (text.trim().length > 0 || (item.attachments?.length ?? 0) > 0);
+  const shareSelected = selectionActive && shareSelection.selectedIds.has(item.id);
   const selectionControl = selectionActive && shareable && onToggleShareMessage !== undefined
     ? <MessageSelectionControl item={item} selected={shareSelection.selectedIds.has(item.id)} roleLabel={roleLabel} t={t} onToggle={onToggleShareMessage} />
     : null;
@@ -1381,11 +1399,12 @@ function MessageBlock({ sessionId, sessionName, item, role, locale, reducedMotio
       : <SentPastedTextInline ownerKey={JSON.stringify([personalization.ownerKey, sessionId, item.id, item.sourceEventId, index])} segment={projected} t={t} renderText={renderText} key={`${item.id}:text:${index}`} />;
   });
   if (role === "user") {
-    if (editing && onCancelEdit !== undefined && onMoveEditedMessageToComposer !== undefined) {
-      return <article className="message-user message-user--editing" data-user-msg-id={item.id} data-message-client-id={item.id} aria-label={roleLabel}><div className="message-user__stack">{item.automationOrigin !== undefined && <AutomationOriginBadge automationOrigin={item.automationOrigin} t={t} />}<UserMessageEditBox initialText={quotedUserMessage.body} t={t} onCancel={onCancelEdit} onMoveToComposer={(value) => onMoveEditedMessageToComposer(item, value)} /></div></article>;
+    if (!selectionActive && editing && onCancelEdit !== undefined && onMoveEditedMessageToComposer !== undefined) {
+      return <article className="message-user message-user--editing" data-user-msg-id={item.id} data-message-client-id={item.id} {...(shareable ? { [RENDERED_SHARE_MESSAGE_ATTRIBUTE]: item.id } : {})} aria-label={roleLabel}><div className="message-user__stack">{item.automationOrigin !== undefined && <AutomationOriginBadge automationOrigin={item.automationOrigin} t={t} />}<UserMessageEditBox initialText={quotedUserMessage.body} t={t} onCancel={onCancelEdit} onMoveToComposer={(value) => onMoveEditedMessageToComposer(item, value)} /></div></article>;
     }
     return (
-      <article className={cx("message-user", selectionActive && "is-share-selecting")} data-user-msg-id={item.id} data-message-client-id={item.id} data-selection-quote-message-id={item.id} data-selection-quote-source-event-id={item.sourceEventId} data-selection-quote-role="user" aria-label={roleLabel}>
+      <RenderedShareSelectionContext.Provider value={shareSelected}>
+      <article className={cx("message-user", selectionActive && "is-share-selecting")} data-user-msg-id={item.id} data-message-client-id={item.id} {...(shareable ? { [RENDERED_SHARE_MESSAGE_ATTRIBUTE]: item.id } : {})} data-selection-quote-message-id={item.id} data-selection-quote-source-event-id={item.sourceEventId} data-selection-quote-role="user" aria-label={roleLabel}>
         {selectionControl}
         <div className="message-user__stack">
           {item.automationOrigin !== undefined && <AutomationOriginBadge automationOrigin={item.automationOrigin} t={t} />}
@@ -1401,6 +1420,7 @@ function MessageBlock({ sessionId, sessionName, item, role, locale, reducedMotio
           {!selectionActive && showActions && <MessageActions ownerKey={personalization.ownerKey} sessionId={sessionId} sessionName={sessionName} item={item} text={actionText} align="right" locale={locale} t={t} onAddMessageToComposer={onAddMessageToComposer} onFork={onForkMessage} forking={forking} onStartShareSelection={onStartShareSelection} editable={editable} onEdit={onEdit} onPreviewMessageRewind={onPreviewMessageRewind} rewindToStartSupported={rewindToStartSupported} onDeleteMessage={onDeleteMessage} messageDeleteBlockedReason={messageDeleteBlockedReason} />}
         </div>
       </article>
+      </RenderedShareSelectionContext.Provider>
     );
   }
   const assistantContent = <>
@@ -1409,15 +1429,17 @@ function MessageBlock({ sessionId, sessionName, item, role, locale, reducedMotio
     {!selectionActive && !item.streaming && showActions && <MessageActions ownerKey={personalization.ownerKey} sessionId={sessionId} sessionName={sessionName} item={item} text={text} align="left" locale={locale} t={t} onAddMessageToComposer={onAddMessageToComposer} onFork={onForkMessage} forking={forking} onStartShareSelection={onStartShareSelection} editable={false} onPreviewMessageRewind={onPreviewMessageRewind} rewindToStartSupported={rewindToStartSupported} onDeleteMessage={onDeleteMessage} messageDeleteBlockedReason={messageDeleteBlockedReason} />}
   </>;
   return (
-    <article className={cx("message-assistant", selectionActive && "is-share-selecting")} data-message-client-id={item.id} data-selection-quote-message-id={item.id} data-selection-quote-source-event-id={item.sourceEventId} data-selection-quote-role="assistant" aria-label={roleLabel}>
+    <RenderedShareSelectionContext.Provider value={shareSelected}>
+    <article className={cx("message-assistant", selectionActive && "is-share-selecting")} data-message-client-id={item.id} {...(shareable ? { [RENDERED_SHARE_MESSAGE_ATTRIBUTE]: item.id } : {})} data-selection-quote-message-id={item.id} data-selection-quote-source-event-id={item.sourceEventId} data-selection-quote-role="assistant" aria-label={roleLabel}>
       {selectionControl}
       {selectionActive ? <div className="message-assistant__selection-stack">{assistantContent}</div> : assistantContent}
     </article>
+    </RenderedShareSelectionContext.Provider>
   );
 }
 
 function MessageSelectionControl({ item, selected, roleLabel, t, onToggle }: { readonly item: TimelineItemView; readonly selected: boolean; readonly roleLabel: string; readonly t: Translator; readonly onToggle: (itemId: string, extendRange: boolean) => void }): JSX.Element {
-  return <button type="button" className={cx("message-share-choice", selected && "is-selected")} role="checkbox" aria-checked={selected} aria-label={t("timeline.shareSelectionToggle", { role: roleLabel })} onClick={(event) => onToggle(item.id, event.shiftKey)}><span aria-hidden="true">{selected && <Check />}</span></button>;
+  return <button type="button" {...{ [RENDERED_SHARE_EXCLUDE_ATTRIBUTE]: "" }} className={cx("message-share-choice", selected && "is-selected")} role="checkbox" aria-checked={selected} aria-label={t("timeline.shareSelectionToggle", { role: roleLabel })} onClick={(event) => onToggle(item.id, event.shiftKey)}><span aria-hidden="true">{selected && <Check />}</span></button>;
 }
 
 export function MessageActions({ ownerKey, sessionId, sessionName, item, text, align, locale, t, onAddMessageToComposer, onFork, forking, onStartShareSelection, editable, onEdit, onPreviewMessageRewind, rewindToStartSupported, onDeleteMessage, messageDeleteBlockedReason }: { readonly ownerKey: string; readonly sessionId: string; readonly sessionName: string; readonly item: TimelineItemView; readonly text: string; readonly align: "left" | "right"; readonly locale: string; readonly t: Translator; readonly onAddMessageToComposer?: (item: TimelineItemView) => void; readonly onFork?: (item: TimelineItemView) => void; readonly forking: boolean; readonly onStartShareSelection?: (item: TimelineItemView) => void; readonly editable: boolean; readonly onEdit?: (item: TimelineItemView) => void; readonly onPreviewMessageRewind?: (item: TimelineItemView) => void; readonly rewindToStartSupported?: boolean; readonly onDeleteMessage?: (item: TimelineItemView) => void; readonly messageDeleteBlockedReason?: string }): JSX.Element {
@@ -1441,12 +1463,11 @@ export function MessageActions({ ownerKey, sessionId, sessionName, item, text, a
   };
   const shareContent = {
     sessionName,
-    role: align === "right" ? "user" as const : "assistant" as const,
-    roleLabel: align === "right" ? t("timeline.you") : t("timeline.agent"),
-    text,
-    attachmentNames: item.attachments?.map((attachment) => attachment.fileName || attachment.title),
-    attachmentsLabel: t("timeline.attachments"),
-    createdAtLabel: formatDateTime(item.createdAt, locale)
+    messages: [{
+      id: item.id,
+      text,
+      attachmentNames: item.attachments?.map((attachment) => attachment.fileName || attachment.title) ?? []
+    }]
   };
   const actionOwnerKey = JSON.stringify([ownerKey, sessionId, item.id, item.sourceEventId, item.createdAt, shareContent]);
   const retireActions = (): void => {
@@ -1514,20 +1535,35 @@ export function MessageActions({ ownerKey, sessionId, sessionName, item, text, a
     if (!shareable || shareRequestRef.current !== undefined) return;
     const owner = ownerRef.current;
     if (owner === undefined || owner.document !== trigger.ownerDocument) return;
+    const intent = {};
+    feedbackIntentRef.current = intent;
+    clearFeedbackTimer();
+    setShareFeedback(undefined);
+    const sourceMessage = actionsRef.current?.closest<HTMLElement>(`[${RENDERED_SHARE_MESSAGE_ATTRIBUTE}]`);
+    const timelineRoot = sourceMessage?.closest<HTMLElement>("[data-timeline-session-id]");
+    if (
+      sourceMessage === null || sourceMessage === undefined || sourceMessage.getAttribute(RENDERED_SHARE_MESSAGE_ATTRIBUTE) !== item.id
+      || timelineRoot === null || timelineRoot === undefined || !timelineRoot.isConnected || timelineRoot.ownerDocument !== trigger.ownerDocument
+      || timelineRoot.dataset.timelineSessionId !== sessionId
+    ) {
+      reportShareFeedback(intent, "error", t("timeline.shareNotReady"));
+      return;
+    }
+    const orderedTimelineMessageIds = queryRenderedShareMessageIds(timelineRoot);
     const request = new AbortController();
     const action: BrowserActionContext = { ownerDocument: trigger.ownerDocument, signal: request.signal };
     shareRequestRef.current = request;
     const current = (): boolean => ownerRef.current === owner && shareRequestRef.current === request && !request.signal.aborted
       && actionsRef.current?.isConnected === true && actionsRef.current.ownerDocument === action.ownerDocument
+      && sourceMessage.isConnected && sourceMessage.getAttribute(RENDERED_SHARE_MESSAGE_ATTRIBUTE) === item.id
+      && sourceMessage.closest<HTMLElement>("[data-timeline-session-id]") === timelineRoot
+      && timelineRoot.isConnected && timelineRoot.ownerDocument === action.ownerDocument
+      && timelineRoot.dataset.timelineSessionId === sessionId
       && action.ownerDocument.defaultView?.document === action.ownerDocument && !action.ownerDocument.defaultView.closed;
-    const intent = {};
-    feedbackIntentRef.current = intent;
-    clearFeedbackTimer();
     setSharing(true);
-    setShareFeedback(undefined);
     try {
       assertBrowserActionCurrent(action);
-      const blob = await buildShareMessageImagePng(shareContent, action);
+      const blob = await buildRenderedShareMessageImagePng({ timelineRoot, sessionId, orderedTimelineMessageIds, content: shareContent, action });
       if (!current()) return;
       assertBrowserActionCurrent(action);
       const delivery = await deliverShareMessageImage(blob, shareMessageImageFilename(sessionName, item.createdAt), sessionName, action);
@@ -1538,6 +1574,8 @@ export function MessageActions({ ownerKey, sessionId, sessionName, item, text, a
       if (!current()) return;
       reportShareFeedback(intent, "error", error instanceof ShareMessageImageTooLargeError
         ? t("timeline.shareTooLarge")
+        : error instanceof ShareRenderedMessageNotMountedError || error instanceof ShareRenderedMessageImageUnavailableError
+          ? t("timeline.shareNotReady")
         : error instanceof ShareMessageImageEmptyError
           ? t("timeline.shareEmpty")
           : t("timeline.shareFailed"));
@@ -1559,7 +1597,7 @@ export function MessageActions({ ownerKey, sessionId, sessionName, item, text, a
     ? <IconButton key="edit" className="copy-button" label={t("timeline.editMessage")} onClick={() => onEdit(item)}><Pencil aria-hidden="true" /></IconButton>
     : null;
   const more = <MessageMoreMenu key="more" item={item} copying={copying !== undefined} onCopyLink={(trigger) => { void copyMessage("link", trigger); }} align={align} t={t} onAddMessageToComposer={onAddMessageToComposer} onStartShareSelection={onStartShareSelection} onPreviewMessageRewind={onPreviewMessageRewind} rewindToStartSupported={rewindToStartSupported} onDeleteMessage={onDeleteMessage} messageDeleteBlockedReason={messageDeleteBlockedReason} />;
-  return <div ref={actionsRef} className={cx("message-actions", `message-actions--${align}`, shareFeedback !== undefined && "has-feedback")}>{align === "left" ? <>{copy}{share}{fork}{more}{time}{usage}</> : <>{time}{copy}{share}{edit}{fork}{more}</>}{shareFeedback !== undefined && <span className={cx("message-share-feedback", shareFeedback.kind === "error" && "is-error")} role={shareFeedback.kind === "error" ? "alert" : "status"}>{shareFeedback.text}</span>}</div>;
+  return <div ref={actionsRef} {...{ [RENDERED_SHARE_EXCLUDE_ATTRIBUTE]: "" }} className={cx("message-actions", `message-actions--${align}`, shareFeedback !== undefined && "has-feedback")}>{align === "left" ? <>{copy}{share}{fork}{more}{time}{usage}</> : <>{time}{copy}{share}{edit}{fork}{more}</>}{shareFeedback !== undefined && <span className={cx("message-share-feedback", shareFeedback.kind === "error" && "is-error")} role={shareFeedback.kind === "error" ? "alert" : "status"}>{shareFeedback.text}</span>}</div>;
 }
 
 function MessageMoreMenu({ item, copying, onCopyLink, align, t, onAddMessageToComposer, onStartShareSelection, onPreviewMessageRewind, rewindToStartSupported, onDeleteMessage, messageDeleteBlockedReason }: { readonly item: TimelineItemView; readonly copying: boolean; readonly onCopyLink: (trigger: HTMLElement) => void; readonly align: "left" | "right"; readonly t: Translator; readonly onAddMessageToComposer?: (item: TimelineItemView) => void; readonly onStartShareSelection?: (item: TimelineItemView) => void; readonly onPreviewMessageRewind?: (item: TimelineItemView) => void; readonly rewindToStartSupported?: boolean; readonly onDeleteMessage?: (item: TimelineItemView) => void; readonly messageDeleteBlockedReason?: string }): JSX.Element {
@@ -1594,6 +1632,7 @@ function MessageMoreMenu({ item, copying, onCopyLink, align, t, onAddMessageToCo
 }
 
 export function MessageAttachment({ artifact, galleryId, t, onArtifactUrl, onArtifactDownload }: { readonly artifact: NonNullable<TimelineItemView["attachments"]>[number]; readonly galleryId?: string; readonly t: Translator; readonly onArtifactUrl: (blobId: string) => Promise<string>; readonly onArtifactDownload: OperationApi["downloadArtifact"] }): JSX.Element {
+  const renderForShare = useRenderedShareSelection();
   const gallery = useContext(TimelineImageGalleryContext);
   const { ownerKey } = useContext(TimelinePersonalizationContext);
   const [textPreviewTrigger, setTextPreviewTrigger] = useState<HTMLElement>();
@@ -1610,8 +1649,8 @@ export function MessageAttachment({ artifact, galleryId, t, onArtifactUrl, onArt
       ? <IconButton className="message-attachment__preview message-attachment__preview--text" label={`${t("workspace.preview")}: ${artifact.fileName}`} tip={t("workspace.preview")} onClick={(event) => setTextPreviewTrigger(event.currentTarget)}><FileText aria-hidden="true" /></IconButton>
       : <span className="message-attachment__icon" aria-hidden="true"><FileOutput /></span>
     : image.status === "ready" && gallery !== undefined && galleryId !== undefined
-      ? <button className="message-attachment__preview" type="button" data-gallery-image-id={galleryId} aria-label={t("timeline.openImage", { name: artifact.title })} onClick={(event) => gallery.open(galleryId, event.currentTarget)}><img src={image.url} alt={artifact.title} loading="lazy" onError={markImageFailed} /></button>
-      : <span className={cx("message-attachment__icon", image.status === "error" && "image-preview--failed")} aria-hidden="true">{image.status === "error" ? <ImageOff /> : <ImageIcon />}</span>;
+      ? <button className="message-attachment__preview" type="button" data-gallery-image-id={galleryId} aria-label={t("timeline.openImage", { name: artifact.title })} onClick={(event) => gallery.open(galleryId, event.currentTarget)}><img src={image.url} alt={artifact.title} loading={renderForShare ? "eager" : "lazy"} onError={markImageFailed} /></button>
+      : <span {...(artifact.kind === "image" && image.status === "loading" ? { [RENDERED_SHARE_CONTENT_PENDING_ATTRIBUTE]: "" } : {})} className={cx("message-attachment__icon", image.status === "error" && "image-preview--failed")} aria-hidden="true">{image.status === "error" ? <ImageOff /> : <ImageIcon />}</span>;
   return <>
     <article className={cx("message-attachment", mediaKind !== undefined && "message-attachment--media")}>{imagePreview}<span className="message-attachment__copy"><strong>{artifact.title}</strong><small>{artifact.fileName} · {formatBytes(artifact.byteSize)}</small>{mediaKind === undefined && image.status === "error" && <small className="image-preview__failure-label">{t("timeline.imageUnavailable")}</small>}</span><ArtifactDownloadButton iconOnly ownerKey={JSON.stringify([ownerKey, artifact.blobId, artifact.fileName])} connectionOwner={onArtifactUrl} label={t("timeline.downloadArtifact", { name: artifact.fileName })} errorLabel={t("workspace.downloadUnavailable")} action={(context) => onArtifactDownload(artifact.blobId, artifact.fileName, context)} /></article>
     {textPreviewTrigger !== undefined && <TimelineTextAttachmentLightbox

@@ -1,6 +1,7 @@
 import { Music2 } from "lucide-react";
 import { createContext, useContext, useLayoutEffect, useState, type JSX } from "react";
 import type { AudioArtifactMetadataView } from "../model.js";
+import { RENDERED_SHARE_CONTENT_PENDING_ATTRIBUTE } from "./rendered-share-dom.js";
 
 export const AudioArtworkContext = createContext<{
   readonly acquire: (blobId: string) => Promise<string>;
@@ -44,7 +45,7 @@ function ArtworkSource({ artwork }: { readonly artwork: AudioArtifactMetadataVie
       ownerWindow?.removeEventListener("pageshow", restore);
     };
   }, [artwork?.blobId, epoch, failed, gateway, node, ownerDocument]);
-  return <span ref={setNode} className="audio-preview__art" data-artwork-state={failed ? "error" : url === undefined ? "placeholder" : "ready"}>
-    {url === undefined ? <Music2 aria-hidden="true" /> : <img src={url} alt={artwork?.alt ?? ""} onError={() => setFailed(true)} />}
+  return <span ref={setNode} {...(artwork !== undefined && url === undefined && !failed ? { [RENDERED_SHARE_CONTENT_PENDING_ATTRIBUTE]: "" } : {})} className="audio-preview__art" data-artwork-state={failed ? "error" : url === undefined ? "placeholder" : "ready"}>
+    {url === undefined ? <Music2 aria-hidden="true" /> : <img src={url} alt={artwork?.alt ?? ""} onError={() => { setUrl(undefined); setFailed(true); }} />}
   </span>;
 }

@@ -4,6 +4,7 @@ import { assertBrowserActionCurrent } from "../browser-action.js";
 import { copyTimelinePng, timelineDomToPng } from "./timeline-image-export.js";
 import { useClipboardAction } from "./use-clipboard-action.js";
 import { GeneratedImageAnnotationButton, generatedImageAnnotationLabels } from "./GeneratedImageAnnotationButton.js";
+import { RENDERED_SHARE_EXCLUDE_ATTRIBUTE } from "./rendered-share-dom.js";
 import type { Translator } from "./types.js";
 import { IconButton } from "./ui.js";
 
@@ -33,7 +34,7 @@ export function TimelineCopyAsImageBlock({ children, ownerKey, sourceKey, imageN
 
   return <div className={`timeline-copy-block${className === undefined ? "" : ` ${className}`}`}>
     <div ref={bindContent} className={contentClassName}>{children}</div>
-    <IconButton className="timeline-copy-block__button" aria-disabled={copy.pending} aria-busy={copy.pending} label={label} onClick={(event) => {
+    <IconButton {...{ [RENDERED_SHARE_EXCLUDE_ATTRIBUTE]: "" }} className="timeline-copy-block__button" aria-disabled={copy.pending} aria-busy={copy.pending} label={label} onClick={(event) => {
       const node = contentRef.current;
       if (node === null) return;
       copy.run(event.currentTarget.ownerDocument, async (context) => {

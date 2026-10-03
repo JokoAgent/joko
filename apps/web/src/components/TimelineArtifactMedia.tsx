@@ -8,6 +8,7 @@ import { Spinner, cx } from "./ui.js";
 import { VideoPreview } from "./VideoPreview.js";
 import { AudioPreview } from "./AudioPreview.js";
 import { NativeFileActionsContext, NativeFileActionsMenu } from "./NativeFileCopyMenu.js";
+import { RENDERED_SHARE_CONTENT_PENDING_ATTRIBUTE } from "./rendered-share-dom.js";
 
 export type TimelineArtifactMediaKind = "audio" | "video";
 
@@ -58,7 +59,7 @@ export function TimelineArtifactMedia({ artifact, playbackOwnerKey, loadUrl, t, 
     setLoadedUrl({ status: "error", owner: sourceKey });
   };
 
-  return <div className={cx("timeline-artifact-media", `timeline-artifact-media--${kind}`, className)}>
+  return <div {...(urlState.status === "loading" ? { [RENDERED_SHARE_CONTENT_PENDING_ATTRIBUTE]: "" } : {})} className={cx("timeline-artifact-media", `timeline-artifact-media--${kind}`, className)}>
     {urlState.status === "loading" && <div className="timeline-artifact-media__state"><Spinner label={t("timeline.mediaLoading")} /></div>}
     {urlState.status === "error" && <div className="timeline-artifact-media__state is-error" role="alert"><AlertCircle aria-hidden="true" /><span>{t("timeline.mediaUnavailable")}</span></div>}
     {urlState.status === "error" && kind === "video" && <NativeFileActionsMenu actions={fileActions} artifactId={artifact.id} blobId={artifact.blobId} name={artifact.fileName} byteSize={artifact.byteSize} {...(artifact.sourceSessionId === undefined ? {} : { sourceSessionId: artifact.sourceSessionId })} sourceRevealAvailable={artifact.sourceRevealAvailable} ownerKey={sourceKey} t={t} />}

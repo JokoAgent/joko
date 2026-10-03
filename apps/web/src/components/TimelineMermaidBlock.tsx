@@ -9,6 +9,7 @@ import { generatedImageAnnotationLabels } from "./GeneratedImageAnnotationButton
 import { useMermaidTheme } from "./use-mermaid-theme.js";
 import { useClipboardAction } from "./use-clipboard-action.js";
 import { repairTimelineMermaidSource } from "./timeline-mermaid-autofix.js";
+import { RENDERED_SHARE_CONTENT_PENDING_ATTRIBUTE, RENDERED_SHARE_EXCLUDE_ATTRIBUTE } from "./rendered-share-dom.js";
 import type { Translator } from "./types.js";
 import { IconButton } from "./ui.js";
 
@@ -83,7 +84,8 @@ export const TimelineMermaidBlock = memo(function TimelineMermaidBlock({ ownerKe
     copyFailed: t("timeline.mermaidCopyFailed"), close: t("common.close")
   }), [t]);
   const copyLabel = copy.state === "copied" ? labels.copied : copy.state === "failed" ? labels.copyFailed : labels.copy;
-  return <div ref={bindRoot} className="timeline-mermaid">
+  const rendering = !sourceView && source.trim().length > 0 && svg === undefined && error === undefined;
+  return <div ref={bindRoot} {...(rendering ? { [RENDERED_SHARE_CONTENT_PENDING_ATTRIBUTE]: "" } : {})} className="timeline-mermaid">
     {sourceView ? <pre className="timeline-mermaid__source"><code className="language-mermaid">{source}</code></pre> : svg !== undefined ? (
       <div ref={cardRef} className="timeline-mermaid__diagram" role="button" tabIndex={0} aria-label={t("timeline.mermaidZoom")} title={t("timeline.mermaidZoom")}
         onClick={(event) => open(event.currentTarget)}
@@ -93,9 +95,9 @@ export const TimelineMermaidBlock = memo(function TimelineMermaidBlock({ ownerKe
         }}
         dangerouslySetInnerHTML={{ __html: svg }}
       />
-    ) : <pre className="timeline-mermaid__source is-loading"><code className="language-mermaid">{source}</code></pre>}
+    ) : <pre className={rendering ? "timeline-mermaid__source is-loading" : "timeline-mermaid__source"}><code className="language-mermaid">{source}</code></pre>}
     {error !== undefined && <p className="timeline-mermaid__error" title={error}>{t("timeline.mermaidRenderFailed")}</p>}
-    <div className="timeline-mermaid__toolbar">
+    <div {...{ [RENDERED_SHARE_EXCLUDE_ATTRIBUTE]: "" }} className="timeline-mermaid__toolbar">
       {svg !== undefined && !sourceView && <IconButton label={t("timeline.mermaidZoom")} onClick={(event) => open(event.currentTarget)}><Expand aria-hidden="true" /></IconButton>}
       {svg !== undefined && <IconButton label={sourceView ? t("timeline.mermaidViewDiagram") : t("timeline.mermaidViewSource")} onClick={() => setSourceViewScope(sourceView ? undefined : scope)}>{sourceView ? <Eye aria-hidden="true" /> : <Code2 aria-hidden="true" />}</IconButton>}
       <IconButton className="timeline-mermaid__copy" label={copyLabel} aria-busy={copy.pending} aria-disabled={copy.pending} onClick={(event) => {

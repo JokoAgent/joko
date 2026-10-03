@@ -5,6 +5,7 @@ import type { JSX, MouseEvent, ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { assertBrowserActionCurrent, WorkspaceHtmlExternalUnavailableError, type HttpLinkOpenOptions } from "../browser-action.js";
 import { writeClipboardText } from "../clipboard-action.js";
+import { RENDERED_SHARE_CONTENT_PENDING_ATTRIBUTE, RENDERED_SHARE_EXCLUDE_ATTRIBUTE, useRenderedShareSelection } from "./rendered-share-dom.js";
 import { useClipboardAction } from "./use-clipboard-action.js";
 import { TimelineLinkMenu } from "./TimelineLinkMenu.js";
 import type { ArtifactView, OperationApi, TimelineInputMentionRangeView, TimelineInputMentionView } from "../model.js";
@@ -136,8 +137,12 @@ function TimelineArtifactMention({ mention, actions, children }: {
       aria-busy={current?.status === "loading"} aria-disabled={!available || current?.status === "loading"}
       title={mention.displayText} onClick={open}>
       <FileText aria-hidden="true" /><span>{children}</span>
-      {current?.status === "loading" && <small role="status">{actions.t("common.loading")}</small>}
-      {(!available || current?.status === "error") && <small role="status">{actions.t("timeline.referenceUnavailable")}</small>}
+      {current?.status === "loading" && <small {...{ [RENDERED_SHARE_EXCLUDE_ATTRIBUTE]: "" }} role="status">{actions.t("common.loading")}</small>}
+      {!available
+        ? <small role="status">{actions.t("timeline.referenceUnavailable")}</small>
+        : current?.status === "error"
+          ? <small {...{ [RENDERED_SHARE_EXCLUDE_ATTRIBUTE]: "" }} role="status">{actions.t("timeline.referenceUnavailable")}</small>
+          : null}
     </button>
     {current?.status === "ready" && current.artifact !== undefined && trigger !== null
       && actions.renderArtifactPreview?.(current.artifact, trigger, () => setState(undefined))}
@@ -311,6 +316,7 @@ function TimelineWorkspaceImage({ path, alt, actions, t }: {
   readonly actions: TimelineReferenceActions;
   readonly t: Translator;
 }): JSX.Element {
+  const renderForShare = useRenderedShareSelection();
   const [state, setState] = useState<{ readonly status: "loading" } | { readonly status: "error" } | { readonly status: "ready"; readonly asset: TimelineWorkspaceAsset }>({ status: "loading" });
   const [open, setOpen] = useState(false);
   const triggerRef = useRef<HTMLButtonElement>(null);
@@ -330,12 +336,12 @@ function TimelineWorkspaceImage({ path, alt, actions, t }: {
     );
     return () => { active = false; acquired?.release(); };
   }, [path]);
-  if (state.status === "loading") return <span className="timeline-workspace-image is-loading" role="status">{t("workspace.loadingPreview")}</span>;
+  if (state.status === "loading") return <span {...{ [RENDERED_SHARE_CONTENT_PENDING_ATTRIBUTE]: "" }} className="timeline-workspace-image is-loading" role="status">{t("workspace.loadingPreview")}</span>;
   if (state.status === "error") return <span className="markdown-image-blocked">[{t("workspace.imageUnavailable")}{alt === undefined || alt.length === 0 ? "" : `: ${alt}`}]</span>;
   const asset = state.asset;
   return <>
     <button ref={triggerRef} type="button" className="timeline-workspace-image" aria-label={`${t("workspace.imageOpen")}: ${asset.name}`} onClick={() => setOpen(true)}>
-      <img src={asset.url} alt={alt ?? asset.name} loading="lazy" />
+      <img src={asset.url} alt={alt ?? asset.name} loading={renderForShare ? "eager" : "lazy"} />
     </button>
     {open && <WorkspaceImageLightbox
       ownerKey={JSON.stringify([actions.ownerKey, actions.sessionId, path])}
