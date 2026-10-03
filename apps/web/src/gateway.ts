@@ -996,6 +996,20 @@ interface GatewayActionScope {
   readonly signal: AbortSignal;
 }
 
+interface LocalUserInputOperation {
+  readonly profileId: string;
+  readonly serverId: string;
+  readonly origin: string;
+  readonly sessionId: string;
+  readonly generation: bigint;
+}
+
+type LocalUserInputMatcher = (event: Event) => boolean;
+
+// Retain exact attempts across reconnects and uncertain responses for this
+// renderer lifetime. Only operation and connection identities enter this map.
+const localUserInputOperations = new Map<string, LocalUserInputOperation>();
+
 class ConnectOrchestratorGateway implements OrchestratorGateway {
   readonly #profile: ConnectionProfile | undefined;
   readonly #authKey: string | undefined;
@@ -1743,7 +1757,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
       && fetchedCursor.sequence < currentCursor.sequence
     ) return;
     const mapped = {
-      ...mapSnapshot(raw, entryMap, managedModelRuntimes),
+      ...mapSnapshot(raw, entryMap, managedModelRuntimes, this.isLocalUserInput),
       // Owner snapshots intentionally omit session timelines. Preserve the
       // client-side deletion fences until the App has reloaded the affected
       // authoritative history page.
@@ -5466,7 +5480,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
       aroundEventId: eventId,
       limit: Math.min(Math.max(Math.trunc(limit), 1), 500)
     }, this.#abort === undefined ? undefined : { signal: this.#abort.signal });
-    return buildTimeline(response.events).get(sessionId) ?? [];
+    return buildTimeline(response.events, this.isLocalUserInput).get(sessionId) ?? [];
   }
 
   async loadSessionTimelinePage(sessionId: string, beforeCursor?: TimelineHistoryCursorView, limit = 200): Promise<TimelineHistoryPageView> {
@@ -5483,7 +5497,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
       limit: Math.min(Math.max(Math.trunc(limit), 1), 500)
     }, this.#abort === undefined ? undefined : { signal: this.#abort.signal });
     return {
-      items: buildTimeline(response.events).get(sessionId) ?? [],
+      items: buildTimeline(response.events, this.isLocalUserInput).get(sessionId) ?? [],
       ...(response.nextBeforeCursor === undefined ? {} : {
         nextBeforeCursor: {
           opaqueToken: response.nextBeforeCursor.opaqueToken,
@@ -8940,7 +8954,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
               lastSequence = this.#snapshot?.cursor;
               continue;
             }
-            const projected = projectSnapshotEvent(rawSnapshot, snapshot, event);
+            const projected = projectSnapshotEvent(rawSnapshot, snapshot, event, this.isLocalUserInput);
             this.#rawSnapshot = projected.rawSnapshot;
             this.#snapshot = projected.snapshot;
             this.#callbacks.onSnapshot?.(projected.snapshot);
@@ -9036,7 +9050,25 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     };
     const signal = combinedAbortSignal(callerSignal, this.#abort?.signal);
     const options = signal === undefined ? undefined : { signal };
-    const submitOnce = () => { signal?.throwIfAborted(); return client.submitOperation(request, options); };
+    const submitOnce = () => {
+      signal?.throwIfAborted();
+      if (payload.case === "sendInput" && this.#profile !== undefined) {
+        const generation = request.mutation.preconditions.find((precondition) =>
+          precondition.entity?.kind === EntityKind.SESSION
+          && precondition.entity.id === payload.value.sessionId
+        )?.expectedGeneration;
+        if (generation !== undefined && generation > 0n) {
+          localUserInputOperations.set(operationId, {
+            profileId: this.#profile.id,
+            serverId: this.#profile.serverId,
+            origin: this.#profile.origin,
+            sessionId: payload.value.sessionId ?? "",
+            generation
+          });
+        }
+      }
+      return client.submitOperation(request, options);
+    };
     let response;
     try {
       response = await submitOnce();
@@ -9080,6 +9112,19 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     void this.refresh().catch((error: unknown) => { if (!signal?.aborted) this.#callbacks.onError?.(normalizeError(error)); });
     return operation;
   }
+
+  private readonly isLocalUserInput: LocalUserInputMatcher = (event) => {
+    const identity = event.identity;
+    const profile = this.#profile;
+    if (identity === undefined || profile === undefined || identity.operationId === "") return false;
+    const local = localUserInputOperations.get(identity.operationId);
+    return local !== undefined
+      && local.profileId === profile.id
+      && local.serverId === profile.serverId
+      && local.origin === profile.origin
+      && local.sessionId === identity.sessionId
+      && local.generation === identity.generation;
+  };
 
   private async uploadAttachment(file: File, scope: GatewayActionScope): Promise<Record<string, unknown>> {
     return this.uploadBlob(file, BlobDisposition.ATTACHMENT, scope);
@@ -9294,7 +9339,8 @@ export interface EventProjectionResult {
 export function projectSnapshotEvent(
   rawSnapshot: Snapshot,
   snapshot: AppSnapshot,
-  event: Event
+  event: Event,
+  isLocalUserInput?: LocalUserInputMatcher
 ): EventProjectionResult {
   const cursor = event.cursor;
   let raw: Snapshot = {
@@ -9318,7 +9364,7 @@ export function projectSnapshotEvent(
 
   if (isTimelineEvent(kind.case) && !isVisionBridgeStatusEvent(event)) {
     raw = { ...raw, timeline: [...raw.timeline, event] };
-    projected = { ...projected, timelineBySession: projectTimelineEvent(projected.timelineBySession, event) };
+    projected = { ...projected, timelineBySession: projectTimelineEvent(projected.timelineBySession, event, isLocalUserInput) };
     if (kind.case === "runtimeRecoveryChanged") {
       const sessionId = event.identity?.sessionId ?? "";
       if (sessionId.length > 0) projected = remapSessionProjection(raw, projected, sessionId);
@@ -9933,7 +9979,8 @@ function isTimelineEvent(kind: NonNullable<NonNullable<Event["payload"]>["kind"]
 
 function projectTimelineEvent(
   timeline: ReadonlyMap<string, readonly TimelineItemView[]>,
-  event: Event
+  event: Event,
+  isLocalUserInput?: LocalUserInputMatcher
 ): ReadonlyMap<string, readonly TimelineItemView[]> {
   if (isVisionBridgeStatusEvent(event)) return timeline;
   const sessionId = event.identity?.sessionId ?? "";
@@ -9975,6 +10022,7 @@ function projectTimelineEvent(
           }
         : existing?.automationOrigin;
       const inputDelivery = uiMessageInputDelivery(kind.value.inputDelivery);
+      const inputOperationId = kind.value.role === 1 ? event.identity?.operationId : undefined;
       replaceOrAppend({
         id: kind.value.messageId,
         messageId: kind.value.messageId,
@@ -9987,6 +10035,8 @@ function projectTimelineEvent(
         text: kind.value.role === 1 ? userText : existing?.text ?? "",
         ...(kind.value.role === 1 ? { attachments: inputAttachments(userInput) } : {}),
         ...(userInputAccepted ? { userInputAccepted: true } : {}),
+        ...(inputOperationId ? { inputOperationId } : {}),
+        ...(kind.value.role === 1 && isLocalUserInput?.(event) === true ? { localUserInput: true } : {}),
         ...(userInputAccepted && inputMentions.length > 0 ? { inputMentions } : {}),
         ...(userInputAccepted && mentionRanges.length > 0 ? { mentionRanges } : {}),
         ...(userInputAccepted && userInput?.quotesEncoded === true ? { quotesEncoded: true } : {}),
@@ -10913,7 +10963,8 @@ async function loadManagedModelRuntimes(
 export function mapSnapshot(
   snapshot: Snapshot,
   workspaceEntries: ReadonlyMap<string, readonly WorkspaceEntry[]> = new Map(),
-  managedModelRuntimes: readonly ManagedModelRuntimeView[] = []
+  managedModelRuntimes: readonly ManagedModelRuntimeView[] = [],
+  isLocalUserInput?: LocalUserInputMatcher
 ): AppSnapshot {
   const settings = mapSettings(snapshot.settings);
   const providers = new Map(snapshot.providers.map((provider) => [providerKey(provider.backendId, provider.providerId), provider] as const));
@@ -10933,7 +10984,7 @@ export function mapSnapshot(
   }
   const reviewRuns = snapshot.reviewRuns.map(mapReviewRun);
   const timelineBySession = withMissingRunningReviewCards(
-    buildTimeline(snapshot.timeline),
+    buildTimeline(snapshot.timeline, isLocalUserInput),
     reviewRuns,
     snapshot.resumeCursor?.sequence ?? 0n
   );
@@ -17496,10 +17547,10 @@ function scheduleDeletionResult(operation: Operation): ScheduleDeletionResultVie
   };
 }
 
-function buildTimeline(events: readonly Event[]): ReadonlyMap<string, readonly TimelineItemView[]> {
+function buildTimeline(events: readonly Event[], isLocalUserInput?: LocalUserInputMatcher): ReadonlyMap<string, readonly TimelineItemView[]> {
   let timeline: ReadonlyMap<string, readonly TimelineItemView[]> = new Map();
   for (const event of [...events].sort((left, right) => Number((left.cursor?.sequence ?? 0n) - (right.cursor?.sequence ?? 0n)))) {
-    timeline = projectTimelineEvent(timeline, event);
+    timeline = projectTimelineEvent(timeline, event, isLocalUserInput);
   }
   return timeline;
 }

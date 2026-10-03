@@ -93,7 +93,7 @@ it("keeps mounted word timing and selection through appends and renders complete
     else Object.defineProperty(HTMLElement.prototype, "scrollTo", previousScrollTo);
   });
   await act(async () => root.render(<Timeline
-    ownerKey="thinking-owner" sessionId="thinking-session" sessionName="Thinking" sessionActive={false}
+    ownerKey="thinking-owner" viewportOwnerKey="thinking-viewport" sessionId="thinking-session" sessionName="Thinking" sessionActive={false}
     items={[{ id: "thinking", sequence: 1n, kind: "thinking", createdAt: 0, text: "```diff\n- old\n+ " + "long line ".repeat(50) + "\n```" }]}
     messageNavRailEnabled={false} streamFadeEnabled={false} hasEarlier={false} historyLoading={false}
     locale="en" t={t} onLoadEarlier={async () => undefined}
