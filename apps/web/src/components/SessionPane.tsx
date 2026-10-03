@@ -268,6 +268,11 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
   const compactGuardRef = useRef(new SessionScopedRequestGuard());
   const messageDeleteGuardRef = useRef(new SessionScopedRequestGuard());
   const paneRef = useRef<HTMLElement>(null);
+  const timelineRootRef = useRef<HTMLDivElement | null>(null);
+  const bindTimelineRoot = useCallback((root: HTMLDivElement | null): void => {
+    timelineRootRef.current = root;
+  }, []);
+  const getTimelineRoot = useCallback((): HTMLDivElement | null => timelineRootRef.current, []);
   const artifactCatalogDocumentEpochRef = useRef(0);
   const [artifactCatalogDocumentOwner, setArtifactCatalogDocumentOwner] = useState<{
     readonly document: Document;
@@ -1904,6 +1909,7 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
         onDeleteMessage={messageDeleteSupported ? openMessageDelete : undefined}
         messageDeleteBlockedReason={messageDeleteSupported ? messageDeleteBlockedReason : undefined}
         messageActionResetSignal={messageActionResetSignal}
+        onRootChange={bindTimelineRoot}
         onWorkspaceRewind={reviewReadOnly || !canRewindFromTimeline(backend, workspace) ? undefined : (workspaceId, changeSetId) => runAction(`preview-rewind:${changeSetId}`, async () => {
           if (workspace?.id !== workspaceId) throw new Error("This workspace change no longer belongs to the active task.");
           const requestId = ++messageRewindRequestIdRef.current;
@@ -2008,7 +2014,7 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
       >
         <InteractionDialog key={interaction === undefined ? "interaction:none" : `${interaction.sessionId}:${interaction.id}`} controller={controller} interaction={interaction} remaining={remainingInteractions} inline t={t} runAction={runAction} />
       </InteractionPromptHost>
-      {currentShareSelection !== undefined && <ShareSelectionBar ownerKey={`${timelineResourceOwnerKey}:${session.generation}`} sessionName={session.name} messages={shareableMessages} selectedIds={currentShareSelection.selectedIds} locale={controller.state.preferences.locale} t={t} onToggleAll={toggleAllShareMessages} onCancel={closeShareSelection} />}
+      {currentShareSelection !== undefined && <ShareSelectionBar ownerKey={`${timelineResourceOwnerKey}:${session.generation}`} sessionId={session.id} sessionName={session.name} messages={shareableMessages} selectedIds={currentShareSelection.selectedIds} locale={controller.state.preferences.locale} t={t} getTimelineRoot={getTimelineRoot} onToggleAll={toggleAllShareMessages} onCancel={closeShareSelection} />}
 {interaction === undefined && <div className="session-composer-layer" hidden={currentShareSelection !== undefined}><Composer artifacts={canListSessionArtifacts ? liveArtifacts : []} sessions={historicalSessionMentionCandidates} controller={controller} session={session} backend={backend} sessionUsage={effectiveSessionUsage} readOnly={reviewReadOnly} autoFocus={composerAutoFocus && presentation === "standard" && currentShareSelection === undefined} focusRequest={composerFocusRequest} queue={queue} queueControl={queueControl} workspace={workspace} extraDirectories={extraDirectories} resources={canListSessionResources ? liveResources : []} commands={canListRuntimeCommands ? liveCommands : []} messageHistory={messageHistory} controls={composerControls} runningStatus={<SessionRunningStatusBar session={session} items={recoveryPresentationTimeline} backgroundTaskIds={backgroundTaskIds} canStopBackgroundTasks={canStopBackgroundTasks} backgroundStopping={backgroundStopping} backgroundStopError={backgroundStopError} suppressed={reviewReadOnly} t={t} onStopBackgroundTasks={stopAllBackgroundTasks} />} messageMentionInsertion={composerMessageMentionInsertion} selectionQuoteInsertion={composerSelectionQuoteInsertion} attachmentInsertion={composerAttachmentInsertion} draftReplacement={composerDraftReplacement} onDraftMutation={noteComposerDraftMutation} t={t} runAction={runAction} onLocalSend={(sourceSessionId) => { if (activeSessionIdRef.current === sourceSessionId) setFollowLatestSignal((current) => current + 1); }} onStop={canStop ? stopRun : undefined} stopInFlight={stopInFlight} onCompact={canCompact && !running && activeCompaction === undefined && !compactInFlight && (session.context?.usedTokens ?? 0) > 0 ? requestCompact : undefined} /></div>}
       <ExtensionWidgets widgets={extensionWidgets.filter((widget) => widget.placement === "belowEditor")} label={t("a11y.extensionWidgets")} />
       </div>

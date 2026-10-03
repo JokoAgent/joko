@@ -20,6 +20,20 @@ export function orderedSelectedShareMessages(
   return shareableTimelineMessages(items).filter((item) => selectedIds.has(item.id));
 }
 
+export function shareSelectionPinnedRenderIndexes(
+  selectedIds: ReadonlySet<string>,
+  renderIndexByChildId: ReadonlyMap<string, number>,
+  maximumSelectedMessages: number
+): readonly number[] {
+  if (selectedIds.size > maximumSelectedMessages) return [];
+  const indexes = new Set<number>();
+  for (const id of selectedIds) {
+    const index = renderIndexByChildId.get(id);
+    if (index !== undefined) indexes.add(index);
+  }
+  return [...indexes].sort((left, right) => left - right);
+}
+
 export function toggleShareMessageSelection(
   orderedIds: readonly string[],
   current: ReadonlySet<string>,

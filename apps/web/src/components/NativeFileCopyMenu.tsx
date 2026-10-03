@@ -5,6 +5,7 @@ import type { OperationApi } from "../model.js";
 import type { MessageKey } from "../i18n.js";
 import { nativeArtifactSourceRevealAvailable, nativeFileCopyAvailable, nativeFileOpenAvailable } from "../native-file-actions.js";
 import type { Translator } from "./types.js";
+import { RENDERED_SHARE_EXCLUDE_ATTRIBUTE } from "./rendered-share-dom.js";
 import "./native-file-actions.css";
 
 export interface NativeArtifactFileActions {
@@ -193,7 +194,7 @@ export function NativeFileActionsMenu({ actions, artifactId, blobId, name, byteS
   };
   const text = feedback === undefined ? undefined : t(FEEDBACK_KEYS[feedback]);
   const pendingText = pending === "copy" ? t("media.copyingFile") : pending === "open" ? t("media.openingFile") : pending === "reveal" ? t("media.revealingSource") : undefined;
-  return <div ref={setNode} className="native-file-actions" aria-busy={pending !== undefined}>
+  return <div ref={setNode} {...{ [RENDERED_SHARE_EXCLUDE_ATTRIBUTE]: "" }} className="native-file-actions" aria-busy={pending !== undefined}>
     <details className="message-action-menu" onKeyDown={(event) => {
       if (event.nativeEvent.isComposing) return;
       if (event.key === "Escape") {

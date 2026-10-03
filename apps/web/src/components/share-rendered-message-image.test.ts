@@ -2,8 +2,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { pngBlob } from "./share-image.test-support.js";
 import {
-  RENDERED_SHARE_EXCLUDE_ATTRIBUTE,
-  RENDERED_SHARE_MESSAGE_ATTRIBUTE,
+  ShareRenderedMessageImageUnavailableError,
   ShareRenderedMessageNotMountedError,
   assertRenderedShareReadableSize,
   buildRenderedShareMessageImagePng,
@@ -15,6 +14,7 @@ import {
   stripRenderedShareInteractiveElements,
   type RenderedShareImageContent
 } from "./share-rendered-message-image.js";
+import { RENDERED_SHARE_CONTENT_PENDING_ATTRIBUTE, RENDERED_SHARE_EXCLUDE_ATTRIBUTE, RENDERED_SHARE_MESSAGE_ATTRIBUTE } from "./rendered-share-dom.js";
 import { ShareMessageImageTooLargeError } from "./share-message-image.js";
 import { timelineDomToPng } from "./timeline-image-export.js";
 
@@ -34,6 +34,7 @@ beforeEach(() => {
 afterEach(() => {
   document.body.replaceChildren();
   vi.restoreAllMocks();
+  vi.unstubAllGlobals();
 });
 
 describe("rendered share selection identity", () => {
@@ -141,6 +142,59 @@ describe("rendered share clone preparation", () => {
     });
     expect(() => assertRenderedShareReadableSize(root)).toThrow(ShareMessageImageTooLargeError);
   });
+
+  it("fails closed while a selected rich image has no capturable source", async () => {
+    const root = timelineRoot("session-loading");
+    const selected = message("selected");
+    const loading = selected.appendChild(document.createElement("span"));
+    loading.setAttribute(RENDERED_SHARE_CONTENT_PENDING_ATTRIBUTE, "");
+    root.append(selected);
+
+    await expect(build(root, "session-loading", content("selected"))).rejects.toBeInstanceOf(ShareRenderedMessageImageUnavailableError);
+    expect(timelineDomToPng).not.toHaveBeenCalled();
+  });
+});
+
+it("materializes a captured lazy image source without requiring the live image to be decoded", async () => {
+  const loadedSources: string[] = [];
+  class LoadableImage extends EventTarget {
+    complete = false;
+    decoding = "auto";
+    naturalWidth = 640;
+    naturalHeight = 360;
+    private value = "";
+    get src(): string { return this.value; }
+    set src(value: string) {
+      this.value = value;
+      loadedSources.push(value);
+      queueMicrotask(() => { this.complete = true; this.dispatchEvent(new Event("load")); });
+    }
+    removeAttribute(name: string): void { if (name === "src") this.value = ""; }
+  }
+  vi.stubGlobal("Image", LoadableImage);
+  vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue({ drawImage: vi.fn() } as unknown as CanvasRenderingContext2D);
+  vi.spyOn(HTMLCanvasElement.prototype, "toDataURL").mockReturnValue("data:image/png;base64,bGF6eQ==");
+  const root = timelineRoot("session-lazy");
+  const selected = message("selected");
+  const image = selected.appendChild(document.createElement("img"));
+  image.setAttribute("src", "blob:lazy-image");
+  Object.defineProperties(image, {
+    complete: { configurable: true, value: false },
+    naturalWidth: { configurable: true, value: 0 },
+    naturalHeight: { configurable: true, value: 0 }
+  });
+  root.append(selected);
+  let snapshot!: HTMLElement;
+  vi.mocked(timelineDomToPng).mockImplementation(async (node) => {
+    snapshot = node.cloneNode(true) as HTMLElement;
+    return validatedPngBlob();
+  });
+
+  await expect(build(root, "session-lazy", content("selected"))).resolves.toMatchObject({ type: "image/png" });
+
+  expect(loadedSources).toEqual(["blob:lazy-image"]);
+  expect(snapshot.querySelector("img")?.getAttribute("src")).toBe("data:image/png;base64,bGF6eQ==");
+  expect(image.getAttribute("src")).toBe("blob:lazy-image");
 });
 
 it("passes an ordered rich, redacted snapshot with explicit gaps to rasterization without mutating the timeline", async () => {

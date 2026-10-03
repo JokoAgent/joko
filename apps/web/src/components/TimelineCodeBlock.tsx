@@ -6,6 +6,7 @@ import type { Translator } from "./types.js";
 import { IconButton } from "./ui.js";
 import { timelineCodeHighlight, timelineCodeLanguage, timelineCodeLanguageLabel } from "./timeline-code-highlighting.js";
 import { TimelineMarkdownDiffRows } from "./TimelineMarkdownDiffRows.js";
+import { RENDERED_SHARE_EXCLUDE_ATTRIBUTE } from "./rendered-share-dom.js";
 import "./timeline-code-block.css";
 
 export function TimelineCodeBlock({ ownerKey, source, codeClassName, t }: {
@@ -32,7 +33,7 @@ export function TimelineCodeBlock({ ownerKey, source, codeClassName, t }: {
     <pre className={language === "diff" ? "timeline-code-block__diff" : undefined} tabIndex={language === "diff" ? 0 : undefined} aria-label={language === "diff" ? timelineCodeLanguageLabel(language, t("timeline.codePlainText")) : undefined}>
       <code className={codeClassName}>{language === "diff" ? <TimelineMarkdownDiffRows source={source} /> : highlightedCode(source, tokens)}</code>
     </pre>
-    <IconButton className="timeline-code-block__copy" label={label} aria-disabled={copy.pending} aria-busy={copy.pending} onClick={(event) => copy.run(event.currentTarget.ownerDocument, (context) => writeClipboardText(source, context))}>
+    <IconButton {...{ [RENDERED_SHARE_EXCLUDE_ATTRIBUTE]: "" }} className="timeline-code-block__copy" label={label} aria-disabled={copy.pending} aria-busy={copy.pending} onClick={(event) => copy.run(event.currentTarget.ownerDocument, (context) => writeClipboardText(source, context))}>
       {copy.state === "copied" ? <Check aria-hidden="true" /> : <Clipboard aria-hidden="true" />}
     </IconButton>
     {copy.state === "failed" && <span className="sr-only" role="alert">{label}</span>}

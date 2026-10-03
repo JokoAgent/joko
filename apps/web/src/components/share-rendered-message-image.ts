@@ -10,9 +10,8 @@ import {
   redactShareMessageText
 } from "./share-message-image.js";
 import { TIMELINE_FROZEN_IMAGE_ATTRIBUTE, rewriteTimelineSnapshotIds, timelineDomToPng, timelineExportScale } from "./timeline-image-export.js";
+import { RENDERED_SHARE_CONTENT_PENDING_ATTRIBUTE, RENDERED_SHARE_EXCLUDE_ATTRIBUTE, RENDERED_SHARE_MESSAGE_ATTRIBUTE } from "./rendered-share-dom.js";
 
-export const RENDERED_SHARE_MESSAGE_ATTRIBUTE = "data-rendered-share-message-id";
-export const RENDERED_SHARE_EXCLUDE_ATTRIBUTE = "data-rendered-share-exclude";
 export const MAXIMUM_RENDERED_SHARE_MESSAGES = 80;
 export const MAXIMUM_RENDERED_SHARE_ATTACHMENTS = 64;
 export const MAXIMUM_RENDERED_SHARE_IMAGE_EDGE_PIXELS = 16_384;
@@ -22,6 +21,7 @@ const MAXIMUM_RENDERED_SHARE_SOURCE_IMAGE_PIXELS = MAXIMUM_SHARE_IMAGE_PIXELS * 
 const MAXIMUM_RENDERED_SHARE_DOM_NODES = 20_000;
 const MAXIMUM_RENDERED_SHARE_DOM_CHARACTERS = MAXIMUM_SHARE_MESSAGE_CHARACTERS * 4;
 const MAXIMUM_SHARE_CONTENT_CSS_WIDTH = 914;
+const RENDERED_SHARE_IMAGE_INDEX_ATTRIBUTE = "data-rendered-share-image-index";
 let renderedShareSnapshotSequence = 0;
 
 const CLONE_STRIPPED_ATTRIBUTES = [
@@ -34,6 +34,7 @@ const CLONE_STRIPPED_ATTRIBUTES = [
   "data-selection-quote-message-id",
   "data-selection-quote-source-event-id",
   "data-selection-quote-role",
+  RENDERED_SHARE_CONTENT_PENDING_ATTRIBUTE,
   RENDERED_SHARE_MESSAGE_ATTRIBUTE
 ] as const;
 
@@ -230,15 +231,21 @@ export async function buildRenderedShareMessageImagePng({
   const gaps = renderedShareSelectionGaps(orderedTimelineMessageIds, content.messages.map((message) => message.id));
   assertTimelineSourceCurrent(timelineRoot, sessionId, action);
   const sourceNodes = exactRenderedShareMessageNodes(timelineRoot, content.messages.map((message) => message.id));
+  if (sourceNodes.some((node) => node.hasAttribute(RENDERED_SHARE_CONTENT_PENDING_ATTRIBUTE)
+    || node.querySelector(`[${RENDERED_SHARE_CONTENT_PENDING_ATTRIBUTE}]`) !== null)) {
+    throw new ShareRenderedMessageImageUnavailableError();
+  }
   const ownerDocument = action.ownerDocument;
   const frozenImages = { count: 0, pixels: 0 };
+  const pendingImages: CapturedRenderedImage[] = [];
   const clones = sourceNodes.map((source) => {
     const clone = source.cloneNode(true) as HTMLElement;
-    freezeRenderedImages(source, clone, action, frozenImages);
+    markRenderedImageCloneIndexes(source, clone);
     stripRenderedShareInteractiveElements(clone);
     expandRenderedShareCollapsedContent(clone);
     stripRenderedShareCloneAnchors(clone);
     redactRenderedShareTextNodes(clone);
+    pendingImages.push(...captureRenderedImages(source, clone, action, frozenImages));
     return clone;
   });
   assertRenderedShareDomBudget(clones);
@@ -274,6 +281,8 @@ export async function buildRenderedShareMessageImagePng({
   // it its own ids before attachment so Mermaid/KaTeX/useId references cannot
   // resolve against the live Timeline. The rasterizer remaps its second clone.
   rewriteTimelineSnapshotIds(stage, nextRenderedShareSnapshotPrefix(ownerDocument));
+  await materializeCapturedRenderedImages(pendingImages, action, frozenImages);
+  assertTimelineSourceCurrent(timelineRoot, sessionId, action);
   host.append(stage);
   ownerDocument.body.append(host);
   try {
@@ -378,47 +387,121 @@ function assertTimelineSourceCurrent(root: HTMLElement, sessionId: string, actio
   ) throw new ShareRenderedMessageNotMountedError();
 }
 
-function freezeRenderedImages(
+interface CapturedRenderedImage {
+  readonly copy: HTMLImageElement;
+  readonly sourceUrl: string;
+}
+
+function markRenderedImageCloneIndexes(source: HTMLElement, clone: HTMLElement): void {
+  const originals = source.querySelectorAll("img");
+  const copies = clone.querySelectorAll("img");
+  if (originals.length !== copies.length) throw new ShareMessageImageEncodingError();
+  copies.forEach((copy, index) => copy.setAttribute(RENDERED_SHARE_IMAGE_INDEX_ATTRIBUTE, String(index)));
+}
+
+function captureRenderedImages(
   source: HTMLElement,
   clone: HTMLElement,
   action: BrowserActionContext,
   budget: { count: number; pixels: number }
-): void {
+): readonly CapturedRenderedImage[] {
   const originals = [...source.querySelectorAll<HTMLImageElement>("img")];
   const copies = [...clone.querySelectorAll<HTMLImageElement>("img")];
-  if (originals.length !== copies.length) throw new ShareMessageImageEncodingError();
-  originals.forEach((image, index) => {
+  const pending: CapturedRenderedImage[] = [];
+  copies.forEach((copy) => {
     assertBrowserActionCurrent(action);
-    if (!image.complete || image.naturalWidth <= 0 || image.naturalHeight <= 0) throw new ShareRenderedMessageImageUnavailableError();
+    const originalIndex = Number(copy.getAttribute(RENDERED_SHARE_IMAGE_INDEX_ATTRIBUTE));
+    copy.removeAttribute(RENDERED_SHARE_IMAGE_INDEX_ATTRIBUTE);
+    const image = Number.isSafeInteger(originalIndex) && originalIndex >= 0 ? originals[originalIndex] : undefined;
+    if (image === undefined) throw new ShareMessageImageEncodingError();
     budget.count += 1;
-    const scale = timelineExportScale(image.naturalWidth, image.naturalHeight, 1);
-    const width = Math.max(1, Math.floor(image.naturalWidth * scale));
-    const height = Math.max(1, Math.floor(image.naturalHeight * scale));
-    budget.pixels += width * height;
-    if (budget.count > MAXIMUM_RENDERED_SHARE_IMAGES || budget.pixels > MAXIMUM_RENDERED_SHARE_SOURCE_IMAGE_PIXELS) {
-      throw new ShareMessageImageTooLargeError();
-    }
-    const canvas = action.ownerDocument.createElement("canvas");
-    try {
-      canvas.width = width;
-      canvas.height = height;
-      const drawing = canvas.getContext("2d");
-      if (drawing === null) throw new ShareMessageImageEncodingError();
-      drawing.drawImage(image, 0, 0, width, height);
-      const copy = copies[index]!;
-      copy.setAttribute("src", canvas.toDataURL("image/png"));
-      copy.removeAttribute("srcset");
-      copy.closest("picture")?.querySelectorAll("source").forEach((source) => source.remove());
-      copy.setAttribute("loading", "eager");
-      copy.setAttribute(TIMELINE_FROZEN_IMAGE_ATTRIBUTE, "");
-    } catch (error) {
-      if (error instanceof ShareMessageImageTooLargeError || error instanceof ShareMessageImageEncodingError) throw error;
-      throw new ShareMessageImageEncodingError();
-    } finally {
-      canvas.width = 0;
-      canvas.height = 0;
+    if (budget.count > MAXIMUM_RENDERED_SHARE_IMAGES) throw new ShareMessageImageTooLargeError();
+    const rawSource = image.currentSrc || image.getAttribute("src") || "";
+    const sourceUrl = image.currentSrc || image.src;
+    if (rawSource.trim() === "" || sourceUrl.trim() === "") throw new ShareRenderedMessageImageUnavailableError();
+    copy.removeAttribute("src");
+    copy.removeAttribute("srcset");
+    copy.closest("picture")?.querySelectorAll("source").forEach((pictureSource) => pictureSource.remove());
+    copy.setAttribute("loading", "eager");
+    if (image.complete && image.naturalWidth > 0 && image.naturalHeight > 0) {
+      freezeRenderedImage(image, copy, action, budget);
+    } else {
+      pending.push({ copy, sourceUrl });
     }
   });
+  return pending;
+}
+
+async function materializeCapturedRenderedImages(
+  images: readonly CapturedRenderedImage[],
+  action: BrowserActionContext,
+  budget: { count: number; pixels: number }
+): Promise<void> {
+  for (const captured of images) {
+    assertBrowserActionCurrent(action);
+    const image = await loadCapturedRenderedImage(captured.sourceUrl, action);
+    assertBrowserActionCurrent(action);
+    freezeRenderedImage(image, captured.copy, action, budget);
+  }
+}
+
+function loadCapturedRenderedImage(sourceUrl: string, action: BrowserActionContext): Promise<HTMLImageElement> {
+  const ownerWindow = action.ownerDocument.defaultView;
+  if (ownerWindow === null) throw new ShareRenderedMessageNotMountedError();
+  const image = new ownerWindow.Image();
+  image.decoding = "sync";
+  return new Promise<HTMLImageElement>((resolve, reject) => {
+    const cleanup = (): void => {
+      image.removeEventListener("load", onLoad);
+      image.removeEventListener("error", onError);
+      action.signal.removeEventListener("abort", onAbort);
+    };
+    const onLoad = (): void => {
+      cleanup();
+      if (image.naturalWidth <= 0 || image.naturalHeight <= 0) reject(new ShareRenderedMessageImageUnavailableError());
+      else resolve(image);
+    };
+    const onError = (): void => { cleanup(); reject(new ShareRenderedMessageImageUnavailableError()); };
+    const onAbort = (): void => {
+      cleanup();
+      image.removeAttribute("src");
+      reject(action.signal.reason);
+    };
+    image.addEventListener("load", onLoad, { once: true });
+    image.addEventListener("error", onError, { once: true });
+    action.signal.addEventListener("abort", onAbort, { once: true });
+    image.src = sourceUrl;
+    if (image.complete) ownerWindow.queueMicrotask(image.naturalWidth > 0 && image.naturalHeight > 0 ? onLoad : onError);
+  });
+}
+
+function freezeRenderedImage(
+  image: HTMLImageElement,
+  copy: HTMLImageElement,
+  action: BrowserActionContext,
+  budget: { count: number; pixels: number }
+): void {
+  const scale = timelineExportScale(image.naturalWidth, image.naturalHeight, 1);
+  const width = Math.max(1, Math.floor(image.naturalWidth * scale));
+  const height = Math.max(1, Math.floor(image.naturalHeight * scale));
+  budget.pixels += width * height;
+  if (budget.pixels > MAXIMUM_RENDERED_SHARE_SOURCE_IMAGE_PIXELS) throw new ShareMessageImageTooLargeError();
+  const canvas = action.ownerDocument.createElement("canvas");
+  try {
+    canvas.width = width;
+    canvas.height = height;
+    const drawing = canvas.getContext("2d");
+    if (drawing === null) throw new ShareMessageImageEncodingError();
+    drawing.drawImage(image, 0, 0, width, height);
+    copy.setAttribute("src", canvas.toDataURL("image/png"));
+    copy.setAttribute(TIMELINE_FROZEN_IMAGE_ATTRIBUTE, "");
+  } catch (error) {
+    if (error instanceof ShareMessageImageTooLargeError || error instanceof ShareMessageImageEncodingError) throw error;
+    throw new ShareMessageImageEncodingError();
+  } finally {
+    canvas.width = 0;
+    canvas.height = 0;
+  }
 }
 
 function renderedShareContentWidth(root: HTMLElement, nodes: readonly HTMLElement[]): number {

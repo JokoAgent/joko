@@ -4,20 +4,23 @@ import type { JSX } from "react";
 import type { TimelineItemView } from "../model.js";
 import { assertBrowserActionCurrent, type BrowserActionContext } from "../browser-action.js";
 import { orderedSelectedShareMessages } from "./share-selection-behavior.js";
-import { buildShareSelectionImagePng, copyShareSelectionImagePng, deliverShareSelectionImagePng, downloadShareSelectionImagePng, shareSelectionImageMessages } from "./share-selection-image.js";
+import { copyShareSelectionImagePng, deliverShareSelectionImagePng, downloadShareSelectionImagePng, shareSelectionImageMessages } from "./share-selection-image.js";
 import { ShareMessageImageEmptyError, ShareMessageImageTooLargeError } from "./share-message-image.js";
+import { ShareRenderedMessageImageUnavailableError, ShareRenderedMessageNotMountedError, buildRenderedShareMessageImagePng } from "./share-rendered-message-image.js";
 import type { Translator } from "./types.js";
 import { Button, Spinner, cx, formatDateTime } from "./ui.js";
 
 type BusyKind = "copy" | "download" | "share";
 
-export function ShareSelectionBar({ ownerKey, sessionName, messages, selectedIds, locale, t, onToggleAll, onCancel }: {
+export function ShareSelectionBar({ ownerKey, sessionId, sessionName, messages, selectedIds, locale, t, getTimelineRoot, onToggleAll, onCancel }: {
   readonly ownerKey: string;
+  readonly sessionId: string;
   readonly sessionName: string;
   readonly messages: readonly TimelineItemView[];
   readonly selectedIds: ReadonlySet<string>;
   readonly locale: string;
   readonly t: Translator;
+  readonly getTimelineRoot: () => HTMLElement | null;
   readonly onToggleAll: () => void;
   readonly onCancel: () => void;
 }): JSX.Element {
@@ -39,7 +42,10 @@ export function ShareSelectionBar({ ownerKey, sessionName, messages, selectedIds
       attachments: t("timeline.attachments")
     }, (createdAt) => formatDateTime(createdAt, locale))
   };
-  const sourceKey = JSON.stringify([content, selectedMessages.map((message) => [message.id, message.sourceEventId, message.createdAt])]);
+  const sourceKey = JSON.stringify([
+    content,
+    messages.map((message) => [message.id, message.sourceEventId, message.createdAt])
+  ]);
   const retire = useCallback((): void => {
     const request = requestRef.current;
     requestRef.current = undefined;
@@ -73,20 +79,33 @@ export function ShareSelectionBar({ ownerKey, sessionName, messages, selectedIds
   const run = async (kind: BusyKind, ownerDocument: Document): Promise<void> => {
     const scope = scopeRef.current;
     if (scope === undefined || scope.document !== ownerDocument || requestRef.current !== undefined || selectedMessages.length === 0) return;
+    const timelineRoot = getTimelineRoot();
+    if (timelineRoot === null || !timelineRoot.isConnected || timelineRoot.ownerDocument !== ownerDocument || timelineRoot.dataset.timelineSessionId !== sessionId) {
+      setFeedback({ kind: "error", text: t("timeline.shareSelectionNotReady") });
+      return;
+    }
     retire();
     const abort = new AbortController();
     const ownerWindow = ownerDocument.defaultView;
     const request = abort;
     const current = (): boolean => scopeRef.current === scope && requestRef.current === request && !abort.signal.aborted
       && barRef.current?.isConnected === true && barRef.current.ownerDocument === ownerDocument
-      && ownerWindow?.document === ownerDocument && !ownerWindow.closed;
+      && ownerWindow?.document === ownerDocument && !ownerWindow.closed
+      && getTimelineRoot() === timelineRoot && timelineRoot.isConnected && timelineRoot.ownerDocument === ownerDocument
+      && timelineRoot.dataset.timelineSessionId === sessionId;
     const action: BrowserActionContext = { ownerDocument, signal: abort.signal };
     requestRef.current = request;
     setBusy(kind);
     setFeedback(undefined);
     try {
       assertBrowserActionCurrent(action);
-      const blob = await buildShareSelectionImagePng(content, action);
+      const blob = await buildRenderedShareMessageImagePng({
+        timelineRoot,
+        sessionId,
+        orderedTimelineMessageIds: messages.map((message) => message.id),
+        content,
+        action
+      });
       if (!current()) return;
       assertBrowserActionCurrent(action);
       const createdAt = selectedMessages[0]?.createdAt ?? Date.now();
@@ -118,6 +137,8 @@ export function ShareSelectionBar({ ownerKey, sessionName, messages, selectedIds
         kind: "error",
         text: error instanceof ShareMessageImageTooLargeError
           ? t("timeline.shareSelectionTooLarge")
+          : error instanceof ShareRenderedMessageNotMountedError || error instanceof ShareRenderedMessageImageUnavailableError
+            ? t("timeline.shareSelectionNotReady")
           : error instanceof ShareMessageImageEmptyError
             ? t("timeline.shareEmpty")
             : kind === "copy"
