@@ -5,7 +5,7 @@ import type { DedicatedHardwareTaskActivity, DedicatedHardwareTaskCatalog } from
 import { dedicatedHardwareTaskActivity } from "./dedicated-hardware-app.js";
 
 const REFRESH_MS = 10_000;
-const INITIAL_REFRESH_MS = 250;
+const ACTIVITY_REFRESH_MS = 250;
 const REQUEST_TIMEOUT_MS = 5_000;
 const ROUND_TIMEOUT_MS = 5_000;
 const ROUND_REQUEST_BUDGET = 128;
@@ -79,6 +79,7 @@ export function useDedicatedHardwareCollaborationCatalog(
   const latest = useRef({ controller, catalog });
   latest.current = { controller, catalog };
   const pageRetired = useRef(false);
+  const activityRefresh = useRef<(() => void) | undefined>(undefined);
   const [snapshot, setSnapshot] = useState<RelationSnapshot>();
   useEffect(() => {
     const retire = (): void => { pageRetired.current = true; setSnapshot(undefined); };
@@ -86,6 +87,15 @@ export function useDedicatedHardwareCollaborationCatalog(
     return () => window.removeEventListener("pagehide", retire);
   }, []);
   const state = controller.state;
+  const activityKey = useMemo(() => JSON.stringify([...state.snapshot.sessions]
+    .sort((left, right) => left.id < right.id ? -1 : left.id > right.id ? 1 : 0)
+    .map((session) => {
+      const activity = dedicatedHardwareTaskActivity(session, state.snapshot.interactions);
+      return [session.id, session.generation.toString(10), session.backendId, session.targetId,
+        session.archived, session.state === "closed", activity.phase, activity.attention,
+        state.snapshot.interactions.filter((interaction) => interaction.sessionId === session.id
+          && interaction.generation === session.generation).map((interaction) => interaction.id).sort()];
+    })), [state.snapshot.sessions, state.snapshot.interactions]);
   const leads = catalog?.tasks.filter((task) => task.catalogEligible && task.sidebarOrder !== null
     && state.snapshot.sessions.some((session) => session.id === task.sessionId && !session.archived && session.state !== "closed"
       && session.generation.toString(10) === task.sessionGeneration))
@@ -106,6 +116,9 @@ export function useDedicatedHardwareCollaborationCatalog(
     const expectedConnection = state.connectionGeneration;
     let nextLead = 0;
     let timer: number | undefined;
+    let timerIsActivity = false;
+    let refreshInFlight = false;
+    let refreshQueued = false;
     const current = (): boolean => {
       const now = latest.current;
       return !abort.signal.aborted && !pageRetired.current && now.controller === controller && now.catalog !== undefined
@@ -169,47 +182,86 @@ export function useDedicatedHardwareCollaborationCatalog(
         if (currentLead(lead)) cache.set(lead.sessionId, retained);
       } catch { if (currentLead(lead)) { cache.delete(lead.sessionId); publishCache(); } }
     };
+    const clearRefreshTimer = (): void => {
+      if (timer !== undefined) window.clearTimeout(timer);
+      timer = undefined;
+      timerIsActivity = false;
+    };
+    const scheduleRefresh = (delayMs: number, activity: boolean): void => {
+      timerIsActivity = activity;
+      timer = window.setTimeout(() => {
+        timer = undefined;
+        timerIsActivity = false;
+        void refresh();
+      }, delayMs);
+    };
     const refresh = async (): Promise<void> => {
       if (!current()) return;
-      const leadCount = Math.min(leads.length, ROUND_REQUEST_BUDGET / 2);
-      const firstLead = nextLead;
-      const selected = Array.from({ length: leadCount }, (_, index) => leads[(firstLead + index) % leads.length]!);
-      const goalBudget = Math.max(1, Math.floor(ROUND_REQUEST_BUDGET / leadCount) - 1);
-      let pending = 0;
-      const round = new AbortController();
-      const cancelRound = (): void => round.abort();
-      abort.signal.addEventListener("abort", cancelRound, { once: true });
-      const roundTimer = window.setTimeout(cancelRound, ROUND_TIMEOUT_MS);
+      if (refreshInFlight) { refreshQueued = true; return; }
+      refreshInFlight = true;
       try {
-        await Promise.all(Array.from({ length: Math.min(CONCURRENCY, leadCount) }, async () => {
-          while (pending < selected.length && current() && !round.signal.aborted) {
-            const lead = selected[pending++]!;
-            await loadLead(lead, goalBudget, round.signal);
-          }
-        }));
+        const leadCount = Math.min(leads.length, ROUND_REQUEST_BUDGET / 2);
+        const firstLead = nextLead;
+        const selected = Array.from({ length: leadCount }, (_, index) => leads[(firstLead + index) % leads.length]!);
+        const goalBudget = Math.max(1, Math.floor(ROUND_REQUEST_BUDGET / leadCount) - 1);
+        let pending = 0;
+        const round = new AbortController();
+        const cancelRound = (): void => round.abort();
+        abort.signal.addEventListener("abort", cancelRound, { once: true });
+        const roundTimer = window.setTimeout(cancelRound, ROUND_TIMEOUT_MS);
+        try {
+          await Promise.all(Array.from({ length: Math.min(CONCURRENCY, leadCount) }, async () => {
+            while (pending < selected.length && current() && !round.signal.aborted) {
+              const lead = selected[pending++]!;
+              await loadLead(lead, goalBudget, round.signal);
+            }
+          }));
+        } finally {
+          nextLead = (firstLead + pending) % leads.length;
+          window.clearTimeout(roundTimer);
+          abort.signal.removeEventListener("abort", cancelRound);
+        }
+        publishCache();
       } finally {
-        nextLead = (firstLead + pending) % leads.length;
-        window.clearTimeout(roundTimer);
-        abort.signal.removeEventListener("abort", cancelRound);
+        refreshInFlight = false;
+        if (current()) {
+          if (refreshQueued) {
+            refreshQueued = false;
+            void refresh();
+          } else if (timer === undefined) {
+            scheduleRefresh(REFRESH_MS, false);
+          }
+        } else {
+          refreshQueued = false;
+        }
       }
-      if (!current()) return;
-      publishCache();
-      timer = window.setTimeout(() => { void refresh(); }, REFRESH_MS);
     };
+    const scheduleActivityRefresh = (): void => {
+      if (!current() || refreshQueued || timerIsActivity) return;
+      clearRefreshTimer();
+      scheduleRefresh(ACTIVITY_REFRESH_MS, true);
+    };
+    activityRefresh.current = scheduleActivityRefresh;
     const retire = (): void => {
       pageRetired.current = true;
       abort.abort();
-      if (timer !== undefined) window.clearTimeout(timer);
+      clearRefreshTimer();
+      refreshQueued = false;
+      if (activityRefresh.current === scheduleActivityRefresh) activityRefresh.current = undefined;
       setSnapshot(undefined);
     };
     window.addEventListener("pagehide", retire);
-    timer = window.setTimeout(() => { void refresh(); }, INITIAL_REFRESH_MS);
+    scheduleActivityRefresh();
     return () => {
       abort.abort();
-      if (timer !== undefined) window.clearTimeout(timer);
+      clearRefreshTimer();
+      refreshQueued = false;
+      if (activityRefresh.current === scheduleActivityRefresh) activityRefresh.current = undefined;
       window.removeEventListener("pagehide", retire);
     };
   }, [scope, controller]);
+
+  useEffect(() => { activityRefresh.current?.(); }, [activityKey, scope, controller]);
 
   return useMemo(() => catalog === undefined || scope === undefined || snapshot?.scope !== scope || pageRetired.current ? catalog
     : foldDedicatedHardwareCollaborationActivity(catalog, snapshot.relations, state.snapshot.sessions, state.snapshot.interactions),

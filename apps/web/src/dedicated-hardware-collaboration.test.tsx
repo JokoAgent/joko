@@ -1,17 +1,19 @@
 // @vitest-environment jsdom
 import { act, useEffect } from "react";
 import { createRoot, type Root } from "react-dom/client";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AppController } from "./controller.js";
-import type { CollaborationGoalTreeView, CollaborationGoalView, SessionView } from "./model.js";
+import type { CollaborationGoalTreeView, CollaborationGoalView, InteractionView, SessionAttentionView, SessionView } from "./model.js";
 import type { DedicatedHardwareTaskCatalog } from "./dedicated-hardware.js";
 import { foldDedicatedHardwareCollaborationActivity, useDedicatedHardwareCollaborationCatalog,
   type DedicatedHardwareCollaborationSource } from "./dedicated-hardware-collaboration.js";
 
 const roots: Root[] = [];
+beforeEach(() => { vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true); });
 afterEach(async () => {
   await act(async () => { for (const root of roots.splice(0)) root.unmount(); });
   vi.useRealTimers();
+  vi.unstubAllGlobals();
   document.body.innerHTML = "";
 });
 
@@ -29,8 +31,7 @@ describe("dedicated hardware collaboration activity", () => {
     expect(folded.tasks[0]?.sessionId).toBe("lead");
     expect(foldDedicatedHardwareCollaborationActivity(source, relations, [lead, { ...running, archived: true }, stale], [])).toBe(source);
     expect(foldDedicatedHardwareCollaborationActivity(source, relations, [{ ...lead, generation: 2n }, running], [])).toBe(source);
-    const waiting = { id: "question", sessionId: running.id, generation: 1n, kind: "question" as const,
-      title: "Question", message: "", options: [], fields: [], planSteps: [], createdAt: 0 };
+    const waiting = question(running);
     expect(foldDedicatedHardwareCollaborationActivity(source, relations, [lead, running], [waiting]).tasks[0]?.activity)
       .toEqual({ phase: "needs-interaction", attention: false });
   });
@@ -49,8 +50,7 @@ describe("dedicated hardware collaboration activity", () => {
     expect(value?.tasks[0]?.activity.phase).toBeNull();
     await act(async () => { await vi.advanceTimersByTimeAsync(250); });
     expect(value?.tasks[0]?.activity.phase).toBe("running");
-    const interaction = { id: "question", sessionId: worker.id, generation: 1n, kind: "question" as const,
-      title: "Question", message: "", options: [], fields: [], planSteps: [], createdAt: 0 };
+    const interaction = question(worker);
     state = { ...state, snapshot: { ...state.snapshot, interactions: [interaction] } };
     await act(async () => root.render(<Harness controller={controller} source={{ ...catalog([lead]), snapshotRevision: "2" }} receive={(next) => { value = next; }} />));
     expect(value?.tasks[0]?.activity.phase).toBe("needs-interaction");
@@ -61,19 +61,134 @@ describe("dedicated hardware collaboration activity", () => {
     expect(value?.tasks[0]?.activity.phase).toBeNull();
   });
 
-  it("drops late relationship results after page retirement", async () => {
+  it.each([
+    { change: "phase", expected: "running" },
+    { change: "interaction", expected: "needs-interaction" },
+    { change: "interaction-identity", expected: "needs-interaction" },
+    { change: "attention", expected: "completed" }
+  ] as const)("refreshes a new worker relation after a same-scope $change change within 250 ms", async ({ change, expected }) => {
+    vi.useFakeTimers();
+    const lead = session("lead", "idle");
+    const worker = session("worker", "idle");
+    let available = false;
+    const list = vi.fn(async () => available ? [goal(lead)] : []);
+    const get = vi.fn(async () => tree(lead, worker));
+    const initial = owner([lead, worker], list, get);
+    let state = change === "interaction-identity"
+      ? { ...initial.state, snapshot: { ...initial.state.snapshot, interactions: [question(worker)] } } : initial.state;
+    const controller = { ...initial, get state() { return state; } };
+    let value: DedicatedHardwareTaskCatalog | undefined;
+    const receive = (next: DedicatedHardwareTaskCatalog | undefined) => { value = next; };
+    const root = await mount(<Harness controller={controller} source={catalog([lead])} receive={receive} />);
+    await act(async () => { await vi.advanceTimersByTimeAsync(250); });
+    expect(value?.tasks[0]?.activity.phase).toBeNull();
+    expect(list).toHaveBeenCalledTimes(1);
+    expect(get).not.toHaveBeenCalled();
+
+    available = true;
+    const changed = change === "phase" ? { ...worker, state: "running" as const }
+      : change === "attention" ? { ...worker, attention: unreadAttention("done") } : worker;
+    state = { ...state, snapshot: { ...state.snapshot, sessions: [lead, changed],
+      interactions: change === "interaction" ? [question(worker)]
+        : change === "interaction-identity" ? [{ ...question(worker), id: "replacement-question" }] : [] } };
+    await act(async () => root.render(<Harness controller={controller} source={catalog([lead])} receive={receive} />));
+    await act(async () => { await vi.advanceTimersByTimeAsync(249); });
+    expect(list).toHaveBeenCalledTimes(1);
+    expect(value?.tasks[0]?.activity.phase).toBeNull();
+    await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+    expect(list).toHaveBeenCalledTimes(2);
+    expect(get).toHaveBeenCalledTimes(1);
+    expect(value?.tasks[0]?.activity.phase).toBe(expected);
+    await act(async () => { await vi.advanceTimersByTimeAsync(250); });
+    expect(list).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not query for ordinary facade snapshots, titles, revisions, stale interactions or folded output", async () => {
+    vi.useFakeTimers();
+    const lead = session("lead", "idle");
+    const worker = session("worker", "running");
+    const list = vi.fn(async () => [goal(lead)]);
+    const get = vi.fn(async () => tree(lead, worker));
+    const initial = owner([lead, worker], list, get);
+    let state = initial.state;
+    const controller = { ...initial, get state() { return state; } };
+    let value: DedicatedHardwareTaskCatalog | undefined;
+    const receive = (next: DedicatedHardwareTaskCatalog | undefined) => { value = next; };
+    const root = await mount(<Harness controller={controller} source={catalog([lead])} receive={receive} />);
+    await act(async () => { await vi.advanceTimersByTimeAsync(250); });
+    expect(value?.tasks[0]?.activity.phase).toBe("running");
+    const renamed = { ...lead, name: "Renamed lead", updatedAt: 123 };
+    state = { ...state, snapshot: { ...state.snapshot, sessions: [renamed, { ...worker }],
+      interactions: [{ ...question(worker), generation: 2n }, question(session("missing", "idle"))] } };
+    await act(async () => root.render(<Harness controller={controller} source={{ ...catalog([renamed]), snapshotRevision: "2" }} receive={receive} />));
+    await act(async () => { await vi.advanceTimersByTimeAsync(500); });
+    expect(value?.tasks[0]?.title).toBe("Renamed lead");
+    expect(value?.tasks[0]?.activity.phase).toBe("running");
+    expect(list).toHaveBeenCalledTimes(1);
+    expect(get).toHaveBeenCalledTimes(1);
+  });
+
+  it("coalesces an in-flight activity burst into one immediate follow-up with the latest worker generation", async () => {
+    vi.useFakeTimers();
+    const lead = session("lead", "idle");
+    const worker = session("worker", "idle");
+    let resolve: ((value: CollaborationGoalTreeView) => void) | undefined;
+    let currentWorker = worker;
+    const list = vi.fn(async () => [goal(lead)]);
+    let requests = 0;
+    const get = vi.fn(() => ++requests === 1
+      ? new Promise<CollaborationGoalTreeView>((done) => { resolve = done; }) : Promise.resolve(tree(lead, currentWorker)));
+    const initial = owner([lead, worker], list, get);
+    let state = initial.state;
+    const controller = { ...initial, get state() { return state; } };
+    let value: DedicatedHardwareTaskCatalog | undefined;
+    const receive = (next: DedicatedHardwareTaskCatalog | undefined) => { value = next; };
+    const root = await mount(<Harness controller={controller} source={catalog([lead])} receive={receive} />);
+    await act(async () => { await vi.advanceTimersByTimeAsync(250); });
+    expect(get).toHaveBeenCalledTimes(1);
+    currentWorker = { ...worker, state: "running" };
+    state = { ...state, snapshot: { ...state.snapshot, sessions: [lead, currentWorker] } };
+    await act(async () => root.render(<Harness controller={controller} source={catalog([lead])} receive={receive} />));
+    state = { ...state, snapshot: { ...state.snapshot, interactions: [question(currentWorker)] } };
+    await act(async () => root.render(<Harness controller={controller} source={{ ...catalog([lead]), snapshotRevision: "2" }} receive={receive} />));
+    await act(async () => { await vi.advanceTimersByTimeAsync(250); });
+    expect(list).toHaveBeenCalledTimes(1);
+    expect(get).toHaveBeenCalledTimes(1);
+    currentWorker = { ...worker, generation: 3n, state: "error", attention: unreadAttention("error") };
+    state = { ...state, snapshot: { ...state.snapshot, sessions: [lead, currentWorker], interactions: [] } };
+    await act(async () => root.render(<Harness controller={controller} source={{ ...catalog([lead]), snapshotRevision: "3" }} receive={receive} />));
+    await act(async () => { resolve?.(tree(lead, worker)); });
+    expect(list).toHaveBeenCalledTimes(2);
+    expect(get).toHaveBeenCalledTimes(2);
+    expect(value?.tasks[0]?.activity).toEqual({ phase: "error", attention: true });
+    await act(async () => { await vi.advanceTimersByTimeAsync(250); });
+    expect(list).toHaveBeenCalledTimes(2);
+    expect(get).toHaveBeenCalledTimes(2);
+  });
+
+  it("retires a queued activity refresh and drops late relationship results after pagehide", async () => {
     vi.useFakeTimers();
     const lead = session("lead", "idle");
     const worker = session("worker", "running");
     let resolve: ((value: CollaborationGoalTreeView) => void) | undefined;
     const get = vi.fn(() => new Promise<CollaborationGoalTreeView>((done) => { resolve = done; }));
-    const controller = owner([lead, worker], vi.fn(async () => [goal(lead)]), get);
+    const list = vi.fn(async () => [goal(lead)]);
+    const initial = owner([lead, { ...worker, state: "idle" }], list, get);
+    let state = initial.state;
+    const controller = { ...initial, get state() { return state; } };
     let value: DedicatedHardwareTaskCatalog | undefined;
-    await mount(<Harness controller={controller} source={catalog([lead])} receive={(next) => { value = next; }} />);
+    const receive = (next: DedicatedHardwareTaskCatalog | undefined) => { value = next; };
+    const root = await mount(<Harness controller={controller} source={catalog([lead])} receive={receive} />);
     await act(async () => { await vi.advanceTimersByTimeAsync(250); });
+    state = { ...state, snapshot: { ...state.snapshot, sessions: [lead, worker] } };
+    await act(async () => root.render(<Harness controller={controller} source={catalog([lead])} receive={receive} />));
+    await act(async () => { await vi.advanceTimersByTimeAsync(250); });
+    expect(list).toHaveBeenCalledTimes(1);
+    expect(get).toHaveBeenCalledTimes(1);
     await act(async () => { window.dispatchEvent(new Event("pagehide")); resolve?.(tree(lead, worker)); });
     expect(value?.tasks[0]?.activity.phase).toBeNull();
     await act(async () => { await vi.advanceTimersByTimeAsync(20_000); });
+    expect(list).toHaveBeenCalledTimes(1);
     expect(get).toHaveBeenCalledTimes(1);
   });
 
@@ -163,6 +278,16 @@ async function mount(node: React.ReactNode): Promise<Root> {
 function session(id: string, state: SessionView["state"]): SessionView {
   return { id, backendId: "backend", targetId: "target", name: id, state, generation: 1n, pinned: false, archived: false,
     fastMode: false, permissionMode: "ask", planMode: false, updatedAt: 0 };
+}
+
+function question(session: SessionView): InteractionView {
+  return { id: "question", sessionId: session.id, generation: session.generation, kind: "question",
+    title: "Question", message: "", options: [], fields: [], planSteps: [], createdAt: 0 };
+}
+
+function unreadAttention(kind: SessionAttentionView["kind"]): SessionAttentionView {
+  const cursor = { opaqueToken: "cursor", sequence: 1n, generation: 1n };
+  return { kind, unread: true, subjectCursor: cursor, attentionCursor: cursor, readThroughCursor: cursor, updatedAt: 0 };
 }
 
 function catalog(sessions: readonly SessionView[]): DedicatedHardwareTaskCatalog {
