@@ -14,7 +14,7 @@ import {
   rm,
   writeFile
 } from "node:fs/promises";
-import { basename, dirname, isAbsolute, posix as remotePath, relative, resolve, sep, win32, type PlatformPath } from "node:path";
+import { basename, dirname, isAbsolute, join, posix as remotePath, relative, resolve, sep, win32, type PlatformPath } from "node:path";
 import { PassThrough, Transform, type Readable, type TransformCallback, type Writable } from "node:stream";
 import { StringDecoder } from "node:string_decoder";
 
@@ -25,12 +25,13 @@ import {
   type PiManagedDurableRunSnapshot,
   type PiManagedDurableStore,
   type PiManagedDurableStoreRegistry,
+  type PiRemoteNavigationOwner,
   spawnPiProcess,
   type PiProcessFactory,
   type PiProcessHandle,
   type PiProcessSpec
 } from "@joko/adapter-pi";
-import type { RemoteWorkspaceBinding } from "@joko/core";
+import type { AdapterContext, NativeSessionBinding, NativeSessionDerivationLifecycle, RemoteWorkspaceBinding } from "@joko/core";
 import { DEVICE_PEER_RUNTIME_EXECUTABLES } from "@joko/device-peer";
 import type {
   RemoteFileTransportPort,
@@ -48,6 +49,7 @@ import {
   REMOTE_PI_BROKER_SOURCE_SHA256,
   remotePiLaunchHash
 } from "./remote-pi-broker-source.js";
+import { REMOTE_PI_SESSION_SOURCE, REMOTE_PI_SESSION_SOURCE_SHA256 } from "./remote-pi-session-source.js";
 
 const MAXIMUM_SYNC_FILES = 20_000;
 const MAXIMUM_SYNC_BYTES = 128 * 1024 * 1024;
@@ -149,6 +151,23 @@ interface RemoteAuthorityRecord {
   };
 }
 
+interface RemoteNavigationRecord {
+  readonly format: 1;
+  readonly operationId: string;
+  readonly targetId: string;
+  readonly sourceSessionId: string;
+  readonly sourceBinding: NativeSessionBinding;
+  readonly binding: NativeSessionBinding;
+  readonly shadowSessionId: string;
+  readonly localSessionsRoot: string;
+  readonly remoteWorkspace: RemoteWorkspaceBinding;
+  readonly executionIdentity: string;
+  readonly remoteSessionsRoot: string;
+  readonly remoteSessionPath: string;
+  readonly shadowStarted: boolean;
+  readonly state: "prepared" | "adopted" | "cleaned";
+}
+
 type RemoteAuthorityControl = {
   readonly ok: true;
   readonly authority: RemoteAuthorityEnvelope;
@@ -171,6 +190,7 @@ export class RemotePiProcessFactory implements PiManagedDurableStoreRegistry {
   readonly #store: Pick<OperationalStore, "getTarget">;
   readonly #localFactory: PiProcessFactory;
   readonly #authorityStore: RemotePiAuthorityStore;
+  readonly #navigationRoot: string;
   readonly #managedStoreScopes = new Map<string, RemoteManagedStoreScope>();
   readonly #managedStores = new Map<string, PiManagedDurableStore>();
 
@@ -179,12 +199,207 @@ export class RemotePiProcessFactory implements PiManagedDurableStoreRegistry {
     this.#store = options.store;
     this.#localFactory = options.localFactory ?? spawnPiProcess;
     this.#authorityStore = new RemotePiAuthorityStore(options.authorityRoot);
+    this.#navigationRoot = join(options.authorityRoot, "navigation");
   }
 
   readonly create: PiProcessFactory = async (spec) => {
     if (spec.remoteWorkspace === undefined) return this.#localFactory(spec);
     return this.#createRemote(spec);
   };
+
+  readonly navigationOwner: PiRemoteNavigationOwner = {
+    prepare: async (input) => this.#prepareNavigation(input),
+    beginShadow: async (context) => {
+      const record = await this.#readNavigation(exactBoundedText(context.operationId, 512, "navigation operation identity"));
+      if (record === undefined || record.state !== "prepared" || record.shadowStarted) throw new Error("Remote Pi navigation shadow cannot be replayed.");
+      context.signal.throwIfAborted();
+      this.#assertNavigationTarget(record.targetId, record.remoteWorkspace);
+      await this.#writeNavigation({ ...record, shadowStarted: true });
+    },
+    adopt: async (lifecycle, signal) => this.#finishNavigation(lifecycle, signal, "adopted"),
+    cleanup: async (lifecycle, signal) => this.#finishNavigation(lifecycle, signal, "cleaned")
+  };
+
+  async #prepareNavigation(input: {
+    readonly context: AdapterContext;
+    readonly binding: NativeSessionBinding;
+    readonly sourceBinding: NativeSessionBinding;
+    readonly shadowSessionId: string;
+    readonly localSessionsRoot: string;
+  }): Promise<void> {
+    const context = input.context;
+    const operationId = exactBoundedText(context.operationId, 512, "navigation operation identity");
+    const binding = context.target.remoteWorkspace;
+    if (binding === undefined || input.binding.nativeSessionId === undefined
+      || input.binding.opaqueRef === input.sourceBinding.opaqueRef
+      || input.binding.nativeSessionId === input.sourceBinding.nativeSessionId
+      || input.binding.generation <= input.sourceBinding.generation) throw new Error("Remote Pi navigation identity is invalid.");
+    this.#assertNavigationTarget(context.target.id, binding);
+    const authority = await this.#remoteExecution.workspace(binding, context.signal);
+    const paths = remotePlatformPaths(authority.pathStyle);
+    const canonicalWorkspace = await authority.files.realpath(binding.workspaceRoot, context.signal);
+    if (canonicalWorkspace !== binding.workspaceRoot || (await authority.files.stat(canonicalWorkspace, context.signal)).kind !== "directory") {
+      throw new Error("Remote Pi navigation workspace is not canonical.");
+    }
+    const home = await authority.files.realpath(".", context.signal);
+    const remoteSessionsRoot = paths.join(home, ".joko", "sessions", stableIdentity(context.target.id, remoteRouteIdentity(binding)));
+    const child = relative(input.localSessionsRoot, input.binding.opaqueRef);
+    if (!child || child.startsWith("..") || isAbsolute(child)) throw new Error("Remote Pi navigation path escaped its mirror root.");
+    const remoteSessionPath = paths.join(remoteSessionsRoot, ...child.split(sep));
+    authority.assertCurrent();
+    const record: RemoteNavigationRecord = {
+      format: 1, operationId, targetId: context.target.id, sourceSessionId: context.sessionId,
+      sourceBinding: input.sourceBinding, binding: input.binding, shadowSessionId: input.shadowSessionId,
+      localSessionsRoot: input.localSessionsRoot, remoteWorkspace: binding, executionIdentity: authority.executionIdentity,
+      remoteSessionsRoot, remoteSessionPath, shadowStarted: false, state: "prepared"
+    };
+    const existing = await this.#readNavigation(operationId);
+    if (existing !== undefined) throw new Error("Remote Pi navigation creation cannot be replayed.");
+    await this.#writeNavigation(record);
+    context.signal.throwIfAborted();
+    this.#assertNavigationTarget(context.target.id, binding);
+    authority.assertCurrent();
+    await ensureRemotePrivateDirectory(authority.files, remoteSessionsRoot, authority.pathStyle);
+    const content = Buffer.from(`${JSON.stringify({ type: "session", version: 3, id: input.binding.nativeSessionId,
+      timestamp: new Date().toISOString(), cwd: canonicalWorkspace })}\n`, "utf8");
+    await remoteSessionRequest(authority, binding, {
+      action: "materialize", root: remoteSessionsRoot, path: remoteSessionPath,
+      cwd: canonicalWorkspace, nativeSessionId: input.binding.nativeSessionId, content: content.toString("base64")
+    }, context.signal);
+    authority.assertCurrent();
+    this.#assertNavigationTarget(context.target.id, binding);
+  }
+
+  async #finishNavigation(
+    lifecycle: NativeSessionDerivationLifecycle, signal: AbortSignal, outcome: "adopted" | "cleaned"
+  ): Promise<void> {
+    if (lifecycle.kind !== "navigate" || lifecycle.target.remoteWorkspace === undefined) throw new Error("Remote Pi navigation lifecycle is invalid.");
+    const record = await this.#readNavigation(lifecycle.operationId);
+    // Persistence precedes every remote effect. A crash before that write has
+    // no native owner to clean; adoption always requires the exact record.
+    if (record === undefined) {
+      if (outcome === "cleaned") return;
+      throw new Error("Remote Pi navigation receipt is unavailable.");
+    }
+    if (record.targetId !== lifecycle.target.id || record.sourceSessionId !== lifecycle.sourceSessionId
+      || !sameRemoteBinding(record.remoteWorkspace, lifecycle.target.remoteWorkspace)
+      || JSON.stringify(record.sourceBinding) !== JSON.stringify(lifecycle.sourceBinding)
+      || lifecycle.binding !== undefined && JSON.stringify(record.binding) !== JSON.stringify(lifecycle.binding)
+      || lifecycle.sessionId !== record.sourceSessionId) throw new Error("Remote Pi navigation receipt crossed its lifecycle fence.");
+    if (record.state === outcome) return;
+    if (record.state !== "prepared") throw new Error("Remote Pi navigation already settled under a different owner.");
+    if (outcome === "adopted" && !record.shadowStarted) throw new Error("Remote Pi navigation never established a shadow owner.");
+    this.#assertNavigationTarget(record.targetId, record.remoteWorkspace);
+    const authority = await this.#remoteExecution.workspace(record.remoteWorkspace, signal);
+    if (authority.executionIdentity !== record.executionIdentity) throw new Error("Remote Pi navigation execution owner changed.");
+    const paths = remotePlatformPaths(authority.pathStyle);
+    const home = await authority.files.realpath(".", signal);
+    const expectedRoot = paths.join(home, ".joko", "sessions", stableIdentity(record.targetId, remoteRouteIdentity(record.remoteWorkspace)));
+    if (expectedRoot !== record.remoteSessionsRoot) throw new Error("Remote Pi navigation storage owner changed.");
+    const child = relative(record.localSessionsRoot, record.binding.opaqueRef);
+    if (!isAbsolute(record.localSessionsRoot) || resolve(record.localSessionsRoot) !== record.localSessionsRoot
+      || !child || child.startsWith("..") || isAbsolute(child)
+      || paths.join(expectedRoot, ...child.split(sep)) !== record.remoteSessionPath
+      || record.shadowSessionId !== `navigate-shadow-${createHash("sha256").update(record.operationId).digest("hex")}`
+      || record.binding.opaqueRef === record.sourceBinding.opaqueRef || record.binding.nativeSessionId === record.sourceBinding.nativeSessionId) {
+      throw new Error("Remote Pi navigation receipt storage scope is invalid.");
+    }
+    const routeIdentity = remoteRouteIdentity(record.remoteWorkspace);
+    const recoveryIdentity = remoteRecoveryIdentity(record.shadowSessionId, record.targetId, record.remoteWorkspace);
+    const identity = stableIdentity(record.targetId, routeIdentity, recoveryIdentity);
+    const shadow = await this.#authorityStore.read(identity, { targetId: record.targetId, routeIdentity, recoveryIdentity });
+    if (record.shadowStarted && shadow === undefined) throw new Error("Remote Pi navigation shadow retirement is uncertain.");
+    if (shadow !== undefined) {
+      if (shadow.deletion === undefined && shadow.authority.trustedRunnerScriptSha256 !== "0".repeat(64)) {
+        const durable = new RemotePiManagedDurableStore({ scope: { targetId: record.targetId, routeIdentity, recoveryIdentity,
+          sessionId: record.shadowSessionId, binding: record.remoteWorkspace, identity }, remoteExecution: this.#remoteExecution,
+          authorityStore: this.#authorityStore });
+        const removed = await durable.stopAndRemoveSession({ sessionId: record.shadowSessionId, sessionKey: managedSessionKey(record.shadowSessionId), timeoutMs: BROKER_KILL_TIMEOUT_MS });
+        if (!removed.removed) throw new Error("Remote Pi navigation shadow lineage did not retire.");
+        await durable.finalizeDeletion({ sessionId: record.shadowSessionId, sessionKey: managedSessionKey(record.shadowSessionId), deletionReceipt: removed.deletionReceipt });
+      }
+      const managedRoot = paths.join(home, ".joko", "pi-broker");
+      await provisionRemoteBroker(authority.files, managedRoot, authority.pathStyle);
+      authority.assertCurrent();
+      await requestRemoteBrokerKill({ processes: authority.processes,
+        sourcePath: paths.join(managedRoot, `broker-${REMOTE_PI_BROKER_SOURCE_SHA256}.mjs`), managedRoot,
+        nodeExecutable: remoteNodeExecutableFor(record.remoteWorkspace), pathStyle: authority.pathStyle,
+        controlCwd: record.remoteWorkspace.kind === "device_peer" ? record.remoteWorkspace.workspaceRoot : home,
+        identity, signal: "SIGKILL", authority: shadow.authority });
+    }
+    signal.throwIfAborted();
+    authority.assertCurrent();
+    this.#assertNavigationTarget(record.targetId, record.remoteWorkspace);
+    if (outcome === "cleaned") {
+      await remoteSessionRequest(authority, record.remoteWorkspace, { action: "remove", root: record.remoteSessionsRoot,
+        path: record.remoteSessionPath, cwd: record.remoteWorkspace.workspaceRoot, nativeSessionId: record.binding.nativeSessionId }, signal);
+    } else {
+      const content = Buffer.from(`${JSON.stringify({ type: "session", version: 3, id: record.binding.nativeSessionId,
+        timestamp: new Date().toISOString(), cwd: record.remoteWorkspace.workspaceRoot })}\n`, "utf8");
+      // Adoption only confirms existing storage; it must not recreate a lost
+      // candidate after an uncertain native effect.
+      await authority.files.stat(record.remoteSessionPath, signal);
+      await remoteSessionRequest(authority, record.remoteWorkspace, { action: "confirm", root: record.remoteSessionsRoot,
+        path: record.remoteSessionPath, cwd: record.remoteWorkspace.workspaceRoot, nativeSessionId: record.binding.nativeSessionId,
+        content: content.toString("base64") }, signal);
+    }
+    signal.throwIfAborted();
+    authority.assertCurrent();
+    this.#assertNavigationTarget(record.targetId, record.remoteWorkspace);
+    await this.#writeNavigation({ ...record, state: outcome });
+  }
+
+  #assertNavigationTarget(targetId: string, binding: RemoteWorkspaceBinding): void {
+    const current = this.#store.getTarget(targetId).descriptor.remoteWorkspace;
+    if (current === undefined || !sameRemoteBinding(current, binding)) throw new Error("Remote Pi navigation Target authority changed.");
+  }
+
+  async #navigationPath(operationId: string): Promise<string> {
+    exactBoundedText(operationId, 512, "navigation operation identity");
+    await mkdir(this.#navigationRoot, { recursive: true, mode: 0o700 });
+    const info = await lstat(this.#navigationRoot);
+    if (!info.isDirectory() || info.isSymbolicLink() || !sameLocalPath(await realpath(this.#navigationRoot), this.#navigationRoot)
+      || process.platform !== "win32" && (info.mode & 0o077) !== 0) throw new Error("Remote Pi navigation receipt root is unsafe.");
+    return join(this.#navigationRoot, `${createHash("sha256").update(operationId).digest("hex")}.json`);
+  }
+
+  async #readNavigation(operationId: string): Promise<RemoteNavigationRecord | undefined> {
+    const path = await this.#navigationPath(operationId);
+    const info = await lstat(path).catch((error: NodeJS.ErrnoException) => { if (error.code === "ENOENT") return undefined; throw error; });
+    if (info === undefined) return undefined;
+    if (!info.isFile() || info.isSymbolicLink() || info.nlink !== 1 || info.size > MAXIMUM_AUTHORITY_BYTES
+      || process.platform !== "win32" && (info.mode & 0o077) !== 0 || !sameLocalPath(await realpath(path), path)) {
+      throw new Error("Remote Pi navigation receipt is unsafe.");
+    }
+    const handle = await open(path, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
+    try {
+      assertStableLocalFile(info, await handle.stat());
+      const value: unknown = JSON.parse(await handle.readFile({ encoding: "utf8" }));
+      assertStableLocalFile(info, await handle.stat());
+      assertStableLocalFile(info, await lstat(path));
+      if (!isPlainRecord(value)) throw new Error("Remote Pi navigation receipt is invalid.");
+      assertExactKeys(value, ["format", "operationId", "targetId", "sourceSessionId", "sourceBinding", "binding", "shadowSessionId",
+        "localSessionsRoot", "remoteWorkspace", "executionIdentity", "remoteSessionsRoot", "remoteSessionPath", "shadowStarted", "state"]);
+      if (value["format"] !== 1 || value["operationId"] !== operationId
+        || !["prepared", "adopted", "cleaned"].includes(String(value["state"]))
+        || typeof value["shadowStarted"] !== "boolean"
+        || !isPlainRecord(value["binding"]) || !isPlainRecord(value["sourceBinding"]) || !isPlainRecord(value["remoteWorkspace"])) {
+        throw new Error("Remote Pi navigation receipt is invalid.");
+      }
+      for (const key of ["targetId", "sourceSessionId", "shadowSessionId", "localSessionsRoot", "executionIdentity", "remoteSessionsRoot", "remoteSessionPath"]) {
+        exactBoundedText(value[key], 4096, "navigation receipt identity");
+      }
+      return value as unknown as RemoteNavigationRecord;
+    } finally { await handle.close(); }
+  }
+
+  async #writeNavigation(record: RemoteNavigationRecord): Promise<void> {
+    const path = await this.#navigationPath(record.operationId);
+    const temporary = `${path}.${randomUUID()}.tmp`;
+    const handle = await open(temporary, "wx", 0o600);
+    try { await handle.writeFile(`${JSON.stringify(record)}\n`); await handle.sync(); } finally { await handle.close(); }
+    try { await rename(temporary, path); } finally { await rm(temporary, { force: true }).catch(() => undefined); }
+  }
 
   async storeFor(input: {
     readonly sessionId: string;
@@ -390,7 +605,8 @@ export class RemotePiProcessFactory implements PiManagedDurableStoreRegistry {
           }
         } else if (assetSnapshot !== undefined || isSessionSelector) {
           assetSnapshot ??= await snapshotAsset(value);
-          stagingPlans.push({ local: resolve(value), remote: mapped, snapshot: assetSnapshot });
+          stagingPlans.push({ local: resolve(value), remote: mapped, snapshot: assetSnapshot,
+            ...(isSessionSelector ? { sessionRoot: remoteSessions } : {}) });
         }
         rewrittenArgs[index] = mapped;
         continue;
@@ -475,7 +691,7 @@ export class RemotePiProcessFactory implements PiManagedDurableStoreRegistry {
       remoteRuntime,
       assets: compatibilityAssets
     });
-    if (existingAuthority === undefined) await stageRemoteRuntime(files, stagingPlans);
+    if (existingAuthority === undefined) await stageRemoteRuntime(initialAuthority, binding, stagingPlans);
     const sourcePath = targetPaths.join(managedRoot, `broker-${REMOTE_PI_BROKER_SOURCE_SHA256}.mjs`);
     const openAttachment = async (selectedAuthority: RemoteWorkspaceAuthority): Promise<RemoteBridgeAttachment> => {
       selectedAuthority.assertCurrent();
@@ -548,7 +764,7 @@ export class RemotePiProcessFactory implements PiManagedDurableStoreRegistry {
           });
         } else if (error.reason !== "child_absent") throw error;
         await this.#authorityStore.remove(identity);
-        await stageRemoteRuntime(selectedFiles, stagingPlans);
+        await stageRemoteRuntime(selectedAuthority, binding, stagingPlans);
         await refreshRuntimeFiles(selectedFiles, spec.env, pathMap);
         const { previousAuthority: _previousAuthority, ...freshBridgeOptions } = bridgeOptions;
         return openRemoteBrokerBridge(freshBridgeOptions);
@@ -2518,20 +2734,81 @@ interface RemoteStagingPlan {
   readonly remote: string;
   readonly snapshot?: LocalAssetSnapshot;
   readonly replaceDirectory?: boolean;
+  readonly sessionRoot?: string;
 }
 
 async function stageRemoteRuntime(
-  files: RemoteFileTransportPort,
+  authority: RemoteWorkspaceAuthority,
+  binding: RemoteWorkspaceBinding,
   plans: readonly RemoteStagingPlan[]
 ): Promise<void> {
+  const files = authority.files;
   const budget = { files: 0, bytes: 0 };
   for (const plan of plans) {
+    authority.assertCurrent();
+    if (plan.sessionRoot !== undefined) {
+      const content = plan.snapshot?.entries.find((entry) => entry.path === "" && entry.kind === "file")?.content;
+      if (content === undefined) throw new Error("Remote Pi native Session mirror is unavailable.");
+      let header: unknown;
+      try { header = JSON.parse(content.subarray(0, content.indexOf(10)).toString("utf8")); }
+      catch { throw new Error("Remote Pi native Session mirror header is invalid."); }
+      if (!isPlainRecord(header) || header["type"] !== "session" || header["version"] !== 3
+        || typeof header["id"] !== "string" || header["cwd"] !== binding.workspaceRoot) {
+        throw new Error("Remote Pi native Session mirror crossed its identity fence.");
+      }
+      await remoteSessionRequest(authority, binding, { action: "confirm", root: plan.sessionRoot, path: plan.remote,
+        cwd: binding.workspaceRoot, nativeSessionId: header["id"], content: content.toString("base64") });
+      continue;
+    }
     if (plan.snapshot === undefined) await syncLocalTree(files, plan.local, plan.remote, budget);
     else {
       if (plan.replaceDirectory === true) await files.remove(plan.remote, { recursive: true });
       await stageLocalAssetSnapshot(files, plan.remote, plan.snapshot, budget);
     }
   }
+}
+
+async function remoteSessionRequest(
+  authority: RemoteWorkspaceAuthority,
+  binding: RemoteWorkspaceBinding,
+  body: Readonly<Record<string, unknown>>,
+  signal?: AbortSignal
+): Promise<void> {
+  signal?.throwIfAborted();
+  authority.assertCurrent();
+  const paths = remotePlatformPaths(authority.pathStyle);
+  const home = await authority.files.realpath(".", signal);
+  const managedRoot = paths.join(home, ".joko", "pi-broker");
+  await ensureRemotePrivateDirectory(authority.files, managedRoot, authority.pathStyle);
+  const sourcePath = paths.join(managedRoot, `session-${REMOTE_PI_SESSION_SOURCE_SHA256}.mjs`);
+  await authority.files.write({ path: sourcePath, content: Buffer.from(REMOTE_PI_SESSION_SOURCE), mode: 0o600, atomic: true, signal });
+  const source = await authority.files.read({ path: sourcePath, maximumBytes: Buffer.byteLength(REMOTE_PI_SESSION_SOURCE) + 1, signal });
+  if (createHash("sha256").update(source).digest("hex") !== REMOTE_PI_SESSION_SOURCE_SHA256) throw new Error("Remote Pi native Session helper integrity failed.");
+  authority.assertCurrent();
+  signal?.throwIfAborted();
+  const request = await authority.processes.open({ executable: remoteNodeExecutableFor(binding), args: [sourcePath],
+    cwd: binding.kind === "device_peer" ? binding.workspaceRoot : home, env: {}, ...(signal === undefined ? {} : { signal }) });
+  const terminate = (): void => { try { request.kill("SIGKILL"); } catch { /* An interrupted effect remains unknown. */ } };
+  signal?.addEventListener("abort", terminate, { once: true });
+  const payload = Buffer.from(`${JSON.stringify(body)}\n`);
+  if (payload.byteLength > 90 * 1024 * 1024) { terminate(); throw new Error("Remote Pi native Session request exceeds its safety limit."); }
+  const exit = waitForRemoteProcessExit(request, BROKER_KILL_TIMEOUT_MS);
+  const output = readBoundedRemoteControlOutput(request, BROKER_KILL_TIMEOUT_MS);
+  request.stderr.resume();
+  request.stdin.end(payload);
+  try {
+    const [terminal, bytes] = await Promise.all([exit, output]);
+    signal?.throwIfAborted();
+    authority.assertCurrent();
+    if (terminal.code !== 0) throw new Error("Remote Pi native Session effect was not confirmed.");
+    const value: unknown = JSON.parse(bytes.toString("utf8"));
+    if (!isPlainRecord(value)) throw new Error("Remote Pi native Session response is invalid.");
+    const field = body["action"] === "remove" ? "removed" : "created";
+    assertExactKeys(value, ["ok", field]);
+    if (value["ok"] !== true || typeof value[field] !== "boolean" || body["action"] === "confirm" && value[field] !== false) {
+      throw new Error("Remote Pi native Session response is invalid.");
+    }
+  } finally { signal?.removeEventListener("abort", terminate); }
 }
 
 async function stageLocalAssetSnapshot(

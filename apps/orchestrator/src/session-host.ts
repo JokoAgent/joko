@@ -4005,7 +4005,7 @@ export class SessionHost {
         sourceTarget: sourceContext.target,
         target: derivationTarget
       };
-      const ownsDurableLifecycle = active.adapter.ownsNativeSessionDerivationLifecycle?.(lifecycle) === true;
+      const ownsDurableLifecycle = await active.adapter.ownsNativeSessionDerivationLifecycle?.(lifecycle) === true;
       if (remotePlan !== undefined && !ownsDurableLifecycle) {
         throw new StoreError("The remote Backend cannot adopt an isolated native derivation safely.");
       }
@@ -6998,13 +6998,14 @@ export class SessionHost {
           const lifecycle: NativeSessionDerivationLifecycle = {
             operationId: authority.operationId,
             kind: "navigate",
+            navigationTarget: target,
             sourceSessionId: sessionId,
             sourceBinding: lease.stored.descriptor.binding,
             sessionId,
             sourceTarget: lease.context.target,
             target: lease.context.target
           };
-          if (active.adapter.ownsNativeSessionDerivationLifecycle?.(lifecycle) === true) {
+          if (await active.adapter.ownsNativeSessionDerivationLifecycle?.(lifecycle) === true) {
             if (active.adapter.adoptNativeSessionDerivation === undefined
               || active.adapter.cleanupNativeSessionDerivation === undefined) {
               throw new StoreError("The Backend declared a native derivation lifecycle without adoption and cleanup owners.");

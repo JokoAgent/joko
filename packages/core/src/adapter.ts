@@ -5,6 +5,7 @@ import type {
   ApprovedDirectory,
   DynamicInputSchema,
   NativeSessionBinding,
+  NativeNavigationTarget,
   NativeSessionCatalogEntry,
   NativeSessionCatalogResult,
   NativeSessionCandidate,
@@ -223,6 +224,7 @@ export interface NativeSessionDerivation {
 export interface NativeSessionDerivationLifecycle {
   readonly operationId: string;
   readonly kind: "fork" | "clone" | "navigate";
+  readonly navigationTarget?: NativeNavigationTarget;
   readonly sourceSessionId: SessionId;
   readonly sourceBinding: NativeSessionBinding;
   readonly sessionId: SessionId;
@@ -546,7 +548,7 @@ export interface BackendAdapter {
   clone(context: AdapterContext, derivation: NativeSessionDerivation): Promise<NativeSessionBinding>;
   /** True only when this exact route is durably staged by the Adapter and
    * therefore requires explicit post-Product adoption or exact cleanup. */
-  ownsNativeSessionDerivationLifecycle?(lifecycle: NativeSessionDerivationLifecycle): boolean;
+  ownsNativeSessionDerivationLifecycle?(lifecycle: NativeSessionDerivationLifecycle): boolean | Promise<boolean>;
   /** Adopt an already-recorded native child after the Product transaction has
    * committed. Must be idempotent for the exact operation and binding. */
   adoptNativeSessionDerivation?(
