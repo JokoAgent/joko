@@ -278,6 +278,27 @@ describe("timeline reference content", () => {
     expect(releaseSecond).toHaveBeenCalledTimes(1);
   });
 
+  it("retires an acquired workspace image lease and exposes a stable fallback after decode failure", async () => {
+    const release = vi.fn();
+    const mounted = mount(<TimelineMarkdownImage
+      src="broken.png"
+      alt="Broken preview"
+      actions={{ ownerKey: "profile", sessionId: "task", t, onLoadWorkspaceAsset: async () => ({ path: "broken.png", name: "broken.png", url: "blob:broken", release }) }}
+      t={t}
+    />);
+    await act(async () => undefined);
+    const image = mounted.host.querySelector<HTMLImageElement>("img")!;
+
+    act(() => image.dispatchEvent(new Event("error", { bubbles: true })));
+
+    expect(release).toHaveBeenCalledTimes(1);
+    expect(mounted.host.querySelector("img")).toBeNull();
+    expect(mounted.host.textContent).toContain("workspace.imageUnavailable: Broken preview");
+    expect(mounted.host.querySelector("[data-rendered-share-content-pending]")).toBeNull();
+    act(() => mounted.root.render(null));
+    expect(release).toHaveBeenCalledTimes(1);
+  });
+
   it("previews complete workspace SVG text through the task owner and revokes each URL once across StrictMode and owner changes", async () => {
     const created: Blob[] = [];
     const createObjectURL = vi.fn((blob: Blob) => { created.push(blob); return `blob:svg-${created.length}`; });

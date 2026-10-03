@@ -317,7 +317,13 @@ function TimelineWorkspaceImage({ path, alt, actions, t }: {
   readonly t: Translator;
 }): JSX.Element {
   const renderForShare = useRenderedShareSelection();
-  const [state, setState] = useState<{ readonly status: "loading" } | { readonly status: "error" } | { readonly status: "ready"; readonly asset: TimelineWorkspaceAsset }>({ status: "loading" });
+  const [state, setState] = useState<
+    { readonly status: "loading" }
+    | { readonly status: "error" }
+    | { readonly status: "ready"; readonly asset: TimelineWorkspaceAsset; readonly release: () => void }
+  >({ status: "loading" });
+  const stateRef = useRef(state);
+  stateRef.current = state;
   const [open, setOpen] = useState(false);
   const triggerRef = useRef<HTMLButtonElement>(null);
   const loaderRef = useRef(actions.onLoadWorkspaceAsset);
@@ -325,23 +331,34 @@ function TimelineWorkspaceImage({ path, alt, actions, t }: {
   useEffect(() => {
     let active = true;
     let acquired: TimelineWorkspaceAsset | undefined;
+    const release = (): void => {
+      const asset = acquired;
+      acquired = undefined;
+      asset?.release();
+    };
     setState({ status: "loading" });
     void loaderRef.current?.(path).then(
       (asset) => {
         if (!active) { asset.release(); return; }
         acquired = asset;
-        setState({ status: "ready", asset });
+        setState({ status: "ready", asset, release });
       },
       () => { if (active) setState({ status: "error" }); }
     );
-    return () => { active = false; acquired?.release(); };
+    return () => { active = false; release(); };
   }, [path]);
   if (state.status === "loading") return <span {...{ [RENDERED_SHARE_CONTENT_PENDING_ATTRIBUTE]: "" }} className="timeline-workspace-image is-loading" role="status">{t("workspace.loadingPreview")}</span>;
   if (state.status === "error") return <span className="markdown-image-blocked">[{t("workspace.imageUnavailable")}{alt === undefined || alt.length === 0 ? "" : `: ${alt}`}]</span>;
   const asset = state.asset;
   return <>
     <button ref={triggerRef} type="button" className="timeline-workspace-image" aria-label={`${t("workspace.imageOpen")}: ${asset.name}`} onClick={() => setOpen(true)}>
-      <img src={asset.url} alt={alt ?? asset.name} loading={renderForShare ? "eager" : "lazy"} />
+      <img src={asset.url} alt={alt ?? asset.name} loading={renderForShare ? "eager" : "lazy"} onError={() => {
+        const current = stateRef.current;
+        if (current.status !== "ready" || current.asset !== asset) return;
+        current.release();
+        setOpen(false);
+        setState({ status: "error" });
+      }} />
     </button>
     {open && <WorkspaceImageLightbox
       ownerKey={JSON.stringify([actions.ownerKey, actions.sessionId, path])}
