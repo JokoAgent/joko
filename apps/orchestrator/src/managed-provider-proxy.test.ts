@@ -33,6 +33,9 @@ async function fixture(
     fedramp: string | undefined;
   }[] = [];
   let hold = false; let reject = false; let pending: ServerResponse | undefined; let closed = false;
+  let fixtureResponseBody = "data: fixture\n\n";
+  let fixtureResponseContentType = "text/event-stream";
+  let nativeResponseBody = "data: native fixture\n\n";
   let toolOutcome: "absent" | "present" | "denied" | undefined;
   const upstream = createServer(async (request, response) => {
     const bytes: Buffer[] = []; for await (const chunk of request) bytes.push(Buffer.from(chunk));
@@ -42,7 +45,7 @@ async function fixture(
     forwardedProxyTokens.push(request.headers["x-joko-provider-proxy-token"] as string | undefined);
     forwardedFedrampHeaders.push(request.headers["x-openai-fedramp"] as string | undefined);
     if (reject) { response.writeHead(302, { location: "https://external.invalid/", "content-type": "text/plain" }); response.end("upstream-private-detail"); return; }
-    response.writeHead(200, { "content-type": "text/event-stream" });
+    response.writeHead(200, { "content-type": fixtureResponseContentType });
     if (nativeResponses) {
       const index = received.length;
       const toolOutput = Array.isArray(body.input) ? body.input.find((item: Record<string, unknown>) => item.type === "function_call_output"
@@ -68,7 +71,7 @@ async function fixture(
       emit({ type: "response.completed", response: { id: `response-${index}`, status: "completed", model: body.model, output: [item], usage: { input_tokens: 10, output_tokens: 4, total_tokens: 14 } } });
       response.end(); return;
     }
-    response.write("data: fixture\n\n");
+    response.write(fixtureResponseBody);
     if (hold) { pending = response; response.once("close", () => { closed = true; }); }
     else response.end();
   });
@@ -87,7 +90,7 @@ async function fixture(
       accountId: headers.get("chatgpt-account-id") ?? undefined,
       fedramp: headers.get("x-openai-fedramp") ?? undefined
     });
-    return new Response("data: native fixture\n\n", { status: 200, headers: { "content-type": "text/event-stream" } });
+    return new Response(nativeResponseBody, { status: 200, headers: { "content-type": "text/event-stream" } });
   };
   const proxy = new ManagedProviderProxy({
     providers,
@@ -141,6 +144,11 @@ async function fixture(
     write, markProviderUnavailable,
     token: port.environment[port.secretEnvironmentNames[0]!]!, toolOutcome: () => toolOutcome,
     hold: () => { hold = true; }, reject: () => { reject = true; },
+    respondWith: (body: string, contentType = "text/event-stream") => {
+      fixtureResponseBody = body;
+      fixtureResponseContentType = contentType;
+    },
+    respondNativeWith: (body: string) => { nativeResponseBody = body; },
     retire: () => { ownerCurrent = false; }, closed: () => closed, sessionPresent: (present: boolean) => { sessionPresent = present; },
     finish: () => pending?.end(),
     dispose: async () => { port.dispose(); await proxy.close(); upstream.closeAllConnections(); await new Promise<void>((resolve) => upstream.close(() => resolve())); store.close(); }
@@ -156,6 +164,173 @@ describe("Managed Provider native proxy", () => {
       expect(f.providers.describeInferenceRoute("runtime", "provider", "child-model")).toBeDefined();
       expect(f.port.listSmartRoutingCandidates!()).toEqual([]);
     } finally { await f.dispose(); }
+  });
+
+  it("repairs required Responses arrays on the ordinary managed stream without changing other protocols", async () => {
+    const messageAdded = JSON.stringify({
+      type: "response.output_item.added",
+      output_index: 0,
+      item: {
+        id: "message-one",
+        type: "message",
+        status: "in_progress",
+        role: "assistant",
+        content: null
+      }
+    });
+    const delta = JSON.stringify({
+      type: "response.output_text.delta",
+      item_id: "message-one",
+      output_index: 0,
+      content_index: 0,
+      delta: "usable continuation"
+    });
+    const stream = `data: ${messageAdded}\r\n\r\ndata: ${delta}\n\ndata: [DONE]\n\n`;
+    const f = await fixture();
+    try {
+      f.respondWith(stream);
+      const binding = await f.port.prepare(f.owner);
+      const lease = await binding.activate({
+        operationId: "repair-ordinary",
+        signal: new AbortController().signal,
+        assertCurrent: () => undefined
+      });
+      try {
+        const response = await fetch(`${binding.baseUrl}/responses`, {
+          method: "POST",
+          headers: { authorization: `Bearer ${f.token}`, "content-type": "application/json" },
+          body: JSON.stringify({ model: "model", input: "fixture" })
+        });
+        const output = await response.text();
+        const events = output.split(/\r?\n\r?\n/u).filter(Boolean);
+        expect((JSON.parse(events[0]!.split("data: ")[1]!) as {
+          item: { content: unknown };
+        }).item.content).toEqual([]);
+        expect(events[1]).toBe(`data: ${delta}`);
+        expect(events[2]).toBe("data: [DONE]");
+
+        const validStream = stream.replace('"content":null', '"content":[]');
+        f.respondWith(validStream);
+        const validResponse = await fetch(`${binding.baseUrl}/responses`, {
+          method: "POST",
+          headers: { authorization: `Bearer ${f.token}`, "content-type": "application/json" },
+          body: JSON.stringify({ model: "model", input: "fixture" })
+        });
+        expect(await validResponse.text()).toBe(validStream);
+      } finally {
+        lease.release();
+        binding.dispose();
+      }
+    } finally {
+      await f.dispose();
+    }
+
+    const anthropic = await fixture(false, "anthropic-messages");
+    try {
+      anthropic.respondWith(stream);
+      const binding = await anthropic.port.prepare(anthropic.owner);
+      const lease = await binding.activate({
+        operationId: "repair-protocol-gate",
+        signal: new AbortController().signal,
+        assertCurrent: () => undefined
+      });
+      try {
+        const response = await fetch(`${binding.baseUrl}/v1/messages`, {
+          method: "POST",
+          headers: { authorization: `Bearer ${anthropic.token}`, "content-type": "application/json" },
+          body: JSON.stringify({ model: "model", max_tokens: 100, messages: [] })
+        });
+        expect(await response.text()).toBe(stream);
+      } finally {
+        lease.release();
+        binding.dispose();
+      }
+    } finally {
+      await anthropic.dispose();
+    }
+  });
+
+  it("repairs smart managed Responses while leaving the native route byte-identical", async () => {
+    const f = await fixture();
+    const reasoningAdded = JSON.stringify({
+      type: "response.output_item.added",
+      output_index: 0,
+      item: { id: "reasoning-one", type: "reasoning", status: "in_progress", summary: null }
+    });
+    const stream = `data: ${reasoningAdded}\n\ndata: [DONE]\n\n`;
+    try {
+      f.respondWith(stream);
+      f.respondNativeWith(stream);
+      const child = f.port.listSmartRoutingCandidates!().find((candidate) => candidate.model.modelId === "child-model")!;
+      const binding = await f.port.prepareSmartRouting!({
+        backendId: "runtime",
+        backendInstanceGeneration: 3,
+        targetId: "target",
+        sessionId: "session",
+        sessionGeneration: 4,
+        nativeProviderId: "openai",
+        rootProviderId: "provider",
+        rootModelId: "model",
+        routes: [
+          { providerId: child.providerId, modelId: child.model.modelId, revision: child.revision, native: false },
+          { providerId: "openai", modelId: "native-worker", revision: "native-catalog-a", native: true }
+        ],
+        revision: "catalog-a"
+      });
+      binding.bindRoot({ threadId: "root-thread", providerId: "provider", modelId: "model" });
+      const lease = await binding.activate({
+        operationId: "repair-smart",
+        signal: new AbortController().signal,
+        assertCurrent: () => undefined
+      });
+      const request = (input: {
+        readonly threadId: string;
+        readonly modelId: string;
+        readonly parentThreadId?: string;
+        readonly native?: boolean;
+      }) => fetch(`${binding.baseUrl}/responses`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-joko-provider-proxy-token": f.token,
+          "thread-id": input.threadId,
+          ...(input.parentThreadId === undefined ? {} : {
+            "x-codex-parent-thread-id": input.parentThreadId,
+            "x-openai-subagent": "collab_spawn"
+          }),
+          ...(input.native === true ? { authorization: "Bearer native-private-credential" } : {})
+        },
+        body: JSON.stringify({ model: input.modelId, input: "fixture" })
+      });
+      try {
+        const managed = await (await request({ threadId: "root-thread", modelId: "model" })).text();
+        expect((JSON.parse(managed.split("\n\n")[0]!.slice("data: ".length)) as {
+          item: { summary: unknown };
+        }).item.summary).toEqual([]);
+
+        const managedChild = await (await request({
+          threadId: "managed-child",
+          parentThreadId: "root-thread",
+          modelId: "child-model"
+        })).text();
+        expect((JSON.parse(managedChild.split("\n\n")[0]!.slice("data: ".length)) as {
+          item: { summary: unknown };
+        }).item.summary).toEqual([]);
+
+        const native = await (await request({
+          threadId: "native-child",
+          parentThreadId: "root-thread",
+          modelId: "native-worker",
+          native: true
+        })).text();
+        expect(native).toBe(stream);
+      } finally {
+        lease.release();
+        binding.dispose();
+      }
+    } finally {
+      await f.dispose();
+    }
   });
 
   it.skipIf(process.env.JOKO_CODEX_MANAGED_FIXTURE_COMMAND === undefined)("runs the installed native app-server through the production route on the original thread with an isolated profile", async () => {
