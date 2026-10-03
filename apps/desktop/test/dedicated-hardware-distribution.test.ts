@@ -58,6 +58,7 @@ type AuditDedicatedHardwareSdkDirectory = (
 
 const require = createRequire(import.meta.url);
 const packagedAudit = require("../scripts/audit-packaged.cjs") as {
+  readonly auditNativeSystemFrontmostInput: (root: string, platform: "win32" | "darwin" | "linux", targetArch: string) => Promise<void>;
   readonly auditDedicatedHardwareSdkDirectory: AuditDedicatedHardwareSdkDirectory;
   readonly createDedicatedHardwareSdkDirectoryIntegrity: (entries: readonly Readonly<{
     relativePath: string; size: number; integrity: string; bytes: Uint8Array;
@@ -80,6 +81,37 @@ const runtimeTarget: DedicatedHardwareSdkRuntimeTarget = {
 
 afterEach(() => {
   for (const path of cleanups.splice(0).reverse()) rmSync(path, { recursive: true, force: true });
+});
+
+describe("packaged native foreground input audit", () => {
+  it.each(["x64", "arm64"])("admits a strictly identified Darwin %s resource without claiming native compilation", async (architecture) => {
+    const root = temporaryDirectory();
+    const helper = "joko-macos-frontmost-input.node";
+    const bytes = Buffer.from("controlled native resource identity bytes\n");
+    writeFileSync(resolve(root, helper), bytes);
+    writeFileSync(resolve(root, "manifest.json"), JSON.stringify({
+      architecture, helper, platform: "darwin", protocolVersion: 1,
+      sha256: createHash("sha256").update(bytes).digest("hex")
+    }));
+    await expect(packagedAudit.auditNativeSystemFrontmostInput(root, "darwin", architecture)).resolves.toBeUndefined();
+    const config = JSON.parse(readFileSync(new URL("../electron-builder.json", import.meta.url), "utf8")) as {
+      extraResources: Array<{ from: string; to: string; filter: string[] }>;
+    };
+    expect(config.extraResources.find((entry) => entry.to === "native-system-frontmost-input"))
+      .toMatchObject({ from: "dist/native-system-frontmost-input", filter: expect.arrayContaining(["manifest.json", helper]) });
+
+    await expect(packagedAudit.auditNativeSystemFrontmostInput(root, "darwin", architecture === "x64" ? "arm64" : "x64"))
+      .rejects.toThrow("does not match the artifact target");
+    await expect(packagedAudit.auditNativeSystemFrontmostInput(root, "win32", architecture))
+      .rejects.toThrow("incomplete or contains unexpected files");
+    writeFileSync(resolve(root, helper), "changed native resource bytes\n");
+    await expect(packagedAudit.auditNativeSystemFrontmostInput(root, "darwin", architecture))
+      .rejects.toThrow("failed integrity verification");
+    writeFileSync(resolve(root, helper), bytes);
+    writeFileSync(resolve(root, "joko-windows-frontmost-input.node"), "leftover generated helper\n");
+    await expect(packagedAudit.auditNativeSystemFrontmostInput(root, "darwin", architecture))
+      .rejects.toThrow("incomplete or contains unexpected files");
+  });
 });
 
 describe("packaged dedicated hardware SDK audit", () => {

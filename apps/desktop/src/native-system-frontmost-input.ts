@@ -6,6 +6,7 @@ import type { NativeSystemFrontmostInputHelper } from "./dedicated-hardware-acti
 
 const require = createRequire(import.meta.url);
 const WINDOWS_HELPER = "joko-windows-frontmost-input.node";
+const MACOS_HELPER = "joko-macos-frontmost-input.node";
 const MAX_HELPER_BYTES = 2 * 1024 * 1024;
 
 export interface NativeSystemFrontmostInputOptions {
@@ -19,21 +20,22 @@ export interface NativeSystemFrontmostInputOptions {
 export function loadNativeSystemFrontmostInput(
   options: NativeSystemFrontmostInputOptions
 ): NativeSystemFrontmostInputHelper | undefined {
-  if (options.platform !== "win32") return undefined;
+  const helper = options.platform === "win32" ? WINDOWS_HELPER : options.platform === "darwin" ? MACOS_HELPER : undefined;
+  if (helper === undefined) return undefined;
   try {
     const directory = resolve(options.directory);
     const root = lstatSync(directory);
     if (!root.isDirectory() || root.isSymbolicLink() || realpathSync(directory) !== directory) return undefined;
     const entries = readdirSync(directory).sort();
-    if (entries.length !== 2 || entries[0] !== WINDOWS_HELPER || entries[1] !== "manifest.json") return undefined;
+    if (entries.length !== 2 || entries[0] !== helper || entries[1] !== "manifest.json") return undefined;
     const manifestPath = resolve(directory, "manifest.json");
     if (!regularFile(manifestPath, 4_096)) return undefined;
     const manifest: unknown = JSON.parse(readFileSync(manifestPath, "utf8"));
     if (!record(manifest) || Object.keys(manifest).sort().join(",") !== "architecture,helper,platform,protocolVersion,sha256"
       || manifest.platform !== options.platform || manifest.architecture !== options.architecture
-      || manifest.protocolVersion !== 1 || manifest.helper !== WINDOWS_HELPER
+      || manifest.protocolVersion !== 1 || manifest.helper !== helper
       || typeof manifest.sha256 !== "string" || !/^[a-f0-9]{64}$/u.test(manifest.sha256)) return undefined;
-    const helperPath = resolve(directory, WINDOWS_HELPER);
+    const helperPath = resolve(directory, helper);
     if (!regularFile(helperPath, MAX_HELPER_BYTES)) return undefined;
     if (createHash("sha256").update(readFileSync(helperPath)).digest("hex") !== manifest.sha256) return undefined;
     const native = (options.loadNative ?? require)(helperPath);

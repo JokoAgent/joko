@@ -8,8 +8,12 @@ import { gunzipSync } from "node:zlib";
 
 const desktopRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const outputRoot = join(desktopRoot, "dist", "native-system-frontmost-input");
-const helperName = "joko-windows-frontmost-input.node";
-const output = join(outputRoot, helperName);
+const helperNames = Object.freeze({
+  win32: "joko-windows-frontmost-input.node",
+  darwin: "joko-macos-frontmost-input.node"
+});
+const helperName = helperNames[process.platform];
+const output = helperName === undefined ? undefined : join(outputRoot, helperName);
 const manifestPath = join(outputRoot, "manifest.json");
 const electronVersion = "43.6.0";
 const officialBase = `https://artifacts.electronjs.org/headers/dist/v${electronVersion}/`;
@@ -29,13 +33,20 @@ const headerNames = new Set([
 ]);
 
 mkdirSync(outputRoot, { recursive: true });
-if (existsSync(output)) rmSync(output);
+for (const name of Object.values(helperNames)) {
+  const candidate = join(outputRoot, name);
+  if (existsSync(candidate)) rmSync(candidate);
+}
 writeManifest(null, null);
 
-if (process.platform === "win32") {
-  const architecture = architectures[process.arch];
-  if (architecture === undefined) throw new Error("The Windows system frontmost build architecture is unsupported.");
-  const cacheRoot = join(process.env.LOCALAPPDATA ?? join(homedir(), "AppData", "Local"),
+if (process.platform === "win32" || process.platform === "darwin") {
+  const architecture = process.platform === "win32" ? architectures[process.arch] :
+    process.arch === "x64" ? "x86_64" : process.arch === "arm64" ? "arm64" : undefined;
+  if (architecture === undefined) throw new Error("The system frontmost native build architecture is unsupported.");
+  const cacheBase = process.platform === "win32"
+    ? process.env.LOCALAPPDATA ?? join(homedir(), "AppData", "Local")
+    : join(homedir(), "Library", "Caches");
+  const cacheRoot = join(cacheBase,
     "Joko", "BuildCache", "system-frontmost-input", `electron-${electronVersion}`, process.arch);
   mkdirSync(cacheRoot, { recursive: true });
   const checksums = await cachedInput(cacheRoot, "SHASUMS256.txt", "SHASUMS256.txt", checksumDigest, 16_384);
@@ -44,18 +55,21 @@ if (process.platform === "win32") {
     if (parsed === null) throw new Error("The official Electron native checksums are invalid.");
     return [parsed[2], parsed[1]];
   }));
-  if (identities.get(headerName) !== headerDigest ||
-      identities.get(architecture.library) !== architecture.sha256) {
+  if (identities.get(headerName) !== headerDigest || (process.platform === "win32" &&
+      identities.get(architecture.library) !== architecture.sha256)) {
     throw new Error("The official Electron native checksums do not match the pinned build inputs.");
   }
   const headerArchive = await cachedInput(cacheRoot, headerName, headerName, headerDigest, 4 * 1024 * 1024);
-  await cachedInput(cacheRoot, "node.lib", architecture.library, architecture.sha256, 8 * 1024 * 1024);
+  if (process.platform === "win32") {
+    await cachedInput(cacheRoot, "node.lib", architecture.library, architecture.sha256, 8 * 1024 * 1024);
+  }
   const includeRoot = join(cacheRoot, "include");
   mkdirSync(includeRoot, { recursive: true });
   for (const [name, bytes] of unpackHeaders(headerArchive)) {
     cacheVerifiedBytes(join(includeRoot, name), bytes, digest(bytes));
   }
-  buildWindows(architecture, includeRoot, join(cacheRoot, "node.lib"));
+  if (process.platform === "win32") buildWindows(architecture, includeRoot, join(cacheRoot, "node.lib"));
+  else buildMac(architecture, includeRoot);
   writeManifest(helperName, digest(readFileSync(output)));
 }
 
@@ -178,9 +192,31 @@ function buildWindows(architecture, includeRoot, nodeLibrary) {
   }
 }
 
-function run(command, args, environment) {
+function buildMac(architecture, includeRoot) {
+  const sdkRoot = run("xcrun", ["--sdk", "macosx", "--show-sdk-path"], undefined, 10_000).trim();
+  if (sdkRoot === "" || /[\r\n]/u.test(sdkRoot) || !existsSync(join(sdkRoot, "usr", "lib", "libproc.tbd"))) {
+    throw new Error("The macOS SDK must provide the public process identity library.");
+  }
+  const temporary = join(outputRoot, "joko-macos-frontmost-input.build.node");
+  try {
+    if (existsSync(temporary)) rmSync(temporary);
+    run("xcrun", ["--sdk", "macosx", "clang++", "-std=c++17", "-O2", "-fobjc-arc",
+      "-bundle", "-undefined", "dynamic_lookup", "-arch", architecture, "-isysroot", sdkRoot,
+      "-DNAPI_VERSION=8", `-I${includeRoot}`,
+      join(desktopRoot, "native", "system-frontmost-input", "macos-frontmost-input.mm"),
+      "-framework", "AppKit", "-framework", "ApplicationServices", "-framework", "CoreGraphics",
+      "-lproc", "-o", temporary], undefined, 60_000);
+    if (!existsSync(temporary)) throw new Error("The macOS system frontmost native build produced no helper.");
+    renameSync(temporary, output);
+  } finally {
+    if (existsSync(temporary)) rmSync(temporary);
+  }
+}
+
+function run(command, args, environment, timeoutMs) {
   const result = spawnSync(command, args, { cwd: desktopRoot, env: environment ?? process.env,
-    encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], windowsHide: true, maxBuffer: 1024 * 1024 });
+    encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], windowsHide: true, maxBuffer: 1024 * 1024,
+    ...(timeoutMs === undefined ? {} : { timeout: timeoutMs }) });
   if (result.error !== undefined || result.status !== 0) {
     throw new Error((result.stderr || result.stdout || result.error?.message || "The system frontmost native build failed.").trim());
   }

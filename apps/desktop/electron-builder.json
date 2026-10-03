@@ -79,7 +79,8 @@
       "to": "native-system-frontmost-input",
       "filter": [
         "manifest.json",
-        "joko-windows-frontmost-input.node"
+        "joko-windows-frontmost-input.node",
+        "joko-macos-frontmost-input.node"
       ]
     },
     {

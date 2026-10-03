@@ -13,19 +13,59 @@ afterEach(() => {
   for (const directory of directories.splice(0)) rmSync(directory, { recursive: true, force: true });
 });
 
-function artifact(overrides: Record<string, unknown> = {}): string {
+function artifact(overrides: Record<string, unknown> = {}, platform: "win32" | "darwin" = "win32", architecture = "x64"): string {
   const directory = mkdtempSync(join(tmpdir(), "joko-native-frontmost-"));
   directories.push(directory);
   const bytes = Buffer.from("native input test artifact");
-  writeFileSync(join(directory, "joko-windows-frontmost-input.node"), bytes);
+  const helper = platform === "win32" ? "joko-windows-frontmost-input.node" : "joko-macos-frontmost-input.node";
+  writeFileSync(join(directory, helper), bytes);
   writeFileSync(join(directory, "manifest.json"), JSON.stringify({
-    architecture: "x64", helper: "joko-windows-frontmost-input.node", platform: "win32", protocolVersion: 1,
+    architecture, helper, platform, protocolVersion: 1,
     sha256: createHash("sha256").update(bytes).digest("hex"), ...overrides
   }));
   return directory;
 }
 
 describe("native foreground sampler admission", () => {
+  it.each(["x64", "arm64"])("admits only the current macOS helper for %s without capture during loading", (architecture) => {
+    const captureTarget = vi.fn(() => ({ nativeId: "1780500000000000", processId: 999 }));
+    const loadNative = vi.fn(() => nativeExports(captureTarget));
+    const directory = artifact({}, "darwin", architecture);
+    const helper = loadNativeSystemFrontmostInput({ directory, platform: "darwin", architecture, loadNative });
+    expect(helper).toBeDefined();
+    expect(Object.isFrozen(helper)).toBe(true);
+    expect(loadNative).toHaveBeenCalledExactlyOnceWith(join(directory, "joko-macos-frontmost-input.node"));
+    expect(captureTarget).not.toHaveBeenCalled();
+    const target = helper!.captureTarget();
+    expect(target).toEqual({ nativeId: "1780500000000000", processId: 999 });
+    expect(Object.isFrozen(target)).toBe(true);
+    expect(captureTarget).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    { platform: "win32" }, { architecture: "x64" }, { protocolVersion: 2 },
+    { helper: "joko-windows-frontmost-input.node" }, { sha256: "0".repeat(64) }, { extra: true }
+  ])("rejects macOS artifact identity drift before loading: %j", (overrides) => {
+    const loadNative = vi.fn();
+    expect(loadNativeSystemFrontmostInput({
+      directory: artifact(overrides, "darwin", "arm64"), platform: "darwin", architecture: "arm64", loadNative
+    })).toBeUndefined();
+    expect(loadNative).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    null, { nativeId: "0", processId: 999 }, { nativeId: "01", processId: 999 },
+    { nativeId: "-1", processId: 999 }, { nativeId: "9223372036854775808", processId: 999 },
+    { nativeId: "1780500000000000", processId: 0 }, { nativeId: "1780500000000000", processId: 0x1_0000_0000 },
+    { nativeId: "1780500000000000", processId: 1.5 }, { nativeId: "1780500000000000", processId: 999, extra: true }
+  ])("rejects malformed macOS process birth identity without a fallback: %j", (identity) => {
+    const helper = loadNativeSystemFrontmostInput({
+      directory: artifact({}, "darwin"), platform: "darwin", architecture: "x64",
+      loadNative: () => nativeExports(() => identity)
+    })!;
+    expect(() => helper.captureTarget()).toThrow("identity is invalid");
+  });
+
   it("loads once without sampling and synchronously captures the physical activation target", async () => {
     let foreground = "123";
     const captureTarget = vi.fn(() => ({ nativeId: foreground, processId: 999 }));
