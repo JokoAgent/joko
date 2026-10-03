@@ -41,6 +41,7 @@ import {
   type ClaudeSdkQuery,
   type ClaudeSdkQueryParams,
   type ClaudeSdkRuntime,
+  type ClaudeSdkFreshContextRuntime,
   type ClaudeSdkSessionInfo,
   type ClaudeSdkSessionMessage,
   type ClaudeSdkStoredSessionRuntime,
@@ -5218,6 +5219,176 @@ describe("ClaudeCodeAdapter", () => {
     await adapter.dispose();
   });
 
+  test.each(["delete", "consumed-missing"] as const)("restores the exact remote empty context before %s without using the local input fence", async (ending) => {
+    const directory = await mkdtemp(join(tmpdir(), "joko-claude-remote-empty-"));
+    const selectedTarget: TargetDescriptor = { ...target, id: "remote-empty", workspaceRoot: "/srv/project",
+      remoteWorkspace: { kind: "ssh", hostTargetId: "remote-empty", hostId: "host-a", workspaceRoot: "/srv/project" } };
+    const owner = new ClaudeFreshContextOwner({ rootDirectory: directory, namespace: "backend-remote-empty", generation: INSTANCE_GENERATION });
+    const sourceSdk = new FakeSdkRuntime({ initialFrameOverrides: { cwd: selectedTarget.workspaceRoot } });
+    const localSdk = new FakeSdkRuntime();
+    localSdk.freshContexts = owner;
+    const sourceRemote = asyncFreshRuntime(sourceSdk, owner);
+    const adapter = adapterFor(localSdk, { remoteRuntimes: {
+      supportsFreshContexts: true,
+      resolve: async () => ({ runtime: sourceRemote, workspaceRoot: selectedTarget.workspaceRoot, remote: true, assertCurrent: () => undefined }),
+      close: async () => undefined
+    } });
+    let restored: ClaudeCodeAdapter | undefined;
+    try {
+      const binding = await adapter.createSession(createInput({ target: selectedTarget }), contextFor(undefined, { target: selectedTarget }).context);
+      sourceSdk.sessions.set(binding.nativeSessionId!, { ...sessionInfo(binding.nativeSessionId!), cwd: selectedTarget.workspaceRoot });
+      const messages = forkHistory(binding.nativeSessionId!);
+      sourceSdk.messages.set(binding.nativeSessionId!, messages);
+      const context = contextFor(binding, { target: selectedTarget, operationId: "remote-empty-navigation" }).context;
+      expect((await adapter.describe()).capabilities.get("session.rewind_to_start")).toMatchObject({ supported: true });
+      expect((await adapter.describe()).capabilities.get("session.rewind_to_start")?.options).toBeUndefined();
+      const history = await adapter.getNativeHistoryProjection(context);
+      expect(history.events.find((event) => event.nativeEntryId === messages[0]!.uuid)?.nativeRewindBefore).toEqual({ kind: "session_start" });
+      const recordBinding = vi.fn();
+      const result = await adapter.navigateTree(history.events[0]!.nativeRewindBefore!, false, context, undefined, { recordBinding });
+      if (result.kind !== "replacement") throw new Error("Expected a remote empty replacement.");
+      const lifecycle = { operationId: context.operationId!, kind: "navigate" as const, navigationTarget: { kind: "session_start" as const },
+        sourceSessionId: context.sessionId, sourceBinding: binding, sessionId: context.sessionId, sourceTarget: selectedTarget, target: selectedTarget, binding: result.binding };
+      expect(recordBinding).toHaveBeenCalledExactlyOnceWith(result.binding);
+      expect(result.nativeHistory).toMatchObject({ events: [], activeLineage: [] });
+      expect(sourceSdk.forks).toEqual([]);
+      await expect(adapter.adoptNativeSessionDerivation(lifecycle, context.signal)).rejects.toMatchObject({ publicError: { stateMayHaveChanged: true } });
+      await adapter.closeSession(binding, context);
+      await adapter.adoptNativeSessionDerivation(lifecycle, context.signal);
+      expect(sourceSdk.retiredQueries).toEqual([sourceSdk.queries[0]]);
+      expect(sourceSdk.messages.get(binding.nativeSessionId!)).toEqual(messages);
+      await adapter.dispose();
+
+      const nextSdk = new FakeSdkRuntime({ initialFrameOverrides: { cwd: selectedTarget.workspaceRoot } });
+      nextSdk.persistFreshMetadata = false;
+      const nextOwner = new ClaudeFreshContextOwner({ rootDirectory: directory, namespace: "backend-remote-empty", generation: INSTANCE_GENERATION + 1 });
+      const nextRemote = asyncFreshRuntime(nextSdk, nextOwner);
+      const nextLocal = new FakeSdkRuntime();
+      nextLocal.freshContexts = nextOwner;
+      restored = adapterFor(nextLocal, { instanceGeneration: INSTANCE_GENERATION + 1, remoteRuntimes: {
+        supportsFreshContexts: true,
+        resolve: async () => ({ runtime: nextRemote, workspaceRoot: selectedTarget.workspaceRoot, remote: true, assertCurrent: () => undefined }),
+        close: async () => undefined
+      } });
+      const currentBinding = { ...result.binding, generation: 3 };
+      const restoredContext = contextFor(currentBinding, { target: selectedTarget, generation: 3, backendInstanceGeneration: INSTANCE_GENERATION + 1 }).context;
+      await restored.inspectSession(currentBinding, restoredContext);
+      await restored.resumeSession(result.binding, restoredContext);
+      expect(nextSdk.queries[0]!.params.options).toMatchObject({ cwd: selectedTarget.workspaceRoot, sessionId: result.binding.nativeSessionId,
+        freshContextClaim: { lifecycle: "adopted", dispatch: "never_dispatched", backendGeneration: INSTANCE_GENERATION + 1 } });
+      expect(nextSdk.queries[0]!.params.options.resume).toBeUndefined();
+      expect((await restored.getNativeHistoryProjection(restoredContext)).events).toEqual([]);
+      const mark = vi.spyOn(nextOwner, "markDispatching");
+      if (ending === "delete") {
+        await restored.deleteSession(currentBinding, restoredContext);
+        expect(mark).not.toHaveBeenCalled();
+        expect(nextSdk.deleted).toEqual([]);
+        expect(await restored.inspectNativeSessionDeletion(currentBinding, restoredContext)).toBe("absent");
+      } else {
+        // The manager's own SDK iterator establishes this fact. The local
+        // Adapter must consume it through the async Owner, not mark a queued ACK.
+        const claim = nextSdk.queries[0]!.params.options.freshContextClaim!;
+        nextOwner.markDispatching(claim);
+        await restored.closeSession(currentBinding, restoredContext);
+        const queryCount = nextSdk.queries.length;
+        await expect(restored.resumeSession(currentBinding, restoredContext)).rejects.toMatchObject({ publicError: { code: "NATIVE_SESSION_CONTINUITY_GAP" } });
+        await expect(restored.deleteSession(currentBinding, restoredContext)).rejects.toMatchObject({ publicError: { stateMayHaveChanged: true } });
+        expect(nextSdk.queries).toHaveLength(queryCount);
+        expect(await restored.inspectNativeSessionDeletion(currentBinding, restoredContext)).toBe("unknown");
+        expect(mark).toHaveBeenCalledOnce();
+      }
+    } finally {
+      await restored?.dispose();
+      await adapter.dispose();
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  test.each([
+    { route: "Windows device-peer", workspaceRoot: "C:\\Joko\\Project", observedCwd: "C:\\Joko\\Project", accepted: true },
+    { route: "Windows device-peer alias", workspaceRoot: "C:\\Joko\\Project", observedCwd: "C:\\joko\\project", accepted: false },
+    { route: "POSIX SSH", workspaceRoot: "/srv/Project", observedCwd: "/srv/Project", accepted: true },
+    { route: "POSIX SSH alias", workspaceRoot: "/srv/Project", observedCwd: "/srv/project", accepted: false }
+  ])("checks the exact remote cwd before reserving Session start on $route", async ({ route, workspaceRoot, observedCwd, accepted }) => {
+    const directory = await mkdtemp(join(tmpdir(), "joko-claude-remote-start-cwd-"));
+    const selectedTarget: TargetDescriptor = { ...target, id: "remote-start-cwd", workspaceRoot,
+      remoteWorkspace: route.startsWith("Windows")
+        ? { kind: "device_peer", controllerDeviceId: "controller-a", targetDeviceId: "windows-peer", workspaceRoot }
+        : { kind: "ssh", hostTargetId: "remote-start-cwd", hostId: "host-a", workspaceRoot } };
+    const owner = new ClaudeFreshContextOwner({ rootDirectory: directory, namespace: "backend-remote-cwd", generation: INSTANCE_GENERATION });
+    const sdk = new FakeSdkRuntime({ initialFrameOverrides: { cwd: workspaceRoot } });
+    const remote = asyncFreshRuntime(sdk, owner);
+    // This boundary models a manager on the selected Target OS. Its Owner's
+    // native path validation must not be performed by the service host.
+    vi.spyOn(remote.freshContexts!, "getForBinding").mockResolvedValue(undefined);
+    vi.spyOn(remote.freshContexts!, "hasPendingSource").mockResolvedValue(false);
+    const reserve = vi.spyOn(remote.freshContexts!, "reserve").mockImplementation(async (identity) => ({
+      ...identity, backendGeneration: INSTANCE_GENERATION, lifecycle: "reserved", dispatch: "never_dispatched", sourceRetired: false, revision: 1
+    }));
+    const adapter = adapterFor(new FakeSdkRuntime(), { remoteRuntimes: {
+      supportsFreshContexts: true,
+      resolve: async () => ({ runtime: remote, workspaceRoot, remote: true, assertCurrent: () => undefined }),
+      close: async () => undefined
+    } });
+    try {
+      const binding = await adapter.createSession(createInput({ target: selectedTarget }), contextFor(undefined, { target: selectedTarget }).context);
+      sdk.sessions.set(binding.nativeSessionId!, { ...sessionInfo(binding.nativeSessionId!), cwd: observedCwd });
+      sdk.messages.set(binding.nativeSessionId!, forkHistory(binding.nativeSessionId!));
+      const context = contextFor(binding, { target: selectedTarget, operationId: "remote-start-cwd" }).context;
+      const recordBinding = vi.fn();
+      const initialLookups = sdk.infoOptions.length;
+      const navigation = adapter.navigateTree({ kind: "session_start" }, false, context, undefined, { recordBinding });
+      if (accepted) {
+        const result = await navigation;
+        expect(result.kind).toBe("replacement");
+        expect(reserve).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ workspaceRoot, targetId: selectedTarget.id }));
+        expect(recordBinding).toHaveBeenCalledOnce();
+        expect(sdk.infoOptions.slice(initialLookups).every((entry) => entry.options.dir === workspaceRoot)).toBe(true);
+      } else {
+        await expect(navigation).rejects.toMatchObject({ publicError: { code: "NATIVE_SESSION_CONTINUITY_GAP" } });
+        expect(sdk.infoOptions).toHaveLength(initialLookups + 1);
+        expect(reserve).not.toHaveBeenCalled();
+        expect(recordBinding).not.toHaveBeenCalled();
+      }
+      expect(sdk.queries[0]!.closeCalls).toBe(0);
+    } finally { await adapter.dispose(); await rm(directory, { recursive: true, force: true }); }
+  });
+
+  test("rejects source drift while awaiting a remote empty reservation and cleans only its unused receipt", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "joko-claude-remote-empty-drift-"));
+    const selectedTarget: TargetDescriptor = { ...target, id: "remote-empty-drift", workspaceRoot: "/srv/project",
+      remoteWorkspace: { kind: "ssh", hostTargetId: "remote-empty-drift", hostId: "host-a", workspaceRoot: "/srv/project" } };
+    const owner = new ClaudeFreshContextOwner({ rootDirectory: directory, namespace: "backend-remote-drift", generation: INSTANCE_GENERATION });
+    const sdk = new FakeSdkRuntime();
+    const remote = asyncFreshRuntime(sdk, owner);
+    const adapter = adapterFor(new FakeSdkRuntime(), { remoteRuntimes: {
+      supportsFreshContexts: true,
+      resolve: async () => ({ runtime: remote, workspaceRoot: selectedTarget.workspaceRoot, remote: true, assertCurrent: () => undefined }),
+      close: async () => undefined
+    } });
+    try {
+      const binding = await adapter.createSession(createInput({ target: selectedTarget }), contextFor(undefined, { target: selectedTarget }).context);
+      sdk.sessions.set(binding.nativeSessionId!, { ...sessionInfo(binding.nativeSessionId!), cwd: selectedTarget.workspaceRoot });
+      const messages = forkHistory(binding.nativeSessionId!);
+      sdk.messages.set(binding.nativeSessionId!, messages);
+      const context = contextFor(binding, { target: selectedTarget, operationId: "remote-empty-drift" }).context;
+      const reserve = vi.spyOn(remote.freshContexts!, "reserve").mockImplementation(async (identity) => {
+        const result = owner.reserve(identity);
+        sdk.messages.set(binding.nativeSessionId!, [...messages, { ...messages[0]!, uuid: randomUUID() }]);
+        return result;
+      });
+      const recordBinding = vi.fn();
+      await expect(adapter.navigateTree({ kind: "session_start" }, false, context, undefined, { recordBinding })).rejects.toBeDefined();
+      expect(recordBinding).not.toHaveBeenCalled();
+      await adapter.cleanupNativeSessionDerivation({ operationId: context.operationId!, kind: "navigate", navigationTarget: { kind: "session_start" },
+        sourceSessionId: context.sessionId, sourceBinding: binding, sessionId: context.sessionId, sourceTarget: selectedTarget, target: selectedTarget }, context.signal);
+      expect(owner.getForOperation(context.operationId!)?.lifecycle).toBe("cleaned");
+      expect(sdk.queries[0]!.closeCalls).toBe(0);
+      expect(sdk.deleted).toEqual([]);
+      reserve.mockRestore();
+    } finally { await adapter.dispose(); await rm(directory, { recursive: true, force: true }); }
+  });
+
   test("adopts an empty local context and reclaims the same UUID across Backend and Product generations", async () => {
     const directory = await mkdtemp(join(tmpdir(), "joko-claude-empty-context-"));
     const runtime = new FakeSdkRuntime();
@@ -5456,19 +5627,26 @@ describe("ClaudeCodeAdapter", () => {
     }
   });
 
-  test.each(["system", "tool-result", "child"] as const)("keeps an unconfirmed %s root closed for before-first rewind", async (boundary) => {
+  test.each(["local", "remote"].flatMap((location) => ["system", "tool-result", "child"].map((boundary) => ({ location, boundary }))))("keeps an unconfirmed $location $boundary root closed for before-first rewind", async ({ location, boundary }) => {
     const directory = await mkdtemp(join(tmpdir(), "joko-claude-root-boundary-"));
     const runtime = new FakeSdkRuntime();
     runtime.freshContexts = new ClaudeFreshContextOwner({ rootDirectory: directory, namespace: "backend-empty", generation: INSTANCE_GENERATION });
-    const adapter = adapterFor(runtime);
-    const binding = await adapter.createSession(createInput(), contextFor().context);
+    const selectedTarget: TargetDescriptor = location === "remote" ? { ...target, id: "remote-first-boundary", workspaceRoot: "/srv/project",
+      remoteWorkspace: { kind: "ssh", hostTargetId: "remote-first-boundary", hostId: "host-a", workspaceRoot: "/srv/project" } } : target;
+    const adapter = adapterFor(runtime, location === "remote" ? { remoteRuntimes: {
+      supportsFreshContexts: true,
+      resolve: async () => ({ runtime: asyncFreshRuntime(runtime, runtime.freshContexts!), workspaceRoot: selectedTarget.workspaceRoot, remote: true, assertCurrent: () => undefined }),
+      close: async () => undefined
+    } } : {});
+    const binding = await adapter.createSession(createInput({ target: selectedTarget }), contextFor(undefined, { target: selectedTarget }).context);
+    if (location === "remote") runtime.sessions.set(binding.nativeSessionId!, { ...sessionInfo(binding.nativeSessionId!), cwd: selectedTarget.workspaceRoot });
     const messages = forkHistory(binding.nativeSessionId!);
     if (boundary === "system") messages.unshift({ ...messages[0]!, uuid: randomUUID(), type: "system", message: {} });
     if (boundary === "tool-result") messages[0] = { ...messages[0]!, message: { role: "user", content: [{ type: "tool_result", tool_use_id: "tool", content: "output" }] } };
     if (boundary === "child") messages[0] = { ...messages[0]!, parent_agent_id: "child-agent" };
     runtime.messages.set(binding.nativeSessionId!, messages);
     try {
-      const history = await adapter.getNativeHistoryProjection(contextFor(binding).context);
+      const history = await adapter.getNativeHistoryProjection(contextFor(binding, { target: selectedTarget }).context);
       expect(history.events.some((event) => event.nativeRewindBefore?.kind === "session_start")).toBe(false);
     } finally {
       await adapter.dispose();
@@ -6841,6 +7019,24 @@ function contextFor(
 
 function textPrompt(text: string) {
   return { text, images: [], files: [], mentions: [], disposition: "prompt" as const };
+}
+
+function asyncFreshRuntime(runtime: FakeSdkRuntime, owner: ClaudeFreshContextOwner): ClaudeSdkRuntime {
+  const remote = Object.create(runtime) as ClaudeSdkRuntime;
+  const operations = {
+    reserve: async (identity) => owner.reserve(identity),
+    getForBinding: async (input) => owner.getForBinding(input),
+    getForOperation: async (operationId) => owner.getForOperation(operationId),
+    claim: async (input, proof) => owner.claim(input, proof),
+    recover: async (identity, proof) => owner.recover(identity, proof),
+    hasPendingSource: async (input) => owner.hasPendingSource(input),
+    markSourceRetired: async (input) => owner.markSourceRetired(input),
+    adopt: async (identity, proof) => owner.adopt(identity, proof),
+    cleanup: async (identity, proof) => owner.cleanup(identity, proof),
+    deleteEmptyBinding: async (input, proof) => owner.deleteEmptyBinding(input, proof)
+  } satisfies ClaudeSdkFreshContextRuntime;
+  Object.defineProperty(remote, "freshContexts", { value: operations });
+  return remote;
 }
 
 async function emptyContextFixture(options: Partial<ClaudeCodeAdapterOptions> = {}) {

@@ -27,6 +27,12 @@ import {
   type ClaudeSdkQueryOptions,
   type ClaudeSdkQueryParams,
   type ClaudeSdkRuntime,
+  type ClaudeSdkFreshContextRuntime,
+  ClaudeFreshContextOwnerError,
+  type ClaudeFreshContextBindingLookup,
+  type ClaudeFreshContextIdentity,
+  type ClaudeFreshContextSnapshot,
+  type ClaudeFreshContextSource,
   type ClaudeSdkSessionInfo,
   type ClaudeSdkSessionMessage,
   type ClaudeSdkStoredSessionRuntime,
@@ -38,7 +44,7 @@ import type {
   ClaudeSessionStoreOperationSnapshot,
   ClaudeSessionStoreSessionAccess
 } from "@joko/adapter-claude-code";
-import type { RemoteWorkspaceBinding, TargetDescriptor } from "@joko/core";
+import type { NativeSessionBinding, RemoteWorkspaceBinding, TargetDescriptor } from "@joko/core";
 import type {
   RemoteForwardingTransportPort,
   RemoteProcessHandle,
@@ -76,6 +82,7 @@ const STORE_CODES = new Set([
   "NOT_FOUND", "CONFLICT", "OPERATION_NOT_READY", "CORRUPT", "STORAGE_UNAVAILABLE",
   "COMMIT_UNKNOWN", "RESERVATION_REQUIRED", "RESERVATION_FAILED"
 ]);
+const FRESH_CODES = new Set(["INVALID_AUTHORITY", "INVALID_ACCESS", "NOT_FOUND", "CONFLICT", "CORRUPT", "STORAGE_UNAVAILABLE", "COMMIT_UNKNOWN"]);
 
 interface RemoteClaudeStoreAuthority {
   readonly schemaVersion: 1;
@@ -115,6 +122,7 @@ export interface RemoteClaudeRuntimeResolverOptions {
 
 /** Target-, Host-, SSH-, installation-, and manager-generation-bound Claude runtime owner. */
 export class RemoteClaudeRuntimeResolver implements ClaudeRemoteRuntimePort {
+  readonly supportsFreshContexts = true;
   readonly #store: Pick<OperationalStore, "getTarget">;
   readonly #remoteExecution: Pick<RemoteExecutionRouter, "processes">;
   readonly #authorizeDerivedWorkspace: RemoteClaudeRuntimeResolverOptions["authorizeDerivedWorkspace"];
@@ -252,6 +260,7 @@ export class RemoteClaudeRuntimeResolver implements ClaudeRemoteRuntimePort {
       ownerKey,
       ownerGeneration,
       storeAuthority,
+      targetId: target.id,
       workspaceAuthority,
       authorizedWorkspaceRoot: effectiveWorkspaceRoot,
       ...(directoryAuthority === undefined ? {} : { verifyWorkspace: directoryAuthority.verifyExact }),
@@ -332,6 +341,7 @@ interface RemoteClaudeSdkRuntimeOptions {
   readonly ownerKey: string;
   readonly ownerGeneration: string;
   readonly storeAuthority: RemoteClaudeStoreAuthority;
+  readonly targetId: string;
   readonly workspaceAuthority: string;
   readonly authorizedWorkspaceRoot: string;
   readonly verifyWorkspace?: (signal?: AbortSignal) => Promise<void>;
@@ -344,6 +354,7 @@ class RemoteClaudeSdkRuntime implements ClaudeSdkRuntime {
   readonly packageVersion = CLAUDE_AGENT_SDK_VERSION;
   readonly supportsWorkspaceDerivation = true;
   readonly storedSessions: ClaudeSdkStoredSessionRuntime;
+  readonly freshContexts: ClaudeSdkFreshContextRuntime;
   readonly #options: RemoteClaudeSdkRuntimeOptions;
   readonly #queries = new Map<ClaudeSdkQuery, RemoteClaudeQuery>();
   readonly #ownedQueries = new WeakSet<ClaudeSdkQuery>();
@@ -357,7 +368,114 @@ class RemoteClaudeSdkRuntime implements ClaudeSdkRuntime {
   constructor(options: RemoteClaudeSdkRuntimeOptions) {
     this.#options = options;
     this.storedSessions = this.#createStoredSessions();
+    this.freshContexts = this.#createFreshContexts();
   }
+
+  #createFreshContexts(): ClaudeSdkFreshContextRuntime {
+    const read = (value: unknown): ClaudeFreshContextSnapshot => freshContextSnapshot(value, this.#options);
+    const readCurrent = (value: unknown): ClaudeFreshContextSnapshot => {
+      const result = read(value);
+      if (result.backendGeneration !== this.#options.storeAuthority.generation) throw runtimeFault("invalid_response", true);
+      return result;
+    };
+    const lookup = (input: ClaudeFreshContextBindingLookup): void => this.#assertFreshLookup(input);
+    const identity = (input: ClaudeFreshContextIdentity): void => {
+      lookup(input);
+      if (!validFreshBinding(input.sourceBinding) || !freshOpaqueAuthority(input.sourceSessionId)
+        || typeof input.operationId !== "string" || input.operationId.length === 0 || input.operationId.length > 256
+        || input.sourceSessionId !== input.sessionId) throw runtimeFault("fresh_access_mismatch", false);
+    };
+    const source = (input: ClaudeFreshContextSource): void => {
+      if (!freshOpaqueAuthority(input.sourceSessionId) || !validFreshBinding(input.sourceBinding)) throw runtimeFault("fresh_access_mismatch", false);
+    };
+    const proof = (value: { readonly retirementConfirmed: true }): void => {
+      if (value?.retirementConfirmed !== true) throw runtimeFault("fresh_access_mismatch", false);
+    };
+    return Object.freeze({
+      reserve: async (input: ClaudeFreshContextIdentity) => {
+        identity(input);
+        const result = readCurrent(await this.#freshOperation("fresh.reserve", { identity: input }));
+        assertFreshIdentity(result, input);
+        return result;
+      },
+      getForBinding: async (input: ClaudeFreshContextBindingLookup) => {
+        lookup(input);
+        const value = await this.#freshOperation("fresh.getForBinding", { input });
+        if (value === undefined || value === null) return undefined;
+        const result = read(value);
+        assertFreshLookup(result, input, true);
+        return result;
+      },
+      getForOperation: async (operationId: string) => {
+        if (operationId.length === 0 || operationId.length > 256) throw runtimeFault("fresh_access_mismatch", false);
+        const value = await this.#freshOperation("fresh.getForOperation", { operationId });
+        if (value === undefined || value === null) return undefined;
+        const result = read(value);
+        if (result.operationId !== operationId) throw runtimeFault("invalid_response", true);
+        return result;
+      },
+      claim: async (input: ClaudeFreshContextBindingLookup, retirement: { readonly retirementConfirmed: true }) => {
+        lookup(input); proof(retirement);
+        const result = readCurrent(await this.#freshOperation("fresh.claim", { input, proof: retirement }));
+        assertFreshLookup(result, input);
+        return result;
+      },
+      recover: async (input: ClaudeFreshContextIdentity, retirement: { readonly retirementConfirmed: true }) => {
+        identity(input); proof(retirement);
+        const result = readCurrent(await this.#freshOperation("fresh.recover", { identity: input, proof: retirement }));
+        assertFreshIdentity(result, input);
+        return result;
+      },
+      hasPendingSource: async (input: ClaudeFreshContextSource) => {
+        source(input);
+        const value = await this.#freshOperation("fresh.hasPendingSource", { input });
+        if (typeof value !== "boolean") throw runtimeFault("invalid_response", true);
+        return value;
+      },
+      markSourceRetired: async (input: ClaudeFreshContextSource) => {
+        source(input);
+        const value = await this.#freshOperation("fresh.markSourceRetired", { input });
+        if (!isRecord(value) || value.confirmed !== true) throw runtimeFault("invalid_response", true);
+      },
+      adopt: async (input: ClaudeFreshContextIdentity, retirement: { readonly retirementConfirmed: true }) => {
+        identity(input); proof(retirement);
+        const result = readCurrent(await this.#freshOperation("fresh.adopt", { identity: input, proof: retirement }));
+        assertFreshIdentity(result, input);
+        return result;
+      },
+      cleanup: async (input: ClaudeFreshContextIdentity, retirement: { readonly retirementConfirmed: true }) => {
+        identity(input); proof(retirement);
+        const result = read(await this.#freshOperation("fresh.cleanup", { identity: input, proof: retirement }));
+        assertFreshIdentity(result, input);
+        return result;
+      },
+      deleteEmptyBinding: async (input: ClaudeFreshContextBindingLookup, retirement: { readonly retirementConfirmed: true }) => {
+        lookup(input); proof(retirement);
+        const result = read(await this.#freshOperation("fresh.deleteEmptyBinding", { input, proof: retirement }));
+        assertFreshLookup(result, input);
+        return result;
+      }
+    });
+  }
+
+  #assertFreshLookup(input: ClaudeFreshContextBindingLookup): void {
+    this.#assertOpen();
+    if (!freshOpaqueAuthority(input.sessionId) || !validFreshBinding(input.binding)
+      || input.targetId !== this.#options.targetId || input.workspaceAuthority !== this.#options.workspaceAuthority
+      || input.workspaceRoot !== this.#options.authorizedWorkspaceRoot) throw runtimeFault("fresh_access_mismatch", false);
+  }
+
+  async #freshOperation(method: string, params: Readonly<Record<string, unknown>>): Promise<unknown> {
+    try { return await this.#sessionOperation(method, { authority: this.#options.storeAuthority, ...params }); }
+    catch (error) {
+      if (error instanceof RemoteClaudeManagerFault && FRESH_CODES.has(error.code)) {
+        throw new ClaudeFreshContextOwnerError(error.code as ConstructorParameters<typeof ClaudeFreshContextOwnerError>[0], error.stateMayHaveChanged);
+      }
+      throw error;
+    }
+  }
+
+  async prepareFreshContextRecovery(): Promise<void> { await this.initialize(); }
 
   #createStoredSessions(): ClaudeSdkStoredSessionRuntime {
     const runtime: ClaudeSdkStoredSessionRuntime = {
@@ -588,6 +706,14 @@ class RemoteClaudeSdkRuntime implements ClaudeSdkRuntime {
   async query(params: ClaudeSdkQueryParams): Promise<ClaudeSdkQuery> {
     this.#assertOpen();
     this.#assertDirectory(params.options.cwd);
+    if (params.options.freshContextClaim !== undefined) {
+      const claim = params.options.freshContextClaim;
+      this.#assertFreshLookup(claim);
+      if (claim.backendGeneration !== this.#options.storeAuthority.generation
+        || claim.binding.nativeSessionId !== (params.options.resume ?? params.options.sessionId)
+        || claim.lifecycle !== "adopted" || !claim.sourceRetired
+        || (params.options.resume === undefined && claim.dispatch !== "never_dispatched")) throw runtimeFault("fresh_access_mismatch", false);
+    }
     if (params.options.sessionStoreAccess !== undefined) {
       storeSessionAccess(params.options.sessionStoreAccess,
         this.#options.storeAuthority.generation,
@@ -830,6 +956,57 @@ class RemoteClaudeSdkRuntime implements ClaudeSdkRuntime {
     this.assertManagerGenerationCurrent();
     this.#options.assertCurrent();
   }
+}
+
+function freshOpaqueAuthority(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0 && value.length <= 256 && /^[A-Za-z0-9][A-Za-z0-9._:-]*$/u.test(value);
+}
+
+function validFreshBinding(value: unknown): value is NativeSessionBinding {
+  return isRecord(value) && exactKeys(value, ["opaqueRef", "nativeSessionId", "generation"])
+    && typeof value.opaqueRef === "string" && value.opaqueRef.length <= 1024
+    && /^[A-Za-z0-9][A-Za-z0-9._:-]*$/u.test(value.opaqueRef)
+    && typeof value.nativeSessionId === "string" && UUID.test(value.nativeSessionId)
+    && typeof value.generation === "number" && Number.isSafeInteger(value.generation) && value.generation >= 1;
+}
+
+function freshContextSnapshot(value: unknown, options: RemoteClaudeSdkRuntimeOptions): ClaudeFreshContextSnapshot {
+  if (!isRecord(value) || !exactKeys(value, ["operationId", "sourceSessionId", "sourceBinding", "sessionId", "binding", "targetId", "workspaceAuthority", "workspaceRoot", "backendGeneration", "lifecycle", "dispatch", "sourceRetired", "revision"])
+    || typeof value.operationId !== "string" || value.operationId.length === 0 || value.operationId.length > 256
+    || !freshOpaqueAuthority(value.sessionId) || value.sourceSessionId !== value.sessionId
+    || !validFreshBinding(value.binding) || !validFreshBinding(value.sourceBinding)
+    || value.binding.generation <= value.sourceBinding.generation
+    || value.binding.nativeSessionId === value.sourceBinding.nativeSessionId
+    || value.targetId !== options.targetId || value.workspaceAuthority !== options.workspaceAuthority
+    || value.workspaceRoot !== options.authorizedWorkspaceRoot
+    || typeof value.backendGeneration !== "number" || !Number.isSafeInteger(value.backendGeneration)
+    || value.backendGeneration < 1 || value.backendGeneration > options.storeAuthority.generation
+    || !["reserved", "adopted", "cleaned"].includes(String(value.lifecycle))
+    || !["never_dispatched", "dispatching"].includes(String(value.dispatch))
+    || typeof value.sourceRetired !== "boolean"
+    || (value.lifecycle === "adopted" && !value.sourceRetired)
+    || (value.dispatch === "dispatching" && (value.lifecycle !== "adopted" || !value.sourceRetired))
+    || typeof value.revision !== "number" || !Number.isSafeInteger(value.revision) || value.revision < 1) {
+    throw runtimeFault("invalid_response", true);
+  }
+  return value as unknown as ClaudeFreshContextSnapshot;
+}
+
+function assertFreshLookup(actual: ClaudeFreshContextSnapshot, expected: ClaudeFreshContextBindingLookup, allowHostGeneration = false): void {
+  if (actual.sessionId !== expected.sessionId || actual.targetId !== expected.targetId
+    || actual.workspaceAuthority !== expected.workspaceAuthority || actual.workspaceRoot !== expected.workspaceRoot
+    || actual.binding.opaqueRef !== expected.binding.opaqueRef || actual.binding.nativeSessionId !== expected.binding.nativeSessionId
+    || (allowHostGeneration ? actual.binding.generation > expected.binding.generation : actual.binding.generation !== expected.binding.generation)) {
+    throw runtimeFault("invalid_response", true);
+  }
+}
+
+function assertFreshIdentity(actual: ClaudeFreshContextSnapshot, expected: ClaudeFreshContextIdentity): void {
+  assertFreshLookup(actual, expected);
+  if (actual.operationId !== expected.operationId || actual.sourceSessionId !== expected.sourceSessionId
+    || actual.sourceBinding.opaqueRef !== expected.sourceBinding.opaqueRef
+    || actual.sourceBinding.nativeSessionId !== expected.sourceBinding.nativeSessionId
+    || actual.sourceBinding.generation !== expected.sourceBinding.generation) throw runtimeFault("invalid_response", true);
 }
 
 interface RemoteClaudeQueryOpenOptions extends RemoteClaudeManagerChannelOptions {
@@ -1651,6 +1828,10 @@ function serializeQueryOptions(
     ...(options.sessionStoreAccess === undefined ? {} : {
       sessionStoreAuthority: storeAuthority,
       sessionStoreAccess: options.sessionStoreAccess
+    }),
+    ...(options.freshContextClaim === undefined ? {} : {
+      freshContextAuthority: storeAuthority,
+      freshContextClaim: options.freshContextClaim
     }),
     ...(options.settings === undefined ? {} : { settings: { ...options.settings } }),
     settingSources: [...options.settingSources],

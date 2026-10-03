@@ -16,6 +16,7 @@ export {
   type ClaudeRemoteRuntimePort,
   type ClaudeTargetRuntime,
   type ClaudeSdkRuntime,
+  type ClaudeSdkFreshContextRuntime,
   type ClaudeSdkStoredSessionRuntime,
   type ClaudeSdkQuery,
   type ClaudeSdkQueryOptions,
@@ -44,6 +45,13 @@ export {
   type ClaudeCanUseToolOptions,
   type ClaudeSdkUserMessage
 } from "./sdk-runtime.js";
+export {
+  ClaudeFreshContextOwnerError,
+  type ClaudeFreshContextBindingLookup,
+  type ClaudeFreshContextIdentity,
+  type ClaudeFreshContextSnapshot,
+  type ClaudeFreshContextSource
+} from "./fresh-context-owner.js";
 export {
   ClaudeSessionStoreError,
   type ClaudeSessionStoreOperationAccess,

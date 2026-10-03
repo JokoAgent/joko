@@ -848,6 +848,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
         installed,
         this.#runtime.supportsWorkspaceDerivation === true,
         this.#runtime.freshContexts !== undefined && this.#runtime.prepareFreshContextRecovery !== undefined,
+        this.#remoteRuntimes?.supportsFreshContexts === true,
         supportsIsolatedReview(this.#lastCliVersion),
         supportsNativeTaskProjection(this.#lastCliVersion),
         supportsSteer(this.#lastCliVersion),
@@ -1339,12 +1340,13 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     if (info === undefined) {
       if (storedAccess !== undefined || !this.#supportsFreshContext(context.target)
         || context.binding === undefined || !isDeepStrictEqual(context.binding, binding)) throw continuityGap();
-      const lookup = this.#freshContextLookup(binding, context);
-      const snapshot = scoped.runtime.freshContexts!.getForBinding(lookup);
+      const lookup = this.#freshContextLookup(binding, context, scoped);
+      const snapshot = await scoped.runtime.freshContexts!.getForBinding(lookup);
       if (snapshot?.lifecycle !== "adopted" || snapshot.dispatch !== "never_dispatched") throw continuityGap();
       await scoped.runtime.prepareFreshContextRecovery!();
       context.signal.throwIfAborted();
-      scoped.runtime.freshContexts!.claim(lookup, { retirementConfirmed: true });
+      await scoped.runtime.freshContexts!.claim(lookup, { retirementConfirmed: true });
+      scoped.assertCurrent();
       const messages = await scoped.runtime.getSessionMessages(nativeSessionId, {
         dir: scoped.workspaceRoot, limit: 1, offset: 0, includeSystemMessages: true, signal: context.signal
       });
@@ -1407,7 +1409,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
       // binding. A missing result could be a changed profile, not deletion.
       if (info === undefined) {
         if (!this.#supportsFreshContext(context.target)) return "unknown";
-        const snapshot = scoped.runtime.freshContexts!.getForBinding(this.#freshContextLookup(binding, context));
+        const snapshot = await scoped.runtime.freshContexts!.getForBinding(this.#freshContextLookup(binding, context, scoped));
         if (snapshot?.dispatch !== "never_dispatched" || snapshot.lifecycle === "reserved") return "unknown";
         const messages = await scoped.runtime.getSessionMessages(route.nativeSessionId, {
           dir: scoped.workspaceRoot, limit: 1, offset: 0, includeSystemMessages: true, signal: context.signal
@@ -1442,10 +1444,10 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     );
     this.#assertCurrent(runtime, context, binding);
     if (info === undefined) {
-      if (!this.#isProvenEmptyContext(runtime, context)) throw continuityGap();
+      if (!await this.#isProvenEmptyContext(runtime, context)) throw continuityGap();
       const empty = await this.#readForkHistory(runtime, nativeSessionId, context.signal);
       this.#assertCurrent(runtime, context, binding);
-      if (empty.messages.length !== 0 || !this.#isProvenEmptyContext(runtime, context)) throw continuityGap();
+      if (empty.messages.length !== 0 || !await this.#isProvenEmptyContext(runtime, context)) throw continuityGap();
       return projectNativeHistory([], nativeSessionId, this.#projection);
     }
     if (runtime.storedSessionAccess === undefined) {
@@ -1566,7 +1568,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
       ? await this.#claimStoredSession(route, context.target, targetRuntime)
       : undefined;
     const freshLookup = storedAccess === undefined && this.#supportsFreshContext(context.target)
-      ? this.#freshContextLookup(binding, context) : undefined;
+      ? this.#freshContextLookup(binding, context, targetRuntime) : undefined;
     if (targetRuntime.runtime.ownsSessionFork(nativeSessionId)
       || [...this.#sessions.values()].some((runtime) => runtime.nativeSessionId === nativeSessionId && runtime.productSessionId !== context.sessionId)) {
       throw claudeCodeError("NATIVE_SESSION_DELETE_BUSY", "The native Session still has an active owner.", "session_delete", {
@@ -1609,7 +1611,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
         if (owner === undefined || freshLookup === undefined) throw continuityGap();
         await targetRuntime.runtime.prepareFreshContextRecovery!();
         context.signal.throwIfAborted();
-        const empty = owner.getForBinding(freshLookup);
+        const empty = await owner.getForBinding(freshLookup);
         if (empty?.dispatch !== "never_dispatched" || empty.lifecycle === "reserved") throw continuityGap();
         const messages = await targetRuntime.runtime.getSessionMessages(nativeSessionId, {
           dir: targetRuntime.workspaceRoot, limit: 1, offset: 0, includeSystemMessages: true, signal: context.signal
@@ -1618,7 +1620,8 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
         this.#assertBindingContext(binding, context);
         context.signal.throwIfAborted();
         if (!Array.isArray(messages) || messages.length !== 0) throw continuityGap();
-        owner.deleteEmptyBinding(freshLookup, { retirementConfirmed: true });
+        await owner.deleteEmptyBinding(freshLookup, { retirementConfirmed: true });
+        targetRuntime.assertCurrent();
         return;
       }
       if (storedAccess === undefined) {
@@ -1628,8 +1631,8 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
           signal: context.signal
         });
         if (freshLookup !== undefined
-          && targetRuntime.runtime.freshContexts!.getForBinding(freshLookup)?.dispatch === "never_dispatched") {
-          targetRuntime.runtime.freshContexts!.deleteEmptyBinding(freshLookup, { retirementConfirmed: true });
+          && (await targetRuntime.runtime.freshContexts!.getForBinding(freshLookup))?.dispatch === "never_dispatched") {
+          await targetRuntime.runtime.freshContexts!.deleteEmptyBinding(freshLookup, { retirementConfirmed: true });
         }
       } else {
         assertSessionInfoIdentity(info, nativeSessionId);
@@ -1804,10 +1807,14 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
           if (!this.#isTurnCurrent(runtime, turn) || turn.stopping || turn.terminalClaimed) {
             throw dispatchError("The native input authority ended before consumption.", false);
           }
-          if (runtime.freshContext !== undefined) {
+          if (runtime.freshContext !== undefined && !runtime.remote) {
             // Complete the synchronous durable fence before the SDK iterator
             // can receive this context's first prompt.
-            try { runtime.freshContext = runtime.sdkRuntime.freshContexts!.markDispatching(runtime.freshContext); }
+            try {
+              const mark = runtime.sdkRuntime.freshContexts?.markDispatching;
+              if (mark === undefined) throw new Error("The synchronous context fence is unavailable.");
+              runtime.freshContext = mark.call(runtime.sdkRuntime.freshContexts, runtime.freshContext);
+            }
             catch { throw dispatchError("The durable native input fence could not be recorded.", false); }
           }
         }),
@@ -2042,18 +2049,20 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     signal: AbortSignal
   ): Promise<void> {
     signal.throwIfAborted();
-    if (this.#isFreshContextLifecycle(lifecycle)) {
-      const owner = this.#runtime.freshContexts!;
-      const identity = this.#freshLifecycleIdentity(lifecycle);
+    const fresh = await this.#freshLifecycleRecord(lifecycle, signal);
+    if (fresh?.record !== undefined) {
+      const owner = fresh.scoped.runtime.freshContexts!;
+      const identity = this.#freshLifecycleIdentity(lifecycle, fresh.record, fresh.scoped);
       const source = this.#sessions.get(lifecycle.sourceSessionId);
       if (source?.binding.opaqueRef === lifecycle.sourceBinding.opaqueRef && !source.retirementConfirmed) {
         throw freshContextUnknown("The source Query has not confirmed retirement.");
       }
-      await this.#runtime.prepareFreshContextRecovery!();
+      await fresh.scoped.runtime.prepareFreshContextRecovery!();
       signal.throwIfAborted();
       await this.validateTarget(lifecycle.target);
-      owner.recover(identity, { retirementConfirmed: true });
-      owner.adopt(identity, { retirementConfirmed: true });
+      await owner.recover(identity, { retirementConfirmed: true });
+      await owner.adopt(identity, { retirementConfirmed: true });
+      fresh.scoped.assertCurrent();
       return;
     }
     if (!this.ownsNativeSessionDerivationLifecycle(lifecycle)) {
@@ -2113,16 +2122,18 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     signal: AbortSignal
   ): Promise<void> {
     signal.throwIfAborted();
-    if (this.#isFreshContextLifecycle(lifecycle)) {
-      const identity = this.#freshLifecycleIdentity(lifecycle);
+    const fresh = await this.#freshLifecycleRecord(lifecycle, signal);
+    if (fresh?.record !== undefined) {
+      const identity = this.#freshLifecycleIdentity(lifecycle, fresh.record, fresh.scoped);
       // This Owner never starts a reserved Query. Cleanup has no native side
       // effect and must preserve the source Query, including a failed close.
-      this.#runtime.freshContexts!.cleanup(identity, { retirementConfirmed: true });
+      await fresh.scoped.runtime.freshContexts!.cleanup(identity, { retirementConfirmed: true });
+      fresh.scoped.assertCurrent();
       return;
     }
     if (lifecycle.binding === undefined && this.#matchesFreshContextLifecycleAuthority(lifecycle)
       && (lifecycle.navigationTarget?.kind === "session_start" || parseBindingRoute(lifecycle.sourceBinding).kind === "filesystem")
-      && this.#runtime.freshContexts!.getForOperation(lifecycle.operationId) === undefined) {
+      && fresh !== undefined && fresh.record === undefined) {
       // The exact namespace is healthy and contains no reservation. The Host
       // prepared its receipt before our first read; there is no child effect
       // to retire or delete, including when source validation failed.
@@ -2205,7 +2216,8 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     this.#assertUsable();
     const runtime = this.#requireIdleRuntime(context);
     this.#assertStandardRuntime(runtime, "navigate to the native Session start");
-    if (runtime.remote || !this.#supportsFreshContext(context.target)) return this.unsupported("session.rewind_to_start");
+    if (!this.#supportsFreshContext(context.target) || runtime.sdkRuntime.freshContexts === undefined
+      || runtime.sdkRuntime.prepareFreshContextRecovery === undefined) return this.unsupported("session.rewind_to_start");
     if (context.operationId === undefined || context.binding === undefined) throw continuityGap();
     if (runtime.nativeTasks.hasActiveTasks() || [...runtime.managedChildren.values()].some((child) => !child.terminal)) {
       throw claudeCodeError("SESSION_BUSY", "Native history still has an active writer.", "session_navigation");
@@ -2220,9 +2232,9 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
       const info = await this.#sessionInfo(runtime.nativeSessionId, runtime.target, signal, targetRuntimeOf(runtime), runtime.storedSessionAccess);
       const history = await this.#readForkHistory(runtime, runtime.nativeSessionId, signal);
       if (info === undefined) {
-        if ((!runtime.freshSessionCanRestart && !this.#isProvenEmptyContext(runtime, context)) || history.messages.length !== 0) throw continuityGap();
+        if ((!runtime.freshSessionCanRestart && !await this.#isProvenEmptyContext(runtime, context)) || history.messages.length !== 0) throw continuityGap();
       } else if (runtime.storedSessionAccess === undefined) {
-        assertSessionInfo(info, runtime.nativeSessionId, runtime.runtimeWorkspaceRoot, false);
+        assertSessionInfo(info, runtime.nativeSessionId, runtime.runtimeWorkspaceRoot, runtime.remote);
       } else {
         assertSessionInfoIdentity(info, runtime.nativeSessionId);
       }
@@ -2237,12 +2249,22 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
         throw claudeCodeError("SESSION_BUSY", "Native history still has an active writer.", "session_navigation");
       }
       const binding = bindingFor(randomUUID(), context.generation + 1);
-      this.#runtime.freshContexts!.reserve({
+      await runtime.sdkRuntime.freshContexts!.reserve({
         operationId: context.operationId,
         sourceSessionId: context.sessionId,
         sourceBinding: runtime.binding,
-        ...this.#freshContextLookup(binding, context)
+        ...this.#freshContextLookup(binding, context, targetRuntimeOf(runtime))
       });
+      {
+        // The awaitable reservation can cross a transport boundary. The
+        // public source snapshot must still be exact before the Host receipt.
+        const afterReservation = await this.#readForkHistory(runtime, runtime.nativeSessionId, signal);
+        if (!isDeepStrictEqual(history.messages, afterReservation.messages)) throw invalidRewindBoundary();
+        if (info !== undefined) await this.#assertForkSourceUnchanged(runtime, context, info, signal);
+        else if (await this.#sessionInfo(runtime.nativeSessionId, runtime.target, signal, targetRuntimeOf(runtime), runtime.storedSessionAccess) !== undefined) throw invalidRewindBoundary();
+      }
+      signal.throwIfAborted();
+      this.#assertCurrent(runtime, context, context.binding);
       navigation.recordBinding(binding);
       registered = true;
       return { kind: "replacement", binding, nativeHistory: projectNativeHistory([], binding.nativeSessionId!, this.#projection) };
@@ -2255,11 +2277,17 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
   }
 
   #supportsFreshContext(target: TargetDescriptor): boolean {
-    return target.remoteWorkspace === undefined && target.backendId === this.id
-      && this.#runtime.freshContexts !== undefined && this.#runtime.prepareFreshContextRecovery !== undefined;
+    return target.backendId === this.id && (target.remoteWorkspace === undefined
+      ? this.#runtime.freshContexts !== undefined && this.#runtime.prepareFreshContextRecovery !== undefined
+      : this.#remoteRuntimes?.supportsFreshContexts === true);
   }
 
-  #freshContextLookup(binding: NativeSessionBinding, context: Pick<AdapterContext, "sessionId" | "target">): ClaudeFreshContextBindingLookup {
+  #freshContextLookup(binding: NativeSessionBinding, context: Pick<AdapterContext, "sessionId" | "target">, scoped?: ClaudeTargetRuntime): ClaudeFreshContextBindingLookup {
+    if (context.target.remoteWorkspace !== undefined) {
+      if (scoped?.remote !== true) throw continuityGap();
+      return { sessionId: context.sessionId, binding, targetId: context.target.id,
+        workspaceAuthority: claudeWorkspaceAuthority(context.target), workspaceRoot: scoped.workspaceRoot };
+    }
     const workspaceAuthority = `workspace-${createHash("sha256")
       .update(claudeWorkspaceAuthority(context.target)).update("\0")
       .update(String(context.target.managed)).update("\0").update(String(context.target.trusted)).update("\0")
@@ -2267,15 +2295,22 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     return { sessionId: context.sessionId, binding, targetId: context.target.id, workspaceAuthority, workspaceRoot: context.target.workspaceRoot };
   }
 
-  #isFreshContextLifecycle(lifecycle: NativeSessionDerivationLifecycle): boolean {
-    return lifecycle.kind === "navigate" && this.#supportsFreshContext(lifecycle.target)
-      && this.#runtime.freshContexts!.getForOperation(lifecycle.operationId) !== undefined;
+  async #freshLifecycleRecord(lifecycle: NativeSessionDerivationLifecycle, signal: AbortSignal): Promise<{
+    readonly scoped: ClaudeTargetRuntime; readonly record?: ClaudeFreshContextSnapshot
+  } | undefined> {
+    if (!this.#matchesFreshContextLifecycleAuthority(lifecycle)) return undefined;
+    const scoped = await this.#targetRuntime(lifecycle.target, signal);
+    if (scoped.runtime.freshContexts === undefined || scoped.runtime.prepareFreshContextRecovery === undefined) throw continuityGap();
+    const record = await scoped.runtime.freshContexts.getForOperation(lifecycle.operationId);
+    scoped.assertCurrent();
+    signal.throwIfAborted();
+    return { scoped, ...(record === undefined ? {} : { record }) };
   }
 
   #matchesFreshContextLifecycleAuthority(lifecycle: NativeSessionDerivationLifecycle): boolean {
     return lifecycle.kind === "navigate" && this.#supportsFreshContext(lifecycle.target)
       && lifecycle.sourceSessionId === lifecycle.sessionId
-      && lifecycle.sourceTarget.remoteWorkspace === undefined
+      && sameClaudeRemoteExecutionBinding(lifecycle.sourceTarget.remoteWorkspace, lifecycle.target.remoteWorkspace)
       && lifecycle.sourceTarget.id === lifecycle.target.id
       && lifecycle.sourceTarget.backendId === lifecycle.target.backendId
       && lifecycle.sourceTarget.managed === lifecycle.target.managed
@@ -2283,19 +2318,19 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
       && sameEffectiveTargetWorkspace(lifecycle.sourceTarget, lifecycle.target);
   }
 
-  #freshLifecycleIdentity(lifecycle: NativeSessionDerivationLifecycle): ClaudeFreshContextIdentity {
-    const record = this.#runtime.freshContexts!.getForOperation(lifecycle.operationId);
-    if (record === undefined || !this.#matchesFreshContextLifecycleAuthority(lifecycle)) throw continuityGap();
+  #freshLifecycleIdentity(lifecycle: NativeSessionDerivationLifecycle, record: ClaudeFreshContextSnapshot, scoped: ClaudeTargetRuntime): ClaudeFreshContextIdentity {
+    if (!this.#matchesFreshContextLifecycleAuthority(lifecycle)) throw continuityGap();
     return {
       operationId: lifecycle.operationId, sourceSessionId: lifecycle.sourceSessionId,
       sourceBinding: lifecycle.sourceBinding,
-      ...this.#freshContextLookup(lifecycle.binding ?? record.binding, { sessionId: lifecycle.sessionId, target: lifecycle.target })
+      ...this.#freshContextLookup(lifecycle.binding ?? record.binding, { sessionId: lifecycle.sessionId, target: lifecycle.target }, scoped)
     };
   }
 
-  #isProvenEmptyContext(runtime: NativeRuntime, context: AdapterContext): boolean {
+  async #isProvenEmptyContext(runtime: NativeRuntime, context: AdapterContext): Promise<boolean> {
     if (runtime.freshContext === undefined || !this.#supportsFreshContext(context.target)) return false;
-    const snapshot = this.#runtime.freshContexts!.getForBinding(this.#freshContextLookup(runtime.binding, context));
+    const snapshot = await runtime.sdkRuntime.freshContexts!.getForBinding(this.#freshContextLookup(runtime.binding, context, targetRuntimeOf(runtime)));
+    this.#assertCurrent(runtime, context, context.binding);
     return snapshot?.lifecycle === "adopted" && snapshot.dispatch === "never_dispatched"
       && snapshot.sourceRetired && snapshot.backendGeneration === this.#instanceGeneration;
   }
@@ -3134,8 +3169,8 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     if (storedSessionAccess !== undefined && !launch.resume) throw continuityGap();
     let freshContext: ClaudeFreshContextSnapshot | undefined;
     if (launch.runtimePolicy === "standard" && this.#supportsFreshContext(context.target)) {
-      const lookup = this.#freshContextLookup(binding, context);
-      const reserved = scoped.runtime.freshContexts!.getForBinding(lookup);
+      const lookup = this.#freshContextLookup(binding, context, scoped);
+      const reserved = await scoped.runtime.freshContexts!.getForBinding(lookup);
       if (reserved !== undefined) {
         if (context.binding === undefined || !isDeepStrictEqual(context.binding, binding)
           || reserved.lifecycle !== "adopted") throw continuityGap();
@@ -3144,7 +3179,8 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
         // exact native identity; generation alone never authorizes a fallback.
         await scoped.runtime.prepareFreshContextRecovery!();
         context.signal.throwIfAborted();
-        freshContext = scoped.runtime.freshContexts!.claim(lookup, { retirementConfirmed: true });
+        freshContext = await scoped.runtime.freshContexts!.claim(lookup, { retirementConfirmed: true });
+        scoped.assertCurrent();
       }
     }
     if (launch.resume) {
@@ -3163,7 +3199,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
         if (!Array.isArray(history) || history.length !== 0) throw continuityGap();
         const confirmed = await this.#sessionInfo(nativeSessionId, context.target, context.signal, scoped);
         if (confirmed === undefined) launch = { ...launch, resume: false };
-        else assertSessionInfo(confirmed, nativeSessionId, scoped.workspaceRoot, false);
+        else assertSessionInfo(confirmed, nativeSessionId, scoped.workspaceRoot, scoped.remote);
       } else if (storedSessionAccess === undefined) {
         assertSessionInfo(info, nativeSessionId, scoped.workspaceRoot, scoped.remote);
       } else {
@@ -3252,6 +3288,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
       launch,
       managedRoute,
       storedSessionAccess,
+      freshContext,
       (...args) => {
       if (runtime === undefined) {
         return Promise.resolve({ behavior: "deny", message: "The native Session is not ready." });
@@ -3420,6 +3457,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     },
     managedRoute: ManagedProviderRouteBinding | undefined,
     storedSessionAccess: ClaudeSessionStoreSessionAccess | undefined,
+    freshContext: ClaudeFreshContextSnapshot | undefined,
     canUseTool: (
       toolName: string,
       input: Readonly<Record<string, unknown>>,
@@ -3616,6 +3654,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
           permissionMode: toSdkPermissionMode(launch.permissionMode),
           persistSession: launch.runtimePolicy !== "review_read_only",
           ...(storedSessionAccess === undefined ? {} : { sessionStoreAccess: storedSessionAccess }),
+          ...(freshContext === undefined ? {} : { freshContextClaim: freshContext }),
           ...(launch.resume ? { resume: nativeSessionId } : { sessionId: nativeSessionId }),
           settingSources: launch.runtimePolicy === "review_read_only" ? [] : [...this.#settingSources],
           systemPrompt: {
@@ -5513,9 +5552,12 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
         // The AbortController and closed generation fence remain authoritative.
       }
     }
-    const sourceReservation = runtime.sdkRuntime.freshContexts?.hasPendingSource({
+    let sourceReservation = false;
+    let sourceFenceUnknown = false;
+    try { sourceReservation = await runtime.sdkRuntime.freshContexts?.hasPendingSource({
       sourceSessionId: runtime.productSessionId, sourceBinding: runtime.binding
-    }) === true;
+    }) === true; }
+    catch { sourceReservation = true; sourceFenceUnknown = true; }
     if (sourceReservation) runtime.requiresConfirmedRetirement = true;
     if (!runtime.processRetirementConfirmed
       && (runtime.remote || runtime.storedSessionAccess !== undefined || runtime.freshContext !== undefined || runtime.requiresConfirmedRetirement)) {
@@ -5547,8 +5589,9 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
             );
       }
     }
+    if (sourceFenceUnknown) throw freshContextUnknown("The source Query retired, but its durable context authority could not be read.");
     if (sourceReservation) {
-      try { runtime.sdkRuntime.freshContexts!.markSourceRetired({
+      try { await runtime.sdkRuntime.freshContexts!.markSourceRetired({
         sourceSessionId: runtime.productSessionId, sourceBinding: runtime.binding
       }); }
       catch { throw freshContextUnknown("The source Query retired, but its durable context fence could not be confirmed."); }
@@ -6655,6 +6698,7 @@ function capabilityManifest(
   installed: boolean,
   workspaceDerivationSupported: boolean,
   freshContextSupported: boolean,
+  remoteFreshContextSupported: boolean,
   isolatedReviewSupported: boolean,
   nativeTasksSupported: boolean,
   steerSupported: boolean,
@@ -6725,7 +6769,7 @@ function capabilityManifest(
   return new Map(CAPABILITIES.map((key): [string, Capability] => {
     const implemented = supported.has(key);
     const available = key === "session.catalog" || (installed && implemented);
-    const options = key === "session.rewind_to_start" && freshContextSupported
+    const options = key === "session.rewind_to_start" && freshContextSupported && !remoteFreshContextSupported
       ? [SESSION_REWIND_SERVICE_NODE_ONLY_OPTION]
       : key === "provider.login" && supportsLogin
       ? ["oauth_browser"]

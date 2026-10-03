@@ -20,11 +20,14 @@ describe("remote Claude manager bundle", () => {
       await mkdir(remoteManagerRoot);
       const managerTypescript = await readFile(join(packageSource, "remote-manager", "manager.mts"), "utf8");
       const storeTypescript = await readFile(join(packageSource, "claude-session-store.ts"), "utf8");
+      const freshContextTypescript = await readFile(join(packageSource, "fresh-context-owner.ts"), "utf8");
       await Promise.all([
         writeFile(join(remoteManagerRoot, "manager.mts"), managerTypescript),
         writeFile(join(root, "claude-session-store.ts"), storeTypescript),
+        writeFile(join(root, "fresh-context-owner.ts"), freshContextTypescript),
         writeFile(join(remoteManagerRoot, "manager.mjs"), transpile(managerTypescript, "manager.mts")),
-        writeFile(join(root, "claude-session-store.js"), transpile(storeTypescript, "claude-session-store.ts"))
+        writeFile(join(root, "claude-session-store.js"), transpile(storeTypescript, "claude-session-store.ts")),
+        writeFile(join(root, "fresh-context-owner.js"), transpile(freshContextTypescript, "fresh-context-owner.ts"))
       ]);
       const moduleUrl = pathToFileURL(join(root, "remote-manager-source.js"));
       const [source, repeatedSource, built, repeatedBuilt] = await Promise.all([
@@ -48,7 +51,7 @@ describe("remote Claude manager bundle", () => {
       expect(builtIdentity).toMatchObject({ managerVersion: "2.0.0", protocolVersion: 2 });
       expect(sourceIdentity.managerSha256).toBe(createHash("sha256").update(source).digest("hex"));
       expect(builtIdentity.managerSha256).toBe(createHash("sha256").update(built).digest("hex"));
-      await unlink(join(root, "claude-session-store.js"));
+      await unlink(join(root, "fresh-context-owner.js"));
       await expect(loadClaudeRemoteManagerSource("compiled", moduleUrl)).rejects.toBeDefined();
     } finally {
       await rm(root, { recursive: true, force: true });
@@ -107,7 +110,9 @@ async function exerciseEmbeddedStore(modulePath: string, storeRoot: string): Pro
     },
     destroy: () => undefined
   };
-  const state = manager.createManagerState({}, { sessionStoreRootDirectory: storeRoot });
+  const state = manager.createManagerState({}, {
+    sessionStoreRootDirectory: storeRoot, freshContextRootDirectory: `${storeRoot}-fresh`
+  });
   const connection = new manager.ManagerConnection(socket, state);
   await connection.handle({
     v: 2,
@@ -131,6 +136,37 @@ async function exerciseEmbeddedStore(modulePath: string, storeRoot: string): Pro
     ok: true,
     value: expect.objectContaining({ kind: "operation", operationId: "cccccccc-cccc-4ccc-8ccc-cccccccccccc" })
   })]);
+  const authority = { schemaVersion: 1, namespace: `backend-${"c".repeat(64)}`, generation: 1 };
+  const identity = {
+    operationId: "embedded-fresh-start", sourceSessionId: "session.embedded.source",
+    sourceBinding: { opaqueRef: "claude-code:session:dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+      nativeSessionId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd", generation: 1 },
+    sessionId: "session.embedded.child", binding: {
+      opaqueRef: "claude-code:session:eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+      nativeSessionId: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee", generation: 2
+    }, targetId: "target.embedded", workspaceAuthority: "workspace.embedded", workspaceRoot: storeRoot
+  };
+  await connection.handle({ v: 2, kind: "request", id: "fresh-reserve", method: "fresh.reserve", params: { authority, identity } });
+  expect(frames.at(-1)).toMatchObject({ ok: true, value: { lifecycle: "reserved", dispatch: "never_dispatched" } });
+  await connection.handle({ v: 2, kind: "request", id: "fresh-adopt", method: "fresh.adopt", params: {
+    authority, identity, proof: { retirementConfirmed: true }
+  } });
+  expect(frames.at(-1)).toMatchObject({ ok: true, value: { lifecycle: "adopted", sourceRetired: true } });
+  const restartedState = manager.createManagerState({}, {
+    sessionStoreRootDirectory: storeRoot, freshContextRootDirectory: `${storeRoot}-fresh`
+  });
+  const restarted = new manager.ManagerConnection(socket, restartedState);
+  const nextBinding = { ...identity, binding: { ...identity.binding, generation: 3 } };
+  await restarted.handle({ v: 2, kind: "request", id: "fresh-reclaim", method: "fresh.claim", params: {
+    authority: { ...authority, generation: 2 }, input: nextBinding, proof: { retirementConfirmed: true }
+  } });
+  expect(frames.at(-1)).toMatchObject({ ok: true, value: {
+    lifecycle: "adopted", backendGeneration: 2, binding: { generation: 3 }, dispatch: "never_dispatched"
+  } });
+  await restarted.handle({ v: 2, kind: "request", id: "fresh-delete", method: "fresh.deleteEmptyBinding", params: {
+    authority: { ...authority, generation: 2 }, input: nextBinding, proof: { retirementConfirmed: true }
+  } });
+  expect(frames.at(-1)).toMatchObject({ ok: true, value: { lifecycle: "cleaned", dispatch: "never_dispatched" } });
 }
 
 function randomSuffix(): string {
