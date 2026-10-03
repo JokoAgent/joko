@@ -11,7 +11,7 @@ import Constants from "expo-constants";
 import { randomUUID } from "expo-crypto";
 import * as Clipboard from "expo-clipboard";
 import {
-  CapabilitySupport, ConnectionState, DeviceKind, DevicePresenceState, FileKind, QueueItemState, TargetState, capabilityNames,
+  CapabilitySupport, ConnectionState, DeviceKind, DevicePresenceState, FileKind, QueueItemState, SessionState, TargetState, capabilityNames,
   type QueueItem, type Session
 } from "@joko/contracts";
 import { MobileConnectionStage } from "./MobileConnectionStage";
@@ -142,6 +142,16 @@ import {
 } from "./composer-layout";
 import { MobileKeyboardAvoidingView, useMobileKeyboardState } from "./MobileKeyboardAvoidingView";
 import { timelineRows, type TimelineRow } from "./timeline";
+import {
+  appendMobileOptimisticUserRow,
+  markMobileOptimisticUserRowSubmitted,
+  mobileOptimisticActiveOperationIds,
+  mobileQueueBlocksOptimisticUserRow,
+  projectMobileOptimisticUserRows,
+  reconcileMobileOptimisticUserRows,
+  retireMobileOptimisticUserRow,
+  type MobileOptimisticUserRow
+} from "./mobile-optimistic-user-row";
 import type { MobileTimelineArtifact } from "./mobile-timeline-artifacts";
 import { MobileDrawer } from "./MobileDrawer";
 import { MobileActionSheet } from "./MobileActionSheet";
@@ -3201,6 +3211,7 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
   const [draftReady, setDraftReady] = useState(() => initialDraftIdentity === undefined
     || mobileComposerDrafts.readSync(initialDraftIdentity) !== null);
   const [localError, setLocalError] = useState("");
+  const [optimisticUserRows, setOptimisticUserRows] = useState<readonly MobileOptimisticUserRow[]>([]);
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [drawerMounted, setDrawerMounted] = useState(false);
   const [messageAction, setMessageAction] = useState<{ readonly sessionId: string; readonly row: TimelineRow }>();
@@ -3292,6 +3303,7 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
   useEffect(() => {
     copyGenerationRef.current += 1;
     setComposerNotice("");
+    setOptimisticUserRows([]);
   }, [draftIdentityKey]);
   const imageGallery = useMobileImageGallery(locale, (nextDraft) => {
     const identity = draftIdentityRef.current;
@@ -3362,7 +3374,51 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
   const pendingDrawerActionRef = useRef<(() => void) | undefined>(undefined);
   const session = state.detail?.sessions.find((item) => item.sessionId === state.selectedId)
     || state.owner?.sessions.find((item) => item.sessionId === state.selectedId);
-  const rows = timelineRows(state.window ?? [...state.older, ...(state.detail?.timeline ?? []), ...state.live]);
+  const latestObservedRows = useMemo(() => timelineRows([
+    ...(state.window === undefined ? state.older : []),
+    ...(state.detail?.timeline ?? []),
+    ...state.live
+  ]), [state.detail?.timeline, state.live, state.older, state.window]);
+  const observedRows = useMemo(() => state.window === undefined
+    ? latestObservedRows
+    : timelineRows(state.window), [latestObservedRows, state.window]);
+  const optimisticOwnerKey = state.status === "connected" ? client.taskPresentationOwnerKey() : undefined;
+  const ownerOptimisticRows = useMemo(() => state.status === "connecting"
+    ? optimisticUserRows
+    : optimisticOwnerKey === undefined
+      ? []
+      : optimisticUserRows.filter((entry) => entry.ownerKey === optimisticOwnerKey),
+  [optimisticOwnerKey, optimisticUserRows, state.status]);
+  const rows = useMemo(() => state.window !== undefined
+    ? observedRows
+    : optimisticOwnerKey === undefined && state.status !== "connecting"
+      ? observedRows
+    : projectMobileOptimisticUserRows(
+        observedRows,
+        ownerOptimisticRows,
+        optimisticOwnerKey ?? ownerOptimisticRows[0]?.ownerKey ?? "",
+        state.selectedId ?? ""
+      ), [observedRows, optimisticOwnerKey, ownerOptimisticRows, state.selectedId, state.status, state.window]);
+  const activeOptimisticOperationIds = useMemo(() => new Set([
+    ...state.pending.filter((item) => item.kind === "send" && item.sessionId === state.selectedId
+      && item.state === "accepted").map((item) => item.operationId),
+    ...mobileOptimisticActiveOperationIds(state.detail?.queueItems ?? [], state.selectedId)
+  ]), [state.detail?.queueItems, state.pending, state.selectedId]);
+  useEffect(() => {
+    if (state.status === "connecting") return;
+    if (!state.selectedId || !optimisticOwnerKey) {
+      setOptimisticUserRows((current) => current.length === 0 ? current : []);
+      return;
+    }
+    setOptimisticUserRows((current) => reconcileMobileOptimisticUserRows(
+      current,
+      latestObservedRows,
+      optimisticOwnerKey,
+      state.selectedId!,
+      activeOptimisticOperationIds
+    ));
+  }, [activeOptimisticOperationIds, latestObservedRows, optimisticOwnerKey, optimisticUserRows,
+    state.selectedId, state.status]);
   const activeMessageFocus = messageFocus?.sessionId === state.selectedId ? messageFocus : undefined;
   const messageFocusIndex = activeMessageFocus === undefined
     ? -1
@@ -5019,6 +5075,17 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
     setLocalError("");
     const active = queueEditRef.current;
     let appCommandStarted = false;
+    let optimisticLease: { readonly sessionId: string; readonly operationId: string } | undefined;
+    const retireOptimisticLease = (): void => {
+      const lease = optimisticLease;
+      if (!lease) return;
+      optimisticLease = undefined;
+      setOptimisticUserRows((current) => retireMobileOptimisticUserRow(
+        current,
+        lease.sessionId,
+        lease.operationId
+      ));
+    };
     try {
       if (!active) {
         const identity = draftIdentityRef.current;
@@ -5068,7 +5135,40 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
           }
           return;
         }
-        if (!await client.send(composerDraftRef.current)) {
+        const operationId = randomUUID();
+        const accepted = await client.send(sourceDraft, {
+          operationId,
+          onDispatch: (dispatchDraft) => {
+            const current = client.state;
+            if (!taskMountedRef.current || !identity || current.status !== "connected"
+              || current.activeProfileId !== identity.profileId || current.selectedId !== identity.sessionId
+              || current.window !== undefined
+              || current.pending.some((item) => item.kind === "send" && item.sessionId === identity.sessionId)) return;
+            const currentSession = current.detail?.sessions.find((item) => item.sessionId === identity.sessionId)
+              || current.owner?.sessions.find((item) => item.sessionId === identity.sessionId);
+            const ownerKey = client.taskPresentationOwnerKey();
+            if (!ownerKey) return;
+            const currentObservedRows = timelineRows(
+              current.window ?? [...current.older, ...(current.detail?.timeline ?? []), ...current.live]
+            );
+            const busy = currentSession?.state !== SessionState.IDLE
+              || mobileQueueBlocksOptimisticUserRow(current.detail?.queueItems ?? [], identity.sessionId)
+              || client.taskInteractions().length > 0
+              || currentObservedRows.some((row) => row.kind === "assistant" && !row.completed);
+            if (busy) return;
+            optimisticLease = { sessionId: identity.sessionId, operationId };
+            setOptimisticUserRows((currentRows) => appendMobileOptimisticUserRow(
+              currentRows,
+              currentObservedRows,
+              ownerKey,
+              identity.sessionId,
+              operationId,
+              dispatchDraft
+            ));
+          }
+        });
+        if (!accepted) {
+          retireOptimisticLease();
           if (identity && draftIdentityRef.current
             && mobileComposerDraftIdentityKey(draftIdentityRef.current) === mobileComposerDraftIdentityKey(identity)) {
             const retainedDraft = mobileComposerDrafts.readSync(identity);
@@ -5076,6 +5176,15 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
           }
           return;
         }
+        if (optimisticLease) {
+          const lease = optimisticLease;
+          setOptimisticUserRows((current) => markMobileOptimisticUserRowSubmitted(
+            current,
+            lease.sessionId,
+            lease.operationId
+          ));
+        }
+        optimisticLease = undefined;
         if (!identity) {
           setDraft(emptyMobileComposerDraft());
           setComposerSelection({ start: 0, end: 0 });
@@ -5096,6 +5205,7 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
       setDraft(active.stashedDraft);
       setComposerSelection({ start: active.stashedDraft.text.length, end: active.stashedDraft.text.length });
     } catch (error) {
+      retireOptimisticLease();
       if (taskMountedRef.current) {
         const identity = draftIdentityRef.current;
         if (identity && !queueEditRef.current) {
@@ -5187,7 +5297,7 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
       ListEmptyComponent={<Centered label={mobileMessage(locale, state.status === "offline"
         ? state.detail ? "task.offlineEmpty" : "task.offlineMissing" : "task.empty")} colors={colors} />}
       renderItem={({ item }) => {
-        const linked = messageFocusHighlight === messageFocusKey && messageFocus !== undefined
+        const linked = item.optimistic !== true && messageFocusHighlight === messageFocusKey && messageFocus !== undefined
           && mobileNativeIntentMessageMatches(messageFocus, item);
         return <View accessibilityLiveRegion={linked ? "polite" : undefined}
           style={[styles.message, linked && styles.messageFocused,
@@ -5196,8 +5306,12 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
         {linked && <Text style={[styles.caption, { color: colors.accent }]}>
           {mobileMessage(locale, "intent.linkedMessage", { label: item.label })}
         </Text>}
-        <Text style={[styles.caption, { color: colors.muted }]}>{item.label}</Text>
-        <Text selectable style={[styles.body, { color: colors.ink }]}>{item.text}</Text>
+        <View style={styles.statusTitle}>
+          <Text style={[styles.caption, { color: colors.muted }]}>{item.label}{item.optimistic
+            ? ` · ${mobileMessage(locale, "common.sending")}` : ""}</Text>
+          {item.optimistic && <ActivityIndicator size="small" color={colors.accent} />}
+        </View>
+        <Text selectable={!item.optimistic} style={[styles.body, { color: colors.ink }]}>{item.text}</Text>
         {item.partnerPrivatePreview && <Pressable accessibilityRole="button"
           accessibilityLabel={`${mobileMessage(locale, "partner.openThread")} · ${item.partnerPrivatePreview.targetName}`}
           accessibilityHint={mobileMessage(locale, "partner.readOnly")}
@@ -5271,7 +5385,7 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
             </View>;
           })}
         </View>}
-        <View style={styles.messageActions}>
+        {!item.optimistic && <View style={styles.messageActions}>
           <Pressable accessibilityRole="button" accessibilityLabel={mobileMessage(locale, "task.viewContextFor", { name: item.label })}
             disabled={state.historyBusy || state.status !== "connected"}
             onPress={() => { setLocalError(""); void client.around(item.eventId).catch((error) => setLocalError(errorText(error))); }}
@@ -5289,7 +5403,7 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
               <Text style={[styles.caption, { color: (state.status !== "connected" && state.status !== "offline")
                 || (state.status === "connected" && voice.busy) ? colors.muted : colors.accent }]}>{mobileMessage(locale, "common.more")}</Text>
             </Pressable>}
-        </View>
+        </View>}
       </View>;
       }} />
     {queueItems.length > 0 && <View style={styles.queueRegion}>

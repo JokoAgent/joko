@@ -3392,6 +3392,43 @@ describe("native mobile connection and operation ownership", () => {
     expect(network.submit).toHaveBeenCalledOnce();
   });
 
+  it("exposes the exact send identity to presentation immediately before durable submit", async () => {
+    const network = fakeNetwork();
+    const saved = memoryStorage(credential);
+    const app = client(network, saved.storage);
+    await app.start();
+    const draft = plainTextMobileComposerDraft("one visible message");
+    const ownerKey = app.taskPresentationOwnerKey();
+    expect(ownerKey).toBeTruthy();
+    const order: string[] = [];
+    vi.mocked(network.submit).mockImplementationOnce(async (_credential, operationId, mutation) => {
+      order.push("submit");
+      expect(operationId).toBe("visible-operation");
+      expect(saved.pending()).toMatchObject([{ operationId: "visible-operation", kind: "send", state: "unknown" }]);
+      return create(OperationSchema, {
+        operationId,
+        connectionId: credential.connectionId,
+        state: OperationState.SUCCEEDED,
+        mutation
+      });
+    });
+
+    await expect(app.send(draft, {
+      operationId: "visible-operation",
+      onDispatch: (dispatched) => {
+        order.push("presentation");
+        expect(app.taskPresentationOwnerKey()).toBe(ownerKey);
+        expect(dispatched).toEqual(draft);
+        expect(saved.pending()).toEqual([]);
+        expect(network.submit).not.toHaveBeenCalled();
+      }
+    })).resolves.toBe(true);
+
+    expect(order).toEqual(["presentation", "submit"]);
+    expect(app.taskPresentationOwnerKey()).toBe(ownerKey);
+    expect(saved.pending()).toEqual([]);
+  });
+
   it("retains an unsent operation warning when the app backgrounds during receipt persistence", async () => {
     const network = fakeNetwork();
     const saved = memoryStorage(credential);
