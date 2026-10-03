@@ -56,6 +56,7 @@ export const MAX_DEDICATED_HARDWARE_COMPOSER_TEXT_UTF8_BYTES = 8_000;
 
 export type DedicatedHardwareAction =
   | { readonly kind: "command"; readonly command: DedicatedHardwareCommandId }
+  | { readonly kind: "composer-key"; readonly key: "ArrowUp" | "ArrowDown" | "Enter" }
   | {
     readonly kind: "task";
     readonly profileId: string;
@@ -105,6 +106,11 @@ export function isDedicatedHardwareCommandId(value: unknown): value is Dedicated
 export function parseDedicatedHardwareAction(value: unknown): DedicatedHardwareAction {
   if (!isRecord(value) || typeof value.kind !== "string") throw invalidAction();
   switch (value.kind) {
+    case "composer-key": {
+      if (!hasExactKeys(value, ["kind", "key"])
+        || value.key !== "ArrowUp" && value.key !== "ArrowDown" && value.key !== "Enter") throw invalidAction();
+      return Object.freeze({ kind: "composer-key", key: value.key });
+    }
     case "command": {
       if (!hasExactKeys(value, ["kind", "command"])
         || !isDedicatedHardwareCommandId(value.command)) throw invalidAction();

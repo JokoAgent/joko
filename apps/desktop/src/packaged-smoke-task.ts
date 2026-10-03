@@ -3,6 +3,7 @@ import { createConnectTransport } from "@connectrpc/connect-node";
 import { randomUUID } from "node:crypto";
 import {
   AuthenticationState,
+  AttemptState,
   BackendHealth,
   CapabilitySupport,
   ConnectionService,
@@ -17,6 +18,10 @@ import {
   ProviderApiCompatibility,
   ProviderConfigurationField,
   ProviderKind,
+  QueueDeliveryMode,
+  QueueSourceKind,
+  RunService,
+  RunState,
   TargetService,
   TargetState,
   type BackendDescriptor,
@@ -27,11 +32,13 @@ import {
 
 import type { DesktopManagedOrchestratorConnection } from "./channels.js";
 
-const PACKAGED_SMOKE_TASK_TIMEOUT_MS = 35_000;
+const PACKAGED_SMOKE_TASK_TIMEOUT_MS = 60_000;
 const PACKAGED_SMOKE_PROVIDER_ID = "packaged-smoke-local";
 const PACKAGED_SMOKE_MODEL_ID = "packaged-smoke-model";
 const MANAGED_RUNTIME_CAPABILITY = "provider.managed_catalog";
 const SESSION_RUNTIME_CAPABILITY = "session.resume";
+
+export const PACKAGED_SMOKE_TIMELINE_PROMPT = "Return the exact packaged Timeline clipboard fixture.";
 
 export interface PackagedSmokeTask {
   readonly sessionId: string;
@@ -159,6 +166,85 @@ export async function verifyPackagedSmokeTask(
 ): Promise<void> {
   await withPackagedSmokeAuthority(options, async (transport, signal) => {
     assertTaskInSnapshot(await ownerSnapshot(createClient(EventService, transport), signal), task);
+  });
+}
+
+/**
+ * Admits one real turn through the generated service contract and waits for its
+ * durable Run terminal. The renderer still owns presentation and clipboard
+ * actions; this helper only supplies the accepted product state they consume.
+ */
+export async function runPackagedSmokeTimelineTurn(
+  options: PackagedSmokeTaskOptions,
+  task: PackagedSmokeTask
+): Promise<string> {
+  return withPackagedSmokeAuthority(options, async (transport, signal) => {
+    assertTaskInSnapshot(await ownerSnapshot(createClient(EventService, transport), signal), task);
+    const operationId = options.operationId?.() ?? randomUUID();
+    const operation = (await createClient(OperationService, transport).submitOperation({
+      operationId,
+      connectionId: options.connection.profileId,
+      mutation: {
+        preconditions: [{
+          entity: { kind: EntityKind.SESSION, id: task.sessionId },
+          expectedGeneration: task.generation
+        }],
+        payload: {
+          case: "sendInput",
+          value: {
+            sessionId: task.sessionId,
+            deliveryMode: QueueDeliveryMode.PROMPT,
+            input: {
+              parts: [{ content: { case: "text", value: PACKAGED_SMOKE_TIMELINE_PROMPT } }]
+            }
+          }
+        }
+      }
+    }, { signal })).operation;
+    const result = operation?.result?.payload;
+    if (operation?.operationId !== operationId || operation.connectionId !== options.connection.profileId
+      || operation.state !== OperationState.SUCCEEDED || result?.case !== "queueItem") {
+      throw operationFailure("Packaged smoke Timeline input", operation, "queueItem");
+    }
+    const queueItem = result.value;
+    if (queueItem.queueItemId === "" || queueItem.runId === ""
+      || queueItem.sessionId !== task.sessionId || queueItem.backendId !== task.backendId
+      || queueItem.targetId !== task.targetId || queueItem.sourceKind !== QueueSourceKind.UI
+      || queueItem.sourceId !== operationId || queueItem.deliveryMode !== QueueDeliveryMode.PROMPT
+      || queueItem.input?.parts.length !== 1
+      || queueItem.input.parts[0]?.content.case !== "text"
+      || queueItem.input.parts[0].content.value !== PACKAGED_SMOKE_TIMELINE_PROMPT) {
+      throw new Error("Packaged smoke Timeline input returned an inconsistent durable Queue item.");
+    }
+
+    const runClient = createClient(RunService, transport);
+    do {
+      const run = (await runClient.getRun({ runId: queueItem.runId }, { signal })).run;
+      if (run !== undefined) {
+        if (run.runId !== queueItem.runId || run.sessionId !== task.sessionId
+          || run.backendId !== task.backendId || run.targetId !== task.targetId
+          || run.sourceQueueItemId !== queueItem.queueItemId) {
+          throw new Error("Packaged smoke Timeline Run changed its durable owner.");
+        }
+        if (run.state === RunState.SUCCEEDED) {
+          const successfulAttempts = run.attempts.filter((attempt) => attempt.state === AttemptState.SUCCEEDED);
+          if (successfulAttempts.length !== 1 || successfulAttempts[0]?.runId !== run.runId
+            || successfulAttempts[0].generation !== task.generation) {
+            throw new Error("Packaged smoke Timeline Run did not retain its successful generation owner.");
+          }
+          return run.runId;
+        }
+        if (run.state === RunState.ABORTED || run.state === RunState.FAILED || run.state === RunState.CANCELLED) {
+          throw new Error(
+            `Packaged smoke Timeline Run did not succeed (state=${run.state}, `
+            + `code=${safeOperationDetail(run.error?.code)}, phase=${safeOperationDetail(run.error?.phase)}, `
+            + `message=${safeOperationDetail(run.error?.message)}).`
+          );
+        }
+      }
+      signal.throwIfAborted();
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, 100));
+    } while (true);
   });
 }
 
@@ -318,13 +404,10 @@ function selectPackagedSmokeProviderProtocol(backend: BackendDescriptor): Provid
   if (support === undefined || !support.fields.includes(ProviderConfigurationField.KEYLESS)) {
     throw new Error("Packaged smoke selected a Task runtime without local keyless Provider support.");
   }
-  for (const protocol of [
-    ProviderApiCompatibility.OPENAI_COMPLETIONS,
-    ProviderApiCompatibility.OPENAI_RESPONSES
-  ]) {
-    if (support.protocols.includes(protocol)) return protocol;
+  if (support.protocols.includes(ProviderApiCompatibility.OPENAI_COMPLETIONS)) {
+    return ProviderApiCompatibility.OPENAI_COMPLETIONS;
   }
-  throw new Error("Packaged smoke selected a Task runtime without a supported local Provider protocol.");
+  throw new Error("Packaged smoke selected a Task runtime without local OpenAI Completions support.");
 }
 
 function packagedSmokeProviderEndpoint(raw: string | undefined): string {

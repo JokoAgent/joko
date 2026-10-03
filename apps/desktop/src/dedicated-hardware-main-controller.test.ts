@@ -53,6 +53,7 @@ function harness(initialError?: "invalid" | "unavailable") {
     DEDICATED_HARDWARE_MODEL_IDS.map((model) => [model, connection(model)] as const)
   );
   const desired: Array<{ model: DedicatedHardwareModelId; settings: DedicatedHardwareSettings; preview: boolean }> = [];
+  const lighting = vi.fn<DedicatedHardwareHostClient["setLightingState"]>();
   const store: DedicatedHardwareSettingsStore = {
     initialize: async () => Object.fromEntries(values) as Readonly<Record<DedicatedHardwareModelId, DedicatedHardwareSettingsRead>>,
     get: (model) => values.get(model)!,
@@ -74,6 +75,7 @@ function harness(initialError?: "invalid" | "unavailable") {
   const host: DedicatedHardwareHostClient = {
     getConnectionState: (model) => states.get(model)!,
     setDesiredState: (model, next) => desired.push({ model, settings: next.settings, preview: next.preview }),
+    setLightingState: lighting,
     probe: vi.fn(() => true),
     inspectCreatorKeymapRecovery: vi.fn(async () => states.get("creator-micro-2")!),
     recoverCreatorKeymap: vi.fn(async () => states.get("creator-micro-2")!),
@@ -94,6 +96,7 @@ function harness(initialError?: "invalid" | "unavailable") {
     host,
     input,
     desired,
+    lighting,
     setConnection(model: DedicatedHardwareModelId, status: DedicatedHardwareConnectionSnapshot["status"]) {
       const next = connection(model, status);
       states.set(model, next);
@@ -134,6 +137,7 @@ describe("dedicated hardware main controller", () => {
     const owner = harness();
     const controller = createDedicatedHardwareMainController({ store: owner.store, host: owner.host, input: owner.input });
     await controller.initialize();
+    controller.setPrimaryWindowVisible("window-a", true);
     const state = controller.publishTasks({
       version: 1,
       profileId: "profile-a",
@@ -141,10 +145,10 @@ describe("dedicated hardware main controller", () => {
       connectionGeneration: "4",
       snapshotRevision: "9",
       tasks: [
-        { sessionId: "older", sessionGeneration: "1", targetId: "target-1", title: "Older", pinned: false, userSendAt: 10, sidebarOrder: 0, catalogEligible: true, priorityRank: 1 },
-        { sessionId: "newer", sessionGeneration: "2", targetId: "target-2", title: "Newer", pinned: true, userSendAt: 20, sidebarOrder: 1, catalogEligible: true, priorityRank: 0 }
+        { sessionId: "older", sessionGeneration: "1", targetId: "target-1", title: "Older", pinned: false, userSendAt: 10, sidebarOrder: 0, catalogEligible: true, priorityRank: 1, activity: { phase: "completed", attention: true } },
+        { sessionId: "newer", sessionGeneration: "2", targetId: "target-2", title: "Newer", pinned: true, userSendAt: 20, sidebarOrder: 1, catalogEligible: true, priorityRank: 0, activity: { phase: "running", attention: false } }
       ]
-    });
+    }, "window-a");
     expect(state.models["codex-micro"].taskSlots).toHaveLength(6);
     expect(state.models["codex-micro"].taskSlots.slice(0, 3)).toEqual([
       { slot: 0, sessionId: "newer", title: "Newer" },
@@ -158,12 +162,52 @@ describe("dedicated hardware main controller", () => {
       connectionGeneration: "4",
       snapshotRevision: "8",
       tasks: []
-    });
+    }, "window-a");
     expect(stale.models["codex-micro"].taskSlots[0]).toEqual({
       slot: 0,
       sessionId: "newer",
       title: "Newer"
     });
+  });
+
+  it("keeps background activity while hidden and retires exact document lighting and reveals", async () => {
+    const owner = harness();
+    const controller = createDedicatedHardwareMainController({ store: owner.store, host: owner.host, input: owner.input });
+    await controller.initialize();
+    const catalog = {
+      version: 1, profileId: "profile", serverId: "server", connectionGeneration: "4", snapshotRevision: "9",
+      tasks: [{ sessionId: "task", sessionGeneration: "3", targetId: "target", title: "Task", pinned: false,
+        userSendAt: 1, sidebarOrder: 0, catalogEligible: true, priorityRank: 1, activity: { phase: "running", attention: false } }]
+    };
+    controller.setPrimaryWindowVisible("document-a", true);
+    controller.publishTasks(catalog, "document-a");
+    expect(owner.lighting).toHaveBeenLastCalledWith("creator-micro-2", {
+      version: 1, primaryVisible: true, revealOccurrence: "0",
+      taskSlots: [{ phase: "running", attention: false }, null, null, null, null, null]
+    });
+    controller.setPrimaryWindowVisible("document-a", false);
+    controller.publishTasks({ ...catalog, snapshotRevision: "10", tasks: [{ ...catalog.tasks[0],
+      activity: { phase: "needs-interaction", attention: true } }] }, "document-a");
+    controller.playWindowReveal("document-a");
+    expect(owner.lighting).toHaveBeenLastCalledWith("creator-micro-2", {
+      version: 1, primaryVisible: false, revealOccurrence: "0",
+      taskSlots: [{ phase: "needs-interaction", attention: true }, null, null, null, null, null]
+    });
+    controller.setPrimaryWindowVisible("document-a", true);
+    controller.playWindowReveal("document-a");
+    expect(owner.lighting).toHaveBeenLastCalledWith("creator-micro-2", expect.objectContaining({ revealOccurrence: "1" }));
+    controller.retireOwner("document-a");
+    const retired = { version: 1, primaryVisible: false, revealOccurrence: "1", taskSlots: [null, null, null, null, null, null] };
+    expect(owner.lighting).toHaveBeenLastCalledWith("creator-micro-2", retired);
+    controller.setPrimaryWindowVisible("document-a", true);
+    controller.publishTasks({ ...catalog, snapshotRevision: "11" }, "document-a");
+    controller.playWindowReveal("document-a");
+    expect(owner.lighting).toHaveBeenLastCalledWith("creator-micro-2", retired);
+    controller.setPrimaryWindowVisible("document-b", true);
+    controller.publishTasks(catalog, "document-b");
+    expect(owner.lighting).toHaveBeenLastCalledWith("creator-micro-2", expect.objectContaining({
+      primaryVisible: true, taskSlots: [{ phase: "running", attention: false }, null, null, null, null, null]
+    }));
   });
 
   it("keeps preview exclusive, emits raw preview only, and cancels it on disconnect", async () => {

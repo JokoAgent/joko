@@ -6,7 +6,7 @@ import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
 import type { AppController, ControllerState } from "../controller.js";
 import { DEFAULT_UI_PREFERENCES } from "../local-state.js";
-import { emptySnapshot, type BackendView, type SessionView, type TimelineItemView } from "../model.js";
+import { emptySnapshot, type BackendView, type SessionView, type TargetView, type TimelineItemView } from "../model.js";
 import { SessionPane } from "./SessionPane.js";
 import type { Translator } from "./types.js";
 
@@ -24,11 +24,15 @@ vi.mock("./Timeline.js", async () => {
       readonly items: readonly TimelineItemView[];
       readonly onMoveEditedMessageToComposer?: (item: TimelineItemView, text: string) => Promise<void>;
       readonly onPreviewMessageRewind?: (item: TimelineItemView) => void;
+      readonly editableMessageId?: string;
+      readonly rewindToStartSupported?: boolean;
       readonly t: Translator;
     }) => {
       const item = props.items.at(-1);
       if (item === undefined || props.onMoveEditedMessageToComposer === undefined) return null;
       return React.createElement(React.Fragment, null,
+      React.createElement("output", { "data-testid": "start-rewind-supported" }, String(props.rewindToStartSupported)),
+      React.createElement("output", { "data-testid": "editable-message" }, props.editableMessageId ?? ""),
       React.createElement("button", { type: "button", onClick: () => props.onPreviewMessageRewind?.(item) }, "Preview rewind"),
       React.createElement(UserMessageEditBox, {
         initialText: item.text ?? "",
@@ -53,6 +57,53 @@ afterEach(async () => {
 });
 
 describe("SessionPane edited-message draft transaction", () => {
+  it.each([false, true])("renders first-turn edit and rewind from the current Target scope: remote=%s", (remote) => {
+    const sourceSession = session();
+    const sourceBackend = startBackend();
+    const sourceMessage = startMessage();
+    const controller = controllerFor(sourceSession, sourceBackend, sourceMessage, { readDraft: vi.fn(async () => durableDraft()), saveDraft: vi.fn(async () => undefined), navigateSessionBranch: vi.fn(async () => undefined) });
+    if (remote) Reflect.set(controller.state.snapshot.targets[0]!, "remoteWorkspace", remoteWorkspace());
+    const container = mountPane(controller, sourceSession, sourceBackend, sourceMessage);
+    expect(container.querySelector('[data-testid="start-rewind-supported"]')?.textContent).toBe(String(!remote));
+    expect(container.querySelector('[data-testid="editable-message"]')?.textContent).toBe(remote ? "" : sourceMessage.id);
+  });
+
+  it.each(["preview", "draft read", "draft write"] as const)("rejects a first-turn Target becoming remote during %s without replacing the composer", async (boundary) => {
+    const sourceSession = session();
+    const sourceBackend = startBackend();
+    const sourceMessage = startMessage();
+    let finishRead!: (value: ReturnType<typeof durableDraft>) => void;
+    const readDraft = vi.fn(() => boundary === "draft read"
+      ? new Promise<ReturnType<typeof durableDraft>>((resolve) => { finishRead = resolve; })
+      : Promise.resolve(durableDraft()));
+    const saveDraft = vi.fn(async () => {
+      if (boundary === "draft write") Reflect.set(controller.state.snapshot.targets[0]!, "remoteWorkspace", remoteWorkspace());
+    });
+    const navigateSessionBranch = vi.fn(async () => undefined);
+    const controller = controllerFor(sourceSession, sourceBackend, sourceMessage, { readDraft, saveDraft, navigateSessionBranch });
+    const container = mountPane(controller, sourceSession, sourceBackend, sourceMessage);
+    if (boundary === "preview") {
+      await act(async () => required([...container.querySelectorAll("button")].find((button) => button.textContent === "Preview rewind") ?? null).click());
+      Reflect.set(controller.state.snapshot.targets[0]!, "remoteWorkspace", remoteWorkspace());
+      await act(async () => required([...document.querySelectorAll("button")].find((button) => button.textContent === "timeline.rewindDialogueOnly") ?? null).click());
+      expect(document.querySelector("[role=alert]")?.textContent).toContain("timeline.rewindStale");
+    } else {
+      await act(async () => editSubmit(container).click());
+      if (boundary === "draft read") {
+        await vi.waitFor(() => expect(readDraft).toHaveBeenCalledOnce());
+        Reflect.set(controller.state.snapshot.targets[0]!, "remoteWorkspace", remoteWorkspace());
+        await act(async () => finishRead(durableDraft()));
+      }
+      await vi.waitFor(() => expect(container.querySelector("[role=alert]")?.textContent).toContain("timeline.editStale"));
+    }
+    expect(navigateSessionBranch).not.toHaveBeenCalled();
+    if (boundary === "draft write") {
+      expect(saveDraft).toHaveBeenCalledTimes(2);
+      expect(saveDraft).toHaveBeenLastCalledWith(sourceSession.id, durableDraft());
+    } else expect(saveDraft).not.toHaveBeenCalled();
+    expect(container.querySelector('[data-testid="edit-replacement"]')).toBeNull();
+  });
+
   it.each([false, true])("keeps the first-turn rewind confirmation bound to its document lifetime: pagehide=%s", async (hide) => {
     const sourceSession = session();
     const originalBackend = backend();
@@ -308,6 +359,7 @@ function controllerFor(
     revision: 1n,
     sessions: [sourceSession],
     backends: [sourceBackend],
+    targets: [target()],
     timelineBySession: new Map([[sourceSession.id, [sourceMessage]]])
   };
   const state: ControllerState = {
@@ -328,6 +380,7 @@ function controllerFor(
   let revision = 1;
   return {
     state, ...methods,
+    getPortableReplacementCleanup: async () => undefined,
     readDraftSnapshot: async (sessionId: string) => ({ revision, draft: await methods.readDraft(sessionId) }),
     saveDraftIfRevision: async (sessionId: string, draft: Parameters<AppController["saveDraft"]>[1], expectedRevision: number) => {
       if (expectedRevision !== revision) return undefined;
@@ -345,6 +398,23 @@ function backend(): BackendView {
     health: "healthy",
     capabilities: new Map([["session.rewind", { name: "session.rewind", supported: true, options: [] }]])
   };
+}
+
+function startBackend(): BackendView {
+  const original = backend();
+  return { ...original, capabilities: new Map([...original.capabilities, ["session.rewind_to_start", { name: "session.rewind_to_start", supported: true, options: ["service_node_only"] }]]) };
+}
+
+function startMessage(): TimelineItemView {
+  return { ...message(), nativeParentEntryId: undefined, nativeRewindBefore: { kind: "session_start" } };
+}
+
+function target(): TargetView {
+  return { id: "target-one", revision: 1n, backendId: "backend-one", name: "Project", workspaceId: "workspace-one", workspaceName: "Workspace", trusted: true, pinned: false, archived: false };
+}
+
+function remoteWorkspace(): NonNullable<TargetView["remoteWorkspace"]> {
+  return { kind: "ssh", hostTargetId: "host-target", hostId: "host", workspaceRoot: "/workspace" };
 }
 
 function session(): SessionView {

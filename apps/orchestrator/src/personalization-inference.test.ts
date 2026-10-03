@@ -1,8 +1,13 @@
+import { createHash } from "node:crypto";
 import { rm, writeFile } from "node:fs/promises";
 import { mkdtemp } from "./test-paths.js";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import {
+  NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD,
+  NATIVE_HISTORY_REPLACES_TRANSIENT_FIELD
+} from "@joko/core";
 import { OperationalStore } from "@joko/store";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -354,6 +359,81 @@ describe("PromptPredictionService", () => {
     expect(fetch).toHaveBeenCalledOnce();
   });
 
+  it("predicts from the active native Timeline without replaced transient duplicates", async () => {
+    const store = fixtureStore({ providerId: "provider-a", modelId: "text-model" });
+    const session = store.getSession("session-a").descriptor;
+    const bindingFingerprint = `sha256:${createHash("sha256").update(session.binding.opaqueRef).digest("hex")}`;
+    const append = (
+      id: string,
+      role: "user" | "assistant",
+      text: string,
+      emittedAt: number,
+      fields: Readonly<Record<string, string | number | boolean>>,
+      nativeHistory?: Readonly<{ readonly identity: Readonly<{ readonly entryId: string; readonly parentEntryId?: string }> }>
+    ): void => {
+      store.appendEvent({
+        id,
+        backendId: "pi",
+        targetId: "target-a",
+        sessionId: "session-a",
+        generation: 0,
+        emittedAt,
+        traceId: `prediction:${id}`,
+        payload: {
+          type: "message_complete",
+          role,
+          blocks: [{ kind: "text", text }],
+          ...(nativeHistory === undefined ? {} : { nativeHistory })
+        },
+        metadata: { namespace: "test.native_history", fields }
+      });
+    };
+    append("transient-user", "user", "stale duplicate user", 10, {
+      [NATIVE_HISTORY_REPLACES_TRANSIENT_FIELD]: true
+    });
+    append("transient-assistant", "assistant", "stale duplicate assistant", 20, {
+      [NATIVE_HISTORY_REPLACES_TRANSIENT_FIELD]: true
+    });
+    append("native-user", "user", "canonical user", 30, {
+      [NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD]: bindingFingerprint
+    }, { identity: { entryId: "native-user-entry" } });
+    append("native-assistant", "assistant", "canonical assistant", 40, {
+      [NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD]: bindingFingerprint
+    }, { identity: { entryId: "native-assistant-entry", parentEntryId: "native-user-entry" } });
+    store.appendEvent({
+      id: "native-marker",
+      backendId: "pi",
+      targetId: "target-a",
+      sessionId: "session-a",
+      generation: 0,
+      emittedAt: 50,
+      traceId: "prediction:native-marker",
+      payload: {
+        type: "native_session_changed",
+        opaqueRef: session.binding.opaqueRef,
+        leafId: "native-assistant-entry"
+      }
+    });
+    appendDone(store, "completed", 60);
+    const fetch = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body)) as {
+        readonly messages: readonly [{ readonly content: string }, { readonly content: string }];
+      };
+      expect(body.messages[1].content).toContain("User: canonical user\nAssistant: canonical assistant");
+      expect(body.messages[1].content).not.toContain("stale duplicate");
+      return predictionResponse("Continue from the canonical Timeline.");
+    }) as unknown as typeof globalThis.fetch;
+    const prediction = predictionService(store, fetch);
+
+    await expect(prediction.predict({
+      sessionId: session.id,
+      expectedLastActivityAt: session.updatedAt,
+      expectedGeneration: session.binding.generation,
+      locale: "en"
+    })).resolves.toBe("Continue from the canonical Timeline.");
+    expect(fetch).toHaveBeenCalledOnce();
+  });
+
   it("uses an independent auxiliary route for a native Backend Session", async () => {
     const store = fixtureStore({ providerId: "provider-a", modelId: "text-model" });
     appendMessage(store, "event-user", "user", "Keep this conversation on its native Backend.", 10);
@@ -450,7 +530,11 @@ describe("PromptPredictionService", () => {
       locale: "en"
     })).resolves.toBe("Continue from the latest state.");
     expect(fetch).toHaveBeenCalledOnce();
-    expect(store.listEvents).toHaveBeenCalledWith(expect.objectContaining({ order: "desc", beforeCursor: expect.any(BigInt) }));
+    expect(store.listEvents).toHaveBeenCalledWith(expect.objectContaining({
+      activeNativeTimeline: true,
+      order: "desc",
+      beforeCursor: expect.any(BigInt)
+    }));
   });
 
   it("does not dispatch after an aborted or failed terminal outcome", async () => {

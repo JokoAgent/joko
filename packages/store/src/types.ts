@@ -1351,6 +1351,8 @@ export interface EventQuery {
   readonly limit?: number;
   /** Internal audit/deletion planning only. Public timelines omit tombstones. */
   readonly includeTombstoned?: boolean;
+  /** Apply the current native binding and active-leaf projection before paging. */
+  readonly activeNativeTimeline?: boolean;
 }
 
 export interface StoredSubagentRunProjection {

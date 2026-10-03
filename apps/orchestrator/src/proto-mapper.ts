@@ -210,7 +210,7 @@ import {
 } from "@joko/contracts";
 import * as contract from "@joko/contracts";
 import type { CodeHostSessionReferenceProjection } from "@joko/code-host";
-import { assertAudioArtifactMetadata, redactSecrets, sanitizePublicError, type AudioArtifactMetadata } from "@joko/core";
+import { assertAudioArtifactMetadata, nativeStartScopeOptionsAreValid, redactSecrets, sanitizePublicError, SESSION_REWIND_SERVICE_NODE_ONLY_OPTION, type AudioArtifactMetadata } from "@joko/core";
 import { validatedProviderCredentialSurfaces } from "./provider-credential-surface.js";
 import {
   PROJECT_AUTOMATION_CONFIG_PATH,
@@ -4305,10 +4305,11 @@ function providerApi(api: ProviderModel["api"]): ProviderApiCompatibility {
 }
 
 function toProtoCapability(capability: Capability): ProtoCapability {
+  const scopeInvalid = capability.key === "session.rewind_to_start" && !nativeStartScopeOptionsAreValid(capability);
   return message<ProtoCapability>("joko.v1.Capability", {
     name: capability.key,
-    support: capability.supported ? CapabilitySupport.SUPPORTED : capabilitySupport(capability.reason),
-    reason: capability.detail ?? capability.reason ?? "",
+    support: capability.supported && !scopeInvalid ? CapabilitySupport.SUPPORTED : capabilitySupport(capability.reason),
+    reason: scopeInvalid ? "Native start navigation has an invalid Target scope." : capability.detail ?? capability.reason ?? "",
     options: toProtoCapabilityOptions(capability)
   });
 }
@@ -4347,7 +4348,22 @@ function capabilityReason(support: CapabilitySupport): Capability["reason"] | un
 
 function toProtoCapabilityOptions(capability: Capability): CapabilityOptions | undefined {
   let kind: CapabilityOptions["kind"];
-  if (capability.key.startsWith("model.")) {
+  if (capability.key === "session.rewind_to_start") {
+    if (!nativeStartScopeOptionsAreValid(capability)) return undefined;
+    kind = {
+      case: "session",
+      value: {
+        $typeName: "joko.v1.SessionCapabilityOptions",
+        supportsNativeTree: false,
+        supportsInPlaceNavigation: false,
+        createsNewNativeSession: false,
+        supportsDetach: false,
+        supportsNaming: false,
+        supportsDelete: false,
+        serviceNodeOnly: capability.options?.includes(SESSION_REWIND_SERVICE_NODE_ONLY_OPTION) === true
+      }
+    };
+  } else if (capability.key.startsWith("model.")) {
     kind = {
       case: "model",
       value: {
@@ -4419,6 +4435,7 @@ function toProtoCapabilityOptions(capability: Capability): CapabilityOptions | u
 function fromProtoCapabilityOptions(options: CapabilityOptions | undefined): readonly string[] {
   if (options === undefined) return [];
   switch (options.kind.case) {
+    case "session": return options.kind.value.serviceNodeOnly ? [SESSION_REWIND_SERVICE_NODE_ONLY_OPTION] : [];
     case "model": return options.kind.value.effortIds;
     case "input": return options.kind.value.mediaTypes;
     case "permission": return options.kind.value.modes.map(fromProtoPermissionMode);

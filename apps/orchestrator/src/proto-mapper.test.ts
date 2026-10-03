@@ -178,6 +178,30 @@ describe("proto mapper", () => {
     expect(stored.descriptor.capabilities.get(capabilityNames.queueEdit)?.supported).toBe(false);
   });
 
+  it.each([
+    { options: undefined, supported: true, serviceNodeOnly: false },
+    { options: [], supported: true, serviceNodeOnly: false },
+    { options: ["service_node_only"], supported: true, serviceNodeOnly: true },
+    { options: ["unknown"], supported: false, serviceNodeOnly: undefined },
+    { options: ["service_node_only", "service_node_only"], supported: false, serviceNodeOnly: undefined }
+  ])("preserves native start scope in the public Backend manifest and rejects invalid options: $options", ({ options, supported, serviceNodeOnly }) => {
+    const stored: StoredBackend = {
+      descriptor: {
+        id: "start-runtime", adapterKind: "native-runtime", instanceGeneration: 1, displayName: "Start runtime",
+        version: "1.0.0", health: "healthy", installationState: "installed", authenticationState: "authenticated", capabilities: new Map([["session.rewind_to_start", {
+          key: "session.rewind_to_start", supported: true, ...(options === undefined ? {} : { options })
+        }]]), models: [], tools: [], diagnostics: []
+      }, createdAt: 1, updatedAt: 2, revision: 3n
+    };
+    const capability = toProtoBackend(stored).capabilities!.capabilities[0]!;
+    expect(capability.support === CapabilitySupport.SUPPORTED).toBe(supported);
+    if (supported) expect(capability.options?.kind).toMatchObject({ case: "session", value: { serviceNodeOnly } });
+    else {
+      expect(capability.options).toBeUndefined();
+      expect(capability.reason).toMatch(/invalid Target scope/u);
+    }
+  });
+
   it("preserves exact runtime resource kinds in the public Backend capability manifest", () => {
     const stored: StoredBackend = {
       descriptor: {

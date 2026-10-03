@@ -4,6 +4,19 @@ import { describe, expect, it } from "vitest";
 import { projectPiNativeHistory, type PiNativeSessionHistory } from "./native-history.js";
 
 describe("Pi native history projection", () => {
+  it("keeps an explicit native start empty even when abandoned entries remain", () => {
+    const root = { id: "root-user", type: "message", data: { message: { role: "user", content: "Old context" } } };
+    const projected = projectPiNativeHistory("native-at-start", { entries: [root], leafId: null });
+    expect(projected.events).toEqual([]);
+    expect(projected.activeLineage).toEqual([]);
+    expect(projected.activeEntryId).toBeUndefined();
+    expect(projected.activeNavigationTarget).toEqual({ kind: "session_start" });
+    // An omitted observation remains unknown; it is not an explicit empty leaf.
+    expect(projectPiNativeHistory("native-at-start", { entries: [root] }).events).toHaveLength(1);
+    expect(projectPiNativeHistory("native-at-start", { entries: [root], leafId: root.id }).events[0]?.nativeRewindBefore)
+      .toEqual({ kind: "session_start" });
+  });
+
   it("withholds a managed-resource expansion from projected user history", () => {
     const privateBody = "private-resource-body-7f6c";
     const projected = projectPiNativeHistory("native-resource-session", {

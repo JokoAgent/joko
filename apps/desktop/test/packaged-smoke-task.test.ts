@@ -1,6 +1,7 @@
 import type { Transport } from "@connectrpc/connect";
 import {
   AuthenticationState,
+  AttemptState,
   BackendHealth,
   CapabilitySupport,
   EntityKind,
@@ -9,6 +10,9 @@ import {
   ProviderApiCompatibility,
   ProviderConfigurationField,
   ProviderKind,
+  QueueDeliveryMode,
+  QueueSourceKind,
+  RunState,
   SessionState,
   TargetState
 } from "@joko/contracts";
@@ -17,6 +21,8 @@ import { describe, expect, it, vi } from "vitest";
 import type { DesktopManagedOrchestratorConnection } from "../src/channels.js";
 import {
   createPackagedSmokeTask,
+  PACKAGED_SMOKE_TIMELINE_PROMPT,
+  runPackagedSmokeTimelineTurn,
   verifyPackagedSmokeTask,
   type PackagedSmokeTask
 } from "../src/packaged-smoke-task.js";
@@ -109,8 +115,8 @@ describe("packaged Desktop durable Task acceptance fixture", () => {
       "submitOperation",
       "getSnapshot"
     ]);
-    expect(transportFactory).toHaveBeenNthCalledWith(1, CONNECTION.origin, undefined, 35_000);
-    expect(transportFactory).toHaveBeenNthCalledWith(2, CONNECTION.origin, AUTH_KEY, 35_000);
+    expect(transportFactory).toHaveBeenNthCalledWith(1, CONNECTION.origin, undefined, 60_000);
+    expect(transportFactory).toHaveBeenNthCalledWith(2, CONNECTION.origin, AUTH_KEY, 60_000);
     expect(readAuthKey).toHaveBeenCalledWith(CONNECTION.profileId);
     expect(isAuthorityCurrent).toHaveBeenCalledTimes(3);
 
@@ -285,6 +291,99 @@ describe("packaged Desktop durable Task acceptance fixture", () => {
       transportFactory: () => transport
     }, TASK)).resolves.toBeUndefined();
     expect(calls).toEqual(["getServerInfo", "getSnapshot"]);
+    expect(isAuthorityCurrent).toHaveBeenCalledTimes(3);
+  });
+
+  it("admits one exact-generation Timeline turn and waits for its owned durable Run", async () => {
+    const calls: Array<{ readonly method: string; readonly input: any }> = [];
+    let runReads = 0;
+    const transport = fakeTransport(async (method, input) => {
+      calls.push({ method, input });
+      if (method === "getServerInfo") return serverInfo("managed-server");
+      if (method === "getSnapshot") return { snapshot: snapshot([taskSession()]) };
+      if (method === "submitOperation") return {
+        operation: {
+          operationId: input.operationId,
+          connectionId: input.connectionId,
+          state: OperationState.SUCCEEDED,
+          result: {
+            payload: {
+              case: "queueItem",
+              value: {
+                queueItemId: "queue-packaged",
+                runId: "run-packaged",
+                sessionId: TASK.sessionId,
+                backendId: TASK.backendId,
+                targetId: TASK.targetId,
+                sourceKind: QueueSourceKind.UI,
+                sourceId: "operation-timeline",
+                deliveryMode: QueueDeliveryMode.PROMPT,
+                input: {
+                  parts: [{ content: { case: "text", value: PACKAGED_SMOKE_TIMELINE_PROMPT } }]
+                }
+              }
+            }
+          }
+        }
+      };
+      if (method === "getRun") {
+        runReads += 1;
+        return {
+          run: {
+            runId: "run-packaged",
+            sessionId: TASK.sessionId,
+            backendId: TASK.backendId,
+            targetId: TASK.targetId,
+            sourceQueueItemId: "queue-packaged",
+            state: runReads === 1 ? RunState.RUNNING : RunState.SUCCEEDED,
+            attempts: [{
+              attemptId: "attempt-packaged",
+              runId: "run-packaged",
+              attemptNumber: 1,
+              state: runReads === 1 ? AttemptState.RUNNING : AttemptState.SUCCEEDED,
+              generation: TASK.generation
+            }]
+          }
+        };
+      }
+      throw new Error(`Unexpected method: ${method}`);
+    });
+    const isAuthorityCurrent = vi.fn(async () => true);
+
+    await expect(runPackagedSmokeTimelineTurn({
+      connection: CONNECTION,
+      displayName: DISPLAY_NAME,
+      readAuthKey: async () => AUTH_KEY,
+      isAuthorityCurrent,
+      operationId: () => "operation-timeline",
+      transportFactory: () => transport
+    }, TASK)).resolves.toBe("run-packaged");
+
+    expect(calls.map((call) => call.method)).toEqual([
+      "getServerInfo",
+      "getSnapshot",
+      "submitOperation",
+      "getRun",
+      "getRun"
+    ]);
+    expect(calls.find((call) => call.method === "submitOperation")?.input).toMatchObject({
+      operationId: "operation-timeline",
+      connectionId: CONNECTION.profileId,
+      mutation: {
+        preconditions: [{
+          entity: { kind: EntityKind.SESSION, id: TASK.sessionId },
+          expectedGeneration: TASK.generation
+        }],
+        payload: {
+          case: "sendInput",
+          value: {
+            sessionId: TASK.sessionId,
+            deliveryMode: QueueDeliveryMode.PROMPT,
+            input: { parts: [{ content: { case: "text", value: PACKAGED_SMOKE_TIMELINE_PROMPT } }] }
+          }
+        }
+      }
+    });
     expect(isAuthorityCurrent).toHaveBeenCalledTimes(3);
   });
 });

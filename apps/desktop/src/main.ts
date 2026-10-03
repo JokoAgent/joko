@@ -35,6 +35,7 @@ import { appendFileSync, writeFileSync } from "node:fs";
 import { readdir, stat, unlink } from "node:fs/promises";
 import { createHash, randomUUID } from "node:crypto";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { isDeepStrictEqual } from "node:util";
 import {
   DESKTOP_CHANNELS,
   type DesktopApplicationMenuCommand,
@@ -184,6 +185,7 @@ import {
   createPlatformSystemFrontmostInput
 } from "./dedicated-hardware-action/system-frontmost-input.js";
 import { SystemFrontmostVoiceController } from "./dedicated-hardware-action/system-frontmost-voice.js";
+import { loadNativeSystemFrontmostInput } from "./native-system-frontmost-input.js";
 import {
   createDedicatedHardwareMainActionRuntime,
   type DedicatedHardwareMainActionRuntime
@@ -198,12 +200,15 @@ import {
   resolveDedicatedHardwareSdkIdentity
 } from "./dedicated-hardware-sdk.js";
 import {
+  DEDICATED_HARDWARE_MODEL_IDS,
   createDedicatedHardwareHostClient,
   createDedicatedHardwareInputController,
   createDedicatedHardwareSettingsStore,
+  createDefaultDedicatedHardwareSettings,
   createElectronDedicatedHardwareUtilityFactory,
   isDedicatedHardwareModelId,
   parseDedicatedHardwareSettings,
+  parseDedicatedHardwareUtilityMessage,
   type DedicatedHardwareModelId,
   type DedicatedHardwareSettings
 } from "./dedicated-hardware/index.js";
@@ -245,6 +250,7 @@ import {
   type NativeTaskStatusWindowBounds
 } from "./mac-native-task-status-host.js";
 import {
+  isAllowedDesktopClipboardWriteRequest,
   isAllowedDesktopMicrophoneRequest,
   mapDesktopMicrophonePermissionStatus,
   microphoneMainFrameFromPermissionDetails,
@@ -281,10 +287,19 @@ import { createManagedExitFence } from "./managed-exit-fence.js";
 import { probeManagedRuntimeActivity } from "./managed-runtime-activity.js";
 import {
   createPackagedSmokeTask,
+  runPackagedSmokeTimelineTurn,
   verifyPackagedSmokeTask,
   type PackagedSmokeTask,
   type PackagedSmokeTaskOptions
 } from "./packaged-smoke-task.js";
+import {
+  cleanupPackagedSmokeClipboard,
+  hasOnlyEmptyPackagedSmokeClipboardFormats,
+  isPackagedSmokeRestorableClipboardFormat,
+  isPackagedSmokeClipboardObservationOwned,
+  packagedSmokeSystemClipboardText,
+  type PackagedSmokeClipboardObservation
+} from "./packaged-smoke-clipboard-cleanup.js";
 import {
   canRespawnManagedOrchestratorAfterProbe,
   commitVerifiedManagedOrchestratorAdoption,
@@ -428,8 +443,13 @@ const githubActionsPackagedSmoke = packagedSmoke && process.env["GITHUB_ACTIONS"
 const packagedSmokeConnectOrigin = process.env["JOKO_DESKTOP_SMOKE_CONNECT_ORIGIN"];
 const packagedSmokePublicHttpOrigin = process.env["JOKO_DESKTOP_SMOKE_PUBLIC_HTTP_ORIGIN"];
 const packagedSmokeProviderOrigin = process.env["JOKO_DESKTOP_SMOKE_PROVIDER_ORIGIN"];
+const packagedSmokeClipboardNonce = process.env["JOKO_DESKTOP_SMOKE_CLIPBOARD_NONCE"];
 const packagedSmokeResultPath = process.env["JOKO_DESKTOP_SMOKE_RESULT"];
 const packagedSmokeUserData = process.env["JOKO_DESKTOP_SMOKE_USER_DATA"];
+if (packagedSmoke && packagedSmokeScope === "full" && process.platform === "win32"
+  && (packagedSmokeClipboardNonce === undefined || !/^[0-9a-f]{32}$/u.test(packagedSmokeClipboardNonce))) {
+  throw new Error("Packaged Desktop clipboard smoke requires an exact per-run owner nonce.");
+}
 if (externalPackagedE2e && (packagedSmokeUserData === undefined
   || !isAbsolute(packagedSmokeUserData) || resolve(packagedSmokeUserData) !== packagedSmokeUserData)) {
   throw new Error("Packaged Desktop E2E requires an isolated user-data directory.");
@@ -601,7 +621,14 @@ const sessionWindowOwners = new Map<string, DesktopSessionWindowOwner>();
 const sessionWindowOwnersByContents = new Map<WebContents, DesktopSessionWindowOwner>();
 const extensionWindows = new Map<string, BrowserWindow>();
 const extensionWindowIdsByContents = new Map<WebContents, string>();
-let dedicatedHardwareController: DedicatedHardwareMainController<WebContents> | undefined;
+interface DedicatedHardwareCatalogOwner {
+  readonly contents: WebContents;
+  readonly documentOccurrence: string;
+}
+type DedicatedHardwareControllerOwner = WebContents | DedicatedHardwareCatalogOwner;
+let dedicatedHardwareController: DedicatedHardwareMainController<DedicatedHardwareControllerOwner> | undefined;
+let dedicatedHardwareCatalogOwner: DedicatedHardwareCatalogOwner | undefined;
+let dedicatedHardwarePrimaryVisible = false;
 let dedicatedHardwareActions: DedicatedHardwareMainActionRuntime<BrowserWindow> | undefined;
 let dedicatedHardwareSystemVoiceController: SystemFrontmostVoiceController | undefined;
 const dedicatedHardwareTaskFocusFence = new DedicatedHardwareTaskFocusFence<WebContents>();
@@ -925,6 +952,7 @@ function createWindow(): void {
   const retiredDocument = mainWindowDocuments.retireCurrent();
   if (retiredDocument !== undefined) {
     desktopNotifications.retireOwner(retiredDocument.endpoint, retiredDocument.occurrence);
+    retireDedicatedHardwareCatalogOwner(retiredDocument.endpoint, retiredDocument.occurrence);
   }
   desktopDeepLinkDelivery.resetRenderer();
   const frameOptions = process.platform === "darwin"
@@ -1014,6 +1042,10 @@ function createWindow(): void {
     mainUiLoadRecovery = operation;
   };
   installDesktopNativeTaskStatusVisibilityLifecycle(window);
+  window.on("show", () => refreshDedicatedHardwarePrimaryVisibility(window, true));
+  window.on("restore", () => refreshDedicatedHardwarePrimaryVisibility(window, true));
+  window.on("hide", () => refreshDedicatedHardwarePrimaryVisibility(window));
+  window.on("minimize", () => refreshDedicatedHardwarePrimaryVisibility(window));
   mainWindowState.manage(window);
   window.webContents.on("did-start-navigation", (_event, _url, isInPlace, isMainFrame) => {
     if (isDesktopMainDocumentReplacementNavigation(isMainFrame, isInPlace)) {
@@ -1063,6 +1095,12 @@ function createWindow(): void {
       trustedFrameUrl: webContents?.getURL() ?? "",
       requestingUrl: requestingUrlFromPermissionDetails(details, requestingOrigin),
       mediaTypes: microphoneMediaTypesFromPermissionDetails(details)
+    }) || isAllowedDesktopClipboardWriteRequest({
+      permission,
+      trustedOwner: webContents !== null && isTrustedClipboardWriteContents(webContents),
+      mainFrame: microphoneMainFrameFromPermissionDetails(details),
+      trustedFrameUrl: webContents?.getURL() ?? "",
+      requestingUrl: requestingUrlFromPermissionDetails(details, requestingOrigin)
     }));
   electronSession.setPermissionRequestHandler((webContents, permission, callback, details) => {
     callback(isAllowedDesktopMicrophoneRequest({
@@ -1072,6 +1110,12 @@ function createWindow(): void {
       trustedFrameUrl: webContents.getURL(),
       requestingUrl: requestingUrlFromPermissionDetails(details),
       mediaTypes: microphoneMediaTypesFromPermissionDetails(details)
+    }) || isAllowedDesktopClipboardWriteRequest({
+      permission,
+      trustedOwner: isTrustedClipboardWriteContents(webContents),
+      mainFrame: microphoneMainFrameFromPermissionDetails(details),
+      trustedFrameUrl: webContents.getURL(),
+      requestingUrl: requestingUrlFromPermissionDetails(details)
     }));
   });
   electronSession.setDevicePermissionHandler(() => false);
@@ -1257,6 +1301,7 @@ function createWindow(): void {
           "      window.jokoDesktop &&",
           "      typeof window.jokoDesktop.platform === 'string' &&",
           "      typeof window.jokoDesktop.chooseFiles === 'function' &&",
+          "      typeof window.jokoDesktop.dedicatedHardware?.getDedicatedHardwareState === 'function' &&",
           "      typeof window.jokoDesktop.extensionLibraries?.pickLocation === 'function' &&",
           "      typeof window.jokoDesktop.extensionLibraries?.reveal === 'function' &&",
           "      typeof window.jokoDesktop.extensionLibraries?.beginSave === 'function' &&",
@@ -1374,6 +1419,7 @@ function createWindow(): void {
         if (rendered !== true) {
           throw new Error("The packaged product renderer did not return its exact ready marker.");
         }
+        await verifyPackagedSmokeDedicatedHardwareState(window);
         if (packagedSmokeScope === "draft") {
           await verifyPackagedSmokeNewTaskDraftCrash(window);
         } else {
@@ -1409,6 +1455,60 @@ function createWindow(): void {
   } else {
     beginMainUiLoadRecovery();
   }
+}
+
+async function verifyPackagedSmokeDedicatedHardwareState(window: BrowserWindow): Promise<void> {
+  if (window.isDestroyed() || window.webContents.isDestroyed()) {
+    throw new Error("Packaged smoke owner retired before dedicated hardware verification.");
+  }
+  const raw: unknown = await window.webContents.executeJavaScript([
+    "(async () => {",
+    "  if (!document.querySelector('.app') || typeof window.jokoDesktop?.dedicatedHardware?.getDedicatedHardwareState !== 'function') {",
+    "    throw new Error('Dedicated hardware state is unavailable in the product renderer.');",
+    "  }",
+    "  return window.jokoDesktop.dedicatedHardware.getDedicatedHardwareState();",
+    "})()"
+  ].join("\n"), true);
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+    throw new Error("Packaged smoke dedicated hardware Snapshot was invalid.");
+  }
+  const snapshot = raw as Record<string, unknown>;
+  if (snapshot.models === null || typeof snapshot.models !== "object" || Array.isArray(snapshot.models)) {
+    throw new Error("Packaged smoke dedicated hardware models were invalid.");
+  }
+  const models = snapshot.models as Record<string, unknown>;
+  const expectedModels = {} as Record<DedicatedHardwareModelId, unknown>;
+  for (const model of DEDICATED_HARDWARE_MODEL_IDS) {
+    const state = models[model];
+    if (state === null || typeof state !== "object" || Array.isArray(state)) {
+      throw new Error("Packaged smoke dedicated hardware model state was unavailable.");
+    }
+    const { settingsError: _settingsError, settings: _settings, taskSlots: _taskSlots, ...connection } =
+      state as Record<string, unknown>;
+    const parsed = parseDedicatedHardwareUtilityMessage({ version: 1, generation: 1, kind: "state", ...connection });
+    if (parsed?.kind !== "state" || parsed.model !== model) {
+      throw new Error("Packaged smoke dedicated hardware connection state was invalid.");
+    }
+    expectedModels[model] = {
+      model,
+      status: "disabled",
+      reason: null,
+      devicePresent: null,
+      transport: null,
+      firmwareVersion: null,
+      batteryPercent: null,
+      charging: null,
+      inputPermission: "unknown",
+      keymap: parsed.keymap,
+      settingsError: null,
+      settings: createDefaultDedicatedHardwareSettings(model),
+      taskSlots: Array.from({ length: 6 }, (_, slot) => ({ slot, sessionId: null, title: null }))
+    };
+  }
+  if (!isDeepStrictEqual(raw, { version: 1, models: expectedModels })) {
+    throw new Error("Packaged smoke dedicated hardware Snapshot did not match the isolated disabled defaults.");
+  }
+  recordPackagedSmokeProgress("dedicated_hardware_main_snapshot_verified");
 }
 
 async function verifyPackagedSmokeNativeTaskStatus(owner: BrowserWindow): Promise<void> {
@@ -2082,6 +2182,11 @@ async function verifyPackagedSmokeSessionWindow(owner: BrowserWindow): Promise<v
   await waitForPackagedSmokeTaskPresentation(taskWindow, task, taskOwner);
   assertPackagedSmokeTaskWindowOwner(taskWindow, taskOwner);
   recordPackagedSmokeProgress("task_window_reloaded_exact_owner");
+  if (process.platform === "win32") {
+    await runPackagedSmokeTimelineTurn(taskOptions, task);
+    recordPackagedSmokeProgress("timeline_generation_completed");
+    await verifyPackagedSmokeTimelineSystemClipboard(taskWindow);
+  }
 
   const concurrentTaskOptions = {
     ...taskOptions,
@@ -2152,6 +2257,488 @@ async function verifyPackagedSmokeSessionWindow(owner: BrowserWindow): Promise<v
   }
   recordPackagedSmokeProgress("task_windows_closed_cleanly");
   recordPackagedSmokeProgress("durable_task_reverified");
+}
+
+const PACKAGED_SMOKE_PNG_SIGNATURE = "89504e470d0a1a0a";
+
+interface PackagedSmokeClipboardSnapshot {
+  readonly formats: readonly string[];
+  readonly text: string;
+  readonly html: string;
+  readonly rtf: string;
+  readonly bookmark: Readonly<{ title: string; url: string }>;
+  readonly image?: NativeImage;
+}
+
+interface PackagedSmokeClipboardFingerprint {
+  readonly text: string;
+  readonly imageSha256: string;
+}
+
+async function verifyPackagedSmokeTimelineSystemClipboard(window: BrowserWindow): Promise<void> {
+  const fixture = packagedSmokeTimelineClipboardFixture();
+  const systemClipboardFixture = Object.freeze({
+    codeText: packagedSmokeSystemClipboardText(fixture.codeText, process.platform),
+    mermaidText: packagedSmokeSystemClipboardText(fixture.mermaidSource, process.platform),
+    tableText: packagedSmokeSystemClipboardText(fixture.tableText, process.platform),
+    mathText: packagedSmokeSystemClipboardText(fixture.mathText, process.platform)
+  });
+  await waitForPackagedSmokeTimelineClipboardBlocks(window, fixture);
+  if (window.isDestroyed() || window.webContents.isDestroyed()) {
+    throw new Error("Packaged smoke Timeline clipboard owner retired before verification.");
+  }
+  if (window.isMinimized()) window.restore();
+  window.show();
+  window.focus();
+  const focusDeadline = Date.now() + 5_000;
+  while (!window.isFocused() && Date.now() < focusDeadline) await waitForPackagedSmokePoll();
+  if (!window.isFocused()) throw new Error("Packaged smoke Timeline clipboard owner did not become focused.");
+
+  const writerContents = window.webContents;
+  const snapshot = capturePackagedSmokeClipboard();
+  const sentinel = `joko-packaged-smoke-clipboard-${randomUUID()}`;
+  let mermaidFingerprint: PackagedSmokeClipboardFingerprint | undefined;
+  let tableFingerprint: PackagedSmokeClipboardFingerprint | undefined;
+  let mathFingerprint: PackagedSmokeClipboardFingerprint | undefined;
+  let copyActionsSettled = false;
+  try {
+    clipboard.writeText(sentinel, "clipboard");
+    if (clipboard.readText("clipboard") !== sentinel || !clipboard.readImage("clipboard").isEmpty()) {
+      throw new Error("Packaged smoke could not establish its system clipboard sentinel.");
+    }
+    await clickPackagedSmokeTimelineCopy(window, ".timeline-code-block", ":scope > button.timeline-code-block__copy");
+    await waitForPackagedSmokeTimelineTextClipboard(
+      window,
+      ".timeline-code-block",
+      ":scope > button.timeline-code-block__copy",
+      systemClipboardFixture.codeText
+    );
+    recordPackagedSmokeProgress("timeline_code_system_clipboard_verified");
+
+    assertPackagedSmokeTextClipboard(systemClipboardFixture.codeText);
+    await clickPackagedSmokeTimelineCopy(
+      window,
+      ".timeline-mermaid",
+      ":scope > .timeline-mermaid__toolbar > button.timeline-mermaid__copy"
+    );
+    mermaidFingerprint = await waitForPackagedSmokeTimelineClipboard(
+      window,
+      ".timeline-mermaid",
+      ":scope > .timeline-mermaid__toolbar > button.timeline-mermaid__copy",
+      systemClipboardFixture.mermaidText
+    );
+    recordPackagedSmokeProgress("timeline_mermaid_system_clipboard_verified");
+
+    assertPackagedSmokeClipboardFingerprint(mermaidFingerprint);
+    await clickPackagedSmokeTimelineCopy(
+      window,
+      ".timeline-copy-block--table",
+      ":scope > button.timeline-copy-block__button:not(.timeline-copy-block__annotate)"
+    );
+    tableFingerprint = await waitForPackagedSmokeTimelineClipboard(
+      window,
+      ".timeline-copy-block--table",
+      ":scope > button.timeline-copy-block__button:not(.timeline-copy-block__annotate)",
+      systemClipboardFixture.tableText
+    );
+    recordPackagedSmokeProgress("timeline_table_system_clipboard_verified");
+
+    assertPackagedSmokeClipboardFingerprint(tableFingerprint);
+    await clickPackagedSmokeTimelineCopy(
+      window,
+      ".timeline-copy-block--math",
+      ":scope > button.timeline-copy-block__button:not(.timeline-copy-block__annotate)"
+    );
+    mathFingerprint = await waitForPackagedSmokeTimelineClipboard(
+      window,
+      ".timeline-copy-block--math",
+      ":scope > button.timeline-copy-block__button:not(.timeline-copy-block__annotate)",
+      systemClipboardFixture.mathText
+    );
+    copyActionsSettled = true;
+    if (new Set([
+      mermaidFingerprint.imageSha256,
+      tableFingerprint.imageSha256,
+      mathFingerprint.imageSha256
+    ]).size !== 3) {
+      throw new Error("Packaged smoke Timeline image Copy actions did not produce distinct PNG payloads.");
+    }
+    recordPackagedSmokeProgress("timeline_math_system_clipboard_verified");
+  } finally {
+    await cleanupPackagedSmokeClipboard({
+      writesKnownSettled: copyActionsSettled,
+      waitForWritesToSettle: () => waitForPackagedSmokeTimelineCopyActionsToSettle(window),
+      retireWriter: () => retirePackagedSmokeTimelineClipboardWriter(window, writerContents),
+      ownsCurrentClipboard: () => packagedSmokeClipboardIsOwned(
+        sentinel,
+        [systemClipboardFixture.mermaidText, systemClipboardFixture.tableText, systemClipboardFixture.mathText],
+        [systemClipboardFixture.codeText]
+      ),
+      restorePreviousClipboard: () => restorePackagedSmokeClipboard(snapshot, () => (
+        packagedSmokeClipboardIsOwned(
+          sentinel,
+          [systemClipboardFixture.mermaidText, systemClipboardFixture.tableText, systemClipboardFixture.mathText],
+          [systemClipboardFixture.codeText]
+        )
+      ))
+    });
+  }
+}
+
+async function retirePackagedSmokeTimelineClipboardWriter(
+  window: BrowserWindow,
+  writerContents: WebContents
+): Promise<void> {
+  const contentsDestroyed = writerContents.isDestroyed()
+    ? Promise.resolve()
+    : new Promise<void>((resolveDestroyed) => writerContents.once("destroyed", resolveDestroyed));
+  const windowClosed = window.isDestroyed()
+    ? Promise.resolve()
+    : new Promise<void>((resolveClosed) => window.once("closed", resolveClosed));
+  if (!window.isDestroyed()) window.destroy();
+  await Promise.all([contentsDestroyed, windowClosed]);
+}
+
+function packagedSmokeTimelineClipboardFixture(): Readonly<{
+  codeText: string;
+  mermaidSource: string;
+  tableText: string;
+  mathSource: string;
+  mathText: string;
+}> {
+  if (packagedSmokeClipboardNonce === undefined) {
+    throw new Error("Packaged smoke Timeline clipboard owner nonce is unavailable.");
+  }
+  const codeSource = [
+    `const owner = "${packagedSmokeClipboardNonce}";`,
+    "console.log(owner);"
+  ].join("\n");
+  const mermaidSource = [
+    "flowchart LR",
+    `  A["${packagedSmokeClipboardNonce}"] --> B["Clipboard"]`
+  ].join("\n");
+  const mathSource = `x_{${packagedSmokeClipboardNonce}}=1`;
+  return Object.freeze({
+    codeText: `${codeSource}\n`,
+    mermaidSource,
+    tableText: `Kind\tValue\nAlpha\tBeta\nOwner\t${packagedSmokeClipboardNonce}`,
+    mathSource,
+    mathText: `$$\n${mathSource}\n$$`
+  });
+}
+
+async function waitForPackagedSmokeTimelineClipboardBlocks(
+  window: BrowserWindow,
+  fixture: ReturnType<typeof packagedSmokeTimelineClipboardFixture>
+): Promise<void> {
+  const deadline = Date.now() + 20_000;
+  let lastObservation = "unavailable";
+  while (Date.now() < deadline) {
+    const value = await window.webContents.executeJavaScript([
+      "(() => {",
+      "  const assistant = [...document.querySelectorAll('.message-assistant')].filter((node) =>",
+      "    node.querySelector('.timeline-code-block, .timeline-mermaid, .timeline-copy-block--table, .timeline-copy-block--math'));",
+      "  const codeBlocks = document.querySelectorAll('.message-assistant__body .timeline-code-block');",
+      "  const mermaidBlocks = document.querySelectorAll('.message-assistant__body .timeline-mermaid');",
+      "  const tableBlocks = document.querySelectorAll('.message-assistant__body .timeline-copy-block--table');",
+      "  const mathBlocks = document.querySelectorAll('.message-assistant__body .timeline-copy-block--math');",
+      "  const codeText = codeBlocks.length === 1 ? codeBlocks[0].querySelector('code')?.textContent ?? '' : '';",
+      "  const mermaidReady = mermaidBlocks.length === 1 && Boolean(mermaidBlocks[0].querySelector('.timeline-mermaid__diagram svg'));",
+      "  const table = tableBlocks.length === 1 ? tableBlocks[0].querySelector('table') : null;",
+      "  const tableText = table ? [...table.querySelectorAll('tr')].map((row) =>",
+      "    [...row.querySelectorAll('th, td')].map((cell) => cell.textContent?.trim() ?? '').join('\\t')).join('\\n') : '';",
+      "  const mathSource = mathBlocks.length === 1",
+      "    ? mathBlocks[0].querySelector('annotation[encoding=\"application/x-tex\"]')?.textContent?.trim() ?? '' : '';",
+      "  return {",
+      "    assistantCount: assistant.length, codeCount: codeBlocks.length, mermaidCount: mermaidBlocks.length,",
+      "    tableCount: tableBlocks.length, mathCount: mathBlocks.length, codeText, mermaidReady, tableText, mathSource,",
+      "    streaming: Boolean(assistant[0]?.querySelector('.streaming-cursor'))",
+      "  };",
+      "})()"
+    ].join("\n"), true) as unknown;
+    if (typeof value === "object" && value !== null && !Array.isArray(value)) {
+      const observation = value as Record<string, unknown>;
+      lastObservation = JSON.stringify(observation);
+      if (observation["assistantCount"] === 1
+        && observation["codeCount"] === 1
+        && observation["mermaidCount"] === 1
+        && observation["tableCount"] === 1
+        && observation["mathCount"] === 1
+        && observation["codeText"] === fixture.codeText
+        && observation["mermaidReady"] === true
+        && observation["tableText"] === fixture.tableText
+        && observation["mathSource"] === fixture.mathSource
+        && observation["streaming"] === false) return;
+    }
+    await waitForPackagedSmokePoll();
+  }
+  throw new Error(`Packaged smoke Timeline clipboard blocks did not settle (${lastObservation}).`);
+}
+
+async function clickPackagedSmokeTimelineCopy(
+  window: BrowserWindow,
+  blockSelector: string,
+  buttonSelector: string
+): Promise<void> {
+  const clicked = await window.webContents.executeJavaScript([
+    "(() => {",
+    `  const blocks = document.querySelectorAll(${JSON.stringify(`.message-assistant__body ${blockSelector}`)});`,
+    "  if (blocks.length !== 1) return false;",
+    `  const buttons = blocks[0].querySelectorAll(${JSON.stringify(buttonSelector)});`,
+    "  if (buttons.length !== 1) return false;",
+    "  const button = buttons[0];",
+    "  if (!(button instanceof HTMLButtonElement) || button.disabled || button.getAttribute('aria-busy') === 'true') return false;",
+    "  button.click();",
+    "  return true;",
+    "})()"
+  ].join("\n"), true) as unknown;
+  if (clicked !== true) throw new Error(`Packaged smoke could not dispatch one Copy action for ${blockSelector}.`);
+}
+
+async function waitForPackagedSmokeTimelineTextClipboard(
+  window: BrowserWindow,
+  blockSelector: string,
+  buttonSelector: string,
+  expectedText: string
+): Promise<void> {
+  const deadline = Date.now() + 20_000;
+  let lastObservation = "unavailable";
+  while (Date.now() < deadline) {
+    const state = await packagedSmokeTimelineCopyActionState(window, blockSelector, buttonSelector);
+    if (state === "failed") throw new Error(`Packaged smoke ${blockSelector} Copy action failed.`);
+    const text = clipboard.readText("clipboard");
+    const imageEmpty = clipboard.readImage("clipboard").isEmpty();
+    lastObservation = JSON.stringify({
+      state,
+      textMatches: text === expectedText,
+      textLength: text.length,
+      textSha256: createHash("sha256").update(text).digest("hex"),
+      expectedTextSha256: createHash("sha256").update(expectedText).digest("hex"),
+      imageEmpty,
+      formats: clipboard.availableFormats("clipboard")
+    });
+    if (state === "settled" && text === expectedText && imageEmpty) return;
+    await waitForPackagedSmokePoll();
+  }
+  throw new Error(
+    `Packaged smoke ${blockSelector} system clipboard did not contain only the exact text (${lastObservation}).`
+  );
+}
+
+async function waitForPackagedSmokeTimelineClipboard(
+  window: BrowserWindow,
+  blockSelector: string,
+  buttonSelector: string,
+  expectedText: string
+): Promise<PackagedSmokeClipboardFingerprint> {
+  const deadline = Date.now() + 20_000;
+  let lastObservation = "unavailable";
+  while (Date.now() < deadline) {
+    const state = await packagedSmokeTimelineCopyActionState(window, blockSelector, buttonSelector);
+    if (state === "failed") throw new Error(`Packaged smoke ${blockSelector} Copy action failed.`);
+    const image = clipboard.readImage("clipboard");
+    const text = clipboard.readText("clipboard");
+    const size = image.getSize();
+    const png = image.isEmpty() ? Buffer.alloc(0) : image.toPNG();
+    const validPng = !image.isEmpty() && size.width >= 1 && size.height >= 1 && png.byteLength > 8
+      && png.subarray(0, 8).toString("hex") === PACKAGED_SMOKE_PNG_SIGNATURE
+      && !nativeImage.createFromBuffer(png).isEmpty();
+    lastObservation = JSON.stringify({
+      state,
+      textMatches: text === expectedText,
+      textLength: text.length,
+      textSha256: createHash("sha256").update(text).digest("hex"),
+      expectedTextSha256: createHash("sha256").update(expectedText).digest("hex"),
+      imageEmpty: image.isEmpty(),
+      imageSize: size,
+      pngBytes: png.byteLength,
+      validPng,
+      formats: clipboard.availableFormats("clipboard")
+    });
+    if (state === "settled" && text === expectedText && !image.isEmpty()) {
+      if (!validPng) {
+        throw new Error(`Packaged smoke ${blockSelector} system clipboard PNG was invalid.`);
+      }
+      return Object.freeze({
+        text: expectedText,
+        imageSha256: createHash("sha256").update(png).digest("hex")
+      });
+    }
+    await waitForPackagedSmokePoll();
+  }
+  throw new Error(
+    `Packaged smoke ${blockSelector} system clipboard did not contain the exact PNG and text (${lastObservation}).`
+  );
+}
+
+async function packagedSmokeTimelineCopyActionState(
+  window: BrowserWindow,
+  blockSelector: string,
+  buttonSelector: string
+): Promise<"pending" | "settled" | "failed" | "unavailable"> {
+  if (window.isDestroyed() || window.webContents.isDestroyed()) return "unavailable";
+  const state = await window.webContents.executeJavaScript([
+    "(() => {",
+    `  const block = document.querySelector(${JSON.stringify(`.message-assistant__body ${blockSelector}`)});`,
+    "  if (!block) return 'unavailable';",
+    "  if (block.querySelector('[role=\"alert\"]')) return 'failed';",
+    `  const button = block.querySelector(${JSON.stringify(buttonSelector)});`,
+    "  if (!(button instanceof HTMLButtonElement)) return 'unavailable';",
+    "  return button.getAttribute('aria-busy') === 'true' ? 'pending' : 'settled';",
+    "})()"
+  ].join("\n"), true) as unknown;
+  return state === "pending" || state === "settled" || state === "failed" ? state : "unavailable";
+}
+
+async function waitForPackagedSmokeTimelineCopyActionsToSettle(window: BrowserWindow): Promise<boolean> {
+  const deadline = Date.now() + 5_000;
+  while (Date.now() < deadline) {
+    const states = await Promise.all([
+      packagedSmokeTimelineCopyActionState(window, ".timeline-code-block", ":scope > button.timeline-code-block__copy"),
+      packagedSmokeTimelineCopyActionState(
+        window,
+        ".timeline-mermaid",
+        ":scope > .timeline-mermaid__toolbar > button.timeline-mermaid__copy"
+      ),
+      packagedSmokeTimelineCopyActionState(
+        window,
+        ".timeline-copy-block--table",
+        ":scope > button.timeline-copy-block__button:not(.timeline-copy-block__annotate)"
+      ),
+      packagedSmokeTimelineCopyActionState(
+        window,
+        ".timeline-copy-block--math",
+        ":scope > button.timeline-copy-block__button:not(.timeline-copy-block__annotate)"
+      )
+    ]);
+    if (states.every((state) => state === "settled" || state === "failed")) return true;
+    if (states.includes("unavailable")) return false;
+    await waitForPackagedSmokePoll();
+  }
+  return false;
+}
+
+function assertPackagedSmokeClipboardFingerprint(expected: PackagedSmokeClipboardFingerprint): void {
+  if (!packagedSmokeClipboardMatchesFingerprint(expected)) {
+    throw new Error("Packaged smoke will not replace a newer system clipboard owner.");
+  }
+}
+
+function assertPackagedSmokeTextClipboard(expectedText: string): void {
+  if (clipboard.readText("clipboard") !== expectedText || !clipboard.readImage("clipboard").isEmpty()) {
+    throw new Error("Packaged smoke will not replace a newer system clipboard owner.");
+  }
+}
+
+function packagedSmokeClipboardMatchesFingerprint(expected: PackagedSmokeClipboardFingerprint): boolean {
+  if (clipboard.readText("clipboard") !== expected.text) return false;
+  const image = clipboard.readImage("clipboard");
+  return !image.isEmpty()
+    && createHash("sha256").update(image.toPNG()).digest("hex") === expected.imageSha256;
+}
+
+function packagedSmokeClipboardIsOwned(
+  sentinel: string,
+  expectedImageOutputTexts: readonly string[],
+  expectedTextOnlyOutputs: readonly string[] = []
+): boolean {
+  return isPackagedSmokeClipboardObservationOwned(
+    readPackagedSmokeClipboardObservation(),
+    sentinel,
+    expectedImageOutputTexts,
+    expectedTextOnlyOutputs
+  );
+}
+
+function readPackagedSmokeClipboardObservation(): PackagedSmokeClipboardObservation {
+  const text = clipboard.readText("clipboard");
+  const image = clipboard.readImage("clipboard");
+  if (image.isEmpty()) return Object.freeze({ text });
+  const size = image.getSize();
+  const png = image.toPNG();
+  if (size.width < 1 || size.height < 1 || png.byteLength <= 8
+    || png.subarray(0, 8).toString("hex") !== PACKAGED_SMOKE_PNG_SIGNATURE
+    || nativeImage.createFromBuffer(png).isEmpty()) return Object.freeze({ text });
+  return Object.freeze({ text, imageSha256: createHash("sha256").update(png).digest("hex") });
+}
+
+function capturePackagedSmokeClipboard(): PackagedSmokeClipboardSnapshot {
+  const image = clipboard.readImage("clipboard");
+  const formats = Object.freeze([...new Set(clipboard.availableFormats("clipboard"))]);
+  const unsupportedFormats = formats.filter((format) => !isPackagedSmokeRestorableClipboardFormat(format));
+  if (unsupportedFormats.length > 0) {
+    throw new Error(
+      `Packaged smoke will not replace clipboard formats that cannot be restored atomically: ${unsupportedFormats.join(", ")}`
+    );
+  }
+  const snapshot = Object.freeze({
+    formats,
+    text: clipboard.readText("clipboard"),
+    html: clipboard.readHTML("clipboard"),
+    rtf: clipboard.readRTF("clipboard"),
+    bookmark: Object.freeze(clipboard.readBookmark()),
+    ...(image.isEmpty() ? {} : { image })
+  });
+  if (formats.length > 0 && packagedSmokeClipboardWriteData(snapshot) === undefined) {
+    if (hasOnlyEmptyPackagedSmokeClipboardFormats(
+      formats,
+      (format) => clipboard.readBuffer(format).byteLength
+    )) return Object.freeze({ ...snapshot, formats: Object.freeze([]) });
+    throw new Error("Packaged smoke cannot represent the current system clipboard in one restore transaction.");
+  }
+  return snapshot;
+}
+
+async function restorePackagedSmokeClipboard(
+  snapshot: PackagedSmokeClipboardSnapshot,
+  ownsCurrentClipboard: () => boolean
+): Promise<void> {
+  let lastFailure: unknown;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    if (!ownsCurrentClipboard()) {
+      if (attempt === 0) return;
+      throw new Error(`Packaged smoke lost clipboard ownership while restoring: ${safeSmokeError(lastFailure)}`);
+    }
+    try {
+      const data = packagedSmokeClipboardWriteData(snapshot);
+      if (data === undefined) clipboard.clear("clipboard");
+      else clipboard.write(data, "clipboard");
+      if (packagedSmokeClipboardMatchesSnapshot(snapshot)) return;
+      lastFailure = new Error("restored clipboard did not match the captured snapshot");
+    } catch (error) {
+      lastFailure = error;
+    }
+    if (attempt < 2) await waitForPackagedSmokePoll();
+  }
+  throw new Error(`Packaged smoke could not restore the system clipboard: ${safeSmokeError(lastFailure)}`);
+}
+
+function packagedSmokeClipboardMatchesSnapshot(snapshot: PackagedSmokeClipboardSnapshot): boolean {
+  if (clipboard.readText("clipboard") !== snapshot.text
+    || clipboard.readHTML("clipboard") !== snapshot.html
+    || clipboard.readRTF("clipboard") !== snapshot.rtf
+    || !isDeepStrictEqual(clipboard.readBookmark(), snapshot.bookmark)) return false;
+  const image = clipboard.readImage("clipboard");
+  if (snapshot.image === undefined) return image.isEmpty();
+  return !image.isEmpty() && createHash("sha256").update(image.toPNG()).digest("hex")
+    === createHash("sha256").update(snapshot.image.toPNG()).digest("hex");
+}
+
+function packagedSmokeClipboardWriteData(snapshot: PackagedSmokeClipboardSnapshot): Readonly<{
+  text?: string;
+  html?: string;
+  rtf?: string;
+  bookmark?: string;
+  image?: NativeImage;
+}> | undefined {
+  const data = Object.freeze({
+    ...(snapshot.text !== "" ? { text: snapshot.text } : snapshot.bookmark.url === "" ? {} : { text: snapshot.bookmark.url }),
+    ...(snapshot.html === "" ? {} : { html: snapshot.html }),
+    ...(snapshot.rtf === "" ? {} : { rtf: snapshot.rtf }),
+    ...(snapshot.bookmark.url === "" ? {} : { bookmark: snapshot.bookmark.title || snapshot.bookmark.url }),
+    ...(snapshot.image === undefined ? {} : { image: snapshot.image })
+  });
+  return Object.keys(data).length === 0 ? undefined : data;
 }
 
 function assertPackagedSmokeTaskWindowOwner(
@@ -4951,6 +5538,15 @@ function captureMainWindowDocument(contents: WebContents, claim: string): string
     }
     desktopDeepLinkDelivery.resetRenderer();
   }
+  if (dedicatedHardwareCatalogOwner?.contents !== contents ||
+      dedicatedHardwareCatalogOwner.documentOccurrence !== capture.current.occurrence) {
+    if (dedicatedHardwareCatalogOwner !== undefined) {
+      dedicatedHardwareController?.retireOwner(dedicatedHardwareCatalogOwner);
+    }
+    dedicatedHardwareCatalogOwner = Object.freeze({ contents, documentOccurrence: capture.current.occurrence });
+    dedicatedHardwarePrimaryVisible = false;
+  }
+  refreshDedicatedHardwarePrimaryVisibility(window);
   return capture.current.occurrence;
 }
 
@@ -4959,7 +5555,10 @@ function retireMainWindowDocument(window: BrowserWindow, contents: WebContents):
   // Electron's webContents getter itself throws Object has been destroyed.
   if (mainWindow !== window || mainWindowContentsByWindow.get(window) !== contents) return;
   const retired = mainWindowDocuments.retire(contents);
-  if (retired !== undefined) desktopNotifications.retireOwner(retired.endpoint, retired.occurrence);
+  if (retired !== undefined) {
+    desktopNotifications.retireOwner(retired.endpoint, retired.occurrence);
+    retireDedicatedHardwareCatalogOwner(retired.endpoint, retired.occurrence);
+  }
   desktopDeepLinkDelivery.resetRenderer();
 }
 
@@ -7043,8 +7642,13 @@ function registerIpc(): void {
   });
   ipcMain.handle(DESKTOP_CHANNELS.dedicatedHardwarePublishTasks, (event, ...parameters: unknown[]) => {
     assertDedicatedHardwareSender(event, { mainOnly: true });
-    if (parameters.length !== 1) throw new TypeError("Dedicated hardware tasks require one catalog.");
-    requireDedicatedHardwareController().publishTasks(parameters[0]);
+    if (parameters.length !== 2) throw new TypeError("Dedicated hardware tasks require their current Document and catalog.");
+    const documentOccurrence = assertCurrentMainApplicationDocumentSender(event, parameters[0]);
+    const owner = dedicatedHardwareCatalogOwner;
+    if (owner === undefined || owner.contents !== event.sender || owner.documentOccurrence !== documentOccurrence) {
+      throw new Error("Dedicated hardware tasks require their current Document owner.");
+    }
+    requireDedicatedHardwareController().publishTasks(parameters[1], owner);
   });
   ipcMain.handle(DESKTOP_CHANNELS.dedicatedHardwareAcknowledgeTaskFocus, (event, ...parameters: unknown[]) => {
     const owner = assertDedicatedHardwareSender(event, { mainOnly: true });
@@ -8128,7 +8732,28 @@ async function initializeDedicatedHardwareInput(): Promise<void> {
   dedicatedHardwareTaskFocusFence.clear();
   dedicatedHardwareSystemVoiceController?.retire();
   dedicatedHardwareSystemVoiceController = undefined;
-  const systemFrontmost = createPlatformSystemFrontmostInput({ platform: process.platform });
+  const nativeHelper = loadNativeSystemFrontmostInput({
+    directory: app.isPackaged
+      ? resolve(process.resourcesPath, "native-system-frontmost-input")
+      : resolve(sourceDirectory, "native-system-frontmost-input"),
+    platform: process.platform,
+    architecture: process.arch
+  });
+  const systemFrontmost = createPlatformSystemFrontmostInput({
+    platform: process.platform,
+    linuxSession: {
+      sessionType: process.env.XDG_SESSION_TYPE,
+      waylandDisplay: process.env.WAYLAND_DISPLAY
+    },
+    ...(nativeHelper === undefined ? {} : process.platform === "win32"
+      ? { windowsHelper: nativeHelper }
+      : process.platform === "darwin" ? { macHelper: nativeHelper }
+      : process.platform === "linux" ? { linuxHelper: nativeHelper } : {})
+  });
+  if (packagedSmoke && (process.platform === "win32" || process.platform === "darwin" || process.platform === "linux")) {
+    if (systemFrontmost.status !== "available") throw new Error("Native foreground sampler was not admitted by Main.");
+    process.stdout.write("JOKO_DESKTOP_FRONTMOST_INPUT_READY\n");
+  }
   const systemInput = systemFrontmost.status === "available"
     ? new SystemFrontmostInputController(systemFrontmost.runner, { wheelNotch: systemFrontmost.wheelNotch })
     : undefined;
@@ -8208,7 +8833,7 @@ async function initializeDedicatedHardwareInput(): Promise<void> {
     }),
     keymapBackupDirectory: join(app.getPath("userData"), "hardware-input", "private-keymap")
   });
-  const controller = createDedicatedHardwareMainController<WebContents>({
+  const controller = createDedicatedHardwareMainController<DedicatedHardwareControllerOwner>({
     store,
     host,
     input,
@@ -8217,15 +8842,18 @@ async function initializeDedicatedHardwareInput(): Promise<void> {
       broadcastDedicatedHardwareState(state);
     },
     onPreviewInput: (owner, previewInput) => {
-      const window = dedicatedHardwareWindowForContents(owner);
+      const contents = "documentOccurrence" in owner ? owner.contents : owner;
+      const window = dedicatedHardwareWindowForContents(contents);
       if (window === undefined || !isDedicatedHardwareActionWindowReady(window)) return;
-      owner.send(DESKTOP_CHANNELS.dedicatedHardwarePreviewInput, previewInput);
+      contents.send(DESKTOP_CHANNELS.dedicatedHardwarePreviewInput, previewInput);
     }
   });
   dedicatedHardwareActions = actions;
-  dedicatedHardwareController = controller;
   try {
-    await controller.initialize();
+    const state = await controller.initialize();
+    dedicatedHardwareController = controller;
+    if (mainWindow !== undefined) refreshDedicatedHardwarePrimaryVisibility(mainWindow);
+    broadcastDedicatedHardwareState(state);
   } catch (error) {
     dedicatedHardwareTaskFocusFence.clear();
     dedicatedHardwareController = undefined;
@@ -8266,7 +8894,28 @@ function suspendDedicatedHardwareInput(): void {
   dedicatedHardwareActions?.cancelAll("suspended");
 }
 
-function requireDedicatedHardwareController(): DedicatedHardwareMainController<WebContents> {
+function retireDedicatedHardwareCatalogOwner(contents: WebContents, documentOccurrence: string): void {
+  const owner = dedicatedHardwareCatalogOwner;
+  if (owner === undefined || owner.contents !== contents || owner.documentOccurrence !== documentOccurrence) return;
+  dedicatedHardwareController?.retireOwner(owner);
+  dedicatedHardwareCatalogOwner = undefined;
+  dedicatedHardwarePrimaryVisible = false;
+}
+
+function refreshDedicatedHardwarePrimaryVisibility(window: BrowserWindow, reveal = false): void {
+  const owner = dedicatedHardwareCatalogOwner;
+  if (window !== mainWindow || window.isDestroyed() || owner === undefined || owner.contents.isDestroyed() ||
+      mainWindowContentsByWindow.get(window) !== owner.contents ||
+      !mainWindowDocuments.isCurrent(owner.contents, owner.documentOccurrence)) return;
+  const visible = window.isVisible() && !window.isMinimized();
+  dedicatedHardwareController?.setPrimaryWindowVisible(owner, visible);
+  if (reveal && visible && !dedicatedHardwarePrimaryVisible) {
+    dedicatedHardwareController?.playWindowReveal(owner);
+  }
+  dedicatedHardwarePrimaryVisible = visible;
+}
+
+function requireDedicatedHardwareController(): DedicatedHardwareMainController<DedicatedHardwareControllerOwner> {
   if (dedicatedHardwareController === undefined) {
     throw new Error("Dedicated hardware input is unavailable.");
   }
@@ -8580,6 +9229,13 @@ function trustedApplicationWindowForContents(contents: WebContents): BrowserWind
 function isTrustedApplicationContents(contents: WebContents): boolean {
   const owner = trustedApplicationWindowForContents(contents);
   return owner !== undefined && isAllowedMainFrameNavigation(contents.getURL(), navigationPolicy);
+}
+
+function isTrustedClipboardWriteContents(contents: WebContents): boolean {
+  const owner = trustedApplicationWindowForContents(contents);
+  return owner !== undefined
+    && (owner === mainWindow || sessionWindowOwnersByContents.has(contents))
+    && isAllowedMainFrameNavigation(contents.getURL(), navigationPolicy);
 }
 
 function assertGlobalVoiceOwnerSender(event: IpcMainInvokeEvent): void {

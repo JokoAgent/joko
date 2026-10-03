@@ -5,6 +5,7 @@ import { assertBrowserActionCurrent, type BrowserActionContext } from "../browse
 import { WorkspaceImageLightbox, type WorkspaceImageLightboxLabels } from "./WorkspaceImageLightbox.js";
 import type { Translator } from "./types.js";
 import { IconButton } from "./ui.js";
+import { RENDERED_SHARE_EXCLUDE_ATTRIBUTE } from "./rendered-share-dom.js";
 
 interface GeneratedImage {
   readonly scope: object;
@@ -99,8 +100,8 @@ export function GeneratedImageAnnotationButton({ ownerKey, sourceKey, ownerDocum
     })();
   };
   return <>
-    <IconButton className={className} label={failed ? labels.prepareFailed : labels.annotate} aria-busy={pending} aria-disabled={pending} onClick={(event) => open(event.currentTarget)}>{failed ? <AlertTriangle aria-hidden="true" /> : <Pen aria-hidden="true" />}</IconButton>
-    {failed && <span className="sr-only" role="alert">{labels.prepareFailed}</span>}
+    <IconButton {...{ [RENDERED_SHARE_EXCLUDE_ATTRIBUTE]: "" }} className={className} label={failed ? labels.prepareFailed : labels.annotate} aria-busy={pending} aria-disabled={pending} onClick={(event) => open(event.currentTarget)}>{failed ? <AlertTriangle aria-hidden="true" /> : <Pen aria-hidden="true" />}</IconButton>
+    {failed && <span {...{ [RENDERED_SHARE_EXCLUDE_ATTRIBUTE]: "" }} className="sr-only" role="alert">{labels.prepareFailed}</span>}
     {image?.scope === scope && <WorkspaceImageLightbox
       ownerKey={JSON.stringify([ownerKey, sourceKey])}
       src={image.url}

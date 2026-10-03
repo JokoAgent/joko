@@ -1338,6 +1338,10 @@ export interface TimelineItemView {
     | "review"
     | "status";
   readonly createdAt: number;
+  /** Exact activity completion supplied by the owning tool-call contract. */
+  readonly endedAt?: number;
+  /** Latest observed delta time for this exact thinking block, not its completion or duration. */
+  readonly lastActivityAt?: number;
   readonly title?: string;
   readonly text?: string;
   readonly streaming?: boolean;
@@ -1351,6 +1355,10 @@ export interface TimelineItemView {
   readonly pastedTextRanges?: readonly TimelineInlineTextRangeView[];
   /** Service-authored receipt of the exact accepted user input. */
   readonly userInputAccepted?: true;
+  /** Exact operation identity supplied by the generated user-message event. */
+  readonly inputOperationId?: string;
+  /** Renderer-memory proof that this user input was sent from the same connection scope. */
+  readonly localUserInput?: boolean;
   readonly inputMentions?: readonly TimelineInputMentionView[];
   readonly mentionRanges?: readonly TimelineInputMentionRangeView[];
   /** Authoritative accounting for this completed assistant segment. */

@@ -6,11 +6,13 @@ import {
   type DedicatedHardwareModelId
 } from "./settings.js";
 import {
+  parseDedicatedHardwareLightingState,
   parseDedicatedHardwareUtilityMessage,
   parseDedicatedHardwareUtilityRequest,
   type DedicatedHardwareConnectionReason,
   type DedicatedHardwareConnectionSnapshot,
   type DedicatedHardwareDesiredState,
+  type DedicatedHardwareLightingState,
   type DedicatedHardwareInputEvent,
   type DedicatedHardwareSdkIdentity,
   type DedicatedHardwareUtilityMessage,
@@ -46,6 +48,7 @@ export interface DedicatedHardwareHostClock {
 export interface DedicatedHardwareHostClient {
   readonly getConnectionState: (model: DedicatedHardwareModelId) => DedicatedHardwareConnectionSnapshot;
   readonly setDesiredState: (model: DedicatedHardwareModelId, desired: DedicatedHardwareDesiredState) => void;
+  readonly setLightingState: (model: DedicatedHardwareModelId, state: DedicatedHardwareLightingState) => void;
   readonly probe: (model: DedicatedHardwareModelId) => boolean;
   readonly inspectCreatorKeymapRecovery: () => Promise<DedicatedHardwareConnectionSnapshot>;
   readonly recoverCreatorKeymap: () => Promise<DedicatedHardwareConnectionSnapshot>;
@@ -72,6 +75,9 @@ export function createDedicatedHardwareHostClient(options: {
 }): DedicatedHardwareHostClient {
   const clock = options.clock ?? DEFAULT_CLOCK;
   const desired = new Map<DedicatedHardwareModelId, DedicatedHardwareDesiredState>();
+  const lighting = new Map<DedicatedHardwareModelId, DedicatedHardwareLightingState>();
+  const lightingPending = new Map<DedicatedHardwareModelId, string>();
+  const lightingSent = new Map<DedicatedHardwareModelId, string>();
   const states = new Map<DedicatedHardwareModelId, DedicatedHardwareConnectionSnapshot>(
     DEDICATED_HARDWARE_MODEL_IDS.map((model) => [model, emptyState(model, "disabled", null)])
   );
@@ -199,6 +205,23 @@ export function createDedicatedHardwareHostClient(options: {
     (model) => desired.get(model)?.settings.enabled === true
   );
 
+  const resetLightingDelivery = (): void => {
+    lightingPending.clear();
+    lightingSent.clear();
+  };
+
+  const sendLightingState = (model: DedicatedHardwareModelId): void => {
+    const value = lighting.get(model);
+    if (value === undefined || !ready || connection === undefined || plannedExit !== undefined || permanentlyStopped ||
+        desired.get(model)?.settings.enabled !== true || lightingPending.has(model)) return;
+    const key = JSON.stringify(value);
+    if (lightingSent.get(model) === key) return;
+    const requestId = nextRequestId();
+    lightingPending.set(model, requestId);
+    lightingSent.set(model, key);
+    send({ version: 1, generation, requestId, kind: "set-lighting-state", model, state: value });
+  };
+
   const finishKeymapRecovery = (error?: Error): void => {
     const pending = keymapRecovery;
     if (pending === undefined) return;
@@ -281,6 +304,7 @@ export function createDedicatedHardwareHostClient(options: {
     handshakeRequestId = undefined;
     shutdownRequestId = undefined;
     inputSequences.clear();
+    resetLightingDelivery();
     if (keymapRecovery !== undefined) keymapRecovery.requestId = undefined;
     if (keymapInspection !== undefined) keymapInspection.requestId = undefined;
     const creator = states.get("creator-micro-2");
@@ -310,6 +334,7 @@ export function createDedicatedHardwareHostClient(options: {
       return;
     }
     plannedExit = mode;
+    resetLightingDelivery();
     if (connection === undefined) {
       generation += 1;
       starting = false;
@@ -353,6 +378,7 @@ export function createDedicatedHardwareHostClient(options: {
     handshakeRequestId = undefined;
     shutdownRequestId = undefined;
     inputSequences.clear();
+    resetLightingDelivery();
     const creator = states.get("creator-micro-2");
     if (creator !== undefined) publish("creator-micro-2", {
       ...creator,
@@ -396,6 +422,7 @@ export function createDedicatedHardwareHostClient(options: {
       }
       sendKeymapInspection();
       sendKeymapRecovery();
+      for (const model of DEDICATED_HARDWARE_MODEL_IDS) sendLightingState(model);
       stableTimer = clock.setTimeout(() => {
         if (ownerGeneration === generation && ready) crashCount = 0;
       }, STABLE_RESET_MS);
@@ -435,6 +462,12 @@ export function createDedicatedHardwareHostClient(options: {
       return;
     }
     if (message.kind === "ack") {
+      for (const model of DEDICATED_HARDWARE_MODEL_IDS) {
+        if (lightingPending.get(model) !== message.requestId) continue;
+        lightingPending.delete(model);
+        sendLightingState(model);
+        return;
+      }
       if (keymapInspection?.requestId === message.requestId) {
         finishKeymapInspection();
         if (!hasEnabledModel() && keymapRecovery === undefined) beginPlannedExit("off");
@@ -537,6 +570,7 @@ export function createDedicatedHardwareHostClient(options: {
       };
       desired.set(model, canonical);
       if (!canonical.settings.enabled) {
+        lightingSent.delete(model);
         publish(model, emptyState(model, "disabled", null, states.get(model)?.keymap));
         if (ready) sendDesiredState(model);
         if (!hasEnabledModel() && keymapRecovery === undefined && keymapInspection === undefined) {
@@ -546,6 +580,7 @@ export function createDedicatedHardwareHostClient(options: {
       }
       if (ready && plannedExit === undefined) {
         if (!sendDesiredState(model)) return;
+        sendLightingState(model);
         if (sdkIdentity?.kind === "unavailable") {
           publish(model, emptyState(model, "unavailable", "sdk-unavailable", states.get(model)?.keymap));
         }
@@ -554,6 +589,13 @@ export function createDedicatedHardwareHostClient(options: {
       } else {
         ensureRunning();
       }
+    },
+    setLightingState: (model, next) => {
+      assertModel(model);
+      const canonical = parseDedicatedHardwareLightingState(next);
+      if (canonical === undefined) throw new TypeError("Invalid dedicated hardware lighting state.");
+      lighting.set(model, canonical);
+      sendLightingState(model);
     },
     probe: (model) => {
       assertModel(model);

@@ -602,14 +602,14 @@ describe("PiBackendAdapter", () => {
     expect(validateRemoteWorkspace).toHaveBeenCalledTimes(1);
     await adapter.dispose();
   });
-  it("rejects unsupported start navigation and structured workspace references without spawning a runtime", async () => {
+  it("rejects start navigation without an active owner and structured workspace references without spawning a runtime", async () => {
     const directory = await mkdtemp(join(tmpdir(), "joko-pi-start-boundary-"));
     const processFactory = vi.fn((): PiProcessHandle => { throw new Error("No native runtime should start"); });
     const adapter = createPiAdapter({ agentHome: directory, sessionRoot: directory, versionProbe: async () => "pi 0.84.4", processFactory });
     try {
-      expect((await adapter.describe()).capabilities.get("session.rewind_to_start")?.supported).toBe(false);
+      expect((await adapter.describe()).capabilities.get("session.rewind_to_start")).toMatchObject({ supported: true, options: ["service_node_only"] });
       const target: TargetDescriptor = { id: "target-start", backendId: adapter.id, displayName: "Start", workspaceRoot: directory, managed: false, trusted: true };
-      await expect(adapter.navigateTree({ kind: "session_start" }, false, makeContext(target, []), undefined, navigationAuthority)).rejects.toMatchObject({ publicError: { code: "PI_REWIND_START_UNAVAILABLE" } });
+      await expect(adapter.navigateTree({ kind: "session_start" }, false, makeContext(target, []), undefined, navigationAuthority)).rejects.toMatchObject({ publicError: { code: "PI_RUNTIME_NOT_ACTIVE" } });
       for (const mention of [
         { kind: "workspace_directory", label: "source", reference: "src" },
         { kind: "artifact", label: "Export", reference: "artifact-one", sourceSessionId: "source-task" },
@@ -622,6 +622,149 @@ describe("PiBackendAdapter", () => {
     } finally {
       await adapter.dispose();
       await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it.each(["session_start", "empty-branch", "root-user", "root-custom"] as const)("replaces %s with a registered detached empty context while preserving the source owner", async (boundary) => {
+    const home = await mkdtemp(join(tmpdir(), "joko-pi-start-replacement-"));
+    const workspace = await mkdtemp(join(tmpdir(), "joko-pi-start-workspace-"));
+    const root = boundary === "root-custom" ? {
+      id: "root-custom", parentId: null, type: "custom_message", timestamp: new Date(0).toISOString(),
+      customType: "notice", content: "old context", display: true
+    } : {
+      id: "root-user", parentId: null, type: "message", timestamp: new Date(0).toISOString(),
+      message: { role: "user", content: "old context", timestamp: 0 }
+    };
+    const processes: ScriptedPiProcess[] = [];
+    const events: EventPayload[] = [];
+    const adapter = createPiAdapter({
+      agentHome: home, sessionRoot: home, versionProbe: async () => "pi 99.1.0-start",
+      processFactory: (spec) => {
+        const source = processes.length === 0;
+        const process = new ScriptedPiProcess(spec, source ? {
+          historyResponseData: { entries: [root], leafId: boundary === "empty-branch" ? null : root.id },
+          tree: [{ entry: root, children: [] }]
+        } : { historyResponseData: { entries: [], leafId: null } });
+        if (!source) process.sessionId = String((JSON.parse(readFileSync(process.sessionFile, "utf8")) as { id: string }).id);
+        processes.push(process);
+        return process as unknown as PiProcessHandle;
+      }
+    });
+    const target: TargetDescriptor = { id: "start-target", backendId: "pi", displayName: "Start", workspaceRoot: workspace, managed: true, trusted: true };
+    const base = makeContext(target, events);
+    try {
+      const binding = await adapter.createSession({ target, fastMode: false, permissionMode: "ask" }, base);
+      const source = { ...base, binding };
+      const sourceBytes = await readFile(binding.opaqueRef);
+      const recordBinding = vi.fn((replacement: NativeSessionBinding) => {
+        expect(replacement.generation).toBe(binding.generation + 1);
+        expect(replacement.opaqueRef).not.toBe(binding.opaqueRef);
+        expect(processes).toHaveLength(1);
+        expect(() => readFileSync(replacement.opaqueRef)).toThrow();
+      });
+      const eventCount = events.length;
+      const navigation = await adapter.navigateTree(boundary === "session_start" || boundary === "empty-branch" ? { kind: "session_start" }
+        : { kind: "native_entry", entryId: boundary }, false, source, undefined, { recordBinding });
+      if (navigation.kind !== "replacement") throw new Error("Expected detached start navigation.");
+      expect(recordBinding).toHaveBeenCalledExactlyOnceWith(navigation.binding);
+      expect(navigation.nativeHistory).toMatchObject({ events: [], activeLineage: [], activeNavigationTarget: { kind: "session_start" } });
+      expect(await readFile(binding.opaqueRef)).toEqual(sourceBytes);
+      expect(processes[0]?.signalCode).toBeNull();
+      expect(processes[0]?.commands.some((command) => ["new_session", "fork", "prompt", "abort"].includes(String(command.type)))).toBe(false);
+      expect(processes[1]?.signalCode).toBe("SIGTERM");
+      expect(events).toHaveLength(eventCount);
+      await expect(adapter.getState(source)).resolves.toMatchObject({ sessionFile: binding.opaqueRef });
+    } finally {
+      await adapter.dispose();
+    }
+  });
+
+  it.each([false, true])("scopes remote navigation lifecycle to replacement boundaries with empty source %s", async (empty) => {
+    const home = await mkdtemp(join(tmpdir(), "joko-pi-remote-navigation-"));
+    const root = { id: "root-user", parentId: null, type: "message", timestamp: new Date(0).toISOString(),
+      message: { role: "user", content: "source context", timestamp: 0 } };
+    const assistant = { id: "assistant", parentId: root.id, type: "message", timestamp: new Date(1).toISOString(),
+      message: { role: "assistant", content: [{ type: "text", text: "reply" }], timestamp: 1,
+        api: "openai-responses", provider: "test-provider", model: "test-model", stopReason: "stop",
+        usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } } };
+    const processes: ScriptedPiProcess[] = [];
+    const remoteNavigationOwner = { prepare: vi.fn(async () => undefined), beginShadow: vi.fn(async () => undefined),
+      adopt: vi.fn(async () => undefined), cleanup: vi.fn(async () => undefined) };
+    const adapter = createPiAdapter({ agentHome: home, sessionRoot: home, versionProbe: async () => "pi 99.1.0-remote-start",
+      validateRemoteWorkspace: async () => undefined, remoteNavigationOwner,
+      includeManagedSubagentTools: () => false,
+      processFactory: (spec) => {
+        const source = processes.length === 0;
+        const runtime = new ScriptedPiProcess(spec, source ? { historyResponseData: { entries: empty ? [] : [root, assistant], leafId: empty ? null : assistant.id },
+          tree: empty ? [] : [{ entry: root, children: [{ entry: assistant, children: [] }] }] }
+          : { historyResponseData: { entries: [], leafId: null } });
+        if (!source) runtime.sessionId = String((JSON.parse(readFileSync(runtime.sessionFile, "utf8")) as { id: string }).id);
+        processes.push(runtime); return runtime as unknown as PiProcessHandle;
+      } });
+    const target: TargetDescriptor = { id: "remote-start", backendId: "pi", displayName: "Remote", workspaceRoot: home,
+      managed: true, trusted: true, remoteWorkspace: { kind: "ssh", hostTargetId: "host-target", hostId: "host", workspaceRoot: "/workspace" } };
+    const context = { ...makeContext(target, []), operationId: "remote-start-operation" };
+    try {
+      expect((await adapter.describe()).capabilities.get("session.rewind_to_start")).toMatchObject({ supported: true });
+      expect((await adapter.describe()).capabilities.get("session.rewind_to_start")?.options).toBeUndefined();
+      const binding = await adapter.createSession({ target, fastMode: false, permissionMode: "ask" }, context);
+      const lifecycle = { operationId: context.operationId, kind: "navigate" as const, sourceSessionId: context.sessionId,
+        sourceBinding: binding, sessionId: context.sessionId, target, sourceTarget: target };
+      await expect(adapter.ownsNativeSessionDerivationLifecycle({ ...lifecycle, navigationTarget: { kind: "session_start" } })).resolves.toBe(!empty);
+      await expect(adapter.ownsNativeSessionDerivationLifecycle({ ...lifecycle, navigationTarget: { kind: "native_entry", entryId: "root-user" } })).resolves.toBe(!empty);
+      await expect(adapter.ownsNativeSessionDerivationLifecycle({ ...lifecycle, navigationTarget: { kind: "native_entry", entryId: "assistant" } })).resolves.toBe(false);
+      const recordBinding = vi.fn();
+      const result = await adapter.navigateTree({ kind: "session_start" }, false, { ...context, binding }, undefined, { recordBinding });
+      expect(result.kind).toBe(empty ? "in_place" : "replacement");
+      expect(remoteNavigationOwner.prepare).toHaveBeenCalledTimes(empty ? 0 : 1);
+      expect(remoteNavigationOwner.beginShadow).toHaveBeenCalledTimes(empty ? 0 : 1);
+      expect(recordBinding).toHaveBeenCalledTimes(empty ? 0 : 1);
+      expect(processes[0]?.signalCode).toBeNull();
+      if (!empty) expect(processes[1]?.signalCode).toBe("SIGTERM");
+    } finally { await adapter.dispose(); await rm(home, { recursive: true, force: true }); }
+  });
+
+  it("keeps start navigation fail closed at receipt, cancellation and native-history confirmation", async () => {
+    const home = await mkdtemp(join(tmpdir(), "joko-pi-start-failure-"));
+    const workspace = await mkdtemp(join(tmpdir(), "joko-pi-start-failure-workspace-"));
+    const processes: ScriptedPiProcess[] = [];
+    let cancelled: AbortController | undefined;
+    const adapter = createPiAdapter({
+      agentHome: home, sessionRoot: home, versionProbe: async () => "pi 99.1.0-start-failure",
+      processFactory: (spec) => {
+        const process = new ScriptedPiProcess(spec);
+        if (processes.length > 0) process.sessionId = String((JSON.parse(readFileSync(process.sessionFile, "utf8")) as { id: string }).id);
+        processes.push(process);
+        cancelled?.abort();
+        return process as unknown as PiProcessHandle;
+      }
+    });
+    const target: TargetDescriptor = { id: "failure-target", backendId: "pi", displayName: "Start", workspaceRoot: workspace, managed: true, trusted: true };
+    const base = makeContext(target, []);
+    try {
+      const binding = await adapter.createSession({ target, fastMode: false, permissionMode: "ask" }, base);
+      const source = { ...base, binding };
+      const rejected = vi.fn(() => { throw new Error("Durable receipt unavailable."); });
+      await expect(adapter.navigateTree({ kind: "session_start" }, false, source, undefined, { recordBinding: rejected })).rejects.toThrow("Durable receipt unavailable.");
+      expect(processes).toHaveLength(1);
+      const recordBinding = vi.fn();
+      processes[0]!.isStreaming = true;
+      await expect(adapter.navigateTree({ kind: "session_start" }, false, source, undefined, { recordBinding })).rejects.toMatchObject({ publicError: { code: "PI_TREE_RUNTIME_BUSY", stateMayHaveChanged: false } });
+      processes[0]!.isStreaming = false;
+      await expect(adapter.navigateTree({ kind: "session_start" }, true, source, undefined, { recordBinding })).rejects.toMatchObject({ publicError: { code: "PI_TREE_START_SUMMARY_UNAVAILABLE" } });
+      expect(recordBinding).not.toHaveBeenCalled();
+      await expect(adapter.navigateTree({ kind: "session_start" }, false, source, undefined, { recordBinding })).rejects.toMatchObject({ publicError: { code: "PI_TREE_START_UNCONFIRMED", stateMayHaveChanged: true, retryable: false } });
+      expect(recordBinding).toHaveBeenCalledOnce();
+      expect(processes[1]?.signalCode).toBe("SIGTERM");
+      cancelled = new AbortController();
+      await expect(adapter.navigateTree({ kind: "session_start" }, false, { ...source, signal: cancelled.signal }, undefined, { recordBinding })).rejects.toMatchObject({ publicError: { code: "PI_TREE_START_UNCONFIRMED", stateMayHaveChanged: true, retryable: false } });
+      expect(recordBinding).toHaveBeenCalledTimes(2);
+      expect(processes[2]?.signalCode).toBe("SIGTERM");
+      expect(processes[0]?.signalCode).toBeNull();
+      expect(processes).toHaveLength(3);
+      await expect(adapter.getState(source)).resolves.toMatchObject({ sessionFile: binding.opaqueRef });
+    } finally {
+      await adapter.dispose();
     }
   });
 

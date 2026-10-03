@@ -16,6 +16,7 @@ import { z } from "zod";
 const PROTOCOL_VERSION = 2;
 const MANAGER_VERSION = "2.0.0";
 const SESSION_STORE_MODULE_BASE64 = "__JOKO_EMBEDDED_CLAUDE_SESSION_STORE_V1__";
+const FRESH_CONTEXT_MODULE_BASE64 = "__JOKO_EMBEDDED_CLAUDE_FRESH_CONTEXT_OWNER_V1__";
 const MANAGER_SHA256 = createHash("sha256").update(readFileSync(fileURLToPath(import.meta.url))).digest("hex");
 const MAX_LINE_BYTES = 32 * 1024 * 1024;
 const MAX_EVENTS = 4096;
@@ -50,7 +51,7 @@ const STORE_FAULT_CODES = new Set([
   "invalid_request", "invalid_path", "invalid_store_authority", "invalid_store_access",
   "invalid_store_entry", "store_limit_exceeded", "store_unavailable", "reservation_rejected",
   "callback_unavailable", "callback_capacity", "callback_timeout", "callback_cancelled",
-  "connection_closed"
+  "connection_closed", "method_unsupported"
 ]);
 
 export function createManagerState(runtimeSdk = nativeSdk, options = {}) {
@@ -62,7 +63,10 @@ export function createManagerState(runtimeSdk = nativeSdk, options = {}) {
     terminalOrder: [],
     sessionStoreModule: options.sessionStoreModule,
     sessionStoreModulePromise: undefined,
-    sessionStoreRootDirectory: options.sessionStoreRootDirectory
+    sessionStoreRootDirectory: options.sessionStoreRootDirectory,
+    freshContextModule: options.freshContextModule,
+    freshContextModulePromise: undefined,
+    freshContextRootDirectory: options.freshContextRootDirectory
   };
 }
 
@@ -75,11 +79,21 @@ class InputQueue {
   closed = false;
   error = undefined;
 
+  constructor(beforeConsumed) { this.beforeConsumed = beforeConsumed; }
+
   push(value) {
     if (this.closed) throw fault("query_closed", true);
     const bytes = Buffer.byteLength(JSON.stringify(value), "utf8");
     const waiter = this.waiters.shift();
-    if (waiter) waiter.resolve({ value, done: false });
+    if (waiter) {
+      try { this.beforeConsumed?.(false); }
+      catch (error) {
+        waiter.reject(error);
+        this.close(error);
+        throw error;
+      }
+      waiter.resolve({ value, done: false });
+    }
     else {
       if (this.values.length >= MAX_QUEUED_INPUTS || this.bytes + bytes > MAX_QUEUED_INPUT_BYTES) {
         throw fault("input_queue_full", false);
@@ -93,6 +107,8 @@ class InputQueue {
     if (this.closed) return;
     this.closed = true;
     this.error = error;
+    this.values = [];
+    this.bytes = 0;
     for (const waiter of this.waiters.splice(0)) {
       if (error) waiter.reject(error);
       else waiter.resolve({ value: undefined, done: true });
@@ -102,12 +118,15 @@ class InputQueue {
   [Symbol.asyncIterator]() { return this; }
 
   next() {
-    const queued = this.values.shift();
+    if (this.closed) return this.error ? Promise.reject(this.error) : Promise.resolve({ value: undefined, done: true });
+    const queued = this.values[0];
     if (queued !== undefined) {
+      try { this.beforeConsumed?.(true); }
+      catch (error) { this.close(error); return Promise.reject(error); }
+      this.values.shift();
       this.bytes -= queued.bytes;
       return Promise.resolve({ value: queued.value, done: false });
     }
-    if (this.closed) return this.error ? Promise.reject(this.error) : Promise.resolve({ value: undefined, done: true });
     return new Promise((resolvePromise, reject) => this.waiters.push({ resolve: resolvePromise, reject }));
   }
 }
@@ -288,6 +307,10 @@ async function dispatch(connection, method, params) {
     try { return await storeOperation(connection, method, params); }
     catch (error) { throw normalizeStoreFault(error); }
   }
+  if (typeof method === "string" && method.startsWith("fresh.")) {
+    try { return await freshContextOperation(connection, method, params); }
+    catch (error) { throw normalizeStoreFault(error); }
+  }
   if (method === "session.info") return sessionOperation(connection, params, (signal) => connection.state.sdk.getSessionInfo(
     uuid(params.sessionId), { dir: absolutePath(params.dir), signal }
   ));
@@ -316,6 +339,69 @@ async function dispatch(connection, method, params) {
     }
   ));
   throw fault("method_unsupported", false);
+}
+
+async function freshContextOperation(connection, method, params) {
+  if (!record(params)) throw fault("invalid_request", false);
+  const context = await remoteFreshContextContext(connection.state, params.authority);
+  const owner = context.owner;
+  if (method === "fresh.reserve") return owner.reserve(freshContextInput(params.identity));
+  if (method === "fresh.getForBinding") return owner.getForBinding(freshContextInput(params.input));
+  if (method === "fresh.getForOperation") return owner.getForOperation(boundedString(params.operationId, "operation id", 256));
+  if (method === "fresh.hasPendingSource") return owner.hasPendingSource(freshContextInput(params.input));
+  if (method === "fresh.markSourceRetired") {
+    owner.markSourceRetired(freshContextInput(params.input));
+    return { confirmed: true };
+  }
+  if (method === "fresh.claim") return owner.claim(freshContextInput(params.input), retirementProof(params.proof));
+  if (method === "fresh.recover") return owner.recover(freshContextInput(params.identity), retirementProof(params.proof));
+  if (method === "fresh.adopt") return owner.adopt(freshContextInput(params.identity), retirementProof(params.proof));
+  if (method === "fresh.cleanup") return owner.cleanup(freshContextInput(params.identity), retirementProof(params.proof));
+  if (method === "fresh.deleteEmptyBinding") return owner.deleteEmptyBinding(freshContextInput(params.input), retirementProof(params.proof));
+  throw fault("method_unsupported", false);
+}
+
+function freshContextInput(value) {
+  if (!record(value) || jsonBytes(value) > 48 * 1024) throw fault("invalid_request", false);
+  return value;
+}
+
+function retirementProof(value) {
+  if (!record(value) || value.retirementConfirmed !== true
+    || Object.keys(value).some((key) => key !== "retirementConfirmed")) throw fault("invalid_request", false);
+  return { retirementConfirmed: true };
+}
+
+async function remoteFreshContextContext(managerState, value) {
+  const wire = storeAuthority(value);
+  const configured = managerState.freshContextRootDirectory;
+  const rootDirectory = configured === undefined
+    ? join(absolutePath(process.env.JOKO_CLAUDE_RUNTIME_ROOT), "fresh-context")
+    : configured;
+  if (typeof rootDirectory !== "string" || rootDirectory.length === 0 || rootDirectory.includes("\0")
+    || !isAbsolute(rootDirectory) || resolve(rootDirectory) !== rootDirectory
+    || rootDirectory === managerState.sessionStoreRootDirectory) throw fault("store_unavailable", false);
+  if (configured === undefined) {
+    try { await mkdir(rootDirectory, { mode: 0o700 }); }
+    catch (error) { if (error?.code !== "EEXIST") throw fault("store_unavailable", false); }
+    try { await requirePrivateDirectory(rootDirectory); }
+    catch { throw fault("store_unavailable", false); }
+  }
+  const module = await loadFreshContextModule(managerState);
+  return { wire, owner: new module.ClaudeFreshContextOwner({ rootDirectory, namespace: wire.namespace, generation: wire.generation }) };
+}
+
+async function loadFreshContextModule(managerState) {
+  if (managerState.freshContextModule !== undefined) return managerState.freshContextModule;
+  if (managerState.freshContextModulePromise === undefined) {
+    managerState.freshContextModulePromise = (async () => {
+      if (FRESH_CONTEXT_MODULE_BASE64.length < 128 || FRESH_CONTEXT_MODULE_BASE64.includes("JOKO_EMBEDDED")
+        || !/^[A-Za-z0-9+/]+={0,2}$/u.test(FRESH_CONTEXT_MODULE_BASE64)) throw fault("store_unavailable", false);
+      try { return await import(`data:text/javascript;base64,${FRESH_CONTEXT_MODULE_BASE64}`); }
+      catch { throw fault("store_unavailable", false); }
+    })();
+  }
+  return await managerState.freshContextModulePromise;
 }
 
 async function storeOperation(connection, method, params) {
@@ -562,7 +648,7 @@ async function startQuery(connection, params) {
   const sessionId = uuid(params.sessionId);
   const ownerKey = ownerIdentity(params.ownerKey);
   const ownerGeneration = boundedString(params.ownerGeneration, "owner generation", 256);
-  const queue = new InputQueue();
+  const queue = new InputQueue((wasQueued) => beforeFreshInputConsumed(queryRecord, wasQueued));
   const abortController = new AbortController();
   const queryRecord = {
     state: managerState,
@@ -583,6 +669,9 @@ async function startQuery(connection, params) {
     processes: [],
     consumeLoop: undefined,
     sessionStore: undefined,
+    freshContextOwner: undefined,
+    freshContextClaim: undefined,
+    inputFailure: undefined,
     ended: false,
     retired: false,
     retiring: undefined
@@ -657,8 +746,10 @@ function queryInput(connection, params) {
   query.inputOrder.push(requestId);
   try { query.queue.push(message); }
   catch (error) {
-    query.inputs.delete(requestId);
-    query.inputOrder.pop();
+    if (error?.stateMayHaveChanged !== true) {
+      query.inputs.delete(requestId);
+      query.inputOrder.pop();
+    }
     throw error;
   }
   return { accepted: true };
@@ -746,15 +837,36 @@ async function retireExactQuery(query, timeoutMs) {
 
 async function pumpQuery(query) {
   try {
-    for await (const value of query.query) emitEvent(query, "message", value);
+    for await (const value of query.query) {
+      if (query.inputFailure !== undefined) break;
+      emitEvent(query, "message", value);
+    }
+    if (query.inputFailure !== undefined) return;
     query.ended = true;
     emitEvent(query, "end");
   } catch {
+    if (query.inputFailure !== undefined) return;
     query.ended = true;
     emitEvent(query, "fault", undefined, true);
   } finally {
     closeQueryStore(query);
     rememberTerminal(query);
+  }
+}
+
+function beforeFreshInputConsumed(query, wasQueued) {
+  if (query.freshContextOwner === undefined || query.freshContextClaim?.dispatch === "dispatching") return;
+  try { query.freshContextClaim = query.freshContextOwner.markDispatching(query.freshContextClaim); }
+  catch (error) {
+    const normalized = normalizeStoreFault(error);
+    const failure = fault(normalized.code, wasQueued || normalized.stateMayHaveChanged);
+    query.inputFailure = failure;
+    query.ended = true;
+    emitEvent(query, "fault", undefined, failure.stateMayHaveChanged);
+    try { query.query?.close(); } catch {}
+    query.abortController.abort();
+    rememberTerminal(query);
+    throw failure;
   }
 }
 
@@ -901,6 +1013,25 @@ async function queryOptions(value, query) {
   };
   if (options.additionalDirectories.length > 0) throw fault("remote_extra_directories_unsupported", false);
   if ((options.resume ?? options.sessionId) !== query.sessionId) throw fault("session_mismatch", false);
+  if (value.freshContextClaim !== undefined || value.freshContextAuthority !== undefined) {
+    if (value.freshContextClaim === undefined || value.freshContextAuthority === undefined
+      || value.sessionStoreAuthority !== undefined || value.sessionStoreAccess !== undefined) throw fault("invalid_store_access", false);
+    const claim = freshContextInput(value.freshContextClaim);
+    const context = await remoteFreshContextContext(query.state, value.freshContextAuthority);
+    if (!record(claim.binding) || claim.binding.nativeSessionId !== query.sessionId
+      || claim.binding.opaqueRef !== `claude-code:session:${query.sessionId}` || claim.workspaceRoot !== options.cwd
+      || claim.lifecycle !== "adopted" || claim.sourceRetired !== true || claim.backendGeneration !== context.wire.generation
+      || (claim.dispatch !== "never_dispatched" && claim.dispatch !== "dispatching")
+      || (options.sessionId !== undefined && (options.resume !== undefined || claim.dispatch !== "never_dispatched"))) {
+      throw fault("invalid_store_access", false);
+    }
+    let actual;
+    try { actual = context.owner.getForBinding(claim); }
+    catch (error) { throw normalizeStoreFault(error); }
+    if (!sameFreshContextClaim(actual, claim)) throw fault("invalid_store_access", false);
+    query.freshContextOwner = context.owner;
+    query.freshContextClaim = actual;
+  }
   if (value.sessionStoreAuthority !== undefined || value.sessionStoreAccess !== undefined) {
     if (value.sessionStoreAuthority === undefined || value.sessionStoreAccess === undefined) {
       throw fault("invalid_store_access", false);
@@ -915,6 +1046,14 @@ async function queryOptions(value, query) {
     options.sessionStore = sdkStoreBoundary(store, context.module.CLAUDE_SESSION_STORE_LIMITS.maximumBatchBytes);
   }
   return options;
+}
+
+function sameFreshContextClaim(actual, claim) {
+  return actual !== undefined && record(claim.sourceBinding)
+    && ["operationId", "sourceSessionId", "sessionId", "targetId", "workspaceAuthority", "workspaceRoot",
+      "backendGeneration", "lifecycle", "dispatch", "sourceRetired", "revision"].every((key) => actual[key] === claim[key])
+    && ["opaqueRef", "nativeSessionId", "generation"].every((key) => actual.binding[key] === claim.binding[key]
+      && actual.sourceBinding[key] === claim.sourceBinding[key]);
 }
 
 function createProductMcpServers(value, query) {

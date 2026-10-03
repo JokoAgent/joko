@@ -8,19 +8,21 @@ export interface TimelineViewportState {
   readonly following: boolean;
   readonly unreadCount: number;
   readonly knownItemIds: ReadonlySet<string>;
+  readonly knownUnreadItemIds: ReadonlySet<string>;
   readonly maximumSequence?: bigint;
 }
 
 /**
- * Ephemeral viewport memory. The session key is deliberately part of this
- * layer so virtualized Timeline remounts cannot leak scroll/follow state.
+ * Ephemeral viewport memory. The exact service/session generation key is
+ * supplied by the owner so remounts cannot leak scroll/follow state.
  */
 export class TimelineViewportStore {
   readonly #states = new Map<string, TimelineViewportState>();
 
-  restore(sessionId: string, items: readonly TimelineItemView[]): TimelineViewportState {
-    const stored = this.#states.get(sessionId);
+  restore(ownerKey: string, items: readonly TimelineItemView[]): TimelineViewportState {
+    const stored = this.#states.get(ownerKey);
     const currentIds = new Set(items.map((item) => item.id));
+    const currentUnreadIds = timelineUnreadItemIds(items);
     const currentMaximum = maximumTimelineSequence(items);
     if (stored === undefined) {
       const initial: TimelineViewportState = {
@@ -28,13 +30,14 @@ export class TimelineViewportStore {
         following: true,
         unreadCount: 0,
         knownItemIds: currentIds,
+        knownUnreadItemIds: currentUnreadIds,
         ...(currentMaximum === undefined ? {} : { maximumSequence: currentMaximum })
       };
-      this.#states.set(sessionId, initial);
+      this.#states.set(ownerKey, initial);
       return cloneTimelineViewportState(initial);
     }
 
-    const added = countUnreadTimelineItems(stored.knownItemIds, stored.maximumSequence, items, stored.following);
+    const added = countUnreadTimelineItems(stored.knownUnreadItemIds, stored.maximumSequence, items, stored.following);
     const maximumSequence = maximumBigInt(stored.maximumSequence, currentMaximum);
     const anchorItemId = stored.anchorItemId !== undefined && (items.length === 0 || currentIds.has(stored.anchorItemId))
       ? stored.anchorItemId
@@ -45,22 +48,24 @@ export class TimelineViewportStore {
       following: stored.following,
       unreadCount: stored.following ? 0 : stored.unreadCount + added,
       knownItemIds: currentIds,
+      knownUnreadItemIds: currentUnreadIds,
       ...(maximumSequence === undefined ? {} : { maximumSequence })
     };
-    this.#states.set(sessionId, restored);
+    this.#states.set(ownerKey, restored);
     return cloneTimelineViewportState(restored);
   }
 
-  save(sessionId: string, viewport: Pick<TimelineViewportState, "anchorItemId" | "anchorOffset" | "following" | "unreadCount">, items: readonly TimelineItemView[]): void {
-    const previous = this.#states.get(sessionId);
+  save(ownerKey: string, viewport: Pick<TimelineViewportState, "anchorItemId" | "anchorOffset" | "following" | "unreadCount">, items: readonly TimelineItemView[]): void {
+    const previous = this.#states.get(ownerKey);
     const currentMaximum = maximumTimelineSequence(items);
     const maximumSequence = maximumBigInt(previous?.maximumSequence, currentMaximum);
-    this.#states.set(sessionId, {
+    this.#states.set(ownerKey, {
       ...(viewport.anchorItemId === undefined ? {} : { anchorItemId: viewport.anchorItemId }),
       anchorOffset: viewport.anchorOffset,
       following: viewport.following,
       unreadCount: viewport.following ? 0 : viewport.unreadCount,
       knownItemIds: new Set(items.map((item) => item.id)),
+      knownUnreadItemIds: timelineUnreadItemIds(items),
       ...(maximumSequence === undefined ? {} : { maximumSequence })
     });
   }
@@ -147,8 +152,52 @@ export function countUnreadTimelineItems(
   items: readonly TimelineItemView[],
   following: boolean
 ): number {
-  if (following || previousMaximumSequence === undefined) return 0;
-  return items.reduce((count, item) => count + (!previousIds.has(item.id) && item.sequence > previousMaximumSequence ? 1 : 0), 0);
+  if (following || previousIds.size === 0 || previousMaximumSequence === undefined) return 0;
+  const messages: TimelineItemView[] = [];
+  const currentIds = new Set<string>();
+  for (const item of items) {
+    const id = timelineUnreadItemIdentity(item);
+    if (currentIds.has(id)) continue;
+    currentIds.add(id);
+    messages.push(item);
+  }
+  let lastSeenIndex = -1;
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const item = messages[index];
+    if (item !== undefined && previousIds.has(timelineUnreadItemIdentity(item))) {
+      lastSeenIndex = index;
+      break;
+    }
+  }
+  // An unrelated replacement window cannot establish which rows arrived at
+  // the live edge. Its contents become the next baseline without guessing.
+  if (lastSeenIndex < 0) return 0;
+  let added = 0;
+  for (let index = lastSeenIndex + 1; index < messages.length; index += 1) {
+    const item = messages[index];
+    if (item === undefined || item.sequence <= previousMaximumSequence || !isUnreadTimelineMessage(item)) continue;
+    const id = timelineUnreadItemIdentity(item);
+    if (!previousIds.has(id)) added += 1;
+  }
+  return added;
+}
+
+/** Logical message identities are independent of virtualized row anchors. */
+export function timelineUnreadItemIds(items: readonly TimelineItemView[]): ReadonlySet<string> {
+  return new Set(items.map(timelineUnreadItemIdentity));
+}
+
+function timelineUnreadItemIdentity(item: TimelineItemView): string {
+  if (item.kind === "assistant" || item.kind === "user") return JSON.stringify(["message", item.messageId ?? item.id]);
+  if (item.kind === "interaction" && item.interaction !== undefined) return JSON.stringify(["interaction", item.interaction.id]);
+  return JSON.stringify(["activity", item.id]);
+}
+
+function isUnreadTimelineMessage(item: TimelineItemView): boolean {
+  if (item.inlinePlan !== undefined || item.automaticContinuation !== undefined) return false;
+  if (item.kind === "assistant") return true;
+  if (item.kind === "user") return item.localUserInput !== true;
+  return item.kind === "interaction" && (item.interaction?.kind === "question" || item.interaction?.kind === "plan");
 }
 
 export function maximumTimelineSequence(items: readonly TimelineItemView[]): bigint | undefined {
@@ -179,7 +228,7 @@ export function mergeTimelineWindows(
 }
 
 function cloneTimelineViewportState(state: TimelineViewportState): TimelineViewportState {
-  return { ...state, knownItemIds: new Set(state.knownItemIds) };
+  return { ...state, knownItemIds: new Set(state.knownItemIds), knownUnreadItemIds: new Set(state.knownUnreadItemIds) };
 }
 
 function maximumBigInt(left: bigint | undefined, right: bigint | undefined): bigint | undefined {

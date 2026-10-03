@@ -21,7 +21,7 @@ export interface PiNativeHistoryEntry {
 
 export interface PiNativeSessionHistory {
   readonly entries: readonly PiNativeHistoryEntry[];
-  readonly leafId?: string;
+  readonly leafId?: string | null;
 }
 
 /** Translate Pi's native taxonomy before it crosses the Adapter boundary. */
@@ -59,8 +59,10 @@ export function projectPiNativeHistory(
       return {
         nativeEntryId: entry.id,
         ...(entry.parentId === undefined ? {} : { nativeParentEntryId: entry.parentId }),
-        ...(entry.parentId === undefined || projection.payload.type !== "message_complete" || projection.payload.role !== "user"
-          ? {} : { nativeRewindBefore: { kind: "native_entry" as const, entryId: entry.parentId } }),
+        ...(projection.payload.type !== "message_complete" || projection.payload.role !== "user"
+          ? {} : { nativeRewindBefore: entry.parentId === undefined
+            ? { kind: "session_start" as const }
+            : { kind: "native_entry" as const, entryId: entry.parentId } }),
         projectionKind: projection.kind,
         contentIndex: projection.contentIndex,
         ...(emittedAt === undefined ? {} : { emittedAt }),
@@ -75,13 +77,15 @@ export function projectPiNativeHistory(
   });
   return {
     events,
-    ...(history.leafId === undefined ? {} : { activeEntryId: history.leafId }),
-    ...(history.leafId === undefined ? {} : { activeNavigationTarget: { kind: "native_entry" as const, entryId: history.leafId } }),
+    ...(history.leafId == null ? {} : { activeEntryId: history.leafId }),
+    ...(history.leafId === undefined ? {} : { activeNavigationTarget: history.leafId === null
+      ? { kind: "session_start" as const }
+      : { kind: "native_entry" as const, entryId: history.leafId } }),
     activeLineage: entries.map((entry) => ({
       entryId: entry.id,
       ...(entry.parentId === undefined ? {} : { parentEntryId: entry.parentId })
     })),
-    activeEntryMetadata: activePiEntryMetadata(nativeSessionId, history.leafId)
+    activeEntryMetadata: activePiEntryMetadata(nativeSessionId, history.leafId ?? undefined)
   };
 }
 
@@ -101,13 +105,14 @@ function nativeProjectionPayload(payload: EventPayload, contentIndex: number): E
 
 function activeHistoryEntries(
   entries: readonly PiNativeHistoryEntry[],
-  leafId: string | undefined
+  leafId: string | null | undefined
 ): readonly PiNativeHistoryEntry[] {
   const byId = new Map<string, PiNativeHistoryEntry>();
   for (const entry of entries) {
     if (byId.has(entry.id)) throw new Error(`Native history contains duplicate entry ID '${entry.id}'.`);
     byId.set(entry.id, entry);
   }
+  if (leafId === null) return [];
   if (leafId === undefined) return entries;
   const leaf = byId.get(leafId);
   if (leaf === undefined) throw new Error(`Native history active leaf '${leafId}' was not returned by Pi.`);

@@ -1,5 +1,5 @@
 import { Check, Copy, Minus, Plus, X } from "lucide-react";
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type JSX, type RefObject } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type JSX, type PointerEvent as ReactPointerEvent, type RefObject } from "react";
 import { createPortal } from "react-dom";
 import { WORKSPACE_MERMAID_EDIT_EVENT, WORKSPACE_MERMAID_OPEN_EVENT, type WorkspaceMermaidEditDetail, type WorkspaceMermaidOpenDetail, type WorkspaceMermaidLifetime } from "./workspace-markdown-mermaid.js";
 import { copyMermaid, renderMermaidPng } from "./mermaid-image-export.js";
@@ -23,6 +23,33 @@ export interface WorkspaceMermaidHostLabels {
 }
 
 type WorkspaceMermaidEditShortcut = "apply" | "cancel" | undefined;
+
+interface MermaidViewport {
+  readonly scale: number;
+  readonly x: number;
+  readonly y: number;
+}
+
+interface MermaidPointer {
+  readonly x: number;
+  readonly y: number;
+  readonly type: string;
+}
+
+interface MermaidDragState {
+  readonly pointerId: number;
+  readonly startClientX: number;
+  readonly startClientY: number;
+  readonly startX: number;
+  readonly startY: number;
+}
+
+interface MermaidPinchState {
+  readonly ids: readonly [number, number];
+  readonly distance: number;
+  readonly center: { readonly x: number; readonly y: number };
+  readonly viewport: MermaidViewport;
+}
 
 /** The source editor treats an unchanged Cmd/Ctrl+Enter as cancel. */
 export function workspaceMermaidEditShortcutAction(
@@ -145,15 +172,27 @@ export function WorkspaceMermaidLightbox({ ownerKey, detail, labels, annotationL
   const [visible, setVisible] = useState(false);
   const [annotating, setAnnotating] = useState(false);
   const annotatingRef = useRef(false);
-  const [viewport, setViewport] = useState({ scale: 1, x: 0, y: 0 });
+  const [viewport, setViewport] = useState<MermaidViewport>({ scale: 1, x: 0, y: 0 });
   const viewportRef = useRef(viewport);
   const [dragging, setDragging] = useState(false);
-  const dragRef = useRef<{ readonly id: number; readonly x: number; readonly y: number; readonly viewportX: number; readonly viewportY: number } | undefined>(undefined);
+  const dragRef = useRef<MermaidDragState | undefined>(undefined);
+  const pointersRef = useRef(new Map<number, MermaidPointer>());
+  const pinchRef = useRef<MermaidPinchState | undefined>(undefined);
+  const backdropTapRef = useRef<{ readonly pointerId: number; readonly x: number; readonly y: number } | undefined>(undefined);
   const [wheeling, setWheeling] = useState(false);
   const timers = useRef<{ wheel?: number; close?: number }>({});
   const dialogRef = useRef<HTMLDivElement>(null);
   const stageRef = useRef<HTMLDivElement>(null);
   const cardRef = useRef<HTMLDivElement>(null);
+  const releasePointers = useCallback((): void => {
+    const stage = stageRef.current;
+    const pointerIds = [...pointersRef.current.keys()];
+    pointersRef.current.clear();
+    pinchRef.current = undefined;
+    dragRef.current = undefined;
+    backdropTapRef.current = undefined;
+    for (const pointerId of pointerIds) if (stage?.hasPointerCapture(pointerId)) stage.releasePointerCapture(pointerId);
+  }, []);
   useLayoutEffect(() => {
     const card = cardRef.current;
     if (card === null) return;
@@ -181,15 +220,18 @@ export function WorkspaceMermaidLightbox({ ownerKey, detail, labels, annotationL
     if (!current() || closingRef.current || ownerWindow == null) return;
     closingRef.current = true;
     copy.cancel();
+    releasePointers();
+    setDragging(false);
     setVisible(false);
     timers.current.close = ownerWindow.setTimeout(() => { if (current()) finish(true); }, ownerWindow.matchMedia("(prefers-reduced-motion: reduce)").matches ? 0 : 200);
-  }, [copy.cancel, current, finish, ownerWindow]);
+  }, [copy.cancel, current, finish, ownerWindow, releasePointers]);
 
   useLayoutEffect(() => {
     if (ownerWindow == null) return;
     scopeRef.current = scope;
     closingRef.current = false;
     annotatingRef.current = false;
+    releasePointers();
     setAnnotating(false); setVisible(false); setWheeling(false); setDragging(false);
     applyViewport({ scale: 1, x: 0, y: 0 });
     const dialog = dialogRef.current;
@@ -199,7 +241,7 @@ export function WorkspaceMermaidLightbox({ ownerKey, detail, labels, annotationL
       if (!current()) return;
       setVisible(true); dialog?.focus({ preventScroll: true });
     });
-    const retire = (): void => { if (scopeRef.current === scope) { copy.cancel(); finish(false); scopeRef.current = undefined; } };
+    const retire = (): void => { if (scopeRef.current === scope) { copy.cancel(); releasePointers(); finish(false); scopeRef.current = undefined; } };
     const keydown = (event: KeyboardEvent): void => {
       if (!current() || closingRef.current || annotatingRef.current || event.defaultPrevented || event.isComposing || dialog === null || !modalOwnsKeyboardEvent(event, dialog)) return;
       if (event.key === "Escape") { event.preventDefault(); event.stopImmediatePropagation(); close(); return; }
@@ -217,7 +259,7 @@ export function WorkspaceMermaidLightbox({ ownerKey, detail, labels, annotationL
     if (detail.signal.aborted || !detail.isCurrent()) retire();
     return () => {
       if (scopeRef.current === scope) scopeRef.current = undefined;
-      copy.cancel(); dragRef.current = undefined;
+      copy.cancel(); releasePointers();
       ownerWindow.cancelAnimationFrame(frame);
       if (timers.current.close !== undefined) ownerWindow.clearTimeout(timers.current.close);
       if (timers.current.wheel !== undefined) ownerWindow.clearTimeout(timers.current.wheel);
@@ -229,7 +271,7 @@ export function WorkspaceMermaidLightbox({ ownerKey, detail, labels, annotationL
       if (!others.some((element) => element.classList.contains("workspace-mermaid-lightbox"))) ownerDocument.body.classList.remove("workspace-mermaid-lightbox-open");
       releaseLock();
     };
-  }, [scope, detail, ownerDocument, ownerWindow, applyViewport, current, close, copy.cancel, finish]);
+  }, [scope, detail, ownerDocument, ownerWindow, applyViewport, current, close, copy.cancel, finish, releasePointers]);
 
   useEffect(() => {
     const stage = stageRef.current;
@@ -257,31 +299,109 @@ export function WorkspaceMermaidLightbox({ ownerKey, detail, labels, annotationL
     const value = viewportRef.current;
     applyViewport(mermaidZoomAt(value, { x: 0, y: 0 }, value.scale * factor));
   };
+  const beginDrag = (pointerId: number, point: MermaidPointer): void => {
+    const value = viewportRef.current;
+    dragRef.current = { pointerId, startClientX: point.x, startClientY: point.y, startX: value.x, startY: value.y };
+    setDragging(true);
+  };
+  const beginPinch = (): boolean => {
+    const touches = [...pointersRef.current].filter(([, point]) => point.type === "touch");
+    const first = touches[0];
+    const second = touches[1];
+    if (first === undefined || second === undefined) return false;
+    pinchRef.current = {
+      ids: [first[0], second[0]],
+      distance: Math.max(1, Math.hypot(first[1].x - second[1].x, first[1].y - second[1].y)),
+      center: { x: (first[1].x + second[1].x) / 2, y: (first[1].y + second[1].y) / 2 },
+      viewport: viewportRef.current
+    };
+    dragRef.current = undefined;
+    backdropTapRef.current = undefined;
+    setDragging(true);
+    return true;
+  };
+  const handlePointerDown = (event: ReactPointerEvent<HTMLDivElement>): void => {
+    if (event.button !== 0 || !current() || closingRef.current) return;
+    event.preventDefault();
+    const point: MermaidPointer = { x: event.clientX, y: event.clientY, type: event.pointerType };
+    const pointers = pointersRef.current;
+    if (pointers.size > 0) {
+      const activePointers = [...pointers.values()];
+      if (point.type !== "touch" || activePointers.some((active) => active.type !== "touch") || activePointers.length >= 2) return;
+      backdropTapRef.current = undefined;
+    } else {
+      const card = cardRef.current?.getBoundingClientRect();
+      const outsideCard = card === undefined || point.x < card.left || point.x > card.right || point.y < card.top || point.y > card.bottom;
+      backdropTapRef.current = outsideCard ? { pointerId: event.pointerId, x: point.x, y: point.y } : undefined;
+    }
+    pointers.set(event.pointerId, point);
+    event.currentTarget.setPointerCapture(event.pointerId);
+    if (!beginPinch()) beginDrag(event.pointerId, point);
+  };
+  const handlePointerMove = (event: ReactPointerEvent<HTMLDivElement>): void => {
+    if (!current() || closingRef.current) return;
+    const previous = pointersRef.current.get(event.pointerId);
+    if (previous === undefined) return;
+    const point = { ...previous, x: event.clientX, y: event.clientY };
+    pointersRef.current.set(event.pointerId, point);
+    const backdropTap = backdropTapRef.current;
+    if (backdropTap?.pointerId === event.pointerId && Math.hypot(point.x - backdropTap.x, point.y - backdropTap.y) > 3) backdropTapRef.current = undefined;
+    const pinch = pinchRef.current;
+    if (pinch !== undefined) {
+      if (!pinch.ids.includes(event.pointerId)) return;
+      const first = pointersRef.current.get(pinch.ids[0]);
+      const second = pointersRef.current.get(pinch.ids[1]);
+      const rect = stageRef.current?.getBoundingClientRect();
+      if (first === undefined || second === undefined || rect === undefined) return;
+      const center = { x: (first.x + second.x) / 2, y: (first.y + second.y) / 2 };
+      const scale = pinch.viewport.scale * Math.hypot(first.x - second.x, first.y - second.y) / pinch.distance;
+      const next = mermaidZoomAt(pinch.viewport, {
+        x: pinch.center.x - rect.left - rect.width / 2,
+        y: pinch.center.y - rect.top - rect.height / 2
+      }, scale);
+      applyViewport({ ...next, x: next.x + center.x - pinch.center.x, y: next.y + center.y - pinch.center.y });
+      return;
+    }
+    const drag = dragRef.current;
+    if (drag === undefined || drag.pointerId !== event.pointerId) return;
+    applyViewport({ ...viewportRef.current, x: drag.startX + point.x - drag.startClientX, y: drag.startY + point.y - drag.startClientY });
+  };
+  const handlePointerEnd = (event: ReactPointerEvent<HTMLDivElement>): void => {
+    if (!pointersRef.current.delete(event.pointerId)) return;
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
+    const closeFromBackdrop = backdropTapRef.current?.pointerId === event.pointerId;
+    if (closeFromBackdrop) backdropTapRef.current = undefined;
+    if (pinchRef.current?.ids.includes(event.pointerId)) {
+      pinchRef.current = undefined;
+      if (beginPinch()) return;
+      const remaining = [...pointersRef.current][0];
+      if (remaining !== undefined) {
+        beginDrag(remaining[0], remaining[1]);
+        return;
+      }
+    }
+    if (dragRef.current?.pointerId === event.pointerId) dragRef.current = undefined;
+    if (pointersRef.current.size === 0) setDragging(false);
+    if (closeFromBackdrop) close();
+  };
+  const cancelPointers = (event: ReactPointerEvent<HTMLDivElement>): void => {
+    if (!pointersRef.current.has(event.pointerId)) return;
+    releasePointers();
+    setDragging(false);
+  };
   if (ownerWindow == null) return null;
   return createPortal(<div ref={dialogRef} className={`workspace-mermaid-lightbox${visible ? " is-visible" : ""}`} role="dialog" aria-modal={!annotating} aria-label={labels.close} tabIndex={-1}
     style={annotating ? { display: "none" } : undefined} aria-hidden={annotating}
   >
     <div ref={stageRef} className={`workspace-mermaid-lightbox__stage${dragging ? " is-dragging" : ""}`}
-      onPointerDown={(event) => {
-        if (event.button !== 0 || !current() || closingRef.current) return;
-        event.preventDefault();
-        const value = viewportRef.current;
-        dragRef.current = { id: event.pointerId, x: event.clientX, y: event.clientY, viewportX: value.x, viewportY: value.y };
-        event.currentTarget.setPointerCapture(event.pointerId); setDragging(true);
+      onPointerDown={handlePointerDown}
+      onPointerMove={handlePointerMove}
+      onPointerUp={handlePointerEnd}
+      onPointerCancel={cancelPointers}
+      onLostPointerCapture={cancelPointers}
+      onDoubleClick={() => {
+        if (current() && !closingRef.current && pinchRef.current === undefined && pointersRef.current.size === 0) applyViewport({ scale: 1, x: 0, y: 0 });
       }}
-      onPointerMove={(event) => {
-        const drag = dragRef.current;
-        if (drag === undefined || drag.id !== event.pointerId || !current()) return;
-        applyViewport({ ...viewportRef.current, x: drag.viewportX + event.clientX - drag.x, y: drag.viewportY + event.clientY - drag.y });
-      }}
-      onPointerUp={(event) => {
-        if (dragRef.current?.id !== event.pointerId) return;
-        dragRef.current = undefined; setDragging(false);
-        if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
-      }}
-      onPointerCancel={() => { dragRef.current = undefined; setDragging(false); }}
-      onLostPointerCapture={() => { dragRef.current = undefined; setDragging(false); }}
-      onDoubleClick={() => { if (current()) applyViewport({ scale: 1, x: 0, y: 0 }); }}
     >
       <div ref={cardRef} className="workspace-mermaid-lightbox__card" style={{
         transform: `translate(${viewport.x}px, ${viewport.y}px) scale(${viewport.scale})`,
@@ -295,7 +415,7 @@ export function WorkspaceMermaidLightbox({ ownerKey, detail, labels, annotationL
       <i aria-hidden="true" />
       {onSendToChat !== undefined && <GeneratedImageAnnotationButton ownerKey={ownerKey} sourceKey={sourceKey} ownerDocument={ownerDocument}
         name="diagram.png" labels={annotationLabels} onSendToChat={onSendToChat}
-        onPreviewOpen={() => { if (current()) { copy.cancel(); annotatingRef.current = true; setAnnotating(true); } }}
+        onPreviewOpen={() => { if (current()) { copy.cancel(); releasePointers(); setDragging(false); annotatingRef.current = true; setAnnotating(true); } }}
         onPreviewClose={() => finish(true)}
         buildImage={async (context) => {
           const card = cardRef.current;

@@ -188,6 +188,7 @@ describe("timeline reference content", () => {
     const show = () => { link().focus(); key("ContextMenu"); };
     const copy = () => act(() => {
       const button = doc.querySelector<HTMLButtonElement>('[role="menuitem"]:last-of-type')!;
+      button.focus();
       button.click(); button.click();
     });
     render(); show();
@@ -200,6 +201,16 @@ describe("timeline reference content", () => {
     show(); copy();
     expect(writeText).toHaveBeenCalledExactlyOnceWith("https://example.test/docs");
     expect(doc.querySelector('[role="status"]')?.textContent).toBe("timeline.linkCopying");
+    const copyButton = doc.querySelector<HTMLButtonElement>('[role="menuitem"]:last-of-type')!;
+    expect(doc.activeElement).toBe(copyButton);
+    expect(copyButton.disabled).toBe(false);
+    expect(copyButton.getAttribute("aria-disabled")).toBe("true");
+    act(() => doc.querySelector<HTMLButtonElement>('[role="menuitem"]')!.click());
+    expect(open).not.toHaveBeenCalled();
+    key("Escape"); expect(menu()).toBeNull(); expect(doc.activeElement).toBe(link());
+    await act(async () => pending.shift()!());
+    expect(doc.querySelector('[role="status"]')).toBeNull();
+    show(); copy();
     render("https://example.test/docs", "profile", "edited");
     render();
     expect(menu()).toBeNull();
@@ -265,6 +276,27 @@ describe("timeline reference content", () => {
     expect(document.querySelector("img")?.getAttribute("src")).toBe("blob:second");
     act(() => root.render(null));
     expect(releaseSecond).toHaveBeenCalledTimes(1);
+  });
+
+  it("retires an acquired workspace image lease and exposes a stable fallback after decode failure", async () => {
+    const release = vi.fn();
+    const mounted = mount(<TimelineMarkdownImage
+      src="broken.png"
+      alt="Broken preview"
+      actions={{ ownerKey: "profile", sessionId: "task", t, onLoadWorkspaceAsset: async () => ({ path: "broken.png", name: "broken.png", url: "blob:broken", release }) }}
+      t={t}
+    />);
+    await act(async () => undefined);
+    const image = mounted.host.querySelector<HTMLImageElement>("img")!;
+
+    act(() => image.dispatchEvent(new Event("error", { bubbles: true })));
+
+    expect(release).toHaveBeenCalledTimes(1);
+    expect(mounted.host.querySelector("img")).toBeNull();
+    expect(mounted.host.textContent).toContain("workspace.imageUnavailable: Broken preview");
+    expect(mounted.host.querySelector("[data-rendered-share-content-pending]")).toBeNull();
+    act(() => mounted.root.render(null));
+    expect(release).toHaveBeenCalledTimes(1);
   });
 
   it("previews complete workspace SVG text through the task owner and revokes each URL once across StrictMode and owner changes", async () => {
@@ -362,7 +394,7 @@ function assetController(read: AppController["readWorkspaceFile"], acquire: AppC
     discoveredNodes: [], discoveryState: "idle", managedOrchestratorStatus: undefined, automaticConnectionAvailable: false,
     snapshot: emptySnapshot(), route: { kind: "session", sessionId: "session" }, preferences: DEFAULT_UI_PREFERENCES, extensionNotifications: []
   };
-  return { read: readWorkspaceFile, acquire: getArtifactUrl, release: releaseArtifactUrl, value: { state, readWorkspaceFile, getArtifactUrl, releaseArtifactUrl } as unknown as AppController };
+  return { read: readWorkspaceFile, acquire: getArtifactUrl, release: releaseArtifactUrl, value: { state, readWorkspaceFile, getArtifactUrl, releaseArtifactUrl, getPortableReplacementCleanup: async () => undefined } as unknown as AppController };
 }
 
 async function mountAssetPane(initial: AppController, initialPath: string, strict = false) {

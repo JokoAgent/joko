@@ -2,7 +2,7 @@ import { createContext, isValidElement, memo, useCallback, useContext, useEffect
 import type { ComponentProps, CSSProperties, JSX, ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { assertBrowserActionCurrent, type BrowserActionContext, type HttpLinkOpenOptions } from "../browser-action.js";
-import { useVirtualizer } from "@tanstack/react-virtual";
+import { defaultRangeExtractor, useVirtualizer } from "@tanstack/react-virtual";
 import {
   AlertCircle,
   ArrowRight,
@@ -60,11 +60,14 @@ import { SelectionQuoteChip } from "./SelectionQuoteChip.js";
 import { SentPastedTextInline } from "./SentPastedTextInline.js";
 import { buildSentPastedTextMessageSegments, projectSentPastedTextMessageBody } from "./sent-pasted-text.js";
 import { messageDialogueRewindTarget } from "./message-rewind-behavior.js";
-import { ShareMessageImageEmptyError, ShareMessageImageTooLargeError, buildShareMessageImagePng, deliverShareMessageImage, shareMessageImageFilename } from "./share-message-image.js";
+import { shareSelectionPinnedRenderIndexes } from "./share-selection-behavior.js";
+import { ShareMessageImageEmptyError, ShareMessageImageTooLargeError, deliverShareMessageImage, shareMessageImageFilename } from "./share-message-image.js";
+import { MAXIMUM_RENDERED_SHARE_MESSAGES, ShareRenderedMessageImageUnavailableError, ShareRenderedMessageNotMountedError, buildRenderedShareMessageImagePng, queryRenderedShareMessageIds } from "./share-rendered-message-image.js";
+import { RENDERED_SHARE_CONTENT_PENDING_ATTRIBUTE, RENDERED_SHARE_EXCLUDE_ATTRIBUTE, RENDERED_SHARE_MESSAGE_ATTRIBUTE, RenderedShareSelectionContext, useRenderedShareSelection } from "./rendered-share-dom.js";
 import { projectInlinePlanTimeline, projectPinnedPlan } from "./pinned-plan-behavior.js";
 import { collectTimelineGalleryImages, moveTimelineGalleryIndex, timelineArtifactGalleryId, timelineMessageAttachmentGalleryId, type TimelineGalleryImage } from "./timeline-image-gallery.js";
 import { findTimelineRenderItemIndex, insertTimelineDerivationOrigin, projectTimelineRenderItems, timelineRenderChildIndex, type TimelineRenderItem, type TimelineWorkRenderItem } from "./timeline-render-items.js";
-import { TimelineViewportStore, countUnreadTimelineItems, maximumTimelineSequence, repairStreamingMarkdown, resolveTimelineFollowingOnScroll, resolveTimelineResizeScrollTop, shouldLoadEarlierTimeline, streamingMarkdownRenderValue, streamingMarkdownThrottleDelay, timelineJumpBehavior, type TimelineViewportState } from "./timeline-behavior.js";
+import { TimelineViewportStore, countUnreadTimelineItems, maximumTimelineSequence, repairStreamingMarkdown, resolveTimelineFollowingOnScroll, resolveTimelineResizeScrollTop, shouldLoadEarlierTimeline, streamingMarkdownRenderValue, streamingMarkdownThrottleDelay, timelineJumpBehavior, timelineUnreadItemIds, type TimelineViewportState } from "./timeline-behavior.js";
 import type { Translator } from "./types.js";
 import { Button, IconButton, Modal, Pill, Spinner, Tip, TipSummary, cx, formatBytes, formatDateTime } from "./ui.js";
 import { UserMessageEditBox } from "./UserMessageEditBox.js";
@@ -98,8 +101,13 @@ import { useAppInputTimelineOwner } from "../app-input-owners.js";
 import {
   TIMELINE_HISTORY_NAVIGATION_KEYS,
   TIMELINE_TOUCH_UP_INTENT_THRESHOLD_PX,
+  hasNestedTimelineScrollerThatCanMoveDown,
   hasNestedTimelineScrollerThatCanMoveUp,
   isEditableTimelineKeyboardTarget,
+  isTimelineVerticalScrollbarPress,
+  shouldRepinTimelineOnDownIntent,
+  shouldRepinTimelineOnWheel,
+  shouldUnpinTimelineOnScrollbarDrag,
   shouldUnpinTimelineOnUpIntent,
   shouldUnpinTimelineOnWheel
 } from "./timeline-follow-intent.js";
@@ -183,8 +191,9 @@ export interface TimelineShareSelection {
   readonly selectedIds: ReadonlySet<string>;
 }
 
-export function Timeline({ ownerKey, sessionId, sessionName, workspaceId, onReadArtifact, items, sessionActive, derivationOrigin, sessionCreatedAt, onOpenDerivationOrigin, messageNavRailEnabled, streamFadeEnabled, onOpenHttpLink, onOpenWorkspaceHtml, onLoadWorkspaceAsset, onWorkspaceImageToComposer, subagentRuns, subagentRunDetails, onOpenSubagent, onStopSubagent, onGetPartnerDelegation, onCancelPartnerDelegation, onOpenPartnerSession, hasEarlier, historyLoading, historyError, onLoadEarlier, followLatestSignal = 0, focusRequest, bottomInset = 0, retryRunId, locale, t, onRetry, onRecovery, recoveryContext, onArtifactUrl, onArtifactUrlRelease, onArtifactDownload, onWorkspaceRewind, onOpenGeneratedFile, onOpenTurnReview, onReobserveReview, onAddMessageToComposer, onAddSelectionToComposer, onForkMessage, forkingMessageId, shareSelection, onStartShareSelection, onToggleShareMessage, editableMessageId, onMoveEditedMessageToComposer, onPreviewMessageRewind, rewindToStartSupported, onDeleteMessage, messageDeleteBlockedReason, messageActionResetSignal, onInlinePlanVisibilityChange }: {
+export function Timeline({ ownerKey, viewportOwnerKey, sessionId, sessionName, workspaceId, onReadArtifact, items, sessionActive, derivationOrigin, sessionCreatedAt, onOpenDerivationOrigin, messageNavRailEnabled, streamFadeEnabled, onOpenHttpLink, onOpenWorkspaceHtml, onLoadWorkspaceAsset, onWorkspaceImageToComposer, subagentRuns, subagentRunDetails, onOpenSubagent, onStopSubagent, onGetPartnerDelegation, onCancelPartnerDelegation, onOpenPartnerSession, hasEarlier, historyLoading, historyError, onLoadEarlier, followLatestSignal = 0, focusRequest, bottomInset = 0, retryRunId, locale, t, onRetry, onRecovery, recoveryContext, onArtifactUrl, onArtifactUrlRelease, onArtifactDownload, onWorkspaceRewind, onOpenGeneratedFile, onOpenTurnReview, onReobserveReview, onAddMessageToComposer, onAddSelectionToComposer, onForkMessage, forkingMessageId, shareSelection, onStartShareSelection, onToggleShareMessage, editableMessageId, onMoveEditedMessageToComposer, onPreviewMessageRewind, rewindToStartSupported, onDeleteMessage, messageDeleteBlockedReason, messageActionResetSignal, onInlinePlanVisibilityChange, onRootChange }: {
   readonly ownerKey: string;
+  readonly viewportOwnerKey: string;
   readonly sessionId: string;
   readonly sessionName: string;
   readonly workspaceId?: string;
@@ -241,6 +250,7 @@ export function Timeline({ ownerKey, sessionId, sessionName, workspaceId, onRead
   readonly messageDeleteBlockedReason?: string;
   readonly messageActionResetSignal?: number;
   readonly onInlinePlanVisibilityChange?: (visibility: InlinePlanVisibility | null) => void;
+  readonly onRootChange?: (root: HTMLDivElement | null) => void;
 }): JSX.Element {
   const planTimelineItems = useMemo(() => projectInlinePlanTimeline(items), [items]);
   const currentPlan = useMemo(() => projectPinnedPlan(items), [items]);
@@ -274,30 +284,73 @@ export function Timeline({ ownerKey, sessionId, sessionName, workspaceId, onRead
     setOpenGallery({ imageId, trigger });
   }, []);
   const galleryContext = useMemo<TimelineImageGalleryContextValue>(() => ({ open: openGalleryImage }), [openGalleryImage]);
-  const restoredViewportRef = useRef<TimelineViewportState | undefined>(undefined);
-  if (restoredViewportRef.current === undefined) restoredViewportRef.current = timelineViewports.restore(sessionId, items);
-  const restoredViewport = restoredViewportRef.current;
+  const restoredViewportRef = useRef<{ readonly ownerKey: string; readonly viewport: TimelineViewportState } | undefined>(undefined);
+  if (restoredViewportRef.current?.ownerKey !== viewportOwnerKey) {
+    restoredViewportRef.current = { ownerKey: viewportOwnerKey, viewport: timelineViewports.restore(viewportOwnerKey, items) };
+  }
+  const restoredViewport = restoredViewportRef.current.viewport;
+  const viewportOwnerRef = useRef(viewportOwnerKey);
   const scrollRef = useRef<HTMLDivElement>(null);
+  const bindScrollRoot = useCallback((root: HTMLDivElement | null): void => {
+    scrollRef.current = root;
+    onRootChange?.(root);
+  }, [onRootChange]);
   const contentRef = useRef<HTMLDivElement>(null);
-  const previousMessageJump = usePreviousUserMessageJump({ scrollRef, userMessageIds, resetKey: sessionId });
-  const [following, setFollowing] = useState(restoredViewport.following);
-  const [unreadCount, setUnreadCount] = useState(restoredViewport.unreadCount);
+  const previousMessageJump = usePreviousUserMessageJump({ scrollRef, userMessageIds, resetKey: viewportOwnerKey });
+  const [followingState, setFollowingState] = useState({ ownerKey: viewportOwnerKey, value: restoredViewport.following });
+  const [unreadState, setUnreadState] = useState({ ownerKey: viewportOwnerKey, value: restoredViewport.unreadCount });
+  const following = followingState.ownerKey === viewportOwnerKey ? followingState.value : restoredViewport.following;
+  const unreadCount = unreadState.ownerKey === viewportOwnerKey ? unreadState.value : restoredViewport.unreadCount;
+  const setFollowing = useCallback((value: boolean): void => {
+    if (viewportOwnerRef.current === viewportOwnerKey) setFollowingState({ ownerKey: viewportOwnerKey, value });
+  }, [viewportOwnerKey]);
+  const setUnreadCount = useCallback((value: number): void => {
+    if (viewportOwnerRef.current === viewportOwnerKey) setUnreadState({ ownerKey: viewportOwnerKey, value });
+  }, [viewportOwnerKey]);
   const [focusedItemId, setFocusedItemId] = useState<string>();
   const [nearHistoryStart, setNearHistoryStart] = useState(true);
   const followingRef = useRef(restoredViewport.following);
   const unreadCountRef = useRef(restoredViewport.unreadCount);
-  const knownItemIdsRef = useRef<ReadonlySet<string>>(restoredViewport.knownItemIds);
+  const knownUnreadItemIdsRef = useRef<ReadonlySet<string>>(restoredViewport.knownUnreadItemIds);
   const maximumSequenceRef = useRef<bigint | undefined>(restoredViewport.maximumSequence);
   const viewportAnchorRef = useRef<{ readonly itemId: string; readonly offset: number } | undefined>(restoredViewport.anchorItemId === undefined ? undefined : { itemId: restoredViewport.anchorItemId, offset: restoredViewport.anchorOffset });
   const restoreAnchorRef = useRef<{ readonly itemId: string; readonly offset: number } | undefined>(restoredViewport.following || restoredViewport.anchorItemId === undefined ? undefined : { itemId: restoredViewport.anchorItemId, offset: restoredViewport.anchorOffset });
   const itemsRef = useRef(items);
   itemsRef.current = items;
+  if (viewportOwnerRef.current !== viewportOwnerKey) {
+    viewportOwnerRef.current = viewportOwnerKey;
+    followingRef.current = restoredViewport.following;
+    unreadCountRef.current = restoredViewport.unreadCount;
+    knownUnreadItemIdsRef.current = restoredViewport.knownUnreadItemIds;
+    maximumSequenceRef.current = restoredViewport.maximumSequence;
+    viewportAnchorRef.current = restoredViewport.anchorItemId === undefined ? undefined : { itemId: restoredViewport.anchorItemId, offset: restoredViewport.anchorOffset };
+    restoreAnchorRef.current = restoredViewport.following ? undefined : viewportAnchorRef.current;
+  }
   const followLatestSignalRef = useRef(followLatestSignal);
   const previousScrollTopRef = useRef(0);
   const programmaticScrollUntilRef = useRef(0);
   const touchYRef = useRef<number | undefined>(undefined);
   const handledFocusRequestRef = useRef<number | undefined>(undefined);
   const focusTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const activeFocusRequestRef = useRef<typeof focusRequest>(undefined);
+  const navigationGenerationRef = useRef(0);
+  const navigationFrameRef = useRef<number | undefined>(undefined);
+  const viewportFrameRef = useRef<number | undefined>(undefined);
+  const scrollbarDragRef = useRef<{
+    readonly owner: { readonly ownerKey: string; readonly sessionId: string };
+    readonly node: HTMLDivElement;
+    readonly startScrollTop: number;
+    previousScrollTop: number;
+  } | undefined>(undefined);
+  const navigationOwnerRef = useRef({ ownerKey, sessionId });
+  if (navigationOwnerRef.current.ownerKey !== ownerKey || navigationOwnerRef.current.sessionId !== sessionId) {
+    navigationOwnerRef.current = { ownerKey, sessionId };
+    touchYRef.current = undefined;
+    scrollbarDragRef.current = undefined;
+  }
+  const focusRequestRef = useRef(focusRequest);
+  focusRequestRef.current = focusRequest;
+  const navigationDocumentActiveRef = useRef(true);
   const loadEarlierInFlightRef = useRef(false);
   const reducedMotion = usePrefersReducedMotion();
   const personalizationContext = useMemo<TimelinePersonalizationContextValue>(() => ({
@@ -323,13 +376,29 @@ export function Timeline({ ownerKey, sessionId, sessionName, workspaceId, onRead
     ...(onCancelPartnerDelegation === undefined ? {} : { cancel: onCancelPartnerDelegation }),
     ...(onOpenPartnerSession === undefined ? {} : { openSession: onOpenPartnerSession })
   }), [onCancelPartnerDelegation, onGetPartnerDelegation, onOpenPartnerSession]);
+  const pinnedShareRows = useMemo(() => {
+    if (shareSelection === undefined) return [];
+    return shareSelectionPinnedRenderIndexes(shareSelection.selectedIds, renderIndexByChildId, MAXIMUM_RENDERED_SHARE_MESSAGES);
+  }, [renderIndexByChildId, shareSelection]);
+  const extractTimelineRange = useCallback((range: Parameters<typeof defaultRangeExtractor>[0]): number[] => {
+    if (pinnedShareRows.length === 0) return defaultRangeExtractor(range);
+    return [...new Set([...defaultRangeExtractor(range), ...pinnedShareRows])].sort((left, right) => left - right);
+  }, [pinnedShareRows]);
   const virtualizer = useVirtualizer({
     count: renderItems.length,
     getScrollElement: () => scrollRef.current,
     estimateSize: (index) => estimateRenderHeight(renderItems[index]),
     overscan: 8,
-    getItemKey: (index) => renderItems[index]?.key ?? index
+    getItemKey: (index) => renderItems[index]?.key ?? index,
+    rangeExtractor: extractTimelineRange
   });
+  const positionVirtualRow = useCallback((index: number, align: "start" | "center"): void => {
+    if (!navigationDocumentActiveRef.current) return;
+    const offset = virtualizer.getOffsetForIndex(index, align)?.[0];
+    // Timeline owns subsequent alignment and cancellation; the virtualizer's
+    // scrollToIndex retries can otherwise outlive the original navigation.
+    if (offset !== undefined) virtualizer.scrollToOffset(offset, { behavior: "auto" });
+  }, [virtualizer]);
   const lastItem = items.at(-1);
   const virtualRows = virtualizer.getVirtualItems();
   const renderedRowsKey = virtualRows.map((row) => row.key).join("\u0000");
@@ -454,30 +523,97 @@ export function Timeline({ ownerKey, sessionId, sessionName, workspaceId, onRead
   }, [hasEarlier, historyError, historyLoading, messageNavEntries.length, messageNavRailEnabled, requestEarlier, sessionId]);
 
   const saveViewport = useCallback((nextFollowing = followingRef.current, nextUnreadCount = unreadCountRef.current): void => {
+    if (viewportOwnerRef.current !== viewportOwnerKey) return;
     const currentItems = itemsRef.current;
-    const added = countUnreadTimelineItems(knownItemIdsRef.current, maximumSequenceRef.current, currentItems, nextFollowing);
-    knownItemIdsRef.current = new Set(currentItems.map((item) => item.id));
+    const added = countUnreadTimelineItems(knownUnreadItemIdsRef.current, maximumSequenceRef.current, currentItems, nextFollowing);
+    knownUnreadItemIdsRef.current = timelineUnreadItemIds(currentItems);
     const currentMaximum = maximumTimelineSequence(currentItems);
     if (currentMaximum !== undefined && (maximumSequenceRef.current === undefined || currentMaximum > maximumSequenceRef.current)) maximumSequenceRef.current = currentMaximum;
     const reconciledUnreadCount = nextFollowing ? 0 : nextUnreadCount + added;
     unreadCountRef.current = reconciledUnreadCount;
     const anchor = restoreAnchorRef.current ?? viewportAnchorRef.current;
-    timelineViewports.save(sessionId, {
+    timelineViewports.save(viewportOwnerKey, {
       ...(anchor === undefined ? {} : { anchorItemId: anchor.itemId }),
       anchorOffset: anchor?.offset ?? 0,
       following: nextFollowing,
       unreadCount: reconciledUnreadCount
     }, currentItems);
-  }, [sessionId]);
+  }, [viewportOwnerKey]);
 
   const writeScrollTop = useCallback((top: number, behavior: ScrollBehavior = "auto"): void => {
     const node = scrollRef.current;
-    if (node === null) return;
+    if (node === null || !navigationDocumentActiveRef.current) return;
     programmaticScrollUntilRef.current = performance.now() + (behavior === "smooth" ? 500 : 50);
     node.scrollTo({ top, behavior });
     previousScrollTopRef.current = node.scrollTop;
-    requestAnimationFrame(captureViewportAnchor);
+    if (viewportFrameRef.current !== undefined) cancelAnimationFrame(viewportFrameRef.current);
+    const owner = navigationOwnerRef.current;
+    const generation = navigationGenerationRef.current;
+    viewportFrameRef.current = requestAnimationFrame(() => {
+      if (!navigationDocumentActiveRef.current || navigationOwnerRef.current !== owner || navigationGenerationRef.current !== generation) return;
+      viewportFrameRef.current = undefined;
+      // A virtual-row estimate can still settle after this frame. Keep the
+      // durable reading anchor until measurement has corrected its offset.
+      if (followingRef.current || viewportAnchorRef.current === undefined) captureViewportAnchor();
+    });
   }, [captureViewportAnchor]);
+
+  const cancelTimelineNavigation = useCallback((retireCurrentFocus = true): void => {
+    navigationGenerationRef.current += 1;
+    const focus = retireCurrentFocus ? focusRequestRef.current : undefined;
+    if (focus !== undefined) handledFocusRequestRef.current = focus.requestId;
+    activeFocusRequestRef.current = undefined;
+    if (navigationFrameRef.current !== undefined) {
+      cancelAnimationFrame(navigationFrameRef.current);
+      navigationFrameRef.current = undefined;
+    }
+    if (viewportFrameRef.current !== undefined) {
+      cancelAnimationFrame(viewportFrameRef.current);
+      viewportFrameRef.current = undefined;
+    }
+    if (focusTimerRef.current !== undefined) {
+      clearTimeout(focusTimerRef.current);
+      focusTimerRef.current = undefined;
+    }
+    const node = scrollRef.current;
+    if (node !== null && performance.now() < programmaticScrollUntilRef.current) {
+      node.scrollTo({ top: node.scrollTop, behavior: "auto" });
+    }
+    programmaticScrollUntilRef.current = 0;
+  }, []);
+
+  useLayoutEffect(() => {
+    const owner = navigationOwnerRef.current;
+    return () => {
+      if (navigationOwnerRef.current !== owner) {
+        const focus = activeFocusRequestRef.current;
+        if (focus !== undefined) handledFocusRequestRef.current = focus.requestId;
+        setFocusedItemId(undefined);
+      }
+      touchYRef.current = undefined;
+      cancelTimelineNavigation(false);
+    };
+  }, [cancelTimelineNavigation, ownerKey, sessionId]);
+
+  useEffect(() => {
+    const view = scrollRef.current?.ownerDocument.defaultView;
+    if (view === null || view === undefined) return;
+    const onPageHide = (): void => {
+      navigationDocumentActiveRef.current = false;
+      touchYRef.current = undefined;
+      cancelTimelineNavigation();
+      setFocusedItemId(undefined);
+    };
+    const onPageShow = (): void => { navigationDocumentActiveRef.current = true; };
+    view.addEventListener("pagehide", onPageHide);
+    view.addEventListener("pageshow", onPageShow);
+    return () => {
+      view.removeEventListener("pagehide", onPageHide);
+      view.removeEventListener("pageshow", onPageShow);
+      touchYRef.current = undefined;
+      cancelTimelineNavigation(false);
+    };
+  }, [cancelTimelineNavigation]);
 
   const setTimelineFollowing = useCallback((next: boolean): void => {
     followingRef.current = next;
@@ -487,35 +623,44 @@ export function Timeline({ ownerKey, sessionId, sessionName, workspaceId, onRead
       setUnreadCount(0);
     }
     saveViewport(next, next ? 0 : unreadCountRef.current);
-  }, [saveViewport]);
+  }, [saveViewport, setFollowing, setUnreadCount]);
 
   const jumpToMessageNavEntry = useCallback((itemId: string): void => {
     const node = scrollRef.current;
-    if (node === null) return;
+    if (node === null || !navigationDocumentActiveRef.current) return;
     const index = findTimelineRenderItemIndex(renderItems, itemId);
     if (index < 0) return;
+    cancelTimelineNavigation();
+    setFocusedItemId(undefined);
+    const generation = navigationGenerationRef.current;
+    const owner = navigationOwnerRef.current;
     restoreAnchorRef.current = undefined;
     setTimelineFollowing(false);
     programmaticScrollUntilRef.current = performance.now() + 650;
-    virtualizer.scrollToIndex(index, { align: "start" });
+    positionVirtualRow(index, "start");
     let attempts = 0;
     const align = (): void => {
+      if (!navigationDocumentActiveRef.current || navigationOwnerRef.current !== owner || navigationGenerationRef.current !== generation) return;
+      navigationFrameRef.current = undefined;
       const current = scrollRef.current;
-      if (current === null) return;
+      if (current !== node || !itemsRef.current.some((item) => item.id === itemId)) return;
       const anchor = [...current.querySelectorAll<HTMLElement>("[data-message-client-id]")]
         .find((candidate) => candidate.dataset.messageClientId === itemId);
       if (anchor === undefined && attempts < 2) {
         attempts += 1;
-        requestAnimationFrame(align);
+        navigationFrameRef.current = requestAnimationFrame(align);
         return;
       }
       if (anchor === undefined) return;
-      const nextScrollTop = Math.max(0, current.scrollTop + anchor.getBoundingClientRect().top - current.getBoundingClientRect().top - 12);
+      const anchorRect = anchor.getBoundingClientRect();
+      const row = anchor.closest<HTMLElement>(".timeline__row");
+      const rowOffset = 12 + (row?.getBoundingClientRect().top ?? anchorRect.top) - anchorRect.top;
+      const nextScrollTop = Math.max(0, current.scrollTop + anchorRect.top - current.getBoundingClientRect().top - 12);
       writeScrollTop(nextScrollTop, timelineJumpBehavior(reducedMotion));
-      viewportAnchorRef.current = { itemId, offset: 12 };
+      viewportAnchorRef.current = { itemId: row?.dataset.timelineItemId ?? itemId, offset: rowOffset };
     };
-    requestAnimationFrame(align);
-  }, [reducedMotion, renderItems, setTimelineFollowing, virtualizer, writeScrollTop]);
+    navigationFrameRef.current = requestAnimationFrame(align);
+  }, [cancelTimelineNavigation, positionVirtualRow, reducedMotion, renderItems, setTimelineFollowing, writeScrollTop]);
   const previousMessageEntry = previousMessageJump.displayId === null
     ? undefined
     : messageNavEntries.find((entry) => entry.id === previousMessageJump.displayId);
@@ -529,6 +674,8 @@ export function Timeline({ ownerKey, sessionId, sessionName, workspaceId, onRead
   const pinToLatest = useCallback((behavior: ScrollBehavior = "auto"): void => {
     const node = scrollRef.current;
     if (node === null) return;
+    const drag = scrollbarDragRef.current;
+    if (drag?.node === node && drag.owner === navigationOwnerRef.current) return;
     writeScrollTop(resolveTimelineResizeScrollTop({
       following: true,
       currentScrollTop: node.scrollTop,
@@ -538,28 +685,117 @@ export function Timeline({ ownerKey, sessionId, sessionName, workspaceId, onRead
     }), behavior);
   }, [writeScrollTop]);
 
+  const observeScrollbarMovement = useCallback((node: HTMLDivElement): boolean => {
+    const drag = scrollbarDragRef.current;
+    if (drag === undefined || drag.node !== node || drag.owner !== navigationOwnerRef.current || !navigationDocumentActiveRef.current) return false;
+    const scrollDelta = node.scrollTop - drag.previousScrollTop;
+    drag.previousScrollTop = node.scrollTop;
+    previousScrollTopRef.current = node.scrollTop;
+    if (scrollDelta === 0) return true;
+    restoreAnchorRef.current = undefined;
+    const upwardDelta = scrollDelta < 0 ? Math.min(scrollDelta, node.scrollTop - drag.startScrollTop) : scrollDelta;
+    if (followingRef.current && shouldUnpinTimelineOnScrollbarDrag({ scrollDelta: upwardDelta }) && shouldUnpinTimelineOnUpIntent(node)) setTimelineFollowing(false);
+    const distanceFromEnd = node.scrollHeight - node.scrollTop - node.clientHeight;
+    const nextFollowing = scrollDelta > 0 && shouldRepinTimelineOnDownIntent({ distanceFromEnd })
+      || resolveTimelineFollowingOnScroll({ wasFollowing: followingRef.current, distanceFromEnd, scrollDelta });
+    if (nextFollowing !== followingRef.current) setTimelineFollowing(nextFollowing);
+    captureViewportAnchor();
+    saveViewport(nextFollowing, nextFollowing ? 0 : unreadCountRef.current);
+    return true;
+  }, [captureViewportAnchor, saveViewport, setTimelineFollowing]);
+
+  const timelineHasItems = items.length > 0;
+  useLayoutEffect(() => {
+    const node = scrollRef.current;
+    const view = node?.ownerDocument.defaultView;
+    if (node === null || view === null || view === undefined) return;
+    const document = node.ownerDocument;
+    const owner = navigationOwnerRef.current;
+    let active = true;
+    const suppressScrollbarAdjustment = (): boolean => false;
+    const releaseScrollbarAdjustment = (): void => {
+      if (virtualizer.shouldAdjustScrollPositionOnItemSizeChange === suppressScrollbarAdjustment) {
+        virtualizer.shouldAdjustScrollPositionOnItemSizeChange = undefined;
+      }
+    };
+    const isCurrent = (): boolean => active && navigationOwnerRef.current === owner && scrollRef.current === node;
+    const endScrollbarDrag = (resumePin = true): void => {
+      const drag = scrollbarDragRef.current;
+      if (!isCurrent() || drag?.owner !== owner || drag.node !== node) return;
+      if (resumePin) observeScrollbarMovement(node);
+      scrollbarDragRef.current = undefined;
+      releaseScrollbarAdjustment();
+      if (resumePin && !document.hidden && followingRef.current) pinToLatest();
+    };
+    const onMouseDown = (event: MouseEvent): void => {
+      if (!isCurrent() || !navigationDocumentActiveRef.current || document.hidden || !isTimelineVerticalScrollbarPress({
+        button: event.button,
+        targetIsRoot: event.target === node,
+        offsetX: event.offsetX,
+        clientWidth: node.clientWidth,
+        scrollHeight: node.scrollHeight,
+        clientHeight: node.clientHeight
+      })) return;
+      cancelTimelineNavigation();
+      setFocusedItemId(undefined);
+      previousScrollTopRef.current = node.scrollTop;
+      scrollbarDragRef.current = { owner, node, startScrollTop: node.scrollTop, previousScrollTop: node.scrollTop };
+      virtualizer.shouldAdjustScrollPositionOnItemSizeChange = suppressScrollbarAdjustment;
+    };
+    const onMouseMove = (event: MouseEvent): void => {
+      if (!isCurrent()) return;
+      if ((event.buttons & 1) === 0) endScrollbarDrag();
+      else observeScrollbarMovement(node);
+    };
+    const onMouseUp = (event: MouseEvent): void => { if (event.button === 0) endScrollbarDrag(); };
+    const onCancel = (): void => { endScrollbarDrag(); };
+    const onVisibilityChange = (): void => { if (document.hidden) endScrollbarDrag(false); };
+    const onPageHide = (): void => { endScrollbarDrag(false); };
+    node.addEventListener("mousedown", onMouseDown);
+    view.addEventListener("mousemove", onMouseMove);
+    view.addEventListener("mouseup", onMouseUp);
+    view.addEventListener("pointercancel", onCancel);
+    view.addEventListener("blur", onCancel);
+    view.addEventListener("pagehide", onPageHide);
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    return () => {
+      active = false;
+      node.removeEventListener("mousedown", onMouseDown);
+      view.removeEventListener("mousemove", onMouseMove);
+      view.removeEventListener("mouseup", onMouseUp);
+      view.removeEventListener("pointercancel", onCancel);
+      view.removeEventListener("blur", onCancel);
+      view.removeEventListener("pagehide", onPageHide);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+      if (scrollbarDragRef.current?.owner === owner && scrollbarDragRef.current.node === node) scrollbarDragRef.current = undefined;
+      releaseScrollbarAdjustment();
+    };
+  }, [cancelTimelineNavigation, observeScrollbarMovement, ownerKey, pinToLatest, sessionId, timelineHasItems, virtualizer]);
+
   useLayoutEffect(() => {
     if (!following || items.length === 0) return;
     pinToLatest();
-  }, [following, items.length, lastItem?.id, pinToLatest]);
+  }, [following, items.length, lastItem?.id, pinToLatest, viewportOwnerKey]);
 
   useLayoutEffect(() => {
     if (followLatestSignalRef.current === followLatestSignal) return;
     followLatestSignalRef.current = followLatestSignal;
+    cancelTimelineNavigation();
+    setFocusedItemId(undefined);
     restoreAnchorRef.current = undefined;
     setTimelineFollowing(true);
     if (items.length > 0) pinToLatest();
-  }, [followLatestSignal, items.length, pinToLatest, setTimelineFollowing]);
+  }, [cancelTimelineNavigation, followLatestSignal, items.length, pinToLatest, setTimelineFollowing]);
 
   useEffect(() => {
     saveViewport(followingRef.current, unreadCountRef.current);
     setUnreadCount(unreadCountRef.current);
-  }, [items, saveViewport]);
+  }, [items, saveViewport, setUnreadCount]);
 
   useLayoutEffect(() => {
     const desired = restoreAnchorRef.current;
     const node = scrollRef.current;
-    if (desired === undefined || node === null || items.length === 0) return;
+    if (desired === undefined || node === null || items.length === 0 || scrollbarDragRef.current !== undefined) return;
     const index = findTimelineRenderItemIndex(renderItems, desired.itemId);
     if (index < 0) {
       restoreAnchorRef.current = undefined;
@@ -568,7 +804,7 @@ export function Timeline({ ownerKey, sessionId, sessionName, workspaceId, onRead
     const row = [...node.querySelectorAll<HTMLElement>("[data-timeline-item-id]")].find((candidate) => timelineRowContains(candidate, desired.itemId));
     if (row === undefined) {
       programmaticScrollUntilRef.current = performance.now() + 100;
-      virtualizer.scrollToIndex(index, { align: "start" });
+      positionVirtualRow(index, "start");
       return;
     }
     const currentOffset = row.getBoundingClientRect().top - node.getBoundingClientRect().top;
@@ -577,10 +813,19 @@ export function Timeline({ ownerKey, sessionId, sessionName, workspaceId, onRead
     viewportAnchorRef.current = desired;
     if (Math.abs(nextScrollTop - node.scrollTop) >= 0.5) writeScrollTop(nextScrollTop);
     else captureViewportAnchor();
-  }, [captureViewportAnchor, items, renderItems, renderedRowsKey, virtualizer, writeScrollTop]);
+  }, [captureViewportAnchor, items, positionVirtualRow, renderItems, renderedRowsKey, viewportOwnerKey, writeScrollTop]);
 
   useLayoutEffect(() => {
-    if (focusRequest === undefined || handledFocusRequestRef.current === focusRequest.requestId) return;
+    if (focusRequest === undefined) {
+      if (activeFocusRequestRef.current !== undefined) cancelTimelineNavigation(false);
+      return;
+    }
+    if (!navigationDocumentActiveRef.current || handledFocusRequestRef.current === focusRequest.requestId) return;
+    if (activeFocusRequestRef.current?.requestId !== focusRequest.requestId || activeFocusRequestRef.current.itemId !== focusRequest.itemId) {
+      cancelTimelineNavigation(false);
+      setFocusedItemId(undefined);
+      activeFocusRequestRef.current = focusRequest;
+    }
     const index = findTimelineRenderItemIndex(renderItems, focusRequest.itemId);
     if (index < 0) return;
     const node = scrollRef.current;
@@ -589,7 +834,7 @@ export function Timeline({ ownerKey, sessionId, sessionName, workspaceId, onRead
       .find((candidate) => timelineRowContains(candidate, focusRequest.itemId));
     if (row === undefined) {
       programmaticScrollUntilRef.current = performance.now() + 100;
-      virtualizer.scrollToIndex(index, { align: "center" });
+      positionVirtualRow(index, "center");
       return;
     }
     handledFocusRequestRef.current = focusRequest.requestId;
@@ -601,25 +846,35 @@ export function Timeline({ ownerKey, sessionId, sessionName, workspaceId, onRead
       0,
       node.scrollTop + rowRect.top - viewportRect.top - Math.max(0, (node.clientHeight - rowRect.height) / 2)
     );
+    const rowOffset = rowRect.top - viewportRect.top + node.scrollTop
+      - Math.min(nextScrollTop, Math.max(0, node.scrollHeight - node.clientHeight));
     writeScrollTop(nextScrollTop, timelineJumpBehavior(reducedMotion));
-    viewportAnchorRef.current = { itemId: focusRequest.itemId, offset: rowRect.top - viewportRect.top };
+    viewportAnchorRef.current = { itemId: row.dataset.timelineItemId ?? focusRequest.itemId, offset: rowOffset };
     setFocusedItemId(focusRequest.itemId);
     row.focus({ preventScroll: true });
     if (focusTimerRef.current !== undefined) clearTimeout(focusTimerRef.current);
+    const generation = navigationGenerationRef.current;
+    const owner = navigationOwnerRef.current;
     focusTimerRef.current = setTimeout(() => {
+      if (!navigationDocumentActiveRef.current || navigationOwnerRef.current !== owner || navigationGenerationRef.current !== generation) return;
       focusTimerRef.current = undefined;
       setFocusedItemId((current) => current === focusRequest.itemId ? undefined : current);
     }, 2_400);
-  }, [focusRequest, items, reducedMotion, renderItems, renderedRowsKey, setTimelineFollowing, virtualizer, writeScrollTop]);
+  }, [cancelTimelineNavigation, focusRequest, items, ownerKey, positionVirtualRow, reducedMotion, renderItems, renderedRowsKey, sessionId, setTimelineFollowing, writeScrollTop]);
 
   useEffect(() => {
     const content = contentRef.current;
     if (content === null || typeof ResizeObserver === "undefined") return;
+    const owner = navigationOwnerRef.current;
+    let active = true;
     let frame: number | undefined;
     const observer = new ResizeObserver(() => {
+      if (!active || navigationOwnerRef.current !== owner || scrollbarDragRef.current !== undefined) return;
       if (frame !== undefined) cancelAnimationFrame(frame);
+      const generation = navigationGenerationRef.current;
       frame = requestAnimationFrame(() => {
         frame = undefined;
+        if (!active || !navigationDocumentActiveRef.current || navigationOwnerRef.current !== owner || navigationGenerationRef.current !== generation || scrollbarDragRef.current !== undefined) return;
         const node = scrollRef.current;
         if (node === null) return;
         const anchor = viewportAnchorRef.current;
@@ -649,16 +904,18 @@ export function Timeline({ ownerKey, sessionId, sessionName, workspaceId, onRead
     observer.observe(content);
     for (const row of content.querySelectorAll<HTMLElement>("[data-timeline-item-id]")) observer.observe(row);
     return () => {
+      active = false;
       if (frame !== undefined) cancelAnimationFrame(frame);
       observer.disconnect();
     };
-  }, [captureViewportAnchor, renderedRowsKey, saveViewport, writeScrollTop]);
+  }, [captureViewportAnchor, ownerKey, renderedRowsKey, saveViewport, sessionId, writeScrollTop]);
 
   useEffect(() => () => {
+    if (viewportOwnerRef.current !== viewportOwnerKey) return;
     captureViewportAnchor();
     saveViewport();
     if (focusTimerRef.current !== undefined) clearTimeout(focusTimerRef.current);
-  }, [captureViewportAnchor, saveViewport]);
+  }, [captureViewportAnchor, saveViewport, viewportOwnerKey]);
 
   useEffect(() => {
     const node = scrollRef.current;
@@ -678,10 +935,14 @@ export function Timeline({ ownerKey, sessionId, sessionName, workspaceId, onRead
     const currentScrollTop = node.scrollTop;
     const nextNearHistoryStart = currentScrollTop <= 56;
     setNearHistoryStart((current) => current === nextNearHistoryStart ? current : nextNearHistoryStart);
+    if (observeScrollbarMovement(node)) {
+      if (historyError === undefined && shouldLoadEarlierTimeline({ scrollTop: currentScrollTop, hasEarlier, loading: historyLoading })) requestEarlier();
+      return;
+    }
     const scrollDelta = currentScrollTop - previousScrollTopRef.current;
     previousScrollTopRef.current = currentScrollTop;
     if (performance.now() < programmaticScrollUntilRef.current) {
-      captureViewportAnchor();
+      if (followingRef.current || viewportAnchorRef.current === undefined) captureViewportAnchor();
       saveViewport();
       return;
     }
@@ -700,12 +961,28 @@ export function Timeline({ ownerKey, sessionId, sessionName, workspaceId, onRead
     if (followingRef.current && shouldUnpinTimelineOnUpIntent(node)) setTimelineFollowing(false);
   };
 
+  const resumeFollowingForDownIntent = (): void => {
+    if (followingRef.current) return;
+    cancelTimelineNavigation();
+    setFocusedItemId(undefined);
+    restoreAnchorRef.current = undefined;
+    setTimelineFollowing(true);
+  };
+
   const handleTimelineWheelIntent = (deltaY: number, deltaX = 0, target: EventTarget | null = null): void => {
-    if (deltaY >= 0) return;
     const node = scrollRef.current;
-    if (node === null || hasNestedTimelineScrollerThatCanMoveUp(node, target)) return;
-    if (followingRef.current && shouldUnpinTimelineOnWheel({ deltaX, deltaY, scrollHeight: node.scrollHeight, clientHeight: node.clientHeight })) setTimelineFollowing(false);
-    if (historyError === undefined && shouldLoadEarlierTimeline({ scrollTop: node.scrollTop, hasEarlier, loading: historyLoading })) requestEarlier();
+    if (node === null || !navigationDocumentActiveRef.current) return;
+    if (deltaY < 0) {
+      if (hasNestedTimelineScrollerThatCanMoveUp(node, target)) return;
+      if (followingRef.current && shouldUnpinTimelineOnWheel({ deltaX, deltaY, scrollHeight: node.scrollHeight, clientHeight: node.clientHeight })) setTimelineFollowing(false);
+      if (historyError === undefined && shouldLoadEarlierTimeline({ scrollTop: node.scrollTop, hasEarlier, loading: historyLoading })) requestEarlier();
+      return;
+    }
+    if (deltaY > 0 && !hasNestedTimelineScrollerThatCanMoveDown(node, target) && shouldRepinTimelineOnWheel({
+      deltaX,
+      deltaY,
+      distanceFromEnd: node.scrollHeight - node.scrollTop - node.clientHeight
+    })) resumeFollowingForDownIntent();
   };
 
   useAppInputTimelineOwner(scrollRef, ownerKey, (deltaY) => {
@@ -735,7 +1012,7 @@ export function Timeline({ ownerKey, sessionId, sessionName, workspaceId, onRead
   if (items.length === 0) {
     return (
       <div className="timeline-shell" style={{ "--timeline-bottom-inset": `${Math.max(0, bottomInset)}px` } as CSSProperties}>
-        <div ref={scrollRef} className="timeline timeline--empty" data-timeline-session-id={sessionId} data-selection-quote-context="" aria-busy={historyLoading || undefined} aria-label={t("timeline.label")} tabIndex={0}>
+        <div ref={bindScrollRoot} className="timeline timeline--empty" data-timeline-session-id={sessionId} data-selection-quote-context="" aria-busy={historyLoading || undefined} aria-label={t("timeline.label")} tabIndex={0}>
           {derivationOrigin !== undefined && <SessionDerivationMarker origin={derivationOrigin} onOpen={onOpenDerivationOrigin} t={t} />}
           <div className="timeline-welcome">
             <div className="timeline-welcome__mark">{historyError === undefined ? <Sparkles aria-hidden="true" /> : <AlertCircle aria-hidden="true" />}</div>
@@ -771,25 +1048,38 @@ export function Timeline({ ownerKey, sessionId, sessionName, workspaceId, onRead
         </div>
       )}
       <div
-        ref={scrollRef}
+        ref={bindScrollRoot}
         className="timeline"
         data-timeline-session-id={sessionId}
         data-selection-quote-context=""
         onScroll={onScroll}
-        onWheel={(event) => handleTimelineWheelIntent(event.deltaY, event.deltaX, event.target)}
+        onWheel={(event) => {
+          if (event.ctrlKey || event.metaKey) return;
+          handleTimelineWheelIntent(event.deltaY, event.deltaX, event.target);
+        }}
         onKeyDown={(event) => {
           if (event.defaultPrevented || !TIMELINE_HISTORY_NAVIGATION_KEYS.has(event.key) || isEditableTimelineKeyboardTarget(event.target)) return;
           stopFollowingForUpIntent(event.currentTarget);
           if (historyError === undefined && shouldLoadEarlierTimeline({ scrollTop: event.currentTarget.scrollTop, hasEarlier, loading: historyLoading })) requestEarlier();
         }}
-        onTouchStart={(event) => { touchYRef.current = event.touches[0]?.clientY; }}
+        onTouchStart={(event) => { touchYRef.current = navigationDocumentActiveRef.current && event.touches.length === 1 ? event.touches[0]?.clientY : undefined; }}
         onTouchMove={(event) => {
+          if (!navigationDocumentActiveRef.current || event.touches.length !== 1) {
+            touchYRef.current = undefined;
+            return;
+          }
           const currentY = event.touches[0]?.clientY;
           if (currentY !== undefined && touchYRef.current !== undefined && currentY > touchYRef.current + TIMELINE_TOUCH_UP_INTENT_THRESHOLD_PX) {
             touchYRef.current = currentY;
             if (hasNestedTimelineScrollerThatCanMoveUp(event.currentTarget, event.target)) return;
             stopFollowingForUpIntent(event.currentTarget);
             if (historyError === undefined && shouldLoadEarlierTimeline({ scrollTop: event.currentTarget.scrollTop, hasEarlier, loading: historyLoading })) requestEarlier();
+            return;
+          }
+          if (currentY !== undefined && touchYRef.current !== undefined && touchYRef.current - currentY > TIMELINE_TOUCH_UP_INTENT_THRESHOLD_PX) {
+            touchYRef.current = currentY;
+            if (hasNestedTimelineScrollerThatCanMoveDown(event.currentTarget, event.target)) return;
+            if (shouldRepinTimelineOnDownIntent({ distanceFromEnd: event.currentTarget.scrollHeight - event.currentTarget.scrollTop - event.currentTarget.clientHeight })) resumeFollowingForDownIntent();
           }
         }}
         onTouchEnd={() => { touchYRef.current = undefined; }}
@@ -825,11 +1115,11 @@ export function Timeline({ ownerKey, sessionId, sessionName, workspaceId, onRead
           })}
         </div>
       </div>
-      {messageNavRailEnabled && <MessageNavRail entries={messageNavEntries} scrollRef={scrollRef} contentRef={contentRef} bottomOffset={bottomInset} resetKey={sessionId} estimateEntryTop={estimateMessageNavEntryTop} onWheelIntent={handleTimelineWheelIntent} onCoverageChange={setMessageNavRailCoversNavigation} onJump={jumpToMessageNavEntry} t={t} />}
+      {messageNavRailEnabled && <MessageNavRail entries={messageNavEntries} scrollRef={scrollRef} contentRef={contentRef} bottomOffset={bottomInset} resetKey={JSON.stringify([ownerKey, viewportOwnerKey])} estimateEntryTop={estimateMessageNavEntryTop} onWheelIntent={handleTimelineWheelIntent} onCoverageChange={setMessageNavRailCoversNavigation} onJump={jumpToMessageNavEntry} t={t} />}
       {previousMessageEntry !== undefined && !messageNavRailCoversNavigation && <PrevMessageJumpChip preview={previousMessageEntry.preview} label={t("timeline.jumpPreviousQuestion", { preview: previousMessageEntry.preview })} onClick={jumpToPreviousMessage} />}
       {onAddSelectionToComposer !== undefined && shareSelection === undefined && <SelectionQuoteButton key={sessionId} sessionId={sessionId} containerRef={scrollRef} label={t("timeline.addToChat")} onCommit={onAddSelectionToComposer} />}
       {!following && (
-        <Button className="jump-latest" tone="secondary" aria-label={unreadCount > 0 ? `${t("timeline.jumpLatest")} (${unreadCount})` : t("timeline.jumpLatest")} onClick={() => { setTimelineFollowing(true); pinToLatest(timelineJumpBehavior(reducedMotion)); }}>
+        <Button className="jump-latest" tone="secondary" aria-label={unreadCount > 0 ? `${t("timeline.jumpLatest")} (${unreadCount})` : t("timeline.jumpLatest")} onClick={() => { cancelTimelineNavigation(); setFocusedItemId(undefined); restoreAnchorRef.current = undefined; setTimelineFollowing(true); pinToLatest(timelineJumpBehavior(reducedMotion)); }}>
           <ChevronDown aria-hidden="true" />{t("timeline.jumpLatest")}{unreadCount > 0 && <span className="jump-latest__count">{unreadCount}</span>}
         </Button>
       )}
@@ -1079,6 +1369,7 @@ function MessageBlock({ sessionId, sessionName, item, role, locale, reducedMotio
   const roleLabel = role === "user" ? t("timeline.you") : t("timeline.agent");
   const selectionActive = shareSelection !== undefined;
   const shareable = item.streaming !== true && (text.trim().length > 0 || (item.attachments?.length ?? 0) > 0);
+  const shareSelected = selectionActive && shareSelection.selectedIds.has(item.id);
   const selectionControl = selectionActive && shareable && onToggleShareMessage !== undefined
     ? <MessageSelectionControl item={item} selected={shareSelection.selectedIds.has(item.id)} roleLabel={roleLabel} t={t} onToggle={onToggleShareMessage} />
     : null;
@@ -1108,11 +1399,12 @@ function MessageBlock({ sessionId, sessionName, item, role, locale, reducedMotio
       : <SentPastedTextInline ownerKey={JSON.stringify([personalization.ownerKey, sessionId, item.id, item.sourceEventId, index])} segment={projected} t={t} renderText={renderText} key={`${item.id}:text:${index}`} />;
   });
   if (role === "user") {
-    if (editing && onCancelEdit !== undefined && onMoveEditedMessageToComposer !== undefined) {
-      return <article className="message-user message-user--editing" data-user-msg-id={item.id} data-message-client-id={item.id} aria-label={roleLabel}><div className="message-user__stack">{item.automationOrigin !== undefined && <AutomationOriginBadge automationOrigin={item.automationOrigin} t={t} />}<UserMessageEditBox initialText={quotedUserMessage.body} t={t} onCancel={onCancelEdit} onMoveToComposer={(value) => onMoveEditedMessageToComposer(item, value)} /></div></article>;
+    if (!selectionActive && editing && onCancelEdit !== undefined && onMoveEditedMessageToComposer !== undefined) {
+      return <article className="message-user message-user--editing" data-user-msg-id={item.id} data-message-client-id={item.id} {...(shareable ? { [RENDERED_SHARE_MESSAGE_ATTRIBUTE]: item.id } : {})} aria-label={roleLabel}><div className="message-user__stack">{item.automationOrigin !== undefined && <AutomationOriginBadge automationOrigin={item.automationOrigin} t={t} />}<UserMessageEditBox initialText={quotedUserMessage.body} t={t} onCancel={onCancelEdit} onMoveToComposer={(value) => onMoveEditedMessageToComposer(item, value)} /></div></article>;
     }
     return (
-      <article className={cx("message-user", selectionActive && "is-share-selecting")} data-user-msg-id={item.id} data-message-client-id={item.id} data-selection-quote-message-id={item.id} data-selection-quote-source-event-id={item.sourceEventId} data-selection-quote-role="user" aria-label={roleLabel}>
+      <RenderedShareSelectionContext.Provider value={shareSelected}>
+      <article className={cx("message-user", selectionActive && "is-share-selecting")} data-user-msg-id={item.id} data-message-client-id={item.id} {...(shareable ? { [RENDERED_SHARE_MESSAGE_ATTRIBUTE]: item.id } : {})} data-selection-quote-message-id={item.id} data-selection-quote-source-event-id={item.sourceEventId} data-selection-quote-role="user" aria-label={roleLabel}>
         {selectionControl}
         <div className="message-user__stack">
           {item.automationOrigin !== undefined && <AutomationOriginBadge automationOrigin={item.automationOrigin} t={t} />}
@@ -1128,6 +1420,7 @@ function MessageBlock({ sessionId, sessionName, item, role, locale, reducedMotio
           {!selectionActive && showActions && <MessageActions ownerKey={personalization.ownerKey} sessionId={sessionId} sessionName={sessionName} item={item} text={actionText} align="right" locale={locale} t={t} onAddMessageToComposer={onAddMessageToComposer} onFork={onForkMessage} forking={forking} onStartShareSelection={onStartShareSelection} editable={editable} onEdit={onEdit} onPreviewMessageRewind={onPreviewMessageRewind} rewindToStartSupported={rewindToStartSupported} onDeleteMessage={onDeleteMessage} messageDeleteBlockedReason={messageDeleteBlockedReason} />}
         </div>
       </article>
+      </RenderedShareSelectionContext.Provider>
     );
   }
   const assistantContent = <>
@@ -1136,15 +1429,17 @@ function MessageBlock({ sessionId, sessionName, item, role, locale, reducedMotio
     {!selectionActive && !item.streaming && showActions && <MessageActions ownerKey={personalization.ownerKey} sessionId={sessionId} sessionName={sessionName} item={item} text={text} align="left" locale={locale} t={t} onAddMessageToComposer={onAddMessageToComposer} onFork={onForkMessage} forking={forking} onStartShareSelection={onStartShareSelection} editable={false} onPreviewMessageRewind={onPreviewMessageRewind} rewindToStartSupported={rewindToStartSupported} onDeleteMessage={onDeleteMessage} messageDeleteBlockedReason={messageDeleteBlockedReason} />}
   </>;
   return (
-    <article className={cx("message-assistant", selectionActive && "is-share-selecting")} data-message-client-id={item.id} data-selection-quote-message-id={item.id} data-selection-quote-source-event-id={item.sourceEventId} data-selection-quote-role="assistant" aria-label={roleLabel}>
+    <RenderedShareSelectionContext.Provider value={shareSelected}>
+    <article className={cx("message-assistant", selectionActive && "is-share-selecting")} data-message-client-id={item.id} {...(shareable ? { [RENDERED_SHARE_MESSAGE_ATTRIBUTE]: item.id } : {})} data-selection-quote-message-id={item.id} data-selection-quote-source-event-id={item.sourceEventId} data-selection-quote-role="assistant" aria-label={roleLabel}>
       {selectionControl}
       {selectionActive ? <div className="message-assistant__selection-stack">{assistantContent}</div> : assistantContent}
     </article>
+    </RenderedShareSelectionContext.Provider>
   );
 }
 
 function MessageSelectionControl({ item, selected, roleLabel, t, onToggle }: { readonly item: TimelineItemView; readonly selected: boolean; readonly roleLabel: string; readonly t: Translator; readonly onToggle: (itemId: string, extendRange: boolean) => void }): JSX.Element {
-  return <button type="button" className={cx("message-share-choice", selected && "is-selected")} role="checkbox" aria-checked={selected} aria-label={t("timeline.shareSelectionToggle", { role: roleLabel })} onClick={(event) => onToggle(item.id, event.shiftKey)}><span aria-hidden="true">{selected && <Check />}</span></button>;
+  return <button type="button" {...{ [RENDERED_SHARE_EXCLUDE_ATTRIBUTE]: "" }} className={cx("message-share-choice", selected && "is-selected")} role="checkbox" aria-checked={selected} aria-label={t("timeline.shareSelectionToggle", { role: roleLabel })} onClick={(event) => onToggle(item.id, event.shiftKey)}><span aria-hidden="true">{selected && <Check />}</span></button>;
 }
 
 export function MessageActions({ ownerKey, sessionId, sessionName, item, text, align, locale, t, onAddMessageToComposer, onFork, forking, onStartShareSelection, editable, onEdit, onPreviewMessageRewind, rewindToStartSupported, onDeleteMessage, messageDeleteBlockedReason }: { readonly ownerKey: string; readonly sessionId: string; readonly sessionName: string; readonly item: TimelineItemView; readonly text: string; readonly align: "left" | "right"; readonly locale: string; readonly t: Translator; readonly onAddMessageToComposer?: (item: TimelineItemView) => void; readonly onFork?: (item: TimelineItemView) => void; readonly forking: boolean; readonly onStartShareSelection?: (item: TimelineItemView) => void; readonly editable: boolean; readonly onEdit?: (item: TimelineItemView) => void; readonly onPreviewMessageRewind?: (item: TimelineItemView) => void; readonly rewindToStartSupported?: boolean; readonly onDeleteMessage?: (item: TimelineItemView) => void; readonly messageDeleteBlockedReason?: string }): JSX.Element {
@@ -1168,12 +1463,11 @@ export function MessageActions({ ownerKey, sessionId, sessionName, item, text, a
   };
   const shareContent = {
     sessionName,
-    role: align === "right" ? "user" as const : "assistant" as const,
-    roleLabel: align === "right" ? t("timeline.you") : t("timeline.agent"),
-    text,
-    attachmentNames: item.attachments?.map((attachment) => attachment.fileName || attachment.title),
-    attachmentsLabel: t("timeline.attachments"),
-    createdAtLabel: formatDateTime(item.createdAt, locale)
+    messages: [{
+      id: item.id,
+      text,
+      attachmentNames: item.attachments?.map((attachment) => attachment.fileName || attachment.title) ?? []
+    }]
   };
   const actionOwnerKey = JSON.stringify([ownerKey, sessionId, item.id, item.sourceEventId, item.createdAt, shareContent]);
   const retireActions = (): void => {
@@ -1241,20 +1535,35 @@ export function MessageActions({ ownerKey, sessionId, sessionName, item, text, a
     if (!shareable || shareRequestRef.current !== undefined) return;
     const owner = ownerRef.current;
     if (owner === undefined || owner.document !== trigger.ownerDocument) return;
+    const intent = {};
+    feedbackIntentRef.current = intent;
+    clearFeedbackTimer();
+    setShareFeedback(undefined);
+    const sourceMessage = actionsRef.current?.closest<HTMLElement>(`[${RENDERED_SHARE_MESSAGE_ATTRIBUTE}]`);
+    const timelineRoot = sourceMessage?.closest<HTMLElement>("[data-timeline-session-id]");
+    if (
+      sourceMessage === null || sourceMessage === undefined || sourceMessage.getAttribute(RENDERED_SHARE_MESSAGE_ATTRIBUTE) !== item.id
+      || timelineRoot === null || timelineRoot === undefined || !timelineRoot.isConnected || timelineRoot.ownerDocument !== trigger.ownerDocument
+      || timelineRoot.dataset.timelineSessionId !== sessionId
+    ) {
+      reportShareFeedback(intent, "error", t("timeline.shareNotReady"));
+      return;
+    }
+    const orderedTimelineMessageIds = queryRenderedShareMessageIds(timelineRoot);
     const request = new AbortController();
     const action: BrowserActionContext = { ownerDocument: trigger.ownerDocument, signal: request.signal };
     shareRequestRef.current = request;
     const current = (): boolean => ownerRef.current === owner && shareRequestRef.current === request && !request.signal.aborted
       && actionsRef.current?.isConnected === true && actionsRef.current.ownerDocument === action.ownerDocument
+      && sourceMessage.isConnected && sourceMessage.getAttribute(RENDERED_SHARE_MESSAGE_ATTRIBUTE) === item.id
+      && sourceMessage.closest<HTMLElement>("[data-timeline-session-id]") === timelineRoot
+      && timelineRoot.isConnected && timelineRoot.ownerDocument === action.ownerDocument
+      && timelineRoot.dataset.timelineSessionId === sessionId
       && action.ownerDocument.defaultView?.document === action.ownerDocument && !action.ownerDocument.defaultView.closed;
-    const intent = {};
-    feedbackIntentRef.current = intent;
-    clearFeedbackTimer();
     setSharing(true);
-    setShareFeedback(undefined);
     try {
       assertBrowserActionCurrent(action);
-      const blob = await buildShareMessageImagePng(shareContent, action);
+      const blob = await buildRenderedShareMessageImagePng({ timelineRoot, sessionId, orderedTimelineMessageIds, content: shareContent, action });
       if (!current()) return;
       assertBrowserActionCurrent(action);
       const delivery = await deliverShareMessageImage(blob, shareMessageImageFilename(sessionName, item.createdAt), sessionName, action);
@@ -1265,6 +1574,8 @@ export function MessageActions({ ownerKey, sessionId, sessionName, item, text, a
       if (!current()) return;
       reportShareFeedback(intent, "error", error instanceof ShareMessageImageTooLargeError
         ? t("timeline.shareTooLarge")
+        : error instanceof ShareRenderedMessageNotMountedError || error instanceof ShareRenderedMessageImageUnavailableError
+          ? t("timeline.shareNotReady")
         : error instanceof ShareMessageImageEmptyError
           ? t("timeline.shareEmpty")
           : t("timeline.shareFailed"));
@@ -1286,7 +1597,7 @@ export function MessageActions({ ownerKey, sessionId, sessionName, item, text, a
     ? <IconButton key="edit" className="copy-button" label={t("timeline.editMessage")} onClick={() => onEdit(item)}><Pencil aria-hidden="true" /></IconButton>
     : null;
   const more = <MessageMoreMenu key="more" item={item} copying={copying !== undefined} onCopyLink={(trigger) => { void copyMessage("link", trigger); }} align={align} t={t} onAddMessageToComposer={onAddMessageToComposer} onStartShareSelection={onStartShareSelection} onPreviewMessageRewind={onPreviewMessageRewind} rewindToStartSupported={rewindToStartSupported} onDeleteMessage={onDeleteMessage} messageDeleteBlockedReason={messageDeleteBlockedReason} />;
-  return <div ref={actionsRef} className={cx("message-actions", `message-actions--${align}`, shareFeedback !== undefined && "has-feedback")}>{align === "left" ? <>{copy}{share}{fork}{more}{time}{usage}</> : <>{time}{copy}{share}{edit}{fork}{more}</>}{shareFeedback !== undefined && <span className={cx("message-share-feedback", shareFeedback.kind === "error" && "is-error")} role={shareFeedback.kind === "error" ? "alert" : "status"}>{shareFeedback.text}</span>}</div>;
+  return <div ref={actionsRef} {...{ [RENDERED_SHARE_EXCLUDE_ATTRIBUTE]: "" }} className={cx("message-actions", `message-actions--${align}`, shareFeedback !== undefined && "has-feedback")}>{align === "left" ? <>{copy}{share}{fork}{more}{time}{usage}</> : <>{time}{copy}{share}{edit}{fork}{more}</>}{shareFeedback !== undefined && <span className={cx("message-share-feedback", shareFeedback.kind === "error" && "is-error")} role={shareFeedback.kind === "error" ? "alert" : "status"}>{shareFeedback.text}</span>}</div>;
 }
 
 function MessageMoreMenu({ item, copying, onCopyLink, align, t, onAddMessageToComposer, onStartShareSelection, onPreviewMessageRewind, rewindToStartSupported, onDeleteMessage, messageDeleteBlockedReason }: { readonly item: TimelineItemView; readonly copying: boolean; readonly onCopyLink: (trigger: HTMLElement) => void; readonly align: "left" | "right"; readonly t: Translator; readonly onAddMessageToComposer?: (item: TimelineItemView) => void; readonly onStartShareSelection?: (item: TimelineItemView) => void; readonly onPreviewMessageRewind?: (item: TimelineItemView) => void; readonly rewindToStartSupported?: boolean; readonly onDeleteMessage?: (item: TimelineItemView) => void; readonly messageDeleteBlockedReason?: string }): JSX.Element {
@@ -1321,6 +1632,7 @@ function MessageMoreMenu({ item, copying, onCopyLink, align, t, onAddMessageToCo
 }
 
 export function MessageAttachment({ artifact, galleryId, t, onArtifactUrl, onArtifactDownload }: { readonly artifact: NonNullable<TimelineItemView["attachments"]>[number]; readonly galleryId?: string; readonly t: Translator; readonly onArtifactUrl: (blobId: string) => Promise<string>; readonly onArtifactDownload: OperationApi["downloadArtifact"] }): JSX.Element {
+  const renderForShare = useRenderedShareSelection();
   const gallery = useContext(TimelineImageGalleryContext);
   const { ownerKey } = useContext(TimelinePersonalizationContext);
   const [textPreviewTrigger, setTextPreviewTrigger] = useState<HTMLElement>();
@@ -1337,8 +1649,8 @@ export function MessageAttachment({ artifact, galleryId, t, onArtifactUrl, onArt
       ? <IconButton className="message-attachment__preview message-attachment__preview--text" label={`${t("workspace.preview")}: ${artifact.fileName}`} tip={t("workspace.preview")} onClick={(event) => setTextPreviewTrigger(event.currentTarget)}><FileText aria-hidden="true" /></IconButton>
       : <span className="message-attachment__icon" aria-hidden="true"><FileOutput /></span>
     : image.status === "ready" && gallery !== undefined && galleryId !== undefined
-      ? <button className="message-attachment__preview" type="button" data-gallery-image-id={galleryId} aria-label={t("timeline.openImage", { name: artifact.title })} onClick={(event) => gallery.open(galleryId, event.currentTarget)}><img src={image.url} alt={artifact.title} loading="lazy" onError={markImageFailed} /></button>
-      : <span className={cx("message-attachment__icon", image.status === "error" && "image-preview--failed")} aria-hidden="true">{image.status === "error" ? <ImageOff /> : <ImageIcon />}</span>;
+      ? <button className="message-attachment__preview" type="button" data-gallery-image-id={galleryId} aria-label={t("timeline.openImage", { name: artifact.title })} onClick={(event) => gallery.open(galleryId, event.currentTarget)}><img src={image.url} alt={artifact.title} loading={renderForShare ? "eager" : "lazy"} onError={markImageFailed} /></button>
+      : <span {...(artifact.kind === "image" && image.status === "loading" ? { [RENDERED_SHARE_CONTENT_PENDING_ATTRIBUTE]: "" } : {})} className={cx("message-attachment__icon", image.status === "error" && "image-preview--failed")} aria-hidden="true">{image.status === "error" ? <ImageOff /> : <ImageIcon />}</span>;
   return <>
     <article className={cx("message-attachment", mediaKind !== undefined && "message-attachment--media")}>{imagePreview}<span className="message-attachment__copy"><strong>{artifact.title}</strong><small>{artifact.fileName} · {formatBytes(artifact.byteSize)}</small>{mediaKind === undefined && image.status === "error" && <small className="image-preview__failure-label">{t("timeline.imageUnavailable")}</small>}</span><ArtifactDownloadButton iconOnly ownerKey={JSON.stringify([ownerKey, artifact.blobId, artifact.fileName])} connectionOwner={onArtifactUrl} label={t("timeline.downloadArtifact", { name: artifact.fileName })} errorLabel={t("workspace.downloadUnavailable")} action={(context) => onArtifactDownload(artifact.blobId, artifact.fileName, context)} /></article>
     {textPreviewTrigger !== undefined && <TimelineTextAttachmentLightbox
@@ -1434,8 +1746,8 @@ export function StreamingMarkdown({ text, streaming, streamFadeKey, t }: { reado
   const personalization = useContext(TimelinePersonalizationContext);
   const throttled = useStreamingMarkdownText(text, streaming);
   const source = streaming ? throttled : text;
-  const rendered = useMemo(() => streaming ? repairStreamingMarkdown(source) : source, [source, streaming]);
   const fade = timelineStreamFadeActive(streaming, personalization.streamFadeEnabled, personalization.reducedMotion);
+  const rendered = useMemo(() => fade ? repairStreamingMarkdown(source) : source, [source, fade]);
   const fadeState = useMemo(() => fade ? timelineWordFadeState(streamFadeKey) : undefined, [fade, streamFadeKey]);
   const candidate = useMemo(() => fadeState === undefined ? undefined : createTimelineWordFadeCandidate(fadeState), [fadeState, rendered]);
   useLayoutEffect(() => {
@@ -1471,18 +1783,16 @@ const ParsedMarkdown = memo(function ParsedMarkdown({ text, t, wordFade, onWordF
     ...(personalization.onLoadWorkspaceAsset === undefined ? {} : { onLoadWorkspaceAsset: personalization.onLoadWorkspaceAsset }),
     ...(personalization.onWorkspaceImageToComposer === undefined ? {} : { onWorkspaceImageToComposer: personalization.onWorkspaceImageToComposer })
   }), [personalization.ownerKey, personalization.onLoadWorkspaceAsset, personalization.onOpenHttpLink, personalization.onOpenWorkspaceHtml, personalization.onWorkspaceImageToComposer, personalization.sessionId, t]);
-  const components = useMemo(
-    () => safeMarkdownComponents(t, referenceActions, onWordFadeSettled),
-    [onWordFadeSettled, referenceActions, t]
-  );
+  const renderActions = useMemo(() => ({ referenceActions, onWordFadeSettled }), [onWordFadeSettled, referenceActions]);
   const normalized = useMemo(() => normalizeTimelineMathDelimiters(text), [text]);
   const rehypePlugins = useMemo(() => wordFade === undefined
     ? TIMELINE_REHYPE_PLUGINS
     : [...TIMELINE_REHYPE_PLUGINS, [rehypeTimelineStreamFade, wordFade]] as NonNullable<ComponentProps<typeof ReactMarkdown>["rehypePlugins"]>, [wordFade]);
-  return <TimelineLinkSourceContext.Provider value={text}>
-    <TimelineMarkdownDocument remarkPlugins={TIMELINE_REMARK_PLUGINS} rehypePlugins={rehypePlugins} components={components} skipHtml>{normalized}</TimelineMarkdownDocument>
-
-  </TimelineLinkSourceContext.Provider>;
+  return <TimelineMarkdownRenderContext.Provider value={renderActions}>
+    <TimelineLinkSourceContext.Provider value={text}>
+      <TimelineMarkdownDocument remarkPlugins={TIMELINE_REMARK_PLUGINS} rehypePlugins={rehypePlugins} components={SAFE_MARKDOWN_COMPONENTS} skipHtml>{normalized}</TimelineMarkdownDocument>
+    </TimelineLinkSourceContext.Provider>
+  </TimelineMarkdownRenderContext.Provider>;
 });
 
 function useStreamingMarkdownText(value: string, streaming: boolean, intervalMs = 100): string {
@@ -2012,13 +2322,25 @@ function rememberWorkGroupExpansion(key: string, expanded: boolean): void {
   }
 }
 
-function safeMarkdownComponents(
-  t: Translator,
-  referenceActions: TimelineReferenceActions,
-  onWordFadeSettled?: (event: { readonly animationName: string; readonly currentTarget: { readonly dataset: DOMStringMap } }) => void
-): Components {
-  return {
+interface TimelineMarkdownRenderActions {
+  readonly referenceActions: TimelineReferenceActions;
+  readonly onWordFadeSettled?: (event: { readonly animationName: string; readonly currentTarget: { readonly dataset: DOMStringMap } }) => void;
+}
+
+const TimelineMarkdownRenderContext = createContext<TimelineMarkdownRenderActions | undefined>(undefined);
+
+function useTimelineMarkdownRenderActions(): TimelineMarkdownRenderActions {
+  const actions = useContext(TimelineMarkdownRenderContext);
+  if (actions === undefined) throw new Error("Markdown renderer actions are unavailable.");
+  return actions;
+}
+
+// Keep renderer types stable while current actions flow through their context.
+// Fresh application callbacks must not remount selected words or restart fades.
+const SAFE_MARKDOWN_COMPONENTS: Components = {
     pre: ({ children, node: _node, ...props }) => {
+      const { referenceActions } = useTimelineMarkdownRenderActions();
+      const { t } = referenceActions;
       const first = Array.isArray(children) ? children[0] : children;
       if (isValidElement(first)) {
         const className = (first.props as { readonly className?: string }).className;
@@ -2029,10 +2351,14 @@ function safeMarkdownComponents(
       }
       return <pre {...props}>{children}</pre>;
     },
-    table: ({ children, node, ...props }) => <TimelineCopyAsImageBlock ownerKey={JSON.stringify([referenceActions.ownerKey, referenceActions.sessionId])} sourceKey={JSON.stringify(node)} imageName="table.png" onSendToChat={referenceActions.onWorkspaceImageToComposer} className="timeline-copy-block--table" contentClassName="timeline-copy-block__scroll" extractPlainText={timelineTableToTsv} t={t}>
-      <table {...props}>{children}</table>
-    </TimelineCopyAsImageBlock>,
+    table: ({ children, node, ...props }) => {
+      const { referenceActions } = useTimelineMarkdownRenderActions();
+      return <TimelineCopyAsImageBlock ownerKey={JSON.stringify([referenceActions.ownerKey, referenceActions.sessionId])} sourceKey={JSON.stringify(node)} imageName="table.png" onSendToChat={referenceActions.onWorkspaceImageToComposer} className="timeline-copy-block--table" contentClassName="timeline-copy-block__scroll" extractPlainText={timelineTableToTsv} t={referenceActions.t}>
+        <table {...props}>{children}</table>
+      </TimelineCopyAsImageBlock>;
+    },
     span: ({ children, className, node, ...props }) => {
+      const { referenceActions, onWordFadeSettled } = useTimelineMarkdownRenderActions();
       const wordFadeKey = (props as Record<string, unknown>)["data-wf-key"];
       const startedAt = Number((props as Record<string, unknown>)["data-wf-started-at"]);
       if (typeof wordFadeKey === "string" && Number.isFinite(startedAt)) {
@@ -2046,7 +2372,7 @@ function safeMarkdownComponents(
           : undefined}
       >{children}</span>;
       return className?.split(/\s+/u).includes("katex-display") === true
-        ? <TimelineCopyAsImageBlock ownerKey={JSON.stringify([referenceActions.ownerKey, referenceActions.sessionId])} sourceKey={JSON.stringify(node)} imageName="formula.png" onSendToChat={referenceActions.onWorkspaceImageToComposer} className="timeline-copy-block--math" extractPlainText={timelineMathToLatex} t={t}>{content}</TimelineCopyAsImageBlock>
+        ? <TimelineCopyAsImageBlock ownerKey={JSON.stringify([referenceActions.ownerKey, referenceActions.sessionId])} sourceKey={JSON.stringify(node)} imageName="formula.png" onSendToChat={referenceActions.onWorkspaceImageToComposer} className="timeline-copy-block--math" extractPlainText={timelineMathToLatex} t={referenceActions.t}>{content}</TimelineCopyAsImageBlock>
         : content;
     },
     li: ({ node: _node, ...props }) => {
@@ -2054,11 +2380,14 @@ function safeMarkdownComponents(
       return Number.isFinite(startedAt) ? <TimelineFadeElement as="li" {...props} startedAt={startedAt} /> : <li {...props} />;
     },
     a: ({ children, href, node: _node, ...props }) => {
+      const { referenceActions } = useTimelineMarkdownRenderActions();
       return <TimelineMarkdownLink href={href} actions={referenceActions} anchorProps={props}>{children}</TimelineMarkdownLink>;
     },
-    img: ({ src, alt }) => <TimelineMarkdownImage src={src} alt={alt} actions={referenceActions} t={t} />
-  };
-}
+    img: ({ src, alt }) => {
+      const { referenceActions } = useTimelineMarkdownRenderActions();
+      return <TimelineMarkdownImage src={src} alt={alt} actions={referenceActions} t={referenceActions.t} />;
+    }
+};
 
 function timelineMarkdownNodeText(node: ReactNode): string {
   if (node === null || node === undefined || typeof node === "boolean") return "";

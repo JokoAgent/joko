@@ -234,7 +234,8 @@ export class SessionSdkOwner {
     if (this.#flights.size >= MAXIMUM_WORKERS) return Promise.reject(new SessionSdkFailure("UNAVAILABLE", false));
     let worker: Worker;
     try {
-      worker = this.#workerFactory(new URL("./session-sdk-worker.mjs", import.meta.url), {
+      const workerSpecifier = import.meta.url.endsWith(".ts") ? "./session-sdk-worker.mts" : "./session-sdk-worker.mjs";
+      worker = this.#workerFactory(new URL(workerSpecifier, import.meta.url), {
         workerData: {
           request,
           ...(isStoredRequest(request) ? { sessionStoreAuthority: this.#sessionStoreAuthority } : {})

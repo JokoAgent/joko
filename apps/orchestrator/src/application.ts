@@ -1147,6 +1147,7 @@ export async function createOrchestratorApplication(
     recoverManagedGenerationsOnInitialize: backendInstances.adapter(piBackendId) === undefined,
     ...(config.piExecutable === undefined ? {} : { command: config.piExecutable }),
     processFactory: remotePiProcesses.create,
+    remoteNavigationOwner: remotePiProcesses.navigationOwner,
     managedDurableStoreRegistry: remotePiProcesses,
     onManagedSubagentLineageRemoved: (input) => mcpRouter.revokeNativeAuthSession(input),
     fenceManagedSubagentProviderAuthentication: (providerId) =>

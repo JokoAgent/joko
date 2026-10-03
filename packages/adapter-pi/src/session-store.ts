@@ -1,9 +1,9 @@
 import { createHash, randomUUID } from "node:crypto";
 import { createReadStream } from "node:fs";
 import { lstat, mkdir, open, readdir, realpath, rename, stat, unlink, writeFile } from "node:fs/promises";
-import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
-import { CURRENT_SESSION_VERSION } from "@earendil-works/pi-coding-agent";
-import type { NativeSessionBinding } from "@joko/core";
+import { basename, dirname, extname, isAbsolute, join, posix, relative, resolve, sep, win32 } from "node:path";
+import { CURRENT_SESSION_VERSION, SessionManager } from "@earendil-works/pi-coding-agent";
+import type { NativeSessionBinding, RemoteWorkspaceBinding } from "@joko/core";
 import { asPiError, piError, redactedDiagnostic } from "./errors.js";
 import { MAX_SAFE_PI_JSONL_RECORD_BYTES, StrictJsonLineDecoder } from "./jsonl.js";
 import { isRecord } from "./protocol.js";
@@ -64,6 +64,15 @@ export interface PiDetachedForkMaterialization {
 
 const DEFAULT_PORTABLE_SESSION_LIMIT_BYTES = 512 * 1024 * 1024;
 
+function remoteFreshWorkspaceRoot(workspaceRoot: string, binding: RemoteWorkspaceBinding): string {
+  const paths = binding.kind === "device_peer" && /^[A-Za-z]:\\/u.test(binding.workspaceRoot) ? win32 : posix;
+  if (workspaceRoot !== binding.workspaceRoot || !paths.isAbsolute(workspaceRoot)
+    || paths.normalize(workspaceRoot) !== workspaceRoot || workspaceRoot.includes("\0")) {
+    throw piError("PI_SESSION_MATERIALIZATION_WORKSPACE_INVALID", "Remote native Session workspace identity is invalid", "session");
+  }
+  return workspaceRoot;
+}
+
 export class PiSessionStore {
   readonly root: string;
   readonly sessionsRoot: string;
@@ -105,6 +114,15 @@ export class PiSessionStore {
         recovery: "Ensure the service account can create the managed Pi session and trash directories."
       });
     }
+  }
+
+  /** Reserve the identity through the public native manager before the Host
+   * records it. Materialization and runtime startup happen after that receipt. */
+  reserveFreshSession(workspaceRoot: string, generation: number): NativeSessionBinding {
+    const manager = SessionManager.create(workspaceRoot, this.sessionsRoot);
+    const opaqueRef = manager.getSessionFile();
+    if (opaqueRef === undefined) throw piError("PI_SESSION_IDENTITY_MISSING", "Pi did not reserve a fresh native Session", "session");
+    return { opaqueRef, nativeSessionId: manager.getSessionId(), generation };
   }
 
   async list(workspaceRoot?: string): Promise<readonly PiNativeSessionInfo[]> {
@@ -397,6 +415,8 @@ export class PiSessionStore {
   async materializeFreshSession(input: {
     readonly binding: NativeSessionBinding;
     readonly workspaceRoot: string;
+    /** A mirror of an identity already materialized by the remote authority. */
+    readonly remoteWorkspace?: RemoteWorkspaceBinding;
   }): Promise<NativeSessionBinding> {
     const nativeSessionId = input.binding.nativeSessionId;
     if (nativeSessionId === undefined) {
@@ -407,7 +427,9 @@ export class PiSessionStore {
     }
     const [target, workspaceRoot] = await Promise.all([
       this.assertManagedSessionReference(input.binding.opaqueRef, { requireExists: false }),
-      canonicalWorkspaceRoot(input.workspaceRoot)
+      input.remoteWorkspace === undefined
+        ? canonicalWorkspaceRoot(input.workspaceRoot)
+        : Promise.resolve(remoteFreshWorkspaceRoot(input.workspaceRoot, input.remoteWorkspace))
     ]);
     const header = `${JSON.stringify({
       type: "session",
@@ -424,7 +446,8 @@ export class PiSessionStore {
         target,
         nativeSessionId,
         input.binding.generation,
-        workspaceRoot
+        workspaceRoot,
+        input.remoteWorkspace
       );
     } catch (error: unknown) {
       if ((error as NodeJS.ErrnoException).code === "EEXIST") {
@@ -432,7 +455,8 @@ export class PiSessionStore {
           target,
           nativeSessionId,
           input.binding.generation,
-          workspaceRoot
+          workspaceRoot,
+          input.remoteWorkspace
         );
       }
       if (created) await unlink(target).catch(() => undefined);
@@ -449,13 +473,16 @@ export class PiSessionStore {
     path: string,
     nativeSessionId: string,
     generation: number,
-    workspaceRoot: string
+    workspaceRoot: string,
+    remoteWorkspace?: RemoteWorkspaceBinding
   ): Promise<NativeSessionBinding> {
     const binding = await this.binding(path, generation);
     const info = await inspectSessionFile(binding.opaqueRef);
     const observedWorkspace = info.cwd === undefined
       ? undefined
-      : await canonicalWorkspaceRoot(info.cwd).catch(() => undefined);
+      : remoteWorkspace === undefined
+        ? await canonicalWorkspaceRoot(info.cwd).catch(() => undefined)
+        : remoteFreshWorkspaceRoot(info.cwd, remoteWorkspace);
     if (
       binding.nativeSessionId !== nativeSessionId
       || info.state !== "ready"
