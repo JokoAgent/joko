@@ -34,7 +34,7 @@ export function MessageNavRail({ entries, scrollRef, contentRef, bottomOffset, r
   /** Stable virtual-row fallback for entries outside TanStack Virtual's mounted overscan window. */
   readonly estimateEntryTop?: (id: string, contentTop: number) => number | null;
   /** Joko keeps its history/following wheel intent in React, outside the scroll root's native listeners. */
-  readonly onWheelIntent?: (deltaY: number) => void;
+  readonly onWheelIntent?: (deltaY: number, deltaX: number) => void;
   readonly onCoverageChange?: (covered: boolean) => void;
   readonly onJump: (id: string) => void;
   readonly t: Translator;
@@ -319,11 +319,12 @@ export function MessageNavRail({ entries, scrollRef, contentRef, bottomOffset, r
   }, [closeTooltip]);
 
   const onWheel = useCallback((event: ReactWheelEvent<HTMLElement>): void => {
+    if (event.ctrlKey || event.metaKey) return;
     dropPending();
     const root = scrollRef.current;
     if (root === null) return;
     root.dispatchEvent(new WheelEvent("wheel", { deltaX: event.deltaX, deltaY: event.deltaY }));
-    onWheelIntent?.(event.deltaY);
+    onWheelIntent?.(event.deltaY, event.deltaX);
     root.scrollBy({ top: event.deltaY, left: event.deltaX, behavior: "auto" });
   }, [dropPending, onWheelIntent, scrollRef]);
 

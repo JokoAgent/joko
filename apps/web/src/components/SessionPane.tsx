@@ -1825,6 +1825,7 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
       <Timeline
         key={timelineResourceOwnerKey}
         ownerKey={`${timelineResourceOwnerKey}:${session.generation}:${controller.state.connectionState}`}
+        viewportOwnerKey={JSON.stringify([controller.state.activeProfile?.id, controller.state.activeProfile?.serverId, controller.state.activeProfile?.origin, session.id, String(session.generation)])}
         sessionId={session.id}
         sessionName={session.name}
         workspaceId={canOpenWorkspaceReferences && controller.state.connectionState === "connected" ? workspace?.id : undefined}

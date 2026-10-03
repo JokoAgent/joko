@@ -26,6 +26,7 @@ it("keeps the exact Task identity on an empty timeline", async () => {
   const t = ((key: string) => key) as Translator;
   await act(async () => root.render(<Timeline
     ownerKey="empty-task-owner"
+    viewportOwnerKey="empty-task-viewport"
     sessionId="empty-task"
     sessionName="Empty Task"
     sessionActive={false}

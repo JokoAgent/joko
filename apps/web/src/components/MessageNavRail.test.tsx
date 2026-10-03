@@ -100,7 +100,7 @@ describe("MessageNavRail mounted behavior", () => {
     act(() => tickButtons(mounted.host)[2]!.dispatchEvent(wheel));
     expect(wheel.defaultPrevented).toBe(false);
     expect(received.some((event) => event.deltaX === 3 && event.deltaY === 48)).toBe(true);
-    expect(onWheelIntent).toHaveBeenCalledWith(48);
+    expect(onWheelIntent).toHaveBeenCalledWith(48, 3);
     expect(scrollBy).toHaveBeenCalledWith({ top: 48, left: 3, behavior: "auto" });
 
     unmountRail(mounted);
@@ -166,7 +166,7 @@ function mountRail({
   readonly mountedIndexes?: readonly number[];
   readonly onCoverageChange?: (covered: boolean) => void;
   readonly onJump?: (id: string) => void;
-  readonly onWheelIntent?: (deltaY: number) => void;
+  readonly onWheelIntent?: (deltaY: number, deltaX: number) => void;
   readonly tops: readonly number[];
 }): MountedRail {
   const scroll = document.createElement("div");

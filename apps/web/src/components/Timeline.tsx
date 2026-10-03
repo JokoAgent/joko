@@ -64,7 +64,7 @@ import { ShareMessageImageEmptyError, ShareMessageImageTooLargeError, buildShare
 import { projectInlinePlanTimeline, projectPinnedPlan } from "./pinned-plan-behavior.js";
 import { collectTimelineGalleryImages, moveTimelineGalleryIndex, timelineArtifactGalleryId, timelineMessageAttachmentGalleryId, type TimelineGalleryImage } from "./timeline-image-gallery.js";
 import { findTimelineRenderItemIndex, insertTimelineDerivationOrigin, projectTimelineRenderItems, timelineRenderChildIndex, type TimelineRenderItem, type TimelineWorkRenderItem } from "./timeline-render-items.js";
-import { TimelineViewportStore, countUnreadTimelineItems, maximumTimelineSequence, repairStreamingMarkdown, resolveTimelineFollowingOnScroll, resolveTimelineResizeScrollTop, shouldLoadEarlierTimeline, streamingMarkdownRenderValue, streamingMarkdownThrottleDelay, timelineJumpBehavior, type TimelineViewportState } from "./timeline-behavior.js";
+import { TimelineViewportStore, countUnreadTimelineItems, maximumTimelineSequence, repairStreamingMarkdown, resolveTimelineFollowingOnScroll, resolveTimelineResizeScrollTop, shouldLoadEarlierTimeline, streamingMarkdownRenderValue, streamingMarkdownThrottleDelay, timelineJumpBehavior, timelineUnreadItemIds, type TimelineViewportState } from "./timeline-behavior.js";
 import type { Translator } from "./types.js";
 import { Button, IconButton, Modal, Pill, Spinner, Tip, TipSummary, cx, formatBytes, formatDateTime } from "./ui.js";
 import { UserMessageEditBox } from "./UserMessageEditBox.js";
@@ -98,8 +98,13 @@ import { useAppInputTimelineOwner } from "../app-input-owners.js";
 import {
   TIMELINE_HISTORY_NAVIGATION_KEYS,
   TIMELINE_TOUCH_UP_INTENT_THRESHOLD_PX,
+  hasNestedTimelineScrollerThatCanMoveDown,
   hasNestedTimelineScrollerThatCanMoveUp,
   isEditableTimelineKeyboardTarget,
+  isTimelineVerticalScrollbarPress,
+  shouldRepinTimelineOnDownIntent,
+  shouldRepinTimelineOnWheel,
+  shouldUnpinTimelineOnScrollbarDrag,
   shouldUnpinTimelineOnUpIntent,
   shouldUnpinTimelineOnWheel
 } from "./timeline-follow-intent.js";
@@ -183,8 +188,9 @@ export interface TimelineShareSelection {
   readonly selectedIds: ReadonlySet<string>;
 }
 
-export function Timeline({ ownerKey, sessionId, sessionName, workspaceId, onReadArtifact, items, sessionActive, derivationOrigin, sessionCreatedAt, onOpenDerivationOrigin, messageNavRailEnabled, streamFadeEnabled, onOpenHttpLink, onOpenWorkspaceHtml, onLoadWorkspaceAsset, onWorkspaceImageToComposer, subagentRuns, subagentRunDetails, onOpenSubagent, onStopSubagent, onGetPartnerDelegation, onCancelPartnerDelegation, onOpenPartnerSession, hasEarlier, historyLoading, historyError, onLoadEarlier, followLatestSignal = 0, focusRequest, bottomInset = 0, retryRunId, locale, t, onRetry, onRecovery, recoveryContext, onArtifactUrl, onArtifactUrlRelease, onArtifactDownload, onWorkspaceRewind, onOpenGeneratedFile, onOpenTurnReview, onReobserveReview, onAddMessageToComposer, onAddSelectionToComposer, onForkMessage, forkingMessageId, shareSelection, onStartShareSelection, onToggleShareMessage, editableMessageId, onMoveEditedMessageToComposer, onPreviewMessageRewind, rewindToStartSupported, onDeleteMessage, messageDeleteBlockedReason, messageActionResetSignal, onInlinePlanVisibilityChange }: {
+export function Timeline({ ownerKey, viewportOwnerKey, sessionId, sessionName, workspaceId, onReadArtifact, items, sessionActive, derivationOrigin, sessionCreatedAt, onOpenDerivationOrigin, messageNavRailEnabled, streamFadeEnabled, onOpenHttpLink, onOpenWorkspaceHtml, onLoadWorkspaceAsset, onWorkspaceImageToComposer, subagentRuns, subagentRunDetails, onOpenSubagent, onStopSubagent, onGetPartnerDelegation, onCancelPartnerDelegation, onOpenPartnerSession, hasEarlier, historyLoading, historyError, onLoadEarlier, followLatestSignal = 0, focusRequest, bottomInset = 0, retryRunId, locale, t, onRetry, onRecovery, recoveryContext, onArtifactUrl, onArtifactUrlRelease, onArtifactDownload, onWorkspaceRewind, onOpenGeneratedFile, onOpenTurnReview, onReobserveReview, onAddMessageToComposer, onAddSelectionToComposer, onForkMessage, forkingMessageId, shareSelection, onStartShareSelection, onToggleShareMessage, editableMessageId, onMoveEditedMessageToComposer, onPreviewMessageRewind, rewindToStartSupported, onDeleteMessage, messageDeleteBlockedReason, messageActionResetSignal, onInlinePlanVisibilityChange }: {
   readonly ownerKey: string;
+  readonly viewportOwnerKey: string;
   readonly sessionId: string;
   readonly sessionName: string;
   readonly workspaceId?: string;
@@ -274,30 +280,69 @@ export function Timeline({ ownerKey, sessionId, sessionName, workspaceId, onRead
     setOpenGallery({ imageId, trigger });
   }, []);
   const galleryContext = useMemo<TimelineImageGalleryContextValue>(() => ({ open: openGalleryImage }), [openGalleryImage]);
-  const restoredViewportRef = useRef<TimelineViewportState | undefined>(undefined);
-  if (restoredViewportRef.current === undefined) restoredViewportRef.current = timelineViewports.restore(sessionId, items);
-  const restoredViewport = restoredViewportRef.current;
+  const restoredViewportRef = useRef<{ readonly ownerKey: string; readonly viewport: TimelineViewportState } | undefined>(undefined);
+  if (restoredViewportRef.current?.ownerKey !== viewportOwnerKey) {
+    restoredViewportRef.current = { ownerKey: viewportOwnerKey, viewport: timelineViewports.restore(viewportOwnerKey, items) };
+  }
+  const restoredViewport = restoredViewportRef.current.viewport;
+  const viewportOwnerRef = useRef(viewportOwnerKey);
   const scrollRef = useRef<HTMLDivElement>(null);
   const contentRef = useRef<HTMLDivElement>(null);
-  const previousMessageJump = usePreviousUserMessageJump({ scrollRef, userMessageIds, resetKey: sessionId });
-  const [following, setFollowing] = useState(restoredViewport.following);
-  const [unreadCount, setUnreadCount] = useState(restoredViewport.unreadCount);
+  const previousMessageJump = usePreviousUserMessageJump({ scrollRef, userMessageIds, resetKey: viewportOwnerKey });
+  const [followingState, setFollowingState] = useState({ ownerKey: viewportOwnerKey, value: restoredViewport.following });
+  const [unreadState, setUnreadState] = useState({ ownerKey: viewportOwnerKey, value: restoredViewport.unreadCount });
+  const following = followingState.ownerKey === viewportOwnerKey ? followingState.value : restoredViewport.following;
+  const unreadCount = unreadState.ownerKey === viewportOwnerKey ? unreadState.value : restoredViewport.unreadCount;
+  const setFollowing = useCallback((value: boolean): void => {
+    if (viewportOwnerRef.current === viewportOwnerKey) setFollowingState({ ownerKey: viewportOwnerKey, value });
+  }, [viewportOwnerKey]);
+  const setUnreadCount = useCallback((value: number): void => {
+    if (viewportOwnerRef.current === viewportOwnerKey) setUnreadState({ ownerKey: viewportOwnerKey, value });
+  }, [viewportOwnerKey]);
   const [focusedItemId, setFocusedItemId] = useState<string>();
   const [nearHistoryStart, setNearHistoryStart] = useState(true);
   const followingRef = useRef(restoredViewport.following);
   const unreadCountRef = useRef(restoredViewport.unreadCount);
-  const knownItemIdsRef = useRef<ReadonlySet<string>>(restoredViewport.knownItemIds);
+  const knownUnreadItemIdsRef = useRef<ReadonlySet<string>>(restoredViewport.knownUnreadItemIds);
   const maximumSequenceRef = useRef<bigint | undefined>(restoredViewport.maximumSequence);
   const viewportAnchorRef = useRef<{ readonly itemId: string; readonly offset: number } | undefined>(restoredViewport.anchorItemId === undefined ? undefined : { itemId: restoredViewport.anchorItemId, offset: restoredViewport.anchorOffset });
   const restoreAnchorRef = useRef<{ readonly itemId: string; readonly offset: number } | undefined>(restoredViewport.following || restoredViewport.anchorItemId === undefined ? undefined : { itemId: restoredViewport.anchorItemId, offset: restoredViewport.anchorOffset });
   const itemsRef = useRef(items);
   itemsRef.current = items;
+  if (viewportOwnerRef.current !== viewportOwnerKey) {
+    viewportOwnerRef.current = viewportOwnerKey;
+    followingRef.current = restoredViewport.following;
+    unreadCountRef.current = restoredViewport.unreadCount;
+    knownUnreadItemIdsRef.current = restoredViewport.knownUnreadItemIds;
+    maximumSequenceRef.current = restoredViewport.maximumSequence;
+    viewportAnchorRef.current = restoredViewport.anchorItemId === undefined ? undefined : { itemId: restoredViewport.anchorItemId, offset: restoredViewport.anchorOffset };
+    restoreAnchorRef.current = restoredViewport.following ? undefined : viewportAnchorRef.current;
+  }
   const followLatestSignalRef = useRef(followLatestSignal);
   const previousScrollTopRef = useRef(0);
   const programmaticScrollUntilRef = useRef(0);
   const touchYRef = useRef<number | undefined>(undefined);
   const handledFocusRequestRef = useRef<number | undefined>(undefined);
   const focusTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const activeFocusRequestRef = useRef<typeof focusRequest>(undefined);
+  const navigationGenerationRef = useRef(0);
+  const navigationFrameRef = useRef<number | undefined>(undefined);
+  const viewportFrameRef = useRef<number | undefined>(undefined);
+  const scrollbarDragRef = useRef<{
+    readonly owner: { readonly ownerKey: string; readonly sessionId: string };
+    readonly node: HTMLDivElement;
+    readonly startScrollTop: number;
+    previousScrollTop: number;
+  } | undefined>(undefined);
+  const navigationOwnerRef = useRef({ ownerKey, sessionId });
+  if (navigationOwnerRef.current.ownerKey !== ownerKey || navigationOwnerRef.current.sessionId !== sessionId) {
+    navigationOwnerRef.current = { ownerKey, sessionId };
+    touchYRef.current = undefined;
+    scrollbarDragRef.current = undefined;
+  }
+  const focusRequestRef = useRef(focusRequest);
+  focusRequestRef.current = focusRequest;
+  const navigationDocumentActiveRef = useRef(true);
   const loadEarlierInFlightRef = useRef(false);
   const reducedMotion = usePrefersReducedMotion();
   const personalizationContext = useMemo<TimelinePersonalizationContextValue>(() => ({
@@ -330,6 +375,13 @@ export function Timeline({ ownerKey, sessionId, sessionName, workspaceId, onRead
     overscan: 8,
     getItemKey: (index) => renderItems[index]?.key ?? index
   });
+  const positionVirtualRow = useCallback((index: number, align: "start" | "center"): void => {
+    if (!navigationDocumentActiveRef.current) return;
+    const offset = virtualizer.getOffsetForIndex(index, align)?.[0];
+    // Timeline owns subsequent alignment and cancellation; the virtualizer's
+    // scrollToIndex retries can otherwise outlive the original navigation.
+    if (offset !== undefined) virtualizer.scrollToOffset(offset, { behavior: "auto" });
+  }, [virtualizer]);
   const lastItem = items.at(-1);
   const virtualRows = virtualizer.getVirtualItems();
   const renderedRowsKey = virtualRows.map((row) => row.key).join("\u0000");
@@ -454,30 +506,95 @@ export function Timeline({ ownerKey, sessionId, sessionName, workspaceId, onRead
   }, [hasEarlier, historyError, historyLoading, messageNavEntries.length, messageNavRailEnabled, requestEarlier, sessionId]);
 
   const saveViewport = useCallback((nextFollowing = followingRef.current, nextUnreadCount = unreadCountRef.current): void => {
+    if (viewportOwnerRef.current !== viewportOwnerKey) return;
     const currentItems = itemsRef.current;
-    const added = countUnreadTimelineItems(knownItemIdsRef.current, maximumSequenceRef.current, currentItems, nextFollowing);
-    knownItemIdsRef.current = new Set(currentItems.map((item) => item.id));
+    const added = countUnreadTimelineItems(knownUnreadItemIdsRef.current, maximumSequenceRef.current, currentItems, nextFollowing);
+    knownUnreadItemIdsRef.current = timelineUnreadItemIds(currentItems);
     const currentMaximum = maximumTimelineSequence(currentItems);
     if (currentMaximum !== undefined && (maximumSequenceRef.current === undefined || currentMaximum > maximumSequenceRef.current)) maximumSequenceRef.current = currentMaximum;
     const reconciledUnreadCount = nextFollowing ? 0 : nextUnreadCount + added;
     unreadCountRef.current = reconciledUnreadCount;
     const anchor = restoreAnchorRef.current ?? viewportAnchorRef.current;
-    timelineViewports.save(sessionId, {
+    timelineViewports.save(viewportOwnerKey, {
       ...(anchor === undefined ? {} : { anchorItemId: anchor.itemId }),
       anchorOffset: anchor?.offset ?? 0,
       following: nextFollowing,
       unreadCount: reconciledUnreadCount
     }, currentItems);
-  }, [sessionId]);
+  }, [viewportOwnerKey]);
 
   const writeScrollTop = useCallback((top: number, behavior: ScrollBehavior = "auto"): void => {
     const node = scrollRef.current;
-    if (node === null) return;
+    if (node === null || !navigationDocumentActiveRef.current) return;
     programmaticScrollUntilRef.current = performance.now() + (behavior === "smooth" ? 500 : 50);
     node.scrollTo({ top, behavior });
     previousScrollTopRef.current = node.scrollTop;
-    requestAnimationFrame(captureViewportAnchor);
+    if (viewportFrameRef.current !== undefined) cancelAnimationFrame(viewportFrameRef.current);
+    const owner = navigationOwnerRef.current;
+    const generation = navigationGenerationRef.current;
+    viewportFrameRef.current = requestAnimationFrame(() => {
+      if (!navigationDocumentActiveRef.current || navigationOwnerRef.current !== owner || navigationGenerationRef.current !== generation) return;
+      viewportFrameRef.current = undefined;
+      captureViewportAnchor();
+    });
   }, [captureViewportAnchor]);
+
+  const cancelTimelineNavigation = useCallback((retireCurrentFocus = true): void => {
+    navigationGenerationRef.current += 1;
+    const focus = retireCurrentFocus ? focusRequestRef.current : undefined;
+    if (focus !== undefined) handledFocusRequestRef.current = focus.requestId;
+    activeFocusRequestRef.current = undefined;
+    if (navigationFrameRef.current !== undefined) {
+      cancelAnimationFrame(navigationFrameRef.current);
+      navigationFrameRef.current = undefined;
+    }
+    if (viewportFrameRef.current !== undefined) {
+      cancelAnimationFrame(viewportFrameRef.current);
+      viewportFrameRef.current = undefined;
+    }
+    if (focusTimerRef.current !== undefined) {
+      clearTimeout(focusTimerRef.current);
+      focusTimerRef.current = undefined;
+    }
+    const node = scrollRef.current;
+    if (node !== null && performance.now() < programmaticScrollUntilRef.current) {
+      node.scrollTo({ top: node.scrollTop, behavior: "auto" });
+    }
+    programmaticScrollUntilRef.current = 0;
+  }, []);
+
+  useLayoutEffect(() => {
+    const owner = navigationOwnerRef.current;
+    return () => {
+      if (navigationOwnerRef.current !== owner) {
+        const focus = activeFocusRequestRef.current;
+        if (focus !== undefined) handledFocusRequestRef.current = focus.requestId;
+        setFocusedItemId(undefined);
+      }
+      touchYRef.current = undefined;
+      cancelTimelineNavigation(false);
+    };
+  }, [cancelTimelineNavigation, ownerKey, sessionId]);
+
+  useEffect(() => {
+    const view = scrollRef.current?.ownerDocument.defaultView;
+    if (view === null || view === undefined) return;
+    const onPageHide = (): void => {
+      navigationDocumentActiveRef.current = false;
+      touchYRef.current = undefined;
+      cancelTimelineNavigation();
+      setFocusedItemId(undefined);
+    };
+    const onPageShow = (): void => { navigationDocumentActiveRef.current = true; };
+    view.addEventListener("pagehide", onPageHide);
+    view.addEventListener("pageshow", onPageShow);
+    return () => {
+      view.removeEventListener("pagehide", onPageHide);
+      view.removeEventListener("pageshow", onPageShow);
+      touchYRef.current = undefined;
+      cancelTimelineNavigation(false);
+    };
+  }, [cancelTimelineNavigation]);
 
   const setTimelineFollowing = useCallback((next: boolean): void => {
     followingRef.current = next;
@@ -487,26 +604,32 @@ export function Timeline({ ownerKey, sessionId, sessionName, workspaceId, onRead
       setUnreadCount(0);
     }
     saveViewport(next, next ? 0 : unreadCountRef.current);
-  }, [saveViewport]);
+  }, [saveViewport, setFollowing, setUnreadCount]);
 
   const jumpToMessageNavEntry = useCallback((itemId: string): void => {
     const node = scrollRef.current;
-    if (node === null) return;
+    if (node === null || !navigationDocumentActiveRef.current) return;
     const index = findTimelineRenderItemIndex(renderItems, itemId);
     if (index < 0) return;
+    cancelTimelineNavigation();
+    setFocusedItemId(undefined);
+    const generation = navigationGenerationRef.current;
+    const owner = navigationOwnerRef.current;
     restoreAnchorRef.current = undefined;
     setTimelineFollowing(false);
     programmaticScrollUntilRef.current = performance.now() + 650;
-    virtualizer.scrollToIndex(index, { align: "start" });
+    positionVirtualRow(index, "start");
     let attempts = 0;
     const align = (): void => {
+      if (!navigationDocumentActiveRef.current || navigationOwnerRef.current !== owner || navigationGenerationRef.current !== generation) return;
+      navigationFrameRef.current = undefined;
       const current = scrollRef.current;
-      if (current === null) return;
+      if (current !== node || !itemsRef.current.some((item) => item.id === itemId)) return;
       const anchor = [...current.querySelectorAll<HTMLElement>("[data-message-client-id]")]
         .find((candidate) => candidate.dataset.messageClientId === itemId);
       if (anchor === undefined && attempts < 2) {
         attempts += 1;
-        requestAnimationFrame(align);
+        navigationFrameRef.current = requestAnimationFrame(align);
         return;
       }
       if (anchor === undefined) return;
@@ -514,8 +637,8 @@ export function Timeline({ ownerKey, sessionId, sessionName, workspaceId, onRead
       writeScrollTop(nextScrollTop, timelineJumpBehavior(reducedMotion));
       viewportAnchorRef.current = { itemId, offset: 12 };
     };
-    requestAnimationFrame(align);
-  }, [reducedMotion, renderItems, setTimelineFollowing, virtualizer, writeScrollTop]);
+    navigationFrameRef.current = requestAnimationFrame(align);
+  }, [cancelTimelineNavigation, positionVirtualRow, reducedMotion, renderItems, setTimelineFollowing, writeScrollTop]);
   const previousMessageEntry = previousMessageJump.displayId === null
     ? undefined
     : messageNavEntries.find((entry) => entry.id === previousMessageJump.displayId);
@@ -529,6 +652,8 @@ export function Timeline({ ownerKey, sessionId, sessionName, workspaceId, onRead
   const pinToLatest = useCallback((behavior: ScrollBehavior = "auto"): void => {
     const node = scrollRef.current;
     if (node === null) return;
+    const drag = scrollbarDragRef.current;
+    if (drag?.node === node && drag.owner === navigationOwnerRef.current) return;
     writeScrollTop(resolveTimelineResizeScrollTop({
       following: true,
       currentScrollTop: node.scrollTop,
@@ -538,28 +663,108 @@ export function Timeline({ ownerKey, sessionId, sessionName, workspaceId, onRead
     }), behavior);
   }, [writeScrollTop]);
 
+  const observeScrollbarMovement = useCallback((node: HTMLDivElement): boolean => {
+    const drag = scrollbarDragRef.current;
+    if (drag === undefined || drag.node !== node || drag.owner !== navigationOwnerRef.current || !navigationDocumentActiveRef.current) return false;
+    const scrollDelta = node.scrollTop - drag.previousScrollTop;
+    drag.previousScrollTop = node.scrollTop;
+    previousScrollTopRef.current = node.scrollTop;
+    if (scrollDelta === 0) return true;
+    restoreAnchorRef.current = undefined;
+    const upwardDelta = scrollDelta < 0 ? Math.min(scrollDelta, node.scrollTop - drag.startScrollTop) : scrollDelta;
+    if (followingRef.current && shouldUnpinTimelineOnScrollbarDrag({ scrollDelta: upwardDelta }) && shouldUnpinTimelineOnUpIntent(node)) setTimelineFollowing(false);
+    const distanceFromEnd = node.scrollHeight - node.scrollTop - node.clientHeight;
+    const nextFollowing = scrollDelta > 0 && shouldRepinTimelineOnDownIntent({ distanceFromEnd })
+      || resolveTimelineFollowingOnScroll({ wasFollowing: followingRef.current, distanceFromEnd, scrollDelta });
+    if (nextFollowing !== followingRef.current) setTimelineFollowing(nextFollowing);
+    captureViewportAnchor();
+    saveViewport(nextFollowing, nextFollowing ? 0 : unreadCountRef.current);
+    return true;
+  }, [captureViewportAnchor, saveViewport, setTimelineFollowing]);
+
+  const timelineHasItems = items.length > 0;
+  useLayoutEffect(() => {
+    const node = scrollRef.current;
+    const view = node?.ownerDocument.defaultView;
+    if (node === null || view === null || view === undefined) return;
+    const document = node.ownerDocument;
+    const owner = navigationOwnerRef.current;
+    let active = true;
+    const isCurrent = (): boolean => active && navigationOwnerRef.current === owner && scrollRef.current === node;
+    const endScrollbarDrag = (resumePin = true): void => {
+      const drag = scrollbarDragRef.current;
+      if (!isCurrent() || drag?.owner !== owner || drag.node !== node) return;
+      if (resumePin) observeScrollbarMovement(node);
+      scrollbarDragRef.current = undefined;
+      if (resumePin && !document.hidden && followingRef.current) pinToLatest();
+    };
+    const onMouseDown = (event: MouseEvent): void => {
+      if (!isCurrent() || !navigationDocumentActiveRef.current || document.hidden || !isTimelineVerticalScrollbarPress({
+        button: event.button,
+        targetIsRoot: event.target === node,
+        offsetX: event.offsetX,
+        clientWidth: node.clientWidth,
+        scrollHeight: node.scrollHeight,
+        clientHeight: node.clientHeight
+      })) return;
+      cancelTimelineNavigation();
+      setFocusedItemId(undefined);
+      previousScrollTopRef.current = node.scrollTop;
+      scrollbarDragRef.current = { owner, node, startScrollTop: node.scrollTop, previousScrollTop: node.scrollTop };
+    };
+    const onMouseMove = (event: MouseEvent): void => {
+      if (!isCurrent()) return;
+      if ((event.buttons & 1) === 0) endScrollbarDrag();
+      else observeScrollbarMovement(node);
+    };
+    const onMouseUp = (event: MouseEvent): void => { if (event.button === 0) endScrollbarDrag(); };
+    const onCancel = (): void => { endScrollbarDrag(); };
+    const onVisibilityChange = (): void => { if (document.hidden) endScrollbarDrag(false); };
+    const onPageHide = (): void => { endScrollbarDrag(false); };
+    node.addEventListener("mousedown", onMouseDown);
+    view.addEventListener("mousemove", onMouseMove);
+    view.addEventListener("mouseup", onMouseUp);
+    view.addEventListener("pointercancel", onCancel);
+    view.addEventListener("blur", onCancel);
+    view.addEventListener("pagehide", onPageHide);
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    return () => {
+      active = false;
+      node.removeEventListener("mousedown", onMouseDown);
+      view.removeEventListener("mousemove", onMouseMove);
+      view.removeEventListener("mouseup", onMouseUp);
+      view.removeEventListener("pointercancel", onCancel);
+      view.removeEventListener("blur", onCancel);
+      view.removeEventListener("pagehide", onPageHide);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+      if (scrollbarDragRef.current?.owner === owner && scrollbarDragRef.current.node === node) scrollbarDragRef.current = undefined;
+    };
+  }, [cancelTimelineNavigation, observeScrollbarMovement, ownerKey, pinToLatest, sessionId, timelineHasItems]);
+
   useLayoutEffect(() => {
     if (!following || items.length === 0) return;
     pinToLatest();
-  }, [following, items.length, lastItem?.id, pinToLatest]);
+  }, [following, items.length, lastItem?.id, pinToLatest, viewportOwnerKey]);
 
   useLayoutEffect(() => {
     if (followLatestSignalRef.current === followLatestSignal) return;
     followLatestSignalRef.current = followLatestSignal;
+    cancelTimelineNavigation();
+    setFocusedItemId(undefined);
     restoreAnchorRef.current = undefined;
     setTimelineFollowing(true);
     if (items.length > 0) pinToLatest();
-  }, [followLatestSignal, items.length, pinToLatest, setTimelineFollowing]);
+  }, [cancelTimelineNavigation, followLatestSignal, items.length, pinToLatest, setTimelineFollowing]);
 
   useEffect(() => {
     saveViewport(followingRef.current, unreadCountRef.current);
     setUnreadCount(unreadCountRef.current);
-  }, [items, saveViewport]);
+  }, [items, saveViewport, setUnreadCount]);
 
   useLayoutEffect(() => {
     const desired = restoreAnchorRef.current;
     const node = scrollRef.current;
-    if (desired === undefined || node === null || items.length === 0) return;
+    if (desired === undefined || node === null || items.length === 0 || scrollbarDragRef.current !== undefined) return;
     const index = findTimelineRenderItemIndex(renderItems, desired.itemId);
     if (index < 0) {
       restoreAnchorRef.current = undefined;
@@ -568,7 +773,7 @@ export function Timeline({ ownerKey, sessionId, sessionName, workspaceId, onRead
     const row = [...node.querySelectorAll<HTMLElement>("[data-timeline-item-id]")].find((candidate) => timelineRowContains(candidate, desired.itemId));
     if (row === undefined) {
       programmaticScrollUntilRef.current = performance.now() + 100;
-      virtualizer.scrollToIndex(index, { align: "start" });
+      positionVirtualRow(index, "start");
       return;
     }
     const currentOffset = row.getBoundingClientRect().top - node.getBoundingClientRect().top;
@@ -577,10 +782,19 @@ export function Timeline({ ownerKey, sessionId, sessionName, workspaceId, onRead
     viewportAnchorRef.current = desired;
     if (Math.abs(nextScrollTop - node.scrollTop) >= 0.5) writeScrollTop(nextScrollTop);
     else captureViewportAnchor();
-  }, [captureViewportAnchor, items, renderItems, renderedRowsKey, virtualizer, writeScrollTop]);
+  }, [captureViewportAnchor, items, positionVirtualRow, renderItems, renderedRowsKey, viewportOwnerKey, writeScrollTop]);
 
   useLayoutEffect(() => {
-    if (focusRequest === undefined || handledFocusRequestRef.current === focusRequest.requestId) return;
+    if (focusRequest === undefined) {
+      if (activeFocusRequestRef.current !== undefined) cancelTimelineNavigation(false);
+      return;
+    }
+    if (!navigationDocumentActiveRef.current || handledFocusRequestRef.current === focusRequest.requestId) return;
+    if (activeFocusRequestRef.current?.requestId !== focusRequest.requestId || activeFocusRequestRef.current.itemId !== focusRequest.itemId) {
+      cancelTimelineNavigation(false);
+      setFocusedItemId(undefined);
+      activeFocusRequestRef.current = focusRequest;
+    }
     const index = findTimelineRenderItemIndex(renderItems, focusRequest.itemId);
     if (index < 0) return;
     const node = scrollRef.current;
@@ -589,7 +803,7 @@ export function Timeline({ ownerKey, sessionId, sessionName, workspaceId, onRead
       .find((candidate) => timelineRowContains(candidate, focusRequest.itemId));
     if (row === undefined) {
       programmaticScrollUntilRef.current = performance.now() + 100;
-      virtualizer.scrollToIndex(index, { align: "center" });
+      positionVirtualRow(index, "center");
       return;
     }
     handledFocusRequestRef.current = focusRequest.requestId;
@@ -606,20 +820,28 @@ export function Timeline({ ownerKey, sessionId, sessionName, workspaceId, onRead
     setFocusedItemId(focusRequest.itemId);
     row.focus({ preventScroll: true });
     if (focusTimerRef.current !== undefined) clearTimeout(focusTimerRef.current);
+    const generation = navigationGenerationRef.current;
+    const owner = navigationOwnerRef.current;
     focusTimerRef.current = setTimeout(() => {
+      if (!navigationDocumentActiveRef.current || navigationOwnerRef.current !== owner || navigationGenerationRef.current !== generation) return;
       focusTimerRef.current = undefined;
       setFocusedItemId((current) => current === focusRequest.itemId ? undefined : current);
     }, 2_400);
-  }, [focusRequest, items, reducedMotion, renderItems, renderedRowsKey, setTimelineFollowing, virtualizer, writeScrollTop]);
+  }, [cancelTimelineNavigation, focusRequest, items, ownerKey, positionVirtualRow, reducedMotion, renderItems, renderedRowsKey, sessionId, setTimelineFollowing, writeScrollTop]);
 
   useEffect(() => {
     const content = contentRef.current;
     if (content === null || typeof ResizeObserver === "undefined") return;
+    const owner = navigationOwnerRef.current;
+    let active = true;
     let frame: number | undefined;
     const observer = new ResizeObserver(() => {
+      if (!active || navigationOwnerRef.current !== owner || scrollbarDragRef.current !== undefined) return;
       if (frame !== undefined) cancelAnimationFrame(frame);
+      const generation = navigationGenerationRef.current;
       frame = requestAnimationFrame(() => {
         frame = undefined;
+        if (!active || !navigationDocumentActiveRef.current || navigationOwnerRef.current !== owner || navigationGenerationRef.current !== generation || scrollbarDragRef.current !== undefined) return;
         const node = scrollRef.current;
         if (node === null) return;
         const anchor = viewportAnchorRef.current;
@@ -649,16 +871,18 @@ export function Timeline({ ownerKey, sessionId, sessionName, workspaceId, onRead
     observer.observe(content);
     for (const row of content.querySelectorAll<HTMLElement>("[data-timeline-item-id]")) observer.observe(row);
     return () => {
+      active = false;
       if (frame !== undefined) cancelAnimationFrame(frame);
       observer.disconnect();
     };
-  }, [captureViewportAnchor, renderedRowsKey, saveViewport, writeScrollTop]);
+  }, [captureViewportAnchor, ownerKey, renderedRowsKey, saveViewport, sessionId, writeScrollTop]);
 
   useEffect(() => () => {
+    if (viewportOwnerRef.current !== viewportOwnerKey) return;
     captureViewportAnchor();
     saveViewport();
     if (focusTimerRef.current !== undefined) clearTimeout(focusTimerRef.current);
-  }, [captureViewportAnchor, saveViewport]);
+  }, [captureViewportAnchor, saveViewport, viewportOwnerKey]);
 
   useEffect(() => {
     const node = scrollRef.current;
@@ -678,6 +902,10 @@ export function Timeline({ ownerKey, sessionId, sessionName, workspaceId, onRead
     const currentScrollTop = node.scrollTop;
     const nextNearHistoryStart = currentScrollTop <= 56;
     setNearHistoryStart((current) => current === nextNearHistoryStart ? current : nextNearHistoryStart);
+    if (observeScrollbarMovement(node)) {
+      if (historyError === undefined && shouldLoadEarlierTimeline({ scrollTop: currentScrollTop, hasEarlier, loading: historyLoading })) requestEarlier();
+      return;
+    }
     const scrollDelta = currentScrollTop - previousScrollTopRef.current;
     previousScrollTopRef.current = currentScrollTop;
     if (performance.now() < programmaticScrollUntilRef.current) {
@@ -700,12 +928,28 @@ export function Timeline({ ownerKey, sessionId, sessionName, workspaceId, onRead
     if (followingRef.current && shouldUnpinTimelineOnUpIntent(node)) setTimelineFollowing(false);
   };
 
+  const resumeFollowingForDownIntent = (): void => {
+    if (followingRef.current) return;
+    cancelTimelineNavigation();
+    setFocusedItemId(undefined);
+    restoreAnchorRef.current = undefined;
+    setTimelineFollowing(true);
+  };
+
   const handleTimelineWheelIntent = (deltaY: number, deltaX = 0, target: EventTarget | null = null): void => {
-    if (deltaY >= 0) return;
     const node = scrollRef.current;
-    if (node === null || hasNestedTimelineScrollerThatCanMoveUp(node, target)) return;
-    if (followingRef.current && shouldUnpinTimelineOnWheel({ deltaX, deltaY, scrollHeight: node.scrollHeight, clientHeight: node.clientHeight })) setTimelineFollowing(false);
-    if (historyError === undefined && shouldLoadEarlierTimeline({ scrollTop: node.scrollTop, hasEarlier, loading: historyLoading })) requestEarlier();
+    if (node === null || !navigationDocumentActiveRef.current) return;
+    if (deltaY < 0) {
+      if (hasNestedTimelineScrollerThatCanMoveUp(node, target)) return;
+      if (followingRef.current && shouldUnpinTimelineOnWheel({ deltaX, deltaY, scrollHeight: node.scrollHeight, clientHeight: node.clientHeight })) setTimelineFollowing(false);
+      if (historyError === undefined && shouldLoadEarlierTimeline({ scrollTop: node.scrollTop, hasEarlier, loading: historyLoading })) requestEarlier();
+      return;
+    }
+    if (deltaY > 0 && !hasNestedTimelineScrollerThatCanMoveDown(node, target) && shouldRepinTimelineOnWheel({
+      deltaX,
+      deltaY,
+      distanceFromEnd: node.scrollHeight - node.scrollTop - node.clientHeight
+    })) resumeFollowingForDownIntent();
   };
 
   useAppInputTimelineOwner(scrollRef, ownerKey, (deltaY) => {
@@ -776,20 +1020,33 @@ export function Timeline({ ownerKey, sessionId, sessionName, workspaceId, onRead
         data-timeline-session-id={sessionId}
         data-selection-quote-context=""
         onScroll={onScroll}
-        onWheel={(event) => handleTimelineWheelIntent(event.deltaY, event.deltaX, event.target)}
+        onWheel={(event) => {
+          if (event.ctrlKey || event.metaKey) return;
+          handleTimelineWheelIntent(event.deltaY, event.deltaX, event.target);
+        }}
         onKeyDown={(event) => {
           if (event.defaultPrevented || !TIMELINE_HISTORY_NAVIGATION_KEYS.has(event.key) || isEditableTimelineKeyboardTarget(event.target)) return;
           stopFollowingForUpIntent(event.currentTarget);
           if (historyError === undefined && shouldLoadEarlierTimeline({ scrollTop: event.currentTarget.scrollTop, hasEarlier, loading: historyLoading })) requestEarlier();
         }}
-        onTouchStart={(event) => { touchYRef.current = event.touches[0]?.clientY; }}
+        onTouchStart={(event) => { touchYRef.current = navigationDocumentActiveRef.current && event.touches.length === 1 ? event.touches[0]?.clientY : undefined; }}
         onTouchMove={(event) => {
+          if (!navigationDocumentActiveRef.current || event.touches.length !== 1) {
+            touchYRef.current = undefined;
+            return;
+          }
           const currentY = event.touches[0]?.clientY;
           if (currentY !== undefined && touchYRef.current !== undefined && currentY > touchYRef.current + TIMELINE_TOUCH_UP_INTENT_THRESHOLD_PX) {
             touchYRef.current = currentY;
             if (hasNestedTimelineScrollerThatCanMoveUp(event.currentTarget, event.target)) return;
             stopFollowingForUpIntent(event.currentTarget);
             if (historyError === undefined && shouldLoadEarlierTimeline({ scrollTop: event.currentTarget.scrollTop, hasEarlier, loading: historyLoading })) requestEarlier();
+            return;
+          }
+          if (currentY !== undefined && touchYRef.current !== undefined && touchYRef.current - currentY > TIMELINE_TOUCH_UP_INTENT_THRESHOLD_PX) {
+            touchYRef.current = currentY;
+            if (hasNestedTimelineScrollerThatCanMoveDown(event.currentTarget, event.target)) return;
+            if (shouldRepinTimelineOnDownIntent({ distanceFromEnd: event.currentTarget.scrollHeight - event.currentTarget.scrollTop - event.currentTarget.clientHeight })) resumeFollowingForDownIntent();
           }
         }}
         onTouchEnd={() => { touchYRef.current = undefined; }}
@@ -829,7 +1086,7 @@ export function Timeline({ ownerKey, sessionId, sessionName, workspaceId, onRead
       {previousMessageEntry !== undefined && !messageNavRailCoversNavigation && <PrevMessageJumpChip preview={previousMessageEntry.preview} label={t("timeline.jumpPreviousQuestion", { preview: previousMessageEntry.preview })} onClick={jumpToPreviousMessage} />}
       {onAddSelectionToComposer !== undefined && shareSelection === undefined && <SelectionQuoteButton key={sessionId} sessionId={sessionId} containerRef={scrollRef} label={t("timeline.addToChat")} onCommit={onAddSelectionToComposer} />}
       {!following && (
-        <Button className="jump-latest" tone="secondary" aria-label={unreadCount > 0 ? `${t("timeline.jumpLatest")} (${unreadCount})` : t("timeline.jumpLatest")} onClick={() => { setTimelineFollowing(true); pinToLatest(timelineJumpBehavior(reducedMotion)); }}>
+        <Button className="jump-latest" tone="secondary" aria-label={unreadCount > 0 ? `${t("timeline.jumpLatest")} (${unreadCount})` : t("timeline.jumpLatest")} onClick={() => { cancelTimelineNavigation(); setFocusedItemId(undefined); restoreAnchorRef.current = undefined; setTimelineFollowing(true); pinToLatest(timelineJumpBehavior(reducedMotion)); }}>
           <ChevronDown aria-hidden="true" />{t("timeline.jumpLatest")}{unreadCount > 0 && <span className="jump-latest__count">{unreadCount}</span>}
         </Button>
       )}

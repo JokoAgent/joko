@@ -1351,6 +1351,10 @@ export interface TimelineItemView {
   readonly pastedTextRanges?: readonly TimelineInlineTextRangeView[];
   /** Service-authored receipt of the exact accepted user input. */
   readonly userInputAccepted?: true;
+  /** Exact operation identity supplied by the generated user-message event. */
+  readonly inputOperationId?: string;
+  /** Renderer-memory proof that this user input was sent from the same connection scope. */
+  readonly localUserInput?: boolean;
   readonly inputMentions?: readonly TimelineInputMentionView[];
   readonly mentionRanges?: readonly TimelineInputMentionRangeView[];
   /** Authoritative accounting for this completed assistant segment. */
