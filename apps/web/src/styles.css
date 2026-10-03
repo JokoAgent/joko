@@ -1071,7 +1071,7 @@ button.code-host-pull-request-summary:focus-visible { outline: 2px solid var(--a
 .timeline-link-menu button svg { width: 15px; height: 15px; flex: 0 0 auto; color: var(--text-soft); }
 .timeline-link-menu > [role="separator"] { height: 1px; margin: 2px 4px; background: var(--line); }
 .timeline-link-menu { max-width: calc(100vw - 16px); max-height: calc(100dvh - 16px); overflow: auto; }
-.timeline-link-menu button:disabled { opacity: .5; cursor: default; }
+.timeline-link-menu button:disabled, .timeline-link-menu button[aria-disabled="true"] { opacity: .5; cursor: default; }
 .timeline-link-menu > [role="status"] { max-width: 280px; padding: 4px 9px; font-size: var(--text-12); color: var(--text-soft); }
 .timeline-link-feedback { position: fixed; z-index: 181; right: 18px; bottom: 18px; border: 1px solid var(--line); border-radius: 999px; padding: 7px 12px; background: var(--surface-raised); color: var(--text); box-shadow: var(--shadow-lg); font-size: var(--text-12); }
 .message-user.is-share-selecting { align-items: flex-start; gap: 8px; }

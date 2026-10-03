@@ -1745,7 +1745,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
       loadManagedModelRuntimes(transport, signal)
     ]);
     if (response.snapshot === undefined) throw new GatewayError("Orchestrator returned an empty snapshot.");
-    const raw = response.snapshot;
+    let raw = response.snapshot;
     const entryMap = await loadWorkspaceEntries(transport, raw.workspaces, signal);
     if (signal?.aborted === true || this.#transport !== transport) return;
     const currentCursor = this.#rawSnapshot?.resumeCursor;
@@ -1756,12 +1756,27 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
       && currentCursor.generation === fetchedCursor.generation
       && fetchedCursor.sequence < currentCursor.sequence
     ) return;
+    const previousRaw = this.#rawSnapshot;
+    const sameGeneration = previousRaw?.generation === raw.generation;
+    const previousSessions = new Map(previousRaw?.sessions.map((session) => [session.sessionId, session.nativeBinding?.runtimeGeneration]));
+    const retainedSessions = new Map(raw.sessions.filter((session) => sameGeneration
+      && session.nativeBinding?.runtimeGeneration !== undefined
+      && previousSessions.get(session.sessionId) === session.nativeBinding.runtimeGeneration)
+      .map((session) => [session.sessionId, session.nativeBinding!.runtimeGeneration]));
+    // Owner snapshots omit transcripts. Retain only already durable stream
+    // events still owned by the same service and Session generations.
+    raw = { ...raw, timeline: [...(previousRaw?.timeline ?? []).filter((event) => {
+      const sessionId = event.identity?.sessionId;
+      return sessionId !== undefined && retainedSessions.has(sessionId)
+        && event.identity?.generation === retainedSessions.get(sessionId);
+    }), ...raw.timeline] };
     const mapped = {
       ...mapSnapshot(raw, entryMap, managedModelRuntimes, this.isLocalUserInput),
-      // Owner snapshots intentionally omit session timelines. Preserve the
-      // client-side deletion fences until the App has reloaded the affected
-      // authoritative history page.
-      timelineHistoryRevisionBySession: this.#snapshot?.timelineHistoryRevisionBySession ?? new Map<string, bigint>()
+      // A deletion fence can outlive its descriptor until App adopts the
+      // authoritative history response. It never supplies cached body text.
+      timelineHistoryRevisionBySession: sameGeneration
+        ? this.#snapshot?.timelineHistoryRevisionBySession ?? new Map<string, bigint>()
+        : new Map<string, bigint>()
     };
     this.#rawSnapshot = raw;
     this.#snapshot = mapped;
@@ -8942,6 +8957,12 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
             if (visionEffect !== undefined) this.#callbacks.onVisionBridgeUiEffect?.(visionEffect);
           }
           if (continuity === "gap" || continuity === "generationChanged" || continuity === "missingCursor" || invalidated) {
+            if (this.#rawSnapshot !== undefined && this.#snapshot !== undefined) {
+              const retired = retireTimelineHistory(this.#rawSnapshot, this.#snapshot, undefined, event.cursor?.sequence);
+              this.#rawSnapshot = retired.rawSnapshot;
+              this.#snapshot = retired.snapshot;
+              this.#callbacks.onSnapshot?.(retired.snapshot);
+            }
             await this.flushEventRefresh(event.cursor);
             lastGeneration = this.#snapshot?.generation;
             lastSequence = this.#snapshot?.cursor;
@@ -8961,6 +8982,11 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
             lastGeneration = projected.snapshot.generation;
             lastSequence = projected.snapshot.cursor;
             if (projected.refresh === "batched") this.scheduleEventRefresh();
+            else if (projected.refresh === "authoritative") {
+              await this.flushEventRefresh(event.cursor);
+              lastGeneration = this.#snapshot?.generation;
+              lastSequence = this.#snapshot?.cursor;
+            }
           }
           delay = 350;
         }
@@ -9356,7 +9382,7 @@ export function projectSnapshotEvent(
   const kind = event.payload?.kind;
 
   if (kind?.case === "projectionInvalidated") {
-    return { rawSnapshot: raw, snapshot: projected, refresh: "authoritative" };
+    return { ...retireTimelineHistory(raw, projected, undefined, cursor?.sequence), refresh: "authoritative" };
   }
   if (kind?.case === undefined) {
     return { rawSnapshot: raw, snapshot: projected, refresh: "batched" };
@@ -9581,7 +9607,10 @@ export function projectSnapshotEvent(
         raw = { ...raw, sessions: upsertBy(raw.sessions, updated, (value) => value.sessionId) };
         projected = remapSessionProjection(raw, projected, sessionId);
       }
-      if (kind.value.timelineRebuilt) refresh = "batched";
+      if (kind.value.timelineRebuilt) {
+        ({ rawSnapshot: raw, snapshot: projected } = retireTimelineHistory(raw, projected, sessionId || undefined, cursor?.sequence));
+        refresh = "batched";
+      }
       break;
     }
     case "runtimeCommandsChanged": {
@@ -9616,6 +9645,7 @@ export function projectSnapshotEvent(
     }
     case "sessionReset": {
       const sessionId = kind.value.productSessionId || event.identity?.sessionId || "";
+      ({ rawSnapshot: raw, snapshot: projected } = retireTimelineHistory(raw, projected, sessionId || undefined, cursor?.sequence));
       if (sessionId === "") {
         refresh = "authoritative";
         break;
@@ -9628,7 +9658,6 @@ export function projectSnapshotEvent(
       extensionStatusesBySession.delete(sessionId);
       raw = {
         ...raw,
-        timeline: raw.timeline.filter((candidate) => candidate.identity?.sessionId !== sessionId),
         runs: raw.runs.filter((candidate) => candidate.sessionId !== sessionId),
         queueItems: raw.queueItems.filter((candidate) => candidate.sessionId !== sessionId),
         queueControls: raw.queueControls.filter((candidate) => candidate.sessionId !== sessionId),
@@ -9660,6 +9689,7 @@ export function projectSnapshotEvent(
     }
     case "historyPruned": {
       const sessionId = kind.value.productSessionId || event.identity?.sessionId || "";
+      ({ rawSnapshot: raw, snapshot: projected } = retireTimelineHistory(raw, projected, sessionId || undefined, cursor?.sequence));
       if (sessionId === "") {
         refresh = "authoritative";
         break;
@@ -9672,7 +9702,6 @@ export function projectSnapshotEvent(
       extensionStatusesBySession.delete(sessionId);
       raw = {
         ...raw,
-        timeline: raw.timeline.filter((candidate) => candidate.identity?.sessionId !== sessionId),
         runs: raw.runs.filter((candidate) => candidate.sessionId !== sessionId),
         queueItems: raw.queueItems.filter((candidate) => candidate.sessionId !== sessionId),
         queueControls: raw.queueControls.filter((candidate) => candidate.sessionId !== sessionId),
@@ -9703,9 +9732,7 @@ export function projectSnapshotEvent(
       // Store owns the user-row/assistant-round semantics and the surviving
       // authoritative projection.
       const sessionId = kind.value.productSessionId || event.identity?.sessionId || "";
-      if (sessionId.length > 0) {
-        projected = withTimelineHistoryInvalidation(projected, sessionId, event.cursor?.sequence ?? projected.cursor);
-      }
+      ({ rawSnapshot: raw, snapshot: projected } = retireTimelineHistory(raw, projected, sessionId || undefined, cursor?.sequence));
       refresh = "authoritative";
       break;
     }
@@ -9852,12 +9879,31 @@ export function projectSnapshotEvent(
     case "nativeSessionChanged":
       // A marker can remove the whole active prefix; only the service owns
       // which durable events remain visible on this native branch.
+      ({ rawSnapshot: raw, snapshot: projected } = retireTimelineHistory(raw, projected,
+        kind.value.productSessionId || event.identity?.sessionId || undefined, cursor?.sequence));
       refresh = "authoritative";
       break;
   }
 
   if (diagnosticsChanged) projected = { ...projected, diagnostics: collectDiagnostics(raw) };
   return { rawSnapshot: raw, snapshot: projected, refresh };
+}
+
+function retireTimelineHistory(raw: Snapshot, snapshot: AppSnapshot, sessionId?: string, revision = snapshot.cursor): {
+  readonly rawSnapshot: Snapshot;
+  readonly snapshot: AppSnapshot;
+} {
+  const sessionIds = sessionId === undefined
+    ? new Set([...raw.sessions.map((session) => session.sessionId), ...snapshot.timelineBySession.keys()])
+    : new Set([sessionId]);
+  const timelineBySession = new Map(snapshot.timelineBySession);
+  let next = snapshot;
+  for (const id of sessionIds) {
+    timelineBySession.delete(id);
+    next = withTimelineHistoryInvalidation(next, id, revision);
+  }
+  return { rawSnapshot: { ...raw, timeline: raw.timeline.filter((event) => !sessionIds.has(event.identity?.sessionId ?? "")) },
+    snapshot: { ...next, timelineBySession } };
 }
 
 function projectTerminalRun(

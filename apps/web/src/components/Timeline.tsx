@@ -1744,18 +1744,16 @@ const ParsedMarkdown = memo(function ParsedMarkdown({ text, t, wordFade, onWordF
     ...(personalization.onLoadWorkspaceAsset === undefined ? {} : { onLoadWorkspaceAsset: personalization.onLoadWorkspaceAsset }),
     ...(personalization.onWorkspaceImageToComposer === undefined ? {} : { onWorkspaceImageToComposer: personalization.onWorkspaceImageToComposer })
   }), [personalization.ownerKey, personalization.onLoadWorkspaceAsset, personalization.onOpenHttpLink, personalization.onOpenWorkspaceHtml, personalization.onWorkspaceImageToComposer, personalization.sessionId, t]);
-  const components = useMemo(
-    () => safeMarkdownComponents(t, referenceActions, onWordFadeSettled),
-    [onWordFadeSettled, referenceActions, t]
-  );
+  const renderActions = useMemo(() => ({ referenceActions, onWordFadeSettled }), [onWordFadeSettled, referenceActions]);
   const normalized = useMemo(() => normalizeTimelineMathDelimiters(text), [text]);
   const rehypePlugins = useMemo(() => wordFade === undefined
     ? TIMELINE_REHYPE_PLUGINS
     : [...TIMELINE_REHYPE_PLUGINS, [rehypeTimelineStreamFade, wordFade]] as NonNullable<ComponentProps<typeof ReactMarkdown>["rehypePlugins"]>, [wordFade]);
-  return <TimelineLinkSourceContext.Provider value={text}>
-    <TimelineMarkdownDocument remarkPlugins={TIMELINE_REMARK_PLUGINS} rehypePlugins={rehypePlugins} components={components} skipHtml>{normalized}</TimelineMarkdownDocument>
-
-  </TimelineLinkSourceContext.Provider>;
+  return <TimelineMarkdownRenderContext.Provider value={renderActions}>
+    <TimelineLinkSourceContext.Provider value={text}>
+      <TimelineMarkdownDocument remarkPlugins={TIMELINE_REMARK_PLUGINS} rehypePlugins={rehypePlugins} components={SAFE_MARKDOWN_COMPONENTS} skipHtml>{normalized}</TimelineMarkdownDocument>
+    </TimelineLinkSourceContext.Provider>
+  </TimelineMarkdownRenderContext.Provider>;
 });
 
 function useStreamingMarkdownText(value: string, streaming: boolean, intervalMs = 100): string {
@@ -2285,13 +2283,25 @@ function rememberWorkGroupExpansion(key: string, expanded: boolean): void {
   }
 }
 
-function safeMarkdownComponents(
-  t: Translator,
-  referenceActions: TimelineReferenceActions,
-  onWordFadeSettled?: (event: { readonly animationName: string; readonly currentTarget: { readonly dataset: DOMStringMap } }) => void
-): Components {
-  return {
+interface TimelineMarkdownRenderActions {
+  readonly referenceActions: TimelineReferenceActions;
+  readonly onWordFadeSettled?: (event: { readonly animationName: string; readonly currentTarget: { readonly dataset: DOMStringMap } }) => void;
+}
+
+const TimelineMarkdownRenderContext = createContext<TimelineMarkdownRenderActions | undefined>(undefined);
+
+function useTimelineMarkdownRenderActions(): TimelineMarkdownRenderActions {
+  const actions = useContext(TimelineMarkdownRenderContext);
+  if (actions === undefined) throw new Error("Markdown renderer actions are unavailable.");
+  return actions;
+}
+
+// Keep renderer types stable while current actions flow through their context.
+// Fresh application callbacks must not remount selected words or restart fades.
+const SAFE_MARKDOWN_COMPONENTS: Components = {
     pre: ({ children, node: _node, ...props }) => {
+      const { referenceActions } = useTimelineMarkdownRenderActions();
+      const { t } = referenceActions;
       const first = Array.isArray(children) ? children[0] : children;
       if (isValidElement(first)) {
         const className = (first.props as { readonly className?: string }).className;
@@ -2302,10 +2312,14 @@ function safeMarkdownComponents(
       }
       return <pre {...props}>{children}</pre>;
     },
-    table: ({ children, node, ...props }) => <TimelineCopyAsImageBlock ownerKey={JSON.stringify([referenceActions.ownerKey, referenceActions.sessionId])} sourceKey={JSON.stringify(node)} imageName="table.png" onSendToChat={referenceActions.onWorkspaceImageToComposer} className="timeline-copy-block--table" contentClassName="timeline-copy-block__scroll" extractPlainText={timelineTableToTsv} t={t}>
-      <table {...props}>{children}</table>
-    </TimelineCopyAsImageBlock>,
+    table: ({ children, node, ...props }) => {
+      const { referenceActions } = useTimelineMarkdownRenderActions();
+      return <TimelineCopyAsImageBlock ownerKey={JSON.stringify([referenceActions.ownerKey, referenceActions.sessionId])} sourceKey={JSON.stringify(node)} imageName="table.png" onSendToChat={referenceActions.onWorkspaceImageToComposer} className="timeline-copy-block--table" contentClassName="timeline-copy-block__scroll" extractPlainText={timelineTableToTsv} t={referenceActions.t}>
+        <table {...props}>{children}</table>
+      </TimelineCopyAsImageBlock>;
+    },
     span: ({ children, className, node, ...props }) => {
+      const { referenceActions, onWordFadeSettled } = useTimelineMarkdownRenderActions();
       const wordFadeKey = (props as Record<string, unknown>)["data-wf-key"];
       const startedAt = Number((props as Record<string, unknown>)["data-wf-started-at"]);
       if (typeof wordFadeKey === "string" && Number.isFinite(startedAt)) {
@@ -2319,7 +2333,7 @@ function safeMarkdownComponents(
           : undefined}
       >{children}</span>;
       return className?.split(/\s+/u).includes("katex-display") === true
-        ? <TimelineCopyAsImageBlock ownerKey={JSON.stringify([referenceActions.ownerKey, referenceActions.sessionId])} sourceKey={JSON.stringify(node)} imageName="formula.png" onSendToChat={referenceActions.onWorkspaceImageToComposer} className="timeline-copy-block--math" extractPlainText={timelineMathToLatex} t={t}>{content}</TimelineCopyAsImageBlock>
+        ? <TimelineCopyAsImageBlock ownerKey={JSON.stringify([referenceActions.ownerKey, referenceActions.sessionId])} sourceKey={JSON.stringify(node)} imageName="formula.png" onSendToChat={referenceActions.onWorkspaceImageToComposer} className="timeline-copy-block--math" extractPlainText={timelineMathToLatex} t={referenceActions.t}>{content}</TimelineCopyAsImageBlock>
         : content;
     },
     li: ({ node: _node, ...props }) => {
@@ -2327,11 +2341,14 @@ function safeMarkdownComponents(
       return Number.isFinite(startedAt) ? <TimelineFadeElement as="li" {...props} startedAt={startedAt} /> : <li {...props} />;
     },
     a: ({ children, href, node: _node, ...props }) => {
+      const { referenceActions } = useTimelineMarkdownRenderActions();
       return <TimelineMarkdownLink href={href} actions={referenceActions} anchorProps={props}>{children}</TimelineMarkdownLink>;
     },
-    img: ({ src, alt }) => <TimelineMarkdownImage src={src} alt={alt} actions={referenceActions} t={t} />
-  };
-}
+    img: ({ src, alt }) => {
+      const { referenceActions } = useTimelineMarkdownRenderActions();
+      return <TimelineMarkdownImage src={src} alt={alt} actions={referenceActions} t={referenceActions.t} />;
+    }
+};
 
 function timelineMarkdownNodeText(node: ReactNode): string {
   if (node === null || node === undefined || typeof node === "boolean") return "";
