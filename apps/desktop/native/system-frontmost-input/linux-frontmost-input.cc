@@ -13,6 +13,7 @@
 
 #include <fcntl.h>
 #include <poll.h>
+#include <sys/random.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
@@ -47,12 +48,78 @@ constexpr auto kEffectTimeout = std::chrono::milliseconds(600);
 constexpr auto kActivationTimeout = std::chrono::milliseconds(120);
 constexpr std::size_t kMaximumReplyBytes = 256 * 1024;
 constexpr std::size_t kMaximumAuthorityBytes = 1024 * 1024;
+constexpr std::size_t kMaximumTargets = 256;
 constexpr xcb_keysym_t kReturn = 0xff0d;
 constexpr xcb_keysym_t kPasteKey = 0x0076;
 
+struct ProcessInstance {
+  pid_t process;
+  std::uint64_t start_ticks;
+};
+
+bool SameProcess(const ProcessInstance& first, const ProcessInstance& second) {
+  return first.process == second.process && first.start_ticks == second.start_ticks;
+}
+
+struct ServerPeer {
+  ProcessInstance instance;
+  uid_t user;
+  gid_t group;
+};
+
+bool SamePeer(const ServerPeer& first, const ServerPeer& second) {
+  return SameProcess(first.instance, second.instance) && first.user == second.user && first.group == second.group;
+}
+
+struct ServerIdentity {
+  ServerPeer peer;
+  int display;
+  int screen;
+  xcb_window_t root;
+};
+
+bool SameServer(const ServerIdentity& first, const ServerIdentity& second) {
+  return SamePeer(first.peer, second.peer) && first.display == second.display &&
+      first.screen == second.screen && first.root == second.root;
+}
+
 struct Target {
   xcb_window_t window;
-  pid_t process;
+  ProcessInstance client;
+  ServerIdentity server;
+};
+
+bool SameTarget(const Target& first, const Target& second) {
+  return first.window == second.window && SameProcess(first.client, second.client) &&
+      SameServer(first.server, second.server);
+}
+
+struct IssuedTarget {
+  std::uint64_t token;
+  Target identity;
+};
+
+struct TargetOwner {
+  explicit TargetOwner(napi_env value) : environment(value) { targets.reserve(kMaximumTargets); }
+  napi_env environment;
+  std::vector<IssuedTarget> targets;
+};
+
+void RetireTarget(TargetOwner& owner, std::uint64_t token) {
+  const auto entry = std::find_if(owner.targets.begin(), owner.targets.end(),
+      [token](const IssuedTarget& target) { return target.token == token; });
+  if (entry != owner.targets.end()) owner.targets.erase(entry);
+}
+
+class EffectLease {
+ public:
+  EffectLease(TargetOwner& owner, std::uint64_t token) : owner_(owner), token_(token) {}
+  ~EffectLease() { if (!complete_) RetireTarget(owner_, token_); }
+  void Complete() { complete_ = true; }
+ private:
+  TargetOwner& owner_;
+  std::uint64_t token_;
+  bool complete_ = false;
 };
 
 template <typename T>
@@ -234,12 +301,62 @@ int ConnectLocal(int display, Deadline deadline) {
   return -1;
 }
 
-bool NativeServer(int descriptor, Deadline deadline) {
+bool ReadProcessInstance(pid_t process, Deadline deadline, ProcessInstance* instance) {
+  if (process <= 0 || Clock::now() >= deadline) return false;
+  const std::string path = "/proc/" + std::to_string(process) + "/stat";
+  const Descriptor descriptor(open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NONBLOCK));
+  struct stat metadata{};
+  if (descriptor.get() < 0 || fstat(descriptor.get(), &metadata) != 0 || !S_ISREG(metadata.st_mode)) return false;
+  std::array<char, 4096> storage{};
+  std::size_t size = 0;
+  bool finished = false;
+  while (size < storage.size() && Clock::now() < deadline) {
+    const ssize_t amount = read(descriptor.get(), storage.data() + size, storage.size() - size);
+    if (amount > 0) size += static_cast<std::size_t>(amount);
+    else if (amount == 0) { finished = true; break; }
+    else if (errno != EINTR) return false;
+  }
+  if (!finished || size == 0 || Clock::now() >= deadline) return false;
+  const std::string_view contents(storage.data(), size);
+  const auto opening = contents.find(" (");
+  const auto closing = contents.rfind(')');
+  pid_t observed = 0;
+  if (contents.find('\0') != std::string_view::npos || opening == std::string_view::npos ||
+      closing == std::string_view::npos || closing <= opening + 1 || closing + 4 >= size) return false;
+  const auto parsed_pid = std::from_chars(contents.data(), contents.data() + opening, observed);
+  if (parsed_pid.ec != std::errc() || parsed_pid.ptr != contents.data() + opening || observed != process ||
+      contents[closing + 1] != ' ' || contents[closing + 3] != ' ' ||
+      contents[closing + 2] == 'Z' || contents[closing + 2] == 'X' || contents[closing + 2] == 'x') return false;
+  const char state = contents[closing + 2];
+  if (!((state >= 'A' && state <= 'Z') || (state >= 'a' && state <= 'z'))) return false;
+  std::size_t offset = closing + 4;
+  std::uint64_t start_ticks = 0;
+  for (unsigned int field = 4; field <= 22; ++field) {
+    const std::size_t start = offset;
+    if (field != 22 && offset < size && contents[offset] == '-') ++offset;
+    const std::size_t digits = offset;
+    while (offset < size && contents[offset] >= '0' && contents[offset] <= '9') ++offset;
+    if (offset == digits || offset >= size || contents[offset] != ' ') return false;
+    if (field == 22) {
+      const auto parsed = std::from_chars(contents.data() + start, contents.data() + offset, start_ticks);
+      if (parsed.ec != std::errc() || parsed.ptr != contents.data() + offset || start_ticks == 0) return false;
+    }
+    ++offset;
+  }
+  if (Clock::now() >= deadline) return false;
+  *instance = {process, start_ticks};
+  return true;
+}
+
+bool NativeServer(int descriptor, Deadline deadline, ServerPeer* identity) {
   ucred peer{};
   socklen_t size = sizeof(peer);
   if (Clock::now() >= deadline ||
       getsockopt(descriptor, SOL_SOCKET, SO_PEERCRED, &peer, &size) != 0 ||
       size != sizeof(peer) || peer.pid <= 0) return false;
+  ProcessInstance first{};
+  ProcessInstance second{};
+  if (!ReadProcessInstance(peer.pid, deadline, &first)) return false;
   const std::string path = "/proc/" + std::to_string(peer.pid) + "/exe";
   char executable[4096];
   const ssize_t length = readlink(path.c_str(), executable, sizeof(executable) - 1);
@@ -247,7 +364,17 @@ bool NativeServer(int descriptor, Deadline deadline) {
   executable[length] = '\0';
   const char* basename = std::strrchr(executable, '/');
   // An Xwayland peer cannot prove the global foreground of its compositor.
-  return basename != nullptr && std::strcmp(basename + 1, "Xorg") == 0;
+  // Independent Xvnc is an X11 desktop, subject to the same live capabilities.
+  if (basename == nullptr || (std::strcmp(basename + 1, "Xorg") != 0 &&
+      std::strcmp(basename + 1, "Xvnc") != 0) ||
+      !ReadProcessInstance(peer.pid, deadline, &second) || !SameProcess(first, second)) return false;
+  ucred confirmation{};
+  size = sizeof(confirmation);
+  if (Clock::now() >= deadline ||
+      getsockopt(descriptor, SOL_SOCKET, SO_PEERCRED, &confirmation, &size) != 0 || size != sizeof(confirmation) ||
+      confirmation.pid != peer.pid || confirmation.uid != peer.uid || confirmation.gid != peer.gid) return false;
+  *identity = {first, peer.uid, peer.gid};
+  return true;
 }
 
 class Connection {
@@ -271,7 +398,9 @@ class Connection {
     int screen = 0;
     if (!LocalDisplay(&display, &screen)) return false;
     Descriptor descriptor(ConnectLocal(display, deadline_));
-    if (descriptor.get() < 0 || !NativeServer(descriptor.get(), deadline_)) return false;
+    ServerPeer peer{};
+    if (descriptor.get() < 0 || !NativeServer(descriptor.get(), deadline_, &peer)) return false;
+    server_ = {peer, display, screen, XCB_NONE};
     watchdog_descriptor_ = fcntl(descriptor.get(), F_DUPFD_CLOEXEC, 0);
     if (watchdog_descriptor_ < 0) return false;
     // shutdown wakes libxcb's internal setup/flush waits too. The duplicate
@@ -293,11 +422,17 @@ class Connection {
     while (screen-- > 0 && roots.rem > 0) xcb_screen_next(&roots);
     if (roots.rem == 0 || roots.data == nullptr || roots.data->root == XCB_NONE) return false;
     root_ = roots.data->root;
+    server_.root = root_;
     const xcb_query_extension_reply_t* extension = xcb_get_extension_data(connection_, &xcb_res_id);
     if (extension == nullptr || extension->present == 0 || !Healthy()) return false;
     const auto version_cookie = xcb_res_query_version(connection_, 1, 2);
     const auto version = ReadReply<xcb_res_query_version_reply_t>(version_cookie.sequence);
     if (!version || version->server_major != 1 || version->server_minor < 2) return false;
+    const auto* keyboard_extension = xcb_get_extension_data(connection_, &xcb_xkb_id);
+    if (keyboard_extension == nullptr || keyboard_extension->present == 0 || !Healthy()) return false;
+    const auto keyboard_cookie = xcb_xkb_use_extension(connection_, 1, 0);
+    const auto keyboard = ReadReply<xcb_xkb_use_extension_reply_t>(keyboard_cookie.sequence);
+    if (!keyboard || keyboard->supported == 0) return false;
     active_ = Atom("_NET_ACTIVE_WINDOW");
     supporting_ = Atom("_NET_SUPPORTING_WM_CHECK");
     supported_ = Atom("_NET_SUPPORTED");
@@ -312,7 +447,9 @@ class Connection {
         property->bytes_after != 0 || property->value_len > 1024 ||
         xcb_get_property_value_length(property.get()) != static_cast<int>(property->value_len * sizeof(xcb_atom_t))) return false;
     const auto* atoms = static_cast<const xcb_atom_t*>(xcb_get_property_value(property.get()));
-    return std::find(atoms, atoms + property->value_len, active_) != atoms + property->value_len && Healthy();
+    ServerIdentity confirmation{};
+    return std::find(atoms, atoms + property->value_len, active_) != atoms + property->value_len &&
+        ReadServer(&confirmation) && SameServer(server_, confirmation);
   }
 
   bool Healthy() const {
@@ -324,6 +461,14 @@ class Connection {
   xcb_window_t root() const { return root_; }
   xcb_atom_t active_atom() const { return active_; }
   Deadline deadline() const { return deadline_; }
+
+  bool ReadServer(ServerIdentity* identity, Deadline limit = Deadline::max()) const {
+    ServerPeer observed{};
+    if (!Healthy() || !NativeServer(watchdog_descriptor_, std::min(limit, deadline_), &observed) ||
+        !SamePeer(server_.peer, observed) || !Healthy()) return false;
+    *identity = {observed, server_.display, server_.screen, root_};
+    return true;
+  }
 
   template <typename T>
   Reply<T> ReadReply(unsigned int sequence, Deadline limit = Deadline::max()) {
@@ -376,6 +521,7 @@ class Connection {
 
   Deadline deadline_;
   xcb_connection_t* connection_ = nullptr;
+  ServerIdentity server_{};
   xcb_window_t root_ = XCB_NONE;
   xcb_atom_t active_ = XCB_NONE;
   xcb_atom_t supporting_ = XCB_NONE;
@@ -388,7 +534,7 @@ class Connection {
   bool complete_ = false;
 };
 
-bool ReadOwner(Connection& connection, xcb_window_t window, pid_t* process,
+bool ReadOwner(Connection& connection, xcb_window_t window, ProcessInstance* process,
                 Deadline limit = Deadline::max()) {
   if (window == XCB_NONE || window == connection.root() || !connection.Healthy()) return false;
   const auto ranges_cookie = xcb_res_query_clients(connection.get());
@@ -415,8 +561,8 @@ bool ReadOwner(Connection& connection, xcb_window_t window, pid_t* process,
       iterator.data->spec.mask != XCB_RES_CLIENT_ID_MASK_LOCAL_CLIENT_PID || iterator.data->length != 4) return false;
   const std::uint32_t observed = *xcb_res_client_id_value_value(iterator.data);
   if (observed == 0 || observed > static_cast<std::uint32_t>(std::numeric_limits<pid_t>::max())) return false;
-  *process = static_cast<pid_t>(observed);
-  return connection.Healthy();
+  return ReadProcessInstance(static_cast<pid_t>(observed), std::min(limit, connection.deadline()), process) &&
+      connection.Healthy();
 }
 
 bool Viewable(Connection& connection, xcb_window_t window, Deadline limit = Deadline::max()) {
@@ -431,13 +577,15 @@ bool ConfirmTarget(napi_env environment, Connection& connection, const Target& t
     Fail(environment, 10, "Targeted system input exceeded its deadline.");
     return false;
   }
-  pid_t observed = 0;
-  if (!ReadOwner(connection, target.window, &observed) || observed != target.process) {
+  ServerIdentity server{};
+  ProcessInstance observed{};
+  if (!connection.ReadServer(&server) || !SameServer(server, target.server) ||
+      !ReadOwner(connection, target.window, &observed) || !SameProcess(observed, target.client)) {
     Fail(environment, connection.TimedOut() ? 10 : 3,
          "The targeted system process identity is unavailable or changed.");
     return false;
   }
-  if (observed == getpid()) {
+  if (observed.process == getpid()) {
     Fail(environment, 11, "Targeted system input requires an external process.");
     return false;
   }
@@ -448,12 +596,71 @@ bool ConfirmTarget(napi_env environment, Connection& connection, const Target& t
   return true;
 }
 
+bool NextToken(Deadline deadline, std::uint64_t* token) {
+  // All environments share one non-repeating sequence. A fresh process starts
+  // with a private random epoch rather than restarting the published IDs at one.
+  static std::atomic<std::uint64_t> last{0};
+  std::uint64_t current = last.load();
+  if (Clock::now() >= deadline) return false;
+  if (current == 0) {
+    std::uint64_t seed = 0;
+    std::size_t received = 0;
+    while (received < sizeof(seed) && Clock::now() < deadline) {
+      const ssize_t amount = getrandom(reinterpret_cast<unsigned char*>(&seed) + received,
+          sizeof(seed) - received, GRND_NONBLOCK);
+      if (amount > 0) received += static_cast<std::size_t>(amount);
+      else if (amount == 0 || errno != EINTR) return false;
+    }
+    if (received != sizeof(seed) || Clock::now() >= deadline) return false;
+    seed &= static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max());
+    if (seed == 0 || seed == static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())) return false;
+    if (last.compare_exchange_strong(current, seed)) current = seed;
+  }
+  while (Clock::now() < deadline && current < static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())) {
+    if (last.compare_exchange_weak(current, current + 1)) {
+      *token = current + 1;
+      return true;
+    }
+  }
+  return false;
+}
+
+bool IssueTarget(TargetOwner& owner, const Target& target, Deadline deadline, std::uint64_t* token) {
+  const auto existing = std::find_if(owner.targets.begin(), owner.targets.end(),
+      [&target](const IssuedTarget& entry) { return SameTarget(entry.identity, target); });
+  if (existing != owner.targets.end()) {
+    *token = existing->token;
+    return Clock::now() < deadline;
+  }
+  if (owner.targets.size() == kMaximumTargets) {
+    for (auto entry = owner.targets.begin(); entry != owner.targets.end() && Clock::now() < deadline;) {
+      ProcessInstance server{};
+      ProcessInstance client{};
+      bool valid = ReadProcessInstance(entry->identity.server.peer.instance.process, deadline, &server) &&
+          SameProcess(server, entry->identity.server.peer.instance);
+      if (Clock::now() >= deadline) return false;
+      if (valid) valid = ReadProcessInstance(entry->identity.client.process, deadline, &client) &&
+          SameProcess(client, entry->identity.client);
+      if (Clock::now() >= deadline) return false;
+      if (!valid) entry = owner.targets.erase(entry);
+      else ++entry;
+    }
+  }
+  // No TTL or live-target eviction: a long voice transaction retains its token.
+  // A full table refuses new captures until an instance or effect retires one.
+  if (Clock::now() >= deadline || owner.targets.size() >= kMaximumTargets || !NextToken(deadline, token)) return false;
+  owner.targets.push_back({*token, target});
+  return true;
+}
+
 bool ReadTargetArguments(napi_env environment, napi_callback_info information,
-                         bool scroll, Target* target, std::int32_t* wheel) {
+                         bool scroll, TargetOwner** owner, IssuedTarget* target, std::int32_t* wheel) {
   napi_value arguments[4];
   size_t count = scroll ? 4 : 3;
-  if (napi_get_cb_info(environment, information, &count, arguments, nullptr, nullptr) != napi_ok ||
-      count != (scroll ? 3 : 2)) {
+  void* data = nullptr;
+  if (napi_get_cb_info(environment, information, &count, arguments, nullptr, &data) != napi_ok ||
+      count != (scroll ? 3 : 2) || data == nullptr ||
+      static_cast<TargetOwner*>(data)->environment != environment) {
     Fail(environment, 2, "Targeted system input received invalid arguments.", true);
     return false;
   }
@@ -462,12 +669,12 @@ bool ReadTargetArguments(napi_env environment, napi_callback_info information,
   size_t length = 0;
   if (napi_typeof(environment, arguments[0], &identifier_type) != napi_ok || identifier_type != napi_string ||
       napi_get_value_string_utf8(environment, arguments[0], nullptr, 0, &length) != napi_ok ||
-      length == 0 || length > 10 ||
+      length == 0 || length > 19 ||
       napi_typeof(environment, arguments[1], &process_type) != napi_ok || process_type != napi_number) {
-    Fail(environment, 2, "Targeted system input requires an exact window and process identity.", true);
+    Fail(environment, 2, "Targeted system input requires an exact captured target and process identity.", true);
     return false;
   }
-  char identifier[11];
+  char identifier[20];
   size_t copied = 0;
   if (napi_get_value_string_utf8(environment, arguments[0], identifier, sizeof(identifier), &copied) != napi_ok ||
       copied != length || identifier[0] < '1' || identifier[0] > '9') {
@@ -480,16 +687,26 @@ bool ReadTargetArguments(napi_env environment, napi_callback_info information,
       return false;
     }
   }
-  std::uint32_t window = 0;
-  const auto parsed = std::from_chars(identifier, identifier + length, window);
+  std::uint64_t token = 0;
+  const auto parsed = std::from_chars(identifier, identifier + length, token);
   double process = 0;
   if (parsed.ec != std::errc() || parsed.ptr != identifier + length ||
+      token > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()) ||
       napi_get_value_double(environment, arguments[1], &process) != napi_ok || !std::isfinite(process) ||
       process <= 0 || process > std::numeric_limits<pid_t>::max() || std::floor(process) != process) {
     Fail(environment, 2, "The targeted system window or process identity is invalid.", true);
     return false;
   }
-  *target = {window, static_cast<pid_t>(process)};
+  *owner = static_cast<TargetOwner*>(data);
+  const auto entry = std::find_if((*owner)->targets.begin(), (*owner)->targets.end(),
+      [token](const IssuedTarget& value) { return value.token == token; });
+  if (entry == (*owner)->targets.end() || entry->identity.client.process != static_cast<pid_t>(process)) {
+    // A mismatched process cannot leave a previously issued target usable.
+    RetireTarget(**owner, token);
+    Fail(environment, 3, "The captured system target is unavailable or changed.");
+    return false;
+  }
+  *target = *entry;
   if (scroll) {
     napi_valuetype wheel_type;
     double amount = 0;
@@ -575,6 +792,8 @@ bool FixedMapping(Connection& connection, xcb_keysym_t symbol, std::uint8_t modi
 
 bool FocusReceiver(Connection& connection, const Target& target, xcb_window_t* receiver,
                     Deadline limit = Deadline::max()) {
+  ServerIdentity server{};
+  if (!connection.ReadServer(&server, limit) || !SameServer(server, target.server)) return false;
   xcb_window_t active = XCB_NONE;
   if (!connection.WindowProperty(connection.root(), connection.active_atom(), &active, limit) || active != target.window) return false;
   const auto cookie = xcb_get_input_focus(connection.get());
@@ -591,13 +810,17 @@ bool FocusReceiver(Connection& connection, const Target& target, xcb_window_t* r
     if (!tree || tree->root != connection.root() || tree->parent == ancestor) return false;
     ancestor = tree->parent;
   }
-  pid_t process = 0;
+  ProcessInstance process{};
   if (!belongs || !Viewable(connection, candidate, limit) ||
-      !ReadOwner(connection, candidate, &process, limit) || process != target.process || process == getpid()) return false;
+      !ReadOwner(connection, candidate, &process, limit) || !SameProcess(process, target.client) ||
+      process.process == getpid()) return false;
   const auto second_cookie = xcb_get_input_focus(connection.get());
   const auto second = connection.ReadReply<xcb_get_input_focus_reply_t>(second_cookie.sequence, limit);
+  ProcessInstance confirmation{};
   if (!second || second->focus != candidate ||
-      !connection.WindowProperty(connection.root(), connection.active_atom(), &active, limit) || active != target.window) return false;
+      !connection.WindowProperty(connection.root(), connection.active_atom(), &active, limit) || active != target.window ||
+      !ReadOwner(connection, candidate, &confirmation, limit) || !SameProcess(confirmation, target.client) ||
+      !connection.ReadServer(&server, limit) || !SameServer(server, target.server)) return false;
   *receiver = candidate;
   return connection.Healthy();
 }
@@ -681,8 +904,11 @@ napi_value Safely(napi_env environment, Action action) {
 
 napi_value PostKey(napi_env environment, napi_callback_info information, bool paste) {
   return Safely(environment, [&]() -> napi_value {
-    Target target{};
-    if (!ReadTargetArguments(environment, information, false, &target, nullptr)) return nullptr;
+    TargetOwner* owner = nullptr;
+    IssuedTarget issued{};
+    if (!ReadTargetArguments(environment, information, false, &owner, &issued, nullptr)) return nullptr;
+    EffectLease lease(*owner, issued.token);
+    const Target& target = issued.identity;
     Connection connection(Clock::now() + kEffectTimeout);
     if (!connection.Open()) return Fail(environment, connection.TimedOut() ? 10 : 9, "Native X11 system input is unavailable.");
     if (!ConfirmTarget(environment, connection, target)) return nullptr;
@@ -694,7 +920,9 @@ napi_value PostKey(napi_env environment, napi_callback_info information, bool pa
     if (paste && !Activate(environment, connection, target, &receiver)) return nullptr;
     if (!SendKey(environment, connection, target, key, receiver, paste, true) ||
         !SendKey(environment, connection, target, key, receiver, paste, false)) return nullptr;
-    return EffectComplete(environment);
+    napi_value result = EffectComplete(environment);
+    if (result != nullptr) lease.Complete();
+    return result;
   });
 }
 
@@ -708,11 +936,15 @@ napi_value PostPaste(napi_env environment, napi_callback_info information) {
 
 napi_value PostScroll(napi_env environment, napi_callback_info information) {
   return Safely(environment, [&]() -> napi_value {
-    Target target{};
+    TargetOwner* owner = nullptr;
+    IssuedTarget issued{};
     std::int32_t amount = 0;
-    if (!ReadTargetArguments(environment, information, true, &target, &amount)) return nullptr;
+    if (!ReadTargetArguments(environment, information, true, &owner, &issued, &amount)) return nullptr;
+    EffectLease lease(*owner, issued.token);
+    const Target& target = issued.identity;
     Connection connection(Clock::now() + kEffectTimeout);
     if (!connection.Open()) return Fail(environment, connection.TimedOut() ? 10 : 9, "Native X11 system input is unavailable.");
+    if (!ConfirmTarget(environment, connection, target)) return nullptr;
     const int repeats = std::clamp(static_cast<int>(std::abs(std::floor(amount / 40.0 + 0.5))), 1, 20);
     const std::uint8_t button = amount > 0 ? 4 : 5;
     for (int index = 0; index < repeats; ++index) {
@@ -746,7 +978,9 @@ napi_value PostScroll(napi_env environment, napi_callback_info information) {
         }
       }
     }
-    return EffectComplete(environment);
+    napi_value result = EffectComplete(environment);
+    if (result != nullptr) lease.Complete();
+    return result;
   });
 }
 
@@ -754,7 +988,9 @@ napi_value CaptureTarget(napi_env environment, napi_callback_info information) {
   return Safely(environment, [&]() -> napi_value {
     size_t count = 1;
     napi_value argument;
-    if (napi_get_cb_info(environment, information, &count, &argument, nullptr, nullptr) != napi_ok || count != 0) {
+    void* data = nullptr;
+    if (napi_get_cb_info(environment, information, &count, &argument, nullptr, &data) != napi_ok || count != 0 ||
+        data == nullptr || static_cast<TargetOwner*>(data)->environment != environment) {
       return Fail(environment, 2, "System frontmost capture takes no arguments.", true);
     }
     Connection connection(Clock::now() + kCaptureTimeout);
@@ -762,51 +998,74 @@ napi_value CaptureTarget(napi_env environment, napi_callback_info information) {
     Target first{};
     Target second{};
     xcb_window_t final_window = XCB_NONE;
-    if (!connection.WindowProperty(connection.root(), connection.active_atom(), &first.window) ||
-        !Viewable(connection, first.window) || !ReadOwner(connection, first.window, &first.process) ||
+    if (!connection.ReadServer(&first.server) ||
+        !connection.WindowProperty(connection.root(), connection.active_atom(), &first.window) ||
+        !Viewable(connection, first.window) || !ReadOwner(connection, first.window, &first.client) ||
+        !connection.ReadServer(&second.server) ||
         !connection.WindowProperty(connection.root(), connection.active_atom(), &second.window) ||
-        !Viewable(connection, second.window) || !ReadOwner(connection, second.window, &second.process) ||
-        first.window != second.window || first.process != second.process ||
+        !Viewable(connection, second.window) || !ReadOwner(connection, second.window, &second.client) ||
+        !SameTarget(first, second) ||
         !connection.WindowProperty(connection.root(), connection.active_atom(), &final_window) || final_window != first.window) {
       return Fail(environment, connection.TimedOut() ? 10 : 3, "The system frontmost target identity is unavailable or changed.");
     }
-    if (first.process == getpid()) return Fail(environment, 11, "System frontmost capture requires an external process.");
-    char native_id[11];
-    const auto converted = std::to_chars(native_id, native_id + sizeof(native_id), first.window);
+    ServerIdentity final_server{};
+    if (!connection.ReadServer(&final_server) || !SameServer(final_server, first.server)) {
+      return Fail(environment, connection.TimedOut() ? 10 : 3, "The system frontmost server identity is unavailable or changed.");
+    }
+    if (first.client.process == getpid()) return Fail(environment, 11, "System frontmost capture requires an external process.");
+    std::uint64_t token = 0;
+    auto& owner = *static_cast<TargetOwner*>(data);
+    if (!IssueTarget(owner, first, connection.deadline(), &token)) {
+      return Fail(environment, connection.TimedOut() ? 10 : 12, "The captured system target could not be retained.");
+    }
+    char native_id[20];
+    const auto converted = std::to_chars(native_id, native_id + sizeof(native_id), token);
     napi_value target;
     napi_value identifier;
     napi_value process;
     if (converted.ec != std::errc() || napi_create_object(environment, &target) != napi_ok ||
         napi_create_string_utf8(environment, native_id, converted.ptr - native_id, &identifier) != napi_ok ||
-        napi_create_int32(environment, first.process, &process) != napi_ok ||
+        napi_create_int32(environment, first.client.process, &process) != napi_ok ||
         napi_set_named_property(environment, target, "nativeId", identifier) != napi_ok ||
         napi_set_named_property(environment, target, "processId", process) != napi_ok) {
+      RetireTarget(owner, token);
       return Fail(environment, 12, "The system frontmost target could not be published.");
     }
     return target;
   });
 }
 
+void DestroyOwner(void* data) {
+  delete static_cast<TargetOwner*>(data);
+}
+
 }  // namespace
 
 NAPI_MODULE_INIT() {
-  napi_value version;
-  napi_value capture;
-  napi_value post_return;
-  napi_value post_scroll;
-  napi_value post_paste;
-  // Loading only defines the contract; the physical callback owns live reads.
-  if (napi_create_uint32(env, 1, &version) != napi_ok ||
-      napi_create_function(env, "captureTarget", NAPI_AUTO_LENGTH, CaptureTarget, nullptr, &capture) != napi_ok ||
-      napi_create_function(env, "postReturn", NAPI_AUTO_LENGTH, PostReturn, nullptr, &post_return) != napi_ok ||
-      napi_create_function(env, "postScroll", NAPI_AUTO_LENGTH, PostScroll, nullptr, &post_scroll) != napi_ok ||
-      napi_create_function(env, "postPaste", NAPI_AUTO_LENGTH, PostPaste, nullptr, &post_paste) != napi_ok ||
-      napi_set_named_property(env, exports, "protocolVersion", version) != napi_ok ||
-      napi_set_named_property(env, exports, "captureTarget", capture) != napi_ok ||
-      napi_set_named_property(env, exports, "postReturn", post_return) != napi_ok ||
-      napi_set_named_property(env, exports, "postScroll", post_scroll) != napi_ok ||
-      napi_set_named_property(env, exports, "postPaste", post_paste) != napi_ok) {
-    return Fail(env, 12, "The system frontmost native module could not initialize.");
-  }
-  return exports;
+  return Safely(env, [&]() -> napi_value {
+    auto owned = std::make_unique<TargetOwner>(env);
+    if (napi_add_env_cleanup_hook(env, DestroyOwner, owned.get()) != napi_ok) {
+      return Fail(env, 12, "The system frontmost native owner could not initialize.");
+    }
+    TargetOwner* owner = owned.release();
+    napi_value version;
+    napi_value capture;
+    napi_value post_return;
+    napi_value post_scroll;
+    napi_value post_paste;
+    // Loading only defines the contract; the physical callback owns live reads.
+    if (napi_create_uint32(env, 1, &version) != napi_ok ||
+        napi_create_function(env, "captureTarget", NAPI_AUTO_LENGTH, CaptureTarget, owner, &capture) != napi_ok ||
+        napi_create_function(env, "postReturn", NAPI_AUTO_LENGTH, PostReturn, owner, &post_return) != napi_ok ||
+        napi_create_function(env, "postScroll", NAPI_AUTO_LENGTH, PostScroll, owner, &post_scroll) != napi_ok ||
+        napi_create_function(env, "postPaste", NAPI_AUTO_LENGTH, PostPaste, owner, &post_paste) != napi_ok ||
+        napi_set_named_property(env, exports, "protocolVersion", version) != napi_ok ||
+        napi_set_named_property(env, exports, "captureTarget", capture) != napi_ok ||
+        napi_set_named_property(env, exports, "postReturn", post_return) != napi_ok ||
+        napi_set_named_property(env, exports, "postScroll", post_scroll) != napi_ok ||
+        napi_set_named_property(env, exports, "postPaste", post_paste) != napi_ok) {
+      return Fail(env, 12, "The system frontmost native module could not initialize.");
+    }
+    return exports;
+  });
 }
