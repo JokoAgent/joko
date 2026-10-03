@@ -98,7 +98,7 @@ export const TimelineMermaidBlock = memo(function TimelineMermaidBlock({ ownerKe
     <div className="timeline-mermaid__toolbar">
       {svg !== undefined && !sourceView && <IconButton label={t("timeline.mermaidZoom")} onClick={(event) => open(event.currentTarget)}><Expand aria-hidden="true" /></IconButton>}
       {svg !== undefined && <IconButton label={sourceView ? t("timeline.mermaidViewDiagram") : t("timeline.mermaidViewSource")} onClick={() => setSourceViewScope(sourceView ? undefined : scope)}>{sourceView ? <Eye aria-hidden="true" /> : <Code2 aria-hidden="true" />}</IconButton>}
-      <IconButton label={copyLabel} aria-busy={copy.pending} aria-disabled={copy.pending} onClick={(event) => {
+      <IconButton className="timeline-mermaid__copy" label={copyLabel} aria-busy={copy.pending} aria-disabled={copy.pending} onClick={(event) => {
         const card = cardRef.current ?? rootRef.current;
         copy.run(event.currentTarget.ownerDocument, (context) => svg === undefined || card === null
           ? writeClipboardText(source, context) : copyMermaid(svg, source, card, context));

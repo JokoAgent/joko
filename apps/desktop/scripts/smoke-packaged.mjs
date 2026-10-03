@@ -71,7 +71,23 @@ if (!smokeOptions.providerSmokeClassifierTest) {
   smokeDeadline = Date.now() + timeoutMs;
 }
 const packagedSmokeClipboardNonce = randomUUID().replaceAll("-", "");
+const PACKAGED_SMOKE_TIMELINE_CODE_SOURCE = [
+  `const owner = "${packagedSmokeClipboardNonce}";`,
+  "console.log(owner);"
+].join("\n");
+const PACKAGED_SMOKE_TIMELINE_MERMAID_SOURCE = [
+  "flowchart LR",
+  `  A["${packagedSmokeClipboardNonce}"] --> B["Clipboard"]`
+].join("\n");
 const PACKAGED_SMOKE_TIMELINE_MARKDOWN = [
+  "```ts",
+  PACKAGED_SMOKE_TIMELINE_CODE_SOURCE,
+  "```",
+  "",
+  "```mermaid",
+  PACKAGED_SMOKE_TIMELINE_MERMAID_SOURCE,
+  "```",
+  "",
   "| Kind | Value |",
   "| --- | --- |",
   "| Alpha | Beta |",
@@ -211,6 +227,8 @@ async function runSmokeJourney() {
     "system_handoff_tray_reopened",
     ...(process.platform === "win32" ? [
       "timeline_generation_completed",
+      "timeline_code_system_clipboard_verified",
+      "timeline_mermaid_system_clipboard_verified",
       "timeline_table_system_clipboard_verified",
       "timeline_math_system_clipboard_verified"
     ] : [])

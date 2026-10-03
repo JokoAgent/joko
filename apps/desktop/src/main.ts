@@ -2278,6 +2278,8 @@ interface PackagedSmokeClipboardFingerprint {
 async function verifyPackagedSmokeTimelineSystemClipboard(window: BrowserWindow): Promise<void> {
   const fixture = packagedSmokeTimelineClipboardFixture();
   const systemClipboardFixture = Object.freeze({
+    codeText: packagedSmokeSystemClipboardText(fixture.codeText, process.platform),
+    mermaidText: packagedSmokeSystemClipboardText(fixture.mermaidSource, process.platform),
     tableText: packagedSmokeSystemClipboardText(fixture.tableText, process.platform),
     mathText: packagedSmokeSystemClipboardText(fixture.mathText, process.platform)
   });
@@ -2295,6 +2297,7 @@ async function verifyPackagedSmokeTimelineSystemClipboard(window: BrowserWindow)
   const writerContents = window.webContents;
   const snapshot = capturePackagedSmokeClipboard();
   const sentinel = `joko-packaged-smoke-clipboard-${randomUUID()}`;
+  let mermaidFingerprint: PackagedSmokeClipboardFingerprint | undefined;
   let tableFingerprint: PackagedSmokeClipboardFingerprint | undefined;
   let mathFingerprint: PackagedSmokeClipboardFingerprint | undefined;
   let copyActionsSettled = false;
@@ -2303,24 +2306,62 @@ async function verifyPackagedSmokeTimelineSystemClipboard(window: BrowserWindow)
     if (clipboard.readText("clipboard") !== sentinel || !clipboard.readImage("clipboard").isEmpty()) {
       throw new Error("Packaged smoke could not establish its system clipboard sentinel.");
     }
-    await clickPackagedSmokeTimelineCopy(window, ".timeline-copy-block--table");
+    await clickPackagedSmokeTimelineCopy(window, ".timeline-code-block", ":scope > button.timeline-code-block__copy");
+    await waitForPackagedSmokeTimelineTextClipboard(
+      window,
+      ".timeline-code-block",
+      ":scope > button.timeline-code-block__copy",
+      systemClipboardFixture.codeText
+    );
+    recordPackagedSmokeProgress("timeline_code_system_clipboard_verified");
+
+    assertPackagedSmokeTextClipboard(systemClipboardFixture.codeText);
+    await clickPackagedSmokeTimelineCopy(
+      window,
+      ".timeline-mermaid",
+      ":scope > .timeline-mermaid__toolbar > button.timeline-mermaid__copy"
+    );
+    mermaidFingerprint = await waitForPackagedSmokeTimelineClipboard(
+      window,
+      ".timeline-mermaid",
+      ":scope > .timeline-mermaid__toolbar > button.timeline-mermaid__copy",
+      systemClipboardFixture.mermaidText
+    );
+    recordPackagedSmokeProgress("timeline_mermaid_system_clipboard_verified");
+
+    assertPackagedSmokeClipboardFingerprint(mermaidFingerprint);
+    await clickPackagedSmokeTimelineCopy(
+      window,
+      ".timeline-copy-block--table",
+      ":scope > button.timeline-copy-block__button:not(.timeline-copy-block__annotate)"
+    );
     tableFingerprint = await waitForPackagedSmokeTimelineClipboard(
       window,
       ".timeline-copy-block--table",
+      ":scope > button.timeline-copy-block__button:not(.timeline-copy-block__annotate)",
       systemClipboardFixture.tableText
     );
     recordPackagedSmokeProgress("timeline_table_system_clipboard_verified");
 
     assertPackagedSmokeClipboardFingerprint(tableFingerprint);
-    await clickPackagedSmokeTimelineCopy(window, ".timeline-copy-block--math");
+    await clickPackagedSmokeTimelineCopy(
+      window,
+      ".timeline-copy-block--math",
+      ":scope > button.timeline-copy-block__button:not(.timeline-copy-block__annotate)"
+    );
     mathFingerprint = await waitForPackagedSmokeTimelineClipboard(
       window,
       ".timeline-copy-block--math",
+      ":scope > button.timeline-copy-block__button:not(.timeline-copy-block__annotate)",
       systemClipboardFixture.mathText
     );
     copyActionsSettled = true;
-    if (mathFingerprint.imageSha256 === tableFingerprint.imageSha256) {
-      throw new Error("Packaged smoke Timeline Copy actions did not produce distinct PNG payloads.");
+    if (new Set([
+      mermaidFingerprint.imageSha256,
+      tableFingerprint.imageSha256,
+      mathFingerprint.imageSha256
+    ]).size !== 3) {
+      throw new Error("Packaged smoke Timeline image Copy actions did not produce distinct PNG payloads.");
     }
     recordPackagedSmokeProgress("timeline_math_system_clipboard_verified");
   } finally {
@@ -2330,10 +2371,15 @@ async function verifyPackagedSmokeTimelineSystemClipboard(window: BrowserWindow)
       retireWriter: () => retirePackagedSmokeTimelineClipboardWriter(window, writerContents),
       ownsCurrentClipboard: () => packagedSmokeClipboardIsOwned(
         sentinel,
-        [systemClipboardFixture.tableText, systemClipboardFixture.mathText]
+        [systemClipboardFixture.mermaidText, systemClipboardFixture.tableText, systemClipboardFixture.mathText],
+        [systemClipboardFixture.codeText]
       ),
       restorePreviousClipboard: () => restorePackagedSmokeClipboard(snapshot, () => (
-        packagedSmokeClipboardIsOwned(sentinel, [systemClipboardFixture.tableText, systemClipboardFixture.mathText])
+        packagedSmokeClipboardIsOwned(
+          sentinel,
+          [systemClipboardFixture.mermaidText, systemClipboardFixture.tableText, systemClipboardFixture.mathText],
+          [systemClipboardFixture.codeText]
+        )
       ))
     });
   }
@@ -2354,6 +2400,8 @@ async function retirePackagedSmokeTimelineClipboardWriter(
 }
 
 function packagedSmokeTimelineClipboardFixture(): Readonly<{
+  codeText: string;
+  mermaidSource: string;
   tableText: string;
   mathSource: string;
   mathText: string;
@@ -2361,8 +2409,18 @@ function packagedSmokeTimelineClipboardFixture(): Readonly<{
   if (packagedSmokeClipboardNonce === undefined) {
     throw new Error("Packaged smoke Timeline clipboard owner nonce is unavailable.");
   }
+  const codeSource = [
+    `const owner = "${packagedSmokeClipboardNonce}";`,
+    "console.log(owner);"
+  ].join("\n");
+  const mermaidSource = [
+    "flowchart LR",
+    `  A["${packagedSmokeClipboardNonce}"] --> B["Clipboard"]`
+  ].join("\n");
   const mathSource = `x_{${packagedSmokeClipboardNonce}}=1`;
   return Object.freeze({
+    codeText: `${codeSource}\n`,
+    mermaidSource,
     tableText: `Kind\tValue\nAlpha\tBeta\nOwner\t${packagedSmokeClipboardNonce}`,
     mathSource,
     mathText: `$$\n${mathSource}\n$$`
@@ -2379,17 +2437,22 @@ async function waitForPackagedSmokeTimelineClipboardBlocks(
     const value = await window.webContents.executeJavaScript([
       "(() => {",
       "  const assistant = [...document.querySelectorAll('.message-assistant')].filter((node) =>",
-      "    node.querySelector('.timeline-copy-block--table, .timeline-copy-block--math'));",
+      "    node.querySelector('.timeline-code-block, .timeline-mermaid, .timeline-copy-block--table, .timeline-copy-block--math'));",
+      "  const codeBlocks = document.querySelectorAll('.message-assistant__body .timeline-code-block');",
+      "  const mermaidBlocks = document.querySelectorAll('.message-assistant__body .timeline-mermaid');",
       "  const tableBlocks = document.querySelectorAll('.message-assistant__body .timeline-copy-block--table');",
       "  const mathBlocks = document.querySelectorAll('.message-assistant__body .timeline-copy-block--math');",
+      "  const codeText = codeBlocks.length === 1 ? codeBlocks[0].querySelector('code')?.textContent ?? '' : '';",
+      "  const mermaidReady = mermaidBlocks.length === 1 && Boolean(mermaidBlocks[0].querySelector('.timeline-mermaid__diagram svg'));",
       "  const table = tableBlocks.length === 1 ? tableBlocks[0].querySelector('table') : null;",
       "  const tableText = table ? [...table.querySelectorAll('tr')].map((row) =>",
       "    [...row.querySelectorAll('th, td')].map((cell) => cell.textContent?.trim() ?? '').join('\\t')).join('\\n') : '';",
       "  const mathSource = mathBlocks.length === 1",
       "    ? mathBlocks[0].querySelector('annotation[encoding=\"application/x-tex\"]')?.textContent?.trim() ?? '' : '';",
       "  return {",
-      "    assistantCount: assistant.length, tableCount: tableBlocks.length, mathCount: mathBlocks.length,",
-      "    tableText, mathSource, streaming: Boolean(assistant[0]?.querySelector('.streaming-cursor'))",
+      "    assistantCount: assistant.length, codeCount: codeBlocks.length, mermaidCount: mermaidBlocks.length,",
+      "    tableCount: tableBlocks.length, mathCount: mathBlocks.length, codeText, mermaidReady, tableText, mathSource,",
+      "    streaming: Boolean(assistant[0]?.querySelector('.streaming-cursor'))",
       "  };",
       "})()"
     ].join("\n"), true) as unknown;
@@ -2397,8 +2460,12 @@ async function waitForPackagedSmokeTimelineClipboardBlocks(
       const observation = value as Record<string, unknown>;
       lastObservation = JSON.stringify(observation);
       if (observation["assistantCount"] === 1
+        && observation["codeCount"] === 1
+        && observation["mermaidCount"] === 1
         && observation["tableCount"] === 1
         && observation["mathCount"] === 1
+        && observation["codeText"] === fixture.codeText
+        && observation["mermaidReady"] === true
         && observation["tableText"] === fixture.tableText
         && observation["mathSource"] === fixture.mathSource
         && observation["streaming"] === false) return;
@@ -2408,12 +2475,16 @@ async function waitForPackagedSmokeTimelineClipboardBlocks(
   throw new Error(`Packaged smoke Timeline clipboard blocks did not settle (${lastObservation}).`);
 }
 
-async function clickPackagedSmokeTimelineCopy(window: BrowserWindow, blockSelector: string): Promise<void> {
+async function clickPackagedSmokeTimelineCopy(
+  window: BrowserWindow,
+  blockSelector: string,
+  buttonSelector: string
+): Promise<void> {
   const clicked = await window.webContents.executeJavaScript([
     "(() => {",
     `  const blocks = document.querySelectorAll(${JSON.stringify(`.message-assistant__body ${blockSelector}`)});`,
     "  if (blocks.length !== 1) return false;",
-    "  const buttons = blocks[0].querySelectorAll(':scope > button.timeline-copy-block__button:not(.timeline-copy-block__annotate)');",
+    `  const buttons = blocks[0].querySelectorAll(${JSON.stringify(buttonSelector)});`,
     "  if (buttons.length !== 1) return false;",
     "  const button = buttons[0];",
     "  if (!(button instanceof HTMLButtonElement) || button.disabled || button.getAttribute('aria-busy') === 'true') return false;",
@@ -2424,15 +2495,46 @@ async function clickPackagedSmokeTimelineCopy(window: BrowserWindow, blockSelect
   if (clicked !== true) throw new Error(`Packaged smoke could not dispatch one Copy action for ${blockSelector}.`);
 }
 
+async function waitForPackagedSmokeTimelineTextClipboard(
+  window: BrowserWindow,
+  blockSelector: string,
+  buttonSelector: string,
+  expectedText: string
+): Promise<void> {
+  const deadline = Date.now() + 20_000;
+  let lastObservation = "unavailable";
+  while (Date.now() < deadline) {
+    const state = await packagedSmokeTimelineCopyActionState(window, blockSelector, buttonSelector);
+    if (state === "failed") throw new Error(`Packaged smoke ${blockSelector} Copy action failed.`);
+    const text = clipboard.readText("clipboard");
+    const imageEmpty = clipboard.readImage("clipboard").isEmpty();
+    lastObservation = JSON.stringify({
+      state,
+      textMatches: text === expectedText,
+      textLength: text.length,
+      textSha256: createHash("sha256").update(text).digest("hex"),
+      expectedTextSha256: createHash("sha256").update(expectedText).digest("hex"),
+      imageEmpty,
+      formats: clipboard.availableFormats("clipboard")
+    });
+    if (state === "settled" && text === expectedText && imageEmpty) return;
+    await waitForPackagedSmokePoll();
+  }
+  throw new Error(
+    `Packaged smoke ${blockSelector} system clipboard did not contain only the exact text (${lastObservation}).`
+  );
+}
+
 async function waitForPackagedSmokeTimelineClipboard(
   window: BrowserWindow,
   blockSelector: string,
+  buttonSelector: string,
   expectedText: string
 ): Promise<PackagedSmokeClipboardFingerprint> {
   const deadline = Date.now() + 20_000;
   let lastObservation = "unavailable";
   while (Date.now() < deadline) {
-    const state = await packagedSmokeTimelineCopyActionState(window, blockSelector);
+    const state = await packagedSmokeTimelineCopyActionState(window, blockSelector, buttonSelector);
     if (state === "failed") throw new Error(`Packaged smoke ${blockSelector} Copy action failed.`);
     const image = clipboard.readImage("clipboard");
     const text = clipboard.readText("clipboard");
@@ -2471,7 +2573,8 @@ async function waitForPackagedSmokeTimelineClipboard(
 
 async function packagedSmokeTimelineCopyActionState(
   window: BrowserWindow,
-  blockSelector: string
+  blockSelector: string,
+  buttonSelector: string
 ): Promise<"pending" | "settled" | "failed" | "unavailable"> {
   if (window.isDestroyed() || window.webContents.isDestroyed()) return "unavailable";
   const state = await window.webContents.executeJavaScript([
@@ -2479,7 +2582,7 @@ async function packagedSmokeTimelineCopyActionState(
     `  const block = document.querySelector(${JSON.stringify(`.message-assistant__body ${blockSelector}`)});`,
     "  if (!block) return 'unavailable';",
     "  if (block.querySelector('[role=\"alert\"]')) return 'failed';",
-    "  const button = block.querySelector(':scope > button.timeline-copy-block__button:not(.timeline-copy-block__annotate)');",
+    `  const button = block.querySelector(${JSON.stringify(buttonSelector)});`,
     "  if (!(button instanceof HTMLButtonElement)) return 'unavailable';",
     "  return button.getAttribute('aria-busy') === 'true' ? 'pending' : 'settled';",
     "})()"
@@ -2491,8 +2594,22 @@ async function waitForPackagedSmokeTimelineCopyActionsToSettle(window: BrowserWi
   const deadline = Date.now() + 5_000;
   while (Date.now() < deadline) {
     const states = await Promise.all([
-      packagedSmokeTimelineCopyActionState(window, ".timeline-copy-block--table"),
-      packagedSmokeTimelineCopyActionState(window, ".timeline-copy-block--math")
+      packagedSmokeTimelineCopyActionState(window, ".timeline-code-block", ":scope > button.timeline-code-block__copy"),
+      packagedSmokeTimelineCopyActionState(
+        window,
+        ".timeline-mermaid",
+        ":scope > .timeline-mermaid__toolbar > button.timeline-mermaid__copy"
+      ),
+      packagedSmokeTimelineCopyActionState(
+        window,
+        ".timeline-copy-block--table",
+        ":scope > button.timeline-copy-block__button:not(.timeline-copy-block__annotate)"
+      ),
+      packagedSmokeTimelineCopyActionState(
+        window,
+        ".timeline-copy-block--math",
+        ":scope > button.timeline-copy-block__button:not(.timeline-copy-block__annotate)"
+      )
     ]);
     if (states.every((state) => state === "settled" || state === "failed")) return true;
     if (states.includes("unavailable")) return false;
@@ -2507,6 +2624,12 @@ function assertPackagedSmokeClipboardFingerprint(expected: PackagedSmokeClipboar
   }
 }
 
+function assertPackagedSmokeTextClipboard(expectedText: string): void {
+  if (clipboard.readText("clipboard") !== expectedText || !clipboard.readImage("clipboard").isEmpty()) {
+    throw new Error("Packaged smoke will not replace a newer system clipboard owner.");
+  }
+}
+
 function packagedSmokeClipboardMatchesFingerprint(expected: PackagedSmokeClipboardFingerprint): boolean {
   if (clipboard.readText("clipboard") !== expected.text) return false;
   const image = clipboard.readImage("clipboard");
@@ -2514,11 +2637,16 @@ function packagedSmokeClipboardMatchesFingerprint(expected: PackagedSmokeClipboa
     && createHash("sha256").update(image.toPNG()).digest("hex") === expected.imageSha256;
 }
 
-function packagedSmokeClipboardIsOwned(sentinel: string, expectedOutputTexts: readonly string[]): boolean {
+function packagedSmokeClipboardIsOwned(
+  sentinel: string,
+  expectedImageOutputTexts: readonly string[],
+  expectedTextOnlyOutputs: readonly string[] = []
+): boolean {
   return isPackagedSmokeClipboardObservationOwned(
     readPackagedSmokeClipboardObservation(),
     sentinel,
-    expectedOutputTexts
+    expectedImageOutputTexts,
+    expectedTextOnlyOutputs
   );
 }
 

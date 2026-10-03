@@ -147,6 +147,18 @@ describe("packaged smoke clipboard cleanup", () => {
       ["table nonce", "math nonce"]
     )).toBe(false);
     expect(isPackagedSmokeClipboardObservationOwned(
+      { text: "code nonce" },
+      "sentinel",
+      ["table nonce", "math nonce"],
+      ["code nonce"]
+    )).toBe(true);
+    expect(isPackagedSmokeClipboardObservationOwned(
+      { text: "code nonce", imageSha256: "stale-png" },
+      "sentinel",
+      ["table nonce", "math nonce"],
+      ["code nonce"]
+    )).toBe(false);
+    expect(isPackagedSmokeClipboardObservationOwned(
       { text: "external", imageSha256: "png-sha" },
       "sentinel",
       ["table nonce", "math nonce"]

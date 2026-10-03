@@ -40,10 +40,12 @@ export function hasOnlyEmptyPackagedSmokeClipboardFormats(
 export function isPackagedSmokeClipboardObservationOwned(
   observation: PackagedSmokeClipboardObservation,
   sentinel: string,
-  expectedOutputTexts: readonly string[]
+  expectedImageOutputTexts: readonly string[],
+  expectedTextOnlyOutputs: readonly string[] = []
 ): boolean {
   if (observation.text === sentinel) return observation.imageSha256 === undefined;
-  return observation.imageSha256 !== undefined && expectedOutputTexts.includes(observation.text);
+  if (expectedTextOnlyOutputs.includes(observation.text)) return observation.imageSha256 === undefined;
+  return observation.imageSha256 !== undefined && expectedImageOutputTexts.includes(observation.text);
 }
 
 /**
