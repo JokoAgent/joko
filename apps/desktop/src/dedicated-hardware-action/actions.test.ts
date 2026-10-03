@@ -78,6 +78,17 @@ describe("dedicated hardware action parser", () => {
     });
   });
 
+  it("accepts only fixed composer keys without text or modifier payloads", () => {
+    for (const key of ["ArrowUp", "ArrowDown", "Enter"] as const) {
+      expect(parseDedicatedHardwareAction({ kind: "composer-key", key })).toEqual({ kind: "composer-key", key });
+    }
+    for (const value of [
+      { kind: "composer-key", key: "A" }, { kind: "composer-key", key: "ArrowLeft" },
+      { kind: "composer-key", key: "Enter", text: "draft" },
+      { kind: "composer-key", key: "ArrowUp", shiftKey: true }
+    ]) expect(() => parseDedicatedHardwareAction(value)).toThrow(TypeError);
+  });
+
   it("rejects incomplete, overlong, padded, controlled, or extra identity fields", () => {
     for (const value of [
       { kind: "task", profileId: " profile", sessionId: "session" },

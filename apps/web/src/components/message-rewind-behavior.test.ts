@@ -1,8 +1,24 @@
 import { describe, expect, it } from "vitest";
-import type { TimelineItemView, WorkspaceChangeSetView } from "../model.js";
-import { canEditVisibleUserMessage, changeSetForMessageRound, lastVisibleUserMessage, messageDialogueRewindTarget, messageRoundRunId } from "./message-rewind-behavior.js";
+import type { CapabilityView, TargetView, TimelineItemView, WorkspaceChangeSetView } from "../model.js";
+import { canEditVisibleUserMessage, canRewindToSessionStart, changeSetForMessageRound, lastVisibleUserMessage, messageDialogueRewindTarget, messageRoundRunId } from "./message-rewind-behavior.js";
 
 describe("message rewind boundaries", () => {
+  it("applies only the advertised start scope and rejects unknown or incomplete scope authority", () => {
+    const local: TargetView = { id: "target", revision: 1n, backendId: "backend", name: "Project", workspaceId: "workspace", workspaceName: "Workspace", trusted: true, pinned: false, archived: false };
+    const remote: TargetView = { ...local, remoteWorkspace: { kind: "ssh", hostTargetId: "host-target", hostId: "host", workspaceRoot: "/workspace" } };
+    const capability = (options: readonly string[], supported = true): CapabilityView => ({ name: "session.rewind_to_start", supported, options });
+    expect(canRewindToSessionStart(capability([]), undefined)).toBe(true);
+    expect(canRewindToSessionStart(capability([]), remote)).toBe(true);
+    expect(canRewindToSessionStart(capability(["service_node_only"]), local)).toBe(true);
+    for (const target of [remote, undefined]) expect(canRewindToSessionStart(capability(["service_node_only"]), target)).toBe(false);
+    for (const options of [["unknown"], ["service_node_only", "service_node_only"], ["service_node_only", "unknown"]]) {
+      expect(canRewindToSessionStart(capability(options), local)).toBe(false);
+    }
+    expect(canRewindToSessionStart(capability([], false), local)).toBe(false);
+    expect(canRewindToSessionStart(undefined, local)).toBe(false);
+    expect(messageDialogueRewindTarget(message("entry", "user", "parent"), false)).toEqual({ kind: "native_entry", entryId: "parent" });
+  });
+
   it("requires explicit first-turn authority and the start capability, independently of parent and pagination", () => {
     const root = { ...message("first", "user"), nativeRewindBefore: { kind: "session_start" as const } };
     expect(messageDialogueRewindTarget(root)).toBeUndefined();

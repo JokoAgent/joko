@@ -1707,6 +1707,10 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
       richEditorRef.current?.focus();
       return true;
     },
+    key: (key) => {
+      if (composerLocked || hydratedSession !== session.id || controller.state.connectionState !== "connected") return false;
+      return richEditorRef.current?.inputKey(key) ?? false;
+    },
     insertText: (value) => insertAppTextRef.current(value),
     insertSkill: (binding) => receiveGamepadSkillRef.current(binding),
     voice: {

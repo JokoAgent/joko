@@ -1,4 +1,11 @@
-import type { NativeNavigationTargetView, TimelineItemView, WorkspaceChangeSetView } from "../model.js";
+import type { CapabilityView, NativeNavigationTargetView, TargetView, TimelineItemView, WorkspaceChangeSetView } from "../model.js";
+
+export function canRewindToSessionStart(capability: CapabilityView | undefined, target: TargetView | undefined): boolean {
+  if (capability?.supported !== true) return false;
+  if (capability.options.length === 0) return true;
+  return capability.options.length === 1 && capability.options[0] === "service_node_only"
+    && target !== undefined && target.remoteWorkspace === undefined;
+}
 
 export function lastVisibleUserMessage(items: readonly TimelineItemView[]): TimelineItemView | undefined {
   for (let index = items.length - 1; index >= 0; index -= 1) {

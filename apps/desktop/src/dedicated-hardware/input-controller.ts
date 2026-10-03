@@ -225,7 +225,7 @@ export function createDedicatedHardwareInputController(options: {
     const scrollDirection = binding.kind === "command" && binding.command === "scroll-up" ? "up"
       : binding.kind === "command" && binding.command === "scroll-down" ? "down"
         : undefined;
-    const distance = Math.max(Math.abs(input.x), Math.abs(input.y));
+    const distance = stickDistance(input.x, input.y);
     if (scrollDirection !== undefined) {
       if (runtime.scrolling && runtime.scrollDirection !== scrollDirection) stopScroll(model, runtime, "release");
       const phase = runtime.scrolling ? "move" : "press";
@@ -252,6 +252,7 @@ export function createDedicatedHardwareInputController(options: {
       const side = input.delta < 0 ? "left" : "right";
       const binding = encoderTurnBinding(runtime.value.settings, side);
       emitOneShot(model, binding);
+      return;
     }
     if (input.pressed === runtime.encoderPressed) return;
     runtime.encoderPressed = input.pressed;
@@ -401,36 +402,42 @@ function safeNow(now: () => number): number {
 function encoderTurnBinding(
   settings: DedicatedHardwareSettings,
   side: "left" | "right"
-): DedicatedHardwareBinding {
+): DedicatedHardwareBinding | DedicatedHardwareAction {
   if (settings.layout.encoderMode === "custom") return settings.layout.encoder[side];
   if (settings.layout.encoderMode === "session-switch") {
-    return { kind: "command", command: side === "left" ? "previous-task" : "next-task" };
+    return { kind: "command", command: side === "right" ? "previous-task" : "next-task" };
   }
   if (settings.layout.encoderMode === "reasoning") {
-    return { kind: "command", command: side === "left" ? "effort-decrease" : "effort-increase" };
+    return { kind: "command", command: side === "right" ? "effort-decrease" : "effort-increase" };
   }
   if (settings.layout.encoderMode === "conversation-scroll") {
-    return { kind: "command", command: side === "left" ? "scroll-up" : "scroll-down" };
+    return { kind: "command", command: side === "right" ? "scroll-up" : "scroll-down" };
   }
-  return { kind: "command", command: side === "left" ? "previous-panel" : "next-panel" };
+  return { kind: "composer-key", key: side === "right" ? "ArrowUp" : "ArrowDown" };
 }
 
 function encoderPressBinding(
   settings: DedicatedHardwareSettings,
   input: "click" | "longPress"
-): DedicatedHardwareBinding {
+): DedicatedHardwareBinding | DedicatedHardwareAction {
   if (settings.layout.encoderMode === "custom") return settings.layout.encoder[input];
   if (input === "longPress") return { kind: "command", command: "open-settings" };
   if (settings.layout.encoderMode === "conversation-scroll") return { kind: "command", command: "scroll-bottom" };
-  return { kind: "command", command: "activate" };
+  return { kind: "composer-key", key: "Enter" };
 }
 
 function dominantDirection(x: number, y: number): DedicatedHardwareDirection | undefined {
-  const absoluteX = Math.abs(x);
-  const absoluteY = Math.abs(y);
-  if (Math.max(absoluteX, absoluteY) <= DEDICATED_HARDWARE_STICK_DEAD_ZONE) return undefined;
-  if (absoluteY >= absoluteX) return y < 0 ? "up" : "down";
-  return x < 0 ? "left" : "right";
+  if (stickDistance(x, y) <= DEDICATED_HARDWARE_STICK_DEAD_ZONE) return undefined;
+  const turn = Math.atan2(y, x) / (Math.PI * 2);
+  const angle = turn < 0 ? turn + 1 : turn;
+  if (angle >= 0.625 && angle < 0.875) return "up";
+  if (angle >= 0.125 && angle < 0.375) return "down";
+  if (angle >= 0.375 && angle < 0.625) return "left";
+  return "right";
+}
+
+function stickDistance(x: number, y: number): number {
+  return Math.min(1, Math.hypot(x, y));
 }
 
 function mergeForKey(
@@ -452,7 +459,7 @@ function trackPreviewNeutral(runtime: ModelRuntime, input: DedicatedHardwareInpu
   }
   if (input.kind === "stick" && dominantDirection(input.x, input.y) === undefined) runtime.stickNeedsCenter = false;
   if (input.kind === "stick" && dominantDirection(input.x, input.y) !== undefined) runtime.stickNeedsCenter = true;
-  if (input.kind === "encoder") {
+  if (input.kind === "encoder" && input.delta === 0) {
     runtime.encoderPressed = input.pressed;
     if (input.pressed) runtime.encoderBlocked = true;
     else runtime.encoderBlocked = false;

@@ -49,7 +49,7 @@ import { hidesFromTimelineHistory, resolveActiveRetry, resolveRetryEscapeIntent,
 import { projectRuntimeRecoveryTimeline } from "../runtime-recovery.js";
 import { createMessageComposerMention, messageForkBlocked, resolveMessageDeleteTarget, resolveMessageForkTarget, type MessageForkTarget } from "./message-actions.js";
 import { restoreMessageAttachmentDrafts, sameMessageAttachments } from "./message-attachment-roundtrip.js";
-import { canEditVisibleUserMessage, changeSetForMessageRound, lastVisibleUserMessage, sameNativeNavigationTarget, messageDialogueRewindTarget, messageRoundRunId } from "./message-rewind-behavior.js";
+import { canEditVisibleUserMessage, canRewindToSessionStart, changeSetForMessageRound, lastVisibleUserMessage, sameNativeNavigationTarget, messageDialogueRewindTarget, messageRoundRunId } from "./message-rewind-behavior.js";
 import { reconcileShareSelection, shareableTimelineMessages, toggleShareMessageSelection } from "./share-selection-behavior.js";
 import { ShareSelectionBar } from "./ShareSelectionBar.js";
 import { Timeline, type InlinePlanVisibility } from "./Timeline.js";
@@ -268,6 +268,11 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
   const compactGuardRef = useRef(new SessionScopedRequestGuard());
   const messageDeleteGuardRef = useRef(new SessionScopedRequestGuard());
   const paneRef = useRef<HTMLElement>(null);
+  const timelineRootRef = useRef<HTMLDivElement | null>(null);
+  const bindTimelineRoot = useCallback((root: HTMLDivElement | null): void => {
+    timelineRootRef.current = root;
+  }, []);
+  const getTimelineRoot = useCallback((): HTMLDivElement | null => timelineRootRef.current, []);
   const artifactCatalogDocumentEpochRef = useRef(0);
   const [artifactCatalogDocumentOwner, setArtifactCatalogDocumentOwner] = useState<{
     readonly document: Document;
@@ -617,7 +622,10 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
   const currentMessageFork = messageFork?.sessionId === session.id ? messageFork : undefined;
   const currentMessageDelete = messageDelete?.sessionId === session.id ? messageDelete : undefined;
   const latestVisibleUserMessage = lastVisibleUserMessage(visibleTimeline);
-  const rewindToStartSupported = backend?.capabilities.get("session.rewind_to_start")?.supported === true;
+  const rewindToStartSupported = canRewindToSessionStart(
+    backend?.capabilities.get("session.rewind_to_start"),
+    controller.state.snapshot.targets.find((candidate) => candidate.id === session.targetId)
+  );
   const editableMessageId = messageRewindSupported && canEditVisibleUserMessage(latestVisibleUserMessage, rewindToStartSupported) ? latestVisibleUserMessage.id : undefined;
   const errorTailActions = errorTailProjection?.bannerVisible === true && errorTailProjection.item.error !== undefined
     ? executableRecoveryActions(errorTailProjection.item.error, recoveryContext)
@@ -845,14 +853,31 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
 
   useLayoutEffect(() => {
     const overlay = bottomOverlayRef.current;
-    if (overlay === null) return;
-    const report = (): void => setBottomInset(Math.ceil(overlay.getBoundingClientRect().height));
+    const pane = paneRef.current;
+    const timeline = pane?.querySelector<HTMLElement>(".timeline[data-timeline-session-id]");
+    if (overlay === null || pane === null) return;
+    const currentTimeline = timeline?.dataset.timelineSessionId === session.id ? timeline : undefined;
+    let active = true;
+    const report = (): void => {
+      if (!active || paneRef.current !== pane || bottomOverlayRef.current !== overlay) return;
+      if (currentTimeline !== undefined && pane.contains(currentTimeline)) {
+        overlay.style.setProperty("--session-timeline-scrollbar-gutter", `${Math.max(0, currentTimeline.offsetWidth - currentTimeline.clientWidth)}px`);
+      }
+      setBottomInset(Math.ceil(overlay.getBoundingClientRect().height));
+    };
     report();
-    if (typeof ResizeObserver === "undefined") return;
-    const observer = new ResizeObserver(report);
-    observer.observe(overlay);
-    return () => observer.disconnect();
-  }, [session.id]);
+    const observer = typeof ResizeObserver === "undefined" ? undefined : new ResizeObserver(report);
+    observer?.observe(overlay);
+    if (currentTimeline !== undefined) observer?.observe(currentTimeline);
+    const view = pane.ownerDocument.defaultView;
+    view?.addEventListener("resize", report);
+    return () => {
+      active = false;
+      observer?.disconnect();
+      view?.removeEventListener("resize", report);
+      overlay.style.removeProperty("--session-timeline-scrollbar-gutter");
+    };
+  }, [session.id, timelineResourceOwnerKey, visibleTimeline.length === 0]);
 
   useLayoutEffect(() => {
     compactGuardRef.current.setCurrentSession(session.id);
@@ -1344,6 +1369,8 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
       const snapshot = state.snapshot;
       const activeSession = snapshot.sessions.find((candidate) => candidate.id === sourceSessionId);
       const activeBackend = activeSession === undefined ? undefined : snapshot.backends.find((candidate) => candidate.id === activeSession.backendId);
+      const activeTarget = activeSession === undefined ? undefined : snapshot.targets.find((candidate) => candidate.id === activeSession.targetId);
+      const activeStartSupported = canRewindToSessionStart(activeBackend?.capabilities.get("session.rewind_to_start"), activeTarget);
       const activeTimeline = snapshot.timelineBySession.get(sourceSessionId) ?? [];
       const activeUser = lastVisibleUserMessage(activeTimeline.filter((candidate) => !hidesFromTimelineHistory(candidate)));
       const queuedWork = snapshot.queue.some((candidate) => candidate.sessionId === sourceSessionId && !["completed", "cancelled", "failed"].includes(candidate.state));
@@ -1357,8 +1384,8 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
         || queuedWork
         || activeBackend?.capabilities.get("session.rewind")?.supported !== true
         || activeUser?.id !== item.id
-        || !canEditVisibleUserMessage(activeUser, activeBackend.capabilities.get("session.rewind_to_start")?.supported === true)
-        || !sameNativeNavigationTarget(messageDialogueRewindTarget(activeUser, activeBackend.capabilities.get("session.rewind_to_start")?.supported === true), navigationTarget)
+        || !canEditVisibleUserMessage(activeUser, activeStartSupported)
+        || !sameNativeNavigationTarget(messageDialogueRewindTarget(activeUser, activeStartSupported), navigationTarget)
       ) return undefined;
       return { snapshot, session: activeSession, backend: activeBackend, user: activeUser };
     };
@@ -1511,11 +1538,12 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
     const latest = controllerRef.current.state.snapshot;
     const latestSession = latest.sessions.find((candidate) => candidate.id === rewind.sessionId);
     const latestBackend = latestSession === undefined ? undefined : latest.backends.find((candidate) => candidate.id === latestSession.backendId);
+    const latestTarget = latestSession === undefined ? undefined : latest.targets.find((candidate) => candidate.id === latestSession.targetId);
     const latestQueuedWork = latest.queue.some((candidate) => candidate.sessionId === rewind.sessionId && !["completed", "cancelled", "failed"].includes(candidate.state));
     if (latestSession?.state !== "idle" || latestQueuedWork || latestBackend?.capabilities.get("session.rewind")?.supported !== true) throw new Error(t("timeline.rewindStale"));
     const currentItem = (latest.timelineBySession.get(rewind.sessionId) ?? []).find((item) => item.id === rewind.itemId);
     if (latestSession.generation !== rewind.generation || controllerRef.current.navigateSessionBranch !== rewind.navigate
-      || currentItem === undefined || !sameNativeNavigationTarget(messageDialogueRewindTarget(currentItem, latestBackend.capabilities.get("session.rewind_to_start")?.supported === true), rewind.target)) {
+      || currentItem === undefined || !sameNativeNavigationTarget(messageDialogueRewindTarget(currentItem, canRewindToSessionStart(latestBackend.capabilities.get("session.rewind_to_start"), latestTarget)), rewind.target)) {
       throw new Error(t("timeline.rewindStale"));
     }
     await rewind.navigate(rewind.sessionId, rewind.target, { expectedGeneration: rewind.generation });
@@ -1743,7 +1771,7 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
           </div>
         </div>
         <div className="session-header__actions">
-          {canStop && running && session.activeRunId !== undefined && <Button tone="danger" disabled={stopInFlight} onClick={stopRun}><CircleStop aria-hidden="true" />{t("controls.abort")}</Button>}
+          {canStop && running && session.activeRunId !== undefined && <Button className="session-header__abort" tone="danger" disabled={stopInFlight} onClick={stopRun}><CircleStop aria-hidden="true" />{t("controls.abort")}</Button>}
           {!reviewReadOnly && session.state === "error" && session.retryRunId !== undefined && <Button onClick={() => runAction("retry", () => controller.retry(session.retryRunId as string))}><RotateCcw aria-hidden="true" />{t("common.retry")}</Button>}
           {controller.state.connectionState === "connected" && <IconButton
             buttonRef={collaborationButtonRef}
@@ -1825,6 +1853,7 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
       <Timeline
         key={timelineResourceOwnerKey}
         ownerKey={`${timelineResourceOwnerKey}:${session.generation}:${controller.state.connectionState}`}
+        viewportOwnerKey={JSON.stringify([controller.state.activeProfile?.id, controller.state.activeProfile?.serverId, controller.state.activeProfile?.origin, session.id, String(session.generation)])}
         sessionId={session.id}
         sessionName={session.name}
         workspaceId={canOpenWorkspaceReferences && controller.state.connectionState === "connected" ? workspace?.id : undefined}
@@ -1880,6 +1909,7 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
         onDeleteMessage={messageDeleteSupported ? openMessageDelete : undefined}
         messageDeleteBlockedReason={messageDeleteSupported ? messageDeleteBlockedReason : undefined}
         messageActionResetSignal={messageActionResetSignal}
+        onRootChange={bindTimelineRoot}
         onWorkspaceRewind={reviewReadOnly || !canRewindFromTimeline(backend, workspace) ? undefined : (workspaceId, changeSetId) => runAction(`preview-rewind:${changeSetId}`, async () => {
           if (workspace?.id !== workspaceId) throw new Error("This workspace change no longer belongs to the active task.");
           const requestId = ++messageRewindRequestIdRef.current;
@@ -1984,8 +2014,8 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
       >
         <InteractionDialog key={interaction === undefined ? "interaction:none" : `${interaction.sessionId}:${interaction.id}`} controller={controller} interaction={interaction} remaining={remainingInteractions} inline t={t} runAction={runAction} />
       </InteractionPromptHost>
-      {currentShareSelection !== undefined && <ShareSelectionBar ownerKey={`${timelineResourceOwnerKey}:${session.generation}`} sessionName={session.name} messages={shareableMessages} selectedIds={currentShareSelection.selectedIds} locale={controller.state.preferences.locale} t={t} onToggleAll={toggleAllShareMessages} onCancel={closeShareSelection} />}
-{interaction === undefined && <div hidden={currentShareSelection !== undefined}><Composer artifacts={canListSessionArtifacts ? liveArtifacts : []} sessions={historicalSessionMentionCandidates} controller={controller} session={session} backend={backend} sessionUsage={effectiveSessionUsage} readOnly={reviewReadOnly} autoFocus={composerAutoFocus && presentation === "standard" && currentShareSelection === undefined} focusRequest={composerFocusRequest} queue={queue} queueControl={queueControl} workspace={workspace} extraDirectories={extraDirectories} resources={canListSessionResources ? liveResources : []} commands={canListRuntimeCommands ? liveCommands : []} messageHistory={messageHistory} controls={composerControls} runningStatus={<SessionRunningStatusBar session={session} items={recoveryPresentationTimeline} backgroundTaskIds={backgroundTaskIds} canStopBackgroundTasks={canStopBackgroundTasks} backgroundStopping={backgroundStopping} backgroundStopError={backgroundStopError} suppressed={reviewReadOnly} t={t} onStopBackgroundTasks={stopAllBackgroundTasks} />} messageMentionInsertion={composerMessageMentionInsertion} selectionQuoteInsertion={composerSelectionQuoteInsertion} attachmentInsertion={composerAttachmentInsertion} draftReplacement={composerDraftReplacement} onDraftMutation={noteComposerDraftMutation} t={t} runAction={runAction} onLocalSend={(sourceSessionId) => { if (activeSessionIdRef.current === sourceSessionId) setFollowLatestSignal((current) => current + 1); }} onStop={canStop ? stopRun : undefined} stopInFlight={stopInFlight} onCompact={canCompact && !running && activeCompaction === undefined && !compactInFlight && (session.context?.usedTokens ?? 0) > 0 ? requestCompact : undefined} /></div>}
+      {currentShareSelection !== undefined && <ShareSelectionBar ownerKey={`${timelineResourceOwnerKey}:${session.generation}`} sessionId={session.id} sessionName={session.name} messages={shareableMessages} selectedIds={currentShareSelection.selectedIds} locale={controller.state.preferences.locale} t={t} getTimelineRoot={getTimelineRoot} onToggleAll={toggleAllShareMessages} onCancel={closeShareSelection} />}
+{interaction === undefined && <div className="session-composer-layer" hidden={currentShareSelection !== undefined}><Composer artifacts={canListSessionArtifacts ? liveArtifacts : []} sessions={historicalSessionMentionCandidates} controller={controller} session={session} backend={backend} sessionUsage={effectiveSessionUsage} readOnly={reviewReadOnly} autoFocus={composerAutoFocus && presentation === "standard" && currentShareSelection === undefined} focusRequest={composerFocusRequest} queue={queue} queueControl={queueControl} workspace={workspace} extraDirectories={extraDirectories} resources={canListSessionResources ? liveResources : []} commands={canListRuntimeCommands ? liveCommands : []} messageHistory={messageHistory} controls={composerControls} runningStatus={<SessionRunningStatusBar session={session} items={recoveryPresentationTimeline} backgroundTaskIds={backgroundTaskIds} canStopBackgroundTasks={canStopBackgroundTasks} backgroundStopping={backgroundStopping} backgroundStopError={backgroundStopError} suppressed={reviewReadOnly} t={t} onStopBackgroundTasks={stopAllBackgroundTasks} />} messageMentionInsertion={composerMessageMentionInsertion} selectionQuoteInsertion={composerSelectionQuoteInsertion} attachmentInsertion={composerAttachmentInsertion} draftReplacement={composerDraftReplacement} onDraftMutation={noteComposerDraftMutation} t={t} runAction={runAction} onLocalSend={(sourceSessionId) => { if (activeSessionIdRef.current === sourceSessionId) setFollowLatestSignal((current) => current + 1); }} onStop={canStop ? stopRun : undefined} stopInFlight={stopInFlight} onCompact={canCompact && !running && activeCompaction === undefined && !compactInFlight && (session.context?.usedTokens ?? 0) > 0 ? requestCompact : undefined} /></div>}
       <ExtensionWidgets widgets={extensionWidgets.filter((widget) => widget.placement === "belowEditor")} label={t("a11y.extensionWidgets")} />
       </div>
 

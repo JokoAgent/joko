@@ -353,6 +353,8 @@ class ControlledRemoteClaude {
       managerGeneration: MANAGER_GENERATION
     };
     if (method === "owner.reconcile") return { reconciled: true };
+    if (method === "fresh.getForBinding") return null;
+    if (method === "fresh.hasPendingSource") return false;
     if (method === "session.list") return [...this.#messages.keys()].map((id) => this.info(id, REMOTE_ROOT));
     if (method === "session.info") return this.info(String(params.sessionId), REMOTE_ROOT);
     if (method === "session.messages") return this.messages(String(params.sessionId));

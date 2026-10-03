@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 
-import { create } from "@bufbuild/protobuf";
+import { create, fromBinary } from "@bufbuild/protobuf";
 import { Code, ConnectError } from "@connectrpc/connect";
 import {
   CompactSessionOutcome,
@@ -15,12 +15,15 @@ import {
   RunState,
   SessionSnapshotScopeSchema,
   SnapshotScopeSchema,
+  SubmitOperationRequestSchema,
   nativeSessionTreeRoots
 } from "@joko/contracts";
 import { PI_LIKE_PROFILE } from "@joko/testkit";
+import type { AdapterContext, NativeHistoryEventContext, PromptInput } from "@joko/core";
+import { chromium, type Browser, type Page } from "playwright-core";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { OrchestratorE2eFixture, waitFor } from "./fixture.js";
+import { InstrumentedFakeAdapter, OrchestratorE2eFixture, waitFor } from "./fixture.js";
 import {
   abortRunMutation,
   archiveMutation,
@@ -50,12 +53,28 @@ import {
   submit
 } from "./operations.js";
 
+const mountedTimelineIt = process.env.JOKO_BROWSER_EXECUTABLE?.trim()
+  && process.env.JOKO_MOUNTED_WEB_DIR?.trim() ? it : it.skip;
+
 describe("session host, durable events, and reconnect semantics", () => {
   let fixture: OrchestratorE2eFixture | undefined;
+  let browser: Browser | undefined;
+  let releaseBrowserRequest: (() => void) | undefined;
 
   afterEach(async () => {
-    await fixture?.close({ removeRoot: true });
-    fixture = undefined;
+    releaseBrowserRequest?.();
+    releaseBrowserRequest = undefined;
+    try {
+      await Promise.all(browser?.contexts().map((context) => context.setOffline(false)) ?? []);
+    } finally {
+      try {
+        await browser?.close();
+      } finally {
+        browser = undefined;
+        await fixture?.close({ removeRoot: true });
+        fixture = undefined;
+      }
+    }
   });
 
   it("fences input at atomic admission and replays accepted input after runtime activation", async () => {
@@ -512,4 +531,262 @@ describe("session host, durable events, and reconnect semantics", () => {
     ]));
     expect(fixture.adapter().abortCalls).toBe(0);
   });
+
+  mountedTimelineIt("preserves real scrollbar ownership and durable unread through pre-ACK input and reconnect", { timeout: 120_000 }, async () => {
+    fixture = await OrchestratorE2eFixture.start({
+      webDirectory: process.env.JOKO_MOUNTED_WEB_DIR!,
+      profiles: [{ ...PI_LIKE_PROFILE, streamDelayMs: 0 }],
+      createAdapter: (profile) => new MountedTimelineAdapter(profile)
+    });
+    const manager = await fixture.pair("Mounted Timeline manager");
+    const sessionId = sessionIdFrom(await submit(manager.clients.operation, manager.connectionId,
+      createSessionMutation({ backendId: fixture.adapter().id, targetId: fixture.targetId(), displayName: "Mounted Timeline" })));
+    const adapter = fixture.adapter() as MountedTimelineAdapter;
+    const send = async (text: string) => submit(manager.clients.operation, manager.connectionId,
+      sendInputMutation(sessionId, BigInt(fixture!.application.store.getSession(sessionId).descriptor.binding.generation), text));
+    for (let index = 0; index < 18; index += 1) {
+      const operation = await send(`Timeline layout ${index}\n\n${"A paragraph measured by the real browser. ".repeat(12)}`);
+      await waitFor(() => manager.clients.run.getRun({ runId: queueRunIdFrom(operation) }),
+        (value) => value.run?.state === RunState.SUCCEEDED, "the layout seed to settle");
+    }
+    const generation = fixture.application.store.getSession(sessionId).descriptor.binding.generation;
+    const challenge = await fixture.anonymous.connection.beginPairing({ deviceDisplayName: "Mounted Timeline Web" });
+    if (challenge.challenge === undefined) throw new Error("Mounted Timeline pairing returned no challenge.");
+    browser = await chromium.launch({
+      executablePath: process.env.JOKO_BROWSER_EXECUTABLE!, headless: true, ignoreDefaultArgs: ["--hide-scrollbars"]
+    });
+    const page = await browser.newPage({ viewport: { width: 1440, height: 960 } });
+    const pageErrors: string[] = [];
+    page.on("pageerror", (error) => pageErrors.push(error.name));
+    let failedEventStreams = 0;
+    page.on("requestfailed", (request) => {
+      if (new URL(request.url()).pathname === "/joko.v1.EventService/StreamEvents") failedEventStreams += 1;
+    });
+    await page.goto(`${fixture.baseUrl}/#/tasks/${encodeURIComponent(sessionId)}`, { waitUntil: "domcontentloaded" });
+    await page.locator(".connection-tabs > button").nth(2).click();
+    await page.getByLabel("Joko node address").fill(fixture.baseUrl);
+    await page.getByLabel("Pairing code").fill(fixture.pairingCode(challenge.challenge.challengeId));
+    await page.getByLabel("Device name").fill("Mounted Timeline Web");
+    await page.locator("form.pair-form button[type=submit]").click();
+    const timeline = page.locator(`.timeline[data-timeline-session-id="${sessionId}"]`);
+    await timeline.waitFor({ state: "visible", timeout: 20_000 });
+    const beforeHold = await settledViewportGeometry(page);
+    expect(beforeHold.height).toBeGreaterThan(300);
+    expect(beforeHold.scrollHeight).toBeGreaterThan(beforeHold.height * 3);
+    expect(beforeHold.gutter).toBeGreaterThan(0);
+    const thumbHeight = Math.max(17, beforeHold.height * beforeHold.height / beforeHold.scrollHeight);
+    const scrollbarX = beforeHold.left + beforeHold.width + beforeHold.gutter / 2;
+    const scrollbarY = beforeHold.top + beforeHold.height - thumbHeight / 2 - 1;
+    const overlayGeometry = await page.locator(".session-bottom-overlay").evaluate((overlay) =>
+      [...overlay.querySelectorAll(".composer-region,.composer-stack,.session-running-status")].map((element) => {
+        const rect = element.getBoundingClientRect();
+        const style = getComputedStyle(element);
+        return { className: element.className, left: rect.left, right: rect.right, top: rect.top, bottom: rect.bottom,
+          pointerEvents: style.pointerEvents, paddingLeft: style.paddingLeft, paddingRight: style.paddingRight };
+      }));
+    const scrollbarHits = await timeline.evaluate((node, { gutterStart, gutter, y }) =>
+      [0.2, 0.5, 0.8].map((fraction) => {
+        const hit = node.ownerDocument.elementFromPoint(gutterStart + gutter * fraction, y);
+        const rect = hit?.getBoundingClientRect();
+        return { isTimeline: hit === node, tag: hit?.tagName, className: hit?.getAttribute("class"),
+          parentClass: hit?.parentElement?.getAttribute("class"), left: rect?.left, right: rect?.right };
+      }),
+    { gutterStart: beforeHold.left + beforeHold.width, gutter: beforeHold.gutter, y: scrollbarY });
+    const scrollbarDiagnostics = JSON.stringify({ beforeHold, scrollbarX, scrollbarY, scrollbarHits, overlayGeometry });
+    expect(scrollbarHits.slice(0, 2).map((hit) => hit.isTimeline), scrollbarDiagnostics).toEqual([true, true]);
+    // The Inspector's resize grip owns the pane's outer edge.
+    if (scrollbarHits[2]?.isTimeline !== true) expect(scrollbarHits[2]?.className, scrollbarDiagnostics).toBe("inspector__resize");
+    for (const surface of overlayGeometry) {
+      expect(surface.right, scrollbarDiagnostics).toBeLessThanOrEqual(beforeHold.left + beforeHold.width);
+    }
+    await page.mouse.move(scrollbarX, scrollbarY);
+    await page.mouse.down();
+    await browserFrames(page);
+    const afterPress = await viewportGeometry(page);
+    const heldOperation = await send(MOUNTED_TIMELINE_HOLD);
+    const heldContext = await waitFor(async () => adapter.contexts.get(MOUNTED_TIMELINE_HOLD),
+      (value) => value !== undefined, "the controlled streaming Run");
+    if (heldContext === undefined) throw new Error("The Timeline Run has no active context.");
+    const heldMessage: NativeHistoryEventContext = { identity: { entryId: "mounted-held-answer" } };
+    const growingText = "Browser streaming layout grows while the scrollbar is held.\n\n".repeat(24);
+    await heldContext.emit({ type: "text_delta", blockId: heldMessage.identity!.entryId, delta: growingText, nativeHistory: heldMessage });
+    await waitFor(() => viewportGeometry(page), (value) => value.scrollHeight > beforeHold.scrollHeight + 100,
+      "streaming content to create real layout growth");
+    await browserFrames(page);
+    const holdDiagnostics = {
+      beforeHold, afterPress, afterGrowth: await viewportGeometry(page), scrollbarX, scrollbarY, overlayGeometry
+    };
+    expect(Math.abs(holdDiagnostics.afterGrowth.scrollTop - beforeHold.scrollTop), JSON.stringify(holdDiagnostics)).toBeLessThanOrEqual(2);
+    expect(await page.locator(".jump-latest").count()).toBe(0);
+    await page.mouse.move(scrollbarX, scrollbarY - 75, { steps: 8 });
+    await page.mouse.up();
+    await waitFor(() => viewportGeometry(page), (value) => value.scrollTop < beforeHold.scrollTop - 50,
+      "the actual native thumb drag to commit its upward movement");
+    await page.locator(".jump-latest").waitFor({ state: "visible" });
+    await heldContext.emit({ type: "message_complete", role: "assistant", blocks: [{ kind: "text", text: growingText }], nativeHistory: heldMessage });
+    await heldContext.emit({ type: "done", outcome: "completed" });
+    await waitFor(() => manager.clients.run.getRun({ runId: queueRunIdFrom(heldOperation) }),
+      (value) => value.run?.state === RunState.SUCCEEDED, "the held scrollbar Run to settle");
+    await page.locator(".jump-latest").click();
+    await waitFor(() => viewportGeometry(page), (value) => value.distanceFromEnd <= 2, "the explicit latest jump");
+    await page.getByRole("button", { name: "Close details", exact: true }).click();
+    await settledViewportGeometry(page);
+
+    const requestEntered = browserGate();
+    const forwardRequest = browserGate();
+    const releaseAcknowledgement = browserGate();
+    releaseBrowserRequest = () => { forwardRequest.release(); releaseAcknowledgement.release(); };
+    let heldBrowserRequest = false;
+    await page.route("**/joko.v1.OperationService/SubmitOperation", async (route) => {
+      const bytes = route.request().postDataBuffer();
+      if (bytes === null) throw new Error("Mounted Web sent no binary Operation request.");
+      const body = fromBinary(SubmitOperationRequestSchema, bytes);
+      if (heldBrowserRequest || body.mutation?.payload.case !== "sendInput") {
+        await route.continue();
+        return;
+      }
+      heldBrowserRequest = true;
+      requestEntered.release();
+      await forwardRequest.promise;
+      const response = await route.fetch();
+      await releaseAcknowledgement.promise;
+      await route.fulfill({ response });
+    });
+    const composer = page.locator(".composer-rich-editor__content[contenteditable=true]");
+    await composer.fill(MOUNTED_TIMELINE_LOCAL);
+    await page.getByRole("button", { name: "Send", exact: true }).click();
+    await requestEntered.promise;
+    await timeline.hover({ position: { x: 150, y: 200 } });
+    await page.mouse.wheel(0, -850);
+    await page.locator(".jump-latest").waitFor({ state: "visible" });
+    expect(await unreadCount(page)).toBe(0);
+    const acceptedLocalInput = timeline.getByText(MOUNTED_TIMELINE_LOCAL, { exact: true });
+    expect(await acceptedLocalInput.count()).toBe(0);
+    forwardRequest.release();
+    const localContext = await waitFor(async () => adapter.contexts.get(MOUNTED_TIMELINE_LOCAL),
+      (value) => value !== undefined, "the durable local input before its unary acknowledgement");
+    if (localContext === undefined) throw new Error("The local input has no active Run.");
+    await acceptedLocalInput.waitFor({ state: "attached" });
+    expect(await unreadCount(page)).toBe(0);
+    const localMessage: NativeHistoryEventContext = { identity: { entryId: "mounted-local-answer" } };
+    const localText = "One durable assistant answer with two content blocks.";
+    await localContext.emit({ type: "text_delta", blockId: localMessage.identity!.entryId, contentIndex: 0, delta: localText, nativeHistory: localMessage });
+    await waitFor(() => unreadCount(page), (value) => value === 1, "one unread assistant message before ACK");
+    await localContext.emit({ type: "text_delta", blockId: localMessage.identity!.entryId, contentIndex: 1, delta: "\n\nSecond block.", nativeHistory: localMessage });
+    await localContext.emit({ type: "message_complete", role: "assistant", blocks: [
+      { kind: "text", text: localText }, { kind: "text", text: "\n\nSecond block." }
+    ], nativeHistory: localMessage });
+    await localContext.emit({ type: "done", outcome: "completed" });
+    await browserFrames(page);
+    expect(await unreadCount(page)).toBe(1);
+    releaseAcknowledgement.release();
+    await page.waitForFunction(() => document.querySelector(".composer-rich-editor__content")?.getAttribute("contenteditable") === "true");
+    await browserFrames(page);
+    expect(await unreadCount(page)).toBe(1);
+
+    const anchor = await visibleTimelineAnchor(page);
+    const failuresBeforeFault = failedEventStreams;
+    await page.context().setOffline(true);
+    fixture.dropPublicConnections();
+    await waitFor(async () => failedEventStreams, (value) => value > failuresBeforeFault, "the actual Connect stream network failure");
+    await page.locator(".offline-banner:visible,.error-banner:visible").first().waitFor({ state: "visible", timeout: 20_000 });
+    const remoteOperation = await send(MOUNTED_TIMELINE_REMOTE);
+    const remoteContext = await waitFor(async () => adapter.contexts.get(MOUNTED_TIMELINE_REMOTE),
+      (value) => value !== undefined, "a remote input while the Browser is offline");
+    if (remoteContext === undefined) throw new Error("The remote input has no active Run.");
+    await remoteContext.emit({ type: "message_complete", role: "assistant", blocks: [{ kind: "text", text: "Remote durable answer." }] });
+    await remoteContext.emit({ type: "done", outcome: "completed" });
+    await waitFor(() => manager.clients.run.getRun({ runId: queueRunIdFrom(remoteOperation) }),
+      (value) => value.run?.state === RunState.SUCCEEDED, "the offline remote Run to settle");
+    expect(fixture.application.store.getSession(sessionId).descriptor.binding.generation).toBe(generation);
+    await page.context().setOffline(false);
+    await waitFor(() => page.locator(".offline-banner,.error-banner").count(), (value) => value === 0,
+      "the automatic connection recovery to clear its public error state", 20_000);
+    await waitFor(() => unreadCount(page), (value) => value === 3, "retained unread plus the remote user and assistant after reconnect", 20_000);
+    await browserFrames(page);
+    const recoveredAnchor = await visibleTimelineAnchor(page);
+    const recoveredHistory = await manager.clients.session.listSessionTimeline({ sessionId, limit: 500 });
+    const authoritativeAnchorKinds = recoveredHistory.events.flatMap((event) => {
+      const payload = event.payload?.kind;
+      return payload?.case === "textDelta" || payload?.case === "messageStarted" || payload?.case === "messageCompleted"
+        ? payload.value.messageId === anchor.id ? [payload.case] : []
+        : [];
+    });
+    expect(recoveredAnchor.id, JSON.stringify({ anchor, recoveredAnchor, authoritativeAnchorKinds, geometry: await viewportGeometry(page) })).toBe(anchor.id);
+    expect(Math.abs(recoveredAnchor.offset - anchor.offset)).toBeLessThanOrEqual(3);
+    await page.locator(".jump-latest").click();
+    await waitFor(() => viewportGeometry(page), (value) => value.distanceFromEnd <= 2, "the recovered Timeline latest edge");
+    expect(await page.locator(".jump-latest").count()).toBe(0);
+    await page.getByText("Remote durable answer.", { exact: true }).waitFor({ state: "visible" });
+    expect(pageErrors).toEqual([]);
+  });
 });
+
+const MOUNTED_TIMELINE_HOLD = "Timeline controlled scrollbar stream";
+const MOUNTED_TIMELINE_LOCAL = "Timeline controlled local input";
+const MOUNTED_TIMELINE_REMOTE = "Timeline controlled remote input";
+
+class MountedTimelineAdapter extends InstrumentedFakeAdapter {
+  readonly contexts = new Map<string, AdapterContext>();
+
+  override async send(input: PromptInput, context: AdapterContext): Promise<void> {
+    await context.emit({ type: "message_complete", role: "user", blocks: [{ kind: "text", text: input.text }] });
+    if ([MOUNTED_TIMELINE_HOLD, MOUNTED_TIMELINE_LOCAL, MOUNTED_TIMELINE_REMOTE].includes(input.text)) {
+      this.sendCalls.push(input);
+      this.contexts.set(input.text, context);
+      return;
+    }
+    await super.send(input, context);
+  }
+}
+
+function browserGate(): { readonly promise: Promise<void>; readonly release: () => void } {
+  let release!: () => void;
+  const promise = new Promise<void>((resolve) => { release = resolve; });
+  return { promise, release };
+}
+
+async function browserFrames(page: Page): Promise<void> {
+  await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+}
+
+async function settledViewportGeometry(page: Page) {
+  let previous: Awaited<ReturnType<typeof viewportGeometry>> | undefined;
+  let stableFrames = 0;
+  for (let frame = 0; frame < 120; frame += 1) {
+    await browserFrames(page);
+    const geometry = await viewportGeometry(page);
+    stableFrames = geometry.distanceFromEnd <= 2 && geometry.scrollHeight === previous?.scrollHeight
+      && geometry.scrollTop === previous.scrollTop ? stableFrames + 1 : 0;
+    if (stableFrames >= 8) return geometry;
+    previous = geometry;
+  }
+  throw new Error(`The mounted Timeline layout did not settle: ${JSON.stringify(previous)}`);
+}
+
+async function unreadCount(page: Page): Promise<number> {
+  const counter = page.locator(".jump-latest__count");
+  return await counter.count() === 0 ? 0 : Number(await counter.textContent());
+}
+
+async function viewportGeometry(page: Page) {
+  return page.locator(".timeline").evaluate((element) => {
+    const node = element as HTMLElement;
+    const rect = node.getBoundingClientRect();
+    return {
+      left: rect.left, top: rect.top, width: node.clientWidth, height: node.clientHeight,
+      gutter: node.offsetWidth - node.clientWidth, scrollTop: node.scrollTop, scrollHeight: node.scrollHeight,
+      distanceFromEnd: node.scrollHeight - node.scrollTop - node.clientHeight
+    };
+  });
+}
+
+async function visibleTimelineAnchor(page: Page) {
+  return page.locator(".timeline").evaluate((element) => {
+    const top = element.getBoundingClientRect().top;
+    const row = [...element.querySelectorAll<HTMLElement>("[data-timeline-item-id]")]
+      .find((entry) => entry.getBoundingClientRect().bottom > top + 0.5);
+    if (row === undefined) throw new Error("The Browser has no visible Timeline anchor.");
+    return { id: row.dataset.timelineItemId, offset: row.getBoundingClientRect().top - top };
+  });
+}

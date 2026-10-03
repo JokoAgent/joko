@@ -5,6 +5,11 @@ import {
   type DedicatedHardwareSettings
 } from "./settings.js";
 
+export interface DedicatedHardwareTaskActivity {
+  readonly phase: "running" | "needs-interaction" | "completed" | "error" | null;
+  readonly attention: boolean;
+}
+
 export interface DedicatedHardwarePublishedTask {
   readonly sessionId: string;
   readonly sessionGeneration: string;
@@ -15,6 +20,7 @@ export interface DedicatedHardwarePublishedTask {
   readonly sidebarOrder: number | null;
   readonly catalogEligible: boolean;
   readonly priorityRank: number | null;
+  readonly activity: DedicatedHardwareTaskActivity;
 }
 
 export interface DedicatedHardwareTaskCatalog {
@@ -56,14 +62,18 @@ export function parseDedicatedHardwareTaskCatalog(value: unknown): DedicatedHard
   for (const raw of value.tasks) {
     if (!hasExactKeys(raw, [
       "sessionId", "sessionGeneration", "targetId", "title", "pinned", "userSendAt", "sidebarOrder",
-      "catalogEligible", "priorityRank"
+      "catalogEligible", "priorityRank", "activity"
     ]) || !isBoundedIdentity(raw.sessionId, 512) || seen.has(raw.sessionId) ||
         !isDecimalRevision(raw.sessionGeneration) || !isBoundedIdentity(raw.targetId, 512) ||
         !(raw.title === null || isBoundedTitle(raw.title)) || typeof raw.pinned !== "boolean" ||
         !(raw.userSendAt === null || isNonnegativeSafeInteger(raw.userSendAt)) ||
         !(raw.sidebarOrder === null || isNonnegativeSafeInteger(raw.sidebarOrder)) ||
         typeof raw.catalogEligible !== "boolean" ||
-        !(raw.priorityRank === null || isNonnegativeSafeInteger(raw.priorityRank))) return undefined;
+        !(raw.priorityRank === null || isNonnegativeSafeInteger(raw.priorityRank)) ||
+        !hasExactKeys(raw.activity, ["phase", "attention"]) ||
+        !(raw.activity.phase === null || raw.activity.phase === "running" ||
+          raw.activity.phase === "needs-interaction" || raw.activity.phase === "completed" ||
+          raw.activity.phase === "error") || typeof raw.activity.attention !== "boolean") return undefined;
     seen.add(raw.sessionId);
     tasks.push({
       sessionId: raw.sessionId,
@@ -74,7 +84,8 @@ export function parseDedicatedHardwareTaskCatalog(value: unknown): DedicatedHard
       userSendAt: raw.userSendAt,
       sidebarOrder: raw.sidebarOrder,
       catalogEligible: raw.catalogEligible,
-      priorityRank: raw.priorityRank
+      priorityRank: raw.priorityRank,
+      activity: { phase: raw.activity.phase, attention: raw.activity.attention }
     });
   }
   return {

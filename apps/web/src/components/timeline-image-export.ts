@@ -1,33 +1,210 @@
-import { getFontEmbedCSS, toSvg } from "html-to-image";
+import { toSvg } from "html-to-image";
 import { assertBrowserActionCurrent, type BrowserActionContext } from "../browser-action.js";
 
 const MAX_EDGE = 4_096;
 const MAX_PIXELS = MAX_EDGE * MAX_EDGE;
+export const TIMELINE_FROZEN_IMAGE_ATTRIBUTE = "data-timeline-frozen-image";
 let snapshotSequence = 0;
 
-export function timelineExportScale(width: number, height: number, desired = 2): number {
-  if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) return 1;
-  return Math.min(desired, MAX_EDGE / Math.max(width, height), Math.sqrt(MAX_PIXELS / (width * height)));
+export interface TimelineImageExportOptions {
+  readonly desiredScale?: number;
+  readonly maximumEdgePixels?: number;
+  readonly maximumPixels?: number;
+}
+
+export function timelineExportScale(
+  width: number,
+  height: number,
+  desired = 2,
+  maximumEdgePixels = MAX_EDGE,
+  maximumPixels = MAX_PIXELS
+): number {
+  if (
+    !Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0
+    || !Number.isFinite(desired) || desired <= 0
+    || !Number.isFinite(maximumEdgePixels) || maximumEdgePixels <= 0
+    || !Number.isFinite(maximumPixels) || maximumPixels <= 0
+  ) return 1;
+  return Math.min(desired, maximumEdgePixels / Math.max(width, height), Math.sqrt(maximumPixels / (width * height)));
 }
 
 export function timelineTableToTsv(node: HTMLElement): string | undefined {
   const rows = [...node.querySelectorAll("tr")];
   if (rows.length === 0) return undefined;
-  return rows.map((row) => [...row.querySelectorAll("th, td")]
-    .map((cell) => (cell as HTMLElement).innerText.replace(/\s*\n\s*/gu, " ").trim())
+  const cells = rows.map((row) => [...row.querySelectorAll<HTMLElement>("th, td")]);
+  const mathematicalCells = new Set(cells.flat().filter((cell) =>
+    [...cell.querySelectorAll(".katex")].some((math) => mathSource(math) !== undefined)));
+  const format = (read: (cell: HTMLElement) => string): string => cells.map((row) => row
+    .map((cell) => read(cell).replace(/\s*\n\s*/gu, " ").trim())
     .join("\t")).join("\n");
+  if (mathematicalCells.size === 0) return format((cell) => cell.innerText);
+
+  const ownerDocument = node.ownerDocument;
+  const ownerWindow = ownerDocument.defaultView;
+  if (ownerWindow === null) throw new Error("Content is no longer available.");
+  const clone = node.cloneNode(true) as HTMLElement;
+  const originals = [node, ...node.querySelectorAll("*")];
+  const copies = [clone, ...clone.querySelectorAll("*")];
+  const copiedCells = new Map<HTMLElement, HTMLElement>();
+  originals.forEach((original, index) => {
+    const copy = copies[index] as HTMLElement | SVGElement;
+    if (copy.style !== undefined) copyStyle(ownerWindow.getComputedStyle(original), copy.style);
+    if (mathematicalCells.has(original as HTMLElement)) copiedCells.set(original as HTMLElement, copy as HTMLElement);
+  });
+  for (const math of clone.querySelectorAll<HTMLElement>(".katex")) {
+    const tex = mathSource(math);
+    if (tex !== undefined) math.replaceChildren(ownerDocument.createTextNode(tex));
+  }
+  const staging = ownerDocument.createElement("div");
+  staging.setAttribute("aria-hidden", "true");
+  staging.inert = true;
+  staging.style.cssText = "position:fixed;left:-100000px;top:0;pointer-events:none;contain:layout paint;";
+  // A detached or display-none source uses innerText's textContent fallback.
+  if (!node.isConnected) staging.style.display = "none";
+  for (let parent = node.parentElement; parent !== null; parent = parent.parentElement) {
+    if (ownerWindow.getComputedStyle(parent).display === "none") { staging.style.display = "none"; break; }
+  }
+  staging.append(clone);
+  ownerDocument.body.append(staging);
+  try {
+    // Keep the clone attached for native br/visibility/white-space semantics.
+    return format((cell) => copiedCells.get(cell)?.innerText ?? cell.innerText);
+  } finally {
+    staging.remove();
+  }
 }
 
 export function timelineMathToLatex(node: HTMLElement): string | undefined {
+  const tex = mathSource(node);
+  return tex === undefined ? undefined : `$$\n${tex}\n$$`;
+}
+
+function mathSource(node: Element): string | undefined {
   const tex = node.querySelector('annotation[encoding="application/x-tex"]')?.textContent?.trim();
-  return tex === undefined || tex.length === 0 ? undefined : `$$\n${tex}\n$$`;
+  return tex === undefined || tex.length === 0 ? undefined : tex;
 }
 
 function copyStyle(source: CSSStyleDeclaration, target: CSSStyleDeclaration): void {
   for (let index = 0; index < source.length; index += 1) {
-    const name = source.item(index);
+    const name = typeof source.item === "function" ? source.item(index) : source[index]!;
     target.setProperty(name, source.getPropertyValue(name), source.getPropertyPriority(name));
   }
+}
+
+function fontFamilyNames(value: string): string[] {
+  return [...value.matchAll(/(?:^|,)\s*(?:"([^"]+)"|'([^']+)'|([^,]+))/gu)]
+    .map((match) => (match[1] ?? match[2] ?? match[3] ?? "").trim().toLocaleLowerCase())
+    .filter((name) => name.length > 0);
+}
+
+function fontFaceRules(rules: CSSRuleList, output: CSSFontFaceRule[]): void {
+  for (const rule of rules) {
+    if (rule.type === 5 && "style" in rule) {
+      output.push(rule as CSSFontFaceRule);
+      continue;
+    }
+    if ("cssRules" in rule) fontFaceRules((rule as CSSGroupingRule).cssRules, output);
+  }
+}
+
+function selectedFontSource(value: string): { readonly url: string; readonly format?: string } | undefined {
+  const sources = [...value.matchAll(
+    /url\(\s*(?:"([^"]*)"|'([^']*)'|([^'"\)]*?))\s*\)\s*(?:format\(\s*(?:"([^"]*)"|'([^']*)'|([^'"\)]*?))\s*\))?/giu
+  )].map((match) => ({
+    url: (match[1] ?? match[2] ?? match[3] ?? "").trim(),
+    format: (match[4] ?? match[5] ?? match[6])?.trim().toLocaleLowerCase()
+  })).filter((source) => source.url.length > 0);
+  return sources.find((source) => source.format === "woff2") ?? sources[0];
+}
+
+function fontMimeType(source: { readonly url: string; readonly format?: string }, response: Response): string {
+  if (source.format === "woff2" || /\.woff2(?:$|[?#])/iu.test(source.url)) return "font/woff2";
+  if (source.format === "woff" || /\.woff(?:$|[?#])/iu.test(source.url)) return "font/woff";
+  if (source.format === "truetype" || /\.ttf(?:$|[?#])/iu.test(source.url)) return "font/ttf";
+  return response.headers.get("content-type")?.split(";", 1)[0]?.trim() || "application/octet-stream";
+}
+
+function dataUrl(bytes: ArrayBuffer, mimeType: string, ownerWindow: Window & typeof globalThis, signal: AbortSignal): Promise<string> {
+  signal.throwIfAborted();
+  return new Promise((resolve, reject) => {
+    const reader = new ownerWindow.FileReader();
+    const cleanup = (): void => {
+      signal.removeEventListener("abort", abort);
+      reader.onload = null;
+      reader.onerror = null;
+      reader.onabort = null;
+    };
+    const abort = (): void => {
+      reader.abort();
+      cleanup();
+      reject(signal.reason);
+    };
+    reader.onload = () => {
+      const result = reader.result;
+      cleanup();
+      if (typeof result === "string") resolve(result);
+      else reject(new Error("Font encoding failed."));
+    };
+    reader.onerror = () => {
+      const error = reader.error ?? new Error("Font encoding failed.");
+      cleanup();
+      reject(error);
+    };
+    reader.onabort = () => {
+      cleanup();
+      reject(signal.reason);
+    };
+    signal.addEventListener("abort", abort, { once: true });
+    reader.readAsDataURL(new ownerWindow.Blob([bytes], { type: mimeType }));
+  });
+}
+
+/**
+ * Embed only fonts used by the frozen snapshot without html-to-image's detached
+ * <base> element. The packaged shell intentionally sets base-uri 'none'.
+ */
+async function timelineFontEmbedCss(
+  fontFamilies: ReadonlySet<string>,
+  ownerDocument: Document,
+  signal: AbortSignal
+): Promise<string> {
+  const usedFamilies = new Set([...fontFamilies].flatMap(fontFamilyNames));
+  if (usedFamilies.size === 0) return "";
+  const rules: CSSFontFaceRule[] = [];
+  for (const sheet of ownerDocument.styleSheets) {
+    try {
+      fontFaceRules((sheet as CSSStyleSheet).cssRules, rules);
+    } catch {
+      // Unreadable cross-origin styles cannot own fonts loaded by this origin.
+    }
+  }
+  const ownerWindow = ownerDocument.defaultView as (Window & typeof globalThis) | null;
+  if (ownerWindow === null) throw new Error("Content is no longer available.");
+  const embedded = await Promise.all(rules
+    .filter((rule) => fontFamilyNames(rule.style.getPropertyValue("font-family")).some((name) => usedFamilies.has(name)))
+    .map(async (rule) => {
+      signal.throwIfAborted();
+      const source = selectedFontSource(rule.style.getPropertyValue("src"));
+      if (source === undefined) return rule.cssText;
+      let embeddedUrl = source.url;
+      if (!embeddedUrl.startsWith("data:")) {
+        const baseUrl = rule.parentStyleSheet?.href ?? ownerDocument.baseURI;
+        const resourceUrl = new URL(embeddedUrl, baseUrl).href;
+        const response = await abortable(ownerWindow.fetch(resourceUrl, { signal }), signal);
+        if (!response.ok) throw new Error(`Font request failed (${response.status}).`);
+        const bytes = await abortable(response.arrayBuffer(), signal);
+        embeddedUrl = await dataUrl(bytes, fontMimeType(source, response), ownerWindow, signal);
+      }
+      const declaration = ownerDocument.createElement("span").style;
+      copyStyle(rule.style, declaration);
+      declaration.setProperty(
+        "src",
+        `url("${embeddedUrl}")${source.format === undefined ? "" : ` format("${source.format}")`}`,
+        rule.style.getPropertyPriority("src")
+      );
+      return `@font-face{${declaration.cssText}}`;
+    }));
+  return embedded.join("\n");
 }
 
 function opaqueBackground(node: Element, ownerWindow: Window): string {
@@ -38,6 +215,48 @@ function opaqueBackground(node: Element, ownerWindow: Window): string {
   return node.ownerDocument.documentElement.dataset.theme === "dark" ? "#1f1f1d" : "#ffffff";
 }
 
+export function rewriteTimelineSnapshotIds(root: HTMLElement, snapshotId: string): void {
+  const identified = [root, ...root.querySelectorAll<HTMLElement>("[id]")].filter((element) => element.id !== "");
+  const replacements = new Map<string, string>();
+  identified.forEach((element, index) => {
+    const original = element.id;
+    const replacement = `${snapshotId}-id-${index}`;
+    if (!replacements.has(original)) replacements.set(original, replacement);
+    element.id = replacement;
+  });
+  if (replacements.size === 0) return;
+
+  const orderedReplacements = [...replacements].sort(([left], [right]) => right.length - left.length);
+  const rewrite = (value: string): string => {
+    let result = value;
+    for (const [original, replacement] of orderedReplacements) {
+      result = result
+        .replaceAll(`url(#${original})`, `url(#${replacement})`)
+        .replaceAll(`url("#${original}")`, `url("#${replacement}")`)
+        .replaceAll(`url('#${original}')`, `url('#${replacement}')`);
+      if (result === `#${original}`) result = `#${replacement}`;
+    }
+    return result;
+  };
+  const tokenAttributes = new Set(["aria-controls", "aria-describedby", "aria-details", "aria-labelledby", "aria-owns", "headers"]);
+  for (const element of [root, ...root.querySelectorAll<HTMLElement>("*")]) {
+    for (const attribute of [...element.attributes]) {
+      if (tokenAttributes.has(attribute.name)) {
+        const tokens = attribute.value.split(/\s+/u).map((token) => replacements.get(token) ?? token);
+        element.setAttribute(attribute.name, tokens.join(" "));
+        continue;
+      }
+      const next = rewrite(attribute.value);
+      if (next !== attribute.value) element.setAttribute(attribute.name, next);
+    }
+    if (element.localName === "style" && element.textContent !== null) {
+      let css = element.textContent;
+      for (const [original, replacement] of orderedReplacements) css = css.replaceAll(`#${original}`, `#${replacement}`);
+      element.textContent = css;
+    }
+  }
+}
+
 /** Capture content and inherited presentation before fonts or encoding can yield. */
 function captureContent(node: HTMLElement, context: BrowserActionContext) {
   assertBrowserActionCurrent(context);
@@ -46,7 +265,7 @@ function captureContent(node: HTMLElement, context: BrowserActionContext) {
   if (node.ownerDocument !== ownerDocument || !node.isConnected) throw new Error("Content is no longer available.");
   const width = Math.ceil(node.scrollWidth);
   const height = Math.ceil(node.scrollHeight);
-  if (width <= 0 || height <= 0) throw new Error("Content has no renderable size.");
+  if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) throw new Error("Content has no renderable size.");
   const backgroundColor = opaqueBackground(node, ownerWindow);
   const clone = node.cloneNode(true) as HTMLElement;
   const originals = [node, ...node.querySelectorAll("*")];
@@ -73,6 +292,13 @@ function captureContent(node: HTMLElement, context: BrowserActionContext) {
     }
     if (original.localName === "img") {
       const image = original as HTMLImageElement;
+      const source = image.getAttribute("src") ?? "";
+      if (source.startsWith("data:") && image.hasAttribute(TIMELINE_FROZEN_IMAGE_ATTRIBUTE)) {
+        copy.setAttribute("src", source);
+        copy.removeAttribute("srcset");
+        copy.removeAttribute(TIMELINE_FROZEN_IMAGE_ATTRIBUTE);
+        return;
+      }
       if (!image.complete || image.naturalWidth === 0) throw new Error("An image is still loading.");
       const canvas = ownerDocument.createElement("canvas");
       try {
@@ -90,6 +316,7 @@ function captureContent(node: HTMLElement, context: BrowserActionContext) {
       }
     }
   });
+  rewriteTimelineSnapshotIds(clone, snapshotId);
   clone.style.width = `${width}px`;
   clone.style.height = `${height}px`;
   clone.style.overflow = "visible";
@@ -105,9 +332,7 @@ function captureContent(node: HTMLElement, context: BrowserActionContext) {
   staging.style.cssText = `position:fixed;left:-100000px;top:0;width:${width}px;height:${height}px;pointer-events:none;`;
   staging.append(clone);
   ownerDocument.body.append(staging);
-  const fonts = ownerDocument.createElement("div");
-  fonts.style.fontFamily = [...fontFamilies].join(",");
-  return { clone, staging, fonts, width, height, backgroundColor };
+  return { clone, staging, fontFamilies, width, height, backgroundColor };
 }
 
 function abortable<T>(operation: PromiseLike<T>, signal: AbortSignal): Promise<T> {
@@ -123,7 +348,11 @@ function abortable<T>(operation: PromiseLike<T>, signal: AbortSignal): Promise<T
   });
 }
 
-export async function timelineDomToPng(node: HTMLElement, context: BrowserActionContext): Promise<Blob> {
+export async function timelineDomToPng(
+  node: HTMLElement,
+  context: BrowserActionContext,
+  options: TimelineImageExportOptions = {}
+): Promise<Blob> {
   const captured = captureContent(node, context);
   const { ownerDocument, signal } = context;
   const image = ownerDocument.createElement("img");
@@ -132,7 +361,7 @@ export async function timelineDomToPng(node: HTMLElement, context: BrowserAction
     if (ownerDocument.fonts !== undefined) await abortable(ownerDocument.fonts.ready, signal);
     assertBrowserActionCurrent(context);
     // Font selection is per request and Document; a table cannot cache away a later formula's fonts.
-    const fontEmbedCSS = await abortable(getFontEmbedCSS(captured.fonts, { fetchRequestInit: { signal } }), signal);
+    const fontEmbedCSS = await timelineFontEmbedCss(captured.fontFamilies, ownerDocument, signal);
     assertBrowserActionCurrent(context);
     const svg = await abortable(toSvg(captured.clone, {
       width: captured.width,
@@ -148,7 +377,13 @@ export async function timelineDomToPng(node: HTMLElement, context: BrowserAction
       image.src = svg;
     }), signal);
     assertBrowserActionCurrent(context);
-    const scale = timelineExportScale(captured.width, captured.height);
+    const scale = timelineExportScale(
+      captured.width,
+      captured.height,
+      options.desiredScale,
+      options.maximumEdgePixels,
+      options.maximumPixels
+    );
     canvas.width = Math.max(1, Math.floor(captured.width * scale));
     canvas.height = Math.max(1, Math.floor(captured.height * scale));
     const drawing = canvas.getContext("2d");

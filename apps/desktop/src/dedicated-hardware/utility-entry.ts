@@ -12,13 +12,7 @@ import {
   type DedicatedHardwareUtilityAdapter,
   type DedicatedHardwareUtilityAdapterSink
 } from "./utility-handler.js";
-
-interface StagedAdapterModule {
-  readonly createDedicatedHardwareUtilityAdapter?: (options: {
-    readonly identity: Extract<DedicatedHardwareSdkIdentity, { kind: "staged" }>;
-    readonly sink: DedicatedHardwareUtilityAdapterSink;
-  }) => DedicatedHardwareUtilityAdapter | Promise<DedicatedHardwareUtilityAdapter>;
-}
+import { createDedicatedHardwareVendorAdapter } from "./vendor-adapter.js";
 
 export async function loadDedicatedHardwareStagedAdapter(
   identity: Extract<DedicatedHardwareSdkIdentity, { kind: "staged" }>,
@@ -28,11 +22,8 @@ export async function loadDedicatedHardwareStagedAdapter(
   if (verified === undefined) throw new Error("The staged hardware adapter identity could not be reverified.");
   const entryUrl = pathToFileURL(dedicatedHardwareSdkEntryPath(verified));
   entryUrl.searchParams.set("joko-sdk-manifest", verified.manifest.manifestIntegrity);
-  const loaded = await import(entryUrl.href) as StagedAdapterModule;
-  if (typeof loaded.createDedicatedHardwareUtilityAdapter !== "function") {
-    throw new Error("The staged hardware adapter entry is unavailable.");
-  }
-  return loaded.createDedicatedHardwareUtilityAdapter({ identity: verified, sink });
+  const loaded: unknown = await import(entryUrl.href);
+  return createDedicatedHardwareVendorAdapter({ sdk: loaded, sink, platform: process.platform });
 }
 
 export function startDedicatedHardwareUtility(port: ParentPort): void {

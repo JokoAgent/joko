@@ -5,6 +5,7 @@ import {
   decodeDedicatedHardwareUtilityMessage,
   decodeDedicatedHardwareUtilityRequest,
   encodeDedicatedHardwareUtilityRequest,
+  parseDedicatedHardwareLightingState,
   parseDedicatedHardwareSdkIdentity,
   parseDedicatedHardwareUtilityMessage,
   parseDedicatedHardwareUtilityRequest
@@ -125,6 +126,47 @@ describe("dedicated hardware utility protocol", () => {
     expect(parseDedicatedHardwareUtilityMessage({ ...state, batteryPercent: 101 })).toBeUndefined();
     expect(parseDedicatedHardwareUtilityMessage({ ...state, detail: "native error" })).toBeUndefined();
     expect(parseDedicatedHardwareUtilityMessage({ ...state, firmwareVersion: "x".repeat(129) })).toBeUndefined();
+  });
+
+  it("accepts only explicit six-slot lighting state and canonical reveal occurrences", () => {
+    const state = {
+      version: 1,
+      taskSlots: [
+        { phase: "running", attention: false },
+        { phase: "needs-interaction", attention: true },
+        { phase: "completed", attention: false },
+        { phase: "error", attention: false },
+        { phase: null, attention: true },
+        null
+      ],
+      revealOccurrence: "0",
+      primaryVisible: false
+    } as const;
+    const request = {
+      version: 1, generation: 8, requestId: "g8:5", kind: "set-lighting-state", model: "creator-micro-2", state
+    } as const;
+    expect(parseDedicatedHardwareLightingState(state)).toEqual(state);
+    expect(decodeDedicatedHardwareUtilityRequest(encodeDedicatedHardwareUtilityRequest(request))).toEqual(request);
+    expect(parseDedicatedHardwareLightingState({ ...state, revealOccurrence: "9".repeat(64) })).toBeDefined();
+    for (const revealOccurrence of ["", "00", "01", "-1", "1.0", "1e3", " 1", "9".repeat(65), 0]) {
+      expect(parseDedicatedHardwareUtilityRequest({ ...request, state: { ...state, revealOccurrence } })).toBeUndefined();
+    }
+    for (const invalid of [
+      { ...state, version: 2 },
+      { ...state, taskSlots: state.taskSlots.slice(0, 5) },
+      { ...state, taskSlots: [...state.taskSlots, null] },
+      { ...state, taskSlots: [{ phase: "idle", attention: false }, ...state.taskSlots.slice(1)] },
+      { ...state, taskSlots: [{ phase: "running" }, ...state.taskSlots.slice(1)] },
+      { ...state, taskSlots: [{ phase: "running", attention: 1 }, ...state.taskSlots.slice(1)] },
+      { ...state, taskSlots: [{ phase: "running", attention: false, sessionId: "private" }, ...state.taskSlots.slice(1)] },
+      { ...state, primaryVisible: undefined },
+      { ...state, primaryVisible: 1 },
+      { ...state, extra: true }
+    ]) {
+      expect(parseDedicatedHardwareLightingState(invalid)).toBeUndefined();
+    }
+    expect(parseDedicatedHardwareUtilityRequest({ ...request, model: "unknown" })).toBeUndefined();
+    expect(parseDedicatedHardwareUtilityRequest({ ...request, extra: true })).toBeUndefined();
   });
 
   it("strictly bounds key, stick, and encoder input previews", () => {

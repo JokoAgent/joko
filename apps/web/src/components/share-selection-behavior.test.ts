@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { TimelineItemView } from "../model.js";
-import { orderedSelectedShareMessages, reconcileShareSelection, shareableTimelineMessages, toggleShareMessageSelection } from "./share-selection-behavior.js";
+import { orderedSelectedShareMessages, reconcileShareSelection, shareableTimelineMessages, shareSelectionPinnedRenderIndexes, toggleShareMessageSelection } from "./share-selection-behavior.js";
 
 describe("share message selection", () => {
   const items: readonly TimelineItemView[] = [
@@ -27,6 +27,12 @@ describe("share message selection", () => {
 
   it("drops unavailable rows without retaining a stale range anchor", () => {
     expect(reconcileShareSelection(["user-2"], new Set(["user-1", "user-2"]), "user-1")).toEqual({ selectedIds: new Set(["user-2"]) });
+  });
+
+  it("pins every selected virtual row once and fails closed above the render budget", () => {
+    const indexes = new Map([["user-1", 8], ["assistant-1", 3], ["user-2", 8]]);
+    expect(shareSelectionPinnedRenderIndexes(new Set(["user-1", "assistant-1", "user-2"]), indexes, 3)).toEqual([3, 8]);
+    expect(shareSelectionPinnedRenderIndexes(new Set(["user-1", "assistant-1", "user-2"]), indexes, 2)).toEqual([]);
   });
 });
 

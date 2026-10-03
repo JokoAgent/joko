@@ -5,6 +5,7 @@ export * from "./errors.js";
 export * from "./events.js";
 export * from "./generated-files.js";
 export * from "./managed-provider.js";
+export * from "./native-start-scope.js";
 export * from "./policy.js";
 export * from "./projection.js";
 export * from "./subagents.js";

@@ -996,6 +996,20 @@ interface GatewayActionScope {
   readonly signal: AbortSignal;
 }
 
+interface LocalUserInputOperation {
+  readonly profileId: string;
+  readonly serverId: string;
+  readonly origin: string;
+  readonly sessionId: string;
+  readonly generation: bigint;
+}
+
+type LocalUserInputMatcher = (event: Event) => boolean;
+
+// Retain exact attempts across reconnects and uncertain responses for this
+// renderer lifetime. Only operation and connection identities enter this map.
+const localUserInputOperations = new Map<string, LocalUserInputOperation>();
+
 class ConnectOrchestratorGateway implements OrchestratorGateway {
   readonly #profile: ConnectionProfile | undefined;
   readonly #authKey: string | undefined;
@@ -1731,7 +1745,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
       loadManagedModelRuntimes(transport, signal)
     ]);
     if (response.snapshot === undefined) throw new GatewayError("Orchestrator returned an empty snapshot.");
-    const raw = response.snapshot;
+    let raw = response.snapshot;
     const entryMap = await loadWorkspaceEntries(transport, raw.workspaces, signal);
     if (signal?.aborted === true || this.#transport !== transport) return;
     const currentCursor = this.#rawSnapshot?.resumeCursor;
@@ -1742,12 +1756,27 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
       && currentCursor.generation === fetchedCursor.generation
       && fetchedCursor.sequence < currentCursor.sequence
     ) return;
+    const previousRaw = this.#rawSnapshot;
+    const sameGeneration = previousRaw?.generation === raw.generation;
+    const previousSessions = new Map(previousRaw?.sessions.map((session) => [session.sessionId, session.nativeBinding?.runtimeGeneration]));
+    const retainedSessions = new Map(raw.sessions.filter((session) => sameGeneration
+      && session.nativeBinding?.runtimeGeneration !== undefined
+      && previousSessions.get(session.sessionId) === session.nativeBinding.runtimeGeneration)
+      .map((session) => [session.sessionId, session.nativeBinding!.runtimeGeneration]));
+    // Owner snapshots omit transcripts. Retain only already durable stream
+    // events still owned by the same service and Session generations.
+    raw = { ...raw, timeline: [...(previousRaw?.timeline ?? []).filter((event) => {
+      const sessionId = event.identity?.sessionId;
+      return sessionId !== undefined && retainedSessions.has(sessionId)
+        && event.identity?.generation === retainedSessions.get(sessionId);
+    }), ...raw.timeline] };
     const mapped = {
-      ...mapSnapshot(raw, entryMap, managedModelRuntimes),
-      // Owner snapshots intentionally omit session timelines. Preserve the
-      // client-side deletion fences until the App has reloaded the affected
-      // authoritative history page.
-      timelineHistoryRevisionBySession: this.#snapshot?.timelineHistoryRevisionBySession ?? new Map<string, bigint>()
+      ...mapSnapshot(raw, entryMap, managedModelRuntimes, this.isLocalUserInput),
+      // A deletion fence can outlive its descriptor until App adopts the
+      // authoritative history response. It never supplies cached body text.
+      timelineHistoryRevisionBySession: sameGeneration
+        ? this.#snapshot?.timelineHistoryRevisionBySession ?? new Map<string, bigint>()
+        : new Map<string, bigint>()
     };
     this.#rawSnapshot = raw;
     this.#snapshot = mapped;
@@ -5466,7 +5495,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
       aroundEventId: eventId,
       limit: Math.min(Math.max(Math.trunc(limit), 1), 500)
     }, this.#abort === undefined ? undefined : { signal: this.#abort.signal });
-    return buildTimeline(response.events).get(sessionId) ?? [];
+    return buildTimeline(response.events, this.isLocalUserInput).get(sessionId) ?? [];
   }
 
   async loadSessionTimelinePage(sessionId: string, beforeCursor?: TimelineHistoryCursorView, limit = 200): Promise<TimelineHistoryPageView> {
@@ -5483,7 +5512,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
       limit: Math.min(Math.max(Math.trunc(limit), 1), 500)
     }, this.#abort === undefined ? undefined : { signal: this.#abort.signal });
     return {
-      items: buildTimeline(response.events).get(sessionId) ?? [],
+      items: buildTimeline(response.events, this.isLocalUserInput).get(sessionId) ?? [],
       ...(response.nextBeforeCursor === undefined ? {} : {
         nextBeforeCursor: {
           opaqueToken: response.nextBeforeCursor.opaqueToken,
@@ -8928,6 +8957,12 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
             if (visionEffect !== undefined) this.#callbacks.onVisionBridgeUiEffect?.(visionEffect);
           }
           if (continuity === "gap" || continuity === "generationChanged" || continuity === "missingCursor" || invalidated) {
+            if (this.#rawSnapshot !== undefined && this.#snapshot !== undefined) {
+              const retired = retireTimelineHistory(this.#rawSnapshot, this.#snapshot, undefined, event.cursor?.sequence);
+              this.#rawSnapshot = retired.rawSnapshot;
+              this.#snapshot = retired.snapshot;
+              this.#callbacks.onSnapshot?.(retired.snapshot);
+            }
             await this.flushEventRefresh(event.cursor);
             lastGeneration = this.#snapshot?.generation;
             lastSequence = this.#snapshot?.cursor;
@@ -8940,13 +8975,18 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
               lastSequence = this.#snapshot?.cursor;
               continue;
             }
-            const projected = projectSnapshotEvent(rawSnapshot, snapshot, event);
+            const projected = projectSnapshotEvent(rawSnapshot, snapshot, event, this.isLocalUserInput);
             this.#rawSnapshot = projected.rawSnapshot;
             this.#snapshot = projected.snapshot;
             this.#callbacks.onSnapshot?.(projected.snapshot);
             lastGeneration = projected.snapshot.generation;
             lastSequence = projected.snapshot.cursor;
             if (projected.refresh === "batched") this.scheduleEventRefresh();
+            else if (projected.refresh === "authoritative") {
+              await this.flushEventRefresh(event.cursor);
+              lastGeneration = this.#snapshot?.generation;
+              lastSequence = this.#snapshot?.cursor;
+            }
           }
           delay = 350;
         }
@@ -9036,7 +9076,25 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     };
     const signal = combinedAbortSignal(callerSignal, this.#abort?.signal);
     const options = signal === undefined ? undefined : { signal };
-    const submitOnce = () => { signal?.throwIfAborted(); return client.submitOperation(request, options); };
+    const submitOnce = () => {
+      signal?.throwIfAborted();
+      if (payload.case === "sendInput" && this.#profile !== undefined) {
+        const generation = request.mutation.preconditions.find((precondition) =>
+          precondition.entity?.kind === EntityKind.SESSION
+          && precondition.entity.id === payload.value.sessionId
+        )?.expectedGeneration;
+        if (generation !== undefined && generation > 0n) {
+          localUserInputOperations.set(operationId, {
+            profileId: this.#profile.id,
+            serverId: this.#profile.serverId,
+            origin: this.#profile.origin,
+            sessionId: payload.value.sessionId ?? "",
+            generation
+          });
+        }
+      }
+      return client.submitOperation(request, options);
+    };
     let response;
     try {
       response = await submitOnce();
@@ -9080,6 +9138,19 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     void this.refresh().catch((error: unknown) => { if (!signal?.aborted) this.#callbacks.onError?.(normalizeError(error)); });
     return operation;
   }
+
+  private readonly isLocalUserInput: LocalUserInputMatcher = (event) => {
+    const identity = event.identity;
+    const profile = this.#profile;
+    if (identity === undefined || profile === undefined || identity.operationId === "") return false;
+    const local = localUserInputOperations.get(identity.operationId);
+    return local !== undefined
+      && local.profileId === profile.id
+      && local.serverId === profile.serverId
+      && local.origin === profile.origin
+      && local.sessionId === identity.sessionId
+      && local.generation === identity.generation;
+  };
 
   private async uploadAttachment(file: File, scope: GatewayActionScope): Promise<Record<string, unknown>> {
     return this.uploadBlob(file, BlobDisposition.ATTACHMENT, scope);
@@ -9294,7 +9365,8 @@ export interface EventProjectionResult {
 export function projectSnapshotEvent(
   rawSnapshot: Snapshot,
   snapshot: AppSnapshot,
-  event: Event
+  event: Event,
+  isLocalUserInput?: LocalUserInputMatcher
 ): EventProjectionResult {
   const cursor = event.cursor;
   let raw: Snapshot = {
@@ -9310,7 +9382,7 @@ export function projectSnapshotEvent(
   const kind = event.payload?.kind;
 
   if (kind?.case === "projectionInvalidated") {
-    return { rawSnapshot: raw, snapshot: projected, refresh: "authoritative" };
+    return { ...retireTimelineHistory(raw, projected, undefined, cursor?.sequence), refresh: "authoritative" };
   }
   if (kind?.case === undefined) {
     return { rawSnapshot: raw, snapshot: projected, refresh: "batched" };
@@ -9318,7 +9390,7 @@ export function projectSnapshotEvent(
 
   if (isTimelineEvent(kind.case) && !isVisionBridgeStatusEvent(event)) {
     raw = { ...raw, timeline: [...raw.timeline, event] };
-    projected = { ...projected, timelineBySession: projectTimelineEvent(projected.timelineBySession, event) };
+    projected = { ...projected, timelineBySession: projectTimelineEvent(projected.timelineBySession, event, isLocalUserInput) };
     if (kind.case === "runtimeRecoveryChanged") {
       const sessionId = event.identity?.sessionId ?? "";
       if (sessionId.length > 0) projected = remapSessionProjection(raw, projected, sessionId);
@@ -9535,7 +9607,10 @@ export function projectSnapshotEvent(
         raw = { ...raw, sessions: upsertBy(raw.sessions, updated, (value) => value.sessionId) };
         projected = remapSessionProjection(raw, projected, sessionId);
       }
-      if (kind.value.timelineRebuilt) refresh = "batched";
+      if (kind.value.timelineRebuilt) {
+        ({ rawSnapshot: raw, snapshot: projected } = retireTimelineHistory(raw, projected, sessionId || undefined, cursor?.sequence));
+        refresh = "batched";
+      }
       break;
     }
     case "runtimeCommandsChanged": {
@@ -9570,6 +9645,7 @@ export function projectSnapshotEvent(
     }
     case "sessionReset": {
       const sessionId = kind.value.productSessionId || event.identity?.sessionId || "";
+      ({ rawSnapshot: raw, snapshot: projected } = retireTimelineHistory(raw, projected, sessionId || undefined, cursor?.sequence));
       if (sessionId === "") {
         refresh = "authoritative";
         break;
@@ -9582,7 +9658,6 @@ export function projectSnapshotEvent(
       extensionStatusesBySession.delete(sessionId);
       raw = {
         ...raw,
-        timeline: raw.timeline.filter((candidate) => candidate.identity?.sessionId !== sessionId),
         runs: raw.runs.filter((candidate) => candidate.sessionId !== sessionId),
         queueItems: raw.queueItems.filter((candidate) => candidate.sessionId !== sessionId),
         queueControls: raw.queueControls.filter((candidate) => candidate.sessionId !== sessionId),
@@ -9614,6 +9689,7 @@ export function projectSnapshotEvent(
     }
     case "historyPruned": {
       const sessionId = kind.value.productSessionId || event.identity?.sessionId || "";
+      ({ rawSnapshot: raw, snapshot: projected } = retireTimelineHistory(raw, projected, sessionId || undefined, cursor?.sequence));
       if (sessionId === "") {
         refresh = "authoritative";
         break;
@@ -9626,7 +9702,6 @@ export function projectSnapshotEvent(
       extensionStatusesBySession.delete(sessionId);
       raw = {
         ...raw,
-        timeline: raw.timeline.filter((candidate) => candidate.identity?.sessionId !== sessionId),
         runs: raw.runs.filter((candidate) => candidate.sessionId !== sessionId),
         queueItems: raw.queueItems.filter((candidate) => candidate.sessionId !== sessionId),
         queueControls: raw.queueControls.filter((candidate) => candidate.sessionId !== sessionId),
@@ -9657,9 +9732,7 @@ export function projectSnapshotEvent(
       // Store owns the user-row/assistant-round semantics and the surviving
       // authoritative projection.
       const sessionId = kind.value.productSessionId || event.identity?.sessionId || "";
-      if (sessionId.length > 0) {
-        projected = withTimelineHistoryInvalidation(projected, sessionId, event.cursor?.sequence ?? projected.cursor);
-      }
+      ({ rawSnapshot: raw, snapshot: projected } = retireTimelineHistory(raw, projected, sessionId || undefined, cursor?.sequence));
       refresh = "authoritative";
       break;
     }
@@ -9806,12 +9879,31 @@ export function projectSnapshotEvent(
     case "nativeSessionChanged":
       // A marker can remove the whole active prefix; only the service owns
       // which durable events remain visible on this native branch.
+      ({ rawSnapshot: raw, snapshot: projected } = retireTimelineHistory(raw, projected,
+        kind.value.productSessionId || event.identity?.sessionId || undefined, cursor?.sequence));
       refresh = "authoritative";
       break;
   }
 
   if (diagnosticsChanged) projected = { ...projected, diagnostics: collectDiagnostics(raw) };
   return { rawSnapshot: raw, snapshot: projected, refresh };
+}
+
+function retireTimelineHistory(raw: Snapshot, snapshot: AppSnapshot, sessionId?: string, revision = snapshot.cursor): {
+  readonly rawSnapshot: Snapshot;
+  readonly snapshot: AppSnapshot;
+} {
+  const sessionIds = sessionId === undefined
+    ? new Set([...raw.sessions.map((session) => session.sessionId), ...snapshot.timelineBySession.keys()])
+    : new Set([sessionId]);
+  const timelineBySession = new Map(snapshot.timelineBySession);
+  let next = snapshot;
+  for (const id of sessionIds) {
+    timelineBySession.delete(id);
+    next = withTimelineHistoryInvalidation(next, id, revision);
+  }
+  return { rawSnapshot: { ...raw, timeline: raw.timeline.filter((event) => !sessionIds.has(event.identity?.sessionId ?? "")) },
+    snapshot: { ...next, timelineBySession } };
 }
 
 function projectTerminalRun(
@@ -9933,7 +10025,8 @@ function isTimelineEvent(kind: NonNullable<NonNullable<Event["payload"]>["kind"]
 
 function projectTimelineEvent(
   timeline: ReadonlyMap<string, readonly TimelineItemView[]>,
-  event: Event
+  event: Event,
+  isLocalUserInput?: LocalUserInputMatcher
 ): ReadonlyMap<string, readonly TimelineItemView[]> {
   if (isVisionBridgeStatusEvent(event)) return timeline;
   const sessionId = event.identity?.sessionId ?? "";
@@ -9975,6 +10068,7 @@ function projectTimelineEvent(
           }
         : existing?.automationOrigin;
       const inputDelivery = uiMessageInputDelivery(kind.value.inputDelivery);
+      const inputOperationId = kind.value.role === 1 ? event.identity?.operationId : undefined;
       replaceOrAppend({
         id: kind.value.messageId,
         messageId: kind.value.messageId,
@@ -9987,6 +10081,8 @@ function projectTimelineEvent(
         text: kind.value.role === 1 ? userText : existing?.text ?? "",
         ...(kind.value.role === 1 ? { attachments: inputAttachments(userInput) } : {}),
         ...(userInputAccepted ? { userInputAccepted: true } : {}),
+        ...(inputOperationId ? { inputOperationId } : {}),
+        ...(kind.value.role === 1 && isLocalUserInput?.(event) === true ? { localUserInput: true } : {}),
         ...(userInputAccepted && inputMentions.length > 0 ? { inputMentions } : {}),
         ...(userInputAccepted && mentionRanges.length > 0 ? { mentionRanges } : {}),
         ...(userInputAccepted && userInput?.quotesEncoded === true ? { quotesEncoded: true } : {}),
@@ -10035,7 +10131,26 @@ function projectTimelineEvent(
     }
     case "thinkingDelta": {
       const id = `${kind.value.messageId}:thinking:${kind.value.contentIndex}`;
-      const existing = items.find((item) => item.id === id);
+      const existing = items.find((item) => item.kind === "thinking"
+        && item.id === id
+        && item.messageId === kind.value.messageId
+        && item.contentIndex === kind.value.contentIndex);
+      const occurredAt = event.occurredAt;
+      const observedMilliseconds = occurredAt !== undefined
+        && Number.isInteger(occurredAt.nanos)
+        && occurredAt.nanos >= 0
+        && occurredAt.nanos < 1_000_000_000
+        && occurredAt.nanos % 1_000_000 === 0
+        ? occurredAt.seconds * 1_000n + BigInt(occurredAt.nanos / 1_000_000)
+        : undefined;
+      const observedAt = observedMilliseconds !== undefined
+        && observedMilliseconds >= BigInt(Number.MIN_SAFE_INTEGER)
+        && observedMilliseconds <= BigInt(Number.MAX_SAFE_INTEGER)
+        ? Number(observedMilliseconds)
+        : undefined;
+      const lastActivityAt = observedAt === undefined
+        ? existing?.lastActivityAt
+        : Math.max(existing?.lastActivityAt ?? observedAt, observedAt);
       replaceOrAppend({
         id,
         messageId: kind.value.messageId,
@@ -10044,6 +10159,7 @@ function projectTimelineEvent(
         sequence: existing?.sequence ?? sequence,
         kind: "thinking",
         createdAt: existing?.createdAt ?? createdAt,
+        ...(lastActivityAt === undefined ? {} : { lastActivityAt }),
         text: `${existing?.text ?? ""}${kind.value.delta}`,
         streaming: true
       });
@@ -10475,6 +10591,8 @@ function reconcileCompletedAssistantMessage(
           sequence: existing?.sequence ?? sequence,
           kind: "thinking",
           createdAt: existing?.createdAt ?? createdAt,
+          ...(existing?.messageId === messageId && existing.contentIndex === contentIndex
+            && existing.lastActivityAt !== undefined ? { lastActivityAt: existing.lastActivityAt } : {}),
           text: block.content.value.text,
           streaming: false
         }
@@ -10913,7 +11031,8 @@ async function loadManagedModelRuntimes(
 export function mapSnapshot(
   snapshot: Snapshot,
   workspaceEntries: ReadonlyMap<string, readonly WorkspaceEntry[]> = new Map(),
-  managedModelRuntimes: readonly ManagedModelRuntimeView[] = []
+  managedModelRuntimes: readonly ManagedModelRuntimeView[] = [],
+  isLocalUserInput?: LocalUserInputMatcher
 ): AppSnapshot {
   const settings = mapSettings(snapshot.settings);
   const providers = new Map(snapshot.providers.map((provider) => [providerKey(provider.backendId, provider.providerId), provider] as const));
@@ -10933,7 +11052,7 @@ export function mapSnapshot(
   }
   const reviewRuns = snapshot.reviewRuns.map(mapReviewRun);
   const timelineBySession = withMissingRunningReviewCards(
-    buildTimeline(snapshot.timeline),
+    buildTimeline(snapshot.timeline, isLocalUserInput),
     reviewRuns,
     snapshot.resumeCursor?.sequence ?? 0n
   );
@@ -17496,10 +17615,10 @@ function scheduleDeletionResult(operation: Operation): ScheduleDeletionResultVie
   };
 }
 
-function buildTimeline(events: readonly Event[]): ReadonlyMap<string, readonly TimelineItemView[]> {
+function buildTimeline(events: readonly Event[], isLocalUserInput?: LocalUserInputMatcher): ReadonlyMap<string, readonly TimelineItemView[]> {
   let timeline: ReadonlyMap<string, readonly TimelineItemView[]> = new Map();
   for (const event of [...events].sort((left, right) => Number((left.cursor?.sequence ?? 0n) - (right.cursor?.sequence ?? 0n)))) {
-    timeline = projectTimelineEvent(timeline, event);
+    timeline = projectTimelineEvent(timeline, event, isLocalUserInput);
   }
   return timeline;
 }
@@ -17602,6 +17721,7 @@ function mapToolItem(
   outputMode: "preserve" | "append" | "replace"
 ): TimelineItemView {
   const attachments = toolResultAttachments(result);
+  const endedAt = call.endedAt === undefined ? existing?.endedAt : timestampMs(call.endedAt);
   const name = call.toolId || existing?.tool?.name || "tool";
   const currentInput = displayArguments(call.arguments);
   const outputChunk = toolResultText(result);
@@ -17626,6 +17746,7 @@ function mapToolItem(
     sequence,
     kind: call.state === ToolCallState.SUCCEEDED || call.state === ToolCallState.FAILED ? "toolResult" : "tool",
     createdAt,
+    ...(endedAt === undefined ? {} : { endedAt }),
     title: name,
     tool: {
       id: call.toolCallId,
@@ -18363,6 +18484,7 @@ function inputAttachments(input: any): readonly ArtifactView[] {
 }
 
 function capabilityOptions(options: any): readonly string[] {
+  if (options?.kind?.case === "session") return options.kind.value.serviceNodeOnly === true ? ["service_node_only"] : [];
   if (options?.kind?.case === "model") return [...(options.kind.value.effortIds ?? [])];
   if (options?.kind?.case === "input") return [...(options.kind.value.mediaTypes ?? [])];
   if (options?.kind?.case === "permission") {

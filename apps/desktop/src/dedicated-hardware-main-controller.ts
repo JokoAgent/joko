@@ -70,7 +70,9 @@ export interface DedicatedHardwareMainController<Owner> {
     model: DedicatedHardwareModelId,
     scope: "layout" | "all"
   ) => Promise<DedicatedHardwareProjectedState>;
-  readonly publishTasks: (catalog: unknown) => DedicatedHardwareProjectedState;
+  readonly publishTasks: (catalog: unknown, owner: Owner) => DedicatedHardwareProjectedState;
+  readonly setPrimaryWindowVisible: (owner: Owner, visible: boolean) => void;
+  readonly playWindowReveal: (owner: Owner) => void;
   readonly setPreview: (model: DedicatedHardwareModelId, owner: Owner, enabled: boolean) => void;
   readonly retireOwner: (owner: Owner) => void;
   readonly probe: (model: DedicatedHardwareModelId) => boolean;
@@ -87,6 +89,8 @@ const EMPTY_CATALOG: DedicatedHardwareTaskCatalog = Object.freeze({
   tasks: Object.freeze([])
 });
 
+const MAX_REVEAL_OCCURRENCE = 10n ** 64n - 1n;
+
 export function createDedicatedHardwareMainController<Owner>(options: {
   readonly store: DedicatedHardwareSettingsStore;
   readonly host: DedicatedHardwareHostClient;
@@ -100,11 +104,32 @@ export function createDedicatedHardwareMainController<Owner>(options: {
   const connections = new Map<DedicatedHardwareModelId, DedicatedHardwareConnectionSnapshot>();
   const selections = new Map<DedicatedHardwareModelId, DedicatedHardwareTaskSlotSelection>();
   let catalog = EMPTY_CATALOG;
+  let catalogCursor = EMPTY_CATALOG;
+  let primary: { readonly owner: Owner; readonly visible: boolean } | undefined;
+  const retiredOwners: Owner[] = [];
+  let revealOccurrence = 0n;
   let preview: { readonly model: DedicatedHardwareModelId; readonly owner: Owner } | undefined;
   let initialized = false;
   let disposed = false;
   let unsubscribeState: (() => void) | undefined;
   let unsubscribeInput: (() => void) | undefined;
+
+  const publishLightingState = (model: DedicatedHardwareModelId): void => {
+    const tasks = primary === undefined ? [] : catalog.tasks;
+    const taskSlots = selections.get(model)?.slots ?? emptyTaskSlots();
+    const activityAt = (slot: number) => {
+      const selected = taskSlots[slot];
+      const task = selected?.sessionId === null || selected === undefined ? undefined : tasks.find((candidate) =>
+        candidate.sessionId === selected.sessionId && candidate.sessionGeneration === selected.sessionGeneration);
+      return task === undefined ? null : Object.freeze({ ...task.activity });
+    };
+    options.host.setLightingState(model, {
+      version: 1,
+      primaryVisible: primary?.visible === true,
+      taskSlots: Object.freeze([activityAt(0), activityAt(1), activityAt(2), activityAt(3), activityAt(4), activityAt(5)]),
+      revealOccurrence: revealOccurrence.toString(10)
+    });
+  };
 
   const recomputeModel = (model: DedicatedHardwareModelId): void => {
     const read = reads.get(model);
@@ -115,6 +140,13 @@ export function createDedicatedHardwareMainController<Owner>(options: {
       settings: cloneDedicatedHardwareSettings(read.settings),
       taskSlots: padTaskSelection(selection)
     });
+    publishLightingState(model);
+  };
+
+  const clearCatalog = (): void => {
+    catalog = EMPTY_CATALOG;
+    for (const model of DEDICATED_HARDWARE_MODEL_IDS) recomputeModel(model);
+    publishState();
   };
 
   const publishState = (): DedicatedHardwareProjectedState => {
@@ -233,18 +265,50 @@ export function createDedicatedHardwareMainController<Owner>(options: {
       applyRead(model, next);
       return publishState();
     },
-    publishTasks: (value) => {
+    publishTasks: (value, owner) => {
       assertReady();
       const parsed = parseDedicatedHardwareTaskCatalog(value);
       if (parsed === undefined) throw new TypeError("Invalid dedicated hardware task catalog.");
-      if (!catalogMayAdvance(catalog, parsed)) return projectState();
+      if (primary === undefined || !ownersEqual(primary.owner, owner) ||
+        retiredOwners.some((retired) => ownersEqual(retired, owner))) return projectState();
+      if (!catalogMayAdvance(catalogCursor, parsed)) return projectState();
       if (JSON.stringify(parsed) === JSON.stringify(catalog)) return projectState();
       catalog = parsed;
+      catalogCursor = parsed;
       for (const model of DEDICATED_HARDWARE_MODEL_IDS) recomputeModel(model);
       return publishState();
     },
+    setPrimaryWindowVisible: (owner, visible) => {
+      assertReady();
+      if (typeof visible !== "boolean") throw new TypeError("Primary window visibility must be explicit.");
+      if (retiredOwners.some((retired) => ownersEqual(retired, owner))) return;
+      const current = primary;
+      if (current !== undefined && ownersEqual(current.owner, owner) && current.visible === visible) return;
+      const ownerChanged = current === undefined || !ownersEqual(current.owner, owner);
+      if (ownerChanged) {
+        if (current !== undefined) {
+          retiredOwners.push(current.owner);
+          if (preview !== undefined && ownersEqual(preview.owner, current.owner)) retireModelPreview(preview.model);
+        }
+        catalogCursor = EMPTY_CATALOG;
+      }
+      primary = Object.freeze({ owner, visible });
+      if (ownerChanged) clearCatalog();
+      else for (const model of DEDICATED_HARDWARE_MODEL_IDS) publishLightingState(model);
+    },
+    playWindowReveal: (owner) => {
+      assertReady();
+      if (primary?.visible !== true || !ownersEqual(primary.owner, owner) ||
+        retiredOwners.some((retired) => ownersEqual(retired, owner))) return;
+      if (revealOccurrence >= MAX_REVEAL_OCCURRENCE) return;
+      revealOccurrence += 1n;
+      for (const model of DEDICATED_HARDWARE_MODEL_IDS) publishLightingState(model);
+    },
     setPreview: (model, owner, enabled) => {
       assertReady();
+      if (retiredOwners.some((retired) => ownersEqual(retired, owner))) {
+        throw new Error("Dedicated hardware preview owner is retired.");
+      }
       const read = reads.get(model)!;
       if (!read.settings.enabled || connections.get(model)?.status !== "connected") {
         throw new Error("Dedicated hardware preview requires a connected enabled device.");
@@ -269,12 +333,20 @@ export function createDedicatedHardwareMainController<Owner>(options: {
       options.host.setDesiredState(model, { settings: read.settings, preview: false });
     },
     retireOwner: (owner) => {
-      if (preview === undefined || !ownersEqual(preview.owner, owner)) return;
-      const model = preview.model;
-      preview = undefined;
-      options.input.setPreview(model, false);
-      const read = reads.get(model);
-      if (read !== undefined) options.host.setDesiredState(model, { settings: read.settings, preview: false });
+      if (disposed || !initialized) return;
+      if (!retiredOwners.some((retired) => ownersEqual(retired, owner))) retiredOwners.push(owner);
+      if (primary !== undefined && ownersEqual(primary.owner, owner)) {
+        primary = undefined;
+        catalogCursor = EMPTY_CATALOG;
+        clearCatalog();
+      }
+      if (preview !== undefined && ownersEqual(preview.owner, owner)) {
+        const model = preview.model;
+        preview = undefined;
+        options.input.setPreview(model, false);
+        const read = reads.get(model);
+        if (read !== undefined) options.host.setDesiredState(model, { settings: read.settings, preview: false });
+      }
     },
     probe: (model) => {
       assertReady();
@@ -298,6 +370,8 @@ export function createDedicatedHardwareMainController<Owner>(options: {
       unsubscribeState = undefined;
       unsubscribeInput = undefined;
       preview = undefined;
+      primary = undefined;
+      catalog = EMPTY_CATALOG;
       for (const model of DEDICATED_HARDWARE_MODEL_IDS) options.input.setPreview(model, false);
       options.input.cancelAll();
       await options.host.stop();

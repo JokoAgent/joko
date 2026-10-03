@@ -118,6 +118,8 @@ import {
   useDedicatedHardwareTaskCatalogPublisher,
   visibleDedicatedHardwareTaskOrder
 } from "./dedicated-hardware-app.js";
+import { useDedicatedHardwareCollaborationCatalog,
+  type DedicatedHardwareCollaborationSource } from "./dedicated-hardware-collaboration.js";
 import {
   prefetchWorktreeRemovalPreflight,
   summarizeWorktreeRemovalPreflights,
@@ -816,6 +818,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
         connectionGeneration: state.snapshot.generation,
         snapshotRevision: state.snapshot.revision,
         sessions: state.ready && state.connectionState === "connected" ? state.snapshot.sessions : [],
+        interactions: state.ready && state.connectionState === "connected" ? state.snapshot.interactions : [],
         sidebarSessionIds: dedicatedHardwareSidebarOrder,
         ...(activeSession === undefined ? {} : { viewedSessionId: activeSession.id })
       });
@@ -832,9 +835,18 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
     state.ready,
     state.snapshot.generation,
     state.snapshot.revision,
-    state.snapshot.sessions
+    state.snapshot.sessions,
+    state.snapshot.interactions
   ]);
-  useDedicatedHardwareTaskCatalogPublisher(dedicatedHardwareBridge, dedicatedHardwareTaskCatalog);
+  const dedicatedHardwareControllerRef = useRef(controller);
+  dedicatedHardwareControllerRef.current = controller;
+  const dedicatedHardwareCollaborationSource = useMemo<DedicatedHardwareCollaborationSource>(() => ({
+    get state() { return dedicatedHardwareControllerRef.current.state; },
+    listCollaborationGoals: (...parameters) => dedicatedHardwareControllerRef.current.listCollaborationGoals(...parameters),
+    getCollaborationGoal: (...parameters) => dedicatedHardwareControllerRef.current.getCollaborationGoal(...parameters)
+  }), [state.activeProfile?.id, state.activeProfile?.serverId, state.connectionGeneration, state.snapshot.generation]);
+  const dedicatedHardwareActivityCatalog = useDedicatedHardwareCollaborationCatalog(dedicatedHardwareCollaborationSource, dedicatedHardwareTaskCatalog);
+  useDedicatedHardwareTaskCatalogPublisher(dedicatedHardwareBridge, dedicatedHardwareActivityCatalog);
   useEffect(() => {
     setSessionProjectOverrides((current) => reconcileSessionProjectOverrides(current, state.snapshot.sessions));
   }, [state.snapshot.sessions]);
@@ -1042,7 +1054,12 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
     const requestId = ++timelineHistoryRequestIdRef.current;
     setTimelineHistory((current) => reset || current?.sessionId !== sessionId || current.generation !== generation
       || current.historyRevision !== historyRevision
-      ? { sessionId, generation, historyRevision, items: [], initialized: false, loading: true }
+      ? {
+          sessionId, generation, historyRevision,
+          items: current?.sessionId === sessionId && current.generation === generation && current.historyRevision === historyRevision
+            ? current.items : [],
+          initialized: false, loading: true
+        }
       : {
           sessionId,
           generation,
@@ -1062,7 +1079,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
           sessionId,
           generation,
           historyRevision,
-          items: reset ? page.items : mergeTimelineWindows(current.items, page.items),
+          items: mergeTimelineWindows(current.items, page.items),
           ...(page.nextBeforeCursor === undefined ? {} : { nextBeforeCursor: page.nextBeforeCursor }),
           initialized: true,
           loading: false

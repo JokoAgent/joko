@@ -15,6 +15,7 @@ import {
   parseDedicatedHardwareUtilityRequest,
   type DedicatedHardwareConnectionSnapshot,
   type DedicatedHardwareDesiredState,
+  type DedicatedHardwareLightingState,
   type DedicatedHardwareInputEvent,
   type DedicatedHardwareKeymapSnapshot,
   type DedicatedHardwareSdkIdentity,
@@ -34,6 +35,7 @@ export interface DedicatedHardwareUtilityAdapter {
     model: DedicatedHardwareModelId,
     desired: DedicatedHardwareDesiredState
   ) => Promise<DedicatedHardwareUtilityDeviceSnapshot>;
+  readonly setLightingState: (model: DedicatedHardwareModelId, state: DedicatedHardwareLightingState) => void;
   readonly probe: (model: DedicatedHardwareModelId) => Promise<DedicatedHardwareUtilityDeviceSnapshot>;
   readonly stop: () => Promise<void>;
 }
@@ -291,6 +293,12 @@ export function createDedicatedHardwareUtilityRequestHandler(options: {
       return "continue";
     }
 
+    if (request.kind === "set-lighting-state") {
+      if (!unavailable && adapter !== undefined) adapter.setLightingState(request.model, request.state);
+      post({ version: 1, generation, requestId: request.requestId, kind: "ack" });
+      return "continue";
+    }
+
     if (request.kind === "probe") {
       if (unavailable || adapter === undefined) {
         post({ version: 1, generation, requestId: request.requestId, kind: "ack" });
@@ -411,6 +419,7 @@ function isAdapter(value: unknown): value is DedicatedHardwareUtilityAdapter {
   return typeof value === "object" && value !== null &&
     isKeymapAdapter((value as DedicatedHardwareUtilityAdapter).creatorKeymap) &&
     typeof (value as DedicatedHardwareUtilityAdapter).setDesiredState === "function" &&
+    typeof (value as DedicatedHardwareUtilityAdapter).setLightingState === "function" &&
     typeof (value as DedicatedHardwareUtilityAdapter).probe === "function" &&
     typeof (value as DedicatedHardwareUtilityAdapter).stop === "function";
 }

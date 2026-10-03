@@ -102,6 +102,7 @@ describe("Desktop distribution", () => {
       { from: "resources/app-update.yml", to: "app-update.yml" },
       { from: "resources/native-task-status-sounds", to: "native-task-status-sounds" },
       { from: "dist/native-voice-shortcut", to: "native-voice-shortcut" },
+      { from: "dist/native-system-frontmost-input", to: "native-system-frontmost-input" },
       { from: "dist/native-simulator-hid", to: "native-simulator-hid" },
       { from: "dist/native-simulator-h264", to: "native-simulator-h264" },
       { from: "dist/orchestrator-runtime", to: "orchestrator-runtime" },

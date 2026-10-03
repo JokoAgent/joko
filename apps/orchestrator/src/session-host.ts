@@ -48,7 +48,7 @@ import type {
   UserShellResult,
   UsageSnapshot
 } from "@joko/core";
-import { JokoError, decideToolCall, nativeHistoryEventContext, redactSecrets, toPublicError, validInlineTextRanges, validInputMentionRanges, type ToolRisk } from "@joko/core";
+import { JokoError, decideToolCall, nativeHistoryEventContext, redactSecrets, supportsNativeStartNavigation, toPublicError, validInlineTextRanges, validInputMentionRanges, type ToolRisk } from "@joko/core";
 import {
   AuthorizationError,
   InvalidStateTransitionError,
@@ -4005,7 +4005,7 @@ export class SessionHost {
         sourceTarget: sourceContext.target,
         target: derivationTarget
       };
-      const ownsDurableLifecycle = active.adapter.ownsNativeSessionDerivationLifecycle?.(lifecycle) === true;
+      const ownsDurableLifecycle = await active.adapter.ownsNativeSessionDerivationLifecycle?.(lifecycle) === true;
       if (remotePlan !== undefined && !ownsDurableLifecycle) {
         throw new StoreError("The remote Backend cannot adopt an isolated native derivation safely.");
       }
@@ -6962,8 +6962,10 @@ export class SessionHost {
             throw new StaleGenerationError(source.descriptor.binding.generation, expectedGeneration);
           }
           const descriptor = store.getBackend(source.descriptor.backendId).descriptor;
-          const capability = target.kind === "session_start" ? "session.rewind_to_start" : "session.rewind";
-          if (descriptor.capabilities.get("session.rewind")?.supported !== true || descriptor.capabilities.get(capability)?.supported !== true) {
+          const startAvailable = target.kind !== "session_start" || supportsNativeStartNavigation(
+            descriptor.capabilities.get("session.rewind_to_start"), store.getTarget(source.descriptor.targetId).descriptor
+          );
+          if (descriptor.capabilities.get("session.rewind")?.supported !== true || !startAvailable) {
             throw new StoreError("The requested native navigation target is unavailable.");
           }
           if (lease !== undefined) {
@@ -6996,13 +6998,14 @@ export class SessionHost {
           const lifecycle: NativeSessionDerivationLifecycle = {
             operationId: authority.operationId,
             kind: "navigate",
+            navigationTarget: target,
             sourceSessionId: sessionId,
             sourceBinding: lease.stored.descriptor.binding,
             sessionId,
             sourceTarget: lease.context.target,
             target: lease.context.target
           };
-          if (active.adapter.ownsNativeSessionDerivationLifecycle?.(lifecycle) === true) {
+          if (await active.adapter.ownsNativeSessionDerivationLifecycle?.(lifecycle) === true) {
             if (active.adapter.adoptNativeSessionDerivation === undefined
               || active.adapter.cleanupNativeSessionDerivation === undefined) {
               throw new StoreError("The Backend declared a native derivation lifecycle without adoption and cleanup owners.");
@@ -11790,7 +11793,7 @@ export class SessionHost {
                 const navigationTarget = history.activeNavigationTarget;
                 const backend = this.#store.getBackend(stored.descriptor.backendId).descriptor;
                 if (navigationTarget !== undefined && backend.capabilities.get("session.rewind")?.supported === true
-                  && (navigationTarget.kind !== "session_start" || backend.capabilities.get("session.rewind_to_start")?.supported === true)) {
+                  && (navigationTarget.kind !== "session_start" || supportsNativeStartNavigation(backend.capabilities.get("session.rewind_to_start"), target))) {
                   navigationAnchor = { target: navigationTarget, generation: captureLease.stored.descriptor.binding.generation };
                 }
               } catch (error) { this.recordFailure("workspace-dialogue-baseline", error); }
