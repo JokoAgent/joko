@@ -51,6 +51,8 @@ message SessionCapabilityOptions {
   bool supports_detach = 4;
   bool supports_naming = 5;
   bool supports_delete = 6;
+  // Native session mutations are available only on the Orchestrator service node.
+  bool service_node_only = 7;
 }
 
 message TurnCapabilityOptions {

@@ -5,11 +5,78 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AddressInfo } from "node:net";
 import type { AdapterContext, BlobRef, EventPayload, NativeSessionBinding, SessionTreeNode, TargetDescriptor } from "@joko/core";
+import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { describe, expect, it } from "vitest";
 import { createPiAdapter } from "./adapter.js";
 import { mkdtemp } from "./test-paths.js";
 
 describe("real Pi managed generation smoke", () => {
+  it("persists a detached native start and reopens it without the source conversation or a model request", { timeout: 45_000 }, async () => {
+    const home = await mkdtemp(join(tmpdir(), "joko-real-pi-start-home-"));
+    const workspace = await mkdtemp(join(tmpdir(), "joko-real-pi-start-workspace-"));
+    const sessions = join(home, "sessions");
+    await mkdir(sessions, { recursive: true });
+    const manager = SessionManager.create(workspace, sessions);
+    const root = manager.appendMessage({ role: "user", content: "Source conversation", timestamp: 1 });
+    manager.appendMessage({
+      role: "assistant", content: [{ type: "text", text: "Source answer" }], api: "openai-completions",
+      provider: "local", model: "start-model", usage: {
+        input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }
+      }, stopReason: "stop", timestamp: 2
+    });
+    const sourcePath = manager.getSessionFile();
+    if (sourcePath === undefined) throw new Error("Public manager did not persist source history.");
+    let sourceBytes: Buffer;
+    const options = {
+      agentHome: home, sessionRoot: home,
+      includeManagedSubagentTools: () => false,
+      providers: [{
+        id: "local", baseUrl: "http://127.0.0.1:1/v1", api: "openai-completions" as const, keyless: true,
+        models: [{ id: "start-model", contextWindow: 32_768, maxTokens: 1_024 }]
+      }]
+    };
+    const target: TargetDescriptor = { id: "native-start-target", backendId: "pi", displayName: "Native start", workspaceRoot: workspace, managed: true, trusted: false };
+    const sink = new EventSink();
+    const base = { ...smokeContext(target, 1, sink), sessionId: "native-start-source" };
+    const adapter = createPiAdapter(options);
+    let replacement: NativeSessionBinding | undefined;
+    try {
+      const binding = await adapter.createSession({ target, providerId: "local", modelId: "start-model", fastMode: false,
+        permissionMode: "ask", nativeStart: { kind: "attach", nativeReference: sourcePath } }, base);
+      sourceBytes = await readFile(sourcePath);
+      const source = { ...base, binding };
+      const result = await adapter.navigateTree({ kind: "native_entry", entryId: root }, false, source, undefined, {
+        recordBinding: (next) => {
+          expect(replacement).toBeUndefined();
+          replacement = next;
+          expect(next.generation).toBe(binding.generation + 1);
+        }
+      });
+      if (result.kind !== "replacement") throw new Error("Expected durable empty replacement.");
+      expect(result.binding).toEqual(replacement);
+      expect(result.nativeHistory.events.every((event) => event.payload.type === "status")).toBe(true);
+      expect(await readFile(sourcePath)).toEqual(sourceBytes);
+      expect(SessionManager.open(result.binding.opaqueRef).buildSessionContext().messages).toEqual([]);
+      await adapter.closeSession(binding, source);
+    } finally {
+      await adapter.dispose();
+    }
+    if (replacement === undefined) throw new Error("Missing registered native start.");
+    const reopened = createPiAdapter(options);
+    const current = { ...base, generation: replacement.generation, binding: replacement };
+    try {
+      await reopened.resumeSession(replacement, current);
+      const history = await reopened.getNativeHistoryProjection(current);
+      expect(history.events.every((event) => event.payload.type === "status")).toBe(true);
+      expect(history.activeLineage?.some((entry) => entry.entryId === root)).toBe(false);
+      expect(await readFile(sourcePath)).toEqual(sourceBytes);
+      expect(SessionManager.open(replacement.opaqueRef).buildSessionContext().messages).toEqual([]);
+    } finally {
+      await reopened.dispose();
+    }
+  });
+
   it("exercises the latest native Pi workflow without crossing product bindings", { timeout: 60_000 }, async () => {
     const server = await startOpenAiCompatibleServer();
     const address = server.address() as AddressInfo;

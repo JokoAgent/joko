@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { createReadStream } from "node:fs";
 import { lstat, mkdir, open, readdir, realpath, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
-import { CURRENT_SESSION_VERSION } from "@earendil-works/pi-coding-agent";
+import { CURRENT_SESSION_VERSION, SessionManager } from "@earendil-works/pi-coding-agent";
 import type { NativeSessionBinding } from "@joko/core";
 import { asPiError, piError, redactedDiagnostic } from "./errors.js";
 import { MAX_SAFE_PI_JSONL_RECORD_BYTES, StrictJsonLineDecoder } from "./jsonl.js";
@@ -105,6 +105,15 @@ export class PiSessionStore {
         recovery: "Ensure the service account can create the managed Pi session and trash directories."
       });
     }
+  }
+
+  /** Reserve the identity through the public native manager before the Host
+   * records it. Materialization and runtime startup happen after that receipt. */
+  reserveFreshSession(workspaceRoot: string, generation: number): NativeSessionBinding {
+    const manager = SessionManager.create(workspaceRoot, this.sessionsRoot);
+    const opaqueRef = manager.getSessionFile();
+    if (opaqueRef === undefined) throw piError("PI_SESSION_IDENTITY_MISSING", "Pi did not reserve a fresh native Session", "session");
+    return { opaqueRef, nativeSessionId: manager.getSessionId(), generation };
   }
 
   async list(workspaceRoot?: string): Promise<readonly PiNativeSessionInfo[]> {

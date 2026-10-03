@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import {
   CAPABILITIES,
+  SESSION_REWIND_SERVICE_NODE_ONLY_OPTION,
   evaluateOrderedPolicyRules,
   NATIVE_HISTORY_REPLACES_TRANSIENT_FIELD,
   redactSecrets,
@@ -2446,23 +2447,28 @@ export class PiBackendAdapter implements
     summarize: boolean,
     context: AdapterContext,
     customInstructions: string | undefined,
-    _navigation: NativeSessionNavigation
+    navigation: NativeSessionNavigation
   ): Promise<NativeSessionNavigationResult> {
-    if (target.kind === "session_start") throw piError("PI_REWIND_START_UNAVAILABLE", "Durable navigation to the native Session start is unavailable", "dispatch");
     this.#assertReviewOperationAllowed(context, "navigate native history");
-    const entryId = target.entryId;
-    if (!entryId) throw piError("PI_TREE_ENTRY_REQUIRED", "Native entry id is required", "dispatch");
+    const entryId = target.kind === "native_entry" ? target.entryId : undefined;
+    if (target.kind === "native_entry" && !entryId) throw piError("PI_TREE_ENTRY_REQUIRED", "Native entry id is required", "dispatch");
     const summaryFocus = customInstructions?.trim();
     if (summaryFocus !== undefined && summaryFocus.length > 4_000) {
       throw piError("PI_TREE_SUMMARY_INSTRUCTIONS_TOO_LONG", "Branch summary instructions must not exceed 4000 characters", "dispatch");
     }
     const runtime = this.#runtime(context);
-    await this.#runExclusiveSessionMutation(runtime, context, async () => {
+    return this.#runExclusiveSessionMutation<NativeSessionNavigationResult>(runtime, context, async () => {
+      if (target.kind === "session_start") {
+        return this.#navigateToStart(runtime, context, summarize, customInstructions, navigation);
+      }
       const [before, entries] = await Promise.all([this.getTree(context), this.getEntries(undefined, context)]);
-      if (!containsEntry(before.roots, entryId)) throw piError("PI_TREE_ENTRY_NOT_FOUND", `Pi tree entry '${entryId}' does not exist`, "dispatch");
+      if (!containsEntry(before.roots, target.entryId)) throw piError("PI_TREE_ENTRY_NOT_FOUND", `Pi tree entry '${target.entryId}' does not exist`, "dispatch");
       const targetEntry = entries.entries.find((entry) => entry.id === entryId);
       if (targetEntry === undefined) throw piError("PI_TREE_ENTRY_NOT_FOUND", `Pi tree entry '${entryId}' does not exist`, "dispatch");
       const expectedLeafId = expectedLeafAfterTreeNavigation(targetEntry);
+      if (expectedLeafId === undefined) {
+        return this.#navigateToStart(runtime, context, summarize, customInstructions, navigation);
+      }
       const state = await this.getState(context);
       if (state.isStreaming) throw piError("PI_TREE_RUNTIME_BUSY", "Pi tree navigation requires an idle runtime", "dispatch", { retryable: true });
       const payload = Buffer.from(JSON.stringify({
@@ -2482,10 +2488,81 @@ export class PiBackendAdapter implements
           recovery: "Reload the native tree and reconcile its active leaf before another navigation."
         });
       }
+      // SessionHost confirms persistence and publishes the new active leaf.
+      return { kind: "in_place" };
     });
-    // SessionHost performs a persistence-confirmed get_entries sync and emits
-    // the leaf marker only after every newly visible native entry is durable.
-    return { kind: "in_place" };
+  }
+
+  async #navigateToStart(
+    runtime: PiRuntime,
+    context: AdapterContext,
+    summarize: boolean,
+    customInstructions: string | undefined,
+    navigation: NativeSessionNavigation
+  ): Promise<NativeSessionNavigationResult> {
+    if (summarize || customInstructions !== undefined) {
+      throw piError("PI_TREE_START_SUMMARY_UNAVAILABLE", "Navigation to the native Session start cannot retain a branch summary", "dispatch");
+    }
+    if (context.target.remoteWorkspace !== undefined) {
+      throw piError("PI_REWIND_START_REMOTE_UNAVAILABLE", "Durable navigation to the native Session start is unavailable for this remote Target", "dispatch");
+    }
+    const state = await this.#requestState(runtime, context);
+    if (state.isStreaming || state.isCompacting || state.pendingMessageCount > 0
+      || runtime.lifecycle !== undefined || runtime.runningExtensionCommand !== undefined || runtime.userShell !== undefined) {
+      throw piError("PI_TREE_RUNTIME_BUSY", "Pi tree navigation requires an idle runtime", "dispatch", { retryable: true });
+    }
+    const history = await this.#getEntriesRaw(undefined, runtime, context.signal);
+    if (history.leafId === null && history.entries.length === 0) return { kind: "in_place" };
+    context.signal.throwIfAborted();
+    const sourceBinding = runtime.binding;
+    const shadowKey = `navigate-shadow-${randomUUID()}`;
+    const nextGeneration = Math.max(context.generation, sourceBinding.generation) + 1;
+    const sourceProfile = this.#spawnProfiles.get(runtime.key) ?? restoredSpawnProfile(context);
+    const shadowProfile: SessionSpawnProfile = {
+      ...sourceProfile,
+      providerId: state.model?.provider ?? sourceProfile.providerId,
+      modelId: state.model?.id ?? sourceProfile.modelId,
+      effort: state.thinkingLevel,
+      initialPermissionMode: runtime.control.permissionMode,
+      initialPlanMode: runtime.control.planMode,
+      initialFastMode: runtime.control.fastMode
+    };
+    const binding = this.#sessionStore.reserveFreshSession(runtimeWorkspaceRoot(context.target), nextGeneration);
+    // The public manager has returned a new identity. Register it before any
+    // persistence, startup, validation or cleanup await can lose that receipt.
+    navigation.recordBinding(binding);
+    const shadowContext: AdapterContext = {
+      ...context,
+      sessionId: shadowKey,
+      generation: nextGeneration,
+      binding,
+      emit: async () => undefined
+    };
+    this.#spawnProfiles.set(shadowKey, shadowProfile);
+    let shadow: PiRuntime | undefined;
+    try {
+      await this.#sessionStore.materializeFreshSession({ binding, workspaceRoot: runtimeWorkspaceRoot(context.target) });
+      context.signal.throwIfAborted();
+      shadow = await this.#startRuntime(binding, shadowProfile, shadowContext);
+      if (!sameNativeBinding(shadow.binding, binding)) throw new Error("Pi changed the reserved navigation identity.");
+      const nativeHistory = await this.getNativeHistoryProjection(shadowContext);
+      if (nativeHistory.events.some((event) => event.payload.type !== "status")) {
+        throw new Error("Pi did not confirm an empty native conversation.");
+      }
+      context.signal.throwIfAborted();
+      if (this.#runtimes.get(runtime.key) !== runtime || runtime.transport.closed
+        || !sameNativeBinding(runtime.binding, sourceBinding)) throw new Error("Pi navigation source owner changed.");
+      return { kind: "replacement", binding, nativeHistory };
+    } catch (error) {
+      throw piError("PI_TREE_START_UNCONFIRMED", "The detached native start context could not be confirmed", "session", {
+        stateMayHaveChanged: true,
+        retryable: false,
+        recovery: "Reconcile the exact navigation receipt; do not repeat native context creation automatically.",
+        cause: error
+      });
+    } finally {
+      await this.#disposeDerivationShadow("navigate", shadowKey, shadow, shadowContext);
+    }
   }
 
   async fork(entryId: string, context: AdapterContext, derivation: NativeSessionDerivation): Promise<NativeSessionForkResult> {
@@ -2611,7 +2688,7 @@ export class PiBackendAdapter implements
   }
 
   async #disposeDerivationShadow(
-    operation: "fork" | "clone",
+    operation: "fork" | "clone" | "navigate",
     shadowKey: string,
     shadow: PiRuntime | undefined,
     shadowContext: AdapterContext
@@ -2640,11 +2717,11 @@ export class PiBackendAdapter implements
       }
     }
     if (failures.length > 0) {
-      const code = operation === "fork"
+      const code = operation === "navigate" ? "PI_TREE_START_SHADOW_CLEANUP_FAILED" : operation === "fork"
         ? "PI_SESSION_FORK_SHADOW_CLEANUP_FAILED"
         : "PI_SESSION_CLONE_SHADOW_CLEANUP_FAILED";
       throw piError(code, `Detached Pi ${operation} runtime could not be fully retired`, "shutdown", {
-        retryable: true,
+        retryable: operation !== "navigate",
         stateMayHaveChanged: true,
         recovery: "Keep the derived binding fenced until the detached runtime is confirmed stopped.",
         cause: new AggregateError(failures, `Detached Pi ${operation} runtime cleanup failures`)
@@ -2668,7 +2745,7 @@ export class PiBackendAdapter implements
       const sourceHistory = await this.getEntries(undefined, context);
       const sourceLeafId = sourceHistory.leafId;
       if (
-        sourceLeafId === undefined
+        sourceLeafId == null
         || !sourceHistory.entries.some((entry) => entry.id === sourceLeafId)
       ) {
         throw piError("PI_CLONE_ENTRY_NOT_DURABLE", "Pi native clone requires one stable durable history entry", "dispatch", {
@@ -3914,12 +3991,12 @@ export class PiBackendAdapter implements
     return isRecord(data) ? data : {};
   }
 
-  async getEntries(since: string | undefined, context: AdapterContext): Promise<{ readonly entries: readonly PiRpcEntry[]; readonly leafId?: string }> {
+  async getEntries(since: string | undefined, context: AdapterContext): Promise<{ readonly entries: readonly PiRpcEntry[]; readonly leafId: string | null }> {
     const runtime = this.#runtime(context);
     const raw = await this.#getEntriesRaw(since, runtime, context.signal);
     return {
       entries: raw.entries.map((entry) => redactPiRpcEntry(entry, runtime.redactValues)),
-      ...(raw.leafId === undefined ? {} : { leafId: redactManagedSecrets(raw.leafId, runtime.redactValues) })
+      leafId: raw.leafId === null ? null : redactManagedSecrets(raw.leafId, runtime.redactValues)
     };
   }
 
@@ -3927,7 +4004,7 @@ export class PiBackendAdapter implements
     since: string | undefined,
     runtime: PiRuntime,
     signal: AbortSignal
-  ): Promise<{ readonly entries: readonly PiRpcEntry[]; readonly leafId?: string }> {
+  ): Promise<{ readonly entries: readonly PiRpcEntry[]; readonly leafId: string | null }> {
     const response = await runtime.transport.request({ type: "get_entries", since }, { signal });
     return validatedPiEntriesResponse(responseData(response));
   }
@@ -3943,7 +4020,7 @@ export class PiBackendAdapter implements
     return projectPiNativeHistory(binding.nativeSessionId, {
       entries: await Promise.all(history.entries.map(async (entry) =>
         runtime.translator.materializeNativeHistoryEntry(toNativeHistoryEntry(entry)))),
-      ...(history.leafId === undefined ? {} : { leafId: boundedNativeIdentifier(history.leafId, "leaf") })
+      leafId: history.leafId === null ? null : boundedNativeIdentifier(history.leafId, "leaf")
     });
   }
 
@@ -5952,6 +6029,7 @@ export class PiBackendAdapter implements
       "session.detach",
       "session.fork",
       "session.rewind",
+      "session.rewind_to_start",
       "session.message_delete",
       "session.reset",
       "session.tree",
@@ -6018,6 +6096,7 @@ export class PiBackendAdapter implements
           return [key, {
             key,
             supported: true,
+            ...(key === "session.rewind_to_start" ? { options: [SESSION_REWIND_SERVICE_NODE_ONLY_OPTION] } : {}),
             ...(key === "input.mention" ? { options: ["workspace_file", "resource"] } : {}),
             ...(key === "runtime.resources" ? { options: ["extension", "skill", "prompt", "package"] } : {}),
             ...(key === "permission.modes" ? { options: ["ask", "auto", "bypassPermissions"] } : {})
@@ -6270,7 +6349,7 @@ function validateClearedPiQueue(response: unknown): void {
 
 function validatedPiEntriesResponse(
   data: unknown
-): { readonly entries: readonly PiRpcEntry[]; readonly leafId?: string } {
+): { readonly entries: readonly PiRpcEntry[]; readonly leafId: string | null } {
   if (!isRecord(data) || !Array.isArray(data.entries) ||
       (data.leafId !== null && typeof data.leafId !== "string")) {
     throw piError(
@@ -6322,7 +6401,7 @@ function validatedPiEntriesResponse(
   }
   return {
     entries,
-    ...(typeof data.leafId === "string" ? { leafId: data.leafId } : {})
+    leafId: data.leafId as string | null
   };
 }
 
@@ -6511,9 +6590,9 @@ function isUnconfirmedSessionMutationError(error: unknown): boolean {
 function capabilitiesForMissingCommand(command: PiOptionalProbeCommand): readonly KnownCapability[] {
   switch (command) {
     case "get_tree":
-      return ["session.tree", "session.rewind", "session.message_delete", "session.reset"];
+      return ["session.tree", "session.rewind", "session.rewind_to_start", "session.message_delete", "session.reset"];
     case "get_entries":
-      return ["session.rewind"];
+      return ["session.rewind", "session.rewind_to_start"];
     case "get_available_models":
       return ["model.list"];
     case "get_available_thinking_levels":

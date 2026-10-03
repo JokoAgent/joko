@@ -11452,7 +11452,7 @@ describe("SessionHost", () => {
       ]));
   });
 
-  it("persists an explicit start rewind and fences stale generations without changing the native binding", async () => {
+  it.each(["in_place", "replacement"] as const)("persists an explicit start rewind and fences stale generations with a %s native outcome", async (outcome) => {
     const adapter = new ManagedAttachFakeAdapter({ ...PI_LIKE_PROFILE, capabilities: [...PI_LIKE_PROFILE.capabilities, { key: "session.rewind_to_start", supported: true }] });
     adapter.history = { events: [{ ...fakeHistoryEvent("first-user", "message_user", { type: "message_complete", role: "user", blocks: [{ kind: "text", text: "First" }] }), nativeRewindBefore: { kind: "session_start" } }], activeEntryId: "first-user", activeLineage: [{ entryId: "first-user" }] };
     const fixture = await createFixture(adapter);
@@ -11460,31 +11460,78 @@ describe("SessionHost", () => {
     const binding = fixture.store.getSession(sessionId).descriptor.binding;
     expect(fixture.store.listEvents({ sessionId }).find((event) => event.payload.type === "message_complete")?.payload)
       .toMatchObject({ nativeHistory: { identity: { entryId: "first-user", rewindBefore: { kind: "session_start" } } } });
-    const navigate = vi.spyOn(adapter, "navigateTree").mockImplementation(async () => {
+    const replacement = { opaqueRef: "managed://empty-start", nativeSessionId: "empty-start", generation: binding.generation + 1 };
+    const close = vi.spyOn(adapter, "closeSession");
+    const navigate = vi.spyOn(adapter, "navigateTree").mockImplementation(async (_target, _summarize, _context, _instructions, navigation) => {
       adapter.history = { events: [], activeLineage: [], activeNavigationTarget: { kind: "session_start" } };
+      if (outcome === "replacement") {
+        navigation.recordBinding(replacement);
+        expect(fixture.store.findNativeSessionDerivation("native-navigation-2")?.binding).toEqual(replacement);
+        return { kind: "replacement", binding: replacement, nativeHistory: adapter.history };
+      }
       return { kind: "in_place" };
     });
     await expect(fixture.host.navigateTree(sessionId, { kind: "session_start" }, false, undefined, binding.generation + 1, { connection: fixture.connection, operationId: "native-navigation-1", protocol: { kind: "internal" } })).rejects.toThrow();
     expect(navigate).not.toHaveBeenCalled();
     await fixture.host.navigateTree(sessionId, { kind: "session_start" }, false, undefined, binding.generation, { connection: fixture.connection, operationId: "native-navigation-2", protocol: { kind: "internal" } });
-    expect(fixture.store.getSession(sessionId).descriptor.binding).toEqual(binding);
+    const expectedBinding = outcome === "replacement" ? replacement : binding;
+    expect(fixture.store.getSession(sessionId).descriptor.binding).toEqual(expectedBinding);
+    if (outcome === "replacement") {
+      expect(close).toHaveBeenCalledExactlyOnceWith(binding, expect.objectContaining({ sessionId, binding }));
+      expect(fixture.store.findNativeSessionDerivation("native-navigation-2")).toMatchObject({ state: "adopted", sourceBinding: binding, binding: replacement });
+      expect(fixture.store.listQueueItems({ sessionId })).toEqual([]);
+      expect(fixture.store.listEvents({ sessionId }).some((event) => event.payload.type === "message_complete" && event.generation === binding.generation)).toBe(true);
+    }
     const marker = fixture.store.listEvents({ sessionId }).filter((event) => event.payload.type === "native_session_changed").at(-1);
-    expect(marker?.payload).toEqual({ type: "native_session_changed", opaqueRef: binding.opaqueRef, nativeSessionId: binding.nativeSessionId });
+    expect(marker?.payload).toEqual({ type: "native_session_changed", opaqueRef: expectedBinding.opaqueRef, nativeSessionId: expectedBinding.nativeSessionId });
+    expect(marker?.generation).toBe(expectedBinding.generation);
     expect(materializedSessionRuntimeState(fixture.store.getSetting("session", sessionId, SESSION_RUNTIME_STATE_SETTING_KEY).value)?.activeNativeEntryId).toBeUndefined();
   });
 
-  it.each(["start", "entry", "unavailable"] as const)("captures a typed %s dialogue anchor through native history without requiring a tree capability", async (boundary) => {
-    const adapter = new ManagedAttachFakeAdapter({ ...PI_LIKE_PROFILE, capabilities: [...PI_LIKE_PROFILE.capabilities.filter((capability) => capability.key !== "session.tree"), { key: "session.rewind_to_start", supported: true }] });
+  it.each([
+    { scope: "service node", options: ["service_node_only"], remote: false, allowed: true },
+    { scope: "unrestricted remote", options: [], remote: true, allowed: true },
+    { scope: "restricted remote", options: ["service_node_only"], remote: true, allowed: false },
+    { scope: "unknown option", options: ["unknown"], remote: false, allowed: false },
+    { scope: "duplicate option", options: ["service_node_only", "service_node_only"], remote: false, allowed: false }
+  ])("admits start navigation only within the capability Target scope: $scope", async ({ options, remote, allowed }) => {
+    const adapter = new ManagedAttachFakeAdapter({ ...PI_LIKE_PROFILE, capabilities: [...PI_LIKE_PROFILE.capabilities, { key: "session.rewind_to_start", supported: true, options }] });
+    const fixture = await createFixture(adapter);
+    if (remote) await fixture.host.registerTarget({ ...fixture.store.getTarget("target-one").descriptor,
+      id: "remote-start-target", workspaceRoot: "/workspace",
+      remoteWorkspace: { kind: "ssh", hostTargetId: "target-one", hostId: "host-a", workspaceRoot: "/workspace" } });
+    const sessionId = (await fixture.host.createSession({ operationId: "scope-source", connection: fixture.connection,
+      targetId: remote ? "remote-start-target" : "target-one", title: "Scoped start", fastMode: false, permissionMode: "ask", planMode: false })).value.sessionId;
+    const binding = fixture.store.getSession(sessionId).descriptor.binding;
+    const navigate = vi.spyOn(adapter, "navigateTree");
+    const result = fixture.host.navigateTree(sessionId, { kind: "session_start" }, false, undefined, binding.generation,
+      { connection: fixture.connection, operationId: "scope-navigation", protocol: { kind: "internal" } });
+    if (allowed) {
+      await result;
+      expect(navigate).toHaveBeenCalledOnce();
+    } else {
+      await expect(result).rejects.toThrow("The requested native navigation target is unavailable.");
+      expect(navigate).not.toHaveBeenCalled();
+      expect(fixture.store.getSession(sessionId).descriptor.binding).toEqual(binding);
+      expect(fixture.store.findNativeSessionDerivation("scope-navigation")).toBeUndefined();
+    }
+  });
+
+  it.each(["start", "entry", "unavailable", "start_remote", "start_invalid"] as const)("captures a typed %s dialogue anchor through native history without requiring a tree capability", async (boundary) => {
+    const adapter = new ManagedAttachFakeAdapter({ ...PI_LIKE_PROFILE, capabilities: [...PI_LIKE_PROFILE.capabilities.filter((capability) => capability.key !== "session.tree"), { key: "session.rewind_to_start", supported: true, options: [boundary === "start_invalid" ? "unknown" : "service_node_only"] }] });
     const getTree = vi.spyOn(adapter, "getTree").mockRejectedValue(new Error("No native tree surface"));
     const captureBeforeRun = vi.fn(async (_input: Parameters<WorkspaceRunCapture["captureBeforeRun"]>[0]) => undefined);
     const fixture = await createFixture(adapter, { workspaceCapture: { captureBeforeRun, captureAfterRun: async () => undefined } });
-    const sessionId = (await fixture.host.createSession({ operationId: `capture-${boundary}`, connection: fixture.connection, targetId: "target-one", title: "Capture", fastMode: false, permissionMode: "ask", planMode: false })).value.sessionId;
+    if (boundary === "start_remote") await fixture.host.registerTarget({ ...fixture.store.getTarget("target-one").descriptor,
+      id: "remote-start-target", workspaceRoot: "/workspace",
+      remoteWorkspace: { kind: "ssh", hostTargetId: "target-one", hostId: "host-a", workspaceRoot: "/workspace" } });
+    const sessionId = (await fixture.host.createSession({ operationId: `capture-${boundary}`, connection: fixture.connection, targetId: boundary === "start_remote" ? "remote-start-target" : "target-one", title: "Capture", fastMode: false, permissionMode: "ask", planMode: false })).value.sessionId;
     if (boundary === "unavailable") adapter.historyFailure = new Error("History unavailable");
-    else adapter.history = { events: [], activeNavigationTarget: boundary === "start" ? { kind: "session_start" } : { kind: "native_entry", entryId: "observed-leaf" } };
+    else adapter.history = { events: [], activeNavigationTarget: boundary === "entry" ? { kind: "native_entry", entryId: "observed-leaf" } : { kind: "session_start" } };
     fixture.host.enqueueInput({ operationId: `send-capture-${boundary}`, connection: fixture.connection, sessionId, prompt: { text: "Capture boundary", images: [], files: [], mentions: [], disposition: "prompt" } });
     await vi.waitFor(() => expect(captureBeforeRun).toHaveBeenCalledOnce());
     const anchor = captureBeforeRun.mock.calls[0]?.[0].navigationAnchor;
-    expect(anchor).toEqual(boundary === "unavailable" ? undefined : { target: adapter.history.activeNavigationTarget, generation: fixture.store.getSession(sessionId).descriptor.binding.generation });
+    expect(anchor).toEqual(["unavailable", "start_remote", "start_invalid"].includes(boundary) ? undefined : { target: adapter.history.activeNavigationTarget, generation: fixture.store.getSession(sessionId).descriptor.binding.generation });
     expect(getTree).not.toHaveBeenCalled();
   });
 
