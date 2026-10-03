@@ -98,8 +98,11 @@ import { useAppInputTimelineOwner } from "../app-input-owners.js";
 import {
   TIMELINE_HISTORY_NAVIGATION_KEYS,
   TIMELINE_TOUCH_UP_INTENT_THRESHOLD_PX,
+  hasNestedTimelineScrollerThatCanMoveDown,
   hasNestedTimelineScrollerThatCanMoveUp,
   isEditableTimelineKeyboardTarget,
+  shouldRepinTimelineOnDownIntent,
+  shouldRepinTimelineOnWheel,
   shouldUnpinTimelineOnUpIntent,
   shouldUnpinTimelineOnWheel
 } from "./timeline-follow-intent.js";
@@ -305,6 +308,7 @@ export function Timeline({ ownerKey, sessionId, sessionName, workspaceId, onRead
   const navigationOwnerRef = useRef({ ownerKey, sessionId });
   if (navigationOwnerRef.current.ownerKey !== ownerKey || navigationOwnerRef.current.sessionId !== sessionId) {
     navigationOwnerRef.current = { ownerKey, sessionId };
+    touchYRef.current = undefined;
   }
   const focusRequestRef = useRef(focusRequest);
   focusRequestRef.current = focusRequest;
@@ -529,6 +533,7 @@ export function Timeline({ ownerKey, sessionId, sessionName, workspaceId, onRead
         if (focus !== undefined) handledFocusRequestRef.current = focus.requestId;
         setFocusedItemId(undefined);
       }
+      touchYRef.current = undefined;
       cancelTimelineNavigation(false);
     };
   }, [cancelTimelineNavigation, ownerKey, sessionId]);
@@ -538,6 +543,7 @@ export function Timeline({ ownerKey, sessionId, sessionName, workspaceId, onRead
     if (view === null || view === undefined) return;
     const onPageHide = (): void => {
       navigationDocumentActiveRef.current = false;
+      touchYRef.current = undefined;
       cancelTimelineNavigation();
       setFocusedItemId(undefined);
     };
@@ -547,6 +553,7 @@ export function Timeline({ ownerKey, sessionId, sessionName, workspaceId, onRead
     return () => {
       view.removeEventListener("pagehide", onPageHide);
       view.removeEventListener("pageshow", onPageShow);
+      touchYRef.current = undefined;
       cancelTimelineNavigation(false);
     };
   }, [cancelTimelineNavigation]);
@@ -795,12 +802,28 @@ export function Timeline({ ownerKey, sessionId, sessionName, workspaceId, onRead
     if (followingRef.current && shouldUnpinTimelineOnUpIntent(node)) setTimelineFollowing(false);
   };
 
+  const resumeFollowingForDownIntent = (): void => {
+    if (followingRef.current) return;
+    cancelTimelineNavigation();
+    setFocusedItemId(undefined);
+    restoreAnchorRef.current = undefined;
+    setTimelineFollowing(true);
+  };
+
   const handleTimelineWheelIntent = (deltaY: number, deltaX = 0, target: EventTarget | null = null): void => {
-    if (deltaY >= 0) return;
     const node = scrollRef.current;
-    if (node === null || hasNestedTimelineScrollerThatCanMoveUp(node, target)) return;
-    if (followingRef.current && shouldUnpinTimelineOnWheel({ deltaX, deltaY, scrollHeight: node.scrollHeight, clientHeight: node.clientHeight })) setTimelineFollowing(false);
-    if (historyError === undefined && shouldLoadEarlierTimeline({ scrollTop: node.scrollTop, hasEarlier, loading: historyLoading })) requestEarlier();
+    if (node === null || !navigationDocumentActiveRef.current) return;
+    if (deltaY < 0) {
+      if (hasNestedTimelineScrollerThatCanMoveUp(node, target)) return;
+      if (followingRef.current && shouldUnpinTimelineOnWheel({ deltaX, deltaY, scrollHeight: node.scrollHeight, clientHeight: node.clientHeight })) setTimelineFollowing(false);
+      if (historyError === undefined && shouldLoadEarlierTimeline({ scrollTop: node.scrollTop, hasEarlier, loading: historyLoading })) requestEarlier();
+      return;
+    }
+    if (deltaY > 0 && !hasNestedTimelineScrollerThatCanMoveDown(node, target) && shouldRepinTimelineOnWheel({
+      deltaX,
+      deltaY,
+      distanceFromEnd: node.scrollHeight - node.scrollTop - node.clientHeight
+    })) resumeFollowingForDownIntent();
   };
 
   useAppInputTimelineOwner(scrollRef, ownerKey, (deltaY) => {
@@ -871,20 +894,33 @@ export function Timeline({ ownerKey, sessionId, sessionName, workspaceId, onRead
         data-timeline-session-id={sessionId}
         data-selection-quote-context=""
         onScroll={onScroll}
-        onWheel={(event) => handleTimelineWheelIntent(event.deltaY, event.deltaX, event.target)}
+        onWheel={(event) => {
+          if (event.ctrlKey || event.metaKey) return;
+          handleTimelineWheelIntent(event.deltaY, event.deltaX, event.target);
+        }}
         onKeyDown={(event) => {
           if (event.defaultPrevented || !TIMELINE_HISTORY_NAVIGATION_KEYS.has(event.key) || isEditableTimelineKeyboardTarget(event.target)) return;
           stopFollowingForUpIntent(event.currentTarget);
           if (historyError === undefined && shouldLoadEarlierTimeline({ scrollTop: event.currentTarget.scrollTop, hasEarlier, loading: historyLoading })) requestEarlier();
         }}
-        onTouchStart={(event) => { touchYRef.current = event.touches[0]?.clientY; }}
+        onTouchStart={(event) => { touchYRef.current = navigationDocumentActiveRef.current && event.touches.length === 1 ? event.touches[0]?.clientY : undefined; }}
         onTouchMove={(event) => {
+          if (!navigationDocumentActiveRef.current || event.touches.length !== 1) {
+            touchYRef.current = undefined;
+            return;
+          }
           const currentY = event.touches[0]?.clientY;
           if (currentY !== undefined && touchYRef.current !== undefined && currentY > touchYRef.current + TIMELINE_TOUCH_UP_INTENT_THRESHOLD_PX) {
             touchYRef.current = currentY;
             if (hasNestedTimelineScrollerThatCanMoveUp(event.currentTarget, event.target)) return;
             stopFollowingForUpIntent(event.currentTarget);
             if (historyError === undefined && shouldLoadEarlierTimeline({ scrollTop: event.currentTarget.scrollTop, hasEarlier, loading: historyLoading })) requestEarlier();
+            return;
+          }
+          if (currentY !== undefined && touchYRef.current !== undefined && touchYRef.current - currentY > TIMELINE_TOUCH_UP_INTENT_THRESHOLD_PX) {
+            touchYRef.current = currentY;
+            if (hasNestedTimelineScrollerThatCanMoveDown(event.currentTarget, event.target)) return;
+            if (shouldRepinTimelineOnDownIntent({ distanceFromEnd: event.currentTarget.scrollHeight - event.currentTarget.scrollTop - event.currentTarget.clientHeight })) resumeFollowingForDownIntent();
           }
         }}
         onTouchEnd={() => { touchYRef.current = undefined; }}
