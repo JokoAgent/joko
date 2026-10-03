@@ -8,6 +8,7 @@ import {
 } from "./host-client.js";
 import type {
   DedicatedHardwareSdkIdentity,
+  DedicatedHardwareLightingState,
   DedicatedHardwareUtilityMessage,
   DedicatedHardwareUtilityRequest
 } from "./protocol.js";
@@ -122,6 +123,20 @@ function desired(enabled = true, preview = false, model: "codex-micro" | "creato
   return { settings: { ...createDefaultDedicatedHardwareSettings(model), enabled }, preview };
 }
 
+function lightingState(revealOccurrence: string, primaryVisible = true): DedicatedHardwareLightingState {
+  return {
+    version: 1,
+    taskSlots: [{ phase: "running", attention: false }, null, null, null, null, null],
+    revealOccurrence,
+    primaryVisible
+  };
+}
+
+function lightingRequests(host: FakeHost, model?: "codex-micro" | "creator-micro-2") {
+  return host.sent.filter((request): request is Extract<DedicatedHardwareUtilityRequest, { kind: "set-lighting-state" }> =>
+    request.kind === "set-lighting-state" && (model === undefined || request.model === model));
+}
+
 async function settle(): Promise<void> {
   await Promise.resolve();
   await Promise.resolve();
@@ -153,6 +168,98 @@ function stateMessage(host: FakeHost, overrides: Record<string, unknown> = {}): 
 
 describe("dedicated hardware utility host client", () => {
   afterEach(() => vi.useRealTimers());
+
+  it("coalesces lighting independently per enabled model without starting a host or timing out keymap maintenance", async () => {
+    vi.useFakeTimers();
+    const { client, factory, hosts } = fixture();
+    client.setLightingState("codex-micro", lightingState("0"));
+    client.setLightingState("creator-micro-2", lightingState("0"));
+    expect(factory.spawn).not.toHaveBeenCalled();
+    expect(() => client.setLightingState("codex-micro", { ...lightingState("0"), revealOccurrence: "01" })).toThrow();
+    client.setDesiredState("codex-micro", desired());
+    client.setDesiredState("creator-micro-2", desired(true, false, "creator-micro-2"));
+    await settle();
+    const host = hosts[0]!;
+    host.ready();
+    const first = lightingRequests(host, "codex-micro")[0]!;
+    const creatorFirst = lightingRequests(host, "creator-micro-2")[0]!;
+    expect(host.sent.findIndex((request) => request.kind === "set-desired-state" && request.model === "creator-micro-2"))
+      .toBeLessThan(host.sent.indexOf(first));
+    client.setLightingState("codex-micro", lightingState("1"));
+    client.setLightingState("codex-micro", lightingState("2", false));
+    client.setLightingState("creator-micro-2", lightingState("1"));
+    expect(lightingRequests(host)).toHaveLength(2);
+    host.message({ version: 1, generation: first.generation, requestId: "g1:999", kind: "ack" });
+    expect(lightingRequests(host)).toHaveLength(2);
+    host.message({ version: 1, generation: first.generation, requestId: first.requestId, kind: "ack" });
+    const latest = lightingRequests(host, "codex-micro").at(-1)!;
+    expect(latest.state).toEqual(lightingState("2", false));
+    expect(latest.state.taskSlots[0]?.phase).toBe("running");
+    expect(lightingRequests(host, "creator-micro-2")).toHaveLength(1);
+    host.message({ version: 1, generation: creatorFirst.generation, requestId: creatorFirst.requestId, kind: "ack" });
+    expect(lightingRequests(host, "creator-micro-2")).toHaveLength(2);
+    host.message({ version: 1, generation: latest.generation, requestId: latest.requestId, kind: "ack" });
+    client.setLightingState("codex-micro", lightingState("2", false));
+    expect(lightingRequests(host, "codex-micro")).toHaveLength(2);
+    host.message(stateMessage(host, {
+      model: "creator-micro-2", keymap: { phase: "error", backupAvailable: true, failure: "recovery-required" }
+    }));
+    const recovery = client.recoverCreatorKeymap();
+    const request = host.sent.find((candidate) => candidate.kind === "recover-keymap")!;
+    await vi.advanceTimersByTimeAsync(5_001);
+    expect(host.terminated).toBe(false);
+    expect(hosts).toHaveLength(1);
+    host.message(stateMessage(host, {
+      model: "creator-micro-2", keymap: { phase: "occupied", backupAvailable: true, failure: null }
+    }));
+    host.message({ version: 1, generation: request.generation, requestId: request.requestId, kind: "ack" });
+    await expect(recovery).resolves.toMatchObject({ keymap: { phase: "occupied", backupAvailable: true, failure: null } });
+    const stopped = client.stop();
+    host.stopped();
+    await stopped;
+  });
+
+  it("fences disabled and retired lighting deliveries and replays only the latest state after settings", async () => {
+    vi.useFakeTimers();
+    const { client, hosts } = fixture();
+    client.setDesiredState("codex-micro", desired());
+    client.setDesiredState("creator-micro-2", desired(true, false, "creator-micro-2"));
+    client.setLightingState("codex-micro", lightingState("0"));
+    await settle();
+    const first = hosts[0]!;
+    first.ready();
+    const pending = lightingRequests(first)[0]!;
+    client.setDesiredState("codex-micro", desired(false));
+    client.setLightingState("codex-micro", lightingState("1"));
+    client.setDesiredState("codex-micro", desired());
+    expect(lightingRequests(first)).toHaveLength(1);
+    first.message({ version: 1, generation: pending.generation, requestId: pending.requestId, kind: "ack" });
+    expect(lightingRequests(first).at(-1)?.state).toEqual(lightingState("1"));
+    const oldPending = lightingRequests(first).at(-1)!;
+    client.retry();
+    client.setLightingState("codex-micro", lightingState("2"));
+    first.message({ version: 1, generation: oldPending.generation, requestId: oldPending.requestId, kind: "ack" });
+    expect(lightingRequests(first)).toHaveLength(2);
+    first.stopped();
+    await settle();
+    const second = hosts[1]!;
+    second.ready();
+    const replay = lightingRequests(second)[0]!;
+    expect(replay.generation).not.toBe(oldPending.generation);
+    expect(replay.state).toEqual(lightingState("2"));
+    expect(second.sent.findIndex((request) => request.kind === "set-desired-state" && request.model === "codex-micro"))
+      .toBeLessThan(second.sent.indexOf(replay));
+    client.setLightingState("codex-micro", lightingState("3"));
+    first.message({ version: 1, generation: oldPending.generation, requestId: oldPending.requestId, kind: "ack" });
+    expect(lightingRequests(second)).toHaveLength(1);
+    second.message({ version: 1, generation: replay.generation, requestId: replay.requestId, kind: "ack" });
+    expect(lightingRequests(second).at(-1)?.state).toEqual(lightingState("3"));
+    const stopped = client.stop();
+    client.setLightingState("codex-micro", lightingState("4"));
+    expect(lightingRequests(second)).toHaveLength(2);
+    second.stopped();
+    await stopped;
+  });
 
   it("starts lazily and projects an explicit unavailable SDK without loading a private bundle", async () => {
     vi.useFakeTimers();

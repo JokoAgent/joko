@@ -22,7 +22,8 @@ function catalog() {
       userSendAt: 1_700_000_000_000,
       sidebarOrder: 0,
       catalogEligible: true,
-      priorityRank: null
+      priorityRank: null,
+      activity: { phase: "running", attention: false }
     }]
   } as const;
 }
@@ -46,6 +47,9 @@ describe("dedicated hardware task catalog", () => {
       })) },
       { ...valid, tasks: [{ ...valid.tasks[0], sidebarOrder: -1 }] },
       { ...valid, tasks: [{ ...valid.tasks[0], sessionGeneration: "legacy" }] },
+      { ...valid, tasks: [{ ...valid.tasks[0], activity: { phase: "idle", attention: false } }] },
+      { ...valid, tasks: [{ ...valid.tasks[0], activity: { phase: "running", attention: 1 } }] },
+      { ...valid, tasks: [{ ...valid.tasks[0], activity: { phase: null, attention: false, title: "guess" } }] },
       { ...valid, tasks: [{ ...valid.tasks[0], extra: true }] }
     ]) {
       expect(parseDedicatedHardwareTaskCatalog(invalid)).toBeUndefined();

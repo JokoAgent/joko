@@ -7,9 +7,21 @@ import {
   DEDICATED_HARDWARE_KEYMAP_MAX_BYTES,
   isDedicatedHardwareKeymapDeviceFirmwareIdentity
 } from "./keymap-controller.js";
-import type { DedicatedHardwareDesiredState, DedicatedHardwareUtilityDeviceSnapshot } from "./protocol.js";
-import { DEDICATED_HARDWARE_MODEL_IDS, type DedicatedHardwareModelId, type DedicatedHardwarePhysicalKey }
-  from "./settings.js";
+import {
+  parseDedicatedHardwareLightingState,
+  type DedicatedHardwareDesiredState,
+  type DedicatedHardwareLightingState,
+  type DedicatedHardwareUtilityDeviceSnapshot
+} from "./protocol.js";
+import { createDedicatedHardwareLightingFrame, type DedicatedHardwareLightingFrame } from "./lighting-frame.js";
+import { createDedicatedHardwareLightingRuntime, type DedicatedHardwareLightingRuntime } from "./lighting-runtime.js";
+import {
+  DEDICATED_HARDWARE_MODEL_IDS,
+  cloneDedicatedHardwareSettings,
+  type DedicatedHardwareModelId,
+  type DedicatedHardwarePhysicalKey,
+  type DedicatedHardwareSettings
+} from "./settings.js";
 import type { DedicatedHardwareUtilityAdapter, DedicatedHardwareUtilityAdapterSink } from "./utility-handler.js";
 import { createDedicatedHardwareNotificationCodec, installCompactHardwareNotifications }
   from "./vendor-notifications.js";
@@ -17,6 +29,10 @@ import { createDedicatedHardwareNotificationCodec, installCompactHardwareNotific
 const KEYMAP_FILE = "keymap.json";
 const KEYMAP_SETTLE_MS = 2_500;
 const RPC_TIMEOUT_MS = 4_000;
+const STOP_LIGHTING_TIMEOUT_MS = 500;
+const EMPTY_LIGHTING_STATE: DedicatedHardwareLightingState = {
+  version: 1, taskSlots: [null, null, null, null, null, null], revealOccurrence: "0", primaryVisible: false
+};
 const logger = Object.freeze({ debug() {}, info() {}, warn() {}, error() {} });
 
 interface Device {
@@ -35,6 +51,8 @@ interface DeviceApi {
     writeFile(name: string, contents: string): Promise<unknown>;
   };
   getDeviceStatus(): Promise<unknown>;
+  sendLightingConfig(config: Pick<DedicatedHardwareLightingFrame, "ambient" | "keys">): Promise<unknown>;
+  sendThreadsLighting(threads: DedicatedHardwareLightingFrame["threads"]): Promise<unknown>;
   onHidReceived(listener: (value: unknown) => void): (() => void) | void;
   onJoystickMove(listener: (value: unknown) => void): (() => void) | void;
 }
@@ -57,6 +75,7 @@ interface Connection {
   readonly comm: Communication;
   readonly api: DeviceApi;
   readonly codec: ReturnType<typeof createDedicatedHardwareNotificationCodec>;
+  readonly lighting: DedicatedHardwareLightingRuntime;
   readonly unsubscribers: (() => void)[];
   readonly restoreParser: () => void;
   ready: boolean;
@@ -64,11 +83,16 @@ interface Connection {
   context?: CreatorKeymapContext;
   expectedContents?: string;
   mapping?: ReadonlyMap<DedicatedHardwarePhysicalKey, DedicatedHardwarePhysicalKey>;
+  mappingIdentity?: string;
+  lightingRpc?: Promise<unknown>;
 }
 interface Slot {
   readonly model: DedicatedHardwareModelId;
   generation: number;
   enabled: boolean;
+  maintenanceDepth: number;
+  settings?: DedicatedHardwareSettings;
+  lightingState: DedicatedHardwareLightingState;
   connection?: Connection;
 }
 
@@ -83,7 +107,9 @@ export function createDedicatedHardwareVendorAdapter(options: {
   const discovery = new sdk.WLDeviceDiscovery(logger);
   if (typeof discovery.findWLDevices !== "function") throw failure();
   const slots = new Map<DedicatedHardwareModelId, Slot>(
-    DEDICATED_HARDWARE_MODEL_IDS.map((model) => [model, { model, generation: 0, enabled: false }])
+    DEDICATED_HARDWARE_MODEL_IDS.map((model) => [model, {
+      model, generation: 0, enabled: false, maintenanceDepth: 0, lightingState: EMPTY_LIGHTING_STATE
+    }])
   );
   const settle = options.settle ?? ((milliseconds) => new Promise<void>((resolve) => setTimeout(resolve, milliseconds)));
   let stopped = false;
@@ -109,18 +135,95 @@ export function createDedicatedHardwareVendorAdapter(options: {
   };
   const current = (slot: Slot, connection: Connection): boolean =>
     !stopped && slot.connection === connection && slot.generation === connection.generation;
-  const retire = async (slot: Slot): Promise<void> => {
+  const creatorMappingConfirmed = (connection: Connection): boolean => {
+    if (connection.mapping === undefined || connection.context === undefined ||
+      connection.context.profileIndex !== connection.status.profileIndex ||
+      connection.context.layerIndex !== connection.status.layerIndex) return false;
+    try { return connection.mappingIdentity === deviceIdentity(connection); }
+    catch { return false; }
+  };
+  const lightingAdmitted = (slot: Slot, connection: Connection): boolean =>
+    current(slot, connection) && slot.enabled && connection.ready && slot.maintenanceDepth === 0 &&
+    (slot.model !== "creator-micro-2" || creatorMappingConfirmed(connection));
+  const synchronizeLighting = (slot: Slot): void => {
+    const connection = slot.connection;
+    if (connection === undefined) return;
+    const admitted = lightingAdmitted(slot, connection);
+    if (!admitted) connection.lighting.pause();
+    if (slot.settings !== undefined) connection.lighting.update(slot.settings, slot.lightingState);
+    if (admitted) connection.lighting.resume();
+  };
+  const lightingRpc = async <T>(connection: Connection, operation: () => Promise<T>, timeout = RPC_TIMEOUT_MS): Promise<T> => {
+    if (connection.lightingRpc !== undefined) throw failure();
+    const pending = Promise.resolve().then(operation);
+    connection.lightingRpc = pending;
+    const clear = (): void => {
+      if (connection.lightingRpc === pending) connection.lightingRpc = undefined;
+    };
+    void pending.then(clear, clear);
+    return bounded(pending, timeout);
+  };
+  const turnLightingOff = async (connection: Connection, assertOwned: () => void = () => undefined): Promise<void> => {
+    const deadline = Date.now() + STOP_LIGHTING_TIMEOUT_MS;
+    if (connection.lightingRpc !== undefined) {
+      await bounded(connection.lightingRpc.then(() => undefined, () => undefined), STOP_LIGHTING_TIMEOUT_MS);
+    }
+    assertOwned();
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) throw failure();
+    const off = createDedicatedHardwareLightingFrame(EMPTY_LIGHTING_STATE.taskSlots);
+    const results = await lightingRpc(connection, () => Promise.allSettled([
+      Promise.resolve().then(() => {
+        assertOwned();
+        return connection.api.sendLightingConfig({ ambient: off.ambient, keys: off.keys });
+      }).then(success),
+      Promise.resolve().then(() => {
+        assertOwned();
+        return connection.api.sendThreadsLighting(off.threads);
+      }).then(success)
+    ]), remaining);
+    assertOwned();
+    if (results.some((result) => result.status === "rejected")) throw failure();
+  };
+  const maintainCreator = async <T>(operation: () => Promise<T>): Promise<T> => {
+    const slot = slotFor("creator-micro-2");
+    slot.maintenanceDepth += 1;
+    slot.connection?.lighting.pause();
+    try {
+      const connection = slot.connection;
+      if (connection?.lightingRpc !== undefined) {
+        await bounded(connection.lightingRpc.then(() => undefined, () => undefined));
+        if (!current(slot, connection)) throw failure();
+      }
+      return await operation();
+    }
+    finally {
+      slot.maintenanceDepth -= 1;
+      synchronizeLighting(slot);
+    }
+  };
+  const retire = async (slot: Slot, lightsOff = false): Promise<void> => {
     const connection = slot.connection;
     slot.connection = undefined;
     slot.generation += 1;
     if (connection === undefined) return;
     connection.ready = false;
+    connection.lighting.close();
     connection.codec.reset();
     connection.restoreParser();
     for (const unsubscribe of connection.unsubscribers) {
       try { unsubscribe(); } catch { /* Generation retirement already revoked callbacks. */ }
     }
+    let offFailed = false;
+    if (lightsOff) {
+      try {
+        await turnLightingOff(connection);
+      } catch {
+        offFailed = true;
+      }
+    }
     await bounded(connection.comm.disconnect());
+    if (offFailed) throw failure();
   };
   const readStatus = async (slot: Slot, connection: Connection): Promise<Status> => {
     if (!current(slot, connection)) throw failure();
@@ -148,13 +251,33 @@ export function createDedicatedHardwareVendorAdapter(options: {
       const api = new sdk.RPCApiOAI(comm, logger);
       if (typeof api.getDeviceStatus !== "function" || typeof api.onHidReceived !== "function" ||
         typeof api.onJoystickMove !== "function" || !record(api.api) ||
+        typeof api.sendLightingConfig !== "function" || typeof api.sendThreadsLighting !== "function" ||
         typeof api.api.readFile !== "function" || typeof api.api.writeFile !== "function") throw failure();
       let connection: Connection;
       const codec = createDedicatedHardwareNotificationCodec({
         resolvePhysicalKey: (wire) => slot.model === "creator-micro-2" ? connection.mapping?.get(wire) : wire
       });
+      const lighting = createDedicatedHardwareLightingRuntime({
+        apply: async (frame, signal) => {
+          const assertOwned = (): void => {
+            if (signal.aborted || !lightingAdmitted(slot, connection)) throw failure();
+          };
+          assertOwned();
+          success(await lightingRpc(connection, () => {
+            assertOwned();
+            return api.sendLightingConfig({ ambient: frame.ambient, keys: frame.keys });
+          }));
+          assertOwned();
+          success(await lightingRpc(connection, () => {
+            assertOwned();
+            return api.sendThreadsLighting(frame.threads);
+          }));
+          assertOwned();
+        }
+      });
+      lighting.pause();
       connection = {
-        generation, device, comm, api, codec, ready: false, unsubscribers: [],
+        generation, device, comm, api, codec, lighting, ready: false, unsubscribers: [],
         restoreParser: installCompactHardwareNotifications(comm),
         status: { firmwareVersion: null, batteryPercentage: null, isCharging: null, profileIndex: null, layerIndex: null }
       };
@@ -163,7 +286,10 @@ export function createDedicatedHardwareVendorAdapter(options: {
         if (!current(slot, connection) || !slot.enabled || !connection.ready ||
           (slot.model === "creator-micro-2" && connection.mapping === undefined)) return;
         const input = codec[kind](value);
-        if (input !== undefined) options.sink.publishInput(slot.model, input);
+        if (input !== undefined) {
+          connection.lighting.physicalActivity();
+          options.sink.publishInput(slot.model, input);
+        }
       };
       for (const subscription of [api.onHidReceived((value) => receive("hid", value)),
         api.onJoystickMove((value) => receive("joystick", value))]) {
@@ -198,11 +324,15 @@ export function createDedicatedHardwareVendorAdapter(options: {
   };
   const refresh = async (slot: Slot): Promise<DedicatedHardwareUtilityDeviceSnapshot> => {
     if (!slot.enabled) return snapshot(slot, "disabled");
-    if (slot.connection !== undefined) slot.connection.ready = false;
+    if (slot.connection !== undefined) {
+      slot.connection.ready = false;
+      slot.connection.lighting.pause();
+    }
     try {
       const connection = await connect(slot);
       if (connection === undefined) return snapshot(slot, "not-detected");
       connection.ready = true;
+      synchronizeLighting(slot);
       return snapshot(slot, "connected");
     } catch (error) {
       await retire(slot).catch(() => undefined);
@@ -227,8 +357,8 @@ export function createDedicatedHardwareVendorAdapter(options: {
 
   return Object.freeze({
     creatorKeymap: Object.freeze({
-      readDeviceFirmwareIdentity: async () => (await creator()).identity,
-      readCurrent: async (expected: string) => {
+      readDeviceFirmwareIdentity: () => maintainCreator(async () => (await creator()).identity),
+      readCurrent: (expected: string) => maintainCreator(async () => {
         const { slot, connection } = await creator(expected);
         const context = contextOf(connection.status);
         const contents = await readContents(slot, connection);
@@ -237,13 +367,13 @@ export function createDedicatedHardwareVendorAdapter(options: {
         connection.context ??= context;
         connection.expectedContents ??= contents;
         return contents;
-      },
+      }),
       buildManaged: (original: string, taskKeys: readonly DedicatedHardwarePhysicalKey[]) => {
         const connection = slotFor("creator-micro-2").connection;
         if (connection?.context === undefined) throw failure();
         return buildCreatorManagedKeymap(original, taskKeys, connection.context);
       },
-      writeCurrent: async (expected: string, contents: string) => {
+      writeCurrent: (expected: string, contents: string) => maintainCreator(async () => {
         if (typeof contents !== "string" || contents.length === 0 ||
           Buffer.byteLength(contents, "utf8") > DEDICATED_HARDWARE_KEYMAP_MAX_BYTES) throw failure();
         const { slot, connection } = await creator(expected);
@@ -252,8 +382,8 @@ export function createDedicatedHardwareVendorAdapter(options: {
         success(await bounded(connection.api.api.writeFile(KEYMAP_FILE, contents)));
         if (!current(slot, connection)) throw failure();
         connection.expectedContents = contents;
-      },
-      reload: async (expected: string) => {
+      }),
+      reload: (expected: string) => maintainCreator(async () => {
         const { slot, connection } = await creator(expected);
         if (connection.context === undefined || connection.expectedContents === undefined) throw failure();
         await settle(KEYMAP_SETTLE_MS);
@@ -265,24 +395,42 @@ export function createDedicatedHardwareVendorAdapter(options: {
         assertContext(connection.context, await readStatus(slot, connection));
         if (deviceIdentity(connection) !== expected) throw failure();
         connection.mapping = readCreatorManagedHidMapping(contents, connection.context);
+        connection.mappingIdentity = connection.mapping === undefined ? undefined : expected;
         connection.ready = slot.enabled;
-      }
+      })
     }),
     setDesiredState: async (model: DedicatedHardwareModelId, desired: DedicatedHardwareDesiredState) => {
       const slot = slotFor(model);
+      slot.settings = cloneDedicatedHardwareSettings(desired.settings);
       slot.enabled = desired.settings.enabled;
+      slot.connection?.lighting.pause();
       if (!slot.enabled && slot.connection !== undefined) {
-        slot.connection.ready = false;
-        slot.connection.codec.reset();
+        const connection = slot.connection;
+        connection.ready = false;
+        connection.codec.reset();
+        try {
+          await turnLightingOff(connection, () => {
+            if (!current(slot, connection) || slot.enabled || connection.ready) throw failure();
+          });
+        } catch (error) {
+          return snapshot(slot, "error", errorReason(error));
+        }
       }
       return refresh(slot);
+    },
+    setLightingState: (model: DedicatedHardwareModelId, state: DedicatedHardwareLightingState) => {
+      const slot = slotFor(model);
+      const parsed = parseDedicatedHardwareLightingState(state);
+      if (parsed === undefined) throw failure();
+      slot.lightingState = parsed;
+      synchronizeLighting(slot);
     },
     probe: async (model: DedicatedHardwareModelId) => refresh(slotFor(model)),
     stop: async () => {
       if (stopped) return;
       stopped = true;
       for (const slot of slots.values()) slot.enabled = false;
-      const results = await Promise.allSettled([...slots.values()].map(retire));
+      const results = await Promise.allSettled([...slots.values()].map((slot) => retire(slot, true)));
       if (results.some((result) => result.status === "rejected")) throw failure();
     }
   });
@@ -342,11 +490,11 @@ function errorReason(error: unknown): DedicatedHardwareUtilityDeviceSnapshot["re
   if (code === "ETIMEDOUT") return "connection-timeout";
   return "device-disconnected";
 }
-async function bounded<T>(operation: Promise<T>): Promise<T> {
+async function bounded<T>(operation: Promise<T>, timeout = RPC_TIMEOUT_MS): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     return await Promise.race([operation, new Promise<never>((_resolve, reject) => {
-      timer = setTimeout(() => reject(Object.assign(failure(), { code: "ETIMEDOUT" })), RPC_TIMEOUT_MS);
+      timer = setTimeout(() => reject(Object.assign(failure(), { code: "ETIMEDOUT" })), timeout);
     })]);
   } finally { if (timer !== undefined) clearTimeout(timer); }
 }

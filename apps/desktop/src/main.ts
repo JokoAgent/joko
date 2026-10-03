@@ -602,7 +602,14 @@ const sessionWindowOwners = new Map<string, DesktopSessionWindowOwner>();
 const sessionWindowOwnersByContents = new Map<WebContents, DesktopSessionWindowOwner>();
 const extensionWindows = new Map<string, BrowserWindow>();
 const extensionWindowIdsByContents = new Map<WebContents, string>();
-let dedicatedHardwareController: DedicatedHardwareMainController<WebContents> | undefined;
+interface DedicatedHardwareCatalogOwner {
+  readonly contents: WebContents;
+  readonly documentOccurrence: string;
+}
+type DedicatedHardwareControllerOwner = WebContents | DedicatedHardwareCatalogOwner;
+let dedicatedHardwareController: DedicatedHardwareMainController<DedicatedHardwareControllerOwner> | undefined;
+let dedicatedHardwareCatalogOwner: DedicatedHardwareCatalogOwner | undefined;
+let dedicatedHardwarePrimaryVisible = false;
 let dedicatedHardwareActions: DedicatedHardwareMainActionRuntime<BrowserWindow> | undefined;
 let dedicatedHardwareSystemVoiceController: SystemFrontmostVoiceController | undefined;
 const dedicatedHardwareTaskFocusFence = new DedicatedHardwareTaskFocusFence<WebContents>();
@@ -926,6 +933,7 @@ function createWindow(): void {
   const retiredDocument = mainWindowDocuments.retireCurrent();
   if (retiredDocument !== undefined) {
     desktopNotifications.retireOwner(retiredDocument.endpoint, retiredDocument.occurrence);
+    retireDedicatedHardwareCatalogOwner(retiredDocument.endpoint, retiredDocument.occurrence);
   }
   desktopDeepLinkDelivery.resetRenderer();
   const frameOptions = process.platform === "darwin"
@@ -1015,6 +1023,10 @@ function createWindow(): void {
     mainUiLoadRecovery = operation;
   };
   installDesktopNativeTaskStatusVisibilityLifecycle(window);
+  window.on("show", () => refreshDedicatedHardwarePrimaryVisibility(window, true));
+  window.on("restore", () => refreshDedicatedHardwarePrimaryVisibility(window, true));
+  window.on("hide", () => refreshDedicatedHardwarePrimaryVisibility(window));
+  window.on("minimize", () => refreshDedicatedHardwarePrimaryVisibility(window));
   mainWindowState.manage(window);
   window.webContents.on("did-start-navigation", (_event, _url, isInPlace, isMainFrame) => {
     if (isDesktopMainDocumentReplacementNavigation(isMainFrame, isInPlace)) {
@@ -4952,6 +4964,15 @@ function captureMainWindowDocument(contents: WebContents, claim: string): string
     }
     desktopDeepLinkDelivery.resetRenderer();
   }
+  if (dedicatedHardwareCatalogOwner?.contents !== contents ||
+      dedicatedHardwareCatalogOwner.documentOccurrence !== capture.current.occurrence) {
+    if (dedicatedHardwareCatalogOwner !== undefined) {
+      dedicatedHardwareController?.retireOwner(dedicatedHardwareCatalogOwner);
+    }
+    dedicatedHardwareCatalogOwner = Object.freeze({ contents, documentOccurrence: capture.current.occurrence });
+    dedicatedHardwarePrimaryVisible = false;
+  }
+  refreshDedicatedHardwarePrimaryVisibility(window);
   return capture.current.occurrence;
 }
 
@@ -4960,7 +4981,10 @@ function retireMainWindowDocument(window: BrowserWindow, contents: WebContents):
   // Electron's webContents getter itself throws Object has been destroyed.
   if (mainWindow !== window || mainWindowContentsByWindow.get(window) !== contents) return;
   const retired = mainWindowDocuments.retire(contents);
-  if (retired !== undefined) desktopNotifications.retireOwner(retired.endpoint, retired.occurrence);
+  if (retired !== undefined) {
+    desktopNotifications.retireOwner(retired.endpoint, retired.occurrence);
+    retireDedicatedHardwareCatalogOwner(retired.endpoint, retired.occurrence);
+  }
   desktopDeepLinkDelivery.resetRenderer();
 }
 
@@ -7044,8 +7068,13 @@ function registerIpc(): void {
   });
   ipcMain.handle(DESKTOP_CHANNELS.dedicatedHardwarePublishTasks, (event, ...parameters: unknown[]) => {
     assertDedicatedHardwareSender(event, { mainOnly: true });
-    if (parameters.length !== 1) throw new TypeError("Dedicated hardware tasks require one catalog.");
-    requireDedicatedHardwareController().publishTasks(parameters[0]);
+    if (parameters.length !== 2) throw new TypeError("Dedicated hardware tasks require their current Document and catalog.");
+    const documentOccurrence = assertCurrentMainApplicationDocumentSender(event, parameters[0]);
+    const owner = dedicatedHardwareCatalogOwner;
+    if (owner === undefined || owner.contents !== event.sender || owner.documentOccurrence !== documentOccurrence) {
+      throw new Error("Dedicated hardware tasks require their current Document owner.");
+    }
+    requireDedicatedHardwareController().publishTasks(parameters[1], owner);
   });
   ipcMain.handle(DESKTOP_CHANNELS.dedicatedHardwareAcknowledgeTaskFocus, (event, ...parameters: unknown[]) => {
     const owner = assertDedicatedHardwareSender(event, { mainOnly: true });
@@ -8223,7 +8252,7 @@ async function initializeDedicatedHardwareInput(): Promise<void> {
     }),
     keymapBackupDirectory: join(app.getPath("userData"), "hardware-input", "private-keymap")
   });
-  const controller = createDedicatedHardwareMainController<WebContents>({
+  const controller = createDedicatedHardwareMainController<DedicatedHardwareControllerOwner>({
     store,
     host,
     input,
@@ -8232,15 +8261,18 @@ async function initializeDedicatedHardwareInput(): Promise<void> {
       broadcastDedicatedHardwareState(state);
     },
     onPreviewInput: (owner, previewInput) => {
-      const window = dedicatedHardwareWindowForContents(owner);
+      const contents = "documentOccurrence" in owner ? owner.contents : owner;
+      const window = dedicatedHardwareWindowForContents(contents);
       if (window === undefined || !isDedicatedHardwareActionWindowReady(window)) return;
-      owner.send(DESKTOP_CHANNELS.dedicatedHardwarePreviewInput, previewInput);
+      contents.send(DESKTOP_CHANNELS.dedicatedHardwarePreviewInput, previewInput);
     }
   });
   dedicatedHardwareActions = actions;
-  dedicatedHardwareController = controller;
   try {
-    await controller.initialize();
+    const state = await controller.initialize();
+    dedicatedHardwareController = controller;
+    if (mainWindow !== undefined) refreshDedicatedHardwarePrimaryVisibility(mainWindow);
+    broadcastDedicatedHardwareState(state);
   } catch (error) {
     dedicatedHardwareTaskFocusFence.clear();
     dedicatedHardwareController = undefined;
@@ -8281,7 +8313,28 @@ function suspendDedicatedHardwareInput(): void {
   dedicatedHardwareActions?.cancelAll("suspended");
 }
 
-function requireDedicatedHardwareController(): DedicatedHardwareMainController<WebContents> {
+function retireDedicatedHardwareCatalogOwner(contents: WebContents, documentOccurrence: string): void {
+  const owner = dedicatedHardwareCatalogOwner;
+  if (owner === undefined || owner.contents !== contents || owner.documentOccurrence !== documentOccurrence) return;
+  dedicatedHardwareController?.retireOwner(owner);
+  dedicatedHardwareCatalogOwner = undefined;
+  dedicatedHardwarePrimaryVisible = false;
+}
+
+function refreshDedicatedHardwarePrimaryVisibility(window: BrowserWindow, reveal = false): void {
+  const owner = dedicatedHardwareCatalogOwner;
+  if (window !== mainWindow || window.isDestroyed() || owner === undefined || owner.contents.isDestroyed() ||
+      mainWindowContentsByWindow.get(window) !== owner.contents ||
+      !mainWindowDocuments.isCurrent(owner.contents, owner.documentOccurrence)) return;
+  const visible = window.isVisible() && !window.isMinimized();
+  dedicatedHardwareController?.setPrimaryWindowVisible(owner, visible);
+  if (reveal && visible && !dedicatedHardwarePrimaryVisible) {
+    dedicatedHardwareController?.playWindowReveal(owner);
+  }
+  dedicatedHardwarePrimaryVisible = visible;
+}
+
+function requireDedicatedHardwareController(): DedicatedHardwareMainController<DedicatedHardwareControllerOwner> {
   if (dedicatedHardwareController === undefined) {
     throw new Error("Dedicated hardware input is unavailable.");
   }

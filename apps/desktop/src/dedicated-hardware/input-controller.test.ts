@@ -433,7 +433,8 @@ function publishedTask(): DedicatedHardwarePublishedTask {
     userSendAt: 20,
     sidebarOrder: 0,
     catalogEligible: true,
-    priorityRank: 0
+    priorityRank: 0,
+    activity: { phase: "running", attention: false }
   };
 }
 

@@ -233,7 +233,8 @@ describe("dedicated hardware strict v1 model", () => {
       snapshotRevision: "31",
       tasks: [{
         sessionId: "session", sessionGeneration: "4", targetId: "target", title: "Build",
-        pinned: true, userSendAt: 1_725_000_000_000, sidebarOrder: 0, catalogEligible: true, priorityRank: 1
+        pinned: true, userSendAt: 1_725_000_000_000, sidebarOrder: 0, catalogEligible: true, priorityRank: 1,
+        activity: { phase: "running", attention: false }
       }]
     };
     expect(parseDedicatedHardwareTaskCatalog(catalog)).toEqual(catalog);

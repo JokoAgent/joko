@@ -118,6 +118,8 @@ import {
   useDedicatedHardwareTaskCatalogPublisher,
   visibleDedicatedHardwareTaskOrder
 } from "./dedicated-hardware-app.js";
+import { useDedicatedHardwareCollaborationCatalog,
+  type DedicatedHardwareCollaborationSource } from "./dedicated-hardware-collaboration.js";
 import {
   prefetchWorktreeRemovalPreflight,
   summarizeWorktreeRemovalPreflights,
@@ -816,6 +818,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
         connectionGeneration: state.snapshot.generation,
         snapshotRevision: state.snapshot.revision,
         sessions: state.ready && state.connectionState === "connected" ? state.snapshot.sessions : [],
+        interactions: state.ready && state.connectionState === "connected" ? state.snapshot.interactions : [],
         sidebarSessionIds: dedicatedHardwareSidebarOrder,
         ...(activeSession === undefined ? {} : { viewedSessionId: activeSession.id })
       });
@@ -832,9 +835,18 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
     state.ready,
     state.snapshot.generation,
     state.snapshot.revision,
-    state.snapshot.sessions
+    state.snapshot.sessions,
+    state.snapshot.interactions
   ]);
-  useDedicatedHardwareTaskCatalogPublisher(dedicatedHardwareBridge, dedicatedHardwareTaskCatalog);
+  const dedicatedHardwareControllerRef = useRef(controller);
+  dedicatedHardwareControllerRef.current = controller;
+  const dedicatedHardwareCollaborationSource = useMemo<DedicatedHardwareCollaborationSource>(() => ({
+    get state() { return dedicatedHardwareControllerRef.current.state; },
+    listCollaborationGoals: (...parameters) => dedicatedHardwareControllerRef.current.listCollaborationGoals(...parameters),
+    getCollaborationGoal: (...parameters) => dedicatedHardwareControllerRef.current.getCollaborationGoal(...parameters)
+  }), [state.activeProfile?.id, state.activeProfile?.serverId, state.connectionGeneration, state.snapshot.generation]);
+  const dedicatedHardwareActivityCatalog = useDedicatedHardwareCollaborationCatalog(dedicatedHardwareCollaborationSource, dedicatedHardwareTaskCatalog);
+  useDedicatedHardwareTaskCatalogPublisher(dedicatedHardwareBridge, dedicatedHardwareActivityCatalog);
   useEffect(() => {
     setSessionProjectOverrides((current) => reconcileSessionProjectOverrides(current, state.snapshot.sessions));
   }, [state.snapshot.sessions]);

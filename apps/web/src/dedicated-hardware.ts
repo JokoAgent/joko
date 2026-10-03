@@ -141,6 +141,11 @@ export interface DedicatedHardwareSkillOption {
   readonly name: string;
 }
 
+export interface DedicatedHardwareTaskActivity {
+  readonly phase: "running" | "needs-interaction" | "completed" | "error" | null;
+  readonly attention: boolean;
+}
+
 export interface DedicatedHardwarePublishedTask {
   readonly sessionId: string;
   readonly sessionGeneration: string;
@@ -151,6 +156,7 @@ export interface DedicatedHardwarePublishedTask {
   readonly sidebarOrder: number | null;
   readonly catalogEligible: boolean;
   readonly priorityRank: number | null;
+  readonly activity: DedicatedHardwareTaskActivity;
 }
 
 export interface DedicatedHardwareTaskCatalog {
@@ -384,17 +390,21 @@ export function parseDedicatedHardwareTaskCatalog(value: unknown): DedicatedHard
   const seen = new Set<string>();
   const tasks: DedicatedHardwarePublishedTask[] = [];
   for (const raw of value.tasks) {
-    if (!isRecordWithExactKeys(raw, ["sessionId", "sessionGeneration", "targetId", "title", "pinned", "userSendAt", "sidebarOrder", "catalogEligible", "priorityRank"])
+    if (!isRecordWithExactKeys(raw, ["sessionId", "sessionGeneration", "targetId", "title", "pinned", "userSendAt", "sidebarOrder", "catalogEligible", "priorityRank", "activity"])
       || !isActionIdentity(raw.sessionId, 512) || seen.has(raw.sessionId)
       || !isDecimalGeneration(raw.sessionGeneration) || !isActionIdentity(raw.targetId, 512)
       || !(raw.title === null || isTaskCatalogTitle(raw.title)) || typeof raw.pinned !== "boolean"
       || !(raw.userSendAt === null || typeof raw.userSendAt === "number" && Number.isSafeInteger(raw.userSendAt) && raw.userSendAt >= 0)
-      || !isNullableIndex(raw.sidebarOrder) || typeof raw.catalogEligible !== "boolean" || !isNullableIndex(raw.priorityRank)) return undefined;
+      || !isNullableIndex(raw.sidebarOrder) || typeof raw.catalogEligible !== "boolean" || !isNullableIndex(raw.priorityRank)
+      || !isRecordWithExactKeys(raw.activity, ["phase", "attention"])
+      || !(raw.activity.phase === null || raw.activity.phase === "running" || raw.activity.phase === "needs-interaction"
+        || raw.activity.phase === "completed" || raw.activity.phase === "error") || typeof raw.activity.attention !== "boolean") return undefined;
     seen.add(raw.sessionId);
     tasks.push({
       sessionId: raw.sessionId, sessionGeneration: raw.sessionGeneration, targetId: raw.targetId,
       title: raw.title, pinned: raw.pinned, userSendAt: raw.userSendAt, sidebarOrder: raw.sidebarOrder,
-      catalogEligible: raw.catalogEligible, priorityRank: raw.priorityRank
+      catalogEligible: raw.catalogEligible, priorityRank: raw.priorityRank,
+      activity: { phase: raw.activity.phase, attention: raw.activity.attention }
     });
   }
   return {

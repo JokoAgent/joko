@@ -80,6 +80,8 @@ async function stageAdapter(): Promise<Readonly<{ root: string; lock: DedicatedH
         "  };",
         "  constructor(comm, logger) {}",
         "  async getDeviceStatus() { return { ok: true, value: { firmwareVersion: '1.2.3', batteryPercentage: 71, isCharging: false, profileIndex: 0, layerIndex: 1 } }; }",
+        "  async sendLightingConfig(config) { return { ok: true, value: null }; }",
+        "  async sendThreadsLighting(threads) { return { ok: true, value: null }; }",
         "  onHidReceived(listener) { return () => {}; }",
         "  onJoystickMove(listener) { return () => {}; }",
         "}",

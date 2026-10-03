@@ -116,10 +116,17 @@ describe("dedicated hardware utility request handler", () => {
     expect(messages.at(-2)).toEqual({ version: 1, generation: 1, requestId: "g1:2", kind: "ack" });
     expect(messages.at(-1)).toEqual(expect.objectContaining({ status: "unavailable", reason: "sdk-unavailable" }));
 
+    const beforeLighting = messages.length;
     await expect(handler.handle({
-      version: 1, generation: 1, requestId: "g1:3", kind: "shutdown"
+      version: 1, generation: 1, requestId: "g1:3", kind: "set-lighting-state", model: "codex-micro",
+      state: { version: 1, taskSlots: [null, null, null, null, null, null], revealOccurrence: "0", primaryVisible: false }
+    })).resolves.toBe("continue");
+    expect(messages.slice(beforeLighting)).toEqual([{ version: 1, generation: 1, requestId: "g1:3", kind: "ack" }]);
+
+    await expect(handler.handle({
+      version: 1, generation: 1, requestId: "g1:4", kind: "shutdown"
     })).resolves.toBe("stopped");
-    expect(messages.at(-1)).toEqual({ version: 1, generation: 1, requestId: "g1:3", kind: "stopped" });
+    expect(messages.at(-1)).toEqual({ version: 1, generation: 1, requestId: "g1:4", kind: "stopped" });
   });
 
   it("accepts a locked staged adapter and assigns monotonic input sequences", async () => {
@@ -127,6 +134,7 @@ describe("dedicated hardware utility request handler", () => {
     let sink: DedicatedHardwareUtilityAdapterSink | undefined;
     const adapter: DedicatedHardwareUtilityAdapter = {
       creatorKeymap: creatorKeymap(),
+      setLightingState: vi.fn(() => new Promise<void>(() => undefined)),
       setDesiredState: vi.fn(async (model) => connected(model)),
       probe: vi.fn(async (model) => connected(model)),
       stop: vi.fn(async () => undefined)
@@ -151,6 +159,18 @@ describe("dedicated hardware utility request handler", () => {
     ]));
     expect(messages.at(-1)).toEqual({ version: 1, generation: 2, requestId: "g2:2", kind: "ack" });
 
+    const lighting = {
+      version: 1, taskSlots: [{ phase: "running", attention: false }, null, null, null, null, null],
+      revealOccurrence: "0", primaryVisible: false
+    } as const;
+    const writes = vi.mocked(adapter.creatorKeymap.writeCurrent).mock.calls.length;
+    await expect(handler.handle({
+      version: 1, generation: 2, requestId: "g2:3", kind: "set-lighting-state", model: "creator-micro-2", state: lighting
+    })).resolves.toBe("continue");
+    expect(adapter.setLightingState).toHaveBeenCalledWith("creator-micro-2", lighting);
+    expect(adapter.creatorKeymap.writeCurrent).toHaveBeenCalledTimes(writes);
+    expect(messages.at(-1)).toEqual({ version: 1, generation: 2, requestId: "g2:3", kind: "ack" });
+
     sink!.publishInput("creator-micro-2", { kind: "key", key: "AG00", pressed: true });
     sink!.publishInput("creator-micro-2", { kind: "key", key: "AG00", pressed: false });
     expect(messages.slice(-2)).toEqual([
@@ -173,9 +193,9 @@ describe("dedicated hardware utility request handler", () => {
     sink!.publishInput("creator-micro-2", { kind: "key", key: "AG01", pressed: true });
     expect(messages.filter((message) => (message as { kind?: string }).kind === "input")).toHaveLength(inputCount);
 
-    await handler.handle({ version: 1, generation: 2, requestId: "g2:3", kind: "probe", model: "creator-micro-2" });
+    await handler.handle({ version: 1, generation: 2, requestId: "g2:4", kind: "probe", model: "creator-micro-2" });
     expect(adapter.probe).toHaveBeenCalledWith("creator-micro-2");
-    await expect(handler.handle({ version: 1, generation: 2, requestId: "g2:4", kind: "shutdown" })).resolves.toBe("stopped");
+    await expect(handler.handle({ version: 1, generation: 2, requestId: "g2:5", kind: "shutdown" })).resolves.toBe("stopped");
     expect(adapter.stop).toHaveBeenCalledOnce();
   });
 
@@ -189,6 +209,7 @@ describe("dedicated hardware utility request handler", () => {
         sink.publishInput("codex-micro", { kind: "key", key: "AG00", pressed: true });
         return {
           creatorKeymap: creatorKeymap(),
+          setLightingState: vi.fn(),
           setDesiredState: async (model) => connected(model),
           probe: async (model) => connected(model),
           stop: async () => undefined
@@ -264,6 +285,7 @@ describe("dedicated hardware utility request handler", () => {
     };
     const adapter: DedicatedHardwareUtilityAdapter = {
       creatorKeymap: keymap,
+      setLightingState: vi.fn(),
       setDesiredState: vi.fn(async () => connecting),
       probe: vi.fn(async () => connected("creator-micro-2")),
       stop: vi.fn(async () => undefined)
@@ -312,6 +334,7 @@ describe("dedicated hardware utility request handler", () => {
     });
     const adapter: DedicatedHardwareUtilityAdapter = {
       creatorKeymap: keymap,
+      setLightingState: vi.fn(),
       setDesiredState: vi.fn(async () => connected("creator-micro-2")),
       probe: vi.fn(async () => connected("creator-micro-2")),
       stop: vi.fn(async () => undefined)
@@ -366,6 +389,7 @@ describe("dedicated hardware utility request handler", () => {
     };
     const adapter: DedicatedHardwareUtilityAdapter = {
       creatorKeymap: keymap,
+      setLightingState: vi.fn(),
       setDesiredState: vi.fn(async (_model, desired) =>
         desired.settings.enabled ? connected("creator-micro-2") : disabled),
       probe: vi.fn(async () => connected("creator-micro-2")),
@@ -415,6 +439,7 @@ describe("dedicated hardware utility request handler", () => {
     const keymap = creatorKeymap();
     const adapter: DedicatedHardwareUtilityAdapter = {
       creatorKeymap: keymap,
+      setLightingState: vi.fn(),
       setDesiredState: vi.fn(async () => connected("creator-micro-2")),
       probe: vi.fn(async () => connected("creator-micro-2")),
       stop: vi.fn(async () => undefined)
@@ -476,6 +501,7 @@ describe("dedicated hardware utility request handler", () => {
     };
     const adapter: DedicatedHardwareUtilityAdapter = {
       creatorKeymap: keymap,
+      setLightingState: vi.fn(),
       setDesiredState: vi.fn(async (_model, desired) =>
         desired.settings.enabled ? connected("creator-micro-2") : disabled),
       probe: vi.fn(async () => connected("creator-micro-2")),
@@ -524,6 +550,7 @@ describe("dedicated hardware utility request handler", () => {
     vi.mocked(keymap.buildManaged).mockImplementation(() => { throw new Error("transform failed"); });
     const adapter: DedicatedHardwareUtilityAdapter = {
       creatorKeymap: keymap,
+      setLightingState: vi.fn(),
       setDesiredState: vi.fn(async (_model, desired) => {
         if (!desired.settings.enabled) throw new Error("disable not confirmed");
         return connected("creator-micro-2");

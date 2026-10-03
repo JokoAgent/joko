@@ -9,6 +9,7 @@ import {
   type DedicatedHardwarePhysicalKey,
   type DedicatedHardwareSettings
 } from "./settings.js";
+import type { DedicatedHardwareLightingActivity } from "./lighting-frame.js";
 
 export const DEDICATED_HARDWARE_UTILITY_PROTOCOL_VERSION = 1;
 export const DEDICATED_HARDWARE_UTILITY_REQUEST_MAX_BYTES = 72 * 1024;
@@ -73,6 +74,20 @@ export interface DedicatedHardwareDesiredState {
   readonly preview: boolean;
 }
 
+export interface DedicatedHardwareLightingState {
+  readonly version: 1;
+  readonly taskSlots: readonly [
+    DedicatedHardwareLightingActivity | null,
+    DedicatedHardwareLightingActivity | null,
+    DedicatedHardwareLightingActivity | null,
+    DedicatedHardwareLightingActivity | null,
+    DedicatedHardwareLightingActivity | null,
+    DedicatedHardwareLightingActivity | null
+  ];
+  readonly revealOccurrence: string;
+  readonly primaryVisible: boolean;
+}
+
 export const DEDICATED_HARDWARE_SDK_PLATFORMS = ["win32", "darwin", "linux"] as const;
 export type DedicatedHardwareSdkPlatform = (typeof DEDICATED_HARDWARE_SDK_PLATFORMS)[number];
 export const DEDICATED_HARDWARE_SDK_ARCHITECTURES = ["x64", "arm64"] as const;
@@ -135,6 +150,14 @@ export type DedicatedHardwareUtilityRequest =
       readonly model: DedicatedHardwareModelId;
       readonly settings: DedicatedHardwareSettings;
       readonly preview: boolean;
+    }
+  | {
+      readonly version: 1;
+      readonly generation: number;
+      readonly requestId: string;
+      readonly kind: "set-lighting-state";
+      readonly model: DedicatedHardwareModelId;
+      readonly state: DedicatedHardwareLightingState;
     }
   | {
       readonly version: 1;
@@ -226,6 +249,16 @@ export function parseDedicatedHardwareUtilityRequest(value: unknown): DedicatedH
         kind: "set-desired-state", model: value.model, settings, preview: value.preview
       };
     }
+  } else if (value.kind === "set-lighting-state" &&
+      hasExactKeys(value, ["version", "generation", "requestId", "kind", "model", "state"]) &&
+      isOption(value.model, DEDICATED_HARDWARE_MODEL_IDS)) {
+    const state = parseDedicatedHardwareLightingState(value.state);
+    if (state !== undefined) {
+      parsed = {
+        version: 1, generation: value.generation, requestId: value.requestId,
+        kind: "set-lighting-state", model: value.model, state
+      };
+    }
   } else if (value.kind === "probe" &&
       hasExactKeys(value, ["version", "generation", "requestId", "kind", "model"]) &&
       isOption(value.model, DEDICATED_HARDWARE_MODEL_IDS)) {
@@ -290,6 +323,31 @@ export function encodeDedicatedHardwareUtilityMessage(message: DedicatedHardware
   const parsed = parseDedicatedHardwareUtilityMessage(message);
   if (parsed === undefined) throw new TypeError("Invalid dedicated hardware utility message.");
   return JSON.stringify(parsed);
+}
+
+export function parseDedicatedHardwareLightingState(value: unknown): DedicatedHardwareLightingState | undefined {
+  if (!hasExactKeys(value, ["version", "taskSlots", "revealOccurrence", "primaryVisible"]) || value.version !== 1 ||
+      !Array.isArray(value.taskSlots) || value.taskSlots.length !== 6 ||
+      typeof value.revealOccurrence !== "string" || !/^(?:0|[1-9][0-9]{0,63})$/u.test(value.revealOccurrence) ||
+      typeof value.primaryVisible !== "boolean") return undefined;
+  const taskSlots: Array<DedicatedHardwareLightingActivity | null> = [];
+  for (const activity of value.taskSlots) {
+    if (activity === null) {
+      taskSlots.push(null);
+    } else if (hasExactKeys(activity, ["phase", "attention"]) &&
+        (activity.phase === null || isOption(activity.phase, ["running", "needs-interaction", "completed", "error"])) &&
+        typeof activity.attention === "boolean") {
+      taskSlots.push({ phase: activity.phase, attention: activity.attention });
+    } else {
+      return undefined;
+    }
+  }
+  return {
+    version: 1,
+    taskSlots: taskSlots as unknown as DedicatedHardwareLightingState["taskSlots"],
+    revealOccurrence: value.revealOccurrence,
+    primaryVisible: value.primaryVisible
+  };
 }
 
 function parseConnectionSnapshot(value: Record<string, unknown>): DedicatedHardwareConnectionSnapshot | undefined {

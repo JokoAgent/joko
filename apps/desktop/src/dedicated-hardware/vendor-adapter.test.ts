@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { createDedicatedHardwareSdkManifestIntegrity } from "../dedicated-hardware-sdk.js";
 import type {
@@ -9,6 +9,7 @@ import type { DedicatedHardwareModelId } from "./settings.js";
 import { createDefaultDedicatedHardwareSettings } from "./settings.js";
 import type {
   DedicatedHardwareSdkIdentity,
+  DedicatedHardwareLightingState,
   DedicatedHardwareUtilityMessage
 } from "./protocol.js";
 import {
@@ -61,7 +62,7 @@ function desired(model: DedicatedHardwareModelId, enabled = true) {
     settings: {
       ...defaults,
       enabled,
-      layout: { ...defaults.layout, taskKeys: ["AG03", "ACT10"] as const }
+      layout: model === CREATOR ? { ...defaults.layout, taskKeys: ["AG03", "ACT10"] as const } : defaults.layout
     },
     preview: false
   };
@@ -73,6 +74,7 @@ function sdkFixture(options: { synchronousNotification?: boolean } = {}) {
   let deviceStatus: unknown = status();
   let writeResult: unknown = { ok: true, value: null };
   let readResult: unknown | undefined;
+  let lightingResult: unknown = { ok: true, value: null };
   let connectResult = true;
   let serialNumber: string | undefined = "controlled-device-a";
   const devices = { [CODEX]: "codex", [CREATOR]: "creator" } as const;
@@ -117,6 +119,14 @@ function sdkFixture(options: { synchronousNotification?: boolean } = {}) {
       order.push("read-status");
       return deviceStatus;
     });
+    readonly sendLightingConfig = vi.fn(async (_config: unknown) => {
+      order.push("lighting-config");
+      return lightingResult;
+    });
+    readonly sendThreadsLighting = vi.fn(async (_threads: unknown) => {
+      order.push("lighting-threads");
+      return { ok: true, value: null };
+    });
     constructor(readonly comm: Comm) { apis.push(this); }
     onHidReceived(listener: (event: unknown) => void) {
       this.hidListeners.push(listener);
@@ -147,6 +157,7 @@ function sdkFixture(options: { synchronousNotification?: boolean } = {}) {
     setStatus: (value: unknown) => { deviceStatus = value; },
     setWriteResult: (value: unknown) => { writeResult = value; },
     setReadResult: (value: unknown) => { readResult = value; },
+    setLightingResult: (value: unknown) => { lightingResult = value; },
     setConnectResult: (value: boolean) => { connectResult = value; },
     setSerialNumber: (value: string | undefined) => { serialNumber = value; }
   };
@@ -154,6 +165,17 @@ function sdkFixture(options: { synchronousNotification?: boolean } = {}) {
 
 function sinkFixture() {
   return { publishState: vi.fn(), publishInput: vi.fn() } satisfies DedicatedHardwareUtilityAdapterSink;
+}
+
+function lightingState(phase: "running" | "completed" = "running"): DedicatedHardwareLightingState {
+  return {
+    version: 1, taskSlots: [{ phase, attention: false }, null, null, null, null, null],
+    revealOccurrence: "0", primaryVisible: false
+  };
+}
+
+async function settleLighting(): Promise<void> {
+  for (let index = 0; index < 20; index += 1) await Promise.resolve();
 }
 
 function backupFixture(order: string[]) {
@@ -200,6 +222,100 @@ function stagedIdentity(): Extract<DedicatedHardwareSdkIdentity, { kind: "staged
 }
 
 describe("dedicated hardware vendor adapter", () => {
+  afterEach(() => vi.useRealTimers());
+
+  it("spends a bounded stop budget waiting for the real lighting RPC and disconnects without racing an off write", async () => {
+    vi.useFakeTimers();
+    const fixture = sdkFixture();
+    let release!: (value: unknown) => void;
+    fixture.setLightingResult(new Promise((resolve) => { release = resolve; }));
+    const adapter = createDedicatedHardwareVendorAdapter({ sdk: fixture.sdk, sink: sinkFixture(), platform: "win32" });
+    adapter.setLightingState(CODEX, lightingState());
+    await adapter.setDesiredState(CODEX, desired(CODEX));
+    const api = fixture.apis[0]!;
+    expect(api.sendLightingConfig).toHaveBeenCalledOnce();
+    const stopped = adapter.stop().catch((error: unknown) => error);
+    await vi.advanceTimersByTimeAsync(499);
+    expect(fixture.comms[0]!.disconnect).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(await stopped).toBeInstanceOf(Error);
+    expect(fixture.comms[0]!.disconnect).toHaveBeenCalledOnce();
+    expect(api.sendLightingConfig).toHaveBeenCalledOnce();
+    expect(api.sendThreadsLighting).not.toHaveBeenCalled();
+    release({ ok: true, value: null });
+    await settleLighting();
+    expect(api.sendThreadsLighting).not.toHaveBeenCalled();
+  });
+
+  it("caches lighting without connecting and fences the second shared-API write after disable while retaining HID on RPC failure", async () => {
+    const fixture = sdkFixture();
+    const sink = sinkFixture();
+    let release!: (value: unknown) => void;
+    fixture.setLightingResult(new Promise((resolve) => { release = resolve; }));
+    const adapter = createDedicatedHardwareVendorAdapter({ sdk: fixture.sdk, sink, platform: "win32" });
+    try {
+      adapter.setLightingState(CODEX, lightingState());
+      expect(fixture.comms).toHaveLength(0);
+      await adapter.setDesiredState(CODEX, desired(CODEX));
+      const api = fixture.apis[0]!;
+      expect(fixture.apis).toHaveLength(1);
+      expect(api.sendLightingConfig).toHaveBeenCalledOnce();
+      expect(api.sendThreadsLighting).not.toHaveBeenCalled();
+      const disable = adapter.setDesiredState(CODEX, desired(CODEX, false));
+      release({ ok: true, value: null });
+      expect((await disable).status).toBe("disabled");
+      await settleLighting();
+      expect(api.sendThreadsLighting).toHaveBeenCalledOnce();
+      expect(api.sendLightingConfig.mock.lastCall).toEqual([expect.objectContaining({
+        ambient: expect.objectContaining({ brightness: 0 }), keys: expect.objectContaining({ brightness: 0 })
+      })]);
+      expect(fixture.comms[0]!.disconnect).not.toHaveBeenCalled();
+
+      fixture.setLightingResult({ ok: false, value: null });
+      await adapter.setDesiredState(CODEX, desired(CODEX));
+      await settleLighting();
+      expect(api.sendLightingConfig).toHaveBeenCalledTimes(3);
+      expect(api.sendThreadsLighting).toHaveBeenCalledOnce();
+      await settleLighting();
+      expect(api.sendLightingConfig).toHaveBeenCalledTimes(3);
+      api.emitHid({ key: "AG00", act: 1 });
+      expect(sink.publishInput).toHaveBeenLastCalledWith(CODEX, { kind: "key", key: "AG00", pressed: true });
+    } finally {
+      fixture.setLightingResult({ ok: true, value: null });
+      await adapter.stop();
+    }
+  });
+
+  it("records disabled off timeout while retaining the maintenance connection and fencing the unfinished off before re-enable", async () => {
+    vi.useFakeTimers();
+    const fixture = sdkFixture();
+    const sink = sinkFixture();
+    const adapter = createDedicatedHardwareVendorAdapter({ sdk: fixture.sdk, sink, platform: "win32" });
+    adapter.setLightingState(CODEX, lightingState());
+    await adapter.setDesiredState(CODEX, desired(CODEX));
+    await settleLighting();
+    const api = fixture.apis[0]!;
+    let release!: (value: unknown) => void;
+    fixture.setLightingResult(new Promise((resolve) => { release = resolve; }));
+    const disable = adapter.setDesiredState(CODEX, desired(CODEX, false));
+    await vi.advanceTimersByTimeAsync(500);
+    expect(await disable).toMatchObject({ status: "error", reason: "connection-timeout" });
+    expect(fixture.comms[0]!.disconnect).not.toHaveBeenCalled();
+    api.emitHid({ key: "AG00", act: 1 });
+    expect(sink.publishInput).not.toHaveBeenCalled();
+    expect(api.sendLightingConfig).toHaveBeenCalledTimes(2);
+    await adapter.setDesiredState(CODEX, desired(CODEX));
+    await settleLighting();
+    expect(api.sendLightingConfig).toHaveBeenCalledTimes(2);
+    fixture.setLightingResult({ ok: true, value: null });
+    release({ ok: true, value: null });
+    await settleLighting();
+    adapter.setLightingState(CODEX, lightingState("completed"));
+    await settleLighting();
+    expect(api.sendLightingConfig).toHaveBeenCalledTimes(3);
+    await adapter.stop();
+  });
+
   it("requires the declared raw namespace and fences construction, retired, disabled, and stopped callbacks", async () => {
     const fixture = sdkFixture({ synchronousNotification: true });
     const sink = sinkFixture();
@@ -330,18 +446,36 @@ describe("dedicated hardware vendor adapter", () => {
       version: 1, generation: 1, requestId: "g1:1", kind: "handshake", sdk: stagedIdentity(),
       keymapBackupDirectory: process.platform === "win32" ? "D:\\Joko\\controlled-keymap" : "/tmp/joko-controlled-keymap"
     });
+    await handler.handle({
+      version: 1, generation: 1, requestId: "g1:2", kind: "set-lighting-state", model: CREATOR, state: lightingState()
+    });
+    expect(messages.at(-1)).toMatchObject({ kind: "ack", requestId: "g1:2" });
+    expect(fixture.comms).toHaveLength(0);
     const enabled = desired(CREATOR);
     const occupy = handler.handle({
-      version: 1, generation: 1, requestId: "g1:2", kind: "set-desired-state", model: CREATOR, ...enabled
+      version: 1, generation: 1, requestId: "g1:3", kind: "set-desired-state", model: CREATOR, ...enabled
     });
     await settleStarted;
     const api = fixture.apis.at(-1)!;
+    expect(api.sendLightingConfig).not.toHaveBeenCalled();
     api.emitHid({ key: "AG00", act: 1 });
     expect(messages.filter((message) => message.kind === "input")).toHaveLength(0);
     expect([...backup.sessions.values()][0]?.contents).toBe(ORIGINAL);
     expect(fixture.order.indexOf("save-backup")).toBeLessThan(fixture.order.indexOf("write-managed"));
     releaseSettle();
     await occupy;
+    await settleLighting();
+    expect(api.sendLightingConfig).toHaveBeenCalledOnce();
+    expect(api.sendThreadsLighting).toHaveBeenCalledOnce();
+    const writes = api.api.writeFile.mock.calls.length;
+    let releaseLighting!: (value: unknown) => void;
+    fixture.setLightingResult(new Promise((resolve) => { releaseLighting = resolve; }));
+    await handler.handle({
+      version: 1, generation: 1, requestId: "g1:4", kind: "set-lighting-state", model: CREATOR,
+      state: lightingState("completed")
+    });
+    expect(messages.at(-1)).toMatchObject({ kind: "ack", requestId: "g1:4" });
+    expect(api.api.writeFile).toHaveBeenCalledTimes(writes);
     const source = JSON.parse(ORIGINAL) as { profiles: Array<{ layers: unknown[] }>; metadata: unknown };
     const next = JSON.parse(fixture.current()) as typeof source;
     expect(next.profiles[0]).toEqual(source.profiles[0]);
@@ -359,24 +493,40 @@ describe("dedicated hardware vendor adapter", () => {
       expect.objectContaining({ model: CREATOR, sequence: 1, input: { kind: "key", key: "AG03", pressed: false } })
     ]);
     await handler.handle({
-      version: 1, generation: 1, requestId: "g1:3", kind: "set-desired-state", model: CREATOR, ...desired(CREATOR, false)
+      version: 1, generation: 1, requestId: "g1:5", kind: "set-desired-state", model: CODEX, ...desired(CODEX)
     });
+    const codexApi = fixture.apis.find((candidate) => candidate.comm.model === CODEX)!;
+    const disable = handler.handle({
+      version: 1, generation: 1, requestId: "g1:6", kind: "set-desired-state", model: CREATOR, ...desired(CREATOR, false)
+    });
+    await settleLighting();
+    expect(api.api.writeFile).toHaveBeenCalledTimes(writes);
+    fixture.setLightingResult({ ok: true, value: null });
+    releaseLighting({ ok: true, value: null });
+    await disable;
     expect(fixture.current()).toBe(ORIGINAL);
     expect(backup.sessions.size).toBe(0);
     const restoredAt = fixture.order.indexOf("write-original");
     const restoreConfirmation = fixture.order.indexOf("read-keymap", restoredAt + 1);
     expect(restoreConfirmation).toBeGreaterThan(restoredAt);
     expect(fixture.order.indexOf("clear-backup")).toBeGreaterThan(restoreConfirmation);
+    expect(api.sendLightingConfig.mock.lastCall).toEqual([expect.objectContaining({
+      ambient: expect.objectContaining({ brightness: 0 }), keys: expect.objectContaining({ brightness: 0 })
+    })]);
+    expect(fixture.order.lastIndexOf("lighting-config")).toBeGreaterThan(fixture.order.indexOf("clear-backup"));
+    expect(fixture.comms.every((comm) => comm.disconnect.mock.calls.length === 0)).toBe(true);
     expect(messages).toContainEqual(expect.objectContaining({
       kind: "state", model: CREATOR, status: "disabled",
       keymap: { phase: "idle", backupAvailable: false, failure: null }
     }));
     api.emitHid({ key: "AG00", act: 1 });
     expect(messages.filter((message) => message.kind === "input")).toHaveLength(2);
-    await expect(handler.handle({ version: 1, generation: 1, requestId: "g1:4", kind: "shutdown" }))
+    codexApi.emitHid({ key: "AG00", act: 1 });
+    expect(messages.at(-1)).toMatchObject({ kind: "input", model: CODEX, input: { pressed: true } });
+    await expect(handler.handle({ version: 1, generation: 1, requestId: "g1:7", kind: "shutdown" }))
       .resolves.toBe("stopped");
     expect(fixture.order.lastIndexOf("disconnect")).toBeGreaterThan(fixture.order.indexOf("clear-backup"));
     api.emitHid({ key: "AG01", act: 1 });
-    expect(messages.filter((message) => message.kind === "input")).toHaveLength(2);
+    expect(messages.filter((message) => message.kind === "input")).toHaveLength(3);
   });
 });

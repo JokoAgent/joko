@@ -703,7 +703,7 @@ const desktopApi = Object.freeze({
     setDedicatedHardwarePreview: (model: string, enabled: boolean): Promise<void> =>
       ipcRenderer.invoke(DESKTOP_CHANNELS.dedicatedHardwareSetPreview, { model, enabled }).then(() => undefined),
     publishDedicatedHardwareTasks: (catalog: unknown): Promise<void> =>
-      ipcRenderer.invoke(DESKTOP_CHANNELS.dedicatedHardwarePublishTasks, catalog).then(() => undefined),
+      ipcRenderer.invoke(DESKTOP_CHANNELS.dedicatedHardwarePublishTasks, mainDocumentOccurrence, catalog).then(() => undefined),
     acknowledgeDedicatedHardwareTaskFocus: (acknowledgement: unknown): Promise<boolean> =>
       ipcRenderer.invoke(DESKTOP_CHANNELS.dedicatedHardwareAcknowledgeTaskFocus, acknowledgement).then(parseDesktopBoolean),
     openDedicatedHardwareInputSettings: (): Promise<boolean> =>

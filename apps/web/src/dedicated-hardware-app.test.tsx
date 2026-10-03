@@ -8,9 +8,10 @@ import {
   useDedicatedHardwareTaskCatalogPublisher,
   type DedicatedHardwareRendererHandlers
 } from "./dedicated-hardware-app.js";
-import type { DedicatedHardwareBridge, DedicatedHardwareTaskCatalog } from "./dedicated-hardware.js";
+import { createDefaultDedicatedHardwareSettings, DEDICATED_HARDWARE_MODELS,
+  type DedicatedHardwareBridge, type DedicatedHardwareTaskCatalog } from "./dedicated-hardware.js";
 import { useAppInputCommandOwner, useAppInputComposerOwner, useAppInputTimelineOwner } from "./app-input-owners.js";
-import type { SessionView } from "./model.js";
+import type { InteractionView, SessionView } from "./model.js";
 
 const roots: Root[] = [];
 
@@ -346,6 +347,7 @@ describe("dedicated hardware task catalog", () => {
       connectionGeneration: 9n,
       snapshotRevision: 12n,
       sessions,
+      interactions: [],
       sidebarSessionIds: [sessions[2]!.id, sessions[0]!.id],
       viewedSessionId: sessions[0]!.id
     });
@@ -366,6 +368,32 @@ describe("dedicated hardware task catalog", () => {
     expect(catalog.snapshotRevision).toBe("12");
   });
 
+  it("projects only current session state, exact generation interaction, and durable unread attention", () => {
+    const waiting = { ...session(0), id: "waiting", state: "waiting" as const };
+    const stale = { ...session(1), id: "stale" };
+    const current = { ...session(2), id: "current" };
+    const done = { ...session(3), id: "done", state: "idle" as const,
+      attention: { kind: "done" as const, unread: true, subjectCursor: { opaqueToken: "subject", sequence: 1n, generation: 1n },
+        attentionCursor: { opaqueToken: "attention", sequence: 2n, generation: 1n },
+        readThroughCursor: { opaqueToken: "read", sequence: 0n, generation: 1n }, updatedAt: 4 } };
+    const error = { ...session(4), id: "error", state: "error" as const };
+    const archived = { ...session(5), id: "archived", archived: true, state: "running" as const };
+    const projection = createDedicatedHardwareTaskCatalog({
+      profileId: "profile", serverId: "server", connectionGeneration: 1n, snapshotRevision: 1n,
+      sessions: [waiting, stale, current, done, error, archived], sidebarSessionIds: [],
+      interactions: [interaction(stale.id, 99n), interaction(current.id, current.generation)]
+    });
+    const activity = Object.fromEntries(projection.tasks.map((task) => [task.sessionId, task.activity]));
+    expect(activity).toEqual({
+      waiting: { phase: "running", attention: false },
+      stale: { phase: null, attention: false },
+      current: { phase: "needs-interaction", attention: false },
+      done: { phase: "completed", attention: true },
+      error: { phase: "error", attention: false },
+      archived: { phase: null, attention: false }
+    });
+  });
+
   it("debounces publication and clears the previous owner on switch and unmount", async () => {
     vi.useFakeTimers();
     const publish = vi.fn(async () => undefined);
@@ -383,6 +411,32 @@ describe("dedicated hardware task catalog", () => {
     await act(async () => root.unmount());
     roots.splice(roots.indexOf(root), 1);
     expect(publish).toHaveBeenLastCalledWith({ ...second, tasks: [] });
+  });
+
+  it("replays the current catalog after a valid controller state broadcast and stops on page retirement", async () => {
+    vi.useFakeTimers();
+    const publish = vi.fn<DedicatedHardwareBridge["publishDedicatedHardwareTasks"]>(async () => undefined);
+    let stateChanged: ((value: unknown) => void) | undefined;
+    const bridge = { ...bridgeWith(publish), onDedicatedHardwareStateChanged: (listener: (value: unknown) => void) => {
+      stateChanged = listener; return () => { stateChanged = undefined; };
+    } };
+    const source = catalog("profile", "server", "task");
+    await mount(<Publisher bridge={bridge} catalog={source} />);
+    await act(async () => { await vi.advanceTimersByTimeAsync(80); });
+    expect(publish).toHaveBeenCalledTimes(1);
+    const snapshot = { version: 1, models: Object.fromEntries(DEDICATED_HARDWARE_MODELS.map((model) => [model, {
+      model, status: "disabled", reason: null, devicePresent: null, transport: null, firmwareVersion: null,
+      batteryPercent: null, charging: null, inputPermission: "unknown", settingsError: null,
+      keymap: model === "creator-micro-2" ? { phase: "idle", backupAvailable: false, failure: null } : null,
+      settings: createDefaultDedicatedHardwareSettings(model),
+      taskSlots: Array.from({ length: 6 }, (_, slot) => ({ slot, sessionId: null, title: null }))
+    }])) };
+    await act(async () => { stateChanged?.(snapshot); stateChanged?.(snapshot); await vi.advanceTimersByTimeAsync(80); });
+    expect(publish).toHaveBeenCalledTimes(2);
+    expect(publish).toHaveBeenLastCalledWith(source);
+    await act(async () => { window.dispatchEvent(new Event("pagehide")); stateChanged?.(snapshot); await vi.advanceTimersByTimeAsync(80); });
+    expect(publish).toHaveBeenLastCalledWith({ ...source, tasks: [] });
+    expect(publish.mock.calls.filter(([value]) => value.tasks.length > 0)).toHaveLength(2);
   });
 });
 
@@ -429,9 +483,15 @@ function catalog(profileId: string, serverId: string, sessionId: string): Dedica
       userSendAt: 1,
       sidebarOrder: 0,
       catalogEligible: true,
-      priorityRank: 1
+      priorityRank: 1,
+      activity: { phase: "running", attention: false }
     }]
   };
+}
+
+function interaction(sessionId: string, generation: bigint): InteractionView {
+  return { id: `interaction-${sessionId}`, sessionId, generation, kind: "question", title: "Question", message: "",
+    options: [], fields: [], planSteps: [], createdAt: 0 };
 }
 
 function bridgeWith(publishDedicatedHardwareTasks: DedicatedHardwareBridge["publishDedicatedHardwareTasks"]): DedicatedHardwareBridge {

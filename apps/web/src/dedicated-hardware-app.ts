@@ -3,15 +3,17 @@ import { isStartupUpdateInteractionBlocked } from "./startup-update-interaction.
 import {
   isDedicatedHardwareVoiceRoutedEvent,
   parseDedicatedHardwareActionDelivery,
+  parseDedicatedHardwareSnapshot,
   parseDedicatedHardwareTaskCatalog,
   type DedicatedHardwareBridge,
   type DedicatedHardwareCommand,
   type DedicatedHardwareRoutedActionEvent,
   type DedicatedHardwareTaskAction,
+  type DedicatedHardwareTaskActivity,
   type DedicatedHardwareTaskCatalog,
   type DedicatedHardwareVoiceRoutedEvent
 } from "./dedicated-hardware.js";
-import type { SessionView } from "./model.js";
+import type { InteractionView, SessionView } from "./model.js";
 import { sidebarSessionNaturalPriority } from "./sidebar-layout.js";
 import {
   captureAppInputTimeline,
@@ -288,6 +290,7 @@ export interface DedicatedHardwareTaskCatalogInput {
   readonly connectionGeneration: bigint;
   readonly snapshotRevision: bigint;
   readonly sessions: readonly SessionView[];
+  readonly interactions: readonly InteractionView[];
   readonly sidebarSessionIds: readonly string[];
   readonly viewedSessionId?: string;
 }
@@ -317,12 +320,27 @@ export function createDedicatedHardwareTaskCatalog(input: DedicatedHardwareTaskC
       userSendAt: nonnegativeSafeInteger(session.lastUserInputAt) ? session.lastUserInputAt : null,
       sidebarOrder: sidebarOrder.get(session.id) ?? null,
       catalogEligible: !session.archived,
-      priorityRank: session.archived ? null : sidebarSessionNaturalPriority(session, { viewedSessionId: input.viewedSessionId })
+      priorityRank: session.archived ? null : sidebarSessionNaturalPriority(session, { viewedSessionId: input.viewedSessionId }),
+      activity: dedicatedHardwareTaskActivity(session, input.interactions)
     }))
   };
   const parsed = parseDedicatedHardwareTaskCatalog(catalog);
   if (parsed === undefined) throw new TypeError("Dedicated hardware task catalog source is invalid.");
   return parsed;
+}
+
+export function dedicatedHardwareTaskActivity(
+  session: SessionView,
+  interactions: readonly InteractionView[]
+): DedicatedHardwareTaskActivity {
+  if (session.archived || session.state === "closed") return { phase: null, attention: false };
+  const attention = session.attention?.unread === true;
+  if (interactions.some((interaction) => interaction.sessionId === session.id && interaction.generation === session.generation)
+    || attention && session.attention?.kind === "awaiting") return { phase: "needs-interaction", attention };
+  if (session.state === "error" || attention && session.attention?.kind === "error") return { phase: "error", attention };
+  if (session.state === "running" || session.state === "waiting" || session.state === "retrying") return { phase: "running", attention };
+  if (attention && session.attention?.kind === "done") return { phase: "completed", attention: true };
+  return { phase: null, attention: false };
 }
 
 export function visibleDedicatedHardwareTaskOrder(doc: Document): readonly string[] {
@@ -342,39 +360,69 @@ export function useDedicatedHardwareTaskCatalogPublisher(
   catalog: DedicatedHardwareTaskCatalog | undefined
 ): void {
   const lastOwner = useRef<DedicatedHardwareTaskCatalog | undefined>(undefined);
+  const currentCatalog = useRef(catalog);
+  currentCatalog.current = catalog;
   const timer = useRef<number | undefined>(undefined);
+  const recoveryTimer = useRef<number | undefined>(undefined);
+  const publicationEpoch = useRef(0);
+  const pageRetired = useRef(false);
   const publicationChain = useRef<Promise<void>>(Promise.resolve());
-  const enqueue = (target: DedicatedHardwareBridge, value: DedicatedHardwareTaskCatalog): void => {
+  const enqueue = (target: DedicatedHardwareBridge, value: DedicatedHardwareTaskCatalog, epoch: number): void => {
     publicationChain.current = publicationChain.current.catch(() => undefined).then(async () => {
+      if (value.tasks.length > 0 && (epoch !== publicationEpoch.current || pageRetired.current)) return;
       await target.publishDedicatedHardwareTasks(value);
     }).catch(() => undefined);
   };
   useEffect(() => {
     if (bridge === undefined) return;
+    const epoch = ++publicationEpoch.current;
     const previous = lastOwner.current;
-    const previousKey = previous === undefined ? undefined : `${previous.profileId}\u0000${previous.serverId}`;
-    const nextKey = catalog === undefined ? undefined : `${catalog.profileId}\u0000${catalog.serverId}`;
+    const previousKey = previous === undefined ? undefined : `${previous.profileId}\u0000${previous.serverId}\u0000${previous.connectionGeneration}`;
+    const nextKey = catalog === undefined ? undefined : `${catalog.profileId}\u0000${catalog.serverId}\u0000${catalog.connectionGeneration}`;
     if (previous !== undefined && previousKey !== nextKey) {
-      enqueue(bridge, { ...previous, tasks: [] });
+      enqueue(bridge, { ...previous, tasks: [] }, epoch);
       lastOwner.current = undefined;
     }
     if (timer.current !== undefined) window.clearTimeout(timer.current);
-    if (catalog === undefined) return;
+    if (catalog === undefined || pageRetired.current) return;
     timer.current = window.setTimeout(() => {
       timer.current = undefined;
       lastOwner.current = catalog;
-      enqueue(bridge, catalog);
+      enqueue(bridge, catalog, epoch);
     }, TASK_PUBLICATION_DEBOUNCE_MS);
     return () => {
       if (timer.current !== undefined) { window.clearTimeout(timer.current); timer.current = undefined; }
+      if (recoveryTimer.current !== undefined) { window.clearTimeout(recoveryTimer.current); recoveryTimer.current = undefined; }
     };
   }, [bridge, catalog]);
-  useEffect(() => () => {
-    if (timer.current !== undefined) window.clearTimeout(timer.current);
-    const previous = lastOwner.current;
-    if (bridge !== undefined && previous !== undefined) {
-      enqueue(bridge, { ...previous, tasks: [] });
-    }
+  useEffect(() => {
+    if (bridge === undefined) return;
+    const clear = (): void => {
+      const epoch = ++publicationEpoch.current;
+      if (timer.current !== undefined) { window.clearTimeout(timer.current); timer.current = undefined; }
+      if (recoveryTimer.current !== undefined) { window.clearTimeout(recoveryTimer.current); recoveryTimer.current = undefined; }
+      const previous = lastOwner.current;
+      lastOwner.current = undefined;
+      if (previous !== undefined) enqueue(bridge, { ...previous, tasks: [] }, epoch);
+    };
+    const retire = (): void => { pageRetired.current = true; clear(); };
+    const unsubscribe = bridge.onDedicatedHardwareStateChanged?.((value) => {
+      if (parseDedicatedHardwareSnapshot(value) === undefined || pageRetired.current || currentCatalog.current === undefined
+        || recoveryTimer.current !== undefined) return;
+      recoveryTimer.current = window.setTimeout(() => {
+        recoveryTimer.current = undefined;
+        const current = currentCatalog.current;
+        if (current === undefined || pageRetired.current) return;
+        lastOwner.current = current;
+        enqueue(bridge, current, publicationEpoch.current);
+      }, TASK_PUBLICATION_DEBOUNCE_MS);
+    });
+    window.addEventListener("pagehide", retire);
+    return () => {
+      window.removeEventListener("pagehide", retire);
+      unsubscribe?.();
+      clear();
+    };
   }, [bridge]);
 }
 
