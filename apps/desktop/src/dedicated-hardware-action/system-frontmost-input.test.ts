@@ -7,6 +7,7 @@ import {
   SystemFrontmostScrollPump,
   accumulateSystemFrontmostScrollNotches,
   createPlatformSystemFrontmostInput,
+  type NativeSystemFrontmostInputHelper,
   type SystemFrontmostCommandExecutor,
   type SystemFrontmostInputRunner,
   type SystemFrontmostInputTarget
@@ -45,13 +46,30 @@ function runner(overrides: Partial<SystemFrontmostInputRunner> = {}): SystemFron
 }
 
 describe("platform system frontmost input", () => {
-  it("uses fixed Windows user32 capture, targeted Return, wheel, and paste scripts", async () => {
+  it("requires the Windows helper instead of a capture or command fallback", () => {
     const execute = vi.fn<SystemFrontmostCommandExecutor>(async () => "");
     const atomicCapture = vi.fn(() => ({ nativeId: "4242", processId: 999 }));
+    expect(createPlatformSystemFrontmostInput({
+      platform: "win32", execute, atomicCapture, currentProcessId: 77
+    })).toEqual({ status: "unsupported", reason: "helper-unavailable" });
+    expect(atomicCapture).not.toHaveBeenCalled();
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  it("owns Windows capture and fixed effects through the native helper", async () => {
+    const execute = vi.fn<SystemFrontmostCommandExecutor>(async () => "");
+    const atomicCapture = vi.fn(() => ({ nativeId: "5252", processId: 888 }));
+    const helper = {
+      captureTarget: vi.fn<NativeSystemFrontmostInputHelper["captureTarget"]>(() => ({ nativeId: "4242", processId: 999 })),
+      postReturn: vi.fn<NativeSystemFrontmostInputHelper["postReturn"]>(async () => undefined),
+      postPaste: vi.fn<NativeSystemFrontmostInputHelper["postPaste"]>(async () => undefined),
+      postScroll: vi.fn<NativeSystemFrontmostInputHelper["postScroll"]>(async () => undefined)
+    };
     const resolved = createPlatformSystemFrontmostInput({
       platform: "win32",
       execute,
       atomicCapture,
+      windowsHelper: helper,
       currentProcessId: 77
     });
     if (resolved.status !== "available") throw new Error("Expected Windows input support.");
@@ -67,60 +85,68 @@ describe("platform system frontmost input", () => {
     await postPasteWithIgnoredRuntimeExtra(target, "sensitive transcript");
 
     expect(target).toMatchObject({ platform: "win32", nativeId: "4242", processId: 999 });
-    expect(atomicCapture).toHaveBeenCalledOnce();
-    expect(execute).toHaveBeenCalledTimes(3);
-    const returnCall = execute.mock.calls[0]!;
-    expect(returnCall[0]).toBe("powershell.exe");
-    expect(returnCall[1].slice(0, 4)).toEqual(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"]);
-    expect(returnCall[1][4]).toContain("GetWindowThreadProcessId");
-    expect(returnCall[1][4]).toContain("PostMessage");
-    expect(returnCall[1][4]).toContain("0x0100");
-    expect(returnCall[1][4]).toContain("0x0101");
-    expect(returnCall[1][4]).not.toContain("SendKeys");
-    expect(returnCall[1].slice(-2)).toEqual(["4242", "999"]);
-
-    const scrollCall = execute.mock.calls[1]!;
-    expect(scrollCall[1][4]).toContain("0x020A");
-    expect(scrollCall[1][4]).not.toContain("mouse_event");
-    expect(scrollCall[1].slice(-3)).toEqual(["4242", "999", "121"]);
-    const pasteCall = execute.mock.calls[2]!;
-    expect(pasteCall[0]).toBe("powershell.exe");
-    expect(pasteCall[1][4]).toContain("GetWindowThreadProcessId");
-    expect(pasteCall[1][4]).toContain("SetForegroundWindow");
-    expect(pasteCall[1][4]).toContain("GetForegroundWindow");
-    expect(pasteCall[1][4]).toContain("GetFocus");
-    expect(pasteCall[1][4]).toContain("0x0302");
-    expect(pasteCall[1][4]).not.toContain("SendKeys");
-    expect(pasteCall[1].slice(-2)).toEqual(["4242", "999"]);
-    expect(JSON.stringify(pasteCall)).not.toContain("sensitive transcript");
+    expect(Object.isFrozen(target)).toBe(true);
+    expect(helper.captureTarget).toHaveBeenCalledOnce();
+    expect(helper.postReturn.mock.calls).toEqual([[{ nativeId: "4242", processId: 999 }]]);
+    expect(helper.postScroll.mock.calls).toEqual([[{ nativeId: "4242", processId: 999 }, 121]]);
+    expect(helper.postPaste.mock.calls).toEqual([[{ nativeId: "4242", processId: 999 }]]);
+    expect(Object.isFrozen(helper.postPaste.mock.calls[0]![0])).toBe(true);
+    expect(atomicCapture).not.toHaveBeenCalled();
+    expect(execute).not.toHaveBeenCalled();
     await expect(resolved.runner.postScroll(nativeTarget("not-decimal", 999, "win32"), 120)).rejects.toThrow(TypeError);
+    await expect(resolved.runner.postReturn(nativeTarget("4242", 999, "win32"))).rejects.toThrow(TypeError);
     await expect(resolved.runner.postPaste(nativeTarget("4242", 999, "win32"))).rejects.toThrow(TypeError);
-    expect(execute).toHaveBeenCalledTimes(3);
+    expect(helper.postReturn).toHaveBeenCalledOnce();
+    expect(helper.postScroll).toHaveBeenCalledOnce();
+    expect(helper.postPaste).toHaveBeenCalledOnce();
   });
 
-  it("rejects malformed atomic Windows capture before any target-specific post", () => {
-    const execute = vi.fn<SystemFrontmostCommandExecutor>(async () => "");
+  it.each([
+    { nativeId: "0x4242", processId: 999 },
+    { nativeId: "4242", processId: 0 },
+    { nativeId: "4242", processId: 77 }
+  ])("rejects invalid Windows helper capture %j before any effect", (identity) => {
+    const helper = {
+      captureTarget: vi.fn(() => identity),
+      postReturn: vi.fn(async () => undefined),
+      postPaste: vi.fn(async () => undefined),
+      postScroll: vi.fn(async () => undefined)
+    } satisfies NativeSystemFrontmostInputHelper;
     const resolved = createPlatformSystemFrontmostInput({
-      platform: "win32", execute, atomicCapture: () => ({ nativeId: "0x4242", processId: 999 }), currentProcessId: 77
+      platform: "win32", windowsHelper: helper, currentProcessId: 77
     });
     if (resolved.status !== "available") throw new Error("Expected Windows input support.");
-    expect(() => resolved.runner.captureTarget()).toThrow(TypeError);
-    expect(execute).not.toHaveBeenCalled();
+    expect(() => resolved.runner.captureTarget()).toThrow();
+    expect(helper.captureTarget).toHaveBeenCalledOnce();
+    expect(helper.postReturn).not.toHaveBeenCalled();
+    expect(helper.postPaste).not.toHaveBeenCalled();
+    expect(helper.postScroll).not.toHaveBeenCalled();
   });
 
   it("fails a Windows effect closed when native PID revalidation rejects", async () => {
-    const execute = vi.fn<SystemFrontmostCommandExecutor>(async (_executable, args) => {
-      throw new Error("native PID mismatch");
-    });
+    let currentOwnerPid = 999;
+    const revalidate = async (target: Readonly<{ nativeId: string; processId: number }>): Promise<void> => {
+      if (target.processId !== currentOwnerPid) throw new Error("native PID mismatch");
+    };
+    const helper = {
+      captureTarget: vi.fn(() => ({ nativeId: "4242", processId: currentOwnerPid })),
+      postReturn: vi.fn(revalidate),
+      postPaste: vi.fn(revalidate),
+      postScroll: vi.fn<NativeSystemFrontmostInputHelper["postScroll"]>(revalidate)
+    };
     const resolved = createPlatformSystemFrontmostInput({
-      platform: "win32", execute, atomicCapture: () => ({ nativeId: "4242", processId: 999 }), currentProcessId: 77
+      platform: "win32", windowsHelper: helper, currentProcessId: 77
     });
     if (resolved.status !== "available") throw new Error("Expected Windows input support.");
     const target = resolved.runner.captureTarget();
+    currentOwnerPid = 1000;
     await expect(resolved.runner.postReturn(target)).rejects.toThrow("PID mismatch");
     await expect(resolved.runner.postScroll(target, 120)).rejects.toThrow("PID mismatch");
     await expect(resolved.runner.postPaste(target)).rejects.toThrow("PID mismatch");
-    expect(execute).toHaveBeenCalledTimes(3);
+    expect(helper.captureTarget).toHaveBeenCalledOnce();
+    expect(helper.postReturn.mock.calls).toEqual([[{ nativeId: "4242", processId: 999 }]]);
+    expect(helper.postScroll.mock.calls).toEqual([[{ nativeId: "4242", processId: 999 }, 120]]);
+    expect(helper.postPaste.mock.calls).toEqual([[{ nativeId: "4242", processId: 999 }]]);
   });
 
   it("uses fixed Linux Return, scroll, and paste targets", async () => {
@@ -175,7 +201,7 @@ describe("platform system frontmost input", () => {
       captureTarget: vi.fn(() => ({ nativeId: "55", processId: 999 })),
       postPaste: vi.fn(async () => undefined),
       postScroll: vi.fn(async () => undefined)
-    };
+    } satisfies NativeSystemFrontmostInputHelper;
     const resolved = createPlatformSystemFrontmostInput({ platform: "darwin", macHelper: helper });
     if (resolved.status !== "available") throw new Error("Expected injected macOS input support.");
     const target = resolved.runner.captureTarget();

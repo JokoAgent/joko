@@ -13,49 +13,6 @@ export const SYSTEM_FRONTMOST_SCROLL_MAX_ELAPSED_MS = 100;
 
 const COMMAND_TIMEOUT_MS = 4_000;
 const MAX_NATIVE_TARGET = 9_223_372_036_854_775_807n;
-const WINDOWS_NATIVE_DECLARATION = [
-  "$signature = '[DllImport(\"user32.dll\")] public static extern IntPtr GetForegroundWindow();",
-  "[DllImport(\"user32.dll\")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);",
-  "[DllImport(\"user32.dll\")] public static extern bool PostMessage(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);",
-  "[DllImport(\"user32.dll\")] public static extern bool SetForegroundWindow(IntPtr hWnd);",
-  "[DllImport(\"user32.dll\")] public static extern bool AttachThreadInput(uint source, uint target, bool attach);",
-  "[DllImport(\"user32.dll\")] public static extern IntPtr GetFocus();",
-  "[DllImport(\"kernel32.dll\")] public static extern uint GetCurrentThreadId();';",
-  "$native = Add-Type -MemberDefinition $signature -Name JokoFrontmost -Namespace Joko.Native -PassThru;"
-].join(" ");
-const WINDOWS_RETURN_SCRIPT = [
-  WINDOWS_NATIVE_DECLARATION,
-  "[int64]$target = 0; [uint32]$expectedPid = 0;",
-  "if (![int64]::TryParse($args[0], [ref]$target) -or $target -le 0 -or ![uint32]::TryParse($args[1], [ref]$expectedPid) -or $expectedPid -eq 0) { exit 2 };",
-  "$hwnd = [IntPtr]$target; [uint32]$actualPid = 0; [void]$native::GetWindowThreadProcessId($hwnd, [ref]$actualPid);",
-  "if ($actualPid -eq 0 -or $actualPid -ne $expectedPid) { exit 3 };",
-  "if (!$native::PostMessage($hwnd, 0x0100, [IntPtr]13, [IntPtr]::Zero)) { exit 4 };",
-  "if (!$native::PostMessage($hwnd, 0x0101, [IntPtr]13, [IntPtr]::Zero)) { exit 5 }"
-].join(" ");
-const WINDOWS_SCROLL_SCRIPT = [
-  WINDOWS_NATIVE_DECLARATION,
-  "[int64]$target = 0; [uint32]$expectedPid = 0; [int32]$wheel = 0;",
-  "if (![int64]::TryParse($args[0], [ref]$target) -or $target -le 0 -or ![uint32]::TryParse($args[1], [ref]$expectedPid) -or $expectedPid -eq 0) { exit 2 };",
-  "$hwnd = [IntPtr]$target; [uint32]$actualPid = 0; [void]$native::GetWindowThreadProcessId($hwnd, [ref]$actualPid);",
-  "if ($actualPid -eq 0 -or $actualPid -ne $expectedPid) { exit 3 };",
-  "if (![int32]::TryParse($args[2], [ref]$wheel) -or $wheel -eq 0 -or [Math]::Abs([int64]$wheel) -gt 2400) { exit 4 };",
-  "$wParam = [IntPtr]([int64]$wheel -shl 16);",
-  "if (!$native::PostMessage($hwnd, 0x020A, $wParam, [IntPtr]::Zero)) { exit 5 }"
-].join(" ");
-const WINDOWS_PASTE_SCRIPT = [
-  WINDOWS_NATIVE_DECLARATION,
-  "[int64]$target = 0; [uint32]$expectedPid = 0;",
-  "if (![int64]::TryParse($args[0], [ref]$target) -or $target -le 0 -or ![uint32]::TryParse($args[1], [ref]$expectedPid) -or $expectedPid -eq 0) { exit 2 };",
-  "$hwnd = [IntPtr]$target; [uint32]$actualPid = 0; [uint32]$targetThread = $native::GetWindowThreadProcessId($hwnd, [ref]$actualPid);",
-  "if ($targetThread -eq 0 -or $actualPid -eq 0 -or $actualPid -ne $expectedPid) { exit 3 };",
-  "if (!$native::SetForegroundWindow($hwnd)) { exit 4 }; $foreground = $native::GetForegroundWindow(); if ($foreground.ToInt64() -ne $target) { exit 5 };",
-  "[uint32]$confirmedPid = 0; [uint32]$confirmedThread = $native::GetWindowThreadProcessId($foreground, [ref]$confirmedPid); if ($confirmedThread -eq 0 -or $confirmedPid -ne $expectedPid) { exit 6 };",
-  "$sourceThread = $native::GetCurrentThreadId(); $attached = $false;",
-  "try { if ($sourceThread -ne $confirmedThread) { if (!$native::AttachThreadInput($sourceThread, $confirmedThread, $true)) { exit 7 }; $attached = $true };",
-  "$focus = $native::GetFocus(); if ($focus -eq [IntPtr]::Zero) { exit 8 }; [uint32]$focusPid = 0; [void]$native::GetWindowThreadProcessId($focus, [ref]$focusPid);",
-  "if ($focusPid -eq 0 -or $focusPid -ne $expectedPid) { exit 9 }; if (!$native::PostMessage($focus, 0x0302, [IntPtr]::Zero, [IntPtr]::Zero)) { exit 10 }",
-  "} finally { if ($attached) { [void]$native::AttachThreadInput($sourceThread, $confirmedThread, $false) } }"
-].join(" ");
 const LINUX_RETURN_SCRIPT = [
   "target=\"$1\"; expected_pid=\"$2\"",
   "case \"$target\" in ''|0|0[0-9]*|*[!0-9]*) exit 2;; esac",
@@ -109,7 +66,7 @@ export interface SystemFrontmostInputRunner {
   readonly postScroll: (target: SystemFrontmostInputTarget, deltaY: number) => Promise<void>;
 }
 
-export interface MacSystemFrontmostInputHelper {
+export interface NativeSystemFrontmostInputHelper {
   /** The helper must capture the native id and owning PID atomically. */
   readonly captureTarget: () => Readonly<{ nativeId: string; processId: number }>;
   /** Each helper effect must revalidate that nativeId still belongs to processId. */
@@ -136,9 +93,10 @@ export type PlatformSystemFrontmostInput =
 export interface PlatformSystemFrontmostInputOptions {
   readonly platform: NodeJS.Platform;
   readonly execute?: SystemFrontmostCommandExecutor;
-  /** Must sample target+PID inside the admitted physical press callback without async work or process startup. */
+  /** Linux must sample target+PID inside the admitted physical press callback without async work or process startup. */
   readonly atomicCapture?: () => Readonly<{ nativeId: string; processId: number }>;
-  readonly macHelper?: MacSystemFrontmostInputHelper;
+  readonly windowsHelper?: NativeSystemFrontmostInputHelper;
+  readonly macHelper?: NativeSystemFrontmostInputHelper;
   readonly currentProcessId?: number;
 }
 
@@ -147,7 +105,7 @@ interface NativeTargetIdentity {
   readonly processId: number;
 }
 
-/** Resolves only audited fixed commands; macOS remains unavailable without an injected Joko helper. */
+/** Windows/macOS require native helpers; Linux uses only audited fixed commands. */
 export function createPlatformSystemFrontmostInput(
   options: PlatformSystemFrontmostInputOptions
 ): PlatformSystemFrontmostInput {
@@ -155,51 +113,24 @@ export function createPlatformSystemFrontmostInput(
     return Object.freeze({ status: "unsupported", reason: "platform" });
   }
   const currentProcessId = validProcessId(options.currentProcessId ?? process.pid);
-  if (options.platform === "darwin") {
-    if (options.macHelper === undefined) return Object.freeze({ status: "unsupported", reason: "helper-unavailable" });
-    const helper = options.macHelper;
+  if (options.platform === "win32" || options.platform === "darwin") {
+    const helper = options.platform === "win32" ? options.windowsHelper : options.macHelper;
+    if (helper === undefined) return Object.freeze({ status: "unsupported", reason: "helper-unavailable" });
     return Object.freeze({
       status: "available",
-      wheelNotch: 0,
+      wheelNotch: options.platform === "win32" ? SYSTEM_FRONTMOST_WINDOWS_WHEEL_NOTCH : 0,
       runner: guardedRunner({
         captureTarget: helper.captureTarget,
         postReturn: (target) => helper.postReturn(target),
         postPaste: (target) => helper.postPaste(target),
         postScroll: (target, deltaY) => helper.postScroll(target, deltaY)
-      }, "darwin", currentProcessId)
+      }, options.platform, currentProcessId)
     });
   }
   const execute = options.execute ?? executeFile;
   const atomicCapture = options.atomicCapture;
   if (atomicCapture === undefined) {
     return Object.freeze({ status: "unsupported", reason: "helper-unavailable" });
-  }
-  if (options.platform === "win32") {
-    return Object.freeze({
-      status: "available",
-      wheelNotch: SYSTEM_FRONTMOST_WINDOWS_WHEEL_NOTCH,
-      runner: guardedRunner({
-        postReturn: async (target) => {
-          await execute("powershell.exe", [
-            "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", WINDOWS_RETURN_SCRIPT,
-            target.nativeId, String(target.processId)
-          ], commandOptions());
-        },
-        captureTarget: atomicCapture,
-        postPaste: async (target) => {
-          await execute("powershell.exe", [
-            "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", WINDOWS_PASTE_SCRIPT,
-            target.nativeId, String(target.processId)
-          ], commandOptions());
-        },
-        postScroll: async (target, deltaY) => {
-          await execute("powershell.exe", [
-            "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", WINDOWS_SCROLL_SCRIPT,
-            target.nativeId, String(target.processId), String(deltaY)
-          ], commandOptions());
-        }
-      }, "win32", currentProcessId)
-    });
   }
   return Object.freeze({
     status: "available",

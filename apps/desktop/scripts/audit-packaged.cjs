@@ -114,6 +114,8 @@ module.exports = async function auditPackaged(context) {
     context.electronPlatformName,
     targetArch
   );
+  await auditNativeSystemFrontmostInput(resolve(resourcesRoot, "native-system-frontmost-input"),
+    context.electronPlatformName, targetArch);
   await auditNativeSimulatorHelper(nativeSimulatorHidRoot, context.electronPlatformName,
     targetArch, "Simulator HID", "joko-simulator-hid");
   await auditNativeSimulatorHelper(nativeSimulatorH264Root, context.electronPlatformName,
@@ -823,6 +825,34 @@ async function auditWdaSourceAssets(root, platform) {
   const archive = await readFile(archivePath);
   if (createHash("sha256").update(archive).digest("hex") !== manifest.archiveSha256) {
     throw new Error("The packaged driver source archive failed integrity verification.");
+  }
+}
+
+async function auditNativeSystemFrontmostInput(root, platform, targetArch) {
+  const helper = platform === "win32" ? "joko-windows-frontmost-input.node" : null;
+  const expected = (helper === null ? ["manifest.json"] : [helper, "manifest.json"]).sort();
+  const entries = await readdir(root, { withFileTypes: true }).catch(() => []);
+  const names = entries.map(entry => entry.name).sort();
+  if (names.length !== expected.length || names.some((name, index) => name !== expected[index])) {
+    throw new Error("The packaged native foreground input directory is incomplete or contains unexpected files.");
+  }
+  for (const entry of entries) {
+    await assertCanonicalRegularFile(resolve(root, entry.name), "The packaged native foreground input is unsafe.");
+  }
+  const manifest = await readJsonManifest(resolve(root, "manifest.json"), "native foreground input");
+  if (Object.keys(manifest).sort().join(",") !== "architecture,helper,platform,protocolVersion,sha256"
+    || manifest.architecture !== targetArch || manifest.platform !== platform
+    || manifest.helper !== helper || manifest.protocolVersion !== 1
+    || (helper === null ? manifest.sha256 !== null
+      : typeof manifest.sha256 !== "string" || !/^[a-f0-9]{64}$/u.test(manifest.sha256))) {
+    throw new Error("The packaged native foreground input identity does not match the artifact target.");
+  }
+  if (helper === null) return;
+  const path = resolve(root, helper);
+  const info = await lstat(path);
+  if (info.size <= 0 || info.size > 2 * 1024 * 1024
+    || createHash("sha256").update(await readFile(path)).digest("hex") !== manifest.sha256) {
+    throw new Error("The packaged native foreground input failed integrity verification.");
   }
 }
 

@@ -23,6 +23,8 @@ import {
   terminalElectronSmokeSource
 } from "../dist/runtime-staging.js";
 import { capturePackagedSmokeProcessBirthIdentitySync } from "../dist/packaged-smoke-process-identity.js";
+import { buildNativeFrontmostSmokeTarget, nativeSystemFrontmostElectronSmokeSource }
+  from "./native-system-frontmost-smoke.mjs";
 import {
   applyPrimaryChildExitFence,
   authoritativeSmokeJourneyError,
@@ -70,6 +72,29 @@ async function runSmokeJourney() {
   // Electron's app.setPath throws when its directory does not already exist.
   // Create the isolated smoke profile before the main module receives it.
   mkdirSync(smokeUserDataPath, { recursive: false, mode: 0o700 });
+  let frontmostInputSmoke;
+  if (process.platform === "win32") {
+    const targetExecutable = await buildNativeFrontmostSmokeTarget(markerDirectory);
+    frontmostInputSmoke = await runNativeElectronSmoke(
+      executable,
+      resolveOrchestratorRuntimeRoot(executable, useUnpackedArtifact),
+      markerDirectory,
+      "system-frontmost-input",
+      nativeSystemFrontmostElectronSmokeSource({
+        desktopModulePath: resolve(useUnpackedArtifact ? resolveUnpackedApplicationRoot(executable) : appRoot,
+          "dist", "native-system-frontmost-input.js"),
+        nativeDirectory: useUnpackedArtifact
+          ? resolve(resolveUnpackedResourcesRoot(executable), "native-system-frontmost-input")
+          : resolve(appRoot, "dist", "native-system-frontmost-input"),
+        targetExecutable
+      }),
+      smokeDeadline
+    );
+    for (const key of ["sampler", "exactTarget", "fixedTargetAfterFocusMove", "return", "wheel", "paste",
+      "currentProcessRejected", "wrongProcessRejected", "targetCleanup"]) {
+      if (frontmostInputSmoke[key] !== true) throw new Error("Electron-Node native foreground input smoke was incomplete.");
+    }
+  }
   const sqliteVecSmoke = await runNativeElectronSmoke(
     executable,
     resolveOrchestratorRuntimeRoot(executable, useUnpackedArtifact),
@@ -111,7 +136,7 @@ async function runSmokeJourney() {
   if (claudeSessionSmoke.missingSession !== true || claudeSessionSmoke.workerRetired !== true || claudeSessionSmoke.isolatedProfileUnchanged !== true) {
     throw new Error("Electron-Node Session SDK smoke returned an invalid Worker result.");
   }
-  process.stdout.write(`${JSON.stringify({ event: "JOKO_DESKTOP_NATIVE_RUNTIME_SMOKE_OK", dedicatedHardwareUtilityEntry, sqliteVec: sqliteVecSmoke, extensionLibrary: extensionLibrarySmoke, terminal: terminalSmoke, claudeSession: claudeSessionSmoke })}\n`);
+  process.stdout.write(`${JSON.stringify({ event: "JOKO_DESKTOP_NATIVE_RUNTIME_SMOKE_OK", dedicatedHardwareUtilityEntry, sqliteVec: sqliteVecSmoke, extensionLibrary: extensionLibrarySmoke, terminal: terminalSmoke, claudeSession: claudeSessionSmoke, frontmostInput: frontmostInputSmoke })}\n`);
 
   const connectSmoke = await createConnectSmokeServer();
   const requiredSmokeProgress = smokeScope === "full" ? [

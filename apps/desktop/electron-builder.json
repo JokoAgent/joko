@@ -75,6 +75,14 @@
       ]
     },
     {
+      "from": "dist/native-system-frontmost-input",
+      "to": "native-system-frontmost-input",
+      "filter": [
+        "manifest.json",
+        "joko-windows-frontmost-input.node"
+      ]
+    },
+    {
       "from": "dist/native-simulator-hid",
       "to": "native-simulator-hid",
       "filter": [

@@ -184,6 +184,7 @@ import {
   createPlatformSystemFrontmostInput
 } from "./dedicated-hardware-action/system-frontmost-input.js";
 import { SystemFrontmostVoiceController } from "./dedicated-hardware-action/system-frontmost-voice.js";
+import { loadNativeSystemFrontmostInput } from "./native-system-frontmost-input.js";
 import {
   createDedicatedHardwareMainActionRuntime,
   type DedicatedHardwareMainActionRuntime
@@ -8128,7 +8129,21 @@ async function initializeDedicatedHardwareInput(): Promise<void> {
   dedicatedHardwareTaskFocusFence.clear();
   dedicatedHardwareSystemVoiceController?.retire();
   dedicatedHardwareSystemVoiceController = undefined;
-  const systemFrontmost = createPlatformSystemFrontmostInput({ platform: process.platform });
+  const windowsHelper = loadNativeSystemFrontmostInput({
+    directory: app.isPackaged
+      ? resolve(process.resourcesPath, "native-system-frontmost-input")
+      : resolve(sourceDirectory, "native-system-frontmost-input"),
+    platform: process.platform,
+    architecture: process.arch
+  });
+  const systemFrontmost = createPlatformSystemFrontmostInput({
+    platform: process.platform,
+    ...(windowsHelper === undefined ? {} : { windowsHelper })
+  });
+  if (packagedSmoke && process.platform === "win32") {
+    if (systemFrontmost.status !== "available") throw new Error("Native foreground sampler was not admitted by Main.");
+    process.stdout.write("JOKO_DESKTOP_FRONTMOST_INPUT_READY\n");
+  }
   const systemInput = systemFrontmost.status === "available"
     ? new SystemFrontmostInputController(systemFrontmost.runner, { wheelNotch: systemFrontmost.wheelNotch })
     : undefined;
