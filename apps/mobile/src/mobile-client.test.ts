@@ -14,6 +14,8 @@ import {
   OperationMutationSchema, OperationState, OwnerSnapshotScopeSchema, PermissionMode,
   ProviderDescriptorSchema, ProviderKind, RevisionSchema, SessionMessageSearchMatchSchema, SessionSnapshotScopeSchema,
   SettingsSnapshotSchema, SnapshotScopeSchema, UsageSchema,
+  VoiceInputServiceSettingsSchema, VoiceInputServiceSettingsPatchSchema, VoiceInputTranscriptionProtocol,
+  VoiceInputSaucSettingsSchema, VoiceInputSaucMode, VoiceInputSaucAuthentication,
   QueueControlSchema, QueueDeliveryMode, QueueDispatchState, QueueItemSchema, QueueItemState, QueueSourceKind, ResourceKind,
   ReviewRunSchema, ReviewRunState, RuntimeCommandSchema, RuntimeCommandSource, SessionResourceSchema,
   RunState, ScheduleExecutionMode, ScheduleFireSource, ScheduleMisfirePolicy, ScheduleOverlapPolicy,
@@ -39,6 +41,9 @@ import type { Event, Operation, Schedule, ScheduleInput, SessionMessageSearchMat
 import type { MobileInteractionDraftIdentity } from "./interaction-draft-store";
 import { MobileComposerDraftStore } from "./composer-draft-store";
 import { MobileNewTaskDraftStore } from "./new-task-draft-store";
+import { EMPTY_MOBILE_VOICE_DICTIONARY } from "./mobile-voice-dictionary";
+import { dictionaryWatchFixture, idleDictionaryWatch } from "./test/voice-dictionary-watch";
+import { readOnlyValue } from "./test/voice-dictionary-readonly";
 import { MobileAttachmentFiles, type MobileAttachmentFileDriver } from "./mobile-attachment-files";
 import {
   MobileMediaPreviewFiles,
@@ -990,6 +995,27 @@ function fakeNetwork(): MobileNetwork {
     authorizeBlobDownload: vi.fn(async () => { throw new Error("No Blob authorization fixture was configured."); }),
     uploadBlob: vi.fn(async () => { throw new Error("No Blob upload fixture was configured."); }),
     getVoiceInputCapabilities: vi.fn(async () => { throw new Error("No Voice capability fixture was configured."); }),
+    getVoiceInputServiceSettings: vi.fn(async () => { throw new Error("No Voice settings fixture was configured."); }),
+    uploadVoiceInputSecret: vi.fn(async () => "voice-ticket"),
+    testVoiceInputConnection: vi.fn(async () => { throw new Error("No Voice settings fixture was configured."); }),
+    getVoiceInputDictionary: vi.fn(async () => { throw new Error("No Voice dictionary fixture was configured."); }),
+    getVoiceInputDictionaryReadOnly: vi.fn(async () => { throw new Error("No read-only dictionary fixture was configured."); }),
+    watchVoiceInputDictionaryReadOnly: vi.fn((_credential: PairedCredential, signal: AbortSignal) => idleDictionaryWatch(signal)),
+    watchVoiceInputDictionary: vi.fn((_credential: PairedCredential, signal: AbortSignal) => idleDictionaryWatch(signal)),
+    getVoiceInputDictionaryPeerStatus: vi.fn(async () => { throw new Error("No dictionary sharing fixture was configured."); }),
+    watchVoiceInputDictionaryPeerStatus: vi.fn((_credential: PairedCredential, signal: AbortSignal) => idleDictionaryWatch(signal)),
+    grantVoiceInputDictionaryPeer: vi.fn(async () => { throw new Error("No dictionary sharing fixture was configured."); }),
+    revokeVoiceInputDictionaryPeer: vi.fn(async () => { throw new Error("No dictionary sharing fixture was configured."); }),
+    syncVoiceInputDictionaryNow: vi.fn(async () => { throw new Error("No dictionary sharing fixture was configured."); }),
+    configureVoiceInputDictionaryListener: vi.fn(async () => { throw new Error("No dictionary sharing fixture was configured."); }),
+    getVoiceInputDictionaryPeerInvitation: vi.fn(async () => { throw new Error("No dictionary sharing fixture was configured."); }),
+    grantVoiceInputDictionaryDirectPeer: vi.fn(async () => { throw new Error("No dictionary sharing fixture was configured."); }),
+    clearVoiceInputDictionaryPeerRoute: vi.fn(async () => { throw new Error("No dictionary sharing fixture was configured."); }),
+    setVoiceInputDictionarySyncEnabled: vi.fn(async () => { throw new Error("No Voice dictionary fixture was configured."); }),
+    addVoiceInputDictionaryTerms: vi.fn(async () => { throw new Error("No Voice dictionary fixture was configured."); }),
+    editVoiceInputDictionaryEntry: vi.fn(async () => { throw new Error("No Voice dictionary fixture was configured."); }),
+    deleteVoiceInputDictionaryEntry: vi.fn(async () => { throw new Error("No Voice dictionary fixture was configured."); }),
+    applyVoiceInputDictionaryLearning: vi.fn(async () => { throw new Error("No Voice dictionary fixture was configured."); }),
     adviseVoiceInputDictionaryEdit: vi.fn(async () => ({ actions: [] })),
     startVoiceInput: vi.fn(async () => { throw new Error("No Voice session fixture was configured."); }),
     appendVoiceAudio: vi.fn(async () => { throw new Error("No Voice session fixture was configured."); }),
@@ -1603,11 +1629,12 @@ function client(
   pdfPreviewFiles?: MobilePdfPreviewFiles,
   modelPreviewFiles?: MobileModelPreviewFiles,
   fileShare?: Pick<MobileFileShare, "perform">,
-  offlineCache?: Pick<MobileOfflineCache, "load" | "save" | "clear">
+  offlineCache?: Pick<MobileOfflineCache, "load" | "save" | "clear">,
+  readOnlyDictionaryCache?: { clear(profileId: string): Promise<void> }
 ) {
   const instance = new MobileClient(network, storage, discovery ?? { scan: vi.fn(async () => []) }, newId, "android", now,
     clearInteractionDraft, drafts.newTask, drafts.composer, attachmentFiles, mediaPreviewFiles, pdfPreviewFiles,
-    modelPreviewFiles, fileShare, offlineCache);
+    modelPreviewFiles, fileShare, offlineCache, readOnlyDictionaryCache);
   clients.push(instance);
   return instance;
 }
@@ -2121,6 +2148,259 @@ describe("native mobile Automation ownership and recovery", () => {
 });
 
 describe("native mobile connection and operation ownership", () => {
+  it("reads a second paired dictionary with its exact proof and credential without replacing the active task, then cancels on background", async () => {
+    const network = fakeNetwork();
+    const remote = { ...otherCredential, origin: "http://192.168.1.21:4318", serverId: "node-2" };
+    const saved = memoryStorage([credential, remote]);
+    const remoteNode = { ...node, serverId: remote.serverId, displayName: "Office" };
+    const remoteOwner = { connection: otherConnection, device: otherDevice,
+      snapshot: create(SnapshotSchema, { ...snapshot, server: { ...snapshot.server!, serverId: remote.serverId },
+        connections: [otherConnection], devices: [otherDevice] }) };
+    vi.mocked(network.inspect).mockImplementation(async (origin) => origin === remote.origin ? remoteNode : node);
+    vi.mocked(network.readOwner).mockImplementation(async (value) => value.serverId === remote.serverId ? remoteOwner : { connection, device, snapshot });
+    vi.mocked(network.getVoiceInputDictionaryReadOnly).mockResolvedValue(readOnlyValue());
+    const updates = dictionaryWatchFixture<ReturnType<typeof readOnlyValue>>();
+    vi.mocked(network.watchVoiceInputDictionaryReadOnly).mockImplementation((_credential, signal) => updates.watch(signal));
+    const app = client(network, saved.storage); await app.start();
+    const active = app.state.owner; const selected = app.state.selectedId;
+    const request = new AbortController();
+    const transport = await app.voiceDictionaryReadOnlyTransport(remote.profileId, request.signal);
+    expect(transport.profile.displayName).toBe("Office");
+    expect(vi.mocked(network.inspect).mock.invocationCallOrder.at(-1)!).toBeLessThan(vi.mocked(saved.storage.loadCredential).mock.invocationCallOrder.at(-1)!);
+    await expect(transport.getVoiceInputDictionaryReadOnly()).resolves.toEqual(readOnlyValue());
+    expect(network.getVoiceInputDictionaryReadOnly).toHaveBeenCalledWith(remote, expect.any(AbortSignal));
+    expect(app.state.owner).toBe(active); expect(app.state.selectedId).toBe(selected); expect(app.state.activeProfileId).toBe(credential.profileId);
+    const iterator = transport.watchVoiceInputDictionaryReadOnly(request.signal)[Symbol.asyncIterator]();
+    const initial = iterator.next(); updates.push(readOnlyValue()); await initial;
+    const waiting = iterator.next(); const stopped = expect(waiting).rejects.toMatchObject({ name: "AbortError" });
+    app.setForeground(false);
+    expect(vi.mocked(network.watchVoiceInputDictionaryReadOnly).mock.calls[0]![1].aborted).toBe(true);
+    await stopped; expect(updates.count).toBe(0); expect(transport.isCurrent()).toBe(false);
+  });
+
+  it("rejects an identity-drift dictionary source before protected reads and clears only that source cache", async () => {
+    const network = fakeNetwork(); const saved = memoryStorage(credential, false);
+    const clear = vi.fn(async (_profileId: string) => undefined);
+    const app = client(network, saved.storage, undefined, undefined, undefined, undefined, undefined,
+      undefined, undefined, undefined, undefined, undefined, undefined, { clear });
+    await app.start(); vi.mocked(saved.storage.loadCredential).mockClear();
+    vi.mocked(network.inspect).mockResolvedValue({ ...node, serverId: "drift" });
+    await expect(app.voiceDictionaryReadOnlyTransport(credential.profileId, new AbortController().signal)).rejects.toThrow();
+    expect(saved.storage.loadCredential).not.toHaveBeenCalled(); expect(network.getVoiceInputDictionaryReadOnly).not.toHaveBeenCalled();
+    expect(clear).toHaveBeenCalledExactlyOnceWith(credential.profileId);
+    expect(app.state.saved[0]?.credentialState).toBe("identity-conflict"); expect(saved.key()).toEqual(credential);
+  });
+
+  it("rechecks a normally ended idle readonly stream, clears a revoked pair and retires a late GET without touching the active node", async () => {
+    const network = fakeNetwork(); const saved = memoryStorage([credential, otherCredential]);
+    const clear = vi.fn(async (_profileId: string) => undefined);
+    const app = client(network, saved.storage, undefined, undefined, undefined, undefined, undefined,
+      undefined, undefined, undefined, undefined, undefined, undefined, { clear });
+    await app.start(); const active = app.state.owner;
+    const updates = dictionaryWatchFixture<ReturnType<typeof readOnlyValue>>();
+    vi.mocked(network.watchVoiceInputDictionaryReadOnly).mockImplementation((_credential, signal) => updates.watch(signal));
+    vi.mocked(network.readOwner).mockImplementation(async (value) => value.profileId === otherCredential.profileId
+      ? { connection: otherConnection, device: otherDevice, snapshot: create(SnapshotSchema, { ...snapshot, connections: [otherConnection], devices: [otherDevice] }) }
+      : { connection, device, snapshot });
+    const transport = await app.voiceDictionaryReadOnlyTransport(otherCredential.profileId, new AbortController().signal);
+    let finish!: (value: ReturnType<typeof readOnlyValue>) => void;
+    vi.mocked(network.getVoiceInputDictionaryReadOnly).mockImplementation(async () => await new Promise((resolve) => { finish = resolve; }));
+    const reading = transport.getVoiceInputDictionaryReadOnly(); const rejected = expect(reading).rejects.toMatchObject({ name: "AbortError" });
+    const iterator = transport.watchVoiceInputDictionaryReadOnly(new AbortController().signal)[Symbol.asyncIterator]();
+    const initial = iterator.next(); updates.push(readOnlyValue()); await initial;
+    vi.mocked(network.readOwner).mockImplementation(async (value) => {
+      if (value.profileId === otherCredential.profileId) throw { code: Code.Unauthenticated };
+      return { connection, device, snapshot };
+    });
+    const ended = iterator.next(); const revoked = expect(ended).rejects.toMatchObject({ code: Code.Unauthenticated });
+    updates.end(); await revoked;
+    finish(readOnlyValue(99n)); await rejected;
+    expect(clear).toHaveBeenCalledExactlyOnceWith(otherCredential.profileId); expect(saved.key(otherCredential.profileId)).toBeUndefined();
+    expect(saved.key()).toEqual(credential); expect(app.state.owner).toBe(active); expect(app.state.status).toBe("connected");
+  });
+
+  it("binds both dictionary streams to their original credential and cancels an idle stream on foreground retirement", async () => {
+    const network = fakeNetwork();
+    const app = client(network, memoryStorage(credential).storage);
+    const content = dictionaryWatchFixture<Awaited<ReturnType<MobileNetwork["getVoiceInputDictionary"]>>>();
+    const peers = dictionaryWatchFixture<Awaited<ReturnType<MobileNetwork["getVoiceInputDictionaryPeerStatus"]>>>();
+    vi.mocked(network.watchVoiceInputDictionary).mockImplementation((_credential, signal) => content.watch(signal));
+    vi.mocked(network.watchVoiceInputDictionaryPeerStatus).mockImplementation((_credential, signal) => peers.watch(signal));
+    await app.start();
+    const api = app.voiceDictionaryTransport()!;
+    const request = new AbortController();
+    const dictionary = api.watchVoiceInputDictionary(request.signal)[Symbol.asyncIterator]();
+    const sharing = api.watchVoiceInputDictionaryPeerStatus(request.signal)[Symbol.asyncIterator]();
+    const firstDictionary = dictionary.next(); const firstSharing = sharing.next();
+    const value = { revision: 4n, syncEnabled: true, dictionary: EMPTY_MOBILE_VOICE_DICTIONARY, refinementTerms: [] };
+    const status = { available: true, configurationRevision: 3n, nodeId: "node-a", fingerprint: "a".repeat(64), enabled: true,
+      phase: "waiting" as const, peers: [], candidates: [] };
+    content.push(value); peers.push(status);
+    await expect(firstDictionary).resolves.toEqual({ done: false, value });
+    await expect(firstSharing).resolves.toEqual({ done: false, value: status });
+    expect(network.watchVoiceInputDictionary).toHaveBeenCalledExactlyOnceWith(credential, expect.any(AbortSignal));
+    expect(network.watchVoiceInputDictionaryPeerStatus).toHaveBeenCalledExactlyOnceWith(credential, expect.any(AbortSignal));
+    const waitingDictionary = dictionary.next(); const rejectedDictionary = expect(waitingDictionary).rejects.toThrow(/authority changed|cancelled/u);
+    const waitingSharing = sharing.next(); const rejectedSharing = expect(waitingSharing).rejects.toThrow(/authority changed|cancelled/u);
+    app.setForeground(false);
+    expect(vi.mocked(network.watchVoiceInputDictionary).mock.calls[0]![1]!.aborted).toBe(true);
+    expect(vi.mocked(network.watchVoiceInputDictionaryPeerStatus).mock.calls[0]![1]!.aborted).toBe(true);
+    await rejectedDictionary; await rejectedSharing;
+    expect(content.count).toBe(0); expect(peers.count).toBe(0);
+    app.setForeground(true);
+    await vi.waitFor(() => expect(app.voiceDictionaryTransport()?.isCurrent()).toBe(true));
+    expect(api.isCurrent()).toBe(false);
+    await expect(api.watchVoiceInputDictionary(new AbortController().signal)[Symbol.asyncIterator]().next()).rejects.toThrow(/authority changed/u);
+    expect(network.watchVoiceInputDictionary).toHaveBeenCalledOnce();
+  });
+  it("binds voice settings to the node, uploads primary and fallback secrets before a durable public CAS operation", async () => {
+    const network = fakeNetwork(); const saved = memoryStorage(credential); const app = client(network, saved.storage);
+    const settings = create(VoiceInputServiceSettingsSchema, { protocol: VoiceInputTranscriptionProtocol.VOLCENGINE_SAUC,
+      fallbackProtocol: VoiceInputTranscriptionProtocol.VOLCENGINE_SAUC, endpoint: "wss://speech.example/api/v3/sauc/bigmodel_async",
+      fallbackEndpoint: "wss://fallback.example/api/v3/sauc/bigmodel_async", credentialConfigured: true,
+      sauc: { mode: VoiceInputSaucMode.ASYNC_TWO_PASS, authentication: VoiceInputSaucAuthentication.API_KEY },
+      fallbackSauc: { mode: VoiceInputSaucMode.ASYNC_TWO_PASS, authentication: VoiceInputSaucAuthentication.API_KEY }, version: { revision: { value: 4n } } });
+    vi.mocked(network.getVoiceInputServiceSettings).mockResolvedValue(settings);
+    await app.start(); const api = app.voiceInputSettingsTransport()!; await app.select("session");
+    await expect(api.get()).resolves.toBe(settings); expect(api.isCurrent()).toBe(true); expect(api.ownerKey).not.toContain(credential.authKey);
+    const patch = create(VoiceInputServiceSettingsPatchSchema, { expectedRevision: { value: 4n },
+      sauc: { mode: VoiceInputSaucMode.STREAM_INPUT, authentication: VoiceInputSaucAuthentication.ACCESS_TOKEN, appId: "public-app" } });
+    await expect(api.save(patch)).rejects.toThrow(/Replace or clear/u);
+    await api.save(patch, { primary: "private-primary", fallback: "private-fallback" });
+    expect(network.uploadVoiceInputSecret).toHaveBeenNthCalledWith(1, credential, "private-primary", false, expect.any(AbortSignal));
+    expect(network.uploadVoiceInputSecret).toHaveBeenNthCalledWith(2, credential, "private-fallback", true, expect.any(AbortSignal));
+    const mutation = vi.mocked(network.submit).mock.calls[0]![2];
+    expect(mutation.payload).toMatchObject({ case: "updateVoiceInputServiceSettings", value: { patch: {
+      expectedRevision: { value: 4n }, credentialUploadTicketId: "voice-ticket", fallbackCredentialUploadTicketId: "voice-ticket",
+      sauc: { mode: VoiceInputSaucMode.STREAM_INPUT, authentication: VoiceInputSaucAuthentication.ACCESS_TOKEN, appId: "public-app" }
+    } } });
+    expect(JSON.stringify(vi.mocked(saved.storage.savePending).mock.calls)).not.toContain("private-");
+    expect(new TextDecoder().decode(toBinary(OperationMutationSchema, mutation))).not.toContain("private-");
+  });
+
+  it("retains an unknown voice settings receipt and checks it without reuploading or resending the draft", async () => {
+    const network = fakeNetwork(); const saved = memoryStorage(credential); const app = client(network, saved.storage);
+    vi.mocked(network.getVoiceInputServiceSettings).mockResolvedValue(create(VoiceInputServiceSettingsSchema, {
+      protocol: VoiceInputTranscriptionProtocol.OPENAI_COMPATIBLE_BATCH, fallbackProtocol: VoiceInputTranscriptionProtocol.OPENAI_COMPATIBLE_BATCH,
+      version: { revision: { value: 4n } } }));
+    vi.mocked(network.submit).mockRejectedValueOnce(new Error("connection lost"));
+    await app.start(); const api = app.voiceInputSettingsTransport()!;
+    const patch = create(VoiceInputServiceSettingsPatchSchema, { expectedRevision: { value: 4n }, enabled: true });
+    await expect(api.save(patch, { primary: "private-value" })).rejects.toThrow(/unknown/u);
+    expect(saved.pending()).toEqual([{ operationId: "operation-1", connectionId: credential.connectionId, kind: "voice-settings", state: "unknown" }]);
+    await expect(api.save(patch, { primary: "private-value" })).rejects.toThrow(/receipt/u);
+    expect(network.submit).toHaveBeenCalledOnce(); expect(network.uploadVoiceInputSecret).toHaveBeenCalledOnce();
+    vi.mocked(network.getOperation).mockResolvedValue(create(OperationSchema, { operationId: "operation-1", connectionId: credential.connectionId, state: OperationState.SUCCEEDED }));
+    await api.reconcile(); expect(saved.pending()).toHaveLength(0); expect(network.submit).toHaveBeenCalledOnce();
+  });
+
+  it("aborts an old voice settings upload on foreground retirement before any operation dispatch", async () => {
+    const network = fakeNetwork(); const app = client(network, memoryStorage(credential).storage);
+    vi.mocked(network.getVoiceInputServiceSettings).mockResolvedValue(create(VoiceInputServiceSettingsSchema, {
+      protocol: VoiceInputTranscriptionProtocol.OPENAI_COMPATIBLE_BATCH, fallbackProtocol: VoiceInputTranscriptionProtocol.OPENAI_COMPATIBLE_BATCH,
+      version: { revision: { value: 4n } } }));
+    let release!: (value: string) => void;
+    vi.mocked(network.uploadVoiceInputSecret).mockImplementation(async () => new Promise<string>((resolve) => { release = resolve; }));
+    await app.start(); const api = app.voiceInputSettingsTransport()!;
+    const save = api.save(create(VoiceInputServiceSettingsPatchSchema, { expectedRevision: { value: 4n } }), { primary: "private-value" });
+    const rejected = expect(save).rejects.toThrow(/aborted|cancelled/u);
+    await vi.waitFor(() => expect(network.uploadVoiceInputSecret).toHaveBeenCalledOnce());
+    app.setForeground(false);
+    expect(vi.mocked(network.uploadVoiceInputSecret).mock.calls[0]![3]!.aborted).toBe(true);
+    release("voice-ticket"); await rejected; expect(network.submit).not.toHaveBeenCalled(); expect(api.isCurrent()).toBe(false);
+  });
+
+  it("binds dictionary reads and semantic mutations to a node owner independently of the selected task", async () => {
+    const network = fakeNetwork();
+    const app = client(network, memoryStorage(credential).storage);
+    const dictionary = { revision: 4n, syncEnabled: true, dictionary: { entries: [], candidates: [], suppressedAutomaticTexts: [] }, refinementTerms: [] };
+    const methods = ["getVoiceInputDictionary", "setVoiceInputDictionarySyncEnabled", "addVoiceInputDictionaryTerms",
+      "editVoiceInputDictionaryEntry", "deleteVoiceInputDictionaryEntry", "applyVoiceInputDictionaryLearning"] as const;
+    for (const method of methods) vi.mocked(network[method]).mockResolvedValue(dictionary);
+    const sharing = { available: true, configurationRevision: 3n, nodeId: "node-a", fingerprint: "a".repeat(64),
+      enabled: true, phase: "waiting" as const, peers: [], candidates: [] };
+    const sharingMethods = ["getVoiceInputDictionaryPeerStatus", "grantVoiceInputDictionaryPeer", "revokeVoiceInputDictionaryPeer", "syncVoiceInputDictionaryNow",
+      "configureVoiceInputDictionaryListener", "grantVoiceInputDictionaryDirectPeer", "clearVoiceInputDictionaryPeerRoute"] as const;
+    for (const method of sharingMethods) vi.mocked(network[method]).mockResolvedValue(sharing);
+    const invitation = JSON.stringify({ version: 1, nodeId: "node-b", displayName: "Peer", publicKey: "MCowBQYDK2VuAyEA" + "A".repeat(43) + "=",
+      fingerprint: "b".repeat(64), host: "peer.example", port: 43_121 });
+    vi.mocked(network.getVoiceInputDictionaryPeerInvitation).mockResolvedValue(invitation);
+    expect(app.voiceDictionaryTransport()).toBeUndefined();
+    await app.start();
+    const api = app.voiceDictionaryTransport()!;
+    expect(api.ownerKey).not.toContain(credential.authKey);
+    const request = new AbortController();
+    await expect(api.getVoiceInputDictionary(request.signal)).resolves.toBe(dictionary);
+    await app.select("session");
+    expect(api.isCurrent()).toBe(true);
+    await api.setVoiceInputDictionarySyncEnabled(4n, false, request.signal);
+    await api.addVoiceInputDictionaryTerms(4n, ["Joko"], request.signal);
+    await api.editVoiceInputDictionaryEntry(4n, "dictionary-one", "Joko Core", ["jo ko"], request.signal);
+    await api.deleteVoiceInputDictionaryEntry(4n, "dictionary-one", request.signal);
+    const actions = [{ action: "addCandidate", term: "VoiceKit", aliases: ["voice kit"], type: "productName", confidence: "high" }] as const;
+    await api.applyVoiceInputDictionaryLearning(4n, actions, request.signal);
+    expect(network.getVoiceInputDictionary).toHaveBeenCalledExactlyOnceWith(credential, request.signal);
+    expect(network.setVoiceInputDictionarySyncEnabled).toHaveBeenCalledExactlyOnceWith(credential, 4n, false, request.signal);
+    expect(network.addVoiceInputDictionaryTerms).toHaveBeenCalledExactlyOnceWith(credential, 4n, ["Joko"], request.signal);
+    expect(network.editVoiceInputDictionaryEntry).toHaveBeenCalledExactlyOnceWith(credential, 4n, "dictionary-one", "Joko Core", ["jo ko"], request.signal);
+    expect(network.deleteVoiceInputDictionaryEntry).toHaveBeenCalledExactlyOnceWith(credential, 4n, "dictionary-one", request.signal);
+    expect(network.applyVoiceInputDictionaryLearning).toHaveBeenCalledExactlyOnceWith(credential, 4n, actions, request.signal);
+    await expect(api.getVoiceInputDictionaryPeerStatus(request.signal)).resolves.toBe(sharing);
+    await api.grantVoiceInputDictionaryPeer(3n, "node-b", "b".repeat(64), request.signal);
+    await api.revokeVoiceInputDictionaryPeer("node-b", 2n, request.signal);
+    await api.syncVoiceInputDictionaryNow(3n, "node-b", request.signal);
+    await api.configureVoiceInputDictionaryListener(3n, { listenPort: 43_121, host: "self.example", port: 44_121 }, request.signal);
+    await expect(api.getVoiceInputDictionaryPeerInvitation(request.signal)).resolves.toBe(invitation);
+    await api.grantVoiceInputDictionaryDirectPeer(3n, invitation, "b".repeat(64), request.signal);
+    await api.clearVoiceInputDictionaryPeerRoute(3n, "node-b", request.signal);
+    expect(network.getVoiceInputDictionaryPeerStatus).toHaveBeenCalledExactlyOnceWith(credential, request.signal);
+    expect(network.grantVoiceInputDictionaryPeer).toHaveBeenCalledExactlyOnceWith(credential, 3n, "node-b", "b".repeat(64), request.signal);
+    expect(network.revokeVoiceInputDictionaryPeer).toHaveBeenCalledExactlyOnceWith(credential, "node-b", 2n, request.signal);
+    expect(network.syncVoiceInputDictionaryNow).toHaveBeenCalledExactlyOnceWith(credential, 3n, "node-b", request.signal);
+    expect(network.configureVoiceInputDictionaryListener).toHaveBeenCalledExactlyOnceWith(credential, 3n, { listenPort: 43_121, host: "self.example", port: 44_121 }, request.signal);
+    expect(network.getVoiceInputDictionaryPeerInvitation).toHaveBeenCalledExactlyOnceWith(credential, request.signal);
+    expect(network.grantVoiceInputDictionaryDirectPeer).toHaveBeenCalledExactlyOnceWith(credential, 3n, invitation, "b".repeat(64), request.signal);
+    expect(network.clearVoiceInputDictionaryPeerRoute).toHaveBeenCalledExactlyOnceWith(credential, 3n, "node-b", request.signal);
+    app.setForeground(false);
+    expect(api.isCurrent()).toBe(false);
+    await expect(api.addVoiceInputDictionaryTerms(4n, ["RetiredTerm"])).rejects.toThrow(/authority changed/u);
+    expect(network.addVoiceInputDictionaryTerms).toHaveBeenCalledOnce();
+    await expect(api.grantVoiceInputDictionaryPeer(3n, "retired", "c".repeat(64))).rejects.toThrow(/authority changed/u);
+    expect(network.grantVoiceInputDictionaryPeer).toHaveBeenCalledOnce();
+    await expect(api.clearVoiceInputDictionaryPeerRoute(3n, "node-b")).rejects.toThrow(/authority changed/u);
+    expect(network.clearVoiceInputDictionaryPeerRoute).toHaveBeenCalledOnce();
+    app.setForeground(true);
+    await vi.waitFor(() => expect(app.voiceDictionaryTransport()?.isCurrent()).toBe(true));
+    expect(api.isCurrent()).toBe(false);
+  });
+
+  it.each(["cancel", "generation", "revocation"] as const)("rejects a late dictionary projection after %s", async (change) => {
+    const network = fakeNetwork();
+    const app = client(network, memoryStorage(credential).storage);
+    await app.start();
+    const api = app.voiceDictionaryTransport()!;
+    let finish!: (value: Awaited<ReturnType<MobileNetwork["getVoiceInputDictionary"]>>) => void;
+    vi.mocked(network.getVoiceInputDictionary).mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+    const request = new AbortController();
+    const result = api.getVoiceInputDictionary(request.signal);
+    if (change === "cancel") request.abort();
+    else {
+      const current = app.state.owner!;
+      const updatedDevice = create(DeviceSchema, { ...device, revoked: change === "revocation" });
+      const updated = create(SnapshotSchema, { ...current, generation: change === "generation" ? current.generation + 1n : current.generation,
+        devices: [updatedDevice] });
+      vi.mocked(network.readOwner).mockResolvedValue({ connection, device: updatedDevice, snapshot: updated });
+      vi.mocked(network.readSession).mockResolvedValue(updated);
+      await app.refresh();
+    }
+    finish({ revision: 4n, syncEnabled: true, dictionary: { entries: [], candidates: [], suppressedAutomaticTexts: [] }, refinementTerms: [] });
+    await expect(result).rejects.toThrow(/authority changed|cancelled/u);
+    if (change !== "cancel") {
+      await expect(api.deleteVoiceInputDictionaryEntry(4n, "retired")).rejects.toThrow(/authority changed/u);
+      expect(network.deleteVoiceInputDictionaryEntry).not.toHaveBeenCalled();
+    }
+  });
+
   it("binds Voice Input RPCs to the exact live surface and retains only exact-session cleanup after retirement", async () => {
     const network = fakeNetwork();
     const saved = memoryStorage(credential);
@@ -2139,7 +2419,9 @@ describe("native mobile connection and operation ownership", () => {
       },
       supportsLocale: true,
       supportsLiveDrafts: true,
-      supportsRefinement: true
+      supportsRefinement: true,
+      supportsRecognitionContext: true, recognitionContextMaximumItems: 20,
+      recognitionContextMaximumItemBytes: 2_048, recognitionContextMaximumBytes: 8_192, supportedLocales: []
     };
     const voiceSession: MobileVoiceSession = {
       id: "voice-one",
@@ -2166,7 +2448,7 @@ describe("native mobile connection and operation ownership", () => {
     expect(newTaskVoice).toBeDefined();
     expect(newTaskVoice?.isCurrent()).toBe(true);
     await expect(newTaskVoice!.getCapabilities()).resolves.toBe(voiceCapability);
-    const refinement = { instructions: "Keep commands verbatim.", dictionaryTerms: ["VoiceKit"] };
+    const refinement = { instructions: "Keep commands verbatim." };
     await expect(newTaskVoice!.start("request-one", "audio/pcm", "en-US", refinement)).resolves.toBe(voiceSession);
     expect(network.startVoiceInput).toHaveBeenCalledWith(
       credential,
@@ -2184,6 +2466,13 @@ describe("native mobile connection and operation ownership", () => {
     };
     await expect(newTaskVoice!.adviseVoiceInputDictionaryEdit(adviceDraft)).resolves.toEqual({ actions: [] });
     expect(network.adviseVoiceInputDictionaryEdit).toHaveBeenCalledWith(credential, adviceDraft, undefined);
+    const dictionary = { revision: 3n, syncEnabled: true, dictionary: EMPTY_MOBILE_VOICE_DICTIONARY, refinementTerms: [] };
+    vi.mocked(network.getVoiceInputDictionary).mockResolvedValue(dictionary);
+    vi.mocked(network.applyVoiceInputDictionaryLearning).mockResolvedValue({ ...dictionary, revision: 4n });
+    await expect(newTaskVoice!.getVoiceInputDictionary()).resolves.toBe(dictionary);
+    await newTaskVoice!.applyVoiceInputDictionaryLearning(3n, []);
+    expect(network.getVoiceInputDictionary).toHaveBeenCalledWith(credential, undefined);
+    expect(network.applyVoiceInputDictionaryLearning).toHaveBeenCalledWith(credential, 3n, [], undefined);
 
     await app.select("session");
     const taskVoice = app.taskVoiceTransport();
@@ -2191,6 +2480,8 @@ describe("native mobile connection and operation ownership", () => {
     expect(taskVoice?.surfaceOwnerKey).not.toBe(newTaskVoice?.surfaceOwnerKey);
     app.setForeground(false);
     expect(taskVoice?.isCurrent()).toBe(false);
+    await expect(taskVoice!.applyVoiceInputDictionaryLearning(3n, [])).rejects.toThrow(/authority changed/i);
+    expect(network.applyVoiceInputDictionaryLearning).toHaveBeenCalledTimes(1);
     await expect(taskVoice!.get("voice-one")).rejects.toThrow(/authority changed/i);
     await expect(taskVoice!.cancel("voice-one")).resolves.toMatchObject({ outcome: "cancelled" });
     expect(network.getVoiceInputSession).not.toHaveBeenCalled();

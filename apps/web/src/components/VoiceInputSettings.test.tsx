@@ -1,13 +1,17 @@
 // @vitest-environment jsdom
 
 import { act } from "react";
+import { defaultVoiceInputSaucSettings } from "@joko/contracts";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AppController } from "../controller.js";
 import { translate } from "../i18n.js";
-import { emptySnapshot, type VoiceInputCapabilityView } from "../model.js";
+import { emptySnapshot, type VoiceInputCapabilityView, type VoiceInputDictionaryEntryView, type VoiceInputDictionarySnapshotView } from "../model.js";
 import { readVoiceInputPreferences, writeVoiceInputPreferences } from "../voice-input-preferences.js";
 import { VoiceInputSettings } from "./VoiceInputSettings.js";
+import { dictionaryWatchFixture, idleDictionaryWatch } from "../voice-dictionary.test-support.js";
+
+const dictionaryWatches = { watchVoiceInputDictionary: idleDictionaryWatch, watchVoiceInputDictionaryPeerStatus: idleDictionaryWatch };
 
 const roots: Root[] = [];
 const addDeviceListener = vi.fn();
@@ -16,6 +20,7 @@ const removeDeviceListener = vi.fn();
 beforeEach(() => {
   (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
   localStorage.clear();
+  Object.defineProperty(document, "visibilityState", { configurable: true, value: "visible" });
   vi.stubGlobal("MediaRecorder", class {
     static isTypeSupported(value: string): boolean { return value === "audio/webm"; }
   });
@@ -34,12 +39,134 @@ afterEach(async () => {
   for (const root of roots.splice(0).reverse()) await act(async () => root.unmount());
   document.body.replaceChildren();
   Reflect.deleteProperty(window, "jokoDesktop");
+  Reflect.deleteProperty(document, "visibilityState");
   vi.unstubAllGlobals();
   vi.clearAllMocks();
   Reflect.deleteProperty(globalThis, "IS_REACT_ACT_ENVIRONMENT");
 });
 
 describe("VoiceInputSettings", () => {
+  it("configures independent SAUC routes with credential authority, explicit local context and retired page requests", async () => {
+    const { contextData: _oldContext, recognitionContextEnabled: _oldAuthorization, ...oldPreferences } = readVoiceInputPreferences();
+    localStorage.setItem("joko.voice-input.preferences.v1", JSON.stringify({ ...oldPreferences, locale: "en", refinementInstructions: "Old private setting" }));
+    const base = emptySnapshot();
+    const state = { snapshot: { ...base, settings: { ...base.settings, voiceInput: { ...base.settings.voiceInput,
+      enabled: true, protocol: "volcengineSauc" as const, endpoint: "wss://speech.example/api/v3/sauc/bigmodel_async",
+      resourceId: "volc.seedasr.sauc.duration", credentialConfigured: true, sauc: defaultVoiceInputSaucSettings(), revision: 7n,
+      fallbackEnabled: true, fallbackProtocol: "volcengineSauc" as const, fallbackEndpoint: "wss://backup.example/api/v3/sauc/bigmodel_async",
+      fallbackResourceId: "volc.seedasr.sauc.concurrent", fallbackCredentialConfigured: true, fallbackSauc: defaultVoiceInputSaucSettings() } } },
+      preferences: { appShortcutOverrides: {} } };
+    let finishSave!: () => void;
+    const update = vi.fn().mockResolvedValueOnce(undefined).mockImplementationOnce(() => new Promise<void>((resolve) => { finishSave = resolve; }));
+    let finishProbe!: (result: { ok: true }) => void;
+    const test = vi.fn((_signal?: AbortSignal) => new Promise<{ ok: true }>((resolve) => { finishProbe = resolve; }));
+    const controller = { state, getVoiceInputCapabilities: vi.fn(async () => ({ ...capability, supportsRecognitionContext: false, supportedLocales: ["en-US"] })),
+      updateVoiceInputServiceSettings: update, testVoiceInputConnection: test } as unknown as AppController;
+    const container = document.body.appendChild(document.createElement("div"));
+    const root = createRoot(container); roots.push(root);
+    await act(async () => root.render(<VoiceInputSettings controller={controller} t={(key, values) => translate("en", key, values)} />));
+    const button = (text: string) => [...container.querySelectorAll<HTMLButtonElement>("button")].find((item) => item.textContent === text)!;
+    const field = (label: string) => container.querySelector<HTMLInputElement>(`[aria-label="${label}"]`)!;
+    expect(container.querySelector<HTMLButtonElement>('[aria-label="Spoken language"]')!.disabled).toBe(true);
+    expect(container.textContent).toContain("Stored voice preferences use an incompatible shape.");
+    await act(async () => button("Reset voice preferences").click());
+    expect(readVoiceInputPreferences()).toMatchObject({ locale: "auto", refinementInstructions: "", recognitionContextEnabled: false, contextData: [] });
+    await chooseSelect(container.querySelector<HTMLButtonElement>('[aria-label="Recognition mode"]')!, "Stream input");
+    await chooseSelect(container.querySelector<HTMLButtonElement>('[aria-label="Backup Recognition mode"]')!, "Bidirectional");
+    await act(async () => field("Send dictionary main terms as hotwords").click());
+    await act(async () => setInput(field("Boosting table ID"), "boosting-id"));
+    await act(async () => button("Save transcription service").click());
+    expect(update).toHaveBeenCalledWith(expect.objectContaining({ expectedRevision: 7n, endpoint: "wss://speech.example/api/v3/sauc/bigmodel_nostream",
+      sauc: expect.objectContaining({ mode: "streamInput", authentication: "apiKey", useDictionaryHotwords: true, boostingTableId: "boosting-id" }),
+      fallbackEndpoint: "wss://backup.example/api/v3/sauc/bigmodel", fallbackSauc: expect.objectContaining({ mode: "bidirectional", useDictionaryHotwords: false }) }), expect.any(AbortSignal));
+    expect(update.mock.calls[0]![0]).not.toHaveProperty("secret");
+    await chooseSelect(container.querySelector<HTMLButtonElement>('[aria-label="Authentication"]')!, "APP ID and access token");
+    await act(async () => setInput(field("APP ID"), "public-app"));
+    await act(async () => button("Save transcription service").click());
+    expect(update).toHaveBeenCalledTimes(1);
+    expect(container.textContent).toContain("Replace or clear the saved credential");
+    await act(async () => button("Add context").click());
+    await act(async () => setInput(container.querySelector<HTMLTextAreaElement>('[aria-label="Recognition context 1"]')!, "  First\r\nSecond  "));
+    await act(async () => field("Allow sending my recognition context").click());
+    await act(async () => button("Save context on this device").click());
+    expect(readVoiceInputPreferences()).toMatchObject({ recognitionContextEnabled: true, contextData: ["First\nSecond"] });
+    expect(container.textContent).toContain("Your text and choice remain on this device and will not be sent.");
+    expect(update).toHaveBeenCalledTimes(1);
+    await act(async () => setInput(field("Access token"), "private-token"));
+    await act(async () => button("Save transcription service").click());
+    const saveSignal = update.mock.calls[1]![1] as AbortSignal;
+    expect(update.mock.calls[1]![0]).toMatchObject({ sauc: expect.objectContaining({ authentication: "accessToken", appId: "public-app" }), secret: "private-token" });
+    expect(JSON.stringify(localStorage)).not.toContain("private-token");
+    Object.defineProperty(document, "visibilityState", { configurable: true, value: "hidden" });
+    await act(async () => document.dispatchEvent(new Event("visibilitychange")));
+    expect(saveSignal.aborted).toBe(true); expect(field("Access token").value).toBe("");
+    await act(async () => finishSave());
+    expect(container.textContent).not.toContain("Transcription service saved.");
+    Object.defineProperty(document, "visibilityState", { configurable: true, value: "visible" });
+    await act(async () => document.dispatchEvent(new Event("visibilitychange")));
+    // Restore the saved route before testing its connection, then retire this page's owner.
+    await chooseSelect(container.querySelector<HTMLButtonElement>('[aria-label="Authentication"]')!, "API key");
+    await chooseSelect(container.querySelector<HTMLButtonElement>('[aria-label="Recognition mode"]')!, "Async two-pass");
+    await chooseSelect(container.querySelector<HTMLButtonElement>('[aria-label="Backup Recognition mode"]')!, "Async two-pass");
+    await act(async () => field("Send dictionary main terms as hotwords").click());
+    await act(async () => setInput(field("Boosting table ID"), ""));
+    await act(async () => button("Test connection").click());
+    expect(test).toHaveBeenCalledOnce();
+    const probeSignal = test.mock.calls[0]![0] as AbortSignal;
+    await act(async () => window.dispatchEvent(new Event("pagehide")));
+    expect(probeSignal.aborted).toBe(true);
+    await act(async () => finishProbe({ ok: true }));
+    expect(container.textContent).not.toContain("Transcription connection succeeded.");
+  });
+  it("preserves pushed revisions and frozen editor drafts, exposes disconnect as readonly, and retires hidden streams", async () => {
+    const base = emptySnapshot();
+    const updates = dictionaryWatchFixture<VoiceInputDictionarySnapshotView>();
+    let initial!: (value: VoiceInputDictionarySnapshotView) => void;
+    const getDictionary = vi.fn().mockImplementationOnce(() => new Promise<VoiceInputDictionarySnapshotView>((resolve) => { initial = resolve; }))
+      .mockResolvedValue(dictionarySnapshot([dictionaryEntry("source", "RemoteTerm")], 4n));
+    const editEntry = vi.fn(async () => { throw new Error("revision conflict"); });
+    let added!: (value: VoiceInputDictionarySnapshotView) => void;
+    const addTerms = vi.fn(() => new Promise<VoiceInputDictionarySnapshotView>((resolve) => { added = resolve; }));
+    const watch = vi.fn(updates.watch);
+    const controller = { ...dictionaryWatches,
+      state: { snapshot: { ...base, settings: { ...base.settings, voiceInput: { ...base.settings.voiceInput, refinementEnabled: true } } }, preferences: { appShortcutOverrides: {} } },
+      getVoiceInputCapabilities: vi.fn(async () => capability), getVoiceInputDictionary: getDictionary, watchVoiceInputDictionary: watch,
+      editVoiceInputDictionaryEntry: editEntry, addVoiceInputDictionaryTerms: addTerms } as unknown as AppController;
+    const container = document.body.appendChild(document.createElement("div"));
+    const root = createRoot(container); roots.push(root);
+    const click = async (label: string): Promise<void> => { await act(async () => [...container.querySelectorAll<HTMLButtonElement>("button")].find((button) => button.textContent === label)!.click()); };
+    await act(async () => root.render(<VoiceInputSettings controller={controller} t={(key, values) => translate("en", key, values)} />));
+    await act(async () => updates.push(dictionarySnapshot([dictionaryEntry("source", "SourceTerm")], 3n)));
+    await act(async () => initial(dictionarySnapshot([], 1n)));
+    await click("Edit");
+    await act(async () => setInput(container.querySelector<HTMLInputElement>('[aria-label="Edit dictionary term"]')!, "MyDraft"));
+    await act(async () => updates.push(dictionarySnapshot([dictionaryEntry("source", "RemoteTerm")], 4n)));
+    expect(container.querySelector<HTMLInputElement>('[aria-label="Edit dictionary term"]')?.value).toBe("MyDraft");
+    await click("Save");
+    expect(editEntry).toHaveBeenCalledExactlyOnceWith(3n, "source", "MyDraft", [], expect.any(AbortSignal));
+    expect(container.querySelector<HTMLInputElement>('[aria-label="Edit dictionary term"]')?.value).toBe("MyDraft");
+    await click("Cancel");
+    await act(async () => setInput(container.querySelector<HTMLInputElement>('[aria-label="New dictionary term"]')!, "Added"));
+    await click("Add term");
+    await act(async () => updates.push(dictionarySnapshot([dictionaryEntry("source", "LiveAfter")], 6n)));
+    await act(async () => added(dictionarySnapshot([dictionaryEntry("source", "OldReply")], 5n)));
+    expect(container.textContent).toContain("LiveAfter"); expect(container.textContent).not.toContain("OldReply");
+    await act(async () => updates.end());
+    expect(container.querySelector<HTMLButtonElement>('[aria-label="Sync dictionary across linked devices"]')?.disabled).toBe(true);
+    expect(container.textContent).toContain("The service dictionary could not be loaded.");
+    await click("Retry");
+    expect(watch).toHaveBeenCalledTimes(2);
+    await act(async () => updates.push(dictionarySnapshot([dictionaryEntry("source", "Reconnected")], 7n)));
+    expect(container.querySelector<HTMLButtonElement>('[aria-label="Sync dictionary across linked devices"]')?.disabled).toBe(false);
+    Object.defineProperty(document, "visibilityState", { configurable: true, value: "hidden" });
+    await act(async () => document.dispatchEvent(new Event("visibilitychange")));
+    expect(updates.count).toBe(0);
+    expect(watch.mock.calls[1]![0].aborted).toBe(true);
+    Object.defineProperty(document, "visibilityState", { configurable: true, value: "visible" });
+    await act(async () => document.dispatchEvent(new Event("visibilitychange")));
+    expect(watch).toHaveBeenCalledTimes(3);
+    expect(addTerms).toHaveBeenCalledOnce();
+  });
   it("keeps same-named refinement models on different runtimes independently selectable", async () => {
     const base = emptySnapshot();
     const update = vi.fn(async () => undefined);
@@ -51,14 +178,14 @@ describe("VoiceInputSettings", () => {
             contextWindowTokens: 128_000, maximumOutputTokens: 4096, inputCostMicrosPerMillion: 0, outputCostMicrosPerMillion: 0, cacheReadCostMicrosPerMillion: 0,
             cacheWriteCostMicrosPerMillion: 0, thinkingLevels: [], supportsFastMode: false }] }))
       }] } };
-    const controller = { state: { snapshot, preferences: { appShortcutOverrides: {} } }, getVoiceInputCapabilities: vi.fn(async () => capability), updateVoiceInputServiceSettings: update } as unknown as AppController;
+    const controller = { ...dictionaryWatches, state: { snapshot, preferences: { appShortcutOverrides: {} } }, getVoiceInputCapabilities: vi.fn(async () => capability), getVoiceInputDictionary: vi.fn(async () => dictionarySnapshot()), updateVoiceInputServiceSettings: update } as unknown as AppController;
     const container = document.createElement("div"); document.body.append(container); const root = createRoot(container); roots.push(root);
     await act(async () => root.render(<VoiceInputSettings controller={controller} t={(key, values) => translate("en", key, values)} />));
     await chooseSelect(container.querySelector<HTMLButtonElement>('[aria-label="Refinement model"]')!, "Text provider · Text model · text-one");
     await chooseSelect(container.querySelector<HTMLButtonElement>('[aria-label="Backup refinement model"]')!, "Text provider · Text model · text-two");
     await act(async () => [...container.querySelectorAll<HTMLButtonElement>("button")].find((button) => button.textContent === "Save transcription service")!.click());
     expect(update).toHaveBeenCalledWith(expect.objectContaining({ refinerModel: { backendId: "text-one", providerId: "same-provider", modelId: "same-model" },
-      refinerFallbackModel: { backendId: "text-two", providerId: "same-provider", modelId: "same-model" } }));
+      refinerFallbackModel: { backendId: "text-two", providerId: "same-provider", modelId: "same-model" } }), expect.any(AbortSignal));
   });
 
   it("configures independent SAUC resources and credentials for both routes", async () => {
@@ -80,7 +207,7 @@ describe("VoiceInputSettings", () => {
     expect(container.querySelector<HTMLButtonElement>('[aria-label="Spoken language"]')?.disabled).toBe(true);
     expect(container.querySelector('[aria-label="Spoken language"]')?.textContent).toBe("Automatic");
     expect(readVoiceInputPreferences().locale).toBe("en");
-    expect(container.textContent).toContain("detects the spoken language automatically");
+    expect(container.textContent).toContain("Choose the resource enabled for this route's credentials.");
     await act(async () => container.querySelector<HTMLButtonElement>('[aria-label="Backup transcription route"]')!.click());
     await chooseSelect(container.querySelector<HTMLButtonElement>('[aria-label="Backup protocol"]')!, "Volcengine SAUC");
     await chooseSelect(container.querySelector<HTMLButtonElement>('[aria-label="Backup resource ID"]')!, "volc.bigasr.sauc.concurrent");
@@ -92,7 +219,7 @@ describe("VoiceInputSettings", () => {
     expect(update).toHaveBeenCalledWith(expect.objectContaining({
       protocol: "volcengineSauc", model: "", resourceId: "volc.seedasr.sauc.duration", keyless: false, secret: "primary-sauc-key",
       fallbackEnabled: true, fallbackProtocol: "volcengineSauc", fallbackModel: "", fallbackResourceId: "volc.bigasr.sauc.concurrent", fallbackKeyless: false, fallbackSecret: "backup-sauc-key"
-    }));
+    }), expect.any(AbortSignal));
     expect([...container.querySelectorAll<HTMLInputElement>('input[type="password"]')].every((input) => input.value === "")).toBe(true);
     await chooseSelect(container.querySelector<HTMLButtonElement>('[aria-label="Transcription protocol"]')!, "ElevenLabs Scribe realtime");
     expect(container.querySelector('[aria-label="Transcription resource ID"]')).toBeNull();
@@ -122,10 +249,10 @@ describe("VoiceInputSettings", () => {
     const save = [...container.querySelectorAll<HTMLButtonElement>("button")].find((button) => button.textContent === "Save transcription service")!;
     await act(async () => save.click());
     expect(update).not.toHaveBeenCalled();
-    expect(container.textContent).toContain("Replace or clear the saved key");
+    expect(container.textContent).toContain("Replace or clear the saved credential");
     await act(async () => setInput(container.querySelector<HTMLInputElement>('input[type="password"]')!, "new-scribe-key"));
     await act(async () => save.click());
-    expect(update).toHaveBeenCalledWith(expect.objectContaining({ protocol: "elevenLabsScribeRealtime", model: "scribe_v2_realtime", secret: "new-scribe-key" }));
+    expect(update).toHaveBeenCalledWith(expect.objectContaining({ protocol: "elevenLabsScribeRealtime", model: "scribe_v2_realtime", secret: "new-scribe-key" }), expect.any(AbortSignal));
     expect(container.querySelector<HTMLInputElement>('input[type="password"]')?.value).toBe("");
     expect(JSON.stringify(localStorage)).not.toContain("new-scribe-key");
   });
@@ -169,8 +296,8 @@ describe("VoiceInputSettings", () => {
       deviceId: "mic-one",
       shortcut: { code: "KeyM", key: "m", meta: false, ctrl: false, alt: true, shift: true, fn: false },
       refinementInstructions: "",
-      dictionary: { entries: [], candidates: [], suppressedAutomaticTexts: [] },
-      dictionaryTerms: [],
+      recognitionContextEnabled: false,
+      contextData: [],
       autoDictionaryEnabled: true,
       playInteractionSound: true,
       fastActivationEnabled: false,
@@ -199,7 +326,7 @@ describe("VoiceInputSettings", () => {
     await act(async () => render());
     const button = (label: string): HTMLButtonElement => [...container.querySelectorAll<HTMLButtonElement>("button")].find((item) => item.textContent === label)!;
     await act(async () => button("Test connection").click());
-    expect(test).toHaveBeenCalledWith();
+    expect(test).toHaveBeenCalledWith(expect.any(AbortSignal));
     if (change === "protocol edit") {
       await chooseSelect(container.querySelector<HTMLButtonElement>('button[role="combobox"][aria-label="Transcription protocol"]')!, "ElevenLabs Scribe realtime");
     } else if (change === "fallback edit") {
@@ -222,7 +349,7 @@ describe("VoiceInputSettings", () => {
     expect(button("Test connection").disabled).toBe(change === "protocol edit" || change === "fallback edit");
   });
 
-  it("manages rich local dictionary entries and the automatic-learning preference", async () => {
+  it("waits for service commits while managing entries, aliases, merge, deletion and sync", async () => {
     const base = emptySnapshot();
     const snapshot = {
       ...base,
@@ -231,9 +358,28 @@ describe("VoiceInputSettings", () => {
         voiceInput: { ...base.settings.voiceInput, refinementEnabled: true }
       }
     };
+    const initialEntry = dictionaryEntry("voice-kit", "VoiceKit");
+    const aliasedEntry = { ...initialEntry, aliases: ["voice kit", "new variant"].map((text) => ({ text, count: 1, lastSeenAt: 1_000 })) };
+    const destination = dictionaryEntry("canonical", "Canonical");
+    let finishAdd!: (snapshot: VoiceInputDictionarySnapshotView) => void;
+    const addTerms = vi.fn()
+      .mockImplementationOnce(() => new Promise<VoiceInputDictionarySnapshotView>((resolve) => { finishAdd = resolve; }))
+      .mockResolvedValueOnce(dictionarySnapshot([aliasedEntry, destination], 4n))
+      .mockResolvedValueOnce(dictionarySnapshot([dictionaryEntry("imported", "Imported"), dictionaryEntry("next", "Next")], 7n));
+    const editEntry = vi.fn()
+      .mockResolvedValueOnce(dictionarySnapshot([aliasedEntry], 3n))
+      .mockResolvedValueOnce(dictionarySnapshot([{ ...destination, aliases: aliasedEntry.aliases, frequency: 2 }], 5n));
+    const deleteEntry = vi.fn(async () => dictionarySnapshot([], 6n));
+    const setSync = vi.fn(async () => ({ ...dictionarySnapshot([dictionaryEntry("imported", "Imported"), dictionaryEntry("next", "Next")], 8n), syncEnabled: true }));
     const controller = {
       state: { snapshot, preferences: { appShortcutOverrides: {} } },
       getVoiceInputCapabilities: vi.fn(async () => capability),
+      getVoiceInputDictionary: vi.fn(async () => dictionarySnapshot()),
+      ...dictionaryWatches,
+      addVoiceInputDictionaryTerms: addTerms,
+      editVoiceInputDictionaryEntry: editEntry,
+      deleteVoiceInputDictionaryEntry: deleteEntry,
+      setVoiceInputDictionarySyncEnabled: setSync,
       testVoiceInputConnection: vi.fn(async () => ({ ok: true } as const))
     } as unknown as AppController;
     const container = document.createElement("div");
@@ -244,11 +390,14 @@ describe("VoiceInputSettings", () => {
 
     const newTerm = container.querySelector<HTMLInputElement>('input[aria-label="New dictionary term"]')!;
     const add = [...container.querySelectorAll<HTMLButtonElement>("button")].find((button) => button.textContent === "Add term")!;
-    await act(async () => {
-      setInput(newTerm, "VoiceKit");
-      add.click();
-    });
-    expect(readVoiceInputPreferences().dictionary.entries).toMatchObject([{ text: "VoiceKit", source: "manual" }]);
+    await act(async () => setInput(newTerm, "VoiceKit"));
+    await act(async () => add.click());
+    expect(addTerms).toHaveBeenCalledExactlyOnceWith(1n, ["VoiceKit"], expect.any(AbortSignal));
+    expect(add.disabled).toBe(true);
+    expect(newTerm.value).toBe("VoiceKit");
+    expect(container.querySelectorAll(".voice-input-dictionary-list article")).toHaveLength(0);
+    await act(async () => finishAdd(dictionarySnapshot([initialEntry], 2n)));
+    expect(newTerm.value).toBe("");
     expect(container.textContent).toContain("VoiceKit");
 
     let entry = container.querySelector<HTMLElement>(".voice-input-dictionary-list article")!;
@@ -258,11 +407,11 @@ describe("VoiceInputSettings", () => {
     await act(async () => setInput(aliases, "voice kit\nVoiceKit\nvoice kit\nnew variant"));
     const save = [...entry.querySelectorAll<HTMLButtonElement>("button")].find((button) => button.textContent === "Save")!;
     await act(async () => save.click());
-    expect(readVoiceInputPreferences().dictionary.entries[0]?.aliases.map((alias) => alias.text)).toEqual(["voice kit", "new variant"]);
+    expect(editEntry).toHaveBeenLastCalledWith(2n, initialEntry.id, "VoiceKit", ["voice kit", "new variant"], expect.any(AbortSignal));
     expect(entry.textContent).toContain("Recognized from: voice kit, new variant");
     await act(async () => setInput(newTerm, "Canonical"));
     await act(async () => add.click());
-    const destinationId = readVoiceInputPreferences().dictionary.entries.find((value) => value.text === "Canonical")!.id;
+    expect(addTerms).toHaveBeenLastCalledWith(3n, ["Canonical"], expect.any(AbortSignal));
     await act(async () => [...entry.querySelectorAll<HTMLButtonElement>("button")].find((button) => button.textContent === "Edit")!.click());
     await act(async () => setInput(container.querySelector<HTMLInputElement>('[aria-label="Edit dictionary term"]')!, "Canonical"));
     expect(entry.textContent).toContain("Saving will merge with the existing term");
@@ -270,7 +419,7 @@ describe("VoiceInputSettings", () => {
       const merge = [...entry.querySelectorAll<HTMLButtonElement>("button")].find((button) => button.textContent === "Save")!;
       merge.focus(); merge.click();
     });
-    expect(readVoiceInputPreferences().dictionary.entries).toMatchObject([{ id: destinationId, text: "Canonical", frequency: 2 }]);
+    expect(editEntry).toHaveBeenLastCalledWith(4n, initialEntry.id, "Canonical", ["voice kit", "new variant"], expect.any(AbortSignal));
     expect(container.querySelectorAll(".voice-input-dictionary-list article")).toHaveLength(1);
     expect(container.textContent).toContain("Dictionary entries merged.");
     entry = container.querySelector<HTMLElement>(".voice-input-dictionary-list article")!;
@@ -279,11 +428,92 @@ describe("VoiceInputSettings", () => {
     expect(container.querySelector<HTMLTextAreaElement>('[aria-label="Edit recognition aliases"]')?.value).toBe("voice kit\nnew variant");
     await act(async () => setInput(container.querySelector<HTMLInputElement>('[aria-label="Edit dictionary term"]')!, ""));
     await act(async () => [...entry.querySelectorAll<HTMLButtonElement>("button")].find((button) => button.textContent === "Save")!.click());
-    expect(readVoiceInputPreferences().dictionary.entries).toEqual([]);
+    expect(deleteEntry).toHaveBeenCalledExactlyOnceWith(5n, destination.id, expect.any(AbortSignal));
+    expect(container.querySelectorAll(".voice-input-dictionary-list article")).toHaveLength(0);
+    const file = new File(["Imported\nImported\nNext"], "terms.csv", { type: "text/csv" });
+    Object.defineProperty(file, "text", { value: async () => "Imported\nImported\nNext" });
+    const importInput = container.querySelector<HTMLInputElement>('#voice-input-dictionary-import')!;
+    Object.defineProperty(importInput, "files", { configurable: true, value: [file] });
+    await act(async () => importInput.dispatchEvent(new Event("change", { bubbles: true })));
+    expect(addTerms).toHaveBeenLastCalledWith(6n, ["Imported", "Next"], expect.any(AbortSignal));
+    expect(container.querySelectorAll(".voice-input-dictionary-list article")).toHaveLength(2);
+    await act(async () => container.querySelector<HTMLButtonElement>('[aria-label="Sync dictionary across linked devices"]')!.click());
+    expect(setSync).toHaveBeenCalledExactlyOnceWith(7n, true, expect.any(AbortSignal));
+    expect(readVoiceInputPreferences()).not.toHaveProperty("dictionary");
 
     const automatic = container.querySelector<HTMLButtonElement>('button[aria-label="Learn vocabulary from corrections"]')!;
     await act(async () => automatic.click());
     expect(readVoiceInputPreferences().autoDictionaryEnabled).toBe(false);
+  });
+
+  it("retries dictionary loading and refreshes the service revision after a failed save without clearing the draft", async () => {
+    const base = emptySnapshot();
+    const getDictionary = vi.fn().mockRejectedValueOnce(new Error("Unavailable"))
+      .mockResolvedValueOnce(dictionarySnapshot([], 3n))
+      .mockResolvedValueOnce(dictionarySnapshot([dictionaryEntry("remote", "RemoteTerm")], 4n));
+    const addTerms = vi.fn(async () => { throw new Error("Revision conflict"); });
+    const controller = {
+      state: { snapshot: { ...base, settings: { ...base.settings, voiceInput: { ...base.settings.voiceInput, refinementEnabled: true } } }, preferences: { appShortcutOverrides: {} } },
+      getVoiceInputCapabilities: vi.fn(async () => capability), getVoiceInputDictionary: getDictionary,
+      ...dictionaryWatches,
+      addVoiceInputDictionaryTerms: addTerms
+    } as unknown as AppController;
+    const container = document.body.appendChild(document.createElement("div"));
+    const root = createRoot(container); roots.push(root);
+    await act(async () => root.render(<VoiceInputSettings controller={controller} t={(key, values) => translate("en", key, values)} />));
+    const add = () => [...container.querySelectorAll<HTMLButtonElement>("button")].find((button) => button.textContent === "Add term")!;
+    expect(container.textContent).toContain("The service dictionary could not be loaded.");
+    expect(add().disabled).toBe(true);
+    await act(async () => [...container.querySelectorAll<HTMLButtonElement>("button")].find((button) => button.textContent === "Retry")!.click());
+    const input = container.querySelector<HTMLInputElement>('[aria-label="New dictionary term"]')!;
+    await act(async () => setInput(input, "LocalTerm"));
+    await act(async () => add().click());
+    expect(addTerms).toHaveBeenCalledExactlyOnceWith(3n, ["LocalTerm"], expect.any(AbortSignal));
+    expect(getDictionary).toHaveBeenCalledTimes(3);
+    expect(container.textContent).toContain("RemoteTerm");
+    expect(container.querySelectorAll(".voice-input-dictionary-list article")).toHaveLength(1);
+    expect(container.textContent).toContain("The dictionary changed or could not be saved.");
+    expect(input.value).toBe("LocalTerm");
+    expect(add().disabled).toBe(false);
+  });
+
+  it.each(["save", "import"] as const)("retires a pending dictionary %s when its service owner changes", async (operation) => {
+    const base = emptySnapshot();
+    let finishSave!: (snapshot: VoiceInputDictionarySnapshotView) => void;
+    let finishFile!: (text: string) => void;
+    const addTerms = vi.fn((_revision: bigint, _terms: readonly string[], _signal?: AbortSignal) => new Promise<VoiceInputDictionarySnapshotView>((resolve) => { finishSave = resolve; }));
+    const controller = {
+      state: { snapshot: { ...base, settings: { ...base.settings, voiceInput: { ...base.settings.voiceInput, refinementEnabled: true } } }, preferences: { appShortcutOverrides: {} } },
+      getVoiceInputCapabilities: vi.fn(async () => capability), getVoiceInputDictionary: vi.fn(async () => dictionarySnapshot()),
+      ...dictionaryWatches,
+      addVoiceInputDictionaryTerms: addTerms
+    } as unknown as AppController;
+    const container = document.body.appendChild(document.createElement("div"));
+    const root = createRoot(container); roots.push(root);
+    const render = async (value: AppController) => { await act(async () => root.render(<VoiceInputSettings controller={value} t={(key, values) => translate("en", key, values)} />)); };
+    await render(controller);
+    if (operation === "save") {
+      await act(async () => setInput(container.querySelector<HTMLInputElement>('[aria-label="New dictionary term"]')!, "RetiredTerm"));
+      await act(async () => [...container.querySelectorAll<HTMLButtonElement>("button")].find((button) => button.textContent === "Add term")!.click());
+    } else {
+      const file = new File(["RetiredTerm"], "terms.csv", { type: "text/csv" });
+      Object.defineProperty(file, "text", { value: () => new Promise<string>((resolve) => { finishFile = resolve; }) });
+      const input = container.querySelector<HTMLInputElement>('#voice-input-dictionary-import')!;
+      Object.defineProperty(input, "files", { configurable: true, value: [file] });
+      await act(async () => input.dispatchEvent(new Event("change", { bubbles: true })));
+    }
+    const replacement = { ...controller, getVoiceInputDictionary: vi.fn(async () => dictionarySnapshot([dictionaryEntry("new", "CurrentTerm")], 9n)), addVoiceInputDictionaryTerms: vi.fn() };
+    await render(replacement);
+    await act(async () => {
+      if (operation === "save") finishSave(dictionarySnapshot([dictionaryEntry("old", "RetiredTerm")], 2n));
+      else finishFile("RetiredTerm");
+    });
+    expect(container.textContent).toContain("CurrentTerm");
+    expect(container.textContent).not.toContain("RetiredTerm");
+    expect(container.querySelector<HTMLButtonElement>('[aria-label="Sync dictionary across linked devices"]')?.disabled).toBe(false);
+    if (operation === "save") expect(addTerms.mock.calls[0]?.[2]?.aborted).toBe(true);
+    else expect(addTerms).not.toHaveBeenCalled();
+    expect(replacement.addVoiceInputDictionaryTerms).not.toHaveBeenCalled();
   });
 
   it("does not accept recording keys until Desktop has suspended the active global binding", async () => {
@@ -448,6 +678,14 @@ describe("VoiceInputSettings", () => {
   });
 });
 
+function dictionaryEntry(id: string, text: string): VoiceInputDictionaryEntryView {
+  return { id, text, source: "manual", frequency: 1, aliases: [], createdAt: 1_000, updatedAt: 1_000 };
+}
+
+function dictionarySnapshot(entries: readonly VoiceInputDictionaryEntryView[] = [], revision = 1n): VoiceInputDictionarySnapshotView {
+  return { revision, syncEnabled: false, entries, candidates: [], suppressedAutomaticTerms: [], refinementTerms: entries.map((entry) => entry.text) };
+}
+
 const capability: VoiceInputCapabilityView = {
   support: "supported",
   limits: {
@@ -461,6 +699,8 @@ const capability: VoiceInputCapabilityView = {
     maximumConcurrentSessions: 1
   },
   supportsLocale: true,
+  supportedLocales: [], supportsRecognitionContext: true,
+  recognitionContextMaximumItems: 20, recognitionContextMaximumItemBytes: 2_048, recognitionContextMaximumBytes: 8_192,
   supportsLiveDrafts: true,
   supportsRefinement: false
 };

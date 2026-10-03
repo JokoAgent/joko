@@ -479,6 +479,24 @@ service SubagentService {
 service VoiceInputService {
   rpc GetVoiceInputCapabilities(GetVoiceInputCapabilitiesRequest) returns (GetVoiceInputCapabilitiesResponse);
   rpc TestVoiceInputConnection(TestVoiceInputConnectionRequest) returns (TestVoiceInputConnectionResponse);
+  rpc GetVoiceInputDictionary(GetVoiceInputDictionaryRequest) returns (GetVoiceInputDictionaryResponse);
+  rpc WatchVoiceInputDictionary(WatchVoiceInputDictionaryRequest) returns (stream WatchVoiceInputDictionaryResponse);
+  rpc GetVoiceInputDictionaryReadOnly(GetVoiceInputDictionaryReadOnlyRequest) returns (GetVoiceInputDictionaryReadOnlyResponse);
+  rpc WatchVoiceInputDictionaryReadOnly(WatchVoiceInputDictionaryReadOnlyRequest) returns (stream WatchVoiceInputDictionaryReadOnlyResponse);
+  rpc GetVoiceInputDictionaryPeerStatus(GetVoiceInputDictionaryPeerStatusRequest) returns (GetVoiceInputDictionaryPeerStatusResponse);
+  rpc WatchVoiceInputDictionaryPeerStatus(WatchVoiceInputDictionaryPeerStatusRequest) returns (stream WatchVoiceInputDictionaryPeerStatusResponse);
+  rpc GrantVoiceInputDictionaryPeer(GrantVoiceInputDictionaryPeerRequest) returns (GrantVoiceInputDictionaryPeerResponse);
+  rpc RevokeVoiceInputDictionaryPeer(RevokeVoiceInputDictionaryPeerRequest) returns (RevokeVoiceInputDictionaryPeerResponse);
+  rpc SyncVoiceInputDictionaryNow(SyncVoiceInputDictionaryNowRequest) returns (SyncVoiceInputDictionaryNowResponse);
+  rpc ConfigureVoiceInputDictionaryListener(ConfigureVoiceInputDictionaryListenerRequest) returns (ConfigureVoiceInputDictionaryListenerResponse);
+  rpc GetVoiceInputDictionaryPeerInvitation(GetVoiceInputDictionaryPeerInvitationRequest) returns (GetVoiceInputDictionaryPeerInvitationResponse);
+  rpc GrantVoiceInputDictionaryDirectPeer(GrantVoiceInputDictionaryDirectPeerRequest) returns (GrantVoiceInputDictionaryDirectPeerResponse);
+  rpc ClearVoiceInputDictionaryPeerRoute(ClearVoiceInputDictionaryPeerRouteRequest) returns (ClearVoiceInputDictionaryPeerRouteResponse);
+  rpc SetVoiceInputDictionarySyncEnabled(SetVoiceInputDictionarySyncEnabledRequest) returns (SetVoiceInputDictionarySyncEnabledResponse);
+  rpc AddVoiceInputDictionaryTerms(AddVoiceInputDictionaryTermsRequest) returns (AddVoiceInputDictionaryTermsResponse);
+  rpc EditVoiceInputDictionaryEntry(EditVoiceInputDictionaryEntryRequest) returns (EditVoiceInputDictionaryEntryResponse);
+  rpc DeleteVoiceInputDictionaryEntry(DeleteVoiceInputDictionaryEntryRequest) returns (DeleteVoiceInputDictionaryEntryResponse);
+  rpc ApplyVoiceInputDictionaryLearning(ApplyVoiceInputDictionaryLearningRequest) returns (ApplyVoiceInputDictionaryLearningResponse);
   rpc AdviseVoiceInputDictionaryEdit(AdviseVoiceInputDictionaryEditRequest) returns (AdviseVoiceInputDictionaryEditResponse);
   rpc StartVoiceInput(StartVoiceInputRequest) returns (StartVoiceInputResponse);
   rpc AppendVoiceAudio(AppendVoiceAudioRequest) returns (AppendVoiceAudioResponse);
@@ -519,6 +537,154 @@ message TestVoiceInputConnectionResponse {
   VoiceInputConnectionTestFailure failure = 2;
 }
 
+message GetVoiceInputDictionaryRequest {}
+
+message GetVoiceInputDictionaryResponse {
+  VoiceInputDictionarySnapshot dictionary = 1;
+}
+
+message WatchVoiceInputDictionaryRequest {}
+
+message WatchVoiceInputDictionaryResponse {
+  uint64 sequence = 1;
+  VoiceInputDictionarySnapshot dictionary = 2;
+}
+
+message GetVoiceInputDictionaryReadOnlyRequest {}
+
+message GetVoiceInputDictionaryReadOnlyResponse {
+  VoiceInputDictionaryReadOnlySnapshot dictionary = 1;
+}
+
+message WatchVoiceInputDictionaryReadOnlyRequest {}
+
+message WatchVoiceInputDictionaryReadOnlyResponse {
+  uint64 sequence = 1;
+  VoiceInputDictionaryReadOnlySnapshot dictionary = 2;
+}
+
+message WatchVoiceInputDictionaryPeerStatusRequest {}
+
+message WatchVoiceInputDictionaryPeerStatusResponse {
+  uint64 sequence = 1;
+  VoiceInputDictionaryPeerStatus status = 2;
+}
+
+message SetVoiceInputDictionarySyncEnabledRequest {
+  uint64 expected_revision = 1;
+  bool enabled = 2;
+}
+
+message GetVoiceInputDictionaryPeerStatusRequest {}
+
+message GetVoiceInputDictionaryPeerStatusResponse {
+  VoiceInputDictionaryPeerStatus status = 1;
+}
+
+message GrantVoiceInputDictionaryPeerRequest {
+  uint64 expected_configuration_revision = 1;
+  string peer_id = 2;
+  string expected_fingerprint = 3;
+}
+
+message GrantVoiceInputDictionaryPeerResponse {
+  VoiceInputDictionaryPeerStatus status = 1;
+}
+
+message RevokeVoiceInputDictionaryPeerRequest {
+  string peer_id = 1;
+  uint64 expected_grant_revision = 2;
+}
+
+message RevokeVoiceInputDictionaryPeerResponse {
+  VoiceInputDictionaryPeerStatus status = 1;
+}
+
+message SyncVoiceInputDictionaryNowRequest {
+  uint64 expected_configuration_revision = 1;
+  optional string peer_id = 2;
+}
+
+message SyncVoiceInputDictionaryNowResponse {
+  VoiceInputDictionaryPeerStatus status = 1;
+}
+
+message ConfigureVoiceInputDictionaryListenerRequest {
+  uint64 expected_configuration_revision = 1;
+  optional VoiceInputDictionaryListener listener = 2;
+}
+
+message ConfigureVoiceInputDictionaryListenerResponse {
+  VoiceInputDictionaryPeerStatus status = 1;
+}
+
+message GetVoiceInputDictionaryPeerInvitationRequest {}
+
+message GetVoiceInputDictionaryPeerInvitationResponse {
+  string invitation = 1;
+}
+
+message GrantVoiceInputDictionaryDirectPeerRequest {
+  uint64 expected_configuration_revision = 1;
+  string invitation = 2;
+  string expected_fingerprint = 3;
+}
+
+message GrantVoiceInputDictionaryDirectPeerResponse {
+  VoiceInputDictionaryPeerStatus status = 1;
+}
+
+message ClearVoiceInputDictionaryPeerRouteRequest {
+  uint64 expected_configuration_revision = 1;
+  string peer_id = 2;
+}
+
+message ClearVoiceInputDictionaryPeerRouteResponse {
+  VoiceInputDictionaryPeerStatus status = 1;
+}
+
+message SetVoiceInputDictionarySyncEnabledResponse {
+  VoiceInputDictionarySnapshot dictionary = 1;
+}
+
+message AddVoiceInputDictionaryTermsRequest {
+  uint64 expected_revision = 1;
+  repeated string terms = 2;
+}
+
+message AddVoiceInputDictionaryTermsResponse {
+  VoiceInputDictionarySnapshot dictionary = 1;
+}
+
+message EditVoiceInputDictionaryEntryRequest {
+  uint64 expected_revision = 1;
+  string entry_id = 2;
+  string text = 3;
+  repeated string aliases = 4;
+}
+
+message EditVoiceInputDictionaryEntryResponse {
+  VoiceInputDictionarySnapshot dictionary = 1;
+}
+
+message DeleteVoiceInputDictionaryEntryRequest {
+  uint64 expected_revision = 1;
+  string entry_id = 2;
+}
+
+message DeleteVoiceInputDictionaryEntryResponse {
+  VoiceInputDictionarySnapshot dictionary = 1;
+}
+
+message ApplyVoiceInputDictionaryLearningRequest {
+  uint64 expected_revision = 1;
+  repeated VoiceInputDictionaryLearningAction actions = 2;
+}
+
+message ApplyVoiceInputDictionaryLearningResponse {
+  VoiceInputDictionarySnapshot dictionary = 1;
+}
+
 // Text is processed only for this authenticated request and is never written
 // to Operation, Event, Snapshot, Session, diagnostics, or logs.
 message AdviseVoiceInputDictionaryEditRequest {
@@ -552,7 +718,9 @@ message StartVoiceInputRequest {
   // Ephemeral cleanup preferences. These fields are bounded at the service
   // edge and never enter Operation, Event, Snapshot, Session, or log storage.
   optional string refinement_instructions = 4;
-  repeated string dictionary_terms = 5;
+  reserved 5;
+  reserved "dictionary_terms";
+  optional VoiceInputRecognitionContext recognition_context = 6;
 }
 
 message StartVoiceInputResponse {

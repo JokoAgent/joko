@@ -1,9 +1,9 @@
+import { isNodeSyncCipherChunkFrame, type NodeSyncCipherChunkFrame } from "@joko/node-sync";
+
 import { Worker, type WorkerOptions } from "node:worker_threads";
 
 import {
-  isContactSyncCipherChunkFrame,
   isContactSyncStateMessage,
-  type ContactSyncCipherChunkFrame,
   type ContactSyncCodec,
   type ContactSyncDecodeOptions,
   type ContactSyncEncodeOptions,
@@ -45,9 +45,9 @@ export class ContactSyncWorkerCodec implements ContactSyncCodec {
     this.#workerFactory = options.workerFactory ?? ((url, workerOptions) => new Worker(url, workerOptions));
   }
 
-  async encode(options: ContactSyncEncodeOptions, signal?: AbortSignal): Promise<readonly ContactSyncCipherChunkFrame[]> {
+  async encode(options: ContactSyncEncodeOptions, signal?: AbortSignal): Promise<readonly NodeSyncCipherChunkFrame[]> {
     const value = await this.#call("encode", options, signal);
-    if (!Array.isArray(value) || value.length < 1 || !value.every(isContactSyncCipherChunkFrame)) {
+    if (!Array.isArray(value) || value.length < 1 || !value.every(isNodeSyncCipherChunkFrame)) {
       this.reset();
       throw new Error("Contacts sync codec worker returned invalid frames.");
     }

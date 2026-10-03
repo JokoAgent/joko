@@ -25,21 +25,34 @@ import {
   validateScribeTranscriptionRoute
 } from "@joko/adapter-transcription-scribe";
 import {
+  SAUC_SUPPORTED_LOCALES,
   SaucTranscriptionProvider,
   probeSaucTranscriptionRoute,
-  validateSaucTranscriptionConfiguration
+  validateSaucTranscriptionConfiguration,
+  type SaucAuthentication,
+  type SaucCorpusConfiguration,
+  type SaucTranscriptionMode
 } from "@joko/adapter-transcription-sauc";
 import {
+  VoiceInputSaucAuthentication,
+  VoiceInputSaucMode,
+  VoiceInputSaucSettingsSchema,
   VoiceInputServiceSettingsSchema,
   VoiceInputTranscriptionProtocol,
   type ModelRouteRef,
+  type VoiceInputSaucSettings,
   type VoiceInputServiceSettings,
   type VoiceInputServiceSettingsPatch
 } from "@joko/contracts";
 import type { OperationalStore, SettingRecord } from "@joko/store";
 import {
   FallbackAsrProvider,
+  normalizeRecognitionContext,
+  type AsrEvent,
   type AsrProvider,
+  type AsrRecognitionContext,
+  type AsrStartRequest,
+  type AudioChunk,
   type SupportedAudioMimeType,
   type VoiceRefiner
 } from "@joko/voice-input";
@@ -63,6 +76,17 @@ type StoredTranscriptionProtocol = "openaiCompatibleBatch" | "openaiCompatibleRe
 
 type StoredRefinerModel = Pick<ModelRouteRef, "backendId" | "providerId" | "modelId">;
 
+interface StoredSaucSettings {
+  readonly mode: SaucTranscriptionMode;
+  readonly authentication: "apiKey" | "accessToken";
+  readonly appId: string;
+  readonly useDictionaryHotwords: boolean;
+  readonly boostingTableName: string;
+  readonly boostingTableId: string;
+  readonly correctTableName: string;
+  readonly correctTableId: string;
+}
+
 interface StoredVoiceInputSettings {
   readonly format: 1;
   readonly enabled: boolean;
@@ -70,6 +94,7 @@ interface StoredVoiceInputSettings {
   readonly endpoint: string;
   readonly model: string;
   readonly resourceId: string;
+  readonly sauc: StoredSaucSettings | null;
   readonly credentialReferenceId: string;
   readonly keyless: boolean;
   readonly refinementEnabled: boolean;
@@ -80,6 +105,7 @@ interface StoredVoiceInputSettings {
   readonly fallbackEndpoint: string;
   readonly fallbackModel: string;
   readonly fallbackResourceId: string;
+  readonly fallbackSauc: StoredSaucSettings | null;
   readonly fallbackCredentialReferenceId: string;
   readonly fallbackKeyless: boolean;
 }
@@ -89,6 +115,7 @@ interface TranscriptionRoute {
   readonly endpoint: string;
   readonly model: string;
   readonly resourceId: string;
+  readonly sauc: StoredSaucSettings | null;
   readonly keyless: boolean;
   readonly credentialReferenceId: string;
 }
@@ -109,6 +136,8 @@ export interface VoiceInputSettingsControllerOptions {
   readonly providers?: Pick<ProviderCatalogManager, "resolveInferenceRoute">;
   readonly now?: () => number;
   readonly fetch?: typeof globalThis.fetch;
+  readonly dictionaryTerms?: () => readonly string[];
+  readonly onConfigurationChanged?: () => void;
 }
 
 export type VoiceInputConnectionTestResult = OpenAiTranscriptionProbeResult
@@ -124,6 +153,8 @@ export class VoiceInputSettingsController implements VoiceInputProviderFactory {
   readonly #now: () => number;
   readonly #fetch: typeof globalThis.fetch | undefined;
   readonly #providers: VoiceInputSettingsControllerOptions["providers"];
+  readonly #dictionaryTerms: (() => readonly string[]) | undefined;
+  readonly #onConfigurationChanged: (() => void) | undefined;
   #tail: Promise<void> = Promise.resolve();
   #activeConnectionTest?: { readonly revision: bigint; readonly promise: Promise<VoiceInputConnectionTestResult> };
 
@@ -133,6 +164,8 @@ export class VoiceInputSettingsController implements VoiceInputProviderFactory {
     this.#now = options.now ?? Date.now;
     this.#fetch = options.fetch;
     this.#providers = options.providers;
+    this.#dictionaryTerms = options.dictionaryTerms;
+    this.#onConfigurationChanged = options.onConfigurationChanged;
     const stored = this.#store.findSetting<unknown>(SCOPE_TYPE, SCOPE_ID, SETTING_KEY);
     if (stored === undefined) {
       this.#store.setSetting<StoredVoiceInputSettings>(SCOPE_TYPE, SCOPE_ID, SETTING_KEY, defaultSettings(), this.#now());
@@ -155,6 +188,7 @@ export class VoiceInputSettingsController implements VoiceInputProviderFactory {
       endpoint: settings.endpoint,
       model: settings.model,
       resourceId: settings.resourceId,
+      ...(settings.sauc === null ? {} : { sauc: toProtoSauc(settings.sauc) }),
       keyless: settings.keyless,
       credentialConfigured: this.#credentialConfigured(),
       version: toProtoEntityVersion(record.revision, 0, record.updatedAt),
@@ -166,6 +200,7 @@ export class VoiceInputSettingsController implements VoiceInputProviderFactory {
       fallbackEndpoint: settings.fallbackEndpoint,
       fallbackModel: settings.fallbackModel,
       fallbackResourceId: settings.fallbackResourceId,
+      ...(settings.fallbackSauc === null ? {} : { fallbackSauc: toProtoSauc(settings.fallbackSauc) }),
       fallbackKeyless: settings.fallbackKeyless,
       fallbackCredentialConfigured: this.#fallbackCredentialConfigured()
     });
@@ -174,20 +209,27 @@ export class VoiceInputSettingsController implements VoiceInputProviderFactory {
   describe(): VoiceInputProviderCapability {
     const settings = this.#settings();
     if (!settings.enabled) return unsupported("disabled_by_policy");
-    const routes = this.#availableRoutes(settings);
-    if (routes.length === 0) return unsupported("temporarily_unavailable");
-    const mimeTypes = [...new Set(routes.flatMap((route) => routeMimeTypes(route.protocol)))];
+    if (this.#availableRoutes(settings).length === 0) return unsupported("temporarily_unavailable");
+    const routes = this.#configuredRoutes(settings);
+    const mimeTypes = routeMimeTypes(routes[0]!.protocol).filter((mimeType) =>
+      routes.every((route) => routeMimeTypes(route.protocol).includes(mimeType)));
+    if (mimeTypes.length === 0) return unsupported("temporarily_unavailable");
+    const supportsLocale = routes.every((route) => route.protocol !== "volcengineSauc" || route.sauc?.mode === "streamInput");
     return {
       support: "supported",
       mimeTypes,
-      supportsLocale: routes.every((route) => route.protocol !== "volcengineSauc"),
-      supportsLiveDrafts: routes.some((route) => route.protocol !== "openaiCompatibleBatch"),
+      supportsLocale,
+      supportedLocales: supportsLocale && routes.some((route) => route.protocol === "volcengineSauc") ? SAUC_SUPPORTED_LOCALES : [],
+      supportsLiveDrafts: routes.every((route) => route.protocol !== "openaiCompatibleBatch"
+        && (route.protocol !== "volcengineSauc" || route.sauc?.mode !== "streamInput")),
+      supportsRecognitionContext: routes.every((route) => route.protocol === "volcengineSauc"),
       supportsRefinement: this.#refinementAvailable(settings)
     };
   }
 
-  create(input: { readonly mimeType: SupportedAudioMimeType; readonly locale?: string }): AsrProvider {
-    const settings = this.#settings();
+  create(input: { readonly mimeType: SupportedAudioMimeType; readonly locale?: string; readonly recognitionContext?: AsrRecognitionContext }): AsrProvider {
+    const record = this.#record();
+    const settings = record.value;
     const capability = this.describe();
     if (capability.support !== "supported") throw new VoiceInputSettingsError("credential_unavailable", "Voice input transcription is unavailable.");
     const routes = this.#availableRoutes(settings)
@@ -195,8 +237,33 @@ export class VoiceInputSettingsController implements VoiceInputProviderFactory {
     if (routes.length === 0) {
       throw new VoiceInputSettingsError("credential_unavailable", "Voice input transcription is unavailable.");
     }
-    const factories = routes.map((route) => () => this.#createRouteProvider(route, input));
-    return factories.length === 1 ? factories[0]!() : new FallbackAsrProvider(factories);
+    if (!capability.mimeTypes.includes(input.mimeType)
+      || (input.locale !== undefined && (!capability.supportsLocale
+        || (capability.supportedLocales!.length > 0 && !capability.supportedLocales!.includes(input.locale))))
+      || (input.recognitionContext !== undefined && capability.supportsRecognitionContext !== true)) {
+      throw invalid("The configured transcription routes do not support this request.");
+    }
+    const normalized = normalizeRecognitionContext(input.recognitionContext);
+    const hotwords = routes.some((route) => route.sauc?.useDictionaryHotwords)
+      ? [...(this.#dictionaryTerms?.() ?? [])] : [];
+    const context = normalizeRecognitionContext({ hotwords, contextData: normalized?.contextData ?? [] })!;
+    const isCurrent = (): boolean => this.#isConfigurationCurrent(record.revision);
+    const providers: AsrProvider[] = [];
+    try {
+      for (const route of routes) providers.push(this.#createRouteProvider(route, { ...input, recognitionContext: context }, isCurrent));
+    } catch (error) {
+      for (const provider of providers) void provider.stop().catch(() => undefined);
+      providers.length = 0;
+      throw error;
+    }
+    const factories = providers.map((_provider, index) => () => {
+      if (!isCurrent() || providers[index] === undefined) {
+        throw new VoiceInputSettingsError("credential_unavailable", "Voice input transcription is unavailable.");
+      }
+      return providers[index]!;
+    });
+    const delegate = providers.length === 1 ? providers[0]! : new FallbackAsrProvider(factories);
+    return new CapturedTranscriptionProvider(delegate, providers, isCurrent);
   }
 
   createRefiner(input: {
@@ -266,21 +333,26 @@ export class VoiceInputSettingsController implements VoiceInputProviderFactory {
     return { actions: [] };
   }
 
-  testConnection(): Promise<VoiceInputConnectionTestResult> {
+  testConnection(signal?: AbortSignal): Promise<VoiceInputConnectionTestResult> {
     const record = this.#record();
     const active = this.#activeConnectionTest;
-    if (active !== undefined) {
+    if (signal?.aborted) return Promise.resolve({ ok: false, reason: "network" });
+    if (signal === undefined && active !== undefined) {
       return active.revision === record.revision
         ? active.promise
         : Promise.resolve({ ok: false, reason: "serviceError" });
     }
     const settings = record.value;
+    const credentialGeneration = this.#credentials.find(settings.credentialReferenceId)?.generation;
+    const isCurrent = (): boolean => this.#isConfigurationCurrent(record.revision) && signal?.aborted !== true
+      && (settings.keyless || (this.#credentials.find(settings.credentialReferenceId)?.configured === true
+        && this.#credentials.find(settings.credentialReferenceId)?.generation === credentialGeneration));
     let apiKey: string | undefined;
     if (!settings.keyless) {
       try { apiKey = this.#credentials.resolve(settings.credentialReferenceId); }
       catch { return Promise.resolve({ ok: false, reason: "credentialsMissing" }); }
     }
-    const promise: Promise<VoiceInputConnectionTestResult> = settings.protocol === "openaiCompatibleBatch"
+    const task: Promise<VoiceInputConnectionTestResult> = settings.protocol === "openaiCompatibleBatch"
       ? probeOpenAiTranscriptionRoute({
           endpoint: settings.endpoint,
           model: settings.model,
@@ -294,13 +366,21 @@ export class VoiceInputSettingsController implements VoiceInputProviderFactory {
             ...(apiKey === undefined ? {} : { apiKey })
           })
         : settings.protocol === "volcengineSauc"
-          ? probeSaucTranscriptionRoute({ endpoint: settings.endpoint, resourceId: settings.resourceId, apiKey: apiKey! })
+          ? probeSaucTranscriptionRoute({
+              endpoint: settings.endpoint, resourceId: settings.resourceId, mode: settings.sauc!.mode,
+              corpus: saucCorpus(settings.sauc!), authentication: saucAuthentication(settings.sauc!, apiKey!),
+              isCurrent
+            }, signal === undefined ? {} : { signal })
           : probeRealtimeTranscriptionRoute({
           protocol: realtimeProtocol(settings.protocol),
           endpoint: settings.endpoint,
           model: settings.model,
           ...(apiKey === undefined ? {} : { apiKey })
         });
+    const promise: Promise<VoiceInputConnectionTestResult> = task.then((result) =>
+      isCurrent()
+        ? result : { ok: false, reason: "serviceError" });
+    if (signal !== undefined) return promise;
     this.#activeConnectionTest = { revision: record.revision, promise };
     const clear = (): void => {
       if (this.#activeConnectionTest?.promise === promise) this.#activeConnectionTest = undefined;
@@ -339,6 +419,9 @@ export class VoiceInputSettingsController implements VoiceInputProviderFactory {
       endpoint: patch.endpoint ?? current.endpoint,
       model: patch.model ?? current.model,
       resourceId: patch.resourceId ?? current.resourceId,
+      sauc: patch.sauc === undefined
+        ? (patch.protocol !== undefined && patch.protocol !== VoiceInputTranscriptionProtocol.VOLCENGINE_SAUC ? null : current.sauc)
+        : fromProtoSauc(patch.sauc),
       credentialReferenceId: current.credentialReferenceId,
       keyless: patch.keyless ?? current.keyless,
       refinementEnabled: patch.refinementEnabled ?? current.refinementEnabled,
@@ -351,6 +434,9 @@ export class VoiceInputSettingsController implements VoiceInputProviderFactory {
       fallbackEndpoint: patch.fallbackEndpoint ?? current.fallbackEndpoint,
       fallbackModel: patch.fallbackModel ?? current.fallbackModel,
       fallbackResourceId: patch.fallbackResourceId ?? current.fallbackResourceId,
+      fallbackSauc: patch.fallbackSauc === undefined
+        ? (patch.fallbackProtocol !== undefined && patch.fallbackProtocol !== VoiceInputTranscriptionProtocol.VOLCENGINE_SAUC ? null : current.fallbackSauc)
+        : fromProtoSauc(patch.fallbackSauc),
       fallbackCredentialReferenceId: current.fallbackCredentialReferenceId,
       fallbackKeyless: patch.fallbackKeyless ?? current.fallbackKeyless
     });
@@ -363,17 +449,19 @@ export class VoiceInputSettingsController implements VoiceInputProviderFactory {
       throw invalid("A keyless transcription fallback cannot receive a credential.");
     }
     if (
-      (next.protocol !== current.protocol || credentialOrigin(next.endpoint) !== credentialOrigin(current.endpoint))
+      (next.protocol !== current.protocol || credentialOrigin(next.endpoint) !== credentialOrigin(current.endpoint)
+        || saucCredentialAuthorityChanged(current.sauc, next.sauc))
       && this.#credentialConfigured()
       && ticketId === undefined
       && patch.clearCredential !== true
-    ) throw invalid("Replace or clear the transcription credential when changing protocol or endpoint origin.");
+    ) throw invalid("Replace or clear the transcription credential when changing protocol, endpoint origin, authentication or APP ID.");
     if (
-      (next.fallbackProtocol !== current.fallbackProtocol || credentialOrigin(next.fallbackEndpoint) !== credentialOrigin(current.fallbackEndpoint))
+      (next.fallbackProtocol !== current.fallbackProtocol || credentialOrigin(next.fallbackEndpoint) !== credentialOrigin(current.fallbackEndpoint)
+        || saucCredentialAuthorityChanged(current.fallbackSauc, next.fallbackSauc))
       && this.#fallbackCredentialConfigured()
       && fallbackTicketId === undefined
       && patch.clearFallbackCredential !== true
-    ) throw invalid("Replace or clear the transcription fallback credential when changing protocol or endpoint origin.");
+    ) throw invalid("Replace or clear the transcription fallback credential when changing protocol, endpoint origin, authentication or APP ID.");
     const credentialWillExist = ticketId !== undefined
       || (patch.clearCredential !== true && this.#credentialConfigured());
     if (next.enabled && !next.keyless && !credentialWillExist) {
@@ -400,6 +488,7 @@ export class VoiceInputSettingsController implements VoiceInputProviderFactory {
       throw error;
     }
     const saved = this.snapshot();
+    this.#onConfigurationChanged?.();
     await this.#cleanupCredentials();
     return saved;
   }
@@ -454,24 +543,24 @@ export class VoiceInputSettingsController implements VoiceInputProviderFactory {
     }
   }
 
-  #availableRoutes(settings: StoredVoiceInputSettings): readonly TranscriptionRoute[] {
+  #configuredRoutes(settings: StoredVoiceInputSettings): readonly TranscriptionRoute[] {
     const routes: TranscriptionRoute[] = [];
-    if (settings.keyless || this.#credentialConfigured()) {
       routes.push({
         protocol: settings.protocol,
         endpoint: settings.endpoint,
         model: settings.model,
         resourceId: settings.resourceId,
+        sauc: settings.sauc,
         keyless: settings.keyless,
         credentialReferenceId: settings.credentialReferenceId
       });
-    }
-    if (settings.fallbackEnabled && (settings.fallbackKeyless || this.#fallbackCredentialConfigured())) {
+    if (settings.fallbackEnabled) {
       routes.push({
         protocol: settings.fallbackProtocol,
         endpoint: settings.fallbackEndpoint,
         model: settings.fallbackModel,
         resourceId: settings.fallbackResourceId,
+        sauc: settings.fallbackSauc,
         keyless: settings.fallbackKeyless,
         credentialReferenceId: settings.fallbackCredentialReferenceId
       });
@@ -479,9 +568,15 @@ export class VoiceInputSettingsController implements VoiceInputProviderFactory {
     return routes;
   }
 
+  #availableRoutes(settings: StoredVoiceInputSettings): readonly TranscriptionRoute[] {
+    return this.#configuredRoutes(settings).filter((route) => route.keyless
+      || this.#credentials.find(route.credentialReferenceId)?.configured === true);
+  }
+
   #createRouteProvider(
     route: TranscriptionRoute,
-    input: { readonly mimeType: SupportedAudioMimeType; readonly locale?: string }
+    input: { readonly mimeType: SupportedAudioMimeType; readonly locale?: string; readonly recognitionContext?: AsrRecognitionContext },
+    isCurrent: () => boolean
   ): AsrProvider {
     let apiKey: string | undefined;
     if (!route.keyless) {
@@ -510,7 +605,15 @@ export class VoiceInputSettingsController implements VoiceInputProviderFactory {
       });
     }
     if (route.protocol === "volcengineSauc") {
-      return new SaucTranscriptionProvider({ endpoint: route.endpoint, resourceId: route.resourceId, apiKey: apiKey! });
+      const sauc = route.sauc!;
+      const generation = this.#credentials.find(route.credentialReferenceId)?.generation;
+      return new SaucTranscriptionProvider({ endpoint: route.endpoint, resourceId: route.resourceId,
+        mode: sauc.mode, corpus: saucCorpus(sauc), authentication: saucAuthentication(sauc, apiKey!),
+        recognitionContext: {
+          hotwords: sauc.useDictionaryHotwords ? input.recognitionContext?.hotwords ?? [] : [],
+          contextData: input.recognitionContext?.contextData ?? []
+        }, isCurrent: () => isCurrent() && this.#credentials.find(route.credentialReferenceId)?.configured === true
+          && this.#credentials.find(route.credentialReferenceId)?.generation === generation });
     }
     return new RealtimeTranscriptionProvider({
       protocol: realtimeProtocol(route.protocol),
@@ -546,6 +649,9 @@ export class VoiceInputSettingsController implements VoiceInputProviderFactory {
   }
 
   #settings(): StoredVoiceInputSettings { return this.#record().value; }
+  #isConfigurationCurrent(revision: bigint): boolean {
+    try { return this.#record().revision === revision; } catch { return false; }
+  }
 }
 
 function defaultSettings(): StoredVoiceInputSettings {
@@ -556,6 +662,7 @@ function defaultSettings(): StoredVoiceInputSettings {
     endpoint: DEFAULT_ENDPOINT,
     model: DEFAULT_MODEL,
     resourceId: "",
+    sauc: null,
     credentialReferenceId: "",
     keyless: false,
     refinementEnabled: false,
@@ -566,13 +673,121 @@ function defaultSettings(): StoredVoiceInputSettings {
     fallbackEndpoint: DEFAULT_ENDPOINT,
     fallbackModel: DEFAULT_MODEL,
     fallbackResourceId: "",
+    fallbackSauc: null,
     fallbackCredentialReferenceId: "",
     fallbackKeyless: false
   };
 }
 
+function fromProtoSauc(value: VoiceInputSaucSettings): StoredSaucSettings {
+  const mode = value.mode === VoiceInputSaucMode.ASYNC_TWO_PASS ? "asyncTwoPass"
+    : value.mode === VoiceInputSaucMode.BIDIRECTIONAL ? "bidirectional"
+      : value.mode === VoiceInputSaucMode.STREAM_INPUT ? "streamInput" : undefined;
+  const authentication = value.authentication === VoiceInputSaucAuthentication.API_KEY ? "apiKey"
+    : value.authentication === VoiceInputSaucAuthentication.ACCESS_TOKEN ? "accessToken" : undefined;
+  return requireStoredSauc({ mode, authentication, appId: value.appId, useDictionaryHotwords: value.useDictionaryHotwords,
+    boostingTableName: value.boostingTableName, boostingTableId: value.boostingTableId,
+    correctTableName: value.correctTableName, correctTableId: value.correctTableId })!;
+}
+
+function toProtoSauc(value: StoredSaucSettings): VoiceInputSaucSettings {
+  return create(VoiceInputSaucSettingsSchema, { ...value,
+    mode: value.mode === "asyncTwoPass" ? VoiceInputSaucMode.ASYNC_TWO_PASS
+      : value.mode === "bidirectional" ? VoiceInputSaucMode.BIDIRECTIONAL : VoiceInputSaucMode.STREAM_INPUT,
+    authentication: value.authentication === "apiKey" ? VoiceInputSaucAuthentication.API_KEY : VoiceInputSaucAuthentication.ACCESS_TOKEN });
+}
+
+function requireStoredSauc(value: unknown): StoredSaucSettings | null {
+  if (value === null) return null;
+  const fields = ["mode", "authentication", "appId", "useDictionaryHotwords", "boostingTableName", "boostingTableId", "correctTableName", "correctTableId"];
+  if (!isRecord(value) || Object.keys(value).length !== fields.length || fields.some((field) => !Object.hasOwn(value, field))
+    || (value["mode"] !== "asyncTwoPass" && value["mode"] !== "bidirectional" && value["mode"] !== "streamInput")
+    || (value["authentication"] !== "apiKey" && value["authentication"] !== "accessToken")
+    || typeof value["useDictionaryHotwords"] !== "boolean" || typeof value["appId"] !== "string") {
+    throw invalid("The SAUC configuration is invalid.");
+  }
+  const appId = value["appId"].trim();
+  if (value["authentication"] === "apiKey" ? appId !== "" : !/^[\x21-\x7e]{1,256}$/u.test(appId)) {
+    throw invalid("The SAUC APP ID does not match its authentication.");
+  }
+  return { mode: value["mode"], authentication: value["authentication"], appId,
+    useDictionaryHotwords: value["useDictionaryHotwords"], boostingTableName: requireCorpusReference(value["boostingTableName"]),
+    boostingTableId: requireCorpusReference(value["boostingTableId"]), correctTableName: requireCorpusReference(value["correctTableName"]),
+    correctTableId: requireCorpusReference(value["correctTableId"]) };
+}
+
+function requireCorpusReference(value: unknown): string {
+  if (typeof value !== "string" || value.length > 256 || /[\u0000-\u001f\u007f-\u009f]/u.test(value)) {
+    throw invalid("The SAUC corpus reference is invalid.");
+  }
+  return value.trim();
+}
+
+function saucCorpus(value: StoredSaucSettings): SaucCorpusConfiguration {
+  return { ...(value.boostingTableName === "" ? {} : { boostingTableName: value.boostingTableName }),
+    ...(value.boostingTableId === "" ? {} : { boostingTableId: value.boostingTableId }),
+    ...(value.correctTableName === "" ? {} : { correctTableName: value.correctTableName }),
+    ...(value.correctTableId === "" ? {} : { correctTableId: value.correctTableId }) };
+}
+
+function saucAuthentication(value: StoredSaucSettings, secret: string): SaucAuthentication {
+  return value.authentication === "apiKey" ? { type: "apiKey", apiKey: secret }
+    : { type: "accessToken", appId: value.appId, accessToken: secret };
+}
+
+function saucCredentialAuthorityChanged(before: StoredSaucSettings | null, after: StoredSaucSettings | null): boolean {
+  return before?.authentication !== after?.authentication || before?.appId !== after?.appId;
+}
+
+/** Holds all start-only fallback captures and releases even the unselected transports. */
+class CapturedTranscriptionProvider implements AsrProvider {
+  #stopped = false;
+  #stopTask: Promise<void> | undefined;
+  constructor(private readonly delegate: AsrProvider, private readonly providers: AsrProvider[],
+    private readonly isCurrent: () => boolean) {}
+
+  async start(request: AsrStartRequest): Promise<void> {
+    this.#assertCurrent();
+    await this.delegate.start(request);
+    if (!this.isCurrent()) { await this.stop(); throw new VoiceInputSettingsError("credential_unavailable", "Voice input transcription is unavailable."); }
+  }
+  appendAudio(chunk: AudioChunk): void {
+    if (this.#stopped) return;
+    if (!this.isCurrent()) { void this.stop().catch(() => undefined); return; }
+    this.delegate.appendAudio(chunk);
+  }
+  async flushAudio(): Promise<void> { this.#assertCurrent(); await this.delegate.flushAudio(); this.#assertCurrent(); }
+  async recover(): Promise<void> {
+    this.#assertCurrent();
+    if (this.delegate.recover === undefined) throw new VoiceInputSettingsError("credential_unavailable", "Voice input transcription is unavailable.");
+    await this.delegate.recover();
+    this.#assertCurrent();
+  }
+  onEvent(listener: (event: AsrEvent) => void): () => void {
+    return this.delegate.onEvent((event) => { if (!this.#stopped && this.isCurrent()) listener(event); });
+  }
+  stop(): Promise<void> {
+    if (this.#stopTask !== undefined) return this.#stopTask;
+    this.#stopped = true;
+    const providers = new Set([this.delegate, ...this.providers]);
+    this.providers.length = 0;
+    this.#stopTask = Promise.allSettled([...providers].map((provider) => provider.stop())).then((results) => {
+      const failed = results.find((result) => result.status === "rejected");
+      if (failed?.status === "rejected") throw failed.reason;
+    });
+    return this.#stopTask;
+  }
+  #assertCurrent(): void {
+    if (this.#stopped || !this.isCurrent()) throw new VoiceInputSettingsError("credential_unavailable", "Voice input transcription is unavailable.");
+  }
+}
+
 function decodeSettings(value: unknown): StoredVoiceInputSettings {
-  if (!isRecord(value) || value["format"] !== 1) throw invalid("Stored voice input settings are invalid.");
+  const fields = ["format", "enabled", "protocol", "endpoint", "model", "resourceId", "sauc", "credentialReferenceId", "keyless",
+    "refinementEnabled", "refinerModel", "refinerFallbackModel", "fallbackEnabled", "fallbackProtocol", "fallbackEndpoint",
+    "fallbackModel", "fallbackResourceId", "fallbackSauc", "fallbackCredentialReferenceId", "fallbackKeyless"];
+  if (!isRecord(value) || value["format"] !== 1 || Object.keys(value).length !== fields.length
+    || fields.some((field) => !Object.hasOwn(value, field))) throw invalid("Stored voice input settings are invalid.");
   return validateSettings({
     format: 1,
     enabled: value["enabled"],
@@ -580,6 +795,7 @@ function decodeSettings(value: unknown): StoredVoiceInputSettings {
     endpoint: value["endpoint"],
     model: value["model"],
     resourceId: value["resourceId"],
+    sauc: value["sauc"],
     credentialReferenceId: value["credentialReferenceId"],
     keyless: value["keyless"],
     refinementEnabled: value["refinementEnabled"],
@@ -590,6 +806,7 @@ function decodeSettings(value: unknown): StoredVoiceInputSettings {
     fallbackEndpoint: value["fallbackEndpoint"],
     fallbackModel: value["fallbackModel"],
     fallbackResourceId: value["fallbackResourceId"],
+    fallbackSauc: value["fallbackSauc"],
     fallbackCredentialReferenceId: value["fallbackCredentialReferenceId"],
     fallbackKeyless: value["fallbackKeyless"]
   });
@@ -602,6 +819,7 @@ function validateSettings(value: {
   readonly endpoint: unknown;
   readonly model: unknown;
   readonly resourceId: unknown;
+  readonly sauc: unknown;
   readonly credentialReferenceId: unknown;
   readonly keyless: unknown;
   readonly refinementEnabled: unknown;
@@ -612,6 +830,7 @@ function validateSettings(value: {
   readonly fallbackEndpoint: unknown;
   readonly fallbackModel: unknown;
   readonly fallbackResourceId: unknown;
+  readonly fallbackSauc: unknown;
   readonly fallbackCredentialReferenceId: unknown;
   readonly fallbackKeyless: unknown;
 }): StoredVoiceInputSettings {
@@ -630,9 +849,11 @@ function validateSettings(value: {
   ) throw invalid("Voice input route is invalid.");
   let route: { readonly endpoint: string; readonly model: string; readonly resourceId: string };
   let fallbackRoute: { readonly endpoint: string; readonly model: string; readonly resourceId: string };
+  const sauc = requireStoredSauc(value.sauc);
+  const fallbackSauc = requireStoredSauc(value.fallbackSauc);
   try {
-    route = validateTranscriptionRoute(value.protocol, value.endpoint, value.model, value.resourceId, value.keyless);
-    fallbackRoute = validateTranscriptionRoute(value.fallbackProtocol, value.fallbackEndpoint, value.fallbackModel, value.fallbackResourceId, value.fallbackKeyless);
+    route = validateTranscriptionRoute(value.protocol, value.endpoint, value.model, value.resourceId, value.keyless, sauc);
+    fallbackRoute = validateTranscriptionRoute(value.fallbackProtocol, value.fallbackEndpoint, value.fallbackModel, value.fallbackResourceId, value.fallbackKeyless, fallbackSauc);
   }
   catch { throw invalid("Voice input route is invalid."); }
   const refinerModel = requireStoredRefinerModel(value.refinerModel);
@@ -657,6 +878,7 @@ function validateSettings(value: {
     endpoint: route.endpoint,
     model: route.model,
     resourceId: route.resourceId,
+    sauc,
     credentialReferenceId: requireStoredCredentialReference(value.credentialReferenceId),
     keyless: value.keyless,
     refinementEnabled: value.refinementEnabled,
@@ -667,6 +889,7 @@ function validateSettings(value: {
     fallbackEndpoint: fallbackRoute.endpoint,
     fallbackModel: fallbackRoute.model,
     fallbackResourceId: fallbackRoute.resourceId,
+    fallbackSauc,
     fallbackCredentialReferenceId: requireStoredCredentialReference(value.fallbackCredentialReferenceId),
     fallbackKeyless: value.fallbackKeyless
   };
@@ -774,14 +997,15 @@ function validateTranscriptionRoute(
   endpoint: string,
   model: string,
   resourceId: string,
-  keyless: boolean
+  keyless: boolean,
+  sauc: StoredSaucSettings | null
 ): { readonly endpoint: string; readonly model: string; readonly resourceId: string } {
   if (protocol === "volcengineSauc") {
-    if (model !== "" || keyless) throw invalid("SAUC requires a resource ID and an API key.");
-    const route = validateSaucTranscriptionConfiguration({ endpoint, resourceId });
+    if (model !== "" || keyless || sauc === null) throw invalid("SAUC requires a resource ID, mode and managed authentication.");
+    const route = validateSaucTranscriptionConfiguration({ endpoint, resourceId, mode: sauc.mode, corpus: saucCorpus(sauc) });
     return { endpoint: route.endpoint, model: "", resourceId: route.resourceId };
   }
-  if (resourceId !== "") throw invalid("This transcription protocol does not use a resource ID.");
+  if (resourceId !== "" || sauc !== null) throw invalid("This transcription protocol does not use SAUC configuration.");
   const route = protocol === "openaiCompatibleBatch" ? validateOpenAiTranscriptionRoute({ endpoint, model })
     : protocol === "elevenLabsScribeRealtime" ? validateScribeTranscriptionRoute({ endpoint, model })
       : validateRealtimeTranscriptionRoute({ protocol: realtimeProtocol(protocol), endpoint, model });

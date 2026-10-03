@@ -63,7 +63,6 @@ export class ScribeTranscriptionProvider implements AsrProvider {
   #replayLength = 0;
   #connectionText = "";
   #stable = "";
-  #recoveryPrefix = "";
   readonly #pending: PendingAudio[] = [];
   readonly #boundaries: CommitBoundary[] = [];
   #pendingBytes = 0;
@@ -129,7 +128,7 @@ export class ScribeTranscriptionProvider implements AsrProvider {
     if (this.#state !== "ready") throw new ScribeTranscriptionError("network");
     if (this.#totals.bytes === 0) return;
     const completion = this.#wait(() => this.#pending.length === 0 && this.#commit === undefined
-      && this.#segmentBytes === 0 && this.#recoveryPrefix === "", this.#route.flushTimeoutMs);
+      && this.#segmentBytes === 0, this.#route.flushTimeoutMs);
     this.#pump();
     try { await completion; }
     catch (error) {
@@ -153,13 +152,11 @@ export class ScribeTranscriptionProvider implements AsrProvider {
 
   async #recover(): Promise<void> {
     this.#retire(new ScribeTranscriptionError("network"));
-    this.#recoveryPrefix = this.#stable;
-    this.#connectionText = "";
-    this.#sentCaptureBytes = 0;
-    this.#ackedCaptureBytes = 0;
+    this.#connectionText = this.#stable;
+    this.#sentCaptureBytes = this.#ackedCaptureBytes;
     try {
       await this.#connect(true);
-      await this.#wait(() => this.#ackedCaptureBytes >= this.#recoveryTargetBytes && this.#recoveryPrefix === "", this.#route.connectTimeoutMs);
+      await this.#wait(() => this.#ackedCaptureBytes >= this.#recoveryTargetBytes, this.#route.connectTimeoutMs);
     } catch (error) {
       if (this.#state === "ready") this.#fail(error instanceof ScribeTranscriptionError ? error.code : "protocol");
       throw error;
@@ -176,7 +173,6 @@ export class ScribeTranscriptionProvider implements AsrProvider {
     this.#replayLength = 0;
     this.#stable = "";
     this.#connectionText = "";
-    this.#recoveryPrefix = "";
     this.#boundaries.length = 0;
     this.#listeners.clear();
   }
@@ -247,7 +243,8 @@ export class ScribeTranscriptionProvider implements AsrProvider {
             if (this.#state !== "starting") throw new ScribeTranscriptionError("protocol");
             const config = event["config"];
             if (!isRecord(config) || config["model_id"] !== this.#route.model
-              || config["audio_format"] !== "pcm_16000" || config["sample_rate"] !== 16_000) {
+              || config["audio_format"] !== "pcm_16000" || config["sample_rate"] !== 16_000
+              || (config["commit_strategy"] !== undefined && config["commit_strategy"] !== "manual")) {
               throw new ScribeTranscriptionError("protocol");
             }
             this.#state = "ready";
@@ -286,27 +283,35 @@ export class ScribeTranscriptionProvider implements AsrProvider {
     const committed = type === "committed_transcript";
     const commit = this.#commit;
     if (committed && commit === undefined) { this.#fail("protocol"); return; }
-    let publish = this.#recoveryPrefix === "";
-    if (!publish) {
-      if (text.startsWith(this.#recoveryPrefix)) {
-        if (committed) { this.#recoveryPrefix = ""; publish = true; }
-      } else if (committed && !this.#recoveryPrefix.startsWith(text)) {
-        this.#fail("protocol"); return;
-      }
-    }
     if (committed) {
+      if (!this.#confirmCapture(commit!.captureEnd)) { this.#fail("protocol"); return; }
       this.#connectionText = text;
       clearTimeout(commit!.timer);
-      this.#ackedCaptureBytes = commit!.captureEnd;
       this.#commit = undefined;
       this.#segmentBytes = 0;
       this.#segmentVoiced = false;
       this.#silenceBytes = 0;
-      if (publish) this.#stable = text;
+      this.#stable = text;
     }
-    if (publish) this.#emit({ type: committed ? "stable" : "partial", text });
+    this.#emit({ type: committed ? "stable" : "partial", text });
     this.#pump();
     this.#settleWaiters();
+  }
+
+  #confirmCapture(captureEnd: number): boolean {
+    if (captureEnd <= this.#ackedCaptureBytes || captureEnd > this.#sentCaptureBytes || captureEnd > this.#totals.bytes) return false;
+    if (this.#replay !== undefined) {
+      const retiredBytes = captureEnd - this.#ackedCaptureBytes;
+      if (retiredBytes > this.#replayLength) return false;
+      const remainingBytes = this.#replayLength - retiredBytes;
+      this.#replay.copy(this.#replay, 0, retiredBytes, this.#replayLength);
+      this.#replay.fill(0, remainingBytes, this.#replayLength);
+      this.#replayLength = remainingBytes;
+    }
+    // Capture coordinates remain absolute; synthetic commit padding is excluded.
+    this.#ackedCaptureBytes = captureEnd;
+    while (this.#boundaries[0] !== undefined && this.#boundaries[0].captureEnd <= captureEnd) this.#boundaries.shift();
+    return true;
   }
 
   #enqueue(chunk: PendingAudio): boolean {
@@ -323,18 +328,19 @@ export class ScribeTranscriptionProvider implements AsrProvider {
   #queueReplay(): void {
     const replay = this.#replay!;
     this.#clearPending();
-    this.#recoveryTargetBytes = this.#replayLength;
-    let offset = 0;
+    const base = this.#ackedCaptureBytes;
+    this.#recoveryTargetBytes = base + this.#replayLength;
+    let offset = base;
     // Retain explicit boundaries, including a commit whose receipt was lost.
     // No later segment was sent before that receipt, so replay is serial too.
     for (const boundary of [...this.#boundaries]) {
       if (boundary.captureEnd <= offset || boundary.captureEnd > this.#recoveryTargetBytes) continue;
-      if (!this.#enqueue({ audio: Buffer.from(replay.subarray(offset, boundary.captureEnd)), offset: 0,
+      if (!this.#enqueue({ audio: Buffer.from(replay.subarray(offset - base, boundary.captureEnd - base)), offset: 0,
         voiced: boundary.voiced, commitAfter: true, paddingBytes: boundary.paddingBytes })) return;
       offset = boundary.captureEnd;
     }
     if (offset < this.#recoveryTargetBytes) {
-      this.#enqueue({ audio: Buffer.from(replay.subarray(offset, this.#recoveryTargetBytes)), offset: 0, voiced: true, commitAfter: true });
+      this.#enqueue({ audio: Buffer.from(replay.subarray(offset - base, this.#recoveryTargetBytes - base)), offset: 0, voiced: true, commitAfter: true });
     }
   }
 

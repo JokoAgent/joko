@@ -11,6 +11,9 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run"
   },
+  "dependencies": {
+    "@noble/hashes": "2.3.0"
+  },
   "devDependencies": {
     "@types/node": "24.12.4",
     "typescript": "5.9.3",

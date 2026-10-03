@@ -4,9 +4,12 @@ import {
   ArtifactKind, ArtifactService, BlobDisposition, ConnectionService, DeviceKind, EventService, FileKind,
   MobilePushEnvironment as WireMobilePushEnvironment, MobilePushLocale as WireMobilePushLocale,
   MobilePushProvider, OperationService, OperationState, PartnerService,
-  ResourceKind, SchedulerService, SessionService, TargetService, VoiceInputService,
+  ResourceKind, SchedulerService, SessionService, TargetService, VoiceInputService, SettingsService, CredentialService, CredentialKind,
+  type VoiceInputServiceSettings, type TestVoiceInputConnectionResponse,
   VoiceInputDictionaryEntrySource, VoiceInputDictionaryLearningActionType,
   VoiceInputDictionaryLearningConfidence, VoiceInputDictionaryTermType,
+  nextVoiceDictionaryWatchSequence, projectVoiceDictionaryPeerStatus, readVoiceDictionaryPeerInvitation, type VoiceDictionaryPeerListener, type VoiceDictionaryPeerStatusView,
+  projectVoiceDictionaryReadOnly, type VoiceDictionaryReadOnlyView,
   WorktreeEligibility, WorktreeService,
   TransferDirection, WorkspaceEntryListingPolicy, WorkspaceFileChangeKind, WorkspaceService,
   JOKO_API_VERSION, SessionMessageSearchSemanticMode, SessionMessageSearchSessionStatus,
@@ -36,6 +39,13 @@ import {
   type MobileVoiceDictionaryLearningAction
 } from "./mobile-voice-dictionary";
 import type { MobileVoiceRefinementContext } from "./mobile-voice-input";
+import { assertMobileVoiceServiceSettings } from "./mobile-voice-service-settings";
+import { normalizeMobileVoiceRecognitionContext, type MobileVoiceRecognitionContext } from "./mobile-voice-recognition-context";
+import {
+  mobileVoiceDictionaryLearningRequest,
+  projectMobileVoiceDictionarySnapshot,
+  type MobileVoiceDictionarySnapshot
+} from "./mobile-voice-dictionary-service";
 import {
   projectMobilePartners, projectMobilePrivateDetail, projectMobilePrivateReadResponse,
   projectMobilePrivateThreads, validMobilePartnerId,
@@ -137,10 +147,31 @@ export interface MobileNetwork {
   authorizeBlobDownload(credential: PairedCredential, blob: BlobRef, signal?: AbortSignal): Promise<AuthorizedBlobDownload>;
   uploadBlob(credential: PairedCredential, source: MobileBlobUploadSource, signal?: AbortSignal): Promise<BlobRef>;
   getVoiceInputCapabilities(credential: PairedCredential, signal?: AbortSignal): Promise<MobileVoiceCapability>;
+  getVoiceInputServiceSettings(credential: PairedCredential, signal?: AbortSignal): Promise<VoiceInputServiceSettings>;
+  uploadVoiceInputSecret(credential: PairedCredential, secret: string, fallback: boolean, signal?: AbortSignal): Promise<string>;
+  testVoiceInputConnection(credential: PairedCredential, signal?: AbortSignal): Promise<TestVoiceInputConnectionResponse>;
+  getVoiceInputDictionary(credential: PairedCredential, signal?: AbortSignal): Promise<MobileVoiceDictionarySnapshot>;
+  getVoiceInputDictionaryReadOnly(credential: PairedCredential, signal?: AbortSignal): Promise<VoiceDictionaryReadOnlyView>;
+  watchVoiceInputDictionaryReadOnly(credential: PairedCredential, signal: AbortSignal): AsyncIterable<VoiceDictionaryReadOnlyView>;
+  getVoiceInputDictionaryPeerStatus(credential: PairedCredential, signal?: AbortSignal): Promise<VoiceDictionaryPeerStatusView>;
+  watchVoiceInputDictionary(credential: PairedCredential, signal: AbortSignal): AsyncIterable<MobileVoiceDictionarySnapshot>;
+  watchVoiceInputDictionaryPeerStatus(credential: PairedCredential, signal: AbortSignal): AsyncIterable<VoiceDictionaryPeerStatusView>;
+  grantVoiceInputDictionaryPeer(credential: PairedCredential, expectedConfigurationRevision: bigint, peerId: string, expectedFingerprint: string, signal?: AbortSignal): Promise<VoiceDictionaryPeerStatusView>;
+  revokeVoiceInputDictionaryPeer(credential: PairedCredential, peerId: string, expectedGrantRevision: bigint, signal?: AbortSignal): Promise<VoiceDictionaryPeerStatusView>;
+  syncVoiceInputDictionaryNow(credential: PairedCredential, expectedConfigurationRevision: bigint, peerId: string | undefined, signal?: AbortSignal): Promise<VoiceDictionaryPeerStatusView>;
+  configureVoiceInputDictionaryListener(credential: PairedCredential, expectedConfigurationRevision: bigint, listener: VoiceDictionaryPeerListener | undefined, signal?: AbortSignal): Promise<VoiceDictionaryPeerStatusView>;
+  getVoiceInputDictionaryPeerInvitation(credential: PairedCredential, signal?: AbortSignal): Promise<string>;
+  grantVoiceInputDictionaryDirectPeer(credential: PairedCredential, expectedConfigurationRevision: bigint, invitation: string, expectedFingerprint: string, signal?: AbortSignal): Promise<VoiceDictionaryPeerStatusView>;
+  clearVoiceInputDictionaryPeerRoute(credential: PairedCredential, expectedConfigurationRevision: bigint, peerId: string, signal?: AbortSignal): Promise<VoiceDictionaryPeerStatusView>;
+  setVoiceInputDictionarySyncEnabled(credential: PairedCredential, expectedRevision: bigint, enabled: boolean, signal?: AbortSignal): Promise<MobileVoiceDictionarySnapshot>;
+  addVoiceInputDictionaryTerms(credential: PairedCredential, expectedRevision: bigint, terms: readonly string[], signal?: AbortSignal): Promise<MobileVoiceDictionarySnapshot>;
+  editVoiceInputDictionaryEntry(credential: PairedCredential, expectedRevision: bigint, entryId: string, text: string, aliases: readonly string[], signal?: AbortSignal): Promise<MobileVoiceDictionarySnapshot>;
+  deleteVoiceInputDictionaryEntry(credential: PairedCredential, expectedRevision: bigint, entryId: string, signal?: AbortSignal): Promise<MobileVoiceDictionarySnapshot>;
+  applyVoiceInputDictionaryLearning(credential: PairedCredential, expectedRevision: bigint, actions: readonly MobileVoiceDictionaryLearningAction[], signal?: AbortSignal): Promise<MobileVoiceDictionarySnapshot>;
   adviseVoiceInputDictionaryEdit(credential: PairedCredential, draft: MobileVoiceDictionaryAdviceDraft,
     signal?: AbortSignal): Promise<{ readonly actions: readonly MobileVoiceDictionaryLearningAction[] }>;
   startVoiceInput(credential: PairedCredential, requestId: string, mimeType: string, locale?: string,
-    refinement?: MobileVoiceRefinementContext, signal?: AbortSignal): Promise<MobileVoiceSession>;
+    refinement?: MobileVoiceRefinementContext, signal?: AbortSignal, recognitionContext?: MobileVoiceRecognitionContext): Promise<MobileVoiceSession>;
   appendVoiceAudio(credential: PairedCredential, voiceInputId: string, chunkSequence: bigint, audio: Uint8Array, durationMs: number, voiced: boolean, signal?: AbortSignal): Promise<MobileVoiceSession>;
   stopVoiceInput(credential: PairedCredential, voiceInputId: string, expectedNextChunkSequence: bigint, signal?: AbortSignal): Promise<MobileVoiceSession>;
   cancelVoiceInput(credential: PairedCredential, voiceInputId: string, signal?: AbortSignal): Promise<MobileVoiceSession>;
@@ -1434,14 +1465,154 @@ export const mobileNetwork: MobileNetwork = {
       .getVoiceInputCapabilities({}, options(signal));
     return projectMobileVoiceCapability(response.profile);
   },
+  async getVoiceInputServiceSettings(credential, signal) {
+    const response = await createClient(SettingsService, transport(credential.origin, credential.authKey)).getSettings({}, options(signal));
+    signal?.throwIfAborted();
+    return assertMobileVoiceServiceSettings(response.settings?.voiceInput);
+  },
+  async uploadVoiceInputSecret(credential, secret, fallback, signal) {
+    signal?.throwIfAborted();
+    const bytes = new TextEncoder().encode(secret);
+    try {
+      if (bytes.length === 0 || bytes.length > 64 * 1024) throw new Error("The voice credential input is invalid.");
+      const response = await createClient(CredentialService, transport(credential.origin, credential.authKey))
+        .beginCredentialUpload({ kind: CredentialKind.API_KEY, providerId: "" }, options(signal));
+      signal?.throwIfAborted();
+      const ticket = response.ticket;
+      if (!ticket?.ticketId || ticket.maximumBytes < BigInt(bytes.length) || !ticket.relativeEndpoint.startsWith("/")) throw new Error("The voice credential channel is unavailable.");
+      const endpoint = new URL(ticket.relativeEndpoint, credential.origin);
+      if (endpoint.origin !== new URL(credential.origin).origin || endpoint.username || endpoint.password || endpoint.hash) throw new Error("The voice credential channel is invalid.");
+      const upload = await fetch(endpoint.toString(), { method: "PUT", headers: {
+        authorization: `Bearer ${credential.authKey}`, "content-type": "application/octet-stream"
+      }, body: bytes, signal });
+      signal?.throwIfAborted();
+      if (!upload.ok) throw new Error("The voice credential could not be uploaded.");
+      return ticket.ticketId;
+    } finally { bytes.fill(0); }
+  },
+  async testVoiceInputConnection(credential, signal) {
+    const result = await createClient(VoiceInputService, transport(credential.origin, credential.authKey)).testVoiceInputConnection({}, options(signal));
+    signal?.throwIfAborted();
+    return result;
+  },
+  async getVoiceInputDictionary(credential, signal) {
+    const response = await createClient(VoiceInputService, transport(credential.origin, credential.authKey))
+      .getVoiceInputDictionary({}, options(signal));
+    return projectMobileVoiceDictionarySnapshot(response.dictionary);
+  },
+  async getVoiceInputDictionaryPeerStatus(credential, signal) {
+    const response = await createClient(VoiceInputService, transport(credential.origin, credential.authKey)).getVoiceInputDictionaryPeerStatus({}, options(signal));
+    return projectVoiceDictionaryPeerStatus(response.status);
+  },
+  async getVoiceInputDictionaryReadOnly(credential, signal) {
+    const response = await createClient(VoiceInputService, transport(credential.origin, credential.authKey))
+      .getVoiceInputDictionaryReadOnly({}, options(signal));
+    return projectVoiceDictionaryReadOnly(response.dictionary);
+  },
+  async *watchVoiceInputDictionaryReadOnly(credential, signal) {
+    let sequence = 0n;
+    const request = new AbortController();
+    const cancel = (): void => request.abort();
+    if (signal.aborted) cancel(); else signal.addEventListener("abort", cancel, { once: true });
+    try {
+      const stream = createClient(VoiceInputService, transport(credential.origin, credential.authKey)).watchVoiceInputDictionaryReadOnly({}, options(request.signal));
+      for await (const response of stream) {
+        request.signal.throwIfAborted();
+        sequence = nextVoiceDictionaryWatchSequence(response.sequence, sequence);
+        yield projectVoiceDictionaryReadOnly(response.dictionary);
+      }
+    } finally { cancel(); signal.removeEventListener("abort", cancel); }
+  },
+  async grantVoiceInputDictionaryPeer(credential, expectedConfigurationRevision, peerId, expectedFingerprint, signal) {
+    const response = await createClient(VoiceInputService, transport(credential.origin, credential.authKey)).grantVoiceInputDictionaryPeer({ expectedConfigurationRevision, peerId, expectedFingerprint }, options(signal));
+    return projectVoiceDictionaryPeerStatus(response.status);
+  },
+  async *watchVoiceInputDictionary(credential, signal) {
+    let sequence = 0n;
+    const request = new AbortController();
+    const cancel = (): void => request.abort();
+    if (signal.aborted) cancel(); else signal.addEventListener("abort", cancel, { once: true });
+    try {
+      const stream = createClient(VoiceInputService, transport(credential.origin, credential.authKey)).watchVoiceInputDictionary({}, options(request.signal));
+      for await (const response of stream) {
+        request.signal.throwIfAborted();
+        sequence = nextVoiceDictionaryWatchSequence(response.sequence, sequence);
+        yield projectMobileVoiceDictionarySnapshot(response.dictionary);
+      }
+    } finally { cancel(); signal.removeEventListener("abort", cancel); }
+  },
+  async *watchVoiceInputDictionaryPeerStatus(credential, signal) {
+    let sequence = 0n;
+    const request = new AbortController();
+    const cancel = (): void => request.abort();
+    if (signal.aborted) cancel(); else signal.addEventListener("abort", cancel, { once: true });
+    try {
+      const stream = createClient(VoiceInputService, transport(credential.origin, credential.authKey)).watchVoiceInputDictionaryPeerStatus({}, options(request.signal));
+      for await (const response of stream) {
+        request.signal.throwIfAborted();
+        sequence = nextVoiceDictionaryWatchSequence(response.sequence, sequence);
+        yield projectVoiceDictionaryPeerStatus(response.status);
+      }
+    } finally { cancel(); signal.removeEventListener("abort", cancel); }
+  },
+  async revokeVoiceInputDictionaryPeer(credential, peerId, expectedGrantRevision, signal) {
+    const response = await createClient(VoiceInputService, transport(credential.origin, credential.authKey)).revokeVoiceInputDictionaryPeer({ peerId, expectedGrantRevision }, options(signal));
+    return projectVoiceDictionaryPeerStatus(response.status);
+  },
+  async syncVoiceInputDictionaryNow(credential, expectedConfigurationRevision, peerId, signal) {
+    const response = await createClient(VoiceInputService, transport(credential.origin, credential.authKey)).syncVoiceInputDictionaryNow({ expectedConfigurationRevision, ...(peerId === undefined ? {} : { peerId }) }, options(signal));
+    return projectVoiceDictionaryPeerStatus(response.status);
+  },
+  async configureVoiceInputDictionaryListener(credential, expectedConfigurationRevision, listener, signal) {
+    const response = await createClient(VoiceInputService, transport(credential.origin, credential.authKey)).configureVoiceInputDictionaryListener({ expectedConfigurationRevision, listener }, options(signal));
+    return projectVoiceDictionaryPeerStatus(response.status);
+  },
+  async getVoiceInputDictionaryPeerInvitation(credential, signal) {
+    const response = await createClient(VoiceInputService, transport(credential.origin, credential.authKey)).getVoiceInputDictionaryPeerInvitation({}, options(signal));
+    readVoiceDictionaryPeerInvitation(response.invitation);
+    return response.invitation;
+  },
+  async grantVoiceInputDictionaryDirectPeer(credential, expectedConfigurationRevision, invitation, expectedFingerprint, signal) {
+    const response = await createClient(VoiceInputService, transport(credential.origin, credential.authKey)).grantVoiceInputDictionaryDirectPeer({ expectedConfigurationRevision, invitation, expectedFingerprint }, options(signal));
+    return projectVoiceDictionaryPeerStatus(response.status);
+  },
+  async clearVoiceInputDictionaryPeerRoute(credential, expectedConfigurationRevision, peerId, signal) {
+    const response = await createClient(VoiceInputService, transport(credential.origin, credential.authKey)).clearVoiceInputDictionaryPeerRoute({ expectedConfigurationRevision, peerId }, options(signal));
+    return projectVoiceDictionaryPeerStatus(response.status);
+  },
+  async setVoiceInputDictionarySyncEnabled(credential, expectedRevision, enabled, signal) {
+    const response = await createClient(VoiceInputService, transport(credential.origin, credential.authKey))
+      .setVoiceInputDictionarySyncEnabled({ expectedRevision, enabled }, options(signal));
+    return projectMobileVoiceDictionarySnapshot(response.dictionary);
+  },
+  async addVoiceInputDictionaryTerms(credential, expectedRevision, terms, signal) {
+    const response = await createClient(VoiceInputService, transport(credential.origin, credential.authKey))
+      .addVoiceInputDictionaryTerms({ expectedRevision, terms: [...terms] }, options(signal));
+    return projectMobileVoiceDictionarySnapshot(response.dictionary);
+  },
+  async editVoiceInputDictionaryEntry(credential, expectedRevision, entryId, text, aliases, signal) {
+    const response = await createClient(VoiceInputService, transport(credential.origin, credential.authKey))
+      .editVoiceInputDictionaryEntry({ expectedRevision, entryId, text, aliases: [...aliases] }, options(signal));
+    return projectMobileVoiceDictionarySnapshot(response.dictionary);
+  },
+  async deleteVoiceInputDictionaryEntry(credential, expectedRevision, entryId, signal) {
+    const response = await createClient(VoiceInputService, transport(credential.origin, credential.authKey))
+      .deleteVoiceInputDictionaryEntry({ expectedRevision, entryId }, options(signal));
+    return projectMobileVoiceDictionarySnapshot(response.dictionary);
+  },
+  async applyVoiceInputDictionaryLearning(credential, expectedRevision, actions, signal) {
+    const response = await createClient(VoiceInputService, transport(credential.origin, credential.authKey))
+      .applyVoiceInputDictionaryLearning({ expectedRevision, actions: mobileVoiceDictionaryLearningRequest(actions) }, options(signal));
+    return projectMobileVoiceDictionarySnapshot(response.dictionary);
+  },
   async adviseVoiceInputDictionaryEdit(credential, draft, signal) {
     const response = await createClient(VoiceInputService, transport(credential.origin, credential.authKey))
       .adviseVoiceInputDictionaryEdit(mobileVoiceDictionaryAdviceRequest(draft), options(signal));
     return Object.freeze({ actions: projectMobileVoiceDictionaryAdvice(response.actions, draft) });
   },
-  async startVoiceInput(credential, requestId, mimeType, locale, refinement, signal) {
+  async startVoiceInput(credential, requestId, mimeType, locale, refinement, signal, recognitionContext) {
     const response = await createClient(VoiceInputService, transport(credential.origin, credential.authKey))
-      .startVoiceInput(mobileVoiceStartRequest(requestId, mimeType, locale, refinement), options(signal));
+      .startVoiceInput(mobileVoiceStartRequest(requestId, mimeType, locale, refinement, recognitionContext), options(signal));
     return projectMobileVoiceSession(response.session);
   },
   async appendVoiceAudio(credential, voiceInputId, chunkSequence, audio, durationMs, voiced, signal) {
@@ -1579,14 +1750,17 @@ function mobileVoiceStartRequest(
   requestId: string,
   mimeType: string,
   locale: string | undefined,
-  refinement: MobileVoiceRefinementContext | undefined
+  refinement: MobileVoiceRefinementContext | undefined,
+  recognitionContext?: MobileVoiceRecognitionContext
 ) {
   return {
     requestId,
     mimeType,
     ...(locale === undefined ? {} : { locale }),
     ...(refinement?.instructions === undefined ? {} : { refinementInstructions: refinement.instructions }),
-    dictionaryTerms: [...(refinement?.dictionaryTerms ?? [])]
+    ...(recognitionContext === undefined ? {} : { recognitionContext: {
+      contextData: normalizeMobileVoiceRecognitionContext(recognitionContext).contextData.map((item) => ({ text: item.text }))
+    } })
   };
 }
 

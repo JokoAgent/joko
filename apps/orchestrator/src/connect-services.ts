@@ -426,6 +426,7 @@ import type { RemoteHostRegistry } from "./remote-host-registry.js";
 import type { RemoteBackendRuntimeSetupManager } from "./remote-backend-runtime-setup.js";
 import { createVoiceInputConnectService } from "./voice-input-connect-service.js";
 import type { VoiceInputCoordinator } from "./voice-input-coordinator.js";
+import type { VoiceDictionarySyncRepository } from "./voice-dictionary-sync-repository.js";
 import {
   VoiceInputSettingsError,
   type VoiceInputSettingsController
@@ -533,6 +534,7 @@ interface ConnectServiceDependencies {
   readonly terminals?: TerminalProvider;
   readonly voiceInput?: VoiceInputCoordinator;
   readonly voiceInputSettings?: VoiceInputSettingsController;
+  readonly voiceDictionary?: VoiceDictionarySyncRepository;
   readonly mobilePush?: MobilePushCoordinator;
   readonly refreshPiGeneration?: () => Promise<void>;
   readonly resolveSessionContextDefaults?: SessionContextDefaultsResolver;
@@ -1127,8 +1129,8 @@ const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3
 const RUNTIME_GENERATION = BigInt(Date.now());
 
 /** Register all public v1 services. Every descriptor method receives a concrete handler. */
-export function registerConnectServices(router: ConnectRouter, application: OrchestratorApplication): void {
-  const services = createConnectServices(application);
+export function registerConnectServices(router: ConnectRouter, application: OrchestratorApplication, projectionShutdownSignal?: AbortSignal): void {
+  const services = createConnectServices(application, projectionShutdownSignal);
   router.service(contract.ConnectionService, withConnectErrors(services.connection));
   router.service(contract.EventService, withConnectErrors(services.event));
   router.service(contract.OperationService, withConnectErrors(services.operation));
@@ -1166,7 +1168,7 @@ export function registerConnectServices(router: ConnectRouter, application: Orch
   router.service(contract.PiService, withConnectErrors(services.pi));
 }
 
-export function createConnectServices(application: OrchestratorApplication): ConnectServiceSet {
+export function createConnectServices(application: OrchestratorApplication, projectionShutdownSignal?: AbortSignal): ConnectServiceSet {
   const providerLoginFlows = new Map<string, NativeProviderLoginFlow>();
   const providerLoginEvidence = new Map<string, BackendProviderAuthenticationEvidence>();
   const backendProviderLoginFlows = new Map<string, BackendProviderLoginFlow>();
@@ -1255,6 +1257,7 @@ export function createConnectServices(application: OrchestratorApplication): Con
     ...(application.terminals === undefined ? {} : { terminals: application.terminals }),
     ...(application.voiceInput === undefined ? {} : { voiceInput: application.voiceInput }),
     ...(application.voiceInputSettings === undefined ? {} : { voiceInputSettings: application.voiceInputSettings }),
+    ...(application.voiceDictionary === undefined ? {} : { voiceDictionary: application.voiceDictionary }),
     ...(application.mobilePush === undefined ? {} : { mobilePush: application.mobilePush }),
     ...(application.refreshPiGeneration === undefined ? {} : { refreshPiGeneration: application.refreshPiGeneration }),
     ...(application.resolveSessionContextDefaults === undefined
@@ -1371,9 +1374,9 @@ export function createConnectServices(application: OrchestratorApplication): Con
     connections: dependencies.connections,
     store: dependencies.store
   });
-  const voiceInput = createVoiceInputConnectService(dependencies.voiceInput, dependencies.voiceInputSettings, (context) => ({
+  const voiceInput = createVoiceInputConnectService(dependencies.voiceInput, dependencies.voiceInputSettings, dependencies.voiceDictionary, (context) => ({
     connectionId: authenticate(context).id
-  }));
+  }), application.voiceDictionaryPeers, (connectionId, listener) => dependencies.connections.onRevoked(connectionId, listener), projectionShutdownSignal);
   const managedModelRuntime = createManagedModelRuntimeConnectService(
     dependencies.managedModelRuntime,
     (context) => authenticate(context)

@@ -59,12 +59,13 @@ import {
   mobileInteractionDrafts,
   mobileNewTaskDrafts,
   mobileOfflineCache,
+  mobileReadOnlyDictionaryCache,
   mobileDiagnostics,
   mobileLocalePreferences,
   mobilePushDeviceStore,
   mobileStorage,
   mobileThemePreferences,
-  mobileVoiceDictionary,
+  mobileVoicePreferences,
   mobileUpdates
 } from "./storage";
 import nativeNotifications from "./native-notifications";
@@ -216,6 +217,7 @@ import {
 } from "./workspace-files";
 import { buildMobileMessageActions, queueItemText, type MobileMessageActionId } from "./task-actions";
 import { useMobileVoiceInput, type MobileVoiceInputBinding } from "./use-mobile-voice-input";
+import { MobileVoiceDictionaryController } from "./mobile-voice-dictionary-controller";
 import type { MobileVoiceRunError } from "./mobile-voice-input";
 import { MobileImageLightbox } from "./MobileImageLightbox";
 import { MobileMediaPlayer } from "./MobileMediaPlayer";
@@ -248,6 +250,8 @@ import { MobileAutomationsScreen } from "./MobileAutomationsScreen";
 import { MobilePartnersScreen } from "./MobilePartnersScreen";
 import { MobileFilesToolbar } from "./MobileFilesToolbar";
 import { MobileSettingsScreen } from "./MobileSettingsScreen";
+import { MobileVoiceDictionaryReadOnlyController } from "./mobile-voice-dictionary-readonly-controller";
+import { mobileReadOnlyDictionarySources } from "./mobile-voice-dictionary-readonly";
 import {
   MobileForcedUpdateGate,
   MobileUpdatePrompt,
@@ -282,8 +286,11 @@ const client = new MobileClient(
   mobilePdfPreviewFiles,
   mobileModelPreviewFiles,
   mobileFileShare,
-  mobileOfflineCache
+  mobileOfflineCache,
+  mobileReadOnlyDictionaryCache
 );
+const readOnlyDictionary = new MobileVoiceDictionaryReadOnlyController(mobileReadOnlyDictionaryCache,
+  (profileId, signal) => client.voiceDictionaryReadOnlyTransport(profileId, signal));
 const mobilePush = new MobilePushController({
   platform: Platform.OS,
   environment: __DEV__ ? "sandbox" : "production",
@@ -522,6 +529,10 @@ async function performMobileImageOutput(
 }
 
 export function App() {
+  const dictionaryController = useMemo(() => new MobileVoiceDictionaryController(mobileVoicePreferences), []);
+  const nodeDictionary = useSyncExternalStore(
+    (listener) => dictionaryController.subscribe(listener), () => dictionaryController.snapshot
+  );
   const state = useSyncExternalStore((listener) => client.subscribe(listener), () => client.state);
   const theme = useSyncExternalStore(
     (listener) => mobileThemePreferences.subscribe(listener),
@@ -540,8 +551,8 @@ export function App() {
     () => mobileLocalePreferences.snapshot
   );
   const voiceDictionary = useSyncExternalStore(
-    (listener) => mobileVoiceDictionary.subscribe(listener),
-    () => mobileVoiceDictionary.snapshot
+    (listener) => mobileVoicePreferences.subscribe(listener),
+    () => mobileVoicePreferences.snapshot
   );
   const updates = useSyncExternalStore(
     (listener) => mobileUpdates.subscribe(listener),
@@ -563,6 +574,15 @@ export function App() {
   const [nativeIntentMessageFocus, setNativeIntentMessageFocus] = useState<MobileNativeIntentMessageFocus>();
   const [deviceId, setDeviceId] = useState<string>();
   const [foreground, setForeground] = useState(AppState.currentState === "active");
+  const dictionaryTransport = client.voiceDictionaryTransport();
+  useEffect(() => {
+    readOnlyDictionary.setSources(mobileReadOnlyDictionarySources(state.saved));
+  }, [state.saved]);
+  const dictionaryOwnerKey = foreground && page === "settings" ? dictionaryTransport?.ownerKey : undefined;
+  useEffect(() => {
+    dictionaryController.setTransport(dictionaryOwnerKey ? dictionaryTransport : undefined);
+    return () => dictionaryController.setTransport(undefined);
+  }, [dictionaryController, dictionaryOwnerKey]);
   const homeMenuButtonRef = useRef<View>(null);
   const pendingHomeMenuActionRef = useRef<(() => void) | undefined>(undefined);
   const openedIncomingShareRef = useRef<string | undefined>(undefined);
@@ -589,7 +609,7 @@ export function App() {
     const lifecycle = new MobileAppLifecycleCoordinator(AppState.currentState);
     void mobileThemePreferences.hydrate();
     void mobileLocalePreferences.hydrate();
-    void mobileVoiceDictionary.hydrate();
+    void mobileVoicePreferences.hydrate();
     void mobileUpdates.start(AppState.currentState === "active");
     let diagnosticsStopped = false;
     let diagnosticsState = AppState.currentState;
@@ -880,6 +900,7 @@ export function App() {
                   }} /> :
                 page === "settings" ? <MobileSettingsScreen colors={colors} state={state} foreground={foreground}
                   theme={theme} locale={locale} diagnostics={diagnostics} voiceDictionary={voiceDictionary}
+                  readOnlyDictionary={readOnlyDictionary}
                   updates={updates} updateActions={mobileUpdateActions} push={push} client={client}
                   onThemeChange={(preference) => mobileThemePreferences.setPreference(preference)}
                   onLocaleChange={(preference) => mobileLocalePreferences.setPreference(preference)}
@@ -890,13 +911,20 @@ export function App() {
                     appVersion: Constants.expoConfig?.version || "unknown",
                     platform: Platform.OS === "android" || Platform.OS === "ios" ? Platform.OS : "unknown"
                   })}
-                  onVoiceDictionaryRetry={() => mobileVoiceDictionary.retryHydrate()}
-                  onVoiceDictionaryReset={() => mobileVoiceDictionary.reset()}
-                  onVoiceInstructionsChange={(value) => mobileVoiceDictionary.setRefinementInstructions(value)}
-                  onVoiceAutoLearningChange={(enabled) => mobileVoiceDictionary.setAutoLearningEnabled(enabled)}
-                  onVoiceDictionaryAdd={(value) => mobileVoiceDictionary.addManualTerm(value)}
-                  onVoiceDictionaryEdit={(id, text, aliases) => mobileVoiceDictionary.editEntry(id, text, aliases)}
-                  onVoiceDictionaryDelete={(id) => mobileVoiceDictionary.deleteEntry(id)}
+                  onVoiceDictionaryRetry={() => mobileVoicePreferences.retryHydrate()}
+                  onVoiceDictionaryReset={() => mobileVoicePreferences.reset()}
+                  onVoiceInstructionsChange={(value) => mobileVoicePreferences.setRefinementInstructions(value)}
+                  onVoiceAutoLearningChange={(enabled) => mobileVoicePreferences.setAutoLearningEnabled(enabled)}
+                  onVoiceRecognitionContextChange={(enabled, contextData) => mobileVoicePreferences.setRecognitionContext(enabled, contextData)}
+                  voiceServiceTransport={foreground ? client.voiceInputSettingsTransport() : undefined}
+                  voicePeerTransport={dictionaryOwnerKey ? dictionaryTransport : undefined}
+                  nodeDictionary={nodeDictionary.ownerKey === dictionaryOwnerKey ? nodeDictionary
+                    : { status: dictionaryOwnerKey ? "loading" : "unavailable", ownerKey: dictionaryOwnerKey, saving: false }}
+                  onVoiceDictionaryRefresh={() => dictionaryController.refresh()}
+                  onVoiceDictionarySyncChange={(enabled) => dictionaryController.setSyncEnabled(enabled)}
+                  onVoiceDictionaryAdd={(value) => dictionaryController.addTerm(value)}
+                  onVoiceDictionaryEdit={(id, text, aliases, revision) => dictionaryController.editEntry(id, text, aliases, revision)}
+                  onVoiceDictionaryDelete={(id, revision) => dictionaryController.deleteEntry(id, revision)}
                   onBack={() => setPage("home")} onConnections={() => setPage("connections")}
                   onDevices={() => setPage("devices")} /> :
                 page === "connections" ? <ConnectionsScreen {...common} onBack={() => setPage("home")}

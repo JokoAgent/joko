@@ -1,4 +1,5 @@
 import type { JSONContent } from "@tiptap/core";
+import type { VoiceDictionaryPeerApi, VoiceInputSaucSettingsView, VoiceInputRecognitionContextView } from "@joko/contracts";
 
 export type Locale = "en" | "zh-CN" | "en-XA";
 export type Theme = "system" | "light" | "dark";
@@ -4341,6 +4342,7 @@ export interface VoiceInputServiceSettingsView {
   readonly endpoint: string;
   readonly model: string;
   readonly resourceId: string;
+  readonly sauc?: VoiceInputSaucSettingsView;
   readonly keyless: boolean;
   readonly credentialConfigured: boolean;
   readonly refinementEnabled: boolean;
@@ -4351,6 +4353,7 @@ export interface VoiceInputServiceSettingsView {
   readonly fallbackEndpoint: string;
   readonly fallbackModel: string;
   readonly fallbackResourceId: string;
+  readonly fallbackSauc?: VoiceInputSaucSettingsView;
   readonly fallbackKeyless: boolean;
   readonly fallbackCredentialConfigured: boolean;
   readonly revision: bigint;
@@ -4369,6 +4372,7 @@ export interface VoiceInputServiceSettingsDraft {
   readonly endpoint: string;
   readonly model: string;
   readonly resourceId: string;
+  readonly sauc?: VoiceInputSaucSettingsView;
   readonly keyless: boolean;
   readonly secret?: string;
   readonly clearCredential?: boolean;
@@ -4380,6 +4384,7 @@ export interface VoiceInputServiceSettingsDraft {
   readonly fallbackEndpoint: string;
   readonly fallbackModel: string;
   readonly fallbackResourceId: string;
+  readonly fallbackSauc?: VoiceInputSaucSettingsView;
   readonly fallbackKeyless: boolean;
   readonly fallbackSecret?: string;
   readonly clearFallbackCredential?: boolean;
@@ -4555,7 +4560,6 @@ export type MessagingConnectionTestResultView =
 
 export interface VoiceInputRefinementContextView {
   readonly instructions?: string;
-  readonly dictionaryTerms: readonly string[];
 }
 
 export interface SettingsView {
@@ -5144,6 +5148,11 @@ export interface VoiceInputCapabilityView {
   readonly supportsLocale: boolean;
   readonly supportsLiveDrafts: boolean;
   readonly supportsRefinement: boolean;
+  readonly supportsRecognitionContext: boolean;
+  readonly recognitionContextMaximumItems: number;
+  readonly recognitionContextMaximumItemBytes: number;
+  readonly recognitionContextMaximumBytes: number;
+  readonly supportedLocales: readonly string[];
 }
 
 export type VoiceInputConnectionTestFailureView =
@@ -5195,6 +5204,39 @@ export interface VoiceInputDictionaryLearningActionView {
 
 export interface VoiceInputDictionaryAdviceView {
   readonly actions: readonly VoiceInputDictionaryLearningActionView[];
+}
+
+export interface VoiceInputDictionaryAliasView {
+  readonly text: string;
+  readonly count: number;
+  readonly lastSeenAt: number;
+}
+
+export interface VoiceInputDictionaryEntryView {
+  readonly id: string;
+  readonly text: string;
+  readonly source: "manual" | "automatic";
+  readonly frequency: number;
+  readonly aliases: readonly VoiceInputDictionaryAliasView[];
+  readonly createdAt: number;
+  readonly updatedAt: number;
+}
+
+export interface VoiceInputDictionaryCandidateView {
+  readonly text: string;
+  readonly evidenceCount: number;
+  readonly aliases: readonly VoiceInputDictionaryAliasView[];
+  readonly createdAt: number;
+  readonly updatedAt: number;
+}
+
+export interface VoiceInputDictionarySnapshotView {
+  readonly revision: bigint;
+  readonly syncEnabled: boolean;
+  readonly entries: readonly VoiceInputDictionaryEntryView[];
+  readonly candidates: readonly VoiceInputDictionaryCandidateView[];
+  readonly suppressedAutomaticTerms: readonly string[];
+  readonly refinementTerms: readonly string[];
 }
 
 export type VoiceInputStateView = "idle" | "listening" | "submitting" | "refining" | "done" | "error";
@@ -5503,7 +5545,7 @@ export interface SimulatorViewerVideoPreferenceView {
   readonly clientFallbackReason?: "decode_failed";
 }
 
-export interface OperationApi {
+export interface OperationApi extends VoiceDictionaryPeerApi {
   getSimulatorViewerState(sessionId: string, signal?: AbortSignal): Promise<SimulatorViewerStateView>;
   controlSimulatorInstance(sessionId: string, requestId: string, input: SimulatorViewerControlView, signal?: AbortSignal): Promise<SimulatorViewerControlResultView>;
   controlSimulatorViewerInput(sessionId: string, requestId: string, route: SimulatorViewerRouteView,
@@ -5550,13 +5592,21 @@ export interface OperationApi {
   cancelTaskHistoryCleanup(maintenanceId: string): Promise<TaskHistoryCleanupProgressView>;
   getVoiceInputCapabilities(signal?: AbortSignal): Promise<VoiceInputCapabilityView>;
   testVoiceInputConnection(signal?: AbortSignal): Promise<VoiceInputConnectionTestResultView>;
+  getVoiceInputDictionary(signal?: AbortSignal): Promise<VoiceInputDictionarySnapshotView>;
+  watchVoiceInputDictionary(signal: AbortSignal): AsyncIterable<VoiceInputDictionarySnapshotView>;
+  setVoiceInputDictionarySyncEnabled(expectedRevision: bigint, enabled: boolean, signal?: AbortSignal): Promise<VoiceInputDictionarySnapshotView>;
+  addVoiceInputDictionaryTerms(expectedRevision: bigint, terms: readonly string[], signal?: AbortSignal): Promise<VoiceInputDictionarySnapshotView>;
+  editVoiceInputDictionaryEntry(expectedRevision: bigint, entryId: string, text: string, aliases: readonly string[], signal?: AbortSignal): Promise<VoiceInputDictionarySnapshotView>;
+  deleteVoiceInputDictionaryEntry(expectedRevision: bigint, entryId: string, signal?: AbortSignal): Promise<VoiceInputDictionarySnapshotView>;
+  applyVoiceInputDictionaryLearning(expectedRevision: bigint, actions: readonly VoiceInputDictionaryLearningActionView[], signal?: AbortSignal): Promise<VoiceInputDictionarySnapshotView>;
   adviseVoiceInputDictionaryEdit(draft: VoiceInputDictionaryAdviceDraft, signal?: AbortSignal): Promise<VoiceInputDictionaryAdviceView>;
   startVoiceInput(
     requestId: string,
     mimeType: string,
     locale?: string,
     refinement?: VoiceInputRefinementContextView,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    recognitionContext?: VoiceInputRecognitionContextView
   ): Promise<VoiceInputSessionView>;
   appendVoiceAudio(voiceInputId: string, chunkSequence: bigint, audio: Uint8Array, durationMs: number, voiced: boolean, signal?: AbortSignal): Promise<VoiceInputSessionView>;
   stopVoiceInput(voiceInputId: string, expectedNextChunkSequence: bigint, signal?: AbortSignal): Promise<VoiceInputSessionView>;
@@ -6113,7 +6163,7 @@ export interface OperationApi {
   restartMcpServer(serverId: string): Promise<void>;
   updatePiSettings(backendId: string, patch: { readonly autoCompaction?: boolean; readonly autoCompactionThresholdPercent?: number; readonly resetAutoCompactionThresholdPercent?: boolean; readonly autoRetry?: boolean; readonly steeringMode?: "all" | "oneAtATime"; readonly followUpMode?: "all" | "oneAtATime" }): Promise<void>;
   updateBrowserSettings(browserProviderId: string, patch: BrowserSettingsPatchView): Promise<void>;
-  updateVoiceInputServiceSettings(draft: VoiceInputServiceSettingsDraft): Promise<void>;
+  updateVoiceInputServiceSettings(draft: VoiceInputServiceSettingsDraft, signal?: AbortSignal): Promise<void>;
   showBrowserAutomation(browserProviderId: string, targetId: string): Promise<void>;
   updateComputerAutomationSettings(enabled: boolean): Promise<void>;
   installComputerAutomation(): Promise<void>;

@@ -53,7 +53,7 @@ import {
 } from "@joko/remote-ssh";
 import { createCommandConcurrencyGate } from "@joko/runtime-governance";
 import { createSocks5Dispatcher } from "@joko/outbound-network";
-import { ContactStore, OperationalStore, PartnerStore } from "@joko/store";
+import { ContactStore, OperationalStore, PartnerStore, VoiceDictionaryPeerStore } from "@joko/store";
 import { GitSafetyCoordinator, NodeGitCommandRunner } from "@joko/git-safety";
 import { AndroidAutomationRuntimeFactory } from "@joko/tool-android";
 import { BrowserProvider, type BrowserActivity } from "@joko/tool-browser";
@@ -238,6 +238,8 @@ import {
   VoiceInputCoordinator,
   type VoiceInputProviderFactory
 } from "./voice-input-coordinator.js";
+import { VoiceDictionarySyncRepository } from "./voice-dictionary-sync-repository.js";
+import { VoiceDictionaryPeerManager } from "./voice-dictionary-peer-manager.js";
 import { VoiceInputSettingsController } from "./voice-input-settings.js";
 import { WorkspaceChangeSetService } from "./workspace-change-set.js";
 import { OperationalWorkspaceChangeJournal } from "./workspace-change-stream.js";
@@ -370,6 +372,9 @@ export interface OrchestratorApplication {
   readonly simulatorViewer?: SimulatorViewerServiceOwner;
   readonly voiceInput?: VoiceInputCoordinator;
   readonly voiceInputSettings?: VoiceInputSettingsController;
+  /** Durable current-v1 convergence authority for the node's Voice dictionary replica. */
+  readonly voiceDictionary?: VoiceDictionarySyncRepository;
+  readonly voiceDictionaryPeers?: VoiceDictionaryPeerManager;
   readonly mobilePush?: MobilePushCoordinator;
   /** Point-in-time projection of current Backend process instances. */
   readonly adapters: readonly BackendAdapter[];
@@ -548,6 +553,18 @@ export async function createOrchestratorApplication(
     throw error;
   }
   let backendInstances!: BackendInstanceRegistry;
+  let voiceDictionaryPeerStore: VoiceDictionaryPeerStore;
+  try {
+    voiceDictionaryPeerStore = new VoiceDictionaryPeerStore(join(config.dataDirectory, "voice-dictionary-peers.db"));
+  } catch (error) {
+    contacts.close();
+    contactStore.close();
+    partnerStore.close();
+    store.close();
+    throw error;
+  }
+  let voiceDictionaryPeers!: VoiceDictionaryPeerManager;
+  try {
   let sessionWorktrees!: SessionWorktreeCoordinator;
   let deferredBackendRestarts: DeferredBackendRestartCoordinator | undefined;
   const subagentModels = new SubagentModelSettings({
@@ -713,10 +730,41 @@ export async function createOrchestratorApplication(
   });
   providers.initialize();
   const modelRoutes = createModelRouteCatalog(store, providers);
-  const voiceInputSettings = new VoiceInputSettingsController({ store, credentials, providers });
-  const voiceInput = new VoiceInputCoordinator({
-    provider: dependencies.voiceInputProvider ?? voiceInputSettings
+  const voiceDictionary = new VoiceDictionarySyncRepository({ store });
+  let retireVoiceInputConfiguration = (): void => undefined;
+  const voiceInputSettings = new VoiceInputSettingsController({ store, credentials, providers,
+    dictionaryTerms: () => voiceDictionary.snapshot().dictionary.entries.map((entry) => entry.text),
+    onConfigurationChanged: () => retireVoiceInputConfiguration() });
+  let lastVoiceDictionaryPeerDiagnosticAt = 0;
+  voiceDictionaryPeers = new VoiceDictionaryPeerManager({
+    store: voiceDictionaryPeerStore,
+    dictionary: voiceDictionary,
+    vault: credentialVault,
+    nodeId: serverId,
+    displayName: contactSyncDisplayName(),
+    enableLan: config.voiceDictionaryLanDiscoveryEnabled ?? true,
+    logger: {
+      debug: () => undefined,
+      warn: () => {
+        const at = Date.now();
+        if (at - lastVoiceDictionaryPeerDiagnosticAt < 5 * 60_000) return;
+        lastVoiceDictionaryPeerDiagnosticAt = at;
+        store.appendDiagnostic({
+          severity: "warning",
+          component: "voice-dictionary-sync",
+          code: "VOICE_DICTIONARY_PEER_UNAVAILABLE",
+          message: "Voice dictionary device sync encountered a secure transport failure.",
+          details: {}
+        });
+      }
+    }
   });
+  await voiceDictionaryPeers.initialize().catch(() => undefined);
+  const voiceInput = new VoiceInputCoordinator({
+    provider: dependencies.voiceInputProvider ?? voiceInputSettings,
+    onOwnerRetired: (connectionId, listener) => connections.onRevoked(connectionId, listener)
+  });
+  retireVoiceInputConfiguration = () => { void voiceInput.retireProviderConfiguration().catch(() => undefined); };
   const visionBridge = new VisionBridgeCoordinator({
     store,
     routes: modelRoutes,
@@ -2447,6 +2495,8 @@ export async function createOrchestratorApplication(
     await attempt(() => remoteBackendRuntimeSetup.close());
     await attempt(() => remoteHosts.close());
     await attempt(() => runtimeActivity.close());
+    await attempt(() => voiceDictionaryPeers.close());
+    await attempt(() => voiceDictionaryPeerStore.close());
     await attempt(() => contactSync.close());
     await attempt(() => contacts.close());
     await attempt(() => contactStore.close());
@@ -2491,6 +2541,8 @@ export async function createOrchestratorApplication(
     simulatorViewer,
     voiceInput,
     voiceInputSettings,
+    voiceDictionary,
+    voiceDictionaryPeers,
     mobilePush,
     get adapters() {
       return backendInstances.availableAdapters();
@@ -2637,6 +2689,9 @@ export async function createOrchestratorApplication(
         await attempt(() => remoteBackendRuntimeSetup.close());
         await attempt(() => remoteHosts.close());
         await attempt(() => runtimeActivity.close());
+        await attempt(() => voiceDictionaryPeers.close());
+        await attempt(() => voiceDictionary.close());
+        await attempt(() => voiceDictionaryPeerStore.close());
         await attempt(() => contactSync.close());
         await attempt(() => contacts.close());
         await attempt(() => contactStore.close());
@@ -2681,6 +2736,8 @@ export async function createOrchestratorApplication(
     await attempt(() => extensionPackagePublisher.close());
     await attempt(() => sshKeys.close());
     await attempt(() => runtimeActivity.close());
+    await attempt(() => voiceDictionaryPeers.close());
+    await attempt(() => voiceDictionaryPeerStore.close());
     await attempt(() => contactSync.close());
     await attempt(() => contacts.close());
     await attempt(() => contactStore.close());
@@ -2692,6 +2749,13 @@ export async function createOrchestratorApplication(
         "Orchestrator initialization failed and cleanup remained incomplete."
       );
     }
+    throw error;
+  }
+  } catch (error) {
+    const failures: unknown[] = [];
+    try { voiceDictionaryPeers?.close(); } catch (failure) { failures.push(failure); }
+    try { voiceDictionaryPeerStore.close(); } catch (failure) { failures.push(failure); }
+    if (failures.length > 0) throw new AggregateError([error, ...failures], "Dictionary peer startup cleanup remained incomplete.");
     throw error;
   }
 }

@@ -20,6 +20,7 @@ export interface OrchestratorConfig {
   readonly allowInsecureLoopback: boolean;
   readonly allowInsecureLan: boolean;
   readonly lanDiscoveryEnabled: boolean;
+  readonly voiceDictionaryLanDiscoveryEnabled?: boolean;
   readonly piExecutable?: string;
   readonly codexExecutable?: string;
   readonly claudeCodeExecutable?: string;
@@ -135,6 +136,7 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): Orches
     allowInsecureLoopback,
     allowInsecureLan,
     lanDiscoveryEnabled: environment.JOKO_LAN_DISCOVERY !== "0",
+    voiceDictionaryLanDiscoveryEnabled: environment.JOKO_VOICE_DICTIONARY_LAN_DISCOVERY !== "0",
     ...(environment.JOKO_PI_EXECUTABLE === undefined ? {} : { piExecutable: environment.JOKO_PI_EXECUTABLE }),
     ...(codexExecutable === undefined ? {} : { codexExecutable }),
     ...(environment.JOKO_CLAUDE_CODE_EXECUTABLE === undefined

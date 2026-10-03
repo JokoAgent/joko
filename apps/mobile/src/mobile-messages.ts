@@ -6,6 +6,7 @@ import { mobilePartnerMessages } from "./mobile-partner-messages";
 import { mobileTaskMessages } from "./mobile-task-messages";
 import { mobileUpdateMessages } from "./mobile-update-messages";
 import { mobileVoiceMessages } from "./mobile-voice-messages";
+import { mobileVoiceReadOnlyMessages } from "./mobile-voice-readonly-messages";
 
 const en = {
   "common.about": "About",
@@ -318,7 +319,8 @@ const en = {
   ...mobilePartnerMessages.en,
   ...mobilePushMessages.en,
   ...mobileUpdateMessages.en,
-  ...mobileVoiceMessages.en
+  ...mobileVoiceMessages.en,
+  ...mobileVoiceReadOnlyMessages.en
 } as const;
 
 export type MobileMessageKey = keyof typeof en;
@@ -635,7 +637,8 @@ const zhCN: MobileMessageCatalog = {
   ...mobilePartnerMessages["zh-CN"],
   ...mobilePushMessages["zh-CN"],
   ...mobileUpdateMessages["zh-CN"],
-  ...mobileVoiceMessages["zh-CN"]
+  ...mobileVoiceMessages["zh-CN"],
+  ...mobileVoiceReadOnlyMessages["zh-CN"]
 };
 
 const zhTW: MobileMessageCatalog = {
@@ -949,7 +952,8 @@ const zhTW: MobileMessageCatalog = {
   ...mobilePartnerMessages["zh-TW"],
   ...mobilePushMessages["zh-TW"],
   ...mobileUpdateMessages["zh-TW"],
-  ...mobileVoiceMessages["zh-TW"]
+  ...mobileVoiceMessages["zh-TW"],
+  ...mobileVoiceReadOnlyMessages["zh-TW"]
 };
 
 const ja: MobileMessageCatalog = {
@@ -1263,7 +1267,8 @@ const ja: MobileMessageCatalog = {
   ...mobilePartnerMessages.ja,
   ...mobilePushMessages.ja,
   ...mobileUpdateMessages.ja,
-  ...mobileVoiceMessages.ja
+  ...mobileVoiceMessages.ja,
+  ...mobileVoiceReadOnlyMessages.ja
 };
 
 const ko: MobileMessageCatalog = {
@@ -1577,7 +1582,8 @@ const ko: MobileMessageCatalog = {
   ...mobilePartnerMessages.ko,
   ...mobilePushMessages.ko,
   ...mobileUpdateMessages.ko,
-  ...mobileVoiceMessages.ko
+  ...mobileVoiceMessages.ko,
+  ...mobileVoiceReadOnlyMessages.ko
 };
 
 const catalogs: Readonly<Record<MobileSupportedLocale, MobileMessageCatalog>> = {
