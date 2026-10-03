@@ -22,8 +22,9 @@ async function fixture(onConnection: (socket: WebSocket, request: IncomingMessag
   return { endpoint: `ws://127.0.0.1:${address.port}/v1/speech-to-text/realtime`, model: "scribe_v2_realtime", connectTimeoutMs: 1_500, flushTimeoutMs: 1_000 };
 }
 
-function ready(socket: WebSocket): void {
-  socket.send(JSON.stringify({ message_type: "session_started", config: { model_id: "scribe_v2_realtime", audio_format: "pcm_16000", sample_rate: 16_000 } }));
+function ready(socket: WebSocket, commitStrategy?: string): void {
+  socket.send(JSON.stringify({ message_type: "session_started", config: { model_id: "scribe_v2_realtime", audio_format: "pcm_16000", sample_rate: 16_000,
+    ...(commitStrategy === undefined ? {} : { commit_strategy: commitStrategy }) } }));
 }
 function transcript(socket: WebSocket, type: "partial_transcript" | "committed_transcript" | "committed_transcript_with_timestamps", text: string): void {
   socket.send(JSON.stringify({ message_type: type, text }));
@@ -131,40 +132,49 @@ describe("Scribe realtime protocol", () => {
     ]);
   });
 
-  it("replays complete audio and original commit boundaries on the selected route before extending the stable prefix", async () => {
+  it.each(["spoken", "empty"] as const)("retires confirmed PCM after %s commits and keeps captured tails beyond sixty seconds", async (confirmation) => {
     const sockets: WebSocket[] = [];
     const received: Input[][] = [];
     const route = await fixture((socket, _request, index) => {
       sockets.push(socket);
-      received[index] = record(socket, (commit) => transcript(socket, "committed_transcript", ["hello", "world", "tail"][commit]!));
-      ready(socket);
+      received[index] = record(socket, index === 0 ? undefined : () => transcript(socket, "committed_transcript", "tail"));
+      ready(socket, "manual");
     });
     const { instance, events } = provider(route);
     await instance.start({ runId: "run", mimeType: "audio/pcm" });
-    instance.appendAudio(audio(1_000));
-    instance.appendAudio(audio(1_500, false));
-    await vi.waitFor(() => expect(events.at(-1)).toEqual({ type: "stable", text: "hello" }));
-    instance.appendAudio(audio(1_000));
-    instance.appendAudio(audio(1_500, false));
-    await vi.waitFor(() => expect(events.at(-1)).toEqual({ type: "stable", text: "hello world" }));
-    instance.appendAudio(audio(100));
+    let prefix = "";
+    const beforeAck = audio(100); new Uint8Array(beforeAck.data).fill(7);
+    for (let segment = 0; segment < 3; segment += 1) {
+      instance.appendAudio(audio(10_000, confirmation === "spoken"));
+      instance.appendAudio(audio(10_000, confirmation === "spoken"));
+      await vi.waitFor(() => expect(received[0]!.filter(message => message.commit)).toHaveLength(segment + 1));
+      if (segment === 2) instance.appendAudio(beforeAck);
+      const text = confirmation === "spoken" ? `confirmed-${segment}` : "";
+      prefix = [prefix, text].filter(Boolean).join(" ");
+      transcript(sockets[0]!, "committed_transcript", text);
+      await vi.waitFor(() => expect(events.at(-1)).toEqual({ type: "stable", text: prefix }));
+    }
+    const afterAck = audio(100); new Uint8Array(afterAck.data).fill(8);
+    instance.appendAudio(afterAck);
     await roundTrip(sockets[0]!);
     sockets[0]!.terminate();
     await vi.waitFor(() => expect(events.at(-1)?.type).toBe("disconnected"));
     await instance.recover();
-    expect(received.map(size)).toEqual([5_100 * 32, 7_100 * 32]);
-    expect(received[1]!.filter((message) => message.commit)).toHaveLength(3);
+    expect(received.map(size)).toEqual([60_200 * 32, 2_100 * 32]);
+    expect(received[1]!.filter((message) => message.commit)).toHaveLength(1);
+    expect(Buffer.concat(received[1]!.map(message => Buffer.from(message.audio_base_64, "base64")))).toEqual(
+      Buffer.concat([Buffer.alloc(100 * 32, 7), Buffer.alloc(100 * 32, 8), Buffer.alloc(1_900 * 32)]));
     await instance.flushAudio();
-    expect(events.at(-1)).toEqual({ type: "stable", text: "hello world tail" });
-    expect(events.filter((event) => event.type === "stable").map((event) => event.text)).toEqual(["hello", "hello world", "hello world", "hello world tail"]);
-    expect(events.some((event) => "text" in event && event.text.includes("hello hello"))).toBe(false);
+    expect(events.at(-1)).toEqual({ type: "stable", text: [prefix, "tail"].filter(Boolean).join(" ") });
+    expect(events.filter((event) => event.type === "stable")).toHaveLength(4);
   });
 
-  it("rejects conflicting replay text without changing the confirmed draft", async () => {
+  it("keeps confirmed text when reconnecting with no unconfirmed PCM and appends only new recognition", async () => {
     const sockets: WebSocket[] = [];
+    const received: Input[][] = [];
     const route = await fixture((socket, _request, index) => {
       sockets.push(socket);
-      record(socket, () => transcript(socket, "committed_transcript", index > 0 ? "different" : "confirmed"));
+      received[index] = record(socket, () => transcript(socket, "committed_transcript", index > 0 ? "different" : "confirmed"));
       ready(socket);
     });
     const { instance, events } = provider(route);
@@ -172,8 +182,14 @@ describe("Scribe realtime protocol", () => {
     instance.appendAudio(audio(1_000));
     instance.appendAudio(audio(1_500, false));
     await vi.waitFor(() => expect(events.at(-1)).toEqual({ type: "stable", text: "confirmed" }));
-    await expect(instance.recover()).rejects.toMatchObject({ code: "protocol" });
+    await instance.recover();
+    expect(received[1]).toEqual([]);
     expect(events.filter((event) => "text" in event)).toEqual([{ type: "stable", text: "confirmed" }]);
+    instance.appendAudio(audio(100));
+    await instance.flushAudio();
+    expect(events.filter((event) => event.type === "stable")).toEqual([
+      { type: "stable", text: "confirmed" }, { type: "stable", text: "confirmed different" }
+    ]);
   });
 
   it("stops startup promptly and does not accept a late handshake", async () => {
@@ -292,7 +308,7 @@ describe("Scribe realtime protocol", () => {
     expect(events).toEqual([{ type: "connected" }]);
   });
 
-  it("replays a lost commit receipt once, then drains captured audio before a concurrent stop barrier", async () => {
+  it.each(["capture", "replay"] as const)("replays a lost %s commit with its padding, then drains new capture before the stop barrier", async (lostAt) => {
     const sockets: WebSocket[] = [];
     const sent: Input[][] = [];
     const route = await fixture((socket, _request, index) => {
@@ -302,28 +318,46 @@ describe("Scribe realtime protocol", () => {
     });
     const { instance, events } = provider(route);
     await instance.start({ runId: "run", mimeType: "audio/pcm" });
-    instance.appendAudio(audio(1_000));
-    instance.appendAudio(audio(1_500, false));
-    instance.appendAudio(audio(100));
+    for (let segment = 0; segment < 3; segment += 1) {
+      instance.appendAudio(audio(10_000)); instance.appendAudio(audio(10_000));
+      await vi.waitFor(() => expect(sent[0]!.filter(message => message.commit)).toHaveLength(segment + 1));
+      transcript(sockets[0]!, "committed_transcript", `confirmed-${segment}`);
+      await vi.waitFor(() => expect(events.at(-1)).toEqual({ type: "stable", text: Array.from({ length: segment + 1 }, (_, index) => `confirmed-${index}`).join(" ") }));
+    }
+    if (lostAt === "capture") {
+      instance.appendAudio(audio(1_000)); instance.appendAudio(audio(1_500, false)); instance.appendAudio(audio(100));
+    } else instance.appendAudio(audio(100));
     await roundTrip(sockets[0]!);
     sockets[0]!.terminate();
     await vi.waitFor(() => expect(events.at(-1)?.type).toBe("disconnected"));
+    let connection = 1;
+    if (lostAt === "replay") {
+      const failed = expect(instance.recover()).rejects.toMatchObject({ code: "network" });
+      await vi.waitFor(() => expect(sockets).toHaveLength(2));
+      ready(sockets[1]!);
+      await vi.waitFor(() => expect(sent[1]!.filter(message => message.commit)).toHaveLength(1));
+      expect(size(sent[1]!)).toBe(2_100 * 32);
+      sockets[1]!.terminate();
+      await failed;
+      connection = 2;
+    }
     const recovery = instance.recover();
-    await vi.waitFor(() => expect(sockets).toHaveLength(2));
+    await vi.waitFor(() => expect(sockets).toHaveLength(connection + 1));
     instance.appendAudio(audio(100));
     let finished = false;
     const flush = instance.flushAudio().then(() => { finished = true; });
-    ready(sockets[1]!);
-    await vi.waitFor(() => expect(sent[1]!.filter((message) => message.commit)).toHaveLength(1));
-    expect(size(sent[1]!)).toBe(2_500 * 32);
-    transcript(sockets[1]!, "committed_transcript", "first");
-    await vi.waitFor(() => expect(sent[1]!.filter((message) => message.commit)).toHaveLength(2));
+    ready(sockets[connection]!);
+    await vi.waitFor(() => expect(sent[connection]!.filter((message) => message.commit)).toHaveLength(1));
+    expect(size(sent[connection]!)).toBe((lostAt === "capture" ? 2_500 : 2_100) * 32);
+    if (lostAt === "replay") expect(sent[connection]).toEqual(sent[1]);
+    transcript(sockets[connection]!, "committed_transcript", "first");
+    await vi.waitFor(() => expect(sent[connection]!.filter((message) => message.commit)).toHaveLength(2));
     expect(finished).toBe(false);
-    expect(size(sent[1]!)).toBe(4_600 * 32);
-    transcript(sockets[1]!, "committed_transcript", "tail");
+    expect(size(sent[connection]!)).toBe((lostAt === "capture" ? 4_600 : 4_200) * 32);
+    transcript(sockets[connection]!, "committed_transcript", "tail");
     await recovery;
     await flush;
-    expect(events.at(-1)).toEqual({ type: "stable", text: "first tail" });
+    expect(events.at(-1)).toEqual({ type: "stable", text: "confirmed-0 confirmed-1 confirmed-2 first tail" });
   });
 
   it("fails a recovery whose replay receives no acknowledgement", async () => {
@@ -354,8 +388,11 @@ describe("Scribe realtime protocol", () => {
     expect(await probeScribeTranscriptionRoute({ ...route, apiKey: "private-api-key" })).toEqual({ ok: false, reason });
   });
 
-  it("rejects an incompatible negotiated PCM format", async () => {
-    const route = await fixture((socket) => socket.send(JSON.stringify({ message_type: "session_started", config: { model_id: "scribe_v2_realtime", audio_format: "pcm_24000", sample_rate: 24_000 } })));
+  it.each([
+    ["PCM format", { model_id: "scribe_v2_realtime", audio_format: "pcm_24000", sample_rate: 24_000 }],
+    ["commit strategy", { model_id: "scribe_v2_realtime", audio_format: "pcm_16000", sample_rate: 16_000, commit_strategy: "vad" }]
+  ])("rejects an incompatible negotiated %s", async (_kind, config) => {
+    const route = await fixture((socket) => socket.send(JSON.stringify({ message_type: "session_started", config })));
     expect(await probeScribeTranscriptionRoute(route)).toEqual({ ok: false, reason: "serviceError" });
   });
 
