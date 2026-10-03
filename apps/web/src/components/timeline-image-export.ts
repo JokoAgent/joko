@@ -13,14 +13,57 @@ export function timelineExportScale(width: number, height: number, desired = 2):
 export function timelineTableToTsv(node: HTMLElement): string | undefined {
   const rows = [...node.querySelectorAll("tr")];
   if (rows.length === 0) return undefined;
-  return rows.map((row) => [...row.querySelectorAll("th, td")]
-    .map((cell) => (cell as HTMLElement).innerText.replace(/\s*\n\s*/gu, " ").trim())
+  const cells = rows.map((row) => [...row.querySelectorAll<HTMLElement>("th, td")]);
+  const mathematicalCells = new Set(cells.flat().filter((cell) =>
+    [...cell.querySelectorAll(".katex")].some((math) => mathSource(math) !== undefined)));
+  const format = (read: (cell: HTMLElement) => string): string => cells.map((row) => row
+    .map((cell) => read(cell).replace(/\s*\n\s*/gu, " ").trim())
     .join("\t")).join("\n");
+  if (mathematicalCells.size === 0) return format((cell) => cell.innerText);
+
+  const ownerDocument = node.ownerDocument;
+  const ownerWindow = ownerDocument.defaultView;
+  if (ownerWindow === null) throw new Error("Content is no longer available.");
+  const clone = node.cloneNode(true) as HTMLElement;
+  const originals = [node, ...node.querySelectorAll("*")];
+  const copies = [clone, ...clone.querySelectorAll("*")];
+  const copiedCells = new Map<HTMLElement, HTMLElement>();
+  originals.forEach((original, index) => {
+    const copy = copies[index] as HTMLElement | SVGElement;
+    if (copy.style !== undefined) copyStyle(ownerWindow.getComputedStyle(original), copy.style);
+    if (mathematicalCells.has(original as HTMLElement)) copiedCells.set(original as HTMLElement, copy as HTMLElement);
+  });
+  for (const math of clone.querySelectorAll<HTMLElement>(".katex")) {
+    const tex = mathSource(math);
+    if (tex !== undefined) math.replaceChildren(ownerDocument.createTextNode(tex));
+  }
+  const staging = ownerDocument.createElement("div");
+  staging.setAttribute("aria-hidden", "true");
+  staging.inert = true;
+  staging.style.cssText = "position:fixed;left:-100000px;top:0;pointer-events:none;contain:layout paint;";
+  // A detached or display-none source uses innerText's textContent fallback.
+  if (!node.isConnected) staging.style.display = "none";
+  for (let parent = node.parentElement; parent !== null; parent = parent.parentElement) {
+    if (ownerWindow.getComputedStyle(parent).display === "none") { staging.style.display = "none"; break; }
+  }
+  staging.append(clone);
+  ownerDocument.body.append(staging);
+  try {
+    // Keep the clone attached for native br/visibility/white-space semantics.
+    return format((cell) => copiedCells.get(cell)?.innerText ?? cell.innerText);
+  } finally {
+    staging.remove();
+  }
 }
 
 export function timelineMathToLatex(node: HTMLElement): string | undefined {
+  const tex = mathSource(node);
+  return tex === undefined ? undefined : `$$\n${tex}\n$$`;
+}
+
+function mathSource(node: Element): string | undefined {
   const tex = node.querySelector('annotation[encoding="application/x-tex"]')?.textContent?.trim();
-  return tex === undefined || tex.length === 0 ? undefined : `$$\n${tex}\n$$`;
+  return tex === undefined || tex.length === 0 ? undefined : tex;
 }
 
 function copyStyle(source: CSSStyleDeclaration, target: CSSStyleDeclaration): void {

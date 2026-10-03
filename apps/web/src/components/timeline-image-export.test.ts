@@ -1,11 +1,54 @@
 // @vitest-environment jsdom
 import { getFontEmbedCSS, toSvg } from "html-to-image";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
-import { copyTimelinePng, timelineDomToPng } from "./timeline-image-export.js";
+import { copyTimelinePng, timelineDomToPng, timelineTableToTsv } from "./timeline-image-export.js";
 
 vi.mock("html-to-image", () => ({ getFontEmbedCSS: vi.fn(async () => ""), toSvg: vi.fn(async () => "data:image/svg+xml,test") }));
 beforeEach(() => { vi.clearAllMocks(); });
 afterEach(() => { vi.restoreAllMocks(); document.body.replaceChildren(); });
+
+it("extracts each formula once from an attached styled snapshot without mutating the selected table", () => {
+  const fixture = createDocument();
+  const node = fixture.doc.body.appendChild(fixture.doc.createElement("div"));
+  node.innerHTML = '<table><tbody><tr><td class="math" style="white-space:pre-wrap">Before <span class="katex"><span class="katex-mathml"><math><semantics><mi>E</mi><annotation encoding="application/x-tex"> E=mc^2 </annotation></semantics></math></span><span class="katex-html">Duplicate E</span></span><br>second <span class="katex"><span class="katex-mathml"><math><semantics><mi>fraction</mi><annotation encoding="application/x-tex">\\frac{1}{2}</annotation></semantics></math></span><span class="katex-html">Duplicate fraction</span></span> After<span style="display:none">Hidden</span></td><td class="plain">Alpha<br>Beta</td></tr></tbody></table>';
+  const original = node.innerHTML;
+  const text = node.querySelector("td")!.firstChild!;
+  const selection = fixture.win.getSelection()!;
+  const range = fixture.doc.createRange();
+  range.setStart(text, 0);
+  range.setEnd(text, 6);
+  selection.addRange(range);
+  const observer = new fixture.win.MutationObserver(() => undefined);
+  observer.observe(node, { childList: true, subtree: true, characterData: true, attributes: true });
+  let failRead = false;
+  // jsdom has no native innerText; Chrome separately verifies rendered text semantics.
+  Object.defineProperty(fixture.win.HTMLElement.prototype, "innerText", { configurable: true, get(this: HTMLElement) {
+    if (this.className === "plain") {
+      expect(node.contains(this)).toBe(true);
+      return "Alpha\nBeta";
+    }
+    expect(this.isConnected).toBe(true);
+    expect(node.contains(this)).toBe(false);
+    expect(this.ownerDocument).toBe(fixture.doc);
+    expect(this.style.whiteSpace).toBe("pre-wrap");
+    expect([...this.querySelectorAll(".katex")].map((math) => math.textContent)).toEqual(["E=mc^2", "\\frac{1}{2}"]);
+    expect(this.querySelector(".katex-mathml, .katex-html, annotation")).toBeNull();
+    expect((this.lastElementChild as HTMLElement).style.display).toBe("none");
+    expect(this.closest<HTMLElement>('[aria-hidden="true"]')!.inert).toBe(true);
+    if (failRead) throw new Error("read failed");
+    return "Before E=mc^2\nsecond \\frac{1}{2} After";
+  } });
+  expect(timelineTableToTsv(node)).toBe("Before E=mc^2 second \\frac{1}{2} After\tAlpha Beta");
+  failRead = true;
+  expect(() => timelineTableToTsv(node)).toThrow("read failed");
+  expect(fixture.doc.querySelector('[aria-hidden="true"]')).toBeNull();
+  expect(node.innerHTML).toBe(original);
+  expect(selection.toString()).toBe("Before");
+  expect(selection.anchorNode).toBe(text);
+  expect(selection.focusNode).toBe(text);
+  expect(observer.takeRecords()).toHaveLength(0);
+  observer.disconnect();
+});
 
 it("freezes source content, inherited style, dimensions and fonts before awaiting the originating Document", async () => {
   const fixture = createDocument();
