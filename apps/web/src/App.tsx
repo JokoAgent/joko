@@ -1054,7 +1054,12 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
     const requestId = ++timelineHistoryRequestIdRef.current;
     setTimelineHistory((current) => reset || current?.sessionId !== sessionId || current.generation !== generation
       || current.historyRevision !== historyRevision
-      ? { sessionId, generation, historyRevision, items: [], initialized: false, loading: true }
+      ? {
+          sessionId, generation, historyRevision,
+          items: current?.sessionId === sessionId && current.generation === generation && current.historyRevision === historyRevision
+            ? current.items : [],
+          initialized: false, loading: true
+        }
       : {
           sessionId,
           generation,
@@ -1074,7 +1079,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
           sessionId,
           generation,
           historyRevision,
-          items: reset ? page.items : mergeTimelineWindows(current.items, page.items),
+          items: mergeTimelineWindows(current.items, page.items),
           ...(page.nextBeforeCursor === undefined ? {} : { nextBeforeCursor: page.nextBeforeCursor }),
           initialized: true,
           loading: false

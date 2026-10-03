@@ -845,14 +845,31 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
 
   useLayoutEffect(() => {
     const overlay = bottomOverlayRef.current;
-    if (overlay === null) return;
-    const report = (): void => setBottomInset(Math.ceil(overlay.getBoundingClientRect().height));
+    const pane = paneRef.current;
+    const timeline = pane?.querySelector<HTMLElement>(".timeline[data-timeline-session-id]");
+    if (overlay === null || pane === null) return;
+    const currentTimeline = timeline?.dataset.timelineSessionId === session.id ? timeline : undefined;
+    let active = true;
+    const report = (): void => {
+      if (!active || paneRef.current !== pane || bottomOverlayRef.current !== overlay) return;
+      if (currentTimeline !== undefined && pane.contains(currentTimeline)) {
+        overlay.style.setProperty("--session-timeline-scrollbar-gutter", `${Math.max(0, currentTimeline.offsetWidth - currentTimeline.clientWidth)}px`);
+      }
+      setBottomInset(Math.ceil(overlay.getBoundingClientRect().height));
+    };
     report();
-    if (typeof ResizeObserver === "undefined") return;
-    const observer = new ResizeObserver(report);
-    observer.observe(overlay);
-    return () => observer.disconnect();
-  }, [session.id]);
+    const observer = typeof ResizeObserver === "undefined" ? undefined : new ResizeObserver(report);
+    observer?.observe(overlay);
+    if (currentTimeline !== undefined) observer?.observe(currentTimeline);
+    const view = pane.ownerDocument.defaultView;
+    view?.addEventListener("resize", report);
+    return () => {
+      active = false;
+      observer?.disconnect();
+      view?.removeEventListener("resize", report);
+      overlay.style.removeProperty("--session-timeline-scrollbar-gutter");
+    };
+  }, [session.id, timelineResourceOwnerKey, visibleTimeline.length === 0]);
 
   useLayoutEffect(() => {
     compactGuardRef.current.setCurrentSession(session.id);
@@ -1986,7 +2003,7 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
         <InteractionDialog key={interaction === undefined ? "interaction:none" : `${interaction.sessionId}:${interaction.id}`} controller={controller} interaction={interaction} remaining={remainingInteractions} inline t={t} runAction={runAction} />
       </InteractionPromptHost>
       {currentShareSelection !== undefined && <ShareSelectionBar ownerKey={`${timelineResourceOwnerKey}:${session.generation}`} sessionName={session.name} messages={shareableMessages} selectedIds={currentShareSelection.selectedIds} locale={controller.state.preferences.locale} t={t} onToggleAll={toggleAllShareMessages} onCancel={closeShareSelection} />}
-{interaction === undefined && <div hidden={currentShareSelection !== undefined}><Composer artifacts={canListSessionArtifacts ? liveArtifacts : []} sessions={historicalSessionMentionCandidates} controller={controller} session={session} backend={backend} sessionUsage={effectiveSessionUsage} readOnly={reviewReadOnly} autoFocus={composerAutoFocus && presentation === "standard" && currentShareSelection === undefined} focusRequest={composerFocusRequest} queue={queue} queueControl={queueControl} workspace={workspace} extraDirectories={extraDirectories} resources={canListSessionResources ? liveResources : []} commands={canListRuntimeCommands ? liveCommands : []} messageHistory={messageHistory} controls={composerControls} runningStatus={<SessionRunningStatusBar session={session} items={recoveryPresentationTimeline} backgroundTaskIds={backgroundTaskIds} canStopBackgroundTasks={canStopBackgroundTasks} backgroundStopping={backgroundStopping} backgroundStopError={backgroundStopError} suppressed={reviewReadOnly} t={t} onStopBackgroundTasks={stopAllBackgroundTasks} />} messageMentionInsertion={composerMessageMentionInsertion} selectionQuoteInsertion={composerSelectionQuoteInsertion} attachmentInsertion={composerAttachmentInsertion} draftReplacement={composerDraftReplacement} onDraftMutation={noteComposerDraftMutation} t={t} runAction={runAction} onLocalSend={(sourceSessionId) => { if (activeSessionIdRef.current === sourceSessionId) setFollowLatestSignal((current) => current + 1); }} onStop={canStop ? stopRun : undefined} stopInFlight={stopInFlight} onCompact={canCompact && !running && activeCompaction === undefined && !compactInFlight && (session.context?.usedTokens ?? 0) > 0 ? requestCompact : undefined} /></div>}
+{interaction === undefined && <div className="session-composer-layer" hidden={currentShareSelection !== undefined}><Composer artifacts={canListSessionArtifacts ? liveArtifacts : []} sessions={historicalSessionMentionCandidates} controller={controller} session={session} backend={backend} sessionUsage={effectiveSessionUsage} readOnly={reviewReadOnly} autoFocus={composerAutoFocus && presentation === "standard" && currentShareSelection === undefined} focusRequest={composerFocusRequest} queue={queue} queueControl={queueControl} workspace={workspace} extraDirectories={extraDirectories} resources={canListSessionResources ? liveResources : []} commands={canListRuntimeCommands ? liveCommands : []} messageHistory={messageHistory} controls={composerControls} runningStatus={<SessionRunningStatusBar session={session} items={recoveryPresentationTimeline} backgroundTaskIds={backgroundTaskIds} canStopBackgroundTasks={canStopBackgroundTasks} backgroundStopping={backgroundStopping} backgroundStopError={backgroundStopError} suppressed={reviewReadOnly} t={t} onStopBackgroundTasks={stopAllBackgroundTasks} />} messageMentionInsertion={composerMessageMentionInsertion} selectionQuoteInsertion={composerSelectionQuoteInsertion} attachmentInsertion={composerAttachmentInsertion} draftReplacement={composerDraftReplacement} onDraftMutation={noteComposerDraftMutation} t={t} runAction={runAction} onLocalSend={(sourceSessionId) => { if (activeSessionIdRef.current === sourceSessionId) setFollowLatestSignal((current) => current + 1); }} onStop={canStop ? stopRun : undefined} stopInFlight={stopInFlight} onCompact={canCompact && !running && activeCompaction === undefined && !compactInFlight && (session.context?.usedTokens ?? 0) > 0 ? requestCompact : undefined} /></div>}
       <ExtensionWidgets widgets={extensionWidgets.filter((widget) => widget.placement === "belowEditor")} label={t("a11y.extensionWidgets")} />
       </div>
 

@@ -690,12 +690,19 @@ export function Timeline({ ownerKey, viewportOwnerKey, sessionId, sessionName, w
     const document = node.ownerDocument;
     const owner = navigationOwnerRef.current;
     let active = true;
+    const suppressScrollbarAdjustment = (): boolean => false;
+    const releaseScrollbarAdjustment = (): void => {
+      if (virtualizer.shouldAdjustScrollPositionOnItemSizeChange === suppressScrollbarAdjustment) {
+        virtualizer.shouldAdjustScrollPositionOnItemSizeChange = undefined;
+      }
+    };
     const isCurrent = (): boolean => active && navigationOwnerRef.current === owner && scrollRef.current === node;
     const endScrollbarDrag = (resumePin = true): void => {
       const drag = scrollbarDragRef.current;
       if (!isCurrent() || drag?.owner !== owner || drag.node !== node) return;
       if (resumePin) observeScrollbarMovement(node);
       scrollbarDragRef.current = undefined;
+      releaseScrollbarAdjustment();
       if (resumePin && !document.hidden && followingRef.current) pinToLatest();
     };
     const onMouseDown = (event: MouseEvent): void => {
@@ -711,6 +718,7 @@ export function Timeline({ ownerKey, viewportOwnerKey, sessionId, sessionName, w
       setFocusedItemId(undefined);
       previousScrollTopRef.current = node.scrollTop;
       scrollbarDragRef.current = { owner, node, startScrollTop: node.scrollTop, previousScrollTop: node.scrollTop };
+      virtualizer.shouldAdjustScrollPositionOnItemSizeChange = suppressScrollbarAdjustment;
     };
     const onMouseMove = (event: MouseEvent): void => {
       if (!isCurrent()) return;
@@ -738,8 +746,9 @@ export function Timeline({ ownerKey, viewportOwnerKey, sessionId, sessionName, w
       view.removeEventListener("pagehide", onPageHide);
       document.removeEventListener("visibilitychange", onVisibilityChange);
       if (scrollbarDragRef.current?.owner === owner && scrollbarDragRef.current.node === node) scrollbarDragRef.current = undefined;
+      releaseScrollbarAdjustment();
     };
-  }, [cancelTimelineNavigation, observeScrollbarMovement, ownerKey, pinToLatest, sessionId, timelineHasItems]);
+  }, [cancelTimelineNavigation, observeScrollbarMovement, ownerKey, pinToLatest, sessionId, timelineHasItems, virtualizer]);
 
   useLayoutEffect(() => {
     if (!following || items.length === 0) return;
