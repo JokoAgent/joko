@@ -1691,8 +1691,8 @@ export function StreamingMarkdown({ text, streaming, streamFadeKey, t }: { reado
   const personalization = useContext(TimelinePersonalizationContext);
   const throttled = useStreamingMarkdownText(text, streaming);
   const source = streaming ? throttled : text;
-  const rendered = useMemo(() => streaming ? repairStreamingMarkdown(source) : source, [source, streaming]);
   const fade = timelineStreamFadeActive(streaming, personalization.streamFadeEnabled, personalization.reducedMotion);
+  const rendered = useMemo(() => fade ? repairStreamingMarkdown(source) : source, [source, fade]);
   const fadeState = useMemo(() => fade ? timelineWordFadeState(streamFadeKey) : undefined, [fade, streamFadeKey]);
   const candidate = useMemo(() => fadeState === undefined ? undefined : createTimelineWordFadeCandidate(fadeState), [fadeState, rendered]);
   useLayoutEffect(() => {

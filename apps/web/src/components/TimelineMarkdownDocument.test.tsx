@@ -140,3 +140,63 @@ it("preserves explicit URL destinations while a streamed bare link returns punct
   expect(host.querySelector("code")?.textContent).toBe(unicodeCorpus.codeUrlWithCjkParentheses);
   expect(host.querySelector("strong")?.textContent).toBe(unicodeCorpus.cjkHeadingWithColon);
 });
+
+it("uses the current streaming animation admission for incomplete Markdown repair", async ({ onTestFinished }) => {
+  vi.useFakeTimers();
+  vi.spyOn(HTMLElement.prototype, "offsetHeight", "get").mockReturnValue(600);
+  vi.spyOn(HTMLElement.prototype, "offsetWidth", "get").mockReturnValue(800);
+  const previousScrollTo = Object.getOwnPropertyDescriptor(HTMLElement.prototype, "scrollTo");
+  const previousMatchMedia = Object.getOwnPropertyDescriptor(window, "matchMedia");
+  Object.defineProperty(HTMLElement.prototype, "scrollTo", { configurable: true, value: vi.fn() });
+  let reducedMotion = false;
+  const motion = new EventTarget();
+  Object.defineProperty(motion, "matches", { get: () => reducedMotion });
+  Object.defineProperty(window, "matchMedia", { configurable: true, value: () => motion as MediaQueryList });
+  onTestFinished(() => {
+    if (previousScrollTo === undefined) Reflect.deleteProperty(HTMLElement.prototype, "scrollTo");
+    else Object.defineProperty(HTMLElement.prototype, "scrollTo", previousScrollTo);
+    if (previousMatchMedia === undefined) Reflect.deleteProperty(window, "matchMedia");
+    else Object.defineProperty(window, "matchMedia", previousMatchMedia);
+  });
+  const t = ((key: string) => key) as Translator;
+  const incomplete = ["**unfinished", "[label](https://example.test/unfinished", "![image"];
+  const render = async (streamFadeEnabled: boolean, streaming = true): Promise<void> => {
+    await act(async () => root.render(<Timeline
+      ownerKey="repair-admission" viewportOwnerKey="repair-admission-viewport" sessionId="repair-session" sessionName="Repair" sessionActive={streaming}
+      items={incomplete.map((text, index) => ({ id: `incomplete-${index}`, sequence: BigInt(index + 1), kind: "assistant", createdAt: 0, text, streaming }))}
+      messageNavRailEnabled={false} streamFadeEnabled={streamFadeEnabled} hasEarlier={false} historyLoading={false}
+      locale="en" t={t} onLoadEarlier={async () => undefined}
+      onArtifactUrl={async () => ""} onArtifactUrlRelease={() => undefined} onArtifactDownload={async () => "dispatched"}
+    />));
+  };
+  const bodies = (): HTMLElement[] => [...host.querySelectorAll<HTMLElement>(".message-assistant__body")];
+  const expectRepaired = (): void => {
+    expect(bodies().map((body) => body.textContent)).toEqual(["unfinished", "label", "image"]);
+    expect(bodies()[0]!.querySelector("strong")?.textContent).toBe("unfinished");
+    expect(host.querySelector(".stream-word")).not.toBeNull();
+  };
+  const expectRaw = (): void => {
+    expect(bodies().map((body) => body.textContent)).toEqual(incomplete);
+    expect(bodies()[0]!.querySelector("strong")).toBeNull();
+    expect(host.querySelector(".stream-word")).toBeNull();
+  };
+  const setReducedMotion = async (value: boolean): Promise<void> => {
+    reducedMotion = value;
+    const event = new Event("change");
+    Object.defineProperty(event, "matches", { value });
+    await act(async () => { motion.dispatchEvent(event); });
+  };
+  await render(true);
+  await act(async () => vi.advanceTimersByTime(32));
+  expectRepaired();
+  await render(false);
+  expectRaw();
+  await render(true);
+  expectRepaired();
+  await setReducedMotion(true);
+  expectRaw();
+  await setReducedMotion(false);
+  expectRepaired();
+  await render(true, false);
+  expectRaw();
+});
