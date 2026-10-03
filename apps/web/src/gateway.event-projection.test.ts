@@ -1201,6 +1201,118 @@ describe("incremental event projection", () => {
       .toEqual(snapshot.timelineBySession.get("session-tool-time"));
   });
 
+  it("retains only observed thinking-block activity through completion and history replay", () => {
+    let raw = create(SnapshotSchema, {
+      generation: 3n,
+      resumeCursor: { generation: 3n, sequence: 0n }
+    });
+    let snapshot = mapSnapshot(raw);
+    let sequence = 0n;
+    const apply = (
+      occurredAt: { readonly seconds: bigint; readonly nanos?: number } | undefined,
+      payload: Event["payload"]
+    ): void => {
+      sequence += 1n;
+      const projected = projectSnapshotEvent(raw, snapshot, create(EventSchema, {
+        eventId: `thinking-time-${sequence}`,
+        cursor: { generation: 3n, sequence },
+        identity: { sessionId: "session-thinking-time", runId: "run-1" },
+        ...(occurredAt === undefined ? {} : { occurredAt }),
+        payload
+      }));
+      expect(projected.refresh).toBe("none");
+      raw = projected.rawSnapshot;
+      snapshot = projected.snapshot;
+    };
+    const delta = (messageId: string, contentIndex: number, text: string) => create(EventPayloadSchema, {
+      kind: { case: "thinkingDelta", value: { messageId, contentIndex, delta: text } }
+    });
+    const thinkingItem = (messageId: string, contentIndex: number) =>
+      snapshot.timelineBySession.get("session-thinking-time")?.find((item) =>
+        item.kind === "thinking" && item.messageId === messageId && item.contentIndex === contentIndex
+      );
+
+    apply({ seconds: 0n }, delta("reasoning", 0, "First reasoning."));
+    expect(thinkingItem("reasoning", 0)).toMatchObject({ createdAt: 0, lastActivityAt: 0, sequence: 1n });
+    apply({ seconds: 2_400n, nanos: 125_000_000 }, delta("reasoning", 0, " Later reasoning."));
+    apply({ seconds: 2_340n }, delta("reasoning", 0, " An earlier observation."));
+    for (const occurredAt of [
+      undefined,
+      { seconds: 2_700n, nanos: 1_000_000_000 },
+      { seconds: 2_700n, nanos: 1 },
+      { seconds: 9_007_199_254_740_992n },
+      { seconds: 2_700n, nanos: -1 }
+    ]) {
+      apply(occurredAt, delta("reasoning", 0, " An observation without a valid time."));
+    }
+    expect(thinkingItem("reasoning", 0)).toMatchObject({
+      id: "reasoning:thinking:0",
+      createdAt: 0,
+      lastActivityAt: 2_400_125,
+      sequence: 1n,
+      streaming: true
+    });
+
+    apply({ seconds: 600n }, delta("reasoning", 1, "A separate draft block."));
+    expect(thinkingItem("reasoning", 1)?.lastActivityAt).toBe(600_000);
+    apply({ seconds: 2_460n }, create(EventPayloadSchema, { kind: { case: "toolCallStarted", value: { toolCall: {
+      toolCallId: "next-tool",
+      toolId: "read",
+      state: ToolCallState.RUNNING
+    } } } }));
+    apply({ seconds: 2_520n }, create(EventPayloadSchema, { kind: { case: "messageCompleted", value: {
+      messageId: "reasoning",
+      role: MessageRole.ASSISTANT,
+      generationDurationMs: 2_520_000n,
+      generationReliable: true,
+      blocks: [
+        { content: { case: "thinking", value: { text: "Authoritative reasoning." } } },
+        { content: { case: "text", value: "Answer." } },
+        { content: { case: "thinking", value: { text: "A different final block." } } }
+      ]
+    } } }));
+    expect(thinkingItem("reasoning", 0)).toMatchObject({
+      createdAt: 0,
+      lastActivityAt: 2_400_125,
+      sequence: 1n,
+      text: "Authoritative reasoning.",
+      streaming: false
+    });
+    expect(thinkingItem("reasoning", 1)).toBeUndefined();
+    expect(thinkingItem("reasoning", 2)).toMatchObject({ createdAt: 2_520_000, streaming: false });
+    expect(thinkingItem("reasoning", 2)).not.toHaveProperty("lastActivityAt");
+    expect(snapshot.timelineBySession.get("session-thinking-time")?.map((item) => item.id)).toEqual([
+      "reasoning:thinking:0", "reasoning", "reasoning:thinking:2", "next-tool"
+    ]);
+    expect(snapshot.timelineBySession.get("session-thinking-time")?.find((item) => item.id === "reasoning"))
+      .not.toHaveProperty("lastActivityAt");
+
+    apply(undefined, delta("missing-time", 0, "No observed time."));
+    expect(thinkingItem("missing-time", 0)).not.toHaveProperty("lastActivityAt");
+    apply({ seconds: 2_580n }, create(EventPayloadSchema, { kind: { case: "messageCompleted", value: {
+      messageId: "missing-time",
+      role: MessageRole.ASSISTANT,
+      generationDurationMs: 2_400_000n,
+      generationReliable: true,
+      blocks: [{ content: { case: "thinking", value: { text: "Final without an observed time." } } }]
+    } } }));
+    expect(thinkingItem("missing-time", 0)).not.toHaveProperty("lastActivityAt");
+    apply({ seconds: 2_640n }, create(EventPayloadSchema, { kind: { case: "messageCompleted", value: {
+      messageId: "native-final",
+      role: MessageRole.ASSISTANT,
+      generationDurationMs: 2_400_000n,
+      generationReliable: true,
+      blocks: [{ content: { case: "thinking", value: { text: "Native final without deltas." } } }]
+    } } }));
+    expect(thinkingItem("native-final", 0)).toMatchObject({ createdAt: 2_640_000, streaming: false });
+    expect(thinkingItem("native-final", 0)).not.toHaveProperty("lastActivityAt");
+    apply({ seconds: -2n }, delta("signed-time", 0, "An observed signed time."));
+    apply({ seconds: -1n }, delta("signed-time", 0, "A later signed observation."));
+    expect(thinkingItem("signed-time", 0)).toMatchObject({ createdAt: -2_000, lastActivityAt: -1_000 });
+    expect(mapSnapshot(raw).timelineBySession.get("session-thinking-time"))
+      .toEqual(snapshot.timelineBySession.get("session-thinking-time"));
+  });
+
   it("creates a generic assistant message with text and image from completion alone", () => {
     const raw = create(SnapshotSchema, {
       generation: 1n,

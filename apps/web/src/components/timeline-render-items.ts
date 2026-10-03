@@ -145,17 +145,20 @@ export function projectTimelineRenderItems(
     }
 
     const endedAt = finiteTimestamp(item.endedAt);
-    const endTimestamp = timestamp === undefined
-      ? endedAt
-      : endedAt === undefined ? timestamp : Math.max(timestamp, endedAt);
+    const lastActivityAt = finiteTimestamp(item.lastActivityAt);
+    const activityTimestamp = Math.max(
+      timestamp ?? Number.NEGATIVE_INFINITY,
+      endedAt ?? Number.NEGATIVE_INFINITY,
+      lastActivityAt ?? Number.NEGATIVE_INFINITY
+    );
     if (userBoundary) {
       previousTimestamp = timestamp;
       previousTimestampItemId = timestamp === undefined ? undefined : item.id;
-    } else if (endTimestamp !== undefined) {
-      // Long tools and parallel work settle after their source-ordered starts.
-      // Keep the latest known end so continuous work cannot manufacture a gap.
-      if (previousTimestamp === undefined || endTimestamp >= previousTimestamp) {
-        previousTimestamp = endTimestamp;
+    } else if (Number.isFinite(activityTimestamp)) {
+      // Long tools and thinking remain active after their source-ordered starts.
+      // Keep the latest known activity so continuous work cannot manufacture a gap.
+      if (previousTimestamp === undefined || activityTimestamp >= previousTimestamp) {
+        previousTimestamp = activityTimestamp;
         previousTimestampItemId = item.id;
       }
     }

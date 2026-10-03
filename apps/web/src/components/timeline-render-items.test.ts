@@ -173,6 +173,43 @@ describe("projectTimelineRenderItems", () => {
 
   it.each([
     {
+      name: "thinking followed immediately by more work after a later delta",
+      source: [
+        timelineItem("long-thinking", "thinking", 0, { lastActivityAt: 40 * 60_000 }),
+        timelineItem("next-tool", "tool", 41 * 60_000)
+      ],
+      keys: ["long-thinking"],
+      gaps: []
+    },
+    {
+      name: "thinking observations alongside earlier-settled parallel work",
+      source: [
+        timelineItem("long-thinking", "thinking", 0, { lastActivityAt: 40 * 60_000 }),
+        timelineItem("short-tool", "toolResult", 10 * 60_000, { endedAt: 11 * 60_000 }),
+        timelineItem("next-tool", "tool", 41 * 60_000)
+      ],
+      keys: ["long-thinking"],
+      gaps: []
+    },
+    {
+      name: "a real interval after the latest thinking observation",
+      source: [
+        timelineItem("long-thinking", "thinking", 0, { lastActivityAt: 40 * 60_000 }),
+        timelineItem("next-tool", "tool", 71 * 60_000)
+      ],
+      keys: ["long-thinking", "next-tool"],
+      gaps: [{ previousItemId: "long-thinking", nextItemId: "next-tool", durationMs: 31 * 60_000 }]
+    },
+    {
+      name: "an invalid thinking observation falling back to the known start",
+      source: [
+        timelineItem("thinking-without-time", "thinking", 0, { lastActivityAt: Number.NaN }),
+        timelineItem("next-tool", "tool", 41 * 60_000)
+      ],
+      keys: ["thinking-without-time", "next-tool"],
+      gaps: [{ previousItemId: "thinking-without-time", nextItemId: "next-tool", durationMs: 41 * 60_000 }]
+    },
+    {
       name: "a long tool followed immediately by more work",
       source: [
         timelineItem("long-tool", "toolResult", 0, { endedAt: 40 * 60_000 }),
@@ -230,7 +267,7 @@ describe("projectTimelineRenderItems", () => {
       keys: ["tool-without-end", "next-tool"],
       gaps: [{ previousItemId: "tool-without-end", nextItemId: "next-tool", durationMs: 41 * 60_000 }]
     }
-  ])("uses known completion times for $name", ({ source, keys, gaps }) => {
+  ])("uses known activity times for $name", ({ source, keys, gaps }) => {
     const projected = projectTimelineRenderItems(source);
 
     expect(projected.map((item) => item.key)).toEqual(keys);

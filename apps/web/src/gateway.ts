@@ -10131,7 +10131,26 @@ function projectTimelineEvent(
     }
     case "thinkingDelta": {
       const id = `${kind.value.messageId}:thinking:${kind.value.contentIndex}`;
-      const existing = items.find((item) => item.id === id);
+      const existing = items.find((item) => item.kind === "thinking"
+        && item.id === id
+        && item.messageId === kind.value.messageId
+        && item.contentIndex === kind.value.contentIndex);
+      const occurredAt = event.occurredAt;
+      const observedMilliseconds = occurredAt !== undefined
+        && Number.isInteger(occurredAt.nanos)
+        && occurredAt.nanos >= 0
+        && occurredAt.nanos < 1_000_000_000
+        && occurredAt.nanos % 1_000_000 === 0
+        ? occurredAt.seconds * 1_000n + BigInt(occurredAt.nanos / 1_000_000)
+        : undefined;
+      const observedAt = observedMilliseconds !== undefined
+        && observedMilliseconds >= BigInt(Number.MIN_SAFE_INTEGER)
+        && observedMilliseconds <= BigInt(Number.MAX_SAFE_INTEGER)
+        ? Number(observedMilliseconds)
+        : undefined;
+      const lastActivityAt = observedAt === undefined
+        ? existing?.lastActivityAt
+        : Math.max(existing?.lastActivityAt ?? observedAt, observedAt);
       replaceOrAppend({
         id,
         messageId: kind.value.messageId,
@@ -10140,6 +10159,7 @@ function projectTimelineEvent(
         sequence: existing?.sequence ?? sequence,
         kind: "thinking",
         createdAt: existing?.createdAt ?? createdAt,
+        ...(lastActivityAt === undefined ? {} : { lastActivityAt }),
         text: `${existing?.text ?? ""}${kind.value.delta}`,
         streaming: true
       });
@@ -10571,6 +10591,8 @@ function reconcileCompletedAssistantMessage(
           sequence: existing?.sequence ?? sequence,
           kind: "thinking",
           createdAt: existing?.createdAt ?? createdAt,
+          ...(existing?.messageId === messageId && existing.contentIndex === contentIndex
+            && existing.lastActivityAt !== undefined ? { lastActivityAt: existing.lastActivityAt } : {}),
           text: block.content.value.text,
           streaming: false
         }
