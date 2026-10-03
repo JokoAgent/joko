@@ -120,11 +120,14 @@ describe("share-message PNG integrity and delivery", () => {
     expect(surface.click).not.toHaveBeenCalled();
   });
 
-  it.each(["missing", "throws", "inactive"] as const)("chooses browser delivery when file-share preflight is %s", async (capability) => {
+  it.each(["file-missing", "share-missing", "can-share-missing", "can-share-throws", "activation-inactive", "activation-missing"] as const)("chooses browser delivery when file-share preflight is %s", async (capability) => {
     const surface = shareImageTestSurface();
-    if (capability === "missing") Reflect.deleteProperty(surface.window.navigator, "canShare");
-    else if (capability === "throws") surface.window.navigator.canShare.mockImplementation(() => { throw new Error("unsupported"); });
-    else surface.window.navigator.userActivation.isActive = false;
+    if (capability === "file-missing") Reflect.deleteProperty(surface.window, "File");
+    else if (capability === "share-missing") Reflect.deleteProperty(surface.window.navigator, "share");
+    else if (capability === "can-share-missing") Reflect.deleteProperty(surface.window.navigator, "canShare");
+    else if (capability === "can-share-throws") surface.window.navigator.canShare.mockImplementation(() => { throw new Error("unsupported"); });
+    else if (capability === "activation-inactive") surface.window.navigator.userActivation!.isActive = false;
+    else Reflect.deleteProperty(surface.window.navigator, "userActivation");
     await expect(deliverShareMessageImage(pngBlob(), "task.png", "Task", surface.action)).resolves.toBe("dispatched");
     expect(surface.share).not.toHaveBeenCalled();
     expect(surface.click).toHaveBeenCalledOnce();

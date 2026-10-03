@@ -265,7 +265,7 @@ export async function deliverShareMessageImage(
   const navigator = ownerWindow.navigator;
   const safeTitle = boundedDisplayText(redactShareMessageText(singleLine(title)), SHARE_IMAGE_MAX_TITLE_CHARACTERS) || "Joko";
   const file = typeof ownerWindow.File === "undefined" ? undefined : new ownerWindow.File([blob], filename, { type: "image/png" });
-  if (file !== undefined && typeof navigator.share === "function" && (navigator.userActivation?.isActive ?? true)) {
+  if (file !== undefined && typeof navigator.share === "function" && navigator.userActivation?.isActive === true) {
     let canShare = false;
     try {
       canShare = typeof navigator.canShare === "function" && navigator.canShare({ files: [file] });

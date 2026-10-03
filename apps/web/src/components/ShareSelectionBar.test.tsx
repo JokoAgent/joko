@@ -8,8 +8,8 @@ import type { TimelineItemView } from "../model.js";
 import type { Translator } from "./types.js";
 import { ShareSelectionBar } from "./ShareSelectionBar.js";
 
-const images = vi.hoisted(() => ({ build: vi.fn(), copy: vi.fn(), download: vi.fn() }));
-vi.mock("./share-selection-image.js", async (original) => ({ ...await original<typeof import("./share-selection-image.js")>(), buildShareSelectionImagePng: images.build, copyShareSelectionImagePng: images.copy, downloadShareSelectionImagePng: images.download }));
+const images = vi.hoisted(() => ({ build: vi.fn(), copy: vi.fn(), download: vi.fn(), share: vi.fn() }));
+vi.mock("./share-selection-image.js", async (original) => ({ ...await original<typeof import("./share-selection-image.js")>(), buildShareSelectionImagePng: images.build, copyShareSelectionImagePng: images.copy, deliverShareSelectionImagePng: images.share, downloadShareSelectionImagePng: images.download }));
 
 const roots: Root[] = [];
 const t: Translator = (key) => key;
@@ -20,6 +20,7 @@ beforeEach(() => {
   images.build.mockReset().mockResolvedValue(new Blob(["png"], { type: "image/png" }));
   images.copy.mockReset().mockResolvedValue(undefined);
   images.download.mockReset().mockResolvedValue("dispatched");
+  images.share.mockReset().mockResolvedValue("shared");
 });
 afterEach(async () => {
   for (const root of roots.splice(0)) await act(async () => root.unmount());
@@ -113,10 +114,48 @@ describe("generated selection image ownership", () => {
     expect(images.download).not.toHaveBeenCalled();
     expect(view.host.querySelector('[role="status"]')).toBeNull();
   });
+
+  it("keeps selection on native cancellation or failure and reports only confirmed delivery", async () => {
+    vi.useFakeTimers();
+    images.share.mockResolvedValueOnce("cancelled").mockRejectedValueOnce(new Error("native result unavailable"))
+      .mockResolvedValueOnce("dispatched").mockResolvedValueOnce("shared");
+    const view = mount();
+
+    await act(async () => button(view.host, "Share").click());
+    expect(view.host.querySelector('[role="status"], [role="alert"]')).toBeNull();
+    expect(view.onCancel).not.toHaveBeenCalled();
+
+    await act(async () => button(view.host, "Share").click());
+    expect(view.host.querySelector('[role="alert"]')?.textContent).toBe("timeline.shareFailed");
+    expect(images.download).not.toHaveBeenCalled();
+
+    await act(async () => button(view.host, "Share").click());
+    expect(view.host.querySelector('[role="status"]')?.textContent).toBe("timeline.shareDownloaded");
+    await act(async () => button(view.host, "Share").click());
+    expect(view.host.querySelector('[role="status"]')?.textContent).toBe("timeline.shareShared");
+    expect(images.share).toHaveBeenCalledTimes(4);
+    expect(images.download).not.toHaveBeenCalled();
+  });
+
+  it("suppresses a native share result that settles after explicit selection cancellation", async () => {
+    const pending = deferred<"shared">();
+    images.share.mockReturnValueOnce(pending.promise);
+    const view = mount();
+    await act(async () => button(view.host, "Share").click());
+    const action = images.share.mock.calls[0]![3] as BrowserActionContext;
+    const cancel = Array.from(view.host.querySelectorAll("button")).find((element) => element.textContent?.includes("common.cancel"))!;
+    await act(async () => cancel.click());
+    expect(action.signal.aborted).toBe(true);
+    await act(async () => pending.resolve("shared"));
+    expect(view.host.querySelector('[role="status"], [role="alert"]')).toBeNull();
+    expect(view.onCancel).toHaveBeenCalledOnce();
+    expect(images.download).not.toHaveBeenCalled();
+  });
 });
 
-function button(host: HTMLElement, kind: "Copy" | "Download"): HTMLButtonElement {
-  return Array.from(host.querySelectorAll("button")).find((element) => element.textContent?.includes(`timeline.shareSelection${kind}`))!;
+function button(host: HTMLElement, kind: "Copy" | "Download" | "Share"): HTMLButtonElement {
+  const label = kind === "Share" ? "timeline.shareAsImage" : `timeline.shareSelection${kind}`;
+  return Array.from(host.querySelectorAll("button")).find((element) => element.textContent?.includes(label))!;
 }
 
 function mount(ownerDocument: Document = document) {

@@ -9,8 +9,10 @@ import {
   ShareMessageImageEmptyError,
   ShareMessageImageEncodingError,
   ShareMessageImageTooLargeError,
+  type ShareMessageImageDelivery,
   assertPngBlob,
   canvasPngBlob,
+  deliverShareMessageImage,
   redactShareMessageText,
   shareMessageImageFilename,
   wrapShareMessageText
@@ -266,6 +268,15 @@ export async function downloadShareSelectionImagePng(blob: Blob, sessionName: st
   assertBrowserActionCurrent(action);
   downloadArtifactBlob(blob, shareMessageImageFilename(sessionName, createdAt), action);
   return "dispatched";
+}
+
+export function deliverShareSelectionImagePng(
+  blob: Blob,
+  sessionName: string,
+  createdAt: number,
+  action: BrowserActionContext
+): Promise<ShareMessageImageDelivery> {
+  return deliverShareMessageImage(blob, shareMessageImageFilename(sessionName, createdAt), sessionName, action);
 }
 
 function readPalette(action: BrowserActionContext): ShareSelectionImagePalette {

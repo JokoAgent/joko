@@ -1,15 +1,15 @@
-import { Check, Copy, Download, Images, X } from "lucide-react";
+import { Check, Copy, Download, Images, Share2, X } from "lucide-react";
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { JSX } from "react";
 import type { TimelineItemView } from "../model.js";
 import { assertBrowserActionCurrent, type BrowserActionContext } from "../browser-action.js";
 import { orderedSelectedShareMessages } from "./share-selection-behavior.js";
-import { buildShareSelectionImagePng, copyShareSelectionImagePng, downloadShareSelectionImagePng, shareSelectionImageMessages } from "./share-selection-image.js";
+import { buildShareSelectionImagePng, copyShareSelectionImagePng, deliverShareSelectionImagePng, downloadShareSelectionImagePng, shareSelectionImageMessages } from "./share-selection-image.js";
 import { ShareMessageImageEmptyError, ShareMessageImageTooLargeError } from "./share-message-image.js";
 import type { Translator } from "./types.js";
 import { Button, Spinner, cx, formatDateTime } from "./ui.js";
 
-type BusyKind = "copy" | "download";
+type BusyKind = "copy" | "download" | "share";
 
 export function ShareSelectionBar({ ownerKey, sessionName, messages, selectedIds, locale, t, onToggleAll, onCancel }: {
   readonly ownerKey: string;
@@ -89,10 +89,21 @@ export function ShareSelectionBar({ ownerKey, sessionName, messages, selectedIds
       const blob = await buildShareSelectionImagePng(content, action);
       if (!current()) return;
       assertBrowserActionCurrent(action);
-      if (kind === "copy") await copyShareSelectionImagePng(blob, action);
-      else await downloadShareSelectionImagePng(blob, sessionName, selectedMessages[0]?.createdAt ?? Date.now(), action);
+      const createdAt = selectedMessages[0]?.createdAt ?? Date.now();
+      let successText: string;
+      if (kind === "copy") {
+        await copyShareSelectionImagePng(blob, action);
+        successText = t("timeline.shareSelectionCopied");
+      } else if (kind === "download") {
+        await downloadShareSelectionImagePng(blob, sessionName, createdAt, action);
+        successText = t("timeline.shareDownloaded");
+      } else {
+        const delivery = await deliverShareSelectionImagePng(blob, sessionName, createdAt, action);
+        if (!current() || delivery === "cancelled") return;
+        successText = delivery === "shared" ? t("timeline.shareShared") : t("timeline.shareDownloaded");
+      }
       if (!current()) return;
-      setFeedback({ kind: "success", text: kind === "copy" ? t("timeline.shareSelectionCopied") : t("timeline.shareDownloaded") });
+      setFeedback({ kind: "success", text: successText });
       if (ownerWindow !== null) {
         const timer = { window: ownerWindow, id: ownerWindow.setTimeout(() => {
           if (closeTimerRef.current !== timer || scopeRef.current !== scope || barRef.current?.ownerDocument !== ownerDocument || !barRef.current.isConnected || ownerWindow.document !== ownerDocument || ownerWindow.closed) return;
@@ -142,8 +153,11 @@ export function ShareSelectionBar({ ownerKey, sessionName, messages, selectedIds
         <Button tone="secondary" disabled={busy !== undefined || selectedMessages.length === 0} onClick={(event) => { void run("download", event.currentTarget.ownerDocument); }}>
           {busy === "download" ? <Spinner label={t("timeline.shareGenerating")} /> : <Download aria-hidden="true" />}{t("timeline.shareSelectionDownload")}
         </Button>
-        <Button tone="primary" disabled={busy !== undefined || selectedMessages.length === 0} onClick={(event) => { void run("copy", event.currentTarget.ownerDocument); }}>
+        <Button tone="secondary" disabled={busy !== undefined || selectedMessages.length === 0} onClick={(event) => { void run("copy", event.currentTarget.ownerDocument); }}>
           {busy === "copy" ? <Spinner label={t("timeline.shareGenerating")} /> : <Copy aria-hidden="true" />}{t("timeline.shareSelectionCopy")}
+        </Button>
+        <Button tone="primary" disabled={busy !== undefined || selectedMessages.length === 0} onClick={(event) => { void run("share", event.currentTarget.ownerDocument); }}>
+          {busy === "share" ? <Spinner label={t("timeline.shareGenerating")} /> : <Share2 aria-hidden="true" />}{t("timeline.shareAsImage")}
         </Button>
       </div>
       {feedback !== undefined && <p className={cx("share-selection-bar__feedback", feedback.kind === "error" && "is-error")} role={feedback.kind === "error" ? "alert" : "status"}>{feedback.text}</p>}

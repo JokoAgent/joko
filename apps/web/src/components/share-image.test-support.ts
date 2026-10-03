@@ -12,7 +12,7 @@ interface ShareImageTestSurface {
   readonly window: EventTarget & {
     document: { createElement: Mock<(tag: string) => unknown> };
     closed: boolean;
-    navigator: { share: Mock<(data: ShareData) => Promise<void>>; canShare: Mock<() => boolean>; userActivation: { isActive: boolean }; clipboard: { write: Mock<(items: ClipboardItems) => Promise<void>> } };
+    navigator: { share: Mock<(data: ShareData) => Promise<void>>; canShare: Mock<() => boolean>; userActivation?: { isActive: boolean }; clipboard: { write: Mock<(items: ClipboardItems) => Promise<void>> } };
     File: typeof File;
     ClipboardItem: new (items: Record<string, Blob>) => { readonly items: Record<string, Blob> };
     URL: { createObjectURL: Mock<() => string>; revokeObjectURL: Mock };
