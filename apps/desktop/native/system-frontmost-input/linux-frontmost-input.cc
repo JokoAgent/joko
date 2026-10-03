@@ -364,9 +364,10 @@ bool NativeServer(int descriptor, Deadline deadline, ServerPeer* identity) {
   executable[length] = '\0';
   const char* basename = std::strrchr(executable, '/');
   // An Xwayland peer cannot prove the global foreground of its compositor.
-  // Independent Xvnc is an X11 desktop, subject to the same live capabilities.
+  // Independent Xvnc and Xtigervnc are X11 desktops, subject to the same live capabilities.
   if (basename == nullptr || (std::strcmp(basename + 1, "Xorg") != 0 &&
-      std::strcmp(basename + 1, "Xvnc") != 0) ||
+      std::strcmp(basename + 1, "Xvnc") != 0 &&
+      std::strcmp(basename + 1, "Xtigervnc") != 0) ||
       !ReadProcessInstance(peer.pid, deadline, &second) || !SameProcess(first, second)) return false;
   ucred confirmation{};
   size = sizeof(confirmation);
