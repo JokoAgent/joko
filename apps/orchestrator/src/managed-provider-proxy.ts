@@ -8,6 +8,7 @@ import type {
   ManagedProviderSmartRoutingRoute, ProviderRuntimeProtocol, ProviderRuntimeSupport
 } from "@joko/core";
 import type { ProviderCatalogManager, ProviderInferenceRoute } from "./credential-manager.js";
+import { createManagedResponsesSseRepair } from "./managed-responses-sse-repair.js";
 
 const BODY_LIMIT = 32 * 1024 * 1024;
 const ENVIRONMENT_NAME = "JOKO_PROVIDER_PROXY_TOKEN";
@@ -664,15 +665,16 @@ export class ManagedProviderProxy {
         "content-type": upstream.headers.get("content-type") ?? "application/json",
         "cache-control": "no-store"
       });
-      const reader = upstream.body.getReader();
-      try {
-        for (;;) {
-          const chunk = await reader.read();
-          this.#assertSmartOperation(state, operation);
-          if (chunk.done) break;
-          if (!response.write(chunk.value)) await once(response, "drain", { signal });
-        }
-      } finally { reader.releaseLock(); }
+      await relayUpstreamBody({
+        body: upstream.body,
+        response,
+        signal,
+        assertCurrent: () => this.#assertSmartOperation(state, operation),
+        repair: selected.native ? undefined : createManagedResponsesSseRepair({
+          protocol: "openai-responses",
+          contentType: upstream.headers.get("content-type") ?? ""
+        })
+      });
       response.end();
     } catch {
       if (!response.headersSent) fail(response, signal.aborted ? 499 : 502);
@@ -767,16 +769,19 @@ export class ManagedProviderProxy {
         return;
       }
       response.writeHead(upstream.status, { "content-type": upstream.headers.get("content-type") ?? "application/json", "cache-control": "no-store" });
-      const reader = upstream.body.getReader();
-      try {
-        for (;;) {
-          const chunk = await reader.read();
+      await relayUpstreamBody({
+        body: upstream.body,
+        response,
+        signal,
+        assertCurrent: () => {
           if (subtask === undefined) this.#assertOperation(state, operation);
           else this.#assertSubtask(state, operation, subtask);
-          if (chunk.done) break;
-          if (!response.write(chunk.value)) await once(response, "drain", { signal });
-        }
-      } finally { reader.releaseLock(); }
+        },
+        repair: createManagedResponsesSseRepair({
+          protocol: state.protocol,
+          contentType: upstream.headers.get("content-type") ?? ""
+        })
+      });
       response.end();
     } catch {
       if (!response.headersSent) fail(response, signal.aborted ? 499 : 502);
@@ -787,6 +792,32 @@ export class ManagedProviderProxy {
       request.off("aborted", close);
       response.off("close", close);
     }
+  }
+}
+
+async function relayUpstreamBody(input: {
+  readonly body: ReadableStream<Uint8Array>;
+  readonly response: ServerResponse;
+  readonly signal: AbortSignal;
+  readonly assertCurrent: () => void;
+  readonly repair: ReturnType<typeof createManagedResponsesSseRepair>;
+}): Promise<void> {
+  const reader = input.body.getReader();
+  const write = async (chunk: Uint8Array): Promise<void> => {
+    input.assertCurrent();
+    if (!input.response.write(chunk)) await once(input.response, "drain", { signal: input.signal });
+  };
+  try {
+    for (;;) {
+      const chunk = await reader.read();
+      input.assertCurrent();
+      if (chunk.done) break;
+      const output = input.repair?.write(chunk.value) ?? [chunk.value];
+      for (const bytes of output) await write(bytes);
+    }
+    for (const bytes of input.repair?.finish() ?? []) await write(bytes);
+  } finally {
+    reader.releaseLock();
   }
 }
 
