@@ -139,7 +139,7 @@ async function runSmokeJourney() {
   process.stdout.write(`${JSON.stringify({ event: "JOKO_DESKTOP_NATIVE_RUNTIME_SMOKE_OK", dedicatedHardwareUtilityEntry, sqliteVec: sqliteVecSmoke, extensionLibrary: extensionLibrarySmoke, terminal: terminalSmoke, claudeSession: claudeSessionSmoke, frontmostInput: frontmostInputSmoke })}\n`);
 
   const connectSmoke = await createConnectSmokeServer();
-  const requiredSmokeProgress = smokeScope === "full" ? [
+  const requiredSmokeProgress = ["dedicated_hardware_main_snapshot_verified", ...(smokeScope === "full" ? [
     "system_handoff_cold_argv_ingress",
     "system_handoff_cancelled_navigation_preserved",
     "system_handoff_failed_document_request_injected",
@@ -152,7 +152,7 @@ async function runSmokeJourney() {
     "system_handoff_primary_surfaces_verified",
     "system_handoff_auxiliary_owner_fenced",
     "system_handoff_tray_reopened"
-  ] : smokeScope === "draft" ? ["new_task_draft_recovered_after_renderer_crash"] : [];
+  ] : smokeScope === "draft" ? ["new_task_draft_recovered_after_renderer_crash"] : [])];
   let providerSmoke;
   let child;
   let secondInstance;

@@ -35,6 +35,7 @@ import { appendFileSync, writeFileSync } from "node:fs";
 import { readdir, stat, unlink } from "node:fs/promises";
 import { createHash, randomUUID } from "node:crypto";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { isDeepStrictEqual } from "node:util";
 import {
   DESKTOP_CHANNELS,
   type DesktopApplicationMenuCommand,
@@ -199,12 +200,15 @@ import {
   resolveDedicatedHardwareSdkIdentity
 } from "./dedicated-hardware-sdk.js";
 import {
+  DEDICATED_HARDWARE_MODEL_IDS,
   createDedicatedHardwareHostClient,
   createDedicatedHardwareInputController,
   createDedicatedHardwareSettingsStore,
+  createDefaultDedicatedHardwareSettings,
   createElectronDedicatedHardwareUtilityFactory,
   isDedicatedHardwareModelId,
   parseDedicatedHardwareSettings,
+  parseDedicatedHardwareUtilityMessage,
   type DedicatedHardwareModelId,
   type DedicatedHardwareSettings
 } from "./dedicated-hardware/index.js";
@@ -1270,6 +1274,7 @@ function createWindow(): void {
           "      window.jokoDesktop &&",
           "      typeof window.jokoDesktop.platform === 'string' &&",
           "      typeof window.jokoDesktop.chooseFiles === 'function' &&",
+          "      typeof window.jokoDesktop.getDedicatedHardwareState === 'function' &&",
           "      typeof window.jokoDesktop.extensionLibraries?.pickLocation === 'function' &&",
           "      typeof window.jokoDesktop.extensionLibraries?.reveal === 'function' &&",
           "      typeof window.jokoDesktop.extensionLibraries?.beginSave === 'function' &&",
@@ -1387,6 +1392,7 @@ function createWindow(): void {
         if (rendered !== true) {
           throw new Error("The packaged product renderer did not return its exact ready marker.");
         }
+        await verifyPackagedSmokeDedicatedHardwareState(window);
         if (packagedSmokeScope === "draft") {
           await verifyPackagedSmokeNewTaskDraftCrash(window);
         } else {
@@ -1422,6 +1428,60 @@ function createWindow(): void {
   } else {
     beginMainUiLoadRecovery();
   }
+}
+
+async function verifyPackagedSmokeDedicatedHardwareState(window: BrowserWindow): Promise<void> {
+  if (window.isDestroyed() || window.webContents.isDestroyed()) {
+    throw new Error("Packaged smoke owner retired before dedicated hardware verification.");
+  }
+  const raw: unknown = await window.webContents.executeJavaScript([
+    "(async () => {",
+    "  if (!document.querySelector('.app') || typeof window.jokoDesktop?.getDedicatedHardwareState !== 'function') {",
+    "    throw new Error('Dedicated hardware state is unavailable in the product renderer.');",
+    "  }",
+    "  return window.jokoDesktop.getDedicatedHardwareState();",
+    "})()"
+  ].join("\n"), true);
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+    throw new Error("Packaged smoke dedicated hardware Snapshot was invalid.");
+  }
+  const snapshot = raw as Record<string, unknown>;
+  if (snapshot.models === null || typeof snapshot.models !== "object" || Array.isArray(snapshot.models)) {
+    throw new Error("Packaged smoke dedicated hardware models were invalid.");
+  }
+  const models = snapshot.models as Record<string, unknown>;
+  const expectedModels = {} as Record<DedicatedHardwareModelId, unknown>;
+  for (const model of DEDICATED_HARDWARE_MODEL_IDS) {
+    const state = models[model];
+    if (state === null || typeof state !== "object" || Array.isArray(state)) {
+      throw new Error("Packaged smoke dedicated hardware model state was unavailable.");
+    }
+    const { settingsError: _settingsError, settings: _settings, taskSlots: _taskSlots, ...connection } =
+      state as Record<string, unknown>;
+    const parsed = parseDedicatedHardwareUtilityMessage({ version: 1, generation: 1, kind: "state", ...connection });
+    if (parsed?.kind !== "state" || parsed.model !== model) {
+      throw new Error("Packaged smoke dedicated hardware connection state was invalid.");
+    }
+    expectedModels[model] = {
+      model,
+      status: "disabled",
+      reason: null,
+      devicePresent: null,
+      transport: null,
+      firmwareVersion: null,
+      batteryPercent: null,
+      charging: null,
+      inputPermission: "unknown",
+      keymap: parsed.keymap,
+      settingsError: null,
+      settings: createDefaultDedicatedHardwareSettings(model),
+      taskSlots: Array.from({ length: 6 }, (_, slot) => ({ slot, sessionId: null, title: null }))
+    };
+  }
+  if (!isDeepStrictEqual(raw, { version: 1, models: expectedModels })) {
+    throw new Error("Packaged smoke dedicated hardware Snapshot did not match the isolated disabled defaults.");
+  }
+  recordPackagedSmokeProgress("dedicated_hardware_main_snapshot_verified");
 }
 
 async function verifyPackagedSmokeNativeTaskStatus(owner: BrowserWindow): Promise<void> {
