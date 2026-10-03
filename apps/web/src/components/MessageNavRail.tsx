@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { CSSProperties, JSX, PointerEvent as ReactPointerEvent, RefObject, WheelEvent as ReactWheelEvent } from "react";
 
 import type { Translator } from "./types.js";
@@ -25,6 +25,19 @@ const WAKE_GUTTER_PX = 48;
 const HIDDEN_TOOLTIP_ID = "\u0000message-nav-hidden";
 const NAVIGATION_KEYS = new Set(["PageUp", "PageDown", "ArrowUp", "ArrowDown", "Home", "End", " "]);
 
+interface RailOwner {
+  readonly key: string;
+  readonly node: HTMLDivElement;
+  readonly view: Window & typeof globalThis;
+  active: boolean;
+  generation: number;
+}
+
+interface ScheduledHandle {
+  readonly id: number;
+  readonly view: Window;
+}
+
 export function MessageNavRail({ entries, scrollRef, contentRef, bottomOffset, resetKey, estimateEntryTop, onWheelIntent, onCoverageChange, onJump, t }: {
   readonly entries: readonly MessageNavEntry[];
   readonly scrollRef: RefObject<HTMLDivElement | null>;
@@ -47,11 +60,16 @@ export function MessageNavRail({ entries, scrollRef, contentRef, bottomOffset, r
   const [scrubId, setScrubId] = useState<string>();
   const [tooltipId, setTooltipId] = useState<string>();
   const [awake, setAwake] = useState(true);
+  const [pageActive, setPageActive] = useState(true);
   const railRef = useRef<HTMLElement>(null);
-  const frameRef = useRef<number | undefined>(undefined);
-  const pendingTimerRef = useRef<number | undefined>(undefined);
-  const idleRef = useRef<number | undefined>(undefined);
-  const tooltipTimerRef = useRef<number | undefined>(undefined);
+  const ownerRef = useRef<RailOwner | undefined>(undefined);
+  const ownerKeyRef = useRef(resetKey);
+  ownerKeyRef.current = resetKey;
+  const documentLifecycleRef = useRef<{ readonly view: Window; active: boolean } | undefined>(undefined);
+  const frameRef = useRef<ScheduledHandle | undefined>(undefined);
+  const pendingTimerRef = useRef<ScheduledHandle | undefined>(undefined);
+  const idleRef = useRef<ScheduledHandle | undefined>(undefined);
+  const tooltipTimerRef = useRef<ScheduledHandle | undefined>(undefined);
   const tooltipSkipUntilRef = useRef(0);
   const tooltipTargetRef = useRef<string | undefined>(undefined);
   const tooltipIdRef = useRef<string | undefined>(undefined);
@@ -69,7 +87,7 @@ export function MessageNavRail({ entries, scrollRef, contentRef, bottomOffset, r
   const entriesRef = useRef(entries);
   entriesRef.current = entries;
   const plan = planMessageNavTicks(entries.length, layout.availableHeight);
-  const covered = entries.length >= MESSAGE_NAV_MIN_ENTRIES
+  const covered = pageActive && entries.length >= MESSAGE_NAV_MIN_ENTRIES
     && layout.hasRoom
     && layout.availableHeight >= MESSAGE_NAV_MIN_HEIGHT_PX
     && plan.hiddenCount === 0;
@@ -79,54 +97,67 @@ export function MessageNavRail({ entries, scrollRef, contentRef, bottomOffset, r
     return () => onCoverageChange?.(false);
   }, [covered, onCoverageChange]);
 
+  const ownsCallback = useCallback((owner: RailOwner, generation: number): boolean =>
+    ownerRef.current === owner && owner.key === ownerKeyRef.current
+    && owner.node === scrollRef.current && owner.active && owner.generation === generation,
+  [scrollRef]);
+
   const wake = useCallback((): void => {
+    const owner = ownerRef.current;
+    if (owner === undefined || !ownsCallback(owner, owner.generation)) return;
+    const generation = owner.generation;
     setAwake(true);
-    if (idleRef.current !== undefined) window.clearTimeout(idleRef.current);
+    clearTimer(idleRef);
     const scheduleHide = (): void => {
-      idleRef.current = window.setTimeout(() => {
+      const handle = { view: owner.view, id: owner.view.setTimeout(() => {
+        if (!ownsCallback(owner, generation) || idleRef.current !== handle) return;
         idleRef.current = undefined;
         if (hoveringRef.current) {
           scheduleHide();
           return;
         }
         setAwake(false);
-      }, IDLE_MS);
+      }, IDLE_MS) };
+      idleRef.current = handle;
     };
     scheduleHide();
-  }, []);
+  }, [ownsCallback]);
 
   const closeTooltip = useCallback((id?: string): void => {
-    if (tooltipTimerRef.current !== undefined) {
-      window.clearTimeout(tooltipTimerRef.current);
-      tooltipTimerRef.current = undefined;
-    }
+    clearTimer(tooltipTimerRef);
     if (id !== undefined && tooltipTargetRef.current !== id && tooltipIdRef.current !== id) return;
     if (id === undefined || tooltipTargetRef.current === id) tooltipTargetRef.current = undefined;
     if (id === undefined || tooltipIdRef.current === id) {
-      if (tooltipIdRef.current !== undefined) tooltipSkipUntilRef.current = performance.now() + TOOLTIP_SKIP_MS;
+      if (tooltipIdRef.current !== undefined) tooltipSkipUntilRef.current = (ownerRef.current?.view.performance.now() ?? 0) + TOOLTIP_SKIP_MS;
       tooltipIdRef.current = undefined;
       setTooltipId(undefined);
     }
   }, []);
 
   const scheduleTooltip = useCallback((id: string): void => {
+    const owner = ownerRef.current;
+    if (owner === undefined || !ownsCallback(owner, owner.generation)) return;
+    const generation = owner.generation;
     tooltipTargetRef.current = id;
-    if (tooltipTimerRef.current !== undefined) window.clearTimeout(tooltipTimerRef.current);
+    clearTimer(tooltipTimerRef);
     const open = (): void => {
+      if (!ownsCallback(owner, generation)) return;
       tooltipTimerRef.current = undefined;
       if (tooltipTargetRef.current !== id) return;
       tooltipIdRef.current = id;
       setTooltipId(id);
     };
-    if (tooltipSkipUntilRef.current > 0 && performance.now() <= tooltipSkipUntilRef.current) {
+    if (tooltipSkipUntilRef.current > 0 && owner.view.performance.now() <= tooltipSkipUntilRef.current) {
       open();
       return;
     }
-    tooltipTimerRef.current = window.setTimeout(open, TOOLTIP_DELAY_MS);
-  }, []);
+    const handle = { view: owner.view, id: owner.view.setTimeout(() => {
+      if (tooltipTimerRef.current === handle) open();
+    }, TOOLTIP_DELAY_MS) };
+    tooltipTimerRef.current = handle;
+  }, [ownsCallback]);
 
   const measure = useCallback((): void => {
-    frameRef.current = undefined;
     const root = scrollRef.current;
     const content = contentRef.current;
     if (root === null || content === null) return;
@@ -168,91 +199,168 @@ export function MessageNavRail({ entries, scrollRef, contentRef, bottomOffset, r
       ? currentRange
       : nextRange);
   }, [bottomOffset, contentRef, estimateEntryTop, scrollRef]);
+  const measureRef = useRef(measure);
+  measureRef.current = measure;
 
   const scheduleMeasure = useCallback((): void => {
     if (frameRef.current !== undefined) return;
-    frameRef.current = requestAnimationFrame(measure);
-  }, [measure]);
+    const owner = ownerRef.current;
+    if (owner === undefined || !ownsCallback(owner, owner.generation)) return;
+    const generation = owner.generation;
+    const handle = { view: owner.view, id: owner.view.requestAnimationFrame(() => {
+      if (!ownsCallback(owner, generation) || frameRef.current !== handle) return;
+      frameRef.current = undefined;
+      measureRef.current();
+    }) };
+    frameRef.current = handle;
+  }, [ownsCallback]);
 
   const dropPending = useCallback((): void => {
-    if (pendingTimerRef.current !== undefined) {
-      window.clearTimeout(pendingTimerRef.current);
-      pendingTimerRef.current = undefined;
-    }
+    clearTimer(pendingTimerRef);
     setPendingId(undefined);
   }, []);
 
   const markPending = useCallback((id: string): void => {
+    const owner = ownerRef.current;
+    if (owner === undefined || !ownsCallback(owner, owner.generation)) return;
+    const generation = owner.generation;
     setPendingId(id);
-    if (pendingTimerRef.current !== undefined) window.clearTimeout(pendingTimerRef.current);
-    pendingTimerRef.current = window.setTimeout(() => {
+    clearTimer(pendingTimerRef);
+    const handle = { view: owner.view, id: owner.view.setTimeout(() => {
+      if (!ownsCallback(owner, generation) || pendingTimerRef.current !== handle) return;
       pendingTimerRef.current = undefined;
       setPendingId(undefined);
-    }, PENDING_SAFETY_MS);
+    }, PENDING_SAFETY_MS) };
+    pendingTimerRef.current = handle;
+  }, [ownsCallback]);
+
+  const retireInteractions = useCallback((updateState: boolean): void => {
+    const scrub = scrubRef.current;
+    scrubRef.current = undefined;
+    if (scrub?.button.hasPointerCapture?.(scrub.pointerId)) scrub.button.releasePointerCapture?.(scrub.pointerId);
+    suppressClickRef.current = false;
+    hoveringRef.current = false;
+    tooltipTargetRef.current = undefined;
+    tooltipIdRef.current = undefined;
+    tooltipSkipUntilRef.current = 0;
+    clearTimer(pendingTimerRef);
+    clearTimer(idleRef);
+    clearTimer(tooltipTimerRef);
+    const frame = frameRef.current;
+    frameRef.current = undefined;
+    if (frame !== undefined) frame.view.cancelAnimationFrame(frame.id);
+    if (updateState) {
+      setActiveId(undefined);
+      setVisibleRange(undefined);
+      setPendingId(undefined);
+      setHoveredId(undefined);
+      setScrubId(undefined);
+      setTooltipId(undefined);
+      setAwake(true);
+    }
   }, []);
 
-  useEffect(() => {
-    setActiveId(undefined);
-    setVisibleRange(undefined);
-    setHoveredId(undefined);
-    setScrubId(undefined);
-    scrubRef.current = undefined;
-    suppressClickRef.current = false;
-    dropPending();
-    closeTooltip();
-    setAwake(true);
+  useLayoutEffect(() => {
+    const node = scrollRef.current;
+    const view = node?.ownerDocument.defaultView;
+    if (node === null || view === null || view === undefined) return;
+    if (documentLifecycleRef.current?.view !== view) documentLifecycleRef.current = { view, active: true };
+    const lifecycle = documentLifecycleRef.current;
+    const owner: RailOwner = { key: resetKey, node, view, active: lifecycle.active, generation: 0 };
+    ownerRef.current = owner;
+    retireInteractions(true);
+    setPageActive(owner.active);
+    const onPageHide = (): void => {
+      if (ownerRef.current !== owner || !owner.active) return;
+      lifecycle.active = false;
+      owner.active = false;
+      owner.generation += 1;
+      retireInteractions(true);
+      setPageActive(false);
+    };
+    const onPageShow = (): void => {
+      if (ownerRef.current !== owner || owner.active) return;
+      lifecycle.active = true;
+      owner.active = true;
+      owner.generation += 1;
+      retireInteractions(true);
+      setPageActive(true);
+      scheduleMeasure();
+      wake();
+    };
+    view.addEventListener("pagehide", onPageHide);
+    view.addEventListener("pageshow", onPageShow);
     scheduleMeasure();
-  }, [closeTooltip, dropPending, resetKey, scheduleMeasure]);
+    wake();
+    return () => {
+      view.removeEventListener("pagehide", onPageHide);
+      view.removeEventListener("pageshow", onPageShow);
+      owner.active = false;
+      owner.generation += 1;
+      if (ownerRef.current === owner) {
+        retireInteractions(false);
+        ownerRef.current = undefined;
+      }
+    };
+  }, [resetKey, retireInteractions, scheduleMeasure, scrollRef, wake]);
 
   useEffect(() => {
     const root = scrollRef.current;
-    if (root === null) return;
-    const onScroll = (): void => { wake(); scheduleMeasure(); };
+    const owner = ownerRef.current;
+    if (root === null || owner === undefined || !owner.active) return;
+    const generation = owner.generation;
+    const scheduleOwnedMeasure = (): void => { if (ownsCallback(owner, generation)) scheduleMeasure(); };
+    const onScroll = (): void => {
+      if (!ownsCallback(owner, generation)) return;
+      wake();
+      scheduleMeasure();
+    };
     const onMouseMove = (event: MouseEvent): void => {
+      if (!ownsCallback(owner, generation)) return;
       if (event.clientX - containerLeftRef.current <= WAKE_GUTTER_PX) wake();
     };
+    const onScrollIntent = (): void => { if (ownsCallback(owner, generation)) dropPending(); };
     root.addEventListener("scroll", onScroll, { passive: true });
     root.addEventListener("mousemove", onMouseMove, { passive: true });
-    root.addEventListener("wheel", dropPending, { passive: true });
-    root.addEventListener("touchstart", dropPending, { passive: true });
-    const observer = typeof ResizeObserver === "undefined" ? undefined : new ResizeObserver(scheduleMeasure);
+    root.addEventListener("wheel", onScrollIntent, { passive: true });
+    root.addEventListener("touchstart", onScrollIntent, { passive: true });
+    const observer = typeof owner.view.ResizeObserver === "undefined" ? undefined : new owner.view.ResizeObserver(scheduleOwnedMeasure);
     observer?.observe(root);
     observer?.observe(contentRef.current ?? root);
-    if (observer === undefined) window.addEventListener("resize", scheduleMeasure);
+    if (observer === undefined) owner.view.addEventListener("resize", scheduleOwnedMeasure);
     scheduleMeasure();
     wake();
     return () => {
       root.removeEventListener("scroll", onScroll);
       root.removeEventListener("mousemove", onMouseMove);
-      root.removeEventListener("wheel", dropPending);
-      root.removeEventListener("touchstart", dropPending);
+      root.removeEventListener("wheel", onScrollIntent);
+      root.removeEventListener("touchstart", onScrollIntent);
       observer?.disconnect();
-      if (observer === undefined) window.removeEventListener("resize", scheduleMeasure);
-      if (frameRef.current !== undefined) cancelAnimationFrame(frameRef.current);
+      if (observer === undefined) owner.view.removeEventListener("resize", scheduleOwnedMeasure);
     };
-  }, [contentRef, dropPending, scheduleMeasure, scrollRef, wake]);
+  }, [contentRef, dropPending, ownsCallback, pageActive, resetKey, scheduleMeasure, scrollRef, wake]);
 
   useEffect(() => {
+    const owner = ownerRef.current;
+    if (owner === undefined || !owner.active) return;
+    const generation = owner.generation;
     const onKeyDown = (event: KeyboardEvent): void => {
+      if (!ownsCallback(owner, generation)) return;
       if (!NAVIGATION_KEYS.has(event.key)) return;
-      if (event.key === " " && isEditableKeyboardTarget(event.target)) return;
+      if (event.key === " " && isEditableKeyboardTarget(event.target, owner.view)) return;
       dropPending();
     };
-    window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
-  }, [dropPending]);
+    owner.view.addEventListener("keydown", onKeyDown);
+    return () => owner.view.removeEventListener("keydown", onKeyDown);
+  }, [dropPending, ownsCallback, pageActive, resetKey]);
 
   useEffect(scheduleMeasure, [entries, bottomOffset, scheduleMeasure]);
   useEffect(() => {
     if (pendingId !== undefined && pendingId === activeId) dropPending();
   }, [activeId, dropPending, pendingId]);
-  useEffect(() => () => {
-    if (pendingTimerRef.current !== undefined) window.clearTimeout(pendingTimerRef.current);
-    if (idleRef.current !== undefined) window.clearTimeout(idleRef.current);
-    if (tooltipTimerRef.current !== undefined) window.clearTimeout(tooltipTimerRef.current);
-  }, []);
-
   const jump = useCallback((entry: MessageNavEntry): void => {
+    const owner = ownerRef.current;
+    if (owner === undefined || !ownsCallback(owner, owner.generation)) return;
     if (suppressClickRef.current) {
       suppressClickRef.current = false;
       return;
@@ -260,7 +368,7 @@ export function MessageNavRail({ entries, scrollRef, contentRef, bottomOffset, r
     markPending(entry.id);
     wake();
     onJump(entry.id);
-  }, [markPending, onJump, wake]);
+  }, [markPending, onJump, ownsCallback, wake]);
 
   const findScrubIndex = useCallback((clientY: number): number | undefined => {
     const rail = railRef.current;
@@ -277,6 +385,8 @@ export function MessageNavRail({ entries, scrollRef, contentRef, bottomOffset, r
   }, []);
 
   const jumpToScrubIndex = useCallback((index: number): void => {
+    const owner = ownerRef.current;
+    if (owner === undefined || !ownsCallback(owner, owner.generation)) return;
     const entry = entries[index];
     if (entry === undefined) return;
     setScrubId(entry.id);
@@ -285,7 +395,7 @@ export function MessageNavRail({ entries, scrollRef, contentRef, bottomOffset, r
     if (scrub !== undefined) scrub.lastIndex = index;
     markPending(entry.id);
     onJump(entry.id);
-  }, [entries, markPending, onJump]);
+  }, [entries, markPending, onJump, ownsCallback]);
 
   const onPointerMove = useCallback((event: ReactPointerEvent<HTMLButtonElement>): void => {
     const scrub = scrubRef.current;
@@ -306,11 +416,13 @@ export function MessageNavRail({ entries, scrollRef, contentRef, bottomOffset, r
   }, []);
 
   const beginHover = useCallback((id: string): void => {
+    const owner = ownerRef.current;
+    if (owner === undefined || !ownsCallback(owner, owner.generation)) return;
     hoveringRef.current = true;
     if (id !== HIDDEN_TOOLTIP_ID) setHoveredId(id);
     wake();
     scheduleTooltip(id);
-  }, [scheduleTooltip, wake]);
+  }, [ownsCallback, scheduleTooltip, wake]);
 
   const endHover = useCallback((id: string): void => {
     hoveringRef.current = false;
@@ -320,13 +432,15 @@ export function MessageNavRail({ entries, scrollRef, contentRef, bottomOffset, r
 
   const onWheel = useCallback((event: ReactWheelEvent<HTMLElement>): void => {
     if (event.ctrlKey || event.metaKey) return;
+    const owner = ownerRef.current;
+    if (owner === undefined || !ownsCallback(owner, owner.generation)) return;
     dropPending();
     const root = scrollRef.current;
     if (root === null) return;
-    root.dispatchEvent(new WheelEvent("wheel", { deltaX: event.deltaX, deltaY: event.deltaY }));
+    root.dispatchEvent(new owner.view.WheelEvent("wheel", { deltaX: event.deltaX, deltaY: event.deltaY }));
     onWheelIntent?.(event.deltaY, event.deltaX);
     root.scrollBy({ top: event.deltaY, left: event.deltaX, behavior: "auto" });
-  }, [dropPending, onWheelIntent, scrollRef]);
+  }, [dropPending, onWheelIntent, ownsCallback, scrollRef]);
 
   if (entries.length < MESSAGE_NAV_MIN_ENTRIES || !layout.hasRoom || layout.availableHeight < MESSAGE_NAV_MIN_HEIGHT_PX) return null;
   const visible = entries.slice(plan.startIndex);
@@ -397,6 +511,8 @@ export function MessageNavRail({ entries, scrollRef, contentRef, bottomOffset, r
           style={{ height: `${plan.pitchPx}px` }}
           onPointerDown={(event) => {
             if (event.button !== 0) return;
+            const owner = ownerRef.current;
+            if (owner === undefined || !ownsCallback(owner, owner.generation)) return;
             event.preventDefault();
             suppressClickRef.current = false;
             scrubRef.current = {
@@ -431,11 +547,17 @@ export function MessageNavRail({ entries, scrollRef, contentRef, bottomOffset, r
   );
 }
 
-function isEditableKeyboardTarget(target: EventTarget | null): boolean {
-  if (!(target instanceof HTMLElement)) return false;
-  return target instanceof HTMLInputElement
-    || target instanceof HTMLTextAreaElement
-    || target instanceof HTMLSelectElement
+function clearTimer(ref: { current: ScheduledHandle | undefined }): void {
+  const handle = ref.current;
+  ref.current = undefined;
+  if (handle !== undefined) handle.view.clearTimeout(handle.id);
+}
+
+function isEditableKeyboardTarget(target: EventTarget | null, view: Window & typeof globalThis): boolean {
+  if (!(target instanceof view.HTMLElement)) return false;
+  return target instanceof view.HTMLInputElement
+    || target instanceof view.HTMLTextAreaElement
+    || target instanceof view.HTMLSelectElement
     || target.isContentEditable
     || target.closest("[contenteditable='true']") !== null;
 }

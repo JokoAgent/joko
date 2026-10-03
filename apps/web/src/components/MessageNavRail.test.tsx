@@ -16,6 +16,7 @@ interface MountedRail {
   readonly entries: readonly MessageNavEntry[];
   readonly host: HTMLDivElement;
   readonly reactRoot: Root;
+  readonly render: (resetKey: string) => void;
   readonly scroll: HTMLDivElement;
 }
 
@@ -150,6 +151,85 @@ describe("MessageNavRail mounted behavior", () => {
     expect(completeCoverage).toHaveBeenLastCalledWith(true);
     unmountRail(complete);
   });
+
+  it("retires captured gestures and callbacks on owner reset, pagehide and unmount, then admits fresh page interactions", () => {
+    const timerSpy = vi.spyOn(window, "setTimeout");
+    const onJump = vi.fn();
+    const mounted = mountRail({ tops: [0, 100, 200, 300, 400], onJump });
+    flushMeasure();
+    let ticks = tickButtons(mounted.host);
+    act(() => {
+      window.dispatchEvent(new Event("pageshow"));
+      ticks[4]!.click();
+      mounted.scroll.dispatchEvent(new Event("touchstart"));
+    });
+    expect(ticks[0]!.getAttribute("aria-current")).toBe("true");
+    const release = vi.fn();
+    let captured = false;
+    Object.assign(ticks[1]!, {
+      setPointerCapture: () => { captured = true; },
+      hasPointerCapture: () => captured,
+      releasePointerCapture: (id: number) => { captured = false; release(id); }
+    });
+    act(() => {
+      ticks[4]!.click();
+      ticks[2]!.dispatchEvent(new MouseEvent("mouseover", { bubbles: true }));
+      ticks[1]!.dispatchEvent(pointerEvent("pointerdown", { pointerId: 7, clientY: 13 }));
+    });
+    const oldOwnerCallbacks = timerSpy.mock.calls.map(([callback]) => callback);
+    mounted.render("session-2");
+    flushMeasure();
+    expect(release).toHaveBeenLastCalledWith(7);
+    expect(mounted.host.querySelector("[role=tooltip]")).toBeNull();
+    ticks = tickButtons(mounted.host);
+    expect(ticks[0]!.getAttribute("aria-current")).toBe("true");
+    act(() => {
+      ticks[3]!.click();
+      ticks[3]!.dispatchEvent(new MouseEvent("mouseover", { bubbles: true }));
+      for (const callback of oldOwnerCallbacks) if (typeof callback === "function") callback();
+    });
+    expect(ticks[3]!.getAttribute("aria-current")).toBe("true");
+    act(() => vi.advanceTimersByTime(149));
+    expect(mounted.host.querySelector("[role=tooltip]")).toBeNull();
+    act(() => vi.advanceTimersByTime(1));
+    expect(mounted.host.querySelector("[role=tooltip]")?.textContent).toContain("prompt 4");
+
+    act(() => ticks[1]!.dispatchEvent(pointerEvent("pointerdown", { pointerId: 8, clientY: 13 })));
+    const hiddenPageCallbacks = timerSpy.mock.calls.map(([callback]) => callback);
+    act(() => window.dispatchEvent(new Event("pagehide")));
+    expect(release).toHaveBeenLastCalledWith(8);
+    expect(mounted.host.querySelector("[role=tooltip]")).toBeNull();
+    expect(mounted.host.querySelector("[aria-current]")).toBeNull();
+    const jumpsBeforeHiddenClick = onJump.mock.calls.length;
+    act(() => ticks[4]!.click());
+    expect(onJump).toHaveBeenCalledTimes(jumpsBeforeHiddenClick);
+
+    act(() => window.dispatchEvent(new Event("pageshow")));
+    flushMeasure();
+    act(() => {
+      ticks[2]!.click();
+      ticks[2]!.dispatchEvent(new MouseEvent("mouseover", { bubbles: true }));
+      for (const callback of hiddenPageCallbacks) if (typeof callback === "function") callback();
+    });
+    expect(ticks[2]!.getAttribute("aria-current")).toBe("true");
+    act(() => vi.advanceTimersByTime(149));
+    expect(mounted.host.querySelector("[role=tooltip]")).toBeNull();
+    act(() => vi.advanceTimersByTime(1));
+    expect(mounted.host.querySelector("[role=tooltip]")?.textContent).toContain("prompt 3");
+    act(() => {
+      ticks[2]!.dispatchEvent(new MouseEvent("mouseout", { bubbles: true }));
+      vi.advanceTimersByTime(2_000);
+    });
+    expect(mounted.host.querySelector(".message-nav-rail.is-awake")).toBeNull();
+    act(() => vi.advanceTimersByTime(1_000));
+    expect(mounted.host.querySelector("[aria-current]")?.getAttribute("aria-label")).toContain("prompt 1");
+
+    act(() => ticks[1]!.dispatchEvent(pointerEvent("pointerdown", { pointerId: 9, clientY: 13 })));
+    unmountRail(mounted);
+    expect(release).toHaveBeenLastCalledWith(9);
+    expect(vi.getTimerCount()).toBe(0);
+    timerSpy.mockRestore();
+  });
 });
 
 function mountRail({
@@ -185,19 +265,20 @@ function mountRail({
   scroll.append(content, host);
   document.body.append(scroll);
   const reactRoot = createRoot(host);
-  act(() => reactRoot.render(<MessageNavRail
+  const render = (resetKey: string): void => act(() => reactRoot.render(<MessageNavRail
     entries={entries}
     scrollRef={{ current: scroll }}
     contentRef={{ current: content }}
     bottomOffset={0}
-    resetKey="session-1"
+    resetKey={resetKey}
     estimateEntryTop={(id) => tops[entries.findIndex((entry) => entry.id === id)] ?? null}
     onCoverageChange={onCoverageChange}
     onWheelIntent={onWheelIntent}
     onJump={onJump}
     t={t}
   />));
-  return { content, entries, host, reactRoot, scroll };
+  render("session-1");
+  return { content, entries, host, reactRoot, render, scroll };
 }
 
 function flushMeasure(): void {

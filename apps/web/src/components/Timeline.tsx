@@ -535,7 +535,9 @@ export function Timeline({ ownerKey, viewportOwnerKey, sessionId, sessionName, w
     viewportFrameRef.current = requestAnimationFrame(() => {
       if (!navigationDocumentActiveRef.current || navigationOwnerRef.current !== owner || navigationGenerationRef.current !== generation) return;
       viewportFrameRef.current = undefined;
-      captureViewportAnchor();
+      // A virtual-row estimate can still settle after this frame. Keep the
+      // durable reading anchor until measurement has corrected its offset.
+      if (followingRef.current || viewportAnchorRef.current === undefined) captureViewportAnchor();
     });
   }, [captureViewportAnchor]);
 
@@ -633,9 +635,12 @@ export function Timeline({ ownerKey, viewportOwnerKey, sessionId, sessionName, w
         return;
       }
       if (anchor === undefined) return;
-      const nextScrollTop = Math.max(0, current.scrollTop + anchor.getBoundingClientRect().top - current.getBoundingClientRect().top - 12);
+      const anchorRect = anchor.getBoundingClientRect();
+      const row = anchor.closest<HTMLElement>(".timeline__row");
+      const rowOffset = 12 + (row?.getBoundingClientRect().top ?? anchorRect.top) - anchorRect.top;
+      const nextScrollTop = Math.max(0, current.scrollTop + anchorRect.top - current.getBoundingClientRect().top - 12);
       writeScrollTop(nextScrollTop, timelineJumpBehavior(reducedMotion));
-      viewportAnchorRef.current = { itemId, offset: 12 };
+      viewportAnchorRef.current = { itemId: row?.dataset.timelineItemId ?? itemId, offset: rowOffset };
     };
     navigationFrameRef.current = requestAnimationFrame(align);
   }, [cancelTimelineNavigation, positionVirtualRow, reducedMotion, renderItems, setTimelineFollowing, writeScrollTop]);
@@ -824,8 +829,10 @@ export function Timeline({ ownerKey, viewportOwnerKey, sessionId, sessionName, w
       0,
       node.scrollTop + rowRect.top - viewportRect.top - Math.max(0, (node.clientHeight - rowRect.height) / 2)
     );
+    const rowOffset = rowRect.top - viewportRect.top + node.scrollTop
+      - Math.min(nextScrollTop, Math.max(0, node.scrollHeight - node.clientHeight));
     writeScrollTop(nextScrollTop, timelineJumpBehavior(reducedMotion));
-    viewportAnchorRef.current = { itemId: focusRequest.itemId, offset: rowRect.top - viewportRect.top };
+    viewportAnchorRef.current = { itemId: row.dataset.timelineItemId ?? focusRequest.itemId, offset: rowOffset };
     setFocusedItemId(focusRequest.itemId);
     row.focus({ preventScroll: true });
     if (focusTimerRef.current !== undefined) clearTimeout(focusTimerRef.current);
@@ -918,7 +925,7 @@ export function Timeline({ ownerKey, viewportOwnerKey, sessionId, sessionName, w
     const scrollDelta = currentScrollTop - previousScrollTopRef.current;
     previousScrollTopRef.current = currentScrollTop;
     if (performance.now() < programmaticScrollUntilRef.current) {
-      captureViewportAnchor();
+      if (followingRef.current || viewportAnchorRef.current === undefined) captureViewportAnchor();
       saveViewport();
       return;
     }
@@ -1091,7 +1098,7 @@ export function Timeline({ ownerKey, viewportOwnerKey, sessionId, sessionName, w
           })}
         </div>
       </div>
-      {messageNavRailEnabled && <MessageNavRail entries={messageNavEntries} scrollRef={scrollRef} contentRef={contentRef} bottomOffset={bottomInset} resetKey={sessionId} estimateEntryTop={estimateMessageNavEntryTop} onWheelIntent={handleTimelineWheelIntent} onCoverageChange={setMessageNavRailCoversNavigation} onJump={jumpToMessageNavEntry} t={t} />}
+      {messageNavRailEnabled && <MessageNavRail entries={messageNavEntries} scrollRef={scrollRef} contentRef={contentRef} bottomOffset={bottomInset} resetKey={JSON.stringify([ownerKey, viewportOwnerKey])} estimateEntryTop={estimateMessageNavEntryTop} onWheelIntent={handleTimelineWheelIntent} onCoverageChange={setMessageNavRailCoversNavigation} onJump={jumpToMessageNavEntry} t={t} />}
       {previousMessageEntry !== undefined && !messageNavRailCoversNavigation && <PrevMessageJumpChip preview={previousMessageEntry.preview} label={t("timeline.jumpPreviousQuestion", { preview: previousMessageEntry.preview })} onClick={jumpToPreviousMessage} />}
       {onAddSelectionToComposer !== undefined && shareSelection === undefined && <SelectionQuoteButton key={sessionId} sessionId={sessionId} containerRef={scrollRef} label={t("timeline.addToChat")} onCommit={onAddSelectionToComposer} />}
       {!following && (
