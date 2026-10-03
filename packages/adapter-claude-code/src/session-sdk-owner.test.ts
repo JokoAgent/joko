@@ -36,6 +36,33 @@ function setup(timeoutMs = 1_000, cleanupTimeoutMs = 20) {
 }
 
 describe("SessionSdkOwner", () => {
+  test("discovers an empty Target through the default SDK Worker", async () => {
+    const root = await mkdtemp(join(tmpdir(), "joko-session-sdk-discovery-"));
+    const workspace = join(root, "workspace");
+    const profile = join(root, "profile");
+    await Promise.all([mkdir(workspace), mkdir(profile)]);
+    const owner = new SessionSdkOwner({
+      environment: { CLAUDE_CONFIG_DIR: profile },
+      timeoutMs: 10_000,
+      cleanupTimeoutMs: 2_000
+    });
+    try {
+      await expect(owner.run({
+        kind: "listSessions",
+        options: {
+          dir: workspace,
+          limit: 100,
+          offset: 0,
+          includeWorktrees: false,
+          includeProgrammatic: true
+        }
+      })).resolves.toEqual([]);
+    } finally {
+      await owner.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test("registers the exact new identity before exit and admits only the transcript profile environment", async () => {
     const { owner, worker, factory } = setup();
     const record = vi.fn();
