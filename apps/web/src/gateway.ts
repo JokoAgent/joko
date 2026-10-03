@@ -18484,6 +18484,7 @@ function inputAttachments(input: any): readonly ArtifactView[] {
 }
 
 function capabilityOptions(options: any): readonly string[] {
+  if (options?.kind?.case === "session") return options.kind.value.serviceNodeOnly === true ? ["service_node_only"] : [];
   if (options?.kind?.case === "model") return [...(options.kind.value.effortIds ?? [])];
   if (options?.kind?.case === "input") return [...(options.kind.value.mediaTypes ?? [])];
   if (options?.kind?.case === "permission") {

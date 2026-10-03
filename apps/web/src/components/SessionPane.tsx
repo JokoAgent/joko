@@ -49,7 +49,7 @@ import { hidesFromTimelineHistory, resolveActiveRetry, resolveRetryEscapeIntent,
 import { projectRuntimeRecoveryTimeline } from "../runtime-recovery.js";
 import { createMessageComposerMention, messageForkBlocked, resolveMessageDeleteTarget, resolveMessageForkTarget, type MessageForkTarget } from "./message-actions.js";
 import { restoreMessageAttachmentDrafts, sameMessageAttachments } from "./message-attachment-roundtrip.js";
-import { canEditVisibleUserMessage, changeSetForMessageRound, lastVisibleUserMessage, sameNativeNavigationTarget, messageDialogueRewindTarget, messageRoundRunId } from "./message-rewind-behavior.js";
+import { canEditVisibleUserMessage, canRewindToSessionStart, changeSetForMessageRound, lastVisibleUserMessage, sameNativeNavigationTarget, messageDialogueRewindTarget, messageRoundRunId } from "./message-rewind-behavior.js";
 import { reconcileShareSelection, shareableTimelineMessages, toggleShareMessageSelection } from "./share-selection-behavior.js";
 import { ShareSelectionBar } from "./ShareSelectionBar.js";
 import { Timeline, type InlinePlanVisibility } from "./Timeline.js";
@@ -617,7 +617,10 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
   const currentMessageFork = messageFork?.sessionId === session.id ? messageFork : undefined;
   const currentMessageDelete = messageDelete?.sessionId === session.id ? messageDelete : undefined;
   const latestVisibleUserMessage = lastVisibleUserMessage(visibleTimeline);
-  const rewindToStartSupported = backend?.capabilities.get("session.rewind_to_start")?.supported === true;
+  const rewindToStartSupported = canRewindToSessionStart(
+    backend?.capabilities.get("session.rewind_to_start"),
+    controller.state.snapshot.targets.find((candidate) => candidate.id === session.targetId)
+  );
   const editableMessageId = messageRewindSupported && canEditVisibleUserMessage(latestVisibleUserMessage, rewindToStartSupported) ? latestVisibleUserMessage.id : undefined;
   const errorTailActions = errorTailProjection?.bannerVisible === true && errorTailProjection.item.error !== undefined
     ? executableRecoveryActions(errorTailProjection.item.error, recoveryContext)
@@ -1361,6 +1364,8 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
       const snapshot = state.snapshot;
       const activeSession = snapshot.sessions.find((candidate) => candidate.id === sourceSessionId);
       const activeBackend = activeSession === undefined ? undefined : snapshot.backends.find((candidate) => candidate.id === activeSession.backendId);
+      const activeTarget = activeSession === undefined ? undefined : snapshot.targets.find((candidate) => candidate.id === activeSession.targetId);
+      const activeStartSupported = canRewindToSessionStart(activeBackend?.capabilities.get("session.rewind_to_start"), activeTarget);
       const activeTimeline = snapshot.timelineBySession.get(sourceSessionId) ?? [];
       const activeUser = lastVisibleUserMessage(activeTimeline.filter((candidate) => !hidesFromTimelineHistory(candidate)));
       const queuedWork = snapshot.queue.some((candidate) => candidate.sessionId === sourceSessionId && !["completed", "cancelled", "failed"].includes(candidate.state));
@@ -1374,8 +1379,8 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
         || queuedWork
         || activeBackend?.capabilities.get("session.rewind")?.supported !== true
         || activeUser?.id !== item.id
-        || !canEditVisibleUserMessage(activeUser, activeBackend.capabilities.get("session.rewind_to_start")?.supported === true)
-        || !sameNativeNavigationTarget(messageDialogueRewindTarget(activeUser, activeBackend.capabilities.get("session.rewind_to_start")?.supported === true), navigationTarget)
+        || !canEditVisibleUserMessage(activeUser, activeStartSupported)
+        || !sameNativeNavigationTarget(messageDialogueRewindTarget(activeUser, activeStartSupported), navigationTarget)
       ) return undefined;
       return { snapshot, session: activeSession, backend: activeBackend, user: activeUser };
     };
@@ -1528,11 +1533,12 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
     const latest = controllerRef.current.state.snapshot;
     const latestSession = latest.sessions.find((candidate) => candidate.id === rewind.sessionId);
     const latestBackend = latestSession === undefined ? undefined : latest.backends.find((candidate) => candidate.id === latestSession.backendId);
+    const latestTarget = latestSession === undefined ? undefined : latest.targets.find((candidate) => candidate.id === latestSession.targetId);
     const latestQueuedWork = latest.queue.some((candidate) => candidate.sessionId === rewind.sessionId && !["completed", "cancelled", "failed"].includes(candidate.state));
     if (latestSession?.state !== "idle" || latestQueuedWork || latestBackend?.capabilities.get("session.rewind")?.supported !== true) throw new Error(t("timeline.rewindStale"));
     const currentItem = (latest.timelineBySession.get(rewind.sessionId) ?? []).find((item) => item.id === rewind.itemId);
     if (latestSession.generation !== rewind.generation || controllerRef.current.navigateSessionBranch !== rewind.navigate
-      || currentItem === undefined || !sameNativeNavigationTarget(messageDialogueRewindTarget(currentItem, latestBackend.capabilities.get("session.rewind_to_start")?.supported === true), rewind.target)) {
+      || currentItem === undefined || !sameNativeNavigationTarget(messageDialogueRewindTarget(currentItem, canRewindToSessionStart(latestBackend.capabilities.get("session.rewind_to_start"), latestTarget)), rewind.target)) {
       throw new Error(t("timeline.rewindStale"));
     }
     await rewind.navigate(rewind.sessionId, rewind.target, { expectedGeneration: rewind.generation });
