@@ -1,5 +1,3 @@
-import { execFile } from "node:child_process";
-
 import type { DedicatedHardwareActionEvent } from "./actions.js";
 import {
   DEDICATED_HARDWARE_SCROLL_WATCHDOG_MS,
@@ -11,40 +9,7 @@ export const SYSTEM_FRONTMOST_WINDOWS_WHEEL_NOTCH = 120;
 export const SYSTEM_FRONTMOST_SCROLL_TICK_MS = 16;
 export const SYSTEM_FRONTMOST_SCROLL_MAX_ELAPSED_MS = 100;
 
-const COMMAND_TIMEOUT_MS = 4_000;
 const MAX_NATIVE_TARGET = 9_223_372_036_854_775_807n;
-const LINUX_RETURN_SCRIPT = [
-  "target=\"$1\"; expected_pid=\"$2\"",
-  "case \"$target\" in ''|0|0[0-9]*|*[!0-9]*) exit 2;; esac",
-  "case \"$expected_pid\" in ''|0|0[0-9]*|*[!0-9]*) exit 3;; esac",
-  "actual_pid=\"$(xdotool getwindowpid \"$target\")\" || exit 4",
-  "[ \"$actual_pid\" = \"$expected_pid\" ] || exit 5",
-  "exec xdotool key --window \"$target\" Return"
-].join("\n");
-const LINUX_SCROLL_SCRIPT = [
-  "target=\"$1\"; expected_pid=\"$2\"; repeats=\"$3\"; button=\"$4\"",
-  "case \"$target\" in ''|0|0[0-9]*|*[!0-9]*) exit 2;; esac",
-  "case \"$expected_pid\" in ''|0|0[0-9]*|*[!0-9]*) exit 3;; esac",
-  "case \"$repeats\" in ''|*[!0-9]*) exit 4;; esac",
-  "[ \"$repeats\" -ge 1 ] && [ \"$repeats\" -le 20 ] || exit 4",
-  "[ \"$button\" = 4 ] || [ \"$button\" = 5 ] || exit 5",
-  "actual_pid=\"$(xdotool getwindowpid \"$target\")\" || exit 6",
-  "[ \"$actual_pid\" = \"$expected_pid\" ] || exit 7",
-  "exec xdotool click --window \"$target\" --repeat \"$repeats\" \"$button\""
-].join("\n");
-const LINUX_PASTE_SCRIPT = [
-  "target=\"$1\"; expected_pid=\"$2\"",
-  "case \"$target\" in ''|0|0[0-9]*|*[!0-9]*) exit 2;; esac",
-  "case \"$expected_pid\" in ''|0|0[0-9]*|*[!0-9]*) exit 3;; esac",
-  "actual_pid=\"$(xdotool getwindowpid \"$target\")\" || exit 4",
-  "[ \"$actual_pid\" = \"$expected_pid\" ] || exit 5",
-  "xdotool windowactivate --sync \"$target\" || exit 6",
-  "focused=\"$(xdotool getwindowfocus)\" || exit 7",
-  "[ \"$focused\" = \"$target\" ] || exit 8",
-  "focused_pid=\"$(xdotool getwindowpid \"$focused\")\" || exit 9",
-  "[ \"$focused_pid\" = \"$expected_pid\" ] || exit 10",
-  "exec xdotool key --window \"$target\" --clearmodifiers ctrl+v"
-].join("\n");
 
 const SYSTEM_FRONTMOST_TARGET = Symbol("system-frontmost-target");
 /** Opaque, validated native target and owning process captured at press time. */
@@ -76,12 +41,6 @@ export interface NativeSystemFrontmostInputHelper {
   readonly postScroll: (target: Readonly<{ nativeId: string; processId: number }>, deltaY: number) => Promise<void>;
 }
 
-export type SystemFrontmostCommandExecutor = (
-  executable: string,
-  args: readonly string[],
-  options: Readonly<{ timeoutMs: number; windowsHide: boolean }>
-) => Promise<string | undefined>;
-
 export type PlatformSystemFrontmostInput =
   | {
     readonly status: "available";
@@ -92,11 +51,9 @@ export type PlatformSystemFrontmostInput =
 
 export interface PlatformSystemFrontmostInputOptions {
   readonly platform: NodeJS.Platform;
-  readonly execute?: SystemFrontmostCommandExecutor;
-  /** Linux must sample target+PID inside the admitted physical press callback without async work or process startup. */
-  readonly atomicCapture?: () => Readonly<{ nativeId: string; processId: number }>;
   readonly windowsHelper?: NativeSystemFrontmostInputHelper;
   readonly macHelper?: NativeSystemFrontmostInputHelper;
+  readonly linuxHelper?: NativeSystemFrontmostInputHelper;
   readonly currentProcessId?: number;
 }
 
@@ -105,7 +62,7 @@ interface NativeTargetIdentity {
   readonly processId: number;
 }
 
-/** Windows/macOS require native helpers; Linux uses only audited fixed commands. */
+/** Every supported platform requires its admitted native helper. */
 export function createPlatformSystemFrontmostInput(
   options: PlatformSystemFrontmostInputOptions
 ): PlatformSystemFrontmostInput {
@@ -113,48 +70,18 @@ export function createPlatformSystemFrontmostInput(
     return Object.freeze({ status: "unsupported", reason: "platform" });
   }
   const currentProcessId = validProcessId(options.currentProcessId ?? process.pid);
-  if (options.platform === "win32" || options.platform === "darwin") {
-    const helper = options.platform === "win32" ? options.windowsHelper : options.macHelper;
-    if (helper === undefined) return Object.freeze({ status: "unsupported", reason: "helper-unavailable" });
-    return Object.freeze({
-      status: "available",
-      wheelNotch: options.platform === "win32" ? SYSTEM_FRONTMOST_WINDOWS_WHEEL_NOTCH : 0,
-      runner: guardedRunner({
-        captureTarget: helper.captureTarget,
-        postReturn: (target) => helper.postReturn(target),
-        postPaste: (target) => helper.postPaste(target),
-        postScroll: (target, deltaY) => helper.postScroll(target, deltaY)
-      }, options.platform, currentProcessId)
-    });
-  }
-  const execute = options.execute ?? executeFile;
-  const atomicCapture = options.atomicCapture;
-  if (atomicCapture === undefined) {
-    return Object.freeze({ status: "unsupported", reason: "helper-unavailable" });
-  }
+  const helper = options.platform === "win32" ? options.windowsHelper
+    : options.platform === "darwin" ? options.macHelper : options.linuxHelper;
+  if (helper === undefined) return Object.freeze({ status: "unsupported", reason: "helper-unavailable" });
   return Object.freeze({
     status: "available",
-    wheelNotch: 0,
+    wheelNotch: options.platform === "win32" ? SYSTEM_FRONTMOST_WINDOWS_WHEEL_NOTCH : 0,
     runner: guardedRunner({
-      postReturn: async (target) => {
-        await execute("/bin/sh", [
-          "-c", LINUX_RETURN_SCRIPT, "joko-system-input", target.nativeId, String(target.processId)
-        ], commandOptions());
-      },
-      captureTarget: atomicCapture,
-      postPaste: async (target) => {
-        await execute("/bin/sh", [
-          "-c", LINUX_PASTE_SCRIPT, "joko-system-input", target.nativeId, String(target.processId)
-        ], commandOptions());
-      },
-      postScroll: async (target, deltaY) => {
-        const repeats = Math.max(1, Math.min(20, Math.abs(Math.round(deltaY / 40))));
-        await execute("/bin/sh", [
-          "-c", LINUX_SCROLL_SCRIPT, "joko-system-input", target.nativeId, String(target.processId),
-          String(repeats), deltaY > 0 ? "4" : "5"
-        ], commandOptions());
-      }
-    }, "linux", currentProcessId)
+      captureTarget: helper.captureTarget,
+      postReturn: (target) => helper.postReturn(target),
+      postPaste: (target) => helper.postPaste(target),
+      postScroll: (target, deltaY) => helper.postScroll(target, deltaY)
+    }, options.platform, currentProcessId)
   });
 }
 
@@ -483,12 +410,6 @@ function parseNativeId(value: unknown): string {
   return target;
 }
 
-function parseProcessId(value: unknown): number {
-  const parsed = parseNativeId(value);
-  const numeric = Number(parsed);
-  return validProcessId(numeric);
-}
-
 function createTarget(
   value: unknown,
   platform: SystemFrontmostInputTarget["platform"],
@@ -544,25 +465,4 @@ function validProcessId(value: unknown): number {
 function validScrollInput(direction: unknown, distance: unknown): direction is "up" | "down" {
   return (direction === "up" || direction === "down") && typeof distance === "number" &&
     Number.isFinite(distance) && distance >= 0 && distance <= 1;
-}
-
-function commandOptions(): Readonly<{ timeoutMs: number; windowsHide: boolean }> {
-  return Object.freeze({ timeoutMs: COMMAND_TIMEOUT_MS, windowsHide: true });
-}
-
-function executeFile(
-  executable: string,
-  args: readonly string[],
-  options: Readonly<{ timeoutMs: number; windowsHide: boolean }>
-): Promise<string> {
-  return new Promise((resolve, reject) => {
-    execFile(executable, [...args], {
-      timeout: options.timeoutMs,
-      windowsHide: options.windowsHide,
-      encoding: "utf8"
-    }, (error, stdout) => {
-      if (error === null) resolve(stdout);
-      else reject(error);
-    });
-  });
 }

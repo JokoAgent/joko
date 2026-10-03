@@ -831,7 +831,8 @@ async function auditWdaSourceAssets(root, platform) {
 
 async function auditNativeSystemFrontmostInput(root, platform, targetArch) {
   const helper = platform === "win32" ? "joko-windows-frontmost-input.node"
-    : platform === "darwin" ? "joko-macos-frontmost-input.node" : null;
+    : platform === "darwin" ? "joko-macos-frontmost-input.node"
+      : platform === "linux" ? "joko-linux-frontmost-input.node" : null;
   const expected = (helper === null ? ["manifest.json"] : [helper, "manifest.json"]).sort();
   const entries = await readdir(root, { withFileTypes: true }).catch(() => []);
   const names = entries.map(entry => entry.name).sort();

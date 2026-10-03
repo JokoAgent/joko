@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { existsSync, lstatSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { gunzipSync } from "node:zlib";
 
@@ -10,7 +10,8 @@ const desktopRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const outputRoot = join(desktopRoot, "dist", "native-system-frontmost-input");
 const helperNames = Object.freeze({
   win32: "joko-windows-frontmost-input.node",
-  darwin: "joko-macos-frontmost-input.node"
+  darwin: "joko-macos-frontmost-input.node",
+  linux: "joko-linux-frontmost-input.node"
 });
 const helperName = helperNames[process.platform];
 const output = helperName === undefined ? undefined : join(outputRoot, helperName);
@@ -39,16 +40,22 @@ for (const name of Object.values(helperNames)) {
 }
 writeManifest(null, null);
 
-if (process.platform === "win32" || process.platform === "darwin") {
+if (process.platform === "win32" || process.platform === "darwin" || process.platform === "linux") {
   const architecture = process.platform === "win32" ? architectures[process.arch] :
-    process.arch === "x64" ? "x86_64" : process.arch === "arm64" ? "arm64" : undefined;
+    process.platform === "darwin" ?
+      process.arch === "x64" ? "x86_64" : process.arch === "arm64" ? "arm64" : undefined :
+      process.arch === "x64" || process.arch === "arm64" ? process.arch : undefined;
   if (architecture === undefined) throw new Error("The system frontmost native build architecture is unsupported.");
   const cacheBase = process.platform === "win32"
     ? process.env.LOCALAPPDATA ?? join(homedir(), "AppData", "Local")
-    : join(homedir(), "Library", "Caches");
+    : process.platform === "darwin" ? join(homedir(), "Library", "Caches")
+      : process.env.XDG_CACHE_HOME ?? join(homedir(), ".cache");
+  if (!isAbsolute(cacheBase)) throw new Error("The system frontmost build cache must use an absolute location.");
   const cacheRoot = join(cacheBase,
-    "Joko", "BuildCache", "system-frontmost-input", `electron-${electronVersion}`, process.arch);
-  mkdirSync(cacheRoot, { recursive: true });
+    process.platform === "linux" ? "joko" : "Joko",
+    process.platform === "linux" ? "build-cache" : "BuildCache",
+    "system-frontmost-input", `electron-${electronVersion}`, process.arch);
+  createCacheDirectory(cacheRoot);
   const checksums = await cachedInput(cacheRoot, "SHASUMS256.txt", "SHASUMS256.txt", checksumDigest, 16_384);
   const identities = new Map(checksums.toString("utf8").trim().split(/\r?\n/u).map(line => {
     const parsed = /^([a-f0-9]{64}) {2}(\S+)$/u.exec(line);
@@ -64,12 +71,13 @@ if (process.platform === "win32" || process.platform === "darwin") {
     await cachedInput(cacheRoot, "node.lib", architecture.library, architecture.sha256, 8 * 1024 * 1024);
   }
   const includeRoot = join(cacheRoot, "include");
-  mkdirSync(includeRoot, { recursive: true });
+  createCacheDirectory(includeRoot);
   for (const [name, bytes] of unpackHeaders(headerArchive)) {
     cacheVerifiedBytes(join(includeRoot, name), bytes, digest(bytes));
   }
   if (process.platform === "win32") buildWindows(architecture, includeRoot, join(cacheRoot, "node.lib"));
-  else buildMac(architecture, includeRoot);
+  else if (process.platform === "darwin") buildMac(architecture, includeRoot);
+  else buildLinux(architecture, includeRoot);
   writeManifest(helperName, digest(readFileSync(output)));
 }
 
@@ -81,6 +89,16 @@ function writeManifest(helper, sha256) {
 
 function digest(bytes) {
   return createHash("sha256").update(bytes).digest("hex");
+}
+
+function createCacheDirectory(path) {
+  mkdirSync(path, { recursive: true, mode: 0o700 });
+  if (process.platform !== "linux") return;
+  const metadata = lstatSync(path);
+  if (!metadata.isDirectory() || metadata.isSymbolicLink() || realpathSync(path) !== path ||
+      metadata.uid !== process.getuid() || (metadata.mode & 0o022) !== 0) {
+    throw new Error("The Linux system frontmost build cache must be a canonical directory owned by the current user.");
+  }
 }
 
 async function cachedInput(directory, cacheName, officialName, expectedDigest, maximumBytes) {
@@ -116,7 +134,8 @@ function cacheVerifiedBytes(path, bytes, expectedDigest) {
 
 function verifiedCache(path, expectedDigest, maximumBytes) {
   const metadata = lstatSync(path);
-  if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.size === 0 || metadata.size > maximumBytes) {
+  if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.size === 0 || metadata.size > maximumBytes ||
+      (process.platform === "linux" && (metadata.uid !== process.getuid() || (metadata.mode & 0o022) !== 0))) {
     throw new Error("The cached Electron native build input is not a bounded regular file.");
   }
   const bytes = readFileSync(path);
@@ -211,6 +230,65 @@ function buildMac(architecture, includeRoot) {
   } finally {
     if (existsSync(temporary)) rmSync(temporary);
   }
+}
+
+function buildLinux(architecture, includeRoot) {
+  const dependencies = ["xcb", "xcb-res", "xcb-xkb"];
+  const compilerFlags = pkgConfigFlags(run("pkg-config", ["--cflags", ...dependencies], undefined, 10_000));
+  const linkerFlags = pkgConfigFlags(run("pkg-config", ["--libs", ...dependencies], undefined, 10_000));
+  const temporary = join(outputRoot, "joko-linux-frontmost-input.build.node");
+  try {
+    if (existsSync(temporary)) rmSync(temporary);
+    run("c++", ["-std=c++17", "-O2", "-fPIC", "-shared", "-pthread",
+      "-DBUILDING_NODE_EXTENSION", "-DNAPI_VERSION=8", `-I${includeRoot}`, ...compilerFlags,
+      join(desktopRoot, "native", "system-frontmost-input", "linux-frontmost-input.cc"),
+      ...linkerFlags, "-o", temporary], undefined, 60_000);
+    if (!existsSync(temporary)) throw new Error("The Linux system frontmost native build produced no helper.");
+    const bytes = readFileSync(temporary);
+    const machine = architecture === "x64" ? 62 : 183;
+    if (bytes.length < 20 || bytes[0] !== 0x7f || bytes.subarray(1, 4).toString("ascii") !== "ELF" ||
+        bytes[4] !== 2 || bytes[5] !== 1 || bytes.readUInt16LE(18) !== machine) {
+      throw new Error("The Linux system frontmost native build produced a different artifact architecture.");
+    }
+    renameSync(temporary, output);
+  } finally {
+    if (existsSync(temporary)) rmSync(temporary);
+  }
+}
+
+// pkg-config quotes paths containing spaces. Decode its arguments without a shell.
+function pkgConfigFlags(value) {
+  const argumentsList = [];
+  let argument = "";
+  let quote = null;
+  let escaped = false;
+  let started = false;
+  for (const character of value.trim()) {
+    if (escaped) {
+      argument += character;
+      escaped = false;
+      started = true;
+    } else if (character === "\\" && quote !== "'") {
+      escaped = true;
+      started = true;
+    } else if (quote !== null) {
+      if (character === quote) quote = null;
+      else argument += character;
+    } else if (character === "'" || character === '"') {
+      quote = character;
+      started = true;
+    } else if (/\s/u.test(character)) {
+      if (started) argumentsList.push(argument);
+      argument = "";
+      started = false;
+    } else {
+      argument += character;
+      started = true;
+    }
+  }
+  if (escaped || quote !== null) throw new Error("The Linux native dependencies returned incomplete build arguments.");
+  if (started) argumentsList.push(argument);
+  return argumentsList;
 }
 
 function run(command, args, environment, timeoutMs) {

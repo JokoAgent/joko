@@ -8169,7 +8169,8 @@ async function initializeDedicatedHardwareInput(): Promise<void> {
     platform: process.platform,
     ...(nativeHelper === undefined ? {} : process.platform === "win32"
       ? { windowsHelper: nativeHelper }
-      : process.platform === "darwin" ? { macHelper: nativeHelper } : {})
+      : process.platform === "darwin" ? { macHelper: nativeHelper }
+      : process.platform === "linux" ? { linuxHelper: nativeHelper } : {})
   });
   if (packagedSmoke && (process.platform === "win32" || process.platform === "darwin")) {
     if (systemFrontmost.status !== "available") throw new Error("Native foreground sampler was not admitted by Main.");

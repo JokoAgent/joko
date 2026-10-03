@@ -80,7 +80,8 @@
       "filter": [
         "manifest.json",
         "joko-windows-frontmost-input.node",
-        "joko-macos-frontmost-input.node"
+        "joko-macos-frontmost-input.node",
+        "joko-linux-frontmost-input.node"
       ]
     },
     {

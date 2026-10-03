@@ -7,6 +7,7 @@ import type { NativeSystemFrontmostInputHelper } from "./dedicated-hardware-acti
 const require = createRequire(import.meta.url);
 const WINDOWS_HELPER = "joko-windows-frontmost-input.node";
 const MACOS_HELPER = "joko-macos-frontmost-input.node";
+const LINUX_HELPER = "joko-linux-frontmost-input.node";
 const MAX_HELPER_BYTES = 2 * 1024 * 1024;
 
 export interface NativeSystemFrontmostInputOptions {
@@ -20,7 +21,8 @@ export interface NativeSystemFrontmostInputOptions {
 export function loadNativeSystemFrontmostInput(
   options: NativeSystemFrontmostInputOptions
 ): NativeSystemFrontmostInputHelper | undefined {
-  const helper = options.platform === "win32" ? WINDOWS_HELPER : options.platform === "darwin" ? MACOS_HELPER : undefined;
+  const helper = options.platform === "win32" ? WINDOWS_HELPER
+    : options.platform === "darwin" ? MACOS_HELPER : options.platform === "linux" ? LINUX_HELPER : undefined;
   if (helper === undefined) return undefined;
   try {
     const directory = resolve(options.directory);
