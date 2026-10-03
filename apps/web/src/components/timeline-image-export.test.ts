@@ -81,6 +81,96 @@ it("freezes source content, inherited style, dimensions and fonts before awaitin
   expect([encode.canvas.width, encode.canvas.height]).toEqual([0, 0]);
 });
 
+it("keeps the default raster scale and applies each per-request scale bound", async () => {
+  const fixture = createDocument();
+  const node = fixture.doc.body.appendChild(fixture.doc.createElement("div"));
+  node.textContent = "Bounded export";
+  node.style.fontFamily = "sans-serif";
+  Object.defineProperties(node, {
+    scrollWidth: { configurable: true, value: 300 },
+    scrollHeight: { configurable: true, value: 200 }
+  });
+  const render = async (
+    options: Parameters<typeof timelineDomToPng>[2],
+    expectedSize: readonly [number, number]
+  ): Promise<void> => {
+    const encodeIndex = fixture.encodes.length;
+    const result = timelineDomToPng(
+      node,
+      { ownerDocument: fixture.doc, signal: new AbortController().signal },
+      options
+    );
+    await vi.waitFor(() => expect(fixture.encodes).toHaveLength(encodeIndex + 1));
+    const encode = fixture.encodes[encodeIndex]!;
+    expect([encode.canvas.width, encode.canvas.height]).toEqual(expectedSize);
+    encode.complete(new Blob(["PNG"], { type: "image/png" }));
+    await result;
+  };
+
+  await render(undefined, [600, 400]);
+  await render({ desiredScale: 0.75, maximumEdgePixels: 2_000, maximumPixels: 1_000_000 }, [225, 150]);
+  await render({ desiredScale: 3, maximumEdgePixels: 420, maximumPixels: 1_000_000 }, [420, 280]);
+  await render({ desiredScale: 3, maximumEdgePixels: 2_000, maximumPixels: 30_000 }, [212, 141]);
+});
+
+it("rewrites snapshot DOM and SVG ids, local references and style selectors without mutating the source", async () => {
+  const fixture = createDocument();
+  const node = fixture.doc.body.appendChild(fixture.doc.createElement("div"));
+  node.id = "message-card";
+  node.innerHTML = `
+    <span id="message-label" data-part="label">Rendered message</span>
+    <span data-part="description" aria-labelledby="message-label external-label">Description</span>
+    <svg viewBox="0 0 10 10">
+      <defs>
+        <linearGradient id="paint"><stop offset="1" stop-color="red"></stop></linearGradient>
+        <clipPath id="clip"><rect width="10" height="10"></rect></clipPath>
+        <style>#shape { fill: url(#paint); } .clipped { clip-path: url(#clip); }</style>
+      </defs>
+      <rect id="shape" data-part="shape" fill="url(#paint)" clip-path="url('#clip')"></rect>
+      <use data-part="use" href="#shape"></use>
+    </svg>`;
+  Object.defineProperties(node, { scrollWidth: { value: 200 }, scrollHeight: { value: 100 } });
+
+  const capture = async (): Promise<HTMLElement> => {
+    const callIndex = vi.mocked(toSvg).mock.calls.length;
+    const encodeIndex = fixture.encodes.length;
+    const result = timelineDomToPng(node, { ownerDocument: fixture.doc, signal: new AbortController().signal });
+    await vi.waitFor(() => expect(fixture.encodes).toHaveLength(encodeIndex + 1));
+    const snapshot = vi.mocked(toSvg).mock.calls[callIndex]![0] as HTMLElement;
+    fixture.encodes[encodeIndex]!.complete(new Blob(["PNG"], { type: "image/png" }));
+    await result;
+    return snapshot;
+  };
+
+  const first = await capture();
+  const firstLabel = first.querySelector<HTMLElement>('[data-part="label"]')!;
+  const firstDescription = first.querySelector<HTMLElement>('[data-part="description"]')!;
+  const firstPaint = first.querySelector<SVGElement>("linearGradient")!;
+  const firstClip = first.querySelector<SVGElement>("clipPath")!;
+  const firstShape = first.querySelector<SVGElement>('[data-part="shape"]')!;
+  const firstUse = first.querySelector<SVGElement>('[data-part="use"]')!;
+  const firstIds = [first.id, firstLabel.id, firstPaint.id, firstClip.id, firstShape.id];
+  expect(firstIds.every((id) => /^timeline-export-\d+-id-\d+$/u.test(id))).toBe(true);
+  expect(new Set(firstIds).size).toBe(firstIds.length);
+  expect(firstDescription.getAttribute("aria-labelledby")).toBe(`${firstLabel.id} external-label`);
+  expect(firstShape.getAttribute("fill")).toBe(`url(#${firstPaint.id})`);
+  expect(firstShape.getAttribute("clip-path")).toBe(`url('#${firstClip.id}')`);
+  expect(firstUse.getAttribute("href")).toBe(`#${firstShape.id}`);
+  expect(first.querySelector("style")!.textContent).toContain(`#${firstShape.id}`);
+  expect(first.querySelector("style")!.textContent).toContain(`url(#${firstPaint.id})`);
+  expect(first.querySelector("style")!.textContent).toContain(`url(#${firstClip.id})`);
+
+  const second = await capture();
+  expect(second.id).not.toBe(first.id);
+  expect(second.querySelector<HTMLElement>('[data-part="label"]')!.id).not.toBe(firstLabel.id);
+  expect(node.id).toBe("message-card");
+  expect(node.querySelector<HTMLElement>('[data-part="label"]')!.id).toBe("message-label");
+  expect(node.querySelector('[data-part="description"]')!.getAttribute("aria-labelledby")).toBe("message-label external-label");
+  expect(node.querySelector('[data-part="shape"]')!.getAttribute("fill")).toBe("url(#paint)");
+  expect(node.querySelector('[data-part="shape"]')!.getAttribute("clip-path")).toBe("url('#clip')");
+  expect(node.querySelector('[data-part="use"]')!.getAttribute("href")).toBe("#shape");
+});
+
 it("embeds a used packaged font from its stylesheet URL without creating a CSP-blocked base element", async () => {
   const fixture = createDocument();
   const style = fixture.doc.head.appendChild(fixture.doc.createElement("style"));

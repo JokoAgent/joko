@@ -3,11 +3,29 @@ import { assertBrowserActionCurrent, type BrowserActionContext } from "../browse
 
 const MAX_EDGE = 4_096;
 const MAX_PIXELS = MAX_EDGE * MAX_EDGE;
+export const TIMELINE_FROZEN_IMAGE_ATTRIBUTE = "data-timeline-frozen-image";
 let snapshotSequence = 0;
 
-export function timelineExportScale(width: number, height: number, desired = 2): number {
-  if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) return 1;
-  return Math.min(desired, MAX_EDGE / Math.max(width, height), Math.sqrt(MAX_PIXELS / (width * height)));
+export interface TimelineImageExportOptions {
+  readonly desiredScale?: number;
+  readonly maximumEdgePixels?: number;
+  readonly maximumPixels?: number;
+}
+
+export function timelineExportScale(
+  width: number,
+  height: number,
+  desired = 2,
+  maximumEdgePixels = MAX_EDGE,
+  maximumPixels = MAX_PIXELS
+): number {
+  if (
+    !Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0
+    || !Number.isFinite(desired) || desired <= 0
+    || !Number.isFinite(maximumEdgePixels) || maximumEdgePixels <= 0
+    || !Number.isFinite(maximumPixels) || maximumPixels <= 0
+  ) return 1;
+  return Math.min(desired, maximumEdgePixels / Math.max(width, height), Math.sqrt(maximumPixels / (width * height)));
 }
 
 export function timelineTableToTsv(node: HTMLElement): string | undefined {
@@ -197,6 +215,48 @@ function opaqueBackground(node: Element, ownerWindow: Window): string {
   return node.ownerDocument.documentElement.dataset.theme === "dark" ? "#1f1f1d" : "#ffffff";
 }
 
+export function rewriteTimelineSnapshotIds(root: HTMLElement, snapshotId: string): void {
+  const identified = [root, ...root.querySelectorAll<HTMLElement>("[id]")].filter((element) => element.id !== "");
+  const replacements = new Map<string, string>();
+  identified.forEach((element, index) => {
+    const original = element.id;
+    const replacement = `${snapshotId}-id-${index}`;
+    if (!replacements.has(original)) replacements.set(original, replacement);
+    element.id = replacement;
+  });
+  if (replacements.size === 0) return;
+
+  const orderedReplacements = [...replacements].sort(([left], [right]) => right.length - left.length);
+  const rewrite = (value: string): string => {
+    let result = value;
+    for (const [original, replacement] of orderedReplacements) {
+      result = result
+        .replaceAll(`url(#${original})`, `url(#${replacement})`)
+        .replaceAll(`url("#${original}")`, `url("#${replacement}")`)
+        .replaceAll(`url('#${original}')`, `url('#${replacement}')`);
+      if (result === `#${original}`) result = `#${replacement}`;
+    }
+    return result;
+  };
+  const tokenAttributes = new Set(["aria-controls", "aria-describedby", "aria-details", "aria-labelledby", "aria-owns", "headers"]);
+  for (const element of [root, ...root.querySelectorAll<HTMLElement>("*")]) {
+    for (const attribute of [...element.attributes]) {
+      if (tokenAttributes.has(attribute.name)) {
+        const tokens = attribute.value.split(/\s+/u).map((token) => replacements.get(token) ?? token);
+        element.setAttribute(attribute.name, tokens.join(" "));
+        continue;
+      }
+      const next = rewrite(attribute.value);
+      if (next !== attribute.value) element.setAttribute(attribute.name, next);
+    }
+    if (element.localName === "style" && element.textContent !== null) {
+      let css = element.textContent;
+      for (const [original, replacement] of orderedReplacements) css = css.replaceAll(`#${original}`, `#${replacement}`);
+      element.textContent = css;
+    }
+  }
+}
+
 /** Capture content and inherited presentation before fonts or encoding can yield. */
 function captureContent(node: HTMLElement, context: BrowserActionContext) {
   assertBrowserActionCurrent(context);
@@ -205,7 +265,7 @@ function captureContent(node: HTMLElement, context: BrowserActionContext) {
   if (node.ownerDocument !== ownerDocument || !node.isConnected) throw new Error("Content is no longer available.");
   const width = Math.ceil(node.scrollWidth);
   const height = Math.ceil(node.scrollHeight);
-  if (width <= 0 || height <= 0) throw new Error("Content has no renderable size.");
+  if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) throw new Error("Content has no renderable size.");
   const backgroundColor = opaqueBackground(node, ownerWindow);
   const clone = node.cloneNode(true) as HTMLElement;
   const originals = [node, ...node.querySelectorAll("*")];
@@ -232,6 +292,13 @@ function captureContent(node: HTMLElement, context: BrowserActionContext) {
     }
     if (original.localName === "img") {
       const image = original as HTMLImageElement;
+      const source = image.getAttribute("src") ?? "";
+      if (source.startsWith("data:") && image.hasAttribute(TIMELINE_FROZEN_IMAGE_ATTRIBUTE)) {
+        copy.setAttribute("src", source);
+        copy.removeAttribute("srcset");
+        copy.removeAttribute(TIMELINE_FROZEN_IMAGE_ATTRIBUTE);
+        return;
+      }
       if (!image.complete || image.naturalWidth === 0) throw new Error("An image is still loading.");
       const canvas = ownerDocument.createElement("canvas");
       try {
@@ -249,6 +316,7 @@ function captureContent(node: HTMLElement, context: BrowserActionContext) {
       }
     }
   });
+  rewriteTimelineSnapshotIds(clone, snapshotId);
   clone.style.width = `${width}px`;
   clone.style.height = `${height}px`;
   clone.style.overflow = "visible";
@@ -280,7 +348,11 @@ function abortable<T>(operation: PromiseLike<T>, signal: AbortSignal): Promise<T
   });
 }
 
-export async function timelineDomToPng(node: HTMLElement, context: BrowserActionContext): Promise<Blob> {
+export async function timelineDomToPng(
+  node: HTMLElement,
+  context: BrowserActionContext,
+  options: TimelineImageExportOptions = {}
+): Promise<Blob> {
   const captured = captureContent(node, context);
   const { ownerDocument, signal } = context;
   const image = ownerDocument.createElement("img");
@@ -305,7 +377,13 @@ export async function timelineDomToPng(node: HTMLElement, context: BrowserAction
       image.src = svg;
     }), signal);
     assertBrowserActionCurrent(context);
-    const scale = timelineExportScale(captured.width, captured.height);
+    const scale = timelineExportScale(
+      captured.width,
+      captured.height,
+      options.desiredScale,
+      options.maximumEdgePixels,
+      options.maximumPixels
+    );
     canvas.width = Math.max(1, Math.floor(captured.width * scale));
     canvas.height = Math.max(1, Math.floor(captured.height * scale));
     const drawing = canvas.getContext("2d");
