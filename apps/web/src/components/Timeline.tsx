@@ -101,8 +101,10 @@ import {
   hasNestedTimelineScrollerThatCanMoveDown,
   hasNestedTimelineScrollerThatCanMoveUp,
   isEditableTimelineKeyboardTarget,
+  isTimelineVerticalScrollbarPress,
   shouldRepinTimelineOnDownIntent,
   shouldRepinTimelineOnWheel,
+  shouldUnpinTimelineOnScrollbarDrag,
   shouldUnpinTimelineOnUpIntent,
   shouldUnpinTimelineOnWheel
 } from "./timeline-follow-intent.js";
@@ -305,10 +307,17 @@ export function Timeline({ ownerKey, sessionId, sessionName, workspaceId, onRead
   const navigationGenerationRef = useRef(0);
   const navigationFrameRef = useRef<number | undefined>(undefined);
   const viewportFrameRef = useRef<number | undefined>(undefined);
+  const scrollbarDragRef = useRef<{
+    readonly owner: { readonly ownerKey: string; readonly sessionId: string };
+    readonly node: HTMLDivElement;
+    readonly startScrollTop: number;
+    previousScrollTop: number;
+  } | undefined>(undefined);
   const navigationOwnerRef = useRef({ ownerKey, sessionId });
   if (navigationOwnerRef.current.ownerKey !== ownerKey || navigationOwnerRef.current.sessionId !== sessionId) {
     navigationOwnerRef.current = { ownerKey, sessionId };
     touchYRef.current = undefined;
+    scrollbarDragRef.current = undefined;
   }
   const focusRequestRef = useRef(focusRequest);
   focusRequestRef.current = focusRequest;
@@ -614,6 +623,8 @@ export function Timeline({ ownerKey, sessionId, sessionName, workspaceId, onRead
   const pinToLatest = useCallback((behavior: ScrollBehavior = "auto"): void => {
     const node = scrollRef.current;
     if (node === null) return;
+    const drag = scrollbarDragRef.current;
+    if (drag?.node === node && drag.owner === navigationOwnerRef.current) return;
     writeScrollTop(resolveTimelineResizeScrollTop({
       following: true,
       currentScrollTop: node.scrollTop,
@@ -622,6 +633,84 @@ export function Timeline({ ownerKey, sessionId, sessionName, workspaceId, onRead
       anchorOffsetDelta: 0
     }), behavior);
   }, [writeScrollTop]);
+
+  const observeScrollbarMovement = useCallback((node: HTMLDivElement): boolean => {
+    const drag = scrollbarDragRef.current;
+    if (drag === undefined || drag.node !== node || drag.owner !== navigationOwnerRef.current || !navigationDocumentActiveRef.current) return false;
+    const scrollDelta = node.scrollTop - drag.previousScrollTop;
+    drag.previousScrollTop = node.scrollTop;
+    previousScrollTopRef.current = node.scrollTop;
+    if (scrollDelta === 0) return true;
+    restoreAnchorRef.current = undefined;
+    const upwardDelta = scrollDelta < 0 ? Math.min(scrollDelta, node.scrollTop - drag.startScrollTop) : scrollDelta;
+    if (followingRef.current && shouldUnpinTimelineOnScrollbarDrag({ scrollDelta: upwardDelta }) && shouldUnpinTimelineOnUpIntent(node)) setTimelineFollowing(false);
+    const distanceFromEnd = node.scrollHeight - node.scrollTop - node.clientHeight;
+    const nextFollowing = scrollDelta > 0 && shouldRepinTimelineOnDownIntent({ distanceFromEnd })
+      || resolveTimelineFollowingOnScroll({ wasFollowing: followingRef.current, distanceFromEnd, scrollDelta });
+    if (nextFollowing !== followingRef.current) setTimelineFollowing(nextFollowing);
+    captureViewportAnchor();
+    saveViewport(nextFollowing, nextFollowing ? 0 : unreadCountRef.current);
+    return true;
+  }, [captureViewportAnchor, saveViewport, setTimelineFollowing]);
+
+  const timelineHasItems = items.length > 0;
+  useLayoutEffect(() => {
+    const node = scrollRef.current;
+    const view = node?.ownerDocument.defaultView;
+    if (node === null || view === null || view === undefined) return;
+    const document = node.ownerDocument;
+    const owner = navigationOwnerRef.current;
+    let active = true;
+    const isCurrent = (): boolean => active && navigationOwnerRef.current === owner && scrollRef.current === node;
+    const endScrollbarDrag = (resumePin = true): void => {
+      const drag = scrollbarDragRef.current;
+      if (!isCurrent() || drag?.owner !== owner || drag.node !== node) return;
+      if (resumePin) observeScrollbarMovement(node);
+      scrollbarDragRef.current = undefined;
+      if (resumePin && !document.hidden && followingRef.current) pinToLatest();
+    };
+    const onMouseDown = (event: MouseEvent): void => {
+      if (!isCurrent() || !navigationDocumentActiveRef.current || document.hidden || !isTimelineVerticalScrollbarPress({
+        button: event.button,
+        targetIsRoot: event.target === node,
+        offsetX: event.offsetX,
+        clientWidth: node.clientWidth,
+        scrollHeight: node.scrollHeight,
+        clientHeight: node.clientHeight
+      })) return;
+      cancelTimelineNavigation();
+      setFocusedItemId(undefined);
+      previousScrollTopRef.current = node.scrollTop;
+      scrollbarDragRef.current = { owner, node, startScrollTop: node.scrollTop, previousScrollTop: node.scrollTop };
+    };
+    const onMouseMove = (event: MouseEvent): void => {
+      if (!isCurrent()) return;
+      if ((event.buttons & 1) === 0) endScrollbarDrag();
+      else observeScrollbarMovement(node);
+    };
+    const onMouseUp = (event: MouseEvent): void => { if (event.button === 0) endScrollbarDrag(); };
+    const onCancel = (): void => { endScrollbarDrag(); };
+    const onVisibilityChange = (): void => { if (document.hidden) endScrollbarDrag(false); };
+    const onPageHide = (): void => { endScrollbarDrag(false); };
+    node.addEventListener("mousedown", onMouseDown);
+    view.addEventListener("mousemove", onMouseMove);
+    view.addEventListener("mouseup", onMouseUp);
+    view.addEventListener("pointercancel", onCancel);
+    view.addEventListener("blur", onCancel);
+    view.addEventListener("pagehide", onPageHide);
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    return () => {
+      active = false;
+      node.removeEventListener("mousedown", onMouseDown);
+      view.removeEventListener("mousemove", onMouseMove);
+      view.removeEventListener("mouseup", onMouseUp);
+      view.removeEventListener("pointercancel", onCancel);
+      view.removeEventListener("blur", onCancel);
+      view.removeEventListener("pagehide", onPageHide);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+      if (scrollbarDragRef.current?.owner === owner && scrollbarDragRef.current.node === node) scrollbarDragRef.current = undefined;
+    };
+  }, [cancelTimelineNavigation, observeScrollbarMovement, ownerKey, pinToLatest, sessionId, timelineHasItems]);
 
   useLayoutEffect(() => {
     if (!following || items.length === 0) return;
@@ -646,7 +735,7 @@ export function Timeline({ ownerKey, sessionId, sessionName, workspaceId, onRead
   useLayoutEffect(() => {
     const desired = restoreAnchorRef.current;
     const node = scrollRef.current;
-    if (desired === undefined || node === null || items.length === 0) return;
+    if (desired === undefined || node === null || items.length === 0 || scrollbarDragRef.current !== undefined) return;
     const index = findTimelineRenderItemIndex(renderItems, desired.itemId);
     if (index < 0) {
       restoreAnchorRef.current = undefined;
@@ -715,13 +804,15 @@ export function Timeline({ ownerKey, sessionId, sessionName, workspaceId, onRead
     const content = contentRef.current;
     if (content === null || typeof ResizeObserver === "undefined") return;
     const owner = navigationOwnerRef.current;
+    let active = true;
     let frame: number | undefined;
     const observer = new ResizeObserver(() => {
+      if (!active || navigationOwnerRef.current !== owner || scrollbarDragRef.current !== undefined) return;
       if (frame !== undefined) cancelAnimationFrame(frame);
       const generation = navigationGenerationRef.current;
       frame = requestAnimationFrame(() => {
         frame = undefined;
-        if (!navigationDocumentActiveRef.current || navigationOwnerRef.current !== owner || navigationGenerationRef.current !== generation) return;
+        if (!active || !navigationDocumentActiveRef.current || navigationOwnerRef.current !== owner || navigationGenerationRef.current !== generation || scrollbarDragRef.current !== undefined) return;
         const node = scrollRef.current;
         if (node === null) return;
         const anchor = viewportAnchorRef.current;
@@ -751,6 +842,7 @@ export function Timeline({ ownerKey, sessionId, sessionName, workspaceId, onRead
     observer.observe(content);
     for (const row of content.querySelectorAll<HTMLElement>("[data-timeline-item-id]")) observer.observe(row);
     return () => {
+      active = false;
       if (frame !== undefined) cancelAnimationFrame(frame);
       observer.disconnect();
     };
@@ -780,6 +872,10 @@ export function Timeline({ ownerKey, sessionId, sessionName, workspaceId, onRead
     const currentScrollTop = node.scrollTop;
     const nextNearHistoryStart = currentScrollTop <= 56;
     setNearHistoryStart((current) => current === nextNearHistoryStart ? current : nextNearHistoryStart);
+    if (observeScrollbarMovement(node)) {
+      if (historyError === undefined && shouldLoadEarlierTimeline({ scrollTop: currentScrollTop, hasEarlier, loading: historyLoading })) requestEarlier();
+      return;
+    }
     const scrollDelta = currentScrollTop - previousScrollTopRef.current;
     previousScrollTopRef.current = currentScrollTop;
     if (performance.now() < programmaticScrollUntilRef.current) {

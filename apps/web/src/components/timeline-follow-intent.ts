@@ -33,6 +33,37 @@ export function shouldUnpinTimelineOnUpIntent({
   return scrollHeight - clientHeight > TIMELINE_UNPIN_SCROLLABLE_TOLERANCE_PX;
 }
 
+export function isTimelineVerticalScrollbarPress({
+  button,
+  targetIsRoot,
+  offsetX,
+  clientWidth,
+  scrollHeight,
+  clientHeight
+}: {
+  readonly button: number;
+  readonly targetIsRoot: boolean;
+  readonly offsetX: number;
+  readonly clientWidth: number;
+  readonly scrollHeight: number;
+  readonly clientHeight: number;
+}): boolean {
+  return button === 0
+    && targetIsRoot
+    && offsetX >= clientWidth
+    && shouldUnpinTimelineOnUpIntent({ scrollHeight, clientHeight });
+}
+
+export function shouldUnpinTimelineOnScrollbarDrag({
+  scrollDelta,
+  directionDeadZone = 1
+}: {
+  readonly scrollDelta: number;
+  readonly directionDeadZone?: number;
+}): boolean {
+  return scrollDelta < -directionDeadZone;
+}
+
 export function shouldRepinTimelineOnWheel({
   deltaX,
   deltaY,
