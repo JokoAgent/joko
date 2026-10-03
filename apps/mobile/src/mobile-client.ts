@@ -1,4 +1,4 @@
-import { create } from "@bufbuild/protobuf";
+import { clone, create } from "@bufbuild/protobuf";
 import { Code } from "@connectrpc/connect";
 import {
   ArchiveSessionMutationSchema, BlobDisposition, BlobRefSchema, CancelQueueItemMutationSchema, CapabilitySupport, CompactSessionMutationSchema, CompactSessionOutcome,
@@ -19,11 +19,13 @@ import {
   SessionState, SetQueueInteractionLockMutationSchema, SetQueueItemEditLockMutationSchema, SetScheduleEnabledMutationSchema, SetSessionModelMutationSchema,
   SetSessionPermissionMutationSchema, SetSessionPlanModeMutationSchema, TargetState, capabilityNames,
   StartReviewMutationSchema, TriggerScheduleMutationSchema, UpdateScheduleMutationSchema,
+  UpdateVoiceInputServiceSettingsMutationSchema, VoiceInputServiceSettingsPatchSchema,
   FileKind,
   type Artifact, type BackendDescriptor, type BlobRef, type DiscoveredNodeRecord, type Event, type EventCursor, type FilePreview, type FileRevision, type Interaction,
   type Operation, type OperationMutation, type QueueControl, type QueueItem, type Schedule, type Session, type Snapshot, type Target,
   type WorkspaceEntry, type WorkspaceSearchMatch
 } from "@joko/contracts";
+import { mobileVoiceCredentialBindingChanged, type MobileVoiceSettingsTransport } from "./mobile-voice-service-settings";
 import {
   MobileCredentialStorageError, profileFromCredential,
   type MobileConnectionProfile, type MobileStorage, type PendingOperation
@@ -219,6 +221,9 @@ import {
   type MobileRemoteAppCommandInvocation
 } from "./mobile-app-commands";
 import type { MobileVoiceTransport } from "./mobile-voice-input";
+import type { MobileVoiceDictionaryTransport } from "./mobile-voice-dictionary-service";
+import { mobileReadOnlyDictionaryScope, type MobileReadOnlyDictionaryTransport } from "./mobile-voice-dictionary-readonly";
+import type { MobileVoiceDictionaryReadOnlyCache } from "./mobile-voice-dictionary-readonly-cache";
 import {
   assertMobileNativeTreeNavigation,
   projectMobileNativeTree,
@@ -658,7 +663,8 @@ export class MobileClient {
     private readonly pdfPreviewFiles?: MobilePdfPreviewFiles,
     private readonly modelPreviewFiles?: MobileModelPreviewFiles,
     private readonly fileShare?: Pick<MobileFileShare, "perform">,
-    private readonly offlineCache?: Pick<MobileOfflineCache, "load" | "save" | "clear">
+    private readonly offlineCache?: Pick<MobileOfflineCache, "load" | "save" | "clear">,
+    private readonly readOnlyDictionaryCache?: Pick<MobileVoiceDictionaryReadOnlyCache, "clear">
   ) {}
 
   get state(): MobileState { return this.#state; }
@@ -1321,9 +1327,10 @@ export class MobileClient {
   }
 
   async #clearOfflineCache(profileId: string): Promise<string | undefined> {
-    if (!this.offlineCache) return undefined;
     try {
-      await this.offlineCache.clear(profileId);
+      const results = await Promise.allSettled([this.offlineCache?.clear(profileId), this.readOnlyDictionaryCache?.clear(profileId)]);
+      const failed = results.find((result) => result.status === "rejected");
+      if (failed?.status === "rejected") throw failed.reason;
       return undefined;
     } catch (error) {
       return `The saved offline content could not be cleared: ${message(error)}`;
@@ -6139,6 +6146,226 @@ export class MobileClient {
     }
   }
 
+  async voiceDictionaryReadOnlyTransport(profileId: string, signal: AbortSignal): Promise<MobileReadOnlyDictionaryTransport> {
+    const profile = this.#profiles.find((candidate) => candidate.profileId === profileId);
+    if (!profile) throw new Error("The saved dictionary source is no longer available.");
+    const scope = mobileReadOnlyDictionaryScope(profile);
+    const connectionEpoch = this.#connectionAttemptEpoch;
+    let retired = false;
+    const isCurrent = (): boolean => !retired && !signal.aborted && !this.#disposed && this.#foreground
+      && this.#connectionAttemptEpoch === connectionEpoch
+      && this.#profiles.some((candidate) => mobileReadOnlyDictionaryScope(candidate) === scope)
+      && !this.#state.saved.some((candidate) => candidate.profileId === profileId
+        && ["missing", "unreadable", "identity-conflict"].includes(candidate.credentialState));
+    const assertCurrent = (): void => { if (!isCurrent()) throw new Error("The read-only dictionary source changed or was cancelled."); };
+    const owned = async <T>(caller: AbortSignal | undefined, effect: (request: AbortSignal) => Promise<T>): Promise<T> => {
+      const request = new AbortController();
+      const cancel = (): void => request.abort();
+      assertCurrent();
+      if (caller?.aborted) cancel(); else caller?.addEventListener("abort", cancel, { once: true });
+      signal.addEventListener("abort", cancel, { once: true });
+      const unsubscribe = this.subscribe(() => { if (!isCurrent()) { retired = true; cancel(); } });
+      try { request.signal.throwIfAborted(); const value = await effect(request.signal); request.signal.throwIfAborted(); assertCurrent(); return value; }
+      finally { cancel(); unsubscribe(); signal.removeEventListener("abort", cancel); caller?.removeEventListener("abort", cancel); }
+    };
+    const invalidate = async (error: unknown): Promise<void> => {
+      if (!isCurrent() || (!isRevoked(error) && !(error instanceof CredentialIdentityError))) return;
+      if (this.#activeProfileId === profileId && this.#credential) {
+        if (isRevoked(error)) await this.#invalidateCredential(this.#epoch, profileId, "The dictionary source connection was revoked.");
+        else await this.#identityConflict(this.#epoch, profileId, "The saved dictionary source identity changed.");
+        return;
+      }
+      const cleanup = await this.#clearOfflineCache(profileId);
+      if (!isCurrent()) return;
+      let credentialFailure: string | undefined;
+      if (isRevoked(error)) {
+        try { await this.storage.deleteCredential(profileId); }
+        catch { credentialFailure = "The retired dictionary credential could not be cleared."; }
+      }
+      if (!isCurrent()) return;
+      const detail = ["The saved dictionary source must be paired again.", cleanup, credentialFailure].filter(Boolean).join(" ");
+      this.#set({ saved: this.#savedViews(profileId, isRevoked(error) ? credentialFailure ? "unavailable" : "missing" : "identity-conflict", detail) });
+      retired = true;
+    };
+    let node: NodeIdentity;
+    let credential: PairedCredential;
+    let generation: bigint;
+    try {
+      const proven = await owned(signal, async (request) => {
+        const observed = await this.network.inspect(profile.origin, request);
+        assertCurrent();
+        if (observed.serverId !== profile.serverId) throw new CredentialIdentityError();
+        const saved = await this.storage.loadCredential(profileId);
+        request.throwIfAborted(); assertCurrent();
+        if (!saved || !credentialMatchesProfile(saved, profile)) throw new CredentialIdentityError();
+        const owner = await this.network.readOwner(saved, request);
+        assertCurrent(); this.#assertOwner(saved, owner, observed);
+        if (owner.snapshot.connections.filter((item) => item.connectionId === saved.connectionId).length !== 1
+          || owner.snapshot.devices.filter((item) => item.deviceId === saved.deviceId).length !== 1
+          || !owner.device.connectionIds.includes(saved.connectionId)
+          || !owner.snapshot.devices.find((item) => item.deviceId === saved.deviceId)!.connectionIds.includes(saved.connectionId)
+          || owner.snapshot.generation < 1n) throw new CredentialIdentityError();
+        return { node: observed, credential: Object.freeze({ profileId: saved.profileId, origin: saved.origin,
+          serverId: saved.serverId, connectionId: saved.connectionId, deviceId: saved.deviceId,
+          displayName: saved.displayName, authKey: saved.authKey }), generation: owner.snapshot.generation };
+      });
+      ({ node, credential, generation } = proven);
+    } catch (error) { await invalidate(error); throw error; }
+    const subscribe = this.subscribe.bind(this);
+    const network = this.network;
+    const recheck = async (request: AbortSignal): Promise<void> => {
+      const owner = await network.readOwner(credential, request);
+      assertCurrent(); this.#assertOwner(credential, owner, node);
+      if (owner.snapshot.generation !== generation) throw new Error("The dictionary source generation changed. Refresh to revalidate it.");
+    };
+    return {
+      profile: { profileId: profile.profileId, origin: profile.origin, serverId: profile.serverId,
+        connectionId: profile.connectionId, deviceId: profile.deviceId, displayName: node.displayName },
+      ownerKey: `${scope}\u001f${generation}\u001f${connectionEpoch}\u001fread-only-dictionary`, isCurrent,
+      getVoiceInputDictionaryReadOnly: async (caller) => {
+        try { return await owned(caller, (request) => network.getVoiceInputDictionaryReadOnly(credential, request)); }
+        catch (error) { await invalidate(error); throw error; }
+      },
+      watchVoiceInputDictionaryReadOnly: (caller) => (async function* () {
+        const request = new AbortController();
+        const cancel = (): void => request.abort();
+        assertCurrent();
+        if (caller.aborted) cancel(); else caller.addEventListener("abort", cancel, { once: true });
+        signal.addEventListener("abort", cancel, { once: true });
+        const unsubscribe = subscribe(() => { if (!isCurrent()) { retired = true; cancel(); } });
+        try {
+          for await (const value of network.watchVoiceInputDictionaryReadOnly(credential, request.signal)) {
+            request.signal.throwIfAborted(); assertCurrent(); yield value;
+          }
+          request.signal.throwIfAborted(); assertCurrent();
+          // A revoked idle Watch may close normally. Prove its original owner before retaining a cache.
+          await recheck(request.signal);
+          throw new Error("The read-only dictionary stream ended.");
+        } catch (error) { await invalidate(error); throw error; }
+        finally { cancel(); unsubscribe(); caller.removeEventListener("abort", cancel); signal.removeEventListener("abort", cancel); }
+      })()
+    };
+  }
+
+  voiceInputSettingsTransport(): MobileVoiceSettingsTransport | undefined {
+    const credential = this.#credential;
+    const authorityKey = this.#automationOwnerKey();
+    if (!credential || !authorityKey || this.#disposed) return undefined;
+    const connectionEpoch = this.#connectionAttemptEpoch;
+    let retired = false;
+    const isCurrent = (): boolean => !retired && !this.#disposed && this.#credential === credential
+      && this.#connectionAttemptEpoch === connectionEpoch && this.#automationOwnerKey() === authorityKey;
+    const owned = async <T>(signal: AbortSignal | undefined, effect: (current: AbortSignal) => Promise<T>): Promise<T> => {
+      const request = new AbortController();
+      const cancel = (): void => request.abort();
+      const assertCurrent = (): void => {
+        if (request.signal.aborted || signal?.aborted || !isCurrent()) throw new Error("Voice service authority changed or the request was cancelled.");
+      };
+      signal?.addEventListener("abort", cancel, { once: true });
+      const unsubscribe = this.subscribe(() => { if (!isCurrent()) { retired = true; request.abort(); } });
+      try { assertCurrent(); const result = await effect(request.signal); assertCurrent(); return result; }
+      finally { request.abort(); unsubscribe(); signal?.removeEventListener("abort", cancel); }
+    };
+    const hasPending = (): boolean => this.#state.pending.some((receipt) => receipt.kind === "voice-settings" && receipt.connectionId === credential.connectionId);
+    return {
+      ownerKey: `${authorityKey}\u001f${connectionEpoch}\u001fvoice-settings`, isCurrent, hasPending,
+      get: (signal) => owned(signal, (current) => this.network.getVoiceInputServiceSettings(credential, current)),
+      getCapabilities: (signal) => owned(signal, (current) => this.network.getVoiceInputCapabilities(credential, current)),
+      test: (signal) => owned(signal, (current) => this.network.testVoiceInputConnection(credential, current)),
+      reconcile: (signal) => owned(signal, async (current) => { current.throwIfAborted(); await this.reconcile(); }),
+      save: (source, secrets, signal) => owned(signal, async (current) => {
+        if (hasPending()) throw new Error("Check the existing voice settings operation receipt before saving again.");
+        const action = this.#claimMutation();
+        const patch = clone(VoiceInputServiceSettingsPatchSchema, source);
+        try {
+          const before = await this.network.getVoiceInputServiceSettings(credential, current);
+          current.throwIfAborted();
+          if (!isCurrent()) throw new Error("Voice service authority changed.");
+          if (patch.expectedRevision?.value !== before.version?.revision?.value) throw new Error("Voice service configuration changed. Refresh and review your draft.");
+          for (const fallback of [false, true]) {
+            const secret = fallback ? secrets?.fallback : secrets?.primary;
+            const clear = fallback ? patch.clearFallbackCredential : patch.clearCredential;
+            const configured = fallback ? before.fallbackCredentialConfigured : before.credentialConfigured;
+            if (configured && mobileVoiceCredentialBindingChanged(before, patch, fallback) && !secret && clear !== true) {
+              throw new Error("Replace or clear the credential when its protocol, origin, authentication or APP ID changes.");
+            }
+            if (secret !== undefined && secret !== "") {
+              const ticket = await this.network.uploadVoiceInputSecret(credential, secret, fallback, current);
+              current.throwIfAborted();
+              if (!isCurrent()) throw new Error("Voice service authority changed.");
+              if (fallback) patch.fallbackCredentialUploadTicketId = ticket;
+              else patch.credentialUploadTicketId = ticket;
+            }
+          }
+          const result = await this.#submitTerminal(create(OperationMutationSchema, {
+            payload: { case: "updateVoiceInputServiceSettings", value: create(UpdateVoiceInputServiceSettingsMutationSchema, { patch }) }
+          }), { kind: "voice-settings" }, undefined, true, false, { signal: current, isCurrent });
+          current.throwIfAborted();
+          if (!result.definitive) throw new Error("The voice settings result is unknown. Check the existing operation receipt; it was not resent.");
+          if (!result.accepted) throw new Error("The voice service rejected the configuration. Refresh and review your draft.");
+          return this.network.getVoiceInputServiceSettings(credential, current);
+        } finally { this.#releaseMutation(action); }
+      })
+    };
+  }
+
+  voiceDictionaryTransport(): MobileVoiceDictionaryTransport | undefined {
+    const credential = this.#credential;
+    const authorityKey = this.#automationOwnerKey();
+    if (!credential || !authorityKey || this.#disposed) return undefined;
+    const connectionEpoch = this.#connectionAttemptEpoch;
+    const ownerKey = `${authorityKey}\u001f${connectionEpoch}\u001fvoice-dictionary`;
+    let retired = false;
+    const isCurrent = (): boolean => !retired && !this.#disposed && this.#credential === credential
+      && this.#connectionAttemptEpoch === connectionEpoch && this.#automationOwnerKey() === authorityKey;
+    const owned = async <T>(signal: AbortSignal | undefined, effect: () => Promise<T>): Promise<T> => {
+      const assertCurrent = (): void => {
+        if (signal?.aborted || !isCurrent()) throw new Error("Voice dictionary authority changed or the request was cancelled.");
+      };
+      assertCurrent();
+      const unsubscribe = this.subscribe(() => { if (!isCurrent()) retired = true; });
+      try {
+        const result = await effect();
+        assertCurrent();
+        return result;
+      } finally { unsubscribe(); }
+    };
+    const subscribe = this.subscribe.bind(this);
+    const ownedStream = <T>(signal: AbortSignal, effect: (signal: AbortSignal) => AsyncIterable<T>): AsyncIterable<T> => (async function* () {
+      const request = new AbortController();
+      const cancel = (): void => request.abort();
+      const assertCurrent = (): void => {
+        if (signal.aborted || request.signal.aborted || !isCurrent()) throw new Error("Voice dictionary authority changed or the request was cancelled.");
+      };
+      assertCurrent();
+      signal.addEventListener("abort", cancel, { once: true });
+      const unsubscribe = subscribe(() => { if (!isCurrent()) { retired = true; request.abort(); } });
+      try {
+        for await (const value of effect(request.signal)) { assertCurrent(); yield value; }
+        assertCurrent();
+      } finally { request.abort(); unsubscribe(); signal.removeEventListener("abort", cancel); }
+    })();
+    return {
+      ownerKey, isCurrent,
+      getVoiceInputDictionary: (signal) => owned(signal, () => this.network.getVoiceInputDictionary(credential, signal)),
+      watchVoiceInputDictionary: (signal) => ownedStream(signal, (current) => this.network.watchVoiceInputDictionary(credential, current)),
+      getVoiceInputDictionaryPeerStatus: (signal) => owned(signal, () => this.network.getVoiceInputDictionaryPeerStatus(credential, signal)),
+      watchVoiceInputDictionaryPeerStatus: (signal) => ownedStream(signal, (current) => this.network.watchVoiceInputDictionaryPeerStatus(credential, current)),
+      grantVoiceInputDictionaryPeer: (revision, id, fingerprint, signal) => owned(signal, () => this.network.grantVoiceInputDictionaryPeer(credential, revision, id, fingerprint, signal)),
+      revokeVoiceInputDictionaryPeer: (id, revision, signal) => owned(signal, () => this.network.revokeVoiceInputDictionaryPeer(credential, id, revision, signal)),
+      syncVoiceInputDictionaryNow: (revision, id, signal) => owned(signal, () => this.network.syncVoiceInputDictionaryNow(credential, revision, id, signal)),
+      configureVoiceInputDictionaryListener: (revision, listener, signal) => owned(signal, () => this.network.configureVoiceInputDictionaryListener(credential, revision, listener, signal)),
+      getVoiceInputDictionaryPeerInvitation: (signal) => owned(signal, () => this.network.getVoiceInputDictionaryPeerInvitation(credential, signal)),
+      grantVoiceInputDictionaryDirectPeer: (revision, invitation, fingerprint, signal) => owned(signal, () => this.network.grantVoiceInputDictionaryDirectPeer(credential, revision, invitation, fingerprint, signal)),
+      clearVoiceInputDictionaryPeerRoute: (revision, id, signal) => owned(signal, () => this.network.clearVoiceInputDictionaryPeerRoute(credential, revision, id, signal)),
+      setVoiceInputDictionarySyncEnabled: (revision, enabled, signal) => owned(signal, () => this.network.setVoiceInputDictionarySyncEnabled(credential, revision, enabled, signal)),
+      addVoiceInputDictionaryTerms: (revision, terms, signal) => owned(signal, () => this.network.addVoiceInputDictionaryTerms(credential, revision, terms, signal)),
+      editVoiceInputDictionaryEntry: (revision, id, text, aliases, signal) => owned(signal, () => this.network.editVoiceInputDictionaryEntry(credential, revision, id, text, aliases, signal)),
+      deleteVoiceInputDictionaryEntry: (revision, id, signal) => owned(signal, () => this.network.deleteVoiceInputDictionaryEntry(credential, revision, id, signal)),
+      applyVoiceInputDictionaryLearning: (revision, actions, signal) => owned(signal, () => this.network.applyVoiceInputDictionaryLearning(credential, revision, actions, signal))
+    };
+  }
+
   taskVoiceTransport(): MobileVoiceTransport | undefined {
     const authorityKey = this.#taskAuthorityKey();
     const credential = this.#credential;
@@ -7367,10 +7594,15 @@ export class MobileClient {
       isCurrent,
       waitUntilCurrent,
       getCapabilities: (signal) => owned(() => this.network.getVoiceInputCapabilities(credential, signal)),
+      getVoiceInputDictionary: (signal) => owned(() => this.network.getVoiceInputDictionary(credential, signal)),
+      applyVoiceInputDictionaryLearning: (revision, actions, signal) => owned(() =>
+        this.network.applyVoiceInputDictionaryLearning(credential, revision, actions, signal)),
       adviseVoiceInputDictionaryEdit: (draft, signal) => owned(() =>
         this.network.adviseVoiceInputDictionaryEdit(credential, draft, signal)),
-      start: (requestId, mimeType, locale, refinement, signal) => owned(() =>
-        this.network.startVoiceInput(credential, requestId, mimeType, locale, refinement, signal)),
+      start: (requestId, mimeType, locale, refinement, signal, recognitionContext) => owned(() =>
+        recognitionContext === undefined
+          ? this.network.startVoiceInput(credential, requestId, mimeType, locale, refinement, signal)
+          : this.network.startVoiceInput(credential, requestId, mimeType, locale, refinement, signal, recognitionContext)),
       append: (voiceInputId, chunkSequence, audio, durationMs, voiced, signal) => owned(() =>
         this.network.appendVoiceAudio(
           credential,
@@ -9101,9 +9333,10 @@ export class MobileClient {
     identity: Pick<PendingOperation, "kind" | "sessionId" | "eventId" | "queueItemId" | "interactionId" | "interactionGeneration" | "interactionRevision" | "interactionDraftKind" | "targetConnectionId" | "targetDeviceId" | "scheduleId" | "triggerId" | "targetId">,
     operationId?: string,
     markBusy = true,
-    refreshAfter = true
+    refreshAfter = true,
+    authority?: { readonly signal: AbortSignal; readonly isCurrent: () => boolean }
   ): Promise<TrackedMutationResult> {
-    return this.#submitTracked(mutation, identity, true, operationId, markBusy, refreshAfter);
+    return this.#submitTracked(mutation, identity, true, operationId, markBusy, refreshAfter, authority);
   }
 
   async #submitTracked(
@@ -9112,8 +9345,11 @@ export class MobileClient {
     waitForTerminal: boolean,
     operationId = this.newId(),
     markBusy = true,
-    refreshAfter = true
+    refreshAfter = true,
+    authority?: { readonly signal: AbortSignal; readonly isCurrent: () => boolean }
   ): Promise<TrackedMutationResult> {
+    const requestCurrent = (): boolean => authority === undefined || !authority.signal.aborted && authority.isCurrent();
+    if (!requestCurrent()) return { accepted: false, definitive: false };
     const credential = this.#ready();
     const epoch = this.#epoch;
     const pending: PendingOperation = { ...identity, connectionId: credential.connectionId, operationId, state: "unknown" };
@@ -9127,13 +9363,16 @@ export class MobileClient {
       throw error;
     }
     let operation: Operation;
+    if (!requestCurrent()) return { accepted: false, definitive: false };
+    const operationSignal = authority === undefined ? this.#abort?.signal
+      : this.#abort === undefined ? authority.signal : AbortSignal.any([this.#abort.signal, authority.signal]);
     try {
-      operation = await this.network.submit(credential, pending.operationId, mutation, this.#abort?.signal);
+      operation = await this.network.submit(credential, pending.operationId, mutation, operationSignal);
     } catch (error) {
       if (this.#current(epoch)) this.#set({ ...(markBusy ? { busy: false } : {}), error: `Operation ${pending.operationId}: ${message(error)}. Check status; it was not resent.` });
       return { accepted: false, definitive: false };
     }
-    if (!this.#current(epoch)) return { accepted: false, definitive: false };
+    if (!this.#current(epoch) || !requestCurrent()) return { accepted: false, definitive: false };
     if (operation.operationId !== pending.operationId || operation.connectionId !== pending.connectionId) {
       this.#set({ ...(markBusy ? { busy: false } : {}), error: `Operation ${pending.operationId} returned with the wrong durable identity. Its receipt was retained and no input was resent.` });
       return { accepted: false, definitive: false };
@@ -9141,7 +9380,7 @@ export class MobileClient {
     await this.#receipt(operation, pending, epoch);
     if (waitForTerminal && !isTerminal(operation.state)) {
       try {
-        operation = await this.network.waitOperation(credential, pending.operationId, this.#abort?.signal);
+        operation = await this.network.waitOperation(credential, pending.operationId, operationSignal);
       } catch (error) {
         if (this.#current(epoch)) this.#set({
           ...(markBusy ? { busy: false } : {}),
@@ -9149,7 +9388,7 @@ export class MobileClient {
         });
         return { accepted: false, definitive: false };
       }
-      if (!this.#current(epoch)) return { accepted: false, definitive: false };
+      if (!this.#current(epoch) || !requestCurrent()) return { accepted: false, definitive: false };
       if (operation.operationId !== pending.operationId || operation.connectionId !== pending.connectionId) {
         this.#set({ ...(markBusy ? { busy: false } : {}), error: `Operation ${pending.operationId} completed with the wrong durable identity. Its receipt was retained and no input was resent.` });
         return { accepted: false, definitive: false };

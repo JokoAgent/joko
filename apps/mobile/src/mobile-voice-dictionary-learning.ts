@@ -3,7 +3,8 @@ import {
   type MobileVoiceDictionaryAdviceDraft,
   type MobileVoiceDictionaryLearningAction
 } from "./mobile-voice-dictionary";
-import type { MobileVoiceDictionaryStore } from "./mobile-voice-dictionary-store";
+import type { MobileVoicePreferencesStore } from "./mobile-voice-preferences-store";
+import type { MobileVoiceDictionaryApi } from "./mobile-voice-dictionary-service";
 
 export const MOBILE_VOICE_DICTIONARY_LEARNING_DELAY_MS = 1_200;
 
@@ -20,7 +21,7 @@ export interface MobileVoiceInsertedEditTracker {
   readonly expectedText: string;
   readonly prefixText: string;
   readonly suffixText: string;
-  readonly dictionaryRevision: number;
+  readonly preferencesRevision: number;
 }
 
 export type MobileVoiceInsertedEditInspection =
@@ -36,7 +37,8 @@ export type MobileVoiceInsertedEditInspection =
       | "empty" | "punctuationOnly" | "tooLong" | "broadRewrite";
   };
 
-export interface MobileVoiceDictionaryAdvisor {
+export interface MobileVoiceDictionaryAdvisor extends Pick<MobileVoiceDictionaryApi, "getVoiceInputDictionary" | "applyVoiceInputDictionaryLearning"> {
+  isCurrent(): boolean;
   adviseVoiceInputDictionaryEdit(
     draft: MobileVoiceDictionaryAdviceDraft,
     signal?: AbortSignal
@@ -45,6 +47,7 @@ export interface MobileVoiceDictionaryAdvisor {
 
 interface PendingEdit {
   readonly tracker: MobileVoiceInsertedEditTracker;
+  readonly advisor: MobileVoiceDictionaryAdvisor;
   timer?: ReturnType<typeof setTimeout>;
   request?: AbortController;
   evidenceKey?: string;
@@ -59,7 +62,7 @@ export function createMobileVoiceInsertedEditTracker(input: {
   readonly insertedText: string;
   readonly beforeText: string;
   readonly rawTranscriptText?: string;
-  readonly dictionaryRevision: number;
+  readonly preferencesRevision: number;
 }): MobileVoiceInsertedEditTracker | undefined {
   if (input.start < 0 || input.end < input.start || input.end > input.draft.length
     || input.draft.slice(input.start, input.end) !== input.insertedText) return undefined;
@@ -77,7 +80,7 @@ export function createMobileVoiceInsertedEditTracker(input: {
     expectedText: input.draft,
     prefixText: prefix,
     suffixText: suffix,
-    dictionaryRevision: input.dictionaryRevision
+    preferencesRevision: input.preferencesRevision
   });
 }
 
@@ -103,7 +106,7 @@ export class MobileVoiceDictionaryLearningController {
   #pending?: PendingEdit;
 
   constructor(private readonly options: {
-    readonly store: Pick<MobileVoiceDictionaryStore, "snapshot" | "applyAdvice">;
+    readonly store: Pick<MobileVoicePreferencesStore, "snapshot" | "recordDictionaryChange">;
     readonly readAdvisor: () => MobileVoiceDictionaryAdvisor | undefined;
     readonly readOwnerKey: () => string | undefined;
     readonly readLocale: () => string | undefined;
@@ -116,11 +119,13 @@ export class MobileVoiceDictionaryLearningController {
   track(tracker: MobileVoiceInsertedEditTracker): void {
     this.clear();
     const state = this.options.store.snapshot;
+    const advisor = this.options.readAdvisor();
     if (state.status !== "ready" || !state.document.autoLearningEnabled
+      || !advisor?.isCurrent()
       || tracker.ownerKey !== this.options.readOwnerKey()
       || tracker.locale !== this.options.readLocale()
-      || tracker.dictionaryRevision !== state.document.dictionaryRevision) return;
-    this.#pending = { tracker };
+      || tracker.preferencesRevision !== state.document.preferencesRevision) return;
+    this.#pending = { tracker, advisor };
   }
 
   observe(nextText: string, isComposing = false): void {
@@ -143,24 +148,24 @@ export class MobileVoiceDictionaryLearningController {
     pending.timer = setTimer(() => {
       if (!this.#evidenceCurrent(pending, evidenceKey)) return;
       pending.timer = undefined;
-      const advisor = this.options.readAdvisor();
-      const state = this.options.store.snapshot;
-      if (!advisor || state.status !== "ready") { this.clear(); return; }
       const request = new AbortController();
       pending.request = request;
-      const draft = mobileVoiceDictionaryAdviceDraft(state.document.dictionary, {
-        beforeText: inspection.beforeText,
-        afterText: inspection.afterText,
-        ...(inspection.rawTranscriptText === undefined ? {} : { rawTranscriptText: inspection.rawTranscriptText }),
-        ...(pending.tracker.locale === undefined ? {} : { locale: pending.tracker.locale })
-      });
-      void advisor.adviseVoiceInputDictionaryEdit(draft, request.signal).then(async (advice) => {
-        if (request.signal.aborted || !this.#evidenceCurrent(pending, evidenceKey)) return;
-        await this.options.store.applyAdvice(
-          advice.actions,
-          pending.tracker.dictionaryRevision,
-          () => !request.signal.aborted && this.#evidenceCurrent(pending, evidenceKey)
-        );
+      const current = () => !request.signal.aborted && this.#evidenceCurrent(pending, evidenceKey);
+      const advisor = pending.advisor;
+      void advisor.getVoiceInputDictionary(request.signal).then(async (snapshot) => {
+        if (!current()) return;
+        const draft = mobileVoiceDictionaryAdviceDraft(snapshot.dictionary, {
+          beforeText: inspection.beforeText,
+          afterText: inspection.afterText,
+          ...(inspection.rawTranscriptText === undefined ? {} : { rawTranscriptText: inspection.rawTranscriptText }),
+          ...(pending.tracker.locale === undefined ? {} : { locale: pending.tracker.locale })
+        });
+        const advice = await advisor.adviseVoiceInputDictionaryEdit(draft, request.signal);
+        if (!current() || advice.actions.length === 0) return;
+        const committed = await advisor.applyVoiceInputDictionaryLearning(snapshot.revision, advice.actions, request.signal);
+        if (!current() || committed.revision === snapshot.revision) return;
+        await this.options.store.recordDictionaryChange("automaticLearning", advice.actions.map((action) => action.term), current)
+          .catch(() => undefined);
       }).catch(() => undefined).finally(() => {
         if (this.#pending === pending && pending.request === request) this.#pending = undefined;
       });
@@ -179,11 +184,12 @@ export class MobileVoiceDictionaryLearningController {
   #current(pending: PendingEdit): boolean {
     const state = this.options.store.snapshot;
     return this.#pending === pending
+      && pending.advisor.isCurrent()
       && pending.tracker.ownerKey === this.options.readOwnerKey()
       && pending.tracker.locale === this.options.readLocale()
       && state.status === "ready"
       && state.document.autoLearningEnabled
-      && state.document.dictionaryRevision === pending.tracker.dictionaryRevision;
+      && state.document.preferencesRevision === pending.tracker.preferencesRevision;
   }
 
   #evidenceCurrent(pending: PendingEdit, evidenceKey: string): boolean {

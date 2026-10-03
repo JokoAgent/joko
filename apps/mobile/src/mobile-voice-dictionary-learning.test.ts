@@ -1,20 +1,46 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
-  MobileVoiceDictionaryLearningController,
-  createMobileVoiceInsertedEditTracker,
-  inspectMobileVoiceInsertedEdit
+  MobileVoiceDictionaryLearningController, createMobileVoiceInsertedEditTracker, inspectMobileVoiceInsertedEdit,
+  type MobileVoiceDictionaryAdvisor
 } from "./mobile-voice-dictionary-learning";
-import { MobileVoiceDictionaryStore } from "./mobile-voice-dictionary-store";
-import type { MobileVoiceDictionaryLearningAction } from "./mobile-voice-dictionary";
+import { MobileVoicePreferencesStore } from "./mobile-voice-preferences-store";
+import { EMPTY_MOBILE_VOICE_DICTIONARY, type MobileVoiceDictionaryLearningAction } from "./mobile-voice-dictionary";
 
-function createStore() {
+const action: MobileVoiceDictionaryLearningAction = {
+  action: "addEntry", term: "VoiceKit", aliases: ["voice kit"], type: "productName", confidence: "high"
+};
+async function fixture() {
   let raw: string | null = null;
-  let id = 0;
-  const store = new MobileVoiceDictionaryStore({
-    getItem: async () => raw,
-    setItem: async (_key, value) => { raw = value; }
-  }, () => 100 + id, () => `id-${++id}`);
-  return store;
+  const store = new MobileVoicePreferencesStore({
+    getItem: async () => raw, setItem: async (_key, value) => { raw = value; }
+  }, () => 100, () => "history");
+  await store.hydrate();
+  let draft = "Use voice kit today.";
+  let owner = "owner";
+  let locale = "en";
+  let current = true;
+  const snapshot = {
+    revision: 7n, syncEnabled: true,
+    dictionary: { ...EMPTY_MOBILE_VOICE_DICTIONARY, entries: [{
+      id: "service-entry", text: "Existing", source: "manual" as const, frequency: 3, aliases: [], createdAt: 1, updatedAt: 1
+    }] }, refinementTerms: ["Existing"]
+  };
+  const advisor: MobileVoiceDictionaryAdvisor = {
+    isCurrent: () => current,
+    getVoiceInputDictionary: vi.fn(async () => snapshot),
+    adviseVoiceInputDictionaryEdit: vi.fn(async () => ({ actions: [action] })),
+    applyVoiceInputDictionaryLearning: vi.fn(async () => ({ ...snapshot, revision: 8n }))
+  };
+  const controller = new MobileVoiceDictionaryLearningController({
+    store, readAdvisor: () => advisor, readOwnerKey: () => owner, readLocale: () => locale, readDraftText: () => draft
+  });
+  controller.track(createMobileVoiceInsertedEditTracker({
+    ownerKey: owner, locale, draft, start: 4, end: 13, insertedText: "voice kit", beforeText: "voice kit",
+    rawTranscriptText: "voice kid", preferencesRevision: 0
+  })!);
+  const edit = (text: string) => { draft = text; controller.observe(text); };
+  return { store, advisor, controller, snapshot, edit,
+    changeOwner: () => { owner = "other"; }, changeLocale: () => { locale = "ja"; }, retire: () => { current = false; } };
 }
 
 beforeEach(() => vi.useFakeTimers());
@@ -24,7 +50,7 @@ describe("mobile voice dictionary learning", () => {
   it("extracts only an anchored correction and rejects punctuation-only or broad rewrites", () => {
     const tracker = createMobileVoiceInsertedEditTracker({
       ownerKey: "owner", locale: "en", draft: "Use voice kit today.", start: 4, end: 13,
-      insertedText: "voice kit", beforeText: "voice kit", rawTranscriptText: "voice kid", dictionaryRevision: 0
+      insertedText: "voice kit", beforeText: "voice kit", rawTranscriptText: "voice kid", preferencesRevision: 0
     })!;
     expect(inspectMobileVoiceInsertedEdit(tracker, "Use VoiceKit today.")).toEqual({
       edited: true, beforeText: "voice kit", afterText: "VoiceKit", rawTranscriptText: "voice kid"
@@ -35,7 +61,7 @@ describe("mobile voice dictionary learning", () => {
       .toEqual({ edited: false, reason: "surroundingChanged" });
     const repeated = createMobileVoiceInsertedEditTracker({
       ownerKey: "owner", draft: "voice kit then voice kit", start: 15, end: 24,
-      insertedText: "voice kit", beforeText: "voice kit", dictionaryRevision: 0
+      insertedText: "voice kit", beforeText: "voice kit", preferencesRevision: 0
     })!;
     expect(inspectMobileVoiceInsertedEdit(repeated, "voice kit then VoiceKit"))
       .toMatchObject({ edited: true, afterText: "VoiceKit" });
@@ -43,147 +69,71 @@ describe("mobile voice dictionary learning", () => {
     const whole = createMobileVoiceInsertedEditTracker({
       ownerKey: "owner", draft: wholeText, start: 0, end: wholeText.length,
       insertedText: wholeText,
-      beforeText: wholeText, dictionaryRevision: 0
+      beforeText: wholeText, preferencesRevision: 0
     })!;
     expect(inspectMobileVoiceInsertedEdit(whole, "an entirely unrelated replacement paragraph containing different language"))
       .toMatchObject({ edited: false, reason: "broadRewrite" });
   });
 
-  it("submits grounded evidence after the quiet window and persists accepted advice", async () => {
-    const store = createStore();
-    await store.hydrate();
-    let draft = "Use voice kit today.";
-    const advice = vi.fn(async () => ({ actions: [{
-      action: "addEntry", term: "VoiceKit", aliases: ["voice kit"], type: "productName", confidence: "high"
-    } satisfies MobileVoiceDictionaryLearningAction] }));
-    const controller = new MobileVoiceDictionaryLearningController({
-      store,
-      readAdvisor: () => ({ adviseVoiceInputDictionaryEdit: advice }),
-      readOwnerKey: () => "owner",
-      readLocale: () => "en",
-      readDraftText: () => draft
-    });
-    controller.track(createMobileVoiceInsertedEditTracker({
-      ownerKey: "owner", locale: "en", draft, start: 4, end: 13, insertedText: "voice kit",
-      beforeText: "voice kit", rawTranscriptText: "voice kid", dictionaryRevision: 0
-    })!);
-    draft = "Use VoiceKit today.";
-    controller.observe(draft);
+
+  it("reads the service projection, advises against it and submits the same revision before private history", async () => {
+    const f = await fixture();
+    f.edit("Use VoiceKit today.");
     await vi.advanceTimersByTimeAsync(1_200);
-    await vi.waitFor(() => expect(store.snapshot.document.dictionary.entries).toHaveLength(1));
-    expect(advice).toHaveBeenCalledWith(expect.objectContaining({
-      beforeText: "voice kit",
-      afterText: "VoiceKit",
-      rawTranscriptText: "voice kid",
-      locale: "en"
+    expect(f.advisor.adviseVoiceInputDictionaryEdit).toHaveBeenCalledWith(expect.objectContaining({
+      beforeText: "voice kit", afterText: "VoiceKit", rawTranscriptText: "voice kid", locale: "en",
+      existingEntries: [{ term: "Existing", source: "manual", frequency: 3, aliases: [] }]
     }), expect.any(AbortSignal));
-    expect(store.snapshot.document.usage.correctionObservations).toBe(1);
+    expect(f.advisor.applyVoiceInputDictionaryLearning).toHaveBeenCalledWith(7n, [action], expect.any(AbortSignal));
+    expect(f.store.snapshot.document).toMatchObject({
+      preferencesRevision: 0, history: [{ kind: "automaticLearning", terms: ["VoiceKit"] }], usage: { correctionObservations: 1 }
+    });
+    expect(f.store.snapshot.document).not.toHaveProperty("dictionary");
   });
 
-  it("ends observation after whole deletion so later text cannot become evidence", async () => {
-    const store = createStore();
-    await store.hydrate();
-    let draft = "voice kit";
-    const advice = vi.fn(async () => ({ actions: [] }));
-    const controller = new MobileVoiceDictionaryLearningController({
-      store,
-      readAdvisor: () => ({ adviseVoiceInputDictionaryEdit: advice }),
-      readOwnerKey: () => "owner",
-      readLocale: () => undefined,
-      readDraftText: () => draft
-    });
-    controller.track(createMobileVoiceInsertedEditTracker({
-      ownerKey: "owner", draft, start: 0, end: draft.length, insertedText: draft,
-      beforeText: draft, dictionaryRevision: 0
-    })!);
-    draft = "";
-    controller.observe(draft);
-    draft = "VoiceKit";
-    controller.observe(draft);
-    await vi.advanceTimersByTimeAsync(2_000);
-    expect(advice).not.toHaveBeenCalled();
-  });
+  it.each(["undo", "deletion", "surrounding", "owner", "locale", "preferences", "authority", "dispose"] as const)(
+    "does not let late advice submit after %s retires evidence", async (reason) => {
+      const f = await fixture();
+      let finish!: (value: { actions: readonly MobileVoiceDictionaryLearningAction[] }) => void;
+      vi.mocked(f.advisor.adviseVoiceInputDictionaryEdit).mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+      f.edit("Use VoiceKit today.");
+      await vi.advanceTimersByTimeAsync(1_200);
+      expect(f.advisor.adviseVoiceInputDictionaryEdit).toHaveBeenCalledOnce();
+      if (reason === "undo") f.edit("Use voice kit today.");
+      if (reason === "deletion") { f.edit("Use  today."); f.edit("Use VoiceKit today."); }
+      if (reason === "surrounding") f.edit("Later use VoiceKit today.");
+      if (reason === "owner") f.changeOwner();
+      if (reason === "locale") f.changeLocale();
+      if (reason === "preferences") await f.store.setAutoLearningEnabled(false);
+      if (reason === "authority") f.retire();
+      if (reason === "dispose") f.controller.dispose();
+      finish({ actions: [action] });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(f.advisor.applyVoiceInputDictionaryLearning).not.toHaveBeenCalled();
+      expect(f.store.snapshot.document.history).toEqual([]);
+    }
+  );
 
-  it("retires the observation when unrelated surrounding draft text changes", async () => {
-    const store = createStore();
-    await store.hydrate();
-    let draft = "before voice kit after";
-    const advice = vi.fn(async () => ({ actions: [] }));
-    const controller = new MobileVoiceDictionaryLearningController({
-      store,
-      readAdvisor: () => ({ adviseVoiceInputDictionaryEdit: advice }),
-      readOwnerKey: () => "owner",
-      readLocale: () => undefined,
-      readDraftText: () => draft
-    });
-    controller.track(createMobileVoiceInsertedEditTracker({
-      ownerKey: "owner", draft, start: 7, end: 16, insertedText: "voice kit",
-      beforeText: "voice kit", dictionaryRevision: 0
-    })!);
-    draft = "changed before voice kit after";
-    controller.observe(draft);
-    draft = "changed before VoiceKit after";
-    controller.observe(draft);
-    await vi.advanceTimersByTimeAsync(2_000);
-    expect(advice).not.toHaveBeenCalled();
-  });
-
-  it.each(["owner", "locale"] as const)("does not let late evidence cross a changed %s", async (change) => {
-    const store = createStore();
-    await store.hydrate();
-    let draft = "voice kit";
-    let owner = "owner";
-    let locale = "en";
-    const advice = vi.fn(async () => ({ actions: [] }));
-    const controller = new MobileVoiceDictionaryLearningController({
-      store,
-      readAdvisor: () => ({ adviseVoiceInputDictionaryEdit: advice }),
-      readOwnerKey: () => owner,
-      readLocale: () => locale,
-      readDraftText: () => draft
-    });
-    controller.track(createMobileVoiceInsertedEditTracker({
-      ownerKey: owner, locale, draft, start: 0, end: draft.length, insertedText: draft,
-      beforeText: draft, dictionaryRevision: 0
-    })!);
-    draft = "VoiceKit";
-    controller.observe(draft);
-    if (change === "owner") owner = "other";
-    else locale = "ja";
-    await vi.advanceTimersByTimeAsync(2_000);
-    expect(advice).not.toHaveBeenCalled();
-  });
-
-  it("aborts undone evidence and ignores a late advisor result", async () => {
-    const store = createStore();
-    await store.hydrate();
-    let draft = "voice kit";
-    let finish!: (value: { readonly actions: readonly MobileVoiceDictionaryLearningAction[] }) => void;
-    const advice = vi.fn((_input: unknown, _signal?: AbortSignal) => new Promise<{
-      readonly actions: readonly MobileVoiceDictionaryLearningAction[]
-    }>((resolve) => { finish = resolve; }));
-    const controller = new MobileVoiceDictionaryLearningController({
-      store,
-      readAdvisor: () => ({ adviseVoiceInputDictionaryEdit: advice }),
-      readOwnerKey: () => "owner",
-      readLocale: () => undefined,
-      readDraftText: () => draft
-    });
-    controller.track(createMobileVoiceInsertedEditTracker({
-      ownerKey: "owner", draft, start: 0, end: draft.length, insertedText: draft,
-      beforeText: draft, dictionaryRevision: 0
-    })!);
-    draft = "VoiceKit";
-    controller.observe(draft);
+  it("does not dispatch advice after a late snapshot loses its insertion evidence", async () => {
+    const f = await fixture();
+    let finish!: (value: typeof f.snapshot) => void;
+    vi.mocked(f.advisor.getVoiceInputDictionary).mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+    f.edit("Use VoiceKit today.");
     await vi.advanceTimersByTimeAsync(1_200);
-    expect(advice).toHaveBeenCalledOnce();
-    draft = "voice kit";
-    controller.observe(draft);
-    expect(advice.mock.calls[0]?.[1]?.aborted).toBe(true);
-    finish({ actions: [{
-      action: "addEntry", term: "VoiceKit", aliases: ["voice kit"], type: "productName", confidence: "high"
-    }] });
-    await Promise.resolve();
-    expect(store.snapshot.document.dictionary.entries).toEqual([]);
+    f.edit("Use voice kit today.");
+    finish(f.snapshot);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(f.advisor.adviseVoiceInputDictionaryEdit).not.toHaveBeenCalled();
+  });
+
+  it.each(["empty", "conflict"] as const)("records no learning for %s and does not retry a rejected CAS", async (result) => {
+    const f = await fixture();
+    if (result === "empty") vi.mocked(f.advisor.adviseVoiceInputDictionaryEdit).mockResolvedValueOnce({ actions: [] });
+    else vi.mocked(f.advisor.applyVoiceInputDictionaryLearning).mockRejectedValueOnce(new Error("revision conflict"));
+    f.edit("Use VoiceKit today.");
+    await vi.advanceTimersByTimeAsync(1_200);
+    expect(f.advisor.applyVoiceInputDictionaryLearning).toHaveBeenCalledTimes(result === "empty" ? 0 : 1);
+    expect(f.store.snapshot.document.history).toEqual([]);
+    expect(f.store.snapshot.document.usage.correctionObservations).toBe(0);
   });
 });

@@ -18,11 +18,33 @@ const capability: VoiceInputCapabilityView = {
     maximumConcurrentSessions: 1
   },
   supportsLocale: true,
+  supportedLocales: [], supportsRecognitionContext: true,
+  recognitionContextMaximumItems: 20, recognitionContextMaximumItemBytes: 2_048, recognitionContextMaximumBytes: 8_192,
   supportsLiveDrafts: true,
   supportsRefinement: true
 };
 
 describe("VoiceInputMediaSession", () => {
+  it("freezes authorized recognition text for each run and negotiates context and locale across configured routes", async () => {
+    const context = { contextData: [{ text: "  First\r\nSecond  " }] };
+    for (const supportsContext of [true, false]) {
+      const api = voiceApi();
+      api.getVoiceInputCapabilities = vi.fn(async () => ({ ...capability, supportsRecognitionContext: supportsContext, supportedLocales: ["en-US"] }));
+      api.startVoiceInput = vi.fn(async () => voiceSession());
+      const track = new FakeTrack();
+      const media = new VoiceInputMediaSession({ ownerWindow: window, api,
+        mediaDevices: { getUserMedia: vi.fn(async () => fakeStream(track)) }, mediaRecorder: FakeMediaRecorder as unknown as typeof MediaRecorder,
+        preferences: { locale: "en", recognitionContext: context, refinementInstructions: "Cleanup only", playInteractionSound: false } });
+      context.contextData[0]!.text = "Later local edit";
+      await media.start();
+      expect(api.startVoiceInput).toHaveBeenCalledWith(expect.any(String), "audio/webm", "en-US", { instructions: "Cleanup only" }, expect.any(AbortSignal),
+        supportsContext ? { contextData: [{ text: "First\nSecond" }] } : undefined);
+      expect(media.currentSession).not.toHaveProperty("recognitionContext");
+      await media.cancel();
+      expect(track.stop).toHaveBeenCalledOnce();
+      context.contextData[0]!.text = "  First\r\nSecond  ";
+    }
+  });
   it("does not append a buffered recorder chunk after the capture has failed", async () => {
     const api = voiceApi(); api.getVoiceInputCapabilities = vi.fn(async () => capability); api.startVoiceInput = vi.fn(async () => voiceSession());
     const track = new FakeTrack();
@@ -104,7 +126,6 @@ describe("VoiceInputMediaSession", () => {
       api,
       preferences: {
         refinementInstructions: "Keep commands verbatim.",
-        dictionaryTerms: ["Joko", "Orchestrator"],
         playInteractionSound: false
       },
       mediaDevices: { getUserMedia },
@@ -122,8 +143,8 @@ describe("VoiceInputMediaSession", () => {
       expect.any(String),
       "audio/webm",
       undefined,
-      { instructions: "Keep commands verbatim.", dictionaryTerms: ["Joko", "Orchestrator"] },
-      expect.any(AbortSignal)
+      { instructions: "Keep commands verbatim." },
+      expect.any(AbortSignal), undefined
     );
     expect(api.appendVoiceAudio).toHaveBeenCalledWith("voice-one", 1n, new Uint8Array([1, 2, 3]), 250, false);
     expect(api.stopVoiceInput).toHaveBeenCalledWith("voice-one", 2n);
@@ -255,7 +276,7 @@ describe("VoiceInputMediaSession", () => {
     await vi.waitFor(() => expect(api.appendVoiceAudio).toHaveBeenCalledOnce());
     await media.stop();
 
-    expect(api.startVoiceInput).toHaveBeenCalledWith(expect.any(String), "audio/pcm", undefined, expect.any(Object), expect.any(AbortSignal));
+    expect(api.startVoiceInput).toHaveBeenCalledWith(expect.any(String), "audio/pcm", undefined, undefined, expect.any(AbortSignal), undefined);
     expect(api.appendVoiceAudio).toHaveBeenCalledWith("voice-one", 1n, new Uint8Array([1, 0, 2, 0]), 20, true);
     expect(capture.stop).toHaveBeenCalledOnce();
     expect(track.stop).toHaveBeenCalledOnce();

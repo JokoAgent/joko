@@ -33,3 +33,6 @@ export * from "./gen/joko/v1/workspace_pb.js";
 export * from "./well-known.js";
 export * from "./lan-discovery.js";
 export * from "./protobuf-tree-wire.js";
+export * from "./voice-dictionary-peer-status.js";
+export * from "./voice-dictionary-readonly.js";
+export * from "./voice-input-sauc-settings.js";

@@ -29,12 +29,15 @@ import {
   SessionWorktreeCoordinator,
   WorkspaceChangeSetService,
   WorkspaceService,
+  VoiceDictionarySyncRepository,
+  VoiceDictionaryPeerManager,
+  CredentialVault,
   createPublicServer,
   type OrchestratorApplication,
   type BackendInstanceFactory,
   type OrchestratorConfig
 } from "@joko/orchestrator";
-import { ContactStore, OperationalStore } from "@joko/store";
+import { ContactStore, OperationalStore, VoiceDictionaryPeerStore } from "@joko/store";
 import {
   FakeBackendAdapter,
   PI_LIKE_PROFILE,
@@ -58,6 +61,9 @@ export interface FixtureOptions {
   readonly createAdapter?: (profile: FakeAdapterProfile) => InstrumentedFakeAdapter;
   readonly backendFactories?: readonly BackendInstanceFactory[];
   readonly keepRoot?: boolean;
+  readonly dictionaryPeerNodeId?: string;
+  /** Rebind the same public address for paired-client restart and offline-cache journeys. */
+  readonly publicPort?: number;
   readonly terminals?: OrchestratorApplication["terminals"];
   readonly createAuxiliaryServices?: (
     store: OperationalStore,
@@ -355,7 +361,7 @@ export class OrchestratorE2eFixture {
     };
     const connections = new RecordingConnectionManager(store);
     connections.openPairingWindow();
-    const serverId = "orchestrator-e2e";
+    const serverId = options.dictionaryPeerNodeId ?? "orchestrator-e2e";
     const lanDiscovery = new LanDiscoveryService({
       self: () => ({
         serverId,
@@ -403,6 +409,13 @@ export class OrchestratorE2eFixture {
     };
     const contactStore = new ContactStore(join(dataDirectory, "contacts.db"));
     const contacts = new ContactManager(contactStore);
+    const voiceDictionary = new VoiceDictionarySyncRepository({ store });
+    const dictionaryPeerStore = options.dictionaryPeerNodeId === undefined ? undefined : new VoiceDictionaryPeerStore(join(dataDirectory, "voice-dictionary-peers.db"));
+    const voiceDictionaryPeers = dictionaryPeerStore === undefined ? undefined : new VoiceDictionaryPeerManager({
+      store: dictionaryPeerStore, dictionary: voiceDictionary, nodeId: serverId, displayName: serverId,
+      vault: await CredentialVault.open(join(dataDirectory, "credentials", "master.key"))
+    });
+    await voiceDictionaryPeers?.initialize();
     const application: OrchestratorApplication = {
       config,
       store,
@@ -434,6 +447,8 @@ export class OrchestratorE2eFixture {
       contacts,
       ...(options.terminals === undefined ? {} : { terminals: options.terminals }),
       ...auxiliaryServices,
+      voiceDictionary,
+      ...(voiceDictionaryPeers === undefined ? {} : { voiceDictionaryPeers }),
       async close() {
         const failures: unknown[] = [];
         const attempt = async (cleanup: () => unknown): Promise<void> => {
@@ -459,6 +474,9 @@ export class OrchestratorE2eFixture {
         await attempt(() => lanDiscovery.stop());
         await attempt(() => auxiliaryServices?.sshKeys?.close());
         await attempt(() => contacts.close());
+        await attempt(() => voiceDictionaryPeers?.close());
+        await attempt(() => voiceDictionary.close());
+        await attempt(() => dictionaryPeerStore?.close());
         await attempt(() => contactStore.close());
         await attempt(() => sessionWorktrees.dispose());
         await attempt(() => devicePeers.shutdown());
@@ -468,7 +486,9 @@ export class OrchestratorE2eFixture {
     };
     const server = await createPublicServer(application);
     server.log.level = "silent";
-    await server.listen({ host: "127.0.0.1", port: 0 });
+    const publicPort = options.publicPort ?? 0;
+    if (!Number.isInteger(publicPort) || publicPort < 0 || publicPort > 65_535) throw new Error("Invalid fixture public port.");
+    await server.listen({ host: "127.0.0.1", port: publicPort });
     const address = server.server.address();
     if (address === null || typeof address === "string") throw new Error("Fastify did not expose an ephemeral TCP port.");
     const baseUrl = `http://127.0.0.1:${address.port}`;

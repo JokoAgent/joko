@@ -9,7 +9,6 @@ import type { JSONContent } from "@tiptap/core";
 import { composerDocumentPlainText, emptyComposerDocument, plainTextToComposerDocument } from "../composer-quote-document.js";
 import { remapComposerInlineMentionReplacement } from "../composer-mention-ranges.js";
 import type { VoiceMediaSessionUpdate } from "../voice-input-media.js";
-import { readVoiceInputPreferences } from "../voice-input-preferences.js";
 import {
   emptySnapshot,
   type AppSnapshot,
@@ -641,6 +640,8 @@ describe("new-task native draft recovery", () => {
     });
     const api = Object.assign(controller({ discover: async () => [] }), {
       getVoiceInputCapabilities: vi.fn(async () => ({ support: "supported" })),
+      getVoiceInputDictionary: vi.fn(async () => ({ revision: 7n, syncEnabled: false, entries: [], candidates: [], suppressedAutomaticTerms: [], refinementTerms: [] })),
+      applyVoiceInputDictionaryLearning: vi.fn(),
       adviseVoiceInputDictionaryEdit: advice,
       readNewSessionDraft: vi.fn(async () => ({ ...restoredDraft(), nativeStart: { kind: "fresh" }, text: "", editorDocument: emptyComposerDocument() })),
       createSession: vi.fn()
@@ -685,7 +686,7 @@ describe("new-task native draft recovery", () => {
     expect(api.getVoiceInputCapabilities).toHaveBeenCalledOnce();
     expect(advice.mock.calls[0]?.[0]).toEqual(expect.objectContaining({ beforeText: "voice kit", afterText: "VoiceKit", rawTranscriptText: "raw voice kit" }));
     await act(async () => required(adviceResults[0]).resolve(dictionaryAdvice("VoiceKit")));
-    expect(readVoiceInputPreferences().dictionary.entries.map((entry) => entry.text)).toEqual(["VoiceKit"]);
+    expect(api.applyVoiceInputDictionaryLearning).toHaveBeenCalledExactlyOnceWith(7n, dictionaryAdvice("VoiceKit").actions, expect.any(AbortSignal));
 
     const retired = await startCapture();
     await act(async () => retired.emit(voiceResult("sound kit")));
@@ -702,7 +703,7 @@ describe("new-task native draft recovery", () => {
     await act(async () => required(adviceResults[1]).resolve(dictionaryAdvice("SoundKit")));
     await act(async () => retired.emit(voiceResult("Must not replace the retained draft")));
     expect(composerDocumentPlainText(required(latestEditorProps?.document))).toBe("VoiceKitSoundKit");
-    expect(readVoiceInputPreferences().dictionary.entries.map((entry) => entry.text)).toEqual(["VoiceKit"]);
+    expect(api.applyVoiceInputDictionaryLearning).toHaveBeenCalledOnce();
     expect(onSubmit).not.toHaveBeenCalled();
 
     const moved = await startCapture();
@@ -733,7 +734,7 @@ describe("new-task native draft recovery", () => {
     expect(onSubmit).toHaveBeenCalledWith(expect.objectContaining({ selection: { kind: "target", targetId: "target-1" } }), expect.objectContaining({ text: "VoiceKitSoundKit updatedShipKit" }), expect.objectContaining({ ownerDocument: document, isCurrent: expect.any(Function) }));
     expect(advice.mock.calls[2]?.[1]?.aborted).toBe(true);
     await act(async () => required(adviceResults[2]).resolve(dictionaryAdvice("ShipKit")));
-    expect(readVoiceInputPreferences().dictionary.entries.map((entry) => entry.text)).toEqual(["VoiceKit"]);
+    expect(api.applyVoiceInputDictionaryLearning).toHaveBeenCalledOnce();
   });
 
   it("lets a project-scoped route override the saved draft location without discarding the draft", async () => {

@@ -34,6 +34,11 @@ export interface AsrStartRequest {
   readonly locale?: string;
 }
 
+export interface AsrRecognitionContext {
+  readonly hotwords: readonly string[];
+  readonly contextData: readonly { readonly text: string }[];
+}
+
 export interface AudioChunk {
   readonly data: ArrayBuffer;
   readonly durationMs: number;

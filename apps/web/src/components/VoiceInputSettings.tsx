@@ -1,4 +1,6 @@
 import type { JSX } from "react";
+import { defaultVoiceInputSaucSettings, voiceInputSaucEndpoint, voiceInputRecognitionContextFromTexts,
+  voiceInputRecognitionLocale, type VoiceInputSaucSettingsView } from "@joko/contracts";
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import type { AppController } from "../controller.js";
 import { composerVoiceShortcutsConflict } from "../composer-voice-shortcut-conflict.js";
@@ -23,6 +25,7 @@ import type {
   ModelRouteRefView,
   VoiceInputCapabilityView,
   VoiceInputConnectionTestFailureView,
+  VoiceInputDictionarySnapshotView,
   VoiceInputTranscriptionProtocolView
 } from "../model.js";
 import { supportsVoiceMediaCapture } from "../voice-input-media.js";
@@ -48,23 +51,28 @@ import {
   subscribeVoiceInputPreferences,
   voiceInputShortcutsEqual,
   writeVoiceInputPreferences,
+  hasInvalidStoredVoiceInputPreferences,
+  resetVoiceInputPreferences,
   type VoiceInputShortcutCombo,
 } from "../voice-input-preferences.js";
 import {
-  addManualVoiceDictionaryTerm,
-  deleteVoiceDictionaryEntry,
-  mergeManualVoiceDictionaryTerms,
-  editVoiceDictionaryEntry,
-  voiceDictionaryTermKey,
-  type VoiceInputDictionaryState
+  normalizeVoiceDictionaryTerm,
+  parseVoiceDictionaryAliasDraft,
+  voiceDictionaryTermKey
 } from "../voice-input-dictionary.js";
 import type { Translator } from "./types.js";
 import { Button, ErrorBanner, Pill, CheckboxControl, SelectControl, SwitchControl } from "./ui.js";
+import { VoiceDictionaryPeers } from "./VoiceDictionaryPeers.js";
 
 type CapabilityState =
   | { readonly kind: "loading" }
   | { readonly kind: "ready"; readonly value: VoiceInputCapabilityView }
   | { readonly kind: "error" };
+
+type DictionaryState = { readonly source?: AppController["getVoiceInputDictionary"] } & (
+  | { readonly kind: "loading" }
+  | { readonly kind: "ready"; readonly value: VoiceInputDictionarySnapshotView }
+  | { readonly kind: "error" });
 
 type MicrophonePermissionState = "granted" | "denied" | "prompt" | "unknown";
 
@@ -93,6 +101,7 @@ export function VoiceInputSettings({ controller, t }: {
   const [serviceEndpoint, setServiceEndpoint] = useState(service.endpoint);
   const [serviceModel, setServiceModel] = useState(service.model);
   const [serviceResourceId, setServiceResourceId] = useState(service.resourceId);
+  const [serviceSauc, setServiceSauc] = useState(service.sauc ?? defaultVoiceInputSaucSettings());
   const [serviceKeyless, setServiceKeyless] = useState(service.keyless);
   const [serviceSecret, setServiceSecret] = useState("");
   const [clearServiceCredential, setClearServiceCredential] = useState(false);
@@ -101,6 +110,7 @@ export function VoiceInputSettings({ controller, t }: {
   const [fallbackEndpoint, setFallbackEndpoint] = useState(service.fallbackEndpoint);
   const [fallbackModel, setFallbackModel] = useState(service.fallbackModel);
   const [fallbackResourceId, setFallbackResourceId] = useState(service.fallbackResourceId);
+  const [fallbackSauc, setFallbackSauc] = useState(service.fallbackSauc ?? defaultVoiceInputSaucSettings());
   const [fallbackKeyless, setFallbackKeyless] = useState(service.fallbackKeyless);
   const [fallbackSecret, setFallbackSecret] = useState("");
   const [clearFallbackCredential, setClearFallbackCredential] = useState(false);
@@ -112,6 +122,11 @@ export function VoiceInputSettings({ controller, t }: {
   const [serviceSaved, setServiceSaved] = useState(false);
   const [connectionTest, setConnectionTest] = useState<"idle" | "testing" | "success" | VoiceInputConnectionTestFailureView>("idle");
   const connectionTestRequestRef = useRef(0);
+  const serviceLease = useRef<AbortController | undefined>(undefined);
+  const [recognitionEnabled, setRecognitionEnabled] = useState(preferences.recognitionContextEnabled);
+  const [recognitionTexts, setRecognitionTexts] = useState<readonly string[]>(preferences.contextData);
+  const [recognitionError, setRecognitionError] = useState(false);
+  const [invalidPreferences, setInvalidPreferences] = useState(hasInvalidStoredVoiceInputPreferences);
   const invalidateConnectionTest = useCallback((): void => {
     connectionTestRequestRef.current += 1;
     setConnectionTest("idle");
@@ -120,9 +135,23 @@ export function VoiceInputSettings({ controller, t }: {
   const [dictionarySearch, setDictionarySearch] = useState("");
   const [dictionaryFilter, setDictionaryFilter] = useState<"all" | "manual" | "automatic">("all");
   const [editingDictionaryEntryId, setEditingDictionaryEntryId] = useState<string>();
+  const [editingDictionaryRevision, setEditingDictionaryRevision] = useState<bigint>();
   const [editingDictionaryDraft, setEditingDictionaryDraft] = useState("");
   const [editingDictionaryAliasesDraft, setEditingDictionaryAliasesDraft] = useState("");
   const [dictionaryMessage, setDictionaryMessage] = useState<{ readonly error: boolean; readonly text: string }>();
+  const [dictionaryState, setDictionaryState] = useState<DictionaryState>({ kind: "loading" });
+  const [dictionaryBusy, setDictionaryBusy] = useState(false);
+  const [dictionaryVisible, setDictionaryVisible] = useState(document.visibilityState !== "hidden");
+  const dictionaryVisibleRef = useRef(dictionaryVisible);
+  dictionaryVisibleRef.current = dictionaryVisible;
+  const [dictionaryLiveFailed, setDictionaryLiveFailed] = useState(false);
+  const dictionaryLiveFailedRef = useRef(false);
+  const [dictionaryWatchRetry, setDictionaryWatchRetry] = useState(0);
+  const dictionaryWatchAbortRef = useRef<AbortController | undefined>(undefined);
+  const dictionaryRequestRef = useRef(0);
+  const dictionaryAbortRef = useRef<AbortController | undefined>(undefined);
+  const dictionarySourceRef = useRef(controller.getVoiceInputDictionary);
+  dictionarySourceRef.current = controller.getVoiceInputDictionary;
   const dictionaryListRef = useRef<HTMLDivElement>(null);
   const dictionarySearchRef = useRef<HTMLInputElement>(null);
   const dictionaryFocusRef = useRef<string | undefined>(undefined);
@@ -143,9 +172,91 @@ export function VoiceInputSettings({ controller, t }: {
   const [globalAccessibility, setGlobalAccessibility] = useState<"granted" | "denied" | "not-required" | "unknown">("unknown");
   const [globalInputMonitoring, setGlobalInputMonitoring] = useState<"granted" | "denied" | "not-required" | "unknown">("unknown");
 
-  useEffect(() => subscribeVoiceInputPreferences(setPreferences), []);
+  useEffect(() => subscribeVoiceInputPreferences((value) => { setPreferences(value); setInvalidPreferences(hasInvalidStoredVoiceInputPreferences()); }), []);
+  const recognitionPreferenceKey = JSON.stringify([preferences.recognitionContextEnabled, preferences.contextData]);
+  useEffect(() => {
+    setRecognitionEnabled(preferences.recognitionContextEnabled);
+    setRecognitionTexts(preferences.contextData);
+    setRecognitionError(false);
+  }, [recognitionPreferenceKey]);
+  useEffect(() => {
+    const renew = (): void => { serviceLease.current?.abort(); serviceLease.current = new AbortController(); };
+    const retire = (): void => {
+      serviceLease.current?.abort(); invalidateConnectionTest();
+      setServiceSecret(""); setFallbackSecret(""); setSavingService(false); setServiceSaved(false);
+    };
+    const visibility = (): void => { if (document.visibilityState === "hidden") retire(); else renew(); };
+    if (document.visibilityState !== "hidden") renew();
+    window.addEventListener("pagehide", retire);
+    window.addEventListener("pageshow", visibility);
+    document.addEventListener("visibilitychange", visibility);
+    return () => { retire(); window.removeEventListener("pagehide", retire); window.removeEventListener("pageshow", visibility); document.removeEventListener("visibilitychange", visibility); };
+  }, [controller.updateVoiceInputServiceSettings, controller.testVoiceInputConnection, invalidateConnectionTest]);
   useEffect(() => subscribeVoiceInputUsage(setUsage), []);
   useEffect(() => () => { connectionTestRequestRef.current += 1; }, []);
+  useEffect(() => {
+    const changed = (): void => {
+      const visible = document.visibilityState !== "hidden";
+      dictionaryVisibleRef.current = visible;
+      if (!visible) { dictionaryAbortRef.current?.abort(); dictionaryWatchAbortRef.current?.abort(); }
+      setDictionaryVisible(visible);
+    };
+    document.addEventListener("visibilitychange", changed);
+    return () => document.removeEventListener("visibilitychange", changed);
+  }, []);
+  const loadDictionary = useCallback((): void => {
+    if (!dictionaryVisibleRef.current) return;
+    if (dictionaryLiveFailedRef.current) setDictionaryWatchRetry((value) => value + 1);
+    const source = controller.getVoiceInputDictionary;
+    const sequence = ++dictionaryRequestRef.current;
+    dictionaryAbortRef.current?.abort();
+    const request = new AbortController();
+    dictionaryAbortRef.current = request;
+    setDictionaryBusy(false);
+    setDictionaryState((previous) => previous.source === source && previous.kind === "ready" ? previous : { kind: "loading", source });
+    setDictionaryMessage(undefined);
+    void source(request.signal).then((value) => {
+      if (dictionaryRequestRef.current === sequence && dictionarySourceRef.current === source && !request.signal.aborted) {
+        setDictionaryState((previous) => previous.source === source && previous.kind === "ready" && previous.value.revision > value.revision
+          ? previous : { kind: "ready", source, value });
+      }
+    }).catch(() => {
+      if (dictionaryRequestRef.current === sequence && dictionarySourceRef.current === source && !request.signal.aborted) {
+        setDictionaryState({ kind: "error", source });
+      }
+    });
+  }, [controller.getVoiceInputDictionary]);
+  useEffect(() => {
+    setEditingDictionaryEntryId(undefined); setEditingDictionaryRevision(undefined);
+    setDictionaryState({ kind: "loading", source: controller.getVoiceInputDictionary });
+    dictionaryLiveFailedRef.current = false; setDictionaryLiveFailed(false);
+    if (!refinementEnabled || !dictionaryVisible) return;
+    loadDictionary();
+    return () => {
+      dictionaryRequestRef.current += 1;
+      dictionaryAbortRef.current?.abort();
+    };
+  }, [loadDictionary, refinementEnabled, dictionaryVisible]);
+  useEffect(() => {
+    if (!refinementEnabled || !dictionaryVisible) return;
+    const source = controller.getVoiceInputDictionary;
+    const request = dictionaryWatchAbortRef.current = new AbortController();
+    const current = (): boolean => dictionaryVisibleRef.current && dictionarySourceRef.current === source && !request.signal.aborted;
+    void (async () => {
+      try {
+        for await (const value of controller.watchVoiceInputDictionary(request.signal)) {
+          if (!current()) return;
+          setDictionaryState((previous) => previous.source === source && previous.kind === "ready" && previous.value.revision > value.revision
+            ? previous : { kind: "ready", source, value });
+          dictionaryLiveFailedRef.current = false; setDictionaryLiveFailed(false);
+        }
+        if (current()) throw new Error("Dictionary updates disconnected.");
+      } catch {
+        if (current()) { dictionaryLiveFailedRef.current = true; setDictionaryLiveFailed(true); }
+      }
+    })();
+    return () => request.abort();
+  }, [controller.getVoiceInputDictionary, refinementEnabled, dictionaryVisible, dictionaryWatchRetry]);
   useEffect(() => {
     const id = dictionaryFocusRef.current;
     if (id === undefined) return;
@@ -153,7 +264,7 @@ export function VoiceInputSettings({ controller, t }: {
     const entry = [...(dictionaryListRef.current?.querySelectorAll<HTMLElement>("article") ?? [])]
       .find((item) => item.dataset["dictionaryEntryId"] === id);
     (entry?.querySelector<HTMLButtonElement>("[data-dictionary-edit]") ?? dictionarySearchRef.current)?.focus();
-  }, [preferences.dictionary, editingDictionaryEntryId]);
+  }, [dictionaryState, editingDictionaryEntryId]);
 
   const saveShortcutPreference = useCallback((shortcut: VoiceInputShortcutCombo | "disabled"): void => {
     setShortcutError(undefined);
@@ -347,6 +458,7 @@ export function VoiceInputSettings({ controller, t }: {
     setServiceEndpoint(service.endpoint);
     setServiceModel(service.model);
     setServiceResourceId(service.resourceId);
+    setServiceSauc(service.sauc ?? defaultVoiceInputSaucSettings());
     setServiceKeyless(service.keyless);
     setServiceSecret("");
     setClearServiceCredential(false);
@@ -355,6 +467,7 @@ export function VoiceInputSettings({ controller, t }: {
     setFallbackEndpoint(service.fallbackEndpoint);
     setFallbackModel(service.fallbackModel);
     setFallbackResourceId(service.fallbackResourceId);
+    setFallbackSauc(service.fallbackSauc ?? defaultVoiceInputSaucSettings());
     setFallbackKeyless(service.fallbackKeyless);
     setFallbackSecret("");
     setClearFallbackCredential(false);
@@ -363,7 +476,7 @@ export function VoiceInputSettings({ controller, t }: {
     setRefinerFallbackModel(service.refinerFallbackModel);
     setServiceSaveError(undefined);
     invalidateConnectionTest();
-  }, [controller, invalidateConnectionTest, service.enabled, service.endpoint, service.fallbackEnabled, service.fallbackEndpoint, service.fallbackKeyless, service.fallbackModel, service.fallbackResourceId, service.fallbackProtocol, service.keyless, service.model, service.resourceId, service.protocol, service.refinementEnabled, service.refinerFallbackModel, service.refinerModel, service.revision]);
+  }, [controller, invalidateConnectionTest, service.enabled, service.endpoint, service.fallbackEnabled, service.fallbackEndpoint, service.fallbackKeyless, service.fallbackModel, service.fallbackResourceId, service.fallbackProtocol, service.keyless, service.model, service.resourceId, service.protocol, service.sauc, service.fallbackSauc, service.refinementEnabled, service.refinerFallbackModel, service.refinerModel, service.revision]);
 
   useEffect(() => {
     const mediaDevices = typeof navigator === "undefined" ? undefined : navigator.mediaDevices;
@@ -438,6 +551,7 @@ export function VoiceInputSettings({ controller, t }: {
     || serviceEndpoint.trim() !== service.endpoint
     || serviceModel.trim() !== service.model
     || serviceResourceId !== service.resourceId
+    || (serviceProtocol === "volcengineSauc" && JSON.stringify(serviceSauc) !== JSON.stringify(service.sauc))
     || serviceKeyless !== service.keyless
     || serviceSecret.trim() !== ""
     || clearServiceCredential
@@ -446,59 +560,123 @@ export function VoiceInputSettings({ controller, t }: {
     || fallbackEndpoint.trim() !== service.fallbackEndpoint
     || fallbackModel.trim() !== service.fallbackModel
     || fallbackResourceId !== service.fallbackResourceId
+    || (fallbackProtocol === "volcengineSauc" && JSON.stringify(fallbackSauc) !== JSON.stringify(service.fallbackSauc))
     || fallbackKeyless !== service.fallbackKeyless
     || fallbackSecret.trim() !== ""
     || clearFallbackCredential
     || refinementEnabled !== service.refinementEnabled
     || selectedRefinementModel !== refinementModelKey(service.refinerModel)
     || selectedRefinementFallbackModel !== refinementModelKey(service.refinerFallbackModel);
-  const dictionaryCounts = preferences.dictionary.entries.reduce((counts, entry) => ({
+  const visibleDictionaryState = dictionaryState.source === controller.getVoiceInputDictionary
+    ? dictionaryState : { kind: "loading" as const };
+  const dictionary = visibleDictionaryState.kind === "ready" ? visibleDictionaryState.value : undefined;
+  const dictionaryReadOnly = dictionaryBusy || dictionaryLiveFailed || !dictionaryVisible;
+  const dictionaryEntries = dictionary?.entries ?? [];
+  const dictionaryCounts = dictionaryEntries.reduce((counts, entry) => ({
     all: counts.all + 1,
     manual: counts.manual + (entry.source === "manual" ? 1 : 0),
     automatic: counts.automatic + (entry.source === "automatic" ? 1 : 0)
   }), { all: 0, manual: 0, automatic: 0 });
   const normalizedDictionarySearch = voiceDictionaryTermKey(dictionarySearch);
-  const visibleDictionaryEntries = preferences.dictionary.entries.filter((entry) =>
+  const visibleDictionaryEntries = dictionaryEntries.filter((entry) =>
     (dictionaryFilter === "all" || entry.source === dictionaryFilter)
     && (normalizedDictionarySearch === ""
       || voiceDictionaryTermKey(entry.text).includes(normalizedDictionarySearch)
       || entry.aliases.some((alias) => voiceDictionaryTermKey(alias.text).includes(normalizedDictionarySearch))));
 
-  const persistDictionary = (dictionary: VoiceInputDictionaryState, message: string): void => {
-    const saved = writeVoiceInputPreferences({ dictionary });
-    setPreferences(saved);
-    setDictionaryMessage({ error: false, text: message });
+  const commitDictionary = async (
+    mutation: (current: VoiceInputDictionarySnapshotView, signal: AbortSignal) => Promise<VoiceInputDictionarySnapshotView>,
+    successMessage: string,
+    onCommitted?: (previous: VoiceInputDictionarySnapshotView, next: VoiceInputDictionarySnapshotView) => void
+  ): Promise<void> => {
+    const source = controller.getVoiceInputDictionary;
+    if (dictionary === undefined || dictionaryBusy || dictionaryLiveFailedRef.current || !dictionaryVisibleRef.current || dictionarySourceRef.current !== source) return;
+    const previous = dictionary;
+    const sequence = ++dictionaryRequestRef.current;
+    dictionaryAbortRef.current?.abort();
+    const request = new AbortController();
+    dictionaryAbortRef.current = request;
+    const isCurrent = (): boolean => dictionaryRequestRef.current === sequence
+      && dictionarySourceRef.current === source && dictionaryVisibleRef.current && !request.signal.aborted;
+    setDictionaryBusy(true);
+    setDictionaryMessage(undefined);
+    try {
+      const next = await mutation(previous, request.signal);
+      if (!isCurrent()) return;
+      setDictionaryState((previous) => previous.source === source && previous.kind === "ready" && previous.value.revision > next.revision
+        ? previous : { kind: "ready", source, value: next });
+      setDictionaryMessage({ error: false, text: successMessage });
+      onCommitted?.(previous, next);
+    } catch {
+      if (!isCurrent()) return;
+      try {
+        const current = await source(request.signal);
+        if (isCurrent()) setDictionaryState((previous) => previous.source === source && previous.kind === "ready" && previous.value.revision > current.revision
+          ? previous : { kind: "ready", source, value: current });
+      } catch {
+        if (isCurrent()) setDictionaryState({ kind: "error", source });
+      }
+      if (isCurrent()) {
+        setDictionaryMessage({ error: true, text: t("settings.voiceInputDictionarySaveFailed") });
+      }
+    } finally {
+      if (dictionaryRequestRef.current === sequence) setDictionaryBusy(false);
+    }
   };
 
   const addDictionaryEntry = (): void => {
-    const next = addManualVoiceDictionaryTerm(preferences.dictionary, dictionaryDraft);
-    if (next === undefined) {
-      setDictionaryMessage({ error: true, text: t(dictionaryDraft.trim().length > MAXIMUM_VOICE_DICTIONARY_TERM_CHARACTERS
-        ? "settings.voiceInputDictionaryInvalid"
-        : "settings.voiceInputDictionaryTooLarge") });
+    const term = normalizeVoiceDictionaryTerm(dictionaryDraft);
+    if (term === undefined) {
+      setDictionaryMessage({ error: true, text: t("settings.voiceInputDictionaryInvalid") });
       return;
     }
-    persistDictionary(next, t("settings.voiceInputDictionaryAdded"));
-    setDictionaryDraft("");
+    if (dictionary === undefined) return;
+    if (dictionary.entries.length >= 1_000
+      && !dictionary.entries.some((entry) => voiceDictionaryTermKey(entry.text) === voiceDictionaryTermKey(term))) {
+      setDictionaryMessage({ error: true, text: t("settings.voiceInputDictionaryTooLarge") });
+      return;
+    }
+    void commitDictionary(
+      (current, signal) => controller.addVoiceInputDictionaryTerms(current.revision, [term], signal),
+      t("settings.voiceInputDictionaryAdded"),
+      () => setDictionaryDraft("")
+    );
   };
 
   const saveDictionaryEdit = (entryId: string): void => {
-    const next = editVoiceDictionaryEntry(preferences.dictionary, entryId, editingDictionaryDraft, editingDictionaryAliasesDraft);
-    if (next === undefined) {
+    if (dictionary === undefined || editingDictionaryRevision === undefined) return;
+    const deleted = editingDictionaryDraft.trim() === "";
+    const term = deleted ? undefined : normalizeVoiceDictionaryTerm(editingDictionaryDraft);
+    const parsedAliases = deleted ? [] : parseVoiceDictionaryAliasDraft(editingDictionaryAliasesDraft);
+    if (!deleted && (term === undefined || parsedAliases === undefined)) {
       setDictionaryMessage({ error: true, text: t("settings.voiceInputDictionaryEditInvalid") });
       return;
     }
-    const deleted = editingDictionaryDraft.trim() === "";
-    dictionaryFocusRef.current = deleted ? entryId
-      : next.entries.find((entry) => voiceDictionaryTermKey(entry.text) === voiceDictionaryTermKey(editingDictionaryDraft))?.id;
-    persistDictionary(next, t(deleted ? "settings.voiceInputDictionaryDeleted"
-      : next.entries.length < preferences.dictionary.entries.length ? "settings.voiceInputDictionaryMerged" : "settings.voiceInputDictionaryUpdated"));
-    setEditingDictionaryEntryId(undefined);
-    setEditingDictionaryDraft("");
+    const aliases = term === undefined ? [] : parsedAliases!.filter((alias) =>
+      voiceDictionaryTermKey(alias) !== voiceDictionaryTermKey(term));
+    const merged = term !== undefined && dictionary.entries.some((entry) => entry.id !== entryId
+      && voiceDictionaryTermKey(entry.text) === voiceDictionaryTermKey(term));
+    void commitDictionary(
+      deleted
+        ? (_current, signal) => controller.deleteVoiceInputDictionaryEntry(editingDictionaryRevision, entryId, signal)
+        : (_current, signal) => controller.editVoiceInputDictionaryEntry(editingDictionaryRevision, entryId, term!, aliases, signal),
+      t(deleted ? "settings.voiceInputDictionaryDeleted"
+        : merged ? "settings.voiceInputDictionaryMerged" : "settings.voiceInputDictionaryUpdated"),
+      (_previous, next) => {
+        dictionaryFocusRef.current = deleted ? entryId
+          : next.entries.find((entry) => voiceDictionaryTermKey(entry.text) === voiceDictionaryTermKey(term!))?.id;
+        setEditingDictionaryEntryId(undefined);
+        setEditingDictionaryDraft("");
+        setEditingDictionaryAliasesDraft("");
+      }
+    );
   };
 
   const importDictionary = async (file: File | undefined): Promise<void> => {
-    if (file === undefined) return;
+    if (file === undefined || dictionary === undefined || dictionaryReadOnly) return;
+    const source = controller.getVoiceInputDictionary;
+    const sequence = dictionaryRequestRef.current;
+    const isCurrent = (): boolean => dictionaryVisibleRef.current && !dictionaryLiveFailedRef.current && dictionarySourceRef.current === source && dictionaryRequestRef.current === sequence;
     if (file.size > MAXIMUM_VOICE_DICTIONARY_CSV_BYTES) {
       setDictionaryMessage({ error: true, text: t("settings.voiceInputDictionaryImportTooLarge") });
       return;
@@ -506,26 +684,30 @@ export function VoiceInputSettings({ controller, t }: {
     let text: string;
     try { text = await file.text(); }
     catch {
-      setDictionaryMessage({ error: true, text: t("settings.voiceInputDictionaryImportFailed") });
+      if (isCurrent()) setDictionaryMessage({ error: true, text: t("settings.voiceInputDictionaryImportFailed") });
       return;
     }
+    if (!isCurrent()) return;
     const parsed = parseVoiceDictionaryCsv(text);
     if (!parsed.ok) {
       setDictionaryMessage({ error: true, text: t("settings.voiceInputDictionaryImportFailed") });
       return;
     }
-    const existingManual = preferences.dictionary.entries
-      .filter((entry) => entry.source === "manual")
-      .map((entry) => entry.text);
-    const imported = mergeManualVoiceDictionaryTerms(preferences.dictionary, [...existingManual, ...parsed.terms]);
-    if (imported === undefined) {
+    const entryKeys = new Set(dictionary.entries.map((entry) => voiceDictionaryTermKey(entry.text)));
+    for (const term of parsed.terms) entryKeys.add(voiceDictionaryTermKey(term));
+    if (entryKeys.size > 1_000) {
       setDictionaryMessage({ error: true, text: t("settings.voiceInputDictionaryTooLarge") });
       return;
     }
-    persistDictionary(imported, t("settings.voiceInputDictionaryImported", { count: parsed.terms.length }));
+    await commitDictionary(
+      (current, signal) => controller.addVoiceInputDictionaryTerms(current.revision, parsed.terms, signal),
+      t("settings.voiceInputDictionaryImported", { count: parsed.terms.length })
+    );
   };
 
   const saveService = async (): Promise<void> => {
+    const lease = serviceLease.current;
+    if (lease === undefined || lease.signal.aborted) return;
     invalidateConnectionTest();
     setServiceSaveError(undefined);
     setServiceSaved(false);
@@ -533,9 +715,9 @@ export function VoiceInputSettings({ controller, t }: {
     const replacingFallbackCredential = fallbackSecret.trim() !== "";
     if (
       (service.credentialConfigured && !replacingCredential && !clearServiceCredential
-        && transcriptionAuthorityChanged(service.protocol, service.endpoint, serviceProtocol, serviceEndpoint))
+        && transcriptionAuthorityChanged(service.protocol, service.endpoint, serviceProtocol, serviceEndpoint, service.sauc, serviceSauc))
       || (service.fallbackCredentialConfigured && !replacingFallbackCredential && !clearFallbackCredential
-        && transcriptionAuthorityChanged(service.fallbackProtocol, service.fallbackEndpoint, fallbackProtocol, fallbackEndpoint))
+        && transcriptionAuthorityChanged(service.fallbackProtocol, service.fallbackEndpoint, fallbackProtocol, fallbackEndpoint, service.fallbackSauc, fallbackSauc))
     ) {
       setServiceSaveError(t("settings.voiceInputCredentialRouteChanged"));
       return;
@@ -572,6 +754,7 @@ export function VoiceInputSettings({ controller, t }: {
         endpoint: serviceEndpoint,
         model: serviceModel,
         resourceId: serviceResourceId,
+        ...(serviceProtocol === "volcengineSauc" ? { sauc: serviceSauc } : {}),
         keyless: serviceKeyless,
         ...(replacingCredential ? { secret: serviceSecret } : {}),
         ...(clearServiceCredential ? { clearCredential: true } : {}),
@@ -583,33 +766,37 @@ export function VoiceInputSettings({ controller, t }: {
         fallbackEndpoint,
         fallbackModel,
         fallbackResourceId,
+        ...(fallbackProtocol === "volcengineSauc" ? { fallbackSauc } : {}),
         fallbackKeyless,
         ...(replacingFallbackCredential ? { fallbackSecret } : {}),
         ...(clearFallbackCredential ? { clearFallbackCredential: true } : {}),
         expectedRevision: service.revision
-      });
+      }, lease.signal);
+      if (lease.signal.aborted || serviceLease.current !== lease) return;
       setServiceSecret("");
       setClearServiceCredential(false);
       setFallbackSecret("");
       setClearFallbackCredential(false);
       setServiceSaved(true);
     } catch {
-      setServiceSaveError(t("settings.voiceInputServiceSaveFailed"));
+      if (!lease.signal.aborted && serviceLease.current === lease) setServiceSaveError(t("settings.voiceInputServiceSaveFailed"));
     } finally {
-      setSavingService(false);
+      if (!lease.signal.aborted && serviceLease.current === lease) setSavingService(false);
     }
   };
 
   const testServiceConnection = async (): Promise<void> => {
+    const lease = serviceLease.current;
+    if (lease === undefined || lease.signal.aborted) return;
     const requestId = connectionTestRequestRef.current + 1;
     connectionTestRequestRef.current = requestId;
     setConnectionTest("testing");
     try {
-      const result = await controller.testVoiceInputConnection();
-      if (connectionTestRequestRef.current !== requestId) return;
+      const result = await controller.testVoiceInputConnection(lease.signal);
+      if (lease.signal.aborted || serviceLease.current !== lease || connectionTestRequestRef.current !== requestId) return;
       setConnectionTest(result.ok ? "success" : result.reason);
     } catch {
-      if (connectionTestRequestRef.current === requestId) setConnectionTest("serviceError");
+      if (!lease.signal.aborted && serviceLease.current === lease && connectionTestRequestRef.current === requestId) setConnectionTest("serviceError");
     }
   };
 
@@ -633,6 +820,7 @@ export function VoiceInputSettings({ controller, t }: {
           setServiceEndpoint(route.endpoint);
           setServiceModel(route.model);
           setServiceResourceId(route.resourceId);
+          setServiceSauc(defaultVoiceInputSaucSettings());
           setServiceKeyless(false);
           setServiceSecret("");
         }}>
@@ -652,18 +840,24 @@ export function VoiceInputSettings({ controller, t }: {
         <div><strong>{t("settings.voiceInputServiceModel")}</strong><span>{t("settings.voiceInputServiceModelHint")}</span></div>
         <input value={serviceModel} disabled={savingService} aria-label={t("settings.voiceInputServiceModel")} spellCheck={false} onChange={(event) => { invalidateConnectionTest(); setServiceModel(event.target.value); }} />
       </div>}
+      {serviceProtocol === "volcengineSauc" && <SaucFields value={serviceSauc} disabled={savingService} t={t} onChange={(value) => {
+        invalidateConnectionTest();
+        if (value.authentication !== serviceSauc.authentication || value.appId !== serviceSauc.appId) setServiceSecret("");
+        if (value.mode !== serviceSauc.mode) { try { setServiceEndpoint(voiceInputSaucEndpoint(serviceEndpoint, value.mode)); } catch { /* Keep the invalid endpoint visible for correction. */ } }
+        setServiceSauc(value);
+      }} />}
       {serviceProtocol !== "volcengineSauc" && <div className="setting-row">
         <div><strong>{t("settings.voiceInputServiceKeyless")}</strong><span>{t("settings.voiceInputServiceKeylessHint")}</span></div>
         <SwitchControl checked={serviceKeyless} disabled={savingService} aria-label={t("settings.voiceInputServiceKeyless")} onChange={(event) => { invalidateConnectionTest(); setServiceKeyless(event.target.checked); }} />
       </div>}
       <div className="setting-row">
-        <div><strong>{t("settings.voiceInputServiceApiKey")}</strong><span>{service.credentialConfigured ? t("settings.voiceInputCredentialStored") : t("settings.voiceInputCredentialNotStored")}</span></div>
+        <div><strong>{t(serviceProtocol === "volcengineSauc" && serviceSauc.authentication === "accessToken" ? "settings.voiceInputAccessToken" : "settings.voiceInputServiceApiKey")}</strong><span>{service.credentialConfigured ? t("settings.voiceInputCredentialStored") : t("settings.voiceInputCredentialNotStored")}</span></div>
         <input
           type="password"
           value={serviceSecret}
           disabled={savingService || serviceKeyless}
           autoComplete="off"
-          aria-label={t("settings.voiceInputServiceApiKey")}
+          aria-label={t(serviceProtocol === "volcengineSauc" && serviceSauc.authentication === "accessToken" ? "settings.voiceInputAccessToken" : "settings.voiceInputServiceApiKey")}
           placeholder={service.credentialConfigured ? t("settings.voiceInputCredentialUnchanged") : t("settings.voiceInputCredentialPlaceholder")}
           onChange={(event) => {
             invalidateConnectionTest();
@@ -695,6 +889,7 @@ export function VoiceInputSettings({ controller, t }: {
             setFallbackEndpoint(route.endpoint);
             setFallbackModel(route.model);
             setFallbackResourceId(route.resourceId);
+            setFallbackSauc(defaultVoiceInputSaucSettings());
             setFallbackKeyless(false);
             setFallbackSecret("");
           }}>
@@ -714,18 +909,24 @@ export function VoiceInputSettings({ controller, t }: {
           <div><strong>{t("settings.voiceInputFallbackModel")}</strong><span>{t("settings.voiceInputServiceModelHint")}</span></div>
           <input value={fallbackModel} disabled={savingService} aria-label={t("settings.voiceInputFallbackModel")} spellCheck={false} onChange={(event) => { invalidateConnectionTest(); setFallbackModel(event.target.value); }} />
         </div>}
+        {fallbackProtocol === "volcengineSauc" && <SaucFields value={fallbackSauc} disabled={savingService} backup t={t} onChange={(value) => {
+          invalidateConnectionTest();
+          if (value.authentication !== fallbackSauc.authentication || value.appId !== fallbackSauc.appId) setFallbackSecret("");
+          if (value.mode !== fallbackSauc.mode) { try { setFallbackEndpoint(voiceInputSaucEndpoint(fallbackEndpoint, value.mode)); } catch { /* Keep the invalid endpoint visible for correction. */ } }
+          setFallbackSauc(value);
+        }} />}
         {fallbackProtocol !== "volcengineSauc" && <div className="setting-row">
           <div><strong>{t("settings.voiceInputFallbackKeyless")}</strong><span>{t("settings.voiceInputServiceKeylessHint")}</span></div>
           <SwitchControl checked={fallbackKeyless} disabled={savingService} aria-label={t("settings.voiceInputFallbackKeyless")} onChange={(event) => { invalidateConnectionTest(); setFallbackKeyless(event.target.checked); }} />
         </div>}
         <div className="setting-row">
-          <div><strong>{t("settings.voiceInputFallbackApiKey")}</strong><span>{service.fallbackCredentialConfigured ? t("settings.voiceInputCredentialStored") : t("settings.voiceInputCredentialNotStored")}</span></div>
+          <div><strong>{t(fallbackProtocol === "volcengineSauc" && fallbackSauc.authentication === "accessToken" ? "settings.voiceInputFallbackAccessToken" : "settings.voiceInputFallbackApiKey")}</strong><span>{service.fallbackCredentialConfigured ? t("settings.voiceInputCredentialStored") : t("settings.voiceInputCredentialNotStored")}</span></div>
           <input
             type="password"
             value={fallbackSecret}
             disabled={savingService || fallbackKeyless}
             autoComplete="off"
-            aria-label={t("settings.voiceInputFallbackApiKey")}
+            aria-label={t(fallbackProtocol === "volcengineSauc" && fallbackSauc.authentication === "accessToken" ? "settings.voiceInputFallbackAccessToken" : "settings.voiceInputFallbackApiKey")}
             placeholder={service.fallbackCredentialConfigured ? t("settings.voiceInputCredentialUnchanged") : t("settings.voiceInputCredentialPlaceholder")}
             onChange={(event) => {
               invalidateConnectionTest();
@@ -814,11 +1015,12 @@ export function VoiceInputSettings({ controller, t }: {
         <SelectControl
           aria-label={t("settings.voiceInputLocale")}
           value={capability.kind === "ready" && !capability.value.supportsLocale ? "auto" : preferences.locale}
-          disabled={capability.kind === "ready" && !capability.value.supportsLocale}
+          disabled={invalidPreferences || capability.kind === "ready" && !capability.value.supportsLocale}
           onChange={(event) => setPreferences(writeVoiceInputPreferences({ locale: event.target.value }))}
         >
           <option value="auto">{t("settings.voiceInputLocaleAuto")}</option>
-          {VOICE_INPUT_LOCALES.map((locale) => <option key={locale} value={locale}>{t(voiceInputLocaleLabelKey(locale))}</option>)}
+          {VOICE_INPUT_LOCALES.map((locale) => <option key={locale} value={locale}
+            disabled={capability.kind === "ready" && voiceInputRecognitionLocale(locale, capability.value) === undefined}>{voiceInputLocaleLabel(locale, t)}</option>)}
         </SelectControl>
       </div>
       <div className="setting-row">
@@ -826,6 +1028,7 @@ export function VoiceInputSettings({ controller, t }: {
         <SelectControl
           aria-label={t("settings.voiceInputDevice")}
           value={preferences.deviceId ?? ""}
+          disabled={invalidPreferences}
           onChange={(event) => setPreferences(writeVoiceInputPreferences({ deviceId: event.target.value }))}
         >
           <option value="">{t("settings.voiceInputDeviceDefault")}</option>
@@ -837,12 +1040,12 @@ export function VoiceInputSettings({ controller, t }: {
         <div><strong>{t("settings.voiceInputShortcut")}</strong><span>{shortcutError ?? globalVoiceShortcutHint(desktopGlobalVoice !== undefined, globalShortcutRegistration, t)}</span></div>
         <div className="voice-input-shortcut-control">
           <kbd>{recordingShortcut ? t("settings.voiceInputShortcutRecording") : formatVoiceInputShortcut(preferences.shortcut, typeof navigator === "undefined" ? "" : navigator.platform) || t("settings.voiceInputShortcutOff")}</kbd>
-          <Button tone="ghost" onClick={() => {
+          <Button tone="ghost" disabled={invalidPreferences} onClick={() => {
             setShortcutError(undefined);
             setRecordingShortcut((current) => !current);
           }}>{recordingShortcut ? t("settings.voiceInputShortcutCancel") : t("settings.voiceInputShortcutChange")}</Button>
-          {preferences.shortcut !== "disabled" && <Button tone="ghost" onClick={() => saveShortcutPreference("disabled")}>{t("settings.voiceInputShortcutDisable")}</Button>}
-          {!voiceInputShortcutsEqual(preferences.shortcut, defaultVoiceInputShortcut()) && <Button tone="ghost" onClick={() => saveShortcutPreference(defaultVoiceInputShortcut())}>{t("settings.voiceInputShortcutReset")}</Button>}
+          {preferences.shortcut !== "disabled" && <Button tone="ghost" disabled={invalidPreferences} onClick={() => saveShortcutPreference("disabled")}>{t("settings.voiceInputShortcutDisable")}</Button>}
+          {!voiceInputShortcutsEqual(preferences.shortcut, defaultVoiceInputShortcut()) && <Button tone="ghost" disabled={invalidPreferences} onClick={() => saveShortcutPreference(defaultVoiceInputShortcut())}>{t("settings.voiceInputShortcutReset")}</Button>}
         </div>
       </div>
       {desktopGlobalVoice !== undefined && window.jokoDesktop?.platform === "darwin" && <div className="setting-row">
@@ -855,21 +1058,50 @@ export function VoiceInputSettings({ controller, t }: {
       </div>}
       <div className="setting-row">
         <div><strong>{t("settings.voiceInputInteractionSound")}</strong><span>{t("settings.voiceInputInteractionSoundHint")}</span></div>
-        <SwitchControl checked={preferences.playInteractionSound} aria-label={t("settings.voiceInputInteractionSound")} onChange={(event) => setPreferences(writeVoiceInputPreferences({ playInteractionSound: event.target.checked }))} />
+        <SwitchControl disabled={invalidPreferences} checked={preferences.playInteractionSound} aria-label={t("settings.voiceInputInteractionSound")} onChange={(event) => setPreferences(writeVoiceInputPreferences({ playInteractionSound: event.target.checked }))} />
       </div>
       {desktopGlobalVoice !== undefined && (window.jokoDesktop?.platform === "darwin" || window.jokoDesktop?.platform === "win32") && <div className="setting-row">
         <div><strong>{t("settings.voiceInputMuteSystemAudio")}</strong><span>{t("settings.voiceInputMuteSystemAudioHint")}</span></div>
-        <SwitchControl checked={preferences.muteOtherSounds} aria-label={t("settings.voiceInputMuteSystemAudio")} onChange={(event) => setPreferences(writeVoiceInputPreferences({ muteOtherSounds: event.target.checked }))} />
+        <SwitchControl disabled={invalidPreferences} checked={preferences.muteOtherSounds} aria-label={t("settings.voiceInputMuteSystemAudio")} onChange={(event) => setPreferences(writeVoiceInputPreferences({ muteOtherSounds: event.target.checked }))} />
       </div>}
       <div className="setting-row">
         <div><strong>{t("settings.voiceInputFastActivation")}</strong><span>{t("settings.voiceInputFastActivationHint")}</span></div>
-        <SwitchControl checked={preferences.fastActivationEnabled} aria-label={t("settings.voiceInputFastActivation")} onChange={(event) => setPreferences(writeVoiceInputPreferences({ fastActivationEnabled: event.target.checked }))} />
+        <SwitchControl disabled={invalidPreferences} checked={preferences.fastActivationEnabled} aria-label={t("settings.voiceInputFastActivation")} onChange={(event) => setPreferences(writeVoiceInputPreferences({ fastActivationEnabled: event.target.checked }))} />
+      </div>
+      {invalidPreferences && <div className="setting-row">
+        <div><strong>{t("settings.voiceInputPreferencesReset")}</strong><span>{t("settings.voiceInputPreferencesResetHint")}</span></div>
+        <Button tone="ghost" onClick={() => { setPreferences(resetVoiceInputPreferences()); setInvalidPreferences(false); }}>{t("settings.voiceInputPreferencesReset")}</Button>
+      </div>}
+      <div className="voice-input-setting-stack">
+        <div className="setting-row">
+          <div><strong>{t("settings.voiceInputRecognitionContext")}</strong><span>{t("settings.voiceInputRecognitionContextHint")}</span></div>
+          <SwitchControl checked={recognitionEnabled} aria-label={t("settings.voiceInputRecognitionContext")}
+            onChange={(event) => { setRecognitionEnabled(event.target.checked); setRecognitionError(false); }} />
+        </div>
+        {capability.kind === "ready" && !capability.value.supportsRecognitionContext && <p>{t("settings.voiceInputRecognitionContextUnavailable")}</p>}
+        {recognitionTexts.map((text, index) => <div className="voice-input-setting-stack" key={index}>
+          <textarea value={text} rows={3} aria-label={t("settings.voiceInputRecognitionContextItem", { number: index + 1 })}
+            onChange={(event) => { setRecognitionTexts(recognitionTexts.map((value, position) => position === index ? event.target.value : value)); setRecognitionError(false); }} />
+          <Button tone="ghost" onClick={() => { setRecognitionTexts(recognitionTexts.filter((_value, position) => position !== index)); setRecognitionError(false); }}>{t("settings.voiceInputRecognitionContextRemove", { number: index + 1 })}</Button>
+        </div>)}
+        {recognitionError && <ErrorBanner message={t("settings.voiceInputRecognitionContextInvalid")} />}
+        <div className="voice-input-service-actions">
+          <Button tone="ghost" disabled={recognitionTexts.length >= 20} onClick={() => setRecognitionTexts([...recognitionTexts, ""])}>{t("settings.voiceInputRecognitionContextAdd")}</Button>
+          <Button disabled={invalidPreferences} onClick={() => {
+            try {
+              const context = voiceInputRecognitionContextFromTexts(recognitionTexts);
+              setPreferences(writeVoiceInputPreferences({ recognitionContextEnabled: recognitionEnabled, contextData: context?.contextData.map((item) => item.text) ?? [] }));
+              setRecognitionError(false);
+            } catch { setRecognitionError(true); }
+          }}>{t("settings.voiceInputRecognitionContextSave")}</Button>
+        </div>
       </div>
       {refinementEnabled && <>
         <div className="voice-input-setting-stack">
           <div><strong>{t("settings.voiceInputRefinementInstructions")}</strong><span>{t("settings.voiceInputRefinementInstructionsHint")}</span></div>
           <textarea
             value={preferences.refinementInstructions}
+            disabled={invalidPreferences}
             maxLength={MAXIMUM_VOICE_REFINEMENT_INSTRUCTIONS_CHARACTERS}
             rows={4}
             aria-label={t("settings.voiceInputRefinementInstructions")}
@@ -879,9 +1111,25 @@ export function VoiceInputSettings({ controller, t }: {
         </div>
         <div className="setting-row">
           <div><strong>{t("settings.voiceInputAutoDictionary")}</strong><span>{t("settings.voiceInputAutoDictionaryHint")}</span></div>
-          <SwitchControl checked={preferences.autoDictionaryEnabled} aria-label={t("settings.voiceInputAutoDictionary")} onChange={(event) => setPreferences(writeVoiceInputPreferences({ autoDictionaryEnabled: event.target.checked }))} />
+          <SwitchControl disabled={invalidPreferences} checked={preferences.autoDictionaryEnabled} aria-label={t("settings.voiceInputAutoDictionary")} onChange={(event) => setPreferences(writeVoiceInputPreferences({ autoDictionaryEnabled: event.target.checked }))} />
+        </div>
+        <div className="setting-row">
+          <div><strong>{t("settings.voiceInputDictionarySync")}</strong><span>{t("settings.voiceInputDictionarySyncHint")}</span></div>
+          <SwitchControl
+            checked={dictionary?.syncEnabled === true}
+            disabled={dictionary === undefined || dictionaryReadOnly}
+            aria-label={t("settings.voiceInputDictionarySync")}
+            onChange={(event) => {
+              const enabled = event.target.checked;
+              void commitDictionary(
+                (current, signal) => controller.setVoiceInputDictionarySyncEnabled(current.revision, enabled, signal),
+                t(enabled ? "settings.voiceInputDictionarySyncEnabled" : "settings.voiceInputDictionarySyncDisabled")
+              );
+            }}
+          />
         </div>
         <div className="voice-input-setting-stack">
+          <VoiceDictionaryPeers api={controller} t={t} enabled={dictionary?.syncEnabled ?? false} />
           <div><strong>{t("settings.voiceInputDictionary")}</strong><span>{t("settings.voiceInputDictionaryHint")}</span></div>
           <div className="voice-input-dictionary-add">
             <input
@@ -889,6 +1137,7 @@ export function VoiceInputSettings({ controller, t }: {
               maxLength={MAXIMUM_VOICE_DICTIONARY_TERM_CHARACTERS}
               aria-label={t("settings.voiceInputDictionaryNewTerm")}
               placeholder={t("settings.voiceInputDictionaryPlaceholder")}
+              disabled={dictionary === undefined || dictionaryReadOnly}
               onChange={(event) => {
                 setDictionaryDraft(event.target.value);
                 setDictionaryMessage(undefined);
@@ -899,7 +1148,7 @@ export function VoiceInputSettings({ controller, t }: {
                 addDictionaryEntry();
               }}
             />
-            <Button tone="primary" disabled={dictionaryDraft.trim() === ""} onClick={addDictionaryEntry}>{t("settings.voiceInputDictionaryAdd")}</Button>
+            <Button tone="primary" disabled={dictionary === undefined || dictionaryReadOnly || dictionaryDraft.trim() === ""} onClick={addDictionaryEntry}>{t("settings.voiceInputDictionaryAdd")}</Button>
           </div>
           <div className="voice-input-dictionary-toolbar">
             <input
@@ -917,13 +1166,18 @@ export function VoiceInputSettings({ controller, t }: {
             </SelectControl>
           </div>
           <div className="voice-input-dictionary-actions">
-            <span className={dictionaryMessage?.error === true ? "is-error" : undefined} role={dictionaryMessage?.error === true ? "alert" : "status"}>{dictionaryMessage?.text ?? t("settings.voiceInputDictionaryCountRich", { entries: dictionaryCounts.all, candidates: preferences.dictionary.candidates.length })}</span>
-            <label className="button button--ghost" htmlFor="voice-input-dictionary-import">{t("settings.voiceInputDictionaryImport")}</label>
+            <span className={dictionaryLiveFailed || dictionaryMessage?.error === true || visibleDictionaryState.kind === "error" ? "is-error" : undefined} role={dictionaryLiveFailed || dictionaryMessage?.error === true || visibleDictionaryState.kind === "error" ? "alert" : "status"}>{dictionaryLiveFailed ? t("settings.voiceInputDictionaryLoadFailed") : dictionaryMessage?.text
+              ?? (visibleDictionaryState.kind === "loading" ? t("settings.voiceInputDictionaryLoading")
+                : visibleDictionaryState.kind === "error" ? t("settings.voiceInputDictionaryLoadFailed")
+                  : t("settings.voiceInputDictionaryCountRich", { entries: dictionaryCounts.all, candidates: dictionary?.candidates.length ?? 0 }))}</span>
+            {(dictionaryLiveFailed || visibleDictionaryState.kind === "error") && <Button tone="ghost" disabled={dictionaryBusy} onClick={loadDictionary}>{t("common.retry")}</Button>}
+            <label className="button button--ghost" aria-disabled={dictionary === undefined || dictionaryReadOnly} htmlFor="voice-input-dictionary-import">{t("settings.voiceInputDictionaryImport")}</label>
             <input
               id="voice-input-dictionary-import"
               className="sr-only"
               type="file"
               accept=".csv,text/csv"
+              disabled={dictionary === undefined || dictionaryReadOnly}
               onChange={(event) => {
                 const file = event.target.files?.[0];
                 event.target.value = "";
@@ -932,7 +1186,11 @@ export function VoiceInputSettings({ controller, t }: {
             />
           </div>
           <div className="voice-input-dictionary-list" ref={dictionaryListRef}>
-            {visibleDictionaryEntries.length === 0
+            {visibleDictionaryState.kind !== "ready"
+              ? <p className="voice-input-dictionary-empty">{t(visibleDictionaryState.kind === "loading"
+                  ? "settings.voiceInputDictionaryLoading"
+                  : "settings.voiceInputDictionaryLoadFailed")}</p>
+              : visibleDictionaryEntries.length === 0
               ? <p className="voice-input-dictionary-empty">{t(normalizedDictionarySearch === "" && dictionaryFilter === "all"
                   ? "settings.voiceInputDictionaryEmpty"
                   : "settings.voiceInputDictionaryNoMatches")}</p>
@@ -942,6 +1200,7 @@ export function VoiceInputSettings({ controller, t }: {
                       ? <><input
                           autoFocus
                           value={editingDictionaryDraft}
+                          disabled={dictionaryReadOnly}
                           maxLength={MAXIMUM_VOICE_DICTIONARY_TERM_CHARACTERS}
                           aria-label={t("settings.voiceInputDictionaryEditTerm")}
                           onChange={(event) => setEditingDictionaryDraft(event.target.value)}
@@ -954,13 +1213,14 @@ export function VoiceInputSettings({ controller, t }: {
                               saveDictionaryEdit(entry.id);
                             }
                           }}
-                        />{preferences.dictionary.entries.some((candidate) => candidate.id !== entry.id
+                        />{dictionaryEntries.some((candidate) => candidate.id !== entry.id
                           && voiceDictionaryTermKey(candidate.text) === voiceDictionaryTermKey(editingDictionaryDraft))
                           && <small role="status">{t("settings.voiceInputDictionaryMergeHint")}</small>}<label className="field">
                           <span>{t("settings.voiceInputDictionaryEditAliases")}</span>
                           <textarea
                             rows={3}
                             value={editingDictionaryAliasesDraft}
+                            disabled={dictionaryReadOnly}
                             aria-label={t("settings.voiceInputDictionaryEditAliases")}
                             onChange={(event) => setEditingDictionaryAliasesDraft(event.target.value)}
                             onKeyDown={(event) => {
@@ -982,23 +1242,27 @@ export function VoiceInputSettings({ controller, t }: {
                   <div className="voice-input-dictionary-entry-actions">
                     {editingDictionaryEntryId === entry.id
                       ? <>
-                          <Button tone="primary" onClick={() => saveDictionaryEdit(entry.id)}>{t("common.save")}</Button>
-                          <Button tone="ghost" onClick={() => {
+                          <Button tone="primary" disabled={dictionaryReadOnly} onClick={() => saveDictionaryEdit(entry.id)}>{t("common.save")}</Button>
+                          <Button tone="ghost" disabled={dictionaryBusy} onClick={() => {
                             setEditingDictionaryEntryId(undefined);
                             setEditingDictionaryDraft("");
                             setEditingDictionaryAliasesDraft("");
                           }}>{t("common.cancel")}</Button>
                         </>
                       : <>
-                          <Button tone="ghost" data-dictionary-edit onClick={() => {
+                          <Button tone="ghost" disabled={dictionaryReadOnly} data-dictionary-edit onClick={() => {
                             setEditingDictionaryEntryId(entry.id);
+                            setEditingDictionaryRevision(dictionary!.revision);
                             setEditingDictionaryDraft(entry.text);
                             setEditingDictionaryAliasesDraft(entry.aliases.map((alias) => alias.text).join("\n"));
                             setDictionaryMessage(undefined);
                           }}>{t("common.edit")}</Button>
-                          <Button tone="ghost" onClick={() => {
-                            persistDictionary(deleteVoiceDictionaryEntry(preferences.dictionary, entry.id), t("settings.voiceInputDictionaryDeleted"));
-                            if (editingDictionaryEntryId === entry.id) setEditingDictionaryEntryId(undefined);
+                          <Button tone="ghost" disabled={dictionaryReadOnly} onClick={() => {
+                            void commitDictionary(
+                              (current, signal) => controller.deleteVoiceInputDictionaryEntry(current.revision, entry.id, signal),
+                              t("settings.voiceInputDictionaryDeleted"),
+                              () => { if (editingDictionaryEntryId === entry.id) setEditingDictionaryEntryId(undefined); }
+                            );
                           }}>{t("common.delete")}</Button>
                         </>}
                   </div>
@@ -1082,9 +1346,11 @@ function voiceInputProtocolLabel(protocol: VoiceInputTranscriptionProtocolView):
 
 function transcriptionAuthorityChanged(
   previousProtocol: VoiceInputTranscriptionProtocolView, previousEndpoint: string,
-  protocol: VoiceInputTranscriptionProtocolView, endpoint: string
+  protocol: VoiceInputTranscriptionProtocolView, endpoint: string,
+  previousSauc?: VoiceInputSaucSettingsView, sauc?: VoiceInputSaucSettingsView
 ): boolean {
   if (protocol !== previousProtocol) return true;
+  if (protocol === "volcengineSauc" && (previousSauc?.authentication !== sauc?.authentication || previousSauc?.appId !== sauc?.appId)) return true;
   try { return new URL(previousEndpoint).origin !== new URL(endpoint).origin; }
   catch { return true; }
 }
@@ -1125,14 +1391,60 @@ function voiceInputConnectionFailureKey(value: VoiceInputConnectionTestFailureVi
   }
 }
 
-function voiceInputLocaleLabelKey(locale: typeof VOICE_INPUT_LOCALES[number]): Parameters<Translator>[0] {
+function voiceInputLocaleLabel(locale: typeof VOICE_INPUT_LOCALES[number], t: Translator): string {
   switch (locale) {
-    case "zh-CN": return "language.zh-CN";
-    case "zh-TW": return "language.zh-TW";
-    case "en": return "language.en";
-    case "ja": return "language.ja";
-    case "ko": return "language.ko";
+    case "zh-CN": return t("language.zh-CN");
+    case "zh-TW": return t("language.zh-TW");
+    case "en": return t("language.en");
+    case "ja": return t("language.ja");
+    case "ko": return t("language.ko");
+    default: return t(`settings.voiceInputLocale.${locale}`);
   }
+}
+
+function SaucFields({ value, disabled, backup = false, onChange, t }: {
+  readonly value: VoiceInputSaucSettingsView; readonly disabled: boolean; readonly backup?: boolean;
+  readonly onChange: (value: VoiceInputSaucSettingsView) => void; readonly t: Translator;
+}): JSX.Element {
+  const label = (key: Parameters<Translator>[0]): string => backup ? t("settings.voiceInputBackupField", { field: t(key) }) : t(key);
+  const textFields = [
+    ["boostingTableName", "settings.voiceInputBoostingTableName"], ["boostingTableId", "settings.voiceInputBoostingTableId"],
+    ["correctTableName", "settings.voiceInputCorrectTableName"], ["correctTableId", "settings.voiceInputCorrectTableId"]
+  ] as const;
+  return <>
+    <div className="setting-row">
+      <div><strong>{label("settings.voiceInputSaucMode")}</strong><span>{t("settings.voiceInputSaucModeHint")}</span></div>
+      <SelectControl value={value.mode} disabled={disabled} aria-label={label("settings.voiceInputSaucMode")}
+        onChange={(event) => onChange({ ...value, mode: event.target.value as VoiceInputSaucSettingsView["mode"] })}>
+        <option value="asyncTwoPass">{t("settings.voiceInputSaucAsyncTwoPass")}</option>
+        <option value="bidirectional">{t("settings.voiceInputSaucBidirectional")}</option>
+        <option value="streamInput">{t("settings.voiceInputSaucStreamInput")}</option>
+      </SelectControl>
+    </div>
+    <div className="setting-row">
+      <div><strong>{label("settings.voiceInputSaucAuthentication")}</strong><span>{t("settings.voiceInputSaucAuthenticationHint")}</span></div>
+      <SelectControl value={value.authentication} disabled={disabled} aria-label={label("settings.voiceInputSaucAuthentication")}
+        onChange={(event) => onChange({ ...value, authentication: event.target.value as VoiceInputSaucSettingsView["authentication"], appId: "" })}>
+        <option value="apiKey">{t("settings.voiceInputServiceApiKey")}</option>
+        <option value="accessToken">{t("settings.voiceInputSaucAccessTokenAuthentication")}</option>
+      </SelectControl>
+    </div>
+    {value.authentication === "accessToken" && <div className="setting-row">
+      <div><strong>{label("settings.voiceInputSaucAppId")}</strong><span>{t("settings.voiceInputSaucAppIdHint")}</span></div>
+      <input value={value.appId} disabled={disabled} aria-label={label("settings.voiceInputSaucAppId")} spellCheck={false}
+        onChange={(event) => onChange({ ...value, appId: event.target.value })} />
+    </div>}
+    <div className="setting-row">
+      <div><strong>{label("settings.voiceInputDictionaryHotwords")}</strong><span>{t("settings.voiceInputDictionaryHotwordsHint")}</span></div>
+      <SwitchControl checked={value.useDictionaryHotwords} disabled={disabled} aria-label={label("settings.voiceInputDictionaryHotwords")}
+        onChange={(event) => onChange({ ...value, useDictionaryHotwords: event.target.checked })} />
+    </div>
+    {textFields.map(([field, key]) => <div className="setting-row" key={field}>
+      <div><strong>{label(key)}</strong><span>{t("settings.voiceInputServerTableHint")}</span></div>
+      <input value={value[field]} disabled={disabled} aria-label={label(key)} spellCheck={false}
+        onChange={(event) => onChange({ ...value, [field]: event.target.value })} />
+    </div>)}
+  </>;
 }
 
 function supportsManagedTextInference(compatibility: string): boolean {

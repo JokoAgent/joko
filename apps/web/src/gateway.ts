@@ -4,6 +4,8 @@ import { createConnectTransport } from "@connectrpc/connect-web";
 import { createTerminalGateway } from "./terminal-gateway.js";
 import { createSimulatorViewerGateway } from "./simulator-viewer-gateway.js";
 import { UsageReportGroup } from "@joko/contracts";
+import { projectVoiceInputSaucSettings, protoVoiceInputSaucSettings, type VoiceInputRecognitionContextView } from "@joko/contracts";
+import { nextVoiceDictionaryWatchSequence, projectVoiceDictionaryPeerStatus, readVoiceDictionaryPeerInvitation, type VoiceDictionaryPeerListener, type VoiceDictionaryPeerStatusView } from "@joko/contracts";
 import { SshKeyService, SshAgentState, SshAgentHostPlatform, SshKeyPassphrasePurpose, SshInstallShell, type SshKey, type CredentialUploadTicket } from "@joko/contracts";
 import type { SshKeyView, SshKeyCatalogView, SshKeyGenerateDraft, SshKeyInstallCommandDraft } from "./model.js";
 import type { UsageReportQueryView, UsageReportView } from "./model.js";
@@ -507,6 +509,7 @@ import {
   type ToolCall,
   type ToolResult,
   type VoiceInputCapabilityProfile as ProtoVoiceInputCapabilityProfile,
+  type VoiceInputDictionarySnapshot as ProtoVoiceInputDictionarySnapshot,
   type VoiceInputSession as ProtoVoiceInputSession,
   type SettingsSnapshot,
   type RuntimeCommand,
@@ -865,6 +868,7 @@ import type {
   VoiceInputDictionaryAdviceDraft,
   VoiceInputDictionaryAdviceView,
   VoiceInputDictionaryLearningActionView,
+  VoiceInputDictionarySnapshotView,
   VoiceInputRefinementContextView,
   VoiceInputServiceSettingsDraft,
   TelegramMessagingConfigurationView,
@@ -1494,6 +1498,139 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     return { ok: false, reason: voiceInputConnectionTestFailure(response.failure) };
   }
 
+  async getVoiceInputDictionary(signal?: AbortSignal): Promise<VoiceInputDictionarySnapshotView> {
+    const client = createClient(VoiceInputService, this.requireTransport());
+    const response = await client.getVoiceInputDictionary({}, voiceRpcOptions(this.#abort?.signal, signal));
+    return requireVoiceInputDictionary(response.dictionary);
+  }
+
+  async getVoiceInputDictionaryPeerStatus(signal?: AbortSignal): Promise<VoiceDictionaryPeerStatusView> {
+    const response = await createClient(VoiceInputService, this.requireTransport()).getVoiceInputDictionaryPeerStatus({}, voiceRpcOptions(this.#abort?.signal, signal));
+    return projectVoiceDictionaryPeerStatus(response.status);
+  }
+  async *watchVoiceInputDictionary(signal: AbortSignal): AsyncIterable<VoiceInputDictionarySnapshotView> {
+    let sequence = 0n;
+    const request = new AbortController();
+    const options = voiceRpcOptions(this.#abort?.signal, AbortSignal.any([signal, request.signal]))!;
+    try {
+      const stream = createClient(VoiceInputService, this.requireTransport()).watchVoiceInputDictionary({}, options);
+      for await (const response of stream) {
+        options.signal.throwIfAborted();
+        sequence = nextVoiceDictionaryWatchSequence(response.sequence, sequence);
+        yield requireVoiceInputDictionary(response.dictionary);
+      }
+    } finally { request.abort(); }
+  }
+  async *watchVoiceInputDictionaryPeerStatus(signal: AbortSignal): AsyncIterable<VoiceDictionaryPeerStatusView> {
+    let sequence = 0n;
+    const request = new AbortController();
+    const options = voiceRpcOptions(this.#abort?.signal, AbortSignal.any([signal, request.signal]))!;
+    try {
+      const stream = createClient(VoiceInputService, this.requireTransport()).watchVoiceInputDictionaryPeerStatus({}, options);
+      for await (const response of stream) {
+        options.signal.throwIfAborted();
+        sequence = nextVoiceDictionaryWatchSequence(response.sequence, sequence);
+        yield projectVoiceDictionaryPeerStatus(response.status);
+      }
+    } finally { request.abort(); }
+  }
+  async grantVoiceInputDictionaryPeer(expectedConfigurationRevision: bigint, peerId: string, expectedFingerprint: string, signal?: AbortSignal): Promise<VoiceDictionaryPeerStatusView> {
+    const response = await createClient(VoiceInputService, this.requireTransport()).grantVoiceInputDictionaryPeer({ expectedConfigurationRevision, peerId, expectedFingerprint }, voiceRpcOptions(this.#abort?.signal, signal));
+    return projectVoiceDictionaryPeerStatus(response.status);
+  }
+  async revokeVoiceInputDictionaryPeer(peerId: string, expectedGrantRevision: bigint, signal?: AbortSignal): Promise<VoiceDictionaryPeerStatusView> {
+    const response = await createClient(VoiceInputService, this.requireTransport()).revokeVoiceInputDictionaryPeer({ peerId, expectedGrantRevision }, voiceRpcOptions(this.#abort?.signal, signal));
+    return projectVoiceDictionaryPeerStatus(response.status);
+  }
+  async syncVoiceInputDictionaryNow(expectedConfigurationRevision: bigint, peerId?: string, signal?: AbortSignal): Promise<VoiceDictionaryPeerStatusView> {
+    const response = await createClient(VoiceInputService, this.requireTransport()).syncVoiceInputDictionaryNow({ expectedConfigurationRevision, ...(peerId === undefined ? {} : { peerId }) }, voiceRpcOptions(this.#abort?.signal, signal));
+    return projectVoiceDictionaryPeerStatus(response.status);
+  }
+  async configureVoiceInputDictionaryListener(expectedConfigurationRevision: bigint, listener: VoiceDictionaryPeerListener | undefined, signal?: AbortSignal): Promise<VoiceDictionaryPeerStatusView> {
+    const response = await createClient(VoiceInputService, this.requireTransport()).configureVoiceInputDictionaryListener({ expectedConfigurationRevision, listener }, voiceRpcOptions(this.#abort?.signal, signal));
+    return projectVoiceDictionaryPeerStatus(response.status);
+  }
+  async getVoiceInputDictionaryPeerInvitation(signal?: AbortSignal): Promise<string> {
+    const response = await createClient(VoiceInputService, this.requireTransport()).getVoiceInputDictionaryPeerInvitation({}, voiceRpcOptions(this.#abort?.signal, signal));
+    readVoiceDictionaryPeerInvitation(response.invitation);
+    return response.invitation;
+  }
+  async grantVoiceInputDictionaryDirectPeer(expectedConfigurationRevision: bigint, invitation: string, expectedFingerprint: string, signal?: AbortSignal): Promise<VoiceDictionaryPeerStatusView> {
+    const response = await createClient(VoiceInputService, this.requireTransport()).grantVoiceInputDictionaryDirectPeer({ expectedConfigurationRevision, invitation, expectedFingerprint }, voiceRpcOptions(this.#abort?.signal, signal));
+    return projectVoiceDictionaryPeerStatus(response.status);
+  }
+  async clearVoiceInputDictionaryPeerRoute(expectedConfigurationRevision: bigint, peerId: string, signal?: AbortSignal): Promise<VoiceDictionaryPeerStatusView> {
+    const response = await createClient(VoiceInputService, this.requireTransport()).clearVoiceInputDictionaryPeerRoute({ expectedConfigurationRevision, peerId }, voiceRpcOptions(this.#abort?.signal, signal));
+    return projectVoiceDictionaryPeerStatus(response.status);
+  }
+
+  async setVoiceInputDictionarySyncEnabled(
+    expectedRevision: bigint,
+    enabled: boolean,
+    signal?: AbortSignal
+  ): Promise<VoiceInputDictionarySnapshotView> {
+    const client = createClient(VoiceInputService, this.requireTransport());
+    const response = await client.setVoiceInputDictionarySyncEnabled(
+      { expectedRevision, enabled },
+      voiceRpcOptions(this.#abort?.signal, signal)
+    );
+    return requireVoiceInputDictionary(response.dictionary);
+  }
+
+  async addVoiceInputDictionaryTerms(
+    expectedRevision: bigint,
+    terms: readonly string[],
+    signal?: AbortSignal
+  ): Promise<VoiceInputDictionarySnapshotView> {
+    const client = createClient(VoiceInputService, this.requireTransport());
+    const response = await client.addVoiceInputDictionaryTerms(
+      { expectedRevision, terms: [...terms] },
+      voiceRpcOptions(this.#abort?.signal, signal)
+    );
+    return requireVoiceInputDictionary(response.dictionary);
+  }
+
+  async editVoiceInputDictionaryEntry(
+    expectedRevision: bigint,
+    entryId: string,
+    text: string,
+    aliases: readonly string[],
+    signal?: AbortSignal
+  ): Promise<VoiceInputDictionarySnapshotView> {
+    const client = createClient(VoiceInputService, this.requireTransport());
+    const response = await client.editVoiceInputDictionaryEntry(
+      { expectedRevision, entryId, text, aliases: [...aliases] },
+      voiceRpcOptions(this.#abort?.signal, signal)
+    );
+    return requireVoiceInputDictionary(response.dictionary);
+  }
+
+  async deleteVoiceInputDictionaryEntry(
+    expectedRevision: bigint,
+    entryId: string,
+    signal?: AbortSignal
+  ): Promise<VoiceInputDictionarySnapshotView> {
+    const client = createClient(VoiceInputService, this.requireTransport());
+    const response = await client.deleteVoiceInputDictionaryEntry(
+      { expectedRevision, entryId },
+      voiceRpcOptions(this.#abort?.signal, signal)
+    );
+    return requireVoiceInputDictionary(response.dictionary);
+  }
+
+  async applyVoiceInputDictionaryLearning(
+    expectedRevision: bigint,
+    actions: readonly VoiceInputDictionaryLearningActionView[],
+    signal?: AbortSignal
+  ): Promise<VoiceInputDictionarySnapshotView> {
+    const client = createClient(VoiceInputService, this.requireTransport());
+    const response = await client.applyVoiceInputDictionaryLearning({
+      expectedRevision,
+      actions: actions.map(toProtoVoiceInputDictionaryAction)
+    }, voiceRpcOptions(this.#abort?.signal, signal));
+    return requireVoiceInputDictionary(response.dictionary);
+  }
+
   async adviseVoiceInputDictionaryEdit(
     draft: VoiceInputDictionaryAdviceDraft,
     signal?: AbortSignal
@@ -1526,7 +1663,8 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     mimeType: string,
     locale?: string,
     refinement?: VoiceInputRefinementContextView,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    recognitionContext?: VoiceInputRecognitionContextView
   ): Promise<VoiceInputSessionView> {
     const client = createClient(VoiceInputService, this.requireTransport());
     const response = await client.startVoiceInput({
@@ -1534,7 +1672,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
       mimeType,
       ...(locale === undefined ? {} : { locale }),
       ...(refinement?.instructions === undefined ? {} : { refinementInstructions: refinement.instructions }),
-      dictionaryTerms: [...(refinement?.dictionaryTerms ?? [])]
+      ...(recognitionContext === undefined ? {} : { recognitionContext: { contextData: recognitionContext.contextData.map((value) => ({ text: value.text })) } })
     }, voiceRpcOptions(this.#abort?.signal, signal));
     return requireVoiceInputSession(response.session);
   }
@@ -8237,8 +8375,8 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     }, true);
   }
 
-  async updateVoiceInputServiceSettings(draft: VoiceInputServiceSettingsDraft): Promise<void> {
-    const scope = this.captureActionScope();
+  async updateVoiceInputServiceSettings(draft: VoiceInputServiceSettingsDraft, signal?: AbortSignal): Promise<void> {
+    const scope = this.captureActionScope(signal);
     const secret = draft.secret?.trim();
     const fallbackSecret = draft.fallbackSecret?.trim();
     const credentialUploadTicketId = secret === undefined || secret === ""
@@ -8258,6 +8396,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
           endpoint: draft.endpoint.trim(),
           model: draft.model.trim(),
           resourceId: draft.resourceId.trim(),
+          ...(draft.sauc === undefined ? {} : { sauc: protoVoiceInputSaucSettings(draft.sauc) }),
           keyless: draft.keyless,
           ...(credentialUploadTicketId === undefined ? {} : { credentialUploadTicketId }),
           ...(draft.clearCredential === undefined ? {} : { clearCredential: draft.clearCredential }),
@@ -8269,6 +8408,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
           fallbackEndpoint: draft.fallbackEndpoint.trim(),
           fallbackModel: draft.fallbackModel.trim(),
           fallbackResourceId: draft.fallbackResourceId.trim(),
+          ...(draft.fallbackSauc === undefined ? {} : { fallbackSauc: protoVoiceInputSaucSettings(draft.fallbackSauc) }),
           fallbackKeyless: draft.fallbackKeyless,
           ...(fallbackCredentialUploadTicketId === undefined ? {} : { fallbackCredentialUploadTicketId }),
           ...(draft.clearFallbackCredential === undefined ? {} : { clearFallbackCredential: draft.clearFallbackCredential }),
@@ -10949,7 +11089,12 @@ function mapVoiceInputCapability(profile: ProtoVoiceInputCapabilityProfile): Voi
     },
     supportsLocale: profile.supportsLocale,
     supportsLiveDrafts: profile.supportsLiveDrafts,
-    supportsRefinement: profile.supportsRefinement
+    supportsRefinement: profile.supportsRefinement,
+    supportsRecognitionContext: profile.supportsRecognitionContext,
+    recognitionContextMaximumItems: voiceInputNumber(profile.recognitionContextMaximumItems, "recognition context item limit"),
+    recognitionContextMaximumItemBytes: voiceInputNumber(profile.recognitionContextMaximumItemBytes, "recognition context item byte limit"),
+    recognitionContextMaximumBytes: voiceInputNumber(profile.recognitionContextMaximumBytes, "recognition context byte limit"),
+    supportedLocales: [...profile.supportedLocales]
   };
 }
 
@@ -10966,6 +11111,157 @@ function voiceInputConnectionTestFailure(
     case ProtoVoiceInputConnectionTestFailure.UNSPECIFIED:
       throw new GatewayError("Orchestrator returned no voice input connection test failure reason.");
   }
+}
+
+function requireVoiceInputDictionary(
+  value: ProtoVoiceInputDictionarySnapshot | undefined
+): VoiceInputDictionarySnapshotView {
+  if (value === undefined) throw new GatewayError("Orchestrator returned no voice input dictionary.");
+  if (value.revision < 1n || value.revision > BigInt(Number.MAX_SAFE_INTEGER) || value.entries.length > 1_000 || value.candidates.length > 200
+    || value.suppressedAutomaticTerms.length > 1_000 || value.refinementTerms.length > 200) {
+    throw new GatewayError("Orchestrator returned invalid voice input dictionary bounds.");
+  }
+  const entryIds = new Set<string>();
+  const entryTerms = new Set<string>();
+  const entries = value.entries.map((entry) => {
+    const id = entry.entryId.trim();
+    const text = voiceInputDictionaryTerm(entry.text, "entry");
+    const key = voiceInputDictionaryTermKey(text);
+    if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u.test(id) || entryIds.has(id) || entryTerms.has(key)) {
+      throw new GatewayError("Orchestrator returned a duplicate or invalid voice input dictionary entry.");
+    }
+    const source = entry.source === VoiceInputDictionaryEntrySource.MANUAL ? "manual" as const
+      : entry.source === VoiceInputDictionaryEntrySource.AUTOMATIC ? "automatic" as const
+        : (() => { throw new GatewayError("Orchestrator returned an unspecified voice input dictionary source."); })();
+    const createdAt = voiceInputTimestamp(entry.createdAt, "dictionary entry created");
+    const updatedAt = voiceInputTimestamp(entry.updatedAt, "dictionary entry updated");
+    if (updatedAt < createdAt) throw new GatewayError("Orchestrator returned an invalid voice input dictionary entry time.");
+    entryIds.add(id);
+    entryTerms.add(key);
+    return Object.freeze({
+      id,
+      text,
+      source,
+      frequency: positiveVoiceInputCounter(entry.frequency, "dictionary entry frequency"),
+      aliases: mapVoiceInputDictionaryAliases(entry.aliases),
+      createdAt,
+      updatedAt
+    });
+  });
+  const candidateTerms = new Set<string>();
+  const candidates = value.candidates.map((candidate) => {
+    const text = voiceInputDictionaryTerm(candidate.text, "candidate");
+    const key = voiceInputDictionaryTermKey(text);
+    if (entryTerms.has(key) || candidateTerms.has(key)) {
+      throw new GatewayError("Orchestrator returned a duplicate voice input dictionary candidate.");
+    }
+    const createdAt = voiceInputTimestamp(candidate.createdAt, "dictionary candidate created");
+    const updatedAt = voiceInputTimestamp(candidate.updatedAt, "dictionary candidate updated");
+    if (updatedAt < createdAt) throw new GatewayError("Orchestrator returned an invalid voice input dictionary candidate time.");
+    candidateTerms.add(key);
+    return Object.freeze({
+      text,
+      evidenceCount: positiveVoiceInputCounter(candidate.evidenceCount, "dictionary candidate evidence count"),
+      aliases: mapVoiceInputDictionaryAliases(candidate.aliases),
+      createdAt,
+      updatedAt
+    });
+  });
+  const suppressedAutomaticTerms = mapVoiceInputDictionaryTermList(
+    value.suppressedAutomaticTerms,
+    1_000,
+    "suppressed term"
+  );
+  const automaticTerms = new Set(entries.filter((entry) => entry.source === "automatic").map((entry) => voiceInputDictionaryTermKey(entry.text)));
+  if (suppressedAutomaticTerms.some((term) => automaticTerms.has(voiceInputDictionaryTermKey(term)))) {
+    throw new GatewayError("Orchestrator returned an active suppressed voice input dictionary term.");
+  }
+  const refinementTerms = mapVoiceInputDictionaryTermList(value.refinementTerms, 200, "refinement term");
+  if (refinementTerms.reduce((sum, term) => sum + term.length, 0) > 8_000
+    || refinementTerms.some((term) => !entryTerms.has(voiceInputDictionaryTermKey(term)))) {
+    throw new GatewayError("Orchestrator returned invalid voice input dictionary refinement terms.");
+  }
+  return Object.freeze({
+    revision: value.revision,
+    syncEnabled: value.syncEnabled,
+    entries: Object.freeze(entries),
+    candidates: Object.freeze(candidates),
+    suppressedAutomaticTerms,
+    refinementTerms
+  });
+}
+
+function mapVoiceInputDictionaryAliases(
+  values: ProtoVoiceInputDictionarySnapshot["entries"][number]["aliases"]
+): readonly VoiceInputDictionarySnapshotView["entries"][number]["aliases"][number][] {
+  if (values.length > 8) throw new GatewayError("Orchestrator returned too many voice input dictionary aliases.");
+  const seen = new Set<string>();
+  return Object.freeze(values.map((alias) => {
+    const text = voiceInputDictionaryTerm(alias.text, "alias");
+    const key = voiceInputDictionaryTermKey(text);
+    if (seen.has(key)) throw new GatewayError("Orchestrator returned a duplicate voice input dictionary alias.");
+    seen.add(key);
+    return Object.freeze({
+      text,
+      count: positiveVoiceInputCounter(alias.count, "dictionary alias count"),
+      lastSeenAt: voiceInputTimestamp(alias.lastSeenAt, "dictionary alias last seen")
+    });
+  }));
+}
+
+function mapVoiceInputDictionaryTermList(
+  values: readonly string[],
+  maximum: number,
+  label: string
+): readonly string[] {
+  if (values.length > maximum) throw new GatewayError(`Orchestrator returned too many voice input dictionary ${label}s.`);
+  const seen = new Set<string>();
+  return Object.freeze(values.map((value) => {
+    const text = voiceInputDictionaryTerm(value, label);
+    const key = voiceInputDictionaryTermKey(text);
+    if (seen.has(key)) throw new GatewayError(`Orchestrator returned duplicate voice input dictionary ${label}s.`);
+    seen.add(key);
+    return text;
+  }));
+}
+
+function voiceInputDictionaryTerm(value: string, label: string): string {
+  const term = value.replace(/\s+/gu, " ").trim();
+  if (term !== value || term === "" || term.length > 120 || /[\u0000-\u001f\u007f]/u.test(term)) {
+    throw new GatewayError(`Orchestrator returned an invalid voice input dictionary ${label}.`);
+  }
+  return term;
+}
+
+function voiceInputDictionaryTermKey(value: string): string {
+  return value.toLocaleLowerCase();
+}
+
+function positiveVoiceInputCounter(value: bigint, label: string): number {
+  const mapped = voiceInputCounter(value, label);
+  if (mapped < 1) throw new GatewayError(`Orchestrator returned an invalid voice input ${label}.`);
+  return mapped;
+}
+
+function toProtoVoiceInputDictionaryAction(value: VoiceInputDictionaryLearningActionView) {
+  return {
+    action: value.action === "addCandidate" ? VoiceInputDictionaryLearningActionType.ADD_CANDIDATE
+      : value.action === "addEntry" ? VoiceInputDictionaryLearningActionType.ADD_ENTRY
+        : VoiceInputDictionaryLearningActionType.UPDATE_ENTRY,
+    term: value.term,
+    aliases: [...value.aliases],
+    termType: value.type === "productName" ? VoiceInputDictionaryTermType.PRODUCT_NAME
+      : value.type === "projectName" ? VoiceInputDictionaryTermType.PROJECT_NAME
+        : value.type === "technicalTerm" ? VoiceInputDictionaryTermType.TECHNICAL_TERM
+          : value.type === "personName" ? VoiceInputDictionaryTermType.PERSON_NAME
+            : value.type === "teamName" ? VoiceInputDictionaryTermType.TEAM_NAME
+              : value.type === "codeName" ? VoiceInputDictionaryTermType.CODE_NAME
+                : value.type === "phrase" ? VoiceInputDictionaryTermType.PHRASE
+                  : VoiceInputDictionaryTermType.OTHER,
+    confidence: value.confidence === "high"
+      ? VoiceInputDictionaryLearningConfidence.HIGH
+      : VoiceInputDictionaryLearningConfidence.MEDIUM
+  };
 }
 
 function mapVoiceInputDictionaryAction(value: {
@@ -16296,6 +16592,7 @@ function mapSettings(settings: SettingsSnapshot | undefined): SettingsView {
           endpoint: settings.voiceInput.endpoint,
           model: settings.voiceInput.model,
           resourceId: settings.voiceInput.resourceId,
+          ...(settings.voiceInput.sauc === undefined ? {} : { sauc: projectVoiceInputSaucSettings(settings.voiceInput.sauc)! }),
           keyless: settings.voiceInput.keyless,
           credentialConfigured: settings.voiceInput.credentialConfigured,
           refinementEnabled: settings.voiceInput.refinementEnabled,
@@ -16310,6 +16607,7 @@ function mapSettings(settings: SettingsSnapshot | undefined): SettingsView {
           fallbackEndpoint: settings.voiceInput.fallbackEndpoint,
           fallbackModel: settings.voiceInput.fallbackModel,
           fallbackResourceId: settings.voiceInput.fallbackResourceId,
+          ...(settings.voiceInput.fallbackSauc === undefined ? {} : { fallbackSauc: projectVoiceInputSaucSettings(settings.voiceInput.fallbackSauc)! }),
           fallbackKeyless: settings.voiceInput.fallbackKeyless,
           fallbackCredentialConfigured: settings.voiceInput.fallbackCredentialConfigured,
           revision: settings.voiceInput.version?.revision?.value ?? 0n

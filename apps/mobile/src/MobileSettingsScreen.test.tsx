@@ -25,7 +25,9 @@ import type { MobileThemePreferenceState } from "./mobile-theme-preference";
 import type { MobileDiagnosticsState } from "./mobile-diagnostics";
 import type { MobileLocalePreferenceState } from "./mobile-locale-preference";
 import { EMPTY_MOBILE_VOICE_DICTIONARY } from "./mobile-voice-dictionary";
-import type { MobileVoiceDictionaryStoreState } from "./mobile-voice-dictionary-store";
+import { MobileVoiceDictionaryReadOnlyCache } from "./mobile-voice-dictionary-readonly-cache";
+import { MobileVoiceDictionaryReadOnlyController } from "./mobile-voice-dictionary-readonly-controller";
+import type { MobileVoicePreferencesStoreState } from "./mobile-voice-preferences-store";
 import type { MobileUpdateControllerState } from "./mobile-update-controller";
 import type { MobilePushControllerState } from "./mobile-push-controller";
 
@@ -64,6 +66,7 @@ vi.mock("react-native", async () => {
     }, props.children);
   return {
     Alert: { alert: native.alert },
+    AppState: { addEventListener: () => ({ remove: () => undefined }) },
     BackHandler: { addEventListener: (_name: string, handler: () => boolean) => {
       native.hardwareBack = handler;
       return { remove: () => { if (native.hardwareBack === handler) native.hardwareBack = undefined; } };
@@ -71,6 +74,8 @@ vi.mock("react-native", async () => {
     Platform: { OS: "android" },
     Pressable: element("button"),
     ScrollView: element("div"),
+    FlatList: ({ ListHeaderComponent, ListEmptyComponent }: { ListHeaderComponent: React.ReactNode; ListEmptyComponent: React.ReactNode }) =>
+      React.createElement("div", {}, ListHeaderComponent, ListEmptyComponent),
     Switch: ({ accessibilityLabel, value, onValueChange, disabled }: {
       accessibilityLabel?: string;
       value?: boolean;
@@ -219,16 +224,16 @@ const readyDiagnostics: MobileDiagnosticsState = {
   exporting: false,
   eventCount: 0
 };
-const readyVoiceDictionary: MobileVoiceDictionaryStoreState = {
+const readyVoiceDictionary: MobileVoicePreferencesStoreState = {
   status: "ready",
   saving: false,
   document: {
     version: 1,
     revision: 0,
-    dictionaryRevision: 0,
+    preferencesRevision: 0,
     refinementInstructions: "",
+    recognitionContextEnabled: false, recognitionContextData: [],
     autoLearningEnabled: true,
-    dictionary: EMPTY_MOBILE_VOICE_DICTIONARY,
     usage: { voiceStarts: 0, correctionObservations: 0, lastVoiceStartedAt: null, lastCorrectionAt: null },
     history: []
   }
@@ -277,7 +282,7 @@ function mount(options: {
   theme?: MobileThemePreferenceState;
   locale?: MobileLocalePreferenceState;
   diagnostics?: MobileDiagnosticsState;
-  voiceDictionary?: MobileVoiceDictionaryStoreState;
+  voiceDictionary?: MobileVoicePreferencesStoreState;
   updates?: MobileUpdateControllerState;
   push?: MobilePushControllerState;
   client?: MobileSettingsClient;
@@ -294,6 +299,9 @@ function mount(options: {
   const onCheck = vi.fn(async () => undefined);
   const onReset = vi.fn(async () => undefined);
   const onBack = vi.fn();
+  const readOnlyDictionary = new MobileVoiceDictionaryReadOnlyController(new MobileVoiceDictionaryReadOnlyCache({
+    getItem: async () => null, setItem: async () => undefined, removeItem: async () => undefined, getAllKeys: async () => []
+  }), async () => { throw new Error("No read-only source fixture."); });
   const onConnections = vi.fn();
   const onDevices = vi.fn();
   let state = options.state ?? mobileState();
@@ -312,6 +320,9 @@ function mount(options: {
     locale,
     diagnostics,
     voiceDictionary,
+    readOnlyDictionary,
+    nodeDictionary: { status: "ready", ownerKey: "node", saving: false,
+      snapshot: { revision: 1n, syncEnabled: false, dictionary: EMPTY_MOBILE_VOICE_DICTIONARY, refinementTerms: [] } },
     updates,
     push,
     updateActions: { onChannelChange, onCheck, onReset },
@@ -326,6 +337,8 @@ function mount(options: {
     onVoiceDictionaryReset: vi.fn(async () => undefined),
     onVoiceInstructionsChange: vi.fn(async () => undefined),
     onVoiceAutoLearningChange: vi.fn(async () => undefined),
+    onVoiceDictionaryRefresh: vi.fn(async () => undefined),
+    onVoiceDictionarySyncChange: vi.fn(async () => undefined),
     onVoiceDictionaryAdd: vi.fn(async () => undefined),
     onVoiceDictionaryEdit: vi.fn(async () => "updated" as const),
     onVoiceDictionaryDelete: vi.fn(async () => undefined),
@@ -353,7 +366,7 @@ function mount(options: {
     onDevices,
     rerender: (next: { state?: MobileState; foreground?: boolean; theme?: MobileThemePreferenceState;
       locale?: MobileLocalePreferenceState;
-      diagnostics?: MobileDiagnosticsState; voiceDictionary?: MobileVoiceDictionaryStoreState;
+      diagnostics?: MobileDiagnosticsState; voiceDictionary?: MobileVoicePreferencesStoreState;
       updates?: MobileUpdateControllerState; push?: MobilePushControllerState }) => {
       state = next.state ?? state;
       foreground = next.foreground ?? foreground;
@@ -392,6 +405,18 @@ function deferred<T>() {
 }
 
 describe("MobileSettingsScreen", () => {
+  it("opens the readonly shared dictionary from Settings and voice preferences, and returns to the initiating surface", async () => {
+    const mounted = mount();
+    await act(async () => button(mounted.container, "Shared dictionary · read only").click());
+    expect(mounted.container.textContent).toContain("No paired dictionary sources.");
+    act(() => button(mounted.container, "Back to Settings").click());
+    act(() => button(mounted.container, "Voice input").click());
+    await act(async () => button(mounted.container, "Shared dictionary · read only").click());
+    act(() => { expect(native.hardwareBack?.()).toBe(true); });
+    expect(mounted.container.textContent).toContain("Refinement instructions");
+    expect(mounted.onBack).not.toHaveBeenCalled();
+  });
+
   it("renders exact node/device/about identity, changes theme, copies ID, and navigates", async () => {
     const mounted = mount();
 
@@ -403,7 +428,7 @@ describe("MobileSettingsScreen", () => {
     expect(mounted.container.textContent).toContain("0.1.0-test");
 
     act(() => button(mounted.container, "Voice input").click());
-    expect(mounted.container.textContent).toContain("These instructions, entries, correction evidence");
+    expect(mounted.container.textContent).toContain("The node stores dictionary terms and vocabulary evidence.");
     act(() => button(mounted.container, "Back to Voice input").click());
     expect(mounted.container.textContent).toContain("Settings");
 

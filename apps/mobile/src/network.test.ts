@@ -1,4 +1,4 @@
-import { create } from "@bufbuild/protobuf";
+import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
 import { TimestampSchema } from "@bufbuild/protobuf/wkt";
 import {
   ArtifactKind,
@@ -21,8 +21,30 @@ import {
   VoiceInputDictionaryLearningActionType,
   VoiceInputDictionaryLearningConfidence,
   VoiceInputDictionaryTermType,
+  VoiceInputDictionarySnapshotSchema,
+  GetVoiceInputDictionaryResponseSchema,
+  WatchVoiceInputDictionaryResponseSchema,
+  WatchVoiceInputDictionaryPeerStatusResponseSchema,
+  WatchVoiceInputDictionaryReadOnlyResponseSchema,
+  VoiceInputDictionaryPeerPhase,
+  SetVoiceInputDictionarySyncEnabledResponseSchema,
+  AddVoiceInputDictionaryTermsResponseSchema,
+  EditVoiceInputDictionaryEntryResponseSchema,
+  DeleteVoiceInputDictionaryEntryResponseSchema,
+  ApplyVoiceInputDictionaryLearningResponseSchema,
+  AddVoiceInputDictionaryTermsRequestSchema,
+  ApplyVoiceInputDictionaryLearningRequestSchema,
+  ConfigureVoiceInputDictionaryListenerResponseSchema,
+  ConfigureVoiceInputDictionaryListenerRequestSchema,
+  GetVoiceInputDictionaryPeerInvitationResponseSchema,
+  GrantVoiceInputDictionaryDirectPeerResponseSchema,
+  GrantVoiceInputDictionaryDirectPeerRequestSchema,
+  ClearVoiceInputDictionaryPeerRouteResponseSchema,
+  ClearVoiceInputDictionaryPeerRouteRequestSchema,
   WorkspaceEntrySchema,
-  WorkspaceSearchMatchSchema
+  WorkspaceSearchMatchSchema,
+  VoiceInputServiceSettingsSchema, VoiceInputTranscriptionProtocol, VoiceInputSaucSettingsSchema, VoiceInputSaucMode, VoiceInputSaucAuthentication,
+  GetSettingsResponseSchema, BeginCredentialUploadResponseSchema, BeginCredentialUploadRequestSchema, TestVoiceInputConnectionResponseSchema
 } from "@joko/contracts";
 import { describe, expect, it, vi } from "vitest";
 import {
@@ -42,11 +64,186 @@ import {
   downloadVerifiedBlob,
   uploadVerifiedBlob,
   validateScheduleHistoryPage,
-  mobileVoiceNetworkTesting
+  mobileVoiceNetworkTesting,
+  mobileNetwork,
+  type PairedCredential
 } from "./network";
+import { projectMobileVoiceDictionarySnapshot, mobileVoiceDictionaryLearningRequest } from "./mobile-voice-dictionary-service";
 
 describe("mobile voice ephemeral requests", () => {
-  it("projects device-local evidence and refinement without adding a durable shape", () => {
+  it("loads voice service settings, uploads credentials only through a same-origin ticket, and keeps context separate", async () => {
+    const credential: PairedCredential = { profileId: "voice-profile", origin: "https://node.example", serverId: "voice-server", connectionId: "voice-connection", deviceId: "voice-device", displayName: "Phone", authKey: "voice-test-key" };
+    const settings = create(VoiceInputServiceSettingsSchema, { protocol: VoiceInputTranscriptionProtocol.VOLCENGINE_SAUC,
+      fallbackProtocol: VoiceInputTranscriptionProtocol.OPENAI_COMPATIBLE_BATCH, version: { revision: { value: 4n } },
+      sauc: create(VoiceInputSaucSettingsSchema, { mode: VoiceInputSaucMode.STREAM_INPUT, authentication: VoiceInputSaucAuthentication.ACCESS_TOKEN, appId: "public-app" }) });
+    let relativeEndpoint = "/credentials/input/voice-ticket";
+    const calls: { url: string; body: Uint8Array; signal: AbortSignal | null | undefined }[] = [];
+    let originalBytes: Uint8Array | undefined;
+    const fetcher = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const url = String(input); const body = new Uint8Array(init?.body as Uint8Array);
+      calls.push({ url, body, signal: init?.signal });
+      expect(new Headers(init?.headers).get("authorization")).toBe(`Bearer ${credential.authKey}`);
+      if (init?.method === "PUT") { originalBytes = init.body as Uint8Array; return new Response(null, { status: 204 }); }
+      const bytes = url.endsWith("GetSettings") ? toBinary(GetSettingsResponseSchema, create(GetSettingsResponseSchema, { settings: { voiceInput: settings } }))
+        : url.endsWith("BeginCredentialUpload") ? toBinary(BeginCredentialUploadResponseSchema, create(BeginCredentialUploadResponseSchema, { ticket: { ticketId: "voice-ticket", relativeEndpoint, maximumBytes: 65_536n } }))
+          : toBinary(TestVoiceInputConnectionResponseSchema, create(TestVoiceInputConnectionResponseSchema, { ok: true }));
+      return new Response(bytes, { status: 200, headers: { "content-type": "application/proto" } });
+    });
+    try {
+      await expect(mobileNetwork.getVoiceInputServiceSettings(credential)).resolves.toEqual(settings);
+      await expect(mobileNetwork.uploadVoiceInputSecret(credential, "temporary-private-value", true)).resolves.toBe("voice-ticket");
+      expect(fromBinary(BeginCredentialUploadRequestSchema, calls[1]!.body).providerId).toBe("");
+      expect(calls[2]!.url).toBe("https://node.example/credentials/input/voice-ticket");
+      expect(new TextDecoder().decode(calls[2]!.body)).toBe("temporary-private-value");
+      expect(originalBytes?.every((byte) => byte === 0)).toBe(true);
+      await expect(mobileNetwork.testVoiceInputConnection(credential)).resolves.toMatchObject({ ok: true });
+      relativeEndpoint = "//other.example/credentials/input/voice-ticket";
+      await expect(mobileNetwork.uploadVoiceInputSecret(credential, "private-value", false)).rejects.toThrow(/invalid/u);
+      expect(calls.filter((call) => call.url.includes("other.example"))).toHaveLength(0);
+      expect(mobileVoiceNetworkTesting.startRequest("context", "audio/pcm", undefined, { instructions: "refine" },
+        { contextData: [{ text: " first\r\nsecond " }] })).toEqual({ requestId: "context", mimeType: "audio/pcm", refinementInstructions: "refine", recognitionContext: { contextData: [{ text: "first\nsecond" }] } });
+    } finally { fetcher.mockRestore(); }
+  });
+  it("uses generated direct-route requests with separate revision and fingerprint confirmation and validates the public invitation", async () => {
+    const listener = { listenPort: 43_121, host: "self.example", port: 44_121 };
+    const status = { available: true, configurationRevision: 4n, nodeId: "node-a", fingerprint: "a".repeat(64), enabled: true,
+      phase: VoiceInputDictionaryPeerPhase.WAITING, listener,
+      peers: [{ peerId: "node-b", revision: 3n, displayName: "Peer", fingerprint: "b".repeat(64), online: false,
+        grantedAt: { seconds: 1n }, route: { host: "peer.example", port: 43_121 } }] };
+    let invitation = JSON.stringify({ version: 1, nodeId: "node-a", displayName: "Node", publicKey: "MCowBQYDK2VuAyEA" + "A".repeat(43) + "=",
+      fingerprint: "a".repeat(64), host: listener.host, port: listener.port });
+    const calls: Array<{ method: string; body: Uint8Array }> = [];
+    const credential: PairedCredential = { profileId: "direct-profile", origin: "https://node.example", serverId: "node-a", connectionId: "direct-connection",
+      deviceId: "direct-phone", displayName: "Phone", authKey: "direct-test-key" };
+    const fetch = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const request = new Request(input, init);
+      expect(request.headers.get("authorization")).toBe("Bearer direct-test-key");
+      const method = request.url.slice(request.url.lastIndexOf("/") + 1);
+      calls.push({ method, body: new Uint8Array(await request.arrayBuffer()) });
+      const responses = {
+        ConfigureVoiceInputDictionaryListener: toBinary(ConfigureVoiceInputDictionaryListenerResponseSchema, create(ConfigureVoiceInputDictionaryListenerResponseSchema, { status })),
+        GetVoiceInputDictionaryPeerInvitation: toBinary(GetVoiceInputDictionaryPeerInvitationResponseSchema, create(GetVoiceInputDictionaryPeerInvitationResponseSchema, { invitation })),
+        GrantVoiceInputDictionaryDirectPeer: toBinary(GrantVoiceInputDictionaryDirectPeerResponseSchema, create(GrantVoiceInputDictionaryDirectPeerResponseSchema, { status })),
+        ClearVoiceInputDictionaryPeerRoute: toBinary(ClearVoiceInputDictionaryPeerRouteResponseSchema, create(ClearVoiceInputDictionaryPeerRouteResponseSchema, { status }))
+      };
+      const bytes = responses[method as keyof typeof responses];
+      if (!bytes) throw new Error("Unexpected direct dictionary RPC.");
+      return new Response(bytes, { status: 200, headers: { "content-type": "application/proto" } });
+    });
+    try {
+      await expect(mobileNetwork.configureVoiceInputDictionaryListener(credential, 3n, listener)).resolves.toMatchObject({ listener, peers: [{ online: false, route: { host: "peer.example", port: 43_121 } }] });
+      await expect(mobileNetwork.getVoiceInputDictionaryPeerInvitation(credential)).resolves.toBe(invitation);
+      await mobileNetwork.grantVoiceInputDictionaryDirectPeer(credential, 4n, invitation, "a".repeat(64));
+      await mobileNetwork.clearVoiceInputDictionaryPeerRoute(credential, 4n, "node-b");
+      await mobileNetwork.configureVoiceInputDictionaryListener(credential, 4n, undefined);
+      expect(fromBinary(ConfigureVoiceInputDictionaryListenerRequestSchema, calls[0]!.body)).toMatchObject({ expectedConfigurationRevision: 3n, listener });
+      expect(fromBinary(GrantVoiceInputDictionaryDirectPeerRequestSchema, calls[2]!.body)).toMatchObject({ expectedConfigurationRevision: 4n, invitation, expectedFingerprint: "a".repeat(64) });
+      expect(fromBinary(ClearVoiceInputDictionaryPeerRouteRequestSchema, calls[3]!.body)).toMatchObject({ expectedConfigurationRevision: 4n, peerId: "node-b" });
+      expect(fromBinary(ConfigureVoiceInputDictionaryListenerRequestSchema, calls[4]!.body).listener).toBeUndefined();
+      invitation = JSON.stringify({ version: 1, authKey: "private" });
+      await expect(mobileNetwork.getVoiceInputDictionaryPeerInvitation(credential)).rejects.toThrow(/invalid/u);
+    } finally { fetch.mockRestore(); }
+  });
+  it.each(["content", "sharing", "readonly"] as const)("decodes the generated %s stream and cancels its HTTP owner after a duplicate sequence or consumer return", async (kind) => {
+    const signals: AbortSignal[] = [];
+    const credential: PairedCredential = { profileId: "voice-profile", origin: "https://node.example", serverId: "voice-server", connectionId: "voice-connection", deviceId: "voice-device", displayName: "Voice phone", authKey: "voice-test-key" };
+    const content = create(WatchVoiceInputDictionaryResponseSchema, { sequence: 1n, dictionary: dictionaryWireSnapshot() });
+    const sharing = create(WatchVoiceInputDictionaryPeerStatusResponseSchema, { sequence: 1n, status: { available: true,
+      configurationRevision: 3n, nodeId: "voice-server", fingerprint: "a".repeat(64), enabled: true, phase: VoiceInputDictionaryPeerPhase.WAITING } });
+    const readonly = create(WatchVoiceInputDictionaryReadOnlyResponseSchema, { sequence: 1n, dictionary: {
+      revision: 4n, syncEnabled: false, entries: [], stateVector: { versions: [{ nodeId: "a", stamp: "0000000001.0000.a" }] }
+    } });
+    const message = kind === "content" ? toBinary(WatchVoiceInputDictionaryResponseSchema, content)
+      : kind === "sharing" ? toBinary(WatchVoiceInputDictionaryPeerStatusResponseSchema, sharing)
+        : toBinary(WatchVoiceInputDictionaryReadOnlyResponseSchema, readonly);
+    const frame = new Uint8Array(5 + message.byteLength);
+    new DataView(frame.buffer).setUint32(1, message.byteLength); frame.set(message, 5);
+    const fetch = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const request = new Request(input, init); signals.push(request.signal);
+      expect(request.headers.get("authorization")).toBe("Bearer voice-test-key");
+      expect(request.url).toMatch(kind === "content" ? /\/WatchVoiceInputDictionary$/u
+        : kind === "sharing" ? /\/WatchVoiceInputDictionaryPeerStatus$/u : /\/WatchVoiceInputDictionaryReadOnly$/u);
+      return new Response(new ReadableStream<Uint8Array>({ start(controller) {
+        controller.enqueue(frame); controller.enqueue(frame);
+        request.signal.addEventListener("abort", () => controller.close(), { once: true });
+      } }), { status: 200, headers: { "content-type": "application/connect+proto" } });
+    });
+    const request = new AbortController();
+    const watch = () => kind === "content" ? mobileNetwork.watchVoiceInputDictionary(credential, request.signal)
+      : kind === "sharing" ? mobileNetwork.watchVoiceInputDictionaryPeerStatus(credential, request.signal)
+        : mobileNetwork.watchVoiceInputDictionaryReadOnly(credential, request.signal);
+    try {
+      const stream = watch()[Symbol.asyncIterator]();
+      await expect(stream.next()).resolves.toMatchObject({ done: false, value: kind === "sharing" ? { configurationRevision: 3n } : { revision: 4n } });
+      await expect(stream.next()).rejects.toThrow(/invalid/u);
+      expect(signals[0]!.aborted).toBe(true);
+      const resumed = watch()[Symbol.asyncIterator]();
+      await expect(resumed.next()).resolves.toMatchObject({ done: false });
+      await resumed.return?.();
+      expect(signals[1]!.aborted).toBe(true);
+      expect(fetch).toHaveBeenCalledTimes(2);
+    } finally { request.abort(); fetch.mockRestore(); }
+  });
+  it("maps all generated dictionary RPCs with one credential and semantic expected revisions", async () => {
+    const dictionary = dictionaryWireSnapshot();
+    const responses = [
+      ["GetVoiceInputDictionary", toBinary(GetVoiceInputDictionaryResponseSchema, create(GetVoiceInputDictionaryResponseSchema, { dictionary }))],
+      ["SetVoiceInputDictionarySyncEnabled", toBinary(SetVoiceInputDictionarySyncEnabledResponseSchema, create(SetVoiceInputDictionarySyncEnabledResponseSchema, { dictionary }))],
+      ["AddVoiceInputDictionaryTerms", toBinary(AddVoiceInputDictionaryTermsResponseSchema, create(AddVoiceInputDictionaryTermsResponseSchema, { dictionary }))],
+      ["EditVoiceInputDictionaryEntry", toBinary(EditVoiceInputDictionaryEntryResponseSchema, create(EditVoiceInputDictionaryEntryResponseSchema, { dictionary }))],
+      ["DeleteVoiceInputDictionaryEntry", toBinary(DeleteVoiceInputDictionaryEntryResponseSchema, create(DeleteVoiceInputDictionaryEntryResponseSchema, { dictionary }))],
+      ["ApplyVoiceInputDictionaryLearning", toBinary(ApplyVoiceInputDictionaryLearningResponseSchema, create(ApplyVoiceInputDictionaryLearningResponseSchema, { dictionary }))]
+    ] as const;
+    const requests: Array<{ method: string; body: Uint8Array }> = [];
+    const credential: PairedCredential = { profileId: "voice-profile", origin: "https://node.example", serverId: "voice-server", connectionId: "voice-connection", deviceId: "voice-device", displayName: "Voice phone", authKey: "voice-test-key" };
+    const fetch = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const request = new Request(input, init);
+      expect(request.headers.get("authorization")).toBe("Bearer voice-test-key");
+      const response = responses.find(([method]) => request.url.endsWith(`/${method}`));
+      if (!response) throw new Error("Unexpected dictionary RPC.");
+      requests.push({ method: response[0], body: new Uint8Array(await request.arrayBuffer()) });
+      return new Response(response[1], { status: 200, headers: { "content-type": "application/proto" } });
+    });
+    const actions = [{ action: "addCandidate", term: "VoiceKit", aliases: ["voice kit"], type: "productName", confidence: "high" }] as const;
+    try {
+      await expect(mobileNetwork.getVoiceInputDictionary(credential)).resolves.toMatchObject({
+        revision: 4n, syncEnabled: true, dictionary: { entries: [{ id: "dictionary-one", text: "Joko", source: "manual", frequency: 2 }] }, refinementTerms: ["Joko"]
+      });
+      await mobileNetwork.setVoiceInputDictionarySyncEnabled(credential, 4n, false);
+      await mobileNetwork.addVoiceInputDictionaryTerms(credential, 4n, ["Joko Core"]);
+      await mobileNetwork.editVoiceInputDictionaryEntry(credential, 4n, "dictionary-one", "Joko Core", ["jo ko"]);
+      await mobileNetwork.deleteVoiceInputDictionaryEntry(credential, 4n, "dictionary-one");
+      await mobileNetwork.applyVoiceInputDictionaryLearning(credential, 4n, actions);
+      expect(requests.map((request) => request.method)).toEqual(responses.map(([method]) => method));
+      expect(fromBinary(AddVoiceInputDictionaryTermsRequestSchema, requests[2]!.body)).toMatchObject({ expectedRevision: 4n, terms: ["Joko Core"] });
+      const learning = fromBinary(ApplyVoiceInputDictionaryLearningRequestSchema, requests[5]!.body);
+      expect(learning).toMatchObject({ expectedRevision: 4n, actions: [{ action: VoiceInputDictionaryLearningActionType.ADD_CANDIDATE, termType: VoiceInputDictionaryTermType.PRODUCT_NAME, confidence: VoiceInputDictionaryLearningConfidence.HIGH }] });
+      expect(Object.keys(learning).sort()).toEqual(["$typeName", "actions", "expectedRevision"]);
+    } finally { fetch.mockRestore(); }
+  });
+
+  it.each(["missing", "revision", "source", "count", "timestamp", "duplicate", "refinement", "canonical"] as const)("rejects a service dictionary with invalid %s", (invalid) => {
+    const value = dictionaryWireSnapshot();
+    if (invalid === "revision") value.revision = BigInt(Number.MAX_SAFE_INTEGER) + 1n;
+    if (invalid === "source") value.entries[0]!.source = VoiceInputDictionaryEntrySource.UNSPECIFIED;
+    if (invalid === "count") value.entries[0]!.frequency = BigInt(Number.MAX_SAFE_INTEGER) + 1n;
+    if (invalid === "timestamp") value.entries[0]!.updatedAt = undefined;
+    if (invalid === "duplicate") value.entries.push(value.entries[0]!);
+    if (invalid === "refinement") value.refinementTerms = ["NotInDictionary"];
+    if (invalid === "canonical") value.entries[0]!.text = " Joko ";
+    expect(() => projectMobileVoiceDictionarySnapshot(invalid === "missing" ? undefined : value)).toThrow(/dictionary/u);
+  });
+
+  it("preserves manual intent under automatic suppression and rejects malformed learning actions", () => {
+    const value = dictionaryWireSnapshot(); value.suppressedAutomaticTerms = ["Joko"];
+    expect(projectMobileVoiceDictionarySnapshot(value).dictionary).toMatchObject({ entries: [{ text: "Joko", source: "manual" }], suppressedAutomaticTexts: ["Joko"] });
+    expect(() => mobileVoiceDictionaryLearningRequest([])).toThrow(/action count/u);
+    const action = { action: "addEntry", term: "Joko", aliases: [], type: "productName", confidence: "high" } as const;
+    expect(() => mobileVoiceDictionaryLearningRequest([action, action, action, action])).toThrow(/action count/u);
+    expect(() => mobileVoiceDictionaryLearningRequest([{ ...action, action: "constructor" as typeof action.action }])).toThrow(/learning action/u);
+  });
+
+  it("projects ephemeral evidence and instructions without a client dictionary override", () => {
     expect(mobileVoiceNetworkTesting.adviceRequest({
       beforeText: "voice kit",
       afterText: "VoiceKit",
@@ -65,13 +262,13 @@ describe("mobile voice ephemeral requests", () => {
       existingCandidates: [{ term: "Candidate", evidenceCount: 3, aliases: [] }]
     });
     expect(mobileVoiceNetworkTesting.startRequest("request", "audio/pcm", "en-US", {
-      instructions: "Keep commands verbatim.", dictionaryTerms: ["VoiceKit", "Joko"]
+      instructions: "Keep commands verbatim."
     })).toEqual({
       requestId: "request", mimeType: "audio/pcm", locale: "en-US",
-      refinementInstructions: "Keep commands verbatim.", dictionaryTerms: ["VoiceKit", "Joko"]
+      refinementInstructions: "Keep commands verbatim."
     });
     expect(mobileVoiceNetworkTesting.startRequest("request", "audio/pcm", undefined, undefined))
-      .toEqual({ requestId: "request", mimeType: "audio/pcm", dictionaryTerms: [] });
+      .toEqual({ requestId: "request", mimeType: "audio/pcm" });
   });
 
   it("fails closed on malformed or unspecified advisor actions", () => {
@@ -131,6 +328,16 @@ describe("mobile voice ephemeral requests", () => {
       .toThrow(/too many voice dictionary actions/i);
   });
 });
+
+function dictionaryWireSnapshot() {
+  return create(VoiceInputDictionarySnapshotSchema, {
+    revision: 4n, syncEnabled: true,
+    entries: [{ entryId: "dictionary-one", text: "Joko", source: VoiceInputDictionaryEntrySource.MANUAL, frequency: 2n,
+      aliases: [{ text: "jo ko", count: 1n, lastSeenAt: { seconds: 1n, nanos: 0 } }],
+      createdAt: { seconds: 1n, nanos: 0 }, updatedAt: { seconds: 2n, nanos: 0 } }],
+    candidates: [], suppressedAutomaticTerms: [], refinementTerms: ["Joko"]
+  });
+}
 
 function matches(count: number, offset = 0) {
   return Array.from({ length: count }, (_, index) => create(SessionMessageSearchMatchSchema, {

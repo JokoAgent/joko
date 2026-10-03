@@ -14,7 +14,7 @@ import type { Message } from "@bufbuild/protobuf";
  * Describes the file joko/v1/voice.proto.
  */
 export const file_joko_v1_voice: GenFile = /*@__PURE__*/
-  fileDesc("ChNqb2tvL3YxL3ZvaWNlLnByb3RvEgdqb2tvLnYxIuQCChBWb2ljZUlucHV0TGltaXRzEhwKFHN1cHBvcnRlZF9taW1lX3R5cGVzGAEgAygJEiEKGW1heGltdW1fYXVkaW9fY2h1bmtfYnl0ZXMYAiABKAQSGwoTbWF4aW11bV9hdWRpb19ieXRlcxgDIAEoBBI/ChxtYXhpbXVtX2F1ZGlvX2NodW5rX2R1cmF0aW9uGAQgASgLMhkuZ29vZ2xlLnByb3RvYnVmLkR1cmF0aW9uEjkKFm1heGltdW1fYXVkaW9fZHVyYXRpb24YBSABKAsyGS5nb29nbGUucHJvdG9idWYuRHVyYXRpb24SIQoZbWF4aW11bV9sb2NhbGVfY2hhcmFjdGVycxgGIAEoDRIuCgtzdGFibGVfd2FpdBgHIAEoCzIZLmdvb2dsZS5wcm90b2J1Zi5EdXJhdGlvbhIjChttYXhpbXVtX2NvbmN1cnJlbnRfc2Vzc2lvbnMYCCABKA0ixQEKG1ZvaWNlSW5wdXRDYXBhYmlsaXR5UHJvZmlsZRInCgpjYXBhYmlsaXR5GAEgASgLMhMuam9rby52MS5DYXBhYmlsaXR5EikKBmxpbWl0cxgCIAEoCzIZLmpva28udjEuVm9pY2VJbnB1dExpbWl0cxIXCg9zdXBwb3J0c19sb2NhbGUYAyABKAgSHAoUc3VwcG9ydHNfbGl2ZV9kcmFmdHMYBCABKAgSGwoTc3VwcG9ydHNfcmVmaW5lbWVudBgFIAEoCCJOCg9Wb2ljZUlucHV0RHJhZnQSDAoEdGV4dBgBIAEoCRItCgZzb3VyY2UYAiABKA4yHS5qb2tvLnYxLlZvaWNlSW5wdXRUZXh0U291cmNlIpsBChBWb2ljZUlucHV0UmVzdWx0EgwKBHRleHQYASABKAkSLQoGc291cmNlGAIgASgOMh0uam9rby52MS5Wb2ljZUlucHV0VGV4dFNvdXJjZRIQCghzYWx2YWdlZBgDIAEoCBIgChNyYXdfdHJhbnNjcmlwdF90ZXh0GAQgASgJSACIAQFCFgoUX3Jhd190cmFuc2NyaXB0X3RleHQiPQoeVm9pY2VJbnB1dERpY3Rpb25hcnlBbGlhc1N0YXRlEgwKBHRleHQYASABKAkSDQoFY291bnQYAiABKA0itQEKHlZvaWNlSW5wdXREaWN0aW9uYXJ5RW50cnlTdGF0ZRIMCgR0ZXJtGAEgASgJEjgKBnNvdXJjZRgCIAEoDjIoLmpva28udjEuVm9pY2VJbnB1dERpY3Rpb25hcnlFbnRyeVNvdXJjZRIRCglmcmVxdWVuY3kYAyABKA0SOAoHYWxpYXNlcxgEIAMoCzInLmpva28udjEuVm9pY2VJbnB1dERpY3Rpb25hcnlBbGlhc1N0YXRlIoQBCiJWb2ljZUlucHV0RGljdGlvbmFyeUNhbmRpZGF0ZVN0YXRlEgwKBHRlcm0YASABKAkSFgoOZXZpZGVuY2VfY291bnQYAiABKA0SOAoHYWxpYXNlcxgDIAMoCzInLmpva28udjEuVm9pY2VJbnB1dERpY3Rpb25hcnlBbGlhc1N0YXRlIoMCCiJWb2ljZUlucHV0RGljdGlvbmFyeUxlYXJuaW5nQWN0aW9uEj8KBmFjdGlvbhgBIAEoDjIvLmpva28udjEuVm9pY2VJbnB1dERpY3Rpb25hcnlMZWFybmluZ0FjdGlvblR5cGUSDAoEdGVybRgCIAEoCRIPCgdhbGlhc2VzGAMgAygJEjgKCXRlcm1fdHlwZRgEIAEoDjIlLmpva28udjEuVm9pY2VJbnB1dERpY3Rpb25hcnlUZXJtVHlwZRJDCgpjb25maWRlbmNlGAUgASgOMi8uam9rby52MS5Wb2ljZUlucHV0RGljdGlvbmFyeUxlYXJuaW5nQ29uZmlkZW5jZSJaChFWb2ljZUlucHV0RmFpbHVyZRIsCgRjb2RlGAEgASgOMh4uam9rby52MS5Wb2ljZUlucHV0RmFpbHVyZUNvZGUSFwoPdHJhbnNjcmlwdF9rZXB0GAIgASgIIpMEChFWb2ljZUlucHV0U2Vzc2lvbhIWCg52b2ljZV9pbnB1dF9pZBgBIAEoCRInCgVzdGF0ZRgCIAEoDjIYLmpva28udjEuVm9pY2VJbnB1dFN0YXRlEjMKB291dGNvbWUYAyABKA4yIi5qb2tvLnYxLlZvaWNlSW5wdXRUZXJtaW5hbE91dGNvbWUSJwoFZHJhZnQYBCABKAsyGC5qb2tvLnYxLlZvaWNlSW5wdXREcmFmdBIpCgZyZXN1bHQYBSABKAsyGS5qb2tvLnYxLlZvaWNlSW5wdXRSZXN1bHQSKwoHZmFpbHVyZRgGIAEoCzIaLmpva28udjEuVm9pY2VJbnB1dEZhaWx1cmUSGwoTbmV4dF9jaHVua19zZXF1ZW5jZRgHIAEoBBIcChRhY2NlcHRlZF9hdWRpb19ieXRlcxgIIAEoBBI6ChdhY2NlcHRlZF9hdWRpb19kdXJhdGlvbhgJIAEoCzIZLmdvb2dsZS5wcm90b2J1Zi5EdXJhdGlvbhIuCgpjcmVhdGVkX2F0GAogASgLMhouZ29vZ2xlLnByb3RvYnVmLlRpbWVzdGFtcBIuCgp1cGRhdGVkX2F0GAsgASgLMhouZ29vZ2xlLnByb3RvYnVmLlRpbWVzdGFtcBIZChFyZWNvdmVyeV9hdHRlbXB0cxgMIAEoDRIVCg1zdGFsbF93YXJuaW5nGA0gASgIKuwBCg9Wb2ljZUlucHV0U3RhdGUSIQodVk9JQ0VfSU5QVVRfU1RBVEVfVU5TUEVDSUZJRUQQABIaChZWT0lDRV9JTlBVVF9TVEFURV9JRExFEAESHwobVk9JQ0VfSU5QVVRfU1RBVEVfTElTVEVOSU5HEAISIAocVk9JQ0VfSU5QVVRfU1RBVEVfU1VCTUlUVElORxADEh4KGlZPSUNFX0lOUFVUX1NUQVRFX1JFRklOSU5HEAQSGgoWVk9JQ0VfSU5QVVRfU1RBVEVfRE9ORRAFEhsKF1ZPSUNFX0lOUFVUX1NUQVRFX0VSUk9SEAYq9AEKGVZvaWNlSW5wdXRUZXJtaW5hbE91dGNvbWUSLAooVk9JQ0VfSU5QVVRfVEVSTUlOQUxfT1VUQ09NRV9VTlNQRUNJRklFRBAAEigKJFZPSUNFX0lOUFVUX1RFUk1JTkFMX09VVENPTUVfU1VDQ0VTUxABEioKJlZPSUNFX0lOUFVUX1RFUk1JTkFMX09VVENPTUVfTk9fU1BFRUNIEAISJwojVk9JQ0VfSU5QVVRfVEVSTUlOQUxfT1VUQ09NRV9GQUlMRUQQAxIqCiZWT0lDRV9JTlBVVF9URVJNSU5BTF9PVVRDT01FX0NBTkNFTExFRBAEKogBChRWb2ljZUlucHV0VGV4dFNvdXJjZRInCiNWT0lDRV9JTlBVVF9URVhUX1NPVVJDRV9VTlNQRUNJRklFRBAAEiMKH1ZPSUNFX0lOUFVUX1RFWFRfU09VUkNFX1BBUlRJQUwQARIiCh5WT0lDRV9JTlBVVF9URVhUX1NPVVJDRV9TVEFCTEUQAiq2BAoVVm9pY2VJbnB1dEZhaWx1cmVDb2RlEigKJFZPSUNFX0lOUFVUX0ZBSUxVUkVfQ09ERV9VTlNQRUNJRklFRBAAEjMKL1ZPSUNFX0lOUFVUX0ZBSUxVUkVfQ09ERV9DT05ORUNUSU9OX0lOVEVSUlVQVEVEEAESLQopVk9JQ0VfSU5QVVRfRkFJTFVSRV9DT0RFX0VNUFRZX1RSQU5TQ1JJUFQQAhIzCi9WT0lDRV9JTlBVVF9GQUlMVVJFX0NPREVfSE9TVF9TVUJNSVNTSU9OX0ZBSUxFRBADEjQKMFZPSUNFX0lOUFVUX0ZBSUxVUkVfQ09ERV9QUk9WSURFUl9BVVRIRU5USUNBVElPThAEEjIKLlZPSUNFX0lOUFVUX0ZBSUxVUkVfQ09ERV9QUk9WSURFUl9DTE9TRV9GQUlMRUQQBRIrCidWT0lDRV9JTlBVVF9GQUlMVVJFX0NPREVfUFJPVklERVJfRVJST1IQBhIyCi5WT0lDRV9JTlBVVF9GQUlMVVJFX0NPREVfUFJPVklERVJfRkxVU0hfRkFJTEVEEAcSLgoqVk9JQ0VfSU5QVVRfRkFJTFVSRV9DT0RFX1BST1ZJREVSX1BST1RPQ09MEAgSKwonVk9JQ0VfSU5QVVRfRkFJTFVSRV9DT0RFX1BST1ZJREVSX1FVT1RBEAkSMgouVk9JQ0VfSU5QVVRfRkFJTFVSRV9DT0RFX1BST1ZJREVSX1NUQVJUX0ZBSUxFRBAKKrkBCh9Wb2ljZUlucHV0RGljdGlvbmFyeUVudHJ5U291cmNlEjMKL1ZPSUNFX0lOUFVUX0RJQ1RJT05BUllfRU5UUllfU09VUkNFX1VOU1BFQ0lGSUVEEAASLgoqVk9JQ0VfSU5QVVRfRElDVElPTkFSWV9FTlRSWV9TT1VSQ0VfTUFOVUFMEAESMQotVk9JQ0VfSU5QVVRfRElDVElPTkFSWV9FTlRSWV9TT1VSQ0VfQVVUT01BVElDEAIqnQIKJlZvaWNlSW5wdXREaWN0aW9uYXJ5TGVhcm5pbmdBY3Rpb25UeXBlEjsKN1ZPSUNFX0lOUFVUX0RJQ1RJT05BUllfTEVBUk5JTkdfQUNUSU9OX1RZUEVfVU5TUEVDSUZJRUQQABI9CjlWT0lDRV9JTlBVVF9ESUNUSU9OQVJZX0xFQVJOSU5HX0FDVElPTl9UWVBFX0FERF9DQU5ESURBVEUQARI5CjVWT0lDRV9JTlBVVF9ESUNUSU9OQVJZX0xFQVJOSU5HX0FDVElPTl9UWVBFX0FERF9FTlRSWRACEjwKOFZPSUNFX0lOUFVUX0RJQ1RJT05BUllfTEVBUk5JTkdfQUNUSU9OX1RZUEVfVVBEQVRFX0VOVFJZEAMq1gMKHFZvaWNlSW5wdXREaWN0aW9uYXJ5VGVybVR5cGUSMAosVk9JQ0VfSU5QVVRfRElDVElPTkFSWV9URVJNX1RZUEVfVU5TUEVDSUZJRUQQABIxCi1WT0lDRV9JTlBVVF9ESUNUSU9OQVJZX1RFUk1fVFlQRV9QUk9EVUNUX05BTUUQARIxCi1WT0lDRV9JTlBVVF9ESUNUSU9OQVJZX1RFUk1fVFlQRV9QUk9KRUNUX05BTUUQAhIzCi9WT0lDRV9JTlBVVF9ESUNUSU9OQVJZX1RFUk1fVFlQRV9URUNITklDQUxfVEVSTRADEjAKLFZPSUNFX0lOUFVUX0RJQ1RJT05BUllfVEVSTV9UWVBFX1BFUlNPTl9OQU1FEAQSLgoqVk9JQ0VfSU5QVVRfRElDVElPTkFSWV9URVJNX1RZUEVfVEVBTV9OQU1FEAUSLgoqVk9JQ0VfSU5QVVRfRElDVElPTkFSWV9URVJNX1RZUEVfQ09ERV9OQU1FEAYSKwonVk9JQ0VfSU5QVVRfRElDVElPTkFSWV9URVJNX1RZUEVfUEhSQVNFEAcSKgomVk9JQ0VfSU5QVVRfRElDVElPTkFSWV9URVJNX1RZUEVfT1RIRVIQCCrQAQomVm9pY2VJbnB1dERpY3Rpb25hcnlMZWFybmluZ0NvbmZpZGVuY2USOgo2Vk9JQ0VfSU5QVVRfRElDVElPTkFSWV9MRUFSTklOR19DT05GSURFTkNFX1VOU1BFQ0lGSUVEEAASNQoxVk9JQ0VfSU5QVVRfRElDVElPTkFSWV9MRUFSTklOR19DT05GSURFTkNFX01FRElVTRABEjMKL1ZPSUNFX0lOUFVUX0RJQ1RJT05BUllfTEVBUk5JTkdfQ09ORklERU5DRV9ISUdIEAJiBnByb3RvMw", [file_google_protobuf_duration, file_google_protobuf_timestamp, file_joko_v1_capability]);
+  fileDesc("ChNqb2tvL3YxL3ZvaWNlLnByb3RvEgdqb2tvLnYxIuQCChBWb2ljZUlucHV0TGltaXRzEhwKFHN1cHBvcnRlZF9taW1lX3R5cGVzGAEgAygJEiEKGW1heGltdW1fYXVkaW9fY2h1bmtfYnl0ZXMYAiABKAQSGwoTbWF4aW11bV9hdWRpb19ieXRlcxgDIAEoBBI/ChxtYXhpbXVtX2F1ZGlvX2NodW5rX2R1cmF0aW9uGAQgASgLMhkuZ29vZ2xlLnByb3RvYnVmLkR1cmF0aW9uEjkKFm1heGltdW1fYXVkaW9fZHVyYXRpb24YBSABKAsyGS5nb29nbGUucHJvdG9idWYuRHVyYXRpb24SIQoZbWF4aW11bV9sb2NhbGVfY2hhcmFjdGVycxgGIAEoDRIuCgtzdGFibGVfd2FpdBgHIAEoCzIZLmdvb2dsZS5wcm90b2J1Zi5EdXJhdGlvbhIjChttYXhpbXVtX2NvbmN1cnJlbnRfc2Vzc2lvbnMYCCABKA0ijAMKG1ZvaWNlSW5wdXRDYXBhYmlsaXR5UHJvZmlsZRInCgpjYXBhYmlsaXR5GAEgASgLMhMuam9rby52MS5DYXBhYmlsaXR5EikKBmxpbWl0cxgCIAEoCzIZLmpva28udjEuVm9pY2VJbnB1dExpbWl0cxIXCg9zdXBwb3J0c19sb2NhbGUYAyABKAgSHAoUc3VwcG9ydHNfbGl2ZV9kcmFmdHMYBCABKAgSGwoTc3VwcG9ydHNfcmVmaW5lbWVudBgFIAEoCBIkChxzdXBwb3J0c19yZWNvZ25pdGlvbl9jb250ZXh0GAYgASgIEikKIXJlY29nbml0aW9uX2NvbnRleHRfbWF4aW11bV9pdGVtcxgHIAEoDRIuCiZyZWNvZ25pdGlvbl9jb250ZXh0X21heGltdW1faXRlbV9ieXRlcxgIIAEoDRIpCiFyZWNvZ25pdGlvbl9jb250ZXh0X21heGltdW1fYnl0ZXMYCSABKA0SGQoRc3VwcG9ydGVkX2xvY2FsZXMYCiADKAkiMAogVm9pY2VJbnB1dFJlY29nbml0aW9uQ29udGV4dEl0ZW0SDAoEdGV4dBgBIAEoCSJfChxWb2ljZUlucHV0UmVjb2duaXRpb25Db250ZXh0Ej8KDGNvbnRleHRfZGF0YRgBIAMoCzIpLmpva28udjEuVm9pY2VJbnB1dFJlY29nbml0aW9uQ29udGV4dEl0ZW0iTgoPVm9pY2VJbnB1dERyYWZ0EgwKBHRleHQYASABKAkSLQoGc291cmNlGAIgASgOMh0uam9rby52MS5Wb2ljZUlucHV0VGV4dFNvdXJjZSKbAQoQVm9pY2VJbnB1dFJlc3VsdBIMCgR0ZXh0GAEgASgJEi0KBnNvdXJjZRgCIAEoDjIdLmpva28udjEuVm9pY2VJbnB1dFRleHRTb3VyY2USEAoIc2FsdmFnZWQYAyABKAgSIAoTcmF3X3RyYW5zY3JpcHRfdGV4dBgEIAEoCUgAiAEBQhYKFF9yYXdfdHJhbnNjcmlwdF90ZXh0Ij0KHlZvaWNlSW5wdXREaWN0aW9uYXJ5QWxpYXNTdGF0ZRIMCgR0ZXh0GAEgASgJEg0KBWNvdW50GAIgASgNIrUBCh5Wb2ljZUlucHV0RGljdGlvbmFyeUVudHJ5U3RhdGUSDAoEdGVybRgBIAEoCRI4CgZzb3VyY2UYAiABKA4yKC5qb2tvLnYxLlZvaWNlSW5wdXREaWN0aW9uYXJ5RW50cnlTb3VyY2USEQoJZnJlcXVlbmN5GAMgASgNEjgKB2FsaWFzZXMYBCADKAsyJy5qb2tvLnYxLlZvaWNlSW5wdXREaWN0aW9uYXJ5QWxpYXNTdGF0ZSKEAQoiVm9pY2VJbnB1dERpY3Rpb25hcnlDYW5kaWRhdGVTdGF0ZRIMCgR0ZXJtGAEgASgJEhYKDmV2aWRlbmNlX2NvdW50GAIgASgNEjgKB2FsaWFzZXMYAyADKAsyJy5qb2tvLnYxLlZvaWNlSW5wdXREaWN0aW9uYXJ5QWxpYXNTdGF0ZSKDAgoiVm9pY2VJbnB1dERpY3Rpb25hcnlMZWFybmluZ0FjdGlvbhI/CgZhY3Rpb24YASABKA4yLy5qb2tvLnYxLlZvaWNlSW5wdXREaWN0aW9uYXJ5TGVhcm5pbmdBY3Rpb25UeXBlEgwKBHRlcm0YAiABKAkSDwoHYWxpYXNlcxgDIAMoCRI4Cgl0ZXJtX3R5cGUYBCABKA4yJS5qb2tvLnYxLlZvaWNlSW5wdXREaWN0aW9uYXJ5VGVybVR5cGUSQwoKY29uZmlkZW5jZRgFIAEoDjIvLmpva28udjEuVm9pY2VJbnB1dERpY3Rpb25hcnlMZWFybmluZ0NvbmZpZGVuY2UicgohVm9pY2VJbnB1dERpY3Rpb25hcnlTbmFwc2hvdEFsaWFzEgwKBHRleHQYASABKAkSDQoFY291bnQYAiABKAQSMAoMbGFzdF9zZWVuX2F0GAMgASgLMhouZ29vZ2xlLnByb3RvYnVmLlRpbWVzdGFtcCKtAgohVm9pY2VJbnB1dERpY3Rpb25hcnlTbmFwc2hvdEVudHJ5EhAKCGVudHJ5X2lkGAEgASgJEgwKBHRleHQYAiABKAkSOAoGc291cmNlGAMgASgOMiguam9rby52MS5Wb2ljZUlucHV0RGljdGlvbmFyeUVudHJ5U291cmNlEhEKCWZyZXF1ZW5jeRgEIAEoBBI7CgdhbGlhc2VzGAUgAygLMiouam9rby52MS5Wb2ljZUlucHV0RGljdGlvbmFyeVNuYXBzaG90QWxpYXMSLgoKY3JlYXRlZF9hdBgGIAEoCzIaLmdvb2dsZS5wcm90b2J1Zi5UaW1lc3RhbXASLgoKdXBkYXRlZF9hdBgHIAEoCzIaLmdvb2dsZS5wcm90b2J1Zi5UaW1lc3RhbXAi6gEKJVZvaWNlSW5wdXREaWN0aW9uYXJ5U25hcHNob3RDYW5kaWRhdGUSDAoEdGV4dBgBIAEoCRIWCg5ldmlkZW5jZV9jb3VudBgCIAEoBBI7CgdhbGlhc2VzGAMgAygLMiouam9rby52MS5Wb2ljZUlucHV0RGljdGlvbmFyeVNuYXBzaG90QWxpYXMSLgoKY3JlYXRlZF9hdBgEIAEoCzIaLmdvb2dsZS5wcm90b2J1Zi5UaW1lc3RhbXASLgoKdXBkYXRlZF9hdBgFIAEoCzIaLmdvb2dsZS5wcm90b2J1Zi5UaW1lc3RhbXAihQIKHFZvaWNlSW5wdXREaWN0aW9uYXJ5U25hcHNob3QSEAoIcmV2aXNpb24YASABKAQSFAoMc3luY19lbmFibGVkGAIgASgIEjsKB2VudHJpZXMYAyADKAsyKi5qb2tvLnYxLlZvaWNlSW5wdXREaWN0aW9uYXJ5U25hcHNob3RFbnRyeRJCCgpjYW5kaWRhdGVzGAQgAygLMi4uam9rby52MS5Wb2ljZUlucHV0RGljdGlvbmFyeVNuYXBzaG90Q2FuZGlkYXRlEiIKGnN1cHByZXNzZWRfYXV0b21hdGljX3Rlcm1zGAUgAygJEhgKEHJlZmluZW1lbnRfdGVybXMYBiADKAkiQAohVm9pY2VJbnB1dERpY3Rpb25hcnlSZWFkT25seUFsaWFzEgwKBHRleHQYASABKAkSDQoFY291bnQYAiABKAQigQEKIVZvaWNlSW5wdXREaWN0aW9uYXJ5UmVhZE9ubHlFbnRyeRIMCgR0ZXh0GAEgASgJEhEKCWZyZXF1ZW5jeRgCIAEoBBI7CgdhbGlhc2VzGAMgAygLMiouam9rby52MS5Wb2ljZUlucHV0RGljdGlvbmFyeVJlYWRPbmx5QWxpYXMiQgogVm9pY2VJbnB1dERpY3Rpb25hcnlTdGF0ZVZlcnNpb24SDwoHbm9kZV9pZBgBIAEoCRINCgVzdGFtcBgCIAEoCSJeCh9Wb2ljZUlucHV0RGljdGlvbmFyeVN0YXRlVmVjdG9yEjsKCHZlcnNpb25zGAEgAygLMikuam9rby52MS5Wb2ljZUlucHV0RGljdGlvbmFyeVN0YXRlVmVyc2lvbiLLAQokVm9pY2VJbnB1dERpY3Rpb25hcnlSZWFkT25seVNuYXBzaG90EhAKCHJldmlzaW9uGAEgASgEEhQKDHN5bmNfZW5hYmxlZBgCIAEoCBI7CgdlbnRyaWVzGAMgAygLMiouam9rby52MS5Wb2ljZUlucHV0RGljdGlvbmFyeVJlYWRPbmx5RW50cnkSPgoMc3RhdGVfdmVjdG9yGAQgASgLMiguam9rby52MS5Wb2ljZUlucHV0RGljdGlvbmFyeVN0YXRlVmVjdG9yIj4KIFZvaWNlSW5wdXREaWN0aW9uYXJ5UGVlckVuZHBvaW50EgwKBGhvc3QYASABKAkSDAoEcG9ydBgCIAEoDSJPChxWb2ljZUlucHV0RGljdGlvbmFyeUxpc3RlbmVyEhMKC2xpc3Rlbl9wb3J0GAEgASgNEgwKBGhvc3QYAiABKAkSDAoEcG9ydBgDIAEoDSKUAgoYVm9pY2VJbnB1dERpY3Rpb25hcnlQZWVyEg8KB3BlZXJfaWQYASABKAkSEAoIcmV2aXNpb24YAiABKAQSFAoMZGlzcGxheV9uYW1lGAMgASgJEhMKC2ZpbmdlcnByaW50GAQgASgJEg4KBm9ubGluZRgFIAEoCBIuCgpncmFudGVkX2F0GAYgASgLMhouZ29vZ2xlLnByb3RvYnVmLlRpbWVzdGFtcBIwCgxsYXN0X3N5bmNfYXQYByABKAsyGi5nb29nbGUucHJvdG9idWYuVGltZXN0YW1wEjgKBXJvdXRlGAggASgLMikuam9rby52MS5Wb2ljZUlucHV0RGljdGlvbmFyeVBlZXJFbmRwb2ludCKyAQohVm9pY2VJbnB1dERpY3Rpb25hcnlQZWVyQ2FuZGlkYXRlEg8KB25vZGVfaWQYASABKAkSFAoMZGlzcGxheV9uYW1lGAIgASgJEhMKC2ZpbmdlcnByaW50GAMgASgJEisKB3NlZW5fYXQYBCABKAsyGi5nb29nbGUucHJvdG9idWYuVGltZXN0YW1wEg8KB2dyYW50ZWQYBSABKAgSEwoLa2V5X2NoYW5nZWQYBiABKAgiwAMKHlZvaWNlSW5wdXREaWN0aW9uYXJ5UGVlclN0YXR1cxIRCglhdmFpbGFibGUYASABKAgSHgoWY29uZmlndXJhdGlvbl9yZXZpc2lvbhgCIAEoBBIPCgdub2RlX2lkGAMgASgJEhMKC2ZpbmdlcnByaW50GAQgASgJEg8KB2VuYWJsZWQYBSABKAgSNQoFcGhhc2UYBiABKA4yJi5qb2tvLnYxLlZvaWNlSW5wdXREaWN0aW9uYXJ5UGVlclBoYXNlEkMKCmVycm9yX2NvZGUYByABKA4yKi5qb2tvLnYxLlZvaWNlSW5wdXREaWN0aW9uYXJ5UGVlckVycm9yQ29kZUgAiAEBEjAKBXBlZXJzGAggAygLMiEuam9rby52MS5Wb2ljZUlucHV0RGljdGlvbmFyeVBlZXISPgoKY2FuZGlkYXRlcxgJIAMoCzIqLmpva28udjEuVm9pY2VJbnB1dERpY3Rpb25hcnlQZWVyQ2FuZGlkYXRlEjcKCGxpc3RlbmVyGAogASgLMiUuam9rby52MS5Wb2ljZUlucHV0RGljdGlvbmFyeUxpc3RlbmVyQg0KC19lcnJvcl9jb2RlIloKEVZvaWNlSW5wdXRGYWlsdXJlEiwKBGNvZGUYASABKA4yHi5qb2tvLnYxLlZvaWNlSW5wdXRGYWlsdXJlQ29kZRIXCg90cmFuc2NyaXB0X2tlcHQYAiABKAgikwQKEVZvaWNlSW5wdXRTZXNzaW9uEhYKDnZvaWNlX2lucHV0X2lkGAEgASgJEicKBXN0YXRlGAIgASgOMhguam9rby52MS5Wb2ljZUlucHV0U3RhdGUSMwoHb3V0Y29tZRgDIAEoDjIiLmpva28udjEuVm9pY2VJbnB1dFRlcm1pbmFsT3V0Y29tZRInCgVkcmFmdBgEIAEoCzIYLmpva28udjEuVm9pY2VJbnB1dERyYWZ0EikKBnJlc3VsdBgFIAEoCzIZLmpva28udjEuVm9pY2VJbnB1dFJlc3VsdBIrCgdmYWlsdXJlGAYgASgLMhouam9rby52MS5Wb2ljZUlucHV0RmFpbHVyZRIbChNuZXh0X2NodW5rX3NlcXVlbmNlGAcgASgEEhwKFGFjY2VwdGVkX2F1ZGlvX2J5dGVzGAggASgEEjoKF2FjY2VwdGVkX2F1ZGlvX2R1cmF0aW9uGAkgASgLMhkuZ29vZ2xlLnByb3RvYnVmLkR1cmF0aW9uEi4KCmNyZWF0ZWRfYXQYCiABKAsyGi5nb29nbGUucHJvdG9idWYuVGltZXN0YW1wEi4KCnVwZGF0ZWRfYXQYCyABKAsyGi5nb29nbGUucHJvdG9idWYuVGltZXN0YW1wEhkKEXJlY292ZXJ5X2F0dGVtcHRzGAwgASgNEhUKDXN0YWxsX3dhcm5pbmcYDSABKAgq7AEKD1ZvaWNlSW5wdXRTdGF0ZRIhCh1WT0lDRV9JTlBVVF9TVEFURV9VTlNQRUNJRklFRBAAEhoKFlZPSUNFX0lOUFVUX1NUQVRFX0lETEUQARIfChtWT0lDRV9JTlBVVF9TVEFURV9MSVNURU5JTkcQAhIgChxWT0lDRV9JTlBVVF9TVEFURV9TVUJNSVRUSU5HEAMSHgoaVk9JQ0VfSU5QVVRfU1RBVEVfUkVGSU5JTkcQBBIaChZWT0lDRV9JTlBVVF9TVEFURV9ET05FEAUSGwoXVk9JQ0VfSU5QVVRfU1RBVEVfRVJST1IQBir0AQoZVm9pY2VJbnB1dFRlcm1pbmFsT3V0Y29tZRIsCihWT0lDRV9JTlBVVF9URVJNSU5BTF9PVVRDT01FX1VOU1BFQ0lGSUVEEAASKAokVk9JQ0VfSU5QVVRfVEVSTUlOQUxfT1VUQ09NRV9TVUNDRVNTEAESKgomVk9JQ0VfSU5QVVRfVEVSTUlOQUxfT1VUQ09NRV9OT19TUEVFQ0gQAhInCiNWT0lDRV9JTlBVVF9URVJNSU5BTF9PVVRDT01FX0ZBSUxFRBADEioKJlZPSUNFX0lOUFVUX1RFUk1JTkFMX09VVENPTUVfQ0FOQ0VMTEVEEAQqiAEKFFZvaWNlSW5wdXRUZXh0U291cmNlEicKI1ZPSUNFX0lOUFVUX1RFWFRfU09VUkNFX1VOU1BFQ0lGSUVEEAASIwofVk9JQ0VfSU5QVVRfVEVYVF9TT1VSQ0VfUEFSVElBTBABEiIKHlZPSUNFX0lOUFVUX1RFWFRfU09VUkNFX1NUQUJMRRACKrYEChVWb2ljZUlucHV0RmFpbHVyZUNvZGUSKAokVk9JQ0VfSU5QVVRfRkFJTFVSRV9DT0RFX1VOU1BFQ0lGSUVEEAASMwovVk9JQ0VfSU5QVVRfRkFJTFVSRV9DT0RFX0NPTk5FQ1RJT05fSU5URVJSVVBURUQQARItCilWT0lDRV9JTlBVVF9GQUlMVVJFX0NPREVfRU1QVFlfVFJBTlNDUklQVBACEjMKL1ZPSUNFX0lOUFVUX0ZBSUxVUkVfQ09ERV9IT1NUX1NVQk1JU1NJT05fRkFJTEVEEAMSNAowVk9JQ0VfSU5QVVRfRkFJTFVSRV9DT0RFX1BST1ZJREVSX0FVVEhFTlRJQ0FUSU9OEAQSMgouVk9JQ0VfSU5QVVRfRkFJTFVSRV9DT0RFX1BST1ZJREVSX0NMT1NFX0ZBSUxFRBAFEisKJ1ZPSUNFX0lOUFVUX0ZBSUxVUkVfQ09ERV9QUk9WSURFUl9FUlJPUhAGEjIKLlZPSUNFX0lOUFVUX0ZBSUxVUkVfQ09ERV9QUk9WSURFUl9GTFVTSF9GQUlMRUQQBxIuCipWT0lDRV9JTlBVVF9GQUlMVVJFX0NPREVfUFJPVklERVJfUFJPVE9DT0wQCBIrCidWT0lDRV9JTlBVVF9GQUlMVVJFX0NPREVfUFJPVklERVJfUVVPVEEQCRIyCi5WT0lDRV9JTlBVVF9GQUlMVVJFX0NPREVfUFJPVklERVJfU1RBUlRfRkFJTEVEEAoquQEKH1ZvaWNlSW5wdXREaWN0aW9uYXJ5RW50cnlTb3VyY2USMwovVk9JQ0VfSU5QVVRfRElDVElPTkFSWV9FTlRSWV9TT1VSQ0VfVU5TUEVDSUZJRUQQABIuCipWT0lDRV9JTlBVVF9ESUNUSU9OQVJZX0VOVFJZX1NPVVJDRV9NQU5VQUwQARIxCi1WT0lDRV9JTlBVVF9ESUNUSU9OQVJZX0VOVFJZX1NPVVJDRV9BVVRPTUFUSUMQAiqdAgomVm9pY2VJbnB1dERpY3Rpb25hcnlMZWFybmluZ0FjdGlvblR5cGUSOwo3Vk9JQ0VfSU5QVVRfRElDVElPTkFSWV9MRUFSTklOR19BQ1RJT05fVFlQRV9VTlNQRUNJRklFRBAAEj0KOVZPSUNFX0lOUFVUX0RJQ1RJT05BUllfTEVBUk5JTkdfQUNUSU9OX1RZUEVfQUREX0NBTkRJREFURRABEjkKNVZPSUNFX0lOUFVUX0RJQ1RJT05BUllfTEVBUk5JTkdfQUNUSU9OX1RZUEVfQUREX0VOVFJZEAISPAo4Vk9JQ0VfSU5QVVRfRElDVElPTkFSWV9MRUFSTklOR19BQ1RJT05fVFlQRV9VUERBVEVfRU5UUlkQAyrWAwocVm9pY2VJbnB1dERpY3Rpb25hcnlUZXJtVHlwZRIwCixWT0lDRV9JTlBVVF9ESUNUSU9OQVJZX1RFUk1fVFlQRV9VTlNQRUNJRklFRBAAEjEKLVZPSUNFX0lOUFVUX0RJQ1RJT05BUllfVEVSTV9UWVBFX1BST0RVQ1RfTkFNRRABEjEKLVZPSUNFX0lOUFVUX0RJQ1RJT05BUllfVEVSTV9UWVBFX1BST0pFQ1RfTkFNRRACEjMKL1ZPSUNFX0lOUFVUX0RJQ1RJT05BUllfVEVSTV9UWVBFX1RFQ0hOSUNBTF9URVJNEAMSMAosVk9JQ0VfSU5QVVRfRElDVElPTkFSWV9URVJNX1RZUEVfUEVSU09OX05BTUUQBBIuCipWT0lDRV9JTlBVVF9ESUNUSU9OQVJZX1RFUk1fVFlQRV9URUFNX05BTUUQBRIuCipWT0lDRV9JTlBVVF9ESUNUSU9OQVJZX1RFUk1fVFlQRV9DT0RFX05BTUUQBhIrCidWT0lDRV9JTlBVVF9ESUNUSU9OQVJZX1RFUk1fVFlQRV9QSFJBU0UQBxIqCiZWT0lDRV9JTlBVVF9ESUNUSU9OQVJZX1RFUk1fVFlQRV9PVEhFUhAIKtABCiZWb2ljZUlucHV0RGljdGlvbmFyeUxlYXJuaW5nQ29uZmlkZW5jZRI6CjZWT0lDRV9JTlBVVF9ESUNUSU9OQVJZX0xFQVJOSU5HX0NPTkZJREVOQ0VfVU5TUEVDSUZJRUQQABI1CjFWT0lDRV9JTlBVVF9ESUNUSU9OQVJZX0xFQVJOSU5HX0NPTkZJREVOQ0VfTUVESVVNEAESMwovVk9JQ0VfSU5QVVRfRElDVElPTkFSWV9MRUFSTklOR19DT05GSURFTkNFX0hJR0gQAiq6AgodVm9pY2VJbnB1dERpY3Rpb25hcnlQZWVyUGhhc2USMQotVk9JQ0VfSU5QVVRfRElDVElPTkFSWV9QRUVSX1BIQVNFX1VOU1BFQ0lGSUVEEAASKQolVk9JQ0VfSU5QVVRfRElDVElPTkFSWV9QRUVSX1BIQVNFX09GRhABEi0KKVZPSUNFX0lOUFVUX0RJQ1RJT05BUllfUEVFUl9QSEFTRV9XQUlUSU5HEAISLQopVk9JQ0VfSU5QVVRfRElDVElPTkFSWV9QRUVSX1BIQVNFX1NZTkNJTkcQAxIwCixWT0lDRV9JTlBVVF9ESUNUSU9OQVJZX1BFRVJfUEhBU0VfVVBfVE9fREFURRAEEisKJ1ZPSUNFX0lOUFVUX0RJQ1RJT05BUllfUEVFUl9QSEFTRV9FUlJPUhAFKpcCCiFWb2ljZUlucHV0RGljdGlvbmFyeVBlZXJFcnJvckNvZGUSNgoyVk9JQ0VfSU5QVVRfRElDVElPTkFSWV9QRUVSX0VSUk9SX0NPREVfVU5TUEVDSUZJRUQQABI/CjtWT0lDRV9JTlBVVF9ESUNUSU9OQVJZX1BFRVJfRVJST1JfQ09ERV9JREVOVElUWV9VTkFWQUlMQUJMRRABEkEKPVZPSUNFX0lOUFVUX0RJQ1RJT05BUllfUEVFUl9FUlJPUl9DT0RFX0RJQ1RJT05BUllfVU5BVkFJTEFCTEUQAhI2CjJWT0lDRV9JTlBVVF9ESUNUSU9OQVJZX1BFRVJfRVJST1JfQ09ERV9TWU5DX0ZBSUxFRBADYgZwcm90bzM", [file_google_protobuf_duration, file_google_protobuf_timestamp, file_joko_v1_capability]);
 
 /**
  * @generated from message joko.v1.VoiceInputLimits
@@ -96,6 +96,33 @@ export type VoiceInputCapabilityProfile = Message<"joko.v1.VoiceInputCapabilityP
    * @generated from field: bool supports_refinement = 5;
    */
   supportsRefinement: boolean;
+
+  /**
+   * @generated from field: bool supports_recognition_context = 6;
+   */
+  supportsRecognitionContext: boolean;
+
+  /**
+   * @generated from field: uint32 recognition_context_maximum_items = 7;
+   */
+  recognitionContextMaximumItems: number;
+
+  /**
+   * @generated from field: uint32 recognition_context_maximum_item_bytes = 8;
+   */
+  recognitionContextMaximumItemBytes: number;
+
+  /**
+   * @generated from field: uint32 recognition_context_maximum_bytes = 9;
+   */
+  recognitionContextMaximumBytes: number;
+
+  /**
+   * Empty means the configured routes impose no finite locale allowlist.
+   *
+   * @generated from field: repeated string supported_locales = 10;
+   */
+  supportedLocales: string[];
 };
 
 /**
@@ -104,6 +131,43 @@ export type VoiceInputCapabilityProfile = Message<"joko.v1.VoiceInputCapabilityP
  */
 export const VoiceInputCapabilityProfileSchema: GenMessage<VoiceInputCapabilityProfile> = /*@__PURE__*/
   messageDesc(file_joko_v1_voice, 1);
+
+/**
+ * Explicitly supplied and authorized client text. This request-only context
+ * never appears in a public Voice session, Operation, Event or Snapshot.
+ *
+ * @generated from message joko.v1.VoiceInputRecognitionContextItem
+ */
+export type VoiceInputRecognitionContextItem = Message<"joko.v1.VoiceInputRecognitionContextItem"> & {
+  /**
+   * @generated from field: string text = 1;
+   */
+  text: string;
+};
+
+/**
+ * Describes the message joko.v1.VoiceInputRecognitionContextItem.
+ * Use `create(VoiceInputRecognitionContextItemSchema)` to create a new message.
+ */
+export const VoiceInputRecognitionContextItemSchema: GenMessage<VoiceInputRecognitionContextItem> = /*@__PURE__*/
+  messageDesc(file_joko_v1_voice, 2);
+
+/**
+ * @generated from message joko.v1.VoiceInputRecognitionContext
+ */
+export type VoiceInputRecognitionContext = Message<"joko.v1.VoiceInputRecognitionContext"> & {
+  /**
+   * @generated from field: repeated joko.v1.VoiceInputRecognitionContextItem context_data = 1;
+   */
+  contextData: VoiceInputRecognitionContextItem[];
+};
+
+/**
+ * Describes the message joko.v1.VoiceInputRecognitionContext.
+ * Use `create(VoiceInputRecognitionContextSchema)` to create a new message.
+ */
+export const VoiceInputRecognitionContextSchema: GenMessage<VoiceInputRecognitionContext> = /*@__PURE__*/
+  messageDesc(file_joko_v1_voice, 3);
 
 /**
  * Text-bearing values exist only in the authenticated, in-memory Voice input
@@ -128,7 +192,7 @@ export type VoiceInputDraft = Message<"joko.v1.VoiceInputDraft"> & {
  * Use `create(VoiceInputDraftSchema)` to create a new message.
  */
 export const VoiceInputDraftSchema: GenMessage<VoiceInputDraft> = /*@__PURE__*/
-  messageDesc(file_joko_v1_voice, 2);
+  messageDesc(file_joko_v1_voice, 4);
 
 /**
  * @generated from message joko.v1.VoiceInputResult
@@ -163,7 +227,7 @@ export type VoiceInputResult = Message<"joko.v1.VoiceInputResult"> & {
  * Use `create(VoiceInputResultSchema)` to create a new message.
  */
 export const VoiceInputResultSchema: GenMessage<VoiceInputResult> = /*@__PURE__*/
-  messageDesc(file_joko_v1_voice, 3);
+  messageDesc(file_joko_v1_voice, 5);
 
 /**
  * @generated from message joko.v1.VoiceInputDictionaryAliasState
@@ -185,7 +249,7 @@ export type VoiceInputDictionaryAliasState = Message<"joko.v1.VoiceInputDictiona
  * Use `create(VoiceInputDictionaryAliasStateSchema)` to create a new message.
  */
 export const VoiceInputDictionaryAliasStateSchema: GenMessage<VoiceInputDictionaryAliasState> = /*@__PURE__*/
-  messageDesc(file_joko_v1_voice, 4);
+  messageDesc(file_joko_v1_voice, 6);
 
 /**
  * @generated from message joko.v1.VoiceInputDictionaryEntryState
@@ -217,7 +281,7 @@ export type VoiceInputDictionaryEntryState = Message<"joko.v1.VoiceInputDictiona
  * Use `create(VoiceInputDictionaryEntryStateSchema)` to create a new message.
  */
 export const VoiceInputDictionaryEntryStateSchema: GenMessage<VoiceInputDictionaryEntryState> = /*@__PURE__*/
-  messageDesc(file_joko_v1_voice, 5);
+  messageDesc(file_joko_v1_voice, 7);
 
 /**
  * @generated from message joko.v1.VoiceInputDictionaryCandidateState
@@ -244,7 +308,7 @@ export type VoiceInputDictionaryCandidateState = Message<"joko.v1.VoiceInputDict
  * Use `create(VoiceInputDictionaryCandidateStateSchema)` to create a new message.
  */
 export const VoiceInputDictionaryCandidateStateSchema: GenMessage<VoiceInputDictionaryCandidateState> = /*@__PURE__*/
-  messageDesc(file_joko_v1_voice, 6);
+  messageDesc(file_joko_v1_voice, 8);
 
 /**
  * @generated from message joko.v1.VoiceInputDictionaryLearningAction
@@ -281,7 +345,496 @@ export type VoiceInputDictionaryLearningAction = Message<"joko.v1.VoiceInputDict
  * Use `create(VoiceInputDictionaryLearningActionSchema)` to create a new message.
  */
 export const VoiceInputDictionaryLearningActionSchema: GenMessage<VoiceInputDictionaryLearningAction> = /*@__PURE__*/
-  messageDesc(file_joko_v1_voice, 7);
+  messageDesc(file_joko_v1_voice, 9);
+
+/**
+ * Bounded materialized projection of the service-owned current-v1 dictionary
+ * replica. Convergence state and replica identity never cross the UI contract.
+ *
+ * @generated from message joko.v1.VoiceInputDictionarySnapshotAlias
+ */
+export type VoiceInputDictionarySnapshotAlias = Message<"joko.v1.VoiceInputDictionarySnapshotAlias"> & {
+  /**
+   * @generated from field: string text = 1;
+   */
+  text: string;
+
+  /**
+   * @generated from field: uint64 count = 2;
+   */
+  count: bigint;
+
+  /**
+   * @generated from field: google.protobuf.Timestamp last_seen_at = 3;
+   */
+  lastSeenAt?: Timestamp | undefined;
+};
+
+/**
+ * Describes the message joko.v1.VoiceInputDictionarySnapshotAlias.
+ * Use `create(VoiceInputDictionarySnapshotAliasSchema)` to create a new message.
+ */
+export const VoiceInputDictionarySnapshotAliasSchema: GenMessage<VoiceInputDictionarySnapshotAlias> = /*@__PURE__*/
+  messageDesc(file_joko_v1_voice, 10);
+
+/**
+ * @generated from message joko.v1.VoiceInputDictionarySnapshotEntry
+ */
+export type VoiceInputDictionarySnapshotEntry = Message<"joko.v1.VoiceInputDictionarySnapshotEntry"> & {
+  /**
+   * @generated from field: string entry_id = 1;
+   */
+  entryId: string;
+
+  /**
+   * @generated from field: string text = 2;
+   */
+  text: string;
+
+  /**
+   * @generated from field: joko.v1.VoiceInputDictionaryEntrySource source = 3;
+   */
+  source: VoiceInputDictionaryEntrySource;
+
+  /**
+   * @generated from field: uint64 frequency = 4;
+   */
+  frequency: bigint;
+
+  /**
+   * @generated from field: repeated joko.v1.VoiceInputDictionarySnapshotAlias aliases = 5;
+   */
+  aliases: VoiceInputDictionarySnapshotAlias[];
+
+  /**
+   * @generated from field: google.protobuf.Timestamp created_at = 6;
+   */
+  createdAt?: Timestamp | undefined;
+
+  /**
+   * @generated from field: google.protobuf.Timestamp updated_at = 7;
+   */
+  updatedAt?: Timestamp | undefined;
+};
+
+/**
+ * Describes the message joko.v1.VoiceInputDictionarySnapshotEntry.
+ * Use `create(VoiceInputDictionarySnapshotEntrySchema)` to create a new message.
+ */
+export const VoiceInputDictionarySnapshotEntrySchema: GenMessage<VoiceInputDictionarySnapshotEntry> = /*@__PURE__*/
+  messageDesc(file_joko_v1_voice, 11);
+
+/**
+ * @generated from message joko.v1.VoiceInputDictionarySnapshotCandidate
+ */
+export type VoiceInputDictionarySnapshotCandidate = Message<"joko.v1.VoiceInputDictionarySnapshotCandidate"> & {
+  /**
+   * @generated from field: string text = 1;
+   */
+  text: string;
+
+  /**
+   * @generated from field: uint64 evidence_count = 2;
+   */
+  evidenceCount: bigint;
+
+  /**
+   * @generated from field: repeated joko.v1.VoiceInputDictionarySnapshotAlias aliases = 3;
+   */
+  aliases: VoiceInputDictionarySnapshotAlias[];
+
+  /**
+   * @generated from field: google.protobuf.Timestamp created_at = 4;
+   */
+  createdAt?: Timestamp | undefined;
+
+  /**
+   * @generated from field: google.protobuf.Timestamp updated_at = 5;
+   */
+  updatedAt?: Timestamp | undefined;
+};
+
+/**
+ * Describes the message joko.v1.VoiceInputDictionarySnapshotCandidate.
+ * Use `create(VoiceInputDictionarySnapshotCandidateSchema)` to create a new message.
+ */
+export const VoiceInputDictionarySnapshotCandidateSchema: GenMessage<VoiceInputDictionarySnapshotCandidate> = /*@__PURE__*/
+  messageDesc(file_joko_v1_voice, 12);
+
+/**
+ * @generated from message joko.v1.VoiceInputDictionarySnapshot
+ */
+export type VoiceInputDictionarySnapshot = Message<"joko.v1.VoiceInputDictionarySnapshot"> & {
+  /**
+   * @generated from field: uint64 revision = 1;
+   */
+  revision: bigint;
+
+  /**
+   * @generated from field: bool sync_enabled = 2;
+   */
+  syncEnabled: boolean;
+
+  /**
+   * @generated from field: repeated joko.v1.VoiceInputDictionarySnapshotEntry entries = 3;
+   */
+  entries: VoiceInputDictionarySnapshotEntry[];
+
+  /**
+   * @generated from field: repeated joko.v1.VoiceInputDictionarySnapshotCandidate candidates = 4;
+   */
+  candidates: VoiceInputDictionarySnapshotCandidate[];
+
+  /**
+   * @generated from field: repeated string suppressed_automatic_terms = 5;
+   */
+  suppressedAutomaticTerms: string[];
+
+  /**
+   * Exact bounded terms the service will inject into a refinement request.
+   *
+   * @generated from field: repeated string refinement_terms = 6;
+   */
+  refinementTerms: string[];
+};
+
+/**
+ * Describes the message joko.v1.VoiceInputDictionarySnapshot.
+ * Use `create(VoiceInputDictionarySnapshotSchema)` to create a new message.
+ */
+export const VoiceInputDictionarySnapshotSchema: GenMessage<VoiceInputDictionarySnapshot> = /*@__PURE__*/
+  messageDesc(file_joko_v1_voice, 13);
+
+/**
+ * Read-only sharing projection, distinct from the editable node dictionary.
+ * Disabling sharing empties entries, not the causal vector or durable revision.
+ *
+ * @generated from message joko.v1.VoiceInputDictionaryReadOnlyAlias
+ */
+export type VoiceInputDictionaryReadOnlyAlias = Message<"joko.v1.VoiceInputDictionaryReadOnlyAlias"> & {
+  /**
+   * @generated from field: string text = 1;
+   */
+  text: string;
+
+  /**
+   * @generated from field: uint64 count = 2;
+   */
+  count: bigint;
+};
+
+/**
+ * Describes the message joko.v1.VoiceInputDictionaryReadOnlyAlias.
+ * Use `create(VoiceInputDictionaryReadOnlyAliasSchema)` to create a new message.
+ */
+export const VoiceInputDictionaryReadOnlyAliasSchema: GenMessage<VoiceInputDictionaryReadOnlyAlias> = /*@__PURE__*/
+  messageDesc(file_joko_v1_voice, 14);
+
+/**
+ * @generated from message joko.v1.VoiceInputDictionaryReadOnlyEntry
+ */
+export type VoiceInputDictionaryReadOnlyEntry = Message<"joko.v1.VoiceInputDictionaryReadOnlyEntry"> & {
+  /**
+   * @generated from field: string text = 1;
+   */
+  text: string;
+
+  /**
+   * @generated from field: uint64 frequency = 2;
+   */
+  frequency: bigint;
+
+  /**
+   * @generated from field: repeated joko.v1.VoiceInputDictionaryReadOnlyAlias aliases = 3;
+   */
+  aliases: VoiceInputDictionaryReadOnlyAlias[];
+};
+
+/**
+ * Describes the message joko.v1.VoiceInputDictionaryReadOnlyEntry.
+ * Use `create(VoiceInputDictionaryReadOnlyEntrySchema)` to create a new message.
+ */
+export const VoiceInputDictionaryReadOnlyEntrySchema: GenMessage<VoiceInputDictionaryReadOnlyEntry> = /*@__PURE__*/
+  messageDesc(file_joko_v1_voice, 15);
+
+/**
+ * @generated from message joko.v1.VoiceInputDictionaryStateVersion
+ */
+export type VoiceInputDictionaryStateVersion = Message<"joko.v1.VoiceInputDictionaryStateVersion"> & {
+  /**
+   * @generated from field: string node_id = 1;
+   */
+  nodeId: string;
+
+  /**
+   * @generated from field: string stamp = 2;
+   */
+  stamp: string;
+};
+
+/**
+ * Describes the message joko.v1.VoiceInputDictionaryStateVersion.
+ * Use `create(VoiceInputDictionaryStateVersionSchema)` to create a new message.
+ */
+export const VoiceInputDictionaryStateVersionSchema: GenMessage<VoiceInputDictionaryStateVersion> = /*@__PURE__*/
+  messageDesc(file_joko_v1_voice, 16);
+
+/**
+ * @generated from message joko.v1.VoiceInputDictionaryStateVector
+ */
+export type VoiceInputDictionaryStateVector = Message<"joko.v1.VoiceInputDictionaryStateVector"> & {
+  /**
+   * @generated from field: repeated joko.v1.VoiceInputDictionaryStateVersion versions = 1;
+   */
+  versions: VoiceInputDictionaryStateVersion[];
+};
+
+/**
+ * Describes the message joko.v1.VoiceInputDictionaryStateVector.
+ * Use `create(VoiceInputDictionaryStateVectorSchema)` to create a new message.
+ */
+export const VoiceInputDictionaryStateVectorSchema: GenMessage<VoiceInputDictionaryStateVector> = /*@__PURE__*/
+  messageDesc(file_joko_v1_voice, 17);
+
+/**
+ * @generated from message joko.v1.VoiceInputDictionaryReadOnlySnapshot
+ */
+export type VoiceInputDictionaryReadOnlySnapshot = Message<"joko.v1.VoiceInputDictionaryReadOnlySnapshot"> & {
+  /**
+   * @generated from field: uint64 revision = 1;
+   */
+  revision: bigint;
+
+  /**
+   * @generated from field: bool sync_enabled = 2;
+   */
+  syncEnabled: boolean;
+
+  /**
+   * @generated from field: repeated joko.v1.VoiceInputDictionaryReadOnlyEntry entries = 3;
+   */
+  entries: VoiceInputDictionaryReadOnlyEntry[];
+
+  /**
+   * @generated from field: joko.v1.VoiceInputDictionaryStateVector state_vector = 4;
+   */
+  stateVector?: VoiceInputDictionaryStateVector | undefined;
+};
+
+/**
+ * Describes the message joko.v1.VoiceInputDictionaryReadOnlySnapshot.
+ * Use `create(VoiceInputDictionaryReadOnlySnapshotSchema)` to create a new message.
+ */
+export const VoiceInputDictionaryReadOnlySnapshotSchema: GenMessage<VoiceInputDictionaryReadOnlySnapshot> = /*@__PURE__*/
+  messageDesc(file_joko_v1_voice, 18);
+
+/**
+ * @generated from message joko.v1.VoiceInputDictionaryPeerEndpoint
+ */
+export type VoiceInputDictionaryPeerEndpoint = Message<"joko.v1.VoiceInputDictionaryPeerEndpoint"> & {
+  /**
+   * @generated from field: string host = 1;
+   */
+  host: string;
+
+  /**
+   * @generated from field: uint32 port = 2;
+   */
+  port: number;
+};
+
+/**
+ * Describes the message joko.v1.VoiceInputDictionaryPeerEndpoint.
+ * Use `create(VoiceInputDictionaryPeerEndpointSchema)` to create a new message.
+ */
+export const VoiceInputDictionaryPeerEndpointSchema: GenMessage<VoiceInputDictionaryPeerEndpoint> = /*@__PURE__*/
+  messageDesc(file_joko_v1_voice, 19);
+
+/**
+ * @generated from message joko.v1.VoiceInputDictionaryListener
+ */
+export type VoiceInputDictionaryListener = Message<"joko.v1.VoiceInputDictionaryListener"> & {
+  /**
+   * @generated from field: uint32 listen_port = 1;
+   */
+  listenPort: number;
+
+  /**
+   * @generated from field: string host = 2;
+   */
+  host: string;
+
+  /**
+   * @generated from field: uint32 port = 3;
+   */
+  port: number;
+};
+
+/**
+ * Describes the message joko.v1.VoiceInputDictionaryListener.
+ * Use `create(VoiceInputDictionaryListenerSchema)` to create a new message.
+ */
+export const VoiceInputDictionaryListenerSchema: GenMessage<VoiceInputDictionaryListener> = /*@__PURE__*/
+  messageDesc(file_joko_v1_voice, 20);
+
+/**
+ * @generated from message joko.v1.VoiceInputDictionaryPeer
+ */
+export type VoiceInputDictionaryPeer = Message<"joko.v1.VoiceInputDictionaryPeer"> & {
+  /**
+   * @generated from field: string peer_id = 1;
+   */
+  peerId: string;
+
+  /**
+   * @generated from field: uint64 revision = 2;
+   */
+  revision: bigint;
+
+  /**
+   * @generated from field: string display_name = 3;
+   */
+  displayName: string;
+
+  /**
+   * @generated from field: string fingerprint = 4;
+   */
+  fingerprint: string;
+
+  /**
+   * @generated from field: bool online = 5;
+   */
+  online: boolean;
+
+  /**
+   * @generated from field: google.protobuf.Timestamp granted_at = 6;
+   */
+  grantedAt?: Timestamp | undefined;
+
+  /**
+   * @generated from field: google.protobuf.Timestamp last_sync_at = 7;
+   */
+  lastSyncAt?: Timestamp | undefined;
+
+  /**
+   * @generated from field: joko.v1.VoiceInputDictionaryPeerEndpoint route = 8;
+   */
+  route?: VoiceInputDictionaryPeerEndpoint | undefined;
+};
+
+/**
+ * Describes the message joko.v1.VoiceInputDictionaryPeer.
+ * Use `create(VoiceInputDictionaryPeerSchema)` to create a new message.
+ */
+export const VoiceInputDictionaryPeerSchema: GenMessage<VoiceInputDictionaryPeer> = /*@__PURE__*/
+  messageDesc(file_joko_v1_voice, 21);
+
+/**
+ * @generated from message joko.v1.VoiceInputDictionaryPeerCandidate
+ */
+export type VoiceInputDictionaryPeerCandidate = Message<"joko.v1.VoiceInputDictionaryPeerCandidate"> & {
+  /**
+   * @generated from field: string node_id = 1;
+   */
+  nodeId: string;
+
+  /**
+   * @generated from field: string display_name = 2;
+   */
+  displayName: string;
+
+  /**
+   * @generated from field: string fingerprint = 3;
+   */
+  fingerprint: string;
+
+  /**
+   * @generated from field: google.protobuf.Timestamp seen_at = 4;
+   */
+  seenAt?: Timestamp | undefined;
+
+  /**
+   * @generated from field: bool granted = 5;
+   */
+  granted: boolean;
+
+  /**
+   * @generated from field: bool key_changed = 6;
+   */
+  keyChanged: boolean;
+};
+
+/**
+ * Describes the message joko.v1.VoiceInputDictionaryPeerCandidate.
+ * Use `create(VoiceInputDictionaryPeerCandidateSchema)` to create a new message.
+ */
+export const VoiceInputDictionaryPeerCandidateSchema: GenMessage<VoiceInputDictionaryPeerCandidate> = /*@__PURE__*/
+  messageDesc(file_joko_v1_voice, 22);
+
+/**
+ * Independent dictionary-sharing authority. Configured public endpoints are
+ * visible; keys, ciphertext, proof and convergence state remain private.
+ *
+ * @generated from message joko.v1.VoiceInputDictionaryPeerStatus
+ */
+export type VoiceInputDictionaryPeerStatus = Message<"joko.v1.VoiceInputDictionaryPeerStatus"> & {
+  /**
+   * @generated from field: bool available = 1;
+   */
+  available: boolean;
+
+  /**
+   * @generated from field: uint64 configuration_revision = 2;
+   */
+  configurationRevision: bigint;
+
+  /**
+   * @generated from field: string node_id = 3;
+   */
+  nodeId: string;
+
+  /**
+   * @generated from field: string fingerprint = 4;
+   */
+  fingerprint: string;
+
+  /**
+   * @generated from field: bool enabled = 5;
+   */
+  enabled: boolean;
+
+  /**
+   * @generated from field: joko.v1.VoiceInputDictionaryPeerPhase phase = 6;
+   */
+  phase: VoiceInputDictionaryPeerPhase;
+
+  /**
+   * @generated from field: optional joko.v1.VoiceInputDictionaryPeerErrorCode error_code = 7;
+   */
+  errorCode?: VoiceInputDictionaryPeerErrorCode | undefined;
+
+  /**
+   * @generated from field: repeated joko.v1.VoiceInputDictionaryPeer peers = 8;
+   */
+  peers: VoiceInputDictionaryPeer[];
+
+  /**
+   * @generated from field: repeated joko.v1.VoiceInputDictionaryPeerCandidate candidates = 9;
+   */
+  candidates: VoiceInputDictionaryPeerCandidate[];
+
+  /**
+   * @generated from field: joko.v1.VoiceInputDictionaryListener listener = 10;
+   */
+  listener?: VoiceInputDictionaryListener | undefined;
+};
+
+/**
+ * Describes the message joko.v1.VoiceInputDictionaryPeerStatus.
+ * Use `create(VoiceInputDictionaryPeerStatusSchema)` to create a new message.
+ */
+export const VoiceInputDictionaryPeerStatusSchema: GenMessage<VoiceInputDictionaryPeerStatus> = /*@__PURE__*/
+  messageDesc(file_joko_v1_voice, 23);
 
 /**
  * Failure projection is intentionally closed and content-free. Provider error
@@ -306,7 +859,7 @@ export type VoiceInputFailure = Message<"joko.v1.VoiceInputFailure"> & {
  * Use `create(VoiceInputFailureSchema)` to create a new message.
  */
 export const VoiceInputFailureSchema: GenMessage<VoiceInputFailure> = /*@__PURE__*/
-  messageDesc(file_joko_v1_voice, 8);
+  messageDesc(file_joko_v1_voice, 24);
 
 /**
  * @generated from message joko.v1.VoiceInputSession
@@ -383,7 +936,7 @@ export type VoiceInputSession = Message<"joko.v1.VoiceInputSession"> & {
  * Use `create(VoiceInputSessionSchema)` to create a new message.
  */
 export const VoiceInputSessionSchema: GenMessage<VoiceInputSession> = /*@__PURE__*/
-  messageDesc(file_joko_v1_voice, 9);
+  messageDesc(file_joko_v1_voice, 25);
 
 /**
  * @generated from enum joko.v1.VoiceInputState
@@ -697,4 +1250,76 @@ export enum VoiceInputDictionaryLearningConfidence {
  */
 export const VoiceInputDictionaryLearningConfidenceSchema: GenEnum<VoiceInputDictionaryLearningConfidence> = /*@__PURE__*/
   enumDesc(file_joko_v1_voice, 7);
+
+/**
+ * @generated from enum joko.v1.VoiceInputDictionaryPeerPhase
+ */
+export enum VoiceInputDictionaryPeerPhase {
+  /**
+   * @generated from enum value: VOICE_INPUT_DICTIONARY_PEER_PHASE_UNSPECIFIED = 0;
+   */
+  UNSPECIFIED = 0,
+
+  /**
+   * @generated from enum value: VOICE_INPUT_DICTIONARY_PEER_PHASE_OFF = 1;
+   */
+  OFF = 1,
+
+  /**
+   * @generated from enum value: VOICE_INPUT_DICTIONARY_PEER_PHASE_WAITING = 2;
+   */
+  WAITING = 2,
+
+  /**
+   * @generated from enum value: VOICE_INPUT_DICTIONARY_PEER_PHASE_SYNCING = 3;
+   */
+  SYNCING = 3,
+
+  /**
+   * @generated from enum value: VOICE_INPUT_DICTIONARY_PEER_PHASE_UP_TO_DATE = 4;
+   */
+  UP_TO_DATE = 4,
+
+  /**
+   * @generated from enum value: VOICE_INPUT_DICTIONARY_PEER_PHASE_ERROR = 5;
+   */
+  ERROR = 5,
+}
+
+/**
+ * Describes the enum joko.v1.VoiceInputDictionaryPeerPhase.
+ */
+export const VoiceInputDictionaryPeerPhaseSchema: GenEnum<VoiceInputDictionaryPeerPhase> = /*@__PURE__*/
+  enumDesc(file_joko_v1_voice, 8);
+
+/**
+ * @generated from enum joko.v1.VoiceInputDictionaryPeerErrorCode
+ */
+export enum VoiceInputDictionaryPeerErrorCode {
+  /**
+   * @generated from enum value: VOICE_INPUT_DICTIONARY_PEER_ERROR_CODE_UNSPECIFIED = 0;
+   */
+  UNSPECIFIED = 0,
+
+  /**
+   * @generated from enum value: VOICE_INPUT_DICTIONARY_PEER_ERROR_CODE_IDENTITY_UNAVAILABLE = 1;
+   */
+  IDENTITY_UNAVAILABLE = 1,
+
+  /**
+   * @generated from enum value: VOICE_INPUT_DICTIONARY_PEER_ERROR_CODE_DICTIONARY_UNAVAILABLE = 2;
+   */
+  DICTIONARY_UNAVAILABLE = 2,
+
+  /**
+   * @generated from enum value: VOICE_INPUT_DICTIONARY_PEER_ERROR_CODE_SYNC_FAILED = 3;
+   */
+  SYNC_FAILED = 3,
+}
+
+/**
+ * Describes the enum joko.v1.VoiceInputDictionaryPeerErrorCode.
+ */
+export const VoiceInputDictionaryPeerErrorCodeSchema: GenEnum<VoiceInputDictionaryPeerErrorCode> = /*@__PURE__*/
+  enumDesc(file_joko_v1_voice, 9);
 

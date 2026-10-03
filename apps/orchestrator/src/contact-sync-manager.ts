@@ -10,20 +10,21 @@ import {
 import { type CredentialVault, type EncryptedCredential } from "./credential-vault.js";
 import { ContactSyncWorkerCodec } from "./contact-sync-codec.js";
 import {
-  contactSyncPublicKeyFromPrivate,
-  generateContactSyncIdentity,
-  isValidContactSyncPrivateKey,
-  isValidContactSyncPublicKey
-} from "./contact-sync-crypto.js";
+  nodeSyncPublicKeyFromPrivate,
+  generateNodeSyncIdentity,
+  isValidNodeSyncPrivateKey,
+  isValidNodeSyncPublicKey
+} from "@joko/node-sync";
 import {
-  ContactSyncLanTransport,
-  type ContactSyncLanCandidate,
-  type ContactSyncLanLogger,
-  type ContactSyncLanTransportOptions
-} from "./contact-sync-lan.js";
+  NodeSyncLanTransport,
+  type NodeSyncCipherChunkFrame,
+  type NodeSyncDeliveryContext,
+  type NodeSyncLanCandidate,
+  type NodeSyncLanLogger,
+  type NodeSyncLanTransportOptions
+} from "@joko/node-sync";
 import {
   ContactSyncWireDecoder,
-  type ContactSyncCipherChunkFrame,
   type ContactSyncCodec
 } from "./contact-sync-wire.js";
 
@@ -83,8 +84,8 @@ export class ContactSyncManagerError extends Error {
 interface ContactSyncTransportPort {
   start(): Promise<void>;
   stop(): void;
-  send(nodeId: string, frame: ContactSyncCipherChunkFrame): Promise<boolean>;
-  candidates(now?: number): readonly ContactSyncLanCandidate[];
+  send(nodeId: string, frame: NodeSyncCipherChunkFrame): Promise<boolean>;
+  candidates(now?: number): readonly NodeSyncLanCandidate[];
   onlinePeerIds(now?: number): readonly string[];
 }
 
@@ -99,8 +100,8 @@ export interface ContactSyncManagerOptions {
   readonly nodeId: string;
   readonly displayName: string;
   readonly codec?: ManagedContactSyncCodec;
-  readonly logger?: ContactSyncLanLogger;
-  readonly transportFactory?: (options: ContactSyncLanTransportOptions) => ContactSyncTransportPort;
+  readonly logger?: NodeSyncLanLogger;
+  readonly transportFactory?: (options: NodeSyncLanTransportOptions) => ContactSyncTransportPort;
   readonly onChanged?: () => void;
   readonly now?: () => number;
 }
@@ -112,8 +113,8 @@ export class ContactSyncManager {
   readonly #displayName: string;
   readonly #codec: ManagedContactSyncCodec;
   readonly #wireDecoder: ContactSyncWireDecoder;
-  readonly #logger: ContactSyncLanLogger;
-  readonly #transportFactory: (options: ContactSyncLanTransportOptions) => ContactSyncTransportPort;
+  readonly #logger: NodeSyncLanLogger;
+  readonly #transportFactory: (options: NodeSyncLanTransportOptions) => ContactSyncTransportPort;
   readonly #onChanged: () => void;
   readonly #now: () => number;
   readonly #peerKnownClocks = new Map<string, readonly ContactSyncClock[]>();
@@ -137,7 +138,7 @@ export class ContactSyncManager {
     this.#codec = options.codec ?? new ContactSyncWorkerCodec();
     this.#wireDecoder = new ContactSyncWireDecoder(this.#codec);
     this.#logger = options.logger ?? { debug: () => undefined, warn: () => undefined };
-    this.#transportFactory = options.transportFactory ?? ((transportOptions) => new ContactSyncLanTransport(transportOptions));
+    this.#transportFactory = options.transportFactory ?? ((transportOptions) => new NodeSyncLanTransport(transportOptions));
     this.#onChanged = options.onChanged ?? (() => undefined);
     this.#now = options.now ?? Date.now;
   }
@@ -149,7 +150,7 @@ export class ContactSyncManager {
       let configuration = this.#store.contactSyncConfiguration();
       let privateKey: string;
       if (configuration === undefined) {
-        const identity = generateContactSyncIdentity();
+        const identity = generateNodeSyncIdentity();
         const sealed = this.#vault.seal(identity.privateKey, this.#privateKeyAssociation());
         configuration = this.#store.initializeContactSyncConfiguration({
           nodeId: this.#nodeId,
@@ -165,8 +166,8 @@ export class ContactSyncManager {
         privateKey = this.#vault.open(parseSealedCredential(configuration.sealedPrivateKey), this.#privateKeyAssociation());
       }
       this.#configuration = configuration;
-      if (!isValidContactSyncPrivateKey(privateKey) || !isValidContactSyncPublicKey(configuration.publicKey) ||
-        contactSyncPublicKeyFromPrivate(privateKey) !== configuration.publicKey) {
+      if (!isValidNodeSyncPrivateKey(privateKey) || !isValidNodeSyncPublicKey(configuration.publicKey) ||
+        nodeSyncPublicKeyFromPrivate(privateKey) !== configuration.publicKey) {
         throw new Error("Contacts sync identity is invalid.");
       }
       this.#privateKey = privateKey;
@@ -337,6 +338,7 @@ export class ContactSyncManager {
   async #startTransport(): Promise<void> {
     if (this.#transport !== undefined) return;
     const transport = this.#transportFactory({
+      purpose: "contacts",
       getSelf: () => {
         const configuration = this.#configuration;
         const privateKey = this.#privateKey;
@@ -360,7 +362,7 @@ export class ContactSyncManager {
         this.#emitChanged();
         this.#scheduleAutomaticSync(250);
       },
-      onFrame: (sourceNodeId, frame) => this.#receiveFrame(sourceNodeId, frame),
+      onFrame: (sourceNodeId, frame, delivery) => this.#receiveFrame(sourceNodeId, frame, delivery),
       logger: this.#logger
     });
     this.#transport = transport;
@@ -406,12 +408,12 @@ export class ContactSyncManager {
     this.#emitChanged();
   }
 
-  async #receiveFrame(sourceNodeId: string, frame: ContactSyncCipherChunkFrame): Promise<void> {
+  async #receiveFrame(sourceNodeId: string, frame: NodeSyncCipherChunkFrame, delivery: NodeSyncDeliveryContext): Promise<void> {
     const generation = this.#generation;
     const configuration = this.#requireConfiguration();
     const privateKey = this.#privateKey;
     const peer = this.#store.contactSyncPeer(sourceNodeId);
-    if (!configuration.enabled || privateKey === undefined || peer === undefined || peer.publicKey !== frame.senderPublicKey) {
+    if (!delivery.isCurrent() || !configuration.enabled || privateKey === undefined || peer === undefined || peer.publicKey !== frame.senderPublicKey) {
       throw new ContactSyncManagerError("NOT_FOUND", "The Contacts sync sender is not granted.");
     }
     this.#activeSyncs += 1;
@@ -426,6 +428,7 @@ export class ContactSyncManager {
         now: this.#now()
       });
       this.#assertGeneration(generation);
+      if (!delivery.isCurrent()) throw new ContactSyncManagerError("UNAVAILABLE", "Contacts sync delivery authority was retired.");
       if (message === null) return;
       const merged = this.#store.mergeContactSyncState(configuration.nodeId, message.state);
       this.#peerKnownClocks.set(peer.peerId, message.state.clocks.map((clock) => ({ ...clock })));

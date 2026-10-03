@@ -108,6 +108,8 @@ describe("Orchestrator network configuration", () => {
   it("enables LAN discovery by default and supports an explicit off switch", () => {
     expect(loadConfig(base).lanDiscoveryEnabled).toBe(true);
     expect(loadConfig({ ...base, JOKO_LAN_DISCOVERY: "0" }).lanDiscoveryEnabled).toBe(false);
+    expect(loadConfig(base).voiceDictionaryLanDiscoveryEnabled).toBe(true);
+    expect(loadConfig({ ...base, JOKO_VOICE_DICTIONARY_LAN_DISCOVERY: "0" }).voiceDictionaryLanDiscoveryEnabled).toBe(false);
   });
 
   it("reserves a distinct loopback-only internal bridge port", () => {
