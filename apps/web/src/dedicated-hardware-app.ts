@@ -125,6 +125,9 @@ export class DedicatedHardwareRendererInput {
     if (action.kind === "composer-text") {
       return dispatchAppInputComposerAction(this.doc, { kind: "composer-text", text: action.text });
     }
+    if (action.kind === "composer-key") {
+      return dispatchAppInputComposerAction(this.doc, { kind: "key", key: action.key });
+    }
     return this.handlers.fixedLink(action.linkId);
   }
 

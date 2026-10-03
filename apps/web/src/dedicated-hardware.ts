@@ -164,6 +164,7 @@ export interface DedicatedHardwareTaskCatalog {
 
 export type DedicatedHardwareAction =
   | { readonly kind: "command"; readonly command: DedicatedHardwareCommand }
+  | { readonly kind: "composer-key"; readonly key: "ArrowUp" | "ArrowDown" | "Enter" }
   | {
     readonly kind: "task";
     readonly profileId: string;
@@ -438,6 +439,10 @@ export function parseDedicatedHardwareAction(value: unknown): DedicatedHardwareA
   if (value === null || typeof value !== "object" || Array.isArray(value) || !("kind" in value)) throw invalidAction();
   const action = value as Record<string, unknown>;
   switch (action.kind) {
+    case "composer-key":
+      if (!isRecordWithExactKeys(action, ["kind", "key"])
+        || action.key !== "ArrowUp" && action.key !== "ArrowDown" && action.key !== "Enter") throw invalidAction();
+      return Object.freeze({ kind: "composer-key", key: action.key });
     case "command":
       if (!isRecordWithExactKeys(action, ["kind", "command"]) || !isOption(action.command, DEDICATED_HARDWARE_COMMANDS)) throw invalidAction();
       return Object.freeze({ kind: "command", command: action.command });

@@ -29,6 +29,7 @@ export interface AppInputVoiceOwnerOptions {
 
 export interface AppInputComposerHandlers {
   readonly focus?: () => boolean;
+  readonly key?: (key: "ArrowUp" | "ArrowDown" | "Enter") => boolean;
   readonly insertText?: (text: string) => boolean;
   readonly insertSkill?: (skill: AppInputSkillIdentity) => boolean;
   readonly voice?: AppInputVoiceOwnerOptions;
@@ -36,6 +37,7 @@ export interface AppInputComposerHandlers {
 
 export type AppInputComposerAction =
   | { readonly kind: "focus" }
+  | { readonly kind: "key"; readonly key: "ArrowUp" | "ArrowDown" | "Enter" }
   | { readonly kind: "composer-text"; readonly text: string }
   | { readonly kind: "skill"; readonly skill: AppInputSkillIdentity };
 
@@ -232,6 +234,7 @@ export function useAppInputComposerOwner(
         if (!active || !pageActive || composerOwners.get(root) !== registration || !available(root, doc)
           || currentComposerRegistration(doc)?.node !== root) return false;
         if (action.kind === "focus") return latest.current.focus?.() ?? false;
+        if (action.kind === "key") return latest.current.key?.(action.key) ?? false;
         if (action.kind === "composer-text") return latest.current.insertText?.(action.text) ?? false;
         return latest.current.insertSkill?.(action.skill) ?? false;
       },

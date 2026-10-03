@@ -63,9 +63,10 @@ afterEach(async () => {
   vi.unstubAllGlobals();
 });
 
-function InputOwners({ insertText, insertSkill, voice, scroll }: {
+function InputOwners({ insertText, insertSkill, keyInput, voice, scroll }: {
   readonly insertText: (text: string) => boolean;
   readonly insertSkill: (skill: { readonly serverId: string; readonly resourceId: string; readonly name: string }) => boolean;
+  readonly keyInput?: (key: "ArrowUp" | "ArrowDown" | "Enter") => boolean;
   readonly voice?: Parameters<typeof useAppInputComposerOwner>[2]["voice"];
   readonly scroll: (deltaY: number) => void;
 }) {
@@ -76,6 +77,7 @@ function InputOwners({ insertText, insertSkill, voice, scroll }: {
     focus: () => true,
     insertText,
     insertSkill,
+    ...(keyInput === undefined ? {} : { key: keyInput }),
     ...(voice === undefined ? {} : { voice })
   });
   useAppInputTimelineOwner(timeline, "task-one:1", scroll);
@@ -100,6 +102,24 @@ async function mount(children: React.ReactNode): Promise<Root> {
 }
 
 describe("dedicated hardware renderer input", () => {
+  it("routes only fixed composer keys through the current owner and retires delivery on pagehide", async () => {
+    const keyInput = vi.fn(() => true);
+    await mount(<InputOwners insertText={() => true} insertSkill={() => true} keyInput={keyInput} scroll={() => undefined} />);
+    document.querySelector<HTMLButtonElement>("button")!.focus();
+    const command = vi.fn(() => false);
+    const input = new DedicatedHardwareRendererInput(document, { command, task: () => false, fixedLink: () => false });
+    for (const key of ["ArrowUp", "ArrowDown", "Enter"] as const) {
+      expect(input.handle(delivery({ kind: "button", phase: "press", action: { kind: "composer-key", key } }))).toBe(true);
+    }
+    expect(keyInput.mock.calls).toEqual([["ArrowUp"], ["ArrowDown"], ["Enter"]]);
+    expect(command).not.toHaveBeenCalled();
+    expect(input.handle(delivery({ kind: "button", phase: "press", action: { kind: "composer-key", key: "A" } }))).toBe(false);
+    window.dispatchEvent(new Event("pagehide"));
+    expect(input.handle(delivery({ kind: "button", phase: "press", action: { kind: "composer-key", key: "ArrowUp" } }))).toBe(false);
+    expect(keyInput).toHaveBeenCalledTimes(3);
+    input.dispose();
+  });
+
   it("strictly parses payloads and routes text, exact skills, fixed links, and tasks through current owners", async () => {
     const text = vi.fn(() => true);
     const skill = vi.fn(() => true);

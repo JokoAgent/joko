@@ -78,6 +78,7 @@ export type ComposerRouteReferenceDropAction =
 
 export interface ComposerRichTextEditorHandle {
   readonly focus: (position?: "start" | "end") => void;
+  readonly inputKey: (key: "ArrowUp" | "ArrowDown" | "Enter") => boolean;
   readonly focusFromBlankSurface: () => void;
   readonly editPastedText: (nodePosition: number, expectedText: string, nextText: string, display: string) => boolean;
   readonly insertRouteReference: (insertion: ComposerInternalDropInsertion) => boolean;
@@ -235,6 +236,22 @@ export const ComposerRichTextEditor = forwardRef<ComposerRichTextEditorHandle, {
 
   useImperativeHandle(forwardedRef, () => ({
     focus: (position = "end") => { editor?.commands.focus(position); },
+    inputKey: (key) => {
+      if (editor === null || editor.isDestroyed || !editor.isEditable
+        || !pasteRuntimeRef.current.editable || pasteRuntimeRef.current.disabled) return false;
+      const view = editor.view;
+      const doc = view.dom.ownerDocument;
+      if (key !== "ArrowUp" && key !== "ArrowDown" && key !== "Enter"
+        || view.composing || !view.hasFocus() || doc.activeElement !== view.dom
+        || !view.dom.isConnected || view.dom.closest("[hidden], [inert], [aria-hidden='true']") !== null
+        || doc.visibilityState !== "visible" || !doc.hasFocus()) return false;
+      const ownerWindow = doc.defaultView;
+      if (ownerWindow === null || ownerWindow.closed) return false;
+      const event = new ownerWindow.KeyboardEvent("keydown", { key, code: key, bubbles: true, cancelable: true });
+      if (view.someProp("handleKeyDown", (handle) => handle(view, event)) || event.defaultPrevented) return true;
+      if (key === "Enter") return editor.commands.splitBlock();
+      return moveComposerCaretVertically(view, key === "ArrowUp" ? -1 : 1);
+    },
     focusFromBlankSurface: () => {
       if (editor === null) return;
       const intent = resolveComposerBlankFocusIntent({
@@ -315,6 +332,28 @@ export const ComposerRichTextEditor = forwardRef<ComposerRichTextEditorHandle, {
     />
   );
 });
+
+function moveComposerCaretVertically(view: EditorView, direction: -1 | 1): boolean {
+  const { state } = view;
+  if (!state.selection.empty) {
+    const position = direction < 0 ? state.selection.from : state.selection.to;
+    view.dispatch(state.tr.setSelection(Selection.near(state.doc.resolve(position), direction)).scrollIntoView());
+    return true;
+  }
+  let position: number | undefined;
+  try {
+    const caret = view.coordsAtPos(state.selection.head);
+    const halfLine = Math.max(1, (caret.bottom - caret.top) / 2);
+    position = view.posAtCoords({
+      left: caret.left,
+      top: direction < 0 ? caret.top - halfLine : caret.bottom + halfLine
+    })?.pos;
+  } catch { return false; }
+  if (position === undefined || !Number.isInteger(position) || position < 0 || position > state.doc.content.size) return false;
+  const selection = Selection.near(state.doc.resolve(position), direction);
+  if (!selection.eq(state.selection)) view.dispatch(state.tr.setSelection(selection).scrollIntoView());
+  return true;
+}
 
 function composerRouteReferenceInsertionPosition(state: EditorState, requestedPosition: number): number | undefined {
   const routeType = state.schema.nodes[ComposerRouteReferenceNode.name];

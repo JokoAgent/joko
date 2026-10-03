@@ -13,6 +13,7 @@ import {
 import type { DedicatedHardwareInputEvent } from "./protocol.js";
 import {
   createDefaultDedicatedHardwareSettings,
+  type DedicatedHardwareDirection,
   type DedicatedHardwareEncoderMode,
   type DedicatedHardwareModelId,
   type DedicatedHardwareSettings
@@ -151,10 +152,62 @@ describe("dedicated hardware input controller", () => {
     stick(controller, 0, 0);
 
     expect(events).toEqual([
-      { kind: "scroll", phase: "press", direction: "up", distance: 0.8 },
-      { kind: "scroll", phase: "move", direction: "up", distance: 0.9 },
+      { kind: "scroll", phase: "press", direction: "up", distance: expect.any(Number) },
+      { kind: "scroll", phase: "move", direction: "up", distance: expect.any(Number) },
       { kind: "scroll", phase: "release" },
       button("press", { kind: "command", command: "toggle-inspector" })
+    ]);
+    expect((events[0] as { distance: number }).distance).toBeCloseTo(0.894427190999916, 12);
+    expect((events[1] as { distance: number }).distance).toBeCloseTo(0.9486832980505138, 12);
+  });
+
+  it.each([
+    [0.125 - 0.000001, "right"], [0.125, "down"],
+    [0.375 - 0.000001, "down"], [0.375, "left"],
+    [0.625 - 0.000001, "left"], [0.625, "up"],
+    [0.875 - 0.000001, "up"], [0.875, "right"]
+  ] as const)("maps polar stick angle %s to %s at sector boundaries", (angle, direction) => {
+    const events: DedicatedHardwareActionEvent[] = [];
+    const base = enabledSettings();
+    const commands = {
+      up: "previous-task", down: "next-task", left: "toggle-sidebar", right: "toggle-inspector"
+    } as const;
+    const settings: DedicatedHardwareSettings = {
+      ...base,
+      layout: {
+        ...base.layout,
+        stick: Object.fromEntries(Object.entries(commands).map(([side, command]) =>
+          [side, { kind: "command", command }]
+        )) as DedicatedHardwareSettings["layout"]["stick"]
+      }
+    };
+    const controller = createDedicatedHardwareInputController({ emitAction: (_model, event) => events.push(event) });
+    controller.updateModel(MODEL, { settings, taskSlots: selection(settings) });
+    stick(controller, 0, 0);
+    stick(controller, Math.cos(angle * Math.PI * 2), Math.sin(angle * Math.PI * 2));
+    expect(events).toEqual([
+      button("press", { kind: "command", command: commands[direction as DedicatedHardwareDirection] })
+    ]);
+  });
+
+  it("uses radial polar distance for diagonal activation and full scroll intensity", () => {
+    const events: DedicatedHardwareActionEvent[] = [];
+    const settings = enabledSettings();
+    const controller = createDedicatedHardwareInputController({ emitAction: (_model, event) => events.push(event) });
+    controller.updateModel(MODEL, { settings, taskSlots: selection(settings) });
+    stick(controller, 0, 0);
+    const angle = 0.625 * Math.PI * 2;
+    stick(controller, Math.cos(angle) * 0.6, Math.sin(angle) * 0.6);
+    expect(events[0]).toMatchObject({ kind: "scroll", phase: "press", direction: "up" });
+    if (events[0]?.kind !== "scroll" || events[0].phase !== "press") throw new Error("Expected radial scroll admission.");
+    expect(events[0].distance).toBeCloseTo(0.6, 12);
+    stick(controller, Math.cos(angle), Math.sin(angle));
+    stick(controller, -1, -1);
+    stick(controller, 0, 0);
+    expect(events.slice(1)).toEqual([
+      { kind: "scroll", phase: "move", direction: "up", distance: 1 },
+      { kind: "scroll", phase: "move", direction: "up", distance: 1 },
+      { kind: "scroll", phase: "release" }
     ]);
   });
 
@@ -181,23 +234,21 @@ describe("dedicated hardware input controller", () => {
   it("maps all encoder turn modes without synthesizing arbitrary keyboard input", () => {
     const events: DedicatedHardwareActionEvent[] = [];
     const controller = createDedicatedHardwareInputController({ emitAction: (_model, event) => events.push(event) });
-    const expected: Readonly<Record<Exclude<DedicatedHardwareEncoderMode, "custom">, readonly [string, string]>> = {
-      "session-switch": ["previous-task", "next-task"],
-      reasoning: ["effort-decrease", "effort-increase"],
-      "conversation-scroll": ["scroll-up", "scroll-down"],
-      "composer-navigation": ["previous-panel", "next-panel"]
+    const expected: Readonly<Record<Exclude<DedicatedHardwareEncoderMode, "custom">, readonly [DedicatedHardwareAction, DedicatedHardwareAction]>> = {
+      "session-switch": [{ kind: "command", command: "previous-task" }, { kind: "command", command: "next-task" }],
+      reasoning: [{ kind: "command", command: "effort-decrease" }, { kind: "command", command: "effort-increase" }],
+      "conversation-scroll": [{ kind: "command", command: "scroll-up" }, { kind: "command", command: "scroll-down" }],
+      "composer-navigation": [{ kind: "composer-key", key: "ArrowUp" }, { kind: "composer-key", key: "ArrowDown" }]
     };
     for (const [mode, commands] of Object.entries(expected) as Array<[
       Exclude<DedicatedHardwareEncoderMode, "custom">,
-      readonly [string, string]
+      readonly [DedicatedHardwareAction, DedicatedHardwareAction]
     ]>) {
       const settings = withEncoderMode(mode);
       controller.updateModel(MODEL, { settings, taskSlots: selection(settings) });
-      controller.handleInput(MODEL, { kind: "encoder", delta: -1, pressed: false });
       controller.handleInput(MODEL, { kind: "encoder", delta: 1, pressed: false });
-      expect(events.splice(0)).toEqual(commands.map((command) =>
-        button("press", { kind: "command", command } as Parameters<typeof button>[1])
-      ));
+      controller.handleInput(MODEL, { kind: "encoder", delta: -1, pressed: false });
+      expect(events.splice(0)).toEqual(commands.map((action) => button("press", action)));
     }
 
     const base = enabledSettings();
@@ -222,6 +273,46 @@ describe("dedicated hardware input controller", () => {
     ]);
   });
 
+  it("keeps encoder rotations separate from press release, long press, and owner cancellation", () => {
+    vi.useFakeTimers();
+    const events: DedicatedHardwareActionEvent[] = [];
+    const settings = withEncoderMode("reasoning");
+    const controller = createDedicatedHardwareInputController({ emitAction: (_model, event) => events.push(event) });
+    controller.updateModel(MODEL, { settings, taskSlots: selection(settings) });
+
+    controller.handleInput(MODEL, { kind: "encoder", delta: 0, pressed: true });
+    vi.advanceTimersByTime(250);
+    controller.handleInput(MODEL, { kind: "encoder", delta: 1, pressed: false });
+    vi.advanceTimersByTime(DEDICATED_HARDWARE_ENCODER_LONG_PRESS_MS - 251);
+    controller.handleInput(MODEL, { kind: "encoder", delta: -1, pressed: true });
+    expect(events).toEqual([
+      button("press", { kind: "command", command: "effort-decrease" }),
+      button("press", { kind: "command", command: "effort-increase" })
+    ]);
+    vi.advanceTimersByTime(1);
+    controller.handleInput(MODEL, { kind: "encoder", delta: 0, pressed: false });
+    expect(events.splice(0)).toEqual([
+      button("press", { kind: "command", command: "effort-decrease" }),
+      button("press", { kind: "command", command: "effort-increase" }),
+      button("press", { kind: "command", command: "open-settings" })
+    ]);
+
+    controller.handleInput(MODEL, { kind: "encoder", delta: 0, pressed: true });
+    controller.handleInput(MODEL, { kind: "encoder", delta: 1, pressed: false });
+    controller.updateModel(MODEL, { settings, taskSlots: { ...selection(settings), connectionGeneration: "8" } });
+    vi.advanceTimersByTime(DEDICATED_HARDWARE_ENCODER_LONG_PRESS_MS);
+    controller.handleInput(MODEL, { kind: "encoder", delta: 0, pressed: true });
+    vi.advanceTimersByTime(DEDICATED_HARDWARE_ENCODER_LONG_PRESS_MS);
+    controller.handleInput(MODEL, { kind: "encoder", delta: 0, pressed: false });
+    expect(events.splice(0)).toEqual([
+      button("press", { kind: "command", command: "effort-decrease" })
+    ]);
+
+    controller.handleInput(MODEL, { kind: "encoder", delta: 0, pressed: true });
+    controller.handleInput(MODEL, { kind: "encoder", delta: 0, pressed: false });
+    expect(events).toEqual([button("press", { kind: "composer-key", key: "Enter" })]);
+  });
+
   it("distinguishes bounded encoder clicks and long presses in built-in and custom modes", () => {
     vi.useFakeTimers();
     const events: DedicatedHardwareActionEvent[] = [];
@@ -236,7 +327,7 @@ describe("dedicated hardware input controller", () => {
     vi.advanceTimersByTime(DEDICATED_HARDWARE_ENCODER_LONG_PRESS_MS);
     controller.handleInput(MODEL, { kind: "encoder", delta: 0, pressed: false });
     expect(events.splice(0)).toEqual([
-      button("press", { kind: "command", command: "activate" }),
+      button("press", { kind: "composer-key", key: "Enter" }),
       button("press", { kind: "command", command: "open-settings" })
     ]);
 

@@ -13,6 +13,7 @@ import {
   type DedicatedHardwareSdkRuntimeTarget
 } from "../dedicated-hardware-sdk.js";
 import { loadDedicatedHardwareStagedAdapter } from "./utility-entry.js";
+import { createDefaultDedicatedHardwareSettings } from "./settings.js";
 
 const cleanups: string[] = [];
 const runtimeTarget: DedicatedHardwareSdkRuntimeTarget = {
@@ -37,7 +38,14 @@ describe("dedicated hardware utility SDK admission", () => {
     if (identity.kind !== "staged") throw new Error("Expected a staged identity.");
     const sink = { publishState: vi.fn(), publishInput: vi.fn() };
     const adapter = await loadDedicatedHardwareStagedAdapter(identity, sink);
-    expect(adapter.stop).toBeTypeOf("function");
+    expect(await adapter.setDesiredState("codex-micro", {
+      settings: { ...createDefaultDedicatedHardwareSettings("codex-micro"), enabled: true },
+      preview: false
+    })).toMatchObject({
+      model: "codex-micro", status: "connected", transport: "usb", firmwareVersion: "1.2.3",
+      keymapDeviceFirmwareIdentity: null
+    });
+    await adapter.stop();
 
     await writeFile(resolve(staged.root, staged.lock.entry.relativePath), "export const replaced = true;\n");
     await expect(loadDedicatedHardwareStagedAdapter(identity, sink))
@@ -55,12 +63,25 @@ async function stageAdapter(): Promise<Readonly<{ root: string; lock: DedicatedH
     {
       relativePath: "adapter.mjs",
       bytes: new TextEncoder().encode([
-        "export function createDedicatedHardwareUtilityAdapter() {",
-        "  return {",
-        "    async setDesiredState(_model, desired) { return desired; },",
-        "    async probe(model) { return { model }; },",
-        "    async stop() {}",
+        "export const DeviceType = { CodexMicro: 1, CreatorMicroV2: 2 };",
+        "export class WLDeviceDiscovery {",
+        "  findWLDevices(filter) { return [{ isUsbConnection: true, serialNumber: 'controlled-device-a' }]; }",
+        "}",
+        "export class WLDeviceCommImpl {",
+        "  rpcResponse = '';",
+        "  async connect(device) { return true; }",
+        "  async disconnect() {}",
+        "  parseRpcData(data) { return false; }",
+        "}",
+        "export class RPCApiOAI {",
+        "  api = {",
+        "    async readFile(name) { return { ok: true, value: '{\"profiles\":[{\"layers\":[{\"layout\":{}}]}]}' }; },",
+        "    async writeFile(name, contents) { return { ok: true, value: null }; }",
         "  };",
+        "  constructor(comm, logger) {}",
+        "  async getDeviceStatus() { return { ok: true, value: { firmwareVersion: '1.2.3', batteryPercentage: 71, isCharging: false, profileIndex: 0, layerIndex: 1 } }; }",
+        "  onHidReceived(listener) { return () => {}; }",
+        "  onJoystickMove(listener) { return () => {}; }",
         "}",
         ""
       ].join("\n"))

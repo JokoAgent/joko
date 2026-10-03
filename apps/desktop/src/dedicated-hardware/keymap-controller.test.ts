@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 
+import { buildCreatorManagedKeymap, readCreatorManagedHidMapping } from "./creator-keymap.js";
 import {
   createDedicatedHardwareKeymapController,
   type DedicatedHardwareKeymapAdapter
@@ -70,6 +71,38 @@ function adapterFixture(options: { backup?: string; current?: string } = {}) {
 }
 
 describe("dedicated hardware exclusive keymap controller", () => {
+  it("backs up a nondefault active layer, rolls a failed real layout update back, and restores the exact original", async () => {
+    const original = JSON.stringify({
+      retained: "document",
+      profiles: [
+        { layers: [{ layout: { keymap: [["other profile"]] } }] },
+        { layers: [
+          { layout: { keymap: [["other layer"]] } },
+          { id: 7, layout: { keymap: [["factory"]], retain: "layout" } }
+        ] }
+      ]
+    }, null, 2);
+    const context = { profileIndex: 1, layerIndex: 2 };
+    const fixture = adapterFixture({ current: original });
+    vi.mocked(fixture.adapter.buildManaged).mockImplementation((value, taskKeys) =>
+      buildCreatorManagedKeymap(value, taskKeys, context));
+    const controller = createDedicatedHardwareKeymapController(fixture.adapter);
+    await controller.occupy(["AG00", "ACT07"], IDENTITY);
+    const confirmed = fixture.current();
+    expect(fixture.backup()).toBe(original);
+    expect(readCreatorManagedHidMapping(confirmed, context)?.get("AG01")).toBe("ACT07");
+    expect(fixture.order.indexOf("save-backup")).toBeLessThan(fixture.order.indexOf("write-1"));
+    fixture.failWriteCalls(2);
+    await expect(controller.occupy(["AG03"], IDENTITY)).rejects.toThrow("apply");
+    expect(fixture.current()).toBe(confirmed);
+    expect(readCreatorManagedHidMapping(fixture.current(), context)?.get("AG01")).toBe("ACT07");
+    expect(fixture.backup()).toBe(original);
+    await controller.release();
+    expect(fixture.current()).toBe(original);
+    expect(fixture.backup()).toBeUndefined();
+    expect(controller.getState()).toEqual({ phase: "idle", backupAvailable: false, failure: null });
+  });
+
   it("keeps a retained A recovery visible and prevents B from consuming or bypassing it", async () => {
     const fixture = adapterFixture({ backup: ORIGINAL, current: managed(ORIGINAL, ["AG00"]) });
     const controller = createDedicatedHardwareKeymapController(fixture.adapter);
