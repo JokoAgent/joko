@@ -250,6 +250,7 @@ import {
   type NativeTaskStatusWindowBounds
 } from "./mac-native-task-status-host.js";
 import {
+  isAllowedDesktopClipboardWriteRequest,
   isAllowedDesktopMicrophoneRequest,
   mapDesktopMicrophonePermissionStatus,
   microphoneMainFrameFromPermissionDetails,
@@ -286,10 +287,19 @@ import { createManagedExitFence } from "./managed-exit-fence.js";
 import { probeManagedRuntimeActivity } from "./managed-runtime-activity.js";
 import {
   createPackagedSmokeTask,
+  runPackagedSmokeTimelineTurn,
   verifyPackagedSmokeTask,
   type PackagedSmokeTask,
   type PackagedSmokeTaskOptions
 } from "./packaged-smoke-task.js";
+import {
+  cleanupPackagedSmokeClipboard,
+  hasOnlyEmptyPackagedSmokeClipboardFormats,
+  isPackagedSmokeRestorableClipboardFormat,
+  isPackagedSmokeClipboardObservationOwned,
+  packagedSmokeSystemClipboardText,
+  type PackagedSmokeClipboardObservation
+} from "./packaged-smoke-clipboard-cleanup.js";
 import {
   canRespawnManagedOrchestratorAfterProbe,
   commitVerifiedManagedOrchestratorAdoption,
@@ -433,8 +443,13 @@ const githubActionsPackagedSmoke = packagedSmoke && process.env["GITHUB_ACTIONS"
 const packagedSmokeConnectOrigin = process.env["JOKO_DESKTOP_SMOKE_CONNECT_ORIGIN"];
 const packagedSmokePublicHttpOrigin = process.env["JOKO_DESKTOP_SMOKE_PUBLIC_HTTP_ORIGIN"];
 const packagedSmokeProviderOrigin = process.env["JOKO_DESKTOP_SMOKE_PROVIDER_ORIGIN"];
+const packagedSmokeClipboardNonce = process.env["JOKO_DESKTOP_SMOKE_CLIPBOARD_NONCE"];
 const packagedSmokeResultPath = process.env["JOKO_DESKTOP_SMOKE_RESULT"];
 const packagedSmokeUserData = process.env["JOKO_DESKTOP_SMOKE_USER_DATA"];
+if (packagedSmoke && packagedSmokeScope === "full" && process.platform === "win32"
+  && (packagedSmokeClipboardNonce === undefined || !/^[0-9a-f]{32}$/u.test(packagedSmokeClipboardNonce))) {
+  throw new Error("Packaged Desktop clipboard smoke requires an exact per-run owner nonce.");
+}
 if (externalPackagedE2e && (packagedSmokeUserData === undefined
   || !isAbsolute(packagedSmokeUserData) || resolve(packagedSmokeUserData) !== packagedSmokeUserData)) {
   throw new Error("Packaged Desktop E2E requires an isolated user-data directory.");
@@ -1080,6 +1095,12 @@ function createWindow(): void {
       trustedFrameUrl: webContents?.getURL() ?? "",
       requestingUrl: requestingUrlFromPermissionDetails(details, requestingOrigin),
       mediaTypes: microphoneMediaTypesFromPermissionDetails(details)
+    }) || isAllowedDesktopClipboardWriteRequest({
+      permission,
+      trustedOwner: webContents !== null && isTrustedClipboardWriteContents(webContents),
+      mainFrame: microphoneMainFrameFromPermissionDetails(details),
+      trustedFrameUrl: webContents?.getURL() ?? "",
+      requestingUrl: requestingUrlFromPermissionDetails(details, requestingOrigin)
     }));
   electronSession.setPermissionRequestHandler((webContents, permission, callback, details) => {
     callback(isAllowedDesktopMicrophoneRequest({
@@ -1089,6 +1110,12 @@ function createWindow(): void {
       trustedFrameUrl: webContents.getURL(),
       requestingUrl: requestingUrlFromPermissionDetails(details),
       mediaTypes: microphoneMediaTypesFromPermissionDetails(details)
+    }) || isAllowedDesktopClipboardWriteRequest({
+      permission,
+      trustedOwner: isTrustedClipboardWriteContents(webContents),
+      mainFrame: microphoneMainFrameFromPermissionDetails(details),
+      trustedFrameUrl: webContents.getURL(),
+      requestingUrl: requestingUrlFromPermissionDetails(details)
     }));
   });
   electronSession.setDevicePermissionHandler(() => false);
@@ -2155,6 +2182,11 @@ async function verifyPackagedSmokeSessionWindow(owner: BrowserWindow): Promise<v
   await waitForPackagedSmokeTaskPresentation(taskWindow, task, taskOwner);
   assertPackagedSmokeTaskWindowOwner(taskWindow, taskOwner);
   recordPackagedSmokeProgress("task_window_reloaded_exact_owner");
+  if (process.platform === "win32") {
+    await runPackagedSmokeTimelineTurn(taskOptions, task);
+    recordPackagedSmokeProgress("timeline_generation_completed");
+    await verifyPackagedSmokeTimelineSystemClipboard(taskWindow);
+  }
 
   const concurrentTaskOptions = {
     ...taskOptions,
@@ -2225,6 +2257,360 @@ async function verifyPackagedSmokeSessionWindow(owner: BrowserWindow): Promise<v
   }
   recordPackagedSmokeProgress("task_windows_closed_cleanly");
   recordPackagedSmokeProgress("durable_task_reverified");
+}
+
+const PACKAGED_SMOKE_PNG_SIGNATURE = "89504e470d0a1a0a";
+
+interface PackagedSmokeClipboardSnapshot {
+  readonly formats: readonly string[];
+  readonly text: string;
+  readonly html: string;
+  readonly rtf: string;
+  readonly bookmark: Readonly<{ title: string; url: string }>;
+  readonly image?: NativeImage;
+}
+
+interface PackagedSmokeClipboardFingerprint {
+  readonly text: string;
+  readonly imageSha256: string;
+}
+
+async function verifyPackagedSmokeTimelineSystemClipboard(window: BrowserWindow): Promise<void> {
+  const fixture = packagedSmokeTimelineClipboardFixture();
+  const systemClipboardFixture = Object.freeze({
+    tableText: packagedSmokeSystemClipboardText(fixture.tableText, process.platform),
+    mathText: packagedSmokeSystemClipboardText(fixture.mathText, process.platform)
+  });
+  await waitForPackagedSmokeTimelineClipboardBlocks(window, fixture);
+  if (window.isDestroyed() || window.webContents.isDestroyed()) {
+    throw new Error("Packaged smoke Timeline clipboard owner retired before verification.");
+  }
+  if (window.isMinimized()) window.restore();
+  window.show();
+  window.focus();
+  const focusDeadline = Date.now() + 5_000;
+  while (!window.isFocused() && Date.now() < focusDeadline) await waitForPackagedSmokePoll();
+  if (!window.isFocused()) throw new Error("Packaged smoke Timeline clipboard owner did not become focused.");
+
+  const writerContents = window.webContents;
+  const snapshot = capturePackagedSmokeClipboard();
+  const sentinel = `joko-packaged-smoke-clipboard-${randomUUID()}`;
+  let tableFingerprint: PackagedSmokeClipboardFingerprint | undefined;
+  let mathFingerprint: PackagedSmokeClipboardFingerprint | undefined;
+  let copyActionsSettled = false;
+  try {
+    clipboard.writeText(sentinel, "clipboard");
+    if (clipboard.readText("clipboard") !== sentinel || !clipboard.readImage("clipboard").isEmpty()) {
+      throw new Error("Packaged smoke could not establish its system clipboard sentinel.");
+    }
+    await clickPackagedSmokeTimelineCopy(window, ".timeline-copy-block--table");
+    tableFingerprint = await waitForPackagedSmokeTimelineClipboard(
+      window,
+      ".timeline-copy-block--table",
+      systemClipboardFixture.tableText
+    );
+    recordPackagedSmokeProgress("timeline_table_system_clipboard_verified");
+
+    assertPackagedSmokeClipboardFingerprint(tableFingerprint);
+    await clickPackagedSmokeTimelineCopy(window, ".timeline-copy-block--math");
+    mathFingerprint = await waitForPackagedSmokeTimelineClipboard(
+      window,
+      ".timeline-copy-block--math",
+      systemClipboardFixture.mathText
+    );
+    copyActionsSettled = true;
+    if (mathFingerprint.imageSha256 === tableFingerprint.imageSha256) {
+      throw new Error("Packaged smoke Timeline Copy actions did not produce distinct PNG payloads.");
+    }
+    recordPackagedSmokeProgress("timeline_math_system_clipboard_verified");
+  } finally {
+    await cleanupPackagedSmokeClipboard({
+      writesKnownSettled: copyActionsSettled,
+      waitForWritesToSettle: () => waitForPackagedSmokeTimelineCopyActionsToSettle(window),
+      retireWriter: () => retirePackagedSmokeTimelineClipboardWriter(window, writerContents),
+      ownsCurrentClipboard: () => packagedSmokeClipboardIsOwned(
+        sentinel,
+        [systemClipboardFixture.tableText, systemClipboardFixture.mathText]
+      ),
+      restorePreviousClipboard: () => restorePackagedSmokeClipboard(snapshot, () => (
+        packagedSmokeClipboardIsOwned(sentinel, [systemClipboardFixture.tableText, systemClipboardFixture.mathText])
+      ))
+    });
+  }
+}
+
+async function retirePackagedSmokeTimelineClipboardWriter(
+  window: BrowserWindow,
+  writerContents: WebContents
+): Promise<void> {
+  const contentsDestroyed = writerContents.isDestroyed()
+    ? Promise.resolve()
+    : new Promise<void>((resolveDestroyed) => writerContents.once("destroyed", resolveDestroyed));
+  const windowClosed = window.isDestroyed()
+    ? Promise.resolve()
+    : new Promise<void>((resolveClosed) => window.once("closed", resolveClosed));
+  if (!window.isDestroyed()) window.destroy();
+  await Promise.all([contentsDestroyed, windowClosed]);
+}
+
+function packagedSmokeTimelineClipboardFixture(): Readonly<{
+  tableText: string;
+  mathSource: string;
+  mathText: string;
+}> {
+  if (packagedSmokeClipboardNonce === undefined) {
+    throw new Error("Packaged smoke Timeline clipboard owner nonce is unavailable.");
+  }
+  const mathSource = `x_{${packagedSmokeClipboardNonce}}=1`;
+  return Object.freeze({
+    tableText: `Kind\tValue\nAlpha\tBeta\nOwner\t${packagedSmokeClipboardNonce}`,
+    mathSource,
+    mathText: `$$\n${mathSource}\n$$`
+  });
+}
+
+async function waitForPackagedSmokeTimelineClipboardBlocks(
+  window: BrowserWindow,
+  fixture: ReturnType<typeof packagedSmokeTimelineClipboardFixture>
+): Promise<void> {
+  const deadline = Date.now() + 20_000;
+  let lastObservation = "unavailable";
+  while (Date.now() < deadline) {
+    const value = await window.webContents.executeJavaScript([
+      "(() => {",
+      "  const assistant = [...document.querySelectorAll('.message-assistant')].filter((node) =>",
+      "    node.querySelector('.timeline-copy-block--table, .timeline-copy-block--math'));",
+      "  const tableBlocks = document.querySelectorAll('.message-assistant__body .timeline-copy-block--table');",
+      "  const mathBlocks = document.querySelectorAll('.message-assistant__body .timeline-copy-block--math');",
+      "  const table = tableBlocks.length === 1 ? tableBlocks[0].querySelector('table') : null;",
+      "  const tableText = table ? [...table.querySelectorAll('tr')].map((row) =>",
+      "    [...row.querySelectorAll('th, td')].map((cell) => cell.textContent?.trim() ?? '').join('\\t')).join('\\n') : '';",
+      "  const mathSource = mathBlocks.length === 1",
+      "    ? mathBlocks[0].querySelector('annotation[encoding=\"application/x-tex\"]')?.textContent?.trim() ?? '' : '';",
+      "  return {",
+      "    assistantCount: assistant.length, tableCount: tableBlocks.length, mathCount: mathBlocks.length,",
+      "    tableText, mathSource, streaming: Boolean(assistant[0]?.querySelector('.streaming-cursor'))",
+      "  };",
+      "})()"
+    ].join("\n"), true) as unknown;
+    if (typeof value === "object" && value !== null && !Array.isArray(value)) {
+      const observation = value as Record<string, unknown>;
+      lastObservation = JSON.stringify(observation);
+      if (observation["assistantCount"] === 1
+        && observation["tableCount"] === 1
+        && observation["mathCount"] === 1
+        && observation["tableText"] === fixture.tableText
+        && observation["mathSource"] === fixture.mathSource
+        && observation["streaming"] === false) return;
+    }
+    await waitForPackagedSmokePoll();
+  }
+  throw new Error(`Packaged smoke Timeline clipboard blocks did not settle (${lastObservation}).`);
+}
+
+async function clickPackagedSmokeTimelineCopy(window: BrowserWindow, blockSelector: string): Promise<void> {
+  const clicked = await window.webContents.executeJavaScript([
+    "(() => {",
+    `  const blocks = document.querySelectorAll(${JSON.stringify(`.message-assistant__body ${blockSelector}`)});`,
+    "  if (blocks.length !== 1) return false;",
+    "  const buttons = blocks[0].querySelectorAll(':scope > button.timeline-copy-block__button:not(.timeline-copy-block__annotate)');",
+    "  if (buttons.length !== 1) return false;",
+    "  const button = buttons[0];",
+    "  if (!(button instanceof HTMLButtonElement) || button.disabled || button.getAttribute('aria-busy') === 'true') return false;",
+    "  button.click();",
+    "  return true;",
+    "})()"
+  ].join("\n"), true) as unknown;
+  if (clicked !== true) throw new Error(`Packaged smoke could not dispatch one Copy action for ${blockSelector}.`);
+}
+
+async function waitForPackagedSmokeTimelineClipboard(
+  window: BrowserWindow,
+  blockSelector: string,
+  expectedText: string
+): Promise<PackagedSmokeClipboardFingerprint> {
+  const deadline = Date.now() + 20_000;
+  let lastObservation = "unavailable";
+  while (Date.now() < deadline) {
+    const state = await packagedSmokeTimelineCopyActionState(window, blockSelector);
+    if (state === "failed") throw new Error(`Packaged smoke ${blockSelector} Copy action failed.`);
+    const image = clipboard.readImage("clipboard");
+    const text = clipboard.readText("clipboard");
+    const size = image.getSize();
+    const png = image.isEmpty() ? Buffer.alloc(0) : image.toPNG();
+    const validPng = !image.isEmpty() && size.width >= 1 && size.height >= 1 && png.byteLength > 8
+      && png.subarray(0, 8).toString("hex") === PACKAGED_SMOKE_PNG_SIGNATURE
+      && !nativeImage.createFromBuffer(png).isEmpty();
+    lastObservation = JSON.stringify({
+      state,
+      textMatches: text === expectedText,
+      textLength: text.length,
+      textSha256: createHash("sha256").update(text).digest("hex"),
+      expectedTextSha256: createHash("sha256").update(expectedText).digest("hex"),
+      imageEmpty: image.isEmpty(),
+      imageSize: size,
+      pngBytes: png.byteLength,
+      validPng,
+      formats: clipboard.availableFormats("clipboard")
+    });
+    if (state === "settled" && text === expectedText && !image.isEmpty()) {
+      if (!validPng) {
+        throw new Error(`Packaged smoke ${blockSelector} system clipboard PNG was invalid.`);
+      }
+      return Object.freeze({
+        text: expectedText,
+        imageSha256: createHash("sha256").update(png).digest("hex")
+      });
+    }
+    await waitForPackagedSmokePoll();
+  }
+  throw new Error(
+    `Packaged smoke ${blockSelector} system clipboard did not contain the exact PNG and text (${lastObservation}).`
+  );
+}
+
+async function packagedSmokeTimelineCopyActionState(
+  window: BrowserWindow,
+  blockSelector: string
+): Promise<"pending" | "settled" | "failed" | "unavailable"> {
+  if (window.isDestroyed() || window.webContents.isDestroyed()) return "unavailable";
+  const state = await window.webContents.executeJavaScript([
+    "(() => {",
+    `  const block = document.querySelector(${JSON.stringify(`.message-assistant__body ${blockSelector}`)});`,
+    "  if (!block) return 'unavailable';",
+    "  if (block.querySelector('[role=\"alert\"]')) return 'failed';",
+    "  const button = block.querySelector(':scope > button.timeline-copy-block__button:not(.timeline-copy-block__annotate)');",
+    "  if (!(button instanceof HTMLButtonElement)) return 'unavailable';",
+    "  return button.getAttribute('aria-busy') === 'true' ? 'pending' : 'settled';",
+    "})()"
+  ].join("\n"), true) as unknown;
+  return state === "pending" || state === "settled" || state === "failed" ? state : "unavailable";
+}
+
+async function waitForPackagedSmokeTimelineCopyActionsToSettle(window: BrowserWindow): Promise<boolean> {
+  const deadline = Date.now() + 5_000;
+  while (Date.now() < deadline) {
+    const states = await Promise.all([
+      packagedSmokeTimelineCopyActionState(window, ".timeline-copy-block--table"),
+      packagedSmokeTimelineCopyActionState(window, ".timeline-copy-block--math")
+    ]);
+    if (states.every((state) => state === "settled" || state === "failed")) return true;
+    if (states.includes("unavailable")) return false;
+    await waitForPackagedSmokePoll();
+  }
+  return false;
+}
+
+function assertPackagedSmokeClipboardFingerprint(expected: PackagedSmokeClipboardFingerprint): void {
+  if (!packagedSmokeClipboardMatchesFingerprint(expected)) {
+    throw new Error("Packaged smoke will not replace a newer system clipboard owner.");
+  }
+}
+
+function packagedSmokeClipboardMatchesFingerprint(expected: PackagedSmokeClipboardFingerprint): boolean {
+  if (clipboard.readText("clipboard") !== expected.text) return false;
+  const image = clipboard.readImage("clipboard");
+  return !image.isEmpty()
+    && createHash("sha256").update(image.toPNG()).digest("hex") === expected.imageSha256;
+}
+
+function packagedSmokeClipboardIsOwned(sentinel: string, expectedOutputTexts: readonly string[]): boolean {
+  return isPackagedSmokeClipboardObservationOwned(
+    readPackagedSmokeClipboardObservation(),
+    sentinel,
+    expectedOutputTexts
+  );
+}
+
+function readPackagedSmokeClipboardObservation(): PackagedSmokeClipboardObservation {
+  const text = clipboard.readText("clipboard");
+  const image = clipboard.readImage("clipboard");
+  if (image.isEmpty()) return Object.freeze({ text });
+  const size = image.getSize();
+  const png = image.toPNG();
+  if (size.width < 1 || size.height < 1 || png.byteLength <= 8
+    || png.subarray(0, 8).toString("hex") !== PACKAGED_SMOKE_PNG_SIGNATURE
+    || nativeImage.createFromBuffer(png).isEmpty()) return Object.freeze({ text });
+  return Object.freeze({ text, imageSha256: createHash("sha256").update(png).digest("hex") });
+}
+
+function capturePackagedSmokeClipboard(): PackagedSmokeClipboardSnapshot {
+  const image = clipboard.readImage("clipboard");
+  const formats = Object.freeze([...new Set(clipboard.availableFormats("clipboard"))]);
+  const unsupportedFormats = formats.filter((format) => !isPackagedSmokeRestorableClipboardFormat(format));
+  if (unsupportedFormats.length > 0) {
+    throw new Error(
+      `Packaged smoke will not replace clipboard formats that cannot be restored atomically: ${unsupportedFormats.join(", ")}`
+    );
+  }
+  const snapshot = Object.freeze({
+    formats,
+    text: clipboard.readText("clipboard"),
+    html: clipboard.readHTML("clipboard"),
+    rtf: clipboard.readRTF("clipboard"),
+    bookmark: Object.freeze(clipboard.readBookmark()),
+    ...(image.isEmpty() ? {} : { image })
+  });
+  if (formats.length > 0 && packagedSmokeClipboardWriteData(snapshot) === undefined) {
+    if (hasOnlyEmptyPackagedSmokeClipboardFormats(
+      formats,
+      (format) => clipboard.readBuffer(format).byteLength
+    )) return Object.freeze({ ...snapshot, formats: Object.freeze([]) });
+    throw new Error("Packaged smoke cannot represent the current system clipboard in one restore transaction.");
+  }
+  return snapshot;
+}
+
+async function restorePackagedSmokeClipboard(
+  snapshot: PackagedSmokeClipboardSnapshot,
+  ownsCurrentClipboard: () => boolean
+): Promise<void> {
+  let lastFailure: unknown;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    if (!ownsCurrentClipboard()) {
+      if (attempt === 0) return;
+      throw new Error(`Packaged smoke lost clipboard ownership while restoring: ${safeSmokeError(lastFailure)}`);
+    }
+    try {
+      const data = packagedSmokeClipboardWriteData(snapshot);
+      if (data === undefined) clipboard.clear("clipboard");
+      else clipboard.write(data, "clipboard");
+      if (packagedSmokeClipboardMatchesSnapshot(snapshot)) return;
+      lastFailure = new Error("restored clipboard did not match the captured snapshot");
+    } catch (error) {
+      lastFailure = error;
+    }
+    if (attempt < 2) await waitForPackagedSmokePoll();
+  }
+  throw new Error(`Packaged smoke could not restore the system clipboard: ${safeSmokeError(lastFailure)}`);
+}
+
+function packagedSmokeClipboardMatchesSnapshot(snapshot: PackagedSmokeClipboardSnapshot): boolean {
+  if (clipboard.readText("clipboard") !== snapshot.text
+    || clipboard.readHTML("clipboard") !== snapshot.html
+    || clipboard.readRTF("clipboard") !== snapshot.rtf
+    || !isDeepStrictEqual(clipboard.readBookmark(), snapshot.bookmark)) return false;
+  const image = clipboard.readImage("clipboard");
+  if (snapshot.image === undefined) return image.isEmpty();
+  return !image.isEmpty() && createHash("sha256").update(image.toPNG()).digest("hex")
+    === createHash("sha256").update(snapshot.image.toPNG()).digest("hex");
+}
+
+function packagedSmokeClipboardWriteData(snapshot: PackagedSmokeClipboardSnapshot): Readonly<{
+  text?: string;
+  html?: string;
+  rtf?: string;
+  bookmark?: string;
+  image?: NativeImage;
+}> | undefined {
+  const data = Object.freeze({
+    ...(snapshot.text !== "" ? { text: snapshot.text } : snapshot.bookmark.url === "" ? {} : { text: snapshot.bookmark.url }),
+    ...(snapshot.html === "" ? {} : { html: snapshot.html }),
+    ...(snapshot.rtf === "" ? {} : { rtf: snapshot.rtf }),
+    ...(snapshot.bookmark.url === "" ? {} : { bookmark: snapshot.bookmark.title || snapshot.bookmark.url }),
+    ...(snapshot.image === undefined ? {} : { image: snapshot.image })
+  });
+  return Object.keys(data).length === 0 ? undefined : data;
 }
 
 function assertPackagedSmokeTaskWindowOwner(
@@ -8711,6 +9097,13 @@ function trustedApplicationWindowForContents(contents: WebContents): BrowserWind
 function isTrustedApplicationContents(contents: WebContents): boolean {
   const owner = trustedApplicationWindowForContents(contents);
   return owner !== undefined && isAllowedMainFrameNavigation(contents.getURL(), navigationPolicy);
+}
+
+function isTrustedClipboardWriteContents(contents: WebContents): boolean {
+  const owner = trustedApplicationWindowForContents(contents);
+  return owner !== undefined
+    && (owner === mainWindow || sessionWindowOwnersByContents.has(contents))
+    && isAllowedMainFrameNavigation(contents.getURL(), navigationPolicy);
 }
 
 function assertGlobalVoiceOwnerSender(event: IpcMainInvokeEvent): void {

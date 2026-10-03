@@ -277,7 +277,7 @@ async function runNativeFrontmostSmoke(configuration) {
       const pasted = await stateAfter("paste", (value) => value.first.pastes === 1 && value.first.pasteMatches === true);
       assert.equal(pasted.second.pastes, 0);
 
-      await focus("focus-first", ready.first.nativeId);
+      const rejectionBaseline = await focus("focus-first", ready.first.nativeId);
       const currentInput = createPlatformSystemFrontmostInput({
         platform: process.platform, windowsHelper: helper, currentProcessId: child.pid
       });
@@ -298,8 +298,8 @@ async function runNativeFrontmostSmoke(configuration) {
         await assert.rejects(() => postEffect(wrongInput.runner, effect, wrongTarget, 120), (error) => error.code === 3);
       }
       const final = await command("state");
-      assert.deepEqual(final.first, pasted.first);
-      assert.deepEqual(final.second, pasted.second);
+      assert.deepEqual(final.first, rejectionBaseline.first);
+      assert.deepEqual(final.second, rejectionBaseline.second);
       return {
         sampler: true, exactTarget: true, fixedTargetAfterFocusMove: true,
         return: true, wheel: true, paste: true, currentProcessRejected: true, wrongProcessRejected: true

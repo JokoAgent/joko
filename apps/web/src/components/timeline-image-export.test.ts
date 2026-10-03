@@ -1,9 +1,9 @@
 // @vitest-environment jsdom
-import { getFontEmbedCSS, toSvg } from "html-to-image";
+import { toSvg } from "html-to-image";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { copyTimelinePng, timelineDomToPng, timelineTableToTsv } from "./timeline-image-export.js";
 
-vi.mock("html-to-image", () => ({ getFontEmbedCSS: vi.fn(async () => ""), toSvg: vi.fn(async () => "data:image/svg+xml,test") }));
+vi.mock("html-to-image", () => ({ toSvg: vi.fn(async () => "data:image/svg+xml,test") }));
 beforeEach(() => { vi.clearAllMocks(); });
 afterEach(() => { vi.restoreAllMocks(); document.body.replaceChildren(); });
 
@@ -70,7 +70,7 @@ it("freezes source content, inherited style, dimensions and fonts before awaitin
   expect(snapshot.textContent).toBe("Formula A");
   expect((snapshot.firstElementChild as HTMLElement).style.color).toBe("rgb(255, 0, 0)");
   expect(options).toEqual(expect.objectContaining({ width: 300, height: 120 }));
-  expect(vi.mocked(getFontEmbedCSS).mock.calls[0]![0].style.fontFamily).toContain("KaTeX_Main");
+  expect(options).toEqual(expect.objectContaining({ fontEmbedCSS: "" }));
   const encode = fixture.encodes[0]!;
   expect(encode.canvas.ownerDocument).toBe(fixture.doc);
   expect([encode.canvas.width, encode.canvas.height]).toEqual([600, 240]);
@@ -79,6 +79,38 @@ it("freezes source content, inherited style, dimensions and fonts before awaitin
   expect(await result).toBe(png);
   expect(staging.isConnected).toBe(false);
   expect([encode.canvas.width, encode.canvas.height]).toEqual([0, 0]);
+});
+
+it("embeds a used packaged font from its stylesheet URL without creating a CSP-blocked base element", async () => {
+  const fixture = createDocument();
+  const style = fixture.doc.head.appendChild(fixture.doc.createElement("style"));
+  style.textContent = '@font-face{font-display:block;font-family:"KaTeX_Main";font-style:normal;font-weight:400;src:url("./font.woff2") format("woff2"),url("./font.ttf") format("truetype")}';
+  Object.defineProperty(style.sheet!, "href", { configurable: true, value: "joko://app/assets/Timeline.css" });
+  const fetch = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) => ({
+    ok: true,
+    status: 200,
+    headers: { get: () => "font/woff2" },
+    arrayBuffer: async () => new Uint8Array([1, 2, 3, 4]).buffer
+  } as unknown as Response));
+  Object.defineProperty(fixture.win, "fetch", { configurable: true, value: fetch });
+  const result = timelineDomToPng(
+    content(fixture.doc, "Formula", '"KaTeX_Main"'),
+    { ownerDocument: fixture.doc, signal: new AbortController().signal }
+  );
+  await vi.waitFor(() => expect(fixture.encodes).toHaveLength(1));
+  expect(fetch).toHaveBeenCalledOnce();
+  expect(fetch).toHaveBeenCalledWith(
+    "joko://app/assets/font.woff2",
+    expect.objectContaining({ signal: expect.any(AbortSignal) })
+  );
+  const options = vi.mocked(toSvg).mock.calls[0]![1]!;
+  expect(options.fontEmbedCSS).toContain("@font-face");
+  expect(options.fontEmbedCSS).toContain("data:font/woff2;base64,AQIDBA==");
+  expect(options.fontEmbedCSS).toContain('format("woff2")');
+  expect(options.fontEmbedCSS).not.toContain("font.ttf");
+  expect(fixture.doc.querySelector("base")).toBeNull();
+  fixture.encodes[0]!.complete(new Blob(["PNG"]));
+  await result;
 });
 
 it("cancels preparation promptly, cleans its snapshot and selects fonts separately in another Document", async () => {
@@ -96,7 +128,7 @@ it("cancels preparation promptly, cleans its snapshot and selects fonts separate
   const second = createDocument();
   const fresh = timelineDomToPng(content(second.doc, "Formula", '"KaTeX_Main"'), { ownerDocument: second.doc, signal: new AbortController().signal });
   await vi.waitFor(() => expect(second.encodes).toHaveLength(1));
-  expect(vi.mocked(getFontEmbedCSS).mock.calls[0]![0].ownerDocument).toBe(second.doc);
+  expect((vi.mocked(toSvg).mock.calls[0]![0] as HTMLElement).ownerDocument).toBe(second.doc);
   second.encodes[0]!.complete(new Blob(["PNG"]));
   await fresh;
   expect(first.encodes).toHaveLength(0);

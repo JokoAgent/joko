@@ -502,6 +502,7 @@ function recentConversationEvents(store: OperationalStore, sessionId: string): P
     const page = store.listEvents({
       sessionId,
       order: "desc",
+      activeNativeTimeline: true,
       ...(beforeCursor === undefined ? {} : { beforeCursor }),
       limit: SESSION_EVENT_SCAN_PAGE_SIZE
     });

@@ -10368,6 +10368,10 @@ export class OperationalStore {
     this.assertOpen();
     const clauses: string[] = [];
     const params: Array<string | number | bigint> = [];
+    if (query.activeNativeTimeline === true && (query.sessionId === undefined
+      || query.sessionIds !== undefined || query.targetId !== undefined || query.includeTombstoned === true)) {
+      throw new StoreError("Active native Timeline projection requires one non-tombstoned Session scope.");
+    }
     if (query.afterCursor !== undefined && query.beforeCursor !== undefined) {
       throw new StoreError("Event history cannot page after and before a cursor at the same time.");
     }
@@ -10415,11 +10419,24 @@ export class OperationalStore {
     const where = clauses.length === 0 ? "" : `WHERE ${clauses.join(" AND ")}`;
     const limit = normalizeLimit(query.limit, 1000);
     const order = query.order === "desc" ? "DESC" : "ASC";
+    const nativeVisibility = query.activeNativeTimeline === true && query.sessionId !== undefined
+      ? this.nativeMessageSearchVisibility(
+          { kind: "session", id: nonBlank(query.sessionId, "Timeline Session ID") },
+          this.latestEventCursor()
+        )
+      : undefined;
+    const ctePrefix = nativeVisibility === undefined ? "" : `WITH RECURSIVE ${nativeVisibility.ctes}`;
     return (this.database.prepare(
-      `SELECT event.* FROM events AS event
+      `${ctePrefix}
+       SELECT event.* FROM events AS event
        LEFT JOIN message_event_tombstones AS tombstone ON tombstone.event_id = event.id
-       ${where} ORDER BY event.global_cursor ${order} LIMIT ?`
-    ).all(...params, limit) as Row[]).map(eventFromRow);
+       ${where}${nativeVisibility?.clause("event") ?? ""}
+       ORDER BY event.global_cursor ${order} LIMIT ?`
+    ).all(
+      ...(nativeVisibility?.params ?? []),
+      ...params,
+      limit
+    ) as Row[]).map(eventFromRow);
   }
 
   /**
