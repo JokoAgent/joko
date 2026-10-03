@@ -25,6 +25,9 @@ import type { MobileVoiceDictionaryControllerState } from "./mobile-voice-dictio
 import { EMPTY_MOBILE_VOICE_DICTIONARY, type MobileVoiceDictionary } from "./mobile-voice-dictionary";
 import { MobileVoiceDictionaryPeers } from "./MobileVoiceDictionaryPeers";
 import type { MobileVoiceDictionaryTransport } from "./mobile-voice-dictionary-service";
+import { MobileVoiceServiceSettings, type MobileVoiceServiceDraft } from "./MobileVoiceServiceSettings";
+import type { MobileVoiceSettingsTransport } from "./mobile-voice-service-settings";
+import type { MutableRefObject } from "react";
 
 export interface MobileVoiceDictionaryScreenProps {
   readonly colors: MobileSettingsColors;
@@ -32,6 +35,9 @@ export interface MobileVoiceDictionaryScreenProps {
   readonly state: MobileVoicePreferencesStoreState;
   readonly dictionary: MobileVoiceDictionaryControllerState;
   readonly peerTransport?: MobileVoiceDictionaryTransport;
+  readonly serviceTransport?: MobileVoiceSettingsTransport;
+  readonly serviceDraftCache?: MutableRefObject<MobileVoiceServiceDraft | undefined>;
+  readonly onSetRecognitionContext?: (enabled: boolean, contextData: readonly { readonly text: string }[]) => Promise<void>;
   readonly onBack: () => void;
   readonly onRetry: () => Promise<void>;
   readonly onReset: () => Promise<void>;
@@ -229,6 +235,9 @@ export function MobileVoiceDictionaryScreen(props: MobileVoiceDictionaryScreenPr
     <Notice colors={colors} text={t("settings.voice.privacy")} />
     {props.onReadOnlyDictionary && <Button label={t("settings.voiceReadonly.title")} colors={colors}
       onPress={props.onReadOnlyDictionary} />}
+
+    <MobileVoiceServiceSettings colors={colors} locale={locale} transport={props.serviceTransport}
+      cache={props.serviceDraftCache} preferences={state} onSetContext={props.onSetRecognitionContext} />
 
     <Text style={[styles.section, { color: colors.muted }]}>{t("settings.voice.instructions")}</Text>
     <Text style={[styles.caption, { color: colors.muted }]}>{t("settings.voice.instructionsHint")}</Text>

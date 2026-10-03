@@ -4,7 +4,9 @@ import { gzipSync, gunzipSync } from "node:zlib";
 import { WebSocketServer, type WebSocket } from "ws";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AsrEvent } from "@joko/voice-input";
-import { SaucTranscriptionProvider, probeSaucTranscriptionRoute, validateSaucTranscriptionConfiguration, validateSaucTranscriptionRoute } from "./provider.js";
+import { SAUC_SUPPORTED_LOCALES, SaucTranscriptionProvider, probeSaucTranscriptionRoute, validateSaucLocale,
+  validateSaucTranscriptionConfiguration, validateSaucTranscriptionRoute, type SaucAuthentication,
+  type SaucTranscriptionMode, type SaucTranscriptionRoute } from "./provider.js";
 
 const cleanups: Array<() => Promise<void>> = [];
 afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); });
@@ -59,7 +61,8 @@ async function fixture(onConnection: (socket: WebSocket, request: IncomingMessag
   const address = server.address();
   if (typeof address === "string" || address === null) throw new Error("Missing test socket address.");
   return { endpoint: `ws://127.0.0.1:${address.port}/api/v3/sauc/bigmodel_async`, resourceId: "volc.seedasr.sauc.duration",
-    apiKey: "ephemeral-test-key", connectTimeoutMs: 1_000, flushTimeoutMs: 500 };
+    mode: "asyncTwoPass" as const, authentication: { type: "apiKey" as const, apiKey: "ephemeral-test-key" },
+    connectTimeoutMs: 1_000, flushTimeoutMs: 500 };
 }
 function provider(route: ConstructorParameters<typeof SaucTranscriptionProvider>[0]) {
   const instance = new SaucTranscriptionProvider(route);
@@ -81,31 +84,51 @@ async function flushWithResult(instance: SaucTranscriptionProvider, packets: Pac
 }
 
 describe("SAUC native transcription", () => {
-  it("negotiates before audio, segments copied PCM, retains only definite prefixes, and waits for the last response", async () => {
+  it.each((["asyncTwoPass", "bidirectional", "streamInput"] as const).flatMap((mode) =>
+    (["apiKey", "accessToken"] as const).map((authenticationType) => ({ mode, authenticationType }))
+  ))("negotiates $mode with $authenticationType, freezes its text context, and waits for the last response", async ({ mode, authenticationType }) => {
     let socket!: WebSocket;
     let request!: IncomingMessage;
     let packets!: Packet[];
-    const route = await fixture((connected, handshake, _index, sent) => { socket = connected; request = handshake; packets = sent; }, false);
+    const initial = await fixture((connected, handshake, _index, sent) => { socket = connected; request = handshake; packets = sent; }, false);
+    const path = mode === "asyncTwoPass" ? "bigmodel_async" : mode === "bidirectional" ? "bigmodel" : "bigmodel_nostream";
+    const authentication: SaucAuthentication = authenticationType === "apiKey" ? { type: "apiKey", apiKey: "frozen-key" }
+      : { type: "accessToken", appId: "application-123", accessToken: "frozen-access-token" };
+    const corpus = { boostingTableName: "专用词表", boostingTableId: "boost-id", correctTableName: "correction-name", correctTableId: "correct-id" };
+    const recognitionContext = { hotwords: ["VoiceKit"], contextData: [{ text: "A deliberately supplied context." }] };
+    const route: SaucTranscriptionRoute = { ...initial, endpoint: initial.endpoint.replace("bigmodel_async", path),
+      mode, authentication, corpus, recognitionContext };
     const { instance, events } = provider(route);
+    Object.assign(authentication, authenticationType === "apiKey" ? { apiKey: "changed-key" } : { accessToken: "changed-token", appId: "changed-application" });
+    corpus.boostingTableName = "changed table";
+    recognitionContext.hotwords[0] = "changed hotword";
+    recognitionContext.contextData[0]!.text = "changed context";
     const started = instance.start({ runId: "private-run", mimeType: "audio/pcm", locale: "ja-JP" });
     const captured = audio(500, 7);
     instance.appendAudio(captured);
     new Uint8Array(captured.data).fill(8);
     await vi.waitFor(() => expect(packets).toHaveLength(1));
     expect(events).toEqual([]);
-    expect(request.headers["x-api-key"]).toBe(route.apiKey);
+    expect(request.headers["x-api-key"]).toBe(authenticationType === "apiKey" ? "frozen-key" : undefined);
     expect(request.headers["x-api-resource-id"]).toBe(route.resourceId);
     expect(request.headers["x-api-sequence"]).toBe("-1");
     expect(request.headers["x-api-connect-id"]).toMatch(/^[0-9a-f-]{36}$/u);
     expect(request.headers["x-api-request-id"]).toMatch(/^[0-9a-f-]{36}$/u);
     expect(request.headers["authorization"]).toBeUndefined();
-    expect(request.headers["x-api-access-key"]).toBeUndefined();
-    expect(request.headers["x-api-app-key"]).toBeUndefined();
-    expect(request.url).toBe("/api/v3/sauc/bigmodel_async");
+    expect(request.headers["x-api-access-key"]).toBe(authenticationType === "accessToken" ? "frozen-access-token" : undefined);
+    expect(request.headers["x-api-app-key"]).toBe(authenticationType === "accessToken" ? "application-123" : undefined);
+    expect(request.headers["x-api-app-id"]).toBeUndefined();
+    expect(request.url).toBe(`/api/v3/sauc/${path}`);
     expect(JSON.parse(packets[0]!.data.toString())).toEqual({
-      audio: { format: "pcm", codec: "raw", rate: 16_000, bits: 16, channel: 1 },
-      request: { model_name: "bigmodel", result_type: "full", show_utterances: true, enable_nonstream: true,
-        end_window_size: 300, enable_punc: true, enable_itn: true }
+      audio: { format: "pcm", codec: "raw", rate: 16_000, bits: 16, channel: 1,
+        ...(mode === "streamInput" ? { language: "ja-JP" } : {}) },
+      request: { model_name: "bigmodel", result_type: "full", show_utterances: true,
+        ...(mode === "asyncTwoPass" ? { enable_nonstream: true, end_window_size: 300 } : {}),
+        enable_punc: true, enable_itn: true, corpus: {
+          boosting_table_name: "专用词表", boosting_table_id: "boost-id", correct_table_name: "correction-name", correct_table_id: "correct-id",
+          context: JSON.stringify({ hotwords: [{ word: "VoiceKit" }], context_type: "dialog_ctx",
+            context_data: [{ text: "A deliberately supplied context." }] })
+        } }
     });
     socket.send(response({}));
     await started;
@@ -153,8 +176,13 @@ describe("SAUC native transcription", () => {
 
   it("replays the complete bounded capture on the same route, shields old stable text, and drains a stop during recovery", async () => {
     const sockets: WebSocket[] = []; const captures: Packet[][] = []; const headers: IncomingMessage["headers"][] = [];
-    const route = await fixture((socket, request, _index, packets) => { sockets.push(socket); captures.push(packets); headers.push(request.headers); });
+    const initial = await fixture((socket, request, _index, packets) => { sockets.push(socket); captures.push(packets); headers.push(request.headers); });
+    const recognitionContext = { hotwords: ["VoiceKit"], contextData: [{ text: "Frozen recording context." }] };
+    const route: SaucTranscriptionRoute = { ...initial, authentication: { type: "accessToken", appId: "original-application", accessToken: "original-token" }, recognitionContext };
     const { instance, events } = provider(route);
+    Object.assign(route.authentication, { appId: "changed-application", accessToken: "changed-token" });
+    recognitionContext.hotwords[0] = "changed-hotword";
+    recognitionContext.contextData[0]!.text = "Changed recording context.";
     await instance.start({ runId: "run", mimeType: "audio/pcm" });
     instance.appendAudio(audio(200, 1));
     await vi.waitFor(() => expect(captures[0]).toHaveLength(2));
@@ -183,7 +211,13 @@ describe("SAUC native transcription", () => {
     await vi.waitFor(() => expect(captures[1]!.at(-1)?.sequence).toBeLessThan(0));
     const replay = captures[1]!.slice(1);
     expect(Buffer.concat(replay.map((packet) => packet.data))).toEqual(Buffer.concat([Buffer.alloc(6_400, 1), Buffer.alloc(3_200, 2), Buffer.alloc(3_200, 3)]));
-    expect(headers[1]!["x-api-key"]).toBe(headers[0]!["x-api-key"]);
+    expect(headers.map((header) => header["x-api-app-key"])).toEqual(["original-application", "original-application"]);
+    expect(headers.map((header) => header["x-api-access-key"])).toEqual(["original-token", "original-token"]);
+    expect(headers.every((header) => header["x-api-key"] === undefined)).toBe(true);
+    expect(captures[1]![0]!.data).toEqual(captures[0]![0]!.data);
+    expect(JSON.parse(captures[1]![0]!.data.toString()).request.corpus.context).toBe(JSON.stringify({
+      hotwords: [{ word: "VoiceKit" }], context_type: "dialog_ctx", context_data: [{ text: "Frozen recording context." }]
+    }));
     expect(headers[1]!["x-api-connect-id"]).not.toBe(headers[0]!["x-api-connect-id"]);
     sockets[1]!.send(response(result("hello new"), Math.abs(replay.at(-1)!.sequence!), true));
     await stopping;
@@ -252,10 +286,13 @@ describe("SAUC native transcription", () => {
     expect(second.events.at(-1)).toEqual({ type: "error", category: "protocol", recoverable: false });
   });
 
-  it.each(["startup", "flush", "recovery"] as const)("cancels %s and fences late provider results", async (stage) => {
+  it.each((["startup", "flush", "recovery"] as const).flatMap((stage) =>
+    (["stop", "retire"] as const).map((action) => ({ stage, action }))
+  ))("$action during $stage fences late provider results", async ({ stage, action }) => {
     const sockets: WebSocket[] = []; const sent: Packet[][] = [];
     const route = await fixture((socket, _request, _index, packets) => { sockets.push(socket); sent.push(packets); }, stage !== "startup");
-    const { instance, events } = provider(route);
+    let current = true;
+    const { instance, events } = provider({ ...route, isCurrent: () => current });
     let pending: Promise<void>;
     if (stage === "startup") pending = instance.start({ runId: "run", mimeType: "audio/pcm" });
     else {
@@ -276,12 +313,14 @@ describe("SAUC native transcription", () => {
     const rejected = expect(pending).rejects.toMatchObject({ code: "stopped" });
     await vi.waitFor(() => expect(sockets.length).toBeGreaterThan(0));
     const before = [...events];
+    if (action === "retire") current = false;
     sockets.at(-1)!.send(response(result("late"), 10, true));
-    await instance.stop();
+    if (action === "stop") await instance.stop();
     await rejected;
     await vi.waitFor(() => expect(sockets.every((socket) => socket.readyState === 3)).toBe(true));
     expect(events).toEqual(before);
     expect(sockets).toHaveLength(stage === "recovery" ? 2 : 1);
+    await expect(instance.recover()).rejects.toMatchObject({ code: action === "retire" ? "stopped" : "network" });
   });
 
   it("times out unacknowledged finalization without promoting a partial transcript", async () => {
@@ -337,17 +376,56 @@ describe("SAUC native transcription", () => {
   });
 
   it("validates public configuration independently and never accepts empty or header-injected secrets", () => {
-    const publicRoute = { endpoint: "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async", resourceId: "volc.seedasr.sauc.duration" };
+    const publicRoute = { endpoint: "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async", resourceId: "volc.seedasr.sauc.duration", mode: "asyncTwoPass" as const };
     expect(validateSaucTranscriptionConfiguration(publicRoute)).toEqual(publicRoute);
-    expect(() => validateSaucTranscriptionRoute({ ...publicRoute, apiKey: "" })).toThrow();
-    for (const apiKey of ["x\r\nAuthorization: stolen", " ", "x".repeat(8_193)]) {
-      expect(() => validateSaucTranscriptionRoute({ ...publicRoute, apiKey })).toThrow();
+    for (const secret of ["", "x\r\nAuthorization: stolen", " ", "x".repeat(8_193)]) {
+      for (const authentication of [{ type: "apiKey", apiKey: secret }, { type: "accessToken", appId: "application", accessToken: secret }] as const) {
+        expect(() => validateSaucTranscriptionRoute({ ...publicRoute, authentication })).toThrow();
+      }
+    }
+    for (const authentication of [undefined, null, { type: "apiKey", apiKey: "valid", appId: "mixed" },
+      { type: "accessToken", appId: "application", accessToken: "valid", apiKey: "mixed" },
+      { type: "accessToken", appId: "", accessToken: "valid" }, { type: "accessToken", appId: "x\r\nX-Api-Key: stolen", accessToken: "valid" },
+      { type: "apiKey" }, { type: "accessToken", appId: "application" }, { type: "guessed", apiKey: "valid" }]) {
+      expect(() => validateSaucTranscriptionRoute({ ...publicRoute, authentication } as SaucTranscriptionRoute)).toThrow();
+    }
+    for (const extra of [{ apiKey: "old-shape" }, { authentication: { type: "apiKey", apiKey: "valid" }, apiKey: "mixed-shape" }]) {
+      expect(() => validateSaucTranscriptionRoute({ ...publicRoute, ...extra } as unknown as SaucTranscriptionRoute)).toThrow();
+    }
+    for (const corpus of [null, { context: "untyped" }, { regexCorrectTableId: "outside-scope" }, { boostingTableId: "" },
+      { boostingTableId: " leading" }, { correctTableName: "x\u0085invalid" }, { correctTableId: "x".repeat(257) }]) {
+      expect(() => validateSaucTranscriptionConfiguration({ ...publicRoute, corpus } as SaucTranscriptionRoute)).toThrow();
     }
     for (const endpoint of ["ws://example.com/api/v3/sauc/bigmodel_async", `${publicRoute.endpoint}?key=secret`, `${publicRoute.endpoint}#secret`,
       "wss://key@example.com/api/v3/sauc/bigmodel_async", "wss://example.com/api/v3/sauc/bigmodel_nostream", "wss://example.com/api/v3/sauc/bigmodel"]) {
       expect(() => validateSaucTranscriptionConfiguration({ ...publicRoute, endpoint })).toThrow();
     }
     expect(() => validateSaucTranscriptionConfiguration({ ...publicRoute, resourceId: "guessed-model" })).toThrow();
+    expect(() => validateSaucTranscriptionConfiguration({ ...publicRoute, mode: "guessed" as SaucTranscriptionMode })).toThrow();
+    expect(SAUC_SUPPORTED_LOCALES).toHaveLength(25);
+    expect(SAUC_SUPPORTED_LOCALES.map(validateSaucLocale)).toEqual(SAUC_SUPPORTED_LOCALES);
+    expect(validateSaucLocale(undefined)).toBeUndefined();
+    for (const locale of [null, "en", "zh-TW", "ja-jp", "", " ja-JP", "ro-R0"]) expect(() => validateSaucLocale(locale)).toThrow();
+  });
+
+  it("rejects retired starts or recovery and unsupported stream-input locales before opening a socket", async () => {
+    let connections = 0;
+    let socket!: WebSocket;
+    const route = await fixture((connected) => { connections += 1; socket = connected; });
+    const retired = provider({ ...route, isCurrent: () => false });
+    await expect(retired.instance.start({ runId: "retired", mimeType: "audio/pcm" })).rejects.toMatchObject({ code: "stopped" });
+    expect(retired.events).toEqual([]);
+    const locale = provider({ ...route, mode: "streamInput", endpoint: route.endpoint.replace("bigmodel_async", "bigmodel_nostream") });
+    await expect(locale.instance.start({ runId: "unsupported-locale", mimeType: "audio/pcm", locale: "zh-TW" })).rejects.toMatchObject({ code: "protocol" });
+    expect(connections).toBe(0);
+    let current = true;
+    const active = provider({ ...route, isCurrent: () => current });
+    await active.instance.start({ runId: "initially-current", mimeType: "audio/pcm" });
+    socket.terminate();
+    await vi.waitFor(() => expect(active.events.at(-1)).toEqual({ type: "disconnected", recoverable: true }));
+    current = false;
+    await expect(active.instance.recover()).rejects.toMatchObject({ code: "stopped" });
+    expect(connections).toBe(1);
   });
 
   it("sanitizes HTTP failures, refuses redirects, and probes readiness without sending audio", async () => {
@@ -362,7 +440,8 @@ describe("SAUC native transcription", () => {
     cleanups.push(() => new Promise<void>((resolve) => server.close(() => resolve())));
     const address = server.address();
     if (typeof address === "string" || address === null) throw new Error("Missing test HTTP address.");
-    const route = { endpoint: `ws://127.0.0.1:${address.port}/api/v3/sauc/bigmodel_async`, resourceId: "volc.seedasr.sauc.duration", apiKey: "key" };
+    const route: SaucTranscriptionRoute = { endpoint: `ws://127.0.0.1:${address.port}/api/v3/sauc/bigmodel_async`, resourceId: "volc.seedasr.sauc.duration",
+      mode: "asyncTwoPass", authentication: { type: "apiKey", apiKey: "key" } };
     expect(await probeSaucTranscriptionRoute(route)).toEqual({ ok: false, reason: "authenticationFailed" });
     status = 302;
     expect(await probeSaucTranscriptionRoute(route)).toEqual({ ok: false, reason: "serviceError" });
@@ -373,5 +452,22 @@ describe("SAUC native transcription", () => {
     const valid = await fixture((_socket, _request, _index, packets) => { sent = packets; });
     expect(await probeSaucTranscriptionRoute(valid)).toEqual({ ok: true });
     expect(sent.map((packet) => packet.type)).toEqual([1]);
+  });
+
+  it("aborts only the original readiness probe and closes its socket before the deadline", async () => {
+    const sockets: WebSocket[] = []; const packets: Packet[][] = [];
+    const route = { ...await fixture((socket, _request, _index, sent) => { sockets.push(socket); packets.push(sent); }, false), connectTimeoutMs: 5_000 };
+    const cancellation = new AbortController();
+    const canceled = probeSaucTranscriptionRoute(route, { signal: cancellation.signal });
+    await vi.waitFor(() => expect(packets[0]).toHaveLength(1));
+    const sibling = probeSaucTranscriptionRoute(route);
+    await vi.waitFor(() => expect(packets[1]).toHaveLength(1));
+    cancellation.abort();
+    await expect(canceled).resolves.toEqual({ ok: false, reason: "serviceError" });
+    await vi.waitFor(() => expect(sockets[0]!.readyState).toBe(3));
+    expect(sockets[1]!.readyState).toBe(1);
+    sockets[1]!.send(response({}));
+    await expect(sibling).resolves.toEqual({ ok: true });
+    expect(packets.map((sent) => sent.map((packet) => packet.type))).toEqual([[1], [1]]);
   });
 });

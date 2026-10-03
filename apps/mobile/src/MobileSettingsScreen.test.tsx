@@ -66,6 +66,7 @@ vi.mock("react-native", async () => {
     }, props.children);
   return {
     Alert: { alert: native.alert },
+    AppState: { addEventListener: () => ({ remove: () => undefined }) },
     BackHandler: { addEventListener: (_name: string, handler: () => boolean) => {
       native.hardwareBack = handler;
       return { remove: () => { if (native.hardwareBack === handler) native.hardwareBack = undefined; } };
@@ -231,6 +232,7 @@ const readyVoiceDictionary: MobileVoicePreferencesStoreState = {
     revision: 0,
     preferencesRevision: 0,
     refinementInstructions: "",
+    recognitionContextEnabled: false, recognitionContextData: [],
     autoLearningEnabled: true,
     usage: { voiceStarts: 0, correctionObservations: 0, lastVoiceStartedAt: null, lastCorrectionAt: null },
     history: []

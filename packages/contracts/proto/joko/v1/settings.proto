@@ -64,6 +64,32 @@ enum VoiceInputTranscriptionProtocol {
   VOICE_INPUT_TRANSCRIPTION_PROTOCOL_VOLCENGINE_SAUC = 5;
 }
 
+enum VoiceInputSaucMode {
+  VOICE_INPUT_SAUC_MODE_UNSPECIFIED = 0;
+  VOICE_INPUT_SAUC_MODE_ASYNC_TWO_PASS = 1;
+  VOICE_INPUT_SAUC_MODE_BIDIRECTIONAL = 2;
+  VOICE_INPUT_SAUC_MODE_STREAM_INPUT = 3;
+}
+
+enum VoiceInputSaucAuthentication {
+  VOICE_INPUT_SAUC_AUTHENTICATION_UNSPECIFIED = 0;
+  VOICE_INPUT_SAUC_AUTHENTICATION_API_KEY = 1;
+  VOICE_INPUT_SAUC_AUTHENTICATION_ACCESS_TOKEN = 2;
+}
+
+// Public route selection only. API keys and access tokens use the existing
+// connection-bound credential ticket and cannot appear in this projection.
+message VoiceInputSaucSettings {
+  VoiceInputSaucMode mode = 1;
+  VoiceInputSaucAuthentication authentication = 2;
+  string app_id = 3;
+  bool use_dictionary_hotwords = 4;
+  string boosting_table_name = 5;
+  string boosting_table_id = 6;
+  string correct_table_name = 7;
+  string correct_table_id = 8;
+}
+
 // Service-node configuration only. The credential value is deliberately not
 // representable; clients see only whether an encrypted reference is usable.
 message VoiceInputServiceSettings {
@@ -86,6 +112,8 @@ message VoiceInputServiceSettings {
   // SAUC resource identities are independent from transcription model IDs.
   string resource_id = 19;
   string fallback_resource_id = 20;
+  optional VoiceInputSaucSettings sauc = 21;
+  optional VoiceInputSaucSettings fallback_sauc = 22;
 }
 
 message VoiceInputServiceSettingsPatch {
@@ -112,6 +140,10 @@ message VoiceInputServiceSettingsPatch {
   optional bool clear_fallback_credential = 20;
   optional string resource_id = 21;
   optional string fallback_resource_id = 22;
+  // Absent preserves the selection; a present message replaces the complete
+  // SAUC configuration. Non-SAUC routes never project SAUC settings.
+  optional VoiceInputSaucSettings sauc = 23;
+  optional VoiceInputSaucSettings fallback_sauc = 24;
 }
 
 message ProviderConfiguration {

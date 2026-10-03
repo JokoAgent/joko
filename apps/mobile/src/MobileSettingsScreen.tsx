@@ -36,6 +36,8 @@ import type { MobileUpdateControllerState } from "./mobile-update-controller";
 import type { MobilePushControllerState } from "./mobile-push-controller";
 import type { MobileVoiceDictionaryControllerState } from "./mobile-voice-dictionary-controller";
 import type { MobileVoiceDictionaryTransport } from "./mobile-voice-dictionary-service";
+import type { MobileVoiceSettingsTransport } from "./mobile-voice-service-settings";
+import type { MobileVoiceServiceDraft } from "./MobileVoiceServiceSettings";
 
 export interface MobileSettingsColors {
   readonly background: string;
@@ -61,6 +63,8 @@ export interface MobileSettingsScreenProps {
   readonly voiceDictionary: MobileVoicePreferencesStoreState;
   readonly nodeDictionary: MobileVoiceDictionaryControllerState;
   readonly voicePeerTransport?: MobileVoiceDictionaryTransport;
+  readonly voiceServiceTransport?: MobileVoiceSettingsTransport;
+  readonly onVoiceRecognitionContextChange?: (enabled: boolean, contextData: readonly { readonly text: string }[]) => Promise<void>;
   readonly readOnlyDictionary: MobileVoiceDictionaryReadOnlyController;
   readonly updates: MobileUpdateControllerState;
   readonly push: MobilePushControllerState;
@@ -134,6 +138,7 @@ export function MobileSettingsScreen(props: MobileSettingsScreenProps) {
   const [notice, setNotice] = useState("");
   const [diagnosticsExpanded, setDiagnosticsExpanded] = useState(false);
   const [voiceOpen, setVoiceOpen] = useState(false);
+  const voiceServiceDraft = useRef<MobileVoiceServiceDraft | undefined>(undefined);
   const [readOnlyOpen, setReadOnlyOpen] = useState(false);
   const saveGeneration = useRef(0);
   const unknownReceiptSeen = useRef(false);
@@ -273,6 +278,8 @@ export function MobileSettingsScreen(props: MobileSettingsScreenProps) {
   if (voiceOpen) return <MobileVoiceDictionaryScreen key={props.nodeDictionary.ownerKey ?? "unavailable"}
     colors={colors} locale={locale.effectiveLocale}
     state={voiceDictionary} dictionary={props.nodeDictionary} peerTransport={foreground ? props.voicePeerTransport : undefined} onBack={() => setVoiceOpen(false)} onRetry={onVoiceDictionaryRetry}
+    serviceTransport={foreground ? props.voiceServiceTransport : undefined} serviceDraftCache={voiceServiceDraft}
+    onSetRecognitionContext={props.onVoiceRecognitionContextChange}
     onReset={onVoiceDictionaryReset}
     onSetInstructions={onVoiceInstructionsChange} onSetAutoLearning={onVoiceAutoLearningChange}
     onRefreshDictionary={props.onVoiceDictionaryRefresh} onSetSyncEnabled={props.onVoiceDictionarySyncChange}

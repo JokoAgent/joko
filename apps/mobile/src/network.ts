@@ -4,7 +4,8 @@ import {
   ArtifactKind, ArtifactService, BlobDisposition, ConnectionService, DeviceKind, EventService, FileKind,
   MobilePushEnvironment as WireMobilePushEnvironment, MobilePushLocale as WireMobilePushLocale,
   MobilePushProvider, OperationService, OperationState, PartnerService,
-  ResourceKind, SchedulerService, SessionService, TargetService, VoiceInputService,
+  ResourceKind, SchedulerService, SessionService, TargetService, VoiceInputService, SettingsService, CredentialService, CredentialKind,
+  type VoiceInputServiceSettings, type TestVoiceInputConnectionResponse,
   VoiceInputDictionaryEntrySource, VoiceInputDictionaryLearningActionType,
   VoiceInputDictionaryLearningConfidence, VoiceInputDictionaryTermType,
   nextVoiceDictionaryWatchSequence, projectVoiceDictionaryPeerStatus, readVoiceDictionaryPeerInvitation, type VoiceDictionaryPeerListener, type VoiceDictionaryPeerStatusView,
@@ -38,6 +39,8 @@ import {
   type MobileVoiceDictionaryLearningAction
 } from "./mobile-voice-dictionary";
 import type { MobileVoiceRefinementContext } from "./mobile-voice-input";
+import { assertMobileVoiceServiceSettings } from "./mobile-voice-service-settings";
+import { normalizeMobileVoiceRecognitionContext, type MobileVoiceRecognitionContext } from "./mobile-voice-recognition-context";
 import {
   mobileVoiceDictionaryLearningRequest,
   projectMobileVoiceDictionarySnapshot,
@@ -144,6 +147,9 @@ export interface MobileNetwork {
   authorizeBlobDownload(credential: PairedCredential, blob: BlobRef, signal?: AbortSignal): Promise<AuthorizedBlobDownload>;
   uploadBlob(credential: PairedCredential, source: MobileBlobUploadSource, signal?: AbortSignal): Promise<BlobRef>;
   getVoiceInputCapabilities(credential: PairedCredential, signal?: AbortSignal): Promise<MobileVoiceCapability>;
+  getVoiceInputServiceSettings(credential: PairedCredential, signal?: AbortSignal): Promise<VoiceInputServiceSettings>;
+  uploadVoiceInputSecret(credential: PairedCredential, secret: string, fallback: boolean, signal?: AbortSignal): Promise<string>;
+  testVoiceInputConnection(credential: PairedCredential, signal?: AbortSignal): Promise<TestVoiceInputConnectionResponse>;
   getVoiceInputDictionary(credential: PairedCredential, signal?: AbortSignal): Promise<MobileVoiceDictionarySnapshot>;
   getVoiceInputDictionaryReadOnly(credential: PairedCredential, signal?: AbortSignal): Promise<VoiceDictionaryReadOnlyView>;
   watchVoiceInputDictionaryReadOnly(credential: PairedCredential, signal: AbortSignal): AsyncIterable<VoiceDictionaryReadOnlyView>;
@@ -165,7 +171,7 @@ export interface MobileNetwork {
   adviseVoiceInputDictionaryEdit(credential: PairedCredential, draft: MobileVoiceDictionaryAdviceDraft,
     signal?: AbortSignal): Promise<{ readonly actions: readonly MobileVoiceDictionaryLearningAction[] }>;
   startVoiceInput(credential: PairedCredential, requestId: string, mimeType: string, locale?: string,
-    refinement?: MobileVoiceRefinementContext, signal?: AbortSignal): Promise<MobileVoiceSession>;
+    refinement?: MobileVoiceRefinementContext, signal?: AbortSignal, recognitionContext?: MobileVoiceRecognitionContext): Promise<MobileVoiceSession>;
   appendVoiceAudio(credential: PairedCredential, voiceInputId: string, chunkSequence: bigint, audio: Uint8Array, durationMs: number, voiced: boolean, signal?: AbortSignal): Promise<MobileVoiceSession>;
   stopVoiceInput(credential: PairedCredential, voiceInputId: string, expectedNextChunkSequence: bigint, signal?: AbortSignal): Promise<MobileVoiceSession>;
   cancelVoiceInput(credential: PairedCredential, voiceInputId: string, signal?: AbortSignal): Promise<MobileVoiceSession>;
@@ -1459,6 +1465,36 @@ export const mobileNetwork: MobileNetwork = {
       .getVoiceInputCapabilities({}, options(signal));
     return projectMobileVoiceCapability(response.profile);
   },
+  async getVoiceInputServiceSettings(credential, signal) {
+    const response = await createClient(SettingsService, transport(credential.origin, credential.authKey)).getSettings({}, options(signal));
+    signal?.throwIfAborted();
+    return assertMobileVoiceServiceSettings(response.settings?.voiceInput);
+  },
+  async uploadVoiceInputSecret(credential, secret, fallback, signal) {
+    signal?.throwIfAborted();
+    const bytes = new TextEncoder().encode(secret);
+    try {
+      if (bytes.length === 0 || bytes.length > 64 * 1024) throw new Error("The voice credential input is invalid.");
+      const response = await createClient(CredentialService, transport(credential.origin, credential.authKey))
+        .beginCredentialUpload({ kind: CredentialKind.API_KEY, providerId: "" }, options(signal));
+      signal?.throwIfAborted();
+      const ticket = response.ticket;
+      if (!ticket?.ticketId || ticket.maximumBytes < BigInt(bytes.length) || !ticket.relativeEndpoint.startsWith("/")) throw new Error("The voice credential channel is unavailable.");
+      const endpoint = new URL(ticket.relativeEndpoint, credential.origin);
+      if (endpoint.origin !== new URL(credential.origin).origin || endpoint.username || endpoint.password || endpoint.hash) throw new Error("The voice credential channel is invalid.");
+      const upload = await fetch(endpoint.toString(), { method: "PUT", headers: {
+        authorization: `Bearer ${credential.authKey}`, "content-type": "application/octet-stream"
+      }, body: bytes, signal });
+      signal?.throwIfAborted();
+      if (!upload.ok) throw new Error("The voice credential could not be uploaded.");
+      return ticket.ticketId;
+    } finally { bytes.fill(0); }
+  },
+  async testVoiceInputConnection(credential, signal) {
+    const result = await createClient(VoiceInputService, transport(credential.origin, credential.authKey)).testVoiceInputConnection({}, options(signal));
+    signal?.throwIfAborted();
+    return result;
+  },
   async getVoiceInputDictionary(credential, signal) {
     const response = await createClient(VoiceInputService, transport(credential.origin, credential.authKey))
       .getVoiceInputDictionary({}, options(signal));
@@ -1574,9 +1610,9 @@ export const mobileNetwork: MobileNetwork = {
       .adviseVoiceInputDictionaryEdit(mobileVoiceDictionaryAdviceRequest(draft), options(signal));
     return Object.freeze({ actions: projectMobileVoiceDictionaryAdvice(response.actions, draft) });
   },
-  async startVoiceInput(credential, requestId, mimeType, locale, refinement, signal) {
+  async startVoiceInput(credential, requestId, mimeType, locale, refinement, signal, recognitionContext) {
     const response = await createClient(VoiceInputService, transport(credential.origin, credential.authKey))
-      .startVoiceInput(mobileVoiceStartRequest(requestId, mimeType, locale, refinement), options(signal));
+      .startVoiceInput(mobileVoiceStartRequest(requestId, mimeType, locale, refinement, recognitionContext), options(signal));
     return projectMobileVoiceSession(response.session);
   },
   async appendVoiceAudio(credential, voiceInputId, chunkSequence, audio, durationMs, voiced, signal) {
@@ -1714,13 +1750,17 @@ function mobileVoiceStartRequest(
   requestId: string,
   mimeType: string,
   locale: string | undefined,
-  refinement: MobileVoiceRefinementContext | undefined
+  refinement: MobileVoiceRefinementContext | undefined,
+  recognitionContext?: MobileVoiceRecognitionContext
 ) {
   return {
     requestId,
     mimeType,
     ...(locale === undefined ? {} : { locale }),
-    ...(refinement?.instructions === undefined ? {} : { refinementInstructions: refinement.instructions })
+    ...(refinement?.instructions === undefined ? {} : { refinementInstructions: refinement.instructions }),
+    ...(recognitionContext === undefined ? {} : { recognitionContext: {
+      contextData: normalizeMobileVoiceRecognitionContext(recognitionContext).contextData.map((item) => ({ text: item.text }))
+    } })
   };
 }
 

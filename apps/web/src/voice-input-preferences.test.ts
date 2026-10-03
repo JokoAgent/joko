@@ -9,10 +9,30 @@ import {
   readVoiceInputPreferences,
   releasesVoiceInputShortcut,
   voiceInputLocale,
-  writeVoiceInputPreferences
+  writeVoiceInputPreferences, resetVoiceInputPreferences, voiceInputRecognitionContext, hasInvalidStoredVoiceInputPreferences
 } from "./voice-input-preferences.js";
 
 describe("voice input preferences", () => {
+  it("saves authorized ordered normalized context locally, rejects old shapes and enforces UTF-8 budgets", () => {
+    const values = new Map<string, string>();
+    const storage = { getItem: (key: string) => values.get(key) ?? null, setItem: (key: string, value: string) => { values.set(key, value); } };
+    const saved = writeVoiceInputPreferences({ contextData: ["  第一行\r\n第二行\t语境  ", "Second"] }, storage);
+    expect(saved.contextData).toEqual(["第一行\n第二行\t语境", "Second"]);
+    expect(voiceInputRecognitionContext(saved)).toBeUndefined();
+    const authorized = writeVoiceInputPreferences({ recognitionContextEnabled: true }, storage);
+    expect(voiceInputRecognitionContext(authorized)).toEqual({ contextData: [{ text: "第一行\n第二行\t语境" }, { text: "Second" }] });
+    expect(readVoiceInputPreferences(storage)).toEqual(authorized);
+    expect(() => writeVoiceInputPreferences({ contextData: ["中".repeat(683)] }, storage)).toThrow();
+    expect(() => writeVoiceInputPreferences({ contextData: [" \n "] }, storage)).toThrow();
+    const { contextData: _context, recognitionContextEnabled: _authorized, ...oldShape } = authorized;
+    storage.setItem("joko.voice-input.preferences.v1", JSON.stringify(oldShape));
+    expect(hasInvalidStoredVoiceInputPreferences(storage)).toBe(true);
+    expect(readVoiceInputPreferences(storage).recognitionContextEnabled).toBe(false);
+    expect(() => writeVoiceInputPreferences({ locale: "zh-TW" }, storage)).toThrow(/Reset/u);
+    resetVoiceInputPreferences(storage);
+    expect(hasInvalidStoredVoiceInputPreferences(storage)).toBe(false);
+    expect(writeVoiceInputPreferences({ locale: "zh-TW" }, storage).locale).toBe("zh-TW");
+  });
   it("persists only bounded device, locale, and shortcut preferences", () => {
     const values = new Map<string, string>();
     const storage = {
@@ -27,6 +47,8 @@ describe("voice input preferences", () => {
       deviceId: "device-a",
       shortcut,
       refinementInstructions: "",
+      recognitionContextEnabled: false,
+      contextData: [],
       autoDictionaryEnabled: true,
       playInteractionSound: true,
       fastActivationEnabled: false,
@@ -38,9 +60,9 @@ describe("voice input preferences", () => {
 
   it("rejects malformed or noncanonical stored values as a whole", () => {
     expect(parseVoiceInputPreferences({ locale: "not_a_locale", deviceId: "bad\0device", shortcut: "unexpected" }))
-      .toEqual({ locale: "auto", shortcut: defaultVoiceInputShortcut(), refinementInstructions: "", autoDictionaryEnabled: true, playInteractionSound: true, fastActivationEnabled: false, muteOtherSounds: true });
+      .toEqual({ locale: "auto", shortcut: defaultVoiceInputShortcut(), refinementInstructions: "", recognitionContextEnabled: false, contextData: [], autoDictionaryEnabled: true, playInteractionSound: true, fastActivationEnabled: false, muteOtherSounds: true });
     expect(parseVoiceInputPreferences({ locale: "en-us" }))
-      .toEqual({ locale: "auto", shortcut: defaultVoiceInputShortcut(), refinementInstructions: "", autoDictionaryEnabled: true, playInteractionSound: true, fastActivationEnabled: false, muteOtherSounds: true });
+      .toEqual({ locale: "auto", shortcut: defaultVoiceInputShortcut(), refinementInstructions: "", recognitionContextEnabled: false, contextData: [], autoDictionaryEnabled: true, playInteractionSound: true, fastActivationEnabled: false, muteOtherSounds: true });
     const current = writeVoiceInputPreferences({}, undefined);
     const { muteOtherSounds: _missingBoolean, ...incompletePreferences } = current;
     expect(parseVoiceInputPreferences(incompletePreferences)).toEqual(parseVoiceInputPreferences(undefined));
@@ -65,7 +87,7 @@ describe("voice input preferences", () => {
     expect(writeVoiceInputPreferences({ locale: "en-US" }, undefined).locale).toBe("en");
     expect(writeVoiceInputPreferences({ locale: "ja-JP" }, undefined).locale).toBe("ja");
     expect(writeVoiceInputPreferences({ locale: "zh-TW" }, undefined).locale).toBe("zh-TW");
-    expect(writeVoiceInputPreferences({ locale: "fr-FR" }, undefined).locale).toBe("auto");
+    expect(writeVoiceInputPreferences({ locale: "fr-FR" }, undefined).locale).toBe("fr-FR");
   });
 
   it("ends a held shortcut when any member key is released", () => {

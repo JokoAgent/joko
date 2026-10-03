@@ -720,6 +720,7 @@ message StartVoiceInputRequest {
   optional string refinement_instructions = 4;
   reserved 5;
   reserved "dictionary_terms";
+  optional VoiceInputRecognitionContext recognition_context = 6;
 }
 
 message StartVoiceInputResponse {

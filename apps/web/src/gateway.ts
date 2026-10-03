@@ -4,6 +4,7 @@ import { createConnectTransport } from "@connectrpc/connect-web";
 import { createTerminalGateway } from "./terminal-gateway.js";
 import { createSimulatorViewerGateway } from "./simulator-viewer-gateway.js";
 import { UsageReportGroup } from "@joko/contracts";
+import { projectVoiceInputSaucSettings, protoVoiceInputSaucSettings, type VoiceInputRecognitionContextView } from "@joko/contracts";
 import { nextVoiceDictionaryWatchSequence, projectVoiceDictionaryPeerStatus, readVoiceDictionaryPeerInvitation, type VoiceDictionaryPeerListener, type VoiceDictionaryPeerStatusView } from "@joko/contracts";
 import { SshKeyService, SshAgentState, SshAgentHostPlatform, SshKeyPassphrasePurpose, SshInstallShell, type SshKey, type CredentialUploadTicket } from "@joko/contracts";
 import type { SshKeyView, SshKeyCatalogView, SshKeyGenerateDraft, SshKeyInstallCommandDraft } from "./model.js";
@@ -1662,14 +1663,16 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     mimeType: string,
     locale?: string,
     refinement?: VoiceInputRefinementContextView,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    recognitionContext?: VoiceInputRecognitionContextView
   ): Promise<VoiceInputSessionView> {
     const client = createClient(VoiceInputService, this.requireTransport());
     const response = await client.startVoiceInput({
       requestId,
       mimeType,
       ...(locale === undefined ? {} : { locale }),
-      ...(refinement?.instructions === undefined ? {} : { refinementInstructions: refinement.instructions })
+      ...(refinement?.instructions === undefined ? {} : { refinementInstructions: refinement.instructions }),
+      ...(recognitionContext === undefined ? {} : { recognitionContext: { contextData: recognitionContext.contextData.map((value) => ({ text: value.text })) } })
     }, voiceRpcOptions(this.#abort?.signal, signal));
     return requireVoiceInputSession(response.session);
   }
@@ -8372,8 +8375,8 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     }, true);
   }
 
-  async updateVoiceInputServiceSettings(draft: VoiceInputServiceSettingsDraft): Promise<void> {
-    const scope = this.captureActionScope();
+  async updateVoiceInputServiceSettings(draft: VoiceInputServiceSettingsDraft, signal?: AbortSignal): Promise<void> {
+    const scope = this.captureActionScope(signal);
     const secret = draft.secret?.trim();
     const fallbackSecret = draft.fallbackSecret?.trim();
     const credentialUploadTicketId = secret === undefined || secret === ""
@@ -8393,6 +8396,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
           endpoint: draft.endpoint.trim(),
           model: draft.model.trim(),
           resourceId: draft.resourceId.trim(),
+          ...(draft.sauc === undefined ? {} : { sauc: protoVoiceInputSaucSettings(draft.sauc) }),
           keyless: draft.keyless,
           ...(credentialUploadTicketId === undefined ? {} : { credentialUploadTicketId }),
           ...(draft.clearCredential === undefined ? {} : { clearCredential: draft.clearCredential }),
@@ -8404,6 +8408,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
           fallbackEndpoint: draft.fallbackEndpoint.trim(),
           fallbackModel: draft.fallbackModel.trim(),
           fallbackResourceId: draft.fallbackResourceId.trim(),
+          ...(draft.fallbackSauc === undefined ? {} : { fallbackSauc: protoVoiceInputSaucSettings(draft.fallbackSauc) }),
           fallbackKeyless: draft.fallbackKeyless,
           ...(fallbackCredentialUploadTicketId === undefined ? {} : { fallbackCredentialUploadTicketId }),
           ...(draft.clearFallbackCredential === undefined ? {} : { clearFallbackCredential: draft.clearFallbackCredential }),
@@ -11084,7 +11089,12 @@ function mapVoiceInputCapability(profile: ProtoVoiceInputCapabilityProfile): Voi
     },
     supportsLocale: profile.supportsLocale,
     supportsLiveDrafts: profile.supportsLiveDrafts,
-    supportsRefinement: profile.supportsRefinement
+    supportsRefinement: profile.supportsRefinement,
+    supportsRecognitionContext: profile.supportsRecognitionContext,
+    recognitionContextMaximumItems: voiceInputNumber(profile.recognitionContextMaximumItems, "recognition context item limit"),
+    recognitionContextMaximumItemBytes: voiceInputNumber(profile.recognitionContextMaximumItemBytes, "recognition context item byte limit"),
+    recognitionContextMaximumBytes: voiceInputNumber(profile.recognitionContextMaximumBytes, "recognition context byte limit"),
+    supportedLocales: [...profile.supportedLocales]
   };
 }
 
@@ -16582,6 +16592,7 @@ function mapSettings(settings: SettingsSnapshot | undefined): SettingsView {
           endpoint: settings.voiceInput.endpoint,
           model: settings.voiceInput.model,
           resourceId: settings.voiceInput.resourceId,
+          ...(settings.voiceInput.sauc === undefined ? {} : { sauc: projectVoiceInputSaucSettings(settings.voiceInput.sauc)! }),
           keyless: settings.voiceInput.keyless,
           credentialConfigured: settings.voiceInput.credentialConfigured,
           refinementEnabled: settings.voiceInput.refinementEnabled,
@@ -16596,6 +16607,7 @@ function mapSettings(settings: SettingsSnapshot | undefined): SettingsView {
           fallbackEndpoint: settings.voiceInput.fallbackEndpoint,
           fallbackModel: settings.voiceInput.fallbackModel,
           fallbackResourceId: settings.voiceInput.fallbackResourceId,
+          ...(settings.voiceInput.fallbackSauc === undefined ? {} : { fallbackSauc: projectVoiceInputSaucSettings(settings.voiceInput.fallbackSauc)! }),
           fallbackKeyless: settings.voiceInput.fallbackKeyless,
           fallbackCredentialConfigured: settings.voiceInput.fallbackCredentialConfigured,
           revision: settings.voiceInput.version?.revision?.value ?? 0n

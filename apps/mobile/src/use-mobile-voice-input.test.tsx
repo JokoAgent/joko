@@ -64,7 +64,7 @@ afterEach(async () => {
 });
 
 describe("useMobileVoiceInput dictionary integration", () => {
-  it("passes only local instructions and learns against the node revision from the kept insertion correction", async () => {
+  it("keeps recognition context opt-in, passes local instructions and learns against the node revision from the kept insertion correction", async () => {
     const store = preferencesStore();
     await store.hydrate();
     await store.setRefinementInstructions("Keep commands verbatim.");
@@ -90,7 +90,9 @@ describe("useMobileVoiceInput dictionary integration", () => {
         },
         supportsLocale: true,
         supportsLiveDrafts: true,
-        supportsRefinement: true
+        supportsRefinement: true,
+        supportsRecognitionContext: true, recognitionContextMaximumItems: 20,
+        recognitionContextMaximumItemBytes: 2_048, recognitionContextMaximumBytes: 8_192, supportedLocales: []
       })),
       adviseVoiceInputDictionaryEdit: advice,
       start: vi.fn(async () => session()),
@@ -159,5 +161,11 @@ describe("useMobileVoiceInput dictionary integration", () => {
     expect(advice).toHaveBeenCalledWith(expect.objectContaining({
       beforeText: "voice kit", afterText: "VoiceKit", rawTranscriptText: "voice kid", locale: "en-US"
     }), expect.any(AbortSignal));
+    await store.setRecognitionContext(true, [{ text: " authorized\r\ncontext " }]);
+    await act(async () => binding!.start());
+    expect(transport.start).toHaveBeenLastCalledWith("request-one", "audio/pcm", "en-US", {
+      instructions: "Keep commands verbatim."
+    }, expect.any(AbortSignal), { contextData: [{ text: "authorized\ncontext" }] });
+    await act(async () => binding!.cancel());
   });
 });

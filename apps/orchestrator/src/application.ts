@@ -730,8 +730,11 @@ export async function createOrchestratorApplication(
   });
   providers.initialize();
   const modelRoutes = createModelRouteCatalog(store, providers);
-  const voiceInputSettings = new VoiceInputSettingsController({ store, credentials, providers });
   const voiceDictionary = new VoiceDictionarySyncRepository({ store });
+  let retireVoiceInputConfiguration = (): void => undefined;
+  const voiceInputSettings = new VoiceInputSettingsController({ store, credentials, providers,
+    dictionaryTerms: () => voiceDictionary.snapshot().dictionary.entries.map((entry) => entry.text),
+    onConfigurationChanged: () => retireVoiceInputConfiguration() });
   let lastVoiceDictionaryPeerDiagnosticAt = 0;
   voiceDictionaryPeers = new VoiceDictionaryPeerManager({
     store: voiceDictionaryPeerStore,
@@ -758,8 +761,10 @@ export async function createOrchestratorApplication(
   });
   await voiceDictionaryPeers.initialize().catch(() => undefined);
   const voiceInput = new VoiceInputCoordinator({
-    provider: dependencies.voiceInputProvider ?? voiceInputSettings
+    provider: dependencies.voiceInputProvider ?? voiceInputSettings,
+    onOwnerRetired: (connectionId, listener) => connections.onRevoked(connectionId, listener)
   });
+  retireVoiceInputConfiguration = () => { void voiceInput.retireProviderConfiguration().catch(() => undefined); };
   const visionBridge = new VisionBridgeCoordinator({
     store,
     routes: modelRoutes,

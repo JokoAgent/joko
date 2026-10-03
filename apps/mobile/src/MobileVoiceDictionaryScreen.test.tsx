@@ -9,6 +9,9 @@ import type { MobileVoicePreferencesStoreState } from "./mobile-voice-preference
 import type { MobileVoiceDictionaryControllerState } from "./mobile-voice-dictionary-controller";
 import type { VoiceDictionaryPeerStatusView } from "@joko/contracts";
 import type { MobileVoiceDictionaryTransport } from "./mobile-voice-dictionary-service";
+import { create } from "@bufbuild/protobuf";
+import { VoiceInputServiceSettingsSchema, VoiceInputTranscriptionProtocol, VoiceInputSaucMode, VoiceInputSaucAuthentication, TestVoiceInputConnectionResponseSchema } from "@joko/contracts";
+import type { MobileVoiceSettingsTransport } from "./mobile-voice-service-settings";
 import { dictionaryWatchFixture, idleDictionaryWatch } from "./test/voice-dictionary-watch";
 
 const native = vi.hoisted(() => ({ alert: vi.fn() }));
@@ -33,7 +36,8 @@ vi.mock("react-native", async () => {
     accessibilityLabel?: string; value?: string; editable?: boolean; multiline?: boolean;
     onChangeText?: (value: string) => void; onSubmitEditing?: () => void;
   } & Record<string, unknown>>((rawProps, ref) => {
-    const { accessibilityLabel, value, editable = true, multiline,
+    const { accessibilityLabel, value, editable = true, multiline, secureTextEntry, autoCorrect: _autoCorrect,
+      placeholderTextColor: _placeholderTextColor,
       onChangeText: rawChangeText, onSubmitEditing: rawSubmitEditing, ...props } = rawProps;
     const onChangeText = rawChangeText as ((value: string) => void) | undefined;
     const onSubmitEditing = rawSubmitEditing as (() => void) | undefined;
@@ -42,6 +46,7 @@ vi.mock("react-native", async () => {
         ref,
         "aria-label": accessibilityLabel,
         value,
+        ...(!multiline && secureTextEntry ? { type: "password" } : {}),
         disabled: !editable,
         onChange: (event: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement>) => onChangeText?.(event.target.value),
         onKeyDown: (event: React.KeyboardEvent) => { if (event.key === "Enter") onSubmitEditing?.(); },
@@ -50,6 +55,7 @@ vi.mock("react-native", async () => {
   });
   return {
     Alert: { alert: native.alert },
+    AppState: { addEventListener: () => ({ remove: () => undefined }) },
     BackHandler: { addEventListener: () => ({ remove: () => undefined }) },
     Pressable: element("button"),
     ScrollView: element("div"),
@@ -80,6 +86,7 @@ function voiceState(status: MobileVoicePreferencesStoreState["status"] = "ready"
       preferencesRevision: 3,
       refinementInstructions: "Keep commands verbatim.",
       autoLearningEnabled: true,
+      recognitionContextEnabled: false, recognitionContextData: [],
       usage: { voiceStarts: 4, correctionObservations: 2, lastVoiceStartedAt: 30, lastCorrectionAt: 25 },
       history: []
     }
@@ -173,13 +180,14 @@ function render(locale: MobileSupportedLocale, overrides: Partial<MobileVoiceDic
 }
 
 function button(label: string): HTMLButtonElement {
-  const value = container.querySelector(`button[aria-label="${label}"]`);
+  const value = Array.from(container.querySelectorAll("button")).find((entry) => entry.getAttribute("aria-label") === label);
   if (!(value instanceof HTMLButtonElement)) throw new Error(`Missing button: ${label}`);
   return value;
 }
 
 function change(label: string, value: string): void {
-  const input = container.querySelector<HTMLInputElement | HTMLTextAreaElement>(`[aria-label="${label}"]`);
+  const input = Array.from(container.querySelectorAll<HTMLInputElement | HTMLTextAreaElement>("input, textarea"))
+    .find((entry) => entry.getAttribute("aria-label") === label);
   if (!input) throw new Error(`Missing input: ${label}`);
   act(() => {
     Object.getOwnPropertyDescriptor(Object.getPrototypeOf(input), "value")!.set!.call(input, value);
@@ -188,6 +196,62 @@ function change(label: string, value: string): void {
 }
 
 describe("MobileVoiceDictionaryScreen", () => {
+  it("connects the voice service settings section to full primary and fallback configuration and private context authorization", async () => {
+    const settings = create(VoiceInputServiceSettingsSchema, { enabled: true, protocol: VoiceInputTranscriptionProtocol.VOLCENGINE_SAUC,
+      fallbackProtocol: VoiceInputTranscriptionProtocol.VOLCENGINE_SAUC, fallbackEnabled: true,
+      endpoint: "wss://speech.example/api/v3/sauc/bigmodel_async", fallbackEndpoint: "wss://fallback.example/api/v3/sauc/bigmodel_async",
+      resourceId: "primary-resource", fallbackResourceId: "fallback-resource", version: { revision: { value: 4n } },
+      sauc: { mode: VoiceInputSaucMode.ASYNC_TWO_PASS, authentication: VoiceInputSaucAuthentication.API_KEY },
+      fallbackSauc: { mode: VoiceInputSaucMode.ASYNC_TWO_PASS, authentication: VoiceInputSaucAuthentication.API_KEY } });
+    const api: MobileVoiceSettingsTransport = { ownerKey: "voice-node-a", isCurrent: () => true,
+      get: vi.fn(async () => settings), getCapabilities: vi.fn(async () => ({ support: "supported" as const, supportsLocale: true,
+        supportsLiveDrafts: true, supportsRefinement: true, supportsRecognitionContext: true,
+        recognitionContextMaximumItems: 20, recognitionContextMaximumItemBytes: 2_048, recognitionContextMaximumBytes: 8_192, supportedLocales: [],
+        limits: { supportedMimeTypes: ["audio/pcm"], maximumAudioChunkBytes: 1024, maximumAudioBytes: 4096,
+          maximumAudioChunkDurationMs: 1000, maximumAudioDurationMs: 10_000, maximumLocaleCharacters: 35, stableWaitMs: 500, maximumConcurrentSessions: 1 } })),
+      save: vi.fn(async () => settings), test: vi.fn(async () => create(TestVoiceInputConnectionResponseSchema, { ok: true })),
+      reconcile: vi.fn(async () => undefined), hasPending: () => false };
+    const setContext = vi.fn(async () => undefined);
+    await act(async () => { render("en", { serviceTransport: api, onSetRecognitionContext: setContext }); });
+    act(() => { button("Primary · Streaming input").click(); button("Fallback · Bidirectional streaming").click(); });
+    expect(Array.from(container.querySelectorAll("button")).map((entry) => entry.getAttribute("aria-label")).filter((label) => label?.startsWith("Primary")))
+      .toContain("Primary · APP ID + Access Token");
+    act(() => button("Primary · APP ID + Access Token").click());
+    change("Primary · APP ID", "public-app"); change("Primary · Hotword table name", "word-table");
+    change("Primary · Hotword table ID", "word-id"); change("Fallback · Replacement table ID", "replacement-id");
+    change("Primary · APP ID + Access Token", "private-primary"); change("Fallback · API Key", "private-fallback");
+    act(() => (container.querySelector('[aria-label="Primary · Send dictionary main terms as hotwords"]') as HTMLInputElement).click());
+    await act(async () => button("Save configuration").click());
+    expect(api.save).toHaveBeenCalledWith(expect.objectContaining({ expectedRevision: expect.objectContaining({ value: 4n }),
+      endpoint: "wss://speech.example/api/v3/sauc/bigmodel_nostream", fallbackEndpoint: "wss://fallback.example/api/v3/sauc/bigmodel",
+      sauc: expect.objectContaining({ mode: VoiceInputSaucMode.STREAM_INPUT, authentication: VoiceInputSaucAuthentication.ACCESS_TOKEN,
+        appId: "public-app", useDictionaryHotwords: true, boostingTableName: "word-table", boostingTableId: "word-id" }),
+      fallbackSauc: expect.objectContaining({ mode: VoiceInputSaucMode.BIDIRECTIONAL, correctTableId: "replacement-id" })
+    }), { primary: "private-primary", fallback: "private-fallback" }, expect.any(AbortSignal));
+    expect((container.querySelector('[aria-label="Primary · API Key"]') as HTMLInputElement).value).toBe("");
+    await act(async () => button("Test saved connection").click()); expect(api.test).toHaveBeenCalledOnce();
+    act(() => { (container.querySelector('[aria-label="Authorize sending these texts to the recognition service"]') as HTMLInputElement).click(); button("Add text").click(); });
+    change("Recognition context 1", "private context\nsecond paragraph");
+    await act(async () => button("Save private context").click());
+    expect(setContext).toHaveBeenCalledWith(true, [{ text: "private context\nsecond paragraph" }]);
+    expect(api.save).toHaveBeenCalledOnce();
+    change("Primary · Endpoint", "wss://retained.example/api/v3/sauc/bigmodel_async");
+    await act(async () => { render("en", { serviceTransport: undefined, onSetRecognitionContext: setContext }); });
+    expect((container.querySelector('[aria-label="Primary · Endpoint"]') as HTMLInputElement).value).toBe("wss://retained.example/api/v3/sauc/bigmodel_async");
+    expect((container.querySelector('[aria-label="Primary · Endpoint"]') as HTMLInputElement).disabled).toBe(true);
+    await act(async () => { render("en", { serviceTransport: { ...api, ownerKey: "voice-node-b" }, onSetRecognitionContext: setContext }); });
+    expect(button("Save configuration").disabled).toBe(true);
+    expect(container.textContent).toContain("Review current revision");
+    act(() => button("Review current revision").click());
+    expect(button("Save configuration").disabled).toBe(false);
+    vi.mocked(api.get).mockResolvedValue({ ...settings,
+      version: { ...settings.version!, revision: { ...settings.version!.revision!, value: 5n } } });
+    await act(async () => button("Refresh configuration").click());
+    expect(button("Save configuration").disabled).toBe(true);
+    expect((container.querySelector('[aria-label="Primary · Endpoint"]') as HTMLInputElement).value).toBe("wss://retained.example/api/v3/sauc/bigmodel_async");
+    act(() => button("Review current revision").click());
+    expect(button("Save configuration").disabled).toBe(false);
+  });
   it("configures and exports a listener, confirms an exact direct invitation, clears its route and retires native confirmations", async () => {
     const peer = peerTransport();
     const updates = dictionaryWatchFixture<VoiceDictionaryPeerStatusView>();

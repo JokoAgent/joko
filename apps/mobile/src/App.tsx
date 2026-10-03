@@ -915,6 +915,8 @@ export function App() {
                   onVoiceDictionaryReset={() => mobileVoicePreferences.reset()}
                   onVoiceInstructionsChange={(value) => mobileVoicePreferences.setRefinementInstructions(value)}
                   onVoiceAutoLearningChange={(enabled) => mobileVoicePreferences.setAutoLearningEnabled(enabled)}
+                  onVoiceRecognitionContextChange={(enabled, contextData) => mobileVoicePreferences.setRecognitionContext(enabled, contextData)}
+                  voiceServiceTransport={foreground ? client.voiceInputSettingsTransport() : undefined}
                   voicePeerTransport={dictionaryOwnerKey ? dictionaryTransport : undefined}
                   nodeDictionary={nodeDictionary.ownerKey === dictionaryOwnerKey ? nodeDictionary
                     : { status: dictionaryOwnerKey ? "loading" : "unavailable", ownerKey: dictionaryOwnerKey, saving: false }}

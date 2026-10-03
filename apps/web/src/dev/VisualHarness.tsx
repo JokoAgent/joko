@@ -587,6 +587,8 @@ export function VisualHarness(): JSX.Element {
         supportsLocale: state.snapshot.settings.voiceInput.protocol !== "volcengineSauc"
           && (!state.snapshot.settings.voiceInput.fallbackEnabled || state.snapshot.settings.voiceInput.fallbackProtocol !== "volcengineSauc"),
         supportsLiveDrafts: true,
+        supportedLocales: [], supportsRecognitionContext: true,
+        recognitionContextMaximumItems: 20, recognitionContextMaximumItemBytes: 2_048, recognitionContextMaximumBytes: 8_192,
         supportsRefinement: true
       }),
       testVoiceInputConnection: async () => ({ ok: true } as const),

@@ -44,12 +44,17 @@ export function createVoiceInputConnectService(
       });
     }),
     testVoiceInputConnection: async (_request, context) => voiceRpc(async () => {
-      authenticate(context);
-      const result = await requireSettings(settings).testConnection();
-      return create(contract.TestVoiceInputConnectionResponseSchema, {
-        ok: result.ok,
-        failure: toProtoConnectionTestFailure(result)
-      });
+      const owner = authenticate(context);
+      const revoked = new AbortController();
+      const unsubscribe = onRevoked?.(owner.connectionId, () => revoked.abort());
+      const signal = AbortSignal.any([context.signal, revoked.signal, ...(shutdownSignal === undefined ? [] : [shutdownSignal])]);
+      try {
+        if (signal.aborted) throw new ConnectError("Voice connection test was cancelled.", Code.Canceled);
+        const result = await requireSettings(settings).testConnection(signal);
+        if (signal.aborted) throw new ConnectError("Voice connection test was cancelled.", Code.Canceled);
+        if (authenticate(context).connectionId !== owner.connectionId) throw new ConnectError("Voice connection authority changed.", Code.PermissionDenied);
+        return create(contract.TestVoiceInputConnectionResponseSchema, { ok: result.ok, failure: toProtoConnectionTestFailure(result) });
+      } finally { unsubscribe?.(); }
     }),
     getVoiceInputDictionary: async (_request, context) => voiceRpc(async () => {
       authenticate(context);
@@ -247,14 +252,26 @@ export function createVoiceInputConnectService(
       const owner = authenticate(context);
       const runtime = requireCoordinator(coordinator);
       const dictionaryTerms = requireDictionary(dictionary).snapshot().refinementTerms;
-      const session = await runtime.start({
-        ownerConnectionId: owner.connectionId,
-        requestId: request.requestId,
-        mimeType: request.mimeType,
-        ...(request.locale === undefined ? {} : { locale: request.locale }),
-        ...(request.refinementInstructions === undefined ? {} : { refinementInstructions: request.refinementInstructions }),
-        dictionaryTerms
-      });
+      let session: VoiceInputSessionSnapshot;
+      try {
+        session = await runtime.start({ ownerConnectionId: owner.connectionId, requestId: request.requestId,
+          mimeType: request.mimeType,
+          ...(request.locale === undefined ? {} : { locale: request.locale }),
+          ...(request.refinementInstructions === undefined ? {} : { refinementInstructions: request.refinementInstructions }),
+          ...(request.recognitionContext === undefined ? {} : { recognitionContext: {
+            hotwords: [], contextData: request.recognitionContext.contextData.map((item) => ({ text: item.text })) } }),
+          dictionaryTerms, signal: context.signal });
+      } catch (error) {
+        if (context.signal.aborted) throw new ConnectError("Voice input start was cancelled.", Code.Canceled);
+        throw error;
+      }
+      try {
+        if (context.signal.aborted) throw new ConnectError("Voice input start was cancelled.", Code.Canceled);
+        if (authenticate(context).connectionId !== owner.connectionId) throw new ConnectError("Voice input authority changed.", Code.PermissionDenied);
+      } catch (error) {
+        await runtime.cancel({ ownerConnectionId: owner.connectionId, voiceInputId: session.id }).catch(() => undefined);
+        throw error;
+      }
       return create(contract.StartVoiceInputResponseSchema, { session: toProtoSession(session) });
     }),
     appendVoiceAudio: async (request, context) => voiceRpc(async () => {
@@ -370,6 +387,11 @@ function toProtoCapability(value: VoiceInputCapabilitySnapshot): contract.VoiceI
       maximumConcurrentSessions: value.maximumConcurrentSessions
     }),
     supportsLocale: value.supportsLocale,
+    supportedLocales: [...value.supportedLocales],
+    supportsRecognitionContext: value.supportsRecognitionContext,
+    recognitionContextMaximumItems: value.supportsRecognitionContext ? VOICE_INPUT_LIMITS.recognitionContextMaximumItems : 0,
+    recognitionContextMaximumItemBytes: value.supportsRecognitionContext ? VOICE_INPUT_LIMITS.recognitionContextMaximumItemBytes : 0,
+    recognitionContextMaximumBytes: value.supportsRecognitionContext ? VOICE_INPUT_LIMITS.recognitionContextMaximumBytes : 0,
     supportsLiveDrafts: value.supportsLiveDrafts,
     supportsRefinement: value.supportsRefinement
   });
@@ -466,6 +488,8 @@ function unsupportedCapability(): VoiceInputCapabilitySnapshot {
     support: "not_implemented",
     mimeTypes: [],
     supportsLocale: false,
+    supportedLocales: [],
+    supportsRecognitionContext: false,
     supportsLiveDrafts: true,
     supportsRefinement: false,
     maximumConcurrentSessions: 0

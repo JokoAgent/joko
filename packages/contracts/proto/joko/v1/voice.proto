@@ -61,6 +61,22 @@ message VoiceInputCapabilityProfile {
   bool supports_locale = 3;
   bool supports_live_drafts = 4;
   bool supports_refinement = 5;
+  bool supports_recognition_context = 6;
+  uint32 recognition_context_maximum_items = 7;
+  uint32 recognition_context_maximum_item_bytes = 8;
+  uint32 recognition_context_maximum_bytes = 9;
+  // Empty means the configured routes impose no finite locale allowlist.
+  repeated string supported_locales = 10;
+}
+
+// Explicitly supplied and authorized client text. This request-only context
+// never appears in a public Voice session, Operation, Event or Snapshot.
+message VoiceInputRecognitionContextItem {
+  string text = 1;
+}
+
+message VoiceInputRecognitionContext {
+  repeated VoiceInputRecognitionContextItem context_data = 1;
 }
 
 // Text-bearing values exist only in the authenticated, in-memory Voice input

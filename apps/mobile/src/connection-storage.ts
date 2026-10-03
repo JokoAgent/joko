@@ -25,7 +25,7 @@ export interface PendingOperation {
     | "schedule-run" | "schedule-enable" | "schedule-run-restart" | "schedule-run-read"
     | "schedule-runs-read" | "schedule-all-read" | "schedule-run-delete"
     | "schedule-create" | "schedule-update" | "schedule-delete" | "schedule-promote"
-    | "schedule-clone" | "schedule-project-remove" | "schedule-project-reconcile";
+    | "schedule-clone" | "schedule-project-remove" | "schedule-project-reconcile" | "voice-settings";
   readonly sessionId?: string;
   readonly eventId?: string;
   readonly queueItemId?: string;
@@ -395,7 +395,7 @@ function isPending(value: unknown): value is PendingOperation {
       "session-branch", "session-shell", "session-reset", "session-review", "schedule-run", "schedule-enable",
       "schedule-run-restart", "schedule-run-read", "schedule-runs-read", "schedule-all-read",
       "schedule-run-delete", "schedule-create", "schedule-update", "schedule-delete", "schedule-promote",
-      "schedule-clone", "schedule-project-remove", "schedule-project-reconcile"].includes(String(record.kind))
+      "schedule-clone", "schedule-project-remove", "schedule-project-reconcile", "voice-settings"].includes(String(record.kind))
     || (record.state !== "unknown" && record.state !== "accepted")) return false;
   if (record.sessionId !== undefined && typeof record.sessionId !== "string") return false;
   if (record.eventId !== undefined && typeof record.eventId !== "string") return false;

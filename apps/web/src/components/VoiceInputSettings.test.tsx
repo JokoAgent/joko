@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 
 import { act } from "react";
+import { defaultVoiceInputSaucSettings } from "@joko/contracts";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AppController } from "../controller.js";
@@ -45,6 +46,78 @@ afterEach(async () => {
 });
 
 describe("VoiceInputSettings", () => {
+  it("configures independent SAUC routes with credential authority, explicit local context and retired page requests", async () => {
+    const { contextData: _oldContext, recognitionContextEnabled: _oldAuthorization, ...oldPreferences } = readVoiceInputPreferences();
+    localStorage.setItem("joko.voice-input.preferences.v1", JSON.stringify({ ...oldPreferences, locale: "en", refinementInstructions: "Old private setting" }));
+    const base = emptySnapshot();
+    const state = { snapshot: { ...base, settings: { ...base.settings, voiceInput: { ...base.settings.voiceInput,
+      enabled: true, protocol: "volcengineSauc" as const, endpoint: "wss://speech.example/api/v3/sauc/bigmodel_async",
+      resourceId: "volc.seedasr.sauc.duration", credentialConfigured: true, sauc: defaultVoiceInputSaucSettings(), revision: 7n,
+      fallbackEnabled: true, fallbackProtocol: "volcengineSauc" as const, fallbackEndpoint: "wss://backup.example/api/v3/sauc/bigmodel_async",
+      fallbackResourceId: "volc.seedasr.sauc.concurrent", fallbackCredentialConfigured: true, fallbackSauc: defaultVoiceInputSaucSettings() } } },
+      preferences: { appShortcutOverrides: {} } };
+    let finishSave!: () => void;
+    const update = vi.fn().mockResolvedValueOnce(undefined).mockImplementationOnce(() => new Promise<void>((resolve) => { finishSave = resolve; }));
+    let finishProbe!: (result: { ok: true }) => void;
+    const test = vi.fn((_signal?: AbortSignal) => new Promise<{ ok: true }>((resolve) => { finishProbe = resolve; }));
+    const controller = { state, getVoiceInputCapabilities: vi.fn(async () => ({ ...capability, supportsRecognitionContext: false, supportedLocales: ["en-US"] })),
+      updateVoiceInputServiceSettings: update, testVoiceInputConnection: test } as unknown as AppController;
+    const container = document.body.appendChild(document.createElement("div"));
+    const root = createRoot(container); roots.push(root);
+    await act(async () => root.render(<VoiceInputSettings controller={controller} t={(key, values) => translate("en", key, values)} />));
+    const button = (text: string) => [...container.querySelectorAll<HTMLButtonElement>("button")].find((item) => item.textContent === text)!;
+    const field = (label: string) => container.querySelector<HTMLInputElement>(`[aria-label="${label}"]`)!;
+    expect(container.querySelector<HTMLButtonElement>('[aria-label="Spoken language"]')!.disabled).toBe(true);
+    expect(container.textContent).toContain("Stored voice preferences use an incompatible shape.");
+    await act(async () => button("Reset voice preferences").click());
+    expect(readVoiceInputPreferences()).toMatchObject({ locale: "auto", refinementInstructions: "", recognitionContextEnabled: false, contextData: [] });
+    await chooseSelect(container.querySelector<HTMLButtonElement>('[aria-label="Recognition mode"]')!, "Stream input");
+    await chooseSelect(container.querySelector<HTMLButtonElement>('[aria-label="Backup Recognition mode"]')!, "Bidirectional");
+    await act(async () => field("Send dictionary main terms as hotwords").click());
+    await act(async () => setInput(field("Boosting table ID"), "boosting-id"));
+    await act(async () => button("Save transcription service").click());
+    expect(update).toHaveBeenCalledWith(expect.objectContaining({ expectedRevision: 7n, endpoint: "wss://speech.example/api/v3/sauc/bigmodel_nostream",
+      sauc: expect.objectContaining({ mode: "streamInput", authentication: "apiKey", useDictionaryHotwords: true, boostingTableId: "boosting-id" }),
+      fallbackEndpoint: "wss://backup.example/api/v3/sauc/bigmodel", fallbackSauc: expect.objectContaining({ mode: "bidirectional", useDictionaryHotwords: false }) }), expect.any(AbortSignal));
+    expect(update.mock.calls[0]![0]).not.toHaveProperty("secret");
+    await chooseSelect(container.querySelector<HTMLButtonElement>('[aria-label="Authentication"]')!, "APP ID and access token");
+    await act(async () => setInput(field("APP ID"), "public-app"));
+    await act(async () => button("Save transcription service").click());
+    expect(update).toHaveBeenCalledTimes(1);
+    expect(container.textContent).toContain("Replace or clear the saved credential");
+    await act(async () => button("Add context").click());
+    await act(async () => setInput(container.querySelector<HTMLTextAreaElement>('[aria-label="Recognition context 1"]')!, "  First\r\nSecond  "));
+    await act(async () => field("Allow sending my recognition context").click());
+    await act(async () => button("Save context on this device").click());
+    expect(readVoiceInputPreferences()).toMatchObject({ recognitionContextEnabled: true, contextData: ["First\nSecond"] });
+    expect(container.textContent).toContain("Your text and choice remain on this device and will not be sent.");
+    expect(update).toHaveBeenCalledTimes(1);
+    await act(async () => setInput(field("Access token"), "private-token"));
+    await act(async () => button("Save transcription service").click());
+    const saveSignal = update.mock.calls[1]![1] as AbortSignal;
+    expect(update.mock.calls[1]![0]).toMatchObject({ sauc: expect.objectContaining({ authentication: "accessToken", appId: "public-app" }), secret: "private-token" });
+    expect(JSON.stringify(localStorage)).not.toContain("private-token");
+    Object.defineProperty(document, "visibilityState", { configurable: true, value: "hidden" });
+    await act(async () => document.dispatchEvent(new Event("visibilitychange")));
+    expect(saveSignal.aborted).toBe(true); expect(field("Access token").value).toBe("");
+    await act(async () => finishSave());
+    expect(container.textContent).not.toContain("Transcription service saved.");
+    Object.defineProperty(document, "visibilityState", { configurable: true, value: "visible" });
+    await act(async () => document.dispatchEvent(new Event("visibilitychange")));
+    // Restore the saved route before testing its connection, then retire this page's owner.
+    await chooseSelect(container.querySelector<HTMLButtonElement>('[aria-label="Authentication"]')!, "API key");
+    await chooseSelect(container.querySelector<HTMLButtonElement>('[aria-label="Recognition mode"]')!, "Async two-pass");
+    await chooseSelect(container.querySelector<HTMLButtonElement>('[aria-label="Backup Recognition mode"]')!, "Async two-pass");
+    await act(async () => field("Send dictionary main terms as hotwords").click());
+    await act(async () => setInput(field("Boosting table ID"), ""));
+    await act(async () => button("Test connection").click());
+    expect(test).toHaveBeenCalledOnce();
+    const probeSignal = test.mock.calls[0]![0] as AbortSignal;
+    await act(async () => window.dispatchEvent(new Event("pagehide")));
+    expect(probeSignal.aborted).toBe(true);
+    await act(async () => finishProbe({ ok: true }));
+    expect(container.textContent).not.toContain("Transcription connection succeeded.");
+  });
   it("preserves pushed revisions and frozen editor drafts, exposes disconnect as readonly, and retires hidden streams", async () => {
     const base = emptySnapshot();
     const updates = dictionaryWatchFixture<VoiceInputDictionarySnapshotView>();
@@ -112,7 +185,7 @@ describe("VoiceInputSettings", () => {
     await chooseSelect(container.querySelector<HTMLButtonElement>('[aria-label="Backup refinement model"]')!, "Text provider · Text model · text-two");
     await act(async () => [...container.querySelectorAll<HTMLButtonElement>("button")].find((button) => button.textContent === "Save transcription service")!.click());
     expect(update).toHaveBeenCalledWith(expect.objectContaining({ refinerModel: { backendId: "text-one", providerId: "same-provider", modelId: "same-model" },
-      refinerFallbackModel: { backendId: "text-two", providerId: "same-provider", modelId: "same-model" } }));
+      refinerFallbackModel: { backendId: "text-two", providerId: "same-provider", modelId: "same-model" } }), expect.any(AbortSignal));
   });
 
   it("configures independent SAUC resources and credentials for both routes", async () => {
@@ -134,7 +207,7 @@ describe("VoiceInputSettings", () => {
     expect(container.querySelector<HTMLButtonElement>('[aria-label="Spoken language"]')?.disabled).toBe(true);
     expect(container.querySelector('[aria-label="Spoken language"]')?.textContent).toBe("Automatic");
     expect(readVoiceInputPreferences().locale).toBe("en");
-    expect(container.textContent).toContain("detects the spoken language automatically");
+    expect(container.textContent).toContain("Choose the resource enabled for this route's credentials.");
     await act(async () => container.querySelector<HTMLButtonElement>('[aria-label="Backup transcription route"]')!.click());
     await chooseSelect(container.querySelector<HTMLButtonElement>('[aria-label="Backup protocol"]')!, "Volcengine SAUC");
     await chooseSelect(container.querySelector<HTMLButtonElement>('[aria-label="Backup resource ID"]')!, "volc.bigasr.sauc.concurrent");
@@ -146,7 +219,7 @@ describe("VoiceInputSettings", () => {
     expect(update).toHaveBeenCalledWith(expect.objectContaining({
       protocol: "volcengineSauc", model: "", resourceId: "volc.seedasr.sauc.duration", keyless: false, secret: "primary-sauc-key",
       fallbackEnabled: true, fallbackProtocol: "volcengineSauc", fallbackModel: "", fallbackResourceId: "volc.bigasr.sauc.concurrent", fallbackKeyless: false, fallbackSecret: "backup-sauc-key"
-    }));
+    }), expect.any(AbortSignal));
     expect([...container.querySelectorAll<HTMLInputElement>('input[type="password"]')].every((input) => input.value === "")).toBe(true);
     await chooseSelect(container.querySelector<HTMLButtonElement>('[aria-label="Transcription protocol"]')!, "ElevenLabs Scribe realtime");
     expect(container.querySelector('[aria-label="Transcription resource ID"]')).toBeNull();
@@ -176,10 +249,10 @@ describe("VoiceInputSettings", () => {
     const save = [...container.querySelectorAll<HTMLButtonElement>("button")].find((button) => button.textContent === "Save transcription service")!;
     await act(async () => save.click());
     expect(update).not.toHaveBeenCalled();
-    expect(container.textContent).toContain("Replace or clear the saved key");
+    expect(container.textContent).toContain("Replace or clear the saved credential");
     await act(async () => setInput(container.querySelector<HTMLInputElement>('input[type="password"]')!, "new-scribe-key"));
     await act(async () => save.click());
-    expect(update).toHaveBeenCalledWith(expect.objectContaining({ protocol: "elevenLabsScribeRealtime", model: "scribe_v2_realtime", secret: "new-scribe-key" }));
+    expect(update).toHaveBeenCalledWith(expect.objectContaining({ protocol: "elevenLabsScribeRealtime", model: "scribe_v2_realtime", secret: "new-scribe-key" }), expect.any(AbortSignal));
     expect(container.querySelector<HTMLInputElement>('input[type="password"]')?.value).toBe("");
     expect(JSON.stringify(localStorage)).not.toContain("new-scribe-key");
   });
@@ -223,6 +296,8 @@ describe("VoiceInputSettings", () => {
       deviceId: "mic-one",
       shortcut: { code: "KeyM", key: "m", meta: false, ctrl: false, alt: true, shift: true, fn: false },
       refinementInstructions: "",
+      recognitionContextEnabled: false,
+      contextData: [],
       autoDictionaryEnabled: true,
       playInteractionSound: true,
       fastActivationEnabled: false,
@@ -251,7 +326,7 @@ describe("VoiceInputSettings", () => {
     await act(async () => render());
     const button = (label: string): HTMLButtonElement => [...container.querySelectorAll<HTMLButtonElement>("button")].find((item) => item.textContent === label)!;
     await act(async () => button("Test connection").click());
-    expect(test).toHaveBeenCalledWith();
+    expect(test).toHaveBeenCalledWith(expect.any(AbortSignal));
     if (change === "protocol edit") {
       await chooseSelect(container.querySelector<HTMLButtonElement>('button[role="combobox"][aria-label="Transcription protocol"]')!, "ElevenLabs Scribe realtime");
     } else if (change === "fallback edit") {
@@ -624,6 +699,8 @@ const capability: VoiceInputCapabilityView = {
     maximumConcurrentSessions: 1
   },
   supportsLocale: true,
+  supportedLocales: [], supportsRecognitionContext: true,
+  recognitionContextMaximumItems: 20, recognitionContextMaximumItemBytes: 2_048, recognitionContextMaximumBytes: 8_192,
   supportsLiveDrafts: true,
   supportsRefinement: false
 };

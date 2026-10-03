@@ -1,13 +1,31 @@
 import { gzipSync, gunzipSync } from "node:zlib";
+import type { AsrRecognitionContext } from "@joko/voice-input";
+import type { SaucTranscriptionConfiguration, SaucSupportedLocale } from "./provider.js";
 
 export const MAXIMUM_MESSAGE_BYTES = 256 * 1024;
 export const MAXIMUM_TRANSCRIPT_CHARACTERS = 200_000;
 
-export function configurationFrame(): Buffer {
+export function configurationFrame(configuration: SaucTranscriptionConfiguration, context?: AsrRecognitionContext,
+  locale?: SaucSupportedLocale): Buffer {
+  const corpus: Record<string, unknown> = {};
+  const configured = configuration.corpus;
+  if (configured?.boostingTableName !== undefined) corpus["boosting_table_name"] = configured.boostingTableName;
+  if (configured?.boostingTableId !== undefined) corpus["boosting_table_id"] = configured.boostingTableId;
+  if (configured?.correctTableName !== undefined) corpus["correct_table_name"] = configured.correctTableName;
+  if (configured?.correctTableId !== undefined) corpus["correct_table_id"] = configured.correctTableId;
+  if (context !== undefined && (context.hotwords.length > 0 || context.contextData.length > 0)) {
+    corpus["context"] = JSON.stringify({
+      ...(context.hotwords.length === 0 ? {} : { hotwords: context.hotwords.map((word) => ({ word })) }),
+      ...(context.contextData.length === 0 ? {} : { context_type: "dialog_ctx", context_data: context.contextData })
+    });
+  }
   return frame(1, 0, Buffer.from(JSON.stringify({
-    audio: { format: "pcm", codec: "raw", rate: 16_000, bits: 16, channel: 1 },
+    audio: { format: "pcm", codec: "raw", rate: 16_000, bits: 16, channel: 1,
+      ...(configuration.mode !== "streamInput" || locale === undefined ? {} : { language: locale }) },
     request: { model_name: "bigmodel", result_type: "full", show_utterances: true,
-      enable_nonstream: true, end_window_size: 300, enable_punc: true, enable_itn: true }
+      ...(configuration.mode === "asyncTwoPass" ? { enable_nonstream: true, end_window_size: 300 } : {}),
+      enable_punc: true, enable_itn: true,
+      ...(Object.keys(corpus).length === 0 ? {} : { corpus }) }
   })), undefined);
 }
 

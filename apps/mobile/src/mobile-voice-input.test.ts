@@ -42,7 +42,9 @@ const capability: MobileVoiceCapability = {
   },
   supportsLocale: true,
   supportsLiveDrafts: true,
-  supportsRefinement: true
+  supportsRefinement: true,
+  supportsRecognitionContext: true, recognitionContextMaximumItems: 20,
+  recognitionContextMaximumItemBytes: 2_048, recognitionContextMaximumBytes: 8_192, supportedLocales: []
 };
 
 describe("mobile voice protocol projection", () => {
@@ -106,6 +108,23 @@ describe("mobile voice protocol projection", () => {
 });
 
 describe("MobileVoiceInputRun", () => {
+  it("freezes recognition context for the run and refuses an explicit request without joint capability", async () => {
+    const context = { contextData: [{ text: " First\r\nsecond " }] };
+    const transport = fakeTransport();
+    const run = new MobileVoiceInputRun({ transport, capture: fakeCapture(), requestId: () => "request-context", recognitionContext: context });
+    context.contextData[0]!.text = "late edit";
+    await run.start();
+    expect(transport.start).toHaveBeenCalledWith("request-context", "audio/pcm", undefined, undefined, expect.any(AbortSignal),
+      { contextData: [{ text: "First\nsecond" }] });
+    expect(Object.isFrozen(transport.start.mock.calls[0]?.[5]?.contextData[0])).toBe(true);
+    await run.cancel();
+    const unavailable = fakeTransport(); unavailable.getCapabilities.mockResolvedValue({ ...capability, supportsRecognitionContext: false });
+    const capture = fakeCapture();
+    const rejected = new MobileVoiceInputRun({ transport: unavailable, capture, requestId: () => "request-context", recognitionContext: context });
+    await expect(rejected.start()).rejects.toMatchObject({ code: "unsupported" });
+    expect(unavailable.start).not.toHaveBeenCalled(); expect(capture.ensurePermission).not.toHaveBeenCalled();
+    await rejected.dispose();
+  });
   it("sends the selected BCP47 locale when the voice capability accepts one", async () => {
     const transport = fakeTransport();
     const run = new MobileVoiceInputRun({

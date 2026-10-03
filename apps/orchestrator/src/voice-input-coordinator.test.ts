@@ -1,9 +1,10 @@
 import { afterEach, describe, expect, it } from "vitest";
-import type { AsrEvent, AsrProvider, AsrStartRequest, AudioChunk } from "@joko/voice-input";
+import type { AsrEvent, AsrProvider, AsrRecognitionContext, AsrStartRequest, AudioChunk } from "@joko/voice-input";
 import {
   VoiceInputControlError,
   VoiceInputCoordinator,
-  type VoiceInputProviderFactory
+  type VoiceInputProviderFactory,
+  type VoiceInputCoordinatorOptions
 } from "./voice-input-coordinator.js";
 
 const coordinators: VoiceInputCoordinator[] = [];
@@ -13,6 +14,73 @@ afterEach(async () => {
 });
 
 describe("VoiceInputCoordinator", () => {
+  it("freezes authorized recognition context and validates its capability before creating a provider", async () => {
+    const provider = new FakeAsrProvider();
+    let context: AsrRecognitionContext | undefined;
+    let creates = 0;
+    const coordinator = createCoordinator({
+      describe: () => ({ support: "supported", mimeTypes: ["audio/pcm"], supportsLocale: true,
+        supportedLocales: ["en-US"], supportsRecognitionContext: true }),
+      create: (input) => { creates += 1; context = input.recognitionContext; return provider; }
+    });
+    const input = { ownerConnectionId: "connection-context", requestId: "context-request", mimeType: "audio/pcm",
+      locale: "en-us", recognitionContext: { hotwords: [], contextData: [{ text: "  Authorized\r\ncontext\ttext  " }] } };
+    const started = await coordinator.start(input);
+    input.recognitionContext.contextData[0]!.text = "Changed input";
+    expect(context).toEqual({ hotwords: [], contextData: [{ text: "Authorized\ncontext\ttext" }] });
+    expect(Object.isFrozen(context!.contextData[0])).toBe(true);
+    expect(JSON.stringify(started, (_key, value) => typeof value === "bigint" ? value.toString() : value)).not.toContain("Authorized");
+    await expect(coordinator.start(input)).rejects.toMatchObject({ code: "conflict" });
+    await coordinator.cancel({ ownerConnectionId: input.ownerConnectionId, voiceInputId: started.id });
+    await expect(coordinator.start({ ...input, requestId: "wrong-locale", locale: "ja" })).rejects.toMatchObject({ code: "not_supported" });
+    await expect(coordinator.start({ ...input, requestId: "invalid-context", recognitionContext: {
+      hotwords: [], contextData: [{ text: "a".repeat(2_049) }] } })).rejects.toMatchObject({ code: "invalid_argument" });
+    expect(creates).toBe(1);
+    const unsupported = createCoordinator(factory(new FakeAsrProvider()));
+    await expect(unsupported.start({ ...input, requestId: "unsupported-context", mimeType: "audio/webm", locale: undefined }))
+      .rejects.toMatchObject({ code: "not_supported" });
+  });
+
+  it.each(["Connection", "request", "configuration"] as const)("retires a pending voice provider after %s cancellation", async (kind) => {
+    const provider = new FakeAsrProvider();
+    const pending = deferred<AsrProvider>();
+    const abort = new AbortController();
+    let retireOwner: () => void = () => undefined;
+    let disposed = 0;
+    const coordinator = createCoordinator({
+      describe: () => ({ support: "supported", mimeTypes: ["audio/pcm"], supportsLocale: false, supportsRecognitionContext: true }),
+      create: () => pending.promise
+    }, { onOwnerRetired: (_owner, callback) => { retireOwner = callback; return () => { disposed += 1; }; } });
+    const starting = coordinator.start({ ownerConnectionId: "connection-retire", requestId: "pending-retire", mimeType: "audio/pcm",
+      recognitionContext: { hotwords: [], contextData: [{ text: "Private context" }] }, signal: abort.signal });
+    if (kind === "Connection") retireOwner();
+    else if (kind === "request") abort.abort();
+    else await coordinator.retireProviderConfiguration();
+    pending.resolve(provider);
+    await expect(starting).rejects.toMatchObject({ code: "provider_unavailable" });
+    expect(provider.startRequests).toHaveLength(0);
+    expect(provider.stopCalls).toBe(1);
+    expect(disposed).toBe(1);
+  });
+
+  it("cleans a live voice capture when its Connection or provider configuration retires", async () => {
+    const callbacks = new Map<string, () => void>();
+    const providers = [new FakeAsrProvider(), new FakeAsrProvider()];
+    const coordinator = createCoordinator({
+      describe: () => ({ support: "supported", mimeTypes: ["audio/pcm"], supportsLocale: false }),
+      create: () => providers.shift()!
+    }, { onOwnerRetired: (owner, callback) => { callbacks.set(owner, callback); return () => { callbacks.delete(owner); }; } });
+    const first = await coordinator.start({ ownerConnectionId: "connection-a", requestId: "voice-a", mimeType: "audio/pcm" });
+    callbacks.get("connection-a")!();
+    await settlePromises();
+    expect(coordinator.get({ ownerConnectionId: "connection-a", voiceInputId: first.id }).outcome).toBe("cancelled");
+    expect(callbacks.has("connection-a")).toBe(false);
+    const second = await coordinator.start({ ownerConnectionId: "connection-b", requestId: "voice-b", mimeType: "audio/pcm" });
+    await coordinator.retireProviderConfiguration();
+    expect(coordinator.get({ ownerConnectionId: "connection-b", voiceInputId: second.id }).outcome).toBe("cancelled");
+    expect(callbacks.size).toBe(0);
+  });
+
   it("owns an ephemeral, sequence-fenced transcription session", async () => {
     const provider = new FakeAsrProvider();
     provider.flushImpl = async () => provider.emit({ type: "stable", text: "private final words" });
@@ -282,7 +350,7 @@ function factory(provider: AsrProvider): VoiceInputProviderFactory & { createCal
 
 function createCoordinator(
   provider?: VoiceInputProviderFactory,
-  overrides: { readonly maximumConcurrentSessions?: number } = {}
+  overrides: Pick<VoiceInputCoordinatorOptions, "maximumConcurrentSessions" | "onOwnerRetired"> = {}
 ): VoiceInputCoordinator {
   let nextId = 0;
   const coordinator = new VoiceInputCoordinator({

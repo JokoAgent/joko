@@ -86,6 +86,7 @@ export function useMobileVoiceInput(options: UseMobileVoiceInputOptions): Mobile
   const baseSelectionRef = useRef<MobileComposerSelection | undefined>(undefined);
   const usageSessionRef = useRef<string | undefined>(undefined);
   const refinementSupportedRef = useRef(false);
+  const recognitionContextSupportedRef = useRef(false);
   const learning = useMemo(() => new MobileVoiceDictionaryLearningController({
     store: preferencesStore,
     readAdvisor: () => {
@@ -229,6 +230,7 @@ export function useMobileVoiceInput(options: UseMobileVoiceInputOptions): Mobile
     void transport.getCapabilities(controller.signal).then((capability) => {
       if (!controller.signal.aborted && transportRef.current?.surfaceOwnerKey === expectedOwnerKey) {
         setAvailable(supportsMobileVoiceCapture(capability, capture.isAvailable()));
+        recognitionContextSupportedRef.current = capability.supportsRecognitionContext;
       }
     }).catch(() => {
       if (!controller.signal.aborted && transportRef.current?.surfaceOwnerKey === expectedOwnerKey) setAvailable(false);
@@ -250,6 +252,7 @@ export function useMobileVoiceInput(options: UseMobileVoiceInputOptions): Mobile
     learning.clear();
     usageSessionRef.current = undefined;
     refinementSupportedRef.current = false;
+    recognitionContextSupportedRef.current = false;
     setState("idle");
     setError(undefined);
   }, [learning, ownerKey, options.draftOwnerKey, options.enabled, rollbackInsertion]);
@@ -295,6 +298,10 @@ export function useMobileVoiceInput(options: UseMobileVoiceInputOptions): Mobile
     baseSelectionRef.current = { ...readSelectionRef.current() };
     setError(undefined);
     const dictionary = preferencesStore.snapshot;
+    if (dictionary.status === "ready" && dictionary.document.recognitionContextEnabled
+      && dictionary.document.recognitionContextData.length > 0 && !recognitionContextSupportedRef.current) {
+      onErrorRef.current("The configured voice routes do not support recognition context. Your local text was retained and was not submitted.");
+    }
     const refinement = dictionary.status === "ready" ? {
       ...(dictionary.document.refinementInstructions === ""
         ? {} : { instructions: dictionary.document.refinementInstructions })
@@ -305,6 +312,10 @@ export function useMobileVoiceInput(options: UseMobileVoiceInputOptions): Mobile
       requestId: () => requestIdRef.current(),
       locale: localeRef.current,
       ...(refinement === undefined ? {} : { refinement }),
+      ...(dictionary.status === "ready" && dictionary.document.recognitionContextEnabled
+        && dictionary.document.recognitionContextData.length > 0 && recognitionContextSupportedRef.current ? {
+          recognitionContext: { contextData: dictionary.document.recognitionContextData }
+        } : {}),
       onCapability: (capability) => { refinementSupportedRef.current = capability.supportsRefinement; },
       onCaptureStopped: playMobileVoiceInputEndCue,
       onUpdate: (update) => handleUpdate(update, transport.surfaceOwnerKey, draftOwnerKey)

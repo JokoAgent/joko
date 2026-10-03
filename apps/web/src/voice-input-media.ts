@@ -1,3 +1,4 @@
+import { voiceInputRecognitionContextFromTexts, voiceInputRecognitionLocale, type VoiceInputRecognitionContextView } from "@joko/contracts";
 import type {
   OperationApi,
   VoiceInputCapabilityView,
@@ -48,6 +49,7 @@ export interface VoiceMediaPreferences {
   readonly locale?: string;
   readonly deviceId?: string;
   readonly refinementInstructions?: string;
+  readonly recognitionContext?: VoiceInputRecognitionContextView;
   readonly playInteractionSound?: boolean;
 }
 
@@ -86,6 +88,7 @@ export class VoiceInputMediaSession {
   private readonly subscribeMicrophoneRelease: VoiceMediaSessionOptions["subscribeMicrophoneRelease"];
   private readonly api: OperationApi;
   private readonly preferences: VoiceMediaPreferences;
+  private recognitionContext?: VoiceInputRecognitionContextView;
   private readonly onUpdate: (update: VoiceMediaSessionUpdate) => void;
   private readonly mediaDevices: Pick<MediaDevices, "getUserMedia">;
   private readonly MediaRecorderClass: typeof MediaRecorder | undefined;
@@ -117,7 +120,10 @@ export class VoiceInputMediaSession {
     this.api = options.api;
     this.ownerWindow = options.ownerWindow;
     this.subscribeMicrophoneRelease = options.subscribeMicrophoneRelease;
-    this.preferences = options.preferences ?? {};
+    const { recognitionContext, ...preferences } = options.preferences ?? {};
+    this.preferences = preferences;
+    this.recognitionContext = recognitionContext === undefined ? undefined
+      : voiceInputRecognitionContextFromTexts(recognitionContext.contextData.map((value) => value.text));
     this.onUpdate = options.onUpdate ?? (() => undefined);
     const mediaDevices = options.mediaDevices ?? options.ownerWindow.navigator.mediaDevices;
     const MediaRecorderClass = options.mediaRecorder ?? options.ownerWindow.MediaRecorder;
@@ -182,12 +188,15 @@ export class VoiceInputMediaSession {
       const session = await this.api.startVoiceInput(
         randomUuid(),
         mimeType,
-        capability.supportsLocale ? this.preferences.locale : undefined,
+        voiceInputRecognitionLocale(this.preferences.locale, capability),
         this.preferences.refinementInstructions === undefined
           ? undefined
           : { instructions: this.preferences.refinementInstructions },
-        startAbort.signal
+        startAbort.signal,
+        capability.supportsRecognitionContext && this.recognitionContext !== undefined
+          ? voiceInputRecognitionContextFromTexts(this.recognitionContext.contextData.map((value) => value.text), capability) : undefined
       );
+      this.recognitionContext = undefined;
       if (!this.isCurrent(generation) || startAbort.signal.aborted) {
         if (recorder !== undefined) stopMediaRecorder(recorder);
         if (this.stream === stream) { stopMediaStream(stream); this.stream = undefined; }
@@ -265,6 +274,7 @@ export class VoiceInputMediaSession {
   }
 
   async cancel(): Promise<void> {
+    this.recognitionContext = undefined;
     if (this.state === "cancelled" || this.state === "done") return;
     ++this.generation;
     this.stopRequested = false;
@@ -415,6 +425,7 @@ export class VoiceInputMediaSession {
   }
 
   private stopCaptureResources(): void {
+    this.recognitionContext = undefined;
     const recorder = this.recorder;
     if (recorder !== undefined) {
       recorder.removeEventListener("dataavailable", this.handleDataAvailable);

@@ -16,6 +16,42 @@ afterEach(async () => {
 });
 
 describe("VoiceInputService", () => {
+  it("fences each connection probe by its caller and original Connection without cancelling another probe", async () => {
+    const requests: Array<{ signal: AbortSignal; resolve: (value: { ok: true }) => void }> = [];
+    const revocations = new Map<string, Set<() => void>>();
+    let connectionId = "connection-a";
+    const settings = { adviseDictionaryEdit: async () => ({ actions: [] }),
+      testConnection: (signal?: AbortSignal) => new Promise<{ ok: true }>((resolve) => {
+        requests.push({ signal: signal!, resolve });
+      }) };
+    const service = createVoiceInputConnectService(undefined, settings, undefined, () => ({ connectionId }), undefined,
+      (owner, listener) => {
+        const listeners = revocations.get(owner) ?? new Set<() => void>();
+        revocations.set(owner, listeners); listeners.add(listener);
+        return () => { listeners.delete(listener); };
+      });
+    const firstAbort = new AbortController();
+    const first = service.testVoiceInputConnection(create(contract.TestVoiceInputConnectionRequestSchema), { signal: firstAbort.signal } as HandlerContext);
+    const healthy = service.testVoiceInputConnection(create(contract.TestVoiceInputConnectionRequestSchema), { signal: new AbortController().signal } as HandlerContext);
+    firstAbort.abort();
+    expect(requests[0]!.signal.aborted).toBe(true);
+    expect(requests[1]!.signal.aborted).toBe(false);
+    requests[0]!.resolve({ ok: true }); requests[1]!.resolve({ ok: true });
+    await expect(first).rejects.toMatchObject({ code: Code.Canceled });
+    await expect(healthy).resolves.toMatchObject({ ok: true });
+    expect(revocations.get("connection-a")?.size).toBe(0);
+    const revoked = service.testVoiceInputConnection(create(contract.TestVoiceInputConnectionRequestSchema), { signal: new AbortController().signal } as HandlerContext);
+    for (const callback of revocations.get("connection-a")!) callback();
+    expect(requests[2]!.signal.aborted).toBe(true);
+    requests[2]!.resolve({ ok: true });
+    await expect(revoked).rejects.toMatchObject({ code: Code.Canceled });
+    const changed = service.testVoiceInputConnection(create(contract.TestVoiceInputConnectionRequestSchema), { signal: new AbortController().signal } as HandlerContext);
+    connectionId = "connection-b";
+    requests[3]!.resolve({ ok: true });
+    await expect(changed).rejects.toMatchObject({ code: Code.PermissionDenied });
+    expect(revocations.get("connection-a")?.size).toBe(0);
+  });
+
   it("authenticates and maps the strict start/chunk/stop/status contract", async () => {
     const provider = new FakeAsrProvider();
     provider.flushImpl = async () => provider.emit({ type: "stable", text: "ephemeral result" });

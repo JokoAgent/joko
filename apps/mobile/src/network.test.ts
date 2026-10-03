@@ -42,7 +42,9 @@ import {
   ClearVoiceInputDictionaryPeerRouteResponseSchema,
   ClearVoiceInputDictionaryPeerRouteRequestSchema,
   WorkspaceEntrySchema,
-  WorkspaceSearchMatchSchema
+  WorkspaceSearchMatchSchema,
+  VoiceInputServiceSettingsSchema, VoiceInputTranscriptionProtocol, VoiceInputSaucSettingsSchema, VoiceInputSaucMode, VoiceInputSaucAuthentication,
+  GetSettingsResponseSchema, BeginCredentialUploadResponseSchema, BeginCredentialUploadRequestSchema, TestVoiceInputConnectionResponseSchema
 } from "@joko/contracts";
 import { describe, expect, it, vi } from "vitest";
 import {
@@ -69,6 +71,39 @@ import {
 import { projectMobileVoiceDictionarySnapshot, mobileVoiceDictionaryLearningRequest } from "./mobile-voice-dictionary-service";
 
 describe("mobile voice ephemeral requests", () => {
+  it("loads voice service settings, uploads credentials only through a same-origin ticket, and keeps context separate", async () => {
+    const credential: PairedCredential = { profileId: "voice-profile", origin: "https://node.example", serverId: "voice-server", connectionId: "voice-connection", deviceId: "voice-device", displayName: "Phone", authKey: "voice-test-key" };
+    const settings = create(VoiceInputServiceSettingsSchema, { protocol: VoiceInputTranscriptionProtocol.VOLCENGINE_SAUC,
+      fallbackProtocol: VoiceInputTranscriptionProtocol.OPENAI_COMPATIBLE_BATCH, version: { revision: { value: 4n } },
+      sauc: create(VoiceInputSaucSettingsSchema, { mode: VoiceInputSaucMode.STREAM_INPUT, authentication: VoiceInputSaucAuthentication.ACCESS_TOKEN, appId: "public-app" }) });
+    let relativeEndpoint = "/credentials/input/voice-ticket";
+    const calls: { url: string; body: Uint8Array; signal: AbortSignal | null | undefined }[] = [];
+    let originalBytes: Uint8Array | undefined;
+    const fetcher = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const url = String(input); const body = new Uint8Array(init?.body as Uint8Array);
+      calls.push({ url, body, signal: init?.signal });
+      expect(new Headers(init?.headers).get("authorization")).toBe(`Bearer ${credential.authKey}`);
+      if (init?.method === "PUT") { originalBytes = init.body as Uint8Array; return new Response(null, { status: 204 }); }
+      const bytes = url.endsWith("GetSettings") ? toBinary(GetSettingsResponseSchema, create(GetSettingsResponseSchema, { settings: { voiceInput: settings } }))
+        : url.endsWith("BeginCredentialUpload") ? toBinary(BeginCredentialUploadResponseSchema, create(BeginCredentialUploadResponseSchema, { ticket: { ticketId: "voice-ticket", relativeEndpoint, maximumBytes: 65_536n } }))
+          : toBinary(TestVoiceInputConnectionResponseSchema, create(TestVoiceInputConnectionResponseSchema, { ok: true }));
+      return new Response(bytes, { status: 200, headers: { "content-type": "application/proto" } });
+    });
+    try {
+      await expect(mobileNetwork.getVoiceInputServiceSettings(credential)).resolves.toEqual(settings);
+      await expect(mobileNetwork.uploadVoiceInputSecret(credential, "temporary-private-value", true)).resolves.toBe("voice-ticket");
+      expect(fromBinary(BeginCredentialUploadRequestSchema, calls[1]!.body).providerId).toBe("");
+      expect(calls[2]!.url).toBe("https://node.example/credentials/input/voice-ticket");
+      expect(new TextDecoder().decode(calls[2]!.body)).toBe("temporary-private-value");
+      expect(originalBytes?.every((byte) => byte === 0)).toBe(true);
+      await expect(mobileNetwork.testVoiceInputConnection(credential)).resolves.toMatchObject({ ok: true });
+      relativeEndpoint = "//other.example/credentials/input/voice-ticket";
+      await expect(mobileNetwork.uploadVoiceInputSecret(credential, "private-value", false)).rejects.toThrow(/invalid/u);
+      expect(calls.filter((call) => call.url.includes("other.example"))).toHaveLength(0);
+      expect(mobileVoiceNetworkTesting.startRequest("context", "audio/pcm", undefined, { instructions: "refine" },
+        { contextData: [{ text: " first\r\nsecond " }] })).toEqual({ requestId: "context", mimeType: "audio/pcm", refinementInstructions: "refine", recognitionContext: { contextData: [{ text: "first\nsecond" }] } });
+    } finally { fetcher.mockRestore(); }
+  });
   it("uses generated direct-route requests with separate revision and fingerprint confirmation and validates the public invitation", async () => {
     const listener = { listenPort: 43_121, host: "self.example", port: 44_121 };
     const status = { available: true, configurationRevision: 4n, nodeId: "node-a", fingerprint: "a".repeat(64), enabled: true,

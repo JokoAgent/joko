@@ -1,4 +1,4 @@
-import type { AudioChunk, SupportedAudioMimeType } from "./types.js";
+import type { AsrRecognitionContext, AudioChunk, SupportedAudioMimeType } from "./types.js";
 
 export const DEFAULT_STABLE_WAIT_MS = 500;
 export const STALL_WALL_TIMEOUT_MS = 4_000;
@@ -13,6 +13,12 @@ export const MAXIMUM_REFINEMENT_INSTRUCTIONS_CHARACTERS = 1_000;
 export const MAXIMUM_DICTIONARY_TERM_CHARACTERS = 120;
 export const MAXIMUM_DICTIONARY_TERMS = 200;
 export const MAXIMUM_DICTIONARY_CHARACTERS = 8_000;
+export const MAXIMUM_RECOGNITION_HOTWORDS = 1_000;
+export const MAXIMUM_RECOGNITION_HOTWORD_CHARACTERS = 120;
+export const MAXIMUM_RECOGNITION_HOTWORD_BYTES = 512 * 1024;
+export const MAXIMUM_RECOGNITION_CONTEXT_ITEMS = 20;
+export const MAXIMUM_RECOGNITION_CONTEXT_ITEM_BYTES = 2 * 1024;
+export const MAXIMUM_RECOGNITION_CONTEXT_BYTES = 8 * 1024;
 
 const SUPPORTED_AUDIO_MIME_TYPES = new Set<SupportedAudioMimeType>([
   "audio/mp4",
@@ -30,6 +36,7 @@ export type VoiceInputBoundsErrorCode =
   | "audio_total_duration"
   | "locale"
   | "mime_type"
+  | "recognition_context"
   | "refinement_context"
   | "stable_wait";
 
@@ -103,6 +110,52 @@ export function normalizeDictionaryTerms(values: readonly string[] | undefined):
     normalized.push(term);
   }
   return Object.freeze(normalized);
+}
+
+export function normalizeRecognitionContext(value: undefined): undefined;
+export function normalizeRecognitionContext(value: AsrRecognitionContext): AsrRecognitionContext;
+export function normalizeRecognitionContext(value: unknown): AsrRecognitionContext | undefined;
+export function normalizeRecognitionContext(value: unknown): AsrRecognitionContext | undefined {
+  if (value === undefined) return undefined;
+  const fail = (): never => { throw new VoiceInputBoundsError("recognition_context"); };
+  const hasShape = (candidate: unknown, keys: readonly string[]): candidate is Record<string, unknown> => {
+    if (candidate === null || typeof candidate !== "object" || Array.isArray(candidate)) return false;
+    const prototype = Object.getPrototypeOf(candidate);
+    if (prototype !== Object.prototype && prototype !== null) return false;
+    const ownKeys = Reflect.ownKeys(candidate);
+    return ownKeys.length === keys.length && keys.every((key) => ownKeys.includes(key));
+  };
+  if (!hasShape(value, ["hotwords", "contextData"])) return fail();
+  if (!Array.isArray(value.hotwords) || value.hotwords.length > MAXIMUM_RECOGNITION_HOTWORDS ||
+      !Array.isArray(value.contextData) || value.contextData.length > MAXIMUM_RECOGNITION_CONTEXT_ITEMS) return fail();
+  const encoder = new TextEncoder();
+  const textBytes = (candidate: unknown): number => {
+    if (typeof candidate !== "string" || /[\u0000-\u001f\u007f-\u009f]/u.test(candidate)) return fail();
+    return encoder.encode(candidate).byteLength;
+  };
+  const hotwords: string[] = [];
+  let hotwordBytes = 0;
+  for (const word of value.hotwords) {
+    const bytes = textBytes(word);
+    if (word.length > MAXIMUM_RECOGNITION_HOTWORD_CHARACTERS) return fail();
+    hotwordBytes += bytes;
+    if (hotwordBytes > MAXIMUM_RECOGNITION_HOTWORD_BYTES) return fail();
+    hotwords.push(word);
+  }
+  const contextData: { readonly text: string }[] = [];
+  let contextBytes = 0;
+  for (const item of value.contextData) {
+    if (!hasShape(item, ["text"])) return fail();
+    if (typeof item.text !== "string" || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/u.test(item.text)) return fail();
+    const normalized = item.text.replace(/\r\n?/gu, "\n").trim();
+    if (!normalized) return fail();
+    const bytes = encoder.encode(normalized).byteLength;
+    if (bytes > MAXIMUM_RECOGNITION_CONTEXT_ITEM_BYTES) return fail();
+    contextBytes += bytes;
+    if (contextBytes > MAXIMUM_RECOGNITION_CONTEXT_BYTES) return fail();
+    contextData.push(Object.freeze({ text: normalized }));
+  }
+  return Object.freeze({ hotwords: Object.freeze(hotwords), contextData: Object.freeze(contextData) });
 }
 
 export function validateStableWait(value: number): number {

@@ -3,7 +3,7 @@ import type { AppController } from "../controller.js";
 import { recordVoiceInputSession } from "../voice-input-history.js";
 import { supportsVoiceMediaCapture, VoiceInputMediaSession, type VoiceMediaSessionUpdate } from "../voice-input-media.js";
 import { VoiceInputMicrophonePrewarmer } from "../voice-input-prewarm.js";
-import { readVoiceInputPreferences, subscribeVoiceInputPreferences, voiceInputLocale } from "../voice-input-preferences.js";
+import { readVoiceInputPreferences, subscribeVoiceInputPreferences, voiceInputLocale, voiceInputRecognitionContext } from "../voice-input-preferences.js";
 import type { Translator } from "./types.js";
 
 export type VoiceDraftCompletion<T> =
@@ -142,6 +142,7 @@ export function useDraftVoiceInput<T>(options: DraftVoiceInputOptions<T>) {
         preferences: {
           ...(locale === undefined ? {} : { locale }), ...(preferences.deviceId === undefined ? {} : { deviceId: preferences.deviceId }),
           ...(preferences.refinementInstructions === "" ? {} : { refinementInstructions: preferences.refinementInstructions }),
+          recognitionContext: voiceInputRecognitionContext(preferences),
           playInteractionSound: preferences.playInteractionSound
         },
         prewarmedStream: prewarmerRef.current?.checkout(),

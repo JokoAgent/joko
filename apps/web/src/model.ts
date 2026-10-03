@@ -1,5 +1,5 @@
 import type { JSONContent } from "@tiptap/core";
-import type { VoiceDictionaryPeerApi } from "@joko/contracts";
+import type { VoiceDictionaryPeerApi, VoiceInputSaucSettingsView, VoiceInputRecognitionContextView } from "@joko/contracts";
 
 export type Locale = "en" | "zh-CN" | "en-XA";
 export type Theme = "system" | "light" | "dark";
@@ -4342,6 +4342,7 @@ export interface VoiceInputServiceSettingsView {
   readonly endpoint: string;
   readonly model: string;
   readonly resourceId: string;
+  readonly sauc?: VoiceInputSaucSettingsView;
   readonly keyless: boolean;
   readonly credentialConfigured: boolean;
   readonly refinementEnabled: boolean;
@@ -4352,6 +4353,7 @@ export interface VoiceInputServiceSettingsView {
   readonly fallbackEndpoint: string;
   readonly fallbackModel: string;
   readonly fallbackResourceId: string;
+  readonly fallbackSauc?: VoiceInputSaucSettingsView;
   readonly fallbackKeyless: boolean;
   readonly fallbackCredentialConfigured: boolean;
   readonly revision: bigint;
@@ -4370,6 +4372,7 @@ export interface VoiceInputServiceSettingsDraft {
   readonly endpoint: string;
   readonly model: string;
   readonly resourceId: string;
+  readonly sauc?: VoiceInputSaucSettingsView;
   readonly keyless: boolean;
   readonly secret?: string;
   readonly clearCredential?: boolean;
@@ -4381,6 +4384,7 @@ export interface VoiceInputServiceSettingsDraft {
   readonly fallbackEndpoint: string;
   readonly fallbackModel: string;
   readonly fallbackResourceId: string;
+  readonly fallbackSauc?: VoiceInputSaucSettingsView;
   readonly fallbackKeyless: boolean;
   readonly fallbackSecret?: string;
   readonly clearFallbackCredential?: boolean;
@@ -5144,6 +5148,11 @@ export interface VoiceInputCapabilityView {
   readonly supportsLocale: boolean;
   readonly supportsLiveDrafts: boolean;
   readonly supportsRefinement: boolean;
+  readonly supportsRecognitionContext: boolean;
+  readonly recognitionContextMaximumItems: number;
+  readonly recognitionContextMaximumItemBytes: number;
+  readonly recognitionContextMaximumBytes: number;
+  readonly supportedLocales: readonly string[];
 }
 
 export type VoiceInputConnectionTestFailureView =
@@ -5596,7 +5605,8 @@ export interface OperationApi extends VoiceDictionaryPeerApi {
     mimeType: string,
     locale?: string,
     refinement?: VoiceInputRefinementContextView,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    recognitionContext?: VoiceInputRecognitionContextView
   ): Promise<VoiceInputSessionView>;
   appendVoiceAudio(voiceInputId: string, chunkSequence: bigint, audio: Uint8Array, durationMs: number, voiced: boolean, signal?: AbortSignal): Promise<VoiceInputSessionView>;
   stopVoiceInput(voiceInputId: string, expectedNextChunkSequence: bigint, signal?: AbortSignal): Promise<VoiceInputSessionView>;
@@ -6153,7 +6163,7 @@ export interface OperationApi extends VoiceDictionaryPeerApi {
   restartMcpServer(serverId: string): Promise<void>;
   updatePiSettings(backendId: string, patch: { readonly autoCompaction?: boolean; readonly autoCompactionThresholdPercent?: number; readonly resetAutoCompactionThresholdPercent?: boolean; readonly autoRetry?: boolean; readonly steeringMode?: "all" | "oneAtATime"; readonly followUpMode?: "all" | "oneAtATime" }): Promise<void>;
   updateBrowserSettings(browserProviderId: string, patch: BrowserSettingsPatchView): Promise<void>;
-  updateVoiceInputServiceSettings(draft: VoiceInputServiceSettingsDraft): Promise<void>;
+  updateVoiceInputServiceSettings(draft: VoiceInputServiceSettingsDraft, signal?: AbortSignal): Promise<void>;
   showBrowserAutomation(browserProviderId: string, targetId: string): Promise<void>;
   updateComputerAutomationSettings(enabled: boolean): Promise<void>;
   installComputerAutomation(): Promise<void>;

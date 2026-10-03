@@ -40,7 +40,8 @@ import {
   EditVoiceInputDictionaryEntryResponseSchema,
   DeleteVoiceInputDictionaryEntryResponseSchema,
   ApplyVoiceInputDictionaryLearningResponseSchema,
-  VoiceInputTranscriptionProtocol
+  VoiceInputTranscriptionProtocol,
+  defaultVoiceInputSaucSettings, protoVoiceInputSaucSettings
 } from "@joko/contracts";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createOrchestratorGateway } from "./gateway.js";
@@ -110,6 +111,8 @@ describe("voice input gateway", () => {
               maximumConcurrentSessions: 1
             },
             supportsLocale: true,
+            supportedLocales: ["en-US"], supportsRecognitionContext: true,
+            recognitionContextMaximumItems: 20, recognitionContextMaximumItemBytes: 2_048, recognitionContextMaximumBytes: 8_192,
             supportsLiveDrafts: true,
             supportsRefinement: true
           }
@@ -162,6 +165,8 @@ describe("voice input gateway", () => {
       support: "supported",
       limits: { supportedMimeTypes: ["audio/webm"], maximumAudioChunkBytes: 8_192, stableWaitMs: 1_250 },
       supportsLocale: true,
+      supportedLocales: ["en-US"], supportsRecognitionContext: true,
+      recognitionContextMaximumItems: 20, recognitionContextMaximumItemBytes: 2_048, recognitionContextMaximumBytes: 8_192,
       supportsLiveDrafts: true,
       supportsRefinement: true
     });
@@ -198,7 +203,7 @@ describe("voice input gateway", () => {
     }]);
     await gateway.startVoiceInput("request-one", "audio/webm", "en-US", {
       instructions: "Keep commands verbatim."
-    });
+    }, undefined, { contextData: [{ text: "Client authorized context" }, { text: "Next item" }] });
     await gateway.appendVoiceAudio("voice-one", 1n, new Uint8Array([1, 2, 3]), 250, true);
     const result = await gateway.stopVoiceInput("voice-one", 2n);
     await gateway.cancelVoiceInput("voice-one");
@@ -208,7 +213,8 @@ describe("voice input gateway", () => {
       requestId: "request-one",
       mimeType: "audio/webm",
       locale: "en-US",
-      refinementInstructions: "Keep commands verbatim."
+      refinementInstructions: "Keep commands verbatim.",
+      recognitionContext: { contextData: [{ text: "Client authorized context" }, { text: "Next item" }] }
     });
     expect("dictionaryTerms" in requests.find((request) => request.method === "startVoiceInput")!.input).toBe(false);
     expect(requests.find((request) => request.method === "setVoiceInputDictionarySyncEnabled")?.input)
@@ -362,6 +368,8 @@ describe("voice input gateway", () => {
       endpoint: "wss://speech.example/api/v3/sauc/bigmodel_async",
       model: "",
       resourceId: "volc.seedasr.sauc.duration",
+      sauc: { ...defaultVoiceInputSaucSettings(), mode: "bidirectional", authentication: "accessToken", appId: "public-app", useDictionaryHotwords: true,
+        boostingTableId: "boost", correctTableName: "correct" },
       keyless: false,
       secret: "replacement-key",
       refinementEnabled: false,
@@ -387,6 +395,8 @@ describe("voice input gateway", () => {
           endpoint: "wss://speech.example/api/v3/sauc/bigmodel_async",
           model: "",
           resourceId: "volc.seedasr.sauc.duration",
+          sauc: protoVoiceInputSaucSettings({ ...defaultVoiceInputSaucSettings(), mode: "bidirectional", authentication: "accessToken", appId: "public-app", useDictionaryHotwords: true,
+            boostingTableId: "boost", correctTableName: "correct" }),
           refinerModel: { backendId: "text-one", providerId: "same-provider", modelId: "same-model" },
           refinerFallbackModel: { backendId: "text-two", providerId: "same-provider", modelId: "same-model" },
           fallbackResourceId: "",

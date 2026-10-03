@@ -13,6 +13,23 @@ function fixture(initial: string | null = null) {
 }
 
 describe("MobileVoicePreferencesStore", () => {
+  it("persists only explicitly authorized normalized recognition texts and rejects missing current fields", async () => {
+    const f = fixture();
+    await f.store.hydrate();
+    expect(f.store.snapshot.document).toMatchObject({ recognitionContextEnabled: false, recognitionContextData: [] });
+    await f.store.setRecognitionContext(true, [{ text: "  First\r\nsecond\tpart  " }]);
+    expect(f.store.snapshot.document).toMatchObject({ recognitionContextEnabled: true,
+      recognitionContextData: [{ text: "First\nsecond\tpart" }], refinementInstructions: "", preferencesRevision: 1 });
+    const restarted = fixture(f.read()); await restarted.store.hydrate();
+    expect(restarted.store.snapshot.document).toEqual(f.store.snapshot.document);
+    await f.store.setRecognitionContext(false, f.store.snapshot.document.recognitionContextData);
+    expect(f.store.snapshot.document.recognitionContextData).toHaveLength(1);
+    await expect(f.store.setRecognitionContext(true, [{ text: "字".repeat(683) }])).rejects.toThrow();
+    await expect(f.store.setRecognitionContext(true, [{ text: " \n " }])).rejects.toThrow();
+    const missing = JSON.parse(f.read()!); delete missing.recognitionContextData;
+    const incompatible = fixture(JSON.stringify(missing)); await incompatible.store.hydrate();
+    expect(incompatible.store.snapshot.status).toBe("error"); expect(incompatible.storage.setItem).not.toHaveBeenCalled();
+  });
   it("rejects incompatible development data without overwriting it and explicitly rebuilds private preferences", async () => {
     const old = JSON.stringify({ version: 1, dictionary: { entries: [] }, dictionaryRevision: 4 });
     const f = fixture(old);

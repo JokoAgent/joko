@@ -14,6 +14,8 @@ import {
   OperationMutationSchema, OperationState, OwnerSnapshotScopeSchema, PermissionMode,
   ProviderDescriptorSchema, ProviderKind, RevisionSchema, SessionMessageSearchMatchSchema, SessionSnapshotScopeSchema,
   SettingsSnapshotSchema, SnapshotScopeSchema, UsageSchema,
+  VoiceInputServiceSettingsSchema, VoiceInputServiceSettingsPatchSchema, VoiceInputTranscriptionProtocol,
+  VoiceInputSaucSettingsSchema, VoiceInputSaucMode, VoiceInputSaucAuthentication,
   QueueControlSchema, QueueDeliveryMode, QueueDispatchState, QueueItemSchema, QueueItemState, QueueSourceKind, ResourceKind,
   ReviewRunSchema, ReviewRunState, RuntimeCommandSchema, RuntimeCommandSource, SessionResourceSchema,
   RunState, ScheduleExecutionMode, ScheduleFireSource, ScheduleMisfirePolicy, ScheduleOverlapPolicy,
@@ -993,6 +995,9 @@ function fakeNetwork(): MobileNetwork {
     authorizeBlobDownload: vi.fn(async () => { throw new Error("No Blob authorization fixture was configured."); }),
     uploadBlob: vi.fn(async () => { throw new Error("No Blob upload fixture was configured."); }),
     getVoiceInputCapabilities: vi.fn(async () => { throw new Error("No Voice capability fixture was configured."); }),
+    getVoiceInputServiceSettings: vi.fn(async () => { throw new Error("No Voice settings fixture was configured."); }),
+    uploadVoiceInputSecret: vi.fn(async () => "voice-ticket"),
+    testVoiceInputConnection: vi.fn(async () => { throw new Error("No Voice settings fixture was configured."); }),
     getVoiceInputDictionary: vi.fn(async () => { throw new Error("No Voice dictionary fixture was configured."); }),
     getVoiceInputDictionaryReadOnly: vi.fn(async () => { throw new Error("No read-only dictionary fixture was configured."); }),
     watchVoiceInputDictionaryReadOnly: vi.fn((_credential: PairedCredential, signal: AbortSignal) => idleDictionaryWatch(signal)),
@@ -2248,6 +2253,63 @@ describe("native mobile connection and operation ownership", () => {
     await expect(api.watchVoiceInputDictionary(new AbortController().signal)[Symbol.asyncIterator]().next()).rejects.toThrow(/authority changed/u);
     expect(network.watchVoiceInputDictionary).toHaveBeenCalledOnce();
   });
+  it("binds voice settings to the node, uploads primary and fallback secrets before a durable public CAS operation", async () => {
+    const network = fakeNetwork(); const saved = memoryStorage(credential); const app = client(network, saved.storage);
+    const settings = create(VoiceInputServiceSettingsSchema, { protocol: VoiceInputTranscriptionProtocol.VOLCENGINE_SAUC,
+      fallbackProtocol: VoiceInputTranscriptionProtocol.VOLCENGINE_SAUC, endpoint: "wss://speech.example/api/v3/sauc/bigmodel_async",
+      fallbackEndpoint: "wss://fallback.example/api/v3/sauc/bigmodel_async", credentialConfigured: true,
+      sauc: { mode: VoiceInputSaucMode.ASYNC_TWO_PASS, authentication: VoiceInputSaucAuthentication.API_KEY },
+      fallbackSauc: { mode: VoiceInputSaucMode.ASYNC_TWO_PASS, authentication: VoiceInputSaucAuthentication.API_KEY }, version: { revision: { value: 4n } } });
+    vi.mocked(network.getVoiceInputServiceSettings).mockResolvedValue(settings);
+    await app.start(); const api = app.voiceInputSettingsTransport()!; await app.select("session");
+    await expect(api.get()).resolves.toBe(settings); expect(api.isCurrent()).toBe(true); expect(api.ownerKey).not.toContain(credential.authKey);
+    const patch = create(VoiceInputServiceSettingsPatchSchema, { expectedRevision: { value: 4n },
+      sauc: { mode: VoiceInputSaucMode.STREAM_INPUT, authentication: VoiceInputSaucAuthentication.ACCESS_TOKEN, appId: "public-app" } });
+    await expect(api.save(patch)).rejects.toThrow(/Replace or clear/u);
+    await api.save(patch, { primary: "private-primary", fallback: "private-fallback" });
+    expect(network.uploadVoiceInputSecret).toHaveBeenNthCalledWith(1, credential, "private-primary", false, expect.any(AbortSignal));
+    expect(network.uploadVoiceInputSecret).toHaveBeenNthCalledWith(2, credential, "private-fallback", true, expect.any(AbortSignal));
+    const mutation = vi.mocked(network.submit).mock.calls[0]![2];
+    expect(mutation.payload).toMatchObject({ case: "updateVoiceInputServiceSettings", value: { patch: {
+      expectedRevision: { value: 4n }, credentialUploadTicketId: "voice-ticket", fallbackCredentialUploadTicketId: "voice-ticket",
+      sauc: { mode: VoiceInputSaucMode.STREAM_INPUT, authentication: VoiceInputSaucAuthentication.ACCESS_TOKEN, appId: "public-app" }
+    } } });
+    expect(JSON.stringify(vi.mocked(saved.storage.savePending).mock.calls)).not.toContain("private-");
+    expect(new TextDecoder().decode(toBinary(OperationMutationSchema, mutation))).not.toContain("private-");
+  });
+
+  it("retains an unknown voice settings receipt and checks it without reuploading or resending the draft", async () => {
+    const network = fakeNetwork(); const saved = memoryStorage(credential); const app = client(network, saved.storage);
+    vi.mocked(network.getVoiceInputServiceSettings).mockResolvedValue(create(VoiceInputServiceSettingsSchema, {
+      protocol: VoiceInputTranscriptionProtocol.OPENAI_COMPATIBLE_BATCH, fallbackProtocol: VoiceInputTranscriptionProtocol.OPENAI_COMPATIBLE_BATCH,
+      version: { revision: { value: 4n } } }));
+    vi.mocked(network.submit).mockRejectedValueOnce(new Error("connection lost"));
+    await app.start(); const api = app.voiceInputSettingsTransport()!;
+    const patch = create(VoiceInputServiceSettingsPatchSchema, { expectedRevision: { value: 4n }, enabled: true });
+    await expect(api.save(patch, { primary: "private-value" })).rejects.toThrow(/unknown/u);
+    expect(saved.pending()).toEqual([{ operationId: "operation-1", connectionId: credential.connectionId, kind: "voice-settings", state: "unknown" }]);
+    await expect(api.save(patch, { primary: "private-value" })).rejects.toThrow(/receipt/u);
+    expect(network.submit).toHaveBeenCalledOnce(); expect(network.uploadVoiceInputSecret).toHaveBeenCalledOnce();
+    vi.mocked(network.getOperation).mockResolvedValue(create(OperationSchema, { operationId: "operation-1", connectionId: credential.connectionId, state: OperationState.SUCCEEDED }));
+    await api.reconcile(); expect(saved.pending()).toHaveLength(0); expect(network.submit).toHaveBeenCalledOnce();
+  });
+
+  it("aborts an old voice settings upload on foreground retirement before any operation dispatch", async () => {
+    const network = fakeNetwork(); const app = client(network, memoryStorage(credential).storage);
+    vi.mocked(network.getVoiceInputServiceSettings).mockResolvedValue(create(VoiceInputServiceSettingsSchema, {
+      protocol: VoiceInputTranscriptionProtocol.OPENAI_COMPATIBLE_BATCH, fallbackProtocol: VoiceInputTranscriptionProtocol.OPENAI_COMPATIBLE_BATCH,
+      version: { revision: { value: 4n } } }));
+    let release!: (value: string) => void;
+    vi.mocked(network.uploadVoiceInputSecret).mockImplementation(async () => new Promise<string>((resolve) => { release = resolve; }));
+    await app.start(); const api = app.voiceInputSettingsTransport()!;
+    const save = api.save(create(VoiceInputServiceSettingsPatchSchema, { expectedRevision: { value: 4n } }), { primary: "private-value" });
+    const rejected = expect(save).rejects.toThrow(/aborted|cancelled/u);
+    await vi.waitFor(() => expect(network.uploadVoiceInputSecret).toHaveBeenCalledOnce());
+    app.setForeground(false);
+    expect(vi.mocked(network.uploadVoiceInputSecret).mock.calls[0]![3]!.aborted).toBe(true);
+    release("voice-ticket"); await rejected; expect(network.submit).not.toHaveBeenCalled(); expect(api.isCurrent()).toBe(false);
+  });
+
   it("binds dictionary reads and semantic mutations to a node owner independently of the selected task", async () => {
     const network = fakeNetwork();
     const app = client(network, memoryStorage(credential).storage);
@@ -2357,7 +2419,9 @@ describe("native mobile connection and operation ownership", () => {
       },
       supportsLocale: true,
       supportsLiveDrafts: true,
-      supportsRefinement: true
+      supportsRefinement: true,
+      supportsRecognitionContext: true, recognitionContextMaximumItems: 20,
+      recognitionContextMaximumItemBytes: 2_048, recognitionContextMaximumBytes: 8_192, supportedLocales: []
     };
     const voiceSession: MobileVoiceSession = {
       id: "voice-one",

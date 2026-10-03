@@ -6,6 +6,7 @@ import { recordVoiceInputSession } from "../voice-input-history.js";
 import { VoiceInputMediaSession, type VoiceMediaErrorCode, type VoiceMediaSessionUpdate } from "../voice-input-media.js";
 import {
   readVoiceInputPreferences,
+  voiceInputRecognitionContext,
   subscribeVoiceInputPreferences,
   voiceInputLocale,
   type VoiceInputPreferences
@@ -266,6 +267,7 @@ export function createDesktopGlobalVoiceSession(
       ...(locale === undefined ? {} : { locale }),
       ...(preferences.deviceId === undefined ? {} : { deviceId: preferences.deviceId }),
       ...(preferences.refinementInstructions === "" ? {} : { refinementInstructions: preferences.refinementInstructions }),
+      recognitionContext: voiceInputRecognitionContext(preferences),
       playInteractionSound: preferences.playInteractionSound
     },
     onUpdate

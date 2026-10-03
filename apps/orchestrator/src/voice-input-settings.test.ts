@@ -1,5 +1,8 @@
 import { create } from "@bufbuild/protobuf";
 import {
+  VoiceInputSaucAuthentication,
+  VoiceInputSaucMode,
+  VoiceInputSaucSettingsSchema,
   VoiceInputServiceSettingsPatchSchema,
   VoiceInputTranscriptionProtocol
 } from "@joko/contracts";
@@ -7,6 +10,7 @@ import { OperationalStore } from "@joko/store";
 import type { AsrEvent } from "@joko/voice-input";
 import { readFile } from "node:fs/promises";
 import { once } from "node:events";
+import { gunzipSync } from "node:zlib";
 import { WebSocketServer } from "ws";
 import { mkdtemp } from "./test-paths.js";
 import { tmpdir } from "node:os";
@@ -35,7 +39,113 @@ function saucResponse(last: boolean): Buffer {
   return Buffer.concat([header, data]);
 }
 
+const asyncSauc = () => create(VoiceInputSaucSettingsSchema, {
+  mode: VoiceInputSaucMode.ASYNC_TWO_PASS, authentication: VoiceInputSaucAuthentication.API_KEY
+});
+
 describe("VoiceInputSettingsController", () => {
+  it("keeps SAUC authentication and authorized corpus snapshots across fallback and restart", async () => {
+    const { credentials, store, credentialPath } = await fixture();
+    const server = new WebSocketServer({ host: "127.0.0.1", port: 0 });
+    await once(server, "listening");
+    const address = server.address();
+    if (address === null || typeof address === "string") throw new Error("No socket address.");
+    const origin = `ws://127.0.0.1:${address.port}`;
+    const captured: Array<{ appId: unknown; token: unknown; apiKey: unknown; path: string;
+      body: { audio: Record<string, unknown>; request: { corpus: Record<string, string> } } }> = [];
+    server.on("connection", (socket, request) => {
+      socket.on("message", (raw) => {
+        const packet = Buffer.from(raw as Buffer);
+        if ((packet[1]! >> 4) === 1) {
+          captured.push({ appId: request.headers["x-api-app-key"], token: request.headers["x-api-access-key"],
+            apiKey: request.headers["x-api-key"], path: request.url!, body: JSON.parse(gunzipSync(packet.subarray(8)).toString()) });
+          socket.send(saucResponse(false));
+        } else if ((packet[1]! & 3) === 3) socket.send(saucResponse(true));
+      });
+    });
+    const ticket = (secret: string, connectionId = "connection-a") => {
+      const value = credentials.createUploadTicket({ kind: "api_key", connectionId });
+      credentials.upload(value.credentialUploadTicketId, secret, connectionId);
+      return value.credentialUploadTicketId;
+    };
+    let terms = ["NodeTerm"];
+    const controller = new VoiceInputSettingsController({ store, credentials, dictionaryTerms: () => terms });
+    const publicSauc = create(VoiceInputSaucSettingsSchema, { mode: VoiceInputSaucMode.STREAM_INPUT,
+      authentication: VoiceInputSaucAuthentication.ACCESS_TOKEN, appId: "application-a", useDictionaryHotwords: true,
+      boostingTableName: "term-table", boostingTableId: "term-id", correctTableName: "correct-table", correctTableId: "correct-id" });
+    let provider: ReturnType<typeof controller.create> | undefined;
+    try {
+      const saved = await controller.apply(create(VoiceInputServiceSettingsPatchSchema, { enabled: true,
+        protocol: VoiceInputTranscriptionProtocol.VOLCENGINE_SAUC, model: "", resourceId: "volc.seedasr.sauc.duration",
+        endpoint: `${origin}/api/v3/sauc/bigmodel_nostream`, sauc: publicSauc,
+        credentialUploadTicketId: ticket("access-secret") }), "connection-a");
+      expect(saved.sauc).toMatchObject(publicSauc);
+      expect(controller.describe()).toMatchObject({ supportsLocale: true, supportsLiveDrafts: false,
+        supportedLocales: expect.arrayContaining(["en-US", "yue-CN"]), supportsRecognitionContext: true });
+      expect(await controller.testConnection()).toEqual({ ok: true });
+      expect(captured[0]).toMatchObject({ appId: "application-a", token: "access-secret", apiKey: undefined,
+        body: { request: { corpus: { boosting_table_id: "term-id", correct_table_id: "correct-id" } } } });
+      const original = store.getSetting("service", "orchestrator", "settings.voice_input");
+      for (const patch of [
+        { sauc: { ...publicSauc, authentication: VoiceInputSaucAuthentication.API_KEY, appId: "" } },
+        { sauc: { ...publicSauc, appId: "application-b" } },
+        { endpoint: `${origin}/api/v3/sauc/bigmodel`, sauc: publicSauc }
+      ]) await expect(controller.apply(create(VoiceInputServiceSettingsPatchSchema, patch), "connection-a")).rejects.toMatchObject({ code: "invalid" });
+      expect(store.getSetting("service", "orchestrator", "settings.voice_input")).toEqual(original);
+      await expect(controller.apply(create(VoiceInputServiceSettingsPatchSchema, {
+        sauc: { ...publicSauc, appId: "application-b" }, credentialUploadTicketId: ticket("unadopted", "connection-b")
+      }), "connection-a")).rejects.toThrow("does not authorize");
+      expect(store.getSetting("service", "orchestrator", "settings.voice_input")).toEqual(original);
+
+      const input = { hotwords: [], contextData: [{ text: "  Explicit\r\ncontext  " }] };
+      provider = controller.create({ mimeType: "audio/pcm", locale: "en-US", recognitionContext: input });
+      terms = ["ChangedAfterCapture"];
+      input.contextData[0]!.text = "Changed client text";
+      const events: AsrEvent[] = [];
+      provider.onEvent((event) => events.push(event));
+      await provider.start({ runId: "context-run", mimeType: "audio/pcm", locale: "en-US" });
+      const sent = captured.at(-1)!;
+      expect(sent.body["audio"]).toMatchObject({ language: "en-US" });
+      expect(JSON.parse(sent.body["request"].corpus.context!)).toEqual({ hotwords: [{ word: "NodeTerm" }],
+        context_type: "dialog_ctx", context_data: [{ text: "Explicit\ncontext" }] });
+      provider.appendAudio({ data: new Uint8Array(3_200).buffer, durationMs: 100, voiced: true });
+      await provider.flushAudio();
+      expect(events.at(-1)).toEqual({ type: "stable", text: "ephemeral transcription words" });
+      await provider.stop();
+
+      await controller.apply(create(VoiceInputServiceSettingsPatchSchema, {
+        endpoint: "ws://127.0.0.1:1/api/v3/sauc/bigmodel", sauc: { ...publicSauc, mode: VoiceInputSaucMode.BIDIRECTIONAL,
+          authentication: VoiceInputSaucAuthentication.API_KEY, appId: "", useDictionaryHotwords: false },
+        credentialUploadTicketId: ticket("primary-secret"), fallbackEnabled: true,
+        fallbackProtocol: VoiceInputTranscriptionProtocol.VOLCENGINE_SAUC,
+        fallbackEndpoint: `${origin}/api/v3/sauc/bigmodel_async`, fallbackModel: "", fallbackResourceId: "volc.bigasr.sauc.concurrent",
+        fallbackSauc: asyncSauc(), fallbackCredentialUploadTicketId: ticket("fallback-secret")
+      }), "connection-a");
+      provider = controller.create({ mimeType: "audio/pcm", recognitionContext: { hotwords: [], contextData: [{ text: "Fallback context" }] } });
+      await provider.start({ runId: "fallback-context", mimeType: "audio/pcm" });
+      expect(captured.at(-1)).toMatchObject({ token: undefined, appId: undefined, apiKey: "fallback-secret",
+        path: "/api/v3/sauc/bigmodel_async" });
+      expect(JSON.parse(captured.at(-1)!.body["request"].corpus.context!)).toEqual({ context_type: "dialog_ctx",
+        context_data: [{ text: "Fallback context" }] });
+      await provider.stop();
+      const reopenedCredentials = new CredentialManager({ vault: await CredentialVault.open(join(credentialPath, "..", "vault.key")), storagePath: credentialPath });
+      await reopenedCredentials.initialize();
+      const reopened = new VoiceInputSettingsController({ store, credentials: reopenedCredentials });
+      expect(reopened.snapshot()).toEqual(controller.snapshot());
+      expect(reopened.describe()).toMatchObject({ supportsRecognitionContext: true, supportsLocale: false, supportsLiveDrafts: true });
+      const durable = JSON.stringify(store.listSettings().map((record) => record.value));
+      for (const privateValue of ["access-secret", "primary-secret", "fallback-secret", "Explicit\ncontext", "Fallback context", "ephemeral transcription words"]) {
+        expect(durable).not.toContain(privateValue);
+        expect(await readFile(credentialPath, "utf8")).not.toContain(privateValue);
+      }
+    } finally {
+      await provider?.stop();
+      for (const socket of server.clients) socket.terminate();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      store.close();
+    }
+  });
+
   it("keeps old route authority on a partial credential failure and retires only unadopted generations", async () => {
     const { credentials, store, credentialPath } = await fixture();
     const sent: Array<{ endpoint: string; authorization: string | null }> = [];
@@ -134,7 +244,8 @@ describe("VoiceInputSettingsController", () => {
     credentials.upload(ticket.credentialUploadTicketId, secret, "connection-a");
     let provider: ReturnType<typeof controller.create> | undefined;
     try {
-      const route = { endpoint, model, resourceId, protocol };
+      const route = { endpoint, model, resourceId, protocol,
+        ...(name === "SAUC" ? { sauc: asyncSauc() } : {}) };
       await controller.apply(create(VoiceInputServiceSettingsPatchSchema, position === "primary" ? {
         enabled: true, ...route, credentialUploadTicketId: ticket.credentialUploadTicketId
       } : {
@@ -142,6 +253,7 @@ describe("VoiceInputSettingsController", () => {
         endpoint: "ws://127.0.0.1:1/realtime", model: "unavailable", keyless: true,
         fallbackEnabled: true, fallbackProtocol: route.protocol, fallbackEndpoint: endpoint, fallbackModel: route.model,
         fallbackResourceId: resourceId,
+        ...(name === "SAUC" ? { fallbackSauc: asyncSauc() } : {}),
         fallbackCredentialUploadTicketId: ticket.credentialUploadTicketId
       }), "connection-a");
       expect(controller.describe()).toMatchObject({ support: "supported", supportsLiveDrafts: true, mimeTypes: ["audio/pcm"] });
@@ -183,14 +295,15 @@ describe("VoiceInputSettingsController", () => {
     try {
       const controller = new VoiceInputSettingsController({ store, credentials });
       const route = { protocol: VoiceInputTranscriptionProtocol.VOLCENGINE_SAUC,
-        endpoint: "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async", model: "", resourceId: "volc.seedasr.sauc.duration", keyless: false };
+        endpoint: "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async", model: "", resourceId: "volc.seedasr.sauc.duration", keyless: false,
+        sauc: asyncSauc() };
       for (const patch of [{ ...route, keyless: true }, { ...route, model: route.resourceId, resourceId: "" }, { ...route, resourceId: "unsupported" }]) {
         await expect(controller.apply(create(VoiceInputServiceSettingsPatchSchema, patch), "connection-a")).rejects.toMatchObject({ code: "invalid" });
       }
       await controller.apply(create(VoiceInputServiceSettingsPatchSchema, route), "connection-a");
       expect(controller.snapshot()).toMatchObject({ model: "", resourceId: route.resourceId });
       const current = store.findSetting<Record<string, unknown>>("service", "orchestrator", "settings.voice_input")!;
-      for (const field of ["fallbackProtocol", "refinerModel", "refinerFallbackModel", "credentialReferenceId", "fallbackCredentialReferenceId"]) {
+      for (const field of ["fallbackProtocol", "refinerModel", "refinerFallbackModel", "credentialReferenceId", "fallbackCredentialReferenceId", "sauc", "fallbackSauc"]) {
         const incomplete = { ...current.value }; delete incomplete[field];
         store.setSetting("service", "orchestrator", "settings.voice_input", incomplete, 1_800_000_000_000);
         expect(() => new VoiceInputSettingsController({ store, credentials })).toThrow(VoiceInputSettingsError);
@@ -567,8 +680,8 @@ describe("VoiceInputSettingsController", () => {
     });
     expect(controller.describe()).toMatchObject({
       support: "supported",
-      supportsLiveDrafts: true,
-      mimeTypes: expect.arrayContaining(["audio/pcm", "audio/webm"])
+      supportsLiveDrafts: false,
+      mimeTypes: ["audio/pcm"]
     });
     const provider = controller.create({ mimeType: "audio/pcm", locale: "en" });
     const events: AsrEvent[] = [];

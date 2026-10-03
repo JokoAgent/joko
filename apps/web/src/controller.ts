@@ -2739,7 +2739,7 @@ export function useAppController(): AppController {
     ...mcpApi,
     updatePiSettings: (backendId, patch) => gateway().updatePiSettings(backendId, patch),
     updateBrowserSettings: (browserProviderId, patch) => gateway().updateBrowserSettings(browserProviderId, patch),
-    updateVoiceInputServiceSettings: (draft) => gateway().updateVoiceInputServiceSettings(draft),
+    updateVoiceInputServiceSettings: (draft, signal) => gateway().updateVoiceInputServiceSettings(draft, signal),
     showBrowserAutomation: (browserProviderId, targetId) => gateway().showBrowserAutomation(browserProviderId, targetId),
     updateComputerAutomationSettings: (enabled) => gateway().updateComputerAutomationSettings(enabled),
     installComputerAutomation: () => gateway().installComputerAutomation(),

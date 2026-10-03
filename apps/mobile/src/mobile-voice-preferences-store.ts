@@ -1,5 +1,6 @@
 import type { MobilePlainStorageDriver } from "./connection-storage";
 import { normalizeMobileVoiceDictionaryTerm } from "./mobile-voice-dictionary";
+import { normalizeMobileVoiceRecognitionContext } from "./mobile-voice-recognition-context";
 
 export const MAXIMUM_MOBILE_VOICE_REFINEMENT_INSTRUCTION_CHARACTERS = 1_000;
 export const MAXIMUM_MOBILE_VOICE_DICTIONARY_HISTORY = 100;
@@ -27,6 +28,8 @@ export interface MobileVoicePreferencesDocument {
   readonly preferencesRevision: number;
   readonly refinementInstructions: string;
   readonly autoLearningEnabled: boolean;
+  readonly recognitionContextEnabled: boolean;
+  readonly recognitionContextData: readonly { readonly text: string }[];
   readonly usage: MobileVoiceDictionaryUsage;
   readonly history: readonly MobileVoiceDictionaryHistoryEntry[];
 }
@@ -113,6 +116,18 @@ export class MobileVoicePreferencesStore {
       preferencesRevision: current.preferencesRevision + 1,
       autoLearningEnabled: enabled
     }));
+  }
+
+  setRecognitionContext(enabled: boolean, contextData: readonly { readonly text: string }[]): Promise<void> {
+    if (typeof enabled !== "boolean") return Promise.reject(new Error("The recognition context authorization is invalid."));
+    let context: ReturnType<typeof normalizeMobileVoiceRecognitionContext>;
+    try { context = normalizeMobileVoiceRecognitionContext({ contextData }); }
+    catch (error) { return Promise.reject(error); }
+    return this.#mutate((current) => enabled === current.recognitionContextEnabled
+      && JSON.stringify(context.contextData) === JSON.stringify(current.recognitionContextData) ? current : Object.freeze({
+        ...current, revision: current.revision + 1, preferencesRevision: current.preferencesRevision + 1,
+        recognitionContextEnabled: enabled, recognitionContextData: context.contextData
+      }));
   }
 
   recordVoiceStart(): Promise<void> {
@@ -232,6 +247,8 @@ function emptyDocument(revision = 0): MobileVoicePreferencesDocument {
     preferencesRevision: revision,
     refinementInstructions: "",
     autoLearningEnabled: true,
+    recognitionContextEnabled: false,
+    recognitionContextData: Object.freeze([]),
     usage: Object.freeze({
       voiceStarts: 0,
       correctionObservations: 0,
@@ -245,9 +262,10 @@ function emptyDocument(revision = 0): MobileVoicePreferencesDocument {
 function parseDocument(raw: string): MobileVoicePreferencesDocument {
   const value: unknown = JSON.parse(raw);
   if (!isRecord(value) || !hasExactKeys(value, [
-    "autoLearningEnabled", "history", "preferencesRevision", "refinementInstructions",
+    "autoLearningEnabled", "history", "preferencesRevision", "recognitionContextData", "recognitionContextEnabled", "refinementInstructions",
     "revision", "usage", "version"
-  ]) || value.version !== 1 || typeof value.autoLearningEnabled !== "boolean") throw new Error("invalid current-v1 record");
+  ]) || value.version !== 1 || typeof value.autoLearningEnabled !== "boolean" || typeof value.recognitionContextEnabled !== "boolean") throw new Error("invalid current-v1 record");
+  const recognitionContext = normalizeMobileVoiceRecognitionContext({ contextData: value.recognitionContextData });
   const revision = nonNegativeInteger(value.revision);
   const preferencesRevision = nonNegativeInteger(value.preferencesRevision);
   const refinementInstructions = normalizeInstructions(value.refinementInstructions);
@@ -261,6 +279,8 @@ function parseDocument(raw: string): MobileVoicePreferencesDocument {
     preferencesRevision,
     refinementInstructions,
     autoLearningEnabled: value.autoLearningEnabled,
+    recognitionContextEnabled: value.recognitionContextEnabled,
+    recognitionContextData: recognitionContext.contextData,
     usage,
     history
   });

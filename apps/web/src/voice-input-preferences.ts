@@ -1,3 +1,4 @@
+import { voiceInputRecognitionContextFromTexts, type VoiceInputRecognitionContextView } from "@joko/contracts";
 import {
   appShortcutCombosEqual,
   currentAppShortcutPlatform,
@@ -43,6 +44,8 @@ export interface VoiceInputPreferences {
   readonly deviceId?: string;
   readonly shortcut: VoiceInputShortcutPreference;
   readonly refinementInstructions: string;
+  readonly recognitionContextEnabled: boolean;
+  readonly contextData: readonly string[];
   readonly autoDictionaryEnabled: boolean;
   readonly playInteractionSound: boolean;
   readonly fastActivationEnabled: boolean;
@@ -53,6 +56,8 @@ export const DEFAULT_VOICE_INPUT_PREFERENCES: VoiceInputPreferences = Object.fre
   locale: "auto",
   shortcut: defaultVoiceInputShortcut(),
   refinementInstructions: "",
+  recognitionContextEnabled: false,
+  contextData: Object.freeze([]),
   autoDictionaryEnabled: true,
   playInteractionSound: true,
   fastActivationEnabled: false,
@@ -63,7 +68,8 @@ export const MAXIMUM_VOICE_REFINEMENT_INSTRUCTIONS_CHARACTERS = 1_000;
 export const MAXIMUM_VOICE_DICTIONARY_TERM_CHARACTERS = 120;
 export const MAXIMUM_VOICE_DICTIONARY_TERMS = 1_000;
 export const MAXIMUM_VOICE_DICTIONARY_CSV_BYTES = 5 * 1024 * 1024;
-export const VOICE_INPUT_LOCALES = Object.freeze(["zh-CN", "zh-TW", "en", "ja", "ko"] as const);
+export const VOICE_INPUT_LOCALES = Object.freeze(["zh-CN", "zh-TW", "en", "ja", "ko", "id-ID", "es-MX", "pt-BR", "de-DE", "fr-FR",
+  "fil-PH", "ms-MY", "th-TH", "ar-SA", "it-IT", "bn-BD", "el-GR", "nl-NL", "ru-RU", "tr-TR", "vi-VN", "pl-PL", "ro-RO", "ne-NP", "uk-UA", "yue-CN"] as const);
 
 export type VoiceDictionaryCsvParseResult =
   | { readonly ok: true; readonly terms: readonly string[]; readonly duplicateRows: number; readonly skippedTooLong: number }
@@ -86,8 +92,16 @@ export function writeVoiceInputPreferences(
   patch: Partial<VoiceInputPreferences>,
   storage: Pick<Storage, "getItem" | "setItem"> | undefined = browserStorage()
 ): VoiceInputPreferences {
+  if (hasInvalidStoredVoiceInputPreferences(storage)) throw new TypeError("Reset incompatible voice preferences before saving.");
   const current = readVoiceInputPreferences(storage);
   const next = normalizeWritableVoiceInputPreferences({ ...current, ...patch });
+  if (storage !== undefined) storage.setItem(STORAGE_KEY, JSON.stringify(next));
+  if (typeof window !== "undefined") window.dispatchEvent(new CustomEvent(CHANGE_EVENT, { detail: next }));
+  return next;
+}
+
+export function resetVoiceInputPreferences(storage: Pick<Storage, "setItem"> | undefined = browserStorage()): VoiceInputPreferences {
+  const next = DEFAULT_VOICE_INPUT_PREFERENCES;
   if (storage !== undefined) storage.setItem(STORAGE_KEY, JSON.stringify(next));
   if (typeof window !== "undefined") window.dispatchEvent(new CustomEvent(CHANGE_EVENT, { detail: next }));
   return next;
@@ -117,6 +131,17 @@ export function voiceInputLocale(preferences: Pick<VoiceInputPreferences, "local
   } catch {
     return undefined;
   }
+}
+
+export function voiceInputRecognitionContext(preferences: Pick<VoiceInputPreferences, "recognitionContextEnabled" | "contextData">): VoiceInputRecognitionContextView | undefined {
+  return preferences.recognitionContextEnabled ? voiceInputRecognitionContextFromTexts(preferences.contextData) : undefined;
+}
+
+export function hasInvalidStoredVoiceInputPreferences(storage: Pick<Storage, "getItem"> | undefined = browserStorage()): boolean {
+  try {
+    const value = storage?.getItem(STORAGE_KEY);
+    return value != null && parseVoiceInputPreferences(JSON.parse(value)) === DEFAULT_VOICE_INPUT_PREFERENCES;
+  } catch { return true; }
 }
 
 export function matchesVoiceInputShortcut(
@@ -201,20 +226,26 @@ export function parseVoiceInputPreferences(value: unknown): VoiceInputPreference
   const candidate = value as Record<string, unknown>;
   const keys = Object.keys(candidate).sort().join(",");
   if (
-    (keys !== "autoDictionaryEnabled,fastActivationEnabled,locale,muteOtherSounds,playInteractionSound,refinementInstructions,shortcut"
-      && keys !== "autoDictionaryEnabled,deviceId,fastActivationEnabled,locale,muteOtherSounds,playInteractionSound,refinementInstructions,shortcut")
+    (keys !== "autoDictionaryEnabled,contextData,fastActivationEnabled,locale,muteOtherSounds,playInteractionSound,recognitionContextEnabled,refinementInstructions,shortcut"
+      && keys !== "autoDictionaryEnabled,contextData,deviceId,fastActivationEnabled,locale,muteOtherSounds,playInteractionSound,recognitionContextEnabled,refinementInstructions,shortcut")
     || typeof candidate["autoDictionaryEnabled"] !== "boolean"
     || typeof candidate["playInteractionSound"] !== "boolean"
     || typeof candidate["fastActivationEnabled"] !== "boolean"
     || typeof candidate["muteOtherSounds"] !== "boolean"
     || typeof candidate["locale"] !== "string"
+    || typeof candidate["recognitionContextEnabled"] !== "boolean"
+    || !Array.isArray(candidate["contextData"])
   ) return DEFAULT_VOICE_INPUT_PREFERENCES;
   const locale = normalizeLocale(candidate["locale"]);
   const shortcut = normalizeVoiceInputShortcut(candidate["shortcut"]);
   const deviceId = normalizeDeviceId(candidate["deviceId"]);
   const refinementInstructions = normalizeRefinementInstructions(candidate["refinementInstructions"]);
+  let contextData: readonly string[];
+  try { contextData = normalizedContextData(candidate["contextData"]); }
+  catch { return DEFAULT_VOICE_INPUT_PREFERENCES; }
   if (
     locale !== candidate["locale"]
+    || contextData.some((text, index) => text !== (candidate["contextData"] as unknown[])[index])
     || shortcut === undefined
     || (Object.hasOwn(candidate, "deviceId") && deviceId !== candidate["deviceId"])
     || (Object.hasOwn(candidate, "refinementInstructions") && refinementInstructions !== candidate["refinementInstructions"])
@@ -224,6 +255,8 @@ export function parseVoiceInputPreferences(value: unknown): VoiceInputPreference
     shortcut,
     ...(deviceId === undefined ? {} : { deviceId }),
     refinementInstructions,
+    contextData,
+    recognitionContextEnabled: candidate["recognitionContextEnabled"],
     autoDictionaryEnabled: candidate["autoDictionaryEnabled"],
     playInteractionSound: candidate["playInteractionSound"],
     fastActivationEnabled: candidate["fastActivationEnabled"],
@@ -236,6 +269,7 @@ function normalizeWritableVoiceInputPreferences(value: Partial<VoiceInputPrefere
   const shortcut = normalizeVoiceInputShortcut(value.shortcut) ?? defaultVoiceInputShortcut();
   const deviceId = normalizeDeviceId(value.deviceId);
   const refinementInstructions = normalizeRefinementInstructions(value.refinementInstructions);
+  const contextData = normalizedContextData(value.contextData ?? []);
   const playInteractionSound = value.playInteractionSound !== false;
   const fastActivationEnabled = value.fastActivationEnabled === true;
   const muteOtherSounds = value.muteOtherSounds !== false;
@@ -244,11 +278,19 @@ function normalizeWritableVoiceInputPreferences(value: Partial<VoiceInputPrefere
     shortcut,
     ...(deviceId === undefined ? {} : { deviceId }),
     refinementInstructions,
+    contextData,
+    recognitionContextEnabled: value.recognitionContextEnabled === true,
     autoDictionaryEnabled: value.autoDictionaryEnabled !== false,
     playInteractionSound,
     fastActivationEnabled,
     muteOtherSounds
   });
+}
+
+function normalizedContextData(values: readonly unknown[]): readonly string[] {
+  if (values.some((value) => typeof value !== "string")) throw new TypeError("Recognition context text is invalid.");
+  const texts = values as readonly string[];
+  return Object.freeze(voiceInputRecognitionContextFromTexts(texts)?.contextData.map((item) => item.text) ?? []);
 }
 
 function normalizeVoiceInputShortcut(value: unknown): VoiceInputShortcutPreference | undefined {
@@ -331,7 +373,8 @@ function normalizeLocale(value: unknown): string {
     if (locale === undefined) return "auto";
     if (locale === "zh-CN" || locale === "zh-TW") return locale;
     const language = new Intl.Locale(locale).language.toLocaleLowerCase("en-US");
-    return VOICE_INPUT_LOCALES.includes(language as typeof VOICE_INPUT_LOCALES[number]) ? language : "auto";
+    if (language === "en" || language === "ja" || language === "ko") return language;
+    return VOICE_INPUT_LOCALES.includes(locale as typeof VOICE_INPUT_LOCALES[number]) ? locale : "auto";
   } catch {
     return "auto";
   }

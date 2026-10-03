@@ -4,6 +4,7 @@ import {
   VoiceInputState as ProtoVoiceInputState,
   VoiceInputTerminalOutcome as ProtoVoiceInputTerminalOutcome,
   VoiceInputTextSource as ProtoVoiceInputTextSource,
+  voiceInputRecognitionLocale,
   type VoiceInputCapabilityProfile as ProtoVoiceInputCapabilityProfile,
   type VoiceInputSession as ProtoVoiceInputSession
 } from "@joko/contracts";
@@ -12,6 +13,7 @@ import type {
   MobileVoiceDictionaryLearningAction
 } from "./mobile-voice-dictionary";
 import type { MobileVoiceDictionaryApi } from "./mobile-voice-dictionary-service";
+import { normalizeMobileVoiceRecognitionContext, type MobileVoiceRecognitionContext } from "./mobile-voice-recognition-context";
 
 const TERMINAL_POLL_INTERVAL_MS = 180;
 const IDENTIFIER_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
@@ -42,6 +44,11 @@ export interface MobileVoiceCapability {
   readonly supportsLocale: boolean;
   readonly supportsLiveDrafts: boolean;
   readonly supportsRefinement: boolean;
+  readonly supportsRecognitionContext: boolean;
+  readonly recognitionContextMaximumItems: number;
+  readonly recognitionContextMaximumItemBytes: number;
+  readonly recognitionContextMaximumBytes: number;
+  readonly supportedLocales: readonly string[];
 }
 
 export interface MobileVoiceSession {
@@ -87,7 +94,8 @@ export interface MobileVoiceTransport extends Pick<MobileVoiceDictionaryApi, "ge
     mimeType: string,
     locale?: string,
     refinement?: MobileVoiceRefinementContext,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    recognitionContext?: MobileVoiceRecognitionContext
   ): Promise<MobileVoiceSession>;
   append(
     voiceInputId: string,
@@ -165,6 +173,7 @@ export interface MobileVoiceRunOptions {
   readonly requestId: () => string;
   readonly locale?: string;
   readonly refinement?: MobileVoiceRefinementContext;
+  readonly recognitionContext?: MobileVoiceRecognitionContext;
   readonly onCapability?: (capability: MobileVoiceCapability) => void;
   readonly onUpdate?: (update: MobileVoiceRunUpdate) => void;
   readonly onCaptureStopped?: () => void;
@@ -179,6 +188,7 @@ export class MobileVoiceInputRun {
   readonly #requestId: () => string;
   readonly #locale: string | undefined;
   readonly #refinement: MobileVoiceRefinementContext | undefined;
+  #recognitionContext: MobileVoiceRecognitionContext | undefined;
   readonly #onCapability: (capability: MobileVoiceCapability) => void;
   readonly #onUpdate: (update: MobileVoiceRunUpdate) => void;
   readonly #onCaptureStopped: () => void;
@@ -210,6 +220,7 @@ export class MobileVoiceInputRun {
     this.#requestId = options.requestId;
     this.#locale = options.locale;
     this.#refinement = options.refinement;
+    this.#recognitionContext = options.recognitionContext === undefined ? undefined : normalizeMobileVoiceRecognitionContext(options.recognitionContext);
     this.#onCapability = options.onCapability ?? (() => undefined);
     this.#onUpdate = options.onUpdate ?? (() => undefined);
     this.#onCaptureStopped = options.onCaptureStopped ?? (() => undefined);
@@ -253,6 +264,13 @@ export class MobileVoiceInputRun {
         throw new MobileVoiceRunError("unsupported");
       }
       this.#capability = capability;
+      if (this.#recognitionContext !== undefined) {
+        if (!capability.supportsRecognitionContext) throw new MobileVoiceRunError("unsupported");
+        this.#recognitionContext = normalizeMobileVoiceRecognitionContext(this.#recognitionContext, {
+          maximumItems: capability.recognitionContextMaximumItems, maximumItemBytes: capability.recognitionContextMaximumItemBytes,
+          maximumBytes: capability.recognitionContextMaximumBytes
+        });
+      }
       const permission = await this.#capture.ensurePermission(abort.signal);
       if (!this.#isCurrent(generation, abort)) throw new MobileVoiceRunError("cancelled");
       if (!permission.granted) {
@@ -270,7 +288,10 @@ export class MobileVoiceInputRun {
       if (!IDENTIFIER_PATTERN.test(requestId)) throw new MobileVoiceRunError("serviceUnavailable");
       const locale = capability.supportsLocale ? normalizeMobileVoiceLocale(this.#locale, capability) : undefined;
       const refinement = capability.supportsRefinement ? this.#refinement : undefined;
-      const sessionPromise = this.#transport.start(requestId, "audio/pcm", locale, refinement, abort.signal).then(async (session) => {
+      const sessionPromise = (this.#recognitionContext === undefined
+        ? this.#transport.start(requestId, "audio/pcm", locale, refinement, abort.signal)
+        : this.#transport.start(requestId, "audio/pcm", locale, refinement, abort.signal, this.#recognitionContext)).then(async (session) => {
+        this.#recognitionContext = undefined;
         if (!this.#isCurrent(generation, abort)) {
           await this.#transport.cancel(session.id).catch(() => undefined);
           throw new MobileVoiceRunError("cancelled");
@@ -358,6 +379,7 @@ export class MobileVoiceInputRun {
     this.#stopRequested = false;
     const id = this.#session?.id;
     this.#abort?.abort();
+    this.#recognitionContext = undefined;
     this.#abort = undefined;
     this.#pollAbort?.abort();
     this.#pollAbort = undefined;
@@ -491,6 +513,7 @@ export class MobileVoiceInputRun {
   }
 
   async #finishTerminal(session: MobileVoiceSession): Promise<void> {
+    this.#recognitionContext = undefined;
     this.#pollAbort?.abort();
     this.#pollAbort = undefined;
     this.#clearPoll();
@@ -512,6 +535,7 @@ export class MobileVoiceInputRun {
   async #fail(error: MobileVoiceRunError, generation: number): Promise<void> {
     if (!this.#isGeneration(generation) || ["cancelled", "done", "error"].includes(this.#state)) return;
     ++this.#generation;
+    this.#recognitionContext = undefined;
     const id = this.#session?.id;
     this.#stopRequested = false;
     this.#abort?.abort();
@@ -642,7 +666,15 @@ export function projectMobileVoiceCapability(profile: ProtoVoiceInputCapabilityP
     },
     supportsLocale: profile.supportsLocale,
     supportsLiveDrafts: profile.supportsLiveDrafts,
-    supportsRefinement: profile.supportsRefinement
+    supportsRefinement: profile.supportsRefinement,
+    supportsRecognitionContext: profile.supportsRecognitionContext,
+    recognitionContextMaximumItems: safeNumber(profile.recognitionContextMaximumItems, "recognition context item limit"),
+    recognitionContextMaximumItemBytes: safeNumber(profile.recognitionContextMaximumItemBytes, "recognition context item byte limit"),
+    recognitionContextMaximumBytes: safeNumber(profile.recognitionContextMaximumBytes, "recognition context byte limit"),
+    supportedLocales: Object.freeze(profile.supportedLocales.map((locale) => {
+      if (!locale || locale.length > 35 || !/^[A-Za-z0-9-]+$/u.test(locale)) throw new Error("The node returned an invalid recognition language.");
+      return locale;
+    }))
   };
 }
 
@@ -699,7 +731,7 @@ function normalizeMobileVoiceLocale(value: string | undefined, capability: Mobil
   const locale = value?.trim();
   if (!locale) return undefined;
   if (locale.length > capability.limits.maximumLocaleCharacters || !/^[A-Za-z0-9-]+$/u.test(locale)) return undefined;
-  return locale;
+  return voiceInputRecognitionLocale(locale, capability);
 }
 
 function isMobileVoiceTerminal(session: MobileVoiceSession): boolean {

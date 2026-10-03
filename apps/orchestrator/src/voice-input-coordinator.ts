@@ -6,6 +6,9 @@ import {
   MAXIMUM_AUDIO_CHUNK_DURATION_MS,
   MAXIMUM_AUDIO_DURATION_MS,
   MAXIMUM_LOCALE_CHARACTERS,
+  MAXIMUM_RECOGNITION_CONTEXT_ITEMS,
+  MAXIMUM_RECOGNITION_CONTEXT_ITEM_BYTES,
+  MAXIMUM_RECOGNITION_CONTEXT_BYTES,
   VoiceInputBoundsError,
   VoiceInputController,
   VoiceInputOperationError,
@@ -13,7 +16,9 @@ import {
   normalizeLocale,
   normalizeMimeType,
   normalizeRefinementInstructions,
+  normalizeRecognitionContext,
   type AsrProvider,
+  type AsrRecognitionContext,
   type SupportedAudioMimeType,
   type VoiceRefiner,
   type VoiceInputFailure,
@@ -33,6 +38,8 @@ export interface VoiceInputProviderCapability {
   readonly support: VoiceInputCapabilitySupport;
   readonly mimeTypes: readonly string[];
   readonly supportsLocale: boolean;
+  readonly supportedLocales?: readonly string[];
+  readonly supportsRecognitionContext?: boolean;
   readonly supportsLiveDrafts?: boolean;
   readonly supportsRefinement?: boolean;
 }
@@ -43,6 +50,7 @@ export interface VoiceInputProviderFactory {
   create(input: {
     readonly mimeType: SupportedAudioMimeType;
     readonly locale?: string;
+    readonly recognitionContext?: AsrRecognitionContext;
   }): Promise<AsrProvider> | AsrProvider;
   createRefiner?(input: {
     readonly locale?: string;
@@ -55,6 +63,8 @@ export interface VoiceInputCapabilitySnapshot {
   readonly support: VoiceInputCapabilitySupport;
   readonly mimeTypes: readonly SupportedAudioMimeType[];
   readonly supportsLocale: boolean;
+  readonly supportedLocales: readonly string[];
+  readonly supportsRecognitionContext: boolean;
   readonly supportsLiveDrafts: boolean;
   readonly supportsRefinement: boolean;
   readonly maximumConcurrentSessions: number;
@@ -126,6 +136,7 @@ interface VoiceInputRecord {
   updatedAt: number;
   recoveryAttempts: number;
   stallWarning: boolean;
+  disposeOwner?: () => void;
 }
 
 interface PendingStart {
@@ -141,6 +152,7 @@ export interface VoiceInputCoordinatorOptions {
   readonly maximumConcurrentSessions?: number;
   readonly terminalRetentionMs?: number;
   readonly maximumSessionAgeMs?: number;
+  readonly onOwnerRetired?: (ownerConnectionId: string, listener: () => void) => () => void;
 }
 
 const VOICE_CONTROL_ERROR_MESSAGES: Readonly<Record<VoiceInputControlErrorCode, string>> = {
@@ -168,14 +180,17 @@ export class VoiceInputCoordinator {
   private readonly maximumConcurrentSessions: number;
   private readonly terminalRetentionMs: number;
   private readonly maximumSessionAgeMs: number;
+  private readonly onOwnerRetired: VoiceInputCoordinatorOptions["onOwnerRetired"];
   private readonly sessions = new Map<string, VoiceInputRecord>();
   private readonly requests = new Map<string, string>();
   private readonly activeByOwner = new Map<string, string>();
   private readonly pendingByOwner = new Map<string, PendingStart>();
   private closed = false;
+  private providerGeneration = 0;
 
   constructor(options: VoiceInputCoordinatorOptions = {}) {
     this.provider = options.provider;
+    this.onOwnerRetired = options.onOwnerRetired;
     this.now = options.now ?? Date.now;
     this.createId = options.createId ?? randomUUID;
     this.maximumConcurrentSessions = boundedPositiveInteger(
@@ -213,6 +228,12 @@ export class VoiceInputCoordinator {
         support: "supported",
         mimeTypes,
         supportsLocale: described.supportsLocale,
+        supportedLocales: described.supportsLocale ? [...new Set((described.supportedLocales ?? []).map((locale) => {
+          const value = normalizeLocale(locale);
+          if (value === undefined) throw new VoiceInputBoundsError("locale");
+          return value;
+        }))] : [],
+        supportsRecognitionContext: described.supportsRecognitionContext ?? false,
         supportsLiveDrafts: described.supportsLiveDrafts ?? true,
         supportsRefinement: described.supportsRefinement ?? false,
         maximumConcurrentSessions: this.maximumConcurrentSessions
@@ -229,6 +250,8 @@ export class VoiceInputCoordinator {
     readonly locale?: string;
     readonly refinementInstructions?: string;
     readonly dictionaryTerms?: readonly string[];
+    readonly recognitionContext?: AsrRecognitionContext;
+    readonly signal?: AbortSignal;
   }): Promise<VoiceInputSessionSnapshot> {
     this.assertOpen();
     this.sweepExpired();
@@ -238,15 +261,18 @@ export class VoiceInputCoordinator {
     let locale: string | undefined;
     let refinementInstructions: string | undefined;
     let dictionaryTerms: readonly string[];
+    let recognitionContext: AsrRecognitionContext | undefined;
     try {
       mimeType = normalizeMimeType(input.mimeType);
       locale = normalizeLocale(input.locale);
       refinementInstructions = normalizeRefinementInstructions(input.refinementInstructions);
       dictionaryTerms = normalizeDictionaryTerms(input.dictionaryTerms);
+      recognitionContext = normalizeRecognitionContext(input.recognitionContext);
     } catch (error) {
       throw boundsControlError(error);
     }
-    const fingerprint = voiceRequestFingerprint({ mimeType, locale, refinementInstructions, dictionaryTerms });
+    if (input.signal?.aborted) throw new VoiceInputControlError("provider_unavailable");
+    const fingerprint = voiceRequestFingerprint({ mimeType, locale, refinementInstructions, dictionaryTerms, recognitionContext });
     const requestKey = `${ownerConnectionId}\u0000${requestId}`;
     const priorId = this.requests.get(requestKey);
     if (priorId !== undefined) {
@@ -274,7 +300,9 @@ export class VoiceInputCoordinator {
       mimeType,
       locale,
       refinementInstructions,
-      dictionaryTerms
+      dictionaryTerms,
+      recognitionContext,
+      ...(input.signal === undefined ? {} : { signal: input.signal })
     })
       .finally(() => {
         if (this.pendingByOwner.get(ownerConnectionId)?.promise === promise) {
@@ -348,6 +376,12 @@ export class VoiceInputCoordinator {
     return snapshot(this.ownedRecord(input.ownerConnectionId, input.voiceInputId));
   }
 
+  async retireProviderConfiguration(): Promise<void> {
+    this.providerGeneration += 1;
+    await Promise.all([...this.sessions.values()].filter((record) => record.outcome === undefined)
+      .map((record) => record.controller?.cancel().catch(() => undefined)));
+  }
+
   async close(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
@@ -368,6 +402,8 @@ export class VoiceInputCoordinator {
     readonly locale?: string;
     readonly refinementInstructions?: string;
     readonly dictionaryTerms: readonly string[];
+    readonly recognitionContext?: AsrRecognitionContext;
+    readonly signal?: AbortSignal;
   }): Promise<VoiceInputSessionSnapshot> {
     const capability = this.capabilities();
     if (capability.support !== "supported") {
@@ -377,6 +413,9 @@ export class VoiceInputCoordinator {
     }
     if (!capability.mimeTypes.includes(input.mimeType)) throw new VoiceInputControlError("not_supported");
     if (input.locale !== undefined && !capability.supportsLocale) throw new VoiceInputControlError("not_supported");
+    if (input.locale !== undefined && capability.supportedLocales.length > 0
+      && !capability.supportedLocales.includes(input.locale)) throw new VoiceInputControlError("not_supported");
+    if (input.recognitionContext !== undefined && !capability.supportsRecognitionContext) throw new VoiceInputControlError("not_supported");
     if (
       [...this.sessions.values()].filter(({ outcome }) => outcome === undefined).length +
       this.pendingByOwner.size >= this.maximumConcurrentSessions
@@ -386,12 +425,32 @@ export class VoiceInputCoordinator {
 
     let provider: AsrProvider;
     let refiner: VoiceRefiner | undefined;
+    const providerGeneration = this.providerGeneration;
+    let retired = input.signal?.aborted === true;
+    let activeController: VoiceInputController | undefined;
+    const retire = (): void => { retired = true; void activeController?.cancel().catch(() => undefined); };
+    const disposeOwner = this.onOwnerRetired?.(input.ownerConnectionId, retire);
+    input.signal?.addEventListener("abort", retire, { once: true });
+    if (retired) {
+      disposeOwner?.();
+      input.signal?.removeEventListener("abort", retire);
+      throw new VoiceInputControlError("provider_unavailable");
+    }
     try {
       provider = await this.provider!.create({
         mimeType: input.mimeType,
-        ...(input.locale === undefined ? {} : { locale: input.locale })
+        ...(input.locale === undefined ? {} : { locale: input.locale }),
+        ...(input.recognitionContext === undefined ? {} : { recognitionContext: input.recognitionContext })
       });
     } catch {
+      disposeOwner?.();
+      input.signal?.removeEventListener("abort", retire);
+      throw new VoiceInputControlError("provider_unavailable");
+    }
+    if (this.closed || retired || providerGeneration !== this.providerGeneration) {
+      disposeOwner?.();
+      input.signal?.removeEventListener("abort", retire);
+      await provider.stop().catch(() => undefined);
       throw new VoiceInputControlError("provider_unavailable");
     }
     try {
@@ -405,13 +464,17 @@ export class VoiceInputCoordinator {
       // its independently authenticated route disappears at session start.
       refiner = undefined;
     }
-    if (this.closed) {
+    if (this.closed || retired || providerGeneration !== this.providerGeneration) {
+      disposeOwner?.();
+      input.signal?.removeEventListener("abort", retire);
       await provider.stop().catch(() => undefined);
       throw new VoiceInputControlError("provider_unavailable");
     }
 
     const id = requireIdentifier(this.createId());
     if (this.sessions.has(id)) {
+      disposeOwner?.();
+      input.signal?.removeEventListener("abort", retire);
       await provider.stop().catch(() => undefined);
       throw new VoiceInputControlError("provider_unavailable");
     }
@@ -429,7 +492,8 @@ export class VoiceInputCoordinator {
       updatedAt: createdAt,
       recoveryAttempts: 0,
       stallWarning: false,
-      resultRevision: 0
+      resultRevision: 0,
+      ...(disposeOwner === undefined ? {} : { disposeOwner })
     };
     const touch = (): void => { record.updatedAt = this.now(); };
     let controller: VoiceInputController;
@@ -442,6 +506,8 @@ export class VoiceInputCoordinator {
         onStateChanged: (state, outcome) => {
           record.state = state;
           if (outcome !== undefined) {
+            record.disposeOwner?.();
+            delete record.disposeOwner;
             record.outcome = outcome;
             record.draft = undefined;
             if (this.activeByOwner.get(record.ownerConnectionId) === record.id) {
@@ -498,10 +564,13 @@ export class VoiceInputCoordinator {
         }
       });
     } catch {
+      disposeOwner?.();
+      input.signal?.removeEventListener("abort", retire);
       await provider.stop().catch(() => undefined);
       throw new VoiceInputControlError("provider_unavailable");
     }
     record.controller = controller;
+    activeController = controller;
     this.sessions.set(id, record);
     this.requests.set(input.requestKey, id);
     this.activeByOwner.set(input.ownerConnectionId, id);
@@ -512,6 +581,12 @@ export class VoiceInputCoordinator {
         this.remove(record);
         throw new VoiceInputControlError("provider_unavailable");
       }
+    } finally {
+      input.signal?.removeEventListener("abort", retire);
+    }
+    if (retired || providerGeneration !== this.providerGeneration) {
+      await controller.cancel();
+      throw new VoiceInputControlError("provider_unavailable");
     }
     return snapshot(record);
   }
@@ -536,6 +611,8 @@ export class VoiceInputCoordinator {
   }
 
   private remove(record: VoiceInputRecord): void {
+    record.disposeOwner?.();
+    delete record.disposeOwner;
     record.controller?.detach();
     this.sessions.delete(record.id);
     if (this.requests.get(record.requestKey) === record.id) this.requests.delete(record.requestKey);
@@ -558,6 +635,9 @@ export const VOICE_INPUT_LIMITS = Object.freeze({
   maximumAudioChunkDurationMs: MAXIMUM_AUDIO_CHUNK_DURATION_MS,
   maximumAudioDurationMs: MAXIMUM_AUDIO_DURATION_MS,
   maximumLocaleCharacters: MAXIMUM_LOCALE_CHARACTERS,
+  recognitionContextMaximumItems: MAXIMUM_RECOGNITION_CONTEXT_ITEMS,
+  recognitionContextMaximumItemBytes: MAXIMUM_RECOGNITION_CONTEXT_ITEM_BYTES,
+  recognitionContextMaximumBytes: MAXIMUM_RECOGNITION_CONTEXT_BYTES,
   stableWaitMs: DEFAULT_STABLE_WAIT_MS
 });
 
@@ -569,6 +649,8 @@ function unsupportedCapability(
     support,
     mimeTypes: [],
     supportsLocale: false,
+    supportedLocales: [],
+    supportsRecognitionContext: false,
     supportsLiveDrafts: false,
     supportsRefinement: false,
     maximumConcurrentSessions
@@ -609,6 +691,7 @@ function voiceRequestFingerprint(input: {
   readonly locale?: string;
   readonly refinementInstructions?: string;
   readonly dictionaryTerms: readonly string[];
+  readonly recognitionContext?: AsrRecognitionContext;
 }): string {
   return createHash("sha256")
     .update(input.mimeType)
@@ -618,6 +701,8 @@ function voiceRequestFingerprint(input: {
     .update(input.refinementInstructions ?? "")
     .update("\0")
     .update(JSON.stringify(input.dictionaryTerms))
+    .update("\0")
+    .update(JSON.stringify(input.recognitionContext ?? null))
     .digest("hex");
 }
 
