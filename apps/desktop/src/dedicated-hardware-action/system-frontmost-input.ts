@@ -47,13 +47,19 @@ export type PlatformSystemFrontmostInput =
     readonly runner: SystemFrontmostInputRunner;
     readonly wheelNotch: number;
   }
-  | { readonly status: "unsupported"; readonly reason: "platform" | "helper-unavailable" };
+  | { readonly status: "unsupported"; readonly reason: "platform" | "helper-unavailable" | "session-unsupported" };
+
+export interface LinuxSystemFrontmostSession {
+  readonly sessionType: string | undefined;
+  readonly waylandDisplay: string | undefined;
+}
 
 export interface PlatformSystemFrontmostInputOptions {
   readonly platform: NodeJS.Platform;
   readonly windowsHelper?: NativeSystemFrontmostInputHelper;
   readonly macHelper?: NativeSystemFrontmostInputHelper;
   readonly linuxHelper?: NativeSystemFrontmostInputHelper;
+  readonly linuxSession?: LinuxSystemFrontmostSession;
   readonly currentProcessId?: number;
 }
 
@@ -73,6 +79,10 @@ export function createPlatformSystemFrontmostInput(
   const helper = options.platform === "win32" ? options.windowsHelper
     : options.platform === "darwin" ? options.macHelper : options.linuxHelper;
   if (helper === undefined) return Object.freeze({ status: "unsupported", reason: "helper-unavailable" });
+  if (options.platform === "linux" && (options.linuxSession?.sessionType !== "x11"
+      || (options.linuxSession.waylandDisplay !== undefined && options.linuxSession.waylandDisplay !== ""))) {
+    return Object.freeze({ status: "unsupported", reason: "session-unsupported" });
+  }
   return Object.freeze({
     status: "available",
     wheelNotch: options.platform === "win32" ? SYSTEM_FRONTMOST_WINDOWS_WHEEL_NOTCH : 0,

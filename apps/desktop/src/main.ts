@@ -8741,12 +8741,16 @@ async function initializeDedicatedHardwareInput(): Promise<void> {
   });
   const systemFrontmost = createPlatformSystemFrontmostInput({
     platform: process.platform,
+    linuxSession: {
+      sessionType: process.env.XDG_SESSION_TYPE,
+      waylandDisplay: process.env.WAYLAND_DISPLAY
+    },
     ...(nativeHelper === undefined ? {} : process.platform === "win32"
       ? { windowsHelper: nativeHelper }
       : process.platform === "darwin" ? { macHelper: nativeHelper }
       : process.platform === "linux" ? { linuxHelper: nativeHelper } : {})
   });
-  if (packagedSmoke && (process.platform === "win32" || process.platform === "darwin")) {
+  if (packagedSmoke && (process.platform === "win32" || process.platform === "darwin" || process.platform === "linux")) {
     if (systemFrontmost.status !== "available") throw new Error("Native foreground sampler was not admitted by Main.");
     process.stdout.write("JOKO_DESKTOP_FRONTMOST_INPUT_READY\n");
   }

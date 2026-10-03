@@ -61,14 +61,25 @@ bool SameProcess(const ProcessInstance& first, const ProcessInstance& second) {
   return first.process == second.process && first.start_ticks == second.start_ticks;
 }
 
+struct ExecutableIdentity {
+  dev_t device;
+  ino_t inode;
+};
+
+bool SameExecutable(const ExecutableIdentity& first, const ExecutableIdentity& second) {
+  return first.device == second.device && first.inode == second.inode;
+}
+
 struct ServerPeer {
   ProcessInstance instance;
+  ExecutableIdentity executable;
   uid_t user;
   gid_t group;
 };
 
 bool SamePeer(const ServerPeer& first, const ServerPeer& second) {
-  return SameProcess(first.instance, second.instance) && first.user == second.user && first.group == second.group;
+  return SameProcess(first.instance, second.instance) && SameExecutable(first.executable, second.executable) &&
+      first.user == second.user && first.group == second.group;
 }
 
 struct ServerIdentity {
@@ -348,6 +359,30 @@ bool ReadProcessInstance(pid_t process, Deadline deadline, ProcessInstance* inst
   return true;
 }
 
+bool ReadServerExecutable(pid_t process, Deadline deadline, ExecutableIdentity* identity) {
+  if (process <= 0 || Clock::now() >= deadline) return false;
+  const std::string path = "/proc/" + std::to_string(process) + "/exe";
+  const Descriptor executable(open(path.c_str(), O_PATH | O_CLOEXEC));
+  struct stat metadata{};
+  if (executable.get() < 0 || fstat(executable.get(), &metadata) != 0 ||
+      !S_ISREG(metadata.st_mode) || metadata.st_ino == 0 || Clock::now() >= deadline) return false;
+  const std::string descriptor_path = "/proc/self/fd/" + std::to_string(executable.get());
+  char resolved[4096];
+  const ssize_t length = readlink(descriptor_path.c_str(), resolved, sizeof(resolved) - 1);
+  if (length <= 0 || length >= static_cast<ssize_t>(sizeof(resolved) - 1) || Clock::now() >= deadline) return false;
+  resolved[length] = '\0';
+  const char* basename = std::strrchr(resolved, '/');
+  // Classification comes from the opened executable itself, not argv, comm or a mutable wrapper path.
+  if (basename == nullptr || (std::strcmp(basename + 1, "Xorg") != 0 &&
+      std::strcmp(basename + 1, "Xvnc") != 0 &&
+      std::strcmp(basename + 1, "Xtigervnc") != 0 &&
+      std::strcmp(basename + 1, "Xtightvnc") != 0 &&
+      std::strcmp(basename + 1, "Xvfb") != 0 &&
+      std::strcmp(basename + 1, "Xfbdev") != 0)) return false;
+  *identity = {metadata.st_dev, metadata.st_ino};
+  return true;
+}
+
 bool NativeServer(int descriptor, Deadline deadline, ServerPeer* identity) {
   ucred peer{};
   socklen_t size = sizeof(peer);
@@ -356,26 +391,19 @@ bool NativeServer(int descriptor, Deadline deadline, ServerPeer* identity) {
       size != sizeof(peer) || peer.pid <= 0) return false;
   ProcessInstance first{};
   ProcessInstance second{};
-  if (!ReadProcessInstance(peer.pid, deadline, &first)) return false;
-  const std::string path = "/proc/" + std::to_string(peer.pid) + "/exe";
-  char executable[4096];
-  const ssize_t length = readlink(path.c_str(), executable, sizeof(executable) - 1);
-  if (length <= 0 || length >= static_cast<ssize_t>(sizeof(executable) - 1) || Clock::now() >= deadline) return false;
-  executable[length] = '\0';
-  const char* basename = std::strrchr(executable, '/');
-  // An Xwayland peer cannot prove the global foreground of its compositor.
-  // Independent Xvnc, Xtigervnc and Xvfb provide X11 displays subject to the same live capabilities.
-  if (basename == nullptr || (std::strcmp(basename + 1, "Xorg") != 0 &&
-      std::strcmp(basename + 1, "Xvnc") != 0 &&
-      std::strcmp(basename + 1, "Xtigervnc") != 0 &&
-      std::strcmp(basename + 1, "Xvfb") != 0) ||
-      !ReadProcessInstance(peer.pid, deadline, &second) || !SameProcess(first, second)) return false;
+  ExecutableIdentity first_executable{};
+  ExecutableIdentity second_executable{};
+  if (!ReadProcessInstance(peer.pid, deadline, &first) ||
+      !ReadServerExecutable(peer.pid, deadline, &first_executable)) return false;
   ucred confirmation{};
   size = sizeof(confirmation);
   if (Clock::now() >= deadline ||
       getsockopt(descriptor, SOL_SOCKET, SO_PEERCRED, &confirmation, &size) != 0 || size != sizeof(confirmation) ||
       confirmation.pid != peer.pid || confirmation.uid != peer.uid || confirmation.gid != peer.gid) return false;
-  *identity = {first, peer.uid, peer.gid};
+  if (!ReadServerExecutable(peer.pid, deadline, &second_executable) ||
+      !ReadProcessInstance(peer.pid, deadline, &second) || !SameProcess(first, second) ||
+      !SameExecutable(first_executable, second_executable)) return false;
+  *identity = {first, first_executable, peer.uid, peer.gid};
   return true;
 }
 
@@ -420,6 +448,12 @@ class Connection {
     if (!Healthy()) return false;
     const xcb_setup_t* setup = xcb_get_setup(connection_);
     if (setup == nullptr || setup->status != 1 || setup->protocol_major_version != 11) return false;
+    constexpr char kXwaylandExtension[] = "XWAYLAND";
+    const auto xwayland_cookie = xcb_query_extension(connection_, sizeof(kXwaylandExtension) - 1,
+        kXwaylandExtension);
+    const auto xwayland = ReadReply<xcb_query_extension_reply_t>(xwayland_cookie.sequence);
+    // Only Xwayland initializes this extension; it cannot prove the compositor's global foreground.
+    if (!xwayland || xwayland->present != 0) return false;
     auto roots = xcb_setup_roots_iterator(setup);
     while (screen-- > 0 && roots.rem > 0) xcb_screen_next(&roots);
     if (roots.rem == 0 || roots.data == nullptr || roots.data->root == XCB_NONE) return false;
