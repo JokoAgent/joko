@@ -289,8 +289,16 @@ export function Timeline({ ownerKey, viewportOwnerKey, sessionId, sessionName, w
   const scrollRef = useRef<HTMLDivElement>(null);
   const contentRef = useRef<HTMLDivElement>(null);
   const previousMessageJump = usePreviousUserMessageJump({ scrollRef, userMessageIds, resetKey: viewportOwnerKey });
-  const [following, setFollowing] = useState(restoredViewport.following);
-  const [unreadCount, setUnreadCount] = useState(restoredViewport.unreadCount);
+  const [followingState, setFollowingState] = useState({ ownerKey: viewportOwnerKey, value: restoredViewport.following });
+  const [unreadState, setUnreadState] = useState({ ownerKey: viewportOwnerKey, value: restoredViewport.unreadCount });
+  const following = followingState.ownerKey === viewportOwnerKey ? followingState.value : restoredViewport.following;
+  const unreadCount = unreadState.ownerKey === viewportOwnerKey ? unreadState.value : restoredViewport.unreadCount;
+  const setFollowing = useCallback((value: boolean): void => {
+    if (viewportOwnerRef.current === viewportOwnerKey) setFollowingState({ ownerKey: viewportOwnerKey, value });
+  }, [viewportOwnerKey]);
+  const setUnreadCount = useCallback((value: number): void => {
+    if (viewportOwnerRef.current === viewportOwnerKey) setUnreadState({ ownerKey: viewportOwnerKey, value });
+  }, [viewportOwnerKey]);
   const [focusedItemId, setFocusedItemId] = useState<string>();
   const [nearHistoryStart, setNearHistoryStart] = useState(true);
   const followingRef = useRef(restoredViewport.following);
@@ -309,8 +317,6 @@ export function Timeline({ ownerKey, viewportOwnerKey, sessionId, sessionName, w
     maximumSequenceRef.current = restoredViewport.maximumSequence;
     viewportAnchorRef.current = restoredViewport.anchorItemId === undefined ? undefined : { itemId: restoredViewport.anchorItemId, offset: restoredViewport.anchorOffset };
     restoreAnchorRef.current = restoredViewport.following ? undefined : viewportAnchorRef.current;
-    setFollowing(restoredViewport.following);
-    setUnreadCount(restoredViewport.unreadCount);
   }
   const followLatestSignalRef = useRef(followLatestSignal);
   const previousScrollTopRef = useRef(0);
@@ -369,6 +375,13 @@ export function Timeline({ ownerKey, viewportOwnerKey, sessionId, sessionName, w
     overscan: 8,
     getItemKey: (index) => renderItems[index]?.key ?? index
   });
+  const positionVirtualRow = useCallback((index: number, align: "start" | "center"): void => {
+    if (!navigationDocumentActiveRef.current) return;
+    const offset = virtualizer.getOffsetForIndex(index, align)?.[0];
+    // Timeline owns subsequent alignment and cancellation; the virtualizer's
+    // scrollToIndex retries can otherwise outlive the original navigation.
+    if (offset !== undefined) virtualizer.scrollToOffset(offset, { behavior: "auto" });
+  }, [virtualizer]);
   const lastItem = items.at(-1);
   const virtualRows = virtualizer.getVirtualItems();
   const renderedRowsKey = virtualRows.map((row) => row.key).join("\u0000");
@@ -591,7 +604,7 @@ export function Timeline({ ownerKey, viewportOwnerKey, sessionId, sessionName, w
       setUnreadCount(0);
     }
     saveViewport(next, next ? 0 : unreadCountRef.current);
-  }, [saveViewport]);
+  }, [saveViewport, setFollowing, setUnreadCount]);
 
   const jumpToMessageNavEntry = useCallback((itemId: string): void => {
     const node = scrollRef.current;
@@ -605,7 +618,7 @@ export function Timeline({ ownerKey, viewportOwnerKey, sessionId, sessionName, w
     restoreAnchorRef.current = undefined;
     setTimelineFollowing(false);
     programmaticScrollUntilRef.current = performance.now() + 650;
-    virtualizer.scrollToIndex(index, { align: "start" });
+    positionVirtualRow(index, "start");
     let attempts = 0;
     const align = (): void => {
       if (!navigationDocumentActiveRef.current || navigationOwnerRef.current !== owner || navigationGenerationRef.current !== generation) return;
@@ -625,7 +638,7 @@ export function Timeline({ ownerKey, viewportOwnerKey, sessionId, sessionName, w
       viewportAnchorRef.current = { itemId, offset: 12 };
     };
     navigationFrameRef.current = requestAnimationFrame(align);
-  }, [cancelTimelineNavigation, reducedMotion, renderItems, setTimelineFollowing, virtualizer, writeScrollTop]);
+  }, [cancelTimelineNavigation, positionVirtualRow, reducedMotion, renderItems, setTimelineFollowing, writeScrollTop]);
   const previousMessageEntry = previousMessageJump.displayId === null
     ? undefined
     : messageNavEntries.find((entry) => entry.id === previousMessageJump.displayId);
@@ -746,7 +759,7 @@ export function Timeline({ ownerKey, viewportOwnerKey, sessionId, sessionName, w
   useEffect(() => {
     saveViewport(followingRef.current, unreadCountRef.current);
     setUnreadCount(unreadCountRef.current);
-  }, [items, saveViewport]);
+  }, [items, saveViewport, setUnreadCount]);
 
   useLayoutEffect(() => {
     const desired = restoreAnchorRef.current;
@@ -760,7 +773,7 @@ export function Timeline({ ownerKey, viewportOwnerKey, sessionId, sessionName, w
     const row = [...node.querySelectorAll<HTMLElement>("[data-timeline-item-id]")].find((candidate) => timelineRowContains(candidate, desired.itemId));
     if (row === undefined) {
       programmaticScrollUntilRef.current = performance.now() + 100;
-      virtualizer.scrollToIndex(index, { align: "start" });
+      positionVirtualRow(index, "start");
       return;
     }
     const currentOffset = row.getBoundingClientRect().top - node.getBoundingClientRect().top;
@@ -769,7 +782,7 @@ export function Timeline({ ownerKey, viewportOwnerKey, sessionId, sessionName, w
     viewportAnchorRef.current = desired;
     if (Math.abs(nextScrollTop - node.scrollTop) >= 0.5) writeScrollTop(nextScrollTop);
     else captureViewportAnchor();
-  }, [captureViewportAnchor, items, renderItems, renderedRowsKey, viewportOwnerKey, virtualizer, writeScrollTop]);
+  }, [captureViewportAnchor, items, positionVirtualRow, renderItems, renderedRowsKey, viewportOwnerKey, writeScrollTop]);
 
   useLayoutEffect(() => {
     if (focusRequest === undefined) {
@@ -790,7 +803,7 @@ export function Timeline({ ownerKey, viewportOwnerKey, sessionId, sessionName, w
       .find((candidate) => timelineRowContains(candidate, focusRequest.itemId));
     if (row === undefined) {
       programmaticScrollUntilRef.current = performance.now() + 100;
-      virtualizer.scrollToIndex(index, { align: "center" });
+      positionVirtualRow(index, "center");
       return;
     }
     handledFocusRequestRef.current = focusRequest.requestId;
@@ -814,7 +827,7 @@ export function Timeline({ ownerKey, viewportOwnerKey, sessionId, sessionName, w
       focusTimerRef.current = undefined;
       setFocusedItemId((current) => current === focusRequest.itemId ? undefined : current);
     }, 2_400);
-  }, [cancelTimelineNavigation, focusRequest, items, ownerKey, reducedMotion, renderItems, renderedRowsKey, sessionId, setTimelineFollowing, virtualizer, writeScrollTop]);
+  }, [cancelTimelineNavigation, focusRequest, items, ownerKey, positionVirtualRow, reducedMotion, renderItems, renderedRowsKey, sessionId, setTimelineFollowing, writeScrollTop]);
 
   useEffect(() => {
     const content = contentRef.current;
