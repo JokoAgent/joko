@@ -1,4 +1,4 @@
-import { getFontEmbedCSS, toSvg } from "html-to-image";
+import { toSvg } from "html-to-image";
 import { assertBrowserActionCurrent, type BrowserActionContext } from "../browser-action.js";
 
 const MAX_EDGE = 4_096;
@@ -68,9 +68,125 @@ function mathSource(node: Element): string | undefined {
 
 function copyStyle(source: CSSStyleDeclaration, target: CSSStyleDeclaration): void {
   for (let index = 0; index < source.length; index += 1) {
-    const name = source.item(index);
+    const name = typeof source.item === "function" ? source.item(index) : source[index]!;
     target.setProperty(name, source.getPropertyValue(name), source.getPropertyPriority(name));
   }
+}
+
+function fontFamilyNames(value: string): string[] {
+  return [...value.matchAll(/(?:^|,)\s*(?:"([^"]+)"|'([^']+)'|([^,]+))/gu)]
+    .map((match) => (match[1] ?? match[2] ?? match[3] ?? "").trim().toLocaleLowerCase())
+    .filter((name) => name.length > 0);
+}
+
+function fontFaceRules(rules: CSSRuleList, output: CSSFontFaceRule[]): void {
+  for (const rule of rules) {
+    if (rule.type === 5 && "style" in rule) {
+      output.push(rule as CSSFontFaceRule);
+      continue;
+    }
+    if ("cssRules" in rule) fontFaceRules((rule as CSSGroupingRule).cssRules, output);
+  }
+}
+
+function selectedFontSource(value: string): { readonly url: string; readonly format?: string } | undefined {
+  const sources = [...value.matchAll(
+    /url\(\s*(?:"([^"]*)"|'([^']*)'|([^'"\)]*?))\s*\)\s*(?:format\(\s*(?:"([^"]*)"|'([^']*)'|([^'"\)]*?))\s*\))?/giu
+  )].map((match) => ({
+    url: (match[1] ?? match[2] ?? match[3] ?? "").trim(),
+    format: (match[4] ?? match[5] ?? match[6])?.trim().toLocaleLowerCase()
+  })).filter((source) => source.url.length > 0);
+  return sources.find((source) => source.format === "woff2") ?? sources[0];
+}
+
+function fontMimeType(source: { readonly url: string; readonly format?: string }, response: Response): string {
+  if (source.format === "woff2" || /\.woff2(?:$|[?#])/iu.test(source.url)) return "font/woff2";
+  if (source.format === "woff" || /\.woff(?:$|[?#])/iu.test(source.url)) return "font/woff";
+  if (source.format === "truetype" || /\.ttf(?:$|[?#])/iu.test(source.url)) return "font/ttf";
+  return response.headers.get("content-type")?.split(";", 1)[0]?.trim() || "application/octet-stream";
+}
+
+function dataUrl(bytes: ArrayBuffer, mimeType: string, ownerWindow: Window & typeof globalThis, signal: AbortSignal): Promise<string> {
+  signal.throwIfAborted();
+  return new Promise((resolve, reject) => {
+    const reader = new ownerWindow.FileReader();
+    const cleanup = (): void => {
+      signal.removeEventListener("abort", abort);
+      reader.onload = null;
+      reader.onerror = null;
+      reader.onabort = null;
+    };
+    const abort = (): void => {
+      reader.abort();
+      cleanup();
+      reject(signal.reason);
+    };
+    reader.onload = () => {
+      const result = reader.result;
+      cleanup();
+      if (typeof result === "string") resolve(result);
+      else reject(new Error("Font encoding failed."));
+    };
+    reader.onerror = () => {
+      const error = reader.error ?? new Error("Font encoding failed.");
+      cleanup();
+      reject(error);
+    };
+    reader.onabort = () => {
+      cleanup();
+      reject(signal.reason);
+    };
+    signal.addEventListener("abort", abort, { once: true });
+    reader.readAsDataURL(new ownerWindow.Blob([bytes], { type: mimeType }));
+  });
+}
+
+/**
+ * Embed only fonts used by the frozen snapshot without html-to-image's detached
+ * <base> element. The packaged shell intentionally sets base-uri 'none'.
+ */
+async function timelineFontEmbedCss(
+  fontFamilies: ReadonlySet<string>,
+  ownerDocument: Document,
+  signal: AbortSignal
+): Promise<string> {
+  const usedFamilies = new Set([...fontFamilies].flatMap(fontFamilyNames));
+  if (usedFamilies.size === 0) return "";
+  const rules: CSSFontFaceRule[] = [];
+  for (const sheet of ownerDocument.styleSheets) {
+    try {
+      fontFaceRules((sheet as CSSStyleSheet).cssRules, rules);
+    } catch {
+      // Unreadable cross-origin styles cannot own fonts loaded by this origin.
+    }
+  }
+  const ownerWindow = ownerDocument.defaultView as (Window & typeof globalThis) | null;
+  if (ownerWindow === null) throw new Error("Content is no longer available.");
+  const embedded = await Promise.all(rules
+    .filter((rule) => fontFamilyNames(rule.style.getPropertyValue("font-family")).some((name) => usedFamilies.has(name)))
+    .map(async (rule) => {
+      signal.throwIfAborted();
+      const source = selectedFontSource(rule.style.getPropertyValue("src"));
+      if (source === undefined) return rule.cssText;
+      let embeddedUrl = source.url;
+      if (!embeddedUrl.startsWith("data:")) {
+        const baseUrl = rule.parentStyleSheet?.href ?? ownerDocument.baseURI;
+        const resourceUrl = new URL(embeddedUrl, baseUrl).href;
+        const response = await abortable(ownerWindow.fetch(resourceUrl, { signal }), signal);
+        if (!response.ok) throw new Error(`Font request failed (${response.status}).`);
+        const bytes = await abortable(response.arrayBuffer(), signal);
+        embeddedUrl = await dataUrl(bytes, fontMimeType(source, response), ownerWindow, signal);
+      }
+      const declaration = ownerDocument.createElement("span").style;
+      copyStyle(rule.style, declaration);
+      declaration.setProperty(
+        "src",
+        `url("${embeddedUrl}")${source.format === undefined ? "" : ` format("${source.format}")`}`,
+        rule.style.getPropertyPriority("src")
+      );
+      return `@font-face{${declaration.cssText}}`;
+    }));
+  return embedded.join("\n");
 }
 
 function opaqueBackground(node: Element, ownerWindow: Window): string {
@@ -148,9 +264,7 @@ function captureContent(node: HTMLElement, context: BrowserActionContext) {
   staging.style.cssText = `position:fixed;left:-100000px;top:0;width:${width}px;height:${height}px;pointer-events:none;`;
   staging.append(clone);
   ownerDocument.body.append(staging);
-  const fonts = ownerDocument.createElement("div");
-  fonts.style.fontFamily = [...fontFamilies].join(",");
-  return { clone, staging, fonts, width, height, backgroundColor };
+  return { clone, staging, fontFamilies, width, height, backgroundColor };
 }
 
 function abortable<T>(operation: PromiseLike<T>, signal: AbortSignal): Promise<T> {
@@ -175,7 +289,7 @@ export async function timelineDomToPng(node: HTMLElement, context: BrowserAction
     if (ownerDocument.fonts !== undefined) await abortable(ownerDocument.fonts.ready, signal);
     assertBrowserActionCurrent(context);
     // Font selection is per request and Document; a table cannot cache away a later formula's fonts.
-    const fontEmbedCSS = await abortable(getFontEmbedCSS(captured.fonts, { fetchRequestInit: { signal } }), signal);
+    const fontEmbedCSS = await timelineFontEmbedCss(captured.fontFamilies, ownerDocument, signal);
     assertBrowserActionCurrent(context);
     const svg = await abortable(toSvg(captured.clone, {
       width: captured.width,

@@ -1766,7 +1766,7 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
           </div>
         </div>
         <div className="session-header__actions">
-          {canStop && running && session.activeRunId !== undefined && <Button tone="danger" disabled={stopInFlight} onClick={stopRun}><CircleStop aria-hidden="true" />{t("controls.abort")}</Button>}
+          {canStop && running && session.activeRunId !== undefined && <Button className="session-header__abort" tone="danger" disabled={stopInFlight} onClick={stopRun}><CircleStop aria-hidden="true" />{t("controls.abort")}</Button>}
           {!reviewReadOnly && session.state === "error" && session.retryRunId !== undefined && <Button onClick={() => runAction("retry", () => controller.retry(session.retryRunId as string))}><RotateCcw aria-hidden="true" />{t("common.retry")}</Button>}
           {controller.state.connectionState === "connected" && <IconButton
             buttonRef={collaborationButtonRef}

@@ -2479,6 +2479,7 @@ export function createConnectServices(application: OrchestratorApplication, proj
         sessionId: request.sessionId,
         ...(before === undefined ? {} : { beforeCursor: before }),
         order: "desc",
+        activeNativeTimeline: true,
         limit: limit + 1
       });
       const hasMore = page.length > limit;

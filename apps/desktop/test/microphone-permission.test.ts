@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  isAllowedDesktopClipboardWriteRequest,
   isAllowedDesktopMicrophoneRequest,
   mapDesktopMicrophonePermissionStatus,
   microphoneMainFrameFromPermissionDetails,
@@ -30,6 +31,22 @@ describe("desktop microphone permission fence", () => {
     expect(microphoneMediaTypesFromPermissionDetails({ mediaTypes: "audio" })).toEqual([]);
     expect(microphoneMainFrameFromPermissionDetails({ isMainFrame: true })).toBe(true);
     expect(microphoneMainFrameFromPermissionDetails({ isMainFrame: "true" })).toBe(false);
+  });
+
+  it("allows sanitized writes only for a trusted same-origin main frame and never grants reads", () => {
+    const request = {
+      permission: "clipboard-sanitized-write",
+      trustedOwner: true,
+      mainFrame: true,
+      trustedFrameUrl: "joko://app/index.html?sessionWindow=1&bootSession=session-a#/tasks/session-a",
+      requestingUrl: "joko://app/index.html"
+    } as const;
+    expect(isAllowedDesktopClipboardWriteRequest(request)).toBe(true);
+    expect(isAllowedDesktopClipboardWriteRequest({ ...request, permission: "clipboard-read" })).toBe(false);
+    expect(isAllowedDesktopClipboardWriteRequest({ ...request, trustedOwner: false })).toBe(false);
+    expect(isAllowedDesktopClipboardWriteRequest({ ...request, mainFrame: false })).toBe(false);
+    expect(isAllowedDesktopClipboardWriteRequest({ ...request, requestingUrl: "https://untrusted.example/" })).toBe(false);
+    expect(isAllowedDesktopClipboardWriteRequest({ ...request, requestingUrl: "joko://user@app/index.html" })).toBe(false);
   });
 
   it("projects bounded operating-system permission states", () => {

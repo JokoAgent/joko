@@ -7,11 +7,27 @@ export interface DesktopMicrophonePermissionRequest {
   readonly mediaTypes: readonly string[];
 }
 
+export interface DesktopClipboardWritePermissionRequest {
+  readonly permission: string;
+  readonly trustedOwner: boolean;
+  readonly mainFrame: boolean;
+  readonly trustedFrameUrl: string;
+  readonly requestingUrl: string;
+}
+
 /** Only the trusted application main frame may request audio-only capture. */
 export function isAllowedDesktopMicrophoneRequest(request: DesktopMicrophonePermissionRequest): boolean {
   if (request.permission !== "media" || !request.trustedOwner || !request.mainFrame) return false;
   if (!sameCredentialFreeOrigin(request.trustedFrameUrl, request.requestingUrl)) return false;
   return request.mediaTypes.length === 1 && request.mediaTypes[0] === "audio";
+}
+
+/** The production app may write sanitized clipboard data, but never read it. */
+export function isAllowedDesktopClipboardWriteRequest(request: DesktopClipboardWritePermissionRequest): boolean {
+  return request.permission === "clipboard-sanitized-write"
+    && request.trustedOwner
+    && request.mainFrame
+    && sameCredentialFreeOrigin(request.trustedFrameUrl, request.requestingUrl);
 }
 
 export function microphoneMediaTypesFromPermissionDetails(details: unknown): readonly string[] {

@@ -832,6 +832,18 @@ describe("OperationalStore visible message search", () => {
     expect(() => fixture.store.listEventsAround("branch-session", "branch-b", 5)).toThrow(/Event/u);
     expect(fixture.store.listEventsAround("branch-session", "branch-a", 5).map((event) => event.id))
       .toEqual(["branch-root", "branch-a", "branch-marker-a"]);
+    expect(fixture.store.listEvents({ sessionId: "branch-session", activeNativeTimeline: true, order: "desc", limit: 3 }).map((event) => event.id))
+      .toEqual(["branch-marker-a", "branch-a", "branch-root"]);
+    const branchA = fixture.store.listEvents({ sessionId: "branch-session", activeNativeTimeline: true, order: "desc", limit: 2 });
+    expect(branchA.map((event) => event.id)).toEqual(["branch-marker-a", "branch-a"]);
+    expect(fixture.store.listEvents({
+      sessionId: "branch-session",
+      activeNativeTimeline: true,
+      order: "desc",
+      beforeCursor: branchA.at(-1)!.globalCursor,
+      limit: 2
+    }).map((event) => event.id)).toEqual(["branch-root"]);
+    expect(() => fixture.store.listEventsAround("branch-session", "branch-live", 5)).toThrow(/Event/u);
 
     for (;;) {
       const jobs = fixture.store.claimMessageEmbeddingJobs(64, 60);
