@@ -37,20 +37,23 @@ async function inspectClaudeSessionRuntimeAssets(runtimeArgument: string, depend
   const workerEntry = await regularFile(adapterRoot, resolve(adapterRoot, "dist/session-sdk-worker.mjs"));
   const managerTemplate = await regularFile(adapterRoot, resolve(adapterRoot, "dist/remote-manager/manager.mjs"));
   const sessionStoreEntry = await regularFile(adapterRoot, resolve(adapterRoot, "dist/claude-session-store.js"));
+  const freshContextOwnerEntry = await regularFile(adapterRoot, resolve(adapterRoot, "dist/fresh-context-owner.js"));
   const managerEntry = await regularFile(
     adapterRoot,
     resolve(adapterRoot, "dist/remote-manager/device-peer-manager.mjs")
   );
-  const marker = "__JOKO_EMBEDDED_CLAUDE_SESSION_STORE_V1__";
-  const managerTemplateSource = await readFile(managerTemplate, "utf8");
-  const markerOffset = managerTemplateSource.indexOf(marker);
-  if (markerOffset < 0 || managerTemplateSource.indexOf(marker, markerOffset + marker.length) >= 0) {
-    throw new Error("The Session SDK manager template marker is invalid.");
+  let managerTemplateSource = await readFile(managerTemplate, "utf8");
+  for (const [marker, entry] of [
+    ["__JOKO_EMBEDDED_CLAUDE_SESSION_STORE_V1__", sessionStoreEntry],
+    ["__JOKO_EMBEDDED_CLAUDE_FRESH_CONTEXT_OWNER_V1__", freshContextOwnerEntry]
+  ] as const) {
+    const markerOffset = managerTemplateSource.indexOf(marker);
+    if (markerOffset < 0 || managerTemplateSource.indexOf(marker, markerOffset + marker.length) >= 0) {
+      throw new Error("The Session SDK manager template marker is invalid.");
+    }
+    managerTemplateSource = managerTemplateSource.replace(marker, (await readFile(entry)).toString("base64"));
   }
-  const expectedManager = Buffer.from(managerTemplateSource.replace(
-    marker,
-    (await readFile(sessionStoreEntry)).toString("base64")
-  ), "utf8");
+  const expectedManager = Buffer.from(managerTemplateSource, "utf8");
   const actualManager = await readFile(managerEntry);
   if (!actualManager.equals(expectedManager)) {
     throw new Error("The Session SDK Device peer manager bundle is not from this adapter build.");
@@ -71,6 +74,7 @@ async function inspectClaudeSessionRuntimeAssets(runtimeArgument: string, depend
     workerEntry,
     managerTemplate,
     sessionStoreEntry,
+    freshContextOwnerEntry,
     managerEntry,
     sdkEntry
   ].map(async (path) => ({
@@ -83,6 +87,7 @@ async function inspectClaudeSessionRuntimeAssets(runtimeArgument: string, depend
     workerEntry,
     managerTemplate,
     sessionStoreEntry,
+    freshContextOwnerEntry,
     managerEntry,
     sdkEntry,
     version: sdkManifest.version,

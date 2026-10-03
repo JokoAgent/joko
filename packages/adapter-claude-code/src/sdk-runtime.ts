@@ -13,6 +13,13 @@ import {
   type DurableProcessUsage
 } from "@joko/runtime-governance";
 import { z } from "zod";
+import {
+  ClaudeFreshContextOwner,
+  type ClaudeFreshContextBindingLookup,
+  type ClaudeFreshContextIdentity,
+  type ClaudeFreshContextSnapshot,
+  type ClaudeFreshContextSource
+} from "./fresh-context-owner.js";
 import type { ClaudeMcpCallResult, ClaudeMcpTool } from "./mcp-bridge.js";
 import {
   CLAUDE_SESSION_STORE_LIMITS,
@@ -245,6 +252,8 @@ export interface ClaudeSdkQueryOptions {
   readonly resume?: string;
   /** Exact adopted Store Session authority for this Query. */
   readonly sessionStoreAccess?: ClaudeSessionStoreSessionAccess;
+  /** Content-free, exact adopted context authority for the native input fence. */
+  readonly freshContextClaim?: ClaudeFreshContextSnapshot;
   readonly sessionId?: string;
   readonly settings?: Exclude<NativeOptions["settings"], string>;
   readonly settingSources: readonly ("user" | "project" | "local")[];
@@ -316,6 +325,22 @@ export interface ClaudeSdkProbe {
   readonly diagnostic?: string;
 }
 
+/** Lifecycle operations run at the durable Owner, which may live on the selected remote route. */
+export interface ClaudeSdkFreshContextRuntime {
+  reserve(identity: ClaudeFreshContextIdentity): ClaudeFreshContextSnapshot | Promise<ClaudeFreshContextSnapshot>;
+  getForBinding(input: ClaudeFreshContextBindingLookup): ClaudeFreshContextSnapshot | undefined | Promise<ClaudeFreshContextSnapshot | undefined>;
+  getForOperation(operationId: string): ClaudeFreshContextSnapshot | undefined | Promise<ClaudeFreshContextSnapshot | undefined>;
+  claim(input: ClaudeFreshContextBindingLookup, proof: { readonly retirementConfirmed: true }): ClaudeFreshContextSnapshot | Promise<ClaudeFreshContextSnapshot>;
+  recover(identity: ClaudeFreshContextIdentity, proof: { readonly retirementConfirmed: true }): ClaudeFreshContextSnapshot | Promise<ClaudeFreshContextSnapshot>;
+  hasPendingSource(input: ClaudeFreshContextSource): boolean | Promise<boolean>;
+  markSourceRetired(input: ClaudeFreshContextSource): void | Promise<void>;
+  adopt(identity: ClaudeFreshContextIdentity, proof: { readonly retirementConfirmed: true }): ClaudeFreshContextSnapshot | Promise<ClaudeFreshContextSnapshot>;
+  cleanup(identity: ClaudeFreshContextIdentity, proof: { readonly retirementConfirmed: true }): ClaudeFreshContextSnapshot | Promise<ClaudeFreshContextSnapshot>;
+  deleteEmptyBinding(input: ClaudeFreshContextBindingLookup, proof: { readonly retirementConfirmed: true }): ClaudeFreshContextSnapshot | Promise<ClaudeFreshContextSnapshot>;
+  /** Only local gates call this synchronously; a remote manager owns its own SDK iterator fence. */
+  markDispatching?(claim: ClaudeFreshContextSnapshot): ClaudeFreshContextSnapshot;
+}
+
 export interface ClaudeSdkRuntime {
   readonly packageVersion: string;
   /** Exact CLI version declared by this runtime's bundled executable. Callers
@@ -329,6 +354,10 @@ export interface ClaudeSdkRuntime {
    * the Adapter must not advertise workspace derivation until Host adoption,
    * recovery and live-cwd proof are also configured. */
   readonly storedSessions?: ClaudeSdkStoredSessionRuntime;
+  /** Joko-owned empty-context reservations, separate from opaque SDK entries. */
+  readonly freshContexts?: ClaudeSdkFreshContextRuntime;
+  /** Retire stale exact processes before claiming a durable empty context. */
+  prepareFreshContextRecovery?(): Promise<void>;
   /** True only for exact local Query roots owned by this runtime. */
   readonly processInspectionSupported?: boolean;
   probe(input: ClaudeSdkProbeInput): Promise<ClaudeSdkProbe>;
@@ -448,6 +477,8 @@ export interface ClaudeTargetRuntime {
 
 /** Adapter-owned resolver for Target-scoped remote Claude runtimes. */
 export interface ClaudeRemoteRuntimePort {
+  /** The resolver composes a route-owned durable context and native consumption fence. */
+  readonly supportsFreshContexts?: boolean;
   resolve(target: TargetDescriptor, signal?: AbortSignal): Promise<ClaudeTargetRuntime>;
   close(): Promise<void>;
 }
@@ -490,6 +521,7 @@ export class DefaultClaudeSdkRuntime implements ClaudeSdkRuntime {
   readonly bundledCliVersion = CLAUDE_AGENT_SDK_CLI_VERSION;
   readonly supportsWorkspaceDerivation: boolean;
   readonly storedSessions: ClaudeSdkStoredSessionRuntime | undefined;
+  readonly freshContexts: ClaudeFreshContextOwner | undefined;
   readonly #processOwner: DurableProcessOwner | undefined;
   readonly #retirementTimeoutMs: number;
   readonly #sessionOwner: SessionSdkOwner;
@@ -532,6 +564,11 @@ export class DefaultClaudeSdkRuntime implements ClaudeSdkRuntime {
           generation: options.processOwner.generation
         });
     this.#sessionStoreAuthority = sessionStoreAuthority;
+    this.freshContexts = sessionStoreAuthority === undefined ? undefined : new ClaudeFreshContextOwner({
+      rootDirectory: sessionStoreAuthority.rootDirectory,
+      namespace: sessionStoreAuthority.namespace,
+      generation: sessionStoreAuthority.generation
+    });
     this.supportsWorkspaceDerivation = sessionStoreAuthority !== undefined;
     this.#sessionOwner = new SessionSdkOwner({
       environment: options.environment ?? process.env,
@@ -546,6 +583,13 @@ export class DefaultClaudeSdkRuntime implements ClaudeSdkRuntime {
 
   get processInspectionSupported(): boolean {
     return this.#processOwner?.inspectionSupported === true;
+  }
+
+  async prepareFreshContextRecovery(): Promise<void> {
+    if (this.#processOwner === undefined || this.freshContexts === undefined) {
+      throw new Error("The durable fresh context process authority is unavailable.");
+    }
+    await this.#processOwner.prepare(this.#retirementTimeoutMs);
   }
 
   async probe(input: ClaudeSdkProbeInput): Promise<ClaudeSdkProbe> {

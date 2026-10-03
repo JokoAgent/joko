@@ -10,7 +10,9 @@ import type {
   ClaudePermissionResult,
   ClaudeSdkQueryOptions,
   ClaudeSdkQueryParams,
-  ClaudeSdkUserMessage
+  ClaudeSdkUserMessage,
+  ClaudeFreshContextIdentity,
+  ClaudeFreshContextSnapshot
 } from "@joko/adapter-claude-code";
 import type { TargetDescriptor } from "@joko/core";
 import type {
@@ -42,6 +44,132 @@ afterEach(async () => {
 });
 
 describe("RemoteClaudeRuntimeResolver", () => {
+  it("routes fresh context lifecycle and Query claims through one exact remote authority", async () => {
+    const fixture = createFixture();
+    cleanups.push(() => fixture.resolver.close());
+    const binding = await fixture.resolver.resolve(fixture.target);
+    expect(fixture.resolver.supportsFreshContexts).toBe(true);
+    const owner = binding.runtime.freshContexts!;
+    expect(Object.isFrozen(owner)).toBe(true);
+    const identity = freshIdentity(fixture.target, binding.workspaceRoot);
+    const source = { sourceSessionId: identity.sourceSessionId, sourceBinding: identity.sourceBinding };
+    const proof = { retirementConfirmed: true } as const;
+    const reserved: ClaudeFreshContextSnapshot = {
+      ...identity, backendGeneration: 7, lifecycle: "reserved", dispatch: "never_dispatched", sourceRetired: false, revision: 1
+    };
+    fixture.processes.freshResponses.set("fresh.reserve", reserved);
+    expect(await owner.reserve(identity)).toEqual(reserved);
+    fixture.processes.freshResponses.set("fresh.getForBinding", reserved);
+    fixture.processes.freshResponses.set("fresh.getForOperation", reserved);
+    expect(await owner.getForBinding(identity)).toEqual(reserved);
+    expect(await owner.getForOperation(identity.operationId)).toEqual(reserved);
+    fixture.processes.freshResponses.set("fresh.hasPendingSource", true);
+    fixture.processes.freshResponses.set("fresh.markSourceRetired", { confirmed: true });
+    expect(await owner.hasPendingSource(source)).toBe(true);
+    await owner.markSourceRetired(source);
+    const adopted = { ...reserved, lifecycle: "adopted", sourceRetired: true, revision: 2 } as const;
+    fixture.processes.freshResponses.set("fresh.adopt", adopted);
+    expect(await owner.adopt(identity, proof)).toEqual(adopted);
+    const current = { ...identity, binding: { ...identity.binding, generation: 6 } };
+    const claimed = { ...adopted, binding: current.binding, revision: 3 };
+    fixture.processes.freshResponses.set("fresh.claim", claimed);
+    fixture.processes.freshResponses.set("fresh.recover", claimed);
+    fixture.processes.freshResponses.set("fresh.cleanup", claimed);
+    expect(await owner.claim(current, proof)).toEqual(claimed);
+    expect(await owner.recover(current, proof)).toEqual(claimed);
+    expect(await owner.cleanup(current, proof)).toEqual(claimed);
+
+    const query = await binding.runtime.query(queryParams(undefined, undefined, false, undefined, {
+      cwd: binding.workspaceRoot, sessionId: FORK_ID, freshContextClaim: claimed
+    }, []));
+    const start = record(fixture.processes.startRequests.at(-1)?.params.options);
+    const authority = record(fixture.processes.freshRequests[0]?.params.authority);
+    expect(start.freshContextClaim).toEqual(claimed);
+    expect(start.freshContextAuthority).toEqual(authority);
+    expect(authority).toEqual({ schemaVersion: 1, namespace: expect.stringMatching(/^backend-[0-9a-f]{64}$/u), generation: 7 });
+    expect(start).not.toHaveProperty("sessionStoreAuthority");
+    expect(start).not.toHaveProperty("sessionStoreAccess");
+    for (const request of fixture.processes.freshRequests) {
+      expect(request.params.authority).toEqual(authority);
+      expect(request.params).not.toHaveProperty("rootDirectory");
+      expect(request.params).not.toHaveProperty("sessionStoreRootDirectory");
+    }
+    expect(fixture.processes.freshRequests.map((request) => request.method)).toEqual([
+      "fresh.reserve", "fresh.getForBinding", "fresh.getForOperation", "fresh.hasPendingSource", "fresh.markSourceRetired",
+      "fresh.adopt", "fresh.claim", "fresh.recover", "fresh.cleanup"
+    ]);
+    expect(fixture.processes.freshRequests[0]?.params.identity).toEqual(identity);
+    expect(fixture.processes.freshRequests[6]?.params).toEqual({ authority, input: current, proof });
+    expect(fixture.processes.requests.filter((request) => request.executable === "/bin/sh")).toHaveLength(1);
+    for (const route of fixture.processes.requests.filter((request) => request.executable !== "/bin/sh")) {
+      expect(route).toMatchObject({
+        executable: "/home/test/.joko/runtime/v1/claude-code/current/node/bin/node", cwd: "/srv/project"
+      });
+    }
+    await binding.runtime.retireQuery(query, 2_000);
+    const cleaned = { ...claimed, lifecycle: "cleaned", revision: 4 } as const;
+    fixture.processes.freshResponses.set("fresh.deleteEmptyBinding", cleaned);
+    expect(await owner.deleteEmptyBinding(current, proof)).toEqual(cleaned);
+    expect(fixture.processes.freshRequests.at(-1)).toEqual({ method: "fresh.deleteEmptyBinding", params: { authority, input: current, proof } });
+  });
+
+  it("fences fresh context identity, response, and route drift before adopting another remote authority", async () => {
+    const fixture = createFixture();
+    cleanups.push(() => fixture.resolver.close());
+    const binding = await fixture.resolver.resolve(fixture.target);
+    const owner = binding.runtime.freshContexts!;
+    const identity = freshIdentity(fixture.target, binding.workspaceRoot);
+    const proof = { retirementConfirmed: true } as const;
+    const adopted: ClaudeFreshContextSnapshot = {
+      ...identity, backendGeneration: 7, lifecycle: "adopted", dispatch: "never_dispatched", sourceRetired: true, revision: 2
+    };
+    const effects = fixture.processes.frames.length;
+    for (const invalid of [
+      { ...identity, targetId: "target.other" },
+      { ...identity, workspaceAuthority: "workspace.other" },
+      { ...identity, workspaceRoot: "/srv/other" },
+      { ...identity, sourceSessionId: "session.other" },
+      { ...identity, binding: { ...identity.binding, nativeSessionId: "invalid-native-id" } }
+    ]) await expect(owner.reserve(invalid)).rejects.toMatchObject({ code: "fresh_access_mismatch", stateMayHaveChanged: false });
+    await expect(owner.claim(identity, { retirementConfirmed: false } as unknown as typeof proof))
+      .rejects.toMatchObject({ code: "fresh_access_mismatch", stateMayHaveChanged: false });
+    for (const claim of [
+      { ...adopted, targetId: "target.other" }, { ...adopted, backendGeneration: 6 },
+      { ...adopted, lifecycle: "reserved" as const }, { ...adopted, dispatch: "dispatching" as const }
+    ]) await expect(binding.runtime.query(queryParams(undefined, undefined, false, undefined, { sessionId: FORK_ID, freshContextClaim: claim }, [])))
+      .rejects.toMatchObject({ code: "fresh_access_mismatch", stateMayHaveChanged: false });
+    await expect(binding.runtime.query(queryParams(undefined, undefined, false, undefined, { sessionId: SESSION_ID, freshContextClaim: adopted }, [])))
+      .rejects.toMatchObject({ code: "fresh_access_mismatch", stateMayHaveChanged: false });
+    expect(fixture.processes.frames).toHaveLength(effects);
+
+    for (const response of [
+      { ...adopted, targetId: "target.other" }, { ...adopted, workspaceRoot: "/srv/other" },
+      { ...adopted, workspaceAuthority: "workspace.other" }, { ...adopted, backendGeneration: 8 },
+      { ...adopted, sourceRetired: false }, { ...adopted, unexpected: "unowned" }
+    ]) {
+      fixture.processes.freshResponses.set("fresh.getForBinding", response);
+      await expect(owner.getForBinding(identity)).rejects.toMatchObject({ code: "invalid_response", stateMayHaveChanged: true });
+    }
+    fixture.processes.freshResponses.set("fresh.getForOperation", { ...adopted, operationId: "another-operation" });
+    await expect(owner.getForOperation(identity.operationId)).rejects.toMatchObject({ code: "invalid_response", stateMayHaveChanged: true });
+    fixture.processes.freshResponses.set("fresh.claim", { ...adopted, backendGeneration: 6 });
+    await expect(owner.claim(identity, proof)).rejects.toMatchObject({ code: "invalid_response", stateMayHaveChanged: true });
+    fixture.processes.freshResponses.set("fresh.getForBinding", null);
+    fixture.processes.freshResponses.set("fresh.getForOperation", undefined);
+    expect(await owner.getForBinding(identity)).toBeUndefined();
+    expect(await owner.getForOperation("missing-operation")).toBeUndefined();
+    expect(fixture.processes.queryStartEffects).toBe(0);
+
+    const afterResponses = fixture.processes.frames.length;
+    fixture.authorityCurrent = false;
+    await expect(owner.adopt(identity, proof)).rejects.toThrow("SSH authority changed");
+    expect(fixture.processes.frames).toHaveLength(afterResponses);
+    fixture.authorityCurrent = true;
+    fixture.stored = { ...fixture.stored, revision: fixture.stored.revision + 1n };
+    await expect(owner.deleteEmptyBinding(identity, proof)).rejects.toMatchObject({ code: "authority_changed", stateMayHaveChanged: false });
+    expect(fixture.processes.frames).toHaveLength(afterResponses);
+  });
+
   it("serializes only the frozen product Tool manifest and fences its callbacks to the exact Query", async () => {
     const fixture = createFixture();
     cleanups.push(() => fixture.resolver.close());
@@ -710,6 +838,8 @@ class FakeClaudeManagerProcesses implements RemoteProcessTransportPort {
   readonly inputRequests: Array<{ readonly id: string; readonly params: Record<string, unknown> }> = [];
   readonly attachRequests: Array<Record<string, unknown>> = [];
   readonly storeRequests: Array<{ readonly method: string; readonly params: Record<string, unknown> }> = [];
+  readonly freshRequests: Array<{ readonly method: string; readonly params: Record<string, unknown> }> = [];
+  readonly freshResponses = new Map<string, unknown>();
   readonly storeReservationAcks: Array<{ readonly ok: boolean; readonly value: unknown }> = [];
   queryStartEffects = 0;
   inputEffects = 0;
@@ -812,6 +942,10 @@ class FakeClaudeManagerProcesses implements RemoteProcessTransportPort {
     if (frame.method.startsWith("store.")) {
       this.storeRequests.push({ method: frame.method, params });
       return this.#acceptStore(frame.id, frame.method, params, process);
+    }
+    if (frame.method.startsWith("fresh.")) {
+      this.freshRequests.push({ method: frame.method, params });
+      return process.respond(frame.id, this.freshResponses.get(frame.method));
     }
     if (frame.method === "query.start") {
       this.startRequests.push({ id: frame.id, params });
@@ -1157,6 +1291,15 @@ function sessionInfo(sessionId: string, cwd = "/srv/project") {
 
 function workspaceAuthority(target: TargetDescriptor): string {
   return claudeWorkspaceAuthority(target);
+}
+
+function freshIdentity(target: TargetDescriptor, workspaceRoot: string): ClaudeFreshContextIdentity {
+  return {
+    operationId: "remote-start-boundary", sourceSessionId: "session.product", sessionId: "session.product",
+    sourceBinding: { opaqueRef: `claude-code:session:${SESSION_ID}`, nativeSessionId: SESSION_ID, generation: 4 },
+    binding: { opaqueRef: `claude-code:session:${FORK_ID}`, nativeSessionId: FORK_ID, generation: 5 },
+    targetId: target.id, workspaceAuthority: workspaceAuthority(target), workspaceRoot
+  };
 }
 
 function probeOutput(): Buffer {
