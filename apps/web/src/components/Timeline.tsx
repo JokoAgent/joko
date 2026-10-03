@@ -298,6 +298,17 @@ export function Timeline({ ownerKey, sessionId, sessionName, workspaceId, onRead
   const touchYRef = useRef<number | undefined>(undefined);
   const handledFocusRequestRef = useRef<number | undefined>(undefined);
   const focusTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const activeFocusRequestRef = useRef<typeof focusRequest>(undefined);
+  const navigationGenerationRef = useRef(0);
+  const navigationFrameRef = useRef<number | undefined>(undefined);
+  const viewportFrameRef = useRef<number | undefined>(undefined);
+  const navigationOwnerRef = useRef({ ownerKey, sessionId });
+  if (navigationOwnerRef.current.ownerKey !== ownerKey || navigationOwnerRef.current.sessionId !== sessionId) {
+    navigationOwnerRef.current = { ownerKey, sessionId };
+  }
+  const focusRequestRef = useRef(focusRequest);
+  focusRequestRef.current = focusRequest;
+  const navigationDocumentActiveRef = useRef(true);
   const loadEarlierInFlightRef = useRef(false);
   const reducedMotion = usePrefersReducedMotion();
   const personalizationContext = useMemo<TimelinePersonalizationContextValue>(() => ({
@@ -472,12 +483,73 @@ export function Timeline({ ownerKey, sessionId, sessionName, workspaceId, onRead
 
   const writeScrollTop = useCallback((top: number, behavior: ScrollBehavior = "auto"): void => {
     const node = scrollRef.current;
-    if (node === null) return;
+    if (node === null || !navigationDocumentActiveRef.current) return;
     programmaticScrollUntilRef.current = performance.now() + (behavior === "smooth" ? 500 : 50);
     node.scrollTo({ top, behavior });
     previousScrollTopRef.current = node.scrollTop;
-    requestAnimationFrame(captureViewportAnchor);
+    if (viewportFrameRef.current !== undefined) cancelAnimationFrame(viewportFrameRef.current);
+    const owner = navigationOwnerRef.current;
+    const generation = navigationGenerationRef.current;
+    viewportFrameRef.current = requestAnimationFrame(() => {
+      if (!navigationDocumentActiveRef.current || navigationOwnerRef.current !== owner || navigationGenerationRef.current !== generation) return;
+      viewportFrameRef.current = undefined;
+      captureViewportAnchor();
+    });
   }, [captureViewportAnchor]);
+
+  const cancelTimelineNavigation = useCallback((retireCurrentFocus = true): void => {
+    navigationGenerationRef.current += 1;
+    const focus = retireCurrentFocus ? focusRequestRef.current : undefined;
+    if (focus !== undefined) handledFocusRequestRef.current = focus.requestId;
+    activeFocusRequestRef.current = undefined;
+    if (navigationFrameRef.current !== undefined) {
+      cancelAnimationFrame(navigationFrameRef.current);
+      navigationFrameRef.current = undefined;
+    }
+    if (viewportFrameRef.current !== undefined) {
+      cancelAnimationFrame(viewportFrameRef.current);
+      viewportFrameRef.current = undefined;
+    }
+    if (focusTimerRef.current !== undefined) {
+      clearTimeout(focusTimerRef.current);
+      focusTimerRef.current = undefined;
+    }
+    const node = scrollRef.current;
+    if (node !== null && performance.now() < programmaticScrollUntilRef.current) {
+      node.scrollTo({ top: node.scrollTop, behavior: "auto" });
+    }
+    programmaticScrollUntilRef.current = 0;
+  }, []);
+
+  useLayoutEffect(() => {
+    const owner = navigationOwnerRef.current;
+    return () => {
+      if (navigationOwnerRef.current !== owner) {
+        const focus = activeFocusRequestRef.current;
+        if (focus !== undefined) handledFocusRequestRef.current = focus.requestId;
+        setFocusedItemId(undefined);
+      }
+      cancelTimelineNavigation(false);
+    };
+  }, [cancelTimelineNavigation, ownerKey, sessionId]);
+
+  useEffect(() => {
+    const view = scrollRef.current?.ownerDocument.defaultView;
+    if (view === null || view === undefined) return;
+    const onPageHide = (): void => {
+      navigationDocumentActiveRef.current = false;
+      cancelTimelineNavigation();
+      setFocusedItemId(undefined);
+    };
+    const onPageShow = (): void => { navigationDocumentActiveRef.current = true; };
+    view.addEventListener("pagehide", onPageHide);
+    view.addEventListener("pageshow", onPageShow);
+    return () => {
+      view.removeEventListener("pagehide", onPageHide);
+      view.removeEventListener("pageshow", onPageShow);
+      cancelTimelineNavigation(false);
+    };
+  }, [cancelTimelineNavigation]);
 
   const setTimelineFollowing = useCallback((next: boolean): void => {
     followingRef.current = next;
@@ -491,22 +563,28 @@ export function Timeline({ ownerKey, sessionId, sessionName, workspaceId, onRead
 
   const jumpToMessageNavEntry = useCallback((itemId: string): void => {
     const node = scrollRef.current;
-    if (node === null) return;
+    if (node === null || !navigationDocumentActiveRef.current) return;
     const index = findTimelineRenderItemIndex(renderItems, itemId);
     if (index < 0) return;
+    cancelTimelineNavigation();
+    setFocusedItemId(undefined);
+    const generation = navigationGenerationRef.current;
+    const owner = navigationOwnerRef.current;
     restoreAnchorRef.current = undefined;
     setTimelineFollowing(false);
     programmaticScrollUntilRef.current = performance.now() + 650;
     virtualizer.scrollToIndex(index, { align: "start" });
     let attempts = 0;
     const align = (): void => {
+      if (!navigationDocumentActiveRef.current || navigationOwnerRef.current !== owner || navigationGenerationRef.current !== generation) return;
+      navigationFrameRef.current = undefined;
       const current = scrollRef.current;
-      if (current === null) return;
+      if (current !== node || !itemsRef.current.some((item) => item.id === itemId)) return;
       const anchor = [...current.querySelectorAll<HTMLElement>("[data-message-client-id]")]
         .find((candidate) => candidate.dataset.messageClientId === itemId);
       if (anchor === undefined && attempts < 2) {
         attempts += 1;
-        requestAnimationFrame(align);
+        navigationFrameRef.current = requestAnimationFrame(align);
         return;
       }
       if (anchor === undefined) return;
@@ -514,8 +592,8 @@ export function Timeline({ ownerKey, sessionId, sessionName, workspaceId, onRead
       writeScrollTop(nextScrollTop, timelineJumpBehavior(reducedMotion));
       viewportAnchorRef.current = { itemId, offset: 12 };
     };
-    requestAnimationFrame(align);
-  }, [reducedMotion, renderItems, setTimelineFollowing, virtualizer, writeScrollTop]);
+    navigationFrameRef.current = requestAnimationFrame(align);
+  }, [cancelTimelineNavigation, reducedMotion, renderItems, setTimelineFollowing, virtualizer, writeScrollTop]);
   const previousMessageEntry = previousMessageJump.displayId === null
     ? undefined
     : messageNavEntries.find((entry) => entry.id === previousMessageJump.displayId);
@@ -546,10 +624,12 @@ export function Timeline({ ownerKey, sessionId, sessionName, workspaceId, onRead
   useLayoutEffect(() => {
     if (followLatestSignalRef.current === followLatestSignal) return;
     followLatestSignalRef.current = followLatestSignal;
+    cancelTimelineNavigation();
+    setFocusedItemId(undefined);
     restoreAnchorRef.current = undefined;
     setTimelineFollowing(true);
     if (items.length > 0) pinToLatest();
-  }, [followLatestSignal, items.length, pinToLatest, setTimelineFollowing]);
+  }, [cancelTimelineNavigation, followLatestSignal, items.length, pinToLatest, setTimelineFollowing]);
 
   useEffect(() => {
     saveViewport(followingRef.current, unreadCountRef.current);
@@ -580,7 +660,16 @@ export function Timeline({ ownerKey, sessionId, sessionName, workspaceId, onRead
   }, [captureViewportAnchor, items, renderItems, renderedRowsKey, virtualizer, writeScrollTop]);
 
   useLayoutEffect(() => {
-    if (focusRequest === undefined || handledFocusRequestRef.current === focusRequest.requestId) return;
+    if (focusRequest === undefined) {
+      if (activeFocusRequestRef.current !== undefined) cancelTimelineNavigation(false);
+      return;
+    }
+    if (!navigationDocumentActiveRef.current || handledFocusRequestRef.current === focusRequest.requestId) return;
+    if (activeFocusRequestRef.current?.requestId !== focusRequest.requestId || activeFocusRequestRef.current.itemId !== focusRequest.itemId) {
+      cancelTimelineNavigation(false);
+      setFocusedItemId(undefined);
+      activeFocusRequestRef.current = focusRequest;
+    }
     const index = findTimelineRenderItemIndex(renderItems, focusRequest.itemId);
     if (index < 0) return;
     const node = scrollRef.current;
@@ -606,20 +695,26 @@ export function Timeline({ ownerKey, sessionId, sessionName, workspaceId, onRead
     setFocusedItemId(focusRequest.itemId);
     row.focus({ preventScroll: true });
     if (focusTimerRef.current !== undefined) clearTimeout(focusTimerRef.current);
+    const generation = navigationGenerationRef.current;
+    const owner = navigationOwnerRef.current;
     focusTimerRef.current = setTimeout(() => {
+      if (!navigationDocumentActiveRef.current || navigationOwnerRef.current !== owner || navigationGenerationRef.current !== generation) return;
       focusTimerRef.current = undefined;
       setFocusedItemId((current) => current === focusRequest.itemId ? undefined : current);
     }, 2_400);
-  }, [focusRequest, items, reducedMotion, renderItems, renderedRowsKey, setTimelineFollowing, virtualizer, writeScrollTop]);
+  }, [cancelTimelineNavigation, focusRequest, items, ownerKey, reducedMotion, renderItems, renderedRowsKey, sessionId, setTimelineFollowing, virtualizer, writeScrollTop]);
 
   useEffect(() => {
     const content = contentRef.current;
     if (content === null || typeof ResizeObserver === "undefined") return;
+    const owner = navigationOwnerRef.current;
     let frame: number | undefined;
     const observer = new ResizeObserver(() => {
       if (frame !== undefined) cancelAnimationFrame(frame);
+      const generation = navigationGenerationRef.current;
       frame = requestAnimationFrame(() => {
         frame = undefined;
+        if (!navigationDocumentActiveRef.current || navigationOwnerRef.current !== owner || navigationGenerationRef.current !== generation) return;
         const node = scrollRef.current;
         if (node === null) return;
         const anchor = viewportAnchorRef.current;
@@ -652,7 +747,7 @@ export function Timeline({ ownerKey, sessionId, sessionName, workspaceId, onRead
       if (frame !== undefined) cancelAnimationFrame(frame);
       observer.disconnect();
     };
-  }, [captureViewportAnchor, renderedRowsKey, saveViewport, writeScrollTop]);
+  }, [captureViewportAnchor, ownerKey, renderedRowsKey, saveViewport, sessionId, writeScrollTop]);
 
   useEffect(() => () => {
     captureViewportAnchor();
@@ -829,7 +924,7 @@ export function Timeline({ ownerKey, sessionId, sessionName, workspaceId, onRead
       {previousMessageEntry !== undefined && !messageNavRailCoversNavigation && <PrevMessageJumpChip preview={previousMessageEntry.preview} label={t("timeline.jumpPreviousQuestion", { preview: previousMessageEntry.preview })} onClick={jumpToPreviousMessage} />}
       {onAddSelectionToComposer !== undefined && shareSelection === undefined && <SelectionQuoteButton key={sessionId} sessionId={sessionId} containerRef={scrollRef} label={t("timeline.addToChat")} onCommit={onAddSelectionToComposer} />}
       {!following && (
-        <Button className="jump-latest" tone="secondary" aria-label={unreadCount > 0 ? `${t("timeline.jumpLatest")} (${unreadCount})` : t("timeline.jumpLatest")} onClick={() => { setTimelineFollowing(true); pinToLatest(timelineJumpBehavior(reducedMotion)); }}>
+        <Button className="jump-latest" tone="secondary" aria-label={unreadCount > 0 ? `${t("timeline.jumpLatest")} (${unreadCount})` : t("timeline.jumpLatest")} onClick={() => { cancelTimelineNavigation(); setFocusedItemId(undefined); restoreAnchorRef.current = undefined; setTimelineFollowing(true); pinToLatest(timelineJumpBehavior(reducedMotion)); }}>
           <ChevronDown aria-hidden="true" />{t("timeline.jumpLatest")}{unreadCount > 0 && <span className="jump-latest__count">{unreadCount}</span>}
         </Button>
       )}
