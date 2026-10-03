@@ -286,12 +286,12 @@ function TimelineReferenceLink({ target, actions, mention = false, anchorProps, 
     {menu !== undefined && trigger !== null && <TimelineLinkMenu trigger={trigger} position={menu}
       label={actions.t(external ? "timeline.linkOpenMenu" : "workspace.fileActions")} onClose={close}>
       {(external || html) && <>
-        <button type="button" role="menuitem" disabled={opening || copy.pending || !canOpen} onClick={() => openLink({ forceSidebar: true })}><PanelRight aria-hidden="true" />{actions.t("timeline.openInSidebarBrowser")}</button>
-        <button type="button" role="menuitem" disabled={opening || copy.pending || !canOpen} onClick={() => openLink({ forceExternal: true })}><Globe2 aria-hidden="true" />{actions.t(html ? "timeline.openInManagedBrowser" : "timeline.openInDefaultBrowser")}</button>
+        <button type="button" role="menuitem" disabled={!canOpen} aria-disabled={opening || copy.pending || !canOpen} onClick={() => openLink({ forceSidebar: true })}><PanelRight aria-hidden="true" />{actions.t("timeline.openInSidebarBrowser")}</button>
+        <button type="button" role="menuitem" disabled={!canOpen} aria-disabled={opening || copy.pending || !canOpen} onClick={() => openLink({ forceExternal: true })}><Globe2 aria-hidden="true" />{actions.t(html ? "timeline.openInManagedBrowser" : "timeline.openInDefaultBrowser")}</button>
         <span role="separator" />
       </>}
-      <button type="button" role="menuitem" disabled={opening || copy.pending} onClick={() => {
-        if (requestRef.current !== undefined || scopeRef.current?.signal.aborted) return;
+      <button type="button" role="menuitem" aria-disabled={opening || copy.pending} onClick={() => {
+        if (opening || copy.pending || requestRef.current !== undefined || scopeRef.current?.signal.aborted) return;
         const value = target.kind === "workspace" ? `${target.path}${target.line === undefined ? "" : `:${target.line}${target.column === undefined ? "" : `:${target.column}`}`}` : target.href;
         copy.run(trigger.ownerDocument, (context) => writeClipboardText(value, context));
       }}><Clipboard aria-hidden="true" />{actions.t(external ? "timeline.copyUrl" : "workspace.copyRelativePath")}</button>

@@ -1338,6 +1338,10 @@ export interface TimelineItemView {
     | "review"
     | "status";
   readonly createdAt: number;
+  /** Exact activity completion supplied by the owning tool-call contract. */
+  readonly endedAt?: number;
+  /** Latest observed delta time for this exact thinking block, not its completion or duration. */
+  readonly lastActivityAt?: number;
   readonly title?: string;
   readonly text?: string;
   readonly streaming?: boolean;

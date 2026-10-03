@@ -547,6 +547,10 @@ export class OrchestratorE2eFixture {
     return adapter;
   }
 
+  dropPublicConnections(): void {
+    this.#server.server.closeAllConnections();
+  }
+
   async close(options: { readonly removeRoot?: boolean } = {}): Promise<void> {
     if (this.#closed) return;
     this.#closed = true;

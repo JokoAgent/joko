@@ -1071,7 +1071,7 @@ button.code-host-pull-request-summary:focus-visible { outline: 2px solid var(--a
 .timeline-link-menu button svg { width: 15px; height: 15px; flex: 0 0 auto; color: var(--text-soft); }
 .timeline-link-menu > [role="separator"] { height: 1px; margin: 2px 4px; background: var(--line); }
 .timeline-link-menu { max-width: calc(100vw - 16px); max-height: calc(100dvh - 16px); overflow: auto; }
-.timeline-link-menu button:disabled { opacity: .5; cursor: default; }
+.timeline-link-menu button:disabled, .timeline-link-menu button[aria-disabled="true"] { opacity: .5; cursor: default; }
 .timeline-link-menu > [role="status"] { max-width: 280px; padding: 4px 9px; font-size: var(--text-12); color: var(--text-soft); }
 .timeline-link-feedback { position: fixed; z-index: 181; right: 18px; bottom: 18px; border: 1px solid var(--line); border-radius: 999px; padding: 7px 12px; background: var(--surface-raised); color: var(--text); box-shadow: var(--shadow-lg); font-size: var(--text-12); }
 .message-user.is-share-selecting { align-items: flex-start; gap: 8px; }
@@ -1586,8 +1586,10 @@ details[open] > summary .details-chevron { transform: rotate(180deg); }
 @keyframes session-status-breathing { 0%, 100% { opacity: .68; transform: scale(.94); } 50% { opacity: 1; transform: scale(1.04); } }
 
 /* Composer */
-.session-bottom-overlay { position: absolute; z-index: 12; right: 0; bottom: 0; left: 0; padding-top: 32px; background: linear-gradient(to bottom, transparent, var(--surface-raised) 32px); pointer-events: none; }
+.session-bottom-overlay { position: absolute; z-index: 12; right: var(--session-timeline-scrollbar-gutter, 0px); bottom: 0; left: 0; padding-top: 32px; background: linear-gradient(to bottom, transparent, var(--surface-raised) 32px); pointer-events: none; }
 .session-bottom-overlay > * { pointer-events: auto; }
+.session-bottom-overlay > .session-composer-layer, .session-composer-layer > .composer-region { pointer-events: none; }
+.session-composer-layer .composer-stack, .session-composer-layer .session-running-status, .session-composer-layer > .composer-region > .modal-layer { pointer-events: auto; }
 .share-selection-bar { width: min(calc(100% - 80px), 934px); min-height: 68px; position: relative; display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 12px; margin: 0 auto 20px; border-top: 1px solid var(--line); padding: 12px 0 0; background: var(--surface-raised); }
 .share-selection-bar__select-all { min-height: 32px; display: inline-flex; align-items: center; gap: 7px; border: 1px solid var(--line); border-radius: 999px; padding: 5px 11px; background: var(--surface); color: var(--text); font-size: var(--text-11); font-weight: 600; }
 .share-selection-bar__select-all > span { width: 16px; height: 16px; display: grid; place-items: center; border: 1px solid var(--text-faint); border-radius: 999px; }

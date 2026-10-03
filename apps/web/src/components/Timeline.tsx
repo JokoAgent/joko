@@ -535,7 +535,9 @@ export function Timeline({ ownerKey, viewportOwnerKey, sessionId, sessionName, w
     viewportFrameRef.current = requestAnimationFrame(() => {
       if (!navigationDocumentActiveRef.current || navigationOwnerRef.current !== owner || navigationGenerationRef.current !== generation) return;
       viewportFrameRef.current = undefined;
-      captureViewportAnchor();
+      // A virtual-row estimate can still settle after this frame. Keep the
+      // durable reading anchor until measurement has corrected its offset.
+      if (followingRef.current || viewportAnchorRef.current === undefined) captureViewportAnchor();
     });
   }, [captureViewportAnchor]);
 
@@ -633,9 +635,12 @@ export function Timeline({ ownerKey, viewportOwnerKey, sessionId, sessionName, w
         return;
       }
       if (anchor === undefined) return;
-      const nextScrollTop = Math.max(0, current.scrollTop + anchor.getBoundingClientRect().top - current.getBoundingClientRect().top - 12);
+      const anchorRect = anchor.getBoundingClientRect();
+      const row = anchor.closest<HTMLElement>(".timeline__row");
+      const rowOffset = 12 + (row?.getBoundingClientRect().top ?? anchorRect.top) - anchorRect.top;
+      const nextScrollTop = Math.max(0, current.scrollTop + anchorRect.top - current.getBoundingClientRect().top - 12);
       writeScrollTop(nextScrollTop, timelineJumpBehavior(reducedMotion));
-      viewportAnchorRef.current = { itemId, offset: 12 };
+      viewportAnchorRef.current = { itemId: row?.dataset.timelineItemId ?? itemId, offset: rowOffset };
     };
     navigationFrameRef.current = requestAnimationFrame(align);
   }, [cancelTimelineNavigation, positionVirtualRow, reducedMotion, renderItems, setTimelineFollowing, writeScrollTop]);
@@ -690,12 +695,19 @@ export function Timeline({ ownerKey, viewportOwnerKey, sessionId, sessionName, w
     const document = node.ownerDocument;
     const owner = navigationOwnerRef.current;
     let active = true;
+    const suppressScrollbarAdjustment = (): boolean => false;
+    const releaseScrollbarAdjustment = (): void => {
+      if (virtualizer.shouldAdjustScrollPositionOnItemSizeChange === suppressScrollbarAdjustment) {
+        virtualizer.shouldAdjustScrollPositionOnItemSizeChange = undefined;
+      }
+    };
     const isCurrent = (): boolean => active && navigationOwnerRef.current === owner && scrollRef.current === node;
     const endScrollbarDrag = (resumePin = true): void => {
       const drag = scrollbarDragRef.current;
       if (!isCurrent() || drag?.owner !== owner || drag.node !== node) return;
       if (resumePin) observeScrollbarMovement(node);
       scrollbarDragRef.current = undefined;
+      releaseScrollbarAdjustment();
       if (resumePin && !document.hidden && followingRef.current) pinToLatest();
     };
     const onMouseDown = (event: MouseEvent): void => {
@@ -711,6 +723,7 @@ export function Timeline({ ownerKey, viewportOwnerKey, sessionId, sessionName, w
       setFocusedItemId(undefined);
       previousScrollTopRef.current = node.scrollTop;
       scrollbarDragRef.current = { owner, node, startScrollTop: node.scrollTop, previousScrollTop: node.scrollTop };
+      virtualizer.shouldAdjustScrollPositionOnItemSizeChange = suppressScrollbarAdjustment;
     };
     const onMouseMove = (event: MouseEvent): void => {
       if (!isCurrent()) return;
@@ -738,8 +751,9 @@ export function Timeline({ ownerKey, viewportOwnerKey, sessionId, sessionName, w
       view.removeEventListener("pagehide", onPageHide);
       document.removeEventListener("visibilitychange", onVisibilityChange);
       if (scrollbarDragRef.current?.owner === owner && scrollbarDragRef.current.node === node) scrollbarDragRef.current = undefined;
+      releaseScrollbarAdjustment();
     };
-  }, [cancelTimelineNavigation, observeScrollbarMovement, ownerKey, pinToLatest, sessionId, timelineHasItems]);
+  }, [cancelTimelineNavigation, observeScrollbarMovement, ownerKey, pinToLatest, sessionId, timelineHasItems, virtualizer]);
 
   useLayoutEffect(() => {
     if (!following || items.length === 0) return;
@@ -815,8 +829,10 @@ export function Timeline({ ownerKey, viewportOwnerKey, sessionId, sessionName, w
       0,
       node.scrollTop + rowRect.top - viewportRect.top - Math.max(0, (node.clientHeight - rowRect.height) / 2)
     );
+    const rowOffset = rowRect.top - viewportRect.top + node.scrollTop
+      - Math.min(nextScrollTop, Math.max(0, node.scrollHeight - node.clientHeight));
     writeScrollTop(nextScrollTop, timelineJumpBehavior(reducedMotion));
-    viewportAnchorRef.current = { itemId: focusRequest.itemId, offset: rowRect.top - viewportRect.top };
+    viewportAnchorRef.current = { itemId: row.dataset.timelineItemId ?? focusRequest.itemId, offset: rowOffset };
     setFocusedItemId(focusRequest.itemId);
     row.focus({ preventScroll: true });
     if (focusTimerRef.current !== undefined) clearTimeout(focusTimerRef.current);
@@ -909,7 +925,7 @@ export function Timeline({ ownerKey, viewportOwnerKey, sessionId, sessionName, w
     const scrollDelta = currentScrollTop - previousScrollTopRef.current;
     previousScrollTopRef.current = currentScrollTop;
     if (performance.now() < programmaticScrollUntilRef.current) {
-      captureViewportAnchor();
+      if (followingRef.current || viewportAnchorRef.current === undefined) captureViewportAnchor();
       saveViewport();
       return;
     }
@@ -1082,7 +1098,7 @@ export function Timeline({ ownerKey, viewportOwnerKey, sessionId, sessionName, w
           })}
         </div>
       </div>
-      {messageNavRailEnabled && <MessageNavRail entries={messageNavEntries} scrollRef={scrollRef} contentRef={contentRef} bottomOffset={bottomInset} resetKey={sessionId} estimateEntryTop={estimateMessageNavEntryTop} onWheelIntent={handleTimelineWheelIntent} onCoverageChange={setMessageNavRailCoversNavigation} onJump={jumpToMessageNavEntry} t={t} />}
+      {messageNavRailEnabled && <MessageNavRail entries={messageNavEntries} scrollRef={scrollRef} contentRef={contentRef} bottomOffset={bottomInset} resetKey={JSON.stringify([ownerKey, viewportOwnerKey])} estimateEntryTop={estimateMessageNavEntryTop} onWheelIntent={handleTimelineWheelIntent} onCoverageChange={setMessageNavRailCoversNavigation} onJump={jumpToMessageNavEntry} t={t} />}
       {previousMessageEntry !== undefined && !messageNavRailCoversNavigation && <PrevMessageJumpChip preview={previousMessageEntry.preview} label={t("timeline.jumpPreviousQuestion", { preview: previousMessageEntry.preview })} onClick={jumpToPreviousMessage} />}
       {onAddSelectionToComposer !== undefined && shareSelection === undefined && <SelectionQuoteButton key={sessionId} sessionId={sessionId} containerRef={scrollRef} label={t("timeline.addToChat")} onCommit={onAddSelectionToComposer} />}
       {!following && (
@@ -1691,8 +1707,8 @@ export function StreamingMarkdown({ text, streaming, streamFadeKey, t }: { reado
   const personalization = useContext(TimelinePersonalizationContext);
   const throttled = useStreamingMarkdownText(text, streaming);
   const source = streaming ? throttled : text;
-  const rendered = useMemo(() => streaming ? repairStreamingMarkdown(source) : source, [source, streaming]);
   const fade = timelineStreamFadeActive(streaming, personalization.streamFadeEnabled, personalization.reducedMotion);
+  const rendered = useMemo(() => fade ? repairStreamingMarkdown(source) : source, [source, fade]);
   const fadeState = useMemo(() => fade ? timelineWordFadeState(streamFadeKey) : undefined, [fade, streamFadeKey]);
   const candidate = useMemo(() => fadeState === undefined ? undefined : createTimelineWordFadeCandidate(fadeState), [fadeState, rendered]);
   useLayoutEffect(() => {
@@ -1728,18 +1744,16 @@ const ParsedMarkdown = memo(function ParsedMarkdown({ text, t, wordFade, onWordF
     ...(personalization.onLoadWorkspaceAsset === undefined ? {} : { onLoadWorkspaceAsset: personalization.onLoadWorkspaceAsset }),
     ...(personalization.onWorkspaceImageToComposer === undefined ? {} : { onWorkspaceImageToComposer: personalization.onWorkspaceImageToComposer })
   }), [personalization.ownerKey, personalization.onLoadWorkspaceAsset, personalization.onOpenHttpLink, personalization.onOpenWorkspaceHtml, personalization.onWorkspaceImageToComposer, personalization.sessionId, t]);
-  const components = useMemo(
-    () => safeMarkdownComponents(t, referenceActions, onWordFadeSettled),
-    [onWordFadeSettled, referenceActions, t]
-  );
+  const renderActions = useMemo(() => ({ referenceActions, onWordFadeSettled }), [onWordFadeSettled, referenceActions]);
   const normalized = useMemo(() => normalizeTimelineMathDelimiters(text), [text]);
   const rehypePlugins = useMemo(() => wordFade === undefined
     ? TIMELINE_REHYPE_PLUGINS
     : [...TIMELINE_REHYPE_PLUGINS, [rehypeTimelineStreamFade, wordFade]] as NonNullable<ComponentProps<typeof ReactMarkdown>["rehypePlugins"]>, [wordFade]);
-  return <TimelineLinkSourceContext.Provider value={text}>
-    <TimelineMarkdownDocument remarkPlugins={TIMELINE_REMARK_PLUGINS} rehypePlugins={rehypePlugins} components={components} skipHtml>{normalized}</TimelineMarkdownDocument>
-
-  </TimelineLinkSourceContext.Provider>;
+  return <TimelineMarkdownRenderContext.Provider value={renderActions}>
+    <TimelineLinkSourceContext.Provider value={text}>
+      <TimelineMarkdownDocument remarkPlugins={TIMELINE_REMARK_PLUGINS} rehypePlugins={rehypePlugins} components={SAFE_MARKDOWN_COMPONENTS} skipHtml>{normalized}</TimelineMarkdownDocument>
+    </TimelineLinkSourceContext.Provider>
+  </TimelineMarkdownRenderContext.Provider>;
 });
 
 function useStreamingMarkdownText(value: string, streaming: boolean, intervalMs = 100): string {
@@ -2269,13 +2283,25 @@ function rememberWorkGroupExpansion(key: string, expanded: boolean): void {
   }
 }
 
-function safeMarkdownComponents(
-  t: Translator,
-  referenceActions: TimelineReferenceActions,
-  onWordFadeSettled?: (event: { readonly animationName: string; readonly currentTarget: { readonly dataset: DOMStringMap } }) => void
-): Components {
-  return {
+interface TimelineMarkdownRenderActions {
+  readonly referenceActions: TimelineReferenceActions;
+  readonly onWordFadeSettled?: (event: { readonly animationName: string; readonly currentTarget: { readonly dataset: DOMStringMap } }) => void;
+}
+
+const TimelineMarkdownRenderContext = createContext<TimelineMarkdownRenderActions | undefined>(undefined);
+
+function useTimelineMarkdownRenderActions(): TimelineMarkdownRenderActions {
+  const actions = useContext(TimelineMarkdownRenderContext);
+  if (actions === undefined) throw new Error("Markdown renderer actions are unavailable.");
+  return actions;
+}
+
+// Keep renderer types stable while current actions flow through their context.
+// Fresh application callbacks must not remount selected words or restart fades.
+const SAFE_MARKDOWN_COMPONENTS: Components = {
     pre: ({ children, node: _node, ...props }) => {
+      const { referenceActions } = useTimelineMarkdownRenderActions();
+      const { t } = referenceActions;
       const first = Array.isArray(children) ? children[0] : children;
       if (isValidElement(first)) {
         const className = (first.props as { readonly className?: string }).className;
@@ -2286,10 +2312,14 @@ function safeMarkdownComponents(
       }
       return <pre {...props}>{children}</pre>;
     },
-    table: ({ children, node, ...props }) => <TimelineCopyAsImageBlock ownerKey={JSON.stringify([referenceActions.ownerKey, referenceActions.sessionId])} sourceKey={JSON.stringify(node)} imageName="table.png" onSendToChat={referenceActions.onWorkspaceImageToComposer} className="timeline-copy-block--table" contentClassName="timeline-copy-block__scroll" extractPlainText={timelineTableToTsv} t={t}>
-      <table {...props}>{children}</table>
-    </TimelineCopyAsImageBlock>,
+    table: ({ children, node, ...props }) => {
+      const { referenceActions } = useTimelineMarkdownRenderActions();
+      return <TimelineCopyAsImageBlock ownerKey={JSON.stringify([referenceActions.ownerKey, referenceActions.sessionId])} sourceKey={JSON.stringify(node)} imageName="table.png" onSendToChat={referenceActions.onWorkspaceImageToComposer} className="timeline-copy-block--table" contentClassName="timeline-copy-block__scroll" extractPlainText={timelineTableToTsv} t={referenceActions.t}>
+        <table {...props}>{children}</table>
+      </TimelineCopyAsImageBlock>;
+    },
     span: ({ children, className, node, ...props }) => {
+      const { referenceActions, onWordFadeSettled } = useTimelineMarkdownRenderActions();
       const wordFadeKey = (props as Record<string, unknown>)["data-wf-key"];
       const startedAt = Number((props as Record<string, unknown>)["data-wf-started-at"]);
       if (typeof wordFadeKey === "string" && Number.isFinite(startedAt)) {
@@ -2303,7 +2333,7 @@ function safeMarkdownComponents(
           : undefined}
       >{children}</span>;
       return className?.split(/\s+/u).includes("katex-display") === true
-        ? <TimelineCopyAsImageBlock ownerKey={JSON.stringify([referenceActions.ownerKey, referenceActions.sessionId])} sourceKey={JSON.stringify(node)} imageName="formula.png" onSendToChat={referenceActions.onWorkspaceImageToComposer} className="timeline-copy-block--math" extractPlainText={timelineMathToLatex} t={t}>{content}</TimelineCopyAsImageBlock>
+        ? <TimelineCopyAsImageBlock ownerKey={JSON.stringify([referenceActions.ownerKey, referenceActions.sessionId])} sourceKey={JSON.stringify(node)} imageName="formula.png" onSendToChat={referenceActions.onWorkspaceImageToComposer} className="timeline-copy-block--math" extractPlainText={timelineMathToLatex} t={referenceActions.t}>{content}</TimelineCopyAsImageBlock>
         : content;
     },
     li: ({ node: _node, ...props }) => {
@@ -2311,11 +2341,14 @@ function safeMarkdownComponents(
       return Number.isFinite(startedAt) ? <TimelineFadeElement as="li" {...props} startedAt={startedAt} /> : <li {...props} />;
     },
     a: ({ children, href, node: _node, ...props }) => {
+      const { referenceActions } = useTimelineMarkdownRenderActions();
       return <TimelineMarkdownLink href={href} actions={referenceActions} anchorProps={props}>{children}</TimelineMarkdownLink>;
     },
-    img: ({ src, alt }) => <TimelineMarkdownImage src={src} alt={alt} actions={referenceActions} t={t} />
-  };
-}
+    img: ({ src, alt }) => {
+      const { referenceActions } = useTimelineMarkdownRenderActions();
+      return <TimelineMarkdownImage src={src} alt={alt} actions={referenceActions} t={referenceActions.t} />;
+    }
+};
 
 function timelineMarkdownNodeText(node: ReactNode): string {
   if (node === null || node === undefined || typeof node === "boolean") return "";
