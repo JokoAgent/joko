@@ -1274,7 +1274,7 @@ function createWindow(): void {
           "      window.jokoDesktop &&",
           "      typeof window.jokoDesktop.platform === 'string' &&",
           "      typeof window.jokoDesktop.chooseFiles === 'function' &&",
-          "      typeof window.jokoDesktop.getDedicatedHardwareState === 'function' &&",
+          "      typeof window.jokoDesktop.dedicatedHardware?.getDedicatedHardwareState === 'function' &&",
           "      typeof window.jokoDesktop.extensionLibraries?.pickLocation === 'function' &&",
           "      typeof window.jokoDesktop.extensionLibraries?.reveal === 'function' &&",
           "      typeof window.jokoDesktop.extensionLibraries?.beginSave === 'function' &&",
@@ -1436,10 +1436,10 @@ async function verifyPackagedSmokeDedicatedHardwareState(window: BrowserWindow):
   }
   const raw: unknown = await window.webContents.executeJavaScript([
     "(async () => {",
-    "  if (!document.querySelector('.app') || typeof window.jokoDesktop?.getDedicatedHardwareState !== 'function') {",
+    "  if (!document.querySelector('.app') || typeof window.jokoDesktop?.dedicatedHardware?.getDedicatedHardwareState !== 'function') {",
     "    throw new Error('Dedicated hardware state is unavailable in the product renderer.');",
     "  }",
-    "  return window.jokoDesktop.getDedicatedHardwareState();",
+    "  return window.jokoDesktop.dedicatedHardware.getDedicatedHardwareState();",
     "})()"
   ].join("\n"), true);
   if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
