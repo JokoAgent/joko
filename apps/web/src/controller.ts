@@ -85,6 +85,7 @@ import {
   withSessionNotificationPreference
 } from "./session-notification-preference-sync.js";
 import { subscribeLocalePreferenceChange, withLocalePreference } from "./locale-preference-sync.js";
+import { subscribeConversationPreferencesChange, withConversationPreferences } from "./conversation-preference-sync.js";
 import {
   withSidebarDisplayPreferences,
   withSidebarOwnerLayout,
@@ -334,6 +335,8 @@ export function useAppController(): AppController {
   const sessionNotificationPreferenceHintRevisionRef = useRef(0);
   const localePreferenceSyncOwnerRef = useRef(0);
   const localePreferenceHintRevisionRef = useRef(0);
+  const conversationPreferenceSyncOwnerRef = useRef(0);
+  const conversationPreferenceHintRevisionRef = useRef(0);
   const gatewayRef = useRef<OrchestratorGateway | undefined>(undefined);
   const gatewayGenerationRef = useRef(0);
   const htmlPreviewsRef = useRef(new Map<string, {
@@ -461,6 +464,28 @@ export function useAppController(): AppController {
     }).catch(() => undefined);
   }, [enqueuePreferenceOperation, systemLocale]);
 
+  const enqueueConversationPreferenceRefresh = useCallback((owner: number, requestRevision: number): void => {
+    void enqueuePreferenceOperation(async () => {
+      if (conversationPreferenceSyncOwnerRef.current !== owner
+        || conversationPreferenceHintRevisionRef.current !== requestRevision) return;
+      const local = localRef.current;
+      if (local === undefined) return;
+      const durable = (await local.readPreferences()) ?? DEFAULT_UI_PREFERENCES;
+      if (conversationPreferenceSyncOwnerRef.current !== owner
+        || conversationPreferenceHintRevisionRef.current !== requestRevision) return;
+      const previous = preferencesRef.current;
+      const next = withConversationPreferences(previous, durable);
+      if (next === previous) return;
+      preferencesRef.current = next;
+      setState((current) => {
+        const projected = current.preferences === previous
+          ? next
+          : withConversationPreferences(current.preferences, durable);
+        return projected === current.preferences ? current : withControllerPreferences(current, projected, systemLocale);
+      });
+    }).catch(() => undefined);
+  }, [enqueuePreferenceOperation, systemLocale]);
+
   useEffect(() => {
     const routeSessionId = extensionUiRouteSessionId(state.route);
     if (extensionTitleSessionRef.current === undefined || extensionTitleSessionRef.current === routeSessionId) return;
@@ -474,6 +499,7 @@ export function useAppController(): AppController {
     let appShortcutSyncLive = false;
     let sessionNotificationSyncLive = false;
     let localeSyncLive = false;
+    let conversationSyncLive = false;
     const appearanceSyncOwner = ++appearancePreferenceSyncOwnerRef.current;
     appearancePreferenceHintRevisionRef.current = 0;
     const appShortcutSyncOwner = ++appShortcutPreferenceSyncOwnerRef.current;
@@ -482,6 +508,8 @@ export function useAppController(): AppController {
     sessionNotificationPreferenceHintRevisionRef.current = 0;
     const localeSyncOwner = ++localePreferenceSyncOwnerRef.current;
     localePreferenceHintRevisionRef.current = 0;
+    const conversationSyncOwner = ++conversationPreferenceSyncOwnerRef.current;
+    conversationPreferenceHintRevisionRef.current = 0;
     const closeAppearancePreferenceSync = subscribeAppearancePreferencesChange(() => {
       const requestRevision = ++appearancePreferenceHintRevisionRef.current;
       if (appearanceSyncLive) enqueueAppearancePreferenceRefresh(appearanceSyncOwner, requestRevision);
@@ -501,9 +529,14 @@ export function useAppController(): AppController {
       if (localeSyncLive) enqueueLocalePreferenceRefresh(localeSyncOwner, requestRevision);
     });
     const initialAppearanceRevision = appearancePreferenceHintRevisionRef.current;
+    const closeConversationPreferenceSync = subscribeConversationPreferencesChange(() => {
+      const requestRevision = ++conversationPreferenceHintRevisionRef.current;
+      if (conversationSyncLive) enqueueConversationPreferenceRefresh(conversationSyncOwner, requestRevision);
+    });
     const initialAppShortcutRevision = appShortcutPreferenceHintRevisionRef.current;
     const initialSessionNotificationRevision = sessionNotificationPreferenceHintRevisionRef.current;
     const initialLocaleRevision = localePreferenceHintRevisionRef.current;
+    const initialConversationRevision = conversationPreferenceHintRevisionRef.current;
     void LocalState.open().then(async (local) => {
       const [persistedProfiles, machineCaches, preferences, managedStatus, automaticConnectionAvailable] = await Promise.all([
         local.listProfiles(),
@@ -556,22 +589,27 @@ export function useAppController(): AppController {
       let observedAppShortcutRevision = initialAppShortcutRevision;
       let observedSessionNotificationRevision = initialSessionNotificationRevision;
       let observedLocaleRevision = initialLocaleRevision;
+      let observedConversationRevision = initialConversationRevision;
       while (!cancelled && (observedAppearanceRevision !== appearancePreferenceHintRevisionRef.current
         || observedAppShortcutRevision !== appShortcutPreferenceHintRevisionRef.current
         || observedSessionNotificationRevision !== sessionNotificationPreferenceHintRevisionRef.current
-        || observedLocaleRevision !== localePreferenceHintRevisionRef.current)) {
+        || observedLocaleRevision !== localePreferenceHintRevisionRef.current
+        || observedConversationRevision !== conversationPreferenceHintRevisionRef.current)) {
         const nextAppearanceRevision = appearancePreferenceHintRevisionRef.current;
         const nextAppShortcutRevision = appShortcutPreferenceHintRevisionRef.current;
         const nextSessionNotificationRevision = sessionNotificationPreferenceHintRevisionRef.current;
         const nextLocaleRevision = localePreferenceHintRevisionRef.current;
+        const nextConversationRevision = conversationPreferenceHintRevisionRef.current;
         const refreshAppearance = observedAppearanceRevision !== nextAppearanceRevision;
         const refreshAppShortcuts = observedAppShortcutRevision !== nextAppShortcutRevision;
         const refreshSessionNotification = observedSessionNotificationRevision !== nextSessionNotificationRevision;
         const refreshLocale = observedLocaleRevision !== nextLocaleRevision;
+        const refreshConversation = observedConversationRevision !== nextConversationRevision;
         observedAppearanceRevision = nextAppearanceRevision;
         observedAppShortcutRevision = nextAppShortcutRevision;
         observedSessionNotificationRevision = nextSessionNotificationRevision;
         observedLocaleRevision = nextLocaleRevision;
+        observedConversationRevision = nextConversationRevision;
         const durable = (await local.readPreferences()) ?? DEFAULT_UI_PREFERENCES;
         if (refreshAppearance) effectivePreferences = withAppearanceProjection(effectivePreferences, durable);
         if (refreshAppShortcuts) effectivePreferences = withAppShortcutProjection(effectivePreferences, durable);
@@ -579,6 +617,7 @@ export function useAppController(): AppController {
           effectivePreferences = withSessionNotificationPreference(effectivePreferences, durable);
         }
         if (refreshLocale) effectivePreferences = withLocalePreference(effectivePreferences, durable);
+        if (refreshConversation) effectivePreferences = withConversationPreferences(effectivePreferences, durable);
       }
       if (cancelled) return;
       localRef.current = local;
@@ -601,6 +640,7 @@ export function useAppController(): AppController {
       appShortcutSyncLive = true;
       sessionNotificationSyncLive = true;
       localeSyncLive = true;
+      conversationSyncLive = true;
     }).catch((error: unknown) => {
       if (!cancelled) setState((current) => ({ ...current, ready: true, error: messageOf(error) }));
     });
@@ -680,16 +720,21 @@ export function useAppController(): AppController {
       appShortcutSyncLive = false;
       sessionNotificationSyncLive = false;
       localeSyncLive = false;
+      conversationSyncLive = false;
       closeAppearancePreferenceSync();
       closeAppShortcutPreferenceSync();
       closeSessionNotificationPreferenceSync();
       closeLocalePreferenceSync();
+      closeConversationPreferenceSync();
       if (appearancePreferenceSyncOwnerRef.current === appearanceSyncOwner) appearancePreferenceSyncOwnerRef.current += 1;
       if (appShortcutPreferenceSyncOwnerRef.current === appShortcutSyncOwner) appShortcutPreferenceSyncOwnerRef.current += 1;
       if (sessionNotificationPreferenceSyncOwnerRef.current === sessionNotificationSyncOwner) {
         sessionNotificationPreferenceSyncOwnerRef.current += 1;
       }
       if (localePreferenceSyncOwnerRef.current === localeSyncOwner) localePreferenceSyncOwnerRef.current += 1;
+      if (conversationPreferenceSyncOwnerRef.current === conversationSyncOwner) {
+        conversationPreferenceSyncOwnerRef.current += 1;
+      }
       gatewayGenerationRef.current += 1;
       machineRefreshGenerationRef.current += 1;
       discoveryGenerationRef.current += 1;
@@ -709,6 +754,7 @@ export function useAppController(): AppController {
     enqueueAppearancePreferenceRefresh,
     enqueueAppShortcutPreferenceRefresh,
     enqueueLocalePreferenceRefresh,
+    enqueueConversationPreferenceRefresh,
     enqueueSessionNotificationPreferenceRefresh
   ]);
 

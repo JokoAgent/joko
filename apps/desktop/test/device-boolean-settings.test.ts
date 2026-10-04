@@ -6,6 +6,8 @@ import { describe, expect, it, vi } from "vitest";
 import { createDesktopKeepAwakeSettingsStore } from "../src/keep-awake-settings.js";
 import { createDesktopUpdateAutoSettingsStore } from "../src/update-auto-settings.js";
 import { createDesktopUpdateChannelSettingsStore } from "../src/update-channel-settings.js";
+import { broadcastDesktopUpdateSettings, type DesktopUpdateSettingsObserver } from "../src/update-settings-broadcast.js";
+import { DESKTOP_CHANNELS } from "../src/channels.js";
 import {
   broadcastDesktopWindowInteractionSettings,
   createDesktopWindowInteractionSettingsStore,
@@ -149,6 +151,26 @@ it("broadcasts committed activation-click settings to each live observer indepen
   expect(failedSend).toHaveBeenCalledWith("window-interaction:changed", settings);
   expect(laterApplicationSend).toHaveBeenCalledWith("window-interaction:changed", settings);
   expect(inspectorSend).toHaveBeenCalledWith("window-interaction:changed", settings);
+});
+
+it.each([
+  [DESKTOP_CHANNELS.updateAutoRelaunchSettingsChanged, { autoRelaunchOnIdle: true, isCustomized: true, defaultAutoRelaunchOnIdle: false }],
+  [DESKTOP_CHANNELS.updateChannelSettingsChanged, { enableBeta: true, isCustomized: true, defaultEnableBeta: false }]
+] as const)("delivers committed update settings on %s despite retired observers", (channel, settings) => {
+  const failedSend = vi.fn(() => { throw new Error("retired renderer"); });
+  const mainSend = vi.fn();
+  const taskSend = vi.fn();
+  const observers: DesktopUpdateSettingsObserver[] = [
+    { isDestroyed: () => true, get webContents(): never { throw new Error("closed window"); } },
+    { isDestroyed: () => { throw new Error("retired window"); }, webContents: { isDestroyed: () => false, send: vi.fn() } },
+    { isDestroyed: () => false, webContents: { isDestroyed: () => true, send: vi.fn() } },
+    { isDestroyed: () => false, webContents: { isDestroyed: () => false, send: failedSend } },
+    { isDestroyed: () => false, webContents: { isDestroyed: () => false, send: mainSend } },
+    { isDestroyed: () => false, webContents: { isDestroyed: () => false, send: taskSend } }
+  ];
+  expect(() => broadcastDesktopUpdateSettings(observers, channel, settings)).not.toThrow();
+  expect(mainSend).toHaveBeenCalledExactlyOnceWith(channel, settings);
+  expect(taskSend).toHaveBeenCalledExactlyOnceWith(channel, settings);
 });
 
 function flag(value: unknown, key: string): boolean {

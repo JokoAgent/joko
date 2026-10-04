@@ -631,6 +631,7 @@ interface JokoDesktopApi {
     getAutoRelaunchSettings(): Promise<JokoDesktopAutoRelaunchSettings>;
     setAutoRelaunchOnIdle(enabled: boolean): Promise<JokoDesktopAutoRelaunchSettings>;
     resetAutoRelaunchSettings(): Promise<JokoDesktopAutoRelaunchSettings>;
+    onAutoRelaunchSettings(listener: (settings: JokoDesktopAutoRelaunchSettings) => void): () => void;
     getChannelSettings(): Promise<JokoDesktopUpdateChannelSettings>;
     setBetaChannelEnabled(enabled: boolean): Promise<JokoDesktopUpdateChannelSettings>;
     resetChannelSettings(): Promise<JokoDesktopUpdateChannelSettings>;

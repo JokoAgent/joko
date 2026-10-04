@@ -220,6 +220,7 @@ const DESKTOP_CHANNELS = {
   updateAutoRelaunchSettingsGet: "joko:update:auto-relaunch-settings:get",
   updateAutoRelaunchSettingsSet: "joko:update:auto-relaunch-settings:set",
   updateAutoRelaunchSettingsReset: "joko:update:auto-relaunch-settings:reset",
+  updateAutoRelaunchSettingsChanged: "joko:update:auto-relaunch-settings:changed",
   updateChannelSettingsGet: "joko:update:channel-settings:get",
   updateChannelSettingsSet: "joko:update:channel-settings:set",
   updateChannelSettingsReset: "joko:update:channel-settings:reset",
@@ -849,6 +850,18 @@ const desktopApi = Object.freeze({
         .then(parseDesktopUpdateAutoRelaunchSettings),
     resetAutoRelaunchSettings: (): Promise<DesktopUpdateAutoRelaunchSettings> =>
       ipcRenderer.invoke(DESKTOP_CHANNELS.updateAutoRelaunchSettingsReset).then(parseDesktopUpdateAutoRelaunchSettings),
+    onAutoRelaunchSettings: (listener: (settings: DesktopUpdateAutoRelaunchSettings) => void): (() => void) => {
+      if (typeof listener !== "function") throw new TypeError("Desktop idle update settings listener must be a function.");
+      const wrapped = (_event: IpcRendererEvent, value: unknown): void => {
+        try {
+          listener(parseDesktopUpdateAutoRelaunchSettings(value));
+        } catch {
+          // Ignore malformed host messages; the next get remains authoritative.
+        }
+      };
+      ipcRenderer.on(DESKTOP_CHANNELS.updateAutoRelaunchSettingsChanged, wrapped);
+      return () => ipcRenderer.removeListener(DESKTOP_CHANNELS.updateAutoRelaunchSettingsChanged, wrapped);
+    },
     getChannelSettings: (): Promise<DesktopUpdateChannelSettings> =>
       ipcRenderer.invoke(DESKTOP_CHANNELS.updateChannelSettingsGet).then(parseDesktopUpdateChannelSettings),
     setBetaChannelEnabled: (enableBeta: boolean): Promise<DesktopUpdateChannelSettings> =>

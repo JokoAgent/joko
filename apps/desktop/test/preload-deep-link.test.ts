@@ -195,6 +195,28 @@ describe("main application preload preferred system locale", () => {
   );
 });
 
+describe("main application preload update settings observers", () => {
+  it.each([
+    ["onAutoRelaunchSettings", DESKTOP_CHANNELS.updateAutoRelaunchSettingsChanged, { autoRelaunchOnIdle: true, isCustomized: true, defaultAutoRelaunchOnIdle: false }],
+    ["onChannelSettings", DESKTOP_CHANNELS.updateChannelSettingsChanged, { enableBeta: true, isCustomized: true, defaultEnableBeta: false }]
+  ] as const)("validates and retires %s messages", (method, channel, settings) => {
+    const loaded = loadPreload("document-current");
+    const updates = loaded.exposed["updates"] as Record<typeof method, (listener: (value: unknown) => void) => () => void>;
+    const listener = vi.fn();
+    const unsubscribe = updates[method](listener);
+    const wrapped = loaded.listeners.get(channel);
+    expect(wrapped).toBeTypeOf("function");
+    wrapped?.({}, settings);
+    expect(listener).toHaveBeenCalledExactlyOnceWith(settings);
+    wrapped?.({}, { ...settings, isCustomized: "true" });
+    wrapped?.({}, { ...settings, extra: true });
+    wrapped?.({}, null);
+    expect(listener).toHaveBeenCalledTimes(1);
+    unsubscribe();
+    expect(loaded.listeners.has(channel)).toBe(false);
+  });
+});
+
 describe("main application preload keep-awake observer", () => {
   it("delivers only exact keep-awake settings and removes the wrapped listener", () => {
     const loaded = loadPreload("document-current");

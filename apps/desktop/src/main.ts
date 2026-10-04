@@ -27,6 +27,7 @@ import {
 } from "electron";
 import windowStateKeeper from "electron-window-state";
 import { toggleApplicationWindowFullscreen } from "./window-fullscreen.js";
+import { broadcastDesktopUpdateSettings } from "./update-settings-broadcast.js";
 import { promoteExternalWindowActivation } from "./external-window-activation.js";
 import { basename, extname, isAbsolute, join, resolve } from "node:path";
 import { spawn } from "node:child_process";
@@ -6446,13 +6447,7 @@ function broadcastDesktopNativeTaskStatusSettings(settings: DesktopNativeTaskSta
 }
 
 function broadcastDesktopUpdateChannelSettings(settings: DesktopUpdateChannelSettings): void {
-  const window = mainWindow;
-  if (window === undefined || window.isDestroyed()) return;
-  try {
-    window.webContents.send(DESKTOP_CHANNELS.updateChannelSettingsChanged, settings);
-  } catch {
-    // Renderer reload/crash cannot change the durable device setting.
-  }
+  broadcastDesktopUpdateSettings(applicationWindows(), DESKTOP_CHANNELS.updateChannelSettingsChanged, settings);
 }
 
 function releaseDesktopUpdateStartup(): void {
@@ -6590,12 +6585,12 @@ async function writeDesktopUpdateChannelSettings(
   desktopUpdateChannelChangePending = true;
   try {
     const settings = await operation(store);
+    broadcastDesktopUpdateChannelSettings(settings);
     if (settings.enableBeta !== previous.enableBeta) {
       const feedUrl = settings.enableBeta ? desktopUpdateBetaFeedUrl : desktopUpdateReleaseFeedUrl;
       if (feedUrl !== undefined) await service.changeFeed(feedUrl);
       service.startBackgroundPolling();
     }
-    broadcastDesktopUpdateChannelSettings(settings);
     return settings;
   } finally {
     desktopUpdateChannelChangePending = false;
@@ -8199,6 +8194,7 @@ function registerIpc(): void {
     const result = await requireDesktopUpdateAutoSettings().setAutoRelaunchOnIdle(
       (parameters[0] as { readonly autoRelaunchOnIdle: boolean }).autoRelaunchOnIdle
     );
+    broadcastDesktopUpdateSettings(applicationWindows(), DESKTOP_CHANNELS.updateAutoRelaunchSettingsChanged, result);
     void desktopUpdateAutoRelaunchPolicy?.evaluate("settings-set");
     return result;
   });
@@ -8206,6 +8202,7 @@ function registerIpc(): void {
     assertTrustedIpcSender(event);
     if (parameters.length !== 0) throw new TypeError("Desktop auto relaunch settings reset does not accept parameters.");
     const result = await requireDesktopUpdateAutoSettings().reset();
+    broadcastDesktopUpdateSettings(applicationWindows(), DESKTOP_CHANNELS.updateAutoRelaunchSettingsChanged, result);
     void desktopUpdateAutoRelaunchPolicy?.evaluate("settings-reset");
     return result;
   });

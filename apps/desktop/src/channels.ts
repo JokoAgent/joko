@@ -136,6 +136,7 @@ export const DESKTOP_CHANNELS = {
   updateAutoRelaunchSettingsGet: "joko:update:auto-relaunch-settings:get",
   updateAutoRelaunchSettingsSet: "joko:update:auto-relaunch-settings:set",
   updateAutoRelaunchSettingsReset: "joko:update:auto-relaunch-settings:reset",
+  updateAutoRelaunchSettingsChanged: "joko:update:auto-relaunch-settings:changed",
   updateChannelSettingsGet: "joko:update:channel-settings:get",
   updateChannelSettingsSet: "joko:update:channel-settings:set",
   updateChannelSettingsReset: "joko:update:channel-settings:reset",

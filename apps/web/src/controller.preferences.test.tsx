@@ -8,6 +8,7 @@ import { publishAppearancePreferencesChange } from "./appearance-preference-sync
 import { publishAppShortcutPreferencesChange } from "./app-shortcut-preference-sync.js";
 import { publishSessionNotificationPreferenceChange } from "./session-notification-preference-sync.js";
 import { publishLocalePreferenceChange } from "./locale-preference-sync.js";
+import { publishConversationPreferencesChange, sameConversationPreferences } from "./conversation-preference-sync.js";
 import {
   effectiveAppShortcutCombos,
   matchesAppShortcutEvent,
@@ -694,7 +695,36 @@ it("hot-converges session notifications after queued local preference mutations"
   expect(first!.setSessionNotificationsEnabled).toBe(stableFirstSetter);
 });
 
-it("closes locale bootstrap hints and drops failed, stale, or retired reads", async () => {
+it.each([
+  {
+    name: "locale",
+    channelName: "joko:locale-preference:v1",
+    kind: "locale-preference-changed",
+    publish: publishLocalePreferenceChange,
+    bootstrap: { locale: "zh-CN" as const },
+    stale: { locale: "en-XA" as const },
+    newest: { locale: "en" as const }
+  },
+  {
+    name: "conversation preferences",
+    channelName: "joko:conversation-preferences:v1",
+    kind: "conversation-preferences-changed",
+    publish: publishConversationPreferencesChange,
+    bootstrap: {
+      composerSendShortcut: "modifier-enter" as const, messageNavRailEnabled: false,
+      streamFadeEnabled: false, webLinkOpenPreference: "sidebar" as const, localLinkOpenPreference: "external" as const,
+      personalizationPrompts: { "owner-a": "Use concise answers.", "owner-b": "Explain tradeoffs." }, newSessionWorktreeEnabled: true
+    },
+    stale: {
+      composerSendShortcut: "enter" as const, messageNavRailEnabled: false, streamFadeEnabled: false,
+      personalizationPrompts: { "owner-a": "Retired instructions." }, newSessionWorktreeEnabled: true
+    },
+    newest: {
+      composerSendShortcut: "modifier-enter" as const, messageNavRailEnabled: true, streamFadeEnabled: true,
+      personalizationPrompts: { "owner-b": "Explain tradeoffs." }, newSessionWorktreeEnabled: false
+    }
+  }
+])("closes $name bootstrap hints and drops failed, stale, or retired reads", async ({ publish, bootstrap, stale, newest, channelName, kind }) => {
   vi.stubGlobal("matchMedia", () => ({ matches: false, addEventListener: vi.fn(), removeEventListener: vi.fn() }));
   const channels = installTestBroadcastChannel();
   const initialRead = deferred<UiPreferences | undefined>();
@@ -720,71 +750,126 @@ it("closes locale bootstrap hints and drops failed, stale, or retired reads", as
   } as unknown as LocalState);
 
   let controller: AppController | undefined;
-  const observedLocales: string[] = [];
+  const observedPreferences: UiPreferences[] = [];
   const host = document.createElement("div");
   document.body.append(host);
   root = createRoot(host);
   function Probe(): null {
     controller = useAppController();
-    observedLocales.push(controller.state.preferences.locale);
+    observedPreferences.push(controller.state.preferences);
     return null;
   }
   await act(async () => { root?.render(<Probe />); });
   await vi.waitFor(() => expect(readPreferences).toHaveBeenCalledOnce());
 
   await act(async () => {
-    publishLocalePreferenceChange();
+    for (const channel of channels) if (channel.name === channelName) {
+      for (const data of [{ kind, extra: true }, { kind: "other" }, kind, null, [kind]]) {
+        channel.onmessage?.({ data } as MessageEvent<unknown>);
+      }
+    }
+    await Promise.resolve();
+  });
+  expect(readPreferences).toHaveBeenCalledOnce();
+
+  await act(async () => {
+    publish();
     await Promise.resolve();
     initialRead.resolve(DEFAULT_UI_PREFERENCES);
   });
   await bootstrapRead.started.promise;
   await act(async () => {
-    bootstrapRead.result.resolve({ ...DEFAULT_UI_PREFERENCES, theme: "light", locale: "zh-CN" });
+    bootstrapRead.result.resolve({ ...DEFAULT_UI_PREFERENCES, theme: "light", ...bootstrap });
   });
   await vi.waitFor(() => {
     expect(controller?.state.ready).toBe(true);
-    expect(controller?.state.preferences).toMatchObject({ theme: "dark", locale: "zh-CN" });
+    expect(controller?.state.preferences).toMatchObject({ theme: "dark", ...bootstrap });
   });
   const stableSetter = controller!.setLocale;
-  observedLocales.length = 0;
+  observedPreferences.length = 0;
 
-  publishLocalePreferenceChange();
+  publish();
   await staleRead.started.promise;
-  publishLocalePreferenceChange();
+  publish();
   await act(async () => {
-    staleRead.result.resolve({ ...DEFAULT_UI_PREFERENCES, theme: "light", locale: "en-XA" });
+    staleRead.result.resolve({ ...DEFAULT_UI_PREFERENCES, theme: "light", ...stale });
   });
   await newestRead.started.promise;
-  expect(controller?.state.preferences).toMatchObject({ theme: "dark", locale: "zh-CN" });
-  expect(observedLocales).not.toContain("en-XA");
+  expect(controller?.state.preferences).toMatchObject({ theme: "dark", ...bootstrap });
+  expect(observedPreferences).not.toEqual(expect.arrayContaining([expect.objectContaining(stale)]));
   await act(async () => {
-    newestRead.result.resolve({ ...DEFAULT_UI_PREFERENCES, theme: "light", locale: "en" });
+    newestRead.result.resolve({ ...DEFAULT_UI_PREFERENCES, theme: "light", ...newest });
   });
-  expect(controller?.state.preferences).toMatchObject({ theme: "dark", locale: "en" });
+  expect(controller?.state.preferences).toMatchObject({ theme: "dark", ...newest });
   expect(controller?.setLocale).toBe(stableSetter);
 
-  publishLocalePreferenceChange();
+  publish();
   await failedRead.started.promise;
   await act(async () => {
     failedRead.result.reject(new Error("preference read failed"));
     await Promise.resolve();
   });
-  expect(controller?.state.preferences.locale).toBe("en");
+  expect(controller?.state.preferences).toMatchObject(newest);
 
-  publishLocalePreferenceChange();
+  publish();
   await retiredRead.started.promise;
   const retiredController = controller!;
   await act(async () => { root?.render(<></>); });
   expect(channels.size).toBe(0);
   await act(async () => {
-    retiredRead.result.resolve({ ...DEFAULT_UI_PREFERENCES, locale: "zh-CN" });
+    retiredRead.result.resolve({ ...DEFAULT_UI_PREFERENCES, ...bootstrap });
     await Promise.resolve();
   });
-  expect(retiredController.state.preferences.locale).toBe("en");
-  expect(observedLocales).not.toContain("zh-CN");
+  expect(retiredController.state.preferences).toMatchObject(newest);
+  expect(observedPreferences).not.toEqual(expect.arrayContaining([expect.objectContaining(bootstrap)]));
 });
 
-it("hot-converges locales after queued local preference mutations", async () => {
+it.each([
+  {
+    name: "locale",
+    changed: (left: UiPreferences, right: UiPreferences) => left.locale !== right.locale,
+    publish: publishLocalePreferenceChange,
+    applyFirst: (controller: AppController) => controller.setLocale("zh-CN"),
+    applySecond: (controller: AppController) => controller.setLocale("en-XA"),
+    externalFirst: {},
+    externalSecond: {},
+    firstProjection: { locale: "zh-CN" },
+    secondProjection: { locale: "en-XA" }
+  },
+  {
+    name: "conversation preferences",
+    changed: (left: UiPreferences, right: UiPreferences) => !sameConversationPreferences(left, right),
+    publish: publishConversationPreferencesChange,
+    applyFirst: async (controller: AppController) => {
+      await controller.setComposerSendShortcut("modifier-enter");
+      await controller.setMessageNavRailEnabled(false);
+      await controller.setStreamFadeEnabled(false);
+      await controller.setLinkOpenPreference("web", "sidebar");
+      await controller.setLinkOpenPreference("local", "external");
+      await controller.setNewSessionWorktreeEnabled(true);
+    },
+    applySecond: async (controller: AppController) => {
+      await controller.setComposerSendShortcut("enter");
+      await controller.resetMessageNavRailEnabled();
+      await controller.resetStreamFadeEnabled();
+      await controller.resetLinkOpenPreference("web");
+      await controller.resetLinkOpenPreference("local");
+      await controller.setNewSessionWorktreeEnabled(false);
+    },
+    externalFirst: { personalizationPrompts: { "owner-a": "Use concise answers.", "owner-b": "Explain tradeoffs." } },
+    externalSecond: { personalizationPrompts: { "owner-b": "Explain tradeoffs." } },
+    firstProjection: {
+      composerSendShortcut: "modifier-enter", messageNavRailEnabled: false, streamFadeEnabled: false,
+      webLinkOpenPreference: "sidebar", localLinkOpenPreference: "external", newSessionWorktreeEnabled: true,
+      personalizationPrompts: { "owner-a": "Use concise answers.", "owner-b": "Explain tradeoffs." }
+    },
+    secondProjection: {
+      composerSendShortcut: "enter", messageNavRailEnabled: true, streamFadeEnabled: true,
+      webLinkOpenPreference: "external", localLinkOpenPreference: "sidebar", newSessionWorktreeEnabled: false,
+      personalizationPrompts: { "owner-b": "Explain tradeoffs." }
+    }
+  }
+])("hot-converges $name after queued local preference mutations", async ({ changed, publish, applyFirst, applySecond, externalFirst, externalSecond, firstProjection, secondProjection }) => {
   vi.stubGlobal("matchMedia", () => ({ matches: false, addEventListener: vi.fn(), removeEventListener: vi.fn() }));
   installTestBroadcastChannel();
   let stored: UiPreferences = DEFAULT_UI_PREFERENCES;
@@ -795,9 +880,9 @@ it("hot-converges locales after queued local preference mutations", async () => 
     readPreferences: vi.fn(async () => stored),
     mutatePreferences: vi.fn(async (mutation: UiPreferencesMutation) => {
       if (windowId === "second" && secondWindowGate !== undefined) await secondWindowGate.promise;
-      const previousLocale = stored.locale;
+      const previous = stored;
       stored = mutation(stored);
-      if (previousLocale !== stored.locale) publishLocalePreferenceChange();
+      if (changed(previous, stored)) publish();
       return stored;
     })
   } as unknown as LocalState);
@@ -825,9 +910,9 @@ it("hot-converges locales after queued local preference mutations", async () => 
   });
   const stableFirstSetter = first!.setLocale;
 
-  stored = { ...stored, theme: "light", sessionNotificationsEnabled: false };
-  await act(async () => { await first!.setLocale("zh-CN"); });
-  await vi.waitFor(() => expect(second!.state.preferences.locale).toBe("zh-CN"));
+  stored = { ...stored, theme: "light", sessionNotificationsEnabled: false, ...externalFirst };
+  await act(async () => { await applyFirst(first!); });
+  await vi.waitFor(() => expect(second!.state.preferences).toMatchObject(firstProjection));
   expect(first!.state.preferences).toMatchObject({ theme: "dark", sessionNotificationsEnabled: true });
   expect(second!.state.preferences).toMatchObject({ theme: "dark", sessionNotificationsEnabled: true });
   expect(first!.setLocale).toBe(stableFirstSetter);
@@ -838,16 +923,17 @@ it("hot-converges locales after queued local preference mutations", async () => 
     pendingSecondMutation = second!.setTheme("system");
     await Promise.resolve();
   });
-  await act(async () => { await first!.setLocale("en-XA"); });
-  expect(second!.state.preferences).toMatchObject({ theme: "system", locale: "zh-CN" });
+  stored = { ...stored, ...externalSecond };
+  await act(async () => { await applySecond(first!); });
+  expect(second!.state.preferences).toMatchObject({ theme: "system", ...firstProjection });
 
   await act(async () => {
     secondWindowGate?.resolve();
     await pendingSecondMutation;
   });
   secondWindowGate = undefined;
-  await vi.waitFor(() => expect(second!.state.preferences).toMatchObject({ theme: "system", locale: "en-XA" }));
-  expect(first!.state.preferences).toMatchObject({ theme: "dark", locale: "en-XA" });
+  await vi.waitFor(() => expect(second!.state.preferences).toMatchObject({ theme: "system", ...secondProjection }));
+  expect(first!.state.preferences).toMatchObject({ theme: "dark", ...secondProjection });
   expect(first!.setLocale).toBe(stableFirstSetter);
 });
 
@@ -1066,7 +1152,7 @@ it("adopts durable appearance and bases zoom intent on the latest cross-controll
   await act(async () => { await first!.setCodeFamily("Mono"); });
   await Promise.resolve();
   expect(retiredSecond.state.preferences.codeFamily).toBe("");
-  expect(channels.size).toBe(4);
+  expect([...channels].filter((channel) => channel.name === "joko:appearance-preferences:v1")).toHaveLength(1);
 
   const setZoomFactor = vi.fn(async () => undefined);
   vi.stubGlobal("jokoDesktop", {

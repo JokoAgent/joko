@@ -96,7 +96,7 @@ describe("Desktop idle update settings", () => {
     const updates = validUpdates();
     updates.getAutoRelaunchSettings = vi.fn()
       .mockRejectedValueOnce(new Error("private IPC detail"))
-      .mockResolvedValueOnce(settings(false, false));
+      .mockResolvedValue(settings(false, false));
     updates.setAutoRelaunchOnIdle = vi.fn(async () => { throw new Error("secret path"); });
     installDesktop(updates);
     const { container } = await renderSetting();
@@ -114,35 +114,25 @@ describe("Desktop idle update settings", () => {
     expect(checkbox(container).disabled).toBe(false);
   });
 
-  it("lets the newest mutation or reset win and ignores every superseded response", async () => {
+  it("admits one toggle or reset before rendering and keeps newer committed pushes over its late response", async () => {
     const firstSet = deferred<JokoDesktopAutoRelaunchSettings>();
-    const secondSet = deferred<JokoDesktopAutoRelaunchSettings>();
-    const reset = deferred<JokoDesktopAutoRelaunchSettings>();
     const updates = validUpdates();
-    updates.setAutoRelaunchOnIdle = vi.fn()
-      .mockImplementationOnce(() => firstSet.promise)
-      .mockImplementationOnce(() => secondSet.promise);
-    updates.resetAutoRelaunchSettings = vi.fn(() => reset.promise);
+    let publish!: (value: JokoDesktopAutoRelaunchSettings) => void;
+    updates.onAutoRelaunchSettings = vi.fn((listener) => { publish = listener; return vi.fn(); });
+    updates.setAutoRelaunchOnIdle = vi.fn(() => firstSet.promise);
     installDesktop(updates);
     const harness = await renderHarness();
 
     await act(async () => {
       void harness.actions().setAutoRelaunchOnIdle(true);
       void harness.actions().setAutoRelaunchOnIdle(false);
-    });
-    await act(async () => secondSet.resolve(settings(false, true)));
-    expect(harness.state().autoRelaunchOnIdle).toBe(false);
-    await act(async () => firstSet.resolve(settings(true, true)));
-    expect(harness.state().autoRelaunchOnIdle).toBe(false);
-
-    const lateSet = deferred<JokoDesktopAutoRelaunchSettings>();
-    updates.setAutoRelaunchOnIdle = vi.fn(() => lateSet.promise);
-    await act(async () => {
-      void harness.actions().setAutoRelaunchOnIdle(true);
       void harness.actions().reset();
     });
-    await act(async () => reset.resolve(settings(false, false)));
-    await act(async () => lateSet.resolve(settings(true, true)));
+    expect(updates.setAutoRelaunchOnIdle).toHaveBeenCalledExactlyOnceWith(true);
+    expect(updates.resetAutoRelaunchSettings).not.toHaveBeenCalled();
+    await act(async () => publish(settings(false, false)));
+    expect(harness.state().saving).toBe(true);
+    await act(async () => firstSet.resolve(settings(true, true)));
     expect(harness.state()).toMatchObject({
       autoRelaunchOnIdle: false,
       isCustomized: false,
@@ -151,15 +141,91 @@ describe("Desktop idle update settings", () => {
     expect(harness.state().error).toBeUndefined();
   });
 
+  it("subscribes before hydration and rejects a late read after a synchronous confirmed push", async () => {
+    const updates = validUpdates();
+    const unsubscribe = vi.fn();
+    updates.onAutoRelaunchSettings = vi.fn((listener) => {
+      listener(settings(true, true));
+      return unsubscribe;
+    });
+    updates.getAutoRelaunchSettings = vi.fn(async () => {
+      expect(updates.onAutoRelaunchSettings).toHaveBeenCalledOnce();
+      return settings(false, false);
+    });
+    installDesktop(updates);
+    const harness = await renderHarness();
+    expect(harness.state()).toMatchObject({ autoRelaunchOnIdle: true, loading: false, isCustomized: true });
+    await unmount(harness.root);
+    expect(unsubscribe).toHaveBeenCalledOnce();
+  });
+
+  it("converges two mounted settings surfaces after a toggle and reset", async () => {
+    const updates = validUpdates();
+    const listeners = new Set<(value: JokoDesktopAutoRelaunchSettings) => void>();
+    const publish = (value: JokoDesktopAutoRelaunchSettings): JokoDesktopAutoRelaunchSettings => {
+      for (const listener of listeners) listener(value);
+      return value;
+    };
+    updates.onAutoRelaunchSettings = vi.fn((listener) => {
+      listeners.add(listener);
+      return () => listeners.delete(listener);
+    });
+    updates.setAutoRelaunchOnIdle = vi.fn(async (enabled) => publish(settings(enabled, true)));
+    updates.resetAutoRelaunchSettings = vi.fn(async () => publish(settings(false, false)));
+    installDesktop(updates);
+    const first = await renderSetting();
+    const second = await renderSetting();
+    await act(async () => checkbox(first.container).click());
+    expect(checkbox(second.container).checked).toBe(true);
+    expect(second.container.textContent).toContain("Customized");
+    const reset = second.container.querySelector<HTMLButtonElement>('button[aria-label="Restore default"]');
+    await act(async () => reset?.click());
+    expect(checkbox(first.container).checked).toBe(false);
+    expect(first.container.textContent).not.toContain("Customized");
+  });
+
+  it("reads current Main authority on failure and fences a late recovery against a newer push", async () => {
+    const updates = validUpdates();
+    let publish!: (value: JokoDesktopAutoRelaunchSettings) => void;
+    updates.onAutoRelaunchSettings = vi.fn((listener) => { publish = listener; return vi.fn(); });
+    updates.setAutoRelaunchOnIdle = vi.fn(async () => { throw new Error("private failure"); });
+    installDesktop(updates);
+    const harness = await renderHarness();
+    const recovery = deferred<JokoDesktopAutoRelaunchSettings>();
+    updates.getAutoRelaunchSettings = vi.fn(() => recovery.promise);
+    await act(async () => { void harness.actions().setAutoRelaunchOnIdle(true); });
+    expect(updates.getAutoRelaunchSettings).toHaveBeenCalledOnce();
+    await act(async () => publish(settings(true, true)));
+    await act(async () => recovery.resolve(settings(false, false)));
+    expect(harness.state()).toMatchObject({ autoRelaunchOnIdle: true, isCustomized: true, saving: false, error: "save" });
+  });
+
+  it("disables an unknown setting when both save and recovery fail, then accepts a confirmed update", async () => {
+    const updates = validUpdates();
+    let publish!: (value: JokoDesktopAutoRelaunchSettings) => void;
+    updates.onAutoRelaunchSettings = vi.fn((listener) => { publish = listener; return vi.fn(); });
+    updates.setAutoRelaunchOnIdle = vi.fn(async () => { throw new Error("private failure"); });
+    installDesktop(updates);
+    const view = await renderSetting();
+    updates.getAutoRelaunchSettings = vi.fn(async () => { throw new Error("private recovery"); });
+    await act(async () => checkbox(view.container).click());
+    expect(checkbox(view.container).disabled).toBe(true);
+    expect(view.container.textContent).toContain("Idle update settings could not be loaded.");
+    await act(async () => publish(settings(true, true)));
+    expect(checkbox(view.container).checked).toBe(true);
+    expect(checkbox(view.container).disabled).toBe(false);
+  });
+
   it("drops hydration and mutation completions after unmount", async () => {
     const hydration = deferred<JokoDesktopAutoRelaunchSettings>();
     const updates = validUpdates();
     updates.getAutoRelaunchSettings = vi.fn(() => hydration.promise);
     installDesktop(updates);
     const harness = await renderHarness();
+    const renderCount = harness.renderCount();
     await unmount(harness.root);
     await act(async () => hydration.resolve(settings(true, true)));
-    expect(harness.renderCount()).toBe(1);
+    expect(harness.renderCount()).toBe(renderCount);
   });
 });
 
@@ -248,6 +314,7 @@ function validUpdates(): JokoDesktopApi["updates"] {
     getAutoRelaunchSettings: vi.fn(async () => settings(false, false)),
     setAutoRelaunchOnIdle: vi.fn(async (enabled) => settings(enabled, true)),
     resetAutoRelaunchSettings: vi.fn(async () => settings(false, false)),
+    onAutoRelaunchSettings: vi.fn(() => vi.fn()),
     getChannelSettings: vi.fn(async () => channelSettings(false, false)),
     setBetaChannelEnabled: vi.fn(async (enabled) => channelSettings(enabled, true)),
     resetChannelSettings: vi.fn(async () => channelSettings(false, false)),

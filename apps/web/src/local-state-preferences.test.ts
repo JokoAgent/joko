@@ -1,11 +1,12 @@
 import { describe, expect, it, vi } from "vitest";
-import { DEFAULT_UI_PREFERENCES, LocalState } from "./local-state.js";
+import { DEFAULT_UI_PREFERENCES, LocalState, type UiPreferences } from "./local-state.js";
 import { DEFAULT_SIDEBAR_OWNER_LAYOUT, withSidebarOwnerLayout } from "./sidebar-layout.js";
 import { subscribeAppearancePreferencesChange } from "./appearance-preference-sync.js";
 import { withAppShortcutOverride, type AppShortcutCombo } from "./app-shortcuts.js";
 import { subscribeAppShortcutPreferencesChange } from "./app-shortcut-preference-sync.js";
 import { subscribeSessionNotificationPreferenceChange } from "./session-notification-preference-sync.js";
 import { subscribeLocalePreferenceChange } from "./locale-preference-sync.js";
+import { subscribeConversationPreferencesChange } from "./conversation-preference-sync.js";
 
 describe("cross-window durable UI preference mutations", () => {
   it("merges a stale renderer's unrelated patch with the latest durable owner layout", async () => {
@@ -404,6 +405,71 @@ describe("cross-window durable UI preference mutations", () => {
       vi.unstubAllGlobals();
     }
   });
+});
+
+it("publishes one content-free conversation hint only after changed durable fields commit and reset", async () => {
+  const database = memoryPreferenceDatabase();
+  const published: Array<{ readonly value: unknown; readonly durable: unknown }> = [];
+  const channels = new Set<TestChannel>();
+  class TestChannel {
+    onmessage: ((event: MessageEvent<unknown>) => void) | null = null;
+    constructor(readonly name: string) { channels.add(this); }
+    postMessage(value: unknown): void {
+      if (this.name === "joko:conversation-preferences:v1") published.push({ value, durable: database.readUiRecord() });
+      for (const peer of channels) if (peer !== this && peer.name === this.name) {
+        queueMicrotask(() => peer.onmessage?.({ data: value } as MessageEvent<unknown>));
+      }
+    }
+    close(): void { channels.delete(this); }
+  }
+  vi.stubGlobal("BroadcastChannel", TestChannel);
+  try {
+    const state = memoryLocalState(database.database);
+    const changed = vi.fn();
+    const unsubscribe = subscribeConversationPreferencesChange(changed);
+    const patches = [
+      { composerSendShortcut: "modifier-enter" as const }, { messageNavRailEnabled: false }, { streamFadeEnabled: false },
+      { webLinkOpenPreference: "sidebar" as const }, { localLinkOpenPreference: "external" as const },
+      { personalizationPrompts: { "owner-a": "Use concise answers.", "owner-b": "Explain tradeoffs." } },
+      { newSessionWorktreeEnabled: true }
+    ];
+    for (const [index, patch] of patches.entries()) {
+      await state.mutatePreferences((current) => ({ ...current, ...patch }));
+      await state.mutatePreferences((current) => ({ ...current, ...patch }));
+      await Promise.resolve();
+      expect(changed).toHaveBeenCalledTimes(index + 1);
+      expect(published[index]).toMatchObject({ value: { kind: "conversation-preferences-changed" }, durable: patch });
+    }
+    await state.mutatePreferences((current) => ({ ...current, theme: "light", locale: "zh-CN" }));
+    expect(published).toHaveLength(patches.length);
+    database.failNextPut();
+    await expect(state.mutatePreferences((current) => ({ ...current, composerSendShortcut: "enter" })))
+      .rejects.toThrow("preference write failed");
+    expect(published).toHaveLength(patches.length);
+    await state.mutatePreferences((current) => ({
+      ...current,
+      personalizationPrompts: { "owner-b": "Explain tradeoffs.", "owner-a": "Use concise answers." }
+    }));
+    await Promise.resolve();
+    expect(changed).toHaveBeenCalledTimes(patches.length + 1);
+    expect(published[patches.length]?.value).toEqual({ kind: "conversation-preferences-changed" });
+    expect(Object.keys((published[patches.length]?.durable as UiPreferences).personalizationPrompts)).toEqual(["owner-b", "owner-a"]);
+    await state.mutatePreferences((current) => ({
+      ...current, composerSendShortcut: "enter", messageNavRailEnabled: true, streamFadeEnabled: true,
+      webLinkOpenPreference: "external", localLinkOpenPreference: "sidebar", personalizationPrompts: {}, newSessionWorktreeEnabled: false
+    }));
+    await Promise.resolve();
+    expect(changed).toHaveBeenCalledTimes(patches.length + 2);
+    expect(published[patches.length + 1]?.durable).toMatchObject({ theme: "light", locale: "zh-CN" });
+    for (const patch of patches) expect(published[patches.length + 1]?.durable).not.toHaveProperty(Object.keys(patch)[0]!);
+    unsubscribe();
+    vi.stubGlobal("BroadcastChannel", undefined);
+    await expect(state.mutatePreferences((current) => ({ ...current, composerSendShortcut: "modifier-enter" }))).resolves.toMatchObject({
+      composerSendShortcut: "modifier-enter"
+    });
+  } finally {
+    vi.unstubAllGlobals();
+  }
 });
 
 describe("device-local recent projects", () => {

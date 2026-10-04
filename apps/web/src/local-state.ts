@@ -27,6 +27,7 @@ import {
   sameSessionNotificationPreference
 } from "./session-notification-preference-sync.js";
 import { publishLocalePreferenceChange, sameLocalePreference } from "./locale-preference-sync.js";
+import { publishConversationPreferencesChange, sameConversationPreferences } from "./conversation-preference-sync.js";
 import {
   DEFAULT_SIDEBAR_DISPLAY_PREFERENCES,
   normalizeSidebarDisplayPreferences,
@@ -695,6 +696,7 @@ export class LocalState {
     if (!sameAppShortcutProjection(current, next)) publishAppShortcutPreferencesChange();
     if (!sameSessionNotificationPreference(current, next)) publishSessionNotificationPreferenceChange();
     if (!sameLocalePreference(current, next)) publishLocalePreferenceChange();
+    if (!sameConversationPreferences(current, next)) publishConversationPreferencesChange();
     return next;
   }
 
