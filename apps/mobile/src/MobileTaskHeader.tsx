@@ -6,7 +6,7 @@ import type { MobileSupportedLocale } from "./mobile-locale-preference";
 import { mobileMessage } from "./mobile-messages";
 
 export interface MobileTaskHeaderAction {
-  readonly id: "branches" | "context" | "controls" | "copy-link" | "files" | "refresh";
+  readonly id: "clone" | "branches" | "context" | "controls" | "copy-link" | "files" | "refresh";
   readonly label: string;
   readonly disabled: boolean;
   readonly onPress: () => void;

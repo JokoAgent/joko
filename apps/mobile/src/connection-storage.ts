@@ -21,13 +21,17 @@ export interface PendingOperation {
     | "message-delete" | "queue-cancel" | "queue-edit-lock" | "queue-edit"
     | "queue-interaction-lock" | "queue-reorder" | "interaction-resolve" | "interaction-dismiss"
     | "session-model" | "session-permission" | "session-plan" | "session-compact" | "session-branch"
-    | "session-shell" | "session-reset" | "session-review"
+    | "session-shell" | "session-reset" | "session-review" | "session-clone" | "session-fork" | "session-rewind" | "workspace-rewind"
     | "schedule-run" | "schedule-enable" | "schedule-run-restart" | "schedule-run-read"
     | "schedule-runs-read" | "schedule-all-read" | "schedule-run-delete"
     | "schedule-create" | "schedule-update" | "schedule-delete" | "schedule-promote"
     | "schedule-clone" | "schedule-project-remove" | "schedule-project-reconcile" | "voice-settings";
   readonly sessionId?: string;
   readonly eventId?: string;
+  readonly backendId?: string;
+  readonly sourceGeneration?: string;
+  readonly workspaceId?: string;
+  readonly changeSetId?: string;
   readonly queueItemId?: string;
   readonly interactionId?: string;
   readonly interactionGeneration?: string;
@@ -392,13 +396,18 @@ function isPending(value: unknown): value is PendingOperation {
     || !["create", "send", "logout", "revoke", "device-rename", "rename", "pin", "archive", "delete", "message-delete",
       "queue-cancel", "queue-edit-lock", "queue-edit", "queue-interaction-lock", "queue-reorder",
       "interaction-resolve", "interaction-dismiss", "session-model", "session-permission", "session-plan", "session-compact",
-      "session-branch", "session-shell", "session-reset", "session-review", "schedule-run", "schedule-enable",
+      "session-branch", "session-shell", "session-reset", "session-review", "session-clone", "session-fork", "session-rewind", "workspace-rewind", "schedule-run", "schedule-enable",
       "schedule-run-restart", "schedule-run-read", "schedule-runs-read", "schedule-all-read",
       "schedule-run-delete", "schedule-create", "schedule-update", "schedule-delete", "schedule-promote",
       "schedule-clone", "schedule-project-remove", "schedule-project-reconcile", "voice-settings"].includes(String(record.kind))
     || (record.state !== "unknown" && record.state !== "accepted")) return false;
   if (record.sessionId !== undefined && typeof record.sessionId !== "string") return false;
   if (record.eventId !== undefined && typeof record.eventId !== "string") return false;
+  if (record.backendId !== undefined && !validReceiptIdentity(record.backendId)) return false;
+  if (record.sourceGeneration !== undefined && (typeof record.sourceGeneration !== "string" || record.sourceGeneration.length > 20
+    || !/^[1-9][0-9]*$/u.test(record.sourceGeneration) || BigInt(record.sourceGeneration) > 18_446_744_073_709_551_615n)) return false;
+  if (record.workspaceId !== undefined && !validReceiptIdentity(record.workspaceId)) return false;
+  if (record.changeSetId !== undefined && !validReceiptIdentity(record.changeSetId)) return false;
   if (record.queueItemId !== undefined && typeof record.queueItemId !== "string") return false;
   if (record.interactionId !== undefined && typeof record.interactionId !== "string") return false;
   if (record.interactionGeneration !== undefined && (typeof record.interactionGeneration !== "string" || !/^[1-9][0-9]*$/u.test(record.interactionGeneration))) return false;
@@ -426,8 +435,13 @@ function isPending(value: unknown): value is PendingOperation {
     && (typeof record.sessionId !== "string" || typeof record.interactionId !== "string"
       || typeof record.interactionGeneration !== "string" || typeof record.interactionRevision !== "string")) return false;
   if (["session-model", "session-permission", "session-plan", "session-compact", "session-branch",
-    "session-shell", "session-reset", "session-review"].includes(String(record.kind))
+    "session-shell", "session-reset", "session-review", "session-clone", "session-fork"].includes(String(record.kind))
     && typeof record.sessionId !== "string") return false;
+  if (record.kind === "session-fork" && !validReceiptIdentity(record.eventId)) return false;
+  if (["session-rewind", "workspace-rewind"].includes(String(record.kind)) && (!validReceiptIdentity(record.sessionId)
+    || !validReceiptIdentity(record.eventId) || !validReceiptIdentity(record.targetId) || !validReceiptIdentity(record.backendId)
+    || record.sourceGeneration === undefined)) return false;
+  if (record.kind === "workspace-rewind" && (!validReceiptIdentity(record.workspaceId) || !validReceiptIdentity(record.changeSetId))) return false;
   if (["schedule-run", "schedule-enable", "schedule-runs-read"].includes(String(record.kind))
     && !validReceiptIdentity(record.scheduleId)) return false;
   if (["schedule-run-restart", "schedule-run-read", "schedule-run-delete"].includes(String(record.kind))
@@ -445,8 +459,11 @@ function isPending(value: unknown): value is PendingOperation {
     && (record.scheduleId !== undefined || record.triggerId !== undefined)) return false;
   if (!["schedule-run-restart", "schedule-run-read", "schedule-run-delete"].includes(String(record.kind))
     && record.triggerId !== undefined) return false;
-  if (!["schedule-create", "schedule-update", "schedule-project-reconcile"].includes(String(record.kind))
+  if (!["schedule-create", "schedule-update", "schedule-project-reconcile", "session-rewind", "workspace-rewind"].includes(String(record.kind))
     && record.targetId !== undefined) return false;
+  if (!["session-rewind", "workspace-rewind"].includes(String(record.kind))
+    && (record.backendId !== undefined || record.sourceGeneration !== undefined || record.workspaceId !== undefined || record.changeSetId !== undefined)) return false;
+  if (record.kind === "session-rewind" && (record.workspaceId !== undefined || record.changeSetId !== undefined)) return false;
   if (!["interaction-resolve", "interaction-dismiss"].includes(String(record.kind))
     && (record.interactionId !== undefined || record.interactionGeneration !== undefined
       || record.interactionRevision !== undefined || record.interactionDraftKind !== undefined)) return false;

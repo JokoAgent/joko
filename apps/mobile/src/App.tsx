@@ -157,6 +157,9 @@ import {
 import type { MobileTimelineArtifact } from "./mobile-timeline-artifacts";
 import { MobileDrawer } from "./MobileDrawer";
 import { MobileActionSheet } from "./MobileActionSheet";
+import { MobileTaskDerivationSheet } from "./MobileTaskDerivationSheet";
+import { MobileMessageRewindSheet } from "./MobileMessageRewindSheet";
+import { MobileSessionDerivationMarker } from "./MobileSessionDerivationMarker";
 import { MobileTaskHeader } from "./MobileTaskHeader";
 import { MobileComposerAtomSheet } from "./MobileComposerAtomSheet";
 import {
@@ -614,8 +617,34 @@ export function App() {
   const nativeIntentConnectingRef = useRef(false);
   const externalIntentFenceRef = useRef<MobileExternalIntentFence | null>(null);
   const appMountedRef = useRef(true);
+  const externalNavigationRevisionRef = useRef(0);
   if (nativeIntentDeliveryRef.current === null) nativeIntentDeliveryRef.current = new MobileNativeIntentDelivery();
   if (externalIntentFenceRef.current === null) externalIntentFenceRef.current = new MobileExternalIntentFence();
+  const offerNativeUrl = useCallback((url: string): boolean => {
+    if (isMobileIncomingShareUrl(url)) {
+      externalNavigationRevisionRef.current++;
+      externalIntentFenceRef.current!.offerShare();
+      nativeIntentDeliveryRef.current!.invalidate();
+      if (nativeIntentConnectingRef.current) client.cancel();
+      setIncomingShareRequestRevision((value) => value + 1);
+      void mobileIncomingShare.refresh().catch(() => undefined);
+      return true;
+    }
+    const intent = parseMobileNativeIntent(url);
+    if (intent !== undefined && nativeIntentDeliveryRef.current!.offer(url)) {
+      externalNavigationRevisionRef.current++;
+      externalIntentFenceRef.current!.offerNative(intent);
+      if (nativeIntentConnectingRef.current) client.cancel();
+      setNativeIntentRevision((value) => value + 1);
+    }
+    return intent !== undefined;
+  }, []);
+  const openDerivationOrigin = useCallback(async (authorityKey: string, signal: AbortSignal): Promise<boolean> => {
+    const revision = externalNavigationRevisionRef.current;
+    const url = await client.prepareTaskDerivationOrigin(authorityKey, signal);
+    return url !== undefined && !signal.aborted && appMountedRef.current && AppState.currentState === "active"
+      && revision === externalNavigationRevisionRef.current && offerNativeUrl(url);
+  }, [offerNativeUrl]);
   const scheme = useColorScheme();
   const dark = resolveMobileDarkTheme(theme.preference, scheme);
   const colors = useMemo(() => ({
@@ -693,25 +722,8 @@ export function App() {
       diagnosticsTick = nextTick;
       if (mobileDiagnostics.snapshot.enabled) void mobileDiagnostics.flush().catch(() => undefined);
     }, 2_000);
-    const offerUrl = (url: string): boolean => {
-      if (isMobileIncomingShareUrl(url)) {
-        externalIntentFenceRef.current!.offerShare();
-        nativeIntentDeliveryRef.current!.invalidate();
-        if (nativeIntentConnectingRef.current) client.cancel();
-        setIncomingShareRequestRevision((value) => value + 1);
-        void mobileIncomingShare.refresh().catch(() => undefined);
-        return true;
-      }
-      const intent = parseMobileNativeIntent(url);
-      if (intent !== undefined && nativeIntentDeliveryRef.current!.offer(url)) {
-        externalIntentFenceRef.current!.offerNative(intent);
-        if (nativeIntentConnectingRef.current) client.cancel();
-        setNativeIntentRevision((value) => value + 1);
-      }
-      return intent !== undefined;
-    };
-    const removeLinking = installMobileNativeIntentLinking(Linking, offerUrl);
-    void mobilePush.start(offerUrl, lifecycle.transportForeground);
+    const removeLinking = installMobileNativeIntentLinking(Linking, offerNativeUrl);
+    void mobilePush.start(offerNativeUrl, lifecycle.transportForeground);
     mobilePush.handleAppStateChange(AppState.currentState);
     return () => {
       appMountedRef.current = false;
@@ -895,6 +907,7 @@ export function App() {
                     setPage("partners");
                   }}
                   focusComposer={focusTaskComposer} onComposerFocused={handleComposerFocused}
+                  onOpenDerivationOrigin={openDerivationOrigin}
                   messageFocus={nativeIntentMessageFocus} /> :
                 page === "files" ? <FilesScreen {...common} initialSource={filesInitialSource} onBack={() => setPage("task")}
                   onAdded={() => {
@@ -3201,11 +3214,12 @@ function NewTaskScreen({ colors, state, locale, onBack, onCreated, onImportedExi
 }
 
 function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onOpenPartnerThread, focusComposer, onComposerFocused,
-  messageFocus }: ScreenProps & {
+  messageFocus, onOpenDerivationOrigin }: ScreenProps & {
   onBack: () => void; onHome: () => void; onNew: () => void; onFiles: (source?: MobileFilesComposerSource) => void;
   onOpenPartnerThread: (preview: NonNullable<TimelineRow["partnerPrivatePreview"]>) => void;
   focusComposer: boolean; onComposerFocused: () => void;
   messageFocus?: MobileNativeIntentMessageFocus;
+  onOpenDerivationOrigin: (authorityKey: string, signal: AbortSignal) => Promise<boolean>;
 }) {
   const initialDraftIdentity = state.activeProfileId && state.selectedId
     ? { profileId: state.activeProfileId, sessionId: state.selectedId }
@@ -3470,6 +3484,12 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
   const contextControls = state.status === "connected" ? client.taskContextControls() : undefined;
   const contextOwnerRef = useRef(contextControls?.surfaceOwnerKey);
   const nativeTreeControls = state.status === "connected" ? client.taskNativeTreeControls() : undefined;
+  const cloneControls = state.status === "connected" ? client.taskCloneControls() : undefined;
+  const [cloneVisible, setCloneVisible] = useState(false);
+  const [forkEventId, setForkEventId] = useState<string>();
+  const forkControls = state.status === "connected" && forkEventId ? client.taskMessageForkControls(forkEventId) : undefined;
+  const [rewindEventId, setRewindEventId] = useState<string>();
+  const rewindControls = state.status === "connected" && rewindEventId ? client.taskMessageRewindControls(rewindEventId) : undefined;
   const nativeTreeOwnerRef = useRef(nativeTreeControls?.surfaceOwnerKey);
   const sessionMentionControls = state.status === "connected" ? client.taskSessionMentionControls() : undefined;
   const sessionMentionOwnerRef = useRef(sessionMentionControls?.surfaceOwnerKey);
@@ -3818,6 +3838,18 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
       void mobileComposerDrafts.flush(identity).catch(() => undefined);
     };
   }, [draftIdentityKey]);
+  useEffect(() => {
+    const restored = state.restoredComposerDraft;
+    const identity = draftIdentityRef.current;
+    if (!restored || !identity || restored.profileId !== identity.profileId || restored.sessionId !== identity.sessionId
+      || !taskMountedRef.current || AppState.currentState !== "active" || queueEditRef.current) return;
+    const next = mobileComposerDrafts.readSync(identity);
+    if (!next) return;
+    composerDraftRef.current = next;
+    setDraft(next);
+    setComposerSelection({ start: next.text.length, end: next.text.length });
+    setDraftReady(true);
+  }, [state.restoredComposerDraft]);
   const composerOwnerReady = loadedDraftKey === draftIdentityKey && draftReady;
   useEffect(() => {
     if (!composerOwnerReady || !focusComposer) return;
@@ -3949,12 +3981,15 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
   const messageActionItems = messageAction
     ? buildMobileMessageActions(messageAction.row, {
       canDelete: client.canDeleteMessage(messageAction.row.eventId), locale, copyDisabled: copyBusy,
+      canFork: !state.busy && !attachmentBusy && !voice.busy && client.taskMessageForkControls(messageAction.row.eventId)?.canFork === true,
+      canRewind: !state.busy && !attachmentBusy && !voice.busy && queueEdit === undefined
+        && client.taskMessageRewindControls(messageAction.row.eventId)?.canRewind === true,
       shareDisabled: conversationShareDisabled
     }).filter((item) => state.status === "connected" || item.id === "copy-link")
     : [];
   useMobileScreenshotSelection({ owner: client.conversationShareOwnerKey(), selectionActive: conversationShare.active,
     blocked: conversationShareDisabled || drawerOpen || messageActionsVisible || taskActionsVisible || interactionVisible || contextVisible
-      || nativeTreeVisible || runtimeControlsVisible || sessionMentionsVisible || workspaceMentionsVisible || catalogMentionsVisible
+      || cloneVisible || forkEventId !== undefined || rewindEventId !== undefined || nativeTreeVisible || runtimeControlsVisible || sessionMentionsVisible || workspaceMentionsVisible || catalogMentionsVisible
       || photoLibraryLease !== undefined || imageEditorLease !== undefined || quoteSelection !== undefined
       || commandHelpItems !== undefined || runtimeCommandCommitting,
     visible: (signal) => {
@@ -5031,6 +5066,21 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
       return;
     }
     if (state.status !== "connected" || voice.busy) return;
+    if (action === "fork") {
+      if (state.busy || attachmentBusy || !client.taskMessageForkControls(latest.eventId)?.canFork) return;
+      setSessionMentionsVisible(false); setWorkspaceMentionsVisible(false); setCatalogMentionsVisible(false);
+      setContextVisible(false); setRuntimeControlsVisible(false); setNativeTreeVisible(false); setCloneVisible(false);
+      setRewindEventId(undefined);
+      setForkEventId(latest.eventId);
+      return;
+    }
+    if (action === "rewind") {
+      if (state.busy || attachmentBusy || queueEditRef.current || !client.taskMessageRewindControls(latest.eventId)?.canRewind) return;
+      setSessionMentionsVisible(false); setWorkspaceMentionsVisible(false); setCatalogMentionsVisible(false);
+      setContextVisible(false); setRuntimeControlsVisible(false); setNativeTreeVisible(false); setCloneVisible(false); setForkEventId(undefined);
+      setRewindEventId(latest.eventId);
+      return;
+    }
     if (action === "share-image") {
       if (!conversationShareDisabled) conversationShare.enter(latest.id);
       return;
@@ -5302,6 +5352,9 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
         ? () => { pendingDrawerActionRef.current = undefined; setDrawerOpen(true); } : onBack}
       disabled={session === undefined} colors={colors} locale={locale} onMenuVisibilityChange={setTaskActionsVisible}
       actions={[
+        { id: "clone", label: mobileMessage(locale, "clone.title"),
+          onPress: () => { setSessionMentionsVisible(false); setWorkspaceMentionsVisible(false); setCatalogMentionsVisible(false); setContextVisible(false); setRuntimeControlsVisible(false); setNativeTreeVisible(false); setForkEventId(undefined); setRewindEventId(undefined); setCloneVisible(true); },
+          disabled: !cloneControls?.canClone || state.busy || attachmentBusy || voice.busy },
         { id: "branches", label: mobileMessage(locale, "task.branches"),
           onPress: () => { setSessionMentionsVisible(false); setWorkspaceMentionsVisible(false); setCatalogMentionsVisible(false); setContextVisible(false); setRuntimeControlsVisible(false); setNativeTreeVisible(true); },
           disabled: state.status !== "connected" || nativeTreeControls === undefined || state.busy || attachmentBusy || voice.busy || interactions.length > 0 },
@@ -5346,11 +5399,15 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
           messageFocusRetryRef.current = undefined;
         }, 80);
       }}
-      ListHeaderComponent={<View style={styles.historyActions}>
+      ListHeaderComponent={<View>
+        <MobileSessionDerivationMarker controls={client.taskDerivationOriginControls()} colors={colors} locale={locale}
+          busy={state.busy || attachmentBusy || voice.busy} onOpen={onOpenDerivationOrigin} />
+        <View style={styles.historyActions}>
         {state.window && <Action label={mobileMessage(locale, "task.returnLatest")} colors={colors} onPress={() => client.latest()} />}
         {!state.historyEnd && <Action label={mobileMessage(locale, state.historyBusy ? "task.loadingHistory" : "task.loadEarlier")} colors={colors}
           disabled={state.historyBusy || state.status !== "connected"}
           onPress={() => void client.older().catch((error) => setLocalError(errorText(error)))} />}
+        </View>
       </View>}
       ListEmptyComponent={<Centered label={mobileMessage(locale, state.status === "offline"
         ? state.detail ? "task.offlineEmpty" : "task.offlineMissing" : "task.empty")} colors={colors} />}
@@ -5824,6 +5881,29 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
     <MobileQuoteSelectionSheet lease={state.status === "connected" ? quoteSelection?.lease : undefined} locale={locale}
       colors={colors} busy={state.busy || voice.busy}
       onClose={() => setQuoteSelection(undefined)} onAdd={addSelectedQuote} />
+    <MobileTaskDerivationSheet kind="clone" visible={cloneVisible}
+      controls={cloneControls ? { ...cloneControls, canDerive: cloneControls.canClone } : undefined} locale={locale} colors={colors}
+      busy={state.busy || attachmentBusy || voice.busy} onClose={() => setCloneVisible(false)}
+      onSubmit={(key, name, signal) => client.cloneTask(key, name, signal)}
+      onOpen={(id) => { setCloneVisible(false); void client.select(id).catch((error) => {
+        if (taskMountedRef.current) setLocalError(errorText(error));
+      }); }} onError={setLocalError} />
+    <MobileTaskDerivationSheet kind="fork" visible={forkEventId !== undefined}
+      controls={forkControls ? { ...forkControls, canDerive: forkControls.canFork, restoreInput: forkControls.source.restoreInput } : undefined}
+      locale={locale} colors={colors} busy={state.busy || attachmentBusy || voice.busy} onClose={() => setForkEventId(undefined)}
+      onSubmit={(key, name, signal) => client.forkTaskMessage(key, forkEventId!, name, signal)}
+      onOpen={(id) => { setForkEventId(undefined); void client.select(id).catch((error) => {
+        if (taskMountedRef.current) setLocalError(errorText(error));
+      }); }} onError={setLocalError} />
+    <MobileMessageRewindSheet visible={rewindEventId !== undefined} controls={rewindControls} locale={locale} colors={colors}
+      busy={state.busy || attachmentBusy || voice.busy || queueEdit !== undefined} onClose={() => setRewindEventId(undefined)}
+      onLoad={(key, eventId, signal) => client.loadTaskMessageRewindPreview(key, eventId, signal)}
+      onCommit={(preview, mode, signal) => client.commitTaskMessageRewind(preview, mode, signal)}
+      onCheckOperation={async () => {
+        await client.reconcile();
+        return !client.state.pending.some((value) => value.sessionId === state.selectedId
+          && (value.kind === "session-rewind" || value.kind === "workspace-rewind"));
+      }} onError={setLocalError} />
     <MobileComposerAtomSheet atom={state.status === "connected"
       ? draft.atoms.find((atom) => atom.atomId === composerAtomId) : undefined}
       colors={colors} locale={locale} busy={state.busy || voice.busy || attachmentBusy || !composerOwnerReady || queueEdit !== undefined}

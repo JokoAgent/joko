@@ -16,7 +16,7 @@ import { mobileVisibleSelectionQuoteText } from "./mobile-composer-document";
 import type { MobileSupportedLocale } from "./mobile-locale-preference";
 import { mobileMessage } from "./mobile-messages";
 
-export type MobileMessageActionId = "add-to-composer" | "quote-selection" | "copy-link" | "share-image" | "delete";
+export type MobileMessageActionId = "add-to-composer" | "quote-selection" | "copy-link" | "share-image" | "fork" | "rewind" | "delete";
 
 export interface MobileMessageActionItem {
   readonly id: MobileMessageActionId;
@@ -28,7 +28,7 @@ export interface MobileMessageActionItem {
 
 export function buildMobileMessageActions(
   row: TimelineRow,
-  input: { readonly canDelete: boolean; readonly locale: MobileSupportedLocale; readonly copyDisabled?: boolean; readonly shareDisabled?: boolean }
+  input: { readonly canDelete: boolean; readonly canFork?: boolean; readonly canRewind?: boolean; readonly locale: MobileSupportedLocale; readonly copyDisabled?: boolean; readonly shareDisabled?: boolean }
 ): readonly MobileMessageActionItem[] {
   if (!row.completed || row.optimistic || (row.kind !== "user" && row.kind !== "assistant")) return [];
   const actions: MobileMessageActionItem[] = [];
@@ -40,6 +40,8 @@ export function buildMobileMessageActions(
     ...(input.copyDisabled ? { disabled: true } : {})
   });
   actions.push({ id: "share-image", label: mobileMessage(input.locale, "share.shareImage"), ...(input.shareDisabled ? { disabled: true } : {}) });
+  if (input.canFork) actions.push({ id: "fork", label: mobileMessage(input.locale, "fork.title") });
+  if (input.canRewind && row.kind === "user") actions.push({ id: "rewind", label: mobileMessage(input.locale, "rewind.title") });
   if (input.canDelete) actions.push({
     id: "delete",
     label: mobileMessage(input.locale, "actions.deleteMessage"),

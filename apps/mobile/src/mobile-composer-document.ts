@@ -93,7 +93,8 @@ export interface MobileComposerQuoteAtom {
   readonly sourceSessionId: string;
   readonly sourceMessageId: string;
   readonly sourceEventId: string;
-  readonly sourceRole: "assistant";
+  /** A restored quote can retain its canonical containing user input. */
+  readonly sourceRole: "assistant" | "user";
   readonly text: string;
   readonly start: number;
   readonly end: number;
@@ -963,6 +964,98 @@ export function mobileComposerInput(draft: MobileComposerDraft): InputContent {
   });
 }
 
+/** Restore accepted input semantics; historical attachment bytes require a new explicit selection. */
+export function restoreMobileComposerInput(input: InputContent, source: {
+  readonly sessionId: string; readonly messageId: string; readonly eventId: string;
+}): MobileComposerDraft {
+  const wireText = input.parts.flatMap((part) => part.content.case === "text" ? [part.content.value] : []).join("");
+  if (wireText.length > maximumSerializedCharacters || input.parts.length > 1_024) {
+    throw new Error("The historical task input exceeds the composer limit.");
+  }
+  const parts = input.parts.flatMap((part) => part.content.case === "sessionMention" || part.content.case === "workspaceMention"
+    || part.content.case === "resourceMention" || part.content.case === "artifactMention" ? [part.content] : []);
+  if (!validMentionRanges(wireText, parts.length, input.mentionRanges, input.pastedTextRanges)) {
+    throw new Error("The historical task input has invalid reference or paste ranges.");
+  }
+  type Segment = { start: number; end: number; kind: "mention"; index: number }
+    | { start: number; end: number; kind: "paste" | "quote"; text: string };
+  const segments: Segment[] = [
+    ...input.mentionRanges.map((range): Segment => ({ start: range.start, end: range.end, kind: "mention", index: range.mentionIndex })),
+    ...input.pastedTextRanges.map((range): Segment => ({ start: range.start, end: range.end, kind: "paste", text: wireText.slice(range.start, range.end) }))
+  ];
+  if (input.quotesEncoded) {
+    let cursor = 0;
+    const lines = wireText.match(/[^\n]*\n|[^\n]+$/gu) ?? [];
+    for (let index = 0; index < lines.length; index += 1) {
+      const line = lines[index]!;
+      const start = cursor; cursor += line.length;
+      if (line.replace(/\n$/u, "") !== mobileSelectionQuoteMarkerLine
+        || segments.some((segment) => start < segment.end && cursor > segment.start)) continue;
+      let end = cursor;
+      const quoted: string[] = [];
+      while (index + 1 < lines.length) {
+        const next = lines[index + 1]!.replace(/\n$/u, "");
+        if (next !== ">" && !next.startsWith("> ")) break;
+        quoted.push(next === ">" ? "" : next.slice(2));
+        index += 1; end += lines[index]!.length; cursor = end;
+      }
+      if (wireText[end - 1] === "\n") end -= 1;
+      if (quoted.length === 0 || segments.some((segment) => start < segment.end && end > segment.start)) {
+        throw new Error("The historical quote overlaps another input item or has no quoted text.");
+      }
+      segments.push({ start, end, kind: "quote", text: quoted.join("\n") });
+    }
+  }
+  segments.sort((left, right) => left.start - right.start);
+  let text = ""; let cursor = 0;
+  const mentions: MobileComposerMention[] = [];
+  const atoms: MobileComposerAtom[] = [];
+  const restored = new Set<number>();
+  type MentionSeed = Omit<MobileComposerSessionMention, "mentionId" | "start" | "end">
+    | Omit<MobileComposerWorkspaceMention, "mentionId" | "start" | "end">
+    | Omit<MobileComposerResourceMention, "mentionId" | "start" | "end">
+    | Omit<MobileComposerArtifactMention, "mentionId" | "start" | "end">;
+  const mentionSeed = (index: number): MentionSeed => {
+    const part = parts[index]!;
+    if (part.case === "sessionMention") return { kind: "session", sessionId: part.value.sessionId, displayText: part.value.displayText };
+    if (part.case === "workspaceMention") return { kind: "workspace", workspaceId: part.value.workspaceId,
+      relativePath: part.value.relativePath, directory: part.value.directory, displayText: part.value.displayText,
+      ...(part.value.lineRange ? { lineRange: { startLine: part.value.lineRange.startLine, endLine: part.value.lineRange.endLine } } : {}) };
+    if (part.case === "resourceMention") return { kind: "resource", resourceId: part.value.resourceId,
+      displayText: part.value.displayText, discoveredRevision: part.value.discoveredRevision,
+      resourceVersion: part.value.resourceVersion.toString(10), runtimeGeneration: part.value.runtimeGeneration.toString(10) };
+    return { kind: "artifact", artifactId: part.value.artifactId, sourceSessionId: part.value.sourceSessionId,
+      displayText: part.value.displayText };
+  };
+  for (const segment of segments) {
+    if (segment.start < cursor) throw new Error("The historical input items overlap.");
+    text += wireText.slice(cursor, segment.start);
+    const start = text.length;
+    if (segment.kind === "mention") {
+      const seed = mentionSeed(segment.index);
+      text += mobileComposerMentionToken(seed);
+      mentions.push({ ...seed, mentionId: `restored-mention-${segment.index}`, start, end: text.length } as MobileComposerMention);
+      restored.add(segment.index);
+    } else {
+      const seed = segment.kind === "quote" ? { kind: "quote" as const, text: segment.text, sourceRole: "user" as const,
+        sourceSessionId: source.sessionId, sourceMessageId: source.messageId, sourceEventId: source.eventId }
+        : { kind: "pasted-text" as const, text: segment.text };
+      text += mobileComposerAtomToken(seed);
+      atoms.push({ ...seed, atomId: `restored-${segment.kind}-${atoms.length}`, start, end: text.length });
+    }
+    cursor = segment.end;
+  }
+  text += wireText.slice(cursor);
+  parts.forEach((_part, index) => {
+    if (restored.has(index)) return;
+    if (text.length) text += atoms.some((atom) => atom.kind === "quote" && atom.end === text.length) ? "\n\n" : "\n";
+    const seed = mentionSeed(index); const start = text.length;
+    text += mobileComposerMentionToken(seed);
+    mentions.push({ ...seed, mentionId: `restored-mention-${index}`, start, end: text.length } as MobileComposerMention);
+  });
+  return normalizeMobileComposerDraft({ text, mentions, atoms, attachments: [], slashCommands: [] });
+}
+
 export function mobileInputSummary(input: InputContent | undefined, typedMetadataTrusted = true): string {
   if (!input) return "";
   const wireText = input.parts.flatMap((part) => part.content.case === "text" ? [part.content.value] : []).join("");
@@ -1133,7 +1226,7 @@ function replaceMobileComposerAtom(
 function normalizeQuoteAtom(
   atom: MobileComposerQuoteAtom
 ): Omit<MobileComposerQuoteAtom, "atomId" | "start" | "end"> {
-  if (atom.sourceRole !== "assistant") throw new Error("Only assistant text can be stored as a message quote.");
+  if (atom.sourceRole !== "assistant" && atom.sourceRole !== "user") throw new Error("The message quote source role is invalid.");
   const text = normalizedSelectionQuoteText(atom.text);
   if (text === undefined || text !== atom.text || text.length > mobileSelectionQuoteMaximumCharacters) {
     throw new Error("The local Joko message quote is invalid.");
@@ -1143,7 +1236,7 @@ function normalizeQuoteAtom(
     sourceSessionId: normalizeExactIdentity(atom.sourceSessionId, "quote source task", 1_024),
     sourceMessageId: normalizeExactIdentity(atom.sourceMessageId, "quote source message", 1_024),
     sourceEventId: normalizeExactIdentity(atom.sourceEventId, "quote source Event", 1_024),
-    sourceRole: "assistant",
+    sourceRole: atom.sourceRole,
     text
   };
 }

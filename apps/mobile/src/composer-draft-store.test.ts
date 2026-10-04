@@ -35,6 +35,24 @@ describe("mobile composer draft store", () => {
   beforeEach(() => vi.useFakeTimers());
   afterEach(() => vi.useRealTimers());
 
+  it("retains rewind input across restart under exact task and operation identity without replacing the newer live draft", async () => {
+    const memory = memoryDriver(); const store = new MobileComposerDraftStore(memory.driver);
+    const input = insertMobilePastedText(plainTextMobileComposerDraft("Original "), { start: 9, end: 9 }, "😀 original\n".repeat(30), "paste").draft;
+    store.save(first, plainTextMobileComposerDraft("Newer draft")); await store.flush(first);
+    await store.retainOperationInput(first, "rewind", input);
+    const restarted = new MobileComposerDraftStore(memory.driver);
+    await expect(restarted.readOperationInput(first, "rewind")).resolves.toEqual(input);
+    await expect(restarted.read(first)).resolves.toEqual(plainTextMobileComposerDraft("Newer draft"));
+    await expect(restarted.readOperationInput(second, "rewind")).resolves.toBeNull();
+    await expect(restarted.readOperationInput(first, "other")).resolves.toBeNull();
+    const key = [...memory.values.keys()].find((value) => value.includes(".operation-input."))!;
+    const record = JSON.parse(memory.values.get(key)!); record.identity.sessionId = second.sessionId;
+    memory.values.set(key, JSON.stringify(record));
+    await expect(restarted.readOperationInput(first, "rewind")).rejects.toThrow();
+    await restarted.clearOperationInput(first, "rewind");
+    await expect(restarted.readOperationInput(first, "rewind")).resolves.toBeNull();
+  });
+
   it("debounces the latest structured draft independently for each exact profile and task", async () => {
     const memory = memoryDriver();
     const store = new MobileComposerDraftStore(memory.driver);

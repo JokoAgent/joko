@@ -1,4 +1,4 @@
-import { create, toBinary } from "@bufbuild/protobuf";
+import { clone, create, toBinary } from "@bufbuild/protobuf";
 import { Code } from "@connectrpc/connect";
 import { createHash } from "node:crypto";
 import {
@@ -6,11 +6,11 @@ import {
   CapabilityManifestSchema, CapabilityOptionsSchema, CapabilitySchema, CapabilitySupport, CompactSessionOutcome, ConnectionSchema, ConnectionState,
   ContextUsageSchema, DeviceKind, DevicePresenceState, DeviceSchema, EntityKind, EntityVersionSchema,
   FileKind, FilePreviewSchema, FileRevisionSchema, TargetSchema, WorkspaceDescriptorSchema, WorkspaceEntrySchema, WorkspaceFileChangeKind, WorkspaceFileChangeSchema,
-  WorkspaceSearchMatchSchema,
+  WorkspaceSearchMatchSchema, WorkspaceChangeSetSchema, WorkspaceRewindPreviewSchema, WorkspaceRewindResultSchema, RewindSafety, FileChangeKind,
   JOKO_API_VERSION, NativeEntryKind, NativeSessionBindingSchema, NativeSessionTreeNodeSchema, NativeSessionTreeSchema, OperationSchema,
   ListPartnerSessionsResponseSchema, PartnerSessionRole,
   InputCapabilityOptionsSchema, InteractionKind, InteractionSchema, InteractionState, PermissionDecisionKind, PermissionRisk, PlanReviewDecisionKind,
-  EventCursorSchema, EventSchema, ImageRefSchema, MessageRole, ModelDescriptorSchema, ModelInputModality, ModelKeySchema, ModelOutputModality, ModelSelectionSchema,
+  EventCursorSchema, EventSchema, ImageRefSchema, MessageInputDelivery, MessageRole, ModelDescriptorSchema, ModelInputModality, ModelKeySchema, ModelOutputModality, ModelSelectionSchema,
   OperationMutationSchema, OperationState, OwnerSnapshotScopeSchema, PermissionMode,
   ProviderDescriptorSchema, ProviderKind, RevisionSchema, SessionMessageSearchMatchSchema, SessionSnapshotScopeSchema,
   SettingsSnapshotSchema, SnapshotScopeSchema, UsageSchema,
@@ -22,8 +22,8 @@ import {
   ScheduleGeneratedSessionDisposition,
   ScheduleDeletionResultSchema, ScheduleRunCostAttribution, ScheduleRunHistorySchema, ScheduleRunOutcome, ScheduleRunPhase, ScheduleSchema,
   ScheduleSessionMode, ScheduleSource, ScheduleState, SchedulerRuntimeSnapshotSchema,
-  SessionContextStateSchema, SessionMessageSearchSessionStatus, SessionSchema, SessionState, SnapshotSchema,
-  TargetState, ToolCallOutputMode, WorkspaceKind, WorkspaceLocationSchema, capabilityNames, nativeSessionTreeWireFields
+  SessionContextStateSchema, SessionDerivationKind, SessionDerivationOriginSchema, SessionMessageSearchSessionStatus, SessionSchema, SessionState, SnapshotSchema,
+  SessionWorktreeSchema, TargetState, ToolCallOutputMode, WorkspaceKind, WorkspaceLocationSchema, capabilityNames, nativeSessionTreeWireFields
 } from "@joko/contracts";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MobileClient, type MobileStorage, type PendingOperation } from "./mobile-client";
@@ -71,6 +71,7 @@ import {
   insertMobileArtifactMention,
   insertMobileResourceMention,
   insertMobileSessionMention,
+  insertMobilePastedText,
   insertMobileStructuredClipboardText,
   insertMobileWorkspaceMention,
   mobileComposerInput,
@@ -78,6 +79,7 @@ import {
   type MobileComposerDraft
 } from "./mobile-composer-document";
 import { createMobileAutomationDraft } from "./mobile-automation-authoring";
+import { parseMobileNativeIntent } from "./mobile-native-intent";
 
 const credential: PairedCredential = {
   profileId: "mobile-profile", origin: "http://192.168.1.20:4318", serverId: "node-1", connectionId: "mobile-connection",
@@ -971,6 +973,8 @@ function fakeNetwork(): MobileNetwork {
     }),
     listWorkspaceDirectory: vi.fn(async () => ({ entries: [], revision: "directory-1" })),
     listWorkspaceFileIndex: vi.fn(async () => ({ paths: [], revision: "index-1", truncated: false })),
+    listWorkspaceChangeSets: vi.fn(async () => []),
+    previewWorkspaceRewind: vi.fn(async () => { throw new Error("No Workspace rewind fixture was configured."); }),
     searchWorkspace: vi.fn(async () => ({ matches: [], revision: "search-1", truncated: false, totalFiles: 0 })),
     watchWorkspace: vi.fn(async function* (_credential, _workspaceId, signal) {
       await new Promise<void>((resolve) => {
@@ -7046,6 +7050,557 @@ describe("native composer task-link resolution", () => {
     app.setForeground(false);
     finish([messageEvent]);
     await expect(pending).resolves.toBeUndefined();
+  });
+});
+
+describe("native current-task cloning", () => {
+  function fixture() {
+    const state = {
+      session: runtimeSession,
+      backend: create(BackendDescriptorSchema, { ...runtimeBackend, capabilities: create(CapabilityManifestSchema, {
+        ...runtimeBackend.capabilities!, capabilities: [...runtimeBackend.capabilities!.capabilities,
+          create(CapabilitySchema, { name: capabilityNames.sessionClone, support: CapabilitySupport.SUPPORTED })]
+      }) }),
+      reviews: [] as Snapshot["reviewRuns"],
+      derived: undefined as Snapshot["sessions"][number] | undefined
+    };
+    const network = fakeNetwork();
+    const projection = (detail: boolean) => create(SnapshotSchema, { ...runtimeControlProjection(state.session, detail),
+      backends: [state.backend], reviewRuns: state.reviews,
+      ...(!detail && state.derived ? { sessions: [state.session, state.derived] } : {}) });
+    network.readOwner = vi.fn(async () => ({ connection, device, snapshot: projection(false) }));
+    network.readSession = vi.fn(async () => projection(true));
+    const child = () => create(SessionSchema, { ...runtimeSession, sessionId: "cloned-task",
+      nativeBinding: create(NativeSessionBindingSchema, { ...runtimeSession.nativeBinding!, backendId: "backend", opaqueReference: "cloned-native" }),
+      derivationOrigin: create(SessionDerivationOriginSchema, { kind: SessionDerivationKind.CLONE, sourceSessionId: "session" }) });
+    const operation = (operationId: string, derived = child()) => create(OperationSchema, {
+      operationId, connectionId: credential.connectionId, state: OperationState.SUCCEEDED,
+      result: { payload: { case: "session", value: derived } }
+    });
+    return { state, network, child, operation };
+  }
+
+  it("clones an active task through a preconditioned typed operation after saving a body-free receipt", async () => {
+    const f = fixture();
+    f.state.session = create(SessionSchema, { ...runtimeSession, state: SessionState.RUNNING });
+    const saved = memoryStorage(credential);
+    vi.mocked(f.network.submit).mockImplementation(async (_credential, operationId, mutation) => {
+      expect(saved.pending()).toEqual([{ operationId, connectionId: credential.connectionId,
+        kind: "session-clone", sessionId: "session", state: "unknown" }]);
+      expect(mutation).toMatchObject({ preconditions: [{ entity: { kind: EntityKind.SESSION, id: "session" },
+        expectedGeneration: 8n, expectedRevision: { value: 9n } }],
+      payload: { case: "cloneSession", value: { sourceSessionId: "session", newDisplayName: "My copy" } } });
+      f.state.derived = f.child();
+      return f.operation(operationId);
+    });
+    const app = client(f.network, saved.storage, undefined, undefined, () => "clone-operation");
+    await app.start();
+    expect(app.taskCloneControls()?.canClone).toBe(true);
+    await expect(app.cloneTask(app.taskCloneControls()!.authorityKey, " My copy "))
+      .resolves.toEqual({ kind: "cloned", sessionId: "cloned-task" });
+    expect(saved.pending()).toEqual([]);
+    expect(app.state.selectedId).toBe("session");
+    expect(app.state.owner?.sessions.map((session) => session.sessionId)).toEqual(["session", "cloned-task"]);
+  });
+
+  it("blocks unsupported, duplicate capability, read-only, worktree and stale confirmation owners before dispatch", async () => {
+    const f = fixture();
+    const app = client(f.network, memoryStorage(credential).storage);
+    await app.start();
+    const key = app.taskCloneControls()!.authorityKey;
+    f.state.backend.capabilities!.capabilities.push(create(CapabilitySchema, { name: capabilityNames.sessionClone, support: CapabilitySupport.SUPPORTED }));
+    await app.refresh();
+    expect(app.taskCloneControls()?.canClone).toBe(false);
+    await expect(app.cloneTask(key, "Copy")).rejects.toThrow(/owner changed/u);
+    f.state.backend.capabilities!.capabilities.pop();
+    f.state.session = create(SessionSchema, { ...runtimeSession, worktree: create(SessionWorktreeSchema, { leaseId: "lease", workspaceId: "owned" }) });
+    await app.refresh();
+    expect(app.taskCloneControls()?.canClone).toBe(false);
+    f.state.session = runtimeSession;
+    f.state.reviews = [create(ReviewRunSchema, { reviewerSessionId: "session" })];
+    await app.refresh();
+    expect(app.taskCloneControls()?.canClone).toBe(false);
+    f.state.reviews = [];
+    f.state.backend.capabilities!.capabilities = f.state.backend.capabilities!.capabilities.filter((capability) => capability.name !== capabilityNames.sessionClone);
+    await app.refresh();
+    expect(app.taskCloneControls()?.canClone).toBe(false);
+    expect(f.network.submit).not.toHaveBeenCalled();
+  });
+
+  it("retains unknown cloning across reconciliation and never dispatches a duplicate", async () => {
+    const f = fixture();
+    const saved = memoryStorage(credential);
+    vi.mocked(f.network.submit).mockRejectedValue(new Error("response lost"));
+    const app = client(f.network, saved.storage, undefined, undefined, () => "unknown-clone");
+    await app.start();
+    const key = app.taskCloneControls()!.authorityKey;
+    await expect(app.cloneTask(key, "Copy")).resolves.toEqual({ kind: "unknown" });
+    expect(saved.pending()).toMatchObject([{ kind: "session-clone", state: "unknown" }]);
+    expect(app.taskCloneControls()?.canClone).toBe(false);
+    await expect(app.cloneTask(key, "Again")).rejects.toThrow(/owner changed/u);
+    vi.mocked(f.network.getOperation).mockResolvedValue(f.operation("unknown-clone"));
+    await app.reconcile();
+    expect(saved.pending()).toEqual([]);
+    expect(f.network.submit).toHaveBeenCalledTimes(1);
+  });
+
+  it("refuses a foreign terminal Session and ignores a late result after background retirement", async () => {
+    const f = fixture();
+    const app = client(f.network, memoryStorage(credential).storage, undefined, undefined, fixedIds("bad-clone", "late-clone"));
+    await app.start();
+    const foreign = f.child();
+    foreign.derivationOrigin!.sourceSessionId = "foreign";
+    vi.mocked(f.network.submit).mockResolvedValueOnce(f.operation("bad-clone", foreign));
+    await expect(app.cloneTask(app.taskCloneControls()!.authorityKey, "Copy")).rejects.toThrow(/derived Session identity/u);
+    let finish!: (operation: Operation) => void;
+    vi.mocked(f.network.submit).mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+    const pending = app.cloneTask(app.taskCloneControls()!.authorityKey, "Late copy");
+    await vi.waitFor(() => expect(f.network.submit).toHaveBeenCalledTimes(2));
+    app.setForeground(false);
+    finish(f.operation("late-clone"));
+    await expect(pending).resolves.toEqual({ kind: "retired" });
+    expect(app.state.selectedId).toBe("session");
+  });
+});
+
+describe("native derivation origin navigation", () => {
+  function fixture() {
+    const state = {
+      child: create(SessionSchema, { ...runtimeSession, nativeBinding: create(NativeSessionBindingSchema, {
+        backendId: "backend", opaqueReference: "child-native", runtimeGeneration: 8n }),
+        derivationOrigin: create(SessionDerivationOriginSchema, { kind: SessionDerivationKind.FORK, sourceSessionId: "source", sourceMessageId: "origin-message",
+          sourceEventId: "origin-event", sourceSessionAvailable: true, sourceMessageAvailable: true }) }),
+      source: create(SessionSchema, { ...runtimeSession, sessionId: "source", nativeBinding: create(NativeSessionBindingSchema, {
+        backendId: "backend", opaqueReference: "source-native", runtimeGeneration: 21n }) })
+    };
+    const network = fakeNetwork();
+    const owner = () => clone(SnapshotSchema, create(SnapshotSchema, { ...runtimeControlProjection(state.child), sessions: [state.child, state.source] }));
+    const detail = (id: string) => clone(SnapshotSchema, create(SnapshotSchema, { ...runtimeControlProjection(state.child, true),
+      scope: create(SnapshotScopeSchema, { kind: { case: "session", value: { sessionId: id } } }),
+      sessions: [id === "session" ? state.child : state.source] }));
+    const event = create(EventSchema, { eventId: "origin-event", identity: { sessionId: "source" },
+      cursor: { opaqueToken: "origin-cursor", generation: 1n, sequence: 20n },
+      payload: { kind: { case: "messageCompleted", value: { messageId: "origin-message", role: MessageRole.ASSISTANT } } } });
+    network.readOwner = vi.fn(async () => ({ connection, device, snapshot: owner() }));
+    network.readSession = vi.fn(async (_credential, id) => detail(id));
+    network.readAround = vi.fn(async () => [event]);
+    return { state, network, event, owner, detail };
+  }
+
+  it("reauthorizes a fork message or clone source with current generated reads and an exact profile handoff without changing drafts or dispatching", async () => {
+    const f = fixture(); const saved = memoryStorage(credential); const drafts = memoryDraftStores();
+    const input = plainTextMobileComposerDraft("retained source draft");
+    await drafts.composer.save({ profileId: credential.profileId, sessionId: "source" }, input);
+    const app = client(f.network, saved.storage, undefined, undefined, undefined, undefined, drafts);
+    await app.start();
+    expect(app.state).toMatchObject({ status: "connected", selectedId: "session" });
+    const saveCalls = vi.mocked(saved.storage.saveSelection).mock.calls.length;
+    expect(app.taskDerivationOriginControls()?.canOpen).toBe(true);
+    const url = await app.prepareTaskDerivationOrigin(app.taskDerivationOriginControls()!.authorityKey!);
+    expect(parseMobileNativeIntent(url)).toEqual({ kind: "session", profileId: credential.profileId,
+      sessionId: "source", messageId: "origin-message", messageEventId: "origin-event" });
+    expect(f.network.readAround).toHaveBeenCalledExactlyOnceWith(credential, "source", "origin-event", expect.any(AbortSignal));
+    expect(app.state.selectedId).toBe("session"); expect(saved.pending()).toEqual([]);
+    expect(saved.storage.saveSelection).toHaveBeenCalledTimes(saveCalls);
+    expect(await drafts.composer.read({ profileId: credential.profileId, sessionId: "source" })).toEqual(input);
+    expect(f.network.submit).not.toHaveBeenCalled();
+    const accepted = create(EventSchema, { eventId: f.event.eventId, identity: f.event.identity, cursor: f.event.cursor,
+      payload: { kind: { case: "messageStarted", value: { messageId: "origin-message", role: MessageRole.USER,
+        userInputAccepted: true, nativeIdentity: { entryId: "user-entry" } } } } });
+    const completed = create(EventSchema, { eventId: "completed-origin", identity: f.event.identity,
+      cursor: { opaqueToken: "completed-cursor", generation: 1n, sequence: 21n },
+      payload: { kind: { case: "messageCompleted", value: { messageId: "origin-message", role: MessageRole.USER,
+        nativeIdentity: { entryId: "user-entry" } } } } });
+    vi.mocked(f.network.readAround).mockResolvedValueOnce([accepted, completed]);
+    expect(parseMobileNativeIntent(await app.prepareTaskDerivationOrigin(app.taskDerivationOriginControls()!.authorityKey!)))
+      .toMatchObject({ messageId: "origin-message", messageEventId: "completed-origin" });
+    const conflicting = clone(EventSchema, completed);
+    if (conflicting.payload?.kind.case === "messageCompleted") conflicting.payload.kind.value.nativeIdentity!.entryId = "different-user";
+    vi.mocked(f.network.readAround).mockResolvedValueOnce([accepted, conflicting]);
+    expect(await app.prepareTaskDerivationOrigin(app.taskDerivationOriginControls()!.authorityKey!)).toBeUndefined();
+    f.state.child.derivationOrigin = create(SessionDerivationOriginSchema, { kind: SessionDerivationKind.CLONE,
+      sourceSessionId: "source", sourceSessionAvailable: true });
+    await app.refresh(); vi.mocked(f.network.readAround).mockClear();
+    const cloneUrl = await app.prepareTaskDerivationOrigin(app.taskDerivationOriginControls()!.authorityKey!);
+    expect(parseMobileNativeIntent(cloneUrl)).toEqual({ kind: "session", profileId: credential.profileId, sessionId: "source" });
+    expect(f.network.readAround).not.toHaveBeenCalled();
+  });
+
+  it("refuses missing, ambiguous or wrong message Events and service availability revoked during authenticated around", async () => {
+    const f = fixture(); const app = client(f.network, memoryStorage(credential).storage);
+    await app.start(); const key = app.taskDerivationOriginControls()!.authorityKey!;
+    const foreign = clone(EventSchema, f.event); foreign.identity!.sessionId = "foreign";
+    const wrong = clone(EventSchema, f.event);
+    if (wrong.payload?.kind.case === "messageCompleted") wrong.payload.kind.value.messageId = "wrong";
+    const unaccepted = create(EventSchema, { eventId: f.event.eventId, identity: f.event.identity, cursor: f.event.cursor,
+      payload: { kind: { case: "messageStarted", value: { messageId: "origin-message", role: MessageRole.USER } } } });
+    for (const events of [[], [f.event, f.event], [foreign], [wrong], [unaccepted]]) {
+      vi.mocked(f.network.readAround).mockResolvedValueOnce(events);
+      try { expect(await app.prepareTaskDerivationOrigin(key)).toBeUndefined(); }
+      catch (error) { expect(String(error)).toMatch(/mismatched or cyclic/u); }
+    }
+    vi.mocked(f.network.readAround).mockImplementationOnce(async () => {
+      f.state.child.derivationOrigin!.sourceMessageAvailable = false; return [f.event];
+    });
+    expect(await app.prepareTaskDerivationOrigin(key)).toBeUndefined();
+    expect(app.state.selectedId).toBe("session"); expect(f.network.submit).not.toHaveBeenCalled();
+  });
+
+  it("rejects foreign owner and native generation drift instead of trusting saved lineage identity", async () => {
+    const f = fixture(); const app = client(f.network, memoryStorage(credential).storage);
+    await app.start(); const key = app.taskDerivationOriginControls()!.authorityKey!;
+    vi.mocked(f.network.readOwner).mockResolvedValueOnce({ connection, device,
+      snapshot: create(SnapshotSchema, { ...f.owner(), server: { ...f.owner().server!, serverId: "foreign-node" } }) });
+    await expect(app.prepareTaskDerivationOrigin(key)).rejects.toThrow(/node identity/u);
+    vi.mocked(f.network.readSession).mockResolvedValueOnce(create(SnapshotSchema, { ...f.detail("session"),
+      scope: create(SnapshotScopeSchema, { kind: { case: "session", value: { sessionId: "foreign-session" } } }) }));
+    expect(await app.prepareTaskDerivationOrigin(key)).toBeUndefined();
+    vi.mocked(f.network.readSession).mockImplementationOnce(async () => create(SnapshotSchema, {
+      ...f.detail("session"), sessions: [create(SessionSchema, { ...f.state.child,
+        nativeBinding: { ...f.state.child.nativeBinding!, runtimeGeneration: 9n } })] }));
+    expect(await app.prepareTaskDerivationOrigin(key)).toBeUndefined();
+    vi.mocked(f.network.readSession).mockImplementationOnce(async () => f.detail("session"));
+    vi.mocked(f.network.readSession).mockImplementationOnce(async () => create(SnapshotSchema, {
+      ...f.detail("source"), sessions: [create(SessionSchema, { ...f.state.source, archived: true })] }));
+    expect(await app.prepareTaskDerivationOrigin(key)).toBeUndefined();
+    app.setForeground(false);
+    expect(app.taskDerivationOriginControls()).toMatchObject({ kind: "fork", canOpen: false });
+    expect(f.network.submit).not.toHaveBeenCalled();
+  });
+
+  it("retires a pending origin read on cancellation, background or later task selection", async () => {
+    const f = fixture(); const app = client(f.network, memoryStorage(credential).storage);
+    await app.start(); const key = app.taskDerivationOriginControls()!.authorityKey!;
+    let finish!: (events: Event[]) => void;
+    vi.mocked(f.network.readAround).mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+    const signal = new AbortController(); const pending = app.prepareTaskDerivationOrigin(key, signal.signal);
+    await vi.waitFor(() => expect(f.network.readAround).toHaveBeenCalledOnce());
+    signal.abort(); finish([f.event]); expect(await pending).toBeUndefined();
+    vi.mocked(f.network.readAround).mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+    const background = app.prepareTaskDerivationOrigin(key);
+    await vi.waitFor(() => expect(f.network.readAround).toHaveBeenCalledTimes(2));
+    app.setForeground(false); finish([f.event]); expect(await background).toBeUndefined();
+    app.setForeground(true); await app.refresh();
+    vi.mocked(f.network.readAround).mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+    const later = app.prepareTaskDerivationOrigin(app.taskDerivationOriginControls()!.authorityKey!);
+    await vi.waitFor(() => expect(f.network.readAround).toHaveBeenCalledTimes(3));
+    await app.select("source"); finish([f.event]); expect(await later).toBeUndefined();
+    expect(app.state.selectedId).toBe("source"); expect(f.network.submit).not.toHaveBeenCalled();
+  });
+});
+
+describe("native message rewinds", () => {
+  function fixture(boundary = true) {
+    let input = insertMobileSessionMention(plainTextMobileComposerDraft("Discuss "), { start: 8, end: 8 },
+      { sessionId: "related", displayText: "Related" }, "rewind-mention").draft;
+    input = insertMobilePastedText(input, { start: input.text.length, end: input.text.length }, "😀 evidence\n".repeat(30), "rewind-paste").draft;
+    const nativeIdentity = { entryId: "user-entry", parentEntryId: "parent-is-not-boundary",
+      ...(boundary ? { rewindBefore: { kind: { case: "nativeEntryId" as const, value: "public-boundary" } } } : {}) };
+    const started = create(EventSchema, { eventId: "rewind-start", identity: { sessionId: "session", runId: "round-run" },
+      cursor: { generation: 1n, sequence: 20n }, payload: { kind: { case: "messageStarted", value: {
+        messageId: "rewind-message", role: MessageRole.USER, userInputAccepted: true, nativeIdentity, userInput: mobileComposerInput(input)
+      } } } });
+    const completed = create(EventSchema, { eventId: "rewind-complete", identity: { sessionId: "session", runId: "round-run" },
+      cursor: { generation: 1n, sequence: 21n }, payload: { kind: { case: "messageCompleted", value: {
+        messageId: "rewind-message", role: MessageRole.USER, nativeIdentity, blocks: [{ content: { case: "text", value: "Compact display" } }]
+      } } } });
+    const state = { source: create(SessionSchema, { ...runtimeSession, state: SessionState.IDLE,
+      nativeBinding: create(NativeSessionBindingSchema, { backendId: "backend", opaqueReference: "native-task", runtimeGeneration: 8n }) }),
+      events: [started, completed] };
+    const backend = create(BackendDescriptorSchema, { ...runtimeBackend, capabilities: create(CapabilityManifestSchema, {
+      ...runtimeBackend.capabilities!, capabilities: [...runtimeBackend.capabilities!.capabilities,
+        create(CapabilitySchema, { name: "workspace.rewind", support: CapabilitySupport.SUPPORTED })]
+    }) });
+    const workspace = create(WorkspaceDescriptorSchema, { workspaceId: "rewind-workspace", targetId: "target", serverPathDisplay: "D:\\project",
+      location: { kind: { case: "serviceNode", value: {} } }, version: { revision: { value: 3n }, generation: 1n } });
+    const target = create(TargetSchema, { ...snapshot.targets[0]!, workspaceId: workspace.workspaceId });
+    const projection = (detail: boolean) => create(SnapshotSchema, { ...runtimeControlProjection(state.source, detail),
+      backends: [backend], targets: [target], workspaces: [workspace], ...(detail ? { timeline: state.events } : {}) });
+    const network = fakeNetwork(); network.readOwner = vi.fn(async () => ({ connection, device, snapshot: projection(false) }));
+    network.readSession = vi.fn(async () => projection(true));
+    network.listWorkspaceChangeSets = vi.fn(async () => [create(WorkspaceChangeSetSchema, { workspaceId: workspace.workspaceId,
+      sessionId: "session", changeSetId: "checkpoint", runId: "round-run", capturedAt: { seconds: 1n } })]);
+    const files = create(WorkspaceRewindPreviewSchema, { previewId: "preview", workspaceId: workspace.workspaceId, changeSetId: "checkpoint",
+      safety: RewindSafety.SAFE, expiresAt: { seconds: 100n }, inverseChanges: [{ relativePath: "src/main.ts", kind: FileChangeKind.UPDATED }] });
+    network.previewWorkspaceRewind = vi.fn(async () => files);
+    const operation = (operationId: string, mode: "dialogue" | "files" = "dialogue") => create(OperationSchema, {
+      operationId, connectionId: credential.connectionId, state: OperationState.SUCCEEDED, result: { payload: mode === "dialogue"
+        ? { case: "acknowledgement", value: create(AcknowledgementSchema, { accepted: true }) }
+        : { case: "workspaceRewind", value: create(WorkspaceRewindResultSchema, { workspaceId: workspace.workspaceId,
+          changeSetId: "checkpoint", restoredPaths: ["src/main.ts"], filesRewound: true, dialogueRewound: false }) } }
+    });
+    const advance = () => {
+      state.source = create(SessionSchema, { ...state.source,
+        nativeBinding: create(NativeSessionBindingSchema, { ...state.source.nativeBinding!, runtimeGeneration: 9n }),
+        version: create(EntityVersionSchema, { revision: { value: 10n }, generation: 9n }) }); state.events = [];
+    };
+    return { state, backend, workspace, files, network, operation, advance, input };
+  }
+  async function preview(app: MobileClient) {
+    const controls = app.taskMessageRewindControls("rewind-complete")!;
+    return (await app.loadTaskMessageRewindPreview(controls.authorityKey, "rewind-complete", new AbortController().signal))!;
+  }
+
+  it("persists approved input and body-free receipt before native dialogue rewind, then merges the draft before receipt clearance and refreshes new history", async () => {
+    const f = fixture(); const saved = memoryStorage(credential); const drafts = memoryDraftStores();
+    const identity = { profileId: credential.profileId, sessionId: "session" };
+    drafts.composer.save(identity, plainTextMobileComposerDraft("Keep newer input")); await drafts.composer.flush(identity);
+    vi.mocked(f.network.submit).mockImplementationOnce(async (_credential, operationId, mutation) => {
+      expect(saved.pending()).toEqual([{ kind: "session-rewind", operationId, connectionId: credential.connectionId,
+        sessionId: "session", eventId: "rewind-complete", backendId: "backend", targetId: "target", sourceGeneration: "8", state: "unknown" }]);
+      expect(await drafts.composer.readOperationInput(identity, operationId)).toMatchObject({ mentions: [{ sessionId: "related" }] });
+      expect(mutation).toMatchObject({ preconditions: [{ expectedGeneration: 8n, expectedRevision: { value: 9n } }],
+        payload: { case: "navigateSessionBranch", value: { sessionId: "session", target: { kind: { case: "nativeEntryId", value: "public-boundary" } }, summarize: false, customInstructions: "" } } });
+      f.advance(); return f.operation(operationId);
+    });
+    const save = saved.storage.savePending;
+    saved.storage.savePending = vi.fn(async (items) => {
+      if (!items.length) expect(await drafts.composer.readDurable(identity)).toMatchObject({ mentions: [{ sessionId: "related" }], atoms: [{ kind: "pasted-text" }] });
+      await save(items);
+    });
+    const app = client(f.network, saved.storage, undefined, undefined, undefined, undefined, drafts); await app.start();
+    await expect(app.commitTaskMessageRewind(await preview(app), "dialogue", new AbortController().signal))
+      .resolves.toEqual({ kind: "rewound", mode: "dialogue" });
+    expect((await drafts.composer.readDurable(identity))?.text).toContain("Keep newer input");
+    expect(saved.pending()).toEqual([]); expect(app.state.detail!.sessions[0]!.nativeBinding!.runtimeGeneration).toBe(9n);
+    expect(timelineRows(app.state.detail!.timeline)).toEqual([]); expect(app.state.restoredComposerDraft).toMatchObject(identity);
+    await expect(drafts.composer.readOperationInput(identity, "operation-1")).resolves.toBeNull();
+    expect(f.network.readAround).not.toHaveBeenCalled(); expect(f.network.submit).toHaveBeenCalledOnce();
+  });
+
+  it("restores files independently at the exact Workspace/Run checkpoint when the backend lacks the message dialogue boundary", async () => {
+    const f = fixture(false); const saved = memoryStorage(credential); const drafts = memoryDraftStores();
+    f.workspace.workspaceId = "owned-workspace";
+    f.state.source.worktree = create(SessionWorktreeSchema, { workspaceId: "owned-workspace", leaseId: "owned-lease" });
+    const identity = { profileId: credential.profileId, sessionId: "session" }; drafts.composer.save(identity, plainTextMobileComposerDraft("Keep draft"));
+    vi.mocked(f.network.submit).mockImplementationOnce(async (_credential, operationId, mutation) => {
+      expect(mutation).toMatchObject({ preconditions: [{ expectedGeneration: 8n, expectedRevision: { value: 9n } }],
+        payload: { case: "executeWorkspaceRewind", value: { workspaceId: "owned-workspace", previewId: "preview", changeSetId: "checkpoint",
+          confirmFileRestore: true, allowDialogueOnly: false } } });
+      expect(saved.pending()).toMatchObject([{ kind: "workspace-rewind", workspaceId: "owned-workspace", changeSetId: "checkpoint" }]);
+      return f.operation(operationId, "files");
+    });
+    f.files.workspaceId = "owned-workspace";
+    const app = client(f.network, saved.storage, undefined, undefined, undefined, undefined, drafts); await app.start();
+    expect(app.taskMessageRewindControls("rewind-complete")).toMatchObject({ canDialogue: false, canFiles: true });
+    const value = await preview(app);
+    await expect(app.commitTaskMessageRewind(value, "dialogue", new AbortController().signal)).rejects.toThrow(/preview changed/u);
+    await expect(app.commitTaskMessageRewind(value, "files", new AbortController().signal)).resolves.toEqual({ kind: "rewound", mode: "files" });
+    expect(f.network.listWorkspaceChangeSets).toHaveBeenCalledWith(credential, "owned-workspace", "session", expect.any(AbortSignal));
+    expect(f.network.previewWorkspaceRewind).toHaveBeenCalledWith(credential, "owned-workspace", "checkpoint", expect.any(AbortSignal));
+    expect(drafts.composer.readSync(identity)?.text).toBe("Keep draft"); expect(saved.pending()).toEqual([]);
+  });
+
+  it("reconciles a lost response after restart from private retained input when the original Event is gone, without resending", async () => {
+    const f = fixture(); const saved = memoryStorage(credential); const drafts = memoryDraftStores();
+    vi.mocked(f.network.submit).mockRejectedValueOnce(new Error("response lost"));
+    const app = client(f.network, saved.storage, undefined, undefined, undefined, undefined, drafts); await app.start();
+    await expect(app.commitTaskMessageRewind(await preview(app), "dialogue", new AbortController().signal)).resolves.toEqual({ kind: "unknown" });
+    expect(app.taskMessageRewindControls("rewind-complete")?.canRewind).toBe(false); app.dispose(); f.advance();
+    vi.mocked(f.network.getOperation).mockResolvedValue(f.operation("operation-1"));
+    const driver: MobilePlainStorageDriver = { async getItem(key) { return drafts.values.get(key) ?? null; },
+      async setItem(key, value) { drafts.values.set(key, value); }, async removeItem(key) { drafts.values.delete(key); } };
+    const restartedDrafts = { values: drafts.values, composer: new MobileComposerDraftStore(driver), newTask: new MobileNewTaskDraftStore(driver) };
+    const restarted = client(f.network, saved.storage, undefined, undefined, undefined, undefined, restartedDrafts); await restarted.start();
+    const restored = await restartedDrafts.composer.readDurable({ profileId: credential.profileId, sessionId: "session" });
+    expect(mobileComposerInput(restored!)).toEqual(mobileComposerInput(f.input)); expect(restored!.attachments).toEqual([]);
+    expect(saved.pending()).toEqual([]); expect(f.network.submit).toHaveBeenCalledOnce(); expect(f.network.readAround).not.toHaveBeenCalled();
+  });
+
+  it("keeps a known native effect pending during a draft CAS conflict, preserves newer input, and recovers through its original operation", async () => {
+    const f = fixture(); const saved = memoryStorage(credential); const drafts = memoryDraftStores();
+    vi.mocked(f.network.submit).mockImplementationOnce(async (_credential, operationId) => { f.advance(); return f.operation(operationId); });
+    const save = drafts.composer.saveIfRevision.bind(drafts.composer);
+    vi.spyOn(drafts.composer, "saveIfRevision").mockImplementationOnce((identity, draft, revision) => {
+      drafts.composer.save(identity, plainTextMobileComposerDraft("Newer edit")); return save(identity, draft, revision);
+    });
+    const app = client(f.network, saved.storage, undefined, undefined, undefined, undefined, drafts); await app.start();
+    await expect(app.commitTaskMessageRewind(await preview(app), "dialogue", new AbortController().signal)).resolves.toEqual({ kind: "unknown" });
+    expect(drafts.composer.readSync({ profileId: credential.profileId, sessionId: "session" })?.text).toBe("Newer edit");
+    expect(saved.pending()).toMatchObject([{ kind: "session-rewind", state: "unknown" }]);
+    vi.mocked(f.network.getOperation).mockResolvedValueOnce(f.operation("operation-1")); await app.reconcile();
+    expect(saved.pending()).toEqual([]); expect(app.state.restoredComposerDraft).toMatchObject({ sessionId: "session" });
+    expect(drafts.composer.readSync({ profileId: credential.profileId, sessionId: "session" })?.text).toContain("Newer edit");
+    expect(f.network.submit).toHaveBeenCalledOnce();
+  });
+
+  it("retains receipt and input for malformed terminal outcomes or a foreign adopted native binding, then recovers the exact task", async () => {
+    const f = fixture(); const saved = memoryStorage(credential); const drafts = memoryDraftStores();
+    vi.mocked(f.network.submit).mockImplementationOnce(async (_credential, operationId) => {
+      f.advance(); const operation = f.operation(operationId);
+      if (operation.result?.payload.case === "acknowledgement") operation.result.payload.value.accepted = false;
+      return operation;
+    });
+    const app = client(f.network, saved.storage, undefined, undefined, undefined, undefined, drafts); await app.start();
+    await expect(app.commitTaskMessageRewind(await preview(app), "dialogue", new AbortController().signal)).resolves.toEqual({ kind: "unknown" });
+    vi.mocked(f.network.getOperation).mockResolvedValue(f.operation("operation-1"));
+    f.state.source.nativeBinding!.backendId = "foreign-backend"; await app.reconcile();
+    expect(saved.pending()).toMatchObject([{ kind: "session-rewind" }]);
+    expect(drafts.composer.readSync({ profileId: credential.profileId, sessionId: "session" })).toBeNull();
+    f.state.source.nativeBinding!.backendId = "backend"; await app.reconcile();
+    expect(saved.pending()).toEqual([]); expect(f.network.submit).toHaveBeenCalledOnce();
+  });
+
+  it("rejects blocked, expired and stale confirmations, and retires a late terminal response after background without restoring input", async () => {
+    const f = fixture(); const saved = memoryStorage(credential); const drafts = memoryDraftStores();
+    const app = client(f.network, saved.storage, undefined, undefined, undefined, undefined, drafts); await app.start();
+    let value = await preview(app);
+    f.files.safety = RewindSafety.BLOCKED;
+    await expect(app.commitTaskMessageRewind(value, "files", new AbortController().signal)).rejects.toThrow(/blocked or expired/u);
+    f.files.safety = RewindSafety.SAFE; f.files.expiresAt!.seconds = 1n;
+    await expect(app.commitTaskMessageRewind(value, "files", new AbortController().signal)).rejects.toThrow(/blocked or expired/u);
+    f.files.expiresAt!.seconds = 100n;
+    const controller = new AbortController(); controller.abort();
+    await expect(app.commitTaskMessageRewind(value, "dialogue", controller.signal)).rejects.toThrow(/preview changed/u);
+    expect(f.network.submit).not.toHaveBeenCalled();
+    f.state.source = create(SessionSchema, { ...f.state.source, version: create(EntityVersionSchema, { revision: { value: 10n }, generation: 8n }) });
+    await app.refresh();
+    await expect(app.commitTaskMessageRewind(value, "dialogue", new AbortController().signal)).rejects.toThrow(/preview changed/u);
+    value = await preview(app);
+    let finish!: (operation: Operation) => void;
+    vi.mocked(f.network.submit).mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+    const pending = app.commitTaskMessageRewind(value, "dialogue", new AbortController().signal);
+    await vi.waitFor(() => expect(f.network.submit).toHaveBeenCalledOnce()); app.setForeground(false); f.advance(); finish(f.operation("operation-1"));
+    await expect(pending).resolves.toEqual({ kind: "retired" }); expect(saved.pending()).toMatchObject([{ kind: "session-rewind" }]);
+    expect(drafts.composer.readSync({ profileId: credential.profileId, sessionId: "session" })).toBeNull();
+  });
+});
+
+describe("native message forks", () => {
+  function fixture() {
+    let inputDraft = insertMobileSessionMention(plainTextMobileComposerDraft("Discuss "), { start: 8, end: 8 },
+      { sessionId: "related", displayText: "Related" }, "fork-mention").draft;
+    inputDraft = insertMobilePastedText(inputDraft, { start: inputDraft.text.length, end: inputDraft.text.length },
+      "😀 evidence\n".repeat(30), "fork-paste").draft;
+    const started = create(EventSchema, { eventId: "fork-start", identity: { sessionId: "session" },
+      cursor: { generation: 1n, sequence: 20n }, payload: { kind: { case: "messageStarted", value: {
+        messageId: "fork-user", role: MessageRole.USER, userInputAccepted: true, inputDelivery: MessageInputDelivery.PROMPT,
+        nativeIdentity: { entryId: "user-native", parentEntryId: "parent-native" }, userInput: mobileComposerInput(inputDraft)
+      } } } });
+    const completed = create(EventSchema, { eventId: "fork-complete", identity: { sessionId: "session" },
+      cursor: { generation: 1n, sequence: 21n }, payload: { kind: { case: "messageCompleted", value: {
+        messageId: "fork-user", role: MessageRole.USER,
+        nativeIdentity: { entryId: "user-native", parentEntryId: "parent-native" },
+        blocks: [{ content: { case: "text", value: "Compact display" } }]
+      } } } });
+    const state = { source: runtimeSession, events: [started, completed], child: undefined as Snapshot["sessions"][number] | undefined };
+    const backend = create(BackendDescriptorSchema, { ...runtimeBackend, capabilities: create(CapabilityManifestSchema, {
+      ...runtimeBackend.capabilities!, capabilities: [...runtimeBackend.capabilities!.capabilities,
+        create(CapabilitySchema, { name: capabilityNames.sessionFork, support: CapabilitySupport.SUPPORTED })]
+    }) });
+    const projection = (detail: boolean) => create(SnapshotSchema, { ...runtimeControlProjection(state.source, detail), backends: [backend],
+      ...(detail ? { timeline: state.events } : { sessions: [state.source, ...(state.child ? [state.child] : [])] }) });
+    const network = fakeNetwork();
+    network.readOwner = vi.fn(async () => ({ connection, device, snapshot: projection(false) }));
+    network.readSession = vi.fn(async () => projection(true));
+    network.readAround = vi.fn(async () => state.events);
+    const child = () => create(SessionSchema, { ...runtimeSession, sessionId: "forked-task",
+      nativeBinding: create(NativeSessionBindingSchema, { ...runtimeSession.nativeBinding!, backendId: "backend", opaqueReference: "forked-native" }),
+      derivationOrigin: create(SessionDerivationOriginSchema, { kind: SessionDerivationKind.FORK, sourceSessionId: "session",
+        sourceMessageId: "fork-user", sourceEventId: "fork-complete" }) });
+    const operation = (operationId: string, value = child()) => create(OperationSchema, { operationId,
+      connectionId: credential.connectionId, state: OperationState.SUCCEEDED, result: { payload: { case: "session", value } } });
+    return { state, network, backend, child, operation, inputDraft };
+  }
+
+  it("forks stable active input at its exact parent, persists the receipt first and the new draft before terminal receipt clearance", async () => {
+    const f = fixture(); f.state.source = create(SessionSchema, { ...runtimeSession, state: SessionState.RUNNING });
+    const saved = memoryStorage(credential); const drafts = memoryDraftStores();
+    const sourceIdentity = { profileId: credential.profileId, sessionId: "session" };
+    drafts.composer.save(sourceIdentity, plainTextMobileComposerDraft("Keep source draft"));
+    await drafts.composer.flush(sourceIdentity);
+    vi.mocked(f.network.submit).mockImplementation(async (_credential, operationId, mutation) => {
+      expect(saved.pending()).toEqual([{ operationId, connectionId: credential.connectionId,
+        kind: "session-fork", sessionId: "session", eventId: "fork-complete", state: "unknown" }]);
+      expect(mutation).toMatchObject({ preconditions: [{ expectedGeneration: 8n, expectedRevision: { value: 9n } }],
+        payload: { case: "forkSession", value: { sourceSessionId: "session", nativeEntryId: "parent-native",
+          sourceMessageId: "fork-user", sourceEventId: "fork-complete", newDisplayName: "Branch" } } });
+      f.state.child = f.child(); return f.operation(operationId);
+    });
+    const savePending = saved.storage.savePending;
+    saved.storage.savePending = vi.fn(async (items) => {
+      if (items.length === 0) expect(await drafts.composer.readDurable({ ...sourceIdentity, sessionId: "forked-task" }))
+        .toMatchObject({ mentions: [{ sessionId: "related" }], atoms: [{ text: "😀 evidence\n".repeat(30) }] });
+      await savePending(items);
+    });
+    const app = client(f.network, saved.storage, undefined, undefined, () => "fork-operation", undefined, drafts);
+    await app.start();
+    const controls = app.taskMessageForkControls("fork-complete")!;
+    expect(controls.canFork).toBe(true);
+    await expect(app.forkTaskMessage(controls.authorityKey, "fork-complete", "Branch"))
+      .resolves.toEqual({ kind: "forked", sessionId: "forked-task", draftRestored: true });
+    expect(saved.pending()).toEqual([]); expect(app.state.selectedId).toBe("session");
+    await expect(drafts.composer.readDurable(sourceIdentity)).resolves.toMatchObject({ text: "Keep source draft" });
+  });
+
+  it("reconciles an unknown fork after restart from its exact canonical source without dispatching again", async () => {
+    const f = fixture(); const saved = memoryStorage(credential); const drafts = memoryDraftStores();
+    vi.mocked(f.network.submit).mockRejectedValueOnce(new Error("response lost"));
+    const app = client(f.network, saved.storage, undefined, undefined, () => "unknown-fork", undefined, drafts);
+    await app.start();
+    await expect(app.forkTaskMessage(app.taskMessageForkControls("fork-complete")!.authorityKey, "fork-complete", "Branch"))
+      .resolves.toEqual({ kind: "unknown" });
+    expect(app.taskMessageForkControls("fork-complete")?.canFork).toBe(false);
+    app.dispose();
+    f.state.child = f.child(); vi.mocked(f.network.getOperation).mockResolvedValue(f.operation("unknown-fork"));
+    const restarted = client(f.network, saved.storage, undefined, undefined, () => "should-not-dispatch", undefined, drafts);
+    await restarted.start();
+    expect(saved.pending()).toEqual([]); expect(f.network.submit).toHaveBeenCalledOnce();
+    expect(f.network.readAround).toHaveBeenCalledWith(credential, "session", "fork-complete", expect.any(AbortSignal));
+    const restored = await drafts.composer.readDurable({ profileId: credential.profileId, sessionId: "forked-task" });
+    expect(restored?.attachments).toEqual([]);
+    expect(mobileComposerInput(restored!)).toEqual(mobileComposerInput(f.inputDraft));
+    expect(restarted.state.selectedId).toBe("session");
+  });
+
+  it("rejects a stale source confirmation and leaves a foreign derived Session receipt unresolved", async () => {
+    const f = fixture(); const saved = memoryStorage(credential);
+    const app = client(f.network, saved.storage);
+    await app.start(); const old = app.taskMessageForkControls("fork-complete")!;
+    const original = clone(EventSchema, f.state.events[1]!);
+    const changed = clone(EventSchema, original);
+    if (changed.payload?.kind.case === "messageCompleted") changed.payload.kind.value.nativeIdentity!.parentEntryId = "different-parent";
+    f.state.events = [f.state.events[0]!, changed]; await app.refresh();
+    await expect(app.forkTaskMessage(old.authorityKey, "fork-complete", "Branch")).rejects.toThrow(/boundary changed/u);
+    expect(f.network.submit).not.toHaveBeenCalled();
+    f.state.events = [f.state.events[0]!, original]; await app.refresh();
+    const foreign = f.child(); foreign.derivationOrigin!.sourceEventId = "foreign-event";
+    vi.mocked(f.network.submit).mockImplementationOnce(async (_credential, operationId) => f.operation(operationId, foreign));
+    await expect(app.forkTaskMessage(app.taskMessageForkControls("fork-complete")!.authorityKey, "fork-complete", "Branch"))
+      .rejects.toThrow(/derived Session identity/u);
+    expect(saved.pending()).toMatchObject([{ kind: "session-fork", state: "unknown" }]);
+  });
+
+  it("reports a draft CAS conflict without repeating native work or replacing a newer draft", async () => {
+    const f = fixture(); const saved = memoryStorage(credential); const drafts = memoryDraftStores();
+    vi.mocked(f.network.submit).mockImplementationOnce(async (_credential, operationId) => {
+      f.state.child = f.child(); return f.operation(operationId);
+    });
+    const saveIfRevision = drafts.composer.saveIfRevision.bind(drafts.composer);
+    vi.spyOn(drafts.composer, "saveIfRevision").mockImplementationOnce((identity, draft, revision) => {
+      drafts.composer.save(identity, plainTextMobileComposerDraft("Newer draft"));
+      return saveIfRevision(identity, draft, revision);
+    });
+    const app = client(f.network, saved.storage, undefined, undefined, undefined, undefined, drafts); await app.start();
+    await expect(app.forkTaskMessage(app.taskMessageForkControls("fork-complete")!.authorityKey, "fork-complete", "Branch"))
+      .resolves.toEqual({ kind: "forked", sessionId: "forked-task", draftRestored: false });
+    await drafts.composer.flush({ profileId: credential.profileId, sessionId: "forked-task" });
+    await expect(drafts.composer.readDurable({ profileId: credential.profileId, sessionId: "forked-task" }))
+      .resolves.toMatchObject({ text: "Newer draft" });
+    expect(saved.pending()).toEqual([]); expect(f.network.submit).toHaveBeenCalledOnce();
+  });
+
+  it("retires a late native fork result in background and preserves its unknown receipt without touching any new draft", async () => {
+    const f = fixture(); const saved = memoryStorage(credential); const drafts = memoryDraftStores();
+    let finish!: (operation: Operation) => void;
+    vi.mocked(f.network.submit).mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+    const app = client(f.network, saved.storage, undefined, undefined, undefined, undefined, drafts); await app.start();
+    const pending = app.forkTaskMessage(app.taskMessageForkControls("fork-complete")!.authorityKey, "fork-complete", "Branch");
+    await vi.waitFor(() => expect(f.network.submit).toHaveBeenCalledOnce());
+    app.setForeground(false); finish(f.operation("operation-1"));
+    await expect(pending).resolves.toEqual({ kind: "retired" });
+    expect(saved.pending()).toMatchObject([{ kind: "session-fork", state: "unknown" }]);
+    expect(drafts.composer.readSync({ profileId: credential.profileId, sessionId: "forked-task" })).toBeNull();
   });
 });
 

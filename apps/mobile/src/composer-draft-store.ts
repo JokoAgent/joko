@@ -92,6 +92,28 @@ export class MobileComposerDraftStore {
     }
   }
 
+  /** An accepted rewind can hide its original Event, so retain approved input separately from the live draft. */
+  async retainOperationInput(identity: MobileComposerDraftIdentity, operationId: string, draft: MobileComposerDraft): Promise<void> {
+    const exact = normalizeIdentity(identity); assertLocalId(operationId, "operation");
+    const value = normalizeMobileComposerDraft(draft);
+    if (value.attachments.length !== 0 || value.slashCommands.length !== 0) throw new Error("Historical operation input must not retain attachment leases or commands.");
+    await this.#enqueue(exact, () => this.driver.setItem(operationInputKey(exact, operationId), serializeRecord(exact, value)));
+  }
+
+  async readOperationInput(identity: MobileComposerDraftIdentity, operationId: string): Promise<MobileComposerDraft | null> {
+    const exact = normalizeIdentity(identity); assertLocalId(operationId, "operation");
+    const raw = await this.driver.getItem(operationInputKey(exact, operationId));
+    if (raw === null) return null;
+    const value = readRecord(raw, exact);
+    if (value.attachments.length !== 0 || value.slashCommands.length !== 0) throw new Error("Saved operation input contains unavailable attachment leases or commands.");
+    return cloneMobileComposerDraft(value);
+  }
+
+  async clearOperationInput(identity: MobileComposerDraftIdentity, operationId: string): Promise<void> {
+    const exact = normalizeIdentity(identity); assertLocalId(operationId, "operation");
+    await this.#enqueue(exact, () => this.driver.removeItem(operationInputKey(exact, operationId)));
+  }
+
   save(identity: MobileComposerDraftIdentity, draft: MobileComposerDraft): void {
     const exact = normalizeIdentity(identity);
     const value = normalizeMobileComposerDraft(draft);
@@ -269,6 +291,10 @@ function identityKey(identity: MobileComposerDraftIdentity): string {
 function storageKey(identity: MobileComposerDraftIdentity): string {
   const exact = normalizeIdentity(identity);
   return `${storagePrefix}.${encodeURIComponent(exact.profileId)}.${encodeURIComponent(exact.sessionId)}`;
+}
+
+function operationInputKey(identity: MobileComposerDraftIdentity, operationId: string): string {
+  return `${storageKey(identity)}.operation-input.${encodeURIComponent(operationId)}`;
 }
 
 function serializeRecord(identity: MobileComposerDraftIdentity, draft: MobileComposerDraft): string {

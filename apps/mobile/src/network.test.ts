@@ -43,6 +43,9 @@ import {
   ClearVoiceInputDictionaryPeerRouteResponseSchema,
   ClearVoiceInputDictionaryPeerRouteRequestSchema,
   WorkspaceEntrySchema,
+  WorkspaceChangeSetSchema, WorkspaceRewindPreviewSchema, RewindSafety,
+  ListWorkspaceChangeSetsRequestSchema, ListWorkspaceChangeSetsResponseSchema,
+  PreviewWorkspaceRewindRequestSchema, PreviewWorkspaceRewindResponseSchema,
   WorkspaceSearchMatchSchema,
   VoiceInputServiceSettingsSchema, VoiceInputTranscriptionProtocol, VoiceInputSaucSettingsSchema, VoiceInputSaucMode, VoiceInputSaucAuthentication,
   GetSettingsResponseSchema, BeginCredentialUploadResponseSchema, BeginCredentialUploadRequestSchema, TestVoiceInputConnectionResponseSchema
@@ -61,6 +64,7 @@ import {
   collectTargetWorktreeSourcePages,
   collectSessionMessageSearchPages,
   collectWorkspaceDirectoryPages,
+  collectWorkspaceChangeSetPages,
   collectWorkspaceSearchPages,
   downloadVerifiedBlob,
   uploadVerifiedBlob,
@@ -80,6 +84,51 @@ vi.mock("expo-crypto", () => ({
     return Uint8Array.from(createHash("sha256").update(bytes).digest()).buffer;
   }
 }));
+
+describe("mobile Workspace rewind reads", () => {
+  it("collects complete generated checkpoint pages and reads an exact preview with the original credential and abort signal", async () => {
+    const credential: PairedCredential = { profileId: "rewind-profile", origin: "https://node.example", serverId: "node", connectionId: "connection",
+      deviceId: "device", displayName: "Phone", authKey: "private-test-key" };
+    const controller = new AbortController(); const tokens: string[] = [];
+    const preview = create(WorkspaceRewindPreviewSchema, { previewId: "preview", workspaceId: "workspace", changeSetId: "second",
+      safety: RewindSafety.SAFE, expiresAt: { seconds: 100n } });
+    const fetcher = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      expect(new Headers(init?.headers).get("authorization")).toBe("Bearer private-test-key");
+      expect(init?.signal?.aborted).toBe(false);
+      const body = new Uint8Array(init?.body as Uint8Array);
+      if (String(input).endsWith("ListWorkspaceChangeSets")) {
+        const request = fromBinary(ListWorkspaceChangeSetsRequestSchema, body);
+        expect(request.workspaceId).toBe("workspace"); expect(request.sessionId).toBe("task");
+        tokens.push(request.page!.pageToken);
+        return new Response(toBinary(ListWorkspaceChangeSetsResponseSchema, create(ListWorkspaceChangeSetsResponseSchema, {
+          changeSets: [{ changeSetId: request.page!.pageToken ? "second" : "first", workspaceId: "workspace", sessionId: "task", runId: "run", capturedAt: { seconds: 1n } }],
+          page: { nextPageToken: request.page!.pageToken ? "" : "next", totalSize: 2n }
+        })), { headers: { "content-type": "application/proto" } });
+      }
+      expect(fromBinary(PreviewWorkspaceRewindRequestSchema, body)).toMatchObject({ workspaceId: "workspace", changeSetId: "second" });
+      return new Response(toBinary(PreviewWorkspaceRewindResponseSchema, create(PreviewWorkspaceRewindResponseSchema, { preview })),
+        { headers: { "content-type": "application/proto" } });
+    });
+    try {
+      const sets = await mobileNetwork.listWorkspaceChangeSets(credential, "workspace", "task", controller.signal);
+      expect(sets.map((value) => value.changeSetId)).toEqual(["first", "second"]); expect(tokens).toEqual(["", "next"]);
+      await expect(mobileNetwork.previewWorkspaceRewind(credential, "workspace", "second", controller.signal)).resolves.toEqual(preview);
+      controller.abort();
+      await expect(mobileNetwork.previewWorkspaceRewind(credential, "workspace", "second", controller.signal)).rejects.toThrow(/aborted|canceled/u);
+      expect(fetcher).toHaveBeenCalledTimes(3);
+    } finally { fetcher.mockRestore(); }
+  });
+
+  it("rejects incomplete, cyclic, duplicate, changed or foreign checkpoint catalogs", async () => {
+    const checkpoint = create(WorkspaceChangeSetSchema, { changeSetId: "checkpoint", workspaceId: "workspace", sessionId: "task", capturedAt: { seconds: 1n } });
+    await expect(collectWorkspaceChangeSetPages("workspace", "task", async () => ({ changeSets: [checkpoint], nextPageToken: "", totalSize: 2n }))).rejects.toThrow(/incomplete/u);
+    await expect(collectWorkspaceChangeSetPages("workspace", "task", async () => ({ changeSets: [checkpoint], nextPageToken: "next", totalSize: 2n }))).rejects.toThrow(/duplicate/u);
+    await expect(collectWorkspaceChangeSetPages("workspace", "foreign", async () => ({ changeSets: [checkpoint], nextPageToken: "", totalSize: 1n }))).rejects.toThrow(/foreign/u);
+    await expect(collectWorkspaceChangeSetPages("workspace", "task", async (token) => ({ changeSets: [create(WorkspaceChangeSetSchema, { ...checkpoint, changeSetId: token || "first" })],
+      nextPageToken: token ? "" : "next", totalSize: token ? 3n : 2n }))).rejects.toThrow(/changing/u);
+    await expect(collectWorkspaceChangeSetPages("workspace", "task", async (token) => ({ changeSets: token ? [] : [checkpoint], nextPageToken: "next", totalSize: 2n }))).rejects.toThrow(/cyclic/u);
+  });
+});
 
 describe("mobile voice ephemeral requests", () => {
   it("loads voice service settings, uploads credentials only through a same-origin ticket, and keeps context separate", async () => {

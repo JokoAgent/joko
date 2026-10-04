@@ -19,7 +19,7 @@ import {
   type NativeSessionTree, type PendingBlobUpload, type RuntimeCommand, type Schedule, type ScheduleRunHistory,
   type SchedulerRuntimeSnapshot, type SessionMessageSearchMatch, type SessionResource, type Snapshot, type Target,
   type WorkspaceEntry, type WorkspaceFileChange, type ListPartnerSessionsResponse,
-  type WorkspaceSearchMatch
+  type WorkspaceSearchMatch, type WorkspaceChangeSet, type WorkspaceRewindPreview
 } from "@joko/contracts";
 import {
   canonicalWorkspacePath,
@@ -128,6 +128,8 @@ export interface MobileNetwork {
   searchSessionMessages(credential: PairedCredential, query: string, status: SessionMessageSearchSessionStatus, signal?: AbortSignal): Promise<readonly SessionMessageSearchMatch[]>;
   streamOwner(credential: PairedCredential, after: EventCursor, signal: AbortSignal): AsyncIterable<Event>;
   listWorkspaceDirectory(credential: PairedCredential, workspaceId: string, parentPath: string, signal?: AbortSignal): Promise<WorkspaceDirectorySnapshot>;
+  listWorkspaceChangeSets(credential: PairedCredential, workspaceId: string, sessionId: string, signal?: AbortSignal): Promise<readonly WorkspaceChangeSet[]>;
+  previewWorkspaceRewind(credential: PairedCredential, workspaceId: string, changeSetId: string, signal?: AbortSignal): Promise<WorkspaceRewindPreview>;
   listWorkspaceFileIndex(credential: PairedCredential, workspaceId: string, signal?: AbortSignal): Promise<WorkspaceFileIndexSnapshot>;
   searchWorkspace(credential: PairedCredential, workspaceId: string, query: string, caseSensitive: boolean, signal?: AbortSignal): Promise<WorkspaceSearchSnapshot>;
   watchWorkspace(credential: PairedCredential, workspaceId: string, signal: AbortSignal): AsyncIterable<WorkspaceFileChange>;
@@ -393,6 +395,38 @@ export async function collectTargetWorktreeSourcePages(
     pageTokens.add(page.nextPageToken);
     pageToken = page.nextPageToken;
   }
+}
+
+export async function collectWorkspaceChangeSetPages(workspaceId: string, sessionId: string,
+  readPage: (pageToken: string) => Promise<{ readonly changeSets: readonly WorkspaceChangeSet[]; readonly nextPageToken: string; readonly totalSize: bigint }>
+): Promise<readonly WorkspaceChangeSet[]> {
+  const values: WorkspaceChangeSet[] = []; const identities = new Set<string>(); const tokens = new Set<string>();
+  let token = ""; let total: bigint | undefined;
+  for (let index = 0; index < 256; index++) {
+    const page = await readPage(token);
+    if (page.totalSize < 0n || page.totalSize > 30_000n || page.changeSets.length > WORKSPACE_PAGE_SIZE
+      || !validSchedulePageToken(page.nextPageToken) || total !== undefined && page.totalSize !== total) {
+      throw new Error("The Joko node returned invalid or changing Workspace checkpoint metadata.");
+    }
+    total = page.totalSize;
+    for (const value of page.changeSets) {
+      if (!validCatalogIdentity(value.changeSetId) || identities.has(value.changeSetId)
+        || value.workspaceId !== workspaceId || value.sessionId !== sessionId || !value.capturedAt
+        || value.capturedAt.seconds < 0n || value.capturedAt.nanos < 0 || value.capturedAt.nanos >= 1_000_000_000) {
+        throw new Error("The Joko node returned a duplicate or foreign Workspace checkpoint.");
+      }
+      identities.add(value.changeSetId); values.push(value);
+    }
+    if (!page.nextPageToken) {
+      if (BigInt(values.length) !== total) throw new Error("The Workspace checkpoint catalog is incomplete.");
+      return values;
+    }
+    if (!page.changeSets.length || page.nextPageToken === token || tokens.has(page.nextPageToken)) {
+      throw new Error("The Workspace checkpoint catalog has a cyclic page token.");
+    }
+    tokens.add(page.nextPageToken); token = page.nextPageToken;
+  }
+  throw new Error("The Workspace checkpoint catalog exceeds the safe paging limit.");
 }
 
 export function validateScheduleHistoryPage(
@@ -1219,6 +1253,26 @@ export const mobileNetwork: MobileNetwork = {
         revision: responseRevision(response.revision)
       };
     });
+  },
+  async listWorkspaceChangeSets(credential, workspaceId, sessionId, signal) {
+    signal?.throwIfAborted();
+    if (!workspaceId || !sessionId) throw new Error("A current Workspace and task are required.");
+    const client = createClient(WorkspaceService, transport(credential.origin, credential.authKey));
+    return collectWorkspaceChangeSetPages(workspaceId, sessionId, async (pageToken) => {
+      signal?.throwIfAborted();
+      const response = await client.listWorkspaceChangeSets({ workspaceId, sessionId,
+        page: { pageSize: WORKSPACE_PAGE_SIZE, pageToken } }, options(signal));
+      if (!response.page) throw new Error("The Joko node did not return Workspace checkpoint page metadata.");
+      return { changeSets: response.changeSets, nextPageToken: response.page.nextPageToken, totalSize: response.page.totalSize };
+    });
+  },
+  async previewWorkspaceRewind(credential, workspaceId, changeSetId, signal) {
+    signal?.throwIfAborted();
+    if (!workspaceId || !changeSetId) throw new Error("A current Workspace checkpoint is required.");
+    const response = await createClient(WorkspaceService, transport(credential.origin, credential.authKey))
+      .previewWorkspaceRewind({ workspaceId, changeSetId }, options(signal));
+    if (!response.preview) throw new Error("The Joko node did not return a Workspace rewind preview.");
+    return response.preview;
   },
   async listWorkspaceFileIndex(credential, workspaceId, signal) {
     if (!workspaceId) throw new Error("A current Workspace is required.");
