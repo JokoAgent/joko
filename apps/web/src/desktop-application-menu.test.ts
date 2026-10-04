@@ -5,6 +5,7 @@ import {
   desktopApplicationMenuAccelerators,
   desktopUpdateCheckNotice
 } from "./desktop-application-menu.js";
+import { windowZoomAfterIntent } from "./appearance-settings.js";
 
 describe("Desktop application-menu bridge", () => {
   it("maps every manual update outcome to explicit feedback", () => {
@@ -24,7 +25,7 @@ describe("Desktop application-menu bridge", () => {
 
   it("constructs before the App target ref exists and accepts the first render sync", async () => {
     const getPreferences = vi.fn(() => ({ navigationOpen: true, windowZoom: 1 }));
-    const setWindowZoom = vi.fn();
+    const changeWindowZoom = vi.fn(async () => 1.5);
     const queue = createDesktopApplicationMenuCommandQueue({
       getPreferences,
       openAbout: vi.fn(),
@@ -33,13 +34,13 @@ describe("Desktop application-menu bridge", () => {
       openTaskStatusSettings: vi.fn(),
       checkForUpdates: vi.fn(),
       setNavigationOpen: vi.fn(),
-      setWindowZoom
+      changeWindowZoom
     });
     expect(getPreferences).not.toHaveBeenCalled();
     queue.sync({ navigationOpen: false, windowZoom: 1.4 });
     queue.handle("zoom-in");
     await queue.whenIdle();
-    expect(setWindowZoom).toHaveBeenCalledWith(1.5);
+    expect(changeWindowZoom).toHaveBeenCalledWith("increase");
   });
 
   it("routes the native About item through the guarded renderer action", async () => {
@@ -52,7 +53,7 @@ describe("Desktop application-menu bridge", () => {
       openTaskStatusSettings: vi.fn(),
       checkForUpdates: vi.fn(),
       setNavigationOpen: vi.fn(),
-      setWindowZoom: vi.fn()
+      changeWindowZoom: vi.fn(async () => 1)
     });
     queue.handle("open-about");
     await queue.whenIdle();
@@ -69,16 +70,17 @@ describe("Desktop application-menu bridge", () => {
       openTaskStatusSettings,
       checkForUpdates: vi.fn(),
       setNavigationOpen: vi.fn(),
-      setWindowZoom: vi.fn()
+      changeWindowZoom: vi.fn(async () => 1)
     });
     queue.handle("open-task-status-settings");
     await queue.whenIdle();
     expect(openTaskStatusSettings).toHaveBeenCalledOnce();
   });
 
-  it("serializes consecutive preference commands against an optimistic current value", async () => {
+  it("serializes consecutive preference commands against confirmed durable zoom", async () => {
     const zooms: number[] = [];
     const navigation: boolean[] = [];
+    let durableZoom = 1;
     const queue = createDesktopApplicationMenuCommandQueue({
       getPreferences: () => ({ navigationOpen: true, windowZoom: 1 }),
       openAbout: vi.fn(),
@@ -87,16 +89,22 @@ describe("Desktop application-menu bridge", () => {
       openTaskStatusSettings: vi.fn(),
       checkForUpdates: vi.fn(),
       setNavigationOpen: async (open) => { navigation.push(open); },
-      setWindowZoom: async (zoom) => { zooms.push(zoom); }
+      changeWindowZoom: async (intent) => {
+        durableZoom = windowZoomAfterIntent(durableZoom, intent);
+        zooms.push(durableZoom);
+        return durableZoom;
+      }
     });
 
     queue.handle("zoom-in");
     queue.handle("zoom-in");
+    queue.handle("zoom-out");
+    queue.handle("zoom-reset");
     queue.handle("toggle-sidebar");
     queue.handle("toggle-sidebar");
     await queue.whenIdle();
 
-    expect(zooms).toEqual([1.1, 1.2]);
+    expect(zooms).toEqual([1.1, 1.2, 1.1, 1]);
     expect(navigation).toEqual([false, true]);
   });
 
@@ -111,7 +119,7 @@ describe("Desktop application-menu bridge", () => {
       openTaskStatusSettings: vi.fn(),
       checkForUpdates: vi.fn(),
       setNavigationOpen: vi.fn(),
-      setWindowZoom: vi.fn(),
+      changeWindowZoom: vi.fn(async () => 1),
       onError: (error) => { errors.push(error); }
     });
 
@@ -121,6 +129,34 @@ describe("Desktop application-menu bridge", () => {
 
     expect(errors).toHaveLength(1);
     expect(openSettings).toHaveBeenCalledOnce();
+  });
+
+  it("resyncs authoritative preferences after a failed zoom before the next preference command", async () => {
+    let authoritative = { navigationOpen: true, windowZoom: 1 };
+    const getPreferences = vi.fn(() => authoritative);
+    const navigation: boolean[] = [];
+    const errors: unknown[] = [];
+    const queue = createDesktopApplicationMenuCommandQueue({
+      getPreferences,
+      openAbout: vi.fn(),
+      openNewSession: vi.fn(),
+      openSettings: vi.fn(),
+      openTaskStatusSettings: vi.fn(),
+      checkForUpdates: vi.fn(),
+      setNavigationOpen: async (open) => { navigation.push(open); },
+      changeWindowZoom: async () => { throw new Error("zoom save failed"); },
+      onError: (error) => { errors.push(error); }
+    });
+    queue.sync(authoritative);
+
+    queue.handle("zoom-in");
+    authoritative = { navigationOpen: false, windowZoom: 1.4 };
+    queue.handle("toggle-sidebar");
+    await queue.whenIdle();
+
+    expect(errors).toEqual([expect.objectContaining({ message: "zoom save failed" })]);
+    expect(navigation).toEqual([true]);
+    expect(getPreferences).toHaveBeenCalledTimes(2);
   });
 
   it("awaits a guarded navigation before starting the next menu navigation", async () => {
@@ -136,7 +172,7 @@ describe("Desktop application-menu bridge", () => {
       openTaskStatusSettings: vi.fn(),
       checkForUpdates: vi.fn(),
       setNavigationOpen: vi.fn(),
-      setWindowZoom: vi.fn()
+      changeWindowZoom: vi.fn(async () => 1)
     });
     queue.sync({ navigationOpen: true, windowZoom: 1 });
     queue.handle("new-session");

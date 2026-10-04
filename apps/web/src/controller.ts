@@ -68,8 +68,11 @@ import {
   clampCodeSize,
   clampUiSize,
   clampWindowZoom,
-  normalizeFontFamily
+  normalizeFontFamily,
+  windowZoomAfterIntent,
+  type WindowZoomIntent
 } from "./appearance-settings.js";
+import { subscribeAppearancePreferencesChange, withAppearanceProjection } from "./appearance-preference-sync.js";
 import {
   withSidebarDisplayPreferences,
   withSidebarOwnerLayout,
@@ -202,7 +205,7 @@ export interface AppController extends OperationApi {
   setCodeFamily(family: string): Promise<void>;
   setUiSize(size: number): Promise<void>;
   setCodeSize(size: number): Promise<void>;
-  setWindowZoom(zoom: number): Promise<void>;
+  changeWindowZoom(intent: WindowZoomIntent): Promise<number>;
   setComposerSendShortcut(shortcut: ComposerSendShortcutPreference): Promise<void>;
   setMessageSearchSort(sort: MessageSearchSortPreference): Promise<void>;
   setMessageNavRailEnabled(enabled: boolean): Promise<void>;
@@ -267,6 +270,7 @@ export function useAppController(): AppController {
     preferences: DEFAULT_UI_PREFERENCES,
     extensionNotifications: []
   });
+  const [windowZoomApplicationRevision, setWindowZoomApplicationRevision] = useState(0);
   const localRef = useRef<LocalState | undefined>(undefined);
   const activeProfileRef = useRef<ConnectionProfile | undefined>(state.activeProfile);
   activeProfileRef.current = state.activeProfile;
@@ -287,7 +291,9 @@ export function useAppController(): AppController {
   routeRef.current = state.route;
   const preferencesRef = useRef<UiPreferences>(DEFAULT_UI_PREFERENCES);
   preferencesRef.current = state.preferences;
-  const preferenceMutationTailRef = useRef<Promise<void>>(Promise.resolve());
+  const preferenceOperationTailRef = useRef<Promise<void>>(Promise.resolve());
+  const appearancePreferenceSyncOwnerRef = useRef(0);
+  const appearancePreferenceHintRevisionRef = useRef(0);
   const gatewayRef = useRef<OrchestratorGateway | undefined>(undefined);
   const gatewayGenerationRef = useRef(0);
   const htmlPreviewsRef = useRef(new Map<string, {
@@ -319,6 +325,39 @@ export function useAppController(): AppController {
     retryTimer?: number;
   }>());
 
+  const enqueuePreferenceOperation = useCallback(<T,>(operation: () => Promise<T>): Promise<T> => {
+    const scheduled = preferenceOperationTailRef.current.then(operation, operation);
+    preferenceOperationTailRef.current = scheduled.then(() => undefined, () => undefined);
+    return scheduled;
+  }, []);
+  const enqueueAppearancePreferenceRefresh = useCallback((owner: number, requestRevision: number): void => {
+    void enqueuePreferenceOperation(async () => {
+      if (appearancePreferenceSyncOwnerRef.current !== owner
+        || appearancePreferenceHintRevisionRef.current !== requestRevision) return;
+      const local = localRef.current;
+      if (local === undefined) return;
+      const durable = (await local.readPreferences()) ?? DEFAULT_UI_PREFERENCES;
+      if (appearancePreferenceSyncOwnerRef.current !== owner
+        || appearancePreferenceHintRevisionRef.current !== requestRevision) return;
+      const previous = preferencesRef.current;
+      const next = withAppearanceProjection(previous, durable);
+      if (next !== previous) {
+        preferencesRef.current = next;
+        setState((current) => {
+          const projected = current.preferences === previous
+            ? next
+            : withAppearanceProjection(current.preferences, durable);
+          return projected === current.preferences ? current : { ...current, preferences: projected };
+        });
+      }
+      // The content-free hint cannot distinguish a zoom change whose durable
+      // value matches this renderer's last committed React snapshot. Reapply
+      // every accepted confirmed appearance read so batched intermediate
+      // projections cannot leave the shared native zoom stale.
+      setWindowZoomApplicationRevision((revision) => revision + 1);
+    }).catch(() => undefined);
+  }, [enqueuePreferenceOperation]);
+
   useEffect(() => {
     const routeSessionId = extensionUiRouteSessionId(state.route);
     if (extensionTitleSessionRef.current === undefined || extensionTitleSessionRef.current === routeSessionId) return;
@@ -328,6 +367,14 @@ export function useAppController(): AppController {
 
   useEffect(() => {
     let cancelled = false;
+    let appearanceSyncLive = false;
+    const appearanceSyncOwner = ++appearancePreferenceSyncOwnerRef.current;
+    appearancePreferenceHintRevisionRef.current = 0;
+    const closeAppearancePreferenceSync = subscribeAppearancePreferencesChange(() => {
+      const requestRevision = ++appearancePreferenceHintRevisionRef.current;
+      if (appearanceSyncLive) enqueueAppearancePreferenceRefresh(appearanceSyncOwner, requestRevision);
+    });
+    const initialAppearanceRevision = appearancePreferenceHintRevisionRef.current;
     void LocalState.open().then(async (local) => {
       const [persistedProfiles, machineCaches, preferences, managedStatus, automaticConnectionAvailable] = await Promise.all([
         local.listProfiles(),
@@ -376,6 +423,13 @@ export function useAppController(): AppController {
         && effectivePreferences.automaticConnectionTarget?.kind === "managedLocal"
         && automaticProfile === undefined
         && effectiveManagedStatus?.state === "starting";
+      let observedAppearanceRevision = initialAppearanceRevision;
+      while (!cancelled && observedAppearanceRevision !== appearancePreferenceHintRevisionRef.current) {
+        observedAppearanceRevision = appearancePreferenceHintRevisionRef.current;
+        const durable = (await local.readPreferences()) ?? DEFAULT_UI_PREFERENCES;
+        effectivePreferences = withAppearanceProjection(effectivePreferences, durable);
+      }
+      if (cancelled) return;
       localRef.current = local;
       preferencesRef.current = effectivePreferences;
       setState((current) => ({
@@ -390,6 +444,7 @@ export function useAppController(): AppController {
         ...(managedBootstrapError === undefined ? {} : { error: managedBootstrapError }),
         ...(automaticProfile === undefined ? {} : { activeProfile: automaticProfile, connectionState: "connecting" as const })
       }));
+      appearanceSyncLive = true;
     }).catch((error: unknown) => {
       if (!cancelled) setState((current) => ({ ...current, ready: true, error: messageOf(error) }));
     });
@@ -465,6 +520,9 @@ export function useAppController(): AppController {
     window.addEventListener("hashchange", onHashChange);
     return () => {
       cancelled = true;
+      appearanceSyncLive = false;
+      closeAppearancePreferenceSync();
+      if (appearancePreferenceSyncOwnerRef.current === appearanceSyncOwner) appearancePreferenceSyncOwnerRef.current += 1;
       gatewayGenerationRef.current += 1;
       machineRefreshGenerationRef.current += 1;
       discoveryGenerationRef.current += 1;
@@ -480,7 +538,7 @@ export function useAppController(): AppController {
       }
       remoteMachineGatewaysRef.current.clear();
     };
-  }, []);
+  }, [enqueueAppearancePreferenceRefresh]);
 
   useEffect(() => {
     applyTheme(state.preferences.theme);
@@ -500,15 +558,9 @@ export function useAppController(): AppController {
   }, [state.preferences.codeFamily, state.preferences.codeSize, state.preferences.uiFamily, state.preferences.uiSize]);
 
   useEffect(() => {
-    const windowZoom = clampWindowZoom(state.preferences.windowZoom);
-    const nativeZoom = window.jokoDesktop?.window.setZoomFactor;
-    if (nativeZoom !== undefined) {
-      document.documentElement.style.removeProperty("zoom");
-      void nativeZoom(windowZoom).catch(() => undefined);
-      return;
-    }
-    document.documentElement.style.setProperty("zoom", String(windowZoom));
-  }, [state.preferences.windowZoom]);
+    if (!state.ready) return;
+    applyWindowZoom(state.preferences.windowZoom);
+  }, [state.preferences.windowZoom, state.ready, windowZoomApplicationRevision]);
 
   const commitPreferenceMutation = useCallback(async (mutation: UiPreferencesMutation): Promise<void> => {
     const previous = preferencesRef.current;
@@ -534,13 +586,8 @@ export function useAppController(): AppController {
     // If an older write fails, its rollback therefore happens before a newer
     // mutation samples local state; the newer success cannot retain a phantom
     // value that never reached durable storage.
-    const scheduled = preferenceMutationTailRef.current.then(
-      () => commitPreferenceMutation(mutation),
-      () => commitPreferenceMutation(mutation)
-    );
-    preferenceMutationTailRef.current = scheduled.then(() => undefined, () => undefined);
-    return scheduled;
-  }, [commitPreferenceMutation]);
+    return enqueuePreferenceOperation(() => commitPreferenceMutation(mutation));
+  }, [commitPreferenceMutation, enqueuePreferenceOperation]);
 
   const updatePreferences = useCallback(async (patch: Partial<UiPreferences>): Promise<void> => {
     await mutatePreferences((current) => ({ ...current, ...patch }));
@@ -549,6 +596,46 @@ export function useAppController(): AppController {
     (composerSendShortcut) => updatePreferences({ composerSendShortcut }),
     [updatePreferences]
   );
+  const setUiFamily = useCallback<AppController["setUiFamily"]>(
+    (uiFamily) => updatePreferences({ uiFamily: normalizeFontFamily(uiFamily) }),
+    [updatePreferences]
+  );
+  const setCodeFamily = useCallback<AppController["setCodeFamily"]>(
+    (codeFamily) => updatePreferences({ codeFamily: normalizeFontFamily(codeFamily) }),
+    [updatePreferences]
+  );
+  const setUiSize = useCallback<AppController["setUiSize"]>(
+    (uiSize) => updatePreferences({ uiSize: clampUiSize(uiSize) }),
+    [updatePreferences]
+  );
+  const setCodeSize = useCallback<AppController["setCodeSize"]>(
+    (codeSize) => updatePreferences({ codeSize: clampCodeSize(codeSize) }),
+    [updatePreferences]
+  );
+  const changeWindowZoom = useCallback<AppController["changeWindowZoom"]>((intent) => {
+    const owner = appearancePreferenceSyncOwnerRef.current;
+    return enqueuePreferenceOperation(async () => {
+      const durable = await requireLocal(localRef.current).mutatePreferences((current) => ({
+        ...current,
+        windowZoom: windowZoomAfterIntent(current.windowZoom, intent)
+      }));
+      const confirmedZoom = durable.windowZoom;
+      if (appearancePreferenceSyncOwnerRef.current === owner) {
+        if (preferencesRef.current.windowZoom !== confirmedZoom) {
+          preferencesRef.current = { ...preferencesRef.current, windowZoom: confirmedZoom };
+          setState((current) => current.preferences.windowZoom === confirmedZoom
+            ? current
+            : { ...current, preferences: { ...current.preferences, windowZoom: confirmedZoom } });
+        }
+        // A different renderer can already have changed the shared native zoom
+        // while this renderer still projects the confirmed value. Treat every
+        // successful command as a physical application occurrence so React
+        // batching cannot erase an equal-value reset.
+        setWindowZoomApplicationRevision((revision) => revision + 1);
+      }
+      return confirmedZoom;
+    });
+  }, [enqueuePreferenceOperation]);
 
   const setMachineSelection = useCallback(async (selection: MachineSelection): Promise<void> => {
     await updatePreferences({ machineSelection: normalizeMachineSelection(selection) });
@@ -2098,11 +2185,11 @@ export function useAppController(): AppController {
     navigate,
     setLocale: (locale) => updatePreferences({ locale }),
     setTheme: (theme) => updatePreferences({ theme }),
-    setUiFamily: (uiFamily) => updatePreferences({ uiFamily: normalizeFontFamily(uiFamily) }),
-    setCodeFamily: (codeFamily) => updatePreferences({ codeFamily: normalizeFontFamily(codeFamily) }),
-    setUiSize: (uiSize) => updatePreferences({ uiSize: clampUiSize(uiSize) }),
-    setCodeSize: (codeSize) => updatePreferences({ codeSize: clampCodeSize(codeSize) }),
-    setWindowZoom: (windowZoom) => updatePreferences({ windowZoom: clampWindowZoom(windowZoom) }),
+    setUiFamily,
+    setCodeFamily,
+    setUiSize,
+    setCodeSize,
+    changeWindowZoom,
     setComposerSendShortcut,
     setMessageSearchSort: (messageSearchSort) => updatePreferences({ messageSearchSort }),
     setMessageNavRailEnabled: (messageNavRailEnabled) => updatePreferences({ messageNavRailEnabled }),
@@ -2792,7 +2879,7 @@ export function useAppController(): AppController {
     copyArtifactFile,
     openArtifactFile,
     revealArtifactSource
-  }), [saveProvider, openHttpLink, openWorkspaceHtml, readWorkspaceHtmlSnapshot, remoteHostApi, newTaskDraftApi, inputApi, mcpApi, terminalApi, simulatorViewerApi, readDraftSnapshot, saveDraftIfRevision, restoreFirstInputDraft, listWorkspaceChangeSets, previewWorkspaceRewind, executeWorkspaceRewind, readDraft, saveDraft, navigateSessionBranch, copyArtifactFile, openArtifactFile, revealArtifactSource, voiceApi, downloadArtifact, exportSession, exportPortableSession, getArtifactUrl, readWorkspaceFile, releaseArtifactUrl, updateAuxiliaryTextSettings, predictNextPrompt, cancelAutomaticConnectionAttempt, connect, disconnect, forgetProfile, gateway, logoutConnection, logoutProfile, mutatePreferences, navigate, openMachineSession, pair, probeRuntimeActivity, refreshDiscoveredNodes, refreshMachines, retryManagedOrchestrator, revokeDevice, searchRemoteSessionMessages, setAutomaticConnectionEnabled, setComposerSendShortcut, setMachineSelection, state, switchMachine, updatePreferences]);
+  }), [saveProvider, openHttpLink, openWorkspaceHtml, readWorkspaceHtmlSnapshot, remoteHostApi, newTaskDraftApi, inputApi, mcpApi, terminalApi, simulatorViewerApi, readDraftSnapshot, saveDraftIfRevision, restoreFirstInputDraft, listWorkspaceChangeSets, previewWorkspaceRewind, executeWorkspaceRewind, readDraft, saveDraft, navigateSessionBranch, copyArtifactFile, openArtifactFile, revealArtifactSource, voiceApi, downloadArtifact, exportSession, exportPortableSession, getArtifactUrl, readWorkspaceFile, releaseArtifactUrl, updateAuxiliaryTextSettings, predictNextPrompt, cancelAutomaticConnectionAttempt, connect, disconnect, forgetProfile, gateway, logoutConnection, logoutProfile, mutatePreferences, navigate, openMachineSession, pair, probeRuntimeActivity, refreshDiscoveredNodes, refreshMachines, retryManagedOrchestrator, revokeDevice, searchRemoteSessionMessages, setAutomaticConnectionEnabled, setCodeFamily, setCodeSize, setComposerSendShortcut, setMachineSelection, setUiFamily, setUiSize, state, switchMachine, updatePreferences]);
 }
 
 function upsertMachineCache(caches: readonly MachineCacheView[], cache: MachineCacheView): readonly MachineCacheView[] {
@@ -3524,6 +3611,17 @@ function applyTheme(theme: Theme): void {
   const dark = theme === "dark" || (theme === "system" && matchMedia("(prefers-color-scheme: dark)").matches);
   applyFavicon(dark);
   document.querySelector('meta[name="theme-color"]')?.setAttribute("content", dark ? "#0d0d0d" : "#f2f2f2");
+}
+
+function applyWindowZoom(value: number): void {
+  const windowZoom = clampWindowZoom(value);
+  const nativeZoom = window.jokoDesktop?.window.setZoomFactor;
+  if (nativeZoom !== undefined) {
+    document.documentElement.style.removeProperty("zoom");
+    void nativeZoom(windowZoom).catch(() => undefined);
+    return;
+  }
+  document.documentElement.style.setProperty("zoom", String(windowZoom));
 }
 
 export function trustedReusablePairingProfiles(

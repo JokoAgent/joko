@@ -1,6 +1,7 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { DEFAULT_UI_PREFERENCES, LocalState } from "./local-state.js";
 import { DEFAULT_SIDEBAR_OWNER_LAYOUT, withSidebarOwnerLayout } from "./sidebar-layout.js";
+import { subscribeAppearancePreferencesChange } from "./appearance-preference-sync.js";
 
 describe("cross-window durable UI preference mutations", () => {
   it("merges a stale renderer's unrelated patch with the latest durable owner layout", async () => {
@@ -105,6 +106,66 @@ describe("cross-window durable UI preference mutations", () => {
     await expect(state.mutatePreferences((current) => ({ ...current, theme: "dark" })))
       .rejects.toThrow("preference write failed");
     await expect(state.readPreferences()).resolves.toMatchObject({ theme: "light" });
+  });
+
+  it("publishes only successfully committed changes to the shared appearance projection", async () => {
+    const database = memoryPreferenceDatabase();
+    const publishedDurableUiRecords: unknown[] = [];
+    const channels = new Set<TestChannel>();
+    class TestChannel {
+      onmessage: ((event: MessageEvent<unknown>) => void) | null = null;
+      constructor(readonly name: string) { channels.add(this); }
+      postMessage(value: unknown): void {
+        publishedDurableUiRecords.push(database.readUiRecord());
+        for (const peer of channels) if (peer !== this && peer.name === this.name) {
+          queueMicrotask(() => peer.onmessage?.({ data: value } as MessageEvent<unknown>));
+        }
+      }
+      close(): void { channels.delete(this); }
+    }
+    vi.stubGlobal("BroadcastChannel", TestChannel);
+    try {
+      const state = memoryLocalState(database.database);
+      const changed = vi.fn();
+      const close = subscribeAppearancePreferencesChange(changed);
+
+      await state.mutatePreferences((current) => ({ ...current, uiSize: 18 }));
+      await Promise.resolve();
+      expect(changed).toHaveBeenCalledOnce();
+      expect(publishedDurableUiRecords).toHaveLength(1);
+      expect(publishedDurableUiRecords.at(-1)).toMatchObject({ uiSize: 18 });
+
+      await state.mutatePreferences((current) => ({ ...current, windowZoom: 1.5 }));
+      await Promise.resolve();
+      expect(changed).toHaveBeenCalledTimes(2);
+      expect(publishedDurableUiRecords).toHaveLength(2);
+      expect(publishedDurableUiRecords.at(-1)).toMatchObject({ windowZoom: 1.5 });
+
+      await state.mutatePreferences((current) => ({ ...current, windowZoom: 1.5 }));
+      await state.mutatePreferences((current) => ({ ...current, theme: "light" }));
+      await Promise.resolve();
+      expect(changed).toHaveBeenCalledTimes(3);
+      expect(publishedDurableUiRecords).toHaveLength(3);
+      expect(publishedDurableUiRecords.at(-1)).toMatchObject({ theme: "light", windowZoom: 1.5 });
+
+      await state.mutatePreferences((current) => ({ ...current, theme: "light" }));
+      await state.mutatePreferences((current) => ({ ...current, locale: "zh-CN" }));
+      await state.mutatePreferences((current) => ({ ...current, composerSendShortcut: "modifier-enter" }));
+      await Promise.resolve();
+      expect(changed).toHaveBeenCalledTimes(3);
+      expect(publishedDurableUiRecords).toHaveLength(3);
+
+      database.failNextPut();
+      await expect(state.mutatePreferences((current) => ({ ...current, theme: "dark" })))
+        .rejects.toThrow("preference write failed");
+      await Promise.resolve();
+      expect(changed).toHaveBeenCalledTimes(3);
+      expect(publishedDurableUiRecords).toHaveLength(3);
+      expect(database.readUiRecord()).toMatchObject({ theme: "light", windowZoom: 1.5 });
+      close();
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 });
 

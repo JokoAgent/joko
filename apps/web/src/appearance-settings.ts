@@ -6,6 +6,8 @@ export interface AppearancePreferences {
   readonly windowZoom: number;
 }
 
+export type WindowZoomIntent = "increase" | "decrease" | "reset";
+
 export const DEFAULT_APPEARANCE_PREFERENCES: AppearancePreferences = {
   uiFamily: "",
   codeFamily: "",
@@ -34,6 +36,13 @@ export function clampWindowZoom(value: number, fallback = DEFAULT_APPEARANCE_PRE
   if (!Number.isFinite(value)) return fallback;
   const stepped = Math.round(value / APPEARANCE_LIMITS.windowZoom.step) * APPEARANCE_LIMITS.windowZoom.step;
   return roundDecimal(Math.min(APPEARANCE_LIMITS.windowZoom.max, Math.max(APPEARANCE_LIMITS.windowZoom.min, stepped)), 2);
+}
+
+export function windowZoomAfterIntent(current: number, intent: WindowZoomIntent): number {
+  if (intent === "reset") return DEFAULT_APPEARANCE_PREFERENCES.windowZoom;
+  return clampWindowZoom(current + (intent === "increase"
+    ? APPEARANCE_LIMITS.windowZoom.step
+    : -APPEARANCE_LIMITS.windowZoom.step));
 }
 
 export function normalizeFontFamily(value: unknown): string {

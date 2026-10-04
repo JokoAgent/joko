@@ -17,6 +17,7 @@ import {
   normalizeAppearancePreferences,
   type AppearancePreferences
 } from "./appearance-settings.js";
+import { publishAppearancePreferencesChange, sameAppearanceProjection } from "./appearance-preference-sync.js";
 import {
   DEFAULT_SIDEBAR_DISPLAY_PREFERENCES,
   normalizeSidebarDisplayPreferences,
@@ -680,6 +681,7 @@ export class LocalState {
     if (!samePersistedValue(candidate, next)) throw new Error("The UI preference mutation produced an invalid current shape.");
     store.put(persistedUiPreferences(next), "ui");
     await transactionDone(transaction);
+    if (!sameAppearanceProjection(current, next)) publishAppearancePreferencesChange();
     return next;
   }
 

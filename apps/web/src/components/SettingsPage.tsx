@@ -46,6 +46,7 @@ import {
 } from "lucide-react";
 import type { AppController } from "../controller.js";
 import { DEFAULT_UI_PREFERENCES, LINK_OPEN_DEFAULTS, type LinkOpenKind, type LinkOpenPreference } from "../local-state.js";
+import { clampCodeSize, clampUiSize } from "../appearance-settings.js";
 import { currentAppShortcutPlatform } from "../app-shortcuts.js";
 import { composerVoiceShortcutsConflict } from "../composer-voice-shortcut-conflict.js";
 import { isConversationModel } from "../model-capabilities.js";
@@ -566,6 +567,7 @@ export function AppearanceSettings({ controller, locale, theme, onSuccess, onOpe
           preview={t("settings.appearance.uiPreview")}
           fallback="var(--app-font-ui-default)"
           onChange={controller.setUiFamily}
+          onSuccess={onSuccess}
           t={t}
         />
         <FontSizeSetting
@@ -575,7 +577,9 @@ export function AppearanceSettings({ controller, locale, theme, onSuccess, onOpe
           min={12}
           max={24}
           defaultValue={14}
+          normalize={clampUiSize}
           onChange={controller.setUiSize}
+          onSuccess={onSuccess}
           t={t}
         />
         <FontFamilySetting
@@ -590,6 +594,7 @@ export function AppearanceSettings({ controller, locale, theme, onSuccess, onOpe
           previewLanguage="typescript"
           fallback="var(--app-font-code-default)"
           onChange={controller.setCodeFamily}
+          onSuccess={onSuccess}
           t={t}
         />
         <FontSizeSetting
@@ -599,7 +604,9 @@ export function AppearanceSettings({ controller, locale, theme, onSuccess, onOpe
           min={10}
           max={24}
           defaultValue={14}
+          normalize={clampCodeSize}
           onChange={controller.setCodeSize}
+          onSuccess={onSuccess}
           t={t}
         />
       </section>
@@ -2044,7 +2051,7 @@ interface FontPreset {
   readonly family: string;
 }
 
-export function FontFamilySetting({ label, description, value, presets, preview, previewLanguage, fallback, onChange, t }: {
+export function FontFamilySetting({ label, description, value, presets, preview, previewLanguage, fallback, onChange, onSuccess, t }: {
   readonly label: string;
   readonly description: string;
   readonly value: string;
@@ -2053,16 +2060,58 @@ export function FontFamilySetting({ label, description, value, presets, preview,
   readonly previewLanguage?: string;
   readonly fallback: string;
   readonly onChange: (family: string) => Promise<void>;
+  readonly onSuccess: (message: string) => void;
   readonly t: Translator;
 }): JSX.Element {
   const [open, setOpen] = useState(false);
   const [customValue, setCustomValue] = useState(value);
   const selectedPreset = presets.find((preset) => preset.family === value);
+  const defaultFamily = presets.find((preset) => preset.id === "default")?.family ?? "";
   const [previewFamily, setPreviewFamily] = useState<string>();
   const panelRef = useRef<HTMLDivElement>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const resetRef = useRef<HTMLButtonElement>(null);
+  const customInputRef = useRef<HTMLInputElement>(null);
+  const actionOwner = useMemo(() => ({ action: onChange }), [onChange]);
+  const committedOwnerRef = useRef<typeof actionOwner | undefined>(undefined);
+  const flightRef = useRef<{
+    readonly owner: typeof actionOwner;
+    readonly focusTarget: HTMLElement | null;
+    readonly reset: boolean;
+  } | undefined>(undefined);
+  const focusAfterSettleRef = useRef<{
+    readonly owner: typeof actionOwner;
+    readonly target: HTMLElement | null;
+  } | undefined>(undefined);
+  const [feedback, setFeedback] = useState<{
+    readonly owner: typeof actionOwner;
+    readonly pending: boolean;
+    readonly error?: string;
+  }>({ owner: actionOwner, pending: false });
+  const pending = feedback.owner === actionOwner && feedback.pending;
+  const saveError = feedback.owner === actionOwner ? feedback.error : undefined;
+
+  useLayoutEffect(() => {
+    committedOwnerRef.current = actionOwner;
+    return () => {
+      if (committedOwnerRef.current === actionOwner) committedOwnerRef.current = undefined;
+      if (flightRef.current?.owner === actionOwner) flightRef.current = undefined;
+      if (focusAfterSettleRef.current?.owner === actionOwner) focusAfterSettleRef.current = undefined;
+    };
+  }, [actionOwner]);
+  useLayoutEffect(() => {
+    const request = focusAfterSettleRef.current;
+    if (pending || request?.owner !== actionOwner) return;
+    focusAfterSettleRef.current = undefined;
+    const target = request.target;
+    if (target?.isConnected === true && target.ownerDocument.defaultView?.closed !== true) {
+      target.focus({ preventScroll: true });
+    }
+    setPreviewFamily(undefined);
+  }, [actionOwner, pending, saveError, open]);
   useEffect(() => {
-    setCustomValue(value);
-  }, [value]);
+    if (!pending && saveError === undefined) setCustomValue(value);
+  }, [actionOwner, pending, saveError, value]);
   useEffect(() => {
     if (!open) setPreviewFamily(undefined);
   }, [open]);
@@ -2073,27 +2122,70 @@ export function FontFamilySetting({ label, description, value, presets, preview,
     [preview, previewLanguage]
   );
   const selectedLabel = selectedPreset?.label ?? (fontFamilyDisplayName(value) || t("settings.appearance.fontDefault"));
-  const selectFamily = (family: string): void => {
-    void onChange(family.trim());
-    setOpen(false);
+  const selectFamily = (family: string, reset: boolean, focusTarget: HTMLElement | null): void => {
+    if (flightRef.current?.owner === actionOwner) return;
+    const normalized = family.trim();
+    if (normalized === value) {
+      setOpen(false);
+      triggerRef.current?.focus({ preventScroll: true });
+      return;
+    }
+    const flight = { owner: actionOwner, focusTarget, reset };
+    flightRef.current = flight;
+    setFeedback({ owner: actionOwner, pending: true });
+    const current = (): boolean => committedOwnerRef.current === actionOwner && flightRef.current === flight;
+    void (async () => {
+      try {
+        await actionOwner.action(normalized);
+      } catch {
+        if (!current()) return;
+        flightRef.current = undefined;
+        focusAfterSettleRef.current = { owner: actionOwner, target: flight.focusTarget };
+        setPreviewFamily(undefined);
+        setFeedback({ owner: actionOwner, pending: false, error: t("settings.appearance.fontSaveFailed") });
+        return;
+      }
+      if (!current()) return;
+      flightRef.current = undefined;
+      focusAfterSettleRef.current = { owner: actionOwner, target: triggerRef.current };
+      setPreviewFamily(undefined);
+      setFeedback({ owner: actionOwner, pending: false });
+      setOpen(false);
+      onSuccess(t(flight.reset ? "settings.defaults.restored" : "settings.saved"));
+    })();
   };
   return (
     <div className="appearance-font-family">
       <div className="appearance-font-setting__heading">
-        <div><strong>{label}</strong><span>{description}</span></div>
-        <IconButton label={t("settings.appearance.fontReset")} disabled={value.length === 0} onClick={() => void onChange("")}><RotateCcw aria-hidden="true" /></IconButton>
+        <div><strong>{label}</strong><span>{description}</span>{pending && <span role="status">{t("common.working")}</span>}</div>
+        <IconButton
+          label={t("settings.appearance.fontReset")}
+          buttonRef={resetRef}
+          disabled={pending || value === defaultFamily}
+          aria-busy={pending}
+          onClick={() => selectFamily(defaultFamily, true, resetRef.current)}
+        ><RotateCcw aria-hidden="true" /></IconButton>
       </div>
       <MorphPopover
         open={open}
-        onOpenChange={setOpen}
+        onOpenChange={(next) => {
+          if (!next && (pending || flightRef.current?.owner === actionOwner)) return;
+          setOpen(next);
+        }}
         label={label}
         trigger={<button
+          ref={triggerRef}
           type="button"
           className="appearance-font-picker__trigger"
           aria-label={label}
           aria-haspopup="listbox"
           aria-expanded={open}
-          onClick={() => setOpen((current) => !current)}
+          aria-busy={pending}
+          disabled={pending}
+          onClick={() => {
+            if (flightRef.current?.owner === actionOwner) return;
+            setOpen((current) => !current);
+          }}
         >
           <span>{selectedLabel}</span>
           <ChevronDown aria-hidden="true" />
@@ -2104,13 +2196,14 @@ export function FontFamilySetting({ label, description, value, presets, preview,
         className="appearance-font-picker"
         panelClassName="appearance-font-picker__panel"
         panelElementRef={panelRef}
+        additionalOwnedElementRef={resetRef}
         initialFocus={() => panelRef.current?.querySelector<HTMLElement>("[data-font-selected]") ?? null}
       >
-        <div className="appearance-font-picker__content" onMouseLeave={() => setPreviewFamily(undefined)}>
+        <div className="appearance-font-picker__content" aria-busy={pending} onMouseLeave={() => setPreviewFamily(undefined)}>
           <pre className="appearance-font-preview" style={{ fontFamily: activePreviewFamily }}><code>{fontPreviewContents(preview, previewTokens)}</code></pre>
           <div className="appearance-font-picker__group">
             <strong>{t("settings.appearance.fontPresets")}</strong>
-            <div className="appearance-font-picker__options" role="listbox" aria-label={label}>
+            <div className="appearance-font-picker__options" role="listbox" aria-label={label} aria-busy={pending}>
               {presets.map((preset) => {
                 const selected = preset.family === value;
                 return <button
@@ -2121,11 +2214,13 @@ export function FontFamilySetting({ label, description, value, presets, preview,
                   data-font-selected={selected ? "" : undefined}
                   className={selected ? "is-selected" : undefined}
                   key={preset.id}
+                  disabled={pending}
+                  aria-busy={pending}
                   onMouseEnter={() => setPreviewFamily(preset.family)}
                   onMouseLeave={() => setPreviewFamily(undefined)}
                   onFocus={() => setPreviewFamily(preset.family)}
                   onBlur={() => setPreviewFamily(undefined)}
-                  onClick={() => selectFamily(preset.family)}
+                  onClick={(event) => selectFamily(preset.family, false, event.currentTarget)}
                 >
                   <span style={{ fontFamily: preset.family.trim() ? `${preset.family}, ${fallback}` : fallback }}>{preset.label}</span>
                   {selected && <Check aria-hidden="true" />}
@@ -2137,9 +2232,12 @@ export function FontFamilySetting({ label, description, value, presets, preview,
             <strong>{t("settings.appearance.fontCustom")}</strong>
             <div>
               <input
+                ref={customInputRef}
                 value={customValue}
                 maxLength={256}
                 aria-label={t("settings.appearance.fontCustom")}
+                aria-busy={pending}
+                disabled={pending}
                 data-font-selected={selectedPreset === undefined ? "" : undefined}
                 placeholder={t("settings.appearance.fontCustomPlaceholder")}
                 onChange={(event) => {
@@ -2149,14 +2247,22 @@ export function FontFamilySetting({ label, description, value, presets, preview,
                 onFocus={() => setPreviewFamily(customValue)}
                 onBlur={() => setPreviewFamily(undefined)}
                 onKeyDown={(event) => {
-                  if (event.key === "Enter" && customValue.trim() !== "") selectFamily(customValue);
+                  if (event.key !== "Enter" || event.nativeEvent.isComposing || event.keyCode === 229
+                    || customValue.trim() === "" || customValue.trim() === value || pending) return;
+                  event.preventDefault();
+                  selectFamily(customValue, false, event.currentTarget);
                 }}
               />
-              <Button disabled={customValue.trim() === "" || customValue.trim() === value} onClick={() => selectFamily(customValue)}>{t("settings.appearance.fontApply")}</Button>
+              <Button
+                disabled={pending || customValue.trim() === "" || customValue.trim() === value}
+                aria-busy={pending}
+                onClick={() => selectFamily(customValue, false, customInputRef.current)}
+              >{t("settings.appearance.fontApply")}</Button>
             </div>
           </div>
         </div>
       </MorphPopover>
+      {saveError !== undefined && <ErrorBanner message={saveError} />}
     </div>
   );
 }
@@ -2183,26 +2289,159 @@ function fontFamilyDisplayName(value: string): string {
     : trimmed;
 }
 
-function FontSizeSetting({ label, description, value, min, max, defaultValue, onChange, t }: {
+export function FontSizeSetting({ label, description, value, min, max, defaultValue, normalize, onChange, onSuccess, t }: {
   readonly label: string;
   readonly description: string;
   readonly value: number;
   readonly min: number;
   readonly max: number;
   readonly defaultValue: number;
+  readonly normalize: (size: number) => number;
   readonly onChange: (size: number) => Promise<void>;
+  readonly onSuccess: (message: string) => void;
   readonly t: Translator;
 }): JSX.Element {
+  const [draft, setDraft] = useState(String(value));
+  const [rangeValue, setRangeValue] = useState(value);
+  const valueRef = useRef(value);
+  const draftRef = useRef(draft);
+  valueRef.current = value;
+  draftRef.current = draft;
+  const actionOwner = useMemo(() => ({ action: onChange }), [onChange]);
+  const committedOwnerRef = useRef<typeof actionOwner | undefined>(undefined);
+  const nextIntentRef = useRef(0);
+  const batchRef = useRef<{
+    readonly owner: typeof actionOwner;
+    readonly active: Set<number>;
+    readonly outcomes: Map<number, "success" | "failure">;
+    latest: { readonly id: number; readonly value: number; readonly reset: boolean };
+  } | undefined>(undefined);
+  const [feedback, setFeedback] = useState<{
+    readonly owner: typeof actionOwner;
+    readonly pending: boolean;
+    readonly error?: string;
+  }>({ owner: actionOwner, pending: false });
+  const pending = feedback.owner === actionOwner && feedback.pending;
+  const saveError = feedback.owner === actionOwner ? feedback.error : undefined;
+
+  useLayoutEffect(() => {
+    committedOwnerRef.current = actionOwner;
+    return () => {
+      if (committedOwnerRef.current === actionOwner) committedOwnerRef.current = undefined;
+      if (batchRef.current?.owner === actionOwner) batchRef.current = undefined;
+    };
+  }, [actionOwner]);
+  useEffect(() => {
+    if (batchRef.current?.owner === actionOwner) return;
+    const authoritative = String(value);
+    draftRef.current = authoritative;
+    setDraft(authoritative);
+    setRangeValue(value);
+  }, [actionOwner, value]);
+
+  const updateDraft = (next: string): void => {
+    draftRef.current = next;
+    setDraft(next);
+  };
+  const settle = (
+    batch: NonNullable<typeof batchRef.current>,
+    intentId: number,
+    outcome: "success" | "failure"
+  ): void => {
+    batch.active.delete(intentId);
+    batch.outcomes.set(intentId, outcome);
+    if (committedOwnerRef.current !== actionOwner || batchRef.current !== batch || batch.active.size > 0) return;
+    batchRef.current = undefined;
+    const latestOutcome = batch.outcomes.get(batch.latest.id);
+    if (latestOutcome === "failure") {
+      const authoritative = valueRef.current;
+      updateDraft(String(authoritative));
+      setRangeValue(authoritative);
+      setFeedback({ owner: actionOwner, pending: false, error: t("settings.appearance.fontSaveFailed") });
+      return;
+    }
+    updateDraft(String(batch.latest.value));
+    setRangeValue(batch.latest.value);
+    setFeedback({ owner: actionOwner, pending: false });
+    onSuccess(t(batch.latest.reset ? "settings.defaults.restored" : "settings.saved"));
+  };
+  const persist = (requested: number, reset: boolean): void => {
+    const normalized = normalize(requested);
+    const existing = batchRef.current?.owner === actionOwner ? batchRef.current : undefined;
+    const desired = existing?.latest.value ?? valueRef.current;
+    updateDraft(String(normalized));
+    setRangeValue(normalized);
+    if (normalized === desired) return;
+    const intent = { id: ++nextIntentRef.current, value: normalized, reset };
+    const batch = existing ?? {
+      owner: actionOwner,
+      active: new Set<number>(),
+      outcomes: new Map<number, "success" | "failure">(),
+      latest: intent
+    };
+    batch.latest = intent;
+    batch.active.add(intent.id);
+    batchRef.current = batch;
+    setFeedback({ owner: actionOwner, pending: true });
+    void actionOwner.action(normalized).then(
+      () => settle(batch, intent.id, "success"),
+      () => settle(batch, intent.id, "failure")
+    );
+  };
+  const commitDraft = (): void => {
+    const candidate = draftRef.current.trim();
+    const parsed = Number(candidate);
+    if (candidate === "" || !Number.isFinite(parsed)) {
+      const authoritative = valueRef.current;
+      updateDraft(String(authoritative));
+      setRangeValue(authoritative);
+      return;
+    }
+    persist(parsed, false);
+  };
+
   return (
     <div className="appearance-font-size">
       <div className="appearance-font-setting__heading">
-        <div><strong>{label}</strong><span>{description}</span></div>
-        <IconButton label={t("settings.appearance.fontReset")} disabled={value === defaultValue} onClick={() => void onChange(defaultValue)}><RotateCcw aria-hidden="true" /></IconButton>
+        <div><strong>{label}</strong><span>{description}</span>{pending && <span role="status">{t("common.working")}</span>}</div>
+        <IconButton
+          label={t("settings.appearance.fontReset")}
+          disabled={pending || value === defaultValue}
+          aria-busy={pending}
+          onClick={() => persist(defaultValue, true)}
+        ><RotateCcw aria-hidden="true" /></IconButton>
       </div>
       <div className="appearance-font-size__controls">
-        <input type="range" min={min} max={max} step={1} value={value} aria-label={label} onChange={(event) => void onChange(Number(event.target.value))} />
-        <input type="number" min={min} max={max} step={1} value={value} aria-label={`${label} · px`} onChange={(event) => void onChange(Number(event.target.value))} />
+        <input
+          type="range"
+          min={min}
+          max={max}
+          step={1}
+          value={rangeValue}
+          aria-label={label}
+          aria-busy={pending}
+          onChange={(event) => persist(Number(event.target.value), false)}
+        />
+        <input
+          type="number"
+          min={min}
+          max={max}
+          step={1}
+          value={draft}
+          aria-label={`${label} · px`}
+          aria-busy={pending}
+          disabled={pending}
+          onChange={(event) => updateDraft(event.target.value)}
+          onBlur={commitDraft}
+          onKeyDown={(event) => {
+            if (event.key !== "Enter" || event.nativeEvent.isComposing || event.keyCode === 229) return;
+            event.preventDefault();
+            commitDraft();
+            event.currentTarget.blur();
+          }}
+        />
       </div>
+      {saveError !== undefined && <ErrorBanner message={saveError} />}
     </div>
   );
 }

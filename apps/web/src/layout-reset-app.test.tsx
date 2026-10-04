@@ -56,7 +56,7 @@ describe("desktop layout reset broadcast", () => {
       resetLayoutPreferences,
       navigate: vi.fn(),
       setNavigationOpen: vi.fn(async () => undefined),
-      setWindowZoom: vi.fn(async () => undefined)
+      changeWindowZoom: vi.fn(async () => 1)
     } as unknown as AppController;
     const container = document.createElement("div");
     document.body.append(container);

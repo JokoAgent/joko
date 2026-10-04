@@ -3060,7 +3060,8 @@ html[data-desktop-platform="darwin"] .runtime-process-window__titlebar { padding
 .appearance-font-setting__heading .icon-button:disabled { opacity: .4; cursor: default; }
 .appearance-font-picker { width: 100%; display: block; }
 .appearance-font-picker__trigger { width: 100%; min-width: 0; height: 40px; display: flex; align-items: center; justify-content: space-between; gap: 10px; border: 1px solid var(--line); border-radius: 12px; padding: 7px 11px; outline: 0; background: var(--surface); color: var(--text); text-align: left; }
-.appearance-font-picker__trigger:hover { background: var(--surface-hover); }
+.appearance-font-picker__trigger:hover:not(:disabled) { background: var(--surface-hover); }
+.appearance-font-picker__trigger:disabled { opacity: .55; cursor: wait; }
 .appearance-font-picker__trigger:focus-visible, .appearance-font-picker__custom input:focus { border-color: var(--accent-edge); box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent-edge) 18%, transparent); }
 .appearance-font-picker__trigger > span { min-width: 0; overflow: hidden; font-size: var(--text-13); font-weight: 500; text-overflow: ellipsis; white-space: nowrap; }
 .appearance-font-picker__trigger > svg { width: 15px; height: 15px; flex: 0 0 auto; color: var(--text-faint); transition: transform .15s ease; }
@@ -3085,12 +3086,15 @@ html[data-desktop-platform="darwin"] .runtime-process-window__titlebar { padding
 .appearance-font-picker__options { min-width: 0; display: grid; gap: 2px; }
 .appearance-font-picker__options > button { width: 100%; min-width: 0; height: 34px; display: flex; align-items: center; justify-content: space-between; gap: 8px; border: 0; border-radius: 8px; padding: 0 10px; background: transparent; color: var(--text); text-align: left; }
 .appearance-font-picker__options > button:hover, .appearance-font-picker__options > button:focus-visible, .appearance-font-picker__options > button.is-selected { outline: 0; background: var(--surface-hover); }
+.appearance-font-picker__options > button:disabled { opacity: .55; cursor: wait; }
 .appearance-font-picker__options > button > span { min-width: 0; overflow: hidden; font-size: var(--text-13); font-weight: 500; text-overflow: ellipsis; white-space: nowrap; }
 .appearance-font-picker__options > button > svg { width: 16px; height: 16px; flex: 0 0 auto; color: var(--accent-strong); }
 .appearance-font-picker__custom { border-top: 1px solid var(--line); padding-top: 9px; }
 .appearance-font-picker__custom > div { min-width: 0; display: flex; gap: 8px; }
 .appearance-font-picker__custom input { min-width: 0; height: 36px; flex: 1; border: 1px solid var(--line); border-radius: 12px; padding: 6px 10px; outline: 0; background: var(--surface); color: var(--text); font-family: var(--app-font-code, var(--app-font-code-default)); font-size: var(--text-12); }
+.appearance-font-picker__custom input:disabled { opacity: .55; cursor: wait; }
 .appearance-font-picker__custom .button { min-height: 36px; }
+.appearance-font-family > .error-banner { margin: 0; }
 :root[data-theme="dark"] .appearance-font-picker__panel { --appearance-syntax-keyword: var(--syntax-keyword, #ff7b72); --appearance-syntax-constant: var(--syntax-constant, #79c0ff); --appearance-syntax-string: var(--syntax-string, #a5d6ff); --appearance-syntax-comment: var(--syntax-comment, #8b949e); --appearance-syntax-name: var(--syntax-name, #d2a8ff); --appearance-syntax-type: var(--syntax-type, #ffa657); --appearance-syntax-operator: var(--syntax-operator, #79c0ff); --appearance-syntax-deleted: var(--syntax-deleted, #ffa198); }
 @media (prefers-color-scheme: dark) { :root[data-theme="system"] .appearance-font-picker__panel { --appearance-syntax-keyword: var(--syntax-keyword, #ff7b72); --appearance-syntax-constant: var(--syntax-constant, #79c0ff); --appearance-syntax-string: var(--syntax-string, #a5d6ff); --appearance-syntax-comment: var(--syntax-comment, #8b949e); --appearance-syntax-name: var(--syntax-name, #d2a8ff); --appearance-syntax-type: var(--syntax-type, #ffa657); --appearance-syntax-operator: var(--syntax-operator, #79c0ff); --appearance-syntax-deleted: var(--syntax-deleted, #ffa198); } }
 .appearance-font-size__controls { display: grid; grid-template-columns: minmax(0, 1fr) 70px; align-items: center; gap: 12px; }

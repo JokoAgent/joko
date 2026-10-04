@@ -33,7 +33,7 @@ describe("Desktop application-menu App lifecycle", () => {
       state,
       navigate: vi.fn(),
       setNavigationOpen: vi.fn(async () => undefined),
-      setWindowZoom: vi.fn(async () => undefined)
+      changeWindowZoom: vi.fn(async () => 1)
     } as unknown as AppController;
 
     expect(() => renderToStaticMarkup(createElement(AppWithController, { controller }))).not.toThrow();
@@ -84,6 +84,83 @@ describe("Desktop application-menu App lifecycle", () => {
 
     await act(async () => { root.unmount(); });
     expect(unsubscribe).toHaveBeenCalledOnce();
+    container.remove();
+    Reflect.deleteProperty(window, "jokoDesktop");
+  });
+
+  it("serializes renderer zoom shortcuts and reports a failed save without retiring later input", async () => {
+    let resolveFirst: (zoom: number) => void = () => undefined;
+    const firstSave = new Promise<number>((resolve) => { resolveFirst = resolve; });
+    const changeWindowZoom = vi.fn<AppController["changeWindowZoom"]>()
+      .mockImplementationOnce(() => firstSave)
+      .mockResolvedValueOnce(1.2)
+      .mockRejectedValueOnce(new Error("zoom save failed"))
+      .mockResolvedValueOnce(1);
+    Object.defineProperty(window, "jokoDesktop", {
+      configurable: true,
+      value: {
+        platform: "win32",
+        capabilities: ["app.info", "appearance.zoom", "application.menu", "inspector.detach", "selection.quote.contextMenu"],
+        appInfo: { get: vi.fn() },
+        applicationMenu: {
+          configure: vi.fn(async () => undefined),
+          onCommand: vi.fn(() => vi.fn())
+        },
+        selectionContextMenu: { setLocale: vi.fn(async () => undefined), onAddToChat: vi.fn() }
+      } as unknown as JokoDesktopApi
+    });
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    const disconnected = {
+      ...controllerWithState(true, DEFAULT_UI_PREFERENCES),
+      changeWindowZoom
+    } as AppController;
+
+    await act(async () => { root.render(createElement(AppWithController, { controller: disconnected })); });
+    await act(async () => {
+      window.dispatchEvent(new KeyboardEvent("keydown", {
+        key: "+", code: "Equal", ctrlKey: true, bubbles: true, cancelable: true
+      }));
+      window.dispatchEvent(new KeyboardEvent("keydown", {
+        key: "+", code: "Equal", ctrlKey: true, bubbles: true, cancelable: true
+      }));
+      await Promise.resolve();
+    });
+    expect(changeWindowZoom).toHaveBeenCalledTimes(1);
+    expect(changeWindowZoom).toHaveBeenNthCalledWith(1, "increase");
+
+    await act(async () => {
+      resolveFirst(1.1);
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(changeWindowZoom).toHaveBeenCalledTimes(2);
+    expect(changeWindowZoom).toHaveBeenNthCalledWith(2, "increase");
+
+    await act(async () => {
+      window.dispatchEvent(new KeyboardEvent("keydown", {
+        key: "-", code: "Minus", ctrlKey: true, bubbles: true, cancelable: true
+      }));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(changeWindowZoom).toHaveBeenCalledTimes(3);
+    expect(changeWindowZoom).toHaveBeenNthCalledWith(3, "decrease");
+    expect(container.textContent).toContain("zoom save failed");
+
+    await act(async () => {
+      window.dispatchEvent(new KeyboardEvent("keydown", {
+        key: "0", code: "Digit0", ctrlKey: true, bubbles: true, cancelable: true
+      }));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(changeWindowZoom).toHaveBeenCalledTimes(4);
+    expect(changeWindowZoom).toHaveBeenNthCalledWith(4, "reset");
+
+    await act(async () => { root.unmount(); });
     container.remove();
     Reflect.deleteProperty(window, "jokoDesktop");
   });
@@ -311,6 +388,6 @@ function controllerWithState(
     getTaskHistoryMaintenanceSupport: vi.fn(async () => ({ supported: false })),
     setNavigationOpen: vi.fn(async () => undefined),
     setNavigationLayout: vi.fn(async () => undefined),
-    setWindowZoom: vi.fn(async () => undefined)
+    changeWindowZoom: vi.fn(async () => 1)
   } as unknown as AppController;
 }

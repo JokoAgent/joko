@@ -49,6 +49,7 @@ import {
   type DesktopApplicationMenuPreferenceView
 } from "./desktop-application-menu.js";
 import { useAppShortcut } from "./use-app-shortcut.js";
+import type { WindowZoomIntent } from "./appearance-settings.js";
 import { GAMEPAD_PANEL_EVENT, useGamepadInput } from "./gamepad-client.js";
 import { toggleGamepadFullscreen } from "./gamepad-fullscreen.js";
 import { currentGamepadTaskRoot, isGamepadInspectorAction, type GamepadInspectorRequest } from "./gamepad-actions.js";
@@ -195,7 +196,7 @@ interface DesktopApplicationMenuActionTarget {
   readonly openTaskStatusSettings: () => Promise<void>;
   readonly checkForUpdates: () => Promise<void>;
   readonly setNavigationOpen: (open: boolean) => Promise<void>;
-  readonly setWindowZoom: (zoom: number) => Promise<void>;
+  readonly changeWindowZoom: (intent: WindowZoomIntent) => Promise<number>;
   readonly onError: (error: unknown) => void;
 }
 
@@ -620,7 +621,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
       openTaskStatusSettings: () => target().openTaskStatusSettings(),
       checkForUpdates: () => target().checkForUpdates(),
       setNavigationOpen: (open) => target().setNavigationOpen(open),
-      setWindowZoom: (zoom) => target().setWindowZoom(zoom),
+      changeWindowZoom: (intent) => target().changeWindowZoom(intent),
       onError: (error) => target().onError(error)
     });
   }, []);
@@ -1301,7 +1302,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
       });
     },
     setNavigationOpen: async (open) => setWindowNavigationOpen(open),
-    setWindowZoom: (zoom) => controller.setWindowZoom(zoom),
+    changeWindowZoom: (intent) => controller.changeWindowZoom(intent),
     onError: (error) => setActionError(messageOf(error, t("error.unexpected")))
   };
   applicationMenuCommandQueue.sync(applicationMenuPreferences);
@@ -1513,17 +1514,17 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
   });
   useAppShortcut("zoom-in", shortcutOverrides, (event) => {
     if (shortcutBlocked(event) || zoomShortcutBlockedTarget(event.target)) return false;
-    void controller.setWindowZoom(state.preferences.windowZoom + 0.1);
+    applicationMenuCommandQueue.handle("zoom-in");
     return true;
   }, { stopImmediate: true });
   useAppShortcut("zoom-out", shortcutOverrides, (event) => {
     if (shortcutBlocked(event) || zoomShortcutBlockedTarget(event.target)) return false;
-    void controller.setWindowZoom(state.preferences.windowZoom - 0.1);
+    applicationMenuCommandQueue.handle("zoom-out");
     return true;
   }, { stopImmediate: true });
   useAppShortcut("zoom-reset", shortcutOverrides, (event) => {
     if (shortcutBlocked(event) || zoomShortcutBlockedTarget(event.target)) return false;
-    void controller.setWindowZoom(1);
+    applicationMenuCommandQueue.handle("zoom-reset");
     return true;
   }, { stopImmediate: true });
 

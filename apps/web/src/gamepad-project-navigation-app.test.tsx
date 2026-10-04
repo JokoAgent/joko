@@ -266,7 +266,7 @@ function controller(route: AppRoute, connectionState: ControllerState["connectio
     getTaskHistoryMaintenanceSupport: vi.fn(async () => ({ supported: false })),
     setNavigationOpen: vi.fn(async () => undefined),
     setNavigationLayout: vi.fn(async () => undefined),
-    setWindowZoom: vi.fn(async () => undefined),
+    changeWindowZoom: vi.fn(async () => 1),
     probeRuntimeActivity: vi.fn(async () => false),
     readNewSessionDraft: vi.fn(async () => undefined),
     saveNewSessionDraft: vi.fn(async () => undefined),
