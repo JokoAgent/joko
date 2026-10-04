@@ -59,6 +59,8 @@ export type MobileFilePreview =
       readonly endByte: bigint;
       readonly totalLines: number;
       readonly truncated: boolean;
+      readonly focusLine?: number;
+      readonly focusColumn?: number;
     })
   | (MobilePreviewBase & {
       readonly kind: "image";

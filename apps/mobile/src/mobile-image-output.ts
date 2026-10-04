@@ -72,7 +72,8 @@ export class MobileImageOutput {
     action: MobileImageOutputAction,
     source: MobileImageOutputSource,
     rendered?: MobileImageOutputRenderedImage,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    beforeDispatch?: () => Promise<void> | void
   ): Promise<void> {
     signal?.throwIfAborted();
     if (action !== "copy" && action !== "save" && action !== "share") {
@@ -94,6 +95,8 @@ export class MobileImageOutput {
         if (output.mediaType !== "image/jpeg" && output.mediaType !== "image/png") {
           throw new Error("This image must be rendered as PNG or JPEG before it can be copied.");
         }
+        await beforeDispatch?.();
+        signal?.throwIfAborted();
         await this.driver.copyImage(encodeMobileBase64(output.bytes));
         return;
       }
@@ -110,10 +113,12 @@ export class MobileImageOutput {
       let retainForShare = false;
       try {
         signal?.throwIfAborted();
+        await beforeDispatch?.();
+        signal?.throwIfAborted();
         if (action === "save") await this.driver.saveImage(file, output.mediaType);
         else {
-          await this.driver.shareImage(file, output.mediaType);
           retainForShare = true;
+          await this.driver.shareImage(file, output.mediaType);
         }
       } finally {
         if (!retainForShare) await this.driver.removeTemporary(file);

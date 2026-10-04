@@ -16,7 +16,7 @@ import { mobileVisibleSelectionQuoteText } from "./mobile-composer-document";
 import type { MobileSupportedLocale } from "./mobile-locale-preference";
 import { mobileMessage } from "./mobile-messages";
 
-export type MobileMessageActionId = "add-to-composer" | "quote-selection" | "copy-link" | "delete";
+export type MobileMessageActionId = "add-to-composer" | "quote-selection" | "copy-link" | "share-image" | "delete";
 
 export interface MobileMessageActionItem {
   readonly id: MobileMessageActionId;
@@ -28,9 +28,9 @@ export interface MobileMessageActionItem {
 
 export function buildMobileMessageActions(
   row: TimelineRow,
-  input: { readonly canDelete: boolean; readonly locale: MobileSupportedLocale; readonly copyDisabled?: boolean }
+  input: { readonly canDelete: boolean; readonly locale: MobileSupportedLocale; readonly copyDisabled?: boolean; readonly shareDisabled?: boolean }
 ): readonly MobileMessageActionItem[] {
-  if (!row.completed || (row.kind !== "user" && row.kind !== "assistant")) return [];
+  if (!row.completed || row.optimistic || (row.kind !== "user" && row.kind !== "assistant")) return [];
   const actions: MobileMessageActionItem[] = [];
   if (row.text.trim()) actions.push({ id: "add-to-composer", label: mobileMessage(input.locale, "actions.addToComposer") });
   if (row.quoteSource !== undefined) actions.push({ id: "quote-selection", label: mobileMessage(input.locale, "actions.quoteSelection") });
@@ -39,6 +39,7 @@ export function buildMobileMessageActions(
     label: mobileMessage(input.locale, input.copyDisabled ? "actions.copyingLink" : "actions.copyMessageLink"),
     ...(input.copyDisabled ? { disabled: true } : {})
   });
+  actions.push({ id: "share-image", label: mobileMessage(input.locale, "share.shareImage"), ...(input.shareDisabled ? { disabled: true } : {}) });
   if (input.canDelete) actions.push({
     id: "delete",
     label: mobileMessage(input.locale, "actions.deleteMessage"),

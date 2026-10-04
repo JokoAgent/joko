@@ -10,6 +10,16 @@ type MobileTaskMessageRow = readonly [
 ];
 
 const mobileTaskMessageRows = [
+  ["share.shareImage", "Share as image", "分享为图片", "以圖片分享", "画像で共有", "이미지로 공유"],
+  ["share.selected", "{count} selected", "已选择 {count} 条", "已選取 {count} 則", "{count} 件選択中", "{count}개 선택됨"],
+  ["share.selectMessage", "Select message for image sharing", "选择要分享为图片的消息", "選取要以圖片分享的訊息", "画像で共有するメッセージを選択", "이미지로 공유할 메시지 선택"],
+  ["share.screenshotHint", "Share these messages as a clearer image.", "可以将这些消息分享为更清晰的图片。", "可以將這些訊息分享為更清晰的圖片。", "メッセージをより鮮明な画像で共有できます。", "메시지를 더 선명한 이미지로 공유할 수 있어요."],
+  ["share.selectAll", "Select all", "全选", "全選", "すべて選択", "모두 선택"],
+  ["share.restoreSelection", "Restore selection", "还原选择", "還原選取", "選択を戻す", "이전 선택 복원"],
+  ["share.preparing", "Preparing image…", "正在生成图片…", "正在產生圖片…", "画像を作成中…", "이미지 생성 중…"],
+  ["share.failed", "The image could not be shared. Please try again.", "未能分享图片，请重试。", "無法分享圖片，請重試。", "画像を共有できませんでした。もう一度お試しください。", "이미지를 공유하지 못했습니다. 다시 시도해 주세요."],
+  ["share.tooLarge", "The image is too large. Select fewer messages.", "图片过大，请减少选择的消息。", "圖片過大，請減少選取的訊息。", "画像が大きすぎます。選択するメッセージを減らしてください。", "이미지가 너무 큽니다. 메시지를 더 적게 선택해 주세요."],
+  ["share.unknown", "Sharing was opened, but its result could not be confirmed.", "已打开系统分享，但无法确认结果。", "已開啟系統分享，但無法確認結果。", "共有画面を開きましたが、結果を確認できませんでした。", "공유 화면을 열었지만 결과를 확인하지 못했습니다."],
   ["common.save", "Save", "保存", "儲存", "保存", "저장"],
   ["common.remove", "Remove", "移除", "移除", "削除", "제거"],
   ["common.discard", "Discard", "丢弃", "捨棄", "破棄", "버리기"],
@@ -773,6 +783,8 @@ const mobileTaskMessageRows = [
   ["preview.imageDimensions", "{width} × {height} pixels", "{width} × {height} 像素", "{width} × {height} 像素", "{width} × {height} ピクセル", "{width} × {height}픽셀"],
   ["preview.truncated", "Preview is truncated to the authenticated byte window shown above.", "预览已截断为上方显示的已认证字节窗口。", "預覽已截斷為上方顯示的已驗證位元組範圍。", "プレビューは上に表示した認証済みバイト範囲に切り詰められています。", "미리보기가 위에 표시된 인증된 바이트 범위로 잘렸습니다."],
   ["preview.emptyFile", "(empty file)", "（空文件）", "（空檔案）", "（空のファイル）", "(빈 파일)"],
+  ["preview.focusLine", "Line {line}", "第 {line} 行", "第 {line} 行", "{line} 行目", "{line}행"],
+  ["preview.lineOutsideWindow", "Line {line} is outside this preview.", "第 {line} 行超出此预览范围。", "第 {line} 行超出此預覽範圍。", "{line} 行目はこのプレビューの範囲外です。", "{line}행은 이 미리보기 범위를 벗어났습니다."],
   ["preview.unavailable", "Preview unavailable", "预览不可用", "預覽無法使用", "プレビューを利用できません", "미리보기를 사용할 수 없음"],
   ["preview.noInApp", "No in-app preview", "无应用内预览", "沒有應用程式內預覽", "アプリ内プレビューはありません", "앱 내 미리보기 없음"],
   ["preview.mediaFailure", "The media preview process stopped repeatedly. Close the preview and try again.", "媒体预览进程多次停止。请关闭预览后重试。", "媒體預覽程序多次停止。請關閉預覽後重試。", "メディアプレビュー処理が繰り返し停止しました。プレビューを閉じて再試行してください。", "미디어 미리보기 프로세스가 반복해서 중지되었습니다. 미리보기를 닫고 다시 시도하세요."],
@@ -889,7 +901,20 @@ const mobileTaskMessageRows = [
   ["files.workspaceFile", "Workspace file", "工作区文件", "工作區檔案", "Workspace ファイル", "Workspace 파일"],
   ["files.previewResult", "Preview {name}", "预览 {name}", "預覽 {name}", "{name} をプレビュー", "{name} 미리보기"],
   ["files.addResult", "Add {name} to composer", "将 {name} 添加到编辑器", "將 {name} 加入編輯器", "{name} を入力欄に追加", "{name}을 작성기에 추가"],
-  ["files.shareResult", "Share {name}", "分享 {name}", "分享 {name}", "{name} を共有", "{name} 공유"]
+  ["files.shareResult", "Share {name}", "分享 {name}", "分享 {name}", "{name} を共有", "{name} 공유"],
+  ["markdown.code", "Code", "代码", "程式碼", "コード", "코드"],
+  ["markdown.table", "Table", "表格", "表格", "表", "표"],
+  ["markdown.math", "Formula", "公式", "公式", "数式", "수식"],
+  ["markdown.diagram", "Diagram", "图表", "圖表", "図", "다이어그램"],
+  ["markdown.image", "Image", "图片", "圖片", "画像", "이미지"],
+  ["markdown.expand", "Expand", "展开", "展開", "拡大", "확대"],
+  ["markdown.source", "Source", "源码", "原始碼", "ソース", "원본"],
+  ["markdown.copySource", "Copy source", "复制原文", "複製原文", "ソースをコピー", "원본 복사"],
+  ["markdown.copying", "Copying…", "正在复制…", "正在複製…", "コピー中…", "복사 중…"],
+  ["markdown.copied", "Source copied.", "已复制原文。", "已複製原文。", "ソースをコピーしました。", "원본을 복사했습니다."],
+  ["markdown.copyFailed", "Could not copy. Try again.", "复制失败，请重试。", "複製失敗，請重試。", "コピーできませんでした。再試行してください。", "복사하지 못했습니다. 다시 시도하세요."],
+  ["markdown.linkFailed", "Could not open the link.", "无法打开链接。", "無法開啟連結。", "リンクを開けませんでした。", "링크를 열 수 없습니다."],
+  ["markdown.sourceFallback", "Showing source. Open again to retry rendering.", "正在显示源码，可重新打开以重试渲染。", "正在顯示原始碼，可重新開啟以重試呈現。", "ソースを表示しています。再度開くと描画を再試行します。", "원본을 표시합니다. 다시 열면 렌더링을 재시도합니다."]
 ] as const satisfies readonly MobileTaskMessageRow[];
 
 export type MobileTaskMessageKey = typeof mobileTaskMessageRows[number][0];

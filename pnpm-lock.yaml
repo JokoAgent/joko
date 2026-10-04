@@ -241,6 +241,15 @@ importers:
       expo-updates:
         specifier: 57.0.18
         version: 57.0.18(expo@57.0.17)(react-native@0.86.3(@babel/core@7.29.7(supports-color@8.1.1))(@types/react@19.2.2)(react@19.2.3)(supports-color@8.1.1))(react@19.2.3)(supports-color@8.1.1)
+      highlight.js:
+        specifier: 11.11.1
+        version: 11.11.1
+      katex:
+        specifier: 0.16.47
+        version: 0.16.47
+      mermaid:
+        specifier: 11.16.0
+        version: 11.16.0
       pdfjs-dist:
         specifier: 5.7.284
         version: 5.7.284
@@ -275,6 +284,9 @@ importers:
       jsdom:
         specifier: 26.1.0
         version: 26.1.0(supports-color@8.1.1)
+      playwright-core:
+        specifier: 1.60.0
+        version: 1.60.0
       react-dom:
         specifier: 19.2.3
         version: 19.2.3(react@19.2.3)
@@ -5434,6 +5446,10 @@ packages:
 
   highlight.js@10.7.3:
     resolution: {integrity: sha512-tzcUFauisWKNHaRkN4Wjl/ZA07gENAjFl3J/c480dprkGTg5EQstgaNFqBfUqCq54kZRIEcreTsAgF/m2quD7A==}
+
+  highlight.js@11.11.1:
+    resolution: {integrity: sha512-Xwwo44whKBVCYoliBQwaPvtd/2tYFkRQtXDWj1nackaV2JPXx3L0+Jvd8/qCJ2p+ML0/XVkJ2q+Mr+UVdpJK5w==}
+    engines: {node: '>=12.0.0'}
 
   hono@4.13.2:
     resolution: {integrity: sha512-JydRilDRkYBQMt9qR9U92mXxmbGqsqSn/IKOrh4e7/gEbn+0zSr8igTu0obwJoNGN4sez28DIql7FBHWydoJpA==}
@@ -13100,6 +13116,8 @@ snapshots:
       hermes-estree: 0.36.1
 
   highlight.js@10.7.3: {}
+
+  highlight.js@11.11.1: {}
 
   hono@4.13.2: {}
 

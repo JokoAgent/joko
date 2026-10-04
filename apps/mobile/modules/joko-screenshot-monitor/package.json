@@ -1,0 +1,8 @@
+{
+  "name": "@joko/mobile-screenshot-monitor",
+  "version": "0.1.0",
+  "description": "Joko-owned foreground iOS screenshot observation.",
+  "license": "UNLICENSED",
+  "private": true,
+  "peerDependencies": { "expo": "*" }
+}

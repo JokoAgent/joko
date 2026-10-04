@@ -31,6 +31,7 @@ describe("mobile message action sheet", () => {
     expect(buildMobileMessageActions(row, { canDelete: true, locale: "en" })).toEqual([
       { id: "add-to-composer", label: "Add to composer" },
       { id: "copy-link", label: "Copy message link" },
+      { id: "share-image", label: "Share as image" },
       { id: "delete", label: "Delete message", destructive: true, separatorBefore: true }
     ]);
     expect(buildMobileMessageActions({ ...row, completed: false }, { canDelete: true, locale: "en" })).toEqual([]);
@@ -44,10 +45,12 @@ describe("mobile message action sheet", () => {
       { id: "add-to-composer", label: "Add to composer" },
       { id: "quote-selection", label: "Quote selection" },
       { id: "copy-link", label: "Copying link…", disabled: true },
+      { id: "share-image", label: "Share as image" },
       { id: "delete", label: "Delete message", destructive: true, separatorBefore: true }
     ]);
     expect(buildMobileMessageActions({ ...row, text: "" }, { canDelete: false, locale: "zh-CN" })).toEqual([
-      { id: "copy-link", label: "复制消息链接" }
+      { id: "copy-link", label: "复制消息链接" },
+      { id: "share-image", label: "分享为图片" }
     ]);
   });
 

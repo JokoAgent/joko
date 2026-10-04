@@ -1,0 +1,8 @@
+{
+  "name": "@joko/mobile-conversation-share-renderer",
+  "version": "0.1.0",
+  "description": "Joko-owned offline iOS conversation image rendering.",
+  "license": "UNLICENSED",
+  "private": true,
+  "peerDependencies": { "expo": "*" }
+}

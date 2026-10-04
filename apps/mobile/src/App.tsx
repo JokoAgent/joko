@@ -15,6 +15,7 @@ import {
   type QueueItem, type Session
 } from "@joko/contracts";
 import { MobileConnectionStage } from "./MobileConnectionStage";
+import { MobileFileTextPreview } from "./MobileFileTextPreview";
 import { MobileNativeIntentNotice } from "./MobileNativeIntentNotice";
 import {
   MobileClient,
@@ -212,6 +213,13 @@ import {
 } from "./interaction-draft-store";
 import { mobileInteractionTitle } from "./mobile-interactions";
 import { SwipeableSessionRow } from "./SwipeableSessionRow";
+import { MobileMarkdownMessage } from "./MobileMarkdownMessage";
+import { MobileConversationShareBar } from "./MobileConversationShareBar";
+import { MobileConversationShareRenderer } from "./MobileConversationShareRenderer";
+import { mobileMessageShareable } from "./mobile-conversation-share";
+import { useMobileConversationShare } from "./use-mobile-conversation-share";
+import { readMobileScreenshotVisibleMessages } from "./mobile-screenshot-selection";
+import { useMobileScreenshotSelection } from "./use-mobile-screenshot-selection";
 import {
   buildMobileHomeSections, buildWideSessionNavLayout, createSwipeRowRegistry,
   type MobileHomeStatusFilter
@@ -573,6 +581,7 @@ export function App() {
     () => mobilePush.snapshot
   );
   const [page, setPage] = useState<Page>("home");
+  const [filesInitialSource, setFilesInitialSource] = useState<MobileFilesComposerSource>();
   const [partnerReturnPage, setPartnerReturnPage] = useState<"home" | "task">("home");
   const [menuOpen, setMenuOpen] = useState(false);
   const [homeDrawerMounted, setHomeDrawerMounted] = useState(false);
@@ -876,7 +885,7 @@ export function App() {
                   onBack={() => { setNativeIntentMessageFocus(undefined); setPage("home"); }}
                   onHome={() => { setNativeIntentMessageFocus(undefined); setPage("home"); }}
                   onNew={() => { setNativeIntentMessageFocus(undefined); setPage("new"); }}
-                  onFiles={() => { setNativeIntentMessageFocus(undefined); setFocusTaskComposer(false); setPage("files"); }}
+                  onFiles={(source) => { setFilesInitialSource(source); setNativeIntentMessageFocus(undefined); setFocusTaskComposer(false); setPage("files"); }}
                   onOpenPartnerThread={(preview) => {
                     if (state.selectedId === undefined || state.status !== "connected") return;
                     setPartnerReturnPage("task");
@@ -885,7 +894,7 @@ export function App() {
                   }}
                   focusComposer={focusTaskComposer} onComposerFocused={handleComposerFocused}
                   messageFocus={nativeIntentMessageFocus} /> :
-                page === "files" ? <FilesScreen {...common} onBack={() => setPage("task")}
+                page === "files" ? <FilesScreen {...common} initialSource={filesInitialSource} onBack={() => setPage("task")}
                   onAdded={() => {
                     setFocusTaskComposer(true);
                     setPage("task");
@@ -3191,7 +3200,7 @@ function NewTaskScreen({ colors, state, locale, onBack, onCreated, onImportedExi
 
 function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onOpenPartnerThread, focusComposer, onComposerFocused,
   messageFocus }: ScreenProps & {
-  onBack: () => void; onHome: () => void; onNew: () => void; onFiles: () => void;
+  onBack: () => void; onHome: () => void; onNew: () => void; onFiles: (source?: MobileFilesComposerSource) => void;
   onOpenPartnerThread: (preview: NonNullable<TimelineRow["partnerPrivatePreview"]>) => void;
   focusComposer: boolean; onComposerFocused: () => void;
   messageFocus?: MobileNativeIntentMessageFocus;
@@ -3276,6 +3285,8 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
   const copyGenerationRef = useRef(0);
   const copyInFlightRef = useRef(false);
   const timelineListRef = useRef<FlatList<TimelineRow>>(null);
+  const timelineViewportRef = useRef<View>(null);
+  const screenshotMessageViewsRef = useRef(new Map<string, View>());
   const messageFocusRetryRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const messageFocusRetryKeyRef = useRef<string | undefined>(undefined);
   const composerPasteEditableRef = useRef(false);
@@ -3533,13 +3544,10 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
     || runtimeControls.canSetPermission || runtimeControls.canSetPlanMode);
   const queueMutationPending = state.pending.some((item) => item.sessionId === state.selectedId
     && ["queue-cancel", "queue-edit-lock", "queue-edit", "queue-interaction-lock", "queue-reorder"].includes(item.kind));
-  const messageActionItems = messageAction
-    ? buildMobileMessageActions(messageAction.row, {
-      canDelete: client.canDeleteMessage(messageAction.row.eventId),
-      locale,
-      copyDisabled: copyBusy
-    }).filter((item) => state.status === "connected" || item.id === "copy-link")
-    : [];
+  const conversationShare = useMobileConversationShare({ client, rows, locale,
+    onNativeActivityChange: (active) => { attachmentNativeActivityRef.current = active; } });
+  const conversationShareColors = useMemo(() => ({ background: colors.background, surfaceElevated: colors.surface,
+    textPrimary: colors.ink, textSecondary: colors.muted, textTertiary: colors.muted }), [colors]);
   useEffect(() => mobileComposerDrafts.subscribeErrors((identity, error) => {
     if (!taskMountedRef.current || mobileComposerDraftIdentityKey(identity) !== draftIdentityKey) return;
     setLocalError(error.message);
@@ -3903,7 +3911,7 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
   const voice = useMobileVoiceInput({
     transport: voiceTransport,
     draftOwnerKey: draftIdentityKey,
-    enabled: composerOwnerReady && queueEdit === undefined && interactions.length === 0
+    enabled: composerOwnerReady && queueEdit === undefined && interactions.length === 0 && !conversationShare.active
       && state.status === "connected" && !state.busy && !composerOperationPending && !attachmentBusy,
     readDraft: () => composerDraftRef.current,
     readSelection: () => composerSelectionRef.current,
@@ -3929,9 +3937,28 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
   });
   useMobileVoicePermissionSettings(voice.error, locale);
   const composerPasteEditable = state.status === "connected" && composerOwnerReady && queueEdit === undefined && !state.busy
-    && !composerOperationPending
+    && !composerOperationPending && !conversationShare.active
     && !voice.busy && !attachmentBusy;
   composerPasteEditableRef.current = composerPasteEditable;
+  const conversationShareDisabled = state.status !== "connected" || state.busy || attachmentBusy || voice.busy
+    || fileShareBusy || galleryOpening || imageGallery.view !== undefined || state.timelinePreview !== undefined
+    || queueEdit !== undefined || conversationShare.busy;
+  const messageActionItems = messageAction
+    ? buildMobileMessageActions(messageAction.row, {
+      canDelete: client.canDeleteMessage(messageAction.row.eventId), locale, copyDisabled: copyBusy,
+      shareDisabled: conversationShareDisabled
+    }).filter((item) => state.status === "connected" || item.id === "copy-link")
+    : [];
+  useMobileScreenshotSelection({ owner: client.conversationShareOwnerKey(), selectionActive: conversationShare.active,
+    blocked: conversationShareDisabled || drawerOpen || messageActionsVisible || interactionVisible || contextVisible
+      || nativeTreeVisible || runtimeControlsVisible || sessionMentionsVisible || workspaceMentionsVisible || catalogMentionsVisible
+      || photoLibraryLease !== undefined || imageEditorLease !== undefined || quoteSelection !== undefined
+      || commandHelpItems !== undefined || runtimeCommandCommitting,
+    visible: (signal) => {
+      const shareable = new Set(rows.filter(mobileMessageShareable).map((row) => row.id));
+      return readMobileScreenshotVisibleMessages(timelineViewportRef.current,
+        new Map([...screenshotMessageViewsRef.current].filter(([id]) => shareable.has(id))), signal);
+    }, enter: conversationShare.enterVisible });
   const runtimeCommandEnabled = composerPasteEditable && composerFocused && interactions.length === 0
     && state.status === "connected" && appCommandControls !== undefined;
   const runtimeCommandActivation = runtimeCommandEnabled
@@ -4169,6 +4196,31 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
       }).finally(() => {
         if (taskMountedRef.current) setGalleryOpening(false);
       });
+  };
+  const openMarkdownImage = (leaseId: string, key: string): void => {
+    if (galleryOpening || imageGallery.view || state.status !== "connected" || state.busy
+      || attachmentBusy || voice.busy || fileShareBusy || conversationShare.active) return;
+    setGalleryOpening(true); setLocalError(""); setComposerNotice("");
+    void imageGallery.open((signal) => client.openMarkdownImageGallery(leaseId, key, signal)).catch((error) => {
+      if (taskMountedRef.current) setLocalError(errorText(error));
+    }).finally(() => { if (taskMountedRef.current) setGalleryOpening(false); });
+  };
+  const markdownPathAbortRef = useRef<AbortController | undefined>(undefined);
+  useEffect(() => () => { markdownPathAbortRef.current?.abort(); }, []);
+  const openMarkdownPath = (leaseId: string, key: string): void => {
+    if (markdownPathAbortRef.current || galleryOpening || imageGallery.view || state.timelinePreview
+      || state.status !== "connected" || state.busy || attachmentBusy || voice.busy || fileShareBusy || conversationShare.active) return;
+    const controller = new AbortController(); markdownPathAbortRef.current = controller;
+    const deadline = setTimeout(() => controller.abort(), 15_000);
+    setGalleryOpening(true); setLocalError(""); setComposerNotice("");
+    void client.openMarkdownPath(leaseId, key, controller.signal).then((source) => {
+      if (taskMountedRef.current && !controller.signal.aborted) onFiles(source);
+    }).catch((error) => {
+      if (taskMountedRef.current) setLocalError(errorText(error));
+    }).finally(() => {
+      clearTimeout(deadline); if (markdownPathAbortRef.current === controller) markdownPathAbortRef.current = undefined;
+      if (taskMountedRef.current) setGalleryOpening(false);
+    });
   };
   const openTimelineArtifact = (artifact: MobileTimelineArtifact): void => {
     if (!artifact.previewKind) return;
@@ -4976,6 +5028,10 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
       return;
     }
     if (state.status !== "connected" || voice.busy) return;
+    if (action === "share-image") {
+      if (!conversationShareDisabled) conversationShare.enter(latest.id);
+      return;
+    }
     if (action === "quote-selection") {
       const identity = draftIdentityRef.current;
       const lease = captureMobileQuoteSelection(selected.sessionId, latest);
@@ -5257,7 +5313,7 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
         <Action label={mobileMessage(locale, copyBusy ? "actions.copyingLink" : "actions.copyTaskLink")}
           onPress={() => void copyPublicTaskLink()} colors={colors} compact
           disabled={copyBusy || session === undefined || (state.status !== "connected" && state.status !== "offline")} />
-        {client.canOpenFiles() && <Action label={mobileMessage(locale, "task.files")} onPress={onFiles} colors={colors} compact
+        {client.canOpenFiles() && <Action label={mobileMessage(locale, "task.files")} onPress={() => onFiles()} colors={colors} compact
           disabled={state.status !== "connected" || attachmentBusy} />}
         <Action label={mobileMessage(locale, "common.refresh")} onPress={() => void client.refresh()} colors={colors} compact disabled={attachmentBusy} />
       </View>
@@ -5274,7 +5330,9 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
       <ActivityIndicator color={colors.accent} />
       <Text style={[styles.caption, styles.fill, { color: colors.muted }]}>{formatMobileFileShareProgress(fileShareProgress, locale)}</Text>
     </View>}
-    <FlatList ref={timelineListRef} data={rows} keyExtractor={(row) => row.id} style={styles.fill} contentContainerStyle={styles.list}
+    {conversationShare.notice && <Banner text={conversationShare.notice} colors={colors} />}
+    <View ref={timelineViewportRef} collapsable={false} style={styles.fill}>
+    <FlatList ref={timelineListRef} data={rows} extraData={conversationShare.selectedIds} keyExtractor={(row) => row.id} style={styles.fill} contentContainerStyle={styles.list}
       onScrollToIndexFailed={({ averageItemLength, index }) => {
         if (messageFocusHighlight === undefined || messageFocusKey !== messageFocusHighlight) return;
         if (messageFocusRetryKeyRef.current === messageFocusKey) return;
@@ -5299,7 +5357,12 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
       renderItem={({ item }) => {
         const linked = item.optimistic !== true && messageFocusHighlight === messageFocusKey && messageFocus !== undefined
           && mobileNativeIntentMessageMatches(messageFocus, item);
+        const markdownOwnerKey = `${state.activeProfileId}/${state.selectedId}/${session?.nativeBinding?.runtimeGeneration}/${item.id}`;
         return <View accessibilityLiveRegion={linked ? "polite" : undefined}
+          collapsable={false} ref={(view) => {
+            if (view && mobileMessageShareable(item)) screenshotMessageViewsRef.current.set(item.id, view);
+            else screenshotMessageViewsRef.current.delete(item.id);
+          }}
           style={[styles.message, linked && styles.messageFocused,
             { backgroundColor: linked ? colors.brandBackground : colors.surface,
               borderColor: linked ? colors.accent : colors.border }]}>
@@ -5310,8 +5373,20 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
           <Text style={[styles.caption, { color: colors.muted }]}>{item.label}{item.optimistic
             ? ` · ${mobileMessage(locale, "common.sending")}` : ""}</Text>
           {item.optimistic && <ActivityIndicator size="small" color={colors.accent} />}
+          {conversationShare.active && mobileMessageShareable(item) && <Pressable accessibilityRole="checkbox"
+            accessibilityLabel={mobileMessage(locale, "share.selectMessage")}
+            accessibilityState={{ checked: conversationShare.selectedIds.includes(item.id), disabled: conversationShare.busy }}
+            disabled={conversationShare.busy} onPress={() => conversationShare.toggle(item.id)}
+            style={styles.inlineTouchAction}>
+            <Text style={[styles.label, { color: colors.accent }]}>{conversationShare.selectedIds.includes(item.id) ? "☑" : "☐"}</Text>
+          </Pressable>}
         </View>
-        <Text selectable={!item.optimistic} style={[styles.body, { color: colors.ink }]}>{item.text}</Text>
+        <View pointerEvents={conversationShare.active ? "none" : "auto"}>
+        {item.kind === "assistant" ? <MobileMarkdownMessage key={markdownOwnerKey} text={item.text} colors={colors} locale={locale}
+          ownerKey={markdownOwnerKey} resourceClient={client} messageId={item.id}
+          resourceOwnerKey={item.completed && !item.optimistic ? client.markdownResourceOwnerKey() : undefined}
+          onOpenImage={openMarkdownImage} onOpenPath={openMarkdownPath} />
+          : <Text selectable={!item.optimistic} style={[styles.body, { color: colors.ink }]}>{item.text}</Text>}
         {item.partnerPrivatePreview && <Pressable accessibilityRole="button"
           accessibilityLabel={`${mobileMessage(locale, "partner.openThread")} · ${item.partnerPrivatePreview.targetName}`}
           accessibilityHint={mobileMessage(locale, "partner.readOnly")}
@@ -5385,7 +5460,7 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
             </View>;
           })}
         </View>}
-        {!item.optimistic && <View style={styles.messageActions}>
+        {!item.optimistic && !conversationShare.active && <View style={styles.messageActions}>
           <Pressable accessibilityRole="button" accessibilityLabel={mobileMessage(locale, "task.viewContextFor", { name: item.label })}
             disabled={state.historyBusy || state.status !== "connected"}
             onPress={() => { setLocalError(""); void client.around(item.eventId).catch((error) => setLocalError(errorText(error))); }}
@@ -5404,8 +5479,10 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
                 || (state.status === "connected" && voice.busy) ? colors.muted : colors.accent }]}>{mobileMessage(locale, "common.more")}</Text>
             </Pressable>}
         </View>}
+        </View>
       </View>;
       }} />
+    </View>
     {queueItems.length > 0 && <View style={styles.queueRegion}>
       <Text style={[styles.section, { color: colors.muted }]}>{mobileMessage(locale, "task.queue")}</Text>
       <ScrollView nestedScrollEnabled style={styles.queueScroll} contentContainerStyle={styles.queueList}
@@ -5463,7 +5540,11 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
       <Action label={mobileMessage(locale, "composer.cancelEdit")} colors={colors} compact disabled={state.status !== "connected" || state.busy}
         onPress={cancelQueueEdit} />
     </View>}
-    {interactions.length > 0 ? <View style={[styles.interactionAwaiting, { borderColor: colors.border, backgroundColor: colors.brandBackground }]}>
+    {conversationShare.active ? <MobileConversationShareBar count={conversationShare.selectedIds.length}
+      allSelected={conversationShare.allSelected} busy={conversationShare.busy} locale={locale} colors={colors}
+      screenshotTriggered={conversationShare.screenshotTriggered}
+      onCancel={conversationShare.cancel} onToggleAll={conversationShare.toggleAll} onShare={() => void conversationShare.share()} />
+      : interactions.length > 0 ? <View style={[styles.interactionAwaiting, { borderColor: colors.border, backgroundColor: colors.brandBackground }]}>
       <View style={styles.fill}>
         <Text style={[styles.caption, { color: colors.muted }]}>{interactions.length === 1
           ? mobileMessage(locale, "task.taskNeedsResponse")
@@ -5671,6 +5752,9 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
       </View>
     </View>}
     </MobileKeyboardAvoidingView>
+    {conversationShare.snapshot && <MobileConversationShareRenderer key={conversationShare.snapshot.leaseId}
+      ref={conversationShare.rendererRef} snapshot={conversationShare.snapshot} colors={conversationShareColors}
+      width={Math.max(280, Math.min(width, 720))} dark={parseInt(colors.background.slice(1, 3), 16) < 128} />}
     <MobilePhotoLibrarySheet visible={photoLibraryLease !== undefined} locale={locale}
       ownerKey={photoLibraryLease?.controls.surfaceOwnerKey}
       maximumSelection={Math.max(0, (photoLibraryLease?.controls.policy.maximumItems ?? 0)
@@ -5816,7 +5900,9 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
   </View>;
 }
 
-function FilesScreen({ colors, state, locale, onBack, onAdded }: ScreenProps & { onBack: () => void; onAdded: () => void }) {
+function FilesScreen({ colors, state, locale, onBack, onAdded, initialSource }: ScreenProps & {
+  onBack: () => void; onAdded: () => void; initialSource?: MobileFilesComposerSource;
+}) {
   const [query, setQuery] = useState("");
   const [mode, setMode] = useState<MobileFilesSearchMode>("name");
   const [caseSensitive, setCaseSensitive] = useState(false);
@@ -5826,7 +5912,7 @@ function FilesScreen({ colors, state, locale, onBack, onAdded }: ScreenProps & {
   const [fileShareBusy, setFileShareBusy] = useState(false);
   const [fileShareProgress, setFileShareProgress] = useState<MobileFileShareProgress>();
   const [galleryOpening, setGalleryOpening] = useState(false);
-  const [previewSource, setPreviewSource] = useState<MobileFilesComposerSource>();
+  const [previewSource, setPreviewSource] = useState<MobileFilesComposerSource | undefined>(initialSource);
   const handoffRef = useRef<AbortController | undefined>(undefined);
   const fileShareRef = useRef<AbortController | undefined>(undefined);
   const filesMountedRef = useRef(true);
@@ -6342,10 +6428,8 @@ function FilePreviewModal({ colors, preview, source, busy, sharing = false, shar
               title={preview.title}
             />
           </View>
-          : preview.kind === "text" ? <ScrollView style={styles.fill} contentContainerStyle={styles.textPreviewContainer}>
-            {preview.truncated && <Text accessibilityRole="alert" style={[styles.warning, { color: colors.negative }]}>{mobileMessage(locale, "preview.truncated")}</Text>}
-            <Text selectable style={[styles.textPreview, { color: colors.ink }]}>{preview.text || mobileMessage(locale, "preview.emptyFile")}</Text>
-          </ScrollView>
+          : preview.kind === "text" ? <MobileFileTextPreview key={preview.revisionKey + "/" + preview.focusLine + "/" + preview.focusColumn}
+            preview={preview} locale={locale} colors={colors} />
           : <View style={styles.previewMessage}>
             <Text accessibilityRole="alert" style={[styles.label, { color: preview.kind === "error" ? colors.negative : colors.ink }]}>
               {mobileMessage(locale, preview.kind === "error" ? "preview.unavailable" : "preview.noInApp")}
