@@ -139,6 +139,9 @@ importers:
       '@joko/device-peer':
         specifier: workspace:*
         version: link:../../packages/device-peer
+      '@joko/tool-android':
+        specifier: workspace:*
+        version: link:../../packages/tool-android
       '@joko/tool-browser':
         specifier: workspace:*
         version: link:../../packages/tool-browser

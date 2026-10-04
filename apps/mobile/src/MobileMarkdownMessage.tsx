@@ -41,9 +41,15 @@ export const MobileMarkdownMessage = memo(function MobileMarkdownMessage({ text,
   const previous = useRef<MobileMarkdownParseResult | null>(null);
   const parsed = useMemo(() => parseMobileMarkdownIncremental(text, previous.current), [text]);
   useEffect(() => { previous.current = parsed; }, [parsed]);
+  const rendersInlineImage = useCallback((inline: MobileMarkdownInline) => {
+    const key = mobileMarkdownResourceKey(inline);
+    return inline.type === "image" && !!key && !!resources?.references.get(key)?.image;
+  }, [resources]);
+  const textSelectable = (values: readonly MobileMarkdownInline[]) => selectable && !values.some(rendersInlineImage);
+  const bodyStyle = (values: readonly MobileMarkdownInline[]) => values.some(rendersInlineImage) ? styles.inlineImageBody : styles.body;
   const groups = useMemo(() => groupMobileMarkdownSelectableBlocks(parsed.blocks, {
-    maxTextRunBlocks: 48, maxTextRunUtf16Length: 12_000, maxTextRunInlineFragments: 512
-  }), [parsed]);
+    maxTextRunBlocks: 48, maxTextRunUtf16Length: 12_000, maxTextRunInlineFragments: 512, rendersInlineImage
+  }), [parsed, rendersInlineImage]);
   const [notice, setNotice] = useState("");
   const [copying, setCopying] = useState(false);
   const [expanded, setExpanded] = useState<Extract<MobileMarkdownBlock, { type: "math" | "mermaid" }>>();
@@ -143,16 +149,20 @@ export const MobileMarkdownMessage = memo(function MobileMarkdownMessage({ text,
             style={[styles.tableRow, rowIndex === 0 && { backgroundColor: colors.background }]}>
             {cells.map((cell, cellIndex) => <View key={cellIndex}
               style={[styles.cell, { borderColor: colors.border }]}>
-              <Text selectable={selectable} style={[styles.body, { color: colors.ink }, rowIndex === 0 && styles.strong]}>{inlines(cell)}</Text>
+              <Text selectable={textSelectable(cell)} style={[bodyStyle(cell), { color: colors.ink }, rowIndex === 0 && styles.strong]}>{inlines(cell)}</Text>
             </View>)}
           </View>)}
         </View>
       </ScrollView>
     </View>;
     if (value.type === "blockquote") return <View key={value.key} style={[styles.quote, { borderColor: colors.accent }]}>
-      <Text selectable={selectable} style={[styles.body, { color: colors.muted }]}>{inlines(value.inlines)}</Text>
+      <Text selectable={textSelectable(value.inlines)} style={[bodyStyle(value.inlines), { color: colors.muted }]}>{inlines(value.inlines)}</Text>
     </View>;
-    return <Text key={value.key} selectable={selectable} style={[styles.body, { color: colors.ink }]}>{inlines(value.inlines)}</Text>;
+    return <Text key={value.key} selectable={textSelectable(value.inlines)} style={[bodyStyle(value.inlines), { color: colors.ink },
+      value.type === "heading" && { fontWeight: "700", fontSize: Math.max(17, 29 - value.level * 2),
+        ...(!value.inlines.some(rendersInlineImage) ? { lineHeight: 34 } : {}) }]}>
+      {value.type === "list_item" ? `${value.checked === true ? "☑" : value.checked === false ? "☐" : value.marker} ` : ""}
+      {inlines(value.inlines)}</Text>;
   };
   return <View style={styles.document}>
     {groups.map((group) => group.type === "single" ? block(group.block) : <Text key={group.key}
@@ -201,15 +211,17 @@ function MobileMarkdownImageSpan({ inline, reference, colors, label, onOpen }: {
   const alive = useRef(true);
   useEffect(() => { alive.current = true; return () => { alive.current = false; }; }, []);
   const open = onOpen ? () => { if (alive.current && AppState.currentState === "active") onOpen(); } : undefined;
-  return <Text accessibilityRole={open ? "button" : undefined} accessibilityLabel={label} onPress={open}>
-    {failed ? <Text style={{ color: colors.muted, ...(open ? { textDecorationLine: "underline" as const } : {}) }}>{label}</Text>
-      : <View style={size}><NativeImage source={{ uri: image.uri }} accessibilityLabel={label} contentFit="cover" cachePolicy="none"
-        style={[size, { borderRadius: 6, backgroundColor: colors.background }]}
-        onLoad={(event) => {
-          if (alive.current && (event.source.width !== image.width || event.source.height !== image.height || event.source.isAnimated)) setFailed(true);
-        }}
-        onError={() => { if (alive.current) setFailed(true); }} /></View>}
-  </Text>;
+  if (failed) return <Text accessibilityRole={open ? "button" : undefined} accessibilityLabel={label} onPress={open}
+    style={{ color: colors.muted, ...(open ? { textDecorationLine: "underline" as const } : {}) }}>{label}</Text>;
+  return <Pressable accessibilityRole={open ? "button" : "image"} accessibilityLabel={label} onPress={open}
+    disabled={!open} style={size}>
+    <NativeImage source={{ uri: image.uri }} accessibilityLabel={label} accessible={false} contentFit="cover" cachePolicy="none"
+      style={[size, { borderRadius: 6, backgroundColor: colors.background }]}
+      onLoad={(event) => {
+        if (alive.current && (event.source.width !== image.width || event.source.height !== image.height || event.source.isAnimated)) setFailed(true);
+      }}
+      onError={() => { if (alive.current) setFailed(true); }} />
+  </Pressable>;
 }
 
 function MobileMarkdownRichBlock({ kind, source, colors, locale, ownerKey, zoomable = false }: {
@@ -251,6 +263,8 @@ function MobileMarkdownRichBlock({ kind, source, colors, locale, ownerKey, zooma
 
 const styles = StyleSheet.create({
   document: { gap: 12 }, fill: { flex: 1 }, body: { fontSize: 15, lineHeight: 23 },
+  // A fixed text line height lets Android inline views overflow neighboring text and hit targets.
+  inlineImageBody: { fontSize: 15 },
   strong: { fontWeight: "700" }, emphasis: { fontStyle: "italic" }, strike: { textDecorationLine: "line-through" },
   inlineCode: { fontFamily: "monospace", fontSize: 13 }, code: { fontFamily: "monospace", fontSize: 13, lineHeight: 20 },
   caption: { fontSize: 12, lineHeight: 18 }, frame: { borderWidth: 1, borderRadius: 8, overflow: "hidden" },

@@ -2302,7 +2302,10 @@ export class MobileClient {
     if (this.#timer !== undefined) clearTimeout(this.#timer);
     this.#timer = setTimeout(() => {
       if (this.#state.busy) this.#schedule();
-      else void this.refresh();
+      else if (this.#state.status === "connected" && this.#credential) {
+        if (this.#projectionReading) this.#schedule();
+        else void this.#syncProjection(this.#epoch, this.#credential, true);
+      } else void this.refresh();
     }, this.#state.liveStatus === "polling" || this.#state.status === "offline" ? 4_000 : 30_000);
   }
 
@@ -2382,41 +2385,52 @@ export class MobileClient {
     }, 180);
   }
 
-  async #syncProjection(epoch: number, credential: PairedCredential): Promise<void> {
+  async #syncProjection(epoch: number, credential: PairedCredential, snapshotPoll = false): Promise<void> {
     this.#projectionReading = true;
     const selectedId = this.#state.selectedId;
-    const edge = this.#streamSequence ?? 0n;
+    const generation = snapshotPoll ? this.#state.owner?.generation : this.#streamGeneration;
+    const edge = snapshotPoll ? this.#state.owner?.resumeCursor?.sequence ?? 0n : this.#streamSequence ?? 0n;
     try {
+      let node = this.#state.node!;
+      if (snapshotPoll) {
+        node = await this.network.inspect(credential.origin, this.#abort?.signal);
+        if (!this.#current(epoch) || credential !== this.#credential || selectedId !== this.#state.selectedId) return;
+        if (node.serverId !== credential.serverId || node.apiVersion !== this.#state.node?.apiVersion) {
+          throw new CredentialIdentityError("The saved Joko node identity or API changed. Its credential was not read again; forget it or pair this node explicitly.");
+        }
+      }
       const [owner, detail] = await Promise.all([
         this.network.readOwner(credential, this.#abort?.signal),
         selectedId ? this.network.readSession(credential, selectedId, this.#abort?.signal) : Promise.resolve(undefined)
       ]);
       if (!this.#current(epoch) || credential !== this.#credential || selectedId !== this.#state.selectedId) return;
-      this.#assertOwner(credential, owner, this.#state.node!);
-      if (owner.snapshot.generation !== this.#streamGeneration || detail && detail.generation !== this.#streamGeneration
+      this.#assertOwner(credential, owner, node);
+      if (owner.snapshot.generation !== generation || detail && detail.generation !== generation
         || selectedId && !owner.snapshot.sessions.some((item) => item.sessionId === selectedId)) {
         void this.refresh();
         return;
       }
-      if (!owner.snapshot.resumeCursor || owner.snapshot.resumeCursor.generation !== this.#streamGeneration
-        || owner.snapshot.resumeCursor.sequence < edge
-        || detail && (!detail.resumeCursor || detail.resumeCursor.generation !== this.#streamGeneration
-          || detail.resumeCursor.sequence < edge)) {
+      const ownerCursor = owner.snapshot.resumeCursor;
+      const detailCursor = detail?.resumeCursor;
+      const currentCursor = (cursor: EventCursor | undefined) => cursor === undefined ? snapshotPoll
+        : cursor.generation === generation && cursor.sequence >= edge;
+      if (!currentCursor(ownerCursor) || detail && !currentCursor(detailCursor)) {
         if (++this.#projectionMisses >= 2) void this.refresh();
         else this.#scheduleProjection(epoch, credential);
         return;
       }
       this.#projectionMisses = 0;
-      const durable = detail?.resumeCursor?.sequence ?? owner.snapshot.resumeCursor.sequence;
+      const durable = detailCursor?.sequence ?? ownerCursor?.sequence;
       const automationChanged = automationCatalogAuthorityKey(this.#state.owner?.schedules ?? [])
         !== automationCatalogAuthorityKey(owner.snapshot.schedules);
       this.#lastAuthenticatedAt = this.now();
-      this.#set({ owner: owner.snapshot, detail,
+      this.#set({ node, owner: owner.snapshot, detail,
         offlineSnapshotAt: undefined,
-        live: this.#state.live.filter((item) => item.cursor && item.cursor.sequence > durable) });
-      await this.#persistOfflineProjection(epoch, credential, this.#state.node!, owner.snapshot, detail);
+        live: durable === undefined ? [] : this.#state.live.filter((item) => item.cursor && item.cursor.sequence > durable) });
+      await this.#persistOfflineProjection(epoch, credential, node, owner.snapshot, detail);
+      if (snapshotPoll) await this.reconcile(epoch);
       if (automationChanged && this.#state.automations.open) void this.refreshAutomations();
-      if ((this.#streamSequence ?? 0n) > durable) this.#scheduleProjection(epoch, credential);
+      if (durable !== undefined && (this.#streamSequence ?? 0n) > durable) this.#scheduleProjection(epoch, credential);
     } catch (error) {
       if (!this.#current(epoch)) return;
       if (isRevoked(error)) await this.#invalidateCredential(
@@ -2424,9 +2438,18 @@ export class MobileClient {
         credential.profileId,
         "This mobile connection was revoked. Forget it or pair this device again."
       );
+      else if (error instanceof CredentialIdentityError) await this.#identityConflict(epoch, credential.profileId, error.message);
       else void this.refresh();
     } finally {
-      if (this.#current(epoch)) this.#projectionReading = false;
+      if (this.#current(epoch)) {
+        this.#projectionReading = false;
+        if (snapshotPoll) {
+          if (!this.#streamAbort && this.#state.status === "connected" && this.#state.owner) {
+            this.#beginStream(epoch, credential, this.#state.owner);
+          }
+          this.#schedule();
+        }
+      }
     }
   }
 

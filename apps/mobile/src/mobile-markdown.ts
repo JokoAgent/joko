@@ -589,6 +589,8 @@ export type MobileMarkdownBlockGroup =
   | { type: 'single'; key: string; block: MobileMarkdownBlock };
 
 export interface MobileMarkdownTextRunGroupingOptions {
+  /** Match the renderer's materialized images; their native views cannot join selectable text runs. */
+  rendersInlineImage?: (inline: MobileMarkdownImageInline) => boolean;
   /**
    * Upper bound for one selectable native text view. Undefined keeps the
    * historical "merge until a non-text block" behavior.
@@ -627,7 +629,7 @@ export function groupMobileMarkdownSelectableBlocks(
     runInlineFragmentCount = 0;
   };
   for (const block of blocks) {
-    if (isTextRunBlock(block)) {
+    if (isTextRunBlock(block, options?.rendersInlineImage)) {
       for (const chunk of splitOversizedTextRunBlock(
         block,
         maxTextRunUtf16Length,
@@ -664,13 +666,15 @@ export function groupMobileMarkdownSelectableBlocks(
   return groups;
 }
 
-function isTextRunBlock(block: MobileMarkdownBlock): block is MobileMarkdownTextRunBlock {
+function isTextRunBlock(block: MobileMarkdownBlock,
+  rendersInlineImage = (inline: MobileMarkdownImageInline) => isMobileMarkdownImageDirectUrl(inline.url),
+): block is MobileMarkdownTextRunBlock {
   if (block.type !== 'paragraph' && block.type !== 'heading' && block.type !== 'list_item') {
     return false;
   }
-  // 直连内联图渲染为 Text 内嵌 View,不能进合并文本树(Android selectable+内嵌 View 行为未定义)。
+  // Rendered inline views need independent native layout; selectable text runs cannot contain them.
   return !block.inlines.some(
-    (inline) => inline.type === 'image' && isMobileMarkdownImageDirectUrl(inline.url),
+    (inline) => inline.type === 'image' && rendersInlineImage(inline),
   );
 }
 

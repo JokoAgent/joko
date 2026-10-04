@@ -116,6 +116,9 @@ export class MobileOfflineCache {
           }
           const detail = readSnapshot(record.snapshot, "task snapshot");
           assertDetailSnapshot(owner, selectedSessionId, detail);
+          if (detail.sessions[0]!.nativeBinding!.runtimeGeneration.toString(10) !== record.sessionGeneration) {
+            throw new Error("task generation drift");
+          }
           const touchedAt = recencyTimestamp(validTimestamp(this.now()), manifest.details);
           const touched = [
             { ...entry, cachedAt: touchedAt },
@@ -203,7 +206,7 @@ export class MobileOfflineCache {
             version: 1,
             identity: profileIdentity(profile),
             sessionId: detailSessionId,
-            sessionGeneration: detail!.generation.toString(10),
+            sessionGeneration: detail!.sessions[0]!.nativeBinding!.runtimeGeneration.toString(10),
             cachedAt,
             snapshot: cacheableSnapshotJson(detail!)
           };
@@ -214,7 +217,7 @@ export class MobileOfflineCache {
           if (this.#epoch(profile.profileId) !== epoch) return;
           details.unshift({
             sessionId: detailSessionId,
-            sessionGeneration: detail!.generation.toString(10),
+            sessionGeneration: detail!.sessions[0]!.nativeBinding!.runtimeGeneration.toString(10),
             cachedAt: recencyTimestamp(cachedAt, details),
             key,
             size
@@ -444,8 +447,8 @@ function assertDetailSnapshot(owner: Snapshot, sessionId: string, detail: Snapsh
   const detailSession = detail.sessions[0];
   if (detail.sessions.length !== 1 || detailSession?.sessionId !== sessionId
     || detailSession.automationOrigin !== undefined
-    || ownerSession?.nativeBinding?.runtimeGeneration !== detail.generation
-    || detailSession.nativeBinding?.runtimeGeneration !== detail.generation
+    || !detailSession.nativeBinding || detailSession.nativeBinding.runtimeGeneration < 1n
+    || ownerSession?.nativeBinding?.runtimeGeneration !== detailSession.nativeBinding.runtimeGeneration
     || ownerSession.backendId !== detailSession.backendId
     || ownerSession.targetId !== detailSession.targetId) {
     throw new Error("The offline task snapshot did not contain exactly one matching task.");

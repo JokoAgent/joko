@@ -1,9 +1,14 @@
 import { create } from "@bufbuild/protobuf";
+import { createRequire } from "node:module";
 import { sha256 } from "@noble/hashes/sha2.js";
 import { bytesToHex } from "@noble/hashes/utils.js";
 import { BlobRefSchema, FileKind, FilePreviewSchema, FileRevisionSchema, WorkspaceEntrySchema, type WorkspaceEntry } from "@joko/contracts";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { collectMobileMarkdownResourceCandidates, MobileMarkdownResourceReader, type MobileMarkdownResourceContext } from "./mobile-markdown-resources";
+import { installMobileAbortSignalRuntime } from "./mobile-abort-runtime";
+
+const sdkRequire = createRequire(createRequire(import.meta.url).resolve("react-native/package.json"));
+const nativeSignals = sdkRequire("abort-controller") as { AbortController: typeof AbortController; AbortSignal: typeof AbortSignal };
 
 const png = Uint8Array.from(Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/lTQAAAAASUVORK5CYII=", "base64"));
 const revision = create(FileRevisionSchema, { opaqueRevision: "image-r1", sha256Hex: bytesToHex(sha256(png)), byteSize: BigInt(png.length) });
@@ -24,7 +29,7 @@ function context(entries: readonly WorkspaceEntry[] = [image, file, folder]): Mo
     download: vi.fn(async () => ({ bytes: png, mediaType: "image/png" }))
   };
 }
-afterEach(() => { vi.useRealTimers(); });
+afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); });
 
 describe("canonical message Markdown resources", () => {
   it("resolves code, explicit, bare and file-URI paths inside the exact Workspace and retains line targets", () => {
@@ -37,7 +42,13 @@ describe("canonical message Markdown resources", () => {
     expect(collectMobileMarkdownResourceCandidates("![x](file://other-host/repo/a.png) ![x](data:image/png;base64,AAAA)", "/repo")).toEqual([]);
   });
 
-  it("adopts only typed exact-version image bytes and revalidates the durable source before opening", async () => {
+  it.each(["standard", "native"] as const)("adopts exact-version image bytes and revalidates their source with %s cancellation signals", async (runtime) => {
+    if (runtime === "native") {
+      vi.stubGlobal("AbortController", nativeSignals.AbortController);
+      vi.stubGlobal("AbortSignal", nativeSignals.AbortSignal);
+      vi.stubGlobal("btoa", undefined);
+      installMobileAbortSignalRuntime();
+    }
     const reader = new MobileMarkdownResourceReader();
     const source = context();
     const descriptor = await reader.prepare("message-1", "![one](images/a.png) `README.md:7:3` [src](src/)", source, new AbortController().signal);

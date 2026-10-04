@@ -40,7 +40,7 @@ const node: NodeIdentity = {
   pairingEnabled: true
 };
 
-function owner(sessions = [session("session-one")], generation = 0n): Snapshot {
+function owner(sessions = [session("session-one")], generation = 42n): Snapshot {
   return create(SnapshotSchema, {
     snapshotId: `owner-${generation}`,
     scope: create(SnapshotScopeSchema, { kind: { case: "owner", value: create(OwnerSnapshotScopeSchema, {}) } }),
@@ -91,7 +91,7 @@ function detail(sessionId = "session-one", generation = 7n, text = "saved messag
     scope: create(SnapshotScopeSchema, {
       kind: { case: "session", value: create(SessionSnapshotScopeSchema, { sessionId, recentTimelineItems: 120 }) }
     }),
-    generation,
+    generation: 42n,
     server: { ...node },
     sessions: [create(SessionSchema, { ...session(sessionId, false, generation), taskSummary: text })],
     operations: [create(OperationSchema, {
@@ -148,14 +148,17 @@ function cacheFixture() {
 }
 
 describe("current-v1 mobile offline content cache", () => {
-  it("round-trips one exact authenticated owner and regular task without credential material", async () => {
+  it("round-trips a task by its native generation independently of the service event generation", async () => {
     const fixture = cacheFixture();
     await fixture.cache.save(profile, node, owner(), detail());
+    await fixture.cache.save(profile, node, owner());
 
     const restored = await fixture.cache.load(profile, "session-one");
     expect(restored).toMatchObject({ cachedAt: 1_000, detailCachedAt: 1_000 });
-    expect(restored?.owner.snapshotId).toBe("owner-0");
+    expect(restored?.owner.snapshotId).toBe("owner-42");
     expect(restored?.detail?.sessions[0]?.taskSummary).toBe("saved message");
+    expect(restored?.detail?.generation).toBe(42n);
+    expect(restored?.detail?.sessions[0]?.nativeBinding?.runtimeGeneration).toBe(7n);
     expect(restored?.owner.operations).toEqual([]);
     expect(restored?.detail?.operations).toEqual([]);
     const durable = [...fixture.memory.values.values()].join("\n");
@@ -198,6 +201,7 @@ describe("current-v1 mobile offline content cache", () => {
     currentDetail.sessionGeneration = "8";
     const driftedRaw = JSON.stringify(currentDetail);
     fixture.memory.values.set(currentDetailKey, driftedRaw);
+    currentManifest.details[0].sessionGeneration = "8";
     currentManifest.details[0].size = driftedRaw.length;
     fixture.memory.values.set(manifestKey, JSON.stringify(currentManifest));
     const restored = await fixture.cache.load(profile, "session-one");
@@ -207,6 +211,7 @@ describe("current-v1 mobile offline content cache", () => {
 
   it("retires a task copy when the owner reports a new native runtime generation", async () => {
     const fixture = cacheFixture();
+    expect(() => fixture.cache.save(profile, node, owner(), detail("session-one", 8n))).toThrow(/matching task/u);
     await fixture.cache.save(profile, node, owner(), detail());
     fixture.tick();
     await fixture.cache.save(profile, node, owner([session("session-one", false, 8n)]));
@@ -224,7 +229,7 @@ describe("current-v1 mobile offline content cache", () => {
     fixture.memory.values.set(detailKey, "{damaged");
 
     const restored = await fixture.cache.load(profile, "session-one");
-    expect(restored?.owner.snapshotId).toBe("owner-0");
+    expect(restored?.owner.snapshotId).toBe("owner-42");
     expect(restored?.detail).toBeUndefined();
     expect(restored?.warning).toMatch(/damaged/u);
     expect(fixture.memory.values.has(detailKey)).toBe(false);
@@ -238,7 +243,7 @@ describe("current-v1 mobile offline content cache", () => {
 
     const transient = await fixture.cache.load(profile, "session-one");
     expect(transient).toMatchObject({
-      owner: { snapshotId: "owner-0" },
+      owner: { snapshotId: "owner-42" },
       warning: expect.stringMatching(/could not read/u)
     });
     expect(transient?.detail).toBeUndefined();

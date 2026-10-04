@@ -24,12 +24,15 @@ vi.mock("expo-image", () => ({ Image: (props: { source: { uri: string }; accessi
 vi.mock("react-native-safe-area-context", () => ({ SafeAreaView: ({ children }: { children?: ReactNode }) => createElement("div", {}, children) }));
 vi.mock("react-native", () => {
   const box = ({ children, accessibilityLabel }: { children?: ReactNode; accessibilityLabel?: string }) => createElement("div", { "aria-label": accessibilityLabel }, children);
-  return { View: box, ScrollView: box, Text: ({ children, onPress, accessibilityRole, accessibilityLabel }: {
-    children?: ReactNode; onPress?: () => void; accessibilityRole?: string; accessibilityLabel?: string;
-  }) => createElement("span", { onClick: onPress, role: accessibilityRole, "aria-label": accessibilityLabel }, children),
+  return { View: box, ScrollView: box, Text: ({ children, onPress, accessibilityRole, accessibilityLabel, selectable, style }: {
+    children?: ReactNode; onPress?: () => void; accessibilityRole?: string; accessibilityLabel?: string; selectable?: boolean; style?: unknown;
+  }) => createElement("span", { onClick: onPress, role: accessibilityRole, "aria-label": accessibilityLabel,
+    "data-selectable": selectable === undefined ? undefined : String(selectable),
+    "data-line-height": (Array.isArray(style) ? Object.assign({}, ...style) : style)?.lineHeight }, children),
     Modal: ({ visible, children }: { visible: boolean; children?: ReactNode }) => visible ? createElement("div", {}, children) : null,
-    Pressable: ({ onPress, children, accessibilityLabel, disabled }: { onPress: () => void; children?: ReactNode; accessibilityLabel?: string; disabled?: boolean }) =>
-      createElement("button", { onClick: onPress, disabled, "aria-label": accessibilityLabel }, children),
+    Pressable: ({ onPress, children, accessibilityRole, accessibilityLabel, disabled }: { onPress: () => void; children?: ReactNode;
+      accessibilityRole?: string; accessibilityLabel?: string; disabled?: boolean }) =>
+      createElement("button", { onClick: onPress, role: accessibilityRole, disabled, "aria-label": accessibilityLabel }, children),
     StyleSheet: { create: (value: unknown) => value }, Linking: { openURL: vi.fn() },
     AppState: { currentState: "active", addEventListener: (_kind: string, listener: (state: string) => void) => {
       appStateListeners.add(listener); return { remove: () => appStateListeners.delete(listener) };
@@ -50,13 +53,16 @@ describe("native message Markdown", () => {
       markdownResourceOwnerKey: () => "resources-owner", subscribe: () => () => undefined
     };
     const onOpenImage = vi.fn(); const onOpenPath = vi.fn();
-    const props = { text: "![Picture](images/a.png) `README.md:7` ![External](https://example.invalid/a.png) `missing`",
+    const props = { text: "Before\n\n![Picture](images/a.png)\n\n`README.md:7` ![External](https://example.invalid/a.png) `missing`\n\nAfter",
       colors: { background: "#ffffff", surface: "#fafafa", ink: "#111111", muted: "#666666", border: "#cccccc", accent: "#ff9800", negative: "#cc634e" },
       locale: "en" as const, ownerKey: "message-owner", resourceClient: client, resourceOwnerKey: "resources-owner",
       messageId: "completed-1", onOpenImage, onOpenPath };
     await act(async () => { root.render(createElement(MobileMarkdownMessage, props)); });
     expect(container.querySelectorAll("img")).toHaveLength(1);
     expect(container.querySelector("img")?.getAttribute("src")).toBe("data:image/png;base64,AAAA");
+    expect(container.querySelector("img")?.closest('[data-selectable="true"]')).toBeNull();
+    expect(container.querySelector("img")?.closest("span[data-line-height]")).toBeNull();
+    expect(container.querySelector('[role="link"]')?.closest('[data-selectable="true"]')?.textContent).toContain("After");
     expect(container.textContent).toContain("External");
     await act(async () => {
       container.querySelector<HTMLElement>('[role="button"][aria-label="Picture"]')!.click();
@@ -64,6 +70,7 @@ describe("native message Markdown", () => {
     });
     expect(onOpenImage).toHaveBeenCalledWith("resources-1", imageKey);
     expect(onOpenPath).toHaveBeenCalledWith("resources-1", pathKey);
+    expect(onOpenImage).toHaveBeenCalledTimes(1);
     await act(async () => { nativeImages.get("Picture")!.onError(); });
     expect(container.querySelector("img")).toBeNull();
     expect(container.querySelector('[role="button"][aria-label="Picture"]')?.textContent).toBe("Picture");

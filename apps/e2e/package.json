@@ -27,6 +27,7 @@
   },
   "devDependencies": {
     "@joko/device-peer": "workspace:*",
+    "@joko/tool-android": "workspace:*",
     "@joko/tool-browser": "workspace:*",
     "@types/node": "24.12.4",
     "@types/ws": "8.18.1",

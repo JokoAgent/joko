@@ -1660,7 +1660,7 @@ function iosClient(network: MobileNetwork, storage: MobileStorage): MobileClient
   clients.push(instance);
   return instance;
 }
-afterEach(() => { for (const item of clients.splice(0)) item.dispose(); });
+afterEach(() => { for (const item of clients.splice(0)) item.dispose(); vi.useRealTimers(); });
 
 describe("mobile Partner private authority", () => {
   it("revalidates a task preview against its exact canonical Partner Session and target participant", async () => {
@@ -4401,14 +4401,67 @@ describe("native mobile connection and operation ownership", () => {
     expect(app.state.older).toHaveLength(0);
   });
 
-  it("exposes a degraded polling state when the native stream fails without treating it as live", async () => {
+  it.each(["cursor", "snapshot-only"] as const)("preserves a degraded polling connection with %s observations without treating it as live", async (mode) => {
+    vi.useFakeTimers();
     const network = fakeNetwork();
     network.streamOwner = vi.fn(async function* () { throw new Error("stream transport unavailable"); });
+    if (mode === "snapshot-only") {
+      const projected = create(SnapshotSchema, { ...snapshot, resumeCursor: undefined });
+      vi.mocked(network.readOwner).mockResolvedValue({ connection, device, snapshot: projected });
+      vi.mocked(network.readSession).mockResolvedValue(projected);
+    }
     const app = client(network, memoryStorage(credential).storage);
     await app.start();
-    await vi.waitFor(() => expect(app.state.liveStatus).toBe("polling"));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(app.state.liveStatus).toBe("polling");
     expect(app.state.status).toBe("connected");
     expect(app.state.live).toHaveLength(0);
+    const observed: string[] = [];
+    app.subscribe((state) => observed.push(state.status));
+    await vi.advanceTimersByTimeAsync(4_000);
+    expect(observed).not.toContain("connecting");
+    expect(app.state.status).toBe("connected");
+    expect(network.inspect).toHaveBeenCalledTimes(2);
+    expect(network.submit).not.toHaveBeenCalled();
+  });
+
+  it.each(["identity", "api", "generation", "runtime", "revoked"] as const)("retires stale task resources when a scheduled snapshot detects %s drift", async (drift) => {
+    vi.useFakeTimers();
+    const network = fakeNetwork();
+    network.streamOwner = vi.fn(async function* () { throw new Error("stream transport unavailable"); });
+    vi.mocked(network.readOwner).mockResolvedValue({ connection, device, snapshot: filesSnapshot });
+    vi.mocked(network.readSession).mockResolvedValue(filesSnapshot);
+    const saved = memoryStorage(credential);
+    const app = client(network, saved.storage);
+    await app.start(); await app.openFiles(); await vi.advanceTimersByTimeAsync(0);
+    const authority = app.filesAuthorityKey();
+    expect(authority).toBeDefined();
+    vi.mocked(network.readOwner).mockClear(); vi.mocked(network.readSession).mockClear();
+    if (drift === "identity" || drift === "api") {
+      vi.mocked(network.inspect).mockResolvedValue({ ...node,
+        ...(drift === "identity" ? { serverId: "different-node" } : { apiVersion: node.apiVersion + "-different" }) });
+    } else if (drift === "revoked") vi.mocked(network.readOwner).mockRejectedValue({ code: Code.Unauthenticated });
+    else {
+      const next = create(SnapshotSchema, { ...filesSnapshot,
+        ...(drift === "generation" ? { generation: 2n,
+          resumeCursor: create(EventCursorSchema, { opaqueToken: "generation-2", generation: 2n, sequence: 1n }) }
+          : { sessions: filesSnapshot.sessions.map((session) => create(SessionSchema, { ...session,
+            nativeBinding: create(NativeSessionBindingSchema, { ...session.nativeBinding!,
+              runtimeGeneration: session.nativeBinding!.runtimeGeneration + 1n }) })) }) });
+      vi.mocked(network.readOwner).mockResolvedValue({ connection, device, snapshot: next });
+      vi.mocked(network.readSession).mockResolvedValue(next);
+    }
+    await vi.advanceTimersByTimeAsync(4_000);
+    expect(app.filesAuthorityKey()).not.toBe(authority);
+    expect(app.state.files.status).not.toBe("ready");
+    if (drift === "identity" || drift === "api") {
+      expect(app.state.status).toBe("unpaired");
+      expect(network.readOwner).not.toHaveBeenCalled(); expect(network.readSession).not.toHaveBeenCalled();
+      expect(saved.storage.deleteCredential).not.toHaveBeenCalled();
+    } else if (drift === "revoked") {
+      expect(app.state.status).toBe("revoked"); expect(saved.storage.deleteCredential).toHaveBeenCalledWith(credential.profileId);
+    }
+    expect(network.submit).not.toHaveBeenCalled();
   });
 });
 
@@ -7263,6 +7316,7 @@ describe("native current-task Files ownership", () => {
   }
 
   it("opens current completed Markdown resources in Files and the gallery, and shares the same authorized inline image", async () => {
+    vi.useFakeTimers();
     const bytes = Uint8Array.from(Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=", "base64"));
     const body = "![Inline picture](images/pixel.png) `README.md:2:1` [source](src/) ![external](https://example.invalid/no.png)";
     const event = create(EventSchema, { eventId: messageEvent.eventId, identity: messageEvent.identity, cursor: messageEvent.cursor,
@@ -7272,6 +7326,7 @@ describe("native current-task Files ownership", () => {
     const projected = create(SnapshotSchema, { ...filesSnapshot, timeline: [event], resumeCursor: event.cursor,
       workspaces: [create(WorkspaceDescriptorSchema, { ...filesSnapshot.workspaces[0]!, serverPathDisplay: "D:\\repo" })] });
     const network = fakeNetwork(); configureFiles(network, projected);
+    network.streamOwner = vi.fn(async function* () { throw new Error("stream transport unavailable"); });
     const imageRevision = create(FileRevisionSchema, { opaqueRevision: "pixel-r1", sha256Hex: sha256Hex(bytes), byteSize: BigInt(bytes.length) });
     const imageEntry = create(WorkspaceEntrySchema, { workspaceId: "workspace", relativePath: "images/pixel.png", kind: FileKind.REGULAR, mediaType: "image/png", revision: imageRevision });
     const imageBlob = create(BlobRefSchema, { blobId: "markdown-pixel", fileName: "pixel.png", mediaType: "image/png", byteSize: imageRevision.byteSize, sha256Hex: imageRevision.sha256Hex });
@@ -7294,12 +7349,17 @@ describe("native current-task Files ownership", () => {
     expect(network.downloadBlob).toHaveBeenCalledWith(credential, imageBlob, expect.any(AbortSignal));
     expect(await app.openMarkdownPath(prepared.leaseId, fileKey, new AbortController().signal)).toMatchObject({ kind: "workspace-entry", entry: readme });
     expect(app.state.files.preview).toMatchObject({ kind: "text", text: "#A\n#B\n", focusLine: 2, focusColumn: 1 });
+    const filePreview = app.state.files.preview;
+    await vi.advanceTimersByTimeAsync(4_000);
+    expect(app.state.files.preview).toBe(filePreview);
+    expect(() => app.assertMarkdownResourcesCurrent(prepared.leaseId)).not.toThrow();
     await app.openMarkdownPath(prepared.leaseId, JSON.stringify(["link", "src/"]), new AbortController().signal);
     expect(app.state.files.location).toEqual({ kind: "workspace", path: "src" });
     const gallery = await app.openMarkdownImageGallery(prepared.leaseId, imageKey, new AbortController().signal);
     app.releaseMarkdownResources(prepared.leaseId);
     const page = await app.loadImageGalleryPage(gallery.leaseId, 0, new AbortController().signal);
     expect(page).toMatchObject({ expectedWidthPixels: 1, expectedHeightPixels: 1, pageCount: 1 });
+    await vi.advanceTimersByTimeAsync(4_000);
     app.confirmImageGalleryPageDecoded(gallery.leaseId, page.leaseId, page.pageId, { width: 1, height: 1, mediaType: "image/png", isAnimated: false });
     expect((await app.prepareImageOutput(page.leaseId, { width: 1, height: 1, mediaType: "image/png", isAnimated: false }, new AbortController().signal)).bytes).toEqual(bytes);
     app.cancelImageGallery(gallery.leaseId);

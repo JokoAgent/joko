@@ -10,6 +10,8 @@ type MobileTaskMessageRow = readonly [
 ];
 
 const mobileTaskMessageRows = [
+  ["task.openActions", "Task actions", "任务操作", "任務操作", "タスク操作", "작업 메뉴"],
+  ["task.closeActions", "Close task actions", "关闭任务操作", "關閉任務操作", "タスク操作を閉じる", "작업 메뉴 닫기"],
   ["share.shareImage", "Share as image", "分享为图片", "以圖片分享", "画像で共有", "이미지로 공유"],
   ["share.selected", "{count} selected", "已选择 {count} 条", "已選取 {count} 則", "{count} 件選択中", "{count}개 선택됨"],
   ["share.selectMessage", "Select message for image sharing", "选择要分享为图片的消息", "選取要以圖片分享的訊息", "画像で共有するメッセージを選択", "이미지로 공유할 메시지 선택"],

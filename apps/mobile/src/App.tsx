@@ -156,6 +156,7 @@ import {
 import type { MobileTimelineArtifact } from "./mobile-timeline-artifacts";
 import { MobileDrawer } from "./MobileDrawer";
 import { MobileActionSheet } from "./MobileActionSheet";
+import { MobileTaskHeader } from "./MobileTaskHeader";
 import { MobileComposerAtomSheet } from "./MobileComposerAtomSheet";
 import {
   MobileComposerRichInput,
@@ -3225,6 +3226,7 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
   const [drawerMounted, setDrawerMounted] = useState(false);
   const [messageAction, setMessageAction] = useState<{ readonly sessionId: string; readonly row: TimelineRow }>();
   const [messageActionsVisible, setMessageActionsVisible] = useState(false);
+  const [taskActionsVisible, setTaskActionsVisible] = useState(false);
   const [quoteSelection, setQuoteSelection] = useState<{
     readonly lease: MobileQuoteSelectionLease;
     readonly draft: MobileComposerDraft;
@@ -3950,7 +3952,7 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
     }).filter((item) => state.status === "connected" || item.id === "copy-link")
     : [];
   useMobileScreenshotSelection({ owner: client.conversationShareOwnerKey(), selectionActive: conversationShare.active,
-    blocked: conversationShareDisabled || drawerOpen || messageActionsVisible || interactionVisible || contextVisible
+    blocked: conversationShareDisabled || drawerOpen || messageActionsVisible || taskActionsVisible || interactionVisible || contextVisible
       || nativeTreeVisible || runtimeControlsVisible || sessionMentionsVisible || workspaceMentionsVisible || catalogMentionsVisible
       || photoLibraryLease !== undefined || imageEditorLease !== undefined || quoteSelection !== undefined
       || commandHelpItems !== undefined || runtimeCommandCommitting,
@@ -5289,35 +5291,32 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
     <MobileKeyboardAvoidingView style={styles.fill} keyboard={keyboard} consumedBottomInset={safeArea.bottom}
       behavior={Platform.OS === "android" ? "height" : undefined}
       accessibilityElementsHidden={drawerMounted} importantForAccessibility={drawerMounted ? "no-hide-descendants" : "auto"}>
-    <View style={styles.header}>
-      {wideNavigation.enabled ? <Pressable ref={drawerMenuRef} accessibilityRole="button" accessibilityLabel={mobileMessage(locale, "task.openList")}
-        onPress={() => { pendingDrawerActionRef.current = undefined; setDrawerOpen(true); }}
-        style={[styles.headerIconButton, { borderColor: colors.border, backgroundColor: colors.surface }]}>
-        <Text style={[styles.headerIcon, { color: colors.ink }]}>☰</Text>
-      </Pressable> : <Back label={mobileMessage(locale, "common.tasks")}
-        accessibilityLabel={mobileMessage(locale, "common.backTo", { label: mobileMessage(locale, "common.tasks") })}
-        onPress={onBack} colors={colors} />}
-      <View style={styles.fill}>
-        <Text style={[styles.title, { color: colors.ink }]} numberOfLines={1}>{session?.displayName || mobileMessage(locale, "task.titleFallback")}</Text>
-        <Text style={[styles.caption, { color: colors.muted }]}>{session ? sessionState(session.state, locale) : mobileMessage(locale, "task.loading")}</Text>
-      </View>
-      <View style={styles.headerActions}>
-        <Action label={mobileMessage(locale, "task.branches")}
-          onPress={() => { setSessionMentionsVisible(false); setWorkspaceMentionsVisible(false); setCatalogMentionsVisible(false); setContextVisible(false); setRuntimeControlsVisible(false); setNativeTreeVisible(true); }} colors={colors} compact
-          disabled={state.status !== "connected" || nativeTreeControls === undefined || state.busy || attachmentBusy || voice.busy || interactions.length > 0} />
-        <Action label={contextControls?.usage ? mobileMessage(locale, "task.contextPercent", { percent: contextControls.usage.percent }) : mobileMessage(locale, "task.context")}
-          onPress={() => { setSessionMentionsVisible(false); setWorkspaceMentionsVisible(false); setCatalogMentionsVisible(false); setNativeTreeVisible(false); setRuntimeControlsVisible(false); setContextVisible(true); }} colors={colors} compact
-          disabled={state.status !== "connected" || contextControls === undefined || state.busy || attachmentBusy || voice.busy || interactions.length > 0} />
-        <Action label={mobileMessage(locale, "task.controls")} onPress={() => { setSessionMentionsVisible(false); setWorkspaceMentionsVisible(false); setCatalogMentionsVisible(false); setNativeTreeVisible(false); setContextVisible(false); setRuntimeControlsVisible(true); }} colors={colors} compact
-          disabled={state.status !== "connected" || !runtimeControlsAvailable || state.busy || attachmentBusy || voice.busy || interactions.length > 0} />
-        <Action label={mobileMessage(locale, copyBusy ? "actions.copyingLink" : "actions.copyTaskLink")}
-          onPress={() => void copyPublicTaskLink()} colors={colors} compact
-          disabled={copyBusy || session === undefined || (state.status !== "connected" && state.status !== "offline")} />
-        {client.canOpenFiles() && <Action label={mobileMessage(locale, "task.files")} onPress={() => onFiles()} colors={colors} compact
-          disabled={state.status !== "connected" || attachmentBusy} />}
-        <Action label={mobileMessage(locale, "common.refresh")} onPress={() => void client.refresh()} colors={colors} compact disabled={attachmentBusy} />
-      </View>
-    </View>
+    <MobileTaskHeader key={`${state.activeProfileId}/${state.selectedId}/${session?.backendId}/${session?.targetId}/${session?.nativeBinding?.runtimeGeneration}`}
+      title={session?.displayName || mobileMessage(locale, "task.titleFallback")}
+      subtitle={session ? sessionState(session.state, locale) : mobileMessage(locale, "task.loading")}
+      navigationRef={drawerMenuRef} drawerNavigation={wideNavigation.enabled}
+      navigationLabel={wideNavigation.enabled ? mobileMessage(locale, "task.openList")
+        : mobileMessage(locale, "common.backTo", { label: mobileMessage(locale, "common.tasks") })}
+      onNavigate={wideNavigation.enabled
+        ? () => { pendingDrawerActionRef.current = undefined; setDrawerOpen(true); } : onBack}
+      disabled={session === undefined} colors={colors} locale={locale} onMenuVisibilityChange={setTaskActionsVisible}
+      actions={[
+        { id: "branches", label: mobileMessage(locale, "task.branches"),
+          onPress: () => { setSessionMentionsVisible(false); setWorkspaceMentionsVisible(false); setCatalogMentionsVisible(false); setContextVisible(false); setRuntimeControlsVisible(false); setNativeTreeVisible(true); },
+          disabled: state.status !== "connected" || nativeTreeControls === undefined || state.busy || attachmentBusy || voice.busy || interactions.length > 0 },
+        { id: "context", label: contextControls?.usage ? mobileMessage(locale, "task.contextPercent", { percent: contextControls.usage.percent }) : mobileMessage(locale, "task.context"),
+          onPress: () => { setSessionMentionsVisible(false); setWorkspaceMentionsVisible(false); setCatalogMentionsVisible(false); setNativeTreeVisible(false); setRuntimeControlsVisible(false); setContextVisible(true); },
+          disabled: state.status !== "connected" || contextControls === undefined || state.busy || attachmentBusy || voice.busy || interactions.length > 0 },
+        { id: "controls", label: mobileMessage(locale, "task.controls"),
+          onPress: () => { setSessionMentionsVisible(false); setWorkspaceMentionsVisible(false); setCatalogMentionsVisible(false); setNativeTreeVisible(false); setContextVisible(false); setRuntimeControlsVisible(true); },
+          disabled: state.status !== "connected" || !runtimeControlsAvailable || state.busy || attachmentBusy || voice.busy || interactions.length > 0 },
+        { id: "copy-link", label: mobileMessage(locale, copyBusy ? "actions.copyingLink" : "actions.copyTaskLink"),
+          onPress: () => void copyPublicTaskLink(),
+          disabled: copyBusy || session === undefined || (state.status !== "connected" && state.status !== "offline") },
+        ...(client.canOpenFiles() ? [{ id: "files" as const, label: mobileMessage(locale, "task.files"),
+          onPress: () => onFiles(), disabled: state.status !== "connected" || attachmentBusy }] : []),
+        { id: "refresh", label: mobileMessage(locale, "common.refresh"), onPress: () => void client.refresh(), disabled: attachmentBusy }
+      ]} />
     <Text accessibilityLiveRegion="polite" style={[styles.caption, styles.queue, { color: colors.muted }]}>
       {mobileMessage(locale, state.liveStatus === "streaming" ? "task.live"
         : state.liveStatus === "verifying" ? "task.checkingLive"
@@ -7046,7 +7045,6 @@ const styles = StyleSheet.create({
   button: { minHeight: 48, borderRadius: 12, alignItems: "center", justifyContent: "center", paddingHorizontal: 18, paddingVertical: 10 },
   buttonText: { fontSize: 15, fontWeight: "700" }, compact: { minHeight: 44 },
   header: { padding: 16, flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 10 },
-  headerActions: { flexDirection: "row", flexWrap: "wrap", justifyContent: "flex-end", gap: 8 },
   homeHeader: { minHeight: 72, paddingHorizontal: 16, paddingVertical: 10, flexDirection: "row", alignItems: "center", gap: 12 },
   homeTitle: { flex: 1, minWidth: 0, alignItems: "center" },
   homeTitleText: { maxWidth: "100%", fontSize: 20, lineHeight: 25, fontWeight: "700" },

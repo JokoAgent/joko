@@ -1,3 +1,4 @@
+import { base64Encode } from "@bufbuild/protobuf/wire";
 import {
   CapabilitySupport,
   FileKind,
@@ -298,13 +299,7 @@ export function normalizeMediaType(value: string): string {
 }
 
 export function bytesToDataUri(bytes: Uint8Array, mediaType: string): string {
-  let binary = "";
-  const chunkSize = 0x8000;
-  for (let offset = 0; offset < bytes.length; offset += chunkSize) {
-    const chunk = bytes.subarray(offset, Math.min(offset + chunkSize, bytes.length));
-    for (const byte of chunk) binary += String.fromCharCode(byte);
-  }
-  return `data:${normalizeMediaType(mediaType)};base64,${btoa(binary)}`;
+  return `data:${normalizeMediaType(mediaType)};base64,${base64Encode(bytes)}`;
 }
 
 function supports(backend: BackendDescriptor, name: string): boolean {

@@ -1,4 +1,5 @@
 import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
+import { createHash } from "node:crypto";
 import { TimestampSchema } from "@bufbuild/protobuf/wkt";
 import {
   ArtifactKind,
@@ -69,6 +70,16 @@ import {
   type PairedCredential
 } from "./network";
 import { projectMobileVoiceDictionarySnapshot, mobileVoiceDictionaryLearningRequest } from "./mobile-voice-dictionary-service";
+
+vi.mock("expo-crypto", () => ({
+  CryptoDigestAlgorithm: { SHA256: "SHA-256" },
+  digest: async (algorithm: string, bytes: BufferSource) => {
+    if (algorithm !== "SHA-256" || !(bytes instanceof Uint8Array)) {
+      throw new Error("The native digest requires a typed byte array.");
+    }
+    return Uint8Array.from(createHash("sha256").update(bytes).digest()).buffer;
+  }
+}));
 
 describe("mobile voice ephemeral requests", () => {
   it("loads voice service settings, uploads credentials only through a same-origin ticket, and keeps context separate", async () => {
@@ -681,6 +692,16 @@ describe("authenticated mobile Blob downloads", () => {
     expect(fetcher).toHaveBeenCalledWith("https://node.example/v1/blobs/ticket-1", expect.objectContaining({
       headers: { authorization: "Bearer secret" }, cache: "no-store"
     }));
+  });
+
+  it("verifies downloaded bytes through the native typed-array digest boundary", async () => {
+    const bytes = new Uint8Array([1, 2, 3, 4]);
+    const exactBlob = create(BlobRefSchema, { ...blob, sha256Hex: createHash("sha256").update(bytes).digest("hex") });
+    const result = await downloadVerifiedBlob(
+      { origin: "https://node.example", authKey: "secret" }, exactBlob, ticket, undefined,
+      vi.fn(async () => response(bytes)) as unknown as typeof fetch
+    );
+    expect(result).toEqual({ bytes, mediaType: "image/png" });
   });
 
   it("fails closed before display for ticket, endpoint, response and digest mismatches", async () => {
