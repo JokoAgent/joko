@@ -566,6 +566,7 @@ export function AppearanceSettings({ controller, locale, theme, onSuccess, onOpe
           preview={t("settings.appearance.uiPreview")}
           fallback="var(--app-font-ui-default)"
           onChange={controller.setUiFamily}
+          onSuccess={onSuccess}
           t={t}
         />
         <FontSizeSetting
@@ -590,6 +591,7 @@ export function AppearanceSettings({ controller, locale, theme, onSuccess, onOpe
           previewLanguage="typescript"
           fallback="var(--app-font-code-default)"
           onChange={controller.setCodeFamily}
+          onSuccess={onSuccess}
           t={t}
         />
         <FontSizeSetting
@@ -2044,7 +2046,7 @@ interface FontPreset {
   readonly family: string;
 }
 
-export function FontFamilySetting({ label, description, value, presets, preview, previewLanguage, fallback, onChange, t }: {
+export function FontFamilySetting({ label, description, value, presets, preview, previewLanguage, fallback, onChange, onSuccess, t }: {
   readonly label: string;
   readonly description: string;
   readonly value: string;
@@ -2053,16 +2055,58 @@ export function FontFamilySetting({ label, description, value, presets, preview,
   readonly previewLanguage?: string;
   readonly fallback: string;
   readonly onChange: (family: string) => Promise<void>;
+  readonly onSuccess: (message: string) => void;
   readonly t: Translator;
 }): JSX.Element {
   const [open, setOpen] = useState(false);
   const [customValue, setCustomValue] = useState(value);
   const selectedPreset = presets.find((preset) => preset.family === value);
+  const defaultFamily = presets.find((preset) => preset.id === "default")?.family ?? "";
   const [previewFamily, setPreviewFamily] = useState<string>();
   const panelRef = useRef<HTMLDivElement>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const resetRef = useRef<HTMLButtonElement>(null);
+  const customInputRef = useRef<HTMLInputElement>(null);
+  const actionOwner = useMemo(() => ({ action: onChange }), [onChange]);
+  const committedOwnerRef = useRef<typeof actionOwner | undefined>(undefined);
+  const flightRef = useRef<{
+    readonly owner: typeof actionOwner;
+    readonly focusTarget: HTMLElement | null;
+    readonly reset: boolean;
+  } | undefined>(undefined);
+  const focusAfterSettleRef = useRef<{
+    readonly owner: typeof actionOwner;
+    readonly target: HTMLElement | null;
+  } | undefined>(undefined);
+  const [feedback, setFeedback] = useState<{
+    readonly owner: typeof actionOwner;
+    readonly pending: boolean;
+    readonly error?: string;
+  }>({ owner: actionOwner, pending: false });
+  const pending = feedback.owner === actionOwner && feedback.pending;
+  const saveError = feedback.owner === actionOwner ? feedback.error : undefined;
+
+  useLayoutEffect(() => {
+    committedOwnerRef.current = actionOwner;
+    return () => {
+      if (committedOwnerRef.current === actionOwner) committedOwnerRef.current = undefined;
+      if (flightRef.current?.owner === actionOwner) flightRef.current = undefined;
+      if (focusAfterSettleRef.current?.owner === actionOwner) focusAfterSettleRef.current = undefined;
+    };
+  }, [actionOwner]);
+  useLayoutEffect(() => {
+    const request = focusAfterSettleRef.current;
+    if (pending || request?.owner !== actionOwner) return;
+    focusAfterSettleRef.current = undefined;
+    const target = request.target;
+    if (target?.isConnected === true && target.ownerDocument.defaultView?.closed !== true) {
+      target.focus({ preventScroll: true });
+    }
+    setPreviewFamily(undefined);
+  }, [actionOwner, pending, saveError, open]);
   useEffect(() => {
-    setCustomValue(value);
-  }, [value]);
+    if (!pending && saveError === undefined) setCustomValue(value);
+  }, [actionOwner, pending, saveError, value]);
   useEffect(() => {
     if (!open) setPreviewFamily(undefined);
   }, [open]);
@@ -2073,27 +2117,70 @@ export function FontFamilySetting({ label, description, value, presets, preview,
     [preview, previewLanguage]
   );
   const selectedLabel = selectedPreset?.label ?? (fontFamilyDisplayName(value) || t("settings.appearance.fontDefault"));
-  const selectFamily = (family: string): void => {
-    void onChange(family.trim());
-    setOpen(false);
+  const selectFamily = (family: string, reset: boolean, focusTarget: HTMLElement | null): void => {
+    if (flightRef.current?.owner === actionOwner) return;
+    const normalized = family.trim();
+    if (normalized === value) {
+      setOpen(false);
+      triggerRef.current?.focus({ preventScroll: true });
+      return;
+    }
+    const flight = { owner: actionOwner, focusTarget, reset };
+    flightRef.current = flight;
+    setFeedback({ owner: actionOwner, pending: true });
+    const current = (): boolean => committedOwnerRef.current === actionOwner && flightRef.current === flight;
+    void (async () => {
+      try {
+        await actionOwner.action(normalized);
+      } catch {
+        if (!current()) return;
+        flightRef.current = undefined;
+        focusAfterSettleRef.current = { owner: actionOwner, target: flight.focusTarget };
+        setPreviewFamily(undefined);
+        setFeedback({ owner: actionOwner, pending: false, error: t("settings.appearance.fontSaveFailed") });
+        return;
+      }
+      if (!current()) return;
+      flightRef.current = undefined;
+      focusAfterSettleRef.current = { owner: actionOwner, target: triggerRef.current };
+      setPreviewFamily(undefined);
+      setFeedback({ owner: actionOwner, pending: false });
+      setOpen(false);
+      onSuccess(t(flight.reset ? "settings.defaults.restored" : "settings.saved"));
+    })();
   };
   return (
     <div className="appearance-font-family">
       <div className="appearance-font-setting__heading">
-        <div><strong>{label}</strong><span>{description}</span></div>
-        <IconButton label={t("settings.appearance.fontReset")} disabled={value.length === 0} onClick={() => void onChange("")}><RotateCcw aria-hidden="true" /></IconButton>
+        <div><strong>{label}</strong><span>{description}</span>{pending && <span role="status">{t("common.working")}</span>}</div>
+        <IconButton
+          label={t("settings.appearance.fontReset")}
+          buttonRef={resetRef}
+          disabled={pending || value === defaultFamily}
+          aria-busy={pending}
+          onClick={() => selectFamily(defaultFamily, true, resetRef.current)}
+        ><RotateCcw aria-hidden="true" /></IconButton>
       </div>
       <MorphPopover
         open={open}
-        onOpenChange={setOpen}
+        onOpenChange={(next) => {
+          if (!next && (pending || flightRef.current?.owner === actionOwner)) return;
+          setOpen(next);
+        }}
         label={label}
         trigger={<button
+          ref={triggerRef}
           type="button"
           className="appearance-font-picker__trigger"
           aria-label={label}
           aria-haspopup="listbox"
           aria-expanded={open}
-          onClick={() => setOpen((current) => !current)}
+          aria-busy={pending}
+          disabled={pending}
+          onClick={() => {
+            if (flightRef.current?.owner === actionOwner) return;
+            setOpen((current) => !current);
+          }}
         >
           <span>{selectedLabel}</span>
           <ChevronDown aria-hidden="true" />
@@ -2104,13 +2191,14 @@ export function FontFamilySetting({ label, description, value, presets, preview,
         className="appearance-font-picker"
         panelClassName="appearance-font-picker__panel"
         panelElementRef={panelRef}
+        additionalOwnedElementRef={resetRef}
         initialFocus={() => panelRef.current?.querySelector<HTMLElement>("[data-font-selected]") ?? null}
       >
-        <div className="appearance-font-picker__content" onMouseLeave={() => setPreviewFamily(undefined)}>
+        <div className="appearance-font-picker__content" aria-busy={pending} onMouseLeave={() => setPreviewFamily(undefined)}>
           <pre className="appearance-font-preview" style={{ fontFamily: activePreviewFamily }}><code>{fontPreviewContents(preview, previewTokens)}</code></pre>
           <div className="appearance-font-picker__group">
             <strong>{t("settings.appearance.fontPresets")}</strong>
-            <div className="appearance-font-picker__options" role="listbox" aria-label={label}>
+            <div className="appearance-font-picker__options" role="listbox" aria-label={label} aria-busy={pending}>
               {presets.map((preset) => {
                 const selected = preset.family === value;
                 return <button
@@ -2121,11 +2209,13 @@ export function FontFamilySetting({ label, description, value, presets, preview,
                   data-font-selected={selected ? "" : undefined}
                   className={selected ? "is-selected" : undefined}
                   key={preset.id}
+                  disabled={pending}
+                  aria-busy={pending}
                   onMouseEnter={() => setPreviewFamily(preset.family)}
                   onMouseLeave={() => setPreviewFamily(undefined)}
                   onFocus={() => setPreviewFamily(preset.family)}
                   onBlur={() => setPreviewFamily(undefined)}
-                  onClick={() => selectFamily(preset.family)}
+                  onClick={(event) => selectFamily(preset.family, false, event.currentTarget)}
                 >
                   <span style={{ fontFamily: preset.family.trim() ? `${preset.family}, ${fallback}` : fallback }}>{preset.label}</span>
                   {selected && <Check aria-hidden="true" />}
@@ -2137,9 +2227,12 @@ export function FontFamilySetting({ label, description, value, presets, preview,
             <strong>{t("settings.appearance.fontCustom")}</strong>
             <div>
               <input
+                ref={customInputRef}
                 value={customValue}
                 maxLength={256}
                 aria-label={t("settings.appearance.fontCustom")}
+                aria-busy={pending}
+                disabled={pending}
                 data-font-selected={selectedPreset === undefined ? "" : undefined}
                 placeholder={t("settings.appearance.fontCustomPlaceholder")}
                 onChange={(event) => {
@@ -2149,14 +2242,22 @@ export function FontFamilySetting({ label, description, value, presets, preview,
                 onFocus={() => setPreviewFamily(customValue)}
                 onBlur={() => setPreviewFamily(undefined)}
                 onKeyDown={(event) => {
-                  if (event.key === "Enter" && customValue.trim() !== "") selectFamily(customValue);
+                  if (event.key !== "Enter" || event.nativeEvent.isComposing || event.keyCode === 229
+                    || customValue.trim() === "" || customValue.trim() === value || pending) return;
+                  event.preventDefault();
+                  selectFamily(customValue, false, event.currentTarget);
                 }}
               />
-              <Button disabled={customValue.trim() === "" || customValue.trim() === value} onClick={() => selectFamily(customValue)}>{t("settings.appearance.fontApply")}</Button>
+              <Button
+                disabled={pending || customValue.trim() === "" || customValue.trim() === value}
+                aria-busy={pending}
+                onClick={() => selectFamily(customValue, false, customInputRef.current)}
+              >{t("settings.appearance.fontApply")}</Button>
             </div>
           </div>
         </div>
       </MorphPopover>
+      {saveError !== undefined && <ErrorBanner message={saveError} />}
     </div>
   );
 }

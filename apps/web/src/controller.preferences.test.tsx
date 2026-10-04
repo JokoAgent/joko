@@ -15,7 +15,7 @@ afterEach(async () => {
   vi.unstubAllGlobals();
 });
 
-it("rolls back a failed preference mutation before a queued newer mutation samples local state", async () => {
+it("keeps font setters stable while rolling back before a queued mutation samples local state", async () => {
   vi.stubGlobal("matchMedia", () => ({ matches: false, addEventListener: vi.fn(), removeEventListener: vi.fn() }));
   let stored: UiPreferences = DEFAULT_UI_PREFERENCES;
   let rejectFirst!: (error: Error) => void;
@@ -43,6 +43,8 @@ it("rolls back a failed preference mutation before a queued newer mutation sampl
   }
   await act(async () => { root?.render(<Probe />); });
   await vi.waitFor(() => expect(controller?.state.ready).toBe(true));
+  const setUiFamily = controller!.setUiFamily;
+  const setCodeFamily = controller!.setCodeFamily;
 
   let first!: Promise<void>;
   let second!: Promise<void>;
@@ -52,6 +54,9 @@ it("rolls back a failed preference mutation before a queued newer mutation sampl
     await Promise.resolve();
   });
   expect(mutatePreferences).toHaveBeenCalledOnce();
+  expect(controller!.state.preferences.theme).toBe("light");
+  expect(controller!.setUiFamily).toBe(setUiFamily);
+  expect(controller!.setCodeFamily).toBe(setCodeFamily);
   const observedFirst = first.catch((error: unknown) => error);
   await act(async () => {
     rejectFirst(new Error("preference write failed"));
@@ -62,4 +67,6 @@ it("rolls back a failed preference mutation before a queued newer mutation sampl
   expect(mutatePreferences).toHaveBeenCalledTimes(2);
   expect(stored).toMatchObject({ theme: "dark", locale: "zh-CN" });
   expect(controller!.state.preferences).toMatchObject({ theme: "dark", locale: "zh-CN" });
+  expect(controller!.setUiFamily).toBe(setUiFamily);
+  expect(controller!.setCodeFamily).toBe(setCodeFamily);
 });
