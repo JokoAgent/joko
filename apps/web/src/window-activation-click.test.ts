@@ -3,6 +3,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
+  connectDesktopActivationClickPreference,
   createActivationClickState,
   installActivationClickGuard,
   readActivationClickPreference,
@@ -11,6 +12,29 @@ import {
 } from "./window-activation-click.js";
 
 afterEach(() => window.localStorage.clear());
+
+function deferred<T>(): {
+  readonly promise: Promise<T>;
+  readonly resolve: (value: T) => void;
+} {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => { resolve = done; });
+  return { promise, resolve };
+}
+
+function desktopActivationClickApi(
+  get: () => Promise<{ readonly swallowActivationClick: boolean }>,
+  onChanged: (listener: (settings: { readonly swallowActivationClick: boolean }) => void) => () => void
+): JokoDesktopApi {
+  return {
+    capabilities: ["window.activationClick"],
+    windowInteraction: {
+      get,
+      onChanged,
+      setSwallowActivationClick: vi.fn()
+    }
+  } as unknown as JokoDesktopApi;
+}
 
 describe("activation-click guard", () => {
   it("swallows the complete first primary-button gesture after mouse activation", () => {
@@ -73,5 +97,59 @@ describe("activation-click guard", () => {
     expect(readActivationClickPreference()).toBe(true);
     expect(listener).toHaveBeenLastCalledWith(true);
     unsubscribe();
+  });
+
+  it("does not let a stale initial desktop read overwrite a newer confirmed hint", async () => {
+    const initial = deferred<{ readonly swallowActivationClick: boolean }>();
+    let changed: ((settings: { readonly swallowActivationClick: boolean }) => void) | undefined;
+    const disconnect = connectDesktopActivationClickPreference(desktopActivationClickApi(
+      () => initial.promise,
+      (listener) => {
+        changed = listener;
+        return vi.fn();
+      }
+    ));
+
+    changed?.({ swallowActivationClick: true });
+    initial.resolve({ swallowActivationClick: false });
+    await initial.promise;
+    await Promise.resolve();
+
+    expect(readActivationClickPreference()).toBe(true);
+    disconnect();
+  });
+
+  it("retires late reads and hints when the bridge is disposed or replaced", async () => {
+    const firstRead = deferred<{ readonly swallowActivationClick: boolean }>();
+    let firstChanged: ((settings: { readonly swallowActivationClick: boolean }) => void) | undefined;
+    const firstUnsubscribe = vi.fn();
+    const disconnectFirst = connectDesktopActivationClickPreference(desktopActivationClickApi(
+      () => firstRead.promise,
+      (listener) => {
+        firstChanged = listener;
+        return firstUnsubscribe;
+      }
+    ));
+    disconnectFirst();
+
+    let secondChanged: ((settings: { readonly swallowActivationClick: boolean }) => void) | undefined;
+    const disconnectSecond = connectDesktopActivationClickPreference(desktopActivationClickApi(
+      async () => ({ swallowActivationClick: true }),
+      (listener) => {
+        secondChanged = listener;
+        return vi.fn();
+      }
+    ));
+    secondChanged?.({ swallowActivationClick: true });
+    firstChanged?.({ swallowActivationClick: false });
+    firstRead.resolve({ swallowActivationClick: false });
+    await firstRead.promise;
+    await Promise.resolve();
+
+    expect(firstUnsubscribe).toHaveBeenCalledTimes(1);
+    expect(readActivationClickPreference()).toBe(true);
+    disconnectFirst();
+    expect(firstUnsubscribe).toHaveBeenCalledTimes(1);
+    disconnectSecond();
   });
 });

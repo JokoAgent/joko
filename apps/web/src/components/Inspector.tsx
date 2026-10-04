@@ -1101,10 +1101,10 @@ export function Inspector({ controller, snapshot, session, workspace, timeline, 
             onRefresh={() => setBackgroundHistoryRefresh((value) => value + 1)}
             canCancel={canCancelBackgroundTasks}
             onCancel={(backgroundTaskId) => controller.cancelBackgroundTask(session.id, backgroundTaskId)}
-            locale={controller.state.preferences.locale}
+            locale={controller.state.effectiveLocale}
             t={t}
           />}
-          {tab.kind === "subagents" && canSubagents && <SubagentsPanel controller={controller} sessionId={session.id} focusRunId={subagentFocusRequest?.sessionId === session.id ? subagentFocusRequest.runId : undefined} focusRequestId={subagentFocusRequest?.sessionId === session.id ? subagentFocusRequest.requestId : undefined} locale={controller.state.preferences.locale} t={t} runAction={runAction} />}
+          {tab.kind === "subagents" && canSubagents && <SubagentsPanel controller={controller} sessionId={session.id} focusRunId={subagentFocusRequest?.sessionId === session.id ? subagentFocusRequest.runId : undefined} focusRequestId={subagentFocusRequest?.sessionId === session.id ? subagentFocusRequest.requestId : undefined} locale={controller.state.effectiveLocale} t={t} runAction={runAction} />}
           {tab.kind === "shell" && canUserShell && <InspectorShellPanel controller={controller} session={session} timeline={timeline} t={t} runAction={runAction} />}
           {tab.kind === "terminal" && terminalCapabilities !== undefined && <Suspense fallback={<p role="status">{t("terminal.connecting")}</p>}><InteractiveTerminalPanel controller={controller} sessionId={session.id} terminalId={tab.id} active={open && tab.id === bucket.activeTabId} capabilities={terminalCapabilities} t={t} onState={(value) => setTerminalRecords((current) => current[value.id]?.generation === value.generation && current[value.id]?.status === value.status && current[value.id]?.shellLabel === value.shellLabel ? current : { ...current, [value.id]: value })} /></Suspense>}
           {tab.kind === "simulator" && <SimulatorViewerPanel controller={controller} sessionId={session.id} active={open && tab.id === bucket.activeTabId} viewportRef={inspectorBodyRef} t={t} />}
@@ -1116,10 +1116,10 @@ export function Inspector({ controller, snapshot, session, workspace, timeline, 
             runtimeState={runtimeToolState}
             runtimeError={runtimeToolError}
             onRefreshRuntime={() => setRuntimeToolRefresh((value) => value + 1)}
-            locale={controller.state.preferences.locale}
+            locale={controller.state.effectiveLocale}
             t={t}
           />}
-          {tab.kind === "browser" && canBrowser && <BrowserPanel controller={controller} browsers={snapshot.browsers} browserSettings={snapshot.settings.browsers} session={session} commentSessions={browserCommentSessions} locale={controller.state.preferences.locale} focusRequest={gamepadBrowserFocusRequest?.sessionId === session.id ? gamepadBrowserFocusRequest : browserFocusRequest?.sessionId === session.id ? browserFocusRequest : undefined} t={t} runAction={runAction} />}
+          {tab.kind === "browser" && canBrowser && <BrowserPanel controller={controller} browsers={snapshot.browsers} browserSettings={snapshot.settings.browsers} session={session} commentSessions={browserCommentSessions} locale={controller.state.effectiveLocale} focusRequest={gamepadBrowserFocusRequest?.sessionId === session.id ? gamepadBrowserFocusRequest : browserFocusRequest?.sessionId === session.id ? browserFocusRequest : undefined} t={t} runAction={runAction} />}
         </InspectorTabErrorBoundary></div>)}
       </div>
     </aside>
@@ -1281,7 +1281,7 @@ function ContextPanel({ controller, backend, session, queue, tasks, t, runAction
   const context = session.context;
   const capacityPercent = context === undefined || context.contextWindow === 0 ? 0 : Math.min(100, context.usedTokens / context.contextWindow * 100);
   const usageSupported = backend?.capabilities.get("context.usage")?.supported === true;
-  const usage = resolveSessionUsageDisplay(session.usage, usageSupported, controller.state.preferences.locale);
+  const usage = resolveSessionUsageDisplay(session.usage, usageSupported, controller.state.effectiveLocale);
   return (
     <div className="inspector-panel">
       <section className="inspector-section">
@@ -2166,7 +2166,7 @@ function ChangesPanel({ controller, session, workspace, focusRequest, canDiff, c
           <header><h2>{t("workspace.rewind")}</h2><span className="section-count">{changeSets.length}</span></header>
           <div className="rewind-card"><ShieldAlert aria-hidden="true" /><div><strong>{t("workspace.previewRestore")}</strong><p>{t("workspace.rewindWarning")}</p></div></div>
           {loading && <Spinner label={t("common.loading")} />}
-          {changeSets.length === 0 ? <p className="muted">{t("workspace.noChangeSets")}</p> : <ul className="change-set-list">{[...changeSets].sort((left, right) => right.capturedAt - left.capturedAt).map((changeSet) => <li key={changeSet.id}><div><strong>{t("workspace.changeCount", { count: changeSet.changeCount })}</strong><span>{formatRelativeTime(changeSet.capturedAt, controller.state.preferences.locale)} · {shortValue(changeSet.runId)}</span></div><Button onClick={() => openPreview(changeSet)}>{t("workspace.previewAction")}</Button></li>)}</ul>}
+          {changeSets.length === 0 ? <p className="muted">{t("workspace.noChangeSets")}</p> : <ul className="change-set-list">{[...changeSets].sort((left, right) => right.capturedAt - left.capturedAt).map((changeSet) => <li key={changeSet.id}><div><strong>{t("workspace.changeCount", { count: changeSet.changeCount })}</strong><span>{formatRelativeTime(changeSet.capturedAt, controller.state.effectiveLocale)} · {shortValue(changeSet.runId)}</span></div><Button onClick={() => openPreview(changeSet)}>{t("workspace.previewAction")}</Button></li>)}</ul>}
         </section>}
       </div>
       <Modal open={preview !== undefined} title={t("workspace.previewTitle")} description={t("workspace.previewDescription")} closeLabel={t("common.close")} size="large" onClose={() => setPreview(undefined)}>

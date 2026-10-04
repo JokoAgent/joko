@@ -208,6 +208,8 @@ function controllerState(): ControllerState {
     snapshot: emptySnapshot(),
     route: { kind: "session", sessionId: "session-a" },
     preferences: DEFAULT_UI_PREFERENCES,
+    systemLocale: "en",
+    effectiveLocale: "en",
     extensionNotifications: []
   };
 }

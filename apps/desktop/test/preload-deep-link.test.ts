@@ -2,11 +2,16 @@ import { readFileSync } from "node:fs";
 import { runInNewContext } from "node:vm";
 import { ModuleKind, ScriptTarget, transpileModule } from "typescript";
 import { describe, expect, it, vi } from "vitest";
+import { DESKTOP_CHANNELS } from "../src/channels.js";
 
 interface DeepLinkApi {
   takePending(): Promise<unknown>;
   acknowledge(value: unknown): Promise<boolean>;
   onNavigate(listener: (delivery: unknown) => void): () => void;
+}
+
+interface KeepAwakeApi {
+  onKeepAwakeChanged(listener: (settings: { readonly enabled: boolean }) => void): () => void;
 }
 
 const MAIN_DOCUMENT_CLAIM = "00000000-0000-4000-8000-000000000001";
@@ -24,10 +29,12 @@ function loadPreload(
   crypto: {
     readonly randomUUID?: () => string;
     readonly getRandomValues?: (bytes: Uint8Array) => Uint8Array;
-  } = { randomUUID: () => MAIN_DOCUMENT_CLAIM }
+  } = { randomUUID: () => MAIN_DOCUMENT_CLAIM },
+  preferredSystemLocale: unknown = "zh-CN"
 ): {
   readonly exposed: Readonly<Record<string, unknown>>;
   readonly deepLinks: DeepLinkApi;
+  readonly power: KeepAwakeApi;
   readonly invoke: ReturnType<typeof vi.fn>;
   readonly synchronousChannels: readonly string[];
   readonly listeners: Map<string, (...parameters: unknown[]) => void>;
@@ -56,7 +63,9 @@ function loadPreload(
         if (channel === "joko:main-document:occurrence:get") {
           expect(parameters).toEqual([MAIN_DOCUMENT_CLAIM]);
         }
-        return channel === "joko:main-document:occurrence:get" ? documentOccurrence : false;
+        if (channel === "joko:main-document:occurrence:get") return documentOccurrence;
+        if (channel === "joko:locale:preferred-system:get") return preferredSystemLocale;
+        return false;
       },
       invoke,
       send: vi.fn(),
@@ -95,10 +104,14 @@ function loadPreload(
     ArrayBuffer,
     structuredClone
   });
-  const desktop = exposed as Readonly<Record<string, unknown>> & { readonly deepLinks: DeepLinkApi };
+  const desktop = exposed as Readonly<Record<string, unknown>> & {
+    readonly deepLinks: DeepLinkApi;
+    readonly power: KeepAwakeApi;
+  };
   return {
     exposed: desktop,
     deepLinks: desktop.deepLinks,
+    power: desktop.power,
     invoke,
     synchronousChannels,
     listeners,
@@ -112,7 +125,8 @@ describe("main application preload deep-link occurrence fence", () => {
 
     expect(loaded.synchronousChannels).toEqual([
       "joko:main-document:occurrence:get",
-      "joko:native-task-status:availability:get"
+      "joko:native-task-status:availability:get",
+      "joko:locale:preferred-system:get"
     ]);
     expect(Reflect.has(loaded.exposed, "mainDocumentOccurrence")).toBe(false);
     expect(Reflect.has(loaded.exposed, "mainDocumentOccurrenceGet")).toBe(false);
@@ -159,5 +173,79 @@ describe("main application preload deep-link occurrence fence", () => {
       documentOccurrence: "document-current",
       deliveryOccurrence: 2
     })).resolves.toBe(true);
+  });
+});
+
+describe("main application preload preferred system locale", () => {
+  it("exposes only the strict effective locale from the synchronous host projection", () => {
+    const loaded = loadPreload("document-current");
+
+    expect(DESKTOP_CHANNELS.preferredSystemLocaleGet).toBe("joko:locale:preferred-system:get");
+    expect(loaded.exposed["preferredSystemLocale"]).toBe("zh-CN");
+    expect(Object.isFrozen(loaded.exposed)).toBe(true);
+    expect(Reflect.has(loaded.exposed, "setPreferredSystemLocale")).toBe(false);
+  });
+
+  it.each(["system", "en-XA", "ja", ["zh-CN"], null])(
+    "fails closed instead of exposing malformed host locale %j",
+    (locale) => {
+      const loaded = loadPreload("document-current", { randomUUID: () => MAIN_DOCUMENT_CLAIM }, locale);
+      expect(loaded.exposed["preferredSystemLocale"]).toBe("en");
+    }
+  );
+});
+
+describe("main application preload update settings observers", () => {
+  it.each([
+    ["onAutoRelaunchSettings", DESKTOP_CHANNELS.updateAutoRelaunchSettingsChanged, { autoRelaunchOnIdle: true, isCustomized: true, defaultAutoRelaunchOnIdle: false }],
+    ["onChannelSettings", DESKTOP_CHANNELS.updateChannelSettingsChanged, { enableBeta: true, isCustomized: true, defaultEnableBeta: false }]
+  ] as const)("validates and retires %s messages", (method, channel, settings) => {
+    const loaded = loadPreload("document-current");
+    const updates = loaded.exposed["updates"] as Record<typeof method, (listener: (value: unknown) => void) => () => void>;
+    const listener = vi.fn();
+    const unsubscribe = updates[method](listener);
+    const wrapped = loaded.listeners.get(channel);
+    expect(wrapped).toBeTypeOf("function");
+    wrapped?.({}, settings);
+    expect(listener).toHaveBeenCalledExactlyOnceWith(settings);
+    wrapped?.({}, { ...settings, isCustomized: "true" });
+    wrapped?.({}, { ...settings, extra: true });
+    wrapped?.({}, null);
+    expect(listener).toHaveBeenCalledTimes(1);
+    unsubscribe();
+    expect(loaded.listeners.has(channel)).toBe(false);
+  });
+});
+
+describe("main application preload keep-awake observer", () => {
+  it("delivers only exact keep-awake settings and removes the wrapped listener", () => {
+    const loaded = loadPreload("document-current");
+    const listener = vi.fn();
+    const unsubscribe = loaded.power.onKeepAwakeChanged(listener);
+
+    expect(DESKTOP_CHANNELS.keepAwakeChanged).toBe("joko:power:keep-awake:changed");
+    const wrapped = loaded.listeners.get(DESKTOP_CHANNELS.keepAwakeChanged);
+    expect(wrapped).toBeTypeOf("function");
+
+    wrapped?.({}, { enabled: true });
+    expect(listener).toHaveBeenCalledExactlyOnceWith({ enabled: true });
+
+    wrapped?.({}, { enabled: "true" });
+    wrapped?.({}, { enabled: false, unexpected: true });
+    wrapped?.({}, null);
+    expect(listener).toHaveBeenCalledTimes(1);
+
+    unsubscribe();
+    expect(loaded.listeners.has(DESKTOP_CHANNELS.keepAwakeChanged)).toBe(false);
+    loaded.listeners.get(DESKTOP_CHANNELS.keepAwakeChanged)?.({}, { enabled: false });
+    expect(listener).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects a non-function keep-awake listener before registering IPC", () => {
+    const loaded = loadPreload("document-current");
+    const subscribe = loaded.power.onKeepAwakeChanged as unknown as (listener: unknown) => () => void;
+
+    expect(() => subscribe(null)).toThrow(/listener must be a function/u);
+    expect(loaded.listeners.has(DESKTOP_CHANNELS.keepAwakeChanged)).toBe(false);
   });
 });

@@ -83,6 +83,18 @@ describe("mobile image output", () => {
     expect(driver.removeTemporary).not.toHaveBeenCalled();
   });
 
+  it("cleans a retired source before dispatch and retains unknown native sharing without replay", async () => {
+    const retired = createDriver();
+    await expect(new MobileImageOutput(retired).perform("share", pngSource(), undefined, undefined,
+      () => { throw new Error("source removed"); })).rejects.toThrow("source removed");
+    expect(retired.shareImage).not.toHaveBeenCalled();
+    expect(retired.removeTemporary).toHaveBeenCalledWith(temporary);
+    const unknown = createDriver({ shareImage: vi.fn(async () => { throw new Error("native response lost"); }) });
+    await expect(new MobileImageOutput(unknown).perform("share", pngSource())).rejects.toThrow("native response lost");
+    expect(unknown.shareImage).toHaveBeenCalledTimes(1);
+    expect(unknown.removeTemporary).not.toHaveBeenCalled();
+  });
+
   it("permits only one output action at a time", async () => {
     let release: (() => void) | undefined;
     const driver = createDriver({

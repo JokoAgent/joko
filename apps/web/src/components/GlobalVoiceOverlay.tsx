@@ -3,6 +3,7 @@ import { useEffect, useState, type JSX } from "react";
 
 import { translate, type MessageKey } from "../i18n.js";
 import type { Locale } from "../model.js";
+import { readHostSystemLocale } from "../system-locale.js";
 import { IconButton } from "./ui.js";
 
 const ERROR_KEYS: Readonly<Record<Extract<JokoDesktopGlobalVoiceStatus, { readonly state: "error" }>["errorKind"], MessageKey>> = Object.freeze({
@@ -17,7 +18,7 @@ const ERROR_KEYS: Readonly<Record<Extract<JokoDesktopGlobalVoiceStatus, { readon
 export function GlobalVoiceOverlay({ initialStatus = { state: "idle", generation: "0" } }: { readonly initialStatus?: JokoDesktopGlobalVoiceStatus }): JSX.Element {
   const api = window.jokoVoiceOverlay;
   const [status, setStatus] = useState<JokoDesktopGlobalVoiceStatus>(initialStatus);
-  const locale = overlayLocale();
+  const [locale, setLocale] = useState<Locale>(() => readHostSystemLocale(window));
   const t = (key: MessageKey): string => translate(locale, key);
   useEffect(() => {
     document.body.classList.add("global-voice-overlay-host");
@@ -34,6 +35,23 @@ export function GlobalVoiceOverlay({ initialStatus = { state: "idle", generation
     });
     return () => {
       active = false;
+      unsubscribe();
+    };
+  }, [api]);
+  useEffect(() => {
+    if (api === undefined) return;
+    let live = true;
+    let revision = 0;
+    const unsubscribe = api.onLocale((value) => {
+      revision += 1;
+      if (live) setLocale(value);
+    });
+    const initialRevision = revision;
+    void api.getLocale().then((value) => {
+      if (live && revision === initialRevision) setLocale(value);
+    }).catch(() => undefined);
+    return () => {
+      live = false;
       unsubscribe();
     };
   }, [api]);
@@ -65,9 +83,4 @@ export function GlobalVoiceOverlay({ initialStatus = { state: "idle", generation
       {status.state === "listening" && <div className="global-voice-overlay__meter" aria-hidden="true"><i /><i /><i /><i /><i /></div>}
     </section>
   </main>;
-}
-
-function overlayLocale(): Locale {
-  if (typeof navigator !== "undefined" && navigator.language.toLocaleLowerCase().startsWith("zh")) return "zh-CN";
-  return "en";
 }

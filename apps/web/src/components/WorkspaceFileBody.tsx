@@ -206,7 +206,7 @@ const WorkspaceFileBodyContent = forwardRef<WorkspaceFileBodyHandle, WorkspaceFi
     artifactOwnerRef.current = { acquire: controller.getArtifactUrl, release: controller.releaseArtifactUrl, generation: artifactOwnerRef.current.generation + 1 };
   }
   const imageOwnerKey = JSON.stringify([controller.state.activeProfile?.serverId, controller.state.activeProfile?.id, sessionId, workspaceId, path, artifactOwnerRef.current.generation]);
-  const labels = useWorkspaceFileBodyLabels(controller.state.preferences.locale, labelOverrides);
+  const labels = useWorkspaceFileBodyLabels(controller.state.effectiveLocale, labelOverrides);
   const controllerRef = useRef(controller);
   controllerRef.current = controller;
   const selectedPathRef = useRef(path);
@@ -578,7 +578,7 @@ const WorkspaceFileBodyContent = forwardRef<WorkspaceFileBodyHandle, WorkspaceFi
         name={textPreview.name}
         theme={controller.state.preferences.theme}
         xml={textPreview.text ?? ""}
-        metadata={workspaceFileMetadata(textPreview, controller.state.preferences.locale)}
+        metadata={workspaceFileMetadata(textPreview, controller.state.effectiveLocale)}
         loadingLabel={labels.drawioRendering}
         unavailableLabel={labels.drawioUnavailable}
         retryLabel={labels.retry}
@@ -761,7 +761,7 @@ function AuthenticatedImagePreview({ ownerKey, controller, preview, labels, onSe
         onClick={() => setOpen(true)}
       ><img src={artifact.url} alt={preview.name} /></button>}
     </div>
-    <FileMeta preview={preview} locale={controller.state.preferences.locale} />
+    <FileMeta preview={preview} locale={controller.state.effectiveLocale} />
     <DownloadAction controller={controller} preview={preview} labels={labels} />
     {open && artifact.status === "ready" && <WorkspaceImageLightbox
       ownerKey={JSON.stringify([ownerKey, preview.blobId])}
@@ -787,7 +787,7 @@ function AuthenticatedAudioPreview({ ownerKey, controller, preview, labels, clas
   readonly className?: string;
 }): JSX.Element {
   const artifact = useAuthenticatedArtifactUrl(controller, preview.blobId);
-  const locale = controller.state.preferences.locale;
+  const locale = controller.state.effectiveLocale;
   return <section className={cx("workspace-file-body workspace-file-body--media", className)} data-file-kind="audio">
     <div className="workspace-file-body__media-stage">
       {artifact.status === "error" ? <span className="audio-preview__feedback is-error" role="alert">{labels.unavailable}</span>
@@ -812,7 +812,7 @@ function AuthenticatedVideoPreview({ ownerKey, controller, preview, labels, clas
 }): JSX.Element {
   const artifact = useAuthenticatedArtifactUrl(controller, preview.blobId);
   const [failedUrl, setFailedUrl] = useState<string>();
-  const locale = controller.state.preferences.locale;
+  const locale = controller.state.effectiveLocale;
   if (artifact.status === "error" || (artifact.status === "ready" && failedUrl === artifact.url)) {
     return <BinaryFilePlaceholder controller={controller} preview={preview} labels={labels} className={className} />;
   }
@@ -826,7 +826,7 @@ function AuthenticatedVideoPreview({ ownerKey, controller, preview, labels, clas
         onError={() => setFailedUrl(artifact.url)}
       />}
     </div>
-    <FileMeta preview={preview} locale={controller.state.preferences.locale} />
+    <FileMeta preview={preview} locale={controller.state.effectiveLocale} />
     <DownloadAction controller={controller} preview={preview} labels={labels} />
   </section>;
 }
@@ -865,7 +865,7 @@ function AuthenticatedModelPreview({ controller, workspaceId, preview, labels, c
         ><Maximize2 aria-hidden="true" /></IconButton>
       </div>}
     </div>
-    <FileMeta preview={preview} locale={controller.state.preferences.locale} />
+    <FileMeta preview={preview} locale={controller.state.effectiveLocale} />
     <DownloadAction controller={controller} preview={preview} labels={labels} />
     {open && artifact.status === "ready" && <WorkspaceModelLightbox
       src={artifact.url}
@@ -902,7 +902,7 @@ function AuthenticatedPdfPreview({ controller, preview, labels, className }: {
       />}
     </div>
     <div className="workspace-file-body__pdf-footer">
-      <FileMeta preview={preview} locale={controller.state.preferences.locale} />
+      <FileMeta preview={preview} locale={controller.state.effectiveLocale} />
       <DownloadAction controller={controller} preview={preview} labels={labels} />
     </div>
   </section>;
@@ -918,7 +918,7 @@ function BinaryFilePlaceholder({ controller, preview, labels, className }: {
   const Icon = iconKind === "markdown" ? FileText : iconKind === "code" ? FileCode2 : iconKind === "image" ? FileImage : File;
   return <section className={cx("workspace-file-body workspace-file-body--unsupported", className)} data-file-kind={preview.kind}>
     <span className="workspace-file-body__file-icon" aria-hidden="true"><Icon /></span>
-    <div><strong>{preview.name}</strong><FileMeta preview={preview} locale={controller.state.preferences.locale} includeName={false} fallbackType={labels.binary} /><p>{preview.summary || labels.unavailable}</p></div>
+    <div><strong>{preview.name}</strong><FileMeta preview={preview} locale={controller.state.effectiveLocale} includeName={false} fallbackType={labels.binary} /><p>{preview.summary || labels.unavailable}</p></div>
     <DownloadAction controller={controller} preview={preview} labels={labels} />
   </section>;
 }
@@ -951,7 +951,7 @@ function DownloadAction({ controller, preview, labels }: {
 
 function FileMeta({ preview, locale, includeName = true, fallbackType }: {
   readonly preview: WorkspaceFilePreviewView;
-  readonly locale: AppController["state"]["preferences"]["locale"];
+  readonly locale: AppController["state"]["effectiveLocale"];
   readonly includeName?: boolean;
   readonly fallbackType?: string;
 }): JSX.Element {
@@ -965,7 +965,7 @@ function FileMeta({ preview, locale, includeName = true, fallbackType }: {
 
 function workspaceFileMetadata(
   preview: WorkspaceFilePreviewView,
-  locale: AppController["state"]["preferences"]["locale"]
+  locale: AppController["state"]["effectiveLocale"]
 ): readonly string[] {
   return [
     preview.byteSize === undefined ? undefined : formatWorkspaceFileBytes(preview.byteSize),
@@ -1196,7 +1196,7 @@ export function formatWorkspaceFileMtime(value: number): string {
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
 }
 
-function useWorkspaceFileBodyLabels(locale: AppController["state"]["preferences"]["locale"], overrides: Partial<WorkspaceFileBodyLabels> | undefined): WorkspaceFileBodyLabels {
+function useWorkspaceFileBodyLabels(locale: AppController["state"]["effectiveLocale"], overrides: Partial<WorkspaceFileBodyLabels> | undefined): WorkspaceFileBodyLabels {
   return useMemo(() => ({
     selectFile: translate(locale, "workspace.noSelection"),
     loading: translate(locale, "workspace.loadingPreview"),

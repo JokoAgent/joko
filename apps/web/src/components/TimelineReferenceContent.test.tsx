@@ -392,7 +392,8 @@ function assetController(read: AppController["readWorkspaceFile"], acquire: AppC
   const state: ControllerState = {
     ready: true, connectionState: "connected", profiles: [], machineCaches: [], machinePresenceByProfile: {},
     discoveredNodes: [], discoveryState: "idle", managedOrchestratorStatus: undefined, automaticConnectionAvailable: false,
-    snapshot: emptySnapshot(), route: { kind: "session", sessionId: "session" }, preferences: DEFAULT_UI_PREFERENCES, extensionNotifications: []
+    snapshot: emptySnapshot(), route: { kind: "session", sessionId: "session" }, preferences: DEFAULT_UI_PREFERENCES,
+    systemLocale: "en", effectiveLocale: "en", extensionNotifications: []
   };
   return { read: readWorkspaceFile, acquire: getArtifactUrl, release: releaseArtifactUrl, value: { state, readWorkspaceFile, getArtifactUrl, releaseArtifactUrl, getPortableReplacementCleanup: async () => undefined } as unknown as AppController };
 }

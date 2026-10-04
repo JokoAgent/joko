@@ -138,12 +138,49 @@ function buildModelViewerRuntimeModule(src, filename) {
   })};`;
 }
 
+function buildRichMarkdownRuntimeModule(src, filename) {
+  if (path.basename(filename) !== "rich-markdown-runtime.richjs") {
+    throw new Error("The mobile rich Markdown runtime entry is invalid.");
+  }
+  const mermaidManifest = nearestPackageManifest(require.resolve("mermaid"));
+  const katexRoot = path.dirname(require.resolve("katex/package.json"));
+  const katexManifest = JSON.parse(fs.readFileSync(path.join(katexRoot, "package.json"), "utf8"));
+  const highlightManifest = nearestPackageManifest(require.resolve("highlight.js"));
+  if (mermaidManifest.version !== "11.16.0" || katexManifest.version !== "0.16.47"
+    || highlightManifest.version !== "11.11.1") throw new Error("The mobile rich Markdown runtime versions are not pinned.");
+  const result = esbuild.buildSync({
+    stdin: { contents: src, loader: "js", resolveDir: path.dirname(filename), sourcefile: filename },
+    bundle: true, format: "iife", platform: "browser", target: ["chrome90", "safari15"],
+    legalComments: "inline", minify: true, write: false
+  });
+  const script = result.outputFiles?.[0]?.text;
+  if (!script || script.length > 8_000_000 || !script.includes("jokoMermaid")) {
+    throw new Error("The mobile rich Markdown runtime bundle is invalid.");
+  }
+  const katexCss = fs.readFileSync(path.join(katexRoot, "dist", "katex.min.css"), "utf8")
+    .replace(/url\(([^)]+)\)/gu, (_match, raw) => {
+      const resource = raw.replace(/["']/gu, "");
+      if (!/^fonts\/KaTeX_[A-Za-z0-9_-]+\.(woff2?|ttf)$/u.test(resource)) {
+        throw new Error("The mobile KaTeX font path is invalid.");
+      }
+      const extension = path.extname(resource).slice(1);
+      const mime = extension === "ttf" ? "font/ttf" : `font/${extension}`;
+      return `url(data:${mime};base64,${fs.readFileSync(path.join(katexRoot, "dist", resource)).toString("base64")})`;
+    });
+  return `module.exports = ${JSON.stringify({
+    mermaidVersion: mermaidManifest.version, katexVersion: katexManifest.version,
+    highlightVersion: highlightManifest.version, mermaidScript: script,
+    katexScript: fs.readFileSync(path.join(katexRoot, "dist", "katex.min.js"), "utf8"), katexCss
+  })};`;
+}
+
 module.exports.transform = ({ src, filename, options }) => {
   const transformed = filename.endsWith(".svg")
     ? `module.exports = ${JSON.stringify(src)};`
     : filename.endsWith(".pdfjs") ? buildPdfJsRuntimeModule(src, filename)
-      : filename.endsWith(".modeljs") ? buildModelViewerRuntimeModule(src, filename) : src;
+      : filename.endsWith(".modeljs") ? buildModelViewerRuntimeModule(src, filename)
+        : filename.endsWith(".richjs") ? buildRichMarkdownRuntimeModule(src, filename) : src;
   return upstreamTransformer.transform({ src: transformed, filename, options });
 };
 
-module.exports.testing = { buildModelViewerRuntimeModule, buildPdfJsRuntimeModule, expectedStandardFonts };
+module.exports.testing = { buildModelViewerRuntimeModule, buildPdfJsRuntimeModule, buildRichMarkdownRuntimeModule, expectedStandardFonts };

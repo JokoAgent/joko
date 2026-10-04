@@ -26,6 +26,10 @@ export interface TimelineRow {
   readonly eventId: string;
   readonly kind: "user" | "assistant" | "system" | "tool" | "status" | "error" | "activity";
   readonly completed: boolean;
+  /** Exact durable send identity; present only on canonical accepted user input. */
+  readonly operationId?: string;
+  /** Page-local presentation only; never sourced from or written to durable events. */
+  readonly optimistic?: boolean;
   readonly quoteSource?: {
     readonly sourceMessageId: string;
     readonly sourceEventId: string;
@@ -64,6 +68,9 @@ export function timelineRows(events: readonly Event[]): TimelineRow[] {
         byId.set(message.messageId, { id: message.messageId, label: roleLabel(message.role),
           text: mobileInputSummary(message.userInput, message.userInputAccepted) || "…", sequence, eventId: event.eventId,
           kind: roleKind(message.role), completed: message.role === MessageRole.USER && message.userInputAccepted,
+          ...(message.role === MessageRole.USER && message.userInputAccepted && event.identity?.operationId
+            ? { operationId: event.identity.operationId }
+            : {}),
           ...(images.length === 0 ? {} : { images }) });
         break;
       }
@@ -98,6 +105,7 @@ export function timelineRows(events: readonly Event[]): TimelineRow[] {
         byId.set(message.messageId, { id: message.messageId, label: previous?.label || roleLabel(message.role),
           text: acceptedInput || blocks.join("\n") || previous?.text || "Completed", sequence: previous?.sequence ?? sequence,
           eventId: event.eventId, kind: roleKind(message.role), completed: true,
+          ...(previous?.operationId === undefined ? {} : { operationId: previous.operationId }),
           ...(quoteText?.trim() ? { quoteSource: {
             sourceMessageId: message.messageId,
             sourceEventId: event.eventId,

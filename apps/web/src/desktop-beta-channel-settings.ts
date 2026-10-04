@@ -91,14 +91,16 @@ export function useDesktopBetaChannelSettings(): {
   const pendingRequestRef = useRef<PendingRequest | undefined>(undefined);
   const latestSettingsRef = useRef<JokoDesktopUpdateChannelSettings>(DEFAULT_SETTINGS);
   const settingsRevisionRef = useRef(0);
+  const ownerEpochRef = useRef(0);
+  const mutationFlightRef = useRef<object | undefined>(undefined);
 
-  const requestSettings = useCallback(async (): Promise<void> => {
+  const requestSettings = useCallback(async (initialRevision?: number): Promise<void> => {
     const api = activeApiRef.current;
-    if (api === undefined) return;
+    if (api === undefined || mutationFlightRef.current !== undefined) return;
     const requestEpoch = ++requestEpochRef.current;
-    const settingsRevision = settingsRevisionRef.current;
+    const settingsRevision = initialRevision ?? settingsRevisionRef.current;
     pendingRequestRef.current = undefined;
-    setState(LOADING_STATE);
+    if (settingsRevisionRef.current === settingsRevision) setState(LOADING_STATE);
     try {
       const settings = normalizeSettings(await api.getChannelSettings());
       if (settings === undefined) {
@@ -128,6 +130,10 @@ export function useDesktopBetaChannelSettings(): {
   useEffect(() => {
     const api = desktopBetaChannelApi();
     activeApiRef.current = api;
+    const ownerEpoch = ++ownerEpochRef.current;
+    const initialRevision = settingsRevisionRef.current;
+    mutationFlightRef.current = undefined;
+    setState(api === undefined ? UNAVAILABLE_STATE : LOADING_STATE);
     if (api === undefined) {
       requestEpochRef.current += 1;
       pendingRequestRef.current = undefined;
@@ -136,12 +142,9 @@ export function useDesktopBetaChannelSettings(): {
     }
 
     let unsubscribe: (() => void) | undefined;
-    // Start hydration before subscribing so even a synchronous initial push
-    // is newer than (and therefore supersedes) the get response.
-    void requestSettings();
     try {
       unsubscribe = api.onChannelSettings((payload) => {
-        if (activeApiRef.current !== api) return;
+        if (activeApiRef.current !== api || ownerEpochRef.current !== ownerEpoch) return;
         const settings = normalizeSettings(payload);
         if (settings === undefined) {
           requestEpochRef.current += 1;
@@ -161,24 +164,29 @@ export function useDesktopBetaChannelSettings(): {
         const requestStillPending = pendingRequestRef.current !== undefined;
         setState((current) => ({
           ...readyState(settings),
-          saving: requestStillPending && current.saving,
+          saving: mutationFlightRef.current !== undefined && current.saving,
           restarting: requestStillPending && current.restarting,
           restartPrompt: settings.enableBeta ? current.restartPrompt : undefined
         }));
       });
+      void requestSettings(initialRevision);
     } catch {
       requestEpochRef.current += 1;
       setState({ ...LOADING_STATE, loading: false, error: "load" });
       return () => {
+        ownerEpochRef.current += 1;
         if (activeApiRef.current === api) activeApiRef.current = undefined;
         requestEpochRef.current += 1;
         pendingRequestRef.current = undefined;
+        mutationFlightRef.current = undefined;
       };
     }
     return () => {
+      ownerEpochRef.current += 1;
       if (activeApiRef.current === api) activeApiRef.current = undefined;
       requestEpochRef.current += 1;
       pendingRequestRef.current = undefined;
+      mutationFlightRef.current = undefined;
       try {
         unsubscribe?.();
       } catch {
@@ -187,132 +195,179 @@ export function useDesktopBetaChannelSettings(): {
     };
   }, [initialApi, requestSettings]);
 
+  const recoverSettings = useCallback(async (
+    api: DesktopBetaChannelApi,
+    requestEpoch: number,
+    error: "save" | "reset"
+  ): Promise<void> => {
+    const recoveryRevision = settingsRevisionRef.current;
+    try {
+      const settings = normalizeSettings(await api.getChannelSettings());
+      if (settings === undefined) throw new TypeError("Invalid update channel settings.");
+      if (!requestIsCurrent(api, requestEpoch, activeApiRef, requestEpochRef)) return;
+      if (settingsRevisionRef.current === recoveryRevision) {
+        latestSettingsRef.current = settings;
+        setState({ ...readyState(settings), saving: true, error });
+      } else {
+        setState((current) => ({ ...current, error }));
+      }
+    } catch {
+      if (!requestIsCurrent(api, requestEpoch, activeApiRef, requestEpochRef)) return;
+      setState((current) => ({
+        ...current,
+        error: settingsRevisionRef.current === recoveryRevision ? "load" : error
+      }));
+    }
+  }, []);
+
   const setEnableBeta = useCallback(async (enabled: boolean): Promise<void> => {
     const api = activeApiRef.current;
-    if (api === undefined) return;
-    const requestEpoch = ++requestEpochRef.current;
-    pendingRequestRef.current = { epoch: requestEpoch, expectedEnableBeta: enabled };
-    setState((current) => current.available
-      ? {
-        ...current,
-        loading: false,
-        saving: true,
-        restarting: false,
-        error: undefined,
-        notice: undefined,
-        restartPrompt: undefined
-      }
-      : current);
+    if (api === undefined || mutationFlightRef.current !== undefined || stateRef.current.loading
+      || stateRef.current.error === "load" || stateRef.current.restarting) return;
+    const flight = {};
+    const ownerEpoch = ownerEpochRef.current;
+    mutationFlightRef.current = flight;
+    try {
+      const requestEpoch = ++requestEpochRef.current;
+      pendingRequestRef.current = { epoch: requestEpoch, expectedEnableBeta: enabled };
+      setState((current) => current.available
+        ? {
+          ...current,
+          loading: false,
+          saving: true,
+          restarting: false,
+          error: undefined,
+          notice: undefined,
+          restartPrompt: undefined
+        }
+        : current);
 
-    if (enabled) {
-      try {
-        const result = await api.probeBetaChannel();
-        if (!requestIsCurrent(api, requestEpoch, activeApiRef, requestEpochRef)) return;
-        if (result?.available !== true) {
+      if (enabled) {
+        try {
+          const result = await api.probeBetaChannel();
+          if (!requestIsCurrent(api, requestEpoch, activeApiRef, requestEpochRef)) return;
+          if (result?.available !== true) {
+            finishPendingRequest(requestEpoch, pendingRequestRef);
+            setState((current) => ({ ...current, saving: false, error: "unavailable" }));
+            return;
+          }
+        } catch {
+          if (!requestIsCurrent(api, requestEpoch, activeApiRef, requestEpochRef)) return;
           finishPendingRequest(requestEpoch, pendingRequestRef);
           setState((current) => ({ ...current, saving: false, error: "unavailable" }));
           return;
         }
-      } catch {
-        if (!requestIsCurrent(api, requestEpoch, activeApiRef, requestEpochRef)) return;
-        finishPendingRequest(requestEpoch, pendingRequestRef);
-        setState((current) => ({ ...current, saving: false, error: "unavailable" }));
-        return;
       }
-    }
 
-    try {
-      const returnedSettings = normalizeSettings(await api.setBetaChannelEnabled(enabled));
-      if (!requestIsCurrent(api, requestEpoch, activeApiRef, requestEpochRef)) return;
-      const settings = observedSettings(requestEpoch, pendingRequestRef, latestSettingsRef)
-        ?? returnedSettings;
-      finishPendingRequest(requestEpoch, pendingRequestRef);
-      if (settings === undefined || settings.enableBeta !== enabled) {
-        setState((current) => ({ ...current, saving: false, error: "save" }));
-        return;
-      }
-      latestSettingsRef.current = settings;
-      setState({
-        ...readyState(settings),
-        notice: enabled ? undefined : "disabled",
-        restartPrompt: enabled ? "restart" : undefined
-      });
-    } catch {
-      if (!requestIsCurrent(api, requestEpoch, activeApiRef, requestEpochRef)) return;
-      const settings = observedSettings(requestEpoch, pendingRequestRef, latestSettingsRef);
-      finishPendingRequest(requestEpoch, pendingRequestRef);
-      if (settings !== undefined && settings.enableBeta === enabled) {
+      try {
+        const returnedSettings = normalizeSettings(await api.setBetaChannelEnabled(enabled));
+        if (!requestIsCurrent(api, requestEpoch, activeApiRef, requestEpochRef)) return;
+        const settings = observedSettings(requestEpoch, pendingRequestRef, latestSettingsRef)
+          ?? returnedSettings;
+        finishPendingRequest(requestEpoch, pendingRequestRef);
+        if (settings === undefined || settings.enableBeta !== enabled) {
+          setState((current) => ({ ...current, saving: false, error: "save" }));
+          return;
+        }
+        latestSettingsRef.current = settings;
         setState({
           ...readyState(settings),
           notice: enabled ? undefined : "disabled",
           restartPrompt: enabled ? "restart" : undefined
         });
-        return;
+      } catch {
+        if (!requestIsCurrent(api, requestEpoch, activeApiRef, requestEpochRef)) return;
+        const settings = observedSettings(requestEpoch, pendingRequestRef, latestSettingsRef);
+        finishPendingRequest(requestEpoch, pendingRequestRef);
+        if (settings !== undefined && settings.enableBeta === enabled) {
+          setState({
+            ...readyState(settings),
+            notice: enabled ? undefined : "disabled",
+            restartPrompt: enabled ? "restart" : undefined
+          });
+          return;
+        }
+        await recoverSettings(api, requestEpoch, "save");
       }
-      setState((current) => ({ ...current, saving: false, error: "save" }));
+    } finally {
+      if (mutationFlightRef.current === flight) mutationFlightRef.current = undefined;
+      if (activeApiRef.current === api && ownerEpochRef.current === ownerEpoch) {
+        setState((current) => ({ ...current, saving: false }));
+      }
     }
-  }, []);
+  }, [recoverSettings]);
 
   const reset = useCallback(async (): Promise<void> => {
     const api = activeApiRef.current;
-    if (api === undefined) return;
-    const expectedEnableBeta = stateRef.current.defaultEnableBeta;
-    const previousEnableBeta = stateRef.current.enableBeta;
-    const requestEpoch = ++requestEpochRef.current;
-    pendingRequestRef.current = { epoch: requestEpoch, expectedEnableBeta };
-    setState((current) => current.available
-      ? { ...current, saving: true, error: undefined, notice: undefined, restartPrompt: undefined }
-      : current);
-    if (expectedEnableBeta) {
-      try {
-        const result = await api.probeBetaChannel();
-        if (!requestIsCurrent(api, requestEpoch, activeApiRef, requestEpochRef)) return;
-        if (result?.available !== true) {
+    if (api === undefined || mutationFlightRef.current !== undefined || stateRef.current.loading
+      || stateRef.current.error === "load" || stateRef.current.restarting) return;
+    const flight = {};
+    const ownerEpoch = ownerEpochRef.current;
+    mutationFlightRef.current = flight;
+    try {
+      const expectedEnableBeta = stateRef.current.defaultEnableBeta;
+      const previousEnableBeta = stateRef.current.enableBeta;
+      const requestEpoch = ++requestEpochRef.current;
+      pendingRequestRef.current = { epoch: requestEpoch, expectedEnableBeta };
+      setState((current) => current.available
+        ? { ...current, saving: true, error: undefined, notice: undefined, restartPrompt: undefined }
+        : current);
+      if (expectedEnableBeta) {
+        try {
+          const result = await api.probeBetaChannel();
+          if (!requestIsCurrent(api, requestEpoch, activeApiRef, requestEpochRef)) return;
+          if (result?.available !== true) {
+            finishPendingRequest(requestEpoch, pendingRequestRef);
+            setState((current) => ({ ...current, saving: false, error: "unavailable" }));
+            return;
+          }
+        } catch {
+          if (!requestIsCurrent(api, requestEpoch, activeApiRef, requestEpochRef)) return;
           finishPendingRequest(requestEpoch, pendingRequestRef);
           setState((current) => ({ ...current, saving: false, error: "unavailable" }));
           return;
         }
-      } catch {
+      }
+      try {
+        const returnedSettings = normalizeSettings(await api.resetChannelSettings());
         if (!requestIsCurrent(api, requestEpoch, activeApiRef, requestEpochRef)) return;
+        const settings = observedSettings(requestEpoch, pendingRequestRef, latestSettingsRef)
+          ?? returnedSettings;
         finishPendingRequest(requestEpoch, pendingRequestRef);
-        setState((current) => ({ ...current, saving: false, error: "unavailable" }));
-        return;
-      }
-    }
-    try {
-      const returnedSettings = normalizeSettings(await api.resetChannelSettings());
-      if (!requestIsCurrent(api, requestEpoch, activeApiRef, requestEpochRef)) return;
-      const settings = observedSettings(requestEpoch, pendingRequestRef, latestSettingsRef)
-        ?? returnedSettings;
-      finishPendingRequest(requestEpoch, pendingRequestRef);
-      if (settings === undefined) {
-        setState((current) => ({ ...current, saving: false, error: "reset" }));
-        return;
-      }
-      latestSettingsRef.current = settings;
-      setState({
-        ...readyState(settings),
-        notice: previousEnableBeta && !settings.enableBeta ? "disabled" : undefined,
-        restartPrompt: !previousEnableBeta && settings.enableBeta ? "restart" : undefined
-      });
-    } catch {
-      if (!requestIsCurrent(api, requestEpoch, activeApiRef, requestEpochRef)) return;
-      const settings = observedSettings(requestEpoch, pendingRequestRef, latestSettingsRef);
-      finishPendingRequest(requestEpoch, pendingRequestRef);
-      if (settings !== undefined) {
+        if (settings === undefined) {
+          setState((current) => ({ ...current, saving: false, error: "reset" }));
+          return;
+        }
+        latestSettingsRef.current = settings;
         setState({
           ...readyState(settings),
           notice: previousEnableBeta && !settings.enableBeta ? "disabled" : undefined,
           restartPrompt: !previousEnableBeta && settings.enableBeta ? "restart" : undefined
         });
-        return;
+      } catch {
+        if (!requestIsCurrent(api, requestEpoch, activeApiRef, requestEpochRef)) return;
+        const settings = observedSettings(requestEpoch, pendingRequestRef, latestSettingsRef);
+        finishPendingRequest(requestEpoch, pendingRequestRef);
+        if (settings !== undefined) {
+          setState({
+            ...readyState(settings),
+            notice: previousEnableBeta && !settings.enableBeta ? "disabled" : undefined,
+            restartPrompt: !previousEnableBeta && settings.enableBeta ? "restart" : undefined
+          });
+          return;
+        }
+        await recoverSettings(api, requestEpoch, "reset");
       }
-      setState((current) => ({ ...current, saving: false, error: "reset" }));
+    } finally {
+      if (mutationFlightRef.current === flight) mutationFlightRef.current = undefined;
+      if (activeApiRef.current === api && ownerEpochRef.current === ownerEpoch) {
+        setState((current) => ({ ...current, saving: false }));
+      }
     }
-  }, []);
+  }, [recoverSettings]);
 
   const dismissRestart = useCallback((): void => {
-    if (stateRef.current.restarting) return;
+    if (stateRef.current.restarting || mutationFlightRef.current !== undefined) return;
     requestEpochRef.current += 1;
     pendingRequestRef.current = undefined;
     setState((current) => ({ ...current, error: undefined, restartPrompt: undefined }));
@@ -323,6 +378,7 @@ export function useDesktopBetaChannelSettings(): {
     const prompt = stateRef.current.restartPrompt;
     if (
       api === undefined
+      || mutationFlightRef.current !== undefined
       || (allowBusy ? prompt !== "busy" : prompt !== "restart")
       || stateRef.current.restarting
     ) return;

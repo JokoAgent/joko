@@ -28,6 +28,7 @@ import type {
   DesktopMainWindowCloseSettings,
   DesktopMainWindowCloseSettingsChange,
   DesktopLocale,
+  DesktopSystemLocale,
   DesktopManagedOrchestratorConnection,
   DesktopManagedOrchestratorStatus,
   DesktopMicrophonePermissionSnapshot,
@@ -122,6 +123,7 @@ const DESKTOP_CHANNELS = {
   pageSearchStop: "joko:page-search:stop",
   pageSearchResult: "joko:page-search:result",
   appGetInfo: "joko:app:get-info",
+  preferredSystemLocaleGet: "joko:locale:preferred-system:get",
   applicationMenuCommand: "joko:application-menu:command",
   applicationMenuConfigure: "joko:application-menu:configure",
   selectionContextMenuAddToChat: "joko:selection-context-menu:add-to-chat",
@@ -150,6 +152,7 @@ const DESKTOP_CHANNELS = {
   nativeTaskStatusAction: "joko:native-task-status:action",
   keepAwakeGet: "joko:power:keep-awake:get",
   keepAwakeSet: "joko:power:keep-awake:set",
+  keepAwakeChanged: "joko:power:keep-awake:changed",
   providerModelRefreshLifecycle: "joko:provider-models:refresh-lifecycle",
   microphoneGetPermission: "joko:microphone:permission:get",
   microphoneOpenSettings: "joko:microphone:settings:open",
@@ -166,6 +169,8 @@ const DESKTOP_CHANNELS = {
   globalVoicePublishStatus: "joko:global-voice:status:publish",
   globalVoiceGetStatus: "joko:global-voice:status:get",
   globalVoiceStatus: "joko:global-voice:status",
+  globalVoiceOverlayGetLocale: "joko:global-voice:overlay-locale:get",
+  globalVoiceOverlayLocaleChanged: "joko:global-voice:overlay-locale:changed",
   globalVoiceCommit: "joko:global-voice:commit",
   globalVoiceOverlayAction: "joko:global-voice:overlay-action",
   globalVoiceGetAccessibility: "joko:global-voice:accessibility:get",
@@ -215,6 +220,7 @@ const DESKTOP_CHANNELS = {
   updateAutoRelaunchSettingsGet: "joko:update:auto-relaunch-settings:get",
   updateAutoRelaunchSettingsSet: "joko:update:auto-relaunch-settings:set",
   updateAutoRelaunchSettingsReset: "joko:update:auto-relaunch-settings:reset",
+  updateAutoRelaunchSettingsChanged: "joko:update:auto-relaunch-settings:changed",
   updateChannelSettingsGet: "joko:update:channel-settings:get",
   updateChannelSettingsSet: "joko:update:channel-settings:set",
   updateChannelSettingsReset: "joko:update:channel-settings:reset",
@@ -243,6 +249,7 @@ function createMainDocumentPreloadClaim(): string {
 const nativeTaskStatusSupported = ipcRenderer.sendSync(
   DESKTOP_CHANNELS.nativeTaskStatusGetAvailability
 ) === true;
+const preferredSystemLocale = readPreferredSystemLocale();
 const attentionBadgeSupported = process.platform === "darwin" || process.platform === "win32"
   || process.platform === "linux";
 const desktopCapabilities = Object.freeze([
@@ -279,6 +286,7 @@ const desktopCapabilities = Object.freeze([
 
 const desktopApi = Object.freeze({
   platform: process.platform,
+  preferredSystemLocale,
   capabilities: desktopCapabilities,
   appInfo: Object.freeze({
     get: (): Promise<DesktopAppInfo> => ipcRenderer.invoke(DESKTOP_CHANNELS.appGetInfo)
@@ -579,6 +587,21 @@ const desktopApi = Object.freeze({
     setKeepAwake: (enabled: boolean): Promise<DesktopKeepAwakeSettings> => {
       if (typeof enabled !== "boolean") return Promise.reject(new TypeError("Desktop keep-awake state must be boolean."));
       return ipcRenderer.invoke(DESKTOP_CHANNELS.keepAwakeSet, enabled).then(parseDesktopKeepAwakeSettings);
+    },
+    onKeepAwakeChanged: (listener: (settings: DesktopKeepAwakeSettings) => void): (() => void) => {
+      if (typeof listener !== "function") throw new TypeError("Desktop keep-awake listener must be a function.");
+      const wrapped = (_event: IpcRendererEvent, value: unknown): void => {
+        let settings: DesktopKeepAwakeSettings;
+        try {
+          settings = parseDesktopKeepAwakeSettings(value);
+        } catch {
+          // Ignore malformed host messages; getKeepAwake remains authoritative.
+          return;
+        }
+        listener(settings);
+      };
+      ipcRenderer.on(DESKTOP_CHANNELS.keepAwakeChanged, wrapped);
+      return () => ipcRenderer.removeListener(DESKTOP_CHANNELS.keepAwakeChanged, wrapped);
     }
   }),
   modelCatalog: Object.freeze({
@@ -827,6 +850,18 @@ const desktopApi = Object.freeze({
         .then(parseDesktopUpdateAutoRelaunchSettings),
     resetAutoRelaunchSettings: (): Promise<DesktopUpdateAutoRelaunchSettings> =>
       ipcRenderer.invoke(DESKTOP_CHANNELS.updateAutoRelaunchSettingsReset).then(parseDesktopUpdateAutoRelaunchSettings),
+    onAutoRelaunchSettings: (listener: (settings: DesktopUpdateAutoRelaunchSettings) => void): (() => void) => {
+      if (typeof listener !== "function") throw new TypeError("Desktop idle update settings listener must be a function.");
+      const wrapped = (_event: IpcRendererEvent, value: unknown): void => {
+        try {
+          listener(parseDesktopUpdateAutoRelaunchSettings(value));
+        } catch {
+          // Ignore malformed host messages; the next get remains authoritative.
+        }
+      };
+      ipcRenderer.on(DESKTOP_CHANNELS.updateAutoRelaunchSettingsChanged, wrapped);
+      return () => ipcRenderer.removeListener(DESKTOP_CHANNELS.updateAutoRelaunchSettingsChanged, wrapped);
+    },
     getChannelSettings: (): Promise<DesktopUpdateChannelSettings> =>
       ipcRenderer.invoke(DESKTOP_CHANNELS.updateChannelSettingsGet).then(parseDesktopUpdateChannelSettings),
     setBetaChannelEnabled: (enableBeta: boolean): Promise<DesktopUpdateChannelSettings> =>
@@ -862,6 +897,15 @@ const desktopApi = Object.freeze({
 });
 
 contextBridge.exposeInMainWorld("jokoDesktop", desktopApi);
+
+function readPreferredSystemLocale(): DesktopSystemLocale {
+  try {
+    const locale: unknown = ipcRenderer.sendSync(DESKTOP_CHANNELS.preferredSystemLocaleGet);
+    return locale === "zh-CN" ? "zh-CN" : "en";
+  } catch {
+    return "en";
+  }
+}
 
 function isDesktopApplicationMenuCommand(value: unknown): value is DesktopApplicationMenuCommand {
   return value === "open-about"

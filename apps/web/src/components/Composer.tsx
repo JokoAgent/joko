@@ -2317,7 +2317,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
         <SessionUsageChip
           usage={sessionUsage}
           supported={backend?.capabilities.get("context.usage")?.supported === true}
-          locale={controller.state.preferences.locale}
+          locale={controller.state.effectiveLocale}
           t={t}
         />
         <ContextCapacityRing context={session.context} modelContextWindow={session.model?.contextWindow} onCompact={onCompact} t={t} />

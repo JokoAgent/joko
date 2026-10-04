@@ -16,7 +16,7 @@ interface ReportPage { readonly pageToken: string; readonly value: UsageReportVi
 export function UsageHistorySection({ controller, t }: { readonly controller: AppController; readonly t: Translator }): JSX.Element {
   const owner = `${controller.state.activeProfile?.serverId ?? ""}\u0000${controller.state.activeProfile?.id ?? ""}`;
   return <UsageHistoryContent key={owner} api={controller.getUsageReport} connected={controller.state.connectionState === "connected"}
-    locale={controller.state.preferences.locale} t={t} />;
+    locale={controller.state.effectiveLocale} t={t} />;
 }
 
 export function UsageHistoryContent({ api, connected, locale, t }: {

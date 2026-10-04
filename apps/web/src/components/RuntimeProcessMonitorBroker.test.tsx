@@ -37,6 +37,7 @@ describe("RuntimeProcessMonitorBroker", () => {
     expect(response.result.kind).toBe("snapshot");
     expect(response.result).not.toHaveProperty("snapshot");
     if (response.result.kind !== "snapshot") throw new Error("expected snapshot");
+    expect(response.result.locale).toBe("zh-CN");
     expect(response.result.backends.find((backend) => backend.backendId === "backend-local"))
       .toMatchObject({ backendId: "backend-local", backendGeneration: "1", state: "ready", capturedAt: 123 });
     expect(response.result.backends.find((backend) => backend.backendId === "backend-broken")).toEqual({
@@ -118,7 +119,9 @@ function controller(
       connectionState: "connected",
       connectionGeneration,
       activeProfile: { id: "profile-local", deviceId: "device-local", serverId: "server-local", name: "Local", origin: "http://127.0.0.1" },
-      preferences: { locale: "en" },
+      preferences: { locale: "system" },
+      systemLocale: "zh-CN",
+      effectiveLocale: "zh-CN",
       snapshot: value
     },
     listRuntimeProcesses,

@@ -9,6 +9,7 @@ import { DEFAULT_UI_PREFERENCES, LocalState, type UiPreferences, type UiPreferen
 import { emptySnapshot, type AppSnapshot, type BrowserSettingsView, type SessionView, type TimelineItemView, type ConnectionProfile } from "./model.js";
 import { registerWorkspaceHtmlPreviewSurface } from "./workspace-html-auto-reload.js";
 import { persistentWebSecretEncryptionAvailable } from "./web-crypto.js";
+import { publishConversationPreferencesChange } from "./conversation-preference-sync.js";
 
 vi.mock("./gateway.js", async (importOriginal) => ({
   ...await importOriginal<typeof import("./gateway.js")>(),
@@ -182,6 +183,20 @@ it("keeps resource and auxiliary operations bound to the controller snapshot's g
   expect(current.exportSession).toBe(firstController.exportSession);
   expect(current.exportPortableSession).toBe(firstController.exportPortableSession);
   expect(current.copyArtifactFile).toBe(firstController.copyArtifactFile);
+  storedPreferences = {
+    ...storedPreferences,
+    personalizationPrompts: { [first.serverId!]: "Use concise answers.", [second.serverId!]: "Explain tradeoffs." }
+  };
+  await act(async () => { publishConversationPreferencesChange(); });
+  await vi.waitFor(() => expect(current.getPersonalizationPrompt()).toBe("Use concise answers."));
+  const personalizedTaskDraft = { targetId: "target", name: "Task", nativeStart: { kind: "fresh" as const }, providerId: "", modelId: "", fastMode: false, permissionMode: "ask" as const, planMode: false };
+  await firstController.createSession(personalizedTaskDraft);
+  expect(inputCalls.get(first.id)!.createSession).toHaveBeenLastCalledWith({
+    ...personalizedTaskDraft, appendSystemPrompt: "Use concise answers."
+  });
+  const attachedTaskDraft = { ...personalizedTaskDraft, nativeStart: { kind: "attach" as const, reference: "existing-native-task" }, appendSystemPrompt: "Retired instructions." };
+  await firstController.createSession(attachedTaskDraft);
+  expect(inputCalls.get(first.id)!.createSession.mock.lastCall?.[0]).not.toHaveProperty("appendSystemPrompt");
   expect(current.openArtifactFile).toBe(firstController.openArtifactFile);
   expect(current.openHttpLink).toBe(firstController.openHttpLink);
   expect(current.navigateSessionBranch).toBe(firstController.navigateSessionBranch);
@@ -209,6 +224,7 @@ it("keeps resource and auxiliary operations bound to the controller snapshot's g
   const oldAcquisition = firstController.getArtifactUrl("shared").then((url) => { firstController.releaseArtifactUrl("shared"); return url; });
   await act(async () => current.connect(second));
   const secondController = current;
+  expect(secondController.getPersonalizationPrompt()).toBe("Explain tradeoffs.");
   const queueArguments: { [Method in typeof queueMethods[number]]: Parameters<AppController[Method]> } = {
     cancelQueueItem: ["shared-item"],
     setQueueItemEditLock: ["shared-item", "captured-token", false],

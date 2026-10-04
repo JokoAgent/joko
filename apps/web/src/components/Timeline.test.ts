@@ -6,6 +6,7 @@ import { translate } from "../i18n.js";
 import type { TimelineItemView } from "../model.js";
 import { AutomationOriginBadge, CollapsibleUserMessageContent, compactionTimelineCopy, windowedTextRows } from "./Timeline.js";
 import { TimelineViewportStore, countUnreadTimelineItems, maximumTimelineSequence, mergeTimelineWindows, repairStreamingMarkdown, resolveTimelineFollowingOnScroll, resolveTimelineResizeScrollTop, shouldLoadEarlierTimeline, streamingMarkdownRenderValue, streamingMarkdownThrottleDelay, timelineJumpBehavior, timelineUnreadItemIds } from "./timeline-behavior.js";
+import { projectTimelineRenderItems } from "./timeline-render-items.js";
 
 describe("timeline following", () => {
   it("unpins on upward intent and resumes only on a downward return to the end", () => {
@@ -86,6 +87,43 @@ describe("timeline following", () => {
       ["shared", "live"],
       ["new", "new"]
     ]);
+  });
+});
+
+describe("activity history windows", () => {
+  it("recovers older activity anchors without replacing current content or inventing gaps", () => {
+    const minute = 60_000;
+    const recent: readonly TimelineItemView[] = [
+      { ...timelineItem("long", 4n), kind: "toolResult", createdAt: 40 * minute, endedAt: 40 * minute + 125,
+        tool: { id: "long", name: "read", state: "succeeded", input: "", output: "Current result", isError: false } },
+      { ...timelineItem("thinking", 10n), kind: "thinking", messageId: "message", contentIndex: 0,
+        createdAt: 82 * minute + 125, text: "Complete thinking", streaming: false },
+      { ...timelineItem("after-thinking", 11n), kind: "tool", createdAt: 83 * minute, endedAt: 83 * minute + 125 },
+      { ...timelineItem("gap", 12n), kind: "tool", createdAt: 114 * minute + 125 }
+    ];
+    const historical: readonly TimelineItemView[] = [
+      { ...timelineItem("user", 1n), kind: "user", createdAt: 0 },
+      { ...timelineItem("long", 2n), kind: "tool", createdAt: 0,
+        tool: { id: "long", name: "read", state: "running", input: "Original input", output: "Old output", isError: false } },
+      { ...timelineItem("thinking", 8n), kind: "thinking", messageId: "message", contentIndex: 0,
+        createdAt: 42 * minute, lastActivityAt: 82 * minute, text: "An earlier delta", streaming: true }
+    ];
+    const merged = mergeTimelineWindows(recent, historical);
+    expect(merged.find((item) => item.id === "long")).toMatchObject({
+      sequence: 2n, createdAt: 0, endedAt: 40 * minute + 125, kind: "toolResult",
+      tool: { state: "succeeded", output: "Current result" }
+    });
+    expect(merged.find((item) => item.id === "thinking")).toMatchObject({
+      sequence: 8n, createdAt: 42 * minute, lastActivityAt: 82 * minute, text: "Complete thinking", streaming: false
+    });
+    const latePage = mergeTimelineWindows(merged, [{ ...historical[2]!, sequence: 9n,
+      createdAt: 81 * minute, lastActivityAt: 81 * minute }]);
+    expect(latePage).toEqual(merged);
+    const rows = projectTimelineRenderItems(latePage);
+    expect(rows.map((row) => row.childIds)).toEqual([["user"], ["long", "thinking", "after-thinking"], ["gap"]]);
+    expect(rows.filter((row) => row.historyGapBefore)).toHaveLength(1);
+    const unrelated = { ...recent[1]!, messageId: "another-message", lastActivityAt: undefined };
+    expect(mergeTimelineWindows([unrelated], [historical[2]!])[0]).toBe(unrelated);
   });
 });
 
