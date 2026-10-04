@@ -28,6 +28,7 @@ import type {
   DesktopMainWindowCloseSettings,
   DesktopMainWindowCloseSettingsChange,
   DesktopLocale,
+  DesktopSystemLocale,
   DesktopManagedOrchestratorConnection,
   DesktopManagedOrchestratorStatus,
   DesktopMicrophonePermissionSnapshot,
@@ -122,6 +123,7 @@ const DESKTOP_CHANNELS = {
   pageSearchStop: "joko:page-search:stop",
   pageSearchResult: "joko:page-search:result",
   appGetInfo: "joko:app:get-info",
+  preferredSystemLocaleGet: "joko:locale:preferred-system:get",
   applicationMenuCommand: "joko:application-menu:command",
   applicationMenuConfigure: "joko:application-menu:configure",
   selectionContextMenuAddToChat: "joko:selection-context-menu:add-to-chat",
@@ -167,6 +169,8 @@ const DESKTOP_CHANNELS = {
   globalVoicePublishStatus: "joko:global-voice:status:publish",
   globalVoiceGetStatus: "joko:global-voice:status:get",
   globalVoiceStatus: "joko:global-voice:status",
+  globalVoiceOverlayGetLocale: "joko:global-voice:overlay-locale:get",
+  globalVoiceOverlayLocaleChanged: "joko:global-voice:overlay-locale:changed",
   globalVoiceCommit: "joko:global-voice:commit",
   globalVoiceOverlayAction: "joko:global-voice:overlay-action",
   globalVoiceGetAccessibility: "joko:global-voice:accessibility:get",
@@ -244,6 +248,7 @@ function createMainDocumentPreloadClaim(): string {
 const nativeTaskStatusSupported = ipcRenderer.sendSync(
   DESKTOP_CHANNELS.nativeTaskStatusGetAvailability
 ) === true;
+const preferredSystemLocale = readPreferredSystemLocale();
 const attentionBadgeSupported = process.platform === "darwin" || process.platform === "win32"
   || process.platform === "linux";
 const desktopCapabilities = Object.freeze([
@@ -280,6 +285,7 @@ const desktopCapabilities = Object.freeze([
 
 const desktopApi = Object.freeze({
   platform: process.platform,
+  preferredSystemLocale,
   capabilities: desktopCapabilities,
   appInfo: Object.freeze({
     get: (): Promise<DesktopAppInfo> => ipcRenderer.invoke(DESKTOP_CHANNELS.appGetInfo)
@@ -878,6 +884,15 @@ const desktopApi = Object.freeze({
 });
 
 contextBridge.exposeInMainWorld("jokoDesktop", desktopApi);
+
+function readPreferredSystemLocale(): DesktopSystemLocale {
+  try {
+    const locale: unknown = ipcRenderer.sendSync(DESKTOP_CHANNELS.preferredSystemLocaleGet);
+    return locale === "zh-CN" ? "zh-CN" : "en";
+  } catch {
+    return "en";
+  }
+}
 
 function isDesktopApplicationMenuCommand(value: unknown): value is DesktopApplicationMenuCommand {
   return value === "open-about"

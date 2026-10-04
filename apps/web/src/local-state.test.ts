@@ -65,6 +65,12 @@ describe("durable UI preferences", () => {
     });
   });
 
+  it("accepts the current system locale preference and rejects non-v1 aliases", () => {
+    expect(normalizeUiPreferences({ locale: "system" })).toEqual(DEFAULT_UI_PREFERENCES);
+    expect(normalizeUiPreferences({ theme: "light", locale: "auto" })).toEqual(DEFAULT_UI_PREFERENCES);
+    expect(normalizeUiPreferences({ theme: "light", locale: "default" })).toEqual(DEFAULT_UI_PREFERENCES);
+  });
+
   it("falls back as a whole for incomplete, extra, or malformed preference records", () => {
     const { theme: _theme, ...incomplete } = DEFAULT_UI_PREFERENCES;
     expect(normalizeUiPreferences(undefined)).toEqual(DEFAULT_UI_PREFERENCES);

@@ -8,7 +8,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AppController } from "../controller.js";
 import { translate } from "../i18n.js";
 import { DEFAULT_UI_PREFERENCES } from "../local-state.js";
-import { emptySnapshot, type Locale, type Theme } from "../model.js";
+import { emptySnapshot, type LocalePreference, type Theme } from "../model.js";
+import { resolveLocalePreference } from "../system-locale.js";
 import { writeVoiceInputPreferences } from "../voice-input-preferences.js";
 import { createUnavailableDedicatedHardwareSnapshot, type DedicatedHardwareBridge } from "../dedicated-hardware.js";
 import {
@@ -121,45 +122,197 @@ describe("shared settings interactions", () => {
     expect(container.querySelector('[role="alert"]')?.textContent).toContain("Could not save the language setting.");
 
     await chooseOption(language, translate("en", "language.zh-CN"));
-    expect(onSuccess).toHaveBeenCalledWith("Language saved.");
+    expect(onSuccess).toHaveBeenCalledWith("语言设置已保存。");
     expect(controller.setLocale).toHaveBeenNthCalledWith(2, "zh-CN");
   });
 
-  it("disables notification changes while pending and lets only the latest request publish feedback", async () => {
+  it("shows System as the durable default while rendering with its effective locale", async () => {
+    const base = controllerFixture();
+    const controller = {
+      ...base,
+      state: { ...base.state, systemLocale: "zh-CN" as const, effectiveLocale: "zh-CN" as const }
+    } as AppController;
+    const container = await renderAppearance(controller);
+    const language = required(container.querySelector<HTMLButtonElement>(`[role="combobox"][aria-label="${translate("zh-CN", "settings.locale")}"]`));
+
+    expect(language.parentElement?.querySelector<HTMLSelectElement>("select")?.value).toBe("system");
+    expect(language.textContent).toContain(translate("zh-CN", "settings.system"));
+    expect(container.textContent).not.toContain(translate("zh-CN", "settings.defaults.customized"));
+  });
+
+  it("single-flights language changes before the disabled state paints", async () => {
+    const saved = deferred<void>();
+    const controller = controllerFixture();
+    controller.setLocale = vi.fn(() => saved.promise);
+    const onSuccess = vi.fn();
+    const container = await renderAppearance(controller, onSuccess);
+    const language = required(container.querySelector<HTMLButtonElement>('[role="combobox"][aria-label="Language"]'));
+
+    await chooseOptionTwice(language, translate("en", "language.zh-CN"));
+    expect(controller.setLocale).toHaveBeenCalledOnce();
+    expect(controller.setLocale).toHaveBeenCalledWith("zh-CN");
+    expect(language.disabled).toBe(true);
+    expect(container.textContent).toContain(translate("zh-CN", "settings.defaults.customized"));
+
+    await act(async () => saved.resolve());
+    expect(onSuccess).toHaveBeenCalledOnce();
+    expect(onSuccess).toHaveBeenCalledWith(translate("zh-CN", "settings.localeSaveSuccess"));
+  });
+
+  it("restores the language default with retry-safe controls and returns owned focus", async () => {
+    const saved = deferred<void>();
+    const controller = controllerFixture(
+      DEFAULT_UI_PREFERENCES.composerSendShortcut,
+      DEFAULT_UI_PREFERENCES.sessionNotificationsEnabled,
+      "zh-CN"
+    );
+    controller.setLocale = vi.fn(() => saved.promise);
+    const onSuccess = vi.fn();
+    const container = await renderAppearance(controller, onSuccess);
+    const language = required(container.querySelector<HTMLButtonElement>(`[role="combobox"][aria-label="${translate("zh-CN", "settings.locale")}"]`));
+    const languageControls = required(language.parentElement);
+    const reset = required(languageControls.querySelector<HTMLButtonElement>(`[aria-label="${translate("zh-CN", "settings.defaults.restore")}"]`));
+
+    reset.focus();
+    await act(async () => reset.click());
+    expect(controller.setLocale).toHaveBeenCalledWith(DEFAULT_UI_PREFERENCES.locale);
+    expect(language.disabled).toBe(true);
+    expect(reset.disabled).toBe(true);
+    expect(container.textContent).toContain(translate("en", "settings.defaults.customized"));
+
+    await act(async () => saved.resolve());
+    await vi.waitFor(() => {
+      expect(document.activeElement).toBe(language);
+      expect(languageControls.querySelector(`[aria-label="${translate("en", "settings.defaults.restore")}"]`)).toBeNull();
+    });
+    expect(onSuccess).toHaveBeenCalledWith(translate("en", "settings.defaults.restored"));
+  });
+
+  it("keeps a failed language reset retryable and retires feedback from replaced owners", async () => {
+    const failed = deferred<void>();
     const stale = deferred<void>();
-    const latest = deferred<void>();
-    const latestFailure = deferred<void>();
+    const replacement = deferred<void>();
+    const first = controllerFixture(
+      DEFAULT_UI_PREFERENCES.composerSendShortcut,
+      DEFAULT_UI_PREFERENCES.sessionNotificationsEnabled,
+      "zh-CN"
+    );
+    first.setLocale = vi.fn()
+      .mockImplementationOnce(() => failed.promise)
+      .mockImplementationOnce(() => stale.promise);
+    const onSuccess = vi.fn();
+    const mounted = await mount(<AppearanceHarness controller={first} onSuccess={onSuccess} />);
+    let reset = required(mounted.container.querySelector<HTMLButtonElement>(`[aria-label="${translate("zh-CN", "settings.defaults.restore")}"]`));
+
+    await act(async () => reset.click());
+    await act(async () => failed.reject(new Error("disk unavailable")));
+    expect(mounted.container.querySelector('[role="alert"]')?.textContent)
+      .toContain(translate("zh-CN", "settings.localeSaveFailed"));
+    reset = required(mounted.container.querySelector<HTMLButtonElement>(`[aria-label="${translate("zh-CN", "settings.defaults.restore")}"]`));
+
+    await act(async () => reset.click());
+    const second = controllerFixture(
+      DEFAULT_UI_PREFERENCES.composerSendShortcut,
+      DEFAULT_UI_PREFERENCES.sessionNotificationsEnabled,
+      "zh-CN"
+    );
+    second.setLocale = vi.fn(() => replacement.promise);
+    await act(async () => mounted.root.render(<AppearanceHarness controller={second} onSuccess={onSuccess} />));
+    await act(async () => stale.resolve());
+    expect(onSuccess).not.toHaveBeenCalled();
+    expect(mounted.container.querySelector('[role="alert"]')).toBeNull();
+
+    reset = required(mounted.container.querySelector<HTMLButtonElement>(`[aria-label="${translate("zh-CN", "settings.defaults.restore")}"]`));
+    await act(async () => reset.click());
+    await act(async () => mounted.root.render(<></>));
+    await act(async () => replacement.resolve());
+    expect(onSuccess).not.toHaveBeenCalled();
+  });
+
+  it("single-flights notification changes and publishes feedback only after the owned request settles", async () => {
+    const saved = deferred<void>();
+    const failed = deferred<void>();
     const controller = controllerFixture();
     controller.setSessionNotificationsEnabled = vi.fn()
-      .mockImplementationOnce(() => stale.promise)
-      .mockImplementationOnce(() => latest.promise)
-      .mockImplementationOnce(() => latestFailure.promise);
+      .mockImplementationOnce(() => saved.promise)
+      .mockImplementationOnce(() => failed.promise);
     const onSuccess = vi.fn();
     const container = await renderGeneral(controller, onSuccess);
     const toggle = required(container.querySelector<HTMLButtonElement>('[role="switch"][aria-label="Desktop notifications"]'));
 
-    // Two native events can be queued before the pending render disables the control.
+    // Two native events can be queued before React paints the disabled state.
     await act(async () => {
       toggle.click();
       toggle.click();
     });
     expect(toggle.disabled).toBe(true);
     expect(toggle.getAttribute("aria-busy")).toBe("true");
-    expect(controller.setSessionNotificationsEnabled).toHaveBeenCalledTimes(2);
-    await act(async () => stale.reject(new Error("stale failure")));
-    expect(toggle.disabled).toBe(true);
-    expect(container.querySelector('[role="alert"]')).toBeNull();
+    expect(controller.setSessionNotificationsEnabled).toHaveBeenCalledTimes(1);
+    expect(controller.setSessionNotificationsEnabled).toHaveBeenCalledWith(false);
 
-    await act(async () => latest.resolve());
+    await act(async () => saved.resolve());
     expect(toggle.disabled).toBe(false);
     expect(onSuccess).toHaveBeenCalledTimes(1);
-    expect(controller.setSessionNotificationsEnabled).toHaveBeenNthCalledWith(2, false);
     expect(onSuccess).toHaveBeenCalledWith("Desktop notifications disabled.");
 
     await act(async () => toggle.click());
-    await act(async () => latestFailure.reject(new Error("latest failure")));
+    await act(async () => failed.reject(new Error("latest failure")));
     expect(container.querySelector('[role="alert"]')?.textContent).toContain("Could not save the desktop notification setting.");
     expect(onSuccess).toHaveBeenCalledTimes(1);
+  });
+
+  it("restores notification defaults with rollback-safe controls and returns owned focus before they disappear", async () => {
+    const saved = deferred<void>();
+    const controller = controllerFixture(DEFAULT_UI_PREFERENCES.composerSendShortcut, false);
+    controller.setSessionNotificationsEnabled = vi.fn(() => saved.promise);
+    const onSuccess = vi.fn();
+    const container = await renderStatefulGeneral(controller, onSuccess);
+    const toggle = required(container.querySelector<HTMLButtonElement>('[role="switch"][aria-label="Desktop notifications"]'));
+    const reset = required(container.querySelector<HTMLButtonElement>('[aria-label="Restore default"]'));
+
+    reset.focus();
+    await act(async () => reset.click());
+    expect(controller.setSessionNotificationsEnabled).toHaveBeenCalledWith(true);
+    expect(toggle.disabled).toBe(true);
+    expect(reset.disabled).toBe(true);
+    expect(container.textContent).toContain("Customized");
+
+    await act(async () => saved.resolve());
+    expect(document.activeElement).toBe(toggle);
+    expect(container.querySelector('[aria-label="Restore default"]')).toBeNull();
+    expect(onSuccess).toHaveBeenCalledWith("Restored default settings");
+  });
+
+  it("keeps a failed notification reset retryable and retires feedback from a replaced owner", async () => {
+    const failed = deferred<void>();
+    const stale = deferred<void>();
+    const replacement = deferred<void>();
+    const first = controllerFixture(DEFAULT_UI_PREFERENCES.composerSendShortcut, false);
+    first.setSessionNotificationsEnabled = vi.fn()
+      .mockImplementationOnce(() => failed.promise)
+      .mockImplementationOnce(() => stale.promise);
+    const onSuccess = vi.fn();
+    const mounted = await mount(<GeneralHarness controller={first} onSuccess={onSuccess} />);
+    let reset = required(mounted.container.querySelector<HTMLButtonElement>('[aria-label="Restore default"]'));
+
+    await act(async () => reset.click());
+    await act(async () => failed.reject(new Error("disk unavailable")));
+    expect(mounted.container.querySelector('[role="alert"]')?.textContent).toContain("Could not save the desktop notification setting.");
+    reset = required(mounted.container.querySelector<HTMLButtonElement>('[aria-label="Restore default"]'));
+
+    await act(async () => reset.click());
+    const second = controllerFixture(DEFAULT_UI_PREFERENCES.composerSendShortcut, false);
+    second.setSessionNotificationsEnabled = vi.fn(() => replacement.promise);
+    await act(async () => mounted.root.render(<GeneralHarness controller={second} onSuccess={onSuccess} />));
+    await act(async () => stale.resolve());
+    expect(onSuccess).not.toHaveBeenCalled();
+    expect(mounted.container.querySelector('[role="alert"]')).toBeNull();
+
+    reset = required(mounted.container.querySelector<HTMLButtonElement>('[aria-label="Restore default"]'));
+    await act(async () => reset.click());
+    await act(async () => mounted.root.render(<></>));
+    await act(async () => replacement.resolve());
+    expect(onSuccess).not.toHaveBeenCalled();
   });
 
   it("rejects a Composer send shortcut already owned by Voice Input without mutating preferences", async () => {
@@ -363,12 +516,37 @@ function AppearanceHarness({ controller, onSuccess }: {
   readonly onSuccess: (message: string) => void;
 }): JSX.Element {
   const [theme, setTheme] = useState<Theme>("system");
-  const [locale, setLocale] = useState<Locale>("en");
+  const [localePreference, setLocalePreference] = useState<LocalePreference>(controller.state.preferences.locale);
+  const locale = resolveLocalePreference(localePreference, controller.state.systemLocale);
+  const localeRef = useRef(localePreference);
+  const localeSourceRef = useRef(controller);
+  localeRef.current = localePreference;
+  localeSourceRef.current = controller;
+  useEffect(() => {
+    localeRef.current = controller.state.preferences.locale;
+    setLocalePreference(controller.state.preferences.locale);
+  }, [controller]);
+  const controllerSetLocale = controller.setLocale;
+  const setWrappedLocale = useCallback(async (next: LocalePreference) => {
+    const previous = localeRef.current;
+    localeRef.current = next;
+    setLocalePreference(next);
+    try {
+      await controllerSetLocale(next);
+    } catch (error) {
+      if (localeSourceRef.current === controller) {
+        localeRef.current = previous;
+        setLocalePreference(previous);
+      }
+      throw error;
+    }
+  }, [controller, controllerSetLocale]);
   const wrapped = {
     ...controller,
     state: {
       ...controller.state,
-      preferences: { ...controller.state.preferences, theme, locale }
+      preferences: { ...controller.state.preferences, theme, locale: localePreference },
+      effectiveLocale: locale
     },
     setTheme: async (next: Theme) => {
       const previous = theme;
@@ -380,16 +558,7 @@ function AppearanceHarness({ controller, onSuccess }: {
         throw error;
       }
     },
-    setLocale: async (next: Locale) => {
-      const previous = locale;
-      setLocale(next);
-      try {
-        await controller.setLocale(next);
-      } catch (error) {
-        setLocale(previous);
-        throw error;
-      }
-    }
+    setLocale: setWrappedLocale
   } as AppController;
   return <AppearanceSettings
     controller={wrapped}
@@ -397,7 +566,7 @@ function AppearanceHarness({ controller, onSuccess }: {
     theme={theme}
     onSuccess={onSuccess}
     onOpenPi={() => undefined}
-    t={(key, values) => translate("en", key, values)}
+    t={(key, values) => translate(locale, key, values)}
   />;
 }
 
@@ -405,14 +574,35 @@ function GeneralHarness({ controller, onSuccess }: {
   readonly controller: AppController;
   readonly onSuccess: (message: string) => void;
 }): JSX.Element {
+  const [notificationsEnabled, setNotificationsEnabled] = useState(
+    controller.state.preferences.sessionNotificationsEnabled
+  );
+  const notificationsRef = useRef(notificationsEnabled);
   const [shortcut, setShortcut] = useState(controller.state.preferences.composerSendShortcut);
   const shortcutRef = useRef(shortcut);
   const sourceRef = useRef(controller);
   sourceRef.current = controller;
+  notificationsRef.current = notificationsEnabled;
   shortcutRef.current = shortcut;
   useEffect(() => {
+    notificationsRef.current = controller.state.preferences.sessionNotificationsEnabled;
+    setNotificationsEnabled(controller.state.preferences.sessionNotificationsEnabled);
     shortcutRef.current = controller.state.preferences.composerSendShortcut;
     setShortcut(controller.state.preferences.composerSendShortcut);
+  }, [controller]);
+  const setSessionNotificationsEnabled = useCallback(async (next: boolean): Promise<void> => {
+    const previous = notificationsRef.current;
+    notificationsRef.current = next;
+    setNotificationsEnabled(next);
+    try {
+      await controller.setSessionNotificationsEnabled(next);
+    } catch (error) {
+      if (sourceRef.current === controller) {
+        notificationsRef.current = previous;
+        setNotificationsEnabled(previous);
+      }
+      throw error;
+    }
   }, [controller]);
   const setComposerSendShortcut = useCallback(async (next: "enter" | "modifier-enter"): Promise<void> => {
     const previous = shortcutRef.current;
@@ -432,8 +622,13 @@ function GeneralHarness({ controller, onSuccess }: {
     ...controller,
     state: {
       ...controller.state,
-      preferences: { ...controller.state.preferences, composerSendShortcut: shortcut }
+      preferences: {
+        ...controller.state.preferences,
+        sessionNotificationsEnabled: notificationsEnabled,
+        composerSendShortcut: shortcut
+      }
     },
+    setSessionNotificationsEnabled,
     setComposerSendShortcut
   } as AppController;
   return <GeneralSettings
@@ -446,11 +641,15 @@ function GeneralHarness({ controller, onSuccess }: {
 }
 
 function controllerFixture(
-  composerSendShortcut: "enter" | "modifier-enter" = DEFAULT_UI_PREFERENCES.composerSendShortcut
+  composerSendShortcut: "enter" | "modifier-enter" = DEFAULT_UI_PREFERENCES.composerSendShortcut,
+  sessionNotificationsEnabled = DEFAULT_UI_PREFERENCES.sessionNotificationsEnabled,
+  locale: LocalePreference = DEFAULT_UI_PREFERENCES.locale
 ): AppController {
   return {
     state: {
-      preferences: { ...DEFAULT_UI_PREFERENCES, composerSendShortcut },
+      preferences: { ...DEFAULT_UI_PREFERENCES, composerSendShortcut, sessionNotificationsEnabled, locale },
+      systemLocale: "en",
+      effectiveLocale: resolveLocalePreference(locale, "en"),
       profiles: [],
       automaticConnectionAvailable: false
     },

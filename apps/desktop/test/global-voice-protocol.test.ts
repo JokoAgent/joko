@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  DESKTOP_CHANNELS,
+  isDesktopLocale,
   isDesktopGlobalVoiceGeneration,
   parseDesktopGlobalVoiceCommand,
   parseDesktopGlobalVoiceCommitRequest,
@@ -8,6 +10,18 @@ import {
 } from "../src/channels.js";
 
 describe("global voice generation protocol", () => {
+  it("keeps concrete overlay locale on dedicated channels outside the status shape", () => {
+    expect(DESKTOP_CHANNELS.globalVoiceOverlayGetLocale).toBe("joko:global-voice:overlay-locale:get");
+    expect(DESKTOP_CHANNELS.globalVoiceOverlayLocaleChanged).toBe("joko:global-voice:overlay-locale:changed");
+    expect(["en", "zh-CN", "en-XA"].every(isDesktopLocale)).toBe(true);
+    expect(isDesktopLocale("system")).toBe(false);
+    expect(() => parseDesktopGlobalVoiceStatus({
+      state: "idle",
+      generation: "0",
+      locale: "en"
+    })).toThrow(TypeError);
+  });
+
   it("accepts only exact commands carrying a live canonical generation", () => {
     expect(parseDesktopGlobalVoiceCommand({ generation: "17", type: "start" })).toEqual({
       type: "start",

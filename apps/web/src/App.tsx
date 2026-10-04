@@ -99,7 +99,7 @@ import {
   desktopDeepLinkRouteHash
 } from "./desktop-deep-link-navigation.js";
 import { isExtensionApplicationWindow, openExtensionWindowFallback } from "./extension-window-navigation.js";
-import { CLIENT_LAYOUT_RESET_EVENT } from "./client-layout-reset.js";
+import { CLIENT_LAYOUT_RESET_EVENT, subscribeClientLayoutResetOccurrence } from "./client-layout-reset.js";
 import {
   applySessionProjectOverrides,
   reconcileSessionProjectOverrides,
@@ -221,7 +221,7 @@ function AppControllerRoot(): JSX.Element {
 
 function ConnectedAppControllerRoot(): JSX.Element {
   const controller = useAppController();
-  const t = useCallback((key: Parameters<typeof translate>[1], values?: Parameters<typeof translate>[2]) => translate(controller.state.preferences.locale, key, values), [controller.state.preferences.locale]);
+  const t = useCallback((key: Parameters<typeof translate>[1], values?: Parameters<typeof translate>[2]) => translate(controller.state.effectiveLocale, key, values), [controller.state.effectiveLocale]);
   const applicationWindowOwner = typeof window !== "undefined"
     && !isSessionApplicationWindow(window.location)
     && !isExtensionApplicationWindow(window.location);
@@ -245,7 +245,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
   const bootSessionId = sessionApplicationWindow
     ? new URLSearchParams(window.location.search).get("bootSession") ?? undefined
     : undefined;
-  const t = useCallback((key: Parameters<typeof translate>[1], values?: Parameters<typeof translate>[2]) => translate(state.preferences.locale, key, values), [state.preferences.locale]);
+  const t = useCallback((key: Parameters<typeof translate>[1], values?: Parameters<typeof translate>[2]) => translate(state.effectiveLocale, key, values), [state.effectiveLocale]);
   const [renameSession, setRenameSession] = useState<SessionView>();
   const [archiveRemoval, setArchiveRemoval] = useState<SessionRemovalDialogRequest>();
   const [deleteRemoval, setDeleteRemoval] = useState<SessionRemovalDialogRequest>();
@@ -297,7 +297,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
   const promptRecommendationOwnerRef = useRef<{ readonly initialized: boolean; readonly key?: string }>({ initialized: false });
   const promptRecommendationConnectionOwner = state.activeProfile === undefined ? undefined : JSON.stringify([state.activeProfile.serverId, state.activeProfile.id]);
   const promptRecommendationOwner = promptRecommendationOwnerKey(state.ready && state.connectionState === "connected" ? state.activeProfile : undefined, {
-    locale: state.preferences.locale,
+    locale: state.effectiveLocale,
     revision: state.snapshot.settings.auxiliaryText.revision,
     runtimeRevision: state.snapshot.settings.auxiliaryText.runtimeRevision,
     enabled: state.snapshot.settings.promptRecommendation.enabled
@@ -442,21 +442,27 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
   const bootConnectionAttemptedRef = useRef(false);
   const layoutRouteSessionIdRef = useRef(state.route.kind === "session" ? state.route.sessionId : undefined);
   layoutRouteSessionIdRef.current = state.route.kind === "session" ? state.route.sessionId : undefined;
+  const desktopLayoutResetAvailable = window.jokoDesktop?.capabilities.includes("layout.reset") === true;
   useEffect(() => {
+    let retired = false;
     const resetView = (): void => {
       setSessionSplitLayout({});
       setFocusedSplitSessionId(layoutRouteSessionIdRef.current);
       if (auxiliaryApplicationWindow) setSessionWindowNavigation({ mode: "hidden", width: NAVIGATION_DEFAULT_WIDTH });
     };
     window.addEventListener(CLIENT_LAYOUT_RESET_EVENT, resetView);
-    const unsubscribe = window.jokoDesktop?.layout?.onReset(() => {
-      controllerRef.current.synchronizeLayoutReset();
-    });
+    const synchronizeLayoutReset = (): void => {
+      if (!retired) controllerRef.current.synchronizeLayoutReset();
+    };
+    const unsubscribe = desktopLayoutResetAvailable
+      ? window.jokoDesktop?.layout?.onReset(synchronizeLayoutReset)
+      : subscribeClientLayoutResetOccurrence(synchronizeLayoutReset);
     return () => {
+      retired = true;
       window.removeEventListener(CLIENT_LAYOUT_RESET_EVENT, resetView);
       unsubscribe?.();
     };
-  }, [auxiliaryApplicationWindow]);
+  }, [auxiliaryApplicationWindow, desktopLayoutResetAvailable]);
   useEffect(() => {
     if (!sessionApplicationWindow || bootSessionId === undefined) return;
     const readOwner = window.jokoDesktop?.sessionWindows.getOwner;
@@ -627,8 +633,9 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
   }, []);
 
   useEffect(() => {
-    void window.jokoDesktop?.selectionContextMenu?.setLocale(state.preferences.locale).catch(() => undefined);
-  }, [state.preferences.locale]);
+    if (!state.ready) return;
+    void window.jokoDesktop?.selectionContextMenu?.setLocale(state.effectiveLocale).catch(() => undefined);
+  }, [state.effectiveLocale, state.ready]);
 
   const applicationMenuNoticeId = applicationMenuNotice?.id;
   useEffect(() => {
@@ -2096,7 +2103,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
         snapshot={sidebarSnapshot}
         activeSessionId={creatingNewSession ? undefined : activeSession?.id}
         route={state.route}
-        locale={state.preferences.locale}
+        locale={state.effectiveLocale}
         messageSearchSort={state.preferences.messageSearchSort}
         sidebarOwnerId={state.activeProfile.serverId}
         sidebarDisplayPreferences={state.preferences.sidebarDisplayPreferences}
@@ -2320,7 +2327,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
             onDropSession={addSessionToSplit}
           />)}
           {state.route.kind === "files" && <main className="empty-session-page"><EmptyState icon={<AlertTriangle />} title={t("workspace.filesLoadFailed")} body={t("workspace.noWorkspace")} action={<Button onClick={() => { const sessionId = activeSession?.id; controller.navigate(sessionId === undefined ? { kind: "session" } : { kind: "session", sessionId }); }}>{t("workspace.filesBack")}</Button>} /></main>}
-          {state.route.kind === "schedules" && <SchedulesPage controller={controller} schedules={state.snapshot.schedules} sessions={state.snapshot.sessions} targets={state.snapshot.targets} models={state.snapshot.models} backends={state.snapshot.backends} extraDirectories={state.snapshot.extraDirectories} focusScheduleId={state.route.scheduleId} locale={state.preferences.locale} t={t} runAction={runAction} onOpenNavigation={() => setWindowNavigationOpen(true)} prepareSessionRemoval={prepareWorktreeRemoval} />}
+          {state.route.kind === "schedules" && <SchedulesPage controller={controller} schedules={state.snapshot.schedules} sessions={state.snapshot.sessions} targets={state.snapshot.targets} models={state.snapshot.models} backends={state.snapshot.backends} extraDirectories={state.snapshot.extraDirectories} focusScheduleId={state.route.scheduleId} locale={state.effectiveLocale} t={t} runAction={runAction} onOpenNavigation={() => setWindowNavigationOpen(true)} prepareSessionRemoval={prepareWorktreeRemoval} />}
           {state.route.kind === "projects" && <ProjectsPage controller={controller} snapshot={state.snapshot} focusProjectId={state.route.projectId} t={t} runAction={runAction} onOpenNavigation={() => setWindowNavigationOpen(true)} prepareSessionRemoval={prepareWorktreeRemoval} />}
           {state.route.kind === "partners" && <PartnersPage controller={controller} snapshot={state.snapshot} focusPartnerId={state.route.partnerId} t={t} onOpenNavigation={() => setWindowNavigationOpen(true)} />}
           {state.route.kind === "tools" && <ToolsPage
@@ -2329,7 +2336,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
             runtimeSessionId={lastRuntimeSessionIdRef.current}
             selectedExtensionId={state.route.extensionId}
             selectedTab={state.route.tab}
-            locale={state.preferences.locale}
+            locale={state.effectiveLocale}
             t={t}
             runAction={runAction}
             onSelectExtension={(extensionId) => controller.navigate({ kind: "tools", ...(extensionId === undefined ? { tab: "extensions" } : { extensionId }) })}
@@ -2353,7 +2360,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
               }
             }}
           />}
-          {state.route.kind === "settings" && <SettingsPage controller={controller} snapshot={state.snapshot} activeTargetId={settingsTargetIdRef.current} locale={state.preferences.locale} t={t} runAction={runAction} onImportPortableSession={portableImportTargets.length === 0 ? undefined : () => { void choosePortableSessionImport(); }} />}
+          {state.route.kind === "settings" && <SettingsPage controller={controller} snapshot={state.snapshot} activeTargetId={settingsTargetIdRef.current} locale={state.effectiveLocale} t={t} runAction={runAction} onImportPortableSession={portableImportTargets.length === 0 ? undefined : () => { void choosePortableSessionImport(); }} />}
           </>}
           </Suspense>
         </AppErrorBoundary>
@@ -2446,7 +2453,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
       <PortableSessionDialogHost
         controller={controller}
         snapshot={state.snapshot}
-        locale={state.preferences.locale}
+        locale={state.effectiveLocale}
         t={t}
         exportSession={portableExportSession}
         importRequest={portableImportRequest}

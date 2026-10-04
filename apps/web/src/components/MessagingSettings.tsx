@@ -691,7 +691,7 @@ export function MessagingSettings({ controller, snapshot, t }: {
                   : t("messaging.credentialMissing")}</span>
                 <span><strong>{t("messaging.lastConnected")}</strong>{connection.lastConnectedAt === undefined
                   ? t("common.none")
-                  : formatRelativeTime(connection.lastConnectedAt, controller.state.preferences.locale)}</span>
+                  : formatRelativeTime(connection.lastConnectedAt, controller.state.effectiveLocale)}</span>
                 <span><strong>{t(connection.channel === "wechat" ? "messaging.wechatAccountId"
                   : connection.channel === "discord" ? "messaging.discordOwnerId"
                   : connection.channel === "slack" ? "messaging.slackOwnerId"

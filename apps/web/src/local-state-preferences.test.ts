@@ -4,6 +4,8 @@ import { DEFAULT_SIDEBAR_OWNER_LAYOUT, withSidebarOwnerLayout } from "./sidebar-
 import { subscribeAppearancePreferencesChange } from "./appearance-preference-sync.js";
 import { withAppShortcutOverride, type AppShortcutCombo } from "./app-shortcuts.js";
 import { subscribeAppShortcutPreferencesChange } from "./app-shortcut-preference-sync.js";
+import { subscribeSessionNotificationPreferenceChange } from "./session-notification-preference-sync.js";
+import { subscribeLocalePreferenceChange } from "./locale-preference-sync.js";
 
 describe("cross-window durable UI preference mutations", () => {
   it("merges a stale renderer's unrelated patch with the latest durable owner layout", async () => {
@@ -118,7 +120,9 @@ describe("cross-window durable UI preference mutations", () => {
       onmessage: ((event: MessageEvent<unknown>) => void) | null = null;
       constructor(readonly name: string) { channels.add(this); }
       postMessage(value: unknown): void {
-        publishedDurableUiRecords.push(database.readUiRecord());
+        if (this.name === "joko:appearance-preferences:v1") {
+          publishedDurableUiRecords.push(database.readUiRecord());
+        }
         for (const peer of channels) if (peer !== this && peer.name === this.name) {
           queueMicrotask(() => peer.onmessage?.({ data: value } as MessageEvent<unknown>));
         }
@@ -265,6 +269,137 @@ describe("cross-window durable UI preference mutations", () => {
         appShortcutOverrides: { "browser-back": rebind }
       });
       close();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("publishes only committed session-notification changes and omits the restored default", async () => {
+    const database = memoryPreferenceDatabase();
+    const publishedDurableUiRecords: unknown[] = [];
+    const channels = new Set<TestChannel>();
+    class TestChannel {
+      onmessage: ((event: MessageEvent<unknown>) => void) | null = null;
+      constructor(readonly name: string) { channels.add(this); }
+      postMessage(value: unknown): void {
+        if (this.name === "joko:session-notification-preference:v1") {
+          publishedDurableUiRecords.push(database.readUiRecord());
+        }
+        for (const peer of channels) if (peer !== this && peer.name === this.name) {
+          queueMicrotask(() => peer.onmessage?.({ data: value } as MessageEvent<unknown>));
+        }
+      }
+      close(): void { channels.delete(this); }
+    }
+    vi.stubGlobal("BroadcastChannel", TestChannel);
+    try {
+      const state = memoryLocalState(database.database);
+      const changed = vi.fn();
+      const unsubscribe = subscribeSessionNotificationPreferenceChange(changed);
+
+      await state.mutatePreferences((current) => ({
+        ...current,
+        theme: "light",
+        sessionNotificationsEnabled: false
+      }));
+      await Promise.resolve();
+      expect(changed).toHaveBeenCalledOnce();
+      expect(publishedDurableUiRecords).toHaveLength(1);
+      expect(publishedDurableUiRecords[0]).toMatchObject({
+        theme: "light",
+        sessionNotificationsEnabled: false
+      });
+
+      await state.mutatePreferences((current) => ({ ...current, sessionNotificationsEnabled: false }));
+      await state.mutatePreferences((current) => ({ ...current, locale: "zh-CN" }));
+      await Promise.resolve();
+      expect(changed).toHaveBeenCalledOnce();
+      expect(publishedDurableUiRecords).toHaveLength(1);
+
+      database.failNextPut();
+      await expect(state.mutatePreferences((current) => ({
+        ...current,
+        sessionNotificationsEnabled: true
+      }))).rejects.toThrow("preference write failed");
+      await Promise.resolve();
+      expect(changed).toHaveBeenCalledOnce();
+      expect(publishedDurableUiRecords).toHaveLength(1);
+      expect(database.readUiRecord()).toMatchObject({
+        theme: "light",
+        locale: "zh-CN",
+        sessionNotificationsEnabled: false
+      });
+
+      await state.mutatePreferences((current) => ({
+        ...current,
+        sessionNotificationsEnabled: true
+      }));
+      await Promise.resolve();
+      expect(changed).toHaveBeenCalledTimes(2);
+      expect(publishedDurableUiRecords).toHaveLength(2);
+      expect(publishedDurableUiRecords[1]).toMatchObject({ theme: "light", locale: "zh-CN" });
+      expect(publishedDurableUiRecords[1]).not.toHaveProperty("sessionNotificationsEnabled");
+      await expect(state.readPreferences()).resolves.toMatchObject({
+        theme: "light",
+        locale: "zh-CN",
+        sessionNotificationsEnabled: true
+      });
+      unsubscribe();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("publishes only committed locale changes and omits the restored default", async () => {
+    const database = memoryPreferenceDatabase();
+    const publishedDurableUiRecords: unknown[] = [];
+    const channels = new Set<TestChannel>();
+    class TestChannel {
+      onmessage: ((event: MessageEvent<unknown>) => void) | null = null;
+      constructor(readonly name: string) { channels.add(this); }
+      postMessage(value: unknown): void {
+        if (this.name === "joko:locale-preference:v1") {
+          publishedDurableUiRecords.push(database.readUiRecord());
+        }
+        for (const peer of channels) if (peer !== this && peer.name === this.name) {
+          queueMicrotask(() => peer.onmessage?.({ data: value } as MessageEvent<unknown>));
+        }
+      }
+      close(): void { channels.delete(this); }
+    }
+    vi.stubGlobal("BroadcastChannel", TestChannel);
+    try {
+      const state = memoryLocalState(database.database);
+      const changed = vi.fn();
+      const unsubscribe = subscribeLocalePreferenceChange(changed);
+
+      await state.mutatePreferences((current) => ({ ...current, theme: "light", locale: "zh-CN" }));
+      await Promise.resolve();
+      expect(changed).toHaveBeenCalledOnce();
+      expect(publishedDurableUiRecords).toHaveLength(1);
+      expect(publishedDurableUiRecords[0]).toMatchObject({ theme: "light", locale: "zh-CN" });
+
+      await state.mutatePreferences((current) => ({ ...current, locale: "zh-CN" }));
+      await state.mutatePreferences((current) => ({ ...current, sessionNotificationsEnabled: false }));
+      await Promise.resolve();
+      expect(changed).toHaveBeenCalledOnce();
+      expect(publishedDurableUiRecords).toHaveLength(1);
+
+      database.failNextPut();
+      await expect(state.mutatePreferences((current) => ({ ...current, locale: "en-XA" })))
+        .rejects.toThrow("preference write failed");
+      await Promise.resolve();
+      expect(changed).toHaveBeenCalledOnce();
+      expect(database.readUiRecord()).toMatchObject({ locale: "zh-CN", sessionNotificationsEnabled: false });
+
+      await state.mutatePreferences((current) => ({ ...current, locale: DEFAULT_UI_PREFERENCES.locale }));
+      await Promise.resolve();
+      expect(changed).toHaveBeenCalledTimes(2);
+      expect(publishedDurableUiRecords).toHaveLength(2);
+      expect(publishedDurableUiRecords[1]).toMatchObject({ theme: "light", sessionNotificationsEnabled: false });
+      expect(publishedDurableUiRecords[1]).not.toHaveProperty("locale");
+      await expect(state.readPreferences()).resolves.toMatchObject({ locale: "system" });
+      unsubscribe();
     } finally {
       vi.unstubAllGlobals();
     }

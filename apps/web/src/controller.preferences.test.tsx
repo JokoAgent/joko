@@ -6,6 +6,8 @@ import { useAppController, type AppController } from "./controller.js";
 import { DEFAULT_UI_PREFERENCES, LocalState, type UiPreferences, type UiPreferencesMutation } from "./local-state.js";
 import { publishAppearancePreferencesChange } from "./appearance-preference-sync.js";
 import { publishAppShortcutPreferencesChange } from "./app-shortcut-preference-sync.js";
+import { publishSessionNotificationPreferenceChange } from "./session-notification-preference-sync.js";
+import { publishLocalePreferenceChange } from "./locale-preference-sync.js";
 import {
   effectiveAppShortcutCombos,
   matchesAppShortcutEvent,
@@ -84,6 +86,54 @@ it("keeps font setters stable while rolling back before a queued mutation sample
   expect(controller!.setCodeFamily).toBe(setCodeFamily);
   expect(controller!.setUiSize).toBe(setUiSize);
   expect(controller!.setCodeSize).toBe(setCodeSize);
+});
+
+it("keeps the system preference separate from the concrete effective locale", async () => {
+  vi.stubGlobal("matchMedia", () => ({ matches: false, addEventListener: vi.fn(), removeEventListener: vi.fn() }));
+  vi.spyOn(window.navigator, "languages", "get").mockReturnValue(["ja-JP", "zh-Hant-TW", "en-US"]);
+  let stored: UiPreferences = DEFAULT_UI_PREFERENCES;
+  vi.spyOn(LocalState, "open").mockResolvedValue({
+    listProfiles: async () => [],
+    listMachineCaches: async () => [],
+    readPreferences: async () => stored,
+    mutatePreferences: async (mutation: UiPreferencesMutation) => {
+      stored = mutation(stored);
+      return stored;
+    }
+  } as unknown as LocalState);
+  let controller: AppController | undefined;
+  const host = document.createElement("div");
+  document.body.append(host);
+  root = createRoot(host);
+  function Probe(): null {
+    controller = useAppController();
+    return null;
+  }
+
+  await act(async () => { root?.render(<Probe />); });
+  await vi.waitFor(() => expect(controller?.state.ready).toBe(true));
+  expect(controller?.state).toMatchObject({
+    systemLocale: "zh-CN",
+    effectiveLocale: "zh-CN",
+    preferences: { locale: "system" }
+  });
+  expect(document.documentElement.lang).toBe("zh-CN");
+
+  await act(async () => { await controller!.setLocale("en-XA"); });
+  expect(controller?.state).toMatchObject({
+    systemLocale: "zh-CN",
+    effectiveLocale: "en-XA",
+    preferences: { locale: "en-XA" }
+  });
+  expect(document.documentElement.lang).toBe("en-XA");
+
+  await act(async () => { await controller!.setLocale("system"); });
+  expect(controller?.state).toMatchObject({
+    systemLocale: "zh-CN",
+    effectiveLocale: "zh-CN",
+    preferences: { locale: "system" }
+  });
+  expect(document.documentElement.lang).toBe("zh-CN");
 });
 
 it("admits only one stale cross-controller shortcut binding and resyncs the rejected owner", async () => {
@@ -452,6 +502,355 @@ it("jointly closes bootstrap hints and drops stale or retired shortcut reads", a
   expect(observedShortcutCodes).not.toContain(retiredShortcut.code);
 });
 
+it("closes session-notification bootstrap hints and drops failed, stale, or retired reads", async () => {
+  vi.stubGlobal("matchMedia", () => ({ matches: false, addEventListener: vi.fn(), removeEventListener: vi.fn() }));
+  const channels = installTestBroadcastChannel();
+  const initialRead = deferred<UiPreferences | undefined>();
+  const bootstrapRead = controlledPreferenceRead();
+  const staleRead = controlledPreferenceRead();
+  const newestRead = controlledPreferenceRead();
+  const failedRead = controlledPreferenceRead();
+  const retiredRead = controlledPreferenceRead();
+  const controlledReads = [bootstrapRead, staleRead, newestRead, failedRead, retiredRead];
+  let firstRead = true;
+  const readPreferences = vi.fn((): Promise<UiPreferences | undefined> => {
+    if (firstRead) {
+      firstRead = false;
+      return initialRead.promise;
+    }
+    const controlled = controlledReads.shift();
+    return controlled === undefined ? Promise.resolve(DEFAULT_UI_PREFERENCES) : controlled.read();
+  });
+  vi.spyOn(LocalState, "open").mockResolvedValue({
+    listProfiles: async () => [],
+    listMachineCaches: async () => [],
+    readPreferences
+  } as unknown as LocalState);
+
+  let controller: AppController | undefined;
+  const observedNotificationValues: boolean[] = [];
+  const host = document.createElement("div");
+  document.body.append(host);
+  root = createRoot(host);
+  function Probe(): null {
+    controller = useAppController();
+    observedNotificationValues.push(controller.state.preferences.sessionNotificationsEnabled);
+    return null;
+  }
+  await act(async () => { root?.render(<Probe />); });
+  await vi.waitFor(() => expect(readPreferences).toHaveBeenCalledOnce());
+
+  await act(async () => {
+    publishSessionNotificationPreferenceChange();
+    await Promise.resolve();
+    initialRead.resolve(DEFAULT_UI_PREFERENCES);
+  });
+  await bootstrapRead.started.promise;
+  await act(async () => {
+    bootstrapRead.result.resolve({
+      ...DEFAULT_UI_PREFERENCES,
+      theme: "light",
+      sessionNotificationsEnabled: false
+    });
+  });
+  await vi.waitFor(() => {
+    expect(controller?.state.ready).toBe(true);
+    expect(controller?.state.preferences).toMatchObject({
+      theme: "dark",
+      sessionNotificationsEnabled: false
+    });
+  });
+  const stableSetter = controller!.setSessionNotificationsEnabled;
+  observedNotificationValues.length = 0;
+
+  publishSessionNotificationPreferenceChange();
+  await staleRead.started.promise;
+  publishSessionNotificationPreferenceChange();
+  await act(async () => {
+    staleRead.result.resolve({
+      ...DEFAULT_UI_PREFERENCES,
+      locale: "zh-CN",
+      sessionNotificationsEnabled: true
+    });
+  });
+  await newestRead.started.promise;
+  expect(controller?.state.preferences).toMatchObject({
+    locale: "system",
+    sessionNotificationsEnabled: false
+  });
+  expect(observedNotificationValues).not.toContain(true);
+  await act(async () => {
+    newestRead.result.resolve({
+      ...DEFAULT_UI_PREFERENCES,
+      locale: "zh-CN",
+      sessionNotificationsEnabled: false
+    });
+  });
+  expect(controller?.setSessionNotificationsEnabled).toBe(stableSetter);
+
+  publishSessionNotificationPreferenceChange();
+  await failedRead.started.promise;
+  await act(async () => {
+    failedRead.result.reject(new Error("preference read failed"));
+    await Promise.resolve();
+  });
+  expect(controller?.state.preferences).toMatchObject({
+    locale: "system",
+    sessionNotificationsEnabled: false
+  });
+
+  publishSessionNotificationPreferenceChange();
+  await retiredRead.started.promise;
+  const retiredController = controller!;
+  await act(async () => { root?.render(<></>); });
+  expect(channels.size).toBe(0);
+  await act(async () => {
+    retiredRead.result.resolve({
+      ...DEFAULT_UI_PREFERENCES,
+      sessionNotificationsEnabled: true
+    });
+    await Promise.resolve();
+  });
+  expect(retiredController.state.preferences.sessionNotificationsEnabled).toBe(false);
+  expect(observedNotificationValues).not.toContain(true);
+});
+
+it("hot-converges session notifications after queued local preference mutations", async () => {
+  vi.stubGlobal("matchMedia", () => ({ matches: false, addEventListener: vi.fn(), removeEventListener: vi.fn() }));
+  installTestBroadcastChannel();
+  let stored: UiPreferences = DEFAULT_UI_PREFERENCES;
+  let secondWindowGate: Deferred<void> | undefined;
+  const createLocal = (windowId: "first" | "second"): LocalState => ({
+    listProfiles: async () => [],
+    listMachineCaches: async () => [],
+    readPreferences: vi.fn(async () => stored),
+    mutatePreferences: vi.fn(async (mutation: UiPreferencesMutation) => {
+      if (windowId === "second" && secondWindowGate !== undefined) await secondWindowGate.promise;
+      const previousNotificationValue = stored.sessionNotificationsEnabled;
+      stored = mutation(stored);
+      if (previousNotificationValue !== stored.sessionNotificationsEnabled) {
+        publishSessionNotificationPreferenceChange();
+      }
+      return stored;
+    })
+  } as unknown as LocalState);
+  const firstLocal = createLocal("first");
+  const secondLocal = createLocal("second");
+  vi.spyOn(LocalState, "open")
+    .mockResolvedValueOnce(firstLocal)
+    .mockResolvedValueOnce(secondLocal);
+
+  let first: AppController | undefined;
+  let second: AppController | undefined;
+  const host = document.createElement("div");
+  document.body.append(host);
+  root = createRoot(host);
+  function Probe({ owner }: { readonly owner: "first" | "second" }): null {
+    const controller = useAppController();
+    if (owner === "first") first = controller;
+    else second = controller;
+    return null;
+  }
+  await act(async () => { root?.render(<><Probe owner="first" /><Probe owner="second" /></>); });
+  await vi.waitFor(() => {
+    expect(first?.state.ready).toBe(true);
+    expect(second?.state.ready).toBe(true);
+  });
+  const stableFirstSetter = first!.setSessionNotificationsEnabled;
+
+  stored = { ...stored, theme: "light", locale: "zh-CN" };
+  await act(async () => { await first!.setSessionNotificationsEnabled(false); });
+  await vi.waitFor(() => expect(second!.state.preferences.sessionNotificationsEnabled).toBe(false));
+  expect(first!.state.preferences).toMatchObject({ theme: "dark", locale: "system" });
+  expect(second!.state.preferences).toMatchObject({ theme: "dark", locale: "system" });
+  expect(first!.setSessionNotificationsEnabled).toBe(stableFirstSetter);
+
+  secondWindowGate = deferred<void>();
+  let pendingSecondMutation!: Promise<void>;
+  await act(async () => {
+    pendingSecondMutation = second!.setTheme("system");
+    await Promise.resolve();
+  });
+  await act(async () => { await first!.setSessionNotificationsEnabled(true); });
+  expect(second!.state.preferences).toMatchObject({ theme: "system", sessionNotificationsEnabled: false });
+
+  await act(async () => {
+    secondWindowGate?.resolve();
+    await pendingSecondMutation;
+  });
+  secondWindowGate = undefined;
+  await vi.waitFor(() => {
+    expect(second!.state.preferences).toMatchObject({
+      theme: "system",
+      locale: "system",
+      sessionNotificationsEnabled: true
+    });
+  });
+  expect(first!.state.preferences).toMatchObject({
+    theme: "dark",
+    locale: "system",
+    sessionNotificationsEnabled: true
+  });
+  expect(first!.setSessionNotificationsEnabled).toBe(stableFirstSetter);
+});
+
+it("closes locale bootstrap hints and drops failed, stale, or retired reads", async () => {
+  vi.stubGlobal("matchMedia", () => ({ matches: false, addEventListener: vi.fn(), removeEventListener: vi.fn() }));
+  const channels = installTestBroadcastChannel();
+  const initialRead = deferred<UiPreferences | undefined>();
+  const bootstrapRead = controlledPreferenceRead();
+  const staleRead = controlledPreferenceRead();
+  const newestRead = controlledPreferenceRead();
+  const failedRead = controlledPreferenceRead();
+  const retiredRead = controlledPreferenceRead();
+  const controlledReads = [bootstrapRead, staleRead, newestRead, failedRead, retiredRead];
+  let firstRead = true;
+  const readPreferences = vi.fn((): Promise<UiPreferences | undefined> => {
+    if (firstRead) {
+      firstRead = false;
+      return initialRead.promise;
+    }
+    const controlled = controlledReads.shift();
+    return controlled === undefined ? Promise.resolve(DEFAULT_UI_PREFERENCES) : controlled.read();
+  });
+  vi.spyOn(LocalState, "open").mockResolvedValue({
+    listProfiles: async () => [],
+    listMachineCaches: async () => [],
+    readPreferences
+  } as unknown as LocalState);
+
+  let controller: AppController | undefined;
+  const observedLocales: string[] = [];
+  const host = document.createElement("div");
+  document.body.append(host);
+  root = createRoot(host);
+  function Probe(): null {
+    controller = useAppController();
+    observedLocales.push(controller.state.preferences.locale);
+    return null;
+  }
+  await act(async () => { root?.render(<Probe />); });
+  await vi.waitFor(() => expect(readPreferences).toHaveBeenCalledOnce());
+
+  await act(async () => {
+    publishLocalePreferenceChange();
+    await Promise.resolve();
+    initialRead.resolve(DEFAULT_UI_PREFERENCES);
+  });
+  await bootstrapRead.started.promise;
+  await act(async () => {
+    bootstrapRead.result.resolve({ ...DEFAULT_UI_PREFERENCES, theme: "light", locale: "zh-CN" });
+  });
+  await vi.waitFor(() => {
+    expect(controller?.state.ready).toBe(true);
+    expect(controller?.state.preferences).toMatchObject({ theme: "dark", locale: "zh-CN" });
+  });
+  const stableSetter = controller!.setLocale;
+  observedLocales.length = 0;
+
+  publishLocalePreferenceChange();
+  await staleRead.started.promise;
+  publishLocalePreferenceChange();
+  await act(async () => {
+    staleRead.result.resolve({ ...DEFAULT_UI_PREFERENCES, theme: "light", locale: "en-XA" });
+  });
+  await newestRead.started.promise;
+  expect(controller?.state.preferences).toMatchObject({ theme: "dark", locale: "zh-CN" });
+  expect(observedLocales).not.toContain("en-XA");
+  await act(async () => {
+    newestRead.result.resolve({ ...DEFAULT_UI_PREFERENCES, theme: "light", locale: "en" });
+  });
+  expect(controller?.state.preferences).toMatchObject({ theme: "dark", locale: "en" });
+  expect(controller?.setLocale).toBe(stableSetter);
+
+  publishLocalePreferenceChange();
+  await failedRead.started.promise;
+  await act(async () => {
+    failedRead.result.reject(new Error("preference read failed"));
+    await Promise.resolve();
+  });
+  expect(controller?.state.preferences.locale).toBe("en");
+
+  publishLocalePreferenceChange();
+  await retiredRead.started.promise;
+  const retiredController = controller!;
+  await act(async () => { root?.render(<></>); });
+  expect(channels.size).toBe(0);
+  await act(async () => {
+    retiredRead.result.resolve({ ...DEFAULT_UI_PREFERENCES, locale: "zh-CN" });
+    await Promise.resolve();
+  });
+  expect(retiredController.state.preferences.locale).toBe("en");
+  expect(observedLocales).not.toContain("zh-CN");
+});
+
+it("hot-converges locales after queued local preference mutations", async () => {
+  vi.stubGlobal("matchMedia", () => ({ matches: false, addEventListener: vi.fn(), removeEventListener: vi.fn() }));
+  installTestBroadcastChannel();
+  let stored: UiPreferences = DEFAULT_UI_PREFERENCES;
+  let secondWindowGate: Deferred<void> | undefined;
+  const createLocal = (windowId: "first" | "second"): LocalState => ({
+    listProfiles: async () => [],
+    listMachineCaches: async () => [],
+    readPreferences: vi.fn(async () => stored),
+    mutatePreferences: vi.fn(async (mutation: UiPreferencesMutation) => {
+      if (windowId === "second" && secondWindowGate !== undefined) await secondWindowGate.promise;
+      const previousLocale = stored.locale;
+      stored = mutation(stored);
+      if (previousLocale !== stored.locale) publishLocalePreferenceChange();
+      return stored;
+    })
+  } as unknown as LocalState);
+  const firstLocal = createLocal("first");
+  const secondLocal = createLocal("second");
+  vi.spyOn(LocalState, "open")
+    .mockResolvedValueOnce(firstLocal)
+    .mockResolvedValueOnce(secondLocal);
+
+  let first: AppController | undefined;
+  let second: AppController | undefined;
+  const host = document.createElement("div");
+  document.body.append(host);
+  root = createRoot(host);
+  function Probe({ owner }: { readonly owner: "first" | "second" }): null {
+    const controller = useAppController();
+    if (owner === "first") first = controller;
+    else second = controller;
+    return null;
+  }
+  await act(async () => { root?.render(<><Probe owner="first" /><Probe owner="second" /></>); });
+  await vi.waitFor(() => {
+    expect(first?.state.ready).toBe(true);
+    expect(second?.state.ready).toBe(true);
+  });
+  const stableFirstSetter = first!.setLocale;
+
+  stored = { ...stored, theme: "light", sessionNotificationsEnabled: false };
+  await act(async () => { await first!.setLocale("zh-CN"); });
+  await vi.waitFor(() => expect(second!.state.preferences.locale).toBe("zh-CN"));
+  expect(first!.state.preferences).toMatchObject({ theme: "dark", sessionNotificationsEnabled: true });
+  expect(second!.state.preferences).toMatchObject({ theme: "dark", sessionNotificationsEnabled: true });
+  expect(first!.setLocale).toBe(stableFirstSetter);
+
+  secondWindowGate = deferred<void>();
+  let pendingSecondMutation!: Promise<void>;
+  await act(async () => {
+    pendingSecondMutation = second!.setTheme("system");
+    await Promise.resolve();
+  });
+  await act(async () => { await first!.setLocale("en-XA"); });
+  expect(second!.state.preferences).toMatchObject({ theme: "system", locale: "zh-CN" });
+
+  await act(async () => {
+    secondWindowGate?.resolve();
+    await pendingSecondMutation;
+  });
+  secondWindowGate = undefined;
+  await vi.waitFor(() => expect(second!.state.preferences).toMatchObject({ theme: "system", locale: "en-XA" }));
+  expect(first!.state.preferences).toMatchObject({ theme: "dark", locale: "en-XA" });
+  expect(first!.setLocale).toBe(stableFirstSetter);
+});
+
 it("waits for confirmed bootstrap preferences before applying native window zoom", async () => {
   vi.stubGlobal("matchMedia", () => ({ matches: false, addEventListener: vi.fn(), removeEventListener: vi.fn() }));
   const initialRead = deferred<UiPreferences | undefined>();
@@ -667,7 +1066,7 @@ it("adopts durable appearance and bases zoom intent on the latest cross-controll
   await act(async () => { await first!.setCodeFamily("Mono"); });
   await Promise.resolve();
   expect(retiredSecond.state.preferences.codeFamily).toBe("");
-  expect(channels.size).toBe(2);
+  expect(channels.size).toBe(4);
 
   const setZoomFactor = vi.fn(async () => undefined);
   vi.stubGlobal("jokoDesktop", {
@@ -865,15 +1264,95 @@ it("closes the bootstrap hint window and discards stale or retired appearance re
   expect(themeColorMeta.content).toBe(themeColorBeforeUnmount);
 });
 
+it("publishes a client layout-reset occurrence only after durable Web reset success", async () => {
+  vi.stubGlobal("matchMedia", () => ({ matches: false, addEventListener: vi.fn(), removeEventListener: vi.fn() }));
+  installTestBroadcastChannel();
+  const occurrences: unknown[] = [];
+  const observer = new BroadcastChannel("joko:client-layout-reset:v1");
+  observer.onmessage = (event) => occurrences.push(event.data);
+  let stored: UiPreferences = {
+    ...DEFAULT_UI_PREFERENCES,
+    inspectorOpen: true,
+    navigationOpen: false,
+    navigationMode: "hidden",
+    navigationWidth: 412
+  };
+  let writeGate: Deferred<void> | undefined = deferred<void>();
+  let rejectNextWrite = false;
+  const mutatePreferences = vi.fn(async (mutation: UiPreferencesMutation): Promise<UiPreferences> => {
+    if (rejectNextWrite) {
+      rejectNextWrite = false;
+      throw new Error("preference write failed");
+    }
+    await writeGate?.promise;
+    stored = mutation(stored);
+    return stored;
+  });
+  vi.spyOn(LocalState, "open").mockResolvedValue({
+    listProfiles: async () => [],
+    listMachineCaches: async () => [],
+    readPreferences: async () => stored,
+    mutatePreferences
+  } as unknown as LocalState);
+  let controller: AppController | undefined;
+  const host = document.createElement("div");
+  document.body.append(host);
+  root = createRoot(host);
+  function Probe(): null {
+    controller = useAppController();
+    return null;
+  }
+
+  await act(async () => { root?.render(<Probe />); });
+  await vi.waitFor(() => expect(controller?.state.ready).toBe(true));
+
+  let reset!: Promise<void>;
+  await act(async () => {
+    reset = controller!.resetLayoutPreferences();
+    await Promise.resolve();
+  });
+  expect(mutatePreferences).toHaveBeenCalledOnce();
+  expect(occurrences).toEqual([]);
+
+  await act(async () => {
+    writeGate?.resolve();
+    await reset;
+    await Promise.resolve();
+  });
+  expect(occurrences).toEqual([{ kind: "client-layout-reset" }]);
+
+  occurrences.length = 0;
+  writeGate = undefined;
+  rejectNextWrite = true;
+  await act(async () => {
+    await expect(controller!.resetLayoutPreferences()).rejects.toThrow("preference write failed");
+    await Promise.resolve();
+  });
+  expect(occurrences).toEqual([]);
+
+  vi.stubGlobal("jokoDesktop", { capabilities: ["layout.reset"] } as unknown as JokoDesktopApi);
+  await act(async () => {
+    await controller!.resetLayoutPreferences();
+    await Promise.resolve();
+  });
+  expect(occurrences).toEqual([]);
+  observer.close();
+});
+
 interface Deferred<T> {
   readonly promise: Promise<T>;
   readonly resolve: (value?: T) => void;
+  readonly reject: (error: unknown) => void;
 }
 
 function deferred<T>(): Deferred<T> {
   let resolve!: (value: T) => void;
-  const promise = new Promise<T>((accept) => { resolve = accept; });
-  return { promise, resolve: (value?: T) => resolve(value as T) };
+  let reject!: (error: unknown) => void;
+  const promise = new Promise<T>((accept, decline) => {
+    resolve = accept;
+    reject = decline;
+  });
+  return { promise, resolve: (value?: T) => resolve(value as T), reject };
 }
 
 function controlledPreferenceRead(): {

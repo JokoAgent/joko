@@ -66,13 +66,13 @@ export function ManagedModelRuntimeSettings({
   }, [active, controller]);
 
   if (runtimes.length === 0) return null;
-  return <section className="managed-model-runtimes" aria-label={copy(controller.state.preferences.locale).sectionLabel}>
+  return <section className="managed-model-runtimes" aria-label={copy(controller.state.effectiveLocale).sectionLabel}>
     {runtimes.map((runtime) => <ManagedModelRuntimePanel
       key={runtime.id}
       controller={controller}
       runtime={runtime}
       runAction={runAction}
-      locale={controller.state.preferences.locale}
+      locale={controller.state.effectiveLocale}
     />)}
   </section>;
 }

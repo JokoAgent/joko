@@ -218,7 +218,7 @@ export function ConnectionScreen({ controller, t }: { readonly controller: AppCo
                 <div className="profile-card__body">
                   <strong>{profile.name}</strong>
                   <span>{profile.origin}</span>
-                  {profile.lastConnectedAt !== undefined && <small>{t("connection.lastUsed", { time: formatRelativeTime(profile.lastConnectedAt, state.preferences.locale) })}</small>}
+                  {profile.lastConnectedAt !== undefined && <small>{t("connection.lastUsed", { time: formatRelativeTime(profile.lastConnectedAt, state.effectiveLocale) })}</small>}
                 </div>
                 <Button tone="primary" onClick={() => connect(profile)} disabled={busy !== undefined}>
                   {busy === profile.id ? <Spinner label={t("connection.connecting")} /> : <ArrowRight aria-hidden="true" />}

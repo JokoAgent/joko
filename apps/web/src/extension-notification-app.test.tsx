@@ -77,6 +77,8 @@ function connectedState(): ControllerState {
     route: { kind: "session", sessionId: "session-current" },
     navigationRevision: 0,
     preferences: DEFAULT_UI_PREFERENCES,
+    systemLocale: "en",
+    effectiveLocale: "en",
     extensionNotifications: []
   };
 }

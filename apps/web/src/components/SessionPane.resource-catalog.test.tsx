@@ -292,6 +292,8 @@ function controllerFor(
     snapshot,
     route: { kind: "session", sessionId: sourceSession.id },
     preferences: DEFAULT_UI_PREFERENCES,
+    systemLocale: "en",
+    effectiveLocale: "en",
     extensionNotifications: []
   };
   return { state, listSessionResources, listSessionArtifacts, listArtifactReferenceCatalog } as unknown as AppController;

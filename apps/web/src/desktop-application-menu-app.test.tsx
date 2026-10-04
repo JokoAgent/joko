@@ -27,6 +27,8 @@ describe("Desktop application-menu App lifecycle", () => {
       route: { kind: "session" },
       navigationRevision: 0,
       preferences: DEFAULT_UI_PREFERENCES,
+      systemLocale: "en",
+      effectiveLocale: "en",
       extensionNotifications: []
     };
     const controller = {
@@ -84,6 +86,57 @@ describe("Desktop application-menu App lifecycle", () => {
 
     await act(async () => { root.unmount(); });
     expect(unsubscribe).toHaveBeenCalledOnce();
+    container.remove();
+    Reflect.deleteProperty(window, "jokoDesktop");
+  });
+
+  it("waits for hydration before sending the concrete effective locale to strict Desktop surfaces", async () => {
+    const setLocale = vi.fn(async () => undefined);
+    Object.defineProperty(window, "jokoDesktop", {
+      configurable: true,
+      value: {
+        platform: "win32",
+        capabilities: ["app.info", "application.menu", "selection.quote.contextMenu"],
+        appInfo: { get: vi.fn() },
+        applicationMenu: {
+          configure: vi.fn(async () => undefined),
+          onCommand: vi.fn(() => vi.fn())
+        },
+        selectionContextMenu: { setLocale, onAddToChat: vi.fn(() => vi.fn()) }
+      } as unknown as JokoDesktopApi
+    });
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    const coldBase = controllerWithState(false, DEFAULT_UI_PREFERENCES);
+    const coldController = {
+      ...coldBase,
+      state: {
+        ...coldBase.state,
+        systemLocale: "zh-CN" as const,
+        effectiveLocale: "zh-CN" as const
+      }
+    } as AppController;
+    const readyBase = controllerWithState(true, { ...DEFAULT_UI_PREFERENCES, locale: "en" });
+    const readyController = {
+      ...readyBase,
+      state: {
+        ...readyBase.state,
+        systemLocale: "zh-CN" as const,
+        effectiveLocale: "en" as const
+      }
+    } as AppController;
+
+    await act(async () => { root.render(createElement(AppWithController, { controller: coldController })); });
+    expect(setLocale).not.toHaveBeenCalled();
+
+    await act(async () => { root.render(createElement(AppWithController, { controller: readyController })); });
+    expect(setLocale).toHaveBeenCalledOnce();
+    expect(setLocale).toHaveBeenCalledWith("en");
+    expect(setLocale).not.toHaveBeenCalledWith("zh-CN");
+    expect(setLocale).not.toHaveBeenCalledWith("system");
+
+    await act(async () => { root.unmount(); });
     container.remove();
     Reflect.deleteProperty(window, "jokoDesktop");
   });
@@ -379,6 +432,8 @@ function controllerWithState(
       route,
       navigationRevision: 0,
       preferences,
+      systemLocale: "en",
+      effectiveLocale: preferences.locale === "system" ? "en" : preferences.locale,
       extensionNotifications: []
     },
     navigate: vi.fn(),

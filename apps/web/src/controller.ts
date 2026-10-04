@@ -43,6 +43,7 @@ import type {
   FederatedSessionMessageSearchMatchView,
   InteractionView,
   Locale,
+  LocalePreference,
   MachineCacheView,
   MachinePresenceView,
   OperationApi,
@@ -52,8 +53,10 @@ import type {
   NewSessionLocalDraft,
   PendingExtensionUseView,
   SessionMessageSearchCollectionOptions,
+  SystemLocale,
   Theme
 } from "./model.js";
+import { readHostSystemLocale, resolveLocalePreference } from "./system-locale.js";
 import { appendTextToComposerDocument, composerDocumentKeepingQuotes } from "./composer-quote-document.js";
 import { restoreRejectedComposerDraft } from "./composer-draft-recovery.js";
 import { emptySnapshot } from "./model.js";
@@ -78,12 +81,21 @@ import {
   withAppShortcutProjection
 } from "./app-shortcut-preference-sync.js";
 import {
+  subscribeSessionNotificationPreferenceChange,
+  withSessionNotificationPreference
+} from "./session-notification-preference-sync.js";
+import { subscribeLocalePreferenceChange, withLocalePreference } from "./locale-preference-sync.js";
+import {
   withSidebarDisplayPreferences,
   withSidebarOwnerLayout,
   type SidebarDisplayPreferences,
   type SidebarOwnerLayout
 } from "./sidebar-layout.js";
-import { layoutResetPersistsSessionSplit, resetClientLayout } from "./client-layout-reset.js";
+import {
+  layoutResetPersistsSessionSplit,
+  publishClientLayoutResetOccurrence,
+  resetClientLayout
+} from "./client-layout-reset.js";
 import {
   machineCacheFromSnapshot,
   normalizeMachineSelection,
@@ -160,6 +172,10 @@ export interface ControllerState {
   /** One-shot focus intent for an in-task Browser page in the Inspector. */
   readonly browserInspectorFocusRequest?: BrowserInspectorFocusRequest;
   readonly preferences: UiPreferences;
+  /** OS-derived locale captured for this renderer owner; refreshed on the next app start. */
+  readonly systemLocale: SystemLocale;
+  /** Strict content locale resolved from the durable preference and system locale. */
+  readonly effectiveLocale: Locale;
   readonly statusMessage?: string;
   readonly error?: string;
   readonly editorTextUpdate?: { readonly eventId: string; readonly sessionId: string; readonly text: string };
@@ -203,7 +219,7 @@ export interface AppController extends OperationApi {
     readonly isCurrent?: () => boolean;
     readonly signal?: AbortSignal;
   }): void;
-  setLocale(locale: Locale): Promise<void>;
+  setLocale(locale: LocalePreference): Promise<void>;
   setTheme(theme: Theme): Promise<void>;
   setUiFamily(family: string): Promise<void>;
   setCodeFamily(family: string): Promise<void>;
@@ -256,7 +272,19 @@ export interface ConnectionSelectionOptions {
   readonly automatic?: boolean;
 }
 
+function withControllerPreferences(
+  current: ControllerState,
+  preferences: UiPreferences,
+  systemLocale: SystemLocale
+): ControllerState {
+  const effectiveLocale = resolveLocalePreference(preferences.locale, systemLocale);
+  return current.preferences === preferences && current.effectiveLocale === effectiveLocale
+    ? current
+    : { ...current, preferences, effectiveLocale };
+}
+
 export function useAppController(): AppController {
+  const [systemLocale] = useState<SystemLocale>(() => readHostSystemLocale(window));
   const [state, setState] = useState<ControllerState>({
     ready: false,
     connectionState: "disconnected",
@@ -272,6 +300,8 @@ export function useAppController(): AppController {
     route: routeFromLocation(),
     navigationRevision: 0,
     preferences: DEFAULT_UI_PREFERENCES,
+    systemLocale,
+    effectiveLocale: resolveLocalePreference(DEFAULT_UI_PREFERENCES.locale, systemLocale),
     extensionNotifications: []
   });
   const [windowZoomApplicationRevision, setWindowZoomApplicationRevision] = useState(0);
@@ -300,6 +330,10 @@ export function useAppController(): AppController {
   const appearancePreferenceHintRevisionRef = useRef(0);
   const appShortcutPreferenceSyncOwnerRef = useRef(0);
   const appShortcutPreferenceHintRevisionRef = useRef(0);
+  const sessionNotificationPreferenceSyncOwnerRef = useRef(0);
+  const sessionNotificationPreferenceHintRevisionRef = useRef(0);
+  const localePreferenceSyncOwnerRef = useRef(0);
+  const localePreferenceHintRevisionRef = useRef(0);
   const gatewayRef = useRef<OrchestratorGateway | undefined>(undefined);
   const gatewayGenerationRef = useRef(0);
   const htmlPreviewsRef = useRef(new Map<string, {
@@ -353,7 +387,7 @@ export function useAppController(): AppController {
           const projected = current.preferences === previous
             ? next
             : withAppearanceProjection(current.preferences, durable);
-          return projected === current.preferences ? current : { ...current, preferences: projected };
+          return projected === current.preferences ? current : withControllerPreferences(current, projected, systemLocale);
         });
       }
       // The content-free hint cannot distinguish a zoom change whose durable
@@ -362,7 +396,7 @@ export function useAppController(): AppController {
       // projections cannot leave the shared native zoom stale.
       setWindowZoomApplicationRevision((revision) => revision + 1);
     }).catch(() => undefined);
-  }, [enqueuePreferenceOperation]);
+  }, [enqueuePreferenceOperation, systemLocale]);
   const enqueueAppShortcutPreferenceRefresh = useCallback((owner: number, requestRevision: number): void => {
     void enqueuePreferenceOperation(async () => {
       if (appShortcutPreferenceSyncOwnerRef.current !== owner
@@ -380,10 +414,52 @@ export function useAppController(): AppController {
         const projected = current.preferences === previous
           ? next
           : withAppShortcutProjection(current.preferences, durable);
-        return projected === current.preferences ? current : { ...current, preferences: projected };
+        return projected === current.preferences ? current : withControllerPreferences(current, projected, systemLocale);
       });
     }).catch(() => undefined);
-  }, [enqueuePreferenceOperation]);
+  }, [enqueuePreferenceOperation, systemLocale]);
+  const enqueueSessionNotificationPreferenceRefresh = useCallback((owner: number, requestRevision: number): void => {
+    void enqueuePreferenceOperation(async () => {
+      if (sessionNotificationPreferenceSyncOwnerRef.current !== owner
+        || sessionNotificationPreferenceHintRevisionRef.current !== requestRevision) return;
+      const local = localRef.current;
+      if (local === undefined) return;
+      const durable = (await local.readPreferences()) ?? DEFAULT_UI_PREFERENCES;
+      if (sessionNotificationPreferenceSyncOwnerRef.current !== owner
+        || sessionNotificationPreferenceHintRevisionRef.current !== requestRevision) return;
+      const previous = preferencesRef.current;
+      const next = withSessionNotificationPreference(previous, durable);
+      if (next === previous) return;
+      preferencesRef.current = next;
+      setState((current) => {
+        const projected = current.preferences === previous
+          ? next
+          : withSessionNotificationPreference(current.preferences, durable);
+        return projected === current.preferences ? current : withControllerPreferences(current, projected, systemLocale);
+      });
+    }).catch(() => undefined);
+  }, [enqueuePreferenceOperation, systemLocale]);
+  const enqueueLocalePreferenceRefresh = useCallback((owner: number, requestRevision: number): void => {
+    void enqueuePreferenceOperation(async () => {
+      if (localePreferenceSyncOwnerRef.current !== owner
+        || localePreferenceHintRevisionRef.current !== requestRevision) return;
+      const local = localRef.current;
+      if (local === undefined) return;
+      const durable = (await local.readPreferences()) ?? DEFAULT_UI_PREFERENCES;
+      if (localePreferenceSyncOwnerRef.current !== owner
+        || localePreferenceHintRevisionRef.current !== requestRevision) return;
+      const previous = preferencesRef.current;
+      const next = withLocalePreference(previous, durable);
+      if (next === previous) return;
+      preferencesRef.current = next;
+      setState((current) => {
+        const projected = current.preferences === previous
+          ? next
+          : withLocalePreference(current.preferences, durable);
+        return projected === current.preferences ? current : withControllerPreferences(current, projected, systemLocale);
+      });
+    }).catch(() => undefined);
+  }, [enqueuePreferenceOperation, systemLocale]);
 
   useEffect(() => {
     const routeSessionId = extensionUiRouteSessionId(state.route);
@@ -396,10 +472,16 @@ export function useAppController(): AppController {
     let cancelled = false;
     let appearanceSyncLive = false;
     let appShortcutSyncLive = false;
+    let sessionNotificationSyncLive = false;
+    let localeSyncLive = false;
     const appearanceSyncOwner = ++appearancePreferenceSyncOwnerRef.current;
     appearancePreferenceHintRevisionRef.current = 0;
     const appShortcutSyncOwner = ++appShortcutPreferenceSyncOwnerRef.current;
     appShortcutPreferenceHintRevisionRef.current = 0;
+    const sessionNotificationSyncOwner = ++sessionNotificationPreferenceSyncOwnerRef.current;
+    sessionNotificationPreferenceHintRevisionRef.current = 0;
+    const localeSyncOwner = ++localePreferenceSyncOwnerRef.current;
+    localePreferenceHintRevisionRef.current = 0;
     const closeAppearancePreferenceSync = subscribeAppearancePreferencesChange(() => {
       const requestRevision = ++appearancePreferenceHintRevisionRef.current;
       if (appearanceSyncLive) enqueueAppearancePreferenceRefresh(appearanceSyncOwner, requestRevision);
@@ -408,8 +490,20 @@ export function useAppController(): AppController {
       const requestRevision = ++appShortcutPreferenceHintRevisionRef.current;
       if (appShortcutSyncLive) enqueueAppShortcutPreferenceRefresh(appShortcutSyncOwner, requestRevision);
     });
+    const closeSessionNotificationPreferenceSync = subscribeSessionNotificationPreferenceChange(() => {
+      const requestRevision = ++sessionNotificationPreferenceHintRevisionRef.current;
+      if (sessionNotificationSyncLive) {
+        enqueueSessionNotificationPreferenceRefresh(sessionNotificationSyncOwner, requestRevision);
+      }
+    });
+    const closeLocalePreferenceSync = subscribeLocalePreferenceChange(() => {
+      const requestRevision = ++localePreferenceHintRevisionRef.current;
+      if (localeSyncLive) enqueueLocalePreferenceRefresh(localeSyncOwner, requestRevision);
+    });
     const initialAppearanceRevision = appearancePreferenceHintRevisionRef.current;
     const initialAppShortcutRevision = appShortcutPreferenceHintRevisionRef.current;
+    const initialSessionNotificationRevision = sessionNotificationPreferenceHintRevisionRef.current;
+    const initialLocaleRevision = localePreferenceHintRevisionRef.current;
     void LocalState.open().then(async (local) => {
       const [persistedProfiles, machineCaches, preferences, managedStatus, automaticConnectionAvailable] = await Promise.all([
         local.listProfiles(),
@@ -460,17 +554,31 @@ export function useAppController(): AppController {
         && effectiveManagedStatus?.state === "starting";
       let observedAppearanceRevision = initialAppearanceRevision;
       let observedAppShortcutRevision = initialAppShortcutRevision;
+      let observedSessionNotificationRevision = initialSessionNotificationRevision;
+      let observedLocaleRevision = initialLocaleRevision;
       while (!cancelled && (observedAppearanceRevision !== appearancePreferenceHintRevisionRef.current
-        || observedAppShortcutRevision !== appShortcutPreferenceHintRevisionRef.current)) {
+        || observedAppShortcutRevision !== appShortcutPreferenceHintRevisionRef.current
+        || observedSessionNotificationRevision !== sessionNotificationPreferenceHintRevisionRef.current
+        || observedLocaleRevision !== localePreferenceHintRevisionRef.current)) {
         const nextAppearanceRevision = appearancePreferenceHintRevisionRef.current;
         const nextAppShortcutRevision = appShortcutPreferenceHintRevisionRef.current;
+        const nextSessionNotificationRevision = sessionNotificationPreferenceHintRevisionRef.current;
+        const nextLocaleRevision = localePreferenceHintRevisionRef.current;
         const refreshAppearance = observedAppearanceRevision !== nextAppearanceRevision;
         const refreshAppShortcuts = observedAppShortcutRevision !== nextAppShortcutRevision;
+        const refreshSessionNotification = observedSessionNotificationRevision !== nextSessionNotificationRevision;
+        const refreshLocale = observedLocaleRevision !== nextLocaleRevision;
         observedAppearanceRevision = nextAppearanceRevision;
         observedAppShortcutRevision = nextAppShortcutRevision;
+        observedSessionNotificationRevision = nextSessionNotificationRevision;
+        observedLocaleRevision = nextLocaleRevision;
         const durable = (await local.readPreferences()) ?? DEFAULT_UI_PREFERENCES;
         if (refreshAppearance) effectivePreferences = withAppearanceProjection(effectivePreferences, durable);
         if (refreshAppShortcuts) effectivePreferences = withAppShortcutProjection(effectivePreferences, durable);
+        if (refreshSessionNotification) {
+          effectivePreferences = withSessionNotificationPreference(effectivePreferences, durable);
+        }
+        if (refreshLocale) effectivePreferences = withLocalePreference(effectivePreferences, durable);
       }
       if (cancelled) return;
       localRef.current = local;
@@ -484,11 +592,15 @@ export function useAppController(): AppController {
         ...(effectiveManagedStatus === undefined ? {} : { managedOrchestratorStatus: effectiveManagedStatus }),
         automaticConnectionAvailable,
         preferences: effectivePreferences,
+        systemLocale,
+        effectiveLocale: resolveLocalePreference(effectivePreferences.locale, systemLocale),
         ...(managedBootstrapError === undefined ? {} : { error: managedBootstrapError }),
         ...(automaticProfile === undefined ? {} : { activeProfile: automaticProfile, connectionState: "connecting" as const })
       }));
       appearanceSyncLive = true;
       appShortcutSyncLive = true;
+      sessionNotificationSyncLive = true;
+      localeSyncLive = true;
     }).catch((error: unknown) => {
       if (!cancelled) setState((current) => ({ ...current, ready: true, error: messageOf(error) }));
     });
@@ -566,10 +678,18 @@ export function useAppController(): AppController {
       cancelled = true;
       appearanceSyncLive = false;
       appShortcutSyncLive = false;
+      sessionNotificationSyncLive = false;
+      localeSyncLive = false;
       closeAppearancePreferenceSync();
       closeAppShortcutPreferenceSync();
+      closeSessionNotificationPreferenceSync();
+      closeLocalePreferenceSync();
       if (appearancePreferenceSyncOwnerRef.current === appearanceSyncOwner) appearancePreferenceSyncOwnerRef.current += 1;
       if (appShortcutPreferenceSyncOwnerRef.current === appShortcutSyncOwner) appShortcutPreferenceSyncOwnerRef.current += 1;
+      if (sessionNotificationPreferenceSyncOwnerRef.current === sessionNotificationSyncOwner) {
+        sessionNotificationPreferenceSyncOwnerRef.current += 1;
+      }
+      if (localePreferenceSyncOwnerRef.current === localeSyncOwner) localePreferenceSyncOwnerRef.current += 1;
       gatewayGenerationRef.current += 1;
       machineRefreshGenerationRef.current += 1;
       discoveryGenerationRef.current += 1;
@@ -585,7 +705,12 @@ export function useAppController(): AppController {
       }
       remoteMachineGatewaysRef.current.clear();
     };
-  }, [enqueueAppearancePreferenceRefresh, enqueueAppShortcutPreferenceRefresh]);
+  }, [
+    enqueueAppearancePreferenceRefresh,
+    enqueueAppShortcutPreferenceRefresh,
+    enqueueLocalePreferenceRefresh,
+    enqueueSessionNotificationPreferenceRefresh
+  ]);
 
   useEffect(() => {
     applyTheme(state.preferences.theme);
@@ -597,8 +722,8 @@ export function useAppController(): AppController {
   }, [state.preferences.theme]);
 
   useEffect(() => {
-    document.documentElement.lang = state.preferences.locale;
-  }, [state.preferences.locale]);
+    document.documentElement.lang = state.effectiveLocale;
+  }, [state.effectiveLocale]);
 
   useEffect(() => {
     applyAppearanceTypography(state.preferences, [document.documentElement, document.body]);
@@ -616,7 +741,7 @@ export function useAppController(): AppController {
     const previous = preferencesRef.current;
     const next = mutation(previous);
     preferencesRef.current = next;
-    setState((current) => ({ ...current, preferences: next }));
+    setState((current) => withControllerPreferences(current, next, systemLocale));
     try {
       await requireLocal(localRef.current).mutatePreferences(mutation);
     } catch (error) {
@@ -625,7 +750,9 @@ export function useAppController(): AppController {
       // if the controller itself was retired while persistence was pending.
       if (preferencesRef.current === next) {
         preferencesRef.current = previous;
-        setState((current) => current.preferences === next ? { ...current, preferences: previous } : current);
+        setState((current) => current.preferences === next
+          ? withControllerPreferences(current, previous, systemLocale)
+          : current);
       }
       // A stale renderer can lose an authoritative shortcut conflict race.
       // Reconcile only that nested value; unrelated preferences intentionally
@@ -640,7 +767,7 @@ export function useAppController(): AppController {
             };
             preferencesRef.current = reconciled;
             setState((current) => current.preferences === previous
-              ? { ...current, preferences: reconciled }
+              ? withControllerPreferences(current, reconciled, systemLocale)
               : current);
           }
         } catch {
@@ -650,7 +777,7 @@ export function useAppController(): AppController {
       }
       throw error;
     }
-  }, []);
+  }, [systemLocale]);
 
   const mutatePreferences = useCallback((
     mutation: UiPreferencesMutation,
@@ -684,6 +811,14 @@ export function useAppController(): AppController {
   );
   const setCodeSize = useCallback<AppController["setCodeSize"]>(
     (codeSize) => updatePreferences({ codeSize: clampCodeSize(codeSize) }),
+    [updatePreferences]
+  );
+  const setSessionNotificationsEnabled = useCallback<AppController["setSessionNotificationsEnabled"]>(
+    (sessionNotificationsEnabled) => updatePreferences({ sessionNotificationsEnabled }),
+    [updatePreferences]
+  );
+  const setLocale = useCallback<AppController["setLocale"]>(
+    (locale) => updatePreferences({ locale }),
     [updatePreferences]
   );
   const changeWindowZoom = useCallback<AppController["changeWindowZoom"]>((intent) => {
@@ -2257,7 +2392,7 @@ export function useAppController(): AppController {
     cancelAutomaticConnectionAttempt,
     setAutomaticConnectionEnabled,
     navigate,
-    setLocale: (locale) => updatePreferences({ locale }),
+    setLocale,
     setTheme: (theme) => updatePreferences({ theme }),
     setUiFamily,
     setCodeFamily,
@@ -2294,7 +2429,7 @@ export function useAppController(): AppController {
       ? { webLinkOpenPreference: LINK_OPEN_DEFAULTS.web } : { localLinkOpenPreference: LINK_OPEN_DEFAULTS.local }),
     setStreamFadeEnabled: (streamFadeEnabled) => updatePreferences({ streamFadeEnabled }),
     resetStreamFadeEnabled: () => updatePreferences({ streamFadeEnabled: true }),
-    setSessionNotificationsEnabled: (sessionNotificationsEnabled) => updatePreferences({ sessionNotificationsEnabled }),
+    setSessionNotificationsEnabled,
     setNewSessionWorktreeEnabled: (newSessionWorktreeEnabled) => updatePreferences({ newSessionWorktreeEnabled }),
     openHttpLink,
     openWorkspaceHtml,
@@ -2336,7 +2471,7 @@ export function useAppController(): AppController {
         navigationWidth: DEFAULT_UI_PREFERENCES.navigationWidth
       };
       preferencesRef.current = next;
-      setState((current) => ({ ...current, preferences: next }));
+      setState((current) => withControllerPreferences(current, next, systemLocale));
     },
     resetLayoutPreferences: async () => {
       const ownerId = state.activeProfile?.serverId;
@@ -2347,6 +2482,9 @@ export function useAppController(): AppController {
         navigationMode: DEFAULT_UI_PREFERENCES.navigationMode,
         navigationWidth: DEFAULT_UI_PREFERENCES.navigationWidth
       });
+      if (window.jokoDesktop?.capabilities.includes("layout.reset") !== true) {
+        publishClientLayoutResetOccurrence();
+      }
     },
     dismissExtensionNotification: (eventId) => setState((current) => ({
       ...current,
@@ -2953,7 +3091,7 @@ export function useAppController(): AppController {
     copyArtifactFile,
     openArtifactFile,
     revealArtifactSource
-  }), [saveProvider, openHttpLink, openWorkspaceHtml, readWorkspaceHtmlSnapshot, remoteHostApi, newTaskDraftApi, inputApi, mcpApi, terminalApi, simulatorViewerApi, readDraftSnapshot, saveDraftIfRevision, restoreFirstInputDraft, listWorkspaceChangeSets, previewWorkspaceRewind, executeWorkspaceRewind, readDraft, saveDraft, navigateSessionBranch, copyArtifactFile, openArtifactFile, revealArtifactSource, voiceApi, downloadArtifact, exportSession, exportPortableSession, getArtifactUrl, readWorkspaceFile, releaseArtifactUrl, updateAuxiliaryTextSettings, predictNextPrompt, cancelAutomaticConnectionAttempt, connect, disconnect, forgetProfile, gateway, logoutConnection, logoutProfile, mutatePreferences, navigate, openMachineSession, pair, probeRuntimeActivity, refreshDiscoveredNodes, refreshMachines, retryManagedOrchestrator, revokeDevice, searchRemoteSessionMessages, setAutomaticConnectionEnabled, setCodeFamily, setCodeSize, setComposerSendShortcut, setMachineSelection, setUiFamily, setUiSize, state, switchMachine, updatePreferences]);
+  }), [saveProvider, openHttpLink, openWorkspaceHtml, readWorkspaceHtmlSnapshot, remoteHostApi, newTaskDraftApi, inputApi, mcpApi, terminalApi, simulatorViewerApi, readDraftSnapshot, saveDraftIfRevision, restoreFirstInputDraft, listWorkspaceChangeSets, previewWorkspaceRewind, executeWorkspaceRewind, readDraft, saveDraft, navigateSessionBranch, copyArtifactFile, openArtifactFile, revealArtifactSource, voiceApi, downloadArtifact, exportSession, exportPortableSession, getArtifactUrl, readWorkspaceFile, releaseArtifactUrl, updateAuxiliaryTextSettings, predictNextPrompt, cancelAutomaticConnectionAttempt, connect, disconnect, forgetProfile, gateway, logoutConnection, logoutProfile, mutatePreferences, navigate, openMachineSession, pair, probeRuntimeActivity, refreshDiscoveredNodes, refreshMachines, retryManagedOrchestrator, revokeDevice, searchRemoteSessionMessages, setAutomaticConnectionEnabled, setCodeFamily, setCodeSize, setComposerSendShortcut, setLocale, setMachineSelection, setSessionNotificationsEnabled, setUiFamily, setUiSize, state, switchMachine, updatePreferences]);
 }
 
 function upsertMachineCache(caches: readonly MachineCacheView[], cache: MachineCacheView): readonly MachineCacheView[] {

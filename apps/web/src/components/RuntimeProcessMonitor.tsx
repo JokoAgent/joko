@@ -234,8 +234,8 @@ export function RuntimeProcessMonitor({ controller, snapshot, runAction, t, stan
   controllerRef.current = controller;
   const snapshotRef = useRef(snapshot);
   snapshotRef.current = snapshot;
-  const localeRef = useRef(controller.state.preferences.locale);
-  localeRef.current = controller.state.preferences.locale;
+  const localeRef = useRef(controller.state.effectiveLocale);
+  localeRef.current = controller.state.effectiveLocale;
   const owner = runtimeProcessDiagnosticsOwner(controller.state);
   const ownerKey = runtimeProcessDiagnosticsOwnerKey(owner);
   const ownerKeyRef = useRef(ownerKey);

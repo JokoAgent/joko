@@ -51,7 +51,7 @@ export function RuntimeProcessMonitorBroker({ controller }: {
             const result = await collectRuntimeProcessDiagnostics(
               initialController,
               initialController.state.snapshot,
-              initialController.state.preferences.locale,
+              initialController.state.effectiveLocale,
               abort.signal
             );
             if (!ownerStillCurrent(controllerRef.current, request.owner)) {

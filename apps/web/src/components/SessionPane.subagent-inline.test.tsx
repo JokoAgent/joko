@@ -157,6 +157,8 @@ function controllerFor(methods: {
     snapshot,
     route: { kind: "session", sessionId: "session-one" },
     preferences: DEFAULT_UI_PREFERENCES,
+    systemLocale: "en",
+    effectiveLocale: "en",
     extensionNotifications: []
   };
   return { state, ...methods } as unknown as AppController;

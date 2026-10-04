@@ -2,6 +2,8 @@ import type { JSONContent } from "@tiptap/core";
 import type { VoiceDictionaryPeerApi, VoiceInputSaucSettingsView, VoiceInputRecognitionContextView } from "@joko/contracts";
 
 export type Locale = "en" | "zh-CN" | "en-XA";
+export type SystemLocale = Exclude<Locale, "en-XA">;
+export type LocalePreference = "system" | Locale;
 export type Theme = "system" | "light" | "dark";
 export type PermissionMode = "ask" | "auto" | "bypassPermissions";
 export type DeliveryMode = "prompt" | "steer" | "followUp";

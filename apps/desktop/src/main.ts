@@ -52,6 +52,8 @@ import {
   type DesktopManagedOrchestratorRecoveryReason,
   type DesktopManagedOrchestratorStatus,
   type DesktopMainWindowCloseSettings,
+  type DesktopLocale,
+  type DesktopSystemLocale,
   type DesktopNativeTaskStatusAction,
   type DesktopNativeTaskStatusDisplay,
   type DesktopNativeTaskStatusSoundChoice,
@@ -81,6 +83,7 @@ import {
   parseDesktopPageSearchRequest,
   parseDesktopPageSearchStopAction
 } from "./channels.js";
+import { readDesktopPreferredSystemLocale } from "./system-locale.js";
 import {
   parseDesktopRuntimeProcessSample,
   parseDesktopRuntimeProcessMonitorOpenResult,
@@ -684,7 +687,8 @@ const managedOrchestratorExitFence = createManagedExitFence({
   }
 });
 let packagedSmokeFinishing = false;
-let applicationMenuLocale = "en";
+let preferredSystemLocale: DesktopSystemLocale = "en";
+let applicationMenuLocale: DesktopLocale = "en";
 const applicationMenuConfigurationState = createMacApplicationMenuConfigurationState({
   shortcutRecording: false,
   newSessionAccelerator: "Command+N",
@@ -935,7 +939,8 @@ if (!app.requestSingleInstanceLock()) {
     registerIpc();
     installMicrophoneLifecycle();
     installProviderModelPowerLifecycle();
-    applicationMenuLocale = app.getLocale();
+    preferredSystemLocale = readDesktopPreferredSystemLocale(app);
+    applicationMenuLocale = preferredSystemLocale;
     installDesktopApplicationMenu();
     createWindow();
     initializeDesktopDevicePeerAgentLifecycle();
@@ -1088,7 +1093,7 @@ function createWindow(): void {
   window.webContents.on("will-prevent-unload", notifyDesktopQuitBlocked);
   installSelectionContextMenu(window, {
     platform: process.platform,
-    systemLocale: () => app.getLocale(),
+    systemLocale: () => applicationMenuLocale,
     buildMenu: (template) => Menu.buildFromTemplate([...template]),
     openExternal: (url) => shell.openExternal(url)
   });
@@ -3689,7 +3694,7 @@ async function presentDesktopWindowLoadFailure(
   attempt: number,
   preferredOwner?: BrowserWindow
 ): Promise<DesktopWindowLoadFailureAction> {
-  const labels = desktopWindowLoadFailureLabels(app.getLocale(), kind, attempt);
+  const labels = desktopWindowLoadFailureLabels(applicationMenuLocale, kind, attempt);
   const main = kind === "main";
   const options: MessageBoxOptions = {
     type: "error",
@@ -4614,7 +4619,7 @@ async function openSessionApplicationWindow(
   window.webContents.on("will-prevent-unload", notifyDesktopQuitBlocked);
   installSelectionContextMenu(window, {
     platform: process.platform,
-    systemLocale: () => app.getLocale(),
+    systemLocale: () => applicationMenuLocale,
     buildMenu: (template) => Menu.buildFromTemplate([...template]),
     openExternal: (url) => shell.openExternal(url)
   });
@@ -4941,7 +4946,7 @@ async function openRuntimeProcessMonitorWindowNow(
   });
   installSelectionContextMenu(window, {
     platform: process.platform,
-    systemLocale: () => app.getLocale(),
+    systemLocale: () => applicationMenuLocale,
     buildMenu: (template) => Menu.buildFromTemplate([...template]),
     openExternal: (url) => shell.openExternal(url)
   });
@@ -5680,7 +5685,7 @@ function installInspectorWindowSecurity(childWindow: BrowserWindow, owner: Brows
 
   installSelectionContextMenu(childWindow, {
     platform: process.platform,
-    systemLocale: () => app.getLocale(),
+    systemLocale: () => applicationMenuLocale,
     buildMenu: (template) => Menu.buildFromTemplate([...template]),
     openExternal: (url) => shell.openExternal(url)
   });
@@ -7062,6 +7067,13 @@ function bindDesktopPageSearchResults(contents: WebContents): Map<number, number
 }
 
 function registerIpc(): void {
+  ipcMain.on(DESKTOP_CHANNELS.preferredSystemLocaleGet, (event, ...parameters: unknown[]) => {
+    assertTrustedIpcSender(event);
+    if (parameters.length !== 0) {
+      throw new TypeError("Preferred system locale does not accept parameters.");
+    }
+    event.returnValue = preferredSystemLocale;
+  });
   ipcMain.on(DESKTOP_CHANNELS.mainDocumentOccurrenceGet, (event, ...parameters: unknown[]) => {
     event.returnValue = parameters.length === 1 && isDesktopMainDocumentClaim(parameters[0])
       ? captureMainApplicationDocumentOccurrenceForSender(event, parameters[0])
@@ -7103,8 +7115,18 @@ function registerIpc(): void {
     if (parameters.length !== 1 || !isDesktopLocale(parameters[0])) {
       throw new TypeError("Selection context-menu locale must be en, zh-CN, or en-XA.");
     }
-    setSelectionContextMenuLocale(parameters[0]);
-    applicationMenuLocale = parameters[0];
+    const locale = parameters[0];
+    const localeChanged = applicationMenuLocale !== locale;
+    setSelectionContextMenuLocale(locale);
+    applicationMenuLocale = locale;
+    const overlay = globalVoiceOverlayWindow;
+    if (localeChanged && overlay !== undefined && !overlay.isDestroyed() && !overlay.webContents.isDestroyed()) {
+      try {
+        overlay.webContents.send(DESKTOP_CHANNELS.globalVoiceOverlayLocaleChanged, applicationMenuLocale);
+      } catch {
+        // Locale is still committed for native surfaces; a retiring overlay cannot observe it.
+      }
+    }
     if (runtimeProcessMonitorWindow !== undefined && !runtimeProcessMonitorWindow.isDestroyed()) {
       runtimeProcessMonitorWindow.setTitle(runtimeProcessMonitorWindowTitle());
     }
@@ -7901,6 +7923,11 @@ function registerIpc(): void {
     assertGlobalVoiceOverlaySender(event);
     if (parameters.length !== 0) throw new TypeError("Global voice overlay status does not accept parameters.");
     return globalVoiceStatus;
+  });
+  ipcMain.handle(DESKTOP_CHANNELS.globalVoiceOverlayGetLocale, (event, ...parameters: unknown[]) => {
+    assertGlobalVoiceOverlaySender(event);
+    if (parameters.length !== 0) throw new TypeError("Global voice overlay locale does not accept parameters.");
+    return applicationMenuLocale;
   });
   ipcMain.handle(DESKTOP_CHANNELS.globalVoiceOverlayAction, (event, ...parameters: unknown[]) => {
     assertGlobalVoiceOverlaySender(event);

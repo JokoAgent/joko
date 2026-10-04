@@ -68,6 +68,7 @@ import { VisualRemoteHostFixture } from "./VisualRemoteHostFixture.js";
 import { VisualUsageHistoryFixture } from "./VisualUsageHistoryFixture.js";
 import { UsageHistorySection } from "../components/UsageHistorySection.js";
 import { translate } from "../i18n.js";
+import { resolveLocalePreference } from "../system-locale.js";
 import { applyAppearanceTypography, clampCodeSize, clampUiSize, normalizeFontFamily } from "../appearance-settings.js";
 import { VISUAL_EXTENSION_MAIN_VIEW_ENDPOINT } from "./visual-extension-surface-contract.js";
 
@@ -134,13 +135,13 @@ export function VisualHarness(): JSX.Element {
 
   useEffect(() => {
     document.documentElement.dataset.theme = state.preferences.theme;
-    document.documentElement.lang = state.preferences.locale;
+    document.documentElement.lang = state.effectiveLocale;
     document.documentElement.dataset.visualHarness = scenario.scenario;
     return () => {
       delete document.documentElement.dataset.visualHarness;
       delete document.documentElement.dataset.harnessLastAction;
     };
-  }, [scenario.scenario, state.preferences.locale, state.preferences.theme]);
+  }, [scenario.scenario, state.effectiveLocale, state.preferences.theme]);
 
   useEffect(() => {
     applyAppearanceTypography(state.preferences, [document.documentElement, document.body]);
@@ -620,7 +621,11 @@ export function VisualHarness(): JSX.Element {
         }));
       },
       setLocale: async (locale: ControllerState["preferences"]["locale"]): Promise<void> => {
-        setState((current) => ({ ...current, preferences: { ...current.preferences, locale } }));
+        setState((current) => ({
+          ...current,
+          preferences: { ...current.preferences, locale },
+          effectiveLocale: resolveLocalePreference(locale, current.systemLocale)
+        }));
       },
       setTheme: async (theme: Theme): Promise<void> => {
         setState((current) => ({ ...current, preferences: { ...current.preferences, theme } }));
@@ -1822,7 +1827,7 @@ export function VisualHarness(): JSX.Element {
   }, [artifactActions, draftActions, mcpActions, remoteHosts, state, usageHistory]);
 
   if (scenario.scenario === "usage") return <main style={{ maxWidth: 1040, margin: "0 auto" }}>
-    <UsageHistorySection controller={controller} t={(key, values) => translate(state.preferences.locale, key, values)} />
+    <UsageHistorySection controller={controller} t={(key, values) => translate(state.effectiveLocale, key, values)} />
   </main>;
 
   return <AppWithController
@@ -2972,6 +2977,8 @@ function initialControllerState(parameters: HarnessParameters, files: VisualWork
       composerSendShortcut: parameters.composerSendShortcut,
       messageSearchSort: "relevance"
     },
+    systemLocale: "en",
+    effectiveLocale: "en",
     error: connectionScenario ? "The saved node rejected this connection. Pair again to restore access." : undefined,
     extensionNotifications: []
   };

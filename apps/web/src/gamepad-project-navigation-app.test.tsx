@@ -250,6 +250,8 @@ function controller(route: AppRoute, connectionState: ControllerState["connectio
     route,
     navigationRevision: 0,
     preferences: DEFAULT_UI_PREFERENCES,
+    systemLocale: "en",
+    effectiveLocale: "en",
     extensionNotifications: []
   } as ControllerState;
   const navigate = vi.fn((next: AppRoute) => {

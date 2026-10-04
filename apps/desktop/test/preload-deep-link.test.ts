@@ -29,7 +29,8 @@ function loadPreload(
   crypto: {
     readonly randomUUID?: () => string;
     readonly getRandomValues?: (bytes: Uint8Array) => Uint8Array;
-  } = { randomUUID: () => MAIN_DOCUMENT_CLAIM }
+  } = { randomUUID: () => MAIN_DOCUMENT_CLAIM },
+  preferredSystemLocale: unknown = "zh-CN"
 ): {
   readonly exposed: Readonly<Record<string, unknown>>;
   readonly deepLinks: DeepLinkApi;
@@ -62,7 +63,9 @@ function loadPreload(
         if (channel === "joko:main-document:occurrence:get") {
           expect(parameters).toEqual([MAIN_DOCUMENT_CLAIM]);
         }
-        return channel === "joko:main-document:occurrence:get" ? documentOccurrence : false;
+        if (channel === "joko:main-document:occurrence:get") return documentOccurrence;
+        if (channel === "joko:locale:preferred-system:get") return preferredSystemLocale;
+        return false;
       },
       invoke,
       send: vi.fn(),
@@ -122,7 +125,8 @@ describe("main application preload deep-link occurrence fence", () => {
 
     expect(loaded.synchronousChannels).toEqual([
       "joko:main-document:occurrence:get",
-      "joko:native-task-status:availability:get"
+      "joko:native-task-status:availability:get",
+      "joko:locale:preferred-system:get"
     ]);
     expect(Reflect.has(loaded.exposed, "mainDocumentOccurrence")).toBe(false);
     expect(Reflect.has(loaded.exposed, "mainDocumentOccurrenceGet")).toBe(false);
@@ -170,6 +174,25 @@ describe("main application preload deep-link occurrence fence", () => {
       deliveryOccurrence: 2
     })).resolves.toBe(true);
   });
+});
+
+describe("main application preload preferred system locale", () => {
+  it("exposes only the strict effective locale from the synchronous host projection", () => {
+    const loaded = loadPreload("document-current");
+
+    expect(DESKTOP_CHANNELS.preferredSystemLocaleGet).toBe("joko:locale:preferred-system:get");
+    expect(loaded.exposed["preferredSystemLocale"]).toBe("zh-CN");
+    expect(Object.isFrozen(loaded.exposed)).toBe(true);
+    expect(Reflect.has(loaded.exposed, "setPreferredSystemLocale")).toBe(false);
+  });
+
+  it.each(["system", "en-XA", "ja", ["zh-CN"], null])(
+    "fails closed instead of exposing malformed host locale %j",
+    (locale) => {
+      const loaded = loadPreload("document-current", { randomUUID: () => MAIN_DOCUMENT_CLAIM }, locale);
+      expect(loaded.exposed["preferredSystemLocale"]).toBe("en");
+    }
+  );
 });
 
 describe("main application preload keep-awake observer", () => {

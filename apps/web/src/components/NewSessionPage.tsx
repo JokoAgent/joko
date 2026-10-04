@@ -2117,7 +2117,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
             const disabled = !canAttach || candidate.state === "error" || candidate.boundSessionId !== undefined;
             return <label className={nativeReference === candidate.reference ? "is-active" : ""} key={candidate.reference}>
               <RadioControl name="new-task-native-session" value={candidate.reference} checked={nativeReference === candidate.reference} disabled={submitting || disabled} onChange={() => { setNativeReference(candidate.reference); setNativeSelectionWarning(undefined); }} />
-              <span><strong>{candidate.name || candidate.id || t("common.unknown")}</strong><small>{t("session.nativeMeta", { count: candidate.messageCount, time: candidate.modifiedAt > 0 ? formatRelativeTime(candidate.modifiedAt, controller.state.preferences.locale) : t("common.unknown") })}</small><small>{candidate.workspaceRoot}</small>{candidate.boundSessionId !== undefined && <em>{t("session.nativeBound", { id: candidate.boundSessionId })}</em>}{candidate.state === "error" && <em>{t("session.nativeError")}</em>}</span>
+              <span><strong>{candidate.name || candidate.id || t("common.unknown")}</strong><small>{t("session.nativeMeta", { count: candidate.messageCount, time: candidate.modifiedAt > 0 ? formatRelativeTime(candidate.modifiedAt, controller.state.effectiveLocale) : t("common.unknown") })}</small><small>{candidate.workspaceRoot}</small>{candidate.boundSessionId !== undefined && <em>{t("session.nativeBound", { id: candidate.boundSessionId })}</em>}{candidate.state === "error" && <em>{t("session.nativeError")}</em>}</span>
             </label>;
           })}
         </section>}
@@ -2420,7 +2420,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
             }}><span><Icon aria-hidden="true" /></span><strong>{t(label)}</strong></button>)}
           </div>
         </section>
-        <HomeUsageDashboard controller={controller} ownerId={pickerOwnerId} locale={controller.state.preferences.locale} t={t} />
+        <HomeUsageDashboard controller={controller} ownerId={pickerOwnerId} locale={controller.state.effectiveLocale} t={t} />
       </section>
     </div>
     <Modal

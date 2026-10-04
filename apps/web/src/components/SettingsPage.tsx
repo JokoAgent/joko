@@ -46,12 +46,14 @@ import {
 } from "lucide-react";
 import type { AppController } from "../controller.js";
 import { DEFAULT_UI_PREFERENCES, LINK_OPEN_DEFAULTS, type LinkOpenKind, type LinkOpenPreference } from "../local-state.js";
+import { translate } from "../i18n.js";
 import { clampCodeSize, clampUiSize } from "../appearance-settings.js";
 import { currentAppShortcutPlatform } from "../app-shortcuts.js";
 import { composerVoiceShortcutsConflict } from "../composer-voice-shortcut-conflict.js";
 import { isConversationModel } from "../model-capabilities.js";
 import { isModelVisible, modelPreferenceOwnerId, providerPreferenceKey, setModelVisible, setProviderDisplayOrder, useModelPickerOwnerPreferences } from "../model-picker-preferences.js";
-import type { AppSnapshot, ArtifactStorageCleanupView, ArtifactStorageMaintenanceView, ArtifactStorageReconcileView, ArtifactStorageScanView, BackendView, CredentialDraft, Locale, McpServerView, ModelInputModalityView, ModelView, NativeSessionCatalogEntryView, NativeSessionCatalogView, PermissionMode, ProviderConfigurationView, ProviderCredentialSurfaceView, ProviderDraft, ProviderLoginFlowView, ProviderLoginMethodView, ProviderModelConfigurationView, ProviderRuntimeView, RemoteConnectionView, ResourceDraft, TaskHistoryCleanupProgressView, TaskHistoryCleanupView, TaskHistoryMaintenanceSupportView, TaskHistoryRetentionView, TaskHistoryScanView, Theme } from "../model.js";
+import type { AppSnapshot, ArtifactStorageCleanupView, ArtifactStorageMaintenanceView, ArtifactStorageReconcileView, ArtifactStorageScanView, BackendView, CredentialDraft, Locale, LocalePreference, McpServerView, ModelInputModalityView, ModelView, NativeSessionCatalogEntryView, NativeSessionCatalogView, PermissionMode, ProviderConfigurationView, ProviderCredentialSurfaceView, ProviderDraft, ProviderLoginFlowView, ProviderLoginMethodView, ProviderModelConfigurationView, ProviderRuntimeView, RemoteConnectionView, ResourceDraft, TaskHistoryCleanupProgressView, TaskHistoryCleanupView, TaskHistoryMaintenanceSupportView, TaskHistoryRetentionView, TaskHistoryScanView, Theme } from "../model.js";
+import { resolveLocalePreference } from "../system-locale.js";
 import { emptyResourceAcquisitionDraft, normalizeResourceDraft, resourceDraftIsValid } from "../resource-draft.js";
 import { resourceKindsForBackend } from "../resource-capabilities.js";
 import type { RunAction, Translator } from "./types.js";
@@ -454,10 +456,34 @@ function useSettingsSaveFeedback(onSuccess: (text: string) => void): SettingsSav
 
 export function AppearanceSettings({ controller, locale, theme, onSuccess, onOpenPi, showHeading = true, t }: { readonly controller: AppController; readonly locale: Locale; readonly theme: Theme; readonly onSuccess: (text: string) => void; readonly onOpenPi: () => void; readonly showHeading?: boolean; readonly t: Translator }): JSX.Element {
   const appearance = controller.state.preferences;
+  const localePreference = appearance.locale;
   const themeSave = useSettingsSaveFeedback(onSuccess);
-  const localeSave = useSettingsSaveFeedback(onSuccess);
   const themePickerRef = useRef<HTMLDivElement>(null);
   const restoreThemeKeyboardFocusRef = useRef(false);
+  const localeControllerAction = controller.setLocale;
+  const localeOwner = useMemo(() => ({ action: localeControllerAction }), [localeControllerAction]);
+  const committedLocaleOwnerRef = useRef<typeof localeOwner | undefined>(undefined);
+  const localeFlightRef = useRef<{
+    readonly owner: typeof localeOwner;
+    readonly next: LocalePreference;
+    readonly previous: LocalePreference;
+    readonly nextEffective: Locale;
+    readonly previousEffective: Locale;
+    readonly reset: boolean;
+    readonly focusSource: HTMLElement | null;
+  } | undefined>(undefined);
+  const localeFocusAfterSettleRef = useRef<typeof localeOwner | undefined>(undefined);
+  const localeControlRef = useRef<HTMLDivElement>(null);
+  const [localeFeedback, setLocaleFeedback] = useState<{
+    readonly owner: typeof localeOwner;
+    readonly pending: boolean;
+    readonly preserveCustomized: boolean;
+    readonly error?: string;
+  }>({ owner: localeOwner, pending: false, preserveCustomized: false });
+  const localePending = localeFeedback.owner === localeOwner && localeFeedback.pending;
+  const localeError = localeFeedback.owner === localeOwner ? localeFeedback.error : undefined;
+  const localeCustomized = localePreference !== DEFAULT_UI_PREFERENCES.locale
+    || (localePending && localeFeedback.preserveCustomized);
   const [layoutResetBusy, setLayoutResetBusy] = useState(false);
   const [layoutResetError, setLayoutResetError] = useState<string>();
   const saveTheme = (next: Theme): void => {
@@ -494,12 +520,68 @@ export function AppearanceSettings({ controller, locale, theme, onSuccess, onOpe
     restoreThemeKeyboardFocusRef.current = false;
     themePickerRef.current?.querySelector<HTMLButtonElement>('button[role="radio"][aria-checked="true"]')?.focus();
   }, [theme, themeSave.error, themeSave.pending]);
-  const saveLocale = (next: Locale): void => {
-    if (next === locale) return;
-    void localeSave.commit(
-      () => controller.setLocale(next),
-      { success: t("settings.localeSaveSuccess"), failure: t("settings.localeSaveFailed") }
-    );
+  useLayoutEffect(() => {
+    committedLocaleOwnerRef.current = localeOwner;
+    return () => {
+      if (committedLocaleOwnerRef.current === localeOwner) committedLocaleOwnerRef.current = undefined;
+      if (localeFlightRef.current?.owner === localeOwner) localeFlightRef.current = undefined;
+      if (localeFocusAfterSettleRef.current === localeOwner) localeFocusAfterSettleRef.current = undefined;
+    };
+  }, [localeOwner]);
+  useLayoutEffect(() => {
+    if (localePending || localeFocusAfterSettleRef.current !== localeOwner) return;
+    localeFocusAfterSettleRef.current = undefined;
+    localeControlRef.current?.querySelector<HTMLButtonElement>('[role="combobox"]')?.focus({ preventScroll: true });
+  }, [localeCustomized, localeOwner, localePending]);
+  const saveLocale = (next: LocalePreference, reset = false): void => {
+    if (next === localePreference || localeFlightRef.current?.owner === localeOwner) return;
+    const activeElement = localeControlRef.current?.ownerDocument.activeElement;
+    const flight = {
+      owner: localeOwner,
+      next,
+      previous: localePreference,
+      nextEffective: resolveLocalePreference(next, controller.state.systemLocale),
+      previousEffective: locale,
+      reset,
+      focusSource: reset && activeElement instanceof HTMLElement
+        && activeElement.closest(".personalization-default-controls") !== null
+        ? activeElement
+        : null
+    };
+    localeFlightRef.current = flight;
+    setLocaleFeedback({
+      owner: localeOwner,
+      pending: true,
+      preserveCustomized: localePreference !== DEFAULT_UI_PREFERENCES.locale
+        || next !== DEFAULT_UI_PREFERENCES.locale
+    });
+    const current = (): boolean => committedLocaleOwnerRef.current === localeOwner
+      && localeFlightRef.current === flight;
+    void (async () => {
+      try {
+        await localeOwner.action(next);
+      } catch {
+        if (!current()) return;
+        localeFlightRef.current = undefined;
+        setLocaleFeedback({
+          owner: localeOwner,
+          pending: false,
+          preserveCustomized: false,
+          error: translate(flight.previousEffective, "settings.localeSaveFailed")
+        });
+        return;
+      }
+      if (!current()) return;
+      if (flight.reset && flight.focusSource !== null) {
+        const activeElementAfterSave = flight.focusSource.ownerDocument.activeElement;
+        if (activeElementAfterSave === flight.focusSource || activeElementAfterSave === flight.focusSource.ownerDocument.body) {
+          localeFocusAfterSettleRef.current = localeOwner;
+        }
+      }
+      localeFlightRef.current = undefined;
+      setLocaleFeedback({ owner: localeOwner, pending: false, preserveCustomized: false });
+      onSuccess(translate(flight.nextEffective, reset ? "settings.defaults.restored" : "settings.localeSaveSuccess"));
+    })();
   };
   const resetLayout = async (): Promise<void> => {
     if (layoutResetBusy) return;
@@ -539,10 +621,19 @@ export function AppearanceSettings({ controller, locale, theme, onSuccess, onOpe
         </div>
         {themeSave.error !== undefined && <ErrorBanner message={themeSave.error} dismissLabel={t("common.dismiss")} onClose={themeSave.dismissError} />}
         <div className="setting-row">
-          <div><strong>{t("settings.locale")}</strong><span>{t("settings.localeBody")}</span>{localeSave.pending && <span role="status">{t("common.working")}</span>}</div>
-          <SelectControl value={locale} disabled={localeSave.pending} aria-busy={localeSave.pending} onChange={(event) => saveLocale(event.target.value as Locale)} aria-label={t("settings.locale")}><option value="en">{t("language.en")}</option><option value="zh-CN">{t("language.zh-CN")}</option><option value="en-XA">{t("language.en-XA")}</option></SelectControl>
+          <div><strong>{t("settings.locale")}</strong><span>{t("settings.localeBody")}</span>{localePending && <span role="status">{t("common.working")}</span>}</div>
+          <div ref={localeControlRef} className="composer-send-shortcut-actions">
+            <DefaultOverrideControls
+              customized={localeCustomized}
+              disabled={localePending}
+              busy={localePending}
+              t={t}
+              onReset={() => saveLocale(DEFAULT_UI_PREFERENCES.locale, true)}
+            />
+            <SelectControl value={localePreference} disabled={localePending} aria-busy={localePending} onChange={(event) => saveLocale(event.target.value as LocalePreference)} aria-label={t("settings.locale")}><option value="system">{t("settings.system")}</option><option value="en">{t("language.en")}</option><option value="zh-CN">{t("language.zh-CN")}</option><option value="en-XA">{t("language.en-XA")}</option></SelectControl>
+          </div>
         </div>
-        {localeSave.error !== undefined && <ErrorBanner message={localeSave.error} dismissLabel={t("common.dismiss")} onClose={localeSave.dismissError} />}
+        {localeError !== undefined && <ErrorBanner message={localeError} dismissLabel={t("common.dismiss")} onClose={() => setLocaleFeedback((current) => current.owner === localeOwner ? { ...current, error: undefined } : current)} />}
         <button type="button" className="setting-row settings-row-link" onClick={onOpenPi}>
           <div>
             <strong><Braces aria-hidden="true" />{t("settings.pi")}</strong>
@@ -903,6 +994,22 @@ export function GeneralSettings({ controller, snapshot, runAction, onSuccess, sh
     (desktop.platform === "win32" || desktop.platform === "darwin");
   const keepAwake = useDesktopKeepAwakeSetting(desktop, powerAvailable);
   const activationClick = useDesktopActivationClickSetting(desktop, activationClickAvailable);
+  const notificationControllerAction = controller.setSessionNotificationsEnabled;
+  const notificationOwner = useMemo(() => ({ action: notificationControllerAction }), [notificationControllerAction]);
+  const committedNotificationOwnerRef = useRef<typeof notificationOwner | undefined>(undefined);
+  const notificationFlightRef = useRef<{
+    readonly owner: typeof notificationOwner;
+    readonly reset: boolean;
+    readonly focusSource: HTMLElement | null;
+  } | undefined>(undefined);
+  const notificationFocusAfterSettleRef = useRef<typeof notificationOwner | undefined>(undefined);
+  const notificationSwitchRef = useRef<HTMLButtonElement>(null);
+  const [notificationFeedback, setNotificationFeedback] = useState<{
+    readonly owner: typeof notificationOwner;
+    readonly pending: boolean;
+    readonly preserveCustomized: boolean;
+    readonly error?: string;
+  }>({ owner: notificationOwner, pending: false, preserveCustomized: false });
   const controllerShortcutAction = controller.setComposerSendShortcut;
   const shortcutOwner = useMemo(() => ({ action: controllerShortcutAction }), [controllerShortcutAction]);
   const committedShortcutOwnerRef = useRef<typeof shortcutOwner | undefined>(undefined);
@@ -913,11 +1020,35 @@ export function GeneralSettings({ controller, snapshot, runAction, onSuccess, sh
     readonly preserveCustomized: boolean;
     readonly error?: string;
   }>({ owner: shortcutOwner, pending: false, preserveCustomized: false });
-  const notificationSave = useSettingsSaveFeedback(onSuccess);
+  const notificationPending = notificationFeedback.owner === notificationOwner && notificationFeedback.pending;
+  const notificationError = notificationFeedback.owner === notificationOwner ? notificationFeedback.error : undefined;
+  const notificationCustomized = controller.state.preferences.sessionNotificationsEnabled
+    !== DEFAULT_UI_PREFERENCES.sessionNotificationsEnabled
+    || (notificationPending && notificationFeedback.preserveCustomized);
   const shortcutPending = shortcutFeedback.owner === shortcutOwner && shortcutFeedback.pending;
   const shortcutError = shortcutFeedback.owner === shortcutOwner ? shortcutFeedback.error : undefined;
   const shortcutCustomized = controller.state.preferences.composerSendShortcut !== DEFAULT_UI_PREFERENCES.composerSendShortcut
     || (shortcutPending && shortcutFeedback.preserveCustomized);
+
+  useLayoutEffect(() => {
+    committedNotificationOwnerRef.current = notificationOwner;
+    return () => {
+      if (committedNotificationOwnerRef.current === notificationOwner) {
+        committedNotificationOwnerRef.current = undefined;
+      }
+      if (notificationFlightRef.current?.owner === notificationOwner) {
+        notificationFlightRef.current = undefined;
+      }
+      if (notificationFocusAfterSettleRef.current === notificationOwner) {
+        notificationFocusAfterSettleRef.current = undefined;
+      }
+    };
+  }, [notificationOwner]);
+  useLayoutEffect(() => {
+    if (notificationPending || notificationFocusAfterSettleRef.current !== notificationOwner) return;
+    notificationFocusAfterSettleRef.current = undefined;
+    notificationSwitchRef.current?.focus({ preventScroll: true });
+  }, [notificationOwner, notificationPending, notificationCustomized]);
 
   useLayoutEffect(() => {
     committedShortcutOwnerRef.current = shortcutOwner;
@@ -927,15 +1058,56 @@ export function GeneralSettings({ controller, snapshot, runAction, onSuccess, sh
     };
   }, [shortcutOwner]);
 
-  const changeNotifications = (enabled: boolean): void => {
-    if (!notificationAvailable) return;
-    void notificationSave.commit(
-      () => controller.setSessionNotificationsEnabled(enabled),
-      {
-        success: t(enabled ? "settings.sessionNotificationsEnabled" : "settings.sessionNotificationsDisabled"),
-        failure: t("settings.sessionNotificationsSaveFailed")
+  const changeNotifications = (enabled: boolean, reset = false): void => {
+    if (!notificationAvailable || notificationFlightRef.current?.owner === notificationOwner) return;
+    const activeElement = notificationSwitchRef.current?.ownerDocument.activeElement;
+    const flight = {
+      owner: notificationOwner,
+      reset,
+      focusSource: reset && activeElement instanceof HTMLElement
+        && activeElement.closest(".personalization-default-controls") !== null
+        ? activeElement
+        : null
+    };
+    notificationFlightRef.current = flight;
+    setNotificationFeedback({
+      owner: notificationOwner,
+      pending: true,
+      preserveCustomized: controller.state.preferences.sessionNotificationsEnabled
+        !== DEFAULT_UI_PREFERENCES.sessionNotificationsEnabled
+        || enabled !== DEFAULT_UI_PREFERENCES.sessionNotificationsEnabled
+    });
+    const current = (): boolean => committedNotificationOwnerRef.current === notificationOwner
+      && notificationFlightRef.current === flight;
+    void (async () => {
+      try {
+        await notificationOwner.action(enabled);
+      } catch {
+        if (!current()) return;
+        notificationFlightRef.current = undefined;
+        setNotificationFeedback({
+          owner: notificationOwner,
+          pending: false,
+          preserveCustomized: false,
+          error: t("settings.sessionNotificationsSaveFailed")
+        });
+        return;
       }
-    );
+      if (!current()) return;
+      if (flight.reset && flight.focusSource !== null) {
+        const activeElement = flight.focusSource.ownerDocument.activeElement;
+        if (activeElement === flight.focusSource || activeElement === flight.focusSource.ownerDocument.body) {
+          notificationFocusAfterSettleRef.current = notificationOwner;
+        }
+      }
+      notificationFlightRef.current = undefined;
+      setNotificationFeedback({ owner: notificationOwner, pending: false, preserveCustomized: false });
+      onSuccess(t(reset
+        ? "settings.defaults.restored"
+        : enabled
+          ? "settings.sessionNotificationsEnabled"
+          : "settings.sessionNotificationsDisabled"));
+    })();
   };
 
   const changeComposerSendShortcut = (
@@ -987,7 +1159,9 @@ export function GeneralSettings({ controller, snapshot, runAction, onSuccess, sh
 
   return <>
     {showHeading && <SettingsHeading title={t("settings.general")} body={t("settings.generalBody")} />}
-    {notificationSave.error !== undefined && <ErrorBanner message={notificationSave.error} onClose={notificationSave.dismissError} />}
+    {notificationError !== undefined && <ErrorBanner message={notificationError} onClose={() => setNotificationFeedback((current) => current.owner === notificationOwner
+      ? { ...current, error: undefined }
+      : current)} />}
     {shortcutError !== undefined && <ErrorBanner message={shortcutError} onClose={() => setShortcutFeedback((current) => current.owner === shortcutOwner
       ? { ...current, error: undefined }
       : current)} />}
@@ -1004,15 +1178,25 @@ export function GeneralSettings({ controller, snapshot, runAction, onSuccess, sh
         <div>
           <strong><Bell aria-hidden="true" />{t("settings.sessionNotifications")}</strong>
           <span>{notificationAvailable ? t("settings.sessionNotificationsBody") : t("settings.desktopOnly")}</span>
-          {notificationSave.pending && <span role="status">{t("common.working")}</span>}
+          {notificationPending && <span role="status">{t("common.working")}</span>}
         </div>
-        <SwitchControl
+        <div className="composer-send-shortcut-actions">
+          <DefaultOverrideControls
+            customized={notificationCustomized}
+            disabled={!notificationAvailable || notificationPending}
+            busy={notificationPending}
+            t={t}
+            onReset={() => changeNotifications(DEFAULT_UI_PREFERENCES.sessionNotificationsEnabled, true)}
+          />
+          <SwitchControl
+            controlRef={notificationSwitchRef}
             checked={controller.state.preferences.sessionNotificationsEnabled}
-            disabled={!notificationAvailable || notificationSave.pending}
-            aria-busy={notificationSave.pending}
+            disabled={!notificationAvailable || notificationPending}
+            aria-busy={notificationPending}
             aria-label={t("settings.sessionNotifications")}
             onChange={(event) => changeNotifications(event.target.checked)}
           />
+        </div>
       </div>
       <div className="setting-row">
         <div>
@@ -1600,7 +1784,7 @@ export function TaskImportSettings({ controller, snapshot, onImportPortable, run
             {listEntries.length > 0 && <label className="task-import-select-all"><CheckboxControl checked={allVisibleSelected} indeterminate={someVisibleSelected && !allVisibleSelected} disabled={selectableVisibleItems.length === 0} onChange={() => toggleSelection(selectableVisibleItems.map((item) => item.key), !allVisibleSelected)} /><span>{t("settings.sessionImport.selectAll", { count: selectableVisibleItems.length })}</span></label>}
             <div className="task-import-list">
               {listEntries.length === 0 ? <div className="task-import-list__empty">{t("settings.sessionImport.noCandidates")}</div> : listEntries.map((entry) => {
-                if (entry.kind === "dialogue") return <NativeImportRow key={entry.key} direct item={entry.item} checked={selected.has(entry.item.key)} state={itemStates.get(entry.item.key)} locale={controller.state.preferences.locale} onChange={() => toggleSelection([entry.item.key])} t={t} />;
+                if (entry.kind === "dialogue") return <NativeImportRow key={entry.key} direct item={entry.item} checked={selected.has(entry.item.key)} state={itemStates.get(entry.item.key)} locale={controller.state.effectiveLocale} onChange={() => toggleSelection([entry.item.key])} t={t} />;
                 const group = entry;
                 const open = expandedGroups.has(group.key);
                 const selectable = group.items.filter(nativeImportItemSelectable);
@@ -1611,9 +1795,9 @@ export function TaskImportSettings({ controller, snapshot, onImportPortable, run
                     <button type="button" aria-expanded={open} aria-label={open ? t("settings.sessionImport.collapse") : t("settings.sessionImport.expand")} onClick={() => setExpandedGroups((current) => { const next = new Set(current); open ? next.delete(group.key) : next.add(group.key); return next; })}><ChevronRight aria-hidden="true" /></button>
                     <button type="button" className="task-import-group__identity" onClick={() => setExpandedGroups((current) => { const next = new Set(current); open ? next.delete(group.key) : next.add(group.key); return next; })}><strong>{group.projectDirectory === undefined ? t("settings.sessionImport.noWorkspace") : nativeImportWorkspaceName(group.projectDirectory)}</strong><span>{group.projectDirectory ?? t("settings.sessionImport.noWorkspace")} · {t("settings.sessionImport.taskCount", { count: group.items.length })}</span></button>
                     {selectedCount > 0 && <span className="task-import-group__selected">{selectedCount}/{group.items.length}</span>}
-                    <time dateTime={new Date(group.modifiedAt).toISOString()} title={new Date(group.modifiedAt).toLocaleString(controller.state.preferences.locale === "zh-CN" ? "zh-CN" : "en-US")}>{formatRelativeTime(group.modifiedAt, controller.state.preferences.locale)}</time>
+                    <time dateTime={new Date(group.modifiedAt).toISOString()} title={new Date(group.modifiedAt).toLocaleString(controller.state.effectiveLocale === "zh-CN" ? "zh-CN" : "en-US")}>{formatRelativeTime(group.modifiedAt, controller.state.effectiveLocale)}</time>
                   </div>
-                  {open && <div className="task-import-group__items">{group.items.map((item) => <NativeImportRow key={item.key} item={item} checked={selected.has(item.key)} state={itemStates.get(item.key)} locale={controller.state.preferences.locale} onChange={() => toggleSelection([item.key])} t={t} />)}</div>}
+                  {open && <div className="task-import-group__items">{group.items.map((item) => <NativeImportRow key={item.key} item={item} checked={selected.has(item.key)} state={itemStates.get(item.key)} locale={controller.state.effectiveLocale} onChange={() => toggleSelection([item.key])} t={t} />)}</div>}
                 </section>;
               })}
             </div>
@@ -3450,7 +3634,7 @@ export function ProviderSettings({ controller, snapshot, runAction, onSuccess, i
                 <ProviderDetailMenu
                   providerName={selectedProvider.name}
                   runtime={providerRuntime}
-                  locale={controller.state.preferences.locale}
+                  locale={controller.state.effectiveLocale}
                   onRefresh={providerRuntime?.supportsRefresh === true ? () => runAction(`refresh-provider:${selectedProvider.id}`, () => controller.refreshProviderCredential(providerRuntime.backendId, selectedProvider.id)) : undefined}
                   onEdit={providerConfigurationEditable(selectedProvider) ? () => setEditor(selectedProvider) : undefined}
                   onDelete={providerConfigurationEditable(selectedProvider) ? () => setProviderRemovalTarget({ entry: selectedProviderEntry!, kind: "configuration" }) : undefined}
@@ -4206,7 +4390,7 @@ function CredentialList({ credentials, controller, onDelete, emptyLabel, t }: {
   readonly emptyLabel: string;
   readonly t: Translator;
 }): JSX.Element {
-  return credentials.length === 0 ? <p className="provider-detail-empty">{emptyLabel}</p> : <div className="provider-credential-list">{credentials.map((credential) => <article key={credential.id}><StatusDot state={credential.error !== undefined ? "error" : credential.configured ? "healthy" : "muted"} label={credential.configured ? t("settings.configured") : t("settings.missing")} /><span><strong>{credential.name}</strong><small>{credential.kind} · {credential.providerId || t("settings.unbound")}{credential.lastRefreshedAt === undefined ? "" : ` · ${formatRelativeTime(credential.lastRefreshedAt, controller.state.preferences.locale)}`}</small></span><Pill tone={credential.configured ? "success" : "warning"}>{credential.configured ? t("settings.configured") : t("settings.missing")}</Pill><IconButton label={`${t("common.delete")} ${credential.name}`} onClick={() => onDelete(credential)}><Trash2 aria-hidden="true" /></IconButton></article>)}</div>;
+  return credentials.length === 0 ? <p className="provider-detail-empty">{emptyLabel}</p> : <div className="provider-credential-list">{credentials.map((credential) => <article key={credential.id}><StatusDot state={credential.error !== undefined ? "error" : credential.configured ? "healthy" : "muted"} label={credential.configured ? t("settings.configured") : t("settings.missing")} /><span><strong>{credential.name}</strong><small>{credential.kind} · {credential.providerId || t("settings.unbound")}{credential.lastRefreshedAt === undefined ? "" : ` · ${formatRelativeTime(credential.lastRefreshedAt, controller.state.effectiveLocale)}`}</small></span><Pill tone={credential.configured ? "success" : "warning"}>{credential.configured ? t("settings.configured") : t("settings.missing")}</Pill><IconButton label={`${t("common.delete")} ${credential.name}`} onClick={() => onDelete(credential)}><Trash2 aria-hidden="true" /></IconButton></article>)}</div>;
 }
 
 function CredentialVaultPanel({ controller, snapshot, runAction, onAdd, t }: { readonly controller: AppController; readonly snapshot: AppSnapshot; readonly runAction: RunAction; readonly onAdd: () => void; readonly t: Translator }): JSX.Element {

@@ -39,6 +39,7 @@ export const DESKTOP_CHANNELS = {
   pageSearchStop: "joko:page-search:stop",
   pageSearchResult: "joko:page-search:result",
   appGetInfo: "joko:app:get-info",
+  preferredSystemLocaleGet: "joko:locale:preferred-system:get",
   applicationMenuCommand: "joko:application-menu:command",
   applicationMenuConfigure: "joko:application-menu:configure",
   selectionContextMenuAddToChat: "joko:selection-context-menu:add-to-chat",
@@ -84,6 +85,8 @@ export const DESKTOP_CHANNELS = {
   globalVoicePublishStatus: "joko:global-voice:status:publish",
   globalVoiceGetStatus: "joko:global-voice:status:get",
   globalVoiceStatus: "joko:global-voice:status",
+  globalVoiceOverlayGetLocale: "joko:global-voice:overlay-locale:get",
+  globalVoiceOverlayLocaleChanged: "joko:global-voice:overlay-locale:changed",
   globalVoiceCommit: "joko:global-voice:commit",
   globalVoiceOverlayAction: "joko:global-voice:overlay-action",
   globalVoiceGetAccessibility: "joko:global-voice:accessibility:get",
@@ -150,6 +153,7 @@ export function isInspectorWindowOpenRequest(url: unknown, frameName: unknown): 
 }
 
 export type DesktopLocale = "en" | "zh-CN" | "en-XA";
+export type DesktopSystemLocale = Exclude<DesktopLocale, "en-XA">;
 
 export const DESKTOP_PAGE_SEARCH_MAX_TEXT_LENGTH = 4_096;
 
@@ -195,6 +199,10 @@ export function parseDesktopPageSearchStopAction(value: unknown): DesktopPageSea
 
 export function isDesktopLocale(value: unknown): value is DesktopLocale {
   return value === "en" || value === "zh-CN" || value === "en-XA";
+}
+
+export function isDesktopSystemLocale(value: unknown): value is DesktopSystemLocale {
+  return value === "en" || value === "zh-CN";
 }
 
 export type DesktopApplicationMenuCommand =

@@ -428,6 +428,8 @@ type DesktopRuntimeProcessMonitorResponse = {
 
 interface JokoDesktopApi {
   readonly platform: string;
+  /** OS-preferred locale captured by the trusted Desktop preload for this app start. */
+  readonly preferredSystemLocale: "en" | "zh-CN";
   readonly capabilities: readonly JokoDesktopCapability[];
   readonly appInfo: {
     get(): Promise<JokoDesktopAppInfo>;
@@ -655,6 +657,8 @@ interface JokoInspectorDesktopApi {
 interface JokoVoiceOverlayApi {
   getStatus(): Promise<JokoDesktopGlobalVoiceStatus>;
   onStatus(listener: (status: JokoDesktopGlobalVoiceStatus) => void): () => void;
+  getLocale(): Promise<"en" | "zh-CN" | "en-XA">;
+  onLocale(listener: (locale: "en" | "zh-CN" | "en-XA") => void): () => void;
   cancel(): Promise<void>;
   retry(): Promise<void>;
 }

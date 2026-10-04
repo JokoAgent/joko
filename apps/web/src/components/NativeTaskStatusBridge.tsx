@@ -34,13 +34,13 @@ export function NativeTaskStatusBridge({ controller, ownsProjection, visibleSess
       ? {
           ownerId: `renderer-unavailable:${ownerId ?? "none"}`,
           revision: "0",
-          locale: controller.state.preferences.locale,
+          locale: controller.state.effectiveLocale,
           sessions: []
         }
       : projectNativeTaskStatusSnapshot({
           ownerId,
           revision: controller.state.snapshot.revision,
-          locale: controller.state.preferences.locale,
+          locale: controller.state.effectiveLocale,
           sessions: controller.state.snapshot.sessions,
           interactions: controller.state.snapshot.interactions,
           timelineBySession: controller.state.snapshot.timelineBySession
@@ -48,7 +48,7 @@ export function NativeTaskStatusBridge({ controller, ownsProjection, visibleSess
     void desktop.nativeTaskStatus.publish(snapshot).catch(() => undefined);
   }, [
     controller.state.connectionState,
-    controller.state.preferences.locale,
+    controller.state.effectiveLocale,
     controller.state.snapshot.interactions,
     controller.state.snapshot.revision,
     controller.state.snapshot.sessions,
@@ -81,7 +81,7 @@ export function NativeTaskStatusBridge({ controller, ownsProjection, visibleSess
     void desktop.nativeTaskStatus.publish({
       ownerId: "renderer-unmounted",
       revision: "0",
-      locale: controllerRef.current.state.preferences.locale,
+      locale: controllerRef.current.state.effectiveLocale,
       sessions: []
     }).catch(() => undefined);
   }, [desktop, ownsProjection, supported]);

@@ -299,7 +299,9 @@ async function render(controller: AppController, value: AppSnapshot): Promise<HT
       connectionState: "connected",
       connectionGeneration: 1,
       activeProfile: { id: "profile-local", deviceId: "device-local", serverId: "server-local", name: "Local", origin: "http://127.0.0.1" },
-      preferences: { locale: "en" },
+      preferences: { locale: "system" },
+      systemLocale: "en",
+      effectiveLocale: "en",
       snapshot: value
     }
   } as unknown as AppController;
