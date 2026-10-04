@@ -257,7 +257,6 @@ import {
   mobileImageGalleryMediaType,
   mobileImageGalleryPage,
   mobileImageGalleryPageSummary,
-  mobileTimelineGalleryMessage,
   mobileTimelineGalleryPages,
   mobileTimelineGalleryWindowKey,
   sameMobileImageGalleryPage,
@@ -454,7 +453,7 @@ interface MobileImageGalleryLease {
     | {
         readonly kind: "timeline";
         readonly eventId: string;
-        readonly messageId: string;
+        readonly pageId: string;
         readonly windowKey: string;
       }
     | {
@@ -4583,14 +4582,13 @@ export class MobileClient {
     const events = this.#timelineEvents();
     const matches = events.filter((event) => event.eventId === eventId);
     const event = matches.length === 1 ? matches[0] : undefined;
-    const message = event ? mobileTimelineGalleryMessage(event) : undefined;
-    if (!event || event.identity?.sessionId !== sessionId || !message) {
-      throw new Error("The durable message image is no longer in the current Timeline window.");
+    if (!event || event.identity?.sessionId !== sessionId) {
+      throw new Error("The durable image is no longer in the current Timeline window.");
     }
-    const pages = mobileTimelineGalleryPages(event);
+    const pages = timelineGalleryPagesForSelection(events, eventId, pageId);
     const initialIndex = pages.findIndex((page) => page.pageId === pageId);
     if (initialIndex < 0 || pages.length === 0) {
-      throw new Error("The selected message image is not in its durable completed message.");
+      throw new Error("The selected image is not in its current durable Timeline source.");
     }
     const identity = { profileId: credential.profileId, sessionId };
     const snapshot = await this.composerDrafts.readSnapshot(identity);
@@ -4604,7 +4602,11 @@ export class MobileClient {
     const descriptor: MobileImageGalleryDescriptor = {
       leaseId,
       sourceKind: "timeline",
-      sourceLabel: message.role === MessageRole.USER ? "Your message" : "Task message",
+      sourceLabel: event.payload?.kind.case === "messageStarted" && event.payload.kind.value.role === MessageRole.USER
+        || event.payload?.kind.case === "messageCompleted" && event.payload.kind.value.role === MessageRole.USER
+        ? "Your message" : event.payload?.kind.case === "toolCallStarted" || event.payload?.kind.case === "toolCallUpdated"
+          || event.payload?.kind.case === "toolCallCompleted" ? "Tool result"
+          : event.payload?.kind.case === "artifactProduced" ? "Generated file" : "Task message",
       pages: pages.map(mobileImageGalleryPageSummary),
       initialIndex
     };
@@ -4622,7 +4624,7 @@ export class MobileClient {
       source: {
         kind: "timeline",
         eventId,
-        messageId: message.messageId,
+        pageId,
         windowKey: mobileTimelineGalleryWindowKey(events)
       },
       operationInFlight: false
@@ -8447,11 +8449,10 @@ export class MobileClient {
       if (mobileTimelineGalleryWindowKey(events) !== source.windowKey) {
         throw new Error("The Timeline source window changed while the gallery was open.");
       }
-      const matches = events.filter((event) => event.eventId === source.eventId);
-      const currentPages = matches.length === 1 ? mobileTimelineGalleryPages(matches[0]!) : [];
+      const currentPages = timelineGalleryPagesForSelection(events, source.eventId, source.pageId);
       if (currentPages.length !== lease.pages.length
         || currentPages.some((page, index) => !sameMobileImageGalleryPage(page, lease.pages[index]!))) {
-        throw new Error("The completed message images changed while the gallery was open.");
+        throw new Error("The durable Timeline images changed while the gallery was open.");
       }
     }
     const snapshot = await this.composerDrafts!.readSnapshot(lease.identity);
@@ -10555,6 +10556,23 @@ function composerRouteOwnerKey(
     session.nativeBinding?.opaqueReference ?? "",
     session.nativeBinding?.runtimeGeneration.toString(10) ?? ""
   ]);
+}
+
+function timelineGalleryPagesForSelection(
+  events: readonly Event[],
+  eventId: string,
+  pageId: string
+): readonly MobileImageGalleryPage[] {
+  const rows = timelineRows(events).filter((row) => row.images?.some((image) =>
+    image.sourceEventId === eventId && image.pageId === pageId));
+  if (rows.length !== 1) return [];
+  const images = rows[0]!.images ?? [];
+  const pages = images.flatMap((image) => {
+    const sources = events.filter((event) => event.eventId === image.sourceEventId);
+    if (sources.length !== 1) return [];
+    return mobileTimelineGalleryPages(sources[0]!).filter((page) => page.pageId === image.pageId);
+  });
+  return pages.length === images.length ? pages : [];
 }
 
 function historyInvalidated(event: Event): boolean {

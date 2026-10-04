@@ -1,6 +1,7 @@
 import { create } from "@bufbuild/protobuf";
 import { EventSchema, MessageRole } from "@joko/contracts";
 import { describe, expect, it } from "vitest";
+import { producedArtifactEvent, producedImageEvent, toolMediaEvent } from "./test/timeline-media";
 import {
   inspectMobileImageGalleryBytes,
   mobileImageGalleryMediaType,
@@ -11,6 +12,26 @@ import {
 const sha = "a".repeat(64);
 
 describe("mobile image gallery", () => {
+  it("preserves typed tool, produced artifact and produced image source identities without interpreting URLs", () => {
+    const message = create(EventSchema, { eventId: "canonical", identity: { sessionId: "session" },
+      cursor: { generation: 1n, sequence: 1n }, payload: { kind: { case: "messageCompleted", value: {
+        messageId: "message", role: MessageRole.ASSISTANT, blocks: [{ content: { case: "image", value: {
+          altText: "Picture", blob: { blobId: "image", fileName: "image.png", mediaType: "image/png", byteSize: 128n, sha256Hex: sha }
+        } } }]
+      } } }
+    });
+    const tool = toolMediaEvent(message);
+    expect(mobileTimelineGalleryPages(tool)).toMatchObject([{ title: "Picture", source: { kind: "tool", eventId: "canonical", contentIndex: 0 } }]);
+    expect(mobileTimelineGalleryPages(producedArtifactEvent(message))).toMatchObject([{
+      source: { kind: "artifactProduced", artifactId: "canonical-file" }
+    }]);
+    expect(mobileTimelineGalleryPages(producedImageEvent(message))).toMatchObject([{
+      source: { kind: "imageProduced", messageId: "message" }
+    }]);
+    if (tool.payload?.kind.case !== "toolCallCompleted") throw new Error("fixture");
+    tool.payload.kind.value.toolCall!.runId = "foreign";
+    expect(mobileTimelineGalleryPages(tool)).toEqual([]);
+  });
   it("accepts bounded static JPEG, PNG, and WebP bytes while rejecting animation and mismatched MIME", () => {
     expect(inspectMobileImageGalleryBytes(png(40, 30), "image/png"))
       .toEqual({ mediaType: "image/png", width: 40, height: 30 });

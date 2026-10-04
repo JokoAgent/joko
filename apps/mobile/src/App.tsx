@@ -143,6 +143,7 @@ import {
 } from "./composer-layout";
 import { MobileKeyboardAvoidingView, useMobileKeyboardState } from "./MobileKeyboardAvoidingView";
 import { timelineRows, type TimelineRow } from "./timeline";
+import { MobileToolCallCard } from "./MobileToolCallCard";
 import {
   appendMobileOptimisticUserRow,
   markMobileOptimisticUserRowSubmitted,
@@ -5381,7 +5382,9 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
           </Pressable>}
         </View>
         <View pointerEvents={conversationShare.active ? "none" : "auto"}>
-        {item.kind === "assistant" ? <MobileMarkdownMessage key={markdownOwnerKey} text={item.text} colors={colors} locale={locale}
+        {item.tool ? <MobileToolCallCard key={markdownOwnerKey} call={item.tool} ownerKey={markdownOwnerKey} colors={colors} locale={locale}
+          enabled={state.status === "connected" || state.status === "offline"} />
+          : item.kind === "assistant" ? <MobileMarkdownMessage key={markdownOwnerKey} text={item.text} colors={colors} locale={locale}
           ownerKey={markdownOwnerKey} resourceClient={client} messageId={item.id}
           resourceOwnerKey={item.completed && !item.optimistic ? client.markdownResourceOwnerKey() : undefined}
           onOpenImage={openMarkdownImage} onOpenPath={openMarkdownPath} />

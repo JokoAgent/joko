@@ -1,4 +1,5 @@
-import { MessageRole, type BlobRef, type Event } from "@joko/contracts";
+import { type BlobRef, type Event } from "@joko/contracts";
+import { mobileTimelineContent, type MobileTimelineContentSource } from "./mobile-timeline-content";
 import { MOBILE_BLOB_PREVIEW_MAXIMUM_BYTES } from "./network";
 import { normalizeMediaType } from "./workspace-files";
 import type { MobileComposerImageEditorSession } from "./mobile-composer-image-editor";
@@ -20,13 +21,7 @@ export interface MobileImageGalleryPage {
   readonly source:
     | { readonly kind: "workspace"; readonly relativePath: string; readonly revisionKey: string }
     | { readonly kind: "artifact"; readonly artifactId: string; readonly sessionId: string }
-    | {
-        readonly kind: "timeline";
-        readonly eventId: string;
-        readonly messageId: string;
-        readonly contentKind: "block" | "inputPart";
-        readonly contentIndex: number;
-      };
+    | MobileTimelineContentSource;
 }
 
 export interface MobileImageGalleryPageSummary {
@@ -80,7 +75,7 @@ export function mobileImageGalleryPageSummary(page: MobileImageGalleryPage): Mob
     byteSize: page.byteSize,
     ...(page.widthPixels === undefined ? {} : { widthPixels: page.widthPixels }),
     ...(page.heightPixels === undefined ? {} : { heightPixels: page.heightPixels }),
-    ...(page.source.kind === "timeline" ? { sourceEventId: page.source.eventId } : {})
+    ...("eventId" in page.source ? { sourceEventId: page.source.eventId } : {})
   };
 }
 
@@ -130,46 +125,22 @@ export function mobileImageGalleryPage(input: {
 }
 
 export function mobileTimelineGalleryPages(event: Event): readonly MobileImageGalleryPage[] {
-  const payload = event.payload?.kind;
-  const sessionId = event.identity?.sessionId ?? "";
-  const message = mobileTimelineGalleryMessage(event);
-  if (!event.eventId || !sessionId || !message) return [];
-  const candidates = payload?.case === "messageCompleted"
-    ? payload.value.blocks.map((block, contentIndex) => ({
-        contentKind: "block" as const,
-        contentIndex,
-        image: block.content.case === "image" ? block.content.value : undefined,
-        artifact: block.content.case === "artifact" ? block.content.value : undefined
-      }))
-    : payload?.case === "messageStarted" && payload.value.userInputAccepted
-      ? (payload.value.userInput?.parts ?? []).map((part, contentIndex) => ({
-          contentKind: "inputPart" as const,
-          contentIndex,
-          image: part.content.case === "image" ? part.content.value : undefined,
-          artifact: undefined
-        }))
-      : [];
   const pages: MobileImageGalleryPage[] = [];
   const seen = new Set<string>();
-  candidates.forEach(({ contentKind, contentIndex, image, artifact }) => {
-    const blob = image?.blob ?? artifact?.blob;
-    const duplicateKey = blob ? `${blob.blobId}\u001f${blob.sha256Hex}` : "";
+  mobileTimelineContent(event).forEach(({ source, blob, label, image }) => {
+    const duplicateKey = `${blob.blobId}\u001f${blob.sha256Hex}`;
     if (!blob || !duplicateKey || seen.has(duplicateKey)) return;
     const page = mobileImageGalleryPage({
-      pageId: `${event.eventId}:${message.messageId}:${contentKind}:${contentIndex}:${blob.blobId}`,
-      title: image?.altText || artifact?.label || blob.fileName || `Image ${pages.length + 1}`,
+      pageId: source.kind === "timeline"
+        ? `${source.eventId}:${source.messageId}:${source.contentKind}:${source.contentIndex}:${blob.blobId}`
+        : JSON.stringify([source.eventId, source.kind, source.kind === "tool" ? source.contentIndex : 0, blob.blobId]),
+      title: label || blob.fileName || `Image ${pages.length + 1}`,
       blob,
       ...(image === undefined ? {} : {
         widthPixels: image.widthPixels,
         heightPixels: image.heightPixels
       }),
-      source: {
-        kind: "timeline",
-        eventId: event.eventId,
-        messageId: message.messageId,
-        contentKind,
-        contentIndex
-      }
+      source
     });
     if (!page) return;
     seen.add(duplicateKey);
@@ -178,26 +149,10 @@ export function mobileTimelineGalleryPages(event: Event): readonly MobileImageGa
   return pages;
 }
 
-export function mobileTimelineGalleryMessage(
-  event: Event
-): { readonly messageId: string; readonly role: MessageRole } | undefined {
-  const payload = event.payload?.kind;
-  if (payload?.case === "messageCompleted" && payload.value.messageId
-    && [MessageRole.USER, MessageRole.ASSISTANT, MessageRole.SYSTEM, MessageRole.TOOL].includes(payload.value.role)) {
-    return { messageId: payload.value.messageId, role: payload.value.role };
-  }
-  if (payload?.case === "messageStarted" && payload.value.messageId
-    && payload.value.role === MessageRole.USER && payload.value.userInputAccepted && payload.value.userInput) {
-    return { messageId: payload.value.messageId, role: payload.value.role };
-  }
-  return undefined;
-}
-
 export function mobileTimelineGalleryWindowKey(events: readonly Event[]): string {
   const unique = new Map(events.map((event) => [event.eventId, event]));
   return [...unique.values()].map((event) => {
     const payload = event.payload?.kind;
-    const message = mobileTimelineGalleryMessage(event);
     const pages = mobileTimelineGalleryPages(event);
     return [
       event.eventId,
@@ -205,7 +160,6 @@ export function mobileTimelineGalleryWindowKey(events: readonly Event[]): string
       event.cursor?.sequence.toString(10) ?? "",
       event.identity?.sessionId ?? "",
       payload?.case ?? "",
-      message?.messageId ?? "",
       ...pages.flatMap((page) => [page.pageId, page.sha256Hex, page.byteSize.toString(10)])
     ].join("\u001e");
   }).join("\u001f");

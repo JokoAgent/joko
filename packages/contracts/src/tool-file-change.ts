@@ -18,7 +18,7 @@ const MAXIMUM_PAYLOAD_CHARS = 1_048_576;
 const MAXIMUM_CHANGES = 256;
 const MAXIMUM_PATH_CHARS = 4_096;
 
-/** Strictly projects the capability-neutral file_change display payload. */
+/** Strictly projects file_change display data without granting Workspace authority. */
 export function parseToolFileChangeSet(toolName: string, input: string): ToolFileChangeSetView | undefined {
   if (toolName !== "file_change" || input.length === 0 || input.length > MAXIMUM_PAYLOAD_CHARS + 3) return undefined;
   const root = parseToolDisplayInput(input, MAXIMUM_PAYLOAD_CHARS);

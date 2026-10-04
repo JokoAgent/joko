@@ -23,11 +23,12 @@ import {
   ScheduleDeletionResultSchema, ScheduleRunCostAttribution, ScheduleRunHistorySchema, ScheduleRunOutcome, ScheduleRunPhase, ScheduleSchema,
   ScheduleSessionMode, ScheduleSource, ScheduleState, SchedulerRuntimeSnapshotSchema,
   SessionContextStateSchema, SessionMessageSearchSessionStatus, SessionSchema, SessionState, SnapshotSchema,
-  TargetState, WorkspaceKind, WorkspaceLocationSchema, capabilityNames, nativeSessionTreeWireFields
+  TargetState, ToolCallOutputMode, WorkspaceKind, WorkspaceLocationSchema, capabilityNames, nativeSessionTreeWireFields
 } from "@joko/contracts";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MobileClient, type MobileStorage, type PendingOperation } from "./mobile-client";
 import { MobileCredentialStorageError, profileFromCredential } from "./connection-storage";
+import { producedArtifactEvent, producedImageEvent, toolMediaEvent } from "./test/timeline-media";
 import type { MobileDiscovery } from "./connection-discovery";
 import {
   normalizeNodeOrigin,
@@ -1511,6 +1512,12 @@ function galleryPngBytes(width: number, height: number): Uint8Array {
   return bytes;
 }
 
+const timelineFileSources = [
+  { kind: "message", project: (event: Event) => event },
+  { kind: "tool", project: (event: Event) => toolMediaEvent(event) },
+  { kind: "artifactProduced", project: producedArtifactEvent }
+] as const;
+
 function timelineGalleryEvent(bytes: Uint8Array): Event {
   const first = create(BlobRefSchema, {
     blobId: "timeline-image-one", fileName: "first.png", mediaType: "image/png",
@@ -1538,6 +1545,17 @@ function timelineGalleryEvent(bytes: Uint8Array): Event {
       ]
     } } }
   });
+}
+
+function timelineToolAppendEvents(bytes: Uint8Array): readonly Event[] {
+  const first = timelineGalleryEvent(bytes);
+  const second = timelineGalleryEvent(bytes);
+  if (first.payload?.kind.case !== "messageCompleted" || second.payload?.kind.case !== "messageCompleted") throw new Error("fixture");
+  first.payload.kind.value.blocks = first.payload.kind.value.blocks.slice(1, 2);
+  second.payload.kind.value.blocks = second.payload.kind.value.blocks.slice(2, 3);
+  second.eventId = "timeline-appended-image";
+  second.cursor!.sequence = 12n;
+  return [toolMediaEvent(first, "toolCallStarted"), toolMediaEvent(second, "toolCallUpdated", ToolCallOutputMode.APPEND)];
 }
 
 function timelinePreviewEvent(
@@ -7561,14 +7579,15 @@ describe("native current-task Files ownership", () => {
     expect(perform).not.toHaveBeenCalled();
   });
 
-  it("shares a bounded non-preview Timeline Artifact only while its durable event remains exact", async () => {
+  it.each(timelineFileSources)("shares a bounded non-preview $kind file only while its durable event remains exact", async ({ project }) => {
     const bytes = Uint8Array.from([1, 2, 3, 4]);
-    const event = timelinePreviewEvent("bundle.zip", "application/zip", bytes, "d".repeat(64), "Bundle");
+    const original = timelinePreviewEvent("bundle.zip", "application/zip", bytes, "d".repeat(64), "Bundle");
+    const event = project(original);
     const network = projectedNetwork(timelineGallerySnapshot(event));
     vi.mocked(network.readAround).mockResolvedValue([event]);
     const rowArtifact = timelineRows([event])[0]!.artifacts![0]!;
     expect(rowArtifact.previewKind).toBeUndefined();
-    const payload = event.payload?.kind;
+    const payload = original.payload?.kind;
     const block = payload?.case === "messageCompleted" ? payload.value.blocks[0] : undefined;
     const blob = block?.content.case === "artifact"
       ? block.content.value.blob!
@@ -7596,6 +7615,10 @@ describe("native current-task Files ownership", () => {
     expect(network.readAround).toHaveBeenCalledTimes(2);
     expect(network.authorizeBlobDownload).toHaveBeenCalledWith(credential, blob, expect.any(AbortSignal));
     expect(perform).toHaveBeenCalledTimes(1);
+    vi.mocked(network.readAround).mockResolvedValue([]);
+    await expect(app.shareTimelineArtifact(rowArtifact)).rejects.toThrow(/changed/u);
+    expect(perform).toHaveBeenCalledTimes(1);
+    expect(network.authorizeBlobDownload).toHaveBeenCalledTimes(1);
   });
 
   it("materializes an authenticated Generated video into one app-owned preview lease and cleans it on background", async () => {
@@ -8048,9 +8071,9 @@ describe("native current-task Files ownership", () => {
     expect(model.driver.write).toHaveBeenCalledTimes(1);
   });
 
-  it("previews an exact durable Timeline video and removes its lease when closed", async () => {
+  it.each(timelineFileSources)("previews an exact durable $kind video and removes its lease when closed", async ({ project }) => {
     const bytes = previewMp4Bytes();
-    const event = timelinePreviewEvent("demo.mp4", "video/mp4", bytes, "c".repeat(64), "Demo video");
+    const event = project(timelinePreviewEvent("demo.mp4", "video/mp4", bytes, "c".repeat(64), "Demo video"));
     const network = projectedNetwork(timelineGallerySnapshot(event));
     vi.mocked(network.downloadBlob).mockResolvedValue({ bytes, mediaType: "video/mp4" });
     const media = mediaPreviewFixture();
@@ -8100,10 +8123,10 @@ describe("native current-task Files ownership", () => {
     expect(app.state.timelinePreview).toBeUndefined();
   });
 
-  it("cleans a late Timeline stage after the exact source window changes", async () => {
+  it.each(timelineFileSources)("cleans a late $kind stage after the exact source window changes", async ({ project }) => {
     const bytes = previewMp4Bytes();
-    const event = timelinePreviewEvent("late.mp4", "video/mp4", bytes, "e".repeat(64), "Late video");
-    const replacement = timelinePreviewEvent("replacement.mp4", "video/mp4", bytes, "d".repeat(64), "Replacement");
+    const event = project(timelinePreviewEvent("late.mp4", "video/mp4", bytes, "e".repeat(64), "Late video"));
+    const replacement = project(timelinePreviewEvent("replacement.mp4", "video/mp4", bytes, "d".repeat(64), "Replacement"));
     const network = projectedNetwork(timelineGallerySnapshot(event));
     vi.mocked(network.downloadBlob).mockResolvedValue({ bytes, mediaType: "video/mp4" });
     vi.mocked(network.readAround).mockResolvedValue([replacement]);
@@ -8420,10 +8443,16 @@ describe("native current-task Files ownership", () => {
     expect(network.submit).not.toHaveBeenCalled();
   });
 
-  it("opens only the selected durable message gallery and appends its authenticated decoded page", async () => {
+  it.each([
+    { kind: "accepted message", label: "Your message", events: (bytes: Uint8Array) => [acceptedTimelineGalleryEvent(bytes)] },
+    { kind: "tool result", label: "Tool result", events: (bytes: Uint8Array) => [toolMediaEvent(timelineGalleryEvent(bytes))] },
+    { kind: "appended tool result", label: "Tool result", events: timelineToolAppendEvents },
+    { kind: "produced artifact", label: "Generated file", events: (bytes: Uint8Array) => [producedArtifactEvent(timelineGalleryEvent(bytes))] },
+    { kind: "produced image", label: "Task message", events: (bytes: Uint8Array) => [producedImageEvent(timelineGalleryEvent(bytes))] }
+  ])("opens only the selected durable $kind gallery and appends its authenticated decoded page", async ({ label, events: sourceEvents }) => {
     const bytes = galleryPngBytes(5, 4);
-    const accepted = acceptedTimelineGalleryEvent(bytes);
-    const network = projectedNetwork(timelineGallerySnapshot(accepted));
+    const events = sourceEvents(bytes);
+    const network = projectedNetwork(create(SnapshotSchema, { ...timelineGallerySnapshot(events[0]!), timeline: [...events] }));
     vi.mocked(network.downloadBlob).mockResolvedValue({ bytes, mediaType: "image/png" });
     const drafts = memoryDraftStores();
     const identity = { profileId: credential.profileId, sessionId: "session" };
@@ -8434,12 +8463,15 @@ describe("native current-task Files ownership", () => {
       fixedIds("timeline-gallery", "timeline-load", "timeline-output"), undefined, drafts, fixture.files);
     await app.start();
     const row = timelineRows(app.state.detail?.timeline ?? [])[0]!;
-    expect(row.images).toMatchObject([{ title: "First image" }, { title: "Second image" }]);
-
-    const descriptor = await app.openTimelineImageGallery(row.eventId, row.images![1]!.pageId);
-    expect(descriptor).toMatchObject({ sourceKind: "timeline", sourceLabel: "Your message", initialIndex: 1, pages: [{}, {}] });
+    const initialIndex = row.images!.length - 1;
+    const selectedImage = row.images![initialIndex]!;
+    const fileName = initialIndex === 1 ? "second.png" : "first.png";
+    expect(row.images).toMatchObject(initialIndex === 1 ? [{ title: "First image" }, { title: "Second image" }] : [{ title: "First image" }]);
+    const descriptor = await app.openTimelineImageGallery(selectedImage.sourceEventId!, selectedImage.pageId);
+    expect(descriptor).toMatchObject({ sourceKind: "timeline", sourceLabel: label, initialIndex });
+    expect(descriptor.pages).toHaveLength(row.images!.length);
     const page = await app.loadImageGalleryPage(descriptor.leaseId, descriptor.initialIndex);
-    expect(page).toMatchObject({ fileName: "second.png", pageIndex: 1, pageCount: 2, addable: true, annotatable: true });
+    expect(page).toMatchObject({ fileName, pageIndex: initialIndex, pageCount: row.images!.length, addable: true, annotatable: true });
     app.confirmImageGalleryPageDecoded(descriptor.leaseId, page.leaseId, page.pageId, {
       width: 5, height: 4, mediaType: "image/png", isAnimated: false
     });
@@ -8450,11 +8482,11 @@ describe("native current-task Files ownership", () => {
     const committed = await app.addImageGalleryPageToComposer(descriptor.leaseId, page.leaseId);
     expect(committed).toMatchObject({
       text: "Keep timeline draft",
-      attachments: [{ attachmentId: "timeline-output", fileName: "second.png", kind: "image" }]
+      attachments: [{ attachmentId: "timeline-output", fileName, kind: "image" }]
     });
     expect(network.downloadBlob).toHaveBeenCalledWith(
       credential,
-      expect.objectContaining({ blobId: "timeline-image-two", sha256Hex: "b".repeat(64) }),
+      expect.objectContaining({ blobId: initialIndex === 1 ? "timeline-image-two" : "timeline-image-one", sha256Hex: "b".repeat(64) }),
       undefined
     );
     expect(network.submit).not.toHaveBeenCalled();

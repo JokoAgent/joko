@@ -1,4 +1,6 @@
-import { MessageRole, type BlobRef, type Event } from "@joko/contracts";
+import { type BlobRef, type Event } from "@joko/contracts";
+import { mobileTimelineContent, mobileTimelineContentSourceKey, mobileTimelineToolMediaEvents,
+  type MobileTimelineContentSource } from "./mobile-timeline-content";
 import { mobileMediaPreviewKind } from "./mobile-media-preview";
 import { mobileModelPreviewKind } from "./mobile-model-preview";
 import { isMobilePdfPreviewMediaType } from "./mobile-pdf-preview";
@@ -8,8 +10,7 @@ import { normalizeMediaType } from "./workspace-files";
 export interface MobileTimelineArtifact {
   readonly artifactId: string;
   readonly eventId: string;
-  readonly messageId: string;
-  readonly contentIndex: number;
+  readonly source: MobileTimelineContentSource;
   readonly title: string;
   readonly mediaType: string;
   readonly byteSize: bigint;
@@ -28,25 +29,19 @@ export interface MobileTimelineArtifactSource<TArtifact extends MobileTimelineAr
 }
 
 export function mobileTimelineArtifacts(event: Event): readonly MobileTimelineArtifact[] {
-  const payload = event.payload?.kind;
-  const sessionId = event.identity?.sessionId ?? "";
-  if (payload?.case !== "messageCompleted" || !event.eventId || !sessionId
-    || !payload.value.messageId || !previewableRole(payload.value.role)) return [];
-  return payload.value.blocks.flatMap((block, contentIndex) => {
-    if (block.content.case !== "artifact" || !block.content.value.blob) return [];
-    const blob = block.content.value.blob;
+  return mobileTimelineContent(event).flatMap((content) => {
+    const blob = content.blob;
     const mediaType = normalizeMediaType(blob.mediaType);
     const previewKind = mobileMediaPreviewKind(mediaType) ? "media"
       : isMobilePdfPreviewMediaType(mediaType) ? "pdf"
         : mobileModelPreviewKind(mediaType, blob.fileName) ? "model" : undefined;
     if (!/^[a-z0-9!#$&^_.+-]+\/[a-z0-9!#$&^_.+-]+$/u.test(mediaType)
       || !validBlobIdentity(blob, MOBILE_FILE_SHARE_MAXIMUM_BYTES)) return [];
-    const title = boundedLabel(block.content.value.label) || boundedLabel(blob.fileName) || "Message file";
+    const title = boundedLabel(content.label) || boundedLabel(blob.fileName) || "Task file";
     return [{
-      artifactId: JSON.stringify([event.eventId, payload.value.messageId, contentIndex, blob.blobId]),
+      artifactId: JSON.stringify([mobileTimelineContentSourceKey(content.source), blob.blobId]),
       eventId: event.eventId,
-      messageId: payload.value.messageId,
-      contentIndex,
+      source: content.source,
       title,
       mediaType,
       byteSize: blob.byteSize,
@@ -75,14 +70,14 @@ export function resolveMobileTimelineArtifact(
   const matchingEvents = events.filter((event) => event.eventId === selected.eventId);
   if (matchingEvents.length !== 1) return undefined;
   const event = matchingEvents[0]!;
-  const payload = event.payload?.kind;
-  if (payload?.case !== "messageCompleted" || payload.value.messageId !== selected.messageId) return undefined;
+  if (selected.source.kind === "tool" && !mobileTimelineToolMediaEvents(events).get(selected.source.scopeKey)
+    ?.some((sourceEvent) => sourceEvent.eventId === event.eventId)) return undefined;
+  const sourceKey = mobileTimelineContentSourceKey(selected.source);
   const artifact = mobileTimelineArtifacts(event)
-    .find((candidate) => candidate.contentIndex === selected.contentIndex);
-  const block = payload.value.blocks[selected.contentIndex];
-  if (!artifact || !sameMobileTimelineArtifact(artifact, selected)
-    || block?.content.case !== "artifact" || !block.content.value.blob) return undefined;
-  return { artifact, blob: block.content.value.blob, event };
+    .find((candidate) => mobileTimelineContentSourceKey(candidate.source) === sourceKey);
+  const content = mobileTimelineContent(event).find((candidate) => mobileTimelineContentSourceKey(candidate.source) === sourceKey);
+  if (!artifact || !sameMobileTimelineArtifact(artifact, selected) || !content) return undefined;
+  return { artifact, blob: content.blob, event };
 }
 
 export function resolveMobileTimelinePreviewArtifact(
@@ -138,8 +133,7 @@ export function sameMobileTimelineArtifact(
 ): boolean {
   return left.artifactId === right.artifactId
     && left.eventId === right.eventId
-    && left.messageId === right.messageId
-    && left.contentIndex === right.contentIndex
+    && mobileTimelineContentSourceKey(left.source) === mobileTimelineContentSourceKey(right.source)
     && left.title === right.title
     && left.mediaType === right.mediaType
     && left.byteSize === right.byteSize
@@ -152,10 +146,6 @@ function validBlobIdentity(blob: BlobRef, maximumBytes: number): boolean {
   return Boolean(blob.blobId && fileName && !fileName.includes("/") && !fileName.includes("\\")
     && /^[a-f0-9]{64}$/u.test(blob.sha256Hex)
     && blob.byteSize >= 0n && blob.byteSize <= BigInt(maximumBytes));
-}
-
-function previewableRole(role: MessageRole): boolean {
-  return [MessageRole.USER, MessageRole.ASSISTANT, MessageRole.SYSTEM, MessageRole.TOOL].includes(role);
 }
 
 function boundedLabel(value: string): string {

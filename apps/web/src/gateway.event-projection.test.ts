@@ -1084,7 +1084,7 @@ describe("incremental event projection", () => {
     apply(create(EventPayloadSchema, { kind: { case: "toolCallUpdated", value: {
       toolCall: { toolCallId: "tool-stream", toolId: "shell", state: ToolCallState.RUNNING },
       incrementalResult: { parts: [
-        { content: { case: "text", value: "B" } },
+        { content: { case: "command", value: { stdoutPreview: "B", stderrPreview: "C" } } },
         { content: { case: "image", value: { altText: "second", blob: {
           blobId: "image-b",
           fileName: "b.png",
@@ -1094,7 +1094,7 @@ describe("incremental event projection", () => {
       ] },
       outputMode: ToolCallOutputMode.APPEND
     } } }));
-    expect(output()).toBe("AB");
+    expect(output()).toBe("ABC");
     expect(snapshot.timelineBySession.get("session-tool-stream")?.find((item) => item.id === "tool-stream")?.attachments)
       .toEqual([
         expect.objectContaining({ blobId: "image-a", title: "first" }),
@@ -1103,7 +1103,7 @@ describe("incremental event projection", () => {
 
     apply(create(EventPayloadSchema, { kind: { case: "toolCallUpdated", value: {
       toolCall: { toolCallId: "tool-stream", toolId: "shell", state: ToolCallState.RUNNING },
-      incrementalResult: { parts: [{ content: { case: "text", value: "replacement" } }] },
+      incrementalResult: { parts: [{ content: { case: "command", value: { stderrPreview: "replacement" } } }] },
       outputMode: ToolCallOutputMode.REPLACE
     } } }));
     expect(output()).toBe("replacement");
@@ -1116,12 +1116,14 @@ describe("incremental event projection", () => {
       sessionId: "session-tool-stream",
       runId: "run-1",
       state: ToolCallState.SUCCEEDED,
-      result: { parts: [{ content: { case: "text", value: "terminal" } }] }
+      result: { parts: [{ content: { case: "command", value: { stdoutPreview: "terminal", stderrPreview: "\nwarning" } } }] }
     } } } }));
     expect(snapshot.timelineBySession.get("session-tool-stream")?.find((item) => item.id === "tool-stream")).toMatchObject({
       kind: "toolResult",
-      tool: { state: "succeeded", output: "terminal" }
+      tool: { state: "succeeded", output: "terminal\nwarning" }
     });
+    expect(mapSnapshot(raw).timelineBySession.get("session-tool-stream"))
+      .toEqual(snapshot.timelineBySession.get("session-tool-stream"));
   });
 
   it("keeps exact tool completion times through live updates and rebuilt history", () => {

@@ -1,5 +1,7 @@
 import { MessageRole, ToolCallState, type Event, type ToolCall } from "@joko/contracts";
 import { mobileInputSummary } from "./mobile-composer-document";
+import { mobileTimelineContent, mobileTimelineContentSourceKey, mobileTimelineToolMediaEvents } from "./mobile-timeline-content";
+import { projectMobileToolCall, mobileToolCallScopeKey, mobileToolCallCompleted, type MobileToolCallView } from "./mobile-tool-call";
 import {
   mobileImageGalleryPageSummary,
   mobileTimelineGalleryPages,
@@ -38,6 +40,7 @@ export interface TimelineRow {
   readonly images?: readonly MobileImageGalleryPageSummary[];
   readonly artifacts?: readonly MobileTimelineArtifact[];
   readonly partnerPrivatePreview?: MobilePartnerPrivatePreviewCandidate;
+  readonly tool?: MobileToolCallView;
 }
 
 const PARTNER_PRIVATE_TOOL_NAMES = new Set([
@@ -85,9 +88,7 @@ export function timelineRows(events: readonly Event[]): TimelineRow[] {
         const completedGalleryPages = mobileTimelineGalleryPages(event);
         const completedImages = completedGalleryPages.map(mobileImageGalleryPageSummary);
         const artifacts = mobileTimelineArtifacts(event).filter((artifact) => !completedGalleryPages.some((page) =>
-          page.source.kind === "timeline" && page.source.contentKind === "block"
-            && page.source.contentIndex === artifact.contentIndex
-        ));
+          "eventId" in page.source && mobileTimelineContentSourceKey(page.source) === mobileTimelineContentSourceKey(artifact.source)));
         const images = message.role === MessageRole.USER && acceptedUserInputs.has(message.messageId)
           && previous?.images && previous.images.length > 0
           ? previous.images
@@ -122,29 +123,75 @@ export function timelineRows(events: readonly Event[]): TimelineRow[] {
       case "terminalError":
         byId.set(event.eventId, { id: event.eventId, label: "Error", text: kind.value.error?.message || "The task reported an error.", sequence, eventId: event.eventId, kind: "error", completed: false });
         break;
-      case "toolCallStarted": {
-        const callId = kind.value.toolCall?.toolCallId;
-        if (callId) toolStarts.set(callId, [...(toolStarts.get(callId) ?? []), event]);
-        byId.set(event.eventId, { id: event.eventId, label: "Tool", text: "Tool call started", sequence, eventId: event.eventId, kind: "tool", completed: false });
-        break;
-      }
+      case "toolCallStarted":
+      case "toolCallUpdated":
       case "toolCallCompleted": {
-        const candidate = partnerPrivatePreview(event, toolStarts.get(kind.value.toolCall?.toolCallId ?? "") ?? []);
-        byId.set(event.eventId, { id: event.eventId, label: "Tool",
-          text: candidate ? "Private message" : kind.value.toolCall?.state === ToolCallState.FAILED
-            || kind.value.toolCall?.state === ToolCallState.ABORTED ? "Tool call failed" : "Tool call completed",
-          sequence, eventId: event.eventId, kind: "tool", completed: true,
+        const callId = kind.value.toolCall?.toolCallId ?? "";
+        if (kind.case === "toolCallStarted" && callId) toolStarts.set(callId, [...(toolStarts.get(callId) ?? []), event]);
+        const scopeKey = mobileToolCallScopeKey(event);
+        if (scopeKey === undefined) {
+          byId.set(event.eventId, { id: event.eventId, label: "Tool", text: "Tool call unavailable",
+            sequence, eventId: event.eventId, kind: "tool", completed: false });
+          break;
+        }
+        const previous = byId.get(scopeKey);
+        const tool = projectMobileToolCall(event, previous?.tool)!;
+        if (previous?.tool === tool) break;
+        const candidate = kind.case === "toolCallCompleted" ? partnerPrivatePreview(event, toolStarts.get(callId) ?? []) : undefined;
+        byId.set(tool.scopeKey, { id: tool.scopeKey, label: "Tool", text: tool.name,
+          sequence: previous?.sequence ?? sequence, eventId: event.eventId, kind: "tool", completed: mobileToolCallCompleted(tool), tool,
           ...(candidate === undefined ? {} : { partnerPrivatePreview: candidate }) });
         break;
       }
       case "runDone":
         byId.set(event.eventId, { id: event.eventId, label: "Run", text: "Run finished", sequence, eventId: event.eventId, kind: "activity", completed: false });
         break;
+      case "artifactProduced":
+      case "imageProduced": {
+        const media = timelineMedia([event]);
+        if (media.images?.length || media.artifacts?.length) byId.set(event.eventId, {
+          id: event.eventId, label: kind.case === "imageProduced" ? "Image" : "File", text: "",
+          sequence, eventId: event.eventId, kind: "activity", completed: true, ...media
+        });
+        break;
+      }
       default:
         byId.set(event.eventId, { id: event.eventId, label: "Activity", text: kind.case.replace(/([A-Z])/g, " $1").trim(), sequence, eventId: event.eventId, kind: "activity", completed: false });
     }
   }
+  const toolMediaEvents = mobileTimelineToolMediaEvents(ordered);
+  const toolBlobs = new Set<string>();
+  for (const [scopeKey, mediaEvents] of toolMediaEvents) {
+    const row = byId.get(scopeKey);
+    if (row?.tool) byId.set(scopeKey, { ...row, ...timelineMedia(mediaEvents) });
+    for (const mediaEvent of mediaEvents) for (const content of mobileTimelineContent(mediaEvent)) {
+      const call = mediaEvent.payload?.kind;
+      const runId = call?.case === "toolCallStarted" || call?.case === "toolCallUpdated" || call?.case === "toolCallCompleted"
+        ? call.value.toolCall?.runId ?? "" : "";
+      toolBlobs.add(JSON.stringify([mediaEvent.identity?.sessionId, runId, content.blob.blobId, content.blob.sha256Hex]));
+    }
+  }
+  for (const event of ordered) if (event.payload?.kind.case === "artifactProduced") {
+    const artifact = event.payload.kind.value.artifact;
+    if (artifact?.blob && toolBlobs.has(JSON.stringify([artifact.sessionId, artifact.runId, artifact.blob.blobId, artifact.blob.sha256Hex]))) {
+      byId.delete(event.eventId);
+    }
+  }
   return [...byId.values()].sort((a, b) => a.sequence < b.sequence ? -1 : a.sequence > b.sequence ? 1 : a.id.localeCompare(b.id));
+}
+
+function timelineMedia(events: readonly Event[]): Pick<TimelineRow, "images" | "artifacts"> {
+  const pages = events.flatMap(mobileTimelineGalleryPages);
+  const imageSources = new Set(pages.flatMap((page) => "eventId" in page.source ? [mobileTimelineContentSourceKey(page.source)] : []));
+  const seen = new Set<string>();
+  const images = pages.filter((page) => {
+    const key = JSON.stringify([page.blob.blobId, page.sha256Hex]);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  }).map(mobileImageGalleryPageSummary);
+  const artifacts = events.flatMap(mobileTimelineArtifacts).filter((artifact) => !imageSources.has(mobileTimelineContentSourceKey(artifact.source)));
+  return { ...(images.length ? { images } : {}), ...(artifacts.length ? { artifacts } : {}) };
 }
 
 function partnerPrivatePreview(event: Event, starts: readonly Event[]): MobilePartnerPrivatePreviewCandidate | undefined {
