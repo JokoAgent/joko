@@ -350,6 +350,7 @@ function persistedUiPreferences(value: UiPreferences): { -readonly [Key in keyof
   // Store only non-default overrides so untouched controls continue
   // to follow future product defaults.
   const persisted: { -readonly [Key in keyof UiPreferences]?: UiPreferences[Key] } = { ...value };
+  if (value.composerSendShortcut === DEFAULT_UI_PREFERENCES.composerSendShortcut) delete persisted.composerSendShortcut;
   if (value.messageNavRailEnabled) delete persisted.messageNavRailEnabled;
   if (value.webLinkOpenPreference === LINK_OPEN_DEFAULTS.web) delete persisted.webLinkOpenPreference;
   if (value.localLinkOpenPreference === LINK_OPEN_DEFAULTS.local) delete persisted.localLinkOpenPreference;

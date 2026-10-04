@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { act, useState } from "react";
+import { act, useCallback, useEffect, useRef, useState } from "react";
 import type { JSX } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -187,6 +187,128 @@ describe("shared settings interactions", () => {
     );
   });
 
+  it("single-flights Composer shortcut selection and reset with pending accessibility and one success each", async () => {
+    const selection = deferred<void>();
+    const reset = deferred<void>();
+    const controller = controllerFixture();
+    controller.setComposerSendShortcut = vi.fn()
+      .mockImplementationOnce(() => selection.promise)
+      .mockImplementationOnce(() => reset.promise);
+    const onSuccess = vi.fn();
+    const container = await renderStatefulGeneral(controller, onSuccess);
+    const shortcut = required(container.querySelector<HTMLButtonElement>('[role="combobox"][aria-label="Send shortcut"]'));
+
+    await chooseOptionTwice(shortcut, "Ctrl/Command+Enter sends");
+
+    expect(controller.setComposerSendShortcut).toHaveBeenCalledTimes(1);
+    expect(controller.setComposerSendShortcut).toHaveBeenLastCalledWith("modifier-enter");
+    expect(shortcut.disabled).toBe(true);
+    expect(shortcut.getAttribute("aria-busy")).toBe("true");
+    expect(container.querySelector('[role="status"]')?.textContent).toBe("Working");
+    expect(container.textContent).toContain("Customized");
+    const pendingReset = required(container.querySelector<HTMLButtonElement>('button[aria-label="Restore default"]'));
+    expect(pendingReset.disabled).toBe(true);
+    expect(pendingReset.getAttribute("aria-busy")).toBe("true");
+
+    await act(async () => selection.resolve());
+
+    expect(shortcut.disabled).toBe(false);
+    expect(onSuccess).toHaveBeenCalledTimes(1);
+    expect(onSuccess).toHaveBeenLastCalledWith("Saved");
+    const restore = required(container.querySelector<HTMLButtonElement>('button[aria-label="Restore default"]'));
+    await act(async () => {
+      restore.click();
+      restore.click();
+    });
+
+    expect(controller.setComposerSendShortcut).toHaveBeenCalledTimes(2);
+    expect(controller.setComposerSendShortcut).toHaveBeenLastCalledWith(DEFAULT_UI_PREFERENCES.composerSendShortcut);
+    expect(shortcut.disabled).toBe(true);
+    expect(restore.disabled).toBe(true);
+    expect(restore.getAttribute("aria-busy")).toBe("true");
+    expect(container.textContent).toContain("Customized");
+
+    await act(async () => reset.resolve());
+
+    expect(onSuccess).toHaveBeenCalledTimes(2);
+    expect(onSuccess).toHaveBeenLastCalledWith("Restored default settings");
+    expect(container.textContent).not.toContain("Customized");
+    expect(container.querySelector('button[aria-label="Restore default"]')).toBeNull();
+  });
+
+  it("shows a localized Composer shortcut failure after the Controller rolls back its authoritative value", async () => {
+    const failed = deferred<void>();
+    const controller = controllerFixture();
+    controller.setComposerSendShortcut = vi.fn(() => failed.promise);
+    const onSuccess = vi.fn();
+    const container = await renderStatefulGeneral(controller, onSuccess);
+    const shortcut = required(container.querySelector<HTMLButtonElement>('[role="combobox"][aria-label="Send shortcut"]'));
+
+    await chooseOption(shortcut, "Ctrl/Command+Enter sends");
+    expect(shortcut.textContent).toContain("Ctrl/Command+Enter sends");
+    await act(async () => failed.reject(new Error("storage failed")));
+
+    expect(shortcut.disabled).toBe(false);
+    expect(shortcut.textContent).toContain("Enter sends");
+    expect(container.querySelector('[role="alert"]')?.textContent).toContain("The shortcut could not be saved.");
+    expect(container.textContent).not.toContain("Customized");
+    expect(onSuccess).not.toHaveBeenCalled();
+  });
+
+  it("validates Restore default against Voice Input before clearing a customized Composer shortcut", async () => {
+    writeVoiceInputPreferences({
+      shortcut: {
+        code: "Enter",
+        key: "Enter",
+        meta: true,
+        ctrl: false,
+        alt: false,
+        shift: false,
+        fn: false
+      }
+    });
+    const controller = controllerFixture("modifier-enter");
+    const container = await renderGeneral(controller, () => undefined);
+    const restore = required(container.querySelector<HTMLButtonElement>('button[aria-label="Restore default"]'));
+
+    await act(async () => restore.click());
+
+    expect(controller.setComposerSendShortcut).not.toHaveBeenCalled();
+    expect(controller.state.preferences.composerSendShortcut).toBe("modifier-enter");
+    expect(container.textContent).toContain("Customized");
+    expect(container.querySelector('[role="alert"]')?.textContent).toContain(
+      "Conflicts with the Voice Input shortcut. Change either the Composer send shortcut or the Voice Input shortcut."
+    );
+  });
+
+  it("retires late Composer shortcut feedback when the Controller owner changes or the page unmounts", async () => {
+    const stale = deferred<void>();
+    const afterUnmount = deferred<void>();
+    const first = controllerFixture();
+    first.setComposerSendShortcut = vi.fn(() => stale.promise);
+    const second = controllerFixture();
+    second.setComposerSendShortcut = vi.fn(() => afterUnmount.promise);
+    const onSuccess = vi.fn();
+    const mounted = await mount(<GeneralHarness controller={first} onSuccess={onSuccess} />);
+    let shortcut = required(mounted.container.querySelector<HTMLButtonElement>('[role="combobox"][aria-label="Send shortcut"]'));
+
+    await chooseOption(shortcut, "Ctrl/Command+Enter sends");
+    await act(async () => mounted.root.render(<GeneralHarness controller={second} onSuccess={onSuccess} />));
+    shortcut = required(mounted.container.querySelector<HTMLButtonElement>('[role="combobox"][aria-label="Send shortcut"]'));
+    expect(shortcut.disabled).toBe(false);
+    await chooseOption(shortcut, "Ctrl/Command+Enter sends");
+    expect(shortcut.disabled).toBe(true);
+    await act(async () => stale.reject(new Error("late old owner failure")));
+    expect(shortcut.disabled).toBe(true);
+    expect(mounted.container.querySelector('[role="alert"]')).toBeNull();
+    expect(onSuccess).not.toHaveBeenCalled();
+
+    await act(async () => mounted.root.render(<></>));
+    await act(async () => afterUnmount.resolve());
+    expect(onSuccess).not.toHaveBeenCalled();
+    expect(mounted.container.querySelector('[role="status"]')).toBeNull();
+  });
+
   it("replaces first-level settings locations instead of adding browser history entries", async () => {
     window.history.replaceState({ marker: "settings" }, "", "/#/settings");
     const before = window.history.length;
@@ -279,10 +401,56 @@ function AppearanceHarness({ controller, onSuccess }: {
   />;
 }
 
-function controllerFixture(): AppController {
+function GeneralHarness({ controller, onSuccess }: {
+  readonly controller: AppController;
+  readonly onSuccess: (message: string) => void;
+}): JSX.Element {
+  const [shortcut, setShortcut] = useState(controller.state.preferences.composerSendShortcut);
+  const shortcutRef = useRef(shortcut);
+  const sourceRef = useRef(controller);
+  sourceRef.current = controller;
+  shortcutRef.current = shortcut;
+  useEffect(() => {
+    shortcutRef.current = controller.state.preferences.composerSendShortcut;
+    setShortcut(controller.state.preferences.composerSendShortcut);
+  }, [controller]);
+  const setComposerSendShortcut = useCallback(async (next: "enter" | "modifier-enter"): Promise<void> => {
+    const previous = shortcutRef.current;
+    shortcutRef.current = next;
+    setShortcut(next);
+    try {
+      await controller.setComposerSendShortcut(next);
+    } catch (error) {
+      if (sourceRef.current === controller) {
+        shortcutRef.current = previous;
+        setShortcut(previous);
+      }
+      throw error;
+    }
+  }, [controller]);
+  const wrapped = {
+    ...controller,
+    state: {
+      ...controller.state,
+      preferences: { ...controller.state.preferences, composerSendShortcut: shortcut }
+    },
+    setComposerSendShortcut
+  } as AppController;
+  return <GeneralSettings
+    controller={wrapped}
+    snapshot={emptySnapshot()}
+    runAction={(_key, action) => { void action(); }}
+    onSuccess={onSuccess}
+    t={(key, values) => translate("en", key, values)}
+  />;
+}
+
+function controllerFixture(
+  composerSendShortcut: "enter" | "modifier-enter" = DEFAULT_UI_PREFERENCES.composerSendShortcut
+): AppController {
   return {
     state: {
-      preferences: { ...DEFAULT_UI_PREFERENCES },
+      preferences: { ...DEFAULT_UI_PREFERENCES, composerSendShortcut },
       profiles: [],
       automaticConnectionAvailable: false
     },
@@ -315,6 +483,13 @@ async function renderGeneral(
   />);
 }
 
+async function renderStatefulGeneral(
+  controller: AppController,
+  onSuccess: (message: string) => void
+): Promise<HTMLDivElement> {
+  return render(<GeneralHarness controller={controller} onSuccess={onSuccess} />);
+}
+
 async function renderSettingsPage(controller: AppController): Promise<HTMLDivElement> {
   return render(<SettingsPage
     controller={controller}
@@ -326,12 +501,16 @@ async function renderSettingsPage(controller: AppController): Promise<HTMLDivEle
 }
 
 async function render(element: JSX.Element): Promise<HTMLDivElement> {
+  return (await mount(element)).container;
+}
+
+async function mount(element: JSX.Element): Promise<{ readonly container: HTMLDivElement; readonly root: Root }> {
   const container = document.createElement("div");
   document.body.append(container);
   const root = createRoot(container);
   roots.push(root);
   await act(async () => root.render(element));
-  return container;
+  return { container, root };
 }
 
 async function chooseOption(trigger: HTMLButtonElement, label: string): Promise<void> {
@@ -339,6 +518,16 @@ async function chooseOption(trigger: HTMLButtonElement, label: string): Promise<
   const option = [...document.querySelectorAll<HTMLElement>('[role="option"]')]
     .find((candidate) => candidate.textContent?.trim() === label);
   await act(async () => required(option).click());
+}
+
+async function chooseOptionTwice(trigger: HTMLButtonElement, label: string): Promise<void> {
+  await act(async () => trigger.click());
+  const option = [...document.querySelectorAll<HTMLElement>('[role="option"]')]
+    .find((candidate) => candidate.textContent?.trim() === label);
+  await act(async () => {
+    required(option).click();
+    required(option).click();
+  });
 }
 
 function fireKey(target: HTMLElement, key: string): KeyboardEvent {

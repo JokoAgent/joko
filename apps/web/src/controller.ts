@@ -545,6 +545,10 @@ export function useAppController(): AppController {
   const updatePreferences = useCallback(async (patch: Partial<UiPreferences>): Promise<void> => {
     await mutatePreferences((current) => ({ ...current, ...patch }));
   }, [mutatePreferences]);
+  const setComposerSendShortcut = useCallback<AppController["setComposerSendShortcut"]>(
+    (composerSendShortcut) => updatePreferences({ composerSendShortcut }),
+    [updatePreferences]
+  );
 
   const setMachineSelection = useCallback(async (selection: MachineSelection): Promise<void> => {
     await updatePreferences({ machineSelection: normalizeMachineSelection(selection) });
@@ -2099,7 +2103,7 @@ export function useAppController(): AppController {
     setUiSize: (uiSize) => updatePreferences({ uiSize: clampUiSize(uiSize) }),
     setCodeSize: (codeSize) => updatePreferences({ codeSize: clampCodeSize(codeSize) }),
     setWindowZoom: (windowZoom) => updatePreferences({ windowZoom: clampWindowZoom(windowZoom) }),
-    setComposerSendShortcut: (composerSendShortcut) => updatePreferences({ composerSendShortcut }),
+    setComposerSendShortcut,
     setMessageSearchSort: (messageSearchSort) => updatePreferences({ messageSearchSort }),
     setMessageNavRailEnabled: (messageNavRailEnabled) => updatePreferences({ messageNavRailEnabled }),
     resetMessageNavRailEnabled: () => updatePreferences({ messageNavRailEnabled: true }),
@@ -2788,7 +2792,7 @@ export function useAppController(): AppController {
     copyArtifactFile,
     openArtifactFile,
     revealArtifactSource
-  }), [saveProvider, openHttpLink, openWorkspaceHtml, readWorkspaceHtmlSnapshot, remoteHostApi, newTaskDraftApi, inputApi, mcpApi, terminalApi, simulatorViewerApi, readDraftSnapshot, saveDraftIfRevision, restoreFirstInputDraft, listWorkspaceChangeSets, previewWorkspaceRewind, executeWorkspaceRewind, readDraft, saveDraft, navigateSessionBranch, copyArtifactFile, openArtifactFile, revealArtifactSource, voiceApi, downloadArtifact, exportSession, exportPortableSession, getArtifactUrl, readWorkspaceFile, releaseArtifactUrl, updateAuxiliaryTextSettings, predictNextPrompt, cancelAutomaticConnectionAttempt, connect, disconnect, forgetProfile, gateway, logoutConnection, logoutProfile, mutatePreferences, navigate, openMachineSession, pair, probeRuntimeActivity, refreshDiscoveredNodes, refreshMachines, retryManagedOrchestrator, revokeDevice, searchRemoteSessionMessages, setAutomaticConnectionEnabled, setMachineSelection, state, switchMachine, updatePreferences]);
+  }), [saveProvider, openHttpLink, openWorkspaceHtml, readWorkspaceHtmlSnapshot, remoteHostApi, newTaskDraftApi, inputApi, mcpApi, terminalApi, simulatorViewerApi, readDraftSnapshot, saveDraftIfRevision, restoreFirstInputDraft, listWorkspaceChangeSets, previewWorkspaceRewind, executeWorkspaceRewind, readDraft, saveDraft, navigateSessionBranch, copyArtifactFile, openArtifactFile, revealArtifactSource, voiceApi, downloadArtifact, exportSession, exportPortableSession, getArtifactUrl, readWorkspaceFile, releaseArtifactUrl, updateAuxiliaryTextSettings, predictNextPrompt, cancelAutomaticConnectionAttempt, connect, disconnect, forgetProfile, gateway, logoutConnection, logoutProfile, mutatePreferences, navigate, openMachineSession, pair, probeRuntimeActivity, refreshDiscoveredNodes, refreshMachines, retryManagedOrchestrator, revokeDevice, searchRemoteSessionMessages, setAutomaticConnectionEnabled, setComposerSendShortcut, setMachineSelection, state, switchMachine, updatePreferences]);
 }
 
 function upsertMachineCache(caches: readonly MachineCacheView[], cache: MachineCacheView): readonly MachineCacheView[] {
