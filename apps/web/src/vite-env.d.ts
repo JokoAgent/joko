@@ -428,6 +428,8 @@ type DesktopRuntimeProcessMonitorResponse = {
 
 interface JokoDesktopApi {
   readonly platform: string;
+  /** OS-preferred locale captured by the trusted Desktop preload for this app start. */
+  readonly preferredSystemLocale: "en" | "zh-CN";
   readonly capabilities: readonly JokoDesktopCapability[];
   readonly appInfo: {
     get(): Promise<JokoDesktopAppInfo>;
@@ -549,6 +551,7 @@ interface JokoDesktopApi {
   readonly power: {
     getKeepAwake(): Promise<{ readonly enabled: boolean }>;
     setKeepAwake(enabled: boolean): Promise<{ readonly enabled: boolean }>;
+    onKeepAwakeChanged(listener: (settings: { readonly enabled: boolean }) => void): () => void;
   };
   readonly modelCatalog: {
     onRefreshLifecycle(listener: (
@@ -628,6 +631,7 @@ interface JokoDesktopApi {
     getAutoRelaunchSettings(): Promise<JokoDesktopAutoRelaunchSettings>;
     setAutoRelaunchOnIdle(enabled: boolean): Promise<JokoDesktopAutoRelaunchSettings>;
     resetAutoRelaunchSettings(): Promise<JokoDesktopAutoRelaunchSettings>;
+    onAutoRelaunchSettings(listener: (settings: JokoDesktopAutoRelaunchSettings) => void): () => void;
     getChannelSettings(): Promise<JokoDesktopUpdateChannelSettings>;
     setBetaChannelEnabled(enabled: boolean): Promise<JokoDesktopUpdateChannelSettings>;
     resetChannelSettings(): Promise<JokoDesktopUpdateChannelSettings>;
@@ -654,6 +658,8 @@ interface JokoInspectorDesktopApi {
 interface JokoVoiceOverlayApi {
   getStatus(): Promise<JokoDesktopGlobalVoiceStatus>;
   onStatus(listener: (status: JokoDesktopGlobalVoiceStatus) => void): () => void;
+  getLocale(): Promise<"en" | "zh-CN" | "en-XA">;
+  onLocale(listener: (locale: "en" | "zh-CN" | "en-XA") => void): () => void;
   cancel(): Promise<void>;
   retry(): Promise<void>;
 }

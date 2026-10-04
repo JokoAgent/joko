@@ -189,7 +189,7 @@ describe("Desktop beta update channel", () => {
     const fixture = createUpdates();
     fixture.updates.getChannelSettings = vi.fn()
       .mockRejectedValueOnce(new Error("C:\\private\\settings.json"))
-      .mockResolvedValueOnce(channelSettings(false, false));
+      .mockResolvedValue(channelSettings(false, false));
     fixture.updates.setBetaChannelEnabled = vi.fn(async () => { throw new Error("IPC_SECRET_SAVE"); });
     installDesktop(fixture.updates);
     const { container } = await renderSetting();
@@ -236,6 +236,36 @@ describe("Desktop beta update channel", () => {
     expect(fixture.unsubscribe).toHaveBeenCalledOnce();
   });
 
+  it("admits only one toggle or reset while its probe is pending", async () => {
+    const probe = deferred<{ readonly available: boolean }>();
+    const fixture = createUpdates();
+    fixture.updates.probeBetaChannel = vi.fn(() => probe.promise);
+    installDesktop(fixture.updates);
+    const harness = await renderHarness();
+    await act(async () => {
+      void harness.actions().setEnableBeta(true);
+      void harness.actions().setEnableBeta(false);
+      void harness.actions().reset();
+    });
+    expect(fixture.updates.probeBetaChannel).toHaveBeenCalledOnce();
+    expect(fixture.updates.resetChannelSettings).not.toHaveBeenCalled();
+    expect(fixture.updates.setBetaChannelEnabled).not.toHaveBeenCalled();
+    await act(async () => probe.resolve({ available: true }));
+    expect(fixture.updates.setBetaChannelEnabled).toHaveBeenCalledExactlyOnceWith(true);
+  });
+
+  it("adopts current Main settings when saving fails without a confirmed push", async () => {
+    const fixture = createUpdates();
+    installDesktop(fixture.updates);
+    const harness = await renderHarness();
+    fixture.updates.setBetaChannelEnabled = vi.fn(async () => { throw new Error("private failure"); });
+    fixture.updates.getChannelSettings = vi.fn(async () => channelSettings(true, true));
+    await act(async () => harness.actions().setEnableBeta(true));
+    expect(fixture.updates.getChannelSettings).toHaveBeenCalledOnce();
+    expect(harness.state()).toMatchObject({ enableBeta: true, isCustomized: true, saving: false, error: "save" });
+    expect(harness.state().restartPrompt).toBeUndefined();
+  });
+
   it("treats even a synchronous or persist-before-error channel push as the newest authority", async () => {
     const save = deferred<JokoDesktopUpdateChannelSettings>();
     const fixture = createUpdates();
@@ -245,6 +275,10 @@ describe("Desktop beta update channel", () => {
       channelListener = listener;
       listener(channelSettings(true, true));
       return () => { fixture.unsubscribe(); };
+    });
+    fixture.updates.getChannelSettings = vi.fn(async () => {
+      expect(fixture.updates.onChannelSettings).toHaveBeenCalledOnce();
+      return channelSettings(false, false);
     });
     fixture.updates.setBetaChannelEnabled = vi.fn(() => save.promise);
     installDesktop(fixture.updates);
@@ -392,6 +426,7 @@ function createUpdates(initial = channelSettings(false, false)): {
     getAutoRelaunchSettings: vi.fn(async () => ({ autoRelaunchOnIdle: false, isCustomized: false, defaultAutoRelaunchOnIdle: false })),
     setAutoRelaunchOnIdle: vi.fn(async (enabled) => ({ autoRelaunchOnIdle: enabled, isCustomized: true, defaultAutoRelaunchOnIdle: false })),
     resetAutoRelaunchSettings: vi.fn(async () => ({ autoRelaunchOnIdle: false, isCustomized: false, defaultAutoRelaunchOnIdle: false })),
+    onAutoRelaunchSettings: vi.fn(() => vi.fn()),
     getChannelSettings: vi.fn(async () => initial),
     setBetaChannelEnabled: vi.fn(async (enabled) => channelSettings(enabled, true)),
     resetChannelSettings: vi.fn(async () => channelSettings(false, false)),

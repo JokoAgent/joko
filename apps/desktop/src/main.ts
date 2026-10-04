@@ -27,6 +27,7 @@ import {
 } from "electron";
 import windowStateKeeper from "electron-window-state";
 import { toggleApplicationWindowFullscreen } from "./window-fullscreen.js";
+import { broadcastDesktopUpdateSettings } from "./update-settings-broadcast.js";
 import { promoteExternalWindowActivation } from "./external-window-activation.js";
 import { basename, extname, isAbsolute, join, resolve } from "node:path";
 import { spawn } from "node:child_process";
@@ -52,6 +53,8 @@ import {
   type DesktopManagedOrchestratorRecoveryReason,
   type DesktopManagedOrchestratorStatus,
   type DesktopMainWindowCloseSettings,
+  type DesktopLocale,
+  type DesktopSystemLocale,
   type DesktopNativeTaskStatusAction,
   type DesktopNativeTaskStatusDisplay,
   type DesktopNativeTaskStatusSoundChoice,
@@ -61,7 +64,6 @@ import {
   type DesktopSaveFileRequest,
   type DesktopSessionDragPreviewRequest,
   type DesktopSessionWindowOwner,
-  type DesktopWindowInteractionSettings,
   type DesktopUpdateRelaunchRequest,
   type DesktopUpdateRelaunchResult,
   type DesktopUpdateChannelSettings,
@@ -82,6 +84,7 @@ import {
   parseDesktopPageSearchRequest,
   parseDesktopPageSearchStopAction
 } from "./channels.js";
+import { readDesktopPreferredSystemLocale } from "./system-locale.js";
 import {
   parseDesktopRuntimeProcessSample,
   parseDesktopRuntimeProcessMonitorOpenResult,
@@ -217,6 +220,12 @@ import {
   type DesktopKeepAwakeSettingsStore
 } from "./keep-awake-settings.js";
 import {
+  broadcastDesktopKeepAwakeSettings,
+  createDesktopKeepAwakeSettingsCoordinator,
+  type DesktopKeepAwakeSettingsCoordinator
+} from "./keep-awake-settings-coordinator.js";
+import {
+  broadcastDesktopWindowInteractionSettings,
   createDesktopWindowInteractionSettingsStore,
   type DesktopWindowInteractionSettingsStore
 } from "./window-interaction-settings.js";
@@ -679,7 +688,8 @@ const managedOrchestratorExitFence = createManagedExitFence({
   }
 });
 let packagedSmokeFinishing = false;
-let applicationMenuLocale = "en";
+let preferredSystemLocale: DesktopSystemLocale = "en";
+let applicationMenuLocale: DesktopLocale = "en";
 const applicationMenuConfigurationState = createMacApplicationMenuConfigurationState({
   shortcutRecording: false,
   newSessionAccelerator: "Command+N",
@@ -693,6 +703,7 @@ let desktopUpdateAutoSettings: DesktopUpdateAutoSettingsStore | undefined;
 let desktopUpdateChannelSettings: DesktopUpdateChannelSettingsStore | undefined;
 let desktopKeepAwakeSettings: DesktopKeepAwakeSettingsStore | undefined;
 let desktopKeepAwakeController: DesktopKeepAwakeController | undefined;
+let desktopKeepAwakeCoordinator: DesktopKeepAwakeSettingsCoordinator | undefined;
 let desktopWindowInteractionSettings: DesktopWindowInteractionSettingsStore | undefined;
 let desktopMainWindowCloseSettings: DesktopMainWindowCloseSettingsStore | undefined;
 let mainWindowCloseController: DesktopMainWindowCloseController | undefined;
@@ -929,7 +940,8 @@ if (!app.requestSingleInstanceLock()) {
     registerIpc();
     installMicrophoneLifecycle();
     installProviderModelPowerLifecycle();
-    applicationMenuLocale = app.getLocale();
+    preferredSystemLocale = readDesktopPreferredSystemLocale(app);
+    applicationMenuLocale = preferredSystemLocale;
     installDesktopApplicationMenu();
     createWindow();
     initializeDesktopDevicePeerAgentLifecycle();
@@ -1082,7 +1094,7 @@ function createWindow(): void {
   window.webContents.on("will-prevent-unload", notifyDesktopQuitBlocked);
   installSelectionContextMenu(window, {
     platform: process.platform,
-    systemLocale: () => app.getLocale(),
+    systemLocale: () => applicationMenuLocale,
     buildMenu: (template) => Menu.buildFromTemplate([...template]),
     openExternal: (url) => shell.openExternal(url)
   });
@@ -3683,7 +3695,7 @@ async function presentDesktopWindowLoadFailure(
   attempt: number,
   preferredOwner?: BrowserWindow
 ): Promise<DesktopWindowLoadFailureAction> {
-  const labels = desktopWindowLoadFailureLabels(app.getLocale(), kind, attempt);
+  const labels = desktopWindowLoadFailureLabels(applicationMenuLocale, kind, attempt);
   const main = kind === "main";
   const options: MessageBoxOptions = {
     type: "error",
@@ -4608,7 +4620,7 @@ async function openSessionApplicationWindow(
   window.webContents.on("will-prevent-unload", notifyDesktopQuitBlocked);
   installSelectionContextMenu(window, {
     platform: process.platform,
-    systemLocale: () => app.getLocale(),
+    systemLocale: () => applicationMenuLocale,
     buildMenu: (template) => Menu.buildFromTemplate([...template]),
     openExternal: (url) => shell.openExternal(url)
   });
@@ -4935,7 +4947,7 @@ async function openRuntimeProcessMonitorWindowNow(
   });
   installSelectionContextMenu(window, {
     platform: process.platform,
-    systemLocale: () => app.getLocale(),
+    systemLocale: () => applicationMenuLocale,
     buildMenu: (template) => Menu.buildFromTemplate([...template]),
     openExternal: (url) => shell.openExternal(url)
   });
@@ -5674,7 +5686,7 @@ function installInspectorWindowSecurity(childWindow: BrowserWindow, owner: Brows
 
   installSelectionContextMenu(childWindow, {
     platform: process.platform,
-    systemLocale: () => app.getLocale(),
+    systemLocale: () => applicationMenuLocale,
     buildMenu: (template) => Menu.buildFromTemplate([...template]),
     openExternal: (url) => shell.openExternal(url)
   });
@@ -6026,8 +6038,18 @@ async function initializeDesktopKeepAwake(): Promise<void> {
   if (desktopKeepAwakeController === undefined) {
     desktopKeepAwakeController = createDesktopKeepAwakeController(powerSaveBlocker);
   }
-  const settings = await desktopKeepAwakeSettings.initialize();
-  desktopKeepAwakeController.apply(settings.enabled);
+  if (desktopKeepAwakeCoordinator === undefined) {
+    desktopKeepAwakeCoordinator = createDesktopKeepAwakeSettingsCoordinator(
+      desktopKeepAwakeSettings,
+      desktopKeepAwakeController,
+      (settings) => broadcastDesktopKeepAwakeSettings(
+        applicationWindows(),
+        DESKTOP_CHANNELS.keepAwakeChanged,
+        settings
+      )
+    );
+  }
+  await desktopKeepAwakeCoordinator.initialize();
 }
 
 async function initializeDesktopWindowInteractionSettings(): Promise<void> {
@@ -6388,18 +6410,6 @@ function broadcastDesktopUpdateStatus(status: DesktopUpdateStatus): void {
   }
 }
 
-function broadcastDesktopWindowInteractionSettings(settings: DesktopWindowInteractionSettings): void {
-  for (const window of applicationWindows()) {
-    if (!window.webContents.isDestroyed()) {
-      window.webContents.send(DESKTOP_CHANNELS.windowInteractionChanged, settings);
-    }
-  }
-  if (inspectorWindow !== undefined && !inspectorWindow.isDestroyed() &&
-    !inspectorWindow.webContents.isDestroyed()) {
-    inspectorWindow.webContents.send(DESKTOP_CHANNELS.windowInteractionChanged, settings);
-  }
-}
-
 function destroyExtensionWindows(): void {
   const windows = [...extensionWindows.values()];
   extensionWindows.clear();
@@ -6437,13 +6447,7 @@ function broadcastDesktopNativeTaskStatusSettings(settings: DesktopNativeTaskSta
 }
 
 function broadcastDesktopUpdateChannelSettings(settings: DesktopUpdateChannelSettings): void {
-  const window = mainWindow;
-  if (window === undefined || window.isDestroyed()) return;
-  try {
-    window.webContents.send(DESKTOP_CHANNELS.updateChannelSettingsChanged, settings);
-  } catch {
-    // Renderer reload/crash cannot change the durable device setting.
-  }
+  broadcastDesktopUpdateSettings(applicationWindows(), DESKTOP_CHANNELS.updateChannelSettingsChanged, settings);
 }
 
 function releaseDesktopUpdateStartup(): void {
@@ -6581,12 +6585,12 @@ async function writeDesktopUpdateChannelSettings(
   desktopUpdateChannelChangePending = true;
   try {
     const settings = await operation(store);
+    broadcastDesktopUpdateChannelSettings(settings);
     if (settings.enableBeta !== previous.enableBeta) {
       const feedUrl = settings.enableBeta ? desktopUpdateBetaFeedUrl : desktopUpdateReleaseFeedUrl;
       if (feedUrl !== undefined) await service.changeFeed(feedUrl);
       service.startBackgroundPolling();
     }
-    broadcastDesktopUpdateChannelSettings(settings);
     return settings;
   } finally {
     desktopUpdateChannelChangePending = false;
@@ -7058,6 +7062,13 @@ function bindDesktopPageSearchResults(contents: WebContents): Map<number, number
 }
 
 function registerIpc(): void {
+  ipcMain.on(DESKTOP_CHANNELS.preferredSystemLocaleGet, (event, ...parameters: unknown[]) => {
+    assertTrustedIpcSender(event);
+    if (parameters.length !== 0) {
+      throw new TypeError("Preferred system locale does not accept parameters.");
+    }
+    event.returnValue = preferredSystemLocale;
+  });
   ipcMain.on(DESKTOP_CHANNELS.mainDocumentOccurrenceGet, (event, ...parameters: unknown[]) => {
     event.returnValue = parameters.length === 1 && isDesktopMainDocumentClaim(parameters[0])
       ? captureMainApplicationDocumentOccurrenceForSender(event, parameters[0])
@@ -7099,8 +7110,18 @@ function registerIpc(): void {
     if (parameters.length !== 1 || !isDesktopLocale(parameters[0])) {
       throw new TypeError("Selection context-menu locale must be en, zh-CN, or en-XA.");
     }
-    setSelectionContextMenuLocale(parameters[0]);
-    applicationMenuLocale = parameters[0];
+    const locale = parameters[0];
+    const localeChanged = applicationMenuLocale !== locale;
+    setSelectionContextMenuLocale(locale);
+    applicationMenuLocale = locale;
+    const overlay = globalVoiceOverlayWindow;
+    if (localeChanged && overlay !== undefined && !overlay.isDestroyed() && !overlay.webContents.isDestroyed()) {
+      try {
+        overlay.webContents.send(DESKTOP_CHANNELS.globalVoiceOverlayLocaleChanged, applicationMenuLocale);
+      } catch {
+        // Locale is still committed for native surfaces; a retiring overlay cannot observe it.
+      }
+    }
     if (runtimeProcessMonitorWindow !== undefined && !runtimeProcessMonitorWindow.isDestroyed()) {
       runtimeProcessMonitorWindow.setTitle(runtimeProcessMonitorWindowTitle());
     }
@@ -7439,7 +7460,10 @@ function registerIpc(): void {
     }
     const settings = await requireDesktopWindowInteractionSettings()
       .setSwallowActivationClick(parameters[0]);
-    broadcastDesktopWindowInteractionSettings(settings);
+    broadcastDesktopWindowInteractionSettings([
+      ...applicationWindows(),
+      ...(inspectorWindow === undefined ? [] : [inspectorWindow])
+    ], DESKTOP_CHANNELS.windowInteractionChanged, settings);
     return settings;
   });
   ipcMain.handle(DESKTOP_CHANNELS.pageSearchStart, (event, ...parameters: unknown[]) => {
@@ -7741,18 +7765,15 @@ function registerIpc(): void {
   ipcMain.handle(DESKTOP_CHANNELS.keepAwakeGet, async (event, ...parameters: unknown[]) => {
     assertTrustedIpcSender(event);
     if (parameters.length !== 0) throw new TypeError("Desktop keep-awake get does not accept parameters.");
-    const store = requireDesktopKeepAwakeSettings();
-    await store.initialize();
-    return store.get();
+    return requireDesktopKeepAwakeCoordinator().get();
   });
   ipcMain.handle(DESKTOP_CHANNELS.keepAwakeSet, async (event, ...parameters: unknown[]) => {
     assertTrustedIpcSender(event);
     if (parameters.length !== 1 || typeof parameters[0] !== "boolean") {
       throw new TypeError("Desktop keep-awake set requires one boolean.");
     }
-    const settings = await requireDesktopKeepAwakeSettings().setEnabled(parameters[0]);
-    requireDesktopKeepAwakeController().apply(settings.enabled);
-    return settings;
+    const result = await requireDesktopKeepAwakeCoordinator().setEnabled(parameters[0]);
+    return result.settings;
   });
   ipcMain.handle(DESKTOP_CHANNELS.microphoneGetPermission, (event, ...parameters: unknown[]) => {
     assertTrustedIpcSender(event);
@@ -7897,6 +7918,11 @@ function registerIpc(): void {
     assertGlobalVoiceOverlaySender(event);
     if (parameters.length !== 0) throw new TypeError("Global voice overlay status does not accept parameters.");
     return globalVoiceStatus;
+  });
+  ipcMain.handle(DESKTOP_CHANNELS.globalVoiceOverlayGetLocale, (event, ...parameters: unknown[]) => {
+    assertGlobalVoiceOverlaySender(event);
+    if (parameters.length !== 0) throw new TypeError("Global voice overlay locale does not accept parameters.");
+    return applicationMenuLocale;
   });
   ipcMain.handle(DESKTOP_CHANNELS.globalVoiceOverlayAction, (event, ...parameters: unknown[]) => {
     assertGlobalVoiceOverlaySender(event);
@@ -8168,6 +8194,7 @@ function registerIpc(): void {
     const result = await requireDesktopUpdateAutoSettings().setAutoRelaunchOnIdle(
       (parameters[0] as { readonly autoRelaunchOnIdle: boolean }).autoRelaunchOnIdle
     );
+    broadcastDesktopUpdateSettings(applicationWindows(), DESKTOP_CHANNELS.updateAutoRelaunchSettingsChanged, result);
     void desktopUpdateAutoRelaunchPolicy?.evaluate("settings-set");
     return result;
   });
@@ -8175,6 +8202,7 @@ function registerIpc(): void {
     assertTrustedIpcSender(event);
     if (parameters.length !== 0) throw new TypeError("Desktop auto relaunch settings reset does not accept parameters.");
     const result = await requireDesktopUpdateAutoSettings().reset();
+    broadcastDesktopUpdateSettings(applicationWindows(), DESKTOP_CHANNELS.updateAutoRelaunchSettingsChanged, result);
     void desktopUpdateAutoRelaunchPolicy?.evaluate("settings-reset");
     return result;
   });
@@ -8240,18 +8268,11 @@ function requireDesktopUpdateChannelSettings(): DesktopUpdateChannelSettingsStor
   return desktopUpdateChannelSettings;
 }
 
-function requireDesktopKeepAwakeSettings(): DesktopKeepAwakeSettingsStore {
-  if (desktopKeepAwakeSettings === undefined) {
+function requireDesktopKeepAwakeCoordinator(): DesktopKeepAwakeSettingsCoordinator {
+  if (desktopKeepAwakeCoordinator === undefined) {
     throw new Error("Desktop keep-awake settings are not initialized.");
   }
-  return desktopKeepAwakeSettings;
-}
-
-function requireDesktopKeepAwakeController(): DesktopKeepAwakeController {
-  if (desktopKeepAwakeController === undefined) {
-    throw new Error("Desktop keep-awake controller is not initialized.");
-  }
-  return desktopKeepAwakeController;
+  return desktopKeepAwakeCoordinator;
 }
 
 function requireDesktopWindowInteractionSettings(): DesktopWindowInteractionSettingsStore {

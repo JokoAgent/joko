@@ -121,7 +121,8 @@ const PACKAGED_SMOKE_PROMPT_RECOMMENDATION_USER_PROMPT = [
   "",
   "<recent_conversation>",
   `User: ${PACKAGED_SMOKE_TIMELINE_PROMPT}`,
-  `Assistant: ${PACKAGED_SMOKE_TIMELINE_MARKDOWN.replace(/\s+/gu, " ").trim()}`,
+  `Assistant: ${PACKAGED_SMOKE_TIMELINE_MARKDOWN.replace(/\s+/gu, " ").trim()
+    .replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;")}`,
   "</recent_conversation>",
   "",
   "Match the user's tone, brevity, phrasing, and terminology.",
@@ -1249,6 +1250,10 @@ function runProviderSmokeClassifierRegressionTests() {
     "repeated Timeline request is not counted");
 
   const recommendation = providerSmokePromptRecommendationInferenceFixture();
+  const unescapedRecommendation = cloneProviderSmokeFixture(recommendation);
+  unescapedRecommendation.messages[1].content = unescapedRecommendation.messages[1].content.replaceAll("--&gt;", "-->");
+  expect(classifyProviderSmokeInference(unescapedRecommendation) === undefined,
+    "unescaped Mermaid reference data is rejected");
   const recommendationTracking = providerSmokeInferenceTrackingFixture();
   expect(acceptProviderSmokeInferenceRequest(recommendationTracking, identity, recommendation) === "promptRecommendation",
     "first prompt recommendation request is accepted");

@@ -1,4 +1,4 @@
-import { clampWindowZoom } from "./appearance-settings.js";
+import { clampWindowZoom, type WindowZoomIntent } from "./appearance-settings.js";
 import {
   comboToElectronAccelerator,
   effectiveAppShortcutCombos,
@@ -30,7 +30,7 @@ export interface DesktopApplicationMenuCommandActions {
   readonly openTaskStatusSettings: () => void | Promise<void>;
   readonly checkForUpdates: () => void | Promise<void>;
   readonly setNavigationOpen: (open: boolean) => void | Promise<void>;
-  readonly setWindowZoom: (zoom: number) => void | Promise<void>;
+  readonly changeWindowZoom: (intent: WindowZoomIntent) => number | Promise<number>;
   readonly onError?: (error: unknown) => void;
 }
 
@@ -83,8 +83,9 @@ export function desktopUpdateCheckNotice(result: DesktopUpdateCheckResultView): 
 }
 
 /**
- * Native menu messages can arrive more quickly than React commits. Keep a
- * serialized optimistic preference view so two clicks always mean two steps.
+ * Native menu commands and renderer shortcuts can arrive more quickly than
+ * React commits. Keep a serialized preference view so two inputs always mean
+ * two steps, while durable-relative zoom adopts the confirmed persisted value.
  */
 export function createDesktopApplicationMenuCommandQueue(
   actions: DesktopApplicationMenuCommandActions
@@ -122,11 +123,16 @@ export function createDesktopApplicationMenuCommandQueue(
       return;
     }
     const current = preferences ?? actions.getPreferences();
-    const windowZoom = command === "zoom-reset"
-      ? 1
-      : clampWindowZoom(current.windowZoom + (command === "zoom-in" ? 0.1 : -0.1));
-    preferences = { ...current, windowZoom };
-    await actions.setWindowZoom(windowZoom);
+    const intent: WindowZoomIntent = command === "zoom-reset"
+      ? "reset"
+      : command === "zoom-in"
+        ? "increase"
+        : "decrease";
+    const confirmedZoom = await actions.changeWindowZoom(intent);
+    preferences = {
+      ...current,
+      windowZoom: clampWindowZoom(confirmedZoom, current.windowZoom)
+    };
   };
 
   return {
@@ -134,7 +140,10 @@ export function createDesktopApplicationMenuCommandQueue(
       pending += 1;
       tail = tail
         .then(() => run(command))
-        .catch((error: unknown) => { actions.onError?.(error); })
+        .catch((error: unknown) => {
+          preferences = actions.getPreferences();
+          actions.onError?.(error);
+        })
         .finally(() => {
           pending -= 1;
           if (pending === 0) preferences = actions.getPreferences();

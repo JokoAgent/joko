@@ -162,12 +162,25 @@ export function connectDesktopActivationClickPreference(
   targetWindow: Window = window
 ): () => void {
   if (desktop === undefined || !desktop.capabilities.includes("window.activationClick")) return () => undefined;
-  const apply = (settings: { readonly swallowActivationClick: boolean }): void => {
+  let live = true;
+  let confirmedHintRevision = 0;
+  const bootstrapRevision = confirmedHintRevision;
+  const applyConfirmedHint = (settings: { readonly swallowActivationClick: boolean }): void => {
+    if (!live) return;
+    confirmedHintRevision += 1;
     writeActivationClickPreference(settings.swallowActivationClick, targetWindow);
   };
-  const unsubscribe = desktop.windowInteraction.onChanged(apply);
-  void desktop.windowInteraction.get().then(apply).catch(() => undefined);
-  return unsubscribe;
+  const unsubscribe = desktop.windowInteraction.onChanged(applyConfirmedHint);
+  void desktop.windowInteraction.get().then((settings) => {
+    if (!live || confirmedHintRevision !== bootstrapRevision) return;
+    applyConfirmedHint(settings);
+  }).catch(() => undefined);
+  return () => {
+    if (!live) return;
+    live = false;
+    confirmedHintRevision += 1;
+    unsubscribe();
+  };
 }
 
 export function installCurrentWindowActivationClickGuard(targetWindow: Window = window): () => void {

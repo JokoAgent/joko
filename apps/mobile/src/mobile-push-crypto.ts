@@ -1,3 +1,4 @@
+import { base64Encode } from "@bufbuild/protobuf/wire";
 import { CryptoDigestAlgorithm, digestStringAsync, getRandomBytesAsync, randomUUID } from "expo-crypto";
 
 export function mobilePushTokenDigest(value: string): Promise<string> {
@@ -10,7 +11,6 @@ export function createMobilePushRegistrationId(): string {
 
 export async function createMobilePushRevocationSecret(): Promise<string> {
   const bytes = await getRandomBytesAsync(32);
-  let binary = "";
-  for (const byte of bytes) binary += String.fromCharCode(byte);
-  return btoa(binary).replace(/\+/gu, "-").replace(/\//gu, "_").replace(/=+$/gu, "");
+  if (bytes.byteLength !== 32) throw new Error("Push revocation requires 32 random bytes.");
+  return base64Encode(bytes, "url");
 }

@@ -238,12 +238,16 @@ export function withAppShortcutOverride(
   }
   const normalized = normalizeAppShortcutCombo(value);
   if (normalized === undefined || !isAppShortcutComboBindable(normalized)
+    || isSystemReservedShortcut(normalized, platform)
     || collidesWithNonRebindableDefault(normalized, platform)) {
     throw new Error("The application shortcut combination is invalid.");
   }
   if (definitionValue.menuBacked === true && platform === "darwin"
     && comboToElectronAccelerator(normalized, platform) === null) {
     throw new Error("The application shortcut cannot be expressed as a macOS menu accelerator.");
+  }
+  if (findAppShortcutConflict(id, normalized, overrides, platform) !== null) {
+    throw new Error("The application shortcut combination conflicts with another action.");
   }
   next[id] = normalized;
   return next;

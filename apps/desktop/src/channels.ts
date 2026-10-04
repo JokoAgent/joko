@@ -39,6 +39,7 @@ export const DESKTOP_CHANNELS = {
   pageSearchStop: "joko:page-search:stop",
   pageSearchResult: "joko:page-search:result",
   appGetInfo: "joko:app:get-info",
+  preferredSystemLocaleGet: "joko:locale:preferred-system:get",
   applicationMenuCommand: "joko:application-menu:command",
   applicationMenuConfigure: "joko:application-menu:configure",
   selectionContextMenuAddToChat: "joko:selection-context-menu:add-to-chat",
@@ -67,6 +68,7 @@ export const DESKTOP_CHANNELS = {
   nativeTaskStatusAction: "joko:native-task-status:action",
   keepAwakeGet: "joko:power:keep-awake:get",
   keepAwakeSet: "joko:power:keep-awake:set",
+  keepAwakeChanged: "joko:power:keep-awake:changed",
   providerModelRefreshLifecycle: "joko:provider-models:refresh-lifecycle",
   microphoneGetPermission: "joko:microphone:permission:get",
   microphoneOpenSettings: "joko:microphone:settings:open",
@@ -83,6 +85,8 @@ export const DESKTOP_CHANNELS = {
   globalVoicePublishStatus: "joko:global-voice:status:publish",
   globalVoiceGetStatus: "joko:global-voice:status:get",
   globalVoiceStatus: "joko:global-voice:status",
+  globalVoiceOverlayGetLocale: "joko:global-voice:overlay-locale:get",
+  globalVoiceOverlayLocaleChanged: "joko:global-voice:overlay-locale:changed",
   globalVoiceCommit: "joko:global-voice:commit",
   globalVoiceOverlayAction: "joko:global-voice:overlay-action",
   globalVoiceGetAccessibility: "joko:global-voice:accessibility:get",
@@ -132,6 +136,7 @@ export const DESKTOP_CHANNELS = {
   updateAutoRelaunchSettingsGet: "joko:update:auto-relaunch-settings:get",
   updateAutoRelaunchSettingsSet: "joko:update:auto-relaunch-settings:set",
   updateAutoRelaunchSettingsReset: "joko:update:auto-relaunch-settings:reset",
+  updateAutoRelaunchSettingsChanged: "joko:update:auto-relaunch-settings:changed",
   updateChannelSettingsGet: "joko:update:channel-settings:get",
   updateChannelSettingsSet: "joko:update:channel-settings:set",
   updateChannelSettingsReset: "joko:update:channel-settings:reset",
@@ -149,6 +154,7 @@ export function isInspectorWindowOpenRequest(url: unknown, frameName: unknown): 
 }
 
 export type DesktopLocale = "en" | "zh-CN" | "en-XA";
+export type DesktopSystemLocale = Exclude<DesktopLocale, "en-XA">;
 
 export const DESKTOP_PAGE_SEARCH_MAX_TEXT_LENGTH = 4_096;
 
@@ -194,6 +200,10 @@ export function parseDesktopPageSearchStopAction(value: unknown): DesktopPageSea
 
 export function isDesktopLocale(value: unknown): value is DesktopLocale {
   return value === "en" || value === "zh-CN" || value === "en-XA";
+}
+
+export function isDesktopSystemLocale(value: unknown): value is DesktopSystemLocale {
+  return value === "en" || value === "zh-CN";
 }
 
 export type DesktopApplicationMenuCommand =

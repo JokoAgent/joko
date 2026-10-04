@@ -78,6 +78,51 @@ describe("mobile Timeline quote source", () => {
   });
 });
 
+describe("mobile accepted-input send identity", () => {
+  it("projects only the exact durable Operation identity onto canonical user rows", () => {
+    const started = create(EventSchema, {
+      eventId: "accepted-start",
+      identity: { sessionId: "session", operationId: "send-operation" },
+      cursor: { generation: 1n, sequence: 1n },
+      payload: { kind: { case: "messageStarted", value: {
+        messageId: "accepted-message",
+        role: MessageRole.USER,
+        userInputAccepted: true,
+        userInput: { parts: [{ content: { case: "text", value: "Hello" } }] }
+      } } }
+    });
+    const completedUser = create(EventSchema, {
+      eventId: "accepted-complete",
+      identity: { sessionId: "session", operationId: "send-operation" },
+      cursor: { generation: 1n, sequence: 2n },
+      payload: { kind: { case: "messageCompleted", value: {
+        messageId: "accepted-message",
+        role: MessageRole.USER,
+        blocks: [{ content: { case: "text", value: "native echo" } }]
+      } } }
+    });
+    expect(timelineRows([started, completedUser])).toMatchObject([{
+      id: "accepted-message",
+      operationId: "send-operation",
+      text: "Hello",
+      completed: true
+    }]);
+
+    const imported = create(EventSchema, {
+      eventId: "imported-start",
+      identity: { sessionId: "session", operationId: "send-operation" },
+      cursor: { generation: 1n, sequence: 3n },
+      payload: { kind: { case: "messageStarted", value: {
+        messageId: "imported-message",
+        role: MessageRole.USER,
+        userInputAccepted: false,
+        userInput: { parts: [{ content: { case: "text", value: "Imported" } }] }
+      } } }
+    });
+    expect(timelineRows([imported])[0]?.operationId).toBeUndefined();
+  });
+});
+
 const privateToolName = "mcp__joko_partners__send_private_message";
 const privateResult = {
   thread_id: "thread-one",

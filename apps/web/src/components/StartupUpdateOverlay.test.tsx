@@ -450,7 +450,8 @@ function installDesktopUpdate(initialStatus: JokoDesktopUpdateStatus): {
         }),
         getAutoRelaunchSettings: vi.fn(async () => ({ autoRelaunchOnIdle: false, isCustomized: false, defaultAutoRelaunchOnIdle: false })),
         setAutoRelaunchOnIdle: vi.fn(async (enabled: boolean) => ({ autoRelaunchOnIdle: enabled, isCustomized: true, defaultAutoRelaunchOnIdle: false })),
-        resetAutoRelaunchSettings: vi.fn(async () => ({ autoRelaunchOnIdle: false, isCustomized: false, defaultAutoRelaunchOnIdle: false }))
+        resetAutoRelaunchSettings: vi.fn(async () => ({ autoRelaunchOnIdle: false, isCustomized: false, defaultAutoRelaunchOnIdle: false })),
+        onAutoRelaunchSettings: vi.fn(() => vi.fn())
       }
     } as unknown as JokoDesktopApi
   });

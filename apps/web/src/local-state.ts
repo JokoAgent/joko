@@ -1,4 +1,4 @@
-import type { AttachmentDraft, BrowserCommentDraftItem, ComposerDraft, ComposerMentionDraft, ConnectionProfile, Locale, MachineCacheView, NewSessionLocalDraft, PendingExtensionUseView, PermissionMode, Theme } from "./model.js";
+import type { AttachmentDraft, BrowserCommentDraftItem, ComposerDraft, ComposerMentionDraft, ConnectionProfile, LocalePreference, MachineCacheView, NewSessionLocalDraft, PendingExtensionUseView, PermissionMode, Theme } from "./model.js";
 import { normalizeBrowserCommentStyleChanges, normalizeBrowserCommentTarget, sanitizeBrowserCommentPageUrl } from "./browser-comment-draft.js";
 import { normalizeRecentProjects, publishRecentProjectsChange, withRecentProject, withoutRecentProject, type RecentProject } from "./recent-projects.js";
 import { normalizeMachineCache, normalizeMachineSelection, type MachineSelection } from "./machine-federation.js";
@@ -17,6 +17,17 @@ import {
   normalizeAppearancePreferences,
   type AppearancePreferences
 } from "./appearance-settings.js";
+import { publishAppearancePreferencesChange, sameAppearanceProjection } from "./appearance-preference-sync.js";
+import {
+  publishAppShortcutPreferencesChange,
+  sameAppShortcutProjection
+} from "./app-shortcut-preference-sync.js";
+import {
+  publishSessionNotificationPreferenceChange,
+  sameSessionNotificationPreference
+} from "./session-notification-preference-sync.js";
+import { publishLocalePreferenceChange, sameLocalePreference } from "./locale-preference-sync.js";
+import { publishConversationPreferencesChange, sameConversationPreferences } from "./conversation-preference-sync.js";
 import {
   DEFAULT_SIDEBAR_DISPLAY_PREFERENCES,
   normalizeSidebarDisplayPreferences,
@@ -78,7 +89,7 @@ interface EncryptedSecret {
 }
 
 export interface UiPreferences extends AppearancePreferences {
-  readonly locale: Locale;
+  readonly locale: LocalePreference;
   readonly theme: Theme;
   readonly inspectorOpen: boolean;
   readonly navigationOpen: boolean;
@@ -132,7 +143,7 @@ export const PERSONALIZATION_PROMPT_MAX_OWNERS = 32;
 
 export const DEFAULT_UI_PREFERENCES: UiPreferences = {
   ...DEFAULT_APPEARANCE_PREFERENCES,
-  locale: "en",
+  locale: "system",
   theme: "dark",
   inspectorOpen: true,
   navigationOpen: true,
@@ -209,7 +220,7 @@ export function normalizeUiPreferences(value: unknown): UiPreferences {
       codeSize: record["codeSize"],
       windowZoom: record["windowZoom"]
     })
-    || (record["locale"] !== "en" && record["locale"] !== "zh-CN" && record["locale"] !== "en-XA")
+    || (record["locale"] !== "system" && record["locale"] !== "en" && record["locale"] !== "zh-CN" && record["locale"] !== "en-XA")
     || (record["theme"] !== "dark" && record["theme"] !== "light" && record["theme"] !== "system")
     || typeof record["inspectorOpen"] !== "boolean"
     || !isNavigationMode(record["navigationMode"])
@@ -350,6 +361,8 @@ function persistedUiPreferences(value: UiPreferences): { -readonly [Key in keyof
   // Store only non-default overrides so untouched controls continue
   // to follow future product defaults.
   const persisted: { -readonly [Key in keyof UiPreferences]?: UiPreferences[Key] } = { ...value };
+  if (value.locale === DEFAULT_UI_PREFERENCES.locale) delete persisted.locale;
+  if (value.composerSendShortcut === DEFAULT_UI_PREFERENCES.composerSendShortcut) delete persisted.composerSendShortcut;
   if (value.messageNavRailEnabled) delete persisted.messageNavRailEnabled;
   if (value.webLinkOpenPreference === LINK_OPEN_DEFAULTS.web) delete persisted.webLinkOpenPreference;
   if (value.localLinkOpenPreference === LINK_OPEN_DEFAULTS.local) delete persisted.localLinkOpenPreference;
@@ -679,6 +692,11 @@ export class LocalState {
     if (!samePersistedValue(candidate, next)) throw new Error("The UI preference mutation produced an invalid current shape.");
     store.put(persistedUiPreferences(next), "ui");
     await transactionDone(transaction);
+    if (!sameAppearanceProjection(current, next)) publishAppearancePreferencesChange();
+    if (!sameAppShortcutProjection(current, next)) publishAppShortcutPreferencesChange();
+    if (!sameSessionNotificationPreference(current, next)) publishSessionNotificationPreferenceChange();
+    if (!sameLocalePreference(current, next)) publishLocalePreferenceChange();
+    if (!sameConversationPreferences(current, next)) publishConversationPreferencesChange();
     return next;
   }
 

@@ -64,4 +64,30 @@ describe("Desktop keep-awake controller", () => {
     controller.release();
     expect(blocker.stop).not.toHaveBeenCalled();
   });
+
+  it("retains a blocker owner when strict disable fails so the stop can be retried", () => {
+    const { blocker, controller, started } = fixture();
+    controller.apply(true);
+    vi.mocked(blocker.stop)
+      .mockImplementationOnce(() => { throw new Error("native stop failed"); })
+      .mockImplementationOnce((id) => { started.delete(id); });
+
+    expect(() => controller.apply(false)).toThrow("native stop failed");
+    expect(controller.isActive()).toBe(true);
+    expect(() => controller.apply(false)).not.toThrow();
+    expect(blocker.stop).toHaveBeenCalledTimes(2);
+    expect(controller.isActive()).toBe(false);
+  });
+
+  it("retains an active blocker owner when the native status probe fails transiently", () => {
+    const { blocker, controller } = fixture();
+    controller.apply(true);
+    vi.mocked(blocker.isStarted).mockImplementationOnce(() => {
+      throw new Error("native status failed");
+    });
+
+    expect(() => controller.apply(true)).toThrow("native status failed");
+    expect(() => controller.apply(true)).not.toThrow();
+    expect(blocker.start).toHaveBeenCalledOnce();
+  });
 });

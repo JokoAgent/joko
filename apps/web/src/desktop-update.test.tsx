@@ -162,6 +162,7 @@ function validUpdates(): JokoDesktopApi["updates"] {
       isCustomized: false,
       defaultAutoRelaunchOnIdle: false
     })),
+    onAutoRelaunchSettings: vi.fn(() => vi.fn()),
     getChannelSettings: vi.fn(async () => ({
       enableBeta: false,
       isCustomized: false,

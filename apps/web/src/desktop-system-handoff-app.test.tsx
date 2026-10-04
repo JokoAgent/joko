@@ -797,6 +797,8 @@ function connectedState(options: {
     route: options.route,
     navigationRevision: 0,
     preferences: DEFAULT_UI_PREFERENCES,
+    systemLocale: "en",
+    effectiveLocale: "en",
     extensionNotifications: []
   };
 }

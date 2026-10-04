@@ -375,6 +375,8 @@ function controllerFor(
     snapshot,
     route: { kind: "session", sessionId: sourceSession.id },
     preferences: DEFAULT_UI_PREFERENCES,
+    systemLocale: "en",
+    effectiveLocale: "en",
     extensionNotifications: []
   };
   let revision = 1;

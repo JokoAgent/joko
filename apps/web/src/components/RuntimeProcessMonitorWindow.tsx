@@ -3,6 +3,7 @@ import type { JSX } from "react";
 import { Activity, ServerOff } from "lucide-react";
 import { translate } from "../i18n.js";
 import type { Locale, RuntimeProcessUsageView } from "../model.js";
+import { readHostSystemLocale } from "../system-locale.js";
 import {
   runtimeProcessDiagnosticsOwnerKey,
   sameRuntimeProcessDiagnosticsOwner,
@@ -260,7 +261,7 @@ function emptyDisplay(ownerKey: string, loaded: boolean, desktopSupported: boole
 }
 
 function initialLocale(): Locale {
-  return typeof navigator !== "undefined" && navigator.language.toLowerCase().startsWith("zh") ? "zh-CN" : "en";
+  return readHostSystemLocale(typeof window === "undefined" ? undefined : window);
 }
 
 function errorMessage(error: unknown, fallback: string): string {

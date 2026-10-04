@@ -1,4 +1,4 @@
-import type { DesktopGlobalVoiceStatus } from "./channels.js";
+import type { DesktopGlobalVoiceStatus, DesktopLocale } from "./channels.js";
 import type { IpcRendererEvent } from "electron";
 
 const { contextBridge, ipcRenderer } = require("electron") as typeof import("electron");
@@ -6,7 +6,15 @@ const { contextBridge, ipcRenderer } = require("electron") as typeof import("ele
 const CHANNELS = Object.freeze({
   getStatus: "joko:global-voice:status:get",
   status: "joko:global-voice:status",
+  getLocale: "joko:global-voice:overlay-locale:get",
+  locale: "joko:global-voice:overlay-locale:changed",
   action: "joko:global-voice:overlay-action"
+} as const satisfies {
+  readonly getStatus: (typeof import("./channels.js").DESKTOP_CHANNELS)["globalVoiceGetStatus"];
+  readonly status: (typeof import("./channels.js").DESKTOP_CHANNELS)["globalVoiceStatus"];
+  readonly getLocale: (typeof import("./channels.js").DESKTOP_CHANNELS)["globalVoiceOverlayGetLocale"];
+  readonly locale: (typeof import("./channels.js").DESKTOP_CHANNELS)["globalVoiceOverlayLocaleChanged"];
+  readonly action: (typeof import("./channels.js").DESKTOP_CHANNELS)["globalVoiceOverlayAction"];
 });
 
 contextBridge.exposeInMainWorld("jokoVoiceOverlay", Object.freeze({
@@ -24,9 +32,35 @@ contextBridge.exposeInMainWorld("jokoVoiceOverlay", Object.freeze({
     ipcRenderer.on(CHANNELS.status, wrapped);
     return () => ipcRenderer.removeListener(CHANNELS.status, wrapped);
   },
+  getLocale: (): Promise<DesktopLocale> =>
+    ipcRenderer.invoke(CHANNELS.getLocale).then(parseLocale),
+  onLocale: (listener: (locale: DesktopLocale) => void): (() => void) => {
+    if (typeof listener !== "function") throw new TypeError("Global voice locale listener must be a function.");
+    let subscribed = true;
+    const wrapped = (_event: IpcRendererEvent, value: unknown): void => {
+      try {
+        listener(parseLocale(value));
+      } catch {
+        // Ignore malformed host projections; getLocale remains authoritative.
+      }
+    };
+    ipcRenderer.on(CHANNELS.locale, wrapped);
+    return () => {
+      if (!subscribed) return;
+      subscribed = false;
+      ipcRenderer.removeListener(CHANNELS.locale, wrapped);
+    };
+  },
   cancel: (): Promise<void> => ipcRenderer.invoke(CHANNELS.action, "cancel").then(() => undefined),
   retry: (): Promise<void> => ipcRenderer.invoke(CHANNELS.action, "retry").then(() => undefined)
 }));
+
+function parseLocale(value: unknown): DesktopLocale {
+  if (value !== "en" && value !== "zh-CN" && value !== "en-XA") {
+    throw new TypeError("Global voice overlay locale is invalid.");
+  }
+  return value;
+}
 
 function parseStatus(value: unknown): DesktopGlobalVoiceStatus {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {

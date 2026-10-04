@@ -1,10 +1,12 @@
-import { clone, create } from "@bufbuild/protobuf";
+import { clone, create, toBinary } from "@bufbuild/protobuf";
+import { sha256 } from "@noble/hashes/sha2.js";
+import { bytesToHex } from "@noble/hashes/utils.js";
 import { Code } from "@connectrpc/connect";
 import {
   ArchiveSessionMutationSchema, BlobDisposition, BlobRefSchema, CancelQueueItemMutationSchema, CapabilitySupport, CompactSessionMutationSchema, CompactSessionOutcome,
   ConnectionState, CreateScheduleMutationSchema, CreateSessionMutationSchema,
   DeleteScheduleMutationSchema, DeleteSessionMessageMutationSchema, DeleteSessionMutationSchema, DeviceKind, DismissInteractionMutationSchema,
-  EditQueueItemMutationSchema, EntityKind, EntityRefSchema, ExecuteUserShellMutationSchema,
+  EditQueueItemMutationSchema, EntityKind, EntityRefSchema, EventSchema, ExecuteUserShellMutationSchema,
   LAN_DISCOVERY_PEER_TTL_MS,
   ModelKeySchema, ModelSelectionSchema, NativeSessionPlacement, NativeSessionStartSchema, NewNativeSessionSchema,
   DeleteScheduleRunMutationSchema, LogoutConnectionMutationSchema, MarkAllScheduleRunsReadMutationSchema,
@@ -26,6 +28,7 @@ import {
   type WorkspaceEntry, type WorkspaceSearchMatch
 } from "@joko/contracts";
 import { mobileVoiceCredentialBindingChanged, type MobileVoiceSettingsTransport } from "./mobile-voice-service-settings";
+import { awaitMobileMarkdownResourceRead, MobileMarkdownResourceReader, type MobileMarkdownResourceContext, type MobileMarkdownResourceDescriptor } from "./mobile-markdown-resources";
 import {
   MobileCredentialStorageError, profileFromCredential,
   type MobileConnectionProfile, type MobileStorage, type PendingOperation
@@ -35,6 +38,7 @@ import type { MobileHomeStatusFilter } from "./home-navigation";
 import {
   MOBILE_BLOB_PREVIEW_MAXIMUM_BYTES,
   MOBILE_FILE_SHARE_MAXIMUM_BYTES,
+  assertWorkspaceFilePreview,
   normalizeNodeOrigin,
   type MobileNetwork, type MobilePushCapabilityResult, type MobilePushRegistrationInput,
   type MobilePushRegistrationResult, type MobilePushRevocationTicket, type NodeIdentity, type PairedCredential
@@ -264,6 +268,11 @@ import {
   type MobileImageGalleryPageSession
 } from "./mobile-image-gallery";
 import type { MobileImageOutputSource } from "./mobile-image-output";
+import { timelineRows } from "./timeline";
+import {
+  mobileMessageShareable, projectMobileConversationShareMessage,
+  type MobileConversationShareSnapshot, type MobileConversationShareImage
+} from "./mobile-conversation-share";
 import {
   inspectMobileImageOutputBytes,
   mobileImageOutputExtension,
@@ -363,6 +372,13 @@ export interface MobileState {
   readonly error?: string;
 }
 
+export interface MobileTaskSendObserver {
+  /** Caller-owned durable Operation identity, allocated before dispatch. */
+  readonly operationId?: string;
+  /** Presentation-only notification after validation/upload and immediately before durable submit. */
+  readonly onDispatch?: (draft: MobileComposerDraft) => void;
+}
+
 export interface MobilePushAuthority {
   readonly key: string;
   readonly profileId: string;
@@ -440,6 +456,10 @@ interface MobileImageGalleryLease {
         readonly eventId: string;
         readonly messageId: string;
         readonly windowKey: string;
+      }
+    | {
+        readonly kind: "markdown";
+        readonly resourceLeaseId: string;
       };
   loaded?: {
     readonly loadId: string;
@@ -496,6 +516,16 @@ interface MobileQueueInteractionLease {
   readonly sessionId: string;
   readonly lockToken: string;
   readonly authorityKey: string;
+}
+
+interface MobileConversationShareLease {
+  readonly leaseId: string;
+  readonly ownerKey: string;
+  readonly credential: PairedCredential;
+  readonly sessionId: string;
+  readonly rowEvents: ReadonlyMap<string, string>;
+  readonly sources: ReadonlyMap<string, string>;
+  readonly markdownResources: string[];
 }
 
 type TrackedMutationResult =
@@ -627,6 +657,8 @@ export class MobileClient {
   #newTaskSubmissionActive = false;
   #composerImageEdit?: MobileComposerImageEditLease;
   #imageGallery?: MobileImageGalleryLease;
+  #conversationShare?: MobileConversationShareLease;
+  #markdownResources = new MobileMarkdownResourceReader();
   #automationEpoch = 0;
   #automationAbort?: AbortController;
   #automationHistoryAbort?: AbortController;
@@ -824,6 +856,7 @@ export class MobileClient {
       next = { ...next, timelinePreview: undefined };
     }
     this.#state = next;
+    this.#markdownResources.retireStale();
     if (this.#fileShareLease?.phase === "preparing"
       && !this.#fileShareLeaseCurrent(this.#fileShareLease)) {
       this.#fileShareLease.controller.abort();
@@ -867,7 +900,9 @@ export class MobileClient {
     this.#cancelTimelinePreviewLease();
     this.#cancelPreparingFileShare();
     this.#composerImageEdit = undefined;
-    this.#imageGallery = undefined;
+    this.#retireImageGallery();
+    if (this.#conversationShare) this.releaseConversationShare(this.#conversationShare.leaseId);
+    this.#markdownResources.releaseAll();
     if (this.#timer !== undefined) clearTimeout(this.#timer);
     if (this.#proofTimer !== undefined) clearTimeout(this.#proofTimer);
     if (this.#projectionTimer !== undefined) clearTimeout(this.#projectionTimer);
@@ -2267,7 +2302,10 @@ export class MobileClient {
     if (this.#timer !== undefined) clearTimeout(this.#timer);
     this.#timer = setTimeout(() => {
       if (this.#state.busy) this.#schedule();
-      else void this.refresh();
+      else if (this.#state.status === "connected" && this.#credential) {
+        if (this.#projectionReading) this.#schedule();
+        else void this.#syncProjection(this.#epoch, this.#credential, true);
+      } else void this.refresh();
     }, this.#state.liveStatus === "polling" || this.#state.status === "offline" ? 4_000 : 30_000);
   }
 
@@ -2347,41 +2385,52 @@ export class MobileClient {
     }, 180);
   }
 
-  async #syncProjection(epoch: number, credential: PairedCredential): Promise<void> {
+  async #syncProjection(epoch: number, credential: PairedCredential, snapshotPoll = false): Promise<void> {
     this.#projectionReading = true;
     const selectedId = this.#state.selectedId;
-    const edge = this.#streamSequence ?? 0n;
+    const generation = snapshotPoll ? this.#state.owner?.generation : this.#streamGeneration;
+    const edge = snapshotPoll ? this.#state.owner?.resumeCursor?.sequence ?? 0n : this.#streamSequence ?? 0n;
     try {
+      let node = this.#state.node!;
+      if (snapshotPoll) {
+        node = await this.network.inspect(credential.origin, this.#abort?.signal);
+        if (!this.#current(epoch) || credential !== this.#credential || selectedId !== this.#state.selectedId) return;
+        if (node.serverId !== credential.serverId || node.apiVersion !== this.#state.node?.apiVersion) {
+          throw new CredentialIdentityError("The saved Joko node identity or API changed. Its credential was not read again; forget it or pair this node explicitly.");
+        }
+      }
       const [owner, detail] = await Promise.all([
         this.network.readOwner(credential, this.#abort?.signal),
         selectedId ? this.network.readSession(credential, selectedId, this.#abort?.signal) : Promise.resolve(undefined)
       ]);
       if (!this.#current(epoch) || credential !== this.#credential || selectedId !== this.#state.selectedId) return;
-      this.#assertOwner(credential, owner, this.#state.node!);
-      if (owner.snapshot.generation !== this.#streamGeneration || detail && detail.generation !== this.#streamGeneration
+      this.#assertOwner(credential, owner, node);
+      if (owner.snapshot.generation !== generation || detail && detail.generation !== generation
         || selectedId && !owner.snapshot.sessions.some((item) => item.sessionId === selectedId)) {
         void this.refresh();
         return;
       }
-      if (!owner.snapshot.resumeCursor || owner.snapshot.resumeCursor.generation !== this.#streamGeneration
-        || owner.snapshot.resumeCursor.sequence < edge
-        || detail && (!detail.resumeCursor || detail.resumeCursor.generation !== this.#streamGeneration
-          || detail.resumeCursor.sequence < edge)) {
+      const ownerCursor = owner.snapshot.resumeCursor;
+      const detailCursor = detail?.resumeCursor;
+      const currentCursor = (cursor: EventCursor | undefined) => cursor === undefined ? snapshotPoll
+        : cursor.generation === generation && cursor.sequence >= edge;
+      if (!currentCursor(ownerCursor) || detail && !currentCursor(detailCursor)) {
         if (++this.#projectionMisses >= 2) void this.refresh();
         else this.#scheduleProjection(epoch, credential);
         return;
       }
       this.#projectionMisses = 0;
-      const durable = detail?.resumeCursor?.sequence ?? owner.snapshot.resumeCursor.sequence;
+      const durable = detailCursor?.sequence ?? ownerCursor?.sequence;
       const automationChanged = automationCatalogAuthorityKey(this.#state.owner?.schedules ?? [])
         !== automationCatalogAuthorityKey(owner.snapshot.schedules);
       this.#lastAuthenticatedAt = this.now();
-      this.#set({ owner: owner.snapshot, detail,
+      this.#set({ node, owner: owner.snapshot, detail,
         offlineSnapshotAt: undefined,
-        live: this.#state.live.filter((item) => item.cursor && item.cursor.sequence > durable) });
-      await this.#persistOfflineProjection(epoch, credential, this.#state.node!, owner.snapshot, detail);
+        live: durable === undefined ? [] : this.#state.live.filter((item) => item.cursor && item.cursor.sequence > durable) });
+      await this.#persistOfflineProjection(epoch, credential, node, owner.snapshot, detail);
+      if (snapshotPoll) await this.reconcile(epoch);
       if (automationChanged && this.#state.automations.open) void this.refreshAutomations();
-      if ((this.#streamSequence ?? 0n) > durable) this.#scheduleProjection(epoch, credential);
+      if (durable !== undefined && (this.#streamSequence ?? 0n) > durable) this.#scheduleProjection(epoch, credential);
     } catch (error) {
       if (!this.#current(epoch)) return;
       if (isRevoked(error)) await this.#invalidateCredential(
@@ -2389,9 +2438,18 @@ export class MobileClient {
         credential.profileId,
         "This mobile connection was revoked. Forget it or pair this device again."
       );
+      else if (error instanceof CredentialIdentityError) await this.#identityConflict(epoch, credential.profileId, error.message);
       else void this.refresh();
     } finally {
-      if (this.#current(epoch)) this.#projectionReading = false;
+      if (this.#current(epoch)) {
+        this.#projectionReading = false;
+        if (snapshotPoll) {
+          if (!this.#streamAbort && this.#state.status === "connected" && this.#state.owner) {
+            this.#beginStream(epoch, credential, this.#state.owner);
+          }
+          this.#schedule();
+        }
+      }
     }
   }
 
@@ -3323,11 +3381,15 @@ export class MobileClient {
   filesAuthorityKey(): string | undefined { return this.#filesAuthorityKey(this.#state); }
 
   async openFiles(): Promise<void> {
+    await this.#openFilesAt("");
+  }
+
+  async #openFilesAt(relativePath: string): Promise<void> {
     const context = this.#filesContext();
     this.closeTimelinePreview();
     this.#cancelFilesRequests();
     const epoch = this.#filesEpoch;
-    const location = { kind: "workspace" as const, path: "" };
+    const location = { kind: "workspace" as const, path: canonicalWorkspacePath(relativePath, true) };
     this.#set({
       files: {
         ...emptyMobileFilesState(),
@@ -4037,7 +4099,7 @@ export class MobileClient {
   ): Promise<MobileImageGalleryDescriptor> {
     signal?.throwIfAborted();
     if (!this.composerDrafts) throw new Error("Retained task drafts are unavailable on this mobile client.");
-    this.#imageGallery = undefined;
+    this.#retireImageGallery();
     const credential = this.#ready();
     const context = this.#filesContext();
     const filesEpoch = this.#filesEpoch;
@@ -4128,9 +4190,9 @@ export class MobileClient {
               pageId: `workspace:${entry.workspaceId}:${entry.relativePath}:${workspaceEntryRevisionKey(entry.revision)}:${blob?.blobId ?? ""}`,
               title: entry.displayName || workspaceBasename(entry.relativePath),
               blob,
-              widthPixels: preview.content.value.widthPixels,
-              heightPixels: preview.content.value.heightPixels,
-              requireDimensions: true,
+              ...(preview.content.value.widthPixels === 0 && preview.content.value.heightPixels === 0 ? {} : {
+                widthPixels: preview.content.value.widthPixels, heightPixels: preview.content.value.heightPixels, requireDimensions: true
+              }),
               source: {
                 kind: "workspace",
                 relativePath: entry.relativePath,
@@ -4195,9 +4257,315 @@ export class MobileClient {
       await this.#assertImageGalleryCurrent(lease, undefined, signal);
       return descriptor;
     } catch (error) {
-      if (this.#imageGallery === lease) this.#imageGallery = undefined;
+      if (this.#imageGallery === lease) this.#retireImageGallery();
       throw error;
     }
+  }
+
+  conversationShareOwnerKey(): string | undefined {
+    if (!this.#taskAuthorityKey()) return undefined;
+    const credential = this.#credential!;
+    const owner = this.#state.owner!;
+    const session = this.#selectedSession()!;
+    const target = owner.targets.find((item) => item.targetId === session.targetId)!;
+    return [credential.profileId, credential.connectionId, credential.deviceId, credential.serverId,
+      owner.generation.toString(10), session.sessionId, session.backendId, session.targetId,
+      session.nativeBinding!.runtimeGeneration.toString(10), entityVersionKey(target.version),
+      backendAuthorityKey(this.#selectedBackend(session)!)].join("\u001f");
+  }
+
+  markdownResourceOwnerKey(): string | undefined {
+    const owner = this.conversationShareOwnerKey();
+    const authority = resolveMobileWorkspaceAuthority(this.#state.owner, this.#state.detail, this.#state.selectedId);
+    if (!owner || !authority || !this.taskWorkspacePathPasteControls()) return undefined;
+    const workspace = authority.workspace;
+    return [owner, workspace.workspaceId, workspace.serverPathDisplay, entityVersionKey(workspace.version)].join("\u001f");
+  }
+
+  async prepareMarkdownResources(messageId: string, text: string, signal: AbortSignal): Promise<MobileMarkdownResourceDescriptor> {
+    return this.#markdownResources.prepare(this.newId(), text, this.#markdownResourceContext(messageId, text), signal);
+  }
+
+  assertMarkdownResourcesCurrent(leaseId: string): void { this.#markdownResources.assertCurrent(leaseId); }
+  releaseMarkdownResources(leaseId: string): void { this.#markdownResources.release(leaseId); }
+
+  #markdownResourceContext(messageId: string, text: string): MobileMarkdownResourceContext {
+    const files = this.#filesContext();
+    const credential = this.#ready();
+    const ownerKey = this.markdownResourceOwnerKey();
+    const source = timelineRows(this.#timelineEvents()).filter((row) => row.id === messageId && row.text === text
+      && row.kind === "assistant" && mobileMessageShareable(row));
+    const events = source.length === 1 ? this.#timelineEvents().filter((event) => event.eventId === source[0]!.eventId) : [];
+    const event = events.length === 1 ? events[0] : undefined;
+    if (!ownerKey || !event || event.identity?.sessionId !== files.authority.sessionId
+      || event.cursor?.generation !== this.#state.owner?.generation || event.payload?.kind.case !== "messageCompleted"
+      || event.payload.kind.value.role !== MessageRole.ASSISTANT) throw new Error("The completed message has no current Workspace authority.");
+    const digest = mobileConversationShareEventDigest(event);
+    const assertCurrent = (signal?: AbortSignal): void => {
+      signal?.throwIfAborted();
+      if (this.#disposed || this.#credential !== credential || this.markdownResourceOwnerKey() !== ownerKey) {
+        throw new Error("The task Workspace changed while the message resource was open.");
+      }
+      const current = this.#timelineEvents().filter((item) => item.eventId === event.eventId);
+      if (current.length !== 1 || mobileConversationShareEventDigest(current[0]!) !== digest
+        || !timelineRows(this.#timelineEvents()).some((row) => row.id === messageId && row.eventId === event.eventId
+          && row.text === text && row.kind === "assistant" && mobileMessageShareable(row))) {
+        throw new Error("The completed message changed or left the current Timeline window.");
+      }
+    };
+    assertCurrent();
+    return {
+      workspaceId: files.authority.workspace.workspaceId, workdir: files.authority.workspace.serverPathDisplay, assertCurrent,
+      revalidateSource: async (signal) => {
+        assertCurrent(signal);
+        const around = await this.network.readAround(credential, files.authority.sessionId, event.eventId, signal);
+        assertCurrent(signal);
+        const matches = around.filter((item) => item.eventId === event.eventId && item.identity?.sessionId === files.authority.sessionId
+          && item.cursor?.generation === this.#state.owner?.generation);
+        if (matches.length !== 1 || mobileConversationShareEventDigest(matches[0]!) !== digest) {
+          throw new Error("The message was changed or removed before its resource opened.");
+        }
+      },
+      listDirectory: (parent, signal) => this.network.listWorkspaceDirectory(credential, files.authority.workspace.workspaceId, parent, signal),
+      readFile: (entry, signal) => this.network.readWorkspaceFile(credential, files.authority.workspace.workspaceId, entry.relativePath, entry.revision!, signal),
+      download: (blob, signal) => this.network.downloadBlob(credential, blob, signal)
+    };
+  }
+
+  async openMarkdownPath(leaseId: string, key: string, signal: AbortSignal): Promise<MobileFilesComposerSource | undefined> {
+    signal.throwIfAborted();
+    let authorityKey = this.filesAuthorityKey();
+    const controller = new AbortController();
+    const current = controller.signal;
+    let filesEpoch: number | undefined;
+    const abort = () => controller.abort();
+    const retireFiles = () => { if (this.#filesEpoch === filesEpoch && this.#state.files.authorityKey === authorityKey) this.closeFiles(); };
+    signal.addEventListener("abort", abort, { once: true });
+    current.addEventListener("abort", retireFiles, { once: true });
+    const deadline = setTimeout(abort, 15_000);
+    const unsubscribe = this.subscribe(() => {
+      try { this.#markdownResources.assertCurrent(leaseId); } catch { abort(); }
+    });
+    try {
+      const { candidate, entry } = await this.#markdownResources.revalidate(leaseId, key, current);
+      const directory = entry.kind === FileKind.DIRECTORY ? entry.relativePath : workspaceParentPath(entry.relativePath);
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        this.#markdownResources.assertCurrent(leaseId); current.throwIfAborted();
+        authorityKey = this.filesAuthorityKey();
+        const opening = this.#openFilesAt(directory); filesEpoch = this.#filesEpoch;
+        await awaitMobileMarkdownResourceRead(opening, current);
+        await this.#markdownResources.revalidate(leaseId, key, current);
+        if (this.filesAuthorityKey() !== authorityKey) continue;
+        if (this.#state.files.status !== "ready") throw new Error("The Workspace directory could not be opened.");
+        if (entry.kind === FileKind.DIRECTORY) return undefined;
+        await awaitMobileMarkdownResourceRead(this.previewWorkspaceEntry(entry), current);
+        await this.#markdownResources.revalidate(leaseId, key, current);
+        if (this.filesAuthorityKey() !== authorityKey) continue;
+        const preview = this.#state.files.preview;
+        if (preview?.kind === "text" && candidate.line) this.#set({ files: { ...this.#state.files,
+          preview: { ...preview, focusLine: candidate.line, ...(candidate.column ? { focusColumn: candidate.column } : {}) } } });
+        return { kind: "workspace-entry", entry };
+      }
+      throw new Error("The Workspace changed before file preview opened.");
+    } catch (error) {
+      retireFiles();
+      throw error;
+    } finally { clearTimeout(deadline); unsubscribe(); signal.removeEventListener("abort", abort); current.removeEventListener("abort", retireFiles); }
+  }
+
+  async openMarkdownImageGallery(leaseId: string, key: string, signal: AbortSignal): Promise<MobileImageGalleryDescriptor> {
+    if (!this.composerDrafts) throw new Error("Retained task drafts are unavailable on this mobile client.");
+    this.#retireImageGallery();
+    await this.#markdownResources.revalidate(leaseId, key, signal);
+    const page = this.#markdownResources.imagePage(leaseId, key);
+    const pages = this.#markdownResources.imagePages(leaseId);
+    if (!page || !pages.length) throw new Error("The message image is unavailable.");
+    const credential = this.#ready();
+    const taskAuthorityKey = this.#taskAuthorityKey();
+    const sessionId = this.#state.selectedId;
+    if (!taskAuthorityKey || !sessionId) throw new Error("The task changed while its image opened.");
+    this.#markdownResources.retain(leaseId);
+    let adopted = false;
+    try {
+      const identity = { profileId: credential.profileId, sessionId };
+      const snapshot = await this.composerDrafts.readSnapshot(identity);
+      const draft = normalizeMobileComposerDraft(snapshot.draft ?? emptyMobileComposerDraft());
+      signal.throwIfAborted(); this.#markdownResources.assertCurrent(leaseId);
+      if (this.#taskAuthorityKey() !== taskAuthorityKey) throw new Error("The task changed while its image opened.");
+      const attachmentOwnerKey = this.taskAttachmentControls()?.surfaceOwnerKey;
+      const descriptor: MobileImageGalleryDescriptor = {
+        leaseId: distinctAttachmentStorageId(this.newId, ...mobileComposerAttachmentStorageIds(draft.attachments)),
+        sourceKind: "timeline", sourceLabel: "Task message", pages: pages.map(mobileImageGalleryPageSummary),
+        initialIndex: pages.findIndex((item) => item.pageId === page.pageId)
+      };
+      const lease: MobileImageGalleryLease = { leaseId: descriptor.leaseId, profileId: credential.profileId,
+        credentialKey: mobileCredentialKey(credential), taskAuthorityKey, identity, snapshot, draft, descriptor, pages,
+        ...(attachmentOwnerKey === undefined ? {} : { attachmentOwnerKey }),
+        source: { kind: "markdown", resourceLeaseId: leaseId }, operationInFlight: false };
+      this.#imageGallery = lease; adopted = true;
+      try { await this.#assertImageGalleryCurrent(lease, undefined, signal); return descriptor; }
+      catch (error) { if (this.#imageGallery === lease) this.#retireImageGallery(); throw error; }
+    } finally { if (!adopted) this.#markdownResources.release(leaseId); }
+  }
+
+  async prepareConversationShare(selectedIds: readonly string[], signal: AbortSignal): Promise<MobileConversationShareSnapshot> {
+    signal.throwIfAborted();
+    if (this.#conversationShare) throw new Error("Another message image is being prepared.");
+    const credential = this.#ready();
+    const ownerKey = this.conversationShareOwnerKey();
+    const sessionId = this.#state.selectedId;
+    if (!ownerKey || !sessionId) throw new Error("Open a current task before sharing its messages.");
+    const events = this.#timelineEvents();
+    const rows = timelineRows(events).filter(mobileMessageShareable);
+    const selected = new Set(selectedIds);
+    const chosen = rows.filter((row) => selected.has(row.id));
+    if (chosen.length === 0 || chosen.length !== selectedIds.length || selected.size !== selectedIds.length) {
+      throw new Error("The selected messages are no longer in the current Timeline window.");
+    }
+    if (chosen.length > 200 || chosen.reduce((size, row) => size + row.text.length, 0) > 200_000) {
+      throw new Error("The selected messages are too large. Select fewer messages.");
+    }
+    const sources = new Map<string, string>();
+    const eventFor = (eventId: string): Event => {
+      const matches = events.filter((event) => event.eventId === eventId);
+      const event = matches.length === 1 ? matches[0]! : undefined;
+      if (!event || event.identity?.sessionId !== sessionId || event.cursor?.generation !== this.#state.owner?.generation) {
+        throw new Error("A selected message source is unavailable.");
+      }
+      sources.set(eventId, mobileConversationShareEventDigest(event));
+      return event;
+    };
+    const projected = chosen.map((row) => {
+      const event = eventFor(row.eventId);
+      const accepted = row.kind === "user" ? events.filter((source) => source.payload?.kind.case === "messageStarted"
+        && source.payload.kind.value.messageId === row.id && source.payload.kind.value.role === MessageRole.USER
+        && source.payload.kind.value.userInputAccepted) : [];
+      if (accepted.length > 1) throw new Error("The accepted message source is ambiguous.");
+      const acceptedInput = accepted[0] ? eventFor(accepted[0].eventId) : undefined;
+      const pages = (row.images ?? []).flatMap((summary) => summary.sourceEventId
+        ? mobileTimelineGalleryPages(eventFor(summary.sourceEventId)).filter((page) => page.pageId === summary.pageId) : []);
+      return { message: projectMobileConversationShareMessage(row, event, pages, acceptedInput), pages };
+    });
+    const lease: MobileConversationShareLease = {
+      leaseId: this.newId(), ownerKey, credential, sessionId,
+      rowEvents: new Map(chosen.map((row) => [row.id, row.eventId])), sources, markdownResources: []
+    };
+    this.#conversationShare = lease;
+    const imageAbort = new AbortController();
+    const abort = () => imageAbort.abort();
+    signal.addEventListener("abort", abort, { once: true });
+    const deadline = setTimeout(abort, 15_000);
+    let remainingBytes = 12 * 1_024 * 1_024;
+    let remainingPixels = 12_000_000;
+    try {
+      const messages: MobileConversationShareSnapshot["messages"][number][] = [];
+      for (const { message, pages } of projected) {
+        const images = new Map<string, MobileConversationShareImage>();
+        for (const page of pages) {
+          this.#assertConversationShareCurrent(lease, signal);
+          if (imageAbort.signal.aborted || page.byteSize > remainingBytes) continue;
+          try {
+            let rejectDownload: (() => void) | undefined;
+            const download = await Promise.race([
+              this.network.downloadBlob(credential, page.blob, imageAbort.signal),
+              new Promise<never>((_resolve, reject) => {
+                rejectDownload = () => reject(new Error("The image preparation was cancelled."));
+                imageAbort.signal.addEventListener("abort", rejectDownload, { once: true });
+              })
+            ]).finally(() => { if (rejectDownload) imageAbort.signal.removeEventListener("abort", rejectDownload); });
+            this.#assertConversationShareCurrent(lease, signal);
+            if (normalizeMediaType(download.mediaType) !== page.mediaType || download.bytes.byteLength !== page.byteSize
+              || bytesToHex(sha256(download.bytes)) !== page.sha256Hex) throw new Error("The canonical message image changed.");
+            const decoded = inspectMobileImageGalleryBytes(download.bytes, page.mediaType);
+            if (decoded.width * decoded.height > remainingPixels || (page.widthPixels !== undefined
+              && (decoded.width !== page.widthPixels || decoded.height !== page.heightPixels))) continue;
+            images.set(page.pageId, { uri: bytesToDataUri(download.bytes, page.mediaType), width: decoded.width, height: decoded.height });
+            remainingBytes -= download.bytes.byteLength;
+            remainingPixels -= decoded.width * decoded.height;
+          } catch {
+            // Unreadable images keep their own label; authority/source drift retires the entire export.
+            this.#assertConversationShareCurrent(lease, signal);
+          }
+        }
+        if (message.kind === "assistant" && this.markdownResourceOwnerKey() && !imageAbort.signal.aborted) {
+          try {
+            const source = chosen.find((row) => row.id === message.clientId)!;
+            const resources = await this.prepareMarkdownResources(source.id, source.text, imageAbort.signal);
+            if (![...resources.references.values()].some((reference) => reference.image !== undefined)) {
+              this.releaseMarkdownResources(resources.leaseId);
+              this.#assertConversationShareCurrent(lease, signal);
+              messages.push({ ...message, images }); continue;
+            }
+            lease.markdownResources.push(resources.leaseId);
+            this.#assertConversationShareCurrent(lease, signal);
+            for (const [key, reference] of resources.references) {
+              const page = this.#markdownResources.imagePage(resources.leaseId, key);
+              const image = reference.image;
+              if (!image || !page || page.byteSize > remainingBytes || image.width * image.height > remainingPixels) continue;
+              const parsed: unknown = JSON.parse(key);
+              if (!Array.isArray(parsed) || parsed[0] !== "image" || typeof parsed[1] !== "string") continue;
+              images.set(parsed[1], image);
+              remainingBytes -= page.byteSize; remainingPixels -= image.width * image.height;
+            }
+          } catch { this.#assertConversationShareCurrent(lease, signal); }
+        }
+        messages.push({ ...message, images });
+      }
+      this.#assertConversationShareCurrent(lease, signal);
+      return { leaseId: lease.leaseId, allShareableIds: rows.map((row) => row.id), messages };
+    } catch (error) {
+      this.releaseConversationShare(lease.leaseId);
+      throw error;
+    } finally {
+      clearTimeout(deadline);
+      signal.removeEventListener("abort", abort);
+      imageAbort.abort();
+    }
+  }
+
+  assertConversationShareCurrent(leaseId: string, signal?: AbortSignal): void {
+    const lease = this.#conversationShare;
+    if (!lease || lease.leaseId !== leaseId) throw new Error("The message image no longer owns its source.");
+    this.#assertConversationShareCurrent(lease, signal);
+  }
+
+  #assertConversationShareCurrent(lease: MobileConversationShareLease, signal?: AbortSignal): void {
+    signal?.throwIfAborted();
+    if (this.#conversationShare !== lease || this.#credential !== lease.credential
+      || this.conversationShareOwnerKey() !== lease.ownerKey) throw new Error("The task changed before message sharing began.");
+    const events = this.#timelineEvents();
+    const rows = timelineRows(events).filter(mobileMessageShareable);
+    for (const [id, eventId] of lease.rowEvents) {
+      if (!rows.some((row) => row.id === id && row.eventId === eventId)) throw new Error("A selected message left the current Timeline window.");
+    }
+    for (const [id, digest] of lease.sources) {
+      const matches = events.filter((event) => event.eventId === id);
+      if (matches.length !== 1 || mobileConversationShareEventDigest(matches[0]!) !== digest) {
+        throw new Error("A selected message source changed.");
+      }
+    }
+    for (const id of lease.markdownResources) this.#markdownResources.assertCurrent(id);
+  }
+
+  async revalidateConversationShare(leaseId: string, signal: AbortSignal): Promise<void> {
+    this.assertConversationShareCurrent(leaseId, signal);
+    const lease = this.#conversationShare!;
+    for (const [eventId, digest] of lease.sources) {
+      const around = await this.network.readAround(lease.credential, lease.sessionId, eventId, signal);
+      this.#assertConversationShareCurrent(lease, signal);
+      const matches = around.filter((event) => event.eventId === eventId && event.identity?.sessionId === lease.sessionId
+        && event.cursor?.generation === this.#state.owner?.generation);
+      if (matches.length !== 1 || mobileConversationShareEventDigest(matches[0]!) !== digest) {
+        throw new Error("A selected message was changed or removed before system sharing began.");
+      }
+    }
+    for (const id of lease.markdownResources) await this.#markdownResources.revalidateImages(id, signal);
+  }
+
+  releaseConversationShare(leaseId: string): void {
+    if (this.#conversationShare?.leaseId !== leaseId) return;
+    for (const id of this.#conversationShare.markdownResources) this.#markdownResources.release(id);
+    this.#conversationShare = undefined;
   }
 
   async openTimelineImageGallery(
@@ -4207,7 +4575,7 @@ export class MobileClient {
   ): Promise<MobileImageGalleryDescriptor> {
     signal?.throwIfAborted();
     if (!this.composerDrafts) throw new Error("Retained task drafts are unavailable on this mobile client.");
-    this.#imageGallery = undefined;
+    this.#retireImageGallery();
     const credential = this.#ready();
     const taskAuthorityKey = this.#taskAuthorityKey();
     const sessionId = this.#state.selectedId;
@@ -4264,7 +4632,7 @@ export class MobileClient {
       await this.#assertImageGalleryCurrent(lease, undefined, signal);
       return descriptor;
     } catch (error) {
-      if (this.#imageGallery === lease) this.#imageGallery = undefined;
+      if (this.#imageGallery === lease) this.#retireImageGallery();
       throw error;
     }
   }
@@ -4428,7 +4796,12 @@ export class MobileClient {
   }
 
   cancelImageGallery(leaseId: string): void {
-    if (this.#imageGallery?.leaseId === leaseId) this.#imageGallery = undefined;
+    if (this.#imageGallery?.leaseId === leaseId) this.#retireImageGallery();
+  }
+
+  #retireImageGallery(): void {
+    if (this.#imageGallery?.source.kind === "markdown") this.#markdownResources.release(this.#imageGallery.source.resourceLeaseId);
+    this.#imageGallery = undefined;
   }
 
   async addImageGalleryPageToComposer(
@@ -5092,7 +5465,7 @@ export class MobileClient {
     return { sessionId: submission.sessionId, created: true, sent: true, definitive: true };
   }
 
-  async send(draft: MobileComposerDraft): Promise<boolean> {
+  async send(draft: MobileComposerDraft, observer: MobileTaskSendObserver = {}): Promise<boolean> {
     const exactDraft = normalizeMobileComposerDraft(draft);
     const sessionId = this.#state.selectedId;
     const session = this.#state.detail?.sessions.find((item) => item.sessionId === sessionId);
@@ -5205,6 +5578,7 @@ export class MobileClient {
         credential,
         generation
       );
+      observer.onDispatch?.(sendDraft);
       const accepted = await this.#submit(create(OperationMutationSchema, {
         preconditions: [create(OperationPreconditionSchema, {
           entity: create(EntityRefSchema, { kind: EntityKind.SESSION, id: sessionId }), expectedGeneration: generation
@@ -5214,7 +5588,7 @@ export class MobileClient {
           input: mobileComposerInput(sendDraft),
           deliveryMode: QueueDeliveryMode.PROMPT
         }) }
-      }), { kind: "send", sessionId });
+      }), { kind: "send", sessionId }, observer.operationId);
       if (accepted) {
         try {
           if (await this.composerDrafts.clearIfEqual(draftIdentity, sendDraft)) {
@@ -5417,6 +5791,26 @@ export class MobileClient {
 
   taskQueueItems(): readonly QueueItem[] {
     return acceptedQueueItems(this.#state.detail?.queueItems ?? [], this.#state.selectedId);
+  }
+
+  /** Stable page-local owner occurrence; excludes normal entity revision advancement. */
+  taskPresentationOwnerKey(): string | undefined {
+    if (!this.#taskAuthorityKey()) return undefined;
+    const credential = this.#credential!;
+    const owner = this.#state.owner!;
+    const session = this.#selectedSession()!;
+    const generation = session.nativeBinding!.runtimeGeneration!;
+    return [
+      credential.profileId,
+      credential.connectionId,
+      credential.deviceId,
+      credential.serverId,
+      owner.generation.toString(10),
+      session.sessionId,
+      session.backendId,
+      session.targetId,
+      generation.toString(10)
+    ].join("\u001f");
   }
 
   taskQueueCapabilities() {
@@ -8041,6 +8435,13 @@ export class MobileClient {
         || mobileFilesGalleryWindowKey(this.#state.files) !== source.filesWindowKey) {
         throw new Error("The Files image source window changed while the gallery was open.");
       }
+    } else if (source.kind === "markdown") {
+      await this.#markdownResources.revalidateImages(source.resourceLeaseId, signal ?? new AbortController().signal);
+      const currentPages = this.#markdownResources.imagePages(source.resourceLeaseId);
+      if (currentPages.length !== lease.pages.length
+        || currentPages.some((page, index) => !sameMobileImageGalleryPage(page, lease.pages[index]!))) {
+        throw new Error("The message Workspace images changed while the gallery was open.");
+      }
     } else {
       const events = this.#timelineEvents();
       if (mobileTimelineGalleryWindowKey(events) !== source.windowKey) {
@@ -8191,7 +8592,7 @@ export class MobileClient {
         committed = true;
         await this.composerDrafts.flush(lease.identity);
         await this.#assertImageGalleryCurrent(lease, nextDraft, signal);
-        this.#imageGallery = undefined;
+        this.#retireImageGallery();
         return nextDraft;
       } catch (error) {
         if (committed && nextDraft) committed = !await this.#restoreFilesComposerDraft(lease.identity, lease.snapshot, nextDraft);
@@ -8201,7 +8602,7 @@ export class MobileClient {
         if (!committed && sourceStaged && source) {
           await this.attachmentFiles.removeOwnedBytes(lease.profileId, source.storageId).catch(() => undefined);
         }
-        if (committed) this.#imageGallery = undefined;
+        if (committed) this.#retireImageGallery();
         throw error;
       }
     } finally {
@@ -8727,7 +9128,7 @@ export class MobileClient {
   }
 
   #cancelFilesRequests(): void {
-    if (this.#imageGallery?.source.kind === "files") this.#imageGallery = undefined;
+    if (this.#imageGallery?.source.kind === "files") this.#retireImageGallery();
     this.#cancelPreparingFileShare("files");
     void this.#releaseFilesBinaryPreviews().catch(() => undefined);
     this.#filesEpoch += 1;
@@ -8981,10 +9382,7 @@ export class MobileClient {
       revision,
       controller.signal
     );
-    if (result.entry?.relativePath !== relativePath || !result.entry.revision
-      || workspaceEntryRevisionKey(result.entry.revision) !== workspaceEntryRevisionKey(revision)) {
-      throw new Error("The Workspace file changed before its exact preview was returned.");
-    }
+    assertWorkspaceFilePreview(context.authority.workspace.workspaceId, relativePath, revision, result);
     if (controller.signal.aborted || this.#filesPreviewAbort !== controller
       || !this.#currentFiles(epoch, context.key)) return;
     const preview = await this.#workspacePreview(context, result, title, controller.signal);
@@ -9323,9 +9721,10 @@ export class MobileClient {
 
   async #submit(
     mutation: OperationMutation,
-    identity: Pick<PendingOperation, "kind" | "sessionId" | "eventId" | "queueItemId" | "interactionId" | "interactionGeneration" | "interactionRevision" | "interactionDraftKind" | "targetConnectionId" | "targetDeviceId" | "scheduleId" | "triggerId" | "targetId">
+    identity: Pick<PendingOperation, "kind" | "sessionId" | "eventId" | "queueItemId" | "interactionId" | "interactionGeneration" | "interactionRevision" | "interactionDraftKind" | "targetConnectionId" | "targetDeviceId" | "scheduleId" | "triggerId" | "targetId">,
+    operationId?: string
   ): Promise<boolean> {
-    return (await this.#submitTracked(mutation, identity, false)).accepted;
+    return (await this.#submitTracked(mutation, identity, false, operationId)).accepted;
   }
 
   async #submitTerminal(
@@ -9701,6 +10100,14 @@ export class MobileClient {
     this.#retire();
     this.#listeners.clear();
   }
+}
+
+function mobileConversationShareEventDigest(event: Event): string {
+  const exact = clone(EventSchema, event);
+  // Snapshot and history reads issue different cursor tickets for the same
+  // durable Event. Preserve its sequence/generation and all message content.
+  if (exact.cursor) { exact.cursor.opaqueToken = ""; exact.cursor.issuedAt = undefined; }
+  return bytesToHex(sha256(toBinary(EventSchema, exact)));
 }
 
 function mobileStateTimelineEvents(state: MobileState): readonly Event[] {

@@ -90,6 +90,16 @@ import {
   type TranslatorState
 } from "./translator.js";
 import {
+  dedupeYieldedExecCells,
+  extractAliveYieldCellsFromCodexItem,
+  extractSettledYieldCellIdsFromCodexItem,
+  extractYieldedExecCellsFromCodexItem,
+  formatYieldContinuationPrompt,
+  isYieldContinuationClientId,
+  YIELD_CONTINUATION_CLIENT_ID_PREFIX,
+  type YieldedExecCell
+} from "./yielded-exec-cell.js";
+import {
   inspectCodexSmartRouting,
   type CodexSmartRoutingInspection,
   type CodexSmartRoutingGeneration,
@@ -268,10 +278,20 @@ interface SessionRuntime {
   planMode: boolean;
   collaborationTouched: boolean;
   defaultCollaborationMarkerPending: boolean;
-  pendingTurnStart?: { readonly planMode: boolean; readonly context: AdapterContext };
+  pendingTurnStart?: {
+    readonly planMode: boolean;
+    readonly context: AdapterContext;
+    readonly yieldClaim?: YieldContinuationClaim;
+  };
   readonly planTurnIds: Set<string>;
   readonly planTextByTurn: Map<string, string>;
   readonly planContextByTurn: Map<string, AdapterContext>;
+  readonly yieldedExecCellsByTurnId: Map<string, Map<string, YieldedExecCell[]>>;
+  yieldContinuation?: YieldContinuationClaim;
+  yieldContinuationStartFlight?: Promise<void>;
+  yieldTerminalOwner?: YieldContinuationClaim;
+  readonly retiredYieldContinuationsByClientId: Map<string, RetiredYieldContinuation>;
+  readonly retiredYieldContinuationsByTurnId: Map<string, RetiredYieldContinuation>;
   planReview?: {
     readonly interactionId: string;
     readonly turnId: string;
@@ -283,6 +303,56 @@ interface SessionRuntime {
   disconnectTerminalEmitted: boolean;
   compaction?: CompactionWaiter;
   rewindUnknown: boolean;
+}
+
+interface YieldContinuationClaim {
+  readonly originTurnId: string;
+  readonly context: AdapterContext;
+  cells: YieldedExecCell[];
+  readonly settledCellIds: Set<string>;
+  attemptsStarted: number;
+  dispatchStarted: boolean;
+  stopRequested: boolean;
+  terminalClaimed: boolean;
+  state: "awaiting" | "starting" | "active" | "cancelled" | "settled";
+  continuationTurnId?: string;
+  clientUserMessageId?: string;
+  abort?: AbortController;
+  deferredPlan?: {
+    readonly turnId: string;
+    readonly markdown: string;
+    readonly context: AdapterContext;
+  };
+  retired?: RetiredYieldContinuation;
+}
+
+interface RetiredYieldContinuation {
+  readonly clientUserMessageId: string;
+  readonly context: AdapterContext;
+  readonly turnIds: Set<string>;
+  readonly interruptFlights: Map<string, Promise<void>>;
+  readonly terminalClaimed: boolean;
+}
+
+interface YieldContinuationDispatch {
+  readonly claim: YieldContinuationClaim;
+  readonly attempt: number;
+  readonly clientUserMessageId: string;
+  readonly signal: AbortSignal;
+}
+
+type CompletedPlan = {
+  readonly turnId: string;
+  readonly markdown: string;
+  readonly context: AdapterContext;
+};
+
+interface YieldTurnResolution {
+  readonly events: readonly import("@joko/core").EventPayload[];
+  readonly logicalTerminal: boolean;
+  readonly startClaim?: YieldContinuationClaim;
+  readonly plan?: CompletedPlan;
+  readonly failure?: "no_progress" | "retry_exhausted";
 }
 
 interface CodexReadScope {
@@ -324,6 +394,7 @@ const REVIEW_MAXIMUM_GREP_FILES = 2_000;
 const REVIEW_MAXIMUM_GREP_BYTES = 16 * 1024 * 1024;
 const REVIEW_MAXIMUM_RESULTS = 500;
 const MAXIMUM_PLAN_REVIEW_BYTES = 1024 * 1024;
+const YIELD_CONTINUATION_MAX_ATTEMPTS = 2;
 const REVIEW_DYNAMIC_TOOL_NAMES = new Set(["joko_read", "joko_grep", "joko_find", "joko_ls"]);
 const REVIEW_DISABLED_FEATURES = [
   "apps",
@@ -1196,7 +1267,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       && this.#isRuntimeCurrent(current, current.hostGeneration)
       && this.#mcpCanRemain(current)) {
       this.#assertNativeAuthenticationAdmission(this.#runtimeNativeAuthenticationAdmission(current));
-      current.context = context;
+      if (!runtimeHasProductWork(current)) current.context = context;
       return stateFromRuntime(current);
     }
     await this.#prepareNativeMemory(inspection.scope, "standard", context.signal);
@@ -1365,7 +1436,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       && runtime.profileKey === inspected.profileKey
       && this.#matchesCoreFence(runtime, context)
       && this.#isRuntimeCurrent(runtime, runtime.hostGeneration)) {
-      if (runtime.state.activeTurnId === undefined) runtime.context = context;
+      if (!runtimeHasProductWork(runtime)) runtime.context = context;
       runtime.name = thread.name ?? runtime.name;
       return stateFromRuntime(runtime, thread);
     }
@@ -1619,10 +1690,17 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     return this.#withNativeMutation(context, () => this.#send(input, context));
   }
 
-  async #send(input: PromptInput, context: AdapterContext): Promise<void> {
+  async #send(
+    input: PromptInput,
+    context: AdapterContext,
+    yieldDispatch?: YieldContinuationDispatch
+  ): Promise<void> {
     this.#assertOpen();
     assertDispatchNotCancelled(context.signal);
     this.#assertBackendContext(context);
+    if (yieldDispatch === undefined && isYieldContinuationClientId(context.operationId)) {
+      throw reservedYieldContinuationClientId();
+    }
     if (context.target.remoteWorkspace !== undefined
       && (input.images.length !== 0 || input.files.length !== 0 || input.mentions.length !== 0)) {
       throw remoteMutationUnsupported("dispatch attachments or typed mentions");
@@ -1639,6 +1717,15 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
         recovery: "Keep the input and explicitly send it as a new prompt after refreshing the task."
       });
     }
+    if (yieldDispatch === undefined && (runtime.yieldContinuation !== undefined
+      || runtime.yieldContinuationStartFlight !== undefined)) {
+      throw yieldContinuationBusy();
+    }
+    if (yieldDispatch === undefined) runtime.yieldTerminalOwner = undefined;
+    if (yieldDispatch !== undefined && (runtime.yieldContinuation !== yieldDispatch.claim
+      || yieldDispatch.claim.state !== "starting")) {
+      throw yieldContinuationCancelled();
+    }
     if (input.disposition !== "steer" && runtime.smartRoute !== undefined) {
       try { runtime.smartRoute.assertCurrent(); }
       catch { throw smartRouteUnavailable(); }
@@ -1650,11 +1737,17 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     }
     if (runtime.routeUnknown) throw managedRouteUnavailable(true);
     const hostGeneration = runtime.hostGeneration;
-    const dispatchSignal = AbortSignal.any([context.signal, runtime.dispatchLifetime.signal]);
+    const dispatchSignal = AbortSignal.any([
+      context.signal,
+      runtime.dispatchLifetime.signal,
+      ...(yieldDispatch === undefined ? [] : [yieldDispatch.signal])
+    ]);
     const expectedTurnId = input.disposition === "steer" ? runtime.state.activeTurnId : undefined;
     const assertDispatchReady = () => {
       assertDispatchNotCancelled(dispatchSignal);
       this.#assertRuntimeDispatchFence(runtime, context, hostGeneration);
+      if (yieldDispatch !== undefined && (runtime.yieldContinuation !== yieldDispatch.claim
+        || yieldDispatch.claim.state !== "starting")) throw yieldContinuationCancelled();
       if (input.disposition === "steer" && (expectedTurnId === undefined
         || runtime.state.activeTurnId !== expectedTurnId
         || runtime.state.terminalTurnIds.has(expectedTurnId))) {
@@ -1687,17 +1780,17 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       nativeInput.assertCurrent();
     };
     assertNativeDispatchReady();
-    const clientUserMessageId = context.operationId;
+    const clientUserMessageId = yieldDispatch?.clientUserMessageId ?? context.operationId;
     const collaborationMode = runtime.runtimePolicy === "standard"
       && supportsNativeCollaboration(runtime.host.initializeResult?.userAgent)
       ? collaborationModeForTurn(runtime)
       : undefined;
-    if (input.disposition !== "steer") {
-      runtime.pendingTurnStart = {
+    const pendingTurnStart = input.disposition === "steer" ? undefined : {
         planMode: collaborationMode?.mode === "plan",
-        context
+        context,
+        ...(yieldDispatch === undefined ? {} : { yieldClaim: yieldDispatch.claim })
       };
-    }
+    if (pendingTurnStart !== undefined) runtime.pendingTurnStart = pendingTurnStart;
     let acceptedResponseShapePending = false;
     try {
       if (input.disposition === "steer") {
@@ -1743,10 +1836,28 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
                     }
                   })
             })
-      }, { mutation: true, signal: dispatchSignal, beforeDispatch: assertNativeDispatchReady });
+      }, {
+        mutation: true,
+        signal: dispatchSignal,
+        beforeDispatch: () => {
+          assertNativeDispatchReady();
+          if (yieldDispatch !== undefined) yieldDispatch.claim.dispatchStarted = true;
+        }
+      });
       this.#assertRuntimeFence(runtime, context, response.hostGeneration);
       acceptedResponseShapePending = true;
       const startedTurn = parseTurnStart(response.value);
+      if (yieldDispatch !== undefined && yieldDispatch.claim.state === "cancelled") {
+        this.#bindRetiredYieldTurn(runtime, yieldDispatch.claim, startedTurn.id, hostGeneration);
+        acceptedResponseShapePending = false;
+        return;
+      }
+      if (yieldDispatch !== undefined && (runtime.yieldContinuation !== yieldDispatch.claim
+        || yieldDispatch.claim.attemptsStarted !== yieldDispatch.attempt
+        || yieldDispatch.claim.clientUserMessageId !== yieldDispatch.clientUserMessageId)) {
+        acceptedResponseShapePending = false;
+        return;
+      }
       if (startedTurn.status !== "inProgress" && !runtime.state.terminalTurnIds.has(startedTurn.id)) {
         throw new ProtocolShapeError("turn start result is not in progress");
       }
@@ -1758,16 +1869,36 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
         throw new ProtocolShapeError("turn start result conflicts with the active turn");
       }
       bindPlanTurnIntent(runtime, startedTurn.id, collaborationMode?.mode === "plan", context);
+      if (yieldDispatch !== undefined) bindYieldContinuationTurn(runtime, yieldDispatch.claim, startedTurn.id);
       if (collaborationMode?.mode === "default") runtime.defaultCollaborationMarkerPending = false;
       acceptedResponseShapePending = false;
     } catch (error) {
+      if (yieldDispatch !== undefined && yieldDispatch.claim.state !== "cancelled"
+        && (runtime.yieldContinuation !== yieldDispatch.claim
+          || yieldDispatch.claim.attemptsStarted !== yieldDispatch.attempt
+          || yieldDispatch.claim.clientUserMessageId !== yieldDispatch.clientUserMessageId)) return;
       if (isAmbiguousDispatchFailure(error)
         || (acceptedResponseShapePending && error instanceof ProtocolShapeError)) {
         const reconciled = await this.#reconcileClientMessage(runtime, context, clientUserMessageId, expectedTurnId);
-        if (reconciled) {
-          if (input.disposition !== "steer" && runtime.state.activeTurnId !== undefined) {
-            runtime.activeTurnContext = context;
-            bindPlanTurnIntent(runtime, runtime.state.activeTurnId, collaborationMode?.mode === "plan", context);
+        if (reconciled !== undefined) {
+          if (yieldDispatch !== undefined && yieldDispatch.claim.state !== "cancelled"
+            && (runtime.yieldContinuation !== yieldDispatch.claim
+              || yieldDispatch.claim.attemptsStarted !== yieldDispatch.attempt
+              || yieldDispatch.claim.clientUserMessageId !== yieldDispatch.clientUserMessageId)) return;
+          if (input.disposition !== "steer") {
+            bindPlanTurnIntent(runtime, reconciled.id, collaborationMode?.mode === "plan", context);
+            if (reconciled.status === "inProgress") runtime.activeTurnContext = context;
+          }
+          if (yieldDispatch !== undefined) {
+            if (yieldDispatch.claim.state === "cancelled") {
+              this.#bindRetiredYieldTurn(runtime, yieldDispatch.claim, reconciled.id, hostGeneration);
+              return;
+            }
+            bindYieldContinuationTurn(runtime, yieldDispatch.claim, reconciled.id);
+            if (reconciled.status !== "inProgress"
+              && runtime.yieldContinuation === yieldDispatch.claim) {
+              await this.#settleReconciledYieldTurn(runtime, yieldDispatch.claim, reconciled, hostGeneration);
+            }
           }
           if (collaborationMode?.mode === "default") runtime.defaultCollaborationMarkerPending = false;
           return;
@@ -1786,12 +1917,66 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       if (error instanceof Error && "publicError" in error) throw error;
       throw this.#requestFailure(error, "dispatch", "CODEX_TURN_START_FAILED", false);
     } finally {
-      if (input.disposition !== "steer") runtime.pendingTurnStart = undefined;
+      if (input.disposition !== "steer" && runtime.pendingTurnStart === pendingTurnStart) {
+        runtime.pendingTurnStart = undefined;
+      }
     }
   }
 
   async abort(context: AdapterContext): Promise<void> {
     const runtime = await this.#requireRuntime(context);
+    const yieldClaim = runtime.yieldContinuation;
+    if (yieldClaim !== undefined) {
+      yieldClaim.stopRequested = true;
+      let yieldTurnId = yieldClaim.continuationTurnId;
+      if (yieldTurnId === undefined) {
+        const startFlight = runtime.yieldContinuationStartFlight;
+        if (yieldClaim.state === "awaiting" && startFlight === undefined) {
+          if (!claimYieldProductTerminal(runtime, yieldClaim)) return;
+          this.#cancelYieldContinuation(runtime, false);
+          this.#releaseManagedOperation(runtime);
+          await yieldClaim.context.emit({ type: "done", outcome: "aborted" }, {
+            namespace: "codex.yield_continuation",
+            fields: { reason: "stopped" }
+          });
+          return;
+        }
+        if (startFlight !== undefined) await startFlight;
+        if (runtime.yieldContinuation !== yieldClaim) return;
+        yieldTurnId = yieldClaim.continuationTurnId;
+        if (yieldTurnId === undefined) {
+          throw await this.#failYieldContinuationStop(runtime, yieldClaim, runtime.hostGeneration);
+        }
+      }
+      const hostGeneration = runtime.hostGeneration;
+      try {
+        const response = await runtime.host.request("turn/interrupt", {
+          threadId: runtime.threadId,
+          turnId: yieldTurnId
+        }, {
+          mutation: true,
+          signal: AbortSignal.any([context.signal, runtime.dispatchLifetime.signal]),
+          beforeDispatch: () => this.#assertRuntimeDispatchFence(runtime, yieldClaim.context, hostGeneration)
+        });
+        this.#assertRuntimeFence(runtime, yieldClaim.context, response.hostGeneration);
+      } catch {
+        throw await this.#failYieldContinuationStop(runtime, yieldClaim, hostGeneration);
+      }
+      if (runtime.yieldContinuation !== yieldClaim) return;
+      if (!claimYieldProductTerminal(runtime, yieldClaim)) return;
+      this.#cancelYieldContinuation(runtime, false);
+      this.#cancelPendingServerRequests(
+        runtime,
+        (pending) => pending.threadId === runtime.threadId && pending.turnId === yieldTurnId
+      );
+      this.#cancelPendingMcpCalls(runtime, (pending) => pending.threadId === runtime.threadId);
+      this.#releaseManagedOperation(runtime);
+      await yieldClaim.context.emit({ type: "done", outcome: "aborted" }, {
+        namespace: "codex.yield_continuation",
+        fields: { reason: "stopped" }
+      });
+      return;
+    }
     this.#releaseManagedOperation(runtime);
     const turnId = runtime.state.activeTurnId;
     if (turnId === undefined) return;
@@ -1946,6 +2131,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     }
     const runtime = await this.#requireRuntime(context);
     this.#assertStandardRuntime(runtime, "compact native history");
+    assertRuntimeProductIdle(runtime);
     if (runtime.compaction !== undefined) {
       throw adapterError({
         code: "CODEX_COMPACTION_IN_PROGRESS",
@@ -1980,6 +2166,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     if (context.target.remoteWorkspace !== undefined) throw remoteMutationUnsupported("fork the native thread");
     const runtime = await this.#requireRuntime(context, "bound");
     this.#assertStandardRuntime(runtime, "fork the native thread");
+    assertRuntimeProductIdle(runtime);
     return {
       binding: await this.#forkThread(runtime, context, derivation, entryId)
     };
@@ -1993,6 +2180,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     if (context.target.remoteWorkspace !== undefined) throw remoteMutationUnsupported("clone the native thread");
     const runtime = await this.#requireRuntime(context, "bound");
     this.#assertStandardRuntime(runtime, "clone the native thread");
+    assertRuntimeProductIdle(runtime);
     return this.#forkThread(runtime, context, derivation);
   }
 
@@ -2016,7 +2204,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       assertDispatchNotCancelled(signal);
       if (!this.#matchesCoreFence(runtime, context) || runtime.hostGeneration !== hostGeneration
         || !this.#host.isActiveGeneration(hostGeneration)) throw nativeHistoryReadFailure("STALE");
-      if (runtime.state.activeTurnId !== undefined || runtime.compaction !== undefined
+      if (runtimeHasProductWork(runtime) || runtime.compaction !== undefined
         || runtime.pendingServerRequests.size !== 0 || runtime.nativeTasks.hasActiveTasks()
         || this.#host.hasPendingThreadNotifications(runtime.threadId, hostGeneration)) throw rewindBusy();
     };
@@ -2107,6 +2295,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
   async #setModel(providerId: string, modelId: string, context: AdapterContext): Promise<ProviderModel> {
     let runtime = await this.#requireRuntime(context, "bound");
     this.#assertStandardRuntime(runtime, "change the model");
+    assertYieldContinuationIdle(runtime);
     const models = runtime.remote
       ? await this.#listRuntimeModels(runtime, context)
       : this.#withManagedModels(this.#models.length === 0 ? await this.listModels() : this.#models);
@@ -2157,6 +2346,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
   async #setEffort(level: string, context: AdapterContext): Promise<void> {
     const runtime = await this.#requireRuntime(context);
     this.#assertStandardRuntime(runtime, "change reasoning effort");
+    assertYieldContinuationIdle(runtime);
     const model = await this.#requireRuntimeModel(runtime, context);
     if (!model.thinkingLevels.includes(level)) {
       throw adapterError({
@@ -2193,6 +2383,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
   async #setFastMode(enabled: boolean, context: AdapterContext): Promise<void> {
     const runtime = await this.#requireRuntime(context);
     this.#assertStandardRuntime(runtime, "change Fast Mode");
+    assertYieldContinuationIdle(runtime);
     if (enabled) {
       const model = await this.#requireRuntimeModel(runtime, context);
       if (!model.supportsFastMode) {
@@ -2234,6 +2425,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     }
     const runtime = await this.#requireRuntime(context);
     this.#assertStandardRuntime(runtime, "change permission mode");
+    assertYieldContinuationIdle(runtime);
     const hostGeneration = runtime.hostGeneration;
     const response = await runtime.host.request("thread/resume", {
       threadId: runtime.threadId,
@@ -2267,6 +2459,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       return this.unsupported("plan_mode");
     }
     this.#assertStandardRuntime(runtime, "change Plan mode");
+    assertYieldContinuationIdle(runtime);
     const model = await this.#requireRuntimeModel(runtime, context);
     const effort = runtime.effort !== undefined && model.thinkingLevels.includes(runtime.effort)
       ? runtime.effort
@@ -2837,7 +3030,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       && this.#matchesCoreFence(runtime, context)
       && this.#isRuntimeCurrent(runtime, runtime.hostGeneration)
       && this.#mcpCanRemain(runtime, mcpRequirement === "allow_pending")) {
-      if (runtime.state.activeTurnId === undefined) runtime.context = context;
+      if (!runtimeHasProductWork(runtime)) runtime.context = context;
       return runtime;
     }
     if (context.runtimePolicy === "review_read_only") throw invalidReviewProfile();
@@ -3187,7 +3380,12 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       if (runtime.providerId !== undefined && this.#managedProviders?.hasProvider(runtime.providerId)) throw managedRouteUnavailable();
       return;
     }
-    if (runtime.managedOperation !== undefined || context.operationId === undefined) throw unavailable();
+    if (context.operationId === undefined) throw unavailable();
+    if (runtime.managedOperation !== undefined) {
+      if (runtime.managedOperation.id !== context.operationId) throw unavailable();
+      route.assertCurrent();
+      return;
+    }
     route.assertCurrent();
     const operation: NonNullable<SessionRuntime["managedOperation"]> = { id: context.operationId };
     runtime.managedOperation = operation;
@@ -3213,14 +3411,13 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
   }
 
   #maybeReleaseManagedOperation(runtime: SessionRuntime): void {
-    if (runtime.smartRoute !== undefined
-      && (runtime.state.activeTurnId !== undefined || runtime.nativeTasks.hasActiveTasks())) return;
+    if (runtimeHasProductWork(runtime) || runtime.nativeTasks.hasActiveTasks()) return;
     this.#releaseManagedOperation(runtime);
   }
 
   async #switchNativeRoute(runtime: SessionRuntime, providerId: string, modelId: string, context: AdapterContext): Promise<SessionRuntime> {
     const nativeAuthenticationEpoch = this.#nativeAuthenticationEpoch;
-    if (runtime.state.activeTurnId !== undefined || runtime.compaction !== undefined || runtime.nativeTasks.hasActiveTasks()) throw managedRouteUnavailable();
+    if (runtimeHasProductWork(runtime) || runtime.compaction !== undefined || runtime.nativeTasks.hasActiveTasks()) throw managedRouteUnavailable();
     const smartRoute = await this.#prepareSmartRoute(providerId, modelId, context);
     const route = smartRoute === undefined ? await this.#prepareManagedRoute(providerId, modelId, context) : undefined;
     const nativeAuthenticationAdmission = this.#nativeAuthenticationAdmission(
@@ -3660,6 +3857,9 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       planTurnIds: new Set(),
       planTextByTurn: new Map(),
       planContextByTurn: new Map(),
+      yieldedExecCellsByTurnId: new Map(),
+      retiredYieldContinuationsByClientId: new Map(),
+      retiredYieldContinuationsByTurnId: new Map(),
       runtimePolicy: input.context.runtimePolicy === "review_read_only" ? "review_read_only" : "standard",
       ...(input.reviewWorkingDirectory === undefined ? {} : { reviewWorkingDirectory: input.reviewWorkingDirectory }),
       closed: false,
@@ -3677,8 +3877,10 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
             this.#resolvePendingServerRequest(runtime, params);
             return;
           }
+          if (this.#handleRetiredYieldNotification(runtime, method, params, input.hostGeneration)) return;
           if (!this.#acceptTurnNotification(runtime, method, params)) return;
-          if (method === "turn/completed" && runtime.smartRoute === undefined) this.#releaseManagedOperation(runtime);
+          observeYieldedExecNotification(runtime, method, params);
+          let logicalTerminal = false;
           try {
             const nativeTaskEffects = runtime.runtimePolicy === "standard"
               ? runtime.nativeTasks.observeRootNotification(method, params)
@@ -3686,13 +3888,19 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
             if (nativeTaskEffects !== undefined) {
               await this.#registerNativeTaskLineages(runtime, nativeTaskEffects, input.hostGeneration);
             }
-            const completedPlan = runtime.runtimePolicy === "standard"
+            const completedPlan: CompletedPlan | undefined = runtime.runtimePolicy === "standard"
               ? observePlanReviewNotification(runtime, method, params)
               : undefined;
             const planTurnId = method === "item/plan/delta" ? turnIdFromParams(params) : undefined;
-            const events = planTurnId !== undefined && runtime.planTurnIds.has(planTurnId)
+            const translatedEvents = (planTurnId !== undefined && runtime.planTurnIds.has(planTurnId))
+              || isAnonymousYieldHelperCompletion(method, params)
               ? []
               : this.#translator.translate(method, params, runtime.state);
+            const yieldResolution = method === "turn/completed"
+              ? resolveYieldTurnCompletion(runtime, params, translatedEvents, completedPlan)
+              : undefined;
+            const events = yieldResolution?.events ?? translatedEvents;
+            logicalTerminal = yieldResolution?.logicalTerminal ?? false;
             for (const event of events) {
               if (!this.#isRuntimeCurrent(runtime, input.hostGeneration)) return;
               await runtime.context.emit(event, {
@@ -3722,12 +3930,26 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
                 recovery: "Inspect the native thread before retrying compaction."
               }));
             }
-            if (completedPlan !== undefined && events.some((event) =>
-              event.type === "done" && event.outcome === "completed")) {
-              this.#schedulePlanReview(runtime, completedPlan, completedPlan.context, input.hostGeneration);
+            if (yieldResolution?.failure !== undefined) {
+              await this.#emitYieldContinuationFailure(
+                runtime,
+                yieldResolution.failure,
+                input.hostGeneration
+              );
+            }
+            if (yieldResolution?.plan !== undefined) {
+              this.#schedulePlanReview(
+                runtime,
+                yieldResolution.plan,
+                yieldResolution.plan.context,
+                input.hostGeneration
+              );
+            }
+            if (yieldResolution?.startClaim !== undefined) {
+              this.#scheduleYieldContinuation(runtime, yieldResolution.startClaim, input.hostGeneration);
             }
           } finally {
-            if (method === "turn/completed") this.#maybeReleaseManagedOperation(runtime);
+            if (method === "turn/completed" && logicalTerminal) this.#maybeReleaseManagedOperation(runtime);
           }
         },
         onDescendantThreadStarted: async (params) => {
@@ -3836,7 +4058,12 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
         },
         onDisconnect: async (fault) => {
           if (!this.#matchesCallbackFence(runtime, input.hostGeneration) || runtime.disconnectTerminalEmitted) return;
+          const activeYieldClaim = runtime.yieldContinuation;
+          const ownsRootTerminal = activeYieldClaim === undefined
+            ? runtime.yieldTerminalOwner === undefined
+            : claimYieldProductTerminal(runtime, activeYieldClaim);
           runtime.dispatchLifetime.abort();
+          this.#cancelYieldContinuation(runtime);
           runtime.managedRoute?.dispose();
           runtime.managedRoute = undefined;
           runtime.smartRoute?.dispose();
@@ -3860,24 +4087,26 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
             true,
             false
           );
-          if (!this.#matchesCallbackFence(runtime, input.hostGeneration)) return;
-          await context.emit({
-            type: "error",
-            error: {
-              code: "CODEX_APP_SERVER_DISCONNECTED",
-              message: "The Codex app-server disconnected during the native Session.",
-              phase: "stream",
-              retryable: true,
-              stateMayHaveChanged: fault.stateMayHaveChanged,
-              recovery: "Reconnect and resume the native thread before sending additional work."
-            },
-            terminal: true
-          }, { namespace: "codex.app_server", fields: { state: "disconnected" } });
-          if (!this.#matchesCallbackFence(runtime, input.hostGeneration)) return;
-          await context.emit({ type: "done", outcome: "failed" }, {
-            namespace: "codex.app_server",
-            fields: { state: "disconnected" }
-          });
+          if (ownsRootTerminal && this.#matchesCallbackFence(runtime, input.hostGeneration)) {
+            await context.emit({
+              type: "error",
+              error: {
+                code: "CODEX_APP_SERVER_DISCONNECTED",
+                message: "The Codex app-server disconnected during the native Session.",
+                phase: "stream",
+                retryable: true,
+                stateMayHaveChanged: fault.stateMayHaveChanged,
+                recovery: "Reconnect and resume the native thread before sending additional work."
+              },
+              terminal: true
+            }, { namespace: "codex.app_server", fields: { state: "disconnected" } });
+            if (this.#matchesCallbackFence(runtime, input.hostGeneration)) {
+              await context.emit({ type: "done", outcome: "failed" }, {
+                namespace: "codex.app_server",
+                fields: { state: "disconnected" }
+              });
+            }
+          }
           this.#settleCompaction(runtime, adapterError({
             code: "CODEX_COMPACTION_INTERRUPTED",
             message: "The Codex app-server disconnected during native compaction.",
@@ -3923,6 +4152,154 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       if (this.#disposed) this.#assertOpen();
       throw error;
     }
+  }
+
+  #scheduleYieldContinuation(
+    runtime: SessionRuntime,
+    claim: YieldContinuationClaim,
+    hostGeneration: number
+  ): void {
+    if (runtime.yieldContinuation !== claim || claim.state !== "awaiting"
+      || runtime.yieldContinuationStartFlight !== undefined) return;
+    let flight!: Promise<void>;
+    flight = new Promise<void>((resolve) => { setTimeout(resolve, 0); })
+      .then(() => this.#startYieldContinuation(runtime, claim, hostGeneration))
+      .finally(() => {
+        if (runtime.yieldContinuationStartFlight === flight) {
+          runtime.yieldContinuationStartFlight = undefined;
+          const pending = runtime.yieldContinuation;
+          if (pending?.state === "awaiting") {
+            this.#scheduleYieldContinuation(runtime, pending, hostGeneration);
+          } else {
+            this.#maybeReleaseManagedOperation(runtime);
+          }
+        }
+      });
+    runtime.yieldContinuationStartFlight = flight;
+  }
+
+  async #startYieldContinuation(
+    runtime: SessionRuntime,
+    claim: YieldContinuationClaim,
+    hostGeneration: number
+  ): Promise<void> {
+    if (runtime.yieldContinuation !== claim || claim.state !== "awaiting"
+      || !this.#isRuntimeCurrent(runtime, hostGeneration)) return;
+    claim.state = "starting";
+    claim.dispatchStarted = false;
+    claim.attemptsStarted += 1;
+    const abort = new AbortController();
+    claim.abort = abort;
+    const clientUserMessageId = yieldContinuationClientUserMessageId(runtime, claim);
+    claim.clientUserMessageId = clientUserMessageId;
+    try {
+      await this.#send({
+        text: formatYieldContinuationPrompt(claim.cells),
+        images: [],
+        files: [],
+        mentions: [],
+        disposition: "prompt"
+      }, claim.context, {
+        claim,
+        attempt: claim.attemptsStarted,
+        clientUserMessageId,
+        signal: abort.signal
+      });
+      if (runtime.yieldContinuation === claim && claim.state === "starting") {
+        claim.state = "active";
+      }
+    } catch (error) {
+      if (runtime.yieldContinuation !== claim || abort.signal.aborted) return;
+      const retireUnknownStart = isUnknownYieldContinuationStart(error);
+      claim.state = "settled";
+      await this.#emitYieldContinuationFailure(runtime, "start_failed", hostGeneration);
+      if (retireUnknownStart) {
+        await this.#retireUnknownYieldStart(runtime, hostGeneration);
+        return;
+      }
+      this.#maybeReleaseManagedOperation(runtime);
+    } finally {
+      if (claim.abort === abort) claim.abort = undefined;
+    }
+  }
+
+  async #emitYieldContinuationFailure(
+    runtime: SessionRuntime,
+    reason: "start_failed" | "no_progress" | "retry_exhausted",
+    hostGeneration: number
+  ): Promise<void> {
+    const claim = runtime.yieldContinuation;
+    if (claim === undefined || claim.state !== "settled") return;
+    const ownsTerminal = claimYieldProductTerminal(runtime, claim);
+    this.#retireYieldContinuation(runtime, claim, true);
+    runtime.yieldContinuation = undefined;
+    claim.deferredPlan = undefined;
+    claim.abort?.abort();
+    claim.abort = undefined;
+    runtime.yieldedExecCellsByTurnId.clear();
+    if (!ownsTerminal) return;
+    const startFailed = reason === "start_failed";
+    const context = claim.context;
+    if (!this.#matchesCallbackFence(runtime, hostGeneration)) return;
+    await context.emit({
+      type: "error",
+      error: {
+        code: startFailed ? "CODEX_YIELD_CONTINUATION_START_FAILED" : "CODEX_YIELD_CONTINUATION_INCOMPLETE",
+        message: startFailed
+          ? "Codex could not start the bounded execution-result continuation."
+          : "Codex could not confirm the result of the existing execution cell.",
+        phase: "stream",
+        retryable: false,
+        stateMayHaveChanged: true,
+        recovery: "Inspect the existing native execution result before explicitly continuing; do not rerun the original command."
+      },
+      terminal: true
+    }, {
+      namespace: "codex.yield_continuation",
+      fields: { reason, attempts: claim.attemptsStarted }
+    });
+    if (!this.#matchesCallbackFence(runtime, hostGeneration)) return;
+    await context.emit({ type: "done", outcome: "failed" }, {
+      namespace: "codex.yield_continuation",
+      fields: { reason, attempts: claim.attemptsStarted }
+    });
+  }
+
+  async #retireUnknownYieldStart(runtime: SessionRuntime, hostGeneration: number): Promise<void> {
+    if (!this.#matchesCallbackFence(runtime, hostGeneration)) return;
+    runtime.dispatchLifetime.abort();
+    runtime.closed = true;
+    if (this.#sessions.get(runtime.sessionId) === runtime) this.#sessions.delete(runtime.sessionId);
+    this.#cancelPendingServerRequests(runtime);
+    this.#cancelPendingMcpCalls(runtime);
+    await this.#releaseRuntimeSubscription(runtime, false).catch(() => undefined);
+  }
+
+  async #failYieldContinuationStop(
+    runtime: SessionRuntime,
+    claim: YieldContinuationClaim,
+    hostGeneration: number
+  ): Promise<JokoError> {
+    const failure = yieldContinuationStopUnknown();
+    const ownsTerminal = claimYieldProductTerminal(runtime, claim);
+    if (runtime.yieldContinuation === claim) this.#cancelYieldContinuation(runtime, false);
+    try {
+      if (ownsTerminal && this.#matchesCallbackFence(runtime, hostGeneration)) {
+        await claim.context.emit({ type: "error", error: failure.publicError, terminal: true }, {
+          namespace: "codex.yield_continuation",
+          fields: { reason: "stop_unknown" }
+        });
+      }
+      if (ownsTerminal && this.#matchesCallbackFence(runtime, hostGeneration)) {
+        await claim.context.emit({ type: "done", outcome: "failed" }, {
+          namespace: "codex.yield_continuation",
+          fields: { reason: "stop_unknown" }
+        });
+      }
+    } finally {
+      await this.#retireUnknownYieldStart(runtime, hostGeneration);
+    }
+    return failure;
   }
 
   #schedulePlanReview(
@@ -4044,6 +4421,15 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
 
   #acceptTurnNotification(runtime: SessionRuntime, method: string, params: JsonValue): boolean {
     const turnId = turnIdFromParams(params);
+    const yieldClaim = runtime.yieldContinuation;
+    if (yieldClaim !== undefined && turnId !== undefined) {
+      const exactPrivateClientId = yieldContinuationClientIdFromNotification(params);
+      if (yieldClaim.continuationTurnId !== turnId
+        && exactPrivateClientId === yieldClaim.clientUserMessageId) {
+        bindYieldContinuationTurn(runtime, yieldClaim, turnId);
+      }
+      if (yieldClaim.continuationTurnId !== turnId) return false;
+    }
     if (method === "turn/started") {
       if (turnId === undefined || runtime.state.terminalTurnIds.has(turnId)) return false;
       if (runtime.state.activeTurnId !== undefined && runtime.state.activeTurnId !== turnId) return false;
@@ -4101,7 +4487,154 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     }
   }
 
+  #handleRetiredYieldNotification(
+    runtime: SessionRuntime,
+    method: string,
+    params: JsonValue,
+    hostGeneration: number
+  ): boolean {
+    const turnId = turnIdFromParams(params);
+    if (turnId === undefined) return false;
+    let retired = runtime.retiredYieldContinuationsByTurnId.get(turnId);
+    if (retired === undefined) {
+      const clientUserMessageId = yieldContinuationClientIdFromNotification(params);
+      if (clientUserMessageId !== undefined) {
+        retired = runtime.retiredYieldContinuationsByClientId.get(clientUserMessageId);
+      }
+    }
+    if (retired === undefined || !retired.terminalClaimed) return false;
+    retired.turnIds.add(turnId);
+    runtime.retiredYieldContinuationsByTurnId.set(turnId, retired);
+    runtime.state.terminalTurnIds.add(turnId);
+    if (runtime.state.activeTurnId === turnId) {
+      runtime.state.activeTurnId = undefined;
+      runtime.activeTurnContext = undefined;
+    }
+    this.#cancelPendingServerRequests(
+      runtime,
+      (pending) => pending.threadId === runtime.threadId && pending.turnId === turnId
+    );
+    this.#cancelPendingMcpCalls(runtime, (pending) => pending.threadId === runtime.threadId);
+    runtime.yieldedExecCellsByTurnId.delete(turnId);
+    runtime.planTurnIds.delete(turnId);
+    runtime.planTextByTurn.delete(turnId);
+    runtime.planContextByTurn.delete(turnId);
+    if (method !== "turn/completed") {
+      this.#scheduleRetiredYieldInterrupt(runtime, retired, turnId, hostGeneration);
+    }
+    return true;
+  }
+
+  #retireYieldContinuation(
+    runtime: SessionRuntime,
+    claim: YieldContinuationClaim,
+    terminalClaimed: boolean,
+    scheduleKnownInterrupt = true
+  ): RetiredYieldContinuation | undefined {
+    claim.deferredPlan = undefined;
+    const clientUserMessageId = claim.clientUserMessageId;
+    if (clientUserMessageId === undefined) return undefined;
+    let retired = claim.retired;
+    if (retired === undefined) {
+      retired = {
+        clientUserMessageId,
+        context: claim.context,
+        turnIds: new Set(),
+        interruptFlights: new Map(),
+        terminalClaimed
+      };
+      claim.retired = retired;
+    }
+    runtime.retiredYieldContinuationsByClientId.set(clientUserMessageId, retired);
+    if (claim.continuationTurnId !== undefined) {
+      retired.turnIds.add(claim.continuationTurnId);
+      runtime.retiredYieldContinuationsByTurnId.set(claim.continuationTurnId, retired);
+      runtime.state.terminalTurnIds.add(claim.continuationTurnId);
+      if (runtime.state.activeTurnId === claim.continuationTurnId) {
+        runtime.state.activeTurnId = undefined;
+        runtime.activeTurnContext = undefined;
+        if (scheduleKnownInterrupt) {
+          this.#scheduleRetiredYieldInterrupt(
+            runtime,
+            retired,
+            claim.continuationTurnId,
+            runtime.hostGeneration
+          );
+        }
+      }
+    }
+    return retired;
+  }
+
+  #bindRetiredYieldTurn(
+    runtime: SessionRuntime,
+    claim: YieldContinuationClaim,
+    turnId: string,
+    hostGeneration: number
+  ): void {
+    const retired = claim.retired ?? this.#retireYieldContinuation(runtime, claim, true);
+    if (retired === undefined) return;
+    retired.turnIds.add(turnId);
+    runtime.retiredYieldContinuationsByTurnId.set(turnId, retired);
+    runtime.state.terminalTurnIds.add(turnId);
+    if (runtime.state.activeTurnId === turnId) {
+      runtime.state.activeTurnId = undefined;
+      runtime.activeTurnContext = undefined;
+    }
+    this.#scheduleRetiredYieldInterrupt(runtime, retired, turnId, hostGeneration);
+  }
+
+  #scheduleRetiredYieldInterrupt(
+    runtime: SessionRuntime,
+    retired: RetiredYieldContinuation,
+    turnId: string,
+    hostGeneration: number
+  ): Promise<void> {
+    const existing = retired.interruptFlights.get(turnId);
+    if (existing !== undefined) return existing;
+    const flight = Promise.resolve().then(async () => {
+      if (!this.#isRuntimeCurrent(runtime, hostGeneration)) return;
+      const response = await runtime.host.request("turn/interrupt", {
+        threadId: runtime.threadId,
+        turnId
+      }, {
+        mutation: true,
+        signal: runtime.dispatchLifetime.signal,
+        beforeDispatch: () => {
+          if (!this.#isRuntimeCurrent(runtime, hostGeneration)) throw yieldContinuationCancelled();
+        }
+      });
+      if (response.hostGeneration !== hostGeneration) throw yieldContinuationCancelled();
+    });
+    retired.interruptFlights.set(turnId, flight);
+    void flight.catch(() => undefined);
+    return flight;
+  }
+
+  #cancelYieldContinuation(
+    runtime: SessionRuntime,
+    scheduleKnownInterrupt = true
+  ): YieldContinuationClaim | undefined {
+    const claim = runtime.yieldContinuation;
+    if (claim === undefined) return undefined;
+    claimYieldProductTerminal(runtime, claim);
+    this.#retireYieldContinuation(runtime, claim, claim.terminalClaimed, scheduleKnownInterrupt);
+    runtime.yieldContinuation = undefined;
+    claim.state = "cancelled";
+    claim.deferredPlan = undefined;
+    claim.abort?.abort();
+    claim.abort = undefined;
+    runtime.yieldedExecCellsByTurnId.clear();
+    if (claim.continuationTurnId !== undefined) {
+      runtime.planTurnIds.delete(claim.continuationTurnId);
+      runtime.planTextByTurn.delete(claim.continuationTurnId);
+      runtime.planContextByTurn.delete(claim.continuationTurnId);
+    }
+    return claim;
+  }
+
   async #releaseRuntimeSubscription(runtime: SessionRuntime, unsubscribe: boolean): Promise<void> {
+    this.#cancelYieldContinuation(runtime);
     this.#releaseManagedOperation(runtime);
     runtime.managedRoute?.dispose();
     runtime.smartRoute?.dispose();
@@ -4126,7 +4659,12 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     }
   }
 
-  async #reconcileClientMessage(runtime: SessionRuntime, context: AdapterContext, clientId: string, expectedTurnId?: string): Promise<boolean> {
+  async #reconcileClientMessage(
+    runtime: SessionRuntime,
+    context: AdapterContext,
+    clientId: string,
+    expectedTurnId?: string
+  ): Promise<NativeTurn | undefined> {
     try {
       const history = await this.#readCompleteHistory(runtime, context);
       history.assertCurrent();
@@ -4135,21 +4673,55 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
         for (const item of turn.items) {
           if (item.type === "userMessage" && item["clientId"] === clientId) {
             history.assertCurrent();
-            if (expectedTurnId === undefined
-              && (runtime.state.activeTurnId === undefined || runtime.state.activeTurnId === turn.id)) {
-              const tail = history.thread.turns.at(-1);
-              runtime.state.activeTurnId = tail?.status === "inProgress" && !runtime.state.terminalTurnIds.has(tail.id)
-                ? tail.id
-                : undefined;
+            if (expectedTurnId === undefined) {
+              if (turn.status === "inProgress" && !runtime.state.terminalTurnIds.has(turn.id)
+                && (runtime.state.activeTurnId === undefined || runtime.state.activeTurnId === turn.id)) {
+                runtime.state.activeTurnId = turn.id;
+              } else if (runtime.state.activeTurnId === turn.id) {
+                runtime.state.activeTurnId = undefined;
+              }
             }
-            return true;
+            return turn;
           }
         }
       }
-      return false;
+      return undefined;
     } catch {
-      return false;
+      return undefined;
     }
+  }
+
+  async #settleReconciledYieldTurn(
+    runtime: SessionRuntime,
+    claim: YieldContinuationClaim,
+    turn: NativeTurn,
+    hostGeneration: number
+  ): Promise<void> {
+    if (runtime.yieldContinuation !== claim || claim.continuationTurnId !== turn.id) return;
+    const params: JsonObject = { threadId: runtime.threadId, turn: turn as unknown as JsonValue };
+    observeYieldedExecNotification(runtime, "turn/completed", params);
+    const completedPlan = runtime.runtimePolicy === "standard"
+      ? observePlanReviewNotification(runtime, "turn/completed", params)
+      : undefined;
+    const translatedEvents = this.#translator.translate("turn/completed", params, runtime.state);
+    const resolution = resolveYieldTurnCompletion(runtime, params, translatedEvents, completedPlan);
+    for (const event of resolution.events) {
+      if (!this.#matchesCallbackFence(runtime, hostGeneration)) return;
+      await claim.context.emit(event, {
+        namespace: "codex.app_server",
+        fields: { method: "turn/completed", reconciled: true }
+      });
+    }
+    if (resolution.failure !== undefined) {
+      await this.#emitYieldContinuationFailure(runtime, resolution.failure, hostGeneration);
+    }
+    if (resolution.plan !== undefined) {
+      this.#schedulePlanReview(runtime, resolution.plan, resolution.plan.context, hostGeneration);
+    }
+    if (resolution.startClaim !== undefined) {
+      this.#scheduleYieldContinuation(runtime, resolution.startClaim, hostGeneration);
+    }
+    if (resolution.logicalTerminal) this.#maybeReleaseManagedOperation(runtime);
   }
 
   #beginCompactionWait(runtime: SessionRuntime): Promise<void> {
@@ -4341,9 +4913,21 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
   async #retireNativeAuthenticationRuntime(runtime: SessionRuntime): Promise<void> {
     if (runtime.closed || this.#sessions.get(runtime.sessionId) !== runtime) return;
     const activeTurnId = runtime.state.activeTurnId;
-    const revokedTurnFailure = activeTurnId === undefined
-      ? undefined
-      : nativeAuthenticationRevokedTurnFailure();
+    const yieldClaim = runtime.yieldContinuation;
+    if (activeTurnId === undefined && (yieldClaim?.state === "starting"
+      || yieldClaim?.state === "active"
+      || (yieldClaim === undefined && runtime.yieldContinuationStartFlight !== undefined))) {
+      throw adapterError({
+        code: "CODEX_AUTH_RUNTIME_RETIREMENT_UNKNOWN",
+        message: "The credential-bearing Codex runtime may own a continuation turn without a confirmed native identity.",
+        phase: "shutdown",
+        retryable: true,
+        stateMayHaveChanged: true,
+        recovery: "Keep the Provider fenced and inspect the exact native thread before retrying sign-out."
+      });
+    }
+    const ownedProductWork = runtimeHasProductWork(runtime);
+    const revokedTurnFailure = ownedProductWork ? nativeAuthenticationRevokedTurnFailure() : undefined;
     if (activeTurnId !== undefined) {
       try {
         const response = await runtime.host.request("turn/interrupt", {
@@ -4383,6 +4967,9 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       });
     }
     let terminalContext: AdapterContext | undefined;
+    const ownsRootTerminal = yieldClaim === undefined
+      ? runtime.yieldTerminalOwner === undefined
+      : claimYieldProductTerminal(runtime, yieldClaim);
     if (activeTurnId !== undefined
       && runtime.state.activeTurnId === activeTurnId
       && !runtime.state.terminalTurnIds.has(activeTurnId)) {
@@ -4390,8 +4977,12 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       // late native turn/completed notification cannot publish a second one.
       runtime.state.terminalTurnIds.add(activeTurnId);
       runtime.state.activeTurnId = undefined;
-      terminalContext = runtime.activeTurnContext ?? runtime.context;
+      terminalContext = yieldClaim?.context ?? runtime.activeTurnContext ?? runtime.context;
+      runtime.activeTurnContext = undefined;
+    } else if (yieldClaim !== undefined && yieldClaim.state === "awaiting") {
+      terminalContext = yieldClaim.context;
     }
+    if (yieldClaim !== undefined) this.#cancelYieldContinuation(runtime);
     runtime.dispatchLifetime.abort();
     await this.#emitNativeTaskPayloads(
       runtime,
@@ -4404,7 +4995,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       false,
       false
     ).catch(() => undefined);
-    if (terminalContext !== undefined && revokedTurnFailure !== undefined) {
+    if (ownsRootTerminal && terminalContext !== undefined && revokedTurnFailure !== undefined) {
       await terminalContext.emit({
         type: "error",
         error: revokedTurnFailure,
@@ -4743,13 +5334,13 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     if (runtime.mcpPending) return allowPending;
     if (runtime.mcp === undefined) return true;
     if (!runtime.remote && runtime.mcp.routes.length === 0) {
-      return runtime.state.activeTurnId !== undefined || runtime.nativeTasks.hasActiveTasks();
+      return runtimeHasProductWork(runtime) || runtime.nativeTasks.hasActiveTasks();
     }
     try {
       runtime.mcp.assertCurrent();
       return true;
     } catch {
-      return runtime.state.activeTurnId !== undefined || runtime.nativeTasks.hasActiveTasks();
+      return runtimeHasProductWork(runtime) || runtime.nativeTasks.hasActiveTasks();
     }
   }
 
@@ -5160,6 +5751,56 @@ function managedRouteUnavailable(stateMayHaveChanged = false): JokoError {
     phase: "dispatch", retryable: false, stateMayHaveChanged,
     recovery: "Keep the input, refresh the task, and explicitly select an available model before sending again."
   });
+}
+
+function yieldContinuationCancelled(): JokoError {
+  return adapterError({
+    code: "CODEX_YIELD_CONTINUATION_CANCELLED",
+    message: "The bounded Codex execution-result continuation no longer owns this Session.",
+    phase: "dispatch",
+    retryable: false,
+    stateMayHaveChanged: false,
+    recovery: "Keep the current Session state; do not replay the original command."
+  });
+}
+
+function yieldContinuationBusy(): JokoError {
+  return adapterError({
+    code: "CODEX_YIELD_CONTINUATION_ACTIVE",
+    message: "This Session is still retrieving the result of an existing execution cell.",
+    phase: "dispatch",
+    retryable: true,
+    stateMayHaveChanged: false,
+    recovery: "Wait for the existing execution-result continuation to finish, or stop it before sending different work."
+  });
+}
+
+function yieldContinuationStopUnknown(): JokoError {
+  return adapterError({
+    code: "CODEX_YIELD_CONTINUATION_STOP_UNKNOWN",
+    message: "Codex could not prove that the execution-result continuation stopped.",
+    phase: "shutdown",
+    retryable: false,
+    stateMayHaveChanged: true,
+    recovery: "Refresh the native thread and inspect the existing execution result before sending more work."
+  });
+}
+
+function reservedYieldContinuationClientId(): JokoError {
+  return adapterError({
+    code: "CODEX_OPERATION_ID_RESERVED",
+    message: "The operation identity is reserved for adapter-owned continuation work.",
+    phase: "dispatch",
+    retryable: false,
+    stateMayHaveChanged: false,
+    recovery: "Dispatch the input through the durable Joko Queue with a new public operation identity."
+  });
+}
+
+function isUnknownYieldContinuationStart(error: unknown): boolean {
+  return error instanceof JokoError
+    && (error.publicError.code === "CODEX_DISPATCH_UNKNOWN"
+      || error.publicError.stateMayHaveChanged === true);
 }
 
 export function createCodexAdapter(options: CodexAdapterOptions): CodexBackendAdapter {
@@ -6331,6 +6972,223 @@ function threadIdFromParams(params: JsonValue): string | undefined {
   return typeof nested === "string" && isValidNativeThreadId(nested) ? nested : undefined;
 }
 
+function observeYieldedExecNotification(runtime: SessionRuntime, method: string, params: JsonValue): void {
+  const turnId = turnIdFromParams(params);
+  if (turnId === undefined) return;
+  const record = isJsonObject(params) ? params : undefined;
+  if (method === "item/updated" || method === "item/completed") {
+    rememberYieldedExecItem(runtime, turnId, record?.["item"], method === "item/updated" ? "updated" : "completed");
+    return;
+  }
+  if (method !== "turn/completed") return;
+  const turn = isJsonObject(record?.["turn"]) ? record["turn"] : undefined;
+  if (!Array.isArray(turn?.["items"])) return;
+  for (const item of turn["items"]) rememberYieldedExecItem(runtime, turnId, item, "completed");
+}
+
+function isAnonymousYieldHelperCompletion(method: string, params: JsonValue): boolean {
+  if (method !== "item/completed" || !isJsonObject(params) || !isJsonObject(params["item"])) return false;
+  const item = params["item"];
+  if (yieldItemLedgerKey(item).length > 0) return false;
+  return extractYieldedExecCellsFromCodexItem(item).length > 0
+    || extractAliveYieldCellsFromCodexItem(item).length > 0
+    || extractSettledYieldCellIdsFromCodexItem(item).length > 0;
+}
+
+function rememberYieldedExecItem(
+  runtime: SessionRuntime,
+  turnId: string,
+  item: unknown,
+  phase: "updated" | "completed"
+): void {
+  const record = isJsonObject(item) ? item : undefined;
+  const itemId = yieldItemLedgerKey(record);
+  const cells = dedupeYieldedExecCells([
+    ...extractYieldedExecCellsFromCodexItem(item),
+    ...extractAliveYieldCellsFromCodexItem(item)
+  ]);
+  const existing = runtime.yieldedExecCellsByTurnId.get(turnId) ?? new Map<string, YieldedExecCell[]>();
+  if (cells.length === 0) {
+    if (phase === "completed" && itemId.length > 0) existing.delete(itemId);
+  } else if (itemId.length > 0) {
+    existing.set(itemId, cells);
+  } else if (phase === "completed") {
+    existing.set("", dedupeYieldedExecCells([...(existing.get("") ?? []), ...cells]));
+  }
+  if (existing.size === 0) runtime.yieldedExecCellsByTurnId.delete(turnId);
+  else runtime.yieldedExecCellsByTurnId.set(turnId, existing);
+
+  const settledIds = extractSettledYieldCellIdsFromCodexItem(item);
+  if (settledIds.length === 0) return;
+  for (const [key, remembered] of [...existing.entries()]) {
+    const remaining = remembered.filter((cell) => !settledIds.includes(cell.cellId));
+    if (remaining.length === 0) existing.delete(key);
+    else existing.set(key, remaining);
+  }
+  if (existing.size === 0) runtime.yieldedExecCellsByTurnId.delete(turnId);
+  const claim = runtime.yieldContinuation;
+  if (claim !== undefined) {
+    for (const cellId of settledIds) claim.settledCellIds.add(cellId);
+  }
+}
+
+function yieldItemLedgerKey(record: JsonObject | undefined): string {
+  if (record === undefined) return "";
+  for (const key of ["id", "call_id", "callId"] as const) {
+    const value = record[key];
+    if (typeof value === "string" && value.trim().length > 0) return value;
+  }
+  return "";
+}
+
+function yieldedCellsForTurn(runtime: SessionRuntime, turnId: string): YieldedExecCell[] {
+  const byItem = runtime.yieldedExecCellsByTurnId.get(turnId);
+  return byItem === undefined ? [] : dedupeYieldedExecCells([...byItem.values()].flat());
+}
+
+function resolveYieldTurnCompletion(
+  runtime: SessionRuntime,
+  params: JsonValue,
+  events: readonly import("@joko/core").EventPayload[],
+  completedPlan: CompletedPlan | undefined
+): YieldTurnResolution {
+  const turnId = turnIdFromParams(params);
+  const record = isJsonObject(params) ? params : undefined;
+  const turn = isJsonObject(record?.["turn"]) ? record["turn"] : undefined;
+  if (turnId === undefined || turn === undefined || !events.some((event) => event.type === "done")) {
+    return { events, logicalTerminal: false };
+  }
+  const yieldedCells = yieldedCellsForTurn(runtime, turnId);
+  runtime.yieldedExecCellsByTurnId.delete(turnId);
+  const claim = runtime.yieldContinuation;
+  if (turn["status"] !== "completed") {
+    if (claim !== undefined && claim.continuationTurnId === turnId) {
+      claimYieldProductTerminal(runtime, claim);
+      claim.deferredPlan = undefined;
+      claim.state = "settled";
+      runtime.yieldContinuation = undefined;
+      claim.abort?.abort();
+    }
+    return { events, logicalTerminal: true };
+  }
+
+  if (claim !== undefined && claim.continuationTurnId === turnId
+    && (claim.state === "starting" || claim.state === "active")) {
+    const outstanding = dedupeYieldedExecCells([...claim.cells, ...yieldedCells])
+      .filter((cell) => !claim.settledCellIds.has(cell.cellId));
+    claim.abort = undefined;
+    claim.deferredPlan = completedPlan ?? claim.deferredPlan;
+    if (outstanding.length === 0) {
+      claimYieldProductTerminal(runtime, claim);
+      claim.state = "settled";
+      runtime.yieldContinuation = undefined;
+      return {
+        events,
+        logicalTerminal: true,
+        ...((completedPlan ?? claim.deferredPlan) === undefined
+          ? {}
+          : { plan: (completedPlan ?? claim.deferredPlan)! })
+      };
+    }
+    claim.cells = outstanding;
+    if (claim.stopRequested) {
+      return {
+        events: withoutSuccessfulDone(events),
+        logicalTerminal: false
+      };
+    }
+    if (yieldedCells.length === 0 || claim.attemptsStarted >= YIELD_CONTINUATION_MAX_ATTEMPTS) {
+      claim.state = "settled";
+      return {
+        events: withoutSuccessfulDone(events),
+        logicalTerminal: true,
+        failure: yieldedCells.length === 0 ? "no_progress" : "retry_exhausted"
+      };
+    }
+    claim.state = "awaiting";
+    claim.continuationTurnId = undefined;
+    claim.clientUserMessageId = undefined;
+    return {
+      events: withoutSuccessfulDone(events),
+      logicalTerminal: false,
+      startClaim: claim
+    };
+  }
+
+  if (claim === undefined && yieldedCells.length > 0) {
+    const next: YieldContinuationClaim = {
+      originTurnId: turnId,
+      context: runtime.activeTurnContext ?? runtime.context,
+      cells: yieldedCells,
+      settledCellIds: new Set(),
+      attemptsStarted: 0,
+      dispatchStarted: false,
+      stopRequested: false,
+      terminalClaimed: false,
+      state: "awaiting",
+      ...(completedPlan === undefined ? {} : { deferredPlan: completedPlan })
+    };
+    runtime.yieldTerminalOwner = undefined;
+    runtime.yieldContinuation = next;
+    return {
+      events: withoutSuccessfulDone(events),
+      logicalTerminal: false,
+      startClaim: next
+    };
+  }
+
+  return {
+    events,
+    logicalTerminal: true,
+    ...(completedPlan === undefined ? {} : { plan: completedPlan })
+  };
+}
+
+function withoutSuccessfulDone(
+  events: readonly import("@joko/core").EventPayload[]
+): readonly import("@joko/core").EventPayload[] {
+  return events.filter((event) => event.type !== "done" || event.outcome !== "completed");
+}
+
+function bindYieldContinuationTurn(
+  runtime: SessionRuntime,
+  claim: YieldContinuationClaim,
+  turnId: string
+): void {
+  if (runtime.yieldContinuation !== claim || claim.state === "cancelled" || claim.state === "settled") return;
+  if (claim.continuationTurnId !== undefined && claim.continuationTurnId !== turnId) return;
+  claim.continuationTurnId = turnId;
+  claim.state = "active";
+}
+
+function yieldContinuationClientUserMessageId(
+  runtime: SessionRuntime,
+  claim: YieldContinuationClaim
+): string {
+  const digest = createHash("sha256")
+    .update(runtime.sessionId).update("\0")
+    .update(String(runtime.sessionGeneration)).update("\0")
+    .update(runtime.threadId).update("\0")
+    .update(claim.context.operationId ?? "").update("\0")
+    .update(claim.originTurnId).update("\0")
+    .update(String(claim.attemptsStarted))
+    .digest("hex");
+  return `${YIELD_CONTINUATION_CLIENT_ID_PREFIX}${digest}:${claim.attemptsStarted}`;
+}
+
+function yieldContinuationClientIdFromNotification(params: JsonValue): string | undefined {
+  if (!isJsonObject(params)) return undefined;
+  const candidates: unknown[] = [params["item"]];
+  const turn = isJsonObject(params["turn"]) ? params["turn"] : undefined;
+  if (Array.isArray(turn?.["items"])) candidates.push(...turn["items"]);
+  for (const candidate of candidates) {
+    if (!isJsonObject(candidate) || candidate["type"] !== "userMessage") continue;
+    const clientId = candidate["clientId"];
+    if (isYieldContinuationClientId(clientId)) return clientId;
+  }
+  return undefined;
+}
+
 function bindPlanTurnIntent(
   runtime: SessionRuntime,
   turnId: string,
@@ -6484,7 +7342,7 @@ function stateFromRuntime(runtime: SessionRuntime, thread?: NativeThread): Nativ
     ...(thread?.name === null || (thread?.name === undefined && runtime.name === undefined)
       ? {}
       : { name: thread?.name ?? runtime.name }),
-    streaming: runtime.state.activeTurnId !== undefined || thread?.status?.["type"] === "active",
+    streaming: runtimeHasProductWork(runtime) || thread?.status?.["type"] === "active",
     compacting: false,
     pendingMessages: 0,
     ...(runtime.providerId === undefined ? {} : { providerId: runtime.providerId }),
@@ -6495,6 +7353,40 @@ function stateFromRuntime(runtime: SessionRuntime, thread?: NativeThread): Nativ
     planMode: runtime.planMode,
     ...(runtime.state.usage === undefined ? {} : { usage: runtime.state.usage })
   };
+}
+
+function runtimeHasProductWork(runtime: SessionRuntime): boolean {
+  return runtime.state.activeTurnId !== undefined
+    || runtime.yieldContinuation !== undefined
+    || runtime.yieldContinuationStartFlight !== undefined;
+}
+
+function claimYieldProductTerminal(runtime: SessionRuntime, claim: YieldContinuationClaim): boolean {
+  if (claim.terminalClaimed) return false;
+  const owner = runtime.yieldTerminalOwner;
+  if (owner !== undefined && owner !== claim && owner.terminalClaimed) return false;
+  claim.terminalClaimed = true;
+  runtime.yieldTerminalOwner = claim;
+  return true;
+}
+
+function assertRuntimeProductIdle(runtime: SessionRuntime): void {
+  if (!runtimeHasProductWork(runtime)) return;
+  assertYieldContinuationIdle(runtime);
+  throw adapterError({
+    code: "CODEX_SESSION_BUSY",
+    message: "This Session still owns active product work.",
+    phase: "dispatch",
+    retryable: true,
+    stateMayHaveChanged: false,
+    recovery: "Wait for the active work to finish or stop it before changing Session execution settings."
+  });
+}
+
+function assertYieldContinuationIdle(runtime: SessionRuntime): void {
+  if (runtime.yieldContinuation !== undefined || runtime.yieldContinuationStartFlight !== undefined) {
+    throw yieldContinuationBusy();
+  }
 }
 
 function stateFromThread(binding: NativeSessionBinding, thread: NativeThread): NativeSessionState {

@@ -4,7 +4,8 @@ import {
   DEFAULT_APPEARANCE_PREFERENCES,
   applyAppearanceTypography,
   clampWindowZoom,
-  normalizeAppearancePreferences
+  normalizeAppearancePreferences,
+  windowZoomAfterIntent
 } from "./appearance-settings.js";
 
 describe("appearance preferences", () => {
@@ -24,6 +25,9 @@ describe("appearance preferences", () => {
     });
     expect(normalizeAppearancePreferences(null)).toEqual(DEFAULT_APPEARANCE_PREFERENCES);
     expect(clampWindowZoom(Number.NaN)).toBe(1);
+    expect(windowZoomAfterIntent(1.2, "increase")).toBe(1.3);
+    expect(windowZoomAfterIntent(0.5, "decrease")).toBe(0.5);
+    expect(windowZoomAfterIntent(2.4, "reset")).toBe(1);
   });
 
   it("updates both root and detached-document body targets and removes empty overrides", () => {

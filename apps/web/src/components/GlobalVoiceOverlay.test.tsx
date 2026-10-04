@@ -5,6 +5,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { GlobalVoiceOverlay } from "./GlobalVoiceOverlay.js";
+import { translate } from "../i18n.js";
 import { TOOLTIP_DELAY_MS } from "./ui.js";
 
 let root: Root | undefined;
@@ -19,6 +20,7 @@ afterEach(async () => {
   root = undefined;
   document.body.replaceChildren();
   vi.useRealTimers();
+  Reflect.deleteProperty(window, "jokoVoiceOverlay");
   Reflect.deleteProperty(globalThis, "IS_REACT_ACT_ENVIRONMENT");
 });
 
@@ -50,6 +52,40 @@ describe("global voice overlay actions", () => {
     expect(document.querySelector('[role="tooltip"]')?.textContent).toBe("Cancel");
     await act(async () => cancel.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true })));
     expect(document.querySelector('[role="tooltip"]')).toBeNull();
+  });
+
+  it("adopts the concrete Main locale and rejects a stale initial read", async () => {
+    let resolveLocale!: (locale: "en" | "zh-CN" | "en-XA") => void;
+    const initialLocale = new Promise<"en" | "zh-CN" | "en-XA">((resolve) => { resolveLocale = resolve; });
+    let localeListener: ((locale: "en" | "zh-CN" | "en-XA") => void) | undefined;
+    const closeLocale = vi.fn();
+    Object.defineProperty(window, "jokoVoiceOverlay", {
+      configurable: true,
+      value: {
+        getStatus: vi.fn(async () => ({ state: "idle", generation: "0" } as const)),
+        onStatus: vi.fn(() => () => undefined),
+        getLocale: vi.fn(() => initialLocale),
+        onLocale: vi.fn((listener: typeof localeListener) => {
+          localeListener = listener;
+          return closeLocale;
+        }),
+        cancel: vi.fn(async () => undefined),
+        retry: vi.fn(async () => undefined)
+      } satisfies JokoVoiceOverlayApi
+    });
+    const container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    await act(async () => root?.render(<GlobalVoiceOverlay initialStatus={{ state: "error", generation: "1", errorKind: "service" }} />));
+
+    await act(async () => localeListener?.("zh-CN"));
+    expect(document.querySelector(`button[aria-label="${translate("zh-CN", "voice.global.cancel")}"]`)).not.toBeNull();
+    await act(async () => resolveLocale("en-XA"));
+    expect(document.querySelector(`button[aria-label="${translate("zh-CN", "voice.global.cancel")}"]`)).not.toBeNull();
+
+    await act(async () => root?.unmount());
+    root = undefined;
+    expect(closeLocale).toHaveBeenCalledOnce();
   });
 });
 
