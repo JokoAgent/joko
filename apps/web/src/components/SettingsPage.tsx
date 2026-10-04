@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { ArtifactDownloadButton } from "./ArtifactDownloadButton.js";
 import { UsageHistorySection } from "./UsageHistorySection.js";
 import { NativeCatalogAdoptionRecovery } from "./NativeCatalogAdoptionRecovery.js";
@@ -45,7 +45,7 @@ import {
   X
 } from "lucide-react";
 import type { AppController } from "../controller.js";
-import { LINK_OPEN_DEFAULTS, type LinkOpenKind, type LinkOpenPreference } from "../local-state.js";
+import { DEFAULT_UI_PREFERENCES, LINK_OPEN_DEFAULTS, type LinkOpenKind, type LinkOpenPreference } from "../local-state.js";
 import { currentAppShortcutPlatform } from "../app-shortcuts.js";
 import { composerVoiceShortcutsConflict } from "../composer-voice-shortcut-conflict.js";
 import { isConversationModel } from "../model-capabilities.js";
@@ -633,9 +633,31 @@ export function GeneralSettings({ controller, snapshot, runAction, onSuccess, sh
   const [powerBusy, setPowerBusy] = useState(false);
   const [activationClickBusy, setActivationClickBusy] = useState(false);
   const [error, setError] = useState<string>();
+  const controllerShortcutAction = controller.setComposerSendShortcut;
+  const shortcutOwner = useMemo(() => ({ action: controllerShortcutAction }), [controllerShortcutAction]);
+  const committedShortcutOwnerRef = useRef<typeof shortcutOwner | undefined>(undefined);
+  const shortcutFlightRef = useRef<typeof shortcutOwner | undefined>(undefined);
+  const [shortcutFeedback, setShortcutFeedback] = useState<{
+    readonly owner: typeof shortcutOwner;
+    readonly pending: boolean;
+    readonly preserveCustomized: boolean;
+    readonly error?: string;
+  }>({ owner: shortcutOwner, pending: false, preserveCustomized: false });
   const notificationSave = useSettingsSaveFeedback(onSuccess);
   const loadGenerationRef = useRef(0);
   const interactionLoadGenerationRef = useRef(0);
+  const shortcutPending = shortcutFeedback.owner === shortcutOwner && shortcutFeedback.pending;
+  const shortcutError = shortcutFeedback.owner === shortcutOwner ? shortcutFeedback.error : undefined;
+  const shortcutCustomized = controller.state.preferences.composerSendShortcut !== DEFAULT_UI_PREFERENCES.composerSendShortcut
+    || (shortcutPending && shortcutFeedback.preserveCustomized);
+
+  useLayoutEffect(() => {
+    committedShortcutOwnerRef.current = shortcutOwner;
+    return () => {
+      if (committedShortcutOwnerRef.current === shortcutOwner) committedShortcutOwnerRef.current = undefined;
+      if (shortcutFlightRef.current === shortcutOwner) shortcutFlightRef.current = undefined;
+    };
+  }, [shortcutOwner]);
 
   useEffect(() => {
     const generation = ++loadGenerationRef.current;
@@ -723,22 +745,59 @@ export function GeneralSettings({ controller, snapshot, runAction, onSuccess, sh
     }
   };
 
-  const changeComposerSendShortcut = (composerShortcut: "enter" | "modifier-enter"): void => {
+  const changeComposerSendShortcut = (
+    composerShortcut: "enter" | "modifier-enter",
+    reset = false
+  ): void => {
+    if (shortcutFlightRef.current === shortcutOwner) return;
     if (composerVoiceShortcutsConflict(
       composerShortcut,
       readVoiceInputPreferences().shortcut,
       currentAppShortcutPlatform()
     )) {
-      setError(t("settings.composerVoiceShortcutConflict"));
+      setShortcutFeedback((current) => ({
+        owner: shortcutOwner,
+        pending: current.owner === shortcutOwner && current.pending,
+        preserveCustomized: current.owner === shortcutOwner && current.preserveCustomized,
+        error: t("settings.composerVoiceShortcutConflict")
+      }));
       return;
     }
-    setError(undefined);
-    void controller.setComposerSendShortcut(composerShortcut);
+    const flight = shortcutOwner;
+    shortcutFlightRef.current = flight;
+    setShortcutFeedback({
+      owner: flight,
+      pending: true,
+      preserveCustomized: controller.state.preferences.composerSendShortcut !== DEFAULT_UI_PREFERENCES.composerSendShortcut
+    });
+    const current = (): boolean => committedShortcutOwnerRef.current === flight && shortcutFlightRef.current === flight;
+    void (async () => {
+      try {
+        await flight.action(composerShortcut);
+      } catch {
+        if (!current()) return;
+        shortcutFlightRef.current = undefined;
+        setShortcutFeedback({
+          owner: flight,
+          pending: false,
+          preserveCustomized: false,
+          error: t("settings.shortcuts.errors.saveFailed")
+        });
+        return;
+      }
+      if (!current()) return;
+      shortcutFlightRef.current = undefined;
+      setShortcutFeedback({ owner: flight, pending: false, preserveCustomized: false });
+      onSuccess(t(reset ? "settings.defaults.restored" : "settings.saved"));
+    })();
   };
 
   return <>
     {showHeading && <SettingsHeading title={t("settings.general")} body={t("settings.generalBody")} />}
     {notificationSave.error !== undefined && <ErrorBanner message={notificationSave.error} onClose={notificationSave.dismissError} />}
+    {shortcutError !== undefined && <ErrorBanner message={shortcutError} onClose={() => setShortcutFeedback((current) => current.owner === shortcutOwner
+      ? { ...current, error: undefined }
+      : current)} />}
     {error !== undefined && <ErrorBanner message={error} onClose={() => setError(undefined)} />}
     <section className="settings-card desktop-behavior-settings">
       <div className="setting-row">
@@ -782,11 +841,26 @@ export function GeneralSettings({ controller, snapshot, runAction, onSuccess, sh
           />
       </div>}
       <div className="setting-row">
-        <div><strong>{t("settings.sendShortcut")}</strong><span>{t("settings.sendShortcutBody")}</span></div>
-        <SelectControl value={controller.state.preferences.composerSendShortcut} onChange={(event) => changeComposerSendShortcut(event.target.value as "enter" | "modifier-enter")} aria-label={t("settings.sendShortcut")}>
-          <option value="enter">{t("settings.sendShortcutEnter")}</option>
-          <option value="modifier-enter">{t("settings.sendShortcutModifierEnter")}</option>
-        </SelectControl>
+        <div><strong>{t("settings.sendShortcut")}</strong><span>{t("settings.sendShortcutBody")}</span>{shortcutPending && <span role="status">{t("common.working")}</span>}</div>
+        <div className="composer-send-shortcut-actions">
+          <DefaultOverrideControls
+            customized={shortcutCustomized}
+            disabled={shortcutPending}
+            busy={shortcutPending}
+            t={t}
+            onReset={() => changeComposerSendShortcut(DEFAULT_UI_PREFERENCES.composerSendShortcut, true)}
+          />
+          <SelectControl
+            value={controller.state.preferences.composerSendShortcut}
+            disabled={shortcutPending}
+            aria-busy={shortcutPending}
+            onChange={(event) => changeComposerSendShortcut(event.target.value as "enter" | "modifier-enter")}
+            aria-label={t("settings.sendShortcut")}
+          >
+            <option value="enter">{t("settings.sendShortcutEnter")}</option>
+            <option value="modifier-enter">{t("settings.sendShortcutModifierEnter")}</option>
+          </SelectControl>
+        </div>
       </div>
     </section>
     <RuntimeGovernanceSettings controller={controller} snapshot={snapshot} runAction={runAction} t={t} />
@@ -2464,14 +2538,15 @@ function LinkOpenSettingRow({ kind, controller, runAction, t }: {
   </div>;
 }
 
-function DefaultOverrideControls({ customized, disabled, t, onReset }: {
+function DefaultOverrideControls({ customized, disabled, busy, t, onReset }: {
   readonly customized: boolean;
   readonly disabled?: boolean;
+  readonly busy?: boolean;
   readonly t: Translator;
   readonly onReset: () => void;
 }): JSX.Element | null {
   if (!customized) return null;
-  return <div className="personalization-default-controls"><span>{t("settings.defaults.customized")}</span><IconButton label={t("settings.defaults.restore")} disabled={disabled} onClick={onReset}><RotateCcw aria-hidden="true" /></IconButton></div>;
+  return <div className="personalization-default-controls"><span>{t("settings.defaults.customized")}</span><IconButton label={t("settings.defaults.restore")} disabled={disabled} aria-busy={busy} onClick={onReset}><RotateCcw aria-hidden="true" /></IconButton></div>;
 }
 
 /** Emit success toasts only for persisted or explicitly reset settings. */

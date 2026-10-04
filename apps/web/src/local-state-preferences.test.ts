@@ -72,6 +72,30 @@ describe("cross-window durable UI preference mutations", () => {
     expect(Object.hasOwn(restored ?? {}, "automaticConnectionTarget")).toBe(false);
   });
 
+  it("stores only a customized composer send shortcut and rehydrates the omitted default", async () => {
+    const database = memoryPreferenceDatabase();
+    const state = memoryLocalState(database.database);
+    await state.savePreferences({
+      ...DEFAULT_UI_PREFERENCES,
+      theme: "light",
+      composerSendShortcut: "modifier-enter"
+    });
+
+    expect(database.readUiRecord()).toMatchObject({
+      theme: "light",
+      composerSendShortcut: "modifier-enter"
+    });
+
+    await state.mutatePreferences((current) => ({ ...current, composerSendShortcut: "enter" }));
+
+    expect(database.readUiRecord()).toMatchObject({ theme: "light" });
+    expect(database.readUiRecord()).not.toHaveProperty("composerSendShortcut");
+    await expect(state.readPreferences()).resolves.toMatchObject({
+      theme: "light",
+      composerSendShortcut: "enter"
+    });
+  });
+
   it("leaves the previous durable value intact when the readwrite transaction aborts", async () => {
     const database = memoryPreferenceDatabase();
     const state = memoryLocalState(database.database);
@@ -113,6 +137,7 @@ function memoryLocalState(database: IDBDatabase): LocalState {
 function memoryPreferenceDatabase(): {
   readonly database: IDBDatabase;
   readonly failNextPut: () => void;
+  readonly readUiRecord: () => unknown;
 } {
   const records = new Map<IDBValidKey, unknown>();
   let rejectNextPut = false;
@@ -171,6 +196,7 @@ function memoryPreferenceDatabase(): {
   } as unknown as IDBDatabase;
   return {
     database,
-    failNextPut: () => { rejectNextPut = true; }
+    failNextPut: () => { rejectNextPut = true; },
+    readUiRecord: () => records.get("ui")
   };
 }
