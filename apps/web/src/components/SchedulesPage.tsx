@@ -25,6 +25,7 @@ import {
   consumeUsageLimitScheduleIntent
 } from "../usage-limit-recovery.js";
 import { deleteScheduleWithGeneratedSessions, prepareScheduleDeletion, type GeneratedSessionDisposition, type ScheduleDeletionPreview, type SessionRemovalPreparer } from "../schedule-deletion.js";
+import { createScheduleRunNowDispatchTracker } from "../schedule-run-now-dispatch.js";
 import { ScheduleDeleteDialog } from "./ScheduleDeleteDialog.js";
 import { ScheduleRunHistoryCard } from "./ScheduleRunHistoryCard.js";
 import { groupScheduleHistoryRuns } from "./schedule-history-grouping.js";
@@ -79,9 +80,13 @@ export function SchedulesPage({ controller, schedules, sessions, targets, models
   const [collapsedGroups, setCollapsedGroups] = useState<ReadonlySet<string>>(() => readCollapsedGroups());
   const [listWidth, setListWidth] = useState(() => readScheduleListWidth());
   const [resizeOrigin, setResizeOrigin] = useState<{ readonly clientX: number; readonly width: number }>();
-  const pendingRunNowRef = useRef<Set<string>>(new Set());
   const [pendingRunNowIds, setPendingRunNowIds] = useState<ReadonlySet<string>>(() => new Set());
-  const [runtime, setRuntime] = useState<SchedulerRuntimeView>();
+  const [runNowDispatchTracker] = useState(() => createScheduleRunNowDispatchTracker(setPendingRunNowIds));
+  const [runtimeOwner, setRuntimeOwner] = useState<{
+    readonly controller: AppController;
+    readonly snapshot: SchedulerRuntimeView;
+  }>();
+  const runtime = runtimeOwner?.controller === controller ? runtimeOwner.snapshot : undefined;
   const [projectNotice, setProjectNotice] = useState<ProjectAutomationNotice>();
   const projectNoticeSequenceRef = useRef(0);
   const [removeProjectSchedule, setRemoveProjectSchedule] = useState<ScheduleView>();
@@ -123,7 +128,10 @@ export function SchedulesPage({ controller, schedules, sessions, targets, models
     const poll = (): void => {
       request = new AbortController();
       void controller.getSchedulerRuntime(request.signal).then((snapshot) => {
-        if (!disposed) setRuntime(snapshot);
+        if (!disposed) {
+          runNowDispatchTracker.observe(snapshot);
+          setRuntimeOwner({ controller, snapshot });
+        }
       }).catch(() => {
         // A transient poll failure must not erase the last authoritative
         // snapshot and make capacity or row status briefly look idle.
@@ -137,7 +145,8 @@ export function SchedulesPage({ controller, schedules, sessions, targets, models
       request?.abort();
       if (timer !== undefined) window.clearTimeout(timer);
     };
-  }, [controller]);
+  }, [controller, runNowDispatchTracker]);
+  useLayoutEffect(() => () => runNowDispatchTracker.retire(), [controller, runNowDispatchTracker]);
   useEffect(() => {
     if (resizeOrigin === undefined) return;
     const move = (event: PointerEvent): void => setListWidth(clampScheduleListWidth(resizeOrigin.width + event.clientX - resizeOrigin.clientX));
@@ -169,20 +178,13 @@ export function SchedulesPage({ controller, schedules, sessions, targets, models
   };
 
   const runScheduleOnce = useCallback((scheduleId: string): void => {
-    if (pendingRunNowRef.current.has(scheduleId)) return;
-    pendingRunNowRef.current = new Set(pendingRunNowRef.current).add(scheduleId);
-    setPendingRunNowIds(pendingRunNowRef.current);
-    runAction(`schedule-run:${scheduleId}`, async () => {
-      try {
-        await controller.runSchedule(scheduleId);
-      } finally {
-        const next = new Set(pendingRunNowRef.current);
-        next.delete(scheduleId);
-        pendingRunNowRef.current = next;
-        setPendingRunNowIds(next);
-      }
-    });
-  }, [controller, runAction]);
+    const attempt = runNowDispatchTracker.begin(scheduleId, runtime);
+    if (attempt === undefined) return;
+    runAction(
+      `schedule-run:${scheduleId}`,
+      () => runNowDispatchTracker.attach(attempt, () => controller.runSchedule(scheduleId))
+    );
+  }, [controller, runAction, runNowDispatchTracker, runtime]);
 
   const selectSchedule = useCallback((schedule: ScheduleView): void => {
     setSelectedId(schedule.id);
