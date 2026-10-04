@@ -150,6 +150,7 @@ const DESKTOP_CHANNELS = {
   nativeTaskStatusAction: "joko:native-task-status:action",
   keepAwakeGet: "joko:power:keep-awake:get",
   keepAwakeSet: "joko:power:keep-awake:set",
+  keepAwakeChanged: "joko:power:keep-awake:changed",
   providerModelRefreshLifecycle: "joko:provider-models:refresh-lifecycle",
   microphoneGetPermission: "joko:microphone:permission:get",
   microphoneOpenSettings: "joko:microphone:settings:open",
@@ -579,6 +580,21 @@ const desktopApi = Object.freeze({
     setKeepAwake: (enabled: boolean): Promise<DesktopKeepAwakeSettings> => {
       if (typeof enabled !== "boolean") return Promise.reject(new TypeError("Desktop keep-awake state must be boolean."));
       return ipcRenderer.invoke(DESKTOP_CHANNELS.keepAwakeSet, enabled).then(parseDesktopKeepAwakeSettings);
+    },
+    onKeepAwakeChanged: (listener: (settings: DesktopKeepAwakeSettings) => void): (() => void) => {
+      if (typeof listener !== "function") throw new TypeError("Desktop keep-awake listener must be a function.");
+      const wrapped = (_event: IpcRendererEvent, value: unknown): void => {
+        let settings: DesktopKeepAwakeSettings;
+        try {
+          settings = parseDesktopKeepAwakeSettings(value);
+        } catch {
+          // Ignore malformed host messages; getKeepAwake remains authoritative.
+          return;
+        }
+        listener(settings);
+      };
+      ipcRenderer.on(DESKTOP_CHANNELS.keepAwakeChanged, wrapped);
+      return () => ipcRenderer.removeListener(DESKTOP_CHANNELS.keepAwakeChanged, wrapped);
     }
   }),
   modelCatalog: Object.freeze({

@@ -67,6 +67,7 @@ export const DESKTOP_CHANNELS = {
   nativeTaskStatusAction: "joko:native-task-status:action",
   keepAwakeGet: "joko:power:keep-awake:get",
   keepAwakeSet: "joko:power:keep-awake:set",
+  keepAwakeChanged: "joko:power:keep-awake:changed",
   providerModelRefreshLifecycle: "joko:provider-models:refresh-lifecycle",
   microphoneGetPermission: "joko:microphone:permission:get",
   microphoneOpenSettings: "joko:microphone:settings:open",

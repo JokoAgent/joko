@@ -2,11 +2,16 @@ import { readFileSync } from "node:fs";
 import { runInNewContext } from "node:vm";
 import { ModuleKind, ScriptTarget, transpileModule } from "typescript";
 import { describe, expect, it, vi } from "vitest";
+import { DESKTOP_CHANNELS } from "../src/channels.js";
 
 interface DeepLinkApi {
   takePending(): Promise<unknown>;
   acknowledge(value: unknown): Promise<boolean>;
   onNavigate(listener: (delivery: unknown) => void): () => void;
+}
+
+interface KeepAwakeApi {
+  onKeepAwakeChanged(listener: (settings: { readonly enabled: boolean }) => void): () => void;
 }
 
 const MAIN_DOCUMENT_CLAIM = "00000000-0000-4000-8000-000000000001";
@@ -28,6 +33,7 @@ function loadPreload(
 ): {
   readonly exposed: Readonly<Record<string, unknown>>;
   readonly deepLinks: DeepLinkApi;
+  readonly power: KeepAwakeApi;
   readonly invoke: ReturnType<typeof vi.fn>;
   readonly synchronousChannels: readonly string[];
   readonly listeners: Map<string, (...parameters: unknown[]) => void>;
@@ -95,10 +101,14 @@ function loadPreload(
     ArrayBuffer,
     structuredClone
   });
-  const desktop = exposed as Readonly<Record<string, unknown>> & { readonly deepLinks: DeepLinkApi };
+  const desktop = exposed as Readonly<Record<string, unknown>> & {
+    readonly deepLinks: DeepLinkApi;
+    readonly power: KeepAwakeApi;
+  };
   return {
     exposed: desktop,
     deepLinks: desktop.deepLinks,
+    power: desktop.power,
     invoke,
     synchronousChannels,
     listeners,
@@ -159,5 +169,38 @@ describe("main application preload deep-link occurrence fence", () => {
       documentOccurrence: "document-current",
       deliveryOccurrence: 2
     })).resolves.toBe(true);
+  });
+});
+
+describe("main application preload keep-awake observer", () => {
+  it("delivers only exact keep-awake settings and removes the wrapped listener", () => {
+    const loaded = loadPreload("document-current");
+    const listener = vi.fn();
+    const unsubscribe = loaded.power.onKeepAwakeChanged(listener);
+
+    expect(DESKTOP_CHANNELS.keepAwakeChanged).toBe("joko:power:keep-awake:changed");
+    const wrapped = loaded.listeners.get(DESKTOP_CHANNELS.keepAwakeChanged);
+    expect(wrapped).toBeTypeOf("function");
+
+    wrapped?.({}, { enabled: true });
+    expect(listener).toHaveBeenCalledExactlyOnceWith({ enabled: true });
+
+    wrapped?.({}, { enabled: "true" });
+    wrapped?.({}, { enabled: false, unexpected: true });
+    wrapped?.({}, null);
+    expect(listener).toHaveBeenCalledTimes(1);
+
+    unsubscribe();
+    expect(loaded.listeners.has(DESKTOP_CHANNELS.keepAwakeChanged)).toBe(false);
+    loaded.listeners.get(DESKTOP_CHANNELS.keepAwakeChanged)?.({}, { enabled: false });
+    expect(listener).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects a non-function keep-awake listener before registering IPC", () => {
+    const loaded = loadPreload("document-current");
+    const subscribe = loaded.power.onKeepAwakeChanged as unknown as (listener: unknown) => () => void;
+
+    expect(() => subscribe(null)).toThrow(/listener must be a function/u);
+    expect(loaded.listeners.has(DESKTOP_CHANNELS.keepAwakeChanged)).toBe(false);
   });
 });

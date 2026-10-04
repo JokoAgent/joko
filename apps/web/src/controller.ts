@@ -74,6 +74,10 @@ import {
 } from "./appearance-settings.js";
 import { subscribeAppearancePreferencesChange, withAppearanceProjection } from "./appearance-preference-sync.js";
 import {
+  subscribeAppShortcutPreferencesChange,
+  withAppShortcutProjection
+} from "./app-shortcut-preference-sync.js";
+import {
   withSidebarDisplayPreferences,
   withSidebarOwnerLayout,
   type SidebarDisplayPreferences,
@@ -294,6 +298,8 @@ export function useAppController(): AppController {
   const preferenceOperationTailRef = useRef<Promise<void>>(Promise.resolve());
   const appearancePreferenceSyncOwnerRef = useRef(0);
   const appearancePreferenceHintRevisionRef = useRef(0);
+  const appShortcutPreferenceSyncOwnerRef = useRef(0);
+  const appShortcutPreferenceHintRevisionRef = useRef(0);
   const gatewayRef = useRef<OrchestratorGateway | undefined>(undefined);
   const gatewayGenerationRef = useRef(0);
   const htmlPreviewsRef = useRef(new Map<string, {
@@ -357,6 +363,27 @@ export function useAppController(): AppController {
       setWindowZoomApplicationRevision((revision) => revision + 1);
     }).catch(() => undefined);
   }, [enqueuePreferenceOperation]);
+  const enqueueAppShortcutPreferenceRefresh = useCallback((owner: number, requestRevision: number): void => {
+    void enqueuePreferenceOperation(async () => {
+      if (appShortcutPreferenceSyncOwnerRef.current !== owner
+        || appShortcutPreferenceHintRevisionRef.current !== requestRevision) return;
+      const local = localRef.current;
+      if (local === undefined) return;
+      const durable = (await local.readPreferences()) ?? DEFAULT_UI_PREFERENCES;
+      if (appShortcutPreferenceSyncOwnerRef.current !== owner
+        || appShortcutPreferenceHintRevisionRef.current !== requestRevision) return;
+      const previous = preferencesRef.current;
+      const next = withAppShortcutProjection(previous, durable);
+      if (next === previous) return;
+      preferencesRef.current = next;
+      setState((current) => {
+        const projected = current.preferences === previous
+          ? next
+          : withAppShortcutProjection(current.preferences, durable);
+        return projected === current.preferences ? current : { ...current, preferences: projected };
+      });
+    }).catch(() => undefined);
+  }, [enqueuePreferenceOperation]);
 
   useEffect(() => {
     const routeSessionId = extensionUiRouteSessionId(state.route);
@@ -368,13 +395,21 @@ export function useAppController(): AppController {
   useEffect(() => {
     let cancelled = false;
     let appearanceSyncLive = false;
+    let appShortcutSyncLive = false;
     const appearanceSyncOwner = ++appearancePreferenceSyncOwnerRef.current;
     appearancePreferenceHintRevisionRef.current = 0;
+    const appShortcutSyncOwner = ++appShortcutPreferenceSyncOwnerRef.current;
+    appShortcutPreferenceHintRevisionRef.current = 0;
     const closeAppearancePreferenceSync = subscribeAppearancePreferencesChange(() => {
       const requestRevision = ++appearancePreferenceHintRevisionRef.current;
       if (appearanceSyncLive) enqueueAppearancePreferenceRefresh(appearanceSyncOwner, requestRevision);
     });
+    const closeAppShortcutPreferenceSync = subscribeAppShortcutPreferencesChange(() => {
+      const requestRevision = ++appShortcutPreferenceHintRevisionRef.current;
+      if (appShortcutSyncLive) enqueueAppShortcutPreferenceRefresh(appShortcutSyncOwner, requestRevision);
+    });
     const initialAppearanceRevision = appearancePreferenceHintRevisionRef.current;
+    const initialAppShortcutRevision = appShortcutPreferenceHintRevisionRef.current;
     void LocalState.open().then(async (local) => {
       const [persistedProfiles, machineCaches, preferences, managedStatus, automaticConnectionAvailable] = await Promise.all([
         local.listProfiles(),
@@ -424,10 +459,18 @@ export function useAppController(): AppController {
         && automaticProfile === undefined
         && effectiveManagedStatus?.state === "starting";
       let observedAppearanceRevision = initialAppearanceRevision;
-      while (!cancelled && observedAppearanceRevision !== appearancePreferenceHintRevisionRef.current) {
-        observedAppearanceRevision = appearancePreferenceHintRevisionRef.current;
+      let observedAppShortcutRevision = initialAppShortcutRevision;
+      while (!cancelled && (observedAppearanceRevision !== appearancePreferenceHintRevisionRef.current
+        || observedAppShortcutRevision !== appShortcutPreferenceHintRevisionRef.current)) {
+        const nextAppearanceRevision = appearancePreferenceHintRevisionRef.current;
+        const nextAppShortcutRevision = appShortcutPreferenceHintRevisionRef.current;
+        const refreshAppearance = observedAppearanceRevision !== nextAppearanceRevision;
+        const refreshAppShortcuts = observedAppShortcutRevision !== nextAppShortcutRevision;
+        observedAppearanceRevision = nextAppearanceRevision;
+        observedAppShortcutRevision = nextAppShortcutRevision;
         const durable = (await local.readPreferences()) ?? DEFAULT_UI_PREFERENCES;
-        effectivePreferences = withAppearanceProjection(effectivePreferences, durable);
+        if (refreshAppearance) effectivePreferences = withAppearanceProjection(effectivePreferences, durable);
+        if (refreshAppShortcuts) effectivePreferences = withAppShortcutProjection(effectivePreferences, durable);
       }
       if (cancelled) return;
       localRef.current = local;
@@ -445,6 +488,7 @@ export function useAppController(): AppController {
         ...(automaticProfile === undefined ? {} : { activeProfile: automaticProfile, connectionState: "connecting" as const })
       }));
       appearanceSyncLive = true;
+      appShortcutSyncLive = true;
     }).catch((error: unknown) => {
       if (!cancelled) setState((current) => ({ ...current, ready: true, error: messageOf(error) }));
     });
@@ -521,8 +565,11 @@ export function useAppController(): AppController {
     return () => {
       cancelled = true;
       appearanceSyncLive = false;
+      appShortcutSyncLive = false;
       closeAppearancePreferenceSync();
+      closeAppShortcutPreferenceSync();
       if (appearancePreferenceSyncOwnerRef.current === appearanceSyncOwner) appearancePreferenceSyncOwnerRef.current += 1;
+      if (appShortcutPreferenceSyncOwnerRef.current === appShortcutSyncOwner) appShortcutPreferenceSyncOwnerRef.current += 1;
       gatewayGenerationRef.current += 1;
       machineRefreshGenerationRef.current += 1;
       discoveryGenerationRef.current += 1;
@@ -538,7 +585,7 @@ export function useAppController(): AppController {
       }
       remoteMachineGatewaysRef.current.clear();
     };
-  }, [enqueueAppearancePreferenceRefresh]);
+  }, [enqueueAppearancePreferenceRefresh, enqueueAppShortcutPreferenceRefresh]);
 
   useEffect(() => {
     applyTheme(state.preferences.theme);
@@ -562,7 +609,10 @@ export function useAppController(): AppController {
     applyWindowZoom(state.preferences.windowZoom);
   }, [state.preferences.windowZoom, state.ready, windowZoomApplicationRevision]);
 
-  const commitPreferenceMutation = useCallback(async (mutation: UiPreferencesMutation): Promise<void> => {
+  const commitPreferenceMutation = useCallback(async (
+    mutation: UiPreferencesMutation,
+    reconcileDurableShortcutsOnFailure = false
+  ): Promise<void> => {
     const previous = preferencesRef.current;
     const next = mutation(previous);
     preferencesRef.current = next;
@@ -577,16 +627,40 @@ export function useAppController(): AppController {
         preferencesRef.current = previous;
         setState((current) => current.preferences === next ? { ...current, preferences: previous } : current);
       }
+      // A stale renderer can lose an authoritative shortcut conflict race.
+      // Reconcile only that nested value; unrelated preferences intentionally
+      // keep their renderer-local projection until their owning sync path runs.
+      if (reconcileDurableShortcutsOnFailure && preferencesRef.current === previous) {
+        try {
+          const durable = (await requireLocal(localRef.current).readPreferences()) ?? DEFAULT_UI_PREFERENCES;
+          if (preferencesRef.current === previous) {
+            const reconciled = {
+              ...previous,
+              appShortcutOverrides: durable.appShortcutOverrides
+            };
+            preferencesRef.current = reconciled;
+            setState((current) => current.preferences === previous
+              ? { ...current, preferences: reconciled }
+              : current);
+          }
+        } catch {
+          // Preserve the original write rejection; the optimistic value has
+          // already been removed even when the authority cannot be reread.
+        }
+      }
       throw error;
     }
   }, []);
 
-  const mutatePreferences = useCallback((mutation: UiPreferencesMutation): Promise<void> => {
+  const mutatePreferences = useCallback((
+    mutation: UiPreferencesMutation,
+    reconcileDurableShortcutsOnFailure = false
+  ): Promise<void> => {
     // Renderer-local intent is serialized as well as the IndexedDB transaction.
     // If an older write fails, its rollback therefore happens before a newer
     // mutation samples local state; the newer success cannot retain a phantom
     // value that never reached durable storage.
-    return enqueuePreferenceOperation(() => commitPreferenceMutation(mutation));
+    return enqueuePreferenceOperation(() => commitPreferenceMutation(mutation, reconcileDurableShortcutsOnFailure));
   }, [commitPreferenceMutation, enqueuePreferenceOperation]);
 
   const updatePreferences = useCallback(async (patch: Partial<UiPreferences>): Promise<void> => {
@@ -2239,7 +2313,7 @@ export function useAppController(): AppController {
     setAppShortcutOverride: (id, value) => mutatePreferences((current) => ({
       ...current,
       appShortcutOverrides: withAppShortcutOverride(current.appShortcutOverrides, id, value)
-    })),
+    }), true),
     resetAppShortcutOverrides: () => updatePreferences({ appShortcutOverrides: {} }),
     setInspectorOpen: (inspectorOpen) => updatePreferences({ inspectorOpen }),
     setNavigationOpen: (navigationOpen) => {

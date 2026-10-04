@@ -9,6 +9,31 @@ export interface DesktopWindowInteractionSettingsStore {
   readonly setSwallowActivationClick: (enabled: boolean) => Promise<DesktopWindowInteractionSettings>;
 }
 
+export interface DesktopWindowInteractionSettingsObserver {
+  readonly isDestroyed: () => boolean;
+  readonly webContents: {
+    readonly isDestroyed: () => boolean;
+    readonly send: (channel: string, settings: DesktopWindowInteractionSettings) => void;
+  };
+}
+
+/** Renderer delivery is an observer effect and cannot reverse a committed setting. */
+export function broadcastDesktopWindowInteractionSettings(
+  observers: readonly DesktopWindowInteractionSettingsObserver[],
+  channel: string,
+  settings: DesktopWindowInteractionSettings
+): void {
+  for (const observer of observers) {
+    try {
+      if (observer.isDestroyed() || observer.webContents.isDestroyed()) continue;
+      observer.webContents.send(channel, settings);
+    } catch {
+      // A renderer can retire between inspection and send without changing
+      // durable device authority or preventing delivery to later observers.
+    }
+  }
+}
+
 export function createDesktopWindowInteractionSettingsStore(
   path: string
 ): DesktopWindowInteractionSettingsStore {

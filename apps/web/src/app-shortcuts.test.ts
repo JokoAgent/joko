@@ -218,6 +218,24 @@ describe("application shortcut registry", () => {
     expect(effectiveAppShortcutCombos("find-in-page", overrides, "win32")).toEqual([ctrlOne]);
   });
 
+  it("rejects reserved, default, and latest override conflicts without mutating the current snapshot", () => {
+    const current = withAppShortcutOverride({}, "toggle-sidebar", ctrlG, "win32");
+    const before = structuredClone(current);
+    const ctrlSpace = { code: "Space", key: " ", meta: false, ctrl: true, alt: false, shift: false };
+    const ctrlShiftF = { code: "KeyF", key: "f", meta: false, ctrl: true, alt: false, shift: true };
+
+    expect(() => withAppShortcutOverride(current, "find-in-page", ctrlSpace, "win32")).toThrow(
+      "combination is invalid"
+    );
+    expect(() => withAppShortcutOverride(current, "find-in-page", ctrlShiftF, "win32")).toThrow(
+      "conflicts with another action"
+    );
+    expect(() => withAppShortcutOverride(current, "find-in-page", ctrlG, "win32")).toThrow(
+      "conflicts with another action"
+    );
+    expect(current).toEqual(before);
+  });
+
   it("models overlapping shortcut scopes", () => {
     expect(appShortcutScopesOverlap("app", "browser")).toBe(true);
     expect(appShortcutScopesOverlap("browser", "workdir-doc")).toBe(true);

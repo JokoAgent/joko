@@ -39,11 +39,23 @@ export function createDesktopKeepAwakeController(
     apply: (enabled: boolean): void => {
       if (typeof enabled !== "boolean") throw new TypeError("Desktop keep-awake state must be boolean.");
       if (!enabled) {
-        release();
+        const id = blockerId;
+        if (id === undefined) return;
+        if (!blocker.isStarted(id)) {
+          blockerId = undefined;
+          return;
+        }
+        blocker.stop(id);
+        if (blocker.isStarted(id)) {
+          throw new Error("Desktop keep-awake blocker remained active after stop.");
+        }
+        blockerId = undefined;
         return;
       }
-      if (isActive()) return;
-      blockerId = undefined;
+      if (blockerId !== undefined) {
+        if (blocker.isStarted(blockerId)) return;
+        blockerId = undefined;
+      }
       const id = blocker.start("prevent-app-suspension");
       if (!Number.isSafeInteger(id) || id < 0) {
         throw new Error("Desktop keep-awake blocker returned an invalid identifier.");

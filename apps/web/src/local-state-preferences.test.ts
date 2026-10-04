@@ -2,6 +2,8 @@ import { describe, expect, it, vi } from "vitest";
 import { DEFAULT_UI_PREFERENCES, LocalState } from "./local-state.js";
 import { DEFAULT_SIDEBAR_OWNER_LAYOUT, withSidebarOwnerLayout } from "./sidebar-layout.js";
 import { subscribeAppearancePreferencesChange } from "./appearance-preference-sync.js";
+import { withAppShortcutOverride, type AppShortcutCombo } from "./app-shortcuts.js";
+import { subscribeAppShortcutPreferencesChange } from "./app-shortcut-preference-sync.js";
 
 describe("cross-window durable UI preference mutations", () => {
   it("merges a stale renderer's unrelated patch with the latest durable owner layout", async () => {
@@ -167,6 +169,106 @@ describe("cross-window durable UI preference mutations", () => {
       vi.unstubAllGlobals();
     }
   });
+
+  it("publishes every successfully committed shortcut change but not same, failed, or unrelated mutations", async () => {
+    const database = memoryPreferenceDatabase();
+    const publishedDurableUiRecords: unknown[] = [];
+    const channels = new Set<TestChannel>();
+    class TestChannel {
+      onmessage: ((event: MessageEvent<unknown>) => void) | null = null;
+      constructor(readonly name: string) { channels.add(this); }
+      postMessage(value: unknown): void {
+        if (this.name === "joko:app-shortcut-preferences:v1") {
+          publishedDurableUiRecords.push(database.readUiRecord());
+        }
+        for (const peer of channels) if (peer !== this && peer.name === this.name) {
+          queueMicrotask(() => peer.onmessage?.({ data: value } as MessageEvent<unknown>));
+        }
+      }
+      close(): void { channels.delete(this); }
+    }
+    vi.stubGlobal("BroadcastChannel", TestChannel);
+    try {
+      const state = memoryLocalState(database.database);
+      const changed = vi.fn();
+      const close = subscribeAppShortcutPreferencesChange(changed);
+      const rebind = shortcut("KeyG", "g");
+
+      await state.mutatePreferences((current) => ({
+        ...current,
+        appShortcutOverrides: withAppShortcutOverride(current.appShortcutOverrides, "browser-back", rebind)
+      }));
+      await Promise.resolve();
+      expect(changed).toHaveBeenCalledOnce();
+      expect(publishedDurableUiRecords).toHaveLength(1);
+      expect(publishedDurableUiRecords.at(-1)).toMatchObject({
+        appShortcutOverrides: { "browser-back": rebind }
+      });
+
+      await state.mutatePreferences((current) => ({
+        ...current,
+        appShortcutOverrides: withAppShortcutOverride(current.appShortcutOverrides, "browser-back", { ...rebind })
+      }));
+      await Promise.resolve();
+      expect(changed).toHaveBeenCalledOnce();
+      expect(publishedDurableUiRecords).toHaveLength(1);
+
+      await state.mutatePreferences((current) => ({
+        ...current,
+        appShortcutOverrides: withAppShortcutOverride(current.appShortcutOverrides, "search-in-project", null)
+      }));
+      await Promise.resolve();
+      expect(changed).toHaveBeenCalledTimes(2);
+      expect(publishedDurableUiRecords.at(-1)).toMatchObject({
+        appShortcutOverrides: { "browser-back": rebind, "search-in-project": null }
+      });
+
+      await state.mutatePreferences((current) => ({
+        ...current,
+        appShortcutOverrides: withAppShortcutOverride(current.appShortcutOverrides, "browser-back", undefined)
+      }));
+      await Promise.resolve();
+      expect(changed).toHaveBeenCalledTimes(3);
+      expect(publishedDurableUiRecords.at(-1)).toMatchObject({
+        appShortcutOverrides: { "search-in-project": null }
+      });
+
+      await state.mutatePreferences((current) => ({ ...current, appShortcutOverrides: {} }));
+      await Promise.resolve();
+      expect(changed).toHaveBeenCalledTimes(4);
+      expect((publishedDurableUiRecords.at(-1) as { appShortcutOverrides: unknown }).appShortcutOverrides).toEqual({});
+
+      await state.mutatePreferences((current) => ({ ...current, appShortcutOverrides: {} }));
+      await state.mutatePreferences((current) => ({ ...current, locale: "zh-CN" }));
+      await state.mutatePreferences((current) => ({ ...current, composerSendShortcut: "modifier-enter" }));
+      await Promise.resolve();
+      expect(changed).toHaveBeenCalledTimes(4);
+      expect(publishedDurableUiRecords).toHaveLength(4);
+
+      await state.mutatePreferences((current) => ({
+        ...current,
+        appShortcutOverrides: withAppShortcutOverride(current.appShortcutOverrides, "browser-back", rebind)
+      }));
+      await Promise.resolve();
+      expect(changed).toHaveBeenCalledTimes(5);
+      expect(publishedDurableUiRecords).toHaveLength(5);
+
+      database.failNextPut();
+      await expect(state.mutatePreferences((current) => ({
+        ...current,
+        appShortcutOverrides: withAppShortcutOverride(current.appShortcutOverrides, "browser-back", null)
+      }))).rejects.toThrow("preference write failed");
+      await Promise.resolve();
+      expect(changed).toHaveBeenCalledTimes(5);
+      expect(publishedDurableUiRecords).toHaveLength(5);
+      expect(database.readUiRecord()).toMatchObject({
+        appShortcutOverrides: { "browser-back": rebind }
+      });
+      close();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
 });
 
 describe("device-local recent projects", () => {
@@ -193,6 +295,17 @@ describe("device-local recent projects", () => {
 function memoryLocalState(database: IDBDatabase): LocalState {
   const LocalStateConstructor = LocalState as unknown as new (database: IDBDatabase) => LocalState;
   return new LocalStateConstructor(database);
+}
+
+function shortcut(code: string, key?: string): AppShortcutCombo {
+  return {
+    code,
+    ...(key === undefined ? {} : { key }),
+    meta: false,
+    ctrl: true,
+    alt: false,
+    shift: false
+  };
 }
 
 function memoryPreferenceDatabase(): {

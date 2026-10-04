@@ -84,10 +84,7 @@ import { MessagingSettings } from "./MessagingSettings.js";
 import { ModelPicker } from "./ModelPicker.js";
 import { ModelPriceOverrideDialog, type ModelPriceVariant } from "./ModelPriceOverrideDialog.js";
 import { PiPackagesSection } from "./PiPackagesSection.js";
-import {
-  subscribeActivationClickPreference,
-  writeActivationClickPreference
-} from "../window-activation-click.js";
+import { writeActivationClickPreference } from "../window-activation-click.js";
 import { ManagedModelRuntimeSettings } from "./ManagedModelRuntimeSettings.js";
 import { RuntimeGovernanceSettings } from "./RuntimeGovernanceSettings.js";
 import { ToolPolicySettings } from "./ToolPolicySettings.js";
@@ -622,6 +619,275 @@ export function AppearanceSettings({ controller, locale, theme, onSuccess, onOpe
   );
 }
 
+type KeepAwakeError = "load" | "save";
+
+interface KeepAwakeOwner {
+  readonly desktop: JokoDesktopApi;
+  readonly generation: number;
+  hintRevision: number;
+}
+
+interface KeepAwakeFlight {
+  readonly owner: KeepAwakeOwner;
+  readonly startingHintRevision: number;
+}
+
+function useDesktopKeepAwakeSetting(
+  desktop: JokoDesktopApi | undefined,
+  available: boolean
+): {
+  readonly enabled: boolean | undefined;
+  readonly busy: boolean;
+  readonly error: KeepAwakeError | undefined;
+  readonly dismissError: () => void;
+  readonly change: (enabled: boolean) => void;
+} {
+  const [enabled, setEnabled] = useState<boolean>();
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<KeepAwakeError>();
+  const generationRef = useRef(0);
+  const ownerRef = useRef<KeepAwakeOwner | undefined>(undefined);
+  const flightRef = useRef<KeepAwakeFlight | undefined>(undefined);
+
+  useEffect(() => {
+    const generation = ++generationRef.current;
+    flightRef.current = undefined;
+    setBusy(false);
+    setError(undefined);
+    if (!available || desktop === undefined) {
+      ownerRef.current = undefined;
+      setEnabled(undefined);
+      return;
+    }
+
+    const owner: KeepAwakeOwner = { desktop, generation, hintRevision: 0 };
+    ownerRef.current = owner;
+    setEnabled(undefined);
+    const current = (): boolean => ownerRef.current === owner && generationRef.current === generation;
+    // Capture before subscribing so even a synchronous current-value push wins
+    // over the initial read that is started after the listener is installed.
+    const initialHintRevision = owner.hintRevision;
+    const unsubscribe = desktop.power.onKeepAwakeChanged((settings) => {
+      if (!current()) return;
+      owner.hintRevision += 1;
+      setEnabled(settings.enabled);
+      setError((value) => value === "load" ? undefined : value);
+    });
+    void desktop.power.getKeepAwake().then((settings) => {
+      if (!current() || owner.hintRevision !== initialHintRevision) return;
+      setEnabled(settings.enabled);
+    }).catch(() => {
+      if (!current() || owner.hintRevision !== initialHintRevision) return;
+      setEnabled(undefined);
+      setError("load");
+    });
+
+    return () => {
+      if (ownerRef.current === owner) {
+        ownerRef.current = undefined;
+        flightRef.current = undefined;
+      }
+      unsubscribe();
+    };
+  }, [available, desktop]);
+
+  const change = useCallback((next: boolean): void => {
+    const owner = ownerRef.current;
+    if (owner === undefined || flightRef.current?.owner === owner) return;
+    const flight: KeepAwakeFlight = {
+      owner,
+      startingHintRevision: owner.hintRevision
+    };
+    flightRef.current = flight;
+    setError(undefined);
+    setBusy(true);
+    setEnabled(next);
+    const current = (): boolean => ownerRef.current === owner
+      && generationRef.current === owner.generation
+      && flightRef.current === flight;
+    void (async () => {
+      try {
+        const confirmed = await owner.desktop.power.setKeepAwake(next);
+        if (!current()) return;
+        // A push received after this intent is a newer Main-owned projection.
+        if (owner.hintRevision === flight.startingHintRevision) setEnabled(confirmed.enabled);
+      } catch {
+        if (!current()) return;
+        const recoveryHintRevision = owner.hintRevision;
+        try {
+          const confirmed = await owner.desktop.power.getKeepAwake();
+          if (!current()) return;
+          if (owner.hintRevision === recoveryHintRevision) setEnabled(confirmed.enabled);
+        } catch {
+          if (!current()) return;
+          // Do not preserve an optimistic value when Main cannot confirm it.
+          if (owner.hintRevision === recoveryHintRevision) setEnabled(undefined);
+        }
+        if (!current()) return;
+        setError("save");
+      }
+      if (!current()) return;
+      flightRef.current = undefined;
+      setBusy(false);
+    })();
+  }, []);
+  const dismissError = useCallback(() => setError(undefined), []);
+
+  return {
+    enabled,
+    busy,
+    error,
+    dismissError,
+    change
+  };
+}
+
+type ActivationClickError = "load" | "save";
+
+interface ActivationClickOwner {
+  readonly desktop: JokoDesktopApi;
+  readonly generation: number;
+  hintRevision: number;
+  confirmed: boolean | undefined;
+}
+
+interface ActivationClickFlight {
+  readonly owner: ActivationClickOwner;
+  readonly startingHintRevision: number;
+  readonly fallbackConfirmed: boolean;
+}
+
+function useDesktopActivationClickSetting(
+  desktop: JokoDesktopApi | undefined,
+  available: boolean
+): {
+  readonly enabled: boolean | undefined;
+  readonly busy: boolean;
+  readonly error: ActivationClickError | undefined;
+  readonly dismissError: () => void;
+  readonly change: (enabled: boolean) => void;
+} {
+  const [enabled, setEnabled] = useState<boolean>();
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<ActivationClickError>();
+  const generationRef = useRef(0);
+  const ownerRef = useRef<ActivationClickOwner | undefined>(undefined);
+  const flightRef = useRef<ActivationClickFlight | undefined>(undefined);
+
+  useEffect(() => {
+    const generation = ++generationRef.current;
+    flightRef.current = undefined;
+    setBusy(false);
+    setError(undefined);
+    if (!available || desktop === undefined) {
+      ownerRef.current = undefined;
+      setEnabled(undefined);
+      return;
+    }
+
+    const owner: ActivationClickOwner = {
+      desktop,
+      generation,
+      hintRevision: 0,
+      confirmed: undefined
+    };
+    ownerRef.current = owner;
+    setEnabled(undefined);
+    const current = (): boolean => ownerRef.current === owner && generationRef.current === generation;
+    const applyConfirmed = (confirmed: boolean): void => {
+      owner.confirmed = confirmed;
+      setEnabled(confirmed);
+      writeActivationClickPreference(confirmed);
+    };
+    const initialHintRevision = owner.hintRevision;
+    const unsubscribe = desktop.windowInteraction.onChanged((settings) => {
+      if (!current()) return;
+      owner.hintRevision += 1;
+      applyConfirmed(settings.swallowActivationClick);
+      setError((value) => value === "load" ? undefined : value);
+    });
+    void desktop.windowInteraction.get().then((settings) => {
+      if (!current() || owner.hintRevision !== initialHintRevision) return;
+      applyConfirmed(settings.swallowActivationClick);
+    }).catch(() => {
+      if (!current() || owner.hintRevision !== initialHintRevision) return;
+      owner.confirmed = undefined;
+      setEnabled(undefined);
+      setError("load");
+    });
+
+    return () => {
+      if (ownerRef.current === owner) {
+        ownerRef.current = undefined;
+        flightRef.current = undefined;
+      }
+      unsubscribe();
+    };
+  }, [available, desktop]);
+
+  const change = useCallback((next: boolean): void => {
+    const owner = ownerRef.current;
+    if (owner === undefined || owner.confirmed === undefined || flightRef.current?.owner === owner) return;
+    const flight: ActivationClickFlight = {
+      owner,
+      startingHintRevision: owner.hintRevision,
+      fallbackConfirmed: owner.confirmed
+    };
+    flightRef.current = flight;
+    setError(undefined);
+    setBusy(true);
+    setEnabled(next);
+    writeActivationClickPreference(next);
+    const current = (): boolean => ownerRef.current === owner
+      && generationRef.current === owner.generation
+      && flightRef.current === flight;
+    const applyConfirmed = (confirmed: boolean): void => {
+      owner.confirmed = confirmed;
+      setEnabled(confirmed);
+      writeActivationClickPreference(confirmed);
+    };
+    void (async () => {
+      try {
+        const confirmed = await owner.desktop.windowInteraction.setSwallowActivationClick(next);
+        if (!current()) return;
+        if (owner.hintRevision === flight.startingHintRevision) {
+          applyConfirmed(confirmed.swallowActivationClick);
+        }
+      } catch {
+        if (!current()) return;
+        try {
+          const confirmed = await owner.desktop.windowInteraction.get();
+          if (!current()) return;
+          if (owner.hintRevision === flight.startingHintRevision) {
+            applyConfirmed(confirmed.swallowActivationClick);
+          }
+        } catch {
+          if (!current()) return;
+          if (owner.hintRevision === flight.startingHintRevision) {
+            // The control is actionable only after a confirmed read or hint, so
+            // this always removes the optimistic projection without guessing.
+            applyConfirmed(flight.fallbackConfirmed);
+          }
+        }
+        if (!current()) return;
+        setError("save");
+      }
+      if (!current()) return;
+      flightRef.current = undefined;
+      setBusy(false);
+    })();
+  }, []);
+  const dismissError = useCallback(() => setError(undefined), []);
+
+  return {
+    enabled,
+    busy,
+    error,
+    dismissError,
+    change
+  };
+}
+
 export function GeneralSettings({ controller, snapshot, runAction, onSuccess, showHeading = true, t }: {
   readonly controller: AppController;
   readonly snapshot: AppSnapshot;
@@ -635,11 +901,8 @@ export function GeneralSettings({ controller, snapshot, runAction, onSuccess, sh
   const powerAvailable = desktop?.capabilities.includes("power.keepAwake") === true;
   const activationClickAvailable = desktop?.capabilities.includes("window.activationClick") === true &&
     (desktop.platform === "win32" || desktop.platform === "darwin");
-  const [keepAwake, setKeepAwake] = useState<boolean>();
-  const [swallowActivationClick, setSwallowActivationClick] = useState<boolean>();
-  const [powerBusy, setPowerBusy] = useState(false);
-  const [activationClickBusy, setActivationClickBusy] = useState(false);
-  const [error, setError] = useState<string>();
+  const keepAwake = useDesktopKeepAwakeSetting(desktop, powerAvailable);
+  const activationClick = useDesktopActivationClickSetting(desktop, activationClickAvailable);
   const controllerShortcutAction = controller.setComposerSendShortcut;
   const shortcutOwner = useMemo(() => ({ action: controllerShortcutAction }), [controllerShortcutAction]);
   const committedShortcutOwnerRef = useRef<typeof shortcutOwner | undefined>(undefined);
@@ -651,8 +914,6 @@ export function GeneralSettings({ controller, snapshot, runAction, onSuccess, sh
     readonly error?: string;
   }>({ owner: shortcutOwner, pending: false, preserveCustomized: false });
   const notificationSave = useSettingsSaveFeedback(onSuccess);
-  const loadGenerationRef = useRef(0);
-  const interactionLoadGenerationRef = useRef(0);
   const shortcutPending = shortcutFeedback.owner === shortcutOwner && shortcutFeedback.pending;
   const shortcutError = shortcutFeedback.owner === shortcutOwner ? shortcutFeedback.error : undefined;
   const shortcutCustomized = controller.state.preferences.composerSendShortcut !== DEFAULT_UI_PREFERENCES.composerSendShortcut
@@ -666,61 +927,6 @@ export function GeneralSettings({ controller, snapshot, runAction, onSuccess, sh
     };
   }, [shortcutOwner]);
 
-  useEffect(() => {
-    const generation = ++loadGenerationRef.current;
-    if (!powerAvailable || desktop === undefined) {
-      setKeepAwake(undefined);
-      return;
-    }
-    setError(undefined);
-    void desktop.power.getKeepAwake().then((settings) => {
-      if (loadGenerationRef.current === generation) setKeepAwake(settings.enabled);
-    }).catch(() => {
-      if (loadGenerationRef.current === generation) setError(t("settings.keepAwakeLoadFailed"));
-    });
-    return () => { loadGenerationRef.current += 1; };
-  }, [desktop, powerAvailable, t]);
-
-  useEffect(() => {
-    const generation = ++interactionLoadGenerationRef.current;
-    if (!activationClickAvailable || desktop === undefined) {
-      setSwallowActivationClick(undefined);
-      return;
-    }
-    setError(undefined);
-    const unsubscribe = subscribeActivationClickPreference(setSwallowActivationClick);
-    void desktop.windowInteraction.get().then((settings) => {
-      if (interactionLoadGenerationRef.current !== generation) return;
-      setSwallowActivationClick(settings.swallowActivationClick);
-      writeActivationClickPreference(settings.swallowActivationClick);
-    }).catch(() => {
-      if (interactionLoadGenerationRef.current === generation) {
-        setError(t("settings.activationClickLoadFailed"));
-      }
-    });
-    return () => {
-      interactionLoadGenerationRef.current += 1;
-      unsubscribe();
-    };
-  }, [activationClickAvailable, desktop, t]);
-
-  const changeKeepAwake = async (enabled: boolean): Promise<void> => {
-    if (!powerAvailable || desktop === undefined || powerBusy) return;
-    const previous = keepAwake;
-    setError(undefined);
-    setPowerBusy(true);
-    setKeepAwake(enabled);
-    try {
-      const settings = await desktop.power.setKeepAwake(enabled);
-      setKeepAwake(settings.enabled);
-    } catch {
-      setKeepAwake(previous);
-      setError(t("settings.keepAwakeSaveFailed"));
-    } finally {
-      setPowerBusy(false);
-    }
-  };
-
   const changeNotifications = (enabled: boolean): void => {
     if (!notificationAvailable) return;
     void notificationSave.commit(
@@ -730,26 +936,6 @@ export function GeneralSettings({ controller, snapshot, runAction, onSuccess, sh
         failure: t("settings.sessionNotificationsSaveFailed")
       }
     );
-  };
-
-  const changeActivationClick = async (enabled: boolean): Promise<void> => {
-    if (!activationClickAvailable || desktop === undefined || activationClickBusy) return;
-    const previous = swallowActivationClick ?? false;
-    setError(undefined);
-    setActivationClickBusy(true);
-    setSwallowActivationClick(enabled);
-    writeActivationClickPreference(enabled);
-    try {
-      const settings = await desktop.windowInteraction.setSwallowActivationClick(enabled);
-      setSwallowActivationClick(settings.swallowActivationClick);
-      writeActivationClickPreference(settings.swallowActivationClick);
-    } catch {
-      setSwallowActivationClick(previous);
-      writeActivationClickPreference(previous);
-      setError(t("settings.activationClickSaveFailed"));
-    } finally {
-      setActivationClickBusy(false);
-    }
   };
 
   const changeComposerSendShortcut = (
@@ -805,7 +991,14 @@ export function GeneralSettings({ controller, snapshot, runAction, onSuccess, sh
     {shortcutError !== undefined && <ErrorBanner message={shortcutError} onClose={() => setShortcutFeedback((current) => current.owner === shortcutOwner
       ? { ...current, error: undefined }
       : current)} />}
-    {error !== undefined && <ErrorBanner message={error} onClose={() => setError(undefined)} />}
+    {keepAwake.error !== undefined && <ErrorBanner
+      message={t(keepAwake.error === "load" ? "settings.keepAwakeLoadFailed" : "settings.keepAwakeSaveFailed")}
+      onClose={keepAwake.dismissError}
+    />}
+    {activationClick.error !== undefined && <ErrorBanner
+      message={t(activationClick.error === "load" ? "settings.activationClickLoadFailed" : "settings.activationClickSaveFailed")}
+      onClose={activationClick.dismissError}
+    />}
     <section className="settings-card desktop-behavior-settings">
       <div className="setting-row">
         <div>
@@ -825,12 +1018,14 @@ export function GeneralSettings({ controller, snapshot, runAction, onSuccess, sh
         <div>
           <strong><Power aria-hidden="true" />{t("settings.keepAwake")}</strong>
           <span>{powerAvailable ? t("settings.keepAwakeBody") : t("settings.desktopOnly")}</span>
+          {keepAwake.busy && <span role="status">{t("common.working")}</span>}
         </div>
         <SwitchControl
-            checked={keepAwake === true}
-            disabled={!powerAvailable || keepAwake === undefined || powerBusy}
+            checked={keepAwake.enabled === true}
+            disabled={!powerAvailable || keepAwake.enabled === undefined || keepAwake.busy}
+            aria-busy={keepAwake.busy}
             aria-label={t("settings.keepAwake")}
-            onChange={(event) => void changeKeepAwake(event.target.checked)}
+            onChange={(event) => keepAwake.change(event.target.checked)}
           />
       </div>
       <DesktopMainWindowCloseSetting t={t} />
@@ -841,10 +1036,11 @@ export function GeneralSettings({ controller, snapshot, runAction, onSuccess, sh
           {desktop?.platform === "darwin" && <span>{t("settings.activationClickRestart")}</span>}
         </div>
         <SwitchControl
-            checked={swallowActivationClick === true}
-            disabled={swallowActivationClick === undefined || activationClickBusy}
+            checked={activationClick.enabled === true}
+            disabled={activationClick.enabled === undefined || activationClick.busy}
+            aria-busy={activationClick.busy}
             aria-label={t("settings.activationClick")}
-            onChange={(event) => void changeActivationClick(event.target.checked)}
+            onChange={(event) => activationClick.change(event.target.checked)}
           />
       </div>}
       <div className="setting-row">

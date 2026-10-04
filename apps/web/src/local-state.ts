@@ -19,6 +19,10 @@ import {
 } from "./appearance-settings.js";
 import { publishAppearancePreferencesChange, sameAppearanceProjection } from "./appearance-preference-sync.js";
 import {
+  publishAppShortcutPreferencesChange,
+  sameAppShortcutProjection
+} from "./app-shortcut-preference-sync.js";
+import {
   DEFAULT_SIDEBAR_DISPLAY_PREFERENCES,
   normalizeSidebarDisplayPreferences,
   normalizeSidebarOwnerLayouts,
@@ -682,6 +686,7 @@ export class LocalState {
     store.put(persistedUiPreferences(next), "ui");
     await transactionDone(transaction);
     if (!sameAppearanceProjection(current, next)) publishAppearancePreferencesChange();
+    if (!sameAppShortcutProjection(current, next)) publishAppShortcutPreferencesChange();
     return next;
   }
 

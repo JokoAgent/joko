@@ -549,6 +549,7 @@ interface JokoDesktopApi {
   readonly power: {
     getKeepAwake(): Promise<{ readonly enabled: boolean }>;
     setKeepAwake(enabled: boolean): Promise<{ readonly enabled: boolean }>;
+    onKeepAwakeChanged(listener: (settings: { readonly enabled: boolean }) => void): () => void;
   };
   readonly modelCatalog: {
     onRefreshLifecycle(listener: (

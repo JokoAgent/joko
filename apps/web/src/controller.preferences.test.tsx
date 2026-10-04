@@ -5,6 +5,14 @@ import { afterEach, beforeAll, expect, it, vi } from "vitest";
 import { useAppController, type AppController } from "./controller.js";
 import { DEFAULT_UI_PREFERENCES, LocalState, type UiPreferences, type UiPreferencesMutation } from "./local-state.js";
 import { publishAppearancePreferencesChange } from "./appearance-preference-sync.js";
+import { publishAppShortcutPreferencesChange } from "./app-shortcut-preference-sync.js";
+import {
+  effectiveAppShortcutCombos,
+  matchesAppShortcutEvent,
+  validateAppShortcutCombo,
+  type AppShortcutCombo,
+  type AppShortcutId
+} from "./app-shortcuts.js";
 
 let root: Root | undefined;
 beforeAll(() => { (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true; });
@@ -76,6 +84,372 @@ it("keeps font setters stable while rolling back before a queued mutation sample
   expect(controller!.setCodeFamily).toBe(setCodeFamily);
   expect(controller!.setUiSize).toBe(setUiSize);
   expect(controller!.setCodeSize).toBe(setCodeSize);
+});
+
+it("admits only one stale cross-controller shortcut binding and resyncs the rejected owner", async () => {
+  vi.stubGlobal("matchMedia", () => ({ matches: false, addEventListener: vi.fn(), removeEventListener: vi.fn() }));
+  const combo: AppShortcutCombo = {
+    code: "KeyG",
+    key: "g",
+    meta: false,
+    ctrl: true,
+    alt: false,
+    shift: false
+  };
+  const firstId: AppShortcutId = "browser-back";
+  const secondId: AppShortcutId = "search-in-project";
+  expect(validateAppShortcutCombo(firstId, combo, {}, "win32")).toBeNull();
+  expect(validateAppShortcutCombo(secondId, combo, {}, "win32")).toBeNull();
+
+  let stored: UiPreferences = DEFAULT_UI_PREFERENCES;
+  let transactionTail = Promise.resolve();
+  const releaseTransactions = deferred<void>();
+  const releaseAuthoritativeRead = deferred<void>();
+  const committed: UiPreferences[] = [];
+  const mutatePreferences = vi.fn((mutation: UiPreferencesMutation): Promise<UiPreferences> => {
+    const transaction = transactionTail.then(async () => {
+      await releaseTransactions.promise;
+      const next = mutation(stored);
+      stored = next;
+      committed.push(next);
+      return next;
+    });
+    transactionTail = transaction.then(() => undefined, () => undefined);
+    return transaction;
+  });
+  const createLocal = (): LocalState => {
+    let initialRead = true;
+    return {
+      listProfiles: async () => [],
+      listMachineCaches: async () => [],
+      readPreferences: vi.fn(async () => {
+        if (initialRead) {
+          initialRead = false;
+          return stored;
+        }
+        await releaseAuthoritativeRead.promise;
+        return stored;
+      }),
+      mutatePreferences
+    } as unknown as LocalState;
+  };
+  const firstLocal = createLocal();
+  const secondLocal = createLocal();
+  vi.spyOn(LocalState, "open")
+    .mockResolvedValueOnce(firstLocal)
+    .mockResolvedValueOnce(secondLocal);
+
+  let first: AppController | undefined;
+  let second: AppController | undefined;
+  const host = document.createElement("div");
+  document.body.append(host);
+  root = createRoot(host);
+  function Probe({ owner }: { readonly owner: "first" | "second" }): null {
+    const controller = useAppController();
+    if (owner === "first") first = controller;
+    else second = controller;
+    return null;
+  }
+  await act(async () => { root?.render(<><Probe owner="first" /><Probe owner="second" /></>); });
+  await vi.waitFor(() => {
+    expect(first?.state.ready).toBe(true);
+    expect(second?.state.ready).toBe(true);
+  });
+  expect(first!.state.preferences.appShortcutOverrides).toEqual({});
+  expect(second!.state.preferences.appShortcutOverrides).toEqual({});
+
+  let firstSave!: Promise<void>;
+  let secondSave!: Promise<void>;
+  await act(async () => {
+    firstSave = first!.setAppShortcutOverride(firstId, combo);
+    secondSave = second!.setAppShortcutOverride(secondId, combo);
+    await Promise.resolve();
+  });
+  const outcomes = Promise.allSettled([firstSave, secondSave]);
+  await vi.waitFor(() => expect(mutatePreferences).toHaveBeenCalledTimes(2));
+  expect(first!.state.preferences.appShortcutOverrides).toEqual({ [firstId]: combo });
+  expect(second!.state.preferences.appShortcutOverrides).toEqual({ [secondId]: combo });
+
+  stored = {
+    ...stored,
+    sidebarOwnerLayouts: {
+      external: {
+        projectFilter: ["external-project"],
+        manualProjectOrder: [],
+        manualPinnedOrder: [],
+        collapsedProjectIds: [],
+        collapsedDialogue: false
+      }
+    }
+  };
+
+  await act(async () => {
+    releaseTransactions.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+  await vi.waitFor(() => {
+    expect(committed).toHaveLength(1);
+    const winnerId = Object.keys(committed[0]!.appShortcutOverrides)[0];
+    const rejectedLocal = winnerId === firstId ? secondLocal : firstLocal;
+    expect(vi.mocked(rejectedLocal.readPreferences).mock.calls.length).toBeGreaterThan(1);
+  });
+  const winnerId = Object.keys(committed[0]!.appShortcutOverrides)[0] as AppShortcutId;
+  const rejectedController = winnerId === firstId ? second! : first!;
+  await vi.waitFor(() => expect(rejectedController.state.preferences.appShortcutOverrides).toEqual({}));
+
+  await act(async () => {
+    releaseAuthoritativeRead.resolve();
+    await outcomes;
+  });
+  const settled = await outcomes;
+  const winnerIndex = winnerId === firstId ? 0 : 1;
+  expect(settled[winnerIndex]).toMatchObject({ status: "fulfilled" });
+  expect(settled[winnerIndex === 0 ? 1 : 0]).toMatchObject({
+    status: "rejected",
+    reason: { message: "The application shortcut combination conflicts with another action." }
+  });
+  expect(committed).toHaveLength(1);
+  expect(Object.keys(stored.appShortcutOverrides)).toEqual([winnerId]);
+  expect(first!.state.preferences.appShortcutOverrides).toEqual(stored.appShortcutOverrides);
+  expect(second!.state.preferences.appShortcutOverrides).toEqual(stored.appShortcutOverrides);
+  expect(stored.sidebarOwnerLayouts).toHaveProperty("external");
+  expect(first!.state.preferences.sidebarOwnerLayouts).toEqual({});
+  expect(second!.state.preferences.sidebarOwnerLayouts).toEqual({});
+});
+
+it("hot-converges every successful shortcut override operation without remounting either controller", async () => {
+  vi.stubGlobal("matchMedia", () => ({ matches: false, addEventListener: vi.fn(), removeEventListener: vi.fn() }));
+  installTestBroadcastChannel();
+  const id: AppShortcutId = "toggle-sidebar";
+  const rebound: AppShortcutCombo = {
+    code: "KeyG",
+    key: "g",
+    meta: false,
+    ctrl: true,
+    alt: false,
+    shift: false
+  };
+  expect(validateAppShortcutCombo(id, rebound, {}, "win32")).toBeNull();
+  const original = effectiveAppShortcutCombos(id, {}, "win32")[0]!;
+  let stored: UiPreferences = DEFAULT_UI_PREFERENCES;
+  let failFirstWindow = false;
+  let secondWindowGate: Deferred<void> | undefined;
+  const createLocal = (windowId: "first" | "second"): LocalState => ({
+    listProfiles: async () => [],
+    listMachineCaches: async () => [],
+    readPreferences: vi.fn(async () => stored),
+    mutatePreferences: vi.fn(async (mutation: UiPreferencesMutation) => {
+      if (windowId === "second" && secondWindowGate !== undefined) await secondWindowGate.promise;
+      if (windowId === "first" && failFirstWindow) {
+        failFirstWindow = false;
+        throw new Error("preference write failed");
+      }
+      const previousShortcuts = stored.appShortcutOverrides;
+      stored = mutation(stored);
+      if (JSON.stringify(previousShortcuts) !== JSON.stringify(stored.appShortcutOverrides)) {
+        publishAppShortcutPreferencesChange();
+      }
+      return stored;
+    })
+  } as unknown as LocalState);
+  const firstLocal = createLocal("first");
+  const secondLocal = createLocal("second");
+  vi.spyOn(LocalState, "open")
+    .mockResolvedValueOnce(firstLocal)
+    .mockResolvedValueOnce(secondLocal);
+
+  let first: AppController | undefined;
+  let second: AppController | undefined;
+  const host = document.createElement("div");
+  document.body.append(host);
+  root = createRoot(host);
+  function Probe({ owner }: { readonly owner: "first" | "second" }): null {
+    const controller = useAppController();
+    if (owner === "first") first = controller;
+    else second = controller;
+    return null;
+  }
+  await act(async () => { root?.render(<><Probe owner="first" /><Probe owner="second" /></>); });
+  await vi.waitFor(() => {
+    expect(first?.state.ready).toBe(true);
+    expect(second?.state.ready).toBe(true);
+  });
+
+  await act(async () => { await first!.setAppShortcutOverride(id, rebound); });
+  await vi.waitFor(() => expect(second!.state.preferences.appShortcutOverrides).toEqual({ [id]: rebound }));
+  const receivedCombos = effectiveAppShortcutCombos(id, second!.state.preferences.appShortcutOverrides, "win32");
+  expect(receivedCombos.some((combo) => matchesAppShortcutEvent(shortcutEvent(rebound), combo))).toBe(true);
+  expect(receivedCombos.some((combo) => matchesAppShortcutEvent(shortcutEvent(original), combo))).toBe(false);
+
+  await act(async () => { await first!.setAppShortcutOverride(id, null); });
+  await vi.waitFor(() => expect(second!.state.preferences.appShortcutOverrides).toEqual({ [id]: null }));
+  expect(effectiveAppShortcutCombos(id, second!.state.preferences.appShortcutOverrides, "win32")).toEqual([]);
+
+  await act(async () => { await first!.setAppShortcutOverride(id, undefined); });
+  await vi.waitFor(() => expect(second!.state.preferences.appShortcutOverrides).toEqual({}));
+  expect(effectiveAppShortcutCombos(id, second!.state.preferences.appShortcutOverrides, "win32"))
+    .toContainEqual(original);
+
+  secondWindowGate = deferred<void>();
+  let pendingSecondMutation!: Promise<void>;
+  await act(async () => {
+    pendingSecondMutation = second!.setTheme("light");
+    await Promise.resolve();
+  });
+  await act(async () => { await first!.setAppShortcutOverride(id, rebound); });
+  expect(second!.state.preferences.appShortcutOverrides).toEqual({});
+  await act(async () => {
+    secondWindowGate?.resolve();
+    await pendingSecondMutation;
+  });
+  secondWindowGate = undefined;
+  await vi.waitFor(() => {
+    expect(second!.state.preferences).toMatchObject({
+      theme: "light",
+      appShortcutOverrides: { [id]: rebound }
+    });
+  });
+
+  await act(async () => { await first!.resetAppShortcutOverrides(); });
+  await vi.waitFor(() => expect(second!.state.preferences.appShortcutOverrides).toEqual({}));
+
+  const secondReadsBeforeFailure = vi.mocked(secondLocal.readPreferences).mock.calls.length;
+  failFirstWindow = true;
+  await act(async () => {
+    await expect(first!.setAppShortcutOverride(id, rebound)).rejects.toThrow("preference write failed");
+  });
+  await Promise.resolve();
+  expect(stored.appShortcutOverrides).toEqual({});
+  expect(first!.state.preferences.appShortcutOverrides).toEqual({});
+  expect(second!.state.preferences.appShortcutOverrides).toEqual({});
+  expect(vi.mocked(secondLocal.readPreferences)).toHaveBeenCalledTimes(secondReadsBeforeFailure);
+});
+
+it("jointly closes bootstrap hints and drops stale or retired shortcut reads", async () => {
+  vi.stubGlobal("matchMedia", () => ({ matches: false, addEventListener: vi.fn(), removeEventListener: vi.fn() }));
+  const channels = installTestBroadcastChannel();
+  const id: AppShortcutId = "toggle-sidebar";
+  const bootstrapShortcut: AppShortcutCombo = {
+    code: "KeyH", key: "h", meta: false, ctrl: true, alt: false, shift: false
+  };
+  const staleShortcut: AppShortcutCombo = {
+    code: "KeyJ", key: "j", meta: false, ctrl: true, alt: false, shift: false
+  };
+  const newestShortcut: AppShortcutCombo = {
+    code: "KeyK", key: "k", meta: false, ctrl: true, alt: false, shift: false
+  };
+  const retiredShortcut: AppShortcutCombo = {
+    code: "KeyU", key: "u", meta: false, ctrl: true, alt: false, shift: false
+  };
+  for (const combo of [bootstrapShortcut, staleShortcut, newestShortcut, retiredShortcut]) {
+    expect(validateAppShortcutCombo(id, combo, {}, "win32")).toBeNull();
+  }
+  const initialRead = deferred<UiPreferences | undefined>();
+  const bootstrapAppearanceRead = controlledPreferenceRead();
+  const bootstrapShortcutRead = controlledPreferenceRead();
+  const staleRead = controlledPreferenceRead();
+  const newestRead = controlledPreferenceRead();
+  const retiredRead = controlledPreferenceRead();
+  const controlledReads = [
+    bootstrapAppearanceRead,
+    bootstrapShortcutRead,
+    staleRead,
+    newestRead,
+    retiredRead
+  ];
+  let firstRead = true;
+  const readPreferences = vi.fn((): Promise<UiPreferences | undefined> => {
+    if (firstRead) {
+      firstRead = false;
+      return initialRead.promise;
+    }
+    const controlled = controlledReads.shift();
+    return controlled === undefined ? Promise.resolve(DEFAULT_UI_PREFERENCES) : controlled.read();
+  });
+  vi.spyOn(LocalState, "open").mockResolvedValue({
+    listProfiles: async () => [],
+    listMachineCaches: async () => [],
+    readPreferences
+  } as unknown as LocalState);
+
+  let controller: AppController | undefined;
+  const observedShortcutCodes: Array<string | undefined> = [];
+  const host = document.createElement("div");
+  document.body.append(host);
+  root = createRoot(host);
+  function Probe(): null {
+    controller = useAppController();
+    const override = controller.state.preferences.appShortcutOverrides[id];
+    observedShortcutCodes.push(override === null ? "disabled" : override?.code);
+    return null;
+  }
+  await act(async () => { root?.render(<Probe />); });
+  await vi.waitFor(() => expect(readPreferences).toHaveBeenCalledOnce());
+
+  const appearanceSnapshot = { ...DEFAULT_UI_PREFERENCES, theme: "light" as const };
+  const bootstrapSnapshot = {
+    ...appearanceSnapshot,
+    appShortcutOverrides: { [id]: bootstrapShortcut }
+  };
+  await act(async () => {
+    publishAppearancePreferencesChange();
+    await Promise.resolve();
+    initialRead.resolve(DEFAULT_UI_PREFERENCES);
+  });
+  await bootstrapAppearanceRead.started.promise;
+  await act(async () => {
+    publishAppShortcutPreferencesChange();
+    await Promise.resolve();
+    bootstrapAppearanceRead.result.resolve(appearanceSnapshot);
+  });
+  await bootstrapShortcutRead.started.promise;
+  await act(async () => { bootstrapShortcutRead.result.resolve(bootstrapSnapshot); });
+  await vi.waitFor(() => {
+    expect(controller?.state.ready).toBe(true);
+    expect(controller?.state.preferences).toMatchObject({
+      theme: "light",
+      appShortcutOverrides: { [id]: bootstrapShortcut }
+    });
+  });
+
+  publishAppShortcutPreferencesChange();
+  await staleRead.started.promise;
+  publishAppShortcutPreferencesChange();
+  await act(async () => {
+    staleRead.result.resolve({
+      ...bootstrapSnapshot,
+      appShortcutOverrides: { [id]: staleShortcut }
+    });
+  });
+  await newestRead.started.promise;
+  expect(controller?.state.preferences.appShortcutOverrides).toEqual({ [id]: bootstrapShortcut });
+  expect(observedShortcutCodes).not.toContain(staleShortcut.code);
+  await act(async () => {
+    newestRead.result.resolve({
+      ...bootstrapSnapshot,
+      appShortcutOverrides: { [id]: newestShortcut }
+    });
+  });
+  await vi.waitFor(() => {
+    expect(controller?.state.preferences.appShortcutOverrides).toEqual({ [id]: newestShortcut });
+  });
+  expect(observedShortcutCodes).not.toContain(staleShortcut.code);
+
+  publishAppShortcutPreferencesChange();
+  await retiredRead.started.promise;
+  const retiredController = controller!;
+  await act(async () => { root?.render(<></>); });
+  expect(channels.size).toBe(0);
+  await act(async () => {
+    retiredRead.result.resolve({
+      ...bootstrapSnapshot,
+      appShortcutOverrides: { [id]: retiredShortcut }
+    });
+    await Promise.resolve();
+  });
+  expect(retiredController.state.preferences.appShortcutOverrides).toEqual({ [id]: newestShortcut });
+  expect(observedShortcutCodes).not.toContain(retiredShortcut.code);
 });
 
 it("waits for confirmed bootstrap preferences before applying native window zoom", async () => {
@@ -293,7 +667,7 @@ it("adopts durable appearance and bases zoom intent on the latest cross-controll
   await act(async () => { await first!.setCodeFamily("Mono"); });
   await Promise.resolve();
   expect(retiredSecond.state.preferences.codeFamily).toBe("");
-  expect(channels.size).toBe(1);
+  expect(channels.size).toBe(2);
 
   const setZoomFactor = vi.fn(async () => undefined);
   vi.stubGlobal("jokoDesktop", {
@@ -500,6 +874,35 @@ function deferred<T>(): Deferred<T> {
   let resolve!: (value: T) => void;
   const promise = new Promise<T>((accept) => { resolve = accept; });
   return { promise, resolve: (value?: T) => resolve(value as T) };
+}
+
+function controlledPreferenceRead(): {
+  readonly started: Deferred<void>;
+  readonly result: Deferred<UiPreferences | undefined>;
+  readonly read: () => Promise<UiPreferences | undefined>;
+} {
+  const started = deferred<void>();
+  const result = deferred<UiPreferences | undefined>();
+  return {
+    started,
+    result,
+    read: () => {
+      started.resolve();
+      return result.promise;
+    }
+  };
+}
+
+function shortcutEvent(combo: AppShortcutCombo): Pick<KeyboardEvent,
+  "code" | "metaKey" | "ctrlKey" | "altKey" | "shiftKey"
+> {
+  return {
+    code: combo.code,
+    metaKey: combo.meta,
+    ctrlKey: combo.ctrl,
+    altKey: combo.alt,
+    shiftKey: combo.shift
+  };
 }
 
 function installThemeColorMeta(): HTMLMetaElement {

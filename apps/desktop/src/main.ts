@@ -61,7 +61,6 @@ import {
   type DesktopSaveFileRequest,
   type DesktopSessionDragPreviewRequest,
   type DesktopSessionWindowOwner,
-  type DesktopWindowInteractionSettings,
   type DesktopUpdateRelaunchRequest,
   type DesktopUpdateRelaunchResult,
   type DesktopUpdateChannelSettings,
@@ -217,6 +216,12 @@ import {
   type DesktopKeepAwakeSettingsStore
 } from "./keep-awake-settings.js";
 import {
+  broadcastDesktopKeepAwakeSettings,
+  createDesktopKeepAwakeSettingsCoordinator,
+  type DesktopKeepAwakeSettingsCoordinator
+} from "./keep-awake-settings-coordinator.js";
+import {
+  broadcastDesktopWindowInteractionSettings,
   createDesktopWindowInteractionSettingsStore,
   type DesktopWindowInteractionSettingsStore
 } from "./window-interaction-settings.js";
@@ -693,6 +698,7 @@ let desktopUpdateAutoSettings: DesktopUpdateAutoSettingsStore | undefined;
 let desktopUpdateChannelSettings: DesktopUpdateChannelSettingsStore | undefined;
 let desktopKeepAwakeSettings: DesktopKeepAwakeSettingsStore | undefined;
 let desktopKeepAwakeController: DesktopKeepAwakeController | undefined;
+let desktopKeepAwakeCoordinator: DesktopKeepAwakeSettingsCoordinator | undefined;
 let desktopWindowInteractionSettings: DesktopWindowInteractionSettingsStore | undefined;
 let desktopMainWindowCloseSettings: DesktopMainWindowCloseSettingsStore | undefined;
 let mainWindowCloseController: DesktopMainWindowCloseController | undefined;
@@ -6026,8 +6032,18 @@ async function initializeDesktopKeepAwake(): Promise<void> {
   if (desktopKeepAwakeController === undefined) {
     desktopKeepAwakeController = createDesktopKeepAwakeController(powerSaveBlocker);
   }
-  const settings = await desktopKeepAwakeSettings.initialize();
-  desktopKeepAwakeController.apply(settings.enabled);
+  if (desktopKeepAwakeCoordinator === undefined) {
+    desktopKeepAwakeCoordinator = createDesktopKeepAwakeSettingsCoordinator(
+      desktopKeepAwakeSettings,
+      desktopKeepAwakeController,
+      (settings) => broadcastDesktopKeepAwakeSettings(
+        applicationWindows(),
+        DESKTOP_CHANNELS.keepAwakeChanged,
+        settings
+      )
+    );
+  }
+  await desktopKeepAwakeCoordinator.initialize();
 }
 
 async function initializeDesktopWindowInteractionSettings(): Promise<void> {
@@ -6385,18 +6401,6 @@ function broadcastDesktopUpdateStatus(status: DesktopUpdateStatus): void {
       // A renderer reload/crash is an observer failure, never an updater state
       // transition. getStatus provides the authoritative snapshot on remount.
     }
-  }
-}
-
-function broadcastDesktopWindowInteractionSettings(settings: DesktopWindowInteractionSettings): void {
-  for (const window of applicationWindows()) {
-    if (!window.webContents.isDestroyed()) {
-      window.webContents.send(DESKTOP_CHANNELS.windowInteractionChanged, settings);
-    }
-  }
-  if (inspectorWindow !== undefined && !inspectorWindow.isDestroyed() &&
-    !inspectorWindow.webContents.isDestroyed()) {
-    inspectorWindow.webContents.send(DESKTOP_CHANNELS.windowInteractionChanged, settings);
   }
 }
 
@@ -7439,7 +7443,10 @@ function registerIpc(): void {
     }
     const settings = await requireDesktopWindowInteractionSettings()
       .setSwallowActivationClick(parameters[0]);
-    broadcastDesktopWindowInteractionSettings(settings);
+    broadcastDesktopWindowInteractionSettings([
+      ...applicationWindows(),
+      ...(inspectorWindow === undefined ? [] : [inspectorWindow])
+    ], DESKTOP_CHANNELS.windowInteractionChanged, settings);
     return settings;
   });
   ipcMain.handle(DESKTOP_CHANNELS.pageSearchStart, (event, ...parameters: unknown[]) => {
@@ -7741,18 +7748,15 @@ function registerIpc(): void {
   ipcMain.handle(DESKTOP_CHANNELS.keepAwakeGet, async (event, ...parameters: unknown[]) => {
     assertTrustedIpcSender(event);
     if (parameters.length !== 0) throw new TypeError("Desktop keep-awake get does not accept parameters.");
-    const store = requireDesktopKeepAwakeSettings();
-    await store.initialize();
-    return store.get();
+    return requireDesktopKeepAwakeCoordinator().get();
   });
   ipcMain.handle(DESKTOP_CHANNELS.keepAwakeSet, async (event, ...parameters: unknown[]) => {
     assertTrustedIpcSender(event);
     if (parameters.length !== 1 || typeof parameters[0] !== "boolean") {
       throw new TypeError("Desktop keep-awake set requires one boolean.");
     }
-    const settings = await requireDesktopKeepAwakeSettings().setEnabled(parameters[0]);
-    requireDesktopKeepAwakeController().apply(settings.enabled);
-    return settings;
+    const result = await requireDesktopKeepAwakeCoordinator().setEnabled(parameters[0]);
+    return result.settings;
   });
   ipcMain.handle(DESKTOP_CHANNELS.microphoneGetPermission, (event, ...parameters: unknown[]) => {
     assertTrustedIpcSender(event);
@@ -8240,18 +8244,11 @@ function requireDesktopUpdateChannelSettings(): DesktopUpdateChannelSettingsStor
   return desktopUpdateChannelSettings;
 }
 
-function requireDesktopKeepAwakeSettings(): DesktopKeepAwakeSettingsStore {
-  if (desktopKeepAwakeSettings === undefined) {
+function requireDesktopKeepAwakeCoordinator(): DesktopKeepAwakeSettingsCoordinator {
+  if (desktopKeepAwakeCoordinator === undefined) {
     throw new Error("Desktop keep-awake settings are not initialized.");
   }
-  return desktopKeepAwakeSettings;
-}
-
-function requireDesktopKeepAwakeController(): DesktopKeepAwakeController {
-  if (desktopKeepAwakeController === undefined) {
-    throw new Error("Desktop keep-awake controller is not initialized.");
-  }
-  return desktopKeepAwakeController;
+  return desktopKeepAwakeCoordinator;
 }
 
 function requireDesktopWindowInteractionSettings(): DesktopWindowInteractionSettingsStore {

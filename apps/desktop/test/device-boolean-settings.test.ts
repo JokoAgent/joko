@@ -1,12 +1,16 @@
 import { readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { createDesktopKeepAwakeSettingsStore } from "../src/keep-awake-settings.js";
 import { createDesktopUpdateAutoSettingsStore } from "../src/update-auto-settings.js";
 import { createDesktopUpdateChannelSettingsStore } from "../src/update-channel-settings.js";
-import { createDesktopWindowInteractionSettingsStore } from "../src/window-interaction-settings.js";
+import {
+  broadcastDesktopWindowInteractionSettings,
+  createDesktopWindowInteractionSettingsStore,
+  type DesktopWindowInteractionSettingsObserver
+} from "../src/window-interaction-settings.js";
 import { mkdtemp } from "./test-paths.js";
 
 interface BooleanSettingsAdapter {
@@ -115,6 +119,36 @@ describe("device-local boolean settings", () => {
       }
     }
   });
+});
+
+it("broadcasts committed activation-click settings to each live observer independently", () => {
+  const failedSend = vi.fn(() => { throw new Error("renderer retired during send"); });
+  const laterApplicationSend = vi.fn();
+  const inspectorSend = vi.fn();
+  const observers: DesktopWindowInteractionSettingsObserver[] = [
+    {
+      isDestroyed: () => false,
+      webContents: { isDestroyed: () => false, send: failedSend }
+    },
+    {
+      isDestroyed: () => false,
+      webContents: { isDestroyed: () => false, send: laterApplicationSend }
+    },
+    {
+      isDestroyed: () => false,
+      webContents: { isDestroyed: () => false, send: inspectorSend }
+    }
+  ];
+  const settings = Object.freeze({ swallowActivationClick: true });
+
+  expect(() => broadcastDesktopWindowInteractionSettings(
+    observers,
+    "window-interaction:changed",
+    settings
+  )).not.toThrow();
+  expect(failedSend).toHaveBeenCalledWith("window-interaction:changed", settings);
+  expect(laterApplicationSend).toHaveBeenCalledWith("window-interaction:changed", settings);
+  expect(inspectorSend).toHaveBeenCalledWith("window-interaction:changed", settings);
 });
 
 function flag(value: unknown, key: string): boolean {
