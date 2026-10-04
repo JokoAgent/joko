@@ -218,13 +218,31 @@ export function mergeTimelineWindows(
   if (historical.length === 0) return recent;
   const byId = new Map<string, TimelineItemView>();
   for (const item of historical) byId.set(item.id, item);
-  // The current snapshot wins when a streamed/reduced item also exists in the
-  // historical window.
-  for (const item of recent) byId.set(item.id, item);
+  // Current content and terminal state win; an older page can still supply the
+  // first activity anchor and observed time facts missing from a reduced window.
+  for (const item of recent) {
+    const previous = byId.get(item.id);
+    const tool = previous !== undefined && (item.kind === "tool" || item.kind === "toolResult")
+      && (previous.kind === "tool" || previous.kind === "toolResult") && item.tool?.id === previous.tool?.id;
+    const thinking = previous?.kind === "thinking" && item.kind === "thinking"
+      && item.messageId !== undefined && item.contentIndex !== undefined
+      && item.messageId === previous.messageId && item.contentIndex === previous.contentIndex;
+    if (!previous || !tool && !thinking) { byId.set(item.id, item); continue; }
+    const first = previous.sequence < item.sequence ? previous : item;
+    const endedAt = tool ? maximumActivityTimestamp(item.endedAt, previous.endedAt) : undefined;
+    const lastActivityAt = thinking ? maximumActivityTimestamp(item.lastActivityAt, previous.lastActivityAt) : undefined;
+    byId.set(item.id, { ...item, sequence: first.sequence, createdAt: first.createdAt,
+      ...(endedAt === undefined ? {} : { endedAt }), ...(lastActivityAt === undefined ? {} : { lastActivityAt }) });
+  }
   return [...byId.values()].sort((left, right) => {
     if (left.sequence !== right.sequence) return left.sequence < right.sequence ? -1 : 1;
     return left.id.localeCompare(right.id);
   });
+}
+
+function maximumActivityTimestamp(left: number | undefined, right: number | undefined): number | undefined {
+  const values = [left, right].filter((value): value is number => value !== undefined && Number.isFinite(value));
+  return values.length ? Math.max(...values) : undefined;
 }
 
 function cloneTimelineViewportState(state: TimelineViewportState): TimelineViewportState {
