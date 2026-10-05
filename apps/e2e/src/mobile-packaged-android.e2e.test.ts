@@ -181,12 +181,50 @@ nativeIt("pairs, sends through native rich input, opens canonical resources, and
     && items.some((node) => node.contentDescription === "Copy image" && node.enabled),
   "native gallery retained across scheduled observations", 22_000);
   await screenshot("gallery");
+  const densityMatch = (await adb("shell", "wm", "density")).match(/(?:Physical|Override) density: (\d+)/gu)?.at(-1)?.match(/(\d+)/u);
+  if (!densityMatch) throw new Error("The isolated native display density was unavailable.");
+  const pixelsPerPoint = Number(densityMatch[1]) / 160;
+  const canvas = await waitNode((node) => node.contentDescription === "Image preview pixel.png", "native gallery gesture canvas");
+  const x = Math.round((canvas.bounds.x1 + canvas.bounds.x2) / 2);
+  const y = Math.round((canvas.bounds.y1 + canvas.bounds.y2) / 2);
+  await adb("shell", `input tap ${x} ${y}; input tap ${x} ${y}`);
+  await waitNode((node) => node.text?.includes("2.5") === true, "native double-tap zoom");
+  await adb("shell", "input", "tap", String(x), String(y));
+  const zoomTapAt = Date.now();
+  await waitFor(nodes, (items) => Date.now() - zoomTapAt >= 400
+    && items.some((node) => node.text?.includes("2.5") === true)
+    && items.some((node) => node.contentDescription === "Copy image" && node.enabled), "zoomed tap keeps the gallery open", 5_000);
+  await screenshot("gallery-zoomed");
+  await tap("Reset");
+  await waitNode((node) => node.text?.includes("1.0") === true, "native gallery zoom reset");
+  await adb("shell", "input", "swipe", String(x), String(y), String(x), String(y + Math.round(90 * pixelsPerPoint)), "900");
+  const shortDragAt = Date.now();
+  await waitFor(nodes, (items) => Date.now() - shortDragAt >= 1_000
+    && items.some((node) => node.contentDescription === "Copy image" && node.enabled), "short native vertical drag returns to the gallery", 5_000);
+  await screenshot("gallery-drag-reset");
+  await adb("shell", "input", "tap", String(x), String(y));
+  await waitNode((node) => node.text === taskName, "task restored after a native gallery tap");
+  await tap("Workspace image", true);
+  await waitNode((node) => node.contentDescription === "Copy image" && node.enabled, "reopened native gallery decode readiness");
+  const verticalCanvas = await waitNode((node) => node.contentDescription === "Image preview pixel.png", "reopened native gesture canvas");
+  const distance = Math.round(160 * pixelsPerPoint);
+  expect(verticalCanvas.bounds.y2 - verticalCanvas.bounds.y1).toBeGreaterThan(distance + 20);
+  const startY = Math.round(Math.min((verticalCanvas.bounds.y1 + verticalCanvas.bounds.y2) / 2, verticalCanvas.bounds.y2 - distance - 10));
+  await adb("shell", "input", "swipe", String(x), String(startY), String(x), String(startY + distance), "600");
+  await waitNode((node) => node.text === taskName, "task restored after a native vertical dismissal");
+  await screenshot("gallery-dismissed");
+  await tap("Workspace image", true);
+  await waitNode((node) => node.contentDescription === "Copy image" && node.enabled, "gallery restored before explicit native close");
   await tap("Close");
   await waitNode((node) => node.text === taskName, "task restored after closing the gallery");
   await screenshot("resource-links");
   await tap("README.md:2:4", true, true);
   await waitNode((node) => node.text?.includes("focus line") === true, "canonical file contents");
-  await waitNode((node) => node.text === "Line 2", "canonical file line focus");
+  await screenshot("file-opened");
+  await waitNode((node) => node.text === "Line 2" || node.contentDescription === "Line 2", "canonical file line focus");
+  await tap("Source");
+  await tap("Copy source");
+  await waitNode((node) => node.text === "Copied.", "native file source copy completion");
   await screenshot("file");
 
   await adb("shell", "am", "force-stop", packageName);
@@ -229,7 +267,7 @@ async function nodes(): Promise<readonly AndroidUiNode[]> {
 
 async function waitNode(predicate: (node: AndroidUiNode) => boolean, label: string): Promise<AndroidUiNode> {
   const found = await waitFor(async () => (await nodes()).find(predicate), (node) => node !== undefined, label, 25_000).catch(async (error) => {
-    if (label === "native gallery decode readiness" || label === "canonical file contents" || label === "restored canonical file contents"
+    if (label === "native gallery decode readiness" || label === "canonical file contents" || label === "canonical file line focus" || label === "native file source copy completion" || label === "restored canonical file contents"
       || label === "restored native task title" || label === "persisted native task input") {
       await screenshot(label === "native gallery decode readiness" ? "gallery-error" : label.startsWith("restored")
         || label === "persisted native task input" ? "restored-error" : "file-error");
