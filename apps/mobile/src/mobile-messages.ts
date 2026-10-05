@@ -7,6 +7,7 @@ import { mobileTaskMessages } from "./mobile-task-messages";
 import { mobileUpdateMessages } from "./mobile-update-messages";
 import { mobileVoiceMessages } from "./mobile-voice-messages";
 import { mobileVoiceReadOnlyMessages } from "./mobile-voice-readonly-messages";
+import { mobileFilesMessages } from "./mobile-files-messages";
 
 const en = {
   "common.about": "About",
@@ -320,6 +321,7 @@ const en = {
   ...mobilePushMessages.en,
   ...mobileUpdateMessages.en,
   ...mobileVoiceMessages.en,
+  ...mobileFilesMessages.en,
   ...mobileVoiceReadOnlyMessages.en
 } as const;
 
@@ -638,6 +640,7 @@ const zhCN: MobileMessageCatalog = {
   ...mobilePushMessages["zh-CN"],
   ...mobileUpdateMessages["zh-CN"],
   ...mobileVoiceMessages["zh-CN"],
+  ...mobileFilesMessages["zh-CN"],
   ...mobileVoiceReadOnlyMessages["zh-CN"]
 };
 
@@ -953,6 +956,7 @@ const zhTW: MobileMessageCatalog = {
   ...mobilePushMessages["zh-TW"],
   ...mobileUpdateMessages["zh-TW"],
   ...mobileVoiceMessages["zh-TW"],
+  ...mobileFilesMessages["zh-TW"],
   ...mobileVoiceReadOnlyMessages["zh-TW"]
 };
 
@@ -1268,6 +1272,7 @@ const ja: MobileMessageCatalog = {
   ...mobilePushMessages.ja,
   ...mobileUpdateMessages.ja,
   ...mobileVoiceMessages.ja,
+  ...mobileFilesMessages.ja,
   ...mobileVoiceReadOnlyMessages.ja
 };
 
@@ -1583,6 +1588,7 @@ const ko: MobileMessageCatalog = {
   ...mobilePushMessages.ko,
   ...mobileUpdateMessages.ko,
   ...mobileVoiceMessages.ko,
+  ...mobileFilesMessages.ko,
   ...mobileVoiceReadOnlyMessages.ko
 };
 

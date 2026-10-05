@@ -68,6 +68,7 @@ import {
   mobilePushDeviceStore,
   mobileStorage,
   mobileThemePreferences,
+  mobileFilesPreferences,
   mobileVoicePreferences,
   mobileUpdates
 } from "./storage";
@@ -234,7 +235,6 @@ import {
 import {
   artifactTitle,
   workspaceBasename,
-  workspaceParentPath,
   type MobileFilePreview,
   type MobileFileSearchResult,
   type MobileFilesComposerSource,
@@ -273,6 +273,10 @@ import { MobileOfflineNotice } from "./MobileOfflineNotice";
 import { MobileAutomationsScreen } from "./MobileAutomationsScreen";
 import { MobilePartnersScreen } from "./MobilePartnersScreen";
 import { MobileFilesToolbar } from "./MobileFilesToolbar";
+import { MobileFilesBrowser } from "./MobileFilesBrowser";
+import { mobileFilesThumbnailCache } from "./mobile-files-thumbnail-cache";
+import { MobileFilesClipboard, type MobileFilesClipboardResult } from "./mobile-files-clipboard";
+import type { MobileFilesPreferences } from "./mobile-files-presentation";
 import { MobileSettingsScreen } from "./MobileSettingsScreen";
 import { MobileVoiceDictionaryReadOnlyController } from "./mobile-voice-dictionary-readonly-controller";
 import { mobileReadOnlyDictionarySources } from "./mobile-voice-dictionary-readonly";
@@ -311,7 +315,8 @@ const client = new MobileClient(
   mobileModelPreviewFiles,
   mobileFileShare,
   mobileOfflineCache,
-  mobileReadOnlyDictionaryCache
+  mobileReadOnlyDictionaryCache,
+  mobileFilesThumbnailCache
 );
 const readOnlyDictionary = new MobileVoiceDictionaryReadOnlyController(mobileReadOnlyDictionaryCache,
   (profileId, signal) => client.voiceDictionaryReadOnlyTransport(profileId, signal));
@@ -5898,6 +5903,9 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
   </View>;
 }
 
+const filesClipboard = new MobileFilesClipboard((text) => Clipboard.setStringAsync(text));
+const filesClipboardMessages = { copied: "files.presentation.copied", failed: "files.presentation.copyFailed", unknown: "files.presentation.copyUnknown", busy: "files.presentation.copyBusy" } as const;
+
 function FilesScreen({ colors, state, locale, onBack, onAdded, initialSource }: ScreenProps & {
   onBack: () => void; onAdded: () => void; initialSource?: MobileFilesComposerSource;
 }) {
@@ -5910,6 +5918,9 @@ function FilesScreen({ colors, state, locale, onBack, onAdded, initialSource }: 
   const [fileShareBusy, setFileShareBusy] = useState(false);
   const [fileShareProgress, setFileShareProgress] = useState<MobileFileShareProgress>();
   const [galleryOpening, setGalleryOpening] = useState(false);
+  const [clipboardBusy, setClipboardBusy] = useState(false);
+  const [clipboardNotice, setClipboardNotice] = useState<Exclude<MobileFilesClipboardResult, "retired">>();
+  const clipboardFlight = useRef<symbol | undefined>(undefined);
   const [previewSource, setPreviewSource] = useState<MobileFilesComposerSource | undefined>(initialSource);
   const handoffRef = useRef<AbortController | undefined>(undefined);
   const fileShareRef = useRef<AbortController | undefined>(undefined);
@@ -5922,7 +5933,46 @@ function FilesScreen({ colors, state, locale, onBack, onAdded, initialSource }: 
     client.closeFiles();
     onAdded();
   });
-  const filesBusy = handoffBusy || fileShareBusy || galleryOpening || imageGallery.view !== undefined;
+  const filesBusy = handoffBusy || fileShareBusy || galleryOpening || clipboardBusy || imageGallery.view !== undefined;
+  useEffect(() => {
+    filesClipboard.cancel(); clipboardFlight.current = undefined; setClipboardBusy(false); setClipboardNotice(undefined);
+    return () => { filesClipboard.cancel(); clipboardFlight.current = undefined; };
+  }, [authorityKey, files.open, files.directoryRevision, files.artifactsRevision, files.location, files.preview, files.status]);
+  const copyPath = (source?: MobileFilesComposerSource): void => {
+    if (client.state.files !== files || client.filesAuthorityKey() !== authorityKey) return;
+    if (clipboardFlight.current || filesBusy) return;
+    const flight = Symbol(); clipboardFlight.current = flight;
+    setClipboardBusy(true); setClipboardNotice(undefined);
+    let lease: ReturnType<MobileClient["prepareFilesPathCopy"]>;
+    try { lease = client.prepareFilesPathCopy(files, source); }
+    catch { clipboardFlight.current = undefined; setClipboardBusy(false); setClipboardNotice("failed"); return; }
+    void filesClipboard.copy(lease).then((result) => {
+      if (!filesMountedRef.current || clipboardFlight.current !== flight || result === "retired") return;
+      try { lease.assertCurrent(); setClipboardNotice(result); } catch { /* The completed write belongs to the retired source. */ }
+    }).finally(() => {
+      if (clipboardFlight.current === flight) { clipboardFlight.current = undefined; if (filesMountedRef.current) setClipboardBusy(false); }
+    });
+  };
+  const preferenceRevision = useSyncExternalStore(useCallback((listener) => mobileFilesPreferences.subscribe(listener), []), () => mobileFilesPreferences.revision);
+  const preferenceScope = useMemo(() => state.activeProfileId && state.owner?.server?.serverId && files.workspace?.workspaceId
+    ? { profileId: state.activeProfileId, serverId: state.owner.server.serverId, workspaceId: files.workspace.workspaceId } : undefined,
+  [state.activeProfileId, state.owner?.server?.serverId, files.workspace?.workspaceId]);
+  const filesPreferences = useMemo(() => mobileFilesPreferences.get(preferenceScope), [preferenceRevision, preferenceScope]);
+  const preferenceScopeKey = preferenceScope ? JSON.stringify(preferenceScope) : "";
+  const preferenceScopeRef = useRef(preferenceScopeKey); preferenceScopeRef.current = preferenceScopeKey;
+  const [preferenceFailed, setPreferenceFailed] = useState(false);
+  useEffect(() => {
+    let current = true; setPreferenceFailed(false);
+    void mobileFilesPreferences.hydrate().catch(() => { if (current) setPreferenceFailed(true); });
+    return () => { current = false; };
+  }, [preferenceScopeKey]);
+  const setFilesPreferences = (preferences: MobileFilesPreferences): void => {
+    if (!preferenceScope || filesBusy) return;
+    setPreferenceFailed(false); const key = preferenceScopeKey;
+    void mobileFilesPreferences.set(preferenceScope, preferences).catch(() => {
+      if (filesMountedRef.current && preferenceScopeRef.current === key) setPreferenceFailed(true);
+    });
+  };
 
   useEffect(() => {
     if (!connected || !authorityKey) return;
@@ -5936,6 +5986,7 @@ function FilesScreen({ colors, state, locale, onBack, onAdded, initialSource }: 
     filesMountedRef.current = true;
     return () => {
       filesMountedRef.current = false;
+      filesClipboard.cancel(); clipboardFlight.current = undefined;
       handoffRef.current?.abort();
       handoffRef.current = undefined;
       fileShareRef.current?.abort();
@@ -5958,6 +6009,7 @@ function FilesScreen({ colors, state, locale, onBack, onAdded, initialSource }: 
     void action().catch((error) => setLocalError(errorText(error)));
   };
   const leave = (): void => {
+    filesClipboard.cancel(); clipboardFlight.current = undefined;
     handoffRef.current?.abort();
     handoffRef.current = undefined;
     fileShareRef.current?.abort();
@@ -5981,7 +6033,7 @@ function FilesScreen({ colors, state, locale, onBack, onAdded, initialSource }: 
     setLocalError("");
     client.closeFilesPreview();
     setPreviewSource(undefined);
-    void imageGallery.open((signal) => client.openFilesImageGallery(source, signal))
+    void imageGallery.open((signal) => client.openFilesImageGallery(source, signal, filesPreferences.sort))
       .catch((error) => setLocalError(errorText(error)))
       .finally(() => setGalleryOpening(false));
   };
@@ -6057,6 +6109,11 @@ function FilesScreen({ colors, state, locale, onBack, onAdded, initialSource }: 
       <Text style={[styles.caption, styles.fill, { color: colors.muted }]}>{mobileMessage(locale, "files.offline")}</Text>
     </View>}
     {(localError || files.error) && <Banner text={localError || files.error || ""} colors={colors} />}
+    {preferenceFailed && <Banner text={mobileMessage(locale, "files.presentation.preferenceError")} colors={colors} />}
+    {clipboardNotice && <Notice text={mobileMessage(locale, filesClipboardMessages[clipboardNotice])} colors={colors} locale={locale} onDismiss={() => setClipboardNotice(undefined)} />}
+    {clipboardBusy && <View accessibilityLiveRegion="polite" style={styles.connectionNotice}>
+      <ActivityIndicator color={colors.accent} /><Text style={[styles.caption, { color: colors.muted }]}>{mobileMessage(locale, "files.presentation.copying")}</Text>
+    </View>}
     {imageOutputNotice && <Notice text={imageOutputNotice} colors={colors} locale={locale}
       onDismiss={() => setImageOutputNotice("")} />}
     {handoffBusy && <View accessibilityLiveRegion="polite" style={[styles.connectionNotice, { backgroundColor: colors.surface, borderColor: colors.border }]}>
@@ -6092,8 +6149,7 @@ function FilesScreen({ colors, state, locale, onBack, onAdded, initialSource }: 
 
     {files.status === "loading" && files.entries.length === 0 && files.artifacts.length === 0
       ? <Centered label={mobileMessage(locale, "files.loading")} colors={colors} />
-      : <ScrollView style={styles.fill} contentContainerStyle={styles.filesList} keyboardShouldPersistTaps="handled">
-        {searching ? <>
+      : searching ? <ScrollView style={styles.fill} contentContainerStyle={styles.filesList} keyboardShouldPersistTaps="handled">
           <Text style={[styles.section, { color: colors.muted }]}>{mobileMessage(locale, "files.searchResults")}</Text>
           {files.searchStatus === "ready" && files.searchResults.length === 0
             && <Text style={[styles.description, { color: colors.muted }]}>{mobileMessage(locale, "files.noMatches")}</Text>}
@@ -6112,96 +6168,23 @@ function FilesScreen({ colors, state, locale, onBack, onAdded, initialSource }: 
                 count: files.searchResults.length
               })}
           </Text>}
-        </> : files.location.kind === "generated" ? <>
-          <Text style={[styles.section, { color: colors.muted }]}>{mobileMessage(locale, "files.generatedByTask")}</Text>
-          {files.artifacts.length === 0
-            && <Text style={[styles.description, { color: colors.muted }]}>{mobileMessage(locale, "files.generatedEmpty")}</Text>}
-          {files.artifacts.map((artifact) => {
-            const galleryImage = mobileImageGalleryMediaType(artifact.blob?.mediaType ?? "") !== undefined;
-            const model = artifact.blob
-              ? mobileModelPreviewKind(artifact.blob.mediaType, artifact.blob.fileName) !== undefined : false;
-            const source = { kind: "artifact" as const, artifact };
-            return <View key={artifact.artifactId} style={styles.fileActionRow}>
-            <Pressable accessibilityRole="button"
-              accessibilityLabel={mobileMessage(locale, galleryImage ? "files.openGalleryFor" : "files.previewGenerated", {
-                name: artifactTitle(artifact)
-              })}
-              disabled={!connected || filesBusy}
-              onPress={() => galleryImage
-                ? openGallery(source)
-                : openPreview(source, () => client.previewArtifact(artifact))}
-              style={[styles.fileRow, styles.fileRowMain, { backgroundColor: colors.surface, borderColor: colors.border },
-                (!connected || filesBusy) && styles.disabled]}>
-              <Text style={styles.fileGlyph}>{galleryImage ? "▧" : model ? "⬡" : "◆"}</Text>
-              <View style={styles.fill}><Text style={[styles.label, { color: colors.ink }]} numberOfLines={1}>{artifactTitle(artifact)}</Text>
-                <Text style={[styles.caption, { color: colors.muted }]} numberOfLines={1}>
-                  {artifact.blob ? `${artifact.blob.mediaType || "application/octet-stream"} · ${formatByteSize(artifact.blob.byteSize)}`
-                    : mobileMessage(locale, "files.blobUnavailable")}
-                </Text></View>
-              <Text style={[styles.chevron, { color: colors.muted }]}>›</Text>
-            </Pressable>
-            <Action label={mobileMessage(locale, "common.add")}
-              accessibilityLabel={mobileMessage(locale, "files.addGenerated", { name: artifactTitle(artifact) })}
-              compact colors={colors} disabled={!connected || filesBusy}
-              onPress={() => addToComposer(source)} />
-            <Action label={mobileMessage(locale, "common.share")}
-              accessibilityLabel={mobileMessage(locale, "files.shareGenerated", { name: artifactTitle(artifact) })}
-              compact colors={colors} disabled={!connected || filesBusy || !shareableBlobSize(artifact.blob?.byteSize)}
-              onPress={() => shareFile(source)} />
-          </View>})}
-        </> : <>
-          <View style={styles.sectionHeader}>
-            <Text style={[styles.section, { color: colors.muted }]}>{files.location.path || mobileMessage(locale, "files.workspaceRoot")}</Text>
-            {files.location.path && <Action label={mobileMessage(locale, "files.up")} compact colors={colors} disabled={!connected || filesBusy}
-              onPress={() => run(() => client.openFilesDirectory(workspaceParentPath(files.location.kind === "workspace" ? files.location.path : "")))} />}
-          </View>
-          {files.entries.length === 0
-            && <Text style={[styles.description, { color: colors.muted }]}>{mobileMessage(locale, "files.directoryEmpty")}</Text>}
-          {files.entries.map((entry) => {
-            const label = entry.displayName || workspaceBasename(entry.relativePath);
-            const galleryImage = entry.kind === FileKind.REGULAR
-              && mobileImageGalleryMediaType(entry.mediaType) !== undefined;
-            const model = entry.kind === FileKind.REGULAR
-              && mobileModelPreviewKind(entry.mediaType, entry.relativePath) !== undefined;
-            const source = { kind: "workspace-entry" as const, entry };
-            return <View key={entry.relativePath} style={styles.fileActionRow}>
-              <Pressable accessibilityRole="button"
-                accessibilityLabel={mobileMessage(locale, entry.kind === FileKind.DIRECTORY
-                  ? "files.openDirectory" : galleryImage ? "files.openGalleryFor" : "files.previewFile", { name: label })}
-                disabled={!connected || filesBusy}
-                onPress={() => entry.kind === FileKind.DIRECTORY
-                  ? run(() => client.previewWorkspaceEntry(entry))
-                  : galleryImage
-                    ? openGallery(source)
-                    : openPreview(source, () => client.previewWorkspaceEntry(entry))}
-                style={[styles.fileRow, styles.fileRowMain, { backgroundColor: colors.surface, borderColor: colors.border },
-                  (!connected || filesBusy) && styles.disabled]}>
-                <Text style={styles.fileGlyph}>{entry.kind === FileKind.DIRECTORY ? "▰" : galleryImage ? "▧" : model ? "⬡" : "◇"}</Text>
-                <View style={styles.fill}>
-                  <Text style={[styles.label, { color: colors.ink }]} numberOfLines={1}>{label}</Text>
-                  <Text style={[styles.caption, { color: colors.muted }]} numberOfLines={1}>
-                    {entry.kind === FileKind.DIRECTORY ? mobileMessage(locale, "files.directory")
-                      : `${entry.mediaType || "application/octet-stream"} · ${formatByteSize(entry.revision?.byteSize ?? 0n)}`}
-                    {entry.hidden ? ` · ${mobileMessage(locale, "files.hidden")}` : ""}
-                    {entry.ignored ? ` · ${mobileMessage(locale, "files.ignored")}` : ""}
-                  </Text>
-                </View>
-                <Text style={[styles.chevron, { color: colors.muted }]}>›</Text>
-              </Pressable>
-              <Action label={mobileMessage(locale, "common.add")}
-                accessibilityLabel={mobileMessage(locale, entry.kind === FileKind.DIRECTORY
-                  ? "files.addDirectory" : "files.addFile", { name: label })}
-                compact colors={colors} disabled={!connected || filesBusy}
-                onPress={() => addToComposer(source)} />
-              <Action label={mobileMessage(locale, "common.share")}
-                accessibilityLabel={mobileMessage(locale, "files.shareFile", { name: label })}
-                compact colors={colors} disabled={!connected || filesBusy || entry.kind !== FileKind.REGULAR
-                  || !shareableBlobSize(entry.revision?.byteSize)}
-                onPress={() => shareFile(source)} />
-            </View>;
-          })}
-        </>}
-      </ScrollView>}
+      </ScrollView> : <MobileFilesBrowser files={files} preferences={filesPreferences} colors={colors} locale={locale}
+        thumbnailClient={client}
+        onCopy={copyPath} onCopyDirectory={() => copyPath()}
+        disabled={!connected || filesBusy} preferencesDisabled={!preferenceScope || filesBusy} onPreferences={setFilesPreferences}
+        onDirectory={(path) => run(() => client.openFilesDirectory(path))} onAdd={addToComposer} onShare={shareFile}
+        canShare={(source) => source.kind === "artifact" ? shareableBlobSize(source.artifact.blob?.byteSize)
+          : source.kind === "workspace-entry" && source.entry.kind === FileKind.REGULAR && shareableBlobSize(source.entry.revision?.byteSize)}
+        onOpen={(source) => {
+          if (source.kind === "artifact") {
+            if (mobileImageGalleryMediaType(source.artifact.blob?.mediaType ?? "")) openGallery(source);
+            else openPreview(source, () => client.previewArtifact(source.artifact));
+          } else if (source.kind === "workspace-entry") {
+            if (source.entry.kind === FileKind.DIRECTORY) run(() => client.previewWorkspaceEntry(source.entry));
+            else if (source.entry.kind === FileKind.REGULAR && mobileImageGalleryMediaType(source.entry.mediaType)) openGallery(source);
+            else openPreview(source, () => client.previewWorkspaceEntry(source.entry));
+          } else openResult(source.result);
+        }} />}
     </View>
     <FilePreviewModal colors={colors} preview={files.preview} source={previewSource} busy={handoffBusy} locale={locale}
       sharing={fileShareBusy} shareProgress={fileShareProgress}

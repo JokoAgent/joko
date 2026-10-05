@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { deflateSync } from "node:zlib";
 import sharp from "sharp";
 import { ImageThumbnailUnavailableReason } from "@joko/contracts";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -15,6 +16,31 @@ async function png(width = 2048, height = 1024) {
 }
 
 describe("canonical static image thumbnails", () => {
+  it("uses a static first frame for File256 GIF, animated WebP/APNG and multi-page TIFF, with decoded raster AVIF support", async () => {
+    const signal = new AbortController().signal;
+    const frame = (pixel: number) => [33, 249, 4, 0, 10, 0, 0, 0, 44, 0, 0, 0, 0, 1, 0, 1, 0, 0, 2, 2, pixel, 1, 0];
+    const gif = Uint8Array.from([71, 73, 70, 56, 57, 97, 1, 0, 1, 0, 128, 0, 0, 255, 0, 0, 0, 0, 255, ...frame(68), ...frame(76), 59]);
+    const animation = await sharp(gif, { animated: true }).webp({ loop: 0, delay: [100, 100] }).toBuffer();
+    const tiff = await sharp({ create: { width: 40, height: 40, pageHeight: 20, channels: 3, background: "red" } }).tiff().toBuffer();
+    expect((await sharp(tiff).metadata()).pages).toBe(2);
+    const avif = await sharp(await png(40, 20)).avif().toBuffer();
+    for (const [bytes, mime, width, height] of [[gif, "image/gif", 1, 1], [animation, "image/webp", 1, 1], [apng(), "image/apng", 1, 2],
+      [apng(), "image/png", 1, 2], [tiff, "image/tiff", 40, 20], [avif, "image/avif", 40, 20]] as const) {
+      const renderer = new ImageThumbnailRenderer({ readBlob: async () => ({ data: bytes, mimeType: mime }) });
+      const result = await renderer.read(source(bytes, mime), 256, signal);
+      expect(result).toMatchObject({ thumbnail: { widthPixels: width, heightPixels: height, sourceWidthPixels: width, sourceHeightPixels: height, mediaType: "image/webp" } });
+      if (!("thumbnail" in result)) throw new Error("File thumbnail missing");
+      const metadata = await sharp(result.thumbnail.data).metadata(); expect(metadata.pages ?? 1).toBe(1);
+      if (mime === "image/gif" || mime === "image/webp" || mime === "image/png" || mime === "image/apng") {
+        const pixel = await sharp(result.thumbnail.data).removeAlpha().raw().toBuffer(); expect(pixel[0]).toBeGreaterThan(230); expect(pixel[2]).toBeLessThan(30);
+      }
+      if (mime !== "image/avif") expect(await renderer.read(source(bytes, mime), 1024, signal)).toEqual({ unavailable: ImageThumbnailUnavailableReason.UNSUPPORTED });
+    }
+    const bytes = await png(600, 300); const renderer = new ImageThumbnailRenderer({ readBlob: async () => ({ data: bytes, mimeType: "image/png" }) });
+    const result = await renderer.read(source(bytes), 256, signal); if (!("thumbnail" in result)) throw new Error("File thumbnail missing");
+    const expected = await sharp(bytes, { page: 0, pages: 1, animated: false, failOn: "warning" }).rotate().resize({ width: 256, height: 256, fit: "inside", withoutEnlargement: true }).webp({ quality: 70 }).toBuffer();
+    expect(Buffer.from(result.thumbnail.data)).toEqual(expected);
+  });
   it("resizes real raster pixels, preserves alpha and orientation, avoids upscale and isolates cached responses", async () => {
     const bytes = await png(); const readBlob = vi.fn(async () => ({ data: bytes, mimeType: "image/png" }));
     const renderer = new ImageThumbnailRenderer({ readBlob }); const signal = new AbortController().signal;
@@ -85,3 +111,17 @@ describe("canonical static image thumbnails", () => {
     await renderer.read(source(bytes, "image/png", "source-1"), 256, signal); expect(readBlob).toHaveBeenCalledTimes(66);
   });
 });
+
+function apng(): Uint8Array {
+  const header = Buffer.alloc(13); header.writeUInt32BE(1); header.writeUInt32BE(2, 4); header[8] = 8; header[9] = 6;
+  const control = Buffer.alloc(8); control.writeUInt32BE(2);
+  const frame = (sequence: number) => { const bytes = Buffer.alloc(26); bytes.writeUInt32BE(sequence); bytes.writeUInt32BE(1, 4); bytes.writeUInt32BE(2, 8); bytes.writeUInt16BE(1, 20); bytes.writeUInt16BE(10, 22); return bytes; };
+  const second = Buffer.concat([Buffer.from([0, 0, 0, 2]), deflateSync(Buffer.from([0, 0, 0, 255, 255, 0, 0, 0, 255, 255]))]);
+  return Buffer.concat([Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]), pngChunk("IHDR", header), pngChunk("acTL", control), pngChunk("fcTL", frame(0)),
+    pngChunk("IDAT", deflateSync(Buffer.from([0, 255, 0, 0, 255, 0, 255, 0, 0, 255]))), pngChunk("fcTL", frame(1)), pngChunk("fdAT", second), pngChunk("IEND", Buffer.alloc(0))]);
+}
+function pngChunk(type: string, data: Buffer): Buffer {
+  const body = Buffer.concat([Buffer.from(type, "ascii"), data]); const result = Buffer.alloc(body.length + 8); result.writeUInt32BE(data.length); body.copy(result, 4);
+  let crc = 0xffff_ffff; for (const byte of body) { crc ^= byte; for (let bit = 0; bit < 8; bit++) crc = crc & 1 ? 0xedb8_8320 ^ (crc >>> 1) : crc >>> 1; }
+  result.writeUInt32BE((crc ^ 0xffff_ffff) >>> 0, result.length - 4); return result;
+}

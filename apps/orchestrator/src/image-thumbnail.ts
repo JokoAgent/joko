@@ -19,7 +19,9 @@ export class ImageThumbnailRenderer {
 
   async read(source: ArtifactRecord, edge: number, signal: AbortSignal): Promise<ImageThumbnailResult> {
     signal.throwIfAborted();
-    if (!["image/png", "image/jpeg", "image/webp"].includes(source.mimeType)) return { unavailable: ImageThumbnailUnavailableReason.UNSUPPORTED };
+    const formats = edge === 256 ? ["image/png", "image/apng", "image/jpeg", "image/webp", "image/gif", "image/tiff", "image/avif", "image/heic", "image/heif"]
+      : ["image/png", "image/jpeg", "image/webp"];
+    if (!formats.includes(source.mimeType)) return { unavailable: ImageThumbnailUnavailableReason.UNSUPPORTED };
     if (source.byteLength < 1 || source.byteLength > maximumInputBytes) return { unavailable: ImageThumbnailUnavailableReason.INPUT_TOO_LARGE };
     const key = JSON.stringify([source.id, source.sha256, source.byteLength, source.mimeType, edge]);
     const cached = this.#cache.get(key);
@@ -57,15 +59,21 @@ export class ImageThumbnailRenderer {
     signal.throwIfAborted();
     if (input.mimeType !== source.mimeType || input.data.length !== source.byteLength || digest(input.data) !== source.sha256) throw new ThumbnailSourceError();
     const detected = await fileTypeFromBuffer(input.data.subarray(0, 65_536)).catch(() => undefined);
-    if (detected?.mime !== source.mimeType) throw new ThumbnailSourceError();
-    if (animatedRaster(input.data, source.mimeType)) return { unavailable: ImageThumbnailUnavailableReason.UNSUPPORTED };
-    const decoder = sharp(Buffer.from(input.data.buffer, input.data.byteOffset, input.data.byteLength), { failOn: "warning", limitInputPixels: maximumPixels }).timeout({ seconds: 5 });
+    // Animated PNG remains a valid general PNG container; an explicit APNG requires its actual control chunk.
+    if (detected?.mime !== source.mimeType && !(source.mimeType === "image/png" && detected?.mime === "image/apng")) throw new ThumbnailSourceError();
+    const fileThumbnail = edge === 256;
+    if (!fileThumbnail && animatedRaster(input.data, source.mimeType)) return { unavailable: ImageThumbnailUnavailableReason.UNSUPPORTED };
+    const decoder = sharp(Buffer.from(input.data.buffer, input.data.byteOffset, input.data.byteLength), {
+      failOn: "warning", limitInputPixels: maximumPixels, ...(fileThumbnail ? { page: 0, pages: 1, animated: false } : {})
+    }).timeout({ seconds: 5 });
     const metadata = await decoder.metadata(); signal.throwIfAborted();
-    if (`image/${metadata.format}` !== source.mimeType || !metadata.width || !metadata.height || (metadata.pages ?? 1) !== 1
+    const mimeMatches = metadata.format === "heif" ? ["image/avif", "image/heic", "image/heif"].includes(source.mimeType)
+      : metadata.format === "png" ? ["image/png", "image/apng"].includes(source.mimeType) : `image/${metadata.format}` === source.mimeType;
+    if (!mimeMatches || !metadata.width || !metadata.height || !fileThumbnail && (metadata.pages ?? 1) !== 1
       || metadata.width > 16_384 || metadata.height > 16_384 || metadata.width * metadata.height > maximumPixels) {
       return { unavailable: ImageThumbnailUnavailableReason.UNSUPPORTED };
     }
-    const output = await decoder.rotate().resize({ width: edge, height: edge, fit: "inside", withoutEnlargement: true }).webp({ quality: 80 }).toBuffer({ resolveWithObject: true });
+    const output = await decoder.rotate().resize({ width: edge, height: edge, fit: "inside", withoutEnlargement: true }).webp({ quality: fileThumbnail ? 70 : 80 }).toBuffer({ resolveWithObject: true });
     signal.throwIfAborted();
     if (!output.data.length || output.data.length > IMAGE_THUMBNAIL_MAXIMUM_BYTES || output.info.width < 1 || output.info.height < 1
       || output.info.width > edge || output.info.height > edge || output.info.format !== "webp") return { unavailable: ImageThumbnailUnavailableReason.RENDER_FAILED };

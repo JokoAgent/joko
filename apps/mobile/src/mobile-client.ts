@@ -41,6 +41,9 @@ import {
 import { buildMobileMessageDeepLink, buildMobileTaskDeepLink, parseMobileNativeIntent } from "./mobile-native-intent";
 import { awaitMobileMarkdownResourceRead, MobileMarkdownResourceReader, type MobileMarkdownResourceContext, type MobileMarkdownResourceDescriptor } from "./mobile-markdown-resources";
 import { MobileTimelineImageReader, type MobileTimelineImageContext, type MobileTimelineImagePreview } from "./mobile-timeline-images";
+import { MobileFilesThumbnailReader, mobileFilesThumbnailKind, mobileFilesThumbnailSourceKey, mobileFilesDocumentBytes,
+  MOBILE_FILES_DOCUMENT_MAXIMUM_BYTES, MOBILE_FILES_IMAGE_MAXIMUM_BYTES, type MobileFilesThumbnailContext, type MobileFilesThumbnailPreview } from "./mobile-files-thumbnails";
+import type { MobileFilesThumbnailCache } from "./mobile-files-thumbnail-cache";
 import {
   MobileCredentialStorageError, profileFromCredential,
   type MobileConnectionProfile, type MobileStorage, type PendingOperation
@@ -81,6 +84,8 @@ import {
   type MobileFilesState,
   type MobileWorkspaceAuthority
 } from "./workspace-files";
+import { sortMobileGeneratedArtifacts, sortMobileWorkspaceEntries, type MobileFilesSortMode } from "./mobile-files-presentation";
+import type { MobileFilesClipboardLease } from "./mobile-files-clipboard";
 import {
   mobileMediaPreviewKind,
   type MobileMediaPreviewFiles,
@@ -676,6 +681,7 @@ export class MobileClient {
   #homeSearchEpoch = 0;
   #homeSearchAbort?: AbortController;
   #filesEpoch = 0;
+  #filesCopyEpoch = 0;
   #filesListAbort?: AbortController;
   #filesSearchAbort?: AbortController;
   #filesPreviewAbort?: AbortController;
@@ -694,6 +700,7 @@ export class MobileClient {
   #conversationShare?: MobileConversationShareLease;
   #markdownResources = new MobileMarkdownResourceReader();
   #timelineImages = new MobileTimelineImageReader();
+  #filesThumbnails: MobileFilesThumbnailReader;
   #messageRewindPreviews = new WeakSet<MobileMessageRewindPreview>();
   #automationEpoch = 0;
   #automationAbort?: AbortController;
@@ -732,8 +739,9 @@ export class MobileClient {
     private readonly modelPreviewFiles?: MobileModelPreviewFiles,
     private readonly fileShare?: Pick<MobileFileShare, "perform">,
     private readonly offlineCache?: Pick<MobileOfflineCache, "load" | "save" | "clear">,
-    private readonly readOnlyDictionaryCache?: Pick<MobileVoiceDictionaryReadOnlyCache, "clear">
-  ) {}
+    private readonly readOnlyDictionaryCache?: Pick<MobileVoiceDictionaryReadOnlyCache, "clear">,
+    filesThumbnailDisk?: Pick<MobileFilesThumbnailCache, "get" | "put" | "remove">
+  ) { this.#filesThumbnails = new MobileFilesThumbnailReader(filesThumbnailDisk); }
 
   get state(): MobileState { return this.#state; }
 
@@ -895,6 +903,8 @@ export class MobileClient {
     this.#markdownResources.retireStale();
     this.#timelineImages.retainOwner(this.#taskAuthorityKey());
     this.#timelineImages.retireStale();
+    this.#filesThumbnails.retainOwner(next.files.open ? this.filesAuthorityKey() : undefined);
+    this.#filesThumbnails.retireStale();
     if (this.#fileShareLease?.phase === "preparing"
       && !this.#fileShareLeaseCurrent(this.#fileShareLease)) {
       this.#fileShareLease.controller.abort();
@@ -942,6 +952,7 @@ export class MobileClient {
     if (this.#conversationShare) this.releaseConversationShare(this.#conversationShare.leaseId);
     this.#markdownResources.releaseAll();
     this.#timelineImages.releaseAll();
+    this.#filesThumbnails.releaseAll();
     if (this.#timer !== undefined) clearTimeout(this.#timer);
     if (this.#proofTimer !== undefined) clearTimeout(this.#proofTimer);
     if (this.#projectionTimer !== undefined) clearTimeout(this.#projectionTimer);
@@ -3419,6 +3430,97 @@ export class MobileClient {
 
   filesAuthorityKey(): string | undefined { return this.#filesAuthorityKey(this.#state); }
 
+  async prepareFilesThumbnail(ownerKey: string, source: MobileFilesComposerSource, signal: AbortSignal): Promise<MobileFilesThumbnailPreview> {
+    signal.throwIfAborted(); const context = this.#filesContext(); const epoch = this.#filesEpoch;
+    const windowKey = mobileFilesGalleryWindowKey(this.#state.files); const kind = mobileFilesThumbnailKind(source);
+    if (!kind || source.kind === "search-result" || context.key !== ownerKey) throw new Error("The file miniature has no current source.");
+    const assertCurrent = (currentSignal?: AbortSignal): void => {
+      currentSignal?.throwIfAborted();
+      if (!this.#currentFiles(epoch, ownerKey) || this.#credential !== context.credential || this.#state.files.status !== "ready"
+        || mobileFilesGalleryWindowKey(this.#state.files) !== windowKey || this.#state.files.preview || this.#imageGallery
+        || !filesComposerSourceIsCurrent(this.#state.files, source)) throw new Error("The file miniature source changed.");
+    };
+    assertCurrent(signal);
+    const maximum = BigInt(kind === "image" ? MOBILE_FILES_IMAGE_MAXIMUM_BYTES : MOBILE_FILES_DOCUMENT_MAXIMUM_BYTES);
+    const revision = source.kind === "workspace-entry" ? source.entry.revision : undefined;
+    const blob = source.kind === "artifact" ? source.artifact.blob : undefined;
+    const size = revision?.byteSize ?? blob?.byteSize;
+    if (size === undefined || size < 0n) throw new Error("The file miniature source metadata is unavailable.");
+    const directoryRevision = this.#state.files.directoryRevision; const artifactsRevision = this.#state.files.artifactsRevision;
+    const thumbnailContext: MobileFilesThumbnailContext = { ownerKey, sourceKey: mobileFilesThumbnailSourceKey(source), assertCurrent,
+      revalidate: async (currentSignal) => {
+        assertCurrent(currentSignal);
+        if (source.kind === "workspace-entry") {
+          if (!revision || source.entry.workspaceId !== context.authority.workspace.workspaceId || !directoryRevision) throw new Error("The miniature Workspace source is unfenced.");
+          const directory = await this.network.listWorkspaceDirectory(context.credential, source.entry.workspaceId, workspaceParentPath(source.entry.relativePath), currentSignal);
+          assertCurrent(currentSignal);
+          const matches = directory.entries.filter((entry) => entry.relativePath === source.entry.relativePath);
+          if (directory.revision !== directoryRevision || matches.length !== 1 || !sameFilesWorkspaceEntry(matches[0]!, source.entry)) throw new Error("The authenticated miniature Workspace source changed.");
+        } else {
+          if (!artifactsRevision) throw new Error("The miniature Generated source is unfenced.");
+          await this.#revalidateGeneratedShareArtifact(context, source.artifact, artifactsRevision, currentSignal); assertCurrent(currentSignal);
+        }
+      },
+      read: async (currentSignal) => {
+        assertCurrent(currentSignal); if (size > maximum) return undefined;
+        let imageBlob = blob;
+        if (source.kind === "workspace-entry") {
+          const entry = source.entry;
+          if (kind === "text") {
+            const preview = await this.network.readWorkspaceFile(context.credential, entry.workspaceId, entry.relativePath, revision!, currentSignal);
+            assertCurrent(currentSignal); assertWorkspaceFilePreview(entry.workspaceId, entry.relativePath, revision!, preview);
+            if (preview.entry?.kind !== FileKind.REGULAR || normalizeMediaType(preview.entry.mediaType) !== normalizeMediaType(entry.mediaType)) throw new Error("The miniature document source changed.");
+            return preview.content.case === "text" && preview.content.value.startByte === 0n && !preview.truncated
+              && new TextEncoder().encode(preview.content.value.utf8Text).length <= MOBILE_FILES_DOCUMENT_MAXIMUM_BYTES
+              ? { kind: "text", text: preview.content.value.utf8Text } : undefined;
+          }
+          const materialized = await this.network.materializeWorkspaceFileBlob(context.credential, entry.workspaceId, entry.relativePath, revision!, currentSignal);
+          assertCurrent(currentSignal); const fresh = materialized.entry; imageBlob = materialized.blob;
+          if (fresh.workspaceId !== entry.workspaceId || fresh.relativePath !== entry.relativePath || fresh.kind !== FileKind.REGULAR
+            || normalizeMediaType(fresh.mediaType) !== normalizeMediaType(entry.mediaType) || !fresh.revision || !workspaceComposerRevisionMatches(revision!, fresh.revision)
+            || fresh.revision.byteSize !== imageBlob.byteSize || fresh.revision.sha256Hex !== imageBlob.sha256Hex
+            || imageBlob.fileName !== workspaceBasename(entry.relativePath) || normalizeMediaType(imageBlob.mediaType) !== normalizeMediaType(entry.mediaType)) throw new Error("The miniature Workspace Blob changed.");
+        }
+        if (!imageBlob) throw new Error("The miniature canonical Blob is unavailable.");
+        if (kind === "text") {
+          const download = await this.network.downloadBlob(context.credential, imageBlob, currentSignal); assertCurrent(currentSignal);
+          const text = mobileFilesDocumentBytes(imageBlob, download); return text === undefined ? undefined : { kind: "text", text };
+        }
+        const thumbnail = await this.network.readImageThumbnail(context.credential, imageBlob, 256, currentSignal); assertCurrent(currentSignal);
+        if (thumbnail) return { kind: "image", blob: imageBlob, bytes: thumbnail.data, mediaType: thumbnail.mediaType, thumbnail };
+        const original = await this.network.downloadBlob(context.credential, imageBlob, currentSignal); assertCurrent(currentSignal);
+        return { kind: "image", blob: imageBlob, ...original };
+      } };
+    return this.#filesThumbnails.prepare(thumbnailContext, signal);
+  }
+
+  confirmFilesThumbnail(leaseId: string, native: MobileImageGalleryNativeDecode): void { this.#filesThumbnails.confirm(leaseId, native); }
+  releaseFilesThumbnail(leaseId: string, discard = false): void { this.#filesThumbnails.release(leaseId, discard); }
+
+  prepareFilesPathCopy(expectedFiles: MobileFilesState, source?: MobileFilesComposerSource): MobileFilesClipboardLease {
+    if (this.#state.files !== expectedFiles) throw new Error("The displayed Files copy surface has changed.");
+    const context = this.#filesContext(); const epoch = this.#filesEpoch;
+    const copyEpoch = this.#filesCopyEpoch;
+    const windowKey = mobileFilesGalleryWindowKey(this.#state.files);
+    const location = this.#state.files.location;
+    const assertCurrent = (signal?: AbortSignal): void => {
+      signal?.throwIfAborted();
+      if (!this.#currentFiles(epoch, context.key) || this.#state.files.status !== "ready" || this.#filesCopyEpoch !== copyEpoch || mobileFilesGalleryWindowKey(this.#state.files) !== windowKey
+        || this.#state.files.preview || this.#imageGallery
+        || (source && !filesComposerSourceIsCurrent(this.#state.files, source))) throw new Error("The Files copy source is no longer current.");
+    };
+    assertCurrent();
+    if (!source) {
+      if (location.kind !== "workspace" || !this.#state.files.directoryRevision) throw new Error("Select a known Workspace directory before copying its path.");
+      return { text: canonicalWorkspacePath(location.path, true) || ".", kind: "path", assertCurrent };
+    }
+    if (source.kind === "workspace-entry") return { text: canonicalWorkspacePath(source.entry.relativePath), kind: "path", assertCurrent };
+    if (source.kind !== "artifact") throw new Error("Select a current browse item before copying its path.");
+    const name = source.artifact.blob?.fileName;
+    if (!name || name === "." || name === ".." || name.length > 4096 || /[\\/\u0000-\u001f\u007f]/u.test(name)) throw new Error("The canonical Generated filename is unavailable.");
+    return { text: name, kind: "file-name", assertCurrent };
+  }
+
   async openFiles(): Promise<void> {
     await this.#openFilesAt("");
   }
@@ -3454,6 +3556,7 @@ export class MobileClient {
 
   async refreshFiles(): Promise<void> {
     if (!this.#state.files.open) return;
+    this.#filesCopyEpoch++;
     let context: MobileFilesContext;
     try { context = this.#filesContext(); }
     catch {
@@ -4135,7 +4238,8 @@ export class MobileClient {
 
   async openFilesImageGallery(
     source: MobileFilesComposerSource,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    sort: MobileFilesSortMode = "name"
   ): Promise<MobileImageGalleryDescriptor> {
     signal?.throwIfAborted();
     if (!this.composerDrafts) throw new Error("Retained task drafts are unavailable on this mobile client.");
@@ -4181,7 +4285,7 @@ export class MobileClient {
       const observedArtifactCounts = countArtifactIds(this.#state.files.artifacts);
       const currentById = new Map(refreshed.artifacts.map((candidate) => [candidate.artifactId, candidate]));
       const seen = new Set<string>();
-      pages = this.#state.files.artifacts.flatMap((observed) => {
+      pages = sortMobileGeneratedArtifacts(this.#state.files.artifacts, sort).flatMap((observed) => {
         if (currentArtifactCounts.get(observed.artifactId) !== 1
           || observedArtifactCounts.get(observed.artifactId) !== 1) return [];
         const current = currentById.get(observed.artifactId);
@@ -4207,7 +4311,7 @@ export class MobileClient {
       }
       const observedEntries = source.kind === "workspace-entry"
         && this.#state.files.location.kind === "workspace"
-        ? this.#state.files.entries
+        ? sortMobileWorkspaceEntries(this.#state.files.entries, sort)
         : [selected];
       const collected: MobileImageGalleryPage[] = [];
       const seen = new Set<string>();

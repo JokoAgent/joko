@@ -7892,6 +7892,72 @@ describe("native current-task Files ownership", () => {
     }));
   }
 
+  it("renders current Workspace image and document miniatures, reauthorizes cached pixels and retires them with directory navigation", async () => {
+    const bytes = await sharp({ create: { width: 512, height: 256, channels: 4, background: "orange" } }).png().toBuffer();
+    const derivative = await sharp(bytes).resize(256, 128).webp().toBuffer();
+    const observedRevision = create(FileRevisionSchema, { opaqueRevision: "picture-r1", byteSize: BigInt(bytes.length), modifiedAt: { seconds: 100n } });
+    const entry = create(WorkspaceEntrySchema, { workspaceId: "workspace", relativePath: "picture.png", kind: FileKind.REGULAR, mediaType: "image/png", revision: observedRevision });
+    const blob = create(BlobRefSchema, { blobId: "picture", fileName: "picture.png", mediaType: "image/png", byteSize: BigInt(bytes.length), sha256Hex: sha256Hex(bytes) });
+    const materialized = create(WorkspaceEntrySchema, { ...entry, revision: { ...observedRevision, opaqueRevision: `sha256:${blob.sha256Hex}:${bytes.length}`, sha256Hex: blob.sha256Hex } });
+    const thumbnail = create(ImageThumbnailSchema, { data: derivative, mediaType: "image/webp", sha256Hex: sha256Hex(derivative), widthPixels: 256, heightPixels: 128, sourceWidthPixels: 512, sourceHeightPixels: 256 });
+    const network = fakeNetwork(); configureFiles(network, handoffSnapshot);
+    vi.mocked(network.listWorkspaceDirectory).mockImplementation(async (_credential, _workspace, parent) => ({ entries: parent === "" ? [entry, readme, sourceDirectory] : [], revision: `directory:${parent || "root"}` }));
+    vi.mocked(network.materializeWorkspaceFileBlob).mockResolvedValue({ entry: materialized, blob }); vi.mocked(network.readImageThumbnail).mockResolvedValue(thumbnail);
+    const app = client(network, memoryStorage(credential).storage); await app.start(); await app.openFiles(); const owner = app.filesAuthorityKey()!;
+    const source = { kind: "workspace-entry" as const, entry: app.state.files.entries.find((item) => item.relativePath === "picture.png")! };
+    const first = await app.prepareFilesThumbnail(owner, source, new AbortController().signal);
+    expect(first.content).toMatchObject({ kind: "image", width: 256, height: 128, mediaType: "image/webp" });
+    app.confirmFilesThumbnail(first.leaseId, { width: 256, height: 128, mediaType: "image/webp", isAnimated: false }); app.releaseFilesThumbnail(first.leaseId);
+    const cached = await app.prepareFilesThumbnail(owner, source, new AbortController().signal); expect(network.materializeWorkspaceFileBlob).toHaveBeenCalledOnce();
+    expect(network.readImageThumbnail).toHaveBeenCalledExactlyOnceWith(credential, blob, 256, expect.any(AbortSignal)); expect(network.listWorkspaceDirectory).toHaveBeenCalledTimes(3);
+    const doc = await app.prepareFilesThumbnail(owner, { kind: "workspace-entry", entry: readme }, new AbortController().signal); expect(doc.content).toEqual({ kind: "text", text: "# Joko" });
+    expect(app.state.files.preview).toBeUndefined(); expect(network.downloadBlob).not.toHaveBeenCalled(); expect(network.submit).not.toHaveBeenCalled();
+    await app.openFilesDirectory("src"); expect(() => app.confirmFilesThumbnail(cached.leaseId, { width: 256, height: 128 })).toThrow(/released/u);
+    await expect(app.prepareFilesThumbnail(owner, source, new AbortController().signal)).rejects.toThrow(/source/u);
+  });
+
+  it("renders only current Generated miniatures, rejects changed catalogs and never falls back after thumbnail authentication fails", async () => {
+    const bytes = new TextEncoder().encode("actual generated document\n42"); const textBlob = create(BlobRefSchema, { blobId: "mini-doc", fileName: "report.txt", mediaType: "text/plain", byteSize: BigInt(bytes.length), sha256Hex: sha256Hex(bytes) });
+    const doc = create(ArtifactSchema, { ...artifact, blob: textBlob });
+    const imageBytes = await sharp({ create: { width: 20, height: 10, channels: 3, background: "orange" } }).webp().toBuffer();
+    const imageBlob = create(BlobRefSchema, { blobId: "mini-picture", fileName: "picture.webp", mediaType: "image/webp", byteSize: BigInt(imageBytes.length), sha256Hex: sha256Hex(imageBytes) });
+    const photo = create(ArtifactSchema, { ...artifact, artifactId: "mini-photo", kind: ArtifactKind.IMAGE, blob: imageBlob });
+    const thumbnail = create(ImageThumbnailSchema, { data: imageBytes, mediaType: "image/webp", sha256Hex: imageBlob.sha256Hex, widthPixels: 20, heightPixels: 10, sourceWidthPixels: 20, sourceHeightPixels: 10 });
+    const network = fakeNetwork(); configureFiles(network, handoffSnapshot); vi.mocked(network.listSessionArtifacts).mockResolvedValue({ artifacts: [doc, photo], revision: "artifacts-1" });
+    vi.mocked(network.downloadBlob).mockResolvedValue({ bytes, mediaType: "text/plain" }); vi.mocked(network.readImageThumbnail).mockRejectedValue(new Error("Thumbnail authorization failed"));
+    const app = client(network, memoryStorage(credential).storage); await app.start(); await app.openFiles(); app.openGeneratedFiles(); const owner = app.filesAuthorityKey()!;
+    const text = await app.prepareFilesThumbnail(owner, { kind: "artifact", artifact: doc }, new AbortController().signal); expect(text.content).toEqual({ kind: "text", text: "actual generated document\n42" }); app.releaseFilesThumbnail(text.leaseId);
+    const source = { kind: "artifact" as const, artifact: photo };
+    await expect(app.prepareFilesThumbnail(owner, source, new AbortController().signal)).rejects.toThrow(/authorization failed/u); expect(network.downloadBlob).toHaveBeenCalledOnce();
+    vi.mocked(network.readImageThumbnail).mockResolvedValue(thumbnail); const current = await app.prepareFilesThumbnail(owner, source, new AbortController().signal);
+    expect(current.content?.kind).toBe("image"); vi.mocked(network.listSessionArtifacts).mockResolvedValue({ artifacts: [doc, photo], revision: "changed-catalog" });
+    await expect(app.prepareFilesThumbnail(owner, source, new AbortController().signal)).rejects.toThrow(/catalog changed/u); expect(network.readImageThumbnail).toHaveBeenCalledTimes(2);
+    app.setForeground(false); expect(() => app.confirmFilesThumbnail(current.leaseId, { width: 20, height: 10 })).toThrow(/released/u);
+    expect(network.submit).not.toHaveBeenCalled(); expect(network.materializeWorkspaceFileBlob).not.toHaveBeenCalled();
+  });
+
+  it("copies only an observed relative Files path or canonical Generated filename and retires the lease with its surface", async () => {
+    const network = fakeNetwork(); configureFiles(network, handoffSnapshot);
+    const app = client(network, memoryStorage(credential).storage); await app.start(); await app.openFiles();
+    const displayed = app.state.files;
+    const root = app.prepareFilesPathCopy(app.state.files); expect(root).toMatchObject({ text: ".", kind: "path" }); root.assertCurrent();
+    const entry = app.state.files.entries.find((value) => value.relativePath === "README.md")!;
+    const file = app.prepareFilesPathCopy(app.state.files, { kind: "workspace-entry", entry }); expect(file.text).toBe("README.md");
+    await app.openFilesDirectory("src"); expect(() => root.assertCurrent()).toThrow(); expect(() => file.assertCurrent()).toThrow();
+    expect(() => app.prepareFilesPathCopy(displayed)).toThrow();
+    const directory = app.prepareFilesPathCopy(app.state.files); expect(directory.text).toBe("src"); await app.refreshFiles(); expect(() => directory.assertCurrent()).toThrow();
+    app.openGeneratedFiles(); expect(() => app.prepareFilesPathCopy(app.state.files)).toThrow();
+    const generated = app.prepareFilesPathCopy(app.state.files, { kind: "artifact", artifact: app.state.files.artifacts[0]! });
+    expect(generated).toMatchObject({ text: "report.txt", kind: "file-name" }); generated.assertCurrent();
+    expect(network.readWorkspaceFile).not.toHaveBeenCalled(); expect(network.downloadBlob).not.toHaveBeenCalled(); expect(network.submit).not.toHaveBeenCalled();
+    await app.openFiles(); expect(() => generated.assertCurrent()).toThrow();
+    const selected = app.state.files.entries.find((value) => value.relativePath === "README.md")!;
+    const beforePreview = app.prepareFilesPathCopy(app.state.files, { kind: "workspace-entry", entry: selected });
+    await app.previewWorkspaceEntry(selected); expect(() => beforePreview.assertCurrent()).toThrow(); expect(() => app.prepareFilesPathCopy(app.state.files)).toThrow();
+    app.closeFilesPreview(); const beforeBackground = app.prepareFilesPathCopy(app.state.files); app.setForeground(false);
+    expect(() => beforeBackground.assertCurrent()).toThrow(); expect(() => app.prepareFilesPathCopy(app.state.files)).toThrow();
+  });
+
   it("opens current completed Markdown resources in Files and the gallery, and shares the same authorized inline image", async () => {
     vi.useFakeTimers();
     const bytes = Uint8Array.from(Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=", "base64"));
@@ -8792,10 +8858,10 @@ describe("native current-task Files ownership", () => {
     configureFiles(network, handoffSnapshot);
     const bytes = galleryPngBytes(3, 2);
     const firstRevision = create(FileRevisionSchema, {
-      opaqueRevision: "image-a", sha256Hex: "b".repeat(64), byteSize: BigInt(bytes.byteLength)
+      opaqueRevision: "image-a", sha256Hex: "b".repeat(64), byteSize: BigInt(bytes.byteLength), modifiedAt: { seconds: 10n, nanos: 0 }
     });
     const secondRevision = create(FileRevisionSchema, {
-      opaqueRevision: "image-b", sha256Hex: "b".repeat(64), byteSize: BigInt(bytes.byteLength)
+      opaqueRevision: "image-b", sha256Hex: "b".repeat(64), byteSize: BigInt(bytes.byteLength), modifiedAt: { seconds: 20n, nanos: 0 }
     });
     const entries = [
       create(WorkspaceEntrySchema, {
@@ -8840,14 +8906,14 @@ describe("native current-task Files ownership", () => {
     await app.openFiles();
     await app.openFilesDirectory("images");
 
-    const descriptor = await app.openFilesImageGallery({ kind: "workspace-entry", entry: app.state.files.entries[1]! });
+    const descriptor = await app.openFilesImageGallery({ kind: "workspace-entry", entry: app.state.files.entries[1]! }, undefined, "mtime");
     expect(descriptor).toMatchObject({
-      sourceKind: "workspace", initialIndex: 1,
-      pages: [{ title: "a.png" }, { title: "b.png" }, { title: "moving.gif" }]
+      sourceKind: "workspace", initialIndex: 0,
+      pages: [{ title: "b.png" }, { title: "a.png" }, { title: "moving.gif" }]
     });
     const page = await app.loadImageGalleryPage(descriptor.leaseId, descriptor.initialIndex);
     expect(page).toMatchObject({
-      pageIndex: 1, pageCount: 3, expectedWidthPixels: 3, expectedHeightPixels: 2,
+      pageIndex: 0, pageCount: 3, expectedWidthPixels: 3, expectedHeightPixels: 2,
       addable: true, annotatable: true
     });
     app.confirmImageGalleryPageDecoded(descriptor.leaseId, page.leaseId, page.pageId, {
@@ -8888,6 +8954,7 @@ describe("native current-task Files ownership", () => {
     const bytes = galleryPngBytes(3, 2);
     const first = create(ArtifactSchema, {
       artifactId: "generated-image-one", sessionId: "session", kind: ArtifactKind.IMAGE, title: "First generated image",
+      createdAt: { seconds: 1n, nanos: 0 },
       blob: create(BlobRefSchema, {
         blobId: "generated-blob-one", fileName: "one.png", mediaType: "image/png",
         byteSize: BigInt(bytes.byteLength), sha256Hex: "b".repeat(64)
@@ -8902,6 +8969,7 @@ describe("native current-task Files ownership", () => {
     });
     const second = create(ArtifactSchema, {
       artifactId: "generated-image-two", sessionId: "session", kind: ArtifactKind.IMAGE, title: "Second generated image",
+      createdAt: { seconds: 2n, nanos: 0 },
       blob: create(BlobRefSchema, {
         blobId: "generated-blob-two", fileName: "two.png", mediaType: "image/png",
         byteSize: BigInt(bytes.byteLength), sha256Hex: "b".repeat(64)
@@ -8937,6 +9005,9 @@ describe("native current-task Files ownership", () => {
     });
     const page = await app.loadImageGalleryPage(descriptor.leaseId, descriptor.initialIndex);
     expect(page).toMatchObject({ fileName: "two.png", pageIndex: 1, pageCount: 2 });
+    const sorted = await app.openFilesImageGallery({ kind: "artifact", artifact: selected }, undefined, "mtime");
+    expect(sorted).toMatchObject({ initialIndex: 0, pages: [{ title: "Second generated image" }, { title: "First generated image" }] });
+    await expect(app.loadImageGalleryPage(descriptor.leaseId, 0)).rejects.toThrow();
   });
 
   it("appends a gallery annotation with an isolated source and refuses an unconfirmed decode", async () => {
