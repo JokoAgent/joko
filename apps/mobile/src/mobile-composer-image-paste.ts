@@ -15,6 +15,7 @@ import {
   assertMobileImageGalleryDimensions
 } from "./mobile-image-gallery";
 import { inspectMobileImageOutputBytes } from "./mobile-image-output-format";
+import { inspectMobileGifBytes } from "./mobile-image-gif";
 import {
   mobileComposerPastedImageMediaTypes,
   mobileComposerRichProtocolLimits,
@@ -251,87 +252,14 @@ export function inspectMobileComposerPastedImageBytes(
     const inspected = inspectMobileImageOutputBytes(bytes, expectedMediaType);
     return { width: inspected.width, height: inspected.height };
   }
-  return inspectGif(bytes);
+  if (bytes.byteLength > MOBILE_MAXIMUM_ATTACHMENT_BYTES) throw new Error("The clipboard GIF exceeds the attachment limit.");
+  const { width, height } = inspectMobileGifBytes(bytes);
+  assertMobileImageGalleryDimensions(width, height);
+  return { width, height };
 }
 
 function pastedImageFileName(index: number, mediaType: MobileComposerPastedImageMediaType | "image/jpeg"): string {
   return `pasted-image-${index + 1}.${mobileImageExtensionForMediaType(mediaType)}`;
-}
-
-function inspectGif(bytes: Uint8Array): { readonly width: number; readonly height: number } {
-  if (!(bytes instanceof Uint8Array) || bytes.byteLength < 14 || bytes.byteLength > MOBILE_MAXIMUM_ATTACHMENT_BYTES
-    || ascii(bytes, 0, 6) !== "GIF87a" && ascii(bytes, 0, 6) !== "GIF89a") {
-    throw new Error("The clipboard GIF signature is invalid.");
-  }
-  const width = readU16Le(bytes, 6);
-  const height = readU16Le(bytes, 8);
-  if (width === undefined || height === undefined) throw new Error("The clipboard GIF dimensions are invalid.");
-  assertMobileImageGalleryDimensions(width, height);
-  const packed = bytes[10]!;
-  let offset = 13;
-  if ((packed & 0x80) !== 0) offset += 3 * 2 ** ((packed & 0x07) + 1);
-  if (offset > bytes.byteLength) throw new Error("The clipboard GIF color table is truncated.");
-  let sawImage = false;
-  while (offset < bytes.byteLength) {
-    const marker = bytes[offset++];
-    if (marker === 0x3b) {
-      if (!sawImage || offset !== bytes.byteLength) throw new Error("The clipboard GIF structure is invalid.");
-      return { width, height };
-    }
-    if (marker === 0x21) {
-      if (offset >= bytes.byteLength) break;
-      offset += 1;
-      offset = skipGifSubBlocks(bytes, offset);
-      continue;
-    }
-    if (marker === 0x2c) {
-      if (offset + 9 > bytes.byteLength) break;
-      const left = readU16Le(bytes, offset);
-      const top = readU16Le(bytes, offset + 2);
-      const frameWidth = readU16Le(bytes, offset + 4);
-      const frameHeight = readU16Le(bytes, offset + 6);
-      const framePacked = bytes[offset + 8]!;
-      if (left === undefined || top === undefined || frameWidth === undefined || frameHeight === undefined
-        || frameWidth < 1 || frameHeight < 1 || left + frameWidth > width || top + frameHeight > height) {
-        throw new Error("The clipboard GIF frame dimensions are invalid.");
-      }
-      assertMobileImageGalleryDimensions(frameWidth, frameHeight);
-      offset += 9;
-      if ((framePacked & 0x80) !== 0) offset += 3 * 2 ** ((framePacked & 0x07) + 1);
-      if (offset >= bytes.byteLength) break;
-      const minimumCodeSize = bytes[offset++];
-      if (minimumCodeSize === undefined || minimumCodeSize < 2 || minimumCodeSize > 12) {
-        throw new Error("The clipboard GIF image code size is invalid.");
-      }
-      offset = skipGifSubBlocks(bytes, offset);
-      sawImage = true;
-      continue;
-    }
-    throw new Error("The clipboard GIF contains an invalid block.");
-  }
-  throw new Error("The clipboard GIF is truncated.");
-}
-
-function skipGifSubBlocks(bytes: Uint8Array, start: number): number {
-  let offset = start;
-  while (offset < bytes.byteLength) {
-    const length = bytes[offset++];
-    if (length === undefined) break;
-    if (length === 0) return offset;
-    if (offset + length > bytes.byteLength) break;
-    offset += length;
-  }
-  throw new Error("The clipboard GIF sub-block is truncated.");
-}
-
-function ascii(bytes: Uint8Array, offset: number, length: number): string {
-  if (offset < 0 || length < 0 || offset + length > bytes.byteLength) return "";
-  return String.fromCharCode(...bytes.slice(offset, offset + length));
-}
-
-function readU16Le(bytes: Uint8Array, offset: number): number | undefined {
-  if (offset < 0 || offset + 2 > bytes.byteLength) return undefined;
-  return bytes[offset]! | bytes[offset + 1]! << 8;
 }
 
 function base64Value(code: number): number {

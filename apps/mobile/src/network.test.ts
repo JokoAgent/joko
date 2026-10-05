@@ -7,6 +7,7 @@ import {
   BlobDisposition,
   BlobRefSchema,
   BlobTransferTicketSchema,
+  GetImageThumbnailRequestSchema, GetImageThumbnailResponseSchema, ImageThumbnailUnavailableReason,
   FileKind,
   FilePreviewSchema,
   FileRevisionSchema,
@@ -73,6 +74,34 @@ import {
   mobileNetwork,
   type PairedCredential
 } from "./network";
+
+describe("canonical image thumbnail network", () => {
+  it("uses the authenticated generated source request and accepts only explicit bounded thumbnail or original-file outcomes", async () => {
+    const credential: PairedCredential = { profileId: "profile", origin: "https://node.example", serverId: "server", connectionId: "connection", deviceId: "phone", displayName: "Phone", authKey: "thumbnail-fixture-key" };
+    const blob = create(BlobRefSchema, { blobId: "canonical", fileName: "image.png", mediaType: "image/png", byteSize: 100n, sha256Hex: "a".repeat(64) });
+    const thumbnail = { data: Uint8Array.from([1, 2, 3]), mediaType: "image/webp", sha256Hex: "b".repeat(64), widthPixels: 512, heightPixels: 256, sourceWidthPixels: 2048, sourceHeightPixels: 1024 };
+    let response = create(GetImageThumbnailResponseSchema, { sourceBlob: blob, result: { case: "thumbnail", value: thumbnail } });
+    const fetcher = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      expect(String(input)).toBe("https://node.example/joko.v1.ArtifactService/GetImageThumbnail");
+      expect(new Headers(init?.headers).get("authorization")).toBe(`Bearer ${credential.authKey}`);
+      expect(fromBinary(GetImageThumbnailRequestSchema, new Uint8Array(init!.body as Uint8Array))).toMatchObject({ expectedSourceBlob: blob, maximumEdgePixels: 1024 });
+      return new Response(toBinary(GetImageThumbnailResponseSchema, response), { status: 200, headers: { "content-type": "application/proto" } });
+    });
+    try {
+      await expect(mobileNetwork.readImageThumbnail(credential, blob, 1024)).resolves.toMatchObject(thumbnail);
+      for (const value of [ImageThumbnailUnavailableReason.UNSUPPORTED, ImageThumbnailUnavailableReason.INPUT_TOO_LARGE, ImageThumbnailUnavailableReason.RENDER_FAILED, ImageThumbnailUnavailableReason.BUSY]) {
+        response = create(GetImageThumbnailResponseSchema, { sourceBlob: blob, result: { case: "unavailable", value } });
+        await expect(mobileNetwork.readImageThumbnail(credential, blob, 1024)).resolves.toBeUndefined();
+      }
+      response = create(GetImageThumbnailResponseSchema, { sourceBlob: { ...blob, blobId: "foreign" }, result: { case: "thumbnail", value: thumbnail } });
+      await expect(mobileNetwork.readImageThumbnail(credential, blob, 1024)).rejects.toThrow(/another canonical/u);
+      response = create(GetImageThumbnailResponseSchema, { sourceBlob: blob, result: { case: "unavailable", value: ImageThumbnailUnavailableReason.UNSPECIFIED } });
+      await expect(mobileNetwork.readImageThumbnail(credential, blob, 1024)).rejects.toThrow(/unknown/u);
+      response = create(GetImageThumbnailResponseSchema, { sourceBlob: blob, result: { case: "thumbnail", value: { ...thumbnail, widthPixels: 1025 } } });
+      await expect(mobileNetwork.readImageThumbnail(credential, blob, 1024)).rejects.toThrow(/bounds/u);
+    } finally { fetcher.mockRestore(); }
+  });
+});
 import { projectMobileVoiceDictionarySnapshot, mobileVoiceDictionaryLearningRequest } from "./mobile-voice-dictionary-service";
 
 vi.mock("expo-crypto", () => ({

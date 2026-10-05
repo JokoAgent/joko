@@ -6,6 +6,7 @@ import { BlobRefSchema, FileKind, FilePreviewSchema, FileRevisionSchema, Workspa
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { collectMobileMarkdownResourceCandidates, MobileMarkdownResourceReader, type MobileMarkdownResourceContext } from "./mobile-markdown-resources";
 import { installMobileAbortSignalRuntime } from "./mobile-abort-runtime";
+import { paddedPngBytes } from "./test/image-formats";
 
 const sdkRequire = createRequire(createRequire(import.meta.url).resolve("react-native/package.json"));
 const nativeSignals = sdkRequire("abort-controller") as { AbortController: typeof AbortController; AbortSignal: typeof AbortSignal };
@@ -114,7 +115,7 @@ describe("canonical message Markdown resources", () => {
 
   it("bounds cached image bytes across mounted messages and restores capacity when the owner releases them", async () => {
     const reader = new MobileMarkdownResourceReader();
-    const bytes = new Uint8Array(8 * 1_024 * 1_024); bytes.set(png);
+    const bytes = paddedPngBytes(png, 8 * 1_024 * 1_024);
     const largeRevision = create(FileRevisionSchema, { ...revision, byteSize: BigInt(bytes.length), sha256Hex: bytesToHex(sha256(bytes)) });
     const largeImage = create(WorkspaceEntrySchema, { ...image, revision: largeRevision });
     const largeBlob = create(BlobRefSchema, { ...blob, byteSize: largeRevision.byteSize, sha256Hex: largeRevision.sha256Hex });

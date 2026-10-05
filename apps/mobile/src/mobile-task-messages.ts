@@ -10,6 +10,9 @@ type MobileTaskMessageRow = readonly [
 ];
 
 const mobileTaskMessageRows = [
+  ["image.previewLoading", "Loading image…", "正在加载图片…", "正在載入圖片…", "画像を読み込み中…", "이미지를 불러오는 중…"],
+  ["image.previewFailed", "Image preview failed. Open the image or try again.", "图片预览失败，可打开图片或重试。", "圖片預覽失敗，可開啟圖片或重試。", "画像を表示できません。画像を開くか再試行してください。", "이미지를 표시할 수 없습니다. 이미지를 열거나 다시 시도하세요."],
+  ["image.previewRetry", "Retry image preview: {name}", "重试图片预览：{name}", "重試圖片預覽：{name}", "画像の表示を再試行: {name}", "이미지 미리 보기 다시 시도: {name}"],
   ["rewind.title", "Rewind before message", "回退到此消息之前", "回退至此訊息之前", "メッセージの前に戻る", "메시지 이전으로 되돌리기"],
   ["rewind.body", "Choose one action. Dialogue rewind restores this input to your draft. File restore applies the previewed changes independently.", "请选择一个操作。对话回退会将此输入恢复到草稿；文件恢复单独应用预览中的变化。", "請選擇一個操作。對話回退會將此輸入還原至草稿；檔案還原獨立套用預覽中的變更。", "操作を選んでください。会話を戻すと入力が下書きに復元されます。ファイルの復元はプレビューの変更だけを適用します。", "작업을 선택하세요. 대화를 되돌리면 입력이 초안에 복원됩니다. 파일 복원은 미리 본 변경 사항을 별도로 적용합니다."],
   ["rewind.attachments", "Select any historical attachments again before sending.", "发送前请重新选择历史附件。", "傳送前請重新選取歷史附件。", "送信前に以前の添付ファイルを選び直してください。", "보내기 전에 이전 첨부 파일을 다시 선택하세요."],

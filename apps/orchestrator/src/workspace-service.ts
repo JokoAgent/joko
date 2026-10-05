@@ -4166,17 +4166,23 @@ export function selectDiffHunkPatch(raw: string, hunkIndex: number): string {
 }
 
 /**
- * Exact audited FileBodyView inline-image set. Git Review intentionally accepts
- * additional raster extensions, so its broader shared map must not be reused.
+ * Canonical Files image snapshots. Git Review owns an independent raster surface;
+ * its display policy must not determine native gallery or Blob availability.
  */
 const WORKSPACE_RASTER_MEDIA_BY_EXTENSION: ReadonlyMap<string, string> = new Map([
   [".png", "image/png"],
+  [".apng", "image/apng"],
   [".jpg", "image/jpeg"],
   [".jpeg", "image/jpeg"],
   [".gif", "image/gif"],
   [".webp", "image/webp"],
   [".bmp", "image/bmp"],
-  [".ico", "image/x-icon"]
+  [".ico", "image/x-icon"],
+  [".avif", "image/avif"],
+  [".heic", "image/heic"],
+  [".heif", "image/heif"],
+  [".tif", "image/tiff"],
+  [".tiff", "image/tiff"]
 ]);
 
 const WORKSPACE_BINARY_MEDIA_BY_EXTENSION: ReadonlyMap<string, string> = new Map([

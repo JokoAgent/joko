@@ -1,6 +1,7 @@
 import { clone, create, toBinary } from "@bufbuild/protobuf";
 import { Code } from "@connectrpc/connect";
 import { createHash } from "node:crypto";
+import sharp from "sharp";
 import {
   AcknowledgementSchema, ArtifactKind, ArtifactSchema, BackendDescriptorSchema, BackendModelAccessSettingsSchema, BackendSettingsSchema, BlobDisposition, BlobRefSchema,
   CapabilityManifestSchema, CapabilityOptionsSchema, CapabilitySchema, CapabilitySupport, CompactSessionOutcome, ConnectionSchema, ConnectionState,
@@ -9,7 +10,7 @@ import {
   WorkspaceSearchMatchSchema, WorkspaceChangeSetSchema, WorkspaceRewindPreviewSchema, WorkspaceRewindResultSchema, RewindSafety, FileChangeKind,
   JOKO_API_VERSION, NativeEntryKind, NativeSessionBindingSchema, NativeSessionTreeNodeSchema, NativeSessionTreeSchema, OperationSchema,
   ListPartnerSessionsResponseSchema, PartnerSessionRole,
-  InputCapabilityOptionsSchema, InteractionKind, InteractionSchema, InteractionState, PermissionDecisionKind, PermissionRisk, PlanReviewDecisionKind,
+  InputCapabilityOptionsSchema, InteractionKind, InteractionSchema, InteractionState, PermissionDecisionKind, PermissionRisk, PlanReviewDecisionKind, ImageThumbnailSchema,
   EventCursorSchema, EventSchema, ImageRefSchema, MessageInputDelivery, MessageRole, ModelDescriptorSchema, ModelInputModality, ModelKeySchema, ModelOutputModality, ModelSelectionSchema,
   OperationMutationSchema, OperationState, OwnerSnapshotScopeSchema, PermissionMode,
   ProviderDescriptorSchema, ProviderKind, RevisionSchema, SessionMessageSearchMatchSchema, SessionSnapshotScopeSchema,
@@ -29,6 +30,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { MobileClient, type MobileStorage, type PendingOperation } from "./mobile-client";
 import { MobileCredentialStorageError, profileFromCredential } from "./connection-storage";
 import { producedArtifactEvent, producedImageEvent, toolMediaEvent } from "./test/timeline-media";
+import { animatedPngBytes, gifBytes, svgBytes, bmpBytes, tiffBytes, isoImageBytes, iconBytes, iconDibBytes } from "./test/image-formats";
 import type { MobileDiscovery } from "./connection-discovery";
 import {
   normalizeNodeOrigin,
@@ -997,6 +999,7 @@ function fakeNetwork(): MobileNetwork {
     })),
     listTargetWorktreeSources: vi.fn(async () => []),
     downloadBlob: vi.fn(async () => { throw new Error("No Blob fixture was configured."); }),
+    readImageThumbnail: vi.fn(async () => undefined),
     authorizeBlobDownload: vi.fn(async () => { throw new Error("No Blob authorization fixture was configured."); }),
     uploadBlob: vi.fn(async () => { throw new Error("No Blob upload fixture was configured."); }),
     getVoiceInputCapabilities: vi.fn(async () => { throw new Error("No Voice capability fixture was configured."); }),
@@ -1264,7 +1267,7 @@ function memoryDraftStores() {
   };
 }
 
-function localAttachmentDraft(text = ""): MobileComposerDraft {
+function localAttachmentDraft(text = "", imageBytes?: Uint8Array): MobileComposerDraft {
   return {
     ...plainTextMobileComposerDraft(text),
     attachments: [
@@ -1274,8 +1277,8 @@ function localAttachmentDraft(text = ""): MobileComposerDraft {
         kind: "image",
         fileName: "pixel.png",
         mediaType: "image/png",
-        byteSize: 4,
-        sha256Hex: "a".repeat(64),
+        byteSize: imageBytes?.byteLength ?? 4,
+        sha256Hex: (imageBytes ? "b" : "a").repeat(64),
         capturedAtUnixMs: 100
       },
       {
@@ -1313,10 +1316,10 @@ function annotatedLocalImageDraft(text = ""): MobileComposerDraft {
   };
 }
 
-function attachmentFileFixture(onRemove?: (attachmentId: string) => void) {
+function attachmentFileFixture(onRemove?: (attachmentId: string) => void, imageBytes?: Uint8Array) {
   const removed: string[] = [];
   const bytes = new Map<string, Uint8Array>([
-    ["image-one", new Uint8Array([1, 1, 1, 1])],
+    ["image-one", imageBytes ?? new Uint8Array([1, 1, 1, 1])],
     ["file-one", new Uint8Array([2, 2, 2, 2, 2, 2, 2])]
   ]);
   const driver: MobileAttachmentFileDriver = {
@@ -1444,6 +1447,7 @@ function fixedIds(...values: readonly string[]): () => string {
 }
 
 const renderedPngBytes = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+const editorSourcePngBytes = galleryPngBytes(1, 1);
 
 function previewMp4Bytes(handler: "soun" | "vide" = "vide"): Uint8Array {
   const bytes = new Uint8Array(48);
@@ -4818,10 +4822,10 @@ describe("native current-task message and Queue actions", () => {
     const network = projectedNetwork(attachmentSnapshot);
     const drafts = memoryDraftStores();
     const identity = { profileId: credential.profileId, sessionId: "session" };
-    const original = localAttachmentDraft("Keep the caption");
+    const original = localAttachmentDraft("Keep the caption", editorSourcePngBytes);
     drafts.composer.save(identity, original);
     await drafts.composer.flush(identity);
-    const fixture = attachmentFileFixture();
+    const fixture = attachmentFileFixture(undefined, editorSourcePngBytes);
     const app = client(network, memoryStorage(credential).storage, undefined, undefined,
       fixedIds("image-source", "editor-one", "rendered-image", "editor-two", "restored-image"),
       undefined, drafts, fixture.files);
@@ -4830,7 +4834,7 @@ describe("native current-task message and Queue actions", () => {
     const editor = await app.openComposerImageEditor({ surface: "task", attachmentId: "image-one" });
     expect(editor).toMatchObject({
       previewUri: "file:///durable/mobile-profile/image-one",
-      sourceBase64: "AQEBAQ==",
+      sourceBase64: Buffer.from(editorSourcePngBytes).toString("base64"),
       sourceMediaType: "image/png",
       fileName: "pixel.png",
       initialStrokes: [],
@@ -4861,8 +4865,8 @@ describe("native current-task message and Queue actions", () => {
               storageId: "image-source",
               fileName: "pixel.png",
               mediaType: "image/png",
-              byteSize: 4,
-              sha256Hex: "a".repeat(64)
+              byteSize: editorSourcePngBytes.byteLength,
+              sha256Hex: "b".repeat(64)
             },
             strokes: [stroke]
           }
@@ -4871,7 +4875,7 @@ describe("native current-task message and Queue actions", () => {
       ]
     });
     expect(await drafts.composer.read(identity)).toEqual(committed.draft);
-    expect(fixture.bytes.get("image-source")).toEqual(new Uint8Array([1, 1, 1, 1]));
+    expect(fixture.bytes.get("image-source")).toEqual(editorSourcePngBytes);
     expect(fixture.bytes.get("rendered-image")).toEqual(renderedPngBytes);
     expect(fixture.removed).toEqual(["image-one"]);
     expect(network.submit).not.toHaveBeenCalled();
@@ -4888,14 +4892,14 @@ describe("native current-task message and Queue actions", () => {
         attachmentId: "restored-image",
         fileName: "pixel.png",
         mediaType: "image/png",
-        byteSize: 4,
-        sha256Hex: "a".repeat(64)
+        byteSize: editorSourcePngBytes.byteLength,
+        sha256Hex: "b".repeat(64)
       },
       original.attachments[1]
     ]);
     expect(restored.draft.attachments[0]?.annotation).toBeUndefined();
     expect(fixture.bytes.has("image-source")).toBe(false);
-    expect(fixture.bytes.get("restored-image")).toEqual(new Uint8Array([1, 1, 1, 1]));
+    expect(fixture.bytes.get("restored-image")).toEqual(editorSourcePngBytes);
     expect(fixture.removed).toEqual(["image-one", "rendered-image", "image-source"]);
   });
 
@@ -4948,10 +4952,10 @@ describe("native current-task message and Queue actions", () => {
     const network = projectedNetwork(attachmentSnapshot);
     const drafts = memoryDraftStores();
     const identity = { profileId: credential.profileId, sessionId: "session" };
-    const original = localAttachmentDraft("Keep one result");
+    const original = localAttachmentDraft("Keep one result", editorSourcePngBytes);
     drafts.composer.save(identity, original);
     await drafts.composer.flush(identity);
-    const fixture = attachmentFileFixture();
+    const fixture = attachmentFileFixture(undefined, editorSourcePngBytes);
     const originalStageBytes = vi.mocked(fixture.driver.stageBytes).getMockImplementation()!;
     let releaseSource!: () => void;
     const sourceGate = new Promise<void>((resolve) => { releaseSource = resolve; });
@@ -4985,10 +4989,10 @@ describe("native current-task message and Queue actions", () => {
     const network = projectedNetwork(attachmentSnapshot);
     const drafts = memoryDraftStores();
     const identity = { profileId: credential.profileId, sessionId: "session" };
-    const original = localAttachmentDraft("Retry the render");
+    const original = localAttachmentDraft("Retry the render", editorSourcePngBytes);
     drafts.composer.save(identity, original);
     await drafts.composer.flush(identity);
-    const fixture = attachmentFileFixture();
+    const fixture = attachmentFileFixture(undefined, editorSourcePngBytes);
     const app = client(network, memoryStorage(credential).storage, undefined, undefined,
       fixedIds("retry-source", "retry-editor", "retry-output"), undefined, drafts, fixture.files);
     await app.start();
@@ -5011,10 +5015,10 @@ describe("native current-task message and Queue actions", () => {
     const network = projectedNetwork(attachmentSnapshot);
     const drafts = memoryDraftStores();
     const identity = { profileId: credential.profileId, sessionId: "session" };
-    const original = localAttachmentDraft("Keep after storage failure");
+    const original = localAttachmentDraft("Keep after storage failure", editorSourcePngBytes);
     drafts.composer.save(identity, original);
     await drafts.composer.flush(identity);
-    const fixture = attachmentFileFixture();
+    const fixture = attachmentFileFixture(undefined, editorSourcePngBytes);
     const app = client(network, memoryStorage(credential).storage, undefined, undefined,
       fixedIds("failed-source", "failed-editor", "failed-output"), undefined, drafts, fixture.files);
     await app.start();
@@ -5036,10 +5040,10 @@ describe("native current-task message and Queue actions", () => {
     const network = projectedNetwork(attachmentSnapshot);
     const drafts = memoryDraftStores();
     const identity = { profileId: credential.profileId, sessionId: "session" };
-    const original = localAttachmentDraft("Original");
+    const original = localAttachmentDraft("Original", editorSourcePngBytes);
     drafts.composer.save(identity, original);
     await drafts.composer.flush(identity);
-    const fixture = attachmentFileFixture();
+    const fixture = attachmentFileFixture(undefined, editorSourcePngBytes);
     const app = client(network, memoryStorage(credential).storage, undefined, undefined,
       fixedIds("stale-source", "stale-editor", "must-not-stage"), undefined, drafts, fixture.files);
     await app.start();
@@ -5066,10 +5070,10 @@ describe("native current-task message and Queue actions", () => {
     const network = projectedNetwork(attachmentSnapshot);
     const drafts = memoryDraftStores();
     const identity = { profileId: credential.profileId };
-    const original = localAttachmentDraft("First input");
+    const original = localAttachmentDraft("First input", editorSourcePngBytes);
     drafts.newTask.save(identity, { targetId: "target", name: "Annotated task", input: original });
     await drafts.newTask.flush(identity);
-    const fixture = attachmentFileFixture();
+    const fixture = attachmentFileFixture(undefined, editorSourcePngBytes);
     const app = client(network, memoryStorage(credential).storage, undefined, undefined,
       fixedIds("new-source", "new-editor", "new-rendered"), undefined, drafts, fixture.files);
     await app.start();
@@ -5104,7 +5108,7 @@ describe("native current-task message and Queue actions", () => {
   it("authenticates an uploaded image into an editor lease and retires the lease on backgrounding", async () => {
     const network = projectedNetwork(attachmentSnapshot);
     vi.mocked(network.downloadBlob).mockResolvedValue({
-      bytes: new Uint8Array([1, 1, 1, 1]),
+      bytes: editorSourcePngBytes,
       mediaType: "image/png"
     });
     const drafts = memoryDraftStores();
@@ -5118,8 +5122,8 @@ describe("native current-task message and Queue actions", () => {
         kind: "image",
         fileName: "pixel.png",
         mediaType: "image/png",
-        byteSize: 4,
-        sha256Hex: "a".repeat(64),
+        byteSize: editorSourcePngBytes.byteLength,
+        sha256Hex: "b".repeat(64),
         capturedAtUnixMs: 100
       }]
     };
@@ -5130,7 +5134,7 @@ describe("native current-task message and Queue actions", () => {
     await app.start();
 
     const editor = await app.openComposerImageEditor({ surface: "task", attachmentId: "uploaded-image" });
-    expect(editor.previewUri).toBe("data:image/png;base64,AQEBAQ==");
+    expect(editor.previewUri).toBe("data:image/png;base64," + Buffer.from(editorSourcePngBytes).toString("base64"));
     expect(network.downloadBlob).toHaveBeenCalledWith(credential, expect.objectContaining({
       blobId: "blob-uploaded-image",
       disposition: BlobDisposition.ATTACHMENT
@@ -8783,7 +8787,7 @@ describe("native current-task Files ownership", () => {
     expect(network.uploadBlob).not.toHaveBeenCalled();
   });
 
-  it("freezes a same-directory raster gallery and appends only its decoded authenticated page", async () => {
+  it("freezes a same-directory image gallery and appends only its decoded authenticated page", async () => {
     const network = fakeNetwork();
     configureFiles(network, handoffSnapshot);
     const bytes = galleryPngBytes(3, 2);
@@ -8839,11 +8843,11 @@ describe("native current-task Files ownership", () => {
     const descriptor = await app.openFilesImageGallery({ kind: "workspace-entry", entry: app.state.files.entries[1]! });
     expect(descriptor).toMatchObject({
       sourceKind: "workspace", initialIndex: 1,
-      pages: [{ title: "a.png" }, { title: "b.png" }]
+      pages: [{ title: "a.png" }, { title: "b.png" }, { title: "moving.gif" }]
     });
     const page = await app.loadImageGalleryPage(descriptor.leaseId, descriptor.initialIndex);
     expect(page).toMatchObject({
-      pageIndex: 1, pageCount: 2, expectedWidthPixels: 3, expectedHeightPixels: 2,
+      pageIndex: 1, pageCount: 3, expectedWidthPixels: 3, expectedHeightPixels: 2,
       addable: true, annotatable: true
     });
     app.confirmImageGalleryPageDecoded(descriptor.leaseId, page.leaseId, page.pageId, {
@@ -8996,6 +9000,272 @@ describe("native current-task Files ownership", () => {
     expect(fixture.driver.stageBytes).toHaveBeenNthCalledWith(1, credential.profileId, "annotation-source", bytes);
     expect(fixture.driver.stageBytes).toHaveBeenNthCalledWith(2, credential.profileId, "annotation-output", bytes);
     expect(network.submit).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { format: "static GIF", fileName: "still.gif", mediaType: "image/gif", bytes: gifBytes(), animated: false, width: 1, height: 1 },
+    { format: "animated GIF", fileName: "moving.gif", mediaType: "image/gif", bytes: gifBytes(true), animated: true, width: 1, height: 1 },
+    { format: "SVG", fileName: "vector.svg", mediaType: "image/svg+xml", bytes: svgBytes(), animated: false, width: 40, height: 20 },
+    { format: "animated PNG", fileName: "moving.png", mediaType: "image/png", bytes: animatedPngBytes(), animated: true, width: 1, height: 1 },
+    { format: "registered APNG", fileName: "moving.apng", mediaType: "image/apng", bytes: animatedPngBytes(), animated: true, width: 1, height: 1 },
+    { format: "ICO", fileName: "icon.ico", mediaType: "image/x-icon", bytes: iconBytes([{ bytes: iconDibBytes(3, 2), width: 3, height: 2 }]), animated: false, width: 3, height: 2 },
+    { format: "static TIFF", fileName: "scan.tiff", mediaType: "image/tiff", bytes: tiffBytes(3, 2), animated: false, width: 3, height: 2 }
+  ])("previews canonical $format, system-shares and appends original bytes, and rejects static rendering", async ({ fileName, mediaType, bytes, animated, width, height }) => {
+    const message = timelinePreviewEvent(fileName, mediaType, bytes, "b".repeat(64));
+    const projected = clone(SnapshotSchema, timelineGallerySnapshot(message));
+    const input = projected.backends[0]!.capabilities!.capabilities.find((item) => item.name === capabilityNames.inputImage)!.options!.kind;
+    if (input.case !== "input") throw new Error("fixture"); input.value.mediaTypes.push(mediaType);
+    const network = projectedNetwork(projected);
+    vi.mocked(network.downloadBlob).mockResolvedValue({ bytes, mediaType });
+    vi.mocked(network.readAround).mockResolvedValue([message]);
+    const blob = message.payload!.kind.case === "messageCompleted" ? message.payload!.kind.value.blocks[0]!.content : undefined;
+    if (blob?.case !== "artifact" || !blob.value.blob) throw new Error("fixture");
+    const canonical = blob.value.blob;
+    const authorized: AuthorizedBlobDownload = { url: credential.origin + "/v1/blobs/ticket", headers: { authorization: "Bearer private-key" },
+      blobId: canonical.blobId, fileName, mediaType, byteSize: bytes.byteLength, sha256Hex: canonical.sha256Hex };
+    vi.mocked(network.authorizeBlobDownload).mockResolvedValue(authorized);
+    const dispatch = vi.fn();
+    const perform = vi.fn(async (request: Parameters<MobileFileShare["perform"]>[0]) => {
+      await request.assertCurrent(); expect(dispatch).not.toHaveBeenCalled(); request.onDispatch?.();
+    });
+    const drafts = memoryDraftStores(); const identity = { profileId: credential.profileId, sessionId: "session" };
+    drafts.composer.save(identity, plainTextMobileComposerDraft("Keep the input")); await drafts.composer.flush(identity);
+    const fixture = attachmentFileFixture();
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined, fixedIds("format-gallery", "format-load", "format-output", "format-edit-source", "format-editor"),
+      undefined, drafts, fixture.files, undefined, undefined, undefined, { perform });
+    await app.start();
+    const selected = timelineRows(app.state.detail?.timeline ?? [])[0]!.images![0]!;
+    const descriptor = await app.openTimelineImageGallery(selected.sourceEventId!, selected.pageId);
+    const page = await app.loadImageGalleryPage(descriptor.leaseId, 0);
+    expect(page).toMatchObject({ sourceMediaType: mediaType, expectedWidthPixels: width, expectedHeightPixels: height,
+      expectedAnimated: animated, annotatable: false, addable: true, sourceBase64: Buffer.from(bytes).toString("base64") });
+    if (mediaType === "image/svg+xml") expect(Buffer.from(page.previewUri.split(",")[1]!, "base64").toString()).toContain('viewBox="0 0 40 20"');
+    expect(() => app.confirmImageGalleryPageDecoded(descriptor.leaseId, page.leaseId, page.pageId,
+      { width: mediaType === "image/gif" && !animated ? width + 1 : width, height, mediaType, isAnimated: !animated })).toThrow(/decoded image/u);
+    app.confirmImageGalleryPageDecoded(descriptor.leaseId, page.leaseId, page.pageId, { width, height, mediaType: page.previewMediaType ?? mediaType, isAnimated: mediaType === "image/gif" || animated });
+    await expect(app.prepareImageOutput(page.leaseId, { width, height, mediaType, isAnimated: false })).rejects.toThrow(/Animated|static image format|signature or dimensions/u);
+    await expect(app.commitImageGalleryPageToComposer(descriptor.leaseId, page.leaseId, [{ points: [{ x: 0.5, y: 0.5 }] }],
+      { bytes: renderedPngBytes, mediaType: "image/png", width, height })).rejects.toThrow(/cannot be rendered/u);
+    await app.shareImageGalleryPageOriginal(descriptor.leaseId, page.leaseId, undefined, dispatch);
+    expect(dispatch).toHaveBeenCalledOnce();
+    expect(perform).toHaveBeenCalledOnce(); expect(perform.mock.calls[0]![0].source).toEqual(authorized);
+    expect(network.readAround).toHaveBeenCalledTimes(2); expect(fixture.driver.stageBytes).not.toHaveBeenCalled();
+    const committed = await app.addImageGalleryPageToComposer(descriptor.leaseId, page.leaseId);
+    expect(committed).toMatchObject({ text: "Keep the input", attachments: [{ attachmentId: "format-output", fileName, mediaType, byteSize: bytes.byteLength }] });
+    expect(fixture.bytes.get("format-output")).toEqual(bytes);
+    const editor = await app.openComposerImageEditor({ surface: "task", attachmentId: "format-output" });
+    expect(editor.annotatable).toBe(false);
+    expect(network.submit).not.toHaveBeenCalled(); expect(network.uploadBlob).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { fileName: "photo.bmp", mediaType: "image/bmp", bytes: bmpBytes(3, 2), originalOnly: false },
+    { fileName: "photo.avif", mediaType: "image/avif", bytes: isoImageBytes(["avif"], 3, 2, { thumbnail: { width: 20, height: 10 } }), originalOnly: false },
+    { fileName: "photo.heic", mediaType: "image/heic", bytes: isoImageBytes(["heic", "mif1"], 3, 2), originalOnly: false },
+    { fileName: "photo.heif", mediaType: "image/heif", bytes: isoImageBytes(["mif1"], 3, 2), originalOnly: false },
+    { fileName: "scan.tiff", mediaType: "image/tiff", bytes: tiffBytes(3, 2), originalOnly: false },
+    { fileName: "icon.ico", mediaType: "image/x-icon", bytes: iconBytes([{ bytes: iconDibBytes(1, 1), width: 1, height: 1 }, { bytes: iconDibBytes(3, 2), width: 3, height: 2 }]), originalOnly: true }
+  ])("opens canonical $mediaType Files and Generated images with exact primary dimensions and original output bytes", async ({ fileName, mediaType, bytes, originalOnly }) => {
+    const network = fakeNetwork(); configureFiles(network, handoffSnapshot);
+    const revision = create(FileRevisionSchema, { opaqueRevision: "container-image", sha256Hex: "b".repeat(64), byteSize: BigInt(bytes.length) });
+    const entry = create(WorkspaceEntrySchema, { workspaceId: "workspace", relativePath: fileName, displayName: fileName,
+      mediaType, kind: FileKind.REGULAR, revision });
+    const blob = create(BlobRefSchema, { blobId: "container-blob", fileName, mediaType, byteSize: BigInt(bytes.length), sha256Hex: "b".repeat(64), disposition: BlobDisposition.INLINE });
+    const artifact = create(ArtifactSchema, { artifactId: "container-artifact", sessionId: "session", kind: ArtifactKind.IMAGE, title: "Image", blob });
+    vi.mocked(network.listWorkspaceDirectory).mockResolvedValue({ entries: [entry], revision: "container-directory" });
+    vi.mocked(network.listWorkspaceFileIndex).mockResolvedValue({ paths: [fileName], revision: "container-index", truncated: false });
+    vi.mocked(network.readWorkspaceFile).mockResolvedValue(create(FilePreviewSchema, { entry, content: { case: "image", value: { blob } } }));
+    vi.mocked(network.listSessionArtifacts).mockResolvedValue({ artifacts: [artifact], revision: "container-catalog" });
+    vi.mocked(network.downloadBlob).mockResolvedValue({ bytes, mediaType });
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined, fixedIds("container-gallery", "container-load"),
+      undefined, memoryDraftStores(), attachmentFileFixture().files);
+    await app.start(); await app.openFiles(); await app.previewWorkspaceEntry(entry);
+    expect(app.state.files.preview).toMatchObject({ kind: "image", mediaType, widthPixels: 3, heightPixels: 2 });
+    if (mediaType === "image/x-icon") expect(app.state.files.preview?.kind === "image" && app.state.files.preview.dataUri.startsWith("data:image/png;")).toBe(true);
+    const descriptor = await app.openFilesImageGallery({ kind: "workspace-entry", entry }); const page = await app.loadImageGalleryPage(descriptor.leaseId, 0);
+    expect(page).toMatchObject({ sourceMediaType: mediaType, expectedWidthPixels: 3, expectedHeightPixels: 2, originalOnly,
+      sourceBase64: Buffer.from(bytes).toString("base64") });
+    expect(() => app.confirmImageGalleryPageDecoded(descriptor.leaseId, page.leaseId, page.pageId,
+      { width: 20, height: 10, mediaType, isAnimated: false })).toThrow(/decoded image/u);
+    app.confirmImageGalleryPageDecoded(descriptor.leaseId, page.leaseId, page.pageId, { width: 3, height: 2, mediaType: page.previewMediaType ?? mediaType, isAnimated: false });
+    if (!originalOnly) {
+      const output = await app.prepareImageOutput(page.leaseId, { width: 3, height: 2, mediaType, isAnimated: false });
+      expect(output).toMatchObject({ mediaType, width: 3, height: 2 }); expect(output.bytes).toEqual(bytes);
+    }
+    app.cancelImageGallery(descriptor.leaseId); app.openGeneratedFiles(); await app.previewArtifact(artifact);
+    expect(app.state.files.preview).toMatchObject({ kind: "image", mediaType, widthPixels: 3, heightPixels: 2 });
+    expect(network.materializeWorkspaceFileBlob).not.toHaveBeenCalled(); expect(network.submit).not.toHaveBeenCalled();
+  });
+
+  it("retires original gallery sharing on cancellation and rejects fresh source drift before native dispatch", async () => {
+    const bytes = gifBytes(true); const message = timelinePreviewEvent("moving.gif", "image/gif", bytes, "b".repeat(64));
+    const network = projectedNetwork(timelineGallerySnapshot(message));
+    vi.mocked(network.downloadBlob).mockResolvedValue({ bytes, mediaType: "image/gif" });
+    vi.mocked(network.readAround).mockResolvedValue([message]);
+    vi.mocked(network.authorizeBlobDownload).mockResolvedValue({ url: credential.origin + "/v1/blobs/ticket", headers: { authorization: "Bearer private-key" },
+      blobId: "timeline-moving.gif", fileName: "moving.gif", mediaType: "image/gif", byteSize: bytes.byteLength, sha256Hex: "b".repeat(64) });
+    let request!: Parameters<MobileFileShare["perform"]>[0]; let finish!: () => void;
+    const perform = vi.fn(async (value: typeof request) => { request = value; await new Promise<void>((resolve) => { finish = resolve; }); await request.assertCurrent(); });
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined, fixedIds("cancel-gallery", "cancel-page", "fresh-gallery", "fresh-page"), undefined, undefined, attachmentFileFixture().files,
+      undefined, undefined, undefined, { perform });
+    await app.start();
+    const selected = timelineRows(app.state.detail!.timeline)[0]!.images![0]!;
+    const descriptor = await app.openTimelineImageGallery(selected.sourceEventId!, selected.pageId);
+    const page = await app.loadImageGalleryPage(descriptor.leaseId, 0);
+    app.confirmImageGalleryPageDecoded(descriptor.leaseId, page.leaseId, page.pageId, { width: 1, height: 1, isAnimated: true });
+    const sharing = app.shareImageGalleryPageOriginal(descriptor.leaseId, page.leaseId); const rejected = expect(sharing).rejects.toThrow();
+    await vi.waitFor(() => expect(perform).toHaveBeenCalledOnce());
+    await expect(app.shareImageGalleryPageOriginal(descriptor.leaseId, page.leaseId)).rejects.toThrow(/no longer owns/u);
+    app.cancelImageGallery(descriptor.leaseId); expect(request.signal!.aborted).toBe(true); finish(); await rejected;
+    const next = await app.openTimelineImageGallery(selected.sourceEventId!, selected.pageId);
+    const nextPage = await app.loadImageGalleryPage(next.leaseId, 0);
+    app.confirmImageGalleryPageDecoded(next.leaseId, nextPage.leaseId, nextPage.pageId, { width: 1, height: 1, isAnimated: true });
+    vi.mocked(network.readAround).mockResolvedValue([]);
+    await expect(app.shareImageGalleryPageOriginal(next.leaseId, nextPage.leaseId)).rejects.toThrow(/Timeline image changed/u);
+    expect(perform).toHaveBeenCalledOnce(); expect(network.authorizeBlobDownload).toHaveBeenCalledOnce();
+  });
+
+  it.each(["Workspace", "Generated"])("previews and shares a canonical %s SVG through its exact typed Blob and rejects a changed source", async (origin) => {
+    const bytes = svgBytes(); const network = fakeNetwork(); configureFiles(network, handoffSnapshot);
+    const imageRevision = create(FileRevisionSchema, { opaqueRevision: "svg-r1", byteSize: BigInt(bytes.byteLength), sha256Hex: "b".repeat(64) });
+    const entry = create(WorkspaceEntrySchema, { workspaceId: "workspace", relativePath: "vector.svg", displayName: "vector.svg",
+      mediaType: "image/svg+xml", kind: FileKind.REGULAR, revision: imageRevision });
+    const blob = create(BlobRefSchema, { blobId: "svg-blob", fileName: "vector.svg", mediaType: "image/svg+xml", byteSize: BigInt(bytes.byteLength),
+      sha256Hex: "b".repeat(64), disposition: BlobDisposition.INLINE });
+    const artifact = create(ArtifactSchema, { artifactId: "vector-artifact", sessionId: "session", kind: ArtifactKind.IMAGE, title: "Vector", blob });
+    vi.mocked(network.listWorkspaceDirectory).mockResolvedValue({ entries: [entry], revision: "svg-directory" });
+    vi.mocked(network.listWorkspaceFileIndex).mockResolvedValue({ paths: ["vector.svg"], revision: "svg-index", truncated: false });
+    vi.mocked(network.readWorkspaceFile).mockResolvedValue(create(FilePreviewSchema, { entry, content: { case: "text", value: {
+      utf8Text: new TextDecoder().decode(bytes), startByte: 0n, endByte: BigInt(bytes.byteLength), totalLines: 1, languageId: "xml" } } }));
+    vi.mocked(network.materializeWorkspaceFileBlob).mockResolvedValue({ entry, blob });
+    vi.mocked(network.listSessionArtifacts).mockResolvedValue({ artifacts: [artifact], revision: "svg-catalog" });
+    vi.mocked(network.downloadBlob).mockResolvedValue({ bytes, mediaType: "image/svg+xml" });
+    const authorized: AuthorizedBlobDownload = { url: credential.origin + "/v1/blobs/svg-ticket", headers: { authorization: "Bearer private-key" },
+      blobId: blob.blobId, fileName: blob.fileName, mediaType: blob.mediaType, byteSize: bytes.byteLength, sha256Hex: blob.sha256Hex };
+    vi.mocked(network.authorizeBlobDownload).mockResolvedValue(authorized);
+    const perform = vi.fn(async (request: Parameters<MobileFileShare["perform"]>[0]) => { await request.assertCurrent(); });
+    const drafts = memoryDraftStores(); const identity = { profileId: credential.profileId, sessionId: "session" };
+    drafts.composer.save(identity, plainTextMobileComposerDraft("Read only")); await drafts.composer.flush(identity);
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined, fixedIds("svg-gallery", "svg-load"),
+      undefined, drafts, attachmentFileFixture().files, undefined, undefined, undefined, { perform });
+    await app.start(); await app.openFiles();
+    const source = origin === "Workspace" ? { kind: "workspace-entry" as const, entry } : { kind: "artifact" as const, artifact };
+    if (origin === "Workspace") {
+      await app.previewWorkspaceEntry(entry);
+      expect(network.materializeWorkspaceFileBlob).toHaveBeenCalledWith(credential, "workspace", "vector.svg", imageRevision, expect.any(AbortSignal));
+    } else { app.openGeneratedFiles(); await app.previewArtifact(artifact); }
+    expect(app.state.files.preview).toMatchObject({ kind: "image", mediaType: "image/svg+xml", widthPixels: 40, heightPixels: 20 });
+    const descriptor = await app.openFilesImageGallery(source); const page = await app.loadImageGalleryPage(descriptor.leaseId, 0);
+    expect(page).toMatchObject({ annotatable: false, addable: false, sourceMediaType: "image/svg+xml", expectedAnimated: false });
+    app.confirmImageGalleryPageDecoded(descriptor.leaseId, page.leaseId, page.pageId, { width: 40, height: 20, mediaType: "image/svg+xml", isAnimated: false });
+    await app.shareImageGalleryPageOriginal(descriptor.leaseId, page.leaseId);
+    expect(perform).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ source: authorized }));
+    if (origin === "Workspace") vi.mocked(network.listWorkspaceDirectory).mockResolvedValue({ entries: [{ ...entry, revision: { ...imageRevision, opaqueRevision: "svg-r2" } }], revision: "svg-directory-next" });
+    else vi.mocked(network.listSessionArtifacts).mockResolvedValue({ artifacts: [artifact], revision: "svg-catalog-next" });
+    await expect(app.shareImageGalleryPageOriginal(descriptor.leaseId, page.leaseId)).rejects.toThrow(/image changed/u);
+    expect(perform).toHaveBeenCalledOnce(); expect(network.authorizeBlobDownload).toHaveBeenCalledOnce();
+    expect(await drafts.composer.read(identity)).toEqual(plainTextMobileComposerDraft("Read only"));
+  });
+
+  it("prepares canonical inline images independently of Gallery and reauthorizes their cached source", async () => {
+    const bytes = iconBytes([{ bytes: iconDibBytes(3, 2), width: 3, height: 2 }]);
+    const message = timelinePreviewEvent("icon.ico", "image/x-icon", bytes, createHash("sha256").update(bytes).digest("hex"));
+    const network = projectedNetwork(timelineGallerySnapshot(message));
+    vi.mocked(network.readAround).mockResolvedValue([message]); vi.mocked(network.downloadBlob).mockResolvedValue({ bytes, mediaType: "image/x-icon" });
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined, fixedIds("inline-gallery", "original-page"), undefined, memoryDraftStores());
+    await app.start(); const selected = timelineRows(app.state.detail!.timeline)[0]!.images![0]!;
+    const preview = await app.prepareTimelineImagePreview(selected.sourceEventId!, selected.pageId, new AbortController().signal);
+    expect(preview).toMatchObject({ width: 3, height: 2, mediaType: "image/png" });
+    app.confirmTimelineImagePreview(preview.leaseId, { width: 3, height: 2, mediaType: "image/png", isAnimated: false }); app.releaseTimelineImagePreview(preview.leaseId);
+    const cached = await app.prepareTimelineImagePreview(selected.sourceEventId!, selected.pageId, new AbortController().signal);
+    expect(network.downloadBlob).toHaveBeenCalledOnce(); expect(network.readAround).toHaveBeenCalledTimes(2);
+    const gallery = await app.openTimelineImageGallery(selected.sourceEventId!, selected.pageId);
+    const original = await app.loadImageGalleryPage(gallery.leaseId, 0);
+    expect(original.sourceBase64).toBe(Buffer.from(bytes).toString("base64")); expect(network.downloadBlob).toHaveBeenCalledTimes(2);
+    app.setForeground(false); expect(app.timelineImagePreviewOwnerKey()).toBeUndefined();
+    expect(() => app.confirmTimelineImagePreview(cached.leaseId, { width: 3, height: 2 })).toThrow(/released|owner/u);
+    expect(network.submit).not.toHaveBeenCalled();
+  });
+
+  it("uses a generated thumbnail only for inline presentation and keeps authentication failures out of original fallback", async () => {
+    const bytes = Uint8Array.from(await sharp({ create: { width: 1, height: 1, channels: 3, background: "orange" } }).webp().toBuffer());
+    const message = timelinePreviewEvent("one.webp", "image/webp", bytes, sha256Hex(bytes));
+    const network = projectedNetwork(timelineGallerySnapshot(message)); vi.mocked(network.readAround).mockResolvedValue([message]);
+    vi.mocked(network.readImageThumbnail).mockResolvedValue(create(ImageThumbnailSchema, { data: bytes, mediaType: "image/webp", sha256Hex: sha256Hex(bytes),
+      widthPixels: 1, heightPixels: 1, sourceWidthPixels: 1, sourceHeightPixels: 1 }));
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined, fixedIds("thumbnail-gallery", "thumbnail-original"), undefined, memoryDraftStores());
+    await app.start(); const selected = timelineRows(app.state.detail!.timeline)[0]!.images![0]!;
+    const preview = await app.prepareTimelineImagePreview(selected.sourceEventId!, selected.pageId, new AbortController().signal);
+    expect(network.readImageThumbnail).toHaveBeenCalledExactlyOnceWith(credential, expect.objectContaining({ blobId: "timeline-one.webp" }), 1024, expect.any(AbortSignal));
+    expect(network.downloadBlob).not.toHaveBeenCalled(); app.releaseTimelineImagePreview(preview.leaseId);
+    const gallery = await app.openTimelineImageGallery(selected.sourceEventId!, selected.pageId); vi.mocked(network.downloadBlob).mockResolvedValue({ bytes, mediaType: "image/webp" });
+    await app.loadImageGalleryPage(gallery.leaseId, 0); expect(network.downloadBlob).toHaveBeenCalledOnce(); expect(network.readImageThumbnail).toHaveBeenCalledOnce();
+    app.releaseImageGalleryPreview(gallery.leaseId, preview.leaseId, true);
+    // A new source/cache miss cannot hide a revoked or malformed thumbnail RPC behind an original download.
+    app.setForeground(false); app.setForeground(true); await app.refresh();
+    vi.mocked(network.readImageThumbnail).mockRejectedValueOnce(new Error("thumbnail connection revoked"));
+    await expect(app.prepareTimelineImagePreview(selected.sourceEventId!, selected.pageId, new AbortController().signal)).rejects.toThrow(/revoked/u);
+    expect(network.downloadBlob).toHaveBeenCalledOnce();
+  });
+
+  it("pins an exact cached gallery preview independently of the inline view and retires original actions during page replacement", async () => {
+    const bytes = iconBytes([{ bytes: iconDibBytes(3, 2), width: 3, height: 2 }]);
+    const message = timelinePreviewEvent("icon.ico", "image/x-icon", bytes, sha256Hex(bytes));
+    const network = projectedNetwork(timelineGallerySnapshot(message));
+    vi.mocked(network.readAround).mockResolvedValue([message]); vi.mocked(network.downloadBlob).mockResolvedValue({ bytes, mediaType: "image/x-icon" });
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined, fixedIds("pinned-gallery", "original-one", "original-two"), undefined, memoryDraftStores());
+    await app.start(); const selected = timelineRows(app.state.detail!.timeline)[0]!.images![0]!;
+    const controller = new AbortController(); const inline = await app.prepareTimelineImagePreview(selected.sourceEventId!, selected.pageId, controller.signal);
+    const gallery = await app.openTimelineImageGallery(selected.sourceEventId!, selected.pageId); expect(app.imageGalleryCurrent(gallery.leaseId)).toBe(true);
+    const preview = await app.pinImageGalleryCachedPreview(gallery.leaseId, 0, new AbortController().signal);
+    expect(preview?.uri).toBe(inline.uri); expect(preview?.leaseId).not.toBe(inline.leaseId); expect(network.downloadBlob).toHaveBeenCalledOnce();
+    controller.abort(); app.confirmTimelineImagePreview(preview!.leaseId, { width: 3, height: 2, mediaType: "image/png", isAnimated: false });
+    const original = await app.loadImageGalleryPage(gallery.leaseId, 0);
+    app.confirmImageGalleryPageDecoded(gallery.leaseId, original.leaseId, original.pageId, { width: 3, height: 2, mediaType: "image/png", isAnimated: false });
+    vi.mocked(network.downloadBlob).mockRejectedValueOnce(new Error("fetch failed"));
+    await expect(app.loadImageGalleryPage(gallery.leaseId, 0)).rejects.toThrow("fetch failed");
+    expect(() => app.confirmImageGalleryPageDecoded(gallery.leaseId, original.leaseId, original.pageId, { width: 3, height: 2 })).toThrow(/decoded|gallery/u);
+    await expect(app.addImageGalleryPageToComposer(gallery.leaseId, original.leaseId)).rejects.toThrow(/decoded gallery/u);
+    app.setForeground(false); expect(app.imageGalleryCurrent(gallery.leaseId)).toBe(false);
+    expect(() => app.confirmTimelineImagePreview(preview!.leaseId, { width: 3, height: 2 })).toThrow(/released/u);
+    expect(await app.pinImageGalleryCachedPreview(gallery.leaseId, 0, new AbortController().signal)).toBeUndefined();
+  });
+
+  it("rejects remote Tool replacement before inline download and cancels a late inline result on background", async () => {
+    const bytes = gifBytes(); const message = timelinePreviewEvent("old.gif", "image/gif", bytes, createHash("sha256").update(bytes).digest("hex"));
+    const tool = toolMediaEvent(message, "toolCallStarted");
+    const replacementMessage = timelinePreviewEvent("new.gif", "image/gif", bytes, createHash("sha256").update(bytes).digest("hex"));
+    replacementMessage.eventId = "new-tool-output"; replacementMessage.cursor!.sequence = 13n;
+    const replacement = toolMediaEvent(replacementMessage, "toolCallUpdated");
+    const network = projectedNetwork(timelineGallerySnapshot(tool)); vi.mocked(network.readAround).mockResolvedValue([tool, replacement]);
+    const app = client(network, memoryStorage(credential).storage); await app.start(); const selected = timelineRows(app.state.detail!.timeline)[0]!.images![0]!;
+    await expect(app.prepareTimelineImagePreview(selected.sourceEventId!, selected.pageId, new AbortController().signal)).rejects.toThrow(/authenticated inline/u);
+    expect(network.downloadBlob).not.toHaveBeenCalled(); vi.mocked(network.readAround).mockResolvedValue([tool]);
+    let finish!: (value: { bytes: Uint8Array; mediaType: string }) => void;
+    vi.mocked(network.downloadBlob).mockImplementation(() => new Promise((resolve) => { finish = resolve; }));
+    const loading = app.prepareTimelineImagePreview(selected.sourceEventId!, selected.pageId, new AbortController().signal); const rejected = expect(loading).rejects.toThrow(/cancelled/u);
+    await vi.waitFor(() => expect(network.downloadBlob).toHaveBeenCalledOnce()); app.setForeground(false); await rejected;
+    finish({ bytes, mediaType: "image/gif" });
+  });
+
+  it("refuses original gallery sharing when authenticated history has replaced the selected tool occurrence", async () => {
+    const bytes = gifBytes(true);
+    const started = toolMediaEvent(timelinePreviewEvent("moving.gif", "image/gif", bytes, "b".repeat(64)), "toolCallStarted");
+    const replacementMessage = timelinePreviewEvent("replacement.gif", "image/gif", bytes, "b".repeat(64));
+    replacementMessage.eventId = "replacement-event"; replacementMessage.cursor!.sequence = 13n;
+    const replacement = toolMediaEvent(replacementMessage, "toolCallUpdated");
+    const network = projectedNetwork(timelineGallerySnapshot(started));
+    vi.mocked(network.downloadBlob).mockResolvedValue({ bytes, mediaType: "image/gif" });
+    vi.mocked(network.readAround).mockResolvedValue([started, replacement]);
+    const perform = vi.fn();
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined, fixedIds("tool-gallery", "tool-page"), undefined,
+      undefined, attachmentFileFixture().files, undefined, undefined, undefined, { perform });
+    await app.start(); const selected = timelineRows(app.state.detail!.timeline)[0]!.images![0]!;
+    const descriptor = await app.openTimelineImageGallery(selected.sourceEventId!, selected.pageId);
+    const page = await app.loadImageGalleryPage(descriptor.leaseId, 0);
+    app.confirmImageGalleryPageDecoded(descriptor.leaseId, page.leaseId, page.pageId, { width: 1, height: 1, isAnimated: true });
+    await expect(app.shareImageGalleryPageOriginal(descriptor.leaseId, page.leaseId)).rejects.toThrow(/source|image/u);
+    expect(network.authorizeBlobDownload).not.toHaveBeenCalled(); expect(perform).not.toHaveBeenCalled();
   });
 
   it.each([

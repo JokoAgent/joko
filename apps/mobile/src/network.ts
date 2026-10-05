@@ -1,7 +1,7 @@
 import { Code, ConnectError, createClient, type Interceptor, type Transport } from "@connectrpc/connect";
 import { createConnectTransport } from "@connectrpc/connect-web";
 import {
-  ArtifactKind, ArtifactService, BlobDisposition, ConnectionService, DeviceKind, EventService, FileKind,
+  ArtifactKind, ArtifactService, BlobDisposition, ConnectionService, DeviceKind, EventService, FileKind, ImageThumbnailUnavailableReason,
   MobilePushEnvironment as WireMobilePushEnvironment, MobilePushLocale as WireMobilePushLocale,
   MobilePushProvider, OperationService, OperationState, PartnerService,
   ResourceKind, SchedulerService, SessionService, TargetService, VoiceInputService, SettingsService, CredentialService, CredentialKind,
@@ -14,7 +14,7 @@ import {
   TransferDirection, WorkspaceEntryListingPolicy, WorkspaceFileChangeKind, WorkspaceService,
   JOKO_API_VERSION, SessionMessageSearchSemanticMode, SessionMessageSearchSessionStatus,
   isPrivateLanDiscoveryHost, validateDiscoveredNode,
-  type Artifact, type BlobRef, type BlobTransferTicket, type Connection, type Device, type DiscoveredNodeRecord,
+  type Artifact, type BlobRef, type BlobTransferTicket, type Connection, type Device, type DiscoveredNodeRecord, type ImageThumbnail,
   type Event, type EventCursor, type FilePreview, type FileRevision, type Operation, type OperationMutation,
   type NativeSessionTree, type PendingBlobUpload, type RuntimeCommand, type Schedule, type ScheduleRunHistory,
   type SchedulerRuntimeSnapshot, type SessionMessageSearchMatch, type SessionResource, type Snapshot, type Target,
@@ -146,6 +146,7 @@ export interface MobileNetwork {
   probeTargetWorktree(credential: PairedCredential, targetId: string, signal?: AbortSignal): Promise<MobileTargetWorktreeProbe>;
   listTargetWorktreeSources(credential: PairedCredential, targetId: string, signal?: AbortSignal): Promise<readonly MobileTargetWorktreeSource[]>;
   downloadBlob(credential: PairedCredential, blob: BlobRef, signal?: AbortSignal): Promise<VerifiedBlobDownload>;
+  readImageThumbnail(credential: PairedCredential, blob: BlobRef, edge: 256 | 1024, signal?: AbortSignal): Promise<ImageThumbnail | undefined>;
   authorizeBlobDownload(credential: PairedCredential, blob: BlobRef, signal?: AbortSignal): Promise<AuthorizedBlobDownload>;
   uploadBlob(credential: PairedCredential, source: MobileBlobUploadSource, signal?: AbortSignal): Promise<BlobRef>;
   getVoiceInputCapabilities(credential: PairedCredential, signal?: AbortSignal): Promise<MobileVoiceCapability>;
@@ -1485,6 +1486,27 @@ export const mobileNetwork: MobileNetwork = {
     const response = await createClient(ArtifactService, transport(credential.origin, credential.authKey))
       .getBlobDownloadTicket({ blobId: blob.blobId }, options(signal));
     return downloadVerifiedBlob(credential, blob, response.ticket, signal);
+  },
+  async readImageThumbnail(credential, blob, edge, signal) {
+    assertDownloadBlob(blob);
+    const response = await createClient(ArtifactService, transport(credential.origin, credential.authKey))
+      .getImageThumbnail({ expectedSourceBlob: blob, maximumEdgePixels: edge }, options(signal));
+    signal?.throwIfAborted(); const source = response.sourceBlob;
+    if (!source || source.blobId !== blob.blobId || source.sha256Hex !== blob.sha256Hex || source.byteSize !== blob.byteSize
+      || source.mediaType !== blob.mediaType || source.fileName !== blob.fileName) throw new Error("The thumbnail belongs to another canonical Blob.");
+    if (response.result.case === "unavailable") {
+      if (![ImageThumbnailUnavailableReason.UNSUPPORTED, ImageThumbnailUnavailableReason.INPUT_TOO_LARGE,
+        ImageThumbnailUnavailableReason.RENDER_FAILED, ImageThumbnailUnavailableReason.BUSY].includes(response.result.value)) throw new Error("The image thumbnail outcome is unknown.");
+      return undefined;
+    }
+    if (response.result.case !== "thumbnail") throw new Error("The image thumbnail result is missing.");
+    const value = response.result.value;
+    if (value.mediaType !== "image/webp" || !/^[0-9a-f]{64}$/u.test(value.sha256Hex) || !value.data.length || value.data.length > 700 * 1024
+      || !Number.isSafeInteger(value.widthPixels) || !Number.isSafeInteger(value.heightPixels) || value.widthPixels < 1 || value.heightPixels < 1
+      || value.widthPixels > edge || value.heightPixels > edge || value.sourceWidthPixels < 1 || value.sourceHeightPixels < 1
+      || value.sourceWidthPixels > 16_384 || value.sourceHeightPixels > 16_384 || value.sourceWidthPixels * value.sourceHeightPixels > 64 * 1024 * 1024
+      || Math.max(value.widthPixels, value.heightPixels) > Math.max(value.sourceWidthPixels, value.sourceHeightPixels)) throw new Error("The image thumbnail exceeds its presentation bounds.");
+    return value;
   },
   async authorizeBlobDownload(credential, blob, signal) {
     assertShareBlob(blob);

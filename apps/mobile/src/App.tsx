@@ -16,6 +16,8 @@ import {
 } from "@joko/contracts";
 import { MobileConnectionStage } from "./MobileConnectionStage";
 import { MobileFileTextPreview } from "./MobileFileTextPreview";
+import { MobileTimelineImage } from "./MobileTimelineImage";
+import { MobileImageGalleryPresenter } from "./mobile-image-gallery-presentation";
 import { MobileNativeIntentNotice } from "./MobileNativeIntentNotice";
 import {
   MobileClient,
@@ -258,7 +260,6 @@ import {
   mobileImageGalleryMediaType,
   type MobileImageGalleryDescriptor,
   type MobileImageGalleryNativeDecode,
-  type MobileImageGalleryPageSession,
   type MobileImageGalleryPageSummary
 } from "./mobile-image-gallery";
 import {
@@ -410,131 +411,43 @@ interface MobileRuntimeCommandPaletteSnapshot {
   readonly draftLease?: MobileRuntimeCommandDraftLease;
 }
 
-interface MobileImageGalleryView {
-  readonly descriptor: MobileImageGalleryDescriptor;
-  readonly session: MobileImageGalleryPageSession;
-  readonly busy: boolean;
-  readonly error?: string;
-}
-
 function useMobileImageGallery(
   locale: MobileSupportedLocale,
   onCommitted: (draft: MobileComposerDraft) => void
 ) {
-  const [view, setView] = useState<MobileImageGalleryView>();
-  const viewRef = useRef<MobileImageGalleryView | undefined>(undefined);
-  const pageControllerRef = useRef<AbortController | undefined>(undefined);
-  const onCommittedRef = useRef(onCommitted);
-  viewRef.current = view;
-  onCommittedRef.current = onCommitted;
-
-  const close = useCallback(() => {
-    pageControllerRef.current?.abort();
-    pageControllerRef.current = undefined;
-    const current = viewRef.current;
-    viewRef.current = undefined;
-    setView(undefined);
-    if (current) client.cancelImageGallery(current.descriptor.leaseId);
-  }, []);
-
-  useEffect(() => close, [close]);
-
-  const open = useCallback(async (
-    begin: (signal: AbortSignal) => Promise<MobileImageGalleryDescriptor>
-  ): Promise<void> => {
-    close();
-    const controller = new AbortController();
-    pageControllerRef.current = controller;
-    let descriptor: MobileImageGalleryDescriptor | undefined;
-    try {
-      descriptor = await begin(controller.signal);
-      const session = await client.loadImageGalleryPage(
-        descriptor.leaseId,
-        descriptor.initialIndex,
-        controller.signal
-      );
-      controller.signal.throwIfAborted();
-      const next = { descriptor, session, busy: false };
-      viewRef.current = next;
-      setView(next);
-    } catch (error) {
-      if (descriptor) client.cancelImageGallery(descriptor.leaseId);
-      if (!controller.signal.aborted) throw error;
-    } finally {
-      if (pageControllerRef.current === controller) pageControllerRef.current = undefined;
-    }
-  }, [close]);
-
-  const navigate = useCallback((pageIndex: number): void => {
-    const current = viewRef.current;
-    if (!current || current.busy || pageIndex === current.session.pageIndex) return;
-    pageControllerRef.current?.abort();
-    const controller = new AbortController();
-    pageControllerRef.current = controller;
-    const pending = { ...current, busy: true, error: undefined };
-    viewRef.current = pending;
-    setView(pending);
-    void client.loadImageGalleryPage(current.descriptor.leaseId, pageIndex, controller.signal).then((session) => {
-      if (controller.signal.aborted || viewRef.current?.descriptor.leaseId !== current.descriptor.leaseId) return;
-      const next = { descriptor: current.descriptor, session, busy: false };
-      viewRef.current = next;
-      setView(next);
-    }).catch((error) => {
-      if (controller.signal.aborted || viewRef.current?.descriptor.leaseId !== current.descriptor.leaseId) return;
-      const failed = { ...current, busy: false, error: errorText(error, locale) };
-      viewRef.current = failed;
-      setView(failed);
-    }).finally(() => {
-      if (pageControllerRef.current === controller) pageControllerRef.current = undefined;
-    });
-  }, [locale]);
-
+  const presenter = useMemo(() => new MobileImageGalleryPresenter(client), []);
+  const view = useSyncExternalStore(presenter.subscribe, () => presenter.snapshot);
+  const onCommittedRef = useRef(onCommitted); onCommittedRef.current = onCommitted;
+  useEffect(() => presenter.close, [presenter]);
+  useEffect(() => client.subscribe(() => {
+    const current = presenter.snapshot;
+    if (current && !client.imageGalleryCurrent(current.descriptor.leaseId)) presenter.close();
+  }), [presenter]);
+  const open = useCallback((begin: (signal: AbortSignal) => Promise<MobileImageGalleryDescriptor>) => presenter.open(begin), [presenter]);
   const decoded = useCallback((value: MobileImageGalleryNativeDecode): void => {
-    const current = viewRef.current;
-    if (!current) throw new Error(mobileMessage(locale, "task.error.galleryClosed"));
-    client.confirmImageGalleryPageDecoded(
-      current.descriptor.leaseId,
-      current.session.leaseId,
-      current.session.pageId,
-      value
-    );
-  }, [locale]);
-
+    const current = presenter.snapshot;
+    if (!current?.session || current.busy || current.failed) throw new Error(mobileMessage(locale, "task.error.galleryClosed"));
+    client.confirmImageGalleryPageDecoded(current.descriptor.leaseId, current.session.leaseId, current.session.pageId, value);
+  }, [presenter, locale]);
   const addOriginal = useCallback(async (signal: AbortSignal): Promise<void> => {
-    const current = viewRef.current;
-    if (!current) throw new Error(mobileMessage(locale, "task.error.galleryClosed"));
-    const draft = await client.addImageGalleryPageToComposer(
-      current.descriptor.leaseId,
-      current.session.leaseId,
-      signal
-    );
-    signal.throwIfAborted();
-    viewRef.current = undefined;
-    setView(undefined);
-    onCommittedRef.current(draft);
-  }, [locale]);
-
-  const save = useCallback(async (
-    strokes: readonly MobileImageAnnotationStroke[],
-    burned: MobileBurnedImage | undefined,
-    signal: AbortSignal
-  ): Promise<void> => {
-    const current = viewRef.current;
-    if (!current) throw new Error(mobileMessage(locale, "task.error.galleryClosed"));
-    const draft = await client.commitImageGalleryPageToComposer(
-      current.descriptor.leaseId,
-      current.session.leaseId,
-      strokes,
-      burned,
-      signal
-    );
-    signal.throwIfAborted();
-    viewRef.current = undefined;
-    setView(undefined);
-    onCommittedRef.current(draft);
-  }, [locale]);
-
-  return { view, open, close, navigate, decoded, addOriginal, save };
+    const current = presenter.snapshot;
+    if (!current?.session || current.busy || current.failed) throw new Error(mobileMessage(locale, "task.error.galleryClosed"));
+    const draft = await client.addImageGalleryPageToComposer(current.descriptor.leaseId, current.session.leaseId, signal);
+    signal.throwIfAborted(); presenter.close(); onCommittedRef.current(draft);
+  }, [presenter, locale]);
+  const save = useCallback(async (strokes: readonly MobileImageAnnotationStroke[], burned: MobileBurnedImage | undefined, signal: AbortSignal): Promise<void> => {
+    const current = presenter.snapshot;
+    if (!current?.session || current.busy || current.failed) throw new Error(mobileMessage(locale, "task.error.galleryClosed"));
+    const draft = await client.commitImageGalleryPageToComposer(current.descriptor.leaseId, current.session.leaseId, strokes, burned, signal);
+    signal.throwIfAborted(); presenter.close(); onCommittedRef.current(draft);
+  }, [presenter, locale]);
+  const shareOriginal = useCallback(async (signal: AbortSignal, onDispatch: () => void): Promise<void> => {
+    const current = presenter.snapshot;
+    if (!current?.session || current.busy || current.failed) throw new Error(mobileMessage(locale, "task.error.galleryClosed"));
+    await client.shareImageGalleryPageOriginal(current.descriptor.leaseId, current.session.leaseId, signal, onDispatch);
+  }, [presenter, locale]);
+  return { view, open, close: presenter.close, navigate: presenter.navigate, retry: presenter.retry,
+    nativeFailed: presenter.nativeFailed, previewFailed: presenter.previewFailed, decoded, addOriginal, shareOriginal, save };
 }
 
 async function performMobileImageOutput(
@@ -3303,6 +3216,13 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
   const copyInFlightRef = useRef(false);
   const timelineListRef = useRef<FlatList<TimelineRow>>(null);
   const timelineViewportRef = useRef<View>(null);
+  const [imageViewportPulse, setImageViewportPulse] = useState(0);
+  const [visibleImageRows, setVisibleImageRows] = useState<ReadonlySet<string>>(new Set());
+  const imageViewability = useRef({ itemVisiblePercentThreshold: 1, minimumViewTime: 80 }).current;
+  const onImageRowsVisible = useRef(({ viewableItems }: { readonly viewableItems: readonly { readonly item: TimelineRow; readonly isViewable: boolean }[] }) => {
+    const next = new Set(viewableItems.filter((item) => item.isViewable).map((item) => item.item.id));
+    setVisibleImageRows((previous) => previous.size === next.size && [...next].every((id) => previous.has(id)) ? previous : next);
+  }).current;
   const screenshotMessageViewsRef = useRef(new Map<string, View>());
   const messageFocusRetryRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const messageFocusRetryKeyRef = useRef<string | undefined>(undefined);
@@ -5384,8 +5304,11 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
       <Text style={[styles.caption, styles.fill, { color: colors.muted }]}>{formatMobileFileShareProgress(fileShareProgress, locale)}</Text>
     </View>}
     {conversationShare.notice && <Banner text={conversationShare.notice} colors={colors} />}
-    <View ref={timelineViewportRef} collapsable={false} style={styles.fill}>
-    <FlatList ref={timelineListRef} data={rows} extraData={conversationShare.selectedIds} keyExtractor={(row) => row.id} style={styles.fill} contentContainerStyle={styles.list}
+    <View ref={timelineViewportRef} collapsable={false} style={styles.fill} onLayout={() => setImageViewportPulse((value) => value + 1)}>
+    <FlatList key={draftIdentityKey} ref={timelineListRef} data={rows}
+      extraData={{ selection: conversationShare.selectedIds, visibleImageRows, imageViewportPulse }} keyExtractor={(row) => row.id} style={styles.fill} contentContainerStyle={styles.list}
+      viewabilityConfig={imageViewability} onViewableItemsChanged={onImageRowsVisible}
+      scrollEventThrottle={100} onScroll={() => setImageViewportPulse((value) => value + 1)}
       onScrollToIndexFailed={({ averageItemLength, index }) => {
         if (messageFocusHighlight === undefined || messageFocusKey !== messageFocusHighlight) return;
         if (messageFocusRetryKeyRef.current === messageFocusKey) return;
@@ -5464,24 +5387,14 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
           <Text style={[styles.caption, { color: colors.accent }]}>{mobileMessage(locale, "partner.openThread")}</Text>
         </Pressable>}
         {item.images && item.images.length > 0 && <View accessibilityLabel={`${item.label} · ${mobileMessage(locale, "task.images", { count: item.images.length })}`} style={styles.messageImages}>
-          {item.images.map((image, index) => <Pressable key={image.pageId} accessibilityRole="imagebutton"
-            accessibilityLabel={mobileMessage(locale, "task.openImage", { index: index + 1, count: item.images!.length, name: image.title })}
-            accessibilityHint={mobileMessage(locale, "task.openImageHint")}
+          {item.images.map((image, index) => <MobileTimelineImage key={image.pageId} client={client} page={image}
+            eventId={image.sourceEventId ?? item.eventId} ownerKey={client.timelineImagePreviewOwnerKey()}
+            eligible={visibleImageRows.has(item.id) && state.status === "connected" && !drawerOpen && !messageActionsVisible && !taskActionsVisible
+              && !interactionVisible && !contextVisible && imageGallery.view === undefined && imageEditorLease === undefined && photoLibraryLease === undefined}
+            viewportRef={timelineViewportRef} viewportPulse={imageViewportPulse} maximumWidth={width - safeArea.left - safeArea.right - 64}
+            colors={colors} locale={locale} openLabel={mobileMessage(locale, "task.openImage", { index: index + 1, count: item.images!.length, name: image.title })}
             disabled={galleryOpening || imageGallery.view !== undefined || state.status !== "connected" || attachmentBusy || voice.busy}
-            onPress={() => openTimelineImage(item, image)}
-            style={[styles.messageImageTile, { borderColor: colors.border, backgroundColor: colors.background },
-              (galleryOpening || imageGallery.view !== undefined || state.status !== "connected" || attachmentBusy || voice.busy)
-                && styles.disabled]}>
-            <Text style={styles.messageImageGlyph}>▧</Text>
-            <View style={styles.fill}>
-              <Text style={[styles.label, { color: colors.ink }]} numberOfLines={1}>{image.title}</Text>
-              <Text style={[styles.caption, { color: colors.muted }]} numberOfLines={1}>
-                {image.mediaType}{image.widthPixels && image.heightPixels
-                  ? ` · ${image.widthPixels} × ${image.heightPixels}` : ""} · {formatByteSize(BigInt(image.byteSize))}
-              </Text>
-            </View>
-            <Text style={[styles.caption, { color: colors.accent }]}>{mobileMessage(locale, "common.open")}</Text>
-          </Pressable>)}
+            onOpen={() => openTimelineImage(item, image)} />)}
         </View>}
         {item.artifacts && item.artifacts.length > 0 && <View accessibilityLabel={`${item.label} · ${mobileMessage(locale, "task.filesCount", { count: item.artifacts.length })}`} style={styles.messageImages}>
           {item.artifacts.map((artifact) => {
@@ -5837,14 +5750,17 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
       }}
       onNativeActivityChange={(active) => { attachmentNativeActivityRef.current = active; }}
       onClose={closeImageEditor} onSave={saveImageEditor} />}
-    {imageGallery.view && <MobileImageLightbox key={imageGallery.view.session.leaseId}
+    {imageGallery.view && <MobileImageLightbox key={imageGallery.view.descriptor.leaseId}
       session={imageGallery.view.session} locale={locale}
       gallery={{
-        session: imageGallery.view.session,
+        descriptor: imageGallery.view.descriptor, pageIndex: imageGallery.view.pageIndex, pageKey: imageGallery.view.pageKey,
+        ...(imageGallery.view.preview ? { preview: imageGallery.view.preview } : {}),
         busy: imageGallery.view.busy,
-        ...(imageGallery.view.error ? { error: imageGallery.view.error } : {}),
+        ...(imageGallery.view.failed ? { error: mobileMessage(locale, "image.previewFailed") } : {}),
+        onRetry: imageGallery.retry, onNativeFailed: imageGallery.nativeFailed, onPreviewFailed: imageGallery.previewFailed,
         onNavigate: imageGallery.navigate,
         onAddOriginal: imageGallery.addOriginal,
+        onShareOriginal: imageGallery.shareOriginal,
         onDecoded: imageGallery.decoded
       }}
       onOutputAction={async (action, decoded, rendered, signal) => {
@@ -5852,7 +5768,7 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
         setLocalError("");
         try {
           const view = imageGallery.view;
-          if (!view) throw new Error(mobileMessage(locale, "task.error.galleryClosed"));
+          if (!view?.session || view.busy || view.failed) throw new Error(mobileMessage(locale, "task.error.galleryClosed"));
           const message = await performMobileImageOutput(view.session, action, decoded, rendered, signal, locale);
           if (!signal.aborted && taskMountedRef.current) setComposerNotice(message);
           return message;
@@ -6295,15 +6211,18 @@ function FilesScreen({ colors, state, locale, onBack, onAdded, initialSource }: 
         setPreviewSource(undefined);
         client.closeFilesPreview();
       }} />
-    {imageGallery.view && <MobileImageLightbox key={imageGallery.view.session.leaseId}
+    {imageGallery.view && <MobileImageLightbox key={imageGallery.view.descriptor.leaseId}
       session={imageGallery.view.session}
       locale={locale}
       gallery={{
-        session: imageGallery.view.session,
+        descriptor: imageGallery.view.descriptor, pageIndex: imageGallery.view.pageIndex, pageKey: imageGallery.view.pageKey,
+        ...(imageGallery.view.preview ? { preview: imageGallery.view.preview } : {}),
         busy: imageGallery.view.busy,
-        ...(imageGallery.view.error ? { error: imageGallery.view.error } : {}),
+        ...(imageGallery.view.failed ? { error: mobileMessage(locale, "image.previewFailed") } : {}),
+        onRetry: imageGallery.retry, onNativeFailed: imageGallery.nativeFailed, onPreviewFailed: imageGallery.previewFailed,
         onNavigate: imageGallery.navigate,
         onAddOriginal: imageGallery.addOriginal,
+        onShareOriginal: imageGallery.shareOriginal,
         onDecoded: imageGallery.decoded
       }}
       onOutputAction={async (action, decoded, rendered, signal) => {
@@ -6311,7 +6230,7 @@ function FilesScreen({ colors, state, locale, onBack, onAdded, initialSource }: 
         setLocalError("");
         try {
           const view = imageGallery.view;
-          if (!view) throw new Error(mobileMessage(locale, "task.error.galleryClosed"));
+          if (!view?.session || view.busy || view.failed) throw new Error(mobileMessage(locale, "task.error.galleryClosed"));
           const message = await performMobileImageOutput(view.session, action, decoded, rendered, signal, locale);
           if (!signal.aborted) setImageOutputNotice(message);
           return message;

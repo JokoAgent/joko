@@ -3,8 +3,8 @@ import { bytesToHex } from "@noble/hashes/utils.js";
 import { FileKind, type BlobRef, type FilePreview, type WorkspaceEntry } from "@joko/contracts";
 import { parseMobileMarkdown, type MobileMarkdownInline } from "./mobile-markdown";
 import { classifyChatPathLinkTarget, classifyInlineCodePathCandidate, resolveChatAbsPath, splitChatPathLineSuffix, toWorkdirRel } from "./mobile-markdown-path-candidate";
-import { bytesToDataUri, canonicalWorkspacePath, normalizeMediaType, workspaceEntryRevisionKey, workspaceParentPath } from "./workspace-files";
-import { inspectMobileImageGalleryBytes, mobileImageGalleryPage, type MobileImageGalleryPage } from "./mobile-image-gallery";
+import { canonicalWorkspacePath, normalizeMediaType, workspaceEntryRevisionKey, workspaceParentPath } from "./workspace-files";
+import { inspectMobileImageGalleryBytes, mobileImageGalleryPage, mobileImageGalleryPreviewUri, type MobileImageGalleryPage } from "./mobile-image-gallery";
 import { assertWorkspaceFilePreview } from "./network";
 
 export interface MobileMarkdownResourceCandidate {
@@ -288,7 +288,7 @@ export class MobileMarkdownResourceReader {
       lease.pixels += decoded.width * decoded.height;
       lease.pages.set(candidate.key, page);
       lease.references.set(candidate.key, { key: candidate.key, kind: "image", label: candidate.label, relativePath: entry.relativePath,
-        image: { uri: bytesToDataUri(downloaded.bytes, page.mediaType), width: decoded.width, height: decoded.height } });
+        image: { uri: mobileImageGalleryPreviewUri(downloaded.bytes, decoded), width: decoded.width, height: decoded.height } });
       adopted = true;
     } finally { if (!adopted) lease.bytes -= Number(revision.byteSize); }
   }

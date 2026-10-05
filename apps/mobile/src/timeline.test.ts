@@ -119,8 +119,8 @@ describe("canonical Timeline tool media", () => {
     const blob = animation.payload.kind.value.blocks[0].content.value.blob!;
     blob.mediaType = "image/gif";
     blob.fileName = "animation.gif";
-    expect(timelineRows([producedImageEvent(animation)])[0]).toMatchObject({ artifacts: [{ title: "animation", mediaType: "image/gif" }] });
-    expect(timelineRows([producedImageEvent(animation)])[0]?.images).toBeUndefined();
+    expect(timelineRows([producedImageEvent(animation)])[0]).toMatchObject({ images: [{ title: "animation", mediaType: "image/gif" }] });
+    expect(timelineRows([producedImageEvent(animation)])[0]?.artifacts).toBeUndefined();
   });
 });
 

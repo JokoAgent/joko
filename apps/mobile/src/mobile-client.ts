@@ -22,7 +22,7 @@ import {
   SetSessionPermissionMutationSchema, SetSessionPlanModeMutationSchema, TargetState, capabilityNames,
   StartReviewMutationSchema, TriggerScheduleMutationSchema, UpdateScheduleMutationSchema,
   UpdateVoiceInputServiceSettingsMutationSchema, VoiceInputServiceSettingsPatchSchema,
-  FileKind,
+  FileKind, ImageRefSchema,
   type Artifact, type BackendDescriptor, type BlobRef, type DiscoveredNodeRecord, type Event, type EventCursor, type FilePreview, type FileRevision, type Interaction,
   type Operation, type OperationMutation, type QueueControl, type QueueItem, type Schedule, type Session, type Snapshot, type Target,
   type WorkspaceEntry, type WorkspaceSearchMatch
@@ -40,6 +40,7 @@ import {
 } from "./mobile-session-origin";
 import { buildMobileMessageDeepLink, buildMobileTaskDeepLink, parseMobileNativeIntent } from "./mobile-native-intent";
 import { awaitMobileMarkdownResourceRead, MobileMarkdownResourceReader, type MobileMarkdownResourceContext, type MobileMarkdownResourceDescriptor } from "./mobile-markdown-resources";
+import { MobileTimelineImageReader, type MobileTimelineImageContext, type MobileTimelineImagePreview } from "./mobile-timeline-images";
 import {
   MobileCredentialStorageError, profileFromCredential,
   type MobileConnectionProfile, type MobileStorage, type PendingOperation
@@ -266,6 +267,8 @@ import {
   assertMobileImageGalleryDimensions,
   inspectMobileImageGalleryBytes,
   mobileImageGalleryMediaType,
+  mobileImageGalleryNativeAnimationMatches,
+  mobileImageGalleryPreviewUri,
   mobileImageGalleryPage,
   mobileImageGalleryPageSummary,
   mobileTimelineGalleryPages,
@@ -463,6 +466,7 @@ interface MobileComposerImageEditLease {
 }
 
 interface MobileImageGalleryLease {
+  previewLeaseIds?: Set<string>;
   readonly leaseId: string;
   readonly profileId: string;
   readonly credentialKey: string;
@@ -499,6 +503,7 @@ interface MobileImageGalleryLease {
     confirmed: boolean;
   };
   operationInFlight: boolean;
+  shareController?: AbortController;
 }
 
 interface MobileTimelinePreviewLease {
@@ -688,6 +693,7 @@ export class MobileClient {
   #imageGallery?: MobileImageGalleryLease;
   #conversationShare?: MobileConversationShareLease;
   #markdownResources = new MobileMarkdownResourceReader();
+  #timelineImages = new MobileTimelineImageReader();
   #messageRewindPreviews = new WeakSet<MobileMessageRewindPreview>();
   #automationEpoch = 0;
   #automationAbort?: AbortController;
@@ -887,6 +893,8 @@ export class MobileClient {
     }
     this.#state = next;
     this.#markdownResources.retireStale();
+    this.#timelineImages.retainOwner(this.#taskAuthorityKey());
+    this.#timelineImages.retireStale();
     if (this.#fileShareLease?.phase === "preparing"
       && !this.#fileShareLeaseCurrent(this.#fileShareLease)) {
       this.#fileShareLease.controller.abort();
@@ -933,6 +941,7 @@ export class MobileClient {
     this.#retireImageGallery();
     if (this.#conversationShare) this.releaseConversationShare(this.#conversationShare.leaseId);
     this.#markdownResources.releaseAll();
+    this.#timelineImages.releaseAll();
     if (this.#timer !== undefined) clearTimeout(this.#timer);
     if (this.#proofTimer !== undefined) clearTimeout(this.#proofTimer);
     if (this.#projectionTimer !== undefined) clearTimeout(this.#projectionTimer);
@@ -3660,8 +3669,9 @@ export class MobileClient {
           reason: `This ${mediaType} file is ${blob.byteSize.toString(10)} bytes and exceeds the mobile preview limit.` };
       } else if (mediaType.startsWith("image/")) {
         const download = await this.network.downloadBlob(context.credential, blob, controller.signal);
-        preview = { ...base, kind: "image", dataUri: bytesToDataUri(download.bytes, download.mediaType),
-          altText: current.description.trim() || artifactTitle(current), widthPixels: 0, heightPixels: 0 };
+        const decoded = mobileImageGalleryMediaType(mediaType) ? inspectMobileImageGalleryBytes(download.bytes, mediaType) : undefined;
+        preview = { ...base, kind: "image", dataUri: decoded ? mobileImageGalleryPreviewUri(download.bytes, decoded) : bytesToDataUri(download.bytes, download.mediaType),
+          altText: current.description.trim() || artifactTitle(current), widthPixels: decoded?.width ?? 0, heightPixels: decoded?.height ?? 0 };
       } else if (mobileModelPreviewKind(mediaType, blob.fileName)) {
         if (!this.modelPreviewFiles) {
           preview = { ...base, kind: "unsupported", reason: "3D model preview is unavailable on this mobile runtime." };
@@ -4206,13 +4216,15 @@ export class MobileClient {
         if (entry.kind !== FileKind.REGULAR || !entry.revision || !mobileImageGalleryMediaType(entry.mediaType)) continue;
         let page: MobileImageGalleryPage | undefined;
         try {
-          const preview = await this.network.readWorkspaceFile(
+          const rawPreview = await this.network.readWorkspaceFile(
             context.credential,
             context.authority.workspace.workspaceId,
             entry.relativePath,
             entry.revision,
             signal
           );
+          assertCurrent();
+          const preview = await this.#canonicalWorkspaceImagePreview(context.credential, entry.workspaceId, rawPreview, signal);
           assertCurrent();
           if (!preview.truncated && preview.content.case === "image") {
             const blob = workspaceComposerBlob(context.authority.workspace.workspaceId, entry, preview);
@@ -4236,7 +4248,7 @@ export class MobileClient {
         }
         if (!page) {
           if (sameFilesWorkspaceEntry(entry, selected)) {
-            throw new Error("The selected Workspace file is not a canonical static gallery image.");
+            throw new Error("The selected Workspace file is not a canonical gallery image.");
           }
           continue;
         }
@@ -4319,6 +4331,45 @@ export class MobileClient {
   assertMarkdownResourcesCurrent(leaseId: string): void { this.#markdownResources.assertCurrent(leaseId); }
   releaseMarkdownResources(leaseId: string): void { this.#markdownResources.release(leaseId); }
 
+  timelineImagePreviewOwnerKey(): string | undefined { return this.#taskAuthorityKey(); }
+
+  async prepareTimelineImagePreview(eventId: string, pageId: string, signal: AbortSignal): Promise<MobileTimelineImagePreview> {
+    signal.throwIfAborted();
+    const credential = this.#ready(); const ownerKey = this.#taskAuthorityKey(); const sessionId = this.#state.selectedId;
+    if (!ownerKey || !sessionId) throw new Error("The inline image has no current task owner.");
+    const currentPage = (events: readonly Event[]): MobileImageGalleryPage | undefined => {
+      const sources = events.filter((event) => event.eventId === eventId && event.identity?.sessionId === sessionId
+        && event.cursor?.generation === this.#state.owner?.generation);
+      return sources.length === 1 ? timelineGalleryPagesForSelection(events, eventId, pageId).find((page) => page.pageId === pageId) : undefined;
+    };
+    const page = currentPage(this.#timelineEvents());
+    if (!page) throw new Error("The inline image is not in the current canonical Timeline window.");
+    const assertCurrent = (currentSignal?: AbortSignal) => {
+      currentSignal?.throwIfAborted();
+      const current = currentPage(this.#timelineEvents());
+      if (this.#disposed || this.#credential !== credential || this.#taskAuthorityKey() !== ownerKey
+        || !current || !sameMobileImageGalleryPage(current, page)) throw new Error("The inline image source changed.");
+    };
+    const context: MobileTimelineImageContext = { ownerKey, page, assertCurrent,
+      // A cached bitmap is presentation only; remounts also reauthorize the exact source through authenticated history.
+      revalidate: async (currentSignal) => {
+        const around = await this.network.readAround(credential, sessionId, eventId, currentSignal);
+        assertCurrent(currentSignal);
+        const fresh = currentPage(around);
+        if (!fresh || !sameMobileImageGalleryPage(fresh, page)) throw new Error("The authenticated inline image source changed.");
+      },
+      download: async (blob, currentSignal) => {
+        const thumbnail = await this.network.readImageThumbnail(credential, blob, 1024, currentSignal);
+        assertCurrent(currentSignal);
+        return thumbnail ? { bytes: thumbnail.data, mediaType: thumbnail.mediaType, thumbnail }
+          : this.network.downloadBlob(credential, blob, currentSignal);
+      } };
+    return this.#timelineImages.prepare(context, signal);
+  }
+
+  confirmTimelineImagePreview(leaseId: string, native: MobileImageGalleryNativeDecode): void { this.#timelineImages.confirm(leaseId, native); }
+  releaseTimelineImagePreview(leaseId: string, discard = false): void { this.#timelineImages.release(leaseId, discard); }
+
   #markdownResourceContext(messageId: string, text: string): MobileMarkdownResourceContext {
     const files = this.#filesContext();
     const credential = this.#ready();
@@ -4357,7 +4408,8 @@ export class MobileClient {
         }
       },
       listDirectory: (parent, signal) => this.network.listWorkspaceDirectory(credential, files.authority.workspace.workspaceId, parent, signal),
-      readFile: (entry, signal) => this.network.readWorkspaceFile(credential, files.authority.workspace.workspaceId, entry.relativePath, entry.revision!, signal),
+      readFile: async (entry, signal) => this.#canonicalWorkspaceImagePreview(credential, files.authority.workspace.workspaceId,
+        await this.network.readWorkspaceFile(credential, files.authority.workspace.workspaceId, entry.relativePath, entry.revision!, signal), signal),
       download: (blob, signal) => this.network.downloadBlob(credential, blob, signal)
     };
   }
@@ -4509,7 +4561,7 @@ export class MobileClient {
             const decoded = inspectMobileImageGalleryBytes(download.bytes, page.mediaType);
             if (decoded.width * decoded.height > remainingPixels || (page.widthPixels !== undefined
               && (decoded.width !== page.widthPixels || decoded.height !== page.heightPixels))) continue;
-            images.set(page.pageId, { uri: bytesToDataUri(download.bytes, page.mediaType), width: decoded.width, height: decoded.height });
+            images.set(page.pageId, { uri: mobileImageGalleryPreviewUri(download.bytes, decoded), width: decoded.width, height: decoded.height });
             remainingBytes -= download.bytes.byteLength;
             remainingPixels -= decoded.width * decoded.height;
           } catch {
@@ -4683,6 +4735,7 @@ export class MobileClient {
     if (!Number.isSafeInteger(pageIndex) || pageIndex < 0 || pageIndex >= lease.pages.length) {
       throw new Error("The requested image gallery page is out of range.");
     }
+    lease.loaded = undefined;
     await this.#assertImageGalleryCurrent(lease, undefined, signal);
     const page = lease.pages[pageIndex]!;
     const credential = this.#ready();
@@ -4710,7 +4763,7 @@ export class MobileClient {
       ? filesAttachmentMetadata(page.blob.fileName || page.title, page.mediaType, BigInt(page.byteSize), lease.draft.attachments, controls)
       : undefined;
     let annotatable = false;
-    if (metadata && controls && canAnnotateMobileImage(page.mediaType)) {
+    if (metadata && controls && !decoded.animated && !decoded.originalOnly && canAnnotateMobileImage(page.mediaType)) {
       try {
         assertMobileAttachmentCandidate({
           fileName: mobileAnnotatedImageFileName(metadata.fileName, mobileAnnotationOutputMediaType(page.mediaType)),
@@ -4728,7 +4781,7 @@ export class MobileClient {
       pageCount: lease.pages.length,
       sourceKind: lease.descriptor.sourceKind,
       sourceLabel: lease.descriptor.sourceLabel,
-      previewUri: bytesToDataUri(download.bytes, page.mediaType),
+      previewUri: mobileImageGalleryPreviewUri(download.bytes, decoded),
       sourceBase64: encodeMobileBase64(download.bytes),
       sourceMediaType: page.mediaType,
       fileName: metadata?.fileName ?? (page.blob.fileName || page.title),
@@ -4737,8 +4790,55 @@ export class MobileClient {
       addable: metadata !== undefined,
       maximumBytes: controls?.policy.maximumBytes ?? MOBILE_BLOB_PREVIEW_MAXIMUM_BYTES,
       expectedWidthPixels: decoded.width,
-      expectedHeightPixels: decoded.height
+      expectedHeightPixels: decoded.height,
+      expectedAnimated: decoded.animated === true,
+      originalOnly: decoded.originalOnly === true,
+      ...(decoded.previewMediaType ? { previewMediaType: decoded.previewMediaType } : {})
     };
+  }
+
+  async pinImageGalleryCachedPreview(leaseId: string, pageIndex: number, signal: AbortSignal): Promise<MobileTimelineImagePreview | undefined> {
+    signal.throwIfAborted(); const lease = this.#imageGallery;
+    if (!lease || lease.leaseId !== leaseId || !Number.isSafeInteger(pageIndex) || !lease.pages[pageIndex]) return undefined;
+    await this.#assertImageGalleryCurrent(lease, undefined, signal);
+    const page = lease.pages[pageIndex]!;
+    const preview = this.#timelineImages.pinCached({ ownerKey: lease.taskAuthorityKey, page, assertCurrent: (currentSignal) => {
+      currentSignal?.throwIfAborted();
+      if (this.#imageGallery !== lease || this.#taskAuthorityKey() !== lease.taskAuthorityKey || lease.pages[pageIndex] !== page) {
+        throw new Error("The cached gallery preview source changed.");
+      }
+      if (lease.source.kind === "timeline" && (mobileTimelineGalleryWindowKey(this.#timelineEvents()) !== lease.source.windowKey
+        || !timelineGalleryPagesForSelection(this.#timelineEvents(), lease.source.eventId, lease.source.pageId).some((current) => sameMobileImageGalleryPage(current, page)))) {
+        throw new Error("The cached Timeline gallery preview changed.");
+      }
+    } }, signal);
+    if (preview) { lease.previewLeaseIds ??= new Set(); lease.previewLeaseIds.add(preview.leaseId); }
+    return preview;
+  }
+
+  imageGalleryCurrent(leaseId: string): boolean {
+    const lease = this.#imageGallery; const credential = this.#credential;
+    if (!lease || lease.leaseId !== leaseId || !credential || this.#taskAuthorityKey() !== lease.taskAuthorityKey
+      || mobileCredentialKey(credential) !== lease.credentialKey || this.taskAttachmentControls()?.surfaceOwnerKey !== lease.attachmentOwnerKey) return false;
+    const source = lease.source;
+    if (source.kind === "files") return this.#currentFiles(source.filesEpoch, source.filesAuthorityKey)
+      && mobileFilesGalleryWindowKey(this.#state.files) === source.filesWindowKey;
+    if (source.kind === "markdown") {
+      try { this.#markdownResources.assertCurrent(source.resourceLeaseId); return true; } catch { return false; }
+    }
+    const events = this.#timelineEvents(); const pages = timelineGalleryPagesForSelection(events, source.eventId, source.pageId);
+    return mobileTimelineGalleryWindowKey(events) === source.windowKey && pages.length === lease.pages.length
+      && pages.every((page, index) => sameMobileImageGalleryPage(page, lease.pages[index]!));
+  }
+
+  releaseImageGalleryPreview(leaseId: string, previewLeaseId: string, discard = false): void {
+    if (this.#imageGallery?.leaseId === leaseId) this.#imageGallery.previewLeaseIds?.delete(previewLeaseId);
+    this.#timelineImages.release(previewLeaseId, discard);
+  }
+
+  discardImageGalleryPage(leaseId: string, loadId?: string): void {
+    const lease = this.#imageGallery;
+    if (lease?.leaseId === leaseId && !lease.operationInFlight && (loadId === undefined || lease.loaded?.loadId === loadId)) lease.loaded = undefined;
   }
 
   confirmImageGalleryPageDecoded(
@@ -4750,9 +4850,9 @@ export class MobileClient {
     const lease = this.#imageGallery;
     const loaded = lease?.loaded;
     if (!lease || lease.leaseId !== galleryLeaseId || !loaded || loaded.loadId !== loadId
-      || loaded.page.pageId !== pageId || decoded.isAnimated === true
+      || loaded.page.pageId !== pageId || !mobileImageGalleryNativeAnimationMatches(loaded.page.mediaType, loaded.decoded.animated === true, decoded.isAnimated)
       || decoded.width !== loaded.decoded.width || decoded.height !== loaded.decoded.height
-      || decoded.mediaType && normalizeMediaType(decoded.mediaType) !== loaded.decoded.mediaType) {
+      || decoded.mediaType && normalizeMediaType(decoded.mediaType) !== (loaded.decoded.previewMediaType ?? loaded.decoded.mediaType)) {
       throw new Error("The decoded image no longer matches this gallery page.");
     }
     if (loaded.confirmed) return;
@@ -4818,8 +4918,8 @@ export class MobileClient {
     }
     return {
       leaseId,
-      fileName: mobileImageOutputFileName(loaded.page.blob.fileName || loaded.page.title, loaded.page.mediaType),
-      mediaType: loaded.page.mediaType,
+      fileName: mobileImageOutputFileName(loaded.page.blob.fileName || loaded.page.title, parsed.mediaType),
+      mediaType: parsed.mediaType,
       byteSize: loaded.page.byteSize,
       sha256Hex: loaded.page.sha256Hex,
       bytes: Uint8Array.from(loaded.bytes),
@@ -4832,7 +4932,40 @@ export class MobileClient {
     if (this.#imageGallery?.leaseId === leaseId) this.#retireImageGallery();
   }
 
+  async shareImageGalleryPageOriginal(galleryLeaseId: string, loadId: string, signal?: AbortSignal, onDispatch?: () => void): Promise<void> {
+    signal?.throwIfAborted();
+    const lease = this.#imageGallery; const loaded = lease?.loaded;
+    if (!this.fileShare) throw new Error("System file sharing is unavailable on this mobile runtime.");
+    if (!lease || lease.leaseId !== galleryLeaseId || !loaded || loaded.loadId !== loadId
+      || !loaded.confirmed || lease.operationInFlight || this.#fileShareLease) {
+      throw new Error("The decoded image no longer owns this sharing action.");
+    }
+    const controller = new AbortController();
+    const operationSignal = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
+    lease.shareController = controller; lease.operationInFlight = true;
+    const assertCurrent = async (): Promise<void> => {
+      await this.#assertImageGalleryCurrent(lease, undefined, operationSignal);
+      if (lease.loaded !== loaded || !loaded.confirmed) throw new Error("The gallery page changed before system sharing began.");
+      await this.#revalidateGalleryImageSource(lease, loaded, operationSignal);
+      await this.#assertImageGalleryCurrent(lease, undefined, operationSignal);
+    };
+    try {
+      await assertCurrent();
+      const authorized = await this.network.authorizeBlobDownload(this.#ready(), loaded.page.blob, operationSignal);
+      if (authorized.blobId !== loaded.page.blob.blobId || authorized.byteSize !== loaded.page.byteSize
+        || authorized.sha256Hex !== loaded.page.sha256Hex || normalizeMediaType(authorized.mediaType) !== loaded.page.mediaType) {
+        throw new Error("The authorized sharing bytes changed from this gallery image.");
+      }
+      await this.#assertImageGalleryCurrent(lease, undefined, operationSignal);
+      await this.fileShare.perform({ source: authorized, signal: operationSignal, assertCurrent, ...(onDispatch ? { onDispatch } : {}) });
+    } finally {
+      if (lease.shareController === controller) { lease.shareController = undefined; lease.operationInFlight = false; }
+    }
+  }
+
   #retireImageGallery(): void {
+    this.#imageGallery?.shareController?.abort();
+    for (const id of this.#imageGallery?.previewLeaseIds ?? []) this.#timelineImages.release(id);
     if (this.#imageGallery?.source.kind === "markdown") this.#markdownResources.release(this.#imageGallery.source.resourceLeaseId);
     this.#imageGallery = undefined;
   }
@@ -6280,6 +6413,10 @@ export class MobileClient {
       sourceUri = bytesToDataUri(sourceBytes, attachment.mediaType);
     }
 
+    const galleryImage = mobileImageGalleryMediaType(source.mediaType) ? inspectMobileImageGalleryBytes(sourceBytes, source.mediaType) : undefined;
+    if (galleryImage?.previewMarkup || galleryImage?.previewBytes || galleryImage?.previewMediaType) {
+      sourceUri = mobileImageGalleryPreviewUri(sourceBytes, galleryImage);
+    }
     const lease: MobileComposerImageEditLease = {
       leaseId: distinctAttachmentStorageId(this.newId, attachment.attachmentId, source.storageId),
       request,
@@ -6298,7 +6435,7 @@ export class MobileClient {
     try {
       await this.#assertComposerImageEditCurrent(lease, undefined, signal);
       const outputMediaType = mobileAnnotationOutputMediaType(source.mediaType);
-      let annotatable = canAnnotateMobileImage(source.mediaType);
+      let annotatable = !galleryImage?.animated && !galleryImage?.originalOnly && canAnnotateMobileImage(source.mediaType);
       if (annotatable) {
         try {
           assertMobileAttachmentCandidate({
@@ -6320,6 +6457,9 @@ export class MobileClient {
           points: stroke.points.map((point) => ({ ...point }))
         })),
         annotatable,
+        animated: galleryImage?.animated === true,
+        originalOnly: galleryImage?.originalOnly === true,
+        ...(galleryImage?.previewMediaType ? { previewMediaType: galleryImage.previewMediaType } : {}),
         maximumBytes: controls.policy.maximumBytes
       };
     } catch (error) {
@@ -6368,7 +6508,9 @@ export class MobileClient {
       outputFileName = lease.source.fileName;
       outputSha256Hex = lease.source.sha256Hex;
     } else {
-      if (!canAnnotateMobileImage(lease.source.mediaType) || !burned) {
+      const sourceImage = mobileImageGalleryMediaType(lease.source.mediaType) !== undefined
+        ? inspectMobileImageGalleryBytes(lease.sourceBytes, lease.source.mediaType) : undefined;
+      if (!canAnnotateMobileImage(lease.source.mediaType) || !burned || sourceImage?.animated || sourceImage?.originalOnly) {
         throw new Error("This image cannot be rendered with annotations.");
       }
       const expectedMediaType = mobileAnnotationOutputMediaType(lease.source.mediaType);
@@ -8953,6 +9095,41 @@ export class MobileClient {
     return controls;
   }
 
+  async #revalidateGalleryImageSource(lease: MobileImageGalleryLease, loaded: NonNullable<MobileImageGalleryLease["loaded"]>, signal: AbortSignal): Promise<void> {
+    signal.throwIfAborted();
+    if (lease.source.kind === "markdown") return; // The resource owner revalidates its exact message and Workspace revision above.
+    const page = loaded.page; const source = page.source; const credential = this.#ready();
+    if (lease.source.kind === "files") {
+      const context = this.#filesContext();
+      if (context.key !== lease.source.filesAuthorityKey) throw new Error("The Files image authority changed.");
+      if (source.kind === "artifact") {
+        const artifacts = await this.network.listSessionArtifacts(credential, source.sessionId, signal);
+        const matches = artifacts.artifacts.filter((item) => item.artifactId === source.artifactId && item.sessionId === source.sessionId);
+        if (artifacts.revision !== this.#state.files.artifactsRevision || matches.length !== 1
+          || !matches[0]?.blob || !sameFilesComposerBlob(matches[0].blob, page.blob)) throw new Error("The Generated image changed before system sharing began.");
+      } else if (source.kind === "workspace") {
+        const path = source.relativePath;
+        const directory = await this.network.listWorkspaceDirectory(credential, context.authority.workspace.workspaceId, workspaceParentPath(path), signal);
+        const matches = directory.entries.filter((item) => item.workspaceId === context.authority.workspace.workspaceId && item.relativePath === path);
+        const entry = matches.length === 1 ? matches[0] : undefined;
+        if (!entry?.revision || entry.kind !== FileKind.REGULAR || workspaceEntryRevisionKey(entry.revision) !== source.revisionKey
+          || normalizeMediaType(entry.mediaType) !== page.mediaType) throw new Error("The Workspace image changed before system sharing began.");
+        const preview = await this.#canonicalWorkspaceImagePreview(credential, entry.workspaceId,
+          await this.network.readWorkspaceFile(credential, entry.workspaceId, path, entry.revision, signal), signal);
+        const blob = workspaceComposerBlob(entry.workspaceId, entry, preview);
+        if (!blob || !sameFilesComposerBlob(blob, page.blob)) throw new Error("The Workspace image Blob changed before system sharing began.");
+      } else throw new Error("The Files gallery returned an invalid source identity.");
+    } else {
+      if (!("eventId" in source)) throw new Error("The Timeline image returned an invalid source identity.");
+      const around = await this.network.readAround(credential, lease.identity.sessionId, source.eventId, signal);
+      const matches = around.filter((event) => event.eventId === source.eventId && event.identity?.sessionId === lease.identity.sessionId
+        && event.cursor?.generation === this.#state.owner?.generation);
+      const current = matches.length === 1 ? timelineGalleryPagesForSelection(around, source.eventId, page.pageId).find((item) => item.pageId === page.pageId) : undefined;
+      if (!current || !sameMobileImageGalleryPage(current, page)) throw new Error("The Timeline image changed before system sharing began.");
+    }
+    signal.throwIfAborted();
+  }
+
   async #commitImageGalleryPage(
     galleryLeaseId: string,
     loadId: string,
@@ -8991,7 +9168,7 @@ export class MobileClient {
       let outputFileName = originalMetadata.fileName;
       let outputSha256Hex = loaded.page.sha256Hex;
       if (exactStrokes.length > 0) {
-        if (!canAnnotateMobileImage(loaded.page.mediaType) || !burned) {
+        if (loaded.decoded.animated || loaded.decoded.originalOnly || !canAnnotateMobileImage(loaded.page.mediaType) || !burned) {
           throw new Error("This gallery image cannot be rendered with annotations.");
         }
         const expectedMediaType = mobileAnnotationOutputMediaType(loaded.page.mediaType);
@@ -9881,12 +10058,26 @@ export class MobileClient {
     this.#set({ files: { ...this.#state.files, preview } });
   }
 
+  async #canonicalWorkspaceImagePreview(credential: PairedCredential, workspaceId: string, preview: FilePreview, signal?: AbortSignal): Promise<FilePreview> {
+    const entry = preview.entry;
+    if (normalizeMediaType(entry?.mediaType ?? "") !== "image/svg+xml" || preview.content.case !== "text" || preview.truncated) return preview;
+    if (!entry?.revision || entry.workspaceId !== workspaceId || entry.kind !== FileKind.REGULAR) throw new Error("The SVG Workspace source is invalid.");
+    const materialized = await this.network.materializeWorkspaceFileBlob(credential, workspaceId, entry.relativePath, entry.revision, signal);
+    signal?.throwIfAborted();
+    if (!sameFilesWorkspaceEntry(materialized.entry, entry) || normalizeMediaType(materialized.blob.mediaType) !== "image/svg+xml"
+      || materialized.blob.byteSize !== entry.revision.byteSize || materialized.blob.sha256Hex !== entry.revision.sha256Hex) {
+      throw new Error("The SVG Workspace revision changed before image preview.");
+    }
+    return { ...preview, entry: materialized.entry, content: { case: "image", value: create(ImageRefSchema, { blob: materialized.blob, altText: entry.displayName }) } };
+  }
+
   async #workspacePreview(
     context: MobileFilesContext,
     preview: FilePreview,
     title: string,
     signal: AbortSignal
   ): Promise<MobileFilePreview> {
+    preview = await this.#canonicalWorkspaceImagePreview(context.credential, context.authority.workspace.workspaceId, preview, signal);
     const entry = preview.entry;
     const revision = entry?.revision;
     if (!entry || !revision || entry.kind === FileKind.DIRECTORY
@@ -9924,8 +10115,12 @@ export class MobileClient {
         throw new Error("The Joko node returned mismatched image preview metadata.");
       }
       const download = await this.network.downloadBlob(context.credential, blob, signal);
-      return { ...base, kind: "image", dataUri: bytesToDataUri(download.bytes, download.mediaType),
-        altText: image.altText || title, widthPixels: image.widthPixels, heightPixels: image.heightPixels };
+      const decoded = mobileImageGalleryMediaType(mediaType) ? inspectMobileImageGalleryBytes(download.bytes, mediaType) : undefined;
+      if (decoded && image.widthPixels > 0 && (image.widthPixels !== decoded.width || image.heightPixels !== decoded.height)) {
+        throw new Error("The Workspace image dimensions do not match the canonical image bytes.");
+      }
+      return { ...base, kind: "image", dataUri: decoded ? mobileImageGalleryPreviewUri(download.bytes, decoded) : bytesToDataUri(download.bytes, download.mediaType),
+        altText: image.altText || title, widthPixels: decoded?.width ?? image.widthPixels, heightPixels: decoded?.height ?? image.heightPixels };
     }
     if (preview.content.case === "blob") {
       const blob = preview.content.value;

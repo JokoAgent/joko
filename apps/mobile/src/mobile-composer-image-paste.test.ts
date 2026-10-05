@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import type { MobileAttachmentFiles } from "./mobile-attachment-files";
+import { isoImageBytes } from "./test/image-formats";
 import type { MobileAttachmentPolicy, MobileLocalComposerAttachment } from "./mobile-attachments";
 import { emptyMobileComposerDraft, mobileComposerDraftsEqual, type MobileComposerDraft } from "./mobile-composer-document";
 import {
@@ -69,9 +70,9 @@ describe("mobile composer clipboard image paste", () => {
     expect(inspectMobileComposerPastedImageBytes(gif(6, 3), "image/gif")).toEqual({ width: 6, height: 3 });
     expect(inspectMobileComposerPastedImageBytes(webp(7, 5), "image/webp")).toEqual({ width: 7, height: 5 });
     expect(inspectMobileComposerPastedImageBytes(jpeg(8, 6), "image/jpeg")).toEqual({ width: 8, height: 6 });
-    expect(inspectMobileComposerPastedImageBytes(isoImage(["mif1", "heic"], 9, 7), "image/heic"))
+    expect(inspectMobileComposerPastedImageBytes(isoImageBytes(["mif1", "heic"], 9, 7), "image/heic"))
       .toEqual({ width: 9, height: 7 });
-    expect(inspectMobileComposerPastedImageBytes(isoImage(["mif1"], 10, 8), "image/heif"))
+    expect(inspectMobileComposerPastedImageBytes(isoImageBytes(["mif1"], 10, 8), "image/heif"))
       .toEqual({ width: 10, height: 8 });
     expect(() => inspectMobileComposerPastedImageBytes(png(5, 4), "image/jpeg")).toThrow(/signature/u);
     const truncatedGif = gif(6, 3).slice(0, -1);
@@ -276,34 +277,6 @@ function gif(width: number, height: number): Uint8Array {
   return bytes;
 }
 
-function isoImage(brands: readonly string[], width: number, height: number): Uint8Array {
-  const major = brands[0] ?? "";
-  const ftyp = box("ftyp", concatenate(ascii(major), new Uint8Array(4), ...brands.slice(1).map(ascii)));
-  const ispePayload = new Uint8Array(12);
-  writeU32(ispePayload, 4, width, false);
-  writeU32(ispePayload, 8, height, false);
-  const metadata = box("meta", concatenate(new Uint8Array(4), box("iprp", box("ipco", box("ispe", ispePayload)))));
-  return concatenate(ftyp, metadata);
-}
-
-function box(type: string, payload: Uint8Array): Uint8Array {
-  const bytes = new Uint8Array(8 + payload.byteLength);
-  writeU32(bytes, 0, bytes.byteLength, false);
-  bytes.set(ascii(type), 4);
-  bytes.set(payload, 8);
-  return bytes;
-}
-
-function ascii(value: string): Uint8Array {
-  return Uint8Array.from([...value].map((character) => character.charCodeAt(0)));
-}
-
-function concatenate(...values: readonly Uint8Array[]): Uint8Array {
-  const output = new Uint8Array(values.reduce((length, value) => length + value.byteLength, 0));
-  let offset = 0;
-  for (const value of values) { output.set(value, offset); offset += value.byteLength; }
-  return output;
-}
 
 function writeU16(bytes: Uint8Array, offset: number, value: number): void {
   bytes[offset] = value & 0xff;
