@@ -5,8 +5,10 @@ import {
   AppState,
   Modal,
   PanResponder,
+  Platform,
   Pressable,
   StyleSheet,
+  StatusBar,
   Text,
   View,
   type GestureResponderEvent,
@@ -782,7 +784,8 @@ export function MobileImageLightbox({
 
   return <Modal visible transparent animationType="fade" presentationStyle="overFullScreen" statusBarTranslucent
     onRequestClose={close} supportedOrientations={["portrait", "landscape"]}>
-    <View style={styles.root}>
+    {Platform.OS === "android" && <StatusBar hidden />}
+    <View style={styles.root} onAccessibilityEscape={close}>
       <Animated.View pointerEvents="none" style={[styles.backdrop, { opacity: dismissY.interpolate({
         inputRange: [-300, 0, 300], outputRange: [0.4, 1, 0.4], extrapolate: "clamp"
       }) }]} />

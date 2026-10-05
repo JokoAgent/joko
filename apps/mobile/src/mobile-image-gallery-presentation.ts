@@ -13,7 +13,7 @@ export interface MobileImageGalleryView {
   readonly busy: boolean;
   readonly failed: boolean;
 }
-type Client = Pick<MobileClient, "loadImageGalleryPage" | "cancelImageGallery" | "pinImageGalleryCachedPreview" | "releaseImageGalleryPreview" | "discardImageGalleryPage">;
+type Client = Pick<MobileClient, "loadImageGalleryPage" | "cancelImageGallery" | "pinImageGalleryCachedPreview" | "prepareImageGalleryAdjacentPreview" | "releaseImageGalleryPreview" | "discardImageGalleryPage">;
 
 /** The selected page is visible before its original bytes or native decode are ready. */
 export class MobileImageGalleryPresenter {
@@ -90,18 +90,19 @@ export class MobileImageGalleryPresenter {
     const controller = new AbortController(); this.#controller = controller;
     const pageKey = `${descriptor.leaseId}:${pageIndex}:${++this.#attempt}`;
     this.#set({ descriptor, pageIndex, pageKey, busy: true, failed: false });
+    const pins: Promise<void>[] = [];
     if (!refresh) for (const index of [pageIndex, pageIndex - 1, pageIndex + 1]) {
       if (!descriptor.pages[index]) continue;
-      void this.client.pinImageGalleryCachedPreview(descriptor.leaseId, index, controller.signal).then((preview) => {
+      pins.push(this.client.pinImageGalleryCachedPreview(descriptor.leaseId, index, controller.signal).then((preview) => {
         if (!preview) return;
         if (controller.signal.aborted || this.#view?.pageKey !== pageKey) { this.client.releaseImageGalleryPreview(descriptor.leaseId, preview.leaseId); return; }
         if (index === pageIndex) this.#set({ ...this.#view, preview });
         else this.#set({ ...this.#view, adjacentPreviews: [...(this.#view.adjacentPreviews ?? []), { pageIndex: index, preview }] });
-      }, () => undefined);
+      }, () => undefined));
     }
-    void this.#read(descriptor, pageIndex, pageKey, controller);
+    void this.#read(descriptor, pageIndex, pageKey, controller, Promise.allSettled(pins));
   }
-  async #read(descriptor: MobileImageGalleryDescriptor, pageIndex: number, pageKey: string, controller: AbortController): Promise<void> {
+  async #read(descriptor: MobileImageGalleryDescriptor, pageIndex: number, pageKey: string, controller: AbortController, pins: Promise<unknown>): Promise<void> {
     const read = new AbortController(); const abort = () => read.abort();
     controller.signal.addEventListener("abort", abort, { once: true });
     const deadline = setTimeout(abort, 15_000);
@@ -117,8 +118,36 @@ export class MobileImageGalleryPresenter {
         throw new Error("The original image belongs to another gallery page.");
       }
       this.#set({ ...this.#view, session, busy: false, failed: false });
+      void this.#warmAdjacent(descriptor, pageIndex, pageKey, controller, pins);
     } catch {
       if (this.#view?.pageKey === pageKey && !controller.signal.aborted) this.#set({ ...this.#view, busy: false, failed: true });
     } finally { clearTimeout(deadline); controller.signal.removeEventListener("abort", abort); }
+  }
+  async #warmAdjacent(descriptor: MobileImageGalleryDescriptor, pageIndex: number, pageKey: string, controller: AbortController, pins: Promise<unknown>): Promise<void> {
+    const cache = new AbortController(); const cancelCache = () => cache.abort();
+    if (controller.signal.aborted) return;
+    controller.signal.addEventListener("abort", cancelCache, { once: true });
+    const cacheDeadline = setTimeout(cancelCache, 15_000);
+    try { await awaitMobileMarkdownResourceRead(pins, cache.signal); }
+    catch { return; }
+    finally { clearTimeout(cacheDeadline); controller.signal.removeEventListener("abort", cancelCache); }
+    for (const index of [pageIndex - 1, pageIndex + 1]) {
+      if (controller.signal.aborted || this.#view?.pageKey !== pageKey) return;
+      if (!descriptor.pages[index] || this.#view.adjacentPreviews?.some((item) => item.pageIndex === index)) continue;
+      const read = new AbortController(); const abort = () => read.abort();
+      controller.signal.addEventListener("abort", abort, { once: true });
+      const deadline = setTimeout(abort, 15_000);
+      try {
+        const raw = this.client.prepareImageGalleryAdjacentPreview(descriptor.leaseId, index, read.signal);
+        void raw.then((preview) => { if (read.signal.aborted && preview) this.client.releaseImageGalleryPreview(descriptor.leaseId, preview.leaseId); }, () => undefined);
+        const preview = await awaitMobileMarkdownResourceRead(raw, read.signal);
+        if (!preview) continue;
+        if (controller.signal.aborted || this.#view?.pageKey !== pageKey) { this.client.releaseImageGalleryPreview(descriptor.leaseId, preview.leaseId); return; }
+        const previous = this.#view.adjacentPreviews?.find((item) => item.pageIndex === index);
+        if (previous) this.client.releaseImageGalleryPreview(descriptor.leaseId, previous.preview.leaseId);
+        this.#set({ ...this.#view, adjacentPreviews: [...(this.#view.adjacentPreviews?.filter((item) => item.pageIndex !== index) ?? []), { pageIndex: index, preview }] });
+      } catch { if (controller.signal.aborted) return; }
+      finally { clearTimeout(deadline); controller.signal.removeEventListener("abort", abort); }
+    }
   }
 }

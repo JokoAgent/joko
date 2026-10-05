@@ -13,6 +13,7 @@ function fixture() {
     previewUri: `data:image/png;base64,${id}`, sourceBase64: "AA==", sourceMediaType: "image/png", fileName: `${index}.png`, initialStrokes: [],
     annotatable: true, addable: true, maximumBytes: 1_024, expectedWidthPixels: 40, expectedHeightPixels: 20, expectedAnimated: false });
   const client = { loadImageGalleryPage: vi.fn<MobileImageGalleryPresenter["client"]["loadImageGalleryPage"]>(async (_id, index) => session(index)),
+    prepareImageGalleryAdjacentPreview: vi.fn<MobileImageGalleryPresenter["client"]["prepareImageGalleryAdjacentPreview"]>().mockRejectedValue(new Error("not cached")),
     pinImageGalleryCachedPreview: vi.fn<MobileImageGalleryPresenter["client"]["pinImageGalleryCachedPreview"]>(async () => preview),
     releaseImageGalleryPreview: vi.fn(), discardImageGalleryPage: vi.fn(), cancelImageGallery: vi.fn() };
   const presenter = new MobileImageGalleryPresenter(client); presenters.push(presenter);
@@ -21,6 +22,26 @@ function fixture() {
 async function settle() { await Promise.resolve(); await Promise.resolve(); await Promise.resolve(); }
 
 describe("progressive canonical gallery presentation", () => {
+  it("warms an uncached adjacent image after the current original and cancels background work before navigating", async () => {
+    const { presenter, client, descriptor, session, preview } = fixture();
+    client.pinImageGalleryCachedPreview.mockResolvedValue(undefined);
+    let original!: (value: MobileImageGalleryPageSession) => void; let warm!: (value: typeof preview) => void;
+    client.loadImageGalleryPage.mockImplementationOnce(() => new Promise((resolve) => { original = resolve; }));
+    client.prepareImageGalleryAdjacentPreview.mockImplementationOnce(() => new Promise((resolve) => { warm = resolve; }));
+    await presenter.open(async () => descriptor); await settle();
+    expect(client.prepareImageGalleryAdjacentPreview).not.toHaveBeenCalled();
+    original(session(0)); await vi.waitFor(() => expect(client.prepareImageGalleryAdjacentPreview).toHaveBeenCalledOnce());
+    expect(client.prepareImageGalleryAdjacentPreview.mock.calls[0]![1]).toBe(1);
+    presenter.navigate(1); expect(client.prepareImageGalleryAdjacentPreview.mock.calls[0]![2].aborted).toBe(true);
+    await vi.waitFor(() => expect(presenter.snapshot?.session?.pageIndex).toBe(1));
+    warm({ ...preview, leaseId: "late-warm" }); await settle();
+    expect(client.releaseImageGalleryPreview).toHaveBeenCalledWith("gallery", "late-warm");
+    expect(presenter.snapshot?.adjacentPreviews).toBeUndefined();
+    client.prepareImageGalleryAdjacentPreview.mockResolvedValue({ ...preview, leaseId: "ready-warm" });
+    presenter.navigate(0); await vi.waitFor(() => expect(presenter.snapshot?.adjacentPreviews?.[0]?.preview.leaseId).toBe("ready-warm"));
+    expect(presenter.snapshot?.session?.pageIndex).toBe(0);
+  });
+
   it("pins only the current and adjacent cached pages, releasing retired or late pins without reading adjacent originals", async () => {
     const { presenter, client, descriptor, session, preview } = fixture();
     const window = { ...descriptor, initialIndex: 2, pages: Array.from({ length: 5 }, (_, index) => ({

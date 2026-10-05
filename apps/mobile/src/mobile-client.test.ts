@@ -9675,6 +9675,46 @@ describe("native current-task Files ownership", () => {
     expect(await app.pinImageGalleryCachedPreview(gallery.leaseId, 0, new AbortController().signal)).toBeUndefined();
   });
 
+  it("prepares only adjacent gallery images without replacing current actions and retains the real Blob slot after cancelled prefetch", async () => {
+    const bytes = galleryPngBytes(5, 4); const message = timelineGalleryEvent(bytes);
+    if (message.payload?.kind.case !== "messageCompleted") throw new Error("fixture");
+    for (const block of message.payload.kind.value.blocks) if (block.content.case === "image") block.content.value.blob!.sha256Hex = sha256Hex(bytes);
+    const network = projectedNetwork(timelineGallerySnapshot(message)); vi.mocked(network.readAround).mockResolvedValue([message]);
+    vi.mocked(network.downloadBlob).mockResolvedValue({ bytes, mediaType: "image/png" });
+    const files = attachmentFileFixture();
+    const drafts = memoryDraftStores(); const snapshots = vi.spyOn(drafts.composer, "readSnapshot");
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined,
+      fixedIds("warm-gallery", "current-image", "next-image"), undefined, drafts, new MobileAttachmentFiles(files.driver, async (value) => sha256Hex(value)));
+    await app.start(); const selected = timelineRows(app.state.detail!.timeline)[0]!.images![0]!;
+    const gallery = await app.openTimelineImageGallery(selected.sourceEventId!, selected.pageId);
+    const current = await app.loadImageGalleryPage(gallery.leaseId, 0);
+    app.confirmImageGalleryPageDecoded(gallery.leaseId, current.leaseId, current.pageId, { width: 5, height: 4, mediaType: "image/png", isAnimated: false });
+    await expect(app.prepareImageGalleryAdjacentPreview(gallery.leaseId, 0, new AbortController().signal)).rejects.toThrow(/adjacent/u);
+    vi.mocked(network.readAround).mockResolvedValueOnce([]);
+    await expect(app.prepareImageGalleryAdjacentPreview(gallery.leaseId, 1, new AbortController().signal)).rejects.toThrow(/Timeline image changed/u);
+    expect(network.downloadBlob).toHaveBeenCalledOnce();
+    const cached = await app.prepareImageGalleryAdjacentPreview(gallery.leaseId, 1, new AbortController().signal);
+    expect(cached).toMatchObject({ width: 5, height: 4, mediaType: "image/png" });
+    expect(await app.prepareImageOutput(current.leaseId, { width: 5, height: 4, mediaType: "image/png", isAnimated: false })).toMatchObject({ bytes });
+    expect(network.downloadBlob).toHaveBeenCalledTimes(2);
+    app.releaseImageGalleryPreview(gallery.leaseId, cached.leaseId, true);
+    let finish!: (value: { bytes: Uint8Array; mediaType: string }) => void;
+    vi.mocked(network.downloadBlob).mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+    const controller = new AbortController();
+    const warming = app.prepareImageGalleryAdjacentPreview(gallery.leaseId, 1, controller.signal);
+    const rejected = expect(warming).rejects.toThrow(/cancelled|aborted/u);
+    await vi.waitFor(() => expect(network.downloadBlob).toHaveBeenCalledTimes(3)); controller.abort(); await rejected;
+    const reads = snapshots.mock.calls.length;
+    const next = app.loadImageGalleryPage(gallery.leaseId, 1, new AbortController().signal);
+    await vi.waitFor(() => expect(snapshots.mock.calls.length).toBeGreaterThan(reads));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(network.downloadBlob).toHaveBeenCalledTimes(3);
+    finish({ bytes, mediaType: "image/png" }); expect((await next).pageIndex).toBe(1); expect(network.downloadBlob).toHaveBeenCalledTimes(4);
+    app.setForeground(false);
+    await expect(app.prepareImageGalleryAdjacentPreview(gallery.leaseId, 0, new AbortController().signal)).rejects.toThrow(/adjacent/u);
+    expect(network.submit).not.toHaveBeenCalled();
+  });
+
   it("rejects remote Tool replacement before inline download and cancels a late inline result on background", async () => {
     const bytes = gifBytes(); const message = timelinePreviewEvent("old.gif", "image/gif", bytes, createHash("sha256").update(bytes).digest("hex"));
     const tool = toolMediaEvent(message, "toolCallStarted");

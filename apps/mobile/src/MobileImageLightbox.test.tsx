@@ -21,7 +21,7 @@ vi.mock("react-native", () => {
     return createElement("div", {}, children);
   }, Text: ({ children }: { children?: ReactNode }) => createElement("span", {}, children),
     Modal: ({ children, visible }: { children?: ReactNode; visible: boolean }) => visible ? createElement("div", { role: "dialog" }, children) : null,
-    ActivityIndicator: box,
+    ActivityIndicator: box, StatusBar: box, Platform: { OS: "android" },
     Pressable: ({ children, onPress, accessibilityLabel, disabled }: { children?: ReactNode; onPress?: () => void; accessibilityLabel?: string; disabled?: boolean }) =>
       createElement("button", { onClick: onPress, "aria-label": accessibilityLabel, disabled }, children),
     PanResponder: { create: (gestures: PanResponderCallbacks) => { native.gestures = gestures; return { panHandlers: {} }; } },

@@ -718,6 +718,7 @@ export class MobileClient {
   #markdownResources = new MobileMarkdownResourceReader();
   #fileHtmlResources = new MobileFileHtmlReader();
   #timelineImages = new MobileTimelineImageReader();
+  #galleryBlobRead: ReturnType<MobileNetwork["downloadBlob"]> | undefined;
   #filesThumbnails: MobileFilesThumbnailReader;
   #messageRewindPreviews = new WeakSet<MobileMessageRewindPreview>();
   #automationEpoch = 0;
@@ -5247,7 +5248,9 @@ export class MobileClient {
     await this.#assertImageGalleryCurrent(lease, undefined, signal);
     const page = lease.pages[pageIndex]!;
     const credential = this.#ready();
-    const download = await this.network.downloadBlob(credential, page.blob, signal);
+    const download = await this.#downloadGalleryBlob(credential, page.blob, () => {
+      if (this.#imageGallery !== lease || !this.imageGalleryCurrent(leaseId) || lease.operationInFlight) throw new Error("The gallery image source changed before download.");
+    }, signal);
     signal?.throwIfAborted();
     if (normalizeMediaType(download.mediaType) !== page.mediaType || download.bytes.byteLength !== page.byteSize) {
       throw new Error("The authenticated gallery image changed media type or size.");
@@ -5303,6 +5306,43 @@ export class MobileClient {
       originalOnly: decoded.originalOnly === true,
       ...(decoded.previewMediaType ? { previewMediaType: decoded.previewMediaType } : {})
     };
+  }
+
+  async #downloadGalleryBlob(credential: PairedCredential, blob: BlobRef, assertCurrent: () => void, signal?: AbortSignal): ReturnType<MobileNetwork["downloadBlob"]> {
+    while (this.#galleryBlobRead) {
+      await awaitMobileMarkdownResourceRead(this.#galleryBlobRead.catch(() => undefined), signal ?? new AbortController().signal);
+    }
+    signal?.throwIfAborted();
+    assertCurrent();
+    const raw = this.network.downloadBlob(credential, blob, signal); this.#galleryBlobRead = raw;
+    void raw.then(() => { if (this.#galleryBlobRead === raw) this.#galleryBlobRead = undefined; },
+      () => { if (this.#galleryBlobRead === raw) this.#galleryBlobRead = undefined; });
+    return raw;
+  }
+
+  async prepareImageGalleryAdjacentPreview(leaseId: string, pageIndex: number, signal: AbortSignal): Promise<MobileTimelineImagePreview> {
+    signal.throwIfAborted();
+    const lease = this.#imageGallery; const currentIndex = lease?.loaded?.pageIndex; const page = lease?.pages[pageIndex];
+    if (!lease || lease.leaseId !== leaseId || currentIndex === undefined || !Number.isSafeInteger(pageIndex)
+      || Math.abs(currentIndex - pageIndex) !== 1 || !page) throw new Error("The adjacent image has no current gallery owner.");
+    const credential = this.#ready();
+    const assertCurrent = (currentSignal?: AbortSignal) => {
+      currentSignal?.throwIfAborted();
+      if (this.#imageGallery !== lease || this.#credential !== credential || !this.imageGalleryCurrent(leaseId)
+        || lease.loaded?.pageIndex !== currentIndex || lease.pages[pageIndex] !== page) throw new Error("The adjacent image source changed.");
+    };
+    const revalidate = async (currentSignal: AbortSignal) => {
+      await this.#assertImageGalleryCurrent(lease, undefined, currentSignal);
+      await this.#revalidateGalleryImageSource(lease, { page }, currentSignal); assertCurrent(currentSignal);
+    };
+    let preview: MobileTimelineImagePreview | undefined;
+    try {
+      preview = await this.#timelineImages.prepare({ ownerKey: lease.taskAuthorityKey, page, assertCurrent, revalidate,
+        download: (blob, currentSignal) => this.#downloadGalleryBlob(credential, blob, () => assertCurrent(currentSignal), currentSignal) }, signal);
+      await revalidate(signal);
+      lease.previewLeaseIds ??= new Set(); lease.previewLeaseIds.add(preview.leaseId);
+      return preview;
+    } catch (failure) { if (preview) this.#timelineImages.release(preview.leaseId, true); throw failure; }
   }
 
   async pinImageGalleryCachedPreview(leaseId: string, pageIndex: number, signal: AbortSignal): Promise<MobileTimelineImagePreview | undefined> {
@@ -9603,7 +9643,7 @@ export class MobileClient {
     return controls;
   }
 
-  async #revalidateGalleryImageSource(lease: MobileImageGalleryLease, loaded: NonNullable<MobileImageGalleryLease["loaded"]>, signal: AbortSignal): Promise<void> {
+  async #revalidateGalleryImageSource(lease: MobileImageGalleryLease, loaded: Pick<NonNullable<MobileImageGalleryLease["loaded"]>, "page">, signal: AbortSignal): Promise<void> {
     signal.throwIfAborted();
     if (lease.source.kind === "markdown") return; // The resource owner revalidates its exact message and Workspace revision above.
     const page = loaded.page; const source = page.source; const credential = this.#ready();
