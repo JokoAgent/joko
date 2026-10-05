@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ComponentType } from "react";
 import {
   ActivityIndicator,
+  Animated,
   AppState,
   Modal,
   PanResponder,
@@ -42,8 +43,11 @@ import {
   mobileAccessibleZoomTransform,
   mobileContainedImageSize,
   mobileDoubleTapTransform,
+  mobileLightboxCanStartDismiss,
   mobileLightboxIsTap,
+  mobileLightboxIsZoomed,
   mobileLightboxPointerIntent,
+  mobileLightboxShouldDismiss,
   mobileLightboxSwipePageIndex,
   mobilePinchTransform,
   mobileTouchCentroid,
@@ -110,6 +114,8 @@ interface ActiveGesture {
   initialTransform: MobileImageTransform;
   initialCentroid: MobileTouchPoint;
   initialDistance: number;
+  maxDistance: number;
+  dismissRejected: boolean;
 }
 
 const initialTransform: MobileImageTransform = { scale: 1, translateX: 0, translateY: 0 };
@@ -153,12 +159,16 @@ export function MobileImageLightbox({
   const decodedRef = useRef(decoded);
   const gestureRef = useRef<ActiveGesture | undefined>(undefined);
   const lastTapRef = useRef<{ readonly at: number; readonly point: MobileTouchPoint } | undefined>(undefined);
+  const tapTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const dismissResetTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const dismissY = useRef(new Animated.Value(0)).current;
   const saveControllerRef = useRef<AbortController | undefined>(undefined);
   const closedRef = useRef(false);
   const nativeActivityRef = useRef(false);
   const sawExpectedInactiveRef = useRef(false);
   const nativeActivityCallbackRef = useRef(onNativeActivityChange);
   const galleryRef = useRef(gallery);
+  const closeCallbackRef = useRef(onClose);
   const loadOwnerRef = useRef(loadKey);
   loadOwnerRef.current = loadKey;
   strokesRef.current = strokes;
@@ -169,9 +179,32 @@ export function MobileImageLightbox({
   naturalRef.current = natural;
   decodedRef.current = decoded;
   galleryRef.current = gallery;
+  closeCallbackRef.current = onClose;
   nativeActivityCallbackRef.current = onNativeActivityChange;
 
+  const clearPendingTap = useCallback((clearLast = true) => {
+    clearTimeout(tapTimerRef.current);
+    tapTimerRef.current = undefined;
+    if (clearLast) lastTapRef.current = undefined;
+  }, []);
+  const resetDismiss = useCallback(() => {
+    clearTimeout(dismissResetTimerRef.current);
+    dismissResetTimerRef.current = undefined;
+    dismissY.stopAnimation();
+    dismissY.setValue(0);
+  }, [dismissY]);
+  const cancelGesture = useCallback(() => {
+    clearPendingTap();
+    resetDismiss();
+    gestureRef.current = undefined;
+    draftStrokeRef.current = undefined;
+    setDraftStroke(undefined);
+  }, [clearPendingTap, resetDismiss]);
+  const canInteract = useCallback(() => !closedRef.current && loadOwnerRef.current === loadKey
+    && AppState.currentState === "active" && !saveControllerRef.current && !nativeActivityRef.current, [loadKey]);
+
   useEffect(() => {
+    cancelGesture();
     saveControllerRef.current?.abort();
     saveControllerRef.current = undefined;
     const nextStrokes = cloneStrokes(initialStrokes);
@@ -198,7 +231,7 @@ export function MobileImageLightbox({
     setOutputAction(undefined);
     setNotice("");
     setError("");
-  }, [loadKey]);
+  }, [loadKey, cancelGesture]);
 
   const backdrop = gallery?.preview;
   useEffect(() => {
@@ -210,18 +243,20 @@ export function MobileImageLightbox({
   const close = useCallback(() => {
     if (closedRef.current) return;
     closedRef.current = true;
+    cancelGesture();
     saveControllerRef.current?.abort();
     if (nativeActivityRef.current) {
       nativeActivityRef.current = false;
       nativeActivityCallbackRef.current?.(false);
     }
-    onClose();
-  }, [onClose]);
+    closeCallbackRef.current();
+  }, [cancelGesture]);
 
   useEffect(() => {
     const subscription = AppState.addEventListener("change", (status) => {
       setForeground(status === "active");
       if (status === "active") return;
+      cancelGesture();
       if (nativeActivityRef.current) {
         sawExpectedInactiveRef.current = true;
         return;
@@ -230,6 +265,9 @@ export function MobileImageLightbox({
     });
     return () => {
       closedRef.current = true;
+      clearPendingTap();
+      resetDismiss();
+      gestureRef.current = undefined;
       subscription.remove();
       saveControllerRef.current?.abort();
       if (nativeActivityRef.current) {
@@ -237,7 +275,7 @@ export function MobileImageLightbox({
         nativeActivityCallbackRef.current?.(false);
       }
     };
-  }, [close]);
+  }, [close, cancelGesture, clearPendingTap, resetDismiss]);
 
   useEffect(() => {
     const next = clampMobileImageTransform(transformRef.current, container, natural);
@@ -246,14 +284,18 @@ export function MobileImageLightbox({
   }, [container, natural]);
 
   const panResponder = useMemo(() => PanResponder.create({
-    onStartShouldSetPanResponder: () => !saveControllerRef.current,
-    onMoveShouldSetPanResponder: () => !saveControllerRef.current,
+    onStartShouldSetPanResponder: canInteract,
+    onMoveShouldSetPanResponder: canInteract,
     onPanResponderGrant: (event) => {
+      if (!canInteract()) return;
+      clearPendingTap(false);
+      resetDismiss();
       setError("");
       const points = responderTouches(event);
       const first = points[0] ?? { x: event.nativeEvent.locationX, y: event.nativeEvent.locationY };
       const intent = mobileLightboxPointerIntent(annotatingRef.current && annotatable, points.length || 1);
       if (intent === "transform") {
+        clearPendingTap();
         const centroid = mobileTouchCentroid(points.slice(0, 2));
         gestureRef.current = {
           mode: "transform",
@@ -262,7 +304,9 @@ export function MobileImageLightbox({
           last: centroid,
           initialTransform: transformRef.current,
           initialCentroid: centroid,
-          initialDistance: mobileTouchDistance(points[0]!, points[1]!)
+          initialDistance: mobileTouchDistance(points[0]!, points[1]!),
+          maxDistance: 0,
+          dismissRejected: true
         };
         return;
       }
@@ -273,7 +317,9 @@ export function MobileImageLightbox({
         last: first,
         initialTransform: transformRef.current,
         initialCentroid: first,
-        initialDistance: 0
+        initialDistance: 0,
+        maxDistance: 0,
+        dismissRejected: false
       };
       if (intent === "draw") {
         const point = annotationPoint(first, containerRef.current, naturalRef.current, transformRef.current);
@@ -293,6 +339,8 @@ export function MobileImageLightbox({
       gestureRef.current = base;
     },
     onPanResponderMove: (event, gestureState) => {
+      if (loadOwnerRef.current !== loadKey) return;
+      if (!canInteract()) { cancelGesture(); return; }
       const touches = responderTouches(event);
       let active = gestureRef.current;
       if (!active) return;
@@ -301,6 +349,8 @@ export function MobileImageLightbox({
         const centroid = mobileTouchCentroid(points);
         const distance = mobileTouchDistance(points[0]!, points[1]!);
         if (active.mode !== "transform") {
+          clearPendingTap();
+          resetDismiss();
           draftStrokeRef.current = undefined;
           setDraftStroke(undefined);
           active = {
@@ -310,7 +360,9 @@ export function MobileImageLightbox({
             last: centroid,
             initialTransform: transformRef.current,
             initialCentroid: centroid,
-            initialDistance: distance
+            initialDistance: distance,
+            maxDistance: active.maxDistance,
+            dismissRejected: true
           };
           gestureRef.current = active;
           return;
@@ -334,6 +386,8 @@ export function MobileImageLightbox({
         y: active.start.y + gestureState.dy
       };
       active.last = point;
+      active.maxDistance = Math.max(active.maxDistance, Math.hypot(gestureState.dx, gestureState.dy), mobileTouchDistance(active.start, point));
+      if (active.maxDistance > MOBILE_LIGHTBOX_TAP_DISTANCE) clearPendingTap();
       if (active.mode === "draw") {
         const normalized = annotationPoint(point, containerRef.current, naturalRef.current, transformRef.current);
         const draft = draftStrokeRef.current;
@@ -348,6 +402,13 @@ export function MobileImageLightbox({
         return;
       }
       if (active.mode === "pan") {
+        if (Math.abs(gestureState.dx) > 12) active.dismissRejected = true;
+        if (!active.dismissRejected && !annotatingRef.current
+          && mobileLightboxCanStartDismiss(gestureState.dx, gestureState.dy, transformRef.current.scale)) {
+          active.mode = "dismiss";
+          dismissY.setValue(gestureState.dy);
+          return;
+        }
         const next = clampMobileImageTransform({
           scale: active.initialTransform.scale,
           translateX: active.initialTransform.translateX + gestureState.dx,
@@ -355,12 +416,30 @@ export function MobileImageLightbox({
         }, containerRef.current, naturalRef.current);
         transformRef.current = next;
         setTransform(next);
+      } else if (active.mode === "dismiss") {
+        dismissY.setValue(gestureState.dy);
       }
     },
     onPanResponderRelease: (_event, gestureState) => {
+      if (loadOwnerRef.current !== loadKey) return;
+      if (!canInteract()) { cancelGesture(); return; }
       const active = gestureRef.current;
       gestureRef.current = undefined;
       if (!active) return;
+      if (active.mode === "dismiss") {
+        clearPendingTap();
+        // PanResponder velocity is points per millisecond; the dismissal threshold uses points per second.
+        if (mobileLightboxShouldDismiss(gestureState.dy, gestureState.vy * 1_000, transformRef.current.scale)) {
+          close();
+        } else {
+          Animated.spring(dismissY, { toValue: 0, damping: 20, stiffness: 240, useNativeDriver: true }).start();
+          const deadline = setTimeout(() => {
+            if (dismissResetTimerRef.current === deadline && loadOwnerRef.current === loadKey && !closedRef.current) resetDismiss();
+          }, 1_000);
+          dismissResetTimerRef.current = deadline;
+        }
+        return;
+      }
       if (active.mode === "draw") {
         const draft = draftStrokeRef.current;
         draftStrokeRef.current = undefined;
@@ -386,7 +465,7 @@ export function MobileImageLightbox({
         annotating: annotatingRef.current
       }) : undefined;
       if (nextPage !== undefined && activeGallery) {
-        lastTapRef.current = undefined;
+        cancelGesture();
         strokesRef.current = cloneStrokes(initialStrokes);
         draftStrokeRef.current = undefined;
         annotatingRef.current = false;
@@ -399,7 +478,7 @@ export function MobileImageLightbox({
         return;
       }
       const now = Date.now();
-      const distance = Math.hypot(gestureState.dx, gestureState.dy);
+      const distance = Math.max(active.maxDistance, Math.hypot(gestureState.dx, gestureState.dy));
       if (!mobileLightboxIsTap(active.startedAt, now, distance)) {
         lastTapRef.current = undefined;
         return;
@@ -416,18 +495,24 @@ export function MobileImageLightbox({
         );
         transformRef.current = next;
         setTransform(next);
-        lastTapRef.current = undefined;
+        clearPendingTap();
       } else {
-        lastTapRef.current = { at: now, point: tap };
+        const pending = { at: now, point: tap };
+        lastTapRef.current = pending;
+        if (!annotatingRef.current && !mobileLightboxIsZoomed(transformRef.current.scale)) {
+          tapTimerRef.current = setTimeout(() => {
+            if (!canInteract() || gestureRef.current || lastTapRef.current !== pending
+              || annotatingRef.current || mobileLightboxIsZoomed(transformRef.current.scale)) return;
+            clearPendingTap();
+            close();
+          }, MOBILE_LIGHTBOX_DOUBLE_TAP_MILLISECONDS);
+        }
       }
     },
     onPanResponderTerminate: () => {
-      gestureRef.current = undefined;
-      draftStrokeRef.current = undefined;
-      setDraftStroke(undefined);
-      lastTapRef.current = undefined;
+      if (loadOwnerRef.current === loadKey) cancelGesture();
     }
-  }), [locale, annotatable, initialStrokes]);
+  }), [locale, annotatable, initialStrokes, canInteract, cancelGesture, clearPendingTap, resetDismiss, dismissY, close, loadKey]);
 
   const displayed = mobileContainedImageSize(container, natural);
   const paths = [...strokes, ...(draftStroke ? [draftStroke] : [])];
@@ -451,14 +536,17 @@ export function MobileImageLightbox({
     return () => clearTimeout(deadline);
   }, [loadKey, decodedFor, gallery?.busy]);
   const updateContainer = (event: LayoutChangeEvent): void => {
+    if (closedRef.current || loadOwnerRef.current !== loadKey) return;
     const next = {
       width: event.nativeEvent.layout.width,
       height: event.nativeEvent.layout.height
     };
+    if (next.width !== containerRef.current.width || next.height !== containerRef.current.height) cancelGesture();
     containerRef.current = next;
     setContainer(next);
   };
   const zoom = (delta: number): void => {
+    cancelGesture();
     const next = mobileAccessibleZoomTransform(
       transformRef.current,
       delta,
@@ -469,10 +557,12 @@ export function MobileImageLightbox({
     setTransform(next);
   };
   const resetTransform = (): void => {
+    cancelGesture();
     transformRef.current = initialTransform;
     setTransform(initialTransform);
   };
   const undo = (): void => {
+    cancelGesture();
     const next = strokesRef.current.slice(0, -1);
     strokesRef.current = next;
     draftStrokeRef.current = undefined;
@@ -481,6 +571,7 @@ export function MobileImageLightbox({
     setError("");
   };
   const discard = (): void => {
+    cancelGesture();
     const next = cloneStrokes(initialStrokes);
     strokesRef.current = next;
     draftStrokeRef.current = undefined;
@@ -492,6 +583,7 @@ export function MobileImageLightbox({
   const navigate = (pageIndex: number): void => {
     if (!gallery || busy || pageIndex < 0 || pageIndex >= gallery.descriptor.pages.length
       || pageIndex === gallery.pageIndex) return;
+    cancelGesture();
     const next = cloneStrokes(initialStrokes);
     strokesRef.current = next;
     draftStrokeRef.current = undefined;
@@ -506,6 +598,7 @@ export function MobileImageLightbox({
   };
   const addOriginal = async (): Promise<void> => {
     if (!gallery || saveControllerRef.current || !gallerySession?.addable || !drawingReady) return;
+    cancelGesture();
     const controller = new AbortController();
     saveControllerRef.current = controller;
     setBusy(true);
@@ -531,6 +624,7 @@ export function MobileImageLightbox({
   };
   const save = async (): Promise<void> => {
     if (!session || saveControllerRef.current || !dirty || gallery?.busy || !canAnnotate) return;
+    cancelGesture();
     const controller = new AbortController();
     saveControllerRef.current = controller;
     setBusy(true);
@@ -575,6 +669,7 @@ export function MobileImageLightbox({
     const originalShare = action === "share" && originalOnly && gallery?.onShareOriginal;
     if (!session || (!originalShare && (!onOutputAction || !outputReady)) || saveControllerRef.current || !exactDecoded
       || !drawingReady || gallery?.busy) return;
+    cancelGesture();
     const controller = new AbortController();
     saveControllerRef.current = controller;
     setBusy(true);
@@ -634,9 +729,12 @@ export function MobileImageLightbox({
     }
   };
 
-  return <Modal visible animationType="fade" presentationStyle="fullScreen" statusBarTranslucent
+  return <Modal visible transparent animationType="fade" presentationStyle="overFullScreen" statusBarTranslucent
     onRequestClose={close} supportedOrientations={["portrait", "landscape"]}>
     <SafeAreaView style={styles.root} edges={["top", "right", "bottom", "left"]}>
+      <Animated.View pointerEvents="none" style={[styles.backdrop, { opacity: dismissY.interpolate({
+        inputRange: [-300, 0, 300], outputRange: [0.4, 1, 0.4], extrapolate: "clamp"
+      }) }]} />
       <View style={styles.header}>
         <ToolButton label={mobileMessage(locale, "image.close")} onPress={close} disabled={false} />
         <View style={styles.heading}>
@@ -653,13 +751,16 @@ export function MobileImageLightbox({
       </View>
       <View accessibilityRole="image" accessibilityLabel={mobileMessage(locale, "image.previewLabel", { name: fileName })}
         style={styles.canvas} onLayout={updateContainer} {...panResponder.panHandlers}>
-        {displayed.width > 0 && displayed.height > 0 && <View pointerEvents="none" style={[
+        {displayed.width > 0 && displayed.height > 0 && <Animated.View pointerEvents="none" style={[
           styles.imagePosition,
           {
             width: displayed.width,
             height: displayed.height,
             left: (container.width - displayed.width) / 2 + transform.translateX,
-            top: (container.height - displayed.height) / 2 + transform.translateY
+            top: (container.height - displayed.height) / 2 + transform.translateY,
+            transform: [{ translateY: dismissY }, { scale: dismissY.interpolate({
+              inputRange: [-300, 0, 300], outputRange: [0.9, 1, 0.9], extrapolate: "clamp"
+            }) }]
           }
         ]}>
           <View style={[styles.imageScale, { transform: [{ scale: transform.scale }] }]}>
@@ -710,7 +811,7 @@ export function MobileImageLightbox({
               <SvgXml xml={annotationSvgXml(paths, natural)} width="100%" height="100%" />
             </View>}
           </View>
-        </View>}
+        </Animated.View>}
         {!drawingReady && !visibleError && <View pointerEvents="none" style={styles.loading}>
           <ActivityIndicator color="#ff9800" />
         </View>}
@@ -726,7 +827,7 @@ export function MobileImageLightbox({
         {gallery && <ToolButton label={mobileMessage(locale, "image.next")} onPress={() => navigate(gallery.pageIndex + 1)}
           disabled={busy || gallery.pageIndex + 1 >= gallery.descriptor.pages.length} />}
         {gallery && visibleError && <ToolButton label={mobileMessage(locale, "image.previewRetry", { name: fileName })}
-          onPress={gallery.onRetry} disabled={busy || gallery.busy} />}
+          onPress={() => { cancelGesture(); gallery.onRetry(); }} disabled={busy || gallery.busy} />}
         {onOutputAction && !originalOnly && <ToolButton label={mobileMessage(locale, outputAction === "copy" ? "image.copying" : "image.copy")}
           onPress={() => void output("copy")} disabled={interactionBusy || !outputReady} />}
         {onOutputAction && !originalOnly && <ToolButton label={mobileMessage(locale, outputAction === "save" ? "image.saving" : "image.save")}
@@ -742,7 +843,7 @@ export function MobileImageLightbox({
         {gallery && gallerySession?.addable && <ToolButton label={mobileMessage(locale, busy ? "image.adding" : "image.addOriginal")}
           onPress={() => void addOriginal()} disabled={interactionBusy || !drawingReady} emphasized />}
         {canAnnotate && <ToolButton label={mobileMessage(locale, "image.annotate")} selected={annotating}
-          onPress={() => { setAnnotating((value) => !value); setError(""); }} disabled={interactionBusy || !drawingReady} />}
+          onPress={() => { cancelGesture(); annotatingRef.current = !annotatingRef.current; setAnnotating(annotatingRef.current); setError(""); }} disabled={interactionBusy || !drawingReady} />}
         {canAnnotate && <ToolButton label={mobileMessage(locale, "image.undo")} onPress={undo} disabled={interactionBusy || strokes.length === 0} />}
         {canAnnotate && <ToolButton label={mobileMessage(locale, "common.discard")} onPress={discard} disabled={interactionBusy || !dirty} />}
         {canAnnotate && <ToolButton label={mobileMessage(locale, busy ? "common.saving" : gallery ? "image.addMarked" : "common.save")}
@@ -837,7 +938,8 @@ function annotationSvgXml(
 }
 
 const styles = StyleSheet.create({
-  root: { flex: 1, backgroundColor: "#050607" },
+  root: { flex: 1 },
+  backdrop: { position: "absolute", inset: 0, backgroundColor: "#050607" },
   header: { minHeight: 64, paddingHorizontal: 12, paddingVertical: 8, flexDirection: "row", alignItems: "center", gap: 12 },
   heading: { flex: 1, minWidth: 0 },
   fileName: { color: "#f7f6f3", fontSize: 16, lineHeight: 21, fontWeight: "700" },

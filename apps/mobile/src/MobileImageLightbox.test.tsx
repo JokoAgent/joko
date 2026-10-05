@@ -2,13 +2,14 @@
 import { act, createElement, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import type { ImageLoadEventData, ImageProps } from "expo-image";
+import type { GestureResponderEvent, PanResponderCallbacks, PanResponderGestureState } from "react-native";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { MobileImageGalleryPageSession } from "./mobile-image-gallery";
 import { mobileMessage } from "./mobile-messages";
 
 const native = vi.hoisted(() => ({ state: "active", listeners: new Set<(state: string) => void>(),
   images: new Map<string, ImageProps>(), layout: undefined as ((event: unknown) => void) | undefined,
-  burn: vi.fn() }));
+  gestures: undefined as PanResponderCallbacks | undefined, offset: 0, spring: vi.fn(), burn: vi.fn() }));
 vi.mock("react-native", () => {
   const box = ({ children }: { children?: ReactNode }) => createElement("div", {}, children);
   return { View: ({ children, accessibilityRole, onLayout }: { children?: ReactNode; accessibilityRole?: string; onLayout?: (event: unknown) => void }) => {
@@ -19,7 +20,12 @@ vi.mock("react-native", () => {
     ActivityIndicator: box,
     Pressable: ({ children, onPress, accessibilityLabel, disabled }: { children?: ReactNode; onPress?: () => void; accessibilityLabel?: string; disabled?: boolean }) =>
       createElement("button", { onClick: onPress, "aria-label": accessibilityLabel, disabled }, children),
-    PanResponder: { create: () => ({ panHandlers: {} }) },
+    PanResponder: { create: (gestures: PanResponderCallbacks) => { native.gestures = gestures; return { panHandlers: {} }; } },
+    Animated: { View: box, Value: class {
+      setValue(value: number) { native.offset = value; }
+      stopAnimation() {}
+      interpolate() { return 1; }
+    }, spring: (...args: unknown[]) => { native.spring(...args); return { start() {} }; } },
     StyleSheet: { create: (value: unknown) => value, absoluteFillObject: {} },
     AppState: { get currentState() { return native.state; }, addEventListener: (_event: string, listener: (state: string) => void) => {
       native.listeners.add(listener); return { remove: () => native.listeners.delete(listener) };
@@ -43,6 +49,7 @@ beforeEach(() => {
   close.mockReset(); share.mockReset(); share.mockImplementation(async (_signal, onDispatch) => onDispatch()); add.mockReset(); add.mockResolvedValue(undefined);
   decoded.mockReset(); output.mockReset(); save.mockReset(); nativeActivity.mockReset();
   nativeFailed.mockReset(); retry.mockReset(); previewFailed.mockReset();
+  native.gestures = undefined; native.offset = 0; native.spring.mockReset();
   host = document.body.appendChild(document.createElement("div")); root = createRoot(host);
 });
 afterEach(async () => {
@@ -74,6 +81,100 @@ async function load(page: MobileImageGalleryPageSession, isAnimated = page.expec
   await act(async () => native.images.get(page.previewUri)!.onLoad!({ cacheType: "none", source: { url: page.previewUri, width: 1, height: 1,
     mediaType: page.previewMediaType ?? page.sourceMediaType, isAnimated } } as ImageLoadEventData));
 }
+function touch(points = [{ x: 200, y: 150 }]): GestureResponderEvent {
+  return { nativeEvent: { locationX: points[0]?.x ?? 200, locationY: points[0]?.y ?? 150,
+    touches: points.map((point) => ({ locationX: point.x, locationY: point.y })) } } as GestureResponderEvent;
+}
+function motion(dx = 0, dy = 0, vy = 0): PanResponderGestureState {
+  return { dx, dy, vy, vx: 0, numberActiveTouches: 1 } as PanResponderGestureState;
+}
+async function tap() {
+  await act(async () => { native.gestures!.onPanResponderGrant!(touch(), motion()); native.gestures!.onPanResponderRelease!(touch(), motion()); });
+}
+async function drag(dx: number, dy: number, vy = 0) {
+  await act(async () => {
+    native.gestures!.onPanResponderGrant!(touch(), motion());
+    native.gestures!.onPanResponderMove!(touch([{ x: 200 + dx, y: 150 + dy }]), motion(dx, dy, vy));
+    native.gestures!.onPanResponderRelease!(touch([]), motion(dx, dy, vy));
+  });
+}
+
+describe("lightbox dismissal and gesture ownership", () => {
+  it("delays single-tap dismissal for double-tap zoom and never closes after zoomed, long or returning drag gestures", async () => {
+    vi.useFakeTimers();
+    const page = session("image/png", false); await render(page);
+    await tap(); await act(async () => vi.advanceTimersByTime(279)); expect(close).not.toHaveBeenCalled();
+    await tap(); await act(async () => vi.advanceTimersByTime(300)); expect(close).not.toHaveBeenCalled();
+    expect(host.textContent).toContain("2.5");
+    await tap(); await act(async () => vi.advanceTimersByTime(300)); expect(close).not.toHaveBeenCalled();
+    await act(async () => button("image.reset")!.click());
+    await act(async () => {
+      native.gestures!.onPanResponderGrant!(touch(), motion());
+      native.gestures!.onPanResponderMove!(touch([{ x: 230, y: 150 }]), motion(30));
+      native.gestures!.onPanResponderMove!(touch(), motion());
+      native.gestures!.onPanResponderRelease!(touch(), motion());
+    });
+    await act(async () => vi.advanceTimersByTime(300)); expect(close).not.toHaveBeenCalled();
+    await act(async () => native.gestures!.onPanResponderGrant!(touch(), motion()));
+    await act(async () => vi.advanceTimersByTime(501));
+    await act(async () => native.gestures!.onPanResponderRelease!(touch(), motion()));
+    await act(async () => vi.advanceTimersByTime(300)); expect(close).not.toHaveBeenCalled();
+    await tap(); await act(async () => vi.advanceTimersByTime(280)); expect(close).toHaveBeenCalledOnce();
+    expect(decoded).not.toHaveBeenCalled(); expect(output).not.toHaveBeenCalled();
+  });
+
+  it("moves and springs a short vertical drag, closes at the distance or converted speed threshold, and preserves horizontal navigation", async () => {
+    vi.useFakeTimers(); const page = session("image/png", false); await render(page);
+    await drag(0, 120, 0.8); expect(close).not.toHaveBeenCalled(); expect(native.offset).toBe(120);
+    expect(native.spring).toHaveBeenLastCalledWith(expect.anything(), expect.objectContaining({ toValue: 0, useNativeDriver: true }));
+    await act(async () => vi.advanceTimersByTime(1_000)); expect(native.offset).toBe(0);
+    const navigate = vi.fn();
+    await act(async () => root.render(createElement(MobileImageLightbox, { session: page, locale: "en", onClose: close, onSave: save,
+      gallery: { ...controls(page), onNavigate: navigate } })));
+    await drag(-80, 10); expect(navigate).toHaveBeenCalledWith(1); expect(close).not.toHaveBeenCalled();
+    await drag(0, -121); expect(close).toHaveBeenCalledOnce();
+    await render(session("image/png", false, "fast-page"));
+    await drag(0, 20, 0.801); expect(close).toHaveBeenCalledTimes(2); expect(output).not.toHaveBeenCalled();
+  });
+
+  it("retires pending taps and old callbacks on page, orientation, annotation, multi-touch, effects and background changes", async () => {
+    vi.useFakeTimers(); const first = { ...session("image/png", false), annotatable: true }; await render(first); await load(first);
+    await tap(); const old = native.gestures!;
+    const second = { ...first, ...session("image/png", false, "second"), annotatable: true }; await render(second); await load(second);
+    await act(async () => { old.onPanResponderGrant!(touch(), motion()); old.onPanResponderRelease!(touch(), motion()); });
+    await act(async () => vi.advanceTimersByTime(300)); expect(close).not.toHaveBeenCalled();
+    await tap(); await act(async () => native.layout?.({ nativeEvent: { layout: { width: 300, height: 400 } } }));
+    await act(async () => vi.advanceTimersByTime(300)); expect(close).not.toHaveBeenCalled();
+    await tap(); await act(async () => button("image.annotate")!.click()); await drag(0, 150, 1);
+    await act(async () => vi.advanceTimersByTime(300)); expect(close).not.toHaveBeenCalled();
+    await act(async () => button("image.annotate")!.click());
+    await tap(); await act(async () => {
+      native.gestures!.onPanResponderGrant!(touch(), motion());
+      native.gestures!.onPanResponderMove!(touch([{ x: 180, y: 150 }, { x: 220, y: 150 }]), motion(0, 150, 1));
+      native.gestures!.onPanResponderMove!(touch([{ x: 200, y: 290 }]), motion(0, 140, 1));
+      native.gestures!.onPanResponderRelease!(touch([]), motion(0, 140, 1));
+    });
+    await act(async () => vi.advanceTimersByTime(300)); expect(close).not.toHaveBeenCalled(); expect(native.offset).toBe(0);
+    await act(async () => button("common.discard")!.click());
+    let finish!: () => void;
+    output.mockImplementationOnce(async () => new Promise<void>((resolve) => { finish = resolve; }));
+    await tap(); await act(async () => button("image.copy")!.click());
+    expect(output).toHaveBeenCalledOnce();
+    await drag(0, 150, 1); await act(async () => vi.advanceTimersByTime(300)); expect(close).not.toHaveBeenCalled();
+    await act(async () => finish());
+    await tap(); await act(async () => { native.state = "background"; native.listeners.forEach((listener) => listener("background")); });
+    expect(close).toHaveBeenCalledOnce(); await act(async () => vi.advanceTimersByTime(300)); expect(close).toHaveBeenCalledOnce();
+  });
+
+  it("keeps the active lease closeable when a parent replaces its callback and clears timers at unmount", async () => {
+    vi.useFakeTimers(); const page = session("image/png", false); await render(page); await tap();
+    const nextClose = vi.fn();
+    await act(async () => root.render(createElement(MobileImageLightbox, { session: page, locale: "en", onClose: nextClose, onSave: save, gallery: controls(page) })));
+    await act(async () => vi.advanceTimersByTime(280)); expect(nextClose).toHaveBeenCalledOnce(); expect(close).not.toHaveBeenCalled();
+    await render(session("image/png", false, "unmount-page")); await tap();
+    await act(async () => root.render(null)); await act(async () => vi.advanceTimersByTime(300)); expect(close).not.toHaveBeenCalled();
+  });
+});
 
 describe("native image gallery formats and ownership", () => {
   it("opens a pending page with an independent preview and keeps that layer through original fetch and native decode", async () => {

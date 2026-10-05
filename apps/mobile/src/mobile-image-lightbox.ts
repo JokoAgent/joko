@@ -6,6 +6,8 @@ export const MOBILE_LIGHTBOX_TAP_DISTANCE = 12;
 export const MOBILE_LIGHTBOX_TAP_MILLISECONDS = 500;
 export const MOBILE_LIGHTBOX_DOUBLE_TAP_MILLISECONDS = 280;
 export const MOBILE_LIGHTBOX_PAGE_SWIPE_DISTANCE = 56;
+export const MOBILE_LIGHTBOX_DISMISS_DISTANCE = 120;
+export const MOBILE_LIGHTBOX_DISMISS_VELOCITY = 800;
 
 export interface MobileImageTransform {
   readonly scale: number;
@@ -23,7 +25,7 @@ export interface MobileTouchPoint {
   readonly y: number;
 }
 
-export type MobileLightboxPointerIntent = "idle" | "pan" | "draw" | "transform";
+export type MobileLightboxPointerIntent = "idle" | "pan" | "draw" | "transform" | "dismiss";
 
 export function mobileLightboxPointerIntent(
   annotating: boolean,
@@ -47,6 +49,17 @@ export function mobileLightboxIsTap(startedAt: number, releasedAt: number, dista
   const duration = releasedAt - startedAt;
   return Number.isFinite(duration) && duration >= 0 && duration <= MOBILE_LIGHTBOX_TAP_MILLISECONDS
     && Number.isFinite(distance) && distance >= 0 && distance <= MOBILE_LIGHTBOX_TAP_DISTANCE;
+}
+
+export function mobileLightboxCanStartDismiss(translationX: number, translationY: number, scale: number): boolean {
+  return Number.isFinite(translationX) && Number.isFinite(translationY)
+    && !mobileLightboxIsZoomed(scale) && Math.abs(translationX) <= 12 && Math.abs(translationY) > 16;
+}
+
+export function mobileLightboxShouldDismiss(translationY: number, velocityY: number, scale: number): boolean {
+  return Number.isFinite(translationY) && !mobileLightboxIsZoomed(scale)
+    && (Math.abs(translationY) > MOBILE_LIGHTBOX_DISMISS_DISTANCE
+      || Number.isFinite(velocityY) && Math.abs(velocityY) > MOBILE_LIGHTBOX_DISMISS_VELOCITY);
 }
 
 export function mobileLightboxSwipePageIndex(input: {
