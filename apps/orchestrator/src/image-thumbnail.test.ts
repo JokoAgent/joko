@@ -2,9 +2,11 @@ import { createHash } from "node:crypto";
 import { deflateSync } from "node:zlib";
 import sharp from "sharp";
 import { ImageThumbnailUnavailableReason } from "@joko/contracts";
+import { heifImageFixture } from "@joko/testkit";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ArtifactRecord } from "./artifact-store.js";
 import { ImageThumbnailRenderer } from "./image-thumbnail.js";
+import { readHeifFileThumbnail } from "./image-heif-thumbnail.js";
 
 afterEach(() => vi.useRealTimers());
 function source(bytes: Uint8Array, mimeType = "image/png", id = "source"): ArtifactRecord {
@@ -16,6 +18,43 @@ async function png(width = 2048, height = 1024) {
 }
 
 describe("canonical static image thumbnails", () => {
+  it("decodes real primary HEVC pixels and conformance-window crops for canonical HEIC and general HEIF files", async () => {
+    const signal = new AbortController().signal;
+    for (const mime of ["image/heic", "image/heif"] as const) for (const [name, sourceWidth, sourceHeight, width, height] of [
+      ["conformance", 1, 1, 1, 1], ["cropped", 64, 64, 64, 64], ["spectrum", 451, 461, 250, 256]
+    ] as const) {
+      const bytes = heifImageFixture(name, mime);
+      const readBlob = vi.fn(async () => ({ data: bytes, mimeType: mime })); const renderer = new ImageThumbnailRenderer({ readBlob });
+      const result = await renderer.read(source(bytes, mime), 256, signal);
+      expect(result).toMatchObject({ thumbnail: { mediaType: "image/webp", widthPixels: width, heightPixels: height,
+        sourceWidthPixels: sourceWidth, sourceHeightPixels: sourceHeight } });
+      if (!("thumbnail" in result)) throw new Error("HEVC file thumbnail missing");
+      const metadata = await sharp(result.thumbnail.data).metadata(); expect(metadata.pages ?? 1).toBe(1);
+      const pixel = await sharp(result.thumbnail.data).removeAlpha().raw().toBuffer();
+      if (name === "conformance") expect(Array.from(pixel)).toEqual([21, 21, 21]);
+      if (name === "cropped") { expect(pixel[0]).toBeGreaterThan(230); expect(pixel[1]).toBeLessThan(30); }
+      if (name === "spectrum") { expect(pixel[1]).toBeLessThan(30); expect(pixel[2]).toBeGreaterThan(230); }
+      expect(await renderer.read(source(bytes, mime), 256, signal)).toEqual(result); expect(readBlob).toHaveBeenCalledOnce();
+      expect(await renderer.read(source(bytes, mime), 1024, signal)).toEqual({ unavailable: ImageThumbnailUnavailableReason.UNSUPPORTED });
+    }
+  });
+
+  it("applies orientation to decoded HEVC pixels and retires a real decoder on cancellation or invalid dimensions", async () => {
+    const request = { bytes: heifImageFixture("spectrum"), width: 451, height: 461, maximumPixels: 64 * 1024 * 1024,
+      maximumDimension: 16_384, maximumOutputBytes: 700 * 1024 };
+    const normal = await readHeifFileThumbnail(request, new AbortController().signal);
+    const rotated = await readHeifFileThumbnail({ ...request, orientation: 6 }, new AbortController().signal);
+    expect(rotated).toMatchObject({ widthPixels: 256, heightPixels: 250 });
+    const expected = await sharp(normal.data).rotate(90).removeAlpha().raw().toBuffer();
+    const actual = await sharp(rotated.data).removeAlpha().raw().toBuffer();
+    expect(actual.length).toBe(expected.length);
+    expect(actual.reduce((sum, pixel, i) => sum + Math.abs(pixel - expected[i]!), 0) / actual.length).toBeLessThan(3);
+    await expect(readHeifFileThumbnail({ ...request, width: 16_385 }, new AbortController().signal)).rejects.toThrow(/could not be decoded/u);
+    await expect(readHeifFileThumbnail({ ...request, bytes: Uint8Array.of(0) }, new AbortController().signal)).rejects.toThrow(/could not be decoded/u);
+    const controller = new AbortController(); const cancelled = readHeifFileThumbnail(request, controller.signal);
+    const rejection = expect(cancelled).rejects.toThrow(); controller.abort(); await rejection;
+  });
+
   it("uses a static first frame for File256 GIF, animated WebP/APNG and multi-page TIFF, with decoded raster AVIF support", async () => {
     const signal = new AbortController().signal;
     const frame = (pixel: number) => [33, 249, 4, 0, 10, 0, 0, 0, 44, 0, 0, 0, 0, 1, 0, 1, 0, 0, 2, 2, pixel, 1, 0];

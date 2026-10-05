@@ -36,5 +36,5 @@
     { "path": "../../packages/voice-input" },
     { "path": "../../packages/worktree" }
   ],
-  "include": ["src/**/*.ts"]
+  "include": ["src/**/*.ts", "src/**/*.mts"]
 }

@@ -3,6 +3,7 @@ import sharp from "sharp";
 import { fileTypeFromBuffer } from "file-type";
 import { ImageThumbnailUnavailableReason, type ImageThumbnail } from "@joko/contracts";
 import type { ArtifactRecord, ArtifactStore } from "./artifact-store.js";
+import { readHeifFileThumbnail } from "./image-heif-thumbnail.js";
 
 export const IMAGE_THUMBNAIL_MAXIMUM_BYTES = 700 * 1_024;
 const maximumInputBytes = 48 * 1_024 * 1_024;
@@ -72,6 +73,14 @@ export class ImageThumbnailRenderer {
     if (!mimeMatches || !metadata.width || !metadata.height || !fileThumbnail && (metadata.pages ?? 1) !== 1
       || metadata.width > 16_384 || metadata.height > 16_384 || metadata.width * metadata.height > maximumPixels) {
       return { unavailable: ImageThumbnailUnavailableReason.UNSUPPORTED };
+    }
+    if (fileThumbnail && (source.mimeType === "image/heic" || source.mimeType === "image/heif") && metadata.compression === "hevc") {
+      const output = await readHeifFileThumbnail({ bytes: input.data, width: metadata.width, height: metadata.height,
+        ...(metadata.orientation ? { orientation: metadata.orientation } : {}), maximumPixels, maximumDimension: 16_384,
+        maximumOutputBytes: IMAGE_THUMBNAIL_MAXIMUM_BYTES }, signal);
+      signal.throwIfAborted();
+      return { thumbnail: { ...output, mediaType: "image/webp", sha256Hex: digest(output.data),
+        sourceWidthPixels: metadata.width, sourceHeightPixels: metadata.height } };
     }
     const output = await decoder.rotate().resize({ width: edge, height: edge, fit: "inside", withoutEnlargement: true }).webp({ quality: fileThumbnail ? 70 : 80 }).toBuffer({ resolveWithObject: true });
     signal.throwIfAborted();
