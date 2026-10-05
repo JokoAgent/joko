@@ -13,6 +13,7 @@ import {
 import { describe, expect, it } from "vitest";
 import {
   appendMobileSelectionQuote,
+  appendMobileFileSelectionQuote,
   appendPlainTextToMobileComposer,
   emptyMobileComposerDraft,
   insertMobileClipboardText,
@@ -31,6 +32,7 @@ import {
   normalizeMobileComposerDraft,
   plainTextMobileComposerDraft,
   recoverMobileComposerDraft,
+  restoreMobileComposerInput,
   reconcileMobileComposerText,
   removeMobileComposerAtom,
   updateMobilePastedTextAtom,
@@ -40,6 +42,37 @@ import {
 import { segmentMobileComposerRoutePaste } from "./mobile-composer-route-links";
 
 describe("mobile structured composer document", () => {
+  it("keeps file excerpts as separate quote atoms across editing, wire offsets and accepted-input recovery", () => {
+    const selected = appendMobileFileSelectionQuote(plainTextMobileComposerDraft("Before"), {
+      sourceSessionId: "task", sourcePath: "docs/README.md", text: "\n  selected 😀\r\nsecond\n"
+    }, "file-one").draft;
+    const mentioned = insertMobileSessionMention(selected, { start: selected.text.length, end: selected.text.length },
+      { sessionId: "other-task", displayText: "Other task" }, "mention").draft;
+    const atom = mentioned.atoms[0]!;
+    if (atom.kind !== "file-quote") throw new Error("Missing file excerpt");
+    expect(atom).toMatchObject({ kind: "file-quote", text: "  selected 😀\nsecond", sourcePath: "docs/README.md" });
+    expect(atom).not.toHaveProperty("sourceMessageId"); expect(atom).not.toHaveProperty("sourceEventId");
+    const input = mobileComposerInput(mentioned);
+    const body = input.parts[0]!.content.value as string;
+    expect(input.quotesEncoded).toBe(true);
+    expect(body).toBe("Before\n\n> <!-- joko-selection-quote -->\n>   selected 😀\n> second\n> — source: docs/README.md\n\n@Other task");
+    expect(body.slice(input.mentionRanges[0]!.start, input.mentionRanges[0]!.end)).toBe("@Other task");
+    const restored = restoreMobileComposerInput(input, { sessionId: "task", messageId: "user-one", eventId: "accepted-one" });
+    expect(restored.atoms[0]).toMatchObject({ kind: "file-quote", sourcePath: "docs/README.md", text: atom.text });
+    expect(mobileComposerInput(restored)).toEqual(input);
+    expect(removeMobileComposerAtom(mentioned, atom.atomId).draft.atoms).toEqual([]);
+    for (const sourcePath of ["../secret", "D:/private.txt", "docs/line\nother"]) {
+      expect(() => appendMobileFileSelectionQuote(selected, { sourceSessionId: "task", sourcePath, text: "excerpt" }, "invalid")).toThrow();
+    }
+    const literalFooter = create(InputContentSchema, { quotesEncoded: true,
+      parts: [{ content: { case: "text", value: `${mobileSelectionQuoteMarkerLine}\n> excerpt\n> — source: D:/private.txt` } }] });
+    const literalQuote = restoreMobileComposerInput(literalFooter, { sessionId: "task", messageId: "user", eventId: "accepted" });
+    expect(literalQuote.atoms[0]).toMatchObject({ kind: "quote", text: "excerpt\n— source: D:/private.txt" });
+    expect(mobileComposerInput(literalQuote)).toEqual(literalFooter);
+    expect(() => appendMobileFileSelectionQuote(selected, { sourceSessionId: "task", sourcePath: "readme.md", text: "x".repeat(4_001) }, "invalid")).toThrow();
+    expect(() => appendMobileFileSelectionQuote(selected, { sourceSessionId: "task", sourcePath: "readme.md", text: "\ud800" }, "invalid")).toThrow();
+    expect(() => normalizeMobileComposerDraft({ ...selected, atoms: [{ ...selected.atoms[0]!, sourceMessageId: "forged" } as never] })).toThrow(/file quote/u);
+  });
   it("serializes attachment-only image/file drafts in stable order and requires canonical uploaded identities", () => {
     const draft = normalizeMobileComposerDraft({
       text: "",

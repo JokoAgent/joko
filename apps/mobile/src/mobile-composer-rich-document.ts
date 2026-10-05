@@ -1,5 +1,6 @@
 import {
   normalizeMobileComposerDraft,
+  isMobileComposerQuoteAtom,
   type MobileComposerAtom,
   type MobileComposerDraft,
   type MobileComposerEditResult,
@@ -91,13 +92,13 @@ export function mobileComposerRichDocument(
         kind: atom.kind,
         token,
         label,
-        accessibilityLabel: atom.kind === "quote"
-          ? mobileMessage(locale, "composer.rich.quote")
+        accessibilityLabel: isMobileComposerQuoteAtom(atom)
+          ? label
           : atom.kind === "route-reference"
             ? mobileMessage(locale, atom.routeKind === "project" ? "composer.rich.projectLink"
               : atom.routeKind === "path" ? "composer.rich.workspacePath" : "composer.rich.taskLink", { name: label })
             : label,
-        block: atom.kind === "quote"
+        block: isMobileComposerQuoteAtom(atom)
       });
     }
     offset = occurrence.end;
@@ -356,6 +357,7 @@ export function mobileComposerRichAtomLabel(
   atom: MobileComposerAtom,
   locale: MobileSupportedLocale
 ): string {
+  if (atom.kind === "file-quote") return mobileMessage(locale, "files.preview.fileQuote");
   if (atom.kind === "quote") return mobileMessage(locale, "composer.rich.quote");
   if (atom.kind === "route-reference") return atom.displayText;
   let lines = atom.text.length === 0 ? 0 : 1;

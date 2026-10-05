@@ -52,12 +52,14 @@ describe("mobile Timeline preview artifacts", () => {
       artifactBlock("movie.mp4", "video/mp4", "Demo"),
       create(MessageBlockSchema, { content: { case: "text", value: "body" } }),
       artifactBlock("notes.pdf", "application/pdf", "Notes"),
-      artifactBlock("mesh.glb", "model/gltf-binary", "Mesh")
+      artifactBlock("mesh.glb", "model/gltf-binary", "Mesh"),
+      artifactBlock("page.html", "text/html", "Page")
     ]);
     expect(mobileTimelinePreviewArtifacts(event)).toMatchObject([
       { source: { kind: "timeline", contentIndex: 0 }, title: "Demo", mediaType: "video/mp4", previewKind: "media" },
       { source: { kind: "timeline", contentIndex: 2 }, title: "Notes", mediaType: "application/pdf", previewKind: "pdf" },
-      { source: { kind: "timeline", contentIndex: 3 }, title: "Mesh", mediaType: "model/gltf-binary", previewKind: "model" }
+      { source: { kind: "timeline", contentIndex: 3 }, title: "Mesh", mediaType: "model/gltf-binary", previewKind: "model" },
+      { source: { kind: "timeline", contentIndex: 4 }, title: "Page", mediaType: "text/html", previewKind: "text" }
     ]);
   });
 
@@ -65,14 +67,16 @@ describe("mobile Timeline preview artifacts", () => {
     const event = completedEvent([
       artifactBlock("archive.zip", "application/zip", "Archive"),
       artifactBlock("empty.txt", "text/plain", "Empty", { byteSize: 0n }),
-      artifactBlock("large.pdf", "application/pdf", "Large", { byteSize: 33_554_433n })
+      artifactBlock("large.pdf", "application/pdf", "Large", { byteSize: 33_554_433n }),
+      artifactBlock("large.html", "text/html", "Large page", { byteSize: 2_097_153n })
     ]);
     expect(mobileTimelineArtifacts(event)).toMatchObject([
       { source: { kind: "timeline", contentIndex: 0 }, title: "Archive", mediaType: "application/zip" },
       { source: { kind: "timeline", contentIndex: 1 }, title: "Empty", mediaType: "text/plain" },
-      { source: { kind: "timeline", contentIndex: 2 }, title: "Large", mediaType: "application/pdf" }
+      { source: { kind: "timeline", contentIndex: 2 }, title: "Large", mediaType: "application/pdf" },
+      { source: { kind: "timeline", contentIndex: 3 }, title: "Large page", mediaType: "text/html" }
     ]);
-    expect(mobileTimelinePreviewArtifacts(event)).toEqual([]);
+    expect(mobileTimelinePreviewArtifacts(event)).toMatchObject([{ title: "Empty", previewKind: "text", byteSize: 0n }]);
     const selected = mobileTimelineArtifacts(event)[0]!;
     expect(resolveMobileTimelineArtifact([event], selected)?.blob.fileName).toBe("archive.zip");
   });

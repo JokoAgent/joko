@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   appendMobileSelectionQuote,
+  appendMobileFileSelectionQuote,
   insertMobilePastedText,
   insertMobileSessionMention,
   markMobileComposerSlashCommand,
@@ -110,8 +111,9 @@ describe("mobile voice draft projection", () => {
     expect(mobileComposerDraftsEqual(restored!.draft, base)).toBe(true);
   });
 
-  it("keeps a quote block isolated while dictating after it and removes the boundary on rollback", () => {
-    const base = appendMobileSelectionQuote(plainTextMobileComposerDraft(""), {
+  it.each(["message", "file"])("keeps a %s quote block isolated while dictating after it and removes the boundary on rollback", (kind) => {
+    const base = kind === "file" ? appendMobileFileSelectionQuote(plainTextMobileComposerDraft(""), { sourceSessionId: "task", sourcePath: "file.md", text: "quoted" }, "quote").draft
+      : appendMobileSelectionQuote(plainTextMobileComposerDraft(""), {
       sourceSessionId: "task",
       sourceMessageId: "message",
       sourceEventId: "event",
@@ -126,7 +128,7 @@ describe("mobile voice draft projection", () => {
       false,
       "draft-one"
     );
-    expect(partial.draft?.text).toBe("⟦Quote from Assistant⟧\n\nanswer");
+    expect(partial.draft?.text).toBe(base.text + "\n\nanswer");
     expect(partial.context?.insertion.text).toBe("\n\nanswer");
     const updated = applyMobileVoiceTranscript(
       partial.draft!,
@@ -136,7 +138,7 @@ describe("mobile voice draft projection", () => {
       true,
       "draft-one"
     );
-    expect(updated.draft?.text).toBe("⟦Quote from Assistant⟧\n\nbetter answer");
+    expect(updated.draft?.text).toBe(base.text + "\n\nbetter answer");
     const restored = rollbackMobileVoiceTranscript(updated.draft!, updated.context!);
     expect(restored).toBeDefined();
     expect(mobileComposerDraftsEqual(restored!.draft, base)).toBe(true);

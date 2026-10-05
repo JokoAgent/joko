@@ -12,6 +12,7 @@ import {
   type WorkspaceSearchMatch
 } from "@joko/contracts";
 import type { MobileModelPreviewLease } from "./mobile-model-preview";
+import type { MobileFilesPreviewPager } from "./mobile-files-preview-pager";
 
 export type MobileFilesLocation =
   | { readonly kind: "workspace"; readonly path: string }
@@ -42,6 +43,7 @@ export type MobileFilesComposerResult = "attachment" | "reference";
 
 interface MobilePreviewBase {
   readonly title: string;
+  readonly fileName?: string;
   readonly sourceLabel: string;
   readonly mediaType: string;
   readonly byteSize: bigint;
@@ -54,6 +56,7 @@ export type MobileFilePreview =
     })
   | (MobilePreviewBase & {
       readonly kind: "text";
+      readonly workspaceEntry?: WorkspaceEntry;
       readonly text: string;
       readonly languageId: string;
       readonly startByte: bigint;
@@ -125,6 +128,7 @@ export interface MobileFilesState {
   readonly searchTotalFiles: number;
   readonly searchError?: string;
   readonly preview?: MobileFilePreview;
+  readonly previewPager?: MobileFilesPreviewPager;
   readonly watchStatus: "idle" | "watching" | "unavailable" | "error";
   readonly watchError?: string;
   readonly error?: string;

@@ -16,6 +16,9 @@ import {
 } from "@joko/contracts";
 import { MobileConnectionStage } from "./MobileConnectionStage";
 import { MobileFileTextPreview } from "./MobileFileTextPreview";
+import { useMobileFileTextActions } from "./use-mobile-file-text-actions";
+import { MobileFilesPreviewPager } from "./MobileFilesPreviewPager";
+import { mobileFilesPreviewCanSwipe, type MobileFilesPreviewPager as FilesPreviewPager } from "./mobile-files-preview-pager";
 import { MobileTimelineImage } from "./MobileTimelineImage";
 import { MobileImageGalleryPresenter } from "./mobile-image-gallery-presentation";
 import { MobileNativeIntentNotice } from "./MobileNativeIntentNotice";
@@ -5785,6 +5788,17 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
       onNativeActivityChange={(active) => { attachmentNativeActivityRef.current = active; }}
       onClose={imageGallery.close} onSave={imageGallery.save} />}
     <FilePreviewModal colors={colors} preview={state.timelinePreview} busy={false}
+      onQuoted={() => {
+        const identity = draftIdentityRef.current;
+        const saved = identity && mobileComposerDrafts.readSync(identity);
+        if (!saved) return;
+        const queue = queueEditRef.current;
+        if (queue) { const updated = { ...queue, stashedDraft: saved }; queueEditRef.current = updated; setQueueEdit(updated); }
+        else { composerDraftRef.current = saved; setDraft(saved); composerSelectionRef.current = { start: saved.text.length, end: saved.text.length }; setComposerSelection(composerSelectionRef.current); }
+        setTimelinePreviewSource(undefined); client.closeTimelinePreview();
+        setTimeout(() => { if (taskMountedRef.current && AppState.currentState === "active" && draftIdentityRef.current
+          && mobileComposerDraftIdentityKey(draftIdentityRef.current) === mobileComposerDraftIdentityKey(identity!)) composerInputRef.current?.focus(); }, 0);
+      }}
       sharing={fileShareBusy} shareProgress={fileShareProgress}
       onShare={timelinePreviewSource ? () => shareTimelineArtifact(timelinePreviewSource) : undefined}
       backLabel={mobileMessage(locale, "preview.taskTitle")}
@@ -5928,6 +5942,8 @@ function FilesScreen({ colors, state, locale, onBack, onAdded, initialSource }: 
   const authorityKey = client.filesAuthorityKey();
   const connected = state.status === "connected" && authorityKey !== undefined;
   const files = state.files;
+  const currentPreviewSource = files.previewPager?.pages[files.previewPager.index]?.source ?? previewSource;
+  const initialPagerSource = useRef<MobileFilesComposerSource | undefined>(undefined);
   const searching = query.trim().length > 0;
   const imageGallery = useMobileImageGallery(locale, () => {
     client.closeFiles();
@@ -5958,6 +5974,12 @@ function FilesScreen({ colors, state, locale, onBack, onAdded, initialSource }: 
     ? { profileId: state.activeProfileId, serverId: state.owner.server.serverId, workspaceId: files.workspace.workspaceId } : undefined,
   [state.activeProfileId, state.owner?.server?.serverId, files.workspace?.workspaceId]);
   const filesPreferences = useMemo(() => mobileFilesPreferences.get(preferenceScope), [preferenceRevision, preferenceScope]);
+  useEffect(() => {
+    if (!initialSource || initialPagerSource.current === initialSource || files.previewPager || !files.preview
+      || files.preview.kind === "loading" || files.status !== "ready") return;
+    initialPagerSource.current = initialSource;
+    void client.openFilesPreviewPager(initialSource, filesPreferences.sort).catch((error) => setLocalError(errorText(error)));
+  }, [initialSource, files.preview, files.previewPager, files.status, filesPreferences.sort]);
   const preferenceScopeKey = preferenceScope ? JSON.stringify(preferenceScope) : "";
   const preferenceScopeRef = useRef(preferenceScopeKey); preferenceScopeRef.current = preferenceScopeKey;
   const [preferenceFailed, setPreferenceFailed] = useState(false);
@@ -6018,14 +6040,13 @@ function FilesScreen({ colors, state, locale, onBack, onAdded, initialSource }: 
     client.closeFiles();
     onBack();
   };
-  const openPreview = (source: MobileFilesComposerSource, action: () => Promise<void>): void => {
+  const openPreview = (source: MobileFilesComposerSource): void => {
     if (handoffRef.current || filesBusy) return;
     setPreviewSource(source);
-    run(action);
+    run(() => client.openFilesPreviewPager(source, filesPreferences.sort));
   };
   const openResult = (result: MobileFileSearchResult): void => openPreview(
-    { kind: "search-result", result },
-    () => client.previewFileSearchResult(result)
+    { kind: "search-result", result }
   );
   const openGallery = (source: MobileFilesComposerSource): void => {
     if (handoffRef.current || galleryOpening || imageGallery.view) return;
@@ -6178,18 +6199,20 @@ function FilesScreen({ colors, state, locale, onBack, onAdded, initialSource }: 
         onOpen={(source) => {
           if (source.kind === "artifact") {
             if (mobileImageGalleryMediaType(source.artifact.blob?.mediaType ?? "")) openGallery(source);
-            else openPreview(source, () => client.previewArtifact(source.artifact));
+            else openPreview(source);
           } else if (source.kind === "workspace-entry") {
             if (source.entry.kind === FileKind.DIRECTORY) run(() => client.previewWorkspaceEntry(source.entry));
             else if (source.entry.kind === FileKind.REGULAR && mobileImageGalleryMediaType(source.entry.mediaType)) openGallery(source);
-            else openPreview(source, () => client.previewWorkspaceEntry(source.entry));
+            else openPreview(source);
           } else openResult(source.result);
         }} />}
     </View>
-    <FilePreviewModal colors={colors} preview={files.preview} source={previewSource} busy={handoffBusy} locale={locale}
+    <FilePreviewModal colors={colors} preview={files.preview} source={currentPreviewSource} pager={files.previewPager}
+      onQuoted={() => { setPreviewSource(undefined); client.closeFiles(); onAdded(); }}
+      onNavigate={(id, key) => run(() => client.selectFilesPreviewPage(id, key))} busy={handoffBusy} locale={locale}
       sharing={fileShareBusy} shareProgress={fileShareProgress}
-      onShare={previewSource && shareableMobileFilesSource(previewSource)
-        ? () => shareFile(previewSource) : undefined}
+      onShare={currentPreviewSource && shareableMobileFilesSource(currentPreviewSource)
+        ? () => shareFile(currentPreviewSource) : undefined}
       onAdd={addToComposer} onOpenImage={openGallery} onClose={() => {
         setPreviewSource(undefined);
         client.closeFilesPreview();
@@ -6255,12 +6278,14 @@ function FileSearchResultRow({ result, colors, locale, disabled, shareDisabled, 
   </View>;
 }
 
-function FilePreviewModal({ colors, preview, source, busy, sharing = false, shareProgress, backLabel,
+function FilePreviewModal({ colors, preview, source, pager, onNavigate, busy, sharing = false, shareProgress, backLabel,
   backAccessibilityLabel, loadingLabel, locale,
-  onAdd, onOpenImage, onShare, onClose }: {
+  onAdd, onOpenImage, onShare, onClose, onQuoted }: {
   colors: Colors;
   preview: MobileFilePreview | undefined;
   source?: MobileFilesComposerSource;
+  pager?: FilesPreviewPager;
+  onNavigate?: (pagerId: string, pageKey: string) => void;
   busy: boolean;
   sharing?: boolean;
   shareProgress?: MobileFileShareProgress;
@@ -6272,10 +6297,13 @@ function FilePreviewModal({ colors, preview, source, busy, sharing = false, shar
   onOpenImage?: (source: MobileFilesComposerSource) => void;
   onShare?: () => void;
   onClose: () => void;
+  onQuoted?: () => void;
 }) {
+  const textActions = useMobileFileTextActions({ client, preview, clipboard: filesClipboard, disabled: busy || sharing, onQuoted, locale });
   const [mediaStatus, setMediaStatus] = useState<MobileMediaPlayerStatus>();
   const [pdfStatus, setPdfStatus] = useState<MobilePdfViewerStatus>();
   const [modelStatus, setModelStatus] = useState<MobileModelViewerStatus>();
+  const [textView, setTextView] = useState<{ identity: string; view: "rendered" | "source" }>();
   const closeRequestedForRef = useRef<string | undefined>(undefined);
   const exactBackLabel = backLabel ?? mobileMessage(locale, "preview.filesTitle");
   const exactLoadingLabel = loadingLabel ?? mobileMessage(locale, "preview.loadingExact");
@@ -6285,8 +6313,12 @@ function FilePreviewModal({ colors, preview, source, busy, sharing = false, shar
   useEffect(() => setMediaStatus(undefined), [mediaLeaseId]);
   useEffect(() => setPdfStatus(undefined), [pdfLeaseId]);
   useEffect(() => setModelStatus(undefined), [modelLeaseId]);
-  const blocked = busy || sharing;
-  const previewIdentity = preview ? `${preview.kind}\u0000${preview.revisionKey}` : undefined;
+  const blocked = busy || sharing || textActions.busy;
+  const previewIdentity = preview ? JSON.stringify([preview.kind, preview.sourceLabel, preview.revisionKey]) : undefined;
+  const currentPreviewIdentity = useRef(previewIdentity); currentPreviewIdentity.current = previewIdentity;
+  const onTextViewChange = useCallback((view: "rendered" | "source") => {
+    if (previewIdentity && currentPreviewIdentity.current === previewIdentity) setTextView({ identity: previewIdentity, view });
+  }, [previewIdentity]);
   useEffect(() => {
     if (previewIdentity === undefined) closeRequestedForRef.current = undefined;
   }, [previewIdentity]);
@@ -6314,6 +6346,7 @@ function FilePreviewModal({ colors, preview, source, busy, sharing = false, shar
           {onShare && <Action label={sharing ? mobileMessage(locale, "preview.sharing") : mobileMessage(locale, "common.share")}
             accessibilityLabel={mobileMessage(locale, "preview.shareTitle", { title: preview.title })} compact colors={colors}
             disabled={blocked || preview.kind === "loading"} onPress={onShare} />}
+          {pager && <Action label={mobileMessage(locale, "files.preview.done")} compact colors={colors} disabled={blocked} onPress={requestClose} />}
         </View>
         {busy && <View accessibilityLiveRegion="polite" style={[styles.connectionNotice, { backgroundColor: colors.surface, borderColor: colors.border }]}>
           <ActivityIndicator color={colors.accent} />
@@ -6323,6 +6356,11 @@ function FilePreviewModal({ colors, preview, source, busy, sharing = false, shar
           <ActivityIndicator color={colors.accent} />
           <Text style={[styles.caption, styles.fill, { color: colors.muted }]}>{formatMobileFileShareProgress(shareProgress, locale)}</Text>
         </View>}
+        {(textActions.error || textActions.copyResult || textActions.busy) && <Text accessibilityRole={textActions.error ? "alert" : "text"} accessibilityLiveRegion="polite"
+          style={[styles.caption, { padding: 12, color: textActions.error ? colors.negative : colors.muted }]}>{textActions.error || mobileMessage(locale,
+            textActions.busy ? textActions.quoting ? "preview.adding" : "files.presentation.copying" : textActions.copyResult === "copied" ? "files.presentation.copied"
+              : textActions.copyResult === "unknown" ? "files.presentation.copyUnknown" : textActions.copyResult === "busy" ? "files.presentation.copyBusy" : "files.presentation.copyFailed")}</Text>}
+        {textActions.busy && <Action label={mobileMessage(locale, "common.cancel")} colors={colors} onPress={textActions.cancel} />}
         <View style={[styles.previewMetadata, { borderColor: colors.border, backgroundColor: colors.surface }]}>
           <Text selectable style={[styles.caption, { color: colors.muted }]}>{preview.mediaType} · {formatByteSize(preview.byteSize)}</Text>
           {preview.kind === "text" && <Text style={[styles.caption, { color: colors.muted }]}>
@@ -6349,6 +6387,8 @@ function FilePreviewModal({ colors, preview, source, busy, sharing = false, shar
             {formatMobileModelViewerStatus(modelStatus, locale)}
           </Text>}
         </View>
+        <MobileFilesPreviewPager pager={pager} colors={colors} locale={locale} disabled={blocked} onNavigate={onNavigate}
+          canSwipe={mobileFilesPreviewCanSwipe(preview, textView?.identity === previewIdentity && textView?.view === "source")}>
         {preview.kind === "loading" ? <Centered label={exactLoadingLabel} colors={colors} />
           : preview.kind === "image" ? <ScrollView style={styles.fill} contentContainerStyle={styles.imagePreviewContainer}>
             <Image source={{ uri: preview.dataUri }} accessibilityLabel={preview.altText} resizeMode="contain" style={styles.imagePreview} />
@@ -6413,13 +6453,14 @@ function FilePreviewModal({ colors, preview, source, busy, sharing = false, shar
             />
           </View>
           : preview.kind === "text" ? <MobileFileTextPreview key={preview.revisionKey + "/" + preview.focusLine + "/" + preview.focusColumn}
-            preview={preview} locale={locale} colors={colors} />
+            preview={preview} locale={locale} colors={colors} client={client} onViewChange={onTextViewChange} actions={{ ...textActions, busy: blocked || !textActions.available }} />
           : <View style={styles.previewMessage}>
             <Text accessibilityRole="alert" style={[styles.label, { color: preview.kind === "error" ? colors.negative : colors.ink }]}>
               {mobileMessage(locale, preview.kind === "error" ? "preview.unavailable" : "preview.noInApp")}
             </Text>
             <Text selectable style={[styles.description, { color: colors.muted }]}>{preview.reason}</Text>
           </View>}
+        </MobileFilesPreviewPager>
       </>}
     </SafeAreaView>
   </Modal>;
@@ -6632,7 +6673,7 @@ function MobileComposerAtomChips({ atoms, colors, locale, disabled, onOpen }: {
     accessibilityLabel={mobileMessage(locale, "composer.atoms.title")} contentContainerStyle={styles.mentionChips}
     showsHorizontalScrollIndicator={false}>
     {atoms.map((atom) => {
-      const action = atom.kind === "quote" ? mobileMessage(locale, "composer.atoms.viewQuote")
+      const action = atom.kind === "quote" || atom.kind === "file-quote" ? mobileMessage(locale, "composer.atoms.viewQuote")
         : atom.kind === "route-reference" ? mobileMessage(locale, "composer.atoms.viewKind", {
           kind: mobileMessage(locale, atom.routeKind === "project" ? "composer.atoms.projectLink"
             : atom.routeKind === "path" ? "composer.atoms.workspacePath" : "composer.atoms.taskLink")

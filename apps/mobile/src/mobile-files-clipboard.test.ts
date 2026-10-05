@@ -10,6 +10,16 @@ function lease() {
   return { value, retire: () => { current = false; } };
 }
 describe("native Files clipboard effect ownership", () => {
+  it("binds source-copy cancellation to its dispatched native write and keeps the unknown writer occupied", async () => {
+    let finish!: (value: boolean) => void; const write = vi.fn(() => new Promise<boolean>((resolve) => { finish = resolve; }));
+    const clipboard = new MobileFilesClipboard(write); const cancelled = new AbortController(); cancelled.abort();
+    expect(await clipboard.copy(lease().value, cancelled.signal)).toBe("retired"); expect(write).not.toHaveBeenCalled();
+    const owner = new AbortController(); const pending = clipboard.copy({ ...lease().value, text: "\uFEFFline\r\nnext", kind: "source" }, owner.signal);
+    expect(write).toHaveBeenCalledWith("\uFEFFline\r\nnext"); owner.abort(); expect(await pending).toBe("retired");
+    expect(await clipboard.copy(lease().value)).toBe("busy"); finish(true); await Promise.resolve(); await Promise.resolve();
+    const otherOwner = new AbortController(); const newer = clipboard.copy(lease().value, otherOwner.signal);
+    owner.abort(); finish(true); expect(await newer).toBe("copied");
+  });
   it("refuses stale dispatch, prevents duplicate writes and retains a cancelled native slot without adopting a late result", async () => {
     let finish!: (saved: boolean) => void; const write = vi.fn(() => new Promise<boolean>((resolve) => { finish = resolve; }));
     const copy = new MobileFilesClipboard(write); const stale = lease(); stale.retire(); expect(await copy.copy(stale.value)).toBe("retired"); expect(write).not.toHaveBeenCalled();

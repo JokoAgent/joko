@@ -100,6 +100,17 @@ export interface MobileComposerQuoteAtom {
   readonly end: number;
 }
 
+/** A copied file excerpt is quoted data, without message or file access authority. */
+export interface MobileComposerFileQuoteAtom {
+  readonly kind: "file-quote";
+  readonly atomId: string;
+  readonly sourceSessionId: string;
+  readonly sourcePath: string;
+  readonly text: string;
+  readonly start: number;
+  readonly end: number;
+}
+
 export interface MobileComposerPastedTextAtom {
   readonly kind: "pasted-text";
   readonly atomId: string;
@@ -143,8 +154,13 @@ export type MobileComposerRouteReferenceAtom = MobileComposerSessionRouteReferen
   | MobileComposerPathRouteReferenceAtom;
 
 export type MobileComposerAtom = MobileComposerQuoteAtom
+  | MobileComposerFileQuoteAtom
   | MobileComposerPastedTextAtom
   | MobileComposerRouteReferenceAtom;
+
+export function isMobileComposerQuoteAtom(atom: MobileComposerAtom | undefined): atom is MobileComposerQuoteAtom | MobileComposerFileQuoteAtom {
+  return atom?.kind === "quote" || atom?.kind === "file-quote";
+}
 
 export interface MobileComposerSlashCommandMark {
   /** Exact local presentation text selected from the current-task command palette. */
@@ -177,6 +193,7 @@ export interface MobileComposerRoutePasteResult extends MobileComposerEditResult
 
 type MobileComposerAtomPresentation =
   | Pick<MobileComposerQuoteAtom, "kind" | "text">
+  | Pick<MobileComposerFileQuoteAtom, "kind" | "text" | "sourcePath">
   | Pick<MobileComposerPastedTextAtom, "kind" | "text">
   | Pick<MobileComposerRouteReferenceAtom, "kind" | "serialized" | "displayText">;
 
@@ -187,6 +204,7 @@ type MobileComposerRouteReferenceAtomSeed =
 
 type MobileComposerAtomSeed =
   | Omit<MobileComposerQuoteAtom, "atomId" | "start" | "end">
+  | Omit<MobileComposerFileQuoteAtom, "atomId" | "start" | "end">
   | Omit<MobileComposerPastedTextAtom, "atomId" | "start" | "end">
   | MobileComposerRouteReferenceAtomSeed;
 
@@ -234,7 +252,7 @@ export function normalizeMobileComposerDraft(value: MobileComposerDraft): Mobile
   if (value.slashCommands.length > maximumSlashCommandMarks) {
     throw new Error(`A task message can contain at most ${maximumSlashCommandMarks} selected slash commands.`);
   }
-  if (value.atoms.filter((atom) => atom?.kind === "quote").length > maximumSelectionQuotes) {
+  if (value.atoms.filter(isMobileComposerQuoteAtom).length > maximumSelectionQuotes) {
     throw new Error(`A task message can contain at most ${maximumSelectionQuotes} selected-text quotes.`);
   }
   const mentionIds = new Set<string>();
@@ -274,7 +292,7 @@ export function normalizeMobileComposerDraft(value: MobileComposerDraft): Mobile
   previousEnd = 0;
   const atoms = value.atoms.map((candidate) => {
     if (!candidate || typeof candidate !== "object"
-      || (candidate.kind !== "quote" && candidate.kind !== "pasted-text" && candidate.kind !== "route-reference")) {
+      || (candidate.kind !== "quote" && candidate.kind !== "file-quote" && candidate.kind !== "pasted-text" && candidate.kind !== "route-reference")) {
       throw new Error("The local Joko composer atom is invalid.");
     }
     assertIdentity(candidate.atomId, "composer atom occurrence");
@@ -282,6 +300,8 @@ export function normalizeMobileComposerDraft(value: MobileComposerDraft): Mobile
     atomIds.add(candidate.atomId);
     const normalized = candidate.kind === "quote"
       ? normalizeQuoteAtom(candidate)
+      : candidate.kind === "file-quote"
+        ? normalizeFileQuoteAtom(candidate)
       : candidate.kind === "pasted-text"
         ? normalizePastedTextAtom(candidate)
         : normalizeRouteReferenceAtom(candidate);
@@ -296,7 +316,7 @@ export function normalizeMobileComposerDraft(value: MobileComposerDraft): Mobile
     return { ...normalized, atomId: candidate.atomId, start: candidate.start, end: candidate.end };
   });
   for (const atom of atoms) {
-    if (atom.kind !== "quote") continue;
+    if (!isMobileComposerQuoteAtom(atom)) continue;
     const separatedBefore = atom.start === 0 || value.text.slice(atom.start - 2, atom.start) === "\n\n";
     const separatedAfter = atom.end === value.text.length || value.text.slice(atom.end, atom.end + 2) === "\n\n";
     if (!separatedBefore || !separatedAfter) {
@@ -391,6 +411,7 @@ export function mobileWorkspaceMentionToken(input: {
 }
 
 export function mobileComposerAtomToken(atom: MobileComposerAtomPresentation): string {
+  if (atom.kind === "file-quote") return "⟦Quote from File⟧";
   if (atom.kind === "quote") return "⟦Quote from Assistant⟧";
   if (atom.kind === "route-reference") return atom.serialized;
   const lines = mobilePastedTextLineCount(atom.text);
@@ -398,6 +419,7 @@ export function mobileComposerAtomToken(atom: MobileComposerAtomPresentation): s
 }
 
 export function mobileComposerAtomLabel(atom: MobileComposerAtomPresentation): string {
+  if (atom.kind === "file-quote") return "Quote from File";
   if (atom.kind === "quote") return "Quote from Assistant";
   return atom.kind === "route-reference" ? atom.displayText : mobileComposerAtomToken(atom).slice(1, -1);
 }
@@ -434,7 +456,7 @@ export function reconcileMobileComposerText(
     || !isUtf16Boundary(nextText, nextText.length - suffix))) suffix -= 1;
   const oldEnd = current.text.length - suffix;
   const inserted = nextText.slice(prefix, nextText.length - suffix);
-  const quoteBefore = current.atoms.find((atom) => atom.kind === "quote" && atom.end === prefix);
+  const quoteBefore = current.atoms.find((atom) => isMobileComposerQuoteAtom(atom) && atom.end === prefix);
   if (inserted && oldEnd === prefix && quoteBefore && quoteBefore.end === current.text.length) {
     if (atomId !== undefined && isLongMobileComposerPaste(inserted)) {
       const separated = replaceMobileComposerRange(current, { start: prefix, end: oldEnd }, "\n\n");
@@ -442,7 +464,7 @@ export function reconcileMobileComposerText(
     }
     return replaceMobileComposerRange(current, { start: prefix, end: oldEnd }, `\n\n${inserted}`);
   }
-  const quoteAfter = current.atoms.find((atom) => atom.kind === "quote" && atom.start === prefix);
+  const quoteAfter = current.atoms.find((atom) => isMobileComposerQuoteAtom(atom) && atom.start === prefix);
   if (inserted && oldEnd === prefix && quoteAfter && quoteAfter.start === 0) {
     if (atomId !== undefined && isLongMobileComposerPaste(inserted)) {
       const separated = replaceMobileComposerRange(current, { start: prefix, end: oldEnd }, "\n\n");
@@ -589,6 +611,20 @@ export function appendMobileSelectionQuote(
   );
 }
 
+export function appendMobileFileSelectionQuote(
+  draft: MobileComposerDraft,
+  quote: { readonly sourceSessionId: string; readonly sourcePath: string; readonly text: string },
+  atomId: string
+): MobileComposerEditResult {
+  const current = normalizeMobileComposerDraft(draft);
+  assertIdentity(atomId, "composer atom occurrence");
+  const text = normalizedSelectionQuoteText(quote.text);
+  if (text === undefined || text.length > mobileSelectionQuoteMaximumCharacters) throw new Error("Select non-empty file text of at most 4,000 characters.");
+  const atom = normalizeFileQuoteAtom({ kind: "file-quote", ...quote, text, atomId, start: 0, end: 0 });
+  return insertMobileComposerAtom(current, { start: current.text.length, end: current.text.length },
+    { ...atom, atomId }, current.text.length ? "\n\n" : "", "");
+}
+
 export function insertMobileClipboardText(
   draft: MobileComposerDraft,
   selection: MobileComposerSelection,
@@ -602,11 +638,11 @@ export function insertMobileClipboardText(
   if (isLongMobileComposerPaste(text)) return insertMobilePastedText(draft, selection, text, atomId);
   const current = normalizeMobileComposerDraft(draft);
   const range = expandedAtomicRange(current, normalizeSelection(selection, current.text));
-  const quoteBefore = current.atoms.find((atom) => atom.kind === "quote" && atom.end === range.start);
+  const quoteBefore = current.atoms.find((atom) => isMobileComposerQuoteAtom(atom) && atom.end === range.start);
   if (range.start === range.end && quoteBefore?.end === current.text.length) {
     return replaceMobileComposerRange(current, range, `\n\n${text}`);
   }
-  const quoteAfter = current.atoms.find((atom) => atom.kind === "quote" && atom.start === range.end);
+  const quoteAfter = current.atoms.find((atom) => isMobileComposerQuoteAtom(atom) && atom.start === range.end);
   if (range.start === range.end && quoteAfter?.start === 0) {
     return replaceMobileComposerRange(current, range, `${text}\n\n`);
   }
@@ -639,8 +675,8 @@ export function insertMobileRouteReferencePaste(
     throw new Error("The clipboard does not contain a Joko link or validated Workspace path.");
   }
   const range = expandedAtomicRange(current, normalizeSelection(selection, current.text));
-  const quoteBefore = current.atoms.find((atom) => atom.kind === "quote" && atom.end === range.start);
-  const quoteAfter = current.atoms.find((atom) => atom.kind === "quote" && atom.start === range.end);
+  const quoteBefore = current.atoms.find((atom) => isMobileComposerQuoteAtom(atom) && atom.end === range.start);
+  const quoteAfter = current.atoms.find((atom) => isMobileComposerQuoteAtom(atom) && atom.start === range.end);
   const prefix = range.start === range.end && quoteBefore?.end === current.text.length ? "\n\n" : "";
   const suffix = range.start === range.end && quoteAfter?.start === 0 ? "\n\n" : "";
   const replacement: string[] = [prefix];
@@ -751,8 +787,8 @@ export function insertMobilePastedText(
   assertIdentity(atomId, "composer atom occurrence");
   const atom = normalizePastedTextAtom({ kind: "pasted-text", atomId, text, start: 0, end: 0 });
   const range = expandedAtomicRange(current, normalizeSelection(selection, current.text));
-  const quoteBefore = current.atoms.find((candidate) => candidate.kind === "quote" && candidate.end === range.start);
-  const quoteAfter = current.atoms.find((candidate) => candidate.kind === "quote" && candidate.start === range.end);
+  const quoteBefore = current.atoms.find((candidate) => isMobileComposerQuoteAtom(candidate) && candidate.end === range.start);
+  const quoteAfter = current.atoms.find((candidate) => isMobileComposerQuoteAtom(candidate) && candidate.start === range.end);
   const prefix = range.start === range.end && quoteBefore?.end === current.text.length ? "\n\n" : "";
   const suffix = range.start === range.end && quoteAfter?.start === 0 ? "\n\n" : "";
   return insertMobileComposerAtom(current, range, { ...atom, atomId }, prefix, suffix);
@@ -777,7 +813,7 @@ export function removeMobileComposerAtom(
   const current = normalizeMobileComposerDraft(draft);
   const atom = current.atoms.find((candidate) => candidate.atomId === atomId);
   if (!atom) throw new Error("The selected structured message item is no longer in this draft.");
-  if (atom.kind !== "quote") return replaceMobileComposerRange(current, { start: atom.start, end: atom.end }, "");
+  if (!isMobileComposerQuoteAtom(atom)) return replaceMobileComposerRange(current, { start: atom.start, end: atom.end }, "");
   const range = atom.start >= 2 && current.text.slice(atom.start - 2, atom.start) === "\n\n"
     ? { start: atom.start - 2, end: atom.end }
     : atom.end + 2 <= current.text.length && current.text.slice(atom.end, atom.end + 2) === "\n\n"
@@ -954,7 +990,7 @@ export function mobileComposerInput(draft: MobileComposerDraft): InputContent {
       )),
       ...exact.mentions.map(mobileComposerInputPart)
     ],
-    quotesEncoded: exact.atoms.some((atom) => atom.kind === "quote"),
+    quotesEncoded: exact.atoms.some(isMobileComposerQuoteAtom),
     pastedTextRanges: serialized.pastedTextRanges.map((range) => create(InlineTextRangeSchema, range)),
     mentionRanges: exact.mentions.map((mention, mentionIndex) => create(InputMentionRangeSchema, {
       start: projectComposerOffset(mention.start, exact.atoms),
@@ -978,7 +1014,7 @@ export function restoreMobileComposerInput(input: InputContent, source: {
     throw new Error("The historical task input has invalid reference or paste ranges.");
   }
   type Segment = { start: number; end: number; kind: "mention"; index: number }
-    | { start: number; end: number; kind: "paste" | "quote"; text: string };
+    | { start: number; end: number; kind: "paste" | "quote"; text: string; sourcePath?: string };
   const segments: Segment[] = [
     ...input.mentionRanges.map((range): Segment => ({ start: range.start, end: range.end, kind: "mention", index: range.mentionIndex })),
     ...input.pastedTextRanges.map((range): Segment => ({ start: range.start, end: range.end, kind: "paste", text: wireText.slice(range.start, range.end) }))
@@ -1003,7 +1039,11 @@ export function restoreMobileComposerInput(input: InputContent, source: {
       if (quoted.length === 0 || segments.some((segment) => start < segment.end && end > segment.start)) {
         throw new Error("The historical quote overlaps another input item or has no quoted text.");
       }
-      segments.push({ start, end, kind: "quote", text: quoted.join("\n") });
+      const footer = quoted.at(-1)?.match(/^— source: (.+)$/u);
+      let sourcePath: string | undefined;
+      if (footer) { try { sourcePath = normalizeFileQuoteSourcePath(footer[1]!); } catch { /* Unrecognized footers remain quoted text. */ } }
+      if (sourcePath && quoted.length > 1) quoted.pop(); else sourcePath = undefined;
+      segments.push({ start, end, kind: "quote", text: quoted.join("\n"), ...(sourcePath ? { sourcePath } : {}) });
     }
   }
   segments.sort((left, right) => left.start - right.start);
@@ -1037,8 +1077,10 @@ export function restoreMobileComposerInput(input: InputContent, source: {
       mentions.push({ ...seed, mentionId: `restored-mention-${segment.index}`, start, end: text.length } as MobileComposerMention);
       restored.add(segment.index);
     } else {
-      const seed = segment.kind === "quote" ? { kind: "quote" as const, text: segment.text, sourceRole: "user" as const,
-        sourceSessionId: source.sessionId, sourceMessageId: source.messageId, sourceEventId: source.eventId }
+      const seed = segment.kind === "quote" ? segment.sourcePath
+        ? { kind: "file-quote" as const, text: segment.text, sourceSessionId: source.sessionId, sourcePath: segment.sourcePath }
+        : { kind: "quote" as const, text: segment.text, sourceRole: "user" as const,
+          sourceSessionId: source.sessionId, sourceMessageId: source.messageId, sourceEventId: source.eventId }
         : { kind: "pasted-text" as const, text: segment.text };
       text += mobileComposerAtomToken(seed);
       atoms.push({ ...seed, atomId: `restored-${segment.kind}-${atoms.length}`, start, end: text.length });
@@ -1048,7 +1090,7 @@ export function restoreMobileComposerInput(input: InputContent, source: {
   text += wireText.slice(cursor);
   parts.forEach((_part, index) => {
     if (restored.has(index)) return;
-    if (text.length) text += atoms.some((atom) => atom.kind === "quote" && atom.end === text.length) ? "\n\n" : "\n";
+    if (text.length) text += atoms.some((atom) => isMobileComposerQuoteAtom(atom) && atom.end === text.length) ? "\n\n" : "\n";
     const seed = mentionSeed(index); const start = text.length;
     text += mobileComposerMentionToken(seed);
     mentions.push({ ...seed, mentionId: `restored-mention-${index}`, start, end: text.length } as MobileComposerMention);
@@ -1156,8 +1198,8 @@ function insertMobileComposerMention(
   mention: MobileComposerMention
 ): MobileComposerEditResult {
   const token = mobileComposerMentionToken(mention);
-  const quoteBefore = draft.atoms.find((atom) => atom.kind === "quote" && atom.end === range.start);
-  const quoteAfter = draft.atoms.find((atom) => atom.kind === "quote" && atom.start === range.end);
+  const quoteBefore = draft.atoms.find((atom) => isMobileComposerQuoteAtom(atom) && atom.end === range.start);
+  const quoteAfter = draft.atoms.find((atom) => isMobileComposerQuoteAtom(atom) && atom.start === range.end);
   const prefix = range.start === range.end && quoteBefore?.end === draft.text.length
     ? "\n\n"
     : range.start > 0 && !/\s/u.test(draft.text[range.start - 1] ?? "") ? " " : "";
@@ -1239,6 +1281,23 @@ function normalizeQuoteAtom(
     sourceRole: atom.sourceRole,
     text
   };
+}
+
+function normalizeFileQuoteAtom(atom: MobileComposerFileQuoteAtom): Omit<MobileComposerFileQuoteAtom, "atomId" | "start" | "end"> {
+  const text = normalizedSelectionQuoteText(atom.text);
+  const sourcePath = normalizeFileQuoteSourcePath(atom.sourcePath);
+  if (text === undefined || text !== atom.text || text.length > mobileSelectionQuoteMaximumCharacters
+    || /[\uD800-\uDFFF]/u.test(text)
+    || Object.hasOwn(atom, "sourceMessageId") || Object.hasOwn(atom, "sourceEventId") || Object.hasOwn(atom, "sourceRole")) {
+    throw new Error("The local Joko file quote is invalid.");
+  }
+  return { kind: "file-quote", text, sourcePath, sourceSessionId: normalizeExactIdentity(atom.sourceSessionId, "quote source task", 1_024) };
+}
+
+function normalizeFileQuoteSourcePath(value: string): string {
+  const path = canonicalWorkspacePath(value);
+  if (path !== value || path.length > 4_096 || /^[a-z]:/iu.test(path)) throw new Error("The local Joko file quote source is invalid.");
+  return path;
 }
 
 function normalizePastedTextAtom(
@@ -1340,8 +1399,8 @@ function serializeMobileComposerText(draft: MobileComposerDraft): MobileSerializ
   const pastedTextRanges: { start: number; end: number; display: string }[] = [];
   for (const atom of draft.atoms) {
     text += draft.text.slice(cursor, atom.start);
-    if (atom.kind === "quote") {
-      text += mobileSelectionQuoteText(atom.text);
+    if (isMobileComposerQuoteAtom(atom)) {
+      text += mobileSelectionQuoteText(atom.text, atom.kind === "file-quote" ? atom.sourcePath : undefined);
     } else if (atom.kind === "pasted-text") {
       const start = text.length;
       text += atom.text;
@@ -1358,10 +1417,11 @@ function serializeMobileComposerText(draft: MobileComposerDraft): MobileSerializ
   return { text, pastedTextRanges };
 }
 
-function mobileSelectionQuoteText(text: string): string {
+function mobileSelectionQuoteText(text: string, sourcePath?: string): string {
   return [
     mobileSelectionQuoteMarkerLine,
-    ...text.split("\n").map((line) => line === "" ? ">" : `> ${line}`)
+    ...text.split("\n").map((line) => line === "" ? ">" : `> ${line}`),
+    ...(sourcePath ? [`> — source: ${sourcePath}`] : [])
   ].join("\n");
 }
 
@@ -1370,8 +1430,8 @@ function projectComposerOffset(offset: number, atoms: readonly MobileComposerAto
   for (const atom of atoms) {
     if (offset <= atom.start) break;
     if (offset < atom.end) throw new Error("A Joko reference offset cannot be inside a composer atom.");
-    const serializedLength = atom.kind === "quote"
-      ? mobileSelectionQuoteText(atom.text).length
+    const serializedLength = isMobileComposerQuoteAtom(atom)
+      ? mobileSelectionQuoteText(atom.text, atom.kind === "file-quote" ? atom.sourcePath : undefined).length
       : atom.kind === "pasted-text" ? atom.text.length : atom.serialized.length;
     projected += serializedLength - (atom.end - atom.start);
   }
@@ -1577,6 +1637,8 @@ function sameMentionAuthority(left: MobileComposerMention, right: MobileComposer
 function sameComposerAtomAuthority(left: MobileComposerAtom, right: MobileComposerAtom): boolean {
   if (left.kind !== right.kind) return false;
   if (left.kind === "pasted-text") return right.kind === "pasted-text" && left.text === right.text;
+  if (left.kind === "file-quote") return right.kind === "file-quote" && left.text === right.text
+    && left.sourceSessionId === right.sourceSessionId && left.sourcePath === right.sourcePath;
   if (left.kind === "quote") {
     return right.kind === "quote" && left.text === right.text
       && left.sourceSessionId === right.sourceSessionId

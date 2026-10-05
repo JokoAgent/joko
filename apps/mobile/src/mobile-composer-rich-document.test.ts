@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   appendMobileSelectionQuote,
+  appendMobileFileSelectionQuote,
   emptyMobileComposerDraft,
   insertMobileClipboardText,
   insertMobileRouteReferencePaste,
@@ -17,6 +18,18 @@ import {
   mobileComposerRichDocument,
   reconcileMobileComposerRichDocument
 } from "./mobile-composer-rich-document";
+
+it("presents a file excerpt as an atomic quote block and retires its identity when the editor removes it", () => {
+  const draft = appendMobileFileSelectionQuote(plainTextMobileComposerDraft("Before"), {
+    sourceSessionId: "task", sourcePath: "docs/file.md", text: "selected"
+  }, "excerpt").draft;
+  const document = mobileComposerRichDocument(draft, "zh-CN");
+  const occurrence = document.nodes.find((node) => node.type === "occurrence")!;
+  expect(occurrence).toMatchObject({ kind: "file-quote", block: true, label: "文件引文" });
+  expect(JSON.stringify(document)).not.toContain("docs/file.md"); expect(JSON.stringify(document)).not.toContain("selected");
+  const changed = reconcileMobileComposerRichDocument(draft, [{ type: "text", text: "Before" }], { start: 6, end: 6 });
+  expect(changed.draft.atoms).toEqual([]);
+});
 
 function structuredDraft(): MobileComposerDraft {
   const mentioned = insertMobileSessionMention(

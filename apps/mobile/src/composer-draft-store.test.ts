@@ -7,6 +7,7 @@ import {
 import type { MobilePlainStorageDriver } from "./connection-storage";
 import {
   appendMobileSelectionQuote,
+  appendMobileFileSelectionQuote,
   insertMobileArtifactMention,
   insertMobileResourceMention,
   insertMobileSessionMention,
@@ -34,6 +35,17 @@ function memoryDriver() {
 describe("mobile composer draft store", () => {
   beforeEach(() => vi.useFakeTimers());
   afterEach(() => vi.useRealTimers());
+
+  it("persists exact file quote occurrences under the current task draft without manufacturing message authority", async () => {
+    const memory = memoryDriver(); const store = new MobileComposerDraftStore(memory.driver);
+    const draft = appendMobileFileSelectionQuote(plainTextMobileComposerDraft("Question"), {
+      sourceSessionId: first.sessionId, sourcePath: "docs/README.md", text: "Selected text"
+    }, "file-excerpt").draft;
+    store.save(first, draft); await store.flush(first);
+    const restarted = new MobileComposerDraftStore(memory.driver);
+    expect(await restarted.read(first)).toEqual(draft); expect(await restarted.read(second)).toBeNull();
+    expect(JSON.stringify(draft)).not.toContain("sourceMessageId");
+  });
 
   it("retains rewind input across restart under exact task and operation identity without replacing the newer live draft", async () => {
     const memory = memoryDriver(); const store = new MobileComposerDraftStore(memory.driver);

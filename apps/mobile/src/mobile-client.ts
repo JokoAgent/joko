@@ -40,6 +40,11 @@ import {
 } from "./mobile-session-origin";
 import { buildMobileMessageDeepLink, buildMobileTaskDeepLink, parseMobileNativeIntent } from "./mobile-native-intent";
 import { awaitMobileMarkdownResourceRead, MobileMarkdownResourceReader, type MobileMarkdownResourceContext, type MobileMarkdownResourceDescriptor } from "./mobile-markdown-resources";
+import { mobileFileTextSource } from "./mobile-file-text-source";
+import { MobileFileHtmlReader, type MobileFileHtmlContext, type MobileFileHtmlDescriptor } from "./mobile-file-html-reader";
+import { mobileFileHtmlComplete } from "./mobile-file-html";
+import { HtmlResourceBudgetError } from "./mobile-file-html-resources";
+import { mobileGeneratedPreviewPages, mobileWorkspacePreviewPages, type MobileFilesPreviewPage, type MobileFilesPreviewPager } from "./mobile-files-preview-pager";
 import { MobileTimelineImageReader, type MobileTimelineImageContext, type MobileTimelineImagePreview } from "./mobile-timeline-images";
 import { MobileFilesThumbnailReader, mobileFilesThumbnailKind, mobileFilesThumbnailSourceKey, mobileFilesDocumentBytes,
   MOBILE_FILES_DOCUMENT_MAXIMUM_BYTES, MOBILE_FILES_IMAGE_MAXIMUM_BYTES, type MobileFilesThumbnailContext, type MobileFilesThumbnailPreview } from "./mobile-files-thumbnails";
@@ -125,6 +130,7 @@ import type {
 } from "./composer-draft-store";
 import {
   emptyMobileComposerDraft,
+  appendMobileFileSelectionQuote,
   insertMobileArtifactMention,
   insertMobileWorkspaceMention,
   mobileComposerDraftWithoutPrefix,
@@ -436,6 +442,12 @@ interface MobileFilesContext {
   readonly authority: MobileWorkspaceAuthority;
   readonly key: string;
 }
+interface MobileFilesPreviewPagerLease {
+  readonly context: MobileFilesContext; readonly epoch: number; readonly controller: AbortController;
+  readonly window: { readonly kind: "workspace"; readonly parent: string; readonly revision: string } | { readonly kind: "generated"; readonly revision: string };
+  descriptor: MobileFilesPreviewPager;
+  original?: WorkspaceEntry;
+}
 
 interface MobileWorkspaceModelObservation {
   readonly revisionKey: string;
@@ -685,6 +697,11 @@ export class MobileClient {
   #filesListAbort?: AbortController;
   #filesSearchAbort?: AbortController;
   #filesPreviewAbort?: AbortController;
+  #filesPreviewPager?: MobileFilesPreviewPagerLease;
+  #filesPagerOpeningAbort?: AbortController;
+  #filesPagerNavigationAbort?: AbortController;
+  #filesPagerReadActive = false;
+  #filesPagerReadWaiting?: { grant(): void; cancel(): void };
   #filesMediaPreview?: MobileMediaPreviewLease;
   #filesPdfPreview?: MobilePdfPreviewLease;
   #filesModelPreview?: MobileModelPreviewLease;
@@ -699,6 +716,7 @@ export class MobileClient {
   #imageGallery?: MobileImageGalleryLease;
   #conversationShare?: MobileConversationShareLease;
   #markdownResources = new MobileMarkdownResourceReader();
+  #fileHtmlResources = new MobileFileHtmlReader();
   #timelineImages = new MobileTimelineImageReader();
   #filesThumbnails: MobileFilesThumbnailReader;
   #messageRewindPreviews = new WeakSet<MobileMessageRewindPreview>();
@@ -900,7 +918,12 @@ export class MobileClient {
       next = { ...next, timelinePreview: undefined };
     }
     this.#state = next;
+    if ((this.#filesPreviewPager && !this.#filesPreviewPagerCurrent(this.#filesPreviewPager)) || (next.files.previewPager && !this.#filesPreviewPager)) {
+      this.#retireFilesPreviewPager(); this.#filesPreviewAbort?.abort();
+      this.#state = { ...next, files: { ...next.files, preview: undefined, previewPager: undefined } };
+    }
     this.#markdownResources.retireStale();
+    this.#fileHtmlResources.retireStale();
     this.#timelineImages.retainOwner(this.#taskAuthorityKey());
     this.#timelineImages.retireStale();
     this.#filesThumbnails.retainOwner(next.files.open ? this.filesAuthorityKey() : undefined);
@@ -951,6 +974,7 @@ export class MobileClient {
     this.#retireImageGallery();
     if (this.#conversationShare) this.releaseConversationShare(this.#conversationShare.leaseId);
     this.#markdownResources.releaseAll();
+    this.#fileHtmlResources.releaseAll();
     this.#timelineImages.releaseAll();
     this.#filesThumbnails.releaseAll();
     if (this.#timer !== undefined) clearTimeout(this.#timer);
@@ -3701,6 +3725,166 @@ export class MobileClient {
     }
   }
 
+  async openFilesPreviewPager(source: MobileFilesComposerSource, sort: MobileFilesSortMode = "name"): Promise<void> {
+    const context = this.#filesContext(); const epoch = this.#filesEpoch;
+    if (!this.#state.files.open || !filesComposerSourceIsCurrent(this.#state.files, source)) throw new Error("Select a current Files item before previewing it.");
+    const prior = this.#state.files.preview;
+    this.#retireFilesPreviewPager(); this.#filesPreviewAbort?.abort();
+    const controller = new AbortController(); this.#filesPagerOpeningAbort = controller;
+    const assertCurrent = () => {
+      controller.signal.throwIfAborted();
+      if (this.#filesPagerOpeningAbort !== controller || !this.#currentFiles(epoch, context.key)) throw new Error("The Files preview owner changed.");
+    };
+    const artifact = filesComposerArtifact(source);
+    const path = artifact ? "" : canonicalWorkspacePath(source.kind === "workspace-entry" ? source.entry.relativePath
+      : source.kind === "search-result" && source.result.kind !== "artifact" ? source.result.kind === "workspace-content" ? source.result.match.relativePath : source.result.relativePath : "");
+    const title = artifact ? artifactTitle(artifact) : workspaceBasename(path);
+    this.#set({ files: { ...this.#state.files, previewPager: undefined,
+      preview: prior?.kind === "text" && prior.sourceLabel === path ? prior : { title, sourceLabel: artifact ? "Generated" : path,
+        mediaType: artifact?.blob?.mediaType ?? "application/octet-stream", byteSize: artifact?.blob?.byteSize ?? 0n, revisionKey: "resolving:" + title, kind: "loading" } } });
+    let timedOut = false;
+    const deadline = setTimeout(() => { timedOut = true; controller.abort(); }, 15_000);
+    try {
+      let pages: readonly MobileFilesPreviewPage[]; let window: MobileFilesPreviewPagerLease["window"]; let selectedKey: string;
+      let directory: Awaited<ReturnType<MobileNetwork["listWorkspaceDirectory"]>> | undefined;
+      let catalog: Awaited<ReturnType<MobileNetwork["listSessionArtifacts"]>> | undefined;
+      if (artifact) {
+        catalog = await this.#readFilesPager(() => this.network.listSessionArtifacts(context.credential, context.authority.sessionId, controller.signal), controller.signal);
+        assertCurrent();
+        const matches = catalog.artifacts.filter((item) => item.artifactId === artifact.artifactId);
+        if (!catalog.revision || matches.length !== 1 || !sameFilesComposerArtifact(matches[0]!, artifact)) throw new Error("The Generated file changed before its preview opened.");
+        pages = mobileGeneratedPreviewPages(catalog.artifacts, sort, artifact.artifactId);
+        window = { kind: "generated", revision: catalog.revision }; selectedKey = JSON.stringify(["artifact", artifact.artifactId]);
+      } else {
+        const parent = workspaceParentPath(path);
+        directory = await this.#readFilesPager(() => this.network.listWorkspaceDirectory(context.credential, context.authority.workspace.workspaceId, parent, controller.signal), controller.signal);
+        assertCurrent(); const seen = new Set<string>();
+        for (const item of directory.entries) {
+          const canonical = canonicalWorkspacePath(item.relativePath);
+          if (item.workspaceId !== context.authority.workspace.workspaceId || workspaceParentPath(canonical) !== parent || seen.has(canonical)) throw new Error("The preview directory returned an ambiguous canonical file.");
+          seen.add(canonical);
+        }
+        const entry = directory.entries.find((item) => item.relativePath === path);
+        if (!directory.revision || !entry?.revision || entry.kind !== FileKind.REGULAR) throw new Error("The selected preview file is no longer available.");
+        if (source.kind === "workspace-entry" && !sameFilesWorkspaceEntry(entry, source.entry)) throw new Error("The selected preview file changed.");
+        if (source.kind === "search-result" && source.result.kind === "workspace-content"
+          && (!source.result.match.revision || workspaceEntryRevisionKey(source.result.match.revision) !== workspaceEntryRevisionKey(entry.revision))) throw new Error("The file search result changed.");
+        pages = mobileWorkspacePreviewPages(directory.entries, sort, entry, source.kind === "search-result" ? source : { kind: "workspace-entry", entry });
+        window = { kind: "workspace", parent, revision: directory.revision }; selectedKey = JSON.stringify(["workspace", entry.workspaceId, path]);
+      }
+      assertCurrent();
+      const index = pages.findIndex((page) => page.key === selectedKey);
+      if (index < 0) throw new Error("The selected file left its preview window.");
+      const descriptor: MobileFilesPreviewPager = { id: this.newId(), pages, index, sort };
+      const lease: MobileFilesPreviewPagerLease = { context, epoch, controller, descriptor, window };
+      this.#filesPreviewPager = lease;
+      const files = this.#state.files;
+      this.#set({ files: { ...files, previewPager: descriptor,
+        ...(catalog ? { artifacts: catalog.artifacts, artifactsRevision: catalog.revision } : {}),
+        ...(directory && window.kind === "workspace" && files.location.kind === "workspace" && files.location.path === window.parent
+          ? { entries: directory.entries, directoryRevision: directory.revision } : {}) } });
+      const selected = pages[index]!;
+      if (prior?.kind === "text" && selected.kind === "workspace" && prior.workspaceEntry?.revision
+        && prior.sourceLabel === path && workspaceComposerRevisionMatches(selected.entry.revision!, prior.workspaceEntry.revision)) { lease.original = prior.workspaceEntry; return; }
+      await this.selectFilesPreviewPage(descriptor.id, selectedKey, false);
+      if (timedOut) throw new Error("The file preview timed out. Open Files again.");
+    } catch (error) {
+      if (!this.#currentFiles(epoch, context.key) || this.#filesPagerOpeningAbort !== controller || controller.signal.aborted && !timedOut) return;
+      this.#retireFilesPreviewPager();
+      this.#set({ files: { ...this.#state.files, previewPager: undefined, preview: { title, sourceLabel: artifact ? "Generated" : path,
+        mediaType: artifact?.blob?.mediaType ?? "application/octet-stream", byteSize: artifact?.blob?.byteSize ?? 0n,
+        revisionKey: "unavailable:" + title, kind: "error", reason: timedOut ? "The file preview timed out. Open Files again." : message(error) } } });
+    } finally { clearTimeout(deadline); if (this.#filesPagerOpeningAbort === controller) this.#filesPagerOpeningAbort = undefined; }
+  }
+
+  async selectFilesPreviewPage(pagerId: string, pageKey: string, revalidate = true): Promise<void> {
+    const lease = this.#filesPreviewPager;
+    if (!lease || lease.descriptor.id !== pagerId || !this.#filesPreviewPagerCurrent(lease)) throw new Error("The Files preview window was retired.");
+    const index = lease.descriptor.pages.findIndex((page) => page.key === pageKey);
+    if (index < 0) throw new Error("Select a file from the current preview window.");
+    const page = lease.descriptor.pages[index]!;
+    this.#filesPagerNavigationAbort?.abort(); this.#filesPreviewAbort?.abort();
+    const retiredBinary = this.#releaseFilesBinaryPreviews().then(() => ({ ok: true as const }), (error: unknown) => ({ ok: false as const, error }));
+    lease.original = undefined;
+    const controller = new AbortController(); this.#filesPagerNavigationAbort = controller;
+    const abort = () => controller.abort(); lease.controller.signal.addEventListener("abort", abort, { once: true });
+    lease.descriptor = { ...lease.descriptor, index };
+    const base = { title: page.title, sourceLabel: page.kind === "workspace" ? page.entry.relativePath : "Generated",
+      mediaType: page.mediaType, byteSize: page.byteSize, revisionKey: page.key };
+    this.#set({ files: { ...this.#state.files, previewPager: lease.descriptor, preview: { ...base, kind: "loading" } } });
+    let timedOut = false; let windowChanged: string | undefined; const deadline = setTimeout(() => { timedOut = true; controller.abort(); }, 15_000);
+    const assertCurrent = () => {
+      controller.signal.throwIfAborted();
+      if (this.#filesPagerNavigationAbort !== controller || !this.#filesPreviewPagerCurrent(lease) || lease.descriptor.pages[lease.descriptor.index]?.key !== page.key) {
+        throw new Error("The visible file preview changed.");
+      }
+    };
+    try {
+      await this.#readFilesPager(async () => {
+        assertCurrent();
+        const release = await retiredBinary; if (!release.ok) throw release.error;
+        assertCurrent();
+        if (revalidate) {
+          if (lease.window.kind === "workspace") {
+            const directory = await this.network.listWorkspaceDirectory(lease.context.credential, lease.context.authority.workspace.workspaceId, lease.window.parent, controller.signal);
+            assertCurrent();
+            if (directory.revision !== lease.window.revision) { windowChanged = "The Files directory changed. Open the file again."; this.closeFilesPreview(); throw new Error(windowChanged); }
+          } else {
+            const catalog = await this.network.listSessionArtifacts(lease.context.credential, lease.context.authority.sessionId, controller.signal);
+            assertCurrent();
+            if (catalog.revision !== lease.window.revision) { windowChanged = "The Generated catalog changed. Open the file again."; this.closeFilesPreview(); throw new Error(windowChanged); }
+          }
+        }
+        assertCurrent(); await this.#releaseFilesBinaryPreviews(); assertCurrent();
+        if (page.kind === "workspace") await this.#previewWorkspaceFile(page.entry.relativePath, page.entry.revision!, page.title, controller.signal);
+        else await this.previewArtifact(page.artifact, controller.signal);
+      }, controller.signal);
+    } catch (error) {
+      if (windowChanged) throw new Error(windowChanged);
+      if (this.#filesPagerNavigationAbort !== controller || !this.#filesPreviewPagerCurrent(lease)) return;
+      if (controller.signal.aborted && !timedOut) return;
+      this.#set({ files: { ...this.#state.files, preview: { ...base, kind: "error", reason: timedOut ? "The file preview timed out. Try another page or open Files again." : message(error) } } });
+    } finally {
+      clearTimeout(deadline); lease.controller.signal.removeEventListener("abort", abort);
+      if (this.#filesPagerNavigationAbort === controller) this.#filesPagerNavigationAbort = undefined;
+    }
+  }
+
+  #filesPreviewPagerCurrent(lease: MobileFilesPreviewPagerLease): boolean {
+    const files = this.#state.files;
+    return this.#filesPreviewPager === lease && !lease.controller.signal.aborted && this.#credential === lease.context.credential
+      && this.#currentFiles(lease.epoch, lease.context.key) && files.status === "ready" && !!files.preview && files.previewPager === lease.descriptor
+      && (lease.window.kind !== "generated" || files.artifactsRevision === lease.window.revision)
+      && (lease.window.kind !== "workspace" || files.location.kind !== "workspace" || files.location.path !== lease.window.parent || files.directoryRevision === lease.window.revision);
+  }
+  #retireFilesPreviewPager(): void {
+    this.#filesPagerOpeningAbort?.abort(); this.#filesPagerOpeningAbort = undefined;
+    this.#filesPagerNavigationAbort?.abort(); this.#filesPagerNavigationAbort = undefined;
+    this.#filesPreviewPager?.controller.abort(); this.#filesPreviewPager = undefined;
+    void this.#releaseFilesBinaryPreviews().catch(() => undefined);
+  }
+  async #readFilesPager<T>(read: () => Promise<T>, signal: AbortSignal): Promise<T> {
+    signal.throwIfAborted();
+    if (this.#filesPagerReadActive) await new Promise<void>((resolve, reject) => {
+      const waiting = { grant: () => { signal.removeEventListener("abort", waiting.cancel); resolve(); },
+        cancel: () => { signal.removeEventListener("abort", waiting.cancel); if (this.#filesPagerReadWaiting === waiting) this.#filesPagerReadWaiting = undefined;
+          reject(new Error("The file preview was cancelled.")); } };
+      this.#filesPagerReadWaiting?.cancel(); this.#filesPagerReadWaiting = waiting; signal.addEventListener("abort", waiting.cancel, { once: true });
+    });
+    if (signal.aborted) {
+      this.#filesPagerReadActive = false; const waiting = this.#filesPagerReadWaiting; this.#filesPagerReadWaiting = undefined;
+      if (waiting) { this.#filesPagerReadActive = true; waiting.grant(); }
+      signal.throwIfAborted();
+    }
+    this.#filesPagerReadActive = true;
+    const release = () => {
+      this.#filesPagerReadActive = false; const waiting = this.#filesPagerReadWaiting; this.#filesPagerReadWaiting = undefined;
+      if (waiting) { this.#filesPagerReadActive = true; waiting.grant(); }
+    };
+    let raw: Promise<T>; try { raw = read(); } catch (error) { release(); throw error; }
+    void raw.then(release, release);
+    return awaitMobileMarkdownResourceRead(raw, signal);
+  }
   async previewWorkspaceEntry(entry: WorkspaceEntry): Promise<void> {
     if (entry.kind === FileKind.DIRECTORY) {
       await this.openFilesDirectory(entry.relativePath);
@@ -3735,7 +3919,7 @@ export class MobileClient {
     await this.#previewIndexedWorkspaceFile(result.relativePath);
   }
 
-  async previewArtifact(artifact: Artifact): Promise<void> {
+  async previewArtifact(artifact: Artifact, signal?: AbortSignal): Promise<void> {
     const current = this.#state.files.artifacts.find((candidate) => candidate.artifactId === artifact.artifactId);
     if (!current || current !== artifact || current.sessionId !== this.#state.files.sessionId) {
       throw new Error("Select a Generated file from the current task.");
@@ -3745,12 +3929,14 @@ export class MobileClient {
     this.#filesPreviewAbort?.abort();
     const controller = new AbortController();
     this.#filesPreviewAbort = controller;
+    const abort = () => controller.abort(); signal?.addEventListener("abort", abort, { once: true }); if (signal?.aborted) abort();
     const epoch = this.#filesEpoch;
     const blob = current.blob;
     const mediaType = normalizeMediaType(blob?.mediaType ?? "application/octet-stream") || "application/octet-stream";
     const byteSize = blob?.byteSize ?? 0n;
     const base = {
       title: artifactTitle(current),
+      fileName: blob?.fileName,
       sourceLabel: "Generated",
       mediaType,
       byteSize,
@@ -3800,7 +3986,7 @@ export class MobileClient {
             reason: `This text file is ${blob.byteSize.toString(10)} bytes and exceeds the 2097152-byte text preview window.` };
         } else {
           const download = await this.network.downloadBlob(context.credential, blob, controller.signal);
-          const text = new TextDecoder("utf-8", { fatal: true }).decode(download.bytes);
+          const text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(download.bytes);
           preview = { ...base, kind: "text", text, languageId: "", startByte: 0n,
             endByte: blob.byteSize, totalLines: text === "" ? 0 : text.split(/\r?\n/gu).length, truncated: false };
         }
@@ -3869,14 +4055,16 @@ export class MobileClient {
         preview: { ...base, kind: "error", reason: message(error) } } });
     } finally {
       if (this.#filesPreviewAbort === controller) this.#filesPreviewAbort = undefined;
+      signal?.removeEventListener("abort", abort);
     }
   }
 
   closeFilesPreview(): void {
+    this.#retireFilesPreviewPager();
     this.#filesPreviewAbort?.abort();
     this.#filesPreviewAbort = undefined;
     void this.#releaseFilesBinaryPreviews().catch(() => undefined);
-    if (this.#state.files.open) this.#set({ files: { ...this.#state.files, preview: undefined } });
+    if (this.#state.files.open) this.#set({ files: { ...this.#state.files, preview: undefined, previewPager: undefined } });
   }
 
   async previewTimelineArtifact(selected: MobileTimelineArtifact): Promise<void> {
@@ -3907,6 +4095,7 @@ export class MobileClient {
     this.#timelinePreview = lease;
     const base = {
       title: source.artifact.title,
+      fileName: source.blob.fileName,
       sourceLabel: "Timeline message file",
       mediaType: source.artifact.mediaType,
       byteSize: source.blob.byteSize,
@@ -3922,7 +4111,14 @@ export class MobileClient {
         throw new Error("The downloaded media type did not match the canonical Timeline Blob.");
       }
       let preview: MobileFilePreview;
-      if (source.artifact.previewKind === "media") {
+      if (source.artifact.previewKind === "text") {
+        if (BigInt(download.bytes.byteLength) !== source.blob.byteSize || bytesToHex(sha256(download.bytes)) !== source.blob.sha256Hex) {
+          throw new Error("The Timeline text bytes do not match their canonical Blob.");
+        }
+        const text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(download.bytes);
+        preview = { ...base, kind: "text", text, languageId: "", startByte: 0n,
+          endByte: source.blob.byteSize, totalLines: text === "" ? 0 : text.split(/\r?\n/gu).length, truncated: false };
+      } else if (source.artifact.previewKind === "media") {
         if (!this.mediaPreviewFiles) throw new Error("Audio/video preview is unavailable on this mobile runtime.");
         stagedMedia = await this.mediaPreviewFiles.stage(
           credential.profileId,
@@ -4132,6 +4328,92 @@ export class MobileClient {
     } finally {
       if (this.#fileShareLease === lease) this.#fileShareLease = undefined;
     }
+  }
+
+  async prepareFileTextSourceCopy(preview: Extract<MobileFilePreview, { kind: "text" }>, signal: AbortSignal): Promise<MobileFilesClipboardLease> {
+    const source = this.#fileTextActionSource(preview);
+    source.assertCurrent(signal);
+    await this.#readFilesPager(() => source.revalidate(signal), signal);
+    source.assertCurrent(signal);
+    return { kind: "source", text: mobileFileTextSource(preview.text).text, assertCurrent: (effectSignal) => { signal.throwIfAborted(); source.assertCurrent(effectSignal); } };
+  }
+
+  async addFileTextQuoteToComposer(preview: Extract<MobileFilePreview, { kind: "text" }>, selectedText: string, signal: AbortSignal): Promise<void> {
+    if (!this.composerDrafts) throw new Error("Retained task drafts are unavailable on this mobile client.");
+    const source = this.#fileTextActionSource(preview);
+    const identity = { profileId: this.#ready().profileId, sessionId: this.#state.selectedId! };
+    const snapshot = await this.composerDrafts.readSnapshot(identity);
+    source.assertCurrent(signal);
+    const next = appendMobileFileSelectionQuote(snapshot.draft ?? emptyMobileComposerDraft(), {
+      sourceSessionId: identity.sessionId, sourcePath: source.path, text: selectedText
+    }, this.newId()).draft;
+    await this.#readFilesPager(() => source.revalidate(signal), signal);
+    source.assertCurrent(signal);
+    if (!this.composerDrafts.saveIfRevision(identity, next, snapshot.revision)) throw new Error("The task composer changed. The original draft was retained.");
+    try {
+      await this.composerDrafts.flush(identity);
+      source.assertCurrent(signal);
+    } catch (error) { await this.#restoreFilesComposerDraft(identity, snapshot, next); throw error; }
+  }
+
+  #fileTextActionSource(preview: Extract<MobileFilePreview, { kind: "text" }>): {
+    readonly path: string; assertCurrent(signal?: AbortSignal): void; revalidate(signal: AbortSignal): Promise<void>
+  } {
+    const credential = this.#ready(); const task = this.#taskAuthorityKey();
+    const owner = this.filesHtmlResourceOwnerKey(preview);
+    const timeline = this.#state.timelinePreview === preview ? this.#timelinePreview : undefined;
+    const pager = timeline ? undefined : this.#filesPreviewPager;
+    const page = pager?.descriptor.pages[pager.descriptor.index];
+    const windowKey = timeline ? undefined : mobileFilesGalleryWindowKey(this.#state.files);
+    const entry = preview.workspaceEntry;
+    const path = canonicalWorkspacePath(entry?.relativePath ?? preview.fileName ?? "");
+    if (!task || !owner || !path || entry && (!entry.revision || workspaceEntryRevisionKey(entry.revision) !== preview.revisionKey)) {
+      throw new Error("The file text has no current canonical source.");
+    }
+    const assertCurrent = (signal?: AbortSignal): void => {
+      signal?.throwIfAborted();
+      if (this.#disposed || this.#credential !== credential || this.#taskAuthorityKey() !== task || this.filesHtmlResourceOwnerKey(preview) !== owner
+        || pager && (this.#filesPreviewPager !== pager || !this.#filesPreviewPagerCurrent(pager) || pager.descriptor.pages[pager.descriptor.index] !== page)
+        || !timeline && mobileFilesGalleryWindowKey(this.#state.files) !== windowKey) throw new Error("The file text source changed.");
+    };
+    assertCurrent();
+    const revalidate = async (signal: AbortSignal): Promise<void> => {
+      assertCurrent(signal);
+      if (timeline) {
+        const around = await this.network.readAround(credential, timeline.sessionId, timeline.artifact.eventId, signal);
+        assertCurrent(signal);
+        const current = resolveMobileTimelinePreviewArtifact(around, timeline.artifact);
+        if (!current || current.event.identity?.sessionId !== timeline.sessionId || current.event.cursor?.generation !== this.#state.owner?.generation
+          || !sameMobileTimelinePreviewArtifact(current.artifact, timeline.artifact)) throw new Error("The canonical Timeline text file changed.");
+      } else if (entry) {
+        const context = this.#filesContext();
+        const directory = await this.network.listWorkspaceDirectory(credential, entry.workspaceId, workspaceParentPath(entry.relativePath), signal);
+        assertCurrent(signal);
+        const matches = directory.entries.filter((item) => item.relativePath === entry.relativePath); const current = matches.length === 1 ? matches[0] : undefined;
+        if (!directory.revision || pager?.window.kind === "workspace" && directory.revision !== pager.window.revision
+          || !current?.revision || current.kind !== FileKind.REGULAR || current.workspaceId !== context.authority.workspace.workspaceId
+          || normalizeMediaType(current.mediaType) !== normalizeMediaType(preview.mediaType)
+          || !workspaceComposerRevisionMatches(current.revision, entry.revision!)) throw new Error("The canonical Workspace text file changed.");
+        const read = await this.network.readWorkspaceFile(credential, entry.workspaceId, entry.relativePath, entry.revision!, signal);
+        assertCurrent(signal);
+        assertWorkspaceFilePreview(entry.workspaceId, entry.relativePath, entry.revision!, read);
+        if (!read.entry?.revision || workspaceEntryRevisionKey(read.entry.revision) !== preview.revisionKey || read.entry.relativePath !== path
+          || read.entry.workspaceId !== entry.workspaceId || read.entry.kind !== FileKind.REGULAR || read.content.case !== "text"
+          || read.content.value.utf8Text !== preview.text || read.content.value.startByte !== preview.startByte || read.content.value.endByte !== preview.endByte
+          || read.truncated !== preview.truncated) throw new Error("The canonical Workspace text bytes changed.");
+      } else {
+        const catalog = await this.network.listSessionArtifacts(credential, this.#state.selectedId!, signal);
+        assertCurrent(signal);
+        const candidates = catalog.artifacts.filter((item) => item.blob && item.sessionId === this.#state.selectedId
+          && [item.artifactId, item.blob.blobId, item.blob.sha256Hex, item.blob.byteSize.toString(10)].join(":") === preview.revisionKey);
+        const artifact = candidates.length === 1 ? candidates[0] : undefined;
+        if (!catalog.revision || pager?.window.kind === "generated" && catalog.revision !== pager.window.revision || !artifact?.blob
+          || artifact.blob.fileName !== path || artifact.blob.byteSize !== preview.byteSize || normalizeMediaType(artifact.blob.mediaType) !== normalizeMediaType(preview.mediaType)
+          || page?.kind === "artifact" && !sameFilesComposerArtifact(page.artifact, artifact)) throw new Error("The canonical Generated text file changed.");
+      }
+      assertCurrent(signal);
+    };
+    return { path, assertCurrent, revalidate };
   }
 
   async addFilesItemToComposer(
@@ -4432,8 +4714,130 @@ export class MobileClient {
     return this.#markdownResources.prepare(this.newId(), text, this.#markdownResourceContext(messageId, text), signal);
   }
 
+  filesMarkdownResourceOwnerKey(preview: Extract<MobileFilePreview, { kind: "text" }>): string | undefined {
+    const owner = this.filesAuthorityKey();
+    return owner && this.#state.files.open && this.#state.files.status === "ready" && this.#state.files.preview === preview
+      && preview.workspaceEntry && !this.#imageGallery ? JSON.stringify([owner, this.#filesEpoch, preview.sourceLabel, preview.revisionKey]) : undefined;
+  }
+
+  async prepareFilesMarkdownResources(preview: Extract<MobileFilePreview, { kind: "text" }>, signal: AbortSignal): Promise<MobileMarkdownResourceDescriptor> {
+    const files = this.#filesContext(); const credential = this.#ready();
+    const ownerKey = this.filesMarkdownResourceOwnerKey(preview); const entry = preview.workspaceEntry;
+    if (!ownerKey || !entry?.revision || entry.kind !== FileKind.REGULAR || entry.workspaceId !== files.authority.workspace.workspaceId
+      || entry.relativePath !== preview.sourceLabel || workspaceEntryRevisionKey(entry.revision) !== preview.revisionKey) {
+      throw new Error("The file Markdown has no current Workspace source.");
+    }
+    const assertCurrent = (currentSignal?: AbortSignal): void => {
+      currentSignal?.throwIfAborted();
+      if (this.#disposed || this.#credential !== credential || this.filesMarkdownResourceOwnerKey(preview) !== ownerKey) {
+        throw new Error("The file Markdown source changed.");
+      }
+    };
+    const revalidateSource = async (currentSignal: AbortSignal): Promise<void> => {
+      assertCurrent(currentSignal);
+      const directory = await this.network.listWorkspaceDirectory(credential, entry.workspaceId, workspaceParentPath(entry.relativePath), currentSignal);
+      assertCurrent(currentSignal);
+      const matches = directory.entries.filter((current) => current.relativePath === entry.relativePath);
+      const fresh = matches.length === 1 ? matches[0] : undefined;
+      if (!directory.revision || !fresh?.revision || fresh.kind !== FileKind.REGULAR || fresh.workspaceId !== entry.workspaceId
+        || normalizeMediaType(fresh.mediaType) !== normalizeMediaType(entry.mediaType) || fresh.revision.byteSize !== entry.revision!.byteSize
+        || !workspaceComposerRevisionMatches(fresh.revision, entry.revision!)) throw new Error("The authenticated Markdown file changed.");
+    };
+    const context: MobileMarkdownResourceContext = { workspaceId: entry.workspaceId, workdir: files.authority.workspace.serverPathDisplay,
+      baseDirectory: workspaceParentPath(entry.relativePath), maximumSourceCharacters: 2_097_152, assertCurrent, revalidateSource,
+      listDirectory: (parent, currentSignal) => this.network.listWorkspaceDirectory(credential, entry.workspaceId, parent, currentSignal),
+      readFile: async (resource, currentSignal) => this.#canonicalWorkspaceImagePreview(credential, entry.workspaceId,
+        await this.network.readWorkspaceFile(credential, entry.workspaceId, resource.relativePath, resource.revision!, currentSignal), currentSignal),
+      download: (blob, currentSignal) => this.network.downloadBlob(credential, blob, currentSignal) };
+    await revalidateSource(signal);
+    const descriptor = await this.#markdownResources.prepare(this.newId(), mobileFileTextSource(preview.text).lines.join("\n"), context, signal);
+    try { await revalidateSource(signal); assertCurrent(signal); return descriptor; }
+    catch (error) { this.#markdownResources.release(descriptor.leaseId); throw error; }
+  }
+
   assertMarkdownResourcesCurrent(leaseId: string): void { this.#markdownResources.assertCurrent(leaseId); }
   releaseMarkdownResources(leaseId: string): void { this.#markdownResources.release(leaseId); }
+
+  filesHtmlResourceOwnerKey(preview: Extract<MobileFilePreview, { kind: "text" }>): string | undefined {
+    const timeline = this.#timelinePreview;
+    if (this.#state.timelinePreview === preview && timeline && this.#timelinePreviewLeaseCurrent(timeline)) {
+      return JSON.stringify(["timeline", timeline.taskAuthorityKey, timeline.windowKey, preview.sourceLabel, preview.revisionKey]);
+    }
+    const owner = this.filesAuthorityKey();
+    return owner && this.#state.files.open && this.#state.files.status === "ready" && this.#state.files.preview === preview
+      && !this.#imageGallery ? JSON.stringify([owner, this.#filesEpoch, preview.sourceLabel, preview.revisionKey]) : undefined;
+  }
+
+  async prepareFilesHtmlResources(preview: Extract<MobileFilePreview, { kind: "text" }>, signal: AbortSignal): Promise<MobileFileHtmlDescriptor> {
+    const credential = this.#ready(); const ownerKey = this.filesHtmlResourceOwnerKey(preview);
+    if (!ownerKey || !mobileFileHtmlComplete(preview)) throw new Error("The HTML page has no current complete file source.");
+    const assertCurrent = (currentSignal?: AbortSignal): void => {
+      currentSignal?.throwIfAborted();
+      if (this.#disposed || this.#credential !== credential || this.filesHtmlResourceOwnerKey(preview) !== ownerKey) {
+        throw new Error("The HTML file source changed.");
+      }
+    };
+    const entry = preview.workspaceEntry; let context: MobileFileHtmlContext = { assertCurrent };
+    if (entry) {
+      const files = this.#filesContext();
+      if (!entry.revision || entry.kind !== FileKind.REGULAR || entry.workspaceId !== files.authority.workspace.workspaceId
+        || entry.relativePath !== preview.sourceLabel || workspaceEntryRevisionKey(entry.revision) !== preview.revisionKey) {
+        throw new Error("The HTML page has no canonical Workspace source.");
+      }
+      const revalidateEntry = async (currentSignal: AbortSignal): Promise<void> => {
+        assertCurrent(currentSignal);
+        const directory = await this.network.listWorkspaceDirectory(credential, entry.workspaceId, workspaceParentPath(entry.relativePath), currentSignal);
+        assertCurrent(currentSignal);
+        const matches = directory.entries.filter((candidate) => candidate.relativePath === entry.relativePath);
+        const fresh = matches.length === 1 ? matches[0] : undefined;
+        if (!directory.revision || !fresh?.revision || fresh.kind !== FileKind.REGULAR || fresh.workspaceId !== entry.workspaceId
+          || normalizeMediaType(fresh.mediaType) !== normalizeMediaType(entry.mediaType) || fresh.revision.byteSize !== entry.revision!.byteSize
+          || !workspaceComposerRevisionMatches(fresh.revision, entry.revision!)) throw new Error("The authenticated HTML file changed.");
+      };
+      let snapshotRevision = "";
+      const revalidateSource = async (currentSignal: AbortSignal): Promise<void> => {
+        await revalidateEntry(currentSignal);
+        const snapshot = await this.network.readWorkspaceHtmlSnapshot(credential, files.authority.sessionId,
+          { workspaceId: entry.workspaceId, relativePath: entry.relativePath, expectedRevision: snapshotRevision }, currentSignal);
+        assertCurrent(currentSignal);
+        if (snapshot.file.workspaceId !== entry.workspaceId || snapshot.file.relativePath !== entry.relativePath
+          || !/^workspace-html:[0-9a-f]{64}$/u.test(snapshot.file.expectedRevision)
+          || snapshotRevision !== "" && snapshot.file.expectedRevision !== snapshotRevision || snapshot.html !== preview.text) {
+          throw new Error("The authenticated HTML snapshot changed.");
+        }
+        snapshotRevision = snapshot.file.expectedRevision;
+      };
+      context = { baseDirectory: workspaceParentPath(entry.relativePath), assertCurrent, revalidateSource,
+        readResource: async (target, maximumBytes, currentSignal) => {
+          await revalidateEntry(currentSignal);
+          const path = canonicalWorkspacePath(target.relativePath); const parent = workspaceParentPath(path);
+          const base = workspaceParentPath(entry.relativePath);
+          if (base && !path.startsWith(base + "/")) throw new Error("The HTML resource left its parent directory.");
+          const directory = await this.network.listWorkspaceDirectory(credential, entry.workspaceId, parent, currentSignal);
+          assertCurrent(currentSignal);
+          const matches = directory.entries.filter((candidate) => candidate.relativePath === path);
+          const resource = matches.length === 1 ? matches[0] : undefined;
+          if (!directory.revision || !resource?.revision || resource.kind !== FileKind.REGULAR || resource.workspaceId !== entry.workspaceId) {
+            throw new Error("The HTML resource has no current canonical file.");
+          }
+          if (resource.revision.byteSize < 0n || resource.revision.byteSize > BigInt(maximumBytes)) {
+            throw new HtmlResourceBudgetError("The HTML resource exceeded its byte budget.");
+          }
+          const materialized = await this.network.materializeWorkspaceFileBlob(credential, entry.workspaceId, path, resource.revision, currentSignal);
+          assertCurrent(currentSignal);
+          const blob = workspaceComposerBlob(entry.workspaceId, resource, { $typeName: "joko.v1.FilePreview", entry: materialized.entry,
+            content: { case: "blob", value: materialized.blob }, truncated: false });
+          if (!blob || blob.byteSize !== resource.revision.byteSize || blob.byteSize > BigInt(maximumBytes)) throw new Error("The HTML resource Blob changed.");
+          const downloaded = await this.network.downloadBlob(credential, blob, currentSignal); assertCurrent(currentSignal);
+          await revalidateEntry(currentSignal);
+          return { blob, ...downloaded };
+        } };
+    }
+    return this.#fileHtmlResources.prepare(this.newId(), preview.text, context, signal);
+  }
+
+  assertFilesHtmlResourcesCurrent(leaseId: string): void { this.#fileHtmlResources.assertCurrent(leaseId); }
+  releaseFilesHtmlResources(leaseId: string): void { this.#fileHtmlResources.release(leaseId); }
 
   timelineImagePreviewOwnerKey(): string | undefined { return this.#taskAuthorityKey(); }
 
@@ -9476,7 +9880,7 @@ export class MobileClient {
         throw new Error("The selected Workspace search result changed before it could be shared.");
       }
     }
-    return entry;
+    return this.#filesPreviewOriginalEntry(source, entry);
   }
 
   #assertFilesShareSourceCurrent(
@@ -9604,15 +10008,16 @@ export class MobileClient {
         draft.attachments,
         attachmentControls
       )) {
+      const original = this.#filesPreviewOriginalEntry(source, entry);
       const preview = await this.network.readWorkspaceFile(
         context.credential,
         context.authority.workspace.workspaceId,
         path,
-        entry.revision,
+        original.revision!,
         signal
       );
       assertCurrent();
-      const blob = workspaceComposerBlob(context.authority.workspace.workspaceId, entry, preview);
+      const blob = workspaceComposerBlob(context.authority.workspace.workspaceId, original, preview);
       if (blob) {
         const metadata = filesAttachmentMetadata(
           blob.fileName || entry.displayName || workspaceBasename(path),
@@ -9790,6 +10195,17 @@ export class MobileClient {
     return { draft: insertion.draft, result: "reference" };
   }
 
+  #filesPreviewOriginalEntry(source: MobileFilesComposerSource, observed: WorkspaceEntry): WorkspaceEntry {
+    const lease = this.#filesPreviewPager;
+    if (!lease || !this.#filesPreviewPagerCurrent(lease) || lease.descriptor.pages[lease.descriptor.index]?.source !== source || !lease.original) return observed;
+    const original = lease.original;
+    if (!original.revision || !observed.revision || original.relativePath !== observed.relativePath || original.workspaceId !== observed.workspaceId
+      || normalizeMediaType(original.mediaType) !== normalizeMediaType(observed.mediaType) || !workspaceComposerRevisionMatches(observed.revision, original.revision)) {
+      throw new Error("The visible original file changed before its action began.");
+    }
+    return { ...observed, revision: original.revision };
+  }
+
   async #resolveFilesComposerWorkspaceEntry(
     context: MobileFilesContext,
     source: MobileFilesComposerSource,
@@ -9891,6 +10307,7 @@ export class MobileClient {
   }
 
   #cancelFilesRequests(): void {
+    this.#retireFilesPreviewPager();
     if (this.#imageGallery?.source.kind === "files") this.#retireImageGallery();
     this.#cancelPreparingFileShare("files");
     void this.#releaseFilesBinaryPreviews().catch(() => undefined);
@@ -10102,7 +10519,7 @@ export class MobileClient {
     }
   }
 
-  async #previewWorkspaceFile(relativePath: string, revision: FileRevision, title: string): Promise<void> {
+  async #previewWorkspaceFile(relativePath: string, revision: FileRevision, title: string, signal?: AbortSignal): Promise<void> {
     const path = canonicalWorkspacePath(relativePath);
     workspaceEntryRevisionKey(revision);
     const context = this.#filesContext();
@@ -10110,9 +10527,11 @@ export class MobileClient {
     this.#filesPreviewAbort?.abort();
     const controller = new AbortController();
     this.#filesPreviewAbort = controller;
+    const abort = () => controller.abort(); signal?.addEventListener("abort", abort, { once: true }); if (signal?.aborted) abort();
     const epoch = this.#filesEpoch;
+    const page = this.#filesPreviewPager?.descriptor.pages[this.#filesPreviewPager.descriptor.index];
     const provisional = {
-      title, sourceLabel: path, mediaType: "application/octet-stream",
+      title, sourceLabel: path, mediaType: page?.kind === "workspace" && page.entry.relativePath === path ? page.mediaType : "application/octet-stream",
       byteSize: revision.byteSize, revisionKey: workspaceEntryRevisionKey(revision)
     };
     this.#set({ files: { ...this.#state.files, preview: { ...provisional, kind: "loading" } } });
@@ -10127,6 +10546,7 @@ export class MobileClient {
         preview: { ...provisional, kind: "error", reason: message(error) } } });
     } finally {
       if (this.#filesPreviewAbort === controller) this.#filesPreviewAbort = undefined;
+      signal?.removeEventListener("abort", abort);
     }
   }
 
@@ -10159,6 +10579,10 @@ export class MobileClient {
     this.#filesMediaPreview = preview.kind === "media" ? preview : undefined;
     this.#filesPdfPreview = preview.kind === "pdf" ? preview : undefined;
     this.#filesModelPreview = preview.kind === "model" ? preview : undefined;
+    if (this.#filesPreviewPager && this.#filesPreviewPagerCurrent(this.#filesPreviewPager)) {
+      const page = this.#filesPreviewPager.descriptor.pages[this.#filesPreviewPager.descriptor.index];
+      if (page?.kind === "workspace" && page.entry.relativePath === relativePath) this.#filesPreviewPager.original = result.entry;
+    }
     this.#set({ files: { ...this.#state.files, preview } });
   }
 
@@ -10192,6 +10616,7 @@ export class MobileClient {
     const base = {
       title,
       sourceLabel: entry.relativePath,
+      fileName: workspaceBasename(entry.relativePath),
       mediaType,
       byteSize: revision.byteSize,
       revisionKey: workspaceEntryRevisionKey(revision)
@@ -10206,7 +10631,7 @@ export class MobileClient {
       if (visibleBytes !== text.endByte - text.startByte) {
         throw new Error("The Joko node returned a text preview with a mismatched byte window.");
       }
-      return { ...base, kind: "text", text: text.utf8Text, languageId: text.languageId,
+      return { ...base, kind: "text", workspaceEntry: entry, text: text.utf8Text, languageId: text.languageId,
         startByte: text.startByte, endByte: text.endByte, totalLines: text.totalLines,
         truncated: preview.truncated };
     }
@@ -10980,6 +11405,7 @@ function mobileCredentialKey(credential: PairedCredential): string {
 }
 
 function filesComposerSourceIsCurrent(files: MobileFilesState, source: MobileFilesComposerSource): boolean {
+  if (files.previewPager) return files.preview?.kind !== "loading" && files.previewPager.pages[files.previewPager.index]?.source === source;
   if (source.kind === "workspace-entry") return files.entries.includes(source.entry);
   if (source.kind === "artifact") return files.artifacts.includes(source.artifact);
   return files.searchResults.includes(source.result);

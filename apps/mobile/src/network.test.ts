@@ -8,6 +8,7 @@ import {
   BlobRefSchema,
   BlobTransferTicketSchema,
   GetImageThumbnailRequestSchema, GetImageThumbnailResponseSchema, ImageThumbnailUnavailableReason,
+  ReadWorkspaceHtmlSnapshotRequestSchema, ReadWorkspaceHtmlSnapshotResponseSchema,
   FileKind,
   FilePreviewSchema,
   FileRevisionSchema,
@@ -99,6 +100,32 @@ describe("canonical image thumbnail network", () => {
       await expect(mobileNetwork.readImageThumbnail(credential, blob, 1024)).rejects.toThrow(/unknown/u);
       response = create(GetImageThumbnailResponseSchema, { sourceBlob: blob, result: { case: "thumbnail", value: { ...thumbnail, widthPixels: 1025 } } });
       await expect(mobileNetwork.readImageThumbnail(credential, blob, 1024)).rejects.toThrow(/bounds/u);
+    } finally { fetcher.mockRestore(); }
+  });
+});
+describe("complete Workspace HTML snapshot network", () => {
+  it("binds the generated authenticated snapshot to its task, path and exact opaque revision", async () => {
+    const credential: PairedCredential = { profileId: "html-profile", origin: "https://node.example", serverId: "server", connectionId: "connection",
+      deviceId: "phone", displayName: "Phone", authKey: "html-fixture-key" };
+    const file = { workspaceId: "workspace", relativePath: "docs/index.html", expectedRevision: "workspace-html:" + "a".repeat(64) };
+    let response = create(ReadWorkspaceHtmlSnapshotResponseSchema, { file, utf8Html: "<!doctype html><p>HTML</p>" });
+    const controller = new AbortController();
+    const fetcher = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      expect(String(input)).toBe("https://node.example/joko.v1.WorkspaceService/ReadWorkspaceHtmlSnapshot");
+      expect(new Headers(init?.headers).get("authorization")).toBe("Bearer html-fixture-key");
+      expect(init?.signal?.aborted).toBe(false);
+      expect(fromBinary(ReadWorkspaceHtmlSnapshotRequestSchema, new Uint8Array(init!.body as Uint8Array))).toMatchObject({ sessionId: "task", file });
+      return new Response(toBinary(ReadWorkspaceHtmlSnapshotResponseSchema, response), { headers: { "content-type": "application/proto" } });
+    });
+    try {
+      await expect(mobileNetwork.readWorkspaceHtmlSnapshot(credential, "task", file, controller.signal)).resolves.toMatchObject({ file, html: response.utf8Html });
+      for (const wrong of [{ ...file, workspaceId: "foreign" }, { ...file, relativePath: "other.html" }, { ...file, expectedRevision: "workspace-html:" + "b".repeat(64) }]) {
+        response = create(ReadWorkspaceHtmlSnapshotResponseSchema, { file: wrong, utf8Html: "<p>HTML</p>" });
+        await expect(mobileNetwork.readWorkspaceHtmlSnapshot(credential, "task", file)).rejects.toThrow(/mismatched/u);
+      }
+      response = create(ReadWorkspaceHtmlSnapshotResponseSchema, { file, utf8Html: "é".repeat(1_048_577) });
+      await expect(mobileNetwork.readWorkspaceHtmlSnapshot(credential, "task", file)).rejects.toThrow(/mismatched/u);
+      controller.abort(); await expect(mobileNetwork.readWorkspaceHtmlSnapshot(credential, "task", file, controller.signal)).rejects.toThrow();
     } finally { fetcher.mockRestore(); }
   });
 });

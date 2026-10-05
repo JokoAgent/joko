@@ -6,7 +6,7 @@ import {
   AcknowledgementSchema, ArtifactKind, ArtifactSchema, BackendDescriptorSchema, BackendModelAccessSettingsSchema, BackendSettingsSchema, BlobDisposition, BlobRefSchema,
   CapabilityManifestSchema, CapabilityOptionsSchema, CapabilitySchema, CapabilitySupport, CompactSessionOutcome, ConnectionSchema, ConnectionState,
   ContextUsageSchema, DeviceKind, DevicePresenceState, DeviceSchema, EntityKind, EntityVersionSchema,
-  FileKind, FilePreviewSchema, FileRevisionSchema, TargetSchema, WorkspaceDescriptorSchema, WorkspaceEntrySchema, WorkspaceFileChangeKind, WorkspaceFileChangeSchema,
+  FileKind, FilePreviewSchema, FileRevisionSchema, TextFilePreviewSchema, TargetSchema, WorkspaceDescriptorSchema, WorkspaceEntrySchema, WorkspaceFileChangeKind, WorkspaceFileChangeSchema,
   WorkspaceSearchMatchSchema, WorkspaceChangeSetSchema, WorkspaceRewindPreviewSchema, WorkspaceRewindResultSchema, RewindSafety, FileChangeKind,
   JOKO_API_VERSION, NativeEntryKind, NativeSessionBindingSchema, NativeSessionTreeNodeSchema, NativeSessionTreeSchema, OperationSchema,
   ListPartnerSessionsResponseSchema, PartnerSessionRole,
@@ -985,6 +985,7 @@ function fakeNetwork(): MobileNetwork {
       });
     }),
     readWorkspaceFile: vi.fn(async () => { throw new Error("No Workspace file fixture was configured."); }),
+    readWorkspaceHtmlSnapshot: vi.fn(async () => { throw new Error("No Workspace HTML snapshot fixture was configured."); }),
     materializeWorkspaceFileBlob: vi.fn(async () => { throw new Error("No Workspace Blob fixture was configured."); }),
     listSessionArtifacts: vi.fn(async () => ({ artifacts: [], revision: "artifacts-1" })),
     listRuntimeCommands: vi.fn(async () => []),
@@ -7776,6 +7777,353 @@ describe("native current-task branch navigation", () => {
 });
 
 describe("native current-task Files ownership", () => {
+  async function textActionFixture(body = "\uFEFF# First\r\n\r\nSelected 😀 text\r\n") {
+    const length = BigInt(new TextEncoder().encode(body).length); const digest = sha256Hex(new TextEncoder().encode(body));
+    const observed = create(WorkspaceEntrySchema, { workspaceId: "workspace", relativePath: "docs/README.md", displayName: "README.md",
+      kind: FileKind.REGULAR, mediaType: "text/markdown", revision: { opaqueRevision: "file-r1", byteSize: length, modifiedAt: { seconds: 100n } } });
+    const canonical = create(WorkspaceEntrySchema, { ...observed, revision: { ...observed.revision!, opaqueRevision: `sha256:${digest}:${length}`, sha256Hex: digest } });
+    const network = fakeNetwork(); configureFiles(network, handoffSnapshot);
+    vi.mocked(network.listWorkspaceDirectory).mockResolvedValue({ entries: [observed], revision: "text-directory" });
+    const response = create(FilePreviewSchema, { entry: canonical, content: { case: "text", value: {
+      utf8Text: body, startByte: 0n, endByte: length, totalLines: body.split(/\r\n?|\n/u).length
+    } } });
+    vi.mocked(network.readWorkspaceFile).mockResolvedValue(response);
+    const drafts = memoryDraftStores(); let id = 0;
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined, () => "file-action-" + ++id, undefined, drafts);
+    await app.start(); await app.openFiles(); await app.openFilesPreviewPager({ kind: "workspace-entry", entry: observed });
+    const preview = app.state.files.preview; if (preview?.kind !== "text") throw new Error("Missing canonical file text");
+    const identity = { profileId: credential.profileId, sessionId: "session" };
+    return { app, network, drafts, identity, observed, response, preview };
+  }
+
+  it("quotes canonical selected file text into the retained draft and copies only displayed source with exact BOM and line endings", async () => {
+    const body = "\uFEFF# First\r\n" + Array.from({ length: 5_001 }, (_, i) => "Row " + i).join("\r\n");
+    const f = await textActionFixture(body); f.drafts.composer.save(f.identity, plainTextMobileComposerDraft("Question"));
+    const copy = await f.app.prepareFileTextSourceCopy(f.preview, new AbortController().signal);
+    expect(copy.text).toBe(body.split("\r\n").slice(0, 5_000).join("\r\n")); copy.assertCurrent();
+    await f.app.addFileTextQuoteToComposer(f.preview, "Selected 😀 text\r\nsecond", new AbortController().signal);
+    const saved = await f.drafts.composer.read(f.identity);
+    expect(saved?.atoms).toMatchObject([{ kind: "file-quote", sourceSessionId: "session", sourcePath: "docs/README.md", text: "Selected 😀 text\nsecond" }]);
+    expect(saved?.text).toBe("Question\n\n⟦Quote from File⟧");
+    expect(f.drafts.values.size).toBe(1); expect(f.network.submit).not.toHaveBeenCalled();
+    f.app.closeFilesPreview(); expect(() => copy.assertCurrent()).toThrow(/source changed/u);
+    await expect(f.app.prepareFileTextSourceCopy(f.preview, new AbortController().signal)).rejects.toThrow(/canonical source/u);
+  });
+
+  it("rejects changed bytes and source windows, preserves concurrent drafts and rolls back a failed quote flush", async () => {
+    const f = await textActionFixture(); const original = plainTextMobileComposerDraft("Original");
+    f.drafts.composer.save(f.identity, original); await f.drafts.composer.flush(f.identity);
+    await expect(f.app.prepareFileTextSourceCopy({ ...f.preview }, new AbortController().signal)).rejects.toThrow(/canonical source/u);
+    vi.mocked(f.network.readWorkspaceFile).mockResolvedValueOnce(create(FilePreviewSchema, { ...f.response,
+      content: { case: "text", value: create(TextFilePreviewSchema, { utf8Text: "spoof", startByte: 0n, endByte: f.preview.endByte, totalLines: 1 }) } }));
+    await expect(f.app.prepareFileTextSourceCopy(f.preview, new AbortController().signal)).rejects.toThrow(/bytes changed/u);
+    const flush = vi.spyOn(f.drafts.composer, "flush").mockRejectedValueOnce(new Error("Storage unavailable"));
+    await expect(f.app.addFileTextQuoteToComposer(f.preview, "excerpt", new AbortController().signal)).rejects.toThrow(/Storage unavailable/u);
+    expect(await f.drafts.composer.read(f.identity)).toEqual(original); flush.mockRestore();
+    let finish!: (value: typeof f.response) => void;
+    vi.mocked(f.network.readWorkspaceFile).mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+    const adding = f.app.addFileTextQuoteToComposer(f.preview, "excerpt", new AbortController().signal);
+    await vi.waitFor(() => expect(finish).toBeDefined()); f.drafts.composer.save(f.identity, plainTextMobileComposerDraft("Newer")); finish(f.response);
+    await expect(adding).rejects.toThrow(/composer changed/u); expect(f.drafts.composer.readSync(f.identity)?.text).toBe("Newer");
+    vi.mocked(f.network.listWorkspaceDirectory).mockResolvedValueOnce({ entries: [f.observed], revision: "changed-window" });
+    await expect(f.app.prepareFileTextSourceCopy(f.preview, new AbortController().signal)).rejects.toThrow(/Workspace text file changed/u);
+    expect(f.network.submit).not.toHaveBeenCalled();
+  });
+
+  it("retires a cancelled text action without releasing its unsettled file read slot or committing to a later preview", async () => {
+    const f = await textActionFixture(); let finish!: (value: typeof f.response) => void;
+    const original = plainTextMobileComposerDraft("Original"); f.drafts.composer.save(f.identity, original);
+    vi.mocked(f.network.readWorkspaceFile).mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+    const controller = new AbortController();
+    const adding = f.app.addFileTextQuoteToComposer(f.preview, "excerpt", controller.signal);
+    await vi.waitFor(() => expect(finish).toBeDefined()); controller.abort(); await expect(adding).rejects.toThrow(/cancel/u);
+    const calls = vi.mocked(f.network.readWorkspaceFile).mock.calls.length;
+    const next = f.app.prepareFileTextSourceCopy(f.preview, new AbortController().signal);
+    await Promise.resolve(); expect(f.network.readWorkspaceFile).toHaveBeenCalledTimes(calls);
+    finish(f.response); const copy = await next; expect(copy.text).toBe(f.preview.text);
+    expect(f.drafts.composer.readSync(f.identity)).toEqual(original);
+    let resolveDirectory!: (value: { entries: typeof f.observed[]; revision: string }) => void;
+    vi.mocked(f.network.listWorkspaceDirectory).mockImplementationOnce(() => new Promise((resolve) => { resolveDirectory = resolve; }));
+    const stale = f.app.prepareFileTextSourceCopy(f.preview, new AbortController().signal);
+    await vi.waitFor(() => expect(resolveDirectory).toBeDefined()); f.app.closeFilesPreview();
+    resolveDirectory({ entries: [f.observed], revision: "text-directory" }); await expect(stale).rejects.toThrow(/source changed/u);
+    expect(() => copy.assertCurrent()).toThrow(); f.app.setForeground(false); expect(f.network.submit).not.toHaveBeenCalled();
+  });
+
+  it("renders file Markdown resources relative to its canonical parent and retires stale or replaced preview sources", async () => {
+    const body = "## Document\n![Pixel](pixel.png) ![outside](../../private.png)\n" + "long document ".repeat(16_000);
+    const bytes = await sharp({ create: { width: 1, height: 1, channels: 3, background: "orange" } }).png().toBuffer(); const length = BigInt(new TextEncoder().encode(body).length);
+    const observed = create(FileRevisionSchema, { opaqueRevision: "document-r1", byteSize: length, modifiedAt: { seconds: 100n } });
+    const doc = create(WorkspaceEntrySchema, { workspaceId: "workspace", relativePath: "docs/README.md", displayName: "README.md", kind: FileKind.REGULAR, mediaType: "text/markdown", revision: observed });
+    const digest = sha256Hex(new TextEncoder().encode(body));
+    const canonical = create(WorkspaceEntrySchema, { ...doc, revision: { ...observed, opaqueRevision: `sha256:${digest}:${length}`, sha256Hex: digest } });
+    const imageRevision = create(FileRevisionSchema, { opaqueRevision: "pixel-r1", byteSize: BigInt(bytes.length), sha256Hex: sha256Hex(bytes) });
+    const picture = create(WorkspaceEntrySchema, { workspaceId: "workspace", relativePath: "docs/pixel.png", displayName: "pixel.png", kind: FileKind.REGULAR, mediaType: "image/png", revision: imageRevision });
+    const blob = create(BlobRefSchema, { blobId: "file-markdown-pixel", fileName: "pixel.png", mediaType: "image/png", byteSize: imageRevision.byteSize, sha256Hex: imageRevision.sha256Hex });
+    const network = fakeNetwork(); configureFiles(network, handoffSnapshot);
+    vi.mocked(network.listWorkspaceDirectory).mockImplementation(async (_credential, _workspace, parent) => ({ entries: parent === "docs" ? [doc, picture] : [sourceDirectory], revision: "directory-" + parent }));
+    vi.mocked(network.readWorkspaceFile).mockImplementation(async (_credential, _workspace, path) => path === doc.relativePath
+      ? create(FilePreviewSchema, { entry: canonical, content: { case: "text", value: { utf8Text: body, startByte: 0n, endByte: length, totalLines: 3 } } })
+      : create(FilePreviewSchema, { entry: picture, content: { case: "image", value: { blob, widthPixels: 1, heightPixels: 1 } } }));
+    vi.mocked(network.downloadBlob).mockResolvedValue({ bytes, mediaType: "image/png" });
+    const app = client(network, memoryStorage(credential).storage); await app.start(); await app.openFiles(); await app.openFilesDirectory("docs");
+    await app.previewWorkspaceEntry(app.state.files.entries.find((entry) => entry.relativePath === doc.relativePath)!);
+    const preview = app.state.files.preview; if (preview?.kind !== "text") throw new Error("Text preview fixture missing");
+    expect(preview.workspaceEntry).toEqual(canonical); expect(preview.fileName).toBe("README.md");
+    const resources = await app.prepareFilesMarkdownResources(preview, new AbortController().signal);
+    expect(vi.mocked(network.readWorkspaceFile).mock.calls.map((call) => call[2])).toEqual([doc.relativePath, picture.relativePath]);
+    expect(resources.references.get('["image","pixel.png"]')?.image).toMatchObject({ width: 1, height: 1 });
+    expect(network.downloadBlob).toHaveBeenCalledExactlyOnceWith(credential, blob, expect.any(AbortSignal));
+    await expect(app.prepareFilesMarkdownResources({ ...preview, text: "spoof" }, new AbortController().signal)).rejects.toThrow(/current Workspace/u);
+    vi.mocked(network.listWorkspaceDirectory).mockResolvedValue({ entries: [create(WorkspaceEntrySchema, { ...doc, revision: create(FileRevisionSchema, { ...observed, opaqueRevision: "document-r2", modifiedAt: { ...observed.modifiedAt!, seconds: 101n } }) }), picture], revision: "changed-directory" });
+    await expect(app.prepareFilesMarkdownResources(preview, new AbortController().signal)).rejects.toThrow(/file changed/u);
+    expect(network.downloadBlob).toHaveBeenCalledOnce(); app.closeFilesPreview();
+    expect(() => app.assertMarkdownResourcesCurrent(resources.leaseId)).toThrow(/changed|released/u);
+    expect(app.filesMarkdownResourceOwnerKey(preview)).toBeUndefined(); expect(network.submit).not.toHaveBeenCalled();
+  });
+
+  it("opens a sorted non-image Files preview window and keeps every original action on the current canonical page", async () => {
+    const entry = (name: string, type: string, size: number) => create(WorkspaceEntrySchema, { workspaceId: "workspace", relativePath: name,
+      displayName: name, mediaType: type, kind: FileKind.REGULAR, revision: { opaqueRevision: name + "-r1", byteSize: BigInt(size), sha256Hex: name === "raw.bin" ? "a".repeat(64) : "" } });
+    const alpha = entry("alpha.txt", "text/plain", 5); const beta = entry("beta.txt", "text/plain", 4);
+    const raw = entry("raw.bin", "application/x-test", 2); const picture = entry("picture.png", "image/png", 12);
+    const entries = [sourceDirectory, alpha, beta, raw, picture]; const network = fakeNetwork(); configureFiles(network, handoffSnapshot);
+    vi.mocked(network.listWorkspaceDirectory).mockResolvedValue({ entries, revision: "pager-directory" });
+    vi.mocked(network.readWorkspaceFile).mockImplementation(async (_credential, _workspace, path) => {
+      const item = entries.find((candidate) => candidate.relativePath === path)!;
+      return create(FilePreviewSchema, { entry: item, content: path.endsWith(".txt")
+        ? { case: "text", value: { utf8Text: path.split(".")[0]!, startByte: 0n, endByte: item.revision!.byteSize, totalLines: 1 } }
+        : { case: "blob", value: { blobId: "raw-blob", fileName: "raw.bin", mediaType: raw.mediaType, byteSize: 2n, sha256Hex: "a".repeat(64) } } });
+    });
+    const drafts = memoryDraftStores();
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined, undefined, undefined, drafts); await app.start(); await app.openFiles();
+    await app.openFilesPreviewPager({ kind: "workspace-entry", entry: alpha }, "size");
+    const pager = app.state.files.previewPager!;
+    expect(pager.pages.map((page) => page.title)).toEqual(["alpha.txt", "beta.txt", "raw.bin"]); expect(pager.index).toBe(0);
+    expect(vi.mocked(network.readWorkspaceFile).mock.calls.map((call) => call[2])).toEqual(["alpha.txt"]);
+    const retiredSource = pager.pages[0]!.source;
+    await app.selectFilesPreviewPage(pager.id, pager.pages[1]!.key);
+    expect(app.state.files.preview).toMatchObject({ title: "beta.txt", sourceLabel: "beta.txt", kind: "text", text: "beta" });
+    expect(app.state.files.previewPager?.index).toBe(1);
+    await expect(app.addFilesItemToComposer(retiredSource)).rejects.toThrow(/authority/u);
+    const visible = app.state.files.previewPager!.pages[1]!.source;
+    await expect(app.addFilesItemToComposer(visible)).resolves.toBe("reference");
+    expect((await drafts.composer.read({ profileId: credential.profileId, sessionId: "session" }))!.text).toContain("beta.txt");
+    await app.selectFilesPreviewPage(pager.id, pager.pages[2]!.key);
+    expect(app.state.files.preview).toMatchObject({ kind: "unsupported", title: "raw.bin" }); expect(app.state.files.previewPager?.index).toBe(2);
+    expect(network.submit).not.toHaveBeenCalled();
+    vi.mocked(network.listWorkspaceDirectory).mockResolvedValue({ entries, revision: "changed-pager-directory" });
+    await expect(app.selectFilesPreviewPage(pager.id, pager.pages[0]!.key)).rejects.toThrow(/directory changed/u);
+    expect(app.state.files.preview).toBeUndefined(); expect(app.state.files.previewPager).toBeUndefined();
+  });
+
+  it("keeps canceled raw pager reads occupied, switches only the selected page and rejects a late old preview", async () => {
+    const entries = ["alpha", "beta", "gamma"].map((name) => create(WorkspaceEntrySchema, { workspaceId: "workspace", relativePath: name + ".txt",
+      displayName: name + ".txt", kind: FileKind.REGULAR, mediaType: "text/plain", revision: { opaqueRevision: name + "-r1", byteSize: BigInt(name.length) } }));
+    const network = fakeNetwork(); configureFiles(network, handoffSnapshot);
+    vi.mocked(network.listWorkspaceDirectory).mockResolvedValue({ entries, revision: "pager-directory" });
+    let finish!: (value: ReturnType<typeof create<typeof FilePreviewSchema>>) => void;
+    vi.mocked(network.readWorkspaceFile).mockImplementation(async (_credential, _workspace, path) => {
+      const entry = entries.find((entry) => entry.relativePath === path)!;
+      const preview = create(FilePreviewSchema, { entry, content: { case: "text", value: { utf8Text: path.split(".")[0]!, startByte: 0n, endByte: entry.revision!.byteSize, totalLines: 1 } } });
+      return path === "beta.txt" ? new Promise<typeof preview>((resolve) => { finish = resolve; }) : preview;
+    });
+    const app = client(network, memoryStorage(credential).storage); await app.start(); await app.openFiles();
+    await app.openFilesPreviewPager({ kind: "workspace-entry", entry: entries[0]! });
+    const pager = app.state.files.previewPager!;
+    const beta = app.selectFilesPreviewPage(pager.id, pager.pages[1]!.key);
+    await vi.waitFor(() => expect(network.readWorkspaceFile).toHaveBeenCalledTimes(2));
+    const gamma = app.selectFilesPreviewPage(pager.id, pager.pages[2]!.key); await beta;
+    expect(app.state.files.preview).toMatchObject({ kind: "loading", title: "gamma.txt" });
+    expect(network.readWorkspaceFile).toHaveBeenCalledTimes(2);
+    finish(create(FilePreviewSchema, { entry: entries[1]!, content: { case: "text", value: { utf8Text: "beta", startByte: 0n, endByte: 4n, totalLines: 1 } } }));
+    await gamma;
+    expect(app.state.files.preview).toMatchObject({ kind: "text", title: "gamma.txt", text: "gamma" });
+    expect(vi.mocked(network.readWorkspaceFile).mock.calls.map((call) => call[2])).toEqual(["alpha.txt", "beta.txt", "gamma.txt"]);
+    app.setForeground(false); expect(app.state.files.previewPager).toBeUndefined();
+  });
+
+  it("pages through the canonical Generated catalog, including missing payloads, and retires a changed catalog", async () => {
+    const body = "\uFEFF<button>Page</button>"; const bytes = new TextEncoder().encode(body);
+    const page = create(ArtifactSchema, { artifactId: "page", sessionId: "session", title: "Page",
+      blob: { blobId: "page-blob", fileName: "page.html", mediaType: "text/html", byteSize: BigInt(bytes.length), sha256Hex: sha256Hex(bytes) } });
+    const missing = create(ArtifactSchema, { artifactId: "missing", sessionId: "session", title: "Missing" });
+    const image = create(ArtifactSchema, { artifactId: "image", sessionId: "session", title: "Image",
+      blob: { blobId: "image-blob", fileName: "image.png", mediaType: "image/png", byteSize: 5n, sha256Hex: "a".repeat(64) } });
+    const network = fakeNetwork(); configureFiles(network);
+    vi.mocked(network.listSessionArtifacts).mockResolvedValue({ artifacts: [page, image, missing], revision: "catalog-r1" });
+    vi.mocked(network.downloadBlob).mockResolvedValue({ bytes, mediaType: "text/html" });
+    const drafts = memoryDraftStores();
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined, undefined, undefined, drafts); await app.start(); await app.openFiles(); app.openGeneratedFiles();
+    await app.openFilesPreviewPager({ kind: "artifact", artifact: app.state.files.artifacts.find((artifact) => artifact.artifactId === "page")! });
+    const pager = app.state.files.previewPager!;
+    expect(pager.pages.map((item) => item.title)).toEqual(["Missing", "Page"]); expect(pager.index).toBe(1);
+    const preview = app.state.files.preview; if (preview?.kind !== "text") throw new Error("Missing Generated HTML");
+    expect(preview.text).toBe(body); expect(preview.fileName).toBe("page.html");
+    const copy = await app.prepareFileTextSourceCopy(preview, new AbortController().signal);
+    expect(copy.text).toBe(body);
+    await app.addFileTextQuoteToComposer(preview, "Page", new AbortController().signal);
+    expect(drafts.composer.readSync({ profileId: credential.profileId, sessionId: "session" })?.atoms)
+      .toMatchObject([{ kind: "file-quote", sourcePath: "page.html", text: "Page" }]);
+    const descriptor = await app.prepareFilesHtmlResources(preview, new AbortController().signal);
+    expect(descriptor).toMatchObject({ html: body, total: 0 }); app.releaseFilesHtmlResources(descriptor.leaseId);
+    expect(network.downloadBlob).toHaveBeenCalledExactlyOnceWith(credential, page.blob, expect.any(AbortSignal));
+    await app.selectFilesPreviewPage(pager.id, pager.pages[0]!.key);
+    expect(() => copy.assertCurrent()).toThrow(/source changed/u);
+    expect(app.state.files.preview).toMatchObject({ kind: "unsupported", title: "Missing" });
+    expect(network.downloadBlob).toHaveBeenCalledOnce();
+    vi.mocked(network.listSessionArtifacts).mockResolvedValue({ artifacts: [page, image, missing], revision: "catalog-r2" });
+    await expect(app.selectFilesPreviewPage(pager.id, pager.pages[1]!.key)).rejects.toThrow(/catalog changed/u);
+    expect(app.state.files.previewPager).toBeUndefined(); expect(app.state.files.preview).toBeUndefined();
+  });
+
+  it("opens a content search result in its actual parent and preserves its initial verified text window", async () => {
+    const parent = "docs"; const path = parent + "/page.txt";
+    const page = create(WorkspaceEntrySchema, { workspaceId: "workspace", relativePath: path, displayName: "page.txt",
+      kind: FileKind.REGULAR, mediaType: "text/plain", revision: { opaqueRevision: "page-r1", byteSize: 4n } });
+    const sibling = create(WorkspaceEntrySchema, { ...page, relativePath: parent + "/next.txt", displayName: "next.txt" });
+    const network = fakeNetwork(); configureFiles(network);
+    vi.mocked(network.listWorkspaceDirectory).mockImplementation(async (_credential, _workspace, directory) => ({
+      entries: directory === parent ? [page, sibling] : [sourceDirectory], revision: "directory-" + directory }));
+    vi.mocked(network.searchWorkspace).mockResolvedValue({ matches: [create(WorkspaceSearchMatchSchema, {
+      relativePath: path, revision: page.revision, linePreview: "page" })], revision: "search-r1", truncated: false, totalFiles: 1 });
+    vi.mocked(network.readWorkspaceFile).mockResolvedValue(create(FilePreviewSchema, { entry: page,
+      content: { case: "text", value: { utf8Text: "page", startByte: 0n, endByte: 4n, totalLines: 1 } } }));
+    const app = client(network, memoryStorage(credential).storage); await app.start(); await app.openFiles(); await app.searchFiles("page", "content", false);
+    const source = { kind: "search-result" as const, result: app.state.files.searchResults[0]! };
+    await app.previewFileSearchResult(source.result); const original = app.state.files.preview;
+    await app.openFilesPreviewPager(source);
+    expect(app.state.files.location).toEqual({ kind: "workspace", path: "" });
+    expect(app.state.files.previewPager?.pages.map((page) => page.title)).toEqual(["next.txt", "page.txt"]);
+    expect(app.state.files.previewPager?.pages[1]!.source).toBe(source); expect(app.state.files.preview).toBe(original);
+    expect(network.readWorkspaceFile).toHaveBeenCalledOnce();
+    expect(network.listWorkspaceDirectory).toHaveBeenLastCalledWith(credential, "workspace", parent, expect.any(AbortSignal));
+    vi.mocked(network.readWorkspaceFile).mockRejectedValueOnce(new Error("The selected file cannot be read."));
+    const pager = app.state.files.previewPager!; await app.selectFilesPreviewPage(pager.id, pager.pages[0]!.key);
+    expect(app.state.files.preview).toMatchObject({ kind: "error", title: "next.txt", mediaType: "text/plain" });
+    expect(app.state.files.previewPager?.index).toBe(0);
+    await app.selectFilesPreviewPage(pager.id, pager.pages[1]!.key);
+    expect(app.state.files.preview).toMatchObject({ kind: "text", title: "page.txt", text: "page" });
+  });
+
+  it("shares the visible original revision and rejects actions from a previous page before dispatch", async () => {
+    const entries = ["alpha", "beta"].map((name) => create(WorkspaceEntrySchema, { workspaceId: "workspace",
+      relativePath: name + ".txt", displayName: name + ".txt", kind: FileKind.REGULAR, mediaType: "text/plain",
+      revision: { opaqueRevision: name + "-observed", byteSize: BigInt(name.length), modifiedAt: { seconds: 100n } } }));
+    const canonical = entries.map((entry, index) => { const name = index === 0 ? "alpha" : "beta"; const digest = sha256Hex(new TextEncoder().encode(name));
+      return create(WorkspaceEntrySchema, { ...entry, revision: create(FileRevisionSchema, { ...entry.revision!,
+        opaqueRevision: "sha256:" + digest + ":" + name.length, sha256Hex: digest }) }); });
+    const network = fakeNetwork(); configureFiles(network);
+    vi.mocked(network.listWorkspaceDirectory).mockResolvedValue({ entries, revision: "share-directory" });
+    vi.mocked(network.readWorkspaceFile).mockImplementation(async (_credential, _workspace, path) => {
+      const entry = canonical.find((item) => item.relativePath === path)!; const text = path.split(".")[0]!;
+      return create(FilePreviewSchema, { entry, content: { case: "text", value: { utf8Text: text, startByte: 0n, endByte: entry.revision!.byteSize, totalLines: 1 } } });
+    });
+    const blob = create(BlobRefSchema, { blobId: "beta-blob", fileName: "beta.txt", mediaType: "text/plain",
+      byteSize: 4n, sha256Hex: canonical[1]!.revision!.sha256Hex });
+    vi.mocked(network.materializeWorkspaceFileBlob).mockImplementation(async (_credential, _workspace, path, expected) => {
+      expect(path).toBe("beta.txt"); expect(expected).toEqual(canonical[1]!.revision); return { entry: canonical[1]!, blob };
+    });
+    vi.mocked(network.authorizeBlobDownload).mockResolvedValue({ url: "http://192.168.1.20:4318/v1/blobs/beta-ticket", headers: {},
+      blobId: blob.blobId, fileName: blob.fileName, mediaType: blob.mediaType, byteSize: 4, sha256Hex: blob.sha256Hex });
+    const perform = vi.fn(async (request: Parameters<MobileFileShare["perform"]>[0]) => { await request.assertCurrent(); request.onDispatch?.(); });
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined, undefined, undefined, undefined,
+      undefined, undefined, undefined, undefined, { perform });
+    await app.start(); await app.openFiles(); await app.openFilesPreviewPager({ kind: "workspace-entry", entry: entries[0]! });
+    const pager = app.state.files.previewPager!; const previous = pager.pages[0]!.source;
+    await app.selectFilesPreviewPage(pager.id, pager.pages[1]!.key); const current = app.state.files.previewPager!.pages[1]!.source;
+    await expect(app.shareFilesItem(previous)).rejects.toThrow(/current file/u);
+    expect(network.materializeWorkspaceFileBlob).not.toHaveBeenCalled();
+    await app.shareFilesItem(current); expect(perform).toHaveBeenCalledOnce();
+    vi.mocked(network.materializeWorkspaceFileBlob).mockRejectedValueOnce(new Error("The file contents changed, despite unchanged size and modification time."));
+    await expect(app.shareFilesItem(current)).rejects.toThrow(/contents changed/u);
+    expect(perform).toHaveBeenCalledOnce(); expect(network.submit).not.toHaveBeenCalled();
+  });
+
+  it("removes the current pager PDF lease when its directory window is retired", async () => {
+    const bytes = previewPdfBytes(); const digest = "f".repeat(64);
+    const pdfEntry = create(WorkspaceEntrySchema, { workspaceId: "workspace", relativePath: "proof.pdf", displayName: "proof.pdf",
+      kind: FileKind.REGULAR, mediaType: "application/pdf", revision: { opaqueRevision: "pdf-r1", byteSize: BigInt(bytes.length), sha256Hex: digest } });
+    const network = fakeNetwork(); configureFiles(network);
+    vi.mocked(network.listWorkspaceDirectory).mockResolvedValue({ entries: [readme, pdfEntry], revision: "pdf-directory" });
+    vi.mocked(network.readWorkspaceFile).mockResolvedValue(create(FilePreviewSchema, { entry: pdfEntry,
+      content: { case: "blob", value: { blobId: "pdf-blob", fileName: "proof.pdf", mediaType: "application/pdf", byteSize: BigInt(bytes.length), sha256Hex: digest } } }));
+    vi.mocked(network.downloadBlob).mockResolvedValue({ bytes, mediaType: "application/pdf" });
+    const pdf = pdfPreviewFixture(); const app = client(network, memoryStorage(credential).storage, undefined, undefined,
+      () => "pager-pdf", undefined, undefined, undefined, undefined, pdf.files);
+    await app.start(); await app.openFiles(); await app.openFilesPreviewPager({ kind: "workspace-entry", entry: pdfEntry });
+    expect(app.state.files.preview).toMatchObject({ kind: "pdf", leaseId: "pager-pdf" });
+    const pager = app.state.files.previewPager!;
+    let finish!: (value: { entries: WorkspaceEntry[]; revision: string }) => void;
+    vi.mocked(network.listWorkspaceDirectory).mockImplementationOnce(async () => new Promise((resolve) => { finish = resolve; }));
+    const navigation = app.selectFilesPreviewPage(pager.id, pager.pages.find((page) => page.title === "README.md")!.key);
+    await vi.waitFor(() => expect(network.listWorkspaceDirectory).toHaveBeenCalledTimes(3));
+    await vi.waitFor(() => expect(pdf.removed).toEqual(["preview-pager-pdf.pdf"]));
+    expect(app.state.files.preview).toMatchObject({ kind: "loading", title: "README.md" });
+    finish({ entries: [readme, pdfEntry], revision: "changed-pdf-directory" });
+    await expect(navigation).rejects.toThrow(/directory changed/u);
+    expect(app.state.files.preview).toBeUndefined(); expect(app.state.files.previewPager).toBeUndefined();
+  });
+
+  it("finishes a timed out preview opening and discards a late directory without leaving loading state", async () => {
+    const network = fakeNetwork(); configureFiles(network); const app = client(network, memoryStorage(credential).storage);
+    await app.start(); await app.openFiles(); const entry = app.state.files.entries.find((item) => item.relativePath === "README.md")!;
+    let finish!: (value: { entries: WorkspaceEntry[]; revision: string }) => void;
+    vi.mocked(network.listWorkspaceDirectory).mockImplementationOnce(async () => new Promise((resolve) => { finish = resolve; }));
+    vi.useFakeTimers();
+    try {
+      const opening = app.openFilesPreviewPager({ kind: "workspace-entry", entry });
+      await vi.advanceTimersByTimeAsync(15_000); await opening;
+      expect(app.state.files.preview).toMatchObject({ kind: "error", reason: expect.stringMatching(/timed out/u) });
+      expect(app.state.files.previewPager).toBeUndefined();
+      finish({ entries: [entry], revision: "late-directory" }); await Promise.resolve(); await Promise.resolve();
+      expect(app.state.files.preview).toMatchObject({ kind: "error" }); expect(app.state.files.previewPager).toBeUndefined();
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("loads HTML resources from the canonical parent and fences exact authenticated source snapshots before and after the batch", async () => {
+    const body = '<script src="./assets/app.js"></script><img src="../private.png"><img src="large.png">';
+    const bytes = new TextEncoder().encode(body); const length = BigInt(bytes.length); const digest = sha256Hex(bytes);
+    const observed = create(FileRevisionSchema, { opaqueRevision: "html-r1", byteSize: length, modifiedAt: { seconds: 100n } });
+    const doc = create(WorkspaceEntrySchema, { workspaceId: "workspace", relativePath: "docs/index.html", displayName: "index.html", kind: FileKind.REGULAR, mediaType: "text/html", revision: observed });
+    const canonical = create(WorkspaceEntrySchema, { ...doc, revision: { ...observed, opaqueRevision: `sha256:${digest}:${length}`, sha256Hex: digest } });
+    const scriptBytes = new TextEncoder().encode('document.title="local"'); const scriptDigest = sha256Hex(scriptBytes);
+    const scriptRevision = create(FileRevisionSchema, { opaqueRevision: "script-r1", byteSize: BigInt(scriptBytes.length), modifiedAt: { seconds: 100n } });
+    const script = create(WorkspaceEntrySchema, { workspaceId: "workspace", relativePath: "docs/assets/app.js", displayName: "app.js", kind: FileKind.REGULAR, mediaType: "text/javascript", revision: scriptRevision });
+    const materialized = create(WorkspaceEntrySchema, { ...script, revision: { ...scriptRevision,
+      opaqueRevision: `sha256:${scriptDigest}:${scriptBytes.length}`, sha256Hex: scriptDigest } });
+    const blob = create(BlobRefSchema, { blobId: "html-script", fileName: "app.js", mediaType: "text/javascript", byteSize: BigInt(scriptBytes.length), sha256Hex: scriptDigest });
+    const large = create(WorkspaceEntrySchema, { workspaceId: "workspace", relativePath: "docs/large.png", displayName: "large.png", kind: FileKind.REGULAR,
+      mediaType: "image/png", revision: { opaqueRevision: "large-r1", byteSize: 2_097_153n } });
+    const network = fakeNetwork(); configureFiles(network, handoffSnapshot);
+    vi.mocked(network.listWorkspaceDirectory).mockImplementation(async (_credential, _workspace, parent) => ({
+      entries: parent === "docs" ? [doc, large] : parent === "docs/assets" ? [script] : [sourceDirectory], revision: "directory-" + parent }));
+    vi.mocked(network.readWorkspaceFile).mockResolvedValue(create(FilePreviewSchema, { entry: canonical,
+      content: { case: "text", value: { utf8Text: body, startByte: 0n, endByte: length, totalLines: 1 } } }));
+    vi.mocked(network.readWorkspaceHtmlSnapshot).mockImplementation(async (_credential, _session, file) => ({ file: {
+      $typeName: "joko.v1.WorkspaceHtmlReference", ...file, expectedRevision: "workspace-html:" + "a".repeat(64) }, html: body }));
+    vi.mocked(network.materializeWorkspaceFileBlob).mockResolvedValue({ entry: materialized, blob });
+    vi.mocked(network.downloadBlob).mockResolvedValue({ bytes: scriptBytes, mediaType: "text/javascript" });
+    const app = client(network, memoryStorage(credential).storage); await app.start(); await app.openFiles(); await app.openFilesDirectory("docs");
+    await app.previewWorkspaceEntry(app.state.files.entries.find((entry) => entry.relativePath === doc.relativePath)!);
+    const preview = app.state.files.preview; if (preview?.kind !== "text") throw new Error("HTML fixture missing");
+    const descriptor = await app.prepareFilesHtmlResources(preview, new AbortController().signal);
+    expect(descriptor).toMatchObject({ total: 2, failed: 0, overBudget: 1 }); expect(descriptor.html).toContain("data:text/javascript;base64,");
+    expect(vi.mocked(network.readWorkspaceHtmlSnapshot).mock.calls.map((call) => call[2].expectedRevision)).toEqual(["", "workspace-html:" + "a".repeat(64)]);
+    expect(network.readWorkspaceHtmlSnapshot).toHaveBeenCalledWith(credential, handoffSnapshot.sessions[0]!.sessionId,
+      { workspaceId: "workspace", relativePath: doc.relativePath, expectedRevision: "" }, expect.any(AbortSignal));
+    expect(network.readWorkspaceFile).toHaveBeenCalledOnce();
+    expect(network.materializeWorkspaceFileBlob).toHaveBeenCalledExactlyOnceWith(credential, "workspace", script.relativePath, scriptRevision, expect.any(AbortSignal));
+    expect(network.downloadBlob).toHaveBeenCalledExactlyOnceWith(credential, blob, expect.any(AbortSignal));
+    await expect(app.prepareFilesHtmlResources({ ...preview }, new AbortController().signal)).rejects.toThrow(/current complete file source/u);
+    vi.mocked(network.readWorkspaceHtmlSnapshot).mockResolvedValueOnce({ file: { $typeName: "joko.v1.WorkspaceHtmlReference", workspaceId: "workspace",
+      relativePath: doc.relativePath, expectedRevision: "workspace-html:" + "b".repeat(64) }, html: body }).mockResolvedValueOnce({
+        file: { $typeName: "joko.v1.WorkspaceHtmlReference", workspaceId: "workspace", relativePath: doc.relativePath, expectedRevision: "workspace-html:" + "b".repeat(64) }, html: "same-size change" });
+    await expect(app.prepareFilesHtmlResources(preview, new AbortController().signal)).rejects.toThrow(/snapshot changed/u);
+    app.closeFilesPreview(); expect(() => app.assertFilesHtmlResourcesCurrent(descriptor.leaseId)).toThrow(/released/u);
+    expect(app.filesHtmlResourceOwnerKey(preview)).toBeUndefined(); expect(network.submit).not.toHaveBeenCalled();
+  });
+
   it("freezes conversation images from authenticated canonical sources and rejects deletion before sharing", async () => {
     const bytes = galleryPngBytes(5, 4);
     const event = timelineGalleryEvent(bytes);
@@ -8724,6 +9072,31 @@ describe("native current-task Files ownership", () => {
     app.closeTimelinePreview();
     await vi.waitFor(() => expect(media.removed).toEqual(["preview-timeline-media-lease.mp4"]));
     expect(app.state.timelinePreview).toBeUndefined();
+  });
+
+  it("renders a current durable Timeline HTML file without borrowing Workspace resource authority", async () => {
+    const html = '<button onclick="this.textContent=1">Run</button>'; const bytes = new TextEncoder().encode(html);
+    const event = timelinePreviewEvent("page.html", "text/html", bytes, sha256Hex(bytes), "Page");
+    const network = projectedNetwork(timelineGallerySnapshot(event));
+    vi.mocked(network.downloadBlob).mockResolvedValue({ bytes, mediaType: "text/html" });
+    const drafts = memoryDraftStores();
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined, undefined, undefined, drafts); await app.start();
+    await app.previewTimelineArtifact(timelineRows(app.state.detail?.timeline ?? [])[0]!.artifacts![0]!);
+    const preview = app.state.timelinePreview; if (preview?.kind !== "text") throw new Error("Missing HTML preview");
+    expect(app.filesHtmlResourceOwnerKey(preview)).toBeTruthy();
+    vi.mocked(network.readAround).mockResolvedValue([event]);
+    const copy = await app.prepareFileTextSourceCopy(preview, new AbortController().signal); expect(copy.text).toBe(html);
+    await app.addFileTextQuoteToComposer(preview, "Run", new AbortController().signal);
+    expect(drafts.composer.readSync({ profileId: credential.profileId, sessionId: "session" })?.atoms)
+      .toMatchObject([{ kind: "file-quote", sourcePath: "page.html", text: "Run" }]);
+    vi.mocked(network.readAround).mockResolvedValue([]);
+    await expect(app.prepareFileTextSourceCopy(preview, new AbortController().signal)).rejects.toThrow(/Timeline text file changed/u);
+    const descriptor = await app.prepareFilesHtmlResources(preview, new AbortController().signal);
+    expect(descriptor).toMatchObject({ html, total: 0, failed: 0 });
+    expect(network.listWorkspaceDirectory).not.toHaveBeenCalled(); expect(network.readWorkspaceHtmlSnapshot).not.toHaveBeenCalled();
+    app.closeTimelinePreview(); expect(app.filesHtmlResourceOwnerKey(preview)).toBeUndefined();
+    expect(() => copy.assertCurrent()).toThrow(/source changed/u);
+    await expect(app.prepareFilesHtmlResources(preview, new AbortController().signal)).rejects.toThrow(/current complete/u);
   });
 
   it("previews an exact durable Timeline PDF and retires it on background", async () => {

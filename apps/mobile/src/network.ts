@@ -18,7 +18,7 @@ import {
   type Event, type EventCursor, type FilePreview, type FileRevision, type Operation, type OperationMutation,
   type NativeSessionTree, type PendingBlobUpload, type RuntimeCommand, type Schedule, type ScheduleRunHistory,
   type SchedulerRuntimeSnapshot, type SessionMessageSearchMatch, type SessionResource, type Snapshot, type Target,
-  type WorkspaceEntry, type WorkspaceFileChange, type ListPartnerSessionsResponse,
+  type WorkspaceEntry, type WorkspaceFileChange, type WorkspaceHtmlReference, type ListPartnerSessionsResponse,
   type WorkspaceSearchMatch, type WorkspaceChangeSet, type WorkspaceRewindPreview
 } from "@joko/contracts";
 import {
@@ -134,6 +134,8 @@ export interface MobileNetwork {
   searchWorkspace(credential: PairedCredential, workspaceId: string, query: string, caseSensitive: boolean, signal?: AbortSignal): Promise<WorkspaceSearchSnapshot>;
   watchWorkspace(credential: PairedCredential, workspaceId: string, signal: AbortSignal): AsyncIterable<WorkspaceFileChange>;
   readWorkspaceFile(credential: PairedCredential, workspaceId: string, relativePath: string, revision: FileRevision, signal?: AbortSignal): Promise<FilePreview>;
+  readWorkspaceHtmlSnapshot(credential: PairedCredential, sessionId: string, file: Pick<WorkspaceHtmlReference, "workspaceId" | "relativePath" | "expectedRevision">,
+    signal?: AbortSignal): Promise<{ readonly file: WorkspaceHtmlReference; readonly html: string }>;
   materializeWorkspaceFileBlob(credential: PairedCredential, workspaceId: string, relativePath: string, revision: FileRevision, signal?: AbortSignal): Promise<MaterializedWorkspaceBlob>;
   listSessionArtifacts(credential: PairedCredential, sessionId: string, signal?: AbortSignal): Promise<ArtifactCatalogSnapshot>;
   listRuntimeCommands(credential: PairedCredential, sessionId: string, signal?: AbortSignal): Promise<readonly RuntimeCommand[]>;
@@ -1353,6 +1355,22 @@ export const mobileNetwork: MobileNetwork = {
       requireBlob: true
     }, options(signal));
     return assertMaterializedWorkspaceBlob(workspaceId, path, revision, response.preview);
+  },
+  async readWorkspaceHtmlSnapshot(credential, sessionId, file, signal) {
+    const relativePath = canonicalWorkspacePath(file.relativePath);
+    if (!sessionId || !file.workspaceId || file.expectedRevision !== "" && !/^workspace-html:[0-9a-f]{64}$/u.test(file.expectedRevision)) {
+      throw new Error("A current task and canonical HTML snapshot reference are required.");
+    }
+    const response = await createClient(WorkspaceService, transport(credential.origin, credential.authKey))
+      .readWorkspaceHtmlSnapshot({ sessionId, file: { ...file, relativePath } }, options(signal));
+    signal?.throwIfAborted();
+    if (!response.file || response.file.workspaceId !== file.workspaceId || response.file.relativePath !== relativePath
+      || !/^workspace-html:[0-9a-f]{64}$/u.test(response.file.expectedRevision)
+      || file.expectedRevision !== "" && response.file.expectedRevision !== file.expectedRevision
+      || new TextEncoder().encode(response.utf8Html).byteLength > 2_097_152) {
+      throw new Error("The Joko node returned a mismatched complete HTML snapshot.");
+    }
+    return { file: response.file, html: response.utf8Html };
   },
   async listSessionArtifacts(credential, sessionId, signal) {
     if (!sessionId) throw new Error("A current task is required for Generated files.");

@@ -1,6 +1,6 @@
 export interface MobileFilesClipboardLease {
   readonly text: string;
-  readonly kind: "path" | "file-name";
+  readonly kind: "path" | "file-name" | "source";
   assertCurrent(signal?: AbortSignal): void;
 }
 export type MobileFilesClipboardResult = "copied" | "failed" | "retired" | "unknown" | "busy";
@@ -10,9 +10,11 @@ export class MobileFilesClipboard {
   #active?: { readonly controller: AbortController };
   constructor(private readonly write: (text: string) => Promise<boolean>) {}
   cancel(): void { this.#active?.controller.abort(); }
-  async copy(lease: MobileFilesClipboardLease): Promise<MobileFilesClipboardResult> {
+  async copy(lease: MobileFilesClipboardLease, cancellation?: AbortSignal): Promise<MobileFilesClipboardResult> {
     if (this.#active) return "busy";
     const current = { controller: new AbortController() }; this.#active = current;
+    const cancel = () => current.controller.abort();
+    cancellation?.addEventListener("abort", cancel, { once: true }); if (cancellation?.aborted) cancel();
     const signal = current.controller.signal; let timer: ReturnType<typeof setTimeout> | undefined; let abort!: () => void;
     let raw: Promise<boolean> | undefined;
     try {
@@ -28,6 +30,7 @@ export class MobileFilesClipboard {
       try { lease.assertCurrent(signal); signal.throwIfAborted(); return "failed"; } catch { return "retired"; }
     } finally {
       if (timer) clearTimeout(timer); if (abort) signal.removeEventListener("abort", abort);
+      cancellation?.removeEventListener("abort", cancel);
       if (!raw && this.#active === current) this.#active = undefined;
     }
   }
