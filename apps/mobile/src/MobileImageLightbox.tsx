@@ -71,6 +71,7 @@ interface MobileImageLightboxGalleryControls {
   readonly pageIndex: number;
   readonly pageKey: string;
   readonly preview?: MobileTimelineImagePreview;
+  readonly adjacentPreviews?: readonly { readonly pageIndex: number; readonly preview: MobileTimelineImagePreview }[];
   readonly busy: boolean;
   readonly error?: string;
   readonly onRetry: () => void;
@@ -163,6 +164,8 @@ export function MobileImageLightbox({
   const tapTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const dismissResetTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const dismissY = useRef(new Animated.Value(0)).current;
+  const pageX = useRef(new Animated.Value(0)).current;
+  const pageAnimationRef = useRef<{ readonly id: object; readonly timer: ReturnType<typeof setTimeout> } | undefined>(undefined);
   const saveControllerRef = useRef<AbortController | undefined>(undefined);
   const closedRef = useRef(false);
   const nativeActivityRef = useRef(false);
@@ -194,16 +197,22 @@ export function MobileImageLightbox({
     dismissY.stopAnimation();
     dismissY.setValue(0);
   }, [dismissY]);
+  const resetPage = useCallback(() => {
+    if (pageAnimationRef.current) clearTimeout(pageAnimationRef.current.timer);
+    pageAnimationRef.current = undefined;
+    pageX.stopAnimation(); pageX.setValue(0);
+  }, [pageX]);
   const cancelGesture = useCallback(() => {
     clearPendingTap();
     resetDismiss();
+    resetPage();
     gestureRef.current = undefined;
     setChromeBusy(false);
     draftStrokeRef.current = undefined;
     setDraftStroke(undefined);
-  }, [clearPendingTap, resetDismiss]);
+  }, [clearPendingTap, resetDismiss, resetPage]);
   const canInteract = useCallback(() => !closedRef.current && loadOwnerRef.current === loadKey
-    && AppState.currentState === "active" && !saveControllerRef.current && !nativeActivityRef.current, [loadKey]);
+    && AppState.currentState === "active" && !saveControllerRef.current && !nativeActivityRef.current && !pageAnimationRef.current, [loadKey]);
 
   useEffect(() => {
     cancelGesture();
@@ -269,6 +278,7 @@ export function MobileImageLightbox({
       closedRef.current = true;
       clearPendingTap();
       resetDismiss();
+      resetPage();
       gestureRef.current = undefined;
       subscription.remove();
       saveControllerRef.current?.abort();
@@ -277,7 +287,7 @@ export function MobileImageLightbox({
         nativeActivityCallbackRef.current?.(false);
       }
     };
-  }, [close, cancelGesture, clearPendingTap, resetDismiss]);
+  }, [close, cancelGesture, clearPendingTap, resetDismiss, resetPage]);
 
   useEffect(() => {
     const next = clampMobileImageTransform(transformRef.current, container, natural);
@@ -292,6 +302,7 @@ export function MobileImageLightbox({
       if (!canInteract()) return;
       clearPendingTap(false);
       resetDismiss();
+      resetPage();
       setError("");
       const points = responderTouches(event);
       const first = points[0] ?? { x: event.nativeEvent.locationX, y: event.nativeEvent.locationY };
@@ -355,6 +366,7 @@ export function MobileImageLightbox({
         if (active.mode !== "transform") {
           clearPendingTap();
           resetDismiss();
+          resetPage();
           draftStrokeRef.current = undefined;
           setDraftStroke(undefined);
           active = {
@@ -408,6 +420,16 @@ export function MobileImageLightbox({
       if (active.mode === "pan") {
         if (mobileLightboxIsZoomed(transformRef.current.scale) && active.maxDistance >= 1) setChromeBusy(true);
         if (Math.abs(gestureState.dx) > 12) active.dismissRejected = true;
+        const activeGallery = galleryRef.current;
+        if (!annotatingRef.current && !mobileLightboxIsZoomed(transformRef.current.scale) && activeGallery
+          && activeGallery.descriptor.pages.length > 1 && Math.abs(gestureState.dx) > 12
+          && Math.abs(gestureState.dx) > Math.abs(gestureState.dy) * 1.2) active.mode = "page";
+        if (active.mode === "page") {
+          clearPendingTap(); setChromeBusy(true);
+          const hasPage = gestureState.dx < 0 ? activeGallery!.pageIndex + 1 < activeGallery!.descriptor.pages.length : activeGallery!.pageIndex > 0;
+          pageX.setValue(Math.max(-containerRef.current.width, Math.min(containerRef.current.width, gestureState.dx * (hasPage ? 1 : 0.25))));
+          return;
+        }
         if (!active.dismissRejected && !annotatingRef.current
           && mobileLightboxCanStartDismiss(gestureState.dx, gestureState.dy, transformRef.current.scale)) {
           active.mode = "dismiss";
@@ -423,6 +445,10 @@ export function MobileImageLightbox({
         setTransform(next);
       } else if (active.mode === "dismiss") {
         dismissY.setValue(gestureState.dy);
+      } else if (active.mode === "page") {
+        const current = galleryRef.current!;
+        const hasPage = gestureState.dx < 0 ? current.pageIndex + 1 < current.descriptor.pages.length : current.pageIndex > 0;
+        pageX.setValue(Math.max(-containerRef.current.width, Math.min(containerRef.current.width, gestureState.dx * (hasPage ? 1 : 0.25))));
       }
     },
     onPanResponderRelease: (_event, gestureState) => {
@@ -432,6 +458,25 @@ export function MobileImageLightbox({
       gestureRef.current = undefined;
       setChromeBusy(false);
       if (!active) return;
+      if (active.mode === "page") {
+        const current = galleryRef.current!;
+        const nextPage = mobileLightboxSwipePageIndex({ currentIndex: current.pageIndex, pageCount: current.descriptor.pages.length,
+          translationX: gestureState.dx, translationY: gestureState.dy, velocityX: gestureState.vx * 1_000,
+          scale: transformRef.current.scale, annotating: annotatingRef.current });
+        const id = {};
+        const timer = setTimeout(() => { if (pageAnimationRef.current?.id === id) { resetPage(); setChromeBusy(false); } }, 1_000);
+        pageAnimationRef.current = { id, timer }; setChromeBusy(true);
+        const animation = nextPage === undefined
+          ? Animated.spring(pageX, { toValue: 0, damping: 20, stiffness: 240, useNativeDriver: true })
+          : Animated.timing(pageX, { toValue: nextPage < current.pageIndex ? containerRef.current.width : -containerRef.current.width,
+            duration: 180, useNativeDriver: true });
+        animation.start(({ finished }) => {
+          if (pageAnimationRef.current?.id !== id || loadOwnerRef.current !== loadKey) return;
+          resetPage(); setChromeBusy(false);
+          if (finished && nextPage !== undefined && canInteract() && galleryRef.current?.pageKey === current.pageKey) current.onNavigate(nextPage);
+        });
+        return;
+      }
       if (active.mode === "dismiss") {
         clearPendingTap();
         // PanResponder velocity is points per millisecond; the dismissal threshold uses points per second.
@@ -518,7 +563,7 @@ export function MobileImageLightbox({
     onPanResponderTerminate: () => {
       if (loadOwnerRef.current === loadKey) cancelGesture();
     }
-  }), [locale, annotatable, initialStrokes, canInteract, cancelGesture, clearPendingTap, resetDismiss, dismissY, close, loadKey]);
+  }), [locale, annotatable, initialStrokes, canInteract, cancelGesture, clearPendingTap, resetDismiss, resetPage, dismissY, pageX, close, loadKey]);
 
   const displayed = mobileContainedImageSize(container, natural);
   const paths = [...strokes, ...(draftStroke ? [draftStroke] : [])];
@@ -743,6 +788,20 @@ export function MobileImageLightbox({
       }) }]} />
       <View accessibilityRole="image" accessibilityLabel={mobileMessage(locale, "image.previewLabel", { name: fileName })}
         style={styles.canvas} onLayout={updateContainer} {...panResponder.panHandlers}>
+        <Animated.View pointerEvents="none" style={[styles.pageStrip, { transform: [{ translateX: pageX }] }]}>
+        {gallery && [-1, 1].map((delta) => {
+          const index = gallery.pageIndex + delta; const neighbor = gallery.descriptor.pages[index];
+          if (!neighbor) return null;
+          const preview = gallery.adjacentPreviews?.find((item) => item.pageIndex === index)?.preview;
+          return <View key={neighbor.pageId} accessibilityElementsHidden importantForAccessibility="no-hide-descendants"
+            style={[styles.adjacentPage, { left: delta * container.width, width: container.width }]}>
+            {preview ? <PreviewImage key={preview.leaseId} accessible={false} source={{ uri: preview.uri }} contentFit="contain"
+              cachePolicy="none" autoplay={false} style={styles.image}
+              onError={() => { if (!closedRef.current && loadOwnerRef.current === loadKey
+                && galleryRef.current?.adjacentPreviews?.some((item) => item.pageIndex === index && item.preview.leaseId === preview.leaseId)) galleryRef.current.onPreviewFailed(preview.leaseId); }} />
+              : <View style={styles.adjacentLoading}><ActivityIndicator color="#ff9800" /><Text numberOfLines={1} style={styles.meta}>{neighbor.title}</Text></View>}
+          </View>;
+        })}
         {displayed.width > 0 && displayed.height > 0 && <Animated.View pointerEvents="none" style={[
           styles.imagePosition,
           {
@@ -807,6 +866,7 @@ export function MobileImageLightbox({
         {!drawingReady && !visibleError && <View pointerEvents="none" style={styles.loading}>
           <ActivityIndicator color="#ff9800" />
         </View>}
+        </Animated.View>
       </View>
       <Animated.View testID="image-lightbox-chrome" pointerEvents={chromeBusy ? "none" : "box-none"}
         accessibilityElementsHidden={chromeBusy} importantForAccessibility={chromeBusy ? "no-hide-descendants" : "auto"}
@@ -964,6 +1024,9 @@ const styles = StyleSheet.create({
   fileName: { color: "#f7f6f3", fontSize: 16, lineHeight: 21, fontWeight: "700" },
   meta: { color: "#adb6b7", fontSize: 12, lineHeight: 17 },
   canvas: { flex: 1, overflow: "hidden" },
+  pageStrip: { position: "absolute", inset: 0 },
+  adjacentPage: { position: "absolute", top: 0, bottom: 0 },
+  adjacentLoading: { flex: 1, alignItems: "center", justifyContent: "center", padding: 24, gap: 12 },
   imagePosition: { position: "absolute" },
   imageScale: { flex: 1 },
   image: { position: "absolute", inset: 0 },

@@ -5763,6 +5763,7 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
       gallery={{
         descriptor: imageGallery.view.descriptor, pageIndex: imageGallery.view.pageIndex, pageKey: imageGallery.view.pageKey,
         ...(imageGallery.view.preview ? { preview: imageGallery.view.preview } : {}),
+        ...(imageGallery.view.adjacentPreviews ? { adjacentPreviews: imageGallery.view.adjacentPreviews } : {}),
         busy: imageGallery.view.busy,
         ...(imageGallery.view.failed ? { error: mobileMessage(locale, "image.previewFailed") } : {}),
         onRetry: imageGallery.retry, onNativeFailed: imageGallery.nativeFailed, onPreviewFailed: imageGallery.previewFailed,
@@ -6223,6 +6224,7 @@ function FilesScreen({ colors, state, locale, onBack, onAdded, initialSource }: 
       gallery={{
         descriptor: imageGallery.view.descriptor, pageIndex: imageGallery.view.pageIndex, pageKey: imageGallery.view.pageKey,
         ...(imageGallery.view.preview ? { preview: imageGallery.view.preview } : {}),
+        ...(imageGallery.view.adjacentPreviews ? { adjacentPreviews: imageGallery.view.adjacentPreviews } : {}),
         busy: imageGallery.view.busy,
         ...(imageGallery.view.failed ? { error: mobileMessage(locale, "image.previewFailed") } : {}),
         onRetry: imageGallery.retry, onNativeFailed: imageGallery.nativeFailed, onPreviewFailed: imageGallery.previewFailed,

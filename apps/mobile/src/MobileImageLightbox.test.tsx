@@ -9,7 +9,8 @@ import { mobileMessage } from "./mobile-messages";
 
 const native = vi.hoisted(() => ({ state: "active", listeners: new Set<(state: string) => void>(),
   images: new Map<string, ImageProps>(), layout: undefined as ((event: unknown) => void) | undefined,
-  gestures: undefined as PanResponderCallbacks | undefined, offset: 0, spring: vi.fn(), burn: vi.fn() }));
+  gestures: undefined as PanResponderCallbacks | undefined, offset: 0, spring: vi.fn(), burn: vi.fn(), valueIndex: 0, pageOffset: 0,
+  autoAnimate: true, timing: vi.fn(), finishAnimation: undefined as ((result: { finished: boolean }) => void) | undefined }));
 vi.mock("react-native", () => {
   const box = ({ children, testID, pointerEvents, accessibilityElementsHidden, importantForAccessibility }: {
     children?: ReactNode; testID?: string; pointerEvents?: string; accessibilityElementsHidden?: boolean; importantForAccessibility?: string;
@@ -25,10 +26,14 @@ vi.mock("react-native", () => {
       createElement("button", { onClick: onPress, "aria-label": accessibilityLabel, disabled }, children),
     PanResponder: { create: (gestures: PanResponderCallbacks) => { native.gestures = gestures; return { panHandlers: {} }; } },
     Animated: { View: box, Value: class {
-      setValue(value: number) { native.offset = value; }
+      readonly index = native.valueIndex++;
+      setValue(value: number) { if (this.index === 0) native.offset = value; else if (this.index === 1) native.pageOffset = value; }
       stopAnimation() {}
       interpolate() { return 1; }
-    }, spring: (...args: unknown[]) => { native.spring(...args); return { start() {} }; } },
+    }, spring: (...args: unknown[]) => { native.spring(...args); return { start() {} }; },
+    timing: (...args: unknown[]) => { native.timing(...args); return { start(callback: (result: { finished: boolean }) => void) {
+      native.finishAnimation = callback; if (native.autoAnimate) callback({ finished: true });
+    } }; } },
     StyleSheet: { create: (value: unknown) => value, absoluteFillObject: {} },
     AppState: { get currentState() { return native.state; }, addEventListener: (_event: string, listener: (state: string) => void) => {
       native.listeners.add(listener); return { remove: () => native.listeners.delete(listener) };
@@ -53,6 +58,7 @@ beforeEach(() => {
   decoded.mockReset(); output.mockReset(); save.mockReset(); nativeActivity.mockReset();
   nativeFailed.mockReset(); retry.mockReset(); previewFailed.mockReset();
   native.gestures = undefined; native.offset = 0; native.spring.mockReset();
+  native.valueIndex = 0; native.pageOffset = 0; native.autoAnimate = true; native.timing.mockReset(); native.finishAnimation = undefined;
   host = document.body.appendChild(document.createElement("div")); root = createRoot(host);
 });
 afterEach(async () => {
@@ -103,6 +109,48 @@ async function drag(dx: number, dy: number, vy = 0) {
 }
 
 describe("lightbox dismissal and gesture ownership", () => {
+  it("follows horizontal drags with cached neighbors, commits a distance or fast swipe, and retires bounce and slide callbacks", async () => {
+    vi.useFakeTimers(); native.autoAnimate = false;
+    const page = session("image/png", false); const navigate = vi.fn();
+    const preview = { leaseId: "neighbor", uri: "data:image/png;base64,neighbor", width: 1, height: 1, mediaType: "image/png", animated: false };
+    const gallery = { ...controls(page), onNavigate: navigate, adjacentPreviews: [{ pageIndex: 1, preview }] };
+    await act(async () => root.render(createElement(MobileImageLightbox, { session: page, locale: "en", onClose: close, onSave: save, gallery })));
+    await act(async () => native.layout?.({ nativeEvent: { layout: { width: 400, height: 300 } } }));
+    expect(native.images.get(preview.uri)?.autoplay).toBe(false);
+    const oldNeighborError = native.images.get(preview.uri)!.onError!;
+    await act(async () => native.gestures!.onPanResponderGrant!(touch(), motion()));
+    await act(async () => native.gestures!.onPanResponderMove!(touch([{ x: 120, y: 150 }]), motion(-80)));
+    expect(native.pageOffset).toBe(-80); expect(navigate).not.toHaveBeenCalled();
+    await act(async () => native.gestures!.onPanResponderRelease!(touch([]), motion(-80)));
+    expect(native.timing).toHaveBeenLastCalledWith(expect.anything(), expect.objectContaining({ toValue: -400, useNativeDriver: true }));
+    expect(navigate).not.toHaveBeenCalled(); await act(async () => native.finishAnimation!({ finished: true }));
+    expect(navigate).toHaveBeenCalledExactlyOnceWith(1); expect(native.pageOffset).toBe(0);
+    navigate.mockClear();
+    await drag(40, 0); expect(native.pageOffset).toBe(10); expect(navigate).not.toHaveBeenCalled();
+    await act(async () => vi.advanceTimersByTime(1_000)); expect(native.pageOffset).toBe(0);
+    await drag(-30, 0); expect(native.pageOffset).toBe(-30);
+    await act(async () => vi.advanceTimersByTime(1_000)); expect(native.pageOffset).toBe(0); expect(navigate).not.toHaveBeenCalled();
+    await act(async () => {
+      native.gestures!.onPanResponderGrant!(touch(), motion());
+      native.gestures!.onPanResponderMove!(touch([{ x: 170, y: 150 }]), motion(-30));
+      native.gestures!.onPanResponderRelease!(touch([]), { ...motion(-30), vx: -0.801 });
+    });
+    expect(native.timing).toHaveBeenCalledTimes(2);
+    await act(async () => native.finishAnimation!({ finished: true })); expect(navigate).toHaveBeenCalledExactlyOnceWith(1);
+    navigate.mockClear(); await drag(-80, 0);
+    const retired = native.finishAnimation!;
+    await act(async () => native.layout?.({ nativeEvent: { layout: { width: 300, height: 400 } } }));
+    await act(async () => retired({ finished: true })); expect(navigate).not.toHaveBeenCalled(); expect(native.pageOffset).toBe(0);
+    await act(async () => native.gestures!.onPanResponderGrant!(touch(), motion()));
+    await act(async () => native.gestures!.onPanResponderMove!(touch([{ x: 120, y: 150 }]), motion(-80)));
+    await act(async () => native.gestures!.onPanResponderMove!(touch([{ x: 180, y: 150 }, { x: 220, y: 150 }]), motion(-80)));
+    expect(native.pageOffset).toBe(0); await act(async () => native.gestures!.onPanResponderRelease!(touch([]), motion(-80)));
+    expect(navigate).not.toHaveBeenCalled();
+    await render(session("image/png", false, "different-page"));
+    await act(async () => oldNeighborError({ error: "retired preview" })); expect(previewFailed).not.toHaveBeenCalled();
+    expect(close).not.toHaveBeenCalled(); expect(output).not.toHaveBeenCalled();
+  });
+
   it("lets pinch and zoomed pan own the whole canvas and restores overlay controls after release, cancellation and rotation", async () => {
     const page = { ...session("image/png", false), annotatable: true }; await render(page); await load(page);
     const chrome = () => host.querySelector('[data-testid="image-lightbox-chrome"]')!;

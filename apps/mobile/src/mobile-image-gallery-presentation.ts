@@ -9,6 +9,7 @@ export interface MobileImageGalleryView {
   readonly pageKey: string;
   readonly session?: MobileImageGalleryPageSession;
   readonly preview?: MobileTimelineImagePreview;
+  readonly adjacentPreviews?: readonly { readonly pageIndex: number; readonly preview: MobileTimelineImagePreview }[];
   readonly busy: boolean;
   readonly failed: boolean;
 }
@@ -27,12 +28,19 @@ export class MobileImageGalleryPresenter {
   get snapshot(): MobileImageGalleryView | undefined { return this.#view; }
   subscribe = (listener: () => void): (() => void) => { this.#listeners.add(listener); return () => this.#listeners.delete(listener); };
   #set(view: MobileImageGalleryView | undefined): void { this.#view = view; for (const listener of this.#listeners) listener(); }
+  #releasePreviews(view: MobileImageGalleryView | undefined, discard = false): void {
+    if (!view) return;
+    const previews = [...(view.preview ? [view.preview] : []), ...(view.adjacentPreviews?.map((item) => item.preview) ?? [])];
+    for (const id of new Set(previews.map((preview) => preview.leaseId))) {
+      this.client.releaseImageGalleryPreview(view.descriptor.leaseId, id, discard && view.preview?.leaseId === id);
+    }
+  }
 
   close = (): void => {
-    this.#opening?.abort(); this.#opening = undefined; this.#controller?.abort(); this.#controller = undefined;
-    const previous = this.#view; this.#set(undefined); this.#nativeRetries.clear();
+    this.#opening?.abort(); this.#opening = undefined;
+    const previous = this.#view; this.#releasePreviews(previous);
+    this.#controller?.abort(); this.#controller = undefined; this.#set(undefined); this.#nativeRetries.clear();
     if (previous) {
-      if (previous.preview) this.client.releaseImageGalleryPreview(previous.descriptor.leaseId, previous.preview.leaseId);
       this.client.cancelImageGallery(previous.descriptor.leaseId);
     }
   };
@@ -64,29 +72,33 @@ export class MobileImageGalleryPresenter {
     if (automatically && !this.#nativeRetries.has(key)) {
       this.#nativeRetries.add(key); this.#startPage(current.descriptor, current.pageIndex, true); return;
     }
-    this.#controller?.abort();
+    this.#releasePreviews(current, true); this.#controller?.abort();
     this.client.discardImageGalleryPage(current.descriptor.leaseId, loadId);
-    if (current.preview) this.client.releaseImageGalleryPreview(current.descriptor.leaseId, current.preview.leaseId, true);
     this.#set({ descriptor: current.descriptor, pageIndex: current.pageIndex, pageKey: current.pageKey, busy: false, failed: true });
   };
   previewFailed = (previewId: string): void => {
-    const current = this.#view; if (!current || current.preview?.leaseId !== previewId) return;
+    const current = this.#view;
+    if (!current || current.preview?.leaseId !== previewId && !current.adjacentPreviews?.some((item) => item.preview.leaseId === previewId)) return;
     this.client.releaseImageGalleryPreview(current.descriptor.leaseId, previewId, true);
-    const { preview: _preview, ...rest } = current; this.#set(rest);
+    if (current.preview?.leaseId === previewId) { const { preview: _preview, ...rest } = current; this.#set(rest); }
+    else this.#set({ ...current, adjacentPreviews: current.adjacentPreviews!.filter((item) => item.preview.leaseId !== previewId) });
   };
 
   #startPage(descriptor: MobileImageGalleryDescriptor, pageIndex: number, refresh: boolean): void {
-    this.#controller?.abort(); const previous = this.#view;
-    if (previous?.preview) this.client.releaseImageGalleryPreview(previous.descriptor.leaseId, previous.preview.leaseId, refresh);
+    this.#releasePreviews(this.#view, refresh); this.#controller?.abort();
     this.client.discardImageGalleryPage(descriptor.leaseId);
     const controller = new AbortController(); this.#controller = controller;
     const pageKey = `${descriptor.leaseId}:${pageIndex}:${++this.#attempt}`;
     this.#set({ descriptor, pageIndex, pageKey, busy: true, failed: false });
-    if (!refresh) void this.client.pinImageGalleryCachedPreview(descriptor.leaseId, pageIndex, controller.signal).then((preview) => {
-      if (!preview) return;
-      if (controller.signal.aborted || this.#view?.pageKey !== pageKey) { this.client.releaseImageGalleryPreview(descriptor.leaseId, preview.leaseId); return; }
-      this.#set({ ...this.#view, preview });
-    }, () => undefined);
+    if (!refresh) for (const index of [pageIndex, pageIndex - 1, pageIndex + 1]) {
+      if (!descriptor.pages[index]) continue;
+      void this.client.pinImageGalleryCachedPreview(descriptor.leaseId, index, controller.signal).then((preview) => {
+        if (!preview) return;
+        if (controller.signal.aborted || this.#view?.pageKey !== pageKey) { this.client.releaseImageGalleryPreview(descriptor.leaseId, preview.leaseId); return; }
+        if (index === pageIndex) this.#set({ ...this.#view, preview });
+        else this.#set({ ...this.#view, adjacentPreviews: [...(this.#view.adjacentPreviews ?? []), { pageIndex: index, preview }] });
+      }, () => undefined);
+    }
     void this.#read(descriptor, pageIndex, pageKey, controller);
   }
   async #read(descriptor: MobileImageGalleryDescriptor, pageIndex: number, pageKey: string, controller: AbortController): Promise<void> {

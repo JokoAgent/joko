@@ -21,6 +21,39 @@ function fixture() {
 async function settle() { await Promise.resolve(); await Promise.resolve(); await Promise.resolve(); }
 
 describe("progressive canonical gallery presentation", () => {
+  it("pins only the current and adjacent cached pages, releasing retired or late pins without reading adjacent originals", async () => {
+    const { presenter, client, descriptor, session, preview } = fixture();
+    const window = { ...descriptor, initialIndex: 2, pages: Array.from({ length: 5 }, (_, index) => ({
+      ...descriptor.pages[0]!, pageId: `page-${index}`, title: `${index}.png`
+    })) };
+    client.loadImageGalleryPage.mockImplementation(async (_id, index) => ({ ...session(0), leaseId: `original-${index}`,
+      pageIndex: index, pageId: window.pages[index]!.pageId, pageCount: 5 }));
+    let late!: (value: typeof preview) => void; let sequence = 0;
+    client.pinImageGalleryCachedPreview.mockImplementation(async (_id, index) => {
+      if (index === 3 && sequence++ === 2) return new Promise((resolve) => { late = resolve; });
+      return { ...preview, leaseId: `cached-${index}-${sequence++}` };
+    });
+    await presenter.open(async () => window); await settle();
+    expect(client.pinImageGalleryCachedPreview.mock.calls.map((call) => call[1])).toEqual([2, 1, 3]);
+    expect(client.loadImageGalleryPage).toHaveBeenCalledOnce();
+    expect(presenter.snapshot?.adjacentPreviews?.map((item) => item.pageIndex)).toEqual([1]);
+    const currentPin = presenter.snapshot!.preview!.leaseId; const neighborPin = presenter.snapshot!.adjacentPreviews![0]!.preview.leaseId;
+    presenter.navigate(4); await settle();
+    expect(client.releaseImageGalleryPreview).toHaveBeenCalledWith("gallery", currentPin, false);
+    expect(client.releaseImageGalleryPreview).toHaveBeenCalledWith("gallery", neighborPin, false);
+    expect(client.pinImageGalleryCachedPreview.mock.calls.slice(3).map((call) => call[1])).toEqual([4, 3]);
+    expect(client.loadImageGalleryPage.mock.calls.map((call) => call[1])).toEqual([2, 4]);
+    late({ ...preview, leaseId: "retired-neighbor" }); await settle();
+    expect(client.releaseImageGalleryPreview).toHaveBeenCalledWith("gallery", "retired-neighbor");
+    expect(presenter.snapshot?.adjacentPreviews).toHaveLength(1);
+    const neighbor = presenter.snapshot!.adjacentPreviews![0]!.preview;
+    presenter.previewFailed(neighbor.leaseId); expect(presenter.snapshot?.adjacentPreviews).toEqual([]);
+    expect(presenter.snapshot?.preview).toBeDefined();
+    expect(client.releaseImageGalleryPreview).toHaveBeenCalledWith("gallery", neighbor.leaseId, true);
+    presenter.close(); expect(presenter.snapshot).toBeUndefined();
+    expect(client.pinImageGalleryCachedPreview.mock.calls.every((call) => call[2].aborted)).toBe(true);
+  });
+
   it("opens before the original and keeps the independently pinned preview while current-page fetch errors recover in place", async () => {
     const { presenter, client, descriptor, preview, session } = fixture();
     let finish!: (value: MobileImageGalleryPageSession) => void;
