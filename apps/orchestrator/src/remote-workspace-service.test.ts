@@ -94,6 +94,14 @@ describe("RemoteWorkspaceService", () => {
     expect(listing.map((entry) => entry.path)).toEqual(["src", "src/main.ts", "README.md", "scene.gltf"]);
     expect(listing.some((entry) => entry.path.startsWith(".git"))).toBe(false);
 
+    for (const [name, mediaType] of [["motion.apng", "image/apng"], ["photo.AVIF", "image/avif"],
+      ["photo.heic", "image/heic"], ["photo.heif", "image/heif"], ["scan.tif", "image/tiff"], ["scan.tiff", "image/tiff"]] as const) {
+      const bytes = Buffer.from([0, 1, 2, 3]);
+      await files.write({ path: `/workspace/${name}`, content: bytes, mode: 0o644 });
+      expect(await workspaces.preview("workspace-a", name, 32)).toMatchObject({ mediaType, bytes, truncated: false,
+        entry: { path: name, size: bytes.length, revision: expect.stringMatching(/^sha256:/u) } });
+    }
+
     const prefix = await workspaces.preview("workspace-a", "README.md", 5);
     expect(prefix).toMatchObject({ text: "hello", truncated: true, mediaType: "text/markdown" });
     const model = await workspaces.preview("workspace-a", "scene.gltf", 5);

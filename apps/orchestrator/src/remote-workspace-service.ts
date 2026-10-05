@@ -996,11 +996,16 @@ function inferRemoteMediaType(value: string): string {
   if (extension === ".gltf") return "model/gltf+json";
   if (extension === ".ktx2") return "image/ktx2";
   if (extension === ".png") return "image/png";
+  if (extension === ".apng") return "image/apng";
   if ([".jpg", ".jpeg"].includes(extension)) return "image/jpeg";
   if (extension === ".gif") return "image/gif";
   if (extension === ".webp") return "image/webp";
   if (extension === ".bmp") return "image/bmp";
   if (extension === ".ico") return "image/x-icon";
+  if (extension === ".avif") return "image/avif";
+  if (extension === ".heic") return "image/heic";
+  if (extension === ".heif") return "image/heif";
+  if ([".tif", ".tiff"].includes(extension)) return "image/tiff";
   if (extension === ".pdf") return "application/pdf";
   if (extension === ".mp3") return "audio/mpeg";
   if (extension === ".wav") return "audio/wav";
