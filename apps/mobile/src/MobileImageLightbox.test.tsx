@@ -11,7 +11,10 @@ const native = vi.hoisted(() => ({ state: "active", listeners: new Set<(state: s
   images: new Map<string, ImageProps>(), layout: undefined as ((event: unknown) => void) | undefined,
   gestures: undefined as PanResponderCallbacks | undefined, offset: 0, spring: vi.fn(), burn: vi.fn() }));
 vi.mock("react-native", () => {
-  const box = ({ children }: { children?: ReactNode }) => createElement("div", {}, children);
+  const box = ({ children, testID, pointerEvents, accessibilityElementsHidden, importantForAccessibility }: {
+    children?: ReactNode; testID?: string; pointerEvents?: string; accessibilityElementsHidden?: boolean; importantForAccessibility?: string;
+  }) => createElement("div", { "data-testid": testID, "data-pointer-events": pointerEvents,
+    "aria-hidden": accessibilityElementsHidden, "data-accessibility": importantForAccessibility }, children);
   return { View: ({ children, accessibilityRole, onLayout }: { children?: ReactNode; accessibilityRole?: string; onLayout?: (event: unknown) => void }) => {
     if (accessibilityRole === "image") native.layout = onLayout;
     return createElement("div", {}, children);
@@ -100,6 +103,39 @@ async function drag(dx: number, dy: number, vy = 0) {
 }
 
 describe("lightbox dismissal and gesture ownership", () => {
+  it("lets pinch and zoomed pan own the whole canvas and restores overlay controls after release, cancellation and rotation", async () => {
+    const page = { ...session("image/png", false), annotatable: true }; await render(page); await load(page);
+    const chrome = () => host.querySelector('[data-testid="image-lightbox-chrome"]')!;
+    const available = () => {
+      expect(chrome().getAttribute("data-pointer-events")).toBe("box-none");
+      expect(chrome().getAttribute("aria-hidden")).toBe("false");
+      expect(chrome().getAttribute("data-accessibility")).toBe("auto");
+    };
+    const hidden = () => {
+      expect(chrome().getAttribute("data-pointer-events")).toBe("none");
+      expect(chrome().getAttribute("aria-hidden")).toBe("true");
+      expect(chrome().getAttribute("data-accessibility")).toBe("no-hide-descendants");
+    };
+    available();
+    await act(async () => native.gestures!.onPanResponderGrant!(touch([{ x: 150, y: 150 }, { x: 250, y: 150 }]), motion())); hidden();
+    await act(async () => native.gestures!.onPanResponderMove!(touch([{ x: 100, y: 150 }, { x: 300, y: 150 }]), motion()));
+    await act(async () => native.gestures!.onPanResponderRelease!(touch([]), motion())); available();
+    await act(async () => native.gestures!.onPanResponderGrant!(touch(), motion())); available();
+    await act(async () => native.gestures!.onPanResponderMove!(touch([{ x: 215, y: 150 }]), motion(15))); hidden();
+    await act(async () => native.gestures!.onPanResponderTerminate!(touch([]), motion(15))); available();
+    await act(async () => native.gestures!.onPanResponderGrant!(touch([{ x: 150, y: 150 }, { x: 250, y: 150 }]), motion())); hidden();
+    const old = native.gestures!;
+    const next = { ...page, ...session("image/png", false, "new-canvas"), annotatable: true }; await render(next); await load(next); available();
+    await act(async () => old.onPanResponderMove!(touch([{ x: 100, y: 150 }, { x: 300, y: 150 }]), motion())); available();
+    await act(async () => native.gestures!.onPanResponderGrant!(touch([{ x: 150, y: 150 }, { x: 250, y: 150 }]), motion())); hidden();
+    await act(async () => native.layout?.({ nativeEvent: { layout: { width: 300, height: 400 } } })); available();
+    await act(async () => button("image.annotate")!.click());
+    await act(async () => native.gestures!.onPanResponderGrant!(touch(), motion())); available();
+    await act(async () => native.gestures!.onPanResponderMove!(touch([{ x: 205, y: 155 }]), motion(5, 5))); available();
+    await act(async () => native.gestures!.onPanResponderRelease!(touch([]), motion(5, 5))); available();
+    expect(close).not.toHaveBeenCalled(); expect(output).not.toHaveBeenCalled();
+  });
+
   it("delays single-tap dismissal for double-tap zoom and never closes after zoomed, long or returning drag gestures", async () => {
     vi.useFakeTimers();
     const page = session("image/png", false); await render(page);

@@ -149,6 +149,7 @@ export function MobileImageLightbox({
   const [notice, setNotice] = useState("");
   const [error, setError] = useState("");
   const [foreground, setForeground] = useState(AppState.currentState === "active");
+  const [chromeBusy, setChromeBusy] = useState(false);
   const { burnIn, host } = useMobileAnnotationBurn();
   const strokesRef = useRef(strokes);
   const draftStrokeRef = useRef(draftStroke);
@@ -197,6 +198,7 @@ export function MobileImageLightbox({
     clearPendingTap();
     resetDismiss();
     gestureRef.current = undefined;
+    setChromeBusy(false);
     draftStrokeRef.current = undefined;
     setDraftStroke(undefined);
   }, [clearPendingTap, resetDismiss]);
@@ -296,6 +298,7 @@ export function MobileImageLightbox({
       const intent = mobileLightboxPointerIntent(annotatingRef.current && annotatable, points.length || 1);
       if (intent === "transform") {
         clearPendingTap();
+        setChromeBusy(true);
         const centroid = mobileTouchCentroid(points.slice(0, 2));
         gestureRef.current = {
           mode: "transform",
@@ -345,6 +348,7 @@ export function MobileImageLightbox({
       let active = gestureRef.current;
       if (!active) return;
       if (touches.length >= 2) {
+        setChromeBusy(true);
         const points = touches.slice(0, 2);
         const centroid = mobileTouchCentroid(points);
         const distance = mobileTouchDistance(points[0]!, points[1]!);
@@ -402,6 +406,7 @@ export function MobileImageLightbox({
         return;
       }
       if (active.mode === "pan") {
+        if (mobileLightboxIsZoomed(transformRef.current.scale) && active.maxDistance >= 1) setChromeBusy(true);
         if (Math.abs(gestureState.dx) > 12) active.dismissRejected = true;
         if (!active.dismissRejected && !annotatingRef.current
           && mobileLightboxCanStartDismiss(gestureState.dx, gestureState.dy, transformRef.current.scale)) {
@@ -425,6 +430,7 @@ export function MobileImageLightbox({
       if (!canInteract()) { cancelGesture(); return; }
       const active = gestureRef.current;
       gestureRef.current = undefined;
+      setChromeBusy(false);
       if (!active) return;
       if (active.mode === "dismiss") {
         clearPendingTap();
@@ -731,24 +737,10 @@ export function MobileImageLightbox({
 
   return <Modal visible transparent animationType="fade" presentationStyle="overFullScreen" statusBarTranslucent
     onRequestClose={close} supportedOrientations={["portrait", "landscape"]}>
-    <SafeAreaView style={styles.root} edges={["top", "right", "bottom", "left"]}>
+    <View style={styles.root}>
       <Animated.View pointerEvents="none" style={[styles.backdrop, { opacity: dismissY.interpolate({
         inputRange: [-300, 0, 300], outputRange: [0.4, 1, 0.4], extrapolate: "clamp"
       }) }]} />
-      <View style={styles.header}>
-        <ToolButton label={mobileMessage(locale, "image.close")} onPress={close} disabled={false} />
-        <View style={styles.heading}>
-          <Text numberOfLines={1} style={styles.fileName}>{fileName}</Text>
-          <Text style={styles.meta}>{gallery
-            ? mobileMessage(locale, "image.galleryMeta", {
-              source: gallery.descriptor.sourceLabel,
-              index: gallery.pageIndex + 1,
-              count: gallery.descriptor.pages.length,
-              scale: transform.scale.toFixed(1)
-            })
-            : mobileMessage(locale, "image.zoomMeta", { scale: transform.scale.toFixed(1) })}</Text>
-        </View>
-      </View>
       <View accessibilityRole="image" accessibilityLabel={mobileMessage(locale, "image.previewLabel", { name: fileName })}
         style={styles.canvas} onLayout={updateContainer} {...panResponder.panHandlers}>
         {displayed.width > 0 && displayed.height > 0 && <Animated.View pointerEvents="none" style={[
@@ -816,6 +808,27 @@ export function MobileImageLightbox({
           <ActivityIndicator color="#ff9800" />
         </View>}
       </View>
+      <Animated.View testID="image-lightbox-chrome" pointerEvents={chromeBusy ? "none" : "box-none"}
+        accessibilityElementsHidden={chromeBusy} importantForAccessibility={chromeBusy ? "no-hide-descendants" : "auto"}
+        style={[styles.chrome, { opacity: chromeBusy ? 0 : dismissY.interpolate({
+          inputRange: [-300, 0, 300], outputRange: [0.4, 1, 0.4], extrapolate: "clamp"
+        }) }]}>
+      <SafeAreaView pointerEvents="box-none" style={styles.chromeSafeArea} edges={["top", "right", "bottom", "left"]}>
+      <View style={styles.header}>
+        <ToolButton label={mobileMessage(locale, "image.close")} onPress={close} disabled={false} />
+        <View pointerEvents="none" style={styles.heading}>
+          <Text numberOfLines={1} style={styles.fileName}>{fileName}</Text>
+          <Text style={styles.meta}>{gallery
+            ? mobileMessage(locale, "image.galleryMeta", {
+              source: gallery.descriptor.sourceLabel,
+              index: gallery.pageIndex + 1,
+              count: gallery.descriptor.pages.length,
+              scale: transform.scale.toFixed(1)
+            })
+            : mobileMessage(locale, "image.zoomMeta", { scale: transform.scale.toFixed(1) })}</Text>
+        </View>
+      </View>
+      <View pointerEvents="box-none" style={styles.footer}>
       {visibleError !== "" && <Text accessibilityRole="alert" style={styles.error}>{visibleError}</Text>}
       {notice !== "" && <Text accessibilityLiveRegion="polite" style={styles.notice}>{notice}</Text>}
       <View style={styles.toolbar}>
@@ -852,8 +865,11 @@ export function MobileImageLightbox({
       {annotating && <Text accessibilityLiveRegion="polite" style={styles.hint}>
         {mobileMessage(locale, "image.drawHint")}
       </Text>}
-      {host}
+      </View>
     </SafeAreaView>
+      </Animated.View>
+      {host}
+    </View>
   </Modal>;
 }
 
@@ -940,7 +956,10 @@ function annotationSvgXml(
 const styles = StyleSheet.create({
   root: { flex: 1 },
   backdrop: { position: "absolute", inset: 0, backgroundColor: "#050607" },
-  header: { minHeight: 64, paddingHorizontal: 12, paddingVertical: 8, flexDirection: "row", alignItems: "center", gap: 12 },
+  chrome: { position: "absolute", inset: 0 },
+  chromeSafeArea: { flex: 1, justifyContent: "space-between" },
+  footer: { backgroundColor: "#050607b3" },
+  header: { minHeight: 64, paddingHorizontal: 12, paddingVertical: 8, flexDirection: "row", alignItems: "center", gap: 12, backgroundColor: "#050607b3" },
   heading: { flex: 1, minWidth: 0 },
   fileName: { color: "#f7f6f3", fontSize: 16, lineHeight: 21, fontWeight: "700" },
   meta: { color: "#adb6b7", fontSize: 12, lineHeight: 17 },
