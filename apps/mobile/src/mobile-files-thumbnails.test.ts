@@ -1,10 +1,10 @@
 import { createHash } from "node:crypto";
 import { create } from "@bufbuild/protobuf";
-import { BlobRefSchema, ImageThumbnailSchema } from "@joko/contracts";
+import { ArtifactSchema, BlobRefSchema, FileKind, ImageThumbnailSchema, WorkspaceEntrySchema } from "@joko/contracts";
 import sharp from "sharp";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { bmpBytes, gifBytes } from "./test/image-formats";
-import { MobileFilesThumbnailReader, mobileFilesDocumentBytes, type MobileFilesThumbnailContext, type MobileFilesThumbnailInput } from "./mobile-files-thumbnails";
+import { MobileFilesThumbnailReader, mobileFilesDocumentBytes, mobileFilesThumbnailKind, type MobileFilesThumbnailContext, type MobileFilesThumbnailInput } from "./mobile-files-thumbnails";
 
 const digest = (bytes: Uint8Array) => createHash("sha256").update(bytes).digest("hex");
 const readers = new Set<MobileFilesThumbnailReader>();
@@ -21,6 +21,23 @@ function original(bytes = gifBytes(), mediaType = "image/gif"): MobileFilesThumb
 }
 
 describe("canonical Files image and document miniature resources", () => {
+  it("offers Workspace and Generated text miniatures for complete filenames while retaining typed binary and directory boundaries", () => {
+    for (const [name, mediaType, expected] of [
+      ["source.ZIG", "application/octet-stream", "text"], ["captions.srt", "application/octet-stream", "text"],
+      ["Gemfile", "application/octet-stream", "text"], ["Jenkinsfile", "application/octet-stream", "text"],
+      [".env.example", "application/octet-stream", "text"], ["view.vue", "application/octet-stream", "text"],
+      ["unknown", "Application/X-Yaml; charset=utf-8", "text"], ["unknown", "application/ld+json", "text"],
+      ["README.md", "application/pdf", undefined], ["unknown", "application/octet-stream", undefined],
+      ["source.zig", "image/png", "image"]
+    ] as const) {
+      const entry = create(WorkspaceEntrySchema, { relativePath: "folder/" + name, kind: FileKind.REGULAR, mediaType });
+      const artifact = create(ArtifactSchema, { artifactId: "generated", blob: create(BlobRefSchema, { fileName: name, mediaType }) });
+      expect(mobileFilesThumbnailKind({ kind: "workspace-entry", entry })).toBe(expected);
+      expect(mobileFilesThumbnailKind({ kind: "artifact", artifact })).toBe(expected);
+      expect(mobileFilesThumbnailKind({ kind: "workspace-entry", entry: create(WorkspaceEntrySchema, { ...entry, kind: FileKind.DIRECTORY }) })).toBeUndefined();
+    }
+  });
+
   it("verifies a real 256px derivative and original fallback, reauthorizes cache hits and rejects a changed native decoder or bytes", async () => {
     const value = reader(); const bytes = await sharp({ create: { width: 256, height: 128, channels: 4, background: "orange" } }).webp().toBuffer();
     const thumbnail = create(ImageThumbnailSchema, { data: bytes, mediaType: "image/webp", sha256Hex: digest(bytes),

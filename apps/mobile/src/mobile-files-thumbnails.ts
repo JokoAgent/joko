@@ -1,7 +1,7 @@
 import { sha256 } from "@noble/hashes/sha2.js";
 import { bytesToHex } from "@noble/hashes/utils.js";
 import { FileKind, type BlobRef, type ImageThumbnail } from "@joko/contracts";
-import { normalizeMediaType, workspaceEntryRevisionKey, type MobileFilesComposerSource } from "./workspace-files";
+import { isTextFilePreviewMetadata, normalizeMediaType, workspaceEntryRevisionKey, type MobileFilesComposerSource } from "./workspace-files";
 import { awaitMobileMarkdownResourceRead } from "./mobile-markdown-resources";
 import type { MobileFilesThumbnailCache } from "./mobile-files-thumbnail-cache";
 import { inspectMobileImageGalleryBytes, mobileImageGalleryDimensionsMatch, mobileImageGalleryMediaType, mobileImageGalleryNativeAnimationMatches, mobileImageGalleryPreviewUri,
@@ -35,8 +35,7 @@ export function mobileFilesThumbnailKind(source: MobileFilesComposerSource): "im
   const mediaType = normalizeMediaType(source.kind === "workspace-entry" ? source.entry.mediaType : source.artifact.blob?.mediaType ?? "");
   if (mobileImageGalleryMediaType(mediaType)) return "image";
   const name = source.kind === "workspace-entry" ? source.entry.relativePath : source.artifact.blob?.fileName ?? "";
-  if (mediaType.startsWith("text/") || ["application/json", "application/xml", "application/javascript", "application/x-yaml", "application/yaml"].includes(mediaType)
-    || /\.(?:md|mdx|txt|log|csv|tsv|json|jsonl|xml|ya?ml|toml|ini|conf|js|jsx|ts|tsx|css|html?|py|rb|rs|go|java|c|cc|cpp|h|hpp|sh|ps1|sql)$/iu.test(name)) return "text";
+  if (isTextFilePreviewMetadata(mediaType, name)) return "text";
   return undefined;
 }
 export function mobileFilesThumbnailSourceKey(source: MobileFilesComposerSource): string {
