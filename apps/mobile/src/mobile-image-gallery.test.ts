@@ -5,7 +5,9 @@ import sharp from "sharp";
 import { animatedPngBytes, gifBytes, svgBytes, bmpBytes, tiffBytes, isoImageBytes, iconBytes, iconDibBytes } from "./test/image-formats";
 import { producedArtifactEvent, producedImageEvent, toolMediaEvent } from "./test/timeline-media";
 import {
+  confirmMobileImageGalleryCanvas,
   inspectMobileImageGalleryBytes,
+  mobileImageGalleryDimensionsMatch,
   mobileImageGalleryMediaType,
   mobileTimelineGalleryPages,
   mobileTimelineGalleryWindowKey
@@ -55,6 +57,25 @@ describe("mobile image gallery", () => {
     const pixels = await sharp(bytes).autoOrient().raw().toBuffer({ resolveWithObject: true });
     expect(inspectMobileImageGalleryBytes(bytes, "image/jpeg"))
       .toEqual({ mediaType: "image/jpeg", width: pixels.info.width, height: pixels.info.height });
+  });
+
+  it.each(["png", "webp"] as const)("confirms only the raw or EXIF-declared canvas of static %s", async (format) => {
+    for (const orientation of [1, 2, 3, 4, 5, 6, 7, 8]) {
+      const bytes = await sharp({ create: { width: 6, height: 4, channels: 3, background: "orange" } })
+        .withMetadata({ orientation }).toFormat(format).toBuffer();
+      const original = Uint8Array.from(bytes);
+      const image = inspectMobileImageGalleryBytes(bytes, "image/" + format);
+      expect(image).toEqual({ mediaType: "image/" + format, width: 6, height: 4,
+        ...(orientation >= 5 ? { nativeQuarterTurn: true } : {}) });
+      const rotated = await sharp(bytes).autoOrient().toBuffer({ resolveWithObject: true });
+      const native = { width: rotated.info.width, height: rotated.info.height };
+      const confirmed = confirmMobileImageGalleryCanvas(image, native);
+      expect(confirmed).toEqual({ mediaType: "image/" + format, ...native });
+      expect(confirmMobileImageGalleryCanvas(image, { width: 6, height: 4 })).toMatchObject({ width: 6, height: 4 });
+      expect(mobileImageGalleryDimensionsMatch(confirmed, 4, 6)).toBe(native.width === 4);
+      expect(() => confirmMobileImageGalleryCanvas(image, { width: 6, height: 5 })).toThrow(/canvas/u);
+      expect(Uint8Array.from(bytes)).toEqual(original);
+    }
   });
 
   it("reads bounded primary JPEG orientation in either byte order and before or after the frame header", () => {

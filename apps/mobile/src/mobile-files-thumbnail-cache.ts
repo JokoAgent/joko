@@ -98,15 +98,18 @@ function validateContent(content: unknown): MobileFilesThumbnailContent {
       || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\r]/u.test(value.text)) throw new Error("The file miniature text cache is invalid.");
     return { kind: "text", text: value.text };
   }
-  if (value.kind !== "image" || !exactKeys(value, ["kind", "uri", "width", "height", "mediaType", "animated"]) || typeof value.uri !== "string"
+  if (value.kind !== "image" || !exactKeys(value, ["kind", "uri", "width", "height", "mediaType", "animated",
+    ...(value.nativeQuarterTurn === true ? ["nativeQuarterTurn"] : [])]) || typeof value.uri !== "string"
     || value.uri.length > MOBILE_FILES_CACHE_MAXIMUM_RECORD_BYTES || typeof value.mediaType !== "string" || typeof value.animated !== "boolean") throw new Error("The file miniature image cache is invalid.");
   const match = /^data:(image\/[a-z0-9.+-]+);base64,([A-Za-z0-9+/]*={0,2})$/u.exec(value.uri);
   if (!match || match[1] !== value.mediaType) throw new Error("The file miniature cache MIME changed.");
   const bytes = decodeMobileBase64(match[2]!, MOBILE_FILES_CACHE_MAXIMUM_RECORD_BYTES);
   const decoded = inspectMobileImageGalleryBytes(bytes, value.mediaType);
   if (decoded.width !== value.width || decoded.height !== value.height || (decoded.animated === true) !== value.animated
+    || decoded.nativeQuarterTurn !== value.nativeQuarterTurn
     || (decoded.previewMediaType ?? decoded.mediaType) !== value.mediaType) throw new Error("The file miniature cache dimensions changed.");
-  return { kind: "image", uri: value.uri, width: decoded.width, height: decoded.height, mediaType: value.mediaType, animated: value.animated };
+  return { kind: "image", uri: value.uri, width: decoded.width, height: decoded.height, mediaType: value.mediaType, animated: value.animated,
+    ...(decoded.nativeQuarterTurn ? { nativeQuarterTurn: true } : {}) };
 }
 
 const directoryName = "joko-mobile-file-miniatures-v1";

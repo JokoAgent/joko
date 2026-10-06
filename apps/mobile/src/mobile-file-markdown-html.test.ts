@@ -11,6 +11,23 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), ".."); const trans
 const colors = { surface: "#fafafa", background: "#ffffff", ink: "#242a2d", muted: "#637073", accent: "#ff9800", border: "#e1e2df", negative: "#cc634e" };
 
 describe("file Markdown document", () => {
+  it("retains intrinsic EXIF proportions both on first render and in-place resource adoption", () => {
+    const key = '["image","portrait.png"]';
+    const resources = { leaseId: "file", references: new Map([[key, { key, label: "Portrait", kind: "image" as const,
+      relativePath: "portrait.png", image: { uri: "data:image/png;base64,AAAA", width: 160, height: 100, nativeQuarterTurn: true as const } }]]) };
+    const runtime = { katexScript: "", katexCss: "", mermaidScript: "" };
+    for (const initial of [resources, undefined]) {
+      const dom = new JSDOM(buildMobileFileMarkdownHtml({ text: "![Portrait](portrait.png)", label: "File", colors, resources: initial }, runtime), { runScripts: "dangerously" });
+      if (!initial) dom.window.eval(mobileFileMarkdownImagesScript(resources));
+      const image = dom.window.document.querySelector("img") as HTMLImageElement;
+      expect(image.getAttribute("src")).toBe("data:image/png;base64,AAAA");
+      expect(image.hasAttribute("width")).toBe(false); expect(image.hasAttribute("height")).toBe(false);
+      expect(image.style.width).toBe("auto"); expect(image.style.height).toBe("auto");
+      expect(image.style.objectFit).toBe("contain"); expect(image.style.aspectRatio).toBe("");
+      dom.window.close();
+    }
+  });
+
   it("renders real offline math, semantic source blocks and line anchors, escapes hostile content and adopts only leased images in place", () => {
     const entry = resolve(root, "src/rich-markdown-runtime.richjs");
     const module = transformer.testing.buildRichMarkdownRuntimeModule(readFileSync(entry, "utf8"), entry);

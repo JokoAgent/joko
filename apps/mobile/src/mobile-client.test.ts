@@ -8320,9 +8320,13 @@ describe("native current-task Files ownership", () => {
     expect(() => beforeBackground.assertCurrent()).toThrow(); expect(() => app.prepareFilesPathCopy(app.state.files)).toThrow();
   });
 
-  it("opens current completed Markdown resources in Files and the gallery, and shares the same authorized inline image", async () => {
+  it.each([false, true])("opens completed Markdown resources and shares the same authorized inline image, EXIF=%s", async (portrait) => {
     vi.useFakeTimers();
-    const bytes = Uint8Array.from(Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=", "base64"));
+    const bytes = portrait ? Uint8Array.from(await sharp({ create: { width: 6, height: 4, channels: 3, background: "orange" } })
+      .withMetadata({ orientation: 6 }).png().toBuffer())
+      : Uint8Array.from(Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=", "base64"));
+    const width = portrait ? 6 : 1; const height = portrait ? 4 : 1;
+    const native = { width: portrait ? height : width, height: portrait ? width : height, mediaType: "image/png", isAnimated: false };
     const body = "![Inline picture](images/pixel.png) `README.md:2:1` [source](src/) ![external](https://example.invalid/no.png)";
     const event = create(EventSchema, { eventId: messageEvent.eventId, identity: messageEvent.identity, cursor: messageEvent.cursor,
       payload: { kind: { case: "messageCompleted", value: {
@@ -8339,7 +8343,7 @@ describe("native current-task Files ownership", () => {
       entries: parent === "" ? [readme, sourceDirectory] : parent === "images" ? [imageEntry] : [], revision: "directory-" + parent
     }));
     vi.mocked(network.readWorkspaceFile).mockImplementation(async (_credential, _workspace, path) => path === imageEntry.relativePath
-      ? create(FilePreviewSchema, { entry: imageEntry, content: { case: "image", value: { blob: imageBlob, widthPixels: 1, heightPixels: 1 } } })
+      ? create(FilePreviewSchema, { entry: imageEntry, content: { case: "image", value: { blob: imageBlob, widthPixels: native.width, heightPixels: native.height } } })
       : create(FilePreviewSchema, { entry: readme, content: { case: "text", value: { utf8Text: "#A\n#B\n", totalLines: 3, startByte: 0n, endByte: 6n } } }));
     vi.mocked(network.downloadBlob).mockResolvedValue({ bytes, mediaType: "image/png" });
     vi.mocked(network.readAround).mockResolvedValue([event]);
@@ -8350,7 +8354,8 @@ describe("native current-task Files ownership", () => {
     await app.start();
     const prepared = await app.prepareMarkdownResources("markdown-completed", body, new AbortController().signal);
     const imageKey = JSON.stringify(["image", "images/pixel.png"]); const fileKey = JSON.stringify(["code", "README.md:2:1"]);
-    expect(prepared.references.get(imageKey)?.image).toMatchObject({ width: 1, height: 1 });
+    expect(prepared.references.get(imageKey)?.image).toMatchObject({ width, height });
+    expect(prepared.references.get(imageKey)?.image?.nativeQuarterTurn).toBe(portrait ? true : undefined);
     expect(network.downloadBlob).toHaveBeenCalledWith(credential, imageBlob, expect.any(AbortSignal));
     expect(await app.openMarkdownPath(prepared.leaseId, fileKey, new AbortController().signal)).toMatchObject({ kind: "workspace-entry", entry: readme });
     expect(app.state.files.preview).toMatchObject({ kind: "text", text: "#A\n#B\n", focusLine: 2, focusColumn: 1 });
@@ -8368,14 +8373,15 @@ describe("native current-task Files ownership", () => {
     const gallery = await app.openMarkdownImageGallery(prepared.leaseId, imageKey, new AbortController().signal);
     app.releaseMarkdownResources(prepared.leaseId);
     const page = await app.loadImageGalleryPage(gallery.leaseId, 0, new AbortController().signal);
-    expect(page).toMatchObject({ expectedWidthPixels: 1, expectedHeightPixels: 1, pageCount: 1 });
+    expect(page).toMatchObject({ expectedWidthPixels: width, expectedHeightPixels: height, pageCount: 1 });
     await vi.advanceTimersByTimeAsync(4_000);
-    app.confirmImageGalleryPageDecoded(gallery.leaseId, page.leaseId, page.pageId, { width: 1, height: 1, mediaType: "image/png", isAnimated: false });
-    expect((await app.prepareImageOutput(page.leaseId, { width: 1, height: 1, mediaType: "image/png", isAnimated: false }, new AbortController().signal)).bytes).toEqual(bytes);
+    app.confirmImageGalleryPageDecoded(gallery.leaseId, page.leaseId, page.pageId, native);
+    expect((await app.prepareImageOutput(page.leaseId, native, new AbortController().signal)).bytes).toEqual(bytes);
     app.cancelImageGallery(gallery.leaseId);
     expect(() => app.assertMarkdownResourcesCurrent(prepared.leaseId)).toThrow(/released/u);
     const shared = await app.prepareConversationShare(["markdown-completed"], new AbortController().signal);
     expect(shared.messages[0]!.images?.get("images/pixel.png")?.uri).toBe("data:image/png;base64," + Buffer.from(bytes).toString("base64"));
+    expect(shared.messages[0]!.images?.get("images/pixel.png")?.nativeQuarterTurn).toBe(portrait ? true : undefined);
     expect(shared.messages[0]!.images?.has("https://example.invalid/no.png")).toBe(false);
     await app.revalidateConversationShare(shared.leaseId, new AbortController().signal);
     vi.mocked(network.listWorkspaceDirectory).mockImplementation(async (_credential, _workspace, parent) => ({
@@ -9650,41 +9656,53 @@ describe("native current-task Files ownership", () => {
     expect(network.materializeWorkspaceFileBlob).not.toHaveBeenCalled(); expect(network.submit).not.toHaveBeenCalled();
   });
 
-  it("keeps a real EXIF portrait JPEG's decoded canvas and original bytes through Generated gallery and Composer", async () => {
+  it.each([
+    { format: "jpeg", nativeWidth: 4, nativeHeight: 6, headerWidth: 4, headerHeight: 6 },
+    { format: "png", nativeWidth: 4, nativeHeight: 6, headerWidth: 6, headerHeight: 4 },
+    { format: "png", nativeWidth: 6, nativeHeight: 4, headerWidth: 6, headerHeight: 4 },
+    { format: "webp", nativeWidth: 4, nativeHeight: 6, headerWidth: 6, headerHeight: 4 },
+    { format: "webp", nativeWidth: 6, nativeHeight: 4, headerWidth: 6, headerHeight: 4 }
+  ] as const)("keeps a real EXIF portrait $format's $nativeWidth×$nativeHeight native canvas and original bytes through Generated gallery and Composer", async ({ format, nativeWidth, nativeHeight, headerWidth, headerHeight }) => {
+    const mediaType = "image/" + format; const fileName = "portrait." + (format === "jpeg" ? "jpg" : format);
     const bytes = await sharp({ create: { width: 6, height: 4, channels: 3, background: "#ff9800" } })
-      .withMetadata({ orientation: 6 }).jpeg().toBuffer();
+      .withMetadata({ orientation: 6 }).toFormat(format).toBuffer();
     const sha256Hex = createHash("sha256").update(bytes).digest("hex");
-    const blob = create(BlobRefSchema, { blobId: "portrait-blob", fileName: "portrait.jpg", mediaType: "image/jpeg",
+    const blob = create(BlobRefSchema, { blobId: "portrait-blob", fileName, mediaType,
       byteSize: BigInt(bytes.byteLength), sha256Hex, disposition: BlobDisposition.INLINE });
     const artifact = create(ArtifactSchema, { artifactId: "portrait-artifact", sessionId: "session", kind: ArtifactKind.IMAGE, title: "Portrait", blob });
     const snapshot = clone(SnapshotSchema, handoffSnapshot);
     const input = snapshot.backends[0]!.capabilities!.capabilities.find((item) => item.name === capabilityNames.inputImage)!.options!.kind;
     if (input.case !== "input") throw new Error("fixture");
-    input.value.mediaTypes.push("image/jpeg"); input.value.maximumBytes = 4_096n;
+    if (!input.value.mediaTypes.includes(mediaType)) input.value.mediaTypes.push(mediaType); input.value.maximumBytes = 4_096n;
     const network = fakeNetwork(); configureFiles(network, snapshot);
     vi.mocked(network.listSessionArtifacts).mockResolvedValue({ artifacts: [artifact], revision: "portrait-catalog" });
-    vi.mocked(network.downloadBlob).mockResolvedValue({ bytes, mediaType: "image/jpeg" });
+    vi.mocked(network.downloadBlob).mockResolvedValue({ bytes, mediaType });
     const drafts = memoryDraftStores(); const fixture = attachmentFileFixture();
     const files = new MobileAttachmentFiles(fixture.driver, async (value) => createHash("sha256").update(value).digest("hex"));
     const app = client(network, memoryStorage(credential).storage, undefined, undefined,
       fixedIds("portrait-gallery", "portrait-load", "portrait-output", "portrait-source", "portrait-editor"), undefined, drafts, files);
     await app.start(); await app.openFiles(); app.openGeneratedFiles(); await app.previewArtifact(artifact);
-    expect(app.state.files.preview).toMatchObject({ kind: "image", mediaType: "image/jpeg", widthPixels: 4, heightPixels: 6 });
+    expect(app.state.files.preview).toMatchObject({ kind: "image", mediaType, widthPixels: headerWidth, heightPixels: headerHeight });
     const descriptor = await app.openFilesImageGallery({ kind: "artifact", artifact });
     const page = await app.loadImageGalleryPage(descriptor.leaseId, 0);
-    expect(page).toMatchObject({ sourceMediaType: "image/jpeg", expectedWidthPixels: 4, expectedHeightPixels: 6,
-      presentationWidth: 4, presentationHeight: 6, sourceBase64: bytes.toString("base64"), annotatable: true, addable: true });
+    expect(page).toMatchObject({ sourceMediaType: mediaType, expectedWidthPixels: headerWidth, expectedHeightPixels: headerHeight,
+      sourceBase64: bytes.toString("base64"), annotatable: true, addable: true,
+      ...(format === "jpeg" ? {} : { nativeQuarterTurn: true }) });
     expect(() => app.confirmImageGalleryPageDecoded(descriptor.leaseId, page.leaseId, page.pageId,
-      { width: 6, height: 4, isAnimated: false })).toThrow(/decoded image/u);
+      { width: format === "jpeg" ? 6 : 5, height: 4, isAnimated: false })).toThrow(/decoded image/u);
     app.confirmImageGalleryPageDecoded(descriptor.leaseId, page.leaseId, page.pageId,
-      { width: 4, height: 6, mediaType: "image/jpeg", isAnimated: false });
-    const output = await app.prepareImageOutput(page.leaseId, { width: 4, height: 6, mediaType: "image/jpeg", isAnimated: false });
-    expect(output).toMatchObject({ width: 4, height: 6, sha256Hex, mediaType: "image/jpeg" }); expect(Buffer.from(output.bytes)).toEqual(bytes);
+      { width: nativeWidth, height: nativeHeight, mediaType, isAnimated: false });
+    expect(() => app.confirmImageGalleryPageDecoded(descriptor.leaseId, page.leaseId, page.pageId,
+      { width: nativeHeight, height: nativeWidth, mediaType, isAnimated: false })).toThrow(/decoded image/u);
+    const output = await app.prepareImageOutput(page.leaseId, { width: nativeWidth, height: nativeHeight, mediaType, isAnimated: false });
+    expect(output).toMatchObject({ width: nativeWidth, height: nativeHeight, sha256Hex, mediaType }); expect(Buffer.from(output.bytes)).toEqual(bytes);
     const committed = await app.addImageGalleryPageToComposer(descriptor.leaseId, page.leaseId);
-    expect(committed.attachments).toEqual([expect.objectContaining({ fileName: "portrait.jpg", mediaType: "image/jpeg", sha256Hex })]);
+    expect(committed.attachments).toEqual([expect.objectContaining({ fileName, mediaType, sha256Hex })]);
     expect(Buffer.from(fixture.bytes.get("portrait-output")!)).toEqual(bytes);
     const editor = await app.openComposerImageEditor({ surface: "task", attachmentId: "portrait-output" });
-    expect(editor).toMatchObject({ expectedWidthPixels: 4, expectedHeightPixels: 6, sourceBase64: bytes.toString("base64"), annotatable: true });
+    expect(editor).toMatchObject({ expectedWidthPixels: headerWidth, expectedHeightPixels: headerHeight,
+      sourceBase64: bytes.toString("base64"), annotatable: true,
+      ...(format === "jpeg" ? {} : { nativeQuarterTurn: true }) });
     expect(network.submit).not.toHaveBeenCalled(); expect(network.uploadBlob).not.toHaveBeenCalled();
   });
 

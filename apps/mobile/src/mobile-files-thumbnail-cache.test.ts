@@ -54,6 +54,19 @@ async function imageContent(bytes?: Uint8Array): Promise<MobileFilesThumbnailCon
 }
 
 describe("bounded private Files miniature disk cache", () => {
+  it("retains authenticated EXIF canvas metadata when rehydrating original PNG and WebP miniatures", async () => {
+    const files = await fixture(); const cache = new MobileFilesThumbnailCache(files.driver);
+    for (const format of ["png", "webp"] as const) {
+      const bytes = await sharp({ create: { width: 6, height: 4, channels: 3, background: "orange" } })
+        .withMetadata({ orientation: 6 }).toFormat(format).toBuffer();
+      const content: MobileFilesThumbnailContent = { kind: "image", uri: "data:image/" + format + ";base64," + bytes.toString("base64"),
+        width: 6, height: 4, mediaType: "image/" + format, animated: false, nativeQuarterTurn: true };
+      await cache.put("owner", format, content, () => undefined);
+      expect(await new MobileFilesThumbnailCache(files.driver).get("owner", format, () => undefined)).toEqual(content);
+      await expect(cache.put("owner", "invalid-" + format, { ...content, nativeQuarterTurn: undefined }, () => undefined)).rejects.toThrow(/cache/u);
+    }
+  });
+
   it("rehydrates exact image/text copies across cache instances, keeps source revalidation and rejects foreign or corrupted records", async () => {
     const files = await fixture(); const cache = new MobileFilesThumbnailCache(files.driver); const image = await imageContent();
     await cache.put("owner", "picture", image, () => undefined); await cache.put("owner", "file", { kind: "text", text: "actual file source" }, () => undefined);

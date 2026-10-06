@@ -5,6 +5,7 @@ import { WebView } from "react-native-webview";
 import { randomUUID } from "expo-crypto";
 import { setStringAsync } from "expo-clipboard";
 import { Image as NativeImage } from "expo-image";
+import { mobileImageGalleryDimensionsMatch } from "./mobile-image-gallery";
 import {
   groupMobileMarkdownSelectableBlocks, mobileMarkdownInlineImageSize, parseMobileMarkdownIncremental,
   type MobileMarkdownBlock, type MobileMarkdownInline, type MobileMarkdownParseResult
@@ -218,7 +219,7 @@ function MobileMarkdownImageSpan({ inline, reference, colors, label, onOpen }: {
     <NativeImage source={{ uri: image.uri }} accessibilityLabel={label} accessible={false} contentFit="cover" cachePolicy="none"
       style={[size, { borderRadius: 6, backgroundColor: colors.background }]}
       onLoad={(event) => {
-        if (alive.current && (event.source.width !== image.width || event.source.height !== image.height || event.source.isAnimated)) setFailed(true);
+        if (alive.current && (!mobileImageGalleryDimensionsMatch(image, event.source.width, event.source.height) || event.source.isAnimated)) setFailed(true);
       }}
       onError={() => { if (alive.current) setFailed(true); }} />
   </Pressable>;

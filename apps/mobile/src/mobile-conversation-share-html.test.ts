@@ -58,4 +58,17 @@ describe("offline rich conversation image document", () => {
     expect(document.documentElement.innerHTML).not.toContain("private-image");
     expect(() => buildMobileConversationShareHtml({ snapshot: source, colors: { ...colors, background: "red;bad" }, width: 390, dark: false }, runtime)).toThrow(/invalid/u);
   });
+  it("lets the browser determine an EXIF image's natural aspect within the export bounds", () => {
+    const source = snapshot("portrait"); const message = source.messages[1]!;
+    const images = new Map([["canonical", { uri: png, width: 160, height: 100, nativeQuarterTurn: true as const }]]);
+    const document = new JSDOM(buildMobileConversationShareHtml({
+      snapshot: { ...source, messages: [{ ...message, images }] }, colors, width: 390, dark: false
+    }, runtime)).window.document;
+    const image = document.querySelector<HTMLImageElement>(".share-image")!;
+    expect(image.getAttribute("src")).toBe(png);
+    expect(image.hasAttribute("width")).toBe(false); expect(image.hasAttribute("height")).toBe(false);
+    expect(image.style.width).toBe("auto"); expect(image.style.height).toBe("auto");
+    expect(image.style.maxWidth).toBe("100%"); expect(image.style.maxHeight).toBe("320px");
+    expect(image.style.aspectRatio).toBe(""); expect(image.style.objectFit).toBe("contain");
+  });
 });

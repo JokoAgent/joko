@@ -45,6 +45,7 @@ beforeEach(() => {
   Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true }); native.state = "active"; native.rect = [0, 80, 280, 140];
   native.images.clear(); native.buttons.clear(); prepare.mockReset(); confirm.mockReset(); release.mockReset(); open.mockReset();
   let next = 0; prepare.mockImplementation(async () => image(`preview-${++next}`));
+  confirm.mockImplementation((id) => image(id));
   props = { client: { prepareTimelineImagePreview: prepare, confirmTimelineImagePreview: confirm, releaseTimelineImagePreview: release },
     page: { pageId: "canonical-page", title: "diagram.png", mediaType: "image/png", byteSize: 200, sha256Hex: "a".repeat(64), widthPixels: 800, heightPixels: 400 },
     eventId: "canonical-event", ownerKey: "current-task", eligible: true, viewportPulse: 0,
@@ -63,6 +64,15 @@ function button(label: string) { return Array.from(host.querySelectorAll<HTMLBut
 function loadData(uri: string): ImageLoadEventData {
   return { cacheType: "none", source: { url: uri, width: 800, height: 400, mediaType: "image/png", isAnimated: false } };
 }
+
+it("fits the image to its confirmed native canvas without replacing its source lease", async () => {
+  await render(); const uri = "data:image/png;base64,preview-1";
+  confirm.mockReturnValue({ ...image("preview-1"), width: 400, height: 800 });
+  await act(async () => native.images.get(uri)!.onLoad!(loadData(uri)));
+  expect(Object.assign({}, ...(native.buttons.get("Open diagram")!.style as object[]))).toMatchObject({ width: 90, height: 180 });
+  expect(native.images.has(uri)).toBe(true);
+  expect(release).not.toHaveBeenCalled();
+});
 async function load(id = "preview-1") {
   const uri = image(id).uri; await act(async () => native.images.get(uri)!.onLoad!(loadData(uri)));
 }

@@ -3,7 +3,8 @@ import { bytesToHex } from "@noble/hashes/utils.js";
 import type { BlobRef, ImageThumbnail } from "@joko/contracts";
 import { normalizeMediaType } from "./workspace-files";
 import { awaitMobileMarkdownResourceRead } from "./mobile-markdown-resources";
-import { inspectMobileImageGalleryBytes, mobileImageGalleryNativeAnimationMatches, mobileImageGalleryPreviewUri,
+import { confirmMobileImageGalleryCanvas, inspectMobileImageGalleryBytes, mobileImageGalleryDimensionsMatch,
+  mobileImageGalleryNativeAnimationMatches, mobileImageGalleryPreviewUri,
   type MobileImageGalleryDecodedImage, type MobileImageGalleryNativeDecode, type MobileImageGalleryPage } from "./mobile-image-gallery";
 
 export interface MobileTimelineImagePreview {
@@ -13,6 +14,7 @@ export interface MobileTimelineImagePreview {
   readonly height: number;
   readonly mediaType: string;
   readonly animated: boolean;
+  readonly nativeQuarterTurn?: true;
 }
 export interface MobileTimelineImageContext {
   readonly ownerKey: string;
@@ -23,9 +25,10 @@ export interface MobileTimelineImageContext {
 }
 interface CachedImage {
   readonly uri: string;
-  readonly decoded: MobileImageGalleryDecodedImage;
+  decoded: MobileImageGalleryDecodedImage;
   readonly cost: number;
   readonly pixels: number;
+  readonly nativeQuarterTurn?: true;
   readonly pins: Set<string>;
 }
 interface ImageLease {
@@ -95,7 +98,7 @@ export class MobileTimelineImageReader {
         if (thumbnail && (decoded.animated || decoded.width !== thumbnail.widthPixels || decoded.height !== thumbnail.heightPixels
           || decoded.width > 1024 || decoded.height > 1024)) throw new Error("The inline thumbnail decoder changed its presentation metadata.");
         if (page.widthPixels !== undefined && (thumbnail ? thumbnail.sourceWidthPixels !== page.widthPixels || thumbnail.sourceHeightPixels !== page.heightPixels
-          : decoded.width !== page.widthPixels || decoded.height !== page.heightPixels)) {
+          : !mobileImageGalleryDimensionsMatch(decoded, page.widthPixels, page.heightPixels!))) {
           throw new Error("The canonical inline image dimensions changed.");
         }
         this.#assert(lease, signal);
@@ -104,8 +107,10 @@ export class MobileTimelineImageReader {
         image = this.#cache.get(key);
         if (!image) {
           image = { uri, decoded: { mediaType: decoded.mediaType, width: decoded.width, height: decoded.height,
+            ...(decoded.nativeQuarterTurn ? { nativeQuarterTurn: true } : {}),
             ...(decoded.animated ? { animated: true } : {}), ...(decoded.previewMediaType ? { previewMediaType: decoded.previewMediaType } : {}) },
-            cost: uri.length * 2, pixels: decoded.width * decoded.height, pins: new Set() };
+            cost: uri.length * 2, pixels: decoded.width * decoded.height, pins: new Set(),
+            ...(decoded.nativeQuarterTurn ? { nativeQuarterTurn: true } : {}) };
           this.#makeRoom(image); this.#cache.set(key, image);
         }
       }
@@ -118,16 +123,18 @@ export class MobileTimelineImageReader {
     finally { clearTimeout(deadline); }
   }
 
-  confirm(id: string, native: MobileImageGalleryNativeDecode): void {
+  confirm(id: string, native: MobileImageGalleryNativeDecode): MobileTimelineImagePreview {
     const lease = this.#leases.get(id);
     if (!lease?.image) throw new Error("The inline image was released.");
     this.#assert(lease);
     const expected = lease.image.decoded;
-    if (native.width !== expected.width || native.height !== expected.height
+    if (!mobileImageGalleryDimensionsMatch(expected, native.width, native.height)
       || native.mediaType && normalizeMediaType(native.mediaType) !== (expected.previewMediaType ?? expected.mediaType)
       || !mobileImageGalleryNativeAnimationMatches(expected.mediaType, expected.animated === true, native.isAnimated)) {
       this.release(id, true); throw new Error("The native image does not match its canonical source.");
     }
+    lease.image.decoded = confirmMobileImageGalleryCanvas(expected, native);
+    return this.#preview(lease, lease.image);
   }
 
   release(id: string, discard = false): void {
@@ -151,7 +158,8 @@ export class MobileTimelineImageReader {
   }
   #preview(lease: ImageLease, image: CachedImage): MobileTimelineImagePreview {
     return { leaseId: lease.id, uri: image.uri, width: image.decoded.width, height: image.decoded.height,
-      mediaType: image.decoded.previewMediaType ?? image.decoded.mediaType, animated: image.decoded.animated === true };
+      mediaType: image.decoded.previewMediaType ?? image.decoded.mediaType, animated: image.decoded.animated === true,
+      ...(image.nativeQuarterTurn ? { nativeQuarterTurn: true } : {}) };
   }
   #makeRoom(incoming: CachedImage): void {
     const fits = () => this.#cache.size < 16 && incoming.cost + [...this.#cache.values()].reduce((sum, entry) => sum + entry.cost, 0) <= 128 * 1_024 * 1_024

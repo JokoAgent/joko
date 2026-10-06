@@ -276,6 +276,23 @@ describe("lightbox dismissal and gesture ownership", () => {
 });
 
 describe("native image gallery formats and ownership", () => {
+  it("draws and burns against the confirmed EXIF canvas and rejects unrelated dimensions", async () => {
+    const page = { ...session("image/png", false), annotatable: true, nativeQuarterTurn: true as const,
+      expectedWidthPixels: 6, expectedHeightPixels: 4 };
+    native.burn.mockResolvedValue({ base64: "AA==", mediaType: "image/png", width: 4, height: 6 });
+    await render(page);
+    const image = native.images.get(page.previewUri)!;
+    await act(async () => image.onLoad!({ cacheType: "none", source: { url: page.previewUri,
+      width: 5, height: 4, mediaType: "image/png", isAnimated: false } } as ImageLoadEventData));
+    expect(nativeFailed).toHaveBeenCalledWith(page.leaseId, false); expect(decoded).not.toHaveBeenCalled();
+    await act(async () => image.onLoad!({ cacheType: "none", source: { url: page.previewUri,
+      width: 4, height: 6, mediaType: "image/png", isAnimated: false } } as ImageLoadEventData));
+    expect(decoded).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ width: 4, height: 6 }));
+    await act(async () => button("image.annotate")!.click()); await drag(20, 10);
+    await act(async () => button("image.addMarked")!.click());
+    expect(native.burn).toHaveBeenCalledOnce();
+    expect(save).toHaveBeenCalledOnce();
+  });
   it("opens a pending page with an independent preview and keeps that layer through original fetch and native decode", async () => {
     const page = session("image/png", false); const preview = { leaseId: "cached-preview", uri: "data:image/png;base64,cached", width: 1, height: 1, mediaType: "image/png", animated: false };
     const pending = { ...controls(page), preview, busy: true };

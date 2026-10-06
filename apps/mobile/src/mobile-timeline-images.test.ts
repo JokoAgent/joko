@@ -22,6 +22,20 @@ function fixture(id = "one", bytes = gifBytes(), mediaType = "image/gif") {
 }
 
 describe("canonical Timeline image resources", () => {
+  it.each(["png", "webp"] as const)("retains the first confirmed EXIF %s canvas across cached previews", async (format) => {
+    const bytes = await sharp({ create: { width: 6, height: 4, channels: 3, background: "orange" } })
+      .withMetadata({ orientation: 6 }).toFormat(format).toBuffer();
+    const value = reader(); const { context } = fixture("portrait", bytes, "image/" + format);
+    const first = await value.prepare(context, new AbortController().signal);
+    expect(first).toMatchObject({ width: 6, height: 4, nativeQuarterTurn: true });
+    expect(value.confirm(first.leaseId, { width: 4, height: 6, mediaType: "image/" + format, isAnimated: false }))
+      .toMatchObject({ leaseId: first.leaseId, uri: first.uri, width: 4, height: 6 });
+    value.release(first.leaseId);
+    const cached = await value.prepare(context, new AbortController().signal);
+    expect(cached).toMatchObject({ width: 4, height: 6, nativeQuarterTurn: true });
+    expect(context.download).toHaveBeenCalledOnce();
+    expect(() => value.confirm(cached.leaseId, { width: 6, height: 4, isAnimated: false })).toThrow(/canonical source/u);
+  });
   it("verifies independent thumbnail bytes and native dimensions while retaining the original Blob as its cache identity", async () => {
     const value = reader(); const bytes = await sharp({ create: { width: 800, height: 400, channels: 3, background: "orange" } }).webp().toBuffer();
     const original = fixture("large-image"); const context = { ...original.context, page: { ...original.context.page, widthPixels: 1600, heightPixels: 800 } };

@@ -4,14 +4,14 @@ import { FileKind, type BlobRef, type ImageThumbnail } from "@joko/contracts";
 import { normalizeMediaType, workspaceEntryRevisionKey, type MobileFilesComposerSource } from "./workspace-files";
 import { awaitMobileMarkdownResourceRead } from "./mobile-markdown-resources";
 import type { MobileFilesThumbnailCache } from "./mobile-files-thumbnail-cache";
-import { inspectMobileImageGalleryBytes, mobileImageGalleryMediaType, mobileImageGalleryNativeAnimationMatches, mobileImageGalleryPreviewUri,
+import { inspectMobileImageGalleryBytes, mobileImageGalleryDimensionsMatch, mobileImageGalleryMediaType, mobileImageGalleryNativeAnimationMatches, mobileImageGalleryPreviewUri,
   type MobileImageGalleryNativeDecode } from "./mobile-image-gallery";
 
 export const MOBILE_FILES_DOCUMENT_MAXIMUM_BYTES = 96 * 1024;
 export const MOBILE_FILES_IMAGE_MAXIMUM_BYTES = 48 * 1024 * 1024;
 export type MobileFilesThumbnailContent =
   | { readonly kind: "text"; readonly text: string }
-  | { readonly kind: "image"; readonly uri: string; readonly width: number; readonly height: number; readonly mediaType: string; readonly animated: boolean };
+  | { readonly kind: "image"; readonly uri: string; readonly width: number; readonly height: number; readonly mediaType: string; readonly animated: boolean; readonly nativeQuarterTurn?: true };
 export interface MobileFilesThumbnailPreview { readonly leaseId: string; readonly content?: MobileFilesThumbnailContent }
 export type MobileFilesThumbnailInput =
   | { readonly kind: "text"; readonly text: string }
@@ -102,7 +102,7 @@ export class MobileFilesThumbnailReader {
   confirm(id: string, native: MobileImageGalleryNativeDecode): void {
     const lease = this.#leases.get(id); if (!lease || lease.cached?.content?.kind !== "image") throw new Error("The file miniature was released.");
     this.#assert(lease); const expected = lease.cached.content;
-    if (native.width !== expected.width || native.height !== expected.height || native.mediaType && normalizeMediaType(native.mediaType) !== expected.mediaType
+    if (!mobileImageGalleryDimensionsMatch(expected, native.width, native.height) || native.mediaType && normalizeMediaType(native.mediaType) !== expected.mediaType
       || !mobileImageGalleryNativeAnimationMatches(expected.mediaType, expected.animated, native.isAnimated)) {
       this.release(id, true); throw new Error("The native file miniature changed its canonical dimensions.");
     }
@@ -166,5 +166,6 @@ function thumbnailContent(input: MobileFilesThumbnailInput | undefined): MobileF
   if (thumbnail && (decoded.animated || decoded.width > 256 || decoded.height > 256 || decoded.width !== thumbnail.widthPixels || decoded.height !== thumbnail.heightPixels
     || Math.max(decoded.width, decoded.height) > Math.max(thumbnail.sourceWidthPixels, thumbnail.sourceHeightPixels))) throw new Error("The file miniature thumbnail dimensions changed.");
   return { kind: "image", uri: mobileImageGalleryPreviewUri(input.bytes, decoded), width: decoded.width, height: decoded.height,
+    ...(decoded.nativeQuarterTurn ? { nativeQuarterTurn: true } : {}),
     mediaType: decoded.previewMediaType ?? decoded.mediaType, animated: decoded.animated === true };
 }

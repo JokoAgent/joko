@@ -277,7 +277,9 @@ import {
 } from "./mobile-composer-image-editor";
 import {
   assertMobileImageGalleryDimensions,
+  confirmMobileImageGalleryCanvas,
   inspectMobileImageGalleryBytes,
+  mobileImageGalleryDimensionsMatch,
   mobileImageGalleryMediaType,
   mobileImageGalleryNativeAnimationMatches,
   mobileImageGalleryPreviewUri,
@@ -517,7 +519,7 @@ interface MobileImageGalleryLease {
     readonly page: MobileImageGalleryPage;
     readonly pageIndex: number;
     readonly bytes: Uint8Array;
-    readonly decoded: MobileImageGalleryDecodedImage;
+    decoded: MobileImageGalleryDecodedImage;
     confirmed: boolean;
   };
   operationInFlight: boolean;
@@ -4938,7 +4940,7 @@ export class MobileClient {
     return this.#timelineImages.prepare(context, signal);
   }
 
-  confirmTimelineImagePreview(leaseId: string, native: MobileImageGalleryNativeDecode): void { this.#timelineImages.confirm(leaseId, native); }
+  confirmTimelineImagePreview(leaseId: string, native: MobileImageGalleryNativeDecode): MobileTimelineImagePreview { return this.#timelineImages.confirm(leaseId, native); }
   releaseTimelineImagePreview(leaseId: string, discard = false): void { this.#timelineImages.release(leaseId, discard); }
 
   #markdownResourceContext(messageId: string, text: string): MobileMarkdownResourceContext {
@@ -5131,8 +5133,10 @@ export class MobileClient {
               || bytesToHex(sha256(download.bytes)) !== page.sha256Hex) throw new Error("The canonical message image changed.");
             const decoded = inspectMobileImageGalleryBytes(download.bytes, page.mediaType);
             if (decoded.width * decoded.height > remainingPixels || (page.widthPixels !== undefined
-              && (decoded.width !== page.widthPixels || decoded.height !== page.heightPixels))) continue;
-            images.set(page.pageId, { uri: mobileImageGalleryPreviewUri(download.bytes, decoded), width: decoded.width, height: decoded.height });
+              && !mobileImageGalleryDimensionsMatch(decoded, page.widthPixels, page.heightPixels!))) continue;
+            images.set(page.pageId, { uri: mobileImageGalleryPreviewUri(download.bytes, decoded),
+              width: decoded.width, height: decoded.height,
+              ...(decoded.nativeQuarterTurn ? { nativeQuarterTurn: true } : {}) });
             remainingBytes -= download.bytes.byteLength;
             remainingPixels -= decoded.width * decoded.height;
           } catch {
@@ -5318,7 +5322,7 @@ export class MobileClient {
       throw new Error("The authenticated gallery image changed media type or size.");
     }
     const decoded = inspectMobileImageGalleryBytes(download.bytes, page.mediaType);
-    if (page.widthPixels !== undefined && (decoded.width !== page.widthPixels || decoded.height !== page.heightPixels)) {
+    if (page.widthPixels !== undefined && !mobileImageGalleryDimensionsMatch(decoded, page.widthPixels, page.heightPixels!)) {
       throw new Error("The gallery image dimensions do not match their canonical metadata.");
     }
     await this.#assertImageGalleryCurrent(lease, undefined, signal);
@@ -5364,6 +5368,7 @@ export class MobileClient {
       maximumBytes: controls?.policy.maximumBytes ?? MOBILE_BLOB_PREVIEW_MAXIMUM_BYTES,
       expectedWidthPixels: decoded.width,
       expectedHeightPixels: decoded.height,
+      ...(decoded.nativeQuarterTurn ? { nativeQuarterTurn: true } : {}),
       expectedAnimated: decoded.animated === true,
       originalOnly: decoded.originalOnly === true,
       ...(decoded.previewMediaType ? { previewMediaType: decoded.previewMediaType } : {})
@@ -5461,11 +5466,12 @@ export class MobileClient {
     const loaded = lease?.loaded;
     if (!lease || lease.leaseId !== galleryLeaseId || !loaded || loaded.loadId !== loadId
       || loaded.page.pageId !== pageId || !mobileImageGalleryNativeAnimationMatches(loaded.page.mediaType, loaded.decoded.animated === true, decoded.isAnimated)
-      || decoded.width !== loaded.decoded.width || decoded.height !== loaded.decoded.height
+      || !mobileImageGalleryDimensionsMatch(loaded.decoded, decoded.width, decoded.height)
       || decoded.mediaType && normalizeMediaType(decoded.mediaType) !== (loaded.decoded.previewMediaType ?? loaded.decoded.mediaType)) {
       throw new Error("The decoded image no longer matches this gallery page.");
     }
     if (loaded.confirmed) return;
+    loaded.decoded = confirmMobileImageGalleryCanvas(loaded.decoded, decoded);
     loaded.confirmed = true;
   }
 
@@ -5509,6 +5515,9 @@ export class MobileClient {
     const loaded = galleryLease?.loaded;
     if (!galleryLease || !loaded || loaded.loadId !== leaseId || !loaded.confirmed || galleryLease.operationInFlight) {
       throw new Error("The decoded image no longer owns this output action.");
+    }
+    if (!mobileImageGalleryDimensionsMatch(loaded.decoded, decoded.width, decoded.height)) {
+      throw new Error("The native output canvas no longer matches the confirmed gallery image.");
     }
     const parsed = inspectMobileImageOutputBytes(loaded.bytes, loaded.page.mediaType, decoded);
     const exactDecoded = assertMobileImageOutputDecode(
@@ -7067,6 +7076,11 @@ export class MobileClient {
           points: stroke.points.map((point) => ({ ...point }))
         })),
         annotatable,
+        ...(galleryImage ? {
+          expectedWidthPixels: galleryImage.width,
+          expectedHeightPixels: galleryImage.height
+        } : {}),
+        ...(galleryImage?.nativeQuarterTurn ? { nativeQuarterTurn: true } : {}),
         animated: galleryImage?.animated === true,
         originalOnly: galleryImage?.originalOnly === true,
         ...(galleryImage?.previewMediaType ? { previewMediaType: galleryImage.previewMediaType } : {}),
@@ -10747,7 +10761,7 @@ export class MobileClient {
       }
       const download = await this.network.downloadBlob(context.credential, blob, signal);
       const decoded = mobileImageGalleryMediaType(mediaType) ? inspectMobileImageGalleryBytes(download.bytes, mediaType) : undefined;
-      if (decoded && image.widthPixels > 0 && (image.widthPixels !== decoded.width || image.heightPixels !== decoded.height)) {
+      if (decoded && image.widthPixels > 0 && !mobileImageGalleryDimensionsMatch(decoded, image.widthPixels, image.heightPixels)) {
         throw new Error("The Workspace image dimensions do not match the canonical image bytes.");
       }
       return { ...base, kind: "image", dataUri: decoded ? mobileImageGalleryPreviewUri(download.bytes, decoded) : bytesToDataUri(download.bytes, download.mediaType),

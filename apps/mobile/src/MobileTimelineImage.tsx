@@ -107,7 +107,10 @@ export function MobileTimelineImage(props: Props) {
         onLoad={(event: ImageLoadEventData) => {
           const active = activeRef.current;
           if (!active || active.controller.signal.aborted || active.preview !== current) return;
-          try { client.confirmTimelineImagePreview(current.leaseId, event.source); setPhase("ready"); }
+          try {
+            const confirmed = client.confirmTimelineImagePreview(current.leaseId, event.source);
+            active.preview = confirmed; setPreview(confirmed); setPhase("ready");
+          }
           catch { fail(); }
         }} onError={() => fail(true)} />}
       {currentPhase === "loading" && <View pointerEvents="none" style={styles.placeholder}>

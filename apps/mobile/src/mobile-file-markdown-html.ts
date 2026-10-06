@@ -18,7 +18,9 @@ export function buildMobileFileMarkdownHtml(input: {
       const key = mobileMarkdownResourceKey(value); const image = key ? input.resources?.references.get(key)?.image : undefined;
       const attributes = ' data-image-key="' + escapeHtml(key!) + '" data-image-alt="' + escapeHtml(value.alt) + '"';
       if (!validImage(image)) return '<span class="image-fallback"' + attributes + '>' + escapeHtml(value.alt) + "</span>";
-      return '<img' + attributes + ' src="' + escapeHtml(image.uri) + '" alt="' + escapeHtml(value.alt) + '" width="' + image.width + '" height="' + image.height + '">';
+      const dimensions = image.nativeQuarterTurn ? ' style="width:auto;height:auto;object-fit:contain"'
+        : ' width="' + image.width + '" height="' + image.height + '"';
+      return '<img' + attributes + ' src="' + escapeHtml(image.uri) + '" alt="' + escapeHtml(value.alt) + '"' + dimensions + '>';
     }
     if (value.type === "link") {
       try {
@@ -67,7 +69,8 @@ export function buildMobileFileMarkdownHtml(input: {
       })();</script></body></html>`;
 }
 
-function validImage(image: { readonly uri: string; readonly width: number; readonly height: number } | undefined): image is { readonly uri: string; readonly width: number; readonly height: number } {
+function validImage(image: { readonly uri: string; readonly width: number; readonly height: number;
+  readonly nativeQuarterTurn?: true } | undefined): image is NonNullable<typeof image> {
   return !!image && /^data:image\/[a-z0-9.+-]+;base64,[A-Za-z0-9+/]+={0,2}$/u.test(image.uri)
     && Number.isSafeInteger(image.width) && Number.isSafeInteger(image.height) && image.width > 0 && image.height > 0 && image.width * image.height <= 12_000_000;
 }
@@ -75,12 +78,16 @@ function validImage(image: { readonly uri: string; readonly width: number; reado
 /** Adopt authenticated images in place; loading an image must not reload the reading document. */
 export function mobileFileMarkdownImagesScript(resources?: MobileMarkdownResourceDescriptor): string {
   const bindings = [...(resources?.references.values() ?? [])].filter((reference) => validImage(reference.image))
-    .map((reference) => [reference.key, [reference.image!.uri, reference.image!.width, reference.image!.height]]);
+    .map((reference) => [reference.key, [reference.image!.uri, reference.image!.width,
+      reference.image!.height, reference.image!.nativeQuarterTurn === true]]);
   return `(function(){var bindings=new Map(JSON.parse(${mobileMarkdownScriptValue(JSON.stringify(bindings))}));
     document.querySelectorAll('[data-image-key]').forEach(function(node){var key=node.getAttribute('data-image-key'),alt=node.getAttribute('data-image-alt')||'',binding=bindings.get(key);
       if(binding&&node.tagName==='IMG'&&node.getAttribute('src')===binding[0])return;
       var replacement=document.createElement(binding?'img':'span');replacement.setAttribute('data-image-key',key);replacement.setAttribute('data-image-alt',alt);
-      if(binding){replacement.src=binding[0];replacement.alt=alt;replacement.width=binding[1];replacement.height=binding[2];replacement.addEventListener('error',function(){
+      if(binding){replacement.src=binding[0];replacement.alt=alt;
+        if(binding[3]){replacement.style.width='auto';replacement.style.height='auto';replacement.style.objectFit='contain';}
+        else{replacement.width=binding[1];replacement.height=binding[2];}
+        replacement.addEventListener('error',function(){
         var label=document.createElement('span');label.className='image-fallback';label.textContent=alt;label.setAttribute('data-image-key',key);label.setAttribute('data-image-alt',alt);replacement.replaceWith(label);},{once:true});}
       else{replacement.className='image-fallback';replacement.textContent=alt;}node.replaceWith(replacement);
     });})();true;`;

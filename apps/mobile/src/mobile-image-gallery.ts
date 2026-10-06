@@ -58,6 +58,7 @@ export interface MobileImageGalleryDecodedImage {
   readonly mediaType: MobileImageGalleryPage["mediaType"];
   readonly width: number;
   readonly height: number;
+  readonly nativeQuarterTurn?: true;
   readonly animated?: boolean;
   readonly originalOnly?: boolean;
   readonly previewMarkup?: string;
@@ -216,10 +217,32 @@ export function inspectMobileImageGalleryBytes(
   }
   assertMobileImageGalleryDimensions(dimensions.width, dimensions.height);
   return { mediaType, width: dimensions.width, height: dimensions.height,
+    ...("nativeQuarterTurn" in dimensions && dimensions.nativeQuarterTurn === true ? { nativeQuarterTurn: true } : {}),
     ...(dimensions.animated === true ? { animated: true } : {}),
     ...(dimensions.originalOnly === true ? { originalOnly: true } : {}),
     ...(dimensions.previewBytes ? { previewBytes: dimensions.previewBytes } : {}),
     ...(mediaType === "image/apng" || mediaType === "image/x-icon" || mediaType === "image/vnd.microsoft.icon" ? { previewMediaType: "image/png" } : {}) };
+}
+
+export function mobileImageGalleryDimensionsMatch(
+  image: { readonly width: number; readonly height: number; readonly nativeQuarterTurn?: true },
+  width: number,
+  height: number
+): boolean {
+  // Static PNG/WebP decoders differ in EXIF handling; only the declared quarter turn is admissible.
+  return width === image.width && height === image.height
+    || image.nativeQuarterTurn === true && width === image.height && height === image.width;
+}
+
+export function confirmMobileImageGalleryCanvas(
+  image: MobileImageGalleryDecodedImage,
+  native: { readonly width: number; readonly height: number }
+): MobileImageGalleryDecodedImage {
+  if (!mobileImageGalleryDimensionsMatch(image, native.width, native.height)) {
+    throw new Error("The native image dimensions do not match the inspected canvas.");
+  }
+  const { nativeQuarterTurn, ...confirmed } = image;
+  return nativeQuarterTurn ? { ...confirmed, width: native.width, height: native.height } : confirmed;
 }
 
 export function mobileImageGalleryPreviewUri(bytes: Uint8Array, decoded: MobileImageGalleryDecodedImage): string {
@@ -245,13 +268,14 @@ export function sameMobileImageGalleryPage(
     && JSON.stringify(left.source) === JSON.stringify(right.source);
 }
 
-function pngDimensions(bytes: Uint8Array): { readonly width: number; readonly height: number; readonly animated?: boolean } | undefined {
+function pngDimensions(bytes: Uint8Array): { readonly width: number; readonly height: number; readonly animated?: boolean; readonly nativeQuarterTurn?: true } | undefined {
   const signature = [137, 80, 78, 71, 13, 10, 26, 10];
   if (!signature.every((byte, index) => bytes[index] === byte)) return undefined;
   let offset = 8;
   let dimensions: { readonly width: number; readonly height: number } | undefined;
   let animationFrames: number | undefined; let frames = 0; let sequence = 0;
   let imageData = false; let frameData = false; let inFrame = false;
+  let orientation: number | undefined;
   while (offset + 12 <= bytes.byteLength) {
     const length = readU32Be(bytes, offset);
     if (length === undefined || length > bytes.byteLength - offset - 12) return undefined;
@@ -264,6 +288,10 @@ function pngDimensions(bytes: Uint8Array): { readonly width: number; readonly he
       const height = readU32Be(bytes, offset + 12);
       if (width === undefined || height === undefined) return undefined;
       dimensions = { width, height };
+    } else if (type === "eXIf") {
+      if (orientation !== undefined) return undefined;
+      orientation = exifOrientation(bytes.subarray(data, data + length));
+      if (orientation === undefined) return undefined;
     } else if (type === "acTL") {
       const count = readU32Be(bytes, data);
       if (animationFrames !== undefined || imageData || length !== 8 || !count || count > 4_096) return undefined;
@@ -286,7 +314,8 @@ function pngDimensions(bytes: Uint8Array): { readonly width: number; readonly he
     if (type === "IEND") {
       if (length !== 0 || offset !== bytes.byteLength || !dimensions
         || (animationFrames !== undefined && (frames !== animationFrames || !frameData))) return undefined;
-      return { ...dimensions, ...(animationFrames !== undefined ? { animated: true } : {}) };
+      return { ...dimensions, ...(animationFrames !== undefined ? { animated: true } : {}),
+        ...(animationFrames === undefined && (orientation ?? 1) >= 5 ? { nativeQuarterTurn: true } : {}) };
     }
   }
   return undefined;
@@ -316,7 +345,7 @@ function jpegDimensions(bytes: Uint8Array): { readonly width: number; readonly h
       dimensions = { width, height };
     } else if (marker === 0xe1 && ascii(bytes, offset + 2, 6) === "Exif\0\0") {
       if (orientation !== undefined) return undefined;
-      orientation = jpegExifOrientation(bytes.subarray(offset + 8, offset + length));
+      orientation = exifOrientation(bytes.subarray(offset + 8, offset + length));
       if (orientation === undefined) return undefined;
     }
     offset += length;
@@ -325,7 +354,7 @@ function jpegDimensions(bytes: Uint8Array): { readonly width: number; readonly h
   return (orientation ?? 1) >= 5 ? { width: dimensions.height, height: dimensions.width } : dimensions;
 }
 
-function jpegExifOrientation(bytes: Uint8Array): number | undefined {
+function exifOrientation(bytes: Uint8Array): number | undefined {
   const order = ascii(bytes, 0, 2);
   if (bytes.byteLength < 8 || order !== "II" && order !== "MM") return undefined;
   const little = order === "II";
@@ -348,13 +377,14 @@ function jpegExifOrientation(bytes: Uint8Array): number | undefined {
   return orientation ?? 1;
 }
 
-function webpDimensions(bytes: Uint8Array): { readonly width: number; readonly height: number; readonly animated?: boolean } | undefined {
+function webpDimensions(bytes: Uint8Array): { readonly width: number; readonly height: number; readonly animated?: boolean; readonly nativeQuarterTurn?: true } | undefined {
   if (ascii(bytes, 0, 4) !== "RIFF" || ascii(bytes, 8, 4) !== "WEBP") return undefined;
   const riffSize = readU32Le(bytes, 4);
   if (riffSize === undefined || riffSize + 8 !== bytes.byteLength) return undefined;
   let offset = 12;
   let dimensions: { readonly width: number; readonly height: number } | undefined;
   let extended = false; let animated = false; let animationControl = false; let frames = 0; let bitmap = false;
+  let orientation: number | undefined;
   while (offset + 8 <= bytes.byteLength) {
     const type = ascii(bytes, offset, 4);
     const length = readU32Le(bytes, offset + 4);
@@ -368,6 +398,11 @@ function webpDimensions(bytes: Uint8Array): { readonly width: number; readonly h
         width: 1 + readU24Le(bytes, data + 4),
         height: 1 + readU24Le(bytes, data + 7)
       };
+    } else if (type === "EXIF") {
+      if (orientation !== undefined) return undefined;
+      const metadata = bytes.subarray(data, data + length);
+      orientation = exifOrientation(ascii(metadata, 0, 6) === "Exif\0\0" ? metadata.subarray(6) : metadata);
+      if (orientation === undefined) return undefined;
     } else if (type === "ANIM") {
       if (!animated || animationControl || frames || length !== 6) return undefined;
       animationControl = true;
@@ -397,7 +432,8 @@ function webpDimensions(bytes: Uint8Array): { readonly width: number; readonly h
     offset += 8 + length + (length % 2);
   }
   return dimensions && offset === bytes.byteLength && (!animated || animationControl && frames > 0)
-    ? { ...dimensions, ...(animated ? { animated: true } : {}) } : undefined;
+    ? { ...dimensions, ...(animated ? { animated: true } : {}),
+      ...(!animated && (orientation ?? 1) >= 5 ? { nativeQuarterTurn: true } : {}) } : undefined;
 }
 
 function webpBitmapDimensions(bytes: Uint8Array, data: number, length: number, type: string): { readonly width: number; readonly height: number } | undefined {

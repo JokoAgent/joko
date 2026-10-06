@@ -12,6 +12,9 @@ export interface MobileComposerImageEditorSession {
   readonly fileName: string;
   readonly initialStrokes: readonly MobileImageAnnotationStroke[];
   readonly annotatable: boolean;
+  readonly expectedWidthPixels?: number;
+  readonly expectedHeightPixels?: number;
+  readonly nativeQuarterTurn?: true;
   readonly animated?: boolean;
   readonly originalOnly?: boolean;
   readonly previewMediaType?: string;

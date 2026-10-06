@@ -1,5 +1,5 @@
 import { MOBILE_BLOB_PREVIEW_MAXIMUM_BYTES } from "./network";
-import { assertMobileImageGalleryDimensions, inspectMobileImageGalleryBytes } from "./mobile-image-gallery";
+import { assertMobileImageGalleryDimensions, inspectMobileImageGalleryBytes, mobileImageGalleryDimensionsMatch } from "./mobile-image-gallery";
 import { inspectMobileBmpBytes, inspectMobileIsoImageBytes, inspectMobileTiffBytes } from "./mobile-image-container";
 import { normalizeMediaType } from "./workspace-files";
 
@@ -56,9 +56,10 @@ export function inspectMobileImageOutputBytes(
     throw new Error("Animated images must use original-file sharing rather than static image output.");
   }
   assertMobileImageGalleryDimensions(dimensions.width, dimensions.height);
-  if (expectedDimensions
-    && (dimensions.width !== expectedDimensions.width || dimensions.height !== expectedDimensions.height)) {
+  const canvas = { width: dimensions.width, height: dimensions.height,
+    ...("nativeQuarterTurn" in dimensions && dimensions.nativeQuarterTurn === true ? { nativeQuarterTurn: true as const } : {}) };
+  if (expectedDimensions && !mobileImageGalleryDimensionsMatch(canvas, expectedDimensions.width, expectedDimensions.height)) {
     throw new Error("The image output bytes do not match the native decoder dimensions.");
   }
-  return { mediaType, width: dimensions.width, height: dimensions.height };
+  return { mediaType, width: expectedDimensions?.width ?? dimensions.width, height: expectedDimensions?.height ?? dimensions.height };
 }

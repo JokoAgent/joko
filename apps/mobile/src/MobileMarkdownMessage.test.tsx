@@ -45,7 +45,7 @@ describe("native message Markdown", () => {
     const container = document.createElement("div"); const root = createRoot(container);
     const imageKey = JSON.stringify(["image", "images/a.png"]); const pathKey = JSON.stringify(["code", "README.md:7"]);
     const descriptor = { leaseId: "resources-1", references: new Map([
-      [imageKey, { key: imageKey, kind: "image" as const, label: "Picture", relativePath: "images/a.png", image: { uri: "data:image/png;base64,AAAA", width: 1, height: 1 } }],
+      [imageKey, { key: imageKey, kind: "image" as const, label: "Picture", relativePath: "images/a.png", image: { uri: "data:image/png;base64,AAAA", width: 6, height: 4, nativeQuarterTurn: true as const } }],
       [pathKey, { key: pathKey, kind: "file" as const, label: "README.md:7", relativePath: "README.md" }]
     ]) };
     let resourceOwner: string | undefined = "resources-owner";
@@ -67,6 +67,8 @@ describe("native message Markdown", () => {
     expect(container.querySelector("img")?.closest("span[data-line-height]")).toBeNull();
     expect(container.querySelector('[role="link"]')?.closest('[data-selectable="true"]')?.textContent).toContain("After");
     expect(container.textContent).toContain("External");
+    await act(async () => nativeImages.get("Picture")!.onLoad({ source: { width: 4, height: 6, isAnimated: false } }));
+    expect(container.querySelector("img")).not.toBeNull();
     await act(async () => {
       container.querySelector<HTMLElement>('[role="button"][aria-label="Picture"]')!.click();
       container.querySelector<HTMLElement>('[role="link"]')!.click();

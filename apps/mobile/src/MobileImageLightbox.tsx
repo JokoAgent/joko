@@ -60,7 +60,8 @@ import {
   type MobileTouchPoint
 } from "./mobile-image-lightbox";
 import { useMobileAnnotationBurn } from "./use-mobile-annotation-burn";
-import { mobileImageGalleryNativeAnimationMatches, type MobileImageGalleryNativeDecode, type MobileImageGalleryDescriptor, type MobileImageGalleryPageSession } from "./mobile-image-gallery";
+import { mobileImageGalleryDimensionsMatch, mobileImageGalleryNativeAnimationMatches,
+  type MobileImageGalleryNativeDecode, type MobileImageGalleryDescriptor, type MobileImageGalleryPageSession } from "./mobile-image-gallery";
 import type { MobileTimelineImagePreview } from "./mobile-timeline-images";
 import type { MobileImageOutputAction, MobileImageOutputRenderedImage } from "./mobile-image-output";
 import { mobileImageOutputMediaType } from "./mobile-image-output-format";
@@ -858,11 +859,17 @@ export function MobileImageLightbox({
                     throw new Error(mobileMessage(locale, "image.decoderDimensions"));
                   }
                   if (gallery) {
-                    if (width !== gallerySession?.expectedWidthPixels || height !== gallerySession?.expectedHeightPixels
+                    if (!gallerySession || !mobileImageGalleryDimensionsMatch({ width: gallerySession.expectedWidthPixels,
+                      height: gallerySession.expectedHeightPixels, nativeQuarterTurn: gallerySession.nativeQuarterTurn }, width, height)
                       || !mobileImageGalleryNativeAnimationMatches(session.sourceMediaType, gallerySession.expectedAnimated, isAnimated)) {
                       throw new Error(mobileMessage(locale, "image.galleryMetadata"));
                     }
                     gallery.onDecoded({ width, height, mediaType, isAnimated });
+                  } else if ((session.expectedWidthPixels === undefined) !== (session.expectedHeightPixels === undefined)
+                    || (session.expectedWidthPixels !== undefined
+                      && !mobileImageGalleryDimensionsMatch({ width: session.expectedWidthPixels, height: session.expectedHeightPixels!,
+                        nativeQuarterTurn: session.nativeQuarterTurn }, width, height))) {
+                    throw new Error(mobileMessage(locale, "image.decoderDimensions"));
                   }
                   const next = { width, height };
                   naturalRef.current = next;
