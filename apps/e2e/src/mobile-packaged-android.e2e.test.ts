@@ -292,7 +292,7 @@ async function scrollToNode(predicate: (node: AndroidUiNode) => boolean, label: 
 
 async function tap(label: string, scroll = false, leadingText = false): Promise<void> {
   const observedResources: string[] = [];
-  for (let attempt = 0; attempt < (scroll ? 7 : 1); attempt += 1) {
+  for (let attempt = 0; attempt < (scroll ? 14 : 1); attempt += 1) {
     const candidates = await nodes();
     if (label === "Workspace image") {
       const resources = candidates.filter((entry) => (entry.text + " " + entry.contentDescription).includes("README.md")
@@ -316,7 +316,20 @@ async function tap(label: string, scroll = false, leadingText = false): Promise<
       await tapNode(node, leadingText);
       return;
     }
-    if (scroll) await adb("shell", "input", "swipe", "540", "1850", "540", "800", "300");
+    // Files retains its offset after closing a gallery; search both ways inside its actual viewport.
+    if (scroll) {
+      const viewport = candidates.filter((entry) => entry.scrollable && entry.enabled
+        && entry.bounds.x2 > entry.bounds.x1 && entry.bounds.y2 > entry.bounds.y1)
+        .sort((left, right) => (right.bounds.x2 - right.bounds.x1) * (right.bounds.y2 - right.bounds.y1)
+          - (left.bounds.x2 - left.bounds.x1) * (left.bounds.y2 - left.bounds.y1))[0];
+      if (!viewport) break;
+      const x = Math.round((viewport.bounds.x1 + viewport.bounds.x2) / 2);
+      const inset = Math.max(1, Math.round((viewport.bounds.y2 - viewport.bounds.y1) * 0.15));
+      const top = viewport.bounds.y1 + inset;
+      const bottom = viewport.bounds.y2 - inset;
+      await adb("shell", "input", "swipe", String(x), String(attempt < 7 ? bottom : top), String(x),
+        String(attempt < 7 ? top : bottom), "300");
+    }
   }
   let node: AndroidUiNode;
   try {
