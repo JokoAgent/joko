@@ -9650,6 +9650,44 @@ describe("native current-task Files ownership", () => {
     expect(network.materializeWorkspaceFileBlob).not.toHaveBeenCalled(); expect(network.submit).not.toHaveBeenCalled();
   });
 
+  it("keeps a real EXIF portrait JPEG's decoded canvas and original bytes through Generated gallery and Composer", async () => {
+    const bytes = await sharp({ create: { width: 6, height: 4, channels: 3, background: "#ff9800" } })
+      .withMetadata({ orientation: 6 }).jpeg().toBuffer();
+    const sha256Hex = createHash("sha256").update(bytes).digest("hex");
+    const blob = create(BlobRefSchema, { blobId: "portrait-blob", fileName: "portrait.jpg", mediaType: "image/jpeg",
+      byteSize: BigInt(bytes.byteLength), sha256Hex, disposition: BlobDisposition.INLINE });
+    const artifact = create(ArtifactSchema, { artifactId: "portrait-artifact", sessionId: "session", kind: ArtifactKind.IMAGE, title: "Portrait", blob });
+    const snapshot = clone(SnapshotSchema, handoffSnapshot);
+    const input = snapshot.backends[0]!.capabilities!.capabilities.find((item) => item.name === capabilityNames.inputImage)!.options!.kind;
+    if (input.case !== "input") throw new Error("fixture");
+    input.value.mediaTypes.push("image/jpeg"); input.value.maximumBytes = 4_096n;
+    const network = fakeNetwork(); configureFiles(network, snapshot);
+    vi.mocked(network.listSessionArtifacts).mockResolvedValue({ artifacts: [artifact], revision: "portrait-catalog" });
+    vi.mocked(network.downloadBlob).mockResolvedValue({ bytes, mediaType: "image/jpeg" });
+    const drafts = memoryDraftStores(); const fixture = attachmentFileFixture();
+    const files = new MobileAttachmentFiles(fixture.driver, async (value) => createHash("sha256").update(value).digest("hex"));
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined,
+      fixedIds("portrait-gallery", "portrait-load", "portrait-output", "portrait-source", "portrait-editor"), undefined, drafts, files);
+    await app.start(); await app.openFiles(); app.openGeneratedFiles(); await app.previewArtifact(artifact);
+    expect(app.state.files.preview).toMatchObject({ kind: "image", mediaType: "image/jpeg", widthPixels: 4, heightPixels: 6 });
+    const descriptor = await app.openFilesImageGallery({ kind: "artifact", artifact });
+    const page = await app.loadImageGalleryPage(descriptor.leaseId, 0);
+    expect(page).toMatchObject({ sourceMediaType: "image/jpeg", expectedWidthPixels: 4, expectedHeightPixels: 6,
+      presentationWidth: 4, presentationHeight: 6, sourceBase64: bytes.toString("base64"), annotatable: true, addable: true });
+    expect(() => app.confirmImageGalleryPageDecoded(descriptor.leaseId, page.leaseId, page.pageId,
+      { width: 6, height: 4, isAnimated: false })).toThrow(/decoded image/u);
+    app.confirmImageGalleryPageDecoded(descriptor.leaseId, page.leaseId, page.pageId,
+      { width: 4, height: 6, mediaType: "image/jpeg", isAnimated: false });
+    const output = await app.prepareImageOutput(page.leaseId, { width: 4, height: 6, mediaType: "image/jpeg", isAnimated: false });
+    expect(output).toMatchObject({ width: 4, height: 6, sha256Hex, mediaType: "image/jpeg" }); expect(Buffer.from(output.bytes)).toEqual(bytes);
+    const committed = await app.addImageGalleryPageToComposer(descriptor.leaseId, page.leaseId);
+    expect(committed.attachments).toEqual([expect.objectContaining({ fileName: "portrait.jpg", mediaType: "image/jpeg", sha256Hex })]);
+    expect(Buffer.from(fixture.bytes.get("portrait-output")!)).toEqual(bytes);
+    const editor = await app.openComposerImageEditor({ surface: "task", attachmentId: "portrait-output" });
+    expect(editor).toMatchObject({ expectedWidthPixels: 4, expectedHeightPixels: 6, sourceBase64: bytes.toString("base64"), annotatable: true });
+    expect(network.submit).not.toHaveBeenCalled(); expect(network.uploadBlob).not.toHaveBeenCalled();
+  });
+
   it("retires original gallery sharing on cancellation and rejects fresh source drift before native dispatch", async () => {
     const bytes = gifBytes(true); const message = timelinePreviewEvent("moving.gif", "image/gif", bytes, "b".repeat(64));
     const network = projectedNetwork(timelineGallerySnapshot(message));

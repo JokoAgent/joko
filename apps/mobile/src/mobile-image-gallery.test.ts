@@ -49,6 +49,33 @@ describe("mobile image gallery", () => {
     expect(mobileImageGalleryMediaType("image/svg+xml")).toBe("image/svg+xml");
   });
 
+  it.each([1, 2, 3, 4, 5, 6, 7, 8])("matches the decoded canvas of a real JPEG with EXIF orientation %s", async (orientation) => {
+    const bytes = await sharp({ create: { width: 6, height: 4, channels: 3, background: "#ff9800" } })
+      .withMetadata({ orientation }).jpeg().toBuffer();
+    const pixels = await sharp(bytes).autoOrient().raw().toBuffer({ resolveWithObject: true });
+    expect(inspectMobileImageGalleryBytes(bytes, "image/jpeg"))
+      .toEqual({ mediaType: "image/jpeg", width: pixels.info.width, height: pixels.info.height });
+  });
+
+  it("reads bounded primary JPEG orientation in either byte order and before or after the frame header", () => {
+    const frame = jpeg(6, 4);
+    for (const little of [true, false]) for (const orientation of [undefined, 1, 2, 3, 4, 5, 6, 7, 8]) {
+      const header = jpegExifHeader(orientation, little);
+      const before = Buffer.concat([frame.subarray(0, 2), header, frame.subarray(2)]);
+      const after = Buffer.concat([frame.subarray(0, -2), header, frame.subarray(-2)]);
+      for (const bytes of [before, after]) expect(inspectMobileImageGalleryBytes(bytes, "image/jpeg"))
+        .toEqual({ mediaType: "image/jpeg", width: (orientation ?? 1) >= 5 ? 4 : 6, height: (orientation ?? 1) >= 5 ? 6 : 4 });
+    }
+    const header = jpegExifHeader(6, true);
+    const outside = Buffer.from(header); outside.writeUInt32LE(header.length, 14);
+    const badType = Buffer.from(header); badType.writeUInt16LE(4, 22);
+    const duplicate = Buffer.concat([header, header]);
+    for (const metadata of [outside, badType, duplicate, jpegExifHeader(9, true)]) {
+      expect(() => inspectMobileImageGalleryBytes(Buffer.concat([frame.subarray(0, 2), metadata, frame.subarray(2)]), "image/jpeg"))
+        .toThrow(/signature or dimensions/u);
+    }
+  });
+
   it("inspects complete GIF and animated PNG frames without flattening their original bytes", async () => {
     expect(inspectMobileImageGalleryBytes(gifBytes(), "image/gif")).toEqual({ mediaType: "image/gif", width: 1, height: 1 });
     expect(inspectMobileImageGalleryBytes(gifBytes(true), "image/gif")).toEqual({ mediaType: "image/gif", width: 1, height: 1, animated: true });
@@ -285,6 +312,19 @@ function png(width: number, height: number): Uint8Array {
   writeU32Be(bytes, 33, 0);
   bytes.set([73, 69, 78, 68], 37);
   return bytes;
+}
+
+function jpegExifHeader(orientation: number | undefined, little: boolean): Buffer {
+  const header = Buffer.alloc(orientation === undefined ? 24 : 36);
+  header.set([0xff, 0xe1]); header.writeUInt16BE(header.length - 2, 2); header.write("Exif\0\0", 4);
+  header.write(little ? "II" : "MM", 10);
+  const view = new DataView(header.buffer, header.byteOffset + 10, header.byteLength - 10);
+  view.setUint16(2, 42, little); view.setUint32(4, 8, little);
+  if (orientation !== undefined) {
+    view.setUint16(8, 1, little); view.setUint16(10, 0x0112, little); view.setUint16(12, 3, little);
+    view.setUint32(14, 1, little); view.setUint16(18, orientation, little);
+  }
+  return header;
 }
 
 function jpeg(width: number, height: number): Uint8Array {

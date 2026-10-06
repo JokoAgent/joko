@@ -296,10 +296,15 @@ function jpegDimensions(bytes: Uint8Array): { readonly width: number; readonly h
   if (bytes[0] !== 0xff || bytes[1] !== 0xd8) return undefined;
   const startOfFrame = new Set([0xc0, 0xc1, 0xc2, 0xc3, 0xc5, 0xc6, 0xc7, 0xc9, 0xca, 0xcb, 0xcd, 0xce, 0xcf]);
   let offset = 2;
-  while (offset + 4 <= bytes.byteLength) {
+  let dimensions: { readonly width: number; readonly height: number } | undefined;
+  let orientation: number | undefined;
+  while (offset < bytes.byteLength) {
+    if (bytes[offset] !== 0xff) return undefined;
     while (offset < bytes.byteLength && bytes[offset] === 0xff) offset += 1;
     const marker = bytes[offset++];
-    if (marker === undefined || marker === 0xd9 || marker === 0xda) return undefined;
+    if (marker === undefined) return undefined;
+    // Header dimensions are provisional until the native decoder confirms actual pixels.
+    if (marker === 0xd9 || marker === 0xda) break;
     if (marker === 0x01 || marker >= 0xd0 && marker <= 0xd8) continue;
     const length = readU16Be(bytes, offset);
     if (length === undefined || length < 2 || offset + length > bytes.byteLength) return undefined;
@@ -307,11 +312,40 @@ function jpegDimensions(bytes: Uint8Array): { readonly width: number; readonly h
       if (length < 7) return undefined;
       const height = readU16Be(bytes, offset + 3);
       const width = readU16Be(bytes, offset + 5);
-      return width === undefined || height === undefined ? undefined : { width, height };
+      if (!width || !height || dimensions && (dimensions.width !== width || dimensions.height !== height)) return undefined;
+      dimensions = { width, height };
+    } else if (marker === 0xe1 && ascii(bytes, offset + 2, 6) === "Exif\0\0") {
+      if (orientation !== undefined) return undefined;
+      orientation = jpegExifOrientation(bytes.subarray(offset + 8, offset + length));
+      if (orientation === undefined) return undefined;
     }
     offset += length;
   }
-  return undefined;
+  if (!dimensions) return undefined;
+  return (orientation ?? 1) >= 5 ? { width: dimensions.height, height: dimensions.width } : dimensions;
+}
+
+function jpegExifOrientation(bytes: Uint8Array): number | undefined {
+  const order = ascii(bytes, 0, 2);
+  if (bytes.byteLength < 8 || order !== "II" && order !== "MM") return undefined;
+  const little = order === "II";
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  if (view.getUint16(2, little) !== 42) return undefined;
+  const directory = view.getUint32(4, little);
+  if (directory < 8 || directory + 2 > bytes.byteLength) return undefined;
+  const count = view.getUint16(directory, little);
+  if (count > 4_096 || directory + 2 + count * 12 + 4 > bytes.byteLength) return undefined;
+  let orientation: number | undefined;
+  for (let index = 0; index < count; index++) {
+    const offset = directory + 2 + index * 12;
+    if (view.getUint16(offset, little) !== 0x0112) continue;
+    if (orientation !== undefined || view.getUint16(offset + 2, little) !== 3
+      || view.getUint32(offset + 4, little) !== 1) return undefined;
+    orientation = view.getUint16(offset + 8, little);
+    if (orientation < 1 || orientation > 8) return undefined;
+  }
+  // Only IFD0 describes the primary image; thumbnail and Exif subdirectories do not own its canvas.
+  return orientation ?? 1;
 }
 
 function webpDimensions(bytes: Uint8Array): { readonly width: number; readonly height: number; readonly animated?: boolean } | undefined {
