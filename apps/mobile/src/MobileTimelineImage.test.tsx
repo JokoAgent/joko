@@ -75,7 +75,7 @@ describe("visible canonical Timeline image presentation", () => {
     native.rect = [0, 80, 280, 140]; await render({ viewportPulse: 1 });
     expect(prepare).toHaveBeenCalledExactlyOnceWith("canonical-event", "canonical-page", expect.any(AbortSignal));
     expect(host.textContent).toContain(mobileMessage("en", "image.previewLoading"));
-    expect(native.images.get(image("preview-1").uri)).toMatchObject({ contentFit: "contain", cachePolicy: "none", autoplay: true });
+    expect(native.images.get(image("preview-1").uri)).toMatchObject({ contentFit: "fill", cachePolicy: "none", autoplay: true });
     expect(Object.assign({}, ...(native.buttons.get("Open diagram")!.style as object[]))).toMatchObject({ width: 280, height: 140, minWidth: 44, minHeight: 44 });
     await load(); expect(confirm).toHaveBeenCalledExactlyOnceWith("preview-1", loadData(image("preview-1").uri).source);
     expect(host.textContent).not.toContain(mobileMessage("en", "image.previewLoading"));
@@ -85,6 +85,17 @@ describe("visible canonical Timeline image presentation", () => {
     expect(prepare.mock.calls[0]![2].aborted).toBe(true); expect(release).toHaveBeenCalledWith("preview-1");
     expect(host.querySelector("[data-image]")).toBeNull();
     await act(async () => oldLoad(loadData(image("preview-1").uri))); expect(confirm).toHaveBeenCalledOnce();
+  });
+
+  it("keeps the presentation aspect inside an independently bounded 44px hit target", async () => {
+    prepare.mockResolvedValueOnce({ ...image("wide-preview"), width: 1_000, height: 100 });
+    await render();
+    const presented = native.images.get(image("wide-preview").uri)!;
+    const presentationStyle = Object.assign({}, ...(presented.style as object[])) as { width: number; height: number };
+    expect(presentationStyle.width).toBe(280); expect(presentationStyle.height).toBeCloseTo(28);
+    expect(Object.assign({}, ...(native.buttons.get("Open diagram")!.style as object[]))).toMatchObject({
+      width: 280, height: 44, minWidth: 44, minHeight: 44
+    });
   });
 
   it("refetches a native failure once, preserves the Gallery entry and offers an accessible explicit retry", async () => {

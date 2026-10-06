@@ -84,7 +84,8 @@ export function MobileTimelineImage(props: Props) {
   const width = current?.width ?? page.widthPixels; const height = current?.height ?? page.heightPixels;
   const limit = Math.max(44, Math.min(280, maximumWidth));
   const fit = width && height ? Math.min(limit / width, 180 / height, 1) : undefined;
-  const frame = { width: fit && width ? Math.max(44, width * fit) : limit, height: fit && height ? Math.max(44, height * fit) : 180 };
+  const imageFrame = { width: fit && width ? width * fit : limit, height: fit && height ? height * fit : 180 };
+  const frame = { width: Math.max(44, imageFrame.width), height: Math.max(44, imageFrame.height) };
   const fail = (retryAutomatically = false) => {
     const active = activeRef.current;
     if (!active?.preview || active.controller.signal.aborted || active.preview !== current) return;
@@ -101,8 +102,8 @@ export function MobileTimelineImage(props: Props) {
     <Pressable accessibilityRole="imagebutton" accessibilityLabel={openLabel}
       accessibilityHint={mobileMessage(locale, "task.openImageHint")} accessibilityState={{ disabled, busy: currentPhase === "loading" }}
       disabled={disabled} onPress={onOpen} style={[styles.frame, frame, { backgroundColor: colors.background }]}>
-      {current && <Image key={current.leaseId} source={{ uri: current.uri }} accessible={false} contentFit="contain" cachePolicy="none"
-        autoplay={foreground && visible && eligible} style={styles.fill}
+      {current && <Image key={current.leaseId} source={{ uri: current.uri }} accessible={false} contentFit="fill" cachePolicy="none"
+        autoplay={foreground && visible && eligible} style={[styles.image, imageFrame]}
         onLoad={(event: ImageLoadEventData) => {
           const active = activeRef.current;
           if (!active || active.controller.signal.aborted || active.preview !== current) return;
@@ -124,6 +125,6 @@ export function MobileTimelineImage(props: Props) {
 }
 
 const styles = StyleSheet.create({ wrap: { alignItems: "flex-start" }, frame: { minWidth: 44, minHeight: 44, borderRadius: 12, overflow: "hidden", alignItems: "center", justifyContent: "center" },
-  fill: { position: "absolute", top: 0, right: 0, bottom: 0, left: 0 },
+  image: { borderRadius: 12, overflow: "hidden" },
   placeholder: { position: "absolute", top: 0, right: 0, bottom: 0, left: 0, alignItems: "center", justifyContent: "center", gap: 8, padding: 8 },
   retry: { minHeight: 44, minWidth: 44, justifyContent: "center", paddingHorizontal: 8 }, caption: { fontSize: 12, lineHeight: 18 } });
