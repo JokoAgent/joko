@@ -7,7 +7,11 @@
   "expo": {
     "autolinking": {
       "android": {
-        "exclude": ["expo-notifications"]
+        "exclude": ["expo-notifications"],
+        "buildFromSource": ["expo-image"]
+      },
+      "ios": {
+        "buildFromSource": ["expo-image-manipulator"]
       }
     }
   },
