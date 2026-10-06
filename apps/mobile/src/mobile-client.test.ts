@@ -8464,6 +8464,27 @@ describe("native current-task Files ownership", () => {
     });
   });
 
+  it("reads a YAML snapshot with its canonical MIME through the current Files owner", async () => {
+    const network = fakeNetwork();
+    configureFiles(network);
+    const entry = create(WorkspaceEntrySchema, {
+      ...readme, relativePath: "settings.yml", displayName: "settings.yml", mediaType: "application/yaml"
+    });
+    vi.mocked(network.listWorkspaceDirectory).mockResolvedValue({ entries: [entry], revision: "directory:root" });
+    vi.mocked(network.listWorkspaceFileIndex).mockResolvedValue({ paths: [entry.relativePath], revision: "index-1", truncated: false });
+    vi.mocked(network.readWorkspaceFile).mockResolvedValue(create(FilePreviewSchema, {
+      entry, content: { case: "text", value: {
+        utf8Text: "a: yes", languageId: "yaml", startByte: 0n, endByte: 6n, totalLines: 1
+      } }
+    }));
+    const app = client(network, memoryStorage(credential).storage);
+    await app.start();
+    await app.openFiles();
+    await app.searchFiles("settings.yml", "name", false);
+    await app.previewFileSearchResult(app.state.files.searchResults[0]!);
+    expect(app.state.files.preview).toMatchObject({ kind: "text", text: "a: yes", mediaType: "application/yaml", languageId: "yaml" });
+  });
+
   it("materializes, revalidates, and system-shares one exact Workspace file", async () => {
     const network = fakeNetwork();
     configureFiles(network);

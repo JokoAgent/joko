@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { mkdir, readFile, realpath, stat } from "node:fs/promises";
 import { basename, isAbsolute, join, resolve } from "node:path";
 import { Readable } from "node:stream";
+import { workspaceMediaTypeForPath as mediaTypeForPath } from "./workspace-file-media.js";
 import { listProjectDirectories } from "./project-directory-browser.js";
 import { inspectRemoteHostDirectory, validateRemoteHostDirectoryPath } from "./remote-host-directory-browser.js";
 import { fromBinary, toBinary } from "@bufbuild/protobuf";
@@ -7797,7 +7798,7 @@ async function mapFilePreview(
     };
   }
   return create(contract.FilePreviewSchema, {
-    entry: mapWorkspaceEntry(workspaceId, mappedEntry),
+    entry: mapWorkspaceEntry(workspaceId, mappedEntry, preview.mediaType),
     content,
     truncated: materialized === undefined && (preview.truncated || byteWindowTruncated)
   });
@@ -23406,37 +23407,7 @@ async function pathExists(path: string): Promise<boolean> {
   }
 }
 
-function mediaTypeForPath(path: string): string {
-  const extension = /(?:\.([^.\/]+))$/u.exec(path)?.[1]?.toLowerCase();
-  switch (extension) {
-    case "md": return "text/markdown";
-    case "txt": return "text/plain";
-    case "json": return "application/json";
-    case "js": case "mjs": case "cjs": return "text/javascript";
-    case "ts": case "tsx": return "text/typescript";
-    case "html": return "text/html";
-    case "css": return "text/css";
-    case "yaml": case "yml": return "application/yaml";
-    case "xml": return "application/xml";
-    case "svg": return "image/svg+xml";
-    case "glb": return "model/gltf-binary";
-    case "gltf": return "model/gltf+json";
-    case "ktx2": return "image/ktx2";
-    case "png": return "image/png";
-    case "apng": return "image/apng";
-    case "jpg": case "jpeg": return "image/jpeg";
-    case "gif": return "image/gif";
-    case "webp": return "image/webp";
-    case "bmp": return "image/bmp";
-    case "ico": return "image/x-icon";
-    case "avif": return "image/avif";
-    case "heic": return "image/heic";
-    case "heif": return "image/heif";
-    case "tif": case "tiff": return "image/tiff";
-    case "pdf": return "application/pdf";
-    default: return "application/octet-stream";
-  }
-}
+
 
 function languageForPath(path: string): string {
   const fileName = basename(path).toLowerCase();

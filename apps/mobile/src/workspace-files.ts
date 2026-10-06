@@ -298,6 +298,7 @@ export function isTextMediaType(value: string): boolean {
     || mediaType === "application/json"
     || mediaType === "application/ld+json"
     || mediaType === "application/xml"
+    || mediaType === "application/yaml"
     || mediaType === "application/javascript"
     || mediaType.endsWith("+json")
     || mediaType.endsWith("+xml");

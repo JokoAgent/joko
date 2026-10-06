@@ -104,6 +104,12 @@ describe("RemoteWorkspaceService", () => {
 
     const prefix = await workspaces.preview("workspace-a", "README.md", 5);
     expect(prefix).toMatchObject({ text: "hello", truncated: true, mediaType: "text/markdown" });
+    for (const [name, mediaType] of [["guide.mdown", "text/markdown"], ["Makefile", "text/plain"],
+      ["data.xml", "application/xml"], ["settings.yml", "application/yaml"],
+      ["styles.css", "text/css"], ["script.mjs", "text/javascript"], ["source.ts", "text/typescript"]] as const) {
+      await files.write({ path: `/workspace/${name}`, content: Buffer.from("hello remote"), mode: 0o644 });
+      expect(await workspaces.preview("workspace-a", name, 5)).toMatchObject({ mediaType, text: "hello", truncated: true });
+    }
     const model = await workspaces.preview("workspace-a", "scene.gltf", 5);
     expect(model).toMatchObject({ mediaType: "model/gltf+json", truncated: false });
     expect(model.text).toBeUndefined();

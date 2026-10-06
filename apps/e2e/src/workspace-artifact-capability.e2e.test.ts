@@ -121,10 +121,18 @@ describe("workspace, artifact, and capability boundaries", () => {
       "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9Zl1sAAAAASUVORK5CYII=",
       "base64"
     );
+    const otherFiles = [
+      { name: "mobile-recording.mp3", mediaType: "audio/mpeg", bytes: Buffer.from("ID3-audio-original") },
+      { name: "mobile-module.wasm", mediaType: "application/wasm", bytes: Buffer.from([0, 97, 115, 109, 1, 0, 0, 0]) },
+      { name: "mobile-source.ts", mediaType: "text/typescript", bytes: Buffer.from("export const value = true;\n") },
+      { name: "mobile-unknown.custom", mediaType: "text/plain", bytes: Buffer.from("probed UTF-8\n") }
+    ];
+    const workspaceDirectory = fixture.workspaceDirectory;
     await Promise.all([
-      writeFile(join(fixture.workspaceDirectory, ".mobile-hidden.txt"), "hidden mobile file\n", "utf8"),
-      writeFile(join(fixture.workspaceDirectory, "mobile-search.txt"), `${marker}\n`, "utf8"),
-      writeFile(join(fixture.workspaceDirectory, "mobile-preview.png"), imageBytes)
+      writeFile(join(workspaceDirectory, ".mobile-hidden.txt"), "hidden mobile file\n", "utf8"),
+      writeFile(join(workspaceDirectory, "mobile-search.txt"), `${marker}\n`, "utf8"),
+      writeFile(join(workspaceDirectory, "mobile-preview.png"), imageBytes),
+      ...otherFiles.map((file) => writeFile(join(workspaceDirectory, file.name), file.bytes))
     ]);
 
     const sessionId = sessionIdFrom(await submit(
@@ -225,6 +233,29 @@ describe("workspace, artifact, and capability boundaries", () => {
     expect(textDownload.headers.get("content-type")).toBe("text/plain");
     expect(textDownload.headers.get("content-length")).toBe(String(textBytes.byteLength));
     expect(Buffer.from(await textDownload.arrayBuffer())).toEqual(textBytes);
+
+    for (const file of otherFiles) {
+      const listed = entries.find((entry) => entry.relativePath === file.name)!;
+      expect(listed.mediaType).toBe(file.name.endsWith(".custom") ? "application/octet-stream" : file.mediaType);
+      const result = await paired.clients.workspace.readWorkspaceFile({
+        workspaceId, relativePath: file.name, expectedRevision: listed.revision,
+        maximumBytes: BigInt(file.bytes.byteLength), requireBlob: true
+      });
+      expect(result.preview?.entry?.mediaType).toBe(file.mediaType);
+      expect(result.preview?.content.case).toBe("blob");
+      if (result.preview?.content.case !== "blob") throw new Error("Complete Files read returned no BlobRef.");
+      const blob = result.preview.content.value;
+      expect(blob).toMatchObject({ mediaType: file.mediaType, byteSize: BigInt(file.bytes.byteLength), sha256Hex: sha256(file.bytes) });
+      const ticket = await paired.clients.artifact.getBlobDownloadTicket({ blobId: blob.blobId });
+      expect(ticket.ticket?.requiredMediaType).toBe(file.mediaType);
+      const downloaded = await fetch(`${fixture.baseUrl}${ticket.ticket!.relativeEndpoint}`, {
+        headers: { authorization: `Bearer ${paired.authKey}` }
+      });
+      expect(downloaded.status).toBe(200);
+      expect(downloaded.headers.get("content-type")).toBe(file.mediaType);
+      expect(downloaded.headers.get("content-length")).toBe(String(file.bytes.byteLength));
+      expect(Buffer.from(await downloaded.arrayBuffer())).toEqual(file.bytes);
+    }
 
     const imageEntry = entries.find((entry) => entry.relativePath === "mobile-preview.png")!;
     expect(imageEntry.revision?.opaqueRevision).not.toBe("");

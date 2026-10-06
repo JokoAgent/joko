@@ -52,6 +52,10 @@ import {
   type WorkspaceTextFileWriteResult
 } from "./workspace-service.js";
 import type { WorkspaceFileChangeRecord, WorkspaceFileChangeScope } from "./workspace-change-stream.js";
+import {
+  isWorkspaceTextMediaType as isTextMediaType,
+  workspaceMediaTypeForPath as inferRemoteMediaType
+} from "./workspace-file-media.js";
 
 const MAXIMUM_PROCESS_OUTPUT = 16 * 1024 * 1024;
 const MAXIMUM_TREE_ENTRIES = 100_000;
@@ -981,49 +985,7 @@ function mutableGitSource(source: WorkspaceGitHunkMutation["source"]): "unstaged
   throw new WorkspaceGitReviewError("Only staged or unstaged remote diffs can be changed.", "invalid");
 }
 
-function inferRemoteMediaType(value: string): string {
-  const extension = path.extname(value).toLowerCase();
-  if ([".md", ".markdown", ".mdx"].includes(extension)) return "text/markdown";
-  if ([".html", ".htm"].includes(extension)) return "text/html";
-  if ([".json", ".jsonc"].includes(extension)) return "application/json";
-  if (extension === ".wasm") return "application/wasm";
-  if (extension === ".woff") return "font/woff";
-  if (extension === ".woff2") return "font/woff2";
-  if (extension === ".ttf") return "font/ttf";
-  if (extension === ".otf") return "font/otf";
-  if (extension === ".svg") return "image/svg+xml";
-  if (extension === ".glb") return "model/gltf-binary";
-  if (extension === ".gltf") return "model/gltf+json";
-  if (extension === ".ktx2") return "image/ktx2";
-  if (extension === ".png") return "image/png";
-  if (extension === ".apng") return "image/apng";
-  if ([".jpg", ".jpeg"].includes(extension)) return "image/jpeg";
-  if (extension === ".gif") return "image/gif";
-  if (extension === ".webp") return "image/webp";
-  if (extension === ".bmp") return "image/bmp";
-  if (extension === ".ico") return "image/x-icon";
-  if (extension === ".avif") return "image/avif";
-  if (extension === ".heic") return "image/heic";
-  if (extension === ".heif") return "image/heif";
-  if ([".tif", ".tiff"].includes(extension)) return "image/tiff";
-  if (extension === ".pdf") return "application/pdf";
-  if (extension === ".mp3") return "audio/mpeg";
-  if (extension === ".wav") return "audio/wav";
-  if ([".ogg", ".oga", ".opus"].includes(extension)) return "audio/ogg";
-  if (extension === ".m4a") return "audio/mp4";
-  if (extension === ".aac") return "audio/aac";
-  if (extension === ".flac") return "audio/flac";
-  if (extension === ".mp4") return "video/mp4";
-  if (extension === ".m4v") return "video/x-m4v";
-  if (extension === ".mov") return "video/quicktime";
-  if (extension === ".webm") return "video/webm";
-  if (extension === ".avi") return "video/x-msvideo";
-  if (extension === ".mkv") return "video/x-matroska";
-  if (/\.(?:txt|log|csv|tsv|js|mjs|cjs|jsx|ts|tsx|py|rb|go|rs|java|kt|swift|c|h|cpp|hpp|cs|proto|php|sh|bash|zsh|ps1|yaml|yml|toml|ini|html|vue|svelte|css|scss|sql|graphql|diff|patch)$/iu.test(value)) return "text/plain";
-  return "application/octet-stream";
-}
 
-function isTextMediaType(value: string): boolean { return value.startsWith("text/") || value === "application/json" || value === "image/svg+xml"; }
 
 function gitUrlContainsCredential(value: string): boolean {
   try {
