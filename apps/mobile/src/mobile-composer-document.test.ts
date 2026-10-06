@@ -34,12 +34,14 @@ import {
   recoverMobileComposerDraft,
   restoreMobileComposerInput,
   reconcileMobileComposerText,
+  replaceMobileComposerRange,
   removeMobileComposerAtom,
   updateMobilePastedTextAtom,
   updateMobileRouteReferenceAtom,
   removeMobileComposerMention
 } from "./mobile-composer-document";
 import { segmentMobileComposerRoutePaste } from "./mobile-composer-route-links";
+import { mobileIncomingShareStorageId } from "./mobile-incoming-share-order";
 
 describe("mobile structured composer document", () => {
   it("keeps file excerpts as separate quote atoms across editing, wire offsets and accepted-input recovery", () => {
@@ -127,6 +129,54 @@ describe("mobile structured composer document", () => {
       ...draft,
       attachments: [{ ...draft.attachments[0]!, state: "local" }]
     })).toThrow(/Finish uploading every attachment/u);
+  });
+
+  it("keeps incoming-share text and files in their original cross-type wire order", () => {
+    const batchId = "10000000-0000-4000-8000-000000000001";
+    const item = (ordinal: number) => `${ordinal + 2}0000000-0000-4000-8000-00000000000${ordinal + 2}`;
+    const firstTextId = mobileIncomingShareStorageId(batchId, item(1), 1);
+    const secondTextId = mobileIncomingShareStorageId(batchId, item(3), 3);
+    const first = insertMobilePastedText(emptyMobileComposerDraft(), { start: 0, end: 0 }, "First", firstTextId);
+    const separated = replaceMobileComposerRange(first.draft, first.selection, "\n\n");
+    const textDraft = insertMobilePastedText(separated.draft, separated.selection, "https://example.test", secondTextId).draft;
+    const attachment = (ordinal: number, kind: "image" | "file", fileName: string, mediaType: string) => ({
+      state: "uploaded" as const,
+      attachmentId: mobileIncomingShareStorageId(batchId, item(ordinal), ordinal),
+      kind,
+      fileName,
+      mediaType,
+      byteSize: ordinal + 1,
+      sha256Hex: ordinal.toString(16).repeat(64),
+      capturedAtUnixMs: ordinal,
+      blobId: `blob-${ordinal}`
+    });
+    const draft = normalizeMobileComposerDraft({
+      ...textDraft,
+      attachments: [
+        attachment(0, "image", "first.png", "image/png"),
+        attachment(2, "file", "middle.pdf", "application/pdf"),
+        {
+          state: "uploaded", attachmentId: "ordinary", kind: "file", fileName: "ordinary.txt",
+          mediaType: "text/plain", byteSize: 7, sha256Hex: "f".repeat(64), capturedAtUnixMs: 7, blobId: "ordinary-blob"
+        }
+      ]
+    });
+    const wire = mobileComposerInput(draft);
+
+    expect(wire.parts.map((part) => part.content.case)).toEqual(["image", "text", "file", "text", "file"]);
+    expect(wire.parts[1]?.content).toEqual({ case: "text", value: "First\n\n" });
+    expect(wire.parts[3]?.content).toEqual({ case: "text", value: "https://example.test" });
+    expect(wire.pastedTextRanges).toMatchObject([
+      { start: 0, end: 5 },
+      { start: 7, end: 27 }
+    ]);
+    const withoutMiddleFile = normalizeMobileComposerDraft({
+      ...draft,
+      attachments: draft.attachments.filter((attachment) => attachment.attachmentId
+        !== mobileIncomingShareStorageId(batchId, item(2), 2))
+    });
+    expect(mobileComposerInput(withoutMiddleFile).parts.map((part) => part.content.case))
+      .toEqual(["image", "text", "file"]);
   });
 
   it("recovers a rejected structured prefix without flattening newer references and removes only that exact prefix", () => {

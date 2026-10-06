@@ -29,6 +29,7 @@ import type {
   MobileNewTaskDraftStore,
   MobileNewTaskEditableDraft
 } from "./new-task-draft-store";
+import { mobileIncomingShareStorageId } from "./mobile-incoming-share-order";
 
 export interface MobileIncomingShareReadyFileItem {
   readonly state: "ready";
@@ -307,12 +308,12 @@ export function planMobileIncomingShare(
   const rejected: MobileIncomingSharePlanRejection[] = [];
   const batchStorageIds = new Set(batch.items.filter(
     (item): item is MobileIncomingShareReadyFileItem => item.state === "ready" && item.kind === "file"
-  ).map((item) => incomingShareStorageId(batch.batchId, item.itemId)));
+  ).map((item) => mobileIncomingShareStorageId(batch.batchId, item.itemId, item.ordinal)));
   const occupiedByOtherInputs = current.filter((attachment) => !batchStorageIds.has(attachment.attachmentId)).length;
   let remaining = Math.max(0, policy.maximumItems - occupiedByOtherInputs);
   const batchTextIds = new Set(batch.items.filter(
     (item): item is MobileIncomingShareReadyTextItem => item.state === "ready" && item.kind !== "file"
-  ).map((item) => incomingShareStorageId(batch.batchId, item.itemId)));
+  ).map((item) => mobileIncomingShareStorageId(batch.batchId, item.itemId, item.ordinal)));
   let remainingAtoms = Math.max(0, mobileComposerMaximumAtoms
     - currentAtoms.filter((atom) => !batchTextIds.has(atom.atomId)).length);
   for (const item of batch.items) {
@@ -338,7 +339,7 @@ export function planMobileIncomingShare(
         text: item.text,
         byteSize: item.byteSize,
         sha256Hex: item.sha256Hex,
-        storageId: incomingShareStorageId(batch.batchId, item.itemId)
+        storageId: mobileIncomingShareStorageId(batch.batchId, item.itemId, item.ordinal)
       });
       remainingAtoms -= 1;
       continue;
@@ -363,7 +364,7 @@ export function planMobileIncomingShare(
         mediaType: item.mediaType,
         byteSize: item.byteSize,
         sha256Hex: item.sha256Hex,
-        storageId: incomingShareStorageId(batch.batchId, item.itemId)
+        storageId: mobileIncomingShareStorageId(batch.batchId, item.itemId, item.ordinal)
       });
       remaining -= 1;
     } catch (failure) {
@@ -903,12 +904,6 @@ function assertSharedUrl(text: string): void {
   }
 }
 
-function incomingShareStorageId(batchId: string, itemId: string): string {
-  assertUuid(batchId, "incoming share");
-  assertUuid(itemId, "incoming-share item");
-  return `share_${batchId.replaceAll("-", "")}_${itemId.replaceAll("-", "")}`;
-}
-
 function record(value: unknown, name: string): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`The ${name} is invalid.`);
   return value as Record<string, unknown>;
@@ -1004,6 +999,6 @@ const nativeIncomingShareDriver: MobileIncomingShareNativeDriver = {
 export const mobileIncomingShare = new MobileIncomingShareInbox();
 
 export const mobileIncomingShareTesting = {
-  incomingShareStorageId,
+  incomingShareStorageId: mobileIncomingShareStorageId,
   normalizeBatch
 };

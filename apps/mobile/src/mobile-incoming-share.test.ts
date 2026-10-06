@@ -20,7 +20,7 @@ import {
 } from "./mobile-incoming-share";
 import { MobileNewTaskDraftStore } from "./new-task-draft-store";
 import { MobileComposerDraftStore } from "./composer-draft-store";
-import { emptyMobileComposerDraft, mobileComposerInput, plainTextMobileComposerDraft } from "./mobile-composer-document";
+import { emptyMobileComposerDraft, mobileComposerInput, normalizeMobileComposerDraft, plainTextMobileComposerDraft } from "./mobile-composer-document";
 import type {
   MobileAttachmentControls,
   MobileAttachmentPolicy,
@@ -188,7 +188,7 @@ describe("mobile incoming-share plan and durable commit", () => {
 
   it("reconstructs the same accepted plan after its deterministic draft attachment already fills the limit", () => {
     const batch = normalizedBatch(rawBatch(batchOne));
-    const storageId = mobileIncomingShareTesting.incomingShareStorageId(batchOne, itemOne);
+    const storageId = mobileIncomingShareTesting.incomingShareStorageId(batchOne, itemOne, 0);
     const plan = planMobileIncomingShare(batch, [localAttachment(storageId)], {
       ...controls.policy,
       maximumItems: 1
@@ -256,7 +256,7 @@ describe("mobile incoming-share plan and durable commit", () => {
 
   it("treats a durable deterministic attachment as an idempotent reentry and only retries native acknowledgement", async () => {
     const batch = claimedBatch(batchOne);
-    const storageId = mobileIncomingShareTesting.incomingShareStorageId(batchOne, itemOne);
+    const storageId = mobileIncomingShareTesting.incomingShareStorageId(batchOne, itemOne, 0);
     const store = await draftStore([localAttachment(storageId)]);
     const files = attachmentFiles();
     const acknowledge = vi.fn(async () => undefined);
@@ -295,7 +295,7 @@ describe("mobile incoming-share plan and durable commit", () => {
     })).rejects.toThrow(/draft changed/u);
     expect(files.removeOwnedBytes).toHaveBeenCalledWith(
       profileId,
-      mobileIncomingShareTesting.incomingShareStorageId(batchOne, itemOne)
+      mobileIncomingShareTesting.incomingShareStorageId(batchOne, itemOne, 0)
     );
     expect(acknowledge).not.toHaveBeenCalled();
 
@@ -438,6 +438,22 @@ describe("mobile incoming-share plan and durable commit", () => {
     ]);
     expect(durable?.attachments).toHaveLength(1);
     expect(durable?.text.startsWith("Existing message\n\n")).toBe(true);
+    if (!durable) throw new Error("expected durable mixed share");
+    const sendable = normalizeMobileComposerDraft({
+      ...durable,
+      attachments: durable.attachments.map((attachment) => ({
+        ...attachment,
+        state: "uploaded" as const,
+        blobId: `blob-${attachment.attachmentId}`
+      }))
+    });
+    const wire = mobileComposerInput(sendable);
+    expect(wire.parts.map((part) => part.content.case)).toEqual(["text", "image", "text"]);
+    expect(wire.parts[0]?.content).toEqual({
+      case: "text",
+      value: "Existing message\n\nPlease inspect this\n\n"
+    });
+    expect(wire.parts[2]?.content).toEqual({ case: "text", value: "https://example.test/report" });
     expect(files.stageCandidates).toHaveBeenCalledTimes(1);
     const replay = await commitMobileIncomingShare({ ...request, allowFreshClaim: false,
       acknowledge: vi.fn(async () => undefined) });
@@ -445,6 +461,38 @@ describe("mobile incoming-share plan and durable commit", () => {
     expect(replay.replayed).toBe(true);
     expect(files.stageCandidates).toHaveBeenCalledTimes(1);
     expect((await composerDraftStore.readDurable(identity))?.atoms).toHaveLength(2);
+    if (replay.destinationKind !== "existing_task") throw new Error("expected existing task replay");
+    expect(mobileComposerInput(normalizeMobileComposerDraft({
+      ...replay.draft,
+      attachments: replay.draft.attachments.map((attachment) => ({
+        ...attachment,
+        state: "uploaded" as const,
+        blobId: `blob-${attachment.attachmentId}`
+      }))
+    })).parts.map((part) => part.content.case)).toEqual(["text", "image", "text"]);
+  });
+
+  it("retains a file-text-file native order in a new-task draft and its v9 durable record", async () => {
+    const items = [readyItem(itemOne, 0), textItem(itemTwo, 1, "Between the files", "text"), readyItem(itemThree, 2)];
+    const batch = normalizedBatch(withClaim({ ...rawBatch(batchOne), boundProfileId: profileId, items },
+      [itemOne, itemTwo, itemThree]));
+    const store = await draftStore();
+    const result = await commitMobileIncomingShare({
+      batch, profileId, destination: { kind: "new_task", targetId: "target-one" }, controls,
+      newTaskDraftStore: storeBoundary(store), composerDraftStore: composerStoreBoundary(), attachmentFiles: attachmentFiles(),
+      validateAuthority: vi.fn(async () => controls), acknowledge: vi.fn(async () => undefined), allowFreshClaim: true
+    });
+    if (result.destinationKind !== "new_task") throw new Error("expected new task result");
+    const sendable = normalizeMobileComposerDraft({
+      ...result.draft.input,
+      attachments: result.draft.input.attachments.map((attachment) => ({
+        ...attachment,
+        state: "uploaded" as const,
+        blobId: `blob-${attachment.attachmentId}`
+      }))
+    });
+    expect(mobileComposerInput(sendable).parts.map((part) => part.content.case)).toEqual(["image", "text", "image"]);
+    expect([...store.memory.values()][0]).toContain('"version":9');
   });
 
   it("fails closed after a claimed text import was removed during an uncertain acknowledgement", async () => {

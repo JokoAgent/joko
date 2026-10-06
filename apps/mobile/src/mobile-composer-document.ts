@@ -33,6 +33,7 @@ import {
   type MobileComposerRoutePasteOptions,
   type MobileComposerRoutePasteSegment
 } from "./mobile-composer-route-links";
+import { parseMobileIncomingSharePartIdentity } from "./mobile-incoming-share-order";
 
 export interface MobileComposerSessionMention {
   readonly kind: "session";
@@ -983,13 +984,7 @@ export function mobileComposerInput(draft: MobileComposerDraft): InputContent {
     throw new Error("Finish uploading every attachment before sending.");
   }
   return create(InputContentSchema, {
-    parts: [
-      ...(serialized.text.length === 0 ? [] : [create(InputPartSchema, { content: { case: "text", value: serialized.text } })]),
-      ...exact.attachments.map((attachment) => mobileComposerAttachmentInputPart(
-        attachment as MobileUploadedComposerAttachment
-      )),
-      ...exact.mentions.map(mobileComposerInputPart)
-    ],
+    parts: mobileComposerInputParts(exact, serialized),
     quotesEncoded: exact.atoms.some(isMobileComposerQuoteAtom),
     pastedTextRanges: serialized.pastedTextRanges.map((range) => create(InlineTextRangeSchema, range)),
     mentionRanges: exact.mentions.map((mention, mentionIndex) => create(InputMentionRangeSchema, {
@@ -1391,14 +1386,17 @@ function mobilePastedTextLineCount(text: string): number {
 interface MobileSerializedComposerText {
   readonly text: string;
   readonly pastedTextRanges: readonly { readonly start: number; readonly end: number; readonly display: string }[];
+  readonly atomTextRanges: readonly { readonly atomId: string; readonly start: number; readonly end: number }[];
 }
 
 function serializeMobileComposerText(draft: MobileComposerDraft): MobileSerializedComposerText {
   let text = "";
   let cursor = 0;
   const pastedTextRanges: { start: number; end: number; display: string }[] = [];
+  const atomTextRanges: { atomId: string; start: number; end: number }[] = [];
   for (const atom of draft.atoms) {
     text += draft.text.slice(cursor, atom.start);
+    const atomStart = text.length;
     if (isMobileComposerQuoteAtom(atom)) {
       text += mobileSelectionQuoteText(atom.text, atom.kind === "file-quote" ? atom.sourcePath : undefined);
     } else if (atom.kind === "pasted-text") {
@@ -1408,13 +1406,113 @@ function serializeMobileComposerText(draft: MobileComposerDraft): MobileSerializ
     } else {
       text += atom.serialized;
     }
+    atomTextRanges.push({ atomId: atom.atomId, start: atomStart, end: text.length });
     cursor = atom.end;
   }
   text += draft.text.slice(cursor);
   if (text.length > maximumSerializedCharacters) {
     throw new Error(`A task message can contain at most ${maximumSerializedCharacters.toLocaleString("en-US")} serialized characters.`);
   }
-  return { text, pastedTextRanges };
+  return { text, pastedTextRanges, atomTextRanges };
+}
+
+function mobileComposerInputParts(
+  draft: MobileComposerDraft,
+  serialized: MobileSerializedComposerText
+): InputContent["parts"] {
+  type OrderedText = {
+    readonly batchKey: string;
+    readonly ordinal: number;
+    readonly start: number;
+    readonly end: number;
+  };
+  type OrderedAttachment = {
+    readonly batchKey: string;
+    readonly ordinal: number;
+    readonly attachmentIndex: number;
+    readonly part: InputContent["parts"][number];
+  };
+  const rangeByAtomId = new Map(serialized.atomTextRanges.map((range) => [range.atomId, range] as const));
+  const orderedTexts: OrderedText[] = draft.atoms.flatMap((atom) => {
+    const identity = parseMobileIncomingSharePartIdentity(atom.atomId);
+    if (!identity) return [];
+    if (atom.kind !== "pasted-text") {
+      throw new Error("An incoming-share text identity is attached to an incompatible composer item.");
+    }
+    const range = rangeByAtomId.get(atom.atomId);
+    if (!range) throw new Error("An incoming-share text item is missing its serialized range.");
+    return [{ ...identity, start: range.start, end: range.end }];
+  });
+  const orderedAttachments: OrderedAttachment[] = draft.attachments.flatMap((attachment, attachmentIndex) => {
+    const identity = parseMobileIncomingSharePartIdentity(attachment.attachmentId);
+    return identity ? [{
+      ...identity,
+      attachmentIndex,
+      part: mobileComposerAttachmentInputPart(attachment as MobileUploadedComposerAttachment)
+    }] : [];
+  });
+  const textsByBatch = new Map<string, OrderedText[]>();
+  for (const item of orderedTexts) {
+    const group = textsByBatch.get(item.batchKey) ?? [];
+    group.push(item);
+    textsByBatch.set(item.batchKey, group);
+  }
+  const attachmentsByBatch = new Map<string, OrderedAttachment[]>();
+  for (const item of orderedAttachments) {
+    const group = attachmentsByBatch.get(item.batchKey) ?? [];
+    group.push(item);
+    attachmentsByBatch.set(item.batchKey, group);
+  }
+  const consumedAttachmentIndexes = new Set<number>();
+  const events: Array<{ readonly offset: number; readonly batchStart: number; readonly item: OrderedAttachment }> = [];
+  const batchKeys = new Set([...textsByBatch.keys(), ...attachmentsByBatch.keys()]);
+  for (const batchKey of batchKeys) {
+    const textItems = textsByBatch.get(batchKey) ?? [];
+    const attachmentItems = attachmentsByBatch.get(batchKey) ?? [];
+    const allOrdinals = [...textItems, ...attachmentItems].map((item) => item.ordinal);
+    if (new Set(allOrdinals).size !== allOrdinals.length) {
+      throw new Error("The incoming-share composer order contains a duplicated item ordinal.");
+    }
+    if (textItems.length === 0 || attachmentItems.length === 0) continue;
+    const orderedTextItems = [...textItems].sort((left, right) => left.ordinal - right.ordinal);
+    const batchStart = Math.min(...orderedTextItems.map((item) => item.start));
+    for (const item of attachmentItems) {
+      const nextText = orderedTextItems.find((candidate) => candidate.ordinal > item.ordinal);
+      const offset = nextText?.start ?? orderedTextItems[orderedTextItems.length - 1]!.end;
+      events.push({ offset, batchStart, item });
+      consumedAttachmentIndexes.add(item.attachmentIndex);
+    }
+  }
+  events.sort((left, right) => left.offset - right.offset
+    || left.batchStart - right.batchStart
+    || left.item.ordinal - right.item.ordinal
+    || left.item.attachmentIndex - right.item.attachmentIndex);
+  const parts: InputContent["parts"] = [];
+  let cursor = 0;
+  let eventIndex = 0;
+  while (eventIndex < events.length) {
+    const offset = events[eventIndex]!.offset;
+    if (offset < cursor || offset < 0 || offset > serialized.text.length) {
+      throw new Error("The incoming-share composer order has an invalid text anchor.");
+    }
+    if (offset > cursor) {
+      parts.push(create(InputPartSchema, { content: { case: "text", value: serialized.text.slice(cursor, offset) } }));
+    }
+    while (eventIndex < events.length && events[eventIndex]!.offset === offset) {
+      parts.push(events[eventIndex]!.item.part);
+      eventIndex += 1;
+    }
+    cursor = offset;
+  }
+  if (cursor < serialized.text.length) {
+    parts.push(create(InputPartSchema, { content: { case: "text", value: serialized.text.slice(cursor) } }));
+  }
+  for (let index = 0; index < draft.attachments.length; index += 1) {
+    if (consumedAttachmentIndexes.has(index)) continue;
+    parts.push(mobileComposerAttachmentInputPart(draft.attachments[index] as MobileUploadedComposerAttachment));
+  }
+  parts.push(...draft.mentions.map(mobileComposerInputPart));
+  return parts;
 }
 
 function mobileSelectionQuoteText(text: string, sourcePath?: string): string {
