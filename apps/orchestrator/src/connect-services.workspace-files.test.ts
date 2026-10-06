@@ -405,6 +405,12 @@ describe("Connect formal Workspace Files contracts", () => {
   it("returns typed Artifact refs for raster, PDF, video, and arbitrary binary files", async () => {
     const imageBytes = Buffer.from([0x89, 0x50, 0x4e, 0x47]);
     const pdfBytes = Buffer.from("%PDF-1.7\n", "utf8");
+    const rasters = new Map([
+      ["pixel.png", "image/png"], ["photo.jpg", "image/jpeg"], ["photo.jpeg", "image/jpeg"],
+      ["motion.gif", "image/gif"], ["modern.webp", "image/webp"], ["sample.bmp", "image/bmp"],
+      ["favicon.ico", "image/x-icon"], ["motion.apng", "image/apng"], ["modern.AVIF", "image/avif"],
+      ["photo.heic", "image/heic"], ["photo.heif", "image/heif"], ["scan.tif", "image/tiff"], ["scan.tiff", "image/tiff"]
+    ]);
     const ingestBytes = vi.fn(async (bytes: Uint8Array, options?: { fileName?: string; mimeType?: string; expiresAt?: number }) => ({
       id: `blob-${options?.fileName ?? "unknown"}`,
       sha256: `sha256:${createHash("sha256").update(bytes).digest("hex")}`,
@@ -416,8 +422,8 @@ describe("Connect formal Workspace Files contracts", () => {
       expiresAt: options?.expiresAt
     }));
     const preview = vi.fn(async (_workspaceId: string, path: string) => {
-      const mediaType = path.endsWith(".png") ? "image/png" : path.endsWith(".pdf") ? "application/pdf" : "audio/mpeg";
-      const bytes = path.endsWith(".png") ? imageBytes : path.endsWith(".pdf") ? pdfBytes : undefined;
+      const mediaType = rasters.get(path) ?? (path.endsWith(".pdf") ? "application/pdf" : "audio/mpeg");
+      const bytes = rasters.has(path) ? imageBytes : path.endsWith(".pdf") ? pdfBytes : undefined;
       return {
         entry: {
           path,
@@ -443,12 +449,22 @@ describe("Connect formal Workspace Files contracts", () => {
       createdAt: 1,
       expiresAt: 301_000
     }));
-    const services = createConnectServices(application({ workspaces: { preview, materializeFile }, ingestBytes }));
-
-    const image = await services.workspace.readWorkspaceFile(create(contract.ReadWorkspaceFileRequestSchema, {
-      workspaceId: "workspace-files",
-      relativePath: "pixel.png"
+    const list = vi.fn(async () => [...rasters.keys()].map((path) => workspaceEntry(path, "revision")));
+    const services = createConnectServices(application({ workspaces: { list, preview, materializeFile }, ingestBytes }));
+    const catalog = await services.workspace.listWorkspaceEntries(create(contract.ListWorkspaceEntriesRequestSchema, {
+      workspaceId: "workspace-files"
     }), context());
+    for (const [path, mediaType] of rasters) {
+      expect(catalog.entries?.find((entry) => entry.relativePath === path)?.mediaType).toBe(mediaType);
+      const image = await services.workspace.readWorkspaceFile(create(contract.ReadWorkspaceFileRequestSchema, {
+        workspaceId: "workspace-files", relativePath: path
+      }), context());
+      expect(image.preview?.entry?.mediaType).toBe(mediaType);
+      expect(image.preview?.content).toMatchObject({
+        case: "image",
+        value: { blob: { blobId: `blob-${path}`, mediaType, disposition: contract.BlobDisposition.INLINE } }
+      });
+    }
     const pdf = await services.workspace.readWorkspaceFile(create(contract.ReadWorkspaceFileRequestSchema, {
       workspaceId: "workspace-files",
       relativePath: "manual.pdf"
@@ -458,10 +474,7 @@ describe("Connect formal Workspace Files contracts", () => {
       relativePath: "recording.mp3"
     }), context());
 
-    expect(image.preview?.content).toMatchObject({
-      case: "image",
-      value: { blob: { blobId: "blob-pixel.png", mediaType: "image/png", disposition: contract.BlobDisposition.INLINE } }
-    });
+    expect(pdf.preview?.entry?.mediaType).toBe("application/pdf");
     expect(pdf.preview?.content).toMatchObject({
       case: "blob",
       value: { blobId: "blob-manual.pdf", mediaType: "application/pdf", disposition: contract.BlobDisposition.ATTACHMENT }
@@ -470,7 +483,7 @@ describe("Connect formal Workspace Files contracts", () => {
       case: "blob",
       value: { blobId: "blob-recording.mp3", mediaType: "audio/mpeg", disposition: contract.BlobDisposition.ATTACHMENT }
     });
-    expect(ingestBytes).toHaveBeenCalledTimes(2);
+    expect(ingestBytes).toHaveBeenCalledTimes(rasters.size + 1);
     expect(ingestBytes).toHaveBeenCalledWith(imageBytes, expect.objectContaining({ fileName: "pixel.png", mimeType: "image/png" }));
     expect(ingestBytes).toHaveBeenCalledWith(pdfBytes, expect.objectContaining({ fileName: "manual.pdf", mimeType: "application/pdf" }));
     expect(materializeFile).toHaveBeenCalledWith(
