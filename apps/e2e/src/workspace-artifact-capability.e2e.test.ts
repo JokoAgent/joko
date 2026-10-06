@@ -127,6 +127,7 @@ describe("workspace, artifact, and capability boundaries", () => {
       { name: "mobile-source.ts", mediaType: "text/typescript", bytes: Buffer.from("export const value = true;\n") },
       { name: "mobile-events.jsonl", mediaType: "text/plain", bytes: Buffer.from('{"event":"read"}\n') },
       { name: "mobile-unicode.zig", mediaType: "text/plain", bytes: Buffer.from("a漢") },
+      { name: "mobile-bom.zig", mediaType: "text/plain", bytes: Buffer.from("\uFEFFfirst\r\nfocus line — 文本\r\nlast\r\n") },
       { name: "Gemfile", mediaType: "text/plain", bytes: Buffer.from('source "local"\n') },
       { name: "mobile-unknown.custom", mediaType: "text/plain", bytes: Buffer.from("probed UTF-8\n") }
     ];
@@ -185,6 +186,15 @@ describe("workspace, artifact, and capability boundaries", () => {
     expect(unicodeText.preview).toMatchObject({
       entry: { mediaType: "text/plain" },
       content: { case: "text", value: { utf8Text: "a", startByte: 0n, endByte: 1n } }, truncated: true
+    });
+    const bomFile = otherFiles.find((file) => file.name === "mobile-bom.zig")!;
+    const bomText = await paired.clients.workspace.readWorkspaceFile({
+      workspaceId, relativePath: bomFile.name,
+      expectedRevision: entries.find((entry) => entry.relativePath === bomFile.name)!.revision
+    });
+    expect(bomText.preview).toMatchObject({
+      content: { case: "text", value: { utf8Text: bomFile.bytes.toString("utf8"), startByte: 0n, endByte: BigInt(bomFile.bytes.length) } },
+      truncated: false
     });
     const largeText = await paired.clients.workspace.readWorkspaceFile({
       workspaceId, relativePath: "mobile-large.zig",

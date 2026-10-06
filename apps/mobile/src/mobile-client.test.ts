@@ -1,4 +1,4 @@
-import { clone, create, toBinary } from "@bufbuild/protobuf";
+import { clone, create, fromBinary, toBinary } from "@bufbuild/protobuf";
 import { Code } from "@connectrpc/connect";
 import { createHash } from "node:crypto";
 import sharp from "sharp";
@@ -7784,9 +7784,9 @@ describe("native current-task Files ownership", () => {
     const canonical = create(WorkspaceEntrySchema, { ...observed, revision: { ...observed.revision!, opaqueRevision: `sha256:${digest}:${length}`, sha256Hex: digest } });
     const network = fakeNetwork(); configureFiles(network, handoffSnapshot);
     vi.mocked(network.listWorkspaceDirectory).mockResolvedValue({ entries: [observed], revision: "text-directory" });
-    const response = create(FilePreviewSchema, { entry: canonical, content: { case: "text", value: {
+    const response = fromBinary(FilePreviewSchema, toBinary(FilePreviewSchema, create(FilePreviewSchema, { entry: canonical, content: { case: "text", value: {
       utf8Text: body, startByte: 0n, endByte: length, totalLines: body.split(/\r\n?|\n/u).length
-    } } });
+    } } })));
     vi.mocked(network.readWorkspaceFile).mockResolvedValue(response);
     const drafts = memoryDraftStores(); let id = 0;
     const app = client(network, memoryStorage(credential).storage, undefined, undefined, () => "file-action-" + ++id, undefined, drafts);

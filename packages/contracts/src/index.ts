@@ -1,3 +1,5 @@
+import "./protobuf-text-encoding.js";
+
 export * from "./gen/joko/v1/capability_pb.js";
 export * from "./gen/joko/v1/code_host_pb.js";
 export * from "./gen/joko/v1/collaboration_pb.js";
