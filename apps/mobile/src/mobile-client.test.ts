@@ -8485,6 +8485,44 @@ describe("native current-task Files ownership", () => {
     expect(app.state.files.preview).toMatchObject({ kind: "text", text: "a: yes", mediaType: "application/yaml", languageId: "yaml" });
   });
 
+  it.each(["main.zig", "events.jsonl", "movie.srt", "Gemfile", ".gitignore", ".env", "production.env.local", "layout.xhtml"])
+  ("reads and source-copies a canonical Generated text filename %s while retaining its declared MIME", async (fileName) => {
+    const network = fakeNetwork();
+    configureFiles(network);
+    const text = "\uFEFFsource\r\ntext";
+    const bytes = new TextEncoder().encode(text);
+    const source = create(ArtifactSchema, {
+      ...artifact, title: fileName,
+      blob: { ...artifact.blob!, fileName, mediaType: "application/octet-stream", byteSize: BigInt(bytes.length) }
+    });
+    vi.mocked(network.listSessionArtifacts).mockResolvedValue({ artifacts: [source], revision: "artifacts-text" });
+    vi.mocked(network.downloadBlob).mockResolvedValue({ bytes, mediaType: "application/octet-stream" });
+    const app = client(network, memoryStorage(credential).storage);
+    await app.start(); await app.openFiles(); app.openGeneratedFiles();
+    await app.previewArtifact(app.state.files.artifacts[0]!);
+    const preview = app.state.files.preview;
+    expect(preview).toMatchObject({ kind: "text", text, mediaType: "application/octet-stream", endByte: BigInt(bytes.length) });
+    if (preview?.kind !== "text") throw new Error("Generated text did not open.");
+    const copied = await app.prepareFileTextSourceCopy(preview, new AbortController().signal);
+    expect(copied.text).toBe(text); copied.assertCurrent();
+    expect(network.downloadBlob).toHaveBeenCalledWith(credential, source.blob, expect.any(AbortSignal));
+  });
+
+  it.each([new Uint8Array([0xff, 0xfe]), new TextEncoder().encode("source\0binary")])
+  ("rejects invalid canonical Generated text bytes without exposing a text preview", async (bytes) => {
+    const network = fakeNetwork(); configureFiles(network);
+    const source = create(ArtifactSchema, { ...artifact, blob: {
+      ...artifact.blob!, fileName: "main.zig", mediaType: "application/octet-stream", byteSize: BigInt(bytes.length)
+    } });
+    vi.mocked(network.listSessionArtifacts).mockResolvedValue({ artifacts: [source], revision: "artifacts-text" });
+    vi.mocked(network.downloadBlob).mockResolvedValue({ bytes, mediaType: "application/octet-stream" });
+    const app = client(network, memoryStorage(credential).storage);
+    await app.start(); await app.openFiles(); app.openGeneratedFiles();
+    await app.previewArtifact(app.state.files.artifacts[0]!);
+    expect(app.state.files.preview).toMatchObject({ kind: "error", reason: expect.any(String) });
+    expect(app.state.files.status).toBe("ready");
+  });
+
   it("materializes, revalidates, and system-shares one exact Workspace file", async () => {
     const network = fakeNetwork();
     configureFiles(network);
@@ -9112,6 +9150,31 @@ describe("native current-task Files ownership", () => {
     app.closeTimelinePreview();
     await vi.waitFor(() => expect(media.removed).toEqual(["preview-timeline-media-lease.mp4"]));
     expect(app.state.timelinePreview).toBeUndefined();
+  });
+
+  it.each([
+    { fileName: "source.zig", text: "\uFEFFsource\r\ntext" },
+    { fileName: ".env", text: "MODE=local\n" },
+    { fileName: "source.zig", text: "source\0binary", invalid: true }
+  ])("reads a current canonical Timeline text filename $fileName without changing Blob metadata", async ({ fileName, text, invalid = false }) => {
+    const bytes = new TextEncoder().encode(text);
+    const event = timelinePreviewEvent(fileName, "application/octet-stream", bytes, sha256Hex(bytes), fileName);
+    const network = projectedNetwork(timelineGallerySnapshot(event));
+    vi.mocked(network.downloadBlob).mockResolvedValue({ bytes, mediaType: "application/octet-stream" });
+    vi.mocked(network.readAround).mockResolvedValue([event]);
+    const app = client(network, memoryStorage(credential).storage);
+    await app.start();
+    await app.previewTimelineArtifact(timelineRows(app.state.detail?.timeline ?? [])[0]!.artifacts![0]!);
+    const preview = app.state.timelinePreview;
+    if (invalid) {
+      expect(preview).toMatchObject({ kind: "error", reason: expect.stringMatching(/binary/u) });
+    } else {
+      expect(preview).toMatchObject({ kind: "text", text, mediaType: "application/octet-stream" });
+      if (preview?.kind !== "text") throw new Error("Missing Timeline text preview");
+      expect((await app.prepareFileTextSourceCopy(preview, new AbortController().signal)).text).toBe(text);
+    }
+    expect(network.listWorkspaceDirectory).not.toHaveBeenCalled();
+    expect(network.readWorkspaceFile).not.toHaveBeenCalled();
   });
 
   it("renders a current durable Timeline HTML file without borrowing Workspace resource authority", async () => {

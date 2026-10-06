@@ -31,6 +31,7 @@ export * from "./gen/joko/v1/terminal_pb.js";
 export * from "./gen/joko/v1/voice_pb.js";
 export * from "./gen/joko/v1/workspace_pb.js";
 export * from "./well-known.js";
+export * from "./file-preview.js";
 export * from "./tool-presentation.js";
 export * from "./tool-file-change.js";
 export * from "./tool-payload.js";

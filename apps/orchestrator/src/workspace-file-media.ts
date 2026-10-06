@@ -1,4 +1,4 @@
-import { posix } from "node:path";
+import { fileNameSupportsTextPreview, filePreviewExtension } from "@joko/contracts";
 
 /** Filename metadata is advisory until a revision-fenced snapshot is read. */
 export const workspaceRasterMediaTypes: ReadonlyMap<string, string> = new Map([
@@ -31,26 +31,17 @@ const mediaTypes: ReadonlyMap<string, string> = new Map([
   [".webm", "video/webm"], [".avi", "video/x-msvideo"], [".mkv", "video/x-matroska"]
 ]);
 
-const textExtensions = new Set([
-  ".txt", ".log", ".csv", ".tsv",
-  ".json", ".jsonc", ".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx",
-  ".py", ".rb", ".go", ".rs", ".java", ".kt", ".swift",
-  ".c", ".h", ".cpp", ".cc", ".cxx", ".hpp", ".cs", ".scala", ".sc",
-  ".groovy", ".gradle", ".pl", ".pm", ".r", ".hs", ".proto", ".php",
-  ".dart", ".lua", ".sh", ".bash", ".zsh", ".ps1",
-  ".yaml", ".yml", ".toml", ".ini", ".html", ".htm", ".vue", ".svelte",
-  ".css", ".scss", ".sass", ".less", ".sql", ".graphql", ".gql",
-  ".diff", ".patch", ".dockerfile", ".makefile", ".mk"
-]);
 
 export function workspaceMediaTypeForPath(value: string): string {
-  const name = posix.basename(value.replace(/\\/gu, "/")).toLowerCase();
-  if (name === "dockerfile" || name === "makefile") return "text/plain";
-  const extension = posix.extname(name);
-  return mediaTypes.get(extension) ?? (textExtensions.has(extension) ? "text/plain" : "application/octet-stream");
+  return mediaTypes.get(filePreviewExtension(value))
+    ?? (fileNameSupportsTextPreview(value) ? "text/plain" : "application/octet-stream");
 }
 
 export function isWorkspaceTextMediaType(value: string): boolean {
   return value.startsWith("text/") || value === "application/json" || value === "application/xml"
     || value === "application/yaml" || value === "image/svg+xml";
+}
+
+export function decodeWorkspaceTextPreview(bytes: Uint8Array, truncated: boolean): string {
+  return new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes, { stream: truncated });
 }

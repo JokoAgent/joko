@@ -5,7 +5,7 @@ import { mobileMediaPreviewKind } from "./mobile-media-preview";
 import { mobileModelPreviewKind } from "./mobile-model-preview";
 import { isMobilePdfPreviewMediaType } from "./mobile-pdf-preview";
 import { MOBILE_BLOB_PREVIEW_MAXIMUM_BYTES, MOBILE_FILE_SHARE_MAXIMUM_BYTES } from "./network";
-import { isTextMediaType, normalizeMediaType } from "./workspace-files";
+import { isTextFilePreviewMetadata, normalizeMediaType } from "./workspace-files";
 
 export interface MobileTimelineArtifact {
   readonly artifactId: string;
@@ -34,7 +34,7 @@ export function mobileTimelineArtifacts(event: Event): readonly MobileTimelineAr
     const mediaType = normalizeMediaType(blob.mediaType);
     const previewKind = mobileMediaPreviewKind(mediaType) ? "media"
       : isMobilePdfPreviewMediaType(mediaType) ? "pdf"
-        : mobileModelPreviewKind(mediaType, blob.fileName) ? "model" : isTextMediaType(mediaType) ? "text" : undefined;
+        : mobileModelPreviewKind(mediaType, blob.fileName) ? "model" : isTextFilePreviewMetadata(mediaType, blob.fileName) ? "text" : undefined;
     if (!/^[a-z0-9!#$&^_.+-]+\/[a-z0-9!#$&^_.+-]+$/u.test(mediaType)
       || !validBlobIdentity(blob, MOBILE_FILE_SHARE_MAXIMUM_BYTES)) return [];
     const title = boundedLabel(content.label) || boundedLabel(blob.fileName) || "Task file";

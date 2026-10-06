@@ -53,6 +53,7 @@ import {
 } from "./workspace-service.js";
 import type { WorkspaceFileChangeRecord, WorkspaceFileChangeScope } from "./workspace-change-stream.js";
 import {
+  decodeWorkspaceTextPreview,
   isWorkspaceTextMediaType as isTextMediaType,
   workspaceMediaTypeForPath as inferRemoteMediaType
 } from "./workspace-file-media.js";
@@ -260,11 +261,10 @@ export class RemoteWorkspaceService implements RemoteWorkspaceDelegate {
     const entry = remoteEntry(canonicalRelative(relativePath), after, contentRevision(bytes));
     if (isTextMediaType(mediaType)) {
       if (bytes.includes(0)) throw new WorkspaceFilePreviewError("Remote file is not valid text.", "unsupported");
-      if (mediaType === "text/html" || maximumFileBytes !== undefined) {
-        try { new TextDecoder("utf-8", { fatal: true }).decode(bytes); }
-        catch { throw new WorkspaceFilePreviewError("Remote file is not complete UTF-8 text.", "unsupported"); }
-      }
-      return { entry, observedRevision: remoteRevision(after), mediaType, text: bytes.toString("utf8"), truncated: before.size > bytes.byteLength };
+      let text: string;
+      try { text = decodeWorkspaceTextPreview(bytes, before.size > bytes.byteLength); }
+      catch { throw new WorkspaceFilePreviewError("Remote file is not valid UTF-8 text.", "unsupported"); }
+      return { entry, observedRevision: remoteRevision(after), mediaType, text, truncated: before.size > bytes.byteLength };
     }
     return { entry, observedRevision: remoteRevision(after), mediaType, bytes, truncated: before.size > bytes.byteLength };
   }

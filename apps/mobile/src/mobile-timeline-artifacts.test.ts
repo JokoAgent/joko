@@ -53,13 +53,17 @@ describe("mobile Timeline preview artifacts", () => {
       create(MessageBlockSchema, { content: { case: "text", value: "body" } }),
       artifactBlock("notes.pdf", "application/pdf", "Notes"),
       artifactBlock("mesh.glb", "model/gltf-binary", "Mesh"),
-      artifactBlock("page.html", "text/html", "Page")
+      artifactBlock("page.html", "text/html", "Page"),
+      artifactBlock("source.zig", "application/octet-stream", "Source"),
+      artifactBlock(".env", "application/octet-stream", "Config")
     ]);
     expect(mobileTimelinePreviewArtifacts(event)).toMatchObject([
       { source: { kind: "timeline", contentIndex: 0 }, title: "Demo", mediaType: "video/mp4", previewKind: "media" },
       { source: { kind: "timeline", contentIndex: 2 }, title: "Notes", mediaType: "application/pdf", previewKind: "pdf" },
       { source: { kind: "timeline", contentIndex: 3 }, title: "Mesh", mediaType: "model/gltf-binary", previewKind: "model" },
-      { source: { kind: "timeline", contentIndex: 4 }, title: "Page", mediaType: "text/html", previewKind: "text" }
+      { source: { kind: "timeline", contentIndex: 4 }, title: "Page", mediaType: "text/html", previewKind: "text" },
+      { source: { kind: "timeline", contentIndex: 5 }, title: "Source", mediaType: "application/octet-stream", previewKind: "text" },
+      { source: { kind: "timeline", contentIndex: 6 }, title: "Config", mediaType: "application/octet-stream", previewKind: "text" }
     ]);
   });
 

@@ -125,6 +125,9 @@ describe("workspace, artifact, and capability boundaries", () => {
       { name: "mobile-recording.mp3", mediaType: "audio/mpeg", bytes: Buffer.from("ID3-audio-original") },
       { name: "mobile-module.wasm", mediaType: "application/wasm", bytes: Buffer.from([0, 97, 115, 109, 1, 0, 0, 0]) },
       { name: "mobile-source.ts", mediaType: "text/typescript", bytes: Buffer.from("export const value = true;\n") },
+      { name: "mobile-events.jsonl", mediaType: "text/plain", bytes: Buffer.from('{"event":"read"}\n') },
+      { name: "mobile-unicode.zig", mediaType: "text/plain", bytes: Buffer.from("a漢") },
+      { name: "Gemfile", mediaType: "text/plain", bytes: Buffer.from('source "local"\n') },
       { name: "mobile-unknown.custom", mediaType: "text/plain", bytes: Buffer.from("probed UTF-8\n") }
     ];
     const workspaceDirectory = fixture.workspaceDirectory;
@@ -132,6 +135,7 @@ describe("workspace, artifact, and capability boundaries", () => {
       writeFile(join(workspaceDirectory, ".mobile-hidden.txt"), "hidden mobile file\n", "utf8"),
       writeFile(join(workspaceDirectory, "mobile-search.txt"), `${marker}\n`, "utf8"),
       writeFile(join(workspaceDirectory, "mobile-preview.png"), imageBytes),
+      writeFile(join(workspaceDirectory, "mobile-large.zig"), Buffer.alloc(2_097_153, 0x78)),
       ...otherFiles.map((file) => writeFile(join(workspaceDirectory, file.name), file.bytes))
     ]);
 
@@ -174,6 +178,24 @@ describe("workspace, artifact, and capability boundaries", () => {
     expect(entries.find((entry) => entry.relativePath === ".mobile-hidden.txt")?.hidden).toBe(true);
 
     const index = await paired.clients.workspace.listWorkspaceFiles({ workspaceId });
+    const unicodeText = await paired.clients.workspace.readWorkspaceFile({
+      workspaceId, relativePath: "mobile-unicode.zig", maximumBytes: 2n,
+      expectedRevision: entries.find((entry) => entry.relativePath === "mobile-unicode.zig")!.revision
+    });
+    expect(unicodeText.preview).toMatchObject({
+      entry: { mediaType: "text/plain" },
+      content: { case: "text", value: { utf8Text: "a", startByte: 0n, endByte: 1n } }, truncated: true
+    });
+    const largeText = await paired.clients.workspace.readWorkspaceFile({
+      workspaceId, relativePath: "mobile-large.zig",
+      expectedRevision: entries.find((entry) => entry.relativePath === "mobile-large.zig")!.revision,
+      maximumBytes: 16n
+    });
+    expect(largeText.preview).toMatchObject({
+      entry: { mediaType: "text/plain", revision: { byteSize: 2_097_153n } },
+      content: { case: "text", value: { utf8Text: "x".repeat(16), startByte: 0n, endByte: 16n } },
+      truncated: true
+    });
     expect(index.relativePaths).toEqual(expect.arrayContaining([".mobile-hidden.txt", "mobile-preview.png", "mobile-search.txt"]));
     expect(index.revision).toBeDefined();
     const searched = await paired.clients.workspace.searchWorkspace({

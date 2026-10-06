@@ -1,20 +1,8 @@
 import type { ArtifactView } from "../model.js";
+import { fileNameSupportsTextPreview } from "@joko/contracts";
 
 export const TIMELINE_TEXT_PREVIEW_LIMIT_BYTES = 10 * 1024 * 1024;
 
-const TEXT_EXTENSIONS = new Set([
-  "bash", "c", "cc", "cfg", "conf", "cpp", "cs", "css", "csv", "cxx", "diff",
-  "dockerfile", "env", "gitattributes", "gitignore", "go", "graphql", "h", "hpp", "htm",
-  "html", "ini", "java", "js", "json", "jsonc", "jsx", "kt", "less", "log", "lua", "md",
-  "mdown", "mdx", "mk", "mkd", "mjs", "patch", "php", "pl", "properties", "proto", "ps1",
-  "py", "r", "rb", "rst", "rs", "sass", "scala", "scss", "sh", "sql", "svelte", "swift",
-  "toml", "ts", "tsx", "txt", "vue", "xml", "yaml", "yml", "zsh"
-]);
-
-const EXTENSIONLESS_TEXT_NAMES = new Set([
-  "authors", "changelog", "contributors", "copying", "dockerfile", "license", "makefile",
-  "notice", "readme", "todo"
-]);
 
 export function timelineArtifactSupportsTextPreview(artifact: Pick<ArtifactView, "fileName" | "mediaType" | "kind">): boolean {
   if (artifact.kind === "image") return false;
@@ -30,13 +18,11 @@ export function timelineArtifactSupportsTextPreview(artifact: Pick<ArtifactView,
     || mediaType === "application/x-ndjson"
     || mediaType === "application/x-sh"
     || mediaType === "application/xml"
+    || mediaType === "application/yaml"
     || mediaType.endsWith("+json")
     || mediaType.endsWith("+xml")
   ) return true;
-  const name = artifact.fileName.trim().toLocaleLowerCase();
-  if (EXTENSIONLESS_TEXT_NAMES.has(name)) return true;
-  const dot = name.lastIndexOf(".");
-  return dot > 0 && TEXT_EXTENSIONS.has(name.slice(dot + 1));
+  return fileNameSupportsTextPreview(artifact.fileName.trim());
 }
 
 export function timelineTextPreviewLikelyBinary(text: string): boolean {

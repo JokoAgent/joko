@@ -74,6 +74,7 @@ import {
   emptyMobileFilesState,
   filterWorkspaceFileNames,
   isTextMediaType,
+  isTextFilePreviewMetadata,
   normalizeMediaType,
   resolveMobileWorkspaceAuthority,
   sortArtifacts,
@@ -4040,13 +4041,14 @@ export class MobileClient {
           });
           preview = { ...base, kind: "model", ...stagedModel };
         }
-      } else if (isTextMediaType(mediaType)) {
+      } else if (isTextFilePreviewMetadata(mediaType, blob.fileName)) {
         if (blob.byteSize > 2_097_152n) {
           preview = { ...base, kind: "unsupported",
             reason: `This text file is ${blob.byteSize.toString(10)} bytes and exceeds the 2097152-byte text preview window.` };
         } else {
           const download = await this.network.downloadBlob(context.credential, blob, controller.signal);
           const text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(download.bytes);
+          if (text.includes("\0")) throw new Error("The Generated text file contains binary data.");
           preview = { ...base, kind: "text", text, languageId: "", startByte: 0n,
             endByte: blob.byteSize, totalLines: text === "" ? 0 : text.split(/\r?\n/gu).length, truncated: false };
         }
@@ -4176,6 +4178,7 @@ export class MobileClient {
           throw new Error("The Timeline text bytes do not match their canonical Blob.");
         }
         const text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(download.bytes);
+        if (text.includes("\0")) throw new Error("The Timeline text file contains binary data.");
         preview = { ...base, kind: "text", text, languageId: "", startByte: 0n,
           endByte: source.blob.byteSize, totalLines: text === "" ? 0 : text.split(/\r?\n/gu).length, truncated: false };
       } else if (source.artifact.previewKind === "media") {

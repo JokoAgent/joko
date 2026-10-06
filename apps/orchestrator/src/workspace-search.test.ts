@@ -5,10 +5,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { afterEach, describe, expect, it } from "vitest";
+import { textFileExtensions, textFileNames } from "@joko/contracts";
 
 import {
-  WORKSPACE_KNOWN_TEXT_FILENAMES,
-  WORKSPACE_SUPPORTED_TEXT_EXTENSIONS,
   workspaceFileIndexArguments,
   workspaceTextSearchArguments,
   runWorkspaceFileIndex,
@@ -40,8 +39,8 @@ describe("workspace ripgrep contracts", () => {
     expect(insensitive.slice(0, 4)).toEqual(["--json", "-F", "--max-count=200", "--hidden"]);
     expect(insensitive.slice(-4)).toEqual(["-i", "--", "[literal", "."]);
     expect(insensitive).not.toContain("--regexp");
-    expect(insensitive.filter((value) => value === "--glob")).toHaveLength(WORKSPACE_SUPPORTED_TEXT_EXTENSIONS.length);
-    expect(insensitive.filter((value) => value === "--iglob")).toHaveLength(WORKSPACE_KNOWN_TEXT_FILENAMES.length);
+    expect(insensitive.filter((value) => value === "--glob")).toHaveLength(textFileExtensions.length);
+    expect(insensitive.filter((value) => value === "--iglob")).toHaveLength(textFileNames.length);
     expect(workspaceTextSearchArguments("Needle", true)).not.toContain("-i");
   });
 

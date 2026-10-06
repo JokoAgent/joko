@@ -8,6 +8,7 @@ import { JokoError, type RemoteWorkspaceBinding } from "@joko/core";
 import { isWithin } from "@joko/core/policy";
 import createIgnore from "ignore";
 import {
+  decodeWorkspaceTextPreview,
   isWorkspaceTextMediaType as isTextMediaType,
   workspaceMediaTypeForPath as inferMediaType,
   workspaceRasterMediaTypes
@@ -709,23 +710,21 @@ export class WorkspaceService {
     );
     const stableObservedRevision = metadataFileRevision(snapshot.info);
     if (content.includes(0)) return { entry, observedRevision: stableObservedRevision, mediaType: "application/octet-stream", truncated: false };
-    if (content.byteLength === snapshot.info.size) {
-      try {
-        new TextDecoder("utf-8", { fatal: true }).decode(content);
-      } catch {
-        return { entry, observedRevision: stableObservedRevision, mediaType: "application/octet-stream", truncated: false };
-      }
-    } else if (mediaType === "application/octet-stream") {
-      // An unknown, oversized file cannot be proven to be complete UTF-8
-      // within the bounded preview and therefore stays binary/fail-closed.
+    if (content.byteLength !== snapshot.info.size && mediaType === "application/octet-stream") {
+      // Unknown oversized files still require complete UTF-8 proof.
       return { entry, observedRevision: stableObservedRevision, mediaType, truncated: false };
+    }
+    try {
+      decodeWorkspaceTextPreview(content, content.byteLength < snapshot.info.size);
+    } catch {
+      return { entry, observedRevision: stableObservedRevision, mediaType: "application/octet-stream", truncated: false };
     }
     const visible = content.subarray(0, Math.min(content.byteLength, visibleMaximum));
     return {
       entry,
       observedRevision: stableObservedRevision,
       mediaType: mediaType === "application/octet-stream" ? "text/plain" : mediaType,
-      text: visible.toString("utf8"),
+      text: decodeWorkspaceTextPreview(visible, visible.byteLength < snapshot.info.size),
       truncated: snapshot.info.size > visible.byteLength
     };
   }

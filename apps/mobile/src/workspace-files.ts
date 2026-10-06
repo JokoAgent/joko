@@ -3,6 +3,7 @@ import {
   CapabilitySupport,
   FileKind,
   capabilityNames,
+  fileNameSupportsTextPreview,
   type Artifact,
   type BackendDescriptor,
   type FileRevision,
@@ -306,6 +307,11 @@ export function isTextMediaType(value: string): boolean {
 
 export function normalizeMediaType(value: string): string {
   return value.split(";", 1)[0]!.trim().toLocaleLowerCase();
+}
+
+export function isTextFilePreviewMetadata(mediaType: string, fileName: string): boolean {
+  return isTextMediaType(mediaType)
+    || (normalizeMediaType(mediaType) === "application/octet-stream" && fileNameSupportsTextPreview(fileName));
 }
 
 export function bytesToDataUri(bytes: Uint8Array, mediaType: string): string {
