@@ -50,11 +50,13 @@ import { MobileImageLightbox } from "./MobileImageLightbox";
 
 let host: HTMLDivElement; let root: Root;
 const close = vi.fn(); const share = vi.fn<(signal: AbortSignal, onDispatch: () => void) => Promise<void>>(); const add = vi.fn();
+const copySource = vi.fn<(signal: AbortSignal) => Promise<string>>();
 const decoded = vi.fn(); const output = vi.fn(); const save = vi.fn(); const nativeActivity = vi.fn();
 const nativeFailed = vi.fn(); const retry = vi.fn(); const previewFailed = vi.fn();
 beforeEach(() => {
   Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true }); native.state = "active"; native.images.clear(); native.burn.mockReset();
   close.mockReset(); share.mockReset(); share.mockImplementation(async (_signal, onDispatch) => onDispatch()); add.mockReset(); add.mockResolvedValue(undefined);
+  copySource.mockReset(); copySource.mockResolvedValue("Copied.");
   decoded.mockReset(); output.mockReset(); save.mockReset(); nativeActivity.mockReset();
   nativeFailed.mockReset(); retry.mockReset(); previewFailed.mockReset();
   native.gestures = undefined; native.offset = 0; native.spring.mockReset();
@@ -81,6 +83,7 @@ function controls(page: MobileImageGalleryPageSession) {
     pages: Array.from({ length: page.pageCount }, (_, index) => ({ pageId: index === page.pageIndex ? page.pageId : `other-${index}`,
       title: page.fileName, mediaType: page.sourceMediaType as "image/png", byteSize: 1, sha256Hex: "a".repeat(64) })) },
     pageIndex: page.pageIndex, pageKey: `request-${page.pageId}`, busy: false, onNavigate: vi.fn(), onAddOriginal: add,
+    copySourceLabel: "Copy relative path", onCopySource: copySource,
     onShareOriginal: share, onDecoded: decoded, onRetry: retry, onNativeFailed: nativeFailed, onPreviewFailed: previewFailed };
 }
 function button(key: Parameters<typeof mobileMessage>[1]) {
@@ -109,6 +112,18 @@ async function drag(dx: number, dy: number, vy = 0) {
 }
 
 describe("lightbox dismissal and gesture ownership", () => {
+  it("copies the exact gallery source with visible feedback and aborts an unsettled copy when the page retires", async () => {
+    const page = session("image/png", false); await render(page);
+    await act(async () => host.querySelector<HTMLButtonElement>('[aria-label="Copy relative path"]')!.click());
+    expect(copySource).toHaveBeenCalledOnce(); expect(host.textContent).toContain("Copied.");
+    let sourceSignal!: AbortSignal;
+    copySource.mockImplementationOnce((signal) => { sourceSignal = signal; return new Promise(() => undefined); });
+    await act(async () => host.querySelector<HTMLButtonElement>('[aria-label="Copy relative path"]')!.click());
+    expect(sourceSignal.aborted).toBe(false);
+    const next = session("image/png", false, "copy-next"); await render(next);
+    expect(sourceSignal.aborted).toBe(true); expect(host.textContent).not.toContain("Copied.");
+  });
+
   it("follows horizontal drags with cached neighbors, commits a distance or fast swipe, and retires bounce and slide callbacks", async () => {
     vi.useFakeTimers(); native.autoAnimate = false;
     const page = session("image/png", false); const navigate = vi.fn();

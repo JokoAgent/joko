@@ -17,6 +17,7 @@ interface ListProps {
 }
 const native = vi.hoisted(() => ({
   width: 360, scroll: vi.fn(),
+  presses: new Map<string, () => void>(),
   pager: undefined as ListProps | undefined,
   layout: undefined as ((event: { nativeEvent: { layout: { width: number } } }) => void) | undefined
 }));
@@ -34,7 +35,10 @@ vi.mock("react-native", () => ({
   Text: ({ children }: { children?: ReactNode }) => createElement("span", {}, children),
   Pressable: ({ children, onPress, accessibilityLabel, disabled }: {
     children?: ReactNode; onPress(): void; accessibilityLabel?: string; disabled?: boolean
-  }) => createElement("button", { onClick: onPress, "aria-label": accessibilityLabel, disabled }, children),
+  }) => {
+    if (accessibilityLabel) native.presses.set(accessibilityLabel, onPress);
+    return createElement("button", { onClick: onPress, "aria-label": accessibilityLabel, disabled }, children);
+  },
   FlatList: forwardRef((props: ListProps, ref) => {
     if (props.horizontal) native.pager = props;
     useImperativeHandle(ref, () => ({ scrollToOffset: native.scroll, scrollToIndex() {} }));
@@ -56,25 +60,27 @@ const momentum = (list: ListProps, index: number, width: number) =>
 
 describe("native Files preview paging", () => {
   beforeEach(() => {
-    native.width = 360; native.scroll.mockClear(); native.pager = undefined; native.layout = undefined;
+    native.width = 360; native.scroll.mockClear(); native.presses.clear(); native.pager = undefined; native.layout = undefined;
     vi.stubGlobal("requestAnimationFrame", (callback: (time: number) => void) => { callback(0); return 1; });
     vi.stubGlobal("cancelAnimationFrame", vi.fn());
   });
   afterEach(() => vi.unstubAllGlobals());
 
   it("mounts only the selected reader, synchronizes controls and anchors its source through layout, rotation and retired native callbacks", async () => {
-    const node = document.createElement("div"); const root = createRoot(node); const navigate = vi.fn();
+    const node = document.createElement("div"); const root = createRoot(node); const navigate = vi.fn(); const copy = vi.fn();
     const render = (value: Pager, disabled = false) => createElement(MobileFilesPreviewPager, {
-      pager: value, colors, locale: "en", disabled, canSwipe: true, onNavigate: navigate,
+      pager: value, colors, locale: "en", disabled, canSwipe: true, copyLabel: "Copy filename", copyStatus: "Copied.", onCopy: copy, onNavigate: navigate,
       children: createElement("div", { "data-reader": true }, value.pages[value.index]!.title)
     });
     await act(async () => { root.render(render(pager)); });
-    expect(node.querySelectorAll("[data-reader]")).toHaveLength(1); expect(node.textContent).toContain("2 of 3");
+    expect(node.querySelectorAll("[data-reader]")).toHaveLength(1); expect(node.textContent).toContain("2 of 3"); expect(node.textContent).toContain("Copied.");
     expect(native.scroll).toHaveBeenLastCalledWith({ offset: 360, animated: false });
-    const old = native.pager!; const oldLayout = native.layout!;
+    const old = native.pager!; const oldLayout = native.layout!; const oldCopy = native.presses.get("Copy filename")!;
+    await act(async () => oldCopy()); expect(copy).toHaveBeenCalledOnce();
     await act(async () => { node.querySelector<HTMLButtonElement>('[aria-label="Next file"]')!.click(); });
     expect(navigate).toHaveBeenLastCalledWith("window", pages[2]!.key);
     await act(async () => { root.render(render({ ...pager, index: 2 })); });
+    await act(async () => oldCopy()); expect(copy).toHaveBeenCalledOnce();
     expect(node.textContent).toContain("3 of 3"); expect(node.querySelector<HTMLButtonElement>('[aria-label="Next file"]')!.disabled).toBe(true);
     expect(native.scroll).toHaveBeenLastCalledWith({ offset: 720, animated: false });
     navigate.mockClear(); await act(async () => { momentum(old, 0, 360); oldLayout({ nativeEvent: { layout: { width: 20 } } }); });
@@ -89,6 +95,7 @@ describe("native Files preview paging", () => {
     await act(async () => { momentum(native.pager!, 1, 640); }); expect(navigate).toHaveBeenLastCalledWith("window", pages[1]!.key);
     navigate.mockClear(); await act(async () => { root.render(render({ ...pager, index: 2 }, true)); });
     expect(native.pager!.scrollEnabled).toBe(false);
+    expect(node.querySelector<HTMLButtonElement>('[aria-label="Copy filename"]')!.disabled).toBe(true);
     await act(async () => { momentum(native.pager!, 0, 640); });
     expect(navigate).not.toHaveBeenCalled();
     const retired = native.pager!; await act(async () => { root.unmount(); momentum(retired, 0, 640); });

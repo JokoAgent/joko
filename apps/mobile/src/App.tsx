@@ -278,7 +278,7 @@ import { MobilePartnersScreen } from "./MobilePartnersScreen";
 import { MobileFilesToolbar } from "./MobileFilesToolbar";
 import { MobileFilesBrowser } from "./MobileFilesBrowser";
 import { mobileFilesThumbnailCache } from "./mobile-files-thumbnail-cache";
-import { MobileFilesClipboard, type MobileFilesClipboardResult } from "./mobile-files-clipboard";
+import { MobileFilesClipboard, type MobileFilesClipboardLease, type MobileFilesClipboardResult } from "./mobile-files-clipboard";
 import type { MobileFilesPreferences } from "./mobile-files-presentation";
 import { MobileSettingsScreen } from "./MobileSettingsScreen";
 import { MobileVoiceDictionaryReadOnlyController } from "./mobile-voice-dictionary-readonly-controller";
@@ -5944,6 +5944,7 @@ function FilesScreen({ colors, state, locale, onBack, onAdded, initialSource }: 
   const connected = state.status === "connected" && authorityKey !== undefined;
   const files = state.files;
   const currentPreviewSource = files.previewPager?.pages[files.previewPager.index]?.source ?? previewSource;
+  const currentPreviewPage = files.previewPager?.pages[files.previewPager.index];
   const initialPagerSource = useRef<MobileFilesComposerSource | undefined>(undefined);
   const searching = query.trim().length > 0;
   const imageGallery = useMobileImageGallery(locale, () => {
@@ -5955,20 +5956,29 @@ function FilesScreen({ colors, state, locale, onBack, onAdded, initialSource }: 
     filesClipboard.cancel(); clipboardFlight.current = undefined; setClipboardBusy(false); setClipboardNotice(undefined);
     return () => { filesClipboard.cancel(); clipboardFlight.current = undefined; };
   }, [authorityKey, files.open, files.directoryRevision, files.artifactsRevision, files.location, files.preview, files.status]);
-  const copyPath = (source?: MobileFilesComposerSource): void => {
-    if (client.state.files !== files || client.filesAuthorityKey() !== authorityKey) return;
-    if (clipboardFlight.current || filesBusy) return;
+  const copyFilesValue = (
+    prepare: () => MobileFilesClipboardLease,
+    cancellation?: AbortSignal,
+    allowGallery = false
+  ): Promise<MobileFilesClipboardResult> => {
+    if (client.state.files !== files || client.filesAuthorityKey() !== authorityKey) return Promise.resolve("retired");
+    if (clipboardFlight.current || handoffRef.current || fileShareRef.current || galleryOpening
+      || !allowGallery && imageGallery.view !== undefined) return Promise.resolve("busy");
     const flight = Symbol(); clipboardFlight.current = flight;
     setClipboardBusy(true); setClipboardNotice(undefined);
-    let lease: ReturnType<MobileClient["prepareFilesPathCopy"]>;
-    try { lease = client.prepareFilesPathCopy(files, source); }
-    catch { clipboardFlight.current = undefined; setClipboardBusy(false); setClipboardNotice("failed"); return; }
-    void filesClipboard.copy(lease).then((result) => {
-      if (!filesMountedRef.current || clipboardFlight.current !== flight || result === "retired") return;
+    let lease: MobileFilesClipboardLease;
+    try { lease = prepare(); }
+    catch { clipboardFlight.current = undefined; setClipboardBusy(false); setClipboardNotice("failed"); return Promise.resolve("failed"); }
+    return filesClipboard.copy(lease, cancellation).then((result) => {
+      if (!filesMountedRef.current || clipboardFlight.current !== flight || result === "retired") return result;
       try { lease.assertCurrent(); setClipboardNotice(result); } catch { /* The completed write belongs to the retired source. */ }
+      return result;
     }).finally(() => {
       if (clipboardFlight.current === flight) { clipboardFlight.current = undefined; if (filesMountedRef.current) setClipboardBusy(false); }
     });
+  };
+  const copyPath = (source?: MobileFilesComposerSource): void => {
+    void copyFilesValue(() => client.prepareFilesPathCopy(files, source));
   };
   const preferenceRevision = useSyncExternalStore(useCallback((listener) => mobileFilesPreferences.subscribe(listener), []), () => mobileFilesPreferences.revision);
   const preferenceScope = useMemo(() => state.activeProfileId && state.owner?.server?.serverId && files.workspace?.workspaceId
@@ -6212,6 +6222,14 @@ function FilesScreen({ colors, state, locale, onBack, onAdded, initialSource }: 
       onQuoted={() => { setPreviewSource(undefined); client.closeFiles(); onAdded(); }}
       onNavigate={(id, key) => run(() => client.selectFilesPreviewPage(id, key))} busy={handoffBusy} locale={locale}
       sharing={fileShareBusy} shareProgress={fileShareProgress}
+      copying={clipboardBusy}
+      copyLabel={currentPreviewPage ? mobileMessage(locale, currentPreviewPage.kind === "workspace"
+        ? "files.presentation.copyPath" : "files.presentation.copyName") : undefined}
+      copyStatus={clipboardBusy ? mobileMessage(locale, "files.presentation.copying")
+        : clipboardNotice ? mobileMessage(locale, filesClipboardMessages[clipboardNotice]) : undefined}
+      onCopy={files.previewPager && currentPreviewPage && files.preview?.kind !== "loading"
+        ? () => { void copyFilesValue(() => client.prepareFilesPreviewPathCopy(files, files.previewPager!.id, currentPreviewPage.key)); }
+        : undefined}
       onShare={currentPreviewSource && shareableMobileFilesSource(currentPreviewSource)
         ? () => shareFile(currentPreviewSource) : undefined}
       onAdd={addToComposer} onOpenImage={openGallery} onClose={() => {
@@ -6229,6 +6247,21 @@ function FilesScreen({ colors, state, locale, onBack, onAdded, initialSource }: 
         ...(imageGallery.view.failed ? { error: mobileMessage(locale, "image.previewFailed") } : {}),
         onRetry: imageGallery.retry, onNativeFailed: imageGallery.nativeFailed, onPreviewFailed: imageGallery.previewFailed,
         onNavigate: imageGallery.navigate,
+        ...(imageGallery.view.session ? {
+          copySourceLabel: mobileMessage(locale, imageGallery.view.descriptor.sourceKind === "workspace"
+            ? "files.presentation.copyPath" : "files.presentation.copyName"),
+          onCopySource: async (signal: AbortSignal): Promise<string> => {
+            const view = imageGallery.view; const session = view?.session;
+            if (!view || !session || view.busy || view.failed) throw new Error(mobileMessage(locale, "task.error.galleryClosed"));
+            const result = await copyFilesValue(() => client.prepareFilesImageGalleryPathCopy(
+              view.descriptor.leaseId, session.leaseId, session.pageId
+            ), signal, true);
+            signal.throwIfAborted();
+            if (result !== "copied") throw new Error(mobileMessage(locale,
+              result === "retired" ? "files.presentation.copyFailed" : filesClipboardMessages[result]));
+            return mobileMessage(locale, "files.presentation.copied");
+          }
+        } : {}),
         onAddOriginal: imageGallery.addOriginal,
         onShareOriginal: imageGallery.shareOriginal,
         onDecoded: imageGallery.decoded
@@ -6281,7 +6314,7 @@ function FileSearchResultRow({ result, colors, locale, disabled, shareDisabled, 
 }
 
 function FilePreviewModal({ colors, preview, source, pager, onNavigate, busy, sharing = false, shareProgress, backLabel,
-  backAccessibilityLabel, loadingLabel, locale,
+  backAccessibilityLabel, loadingLabel, locale, copying = false, copyLabel, copyStatus, onCopy,
   onAdd, onOpenImage, onShare, onClose, onQuoted }: {
   colors: Colors;
   preview: MobileFilePreview | undefined;
@@ -6290,7 +6323,11 @@ function FilePreviewModal({ colors, preview, source, pager, onNavigate, busy, sh
   onNavigate?: (pagerId: string, pageKey: string) => void;
   busy: boolean;
   sharing?: boolean;
+  copying?: boolean;
   shareProgress?: MobileFileShareProgress;
+  copyLabel?: string;
+  copyStatus?: string;
+  onCopy?: () => void;
   backLabel?: string;
   backAccessibilityLabel?: string;
   loadingLabel?: string;
@@ -6315,7 +6352,7 @@ function FilePreviewModal({ colors, preview, source, pager, onNavigate, busy, sh
   useEffect(() => setMediaStatus(undefined), [mediaLeaseId]);
   useEffect(() => setPdfStatus(undefined), [pdfLeaseId]);
   useEffect(() => setModelStatus(undefined), [modelLeaseId]);
-  const blocked = busy || sharing || textActions.busy;
+  const blocked = busy || sharing || copying || textActions.busy;
   const previewIdentity = preview ? JSON.stringify([preview.kind, preview.sourceLabel, preview.revisionKey]) : undefined;
   const currentPreviewIdentity = useRef(previewIdentity); currentPreviewIdentity.current = previewIdentity;
   const onTextViewChange = useCallback((view: "rendered" | "source") => {
@@ -6389,7 +6426,9 @@ function FilePreviewModal({ colors, preview, source, pager, onNavigate, busy, sh
             {formatMobileModelViewerStatus(modelStatus, locale)}
           </Text>}
         </View>
-        <MobileFilesPreviewPager pager={pager} colors={colors} locale={locale} disabled={blocked} onNavigate={onNavigate}
+        <MobileFilesPreviewPager pager={pager} colors={colors} locale={locale} disabled={blocked}
+          copyLabel={copying ? mobileMessage(locale, "files.presentation.copying") : copyLabel}
+          copyStatus={copyStatus} onCopy={onCopy} onNavigate={onNavigate}
           canSwipe={mobileFilesPreviewCanSwipe(preview, textView?.identity === previewIdentity && textView?.view === "source")}>
         {preview.kind === "loading" ? <Centered label={exactLoadingLabel} colors={colors} />
           : preview.kind === "image" ? <ScrollView style={styles.fill} contentContainerStyle={styles.imagePreviewContainer}>

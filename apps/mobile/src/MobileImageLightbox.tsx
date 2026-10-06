@@ -80,6 +80,8 @@ interface MobileImageLightboxGalleryControls {
   readonly onNativeFailed: (loadId: string, automatically?: boolean) => void;
   readonly onPreviewFailed: (previewId: string) => void;
   readonly onNavigate: (pageIndex: number) => void;
+  readonly copySourceLabel?: string;
+  readonly onCopySource?: (signal: AbortSignal) => Promise<string>;
   readonly onAddOriginal: (signal: AbortSignal) => Promise<void>;
   readonly onShareOriginal: (signal: AbortSignal, onDispatch: () => void) => Promise<void>;
   readonly onDecoded: (decoded: MobileImageGalleryNativeDecode) => void;
@@ -646,8 +648,32 @@ export function MobileImageLightbox({
     setDraftStroke(undefined);
     setAnnotating(false);
     setTransform(initialTransform);
+    setNotice("");
     setError("");
     gallery.onNavigate(pageIndex);
+  };
+  const copySource = async (): Promise<void> => {
+    if (!gallery?.onCopySource || saveControllerRef.current || gallery.busy) return;
+    cancelGesture();
+    const controller = new AbortController();
+    saveControllerRef.current = controller;
+    setBusy(true);
+    setNotice("");
+    setError("");
+    try {
+      const message = await gallery.onCopySource(controller.signal);
+      controller.signal.throwIfAborted();
+      if (saveControllerRef.current === controller) setNotice(message);
+    } catch (failure) {
+      if (!controller.signal.aborted) {
+        setError(failure instanceof Error ? failure.message : mobileMessage(locale, "files.presentation.copyFailed"));
+      }
+    } finally {
+      if (saveControllerRef.current === controller) {
+        saveControllerRef.current = undefined;
+        setBusy(false);
+      }
+    }
   };
   const addOriginal = async (): Promise<void> => {
     if (!gallery || saveControllerRef.current || !gallerySession?.addable || !drawingReady) return;
@@ -904,6 +930,8 @@ export function MobileImageLightbox({
           disabled={busy || gallery.pageIndex + 1 >= gallery.descriptor.pages.length} />}
         {gallery && visibleError && <ToolButton label={mobileMessage(locale, "image.previewRetry", { name: fileName })}
           onPress={() => { cancelGesture(); gallery.onRetry(); }} disabled={busy || gallery.busy} />}
+        {gallery?.copySourceLabel && gallery.onCopySource && <ToolButton label={gallery.copySourceLabel}
+          onPress={() => void copySource()} disabled={interactionBusy} />}
         {onOutputAction && !originalOnly && <ToolButton label={mobileMessage(locale, outputAction === "copy" ? "image.copying" : "image.copy")}
           onPress={() => void output("copy")} disabled={interactionBusy || !outputReady} />}
         {onOutputAction && !originalOnly && <ToolButton label={mobileMessage(locale, outputAction === "save" ? "image.saving" : "image.save")}

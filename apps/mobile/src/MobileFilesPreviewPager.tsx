@@ -11,16 +11,19 @@ interface Props {
   readonly locale: MobileSupportedLocale;
   readonly disabled: boolean;
   readonly canSwipe: boolean;
+  readonly copyLabel?: string;
+  readonly copyStatus?: string;
+  readonly onCopy?: () => void;
   readonly onNavigate?: (pagerId: string, pageKey: string) => void;
   readonly children: ReactNode;
 }
 
-export function MobileFilesPreviewPager({ pager, colors, locale, disabled, canSwipe, onNavigate, children }: Props) {
+export function MobileFilesPreviewPager({ pager, colors, locale, disabled, canSwipe, copyLabel, copyStatus, onCopy, onNavigate, children }: Props) {
   const viewport = useWindowDimensions();
   const [layout, setLayout] = useState({ windowWidth: viewport.width, width: viewport.width });
   const width = Math.max(1, layout.windowWidth === viewport.width ? layout.width : viewport.width);
   const list = useRef<FlatList<MobileFilesPreviewPage>>(null);
-  const frame = { pager, width, disabled, canSwipe, onNavigate };
+  const frame = { pager, width, disabled, canSwipe, onCopy, onNavigate };
   const current = useRef<typeof frame | undefined>(frame); current.current = frame;
   useLayoutEffect(() => {
     if (!pager) return;
@@ -32,6 +35,10 @@ export function MobileFilesPreviewPager({ pager, colors, locale, disabled, canSw
   const navigate = (index: number, swipe = false) => {
     if (current.current !== frame || disabled || (swipe && !canSwipe) || !pager || index === pager.index) return;
     const page = pager.pages[index]; if (page) onNavigate?.(pager.id, page.key);
+  };
+  const copy = () => {
+    if (current.current !== frame || disabled) return;
+    onCopy?.();
   };
   if (!pager) return <>{children}</>;
   const previous = mobileMessage(locale, "files.preview.previous"); const next = mobileMessage(locale, "files.preview.next");
@@ -53,6 +60,11 @@ export function MobileFilesPreviewPager({ pager, colors, locale, disabled, canSw
         </View>}
       </View>} />
     <View style={[styles.controls, { borderColor: colors.border, backgroundColor: colors.background }]}>
+      {copyLabel && onCopy && <Pressable accessibilityRole="button" accessibilityLabel={copyLabel}
+        accessibilityState={{ disabled }} disabled={disabled} onPress={copy}
+        style={[styles.button, disabled && styles.disabled]}>
+        <Text style={{ color: colors.accent }}>{copyLabel}</Text>
+      </Pressable>}
       <Pressable accessibilityRole="button" accessibilityLabel={previous} accessibilityState={{ disabled: disabled || pager.index === 0 }}
         disabled={disabled || pager.index === 0} onPress={() => navigate(pager.index - 1)}
         style={[styles.button, (disabled || pager.index === 0) && styles.disabled]}>
@@ -67,6 +79,9 @@ export function MobileFilesPreviewPager({ pager, colors, locale, disabled, canSw
         <Text style={{ color: colors.accent }}>{next}</Text>
       </Pressable>
     </View>
+    {copyStatus && <Text accessibilityLiveRegion="polite" style={[styles.status, { color: colors.muted, backgroundColor: colors.background }]}>
+      {copyStatus}
+    </Text>}
   </View>;
 }
 
@@ -74,5 +89,6 @@ const styles = StyleSheet.create({
   fill: { flex: 1 }, placeholder: { flex: 1, alignItems: "center", justifyContent: "center", padding: 24 },
   controls: { flexDirection: "row", alignItems: "center", borderTopWidth: StyleSheet.hairlineWidth, paddingHorizontal: 12 },
   button: { minHeight: 44, minWidth: 80, justifyContent: "center", alignItems: "center", paddingHorizontal: 12 },
-  count: { flex: 1, textAlign: "center" }, disabled: { opacity: 0.45 }
+  count: { flex: 1, textAlign: "center" }, status: { minHeight: 28, paddingHorizontal: 12, paddingVertical: 4, textAlign: "center" },
+  disabled: { opacity: 0.45 }
 });

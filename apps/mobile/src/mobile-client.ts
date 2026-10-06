@@ -3539,11 +3539,70 @@ export class MobileClient {
       if (location.kind !== "workspace" || !this.#state.files.directoryRevision) throw new Error("Select a known Workspace directory before copying its path.");
       return { text: canonicalWorkspacePath(location.path, true) || ".", kind: "path", assertCurrent };
     }
-    if (source.kind === "workspace-entry") return { text: canonicalWorkspacePath(source.entry.relativePath), kind: "path", assertCurrent };
+    if (source.kind === "workspace-entry") return { ...mobileFilesWorkspaceClipboardValue(source.entry.relativePath), assertCurrent };
     if (source.kind !== "artifact") throw new Error("Select a current browse item before copying its path.");
-    const name = source.artifact.blob?.fileName;
-    if (!name || name === "." || name === ".." || name.length > 4096 || /[\\/\u0000-\u001f\u007f]/u.test(name)) throw new Error("The canonical Generated filename is unavailable.");
-    return { text: name, kind: "file-name", assertCurrent };
+    return { ...mobileFilesGeneratedClipboardValue(source.artifact.blob?.fileName), assertCurrent };
+  }
+
+  prepareFilesPreviewPathCopy(
+    expectedFiles: MobileFilesState,
+    pagerId: string,
+    pageKey: string
+  ): MobileFilesClipboardLease {
+    if (this.#state.files !== expectedFiles) throw new Error("The displayed Files preview surface has changed.");
+    const lease = this.#filesPreviewPager;
+    const copyEpoch = this.#filesCopyEpoch;
+    if (!lease || lease.descriptor.id !== pagerId || expectedFiles.previewPager !== lease.descriptor
+      || !this.#filesPreviewPagerCurrent(lease)) throw new Error("The Files preview window is no longer current.");
+    const descriptor = lease.descriptor;
+    const page = descriptor.pages[descriptor.index];
+    if (!page || page.key !== pageKey || expectedFiles.preview?.kind === "loading") {
+      throw new Error("Select a resolved current file preview before copying its path.");
+    }
+    const value = page.kind === "workspace"
+      ? mobileFilesWorkspaceClipboardValue(page.entry.relativePath)
+      : mobileFilesGeneratedClipboardValue(page.artifact.blob?.fileName);
+    const assertCurrent = (signal?: AbortSignal): void => {
+      signal?.throwIfAborted();
+      if (this.#filesCopyEpoch !== copyEpoch || this.#filesPreviewPager !== lease || lease.descriptor !== descriptor
+        || !this.#filesPreviewPagerCurrent(lease) || this.#imageGallery
+        || descriptor.pages[descriptor.index] !== page || this.#state.files.preview?.kind === "loading") {
+        throw new Error("The visible Files preview page changed before its path was copied.");
+      }
+    };
+    assertCurrent();
+    return { ...value, assertCurrent };
+  }
+
+  prepareFilesImageGalleryPathCopy(
+    galleryLeaseId: string,
+    loadId: string,
+    pageId: string
+  ): MobileFilesClipboardLease {
+    const lease = this.#imageGallery;
+    const loaded = lease?.loaded;
+    const copyEpoch = this.#filesCopyEpoch;
+    if (!lease || lease.leaseId !== galleryLeaseId || lease.source.kind !== "files" || lease.operationInFlight
+      || !loaded || loaded.loadId !== loadId || loaded.page.pageId !== pageId || !this.imageGalleryCurrent(galleryLeaseId)) {
+      throw new Error("The Files image gallery page is no longer current.");
+    }
+    const source = loaded.page.source;
+    const value = source.kind === "workspace"
+      ? mobileFilesWorkspaceClipboardValue(source.relativePath)
+      : source.kind === "artifact"
+        ? mobileFilesGeneratedClipboardValue(loaded.page.blob.fileName)
+        : undefined;
+    if (!value) throw new Error("The current gallery page does not belong to Files.");
+    const assertCurrent = (signal?: AbortSignal): void => {
+      signal?.throwIfAborted();
+      if (this.#filesCopyEpoch !== copyEpoch || this.#imageGallery !== lease || lease.source.kind !== "files"
+        || lease.operationInFlight || lease.loaded !== loaded || loaded.loadId !== loadId
+        || loaded.page.pageId !== pageId || !this.imageGalleryCurrent(galleryLeaseId)) {
+        throw new Error("The visible Files image changed before its path was copied.");
+      }
+    };
+    assertCurrent();
+    return { ...value, assertCurrent };
   }
 
   async openFiles(): Promise<void> {
@@ -11449,6 +11508,18 @@ function filesComposerSourceIsCurrent(files: MobileFilesState, source: MobileFil
   if (source.kind === "workspace-entry") return files.entries.includes(source.entry);
   if (source.kind === "artifact") return files.artifacts.includes(source.artifact);
   return files.searchResults.includes(source.result);
+}
+
+function mobileFilesWorkspaceClipboardValue(relativePath: string): Pick<MobileFilesClipboardLease, "text" | "kind"> {
+  const path = canonicalWorkspacePath(relativePath);
+  if (!path) throw new Error("The canonical Workspace file path is unavailable.");
+  return { text: path, kind: "path" };
+}
+
+function mobileFilesGeneratedClipboardValue(fileName: string | undefined): Pick<MobileFilesClipboardLease, "text" | "kind"> {
+  if (!fileName || fileName === "." || fileName === ".." || fileName.length > 4096
+    || /[\\/\u0000-\u001f\u007f]/u.test(fileName)) throw new Error("The canonical Generated filename is unavailable.");
+  return { text: fileName, kind: "file-name" };
 }
 
 function filesAttachmentMetadata(

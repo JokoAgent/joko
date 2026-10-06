@@ -8302,7 +8302,21 @@ describe("native current-task Files ownership", () => {
     const selected = app.state.files.entries.find((value) => value.relativePath === "README.md")!;
     const beforePreview = app.prepareFilesPathCopy(app.state.files, { kind: "workspace-entry", entry: selected });
     await app.previewWorkspaceEntry(selected); expect(() => beforePreview.assertCurrent()).toThrow(); expect(() => app.prepareFilesPathCopy(app.state.files)).toThrow();
-    app.closeFilesPreview(); const beforeBackground = app.prepareFilesPathCopy(app.state.files); app.setForeground(false);
+    app.closeFilesPreview();
+    await app.openFilesPreviewPager({ kind: "workspace-entry", entry: selected });
+    const workspacePager = app.state.files.previewPager!; const workspacePage = workspacePager.pages[workspacePager.index]!;
+    const previewPath = app.prepareFilesPreviewPathCopy(app.state.files, workspacePager.id, workspacePage.key);
+    expect(previewPath).toMatchObject({ text: "README.md", kind: "path" }); previewPath.assertCurrent();
+    app.closeFilesPreview(); expect(() => previewPath.assertCurrent()).toThrow(/preview page changed/u);
+    app.openGeneratedFiles();
+    const generatedSource = { kind: "artifact" as const, artifact: app.state.files.artifacts[0]! };
+    await app.openFilesPreviewPager(generatedSource);
+    const generatedPager = app.state.files.previewPager!; const generatedPage = generatedPager.pages[generatedPager.index]!;
+    const previewName = app.prepareFilesPreviewPathCopy(app.state.files, generatedPager.id, generatedPage.key);
+    expect(previewName).toMatchObject({ text: "report.txt", kind: "file-name" });
+    expect(() => app.prepareFilesPreviewPathCopy(app.state.files, generatedPager.id, "another-page")).toThrow();
+    await app.openFiles(); expect(() => previewName.assertCurrent()).toThrow();
+    const beforeBackground = app.prepareFilesPathCopy(app.state.files); app.setForeground(false);
     expect(() => beforeBackground.assertCurrent()).toThrow(); expect(() => app.prepareFilesPathCopy(app.state.files)).toThrow();
   });
 
@@ -9289,6 +9303,8 @@ describe("native current-task Files ownership", () => {
       pageIndex: 0, pageCount: 3, expectedWidthPixels: 3, expectedHeightPixels: 2,
       addable: true, annotatable: true
     });
+    const copiedPath = app.prepareFilesImageGalleryPathCopy(descriptor.leaseId, page.leaseId, page.pageId);
+    expect(copiedPath).toMatchObject({ text: "images/b.png", kind: "path" }); copiedPath.assertCurrent();
     app.confirmImageGalleryPageDecoded(descriptor.leaseId, page.leaseId, page.pageId, {
       width: 3, height: 2, mediaType: "image/png", isAnimated: false
     });
@@ -9318,6 +9334,7 @@ describe("native current-task Files ownership", () => {
     );
     await expect(app.addImageGalleryPageToComposer(descriptor.leaseId, page.leaseId))
       .rejects.toThrow(/no longer owns/u);
+    expect(() => copiedPath.assertCurrent()).toThrow(/visible Files image changed/u);
     expect(network.submit).not.toHaveBeenCalled();
   });
 
@@ -9378,7 +9395,10 @@ describe("native current-task Files ownership", () => {
     });
     const page = await app.loadImageGalleryPage(descriptor.leaseId, descriptor.initialIndex);
     expect(page).toMatchObject({ fileName: "two.png", pageIndex: 1, pageCount: 2 });
+    const copiedName = app.prepareFilesImageGalleryPathCopy(descriptor.leaseId, page.leaseId, page.pageId);
+    expect(copiedName).toMatchObject({ text: "two.png", kind: "file-name" }); copiedName.assertCurrent();
     const sorted = await app.openFilesImageGallery({ kind: "artifact", artifact: selected }, undefined, "mtime");
+    expect(() => copiedName.assertCurrent()).toThrow(/visible Files image changed/u);
     expect(sorted).toMatchObject({ initialIndex: 0, pages: [{ title: "Second generated image" }, { title: "First generated image" }] });
     await expect(app.loadImageGalleryPage(descriptor.leaseId, 0)).rejects.toThrow();
   });
