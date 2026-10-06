@@ -8355,6 +8355,9 @@ describe("native current-task Files ownership", () => {
     expect(await app.openMarkdownPath(prepared.leaseId, fileKey, new AbortController().signal)).toMatchObject({ kind: "workspace-entry", entry: readme });
     expect(app.state.files.preview).toMatchObject({ kind: "text", text: "#A\n#B\n", focusLine: 2, focusColumn: 1 });
     const filePreview = app.state.files.preview;
+    vi.mocked(network.readOwner).mockResolvedValue({ connection, device,
+      snapshot: create(SnapshotSchema, { ...projected, snapshotId: "owner-resource-reread" }) });
+    vi.mocked(network.readSession).mockResolvedValue(create(SnapshotSchema, { ...projected, snapshotId: "detail-resource-reread" }));
     await vi.advanceTimersByTimeAsync(4_000);
     expect(app.state.files.preview).toBe(filePreview);
     expect(() => app.assertMarkdownResourcesCurrent(prepared.leaseId)).not.toThrow();

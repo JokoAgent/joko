@@ -65,6 +65,13 @@ describe("mobile Workspace file ownership and presentation", () => {
       backends: [{ ...owner.backends[0]!, capabilities: undefined }]
     }), undefined, "session")).toBeUndefined();
     expect(resolveMobileWorkspaceAuthority(owner, owner, "different-session")).toBeUndefined();
+    const reread = create(SnapshotSchema, { ...owner, snapshotId: "owner-2" });
+    expect(resolveMobileWorkspaceAuthority(reread, create(SnapshotSchema, { ...owner, snapshotId: "detail-2" }), "session")?.key)
+      .toBe(authority?.key);
+    for (const changed of [create(SnapshotSchema, { ...reread, generation: 4n }),
+      create(SnapshotSchema, { ...reread, revision: { ...reread.revision!, etag: "snapshot-4", value: 4n } })]) {
+      expect(resolveMobileWorkspaceAuthority(changed, changed, "session")?.key).not.toBe(authority?.key);
+    }
   });
 
   it("accepts only canonical POSIX paths and derives parents without decoding aliases", () => {

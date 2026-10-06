@@ -313,7 +313,6 @@ function supports(backend: BackendDescriptor, name: string): boolean {
 function snapshotKey(snapshot: Snapshot | undefined): string {
   if (!snapshot) return "";
   return [
-    snapshot.snapshotId,
     snapshot.generation.toString(10),
     snapshot.revision?.etag ?? "",
     snapshot.revision?.value.toString(10) ?? ""
