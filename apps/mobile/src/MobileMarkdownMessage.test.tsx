@@ -41,16 +41,19 @@ vi.mock("react-native", () => {
 });
 
 describe("native message Markdown", () => {
-  it("mounts only authorized inline images and paths, handles decode failure and releases background, pressure and late resources", async () => {
+  it("mounts authorized resources, restores interrupted authority, and retires decode, background, pressure and late resources", async () => {
     const container = document.createElement("div"); const root = createRoot(container);
     const imageKey = JSON.stringify(["image", "images/a.png"]); const pathKey = JSON.stringify(["code", "README.md:7"]);
     const descriptor = { leaseId: "resources-1", references: new Map([
       [imageKey, { key: imageKey, kind: "image" as const, label: "Picture", relativePath: "images/a.png", image: { uri: "data:image/png;base64,AAAA", width: 1, height: 1 } }],
       [pathKey, { key: pathKey, kind: "file" as const, label: "README.md:7", relativePath: "README.md" }]
     ]) };
+    let resourceOwner: string | undefined = "resources-owner";
+    let notifyOwner = () => {};
     const client: MobileMarkdownResourceClient = {
       prepareMarkdownResources: vi.fn(async () => descriptor), assertMarkdownResourcesCurrent: vi.fn(), releaseMarkdownResources: vi.fn(),
-      markdownResourceOwnerKey: () => "resources-owner", subscribe: () => () => undefined
+      markdownResourceOwnerKey: () => resourceOwner,
+      subscribe: (listener) => { notifyOwner = () => listener(undefined!); return () => { notifyOwner = () => {}; }; }
     };
     const onOpenImage = vi.fn(); const onOpenPath = vi.fn();
     const props = { text: "Before\n\n![Picture](images/a.png)\n\n`README.md:7` ![External](https://example.invalid/a.png) `missing`\n\nAfter",
@@ -79,10 +82,21 @@ describe("native message Markdown", () => {
     expect(client.releaseMarkdownResources).toHaveBeenCalledWith("resources-1");
     await act(async () => { appStateListeners.forEach((listener) => listener("active")); });
     expect(container.querySelector("img")).not.toBeNull();
-    await act(async () => { pressureListeners.forEach((listener) => listener()); });
+    await act(async () => { resourceOwner = undefined; notifyOwner(); });
+    expect(container.querySelector("img")).toBeNull();
+    expect(client.prepareMarkdownResources).toHaveBeenCalledTimes(2);
+    await act(async () => { resourceOwner = "resources-owner"; notifyOwner(); });
+    expect(container.querySelector("img")).not.toBeNull();
+    expect(client.prepareMarkdownResources).toHaveBeenCalledTimes(3);
+    await act(async () => { notifyOwner(); });
     expect(client.prepareMarkdownResources).toHaveBeenCalledTimes(3);
     await act(async () => { pressureListeners.forEach((listener) => listener()); });
+    expect(client.prepareMarkdownResources).toHaveBeenCalledTimes(4);
+    await act(async () => { pressureListeners.forEach((listener) => listener()); });
     expect(container.querySelector("img")).toBeNull();
+    await act(async () => { resourceOwner = undefined; notifyOwner(); resourceOwner = "resources-owner"; notifyOwner(); });
+    expect(container.querySelector("img")).toBeNull();
+    expect(client.prepareMarkdownResources).toHaveBeenCalledTimes(4);
     let finish!: (value: typeof descriptor) => void;
     vi.mocked(client.prepareMarkdownResources).mockImplementation(() => new Promise((resolve) => { finish = resolve; }));
     await act(async () => { root.render(createElement(MobileMarkdownMessage, { ...props, text: props.text + " next" })); });
