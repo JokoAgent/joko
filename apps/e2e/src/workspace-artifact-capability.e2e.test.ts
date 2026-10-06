@@ -180,6 +180,7 @@ describe("workspace, artifact, and capability boundaries", () => {
     expect(textMatch?.revision?.opaqueRevision).not.toBe("");
 
     const textBytes = Buffer.from(`${marker}\n`, "utf8");
+    const beforeMaterialization = (await paired.clients.event.getSnapshot({ scope: { kind: { case: "owner", value: {} } } })).snapshot!;
     const completeText = await paired.clients.workspace.readWorkspaceFile({
       workspaceId,
       relativePath: "mobile-search.txt",
@@ -187,6 +188,17 @@ describe("workspace, artifact, and capability boundaries", () => {
       maximumBytes: BigInt(textBytes.byteLength),
       requireBlob: true
     });
+    const afterMaterialization = (await paired.clients.event.getSnapshot({ scope: { kind: { case: "owner", value: {} } } })).snapshot!;
+    expect(afterMaterialization.revision!.value).toBeGreaterThan(beforeMaterialization.revision!.value);
+    expect(afterMaterialization.generation).toBe(beforeMaterialization.generation);
+    expect(afterMaterialization.sessions.find((item) => item.sessionId === sessionId)?.version)
+      .toEqual(beforeMaterialization.sessions.find((item) => item.sessionId === sessionId)?.version);
+    expect(afterMaterialization.targets.find((item) => item.targetId === target.targetId)?.version)
+      .toEqual(beforeMaterialization.targets.find((item) => item.targetId === target.targetId)?.version);
+    expect(afterMaterialization.workspaces.find((item) => item.workspaceId === workspaceId)?.version)
+      .toEqual(beforeMaterialization.workspaces.find((item) => item.workspaceId === workspaceId)?.version);
+    expect(afterMaterialization.backends.find((item) => item.backendId === session.backendId)?.entityVersion)
+      .toEqual(beforeMaterialization.backends.find((item) => item.backendId === session.backendId)?.entityVersion);
     expect(completeText.preview).toMatchObject({
       truncated: false,
       entry: {

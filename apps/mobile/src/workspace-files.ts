@@ -187,15 +187,20 @@ export function resolveMobileWorkspaceAuthority(
     || ownerWorkspace.targetId !== workspace.targetId) return undefined;
 
   const key = [
-    snapshotKey(owner),
-    snapshotKey(detail),
+    owner.generation.toString(10),
+    detail?.generation.toString(10) ?? "",
     selectedId,
+    entityKey(ownerSession.version),
     entityKey(session.version),
+    ownerSession.nativeBinding?.runtimeGeneration.toString(10) ?? "",
     session.nativeBinding?.runtimeGeneration.toString(10) ?? "",
     target.targetId,
+    entityKey(ownerTarget.version),
     entityKey(target.version),
     workspace.workspaceId,
+    entityKey(ownerWorkspace.version),
     entityKey(workspace.version),
+    entityKey(ownerBackend.entityVersion),
     entityKey(backend.entityVersion)
   ].join("\u001f");
   return {
@@ -308,15 +313,6 @@ export function bytesToDataUri(bytes: Uint8Array, mediaType: string): string {
 
 function supports(backend: BackendDescriptor, name: string): boolean {
   return backend.capabilities?.capabilities.some((item) => item.name === name && item.support === CapabilitySupport.SUPPORTED) === true;
-}
-
-function snapshotKey(snapshot: Snapshot | undefined): string {
-  if (!snapshot) return "";
-  return [
-    snapshot.generation.toString(10),
-    snapshot.revision?.etag ?? "",
-    snapshot.revision?.value.toString(10) ?? ""
-  ].join(":");
 }
 
 function entityKey(version: { readonly revision?: { readonly etag: string; readonly value: bigint } } | undefined): string {

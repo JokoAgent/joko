@@ -3,6 +3,7 @@ import {
   ArtifactKind,
   ArtifactSchema,
   CapabilitySupport,
+  EntityVersionSchema,
   FileKind,
   FileRevisionSchema,
   SnapshotSchema,
@@ -65,12 +66,21 @@ describe("mobile Workspace file ownership and presentation", () => {
       backends: [{ ...owner.backends[0]!, capabilities: undefined }]
     }), undefined, "session")).toBeUndefined();
     expect(resolveMobileWorkspaceAuthority(owner, owner, "different-session")).toBeUndefined();
-    const reread = create(SnapshotSchema, { ...owner, snapshotId: "owner-2" });
+    const reread = create(SnapshotSchema, { ...owner, snapshotId: "owner-2",
+      revision: { ...owner.revision!, etag: "snapshot-4", value: 4n } });
     expect(resolveMobileWorkspaceAuthority(reread, create(SnapshotSchema, { ...owner, snapshotId: "detail-2" }), "session")?.key)
       .toBe(authority?.key);
-    for (const changed of [create(SnapshotSchema, { ...reread, generation: 4n }),
-      create(SnapshotSchema, { ...reread, revision: { ...reread.revision!, etag: "snapshot-4", value: 4n } })]) {
-      expect(resolveMobileWorkspaceAuthority(changed, changed, "session")?.key).not.toBe(authority?.key);
+    const revision = { ...owner.revision!, etag: "entity-8", value: 8n };
+    const changedVersion = create(EntityVersionSchema, { revision });
+    for (const changed of [
+      create(SnapshotSchema, { ...reread, generation: 4n }),
+      create(SnapshotSchema, { ...reread, sessions: [{ ...reread.sessions[0]!, version: changedVersion }] }),
+      create(SnapshotSchema, { ...reread, targets: [{ ...reread.targets[0]!, version: changedVersion }] }),
+      create(SnapshotSchema, { ...reread, workspaces: [{ ...reread.workspaces[0]!, version: changedVersion }] }),
+      create(SnapshotSchema, { ...reread, backends: [{ ...reread.backends[0]!, entityVersion: changedVersion }] })
+    ]) {
+      expect(resolveMobileWorkspaceAuthority(changed, reread, "session")?.key).not.toBe(authority?.key);
+      expect(resolveMobileWorkspaceAuthority(reread, changed, "session")?.key).not.toBe(authority?.key);
     }
   });
 
