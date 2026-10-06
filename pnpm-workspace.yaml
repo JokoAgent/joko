@@ -28,6 +28,7 @@ minimumReleaseAgeExclude:
 
 patchedDependencies:
   expo-image-manipulator@57.0.14: dependency-patches/expo-image-manipulator@57.0.14.patch
+  expo-image@57.0.3: dependency-patches/expo-image@57.0.3.patch
 
 allowBuilds:
   '@bufbuild/buf': true
