@@ -71,6 +71,7 @@ import { translate } from "../i18n.js";
 import { resolveLocalePreference } from "../system-locale.js";
 import { applyAppearanceTypography, clampCodeSize, clampUiSize, normalizeFontFamily } from "../appearance-settings.js";
 import { VISUAL_EXTENSION_MAIN_VIEW_ENDPOINT } from "./visual-extension-surface-contract.js";
+import { VisualInteractionFixture, VISUAL_INTERACTION_SETTLE_EVENT } from "./VisualInteractionFixture.js";
 
 const FIXED_NOW = Date.UTC(2026, 7, 22, 4, 0, 0);
 const VISUAL_WORKSPACE_ID = "visual-workspace";
@@ -122,10 +123,28 @@ export function VisualHarness(): JSX.Element {
   const sequence = useRef(100);
   const extensionPackageExports = useRef(new Map<string, ExtensionPackageExportJobView>());
   const [state, setState] = useState<ControllerState>(() => initialControllerState(scenario, files));
+  const interactionFixture = useMemo(() => new VisualInteractionFixture(visualInteractionJourney()), []);
   const remoteHosts = useMemo(() => new VisualRemoteHostFixture(state.snapshot.targets, target => {
     setState(current => ({ ...current, snapshot: { ...current.snapshot, targets: current.snapshot.targets.map(value => value.id === target.id ? target : value) } }));
   }), []);
   const automationSettingsEnteredRef = useRef(false);
+
+  useEffect(() => {
+    if (scenario.scenario !== "interaction") return;
+    const unsubscribe = interactionFixture.subscribe((value) => {
+      document.documentElement.dataset.harnessInteractionState = JSON.stringify(value);
+    });
+    const settle = (event: Event): void => {
+      if (event instanceof CustomEvent) interactionFixture.settle(event.detail);
+    };
+    window.addEventListener(VISUAL_INTERACTION_SETTLE_EVENT, settle);
+    return () => {
+      window.removeEventListener(VISUAL_INTERACTION_SETTLE_EVENT, settle);
+      unsubscribe();
+      interactionFixture.cancelPending();
+      delete document.documentElement.dataset.harnessInteractionState;
+    };
+  }, [interactionFixture, scenario.scenario]);
 
   useEffect(() => {
     if (scenario.scenario !== "automation" || automationSettingsEnteredRef.current) return;
@@ -1571,11 +1590,17 @@ export function VisualHarness(): JSX.Element {
       abortUserShell: async (sessionId: string): Promise<void> => { record(`abort-user-shell:${sessionId}`); },
       resolveInteraction: async (interaction: InteractionView, resolution: InteractionResolutionDraft): Promise<void> => {
         record(`resolve:${interaction.id}:${resolution.kind}`);
-        updateSnapshot((snapshot) => ({ ...snapshot, interactions: snapshot.interactions.filter((candidate) => candidate.id !== interaction.id) }));
+        if (scenario.scenario === "interaction") await interactionFixture.begin(interaction, resolution);
+        updateSnapshot((snapshot) => ({ ...snapshot, interactions: scenario.scenario === "interaction"
+          ? interactionFixture.current === undefined ? [] : [interactionFixture.current]
+          : snapshot.interactions.filter((candidate) => candidate.id !== interaction.id) }));
       },
       dismissInteraction: async (interaction: InteractionView): Promise<void> => {
         record(`dismiss:${interaction.id}`);
-        updateSnapshot((snapshot) => ({ ...snapshot, interactions: snapshot.interactions.filter((candidate) => candidate.id !== interaction.id) }));
+        if (scenario.scenario === "interaction") await interactionFixture.begin(interaction);
+        updateSnapshot((snapshot) => ({ ...snapshot, interactions: scenario.scenario === "interaction"
+          ? interactionFixture.current === undefined ? [] : [interactionFixture.current]
+          : snapshot.interactions.filter((candidate) => candidate.id !== interaction.id) }));
       },
       runSchedule: async (scheduleId: string): Promise<void> => { record(`schedule-run:${scheduleId}`); },
       setScheduleEnabled: async (scheduleId: string, enabled: boolean): Promise<void> => {
@@ -1825,7 +1850,7 @@ export function VisualHarness(): JSX.Element {
         return async (): Promise<undefined> => undefined;
       }
     }) as unknown as AppController;
-  }, [artifactActions, draftActions, mcpActions, remoteHosts, state, usageHistory]);
+  }, [artifactActions, draftActions, interactionFixture, mcpActions, remoteHosts, state, usageHistory]);
 
   if (scenario.scenario === "usage") return <main style={{ maxWidth: 1040, margin: "0 auto" }}>
     <UsageHistorySection controller={controller} t={(key, values) => translate(state.effectiveLocale, key, values)} />
@@ -2821,7 +2846,7 @@ function abortError(): Error {
 }
 
 interface HarnessParameters {
-  readonly scenario: "session" | "question" | "long-question" | "files" | "audio" | "review" | "personalization" | "providers" | "voice" | "automation" | "scheduler" | "connection" | "connections" | "browser" | "extensions" | "background" | "subagents" | "usage";
+  readonly scenario: "session" | "interaction" | "question" | "long-question" | "files" | "audio" | "review" | "personalization" | "providers" | "voice" | "automation" | "scheduler" | "connection" | "connections" | "browser" | "extensions" | "background" | "subagents" | "usage";
   readonly usageState: "ready" | "empty" | "error";
   readonly theme: Theme;
   readonly richCopy: boolean;
@@ -2847,7 +2872,8 @@ function harnessParameters(): HarnessParameters {
   const themeValue = query.get("theme");
   const updateValue = query.get("computerUpdate");
   return {
-    scenario: scenarioValue === "question"
+    scenario: scenarioValue === "interaction"
+      || scenarioValue === "question"
       || scenarioValue === "long-question"
       || scenarioValue === "files"
       || scenarioValue === "audio"
@@ -3346,7 +3372,9 @@ function visualSnapshot(parameters: HarnessParameters, files: VisualWorkspaceFil
         description: output.description, mediaType: "text/plain", byteSize: utf8Length(output.text) }
     }))
   ]);
-  const interactions = parameters.scenario === "session"
+  const interactions = parameters.scenario === "interaction"
+    ? visualInteractionJourney().slice(0, 1)
+    : parameters.scenario === "session"
     || parameters.scenario === "background"
     || parameters.scenario === "personalization"
     || parameters.scenario === "automation"
@@ -4264,4 +4292,30 @@ function questionInteraction(long: boolean): InteractionView {
     planSteps: [],
     createdAt: FIXED_NOW
   };
+}
+
+function visualInteractionJourney(): readonly InteractionView[] {
+  return [{
+    id: "visual-interaction-permission", sessionId: "session-1", generation: 1n,
+    kind: "permission", title: "Inspect the scoped workspace", risk: "read",
+    message: "Read the two declared files before preparing the implementation plan.",
+    permissionSubject: { kind: "file", workspaceId: VISUAL_WORKSPACE_ID,
+      paths: ["src/App.tsx", "README.md"], action: "read", outsidePrimaryWorkspace: false },
+    options: [{ id: "1", label: "Allow once" }, { id: "4", label: "Reject" }],
+    fields: [], planSteps: [], createdAt: FIXED_NOW
+  }, {
+    ...questionInteraction(false), id: "visual-interaction-question", createdAt: FIXED_NOW + 1
+  }, {
+    id: "visual-interaction-plan", sessionId: "session-1", generation: 1n,
+    kind: "plan", title: "Review the scoped implementation plan",
+    message: "Review the exact implementation scope and provide any refinement.",
+    planMarkdown: "## Scoped implementation\n\n1. Inspect `src/App.tsx` and the workspace notes.\n2. Preserve the typed decision and draft after a confirmed failure.\n3. Capture the wide and narrow interaction states.\n\n**Acceptance:** one confirmed decision for each request, with no repeated in-flight submission.",
+    planSteps: [
+      { id: "scope", title: "Inspect the exact scope", description: "Read only the declared workspace files.", state: "completed" },
+      { id: "recovery", title: "Retain error recovery", description: "Preserve the same decision and question draft.", state: "inProgress" },
+      { id: "evidence", title: "Capture visible states", description: "Keep actions reachable in wide and narrow layouts.", state: "pending" }
+    ],
+    options: [{ id: "1", label: "Execute plan" }, { id: "3", label: "Refine plan" }],
+    fields: [], createdAt: FIXED_NOW + 2
+  }];
 }
