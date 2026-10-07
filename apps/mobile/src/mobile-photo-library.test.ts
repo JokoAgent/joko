@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import sharp from "sharp";
 import {
   MobilePhotoLibrary,
   canBrowseMobilePhotoLibraryDirectly,
@@ -11,7 +12,7 @@ import {
   type MobileAttachmentFileDriver,
   type MobileAttachmentFileSnapshot
 } from "./mobile-attachment-files";
-import type { MobileAttachmentPolicy } from "./mobile-attachments";
+import { MOBILE_MAXIMUM_ATTACHMENT_BYTES, type MobileAttachmentPolicy } from "./mobile-attachments";
 
 const jpegPolicy: MobileAttachmentPolicy = {
   images: true,
@@ -117,7 +118,9 @@ describe("mobile photo library", () => {
     expect(canBrowseMobilePhotoLibraryDirectly("android")).toBe(false);
     expect(mobilePhotoLibrarySupported(jpegPolicy)).toBe(true);
     expect(mobilePhotoLibrarySupported({ ...jpegPolicy, imageMediaTypes: ["image/png"] })).toBe(true);
+    expect(mobilePhotoLibrarySupported({ ...jpegPolicy, imageMediaTypes: ["image/avif"] })).toBe(false);
     expect(mobilePhotoLibrarySupported({ ...jpegPolicy, imageMediaTypes: ["image/svg+xml"] })).toBe(false);
+    expect(mobilePhotoLibrarySupported({ ...jpegPolicy, imageMediaTypes: ["image/x-adobe-dng"] })).toBe(false);
     expect(mobilePhotoLibrarySupported({ ...jpegPolicy, images: false, files: true })).toBe(false);
     expect(mobilePhotoLibrarySupported(undefined)).toBe(false);
   });
@@ -289,52 +292,188 @@ describe("mobile photo library", () => {
     expect(value.cleanup).toHaveBeenCalledOnce();
   });
 
-  it.each(["ios", "android"])("imports JPEG as PNG for a PNG-only policy through %s photos", async (platform) => {
+  it.each([
+    ["ios", "JPEG", "image/png", "filename"],
+    ["android", "JPEG", "image/png", "MIME"],
+    ["ios", "AVIF", "image/png", "filename"],
+    ["android", "AVIF", "image/png", "MIME"],
+    ["ios", "AVIF", "image/jpeg", "filename"],
+    ["android", "AVIF", "image/jpeg", "MIME"],
+    ["ios", "DNG", "image/png", "filename"],
+    ["ios", "DNG", "image/jpeg", "filename"],
+    ["android", "DNG", "image/png", "MIME"],
+    ["android", "DNG", "image/jpeg", "MIME"],
+    ["android", "DNG", "image/png", "filename"],
+    ["android", "DNG", "image/jpeg", "filename"]
+  ] as const)("imports %s %s photos through an admitted %s conversion from %s", async (platform, format, targetMediaType, declaration) => {
+    // DNG rows verify provider routing and staging with mocks, not native RAW decoding.
+    const sourceBytes = format === "AVIF" ? await realAvifBytes() : new Uint8Array([1, 2, 3]);
+    const outputBytes = format === "AVIF"
+      ? Uint8Array.from(await sharp(sourceBytes).toFormat(targetMediaType === "image/png" ? "png" : "jpeg").toBuffer())
+      : new Uint8Array([2, 3, 4, 5]);
+    const sourceMediaType = format === "AVIF" ? "image/avif" : format === "DNG" ? "image/x-adobe-dng" : "image/jpeg";
+    const sourceExtension = format === "AVIF" ? "avif" : format === "DNG" ? "dng" : "jpg";
+    const sourceUri = platform === "android"
+      ? `content://picker/one.${sourceExtension}` : `file:///library/IMG_0001.${sourceExtension.toUpperCase()}`;
+    const sourceName = platform === "android" ? `one.${sourceExtension}` : `IMG_0001.${sourceExtension.toUpperCase()}`;
+    const outputUri = targetMediaType === "image/png" ? "file:///cache/converted.png" : "file:///cache/IMG_0002.jpg";
     const value = fixture({
       platform,
       sources: {
-        "content://picker/one.jpg": new Uint8Array([1, 2, 3]),
-        "file:///library/IMG_0001.JPG": new Uint8Array([1, 2, 3]),
-        "file:///cache/converted.png": new Uint8Array([2, 3, 4, 5])
+        [sourceUri]: sourceBytes,
+        [outputUri]: outputBytes
       }
     });
+    vi.mocked(value.driver.pickSystem).mockResolvedValue({
+      canceled: false,
+      assets: [{ uri: sourceUri, type: "image", fileName: sourceName,
+        ...(declaration === "MIME" ? { mimeType: sourceMediaType } : {}),
+        fileSize: sourceBytes.byteLength, width: 7, height: 5 }]
+    });
+    vi.mocked(value.driver.resolve).mockResolvedValue({
+      ...catalogAsset, fileName: sourceName, localUri: sourceUri, width: 7, height: 5
+    });
     const library = new MobilePhotoLibrary(value.files, value.driver);
-    const policy = { ...jpegPolicy, imageMediaTypes: ["image/png"] };
+    const policy = {
+      ...jpegPolicy,
+      maximumBytes: 65_536,
+      imageMediaTypes: format === "DNG"
+        ? [sourceMediaType, targetMediaType, ...(targetMediaType === "image/jpeg" ? ["image/png"] : [])]
+        : [targetMediaType]
+    };
     const staged = platform === "android"
       ? await library.pickSystemAndStage("profile", [], policy, () => "photo-one")
-      : await library.stageSelectedAssets("profile", [], policy, [catalogAsset], () => "photo-one");
+      : await library.stageSelectedAssets("profile", [], policy,
+          [{ ...catalogAsset, fileName: sourceName, width: 7, height: 5 }], () => "photo-one");
 
     expect(staged[0]).toMatchObject({
-      fileName: platform === "android" ? "one.png" : "IMG_0001.png",
-      mediaType: "image/png",
-      byteSize: 4,
+      fileName: `${platform === "android" ? "one" : "IMG_0001"}.${targetMediaType === "image/png" ? "png" : "jpg"}`,
+      mediaType: targetMediaType,
+      byteSize: outputBytes.byteLength,
       sha256Hex: "b".repeat(64)
     });
-    expect(value.driver.convertImage).toHaveBeenCalledWith(
-      platform === "android" ? "content://picker/one.jpg" : "file:///library/IMG_0001.JPG", "image/png"
-    );
-    expect(value.fileDriver.stage).toHaveBeenCalledWith("profile", "photo-one", "file:///cache/converted.png");
+    expect(value.driver.convertImage).toHaveBeenCalledWith(sourceUri, targetMediaType);
+    expect(value.fileDriver.stage).toHaveBeenCalledWith("profile", "photo-one", outputUri);
+    expect(value.stored.get("profile/photo-one")?.bytes).toEqual(outputBytes);
+    if (format === "AVIF") {
+      expect(await sharp(sourceBytes).metadata()).toMatchObject({ width: 7, height: 5, compression: "av1" });
+      expect(await sharp(outputBytes).metadata()).toMatchObject({
+        format: targetMediaType === "image/png" ? "png" : "jpeg", width: 7, height: 5
+      });
+    }
     expect(value.cleanup).toHaveBeenCalledOnce();
   });
 
+  it.each([
+    { imageMediaTypes: ["image/x-adobe-dng"] },
+    { imageMediaTypes: ["image/x-adobe-dng", "image/webp"] }
+  ])("never adopts provider RAW originals without a JPEG or PNG conversion target: $imageMediaTypes", async ({ imageMediaTypes }) => {
+    const value = fixture({ platform: "android" });
+    vi.mocked(value.driver.pickSystem).mockResolvedValue({
+      canceled: false,
+      assets: [{ uri: "content://picker/one.jpg", type: "image", fileName: "one.dng", mimeType: "image/x-adobe-dng" }]
+    });
+    const policy = { ...jpegPolicy, imageMediaTypes };
+    const onlyRaw = imageMediaTypes.length === 1;
+    await expect(new MobilePhotoLibrary(value.files, value.driver).pickSystemAndStage(
+      "profile", [], policy, () => "unused"
+    )).rejects.toThrow(onlyRaw ? /do not accept supported photo-library images/u : /cannot be converted/u);
+    expect(value.driver.pickSystem).toHaveBeenCalledTimes(onlyRaw ? 0 : 1);
+    expect(value.driver.convertImage).not.toHaveBeenCalled();
+    expect(value.fileDriver.stage).not.toHaveBeenCalled();
+    expect(value.stored.size).toBe(0);
+  });
+
+  it.each([
+    { source: "SVG MIME", uri: "content://picker/one.jpg", fileName: "one.jpg", mimeType: "image/svg+xml" },
+    { source: "SVG filename", uri: "content://picker/opaque", fileName: "one.SVG" },
+    { source: "SVG URI", uri: "content://picker/one.svg?selection=1" },
+    { source: "non-image MIME", uri: "content://picker/one.jpg", fileName: "one.jpg", mimeType: "application/pdf" }
+  ])("rejects $source before conversion or durable staging", async ({ source, ...asset }) => {
+    const value = fixture({ platform: "android", sources: { [asset.uri]: new Uint8Array([1, 2, 3]) } });
+    vi.mocked(value.driver.pickSystem).mockResolvedValue({ canceled: false, assets: [{ ...asset, type: "image" }] });
+    await expect(new MobilePhotoLibrary(value.files, value.driver).pickSystemAndStage(
+      "profile", [], { ...jpegPolicy, imageMediaTypes: ["image/jpeg", "image/svg+xml"] }, () => "unused"
+    )).rejects.toThrow(source === "non-image MIME" ? /not an image/u : /not a supported raster/u);
+    expect(value.driver.convertImage).not.toHaveBeenCalled();
+    expect(value.fileDriver.stage).not.toHaveBeenCalled();
+    expect(value.stored.size).toBe(0);
+  });
+
+  it.each([
+    { source: "changed", byteSize: 4, fileSize: 3 },
+    { source: "over budget", byteSize: MOBILE_MAXIMUM_ATTACHMENT_BYTES + 1, fileSize: 0 }
+  ])("rejects $source provider RAW bytes before native conversion", async ({ source, byteSize, fileSize }) => {
+    const value = fixture({ platform: "android" });
+    vi.mocked(value.driver.pickSystem).mockResolvedValue({
+      canceled: false,
+      assets: [{ uri: "content://picker/one.jpg", type: "image", fileName: "one.dng", mimeType: "image/x-adobe-dng", fileSize }]
+    });
+    vi.mocked(value.driver.stat).mockResolvedValue(byteSize);
+    await expect(new MobilePhotoLibrary(value.files, value.driver).pickSystemAndStage(
+      "profile", [], jpegPolicy, () => "unused"
+    )).rejects.toThrow(source === "changed" ? /changed before/u : /too large to convert safely/u);
+    expect(value.driver.convertImage).not.toHaveBeenCalled();
+    expect(value.fileDriver.stage).not.toHaveBeenCalled();
+  });
+
+  it.each(["failure", "cancellation"] as const)("cleans prepared provider images on later conversion %s without adopting the batch", async (outcome) => {
+    const sourceOne = "content://picker/one.dng";
+    const sourceTwo = "content://picker/two.dng";
+    const outputUri = "file:///cache/IMG_0002.jpg";
+    const value = fixture({ platform: "android", sources: {
+      [sourceOne]: new Uint8Array([1, 2, 3]),
+      [sourceTwo]: new Uint8Array([1, 2, 3]),
+      [outputUri]: new Uint8Array([2, 3, 4])
+    } });
+    vi.mocked(value.driver.pickSystem).mockResolvedValue({
+      canceled: false,
+      assets: [sourceOne, sourceTwo].map((uri) => ({ uri, type: "image", mimeType: "image/x-adobe-dng" }))
+    });
+    const controller = new AbortController();
+    vi.mocked(value.driver.convertImage)
+      .mockResolvedValueOnce({ uri: outputUri, cleanup: value.cleanup })
+      .mockImplementationOnce(async () => {
+        if (outcome === "failure") throw new Error("Native decoder rejected these bytes.");
+        controller.abort(new Error("Photo import cancelled."));
+        return { uri: "file:///cache/second.jpg", cleanup: value.cleanup };
+      });
+    const newId = vi.fn(() => "unused");
+    await expect(new MobilePhotoLibrary(value.files, value.driver).pickSystemAndStage(
+      "profile", [], jpegPolicy, newId, controller.signal
+    )).rejects.toThrow(outcome === "failure" ? /could not be converted/u : /cancelled/u);
+    expect(value.driver.convertImage).toHaveBeenCalledTimes(2);
+    expect(value.cleanup).toHaveBeenCalledTimes(outcome === "failure" ? 1 : 2);
+    expect(newId).not.toHaveBeenCalled();
+    expect(value.fileDriver.stage).not.toHaveBeenCalled();
+    expect(value.stored.size).toBe(0);
+  });
+
   it("keeps an admitted PNG original and cleans cancelled conversion output", async () => {
+    const sourceBytes = new Uint8Array([1, 2, 3]);
+    const sourceMediaType = "image/png";
+    const sourceUri = "content://picker/one.png";
     const value = fixture({
       platform: "android",
       sources: {
-        "content://picker/one.png": new Uint8Array([1, 2, 3]),
+        [sourceUri]: sourceBytes,
         "content://picker/one.jpg": new Uint8Array([1, 2, 3]),
         "file:///cache/converted.png": new Uint8Array([2, 3, 4])
       }
     });
     vi.mocked(value.driver.pickSystem).mockResolvedValue({
       canceled: false,
-      assets: [{ uri: "content://picker/one.png", type: "image", fileName: "one.png", mimeType: "image/png" }]
+      assets: [{ uri: sourceUri, type: "image", fileName: "one.png", mimeType: sourceMediaType }]
     });
-    const policy = { ...jpegPolicy, imageMediaTypes: ["image/png"] };
+    const policy = { ...jpegPolicy, maximumBytes: 65_536, imageMediaTypes: [sourceMediaType] };
     const library = new MobilePhotoLibrary(value.files, value.driver);
     await expect(library.pickSystemAndStage("profile", [], policy, () => "photo-one"))
-      .resolves.toMatchObject([{ fileName: "one.png", mediaType: "image/png", sha256Hex: "a".repeat(64) }]);
+      .resolves.toMatchObject([{
+        fileName: "one.png", mediaType: sourceMediaType,
+        byteSize: sourceBytes.byteLength, sha256Hex: "a".repeat(64)
+      }]);
     expect(value.driver.convertImage).not.toHaveBeenCalled();
+    expect(value.stored.get("profile/photo-one")?.bytes).toEqual(sourceBytes);
 
     vi.mocked(value.driver.pickSystem).mockResolvedValue({
       canceled: false,
@@ -345,7 +484,7 @@ describe("mobile photo library", () => {
       controller.abort(new Error("Photo import cancelled."));
       return { uri: "file:///cache/converted.png", cleanup: value.cleanup };
     });
-    await expect(library.pickSystemAndStage("profile", [], policy, () => "photo-two", controller.signal))
+    await expect(library.pickSystemAndStage("profile", [], { ...policy, imageMediaTypes: ["image/png"] }, () => "photo-two", controller.signal))
       .rejects.toThrow(/cancelled/u);
     expect(value.cleanup).toHaveBeenCalledOnce();
     expect(value.fileDriver.stage).toHaveBeenCalledTimes(1);
@@ -426,3 +565,8 @@ describe("mobile photo library", () => {
     expect(value.stored.size).toBe(0);
   });
 });
+
+async function realAvifBytes(): Promise<Uint8Array> {
+  return Uint8Array.from(await sharp({ create: { width: 7, height: 5, channels: 3, background: "#ff9800" } })
+    .avif().toBuffer());
+}

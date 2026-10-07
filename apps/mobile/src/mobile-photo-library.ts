@@ -305,10 +305,11 @@ export class MobilePhotoLibrary {
           sourceMediaType,
           this.now()
         );
-        if (sourceMediaType && !mobileRasterMediaTypes.has(sourceMediaType)) {
+        if (sourceMediaType === "image/svg+xml") {
           throw new Error(`${sourceName} is not a supported raster image.`);
         }
-        if (sourceMediaType && mobileImageMediaTypeAccepted(sourceMediaType, policy)) {
+        if (sourceMediaType && mobileRasterMediaTypes.has(sourceMediaType)
+          && mobileImageMediaTypeAccepted(sourceMediaType, policy)) {
           candidates.push({
             uri: sourceUri,
             fileName: normalizeMobileImageFileExtension(sourceName, sourceMediaType),

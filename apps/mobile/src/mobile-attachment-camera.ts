@@ -113,10 +113,11 @@ export class MobileAttachmentCamera {
       "The camera returned media that is not an image."
     );
     const sourceName = mobileImageFileName(asset.fileName, sourceUri, sourceMediaType, this.now());
-    if (sourceMediaType && !mobileRasterMediaTypes.has(sourceMediaType)) {
+    if (sourceMediaType === "image/svg+xml") {
       throw new Error("The camera returned an unsupported still-image format.");
     }
-    if (sourceMediaType && mobileImageMediaTypeAccepted(sourceMediaType, policy)) {
+    if (sourceMediaType && mobileRasterMediaTypes.has(sourceMediaType)
+      && mobileImageMediaTypeAccepted(sourceMediaType, policy)) {
       return this.files.stageCandidates(profileId, current, policy, [{
         uri: sourceUri,
         fileName: normalizeMobileImageFileExtension(sourceName, sourceMediaType),

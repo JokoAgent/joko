@@ -91,6 +91,7 @@ describe("mobile camera attachment", () => {
     expect(mobileCameraCaptureSupported({ ...jpegPolicy, imageMediaTypes: [] })).toBe(true);
     expect(mobileCameraCaptureSupported({ ...jpegPolicy, imageMediaTypes: ["image/png"] })).toBe(true);
     expect(mobileCameraCaptureSupported({ ...jpegPolicy, imageMediaTypes: ["image/webp"] })).toBe(false);
+    expect(mobileCameraCaptureSupported({ ...jpegPolicy, imageMediaTypes: ["image/x-adobe-dng"] })).toBe(false);
     expect(mobileCameraCaptureSupported({ ...jpegPolicy, images: false, files: true })).toBe(false);
     expect(mobileCameraCaptureSupported(undefined)).toBe(false);
   });
@@ -151,18 +152,23 @@ describe("mobile camera attachment", () => {
   });
 
   it.each([
-    { accepted: ["image/jpeg", "image/png"], target: "image/jpeg", extension: "jpg" },
-    { accepted: ["image/png"], target: "image/png", extension: "png" }
-  ] as const)("converts HEIC to $target, stages the converted bytes, and cleans its temporary file", async ({ accepted, target, extension }) => {
+    { source: "HEIC", sourceExtension: "heic", mimeType: "image/heic" },
+    { source: "explicit provider DNG", sourceExtension: "dng", mimeType: "image/x-adobe-dng" },
+    { source: "missing-MIME DNG", sourceExtension: "dng", mimeType: undefined }
+  ].flatMap((source) => [
+    { ...source, accepted: ["image/jpeg", "image/png", "image/x-adobe-dng"], target: "image/jpeg" as const, extension: "jpg" },
+    { ...source, accepted: ["image/png", "image/x-adobe-dng"], target: "image/png" as const, extension: "png" }
+  ]))("converts $source to $target, stages only converted bytes, and cleans its temporary file", async ({ sourceExtension, mimeType, accepted, target, extension }) => {
+    const sourceUri = `file:///camera/photo.${sourceExtension}`;
     const asset = {
       ...jpegAsset,
-      uri: "file:///camera/photo.heic",
-      fileName: "IMG_0001.HEIC",
-      mimeType: "image/heic",
+      uri: sourceUri,
+      fileName: `IMG_0001.${sourceExtension.toUpperCase()}`,
+      mimeType,
       fileSize: 4
     };
     const fixture = cameraFixture(asset, {
-      "file:///camera/photo.heic": new Uint8Array([1, 2, 3, 4]),
+      [sourceUri]: new Uint8Array([1, 2, 3, 4]),
       [`file:///camera/converted.${extension}`]: new Uint8Array([2, 3, 4])
     });
 
@@ -173,7 +179,7 @@ describe("mobile camera attachment", () => {
     expect(staged[0]).toMatchObject({
       fileName: `IMG_0001.${extension}`, mediaType: target, byteSize: 3, sha256Hex: "b".repeat(64)
     });
-    expect(fixture.cameraDriver.convertImage).toHaveBeenCalledWith("file:///camera/photo.heic", target);
+    expect(fixture.cameraDriver.convertImage).toHaveBeenCalledExactlyOnceWith(sourceUri, target);
     expect(fixture.fileDriver.stage).toHaveBeenCalledWith(
       "profile", "photo-one", `file:///camera/converted.${extension}`
     );
@@ -225,11 +231,32 @@ describe("mobile camera attachment", () => {
     await expect(new MobileAttachmentCamera(malformed.files, malformed.cameraDriver).captureAndStage(
       "profile", [], jpegPolicy, () => "photo-one"
     )).rejects.toThrow(/invalid width/u);
+  });
 
-    const vector = cameraFixture({ ...jpegAsset, mimeType: "image/svg+xml" });
-    await expect(new MobileAttachmentCamera(vector.files, vector.cameraDriver).captureAndStage(
-      "profile", [], jpegPolicy, () => "photo-one"
-    )).rejects.toThrow(/unsupported still-image format/u);
+  it.each([
+    { source: "explicit SVG", uri: "file:///camera/photo.svg", fileName: "photo.svg", mimeType: "image/svg+xml" },
+    { source: "missing-MIME SVG filename", uri: "file:///camera/photo", fileName: "photo.svg", mimeType: undefined },
+    { source: "missing-MIME SVG URI", uri: "file:///camera/photo.svg", fileName: undefined, mimeType: undefined },
+    { source: "non-image MIME", uri: "file:///camera/photo.pdf", fileName: "photo.pdf", mimeType: "application/pdf" }
+  ])("rejects $source before conversion or staging", async ({ uri, fileName, mimeType }) => {
+    const fixture = cameraFixture({ ...jpegAsset, uri, fileName, mimeType }, { [uri]: new Uint8Array([1, 2, 3]) });
+    const newId = vi.fn(() => "photo-one");
+    await expect(new MobileAttachmentCamera(fixture.files, fixture.cameraDriver).captureAndStage(
+      "profile", [], jpegPolicy, newId
+    )).rejects.toThrow(/unsupported still-image format|not an image/u);
+    expect(fixture.cameraDriver.convertImage).not.toHaveBeenCalled();
+    expect(fixture.fileDriver.stage).not.toHaveBeenCalled();
+    expect(newId).not.toHaveBeenCalled();
+  });
+
+  it("does not request the camera for a provider-only image policy", async () => {
+    const fixture = cameraFixture();
+    await expect(new MobileAttachmentCamera(fixture.files, fixture.cameraDriver).captureAndStage(
+      "profile", [], { ...jpegPolicy, imageMediaTypes: ["image/x-adobe-dng"] }, () => "photo-one"
+    )).rejects.toThrow(/do not accept supported camera images/u);
+    expect(fixture.cameraDriver.isAvailable).not.toHaveBeenCalled();
+    expect(fixture.cameraDriver.requestPermission).not.toHaveBeenCalled();
+    expect(fixture.fileDriver.stage).not.toHaveBeenCalled();
   });
 
   it("cleans conversion output when its final size exceeds policy and normalizes native failures", async () => {
@@ -257,23 +284,45 @@ describe("mobile camera attachment", () => {
     expect(nativeError.fileDriver.stage).not.toHaveBeenCalled();
   });
 
-  it("cancels a JPEG to PNG import after conversion and cleans the unused output", async () => {
-    const fixture = cameraFixture(jpegAsset, {
-      "file:///camera/photo.jpeg": new Uint8Array([1, 2, 3]),
-      "file:///camera/converted.png": new Uint8Array([2, 3, 4])
+  it.each([
+    { source: "JPEG", uri: "file:///camera/photo.jpeg", fileName: "photo.jpeg", mimeType: "image/jpeg", target: "image/png" as const, extension: "png" },
+    { source: "provider DNG", uri: "file:///camera/photo.dng", fileName: "photo.dng", mimeType: "image/x-adobe-dng", target: "image/jpeg" as const, extension: "jpg" },
+    { source: "provider DNG", uri: "file:///camera/photo.dng", fileName: "photo.dng", mimeType: "image/x-adobe-dng", target: "image/png" as const, extension: "png" }
+  ])("cancels a $source to $target import after conversion and cleans the unused output", async ({ uri, fileName, mimeType, target, extension }) => {
+    const outputUri = `file:///camera/converted.${extension}`;
+    const fixture = cameraFixture({ ...jpegAsset, uri, fileName, mimeType }, {
+      [uri]: new Uint8Array([1, 2, 3]),
+      [outputUri]: new Uint8Array([2, 3, 4])
     });
     const controller = new AbortController();
     vi.mocked(fixture.cameraDriver.convertImage).mockImplementation(async () => {
       controller.abort(new Error("Camera import cancelled."));
-      return { uri: "file:///camera/converted.png", cleanup: fixture.cleanup };
+      return { uri: outputUri, cleanup: fixture.cleanup };
     });
 
     await expect(new MobileAttachmentCamera(fixture.files, fixture.cameraDriver).captureAndStage(
-      "profile", [], { ...jpegPolicy, imageMediaTypes: ["image/png"] }, () => "photo-one", controller.signal
+      "profile", [], { ...jpegPolicy, imageMediaTypes: [target, "image/x-adobe-dng"] }, () => "photo-one", controller.signal
     )).rejects.toThrow(/cancelled/u);
-    expect(fixture.cameraDriver.convertImage).toHaveBeenCalledWith("file:///camera/photo.jpeg", "image/png");
+    expect(fixture.cameraDriver.convertImage).toHaveBeenCalledWith(uri, target);
     expect(fixture.cleanup).toHaveBeenCalledOnce();
     expect(fixture.fileDriver.stage).not.toHaveBeenCalled();
+    expect(fixture.stored.size).toBe(0);
+  });
+
+  it.each(["image/jpeg", "image/png"] as const)("does not stage provider image bytes when native %s conversion fails", async (target) => {
+    const uri = "file:///camera/photo.dng";
+    const fixture = cameraFixture({ ...jpegAsset, uri, fileName: "photo.dng", mimeType: "image/x-adobe-dng" }, {
+      [uri]: new Uint8Array([1, 2, 3])
+    });
+    vi.mocked(fixture.cameraDriver.convertImage).mockRejectedValue(new Error("native decoder rejected provider bytes"));
+    const newId = vi.fn(() => "photo-one");
+    await expect(new MobileAttachmentCamera(fixture.files, fixture.cameraDriver).captureAndStage(
+      "profile", [], { ...jpegPolicy, imageMediaTypes: [target, "image/x-adobe-dng"] }, newId
+    )).rejects.toThrow("The captured photo could not be converted to a supported image.");
+    expect(fixture.cameraDriver.convertImage).toHaveBeenCalledExactlyOnceWith(uri, target);
+    expect(fixture.fileDriver.stage).not.toHaveBeenCalled();
+    expect(fixture.cleanup).not.toHaveBeenCalled();
+    expect(newId).not.toHaveBeenCalled();
     expect(fixture.stored.size).toBe(0);
   });
 });

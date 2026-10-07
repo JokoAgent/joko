@@ -74,6 +74,7 @@ export function mobileImageMediaType(
   if (["png", "gif", "webp", "heic", "heif"].includes(extension)) return `image/${extension}`;
   if (extension === "bmp") return "image/bmp";
   if (extension === "tif" || extension === "tiff") return "image/tiff";
+  if (extension === "svg") return "image/svg+xml";
   return undefined;
 }
 
