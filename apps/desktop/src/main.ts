@@ -59,6 +59,7 @@ import {
   type DesktopNativeTaskStatusDisplay,
   type DesktopNativeTaskStatusSoundChoice,
   type DesktopNativeTaskStatusSettings,
+  type DesktopNativeGamepadSnapshot,
   type DesktopPageSearchResult,
   type DesktopRuntimeProcessMonitorOwner,
   type DesktopSaveFileRequest,
@@ -81,6 +82,7 @@ import {
   requireCurrentDesktopMainDocumentOccurrence,
   parseDesktopGlobalVoiceCommitRequest,
   parseDesktopGlobalVoiceStatus,
+  parseDesktopNativeGamepadClientState,
   parseDesktopPageSearchRequest,
   parseDesktopPageSearchStopAction
 } from "./channels.js";
@@ -189,6 +191,15 @@ import {
 } from "./dedicated-hardware-action/system-frontmost-input.js";
 import { SystemFrontmostVoiceController } from "./dedicated-hardware-action/system-frontmost-voice.js";
 import { loadNativeSystemFrontmostInput } from "./native-system-frontmost-input.js";
+import {
+  createNativeGamepadRuntime,
+  resolveNativeGamepadDirectory,
+  type NativeGamepadRuntime
+} from "./native-gamepad.js";
+import {
+  DesktopNativeGamepadDocumentAuthority,
+  type DesktopNativeGamepadDocumentOwner
+} from "./native-gamepad-document.js";
 import {
   createDedicatedHardwareMainActionRuntime,
   type DedicatedHardwareMainActionRuntime
@@ -632,6 +643,7 @@ interface DedicatedHardwareCatalogOwner {
   readonly contents: WebContents;
   readonly documentOccurrence: string;
 }
+type NativeGamepadClientOwner = DesktopNativeGamepadDocumentOwner<WebContents>;
 type DedicatedHardwareControllerOwner = WebContents | DedicatedHardwareCatalogOwner;
 let dedicatedHardwareController: DedicatedHardwareMainController<DedicatedHardwareControllerOwner> | undefined;
 let dedicatedHardwareCatalogOwner: DedicatedHardwareCatalogOwner | undefined;
@@ -641,6 +653,12 @@ let dedicatedHardwareSystemVoiceController: SystemFrontmostVoiceController | und
 const dedicatedHardwareTaskFocusFence = new DedicatedHardwareTaskFocusFence<WebContents>();
 const dedicatedHardwareWindowLifecycles = new WeakMap<WebContents, { readonly retire: () => void }>();
 let dedicatedHardwarePowerLifecycleInstalled = false;
+let nativeGamepadRuntime: NativeGamepadRuntime<NativeGamepadClientOwner> | undefined;
+const nativeGamepadDocuments = new DesktopNativeGamepadDocumentAuthority<WebContents>(
+  () => randomUUID(),
+  (owner) => nativeGamepadRuntime?.retireClient(owner)
+);
+const nativeGamepadWindowLifecycles = new WeakMap<WebContents, { readonly retire: () => void }>();
 const pageSearchTokensByContents = new WeakMap<WebContents, Map<number, number>>();
 const pageSearchResultBindings = new WeakSet<WebContents>();
 const sessionWindowStates = new Map<string, windowStateKeeper.State>();
@@ -934,6 +952,7 @@ if (!app.requestSingleInstanceLock()) {
     await initializeDesktopNativeTaskStatus();
     if (shouldRunDesktopUpdateStartup()) desktopUpdateStartupPhase = { kind: "checking" };
     await initializeDesktopKeepAwake();
+    initializeNativeGamepad();
     await initializeDedicatedHardwareInput();
     registerIpc();
     installMicrophoneLifecycle();
@@ -6891,6 +6910,7 @@ async function stopManagedOrchestratorForCompleteExit(): Promise<void> {
     () => desktopDevicePeerAgentLifecycle?.stop() ?? Promise.resolve(),
     () => managedOrchestratorExitFence.stop(),
     stopDedicatedHardwareForQuitHandoff,
+    stopNativeGamepadForQuitHandoff,
     () => externalTextInsertionCoordinator.waitForIdle(),
     () => globalVoiceSystemAudio.releaseAll().catch(() => undefined)
   ]);
@@ -6901,6 +6921,7 @@ async function recoverManagedOrchestratorAfterUpdateApplyFailure(): Promise<void
   desktopUpdateNativeInstallQuitHandoffPending = false;
   if (nativeInstallQuitWasPending) quitting = false;
   if (quitting || desktopUpdateLifecycleDisposed) return;
+  recoverNativeGamepadAfterQuitFailure();
   await recoverDedicatedHardwareAfterQuitFailure();
   managedOrchestratorExitFence.releaseForRecovery();
   globalVoiceExitAdmissionClosed = false;
@@ -7071,6 +7092,12 @@ function registerIpc(): void {
   ipcMain.on(DESKTOP_CHANNELS.mainDocumentOccurrenceGet, (event, ...parameters: unknown[]) => {
     event.returnValue = parameters.length === 1 && isDesktopMainDocumentClaim(parameters[0])
       ? captureMainApplicationDocumentOccurrenceForSender(event, parameters[0])
+      : undefined;
+  });
+  ipcMain.on(DESKTOP_CHANNELS.nativeGamepadCaptureDocument, (event, ...parameters: unknown[]) => {
+    event.returnValue = process.platform === "darwin" && parameters.length === 1
+      && isDesktopMainDocumentClaim(parameters[0])
+      ? captureNativeGamepadDocumentForSender(event, parameters[0])
       : undefined;
   });
   ipcMain.handle(DESKTOP_CHANNELS.deepLinkTakePending, (event, ...parameters: unknown[]) => {
@@ -7622,6 +7649,30 @@ function registerIpc(): void {
     }
     assertCurrentMainApplicationDocumentSender(event, parameters[0]);
     requireDesktopAttentionBadgeController().clear(event.sender.id, parseDesktopAttentionKey(parameters[1]));
+  });
+  ipcMain.handle(DESKTOP_CHANNELS.nativeGamepadGetSnapshot, (event, ...parameters: unknown[]) => {
+    if (parameters.length !== 1) {
+      throw new TypeError("Native gamepad snapshot requires its captured Document occurrence.");
+    }
+    assertNativeGamepadSender(event, parameters[0]);
+    return requireNativeGamepadRuntime().snapshot();
+  });
+  ipcMain.handle(DESKTOP_CHANNELS.nativeGamepadSetClientState, (event, ...parameters: unknown[]) => {
+    if (parameters.length !== 2) {
+      throw new TypeError("Native gamepad client state requires its captured Document occurrence and one request.");
+    }
+    const owner = assertNativeGamepadSender(event, parameters[0]);
+    return requireNativeGamepadRuntime().setClientState(
+      owner,
+      parseDesktopNativeGamepadClientState(parameters[1])
+    );
+  });
+  ipcMain.handle(DESKTOP_CHANNELS.nativeGamepadProbe, (event, ...parameters: unknown[]) => {
+    if (parameters.length !== 1) {
+      throw new TypeError("Native gamepad probe requires its captured Document occurrence.");
+    }
+    assertNativeGamepadSender(event, parameters[0]);
+    return requireNativeGamepadRuntime().probe();
   });
   ipcMain.handle(DESKTOP_CHANNELS.dedicatedHardwareGetState, (event, ...parameters: unknown[]) => {
     assertDedicatedHardwareSender(event);
@@ -8749,6 +8800,20 @@ async function openExternalSafely(value: string): Promise<void> {
   await shell.openExternal(canonicalExternalUrl(value));
 }
 
+function initializeNativeGamepad(): void {
+  if (nativeGamepadRuntime !== undefined) return;
+  nativeGamepadRuntime = createNativeGamepadRuntime<NativeGamepadClientOwner>({
+    platform: process.platform,
+    architecture: process.arch,
+    directory: resolveNativeGamepadDirectory({
+      packaged: app.isPackaged,
+      resourcesPath: process.resourcesPath,
+      sourceDirectory
+    }),
+    onSnapshot: broadcastNativeGamepadSnapshot
+  });
+}
+
 async function initializeDedicatedHardwareInput(): Promise<void> {
   dedicatedHardwareTaskFocusFence.clear();
   dedicatedHardwareSystemVoiceController?.retire();
@@ -8906,6 +8971,14 @@ async function stopDedicatedHardwareForQuitHandoff(): Promise<void> {
   await controller?.dispose();
 }
 
+async function stopNativeGamepadForQuitHandoff(): Promise<void> {
+  await nativeGamepadRuntime?.stop();
+}
+
+function recoverNativeGamepadAfterQuitFailure(): void {
+  nativeGamepadRuntime?.recover();
+}
+
 async function recoverDedicatedHardwareAfterQuitFailure(): Promise<void> {
   if (quitting || dedicatedHardwareController !== undefined) return;
   await initializeDedicatedHardwareInput();
@@ -8944,6 +9017,69 @@ function requireDedicatedHardwareController(): DedicatedHardwareMainController<D
   return dedicatedHardwareController;
 }
 
+function requireNativeGamepadRuntime(): NativeGamepadRuntime<NativeGamepadClientOwner> {
+  if (nativeGamepadRuntime === undefined) throw new Error("Native gamepad runtime is unavailable.");
+  return nativeGamepadRuntime;
+}
+
+function broadcastNativeGamepadSnapshot(snapshot: DesktopNativeGamepadSnapshot): void {
+  const runtime = nativeGamepadRuntime;
+  if (runtime === undefined) return;
+  for (const client of runtime.clients()) {
+    const { endpoint: contents, occurrence } = client;
+    if (contents.isDestroyed() || !nativeGamepadDocuments.isCurrent(contents, occurrence)) continue;
+    const window = dedicatedHardwareWindowForContents(contents);
+    if (window === undefined || !isDedicatedHardwareActionWindowReady(window)) continue;
+    try { contents.send(DESKTOP_CHANNELS.nativeGamepadSnapshot, snapshot); } catch { /* Best effort. */ }
+  }
+}
+
+function installNativeGamepadWindowLifecycle(contents: WebContents): void {
+  if (nativeGamepadWindowLifecycles.has(contents)) return;
+  let retired = false;
+  const onProcessGone = (): void => retire();
+  const onDestroyed = (): void => retire();
+  const retire = (): void => {
+    if (retired) return;
+    retired = true;
+    contents.removeListener("render-process-gone", onProcessGone);
+    contents.removeListener("destroyed", onDestroyed);
+    if (nativeGamepadWindowLifecycles.get(contents)?.retire === retire) {
+      nativeGamepadWindowLifecycles.delete(contents);
+    }
+    nativeGamepadDocuments.retire(contents);
+  };
+  nativeGamepadWindowLifecycles.set(contents, { retire });
+  contents.once("render-process-gone", onProcessGone);
+  contents.once("destroyed", onDestroyed);
+}
+
+function captureNativeGamepadDocumentForSender(
+  event: Pick<IpcMainInvokeEvent, "sender" | "senderFrame">,
+  claim: string
+): string | undefined {
+  const window = nativeGamepadApplicationWindowForContents(event.sender);
+  if (window === undefined) return undefined;
+  if (!isTrustedDesktopIpcSender(event)) {
+    nativeGamepadDocuments.retire(event.sender);
+    return undefined;
+  }
+  installNativeGamepadWindowLifecycle(event.sender);
+  return nativeGamepadDocuments.capture(event.sender, claim).current.occurrence;
+}
+
+function assertNativeGamepadSender(
+  event: IpcMainInvokeEvent,
+  occurrence: unknown
+): NativeGamepadClientOwner {
+  assertTrustedIpcSender(event);
+  const owner = dedicatedHardwareWindowForContents(event.sender);
+  if (owner === undefined) {
+    throw new Error("Native gamepad IPC is restricted to an exact Joko application window.");
+  }
+  return nativeGamepadDocuments.requireCurrent(event.sender, occurrence);
+}
+
 function broadcastDedicatedHardwareState(state: DedicatedHardwareProjectedState): void {
   for (const window of dedicatedHardwareActionWindows()) {
     if (!isDedicatedHardwareActionWindowReady(window)) continue;
@@ -8970,6 +9106,16 @@ function dedicatedHardwareWindowForContents(contents: WebContents): BrowserWindo
   return sessionOwner !== undefined
     && sessionWindows.get(sessionWindowOwnerKey(sessionOwner)) === owner
     && isAllowedSessionWindowNavigation(contents.getURL(), sessionOwner.sessionId, navigationPolicy)
+    ? owner
+    : undefined;
+}
+
+function nativeGamepadApplicationWindowForContents(contents: WebContents): BrowserWindow | undefined {
+  const owner = BrowserWindow.fromWebContents(contents);
+  if (owner === null || owner.isDestroyed() || owner.webContents !== contents) return undefined;
+  if (owner === mainWindow) return owner;
+  const sessionOwner = sessionWindowOwnersByContents.get(contents);
+  return sessionOwner !== undefined && sessionWindows.get(sessionWindowOwnerKey(sessionOwner)) === owner
     ? owner
     : undefined;
 }

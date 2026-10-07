@@ -75,6 +75,9 @@ module.exports = async function auditPackaged(context) {
   } = await import(
     pathToFileURL(resolve(__dirname, "..", "dist", "runtime-staging.js")).href
   );
+  const { buildNativeGamepad } = await import(
+    pathToFileURL(resolve(__dirname, "build-native-gamepad.mjs")).href
+  );
   const targetArch = sqliteVecElectronBuilderArchitecture(context.arch);
   const sqliteVecTarget = sqliteVecRuntimeTarget(context.electronPlatformName, targetArch);
   const productFilename = context.packager.appInfo.productFilename;
@@ -86,6 +89,11 @@ module.exports = async function auditPackaged(context) {
   const nativeVoiceShortcutRoot = resolve(resourcesRoot, "native-voice-shortcut");
   const nativeSimulatorHidRoot = resolve(resourcesRoot, "native-simulator-hid");
   const nativeSimulatorH264Root = resolve(resourcesRoot, "native-simulator-h264");
+  buildNativeGamepad({
+    platform: context.electronPlatformName,
+    architecture: targetArch,
+    output: resolve(resourcesRoot, "native-gamepad")
+  });
   if (context.packager.config.electronVersion !== AUDITED_ELECTRON_VERSION) {
     throw new Error("The dedicated hardware SDK ABI audit is not pinned to the packaged Electron version.");
   }
@@ -117,6 +125,7 @@ module.exports = async function auditPackaged(context) {
   await auditNativeSystemFrontmostInput(resolve(resourcesRoot, "native-system-frontmost-input"),
     context.electronPlatformName, targetArch);
   await auditNativeHardware(resolve(resourcesRoot, "native-hardware"), context.electronPlatformName, targetArch);
+  await auditNativeGamepad(resolve(resourcesRoot, "native-gamepad"), context.electronPlatformName, targetArch);
   await auditNativeSimulatorHelper(nativeSimulatorHidRoot, context.electronPlatformName,
     targetArch, "Simulator HID", "joko-simulator-hid");
   await auditNativeSimulatorHelper(nativeSimulatorH264Root, context.electronPlatformName,
@@ -308,6 +317,7 @@ function isDedicatedHardwareSdkLock(value) {
 module.exports.auditDedicatedHardwareSdkDirectory = auditDedicatedHardwareSdkDirectory;
 module.exports.auditNativeSystemFrontmostInput = auditNativeSystemFrontmostInput;
 module.exports.auditNativeHardware = auditNativeHardware;
+module.exports.auditNativeGamepad = auditNativeGamepad;
 module.exports.createDedicatedHardwareSdkDirectoryIntegrity = createDedicatedHardwareSdkDirectoryIntegrity;
 module.exports.createDedicatedHardwareSdkManifestIntegrity = createDedicatedHardwareSdkManifestIntegrity;
 module.exports.dedicatedHardwareSdkHandshakeBytes = dedicatedHardwareSdkHandshakeBytes;
@@ -888,6 +898,42 @@ async function auditNativeHardware(root, platform, targetArch) {
       bytes.readUInt16LE(0) !== 0x5a4d || offset > bytes.length - 6 || bytes.readUInt32LE(offset) !== 0x4550 ||
       bytes.readUInt16LE(offset + 4) !== (targetArch === "arm64" ? 0xaa64 : 0x8664)) {
     throw new Error("The packaged native USB helper binary does not match its identity.");
+  }
+}
+
+async function auditNativeGamepad(root, platform, targetArch) {
+  const helper = platform === "darwin" ? "joko-macos-gamepad-helper" : null;
+  const expected = ["manifest.json", ...(helper === null ? [] : [helper])].sort();
+  const entries = await readdir(root, { withFileTypes: true }).catch(() => []);
+  const names = entries.map(entry => entry.name).sort();
+  if (names.length !== expected.length || names.some((name, index) => name !== expected[index])) {
+    throw new Error("The packaged native gamepad directory is incomplete or contains unexpected files.");
+  }
+  for (const entry of entries) {
+    await assertCanonicalRegularFile(resolve(root, entry.name), "The packaged native gamepad file is unsafe.");
+  }
+  const manifest = await readJsonManifest(resolve(root, "manifest.json"), "native gamepad");
+  if (Object.keys(manifest).sort().join(",") !== "architecture,helper,platform,protocolVersion,sha256" ||
+      manifest.platform !== platform || manifest.architecture !== targetArch || manifest.protocolVersion !== 1 ||
+      manifest.helper !== helper || (helper === null ? manifest.sha256 !== null :
+        typeof manifest.sha256 !== "string" || !/^[a-f0-9]{64}$/u.test(manifest.sha256))) {
+    throw new Error("The packaged native gamepad identity does not match the artifact target.");
+  }
+  if (helper === null) return;
+  if (!["x64", "arm64"].includes(targetArch)) {
+    throw new Error("The native gamepad helper architecture is unsupported.");
+  }
+  const path = resolve(root, helper);
+  const info = await lstat(path);
+  if (info.size < 32 || info.size > 16 * 1024 * 1024 ||
+      (process.platform !== "win32" && (info.mode & 0o111) === 0)) {
+    throw new Error("The packaged native gamepad helper binary does not match its identity.");
+  }
+  const bytes = await readFile(path);
+  if (createHash("sha256").update(bytes).digest("hex") !== manifest.sha256 ||
+      bytes.readUInt32LE(0) !== 0xfeedfacf ||
+      bytes.readUInt32LE(4) !== (targetArch === "arm64" ? 0x0100000c : 0x01000007)) {
+    throw new Error("The packaged native gamepad helper binary does not match its identity.");
   }
 }
 

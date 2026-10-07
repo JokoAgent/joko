@@ -40,6 +40,9 @@ import type {
   DesktopNativeTaskStatusSoundId,
   DesktopNativeTaskStatusSettings,
   DesktopNativeTaskStatusSnapshot,
+  DesktopNativeGamepadClientState,
+  DesktopNativeGamepadDevice,
+  DesktopNativeGamepadSnapshot,
   DesktopNotification,
   DesktopPageSearchRequest,
   DesktopPageSearchResult,
@@ -189,6 +192,11 @@ const DESKTOP_CHANNELS = {
   dedicatedHardwareStateChanged: "joko:hardware-input:state:changed",
   dedicatedHardwareAction: "joko:hardware-input:action",
   dedicatedHardwarePreviewInput: "joko:hardware-input:preview:input",
+  nativeGamepadCaptureDocument: "joko:native-gamepad:document:capture",
+  nativeGamepadGetSnapshot: "joko:native-gamepad:snapshot:get",
+  nativeGamepadSetClientState: "joko:native-gamepad:client-state:set",
+  nativeGamepadProbe: "joko:native-gamepad:probe",
+  nativeGamepadSnapshot: "joko:native-gamepad:snapshot",
   chooseFiles: "joko:files:choose",
   choosePortableSessionFile: "joko:portable-session:choose",
   deepLinkTakePending: "joko:deep-link:take-pending",
@@ -237,6 +245,12 @@ const mainDocumentOccurrenceValue: unknown = ipcRenderer.sendSync(
 const mainDocumentOccurrence = isDesktopDeepLinkOccurrence(mainDocumentOccurrenceValue)
   ? mainDocumentOccurrenceValue
   : undefined;
+const nativeGamepadDocumentOccurrenceValue: unknown = process.platform === "darwin"
+  ? ipcRenderer.sendSync(DESKTOP_CHANNELS.nativeGamepadCaptureDocument, mainDocumentPreloadClaim)
+  : undefined;
+const nativeGamepadDocumentOccurrence = isDesktopDeepLinkOccurrence(nativeGamepadDocumentOccurrenceValue)
+  ? nativeGamepadDocumentOccurrenceValue
+  : undefined;
 
 function createMainDocumentPreloadClaim(): string {
   if (typeof globalThis.crypto.randomUUID === "function") return globalThis.crypto.randomUUID();
@@ -263,6 +277,7 @@ const desktopCapabilities = Object.freeze([
   "files.open",
   "files.revealSource",
   "hardware.dedicatedInput",
+  ...(nativeGamepadDocumentOccurrence === undefined ? [] : ["hardware.nativeGamepad" as const]),
   "layout.reset",
   ...((process.platform === "win32" || process.platform === "linux") ? ["window.mainCloseBehavior" as const] : []),
   "microphone.lifecycle",
@@ -748,6 +763,45 @@ const desktopApi = Object.freeze({
       const wrapped = (_event: IpcRendererEvent, value: unknown): void => listener(value);
       ipcRenderer.on(DESKTOP_CHANNELS.dedicatedHardwarePreviewInput, wrapped);
       return () => ipcRenderer.removeListener(DESKTOP_CHANNELS.dedicatedHardwarePreviewInput, wrapped);
+    }
+  }),
+  nativeGamepad: Object.freeze({
+    getSnapshot: (): Promise<DesktopNativeGamepadSnapshot> => nativeGamepadDocumentOccurrence === undefined
+      ? Promise.reject(new Error("Native gamepad input is unavailable for this Document."))
+      : ipcRenderer.invoke(DESKTOP_CHANNELS.nativeGamepadGetSnapshot, nativeGamepadDocumentOccurrence)
+        .then(parseDesktopNativeGamepadSnapshot),
+    setClientState: (state: DesktopNativeGamepadClientState): Promise<DesktopNativeGamepadSnapshot> => {
+      let parsed: DesktopNativeGamepadClientState;
+      try {
+        parsed = parseDesktopNativeGamepadClientState(state);
+      } catch (error) {
+        return Promise.reject(error);
+      }
+      if (nativeGamepadDocumentOccurrence === undefined) {
+        return Promise.reject(new Error("Native gamepad input is unavailable for this Document."));
+      }
+      return ipcRenderer.invoke(
+        DESKTOP_CHANNELS.nativeGamepadSetClientState,
+        nativeGamepadDocumentOccurrence,
+        parsed
+      )
+        .then(parseDesktopNativeGamepadSnapshot);
+    },
+    probe: (): Promise<DesktopNativeGamepadSnapshot> => nativeGamepadDocumentOccurrence === undefined
+      ? Promise.reject(new Error("Native gamepad input is unavailable for this Document."))
+      : ipcRenderer.invoke(DESKTOP_CHANNELS.nativeGamepadProbe, nativeGamepadDocumentOccurrence)
+        .then(parseDesktopNativeGamepadSnapshot),
+    onSnapshot: (listener: (snapshot: DesktopNativeGamepadSnapshot) => void): (() => void) => {
+      if (typeof listener !== "function") throw new TypeError("Native gamepad snapshot listener must be a function.");
+      const wrapped = (_event: IpcRendererEvent, value: unknown): void => {
+        try {
+          listener(parseDesktopNativeGamepadSnapshot(value));
+        } catch {
+          // Ignore values that do not satisfy the exact Desktop bridge contract.
+        }
+      };
+      ipcRenderer.on(DESKTOP_CHANNELS.nativeGamepadSnapshot, wrapped);
+      return () => ipcRenderer.removeListener(DESKTOP_CHANNELS.nativeGamepadSnapshot, wrapped);
     }
   }),
   chooseFiles: (): Promise<readonly DesktopFile[]> => ipcRenderer.invoke(DESKTOP_CHANNELS.chooseFiles),
@@ -1743,8 +1797,91 @@ function isPortableExtensionLibraryPath(value: unknown): value is string {
 }
 
 function exactRecord(value: unknown, keys: readonly string[]): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value)
-    && Object.keys(value).sort().join(",") === [...keys].sort().join(",");
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const actual = Object.keys(value);
+  return actual.length === keys.length && keys.every((key) => Object.hasOwn(value, key));
+}
+
+function parseDesktopNativeGamepadClientState(value: unknown): DesktopNativeGamepadClientState {
+  if (!exactRecord(value, ["version", "enabled", "preview"]) || value["version"] !== 1 ||
+    typeof value["enabled"] !== "boolean" || typeof value["preview"] !== "boolean") {
+    throw new TypeError("Desktop native gamepad client state is invalid.");
+  }
+  return Object.freeze({ version: 1, enabled: value["enabled"], preview: value["preview"] });
+}
+
+function parseDesktopNativeGamepadSnapshot(value: unknown): DesktopNativeGamepadSnapshot {
+  if (!exactRecord(value, ["version", "revision", "status", "devices"]) || value["version"] !== 1 ||
+    !Number.isSafeInteger(value["revision"]) || (value["revision"] as number) < 0 ||
+    !isNativeGamepadStatus(value["status"]) || !Array.isArray(value["devices"]) || value["devices"].length > 4) {
+    throw new TypeError("Desktop native gamepad snapshot is invalid.");
+  }
+  const devices = value["devices"].map(parseDesktopNativeGamepadDevice);
+  if (new Set(devices.map((device) => device.family)).size !== devices.length) {
+    throw new TypeError("Desktop native gamepad snapshot is invalid.");
+  }
+  return Object.freeze({
+    version: 1,
+    revision: value["revision"] as number,
+    status: value["status"],
+    devices: Object.freeze(devices)
+  });
+}
+
+function parseDesktopNativeGamepadDevice(value: unknown): DesktopNativeGamepadDevice {
+  if (!exactRecord(value, [
+    "family", "name", "category", "transport", "batteryPercentage", "batteryState", "buttons", "axes"
+  ]) || !isNativeGamepadFamily(value["family"]) || !nativeGamepadText(value["name"]) ||
+    !nativeGamepadText(value["category"]) || !isNativeGamepadTransport(value["transport"]) ||
+    (value["batteryPercentage"] !== null && (typeof value["batteryPercentage"] !== "number" ||
+      !Number.isInteger(value["batteryPercentage"]) || value["batteryPercentage"] < 0 ||
+      value["batteryPercentage"] > 100)) || !isNativeGamepadBatteryState(value["batteryState"])) {
+    throw new TypeError("Desktop native gamepad device is invalid.");
+  }
+  return Object.freeze({
+    family: value["family"],
+    name: value["name"],
+    category: value["category"],
+    transport: value["transport"],
+    batteryPercentage: value["batteryPercentage"],
+    batteryState: value["batteryState"],
+    buttons: parseNativeGamepadValues(value["buttons"], 17, 0, 1),
+    axes: parseNativeGamepadValues(value["axes"], 4, -1, 1)
+  });
+}
+
+function parseNativeGamepadValues(
+  value: unknown,
+  length: number,
+  minimum: number,
+  maximum: number
+): readonly number[] {
+  if (!Array.isArray(value) || value.length !== length || !value.every((entry) =>
+    typeof entry === "number" && Number.isFinite(entry) && entry >= minimum && entry <= maximum)) {
+    throw new TypeError("Desktop native gamepad input values are invalid.");
+  }
+  return Object.freeze([...value] as number[]);
+}
+
+function nativeGamepadText(value: unknown): value is string | null {
+  return value === null || (typeof value === "string" && value.length <= 512 && !/[\u0000-\u001f\u007f]/u.test(value));
+}
+
+function isNativeGamepadFamily(value: unknown): value is DesktopNativeGamepadDevice["family"] {
+  return value === "xbox" || value === "playstation" || value === "nintendo" || value === "generic";
+}
+
+function isNativeGamepadTransport(value: unknown): value is DesktopNativeGamepadDevice["transport"] {
+  return value === "usb" || value === "bluetooth" || value === "unknown";
+}
+
+function isNativeGamepadBatteryState(value: unknown): value is DesktopNativeGamepadDevice["batteryState"] {
+  return value === "unknown" || value === "discharging" || value === "charging" || value === "full";
+}
+
+function isNativeGamepadStatus(value: unknown): value is DesktopNativeGamepadSnapshot["status"] {
+  return value === "idle" || value === "starting" || value === "waiting" || value === "connected" ||
+    value === "unavailable" || value === "error";
 }
 
 function parseDesktopWindowInteractionSettings(value: unknown): DesktopWindowInteractionSettings {

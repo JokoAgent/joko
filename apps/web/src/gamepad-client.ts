@@ -3,6 +3,10 @@ import {
   GamepadInputEngine, readGamepadPreferences, subscribeGamepadPreferences,
   type GamepadAction, type GamepadDeviceInfo, type GamepadInputEffect
 } from "./gamepad-input.js";
+import {
+  nativeGamepadSamples, parseNativeGamepadSnapshot,
+  type NativeGamepadBridge, type NativeGamepadClientState, type NativeGamepadSnapshot
+} from "./native-gamepad.js";
 import { isStartupUpdateInteractionBlocked } from "./startup-update-interaction.js";
 import { currentGamepadTaskRoot, dispatchGamepadOwnedAction, isGamepadInspectorAction, isGamepadOwnedAction } from "./gamepad-actions.js";
 import { dispatchAppInputFocusedCommand } from "./app-input-owners.js";
@@ -11,6 +15,7 @@ export type GamepadClientStatus = "disabled" | "waiting" | "connected" | "unsupp
 export interface GamepadClientSnapshot {
   readonly status: GamepadClientStatus;
   readonly devices: readonly GamepadDeviceInfo[];
+  readonly nativeFallback?: "unavailable" | "error";
 }
 const clients = new WeakMap<Window, GamepadClient>();
 
@@ -23,6 +28,20 @@ export class GamepadClient {
   private emit: ((effect: GamepadInputEffect) => void) | undefined;
   private composing = false;
   private stopped = true;
+  private generation = 0;
+  private pageActive = true;
+  private inputSource: "native" | "browser" | undefined;
+  private nativeSnapshot: NativeGamepadSnapshot | undefined;
+  private nativeFallback: "unavailable" | "error" | undefined;
+  private nativeInterest: string | undefined;
+  private nativeInterestState: NativeGamepadClientState | undefined;
+  private nativeInterestFailed = false;
+  private nativeInterestPending = false;
+  private nativeInterestRetryAt = 0;
+  private nativeInterestRetryDelay = 250;
+  private nativeInterestRetryTimer: number | undefined;
+  private nativeInterestRequest = 0;
+  private nativeUnsubscribe: (() => void) | undefined;
   constructor(private readonly host: Window) {}
   getSnapshot = (): GamepadClientSnapshot => this.snapshot;
   subscribe = (listener: () => void): (() => void) => {
@@ -38,11 +57,124 @@ export class GamepadClient {
     this.snapshot = next;
     for (const listener of this.listeners) { try { listener(); } catch { /* An observer cannot own the sampler. */ } }
   }
+  private hasNativeCapability(): boolean {
+    return this.host.jokoDesktop?.capabilities.includes("hardware.nativeGamepad") === true;
+  }
+  private nativeBridge(): NativeGamepadBridge | undefined {
+    return this.hasNativeCapability() ? this.host.jokoDesktop?.nativeGamepad : undefined;
+  }
+  private selectInputSource(source: "native" | "browser"): void {
+    if (this.inputSource === source) return;
+    this.reset();
+    this.inputSource = source;
+  }
+  private failNative(generation: number): void {
+    if (this.stopped || generation !== this.generation) return;
+    this.nativeFallback = "error";
+    this.sample(this.host.performance.now());
+  }
+  private acceptNative(value: unknown, generation: number): boolean {
+    const parsed = parseNativeGamepadSnapshot(value);
+    if (this.stopped || generation !== this.generation) return parsed !== undefined;
+    if (parsed === undefined) { this.failNative(generation); return false; }
+    if (this.nativeSnapshot !== undefined && parsed.revision < this.nativeSnapshot.revision) return true;
+    this.nativeSnapshot = parsed;
+    this.nativeFallback = parsed.status === "unavailable" || parsed.status === "error" ? parsed.status : undefined;
+    this.sample(this.host.performance.now());
+    return true;
+  }
+  private invokeNative(request: () => Promise<unknown>, generation: number): void {
+    try {
+      void Promise.resolve(request()).then((value) => this.acceptNative(value, generation), () => this.failNative(generation));
+    } catch { this.failNative(generation); }
+  }
+  private clearNativeInterestRetry(): void {
+    if (this.nativeInterestRetryTimer === undefined) return;
+    this.host.clearTimeout(this.nativeInterestRetryTimer);
+    this.nativeInterestRetryTimer = undefined;
+  }
+  private setNativeClientState(state: NativeGamepadClientState, generation: number, force = false): void {
+    const bridge = this.nativeBridge();
+    if (bridge === undefined) return;
+    const identity = `${state.enabled ? 1 : 0}:${state.preview ? 1 : 0}`;
+    const now = this.host.performance.now();
+    if (!force && identity === this.nativeInterest
+      && (this.nativeInterestPending || !this.nativeInterestFailed || now < this.nativeInterestRetryAt)) return;
+    if (identity !== this.nativeInterest) {
+      this.clearNativeInterestRetry();
+      this.nativeInterestFailed = false;
+      this.nativeInterestRetryDelay = 250;
+    } else if (force) {
+      this.clearNativeInterestRetry();
+    }
+    this.nativeInterest = identity;
+    this.nativeInterestState = state;
+    this.nativeInterestPending = true;
+    const request = ++this.nativeInterestRequest;
+    let response: Promise<unknown>;
+    try { response = bridge.setClientState(state); }
+    catch { this.nativeClientStateFailed(identity, generation, request); return; }
+    void Promise.resolve(response).then((value) => {
+      if (!this.stopped && generation === this.generation && this.nativeInterest === identity && this.nativeInterestRequest === request) {
+        this.clearNativeInterestRetry();
+        this.nativeInterestPending = false;
+        this.nativeInterestFailed = false;
+        this.nativeInterestRetryAt = 0;
+        this.nativeInterestRetryDelay = 250;
+      }
+      if (!this.acceptNative(value, generation)) { this.nativeClientStateFailed(identity, generation, request); return; }
+      if (!this.stopped && generation === this.generation && this.nativeInterest === identity && this.nativeInterestRequest === request) {
+        this.sample(this.host.performance.now());
+      }
+    }, () => this.nativeClientStateFailed(identity, generation, request));
+  }
+  private nativeClientStateFailed(identity: string, generation: number, request: number): void {
+    if (this.stopped || generation !== this.generation || this.nativeInterest !== identity || this.nativeInterestRequest !== request) return;
+    this.nativeInterestPending = false;
+    this.nativeInterestFailed = true;
+    const delay = this.nativeInterestRetryDelay;
+    this.nativeInterestRetryAt = this.host.performance.now() + delay;
+    this.nativeInterestRetryDelay = Math.min(4_000, this.nativeInterestRetryDelay * 2);
+    this.clearNativeInterestRetry();
+    this.nativeInterestRetryTimer = this.host.setTimeout(() => {
+      this.nativeInterestRetryTimer = undefined;
+      if (this.stopped || generation !== this.generation || this.nativeInterest !== identity || !this.nativeInterestFailed) return;
+      const desired = this.nativeInterestState;
+      if (desired !== undefined) this.setNativeClientState(desired, generation, true);
+    }, delay);
+    this.failNative(generation);
+  }
+  async probe(): Promise<void> {
+    this.reset();
+    const bridge = this.nativeBridge();
+    if (bridge === undefined) { this.sample(this.host.performance.now()); return; }
+    const generation = this.generation;
+    try {
+      const value = await bridge.probe();
+      const retryInterest = this.nativeInterestFailed;
+      if (retryInterest) this.clearNativeInterestRetry();
+      this.nativeInterestRetryAt = 0;
+      if (this.acceptNative(value, generation) && retryInterest && this.nativeInterestFailed) this.sample(this.host.performance.now());
+    }
+    catch { this.failNative(generation); }
+  }
   start(emit: (effect: GamepadInputEffect) => void): () => void {
     if (!this.stopped) throw new Error("The document already owns a gamepad sampler.");
     this.emit = emit;
     this.stopped = false;
     this.composing = false;
+    this.pageActive = true;
+    this.inputSource = undefined;
+    this.nativeSnapshot = undefined;
+    this.nativeFallback = this.hasNativeCapability() && this.nativeBridge() === undefined ? "error" : undefined;
+    this.nativeInterest = undefined;
+    this.nativeInterestState = undefined;
+    this.nativeInterestFailed = false;
+    this.nativeInterestPending = false;
+    this.nativeInterestRetryAt = 0;
+    this.nativeInterestRetryDelay = 250;
+    this.clearNativeInterestRetry();
+    const generation = ++this.generation;
     const tick = (now: number): void => {
       if (this.stopped) return;
       this.sample(now);
@@ -51,9 +183,22 @@ export class GamepadClient {
     const cancel = (): void => this.reset();
     const compose = (): void => { this.composing = true; cancel(); };
     const composed = (): void => { this.composing = false; cancel(); };
+    const hidden = (): void => {
+      this.pageActive = false;
+      cancel();
+      this.setNativeClientState({ version: 1, enabled: false, preview: false }, generation, true);
+    };
+    const shown = (): void => { this.pageActive = true; this.sample(this.host.performance.now()); };
     const changed = subscribeGamepadPreferences(() => { cancel(); this.sample(this.host.performance.now()); }, this.host);
+    const bridge = this.nativeBridge();
+    if (bridge !== undefined) {
+      try { this.nativeUnsubscribe = bridge.onSnapshot((value) => this.acceptNative(value, generation)); }
+      catch { this.failNative(generation); }
+      this.invokeNative(() => bridge.getSnapshot(), generation);
+    }
     this.host.addEventListener("blur", cancel);
-    this.host.addEventListener("pagehide", cancel);
+    this.host.addEventListener("pagehide", hidden);
+    this.host.addEventListener("pageshow", shown);
     this.host.addEventListener("gamepaddisconnected", cancel);
     this.host.document.addEventListener("visibilitychange", cancel);
     this.host.document.addEventListener("compositionstart", compose, true);
@@ -64,13 +209,19 @@ export class GamepadClient {
     return () => {
       if (closed) return;
       closed = true;
+      this.setNativeClientState({ version: 1, enabled: false, preview: false }, generation, true);
       this.stopped = true;
+      this.generation += 1;
+      this.clearNativeInterestRetry();
       this.composing = false;
       if (this.frame !== undefined) this.host.cancelAnimationFrame(this.frame);
       this.reset(); this.emit = undefined;
+      try { this.nativeUnsubscribe?.(); } catch { /* A bridge listener cannot retain this Document. */ }
+      this.nativeUnsubscribe = undefined;
       changed();
       this.host.removeEventListener("blur", cancel);
-      this.host.removeEventListener("pagehide", cancel);
+      this.host.removeEventListener("pagehide", hidden);
+      this.host.removeEventListener("pageshow", shown);
       this.host.removeEventListener("gamepaddisconnected", cancel);
       this.host.document.removeEventListener("visibilitychange", cancel);
       this.host.document.removeEventListener("compositionstart", compose, true);
@@ -81,33 +232,58 @@ export class GamepadClient {
     const doc = this.host.document;
     let storage: Storage;
     try { storage = this.host.localStorage; }
-    catch { this.reset(); this.publish({ status: "error", devices: [] }); return; }
+    catch {
+      this.setNativeClientState({ version: 1, enabled: false, preview: false }, this.generation);
+      this.reset(); this.publish({ status: "error", devices: [], ...(this.nativeFallback === undefined ? {} : { nativeFallback: this.nativeFallback }) }); return;
+    }
     try {
       const preference = readGamepadPreferences(storage);
       if (preference.error !== undefined) {
-        this.reset(); this.publish({ status: "error", devices: [] }); return;
+        this.setNativeClientState({ version: 1, enabled: false, preview: false }, this.generation);
+        this.reset(); this.publish({ status: "error", devices: [], ...(this.nativeFallback === undefined ? {} : { nativeFallback: this.nativeFallback }) }); return;
       }
-      if (typeof this.host.navigator.getGamepads !== "function") {
-        this.reset(); this.publish({ status: "unsupported", devices: [] }); return;
+      const preview = doc.querySelector("[data-gamepad-preview]") !== null;
+      this.setNativeClientState({
+        version: 1,
+        enabled: this.pageActive && preference.preferences.enabled,
+        preview: this.pageActive && preview
+      }, this.generation);
+      const bridge = this.nativeBridge();
+      const nativeFallback = this.hasNativeCapability()
+        ? (this.nativeInterestFailed ? "error" : this.nativeFallback ?? (bridge === undefined ? "error" : undefined))
+        : undefined;
+      const useNative = bridge !== undefined && nativeFallback === undefined;
+      this.selectInputSource(useNative ? "native" : "browser");
+      if (!useNative && typeof this.host.navigator.getGamepads !== "function") {
+        this.reset(); this.publish({ status: "unsupported", devices: [], ...(nativeFallback === undefined ? {} : { nativeFallback }) }); return;
       }
+      const pads = useNative
+        ? this.nativeSnapshot === undefined ? [] : nativeGamepadSamples(this.nativeSnapshot)
+        : Array.from(this.host.navigator.getGamepads()).filter((pad): pad is Gamepad => pad !== null);
       const result = this.engine.sample({
-        pads: Array.from(this.host.navigator.getGamepads()).filter((pad): pad is Gamepad => pad !== null),
+        pads,
         preferences: preference.preferences, now,
-        active: doc.visibilityState === "visible" && doc.hasFocus() && !this.composing
+        active: this.pageActive && doc.visibilityState === "visible" && doc.hasFocus() && !this.composing
           && doc.body.dataset.appShortcutRecording !== "1" && !isStartupUpdateInteractionBlocked(),
-        preview: doc.querySelector("[data-gamepad-preview]") !== null
+        preview
       });
       for (const effect of result.effects) {
-        if (!this.deliver(effect)) { this.reset(); this.publish({ status: "error", devices: result.devices }); return; }
+        if (!this.deliver(effect)) {
+          this.reset(); this.publish({ status: "error", devices: result.devices, ...(nativeFallback === undefined ? {} : { nativeFallback }) }); return;
+        }
       }
       this.publish({
         devices: result.devices,
         status: !preference.preferences.enabled ? "disabled" : result.devices.length === 0 ? "waiting"
-          : result.devices.some((device) => device.supported) ? "connected" : "unsupported"
+          : result.devices.some((device) => device.supported) ? "connected" : "unsupported",
+        ...(nativeFallback === undefined ? {} : { nativeFallback })
       });
     } catch (error) {
       this.reset();
-      this.publish({ status: error !== null && typeof error === "object" && "name" in error && error.name === "SecurityError" ? "denied" : "error", devices: [] });
+      this.publish({
+        status: error !== null && typeof error === "object" && "name" in error && error.name === "SecurityError" ? "denied" : "error",
+        devices: [], ...(this.nativeFallback === undefined ? {} : { nativeFallback: this.nativeFallback })
+      });
     }
   }
 }

@@ -41,6 +41,9 @@ const tsconfig = JSON.parse(readFileSync(new URL("../tsconfig.json", import.meta
 const config = JSON.parse(readFileSync(new URL("../electron-builder.json", import.meta.url), "utf8")) as BuilderConfig;
 const workspace = readFileSync(new URL("../../../pnpm-workspace.yaml", import.meta.url), "utf8");
 const packagedAudit = readFileSync(new URL("../scripts/audit-packaged.cjs", import.meta.url), "utf8");
+const nativeGamepadBuild = readFileSync(new URL("../scripts/build-native-gamepad.mjs", import.meta.url), "utf8");
+const nativeGamepadSwift = readFileSync(new URL("../native/gamepad/macos-gamepad-helper.swift", import.meta.url), "utf8");
+const nativeGamepadSwitch2 = readFileSync(new URL("../native/gamepad/switch2_usb.c", import.meta.url), "utf8");
 const packagedSmoke = readFileSync(new URL("../scripts/smoke-packaged.mjs", import.meta.url), "utf8");
 const packagedSmokeHelpers = readFileSync(new URL("../scripts/smoke-packaged-helpers.mjs", import.meta.url), "utf8");
 const desktopMain = readFileSync(new URL("../src/main.ts", import.meta.url), "utf8");
@@ -104,6 +107,7 @@ describe("Desktop distribution", () => {
       { from: "dist/native-voice-shortcut", to: "native-voice-shortcut" },
       { from: "dist/native-system-frontmost-input", to: "native-system-frontmost-input" },
       { from: "dist/native-hardware", to: "native-hardware" },
+      { from: "dist/native-gamepad", to: "native-gamepad" },
       { from: "dist/native-simulator-hid", to: "native-simulator-hid" },
       { from: "dist/native-simulator-h264", to: "native-simulator-h264" },
       { from: "dist/orchestrator-runtime", to: "orchestrator-runtime" },
@@ -114,6 +118,9 @@ describe("Desktop distribution", () => {
     ]);
     expect(config.extraResources.find(item => item.to === "native-simulator-hid")?.filter).toEqual([
       "manifest.json", "joko-simulator-hid"
+    ]);
+    expect(config.extraResources.find(item => item.to === "native-gamepad")?.filter).toEqual([
+      "manifest.json", "joko-macos-gamepad-helper"
     ]);
     expect(config.extraResources.find(item => item.to === "native-simulator-h264")?.filter).toEqual([
       "manifest.json", "joko-simulator-h264"
@@ -129,6 +136,111 @@ describe("Desktop distribution", () => {
             "!**/{.env,.env.*,*.db,*.db-shm,*.db-wal,*.log}"]) })
       ]));
     expect(config.afterPack).toBe("scripts/audit-packaged.cjs");
+  });
+
+  it("builds and packages the fixed macOS native gamepad target without claiming other platforms", () => {
+    expect(manifest.scripts?.["build:native-gamepad"]).toBe("node scripts/build-native-gamepad.mjs");
+    expect(manifest.scripts?.build).toContain("pnpm build:native-gamepad");
+    expect(manifest.scripts?.["package:dir"]).toContain("node scripts/build-native-gamepad.mjs");
+    expect(manifest.scripts?.["package:artifacts"]).toContain("node scripts/build-native-gamepad.mjs");
+    expect(nativeGamepadBuild).toContain('const helper = "joko-macos-gamepad-helper"');
+    expect(nativeGamepadBuild).toContain('x64: { compilerArchitecture: "x86_64", triple: "x86_64-apple-macos11.0" }');
+    expect(nativeGamepadBuild).toContain('arm64: { compilerArchitecture: "arm64", triple: "arm64-apple-macos11.0" }');
+    expect(nativeGamepadBuild).toContain('"GameController"');
+    expect(nativeGamepadBuild).toContain('"IOKit"');
+    expect(nativeGamepadBuild).toContain("assertMachOArchitecture(bytes, architecture)");
+    expect(nativeGamepadBuild).toContain("export function buildNativeGamepad(");
+    expect(packagedAudit).toContain("buildNativeGamepad({");
+    expect(packagedAudit).toContain("architecture: targetArch");
+    expect(packagedAudit).toContain('output: resolve(resourcesRoot, "native-gamepad")');
+    expect(nativeGamepadSwift).toContain("GCController.shouldMonitorBackgroundEvents = true");
+    expect(nativeGamepadSwift).toContain('trimmed == "switch2-usb on"');
+    expect(nativeGamepadSwitch2).toContain("#define NINTENDO_VID 0x057E");
+    expect(nativeGamepadSwitch2).toContain("#define SWITCH2_PRO_PID 0x2069");
+    expect(nativeGamepadSwitch2).toContain("#define SWITCH2_IFACE 1");
+    expect(nativeGamepadSwitch2).toContain("static atomic_bool g_stop = ATOMIC_VAR_INIT(false)");
+    expect(nativeGamepadSwitch2).toContain("atomic_load_explicit(&g_stop, memory_order_acquire)");
+    expect(nativeGamepadSwitch2).toContain("atomic_store_explicit(&g_stop, true, memory_order_release)");
+
+    const replacement = nativeGamepadSwift.slice(
+      nativeGamepadSwift.indexOf("if observed[family] !== controller"),
+      nativeGamepadSwift.indexOf("emitPresence(from: controller, family: family)")
+    );
+    expect(replacement).toContain("previous.extendedGamepad?.valueChangedHandler = nil");
+    expect(replacement).toContain('lastPresenceSignature[family] = "absent"');
+    expect(replacement).toContain('emit(["kind": "presence", "present": false, "family": family])');
+    expect(replacement.indexOf('"present": false')).toBeLessThan(replacement.indexOf("observed[family] = controller"));
+    expect(replacement.indexOf("observed[family] = controller")).toBeLessThan(replacement.indexOf("attach(controller)"));
+    expect(replacement).toContain('else if family == "nintendo" && nintendoUsesSwitch2Usb');
+
+    const missingController = nativeGamepadSwift.slice(
+      nativeGamepadSwift.indexOf("guard let controller = next[family] else"),
+      nativeGamepadSwift.indexOf("if observed[family] !== controller")
+    );
+    expect(missingController).toContain("let previous = observed[family]");
+    expect(missingController).toContain("previous?.extendedGamepad?.valueChangedHandler = nil");
+    expect(missingController.indexOf("previous?.extendedGamepad?.valueChangedHandler = nil"))
+      .toBeLessThan(missingController.indexOf('if family == "nintendo"'));
+    expect(missingController).toContain("if previous != nil || lastPresenceSignature[family] != \"absent\"");
+    expect(missingController.indexOf('"present": false'))
+      .toBeLessThan(missingController.indexOf("if switch2UsbWanted"));
+
+    const switch2Emission = nativeGamepadSwift.slice(
+      nativeGamepadSwift.indexOf("private func emitSwitch2("),
+      nativeGamepadSwift.indexOf("private func attach(")
+    );
+    expect(switch2Emission).toContain("if !nintendoUsesSwitch2Usb,");
+    expect(switch2Emission.indexOf('"present": false'))
+      .toBeLessThan(switch2Emission.indexOf("nintendoUsesSwitch2Usb = true"));
+
+    const packagedGamepadAudit = packagedAudit.slice(
+      packagedAudit.indexOf("async function auditNativeGamepad("),
+      packagedAudit.indexOf("async function auditNativeVoiceShortcut(")
+    );
+    expect(packagedGamepadAudit.indexOf("info.size < 32"))
+      .toBeLessThan(packagedGamepadAudit.indexOf("const bytes = await readFile(path)"));
+  });
+
+  it("binds native gamepad ownership to preload occurrences and the shared complete-exit barrier", () => {
+    const ipcRegistration = desktopMain.slice(
+      desktopMain.indexOf("function registerIpc(): void"),
+      desktopMain.indexOf("function initializeNativeGamepad(): void")
+    );
+    expect(ipcRegistration).toContain("DESKTOP_CHANNELS.nativeGamepadCaptureDocument");
+    expect(ipcRegistration).toContain("captureNativeGamepadDocumentForSender(event, parameters[0])");
+    expect(ipcRegistration).toContain("assertNativeGamepadSender(event, parameters[0])");
+
+    const nativeGamepadOwnership = desktopMain.slice(
+      desktopMain.indexOf("function broadcastNativeGamepadSnapshot"),
+      desktopMain.indexOf("function broadcastDedicatedHardwareState")
+    );
+    expect(nativeGamepadOwnership).toContain("nativeGamepadDocuments.isCurrent(contents, occurrence)");
+    expect(nativeGamepadOwnership).toContain("nativeGamepadDocuments.capture(event.sender, claim)");
+    expect(nativeGamepadOwnership).toContain("nativeGamepadDocuments.requireCurrent(event.sender, occurrence)");
+    expect(nativeGamepadOwnership).toContain("const window = nativeGamepadApplicationWindowForContents(event.sender)");
+    expect(nativeGamepadOwnership).toContain("if (window === undefined) return undefined;");
+    const rejectedApplicationPreload = nativeGamepadOwnership.slice(
+      nativeGamepadOwnership.indexOf("if (!isTrustedDesktopIpcSender(event)) {"),
+      nativeGamepadOwnership.indexOf("installNativeGamepadWindowLifecycle(event.sender)")
+    );
+    expect(rejectedApplicationPreload).toContain("nativeGamepadDocuments.retire(event.sender)");
+    expect(rejectedApplicationPreload.indexOf("nativeGamepadDocuments.retire(event.sender)"))
+      .toBeLessThan(rejectedApplicationPreload.indexOf("return undefined"));
+    expect(nativeGamepadOwnership).not.toContain("did-frame-navigate");
+
+    const completeExit = desktopMain.slice(
+      desktopMain.indexOf("async function stopManagedOrchestratorForCompleteExit"),
+      desktopMain.indexOf("function subscribeDesktopQuitBlocked")
+    );
+    expect(completeExit).toContain("stopNativeGamepadForQuitHandoff");
+    expect(completeExit).toContain("recoverNativeGamepadAfterQuitFailure()");
+
+    const willQuit = desktopMain.slice(
+      desktopMain.indexOf('app.on("will-quit"'),
+      desktopMain.indexOf("// Do not top-level await Electron readiness")
+    );
+    expect(willQuit).not.toContain("nativeGamepadRuntime = undefined");
+    expect(willQuit).not.toContain("gamepadRuntime?.dispose()");
   });
 
   it("compiles, packages, audits, and smoke-checks the isolated hardware utility entry", () => {

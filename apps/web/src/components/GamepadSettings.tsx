@@ -81,17 +81,27 @@ export function GamepadSettings({ t, listSkills, serverId, connected }: {
     </div>
     <p role="status" aria-live="polite">{t(`settings.gamepad.status.${snapshot.status}`)}</p>
     <p className="muted">{t("settings.gamepad.preview")}</p>
+    {snapshot.nativeFallback !== undefined && <ErrorBanner message={t(`settings.gamepad.nativeFallback.${snapshot.nativeFallback}`)} />}
     {stored.error !== undefined && <ErrorBanner message={t(`settings.gamepad.storage.${stored.error}`)} />}
     {failed && <ErrorBanner message={t("settings.gamepad.saveFailed")} />}
     {skillCatalog.state === "error" && connected && <ErrorBanner message={t("settings.gamepad.skillsFailed")} />}
     <div className="gamepad-settings__feedback" role="status" aria-live="polite">{notice === undefined ? "" : t(`settings.gamepad.${notice}`)}</div>
     <div className="gamepad-settings__devices">
       {snapshot.devices.length === 0 ? <p className="muted">{t("settings.gamepad.noDevice")}</p> : snapshot.devices.map((device) => <p key={device.index}>
-        <strong>{device.id}</strong><span>{t(device.supported ? "settings.gamepad.standard" : "settings.gamepad.nonstandard")}</span>
+        <strong>{device.source === "native" ? device.name ?? device.id : device.id}</strong>
+        {device.source === "native" && <>
+          <span>{device.category === null ? "" : `${device.category} · `}{t(`settings.gamepad.family.${device.family}`)} · {t(`settings.gamepad.transport.${device.transport}`)}</span>
+          <span>{device.batteryPercentage === null
+            ? device.batteryState === "unknown"
+              ? t("settings.gamepad.battery.unknown")
+              : t("settings.gamepad.battery.stateOnly", { state: t(`settings.gamepad.batteryState.${device.batteryState}`) })
+            : t("settings.gamepad.battery.percent", { percent: device.batteryPercentage, state: t(`settings.gamepad.batteryState.${device.batteryState}`) })}</span>
+        </>}
+        <span>{t(device.supported ? "settings.gamepad.standard" : "settings.gamepad.nonstandard")}</span>
       </p>)}
     </div>
     <div className="gamepad-settings__actions">
-      <Button tone="ghost" onClick={() => { gamepadClient().reset(); gamepadClient().sample(performance.now()); setStored(readGamepadPreferences()); setSkillReload((current) => current + 1); }}>{t("settings.gamepad.refresh")}</Button>
+      <Button tone="ghost" onClick={() => { void gamepadClient().probe(); setStored(readGamepadPreferences()); setSkillReload((current) => current + 1); }}>{t("settings.gamepad.refresh")}</Button>
       <Button tone="ghost" onClick={() => save({ ...createDefaultGamepadPreferences(), enabled: settings.enabled }, true)}>{t("settings.gamepad.restore")}</Button>
     </div>
     <h3>{t("settings.gamepad.buttons")}</h3>

@@ -132,8 +132,20 @@ export function subscribeGamepadPreferences(listener: (result: GamepadPreference
   };
 }
 
-export type GamepadSample = Pick<Gamepad, "index" | "id" | "mapping" | "connected" | "buttons" | "axes">;
-export interface GamepadDeviceInfo {
+export type GamepadDeviceFamily = "xbox" | "playstation" | "nintendo" | "generic";
+export type GamepadDeviceTransport = "usb" | "bluetooth" | "unknown";
+export type GamepadDeviceBatteryState = "unknown" | "discharging" | "charging" | "full";
+type GamepadSampleBase = Pick<Gamepad, "index" | "id" | "mapping" | "connected" | "buttons" | "axes">;
+export type GamepadSample = GamepadSampleBase & ({ readonly source?: undefined } | {
+  readonly source: "native";
+  readonly family: GamepadDeviceFamily;
+  readonly name: string | null;
+  readonly category: string | null;
+  readonly transport: GamepadDeviceTransport;
+  readonly batteryPercentage: number | null;
+  readonly batteryState: GamepadDeviceBatteryState;
+});
+interface GamepadDeviceInfoBase {
   readonly index: number;
   readonly id: string;
   readonly mapping: string;
@@ -141,6 +153,15 @@ export interface GamepadDeviceInfo {
   readonly buttons: readonly boolean[];
   readonly axes: readonly number[];
 }
+export type GamepadDeviceInfo = GamepadDeviceInfoBase & ({ readonly source: "browser" } | {
+  readonly source: "native";
+  readonly family: GamepadDeviceFamily;
+  readonly name: string | null;
+  readonly category: string | null;
+  readonly transport: GamepadDeviceTransport;
+  readonly batteryPercentage: number | null;
+  readonly batteryState: GamepadDeviceBatteryState;
+});
 export type GamepadInputEffect =
   | { readonly kind: "action"; readonly action: Exclude<GamepadAction, "none">; readonly phase: "press" | "release" | "cancel" }
   | { readonly kind: "skill"; readonly binding: GamepadSkillBinding }
@@ -284,10 +305,14 @@ function deviceInfo(pad: GamepadSample): GamepadDeviceInfo {
   const valid = pad.buttons.length >= 17 && pad.axes.length >= 4
     && Array.from(pad.buttons.slice(0, 17)).every((button) => button !== undefined && typeof button.pressed === "boolean" && Number.isFinite(button.value) && button.value >= 0 && button.value <= 1)
     && Array.from(pad.axes.slice(0, 4)).every((axis) => Number.isFinite(axis) && axis >= -1 && axis <= 1);
-  return {
+  const base: GamepadDeviceInfoBase = {
     index: pad.index, id: pad.id.slice(0, 512), mapping: pad.mapping,
     supported: pad.mapping === "standard" && valid,
     buttons: Array.from({ length: 17 }, (_, index) => pad.buttons[index]?.pressed === true || (pad.buttons[index]?.value ?? 0) >= 0.55),
     axes: Array.from({ length: 4 }, (_, index) => Number.isFinite(pad.axes[index]) ? Math.max(-1, Math.min(1, pad.axes[index]!)) : 0)
   };
+  return pad.source === "native" ? {
+    ...base, source: "native", family: pad.family, name: pad.name, category: pad.category, transport: pad.transport,
+    batteryPercentage: pad.batteryPercentage, batteryState: pad.batteryState
+  } : { ...base, source: "browser" };
 }

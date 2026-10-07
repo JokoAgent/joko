@@ -214,6 +214,7 @@ type JokoDesktopCapability =
   | "files.open"
   | "files.revealSource"
   | "hardware.dedicatedInput"
+  | "hardware.nativeGamepad"
   | "app.info"
   | "app.update"
   | "attention.badge"
@@ -585,6 +586,7 @@ interface JokoDesktopApi {
     onCommand(listener: (command: JokoDesktopGlobalVoiceCommand) => void): () => void;
   };
   readonly dedicatedHardware: import("./dedicated-hardware.js").DedicatedHardwareBridge;
+  readonly nativeGamepad?: import("./native-gamepad.js").NativeGamepadBridge;
   chooseFiles(): Promise<readonly JokoDesktopFile[]>;
   choosePortableSessionFile(): Promise<JokoDesktopFile | undefined>;
   readonly deepLinks: {

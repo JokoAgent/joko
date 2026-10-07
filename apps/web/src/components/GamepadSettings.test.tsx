@@ -10,17 +10,24 @@ import {
   createDefaultGamepadPreferences, GAMEPAD_PREFERENCES_KEY, readGamepadPreferences,
   type GamepadPreferences
 } from "../gamepad-input.js";
+import type { GamepadClientSnapshot } from "../gamepad-client.js";
 import { GamepadSettings } from "./GamepadSettings.js";
 
+const gamepadMock = vi.hoisted(() => ({
+  probe: vi.fn(async () => {}),
+  snapshot: { status: "disabled", devices: [] } as GamepadClientSnapshot
+}));
 vi.mock("../gamepad-client.js", () => ({
-  gamepadClient: () => ({ reset() {}, sample() {} }),
-  useGamepadSnapshot: () => ({ status: "disabled", devices: [] })
+  gamepadClient: () => ({ reset() {}, sample() {}, probe: gamepadMock.probe }),
+  useGamepadSnapshot: () => gamepadMock.snapshot
 }));
 
 const roots: Root[] = [];
 beforeEach(() => {
   (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
   window.localStorage.clear();
+  gamepadMock.probe.mockClear();
+  gamepadMock.snapshot = { status: "disabled", devices: [] };
 });
 afterEach(async () => {
   for (const root of roots.splice(0).reverse()) await act(async () => root.unmount());
@@ -62,6 +69,29 @@ async function key(target: HTMLElement, value: string): Promise<void> {
 function store(value: unknown): void { window.localStorage.setItem(GAMEPAD_PREFERENCES_KEY, JSON.stringify(value)); }
 
 describe("gamepad settings", () => {
+  it("shows native device details and fallback state, and probes the helper on refresh", async () => {
+    gamepadMock.snapshot = {
+      status: "connected", nativeFallback: "unavailable", devices: [{
+        index: 1, id: "native:playstation", mapping: "standard", supported: true,
+        buttons: Array<boolean>(17).fill(false), axes: [0, 0, 0, 0], source: "native",
+        family: "playstation", name: "Wireless Controller", category: "DualSense", transport: "bluetooth",
+        batteryPercentage: 75, batteryState: "charging"
+      }, {
+        index: 0, id: "native:xbox", mapping: "standard", supported: true,
+        buttons: Array<boolean>(17).fill(false), axes: [0, 0, 0, 0], source: "native",
+        family: "xbox", name: "Controller", category: null, transport: "usb",
+        batteryPercentage: null, batteryState: "charging"
+      }]
+    };
+    const container = await renderSettings();
+    expect(container.textContent).toContain("Wireless Controller");
+    expect(container.textContent).toContain("DualSense · PlayStation family · Bluetooth");
+    expect(container.textContent).toContain("Battery 75% · charging");
+    expect(container.textContent).toContain("Battery level unavailable · charging");
+    expect(container.querySelector("[role='alert']")?.textContent).toContain("Standard browser gamepad input is being used instead");
+    await act(async () => button(container, "Check again").click());
+    expect(gamepadMock.probe).toHaveBeenCalledOnce();
+  });
   it("persists an enabled skill identity only after a successful save", async () => {
     const listSkills = vi.fn(async () => ({ revision: 1n, skills: [listedSkill] }));
     const container = await renderSettings({ serverId: "server-one", connected: true, listSkills });

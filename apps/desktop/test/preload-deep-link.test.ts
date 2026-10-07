@@ -14,6 +14,12 @@ interface KeepAwakeApi {
   onKeepAwakeChanged(listener: (settings: { readonly enabled: boolean }) => void): () => void;
 }
 
+interface NativeGamepadApi {
+  getSnapshot(): Promise<unknown>;
+  setClientState(value: unknown): Promise<unknown>;
+  probe(): Promise<unknown>;
+}
+
 const MAIN_DOCUMENT_CLAIM = "00000000-0000-4000-8000-000000000001";
 
 function delivery(documentOccurrence: string, deliveryOccurrence = 1): unknown {
@@ -30,11 +36,14 @@ function loadPreload(
     readonly randomUUID?: () => string;
     readonly getRandomValues?: (bytes: Uint8Array) => Uint8Array;
   } = { randomUUID: () => MAIN_DOCUMENT_CLAIM },
-  preferredSystemLocale: unknown = "zh-CN"
+  preferredSystemLocale: unknown = "zh-CN",
+  platform: NodeJS.Platform = "win32",
+  nativeGamepadOccurrence: unknown = "native-gamepad-document"
 ): {
   readonly exposed: Readonly<Record<string, unknown>>;
   readonly deepLinks: DeepLinkApi;
   readonly power: KeepAwakeApi;
+  readonly nativeGamepad: NativeGamepadApi;
   readonly invoke: ReturnType<typeof vi.fn>;
   readonly synchronousChannels: readonly string[];
   readonly listeners: Map<string, (...parameters: unknown[]) => void>;
@@ -46,9 +55,12 @@ function loadPreload(
   }).outputText;
   const listeners = new Map<string, (...parameters: unknown[]) => void>();
   let pending: unknown;
-  const invoke = vi.fn(async (channel: string): Promise<unknown> => {
+  const invoke = vi.fn(async (channel: string, ..._parameters: unknown[]): Promise<unknown> => {
     if (channel === "joko:deep-link:take-pending") return pending;
     if (channel === "joko:deep-link:acknowledge") return true;
+    if (channel.startsWith("joko:native-gamepad:")) {
+      return { version: 1, revision: 0, status: "idle", devices: [] };
+    }
     return undefined;
   });
   let exposed: unknown;
@@ -64,6 +76,10 @@ function loadPreload(
           expect(parameters).toEqual([MAIN_DOCUMENT_CLAIM]);
         }
         if (channel === "joko:main-document:occurrence:get") return documentOccurrence;
+        if (channel === "joko:native-gamepad:document:capture") {
+          expect(parameters).toEqual([MAIN_DOCUMENT_CLAIM]);
+          return nativeGamepadOccurrence;
+        }
         if (channel === "joko:locale:preferred-system:get") return preferredSystemLocale;
         return false;
       },
@@ -83,7 +99,7 @@ function loadPreload(
       if (specifier !== "electron") throw new Error(`Unexpected preload dependency: ${specifier}`);
       return electron;
     },
-    process: { platform: "win32" },
+    process: { platform },
     crypto,
     console,
     Object,
@@ -107,11 +123,13 @@ function loadPreload(
   const desktop = exposed as Readonly<Record<string, unknown>> & {
     readonly deepLinks: DeepLinkApi;
     readonly power: KeepAwakeApi;
+    readonly nativeGamepad: NativeGamepadApi;
   };
   return {
     exposed: desktop,
     deepLinks: desktop.deepLinks,
     power: desktop.power,
+    nativeGamepad: desktop.nativeGamepad,
     invoke,
     synchronousChannels,
     listeners,
@@ -173,6 +191,65 @@ describe("main application preload deep-link occurrence fence", () => {
       documentOccurrence: "document-current",
       deliveryOccurrence: 2
     })).resolves.toBe(true);
+  });
+});
+
+describe("application preload native gamepad Document occurrence fence", () => {
+  it("advertises the capability only after capture and privately binds every request", async () => {
+    const loaded = loadPreload(
+      "document-current",
+      { randomUUID: () => MAIN_DOCUMENT_CLAIM },
+      "en",
+      "darwin",
+      "native-gamepad-current"
+    );
+
+    expect(loaded.synchronousChannels).toEqual([
+      "joko:main-document:occurrence:get",
+      "joko:native-gamepad:document:capture",
+      "joko:native-task-status:availability:get",
+      "joko:locale:preferred-system:get"
+    ]);
+    expect(loaded.exposed["capabilities"]).toContain("hardware.nativeGamepad");
+    expect(Reflect.has(loaded.exposed, "nativeGamepadDocumentOccurrence")).toBe(false);
+
+    await expect(loaded.nativeGamepad.getSnapshot()).resolves.toEqual({
+      version: 1, revision: 0, status: "idle", devices: []
+    });
+    await expect(loaded.nativeGamepad.setClientState({ version: 1, enabled: true, preview: false }))
+      .resolves.toMatchObject({ status: "idle" });
+    await expect(loaded.nativeGamepad.probe()).resolves.toMatchObject({ status: "idle" });
+    expect(loaded.invoke).toHaveBeenCalledWith(
+      DESKTOP_CHANNELS.nativeGamepadGetSnapshot,
+      "native-gamepad-current"
+    );
+    expect(loaded.invoke).toHaveBeenCalledWith(
+      DESKTOP_CHANNELS.nativeGamepadSetClientState,
+      "native-gamepad-current",
+      { version: 1, enabled: true, preview: false }
+    );
+    expect(loaded.invoke).toHaveBeenCalledWith(
+      DESKTOP_CHANNELS.nativeGamepadProbe,
+      "native-gamepad-current"
+    );
+  });
+
+  it("fails closed without advertising or invoking when capture is rejected", async () => {
+    const loaded = loadPreload(
+      "document-current",
+      { randomUUID: () => MAIN_DOCUMENT_CLAIM },
+      "en",
+      "darwin",
+      null
+    );
+
+    expect(loaded.exposed["capabilities"]).not.toContain("hardware.nativeGamepad");
+    await expect(loaded.nativeGamepad.getSnapshot()).rejects.toThrow(/unavailable/u);
+    await expect(loaded.nativeGamepad.setClientState({ version: 1, enabled: true, preview: false }))
+      .rejects.toThrow(/unavailable/u);
+    await expect(loaded.nativeGamepad.probe()).rejects.toThrow(/unavailable/u);
+    expect(loaded.invoke.mock.calls.some(([channel]) => String(channel).startsWith("joko:native-gamepad:")))
+      .toBe(false);
   });
 });
 

@@ -227,6 +227,12 @@ describe("gamepad input ownership", () => {
       expect(state.devices[0]?.supported).toBe(false);
       expect(state.effects).toEqual([]);
     }
+    const native = sample([{ ...pad(), source: "native", family: "playstation", name: "Wireless Controller", category: "DualSense",
+      transport: "bluetooth", batteryPercentage: 75, batteryState: "charging" }], { preview: true });
+    expect(native.devices[0]).toMatchObject({
+      source: "native", family: "playstation", name: "Wireless Controller", category: "DualSense",
+      transport: "bluetooth", batteryPercentage: 75, batteryState: "charging", supported: true
+    });
   });
 
   it("dispatches discrete stick directions and bounds continuous scroll time and deadzone", () => {
