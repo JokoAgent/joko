@@ -4,16 +4,12 @@ import type { DragEvent, JSX } from "react";
 import {
   AlertTriangle,
   AtSign,
-  Code2,
   FolderKanban,
   GitBranch,
-  Hammer,
   Image as ImageIcon,
   Menu,
   MessageSquarePlus,
-  MessageSquareCode,
   Paperclip,
-  SearchCode,
   Send,
   Shield,
   Sparkles,
@@ -53,6 +49,7 @@ import type { TargetDraft } from "../model.js";
 import type { DelayedNewSessionDraft, NewSessionSubmissionOwner } from "../new-session-flow.js";
 import { randomUuid } from "../web-crypto.js";
 import { resolveRecentProject, subscribeRecentProjectsChange, type RecentProject } from "../recent-projects.js";
+import { homeSuggestionPromptKey, type HomeSuggestionId } from "../home-suggestions.js";
 import {
   currentComposerPlatform,
   resolveComposerAttachmentPolicy,
@@ -90,6 +87,7 @@ import { ComposerAddMenu } from "./ComposerAddMenu.js";
 import { ComposerAttachmentTray } from "./ComposerAttachmentTray.js";
 import { ComposerInlineMentionPanel } from "./composer-inline-mention-panel.js";
 import { HomeUsageDashboard } from "./HomeUsageDashboard.js";
+import { HomeSuggestionList } from "./HomeSuggestionList.js";
 import { ComposerPastedTextDialog, type ComposerPastedTextDialogTarget } from "./ComposerPastedTextDialog.js";
 import { ComposerRichTextEditor, type ComposerRichTextEditorHandle } from "./ComposerRichTextEditor.js";
 import { VoiceInputOverlay } from "./VoiceInputOverlay.js";
@@ -164,13 +162,6 @@ interface FullAccessConfirmation {
 interface NewTaskInlineMentionActivation extends ComposerInlineMentionActivation {
   readonly source: "typed" | "button";
 }
-
-const QUICK_STARTS = [
-  { key: "explore", label: "newTask.quickExplore", icon: SearchCode },
-  { key: "build", label: "newTask.quickBuild", icon: Code2 },
-  { key: "review", label: "newTask.quickReview", icon: MessageSquareCode },
-  { key: "fix", label: "newTask.quickFix", icon: Hammer }
-] as const;
 
 /** Delayed-create route rendered within Joko's visual language. */
 export function NewSessionPage({ controller, snapshot, initialTargetId, initialDialogueBackendId, projectPickerRequest, onProjectPickerRequestConsumed, navigationOpen, t, onOpenNavigation, onClose, onSubmit }: NewSessionPageProps): JSX.Element {
@@ -1104,9 +1095,13 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
       setWorktreeEnabled(controllerRef.current.state.preferences.newSessionWorktreeEnabled);
       setWorktreeSourceRef(restored.worktree?.sourceRef);
       setRefreshWorktreeRemote(restored.worktree?.refreshRemote ?? false);
-      setExtraDirectoryIds(canSelectExtraDirectories
-        ? (restored.extraDirectoryIds ?? []).filter((id) => selectableExtraDirectories.some((directory) => directory.id === id))
-        : []);
+      const restoredExtraDirectories = selection.kind === "target"
+        && backend.capabilities.get("workspace.extra_dirs")?.supported === true
+        ? snapshot.extraDirectories.filter((directory) => directory.workspaceId === selected?.workspaceId && directory.trusted)
+        : [];
+      setExtraDirectoryIds((restored.extraDirectoryIds ?? []).filter((id) =>
+        restoredExtraDirectories.some((directory) => directory.id === id)
+      ));
       if (selection.kind === "dialogue") {
         setStartKind("fresh");
         setNativeReference("");
@@ -1904,6 +1899,20 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
 
   submitRef.current = submit;
 
+  const selectHomeSuggestion = (id: HomeSuggestionId): void => {
+    if (submittingRef.current || submissionRef.current !== undefined) return;
+    voiceDictionaryLearning.clear();
+    const nextDocument = plainTextToComposerDocument(t(homeSuggestionPromptKey(id)));
+    const nextText = composerDocumentPlainText(nextDocument);
+    editorDocumentRef.current = nextDocument;
+    setEditorDocument(nextDocument);
+    textRef.current = nextText;
+    setText(nextText);
+    replaceMentions([], []);
+    closePalette();
+    void submit(nextDocument);
+  };
+
   const handleEditorKeyDown = (event: KeyboardEvent, activeDocument: JSONContent): boolean => {
     if (captureInlineMentionKey(event)) return true;
     if (captureTypedCommandKey(event)) return true;
@@ -2403,23 +2412,11 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
           <div className="new-task-composer__meta"><span>{selection?.kind === "dialogue" ? t("newTask.dialogue") : selected?.workspaceName ?? t("session.noProjects")}</span><span>{backend?.name ?? ""}</span></div>
         </div>
 
-        <section className="new-task-quick" aria-labelledby="new-task-quick-title">
-          <h2 id="new-task-quick-title">{t("newTask.quickStart")}</h2>
-          <div className="new-task-quick__grid">
-            {QUICK_STARTS.map(({ key, label, icon: Icon }) => <button type="button" key={key} disabled={submitting} onClick={() => {
-              voiceDictionaryLearning.clear();
-              const nextDocument = plainTextToComposerDocument(t(label));
-              const nextText = composerDocumentPlainText(nextDocument);
-              editorDocumentRef.current = nextDocument;
-              setEditorDocument(nextDocument);
-              textRef.current = nextText;
-              setText(nextText);
-              replaceMentions([], []);
-              closePalette();
-              requestAnimationFrame(() => richEditorRef.current?.focus());
-            }}><span><Icon aria-hidden="true" /></span><strong>{t(label)}</strong></button>)}
-          </div>
-        </section>
+        <HomeSuggestionList
+          t={t}
+          disabled={!hydrated || hydratedProfileScope !== profileScope || submitting || voice.active}
+          onSelect={selectHomeSuggestion}
+        />
         <HomeUsageDashboard controller={controller} ownerId={pickerOwnerId} locale={controller.state.effectiveLocale} t={t} />
       </section>
     </div>

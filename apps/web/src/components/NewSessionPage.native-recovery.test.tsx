@@ -104,10 +104,12 @@ describe("new-task native draft recovery", () => {
     api.readNewSessionDraft = vi.fn(() => pending.promise);
     const { container } = await renderPage(api, vi.fn(async () => undefined));
     expect(container.querySelector("[data-testid='editor']")?.getAttribute("data-editable")).toBe("false");
+    expect(required(container.querySelector<HTMLButtonElement>("[data-home-suggestion-id]")).disabled).toBe(true);
     await act(async () => pending.resolve({
       ...restoredDraft(), selection: { kind: "unselected" }, nativeStart: { kind: "fresh" }
     }));
     await vi.waitFor(() => expect(container.querySelector("[data-testid='editor']")?.getAttribute("data-editable")).toBe("true"));
+    expect(required(container.querySelector<HTMLButtonElement>("[data-home-suggestion-id]")).disabled).toBe(false);
   });
 
   it("does not save one Profile's draft into another while the next Profile hydrates", async () => {
@@ -282,30 +284,46 @@ describe("new-task native draft recovery", () => {
     };
     const base = snapshot();
     const comments = [browserComment("first", 1), browserComment("second", 2)];
+    const attachment = { id: "notes", kind: "file" as const, file: new File(["notes"], "notes.txt", { type: "text/plain" }) };
     const original = controller({ discover: async () => [] });
     const api = { ...original, state: { ...original.state, snapshot: {
       ...base,
       backends: base.backends.map((backend) => ({ ...backend, capabilities: new Map([
         ...backend.capabilities,
         ["model.switch", { name: "model.switch", supported: true, options: [] }],
-        ["input.image", { name: "input.image", supported: true, options: [], maximumItems: 4 }]
+        ["input.image", { name: "input.image", supported: true, options: [], maximumItems: 4 }],
+        ["input.file", { name: "input.file", supported: true, options: [], maximumItems: 4 }],
+        ["workspace.extra_dirs", { name: "workspace.extra_dirs", supported: true, options: [] }]
       ]) })),
-      models: [model]
+      models: [model],
+      extraDirectories: [{ id: "extra-1", workspaceId: "workspace-1", serverPath: "/extra", access: "readOnly", trusted: true }]
     } }, readNewSessionDraft: vi.fn(async () => ({
       ...restoredDraft(), nativeStart: { kind: "fresh" }, providerId: model.providerId, modelId: model.modelId,
-      text: "", editorDocument: emptyComposerDocument(), browserComments: comments
+      text: "", editorDocument: emptyComposerDocument(), attachments: [attachment], browserComments: comments,
+      extraDirectoryIds: ["extra-1"]
     })) } as unknown as AppController;
     const onSubmit = vi.fn(async () => undefined);
     const { container } = await renderPage(api, onSubmit);
 
     expect(container.querySelectorAll(".browser-comment-chip article")).toHaveLength(2);
     expect(sendButton(container).disabled).toBe(false);
+    await vi.waitFor(() => expect(
+      required(container.querySelector<HTMLButtonElement>('button[aria-label="common.add"]')).textContent
+    ).toContain("×1"));
     await act(async () => required(container.querySelectorAll<HTMLButtonElement>('button[aria-label="composer.removeBrowserComment"]')[0]).click());
     expect(container.querySelectorAll(".browser-comment-chip article")).toHaveLength(1);
-    await act(async () => sendButton(container).click());
-    expect(onSubmit).toHaveBeenCalledExactlyOnceWith(expect.anything(), expect.objectContaining({
-      text: "",
-      browserComments: [expect.objectContaining({ id: "second", markerNumber: 2 })]
+    const suggestion = required(container.querySelector<HTMLButtonElement>("[data-home-suggestion-id]"));
+    const suggestionId = required(suggestion.dataset.homeSuggestionId);
+    await act(async () => suggestion.click());
+    expect(onSubmit).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+      selection: { kind: "target", targetId: "target-1" },
+      providerId: model.providerId,
+      modelId: model.modelId
+    }), expect.objectContaining({
+      text: `newTask.homeSuggestions.${suggestionId}.prompt`,
+      attachments: [attachment],
+      browserComments: [expect.objectContaining({ id: "second", markerNumber: 2 })],
+      extraDirectoryIds: ["extra-1"]
     }), expect.anything());
   });
 
@@ -429,7 +447,7 @@ describe("new-task native draft recovery", () => {
     }), expect.anything());
   });
 
-  it("persists exact palette append locations and clears them when a quick start or unowned text replaces the draft", async () => {
+  it("persists exact palette append locations and clears them when a home suggestion or unowned text replaces the draft", async () => {
     vi.useFakeTimers();
     const draft = repeatedMentionDraft();
     const api = Object.assign(controller({ discover: async () => [], listWorkspaceFiles: async () => ({ paths: ["src/guide.md"], truncated: false, revision: "files" }) }), {
@@ -445,12 +463,48 @@ describe("new-task native draft recovery", () => {
       text: "@same @same @same @src/guide.md",
       inlineMentionRanges: [...draft.inlineMentionRanges!, { mentionId: "workspace:workspace-1:src/guide.md", from: 18, to: 31 }]
     }));
-    await act(async () => buttonWithText(container, "newTask.quickExplore").click());
+    const suggestion = required(container.querySelector<HTMLButtonElement>("[data-home-suggestion-id]"));
+    const suggestionId = required(suggestion.dataset.homeSuggestionId);
+    await act(async () => suggestion.click());
+    expect(onSubmit).toHaveBeenCalledExactlyOnceWith(expect.anything(), expect.objectContaining({
+      text: `newTask.homeSuggestions.${suggestionId}.prompt`, mentions: [], inlineMentionRanges: []
+    }), expect.anything());
     await act(async () => { await vi.advanceTimersByTimeAsync(500); });
-    expect(api.saveNewSessionDraft).toHaveBeenLastCalledWith(expect.objectContaining({ mentions: [], inlineMentionRanges: [] }));
+    expect(api.saveNewSessionDraft).toHaveBeenLastCalledWith(expect.objectContaining({
+      text: `newTask.homeSuggestions.${suggestionId}.prompt`, mentions: [], inlineMentionRanges: []
+    }));
+    onSubmit.mockClear();
     await act(async () => required(latestEditorProps?.onDocumentChange)(plainTextToComposerDocument("@same"), false));
     await act(async () => sendButton(container).click());
     expect(onSubmit).toHaveBeenCalledExactlyOnceWith(expect.anything(), expect.objectContaining({ text: "@same", mentions: [], inlineMentionRanges: [] }), expect.anything());
+  });
+
+  it("keeps the full suggestion prompt in the draft when the current connection cannot submit", async () => {
+    vi.useFakeTimers();
+    const saveDraft = vi.fn(async () => undefined);
+    const connected = controller({ discover: async () => [], saveDraft });
+    const api = {
+      ...connected,
+      state: { ...connected.state, connectionState: "disconnected" as const }
+    } as AppController;
+    const onSubmit = vi.fn(async () => undefined);
+    const { container } = await renderPage(api, onSubmit);
+    const suggestion = required(container.querySelector<HTMLButtonElement>("[data-home-suggestion-id]"));
+    const suggestionId = required(suggestion.dataset.homeSuggestionId);
+
+    await act(async () => suggestion.click());
+    await flush();
+
+    const prompt = `newTask.homeSuggestions.${suggestionId}.prompt`;
+    expect(onSubmit).not.toHaveBeenCalled();
+    expect(composerDocumentPlainText(latestEditorProps?.document)).toBe(prompt);
+    await act(async () => { await vi.advanceTimersByTimeAsync(500); });
+    expect(saveDraft).toHaveBeenLastCalledWith(expect.objectContaining({
+      text: prompt,
+      editorDocument: plainTextToComposerDocument(prompt),
+      mentions: [],
+      inlineMentionRanges: []
+    }));
   });
 
   it("retires the selected mention when voice replaces it with the same spelling and preserves other occurrences for first send", async () => {
