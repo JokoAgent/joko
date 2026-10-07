@@ -2868,7 +2868,13 @@ function toProtoEventPayload(event: PersistedEvent, context: EventMappingContext
               }),
           nativeIdentity: toProtoNativeMessageIdentity(payload.nativeHistory?.identity),
           automaticContinuation: payload.automaticContinuation !== undefined,
-          runtimeRecoveryId: payload.automaticContinuation?.recoveryId ?? ""
+          runtimeRecoveryId: payload.automaticContinuation?.recoveryId ?? "",
+          objectiveContinuation: payload.objectiveContinuation === undefined
+            ? undefined
+            : message<contract.ObjectiveContinuation>("joko.v1.ObjectiveContinuation", {
+                ownerGeneration: BigInt(payload.objectiveContinuation.ownerGeneration),
+                turn: payload.objectiveContinuation.turn
+              })
         }));
       }
       return protoPayload("messageCompleted", message<MessageCompletedEvent>("joko.v1.MessageCompletedEvent", {
@@ -2893,6 +2899,17 @@ function toProtoEventPayload(event: PersistedEvent, context: EventMappingContext
         delayMs: payload.delayMs ?? 0,
         routeChanged: payload.routeChanged === true,
         error: toProtoErrorInfo(payload.error)
+      }));
+    case "objective_lifecycle":
+      return protoPayload("objectiveLifecycle", message<contract.ObjectiveLifecycleEvent>("joko.v1.ObjectiveLifecycleEvent", {
+        action: toProtoObjectiveLifecycleAction(payload.action),
+        status: toProtoObjectiveLifecycleStatus(payload.status),
+        ownerGeneration: BigInt(payload.ownerGeneration),
+        turnsUsed: payload.turnsUsed,
+        reason: payload.reason ?? "",
+        objectiveText: payload.objectiveText ?? "",
+        tokensUsed: BigInt(payload.tokensUsed),
+        elapsedMs: BigInt(payload.elapsedMs)
       }));
     case "status":
       return statusPayload(payload.key, payload.key, payload.text ?? "", false);
@@ -3288,6 +3305,18 @@ function fromProtoEventPayload(
             recoveryId: payload.kind.value.runtimeRecoveryId
           }
         } : {}),
+        ...(payload.kind.value.objectiveContinuation === undefined ? {} : {
+          objectiveContinuation: {
+            ownerGeneration: safeNumber(
+              payload.kind.value.objectiveContinuation.ownerGeneration,
+              "event.payload.message_started.objective_continuation.owner_generation"
+            ),
+            turn: positiveUnsignedInt32(
+              payload.kind.value.objectiveContinuation.turn,
+              "event.payload.message_started.objective_continuation.turn"
+            )
+          }
+        }),
         ...(fromProtoNativeMessageIdentity(payload.kind.value.nativeIdentity) === undefined
           ? {}
           : { nativeHistory: { identity: fromProtoNativeMessageIdentity(payload.kind.value.nativeIdentity)! } }),
@@ -3316,6 +3345,31 @@ function fromProtoEventPayload(
         ...(recovery.delayMs === 0 ? {} : { delayMs: unsignedInt32(recovery.delayMs, "event.payload.runtime_recovery_changed.delay_ms") }),
         ...(recovery.routeChanged ? { routeChanged: true } : {}),
         error: fromProtoErrorInfo(recovery.error)
+      };
+    }
+    case "objectiveLifecycle": {
+      const objective = payload.kind.value;
+      const action = fromProtoObjectiveLifecycleAction(objective.action);
+      const objectiveText = boundedObjectiveLifecycleText(objective.objectiveText, "event.payload.objective_lifecycle.objective_text", 32_000);
+      if ((action === "started" || action === "replaced") && objectiveText === "") {
+        throw new ProtoMappingError("invalid_argument", "event.payload.objective_lifecycle.objective_text", "Objective lifecycle start/replacement requires objective text.");
+      }
+      const reason = boundedObjectiveLifecycleText(objective.reason, "event.payload.objective_lifecycle.reason", 2_048);
+      return {
+        type: "objective_lifecycle",
+        action,
+        ...(objective.status === contract.ObjectiveStatus.UNSPECIFIED
+          ? {}
+          : { status: fromProtoObjectiveLifecycleStatus(objective.status) }),
+        ownerGeneration: safeNumber(
+          objective.ownerGeneration,
+          "event.payload.objective_lifecycle.owner_generation"
+        ),
+        turnsUsed: unsignedInt32(objective.turnsUsed, "event.payload.objective_lifecycle.turns_used"),
+        tokensUsed: safeNumber(objective.tokensUsed, "event.payload.objective_lifecycle.tokens_used"),
+        elapsedMs: safeNumber(objective.elapsedMs, "event.payload.objective_lifecycle.elapsed_ms"),
+        ...(objectiveText === "" ? {} : { objectiveText }),
+        ...(reason === "" ? {} : { reason })
       };
     }
     case "messageCompleted": {
@@ -5142,6 +5196,69 @@ function fromProtoRuntimeRecoveryState(
   }
 }
 
+function toProtoObjectiveLifecycleAction(
+  action: Extract<EventPayload, { readonly type: "objective_lifecycle" }>["action"]
+): contract.ObjectiveLifecycleAction {
+  switch (action) {
+    case "started": return contract.ObjectiveLifecycleAction.STARTED;
+    case "replaced": return contract.ObjectiveLifecycleAction.REPLACED;
+    case "paused": return contract.ObjectiveLifecycleAction.PAUSED;
+    case "resumed": return contract.ObjectiveLifecycleAction.RESUMED;
+    case "completed": return contract.ObjectiveLifecycleAction.COMPLETED;
+    case "blocked": return contract.ObjectiveLifecycleAction.BLOCKED;
+    case "limited": return contract.ObjectiveLifecycleAction.LIMITED;
+    case "dispatch_unknown": return contract.ObjectiveLifecycleAction.DISPATCH_UNKNOWN;
+    case "cleared": return contract.ObjectiveLifecycleAction.CLEARED;
+  }
+}
+
+function fromProtoObjectiveLifecycleAction(
+  action: contract.ObjectiveLifecycleAction
+): Extract<EventPayload, { readonly type: "objective_lifecycle" }>["action"] {
+  switch (action) {
+    case contract.ObjectiveLifecycleAction.STARTED: return "started";
+    case contract.ObjectiveLifecycleAction.REPLACED: return "replaced";
+    case contract.ObjectiveLifecycleAction.PAUSED: return "paused";
+    case contract.ObjectiveLifecycleAction.RESUMED: return "resumed";
+    case contract.ObjectiveLifecycleAction.COMPLETED: return "completed";
+    case contract.ObjectiveLifecycleAction.BLOCKED: return "blocked";
+    case contract.ObjectiveLifecycleAction.LIMITED: return "limited";
+    case contract.ObjectiveLifecycleAction.DISPATCH_UNKNOWN: return "dispatch_unknown";
+    case contract.ObjectiveLifecycleAction.CLEARED: return "cleared";
+    default: throw new ProtoMappingError("invalid_argument", "event.payload.objective_lifecycle.action", "Objective lifecycle action is required.");
+  }
+}
+
+function toProtoObjectiveLifecycleStatus(
+  status: Extract<EventPayload, { readonly type: "objective_lifecycle" }>["status"]
+): contract.ObjectiveStatus {
+  if (status === undefined) return contract.ObjectiveStatus.UNSPECIFIED;
+  switch (status) {
+    case "active": return contract.ObjectiveStatus.ACTIVE;
+    case "paused": return contract.ObjectiveStatus.PAUSED;
+    case "blocked": return contract.ObjectiveStatus.BLOCKED;
+    case "complete": return contract.ObjectiveStatus.COMPLETE;
+    case "budget_limited": return contract.ObjectiveStatus.BUDGET_LIMITED;
+    case "usage_limited": return contract.ObjectiveStatus.USAGE_LIMITED;
+    case "dispatch_unknown": return contract.ObjectiveStatus.DISPATCH_UNKNOWN;
+  }
+}
+
+function fromProtoObjectiveLifecycleStatus(
+  status: contract.ObjectiveStatus
+): NonNullable<Extract<EventPayload, { readonly type: "objective_lifecycle" }>["status"]> {
+  switch (status) {
+    case contract.ObjectiveStatus.ACTIVE: return "active";
+    case contract.ObjectiveStatus.PAUSED: return "paused";
+    case contract.ObjectiveStatus.BLOCKED: return "blocked";
+    case contract.ObjectiveStatus.COMPLETE: return "complete";
+    case contract.ObjectiveStatus.BUDGET_LIMITED: return "budget_limited";
+    case contract.ObjectiveStatus.USAGE_LIMITED: return "usage_limited";
+    case contract.ObjectiveStatus.DISPATCH_UNKNOWN: return "dispatch_unknown";
+    default: throw new ProtoMappingError("invalid_argument", "event.payload.objective_lifecycle.status", "Objective lifecycle status is invalid.");
+  }
+}
+
 function terminalScheduleRunOutcome(status: string): boolean {
   return ["success", "succeeded", "completed", "aborted", "interrupted", "cancelled", "failed"]
     .includes(status.toLowerCase());
@@ -6955,6 +7072,14 @@ function signedInt32(value: number, fieldPath: string): number {
 function boundedPiDiagnostic(value: string, _fieldPath: string, maximumCharacters: number): string {
   const sanitized = redactSecrets(value).replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/gu, "�");
   return [...sanitized].slice(0, maximumCharacters).join("");
+}
+
+function boundedObjectiveLifecycleText(value: string, fieldPath: string, maximumCharacters: number): string {
+  const normalized = value.normalize("NFC").replace(/\r\n?/gu, "\n").trim();
+  if (normalized.includes("\0") || [...normalized].length > maximumCharacters) {
+    throw new ProtoMappingError("invalid_argument", fieldPath, `${fieldPath} is not bounded safe text.`);
+  }
+  return normalized;
 }
 
 function requiredProtoTimestamp(value: ProtoTimestamp, fieldPath: string): number {

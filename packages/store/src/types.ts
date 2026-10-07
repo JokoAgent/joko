@@ -495,6 +495,8 @@ export interface ObjectiveRecord extends ObjectiveLimits {
   readonly noProgressTurns: number;
   readonly dispatchRejections: number;
   readonly lastReason?: string;
+  /** Known Provider reset boundary for automatic usage-limit recovery. */
+  readonly usageResetAt?: UnixMillis;
   /** Semantic lifecycle fence. Every replace/edit/pause/resume advances it. */
   readonly ownerGeneration: number;
   /** Current product Session/native binding epoch. */
@@ -524,6 +526,7 @@ export interface UpdateObjectiveInput {
   readonly expectedSessionGeneration?: number;
   readonly text?: string;
   readonly status?: ObjectiveStatus;
+  readonly usageResetAt?: UnixMillis | null;
   readonly tokenBudget?: number | null;
   readonly maximumTurns?: number | null;
   readonly noProgressTurnLimit?: number | null;

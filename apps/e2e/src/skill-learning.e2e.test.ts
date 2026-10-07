@@ -219,6 +219,38 @@ describe("production Skill learning", () => {
       sendInputMutation(sourceSessionId, generation, "Verify staging before applying the change."));
     await waitFor(async () => fixture!.application.store.listRuns({ sessionId: sourceSessionId })[0]?.descriptor.state,
       (state) => state === "completed", "source task completion", 45_000);
+    const sourceStore = fixture.application.store;
+    const source = sourceStore.getSession(sourceSessionId).descriptor;
+    const appendEvidenceMessage = (
+      payload: Parameters<typeof sourceStore.appendEvent>[0]["payload"]
+    ): void => {
+      sourceStore.appendEvent({
+        id: randomUUID(),
+        backendId: source.backendId,
+        targetId: source.targetId,
+        sessionId: sourceSessionId,
+        generation: source.binding.generation,
+        traceId: "skill-learning-session-evidence",
+        payload
+      });
+    };
+    appendEvidenceMessage({
+      type: "message_complete",
+      role: "user",
+      blocks: [{ kind: "text", text: "internal runtime recovery directive" }],
+      automaticContinuation: { recoveryId: "skill-learning-recovery" }
+    });
+    appendEvidenceMessage({
+      type: "message_complete",
+      role: "user",
+      blocks: [{ kind: "text", text: "internal objective directive" }],
+      objectiveContinuation: { ownerGeneration: 1, turn: 1 }
+    });
+    appendEvidenceMessage({
+      type: "message_complete",
+      role: "assistant",
+      blocks: [{ kind: "text", text: "Ordinary assistant evidence remains available." }]
+    });
     const sessionRun = (await paired.clients.skill.startSkillLearning({
       requestId: randomUUID(), targetId: "workspace-real-pi", instruction: "", sourceSessionId
     })).run!;
@@ -228,7 +260,11 @@ describe("production Skill learning", () => {
       (response) => response.run?.state === SkillLearningState.AWAITING_REVIEW,
       "task-derived Skill learning proposal", 45_000
     )).run!;
-    expect(JSON.stringify(fixture.providerRequests.at(-1)?.body)).toContain("Verify staging before applying the change.");
+    const sessionEvidenceRequest = JSON.stringify(fixture.providerRequests.at(-1)?.body);
+    expect(sessionEvidenceRequest).toContain("Verify staging before applying the change.");
+    expect(sessionEvidenceRequest).toContain("Ordinary assistant evidence remains available.");
+    expect(sessionEvidenceRequest).not.toContain("internal runtime recovery directive");
+    expect(sessionEvidenceRequest).not.toContain("internal objective directive");
     expect((await paired.clients.skill.discardSkillLearning({
       operationId: randomUUID(), runId: sessionReview.runId, expectedRunRevision: sessionReview.revision
     })).run?.state).toBe(SkillLearningState.DISCARDED);

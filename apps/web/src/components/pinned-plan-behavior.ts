@@ -1,4 +1,5 @@
 import type { TimelineItemView, TimelinePlanView } from "../model.js";
+import { isInternalContinuationTimelineItem } from "../runtime-recovery.js";
 
 export type PinnedPlanStepState = "pending" | "inProgress" | "completed";
 
@@ -63,6 +64,7 @@ export function projectPinnedPlan(items: readonly TimelineItemView[]): PinnedPla
   for (const item of ordered) {
     if (
       item.kind === "user" &&
+      !isInternalContinuationTimelineItem(item) &&
       latest?.runId !== undefined &&
       item.runId !== undefined &&
       item.runId !== latest.runId
@@ -148,7 +150,7 @@ export function projectInlinePlanTimeline(items: readonly TimelineItemView[]): r
   let lastUserRunId: string | undefined;
 
   for (const item of ordered) {
-    if (item.kind === "user") {
+    if (item.kind === "user" && !isInternalContinuationTimelineItem(item)) {
       if (item.runId === undefined || item.runId !== lastUserRunId) {
         lastUserBoundarySequence = item.sequence;
         lastUserRunId = item.runId;

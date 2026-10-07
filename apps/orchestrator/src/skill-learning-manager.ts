@@ -429,7 +429,9 @@ export class SkillLearningManager {
       }
       const excerpts = this.#store.listEvents({ sessionId: source.id, order: "desc", limit: 200 })
         .filter((event) => event.payload.type === "message_complete"
-          && (event.payload.role === "assistant" || event.payload.role === "user"))
+          && (event.payload.role === "assistant" || event.payload.role === "user")
+          && event.payload.automaticContinuation === undefined
+          && event.payload.objectiveContinuation === undefined)
         .slice(0, 20)
         .reverse()
         .map((event) => {

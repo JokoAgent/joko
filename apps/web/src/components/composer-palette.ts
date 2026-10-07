@@ -29,6 +29,8 @@ export interface ComposerCommandItemOptions {
   readonly helpSupported?: boolean;
   /** Application-owned Skill learning command for the selected writable Target. */
   readonly learnSupported?: boolean;
+  /** Application-owned autonomous Objective command for the current writable Session. */
+  readonly goalSupported?: boolean;
   /** Application-owned exact task navigation command. */
   readonly jumpSessionSupported?: boolean;
   /** Derived from the selected Backend's public runtime.user_shell capability. */
@@ -42,6 +44,7 @@ export interface ComposerCommandItemOptions {
 export type ComposerBuiltInCommand =
   | { readonly kind: "help" }
   | { readonly kind: "learn"; readonly instruction: string }
+  | { readonly kind: "objective"; readonly action: "open" | "clear" | "set"; readonly text?: string }
   | { readonly kind: "jumpSession"; readonly sessionId: string }
   | { readonly kind: "userShell"; readonly command: string }
   | { readonly kind: "sessionReset" }
@@ -104,6 +107,9 @@ export function composerCommandItems(
       : []),
     ...(options.learnSupported === true && !runtimeCommandOwnsApplicationCommand(commands, "learn")
       ? [{ id: "builtin:learn", label: "/learn", value: "/learn", meta: "Distill a reusable skill from this task or an instruction" }]
+      : []),
+    ...(options.goalSupported === true && !runtimeCommandOwnsApplicationCommand(commands, "goal")
+      ? [{ id: "builtin:goal", label: "/goal", value: "/goal", meta: "Start, edit, pause, or clear an autonomous objective" }]
       : []),
     ...(options.jumpSessionSupported === true
       ? [{ id: "builtin:jump-session", label: "/jump-session", value: "/jump-session", meta: "Open an exact task by ID" }]
@@ -203,6 +209,17 @@ export function composerBuiltInCommand(
   if (options.learnSupported === true) {
     const learn = text.match(/^\/learn(?:\s+([\s\S]*?))?\s*$/iu);
     if (learn !== null) return { kind: "learn", instruction: (learn[1] ?? "").trim() };
+  }
+  if (options.goalSupported === true) {
+    const goal = text.match(/^\/goal(?:\s+([\s\S]*?))?\s*$/iu);
+    if (goal !== null) {
+      const value = (goal[1] ?? "").trim();
+      if (value === "") return { kind: "objective", action: "open" };
+      if (/^(?:clear|stop|off|cancel|reset|none)$/iu.test(value)) {
+        return { kind: "objective", action: "clear" };
+      }
+      return { kind: "objective", action: "set", text: value };
+    }
   }
   if (options.jumpSessionSupported === true) {
     const jump = text.match(/^\/jump-session(?:\s+([^\s]+))?\s*$/iu);

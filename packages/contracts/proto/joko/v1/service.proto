@@ -14,6 +14,7 @@ import "joko/v1/managed_model_runtime.proto";
 import "joko/v1/messaging.proto";
 import "joko/v1/mobile_push.proto";
 import "joko/v1/model.proto";
+import "joko/v1/objective.proto";
 import "joko/v1/operation.proto";
 import "joko/v1/partner.proto";
 import "joko/v1/pi.proto";
@@ -108,6 +109,16 @@ service SessionService {
   // Ephemeral one-shot title generation. Conversation material never crosses
   // the renderer boundary and the generated title is not committed here.
   rpc SuggestSessionTitle(SuggestSessionTitleRequest) returns (SuggestSessionTitleResponse);
+}
+
+service ObjectiveService {
+  rpc GetObjective(GetObjectiveRequest) returns (GetObjectiveResponse);
+  rpc WatchObjective(WatchObjectiveRequest) returns (stream WatchObjectiveResponse);
+  rpc SetObjective(SetObjectiveRequest) returns (SetObjectiveResponse);
+  rpc UpdateObjective(UpdateObjectiveRequest) returns (UpdateObjectiveResponse);
+  rpc PauseObjective(PauseObjectiveRequest) returns (PauseObjectiveResponse);
+  rpc ResumeObjective(ResumeObjectiveRequest) returns (ResumeObjectiveResponse);
+  rpc ClearObjective(ClearObjectiveRequest) returns (ClearObjectiveResponse);
 }
 
 // Authenticated portable task transfer. Passwords cross only the transient

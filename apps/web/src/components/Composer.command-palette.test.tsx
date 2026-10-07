@@ -8,7 +8,7 @@ import { remapComposerInlineMentionReplacement } from "../composer-mention-range
 import { appendQuoteToComposerDocument, composerDocumentPlainText, composerDocumentQuotes, plainTextToComposerDocument } from "../composer-quote-document.js";
 import { DEFAULT_UI_PREFERENCES } from "../local-state.js";
 import { GAMEPAD_SKILL_EVENT } from "../gamepad-client.js";
-import { emptySnapshot, type BackendView, type ComposerDraft, type ComposerInlineMentionRange, type RuntimeCommandView, type SessionView } from "../model.js";
+import { emptySnapshot, type BackendView, type ComposerDraft, type ComposerInlineMentionRange, type ObjectiveView, type RuntimeCommandView, type SessionView } from "../model.js";
 import { replaceComposerDocumentTextRange } from "./composer-inline-mention.js";
 import { Composer } from "./Composer.js";
 import { WORKSPACE_ENTRY_DRAG_MIME, encodeWorkspaceEntryDragPayload } from "./workspace-tree-state.js";
@@ -267,6 +267,98 @@ it("clears only the accepted /learn invocation and preserves edits made while le
   expect(view.drafts.get(baseSession.id)?.text).toBe("A newer unrelated draft");
   expect(view.api.navigate).toHaveBeenCalledWith({ kind: "session", sessionId: "delayed-distillation-task" });
   expect(view.api.send).not.toHaveBeenCalled();
+});
+
+it("sets, clears, and opens the application-owned /goal with fresh ownership and draft fences", async () => {
+  const setView = await mount(draft("/goal Ship the complete feature"), document, true);
+  await act(async () => setView.send().click());
+  await settleActions(setView.actions);
+  expect(setView.api.listCommands).toHaveBeenCalledExactlyOnceWith(baseSession.id, expect.any(AbortSignal));
+  expect(setView.api.setObjective).toHaveBeenCalledExactlyOnceWith(
+    baseSession.id,
+    baseSession.generation,
+    "Ship the complete feature",
+    { noProgressTurnLimit: 3 },
+    expect.any(AbortSignal)
+  );
+  expect(setView.api.send).not.toHaveBeenCalled();
+  expect(setView.editor().value).toBe("");
+
+  const clearView = await mount(draft("/goal clear"), document, true);
+  const currentObjective = objective("Current objective", baseSession.generation);
+  vi.mocked(clearView.api.getObjective).mockResolvedValueOnce(currentObjective);
+  await act(async () => clearView.send().click());
+  await settleActions(clearView.actions);
+  expect(clearView.api.getObjective).toHaveBeenCalledWith(baseSession.id, expect.any(AbortSignal));
+  expect(clearView.api.clearObjective).toHaveBeenCalledWith(currentObjective, expect.any(AbortSignal));
+  expect(clearView.editor().value).toBe("");
+
+  const openView = await mount(draft("/goal"), document, true);
+  await act(async () => openView.send().click());
+  await settleActions(openView.actions);
+  expect(openView.openObjective).toHaveBeenCalledTimes(1);
+  expect(openView.editor().value).toBe("/goal");
+  await act(async () => openView.completeObjectiveDialog());
+  await vi.waitFor(() => expect(openView.editor().value).toBe(""));
+
+  const failed = await mount(draft("/goal Keep this draft"), document, true);
+  vi.mocked(failed.api.setObjective).mockRejectedValueOnce(new Error("Objective busy"));
+  await act(async () => failed.send().click());
+  await settleActions(failed.actions);
+  expect(failed.editor().value).toBe("/goal Keep this draft");
+  expect(failed.actionErrors).toEqual([expect.objectContaining({ message: "Objective busy" })]);
+});
+
+it("hands a freshly loaded runtime /goal Skill the complete invocation exactly once", async () => {
+  const view = await mount(draft("/goal runtime owned"), document, true);
+  vi.mocked(view.api.listCommands).mockResolvedValueOnce([...commands, {
+    id: "runtime-goal",
+    name: "goal",
+    description: "Runtime goal Skill",
+    source: "skill",
+    resourceId: "runtime-goal-resource",
+    loaded: true
+  }]);
+  await act(async () => view.send().click());
+  await settleActions(view.actions);
+  expect(view.api.setObjective).not.toHaveBeenCalled();
+  expect(view.api.send).toHaveBeenCalledTimes(1);
+  expect(view.api.send).toHaveBeenCalledWith(baseSession.id, expect.objectContaining({ text: "/goal runtime owned" }), {
+    expectedGeneration: baseSession.generation
+  });
+});
+
+it("retains an application-owned /goal draft across catalog, structured-input, and changed-draft outcomes", async () => {
+  const catalogFailure = await mount(draft("/goal keep catalog failure"), document, true);
+  vi.mocked(catalogFailure.api.listCommands).mockRejectedValueOnce(new Error("Command catalog unavailable"));
+  await act(async () => catalogFailure.send().click());
+  await settleActions(catalogFailure.actions);
+  expect(catalogFailure.api.setObjective).not.toHaveBeenCalled();
+  expect(catalogFailure.editor().value).toBe("/goal keep catalog failure");
+  expect(catalogFailure.actionErrors).toEqual([expect.objectContaining({ message: "Command catalog unavailable" })]);
+
+  const attachment = { id: "objective-file", file: new File(["evidence"], "evidence.txt", { type: "text/plain" }), kind: "file" as const };
+  const structured = await mount({ ...draft("/goal structured"), attachments: [attachment] }, document, true);
+  await act(async () => structured.send().click());
+  await settleActions(structured.actions);
+  expect(structured.api.setObjective).not.toHaveBeenCalled();
+  expect(structured.editor().value).toBe("/goal structured");
+  expect(structured.drafts.get(baseSession.id)?.attachments).toEqual([attachment]);
+
+  const changed = await mount(draft("/goal original"), document, true);
+  let finishSet!: () => void;
+  vi.mocked(changed.api.setObjective).mockImplementationOnce((_sessionId, generation, text) => new Promise((resolve) => {
+    finishSet = () => resolve(objective(text, generation));
+  }));
+  await act(async () => changed.send().click());
+  await vi.waitFor(() => expect(finishSet).toBeTypeOf("function"));
+  await input(changed.editor(), "A newer unrelated draft", 23);
+  await act(async () => finishSet());
+  await settleActions(changed.actions);
+  expect(changed.editor().value).toBe("A newer unrelated draft");
+  await act(async () => changed.add().focus());
+  await vi.waitFor(() => expect(changed.drafts.get(baseSession.id)?.text).toBe("A newer unrelated draft"));
+  expect(changed.actionErrors).toEqual([]);
 });
 
 it("keeps /learn drafts on hub, structured-input, busy, and owner-retirement failures", async () => {
@@ -769,7 +861,7 @@ it("does not clear a new mounted owner after the old reset completes", async () 
   expect(view.editor().value).toBe("Fresh draft");
 });
 
-async function mount(initialDraft: ComposerDraft, ownerDocument: Document = document) {
+async function mount(initialDraft: ComposerDraft, ownerDocument: Document = document, objectiveEnabled = false) {
   const drafts = new Map<string, ComposerDraft>([
     [baseSession.id, initialDraft],
     ["task-two", draft("second task")]
@@ -794,6 +886,12 @@ async function mount(initialDraft: ComposerDraft, ownerDocument: Document = docu
       updatedAt: 1,
       expiresAt: 2
     })),
+    getObjective: vi.fn(async () => undefined),
+    setObjective: vi.fn(async (_sessionId: string, generation: bigint, text: string) => objective(text, generation)),
+    updateObjective: vi.fn(async (current) => current),
+    pauseObjective: vi.fn(async (current) => current),
+    resumeObjective: vi.fn(async (current) => current),
+    clearObjective: vi.fn(async () => undefined),
     navigate: vi.fn(() => undefined),
     resetSession: vi.fn(async () => undefined),
     getVoiceInputCapabilities: vi.fn(async () => ({})),
@@ -822,6 +920,8 @@ async function mount(initialDraft: ComposerDraft, ownerDocument: Document = docu
   roots.push(root);
   const actions: Promise<unknown>[] = [];
   const actionErrors: unknown[] = [];
+  let completeObjectiveDialog = (): void => undefined;
+  const openObjective = vi.fn((onSaved: () => void) => { completeObjectiveDialog = onSaved; });
   let activeController = api;
   const render = async (session: SessionView, nextController: AppController = activeController, nextBackend: BackendView = backend) => {
     activeController = nextController;
@@ -847,6 +947,7 @@ async function mount(initialDraft: ComposerDraft, ownerDocument: Document = docu
       t={(key) => key}
       runAction={(_key, action) => { actions.push(action().catch((error: unknown) => { actionErrors.push(error); })); }}
       onLocalSend={() => undefined}
+      onOpenObjective={objectiveEnabled ? openObjective : undefined}
     />));
   };
   await render(baseSession);
@@ -856,6 +957,8 @@ async function mount(initialDraft: ComposerDraft, ownerDocument: Document = docu
     drafts,
     actions,
     actionErrors,
+    openObjective,
+    completeObjectiveDialog: () => completeObjectiveDialog(),
     render,
     hide: async () => { await act(async () => root.render(null)); },
     editor: () => host.querySelector<HTMLTextAreaElement>('[data-mock-composer-editor="true"]')!,
@@ -867,6 +970,22 @@ async function mount(initialDraft: ComposerDraft, ownerDocument: Document = docu
 
 function draft(text: string): ComposerDraft {
   return { text, editorDocument: plainTextToComposerDocument(text), attachments: [], mentions: [], inlineMentionRanges: [], deliveryMode: "prompt" };
+}
+
+function objective(text: string, sessionGeneration: bigint): ObjectiveView {
+  return {
+    sessionId: baseSession.id,
+    text,
+    status: "active",
+    noProgressTurnLimit: 3,
+    turnsUsed: 0,
+    tokensUsed: 0,
+    noProgressTurns: 0,
+    ownerGeneration: 1n,
+    sessionGeneration,
+    startedAt: 1,
+    revision: 1n
+  };
 }
 
 async function input(element: HTMLTextAreaElement | HTMLInputElement, value: string, caret: number, isComposing = false): Promise<void> {

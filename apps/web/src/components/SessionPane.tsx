@@ -81,6 +81,8 @@ import {
 import { sessionDerivationOriginRoute } from "./session-derivation-origin.js";
 import { CollaborationGoalPanel } from "./CollaborationGoalPanel.js";
 import { PortableReplacementCleanupNotice } from "./PortableReplacementCleanupNotice.js";
+import { ObjectiveIndicator, type ObjectiveDialogRequest } from "./ObjectiveIndicator.js";
+import { objectiveSessionAccess } from "../objective-access.js";
 
 // First-stage contracts do not expose a durable dismissal mutation. Keep this bounded and
 // client-local so route switches/remounts are stable without pretending to persist remotely.
@@ -216,6 +218,8 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
   const [backgroundStopping, setBackgroundStopping] = useState(false);
   const [backgroundStopError, setBackgroundStopError] = useState<string>();
   const [collaborationOpen, setCollaborationOpen] = useState(false);
+  const [objectiveDialogRequest, setObjectiveDialogRequest] = useState<ObjectiveDialogRequest>();
+  const objectiveDialogRequestIdRef = useRef(0);
   const collaborationButtonRef = useRef<HTMLButtonElement>(null);
   const [timelineSubagentRuns, setTimelineSubagentRuns] = useState<{
     readonly sessionId: string;
@@ -451,6 +455,13 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
   const allowedPermissions = advertisedPermissionModes(backend);
   const canSetPermission = !reviewReadOnly && permissionChangeSupported(backend);
   const canListRuntimeCommands = !reviewReadOnly && backend?.capabilities.get("runtime.commands")?.supported === true;
+  const objectiveAccess = objectiveSessionAccess(session, backend, {
+    connected: controller.state.connectionState === "connected",
+    reviewReadOnly,
+    embeddedInFiles: presentation === "filesRail"
+  });
+  const objectiveReadable = objectiveAccess !== "hidden";
+  const objectiveSupported = objectiveAccess === "write";
   const canListSessionResources = !reviewReadOnly
     && controller.state.connectionState === "connected"
     && backend?.capabilities.get("runtime.resources")?.supported === true
@@ -2023,7 +2034,17 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
         <InteractionDialog key={interaction === undefined ? "interaction:none" : `${interaction.sessionId}:${interaction.id}`} controller={controller} interaction={interaction} remaining={remainingInteractions} inline t={t} runAction={runAction} />
       </InteractionPromptHost>
       {currentShareSelection !== undefined && <ShareSelectionBar ownerKey={`${timelineResourceOwnerKey}:${session.generation}`} sessionId={session.id} sessionName={session.name} messages={shareableMessages} selectedIds={currentShareSelection.selectedIds} locale={controller.state.effectiveLocale} t={t} getTimelineRoot={getTimelineRoot} onToggleAll={toggleAllShareMessages} onCancel={closeShareSelection} />}
-{interaction === undefined && <div className="session-composer-layer" hidden={currentShareSelection !== undefined}><Composer artifacts={canListSessionArtifacts ? liveArtifacts : []} sessions={historicalSessionMentionCandidates} controller={controller} session={session} backend={backend} sessionUsage={effectiveSessionUsage} readOnly={reviewReadOnly} autoFocus={composerAutoFocus && presentation === "standard" && currentShareSelection === undefined} focusRequest={composerFocusRequest} queue={queue} queueControl={queueControl} workspace={workspace} extraDirectories={extraDirectories} resources={canListSessionResources ? liveResources : []} commands={canListRuntimeCommands ? liveCommands : []} messageHistory={messageHistory} controls={composerControls} runningStatus={<SessionRunningStatusBar session={session} items={recoveryPresentationTimeline} backgroundTaskIds={backgroundTaskIds} canStopBackgroundTasks={canStopBackgroundTasks} backgroundStopping={backgroundStopping} backgroundStopError={backgroundStopError} suppressed={reviewReadOnly} t={t} onStopBackgroundTasks={stopAllBackgroundTasks} />} messageMentionInsertion={composerMessageMentionInsertion} selectionQuoteInsertion={composerSelectionQuoteInsertion} attachmentInsertion={composerAttachmentInsertion} draftReplacement={composerDraftReplacement} onDraftMutation={noteComposerDraftMutation} t={t} runAction={runAction} onLocalSend={(sourceSessionId) => { if (activeSessionIdRef.current === sourceSessionId) setFollowLatestSignal((current) => current + 1); }} onStop={canStop ? stopRun : undefined} stopInFlight={stopInFlight} onCompact={canCompact && !running && activeCompaction === undefined && !compactInFlight && (session.context?.usedTokens ?? 0) > 0 ? requestCompact : undefined} /></div>}
+{interaction === undefined && <div className="session-composer-layer" hidden={currentShareSelection !== undefined}>
+        {objectiveReadable && <ObjectiveIndicator
+          controller={controller}
+          session={session}
+          readOnly={!objectiveSupported}
+          dialogRequest={objectiveDialogRequest}
+          onDialogRequestHandled={() => setObjectiveDialogRequest(undefined)}
+          t={t}
+        />}
+        <Composer artifacts={canListSessionArtifacts ? liveArtifacts : []} sessions={historicalSessionMentionCandidates} controller={controller} session={session} backend={backend} sessionUsage={effectiveSessionUsage} readOnly={reviewReadOnly} autoFocus={composerAutoFocus && presentation === "standard" && currentShareSelection === undefined} focusRequest={composerFocusRequest} queue={queue} queueControl={queueControl} workspace={workspace} extraDirectories={extraDirectories} resources={canListSessionResources ? liveResources : []} commands={canListRuntimeCommands ? liveCommands : []} messageHistory={messageHistory} controls={composerControls} runningStatus={<SessionRunningStatusBar session={session} items={recoveryPresentationTimeline} backgroundTaskIds={backgroundTaskIds} canStopBackgroundTasks={canStopBackgroundTasks} backgroundStopping={backgroundStopping} backgroundStopError={backgroundStopError} suppressed={reviewReadOnly} t={t} onStopBackgroundTasks={stopAllBackgroundTasks} />} messageMentionInsertion={composerMessageMentionInsertion} selectionQuoteInsertion={composerSelectionQuoteInsertion} attachmentInsertion={composerAttachmentInsertion} draftReplacement={composerDraftReplacement} onDraftMutation={noteComposerDraftMutation} t={t} runAction={runAction} onLocalSend={(sourceSessionId) => { if (activeSessionIdRef.current === sourceSessionId) setFollowLatestSignal((current) => current + 1); }} onOpenObjective={objectiveSupported ? (onSaved) => setObjectiveDialogRequest({ id: ++objectiveDialogRequestIdRef.current, onSaved }) : undefined} onStop={canStop ? stopRun : undefined} stopInFlight={stopInFlight} onCompact={canCompact && !running && activeCompaction === undefined && !compactInFlight && (session.context?.usedTokens ?? 0) > 0 ? requestCompact : undefined} />
+      </div>}
       <ExtensionWidgets widgets={extensionWidgets.filter((widget) => widget.placement === "belowEditor")} label={t("a11y.extensionWidgets")} />
       </div>
 

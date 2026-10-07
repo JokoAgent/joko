@@ -1,6 +1,7 @@
 import { downloadArtifactBlob } from "../artifact-download.js";
 import { assertBrowserActionCurrent, type BrowserActionContext } from "../browser-action.js";
 import type { TimelineItemView } from "../model.js";
+import { isInternalContinuationTimelineItem } from "../runtime-recovery.js";
 import { visibleSelectionQuoteMessageText } from "../selection-quote.js";
 import type { RenderedShareImageMessage } from "./share-rendered-message-image.js";
 import {
@@ -15,7 +16,7 @@ export function shareSelectionImageMessages(
   selectedMessages: readonly TimelineItemView[]
 ): readonly RenderedShareImageMessage[] {
   return selectedMessages.flatMap((item) => {
-    if (item.kind !== "user" && item.kind !== "assistant") return [];
+    if ((item.kind !== "user" && item.kind !== "assistant") || isInternalContinuationTimelineItem(item)) return [];
     return [{
       id: item.id,
       text: item.kind === "user"

@@ -24,6 +24,9 @@ describe("runtime recovery presentation", () => {
       }),
       item("hidden-prompt", 3n, "user", {
         automaticContinuation: { recoveryId: "recover-a" }
+      }),
+      item("hidden-objective-prompt", 4n, "user", {
+        objectiveContinuation: { ownerGeneration: 2n, turn: 3 }
       })
     ];
 

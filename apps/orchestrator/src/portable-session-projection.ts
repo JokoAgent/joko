@@ -53,7 +53,9 @@ export function projectPortableSessionMessages(
     if (event.payload.type === "artifact") artifacts.push({ sourceOrder, emittedAt: event.emittedAt, payload: event.payload });
     if (event.payload.type === "status" && event.payload.key === "artifact_unavailable") artifacts.push({ sourceOrder, emittedAt: event.emittedAt, payload: { type: "status", key: "artifact_unavailable", text: event.payload.text ?? "" } });
     if (event.payload.type !== "message_complete" || event.payload.automaticContinuation !== undefined
-      || event.payload.acceptedInput?.automaticContinuation !== undefined) continue;
+      || event.payload.objectiveContinuation !== undefined
+      || event.payload.acceptedInput?.automaticContinuation !== undefined
+      || event.payload.acceptedInput?.objectiveContinuation !== undefined) continue;
     messages.push({
       sourceOrder,
       emittedAt: event.emittedAt,

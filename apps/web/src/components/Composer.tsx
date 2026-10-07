@@ -92,7 +92,7 @@ interface PendingComposerDraftSave {
   queued: boolean;
 }
 
-export function Composer({ controller, session, backend, sessionUsage, readOnly = false, autoFocus = true, focusRequest = 0, queue, queueControl, workspace, extraDirectories, resources, artifacts, sessions, commands, messageHistory, controls, runningStatus, messageMentionInsertion, selectionQuoteInsertion, attachmentInsertion, draftReplacement, t, runAction, onLocalSend, onDraftMutation, onStop, stopInFlight = false, onCompact }: {
+export function Composer({ controller, session, backend, sessionUsage, readOnly = false, autoFocus = true, focusRequest = 0, queue, queueControl, workspace, extraDirectories, resources, artifacts, sessions, commands, messageHistory, controls, runningStatus, messageMentionInsertion, selectionQuoteInsertion, attachmentInsertion, draftReplacement, t, runAction, onLocalSend, onDraftMutation, onOpenObjective, onStop, stopInFlight = false, onCompact }: {
   readonly controller: AppController;
   readonly session: SessionView;
   readonly backend?: BackendView;
@@ -121,6 +121,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
   readonly runAction: RunAction;
   readonly onLocalSend: (sessionId: string) => void;
   readonly onDraftMutation?: () => void;
+  readonly onOpenObjective?: (onSaved: () => void) => void;
   readonly onStop?: () => void;
   readonly stopInFlight?: boolean;
   readonly onCompact?: () => void;
@@ -291,9 +292,18 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
     && backend.health !== "unavailable"
     && learningTargetMatches.length === 1
     && resourceKindsForBackend(backend).includes("skill");
+  const goalSupported = !readOnly
+    && controller.state.connectionState === "connected"
+    && !session.archived
+    && session.state !== "closed"
+    && backend?.id === session.backendId
+    && backend.health !== "unavailable"
+    && backend.capabilities.get("input.text")?.supported === true
+    && onOpenObjective !== undefined;
   const commandOptions = {
     helpSupported: true,
     learnSupported,
+    goalSupported,
     jumpSessionSupported: true,
     userShellSupported: bashCapable,
     sessionResetSupported,
@@ -471,12 +481,12 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
   });
   const sendRouteKey = JSON.stringify([session.backendId, session.targetId, session.model?.providerId, session.model?.modelId]);
   const sendOwner = useMemo(() => ({}), [voiceDictionaryOwnerKey, controller.getArtifactUrl, controller.state.snapshot.generation, sendRouteKey]);
-  const learnCommandFlightRef = useRef<{ readonly owner: object; readonly controller: AbortController } | undefined>(undefined);
+  const applicationCommandFlightRef = useRef<{ readonly owner: object; readonly controller: AbortController } | undefined>(undefined);
   useLayoutEffect(() => () => {
-    const flight = learnCommandFlightRef.current;
+    const flight = applicationCommandFlightRef.current;
     if (flight?.owner === sendOwner) {
       flight.controller.abort();
-      learnCommandFlightRef.current = undefined;
+      applicationCommandFlightRef.current = undefined;
     }
   }, [sendOwner]);
   const gamepadSkillFlight = useRef<{ readonly owner: object } | undefined>(undefined);
@@ -493,8 +503,8 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
     return () => { retire(); ownerWindow?.removeEventListener("pagehide", retire); ownerWindow?.removeEventListener("pageshow", activate); };
   }, [voiceDictionaryOwnerKey, controller.getArtifactUrl, voiceRoot]);
   useLayoutEffect(() => () => attachmentPicker.retire(), [attachmentPicker, sendOwner]);
-  const sendStateRef = useRef({ owner: sendOwner, readOnly, connected: controller.state.connectionState === "connected", learnSupported, supportedModes, attachmentPolicy, mentionPolicy, resources, route: sendRouteKey });
-  sendStateRef.current = { owner: sendOwner, readOnly, connected: controller.state.connectionState === "connected", learnSupported, supportedModes, attachmentPolicy, mentionPolicy, resources, route: sendRouteKey };
+  const sendStateRef = useRef({ owner: sendOwner, readOnly, connected: controller.state.connectionState === "connected", learnSupported, goalSupported, supportedModes, attachmentPolicy, mentionPolicy, resources, route: sendRouteKey });
+  sendStateRef.current = { owner: sendOwner, readOnly, connected: controller.state.connectionState === "connected", learnSupported, goalSupported, supportedModes, attachmentPolicy, mentionPolicy, resources, route: sendRouteKey };
   const voiceSendFlight = useRef<object | undefined>(undefined);
   const sendDraftRef = useRef<(mode?: DeliveryMode, completedDocument?: JSONContent) => void>(() => undefined);
   const canFinishVoiceSend = !readOnly && controller.state.connectionState === "connected" && submissionKind === undefined && !effectiveBashMode && !modelRouteUnavailable && supportedModes.includes(deliveryMode)
@@ -1103,7 +1113,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
   const sendDraft = (
     modeOverride?: DeliveryMode,
     completedDocument?: JSONContent,
-    runtimeLearnDispatch = false,
+    runtimeApplicationCommand?: "learn" | "goal",
     pinnedController?: AppController
   ): void => {
     if (readOnly) return;
@@ -1166,11 +1176,129 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
       return;
     }
     const parsedBuiltInCommand = composerBuiltInCommand(draftText, commandOptions);
-    const builtInCommand = runtimeLearnDispatch && parsedBuiltInCommand?.kind === "learn"
+    const parsedApplicationCommand = parsedBuiltInCommand?.kind === "learn" || parsedBuiltInCommand?.kind === "objective";
+    const applicationCommandName = parsedBuiltInCommand?.kind === "learn" ? "learn"
+      : parsedBuiltInCommand?.kind === "objective" ? "goal" : undefined;
+    const builtInCommand = applicationCommandName !== undefined && runtimeApplicationCommand === applicationCommandName
       ? undefined
-      : browserComments.length === 0 || parsedBuiltInCommand?.kind === "learn"
+      : browserComments.length === 0 || parsedApplicationCommand
         ? parsedBuiltInCommand
         : undefined;
+    if (builtInCommand?.kind === "objective") {
+      const sourceSessionId = session.id;
+      const owner = sourceGuard.capture(sourceSessionId);
+      if (!sourceGuard.beginSubmission(sourceSessionId, "send")) return;
+      const sourceDeliveryMode = modeOverride ?? deliveryMode;
+      const sourceSendOwner = sendOwner;
+      const sourceRoute = sendRouteKey;
+      const sourceEpoch = sendEpochRef.current;
+      const sourceOwnerDocument = composerStackRef.current?.ownerDocument;
+      const sourceOwnerWindow = sourceOwnerDocument?.defaultView;
+      if (sourceEpoch === undefined || sourceOwnerDocument === undefined || sourceOwnerWindow === null || sourceOwnerWindow === undefined) {
+        finishSubmission(sourceSessionId, "send", sourceGuard);
+        return;
+      }
+      const requestController = new AbortController();
+      const flight = { owner: sourceSendOwner, controller: requestController };
+      applicationCommandFlightRef.current = flight;
+      const retire = (): void => requestController.abort();
+      sourceOwnerWindow.addEventListener("pagehide", retire);
+      setSubmissionKind("send");
+      runAction(`objective-command:${sourceSessionId}`, async () => {
+        let handedOffToRuntime = false;
+        const draftOwnerIsCurrent = (): boolean => {
+          const current = sendStateRef.current;
+          return sourceEpoch === sendEpochRef.current
+            && operationGuardRef.current === sourceGuard
+            && sourceGuard.ownsActivation(owner)
+            && current.owner === sourceSendOwner
+            && !current.readOnly
+            && current.connected
+            && current.goalSupported
+            && current.route === sourceRoute
+            && sourceOwnerDocument.defaultView === sourceOwnerWindow
+            && composerStackRef.current?.ownerDocument === sourceOwnerDocument
+            && composerStackRef.current?.isConnected === true;
+        };
+        const ownerIsCurrent = (): boolean => !requestController.signal.aborted && draftOwnerIsCurrent();
+        const clearInvocation = (): void => {
+          if (!draftOwnerIsCurrent() || !sourceGuard.consumeUnchangedDraft(owner)
+            || !sourceDraftStillClearable(sourceSessionId, owner)) return;
+          resetHistoryNavigation();
+          closePalette();
+          editorRevisionRef.current += 1;
+          const clearedDocument = emptyComposerDocument();
+          editorDocumentRef.current = clearedDocument;
+          textRef.current = "";
+          mentionsRef.current = [];
+          setEditorDocument(clearedDocument);
+          setText("");
+          setMentions([]);
+          replaceInlineMentionRanges([]);
+          setExtraDirectoryIds(undefined);
+          setAttachmentError(undefined);
+          requestComposerFrame(() => richEditorRef.current?.focus());
+          void enqueueDraftSave(draftSaveChainRef, sourceControllerRef, sourceSessionId, {
+            text: "",
+            editorDocument: clearedDocument,
+            deliveryMode: sourceDeliveryMode,
+            mentions: [],
+            attachments: []
+          }).catch(() => undefined);
+        };
+        try {
+          if (!ownerIsCurrent() || !sourceGuard.draftUnchanged(owner)) throw new Error(t("composer.inputUnavailable"));
+          const currentCommands = await sourceController.listCommands(sourceSessionId, requestController.signal);
+          if (!ownerIsCurrent() || !sourceGuard.draftUnchanged(owner)) throw new Error(t("composer.inputUnavailable"));
+          if (runtimeCommandOwnsApplicationCommand(currentCommands, "goal")) {
+            handedOffToRuntime = true;
+            finishSubmission(sourceSessionId, "send", sourceGuard);
+            sendDraft(sourceDeliveryMode, draftDocument, "goal", sourceController);
+            return;
+          }
+          if (
+            attachments.length > 0
+            || browserComments.length > 0
+            || mentions.length > 0
+            || selectionQuotes.length > 0
+            || (extraDirectoryIds?.length ?? 0) > 0
+            || !composerDocumentIsPlainTextInvocation(draftDocument)
+          ) throw new Error(t("composer.inputUnavailable"));
+
+          if (builtInCommand.action === "open") {
+            if (!ownerIsCurrent() || onOpenObjective === undefined) throw new Error(t("composer.inputUnavailable"));
+            onOpenObjective(clearInvocation);
+            return;
+          }
+          if (builtInCommand.action === "set") {
+            await sourceController.setObjective(
+              sourceSessionId,
+              session.generation,
+              builtInCommand.text ?? "",
+              { noProgressTurnLimit: 3 },
+              requestController.signal
+            );
+          } else {
+            const currentObjective = await sourceController.getObjective(sourceSessionId, requestController.signal);
+            if (!ownerIsCurrent() || !sourceGuard.draftUnchanged(owner)) throw new Error(t("composer.inputUnavailable"));
+            if (currentObjective !== undefined) {
+              if (currentObjective.sessionGeneration !== session.generation) throw new Error(t("composer.inputUnavailable"));
+              await sourceController.clearObjective(currentObjective, requestController.signal);
+            }
+          }
+          if (!ownerIsCurrent()) return;
+          clearInvocation();
+        } catch (error) {
+          if (!ownerIsCurrent()) return;
+          throw error;
+        } finally {
+          sourceOwnerWindow.removeEventListener("pagehide", retire);
+          if (applicationCommandFlightRef.current === flight) applicationCommandFlightRef.current = undefined;
+          if (!handedOffToRuntime) finishSubmission(sourceSessionId, "send", sourceGuard);
+        }
+      });
+      return;
+    }
     if (builtInCommand?.kind === "learn") {
       const sourceSessionId = session.id;
       const owner = sourceGuard.capture(sourceSessionId);
@@ -1187,7 +1315,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
       }
       const requestController = new AbortController();
       const flight = { owner: sourceSendOwner, controller: requestController };
-      learnCommandFlightRef.current = flight;
+      applicationCommandFlightRef.current = flight;
       const retire = (): void => requestController.abort();
       sourceOwnerWindow.addEventListener("pagehide", retire);
       setSubmissionKind("send");
@@ -1215,7 +1343,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
           if (runtimeCommandOwnsApplicationCommand(currentCommands, "learn")) {
             handedOffToRuntime = true;
             finishSubmission(sourceSessionId, "send", sourceGuard);
-            sendDraft(sourceDeliveryMode, draftDocument, true, sourceController);
+            sendDraft(sourceDeliveryMode, draftDocument, "learn", sourceController);
             return;
           }
           if (
@@ -1280,7 +1408,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
           throw error;
         } finally {
           sourceOwnerWindow.removeEventListener("pagehide", retire);
-          if (learnCommandFlightRef.current === flight) learnCommandFlightRef.current = undefined;
+          if (applicationCommandFlightRef.current === flight) applicationCommandFlightRef.current = undefined;
           if (!handedOffToRuntime) finishSubmission(sourceSessionId, "send", sourceGuard);
         }
       });

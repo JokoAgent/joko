@@ -1271,6 +1271,50 @@ export interface SessionView {
   readonly codeHostPullRequests?: readonly CodeHostPullRequestView[];
 }
 
+export type ObjectiveStatusView =
+  | "active"
+  | "paused"
+  | "blocked"
+  | "complete"
+  | "budgetLimited"
+  | "usageLimited"
+  | "dispatchUnknown";
+
+export interface ObjectiveLimitsView {
+  readonly tokenBudget?: number;
+  readonly maximumTurns?: number;
+  readonly noProgressTurnLimit?: number;
+}
+
+/** One durable autonomous objective owned by an exact Session generation. */
+export interface ObjectiveView extends ObjectiveLimitsView {
+  readonly sessionId: string;
+  readonly text: string;
+  readonly status: ObjectiveStatusView;
+  readonly turnsUsed: number;
+  readonly tokensUsed: number;
+  readonly noProgressTurns: number;
+  readonly lastReason?: string;
+  readonly ownerGeneration: bigint;
+  readonly sessionGeneration: bigint;
+  readonly pendingRunId?: string;
+  readonly pendingQueueItemId?: string;
+  readonly startedAt: number;
+  readonly usageResetAt?: number;
+  readonly revision: bigint;
+}
+
+export type ObjectiveWatchUpdateView =
+  | { readonly kind: "objective"; readonly objective: ObjectiveView }
+  | { readonly kind: "cleared" };
+
+export interface ObjectiveUpdatePatchView {
+  readonly text?: string;
+  readonly tokenBudget?: number | null;
+  readonly maximumTurns?: number | null;
+  readonly noProgressTurnLimit?: number | null;
+}
+
 export type NativeNavigationTargetView =
   | { readonly kind: "native_entry"; readonly entryId: string }
   | { readonly kind: "session_start" };
@@ -1337,6 +1381,7 @@ export interface TimelineItemView {
     | "compaction"
     | "contextRebuild"
     | "runtimeRecovery"
+    | "objective"
     | "interaction"
     | "background"
     | "review"
@@ -1373,6 +1418,11 @@ export interface TimelineItemView {
   readonly inputDelivery?: DeliveryMode | "scheduler";
   /** Service-owned continuation prompt; hidden in favor of its recovery activity row. */
   readonly automaticContinuation?: { readonly recoveryId: string };
+  /** Host-owned Objective continuation directive; never user-authored or user-visible. */
+  readonly objectiveContinuation?: {
+    readonly ownerGeneration: bigint;
+    readonly turn: number;
+  };
   readonly tool?: ToolCallView;
   /** Inline projection replacing one or more raw plan tool rows. */
   readonly inlinePlan?: TimelinePlanView;
@@ -1390,6 +1440,8 @@ export interface TimelineItemView {
   readonly contextRebuild?: TimelineContextRebuildView;
   /** Durable interrupted-turn recovery lifecycle. */
   readonly runtimeRecovery?: TimelineRuntimeRecoveryView;
+  /** Durable Objective lifecycle presentation; internal directives remain separate and hidden. */
+  readonly objectiveLifecycle?: TimelineObjectiveLifecycleView;
   readonly attachments?: readonly ArtifactView[];
   readonly workspaceDiff?: TimelineWorkspaceDiffView;
 }
@@ -2415,6 +2467,26 @@ export interface TimelineRuntimeRecoveryView {
   readonly delayMs?: number;
   readonly routeChanged?: boolean;
   readonly error: ErrorView;
+}
+
+export interface TimelineObjectiveLifecycleView {
+  readonly action:
+    | "started"
+    | "replaced"
+    | "paused"
+    | "resumed"
+    | "completed"
+    | "blocked"
+    | "limited"
+    | "dispatchUnknown"
+    | "cleared";
+  readonly status?: ObjectiveStatusView;
+  readonly ownerGeneration: bigint;
+  readonly turnsUsed: number;
+  readonly tokensUsed: number;
+  readonly elapsedMs: number;
+  readonly objectiveText?: string;
+  readonly reason?: string;
 }
 
 export interface ScheduleRunMoneyView {
@@ -5881,6 +5953,13 @@ export interface OperationApi extends VoiceDictionaryPeerApi {
   cancelSkillPublication(job: SkillPublicationJobView, signal?: AbortSignal): Promise<void>;
   retrySkillPublication(job: SkillPublicationJobView, signal?: AbortSignal): Promise<void>;
   listCommands(sessionId: string, signal?: AbortSignal): Promise<readonly RuntimeCommandView[]>;
+  getObjective(sessionId: string, signal?: AbortSignal): Promise<ObjectiveView | undefined>;
+  watchObjective(sessionId: string, afterRevision?: bigint, signal?: AbortSignal): AsyncIterable<ObjectiveWatchUpdateView>;
+  setObjective(sessionId: string, expectedSessionGeneration: bigint, text: string, limits?: ObjectiveLimitsView, signal?: AbortSignal): Promise<ObjectiveView>;
+  updateObjective(objective: ObjectiveView, patch: ObjectiveUpdatePatchView, signal?: AbortSignal): Promise<ObjectiveView>;
+  pauseObjective(objective: ObjectiveView, reason: string, signal?: AbortSignal): Promise<ObjectiveView>;
+  resumeObjective(objective: ObjectiveView, signal?: AbortSignal): Promise<ObjectiveView>;
+  clearObjective(objective: ObjectiveView, signal?: AbortSignal): Promise<void>;
   listSessionResources(sessionId: string, signal?: AbortSignal): Promise<readonly SessionResourceView[]>;
   listRuntimeProcesses(backendId: string, signal?: AbortSignal): Promise<RuntimeProcessUsageSnapshotView>;
   getUsageHistory(days?: number, backendId?: string, providerId?: string, signal?: AbortSignal): Promise<UsageHistoryView>;

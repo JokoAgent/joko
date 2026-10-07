@@ -135,6 +135,11 @@ export type EventPayload =
       readonly automaticContinuation?: {
         readonly recoveryId: string;
       };
+      /** Host-authored Objective continuation; hidden from user-message UI. */
+      readonly objectiveContinuation?: {
+        readonly ownerGeneration: number;
+        readonly turn: number;
+      };
       /** Opaque Backend-owned history semantics used only for branch navigation/reconciliation. */
       readonly nativeHistory?: NativeHistoryEventContext;
     }
@@ -150,6 +155,21 @@ export type EventPayload =
       readonly delayMs?: number;
       readonly routeChanged?: boolean;
       readonly error: PublicError;
+    }
+  | {
+      /** Durable, Host-authored Objective lifecycle marker for Timeline UI. */
+      readonly type: "objective_lifecycle";
+      readonly action: "started" | "replaced" | "paused" | "resumed" | "completed" |
+        "blocked" | "limited" | "dispatch_unknown" | "cleared";
+      readonly status?: "active" | "paused" | "blocked" | "complete" | "budget_limited" |
+        "usage_limited" | "dispatch_unknown";
+      readonly ownerGeneration: number;
+      readonly turnsUsed: number;
+      readonly tokensUsed: number;
+      readonly elapsedMs: number;
+      /** Snapshot required for started/replaced markers. */
+      readonly objectiveText?: string;
+      readonly reason?: string;
     }
   | { readonly type: "status"; readonly key: string; readonly text?: string; readonly nativeHistory?: NativeHistoryEventContext }
   | {

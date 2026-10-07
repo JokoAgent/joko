@@ -318,7 +318,8 @@ export class SessionNavigationCoordinator {
           boundaryReached = true;
           break;
         }
-        if (event.payload.type !== "message_complete" || event.payload.automaticContinuation !== undefined) continue;
+        if (event.payload.type !== "message_complete" || event.payload.automaticContinuation !== undefined
+          || event.payload.objectiveContinuation !== undefined) continue;
         if (excludeActiveRuns && event.runId !== undefined && this.#runIsActive(event.runId)) continue;
         const text = event.payload.blocks
           .filter((block): block is Extract<(typeof event.payload.blocks)[number], { readonly kind: "text" }> => block.kind === "text")

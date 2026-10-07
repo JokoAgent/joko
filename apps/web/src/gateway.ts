@@ -181,6 +181,9 @@ import {
   McpServerState,
   McpTransport,
   NativeSessionStartSchema,
+  ObjectiveService,
+  ObjectiveLifecycleAction as ProtoObjectiveLifecycleAction,
+  ObjectiveStatus as ProtoObjectiveStatus,
   OperationService,
   OperationState,
   OperationMutationSchema,
@@ -446,6 +449,8 @@ import {
   type ModelPriceQuote as ProtoModelPriceQuote,
   type NativeSessionCandidate,
   type NativeSessionCatalogEntry,
+  type Objective as ProtoObjective,
+  type ObjectiveLifecycleEvent as ProtoObjectiveLifecycleEvent,
   type Operation,
   type ProviderDescriptor,
   type ProviderConfiguration,
@@ -661,6 +666,10 @@ import type {
   WeChatMessagingConfigurationView,
   SlackMessagingConfigurationView,
   OperationApi,
+  ObjectiveLimitsView,
+  ObjectiveUpdatePatchView,
+  ObjectiveView,
+  ObjectiveWatchUpdateView,
   PartnerCapabilitiesView,
   PartnerActivityView,
   PartnerDelegationStatusView,
@@ -820,6 +829,7 @@ import type {
   TimelineHistoryPageView,
   TimelineItemView,
   TimelineMessageUsageView,
+  TimelineObjectiveLifecycleView,
   UsageCurrencyTotalView,
   UsageHistorySummaryView,
   UsageHistoryView,
@@ -4444,6 +4454,171 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
       throw new GatewayError("Orchestrator returned a runtime command for a different task.");
     }
     return commands;
+  }
+
+  async getObjective(sessionId: string, signal?: AbortSignal): Promise<ObjectiveView | undefined> {
+    requireObjectiveSessionId(sessionId);
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ObjectiveService, scope.transport).getObjective(
+      { sessionId },
+      { signal: scope.signal }
+    );
+    scope.signal.throwIfAborted();
+    return response.objective === undefined ? undefined : mapObjective(response.objective, sessionId);
+  }
+
+  async *watchObjective(
+    sessionId: string,
+    afterRevision?: bigint,
+    signal?: AbortSignal
+  ): AsyncIterable<ObjectiveWatchUpdateView> {
+    requireObjectiveSessionId(sessionId);
+    if (afterRevision !== undefined && afterRevision < 1n) {
+      throw new GatewayError("An Objective watch requires a valid revision.");
+    }
+    const request = new AbortController();
+    const requestSignal = signal === undefined ? request.signal : AbortSignal.any([signal, request.signal]);
+    const scope = this.captureActionScope(requestSignal);
+    try {
+      const stream = createClient(ObjectiveService, scope.transport).watchObjective({
+        sessionId,
+        ...(afterRevision === undefined ? {} : { afterRevision: { value: afterRevision } })
+      }, { signal: scope.signal });
+      for await (const response of stream) {
+        scope.signal.throwIfAborted();
+        if (response.objective !== undefined && response.cleared) {
+          throw new GatewayError("Orchestrator returned an ambiguous Objective update.");
+        }
+        if (response.objective !== undefined) {
+          yield { kind: "objective", objective: mapObjective(response.objective, sessionId) };
+        } else if (response.cleared) {
+          yield { kind: "cleared" };
+        }
+      }
+    } finally {
+      request.abort();
+    }
+  }
+
+  async setObjective(
+    sessionId: string,
+    expectedSessionGeneration: bigint,
+    text: string,
+    limits: ObjectiveLimitsView = {},
+    signal?: AbortSignal
+  ): Promise<ObjectiveView> {
+    requireObjectiveSessionId(sessionId);
+    if (expectedSessionGeneration < 1n) throw new GatewayError("An Objective requires a valid task generation.");
+    const objectiveText = requireObjectiveText(text);
+    const normalizedLimits = normalizeObjectiveLimits(limits);
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ObjectiveService, scope.transport).setObjective({
+      requestId: randomUuid(),
+      sessionId,
+      text: objectiveText,
+      limits: {
+        ...(normalizedLimits.tokenBudget === undefined ? {} : { tokenBudget: BigInt(normalizedLimits.tokenBudget) }),
+        ...(normalizedLimits.maximumTurns === undefined ? {} : { maximumTurns: normalizedLimits.maximumTurns }),
+        ...(normalizedLimits.noProgressTurnLimit === undefined ? {} : { noProgressTurnLimit: normalizedLimits.noProgressTurnLimit })
+      },
+      expectedSessionGeneration
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    const objective = mapObjectiveMutation(response.objective, sessionId);
+    if (objective.text !== objectiveText || objective.sessionGeneration !== expectedSessionGeneration
+      || !objectiveLimitsEqual(objective, normalizedLimits)) {
+      throw new GatewayError("Orchestrator returned a mismatched Objective.");
+    }
+    return objective;
+  }
+
+  async updateObjective(
+    current: ObjectiveView,
+    patch: ObjectiveUpdatePatchView,
+    signal?: AbortSignal
+  ): Promise<ObjectiveView> {
+    requireObjectiveMutationOwner(current);
+    if (!objectivePatchHasUpdate(patch)) throw new GatewayError("An Objective update requires a change.");
+    const text = patch.text === undefined ? undefined : requireObjectiveText(patch.text);
+    const tokenBudgetUpdate = !Object.prototype.hasOwnProperty.call(patch, "tokenBudget")
+      ? { case: undefined } as const
+      : patch.tokenBudget === null
+        ? { case: "clearTokenBudget", value: true } as const
+        : { case: "tokenBudget", value: BigInt(requireObjectiveLimit(patch.tokenBudget, "token budget", Number.MAX_SAFE_INTEGER)) } as const;
+    const maximumTurnsUpdate = !Object.prototype.hasOwnProperty.call(patch, "maximumTurns")
+      ? { case: undefined } as const
+      : patch.maximumTurns === null
+        ? { case: "clearMaximumTurns", value: true } as const
+        : { case: "maximumTurns", value: requireObjectiveLimit(patch.maximumTurns, "maximum turns", 10_000) } as const;
+    const noProgressTurnLimitUpdate = !Object.prototype.hasOwnProperty.call(patch, "noProgressTurnLimit")
+      ? { case: undefined } as const
+      : patch.noProgressTurnLimit === null
+        ? { case: "clearNoProgressTurnLimit", value: true } as const
+        : { case: "noProgressTurnLimit", value: requireObjectiveLimit(patch.noProgressTurnLimit, "no-progress turn limit", 1_000) } as const;
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ObjectiveService, scope.transport).updateObjective({
+      requestId: randomUuid(),
+      sessionId: current.sessionId,
+      expectedRevision: { value: current.revision },
+      expectedOwnerGeneration: current.ownerGeneration,
+      ...(text === undefined ? {} : { text }),
+      tokenBudgetUpdate,
+      maximumTurnsUpdate,
+      noProgressTurnLimitUpdate
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    const objective = mapObjectiveMutation(response.objective, current.sessionId);
+    if (objective.ownerGeneration < current.ownerGeneration || objective.sessionGeneration !== current.sessionGeneration
+      || objective.revision <= current.revision
+      || text !== undefined && objective.text !== text
+      || Object.prototype.hasOwnProperty.call(patch, "tokenBudget") && objective.tokenBudget !== (patch.tokenBudget ?? undefined)
+      || Object.prototype.hasOwnProperty.call(patch, "maximumTurns") && objective.maximumTurns !== (patch.maximumTurns ?? undefined)
+      || Object.prototype.hasOwnProperty.call(patch, "noProgressTurnLimit") && objective.noProgressTurnLimit !== (patch.noProgressTurnLimit ?? undefined)) {
+      throw new GatewayError("Orchestrator returned a mismatched Objective update.");
+    }
+    return objective;
+  }
+
+  async pauseObjective(current: ObjectiveView, reason: string, signal?: AbortSignal): Promise<ObjectiveView> {
+    requireObjectiveMutationOwner(current);
+    const normalizedReason = reason.trim();
+    if (normalizedReason.length === 0) throw new GatewayError("An Objective pause reason is required.");
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ObjectiveService, scope.transport).pauseObjective({
+      requestId: randomUuid(),
+      sessionId: current.sessionId,
+      expectedRevision: { value: current.revision },
+      expectedOwnerGeneration: current.ownerGeneration,
+      reason: normalizedReason
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return requireObjectiveMutationResult(response.objective, current, "paused");
+  }
+
+  async resumeObjective(current: ObjectiveView, signal?: AbortSignal): Promise<ObjectiveView> {
+    requireObjectiveMutationOwner(current);
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ObjectiveService, scope.transport).resumeObjective({
+      requestId: randomUuid(),
+      sessionId: current.sessionId,
+      expectedRevision: { value: current.revision },
+      expectedOwnerGeneration: current.ownerGeneration
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return requireObjectiveMutationResult(response.objective, current);
+  }
+
+  async clearObjective(current: ObjectiveView, signal?: AbortSignal): Promise<void> {
+    requireObjectiveMutationOwner(current);
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ObjectiveService, scope.transport).clearObjective({
+      requestId: randomUuid(),
+      sessionId: current.sessionId,
+      expectedRevision: { value: current.revision },
+      expectedOwnerGeneration: current.ownerGeneration
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    if (!response.cleared) throw new GatewayError("Orchestrator did not confirm that the Objective was cleared.");
   }
 
   async listSessionResources(sessionId: string, signal?: AbortSignal): Promise<readonly SessionResourceView[]> {
@@ -10042,6 +10217,7 @@ export function projectSnapshotEvent(
     case "recoverableError":
     case "contextRebuilt":
     case "browserActivity":
+    case "objectiveLifecycle":
       break;
     case "nativeSessionChanged":
       // A marker can remove the whole active prefix; only the service owns
@@ -10187,7 +10363,8 @@ function isTimelineEvent(kind: NonNullable<NonNullable<Event["payload"]>["kind"]
     || kind === "runAborted"
     || kind === "recoverableError"
     || kind === "terminalError"
-    || kind === "runtimeRecoveryChanged";
+    || kind === "runtimeRecoveryChanged"
+    || kind === "objectiveLifecycle";
 }
 
 function projectTimelineEvent(
@@ -10236,6 +10413,15 @@ function projectTimelineEvent(
         : existing?.automationOrigin;
       const inputDelivery = uiMessageInputDelivery(kind.value.inputDelivery);
       const inputOperationId = kind.value.role === 1 ? event.identity?.operationId : undefined;
+      const rawObjectiveContinuation = kind.value.objectiveContinuation;
+      if (rawObjectiveContinuation !== undefined && (
+        kind.value.role !== 1
+        || rawObjectiveContinuation.ownerGeneration <= 0n
+        || !Number.isSafeInteger(rawObjectiveContinuation.turn)
+        || rawObjectiveContinuation.turn < 1
+      )) {
+        throw new GatewayError("Orchestrator returned an invalid Objective continuation marker.");
+      }
       replaceOrAppend({
         id: kind.value.messageId,
         messageId: kind.value.messageId,
@@ -10259,6 +10445,12 @@ function projectTimelineEvent(
         ...(kind.value.role === 1 && kind.value.automaticContinuation && kind.value.runtimeRecoveryId.trim().length > 0
           ? { automaticContinuation: { recoveryId: kind.value.runtimeRecoveryId } }
           : {}),
+        ...(rawObjectiveContinuation === undefined
+          ? {}
+          : { objectiveContinuation: {
+              ownerGeneration: rawObjectiveContinuation.ownerGeneration,
+              turn: rawObjectiveContinuation.turn
+            } }),
         streaming: kind.value.role !== 1
       });
       break;
@@ -10553,6 +10745,18 @@ function projectTimelineEvent(
           error: mapError(recovery.error, recovery.continuationRunId || recovery.sourceRunId)
         }
       }, (candidate) => candidate.runtimeRecovery?.id === recovery.recoveryId);
+      break;
+    }
+    case "objectiveLifecycle": {
+      const lifecycle = mapObjectiveLifecycle(kind.value);
+      replaceOrAppend({
+        id: event.eventId,
+        sourceEventId: event.eventId,
+        sequence,
+        kind: "objective",
+        createdAt,
+        objectiveLifecycle: lifecycle
+      });
       break;
     }
     case "reviewRunChanged": {
@@ -18809,6 +19013,221 @@ function toolResultAttachments(result: any): readonly ArtifactView[] {
     }
   }
   return attachments;
+}
+
+function requireObjectiveSessionId(value: string): void {
+  if (value.trim() === "" || value !== value.trim()) {
+    throw new GatewayError("An Objective requires an exact task ID.");
+  }
+}
+
+function requireObjectiveText(value: string): string {
+  const normalized = value.normalize("NFC").replace(/\r\n?/gu, "\n").trim();
+  if (normalized.length === 0 || [...normalized].length > 32_000 || normalized.includes("\0")) {
+    throw new GatewayError("Objective text must contain between 1 and 32000 safe characters.");
+  }
+  return normalized;
+}
+
+function requireObjectiveLimit(value: number | undefined, label: string, maximum: number): number {
+  if (value === undefined || !Number.isSafeInteger(value) || value < 1 || value > maximum) {
+    throw new GatewayError(`Objective ${label} must be an integer between 1 and ${maximum}.`);
+  }
+  return value;
+}
+
+function normalizeObjectiveLimits(value: ObjectiveLimitsView): ObjectiveLimitsView {
+  return {
+    ...(value.tokenBudget === undefined ? {} : {
+      tokenBudget: requireObjectiveLimit(value.tokenBudget, "token budget", Number.MAX_SAFE_INTEGER)
+    }),
+    ...(value.maximumTurns === undefined ? {} : {
+      maximumTurns: requireObjectiveLimit(value.maximumTurns, "maximum turns", 10_000)
+    }),
+    ...(value.noProgressTurnLimit === undefined ? {} : {
+      noProgressTurnLimit: requireObjectiveLimit(value.noProgressTurnLimit, "no-progress turn limit", 1_000)
+    })
+  };
+}
+
+function objectiveStatus(value: ProtoObjectiveStatus): ObjectiveView["status"] {
+  switch (value) {
+    case ProtoObjectiveStatus.ACTIVE: return "active";
+    case ProtoObjectiveStatus.PAUSED: return "paused";
+    case ProtoObjectiveStatus.BLOCKED: return "blocked";
+    case ProtoObjectiveStatus.COMPLETE: return "complete";
+    case ProtoObjectiveStatus.BUDGET_LIMITED: return "budgetLimited";
+    case ProtoObjectiveStatus.USAGE_LIMITED: return "usageLimited";
+    case ProtoObjectiveStatus.DISPATCH_UNKNOWN: return "dispatchUnknown";
+    default: throw new GatewayError("Orchestrator returned an unknown Objective status.");
+  }
+}
+
+function objectiveLifecycleAction(value: ProtoObjectiveLifecycleAction): TimelineObjectiveLifecycleView["action"] {
+  switch (value) {
+    case ProtoObjectiveLifecycleAction.STARTED: return "started";
+    case ProtoObjectiveLifecycleAction.REPLACED: return "replaced";
+    case ProtoObjectiveLifecycleAction.PAUSED: return "paused";
+    case ProtoObjectiveLifecycleAction.RESUMED: return "resumed";
+    case ProtoObjectiveLifecycleAction.COMPLETED: return "completed";
+    case ProtoObjectiveLifecycleAction.BLOCKED: return "blocked";
+    case ProtoObjectiveLifecycleAction.LIMITED: return "limited";
+    case ProtoObjectiveLifecycleAction.DISPATCH_UNKNOWN: return "dispatchUnknown";
+    case ProtoObjectiveLifecycleAction.CLEARED: return "cleared";
+    default: throw new GatewayError("Orchestrator returned an unknown Objective lifecycle action.");
+  }
+}
+
+function mapObjectiveLifecycle(value: ProtoObjectiveLifecycleEvent): TimelineObjectiveLifecycleView {
+  const action = objectiveLifecycleAction(value.action);
+  const status = value.status === ProtoObjectiveStatus.UNSPECIFIED ? undefined : objectiveStatus(value.status);
+  const tokensUsed = exactSafeUnsignedNumber(value.tokensUsed);
+  const elapsedMs = exactSafeUnsignedNumber(value.elapsedMs);
+  const objectiveText = value.objectiveText;
+  const reason = value.reason;
+  const actionStatusMatches = action === "started" || action === "resumed"
+    ? status === "active"
+    : action === "replaced"
+      ? status !== undefined
+      : action === "paused"
+        ? status === "paused"
+        : action === "completed"
+          ? status === "complete"
+          : action === "blocked"
+            ? status === "blocked"
+            : action === "limited"
+              ? status === "budgetLimited" || status === "usageLimited"
+              : action === "dispatchUnknown"
+                ? status === "dispatchUnknown"
+                : status === undefined;
+  const hasObjectiveText = action === "started" || action === "replaced";
+  const normalizedObjectiveText = hasObjectiveText ? requireObjectiveText(objectiveText) : undefined;
+  if (
+    value.ownerGeneration < 1n
+    || value.ownerGeneration > BigInt(Number.MAX_SAFE_INTEGER)
+    || !Number.isSafeInteger(value.turnsUsed)
+    || value.turnsUsed < 0
+    || value.turnsUsed > 10_000
+    || tokensUsed === undefined
+    || elapsedMs === undefined
+    || !actionStatusMatches
+    || hasObjectiveText && normalizedObjectiveText !== objectiveText
+    || !hasObjectiveText && objectiveText !== ""
+    || reason !== reason.trim()
+    || reason.includes("\0")
+    || [...reason].length > 2_048
+  ) throw new GatewayError("Orchestrator returned an invalid Objective lifecycle event.");
+  return {
+    action,
+    ...(status === undefined ? {} : { status }),
+    ownerGeneration: value.ownerGeneration,
+    turnsUsed: value.turnsUsed,
+    tokensUsed,
+    elapsedMs,
+    ...(normalizedObjectiveText === undefined ? {} : { objectiveText: normalizedObjectiveText }),
+    ...(reason === "" ? {} : { reason })
+  };
+}
+
+function requiredObjectiveTimestamp(
+  value: { readonly seconds: bigint; readonly nanos: number } | undefined,
+  label: string
+): number {
+  if (value === undefined || value.seconds < 0n || value.nanos < 0 || value.nanos >= 1_000_000_000
+    || value.nanos % 1_000_000 !== 0) {
+    throw new GatewayError(`Orchestrator returned an invalid Objective ${label}.`);
+  }
+  const milliseconds = value.seconds * 1_000n + BigInt(value.nanos / 1_000_000);
+  if (milliseconds > BigInt(Number.MAX_SAFE_INTEGER)) {
+    throw new GatewayError(`Orchestrator returned an invalid Objective ${label}.`);
+  }
+  return Number(milliseconds);
+}
+
+function mapObjective(value: ProtoObjective, expectedSessionId: string): ObjectiveView {
+  const revision = value.version?.revision?.value;
+  const tokensUsed = exactSafeUnsignedNumber(value.tokensUsed);
+  const tokenBudget = value.tokenBudget === undefined ? undefined : exactSafeUnsignedNumber(value.tokenBudget);
+  const usageResetAt = (value as ProtoObjective & {
+    readonly usageResetAt?: { readonly seconds: bigint; readonly nanos: number };
+  }).usageResetAt;
+  const normalizedText = requireObjectiveText(value.text);
+  const pendingRunId = value.pendingRunId;
+  const pendingQueueItemId = value.pendingQueueItemId;
+  if (value.sessionId !== expectedSessionId || normalizedText !== value.text || revision === undefined || revision < 1n
+    || value.ownerGeneration < 1n || value.ownerGeneration > BigInt(Number.MAX_SAFE_INTEGER)
+    || value.sessionGeneration < 1n || value.sessionGeneration > BigInt(Number.MAX_SAFE_INTEGER)
+    || !Number.isSafeInteger(value.turnsUsed) || value.turnsUsed < 0 || value.turnsUsed > 10_000
+    || tokensUsed === undefined
+    || !Number.isSafeInteger(value.noProgressTurns) || value.noProgressTurns < 0 || value.noProgressTurns > 1_000
+    || tokenBudget === undefined && value.tokenBudget !== undefined
+    || value.maximumTurns !== undefined && (!Number.isSafeInteger(value.maximumTurns) || value.maximumTurns < 1 || value.maximumTurns > 10_000)
+    || value.noProgressTurnLimit !== undefined && (!Number.isSafeInteger(value.noProgressTurnLimit) || value.noProgressTurnLimit < 1 || value.noProgressTurnLimit > 1_000)
+    || (pendingRunId === undefined) !== (pendingQueueItemId === undefined)
+    || pendingRunId !== undefined && (pendingRunId.trim() === "" || pendingQueueItemId?.trim() === "")) {
+    throw new GatewayError("Orchestrator returned an invalid Objective.");
+  }
+  const lastReason = value.lastReason.trim();
+  if ([...lastReason].length > 2_048 || lastReason.includes("\0")) {
+    throw new GatewayError("Orchestrator returned an invalid Objective reason.");
+  }
+  return {
+    sessionId: value.sessionId,
+    text: value.text,
+    status: objectiveStatus(value.status),
+    ...(tokenBudget === undefined ? {} : { tokenBudget }),
+    ...(value.maximumTurns === undefined ? {} : { maximumTurns: value.maximumTurns }),
+    ...(value.noProgressTurnLimit === undefined ? {} : { noProgressTurnLimit: value.noProgressTurnLimit }),
+    turnsUsed: value.turnsUsed,
+    tokensUsed,
+    noProgressTurns: value.noProgressTurns,
+    ...(lastReason === "" ? {} : { lastReason }),
+    ownerGeneration: value.ownerGeneration,
+    sessionGeneration: value.sessionGeneration,
+    ...(pendingRunId === undefined ? {} : { pendingRunId, pendingQueueItemId: pendingQueueItemId! }),
+    startedAt: requiredObjectiveTimestamp(value.startedAt, "start time"),
+    ...(usageResetAt === undefined ? {} : { usageResetAt: requiredObjectiveTimestamp(usageResetAt, "usage reset time") }),
+    revision
+  };
+}
+
+function mapObjectiveMutation(value: ProtoObjective | undefined, expectedSessionId: string): ObjectiveView {
+  if (value === undefined) throw new GatewayError("Orchestrator returned no Objective mutation result.");
+  return mapObjective(value, expectedSessionId);
+}
+
+function objectiveLimitsEqual(value: ObjectiveView, limits: ObjectiveLimitsView): boolean {
+  return value.tokenBudget === limits.tokenBudget
+    && value.maximumTurns === limits.maximumTurns
+    && value.noProgressTurnLimit === limits.noProgressTurnLimit;
+}
+
+function objectivePatchHasUpdate(value: ObjectiveUpdatePatchView): boolean {
+  return Object.prototype.hasOwnProperty.call(value, "text")
+    || Object.prototype.hasOwnProperty.call(value, "tokenBudget")
+    || Object.prototype.hasOwnProperty.call(value, "maximumTurns")
+    || Object.prototype.hasOwnProperty.call(value, "noProgressTurnLimit");
+}
+
+function requireObjectiveMutationOwner(value: ObjectiveView): void {
+  requireObjectiveSessionId(value.sessionId);
+  if (value.revision < 1n || value.ownerGeneration < 1n || value.sessionGeneration < 1n) {
+    throw new GatewayError("The Objective mutation owner is no longer valid.");
+  }
+}
+
+function requireObjectiveMutationResult(
+  value: ProtoObjective | undefined,
+  previous: ObjectiveView,
+  status?: ObjectiveView["status"]
+): ObjectiveView {
+  const objective = mapObjectiveMutation(value, previous.sessionId);
+  if ((status !== undefined && objective.status !== status) || objective.revision <= previous.revision
+    || objective.ownerGeneration < previous.ownerGeneration
+    || objective.sessionGeneration !== previous.sessionGeneration) {
+    throw new GatewayError("Orchestrator returned a mismatched Objective mutation.");
+  }
+  return objective;
 }
 
 function requiredCollaborationRevision(value: { readonly value: bigint } | undefined, label: string): bigint {

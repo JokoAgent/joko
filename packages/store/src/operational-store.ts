@@ -3717,13 +3717,14 @@ export class OperationalStore {
       const current = this.findObjective(input.sessionId);
       const at = objectiveTimestamp(input.updatedAt ?? this.now(), "update time");
       if (current === undefined) {
+        const ownerGeneration = this.advanceObjectiveOwnerGeneration(input.sessionId);
         this.database.prepare(`
           INSERT INTO session_objectives(
-            session_id, objective_text, status, token_budget, maximum_turns,
+            session_id, objective_text, status, usage_reset_at, token_budget, maximum_turns,
             no_progress_turn_limit, turns_used, tokens_used,
             no_progress_turns, dispatch_rejections, last_reason,
             owner_generation, session_generation, started_at, updated_at, revision
-          ) VALUES (?, ?, ?, ?, ?, ?, 0, 0, 0, 0, NULL, 1, ?, ?, ?, ?)
+          ) VALUES (?, ?, ?, NULL, ?, ?, ?, 0, 0, 0, 0, NULL, ?, ?, ?, ?, ?)
         `).run(
           input.sessionId,
           text,
@@ -3731,16 +3732,18 @@ export class OperationalStore {
           tokenBudget ?? null,
           maximumTurns ?? null,
           noProgressTurnLimit ?? null,
+          ownerGeneration,
           sessionGeneration,
           at,
           at,
           asSqlInteger(this.requireActiveRevision())
         );
       } else {
-        const ownerGeneration = nextObjectiveOwnerGeneration(current.ownerGeneration);
+        const ownerGeneration = this.advanceObjectiveOwnerGeneration(input.sessionId, current.ownerGeneration);
         this.database.prepare(`
           UPDATE session_objectives SET
-            objective_text = ?, status = ?, token_budget = ?, maximum_turns = ?,
+            objective_text = ?, status = ?, usage_reset_at = NULL,
+            token_budget = ?, maximum_turns = ?,
             no_progress_turn_limit = ?, turns_used = 0, tokens_used = 0,
             no_progress_turns = 0, dispatch_rejections = 0, last_reason = NULL,
             owner_generation = ?, session_generation = ?, started_at = ?,
@@ -3781,8 +3784,17 @@ export class OperationalStore {
         throw new StoreError("Objective pending work cannot be cleared and replaced together.");
       }
       const ownerGeneration = input.advanceOwnerGeneration === true
-        ? nextObjectiveOwnerGeneration(current.ownerGeneration)
+        ? this.advanceObjectiveOwnerGeneration(input.sessionId, current.ownerGeneration)
         : current.ownerGeneration;
+      const status = input.status === undefined ? current.status : objectiveStatus(input.status);
+      const usageResetAt = input.usageResetAt === undefined
+        ? current.usageResetAt
+        : input.usageResetAt === null
+          ? undefined
+          : objectiveTimestamp(input.usageResetAt, "usage reset time");
+      if (usageResetAt !== undefined && status !== "usage_limited") {
+        throw new StoreError("Objective usage reset time requires usage-limited status.");
+      }
       if (input.pending !== undefined) {
         if (input.pending.ownerGeneration !== ownerGeneration) {
           throw new StaleGenerationError(ownerGeneration, input.pending.ownerGeneration);
@@ -3796,7 +3808,8 @@ export class OperationalStore {
         values.push(value);
       };
       if (input.text !== undefined) set("objective_text", objectiveText(input.text));
-      if (input.status !== undefined) set("status", objectiveStatus(input.status));
+      if (input.status !== undefined) set("status", status);
+      if (input.usageResetAt !== undefined) set("usage_reset_at", usageResetAt ?? null);
       if (input.tokenBudget !== undefined) {
         set("token_budget", input.tokenBudget === null
           ? null
@@ -3879,6 +3892,34 @@ export class OperationalStore {
       );
       return current;
     });
+  }
+
+  private advanceObjectiveOwnerGeneration(sessionId: string, expectedCurrent?: number): number {
+    const row = this.database.prepare(`
+      SELECT owner_generation FROM session_objective_generations WHERE session_id = ?
+    `).get(sessionId) as Row | undefined;
+    if (row === undefined) {
+      if (expectedCurrent !== undefined) {
+        throw new StoreError("Objective owner generation checkpoint is missing.");
+      }
+      this.database.prepare(`
+        INSERT INTO session_objective_generations(session_id, owner_generation) VALUES (?, 1)
+      `).run(sessionId);
+      return 1;
+    }
+    const current = numberValue(row["owner_generation"]);
+    if (expectedCurrent !== undefined && current !== expectedCurrent) {
+      throw new StaleGenerationError(expectedCurrent, current);
+    }
+    const next = nextObjectiveOwnerGeneration(current);
+    const result = this.database.prepare(`
+      UPDATE session_objective_generations SET owner_generation = ?
+      WHERE session_id = ? AND owner_generation = ?
+    `).run(next, sessionId, current);
+    if (result.changes !== 1) {
+      throw new StoreError("Objective owner generation checkpoint changed concurrently.");
+    }
+    return next;
   }
 
   createCollaborationGoal(input: CreateCollaborationGoalInput): CollaborationGoalRecord {
@@ -7801,6 +7842,8 @@ export class OperationalStore {
         asSqlInteger(current.revision)
       );
       if (descriptor.deletedAt === undefined && patch.deletedAt !== undefined) {
+        this.database.prepare("DELETE FROM session_objectives WHERE session_id = ?").run(id);
+        this.database.prepare("DELETE FROM session_objective_generations WHERE session_id = ?").run(id);
         const vectorRows = this.database.prepare(`
           SELECT record.event_cursor
           FROM message_embedding_records AS record
@@ -9803,7 +9846,8 @@ export class OperationalStore {
       "event.session_id = ?",
       "tombstone.event_id IS NULL",
       "json_extract(event.payload_json, '$.payload.type') = 'message_complete'",
-      "json_extract(event.payload_json, '$.payload.automaticContinuation') IS NULL"
+      "json_extract(event.payload_json, '$.payload.automaticContinuation') IS NULL",
+      "json_extract(event.payload_json, '$.payload.objectiveContinuation') IS NULL"
     ];
     const params: Array<string | number | bigint | null> = [...(nativeVisibility?.params ?? []), sessionId];
     if (input.eventId !== undefined) {
@@ -10553,7 +10597,7 @@ export class OperationalStore {
 
   /**
    * Returns the latest surviving user-authored message time for a Session.
-   * Automatic service continuations are control traffic, not user activity.
+   * Service-owned continuations are control traffic, not user activity.
    */
   findLatestVisibleUserMessageAt(sessionId: string): number | undefined {
     this.assertOpen();
@@ -10568,6 +10612,7 @@ export class OperationalStore {
         AND json_extract(event.payload_json, '$.payload.type') = 'message_complete'
         AND json_extract(event.payload_json, '$.payload.role') = 'user'
         AND json_extract(event.payload_json, '$.payload.automaticContinuation') IS NULL
+        AND json_extract(event.payload_json, '$.payload.objectiveContinuation') IS NULL
       ORDER BY event.global_cursor DESC
       LIMIT 1
     `).get(normalizedSessionId) as Row | undefined;
@@ -12913,6 +12958,7 @@ export class OperationalStore {
         AND json_extract(event.payload_json, '$.payload.type') = 'message_complete'
         AND json_extract(event.payload_json, '$.payload.role') IN ('user', 'assistant')
         AND json_extract(event.payload_json, '$.payload.automaticContinuation') IS NULL
+        AND json_extract(event.payload_json, '$.payload.objectiveContinuation') IS NULL
         AND (
           (
             identity.entry_id IS NOT NULL
@@ -13082,6 +13128,7 @@ export class OperationalStore {
         AND json_extract(event.payload_json, '$.payload.type') = 'message_complete'
         AND json_extract(event.payload_json, '$.payload.role') = 'assistant'
         AND json_extract(event.payload_json, '$.payload.automaticContinuation') IS NULL
+        AND json_extract(event.payload_json, '$.payload.objectiveContinuation') IS NULL
         ${nativeVisibility.clause("event")}
       ORDER BY event.global_cursor DESC
       LIMIT 1
@@ -17989,7 +18036,8 @@ function escapeLikePattern(query: string): string {
 }
 
 function visibleMessageText(payload: EventPayload): string | undefined {
-  if (payload.type === "message_complete" && payload.automaticContinuation !== undefined) return undefined;
+  if (payload.type === "message_complete"
+    && (payload.automaticContinuation !== undefined || payload.objectiveContinuation !== undefined)) return undefined;
   let parts: readonly string[];
   if (payload.type === "message_complete" && (payload.role === "user" || payload.role === "assistant")) {
     parts = payload.blocks.flatMap((block) =>
@@ -18527,6 +18575,7 @@ function objectiveFromRow(row: Row): ObjectiveRecord {
     noProgressTurns: numberValue(row["no_progress_turns"]),
     dispatchRejections: numberValue(row["dispatch_rejections"]),
     ...optionalString("lastReason", row["last_reason"]),
+    ...optionalNumber("usageResetAt", row["usage_reset_at"]),
     ownerGeneration: numberValue(row["owner_generation"]),
     sessionGeneration: numberValue(row["session_generation"]),
     ...(pendingOwnerGeneration === undefined

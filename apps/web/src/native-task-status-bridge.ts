@@ -1,6 +1,7 @@
 import { PermissionDecisionKind } from "@joko/contracts";
 import type { AppController } from "./controller.js";
 import type { InteractionView, Locale, SessionView, TimelineItemView } from "./model.js";
+import { isInternalContinuationTimelineItem } from "./runtime-recovery.js";
 
 export interface NativeTaskStatusProjectionInput {
   readonly ownerId: string;
@@ -74,6 +75,7 @@ function nativeTaskStatusActivityLines(
 function nativeTaskStatusActivityLine(
   item: TimelineItemView
 ): JokoDesktopNativeTaskStatusSnapshot["sessions"][number]["activityLines"][number] | undefined {
+  if (isInternalContinuationTimelineItem(item)) return undefined;
   const kind = item.kind === "user"
     ? "user"
     : item.kind === "assistant" || item.kind === "thinking"

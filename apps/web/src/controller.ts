@@ -2301,6 +2301,13 @@ export function useAppController(): AppController {
       listProjectDirectories: async (...args: Parameters<OperationApi["listProjectDirectories"]>) => original().listProjectDirectories(...args),
       prepareTargetWorkspace: async (...args: Parameters<OperationApi["prepareTargetWorkspace"]>) => original().prepareTargetWorkspace(...args),
       listCommands: async (...args: Parameters<OperationApi["listCommands"]>) => original().listCommands(...args),
+      getObjective: async (...args: Parameters<OperationApi["getObjective"]>) => original().getObjective(...args),
+      watchObjective: (...args: Parameters<OperationApi["watchObjective"]>) => original().watchObjective(...args),
+      setObjective: async (...args: Parameters<OperationApi["setObjective"]>) => original().setObjective(...args),
+      updateObjective: async (...args: Parameters<OperationApi["updateObjective"]>) => original().updateObjective(...args),
+      pauseObjective: async (...args: Parameters<OperationApi["pauseObjective"]>) => original().pauseObjective(...args),
+      resumeObjective: async (...args: Parameters<OperationApi["resumeObjective"]>) => original().resumeObjective(...args),
+      clearObjective: async (...args: Parameters<OperationApi["clearObjective"]>) => original().clearObjective(...args),
       startSkillLearning: async (...args: Parameters<OperationApi["startSkillLearning"]>) => original().startSkillLearning(...args),
       createSession: async (draft: NewSessionDraft) => original().createSession(sessionDraftWithPersonalization(
         draft,

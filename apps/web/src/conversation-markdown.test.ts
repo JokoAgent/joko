@@ -22,9 +22,10 @@ describe("complete conversation Markdown", () => {
 
   it("joins streaming text fragments and excludes internal continuation prompts", async () => {
     const continuation = { ...item("internal", "user", 1n, "Private retry prompt"), automaticContinuation: { recoveryId: "recovery" } };
+    const objectiveContinuation = { ...item("objective-internal", "user", 3n, "Private objective directive"), objectiveContinuation: { ownerGeneration: 1n, turn: 2 } };
     const load = vi.fn(async (_sessionId: string, before?: TimelineHistoryCursorView): Promise<TimelineHistoryPageView> => before === undefined
       ? { items: [item("answer", "assistant", 5n, " world", true)], nextBeforeCursor: cursor(4n) }
-      : { items: [continuation, item("answer", "assistant", 2n, "Hello", true)] });
+      : { items: [continuation, item("answer", "assistant", 2n, "Hello", true), objectiveContinuation] });
     await expect(collectConversationMarkdown("task", load, () => true, labels)).resolves.toBe("## Agent\n\nHello world");
   });
 

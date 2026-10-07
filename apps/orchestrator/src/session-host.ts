@@ -887,6 +887,7 @@ export class SessionHost {
   readonly #sessionRuntimeRecoveryDelayMs: (attempt: number) => number;
   readonly #backendDispatchBlocked: (backendId: string) => boolean;
   readonly #onBackendMayBeIdle: ((backendId: string) => void) | undefined;
+  readonly #onUserInputAdmitted: ((store: OperationalStore, result: EnqueueResult) => void) | undefined;
   readonly #onServiceRunSettled: ((input: {
     readonly sessionId: string;
     readonly runId: string;
@@ -958,6 +959,10 @@ export class SessionHost {
       readonly backendDispatchBlocked?: (backendId: string) => boolean;
       /** Content-free settle signal for an external deferred replacement owner. */
       readonly onBackendMayBeIdle?: (backendId: string) => void;
+      /** Synchronous, transaction-local admission hook for Session-owned
+       * controllers that must fence autonomous work before a user Queue item
+       * can dispatch. The hook must not perform asynchronous effects. */
+      readonly onUserInputAdmitted?: (store: OperationalStore, result: EnqueueResult) => void;
       /** Post-commit notification for service-owned projections such as Messaging outboxes. */
       readonly onServiceRunSettled?: (input: {
         readonly sessionId: string;
@@ -1007,6 +1012,7 @@ export class SessionHost {
       ?? sessionRuntimeRecoveryDelayMs;
     this.#backendDispatchBlocked = options.backendDispatchBlocked ?? (() => false);
     this.#onBackendMayBeIdle = options.onBackendMayBeIdle;
+    this.#onUserInputAdmitted = options.onUserInputAdmitted;
     this.#onServiceRunSettled = options.onServiceRunSettled;
     this.#onServiceInteractionOpened = options.onServiceInteractionOpened;
     this.#onServiceInteractionSettled = options.onServiceInteractionSettled;
@@ -2421,7 +2427,9 @@ export class SessionHost {
       ...(input.overrides === undefined ? {} : { executionOverrides: input.overrides }),
       createdAt: now
     });
-    return { sessionId: input.sessionId, runId, attemptId, queueItemId };
+    const result = { sessionId: input.sessionId, runId, attemptId, queueItemId };
+    if ((input.source ?? "user") === "user") this.#onUserInputAdmitted?.(store, result);
+    return result;
   }
 
   /** Start runtime work only after admission and the public operation result have committed. */
@@ -5550,6 +5558,7 @@ export class SessionHost {
       sessionReferenceSnapshots: _untrustedSnapshots,
       artifactReferenceSnapshots: _untrustedArtifactSnapshots,
       automaticContinuation: _untrustedContinuation,
+      objectiveContinuation: _untrustedObjectiveContinuation,
       quotesEncoded: _untrustedQuotesEncoded,
       pastedTextRanges: _untrustedPastedTextRanges,
       mentionRanges: _untrustedMentionRanges,
@@ -5569,7 +5578,10 @@ export class SessionHost {
       ...(artifactReferenceSnapshots.length === 0 ? {} : { artifactReferenceSnapshots }),
       ...(current.body.automaticContinuation === undefined
         ? {}
-        : { automaticContinuation: current.body.automaticContinuation })
+        : { automaticContinuation: current.body.automaticContinuation }),
+      ...(current.body.objectiveContinuation === undefined
+        ? {}
+        : { objectiveContinuation: current.body.objectiveContinuation })
     }, { preserveSessionReferenceSnapshots: true, preserveArtifactReferenceSnapshots: true });
   }
 
@@ -5939,6 +5951,7 @@ export class SessionHost {
     const {
       sessionReferenceSnapshots: _sessionReferenceSnapshots,
       artifactReferenceSnapshots: _artifactReferenceSnapshots,
+      objectiveContinuation: _objectiveContinuation,
       ...adapterPrompt
     } = prompt;
     const sessionMentions = prompt.mentions.flatMap((mention, mentionIndex) => mention.kind === "session"
@@ -6358,7 +6371,7 @@ export class SessionHost {
     let portableMessageCount = 0;
     visitVisibleSessionEvents(this.#store, input.sessionId, (event) => {
       if (event.payload.type === "message_complete") {
-        if (event.payload.automaticContinuation !== undefined) return;
+        if (event.payload.automaticContinuation !== undefined || event.payload.objectiveContinuation !== undefined) return;
         portableMessageCount += 1;
       } else if (event.payload.type !== "artifact" && !(event.payload.type === "status" && event.payload.key === "artifact_unavailable")) return;
       if (portableMessageCount > MAXIMUM_PORTABLE_SESSION_MESSAGES || events.length >= MAXIMUM_PORTABLE_SESSION_MESSAGES + 10_000) {
@@ -13353,6 +13366,7 @@ export class SessionHost {
       readonly automationOrigin: Extract<EventPayload, { readonly type: "message_complete" }>["automationOrigin"];
       readonly inputDelivery: Extract<EventPayload, { readonly type: "message_complete" }>["inputDelivery"];
       readonly automaticContinuation: Extract<EventPayload, { readonly type: "message_complete" }>["automaticContinuation"];
+      readonly objectiveContinuation: Extract<EventPayload, { readonly type: "message_complete" }>["objectiveContinuation"];
     };
     const acceptedUserMetadata = new Map<string, AcceptedUserMetadata>();
     const acceptedQueueInputs = new Map<string, QueueItemRecord>();
@@ -13380,13 +13394,15 @@ export class SessionHost {
         && (event.payload.acceptedInput !== undefined
           || event.payload.automationOrigin !== undefined
           || event.payload.inputDelivery !== undefined
-          || event.payload.automaticContinuation !== undefined)
+          || event.payload.automaticContinuation !== undefined
+          || event.payload.objectiveContinuation !== undefined)
       ) {
         const metadata: AcceptedUserMetadata = {
           acceptedInput: event.payload.acceptedInput,
           automationOrigin: event.payload.automationOrigin,
           inputDelivery: event.payload.inputDelivery,
-          automaticContinuation: event.payload.automaticContinuation
+          automaticContinuation: event.payload.automaticContinuation,
+          objectiveContinuation: event.payload.objectiveContinuation
         };
         const entryId = nativeHistoryEventContext(event.payload)?.identity?.entryId;
         const eventBindingFingerprint = event.metadata?.fields[NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD];
@@ -13439,7 +13455,10 @@ export class SessionHost {
             ...(acceptedMetadata.inputDelivery === undefined ? {} : { inputDelivery: acceptedMetadata.inputDelivery }),
             ...(acceptedMetadata.automaticContinuation === undefined
               ? {}
-              : { automaticContinuation: acceptedMetadata.automaticContinuation })
+              : { automaticContinuation: acceptedMetadata.automaticContinuation }),
+            ...(acceptedMetadata.objectiveContinuation === undefined
+              ? {}
+              : { objectiveContinuation: acceptedMetadata.objectiveContinuation })
           });
       store.appendEventIfAbsent({
         id: projection.id,
@@ -13551,6 +13570,9 @@ export class SessionHost {
       ...(queued.body.automaticContinuation === undefined
         ? {}
         : { automaticContinuation: { recoveryId: queued.body.automaticContinuation.recoveryId } }),
+      ...(queued.body.objectiveContinuation === undefined
+        ? {}
+        : { objectiveContinuation: queued.body.objectiveContinuation }),
       inputDelivery
     };
   }
@@ -14151,6 +14173,7 @@ function userMessageClassifier(
     const disposition = dispositionByRunId.get(event.runId);
     if (
       event.payload.automaticContinuation === undefined
+      && event.payload.objectiveContinuation === undefined
       && (disposition === undefined || disposition === "prompt")
     ) continue;
     hiddenEventIds.add(event.id);
@@ -14294,7 +14317,8 @@ function contextRebuildInput(
   const messages = survivingTimeline
     .filter((event): event is PersistedEvent & {
       readonly payload: Extract<PersistedEvent["payload"], { readonly type: "message_complete" }>;
-    } => event.payload.type === "message_complete" && event.payload.automaticContinuation === undefined)
+    } => event.payload.type === "message_complete" && event.payload.automaticContinuation === undefined
+      && event.payload.objectiveContinuation === undefined)
     .map((event) => ({
       role: event.payload.role,
       blocks: event.payload.blocks.flatMap(redactedHandoffBlock)
@@ -15716,6 +15740,7 @@ function sessionReferenceMessage(
 ): Omit<SessionReferenceDispatchMessage, "cursor"> | undefined {
   if (event.payload.type !== "message_complete"
     || event.payload.automaticContinuation !== undefined
+    || event.payload.objectiveContinuation !== undefined
     || (event.payload.role !== "user" && event.payload.role !== "assistant")) return undefined;
   const acceptedText = event.payload.role === "user" ? event.payload.acceptedInput?.text : undefined;
   const text = acceptedText !== undefined && acceptedText.trim() !== ""

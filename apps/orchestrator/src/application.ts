@@ -198,6 +198,7 @@ import { SkillMutationCoordinator } from "./skill-mutation-coordinator.js";
 import { SkillPublicationManager } from "./skill-publication-manager.js";
 import { CollaborationManager } from "./collaboration-manager.js";
 import { CollaborationGoalManager } from "./collaboration-goal-manager.js";
+import { ObjectiveManager } from "./objective-manager.js";
 import { CollaborationToolBridgeProvider } from "./collaboration-tool-provider.js";
 import { ContactManager } from "./contact-manager.js";
 import { ContactSyncManager } from "./contact-sync-manager.js";
@@ -411,6 +412,8 @@ export interface OrchestratorApplication {
   readonly collaboration?: CollaborationManager;
   /** Durable Goal/lead/worker scheduling authority. */
   readonly collaborationGoals?: CollaborationGoalManager;
+  /** Durable autonomous continuation authority for one existing Session. */
+  readonly objectives?: ObjectiveManager;
   /** Node-local structured authority for people and organizations. */
   readonly contacts?: ContactManager;
   /** Explicitly granted, encrypted node-to-node Contacts convergence owner. */
@@ -1524,6 +1527,7 @@ export async function createOrchestratorApplication(
   let androidRuntimeForSessionCleanup: AndroidRuntimeSupervisor | undefined;
   let computerBridgeForSessionCleanup: ComputerToolBridgeProvider | undefined;
   let messaging: MessagingManager | undefined;
+  let objectives: ObjectiveManager | undefined;
   const configuredProviderRouteEnabled = (backendId: string, providerId: string): boolean => {
     const backend = store.getBackend(backendId).descriptor;
     if (backend.capabilities.get(MANAGED_PROVIDER_CATALOG_CAPABILITY)?.supported !== true) return true;
@@ -1583,11 +1587,20 @@ export async function createOrchestratorApplication(
       androidRuntimeForSessionCleanup?.closeSession(sessionId);
       void computerBridgeForSessionCleanup?.closeSession(sessionId).catch(() => undefined);
     },
-    onServiceRunSettled: (input) => messaging?.onRunSettled(input),
+    onUserInputAdmitted: (transactionStore, result) => objectives?.onUserInputAdmitted(transactionStore, result),
+    onServiceRunSettled: async (input) => {
+      const settlements: Promise<void>[] = [];
+      if (objectives !== undefined) settlements.push(objectives.onRunSettled(input));
+      if (messaging !== undefined) settlements.push(Promise.resolve(messaging.onRunSettled(input)));
+      const results = await Promise.allSettled(settlements);
+      const failures = results.flatMap((result) => result.status === "rejected" ? [result.reason] : []);
+      if (failures.length > 0) throw new AggregateError(failures, "Service Run settlement projection failed.");
+    },
     onServiceInteractionOpened: (input) => messaging?.onInteractionOpened(input),
     onServiceInteractionSettled: (input) => messaging?.onInteractionSettled(input),
     closeSessionTerminals: (sessionId) => terminals.closeSession(sessionId)
   });
+  objectives = new ObjectiveManager({ store, sessionHost });
   await simulatorCreate?.recoverPending();
   await simulatorControl?.reconcileDetachedGrace();
   await simulatorControl?.reconcileAbandoned();
@@ -2233,6 +2246,7 @@ export async function createOrchestratorApplication(
         await sessionHost.registerTarget(target, { workspaceId: config.workspace.id });
       }
     }
+    await objectives.initialize();
     await messaging.initialize();
     await collaborationGoals.initialize();
     await partners.recoverPending();
@@ -2447,6 +2461,7 @@ export async function createOrchestratorApplication(
     await attempt(() => providerAuth.beginShutdown());
     await attempt(() => providerAccountUsage.invalidate());
     await attempt(() => managedModelRuntimeSystem.close());
+    await attempt(() => objectives?.close());
     await attempt(() => collaborationGoals.close());
     await attempt(() => messaging.close());
     await attempt(() => refreshTail);
@@ -2573,6 +2588,7 @@ export async function createOrchestratorApplication(
       : { messagingCreateWeChatAuthorization: dependencies.messagingCreateWeChatAuthorization }),
     collaboration,
     collaborationGoals,
+    objectives,
     contacts,
     contactSync,
     partners,
@@ -2645,6 +2661,7 @@ export async function createOrchestratorApplication(
         await attempt(() => providerAuth.beginShutdown());
         await attempt(() => providerAccountUsage.invalidate());
         await attempt(() => managedModelRuntimeSystem.close());
+        await attempt(() => objectives?.close());
         await attempt(() => collaborationGoals.close());
         await attempt(() => messaging.close());
         await refreshTail.catch(() => undefined);

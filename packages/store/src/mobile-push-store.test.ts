@@ -68,6 +68,22 @@ describe("mobile push durable boundary", () => {
       }
     });
     store.appendEvent({
+      id: "objective-continuation-message",
+      backendId: "pi",
+      targetId: "target-1",
+      sessionId: "session-1",
+      runId: "push-run",
+      generation: 0,
+      emittedAt: 1_250,
+      traceId: "push:objective-continuation",
+      payload: {
+        type: "message_complete",
+        role: "assistant",
+        blocks: [{ kind: "text", text: "Internal objective output" }],
+        objectiveContinuation: { ownerGeneration: 1, turn: 1 }
+      }
+    });
+    store.appendEvent({
       id: "done-first",
       backendId: "pi",
       targetId: "target-1",

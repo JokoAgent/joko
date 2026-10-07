@@ -371,6 +371,9 @@ export interface PromptInput {
    * its durable presentation and ownership fence through native history.
    */
   readonly automaticContinuation?: AutomaticContinuationInput;
+  /** Queue-private authority for one Objective-owned turn. Public input
+   * contracts never accept or emit this marker. */
+  readonly objectiveContinuation?: ObjectiveContinuationInput;
 }
 
 export interface AutomaticContinuationInput {
@@ -379,6 +382,11 @@ export interface AutomaticContinuationInput {
   readonly attempt: number;
   readonly maximumAttempts: number;
   readonly sessionTotal: number;
+}
+
+export interface ObjectiveContinuationInput {
+  readonly ownerGeneration: number;
+  readonly turn: number;
 }
 
 export interface ProviderModel {

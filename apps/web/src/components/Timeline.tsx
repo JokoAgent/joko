@@ -31,6 +31,7 @@ import {
   RefreshCw,
   Share,
   Sparkles,
+  Target,
   Terminal,
   Timer,
   Trash2,
@@ -120,6 +121,7 @@ import { SentMessageReferenceChips, SentMessageReferenceText, TimelineLinkSource
 import { validSentInputMentionRanges } from "./timeline-references.js";
 import { normalizeTimelineMathDelimiters, remarkStrictTimelineInlineMath } from "./timeline-markdown-math.js";
 import { TimelineMarkdownDocument } from "./TimelineMarkdownDocument.js";
+import { stripObjectiveVerdict } from "../objective-verdict.js";
 import { TimelineFadeElement } from "./TimelineFadeElement.js";
 import {
   commitTimelineWordFadeCandidate,
@@ -1201,6 +1203,7 @@ function TimelineBlock({ sessionId, sessionName, item, planAnimated = false, ret
     }
     case "contextRebuild": return <ContextRebuildCard item={item} t={t} />;
     case "runtimeRecovery": return <RuntimeRecoveryBlock item={item} t={t} />;
+    case "objective": return <ObjectiveLifecycleBlock item={item} locale={locale} t={t} />;
     case "interaction": return item.interaction?.kind === "question" && item.interaction.state === "resolved"
       ? <InteractionAnswerBlock item={item} t={t} />
       : <NoticeBlock item={item} icon={<ListChecks />} title={item.interaction?.state === "pending" ? t("timeline.inputRequired") : t("timeline.inputClosed")} locale={locale} accent />;
@@ -1351,6 +1354,7 @@ function MessageBlock({ sessionId, sessionName, item, role, locale, reducedMotio
     ...(personalization.onWorkspaceImageToComposer === undefined ? {} : { onWorkspaceImageToComposer: personalization.onWorkspaceImageToComposer })
   }), [item.id, item.sourceEventId, item.text, item.inputMentions, item.mentionRanges, onArtifactUrl, onArtifactDownload, personalization.ownerKey, personalization.workspaceId, personalization.onReadArtifact, personalization.onLoadWorkspaceAsset, personalization.onOpenHttpLink, personalization.onOpenWorkspaceHtml, personalization.onWorkspaceImageToComposer, sessionId, t]);
   const text = item.text ?? "";
+  const displayText = role === "assistant" && item.streaming !== true ? stripObjectiveVerdict(text) : text;
   const inputMentions = item.userInputAccepted === true ? item.inputMentions ?? [] : [];
   const inputRanges = validSentInputMentionRanges(text, inputMentions, item.userInputAccepted === true ? item.mentionRanges ?? [] : []);
   const sourceSegments = selectionQuoteTextSourceSegments(text, item.quotesEncoded === true);
@@ -1368,7 +1372,7 @@ function MessageBlock({ sessionId, sessionName, item, role, locale, reducedMotio
     : quotedUserMessage.body;
   const roleLabel = role === "user" ? t("timeline.you") : t("timeline.agent");
   const selectionActive = shareSelection !== undefined;
-  const shareable = item.streaming !== true && (text.trim().length > 0 || (item.attachments?.length ?? 0) > 0);
+  const shareable = item.streaming !== true && (displayText.trim().length > 0 || (item.attachments?.length ?? 0) > 0);
   const shareSelected = selectionActive && shareSelection.selectedIds.has(item.id);
   const selectionControl = selectionActive && shareable && onToggleShareMessage !== undefined
     ? <MessageSelectionControl item={item} selected={shareSelection.selectedIds.has(item.id)} roleLabel={roleLabel} t={t} onToggle={onToggleShareMessage} />
@@ -1424,9 +1428,9 @@ function MessageBlock({ sessionId, sessionName, item, role, locale, reducedMotio
     );
   }
   const assistantContent = <>
-    <div className="markdown message-assistant__body"><StreamingMarkdown text={text} streaming={item.streaming === true} streamFadeKey={`${sessionId}:${item.id}`} t={t} />{item.streaming && <span className={cx("streaming-cursor", reducedMotion && "streaming-cursor--reduced-motion")} aria-label={t("timeline.streaming")} />}</div>
+    <div className="markdown message-assistant__body"><StreamingMarkdown text={displayText} streaming={item.streaming === true} streamFadeKey={`${sessionId}:${item.id}`} t={t} />{item.streaming && <span className={cx("streaming-cursor", reducedMotion && "streaming-cursor--reduced-motion")} aria-label={t("timeline.streaming")} />}</div>
     {attachments}
-    {!selectionActive && !item.streaming && showActions && <MessageActions ownerKey={personalization.ownerKey} sessionId={sessionId} sessionName={sessionName} item={item} text={text} align="left" locale={locale} t={t} onAddMessageToComposer={onAddMessageToComposer} onFork={onForkMessage} forking={forking} onStartShareSelection={onStartShareSelection} editable={false} onPreviewMessageRewind={onPreviewMessageRewind} rewindToStartSupported={rewindToStartSupported} onDeleteMessage={onDeleteMessage} messageDeleteBlockedReason={messageDeleteBlockedReason} />}
+    {!selectionActive && !item.streaming && showActions && <MessageActions ownerKey={personalization.ownerKey} sessionId={sessionId} sessionName={sessionName} item={item} text={displayText} align="left" locale={locale} t={t} onAddMessageToComposer={onAddMessageToComposer === undefined ? undefined : () => onAddMessageToComposer({ ...item, text: displayText })} onFork={onForkMessage} forking={forking} onStartShareSelection={onStartShareSelection} editable={false} onPreviewMessageRewind={onPreviewMessageRewind} rewindToStartSupported={rewindToStartSupported} onDeleteMessage={onDeleteMessage} messageDeleteBlockedReason={messageDeleteBlockedReason} />}
   </>;
   return (
     <RenderedShareSelectionContext.Provider value={shareSelected}>
@@ -2192,6 +2196,63 @@ export function RuntimeRecoveryBlock({ item, t }: { readonly item: TimelineItemV
   );
 }
 
+const OBJECTIVE_LIFECYCLE_LABEL: Record<NonNullable<TimelineItemView["objectiveLifecycle"]>["action"], MessageKey> = {
+  started: "timeline.objective.started",
+  replaced: "timeline.objective.replaced",
+  paused: "timeline.objective.paused",
+  resumed: "timeline.objective.resumed",
+  completed: "timeline.objective.completed",
+  blocked: "timeline.objective.blocked",
+  limited: "timeline.objective.limited",
+  dispatchUnknown: "timeline.objective.dispatchUnknown",
+  cleared: "timeline.objective.cleared"
+};
+
+export function ObjectiveLifecycleBlock({ item, locale, t }: {
+  readonly item: TimelineItemView;
+  readonly locale: string;
+  readonly t: Translator;
+}): JSX.Element {
+  const lifecycle = item.objectiveLifecycle;
+  if (lifecycle === undefined) return <></>;
+  const label = t(OBJECTIVE_LIFECYCLE_LABEL[lifecycle.action]);
+  const attention = lifecycle.action === "blocked" || lifecycle.action === "limited" || lifecycle.action === "dispatchUnknown";
+  const success = lifecycle.action === "completed";
+  const showMetrics = !["started", "replaced"].includes(lifecycle.action)
+    || lifecycle.turnsUsed > 0
+    || lifecycle.tokensUsed > 0
+    || lifecycle.elapsedMs > 0;
+  return <article
+    className={cx("objective-lifecycle-row", attention && "objective-lifecycle-row--attention", success && "objective-lifecycle-row--success")}
+    data-action={lifecycle.action}
+    role="note"
+    aria-label={label}
+  >
+    <Target aria-hidden="true" />
+    <div className="objective-lifecycle-row__body">
+      <strong>{label}</strong>
+      {lifecycle.objectiveText !== undefined && <p className="objective-lifecycle-row__objective">{lifecycle.objectiveText}</p>}
+      {showMetrics && <div className="objective-lifecycle-row__meta">
+        <span>{t("timeline.objective.turns", { count: lifecycle.turnsUsed })}</span>
+        <span>{t("timeline.objective.tokens", { count: lifecycle.tokensUsed.toLocaleString(locale) })}</span>
+        <span>{t("timeline.objective.elapsed", { duration: formatObjectiveLifecycleElapsed(lifecycle.elapsedMs) })}</span>
+      </div>}
+      {lifecycle.reason !== undefined && <p className="objective-lifecycle-row__reason">{lifecycle.reason}</p>}
+    </div>
+    <time>{formatDateTime(item.createdAt, locale)}</time>
+  </article>;
+}
+
+function formatObjectiveLifecycleElapsed(milliseconds: number): string {
+  const total = Math.max(0, Math.floor(milliseconds / 1_000));
+  const seconds = total % 60;
+  const minutes = Math.floor(total / 60) % 60;
+  const hours = Math.floor(total / 3_600);
+  if (hours > 0) return `${hours}h ${String(minutes).padStart(2, "0")}m`;
+  if (minutes > 0) return `${minutes}m ${String(seconds).padStart(2, "0")}s`;
+  return `${seconds}s`;
+}
+
 function NoticeBlock({ item, icon, title, detail, locale, accent = false }: { readonly item: TimelineItemView; readonly icon: JSX.Element; readonly title: string; readonly detail?: string; readonly locale: string; readonly accent?: boolean }): JSX.Element {
   const body = detail ?? item.text;
   return <article className={cx("notice-block", accent && "notice-block--accent")}><span aria-hidden="true">{icon}</span><div><strong>{title}</strong>{body !== undefined && <p>{body}</p>}</div><time>{formatDateTime(item.createdAt, locale)}</time></article>;
@@ -2305,6 +2366,7 @@ function estimateRenderHeight(item: TimelineRenderItem | undefined): number {
 function estimateHeight(item: TimelineItemView | undefined): number {
   if (item === undefined) return 80;
   if (item.kind === "user" || item.kind === "assistant") return Math.min(420, 92 + (item.text?.length ?? 0) * 0.25);
+  if (item.kind === "objective") return Math.min(260, 76 + ((item.objectiveLifecycle?.objectiveText?.length ?? 0) + (item.objectiveLifecycle?.reason?.length ?? 0)) * 0.2);
   if (item.kind === "tool" || item.kind === "toolResult") return 112;
   if (item.kind === "image") return 300;
   return 76;

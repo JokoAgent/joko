@@ -1503,6 +1503,18 @@ details[open] > summary .details-chevron { transform: rotate(180deg); }
 .runtime-recovery-row__detail-label { opacity: .7; }
 .runtime-recovery-row__details > pre { margin: 2px 0 0; overflow-wrap: anywhere; color: inherit; font-family: var(--app-font-code, var(--app-font-code-default)); font-size: var(--text-11); line-height: 1.45; white-space: pre-wrap; }
 .runtime-recovery-row__meta { display: flex; flex-wrap: wrap; gap: 2px 16px; margin-top: 8px; }
+.objective-lifecycle-row { width: 100%; display: grid; grid-template-columns: 18px minmax(0, 1fr) auto; align-items: start; gap: 8px; border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; background: color-mix(in srgb, var(--surface-raised) 82%, transparent); color: var(--text-soft); font-size: var(--text-12); line-height: 1.45; }
+.objective-lifecycle-row > svg { width: 15px; height: 15px; margin-top: 1px; color: var(--accent-strong); }
+.objective-lifecycle-row > time { color: var(--text-faint); font-size: var(--text-11); white-space: nowrap; }
+.objective-lifecycle-row__body { min-width: 0; }
+.objective-lifecycle-row__body > strong { color: var(--text); font-weight: 600; }
+.objective-lifecycle-row__objective, .objective-lifecycle-row__reason { margin: 3px 0 0; overflow-wrap: anywhere; white-space: pre-wrap; }
+.objective-lifecycle-row__reason { color: var(--text-faint); }
+.objective-lifecycle-row__meta { display: flex; flex-wrap: wrap; gap: 2px 14px; margin-top: 5px; color: var(--text-faint); }
+.objective-lifecycle-row--attention { border-color: color-mix(in srgb, var(--red) 38%, var(--line)); background: color-mix(in srgb, var(--red-soft) 38%, var(--surface-raised)); }
+.objective-lifecycle-row--attention > svg { color: var(--red); }
+.objective-lifecycle-row--success { border-color: color-mix(in srgb, var(--green) 30%, var(--line)); }
+.objective-lifecycle-row--success > svg { color: var(--green); }
 .notice-block, .background-block, .status-block { min-height: 45px; display: flex; align-items: center; gap: 9px; border: 1px solid var(--line); border-radius: 9px; padding: 8px 10px; background: var(--surface); color: var(--text-soft); }
 .review-run-card { margin-block: 8px; border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; background: var(--surface-subtle); color: var(--text); font-size: var(--text-14); line-height: 20px; }
 .review-run-card__header { min-height: 20px; display: flex; align-items: center; gap: 8px; }.review-run-card__header > svg, .review-run-card__header > .spinner, .review-run-card__header > .spinner svg { width: 15px; height: 15px; flex: 0 0 auto; color: var(--text-soft); }.review-run-card[data-state="failed"] .review-run-card__header > svg { color: var(--red); }.review-run-card__header > strong { min-width: 0; flex: 1; font-weight: 500; }.review-run-card__header > button { min-height: 24px; display: inline-flex; align-items: center; gap: 4px; border: 0; border-radius: 4px; padding: 2px 8px; background: transparent; color: var(--text-soft); font: inherit; font-size: var(--text-12); line-height: 16px; cursor: pointer; }.review-run-card__header > button:hover { background: var(--surface-hover); }.review-run-card__header > button:disabled { cursor: wait; opacity: .6; }.review-run-card__header > button svg { width: 12px; height: 12px; }
@@ -1600,6 +1612,38 @@ details[open] > summary .details-chevron { transform: rotate(180deg); }
 .session-bottom-overlay > * { pointer-events: auto; }
 .session-bottom-overlay > .session-composer-layer, .session-composer-layer > .composer-region { pointer-events: none; }
 .session-composer-layer .composer-stack, .session-composer-layer .session-running-status, .session-composer-layer > .composer-region > .modal-layer { pointer-events: auto; }
+.objective-host { width: min(calc(100% - 80px), 934px); margin: 0 auto 6px; pointer-events: auto; }
+.objective-host:empty { display: none; }
+.objective-indicator { min-width: 0; min-height: 36px; display: flex; align-items: center; gap: 7px; overflow: hidden; border: 1px solid var(--line); border-radius: 11px; padding: 5px 8px; background: color-mix(in srgb, var(--surface-raised) 92%, var(--accent-soft)); box-shadow: var(--shadow-sm); color: var(--text-soft); font-size: var(--text-11); }
+.objective-indicator--attention, .objective-indicator--error { border-color: color-mix(in srgb, var(--red) 36%, var(--line)); background: color-mix(in srgb, var(--red-soft) 52%, var(--surface-raised)); }
+.objective-indicator > svg { width: 15px; height: 15px; flex: 0 0 auto; }
+.objective-indicator--attention > svg, .objective-indicator--error > svg { color: var(--red); }
+.objective-indicator__text { min-width: 48px; flex: 1 1 auto; overflow: hidden; color: var(--text); font-weight: 550; text-overflow: ellipsis; white-space: nowrap; }
+.objective-indicator__metric, .objective-indicator__reset { flex: 0 0 auto; color: var(--text-faint); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.objective-indicator__reset { color: var(--red); }
+.objective-indicator .icon-button { width: 26px; height: 26px; min-height: 26px; flex: 0 0 auto; }
+.objective-indicator .icon-button > svg { width: 13px; height: 13px; }
+.objective-indicator__action-error { display: flex; align-items: center; gap: 7px; margin-top: 4px; border-radius: 9px; padding: 5px 8px; background: var(--red-soft); color: var(--red); font-size: var(--text-10); }
+.objective-indicator__action-error > svg { width: 14px; height: 14px; flex: 0 0 auto; }
+.objective-indicator__action-error > span { min-width: 0; flex: 1; overflow-wrap: anywhere; }
+.objective-dialog { display: grid; gap: 14px; }
+.objective-dialog__field { display: grid; gap: 6px; color: var(--text); font-size: var(--text-11); font-weight: 650; }
+.objective-dialog__field textarea { width: 100%; min-height: 118px; resize: vertical; border: 1px solid var(--line); border-radius: 11px; padding: 10px 12px; outline: 0; background: var(--surface-raised); color: var(--text); font-size: var(--text-13); font-weight: 400; line-height: 1.5; }
+.objective-dialog__field textarea:focus { border-color: var(--accent-edge); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 14%, transparent); }
+.objective-dialog__advanced-toggle { width: max-content; display: inline-flex; align-items: center; gap: 5px; border: 0; padding: 0; background: transparent; color: var(--text-soft); font-size: var(--text-11); cursor: pointer; }
+.objective-dialog__advanced-toggle > svg { width: 14px; height: 14px; }
+.objective-dialog__advanced { display: grid; gap: 9px; border-left: 2px solid var(--line); padding-left: 12px; }
+.objective-dialog__advanced > small { color: var(--text-faint); font-size: var(--text-10); line-height: 1.45; }
+.objective-dialog__limit { min-width: 0; display: grid; grid-template-columns: minmax(0, 1fr) minmax(128px, 156px); align-items: center; gap: 12px; color: var(--text); font-size: var(--text-11); font-weight: 600; }
+.objective-dialog__limit .select-control { width: 100%; }
+.objective-dialog__error { margin: 0; color: var(--red); font-size: var(--text-11); overflow-wrap: anywhere; }
+@media (max-width: 720px) {
+  .objective-host { width: calc(100% - 24px); }
+  .objective-indicator { flex-wrap: wrap; }
+  .objective-indicator__text { flex-basis: calc(100% - 110px); }
+  .objective-indicator__metric { display: none; }
+  .objective-dialog__limit { grid-template-columns: minmax(0, 1fr) minmax(112px, 42%); }
+}
 .share-selection-bar { width: min(calc(100% - 80px), 934px); min-height: 68px; position: relative; display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 12px; margin: 0 auto 20px; border-top: 1px solid var(--line); padding: 12px 0 0; background: var(--surface-raised); }
 .share-selection-bar__select-all { min-height: 32px; display: inline-flex; align-items: center; gap: 7px; border: 1px solid var(--line); border-radius: 999px; padding: 5px 11px; background: var(--surface); color: var(--text); font-size: var(--text-11); font-weight: 600; }
 .share-selection-bar__select-all > span { width: 16px; height: 16px; display: grid; place-items: center; border: 1px solid var(--text-faint); border-radius: 999px; }

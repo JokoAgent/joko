@@ -334,6 +334,74 @@ describe("OperationalStore", () => {
     })).toThrow(StaleGenerationError);
   });
 
+  it("persists Objective usage reset boundaries and keeps them coupled to usage-limited state", () => {
+    const fixture = createFixture();
+    const created = fixture.store.putObjective({
+      sessionId: "session-1",
+      text: "Wait for capacity and continue.",
+      updatedAt: 20
+    });
+    expect(created.usageResetAt).toBeUndefined();
+    expect(() => fixture.store.updateObjective({
+      sessionId: created.sessionId,
+      expectedRevision: created.revision,
+      expectedOwnerGeneration: created.ownerGeneration,
+      usageResetAt: 3_600_000,
+      updatedAt: 21
+    })).toThrow(/usage reset time requires usage-limited status/u);
+
+    const limited = fixture.store.updateObjective({
+      sessionId: created.sessionId,
+      expectedRevision: created.revision,
+      expectedOwnerGeneration: created.ownerGeneration,
+      status: "usage_limited",
+      usageResetAt: 3_600_000,
+      lastReason: "Provider capacity resets later.",
+      updatedAt: 22
+    });
+    expect(limited).toMatchObject({ status: "usage_limited", usageResetAt: 3_600_000 });
+
+    const filePath = fixture.store.filePath;
+    fixture.store.close();
+    const reopened = new OperationalStore(filePath);
+    fixture.replaceStore(reopened);
+    expect(reopened.getObjective(created.sessionId)).toEqual(limited);
+    expect(() => reopened.updateObjective({
+      sessionId: limited.sessionId,
+      expectedRevision: limited.revision,
+      expectedOwnerGeneration: limited.ownerGeneration,
+      status: "active",
+      updatedAt: 23
+    })).toThrow(/usage reset time requires usage-limited status/u);
+
+    const resumed = reopened.updateObjective({
+      sessionId: limited.sessionId,
+      expectedRevision: limited.revision,
+      expectedOwnerGeneration: limited.ownerGeneration,
+      status: "active",
+      usageResetAt: null,
+      updatedAt: 24
+    });
+    expect(resumed.status).toBe("active");
+    expect(resumed.usageResetAt).toBeUndefined();
+
+    const limitedAgain = reopened.updateObjective({
+      sessionId: resumed.sessionId,
+      expectedRevision: resumed.revision,
+      expectedOwnerGeneration: resumed.ownerGeneration,
+      status: "usage_limited",
+      usageResetAt: 7_200_000,
+      updatedAt: 25
+    });
+    const replacement = reopened.putObjective({
+      sessionId: limitedAgain.sessionId,
+      text: "Replacement starts without an inherited reset boundary.",
+      updatedAt: 26
+    });
+    expect(replacement.status).toBe("active");
+    expect(replacement.usageResetAt).toBeUndefined();
+  });
+
   it("fences Objective mutations by revision and owner generation", () => {
     const { store } = createFixture();
     const created = store.putObjective({
@@ -406,6 +474,47 @@ describe("OperationalStore", () => {
       expectedOwnerGeneration: replacement.ownerGeneration
     })).toEqual(replacement);
     expect(store.findObjective(replacement.sessionId)).toBeUndefined();
+
+    const recreated = store.putObjective({
+      sessionId: replacement.sessionId,
+      text: "First objective",
+      updatedAt: 13
+    });
+    expect(recreated).toMatchObject({
+      text: "First objective",
+      ownerGeneration: replacement.ownerGeneration + 1,
+      turnsUsed: 0,
+      tokensUsed: 0
+    });
+    expect(() => store.updateObjective({
+      sessionId: recreated.sessionId,
+      expectedRevision: recreated.revision,
+      expectedOwnerGeneration: replacement.ownerGeneration,
+      status: "paused"
+    })).toThrow(StaleGenerationError);
+  });
+
+  it("removes Objective state and its generation checkpoint when the Session is deleted", () => {
+    const fixture = createFixture();
+    fixture.store.putObjective({ sessionId: "session-1", text: "Deleted session objective" });
+    const session = fixture.store.getSession("session-1");
+
+    fixture.store.updateSession("session-1", {
+      archived: true,
+      deletedAt: 20
+    }, session.revision, 20);
+
+    expect(fixture.store.findObjective("session-1")).toBeUndefined();
+    const filePath = fixture.store.filePath;
+    fixture.store.close();
+    const database = new DatabaseSync(filePath, { readOnly: true });
+    try {
+      expect(database.prepare(
+        "SELECT COUNT(*) AS count FROM session_objective_generations WHERE session_id = ?"
+      ).get("session-1")).toMatchObject({ count: 0 });
+    } finally {
+      database.close();
+    }
   });
 
   it("persists one isolated workspace binding per Session and updates only its lifecycle state", () => {
@@ -609,7 +718,7 @@ describe("OperationalStore", () => {
     expect(store.getSession(scheduled.descriptor.id).descriptor.automationOrigin).toBeUndefined();
   });
 
-  it("does not expose a service-owned continuation as a visible message origin", () => {
+  it("does not expose service-owned continuations as visible message origins", () => {
     const { store } = createFixture();
     store.appendEvent({
       id: "internal-continuation-origin",
@@ -629,6 +738,26 @@ describe("OperationalStore", () => {
     expect(store.findVisibleSessionMessageOrigin({
       sessionId: "session-1",
       eventId: "internal-continuation-origin"
+    })).toBeUndefined();
+
+    store.appendEvent({
+      id: "objective-continuation-origin",
+      backendId: "pi",
+      targetId: "target-1",
+      sessionId: "session-1",
+      generation: 0,
+      traceId: "objective:internal-origin",
+      payload: {
+        type: "message_complete",
+        role: "user",
+        blocks: [{ kind: "text", text: "Continue the objective" }],
+        objectiveContinuation: { ownerGeneration: 1, turn: 1 }
+      }
+    });
+
+    expect(store.findVisibleSessionMessageOrigin({
+      sessionId: "session-1",
+      eventId: "objective-continuation-origin"
     })).toBeUndefined();
   });
 
@@ -3465,7 +3594,7 @@ describe("OperationalStore", () => {
     })).toThrow("cannot page after and before a cursor at the same time");
   });
 
-  it("projects latest visible user activity without counting automatic continuations", () => {
+  it("projects latest visible user activity without counting service-owned continuations", () => {
     const { store } = createFixture();
     expect(store.findLatestVisibleUserMessageAt("session-1")).toBeUndefined();
 
@@ -3510,6 +3639,21 @@ describe("OperationalStore", () => {
         role: "user",
         blocks: [{ kind: "text", text: "Continue" }],
         automaticContinuation: { recoveryId: "user-activity-recovery" }
+      }
+    });
+    store.appendEvent({
+      id: "objective-continuation-after-user-activity",
+      backendId: "pi",
+      targetId: "target-1",
+      sessionId: "session-1",
+      generation: 0,
+      emittedAt: 400,
+      traceId: "user-activity:objective-continuation",
+      payload: {
+        type: "message_complete",
+        role: "user",
+        blocks: [{ kind: "text", text: "Continue the objective" }],
+        objectiveContinuation: { ownerGeneration: 1, turn: 1 }
       }
     });
 

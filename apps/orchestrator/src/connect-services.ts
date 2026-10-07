@@ -424,6 +424,7 @@ import { createMessagingConnectService } from "./messaging-connect-service.js";
 import { createContactConnectService } from "./contact-connect-service.js";
 import { createPartnerConnectService } from "./partner-connect-service.js";
 import { createCollaborationConnectService } from "./collaboration-connect-service.js";
+import { createObjectiveConnectService } from "./objective-connect-service.js";
 import type { ManagedModelRuntimeController } from "./managed-model-runtime-controller.js";
 import { PortableSessionPackageError } from "./portable-session-package.js";
 import { PortableSessionExportTooLargeError } from "./portable-session-transfer.js";
@@ -728,6 +729,7 @@ export interface ConnectServiceSet {
   readonly backend: ServiceImpl<typeof contract.BackendService>;
   readonly target: ServiceImpl<typeof contract.TargetService>;
   readonly session: ServiceImpl<typeof contract.SessionService>;
+  readonly objective: ServiceImpl<typeof contract.ObjectiveService>;
   readonly portableSession: ServiceImpl<typeof contract.PortableSessionService>;
   readonly run: ServiceImpl<typeof contract.RunService>;
   readonly subagent: ServiceImpl<typeof contract.SubagentService>;
@@ -1141,6 +1143,7 @@ export function registerConnectServices(router: ConnectRouter, application: Orch
   router.service(contract.BackendService, withConnectErrors(services.backend));
   router.service(contract.TargetService, withConnectErrors(services.target));
   router.service(contract.SessionService, withConnectErrors(services.session));
+  router.service(contract.ObjectiveService, withConnectErrors(services.objective));
   router.service(contract.PortableSessionService, withConnectErrors(services.portableSession));
   router.service(contract.RunService, withConnectErrors(services.run));
   router.service(contract.SubagentService, withConnectErrors(services.subagent));
@@ -1409,6 +1412,11 @@ export function createConnectServices(application: OrchestratorApplication, proj
   const collaborationGoal = createCollaborationConnectService(
     application.collaborationGoals,
     (context) => authenticate(context)
+  );
+  const objective = createObjectiveConnectService(
+    application.objectives,
+    (context) => ({ connectionId: authenticate(context).id }),
+    (connectionId, listener) => dependencies.connections.onRevoked(connectionId, listener)
   );
   const worktree = createWorktreeConnectService(
     dependencies.sessionWorktrees,
@@ -5245,7 +5253,7 @@ export function createConnectServices(application: OrchestratorApplication, proj
     }
   } satisfies ServiceImpl<typeof contract.PiService>;
 
-  return { connection, event, operation, backend, target, session, portableSession, run, subagent, review, queue, scheduler, interaction, workspace, worktree, artifact, historyMaintenance, credential, settings, messaging, contact, partner, collaborationGoal, managedModelRuntime, tool, extension, skill, browser, remoteHost, devicePeer, sshKey, voiceInput, terminal, simulatorViewer, pi };
+  return { connection, event, operation, backend, target, session, objective, portableSession, run, subagent, review, queue, scheduler, interaction, workspace, worktree, artifact, historyMaintenance, credential, settings, messaging, contact, partner, collaborationGoal, managedModelRuntime, tool, extension, skill, browser, remoteHost, devicePeer, sshKey, voiceInput, terminal, simulatorViewer, pi };
 }
 
 function requireAuthentication(dependencies: ConnectServiceDependencies, context: HandlerContext): ConnectionRecord {
@@ -7251,7 +7259,8 @@ async function sessionStatistics(dependencies: ConnectServiceDependencies, sessi
   let turnCount = 0n;
   let compactionCount = 0n;
   visitSessionEvents(dependencies.store, sessionId, (event) => {
-    if (event.payload.type === "message_complete" && event.payload.automaticContinuation === undefined) {
+    if (event.payload.type === "message_complete" && event.payload.automaticContinuation === undefined
+      && event.payload.objectiveContinuation === undefined) {
       messageCount += 1n;
     }
     if (event.payload.type === "done") turnCount += 1n;

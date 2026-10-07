@@ -1328,6 +1328,18 @@ const en = {
   "timeline.runtimeRecoveryReason": "Interruption reason",
   "timeline.runtimeRecoveryAttempt": "This retry {attempt}/{total}",
   "timeline.runtimeRecoverySessionTotal": "Reconnected {count} times in this task",
+  "timeline.objective.started": "Objective started",
+  "timeline.objective.replaced": "Objective replaced",
+  "timeline.objective.paused": "Objective paused",
+  "timeline.objective.resumed": "Objective resumed",
+  "timeline.objective.completed": "Objective completed",
+  "timeline.objective.blocked": "Objective needs attention",
+  "timeline.objective.limited": "Objective limit reached",
+  "timeline.objective.dispatchUnknown": "Objective dispatch needs review",
+  "timeline.objective.cleared": "Objective cleared",
+  "timeline.objective.turns": "{count} turns",
+  "timeline.objective.tokens": "{count} tokens",
+  "timeline.objective.elapsed": "{duration} elapsed",
   "timeline.background": "Background task",
   "timeline.subagent": "Subagent",
   "timeline.subagentOpen": "Open in Subagents",
@@ -5571,6 +5583,41 @@ const en = {
   ,"messaging.status.conflict": "Conflict"
   ,"messaging.status.authLoss": "Authorization lost"
   ,"messaging.status.error": "Error"
+  ,"objective.createTitle": "Start an objective"
+  ,"objective.editTitle": "Edit objective"
+  ,"objective.dialogDescription": "Joko will keep working on this objective in the current task until it completes or needs your attention."
+  ,"objective.objectiveLabel": "Objective"
+  ,"objective.placeholder": "Describe the outcome Joko should keep working toward…"
+  ,"objective.advanced": "Advanced limits"
+  ,"objective.advancedHint": "Safety limits stop autonomous continuation without deleting progress."
+  ,"objective.maximumTurns": "Maximum turns"
+  ,"objective.tokenBudget": "Token budget"
+  ,"objective.noProgressTurnLimit": "No-progress turns"
+  ,"objective.unlimited": "No limit"
+  ,"objective.saving": "Saving…"
+  ,"objective.start": "Start"
+  ,"objective.saveFailed": "The objective could not be saved."
+  ,"objective.loading": "Loading objective…"
+  ,"objective.loadFailed": "The objective status could not be loaded."
+  ,"objective.actionFailed": "The objective action failed."
+  ,"objective.actionPending": "Another objective action is still in progress."
+  ,"objective.ownerChanged": "This task changed while the objective action was in progress."
+  ,"objective.status.active": "Active"
+  ,"objective.status.paused": "Paused"
+  ,"objective.status.blocked": "Blocked"
+  ,"objective.status.complete": "Complete"
+  ,"objective.status.budgetLimited": "Budget reached"
+  ,"objective.status.usageLimited": "Usage limited"
+  ,"objective.status.dispatchUnknown": "Dispatch needs review"
+  ,"objective.usageManualResume": "Resume when capacity is available"
+  ,"objective.usageResetsAt": "Available after {time}"
+  ,"objective.turns": "{used} turns"
+  ,"objective.turnsWithMaximum": "{used}/{maximum} turns"
+  ,"objective.tokens": "{used}/{maximum} tokens"
+  ,"objective.elapsed": "Elapsed time"
+  ,"objective.pause": "Pause objective"
+  ,"objective.resume": "Resume objective"
+  ,"objective.clear": "Clear objective"
 } as const;
 
 export type MessageKey = keyof typeof en;
@@ -7452,6 +7499,18 @@ const zhBase: Record<MessageKey, string> = {
   "timeline.runtimeRecoveryReason": "中断原因",
   "timeline.runtimeRecoveryAttempt": "本次重试 {attempt}/{total}",
   "timeline.runtimeRecoverySessionTotal": "本任务累计重连 {count} 次",
+  "timeline.objective.started": "目标已开始",
+  "timeline.objective.replaced": "目标已替换",
+  "timeline.objective.paused": "目标已暂停",
+  "timeline.objective.resumed": "目标已继续",
+  "timeline.objective.completed": "目标已完成",
+  "timeline.objective.blocked": "目标需要处理",
+  "timeline.objective.limited": "目标已达到限制",
+  "timeline.objective.dispatchUnknown": "目标派发状态待确认",
+  "timeline.objective.cleared": "目标已清除",
+  "timeline.objective.turns": "{count} 轮",
+  "timeline.objective.tokens": "{count} tokens",
+  "timeline.objective.elapsed": "已运行 {duration}",
   "app.name": "Joko",
   "app.tagline": "始终在线的 Agent 工作台",
   "app.skipToContent": "跳到主要内容", "app.degraded": "Orchestrator 状态异常。恢复期间，正在运行的工作仍由服务端持有。", "app.applyingChange": "正在应用更改…", "app.openingState": "正在打开加密的本地 UI 状态…",
@@ -9220,7 +9279,42 @@ const zhBase: Record<MessageKey, string> = {
     "projects.browseServiceTruncated": "这里只显示了部分目录；如需其他目录，可在项目表单中填写完整服务节点路径。",
     "projects.browseServiceDisconnected": "服务连接已断开。重新连接后可重试此目录。",
     "projects.createLocalBody": "选择本机目录，或填写本机受管服务的路径。",
-    "projects.localPathHelp": "选择本机目录，或输入本机服务节点上的路径。"
+    "projects.localPathHelp": "选择本机目录，或输入本机服务节点上的路径。",
+    "objective.createTitle": "开始目标",
+    "objective.editTitle": "编辑目标",
+    "objective.dialogDescription": "Joko 会在当前任务中持续推进此目标，直到完成或需要你处理。",
+    "objective.objectiveLabel": "目标",
+    "objective.placeholder": "描述 Joko 应持续推进的结果…",
+    "objective.advanced": "高级限制",
+    "objective.advancedHint": "安全限制会停止自主续跑，但不会删除已有进度。",
+    "objective.maximumTurns": "最大轮数",
+    "objective.tokenBudget": "Token 预算",
+    "objective.noProgressTurnLimit": "无进展轮数",
+    "objective.unlimited": "不限",
+    "objective.saving": "正在保存…",
+    "objective.start": "开始",
+    "objective.saveFailed": "无法保存目标。",
+    "objective.loading": "正在加载目标…",
+    "objective.loadFailed": "无法加载目标状态。",
+    "objective.actionFailed": "目标操作失败。",
+    "objective.actionPending": "另一项目标操作仍在进行中。",
+    "objective.ownerChanged": "目标操作期间当前任务已发生变化。",
+    "objective.status.active": "进行中",
+    "objective.status.paused": "已暂停",
+    "objective.status.blocked": "已阻塞",
+    "objective.status.complete": "已完成",
+    "objective.status.budgetLimited": "预算已用尽",
+    "objective.status.usageLimited": "用量受限",
+    "objective.status.dispatchUnknown": "派发状态待确认",
+    "objective.usageManualResume": "容量恢复后手动继续",
+    "objective.usageResetsAt": "{time} 后可用",
+    "objective.turns": "{used} 轮",
+    "objective.turnsWithMaximum": "{used}/{maximum} 轮",
+    "objective.tokens": "{used}/{maximum} tokens",
+    "objective.elapsed": "已运行时间",
+    "objective.pause": "暂停目标",
+    "objective.resume": "继续目标",
+    "objective.clear": "清除目标"
   }
 };
 

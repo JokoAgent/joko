@@ -1,4 +1,5 @@
 import type { SessionView, TimelineItemView } from "../model.js";
+import { isInternalContinuationTimelineItem } from "../runtime-recovery.js";
 import { readPartnerDelegationCardData } from "./partner-delegation-card-data.js";
 
 /** History-window guard: a larger interval is treated as missing history. */
@@ -111,6 +112,7 @@ export function projectTimelineRenderItems(
   };
 
   for (const item of sourceItems) {
+    if (isInternalContinuationTimelineItem(item)) continue;
     const timestamp = finiteTimestamp(item.createdAt);
     const userBoundary = item.kind === "user";
     if (!userBoundary

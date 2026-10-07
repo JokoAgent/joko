@@ -1,4 +1,5 @@
 import type { TimelineItemView } from "../model.js";
+import { isInternalContinuationTimelineItem } from "../runtime-recovery.js";
 
 const FENCE_LINE = /^\s{0,3}(`{3,}|~{3,})(.*)$/;
 
@@ -194,7 +195,7 @@ function timelineUnreadItemIdentity(item: TimelineItemView): string {
 }
 
 function isUnreadTimelineMessage(item: TimelineItemView): boolean {
-  if (item.inlinePlan !== undefined || item.automaticContinuation !== undefined) return false;
+  if (item.inlinePlan !== undefined || isInternalContinuationTimelineItem(item)) return false;
   if (item.kind === "assistant") return true;
   if (item.kind === "user") return item.localUserInput !== true;
   return item.kind === "interaction" && (item.interaction?.kind === "question" || item.interaction?.kind === "plan");

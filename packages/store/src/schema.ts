@@ -1276,6 +1276,13 @@ CREATE TABLE session_event_counters (
         last_sequence INTEGER NOT NULL CHECK (last_sequence >= 0)
       ) STRICT;
 
+CREATE TABLE session_objective_generations (
+        session_id TEXT PRIMARY KEY REFERENCES product_sessions(id) ON DELETE CASCADE,
+        owner_generation INTEGER NOT NULL CHECK (
+          owner_generation BETWEEN 1 AND 9007199254740991
+        )
+      ) STRICT;
+
 CREATE TABLE session_objectives (
         session_id TEXT PRIMARY KEY REFERENCES product_sessions(id) ON DELETE CASCADE,
         objective_text TEXT NOT NULL CHECK (
@@ -1286,6 +1293,12 @@ CREATE TABLE session_objectives (
           'active', 'paused', 'blocked', 'complete', 'budget_limited',
           'usage_limited', 'dispatch_unknown'
         )),
+        usage_reset_at INTEGER CHECK (
+          usage_reset_at IS NULL OR (
+            usage_reset_at BETWEEN 0 AND 9007199254740991
+            AND status = 'usage_limited'
+          )
+        ),
         token_budget INTEGER CHECK (token_budget IS NULL OR token_budget BETWEEN 1 AND 9007199254740991),
         maximum_turns INTEGER CHECK (maximum_turns IS NULL OR maximum_turns BETWEEN 1 AND 10000),
         no_progress_turn_limit INTEGER CHECK (
@@ -2541,6 +2554,7 @@ CREATE TRIGGER enqueue_visible_message_embedding
             json_extract(NEW.payload_json, '$.payload.type') = 'message_complete'
             AND json_extract(NEW.payload_json, '$.payload.role') IN ('user', 'assistant')
             AND json_extract(NEW.payload_json, '$.payload.automaticContinuation') IS NULL
+            AND json_extract(NEW.payload_json, '$.payload.objectiveContinuation') IS NULL
           )
           OR (
             json_extract(NEW.payload_json, '$.payload.type') = 'interaction_opened'
@@ -2690,6 +2704,17 @@ CREATE TRIGGER session_objectives_generation_insert
         SELECT RAISE(ABORT, 'objective session generation is stale');
       END;
 
+CREATE TRIGGER session_objectives_owner_generation_insert
+      BEFORE INSERT ON session_objectives
+      WHEN NOT EXISTS (
+        SELECT 1 FROM session_objective_generations generation
+        WHERE generation.session_id = NEW.session_id
+          AND generation.owner_generation = NEW.owner_generation
+      )
+      BEGIN
+        SELECT RAISE(ABORT, 'objective owner generation is stale');
+      END;
+
 CREATE TRIGGER session_objectives_generation_update
       BEFORE UPDATE ON session_objectives
       WHEN NOT EXISTS (
@@ -2699,6 +2724,24 @@ CREATE TRIGGER session_objectives_generation_update
       )
       BEGIN
         SELECT RAISE(ABORT, 'objective session generation is stale');
+      END;
+
+CREATE TRIGGER session_objectives_owner_generation_update
+      BEFORE UPDATE OF owner_generation ON session_objectives
+      WHEN NOT EXISTS (
+        SELECT 1 FROM session_objective_generations generation
+        WHERE generation.session_id = NEW.session_id
+          AND generation.owner_generation = NEW.owner_generation
+      )
+      BEGIN
+        SELECT RAISE(ABORT, 'objective owner generation is stale');
+      END;
+
+CREATE TRIGGER session_objective_generations_monotonic_update
+      BEFORE UPDATE OF owner_generation ON session_objective_generations
+      WHEN NEW.owner_generation <= OLD.owner_generation
+      BEGIN
+        SELECT RAISE(ABORT, 'objective owner generation must advance');
       END;
 
 CREATE TRIGGER collaboration_goals_owner_insert

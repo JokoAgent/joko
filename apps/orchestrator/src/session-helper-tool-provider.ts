@@ -1915,7 +1915,7 @@ function historyMessageFromEvent(event: PersistedEvent): HistoryMessage | undefi
       };
   switch (event.payload.type) {
     case "message_complete":
-      if (event.payload.automaticContinuation !== undefined) return undefined;
+      if (event.payload.automaticContinuation !== undefined || event.payload.objectiveContinuation !== undefined) return undefined;
       return {
         event,
         role: event.payload.role,

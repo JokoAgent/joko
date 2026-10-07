@@ -133,6 +133,46 @@ test("Backend and native-session discovery surfaces stay capability-neutral", ()
   ]);
 });
 
+test("Objective service exposes one fenced Session workload surface", () => {
+  assert.deepEqual(
+    [...contract.ObjectiveService.methods].map((method) => [
+      method.localName, method.methodKind, method.output.typeName
+    ]),
+    [
+      ["getObjective", "unary", "joko.v1.GetObjectiveResponse"],
+      ["watchObjective", "server_streaming", "joko.v1.WatchObjectiveResponse"],
+      ["setObjective", "unary", "joko.v1.SetObjectiveResponse"],
+      ["updateObjective", "unary", "joko.v1.UpdateObjectiveResponse"],
+      ["pauseObjective", "unary", "joko.v1.PauseObjectiveResponse"],
+      ["resumeObjective", "unary", "joko.v1.ResumeObjectiveResponse"],
+      ["clearObjective", "unary", "joko.v1.ClearObjectiveResponse"]
+    ]
+  );
+  assert.equal("ObjectiveMutationResponseSchema" in contract, false);
+
+  const usageResetAt = field(contract.ObjectiveSchema, "usage_reset_at");
+  assert.equal(usageResetAt.number, 17);
+  assert.equal(usageResetAt.proto.proto3Optional, true);
+  assert.equal(usageResetAt.message.typeName, "google.protobuf.Timestamp");
+  assert.equal(roundTrip(contract.ObjectiveSchema, {
+    sessionId: "session-1",
+    usageResetAt: { seconds: 9_007_199_254n, nanos: 123_000_000 }
+  }).usageResetAt.seconds, 9_007_199_254n);
+
+  assert.deepEqual(oneofMembers(contract.UpdateObjectiveRequestSchema, "token_budget_update"), [
+    "token_budget", "clear_token_budget"
+  ]);
+  assert.deepEqual(oneofMembers(contract.UpdateObjectiveRequestSchema, "maximum_turns_update"), [
+    "maximum_turns", "clear_maximum_turns"
+  ]);
+  assert.deepEqual(oneofMembers(contract.UpdateObjectiveRequestSchema, "no_progress_turn_limit_update"), [
+    "no_progress_turn_limit", "clear_no_progress_turn_limit"
+  ]);
+  assertNoFields([contract.ObjectiveSchema], [
+    "pending_operation_id", "pending_attempt_id", "pending_owner_generation", "dispatch_rejections"
+  ]);
+});
+
 test("remote-host requests derive owner identity from authentication", () => {
   const requests = [
     contract.GetRemoteHostCapabilitiesRequestSchema,

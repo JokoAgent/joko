@@ -111,6 +111,38 @@ describe("shared composer palettes", () => {
     expect(runtimeCommandOwnsApplicationCommand([{ ...runtimeLearn, name: "learning" }], "learn")).toBe(false);
   });
 
+  it("parses the application Objective command and gives an exact loaded Skill priority", () => {
+    const runtimeGoal: RuntimeCommandView = {
+      id: "goal-skill",
+      name: "goal",
+      description: "Runtime objective skill",
+      source: "skill",
+      resourceId: "skill-goal",
+      loaded: true
+    };
+    const options = { goalSupported: true };
+    expect(composerBuiltInCommand("/goal", options)).toEqual({ kind: "objective", action: "open" });
+    expect(composerBuiltInCommand("/GOAL  finish the release\nwithout regressions ", options)).toEqual({
+      kind: "objective",
+      action: "set",
+      text: "finish the release\nwithout regressions"
+    });
+    for (const alias of ["clear", "stop", "off", "cancel", "reset", "none"]) {
+      expect(composerBuiltInCommand(`/goal ${alias}`, options)).toEqual({ kind: "objective", action: "clear" });
+    }
+    expect(composerBuiltInCommand(" /goal", options)).toBeUndefined();
+    expect(composerBuiltInCommand("/goals", options)).toBeUndefined();
+    expect(composerCommandItems([], options)).toEqual([
+      expect.objectContaining({ id: "builtin:goal", value: "/goal" })
+    ]);
+    expect(composerCommandItems([runtimeGoal], options)).toEqual([
+      expect.objectContaining({ id: "command:goal-skill", value: "/goal" })
+    ]);
+    expect(runtimeCommandOwnsApplicationCommand([runtimeGoal], "goal")).toBe(true);
+    expect(runtimeCommandOwnsApplicationCommand([{ ...runtimeGoal, source: "backend" }], "goal")).toBe(false);
+    expect(runtimeCommandOwnsApplicationCommand([{ ...runtimeGoal, loaded: false }], "goal")).toBe(false);
+  });
+
   it("tracks a slash query at a token boundary and owns the complete run around the caret", () => {
     expect(detectComposerCommandActivation("inspect /rev", 12, { isComposing: false, bashMode: false }))
       .toEqual({ from: 8, to: 12, query: "rev" });
