@@ -4152,6 +4152,30 @@ html[data-desktop-platform="darwin"] .runtime-process-window__titlebar { padding
   }
 }
 
+@media (orientation: landscape) and (min-width: 721px) and (max-width: 1160px) {
+  .connection-screen {
+    grid-template-columns: minmax(0, .8fr) minmax(0, 1.2fr);
+    align-content: start;
+    gap: clamp(20px, 3vw, 36px);
+    padding: 0 clamp(16px, 2vw, 28px) 0 0;
+  }
+
+  .connection-hero {
+    width: 100%;
+    min-height: 100%;
+    justify-self: stretch;
+  }
+
+  .connection-panel {
+    grid-column: 2;
+    grid-row: 1;
+    align-self: safe center;
+    padding-block: 24px;
+  }
+
+  .connection-tabs { grid-template-columns: auto auto auto; }
+}
+
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .001ms !important; animation-iteration-count: 1 !important; transition-duration: .001ms !important; }
   .streaming-cursor, .thinking-pulse, .spin-slow { animation: none !important; }
