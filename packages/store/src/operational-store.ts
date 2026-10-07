@@ -235,6 +235,7 @@ import type {
   ScheduleRunRecord,
   SchedulerRuntimeOwnerRecord,
   SearchSessionMessagesInput,
+  SetRemoteHostAutoConnectInput,
   SetMessagingConnectionEnabledInput,
   SessionLifecycleCleanupPhase,
   SessionLifecycleCleanupRecord,
@@ -2993,11 +2994,12 @@ export class OperationalStore {
       this.database.prepare(`
         INSERT INTO remote_hosts(
           owner_id, target_id, host_id, hostname, port, username, source,
+          auto_connect, auto_connect_revision,
           authentication_mode, credential_reference_id, node_key_id, node_key_fingerprint,
           trust_algorithm, trust_fingerprint, trust_pinned_at,
           status, status_changed_at, failure_code, failure_retryable,
           created_at, updated_at, revision
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, 'disconnected', ?, NULL, NULL, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, 1, ?, ?, ?, ?, NULL, NULL, NULL, 'disconnected', ?, NULL, NULL, ?, ?, ?)
       `).run(
         ownerId,
         targetId,
@@ -3112,6 +3114,55 @@ export class OperationalStore {
           current.id,
           current.revision,
           this.findRemoteHost(current.ownerId, current.targetId, current.id)?.revision ?? 0n
+        );
+      }
+      return this.getRemoteHost(current.ownerId, current.targetId, current.id);
+    });
+  }
+
+  setRemoteHostAutoConnect(input: SetRemoteHostAutoConnectInput): RemoteHostRecord {
+    return this.write(() => {
+      const current = this.getRemoteHost(input.ownerId, input.targetId, input.id);
+      assertRemoteHostRevision(current, input.expectedRevision);
+      if (current.autoConnectRevision !== input.expectedAutoConnectRevision) {
+        throw new RevisionConflictError(
+          "Remote Host auto-connect preference",
+          current.id,
+          input.expectedAutoConnectRevision,
+          current.autoConnectRevision
+        );
+      }
+      if (current.autoConnect === input.enabled) return current;
+      const nextAutoConnectRevision = current.autoConnectRevision + 1n;
+      const result = this.database.prepare(`
+        UPDATE remote_hosts SET
+          auto_connect = ?, auto_connect_revision = ?
+        WHERE owner_id = ? AND target_id = ? AND host_id = ?
+          AND revision = ? AND auto_connect_revision = ?
+      `).run(
+        boolInt(input.enabled),
+        asSqlInteger(nextAutoConnectRevision),
+        current.ownerId,
+        current.targetId,
+        current.id,
+        asSqlInteger(current.revision),
+        asSqlInteger(current.autoConnectRevision)
+      );
+      if (result.changes !== 1) {
+        const changed = this.getRemoteHost(current.ownerId, current.targetId, current.id);
+        if (changed.revision !== current.revision) {
+          throw new RevisionConflictError(
+            "Remote Host",
+            current.id,
+            current.revision,
+            changed.revision
+          );
+        }
+        throw new RevisionConflictError(
+          "Remote Host auto-connect preference",
+          current.id,
+          current.autoConnectRevision,
+          changed.autoConnectRevision
         );
       }
       return this.getRemoteHost(current.ownerId, current.targetId, current.id);
@@ -18325,6 +18376,8 @@ function remoteHostFromRow(row: Row): RemoteHostRecord {
     port: remoteHostPort(numberValue(row["port"])),
     user: remoteHostUser(stringValue(row["username"])),
     source: remoteHostSource(stringValue(row["source"])),
+    autoConnect: booleanValue(row["auto_connect"]),
+    autoConnectRevision: toBigInt(row["auto_connect_revision"]),
     authenticationMode,
     ...(credentialReferenceId === undefined ? {} : { credentialReferenceId }),
     ...(nodeKey === undefined ? {} : { nodeKey }),

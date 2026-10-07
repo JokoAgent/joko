@@ -2259,6 +2259,7 @@ export function useAppController(): AppController {
       createRemoteHost: async (...args: Parameters<OperationApi["createRemoteHost"]>) => original().createRemoteHost(...args),
       updateRemoteHost: async (...args: Parameters<OperationApi["updateRemoteHost"]>) => original().updateRemoteHost(...args),
       deleteRemoteHost: async (...args: Parameters<OperationApi["deleteRemoteHost"]>) => original().deleteRemoteHost(...args),
+      setRemoteHostAutoConnect: async (...args: Parameters<OperationApi["setRemoteHostAutoConnect"]>) => original().setRemoteHostAutoConnect(...args),
       connectRemoteHost: async (...args: Parameters<OperationApi["connectRemoteHost"]>) => original().connectRemoteHost(...args),
       disconnectRemoteHost: async (...args: Parameters<OperationApi["disconnectRemoteHost"]>) => original().disconnectRemoteHost(...args),
       testRemoteHostConnection: async (...args: Parameters<OperationApi["testRemoteHostConnection"]>) => original().testRemoteHostConnection(...args),

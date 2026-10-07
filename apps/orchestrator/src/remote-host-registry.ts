@@ -30,6 +30,7 @@ import {
   type RemoteHostFailureCode,
   type RemoteHostRecord,
   type RemoteHostStatus,
+  type SetRemoteHostAutoConnectInput,
   type UpdateRemoteHostInput
 } from "@joko/store";
 
@@ -61,6 +62,7 @@ export type RemoteHostCreate = Omit<CreateRemoteHostInput, "ownerId">;
 export type RemoteHostUpdate = Omit<UpdateRemoteHostInput, "ownerId">;
 export type RemoteHostDelete = Omit<DeleteRemoteHostInput, "ownerId">;
 export type RemoteHostTrustReset = Omit<ClearRemoteHostTrustInput, "ownerId">;
+export type RemoteHostAutoConnectSet = Omit<SetRemoteHostAutoConnectInput, "ownerId">;
 
 export interface RemoteHostConnectionOutcome {
   readonly ok: boolean;
@@ -108,6 +110,7 @@ export class RemoteHostRegistry {
   readonly #controllers = new Map<string, ManagedController>();
   readonly #listeners = new Map<string, Set<RemoteHostRegistryListener>>();
   readonly #refreshes = new Map<string, Promise<RemoteHostRecord[]>>();
+  #autoConnectFlight: Promise<void> | undefined;
   #closed = false;
 
   constructor(options: RemoteHostRegistryOptions) {
@@ -227,6 +230,13 @@ export class RemoteHostRegistry {
     return host;
   }
 
+  setAutoConnect(input: RemoteHostAutoConnectSet): RemoteHostRecord {
+    this.assertOpen();
+    const host = this.#store.setRemoteHostAutoConnect({ ...input, ownerId: this.#ownerId });
+    this.publish({ kind: "upserted", host });
+    return host;
+  }
+
   clearTrust(input: RemoteHostTrustReset): RemoteHostRecord {
     this.assertOpen();
     const host = this.#store.clearRemoteHostTrust({ ...input, ownerId: this.#ownerId });
@@ -274,6 +284,20 @@ export class RemoteHostRegistry {
     signal?: AbortSignal
   ): Promise<RemoteHostConnectionOutcome> {
     return this.runConnectionTest(targetId, id, expectedRevision, true, signal);
+  }
+
+  startAutoConnect(): Promise<void> {
+    this.assertOpen();
+    if (this.#autoConnectFlight !== undefined) return this.#autoConnectFlight;
+    const attempts = this.#store.listRemoteHosts(this.#ownerId)
+      .filter((host) => host.autoConnect)
+      .map((host) => host.authenticationMode === "node_key" && host.nodeKey !== undefined
+        ? this.connect(host.targetId, host.id, host.revision)
+        : Promise.resolve().then(() => {
+            this.persistConnectionAdmissionFailure(host, "node_key_unavailable");
+          }));
+    this.#autoConnectFlight = Promise.allSettled(attempts).then(() => undefined);
+    return this.#autoConnectFlight;
   }
 
   async execute(
@@ -408,6 +432,7 @@ export class RemoteHostRegistry {
 
   async close(): Promise<void> {
     if (this.#closed) return;
+    const autoConnectFlight = this.#autoConnectFlight;
     const controllers = [...this.#controllers.values()];
     for (const managed of controllers) {
       try {
@@ -417,6 +442,7 @@ export class RemoteHostRegistry {
       }
       managed.unsubscribe();
     }
+    if (autoConnectFlight !== undefined) await autoConnectFlight;
     this.#controllers.clear();
     this.#listeners.clear();
     this.#closed = true;
@@ -614,6 +640,13 @@ export class RemoteHostRegistry {
   }
 
   private persistMissingCredentialFailure(host: RemoteHostRecord): RemoteHostRecord {
+    return this.persistConnectionAdmissionFailure(host, "authentication_failed");
+  }
+
+  private persistConnectionAdmissionFailure(
+    host: RemoteHostRecord,
+    failureCode: "authentication_failed" | "node_key_unavailable"
+  ): RemoteHostRecord {
     let current = host;
     if (current.status.state === "ready" || current.status.state === "authenticating") {
       current = this.persistStatus(current, "disconnected", this.#now());
@@ -623,7 +656,7 @@ export class RemoteHostRegistry {
       current = this.persistStatus(current, "connecting", this.#now());
       this.publish({ kind: "upserted", host: current });
     }
-    current = this.persistStatus(current, "failed", this.#now(), "authentication_failed");
+    current = this.persistStatus(current, "failed", this.#now(), failureCode);
     this.publish({ kind: "upserted", host: current });
     return current;
   }

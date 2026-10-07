@@ -141,6 +141,13 @@ describe("RemoteHostRegistry owner-private catalog", () => {
       fingerprint: "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
       pinnedAt: changed.createdAt
     });
+    changed = registry.setAutoConnect({
+      targetId: changed.targetId,
+      id: changed.id,
+      expectedRevision: changed.revision,
+      expectedAutoConnectRevision: changed.autoConnectRevision,
+      enabled: true
+    });
     const removed = registry.create(hostCreate({ id: "removed", source: "ssh_config" }));
     const otherTarget = registry.create(hostCreate({
       targetId: "target-b",
@@ -170,9 +177,15 @@ describe("RemoteHostRegistry owner-private catalog", () => {
       port: 2202,
       user: "deployer",
       source: "ssh_config",
-      credentialReferenceId: "agent:changed"
+      credentialReferenceId: "agent:changed",
+      autoConnect: true,
+      autoConnectRevision: changed.autoConnectRevision
     });
     expect(refreshedChanged.trust).toBeUndefined();
+    expect(registry.get("target-a", "added")).toMatchObject({
+      autoConnect: false,
+      autoConnectRevision: 1n
+    });
     expect(() => registry.get("target-a", removed.id)).toThrow(NotFoundError);
     expect(registry.get("target-b", otherTarget.id)).toEqual(otherTarget);
     expect(fixture.store.getRemoteHost("owner-b", "target-a", "other-owner").id).toBe("other-owner");
@@ -666,6 +679,217 @@ describe("RemoteHostRegistry restart and shutdown", () => {
     }
     expect(fixture.store.getRemoteHost("owner-b", otherOwner.targetId, otherOwner.id).status.state)
       .toBe("ready");
+  });
+
+  it("auto-connects only enabled Hosts once and isolates their outcomes", async () => {
+    const fixture = createFixture();
+    const resolve = vi.fn(() => CREDENTIAL_VALUE);
+    const readPublic = vi.fn(async (id: string) => `public:${id}`);
+    const connect = vi.fn(async (request: ResolvedAgentAuthConnectorRequest) => {
+      expect(request.authentication.kind).toBe("agent_key");
+      request.onAuthenticating();
+      if (request.hostname === "failing.example.test") {
+        throw new RemoteSshError(
+          "NODE_KEY_UNAVAILABLE",
+          "The selected node key is unavailable in the SSH agent.",
+          false
+        );
+      }
+      await request.verifyHostKey({
+        algorithm: "ssh-ed25519",
+        key: Buffer.from(`host-key:${request.hostname}`)
+      });
+      return { close: vi.fn(async () => undefined) };
+    });
+    const registry = fixture.registry({
+      credentials: { resolve },
+      nodeKeys: { readPublic },
+      connector: {
+        capabilities: {
+          commandExecution: false,
+          processStreaming: false,
+          fileTransfer: false,
+          tcpForwarding: false,
+          interactiveTerminal: false
+        },
+        connect
+      }
+    });
+    const exactNodeKey = (id: string) => ({
+      id: `id_${id}`,
+      expectedFingerprint: `SHA256:${"b".repeat(43)}`
+    });
+    const ready = registry.create(hostCreate({
+      id: "ready",
+      hostname: "ready.example.test",
+      authenticationMode: "node_key",
+      nodeKey: exactNodeKey("ready")
+    }));
+    const failing = registry.create(hostCreate({
+      id: "failing",
+      hostname: "failing.example.test",
+      authenticationMode: "node_key",
+      nodeKey: exactNodeKey("failing")
+    }));
+    const disabled = registry.create(hostCreate({
+      id: "disabled",
+      hostname: "disabled.example.test",
+      authenticationMode: "node_key",
+      nodeKey: exactNodeKey("disabled")
+    }));
+    const systemAgent = registry.create(hostCreate({
+      id: "system-agent",
+      hostname: "system-agent.example.test",
+      authenticationMode: "system_agent"
+    }));
+    const privateKey = registry.create(hostCreate({
+      id: "private-key",
+      hostname: "private-key.example.test",
+      authenticationMode: "private_key",
+      credentialReferenceId: "agent:private-key"
+    }));
+    for (const host of [ready, failing, systemAgent, privateKey]) {
+      registry.setAutoConnect({
+        targetId: host.targetId,
+        id: host.id,
+        expectedRevision: host.revision,
+        expectedAutoConnectRevision: host.autoConnectRevision,
+        enabled: true
+      });
+    }
+    const changes: RemoteHostRegistryChange[] = [];
+    registry.subscribe("target-a", (change) => changes.push(change));
+
+    const firstStartup = registry.startAutoConnect();
+    expect(registry.startAutoConnect()).toBe(firstStartup);
+    await firstStartup;
+
+    expect(connect).toHaveBeenCalledTimes(2);
+    expect(connect.mock.calls.map(([request]) => request.hostname).sort()).toEqual([
+      "failing.example.test",
+      "ready.example.test"
+    ]);
+    expect(readPublic).toHaveBeenCalledTimes(2);
+    expect(readPublic).toHaveBeenCalledWith(
+      ready.nodeKey!.id,
+      ready.nodeKey!.expectedFingerprint,
+      expect.any(AbortSignal)
+    );
+    expect(readPublic).toHaveBeenCalledWith(
+      failing.nodeKey!.id,
+      failing.nodeKey!.expectedFingerprint,
+      expect.any(AbortSignal)
+    );
+    expect(resolve).not.toHaveBeenCalled();
+    const connectedReady = registry.get(ready.targetId, ready.id);
+    expect(connectedReady).toMatchObject({
+      autoConnect: true,
+      status: { state: "ready" }
+    });
+    expect(registry.get(failing.targetId, failing.id)).toMatchObject({
+      autoConnect: true,
+      status: {
+        state: "failed",
+        failure: { code: "node_key_unavailable", retryable: false }
+      }
+    });
+    expect(registry.get(disabled.targetId, disabled.id)).toMatchObject({
+      autoConnect: false,
+      status: { state: "disconnected" }
+    });
+    for (const host of [systemAgent, privateKey]) {
+      expect(registry.get(host.targetId, host.id)).toMatchObject({
+        autoConnect: true,
+        status: {
+          state: "failed",
+          failure: { code: "node_key_unavailable", retryable: false }
+        }
+      });
+      expect(changes).toContainEqual(expect.objectContaining({
+        kind: "upserted",
+        host: expect.objectContaining({
+          id: host.id,
+          status: expect.objectContaining({
+            state: "failed",
+            failure: { code: "node_key_unavailable", retryable: false }
+          })
+        })
+      }));
+    }
+
+    const preferenceDisabled = registry.setAutoConnect({
+      targetId: connectedReady.targetId,
+      id: connectedReady.id,
+      expectedRevision: connectedReady.revision,
+      expectedAutoConnectRevision: connectedReady.autoConnectRevision,
+      enabled: false
+    });
+    expect(preferenceDisabled).toMatchObject({
+      autoConnect: false,
+      revision: connectedReady.revision,
+      status: { state: "ready" }
+    });
+    await expect(registry.connect(
+      preferenceDisabled.targetId,
+      preferenceDisabled.id,
+      preferenceDisabled.revision
+    )).resolves.toMatchObject({ ok: true });
+    expect(connect).toHaveBeenCalledTimes(2);
+  });
+
+  it("waits for an in-flight startup connection while closing and closes a late handle", async () => {
+    const fixture = createFixture();
+    let release = (): void => undefined;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const lateClose = vi.fn(async () => undefined);
+    const readPublic = vi.fn(async () => "public:startup-close");
+    const connect = vi.fn(async (request: ResolvedAgentAuthConnectorRequest) => {
+      expect(request.authentication.kind).toBe("agent_key");
+      request.onAuthenticating();
+      await gate;
+      return { close: lateClose };
+    });
+    const registry = fixture.registry({
+      nodeKeys: { readPublic },
+      connector: {
+        capabilities: {
+          commandExecution: false,
+          processStreaming: false,
+          fileTransfer: false,
+          tcpForwarding: false,
+          interactiveTerminal: false
+        },
+        connect
+      }
+    });
+    const created = registry.create(hostCreate({
+      authenticationMode: "node_key",
+      nodeKey: {
+        id: "id_startup_close",
+        expectedFingerprint: `SHA256:${"c".repeat(43)}`
+      }
+    }));
+    registry.setAutoConnect({
+      targetId: created.targetId,
+      id: created.id,
+      expectedRevision: created.revision,
+      expectedAutoConnectRevision: created.autoConnectRevision,
+      enabled: true
+    });
+    let startupSettled = false;
+    const startup = registry.startAutoConnect().then(() => { startupSettled = true; });
+    await vi.waitFor(() => expect(connect).toHaveBeenCalledOnce());
+
+    await registry.close();
+
+    expect(startupSettled).toBe(true);
+    expect(fixture.store.getRemoteHost("owner-a", created.targetId, created.id).status.state)
+      .toBe("disconnected");
+    expect(() => registry.list(created.targetId)).toThrow(StoreError);
+
+    release();
+    await vi.waitFor(() => expect(lateClose).toHaveBeenCalledOnce());
+    await startup;
   });
 
   it("closes explicit and registry-wide connections and rejects use after shutdown", async () => {

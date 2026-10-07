@@ -453,6 +453,7 @@ export function VisualHarness(): JSX.Element {
       createRemoteHost: remoteHosts.createRemoteHost,
       updateRemoteHost: remoteHosts.updateRemoteHost,
       deleteRemoteHost: remoteHosts.deleteRemoteHost,
+      setRemoteHostAutoConnect: remoteHosts.setRemoteHostAutoConnect,
       connectRemoteHost: remoteHosts.connectRemoteHost,
       disconnectRemoteHost: remoteHosts.disconnectRemoteHost,
       testRemoteHostConnection: remoteHosts.testRemoteHostConnection,

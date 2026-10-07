@@ -381,6 +381,8 @@ export interface RemoteHostRecord extends RemoteHostScope {
   readonly port: number;
   readonly user: string;
   readonly source: RemoteHostSource;
+  readonly autoConnect: boolean;
+  readonly autoConnectRevision: bigint;
   readonly authenticationMode: RemoteHostAuthenticationMode;
   /** Opaque identifier only; credential material belongs in the credential channel. */
   readonly credentialReferenceId?: string;
@@ -418,6 +420,13 @@ export interface UpdateRemoteHostInput extends RemoteHostScope {
   /** Null explicitly clears the node identity; undefined keeps it unchanged. */
   readonly nodeKey?: RemoteHostNodeKey | null;
   readonly updatedAt?: UnixMillis;
+}
+
+export interface SetRemoteHostAutoConnectInput extends RemoteHostScope {
+  readonly id: string;
+  readonly expectedRevision: bigint;
+  readonly expectedAutoConnectRevision: bigint;
+  readonly enabled: boolean;
 }
 
 export type UpdateRemoteHostStatusInput = RemoteHostScope & {

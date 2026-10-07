@@ -377,6 +377,8 @@ export interface RemoteHostView {
     readonly changedAt: number;
     readonly failure?: { readonly code: string; readonly retryable: boolean };
   };
+  readonly autoConnect: boolean;
+  readonly autoConnectRevision: bigint;
   readonly revision: bigint;
 }
 
@@ -6211,6 +6213,7 @@ export interface OperationApi extends VoiceDictionaryPeerApi {
   createRemoteHost(targetId: string, draft: RemoteHostDraft): Promise<RemoteHostView>;
   updateRemoteHost(targetId: string, hostId: string, expectedRevision: bigint, draft: RemoteHostDraft): Promise<RemoteHostView>;
   deleteRemoteHost(targetId: string, hostId: string, expectedRevision: bigint): Promise<void>;
+  setRemoteHostAutoConnect(targetId: string, hostId: string, expectedHostRevision: bigint, expectedAutoConnectRevision: bigint, enabled: boolean): Promise<RemoteHostView>;
   connectRemoteHost(targetId: string, hostId: string, expectedRevision: bigint): Promise<RemoteHostView>;
   disconnectRemoteHost(targetId: string, hostId: string, expectedRevision: bigint): Promise<RemoteHostView>;
   testRemoteHostConnection(targetId: string, hostId: string, expectedRevision: bigint): Promise<RemoteHostView>;

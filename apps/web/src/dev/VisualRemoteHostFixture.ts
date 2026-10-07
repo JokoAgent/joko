@@ -19,7 +19,7 @@ export class VisualRemoteHostFixture {
     this.#onTarget = onTarget;
     for (const target of targets) this.#hosts.set(target.id, new Map([["visual-workstation", {
       targetId: target.id, id: "visual-workstation", hostname: "workstation.example.test", port: 22, user: "joko",
-      source: "manual", authentication: "systemAgent", revision: 1n,
+      source: "manual", authentication: "systemAgent", autoConnect: false, autoConnectRevision: 1n, revision: 1n,
       trust: { algorithm: "ssh-ed25519", sha256Fingerprint: "SHA256:visual-fixture-only", pinnedAt: 1 },
       status: { state: "ready", changedAt: 1 }
     }]]));
@@ -59,11 +59,17 @@ export class VisualRemoteHostFixture {
   refreshRemoteHostCatalog = async (targetId: string): Promise<readonly RemoteHostView[]> => { this.publish(targetId); return this.listRemoteHosts(targetId); };
   createRemoteHost = async (targetId: string, draft: RemoteHostDraft): Promise<RemoteHostView> => {
     if (this.catalog(targetId).has(draft.id)) throw new Error("The host alias already exists.");
-    const host: RemoteHostView = { ...draft, targetId, source: "manual", revision: 1n, status: { state: "disconnected", changedAt: 1 } };
+    const host: RemoteHostView = { ...draft, targetId, source: "manual", autoConnect: false, autoConnectRevision: 1n, revision: 1n, status: { state: "disconnected", changedAt: 1 } };
     this.catalog(targetId).set(host.id, host); this.publish(targetId); return host;
   };
   updateRemoteHost = async (targetId: string, hostId: string, revision: bigint, draft: RemoteHostDraft): Promise<RemoteHostView> => this.change(targetId, hostId, revision, host => ({ ...host, ...draft, id: hostId }));
   deleteRemoteHost = async (targetId: string, hostId: string, revision: bigint): Promise<void> => { this.requireHost(targetId, hostId, revision); this.catalog(targetId).delete(hostId); this.publish(targetId); };
+  setRemoteHostAutoConnect: AppController["setRemoteHostAutoConnect"] = async (targetId, hostId, expectedHostRevision, expectedAutoConnectRevision, enabled) => {
+    const host = this.requireHost(targetId, hostId, expectedHostRevision);
+    if (host.autoConnectRevision !== expectedAutoConnectRevision) throw new Error("The startup preference changed. Refresh its current value.");
+    const next = { ...host, autoConnect: enabled, autoConnectRevision: expectedAutoConnectRevision + 1n };
+    this.catalog(targetId).set(hostId, next); this.publish(targetId); return next;
+  };
   connectRemoteHost = async (targetId: string, hostId: string, revision: bigint): Promise<RemoteHostView> => this.change(targetId, hostId, revision, host => ({ ...host, trust: { algorithm: "ssh-ed25519", sha256Fingerprint: "SHA256:visual-fixture-only", pinnedAt: 1 }, status: { state: "ready", changedAt: 1 } }));
   disconnectRemoteHost = async (targetId: string, hostId: string, revision: bigint): Promise<RemoteHostView> => this.change(targetId, hostId, revision, host => ({ ...host, status: { state: "disconnected", changedAt: 1 } }));
   testRemoteHostConnection = async (targetId: string, hostId: string, revision: bigint): Promise<RemoteHostView> => this.requireHost(targetId, hostId, revision);

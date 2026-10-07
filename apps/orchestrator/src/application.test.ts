@@ -1,11 +1,17 @@
+import { execFile } from "node:child_process";
 import { mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { mkdtemp } from "./test-paths.js";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { promisify } from "node:util";
 
 import { CodexBackendAdapter } from "@joko/adapter-codex";
 import { PiBackendAdapter } from "@joko/adapter-pi";
+import { createClient } from "@connectrpc/connect";
+import { createConnectTransport } from "@connectrpc/connect-node";
+import { RemoteHostAuthenticationMode, RemoteHostService, RemoteHostStatus, SshKeyService } from "@joko/contracts";
+import { SshKeyManager, type ResolvedAgentAuthConnectorRequest } from "@joko/remote-ssh";
 import { VoiceDictionaryPeerStore } from "@joko/store";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -29,6 +35,139 @@ afterEach(async () => {
 });
 
 describe("Orchestrator application composition", () => {
+  it("restores only opted-in Hosts through the persisted service and authenticated Connect watch after restart", async () => {
+    const root = await mkdtemp(join(tmpdir(), "joko-application-host-autoconnect-"));
+    const dataDirectory = join(root, "data");
+    const workspace = join(root, "workspace");
+    if (process.platform === "win32") {
+      await promisify(execFile)("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", "$sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User; $acl = New-Object System.Security.AccessControl.DirectorySecurity; $acl.SetOwner($sid); $acl.SetAccessRuleProtection($true, $false); $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($sid, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow'))); [System.IO.Directory]::SetAccessControl($env:JOKO_HOST_STARTUP_FIXTURE, $acl)"], {
+        windowsHide: true, env: { ...process.env, JOKO_HOST_STARTUP_FIXTURE: root }
+      });
+    }
+    await mkdir(workspace, { recursive: true });
+    const config: OrchestratorConfig = {
+      host: "127.0.0.1", port: 0, internalPort: 4327,
+      publicOrigin: "http://127.0.0.1", internalOrigin: "http://127.0.0.1:4327",
+      dataDirectory, databasePath: join(dataDirectory, "orchestrator.db"),
+      allowInsecureLoopback: true, allowInsecureLan: false, lanDiscoveryEnabled: false,
+      voiceDictionaryLanDiscoveryEnabled: false,
+      codexExecutable: join(root, "missing-codex"), piAgentHome: join(dataDirectory, "pi"),
+      workspace: { id: "workspace-autoconnect", root: workspace, displayName: "Auto connect", trusted: true },
+      artifactDirectory: join(dataDirectory, "artifacts"), webDirectory: join(root, "no-web-build"), corsOrigins: []
+    };
+    const capabilities = {
+      commandExecution: false, processStreaming: false, fileTransfer: false,
+      interactiveTerminal: false, tcpForwarding: false
+    };
+    let releaseConnection = (): void => undefined;
+    const connectionGate = new Promise<void>((resolve) => { releaseConnection = resolve; });
+    const closeConnection = vi.fn(async () => undefined);
+    let expectedPublicKey = "";
+    const connect = vi.fn(async (request: ResolvedAgentAuthConnectorRequest) => {
+      expect(request.authentication.kind).toBe("agent_key");
+      if (request.authentication.kind !== "agent_key") throw new Error("Startup must use the selected agent identity.");
+      expect(Buffer.from(request.authentication.publicKey).toString()).toBe(expectedPublicKey);
+      await request.verifyHostKey({ algorithm: "ssh-ed25519", key: Uint8Array.of(1, 2, 3) });
+      request.onAuthenticating();
+      await connectionGate;
+      return { capabilities, close: closeConnection };
+    });
+    const agentCommand = vi.fn(async (): Promise<never> => { throw new Error("Startup must not load or change the SSH agent."); });
+    const dependencies = () => ({
+      sshKeys: new SshKeyManager({ directory: join(root, "ssh"), agentCommand }),
+      remoteSshConnector: { capabilities, connect },
+      remoteSshConfig: {
+        importHosts: async () => [],
+        read: async (): Promise<never> => { throw new Error("The startup journey must not read SSH config."); },
+        upsert: async (): Promise<never> => { throw new Error("The startup journey must not edit SSH config."); },
+        remove: async (): Promise<never> => { throw new Error("The startup journey must not edit SSH config."); }
+      }
+    });
+    let application = await createOrchestratorApplication(config, dependencies());
+    let server = await createPublicServer(application);
+    server.log.level = "silent";
+    let baseUrl = await server.listen({ host: "127.0.0.1", port: 0 });
+    const challenge = application.connections.issuePairing("Host startup observer");
+    const paired = application.connections.completePairing({
+      challengeId: challenge.id, code: challenge.code, connectionName: "Host startup observer"
+    });
+    const transport = () => createConnectTransport({
+      baseUrl, httpVersion: "1.1", defaultTimeoutMs: 10_000,
+      interceptors: [next => request => {
+        request.header.set("authorization", `Bearer ${paired.authKey}`);
+        return next(request);
+      }]
+    });
+    const client = () => createClient(RemoteHostService, transport());
+    const watchAbort = new AbortController();
+    try {
+      const targetId = config.workspace.id;
+      const keyClient = createClient(SshKeyService, transport());
+      const key = (await keyClient.generateSshKey({ name: "startup_identity", comment: "Isolated startup test" }, { timeoutMs: 60_000 })).key!;
+      expectedPublicKey = (await keyClient.readSshPublicKey({ keyId: key.id, expectedFingerprint: key.sha256Fingerprint }, { timeoutMs: 30_000 })).publicKey;
+      const host = (await client().createRemoteHost({
+        requestId: "host-startup-opt-in", targetId, hostId: "automatic-host",
+        hostname: "automatic.example.test", user: "fixture", port: 22,
+        authenticationMode: RemoteHostAuthenticationMode.NODE_KEY,
+        nodeKey: { id: key.id, expectedFingerprint: key.sha256Fingerprint }
+      })).host!;
+      await client().createRemoteHost({
+        requestId: "host-startup-manual", targetId, hostId: "manual-host",
+        hostname: "manual.example.test", user: "fixture", port: 22,
+        authenticationMode: RemoteHostAuthenticationMode.SYSTEM_AGENT
+      });
+      const optedIn = (await client().setRemoteHostAutoConnect({
+        targetId, hostId: host.hostId, expectedHostRevision: host.revision,
+        expectedAutoConnectRevision: host.autoConnectRevision, enabled: true
+      })).host!;
+      expect(optedIn).toMatchObject({ autoConnect: true, autoConnectRevision: { value: 2n }, revision: host.revision });
+      expect(connect).not.toHaveBeenCalled();
+      await server.close();
+      await application.close();
+
+      // Reopen the actual Store and production composition, not a copied catalog.
+      application = await createOrchestratorApplication(config, dependencies());
+      await vi.waitFor(() => expect(connect).toHaveBeenCalledOnce(), { timeout: 30_000, interval: 100 });
+      expect(connect.mock.calls[0]![0].hostname).toBe("automatic.example.test");
+      server = await createPublicServer(application);
+      server.log.level = "silent";
+      baseUrl = await server.listen({ host: "127.0.0.1", port: 0 });
+      const stream = client().watchRemoteHosts({ targetId }, { signal: watchAbort.signal });
+      const iterator = stream[Symbol.asyncIterator]();
+      const initial = await iterator.next();
+      expect(initial.value?.update.case).toBe("snapshot");
+      if (initial.value?.update.case !== "snapshot") throw new Error("The Host watch returned no initial snapshot.");
+      expect(initial.value.update.value.hosts).toContainEqual(expect.objectContaining({
+        hostId: "automatic-host", autoConnect: true, autoConnectRevision: expect.objectContaining({ value: 2n }),
+        status: expect.objectContaining({ state: RemoteHostStatus.AUTHENTICATING })
+      }));
+      expect(initial.value.update.value.hosts).toContainEqual(expect.objectContaining({
+        hostId: "manual-host", autoConnect: false,
+        status: expect.objectContaining({ state: RemoteHostStatus.DISCONNECTED })
+      }));
+      const next = iterator.next();
+      releaseConnection();
+      const ready = await next;
+      expect(ready.value).toMatchObject({
+        sequence: 2n, update: { case: "change", value: { host: {
+          hostId: "automatic-host", autoConnect: true, status: { state: RemoteHostStatus.READY }
+        } } }
+      });
+      await application.remoteHosts!.startAutoConnect();
+      expect(connect).toHaveBeenCalledOnce();
+      expect((await client().getRemoteHost({ targetId, hostId: "automatic-host" })).host)
+        .toMatchObject({ autoConnect: true, autoConnectRevision: { value: 2n }, status: { state: RemoteHostStatus.READY } });
+    } finally {
+      releaseConnection();
+      watchAbort.abort();
+      await server.close();
+      await application.close();
+      await rm(root, { recursive: true, force: true, maxRetries: 3 });
+    }
+    expect(closeConnection).toHaveBeenCalledOnce();
+    expect(agentCommand).not.toHaveBeenCalled();
+  }, 90_000);
+
   it("uses a managed Provider catalog only for its declaring Backend and isolates native Provider state", () => {
     const provider = (
       providerId: string,

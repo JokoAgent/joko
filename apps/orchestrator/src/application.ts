@@ -2512,6 +2512,10 @@ export async function createOrchestratorApplication(
     throw error;
   }
 
+  // Host preferences authorize one startup attempt; SSH failures remain in
+  // their own durable projection and must not delay the service becoming usable.
+  void remoteHosts.startAutoConnect().catch(() => undefined);
+
   return {
     config,
     store,

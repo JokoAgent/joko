@@ -274,7 +274,7 @@ it("fences copied public keys and installation commands by the selected key, liv
 });
 
 function key(id = "key-one"): SshKeyView { return { id, name: id, algorithm: "ssh-ed25519", comment: "Work key", sha256Fingerprint: `SHA256:${id}`, modifiedAt: 1000, inAgent: false }; }
-function host(): RemoteHostView { return { id: "build-box", targetId: "project", hostname: "build.internal", port: 22, user: "joko", source: "manual", authentication: "systemAgent", status: { state: "disconnected", changedAt: 1 }, revision: 1n }; }
+function host(): RemoteHostView { return { id: "build-box", targetId: "project", hostname: "build.internal", port: 22, user: "joko", source: "manual", authentication: "systemAgent", status: { state: "disconnected", changedAt: 1 }, autoConnect: false, autoConnectRevision: 1n, revision: 1n }; }
 function deferred<T>() { let resolve!: (value: T) => void; const promise = new Promise<T>((yes) => { resolve = yes; }); return { resolve, promise }; }
 async function mount(initial: SshKeyCatalogView = { keys: [key()], agentState: "ready", generationSupported: true, servicePlatform: "windows" }, strict = false) {
   const root = createRoot(document.body.appendChild(document.createElement("div"))); roots.push(root);

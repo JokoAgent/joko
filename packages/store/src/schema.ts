@@ -982,6 +982,8 @@ CREATE TABLE remote_hosts (
           AND instr(username, char(13)) = 0
         ),
         source TEXT NOT NULL CHECK (source IN ('manual', 'ssh_config')),
+        auto_connect INTEGER NOT NULL CHECK (auto_connect IN (0, 1)),
+        auto_connect_revision INTEGER NOT NULL CHECK (auto_connect_revision >= 1),
         credential_reference_id TEXT CHECK (
           credential_reference_id IS NULL OR (
             length(credential_reference_id) BETWEEN 1 AND 512

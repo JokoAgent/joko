@@ -8200,6 +8200,24 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     );
   }
 
+  async setRemoteHostAutoConnect(
+    targetId: string,
+    hostId: string,
+    expectedHostRevision: bigint,
+    expectedAutoConnectRevision: bigint,
+    enabled: boolean
+  ): Promise<RemoteHostView> {
+    const client = createClient(RemoteHostService, this.requireTransport());
+    const response = await client.setRemoteHostAutoConnect({
+      targetId,
+      hostId,
+      expectedHostRevision: { value: expectedHostRevision },
+      expectedAutoConnectRevision: { value: expectedAutoConnectRevision },
+      enabled
+    }, remoteHostRpcOptions(this.#abort?.signal));
+    return requireRemoteHost(response.host);
+  }
+
   async connectRemoteHost(targetId: string, hostId: string, expectedRevision: bigint): Promise<RemoteHostView> {
     const client = createClient(RemoteHostService, this.requireTransport());
     const response = await client.connectRemoteHost(
@@ -17385,10 +17403,12 @@ function requireRemoteHost(host: ProtoRemoteHost | undefined): RemoteHostView {
 
 function mapRemoteHost(host: ProtoRemoteHost): RemoteHostView {
   const revision = host.revision?.value ?? 0n;
+  const autoConnectRevision = host.autoConnectRevision?.value ?? 0n;
   const status = host.status;
   if (
     host.targetId.trim() === "" || host.hostId.trim() === "" || host.hostname.trim() === "" ||
     host.user.trim() === "" || host.port < 1 || host.port > 65_535 || revision <= 0n ||
+    host.autoConnect === undefined || autoConnectRevision <= 0n ||
     status === undefined || status.changedAt === undefined
   ) throw new GatewayError("Orchestrator returned an incomplete Remote Host.");
   const state = remoteHostStatus(status.state);
@@ -17444,6 +17464,8 @@ function mapRemoteHost(host: ProtoRemoteHost): RemoteHostView {
         failure: { code: remoteHostFailureCode(failure.code), retryable: failure.retryable }
       })
     },
+    autoConnect: host.autoConnect,
+    autoConnectRevision,
     revision
   };
 }

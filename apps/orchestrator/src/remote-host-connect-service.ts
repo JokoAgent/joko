@@ -341,6 +341,24 @@ export function createRemoteHostConnectService(
       return create(contract.UpdateRemoteHostResponseSchema, { host: toProtoRemoteHost(host) });
     }),
 
+    setRemoteHostAutoConnect: async (request, context) => remoteHostRpc(async () => {
+      authenticate(context);
+      if (typeof request.enabled !== "boolean") {
+        throw new ConnectError("Remote Host enabled is required.", Code.InvalidArgument);
+      }
+      const host = requireRegistry(registry).setAutoConnect({
+        targetId: publicIdentity(request.targetId, "target_id"),
+        id: publicHostAlias(request.hostId),
+        expectedRevision: fromProtoRevision(request.expectedHostRevision, "expected_host_revision"),
+        expectedAutoConnectRevision: fromProtoRevision(
+          request.expectedAutoConnectRevision,
+          "expected_auto_connect_revision"
+        ),
+        enabled: request.enabled
+      });
+      return create(contract.SetRemoteHostAutoConnectResponseSchema, { host: toProtoRemoteHost(host) });
+    }),
+
     deleteRemoteHost: async (request, context) => remoteHostRpc(async () => {
       authenticate(context);
       const host = requireRegistry(registry).delete({
@@ -508,7 +526,9 @@ function toProtoRemoteHost(value: RemoteHostRecord): contract.RemoteHost {
     }),
     createdAt: toProtoTimestamp(value.createdAt),
     updatedAt: toProtoTimestamp(value.updatedAt),
-    revision: toProtoRevision(value.revision)
+    revision: toProtoRevision(value.revision),
+    autoConnect: value.autoConnect,
+    autoConnectRevision: toProtoRevision(value.autoConnectRevision)
   });
 }
 
