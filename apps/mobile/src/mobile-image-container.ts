@@ -19,7 +19,8 @@ export function inspectMobileBmpBytes(bytes: Uint8Array): MobileImageContainer |
     const width = u16(bytes, 18, true); const height = u16(bytes, 20, true);
     return width && height && u16(bytes, 22, true) === 1 ? { width, height } : undefined;
   }
-  if (dibSize < 40) return undefined;
+  // Abbreviated OS/2 headers retain the complete canvas; absent trailing codec fields use native defaults.
+  if (dibSize < 40 && ![16, 20, 24, 28, 32, 36].includes(dibSize)) return undefined;
   const width = i32(bytes, 18, true); const signedHeight = i32(bytes, 22, true);
   const bits = u16(bytes, 28, true);
   if (width === undefined || width < 1 || !signedHeight || u16(bytes, 26, true) !== 1

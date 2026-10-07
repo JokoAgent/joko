@@ -1,5 +1,6 @@
 import { create } from "@bufbuild/protobuf";
 import { EventSchema, MessageRole } from "@joko/contracts";
+import { createRequire } from "node:module";
 import { describe, expect, it } from "vitest";
 import sharp from "sharp";
 import { animatedPngBytes, gifBytes, svgBytes, bmpBytes, tiffBytes, isoImageBytes, iconBytes, iconDibBytes } from "./test/image-formats";
@@ -153,6 +154,64 @@ describe("mobile image gallery", () => {
     expect(() => inspectMobileImageGalleryBytes(png(1, 1), "image/apng")).toThrow(/signature/u);
     expect(() => inspectMobileImageGalleryBytes(isoImageBytes(["heic"], 3, 2), "image/avif")).toThrow(/signature/u);
     expect(() => inspectMobileImageGalleryBytes(isoImageBytes(["avif"], 20_000, 2), "image/avif")).toThrow(/safe decode/u);
+  });
+
+  it("preserves the native-decodable abbreviated BMP family and requires its exact canvas", async () => {
+    const require = createRequire(import.meta.url);
+    const canvasPrimitives = createRequire(require.resolve("pdfjs-dist/package.json"))("@napi-rs/canvas") as {
+      readonly loadImage: (bytes: Uint8Array) => Promise<{ readonly width: number; readonly height: number }>;
+      readonly createCanvas: (width: number, height: number) => {
+        readonly getContext: (kind: "2d") => {
+          readonly drawImage: (image: { readonly width: number; readonly height: number }, x: number, y: number) => void;
+          readonly getImageData: (x: number, y: number, width: number, height: number) => { readonly data: Uint8ClampedArray };
+        };
+      };
+    };
+    const encode = (headerSize: number): Buffer => {
+      const pixelOffset = 14 + headerSize;
+      const bytes = Buffer.alloc(pixelOffset + 36);
+      bytes.write("BM"); bytes.writeUInt32LE(bytes.length, 2); bytes.writeUInt32LE(pixelOffset, 10);
+      bytes.writeUInt32LE(headerSize, 14); bytes.writeInt32LE(4, 18); bytes.writeInt32LE(3, 22);
+      bytes.writeUInt16LE(1, 26); bytes.writeUInt16LE(24, 28);
+      for (let offset = pixelOffset; offset < bytes.length; offset += 3) bytes.set([0, 152, 255], offset);
+      return bytes;
+    };
+    for (const headerSize of [16, 20, 24, 28, 32, 36]) {
+      const bytes = encode(headerSize); const original = Uint8Array.from(bytes);
+      const raster = await canvasPrimitives.loadImage(bytes);
+      expect({ width: raster.width, height: raster.height }).toEqual({ width: 4, height: 3 });
+      const context = canvasPrimitives.createCanvas(raster.width, raster.height).getContext("2d");
+      context.drawImage(raster, 0, 0);
+      const pixels = context.getImageData(0, 0, raster.width, raster.height).data;
+      expect([...pixels]).toEqual(Array.from({ length: 12 }, () => [255, 152, 0, 255]).flat());
+      const inspected = inspectMobileImageGalleryBytes(bytes, "image/bmp");
+      expect(inspected).toEqual({ mediaType: "image/bmp", width: 4, height: 3 });
+      expect(confirmMobileImageGalleryCanvas(inspected, raster)).toEqual(inspected);
+      expect(() => confirmMobileImageGalleryCanvas(inspected, { width: 3, height: 4 })).toThrow(/canvas/u);
+      expect(bytes).toEqual(Buffer.from(original));
+      expect(() => inspectMobileImageGalleryBytes(bytes.subarray(0, 29), "image/bmp")).toThrow(/signature/u);
+    }
+    for (const headerSize of [17, 18, 22, 30, 38]) {
+      expect(() => inspectMobileImageGalleryBytes(encode(headerSize), "image/bmp")).toThrow(/signature/u);
+    }
+    const source = encode(16);
+    for (const mutate of [
+      (bytes: Buffer) => bytes.writeUInt32LE(bytes.length - 1, 2),
+      (bytes: Buffer) => bytes.writeUInt32LE(29, 10),
+      (bytes: Buffer) => bytes.writeUInt32LE(bytes.length, 10),
+      (bytes: Buffer) => bytes.writeInt32LE(0, 18),
+      (bytes: Buffer) => bytes.writeInt32LE(-1, 18),
+      (bytes: Buffer) => bytes.writeInt32LE(0, 22),
+      (bytes: Buffer) => bytes.writeUInt16LE(0, 26),
+      (bytes: Buffer) => bytes.writeUInt16LE(2, 26),
+      (bytes: Buffer) => bytes.writeUInt16LE(0, 28),
+      (bytes: Buffer) => bytes.writeUInt16LE(2, 28)
+    ]) {
+      const invalid = Buffer.from(source); mutate(invalid);
+      expect(() => inspectMobileImageGalleryBytes(invalid, "image/bmp")).toThrow(/signature/u);
+    }
+    const oversized = Buffer.from(source); oversized.writeInt32LE(20_000, 18);
+    expect(() => inspectMobileImageGalleryBytes(oversized, "image/bmp")).toThrow(/safe decode/u);
   });
 
   it("binds ISO dimensions to the primary item's exact property associations, crop and rotation", () => {
