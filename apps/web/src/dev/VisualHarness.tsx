@@ -72,6 +72,7 @@ import { resolveLocalePreference } from "../system-locale.js";
 import { applyAppearanceTypography, clampCodeSize, clampUiSize, normalizeFontFamily } from "../appearance-settings.js";
 import { VISUAL_EXTENSION_MAIN_VIEW_ENDPOINT } from "./visual-extension-surface-contract.js";
 import { VisualInteractionFixture, VISUAL_INTERACTION_SETTLE_EVENT } from "./VisualInteractionFixture.js";
+import { VisualHistoryMaintenanceFixture, VISUAL_HISTORY_MAINTENANCE_SETTLE_EVENT } from "./VisualHistoryMaintenanceFixture.js";
 
 const FIXED_NOW = Date.UTC(2026, 7, 22, 4, 0, 0);
 const VISUAL_WORKSPACE_ID = "visual-workspace";
@@ -124,6 +125,7 @@ export function VisualHarness(): JSX.Element {
   const extensionPackageExports = useRef(new Map<string, ExtensionPackageExportJobView>());
   const [state, setState] = useState<ControllerState>(() => initialControllerState(scenario, files));
   const interactionFixture = useMemo(() => new VisualInteractionFixture(visualInteractionJourney()), []);
+  const historyMaintenance = useMemo(() => new VisualHistoryMaintenanceFixture(), []);
   const remoteHosts = useMemo(() => new VisualRemoteHostFixture(state.snapshot.targets, target => {
     setState(current => ({ ...current, snapshot: { ...current.snapshot, targets: current.snapshot.targets.map(value => value.id === target.id ? target : value) } }));
   }), []);
@@ -145,6 +147,23 @@ export function VisualHarness(): JSX.Element {
       delete document.documentElement.dataset.harnessInteractionState;
     };
   }, [interactionFixture, scenario.scenario]);
+
+  useEffect(() => {
+    if (scenario.scenario !== "maintenance") return;
+    const unsubscribe = historyMaintenance.subscribe((value) => {
+      document.documentElement.dataset.harnessHistoryMaintenanceState = JSON.stringify(value);
+    });
+    const settle = (event: Event): void => {
+      if (event instanceof CustomEvent) historyMaintenance.settle(event.detail);
+    };
+    window.addEventListener(VISUAL_HISTORY_MAINTENANCE_SETTLE_EVENT, settle);
+    return () => {
+      window.removeEventListener(VISUAL_HISTORY_MAINTENANCE_SETTLE_EVENT, settle);
+      unsubscribe();
+      historyMaintenance.cancelPending();
+      delete document.documentElement.dataset.harnessHistoryMaintenanceState;
+    };
+  }, [historyMaintenance, scenario.scenario]);
 
   useEffect(() => {
     if (scenario.scenario !== "automation" || automationSettingsEnteredRef.current) return;
@@ -264,6 +283,13 @@ export function VisualHarness(): JSX.Element {
       state,
       ...mcpActions,
       ...draftActions,
+      ...(scenario.scenario === "maintenance" ? {
+        getTaskHistoryMaintenanceSupport: historyMaintenance.getTaskHistoryMaintenanceSupport,
+        scanTaskHistory: historyMaintenance.scanTaskHistory,
+        beginTaskHistoryCleanup: historyMaintenance.beginTaskHistoryCleanup,
+        getTaskHistoryCleanup: historyMaintenance.getTaskHistoryCleanup,
+        cancelTaskHistoryCleanup: historyMaintenance.cancelTaskHistoryCleanup
+      } : {}),
       getRemoteHostCapabilities: remoteHosts.getRemoteHostCapabilities,
       listSshKeys: remoteHosts.listSshKeys,
       generateSshKey: remoteHosts.generateSshKey,
@@ -1850,7 +1876,7 @@ export function VisualHarness(): JSX.Element {
         return async (): Promise<undefined> => undefined;
       }
     }) as unknown as AppController;
-  }, [artifactActions, draftActions, interactionFixture, mcpActions, remoteHosts, state, usageHistory]);
+  }, [artifactActions, draftActions, historyMaintenance, interactionFixture, mcpActions, remoteHosts, state, usageHistory]);
 
   if (scenario.scenario === "usage") return <main style={{ maxWidth: 1040, margin: "0 auto" }}>
     <UsageHistorySection controller={controller} t={(key, values) => translate(state.effectiveLocale, key, values)} />
@@ -2846,7 +2872,7 @@ function abortError(): Error {
 }
 
 interface HarnessParameters {
-  readonly scenario: "session" | "interaction" | "question" | "long-question" | "files" | "audio" | "review" | "personalization" | "providers" | "voice" | "automation" | "scheduler" | "connection" | "connections" | "browser" | "extensions" | "background" | "subagents" | "usage";
+  readonly scenario: "session" | "interaction" | "maintenance" | "question" | "long-question" | "files" | "audio" | "review" | "personalization" | "providers" | "voice" | "automation" | "scheduler" | "connection" | "connections" | "browser" | "extensions" | "background" | "subagents" | "usage";
   readonly usageState: "ready" | "empty" | "error";
   readonly theme: Theme;
   readonly richCopy: boolean;
@@ -2873,6 +2899,7 @@ function harnessParameters(): HarnessParameters {
   const updateValue = query.get("computerUpdate");
   return {
     scenario: scenarioValue === "interaction"
+      || scenarioValue === "maintenance"
       || scenarioValue === "question"
       || scenarioValue === "long-question"
       || scenarioValue === "files"
@@ -2977,7 +3004,7 @@ function initialControllerState(parameters: HarnessParameters, files: VisualWork
     snapshot: visualSnapshot(parameters, files),
     route: parameters.scenario === "files"
       ? { kind: "files", sessionId: "session-1", file: "src/App.tsx" }
-      : parameters.scenario === "personalization" || parameters.scenario === "providers" || parameters.scenario === "voice" || parameters.scenario === "connections"
+      : parameters.scenario === "personalization" || parameters.scenario === "providers" || parameters.scenario === "voice" || parameters.scenario === "connections" || parameters.scenario === "maintenance"
         ? { kind: "settings" }
         : parameters.scenario === "automation"
           ? { kind: "session", sessionId: "session-1" }
