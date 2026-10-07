@@ -1,5 +1,5 @@
 import { create } from "@bufbuild/protobuf";
-import { EventCursorSchema, EventIdentitySchema, EventSchema, MessageRole, ToolCallOutputMode, ToolCallState, ToolFileAction, ToolResultSchema } from "@joko/contracts";
+import { EventCursorSchema, EventIdentitySchema, EventSchema, MessageRole, QueueItemState, RunState, ToolCallOutputMode, ToolCallState, ToolFileAction, ToolResultSchema } from "@joko/contracts";
 import { describe, expect, it } from "vitest";
 import { timelineRows } from "./timeline";
 import { producedArtifactEvent, producedImageEvent, toolMediaEvent } from "./test/timeline-media";
@@ -27,7 +27,20 @@ describe("mobile Timeline metadata events", () => {
         cursor: { generation: 1n, sequence: 10n },
         payload: { kind: { case: "runtimeCommandsChanged", value: { commands: [{
           commandId: "command-one", name: "Inspect", sessionId: "session-one", loaded: true
-        }] } } } })
+        }] } } } }),
+      create(EventSchema, { eventId: "run-projection", identity: { sessionId: "session-one", runId: "run-one" },
+        cursor: { generation: 1n, sequence: 11n },
+        payload: { kind: { case: "runChanged", value: { run: {
+          runId: "run-one", sessionId: "session-one", state: RunState.RUNNING,
+          version: { revision: { value: 2n } }
+        } } } } }),
+      create(EventSchema, { eventId: "queue-projection", identity: { sessionId: "session-one", runId: "run-one" },
+        cursor: { generation: 1n, sequence: 13n },
+        payload: { kind: { case: "queueItemChanged", value: { queueItem: {
+          queueItemId: "queue-one", sessionId: "session-one", runId: "run-one", state: QueueItemState.COMPLETED,
+          ordinal: 1n, input: { parts: [{ content: { case: "text", value: "Hello" } }] },
+          version: { revision: { value: 3n } }
+        } } } } })
     ];
   }
 
@@ -35,7 +48,7 @@ describe("mobile Timeline metadata events", () => {
     const events = metadataEvents(); const original = structuredClone(events);
     expect(timelineRows(events)).toEqual([]);
     expect(events).toEqual(original);
-    expect(events.at(-1)?.cursor?.sequence).toBe(10n);
+    expect(events.at(-1)?.cursor?.sequence).toBe(13n);
   });
 
   it("merges visible history and live content across metadata updates without using visible rows as the window edge", () => {
@@ -66,7 +79,9 @@ describe("mobile Timeline metadata events", () => {
         payload: { kind: { case: "runDone", value: { runId: "run-one" } } } }),
       create(EventSchema, { ...completed([{ content: { case: "text", value: "Finished." } }]),
         identity: create(EventIdentitySchema, { sessionId: "session-one" }),
-        cursor: create(EventCursorSchema, { generation: 1n, sequence: 9n }) }), metadata[1]!
+        cursor: create(EventCursorSchema, { generation: 1n, sequence: 9n }) }), metadata[1]!, metadata[2]!,
+      create(EventSchema, { eventId: "terminal-error", cursor: { generation: 1n, sequence: 12n },
+        payload: { kind: { case: "terminalError", value: { error: { message: "The task stopped." } } } } }), metadata[3]!
     ];
     expect(timelineRows([...history, live[0]!])[1]).toMatchObject({ text: "Working", sequence: 3n, completed: false });
     const events = [...history, ...live]; const original = structuredClone(events);
@@ -76,11 +91,12 @@ describe("mobile Timeline metadata events", () => {
       { kind: "tool", eventId: "tool-completed", sequence: 5n, completed: true },
       { kind: "error", eventId: "recoverable-error", text: "Try again", sequence: 6n },
       { kind: "status", eventId: "task-status", text: "Running · Checking", sequence: 7n },
-      { kind: "activity", eventId: "run-finished", text: "Run finished", sequence: 8n }
+      { kind: "activity", eventId: "run-finished", text: "Run finished", sequence: 8n },
+      { kind: "error", eventId: "terminal-error", text: "The task stopped.", sequence: 12n }
     ]);
     expect(events).toEqual(original);
-    expect(events.at(-1)?.cursor?.sequence).toBe(10n);
-    expect(timelineRows(events).at(-1)?.sequence).toBe(8n);
+    expect(events.at(-1)?.cursor?.sequence).toBe(13n);
+    expect(timelineRows(events).at(-1)?.sequence).toBe(12n);
   });
 });
 

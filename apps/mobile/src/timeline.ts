@@ -66,6 +66,8 @@ export function timelineRows(events: readonly Event[]): TimelineRow[] {
     switch (kind.case) {
       case "sessionChanged":
       case "runtimeCommandsChanged":
+      case "runChanged":
+      case "queueItemChanged":
         break;
       case "messageStarted": {
         const message = kind.value;
