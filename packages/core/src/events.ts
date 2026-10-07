@@ -165,6 +165,8 @@ export type EventPayload =
       readonly callId: string;
       /** Backend-neutral display identity retained across update-only projections. */
       readonly name: string;
+      /** Authoritative input replacement; omission preserves the current input. */
+      readonly input?: string;
       /** Whether output is a delta or an authoritative replacement. */
       readonly outputMode?: "append" | "replace";
       readonly output: string;

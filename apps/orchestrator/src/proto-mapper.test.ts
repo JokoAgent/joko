@@ -1547,6 +1547,21 @@ describe("proto mapper", () => {
     }
   });
 
+  it("round-trips authoritative tool input replacement separately from omission and empty input", () => {
+    for (const input of [undefined, "", '{"plan":[{"step":"Inspect","status":"pending"}]}']) {
+      const payload: EventPayload = { type: "tool_update", callId: "plan-turn", name: "update_plan", output: "", parts: [{ kind: "text", text: "" }],
+        ...(input === undefined ? {} : { input }) };
+      const event: PersistedEvent = { id: "input-event", sequence: 1n, globalCursor: 1n, revision: 1n,
+        emittedAt: 1000, backendId: "backend", targetId: "target", sessionId: "session", runId: "run",
+        generation: 1, traceId: "trace", payload };
+      const proto = fromBinary(EventSchema, toBinary(EventSchema, toProtoEvent(event)));
+      expect(proto.payload?.kind).toMatchObject({ case: "toolCallUpdated", value: {
+        toolCall: { arguments: input === undefined ? [] : [{ fieldPath: "$", value: { case: "text", value: input } }] }
+      } });
+      expect(fromProtoEvent(proto).payload).toEqual(payload);
+    }
+  });
+
   it("round-trips Session-scoped runtime command change events", () => {
     const payload: EventPayload = {
       type: "runtime_commands_changed",

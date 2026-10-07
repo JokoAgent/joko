@@ -3,7 +3,7 @@ import { resolve } from "node:path";
 
 import { createCodexAdapter, AppServerHost } from "@joko/adapter-codex";
 import { FakeCodexAppServer } from "@joko/adapter-codex/testing";
-import { OperationState, RunState } from "@joko/contracts";
+import { OperationState, RunState, ToolCallState } from "@joko/contracts";
 import { chromium, type Browser } from "playwright-core";
 import { expect, it } from "vitest";
 
@@ -92,6 +92,67 @@ it("keeps a Codex thread and durable Queue on the production HTTP/SQLite/Connect
       (value) => value.run?.state === RunState.SUCCEEDED, "independent Backend completion");
     expect(fixture.application.store.listEvents({ sessionId: piSessionId }).some((event) =>
       event.payload.type === "message_complete" && event.payload.role === "assistant")).toBe(true);
+  } finally {
+    await fixture?.close();
+    await host.shutdown();
+  }
+});
+
+it("persists current Codex step plans consistently through generated timeline, Snapshot and tool details", async () => {
+  const backendId = "codex-step-plan";
+  const native = new FakeCodexAppServer();
+  const host = new AppServerHost({ transportFactory: () => native.createTransport() });
+  let fixture: OrchestratorE2eFixture | undefined;
+  try {
+    fixture = await OrchestratorE2eFixture.start({ backendFactories: [{ instanceId: backendId, adapterKind: "codex",
+      displayName: "Step plan fixture", create: ({ generation }) => createCodexAdapter({ id: backendId, instanceGeneration: generation, host }) }] });
+    const paired = await fixture.pair("Step plan client");
+    const sessionId = sessionIdFrom(await submit(paired.clients.operation, paired.connectionId,
+      createSessionMutation({ backendId, targetId: fixture.targetId(backendId) })));
+    const binding = fixture.application.store.getSession(sessionId).descriptor.binding;
+    const threadId = binding.nativeSessionId!;
+    const accepted = await submit(paired.clients.operation, paired.connectionId,
+      sendInputMutation(sessionId, BigInt(binding.generation), "Inspect then implement"));
+    const runId = queueRunIdFrom(accepted);
+    await waitFor(async () => native.transport?.requests.some((request) => request.method === "turn/start") ?? false,
+      (value) => value, "step plan native dispatch");
+    const turnId = String(native.threads.get(threadId)?.turns.at(-1)?.["id"]);
+    const toolCallId = `plan:${turnId}`;
+    await native.transport!.emitNotification("turn/plan/updated", { threadId, turnId, explanation: "Initial plan",
+      plan: [{ step: "Inspect", status: "inProgress" }, { step: "Implement", status: "pending" }] });
+    await native.transport!.emitNotification("turn/plan/updated", { threadId, turnId, explanation: "token=hidden-plan-token",
+      plan: [{ step: "Inspect", status: "completed" }, { step: "Implement", status: "pending" }] });
+    const expectedInput = JSON.stringify({ explanation: "token=[REDACTED]",
+      plan: [{ step: "Inspect", status: "completed" }, { step: "Implement", status: "pending" }] });
+    const live = await paired.clients.tool.getToolCall({ toolCallId });
+    expect(live.toolCall).toMatchObject({ toolCallId, runId, state: ToolCallState.RUNNING,
+      arguments: [{ value: { case: "text", value: expectedInput } }] });
+    const scope = { kind: { case: "session" as const, value: { sessionId, recentTimelineItems: 200 } } };
+    const liveSnapshot = (await paired.clients.event.getSnapshot({ scope })).snapshot!;
+    const liveUpdate = liveSnapshot.timeline.find((event) => event.payload?.kind.case === "toolCallUpdated"
+      && event.payload.kind.value.toolCall?.toolCallId === toolCallId);
+    expect(liveUpdate?.payload?.kind).toMatchObject({ case: "toolCallUpdated", value: {
+      toolCall: { arguments: [{ value: { case: "text", value: expectedInput } }] }
+    } });
+    await native.completeTurn(threadId, "Inspected; implementation remains pending.");
+    await waitFor(() => paired.clients.run.getRun({ runId }), (value) => value.run?.state === RunState.SUCCEEDED,
+      "step plan native terminal");
+    const final = (await paired.clients.tool.getToolCall({ toolCallId })).toolCall!;
+    expect(final).toMatchObject({ state: ToolCallState.SUCCEEDED,
+      arguments: [{ value: { case: "text", value: expectedInput } }] });
+    const tools = await paired.clients.tool.listToolCalls({ sessionId, runId });
+    expect(tools.toolCalls.filter((call) => call.toolCallId === toolCallId)).toEqual([final]);
+    const timeline = await paired.clients.session.listSessionTimeline({ sessionId, limit: 200 });
+    const restoredUpdate = timeline.events.find((event) => event.payload?.kind.case === "toolCallUpdated"
+      && event.payload.kind.value.toolCall?.toolCallId === toolCallId);
+    expect(restoredUpdate?.payload?.kind).toMatchObject({ case: "toolCallUpdated", value: {
+      toolCall: { arguments: [{ value: { case: "text", value: expectedInput } }] }
+    } });
+    expect(timeline.events.filter((event) => event.payload?.kind.case === "toolCallStarted"
+      && event.payload.kind.value.toolCall?.toolCallId === toolCallId)).toHaveLength(1);
+    const durable = fixture.application.store.listEvents({ sessionId });
+    expect(durable.filter((event) => event.payload.type === "tool_result" && event.payload.callId === toolCallId)).toHaveLength(1);
+    expect(JSON.stringify(durable, (_key, value) => typeof value === "bigint" ? value.toString() : value)).not.toContain("hidden-plan-token");
   } finally {
     await fixture?.close();
     await host.shutdown();

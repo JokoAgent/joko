@@ -4057,6 +4057,49 @@ describe("CodexBackendAdapter", () => {
     expect(await stat(String(reviewCwd)).catch(() => undefined)).toBeUndefined();
   });
 
+  it("publishes running step plans only for the current thread and turn without creating plan review", async () => {
+    const setup = await createSetup();
+    await setup.adapter.describe();
+    const events: EventPayload[] = [];
+    const requestInteraction = vi.fn<AdapterContext["requestInteraction"]>(async () => ({ kind: "cancelled" }));
+    const binding = await setup.adapter.createSession(sessionInput(setup.target), context(setup.target, events, { backendInstanceGeneration: 7 }));
+    const active = context(setup.target, events, { binding, backendInstanceGeneration: 7,
+      operationId: "running-step-plan", requestInteraction });
+    await setup.adapter.send(prompt("Inspect and implement"), active);
+    const threadId = binding.nativeSessionId!;
+    const turnId = String(setup.fake.threads.get(threadId)?.turns.at(-1)?.["id"]);
+    const transport = setup.fake.transport!;
+    const initial = { threadId, turnId, explanation: "Start with evidence", plan: [
+      { step: "Inspect", status: "inProgress" }, { step: "Implement", status: "pending" }
+    ] };
+    await transport.emitNotification("turn/plan/updated", initial);
+    await transport.emitNotification("turn/plan/updated", { ...initial, threadId: "old-thread" });
+    await transport.emitNotification("turn/plan/updated", { ...initial, turnId: "old-turn" });
+    const latest = { threadId, turnId, plan: [{ step: "Inspect", status: "completed" }, { step: "Implement", status: "pending" }] };
+    await transport.emitNotification("turn/plan/updated", latest);
+    const toolEvents = events.filter((event) => event.type === "tool_start" || event.type === "tool_update");
+    expect(toolEvents).toEqual([
+      { type: "tool_start", callId: `plan:${turnId}`, name: "update_plan", input: JSON.stringify({
+        explanation: "Start with evidence", plan: [{ step: "Inspect", status: "in_progress" }, { step: "Implement", status: "pending" }]
+      }) },
+      { type: "tool_update", callId: `plan:${turnId}`, name: "update_plan", output: "", outputMode: "replace",
+        input: JSON.stringify({ plan: latest.plan }) }
+    ]);
+    await setup.fake.completeTurn(threadId);
+    expect(events).toContainEqual({ type: "tool_result", callId: `plan:${turnId}`, name: "update_plan", output: "", isError: false });
+    expect(events.at(-1)).toMatchObject({ type: "done", outcome: "completed" });
+    const terminalCount = events.length;
+    await transport.emitNotification("turn/plan/updated", initial);
+    expect(events).toHaveLength(terminalCount);
+    await setup.adapter.send(prompt("Next turn"), { ...active, operationId: "next-step-plan" });
+    const nextTurnId = String(setup.fake.threads.get(threadId)?.turns.at(-1)?.["id"]);
+    await transport.emitNotification("turn/plan/updated", initial);
+    await transport.emitNotification("turn/plan/updated", { ...initial, turnId: nextTurnId });
+    expect(events.filter((event) => event.type === "tool_start" && event.name === "update_plan")).toHaveLength(2);
+    expect(requestInteraction).not.toHaveBeenCalled();
+    await setup.fake.completeTurn(threadId);
+  });
+
   it("opens a completed native plan through the shared review Interaction and resets execution to default", async () => {
     const setup = await createSetup();
     const descriptor = await setup.adapter.describe();

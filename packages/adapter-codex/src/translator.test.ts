@@ -4,6 +4,68 @@ import type { JsonValue } from "./protocol.js";
 import { CodexEventTranslator, createTranslatorState, interactionFromServerRequest } from "./translator.js";
 
 describe("Codex interaction translation", () => {
+  it("keeps running plan snapshots on one exact native turn and seals only its actual successful terminal", () => {
+    const translator = new CodexEventTranslator();
+    const state = createTranslatorState("thread-one");
+    const snapshot: JsonValue = { threadId: "thread-one", turnId: "turn-one", explanation: "Inspect first",
+      plan: [{ step: "Inspect", status: "inProgress" }, { step: "Implement", status: "pending" }] };
+    expect(translator.translate("turn/plan/updated", snapshot, state)).toEqual([]);
+    translator.translate("turn/started", { threadId: "thread-one", turn: { id: "turn-one", status: "inProgress", items: [], error: null } }, state);
+    const initial = translator.translate("turn/plan/updated", snapshot, state);
+    expect(initial).toEqual([{ type: "tool_start", callId: "plan:turn-one", name: "update_plan",
+      input: JSON.stringify({ explanation: "Inspect first", plan: [
+        { step: "Inspect", status: "in_progress" }, { step: "Implement", status: "pending" }
+      ] }) }]);
+    expect(translator.translate("turn/plan/updated", snapshot, state)).toEqual([]);
+    const next: JsonValue = { threadId: "thread-one", turnId: "turn-one", plan: [
+      { step: "Inspect", status: "completed" }, { step: "Implement", status: "inProgress" },
+      { step: "Later", status: "pending" }
+    ] };
+    const update = translator.translate("turn/plan/updated", next, state);
+    expect(update).toEqual([{ type: "tool_update", callId: "plan:turn-one", name: "update_plan", output: "", outputMode: "replace",
+      input: JSON.stringify({ plan: [
+        { step: "Inspect", status: "completed" }, { step: "Implement", status: "in_progress" }, { step: "Later", status: "pending" }
+      ] }) }]);
+    for (const invalid of [
+      { ...next, threadId: "old-thread" }, { ...next, turnId: "old-turn" },
+      { ...next, plan: [{ step: "Wrong schema", status: "in_progress" }] },
+      { ...next, plan: [{ step: "Unknown", status: "unknown" }] },
+      { ...next, plan: [{ status: "pending" }] }, { ...next, explanation: 1 }
+    ]) expect(translator.translate("turn/plan/updated", invalid, state)).toEqual([]);
+    const terminal = { threadId: "thread-one", turn: { id: "turn-one", status: "completed", items: [], error: null } };
+    expect(translator.translate("turn/completed", { ...terminal, threadId: "old-thread" }, state)).toEqual([]);
+    expect(translator.translate("turn/completed", terminal, state)).toEqual([
+      { type: "tool_result", callId: "plan:turn-one", name: "update_plan", output: "", isError: false },
+      { type: "done", outcome: "completed" }
+    ]);
+    expect(translator.translate("turn/plan/updated", next, state)).toEqual([]);
+    expect(translator.translate("turn/completed", terminal, state)).toEqual([]);
+    expect(state.activePlan).toBeUndefined();
+  });
+
+  it("redacts and bounds plan input before publication without projecting native review text as steps", () => {
+    const translator = new CodexEventTranslator();
+    const state = createTranslatorState("thread-one");
+    state.activeTurnId = "turn-one";
+    const events = translator.translate("turn/plan/updated", { threadId: "thread-one", turnId: "turn-one",
+      explanation: "token=private-value", plan: [{ step: `Inspect ${"x".repeat(5_001)}`, status: "pending" }] }, state);
+    expect(events[0]?.type).toBe("tool_start");
+    const input = events[0]?.type === "tool_start" ? events[0].input : "";
+    expect(input).not.toContain("private-value");
+    expect(JSON.parse(input)).toMatchObject({ explanation: "token=[REDACTED]", plan: [{ step: expect.stringContaining("x".repeat(5_001)) }] });
+    const oversized = translator.translate("turn/plan/updated", { threadId: "thread-one", turnId: "turn-one",
+      plan: [{ step: "界".repeat(100_000), status: "pending" }] }, state);
+    const bounded = oversized[0]?.type === "tool_update" ? oversized[0].input! : "";
+    expect(Buffer.byteLength(bounded, "utf8")).toBeLessThanOrEqual(256 * 1024);
+    expect(bounded.endsWith("[truncated]")).toBe(true);
+    expect(() => JSON.parse(bounded)).toThrow();
+    expect(translator.translate("item/completed", { threadId: "thread-one", turnId: "turn-one",
+      item: { type: "plan", id: "review-plan", text: "Review this proposed plan" } }, state)).toEqual([]);
+    expect(translator.translate("turn/completed", { threadId: "thread-one",
+      turn: { id: "turn-one", status: "interrupted", items: [], error: null } }, state))
+      .toEqual([{ type: "done", outcome: "aborted" }]);
+  });
+
   it("separates cumulative uncached usage from the latest request pricing and context", () => {
     const translator = new CodexEventTranslator();
     const state = createTranslatorState();

@@ -6,8 +6,8 @@ export interface MobileExpandedBlockStoreOptions {
 }
 
 export interface MobileExpandedBlockStore {
-  isExpanded(ownerKey: string, blockKey: string): boolean;
-  setExpanded(ownerKey: string, blockKey: string, expanded: boolean): void;
+  isExpanded(ownerKey: string, blockKey: string, defaultExpanded?: boolean): boolean;
+  setExpanded(ownerKey: string, blockKey: string, expanded: boolean, defaultExpanded?: boolean): void;
   subscribe(ownerKey: string, blockKey: string, listener: () => void): () => void;
   reset(): void;
 }
@@ -17,7 +17,7 @@ function expandedBlockKey(ownerKey: string, blockKey: string): string {
   return JSON.stringify([ownerKey, blockKey]);
 }
 
-/** Process-local expansion memory survives virtualization and regrouping; new stores start collapsed. */
+/** Process-local overrides survive virtualization; each caller explicitly owns its initial presentation. */
 export function createMobileExpandedBlockStore(
   options: MobileExpandedBlockStoreOptions = {}
 ): MobileExpandedBlockStore {
@@ -25,7 +25,7 @@ export function createMobileExpandedBlockStore(
   if (!Number.isSafeInteger(maximumEntries) || maximumEntries < 1) {
     throw new Error("The expanded block memory limit must be a positive safe integer.");
   }
-  const expanded = new Set<string>();
+  const overrides = new Map<string, boolean>();
   const subscribers = new Map<string, Set<() => void>>();
   const notify = (key: string): void => {
     for (const listener of [...(subscribers.get(key) ?? [])]) {
@@ -37,21 +37,21 @@ export function createMobileExpandedBlockStore(
     }
   };
   return {
-    isExpanded(ownerKey, blockKey) {
-      return expanded.has(expandedBlockKey(ownerKey, blockKey));
+    isExpanded(ownerKey, blockKey, defaultExpanded = false) {
+      return overrides.get(expandedBlockKey(ownerKey, blockKey)) ?? defaultExpanded;
     },
-    setExpanded(ownerKey, blockKey, next) {
+    setExpanded(ownerKey, blockKey, next, defaultExpanded = false) {
       const key = expandedBlockKey(ownerKey, blockKey);
-      if (expanded.has(key) === next) return;
-      if (next) {
-        expanded.add(key);
-        if (expanded.size > maximumEntries) {
-          const oldest = expanded.values().next().value!;
-          expanded.delete(oldest);
+      if ((overrides.get(key) ?? defaultExpanded) === next) return;
+      if (next !== defaultExpanded) {
+        overrides.set(key, next);
+        if (overrides.size > maximumEntries) {
+          const oldest = overrides.keys().next().value!;
+          overrides.delete(oldest);
           notify(oldest);
         }
       } else {
-        expanded.delete(key);
+        overrides.delete(key);
       }
       notify(key);
     },
@@ -66,8 +66,8 @@ export function createMobileExpandedBlockStore(
       };
     },
     reset() {
-      const previous = [...expanded];
-      expanded.clear();
+      const previous = [...overrides.keys()];
+      overrides.clear();
       for (const key of previous) notify(key);
     }
   };
@@ -75,13 +75,13 @@ export function createMobileExpandedBlockStore(
 
 export const mobileExpandedBlockStore = createMobileExpandedBlockStore();
 
-export function useMobileExpandedBlock(ownerKey: string, blockKey: string): [boolean, () => void] {
+export function useMobileExpandedBlock(ownerKey: string, blockKey: string, defaultExpanded = false): [boolean, () => void] {
   const subscribe = useCallback((listener: () => void) => mobileExpandedBlockStore.subscribe(ownerKey, blockKey, listener),
     [ownerKey, blockKey]);
-  const snapshot = useCallback(() => mobileExpandedBlockStore.isExpanded(ownerKey, blockKey), [ownerKey, blockKey]);
+  const snapshot = useCallback(() => mobileExpandedBlockStore.isExpanded(ownerKey, blockKey, defaultExpanded), [ownerKey, blockKey, defaultExpanded]);
   const expanded = useSyncExternalStore(subscribe, snapshot, snapshot);
   const toggle = useCallback(() => {
-    mobileExpandedBlockStore.setExpanded(ownerKey, blockKey, !mobileExpandedBlockStore.isExpanded(ownerKey, blockKey));
-  }, [ownerKey, blockKey]);
+    mobileExpandedBlockStore.setExpanded(ownerKey, blockKey, !mobileExpandedBlockStore.isExpanded(ownerKey, blockKey, defaultExpanded), defaultExpanded);
+  }, [ownerKey, blockKey, defaultExpanded]);
   return [expanded, toggle];
 }

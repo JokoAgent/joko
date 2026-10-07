@@ -54,4 +54,17 @@ describe("mobile work grouping", () => {
     expect(items[1]).toBe(persistent);
     expect(items[3]).toBe(answer);
   });
+
+  it("places a structural plan at its latest edge and keeps it reachable outside folded work", () => {
+    const plan = row("plan", "tool", 1, { planSequence: 4n });
+    const thought = row("thinking", "thinking", 2);
+    const ordinary = row("ordinary", "tool", 3);
+    const answer = row("answer", "assistant", 5, { turnFinal: true });
+    const items = mobileWorkItems([plan, thought, ordinary, answer], false);
+    expect(items.map((item) => item.kind)).toEqual(["work", "tool", "assistant"]);
+    expect(items[1]).toBe(plan);
+    expect(plan.sequence).toBe(1n);
+    expect(plan.eventId).toBe("plan");
+    expect(items[2]).toBe(answer);
+  });
 });

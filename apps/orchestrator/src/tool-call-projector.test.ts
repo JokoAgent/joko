@@ -47,6 +47,38 @@ describe("Tool Call projector", () => {
     expect(calls[0]?.value.endedAt).toBeDefined();
   });
 
+  it("replaces authoritative input only within its exact live call and preserves it after completion", () => {
+    const start = event(1, { type: "tool_start", callId: "plan-1", name: "plan", input: "first" });
+    const update = (cursor: number, input: string) => event(cursor, {
+      type: "tool_update", callId: "plan-1", name: "plan", input, output: ""
+    });
+    const invalid = [
+      { ...update(3, "foreign backend"), backendId: "other" },
+      { ...update(4, "foreign run"), runId: "other" },
+      { ...update(5, "foreign attempt"), attemptId: "other" },
+      { ...update(6, "foreign generation"), generation: 2 },
+      event(7, { type: "tool_update", callId: "plan-1", name: "other", input: "foreign name", output: "" })
+    ];
+    const live = [start, update(2, "latest"), ...invalid,
+      event(8, { type: "tool_update", callId: "plan-1", name: "plan", output: "progress" })];
+    expect(projectToolCalls(live)[0]?.value.arguments[0]?.value).toEqual({ case: "text", value: "latest" });
+    const cleared = [...live, update(9, "")];
+    expect(projectToolCalls(cleared)[0]?.value.arguments[0]?.value).toEqual({ case: "text", value: "" });
+    const completed = [...live,
+      event(9, { type: "tool_result", callId: "plan-1", name: "plan", output: "finished", isError: false }),
+      update(10, "late")];
+    expect(projectToolCalls(completed)[0]?.value).toMatchObject({
+      state: ToolCallState.SUCCEEDED,
+      arguments: [{ value: { case: "text", value: "latest" } }],
+      result: { parts: [{ content: { case: "text", value: "finished" } }] }
+    });
+    expect(projectToolCalls(completed)[0]?.lastCursor).toBe(9n);
+    expect(projectToolCalls([update(1, "update-only")])[0]?.value.arguments[0]?.value)
+      .toEqual({ case: "text", value: "update-only" });
+    expect(projectToolCalls([start, { ...update(2, "other session"), sessionId: "other" }]))
+      .toHaveLength(2);
+  });
+
   it("accumulates append-mode deltas from a fake non-specialized Backend", () => {
     const calls = projectToolCalls([
       event(1, { type: "tool_start", callId: "shell-1", name: "Shell", input: "pwd" }, "backend-streaming-tools"),

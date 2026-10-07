@@ -108,4 +108,30 @@ describe("mobile expanded block memory", () => {
     expect(first.textContent).toBe("Collapsed");
     expect(mirror.textContent).toBe("Collapsed");
   });
+
+  it("keeps explicit default-expanded plans independent of default-collapsed blocks and remembers manual collapse", () => {
+    function Block({ owner, plan }: { owner: string; plan: boolean }) {
+      const [expanded, toggle] = useMobileExpandedBlock(owner, plan ? "inline-plan" : "thinking-one", plan);
+      return createElement("button", { onClick: toggle, "aria-expanded": expanded }, expanded ? "Expanded" : "Collapsed");
+    }
+    const host = document.createElement("div"); const root = createRoot(host); roots.add(root);
+    act(() => root.render(createElement(Block, { owner: "owner-one", plan: true })));
+    expect(host.textContent).toBe("Expanded");
+    act(() => host.querySelector("button")!.click());
+    expect(host.textContent).toBe("Collapsed");
+    act(() => root.render(null));
+    act(() => root.render(createElement(Block, { owner: "owner-one", plan: true })));
+    expect(host.textContent).toBe("Collapsed");
+    act(() => root.render(createElement(Block, { owner: "owner-two", plan: true })));
+    expect(host.textContent).toBe("Expanded");
+    act(() => root.render(createElement(Block, { owner: "owner-one", plan: false })));
+    expect(host.textContent).toBe("Collapsed");
+    act(() => root.render(createElement(Block, { owner: "owner-one", plan: true })));
+    expect(host.textContent).toBe("Collapsed");
+    act(() => mobileExpandedBlockStore.reset());
+    expect(host.textContent).toBe("Expanded");
+    const restarted = createMobileExpandedBlockStore();
+    expect(restarted.isExpanded("owner-one", "inline-plan", true)).toBe(true);
+    expect(restarted.isExpanded("owner-one", "thinking-one")).toBe(false);
+  });
 });

@@ -152,6 +152,9 @@ import { MobileKeyboardAvoidingView, useMobileKeyboardState } from "./MobileKeyb
 import { timelineRows, type TimelineRow } from "./timeline";
 import { MobileThinkingCard } from "./MobileThinkingCard";
 import { MobileWorkGroupCard } from "./MobileWorkGroupCard";
+import { MobilePlanCard } from "./MobilePlanCard";
+import { projectMobileInlinePlans } from "./mobile-plan-projection";
+import { mobilePlanMessage } from "./mobile-plan-messages";
 import { isWorkGroup, mobileWorkContains, mobileWorkExpansionKeys, mobileWorkItems, type MobileWorkItem } from "./mobile-work-projection";
 import { mobileExpandedBlockStore } from "./mobile-expanded-block-memory";
 import { MobileToolCallCard } from "./MobileToolCallCard";
@@ -3356,6 +3359,11 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
   const delegatedAffinity = useMemo(() => mobileDelegatedTimelineAffinity(state.selectedId ?? "",
     delegatedControls?.generation ?? state.detail?.generation ?? 0n, state.window ?? taskTimelineEvents, delegatedEntries),
   [delegatedControls?.generation, delegatedEntries, state.detail?.generation, state.selectedId, state.window, taskTimelineEvents]);
+  const inlinePlans = useMemo(() => projectMobileInlinePlans(state.window ?? taskTimelineEvents, {
+    sessionId: state.selectedId ?? "", generation: state.detail?.generation ?? 0n,
+    nativeGeneration: session?.nativeBinding?.runtimeGeneration ?? 0n
+  }, actualSessionStreaming && state.window === undefined),
+  [actualSessionStreaming, session?.nativeBinding?.runtimeGeneration, state.detail?.generation, state.selectedId, state.window, taskTimelineEvents]);
   const latestObservedRows = useMemo(() => timelineRows(taskTimelineEvents, actualSessionStreaming),
     [actualSessionStreaming, taskTimelineEvents]);
   const observedRows = useMemo(() => state.window === undefined
@@ -3378,12 +3386,24 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
         optimisticOwnerKey ?? ownerOptimisticRows[0]?.ownerKey ?? "",
         state.selectedId ?? ""
       ), [observedRows, optimisticOwnerKey, ownerOptimisticRows, state.selectedId, state.status, state.window]);
-  const rows = useMemo(() => messageRows.flatMap((row) => {
-    const attached = delegatedAffinity.byEventId.get(row.eventId);
-    if (delegatedAffinity.suppressedMetadataEventIds.has(row.eventId) && !attached?.length) return [];
-    const persistentTask = attached?.some((entry) => ["queued", "running", "waiting"].includes(projectMobileDelegated(entry).state));
-    return [persistentTask ? { ...row, persistentTask: true } : row];
-  }), [delegatedAffinity, messageRows]);
+  const rows = useMemo(() => {
+    const rawRows = messageRows.flatMap((row) => {
+      const attached = delegatedAffinity.byEventId.get(row.eventId);
+      if (delegatedAffinity.suppressedMetadataEventIds.has(row.eventId) && !attached?.length) return [];
+      const persistentTask = attached?.some((entry) => ["queued", "running", "waiting"].includes(projectMobileDelegated(entry).state));
+      return [persistentTask ? { ...row, persistentTask: true } : row];
+    });
+    const sourceRows = new Map(rawRows.map((row) => [row.id, row]));
+    const planRows = inlinePlans.cards.map((plan): TimelineRow => {
+      const source = sourceRows.get(plan.sourceToolScopeKeys.at(-1) ?? "");
+      return { id: plan.identity, eventId: plan.eventId, sequence: plan.sequence, planSequence: plan.sequence, plan,
+        label: mobilePlanMessage(locale, "title", { completed: plan.completed, total: plan.total }),
+        text: "", kind: "activity", completed: !plan.streaming,
+        ...(source?.ownerScope === undefined ? {} : { ownerScope: source.ownerScope }),
+        ...(source?.runScope === undefined ? {} : { runScope: source.runScope }) };
+    });
+    return [...rawRows, ...planRows];
+  }, [delegatedAffinity, inlinePlans, locale, messageRows]);
   const displayRows = useMemo(() => mobileWorkItems(rows, actualSessionStreaming && state.window === undefined),
     [actualSessionStreaming, rows, state.window]);
   const activeOptimisticOperationIds = useMemo(() => new Set([
@@ -5355,6 +5375,18 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
       enabled={state.status === "connected" || state.status === "offline"} colors={colors} locale={locale}>
       {item.children.map((child) => <Fragment key={child.id}>{renderTimelineItem(child, true)}</Fragment>)}
     </MobileWorkGroupCard>;
+    if (item.plan) return <View style={[styles.message, { backgroundColor: colors.surface, borderColor: colors.border }]}>
+      <MobilePlanCard plan={item.plan} ownerKey={blockOwnerKey} colors={colors} locale={locale}
+        enabled={state.status === "connected" || state.status === "offline"} />
+      <View pointerEvents={conversationShare.active ? "none" : "auto"} style={styles.messageActions}>
+        <Pressable accessibilityRole="button" accessibilityLabel={mobileMessage(locale, "task.viewContextFor", { name: item.label })}
+          disabled={state.historyBusy || state.status !== "connected"}
+          onPress={() => { setLocalError(""); void client.around(item.eventId).catch((error) => setLocalError(errorText(error))); }}
+          style={styles.inlineTouchAction}>
+          <Text style={[styles.caption, { color: colors.accent }]}>{mobileMessage(locale, "task.viewContext")}</Text>
+        </Pressable>
+      </View>
+    </View>;
         const delegatedCards = delegatedAffinity.byEventId.get(item.eventId) ?? [];
         const delegatedOnly = delegatedCards.length > 0 && item.tool === undefined;
         const linked = item.optimistic !== true && messageFocusHighlight === messageFocusKey && messageFocus !== undefined

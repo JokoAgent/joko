@@ -13,6 +13,7 @@ import {
 } from "./mobile-timeline-artifacts";
 import { mobileEventTimestamp, mobileMessageEventScope, mobileMessageScope, mobileThinkingViews,
   type MobileThinkingView } from "./mobile-thinking-projection";
+import type { MobileInlinePlan } from "./mobile-plan-projection";
 
 export type MobileTimelineMessagePart =
   | { readonly kind: "text"; readonly contentIndex: number; readonly text: string }
@@ -61,6 +62,9 @@ export interface TimelineRow {
   readonly workStreaming?: boolean;
   readonly persistentTask?: boolean;
   readonly answerSequence?: bigint;
+  /** The exact latest plan edge places its structural card without changing this row's raw cursor. */
+  readonly planSequence?: bigint;
+  readonly plan?: MobileInlinePlan;
 }
 
 const PARTNER_PRIVATE_TOOL_NAMES = new Set([

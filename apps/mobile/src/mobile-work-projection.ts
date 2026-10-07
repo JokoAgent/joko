@@ -23,6 +23,7 @@ export interface MobileWorkCandidate {
   readonly persistentTask?: boolean;
   /** Completed prose is delivered after its work; canonical message cursor stays unchanged. */
   readonly answerSequence?: bigint;
+  readonly planSequence?: bigint;
 }
 
 export interface MobileWorkGroup<T extends MobileWorkCandidate> extends MobileWorkCandidate {
@@ -47,8 +48,8 @@ export function mobileWorkItems<T extends MobileWorkCandidate>(rows: readonly T[
   const segments: T[][] = [];
   let current: T[] = [];
   const ordered = [...rows].sort((a, b) => {
-    const first = a.answerSequence ?? a.sequence;
-    const second = b.answerSequence ?? b.sequence;
+    const first = a.planSequence ?? a.answerSequence ?? a.sequence;
+    const second = b.planSequence ?? b.answerSequence ?? b.sequence;
     return first < second ? -1 : first > second ? 1 : a.id.localeCompare(b.id);
   });
   for (const row of ordered) {
@@ -67,7 +68,7 @@ export function mobileWorkItems<T extends MobileWorkCandidate>(rows: readonly T[
     isSealedAnswer: (row) => row.kind !== "work" && row.turnFinal === true,
     isCompactBoundary: (row) => row.kind !== "work" && row.compactBoundary === true,
     isActivity: (row): row is T => activity(row),
-    isArchivable: (row): row is T => row.persistentTask !== true && (activity(row)
+    isArchivable: (row): row is T => row.planSequence === undefined && row.persistentTask !== true && (activity(row)
       || (row.kind === "assistant" && row.text.trim() !== "" && !deliveryProse(row.text))),
     startTimestamp: (row) => row.startedAtMs ?? null,
     endTimestamp: (row) => row.kind === "work" ? row.startedAtMs ?? null
@@ -123,5 +124,6 @@ function deliveryProse(text: string): boolean {
 }
 
 function activity(row: MobileWorkCandidate): boolean {
-  return row.persistentTask !== true && (row.kind === "thinking" || row.kind === "tool" || row.workActivity === true);
+  return row.planSequence === undefined && row.persistentTask !== true
+    && (row.kind === "thinking" || row.kind === "tool" || row.workActivity === true);
 }

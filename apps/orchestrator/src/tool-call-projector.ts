@@ -19,8 +19,9 @@ interface Accumulator {
   readonly sessionId: string;
   readonly runId?: string;
   readonly attemptId?: string;
+  readonly generation: number;
   readonly name: string;
-  readonly input: string;
+  input?: string;
   readonly startedAt: number;
   readonly firstCursor: bigint;
   lastCursor: bigint;
@@ -66,6 +67,7 @@ export function projectToolCalls(events: readonly PersistedEvent[]): readonly Pr
         sessionId: event.sessionId,
         ...(event.runId === undefined ? {} : { runId: event.runId }),
         ...(event.attemptId === undefined ? {} : { attemptId: event.attemptId }),
+        generation: event.generation,
         name: payload.name,
         input: payload.input,
         startedAt: event.emittedAt,
@@ -78,20 +80,27 @@ export function projectToolCalls(events: readonly PersistedEvent[]): readonly Pr
     }
     if (payload.type === "tool_update" || payload.type === "tool_result") {
       const key = callKey(event.sessionId, payload.callId);
-      const current = calls.get(key) ?? {
+      const existing = calls.get(key);
+      if (payload.type === "tool_update" && payload.input !== undefined && existing !== undefined
+        && (isTerminal(existing.state) || existing.backendId !== event.backendId
+          || existing.sessionId !== event.sessionId || existing.runId !== event.runId
+          || existing.attemptId !== event.attemptId || existing.generation !== event.generation
+          || existing.name !== payload.name)) continue;
+      const current: Accumulator = existing ?? {
         callId: payload.callId,
         backendId: event.backendId,
         sessionId: event.sessionId,
         ...(event.runId === undefined ? {} : { runId: event.runId }),
         ...(event.attemptId === undefined ? {} : { attemptId: event.attemptId }),
+        generation: event.generation,
         name: payload.name,
-        input: "",
         startedAt: event.emittedAt,
         firstCursor: event.globalCursor,
         lastCursor: event.globalCursor,
         state: contract.ToolCallState.RUNNING,
         isError: false
       } satisfies Accumulator;
+      if (payload.type === "tool_update" && payload.input !== undefined) current.input = payload.input;
       current.lastCursor = event.globalCursor;
       const appendDelta = payload.type === "tool_update" && payload.outputMode === "append";
       current.output = appendDelta ? `${current.output ?? ""}${payload.output}` : payload.output;
@@ -131,7 +140,7 @@ export function projectToolCalls(events: readonly PersistedEvent[]): readonly Pr
         runId: item.runId ?? "",
         attemptId: item.attemptId ?? "",
         state: item.state,
-        arguments: item.input === "" ? [] : [create(contract.DisplayArgumentSchema, {
+        arguments: item.input === undefined ? [] : [create(contract.DisplayArgumentSchema, {
           fieldPath: "$",
           value: { case: "text", value: item.input },
           redacted: false,

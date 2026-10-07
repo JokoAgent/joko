@@ -2912,7 +2912,7 @@ function toProtoEventPayload(event: PersistedEvent, context: EventMappingContext
       }));
     case "tool_update":
       return protoPayload("toolCallUpdated", message<ToolCallUpdatedEvent>("joko.v1.ToolCallUpdatedEvent", {
-        toolCall: protoToolCall(event, payload.callId, payload.name, ToolCallState.RUNNING),
+        toolCall: protoToolCall(event, payload.callId, payload.name, ToolCallState.RUNNING, payload.input),
         incrementalResult: protoToolResult(payload.output, payload.artifact, payload.parts),
         outputMode: toProtoToolCallOutputMode(payload.outputMode)
       }));
@@ -3387,6 +3387,7 @@ function fromProtoEventPayload(
         type: "tool_update",
         callId: call.toolCallId,
         name: requireText(call.toolId, "event.payload.tool_call_updated.tool_call.tool_id"),
+        ...(call.arguments.length === 0 ? {} : { input: toolInput(call) }),
         output: toolOutput(result),
         ...(outputMode === undefined ? {} : { outputMode }),
         ...(parts.length === 0 ? {} : { parts }),
