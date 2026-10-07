@@ -1,6 +1,5 @@
 import {
   MOBILE_MAXIMUM_ATTACHMENT_BYTES,
-  classifyMobileAttachment,
   type MobileAttachmentPolicy,
   type MobileComposerAttachment,
   type MobileLocalComposerAttachment,
@@ -15,7 +14,9 @@ import {
   mobileRasterMediaTypes,
   normalizeMobileImageFileExtension,
   normalizeMobileImageUri,
-  statMobileImageFile
+  selectMobileImageImportMediaType,
+  statMobileImageFile,
+  type MobileImageImportMediaType
 } from "./mobile-image-attachment";
 
 export interface MobileCameraAsset {
@@ -42,7 +43,7 @@ export interface MobileAttachmentCameraDriver {
     readonly assets: readonly MobileCameraAsset[];
   }>;
   stat(uri: string): Promise<number>;
-  convertToJpeg(uri: string): Promise<MobileCameraTemporaryFile>;
+  convertImage(uri: string, mediaType: MobileImageImportMediaType): Promise<MobileCameraTemporaryFile>;
 }
 
 export class MobileAttachmentCamera {
@@ -61,7 +62,7 @@ export class MobileAttachmentCamera {
   ): Promise<readonly MobileLocalComposerAttachment[]> {
     signal?.throwIfAborted();
     if (!mobileCameraCaptureSupported(policy)) {
-      throw new Error("The current Backend and model do not accept camera JPEG images.");
+      throw new Error("The current Backend and model do not accept supported camera images.");
     }
     if (current.length >= policy.maximumItems) {
       throw new Error(`A task message can include at most ${policy.maximumItems} attachments.`);
@@ -124,18 +125,22 @@ export class MobileAttachmentCamera {
       }], newId, signal);
     }
 
+    const convertedMediaType = selectMobileImageImportMediaType(policy);
+    if (!convertedMediaType) {
+      throw new Error("The captured photo cannot be converted to an image type accepted by this Backend and model.");
+    }
     let converted: MobileCameraTemporaryFile | undefined;
     try {
-      try { converted = await this.driver.convertToJpeg(sourceUri); }
-      catch { throw new Error("The captured photo could not be converted to a supported JPEG."); }
+      try { converted = await this.driver.convertImage(sourceUri, convertedMediaType); }
+      catch { throw new Error("The captured photo could not be converted to a supported image."); }
       signal?.throwIfAborted();
       const convertedUri = normalizeMobileImageUri(converted.uri, "The converted photo is unreadable.");
       const convertedByteSize = await statMobileImageFile(this.driver, convertedUri, "converted photo");
       signal?.throwIfAborted();
       const candidate: MobilePickedAttachmentCandidate = {
         uri: convertedUri,
-        fileName: normalizeMobileImageFileExtension(sourceName, "image/jpeg"),
-        mediaType: "image/jpeg",
+        fileName: normalizeMobileImageFileExtension(sourceName, convertedMediaType),
+        mediaType: convertedMediaType,
         byteSize: convertedByteSize
       };
       return await this.files.stageCandidates(profileId, current, policy, [candidate], newId, signal);
@@ -146,9 +151,7 @@ export class MobileAttachmentCamera {
 }
 
 export function mobileCameraCaptureSupported(policy: MobileAttachmentPolicy | undefined): boolean {
-  if (!policy?.images) return false;
-  try { return classifyMobileAttachment("image/jpeg", policy) === "image"; }
-  catch { return false; }
+  return policy?.images === true && selectMobileImageImportMediaType(policy) !== undefined;
 }
 
 export function isMobileIosCameraSimulator(platform: string, documentUri: string | undefined): boolean {
@@ -198,13 +201,16 @@ const expoMobileAttachmentCameraDriver: MobileAttachmentCameraDriver = {
     if (!file.exists) throw new Error("Camera file missing.");
     return file.size;
   },
-  async convertToJpeg(uri) {
+  async convertImage(uri, mediaType) {
     const { ImageManipulator, SaveFormat } = await import("expo-image-manipulator");
     const context = ImageManipulator.manipulate(uri);
     let image: Awaited<ReturnType<typeof context.renderAsync>> | undefined;
     try {
       image = await context.renderAsync();
-      const saved = await image.saveAsync({ compress: 0.9, format: SaveFormat.JPEG });
+      const saved = await image.saveAsync({
+        compress: 0.9,
+        format: mediaType === "image/png" ? SaveFormat.PNG : SaveFormat.JPEG
+      });
       return {
         uri: saved.uri,
         async cleanup() {

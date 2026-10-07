@@ -14,6 +14,8 @@ export interface MobileImageStatDriver {
   stat(uri: string): Promise<number>;
 }
 
+export type MobileImageImportMediaType = "image/jpeg" | "image/png";
+
 export const mobileRasterMediaTypes = new Set([
   "image/jpeg",
   "image/png",
@@ -98,6 +100,12 @@ export function mobileImageFileName(
 export function mobileImageMediaTypeAccepted(mediaType: string, policy: MobileAttachmentPolicy): boolean {
   try { return classifyMobileAttachment(mediaType, policy) === "image"; }
   catch { return false; }
+}
+
+export function selectMobileImageImportMediaType(policy: MobileAttachmentPolicy): MobileImageImportMediaType | undefined {
+  if (mobileImageMediaTypeAccepted("image/jpeg", policy)) return "image/jpeg";
+  if (mobileImageMediaTypeAccepted("image/png", policy)) return "image/png";
+  return undefined;
 }
 
 export function normalizeMobileImageFileExtension(fileName: string, mediaType: string): string {

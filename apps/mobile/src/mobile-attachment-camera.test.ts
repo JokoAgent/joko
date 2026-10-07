@@ -72,7 +72,10 @@ function cameraFixture(
       if (!bytes) throw new Error("missing source");
       return bytes.byteLength;
     }),
-    convertToJpeg: vi.fn(async () => ({ uri: "file:///camera/converted.jpg", cleanup }))
+    convertImage: vi.fn(async (_uri, mediaType) => ({
+      uri: mediaType === "image/png" ? "file:///camera/converted.png" : "file:///camera/converted.jpg",
+      cleanup
+    }))
   };
   const files = new MobileAttachmentFiles(
     fileDriver,
@@ -83,10 +86,11 @@ function cameraFixture(
 }
 
 describe("mobile camera attachment", () => {
-  it("shows camera only when an exact image policy can accept generated JPEG", () => {
+  it("shows camera when the exact image policy can accept generated JPEG or PNG", () => {
     expect(mobileCameraCaptureSupported(jpegPolicy)).toBe(true);
     expect(mobileCameraCaptureSupported({ ...jpegPolicy, imageMediaTypes: [] })).toBe(true);
-    expect(mobileCameraCaptureSupported({ ...jpegPolicy, imageMediaTypes: ["image/png"] })).toBe(false);
+    expect(mobileCameraCaptureSupported({ ...jpegPolicy, imageMediaTypes: ["image/png"] })).toBe(true);
+    expect(mobileCameraCaptureSupported({ ...jpegPolicy, imageMediaTypes: ["image/webp"] })).toBe(false);
     expect(mobileCameraCaptureSupported({ ...jpegPolicy, images: false, files: true })).toBe(false);
     expect(mobileCameraCaptureSupported(undefined)).toBe(false);
   });
@@ -143,10 +147,13 @@ describe("mobile camera attachment", () => {
     expect(fixture.fileDriver.stage).toHaveBeenCalledWith(
       "profile-one", "photo-one", "file:///camera/photo.jpeg"
     );
-    expect(fixture.cameraDriver.convertToJpeg).not.toHaveBeenCalled();
+    expect(fixture.cameraDriver.convertImage).not.toHaveBeenCalled();
   });
 
-  it("converts HEIC to an admitted JPEG, stages the converted bytes, and cleans its temporary file", async () => {
+  it.each([
+    { accepted: ["image/jpeg", "image/png"], target: "image/jpeg", extension: "jpg" },
+    { accepted: ["image/png"], target: "image/png", extension: "png" }
+  ] as const)("converts HEIC to $target, stages the converted bytes, and cleans its temporary file", async ({ accepted, target, extension }) => {
     const asset = {
       ...jpegAsset,
       uri: "file:///camera/photo.heic",
@@ -156,19 +163,19 @@ describe("mobile camera attachment", () => {
     };
     const fixture = cameraFixture(asset, {
       "file:///camera/photo.heic": new Uint8Array([1, 2, 3, 4]),
-      "file:///camera/converted.jpg": new Uint8Array([2, 3, 4])
+      [`file:///camera/converted.${extension}`]: new Uint8Array([2, 3, 4])
     });
 
     const staged = await new MobileAttachmentCamera(fixture.files, fixture.cameraDriver).captureAndStage(
-      "profile", [], jpegPolicy, () => "photo-one"
+      "profile", [], { ...jpegPolicy, imageMediaTypes: accepted }, () => "photo-one"
     );
 
     expect(staged[0]).toMatchObject({
-      fileName: "IMG_0001.jpg", mediaType: "image/jpeg", byteSize: 3, sha256Hex: "b".repeat(64)
+      fileName: `IMG_0001.${extension}`, mediaType: target, byteSize: 3, sha256Hex: "b".repeat(64)
     });
-    expect(fixture.cameraDriver.convertToJpeg).toHaveBeenCalledWith("file:///camera/photo.heic");
+    expect(fixture.cameraDriver.convertImage).toHaveBeenCalledWith("file:///camera/photo.heic", target);
     expect(fixture.fileDriver.stage).toHaveBeenCalledWith(
-      "profile", "photo-one", "file:///camera/converted.jpg"
+      "profile", "photo-one", `file:///camera/converted.${extension}`
     );
     expect(fixture.cleanup).toHaveBeenCalledOnce();
   });
@@ -191,7 +198,7 @@ describe("mobile camera attachment", () => {
     );
 
     expect(staged[0]).toMatchObject({ fileName: "photo.heic", mediaType: "image/heic" });
-    expect(fixture.cameraDriver.convertToJpeg).not.toHaveBeenCalled();
+    expect(fixture.cameraDriver.convertImage).not.toHaveBeenCalled();
   });
 
   it("rejects non-still, multiple, changed, or malformed camera results before durable adoption", async () => {
@@ -248,5 +255,25 @@ describe("mobile camera attachment", () => {
       "profile", [], jpegPolicy, () => "photo-one"
     )).rejects.toThrow("The device camera could not take a photo.");
     expect(nativeError.fileDriver.stage).not.toHaveBeenCalled();
+  });
+
+  it("cancels a JPEG to PNG import after conversion and cleans the unused output", async () => {
+    const fixture = cameraFixture(jpegAsset, {
+      "file:///camera/photo.jpeg": new Uint8Array([1, 2, 3]),
+      "file:///camera/converted.png": new Uint8Array([2, 3, 4])
+    });
+    const controller = new AbortController();
+    vi.mocked(fixture.cameraDriver.convertImage).mockImplementation(async () => {
+      controller.abort(new Error("Camera import cancelled."));
+      return { uri: "file:///camera/converted.png", cleanup: fixture.cleanup };
+    });
+
+    await expect(new MobileAttachmentCamera(fixture.files, fixture.cameraDriver).captureAndStage(
+      "profile", [], { ...jpegPolicy, imageMediaTypes: ["image/png"] }, () => "photo-one", controller.signal
+    )).rejects.toThrow(/cancelled/u);
+    expect(fixture.cameraDriver.convertImage).toHaveBeenCalledWith("file:///camera/photo.jpeg", "image/png");
+    expect(fixture.cleanup).toHaveBeenCalledOnce();
+    expect(fixture.fileDriver.stage).not.toHaveBeenCalled();
+    expect(fixture.stored.size).toBe(0);
   });
 });

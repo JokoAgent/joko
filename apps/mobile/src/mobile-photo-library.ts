@@ -14,7 +14,9 @@ import {
   mobileRasterMediaTypes,
   normalizeMobileImageFileExtension,
   normalizeMobileImageUri,
-  statMobileImageFile
+  selectMobileImageImportMediaType,
+  statMobileImageFile,
+  type MobileImageImportMediaType
 } from "./mobile-image-attachment";
 
 export type MobilePhotoLibraryKind = "recent" | "screenshots";
@@ -94,7 +96,7 @@ export interface MobilePhotoLibraryDriver {
     readonly assets: readonly MobileSystemPhotoAsset[];
   }>;
   stat(uri: string): Promise<number>;
-  convertToJpeg(uri: string): Promise<MobilePhotoLibraryTemporaryFile>;
+  convertImage(uri: string, mediaType: MobileImageImportMediaType): Promise<MobilePhotoLibraryTemporaryFile>;
 }
 
 const catalogLimits: Record<MobilePhotoLibraryKind, number> = { recent: 24, screenshots: 60 };
@@ -315,12 +317,13 @@ export class MobilePhotoLibrary {
           });
           continue;
         }
-        if (!mobileImageMediaTypeAccepted("image/jpeg", policy)) {
+        const convertedMediaType = selectMobileImageImportMediaType(policy);
+        if (!convertedMediaType) {
           throw new Error(`${sourceName} cannot be converted to an image type accepted by this Backend and model.`);
         }
         let converted: MobilePhotoLibraryTemporaryFile;
-        try { converted = await this.driver.convertToJpeg(sourceUri); }
-        catch { throw new Error(`${sourceName} could not be converted to a supported JPEG.`); }
+        try { converted = await this.driver.convertImage(sourceUri, convertedMediaType); }
+        catch { throw new Error(`${sourceName} could not be converted to a supported image.`); }
         temporaryFiles.push(converted);
         signal?.throwIfAborted();
         const convertedUri = normalizeMobileImageUri(converted.uri, "The converted photo is unreadable.");
@@ -328,8 +331,8 @@ export class MobilePhotoLibrary {
         signal?.throwIfAborted();
         candidates.push({
           uri: convertedUri,
-          fileName: normalizeMobileImageFileExtension(sourceName, "image/jpeg"),
-          mediaType: "image/jpeg",
+          fileName: normalizeMobileImageFileExtension(sourceName, convertedMediaType),
+          mediaType: convertedMediaType,
           byteSize: convertedByteSize
         });
       }
@@ -531,13 +534,16 @@ const expoMobilePhotoLibraryDriver: MobilePhotoLibraryDriver = {
     if (!file.exists) throw new Error("Photo file missing.");
     return file.size;
   },
-  async convertToJpeg(uri) {
+  async convertImage(uri, mediaType) {
     const { ImageManipulator, SaveFormat } = await import("expo-image-manipulator");
     const context = ImageManipulator.manipulate(uri);
     let image: Awaited<ReturnType<typeof context.renderAsync>> | undefined;
     try {
       image = await context.renderAsync();
-      const saved = await image.saveAsync({ compress: 0.9, format: SaveFormat.JPEG });
+      const saved = await image.saveAsync({
+        compress: 0.9,
+        format: mediaType === "image/png" ? SaveFormat.PNG : SaveFormat.JPEG
+      });
       return {
         uri: saved.uri,
         async cleanup() {

@@ -20,6 +20,38 @@ const policy: MobileAttachmentPolicy = {
   fileMediaTypes: []
 };
 
+const nativeConversion = vi.hoisted(() => {
+  const files = new Map<string, Uint8Array>();
+  const image = { width: 8, height: 6, saveAsync: vi.fn(), release: vi.fn() };
+  const context = { renderAsync: vi.fn(), release: vi.fn() };
+  return { files, image, context, manipulate: vi.fn(() => context) };
+});
+
+vi.mock("expo-file-system", () => ({
+  Paths: { cache: "file:///cache" },
+  Directory: class {
+    readonly uri: string;
+    constructor(root: string, name: string) { this.uri = `${root}/${name}`; }
+    create(): void {}
+  },
+  File: class {
+    readonly uri: string;
+    constructor(root: string | { readonly uri: string }, name?: string) {
+      this.uri = name === undefined ? String(root) : `${typeof root === "string" ? root : root.uri}/${name}`;
+    }
+    get exists(): boolean { return nativeConversion.files.has(this.uri); }
+    create(): void { nativeConversion.files.set(this.uri, new Uint8Array()); }
+    write(bytes: Uint8Array): void { nativeConversion.files.set(this.uri, bytes); }
+    async bytes(): Promise<Uint8Array> { return nativeConversion.files.get(this.uri)!; }
+    delete(): void { nativeConversion.files.delete(this.uri); }
+  }
+}));
+
+vi.mock("expo-image-manipulator", () => ({
+  ImageManipulator: { manipulate: nativeConversion.manipulate },
+  SaveFormat: { JPEG: "jpeg", PNG: "png" }
+}));
+
 function filesFixture(failAt = 0) {
   let stage = 0;
   const staged: MobileLocalComposerAttachment[] = [];
@@ -102,19 +134,94 @@ describe("mobile composer clipboard image paste", () => {
 
   it("converts an unadmitted verified raster to JPEG and verifies the result before staging", async () => {
     const fixture = filesFixture();
-    const converter: MobileComposerImagePasteConverter = { convertToJpeg: vi.fn(async () => jpeg(8, 6)) };
-    const jpegPolicy = { ...policy, imageMediaTypes: ["image/jpeg"] };
+    const converter: MobileComposerImagePasteConverter = { convert: vi.fn(async () => jpeg(8, 6)) };
+    const jpegPolicy = { ...policy, imageMediaTypes: ["image/jpeg", "image/png"] };
 
     const staged = await new MobileComposerImagePaste(fixture.files, converter).stage(
       "profile-one",
       [],
       jpegPolicy,
-      [{ base64: base64(png(5, 4)), mediaType: "image/png", name: "source.png" }],
+      [{ base64: base64(gif(5, 4)), mediaType: "image/gif", name: "source.gif" }],
       () => "paste-one"
     );
 
-    expect(converter.convertToJpeg).toHaveBeenCalledWith(expect.any(Uint8Array), "image/png");
+    expect(converter.convert).toHaveBeenCalledWith(expect.any(Uint8Array), "image/gif", "image/jpeg", undefined);
     expect(staged[0]).toMatchObject({ fileName: "pasted-image-1.jpg", mediaType: "image/jpeg" });
+  });
+
+  it.each([
+    ["image/jpeg", () => jpeg(8, 6)],
+    ["image/heic", () => isoImageBytes(["mif1", "heic"], 8, 6)],
+    ["image/gif", () => gif(8, 6)],
+    ["image/webp", () => webp(8, 6)]
+  ] as const)("converts verified %s clipboard bytes to an admitted PNG", async (mediaType, source) => {
+    const fixture = filesFixture();
+    const converted = png(8, 6);
+    const converter: MobileComposerImagePasteConverter = { convert: vi.fn(async () => converted) };
+    const staged = await new MobileComposerImagePaste(fixture.files, converter).stage(
+      "profile-one", [], { ...policy, imageMediaTypes: ["image/png"] },
+      [{ base64: base64(source()), mediaType, name: "source-image" }], () => "paste-one"
+    );
+
+    expect(converter.convert).toHaveBeenCalledWith(expect.any(Uint8Array), mediaType, "image/png", undefined);
+    expect(staged[0]).toMatchObject({ fileName: "pasted-image-1.png", mediaType: "image/png", byteSize: converted.byteLength });
+    expect(fixture.raw.stageVerifiedBytes.mock.calls[0]?.[3].bytes).toEqual(converted);
+  });
+
+  it.each([
+    ["wrong MIME", () => jpeg(8, 6), /signature/u],
+    ["unbounded dimensions", () => png(0, 6), /dimensions/u],
+    ["oversized bytes", () => new Uint8Array(policy.maximumBytes + 1), /byte limit/u]
+  ] as const)("rejects converted PNG %s before staging", async (_label, output, error) => {
+    const fixture = filesFixture();
+    await expect(new MobileComposerImagePaste(fixture.files, { convert: async () => output() }).stage(
+      "profile-one", [], { ...policy, imageMediaTypes: ["image/png"] },
+      [{ base64: base64(jpeg(8, 6)), mediaType: "image/jpeg", name: "source.jpg" }], () => "unused"
+    )).rejects.toThrow(error);
+    expect(fixture.raw.stageVerifiedBytes).not.toHaveBeenCalled();
+  });
+
+  it.each(["image/png", "image/jpeg"] as const)("uses native %s encoding and cleans its temporary files", async (targetMediaType) => {
+    const converted = targetMediaType === "image/png" ? png(8, 6) : jpeg(8, 6);
+    prepareNativeConversion(converted);
+    const fixture = filesFixture();
+    const source = targetMediaType === "image/png"
+      ? { base64: base64(jpeg(8, 6)), mediaType: "image/jpeg" as const, name: "source.jpg" }
+      : { base64: base64(png(8, 6)), mediaType: "image/png" as const, name: "source.png" };
+    const staged = await new MobileComposerImagePaste(fixture.files).stage(
+      "profile-one", [], { ...policy, imageMediaTypes: [targetMediaType] }, [source], () => "paste-one"
+    );
+
+    expect(staged[0]?.mediaType).toBe(targetMediaType);
+    expect(nativeConversion.image.saveAsync).toHaveBeenCalledWith({
+      compress: targetMediaType === "image/png" ? 1 : 0.9,
+      format: targetMediaType === "image/png" ? "png" : "jpeg"
+    });
+    expect(nativeConversion.image.release).toHaveBeenCalledOnce();
+    expect(nativeConversion.context.release).toHaveBeenCalledOnce();
+    expect(nativeConversion.files.size).toBe(0);
+  });
+
+  it.each(["native dimensions", "cancel"] as const)("cleans native conversion after %s rejection without staging", async (failure) => {
+    const controller = new AbortController();
+    prepareNativeConversion(png(failure === "native dimensions" ? 7 : 8, 6));
+    if (failure === "cancel") {
+      nativeConversion.image.saveAsync.mockImplementationOnce(async () => {
+        nativeConversion.files.set("file:///cache/converted-image.png", png(8, 6));
+        controller.abort(new Error("paste canceled"));
+        return { uri: "file:///cache/converted-image.png" };
+      });
+    }
+    const fixture = filesFixture();
+    await expect(new MobileComposerImagePaste(fixture.files).stage(
+      "profile-one", [], { ...policy, imageMediaTypes: ["image/png"] },
+      [{ base64: base64(jpeg(8, 6)), mediaType: "image/jpeg", name: "source.jpg" }],
+      () => "unused", controller.signal
+    )).rejects.toThrow(failure === "cancel" ? "paste canceled" : /converted.*PNG/u);
+    expect(fixture.raw.stageVerifiedBytes).not.toHaveBeenCalled();
+    expect(nativeConversion.image.release).toHaveBeenCalledOnce();
+    expect(nativeConversion.context.release).toHaveBeenCalledOnce();
+    expect(nativeConversion.files.size).toBe(0);
   });
 
   it("cleans every staged item if a later item fails and never trusts a declared MIME", async () => {
@@ -224,6 +331,20 @@ describe("mobile composer clipboard image paste", () => {
     expect(recoverable.staged).toHaveLength(1);
   });
 });
+
+function prepareNativeConversion(outputBytes: Uint8Array): void {
+  nativeConversion.files.clear();
+  nativeConversion.manipulate.mockClear();
+  nativeConversion.image.width = 8;
+  nativeConversion.image.height = 6;
+  nativeConversion.image.release.mockClear();
+  nativeConversion.context.release.mockClear();
+  nativeConversion.context.renderAsync.mockReset().mockResolvedValue(nativeConversion.image);
+  nativeConversion.image.saveAsync.mockReset().mockImplementation(async () => {
+    nativeConversion.files.set("file:///cache/converted-image.png", outputBytes);
+    return { uri: "file:///cache/converted-image.png" };
+  });
+}
 
 function base64(bytes: Uint8Array): string {
   return Buffer.from(bytes).toString("base64");

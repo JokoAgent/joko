@@ -9,7 +9,8 @@ import {
 import type { MobileComposerDraft } from "./mobile-composer-document";
 import {
   mobileImageExtensionForMediaType,
-  mobileImageMediaTypeAccepted
+  mobileImageMediaTypeAccepted,
+  selectMobileImageImportMediaType
 } from "./mobile-image-attachment";
 import {
   assertMobileImageGalleryDimensions
@@ -29,7 +30,12 @@ export interface MobileComposerPastedImagePayload {
 }
 
 export interface MobileComposerImagePasteConverter {
-  convertToJpeg(bytes: Uint8Array, mediaType: MobileComposerPastedImageMediaType): Promise<Uint8Array>;
+  convert(
+    bytes: Uint8Array,
+    mediaType: MobileComposerPastedImageMediaType,
+    targetMediaType: "image/jpeg" | "image/png",
+    signal?: AbortSignal
+  ): Promise<Uint8Array>;
 }
 
 export interface MobileComposerImagePasteSnapshot<TDraft> {
@@ -115,19 +121,23 @@ export class MobileComposerImagePaste {
         });
         continue;
       }
-      if (!mobileImageMediaTypeAccepted("image/jpeg", policy)) {
+      const targetMediaType = selectMobileImageImportMediaType(policy);
+      if (targetMediaType === undefined) {
         throw new Error(`Pasted image ${index + 1} is not accepted by the current Backend and model.`);
       }
       let converted: Uint8Array;
-      try { converted = await this.converter.convertToJpeg(sourceBytes, payload.mediaType); }
-      catch { throw new Error(`Pasted image ${index + 1} could not be converted to an accepted JPEG.`); }
+      try { converted = await this.converter.convert(sourceBytes, payload.mediaType, targetMediaType, signal); }
+      catch {
+        signal?.throwIfAborted();
+        throw new Error(`Pasted image ${index + 1} could not be converted to an accepted ${targetMediaType === "image/png" ? "PNG" : "JPEG"}.`);
+      }
       signal?.throwIfAborted();
       if (!(converted instanceof Uint8Array) || converted.byteLength < 1
         || converted.byteLength > policy.maximumBytes) {
         throw new Error(`Converted pasted image ${index + 1} exceeds this task's attachment byte limit.`);
       }
-      inspectMobileComposerPastedImageBytes(converted, "image/jpeg");
-      verified.push({ bytes: converted, fileName: pastedImageFileName(index, "image/jpeg"), mediaType: "image/jpeg" });
+      inspectMobileComposerPastedImageBytes(converted, targetMediaType);
+      verified.push({ bytes: converted, fileName: pastedImageFileName(index, targetMediaType), mediaType: targetMediaType });
     }
 
     const staged: MobileLocalComposerAttachment[] = [];
@@ -272,9 +282,11 @@ function base64Value(code: number): number {
 }
 
 const expoMobileComposerImagePasteConverter: MobileComposerImagePasteConverter = {
-  async convertToJpeg(bytes, mediaType) {
+  async convert(bytes, mediaType, targetMediaType, signal) {
+    signal?.throwIfAborted();
     const { Directory, File, Paths } = await import("expo-file-system");
     const { ImageManipulator, SaveFormat } = await import("expo-image-manipulator");
+    signal?.throwIfAborted();
     const directory = new Directory(Paths.cache, composerPasteCacheDirectory);
     directory.create({ idempotent: true, intermediates: true });
     const sequence = ++temporaryFileSequence;
@@ -291,15 +303,28 @@ const expoMobileComposerImagePasteConverter: MobileComposerImagePasteConverter =
       source.write(bytes);
       context = ImageManipulator.manipulate(source.uri);
       image = await context.renderAsync();
-      const saved = await image.saveAsync({ compress: 0.9, format: SaveFormat.JPEG });
+      signal?.throwIfAborted();
+      assertMobileImageGalleryDimensions(image.width, image.height);
+      const saved = await image.saveAsync({
+        compress: targetMediaType === "image/png" ? 1 : 0.9,
+        format: targetMediaType === "image/png" ? SaveFormat.PNG : SaveFormat.JPEG
+      });
       output = new File(saved.uri);
+      signal?.throwIfAborted();
       if (!output.exists) throw new Error("The converted pasted image is missing.");
-      return Uint8Array.from(await output.bytes());
+      const converted = Uint8Array.from(await output.bytes());
+      signal?.throwIfAborted();
+      inspectMobileImageOutputBytes(converted, targetMediaType, { width: image.width, height: image.height });
+      return converted;
     } finally {
-      image?.release();
-      context?.release();
-      if (output?.exists) output.delete();
-      if (source.exists) source.delete();
+      try { image?.release(); }
+      finally {
+        try { context?.release(); }
+        finally {
+          try { if (output?.exists) output.delete(); }
+          finally { if (source.exists) source.delete(); }
+        }
+      }
     }
   }
 };

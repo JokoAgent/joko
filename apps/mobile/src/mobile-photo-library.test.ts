@@ -98,7 +98,10 @@ function fixture(input: {
       if (!bytes) throw new Error("missing source");
       return bytes.byteLength;
     }),
-    convertToJpeg: vi.fn(async () => ({ uri: "file:///cache/IMG_0002.jpg", cleanup }))
+    convertImage: vi.fn(async (_uri, mediaType) => ({
+      uri: mediaType === "image/png" ? "file:///cache/converted.png" : "file:///cache/IMG_0002.jpg",
+      cleanup
+    }))
   };
   const files = new MobileAttachmentFiles(
     fileDriver,
@@ -272,7 +275,7 @@ describe("mobile photo library", () => {
 
     expect(value.driver.resolve).toHaveBeenNthCalledWith(1, "asset-one");
     expect(value.driver.resolve).toHaveBeenNthCalledWith(2, "asset-two");
-    expect(value.driver.convertToJpeg).toHaveBeenCalledWith("file:///library/IMG_0002.HEIC");
+    expect(value.driver.convertImage).toHaveBeenCalledWith("file:///library/IMG_0002.HEIC", "image/jpeg");
     expect(value.fileDriver.stage).toHaveBeenNthCalledWith(
       1, "profile", "photo-1", "file:///library/IMG_0001.JPG"
     );
@@ -284,6 +287,69 @@ describe("mobile photo library", () => {
       { fileName: "IMG_0002.jpg", mediaType: "image/jpeg", byteSize: 3 }
     ]);
     expect(value.cleanup).toHaveBeenCalledOnce();
+  });
+
+  it.each(["ios", "android"])("imports JPEG as PNG for a PNG-only policy through %s photos", async (platform) => {
+    const value = fixture({
+      platform,
+      sources: {
+        "content://picker/one.jpg": new Uint8Array([1, 2, 3]),
+        "file:///library/IMG_0001.JPG": new Uint8Array([1, 2, 3]),
+        "file:///cache/converted.png": new Uint8Array([2, 3, 4, 5])
+      }
+    });
+    const library = new MobilePhotoLibrary(value.files, value.driver);
+    const policy = { ...jpegPolicy, imageMediaTypes: ["image/png"] };
+    const staged = platform === "android"
+      ? await library.pickSystemAndStage("profile", [], policy, () => "photo-one")
+      : await library.stageSelectedAssets("profile", [], policy, [catalogAsset], () => "photo-one");
+
+    expect(staged[0]).toMatchObject({
+      fileName: platform === "android" ? "one.png" : "IMG_0001.png",
+      mediaType: "image/png",
+      byteSize: 4,
+      sha256Hex: "b".repeat(64)
+    });
+    expect(value.driver.convertImage).toHaveBeenCalledWith(
+      platform === "android" ? "content://picker/one.jpg" : "file:///library/IMG_0001.JPG", "image/png"
+    );
+    expect(value.fileDriver.stage).toHaveBeenCalledWith("profile", "photo-one", "file:///cache/converted.png");
+    expect(value.cleanup).toHaveBeenCalledOnce();
+  });
+
+  it("keeps an admitted PNG original and cleans cancelled conversion output", async () => {
+    const value = fixture({
+      platform: "android",
+      sources: {
+        "content://picker/one.png": new Uint8Array([1, 2, 3]),
+        "content://picker/one.jpg": new Uint8Array([1, 2, 3]),
+        "file:///cache/converted.png": new Uint8Array([2, 3, 4])
+      }
+    });
+    vi.mocked(value.driver.pickSystem).mockResolvedValue({
+      canceled: false,
+      assets: [{ uri: "content://picker/one.png", type: "image", fileName: "one.png", mimeType: "image/png" }]
+    });
+    const policy = { ...jpegPolicy, imageMediaTypes: ["image/png"] };
+    const library = new MobilePhotoLibrary(value.files, value.driver);
+    await expect(library.pickSystemAndStage("profile", [], policy, () => "photo-one"))
+      .resolves.toMatchObject([{ fileName: "one.png", mediaType: "image/png", sha256Hex: "a".repeat(64) }]);
+    expect(value.driver.convertImage).not.toHaveBeenCalled();
+
+    vi.mocked(value.driver.pickSystem).mockResolvedValue({
+      canceled: false,
+      assets: [{ uri: "content://picker/one.jpg", type: "image", fileName: "one.jpg", mimeType: "image/jpeg" }]
+    });
+    const controller = new AbortController();
+    vi.mocked(value.driver.convertImage).mockImplementation(async () => {
+      controller.abort(new Error("Photo import cancelled."));
+      return { uri: "file:///cache/converted.png", cleanup: value.cleanup };
+    });
+    await expect(library.pickSystemAndStage("profile", [], policy, () => "photo-two", controller.signal))
+      .rejects.toThrow(/cancelled/u);
+    expect(value.cleanup).toHaveBeenCalledOnce();
+    expect(value.fileDriver.stage).toHaveBeenCalledTimes(1);
+    expect(value.stored.size).toBe(1);
   });
 
   it("fails atomically for missing local assets, identity drift, and iCloud timeout", async () => {
