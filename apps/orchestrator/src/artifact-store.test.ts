@@ -17,6 +17,30 @@ afterEach(async () => {
 });
 
 describe("ArtifactStore garbage collection", () => {
+  it("infers supported text filenames at ingestion and preserves an explicitly declared Blob type", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "joko-artifact-text-"));
+    cleanupPaths.push(directory);
+    const store = new OperationalStore(join(directory, "orchestrator.db"));
+    const artifacts = new ArtifactStore({
+      rootDirectory: join(directory, "artifacts"), repository: new OperationalArtifactRepository(store), ingestRoots: [directory]
+    });
+    await artifacts.initialize();
+    const bytes = Buffer.from("source text\n");
+    try {
+      for (const fileName of ["main.zig", "events.jsonl", "movie.srt", "Gemfile", ".env", "production.env.local"]) {
+        const source = join(directory, fileName);
+        await writeFile(source, bytes);
+        const inferred = await artifacts.ingestPath(source);
+        expect(inferred).toMatchObject({ fileName, mimeType: "text/plain", byteLength: bytes.length });
+        const fromBytes = await artifacts.ingestBytes(bytes, { fileName });
+        expect(fromBytes).toEqual(inferred);
+        const declared = await artifacts.ingestBytes(bytes, { fileName, mimeType: "application/octet-stream" });
+        expect(declared).toMatchObject({ fileName, mimeType: "application/octet-stream", sha256: inferred.sha256 });
+        expect(declared.id).not.toBe(inferred.id);
+      }
+    } finally { store.close(); }
+  });
+
   it("ingests service-produced bytes as a private durable artifact", async () => {
     const directory = await mkdtemp(join(tmpdir(), "joko-artifact-bytes-"));
     cleanupPaths.push(directory);

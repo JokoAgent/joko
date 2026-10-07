@@ -1,16 +1,17 @@
-import { create, toBinary } from "@bufbuild/protobuf";
+import { clone, create, fromBinary, toBinary } from "@bufbuild/protobuf";
 import { Code } from "@connectrpc/connect";
 import { createHash } from "node:crypto";
+import sharp from "sharp";
 import {
   AcknowledgementSchema, ArtifactKind, ArtifactSchema, BackendDescriptorSchema, BackendModelAccessSettingsSchema, BackendSettingsSchema, BlobDisposition, BlobRefSchema,
   CapabilityManifestSchema, CapabilityOptionsSchema, CapabilitySchema, CapabilitySupport, CompactSessionOutcome, ConnectionSchema, ConnectionState,
   ContextUsageSchema, DeviceKind, DevicePresenceState, DeviceSchema, EntityKind, EntityVersionSchema,
-  FileKind, FilePreviewSchema, FileRevisionSchema, TargetSchema, WorkspaceDescriptorSchema, WorkspaceEntrySchema, WorkspaceFileChangeKind, WorkspaceFileChangeSchema,
-  WorkspaceSearchMatchSchema,
+  FileKind, FilePreviewSchema, FileRevisionSchema, TextFilePreviewSchema, TargetSchema, WorkspaceDescriptorSchema, WorkspaceEntrySchema, WorkspaceFileChangeKind, WorkspaceFileChangeSchema,
+  WorkspaceSearchMatchSchema, WorkspaceChangeSetSchema, WorkspaceRewindPreviewSchema, WorkspaceRewindResultSchema, RewindSafety, FileChangeKind,
   JOKO_API_VERSION, NativeEntryKind, NativeSessionBindingSchema, NativeSessionTreeNodeSchema, NativeSessionTreeSchema, OperationSchema,
   ListPartnerSessionsResponseSchema, PartnerSessionRole,
-  InputCapabilityOptionsSchema, InteractionKind, InteractionSchema, InteractionState, PermissionDecisionKind, PermissionRisk, PlanReviewDecisionKind,
-  EventCursorSchema, EventSchema, ImageRefSchema, MessageRole, ModelDescriptorSchema, ModelInputModality, ModelKeySchema, ModelOutputModality, ModelSelectionSchema,
+  InputCapabilityOptionsSchema, InteractionKind, InteractionSchema, InteractionState, PermissionDecisionKind, PermissionRisk, PlanReviewDecisionKind, ImageThumbnailSchema,
+  EventCursorSchema, EventSchema, ImageRefSchema, MessageInputDelivery, MessageRole, ModelDescriptorSchema, ModelInputModality, ModelKeySchema, ModelOutputModality, ModelSelectionSchema,
   OperationMutationSchema, OperationState, OwnerSnapshotScopeSchema, PermissionMode,
   ProviderDescriptorSchema, ProviderKind, RevisionSchema, SessionMessageSearchMatchSchema, SessionSnapshotScopeSchema,
   SettingsSnapshotSchema, SnapshotScopeSchema, UsageSchema,
@@ -22,12 +23,14 @@ import {
   ScheduleGeneratedSessionDisposition,
   ScheduleDeletionResultSchema, ScheduleRunCostAttribution, ScheduleRunHistorySchema, ScheduleRunOutcome, ScheduleRunPhase, ScheduleSchema,
   ScheduleSessionMode, ScheduleSource, ScheduleState, SchedulerRuntimeSnapshotSchema,
-  SessionContextStateSchema, SessionMessageSearchSessionStatus, SessionSchema, SessionState, SnapshotSchema,
-  TargetState, WorkspaceKind, WorkspaceLocationSchema, capabilityNames, nativeSessionTreeWireFields
+  SessionContextStateSchema, SessionDerivationKind, SessionDerivationOriginSchema, SessionMessageSearchSessionStatus, SessionSchema, SessionState, SnapshotSchema,
+  SessionWorktreeSchema, TargetState, ToolCallOutputMode, WorkspaceKind, WorkspaceLocationSchema, capabilityNames, nativeSessionTreeWireFields
 } from "@joko/contracts";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MobileClient, type MobileStorage, type PendingOperation } from "./mobile-client";
 import { MobileCredentialStorageError, profileFromCredential } from "./connection-storage";
+import { producedArtifactEvent, producedImageEvent, toolMediaEvent } from "./test/timeline-media";
+import { animatedPngBytes, gifBytes, svgBytes, bmpBytes, tiffBytes, isoImageBytes, iconBytes, iconDibBytes } from "./test/image-formats";
 import type { MobileDiscovery } from "./connection-discovery";
 import {
   normalizeNodeOrigin,
@@ -70,6 +73,7 @@ import {
   insertMobileArtifactMention,
   insertMobileResourceMention,
   insertMobileSessionMention,
+  insertMobilePastedText,
   insertMobileStructuredClipboardText,
   insertMobileWorkspaceMention,
   mobileComposerInput,
@@ -77,6 +81,7 @@ import {
   type MobileComposerDraft
 } from "./mobile-composer-document";
 import { createMobileAutomationDraft } from "./mobile-automation-authoring";
+import { parseMobileNativeIntent } from "./mobile-native-intent";
 
 const credential: PairedCredential = {
   profileId: "mobile-profile", origin: "http://192.168.1.20:4318", serverId: "node-1", connectionId: "mobile-connection",
@@ -970,6 +975,8 @@ function fakeNetwork(): MobileNetwork {
     }),
     listWorkspaceDirectory: vi.fn(async () => ({ entries: [], revision: "directory-1" })),
     listWorkspaceFileIndex: vi.fn(async () => ({ paths: [], revision: "index-1", truncated: false })),
+    listWorkspaceChangeSets: vi.fn(async () => []),
+    previewWorkspaceRewind: vi.fn(async () => { throw new Error("No Workspace rewind fixture was configured."); }),
     searchWorkspace: vi.fn(async () => ({ matches: [], revision: "search-1", truncated: false, totalFiles: 0 })),
     watchWorkspace: vi.fn(async function* (_credential, _workspaceId, signal) {
       await new Promise<void>((resolve) => {
@@ -978,6 +985,7 @@ function fakeNetwork(): MobileNetwork {
       });
     }),
     readWorkspaceFile: vi.fn(async () => { throw new Error("No Workspace file fixture was configured."); }),
+    readWorkspaceHtmlSnapshot: vi.fn(async () => { throw new Error("No Workspace HTML snapshot fixture was configured."); }),
     materializeWorkspaceFileBlob: vi.fn(async () => { throw new Error("No Workspace Blob fixture was configured."); }),
     listSessionArtifacts: vi.fn(async () => ({ artifacts: [], revision: "artifacts-1" })),
     listRuntimeCommands: vi.fn(async () => []),
@@ -992,6 +1000,7 @@ function fakeNetwork(): MobileNetwork {
     })),
     listTargetWorktreeSources: vi.fn(async () => []),
     downloadBlob: vi.fn(async () => { throw new Error("No Blob fixture was configured."); }),
+    readImageThumbnail: vi.fn(async () => undefined),
     authorizeBlobDownload: vi.fn(async () => { throw new Error("No Blob authorization fixture was configured."); }),
     uploadBlob: vi.fn(async () => { throw new Error("No Blob upload fixture was configured."); }),
     getVoiceInputCapabilities: vi.fn(async () => { throw new Error("No Voice capability fixture was configured."); }),
@@ -1259,7 +1268,7 @@ function memoryDraftStores() {
   };
 }
 
-function localAttachmentDraft(text = ""): MobileComposerDraft {
+function localAttachmentDraft(text = "", imageBytes?: Uint8Array): MobileComposerDraft {
   return {
     ...plainTextMobileComposerDraft(text),
     attachments: [
@@ -1269,8 +1278,8 @@ function localAttachmentDraft(text = ""): MobileComposerDraft {
         kind: "image",
         fileName: "pixel.png",
         mediaType: "image/png",
-        byteSize: 4,
-        sha256Hex: "a".repeat(64),
+        byteSize: imageBytes?.byteLength ?? 4,
+        sha256Hex: (imageBytes ? "b" : "a").repeat(64),
         capturedAtUnixMs: 100
       },
       {
@@ -1308,10 +1317,10 @@ function annotatedLocalImageDraft(text = ""): MobileComposerDraft {
   };
 }
 
-function attachmentFileFixture(onRemove?: (attachmentId: string) => void) {
+function attachmentFileFixture(onRemove?: (attachmentId: string) => void, imageBytes?: Uint8Array) {
   const removed: string[] = [];
   const bytes = new Map<string, Uint8Array>([
-    ["image-one", new Uint8Array([1, 1, 1, 1])],
+    ["image-one", imageBytes ?? new Uint8Array([1, 1, 1, 1])],
     ["file-one", new Uint8Array([2, 2, 2, 2, 2, 2, 2])]
   ]);
   const driver: MobileAttachmentFileDriver = {
@@ -1439,6 +1448,7 @@ function fixedIds(...values: readonly string[]): () => string {
 }
 
 const renderedPngBytes = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+const editorSourcePngBytes = galleryPngBytes(1, 1);
 
 function previewMp4Bytes(handler: "soun" | "vide" = "vide"): Uint8Array {
   const bytes = new Uint8Array(48);
@@ -1511,6 +1521,12 @@ function galleryPngBytes(width: number, height: number): Uint8Array {
   return bytes;
 }
 
+const timelineFileSources = [
+  { kind: "message", project: (event: Event) => event },
+  { kind: "tool", project: (event: Event) => toolMediaEvent(event) },
+  { kind: "artifactProduced", project: producedArtifactEvent }
+] as const;
+
 function timelineGalleryEvent(bytes: Uint8Array): Event {
   const first = create(BlobRefSchema, {
     blobId: "timeline-image-one", fileName: "first.png", mediaType: "image/png",
@@ -1538,6 +1554,17 @@ function timelineGalleryEvent(bytes: Uint8Array): Event {
       ]
     } } }
   });
+}
+
+function timelineToolAppendEvents(bytes: Uint8Array): readonly Event[] {
+  const first = timelineGalleryEvent(bytes);
+  const second = timelineGalleryEvent(bytes);
+  if (first.payload?.kind.case !== "messageCompleted" || second.payload?.kind.case !== "messageCompleted") throw new Error("fixture");
+  first.payload.kind.value.blocks = first.payload.kind.value.blocks.slice(1, 2);
+  second.payload.kind.value.blocks = second.payload.kind.value.blocks.slice(2, 3);
+  second.eventId = "timeline-appended-image";
+  second.cursor!.sequence = 12n;
+  return [toolMediaEvent(first, "toolCallStarted"), toolMediaEvent(second, "toolCallUpdated", ToolCallOutputMode.APPEND)];
 }
 
 function timelinePreviewEvent(
@@ -4796,10 +4823,10 @@ describe("native current-task message and Queue actions", () => {
     const network = projectedNetwork(attachmentSnapshot);
     const drafts = memoryDraftStores();
     const identity = { profileId: credential.profileId, sessionId: "session" };
-    const original = localAttachmentDraft("Keep the caption");
+    const original = localAttachmentDraft("Keep the caption", editorSourcePngBytes);
     drafts.composer.save(identity, original);
     await drafts.composer.flush(identity);
-    const fixture = attachmentFileFixture();
+    const fixture = attachmentFileFixture(undefined, editorSourcePngBytes);
     const app = client(network, memoryStorage(credential).storage, undefined, undefined,
       fixedIds("image-source", "editor-one", "rendered-image", "editor-two", "restored-image"),
       undefined, drafts, fixture.files);
@@ -4808,7 +4835,7 @@ describe("native current-task message and Queue actions", () => {
     const editor = await app.openComposerImageEditor({ surface: "task", attachmentId: "image-one" });
     expect(editor).toMatchObject({
       previewUri: "file:///durable/mobile-profile/image-one",
-      sourceBase64: "AQEBAQ==",
+      sourceBase64: Buffer.from(editorSourcePngBytes).toString("base64"),
       sourceMediaType: "image/png",
       fileName: "pixel.png",
       initialStrokes: [],
@@ -4839,8 +4866,8 @@ describe("native current-task message and Queue actions", () => {
               storageId: "image-source",
               fileName: "pixel.png",
               mediaType: "image/png",
-              byteSize: 4,
-              sha256Hex: "a".repeat(64)
+              byteSize: editorSourcePngBytes.byteLength,
+              sha256Hex: "b".repeat(64)
             },
             strokes: [stroke]
           }
@@ -4849,7 +4876,7 @@ describe("native current-task message and Queue actions", () => {
       ]
     });
     expect(await drafts.composer.read(identity)).toEqual(committed.draft);
-    expect(fixture.bytes.get("image-source")).toEqual(new Uint8Array([1, 1, 1, 1]));
+    expect(fixture.bytes.get("image-source")).toEqual(editorSourcePngBytes);
     expect(fixture.bytes.get("rendered-image")).toEqual(renderedPngBytes);
     expect(fixture.removed).toEqual(["image-one"]);
     expect(network.submit).not.toHaveBeenCalled();
@@ -4866,14 +4893,14 @@ describe("native current-task message and Queue actions", () => {
         attachmentId: "restored-image",
         fileName: "pixel.png",
         mediaType: "image/png",
-        byteSize: 4,
-        sha256Hex: "a".repeat(64)
+        byteSize: editorSourcePngBytes.byteLength,
+        sha256Hex: "b".repeat(64)
       },
       original.attachments[1]
     ]);
     expect(restored.draft.attachments[0]?.annotation).toBeUndefined();
     expect(fixture.bytes.has("image-source")).toBe(false);
-    expect(fixture.bytes.get("restored-image")).toEqual(new Uint8Array([1, 1, 1, 1]));
+    expect(fixture.bytes.get("restored-image")).toEqual(editorSourcePngBytes);
     expect(fixture.removed).toEqual(["image-one", "rendered-image", "image-source"]);
   });
 
@@ -4926,10 +4953,10 @@ describe("native current-task message and Queue actions", () => {
     const network = projectedNetwork(attachmentSnapshot);
     const drafts = memoryDraftStores();
     const identity = { profileId: credential.profileId, sessionId: "session" };
-    const original = localAttachmentDraft("Keep one result");
+    const original = localAttachmentDraft("Keep one result", editorSourcePngBytes);
     drafts.composer.save(identity, original);
     await drafts.composer.flush(identity);
-    const fixture = attachmentFileFixture();
+    const fixture = attachmentFileFixture(undefined, editorSourcePngBytes);
     const originalStageBytes = vi.mocked(fixture.driver.stageBytes).getMockImplementation()!;
     let releaseSource!: () => void;
     const sourceGate = new Promise<void>((resolve) => { releaseSource = resolve; });
@@ -4963,10 +4990,10 @@ describe("native current-task message and Queue actions", () => {
     const network = projectedNetwork(attachmentSnapshot);
     const drafts = memoryDraftStores();
     const identity = { profileId: credential.profileId, sessionId: "session" };
-    const original = localAttachmentDraft("Retry the render");
+    const original = localAttachmentDraft("Retry the render", editorSourcePngBytes);
     drafts.composer.save(identity, original);
     await drafts.composer.flush(identity);
-    const fixture = attachmentFileFixture();
+    const fixture = attachmentFileFixture(undefined, editorSourcePngBytes);
     const app = client(network, memoryStorage(credential).storage, undefined, undefined,
       fixedIds("retry-source", "retry-editor", "retry-output"), undefined, drafts, fixture.files);
     await app.start();
@@ -4989,10 +5016,10 @@ describe("native current-task message and Queue actions", () => {
     const network = projectedNetwork(attachmentSnapshot);
     const drafts = memoryDraftStores();
     const identity = { profileId: credential.profileId, sessionId: "session" };
-    const original = localAttachmentDraft("Keep after storage failure");
+    const original = localAttachmentDraft("Keep after storage failure", editorSourcePngBytes);
     drafts.composer.save(identity, original);
     await drafts.composer.flush(identity);
-    const fixture = attachmentFileFixture();
+    const fixture = attachmentFileFixture(undefined, editorSourcePngBytes);
     const app = client(network, memoryStorage(credential).storage, undefined, undefined,
       fixedIds("failed-source", "failed-editor", "failed-output"), undefined, drafts, fixture.files);
     await app.start();
@@ -5014,10 +5041,10 @@ describe("native current-task message and Queue actions", () => {
     const network = projectedNetwork(attachmentSnapshot);
     const drafts = memoryDraftStores();
     const identity = { profileId: credential.profileId, sessionId: "session" };
-    const original = localAttachmentDraft("Original");
+    const original = localAttachmentDraft("Original", editorSourcePngBytes);
     drafts.composer.save(identity, original);
     await drafts.composer.flush(identity);
-    const fixture = attachmentFileFixture();
+    const fixture = attachmentFileFixture(undefined, editorSourcePngBytes);
     const app = client(network, memoryStorage(credential).storage, undefined, undefined,
       fixedIds("stale-source", "stale-editor", "must-not-stage"), undefined, drafts, fixture.files);
     await app.start();
@@ -5044,10 +5071,10 @@ describe("native current-task message and Queue actions", () => {
     const network = projectedNetwork(attachmentSnapshot);
     const drafts = memoryDraftStores();
     const identity = { profileId: credential.profileId };
-    const original = localAttachmentDraft("First input");
+    const original = localAttachmentDraft("First input", editorSourcePngBytes);
     drafts.newTask.save(identity, { targetId: "target", name: "Annotated task", input: original });
     await drafts.newTask.flush(identity);
-    const fixture = attachmentFileFixture();
+    const fixture = attachmentFileFixture(undefined, editorSourcePngBytes);
     const app = client(network, memoryStorage(credential).storage, undefined, undefined,
       fixedIds("new-source", "new-editor", "new-rendered"), undefined, drafts, fixture.files);
     await app.start();
@@ -5082,7 +5109,7 @@ describe("native current-task message and Queue actions", () => {
   it("authenticates an uploaded image into an editor lease and retires the lease on backgrounding", async () => {
     const network = projectedNetwork(attachmentSnapshot);
     vi.mocked(network.downloadBlob).mockResolvedValue({
-      bytes: new Uint8Array([1, 1, 1, 1]),
+      bytes: editorSourcePngBytes,
       mediaType: "image/png"
     });
     const drafts = memoryDraftStores();
@@ -5096,8 +5123,8 @@ describe("native current-task message and Queue actions", () => {
         kind: "image",
         fileName: "pixel.png",
         mediaType: "image/png",
-        byteSize: 4,
-        sha256Hex: "a".repeat(64),
+        byteSize: editorSourcePngBytes.byteLength,
+        sha256Hex: "b".repeat(64),
         capturedAtUnixMs: 100
       }]
     };
@@ -5108,7 +5135,7 @@ describe("native current-task message and Queue actions", () => {
     await app.start();
 
     const editor = await app.openComposerImageEditor({ surface: "task", attachmentId: "uploaded-image" });
-    expect(editor.previewUri).toBe("data:image/png;base64,AQEBAQ==");
+    expect(editor.previewUri).toBe("data:image/png;base64," + Buffer.from(editorSourcePngBytes).toString("base64"));
     expect(network.downloadBlob).toHaveBeenCalledWith(credential, expect.objectContaining({
       blobId: "blob-uploaded-image",
       disposition: BlobDisposition.ATTACHMENT
@@ -7031,6 +7058,557 @@ describe("native composer task-link resolution", () => {
   });
 });
 
+describe("native current-task cloning", () => {
+  function fixture() {
+    const state = {
+      session: runtimeSession,
+      backend: create(BackendDescriptorSchema, { ...runtimeBackend, capabilities: create(CapabilityManifestSchema, {
+        ...runtimeBackend.capabilities!, capabilities: [...runtimeBackend.capabilities!.capabilities,
+          create(CapabilitySchema, { name: capabilityNames.sessionClone, support: CapabilitySupport.SUPPORTED })]
+      }) }),
+      reviews: [] as Snapshot["reviewRuns"],
+      derived: undefined as Snapshot["sessions"][number] | undefined
+    };
+    const network = fakeNetwork();
+    const projection = (detail: boolean) => create(SnapshotSchema, { ...runtimeControlProjection(state.session, detail),
+      backends: [state.backend], reviewRuns: state.reviews,
+      ...(!detail && state.derived ? { sessions: [state.session, state.derived] } : {}) });
+    network.readOwner = vi.fn(async () => ({ connection, device, snapshot: projection(false) }));
+    network.readSession = vi.fn(async () => projection(true));
+    const child = () => create(SessionSchema, { ...runtimeSession, sessionId: "cloned-task",
+      nativeBinding: create(NativeSessionBindingSchema, { ...runtimeSession.nativeBinding!, backendId: "backend", opaqueReference: "cloned-native" }),
+      derivationOrigin: create(SessionDerivationOriginSchema, { kind: SessionDerivationKind.CLONE, sourceSessionId: "session" }) });
+    const operation = (operationId: string, derived = child()) => create(OperationSchema, {
+      operationId, connectionId: credential.connectionId, state: OperationState.SUCCEEDED,
+      result: { payload: { case: "session", value: derived } }
+    });
+    return { state, network, child, operation };
+  }
+
+  it("clones an active task through a preconditioned typed operation after saving a body-free receipt", async () => {
+    const f = fixture();
+    f.state.session = create(SessionSchema, { ...runtimeSession, state: SessionState.RUNNING });
+    const saved = memoryStorage(credential);
+    vi.mocked(f.network.submit).mockImplementation(async (_credential, operationId, mutation) => {
+      expect(saved.pending()).toEqual([{ operationId, connectionId: credential.connectionId,
+        kind: "session-clone", sessionId: "session", state: "unknown" }]);
+      expect(mutation).toMatchObject({ preconditions: [{ entity: { kind: EntityKind.SESSION, id: "session" },
+        expectedGeneration: 8n, expectedRevision: { value: 9n } }],
+      payload: { case: "cloneSession", value: { sourceSessionId: "session", newDisplayName: "My copy" } } });
+      f.state.derived = f.child();
+      return f.operation(operationId);
+    });
+    const app = client(f.network, saved.storage, undefined, undefined, () => "clone-operation");
+    await app.start();
+    expect(app.taskCloneControls()?.canClone).toBe(true);
+    await expect(app.cloneTask(app.taskCloneControls()!.authorityKey, " My copy "))
+      .resolves.toEqual({ kind: "cloned", sessionId: "cloned-task" });
+    expect(saved.pending()).toEqual([]);
+    expect(app.state.selectedId).toBe("session");
+    expect(app.state.owner?.sessions.map((session) => session.sessionId)).toEqual(["session", "cloned-task"]);
+  });
+
+  it("blocks unsupported, duplicate capability, read-only, worktree and stale confirmation owners before dispatch", async () => {
+    const f = fixture();
+    const app = client(f.network, memoryStorage(credential).storage);
+    await app.start();
+    const key = app.taskCloneControls()!.authorityKey;
+    f.state.backend.capabilities!.capabilities.push(create(CapabilitySchema, { name: capabilityNames.sessionClone, support: CapabilitySupport.SUPPORTED }));
+    await app.refresh();
+    expect(app.taskCloneControls()?.canClone).toBe(false);
+    await expect(app.cloneTask(key, "Copy")).rejects.toThrow(/owner changed/u);
+    f.state.backend.capabilities!.capabilities.pop();
+    f.state.session = create(SessionSchema, { ...runtimeSession, worktree: create(SessionWorktreeSchema, { leaseId: "lease", workspaceId: "owned" }) });
+    await app.refresh();
+    expect(app.taskCloneControls()?.canClone).toBe(false);
+    f.state.session = runtimeSession;
+    f.state.reviews = [create(ReviewRunSchema, { reviewerSessionId: "session" })];
+    await app.refresh();
+    expect(app.taskCloneControls()?.canClone).toBe(false);
+    f.state.reviews = [];
+    f.state.backend.capabilities!.capabilities = f.state.backend.capabilities!.capabilities.filter((capability) => capability.name !== capabilityNames.sessionClone);
+    await app.refresh();
+    expect(app.taskCloneControls()?.canClone).toBe(false);
+    expect(f.network.submit).not.toHaveBeenCalled();
+  });
+
+  it("retains unknown cloning across reconciliation and never dispatches a duplicate", async () => {
+    const f = fixture();
+    const saved = memoryStorage(credential);
+    vi.mocked(f.network.submit).mockRejectedValue(new Error("response lost"));
+    const app = client(f.network, saved.storage, undefined, undefined, () => "unknown-clone");
+    await app.start();
+    const key = app.taskCloneControls()!.authorityKey;
+    await expect(app.cloneTask(key, "Copy")).resolves.toEqual({ kind: "unknown" });
+    expect(saved.pending()).toMatchObject([{ kind: "session-clone", state: "unknown" }]);
+    expect(app.taskCloneControls()?.canClone).toBe(false);
+    await expect(app.cloneTask(key, "Again")).rejects.toThrow(/owner changed/u);
+    vi.mocked(f.network.getOperation).mockResolvedValue(f.operation("unknown-clone"));
+    await app.reconcile();
+    expect(saved.pending()).toEqual([]);
+    expect(f.network.submit).toHaveBeenCalledTimes(1);
+  });
+
+  it("refuses a foreign terminal Session and ignores a late result after background retirement", async () => {
+    const f = fixture();
+    const app = client(f.network, memoryStorage(credential).storage, undefined, undefined, fixedIds("bad-clone", "late-clone"));
+    await app.start();
+    const foreign = f.child();
+    foreign.derivationOrigin!.sourceSessionId = "foreign";
+    vi.mocked(f.network.submit).mockResolvedValueOnce(f.operation("bad-clone", foreign));
+    await expect(app.cloneTask(app.taskCloneControls()!.authorityKey, "Copy")).rejects.toThrow(/derived Session identity/u);
+    let finish!: (operation: Operation) => void;
+    vi.mocked(f.network.submit).mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+    const pending = app.cloneTask(app.taskCloneControls()!.authorityKey, "Late copy");
+    await vi.waitFor(() => expect(f.network.submit).toHaveBeenCalledTimes(2));
+    app.setForeground(false);
+    finish(f.operation("late-clone"));
+    await expect(pending).resolves.toEqual({ kind: "retired" });
+    expect(app.state.selectedId).toBe("session");
+  });
+});
+
+describe("native derivation origin navigation", () => {
+  function fixture() {
+    const state = {
+      child: create(SessionSchema, { ...runtimeSession, nativeBinding: create(NativeSessionBindingSchema, {
+        backendId: "backend", opaqueReference: "child-native", runtimeGeneration: 8n }),
+        derivationOrigin: create(SessionDerivationOriginSchema, { kind: SessionDerivationKind.FORK, sourceSessionId: "source", sourceMessageId: "origin-message",
+          sourceEventId: "origin-event", sourceSessionAvailable: true, sourceMessageAvailable: true }) }),
+      source: create(SessionSchema, { ...runtimeSession, sessionId: "source", nativeBinding: create(NativeSessionBindingSchema, {
+        backendId: "backend", opaqueReference: "source-native", runtimeGeneration: 21n }) })
+    };
+    const network = fakeNetwork();
+    const owner = () => clone(SnapshotSchema, create(SnapshotSchema, { ...runtimeControlProjection(state.child), sessions: [state.child, state.source] }));
+    const detail = (id: string) => clone(SnapshotSchema, create(SnapshotSchema, { ...runtimeControlProjection(state.child, true),
+      scope: create(SnapshotScopeSchema, { kind: { case: "session", value: { sessionId: id } } }),
+      sessions: [id === "session" ? state.child : state.source] }));
+    const event = create(EventSchema, { eventId: "origin-event", identity: { sessionId: "source" },
+      cursor: { opaqueToken: "origin-cursor", generation: 1n, sequence: 20n },
+      payload: { kind: { case: "messageCompleted", value: { messageId: "origin-message", role: MessageRole.ASSISTANT } } } });
+    network.readOwner = vi.fn(async () => ({ connection, device, snapshot: owner() }));
+    network.readSession = vi.fn(async (_credential, id) => detail(id));
+    network.readAround = vi.fn(async () => [event]);
+    return { state, network, event, owner, detail };
+  }
+
+  it("reauthorizes a fork message or clone source with current generated reads and an exact profile handoff without changing drafts or dispatching", async () => {
+    const f = fixture(); const saved = memoryStorage(credential); const drafts = memoryDraftStores();
+    const input = plainTextMobileComposerDraft("retained source draft");
+    await drafts.composer.save({ profileId: credential.profileId, sessionId: "source" }, input);
+    const app = client(f.network, saved.storage, undefined, undefined, undefined, undefined, drafts);
+    await app.start();
+    expect(app.state).toMatchObject({ status: "connected", selectedId: "session" });
+    const saveCalls = vi.mocked(saved.storage.saveSelection).mock.calls.length;
+    expect(app.taskDerivationOriginControls()?.canOpen).toBe(true);
+    const url = await app.prepareTaskDerivationOrigin(app.taskDerivationOriginControls()!.authorityKey!);
+    expect(parseMobileNativeIntent(url)).toEqual({ kind: "session", profileId: credential.profileId,
+      sessionId: "source", messageId: "origin-message", messageEventId: "origin-event" });
+    expect(f.network.readAround).toHaveBeenCalledExactlyOnceWith(credential, "source", "origin-event", expect.any(AbortSignal));
+    expect(app.state.selectedId).toBe("session"); expect(saved.pending()).toEqual([]);
+    expect(saved.storage.saveSelection).toHaveBeenCalledTimes(saveCalls);
+    expect(await drafts.composer.read({ profileId: credential.profileId, sessionId: "source" })).toEqual(input);
+    expect(f.network.submit).not.toHaveBeenCalled();
+    const accepted = create(EventSchema, { eventId: f.event.eventId, identity: f.event.identity, cursor: f.event.cursor,
+      payload: { kind: { case: "messageStarted", value: { messageId: "origin-message", role: MessageRole.USER,
+        userInputAccepted: true, nativeIdentity: { entryId: "user-entry" } } } } });
+    const completed = create(EventSchema, { eventId: "completed-origin", identity: f.event.identity,
+      cursor: { opaqueToken: "completed-cursor", generation: 1n, sequence: 21n },
+      payload: { kind: { case: "messageCompleted", value: { messageId: "origin-message", role: MessageRole.USER,
+        nativeIdentity: { entryId: "user-entry" } } } } });
+    vi.mocked(f.network.readAround).mockResolvedValueOnce([accepted, completed]);
+    expect(parseMobileNativeIntent(await app.prepareTaskDerivationOrigin(app.taskDerivationOriginControls()!.authorityKey!)))
+      .toMatchObject({ messageId: "origin-message", messageEventId: "completed-origin" });
+    const conflicting = clone(EventSchema, completed);
+    if (conflicting.payload?.kind.case === "messageCompleted") conflicting.payload.kind.value.nativeIdentity!.entryId = "different-user";
+    vi.mocked(f.network.readAround).mockResolvedValueOnce([accepted, conflicting]);
+    expect(await app.prepareTaskDerivationOrigin(app.taskDerivationOriginControls()!.authorityKey!)).toBeUndefined();
+    f.state.child.derivationOrigin = create(SessionDerivationOriginSchema, { kind: SessionDerivationKind.CLONE,
+      sourceSessionId: "source", sourceSessionAvailable: true });
+    await app.refresh(); vi.mocked(f.network.readAround).mockClear();
+    const cloneUrl = await app.prepareTaskDerivationOrigin(app.taskDerivationOriginControls()!.authorityKey!);
+    expect(parseMobileNativeIntent(cloneUrl)).toEqual({ kind: "session", profileId: credential.profileId, sessionId: "source" });
+    expect(f.network.readAround).not.toHaveBeenCalled();
+  });
+
+  it("refuses missing, ambiguous or wrong message Events and service availability revoked during authenticated around", async () => {
+    const f = fixture(); const app = client(f.network, memoryStorage(credential).storage);
+    await app.start(); const key = app.taskDerivationOriginControls()!.authorityKey!;
+    const foreign = clone(EventSchema, f.event); foreign.identity!.sessionId = "foreign";
+    const wrong = clone(EventSchema, f.event);
+    if (wrong.payload?.kind.case === "messageCompleted") wrong.payload.kind.value.messageId = "wrong";
+    const unaccepted = create(EventSchema, { eventId: f.event.eventId, identity: f.event.identity, cursor: f.event.cursor,
+      payload: { kind: { case: "messageStarted", value: { messageId: "origin-message", role: MessageRole.USER } } } });
+    for (const events of [[], [f.event, f.event], [foreign], [wrong], [unaccepted]]) {
+      vi.mocked(f.network.readAround).mockResolvedValueOnce(events);
+      try { expect(await app.prepareTaskDerivationOrigin(key)).toBeUndefined(); }
+      catch (error) { expect(String(error)).toMatch(/mismatched or cyclic/u); }
+    }
+    vi.mocked(f.network.readAround).mockImplementationOnce(async () => {
+      f.state.child.derivationOrigin!.sourceMessageAvailable = false; return [f.event];
+    });
+    expect(await app.prepareTaskDerivationOrigin(key)).toBeUndefined();
+    expect(app.state.selectedId).toBe("session"); expect(f.network.submit).not.toHaveBeenCalled();
+  });
+
+  it("rejects foreign owner and native generation drift instead of trusting saved lineage identity", async () => {
+    const f = fixture(); const app = client(f.network, memoryStorage(credential).storage);
+    await app.start(); const key = app.taskDerivationOriginControls()!.authorityKey!;
+    vi.mocked(f.network.readOwner).mockResolvedValueOnce({ connection, device,
+      snapshot: create(SnapshotSchema, { ...f.owner(), server: { ...f.owner().server!, serverId: "foreign-node" } }) });
+    await expect(app.prepareTaskDerivationOrigin(key)).rejects.toThrow(/node identity/u);
+    vi.mocked(f.network.readSession).mockResolvedValueOnce(create(SnapshotSchema, { ...f.detail("session"),
+      scope: create(SnapshotScopeSchema, { kind: { case: "session", value: { sessionId: "foreign-session" } } }) }));
+    expect(await app.prepareTaskDerivationOrigin(key)).toBeUndefined();
+    vi.mocked(f.network.readSession).mockImplementationOnce(async () => create(SnapshotSchema, {
+      ...f.detail("session"), sessions: [create(SessionSchema, { ...f.state.child,
+        nativeBinding: { ...f.state.child.nativeBinding!, runtimeGeneration: 9n } })] }));
+    expect(await app.prepareTaskDerivationOrigin(key)).toBeUndefined();
+    vi.mocked(f.network.readSession).mockImplementationOnce(async () => f.detail("session"));
+    vi.mocked(f.network.readSession).mockImplementationOnce(async () => create(SnapshotSchema, {
+      ...f.detail("source"), sessions: [create(SessionSchema, { ...f.state.source, archived: true })] }));
+    expect(await app.prepareTaskDerivationOrigin(key)).toBeUndefined();
+    app.setForeground(false);
+    expect(app.taskDerivationOriginControls()).toMatchObject({ kind: "fork", canOpen: false });
+    expect(f.network.submit).not.toHaveBeenCalled();
+  });
+
+  it("retires a pending origin read on cancellation, background or later task selection", async () => {
+    const f = fixture(); const app = client(f.network, memoryStorage(credential).storage);
+    await app.start(); const key = app.taskDerivationOriginControls()!.authorityKey!;
+    let finish!: (events: Event[]) => void;
+    vi.mocked(f.network.readAround).mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+    const signal = new AbortController(); const pending = app.prepareTaskDerivationOrigin(key, signal.signal);
+    await vi.waitFor(() => expect(f.network.readAround).toHaveBeenCalledOnce());
+    signal.abort(); finish([f.event]); expect(await pending).toBeUndefined();
+    vi.mocked(f.network.readAround).mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+    const background = app.prepareTaskDerivationOrigin(key);
+    await vi.waitFor(() => expect(f.network.readAround).toHaveBeenCalledTimes(2));
+    app.setForeground(false); finish([f.event]); expect(await background).toBeUndefined();
+    app.setForeground(true); await app.refresh();
+    vi.mocked(f.network.readAround).mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+    const later = app.prepareTaskDerivationOrigin(app.taskDerivationOriginControls()!.authorityKey!);
+    await vi.waitFor(() => expect(f.network.readAround).toHaveBeenCalledTimes(3));
+    await app.select("source"); finish([f.event]); expect(await later).toBeUndefined();
+    expect(app.state.selectedId).toBe("source"); expect(f.network.submit).not.toHaveBeenCalled();
+  });
+});
+
+describe("native message rewinds", () => {
+  function fixture(boundary = true) {
+    let input = insertMobileSessionMention(plainTextMobileComposerDraft("Discuss "), { start: 8, end: 8 },
+      { sessionId: "related", displayText: "Related" }, "rewind-mention").draft;
+    input = insertMobilePastedText(input, { start: input.text.length, end: input.text.length }, "😀 evidence\n".repeat(30), "rewind-paste").draft;
+    const nativeIdentity = { entryId: "user-entry", parentEntryId: "parent-is-not-boundary",
+      ...(boundary ? { rewindBefore: { kind: { case: "nativeEntryId" as const, value: "public-boundary" } } } : {}) };
+    const started = create(EventSchema, { eventId: "rewind-start", identity: { sessionId: "session", runId: "round-run" },
+      cursor: { generation: 1n, sequence: 20n }, payload: { kind: { case: "messageStarted", value: {
+        messageId: "rewind-message", role: MessageRole.USER, userInputAccepted: true, nativeIdentity, userInput: mobileComposerInput(input)
+      } } } });
+    const completed = create(EventSchema, { eventId: "rewind-complete", identity: { sessionId: "session", runId: "round-run" },
+      cursor: { generation: 1n, sequence: 21n }, payload: { kind: { case: "messageCompleted", value: {
+        messageId: "rewind-message", role: MessageRole.USER, nativeIdentity, blocks: [{ content: { case: "text", value: "Compact display" } }]
+      } } } });
+    const state = { source: create(SessionSchema, { ...runtimeSession, state: SessionState.IDLE,
+      nativeBinding: create(NativeSessionBindingSchema, { backendId: "backend", opaqueReference: "native-task", runtimeGeneration: 8n }) }),
+      events: [started, completed] };
+    const backend = create(BackendDescriptorSchema, { ...runtimeBackend, capabilities: create(CapabilityManifestSchema, {
+      ...runtimeBackend.capabilities!, capabilities: [...runtimeBackend.capabilities!.capabilities,
+        create(CapabilitySchema, { name: "workspace.rewind", support: CapabilitySupport.SUPPORTED })]
+    }) });
+    const workspace = create(WorkspaceDescriptorSchema, { workspaceId: "rewind-workspace", targetId: "target", serverPathDisplay: "D:\\project",
+      location: { kind: { case: "serviceNode", value: {} } }, version: { revision: { value: 3n }, generation: 1n } });
+    const target = create(TargetSchema, { ...snapshot.targets[0]!, workspaceId: workspace.workspaceId });
+    const projection = (detail: boolean) => create(SnapshotSchema, { ...runtimeControlProjection(state.source, detail),
+      backends: [backend], targets: [target], workspaces: [workspace], ...(detail ? { timeline: state.events } : {}) });
+    const network = fakeNetwork(); network.readOwner = vi.fn(async () => ({ connection, device, snapshot: projection(false) }));
+    network.readSession = vi.fn(async () => projection(true));
+    network.listWorkspaceChangeSets = vi.fn(async () => [create(WorkspaceChangeSetSchema, { workspaceId: workspace.workspaceId,
+      sessionId: "session", changeSetId: "checkpoint", runId: "round-run", capturedAt: { seconds: 1n } })]);
+    const files = create(WorkspaceRewindPreviewSchema, { previewId: "preview", workspaceId: workspace.workspaceId, changeSetId: "checkpoint",
+      safety: RewindSafety.SAFE, expiresAt: { seconds: 100n }, inverseChanges: [{ relativePath: "src/main.ts", kind: FileChangeKind.UPDATED }] });
+    network.previewWorkspaceRewind = vi.fn(async () => files);
+    const operation = (operationId: string, mode: "dialogue" | "files" = "dialogue") => create(OperationSchema, {
+      operationId, connectionId: credential.connectionId, state: OperationState.SUCCEEDED, result: { payload: mode === "dialogue"
+        ? { case: "acknowledgement", value: create(AcknowledgementSchema, { accepted: true }) }
+        : { case: "workspaceRewind", value: create(WorkspaceRewindResultSchema, { workspaceId: workspace.workspaceId,
+          changeSetId: "checkpoint", restoredPaths: ["src/main.ts"], filesRewound: true, dialogueRewound: false }) } }
+    });
+    const advance = () => {
+      state.source = create(SessionSchema, { ...state.source,
+        nativeBinding: create(NativeSessionBindingSchema, { ...state.source.nativeBinding!, runtimeGeneration: 9n }),
+        version: create(EntityVersionSchema, { revision: { value: 10n }, generation: 9n }) }); state.events = [];
+    };
+    return { state, backend, workspace, files, network, operation, advance, input };
+  }
+  async function preview(app: MobileClient) {
+    const controls = app.taskMessageRewindControls("rewind-complete")!;
+    return (await app.loadTaskMessageRewindPreview(controls.authorityKey, "rewind-complete", new AbortController().signal))!;
+  }
+
+  it("persists approved input and body-free receipt before native dialogue rewind, then merges the draft before receipt clearance and refreshes new history", async () => {
+    const f = fixture(); const saved = memoryStorage(credential); const drafts = memoryDraftStores();
+    const identity = { profileId: credential.profileId, sessionId: "session" };
+    drafts.composer.save(identity, plainTextMobileComposerDraft("Keep newer input")); await drafts.composer.flush(identity);
+    vi.mocked(f.network.submit).mockImplementationOnce(async (_credential, operationId, mutation) => {
+      expect(saved.pending()).toEqual([{ kind: "session-rewind", operationId, connectionId: credential.connectionId,
+        sessionId: "session", eventId: "rewind-complete", backendId: "backend", targetId: "target", sourceGeneration: "8", state: "unknown" }]);
+      expect(await drafts.composer.readOperationInput(identity, operationId)).toMatchObject({ mentions: [{ sessionId: "related" }] });
+      expect(mutation).toMatchObject({ preconditions: [{ expectedGeneration: 8n, expectedRevision: { value: 9n } }],
+        payload: { case: "navigateSessionBranch", value: { sessionId: "session", target: { kind: { case: "nativeEntryId", value: "public-boundary" } }, summarize: false, customInstructions: "" } } });
+      f.advance(); return f.operation(operationId);
+    });
+    const save = saved.storage.savePending;
+    saved.storage.savePending = vi.fn(async (items) => {
+      if (!items.length) expect(await drafts.composer.readDurable(identity)).toMatchObject({ mentions: [{ sessionId: "related" }], atoms: [{ kind: "pasted-text" }] });
+      await save(items);
+    });
+    const app = client(f.network, saved.storage, undefined, undefined, undefined, undefined, drafts); await app.start();
+    await expect(app.commitTaskMessageRewind(await preview(app), "dialogue", new AbortController().signal))
+      .resolves.toEqual({ kind: "rewound", mode: "dialogue" });
+    expect((await drafts.composer.readDurable(identity))?.text).toContain("Keep newer input");
+    expect(saved.pending()).toEqual([]); expect(app.state.detail!.sessions[0]!.nativeBinding!.runtimeGeneration).toBe(9n);
+    expect(timelineRows(app.state.detail!.timeline)).toEqual([]); expect(app.state.restoredComposerDraft).toMatchObject(identity);
+    await expect(drafts.composer.readOperationInput(identity, "operation-1")).resolves.toBeNull();
+    expect(f.network.readAround).not.toHaveBeenCalled(); expect(f.network.submit).toHaveBeenCalledOnce();
+  });
+
+  it("restores files independently at the exact Workspace/Run checkpoint when the backend lacks the message dialogue boundary", async () => {
+    const f = fixture(false); const saved = memoryStorage(credential); const drafts = memoryDraftStores();
+    f.workspace.workspaceId = "owned-workspace";
+    f.state.source.worktree = create(SessionWorktreeSchema, { workspaceId: "owned-workspace", leaseId: "owned-lease" });
+    const identity = { profileId: credential.profileId, sessionId: "session" }; drafts.composer.save(identity, plainTextMobileComposerDraft("Keep draft"));
+    vi.mocked(f.network.submit).mockImplementationOnce(async (_credential, operationId, mutation) => {
+      expect(mutation).toMatchObject({ preconditions: [{ expectedGeneration: 8n, expectedRevision: { value: 9n } }],
+        payload: { case: "executeWorkspaceRewind", value: { workspaceId: "owned-workspace", previewId: "preview", changeSetId: "checkpoint",
+          confirmFileRestore: true, allowDialogueOnly: false } } });
+      expect(saved.pending()).toMatchObject([{ kind: "workspace-rewind", workspaceId: "owned-workspace", changeSetId: "checkpoint" }]);
+      return f.operation(operationId, "files");
+    });
+    f.files.workspaceId = "owned-workspace";
+    const app = client(f.network, saved.storage, undefined, undefined, undefined, undefined, drafts); await app.start();
+    expect(app.taskMessageRewindControls("rewind-complete")).toMatchObject({ canDialogue: false, canFiles: true });
+    const value = await preview(app);
+    await expect(app.commitTaskMessageRewind(value, "dialogue", new AbortController().signal)).rejects.toThrow(/preview changed/u);
+    await expect(app.commitTaskMessageRewind(value, "files", new AbortController().signal)).resolves.toEqual({ kind: "rewound", mode: "files" });
+    expect(f.network.listWorkspaceChangeSets).toHaveBeenCalledWith(credential, "owned-workspace", "session", expect.any(AbortSignal));
+    expect(f.network.previewWorkspaceRewind).toHaveBeenCalledWith(credential, "owned-workspace", "checkpoint", expect.any(AbortSignal));
+    expect(drafts.composer.readSync(identity)?.text).toBe("Keep draft"); expect(saved.pending()).toEqual([]);
+  });
+
+  it("reconciles a lost response after restart from private retained input when the original Event is gone, without resending", async () => {
+    const f = fixture(); const saved = memoryStorage(credential); const drafts = memoryDraftStores();
+    vi.mocked(f.network.submit).mockRejectedValueOnce(new Error("response lost"));
+    const app = client(f.network, saved.storage, undefined, undefined, undefined, undefined, drafts); await app.start();
+    await expect(app.commitTaskMessageRewind(await preview(app), "dialogue", new AbortController().signal)).resolves.toEqual({ kind: "unknown" });
+    expect(app.taskMessageRewindControls("rewind-complete")?.canRewind).toBe(false); app.dispose(); f.advance();
+    vi.mocked(f.network.getOperation).mockResolvedValue(f.operation("operation-1"));
+    const driver: MobilePlainStorageDriver = { async getItem(key) { return drafts.values.get(key) ?? null; },
+      async setItem(key, value) { drafts.values.set(key, value); }, async removeItem(key) { drafts.values.delete(key); } };
+    const restartedDrafts = { values: drafts.values, composer: new MobileComposerDraftStore(driver), newTask: new MobileNewTaskDraftStore(driver) };
+    const restarted = client(f.network, saved.storage, undefined, undefined, undefined, undefined, restartedDrafts); await restarted.start();
+    const restored = await restartedDrafts.composer.readDurable({ profileId: credential.profileId, sessionId: "session" });
+    expect(mobileComposerInput(restored!)).toEqual(mobileComposerInput(f.input)); expect(restored!.attachments).toEqual([]);
+    expect(saved.pending()).toEqual([]); expect(f.network.submit).toHaveBeenCalledOnce(); expect(f.network.readAround).not.toHaveBeenCalled();
+  });
+
+  it("keeps a known native effect pending during a draft CAS conflict, preserves newer input, and recovers through its original operation", async () => {
+    const f = fixture(); const saved = memoryStorage(credential); const drafts = memoryDraftStores();
+    vi.mocked(f.network.submit).mockImplementationOnce(async (_credential, operationId) => { f.advance(); return f.operation(operationId); });
+    const save = drafts.composer.saveIfRevision.bind(drafts.composer);
+    vi.spyOn(drafts.composer, "saveIfRevision").mockImplementationOnce((identity, draft, revision) => {
+      drafts.composer.save(identity, plainTextMobileComposerDraft("Newer edit")); return save(identity, draft, revision);
+    });
+    const app = client(f.network, saved.storage, undefined, undefined, undefined, undefined, drafts); await app.start();
+    await expect(app.commitTaskMessageRewind(await preview(app), "dialogue", new AbortController().signal)).resolves.toEqual({ kind: "unknown" });
+    expect(drafts.composer.readSync({ profileId: credential.profileId, sessionId: "session" })?.text).toBe("Newer edit");
+    expect(saved.pending()).toMatchObject([{ kind: "session-rewind", state: "unknown" }]);
+    vi.mocked(f.network.getOperation).mockResolvedValueOnce(f.operation("operation-1")); await app.reconcile();
+    expect(saved.pending()).toEqual([]); expect(app.state.restoredComposerDraft).toMatchObject({ sessionId: "session" });
+    expect(drafts.composer.readSync({ profileId: credential.profileId, sessionId: "session" })?.text).toContain("Newer edit");
+    expect(f.network.submit).toHaveBeenCalledOnce();
+  });
+
+  it("retains receipt and input for malformed terminal outcomes or a foreign adopted native binding, then recovers the exact task", async () => {
+    const f = fixture(); const saved = memoryStorage(credential); const drafts = memoryDraftStores();
+    vi.mocked(f.network.submit).mockImplementationOnce(async (_credential, operationId) => {
+      f.advance(); const operation = f.operation(operationId);
+      if (operation.result?.payload.case === "acknowledgement") operation.result.payload.value.accepted = false;
+      return operation;
+    });
+    const app = client(f.network, saved.storage, undefined, undefined, undefined, undefined, drafts); await app.start();
+    await expect(app.commitTaskMessageRewind(await preview(app), "dialogue", new AbortController().signal)).resolves.toEqual({ kind: "unknown" });
+    vi.mocked(f.network.getOperation).mockResolvedValue(f.operation("operation-1"));
+    f.state.source.nativeBinding!.backendId = "foreign-backend"; await app.reconcile();
+    expect(saved.pending()).toMatchObject([{ kind: "session-rewind" }]);
+    expect(drafts.composer.readSync({ profileId: credential.profileId, sessionId: "session" })).toBeNull();
+    f.state.source.nativeBinding!.backendId = "backend"; await app.reconcile();
+    expect(saved.pending()).toEqual([]); expect(f.network.submit).toHaveBeenCalledOnce();
+  });
+
+  it("rejects blocked, expired and stale confirmations, and retires a late terminal response after background without restoring input", async () => {
+    const f = fixture(); const saved = memoryStorage(credential); const drafts = memoryDraftStores();
+    const app = client(f.network, saved.storage, undefined, undefined, undefined, undefined, drafts); await app.start();
+    let value = await preview(app);
+    f.files.safety = RewindSafety.BLOCKED;
+    await expect(app.commitTaskMessageRewind(value, "files", new AbortController().signal)).rejects.toThrow(/blocked or expired/u);
+    f.files.safety = RewindSafety.SAFE; f.files.expiresAt!.seconds = 1n;
+    await expect(app.commitTaskMessageRewind(value, "files", new AbortController().signal)).rejects.toThrow(/blocked or expired/u);
+    f.files.expiresAt!.seconds = 100n;
+    const controller = new AbortController(); controller.abort();
+    await expect(app.commitTaskMessageRewind(value, "dialogue", controller.signal)).rejects.toThrow(/preview changed/u);
+    expect(f.network.submit).not.toHaveBeenCalled();
+    f.state.source = create(SessionSchema, { ...f.state.source, version: create(EntityVersionSchema, { revision: { value: 10n }, generation: 8n }) });
+    await app.refresh();
+    await expect(app.commitTaskMessageRewind(value, "dialogue", new AbortController().signal)).rejects.toThrow(/preview changed/u);
+    value = await preview(app);
+    let finish!: (operation: Operation) => void;
+    vi.mocked(f.network.submit).mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+    const pending = app.commitTaskMessageRewind(value, "dialogue", new AbortController().signal);
+    await vi.waitFor(() => expect(f.network.submit).toHaveBeenCalledOnce()); app.setForeground(false); f.advance(); finish(f.operation("operation-1"));
+    await expect(pending).resolves.toEqual({ kind: "retired" }); expect(saved.pending()).toMatchObject([{ kind: "session-rewind" }]);
+    expect(drafts.composer.readSync({ profileId: credential.profileId, sessionId: "session" })).toBeNull();
+  });
+});
+
+describe("native message forks", () => {
+  function fixture() {
+    let inputDraft = insertMobileSessionMention(plainTextMobileComposerDraft("Discuss "), { start: 8, end: 8 },
+      { sessionId: "related", displayText: "Related" }, "fork-mention").draft;
+    inputDraft = insertMobilePastedText(inputDraft, { start: inputDraft.text.length, end: inputDraft.text.length },
+      "😀 evidence\n".repeat(30), "fork-paste").draft;
+    const started = create(EventSchema, { eventId: "fork-start", identity: { sessionId: "session" },
+      cursor: { generation: 1n, sequence: 20n }, payload: { kind: { case: "messageStarted", value: {
+        messageId: "fork-user", role: MessageRole.USER, userInputAccepted: true, inputDelivery: MessageInputDelivery.PROMPT,
+        nativeIdentity: { entryId: "user-native", parentEntryId: "parent-native" }, userInput: mobileComposerInput(inputDraft)
+      } } } });
+    const completed = create(EventSchema, { eventId: "fork-complete", identity: { sessionId: "session" },
+      cursor: { generation: 1n, sequence: 21n }, payload: { kind: { case: "messageCompleted", value: {
+        messageId: "fork-user", role: MessageRole.USER,
+        nativeIdentity: { entryId: "user-native", parentEntryId: "parent-native" },
+        blocks: [{ content: { case: "text", value: "Compact display" } }]
+      } } } });
+    const state = { source: runtimeSession, events: [started, completed], child: undefined as Snapshot["sessions"][number] | undefined };
+    const backend = create(BackendDescriptorSchema, { ...runtimeBackend, capabilities: create(CapabilityManifestSchema, {
+      ...runtimeBackend.capabilities!, capabilities: [...runtimeBackend.capabilities!.capabilities,
+        create(CapabilitySchema, { name: capabilityNames.sessionFork, support: CapabilitySupport.SUPPORTED })]
+    }) });
+    const projection = (detail: boolean) => create(SnapshotSchema, { ...runtimeControlProjection(state.source, detail), backends: [backend],
+      ...(detail ? { timeline: state.events } : { sessions: [state.source, ...(state.child ? [state.child] : [])] }) });
+    const network = fakeNetwork();
+    network.readOwner = vi.fn(async () => ({ connection, device, snapshot: projection(false) }));
+    network.readSession = vi.fn(async () => projection(true));
+    network.readAround = vi.fn(async () => state.events);
+    const child = () => create(SessionSchema, { ...runtimeSession, sessionId: "forked-task",
+      nativeBinding: create(NativeSessionBindingSchema, { ...runtimeSession.nativeBinding!, backendId: "backend", opaqueReference: "forked-native" }),
+      derivationOrigin: create(SessionDerivationOriginSchema, { kind: SessionDerivationKind.FORK, sourceSessionId: "session",
+        sourceMessageId: "fork-user", sourceEventId: "fork-complete" }) });
+    const operation = (operationId: string, value = child()) => create(OperationSchema, { operationId,
+      connectionId: credential.connectionId, state: OperationState.SUCCEEDED, result: { payload: { case: "session", value } } });
+    return { state, network, backend, child, operation, inputDraft };
+  }
+
+  it("forks stable active input at its exact parent, persists the receipt first and the new draft before terminal receipt clearance", async () => {
+    const f = fixture(); f.state.source = create(SessionSchema, { ...runtimeSession, state: SessionState.RUNNING });
+    const saved = memoryStorage(credential); const drafts = memoryDraftStores();
+    const sourceIdentity = { profileId: credential.profileId, sessionId: "session" };
+    drafts.composer.save(sourceIdentity, plainTextMobileComposerDraft("Keep source draft"));
+    await drafts.composer.flush(sourceIdentity);
+    vi.mocked(f.network.submit).mockImplementation(async (_credential, operationId, mutation) => {
+      expect(saved.pending()).toEqual([{ operationId, connectionId: credential.connectionId,
+        kind: "session-fork", sessionId: "session", eventId: "fork-complete", state: "unknown" }]);
+      expect(mutation).toMatchObject({ preconditions: [{ expectedGeneration: 8n, expectedRevision: { value: 9n } }],
+        payload: { case: "forkSession", value: { sourceSessionId: "session", nativeEntryId: "parent-native",
+          sourceMessageId: "fork-user", sourceEventId: "fork-complete", newDisplayName: "Branch" } } });
+      f.state.child = f.child(); return f.operation(operationId);
+    });
+    const savePending = saved.storage.savePending;
+    saved.storage.savePending = vi.fn(async (items) => {
+      if (items.length === 0) expect(await drafts.composer.readDurable({ ...sourceIdentity, sessionId: "forked-task" }))
+        .toMatchObject({ mentions: [{ sessionId: "related" }], atoms: [{ text: "😀 evidence\n".repeat(30) }] });
+      await savePending(items);
+    });
+    const app = client(f.network, saved.storage, undefined, undefined, () => "fork-operation", undefined, drafts);
+    await app.start();
+    const controls = app.taskMessageForkControls("fork-complete")!;
+    expect(controls.canFork).toBe(true);
+    await expect(app.forkTaskMessage(controls.authorityKey, "fork-complete", "Branch"))
+      .resolves.toEqual({ kind: "forked", sessionId: "forked-task", draftRestored: true });
+    expect(saved.pending()).toEqual([]); expect(app.state.selectedId).toBe("session");
+    await expect(drafts.composer.readDurable(sourceIdentity)).resolves.toMatchObject({ text: "Keep source draft" });
+  });
+
+  it("reconciles an unknown fork after restart from its exact canonical source without dispatching again", async () => {
+    const f = fixture(); const saved = memoryStorage(credential); const drafts = memoryDraftStores();
+    vi.mocked(f.network.submit).mockRejectedValueOnce(new Error("response lost"));
+    const app = client(f.network, saved.storage, undefined, undefined, () => "unknown-fork", undefined, drafts);
+    await app.start();
+    await expect(app.forkTaskMessage(app.taskMessageForkControls("fork-complete")!.authorityKey, "fork-complete", "Branch"))
+      .resolves.toEqual({ kind: "unknown" });
+    expect(app.taskMessageForkControls("fork-complete")?.canFork).toBe(false);
+    app.dispose();
+    f.state.child = f.child(); vi.mocked(f.network.getOperation).mockResolvedValue(f.operation("unknown-fork"));
+    const restarted = client(f.network, saved.storage, undefined, undefined, () => "should-not-dispatch", undefined, drafts);
+    await restarted.start();
+    expect(saved.pending()).toEqual([]); expect(f.network.submit).toHaveBeenCalledOnce();
+    expect(f.network.readAround).toHaveBeenCalledWith(credential, "session", "fork-complete", expect.any(AbortSignal));
+    const restored = await drafts.composer.readDurable({ profileId: credential.profileId, sessionId: "forked-task" });
+    expect(restored?.attachments).toEqual([]);
+    expect(mobileComposerInput(restored!)).toEqual(mobileComposerInput(f.inputDraft));
+    expect(restarted.state.selectedId).toBe("session");
+  });
+
+  it("rejects a stale source confirmation and leaves a foreign derived Session receipt unresolved", async () => {
+    const f = fixture(); const saved = memoryStorage(credential);
+    const app = client(f.network, saved.storage);
+    await app.start(); const old = app.taskMessageForkControls("fork-complete")!;
+    const original = clone(EventSchema, f.state.events[1]!);
+    const changed = clone(EventSchema, original);
+    if (changed.payload?.kind.case === "messageCompleted") changed.payload.kind.value.nativeIdentity!.parentEntryId = "different-parent";
+    f.state.events = [f.state.events[0]!, changed]; await app.refresh();
+    await expect(app.forkTaskMessage(old.authorityKey, "fork-complete", "Branch")).rejects.toThrow(/boundary changed/u);
+    expect(f.network.submit).not.toHaveBeenCalled();
+    f.state.events = [f.state.events[0]!, original]; await app.refresh();
+    const foreign = f.child(); foreign.derivationOrigin!.sourceEventId = "foreign-event";
+    vi.mocked(f.network.submit).mockImplementationOnce(async (_credential, operationId) => f.operation(operationId, foreign));
+    await expect(app.forkTaskMessage(app.taskMessageForkControls("fork-complete")!.authorityKey, "fork-complete", "Branch"))
+      .rejects.toThrow(/derived Session identity/u);
+    expect(saved.pending()).toMatchObject([{ kind: "session-fork", state: "unknown" }]);
+  });
+
+  it("reports a draft CAS conflict without repeating native work or replacing a newer draft", async () => {
+    const f = fixture(); const saved = memoryStorage(credential); const drafts = memoryDraftStores();
+    vi.mocked(f.network.submit).mockImplementationOnce(async (_credential, operationId) => {
+      f.state.child = f.child(); return f.operation(operationId);
+    });
+    const saveIfRevision = drafts.composer.saveIfRevision.bind(drafts.composer);
+    vi.spyOn(drafts.composer, "saveIfRevision").mockImplementationOnce((identity, draft, revision) => {
+      drafts.composer.save(identity, plainTextMobileComposerDraft("Newer draft"));
+      return saveIfRevision(identity, draft, revision);
+    });
+    const app = client(f.network, saved.storage, undefined, undefined, undefined, undefined, drafts); await app.start();
+    await expect(app.forkTaskMessage(app.taskMessageForkControls("fork-complete")!.authorityKey, "fork-complete", "Branch"))
+      .resolves.toEqual({ kind: "forked", sessionId: "forked-task", draftRestored: false });
+    await drafts.composer.flush({ profileId: credential.profileId, sessionId: "forked-task" });
+    await expect(drafts.composer.readDurable({ profileId: credential.profileId, sessionId: "forked-task" }))
+      .resolves.toMatchObject({ text: "Newer draft" });
+    expect(saved.pending()).toEqual([]); expect(f.network.submit).toHaveBeenCalledOnce();
+  });
+
+  it("retires a late native fork result in background and preserves its unknown receipt without touching any new draft", async () => {
+    const f = fixture(); const saved = memoryStorage(credential); const drafts = memoryDraftStores();
+    let finish!: (operation: Operation) => void;
+    vi.mocked(f.network.submit).mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+    const app = client(f.network, saved.storage, undefined, undefined, undefined, undefined, drafts); await app.start();
+    const pending = app.forkTaskMessage(app.taskMessageForkControls("fork-complete")!.authorityKey, "fork-complete", "Branch");
+    await vi.waitFor(() => expect(f.network.submit).toHaveBeenCalledOnce());
+    app.setForeground(false); finish(f.operation("operation-1"));
+    await expect(pending).resolves.toEqual({ kind: "retired" });
+    expect(saved.pending()).toMatchObject([{ kind: "session-fork", state: "unknown" }]);
+    expect(drafts.composer.readSync({ profileId: credential.profileId, sessionId: "forked-task" })).toBeNull();
+  });
+});
+
 describe("native current-task branch navigation", () => {
   const ids = () => {
     let value = 0;
@@ -7199,6 +7777,353 @@ describe("native current-task branch navigation", () => {
 });
 
 describe("native current-task Files ownership", () => {
+  async function textActionFixture(body = "\uFEFF# First\r\n\r\nSelected 😀 text\r\n") {
+    const length = BigInt(new TextEncoder().encode(body).length); const digest = sha256Hex(new TextEncoder().encode(body));
+    const observed = create(WorkspaceEntrySchema, { workspaceId: "workspace", relativePath: "docs/README.md", displayName: "README.md",
+      kind: FileKind.REGULAR, mediaType: "text/markdown", revision: { opaqueRevision: "file-r1", byteSize: length, modifiedAt: { seconds: 100n } } });
+    const canonical = create(WorkspaceEntrySchema, { ...observed, revision: { ...observed.revision!, opaqueRevision: `sha256:${digest}:${length}`, sha256Hex: digest } });
+    const network = fakeNetwork(); configureFiles(network, handoffSnapshot);
+    vi.mocked(network.listWorkspaceDirectory).mockResolvedValue({ entries: [observed], revision: "text-directory" });
+    const response = fromBinary(FilePreviewSchema, toBinary(FilePreviewSchema, create(FilePreviewSchema, { entry: canonical, content: { case: "text", value: {
+      utf8Text: body, startByte: 0n, endByte: length, totalLines: body.split(/\r\n?|\n/u).length
+    } } })));
+    vi.mocked(network.readWorkspaceFile).mockResolvedValue(response);
+    const drafts = memoryDraftStores(); let id = 0;
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined, () => "file-action-" + ++id, undefined, drafts);
+    await app.start(); await app.openFiles(); await app.openFilesPreviewPager({ kind: "workspace-entry", entry: observed });
+    const preview = app.state.files.preview; if (preview?.kind !== "text") throw new Error("Missing canonical file text");
+    const identity = { profileId: credential.profileId, sessionId: "session" };
+    return { app, network, drafts, identity, observed, response, preview };
+  }
+
+  it("quotes canonical selected file text into the retained draft and copies only displayed source with exact BOM and line endings", async () => {
+    const body = "\uFEFF# First\r\n" + Array.from({ length: 5_001 }, (_, i) => "Row " + i).join("\r\n");
+    const f = await textActionFixture(body); f.drafts.composer.save(f.identity, plainTextMobileComposerDraft("Question"));
+    const copy = await f.app.prepareFileTextSourceCopy(f.preview, new AbortController().signal);
+    expect(copy.text).toBe(body.split("\r\n").slice(0, 5_000).join("\r\n")); copy.assertCurrent();
+    await f.app.addFileTextQuoteToComposer(f.preview, "Selected 😀 text\r\nsecond", new AbortController().signal);
+    const saved = await f.drafts.composer.read(f.identity);
+    expect(saved?.atoms).toMatchObject([{ kind: "file-quote", sourceSessionId: "session", sourcePath: "docs/README.md", text: "Selected 😀 text\nsecond" }]);
+    expect(saved?.text).toBe("Question\n\n⟦Quote from File⟧");
+    expect(f.drafts.values.size).toBe(1); expect(f.network.submit).not.toHaveBeenCalled();
+    f.app.closeFilesPreview(); expect(() => copy.assertCurrent()).toThrow(/source changed/u);
+    await expect(f.app.prepareFileTextSourceCopy(f.preview, new AbortController().signal)).rejects.toThrow(/canonical source/u);
+  });
+
+  it("rejects changed bytes and source windows, preserves concurrent drafts and rolls back a failed quote flush", async () => {
+    const f = await textActionFixture(); const original = plainTextMobileComposerDraft("Original");
+    f.drafts.composer.save(f.identity, original); await f.drafts.composer.flush(f.identity);
+    await expect(f.app.prepareFileTextSourceCopy({ ...f.preview }, new AbortController().signal)).rejects.toThrow(/canonical source/u);
+    vi.mocked(f.network.readWorkspaceFile).mockResolvedValueOnce(create(FilePreviewSchema, { ...f.response,
+      content: { case: "text", value: create(TextFilePreviewSchema, { utf8Text: "spoof", startByte: 0n, endByte: f.preview.endByte, totalLines: 1 }) } }));
+    await expect(f.app.prepareFileTextSourceCopy(f.preview, new AbortController().signal)).rejects.toThrow(/bytes changed/u);
+    const flush = vi.spyOn(f.drafts.composer, "flush").mockRejectedValueOnce(new Error("Storage unavailable"));
+    await expect(f.app.addFileTextQuoteToComposer(f.preview, "excerpt", new AbortController().signal)).rejects.toThrow(/Storage unavailable/u);
+    expect(await f.drafts.composer.read(f.identity)).toEqual(original); flush.mockRestore();
+    let finish!: (value: typeof f.response) => void;
+    vi.mocked(f.network.readWorkspaceFile).mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+    const adding = f.app.addFileTextQuoteToComposer(f.preview, "excerpt", new AbortController().signal);
+    await vi.waitFor(() => expect(finish).toBeDefined()); f.drafts.composer.save(f.identity, plainTextMobileComposerDraft("Newer")); finish(f.response);
+    await expect(adding).rejects.toThrow(/composer changed/u); expect(f.drafts.composer.readSync(f.identity)?.text).toBe("Newer");
+    vi.mocked(f.network.listWorkspaceDirectory).mockResolvedValueOnce({ entries: [f.observed], revision: "changed-window" });
+    await expect(f.app.prepareFileTextSourceCopy(f.preview, new AbortController().signal)).rejects.toThrow(/Workspace text file changed/u);
+    expect(f.network.submit).not.toHaveBeenCalled();
+  });
+
+  it("retires a cancelled text action without releasing its unsettled file read slot or committing to a later preview", async () => {
+    const f = await textActionFixture(); let finish!: (value: typeof f.response) => void;
+    const original = plainTextMobileComposerDraft("Original"); f.drafts.composer.save(f.identity, original);
+    vi.mocked(f.network.readWorkspaceFile).mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+    const controller = new AbortController();
+    const adding = f.app.addFileTextQuoteToComposer(f.preview, "excerpt", controller.signal);
+    await vi.waitFor(() => expect(finish).toBeDefined()); controller.abort(); await expect(adding).rejects.toThrow(/cancel/u);
+    const calls = vi.mocked(f.network.readWorkspaceFile).mock.calls.length;
+    const next = f.app.prepareFileTextSourceCopy(f.preview, new AbortController().signal);
+    await Promise.resolve(); expect(f.network.readWorkspaceFile).toHaveBeenCalledTimes(calls);
+    finish(f.response); const copy = await next; expect(copy.text).toBe(f.preview.text);
+    expect(f.drafts.composer.readSync(f.identity)).toEqual(original);
+    let resolveDirectory!: (value: { entries: typeof f.observed[]; revision: string }) => void;
+    vi.mocked(f.network.listWorkspaceDirectory).mockImplementationOnce(() => new Promise((resolve) => { resolveDirectory = resolve; }));
+    const stale = f.app.prepareFileTextSourceCopy(f.preview, new AbortController().signal);
+    await vi.waitFor(() => expect(resolveDirectory).toBeDefined()); f.app.closeFilesPreview();
+    resolveDirectory({ entries: [f.observed], revision: "text-directory" }); await expect(stale).rejects.toThrow(/source changed/u);
+    expect(() => copy.assertCurrent()).toThrow(); f.app.setForeground(false); expect(f.network.submit).not.toHaveBeenCalled();
+  });
+
+  it("renders file Markdown resources relative to its canonical parent and retires stale or replaced preview sources", async () => {
+    const body = "## Document\n![Pixel](pixel.png) ![outside](../../private.png)\n" + "long document ".repeat(16_000);
+    const bytes = await sharp({ create: { width: 1, height: 1, channels: 3, background: "orange" } }).png().toBuffer(); const length = BigInt(new TextEncoder().encode(body).length);
+    const observed = create(FileRevisionSchema, { opaqueRevision: "document-r1", byteSize: length, modifiedAt: { seconds: 100n } });
+    const doc = create(WorkspaceEntrySchema, { workspaceId: "workspace", relativePath: "docs/README.md", displayName: "README.md", kind: FileKind.REGULAR, mediaType: "text/markdown", revision: observed });
+    const digest = sha256Hex(new TextEncoder().encode(body));
+    const canonical = create(WorkspaceEntrySchema, { ...doc, revision: { ...observed, opaqueRevision: `sha256:${digest}:${length}`, sha256Hex: digest } });
+    const imageRevision = create(FileRevisionSchema, { opaqueRevision: "pixel-r1", byteSize: BigInt(bytes.length), sha256Hex: sha256Hex(bytes) });
+    const picture = create(WorkspaceEntrySchema, { workspaceId: "workspace", relativePath: "docs/pixel.png", displayName: "pixel.png", kind: FileKind.REGULAR, mediaType: "image/png", revision: imageRevision });
+    const blob = create(BlobRefSchema, { blobId: "file-markdown-pixel", fileName: "pixel.png", mediaType: "image/png", byteSize: imageRevision.byteSize, sha256Hex: imageRevision.sha256Hex });
+    const network = fakeNetwork(); configureFiles(network, handoffSnapshot);
+    vi.mocked(network.listWorkspaceDirectory).mockImplementation(async (_credential, _workspace, parent) => ({ entries: parent === "docs" ? [doc, picture] : [sourceDirectory], revision: "directory-" + parent }));
+    vi.mocked(network.readWorkspaceFile).mockImplementation(async (_credential, _workspace, path) => path === doc.relativePath
+      ? create(FilePreviewSchema, { entry: canonical, content: { case: "text", value: { utf8Text: body, startByte: 0n, endByte: length, totalLines: 3 } } })
+      : create(FilePreviewSchema, { entry: picture, content: { case: "image", value: { blob, widthPixels: 1, heightPixels: 1 } } }));
+    vi.mocked(network.downloadBlob).mockResolvedValue({ bytes, mediaType: "image/png" });
+    const app = client(network, memoryStorage(credential).storage); await app.start(); await app.openFiles(); await app.openFilesDirectory("docs");
+    await app.previewWorkspaceEntry(app.state.files.entries.find((entry) => entry.relativePath === doc.relativePath)!);
+    const preview = app.state.files.preview; if (preview?.kind !== "text") throw new Error("Text preview fixture missing");
+    expect(preview.workspaceEntry).toEqual(canonical); expect(preview.fileName).toBe("README.md");
+    const resources = await app.prepareFilesMarkdownResources(preview, new AbortController().signal);
+    expect(vi.mocked(network.readWorkspaceFile).mock.calls.map((call) => call[2])).toEqual([doc.relativePath, picture.relativePath]);
+    expect(resources.references.get('["image","pixel.png"]')?.image).toMatchObject({ width: 1, height: 1 });
+    expect(network.downloadBlob).toHaveBeenCalledExactlyOnceWith(credential, blob, expect.any(AbortSignal));
+    await expect(app.prepareFilesMarkdownResources({ ...preview, text: "spoof" }, new AbortController().signal)).rejects.toThrow(/current Workspace/u);
+    vi.mocked(network.listWorkspaceDirectory).mockResolvedValue({ entries: [create(WorkspaceEntrySchema, { ...doc, revision: create(FileRevisionSchema, { ...observed, opaqueRevision: "document-r2", modifiedAt: { ...observed.modifiedAt!, seconds: 101n } }) }), picture], revision: "changed-directory" });
+    await expect(app.prepareFilesMarkdownResources(preview, new AbortController().signal)).rejects.toThrow(/file changed/u);
+    expect(network.downloadBlob).toHaveBeenCalledOnce(); app.closeFilesPreview();
+    expect(() => app.assertMarkdownResourcesCurrent(resources.leaseId)).toThrow(/changed|released/u);
+    expect(app.filesMarkdownResourceOwnerKey(preview)).toBeUndefined(); expect(network.submit).not.toHaveBeenCalled();
+  });
+
+  it("opens a sorted non-image Files preview window and keeps every original action on the current canonical page", async () => {
+    const entry = (name: string, type: string, size: number) => create(WorkspaceEntrySchema, { workspaceId: "workspace", relativePath: name,
+      displayName: name, mediaType: type, kind: FileKind.REGULAR, revision: { opaqueRevision: name + "-r1", byteSize: BigInt(size), sha256Hex: name === "raw.bin" ? "a".repeat(64) : "" } });
+    const alpha = entry("alpha.txt", "text/plain", 5); const beta = entry("beta.txt", "text/plain", 4);
+    const raw = entry("raw.bin", "application/x-test", 2); const picture = entry("picture.png", "image/png", 12);
+    const entries = [sourceDirectory, alpha, beta, raw, picture]; const network = fakeNetwork(); configureFiles(network, handoffSnapshot);
+    vi.mocked(network.listWorkspaceDirectory).mockResolvedValue({ entries, revision: "pager-directory" });
+    vi.mocked(network.readWorkspaceFile).mockImplementation(async (_credential, _workspace, path) => {
+      const item = entries.find((candidate) => candidate.relativePath === path)!;
+      return create(FilePreviewSchema, { entry: item, content: path.endsWith(".txt")
+        ? { case: "text", value: { utf8Text: path.split(".")[0]!, startByte: 0n, endByte: item.revision!.byteSize, totalLines: 1 } }
+        : { case: "blob", value: { blobId: "raw-blob", fileName: "raw.bin", mediaType: raw.mediaType, byteSize: 2n, sha256Hex: "a".repeat(64) } } });
+    });
+    const drafts = memoryDraftStores();
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined, undefined, undefined, drafts); await app.start(); await app.openFiles();
+    await app.openFilesPreviewPager({ kind: "workspace-entry", entry: alpha }, "size");
+    const pager = app.state.files.previewPager!;
+    expect(pager.pages.map((page) => page.title)).toEqual(["alpha.txt", "beta.txt", "raw.bin"]); expect(pager.index).toBe(0);
+    expect(vi.mocked(network.readWorkspaceFile).mock.calls.map((call) => call[2])).toEqual(["alpha.txt"]);
+    const retiredSource = pager.pages[0]!.source;
+    await app.selectFilesPreviewPage(pager.id, pager.pages[1]!.key);
+    expect(app.state.files.preview).toMatchObject({ title: "beta.txt", sourceLabel: "beta.txt", kind: "text", text: "beta" });
+    expect(app.state.files.previewPager?.index).toBe(1);
+    await expect(app.addFilesItemToComposer(retiredSource)).rejects.toThrow(/authority/u);
+    const visible = app.state.files.previewPager!.pages[1]!.source;
+    await expect(app.addFilesItemToComposer(visible)).resolves.toBe("reference");
+    expect((await drafts.composer.read({ profileId: credential.profileId, sessionId: "session" }))!.text).toContain("beta.txt");
+    await app.selectFilesPreviewPage(pager.id, pager.pages[2]!.key);
+    expect(app.state.files.preview).toMatchObject({ kind: "unsupported", title: "raw.bin" }); expect(app.state.files.previewPager?.index).toBe(2);
+    expect(network.submit).not.toHaveBeenCalled();
+    vi.mocked(network.listWorkspaceDirectory).mockResolvedValue({ entries, revision: "changed-pager-directory" });
+    await expect(app.selectFilesPreviewPage(pager.id, pager.pages[0]!.key)).rejects.toThrow(/directory changed/u);
+    expect(app.state.files.preview).toBeUndefined(); expect(app.state.files.previewPager).toBeUndefined();
+  });
+
+  it("keeps canceled raw pager reads occupied, switches only the selected page and rejects a late old preview", async () => {
+    const entries = ["alpha", "beta", "gamma"].map((name) => create(WorkspaceEntrySchema, { workspaceId: "workspace", relativePath: name + ".txt",
+      displayName: name + ".txt", kind: FileKind.REGULAR, mediaType: "text/plain", revision: { opaqueRevision: name + "-r1", byteSize: BigInt(name.length) } }));
+    const network = fakeNetwork(); configureFiles(network, handoffSnapshot);
+    vi.mocked(network.listWorkspaceDirectory).mockResolvedValue({ entries, revision: "pager-directory" });
+    let finish!: (value: ReturnType<typeof create<typeof FilePreviewSchema>>) => void;
+    vi.mocked(network.readWorkspaceFile).mockImplementation(async (_credential, _workspace, path) => {
+      const entry = entries.find((entry) => entry.relativePath === path)!;
+      const preview = create(FilePreviewSchema, { entry, content: { case: "text", value: { utf8Text: path.split(".")[0]!, startByte: 0n, endByte: entry.revision!.byteSize, totalLines: 1 } } });
+      return path === "beta.txt" ? new Promise<typeof preview>((resolve) => { finish = resolve; }) : preview;
+    });
+    const app = client(network, memoryStorage(credential).storage); await app.start(); await app.openFiles();
+    await app.openFilesPreviewPager({ kind: "workspace-entry", entry: entries[0]! });
+    const pager = app.state.files.previewPager!;
+    const beta = app.selectFilesPreviewPage(pager.id, pager.pages[1]!.key);
+    await vi.waitFor(() => expect(network.readWorkspaceFile).toHaveBeenCalledTimes(2));
+    const gamma = app.selectFilesPreviewPage(pager.id, pager.pages[2]!.key); await beta;
+    expect(app.state.files.preview).toMatchObject({ kind: "loading", title: "gamma.txt" });
+    expect(network.readWorkspaceFile).toHaveBeenCalledTimes(2);
+    finish(create(FilePreviewSchema, { entry: entries[1]!, content: { case: "text", value: { utf8Text: "beta", startByte: 0n, endByte: 4n, totalLines: 1 } } }));
+    await gamma;
+    expect(app.state.files.preview).toMatchObject({ kind: "text", title: "gamma.txt", text: "gamma" });
+    expect(vi.mocked(network.readWorkspaceFile).mock.calls.map((call) => call[2])).toEqual(["alpha.txt", "beta.txt", "gamma.txt"]);
+    app.setForeground(false); expect(app.state.files.previewPager).toBeUndefined();
+  });
+
+  it("pages through the canonical Generated catalog, including missing payloads, and retires a changed catalog", async () => {
+    const body = "\uFEFF<button>Page</button>"; const bytes = new TextEncoder().encode(body);
+    const page = create(ArtifactSchema, { artifactId: "page", sessionId: "session", title: "Page",
+      blob: { blobId: "page-blob", fileName: "page.html", mediaType: "text/html", byteSize: BigInt(bytes.length), sha256Hex: sha256Hex(bytes) } });
+    const missing = create(ArtifactSchema, { artifactId: "missing", sessionId: "session", title: "Missing" });
+    const image = create(ArtifactSchema, { artifactId: "image", sessionId: "session", title: "Image",
+      blob: { blobId: "image-blob", fileName: "image.png", mediaType: "image/png", byteSize: 5n, sha256Hex: "a".repeat(64) } });
+    const network = fakeNetwork(); configureFiles(network);
+    vi.mocked(network.listSessionArtifacts).mockResolvedValue({ artifacts: [page, image, missing], revision: "catalog-r1" });
+    vi.mocked(network.downloadBlob).mockResolvedValue({ bytes, mediaType: "text/html" });
+    const drafts = memoryDraftStores();
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined, undefined, undefined, drafts); await app.start(); await app.openFiles(); app.openGeneratedFiles();
+    await app.openFilesPreviewPager({ kind: "artifact", artifact: app.state.files.artifacts.find((artifact) => artifact.artifactId === "page")! });
+    const pager = app.state.files.previewPager!;
+    expect(pager.pages.map((item) => item.title)).toEqual(["Missing", "Page"]); expect(pager.index).toBe(1);
+    const preview = app.state.files.preview; if (preview?.kind !== "text") throw new Error("Missing Generated HTML");
+    expect(preview.text).toBe(body); expect(preview.fileName).toBe("page.html");
+    const copy = await app.prepareFileTextSourceCopy(preview, new AbortController().signal);
+    expect(copy.text).toBe(body);
+    await app.addFileTextQuoteToComposer(preview, "Page", new AbortController().signal);
+    expect(drafts.composer.readSync({ profileId: credential.profileId, sessionId: "session" })?.atoms)
+      .toMatchObject([{ kind: "file-quote", sourcePath: "page.html", text: "Page" }]);
+    const descriptor = await app.prepareFilesHtmlResources(preview, new AbortController().signal);
+    expect(descriptor).toMatchObject({ html: body, total: 0 }); app.releaseFilesHtmlResources(descriptor.leaseId);
+    expect(network.downloadBlob).toHaveBeenCalledExactlyOnceWith(credential, page.blob, expect.any(AbortSignal));
+    await app.selectFilesPreviewPage(pager.id, pager.pages[0]!.key);
+    expect(() => copy.assertCurrent()).toThrow(/source changed/u);
+    expect(app.state.files.preview).toMatchObject({ kind: "unsupported", title: "Missing" });
+    expect(network.downloadBlob).toHaveBeenCalledOnce();
+    vi.mocked(network.listSessionArtifacts).mockResolvedValue({ artifacts: [page, image, missing], revision: "catalog-r2" });
+    await expect(app.selectFilesPreviewPage(pager.id, pager.pages[1]!.key)).rejects.toThrow(/catalog changed/u);
+    expect(app.state.files.previewPager).toBeUndefined(); expect(app.state.files.preview).toBeUndefined();
+  });
+
+  it("opens a content search result in its actual parent and preserves its initial verified text window", async () => {
+    const parent = "docs"; const path = parent + "/page.txt";
+    const page = create(WorkspaceEntrySchema, { workspaceId: "workspace", relativePath: path, displayName: "page.txt",
+      kind: FileKind.REGULAR, mediaType: "text/plain", revision: { opaqueRevision: "page-r1", byteSize: 4n } });
+    const sibling = create(WorkspaceEntrySchema, { ...page, relativePath: parent + "/next.txt", displayName: "next.txt" });
+    const network = fakeNetwork(); configureFiles(network);
+    vi.mocked(network.listWorkspaceDirectory).mockImplementation(async (_credential, _workspace, directory) => ({
+      entries: directory === parent ? [page, sibling] : [sourceDirectory], revision: "directory-" + directory }));
+    vi.mocked(network.searchWorkspace).mockResolvedValue({ matches: [create(WorkspaceSearchMatchSchema, {
+      relativePath: path, revision: page.revision, linePreview: "page" })], revision: "search-r1", truncated: false, totalFiles: 1 });
+    vi.mocked(network.readWorkspaceFile).mockResolvedValue(create(FilePreviewSchema, { entry: page,
+      content: { case: "text", value: { utf8Text: "page", startByte: 0n, endByte: 4n, totalLines: 1 } } }));
+    const app = client(network, memoryStorage(credential).storage); await app.start(); await app.openFiles(); await app.searchFiles("page", "content", false);
+    const source = { kind: "search-result" as const, result: app.state.files.searchResults[0]! };
+    await app.previewFileSearchResult(source.result); const original = app.state.files.preview;
+    await app.openFilesPreviewPager(source);
+    expect(app.state.files.location).toEqual({ kind: "workspace", path: "" });
+    expect(app.state.files.previewPager?.pages.map((page) => page.title)).toEqual(["next.txt", "page.txt"]);
+    expect(app.state.files.previewPager?.pages[1]!.source).toBe(source); expect(app.state.files.preview).toBe(original);
+    expect(network.readWorkspaceFile).toHaveBeenCalledOnce();
+    expect(network.listWorkspaceDirectory).toHaveBeenLastCalledWith(credential, "workspace", parent, expect.any(AbortSignal));
+    vi.mocked(network.readWorkspaceFile).mockRejectedValueOnce(new Error("The selected file cannot be read."));
+    const pager = app.state.files.previewPager!; await app.selectFilesPreviewPage(pager.id, pager.pages[0]!.key);
+    expect(app.state.files.preview).toMatchObject({ kind: "error", title: "next.txt", mediaType: "text/plain" });
+    expect(app.state.files.previewPager?.index).toBe(0);
+    await app.selectFilesPreviewPage(pager.id, pager.pages[1]!.key);
+    expect(app.state.files.preview).toMatchObject({ kind: "text", title: "page.txt", text: "page" });
+  });
+
+  it("shares the visible original revision and rejects actions from a previous page before dispatch", async () => {
+    const entries = ["alpha", "beta"].map((name) => create(WorkspaceEntrySchema, { workspaceId: "workspace",
+      relativePath: name + ".txt", displayName: name + ".txt", kind: FileKind.REGULAR, mediaType: "text/plain",
+      revision: { opaqueRevision: name + "-observed", byteSize: BigInt(name.length), modifiedAt: { seconds: 100n } } }));
+    const canonical = entries.map((entry, index) => { const name = index === 0 ? "alpha" : "beta"; const digest = sha256Hex(new TextEncoder().encode(name));
+      return create(WorkspaceEntrySchema, { ...entry, revision: create(FileRevisionSchema, { ...entry.revision!,
+        opaqueRevision: "sha256:" + digest + ":" + name.length, sha256Hex: digest }) }); });
+    const network = fakeNetwork(); configureFiles(network);
+    vi.mocked(network.listWorkspaceDirectory).mockResolvedValue({ entries, revision: "share-directory" });
+    vi.mocked(network.readWorkspaceFile).mockImplementation(async (_credential, _workspace, path) => {
+      const entry = canonical.find((item) => item.relativePath === path)!; const text = path.split(".")[0]!;
+      return create(FilePreviewSchema, { entry, content: { case: "text", value: { utf8Text: text, startByte: 0n, endByte: entry.revision!.byteSize, totalLines: 1 } } });
+    });
+    const blob = create(BlobRefSchema, { blobId: "beta-blob", fileName: "beta.txt", mediaType: "text/plain",
+      byteSize: 4n, sha256Hex: canonical[1]!.revision!.sha256Hex });
+    vi.mocked(network.materializeWorkspaceFileBlob).mockImplementation(async (_credential, _workspace, path, expected) => {
+      expect(path).toBe("beta.txt"); expect(expected).toEqual(canonical[1]!.revision); return { entry: canonical[1]!, blob };
+    });
+    vi.mocked(network.authorizeBlobDownload).mockResolvedValue({ url: "http://192.168.1.20:4318/v1/blobs/beta-ticket", headers: {},
+      blobId: blob.blobId, fileName: blob.fileName, mediaType: blob.mediaType, byteSize: 4, sha256Hex: blob.sha256Hex });
+    const perform = vi.fn(async (request: Parameters<MobileFileShare["perform"]>[0]) => { await request.assertCurrent(); request.onDispatch?.(); });
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined, undefined, undefined, undefined,
+      undefined, undefined, undefined, undefined, { perform });
+    await app.start(); await app.openFiles(); await app.openFilesPreviewPager({ kind: "workspace-entry", entry: entries[0]! });
+    const pager = app.state.files.previewPager!; const previous = pager.pages[0]!.source;
+    await app.selectFilesPreviewPage(pager.id, pager.pages[1]!.key); const current = app.state.files.previewPager!.pages[1]!.source;
+    await expect(app.shareFilesItem(previous)).rejects.toThrow(/current file/u);
+    expect(network.materializeWorkspaceFileBlob).not.toHaveBeenCalled();
+    await app.shareFilesItem(current); expect(perform).toHaveBeenCalledOnce();
+    vi.mocked(network.materializeWorkspaceFileBlob).mockRejectedValueOnce(new Error("The file contents changed, despite unchanged size and modification time."));
+    await expect(app.shareFilesItem(current)).rejects.toThrow(/contents changed/u);
+    expect(perform).toHaveBeenCalledOnce(); expect(network.submit).not.toHaveBeenCalled();
+  });
+
+  it("removes the current pager PDF lease when its directory window is retired", async () => {
+    const bytes = previewPdfBytes(); const digest = "f".repeat(64);
+    const pdfEntry = create(WorkspaceEntrySchema, { workspaceId: "workspace", relativePath: "proof.pdf", displayName: "proof.pdf",
+      kind: FileKind.REGULAR, mediaType: "application/pdf", revision: { opaqueRevision: "pdf-r1", byteSize: BigInt(bytes.length), sha256Hex: digest } });
+    const network = fakeNetwork(); configureFiles(network);
+    vi.mocked(network.listWorkspaceDirectory).mockResolvedValue({ entries: [readme, pdfEntry], revision: "pdf-directory" });
+    vi.mocked(network.readWorkspaceFile).mockResolvedValue(create(FilePreviewSchema, { entry: pdfEntry,
+      content: { case: "blob", value: { blobId: "pdf-blob", fileName: "proof.pdf", mediaType: "application/pdf", byteSize: BigInt(bytes.length), sha256Hex: digest } } }));
+    vi.mocked(network.downloadBlob).mockResolvedValue({ bytes, mediaType: "application/pdf" });
+    const pdf = pdfPreviewFixture(); const app = client(network, memoryStorage(credential).storage, undefined, undefined,
+      () => "pager-pdf", undefined, undefined, undefined, undefined, pdf.files);
+    await app.start(); await app.openFiles(); await app.openFilesPreviewPager({ kind: "workspace-entry", entry: pdfEntry });
+    expect(app.state.files.preview).toMatchObject({ kind: "pdf", leaseId: "pager-pdf" });
+    const pager = app.state.files.previewPager!;
+    let finish!: (value: { entries: WorkspaceEntry[]; revision: string }) => void;
+    vi.mocked(network.listWorkspaceDirectory).mockImplementationOnce(async () => new Promise((resolve) => { finish = resolve; }));
+    const navigation = app.selectFilesPreviewPage(pager.id, pager.pages.find((page) => page.title === "README.md")!.key);
+    await vi.waitFor(() => expect(network.listWorkspaceDirectory).toHaveBeenCalledTimes(3));
+    await vi.waitFor(() => expect(pdf.removed).toEqual(["preview-pager-pdf.pdf"]));
+    expect(app.state.files.preview).toMatchObject({ kind: "loading", title: "README.md" });
+    finish({ entries: [readme, pdfEntry], revision: "changed-pdf-directory" });
+    await expect(navigation).rejects.toThrow(/directory changed/u);
+    expect(app.state.files.preview).toBeUndefined(); expect(app.state.files.previewPager).toBeUndefined();
+  });
+
+  it("finishes a timed out preview opening and discards a late directory without leaving loading state", async () => {
+    const network = fakeNetwork(); configureFiles(network); const app = client(network, memoryStorage(credential).storage);
+    await app.start(); await app.openFiles(); const entry = app.state.files.entries.find((item) => item.relativePath === "README.md")!;
+    let finish!: (value: { entries: WorkspaceEntry[]; revision: string }) => void;
+    vi.mocked(network.listWorkspaceDirectory).mockImplementationOnce(async () => new Promise((resolve) => { finish = resolve; }));
+    vi.useFakeTimers();
+    try {
+      const opening = app.openFilesPreviewPager({ kind: "workspace-entry", entry });
+      await vi.advanceTimersByTimeAsync(15_000); await opening;
+      expect(app.state.files.preview).toMatchObject({ kind: "error", reason: expect.stringMatching(/timed out/u) });
+      expect(app.state.files.previewPager).toBeUndefined();
+      finish({ entries: [entry], revision: "late-directory" }); await Promise.resolve(); await Promise.resolve();
+      expect(app.state.files.preview).toMatchObject({ kind: "error" }); expect(app.state.files.previewPager).toBeUndefined();
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("loads HTML resources from the canonical parent and fences exact authenticated source snapshots before and after the batch", async () => {
+    const body = '<script src="./assets/app.js"></script><img src="../private.png"><img src="large.png">';
+    const bytes = new TextEncoder().encode(body); const length = BigInt(bytes.length); const digest = sha256Hex(bytes);
+    const observed = create(FileRevisionSchema, { opaqueRevision: "html-r1", byteSize: length, modifiedAt: { seconds: 100n } });
+    const doc = create(WorkspaceEntrySchema, { workspaceId: "workspace", relativePath: "docs/index.html", displayName: "index.html", kind: FileKind.REGULAR, mediaType: "text/html", revision: observed });
+    const canonical = create(WorkspaceEntrySchema, { ...doc, revision: { ...observed, opaqueRevision: `sha256:${digest}:${length}`, sha256Hex: digest } });
+    const scriptBytes = new TextEncoder().encode('document.title="local"'); const scriptDigest = sha256Hex(scriptBytes);
+    const scriptRevision = create(FileRevisionSchema, { opaqueRevision: "script-r1", byteSize: BigInt(scriptBytes.length), modifiedAt: { seconds: 100n } });
+    const script = create(WorkspaceEntrySchema, { workspaceId: "workspace", relativePath: "docs/assets/app.js", displayName: "app.js", kind: FileKind.REGULAR, mediaType: "text/javascript", revision: scriptRevision });
+    const materialized = create(WorkspaceEntrySchema, { ...script, revision: { ...scriptRevision,
+      opaqueRevision: `sha256:${scriptDigest}:${scriptBytes.length}`, sha256Hex: scriptDigest } });
+    const blob = create(BlobRefSchema, { blobId: "html-script", fileName: "app.js", mediaType: "text/javascript", byteSize: BigInt(scriptBytes.length), sha256Hex: scriptDigest });
+    const large = create(WorkspaceEntrySchema, { workspaceId: "workspace", relativePath: "docs/large.png", displayName: "large.png", kind: FileKind.REGULAR,
+      mediaType: "image/png", revision: { opaqueRevision: "large-r1", byteSize: 2_097_153n } });
+    const network = fakeNetwork(); configureFiles(network, handoffSnapshot);
+    vi.mocked(network.listWorkspaceDirectory).mockImplementation(async (_credential, _workspace, parent) => ({
+      entries: parent === "docs" ? [doc, large] : parent === "docs/assets" ? [script] : [sourceDirectory], revision: "directory-" + parent }));
+    vi.mocked(network.readWorkspaceFile).mockResolvedValue(create(FilePreviewSchema, { entry: canonical,
+      content: { case: "text", value: { utf8Text: body, startByte: 0n, endByte: length, totalLines: 1 } } }));
+    vi.mocked(network.readWorkspaceHtmlSnapshot).mockImplementation(async (_credential, _session, file) => ({ file: {
+      $typeName: "joko.v1.WorkspaceHtmlReference", ...file, expectedRevision: "workspace-html:" + "a".repeat(64) }, html: body }));
+    vi.mocked(network.materializeWorkspaceFileBlob).mockResolvedValue({ entry: materialized, blob });
+    vi.mocked(network.downloadBlob).mockResolvedValue({ bytes: scriptBytes, mediaType: "text/javascript" });
+    const app = client(network, memoryStorage(credential).storage); await app.start(); await app.openFiles(); await app.openFilesDirectory("docs");
+    await app.previewWorkspaceEntry(app.state.files.entries.find((entry) => entry.relativePath === doc.relativePath)!);
+    const preview = app.state.files.preview; if (preview?.kind !== "text") throw new Error("HTML fixture missing");
+    const descriptor = await app.prepareFilesHtmlResources(preview, new AbortController().signal);
+    expect(descriptor).toMatchObject({ total: 2, failed: 0, overBudget: 1 }); expect(descriptor.html).toContain("data:text/javascript;base64,");
+    expect(vi.mocked(network.readWorkspaceHtmlSnapshot).mock.calls.map((call) => call[2].expectedRevision)).toEqual(["", "workspace-html:" + "a".repeat(64)]);
+    expect(network.readWorkspaceHtmlSnapshot).toHaveBeenCalledWith(credential, handoffSnapshot.sessions[0]!.sessionId,
+      { workspaceId: "workspace", relativePath: doc.relativePath, expectedRevision: "" }, expect.any(AbortSignal));
+    expect(network.readWorkspaceFile).toHaveBeenCalledOnce();
+    expect(network.materializeWorkspaceFileBlob).toHaveBeenCalledExactlyOnceWith(credential, "workspace", script.relativePath, scriptRevision, expect.any(AbortSignal));
+    expect(network.downloadBlob).toHaveBeenCalledExactlyOnceWith(credential, blob, expect.any(AbortSignal));
+    await expect(app.prepareFilesHtmlResources({ ...preview }, new AbortController().signal)).rejects.toThrow(/current complete file source/u);
+    vi.mocked(network.readWorkspaceHtmlSnapshot).mockResolvedValueOnce({ file: { $typeName: "joko.v1.WorkspaceHtmlReference", workspaceId: "workspace",
+      relativePath: doc.relativePath, expectedRevision: "workspace-html:" + "b".repeat(64) }, html: body }).mockResolvedValueOnce({
+        file: { $typeName: "joko.v1.WorkspaceHtmlReference", workspaceId: "workspace", relativePath: doc.relativePath, expectedRevision: "workspace-html:" + "b".repeat(64) }, html: "same-size change" });
+    await expect(app.prepareFilesHtmlResources(preview, new AbortController().signal)).rejects.toThrow(/snapshot changed/u);
+    app.closeFilesPreview(); expect(() => app.assertFilesHtmlResourcesCurrent(descriptor.leaseId)).toThrow(/released/u);
+    expect(app.filesHtmlResourceOwnerKey(preview)).toBeUndefined(); expect(network.submit).not.toHaveBeenCalled();
+  });
+
   it("freezes conversation images from authenticated canonical sources and rejects deletion before sharing", async () => {
     const bytes = galleryPngBytes(5, 4);
     const event = timelineGalleryEvent(bytes);
@@ -7315,9 +8240,93 @@ describe("native current-task Files ownership", () => {
     }));
   }
 
-  it("opens current completed Markdown resources in Files and the gallery, and shares the same authorized inline image", async () => {
+  it("renders current Workspace image and document miniatures, reauthorizes cached pixels and retires them with directory navigation", async () => {
+    const bytes = await sharp({ create: { width: 512, height: 256, channels: 4, background: "orange" } }).png().toBuffer();
+    const derivative = await sharp(bytes).resize(256, 128).webp().toBuffer();
+    const observedRevision = create(FileRevisionSchema, { opaqueRevision: "picture-r1", byteSize: BigInt(bytes.length), modifiedAt: { seconds: 100n } });
+    const entry = create(WorkspaceEntrySchema, { workspaceId: "workspace", relativePath: "picture.png", kind: FileKind.REGULAR, mediaType: "image/png", revision: observedRevision });
+    const blob = create(BlobRefSchema, { blobId: "picture", fileName: "picture.png", mediaType: "image/png", byteSize: BigInt(bytes.length), sha256Hex: sha256Hex(bytes) });
+    const materialized = create(WorkspaceEntrySchema, { ...entry, revision: { ...observedRevision, opaqueRevision: `sha256:${blob.sha256Hex}:${bytes.length}`, sha256Hex: blob.sha256Hex } });
+    const thumbnail = create(ImageThumbnailSchema, { data: derivative, mediaType: "image/webp", sha256Hex: sha256Hex(derivative), widthPixels: 256, heightPixels: 128, sourceWidthPixels: 512, sourceHeightPixels: 256 });
+    const network = fakeNetwork(); configureFiles(network, handoffSnapshot);
+    vi.mocked(network.listWorkspaceDirectory).mockImplementation(async (_credential, _workspace, parent) => ({ entries: parent === "" ? [entry, readme, sourceDirectory] : [], revision: `directory:${parent || "root"}` }));
+    vi.mocked(network.materializeWorkspaceFileBlob).mockResolvedValue({ entry: materialized, blob }); vi.mocked(network.readImageThumbnail).mockResolvedValue(thumbnail);
+    const app = client(network, memoryStorage(credential).storage); await app.start(); await app.openFiles(); const owner = app.filesAuthorityKey()!;
+    const source = { kind: "workspace-entry" as const, entry: app.state.files.entries.find((item) => item.relativePath === "picture.png")! };
+    const first = await app.prepareFilesThumbnail(owner, source, new AbortController().signal);
+    expect(first.content).toMatchObject({ kind: "image", width: 256, height: 128, mediaType: "image/webp" });
+    app.confirmFilesThumbnail(first.leaseId, { width: 256, height: 128, mediaType: "image/webp", isAnimated: false }); app.releaseFilesThumbnail(first.leaseId);
+    const cached = await app.prepareFilesThumbnail(owner, source, new AbortController().signal); expect(network.materializeWorkspaceFileBlob).toHaveBeenCalledOnce();
+    expect(network.readImageThumbnail).toHaveBeenCalledExactlyOnceWith(credential, blob, 256, expect.any(AbortSignal)); expect(network.listWorkspaceDirectory).toHaveBeenCalledTimes(3);
+    const doc = await app.prepareFilesThumbnail(owner, { kind: "workspace-entry", entry: readme }, new AbortController().signal); expect(doc.content).toEqual({ kind: "text", text: "# Joko" });
+    expect(app.state.files.preview).toBeUndefined(); expect(network.downloadBlob).not.toHaveBeenCalled(); expect(network.submit).not.toHaveBeenCalled();
+    await app.openFilesDirectory("src"); expect(() => app.confirmFilesThumbnail(cached.leaseId, { width: 256, height: 128 })).toThrow(/released/u);
+    await expect(app.prepareFilesThumbnail(owner, source, new AbortController().signal)).rejects.toThrow(/source/u);
+  });
+
+  it("renders only current Generated miniatures, rejects changed catalogs and never falls back after thumbnail authentication fails", async () => {
+    const bytes = new TextEncoder().encode("actual generated document\n42"); const textBlob = create(BlobRefSchema, { blobId: "mini-doc", fileName: "report.txt", mediaType: "text/plain", byteSize: BigInt(bytes.length), sha256Hex: sha256Hex(bytes) });
+    const doc = create(ArtifactSchema, { ...artifact, blob: textBlob });
+    const imageBytes = await sharp({ create: { width: 20, height: 10, channels: 3, background: "orange" } }).webp().toBuffer();
+    const imageBlob = create(BlobRefSchema, { blobId: "mini-picture", fileName: "picture.webp", mediaType: "image/webp", byteSize: BigInt(imageBytes.length), sha256Hex: sha256Hex(imageBytes) });
+    const photo = create(ArtifactSchema, { ...artifact, artifactId: "mini-photo", kind: ArtifactKind.IMAGE, blob: imageBlob });
+    const thumbnail = create(ImageThumbnailSchema, { data: imageBytes, mediaType: "image/webp", sha256Hex: imageBlob.sha256Hex, widthPixels: 20, heightPixels: 10, sourceWidthPixels: 20, sourceHeightPixels: 10 });
+    const network = fakeNetwork(); configureFiles(network, handoffSnapshot); vi.mocked(network.listSessionArtifacts).mockResolvedValue({ artifacts: [doc, photo], revision: "artifacts-1" });
+    vi.mocked(network.downloadBlob).mockResolvedValue({ bytes, mediaType: "text/plain" }); vi.mocked(network.readImageThumbnail).mockRejectedValue(new Error("Thumbnail authorization failed"));
+    const app = client(network, memoryStorage(credential).storage); await app.start(); await app.openFiles(); app.openGeneratedFiles(); const owner = app.filesAuthorityKey()!;
+    const text = await app.prepareFilesThumbnail(owner, { kind: "artifact", artifact: doc }, new AbortController().signal); expect(text.content).toEqual({ kind: "text", text: "actual generated document\n42" }); app.releaseFilesThumbnail(text.leaseId);
+    const source = { kind: "artifact" as const, artifact: photo };
+    await expect(app.prepareFilesThumbnail(owner, source, new AbortController().signal)).rejects.toThrow(/authorization failed/u); expect(network.downloadBlob).toHaveBeenCalledOnce();
+    vi.mocked(network.readImageThumbnail).mockResolvedValue(thumbnail); const current = await app.prepareFilesThumbnail(owner, source, new AbortController().signal);
+    expect(current.content?.kind).toBe("image"); vi.mocked(network.listSessionArtifacts).mockResolvedValue({ artifacts: [doc, photo], revision: "changed-catalog" });
+    await expect(app.prepareFilesThumbnail(owner, source, new AbortController().signal)).rejects.toThrow(/catalog changed/u); expect(network.readImageThumbnail).toHaveBeenCalledTimes(2);
+    app.setForeground(false); expect(() => app.confirmFilesThumbnail(current.leaseId, { width: 20, height: 10 })).toThrow(/released/u);
+    expect(network.submit).not.toHaveBeenCalled(); expect(network.materializeWorkspaceFileBlob).not.toHaveBeenCalled();
+  });
+
+  it("copies only an observed relative Files path or canonical Generated filename and retires the lease with its surface", async () => {
+    const network = fakeNetwork(); configureFiles(network, handoffSnapshot);
+    const app = client(network, memoryStorage(credential).storage); await app.start(); await app.openFiles();
+    const displayed = app.state.files;
+    const root = app.prepareFilesPathCopy(app.state.files); expect(root).toMatchObject({ text: ".", kind: "path" }); root.assertCurrent();
+    const entry = app.state.files.entries.find((value) => value.relativePath === "README.md")!;
+    const file = app.prepareFilesPathCopy(app.state.files, { kind: "workspace-entry", entry }); expect(file.text).toBe("README.md");
+    await app.openFilesDirectory("src"); expect(() => root.assertCurrent()).toThrow(); expect(() => file.assertCurrent()).toThrow();
+    expect(() => app.prepareFilesPathCopy(displayed)).toThrow();
+    const directory = app.prepareFilesPathCopy(app.state.files); expect(directory.text).toBe("src"); await app.refreshFiles(); expect(() => directory.assertCurrent()).toThrow();
+    app.openGeneratedFiles(); expect(() => app.prepareFilesPathCopy(app.state.files)).toThrow();
+    const generated = app.prepareFilesPathCopy(app.state.files, { kind: "artifact", artifact: app.state.files.artifacts[0]! });
+    expect(generated).toMatchObject({ text: "report.txt", kind: "file-name" }); generated.assertCurrent();
+    expect(network.readWorkspaceFile).not.toHaveBeenCalled(); expect(network.downloadBlob).not.toHaveBeenCalled(); expect(network.submit).not.toHaveBeenCalled();
+    await app.openFiles(); expect(() => generated.assertCurrent()).toThrow();
+    const selected = app.state.files.entries.find((value) => value.relativePath === "README.md")!;
+    const beforePreview = app.prepareFilesPathCopy(app.state.files, { kind: "workspace-entry", entry: selected });
+    await app.previewWorkspaceEntry(selected); expect(() => beforePreview.assertCurrent()).toThrow(); expect(() => app.prepareFilesPathCopy(app.state.files)).toThrow();
+    app.closeFilesPreview();
+    await app.openFilesPreviewPager({ kind: "workspace-entry", entry: selected });
+    const workspacePager = app.state.files.previewPager!; const workspacePage = workspacePager.pages[workspacePager.index]!;
+    const previewPath = app.prepareFilesPreviewPathCopy(app.state.files, workspacePager.id, workspacePage.key);
+    expect(previewPath).toMatchObject({ text: "README.md", kind: "path" }); previewPath.assertCurrent();
+    app.closeFilesPreview(); expect(() => previewPath.assertCurrent()).toThrow(/preview page changed/u);
+    app.openGeneratedFiles();
+    const generatedSource = { kind: "artifact" as const, artifact: app.state.files.artifacts[0]! };
+    await app.openFilesPreviewPager(generatedSource);
+    const generatedPager = app.state.files.previewPager!; const generatedPage = generatedPager.pages[generatedPager.index]!;
+    const previewName = app.prepareFilesPreviewPathCopy(app.state.files, generatedPager.id, generatedPage.key);
+    expect(previewName).toMatchObject({ text: "report.txt", kind: "file-name" });
+    expect(() => app.prepareFilesPreviewPathCopy(app.state.files, generatedPager.id, "another-page")).toThrow();
+    await app.openFiles(); expect(() => previewName.assertCurrent()).toThrow();
+    const beforeBackground = app.prepareFilesPathCopy(app.state.files); app.setForeground(false);
+    expect(() => beforeBackground.assertCurrent()).toThrow(); expect(() => app.prepareFilesPathCopy(app.state.files)).toThrow();
+  });
+
+  it.each([false, true])("opens completed Markdown resources and shares the same authorized inline image, EXIF=%s", async (portrait) => {
     vi.useFakeTimers();
-    const bytes = Uint8Array.from(Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=", "base64"));
+    const bytes = portrait ? Uint8Array.from(await sharp({ create: { width: 6, height: 4, channels: 3, background: "orange" } })
+      .withMetadata({ orientation: 6 }).png().toBuffer())
+      : Uint8Array.from(Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=", "base64"));
+    const width = portrait ? 6 : 1; const height = portrait ? 4 : 1;
+    const native = { width: portrait ? height : width, height: portrait ? width : height, mediaType: "image/png", isAnimated: false };
     const body = "![Inline picture](images/pixel.png) `README.md:2:1` [source](src/) ![external](https://example.invalid/no.png)";
     const event = create(EventSchema, { eventId: messageEvent.eventId, identity: messageEvent.identity, cursor: messageEvent.cursor,
       payload: { kind: { case: "messageCompleted", value: {
@@ -7334,7 +8343,7 @@ describe("native current-task Files ownership", () => {
       entries: parent === "" ? [readme, sourceDirectory] : parent === "images" ? [imageEntry] : [], revision: "directory-" + parent
     }));
     vi.mocked(network.readWorkspaceFile).mockImplementation(async (_credential, _workspace, path) => path === imageEntry.relativePath
-      ? create(FilePreviewSchema, { entry: imageEntry, content: { case: "image", value: { blob: imageBlob, widthPixels: 1, heightPixels: 1 } } })
+      ? create(FilePreviewSchema, { entry: imageEntry, content: { case: "image", value: { blob: imageBlob, widthPixels: native.width, heightPixels: native.height } } })
       : create(FilePreviewSchema, { entry: readme, content: { case: "text", value: { utf8Text: "#A\n#B\n", totalLines: 3, startByte: 0n, endByte: 6n } } }));
     vi.mocked(network.downloadBlob).mockResolvedValue({ bytes, mediaType: "image/png" });
     vi.mocked(network.readAround).mockResolvedValue([event]);
@@ -7345,11 +8354,17 @@ describe("native current-task Files ownership", () => {
     await app.start();
     const prepared = await app.prepareMarkdownResources("markdown-completed", body, new AbortController().signal);
     const imageKey = JSON.stringify(["image", "images/pixel.png"]); const fileKey = JSON.stringify(["code", "README.md:2:1"]);
-    expect(prepared.references.get(imageKey)?.image).toMatchObject({ width: 1, height: 1 });
+    expect(prepared.references.get(imageKey)?.image).toMatchObject({ width, height });
+    expect(prepared.references.get(imageKey)?.image?.nativeQuarterTurn).toBe(portrait ? true : undefined);
     expect(network.downloadBlob).toHaveBeenCalledWith(credential, imageBlob, expect.any(AbortSignal));
     expect(await app.openMarkdownPath(prepared.leaseId, fileKey, new AbortController().signal)).toMatchObject({ kind: "workspace-entry", entry: readme });
     expect(app.state.files.preview).toMatchObject({ kind: "text", text: "#A\n#B\n", focusLine: 2, focusColumn: 1 });
     const filePreview = app.state.files.preview;
+    vi.mocked(network.readOwner).mockResolvedValue({ connection, device,
+      snapshot: create(SnapshotSchema, { ...projected, snapshotId: "owner-resource-reread",
+        revision: { ...projected.revision!, etag: "blob-materialized-10", value: 10n } }) });
+    vi.mocked(network.readSession).mockResolvedValue(create(SnapshotSchema, { ...projected, snapshotId: "detail-resource-reread",
+      revision: { ...projected.revision!, etag: "blob-materialized-11", value: 11n } }));
     await vi.advanceTimersByTimeAsync(4_000);
     expect(app.state.files.preview).toBe(filePreview);
     expect(() => app.assertMarkdownResourcesCurrent(prepared.leaseId)).not.toThrow();
@@ -7358,14 +8373,15 @@ describe("native current-task Files ownership", () => {
     const gallery = await app.openMarkdownImageGallery(prepared.leaseId, imageKey, new AbortController().signal);
     app.releaseMarkdownResources(prepared.leaseId);
     const page = await app.loadImageGalleryPage(gallery.leaseId, 0, new AbortController().signal);
-    expect(page).toMatchObject({ expectedWidthPixels: 1, expectedHeightPixels: 1, pageCount: 1 });
+    expect(page).toMatchObject({ expectedWidthPixels: width, expectedHeightPixels: height, pageCount: 1 });
     await vi.advanceTimersByTimeAsync(4_000);
-    app.confirmImageGalleryPageDecoded(gallery.leaseId, page.leaseId, page.pageId, { width: 1, height: 1, mediaType: "image/png", isAnimated: false });
-    expect((await app.prepareImageOutput(page.leaseId, { width: 1, height: 1, mediaType: "image/png", isAnimated: false }, new AbortController().signal)).bytes).toEqual(bytes);
+    app.confirmImageGalleryPageDecoded(gallery.leaseId, page.leaseId, page.pageId, native);
+    expect((await app.prepareImageOutput(page.leaseId, native, new AbortController().signal)).bytes).toEqual(bytes);
     app.cancelImageGallery(gallery.leaseId);
     expect(() => app.assertMarkdownResourcesCurrent(prepared.leaseId)).toThrow(/released/u);
     const shared = await app.prepareConversationShare(["markdown-completed"], new AbortController().signal);
     expect(shared.messages[0]!.images?.get("images/pixel.png")?.uri).toBe("data:image/png;base64," + Buffer.from(bytes).toString("base64"));
+    expect(shared.messages[0]!.images?.get("images/pixel.png")?.nativeQuarterTurn).toBe(portrait ? true : undefined);
     expect(shared.messages[0]!.images?.has("https://example.invalid/no.png")).toBe(false);
     await app.revalidateConversationShare(shared.leaseId, new AbortController().signal);
     vi.mocked(network.listWorkspaceDirectory).mockImplementation(async (_credential, _workspace, parent) => ({
@@ -7452,6 +8468,65 @@ describe("native current-task Files ownership", () => {
       kind: "text", text: "# Joko", languageId: "markdown", startByte: 0n, endByte: 6n,
       totalLines: 1, truncated: false
     });
+  });
+
+  it("reads a YAML snapshot with its canonical MIME through the current Files owner", async () => {
+    const network = fakeNetwork();
+    configureFiles(network);
+    const entry = create(WorkspaceEntrySchema, {
+      ...readme, relativePath: "settings.yml", displayName: "settings.yml", mediaType: "application/yaml"
+    });
+    vi.mocked(network.listWorkspaceDirectory).mockResolvedValue({ entries: [entry], revision: "directory:root" });
+    vi.mocked(network.listWorkspaceFileIndex).mockResolvedValue({ paths: [entry.relativePath], revision: "index-1", truncated: false });
+    vi.mocked(network.readWorkspaceFile).mockResolvedValue(create(FilePreviewSchema, {
+      entry, content: { case: "text", value: {
+        utf8Text: "a: yes", languageId: "yaml", startByte: 0n, endByte: 6n, totalLines: 1
+      } }
+    }));
+    const app = client(network, memoryStorage(credential).storage);
+    await app.start();
+    await app.openFiles();
+    await app.searchFiles("settings.yml", "name", false);
+    await app.previewFileSearchResult(app.state.files.searchResults[0]!);
+    expect(app.state.files.preview).toMatchObject({ kind: "text", text: "a: yes", mediaType: "application/yaml", languageId: "yaml" });
+  });
+
+  it.each(["main.zig", "events.jsonl", "movie.srt", "Gemfile", ".gitignore", ".env", "production.env.local", "layout.xhtml"])
+  ("reads and source-copies a canonical Generated text filename %s while retaining its declared MIME", async (fileName) => {
+    const network = fakeNetwork();
+    configureFiles(network);
+    const text = "\uFEFFsource\r\ntext";
+    const bytes = new TextEncoder().encode(text);
+    const source = create(ArtifactSchema, {
+      ...artifact, title: fileName,
+      blob: { ...artifact.blob!, fileName, mediaType: "application/octet-stream", byteSize: BigInt(bytes.length) }
+    });
+    vi.mocked(network.listSessionArtifacts).mockResolvedValue({ artifacts: [source], revision: "artifacts-text" });
+    vi.mocked(network.downloadBlob).mockResolvedValue({ bytes, mediaType: "application/octet-stream" });
+    const app = client(network, memoryStorage(credential).storage);
+    await app.start(); await app.openFiles(); app.openGeneratedFiles();
+    await app.previewArtifact(app.state.files.artifacts[0]!);
+    const preview = app.state.files.preview;
+    expect(preview).toMatchObject({ kind: "text", text, mediaType: "application/octet-stream", endByte: BigInt(bytes.length) });
+    if (preview?.kind !== "text") throw new Error("Generated text did not open.");
+    const copied = await app.prepareFileTextSourceCopy(preview, new AbortController().signal);
+    expect(copied.text).toBe(text); copied.assertCurrent();
+    expect(network.downloadBlob).toHaveBeenCalledWith(credential, source.blob, expect.any(AbortSignal));
+  });
+
+  it.each([new Uint8Array([0xff, 0xfe]), new TextEncoder().encode("source\0binary")])
+  ("rejects invalid canonical Generated text bytes without exposing a text preview", async (bytes) => {
+    const network = fakeNetwork(); configureFiles(network);
+    const source = create(ArtifactSchema, { ...artifact, blob: {
+      ...artifact.blob!, fileName: "main.zig", mediaType: "application/octet-stream", byteSize: BigInt(bytes.length)
+    } });
+    vi.mocked(network.listSessionArtifacts).mockResolvedValue({ artifacts: [source], revision: "artifacts-text" });
+    vi.mocked(network.downloadBlob).mockResolvedValue({ bytes, mediaType: "application/octet-stream" });
+    const app = client(network, memoryStorage(credential).storage);
+    await app.start(); await app.openFiles(); app.openGeneratedFiles();
+    await app.previewArtifact(app.state.files.artifacts[0]!);
+    expect(app.state.files.preview).toMatchObject({ kind: "error", reason: expect.any(String) });
+    expect(app.state.files.status).toBe("ready");
   });
 
   it("materializes, revalidates, and system-shares one exact Workspace file", async () => {
@@ -7561,14 +8636,15 @@ describe("native current-task Files ownership", () => {
     expect(perform).not.toHaveBeenCalled();
   });
 
-  it("shares a bounded non-preview Timeline Artifact only while its durable event remains exact", async () => {
+  it.each(timelineFileSources)("shares a bounded non-preview $kind file only while its durable event remains exact", async ({ project }) => {
     const bytes = Uint8Array.from([1, 2, 3, 4]);
-    const event = timelinePreviewEvent("bundle.zip", "application/zip", bytes, "d".repeat(64), "Bundle");
+    const original = timelinePreviewEvent("bundle.zip", "application/zip", bytes, "d".repeat(64), "Bundle");
+    const event = project(original);
     const network = projectedNetwork(timelineGallerySnapshot(event));
     vi.mocked(network.readAround).mockResolvedValue([event]);
     const rowArtifact = timelineRows([event])[0]!.artifacts![0]!;
     expect(rowArtifact.previewKind).toBeUndefined();
-    const payload = event.payload?.kind;
+    const payload = original.payload?.kind;
     const block = payload?.case === "messageCompleted" ? payload.value.blocks[0] : undefined;
     const blob = block?.content.case === "artifact"
       ? block.content.value.blob!
@@ -7596,6 +8672,10 @@ describe("native current-task Files ownership", () => {
     expect(network.readAround).toHaveBeenCalledTimes(2);
     expect(network.authorizeBlobDownload).toHaveBeenCalledWith(credential, blob, expect.any(AbortSignal));
     expect(perform).toHaveBeenCalledTimes(1);
+    vi.mocked(network.readAround).mockResolvedValue([]);
+    await expect(app.shareTimelineArtifact(rowArtifact)).rejects.toThrow(/changed/u);
+    expect(perform).toHaveBeenCalledTimes(1);
+    expect(network.authorizeBlobDownload).toHaveBeenCalledTimes(1);
   });
 
   it("materializes an authenticated Generated video into one app-owned preview lease and cleans it on background", async () => {
@@ -8048,9 +9128,9 @@ describe("native current-task Files ownership", () => {
     expect(model.driver.write).toHaveBeenCalledTimes(1);
   });
 
-  it("previews an exact durable Timeline video and removes its lease when closed", async () => {
+  it.each(timelineFileSources)("previews an exact durable $kind video and removes its lease when closed", async ({ project }) => {
     const bytes = previewMp4Bytes();
-    const event = timelinePreviewEvent("demo.mp4", "video/mp4", bytes, "c".repeat(64), "Demo video");
+    const event = project(timelinePreviewEvent("demo.mp4", "video/mp4", bytes, "c".repeat(64), "Demo video"));
     const network = projectedNetwork(timelineGallerySnapshot(event));
     vi.mocked(network.downloadBlob).mockResolvedValue({ bytes, mediaType: "video/mp4" });
     const media = mediaPreviewFixture();
@@ -8078,6 +9158,56 @@ describe("native current-task Files ownership", () => {
     expect(app.state.timelinePreview).toBeUndefined();
   });
 
+  it.each([
+    { fileName: "source.zig", text: "\uFEFFsource\r\ntext" },
+    { fileName: ".env", text: "MODE=local\n" },
+    { fileName: "source.zig", text: "source\0binary", invalid: true }
+  ])("reads a current canonical Timeline text filename $fileName without changing Blob metadata", async ({ fileName, text, invalid = false }) => {
+    const bytes = new TextEncoder().encode(text);
+    const event = timelinePreviewEvent(fileName, "application/octet-stream", bytes, sha256Hex(bytes), fileName);
+    const network = projectedNetwork(timelineGallerySnapshot(event));
+    vi.mocked(network.downloadBlob).mockResolvedValue({ bytes, mediaType: "application/octet-stream" });
+    vi.mocked(network.readAround).mockResolvedValue([event]);
+    const app = client(network, memoryStorage(credential).storage);
+    await app.start();
+    await app.previewTimelineArtifact(timelineRows(app.state.detail?.timeline ?? [])[0]!.artifacts![0]!);
+    const preview = app.state.timelinePreview;
+    if (invalid) {
+      expect(preview).toMatchObject({ kind: "error", reason: expect.stringMatching(/binary/u) });
+    } else {
+      expect(preview).toMatchObject({ kind: "text", text, mediaType: "application/octet-stream" });
+      if (preview?.kind !== "text") throw new Error("Missing Timeline text preview");
+      expect((await app.prepareFileTextSourceCopy(preview, new AbortController().signal)).text).toBe(text);
+    }
+    expect(network.listWorkspaceDirectory).not.toHaveBeenCalled();
+    expect(network.readWorkspaceFile).not.toHaveBeenCalled();
+  });
+
+  it("renders a current durable Timeline HTML file without borrowing Workspace resource authority", async () => {
+    const html = '<button onclick="this.textContent=1">Run</button>'; const bytes = new TextEncoder().encode(html);
+    const event = timelinePreviewEvent("page.html", "text/html", bytes, sha256Hex(bytes), "Page");
+    const network = projectedNetwork(timelineGallerySnapshot(event));
+    vi.mocked(network.downloadBlob).mockResolvedValue({ bytes, mediaType: "text/html" });
+    const drafts = memoryDraftStores();
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined, undefined, undefined, drafts); await app.start();
+    await app.previewTimelineArtifact(timelineRows(app.state.detail?.timeline ?? [])[0]!.artifacts![0]!);
+    const preview = app.state.timelinePreview; if (preview?.kind !== "text") throw new Error("Missing HTML preview");
+    expect(app.filesHtmlResourceOwnerKey(preview)).toBeTruthy();
+    vi.mocked(network.readAround).mockResolvedValue([event]);
+    const copy = await app.prepareFileTextSourceCopy(preview, new AbortController().signal); expect(copy.text).toBe(html);
+    await app.addFileTextQuoteToComposer(preview, "Run", new AbortController().signal);
+    expect(drafts.composer.readSync({ profileId: credential.profileId, sessionId: "session" })?.atoms)
+      .toMatchObject([{ kind: "file-quote", sourcePath: "page.html", text: "Run" }]);
+    vi.mocked(network.readAround).mockResolvedValue([]);
+    await expect(app.prepareFileTextSourceCopy(preview, new AbortController().signal)).rejects.toThrow(/Timeline text file changed/u);
+    const descriptor = await app.prepareFilesHtmlResources(preview, new AbortController().signal);
+    expect(descriptor).toMatchObject({ html, total: 0, failed: 0 });
+    expect(network.listWorkspaceDirectory).not.toHaveBeenCalled(); expect(network.readWorkspaceHtmlSnapshot).not.toHaveBeenCalled();
+    app.closeTimelinePreview(); expect(app.filesHtmlResourceOwnerKey(preview)).toBeUndefined();
+    expect(() => copy.assertCurrent()).toThrow(/source changed/u);
+    await expect(app.prepareFilesHtmlResources(preview, new AbortController().signal)).rejects.toThrow(/current complete/u);
+  });
+
   it("previews an exact durable Timeline PDF and retires it on background", async () => {
     const bytes = previewPdfBytes();
     const event = timelinePreviewEvent("proof.pdf", "application/pdf", bytes, "f".repeat(64), "Proof");
@@ -8100,10 +9230,10 @@ describe("native current-task Files ownership", () => {
     expect(app.state.timelinePreview).toBeUndefined();
   });
 
-  it("cleans a late Timeline stage after the exact source window changes", async () => {
+  it.each(timelineFileSources)("cleans a late $kind stage after the exact source window changes", async ({ project }) => {
     const bytes = previewMp4Bytes();
-    const event = timelinePreviewEvent("late.mp4", "video/mp4", bytes, "e".repeat(64), "Late video");
-    const replacement = timelinePreviewEvent("replacement.mp4", "video/mp4", bytes, "d".repeat(64), "Replacement");
+    const event = project(timelinePreviewEvent("late.mp4", "video/mp4", bytes, "e".repeat(64), "Late video"));
+    const replacement = project(timelinePreviewEvent("replacement.mp4", "video/mp4", bytes, "d".repeat(64), "Replacement"));
     const network = projectedNetwork(timelineGallerySnapshot(event));
     vi.mocked(network.downloadBlob).mockResolvedValue({ bytes, mediaType: "video/mp4" });
     vi.mocked(network.readAround).mockResolvedValue([replacement]);
@@ -8205,15 +9335,15 @@ describe("native current-task Files ownership", () => {
     expect(network.uploadBlob).not.toHaveBeenCalled();
   });
 
-  it("freezes a same-directory raster gallery and appends only its decoded authenticated page", async () => {
+  it("freezes a same-directory image gallery and appends only its decoded authenticated page", async () => {
     const network = fakeNetwork();
     configureFiles(network, handoffSnapshot);
     const bytes = galleryPngBytes(3, 2);
     const firstRevision = create(FileRevisionSchema, {
-      opaqueRevision: "image-a", sha256Hex: "b".repeat(64), byteSize: BigInt(bytes.byteLength)
+      opaqueRevision: "image-a", sha256Hex: "b".repeat(64), byteSize: BigInt(bytes.byteLength), modifiedAt: { seconds: 10n, nanos: 0 }
     });
     const secondRevision = create(FileRevisionSchema, {
-      opaqueRevision: "image-b", sha256Hex: "b".repeat(64), byteSize: BigInt(bytes.byteLength)
+      opaqueRevision: "image-b", sha256Hex: "b".repeat(64), byteSize: BigInt(bytes.byteLength), modifiedAt: { seconds: 20n, nanos: 0 }
     });
     const entries = [
       create(WorkspaceEntrySchema, {
@@ -8258,16 +9388,18 @@ describe("native current-task Files ownership", () => {
     await app.openFiles();
     await app.openFilesDirectory("images");
 
-    const descriptor = await app.openFilesImageGallery({ kind: "workspace-entry", entry: app.state.files.entries[1]! });
+    const descriptor = await app.openFilesImageGallery({ kind: "workspace-entry", entry: app.state.files.entries[1]! }, undefined, "mtime");
     expect(descriptor).toMatchObject({
-      sourceKind: "workspace", initialIndex: 1,
-      pages: [{ title: "a.png" }, { title: "b.png" }]
+      sourceKind: "workspace", initialIndex: 0,
+      pages: [{ title: "b.png" }, { title: "a.png" }, { title: "moving.gif" }]
     });
     const page = await app.loadImageGalleryPage(descriptor.leaseId, descriptor.initialIndex);
     expect(page).toMatchObject({
-      pageIndex: 1, pageCount: 2, expectedWidthPixels: 3, expectedHeightPixels: 2,
+      pageIndex: 0, pageCount: 3, expectedWidthPixels: 3, expectedHeightPixels: 2,
       addable: true, annotatable: true
     });
+    const copiedPath = app.prepareFilesImageGalleryPathCopy(descriptor.leaseId, page.leaseId, page.pageId);
+    expect(copiedPath).toMatchObject({ text: "images/b.png", kind: "path" }); copiedPath.assertCurrent();
     app.confirmImageGalleryPageDecoded(descriptor.leaseId, page.leaseId, page.pageId, {
       width: 3, height: 2, mediaType: "image/png", isAnimated: false
     });
@@ -8297,6 +9429,7 @@ describe("native current-task Files ownership", () => {
     );
     await expect(app.addImageGalleryPageToComposer(descriptor.leaseId, page.leaseId))
       .rejects.toThrow(/no longer owns/u);
+    expect(() => copiedPath.assertCurrent()).toThrow(/visible Files image changed/u);
     expect(network.submit).not.toHaveBeenCalled();
   });
 
@@ -8306,6 +9439,7 @@ describe("native current-task Files ownership", () => {
     const bytes = galleryPngBytes(3, 2);
     const first = create(ArtifactSchema, {
       artifactId: "generated-image-one", sessionId: "session", kind: ArtifactKind.IMAGE, title: "First generated image",
+      createdAt: { seconds: 1n, nanos: 0 },
       blob: create(BlobRefSchema, {
         blobId: "generated-blob-one", fileName: "one.png", mediaType: "image/png",
         byteSize: BigInt(bytes.byteLength), sha256Hex: "b".repeat(64)
@@ -8320,6 +9454,7 @@ describe("native current-task Files ownership", () => {
     });
     const second = create(ArtifactSchema, {
       artifactId: "generated-image-two", sessionId: "session", kind: ArtifactKind.IMAGE, title: "Second generated image",
+      createdAt: { seconds: 2n, nanos: 0 },
       blob: create(BlobRefSchema, {
         blobId: "generated-blob-two", fileName: "two.png", mediaType: "image/png",
         byteSize: BigInt(bytes.byteLength), sha256Hex: "b".repeat(64)
@@ -8355,6 +9490,12 @@ describe("native current-task Files ownership", () => {
     });
     const page = await app.loadImageGalleryPage(descriptor.leaseId, descriptor.initialIndex);
     expect(page).toMatchObject({ fileName: "two.png", pageIndex: 1, pageCount: 2 });
+    const copiedName = app.prepareFilesImageGalleryPathCopy(descriptor.leaseId, page.leaseId, page.pageId);
+    expect(copiedName).toMatchObject({ text: "two.png", kind: "file-name" }); copiedName.assertCurrent();
+    const sorted = await app.openFilesImageGallery({ kind: "artifact", artifact: selected }, undefined, "mtime");
+    expect(() => copiedName.assertCurrent()).toThrow(/visible Files image changed/u);
+    expect(sorted).toMatchObject({ initialIndex: 0, pages: [{ title: "Second generated image" }, { title: "First generated image" }] });
+    await expect(app.loadImageGalleryPage(descriptor.leaseId, 0)).rejects.toThrow();
   });
 
   it("appends a gallery annotation with an isolated source and refuses an unconfirmed decode", async () => {
@@ -8420,10 +9561,432 @@ describe("native current-task Files ownership", () => {
     expect(network.submit).not.toHaveBeenCalled();
   });
 
-  it("opens only the selected durable message gallery and appends its authenticated decoded page", async () => {
+  it.each([
+    { format: "static GIF", fileName: "still.gif", mediaType: "image/gif", bytes: gifBytes(), animated: false, width: 1, height: 1 },
+    { format: "animated GIF", fileName: "moving.gif", mediaType: "image/gif", bytes: gifBytes(true), animated: true, width: 1, height: 1 },
+    { format: "SVG", fileName: "vector.svg", mediaType: "image/svg+xml", bytes: svgBytes(), animated: false, width: 40, height: 20 },
+    { format: "animated PNG", fileName: "moving.png", mediaType: "image/png", bytes: animatedPngBytes(), animated: true, width: 1, height: 1 },
+    { format: "registered APNG", fileName: "moving.apng", mediaType: "image/apng", bytes: animatedPngBytes(), animated: true, width: 1, height: 1 },
+    { format: "ICO", fileName: "icon.ico", mediaType: "image/x-icon", bytes: iconBytes([{ bytes: iconDibBytes(3, 2), width: 3, height: 2 }]), animated: false, width: 3, height: 2 }
+  ])("previews canonical $format, system-shares and appends original bytes, and rejects static rendering", async ({ fileName, mediaType, bytes, animated, width, height }) => {
+    const message = timelinePreviewEvent(fileName, mediaType, bytes, "b".repeat(64));
+    const projected = clone(SnapshotSchema, timelineGallerySnapshot(message));
+    const input = projected.backends[0]!.capabilities!.capabilities.find((item) => item.name === capabilityNames.inputImage)!.options!.kind;
+    if (input.case !== "input") throw new Error("fixture"); input.value.mediaTypes.push(mediaType);
+    const network = projectedNetwork(projected);
+    vi.mocked(network.downloadBlob).mockResolvedValue({ bytes, mediaType });
+    vi.mocked(network.readAround).mockResolvedValue([message]);
+    const blob = message.payload!.kind.case === "messageCompleted" ? message.payload!.kind.value.blocks[0]!.content : undefined;
+    if (blob?.case !== "artifact" || !blob.value.blob) throw new Error("fixture");
+    const canonical = blob.value.blob;
+    const authorized: AuthorizedBlobDownload = { url: credential.origin + "/v1/blobs/ticket", headers: { authorization: "Bearer private-key" },
+      blobId: canonical.blobId, fileName, mediaType, byteSize: bytes.byteLength, sha256Hex: canonical.sha256Hex };
+    vi.mocked(network.authorizeBlobDownload).mockResolvedValue(authorized);
+    const dispatch = vi.fn();
+    const perform = vi.fn(async (request: Parameters<MobileFileShare["perform"]>[0]) => {
+      await request.assertCurrent(); expect(dispatch).not.toHaveBeenCalled(); request.onDispatch?.();
+    });
+    const drafts = memoryDraftStores(); const identity = { profileId: credential.profileId, sessionId: "session" };
+    drafts.composer.save(identity, plainTextMobileComposerDraft("Keep the input")); await drafts.composer.flush(identity);
+    const fixture = attachmentFileFixture();
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined, fixedIds("format-gallery", "format-load", "format-output", "format-edit-source", "format-editor"),
+      undefined, drafts, fixture.files, undefined, undefined, undefined, { perform });
+    await app.start();
+    const selected = timelineRows(app.state.detail?.timeline ?? [])[0]!.images![0]!;
+    const descriptor = await app.openTimelineImageGallery(selected.sourceEventId!, selected.pageId);
+    const page = await app.loadImageGalleryPage(descriptor.leaseId, 0);
+    expect(page).toMatchObject({ sourceMediaType: mediaType, expectedWidthPixels: width, expectedHeightPixels: height,
+      expectedAnimated: animated, annotatable: false, addable: true, sourceBase64: Buffer.from(bytes).toString("base64") });
+    if (mediaType === "image/svg+xml") expect(Buffer.from(page.previewUri.split(",")[1]!, "base64").toString()).toContain('viewBox="0 0 40 20"');
+    expect(() => app.confirmImageGalleryPageDecoded(descriptor.leaseId, page.leaseId, page.pageId,
+      { width: mediaType === "image/gif" && !animated ? width + 1 : width, height, mediaType, isAnimated: !animated })).toThrow(/decoded image/u);
+    app.confirmImageGalleryPageDecoded(descriptor.leaseId, page.leaseId, page.pageId, { width, height, mediaType: page.previewMediaType ?? mediaType, isAnimated: mediaType === "image/gif" || animated });
+    await expect(app.prepareImageOutput(page.leaseId, { width, height, mediaType, isAnimated: false })).rejects.toThrow(/Animated|static image format|signature or dimensions/u);
+    await expect(app.commitImageGalleryPageToComposer(descriptor.leaseId, page.leaseId, [{ points: [{ x: 0.5, y: 0.5 }] }],
+      { bytes: renderedPngBytes, mediaType: "image/png", width, height })).rejects.toThrow(/cannot be rendered/u);
+    await app.shareImageGalleryPageOriginal(descriptor.leaseId, page.leaseId, undefined, dispatch);
+    expect(dispatch).toHaveBeenCalledOnce();
+    expect(perform).toHaveBeenCalledOnce(); expect(perform.mock.calls[0]![0].source).toEqual(authorized);
+    expect(network.readAround).toHaveBeenCalledTimes(2); expect(fixture.driver.stageBytes).not.toHaveBeenCalled();
+    const committed = await app.addImageGalleryPageToComposer(descriptor.leaseId, page.leaseId);
+    expect(committed).toMatchObject({ text: "Keep the input", attachments: [{ attachmentId: "format-output", fileName, mediaType, byteSize: bytes.byteLength }] });
+    expect(fixture.bytes.get("format-output")).toEqual(bytes);
+    const editor = await app.openComposerImageEditor({ surface: "task", attachmentId: "format-output" });
+    expect(editor.annotatable).toBe(false);
+    expect(network.submit).not.toHaveBeenCalled(); expect(network.uploadBlob).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { fileName: "photo.bmp", mediaType: "image/bmp", bytes: bmpBytes(3, 2), originalOnly: false },
+    { fileName: "photo.avif", mediaType: "image/avif", bytes: isoImageBytes(["avif"], 3, 2, { thumbnail: { width: 20, height: 10 } }), originalOnly: false },
+    { fileName: "photo.heic", mediaType: "image/heic", bytes: isoImageBytes(["heic", "mif1"], 3, 2), originalOnly: false },
+    { fileName: "photo.heif", mediaType: "image/heif", bytes: isoImageBytes(["mif1"], 3, 2), originalOnly: false },
+    { fileName: "scan.tiff", mediaType: "image/tiff", bytes: tiffBytes(3, 2), originalOnly: false },
+    { fileName: "icon.ico", mediaType: "image/x-icon", bytes: iconBytes([{ bytes: iconDibBytes(1, 1), width: 1, height: 1 }, { bytes: iconDibBytes(3, 2), width: 3, height: 2 }]), originalOnly: true }
+  ])("opens canonical $mediaType Files and Generated images with exact primary dimensions and original output bytes", async ({ fileName, mediaType, bytes, originalOnly }) => {
+    const network = fakeNetwork(); configureFiles(network, handoffSnapshot);
+    const revision = create(FileRevisionSchema, { opaqueRevision: "container-image", sha256Hex: "b".repeat(64), byteSize: BigInt(bytes.length) });
+    const entry = create(WorkspaceEntrySchema, { workspaceId: "workspace", relativePath: fileName, displayName: fileName,
+      mediaType, kind: FileKind.REGULAR, revision });
+    const blob = create(BlobRefSchema, { blobId: "container-blob", fileName, mediaType, byteSize: BigInt(bytes.length), sha256Hex: "b".repeat(64), disposition: BlobDisposition.INLINE });
+    const artifact = create(ArtifactSchema, { artifactId: "container-artifact", sessionId: "session", kind: ArtifactKind.IMAGE, title: "Image", blob });
+    vi.mocked(network.listWorkspaceDirectory).mockResolvedValue({ entries: [entry], revision: "container-directory" });
+    vi.mocked(network.listWorkspaceFileIndex).mockResolvedValue({ paths: [fileName], revision: "container-index", truncated: false });
+    vi.mocked(network.readWorkspaceFile).mockResolvedValue(create(FilePreviewSchema, { entry, content: { case: "image", value: { blob } } }));
+    vi.mocked(network.listSessionArtifacts).mockResolvedValue({ artifacts: [artifact], revision: "container-catalog" });
+    vi.mocked(network.downloadBlob).mockResolvedValue({ bytes, mediaType });
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined, fixedIds("container-gallery", "container-load"),
+      undefined, memoryDraftStores(), attachmentFileFixture().files);
+    await app.start(); await app.openFiles(); await app.previewWorkspaceEntry(entry);
+    expect(app.state.files.preview).toMatchObject({ kind: "image", mediaType, widthPixels: 3, heightPixels: 2 });
+    if (mediaType === "image/x-icon") expect(app.state.files.preview?.kind === "image" && app.state.files.preview.dataUri.startsWith("data:image/png;")).toBe(true);
+    const descriptor = await app.openFilesImageGallery({ kind: "workspace-entry", entry }); const page = await app.loadImageGalleryPage(descriptor.leaseId, 0);
+    expect(page).toMatchObject({ sourceMediaType: mediaType, expectedWidthPixels: 3, expectedHeightPixels: 2, originalOnly,
+      sourceBase64: Buffer.from(bytes).toString("base64") });
+    expect(() => app.confirmImageGalleryPageDecoded(descriptor.leaseId, page.leaseId, page.pageId,
+      { width: 20, height: 10, mediaType, isAnimated: false })).toThrow(/decoded image/u);
+    app.confirmImageGalleryPageDecoded(descriptor.leaseId, page.leaseId, page.pageId, { width: 3, height: 2, mediaType: page.previewMediaType ?? mediaType, isAnimated: false });
+    if (!originalOnly) {
+      const output = await app.prepareImageOutput(page.leaseId, { width: 3, height: 2, mediaType, isAnimated: false });
+      expect(output).toMatchObject({ mediaType, width: 3, height: 2 }); expect(output.bytes).toEqual(bytes);
+    }
+    app.cancelImageGallery(descriptor.leaseId); app.openGeneratedFiles(); await app.previewArtifact(artifact);
+    expect(app.state.files.preview).toMatchObject({ kind: "image", mediaType, widthPixels: 3, heightPixels: 2 });
+    expect(network.materializeWorkspaceFileBlob).not.toHaveBeenCalled(); expect(network.submit).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { format: "jpeg", nativeWidth: 4, nativeHeight: 6, headerWidth: 4, headerHeight: 6 },
+    { format: "png", nativeWidth: 4, nativeHeight: 6, headerWidth: 6, headerHeight: 4 },
+    { format: "png", nativeWidth: 6, nativeHeight: 4, headerWidth: 6, headerHeight: 4 },
+    { format: "webp", nativeWidth: 4, nativeHeight: 6, headerWidth: 6, headerHeight: 4 },
+    { format: "webp", nativeWidth: 6, nativeHeight: 4, headerWidth: 6, headerHeight: 4 }
+  ] as const)("keeps a real EXIF portrait $format's $nativeWidth×$nativeHeight native canvas and original bytes through Generated gallery and Composer", async ({ format, nativeWidth, nativeHeight, headerWidth, headerHeight }) => {
+    const mediaType = "image/" + format; const fileName = "portrait." + (format === "jpeg" ? "jpg" : format);
+    const bytes = await sharp({ create: { width: 6, height: 4, channels: 3, background: "#ff9800" } })
+      .withMetadata({ orientation: 6 }).toFormat(format).toBuffer();
+    const sha256Hex = createHash("sha256").update(bytes).digest("hex");
+    const blob = create(BlobRefSchema, { blobId: "portrait-blob", fileName, mediaType,
+      byteSize: BigInt(bytes.byteLength), sha256Hex, disposition: BlobDisposition.INLINE });
+    const artifact = create(ArtifactSchema, { artifactId: "portrait-artifact", sessionId: "session", kind: ArtifactKind.IMAGE, title: "Portrait", blob });
+    const snapshot = clone(SnapshotSchema, handoffSnapshot);
+    const input = snapshot.backends[0]!.capabilities!.capabilities.find((item) => item.name === capabilityNames.inputImage)!.options!.kind;
+    if (input.case !== "input") throw new Error("fixture");
+    if (!input.value.mediaTypes.includes(mediaType)) input.value.mediaTypes.push(mediaType); input.value.maximumBytes = 4_096n;
+    const network = fakeNetwork(); configureFiles(network, snapshot);
+    vi.mocked(network.listSessionArtifacts).mockResolvedValue({ artifacts: [artifact], revision: "portrait-catalog" });
+    vi.mocked(network.downloadBlob).mockResolvedValue({ bytes, mediaType });
+    const drafts = memoryDraftStores(); const fixture = attachmentFileFixture();
+    const files = new MobileAttachmentFiles(fixture.driver, async (value) => createHash("sha256").update(value).digest("hex"));
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined,
+      fixedIds("portrait-gallery", "portrait-load", "portrait-output", "portrait-source", "portrait-editor"), undefined, drafts, files);
+    await app.start(); await app.openFiles(); app.openGeneratedFiles(); await app.previewArtifact(artifact);
+    expect(app.state.files.preview).toMatchObject({ kind: "image", mediaType, widthPixels: headerWidth, heightPixels: headerHeight });
+    const descriptor = await app.openFilesImageGallery({ kind: "artifact", artifact });
+    const page = await app.loadImageGalleryPage(descriptor.leaseId, 0);
+    expect(page).toMatchObject({ sourceMediaType: mediaType, expectedWidthPixels: headerWidth, expectedHeightPixels: headerHeight,
+      sourceBase64: bytes.toString("base64"), annotatable: true, addable: true,
+      ...(format === "jpeg" ? {} : { nativeQuarterTurn: true }) });
+    expect(() => app.confirmImageGalleryPageDecoded(descriptor.leaseId, page.leaseId, page.pageId,
+      { width: format === "jpeg" ? 6 : 5, height: 4, isAnimated: false })).toThrow(/decoded image/u);
+    app.confirmImageGalleryPageDecoded(descriptor.leaseId, page.leaseId, page.pageId,
+      { width: nativeWidth, height: nativeHeight, mediaType, isAnimated: false });
+    expect(() => app.confirmImageGalleryPageDecoded(descriptor.leaseId, page.leaseId, page.pageId,
+      { width: nativeHeight, height: nativeWidth, mediaType, isAnimated: false })).toThrow(/decoded image/u);
+    const output = await app.prepareImageOutput(page.leaseId, { width: nativeWidth, height: nativeHeight, mediaType, isAnimated: false });
+    expect(output).toMatchObject({ width: nativeWidth, height: nativeHeight, sha256Hex, mediaType }); expect(Buffer.from(output.bytes)).toEqual(bytes);
+    const committed = await app.addImageGalleryPageToComposer(descriptor.leaseId, page.leaseId);
+    expect(committed.attachments).toEqual([expect.objectContaining({ fileName, mediaType, sha256Hex })]);
+    expect(Buffer.from(fixture.bytes.get("portrait-output")!)).toEqual(bytes);
+    const editor = await app.openComposerImageEditor({ surface: "task", attachmentId: "portrait-output" });
+    expect(editor).toMatchObject({ expectedWidthPixels: headerWidth, expectedHeightPixels: headerHeight,
+      sourceBase64: bytes.toString("base64"), annotatable: true,
+      ...(format === "jpeg" ? {} : { nativeQuarterTurn: true }) });
+    expect(network.submit).not.toHaveBeenCalled(); expect(network.uploadBlob).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { mediaType: "image/tiff", fileName: "design.tiff", bytes: () => tiffBytes(6, 4) },
+    { mediaType: "image/heic", fileName: "design.heic", bytes: () => isoImageBytes(["heic", "mif1"], 6, 4) },
+    { mediaType: "image/heif", fileName: "design.heif", bytes: () => isoImageBytes(["mif1"], 6, 4) }
+  ])("retains a native image original ($mediaType) through PNG-only Composer annotation and restores an unmarked PNG after editing", async ({ mediaType, fileName, bytes: fixtureBytes }) => {
+    const bytes = fixtureBytes();
+    const sha256Hex = createHash("sha256").update(bytes).digest("hex");
+    const blob = create(BlobRefSchema, { blobId: "native-raster-blob", fileName, mediaType,
+      byteSize: BigInt(bytes.byteLength), sha256Hex, disposition: BlobDisposition.INLINE });
+    const artifact = create(ArtifactSchema, { artifactId: "native-raster-artifact", sessionId: "session",
+      kind: ArtifactKind.IMAGE, title: "Design", blob });
+    const snapshot = clone(SnapshotSchema, handoffSnapshot);
+    const input = snapshot.backends[0]!.capabilities!.capabilities
+      .find((item) => item.name === capabilityNames.inputImage)!.options!.kind;
+    if (input.case !== "input") throw new Error("fixture");
+    input.value.mediaTypes = ["image/png"];
+    input.value.maximumBytes = 4_096n;
+    const network = fakeNetwork(); configureFiles(network, snapshot);
+    vi.mocked(network.listSessionArtifacts).mockResolvedValue({ artifacts: [artifact], revision: "native-raster-catalog" });
+    vi.mocked(network.downloadBlob).mockResolvedValue({ bytes, mediaType });
+    const fixture = attachmentFileFixture(); const drafts = memoryDraftStores(); let id = 0;
+    const files = new MobileAttachmentFiles(fixture.driver,
+      async (value) => createHash("sha256").update(value).digest("hex"));
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined,
+      () => "native-raster-" + ++id, undefined, drafts, files);
+    await app.start(); await app.openFiles(); app.openGeneratedFiles(); await app.previewArtifact(artifact);
+    expect(app.state.files.preview).toMatchObject({ kind: "image", mediaType, widthPixels: 6, heightPixels: 4 });
+    const descriptor = await app.openFilesImageGallery({ kind: "artifact", artifact });
+    const page = await app.loadImageGalleryPage(descriptor.leaseId, 0);
+    expect(page).toMatchObject({ sourceMediaType: mediaType, annotatable: true, addable: false });
+    app.confirmImageGalleryPageDecoded(descriptor.leaseId, page.leaseId, page.pageId,
+      { width: 6, height: 4, mediaType, isAnimated: false });
+    const original = await app.prepareImageOutput(page.leaseId,
+      { width: 6, height: 4, mediaType, isAnimated: false });
+    expect(original.bytes).toEqual(bytes); expect(original.sha256Hex).toBe(sha256Hex);
+    await expect(app.addImageGalleryPageToComposer(descriptor.leaseId, page.leaseId))
+      .rejects.toThrow(/attachment policy/u);
+    const rendered = Uint8Array.from(await sharp({
+      create: { width: 6, height: 4, channels: 3, background: "#ff9800" }
+    }).png().toBuffer());
+    const strokes = [{ points: [{ x: 0.2, y: 0.3 }, { x: 0.8, y: 0.7 }] }];
+    const committed = await app.commitImageGalleryPageToComposer(descriptor.leaseId, page.leaseId, strokes,
+      { bytes: rendered, mediaType: "image/png", width: 6, height: 4 });
+    const attachment = committed.attachments[0]!;
+    expect(attachment).toMatchObject({ mediaType: "image/png", fileName: "design-annotated.png",
+      annotation: { strokes, source: { mediaType, fileName, byteSize: bytes.byteLength, sha256Hex } } });
+    expect(attachment.annotation).toBeDefined();
+    expect(fixture.bytes.get(attachment.annotation!.source.storageId)).toEqual(bytes);
+    const editor = await app.openComposerImageEditor({ surface: "task", attachmentId: attachment.attachmentId });
+    expect(editor).toMatchObject({ sourceMediaType: mediaType, sourceBase64: Buffer.from(bytes).toString("base64"),
+      initialStrokes: strokes, annotatable: true });
+    await expect(app.commitComposerImageEditor(editor.leaseId, [])).rejects.toThrow(/cannot be rendered/u);
+    const restored = await app.commitComposerImageEditor(editor.leaseId, [], {
+      bytes: rendered, mediaType: "image/png", width: 6, height: 4
+    });
+    expect(restored.draft.attachments[0]).toMatchObject({ mediaType: "image/png", fileName: "design.png" });
+    expect(restored.draft.attachments[0]!.annotation).toBeUndefined();
+    expect(blob).toMatchObject({ mediaType, fileName, sha256Hex });
+    expect(network.submit).not.toHaveBeenCalled(); expect(network.uploadBlob).not.toHaveBeenCalled();
+  });
+
+  it("retires original gallery sharing on cancellation and rejects fresh source drift before native dispatch", async () => {
+    const bytes = gifBytes(true); const message = timelinePreviewEvent("moving.gif", "image/gif", bytes, "b".repeat(64));
+    const network = projectedNetwork(timelineGallerySnapshot(message));
+    vi.mocked(network.downloadBlob).mockResolvedValue({ bytes, mediaType: "image/gif" });
+    vi.mocked(network.readAround).mockResolvedValue([message]);
+    vi.mocked(network.authorizeBlobDownload).mockResolvedValue({ url: credential.origin + "/v1/blobs/ticket", headers: { authorization: "Bearer private-key" },
+      blobId: "timeline-moving.gif", fileName: "moving.gif", mediaType: "image/gif", byteSize: bytes.byteLength, sha256Hex: "b".repeat(64) });
+    let request!: Parameters<MobileFileShare["perform"]>[0]; let finish!: () => void;
+    const perform = vi.fn(async (value: typeof request) => { request = value; await new Promise<void>((resolve) => { finish = resolve; }); await request.assertCurrent(); });
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined, fixedIds("cancel-gallery", "cancel-page", "fresh-gallery", "fresh-page"), undefined, undefined, attachmentFileFixture().files,
+      undefined, undefined, undefined, { perform });
+    await app.start();
+    const selected = timelineRows(app.state.detail!.timeline)[0]!.images![0]!;
+    const descriptor = await app.openTimelineImageGallery(selected.sourceEventId!, selected.pageId);
+    const page = await app.loadImageGalleryPage(descriptor.leaseId, 0);
+    app.confirmImageGalleryPageDecoded(descriptor.leaseId, page.leaseId, page.pageId, { width: 1, height: 1, isAnimated: true });
+    const sharing = app.shareImageGalleryPageOriginal(descriptor.leaseId, page.leaseId); const rejected = expect(sharing).rejects.toThrow();
+    await vi.waitFor(() => expect(perform).toHaveBeenCalledOnce());
+    await expect(app.shareImageGalleryPageOriginal(descriptor.leaseId, page.leaseId)).rejects.toThrow(/no longer owns/u);
+    app.cancelImageGallery(descriptor.leaseId); expect(request.signal!.aborted).toBe(true); finish(); await rejected;
+    const next = await app.openTimelineImageGallery(selected.sourceEventId!, selected.pageId);
+    const nextPage = await app.loadImageGalleryPage(next.leaseId, 0);
+    app.confirmImageGalleryPageDecoded(next.leaseId, nextPage.leaseId, nextPage.pageId, { width: 1, height: 1, isAnimated: true });
+    vi.mocked(network.readAround).mockResolvedValue([]);
+    await expect(app.shareImageGalleryPageOriginal(next.leaseId, nextPage.leaseId)).rejects.toThrow(/Timeline image changed/u);
+    expect(perform).toHaveBeenCalledOnce(); expect(network.authorizeBlobDownload).toHaveBeenCalledOnce();
+  });
+
+  it.each(["Workspace", "Generated"])("previews and shares a canonical %s SVG through its exact typed Blob and rejects a changed source", async (origin) => {
+    const bytes = svgBytes(); const network = fakeNetwork(); configureFiles(network, handoffSnapshot);
+    const imageRevision = create(FileRevisionSchema, { opaqueRevision: "svg-r1", byteSize: BigInt(bytes.byteLength), sha256Hex: "b".repeat(64) });
+    const entry = create(WorkspaceEntrySchema, { workspaceId: "workspace", relativePath: "vector.svg", displayName: "vector.svg",
+      mediaType: "image/svg+xml", kind: FileKind.REGULAR, revision: imageRevision });
+    const blob = create(BlobRefSchema, { blobId: "svg-blob", fileName: "vector.svg", mediaType: "image/svg+xml", byteSize: BigInt(bytes.byteLength),
+      sha256Hex: "b".repeat(64), disposition: BlobDisposition.INLINE });
+    const artifact = create(ArtifactSchema, { artifactId: "vector-artifact", sessionId: "session", kind: ArtifactKind.IMAGE, title: "Vector", blob });
+    vi.mocked(network.listWorkspaceDirectory).mockResolvedValue({ entries: [entry], revision: "svg-directory" });
+    vi.mocked(network.listWorkspaceFileIndex).mockResolvedValue({ paths: ["vector.svg"], revision: "svg-index", truncated: false });
+    vi.mocked(network.readWorkspaceFile).mockResolvedValue(create(FilePreviewSchema, { entry, content: { case: "text", value: {
+      utf8Text: new TextDecoder().decode(bytes), startByte: 0n, endByte: BigInt(bytes.byteLength), totalLines: 1, languageId: "xml" } } }));
+    vi.mocked(network.materializeWorkspaceFileBlob).mockResolvedValue({ entry, blob });
+    vi.mocked(network.listSessionArtifacts).mockResolvedValue({ artifacts: [artifact], revision: "svg-catalog" });
+    vi.mocked(network.downloadBlob).mockResolvedValue({ bytes, mediaType: "image/svg+xml" });
+    const authorized: AuthorizedBlobDownload = { url: credential.origin + "/v1/blobs/svg-ticket", headers: { authorization: "Bearer private-key" },
+      blobId: blob.blobId, fileName: blob.fileName, mediaType: blob.mediaType, byteSize: bytes.byteLength, sha256Hex: blob.sha256Hex };
+    vi.mocked(network.authorizeBlobDownload).mockResolvedValue(authorized);
+    const perform = vi.fn(async (request: Parameters<MobileFileShare["perform"]>[0]) => { await request.assertCurrent(); });
+    const drafts = memoryDraftStores(); const identity = { profileId: credential.profileId, sessionId: "session" };
+    drafts.composer.save(identity, plainTextMobileComposerDraft("Read only")); await drafts.composer.flush(identity);
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined, fixedIds("svg-gallery", "svg-load"),
+      undefined, drafts, attachmentFileFixture().files, undefined, undefined, undefined, { perform });
+    await app.start(); await app.openFiles();
+    const source = origin === "Workspace" ? { kind: "workspace-entry" as const, entry } : { kind: "artifact" as const, artifact };
+    if (origin === "Workspace") {
+      await app.previewWorkspaceEntry(entry);
+      expect(network.materializeWorkspaceFileBlob).toHaveBeenCalledWith(credential, "workspace", "vector.svg", imageRevision, expect.any(AbortSignal));
+    } else { app.openGeneratedFiles(); await app.previewArtifact(artifact); }
+    expect(app.state.files.preview).toMatchObject({ kind: "image", mediaType: "image/svg+xml", widthPixels: 40, heightPixels: 20 });
+    const descriptor = await app.openFilesImageGallery(source); const page = await app.loadImageGalleryPage(descriptor.leaseId, 0);
+    expect(page).toMatchObject({ annotatable: false, addable: false, sourceMediaType: "image/svg+xml", expectedAnimated: false });
+    app.confirmImageGalleryPageDecoded(descriptor.leaseId, page.leaseId, page.pageId, { width: 40, height: 20, mediaType: "image/svg+xml", isAnimated: false });
+    await app.shareImageGalleryPageOriginal(descriptor.leaseId, page.leaseId);
+    expect(perform).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ source: authorized }));
+    if (origin === "Workspace") vi.mocked(network.listWorkspaceDirectory).mockResolvedValue({ entries: [{ ...entry, revision: { ...imageRevision, opaqueRevision: "svg-r2" } }], revision: "svg-directory-next" });
+    else vi.mocked(network.listSessionArtifacts).mockResolvedValue({ artifacts: [artifact], revision: "svg-catalog-next" });
+    await expect(app.shareImageGalleryPageOriginal(descriptor.leaseId, page.leaseId)).rejects.toThrow(/image changed/u);
+    expect(perform).toHaveBeenCalledOnce(); expect(network.authorizeBlobDownload).toHaveBeenCalledOnce();
+    expect(await drafts.composer.read(identity)).toEqual(plainTextMobileComposerDraft("Read only"));
+  });
+
+  it("prepares canonical inline images independently of Gallery and reauthorizes their cached source", async () => {
+    const bytes = iconBytes([{ bytes: iconDibBytes(3, 2), width: 3, height: 2 }]);
+    const message = timelinePreviewEvent("icon.ico", "image/x-icon", bytes, createHash("sha256").update(bytes).digest("hex"));
+    const network = projectedNetwork(timelineGallerySnapshot(message));
+    vi.mocked(network.readAround).mockResolvedValue([message]); vi.mocked(network.downloadBlob).mockResolvedValue({ bytes, mediaType: "image/x-icon" });
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined, fixedIds("inline-gallery", "original-page"), undefined, memoryDraftStores());
+    await app.start(); const selected = timelineRows(app.state.detail!.timeline)[0]!.images![0]!;
+    const preview = await app.prepareTimelineImagePreview(selected.sourceEventId!, selected.pageId, new AbortController().signal);
+    expect(preview).toMatchObject({ width: 3, height: 2, mediaType: "image/png" });
+    app.confirmTimelineImagePreview(preview.leaseId, { width: 3, height: 2, mediaType: "image/png", isAnimated: false }); app.releaseTimelineImagePreview(preview.leaseId);
+    const cached = await app.prepareTimelineImagePreview(selected.sourceEventId!, selected.pageId, new AbortController().signal);
+    expect(network.downloadBlob).toHaveBeenCalledOnce(); expect(network.readAround).toHaveBeenCalledTimes(2);
+    const gallery = await app.openTimelineImageGallery(selected.sourceEventId!, selected.pageId);
+    const original = await app.loadImageGalleryPage(gallery.leaseId, 0);
+    expect(original.sourceBase64).toBe(Buffer.from(bytes).toString("base64")); expect(network.downloadBlob).toHaveBeenCalledTimes(2);
+    app.setForeground(false); expect(app.timelineImagePreviewOwnerKey()).toBeUndefined();
+    expect(() => app.confirmTimelineImagePreview(cached.leaseId, { width: 3, height: 2 })).toThrow(/released|owner/u);
+    expect(network.submit).not.toHaveBeenCalled();
+  });
+
+  it("uses a generated thumbnail only for inline presentation and keeps authentication failures out of original fallback", async () => {
+    const bytes = Uint8Array.from(await sharp({ create: { width: 1, height: 1, channels: 3, background: "orange" } }).webp().toBuffer());
+    const message = timelinePreviewEvent("one.webp", "image/webp", bytes, sha256Hex(bytes));
+    const network = projectedNetwork(timelineGallerySnapshot(message)); vi.mocked(network.readAround).mockResolvedValue([message]);
+    vi.mocked(network.readImageThumbnail).mockResolvedValue(create(ImageThumbnailSchema, { data: bytes, mediaType: "image/webp", sha256Hex: sha256Hex(bytes),
+      widthPixels: 1, heightPixels: 1, sourceWidthPixels: 1, sourceHeightPixels: 1 }));
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined, fixedIds("thumbnail-gallery", "thumbnail-original"), undefined, memoryDraftStores());
+    await app.start(); const selected = timelineRows(app.state.detail!.timeline)[0]!.images![0]!;
+    const preview = await app.prepareTimelineImagePreview(selected.sourceEventId!, selected.pageId, new AbortController().signal);
+    expect(network.readImageThumbnail).toHaveBeenCalledExactlyOnceWith(credential, expect.objectContaining({ blobId: "timeline-one.webp" }), 1024, expect.any(AbortSignal));
+    expect(network.downloadBlob).not.toHaveBeenCalled(); app.releaseTimelineImagePreview(preview.leaseId);
+    const gallery = await app.openTimelineImageGallery(selected.sourceEventId!, selected.pageId); vi.mocked(network.downloadBlob).mockResolvedValue({ bytes, mediaType: "image/webp" });
+    await app.loadImageGalleryPage(gallery.leaseId, 0); expect(network.downloadBlob).toHaveBeenCalledOnce(); expect(network.readImageThumbnail).toHaveBeenCalledOnce();
+    app.releaseImageGalleryPreview(gallery.leaseId, preview.leaseId, true);
+    // A new source/cache miss cannot hide a revoked or malformed thumbnail RPC behind an original download.
+    app.setForeground(false); app.setForeground(true); await app.refresh();
+    vi.mocked(network.readImageThumbnail).mockRejectedValueOnce(new Error("thumbnail connection revoked"));
+    await expect(app.prepareTimelineImagePreview(selected.sourceEventId!, selected.pageId, new AbortController().signal)).rejects.toThrow(/revoked/u);
+    expect(network.downloadBlob).toHaveBeenCalledOnce();
+  });
+
+  it("pins an exact cached gallery preview independently of the inline view and retires original actions during page replacement", async () => {
+    const bytes = iconBytes([{ bytes: iconDibBytes(3, 2), width: 3, height: 2 }]);
+    const message = timelinePreviewEvent("icon.ico", "image/x-icon", bytes, sha256Hex(bytes));
+    const network = projectedNetwork(timelineGallerySnapshot(message));
+    vi.mocked(network.readAround).mockResolvedValue([message]); vi.mocked(network.downloadBlob).mockResolvedValue({ bytes, mediaType: "image/x-icon" });
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined, fixedIds("pinned-gallery", "original-one", "original-two"), undefined, memoryDraftStores());
+    await app.start(); const selected = timelineRows(app.state.detail!.timeline)[0]!.images![0]!;
+    const controller = new AbortController(); const inline = await app.prepareTimelineImagePreview(selected.sourceEventId!, selected.pageId, controller.signal);
+    const gallery = await app.openTimelineImageGallery(selected.sourceEventId!, selected.pageId); expect(app.imageGalleryCurrent(gallery.leaseId)).toBe(true);
+    const preview = await app.pinImageGalleryCachedPreview(gallery.leaseId, 0, new AbortController().signal);
+    expect(preview?.uri).toBe(inline.uri); expect(preview?.leaseId).not.toBe(inline.leaseId); expect(network.downloadBlob).toHaveBeenCalledOnce();
+    controller.abort(); app.confirmTimelineImagePreview(preview!.leaseId, { width: 3, height: 2, mediaType: "image/png", isAnimated: false });
+    const original = await app.loadImageGalleryPage(gallery.leaseId, 0);
+    app.confirmImageGalleryPageDecoded(gallery.leaseId, original.leaseId, original.pageId, { width: 3, height: 2, mediaType: "image/png", isAnimated: false });
+    vi.mocked(network.downloadBlob).mockRejectedValueOnce(new Error("fetch failed"));
+    await expect(app.loadImageGalleryPage(gallery.leaseId, 0)).rejects.toThrow("fetch failed");
+    expect(() => app.confirmImageGalleryPageDecoded(gallery.leaseId, original.leaseId, original.pageId, { width: 3, height: 2 })).toThrow(/decoded|gallery/u);
+    await expect(app.addImageGalleryPageToComposer(gallery.leaseId, original.leaseId)).rejects.toThrow(/decoded gallery/u);
+    app.setForeground(false); expect(app.imageGalleryCurrent(gallery.leaseId)).toBe(false);
+    expect(() => app.confirmTimelineImagePreview(preview!.leaseId, { width: 3, height: 2 })).toThrow(/released/u);
+    expect(await app.pinImageGalleryCachedPreview(gallery.leaseId, 0, new AbortController().signal)).toBeUndefined();
+  });
+
+  it("prepares only adjacent gallery images without replacing current actions and retains the real Blob slot after cancelled prefetch", async () => {
+    const bytes = galleryPngBytes(5, 4); const message = timelineGalleryEvent(bytes);
+    if (message.payload?.kind.case !== "messageCompleted") throw new Error("fixture");
+    for (const block of message.payload.kind.value.blocks) if (block.content.case === "image") block.content.value.blob!.sha256Hex = sha256Hex(bytes);
+    const network = projectedNetwork(timelineGallerySnapshot(message)); vi.mocked(network.readAround).mockResolvedValue([message]);
+    vi.mocked(network.downloadBlob).mockResolvedValue({ bytes, mediaType: "image/png" });
+    const files = attachmentFileFixture();
+    const drafts = memoryDraftStores(); const snapshots = vi.spyOn(drafts.composer, "readSnapshot");
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined,
+      fixedIds("warm-gallery", "current-image", "next-image"), undefined, drafts, new MobileAttachmentFiles(files.driver, async (value) => sha256Hex(value)));
+    await app.start(); const selected = timelineRows(app.state.detail!.timeline)[0]!.images![0]!;
+    const gallery = await app.openTimelineImageGallery(selected.sourceEventId!, selected.pageId);
+    const current = await app.loadImageGalleryPage(gallery.leaseId, 0);
+    app.confirmImageGalleryPageDecoded(gallery.leaseId, current.leaseId, current.pageId, { width: 5, height: 4, mediaType: "image/png", isAnimated: false });
+    await expect(app.prepareImageGalleryAdjacentPreview(gallery.leaseId, 0, new AbortController().signal)).rejects.toThrow(/adjacent/u);
+    vi.mocked(network.readAround).mockResolvedValueOnce([]);
+    await expect(app.prepareImageGalleryAdjacentPreview(gallery.leaseId, 1, new AbortController().signal)).rejects.toThrow(/Timeline image changed/u);
+    expect(network.downloadBlob).toHaveBeenCalledOnce();
+    const cached = await app.prepareImageGalleryAdjacentPreview(gallery.leaseId, 1, new AbortController().signal);
+    expect(cached).toMatchObject({ width: 5, height: 4, mediaType: "image/png" });
+    expect(await app.prepareImageOutput(current.leaseId, { width: 5, height: 4, mediaType: "image/png", isAnimated: false })).toMatchObject({ bytes });
+    expect(network.downloadBlob).toHaveBeenCalledTimes(2);
+    app.releaseImageGalleryPreview(gallery.leaseId, cached.leaseId, true);
+    let finish!: (value: { bytes: Uint8Array; mediaType: string }) => void;
+    vi.mocked(network.downloadBlob).mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+    const controller = new AbortController();
+    const warming = app.prepareImageGalleryAdjacentPreview(gallery.leaseId, 1, controller.signal);
+    const rejected = expect(warming).rejects.toThrow(/cancelled|aborted/u);
+    await vi.waitFor(() => expect(network.downloadBlob).toHaveBeenCalledTimes(3)); controller.abort(); await rejected;
+    const reads = snapshots.mock.calls.length;
+    const next = app.loadImageGalleryPage(gallery.leaseId, 1, new AbortController().signal);
+    await vi.waitFor(() => expect(snapshots.mock.calls.length).toBeGreaterThan(reads));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(network.downloadBlob).toHaveBeenCalledTimes(3);
+    finish({ bytes, mediaType: "image/png" }); expect((await next).pageIndex).toBe(1); expect(network.downloadBlob).toHaveBeenCalledTimes(4);
+    app.setForeground(false);
+    await expect(app.prepareImageGalleryAdjacentPreview(gallery.leaseId, 0, new AbortController().signal)).rejects.toThrow(/adjacent/u);
+    expect(network.submit).not.toHaveBeenCalled();
+  });
+
+  it("rejects remote Tool replacement before inline download and cancels a late inline result on background", async () => {
+    const bytes = gifBytes(); const message = timelinePreviewEvent("old.gif", "image/gif", bytes, createHash("sha256").update(bytes).digest("hex"));
+    const tool = toolMediaEvent(message, "toolCallStarted");
+    const replacementMessage = timelinePreviewEvent("new.gif", "image/gif", bytes, createHash("sha256").update(bytes).digest("hex"));
+    replacementMessage.eventId = "new-tool-output"; replacementMessage.cursor!.sequence = 13n;
+    const replacement = toolMediaEvent(replacementMessage, "toolCallUpdated");
+    const network = projectedNetwork(timelineGallerySnapshot(tool)); vi.mocked(network.readAround).mockResolvedValue([tool, replacement]);
+    const app = client(network, memoryStorage(credential).storage); await app.start(); const selected = timelineRows(app.state.detail!.timeline)[0]!.images![0]!;
+    await expect(app.prepareTimelineImagePreview(selected.sourceEventId!, selected.pageId, new AbortController().signal)).rejects.toThrow(/authenticated inline/u);
+    expect(network.downloadBlob).not.toHaveBeenCalled(); vi.mocked(network.readAround).mockResolvedValue([tool]);
+    let finish!: (value: { bytes: Uint8Array; mediaType: string }) => void;
+    vi.mocked(network.downloadBlob).mockImplementation(() => new Promise((resolve) => { finish = resolve; }));
+    const loading = app.prepareTimelineImagePreview(selected.sourceEventId!, selected.pageId, new AbortController().signal); const rejected = expect(loading).rejects.toThrow(/cancelled/u);
+    await vi.waitFor(() => expect(network.downloadBlob).toHaveBeenCalledOnce()); app.setForeground(false); await rejected;
+    finish({ bytes, mediaType: "image/gif" });
+  });
+
+  it("refuses original gallery sharing when authenticated history has replaced the selected tool occurrence", async () => {
+    const bytes = gifBytes(true);
+    const started = toolMediaEvent(timelinePreviewEvent("moving.gif", "image/gif", bytes, "b".repeat(64)), "toolCallStarted");
+    const replacementMessage = timelinePreviewEvent("replacement.gif", "image/gif", bytes, "b".repeat(64));
+    replacementMessage.eventId = "replacement-event"; replacementMessage.cursor!.sequence = 13n;
+    const replacement = toolMediaEvent(replacementMessage, "toolCallUpdated");
+    const network = projectedNetwork(timelineGallerySnapshot(started));
+    vi.mocked(network.downloadBlob).mockResolvedValue({ bytes, mediaType: "image/gif" });
+    vi.mocked(network.readAround).mockResolvedValue([started, replacement]);
+    const perform = vi.fn();
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined, fixedIds("tool-gallery", "tool-page"), undefined,
+      undefined, attachmentFileFixture().files, undefined, undefined, undefined, { perform });
+    await app.start(); const selected = timelineRows(app.state.detail!.timeline)[0]!.images![0]!;
+    const descriptor = await app.openTimelineImageGallery(selected.sourceEventId!, selected.pageId);
+    const page = await app.loadImageGalleryPage(descriptor.leaseId, 0);
+    app.confirmImageGalleryPageDecoded(descriptor.leaseId, page.leaseId, page.pageId, { width: 1, height: 1, isAnimated: true });
+    await expect(app.shareImageGalleryPageOriginal(descriptor.leaseId, page.leaseId)).rejects.toThrow(/source|image/u);
+    expect(network.authorizeBlobDownload).not.toHaveBeenCalled(); expect(perform).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { kind: "accepted message", label: "Your message", events: (bytes: Uint8Array) => [acceptedTimelineGalleryEvent(bytes)] },
+    { kind: "tool result", label: "Tool result", events: (bytes: Uint8Array) => [toolMediaEvent(timelineGalleryEvent(bytes))] },
+    { kind: "appended tool result", label: "Tool result", events: timelineToolAppendEvents },
+    { kind: "produced artifact", label: "Generated file", events: (bytes: Uint8Array) => [producedArtifactEvent(timelineGalleryEvent(bytes))] },
+    { kind: "produced image", label: "Task message", events: (bytes: Uint8Array) => [producedImageEvent(timelineGalleryEvent(bytes))] }
+  ])("opens only the selected durable $kind gallery and appends its authenticated decoded page", async ({ label, events: sourceEvents }) => {
     const bytes = galleryPngBytes(5, 4);
-    const accepted = acceptedTimelineGalleryEvent(bytes);
-    const network = projectedNetwork(timelineGallerySnapshot(accepted));
+    const events = sourceEvents(bytes);
+    const network = projectedNetwork(create(SnapshotSchema, { ...timelineGallerySnapshot(events[0]!), timeline: [...events] }));
     vi.mocked(network.downloadBlob).mockResolvedValue({ bytes, mediaType: "image/png" });
     const drafts = memoryDraftStores();
     const identity = { profileId: credential.profileId, sessionId: "session" };
@@ -8434,12 +9997,15 @@ describe("native current-task Files ownership", () => {
       fixedIds("timeline-gallery", "timeline-load", "timeline-output"), undefined, drafts, fixture.files);
     await app.start();
     const row = timelineRows(app.state.detail?.timeline ?? [])[0]!;
-    expect(row.images).toMatchObject([{ title: "First image" }, { title: "Second image" }]);
-
-    const descriptor = await app.openTimelineImageGallery(row.eventId, row.images![1]!.pageId);
-    expect(descriptor).toMatchObject({ sourceKind: "timeline", sourceLabel: "Your message", initialIndex: 1, pages: [{}, {}] });
+    const initialIndex = row.images!.length - 1;
+    const selectedImage = row.images![initialIndex]!;
+    const fileName = initialIndex === 1 ? "second.png" : "first.png";
+    expect(row.images).toMatchObject(initialIndex === 1 ? [{ title: "First image" }, { title: "Second image" }] : [{ title: "First image" }]);
+    const descriptor = await app.openTimelineImageGallery(selectedImage.sourceEventId!, selectedImage.pageId);
+    expect(descriptor).toMatchObject({ sourceKind: "timeline", sourceLabel: label, initialIndex });
+    expect(descriptor.pages).toHaveLength(row.images!.length);
     const page = await app.loadImageGalleryPage(descriptor.leaseId, descriptor.initialIndex);
-    expect(page).toMatchObject({ fileName: "second.png", pageIndex: 1, pageCount: 2, addable: true, annotatable: true });
+    expect(page).toMatchObject({ fileName, pageIndex: initialIndex, pageCount: row.images!.length, addable: true, annotatable: true });
     app.confirmImageGalleryPageDecoded(descriptor.leaseId, page.leaseId, page.pageId, {
       width: 5, height: 4, mediaType: "image/png", isAnimated: false
     });
@@ -8450,11 +10016,11 @@ describe("native current-task Files ownership", () => {
     const committed = await app.addImageGalleryPageToComposer(descriptor.leaseId, page.leaseId);
     expect(committed).toMatchObject({
       text: "Keep timeline draft",
-      attachments: [{ attachmentId: "timeline-output", fileName: "second.png", kind: "image" }]
+      attachments: [{ attachmentId: "timeline-output", fileName, kind: "image" }]
     });
     expect(network.downloadBlob).toHaveBeenCalledWith(
       credential,
-      expect.objectContaining({ blobId: "timeline-image-two", sha256Hex: "b".repeat(64) }),
+      expect.objectContaining({ blobId: initialIndex === 1 ? "timeline-image-two" : "timeline-image-one", sha256Hex: "b".repeat(64) }),
       undefined
     );
     expect(network.submit).not.toHaveBeenCalled();

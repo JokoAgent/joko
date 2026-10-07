@@ -3,6 +3,7 @@ import {
   CapabilitySupport,
   FileKind,
   capabilityNames,
+  fileNameSupportsTextPreview,
   type Artifact,
   type BackendDescriptor,
   type FileRevision,
@@ -12,6 +13,7 @@ import {
   type WorkspaceSearchMatch
 } from "@joko/contracts";
 import type { MobileModelPreviewLease } from "./mobile-model-preview";
+import type { MobileFilesPreviewPager } from "./mobile-files-preview-pager";
 
 export type MobileFilesLocation =
   | { readonly kind: "workspace"; readonly path: string }
@@ -42,6 +44,7 @@ export type MobileFilesComposerResult = "attachment" | "reference";
 
 interface MobilePreviewBase {
   readonly title: string;
+  readonly fileName?: string;
   readonly sourceLabel: string;
   readonly mediaType: string;
   readonly byteSize: bigint;
@@ -54,6 +57,7 @@ export type MobileFilePreview =
     })
   | (MobilePreviewBase & {
       readonly kind: "text";
+      readonly workspaceEntry?: WorkspaceEntry;
       readonly text: string;
       readonly languageId: string;
       readonly startByte: bigint;
@@ -125,6 +129,7 @@ export interface MobileFilesState {
   readonly searchTotalFiles: number;
   readonly searchError?: string;
   readonly preview?: MobileFilePreview;
+  readonly previewPager?: MobileFilesPreviewPager;
   readonly watchStatus: "idle" | "watching" | "unavailable" | "error";
   readonly watchError?: string;
   readonly error?: string;
@@ -183,15 +188,20 @@ export function resolveMobileWorkspaceAuthority(
     || ownerWorkspace.targetId !== workspace.targetId) return undefined;
 
   const key = [
-    snapshotKey(owner),
-    snapshotKey(detail),
+    owner.generation.toString(10),
+    detail?.generation.toString(10) ?? "",
     selectedId,
+    entityKey(ownerSession.version),
     entityKey(session.version),
+    ownerSession.nativeBinding?.runtimeGeneration.toString(10) ?? "",
     session.nativeBinding?.runtimeGeneration.toString(10) ?? "",
     target.targetId,
+    entityKey(ownerTarget.version),
     entityKey(target.version),
     workspace.workspaceId,
+    entityKey(ownerWorkspace.version),
     entityKey(workspace.version),
+    entityKey(ownerBackend.entityVersion),
     entityKey(backend.entityVersion)
   ].join("\u001f");
   return {
@@ -289,6 +299,8 @@ export function isTextMediaType(value: string): boolean {
     || mediaType === "application/json"
     || mediaType === "application/ld+json"
     || mediaType === "application/xml"
+    || mediaType === "application/yaml"
+    || mediaType === "application/x-yaml"
     || mediaType === "application/javascript"
     || mediaType.endsWith("+json")
     || mediaType.endsWith("+xml");
@@ -298,22 +310,17 @@ export function normalizeMediaType(value: string): string {
   return value.split(";", 1)[0]!.trim().toLocaleLowerCase();
 }
 
+export function isTextFilePreviewMetadata(mediaType: string, fileName: string): boolean {
+  return isTextMediaType(mediaType)
+    || (normalizeMediaType(mediaType) === "application/octet-stream" && fileNameSupportsTextPreview(fileName));
+}
+
 export function bytesToDataUri(bytes: Uint8Array, mediaType: string): string {
   return `data:${normalizeMediaType(mediaType)};base64,${base64Encode(bytes)}`;
 }
 
 function supports(backend: BackendDescriptor, name: string): boolean {
   return backend.capabilities?.capabilities.some((item) => item.name === name && item.support === CapabilitySupport.SUPPORTED) === true;
-}
-
-function snapshotKey(snapshot: Snapshot | undefined): string {
-  if (!snapshot) return "";
-  return [
-    snapshot.snapshotId,
-    snapshot.generation.toString(10),
-    snapshot.revision?.etag ?? "",
-    snapshot.revision?.value.toString(10) ?? ""
-  ].join(":");
 }
 
 function entityKey(version: { readonly revision?: { readonly etag: string; readonly value: bigint } } | undefined): string {

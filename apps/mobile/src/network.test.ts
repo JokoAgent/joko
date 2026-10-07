@@ -7,6 +7,8 @@ import {
   BlobDisposition,
   BlobRefSchema,
   BlobTransferTicketSchema,
+  GetImageThumbnailRequestSchema, GetImageThumbnailResponseSchema, ImageThumbnailUnavailableReason,
+  ReadWorkspaceHtmlSnapshotRequestSchema, ReadWorkspaceHtmlSnapshotResponseSchema,
   FileKind,
   FilePreviewSchema,
   FileRevisionSchema,
@@ -43,6 +45,9 @@ import {
   ClearVoiceInputDictionaryPeerRouteResponseSchema,
   ClearVoiceInputDictionaryPeerRouteRequestSchema,
   WorkspaceEntrySchema,
+  WorkspaceChangeSetSchema, WorkspaceRewindPreviewSchema, RewindSafety,
+  ListWorkspaceChangeSetsRequestSchema, ListWorkspaceChangeSetsResponseSchema,
+  PreviewWorkspaceRewindRequestSchema, PreviewWorkspaceRewindResponseSchema,
   WorkspaceSearchMatchSchema,
   VoiceInputServiceSettingsSchema, VoiceInputTranscriptionProtocol, VoiceInputSaucSettingsSchema, VoiceInputSaucMode, VoiceInputSaucAuthentication,
   GetSettingsResponseSchema, BeginCredentialUploadResponseSchema, BeginCredentialUploadRequestSchema, TestVoiceInputConnectionResponseSchema
@@ -61,6 +66,7 @@ import {
   collectTargetWorktreeSourcePages,
   collectSessionMessageSearchPages,
   collectWorkspaceDirectoryPages,
+  collectWorkspaceChangeSetPages,
   collectWorkspaceSearchPages,
   downloadVerifiedBlob,
   uploadVerifiedBlob,
@@ -69,6 +75,60 @@ import {
   mobileNetwork,
   type PairedCredential
 } from "./network";
+
+describe("canonical image thumbnail network", () => {
+  it("uses the authenticated generated source request and accepts only explicit bounded thumbnail or original-file outcomes", async () => {
+    const credential: PairedCredential = { profileId: "profile", origin: "https://node.example", serverId: "server", connectionId: "connection", deviceId: "phone", displayName: "Phone", authKey: "thumbnail-fixture-key" };
+    const blob = create(BlobRefSchema, { blobId: "canonical", fileName: "image.png", mediaType: "image/png", byteSize: 100n, sha256Hex: "a".repeat(64) });
+    const thumbnail = { data: Uint8Array.from([1, 2, 3]), mediaType: "image/webp", sha256Hex: "b".repeat(64), widthPixels: 512, heightPixels: 256, sourceWidthPixels: 2048, sourceHeightPixels: 1024 };
+    let response = create(GetImageThumbnailResponseSchema, { sourceBlob: blob, result: { case: "thumbnail", value: thumbnail } });
+    const fetcher = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      expect(String(input)).toBe("https://node.example/joko.v1.ArtifactService/GetImageThumbnail");
+      expect(new Headers(init?.headers).get("authorization")).toBe(`Bearer ${credential.authKey}`);
+      expect(fromBinary(GetImageThumbnailRequestSchema, new Uint8Array(init!.body as Uint8Array))).toMatchObject({ expectedSourceBlob: blob, maximumEdgePixels: 1024 });
+      return new Response(toBinary(GetImageThumbnailResponseSchema, response), { status: 200, headers: { "content-type": "application/proto" } });
+    });
+    try {
+      await expect(mobileNetwork.readImageThumbnail(credential, blob, 1024)).resolves.toMatchObject(thumbnail);
+      for (const value of [ImageThumbnailUnavailableReason.UNSUPPORTED, ImageThumbnailUnavailableReason.INPUT_TOO_LARGE, ImageThumbnailUnavailableReason.RENDER_FAILED, ImageThumbnailUnavailableReason.BUSY]) {
+        response = create(GetImageThumbnailResponseSchema, { sourceBlob: blob, result: { case: "unavailable", value } });
+        await expect(mobileNetwork.readImageThumbnail(credential, blob, 1024)).resolves.toBeUndefined();
+      }
+      response = create(GetImageThumbnailResponseSchema, { sourceBlob: { ...blob, blobId: "foreign" }, result: { case: "thumbnail", value: thumbnail } });
+      await expect(mobileNetwork.readImageThumbnail(credential, blob, 1024)).rejects.toThrow(/another canonical/u);
+      response = create(GetImageThumbnailResponseSchema, { sourceBlob: blob, result: { case: "unavailable", value: ImageThumbnailUnavailableReason.UNSPECIFIED } });
+      await expect(mobileNetwork.readImageThumbnail(credential, blob, 1024)).rejects.toThrow(/unknown/u);
+      response = create(GetImageThumbnailResponseSchema, { sourceBlob: blob, result: { case: "thumbnail", value: { ...thumbnail, widthPixels: 1025 } } });
+      await expect(mobileNetwork.readImageThumbnail(credential, blob, 1024)).rejects.toThrow(/bounds/u);
+    } finally { fetcher.mockRestore(); }
+  });
+});
+describe("complete Workspace HTML snapshot network", () => {
+  it("binds the generated authenticated snapshot to its task, path and exact opaque revision", async () => {
+    const credential: PairedCredential = { profileId: "html-profile", origin: "https://node.example", serverId: "server", connectionId: "connection",
+      deviceId: "phone", displayName: "Phone", authKey: "html-fixture-key" };
+    const file = { workspaceId: "workspace", relativePath: "docs/index.html", expectedRevision: "workspace-html:" + "a".repeat(64) };
+    let response = create(ReadWorkspaceHtmlSnapshotResponseSchema, { file, utf8Html: "<!doctype html><p>HTML</p>" });
+    const controller = new AbortController();
+    const fetcher = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      expect(String(input)).toBe("https://node.example/joko.v1.WorkspaceService/ReadWorkspaceHtmlSnapshot");
+      expect(new Headers(init?.headers).get("authorization")).toBe("Bearer html-fixture-key");
+      expect(init?.signal?.aborted).toBe(false);
+      expect(fromBinary(ReadWorkspaceHtmlSnapshotRequestSchema, new Uint8Array(init!.body as Uint8Array))).toMatchObject({ sessionId: "task", file });
+      return new Response(toBinary(ReadWorkspaceHtmlSnapshotResponseSchema, response), { headers: { "content-type": "application/proto" } });
+    });
+    try {
+      await expect(mobileNetwork.readWorkspaceHtmlSnapshot(credential, "task", file, controller.signal)).resolves.toMatchObject({ file, html: response.utf8Html });
+      for (const wrong of [{ ...file, workspaceId: "foreign" }, { ...file, relativePath: "other.html" }, { ...file, expectedRevision: "workspace-html:" + "b".repeat(64) }]) {
+        response = create(ReadWorkspaceHtmlSnapshotResponseSchema, { file: wrong, utf8Html: "<p>HTML</p>" });
+        await expect(mobileNetwork.readWorkspaceHtmlSnapshot(credential, "task", file)).rejects.toThrow(/mismatched/u);
+      }
+      response = create(ReadWorkspaceHtmlSnapshotResponseSchema, { file, utf8Html: "é".repeat(1_048_577) });
+      await expect(mobileNetwork.readWorkspaceHtmlSnapshot(credential, "task", file)).rejects.toThrow(/mismatched/u);
+      controller.abort(); await expect(mobileNetwork.readWorkspaceHtmlSnapshot(credential, "task", file, controller.signal)).rejects.toThrow();
+    } finally { fetcher.mockRestore(); }
+  });
+});
 import { projectMobileVoiceDictionarySnapshot, mobileVoiceDictionaryLearningRequest } from "./mobile-voice-dictionary-service";
 
 vi.mock("expo-crypto", () => ({
@@ -80,6 +140,51 @@ vi.mock("expo-crypto", () => ({
     return Uint8Array.from(createHash("sha256").update(bytes).digest()).buffer;
   }
 }));
+
+describe("mobile Workspace rewind reads", () => {
+  it("collects complete generated checkpoint pages and reads an exact preview with the original credential and abort signal", async () => {
+    const credential: PairedCredential = { profileId: "rewind-profile", origin: "https://node.example", serverId: "node", connectionId: "connection",
+      deviceId: "device", displayName: "Phone", authKey: "private-test-key" };
+    const controller = new AbortController(); const tokens: string[] = [];
+    const preview = create(WorkspaceRewindPreviewSchema, { previewId: "preview", workspaceId: "workspace", changeSetId: "second",
+      safety: RewindSafety.SAFE, expiresAt: { seconds: 100n } });
+    const fetcher = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      expect(new Headers(init?.headers).get("authorization")).toBe("Bearer private-test-key");
+      expect(init?.signal?.aborted).toBe(false);
+      const body = new Uint8Array(init?.body as Uint8Array);
+      if (String(input).endsWith("ListWorkspaceChangeSets")) {
+        const request = fromBinary(ListWorkspaceChangeSetsRequestSchema, body);
+        expect(request.workspaceId).toBe("workspace"); expect(request.sessionId).toBe("task");
+        tokens.push(request.page!.pageToken);
+        return new Response(toBinary(ListWorkspaceChangeSetsResponseSchema, create(ListWorkspaceChangeSetsResponseSchema, {
+          changeSets: [{ changeSetId: request.page!.pageToken ? "second" : "first", workspaceId: "workspace", sessionId: "task", runId: "run", capturedAt: { seconds: 1n } }],
+          page: { nextPageToken: request.page!.pageToken ? "" : "next", totalSize: 2n }
+        })), { headers: { "content-type": "application/proto" } });
+      }
+      expect(fromBinary(PreviewWorkspaceRewindRequestSchema, body)).toMatchObject({ workspaceId: "workspace", changeSetId: "second" });
+      return new Response(toBinary(PreviewWorkspaceRewindResponseSchema, create(PreviewWorkspaceRewindResponseSchema, { preview })),
+        { headers: { "content-type": "application/proto" } });
+    });
+    try {
+      const sets = await mobileNetwork.listWorkspaceChangeSets(credential, "workspace", "task", controller.signal);
+      expect(sets.map((value) => value.changeSetId)).toEqual(["first", "second"]); expect(tokens).toEqual(["", "next"]);
+      await expect(mobileNetwork.previewWorkspaceRewind(credential, "workspace", "second", controller.signal)).resolves.toEqual(preview);
+      controller.abort();
+      await expect(mobileNetwork.previewWorkspaceRewind(credential, "workspace", "second", controller.signal)).rejects.toThrow(/aborted|canceled/u);
+      expect(fetcher).toHaveBeenCalledTimes(3);
+    } finally { fetcher.mockRestore(); }
+  });
+
+  it("rejects incomplete, cyclic, duplicate, changed or foreign checkpoint catalogs", async () => {
+    const checkpoint = create(WorkspaceChangeSetSchema, { changeSetId: "checkpoint", workspaceId: "workspace", sessionId: "task", capturedAt: { seconds: 1n } });
+    await expect(collectWorkspaceChangeSetPages("workspace", "task", async () => ({ changeSets: [checkpoint], nextPageToken: "", totalSize: 2n }))).rejects.toThrow(/incomplete/u);
+    await expect(collectWorkspaceChangeSetPages("workspace", "task", async () => ({ changeSets: [checkpoint], nextPageToken: "next", totalSize: 2n }))).rejects.toThrow(/duplicate/u);
+    await expect(collectWorkspaceChangeSetPages("workspace", "foreign", async () => ({ changeSets: [checkpoint], nextPageToken: "", totalSize: 1n }))).rejects.toThrow(/foreign/u);
+    await expect(collectWorkspaceChangeSetPages("workspace", "task", async (token) => ({ changeSets: [create(WorkspaceChangeSetSchema, { ...checkpoint, changeSetId: token || "first" })],
+      nextPageToken: token ? "" : "next", totalSize: token ? 3n : 2n }))).rejects.toThrow(/changing/u);
+    await expect(collectWorkspaceChangeSetPages("workspace", "task", async (token) => ({ changeSets: token ? [] : [checkpoint], nextPageToken: "next", totalSize: 2n }))).rejects.toThrow(/cyclic/u);
+  });
+});
 
 describe("mobile voice ephemeral requests", () => {
   it("loads voice service settings, uploads credentials only through a same-origin ticket, and keeps context separate", async () => {

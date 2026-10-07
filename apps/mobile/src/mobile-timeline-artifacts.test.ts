@@ -2,6 +2,7 @@ import { create } from "@bufbuild/protobuf";
 import {
   BlobRefSchema,
   EventPayloadSchema,
+  EventCursorSchema,
   EventSchema,
   MessageArtifactBlockSchema,
   MessageBlockSchema,
@@ -12,6 +13,7 @@ import {
   type Event
 } from "@joko/contracts";
 import { describe, expect, it } from "vitest";
+import { producedArtifactEvent, toolMediaEvent } from "./test/timeline-media";
 import {
   mobileTimelineArtifacts,
   mobileTimelineArtifactWindowKey,
@@ -22,17 +24,46 @@ import {
 } from "./mobile-timeline-artifacts";
 
 describe("mobile Timeline preview artifacts", () => {
+  it("resolves exact typed tool and produced occurrences and retires replaced or foreign scope", () => {
+    const original = completedEvent([artifactBlock("clip.mp4", "video/mp4", "Clip")]);
+    const tool = toolMediaEvent(original, "toolCallUpdated");
+    const selected = mobileTimelineArtifacts(tool)[0]!;
+    expect(selected.source).toMatchObject({ kind: "tool", contentIndex: 0 });
+    expect(resolveMobileTimelineArtifact([tool], selected)?.blob.fileName).toBe("clip.mp4");
+    if (tool.payload?.kind.case !== "toolCallUpdated") throw new Error("fixture");
+    const part = tool.payload.kind.value.incrementalResult!.parts[0]!.content;
+    if (part.case !== "artifact") throw new Error("fixture");
+    part.value.artifactId = "replacement-native-artifact";
+    expect(resolveMobileTimelineArtifact([tool], selected)).toBeUndefined();
+    const terminal = toolMediaEvent(create(EventSchema, { ...original, eventId: "terminal", cursor: create(EventCursorSchema, { generation: 1n, sequence: 5n }) }));
+    expect(resolveMobileTimelineArtifact([tool, terminal], selected)).toBeUndefined();
+    const produced = producedArtifactEvent(original);
+    const artifact = mobileTimelineArtifacts(produced)[0]!;
+    expect(artifact.source).toMatchObject({ kind: "artifactProduced", artifactId: "canonical-file" });
+    expect(resolveMobileTimelineArtifact([produced], artifact)?.blob.fileName).toBe("clip.mp4");
+    if (produced.payload?.kind.case !== "artifactProduced" || tool.payload?.kind.case !== "toolCallUpdated") throw new Error("fixture");
+    produced.payload.kind.value.artifact!.runId = "foreign-run";
+    tool.payload.kind.value.toolCall!.sessionId = "foreign-session";
+    expect(mobileTimelineArtifacts(produced)).toEqual([]);
+    expect(mobileTimelineArtifacts(tool)).toEqual([]);
+  });
   it("projects supported durable artifact blocks in message order", () => {
     const event = completedEvent([
       artifactBlock("movie.mp4", "video/mp4", "Demo"),
       create(MessageBlockSchema, { content: { case: "text", value: "body" } }),
       artifactBlock("notes.pdf", "application/pdf", "Notes"),
-      artifactBlock("mesh.glb", "model/gltf-binary", "Mesh")
+      artifactBlock("mesh.glb", "model/gltf-binary", "Mesh"),
+      artifactBlock("page.html", "text/html", "Page"),
+      artifactBlock("source.zig", "application/octet-stream", "Source"),
+      artifactBlock(".env", "application/octet-stream", "Config")
     ]);
     expect(mobileTimelinePreviewArtifacts(event)).toMatchObject([
-      { contentIndex: 0, title: "Demo", mediaType: "video/mp4", previewKind: "media" },
-      { contentIndex: 2, title: "Notes", mediaType: "application/pdf", previewKind: "pdf" },
-      { contentIndex: 3, title: "Mesh", mediaType: "model/gltf-binary", previewKind: "model" }
+      { source: { kind: "timeline", contentIndex: 0 }, title: "Demo", mediaType: "video/mp4", previewKind: "media" },
+      { source: { kind: "timeline", contentIndex: 2 }, title: "Notes", mediaType: "application/pdf", previewKind: "pdf" },
+      { source: { kind: "timeline", contentIndex: 3 }, title: "Mesh", mediaType: "model/gltf-binary", previewKind: "model" },
+      { source: { kind: "timeline", contentIndex: 4 }, title: "Page", mediaType: "text/html", previewKind: "text" },
+      { source: { kind: "timeline", contentIndex: 5 }, title: "Source", mediaType: "application/octet-stream", previewKind: "text" },
+      { source: { kind: "timeline", contentIndex: 6 }, title: "Config", mediaType: "application/octet-stream", previewKind: "text" }
     ]);
   });
 
@@ -40,14 +71,16 @@ describe("mobile Timeline preview artifacts", () => {
     const event = completedEvent([
       artifactBlock("archive.zip", "application/zip", "Archive"),
       artifactBlock("empty.txt", "text/plain", "Empty", { byteSize: 0n }),
-      artifactBlock("large.pdf", "application/pdf", "Large", { byteSize: 33_554_433n })
+      artifactBlock("large.pdf", "application/pdf", "Large", { byteSize: 33_554_433n }),
+      artifactBlock("large.html", "text/html", "Large page", { byteSize: 2_097_153n })
     ]);
     expect(mobileTimelineArtifacts(event)).toMatchObject([
-      { contentIndex: 0, title: "Archive", mediaType: "application/zip" },
-      { contentIndex: 1, title: "Empty", mediaType: "text/plain" },
-      { contentIndex: 2, title: "Large", mediaType: "application/pdf" }
+      { source: { kind: "timeline", contentIndex: 0 }, title: "Archive", mediaType: "application/zip" },
+      { source: { kind: "timeline", contentIndex: 1 }, title: "Empty", mediaType: "text/plain" },
+      { source: { kind: "timeline", contentIndex: 2 }, title: "Large", mediaType: "application/pdf" },
+      { source: { kind: "timeline", contentIndex: 3 }, title: "Large page", mediaType: "text/html" }
     ]);
-    expect(mobileTimelinePreviewArtifacts(event)).toEqual([]);
+    expect(mobileTimelinePreviewArtifacts(event)).toMatchObject([{ title: "Empty", previewKind: "text", byteSize: 0n }]);
     const selected = mobileTimelineArtifacts(event)[0]!;
     expect(resolveMobileTimelineArtifact([event], selected)?.blob.fileName).toBe("archive.zip");
   });

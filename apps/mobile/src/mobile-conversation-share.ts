@@ -7,6 +7,7 @@ export interface MobileConversationShareImage {
   readonly uri: string;
   readonly width: number;
   readonly height: number;
+  readonly nativeQuarterTurn?: true;
 }
 
 export interface MobileConversationShareMessage {

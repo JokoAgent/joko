@@ -71,8 +71,8 @@ export function applyMobileVoiceTranscript(
   }
 
   const range = expandedMobileComposerSelection(current, selection);
-  const quoteBefore = current.atoms.find((atom) => atom.kind === "quote" && atom.end === range.start);
-  const quoteAfter = current.atoms.find((atom) => atom.kind === "quote" && atom.start === range.end);
+  const quoteBefore = current.atoms.find((atom) => (atom.kind === "quote" || atom.kind === "file-quote") && atom.end === range.start);
+  const quoteAfter = current.atoms.find((atom) => (atom.kind === "quote" || atom.kind === "file-quote") && atom.start === range.end);
   const transcriptPrefix = range.start === range.end && quoteBefore?.end === current.text.length ? "\n\n" : "";
   const transcriptSuffix = range.start === range.end && quoteAfter?.start === 0 ? "\n\n" : "";
   const replacement = `${transcriptPrefix}${text}${transcriptSuffix}`;

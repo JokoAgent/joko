@@ -8,6 +8,7 @@ export const capabilityNames = {
   sessionResume: "session.resume",
   sessionDetach: "session.detach",
   sessionFork: "session.fork",
+  sessionClone: "session.clone",
   sessionRewind: "session.rewind",
   sessionTree: "session.tree",
   sessionMessageDelete: "session.message_delete",

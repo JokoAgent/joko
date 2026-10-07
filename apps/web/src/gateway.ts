@@ -18503,11 +18503,11 @@ function displayArguments(argumentsValue: readonly any[] | undefined): string {
   }).join("\n");
 }
 
-function toolResultText(result: any): string | undefined {
+function toolResultText(result: ToolResult | undefined): string | undefined {
   if (result === undefined) return undefined;
-  const text = (result.parts ?? []).map((part: any) => {
-    if (part.content?.case === "text") return part.content.value;
-    if (part.content?.case === "command") return `${part.content.value.stdout ?? ""}${part.content.value.stderr ?? ""}`;
+  const text = result.parts.map((part) => {
+    if (part.content.case === "text") return part.content.value;
+    if (part.content.case === "command") return `${part.content.value.stdoutPreview}${part.content.value.stderrPreview}`;
     return "";
   }).filter(Boolean).join("\n");
   return text === "" ? undefined : text;

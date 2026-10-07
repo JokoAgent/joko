@@ -21,6 +21,7 @@ export function useMobileMarkdownResources(input: {
     let alive = true;
     let foreground = AppState.currentState === "active";
     let recoveries = 0;
+    let awaitingAuthority = false;
     let controller: AbortController | undefined;
     let descriptor: MobileMarkdownResourceDescriptor | undefined;
     const stop = () => {
@@ -32,6 +33,7 @@ export function useMobileMarkdownResources(input: {
     const start = () => {
       stop();
       if (!alive || !foreground || client.markdownResourceOwnerKey() !== ownerKey || recoveries > 1) return;
+      awaitingAuthority = false;
       const request = new AbortController(); controller = request;
       void client.prepareMarkdownResources(messageId, text, request.signal).then((result) => {
         if (!result.references.size) { client.releaseMarkdownResources(result.leaseId); return; }
@@ -46,7 +48,8 @@ export function useMobileMarkdownResources(input: {
       }).catch(() => { if (controller === request) stop(); });
     };
     const subscription = client.subscribe(() => {
-      if (client.markdownResourceOwnerKey() !== ownerKey) { stop(); return; }
+      if (client.markdownResourceOwnerKey() !== ownerKey) { awaitingAuthority = true; stop(); return; }
+      if (awaitingAuthority) { awaitingAuthority = false; start(); return; }
       if (descriptor) {
         try { client.assertMarkdownResourcesCurrent(descriptor.leaseId); } catch { stop(); }
       }

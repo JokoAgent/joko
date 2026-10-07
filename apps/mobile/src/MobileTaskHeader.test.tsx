@@ -54,6 +54,7 @@ it("keeps navigation and title in the header while task actions cancel, revalida
   const run = vi.fn();
   const visibility = vi.fn();
   const actions: MobileTaskHeaderAction[] = [
+    { id: "clone", label: "Clone task", disabled: false, onPress: run },
     { id: "branches", label: "Branches", disabled: true, onPress: run },
     { id: "context", label: "Context", disabled: false, onPress: run },
     { id: "controls", label: "Controls", disabled: false, onPress: run },

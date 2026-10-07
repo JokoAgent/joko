@@ -6,6 +6,17 @@ import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
 
 import * as contract from "../dist/index.js";
 
+test("binary text previews preserve BOM content and exact UTF-8 byte windows", () => {
+  for (const text of ["\uFEFFfirst\r\nfocus line — 文本\r\n", "\uFEFF\uFEFF😀\n", "plain\n"]) {
+    const byteSize = BigInt(new TextEncoder().encode(text).byteLength);
+    const preview = create(contract.TextFilePreviewSchema, { utf8Text: text, endByte: byteSize });
+    const decoded = fromBinary(contract.TextFilePreviewSchema, toBinary(contract.TextFilePreviewSchema, preview));
+    assert.equal(decoded.utf8Text, text);
+    assert.equal(BigInt(new TextEncoder().encode(decoded.utf8Text).byteLength), decoded.endByte);
+  }
+  assert.throws(() => fromBinary(contract.TextFilePreviewSchema, Uint8Array.of(0x0a, 2, 0xc3, 0x28)));
+});
+
 function fields(schema) {
   return [...schema.fields];
 }

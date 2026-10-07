@@ -13,6 +13,7 @@ import {
 import { describe, expect, it } from "vitest";
 import {
   appendMobileSelectionQuote,
+  appendMobileFileSelectionQuote,
   appendPlainTextToMobileComposer,
   emptyMobileComposerDraft,
   insertMobileClipboardText,
@@ -31,15 +32,49 @@ import {
   normalizeMobileComposerDraft,
   plainTextMobileComposerDraft,
   recoverMobileComposerDraft,
+  restoreMobileComposerInput,
   reconcileMobileComposerText,
+  replaceMobileComposerRange,
   removeMobileComposerAtom,
   updateMobilePastedTextAtom,
   updateMobileRouteReferenceAtom,
   removeMobileComposerMention
 } from "./mobile-composer-document";
 import { segmentMobileComposerRoutePaste } from "./mobile-composer-route-links";
+import { mobileIncomingShareStorageId } from "./mobile-incoming-share-order";
 
 describe("mobile structured composer document", () => {
+  it("keeps file excerpts as separate quote atoms across editing, wire offsets and accepted-input recovery", () => {
+    const selected = appendMobileFileSelectionQuote(plainTextMobileComposerDraft("Before"), {
+      sourceSessionId: "task", sourcePath: "docs/README.md", text: "\n  selected 😀\r\nsecond\n"
+    }, "file-one").draft;
+    const mentioned = insertMobileSessionMention(selected, { start: selected.text.length, end: selected.text.length },
+      { sessionId: "other-task", displayText: "Other task" }, "mention").draft;
+    const atom = mentioned.atoms[0]!;
+    if (atom.kind !== "file-quote") throw new Error("Missing file excerpt");
+    expect(atom).toMatchObject({ kind: "file-quote", text: "  selected 😀\nsecond", sourcePath: "docs/README.md" });
+    expect(atom).not.toHaveProperty("sourceMessageId"); expect(atom).not.toHaveProperty("sourceEventId");
+    const input = mobileComposerInput(mentioned);
+    const body = input.parts[0]!.content.value as string;
+    expect(input.quotesEncoded).toBe(true);
+    expect(body).toBe("Before\n\n> <!-- joko-selection-quote -->\n>   selected 😀\n> second\n> — source: docs/README.md\n\n@Other task");
+    expect(body.slice(input.mentionRanges[0]!.start, input.mentionRanges[0]!.end)).toBe("@Other task");
+    const restored = restoreMobileComposerInput(input, { sessionId: "task", messageId: "user-one", eventId: "accepted-one" });
+    expect(restored.atoms[0]).toMatchObject({ kind: "file-quote", sourcePath: "docs/README.md", text: atom.text });
+    expect(mobileComposerInput(restored)).toEqual(input);
+    expect(removeMobileComposerAtom(mentioned, atom.atomId).draft.atoms).toEqual([]);
+    for (const sourcePath of ["../secret", "D:/private.txt", "docs/line\nother"]) {
+      expect(() => appendMobileFileSelectionQuote(selected, { sourceSessionId: "task", sourcePath, text: "excerpt" }, "invalid")).toThrow();
+    }
+    const literalFooter = create(InputContentSchema, { quotesEncoded: true,
+      parts: [{ content: { case: "text", value: `${mobileSelectionQuoteMarkerLine}\n> excerpt\n> — source: D:/private.txt` } }] });
+    const literalQuote = restoreMobileComposerInput(literalFooter, { sessionId: "task", messageId: "user", eventId: "accepted" });
+    expect(literalQuote.atoms[0]).toMatchObject({ kind: "quote", text: "excerpt\n— source: D:/private.txt" });
+    expect(mobileComposerInput(literalQuote)).toEqual(literalFooter);
+    expect(() => appendMobileFileSelectionQuote(selected, { sourceSessionId: "task", sourcePath: "readme.md", text: "x".repeat(4_001) }, "invalid")).toThrow();
+    expect(() => appendMobileFileSelectionQuote(selected, { sourceSessionId: "task", sourcePath: "readme.md", text: "\ud800" }, "invalid")).toThrow();
+    expect(() => normalizeMobileComposerDraft({ ...selected, atoms: [{ ...selected.atoms[0]!, sourceMessageId: "forged" } as never] })).toThrow(/file quote/u);
+  });
   it("serializes attachment-only image/file drafts in stable order and requires canonical uploaded identities", () => {
     const draft = normalizeMobileComposerDraft({
       text: "",
@@ -94,6 +129,54 @@ describe("mobile structured composer document", () => {
       ...draft,
       attachments: [{ ...draft.attachments[0]!, state: "local" }]
     })).toThrow(/Finish uploading every attachment/u);
+  });
+
+  it("keeps incoming-share text and files in their original cross-type wire order", () => {
+    const batchId = "10000000-0000-4000-8000-000000000001";
+    const item = (ordinal: number) => `${ordinal + 2}0000000-0000-4000-8000-00000000000${ordinal + 2}`;
+    const firstTextId = mobileIncomingShareStorageId(batchId, item(1), 1);
+    const secondTextId = mobileIncomingShareStorageId(batchId, item(3), 3);
+    const first = insertMobilePastedText(emptyMobileComposerDraft(), { start: 0, end: 0 }, "First", firstTextId);
+    const separated = replaceMobileComposerRange(first.draft, first.selection, "\n\n");
+    const textDraft = insertMobilePastedText(separated.draft, separated.selection, "https://example.test", secondTextId).draft;
+    const attachment = (ordinal: number, kind: "image" | "file", fileName: string, mediaType: string) => ({
+      state: "uploaded" as const,
+      attachmentId: mobileIncomingShareStorageId(batchId, item(ordinal), ordinal),
+      kind,
+      fileName,
+      mediaType,
+      byteSize: ordinal + 1,
+      sha256Hex: ordinal.toString(16).repeat(64),
+      capturedAtUnixMs: ordinal,
+      blobId: `blob-${ordinal}`
+    });
+    const draft = normalizeMobileComposerDraft({
+      ...textDraft,
+      attachments: [
+        attachment(0, "image", "first.png", "image/png"),
+        attachment(2, "file", "middle.pdf", "application/pdf"),
+        {
+          state: "uploaded", attachmentId: "ordinary", kind: "file", fileName: "ordinary.txt",
+          mediaType: "text/plain", byteSize: 7, sha256Hex: "f".repeat(64), capturedAtUnixMs: 7, blobId: "ordinary-blob"
+        }
+      ]
+    });
+    const wire = mobileComposerInput(draft);
+
+    expect(wire.parts.map((part) => part.content.case)).toEqual(["image", "text", "file", "text", "file"]);
+    expect(wire.parts[1]?.content).toEqual({ case: "text", value: "First\n\n" });
+    expect(wire.parts[3]?.content).toEqual({ case: "text", value: "https://example.test" });
+    expect(wire.pastedTextRanges).toMatchObject([
+      { start: 0, end: 5 },
+      { start: 7, end: 27 }
+    ]);
+    const withoutMiddleFile = normalizeMobileComposerDraft({
+      ...draft,
+      attachments: draft.attachments.filter((attachment) => attachment.attachmentId
+        !== mobileIncomingShareStorageId(batchId, item(2), 2))
+    });
+    expect(mobileComposerInput(withoutMiddleFile).parts.map((part) => part.content.case))
+      .toEqual(["image", "text", "file"]);
   });
 
   it("recovers a rejected structured prefix without flattening newer references and removes only that exact prefix", () => {

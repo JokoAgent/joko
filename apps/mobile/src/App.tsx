@@ -16,6 +16,11 @@ import {
 } from "@joko/contracts";
 import { MobileConnectionStage } from "./MobileConnectionStage";
 import { MobileFileTextPreview } from "./MobileFileTextPreview";
+import { useMobileFileTextActions } from "./use-mobile-file-text-actions";
+import { MobileFilesPreviewPager } from "./MobileFilesPreviewPager";
+import { mobileFilesPreviewCanSwipe, type MobileFilesPreviewPager as FilesPreviewPager } from "./mobile-files-preview-pager";
+import { MobileTimelineImage } from "./MobileTimelineImage";
+import { MobileImageGalleryPresenter } from "./mobile-image-gallery-presentation";
 import { MobileNativeIntentNotice } from "./MobileNativeIntentNotice";
 import {
   MobileClient,
@@ -66,6 +71,7 @@ import {
   mobilePushDeviceStore,
   mobileStorage,
   mobileThemePreferences,
+  mobileFilesPreferences,
   mobileVoicePreferences,
   mobileUpdates
 } from "./storage";
@@ -143,6 +149,7 @@ import {
 } from "./composer-layout";
 import { MobileKeyboardAvoidingView, useMobileKeyboardState } from "./MobileKeyboardAvoidingView";
 import { timelineRows, type TimelineRow } from "./timeline";
+import { MobileToolCallCard } from "./MobileToolCallCard";
 import {
   appendMobileOptimisticUserRow,
   markMobileOptimisticUserRowSubmitted,
@@ -156,6 +163,9 @@ import {
 import type { MobileTimelineArtifact } from "./mobile-timeline-artifacts";
 import { MobileDrawer } from "./MobileDrawer";
 import { MobileActionSheet } from "./MobileActionSheet";
+import { MobileTaskDerivationSheet } from "./MobileTaskDerivationSheet";
+import { MobileMessageRewindSheet } from "./MobileMessageRewindSheet";
+import { MobileSessionDerivationMarker } from "./MobileSessionDerivationMarker";
 import { MobileTaskHeader } from "./MobileTaskHeader";
 import { MobileComposerAtomSheet } from "./MobileComposerAtomSheet";
 import {
@@ -228,7 +238,6 @@ import {
 import {
   artifactTitle,
   workspaceBasename,
-  workspaceParentPath,
   type MobileFilePreview,
   type MobileFileSearchResult,
   type MobileFilesComposerSource,
@@ -254,7 +263,6 @@ import {
   mobileImageGalleryMediaType,
   type MobileImageGalleryDescriptor,
   type MobileImageGalleryNativeDecode,
-  type MobileImageGalleryPageSession,
   type MobileImageGalleryPageSummary
 } from "./mobile-image-gallery";
 import {
@@ -268,6 +276,10 @@ import { MobileOfflineNotice } from "./MobileOfflineNotice";
 import { MobileAutomationsScreen } from "./MobileAutomationsScreen";
 import { MobilePartnersScreen } from "./MobilePartnersScreen";
 import { MobileFilesToolbar } from "./MobileFilesToolbar";
+import { MobileFilesBrowser } from "./MobileFilesBrowser";
+import { mobileFilesThumbnailCache } from "./mobile-files-thumbnail-cache";
+import { MobileFilesClipboard, type MobileFilesClipboardLease, type MobileFilesClipboardResult } from "./mobile-files-clipboard";
+import type { MobileFilesPreferences } from "./mobile-files-presentation";
 import { MobileSettingsScreen } from "./MobileSettingsScreen";
 import { MobileVoiceDictionaryReadOnlyController } from "./mobile-voice-dictionary-readonly-controller";
 import { mobileReadOnlyDictionarySources } from "./mobile-voice-dictionary-readonly";
@@ -306,7 +318,8 @@ const client = new MobileClient(
   mobileModelPreviewFiles,
   mobileFileShare,
   mobileOfflineCache,
-  mobileReadOnlyDictionaryCache
+  mobileReadOnlyDictionaryCache,
+  mobileFilesThumbnailCache
 );
 const readOnlyDictionary = new MobileVoiceDictionaryReadOnlyController(mobileReadOnlyDictionaryCache,
   (profileId, signal) => client.voiceDictionaryReadOnlyTransport(profileId, signal));
@@ -406,131 +419,43 @@ interface MobileRuntimeCommandPaletteSnapshot {
   readonly draftLease?: MobileRuntimeCommandDraftLease;
 }
 
-interface MobileImageGalleryView {
-  readonly descriptor: MobileImageGalleryDescriptor;
-  readonly session: MobileImageGalleryPageSession;
-  readonly busy: boolean;
-  readonly error?: string;
-}
-
 function useMobileImageGallery(
   locale: MobileSupportedLocale,
   onCommitted: (draft: MobileComposerDraft) => void
 ) {
-  const [view, setView] = useState<MobileImageGalleryView>();
-  const viewRef = useRef<MobileImageGalleryView | undefined>(undefined);
-  const pageControllerRef = useRef<AbortController | undefined>(undefined);
-  const onCommittedRef = useRef(onCommitted);
-  viewRef.current = view;
-  onCommittedRef.current = onCommitted;
-
-  const close = useCallback(() => {
-    pageControllerRef.current?.abort();
-    pageControllerRef.current = undefined;
-    const current = viewRef.current;
-    viewRef.current = undefined;
-    setView(undefined);
-    if (current) client.cancelImageGallery(current.descriptor.leaseId);
-  }, []);
-
-  useEffect(() => close, [close]);
-
-  const open = useCallback(async (
-    begin: (signal: AbortSignal) => Promise<MobileImageGalleryDescriptor>
-  ): Promise<void> => {
-    close();
-    const controller = new AbortController();
-    pageControllerRef.current = controller;
-    let descriptor: MobileImageGalleryDescriptor | undefined;
-    try {
-      descriptor = await begin(controller.signal);
-      const session = await client.loadImageGalleryPage(
-        descriptor.leaseId,
-        descriptor.initialIndex,
-        controller.signal
-      );
-      controller.signal.throwIfAborted();
-      const next = { descriptor, session, busy: false };
-      viewRef.current = next;
-      setView(next);
-    } catch (error) {
-      if (descriptor) client.cancelImageGallery(descriptor.leaseId);
-      if (!controller.signal.aborted) throw error;
-    } finally {
-      if (pageControllerRef.current === controller) pageControllerRef.current = undefined;
-    }
-  }, [close]);
-
-  const navigate = useCallback((pageIndex: number): void => {
-    const current = viewRef.current;
-    if (!current || current.busy || pageIndex === current.session.pageIndex) return;
-    pageControllerRef.current?.abort();
-    const controller = new AbortController();
-    pageControllerRef.current = controller;
-    const pending = { ...current, busy: true, error: undefined };
-    viewRef.current = pending;
-    setView(pending);
-    void client.loadImageGalleryPage(current.descriptor.leaseId, pageIndex, controller.signal).then((session) => {
-      if (controller.signal.aborted || viewRef.current?.descriptor.leaseId !== current.descriptor.leaseId) return;
-      const next = { descriptor: current.descriptor, session, busy: false };
-      viewRef.current = next;
-      setView(next);
-    }).catch((error) => {
-      if (controller.signal.aborted || viewRef.current?.descriptor.leaseId !== current.descriptor.leaseId) return;
-      const failed = { ...current, busy: false, error: errorText(error, locale) };
-      viewRef.current = failed;
-      setView(failed);
-    }).finally(() => {
-      if (pageControllerRef.current === controller) pageControllerRef.current = undefined;
-    });
-  }, [locale]);
-
+  const presenter = useMemo(() => new MobileImageGalleryPresenter(client), []);
+  const view = useSyncExternalStore(presenter.subscribe, () => presenter.snapshot);
+  const onCommittedRef = useRef(onCommitted); onCommittedRef.current = onCommitted;
+  useEffect(() => presenter.close, [presenter]);
+  useEffect(() => client.subscribe(() => {
+    const current = presenter.snapshot;
+    if (current && !client.imageGalleryCurrent(current.descriptor.leaseId)) presenter.close();
+  }), [presenter]);
+  const open = useCallback((begin: (signal: AbortSignal) => Promise<MobileImageGalleryDescriptor>) => presenter.open(begin), [presenter]);
   const decoded = useCallback((value: MobileImageGalleryNativeDecode): void => {
-    const current = viewRef.current;
-    if (!current) throw new Error(mobileMessage(locale, "task.error.galleryClosed"));
-    client.confirmImageGalleryPageDecoded(
-      current.descriptor.leaseId,
-      current.session.leaseId,
-      current.session.pageId,
-      value
-    );
-  }, [locale]);
-
+    const current = presenter.snapshot;
+    if (!current?.session || current.busy || current.failed) throw new Error(mobileMessage(locale, "task.error.galleryClosed"));
+    client.confirmImageGalleryPageDecoded(current.descriptor.leaseId, current.session.leaseId, current.session.pageId, value);
+  }, [presenter, locale]);
   const addOriginal = useCallback(async (signal: AbortSignal): Promise<void> => {
-    const current = viewRef.current;
-    if (!current) throw new Error(mobileMessage(locale, "task.error.galleryClosed"));
-    const draft = await client.addImageGalleryPageToComposer(
-      current.descriptor.leaseId,
-      current.session.leaseId,
-      signal
-    );
-    signal.throwIfAborted();
-    viewRef.current = undefined;
-    setView(undefined);
-    onCommittedRef.current(draft);
-  }, [locale]);
-
-  const save = useCallback(async (
-    strokes: readonly MobileImageAnnotationStroke[],
-    burned: MobileBurnedImage | undefined,
-    signal: AbortSignal
-  ): Promise<void> => {
-    const current = viewRef.current;
-    if (!current) throw new Error(mobileMessage(locale, "task.error.galleryClosed"));
-    const draft = await client.commitImageGalleryPageToComposer(
-      current.descriptor.leaseId,
-      current.session.leaseId,
-      strokes,
-      burned,
-      signal
-    );
-    signal.throwIfAborted();
-    viewRef.current = undefined;
-    setView(undefined);
-    onCommittedRef.current(draft);
-  }, [locale]);
-
-  return { view, open, close, navigate, decoded, addOriginal, save };
+    const current = presenter.snapshot;
+    if (!current?.session || current.busy || current.failed) throw new Error(mobileMessage(locale, "task.error.galleryClosed"));
+    const draft = await client.addImageGalleryPageToComposer(current.descriptor.leaseId, current.session.leaseId, signal);
+    signal.throwIfAborted(); presenter.close(); onCommittedRef.current(draft);
+  }, [presenter, locale]);
+  const save = useCallback(async (strokes: readonly MobileImageAnnotationStroke[], burned: MobileBurnedImage | undefined, signal: AbortSignal): Promise<void> => {
+    const current = presenter.snapshot;
+    if (!current?.session || current.busy || current.failed) throw new Error(mobileMessage(locale, "task.error.galleryClosed"));
+    const draft = await client.commitImageGalleryPageToComposer(current.descriptor.leaseId, current.session.leaseId, strokes, burned, signal);
+    signal.throwIfAborted(); presenter.close(); onCommittedRef.current(draft);
+  }, [presenter, locale]);
+  const shareOriginal = useCallback(async (signal: AbortSignal, onDispatch: () => void): Promise<void> => {
+    const current = presenter.snapshot;
+    if (!current?.session || current.busy || current.failed) throw new Error(mobileMessage(locale, "task.error.galleryClosed"));
+    await client.shareImageGalleryPageOriginal(current.descriptor.leaseId, current.session.leaseId, signal, onDispatch);
+  }, [presenter, locale]);
+  return { view, open, close: presenter.close, navigate: presenter.navigate, retry: presenter.retry,
+    nativeFailed: presenter.nativeFailed, previewFailed: presenter.previewFailed, decoded, addOriginal, shareOriginal, save };
 }
 
 async function performMobileImageOutput(
@@ -613,8 +538,34 @@ export function App() {
   const nativeIntentConnectingRef = useRef(false);
   const externalIntentFenceRef = useRef<MobileExternalIntentFence | null>(null);
   const appMountedRef = useRef(true);
+  const externalNavigationRevisionRef = useRef(0);
   if (nativeIntentDeliveryRef.current === null) nativeIntentDeliveryRef.current = new MobileNativeIntentDelivery();
   if (externalIntentFenceRef.current === null) externalIntentFenceRef.current = new MobileExternalIntentFence();
+  const offerNativeUrl = useCallback((url: string): boolean => {
+    if (isMobileIncomingShareUrl(url)) {
+      externalNavigationRevisionRef.current++;
+      externalIntentFenceRef.current!.offerShare();
+      nativeIntentDeliveryRef.current!.invalidate();
+      if (nativeIntentConnectingRef.current) client.cancel();
+      setIncomingShareRequestRevision((value) => value + 1);
+      void mobileIncomingShare.refresh().catch(() => undefined);
+      return true;
+    }
+    const intent = parseMobileNativeIntent(url);
+    if (intent !== undefined && nativeIntentDeliveryRef.current!.offer(url)) {
+      externalNavigationRevisionRef.current++;
+      externalIntentFenceRef.current!.offerNative(intent);
+      if (nativeIntentConnectingRef.current) client.cancel();
+      setNativeIntentRevision((value) => value + 1);
+    }
+    return intent !== undefined;
+  }, []);
+  const openDerivationOrigin = useCallback(async (authorityKey: string, signal: AbortSignal): Promise<boolean> => {
+    const revision = externalNavigationRevisionRef.current;
+    const url = await client.prepareTaskDerivationOrigin(authorityKey, signal);
+    return url !== undefined && !signal.aborted && appMountedRef.current && AppState.currentState === "active"
+      && revision === externalNavigationRevisionRef.current && offerNativeUrl(url);
+  }, [offerNativeUrl]);
   const scheme = useColorScheme();
   const dark = resolveMobileDarkTheme(theme.preference, scheme);
   const colors = useMemo(() => ({
@@ -692,25 +643,8 @@ export function App() {
       diagnosticsTick = nextTick;
       if (mobileDiagnostics.snapshot.enabled) void mobileDiagnostics.flush().catch(() => undefined);
     }, 2_000);
-    const offerUrl = (url: string): boolean => {
-      if (isMobileIncomingShareUrl(url)) {
-        externalIntentFenceRef.current!.offerShare();
-        nativeIntentDeliveryRef.current!.invalidate();
-        if (nativeIntentConnectingRef.current) client.cancel();
-        setIncomingShareRequestRevision((value) => value + 1);
-        void mobileIncomingShare.refresh().catch(() => undefined);
-        return true;
-      }
-      const intent = parseMobileNativeIntent(url);
-      if (intent !== undefined && nativeIntentDeliveryRef.current!.offer(url)) {
-        externalIntentFenceRef.current!.offerNative(intent);
-        if (nativeIntentConnectingRef.current) client.cancel();
-        setNativeIntentRevision((value) => value + 1);
-      }
-      return intent !== undefined;
-    };
-    const removeLinking = installMobileNativeIntentLinking(Linking, offerUrl);
-    void mobilePush.start(offerUrl, lifecycle.transportForeground);
+    const removeLinking = installMobileNativeIntentLinking(Linking, offerNativeUrl);
+    void mobilePush.start(offerNativeUrl, lifecycle.transportForeground);
     mobilePush.handleAppStateChange(AppState.currentState);
     return () => {
       appMountedRef.current = false;
@@ -894,6 +828,7 @@ export function App() {
                     setPage("partners");
                   }}
                   focusComposer={focusTaskComposer} onComposerFocused={handleComposerFocused}
+                  onOpenDerivationOrigin={openDerivationOrigin}
                   messageFocus={nativeIntentMessageFocus} /> :
                 page === "files" ? <FilesScreen {...common} initialSource={filesInitialSource} onBack={() => setPage("task")}
                   onAdded={() => {
@@ -3200,11 +3135,12 @@ function NewTaskScreen({ colors, state, locale, onBack, onCreated, onImportedExi
 }
 
 function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onOpenPartnerThread, focusComposer, onComposerFocused,
-  messageFocus }: ScreenProps & {
+  messageFocus, onOpenDerivationOrigin }: ScreenProps & {
   onBack: () => void; onHome: () => void; onNew: () => void; onFiles: (source?: MobileFilesComposerSource) => void;
   onOpenPartnerThread: (preview: NonNullable<TimelineRow["partnerPrivatePreview"]>) => void;
   focusComposer: boolean; onComposerFocused: () => void;
   messageFocus?: MobileNativeIntentMessageFocus;
+  onOpenDerivationOrigin: (authorityKey: string, signal: AbortSignal) => Promise<boolean>;
 }) {
   const initialDraftIdentity = state.activeProfileId && state.selectedId
     ? { profileId: state.activeProfileId, sessionId: state.selectedId }
@@ -3288,6 +3224,13 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
   const copyInFlightRef = useRef(false);
   const timelineListRef = useRef<FlatList<TimelineRow>>(null);
   const timelineViewportRef = useRef<View>(null);
+  const [imageViewportPulse, setImageViewportPulse] = useState(0);
+  const [visibleImageRows, setVisibleImageRows] = useState<ReadonlySet<string>>(new Set());
+  const imageViewability = useRef({ itemVisiblePercentThreshold: 1, minimumViewTime: 80 }).current;
+  const onImageRowsVisible = useRef(({ viewableItems }: { readonly viewableItems: readonly { readonly item: TimelineRow; readonly isViewable: boolean }[] }) => {
+    const next = new Set(viewableItems.filter((item) => item.isViewable).map((item) => item.item.id));
+    setVisibleImageRows((previous) => previous.size === next.size && [...next].every((id) => previous.has(id)) ? previous : next);
+  }).current;
   const screenshotMessageViewsRef = useRef(new Map<string, View>());
   const messageFocusRetryRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const messageFocusRetryKeyRef = useRef<string | undefined>(undefined);
@@ -3469,6 +3412,12 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
   const contextControls = state.status === "connected" ? client.taskContextControls() : undefined;
   const contextOwnerRef = useRef(contextControls?.surfaceOwnerKey);
   const nativeTreeControls = state.status === "connected" ? client.taskNativeTreeControls() : undefined;
+  const cloneControls = state.status === "connected" ? client.taskCloneControls() : undefined;
+  const [cloneVisible, setCloneVisible] = useState(false);
+  const [forkEventId, setForkEventId] = useState<string>();
+  const forkControls = state.status === "connected" && forkEventId ? client.taskMessageForkControls(forkEventId) : undefined;
+  const [rewindEventId, setRewindEventId] = useState<string>();
+  const rewindControls = state.status === "connected" && rewindEventId ? client.taskMessageRewindControls(rewindEventId) : undefined;
   const nativeTreeOwnerRef = useRef(nativeTreeControls?.surfaceOwnerKey);
   const sessionMentionControls = state.status === "connected" ? client.taskSessionMentionControls() : undefined;
   const sessionMentionOwnerRef = useRef(sessionMentionControls?.surfaceOwnerKey);
@@ -3817,6 +3766,18 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
       void mobileComposerDrafts.flush(identity).catch(() => undefined);
     };
   }, [draftIdentityKey]);
+  useEffect(() => {
+    const restored = state.restoredComposerDraft;
+    const identity = draftIdentityRef.current;
+    if (!restored || !identity || restored.profileId !== identity.profileId || restored.sessionId !== identity.sessionId
+      || !taskMountedRef.current || AppState.currentState !== "active" || queueEditRef.current) return;
+    const next = mobileComposerDrafts.readSync(identity);
+    if (!next) return;
+    composerDraftRef.current = next;
+    setDraft(next);
+    setComposerSelection({ start: next.text.length, end: next.text.length });
+    setDraftReady(true);
+  }, [state.restoredComposerDraft]);
   const composerOwnerReady = loadedDraftKey === draftIdentityKey && draftReady;
   useEffect(() => {
     if (!composerOwnerReady || !focusComposer) return;
@@ -3948,12 +3909,15 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
   const messageActionItems = messageAction
     ? buildMobileMessageActions(messageAction.row, {
       canDelete: client.canDeleteMessage(messageAction.row.eventId), locale, copyDisabled: copyBusy,
+      canFork: !state.busy && !attachmentBusy && !voice.busy && client.taskMessageForkControls(messageAction.row.eventId)?.canFork === true,
+      canRewind: !state.busy && !attachmentBusy && !voice.busy && queueEdit === undefined
+        && client.taskMessageRewindControls(messageAction.row.eventId)?.canRewind === true,
       shareDisabled: conversationShareDisabled
     }).filter((item) => state.status === "connected" || item.id === "copy-link")
     : [];
   useMobileScreenshotSelection({ owner: client.conversationShareOwnerKey(), selectionActive: conversationShare.active,
     blocked: conversationShareDisabled || drawerOpen || messageActionsVisible || taskActionsVisible || interactionVisible || contextVisible
-      || nativeTreeVisible || runtimeControlsVisible || sessionMentionsVisible || workspaceMentionsVisible || catalogMentionsVisible
+      || cloneVisible || forkEventId !== undefined || rewindEventId !== undefined || nativeTreeVisible || runtimeControlsVisible || sessionMentionsVisible || workspaceMentionsVisible || catalogMentionsVisible
       || photoLibraryLease !== undefined || imageEditorLease !== undefined || quoteSelection !== undefined
       || commandHelpItems !== undefined || runtimeCommandCommitting,
     visible: (signal) => {
@@ -5030,6 +4994,21 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
       return;
     }
     if (state.status !== "connected" || voice.busy) return;
+    if (action === "fork") {
+      if (state.busy || attachmentBusy || !client.taskMessageForkControls(latest.eventId)?.canFork) return;
+      setSessionMentionsVisible(false); setWorkspaceMentionsVisible(false); setCatalogMentionsVisible(false);
+      setContextVisible(false); setRuntimeControlsVisible(false); setNativeTreeVisible(false); setCloneVisible(false);
+      setRewindEventId(undefined);
+      setForkEventId(latest.eventId);
+      return;
+    }
+    if (action === "rewind") {
+      if (state.busy || attachmentBusy || queueEditRef.current || !client.taskMessageRewindControls(latest.eventId)?.canRewind) return;
+      setSessionMentionsVisible(false); setWorkspaceMentionsVisible(false); setCatalogMentionsVisible(false);
+      setContextVisible(false); setRuntimeControlsVisible(false); setNativeTreeVisible(false); setCloneVisible(false); setForkEventId(undefined);
+      setRewindEventId(latest.eventId);
+      return;
+    }
     if (action === "share-image") {
       if (!conversationShareDisabled) conversationShare.enter(latest.id);
       return;
@@ -5301,6 +5280,9 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
         ? () => { pendingDrawerActionRef.current = undefined; setDrawerOpen(true); } : onBack}
       disabled={session === undefined} colors={colors} locale={locale} onMenuVisibilityChange={setTaskActionsVisible}
       actions={[
+        { id: "clone", label: mobileMessage(locale, "clone.title"),
+          onPress: () => { setSessionMentionsVisible(false); setWorkspaceMentionsVisible(false); setCatalogMentionsVisible(false); setContextVisible(false); setRuntimeControlsVisible(false); setNativeTreeVisible(false); setForkEventId(undefined); setRewindEventId(undefined); setCloneVisible(true); },
+          disabled: !cloneControls?.canClone || state.busy || attachmentBusy || voice.busy },
         { id: "branches", label: mobileMessage(locale, "task.branches"),
           onPress: () => { setSessionMentionsVisible(false); setWorkspaceMentionsVisible(false); setCatalogMentionsVisible(false); setContextVisible(false); setRuntimeControlsVisible(false); setNativeTreeVisible(true); },
           disabled: state.status !== "connected" || nativeTreeControls === undefined || state.busy || attachmentBusy || voice.busy || interactions.length > 0 },
@@ -5330,8 +5312,11 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
       <Text style={[styles.caption, styles.fill, { color: colors.muted }]}>{formatMobileFileShareProgress(fileShareProgress, locale)}</Text>
     </View>}
     {conversationShare.notice && <Banner text={conversationShare.notice} colors={colors} />}
-    <View ref={timelineViewportRef} collapsable={false} style={styles.fill}>
-    <FlatList ref={timelineListRef} data={rows} extraData={conversationShare.selectedIds} keyExtractor={(row) => row.id} style={styles.fill} contentContainerStyle={styles.list}
+    <View ref={timelineViewportRef} collapsable={false} style={styles.fill} onLayout={() => setImageViewportPulse((value) => value + 1)}>
+    <FlatList key={draftIdentityKey} ref={timelineListRef} data={rows}
+      extraData={{ selection: conversationShare.selectedIds, visibleImageRows, imageViewportPulse }} keyExtractor={(row) => row.id} style={styles.fill} contentContainerStyle={styles.list}
+      viewabilityConfig={imageViewability} onViewableItemsChanged={onImageRowsVisible}
+      scrollEventThrottle={100} onScroll={() => setImageViewportPulse((value) => value + 1)}
       onScrollToIndexFailed={({ averageItemLength, index }) => {
         if (messageFocusHighlight === undefined || messageFocusKey !== messageFocusHighlight) return;
         if (messageFocusRetryKeyRef.current === messageFocusKey) return;
@@ -5345,11 +5330,15 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
           messageFocusRetryRef.current = undefined;
         }, 80);
       }}
-      ListHeaderComponent={<View style={styles.historyActions}>
+      ListHeaderComponent={<View>
+        <MobileSessionDerivationMarker controls={client.taskDerivationOriginControls()} colors={colors} locale={locale}
+          busy={state.busy || attachmentBusy || voice.busy} onOpen={onOpenDerivationOrigin} />
+        <View style={styles.historyActions}>
         {state.window && <Action label={mobileMessage(locale, "task.returnLatest")} colors={colors} onPress={() => client.latest()} />}
         {!state.historyEnd && <Action label={mobileMessage(locale, state.historyBusy ? "task.loadingHistory" : "task.loadEarlier")} colors={colors}
           disabled={state.historyBusy || state.status !== "connected"}
           onPress={() => void client.older().catch((error) => setLocalError(errorText(error)))} />}
+        </View>
       </View>}
       ListEmptyComponent={<Centered label={mobileMessage(locale, state.status === "offline"
         ? state.detail ? "task.offlineEmpty" : "task.offlineMissing" : "task.empty")} colors={colors} />}
@@ -5381,7 +5370,9 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
           </Pressable>}
         </View>
         <View pointerEvents={conversationShare.active ? "none" : "auto"}>
-        {item.kind === "assistant" ? <MobileMarkdownMessage key={markdownOwnerKey} text={item.text} colors={colors} locale={locale}
+        {item.tool ? <MobileToolCallCard key={markdownOwnerKey} call={item.tool} ownerKey={markdownOwnerKey} colors={colors} locale={locale}
+          enabled={state.status === "connected" || state.status === "offline"} />
+          : item.kind === "assistant" ? <MobileMarkdownMessage key={markdownOwnerKey} text={item.text} colors={colors} locale={locale}
           ownerKey={markdownOwnerKey} resourceClient={client} messageId={item.id}
           resourceOwnerKey={item.completed && !item.optimistic ? client.markdownResourceOwnerKey() : undefined}
           onOpenImage={openMarkdownImage} onOpenPath={openMarkdownPath} />
@@ -5404,24 +5395,14 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
           <Text style={[styles.caption, { color: colors.accent }]}>{mobileMessage(locale, "partner.openThread")}</Text>
         </Pressable>}
         {item.images && item.images.length > 0 && <View accessibilityLabel={`${item.label} · ${mobileMessage(locale, "task.images", { count: item.images.length })}`} style={styles.messageImages}>
-          {item.images.map((image, index) => <Pressable key={image.pageId} accessibilityRole="imagebutton"
-            accessibilityLabel={mobileMessage(locale, "task.openImage", { index: index + 1, count: item.images!.length, name: image.title })}
-            accessibilityHint={mobileMessage(locale, "task.openImageHint")}
+          {item.images.map((image, index) => <MobileTimelineImage key={image.pageId} client={client} page={image}
+            eventId={image.sourceEventId ?? item.eventId} ownerKey={client.timelineImagePreviewOwnerKey()}
+            eligible={visibleImageRows.has(item.id) && state.status === "connected" && !drawerOpen && !messageActionsVisible && !taskActionsVisible
+              && !interactionVisible && !contextVisible && imageGallery.view === undefined && imageEditorLease === undefined && photoLibraryLease === undefined}
+            viewportRef={timelineViewportRef} viewportPulse={imageViewportPulse} maximumWidth={width - safeArea.left - safeArea.right - 64}
+            colors={colors} locale={locale} openLabel={mobileMessage(locale, "task.openImage", { index: index + 1, count: item.images!.length, name: image.title })}
             disabled={galleryOpening || imageGallery.view !== undefined || state.status !== "connected" || attachmentBusy || voice.busy}
-            onPress={() => openTimelineImage(item, image)}
-            style={[styles.messageImageTile, { borderColor: colors.border, backgroundColor: colors.background },
-              (galleryOpening || imageGallery.view !== undefined || state.status !== "connected" || attachmentBusy || voice.busy)
-                && styles.disabled]}>
-            <Text style={styles.messageImageGlyph}>▧</Text>
-            <View style={styles.fill}>
-              <Text style={[styles.label, { color: colors.ink }]} numberOfLines={1}>{image.title}</Text>
-              <Text style={[styles.caption, { color: colors.muted }]} numberOfLines={1}>
-                {image.mediaType}{image.widthPixels && image.heightPixels
-                  ? ` · ${image.widthPixels} × ${image.heightPixels}` : ""} · {formatByteSize(BigInt(image.byteSize))}
-              </Text>
-            </View>
-            <Text style={[styles.caption, { color: colors.accent }]}>{mobileMessage(locale, "common.open")}</Text>
-          </Pressable>)}
+            onOpen={() => openTimelineImage(item, image)} />)}
         </View>}
         {item.artifacts && item.artifacts.length > 0 && <View accessibilityLabel={`${item.label} · ${mobileMessage(locale, "task.filesCount", { count: item.artifacts.length })}`} style={styles.messageImages}>
           {item.artifacts.map((artifact) => {
@@ -5777,14 +5758,18 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
       }}
       onNativeActivityChange={(active) => { attachmentNativeActivityRef.current = active; }}
       onClose={closeImageEditor} onSave={saveImageEditor} />}
-    {imageGallery.view && <MobileImageLightbox key={imageGallery.view.session.leaseId}
+    {imageGallery.view && <MobileImageLightbox key={imageGallery.view.descriptor.leaseId}
       session={imageGallery.view.session} locale={locale}
       gallery={{
-        session: imageGallery.view.session,
+        descriptor: imageGallery.view.descriptor, pageIndex: imageGallery.view.pageIndex, pageKey: imageGallery.view.pageKey,
+        ...(imageGallery.view.preview ? { preview: imageGallery.view.preview } : {}),
+        ...(imageGallery.view.adjacentPreviews ? { adjacentPreviews: imageGallery.view.adjacentPreviews } : {}),
         busy: imageGallery.view.busy,
-        ...(imageGallery.view.error ? { error: imageGallery.view.error } : {}),
+        ...(imageGallery.view.failed ? { error: mobileMessage(locale, "image.previewFailed") } : {}),
+        onRetry: imageGallery.retry, onNativeFailed: imageGallery.nativeFailed, onPreviewFailed: imageGallery.previewFailed,
         onNavigate: imageGallery.navigate,
         onAddOriginal: imageGallery.addOriginal,
+        onShareOriginal: imageGallery.shareOriginal,
         onDecoded: imageGallery.decoded
       }}
       onOutputAction={async (action, decoded, rendered, signal) => {
@@ -5792,7 +5777,7 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
         setLocalError("");
         try {
           const view = imageGallery.view;
-          if (!view) throw new Error(mobileMessage(locale, "task.error.galleryClosed"));
+          if (!view?.session || view.busy || view.failed) throw new Error(mobileMessage(locale, "task.error.galleryClosed"));
           const message = await performMobileImageOutput(view.session, action, decoded, rendered, signal, locale);
           if (!signal.aborted && taskMountedRef.current) setComposerNotice(message);
           return message;
@@ -5804,6 +5789,17 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
       onNativeActivityChange={(active) => { attachmentNativeActivityRef.current = active; }}
       onClose={imageGallery.close} onSave={imageGallery.save} />}
     <FilePreviewModal colors={colors} preview={state.timelinePreview} busy={false}
+      onQuoted={() => {
+        const identity = draftIdentityRef.current;
+        const saved = identity && mobileComposerDrafts.readSync(identity);
+        if (!saved) return;
+        const queue = queueEditRef.current;
+        if (queue) { const updated = { ...queue, stashedDraft: saved }; queueEditRef.current = updated; setQueueEdit(updated); }
+        else { composerDraftRef.current = saved; setDraft(saved); composerSelectionRef.current = { start: saved.text.length, end: saved.text.length }; setComposerSelection(composerSelectionRef.current); }
+        setTimelinePreviewSource(undefined); client.closeTimelinePreview();
+        setTimeout(() => { if (taskMountedRef.current && AppState.currentState === "active" && draftIdentityRef.current
+          && mobileComposerDraftIdentityKey(draftIdentityRef.current) === mobileComposerDraftIdentityKey(identity!)) composerInputRef.current?.focus(); }, 0);
+      }}
       sharing={fileShareBusy} shareProgress={fileShareProgress}
       onShare={timelinePreviewSource ? () => shareTimelineArtifact(timelinePreviewSource) : undefined}
       backLabel={mobileMessage(locale, "preview.taskTitle")}
@@ -5821,6 +5817,29 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
     <MobileQuoteSelectionSheet lease={state.status === "connected" ? quoteSelection?.lease : undefined} locale={locale}
       colors={colors} busy={state.busy || voice.busy}
       onClose={() => setQuoteSelection(undefined)} onAdd={addSelectedQuote} />
+    <MobileTaskDerivationSheet kind="clone" visible={cloneVisible}
+      controls={cloneControls ? { ...cloneControls, canDerive: cloneControls.canClone } : undefined} locale={locale} colors={colors}
+      busy={state.busy || attachmentBusy || voice.busy} onClose={() => setCloneVisible(false)}
+      onSubmit={(key, name, signal) => client.cloneTask(key, name, signal)}
+      onOpen={(id) => { setCloneVisible(false); void client.select(id).catch((error) => {
+        if (taskMountedRef.current) setLocalError(errorText(error));
+      }); }} onError={setLocalError} />
+    <MobileTaskDerivationSheet kind="fork" visible={forkEventId !== undefined}
+      controls={forkControls ? { ...forkControls, canDerive: forkControls.canFork, restoreInput: forkControls.source.restoreInput } : undefined}
+      locale={locale} colors={colors} busy={state.busy || attachmentBusy || voice.busy} onClose={() => setForkEventId(undefined)}
+      onSubmit={(key, name, signal) => client.forkTaskMessage(key, forkEventId!, name, signal)}
+      onOpen={(id) => { setForkEventId(undefined); void client.select(id).catch((error) => {
+        if (taskMountedRef.current) setLocalError(errorText(error));
+      }); }} onError={setLocalError} />
+    <MobileMessageRewindSheet visible={rewindEventId !== undefined} controls={rewindControls} locale={locale} colors={colors}
+      busy={state.busy || attachmentBusy || voice.busy || queueEdit !== undefined} onClose={() => setRewindEventId(undefined)}
+      onLoad={(key, eventId, signal) => client.loadTaskMessageRewindPreview(key, eventId, signal)}
+      onCommit={(preview, mode, signal) => client.commitTaskMessageRewind(preview, mode, signal)}
+      onCheckOperation={async () => {
+        await client.reconcile();
+        return !client.state.pending.some((value) => value.sessionId === state.selectedId
+          && (value.kind === "session-rewind" || value.kind === "workspace-rewind"));
+      }} onError={setLocalError} />
     <MobileComposerAtomSheet atom={state.status === "connected"
       ? draft.atoms.find((atom) => atom.atomId === composerAtomId) : undefined}
       colors={colors} locale={locale} busy={state.busy || voice.busy || attachmentBusy || !composerOwnerReady || queueEdit !== undefined}
@@ -5899,6 +5918,9 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
   </View>;
 }
 
+const filesClipboard = new MobileFilesClipboard((text) => Clipboard.setStringAsync(text));
+const filesClipboardMessages = { copied: "files.presentation.copied", failed: "files.presentation.copyFailed", unknown: "files.presentation.copyUnknown", busy: "files.presentation.copyBusy" } as const;
+
 function FilesScreen({ colors, state, locale, onBack, onAdded, initialSource }: ScreenProps & {
   onBack: () => void; onAdded: () => void; initialSource?: MobileFilesComposerSource;
 }) {
@@ -5911,6 +5933,9 @@ function FilesScreen({ colors, state, locale, onBack, onAdded, initialSource }: 
   const [fileShareBusy, setFileShareBusy] = useState(false);
   const [fileShareProgress, setFileShareProgress] = useState<MobileFileShareProgress>();
   const [galleryOpening, setGalleryOpening] = useState(false);
+  const [clipboardBusy, setClipboardBusy] = useState(false);
+  const [clipboardNotice, setClipboardNotice] = useState<Exclude<MobileFilesClipboardResult, "retired">>();
+  const clipboardFlight = useRef<symbol | undefined>(undefined);
   const [previewSource, setPreviewSource] = useState<MobileFilesComposerSource | undefined>(initialSource);
   const handoffRef = useRef<AbortController | undefined>(undefined);
   const fileShareRef = useRef<AbortController | undefined>(undefined);
@@ -5918,12 +5943,69 @@ function FilesScreen({ colors, state, locale, onBack, onAdded, initialSource }: 
   const authorityKey = client.filesAuthorityKey();
   const connected = state.status === "connected" && authorityKey !== undefined;
   const files = state.files;
+  const currentPreviewSource = files.previewPager?.pages[files.previewPager.index]?.source ?? previewSource;
+  const currentPreviewPage = files.previewPager?.pages[files.previewPager.index];
+  const initialPagerSource = useRef<MobileFilesComposerSource | undefined>(undefined);
   const searching = query.trim().length > 0;
   const imageGallery = useMobileImageGallery(locale, () => {
     client.closeFiles();
     onAdded();
   });
-  const filesBusy = handoffBusy || fileShareBusy || galleryOpening || imageGallery.view !== undefined;
+  const filesBusy = handoffBusy || fileShareBusy || galleryOpening || clipboardBusy || imageGallery.view !== undefined;
+  useEffect(() => {
+    filesClipboard.cancel(); clipboardFlight.current = undefined; setClipboardBusy(false); setClipboardNotice(undefined);
+    return () => { filesClipboard.cancel(); clipboardFlight.current = undefined; };
+  }, [authorityKey, files.open, files.directoryRevision, files.artifactsRevision, files.location, files.preview, files.status]);
+  const copyFilesValue = (
+    prepare: () => MobileFilesClipboardLease,
+    cancellation?: AbortSignal,
+    allowGallery = false
+  ): Promise<MobileFilesClipboardResult> => {
+    if (client.state.files !== files || client.filesAuthorityKey() !== authorityKey) return Promise.resolve("retired");
+    if (clipboardFlight.current || handoffRef.current || fileShareRef.current || galleryOpening
+      || !allowGallery && imageGallery.view !== undefined) return Promise.resolve("busy");
+    const flight = Symbol(); clipboardFlight.current = flight;
+    setClipboardBusy(true); setClipboardNotice(undefined);
+    let lease: MobileFilesClipboardLease;
+    try { lease = prepare(); }
+    catch { clipboardFlight.current = undefined; setClipboardBusy(false); setClipboardNotice("failed"); return Promise.resolve("failed"); }
+    return filesClipboard.copy(lease, cancellation).then((result) => {
+      if (!filesMountedRef.current || clipboardFlight.current !== flight || result === "retired") return result;
+      try { lease.assertCurrent(); setClipboardNotice(result); } catch { /* The completed write belongs to the retired source. */ }
+      return result;
+    }).finally(() => {
+      if (clipboardFlight.current === flight) { clipboardFlight.current = undefined; if (filesMountedRef.current) setClipboardBusy(false); }
+    });
+  };
+  const copyPath = (source?: MobileFilesComposerSource): void => {
+    void copyFilesValue(() => client.prepareFilesPathCopy(files, source));
+  };
+  const preferenceRevision = useSyncExternalStore(useCallback((listener) => mobileFilesPreferences.subscribe(listener), []), () => mobileFilesPreferences.revision);
+  const preferenceScope = useMemo(() => state.activeProfileId && state.owner?.server?.serverId && files.workspace?.workspaceId
+    ? { profileId: state.activeProfileId, serverId: state.owner.server.serverId, workspaceId: files.workspace.workspaceId } : undefined,
+  [state.activeProfileId, state.owner?.server?.serverId, files.workspace?.workspaceId]);
+  const filesPreferences = useMemo(() => mobileFilesPreferences.get(preferenceScope), [preferenceRevision, preferenceScope]);
+  useEffect(() => {
+    if (!initialSource || initialPagerSource.current === initialSource || files.previewPager || !files.preview
+      || files.preview.kind === "loading" || files.status !== "ready") return;
+    initialPagerSource.current = initialSource;
+    void client.openFilesPreviewPager(initialSource, filesPreferences.sort).catch((error) => setLocalError(errorText(error)));
+  }, [initialSource, files.preview, files.previewPager, files.status, filesPreferences.sort]);
+  const preferenceScopeKey = preferenceScope ? JSON.stringify(preferenceScope) : "";
+  const preferenceScopeRef = useRef(preferenceScopeKey); preferenceScopeRef.current = preferenceScopeKey;
+  const [preferenceFailed, setPreferenceFailed] = useState(false);
+  useEffect(() => {
+    let current = true; setPreferenceFailed(false);
+    void mobileFilesPreferences.hydrate().catch(() => { if (current) setPreferenceFailed(true); });
+    return () => { current = false; };
+  }, [preferenceScopeKey]);
+  const setFilesPreferences = (preferences: MobileFilesPreferences): void => {
+    if (!preferenceScope || filesBusy) return;
+    setPreferenceFailed(false); const key = preferenceScopeKey;
+    void mobileFilesPreferences.set(preferenceScope, preferences).catch(() => {
+      if (filesMountedRef.current && preferenceScopeRef.current === key) setPreferenceFailed(true);
+    });
+  };
 
   useEffect(() => {
     if (!connected || !authorityKey) return;
@@ -5937,6 +6019,7 @@ function FilesScreen({ colors, state, locale, onBack, onAdded, initialSource }: 
     filesMountedRef.current = true;
     return () => {
       filesMountedRef.current = false;
+      filesClipboard.cancel(); clipboardFlight.current = undefined;
       handoffRef.current?.abort();
       handoffRef.current = undefined;
       fileShareRef.current?.abort();
@@ -5959,6 +6042,7 @@ function FilesScreen({ colors, state, locale, onBack, onAdded, initialSource }: 
     void action().catch((error) => setLocalError(errorText(error)));
   };
   const leave = (): void => {
+    filesClipboard.cancel(); clipboardFlight.current = undefined;
     handoffRef.current?.abort();
     handoffRef.current = undefined;
     fileShareRef.current?.abort();
@@ -5967,14 +6051,13 @@ function FilesScreen({ colors, state, locale, onBack, onAdded, initialSource }: 
     client.closeFiles();
     onBack();
   };
-  const openPreview = (source: MobileFilesComposerSource, action: () => Promise<void>): void => {
+  const openPreview = (source: MobileFilesComposerSource): void => {
     if (handoffRef.current || filesBusy) return;
     setPreviewSource(source);
-    run(action);
+    run(() => client.openFilesPreviewPager(source, filesPreferences.sort));
   };
   const openResult = (result: MobileFileSearchResult): void => openPreview(
-    { kind: "search-result", result },
-    () => client.previewFileSearchResult(result)
+    { kind: "search-result", result }
   );
   const openGallery = (source: MobileFilesComposerSource): void => {
     if (handoffRef.current || galleryOpening || imageGallery.view) return;
@@ -5982,7 +6065,7 @@ function FilesScreen({ colors, state, locale, onBack, onAdded, initialSource }: 
     setLocalError("");
     client.closeFilesPreview();
     setPreviewSource(undefined);
-    void imageGallery.open((signal) => client.openFilesImageGallery(source, signal))
+    void imageGallery.open((signal) => client.openFilesImageGallery(source, signal, filesPreferences.sort))
       .catch((error) => setLocalError(errorText(error)))
       .finally(() => setGalleryOpening(false));
   };
@@ -6058,6 +6141,11 @@ function FilesScreen({ colors, state, locale, onBack, onAdded, initialSource }: 
       <Text style={[styles.caption, styles.fill, { color: colors.muted }]}>{mobileMessage(locale, "files.offline")}</Text>
     </View>}
     {(localError || files.error) && <Banner text={localError || files.error || ""} colors={colors} />}
+    {preferenceFailed && <Banner text={mobileMessage(locale, "files.presentation.preferenceError")} colors={colors} />}
+    {clipboardNotice && <Notice text={mobileMessage(locale, filesClipboardMessages[clipboardNotice])} colors={colors} locale={locale} onDismiss={() => setClipboardNotice(undefined)} />}
+    {clipboardBusy && <View accessibilityLiveRegion="polite" style={styles.connectionNotice}>
+      <ActivityIndicator color={colors.accent} /><Text style={[styles.caption, { color: colors.muted }]}>{mobileMessage(locale, "files.presentation.copying")}</Text>
+    </View>}
     {imageOutputNotice && <Notice text={imageOutputNotice} colors={colors} locale={locale}
       onDismiss={() => setImageOutputNotice("")} />}
     {handoffBusy && <View accessibilityLiveRegion="polite" style={[styles.connectionNotice, { backgroundColor: colors.surface, borderColor: colors.border }]}>
@@ -6093,8 +6181,7 @@ function FilesScreen({ colors, state, locale, onBack, onAdded, initialSource }: 
 
     {files.status === "loading" && files.entries.length === 0 && files.artifacts.length === 0
       ? <Centered label={mobileMessage(locale, "files.loading")} colors={colors} />
-      : <ScrollView style={styles.fill} contentContainerStyle={styles.filesList} keyboardShouldPersistTaps="handled">
-        {searching ? <>
+      : searching ? <ScrollView style={styles.fill} contentContainerStyle={styles.filesList} keyboardShouldPersistTaps="handled">
           <Text style={[styles.section, { color: colors.muted }]}>{mobileMessage(locale, "files.searchResults")}</Text>
           {files.searchStatus === "ready" && files.searchResults.length === 0
             && <Text style={[styles.description, { color: colors.muted }]}>{mobileMessage(locale, "files.noMatches")}</Text>}
@@ -6113,114 +6200,70 @@ function FilesScreen({ colors, state, locale, onBack, onAdded, initialSource }: 
                 count: files.searchResults.length
               })}
           </Text>}
-        </> : files.location.kind === "generated" ? <>
-          <Text style={[styles.section, { color: colors.muted }]}>{mobileMessage(locale, "files.generatedByTask")}</Text>
-          {files.artifacts.length === 0
-            && <Text style={[styles.description, { color: colors.muted }]}>{mobileMessage(locale, "files.generatedEmpty")}</Text>}
-          {files.artifacts.map((artifact) => {
-            const galleryImage = mobileImageGalleryMediaType(artifact.blob?.mediaType ?? "") !== undefined;
-            const model = artifact.blob
-              ? mobileModelPreviewKind(artifact.blob.mediaType, artifact.blob.fileName) !== undefined : false;
-            const source = { kind: "artifact" as const, artifact };
-            return <View key={artifact.artifactId} style={styles.fileActionRow}>
-            <Pressable accessibilityRole="button"
-              accessibilityLabel={mobileMessage(locale, galleryImage ? "files.openGalleryFor" : "files.previewGenerated", {
-                name: artifactTitle(artifact)
-              })}
-              disabled={!connected || filesBusy}
-              onPress={() => galleryImage
-                ? openGallery(source)
-                : openPreview(source, () => client.previewArtifact(artifact))}
-              style={[styles.fileRow, styles.fileRowMain, { backgroundColor: colors.surface, borderColor: colors.border },
-                (!connected || filesBusy) && styles.disabled]}>
-              <Text style={styles.fileGlyph}>{galleryImage ? "▧" : model ? "⬡" : "◆"}</Text>
-              <View style={styles.fill}><Text style={[styles.label, { color: colors.ink }]} numberOfLines={1}>{artifactTitle(artifact)}</Text>
-                <Text style={[styles.caption, { color: colors.muted }]} numberOfLines={1}>
-                  {artifact.blob ? `${artifact.blob.mediaType || "application/octet-stream"} · ${formatByteSize(artifact.blob.byteSize)}`
-                    : mobileMessage(locale, "files.blobUnavailable")}
-                </Text></View>
-              <Text style={[styles.chevron, { color: colors.muted }]}>›</Text>
-            </Pressable>
-            <Action label={mobileMessage(locale, "common.add")}
-              accessibilityLabel={mobileMessage(locale, "files.addGenerated", { name: artifactTitle(artifact) })}
-              compact colors={colors} disabled={!connected || filesBusy}
-              onPress={() => addToComposer(source)} />
-            <Action label={mobileMessage(locale, "common.share")}
-              accessibilityLabel={mobileMessage(locale, "files.shareGenerated", { name: artifactTitle(artifact) })}
-              compact colors={colors} disabled={!connected || filesBusy || !shareableBlobSize(artifact.blob?.byteSize)}
-              onPress={() => shareFile(source)} />
-          </View>})}
-        </> : <>
-          <View style={styles.sectionHeader}>
-            <Text style={[styles.section, { color: colors.muted }]}>{files.location.path || mobileMessage(locale, "files.workspaceRoot")}</Text>
-            {files.location.path && <Action label={mobileMessage(locale, "files.up")} compact colors={colors} disabled={!connected || filesBusy}
-              onPress={() => run(() => client.openFilesDirectory(workspaceParentPath(files.location.kind === "workspace" ? files.location.path : "")))} />}
-          </View>
-          {files.entries.length === 0
-            && <Text style={[styles.description, { color: colors.muted }]}>{mobileMessage(locale, "files.directoryEmpty")}</Text>}
-          {files.entries.map((entry) => {
-            const label = entry.displayName || workspaceBasename(entry.relativePath);
-            const galleryImage = entry.kind === FileKind.REGULAR
-              && mobileImageGalleryMediaType(entry.mediaType) !== undefined;
-            const model = entry.kind === FileKind.REGULAR
-              && mobileModelPreviewKind(entry.mediaType, entry.relativePath) !== undefined;
-            const source = { kind: "workspace-entry" as const, entry };
-            return <View key={entry.relativePath} style={styles.fileActionRow}>
-              <Pressable accessibilityRole="button"
-                accessibilityLabel={mobileMessage(locale, entry.kind === FileKind.DIRECTORY
-                  ? "files.openDirectory" : galleryImage ? "files.openGalleryFor" : "files.previewFile", { name: label })}
-                disabled={!connected || filesBusy}
-                onPress={() => entry.kind === FileKind.DIRECTORY
-                  ? run(() => client.previewWorkspaceEntry(entry))
-                  : galleryImage
-                    ? openGallery(source)
-                    : openPreview(source, () => client.previewWorkspaceEntry(entry))}
-                style={[styles.fileRow, styles.fileRowMain, { backgroundColor: colors.surface, borderColor: colors.border },
-                  (!connected || filesBusy) && styles.disabled]}>
-                <Text style={styles.fileGlyph}>{entry.kind === FileKind.DIRECTORY ? "▰" : galleryImage ? "▧" : model ? "⬡" : "◇"}</Text>
-                <View style={styles.fill}>
-                  <Text style={[styles.label, { color: colors.ink }]} numberOfLines={1}>{label}</Text>
-                  <Text style={[styles.caption, { color: colors.muted }]} numberOfLines={1}>
-                    {entry.kind === FileKind.DIRECTORY ? mobileMessage(locale, "files.directory")
-                      : `${entry.mediaType || "application/octet-stream"} · ${formatByteSize(entry.revision?.byteSize ?? 0n)}`}
-                    {entry.hidden ? ` · ${mobileMessage(locale, "files.hidden")}` : ""}
-                    {entry.ignored ? ` · ${mobileMessage(locale, "files.ignored")}` : ""}
-                  </Text>
-                </View>
-                <Text style={[styles.chevron, { color: colors.muted }]}>›</Text>
-              </Pressable>
-              <Action label={mobileMessage(locale, "common.add")}
-                accessibilityLabel={mobileMessage(locale, entry.kind === FileKind.DIRECTORY
-                  ? "files.addDirectory" : "files.addFile", { name: label })}
-                compact colors={colors} disabled={!connected || filesBusy}
-                onPress={() => addToComposer(source)} />
-              <Action label={mobileMessage(locale, "common.share")}
-                accessibilityLabel={mobileMessage(locale, "files.shareFile", { name: label })}
-                compact colors={colors} disabled={!connected || filesBusy || entry.kind !== FileKind.REGULAR
-                  || !shareableBlobSize(entry.revision?.byteSize)}
-                onPress={() => shareFile(source)} />
-            </View>;
-          })}
-        </>}
-      </ScrollView>}
+      </ScrollView> : <MobileFilesBrowser files={files} preferences={filesPreferences} colors={colors} locale={locale}
+        thumbnailClient={client}
+        onCopy={copyPath} onCopyDirectory={() => copyPath()}
+        disabled={!connected || filesBusy} preferencesDisabled={!preferenceScope || filesBusy} onPreferences={setFilesPreferences}
+        onDirectory={(path) => run(() => client.openFilesDirectory(path))} onAdd={addToComposer} onShare={shareFile}
+        canShare={(source) => source.kind === "artifact" ? shareableBlobSize(source.artifact.blob?.byteSize)
+          : source.kind === "workspace-entry" && source.entry.kind === FileKind.REGULAR && shareableBlobSize(source.entry.revision?.byteSize)}
+        onOpen={(source) => {
+          if (source.kind === "artifact") {
+            if (mobileImageGalleryMediaType(source.artifact.blob?.mediaType ?? "")) openGallery(source);
+            else openPreview(source);
+          } else if (source.kind === "workspace-entry") {
+            if (source.entry.kind === FileKind.DIRECTORY) run(() => client.previewWorkspaceEntry(source.entry));
+            else if (source.entry.kind === FileKind.REGULAR && mobileImageGalleryMediaType(source.entry.mediaType)) openGallery(source);
+            else openPreview(source);
+          } else openResult(source.result);
+        }} />}
     </View>
-    <FilePreviewModal colors={colors} preview={files.preview} source={previewSource} busy={handoffBusy} locale={locale}
+    <FilePreviewModal colors={colors} preview={files.preview} source={currentPreviewSource} pager={files.previewPager}
+      onQuoted={() => { setPreviewSource(undefined); client.closeFiles(); onAdded(); }}
+      onNavigate={(id, key) => run(() => client.selectFilesPreviewPage(id, key))} busy={handoffBusy} locale={locale}
       sharing={fileShareBusy} shareProgress={fileShareProgress}
-      onShare={previewSource && shareableMobileFilesSource(previewSource)
-        ? () => shareFile(previewSource) : undefined}
+      copying={clipboardBusy}
+      copyLabel={currentPreviewPage ? mobileMessage(locale, currentPreviewPage.kind === "workspace"
+        ? "files.presentation.copyPath" : "files.presentation.copyName") : undefined}
+      copyStatus={clipboardBusy ? mobileMessage(locale, "files.presentation.copying")
+        : clipboardNotice ? mobileMessage(locale, filesClipboardMessages[clipboardNotice]) : undefined}
+      onCopy={files.previewPager && currentPreviewPage && files.preview?.kind !== "loading"
+        ? () => { void copyFilesValue(() => client.prepareFilesPreviewPathCopy(files, files.previewPager!.id, currentPreviewPage.key)); }
+        : undefined}
+      onShare={currentPreviewSource && shareableMobileFilesSource(currentPreviewSource)
+        ? () => shareFile(currentPreviewSource) : undefined}
       onAdd={addToComposer} onOpenImage={openGallery} onClose={() => {
         setPreviewSource(undefined);
         client.closeFilesPreview();
       }} />
-    {imageGallery.view && <MobileImageLightbox key={imageGallery.view.session.leaseId}
+    {imageGallery.view && <MobileImageLightbox key={imageGallery.view.descriptor.leaseId}
       session={imageGallery.view.session}
       locale={locale}
       gallery={{
-        session: imageGallery.view.session,
+        descriptor: imageGallery.view.descriptor, pageIndex: imageGallery.view.pageIndex, pageKey: imageGallery.view.pageKey,
+        ...(imageGallery.view.preview ? { preview: imageGallery.view.preview } : {}),
+        ...(imageGallery.view.adjacentPreviews ? { adjacentPreviews: imageGallery.view.adjacentPreviews } : {}),
         busy: imageGallery.view.busy,
-        ...(imageGallery.view.error ? { error: imageGallery.view.error } : {}),
+        ...(imageGallery.view.failed ? { error: mobileMessage(locale, "image.previewFailed") } : {}),
+        onRetry: imageGallery.retry, onNativeFailed: imageGallery.nativeFailed, onPreviewFailed: imageGallery.previewFailed,
         onNavigate: imageGallery.navigate,
+        ...(imageGallery.view.session ? {
+          copySourceLabel: mobileMessage(locale, imageGallery.view.descriptor.sourceKind === "workspace"
+            ? "files.presentation.copyPath" : "files.presentation.copyName"),
+          onCopySource: async (signal: AbortSignal): Promise<string> => {
+            const view = imageGallery.view; const session = view?.session;
+            if (!view || !session || view.busy || view.failed) throw new Error(mobileMessage(locale, "task.error.galleryClosed"));
+            const result = await copyFilesValue(() => client.prepareFilesImageGalleryPathCopy(
+              view.descriptor.leaseId, session.leaseId, session.pageId
+            ), signal, true);
+            signal.throwIfAborted();
+            if (result !== "copied") throw new Error(mobileMessage(locale,
+              result === "retired" ? "files.presentation.copyFailed" : filesClipboardMessages[result]));
+            return mobileMessage(locale, "files.presentation.copied");
+          }
+        } : {}),
         onAddOriginal: imageGallery.addOriginal,
+        onShareOriginal: imageGallery.shareOriginal,
         onDecoded: imageGallery.decoded
       }}
       onOutputAction={async (action, decoded, rendered, signal) => {
@@ -6228,7 +6271,7 @@ function FilesScreen({ colors, state, locale, onBack, onAdded, initialSource }: 
         setLocalError("");
         try {
           const view = imageGallery.view;
-          if (!view) throw new Error(mobileMessage(locale, "task.error.galleryClosed"));
+          if (!view?.session || view.busy || view.failed) throw new Error(mobileMessage(locale, "task.error.galleryClosed"));
           const message = await performMobileImageOutput(view.session, action, decoded, rendered, signal, locale);
           if (!signal.aborted) setImageOutputNotice(message);
           return message;
@@ -6270,15 +6313,21 @@ function FileSearchResultRow({ result, colors, locale, disabled, shareDisabled, 
   </View>;
 }
 
-function FilePreviewModal({ colors, preview, source, busy, sharing = false, shareProgress, backLabel,
-  backAccessibilityLabel, loadingLabel, locale,
-  onAdd, onOpenImage, onShare, onClose }: {
+function FilePreviewModal({ colors, preview, source, pager, onNavigate, busy, sharing = false, shareProgress, backLabel,
+  backAccessibilityLabel, loadingLabel, locale, copying = false, copyLabel, copyStatus, onCopy,
+  onAdd, onOpenImage, onShare, onClose, onQuoted }: {
   colors: Colors;
   preview: MobileFilePreview | undefined;
   source?: MobileFilesComposerSource;
+  pager?: FilesPreviewPager;
+  onNavigate?: (pagerId: string, pageKey: string) => void;
   busy: boolean;
   sharing?: boolean;
+  copying?: boolean;
   shareProgress?: MobileFileShareProgress;
+  copyLabel?: string;
+  copyStatus?: string;
+  onCopy?: () => void;
   backLabel?: string;
   backAccessibilityLabel?: string;
   loadingLabel?: string;
@@ -6287,10 +6336,13 @@ function FilePreviewModal({ colors, preview, source, busy, sharing = false, shar
   onOpenImage?: (source: MobileFilesComposerSource) => void;
   onShare?: () => void;
   onClose: () => void;
+  onQuoted?: () => void;
 }) {
+  const textActions = useMobileFileTextActions({ client, preview, clipboard: filesClipboard, disabled: busy || sharing, onQuoted, locale });
   const [mediaStatus, setMediaStatus] = useState<MobileMediaPlayerStatus>();
   const [pdfStatus, setPdfStatus] = useState<MobilePdfViewerStatus>();
   const [modelStatus, setModelStatus] = useState<MobileModelViewerStatus>();
+  const [textView, setTextView] = useState<{ identity: string; view: "rendered" | "source" }>();
   const closeRequestedForRef = useRef<string | undefined>(undefined);
   const exactBackLabel = backLabel ?? mobileMessage(locale, "preview.filesTitle");
   const exactLoadingLabel = loadingLabel ?? mobileMessage(locale, "preview.loadingExact");
@@ -6300,8 +6352,12 @@ function FilePreviewModal({ colors, preview, source, busy, sharing = false, shar
   useEffect(() => setMediaStatus(undefined), [mediaLeaseId]);
   useEffect(() => setPdfStatus(undefined), [pdfLeaseId]);
   useEffect(() => setModelStatus(undefined), [modelLeaseId]);
-  const blocked = busy || sharing;
-  const previewIdentity = preview ? `${preview.kind}\u0000${preview.revisionKey}` : undefined;
+  const blocked = busy || sharing || copying || textActions.busy;
+  const previewIdentity = preview ? JSON.stringify([preview.kind, preview.sourceLabel, preview.revisionKey]) : undefined;
+  const currentPreviewIdentity = useRef(previewIdentity); currentPreviewIdentity.current = previewIdentity;
+  const onTextViewChange = useCallback((view: "rendered" | "source") => {
+    if (previewIdentity && currentPreviewIdentity.current === previewIdentity) setTextView({ identity: previewIdentity, view });
+  }, [previewIdentity]);
   useEffect(() => {
     if (previewIdentity === undefined) closeRequestedForRef.current = undefined;
   }, [previewIdentity]);
@@ -6329,6 +6385,7 @@ function FilePreviewModal({ colors, preview, source, busy, sharing = false, shar
           {onShare && <Action label={sharing ? mobileMessage(locale, "preview.sharing") : mobileMessage(locale, "common.share")}
             accessibilityLabel={mobileMessage(locale, "preview.shareTitle", { title: preview.title })} compact colors={colors}
             disabled={blocked || preview.kind === "loading"} onPress={onShare} />}
+          {pager && <Action label={mobileMessage(locale, "files.preview.done")} compact colors={colors} disabled={blocked} onPress={requestClose} />}
         </View>
         {busy && <View accessibilityLiveRegion="polite" style={[styles.connectionNotice, { backgroundColor: colors.surface, borderColor: colors.border }]}>
           <ActivityIndicator color={colors.accent} />
@@ -6338,6 +6395,11 @@ function FilePreviewModal({ colors, preview, source, busy, sharing = false, shar
           <ActivityIndicator color={colors.accent} />
           <Text style={[styles.caption, styles.fill, { color: colors.muted }]}>{formatMobileFileShareProgress(shareProgress, locale)}</Text>
         </View>}
+        {(textActions.error || textActions.copyResult || textActions.busy) && <Text accessibilityRole={textActions.error ? "alert" : "text"} accessibilityLiveRegion="polite"
+          style={[styles.caption, { padding: 12, color: textActions.error ? colors.negative : colors.muted }]}>{textActions.error || mobileMessage(locale,
+            textActions.busy ? textActions.quoting ? "preview.adding" : "files.presentation.copying" : textActions.copyResult === "copied" ? "files.presentation.copied"
+              : textActions.copyResult === "unknown" ? "files.presentation.copyUnknown" : textActions.copyResult === "busy" ? "files.presentation.copyBusy" : "files.presentation.copyFailed")}</Text>}
+        {textActions.busy && <Action label={mobileMessage(locale, "common.cancel")} colors={colors} onPress={textActions.cancel} />}
         <View style={[styles.previewMetadata, { borderColor: colors.border, backgroundColor: colors.surface }]}>
           <Text selectable style={[styles.caption, { color: colors.muted }]}>{preview.mediaType} · {formatByteSize(preview.byteSize)}</Text>
           {preview.kind === "text" && <Text style={[styles.caption, { color: colors.muted }]}>
@@ -6364,6 +6426,10 @@ function FilePreviewModal({ colors, preview, source, busy, sharing = false, shar
             {formatMobileModelViewerStatus(modelStatus, locale)}
           </Text>}
         </View>
+        <MobileFilesPreviewPager pager={pager} colors={colors} locale={locale} disabled={blocked}
+          copyLabel={copying ? mobileMessage(locale, "files.presentation.copying") : copyLabel}
+          copyStatus={copyStatus} onCopy={onCopy} onNavigate={onNavigate}
+          canSwipe={mobileFilesPreviewCanSwipe(preview, textView?.identity === previewIdentity && textView?.view === "source")}>
         {preview.kind === "loading" ? <Centered label={exactLoadingLabel} colors={colors} />
           : preview.kind === "image" ? <ScrollView style={styles.fill} contentContainerStyle={styles.imagePreviewContainer}>
             <Image source={{ uri: preview.dataUri }} accessibilityLabel={preview.altText} resizeMode="contain" style={styles.imagePreview} />
@@ -6428,13 +6494,14 @@ function FilePreviewModal({ colors, preview, source, busy, sharing = false, shar
             />
           </View>
           : preview.kind === "text" ? <MobileFileTextPreview key={preview.revisionKey + "/" + preview.focusLine + "/" + preview.focusColumn}
-            preview={preview} locale={locale} colors={colors} />
+            preview={preview} locale={locale} colors={colors} client={client} onViewChange={onTextViewChange} actions={{ ...textActions, busy: blocked || !textActions.available }} />
           : <View style={styles.previewMessage}>
             <Text accessibilityRole="alert" style={[styles.label, { color: preview.kind === "error" ? colors.negative : colors.ink }]}>
               {mobileMessage(locale, preview.kind === "error" ? "preview.unavailable" : "preview.noInApp")}
             </Text>
             <Text selectable style={[styles.description, { color: colors.muted }]}>{preview.reason}</Text>
           </View>}
+        </MobileFilesPreviewPager>
       </>}
     </SafeAreaView>
   </Modal>;
@@ -6647,7 +6714,7 @@ function MobileComposerAtomChips({ atoms, colors, locale, disabled, onOpen }: {
     accessibilityLabel={mobileMessage(locale, "composer.atoms.title")} contentContainerStyle={styles.mentionChips}
     showsHorizontalScrollIndicator={false}>
     {atoms.map((atom) => {
-      const action = atom.kind === "quote" ? mobileMessage(locale, "composer.atoms.viewQuote")
+      const action = atom.kind === "quote" || atom.kind === "file-quote" ? mobileMessage(locale, "composer.atoms.viewQuote")
         : atom.kind === "route-reference" ? mobileMessage(locale, "composer.atoms.viewKind", {
           kind: mobileMessage(locale, atom.routeKind === "project" ? "composer.atoms.projectLink"
             : atom.routeKind === "path" ? "composer.atoms.workspacePath" : "composer.atoms.taskLink")

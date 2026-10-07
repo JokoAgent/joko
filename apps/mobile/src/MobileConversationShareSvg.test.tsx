@@ -22,7 +22,9 @@ vi.mock("react-native-svg", () => ({
     return createElement("svg", {}, children);
   }),
   Rect: () => null, SvgXml: () => null,
-  Image: () => createElement("image", { "data-rendered-image": "true" }),
+  Image: ({ preserveAspectRatio }: { preserveAspectRatio?: string }) => createElement("image", {
+    "data-rendered-image": "true", "data-preserve-aspect-ratio": preserveAspectRatio
+  }),
   Text: ({ children }: { children?: ReactNode }) => createElement("text", {}, children),
   TSpan: ({ children }: { children?: ReactNode }) => createElement("tspan", {}, children)
 }));
@@ -38,10 +40,11 @@ describe("native conversation PNG export", () => {
     await act(async () => root.render(createElement(MobileConversationShareSvg, { ref, colors, width: 390, dark: false,
       snapshot: { leaseId: "share", allShareableIds: ["a"], messages: [{ clientId: "a", kind: "assistant", body: "",
         bodyParts: [{ kind: "text", text: "before" }, { kind: "image", key: "image", label: "Missing image" }, { kind: "text", text: "after" }],
-        attachments: [], images: new Map([["image", { uri: "data:image/png;base64,AA==", width: 10, height: 10 }]]) }] } })));
+        attachments: [], images: new Map([["image", { uri: "data:image/png;base64,AA==", width: 10, height: 6, nativeQuarterTurn: true as const }]]) }] } })));
     let exported!: Promise<Uint8Array>;
     await act(async () => { exported = ref.current!.exportPng(new AbortController().signal); });
     expect(capture).not.toHaveBeenCalled();
+    expect(container.querySelector("image")?.getAttribute("data-preserve-aspect-ratio")).toBe("xMidYMid meet");
     await act(async () => { container.querySelector("img")!.dispatchEvent(new Event("error")); });
     await expect(exported).resolves.toEqual(bytes);
     expect(capture).toHaveBeenCalledTimes(1);

@@ -3,7 +3,7 @@ import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useSta
 import { createPortal } from "react-dom";
 import { writeClipboardText } from "../clipboard-action.js";
 import { useClipboardAction } from "./use-clipboard-action.js";
-import { toolPayloadDiffFiles, type ToolPayloadSection } from "./tool-payload.js";
+import { toolPayloadDiffFiles, type ToolPayloadSection } from "@joko/contracts";
 import { IconButton, SelectControl, modalOwnsKeyboardEvent, selectControlOwnsEscape } from "./ui.js";
 import "./tool-payload-lightbox.css";
 

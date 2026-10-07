@@ -175,6 +175,7 @@ service ArtifactService {
   rpc BeginBlobUpload(BeginBlobUploadRequest) returns (BeginBlobUploadResponse);
   rpc CompleteBlobUpload(CompleteBlobUploadRequest) returns (CompleteBlobUploadResponse);
   rpc GetBlobDownloadTicket(GetBlobDownloadTicketRequest) returns (GetBlobDownloadTicketResponse);
+  rpc GetImageThumbnail(GetImageThumbnailRequest) returns (GetImageThumbnailResponse);
   rpc GetArtifactStorageStats(GetArtifactStorageStatsRequest) returns (GetArtifactStorageStatsResponse);
   rpc ScanArtifactStorage(ScanArtifactStorageRequest) returns (ScanArtifactStorageResponse);
   rpc ReconcileArtifactStorage(ReconcileArtifactStorageRequest) returns (ReconcileArtifactStorageResponse);
@@ -1799,6 +1800,38 @@ message GetBlobDownloadTicketRequest {
 
 message GetBlobDownloadTicketResponse {
   BlobTransferTicket ticket = 1;
+}
+
+message GetImageThumbnailRequest {
+  BlobRef expected_source_blob = 1;
+  uint32 maximum_edge_pixels = 2;
+}
+
+enum ImageThumbnailUnavailableReason {
+  IMAGE_THUMBNAIL_UNAVAILABLE_REASON_UNSPECIFIED = 0;
+  IMAGE_THUMBNAIL_UNAVAILABLE_REASON_UNSUPPORTED = 1;
+  IMAGE_THUMBNAIL_UNAVAILABLE_REASON_INPUT_TOO_LARGE = 2;
+  IMAGE_THUMBNAIL_UNAVAILABLE_REASON_RENDER_FAILED = 3;
+  IMAGE_THUMBNAIL_UNAVAILABLE_REASON_BUSY = 4;
+}
+
+// A presentation derivative; never an attachment or original-file authority.
+message ImageThumbnail {
+  bytes data = 1;
+  string media_type = 2;
+  string sha256_hex = 3;
+  uint32 width_pixels = 4;
+  uint32 height_pixels = 5;
+  uint32 source_width_pixels = 6;
+  uint32 source_height_pixels = 7;
+}
+
+message GetImageThumbnailResponse {
+  BlobRef source_blob = 1;
+  oneof result {
+    ImageThumbnail thumbnail = 2;
+    ImageThumbnailUnavailableReason unavailable = 3;
+  }
 }
 
 message ArtifactStorageStats {
