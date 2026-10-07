@@ -4,7 +4,7 @@ import { Code } from "@connectrpc/connect";
 import { createHash } from "node:crypto";
 import sharp from "sharp";
 import {
-  AcknowledgementSchema, ArtifactKind, ArtifactSchema, BackendDescriptorSchema, BackendModelAccessSettingsSchema, BackendSettingsSchema, BlobDisposition, BlobRefSchema,
+  AcknowledgementSchema, ArtifactKind, ArtifactSchema, AudioArtifactKind, BackendDescriptorSchema, BackendModelAccessSettingsSchema, BackendSettingsSchema, BlobDisposition, BlobRefSchema,
   CapabilityManifestSchema, CapabilityOptionsSchema, CapabilitySchema, CapabilitySupport, CompactSessionOutcome, ConnectionSchema, ConnectionState,
   ContextUsageSchema, DeviceKind, DevicePresenceState, DeviceSchema, EntityKind, EntityVersionSchema,
   FileKind, FilePreviewSchema, FileRevisionSchema, TextFilePreviewSchema, TargetSchema, WorkspaceDescriptorSchema, WorkspaceEntrySchema, WorkspaceFileChangeKind, WorkspaceFileChangeSchema,
@@ -8904,6 +8904,41 @@ describe("native current-task Files ownership", () => {
     app.setForeground(false);
     await vi.waitFor(() => expect(media.removed).toEqual(["preview-media-lease-1.mp4"]));
     expect(app.state.files.preview).toBeUndefined();
+  });
+
+  it("reads canonical Generated audio metadata and an independent authenticated cover without replacing the player lease", async () => {
+    const network = fakeNetwork(); configureFiles(network);
+    const cover = Uint8Array.from(await sharp({ create: { width: 3, height: 2, channels: 4, background: "orange" } }).png().toBuffer());
+    const coverBlob = create(BlobRefSchema, { blobId: "audio-cover", fileName: "cover.png", mediaType: "image/png",
+      byteSize: BigInt(cover.length), sha256Hex: createHash("sha256").update(cover).digest("hex") });
+    const audio = create(ArtifactSchema, { artifactId: "audio-canonical", sessionId: "session", title: "Raw file title",
+      blob: { blobId: "audio-body", fileName: "music.wav", mediaType: "audio/wav", byteSize: BigInt(previewWavBytes.length), sha256Hex: "d".repeat(64) },
+      audioMetadata: { kind: AudioArtifactKind.MUSIC, title: "Canonical track", description: `Full ${"description ".repeat(400)}end`,
+        durationSeconds: 12.5, artwork: { blob: coverBlob, widthPixels: 3, heightPixels: 2, altText: "Track cover" } } });
+    vi.mocked(network.listSessionArtifacts).mockResolvedValue({ artifacts: [audio], revision: "audio-artifacts" });
+    vi.mocked(network.downloadBlob).mockImplementation(async (_credential, blob) => blob.blobId === coverBlob.blobId
+      ? { bytes: cover, mediaType: "image/png" } : { bytes: previewWavBytes, mediaType: "audio/wav" });
+    const media = mediaPreviewFixture("d".repeat(64));
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined, () => "audio-metadata-lease",
+      undefined, undefined, undefined, media.files);
+    await app.start(); await app.openFiles(); await app.previewArtifact(app.state.files.artifacts[0]!);
+    const preview = app.state.files.preview;
+    if (preview?.kind !== "media") throw new Error("Audio preview was not materialized.");
+    expect(preview).toMatchObject({ title: "Canonical track", audioMetadata: { kind: "music", durationSeconds: 12.5,
+      description: audio.audioMetadata!.description, artwork: { blob: { blobId: coverBlob.blobId }, width: 3, height: 2 } } });
+    const owner = app.audioPreviewOwnerKey(preview); expect(owner).toBeDefined();
+    expect(await app.readAudioArtwork(preview, new AbortController().signal)).toMatchObject({ uri: expect.stringMatching(/^data:image\/png;base64,/u), width: 3, height: 2 });
+    const copy = app.prepareAudioDescriptionCopy(preview); expect(copy.text).toBe(audio.audioMetadata!.description); copy.assertCurrent();
+    vi.mocked(network.downloadBlob).mockResolvedValue({ bytes: Uint8Array.from([...cover.slice(0, -1), cover.at(-1)! ^ 1]), mediaType: "image/png" });
+    await expect(app.readAudioArtwork(preview, new AbortController().signal)).rejects.toThrow(/bytes changed/u);
+    expect(app.state.files.preview).toBe(preview); expect(app.audioPreviewOwnerKey(preview)).toBe(owner);
+    expect(media.driver.write).toHaveBeenCalledTimes(1); expect(media.removed).toEqual([]);
+    expect(network.downloadBlob).toHaveBeenCalledWith(credential, expect.objectContaining({ blobId: coverBlob.blobId }), expect.any(AbortSignal));
+    let finish!: (value: { bytes: Uint8Array; mediaType: string }) => void;
+    vi.mocked(network.downloadBlob).mockImplementation(() => new Promise((resolve) => { finish = resolve; }));
+    const pending = app.readAudioArtwork(preview, new AbortController().signal);
+    app.closeFilesPreview(); finish({ bytes: cover, mediaType: "image/png" });
+    await expect(pending).rejects.toThrow(/source changed/u); expect(() => copy.assertCurrent()).toThrow(/source changed/u);
   });
 
   it("previews an exact Workspace audio Blob and rejects a mismatched container before cache write", async () => {

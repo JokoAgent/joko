@@ -6,6 +6,7 @@ import { mobileModelPreviewKind } from "./mobile-model-preview";
 import { isMobilePdfPreviewMediaType } from "./mobile-pdf-preview";
 import { MOBILE_BLOB_PREVIEW_MAXIMUM_BYTES, MOBILE_FILE_SHARE_MAXIMUM_BYTES } from "./network";
 import { isTextFilePreviewMetadata, normalizeMediaType } from "./workspace-files";
+import { mobileAudioMetadataSourceKey, type MobileAudioMetadataView } from "./mobile-audio-metadata";
 
 export interface MobileTimelineArtifact {
   readonly artifactId: string;
@@ -15,6 +16,7 @@ export interface MobileTimelineArtifact {
   readonly mediaType: string;
   readonly byteSize: bigint;
   readonly sourceKey: string;
+  readonly audioMetadata?: MobileAudioMetadataView;
   readonly previewKind?: "media" | "pdf" | "model" | "text";
 }
 
@@ -37,7 +39,7 @@ export function mobileTimelineArtifacts(event: Event): readonly MobileTimelineAr
         : mobileModelPreviewKind(mediaType, blob.fileName) ? "model" : isTextFilePreviewMetadata(mediaType, blob.fileName) ? "text" : undefined;
     if (!/^[a-z0-9!#$&^_.+-]+\/[a-z0-9!#$&^_.+-]+$/u.test(mediaType)
       || !validBlobIdentity(blob, MOBILE_FILE_SHARE_MAXIMUM_BYTES)) return [];
-    const title = boundedLabel(content.label) || boundedLabel(blob.fileName) || "Task file";
+    const title = content.audioMetadata?.title.trim() || boundedLabel(content.label) || boundedLabel(blob.fileName) || "Task file";
     return [{
       artifactId: JSON.stringify([mobileTimelineContentSourceKey(content.source), blob.blobId]),
       eventId: event.eventId,
@@ -45,8 +47,10 @@ export function mobileTimelineArtifacts(event: Event): readonly MobileTimelineAr
       title,
       mediaType,
       byteSize: blob.byteSize,
+      ...(content.audioMetadata === undefined ? {} : { audioMetadata: content.audioMetadata }),
       sourceKey: JSON.stringify([
-        blob.blobId, blob.fileName, mediaType, blob.byteSize.toString(10), blob.sha256Hex
+        blob.blobId, blob.fileName, mediaType, blob.byteSize.toString(10), blob.sha256Hex,
+        mobileAudioMetadataSourceKey(content.audioMetadata)
       ]),
       ...(previewKind && blob.byteSize <= (previewKind === "text" ? 2_097_152n : BigInt(MOBILE_BLOB_PREVIEW_MAXIMUM_BYTES)) ? { previewKind } : {})
     }];
@@ -138,6 +142,7 @@ export function sameMobileTimelineArtifact(
     && left.mediaType === right.mediaType
     && left.byteSize === right.byteSize
     && left.sourceKey === right.sourceKey
+    && mobileAudioMetadataSourceKey(left.audioMetadata) === mobileAudioMetadataSourceKey(right.audioMetadata)
     && left.previewKind === right.previewKind;
 }
 

@@ -1,4 +1,5 @@
-import { MessageRole, ToolCallOutputMode, ToolCallState, type BlobRef, type Event, type ImageRef } from "@joko/contracts";
+import { MessageRole, ToolCallOutputMode, ToolCallState, type AudioArtifactMetadata, type BlobRef, type Event, type ImageRef } from "@joko/contracts";
+import { mapMobileAudioMetadata, type MobileAudioMetadataView } from "./mobile-audio-metadata";
 import { mobileToolCallScopeKey } from "./mobile-tool-call";
 
 /** An exact public occurrence, never an execution or file-path grant. */
@@ -15,6 +16,7 @@ export interface MobileTimelineContent {
   readonly blob: BlobRef;
   readonly label: string;
   readonly image?: ImageRef;
+  readonly audioMetadata?: MobileAudioMetadataView;
 }
 
 export function mobileTimelineContent(event: Event): readonly MobileTimelineContent[] {
@@ -23,15 +25,20 @@ export function mobileTimelineContent(event: Event): readonly MobileTimelineCont
   if (!validIdentity(event.eventId) || !validIdentity(sessionId)) return [];
   const imageContent = (image: ImageRef, source: MobileTimelineContentSource): MobileTimelineContent[] =>
     image.blob ? [{ source, kind: "image", blob: image.blob, label: image.altText, image }] : [];
+  const artifactContent = (blob: BlobRef, label: string, source: MobileTimelineContentSource,
+    metadata: AudioArtifactMetadata | undefined): MobileTimelineContent[] => {
+    const audioMetadata = mapMobileAudioMetadata(metadata);
+    return [{ source, kind: "artifact", blob, label, ...(audioMetadata === undefined ? {} : { audioMetadata }) }];
+  };
   if (payload?.case === "messageCompleted" && validIdentity(payload.value.messageId)
     && [MessageRole.USER, MessageRole.ASSISTANT, MessageRole.SYSTEM, MessageRole.TOOL].includes(payload.value.role)) {
     return payload.value.blocks.flatMap((block, contentIndex) => {
       const source: MobileTimelineContentSource = { kind: "timeline", eventId: event.eventId,
         messageId: payload.value.messageId, contentKind: "block", contentIndex };
       if (block.content.case === "image") return imageContent(block.content.value, source);
-      if (block.content.case === "artifact" && block.content.value.blob) return [{
-        source, kind: "artifact", blob: block.content.value.blob, label: block.content.value.label
-      }];
+      if (block.content.case === "artifact" && block.content.value.blob) return artifactContent(
+        block.content.value.blob, block.content.value.label, source, block.content.value.audioMetadata
+      );
       return [];
     });
   }
@@ -51,7 +58,7 @@ export function mobileTimelineContent(event: Event): readonly MobileTimelineCont
       if (part.content.case === "artifact" && part.content.value.blob) {
         const artifact = part.content.value;
         if (artifact.artifactId && !validIdentity(artifact.artifactId)) return [];
-        return [{ source: { ...source, artifactId: artifact.artifactId }, kind: "artifact", blob: artifact.blob!, label: artifact.title }];
+        return artifactContent(artifact.blob!, artifact.title, { ...source, artifactId: artifact.artifactId }, artifact.audioMetadata);
       }
       return [];
     });
@@ -60,8 +67,8 @@ export function mobileTimelineContent(event: Event): readonly MobileTimelineCont
     const artifact = payload.value.artifact;
     if (!artifact?.blob || !validIdentity(artifact.artifactId) || artifact.sessionId !== sessionId
       || (event.identity?.runId && artifact.runId !== event.identity.runId)) return [];
-    return [{ source: { kind: "artifactProduced", eventId: event.eventId, artifactId: artifact.artifactId, runId: artifact.runId },
-      kind: "artifact", blob: artifact.blob, label: artifact.title }];
+    return artifactContent(artifact.blob, artifact.title,
+      { kind: "artifactProduced", eventId: event.eventId, artifactId: artifact.artifactId, runId: artifact.runId }, artifact.audioMetadata);
   }
   if (payload?.case === "imageProduced" && validIdentity(payload.value.messageId) && payload.value.image) {
     return imageContent(payload.value.image, { kind: "imageProduced", eventId: event.eventId, messageId: payload.value.messageId });

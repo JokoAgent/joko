@@ -93,6 +93,7 @@ import {
 } from "./workspace-files";
 import { sortMobileGeneratedArtifacts, sortMobileWorkspaceEntries, type MobileFilesSortMode } from "./mobile-files-presentation";
 import type { MobileFilesClipboardLease } from "./mobile-files-clipboard";
+import { mapMobileAudioMetadata, mobileAudioMetadataSourceKey } from "./mobile-audio-metadata";
 import {
   mobileMediaPreviewKind,
   type MobileMediaPreviewFiles,
@@ -4016,8 +4017,9 @@ export class MobileClient {
     const blob = current.blob;
     const mediaType = normalizeMediaType(blob?.mediaType ?? "application/octet-stream") || "application/octet-stream";
     const byteSize = blob?.byteSize ?? 0n;
+    const audioMetadata = mediaType.startsWith("audio/") ? mapMobileAudioMetadata(current.audioMetadata) : undefined;
     const base = {
-      title: artifactTitle(current),
+      title: audioMetadata?.title.trim() || artifactTitle(current),
       fileName: blob?.fileName,
       sourceLabel: "Generated",
       mediaType,
@@ -4090,7 +4092,8 @@ export class MobileClient {
             download.bytes,
             controller.signal
           );
-          preview = { ...base, kind: "media", ...stagedMedia };
+          preview = { ...base, kind: "media", ...stagedMedia,
+            ...(audioMetadata === undefined ? {} : { audioMetadata }) };
         }
       } else if (isMobilePdfPreviewMediaType(mediaType)) {
         if (!this.pdfPreviewFiles) {
@@ -4213,7 +4216,8 @@ export class MobileClient {
           download.bytes,
           controller.signal
         );
-        preview = { ...base, kind: "media", ...stagedMedia };
+        preview = { ...base, kind: "media", ...stagedMedia,
+          ...(source.artifact.audioMetadata === undefined ? {} : { audioMetadata: source.artifact.audioMetadata }) };
       } else if (source.artifact.previewKind === "pdf") {
         if (!this.pdfPreviewFiles) throw new Error("PDF preview is unavailable on this mobile runtime.");
         stagedPdf = await this.pdfPreviewFiles.stage(
@@ -4264,6 +4268,60 @@ export class MobileClient {
   closeTimelinePreview(): void {
     this.#cancelTimelinePreviewLease();
     if (this.#state.timelinePreview) this.#set({ timelinePreview: undefined });
+  }
+
+  audioPreviewOwnerKey(preview: Extract<MobileFilePreview, { kind: "media" }>): string | undefined {
+    if (preview.mediaKind !== "audio" || !preview.audioMetadata) return undefined;
+    const timeline = this.#timelinePreview;
+    if (this.#state.timelinePreview === preview && timeline && this.#timelinePreviewLeaseCurrent(timeline)) {
+      return JSON.stringify(["timeline-audio", timeline.taskAuthorityKey, preview.leaseId,
+        preview.revisionKey, mobileAudioMetadataSourceKey(preview.audioMetadata)]);
+    }
+    const owner = this.filesAuthorityKey();
+    return owner && this.#state.files.open && this.#state.files.status === "ready" && this.#state.files.preview === preview
+      && this.#filesMediaPreview?.leaseId === preview.leaseId && !this.#imageGallery
+      ? JSON.stringify(["files-audio", owner, this.#filesEpoch, preview.leaseId,
+        preview.revisionKey, mobileAudioMetadataSourceKey(preview.audioMetadata)]) : undefined;
+  }
+
+  prepareAudioDescriptionCopy(preview: Extract<MobileFilePreview, { kind: "media" }>): MobileFilesClipboardLease {
+    const ownerKey = this.audioPreviewOwnerKey(preview);
+    const text = preview.audioMetadata?.description;
+    if (!ownerKey || !text?.trim() || preview.audioMetadata?.kind === "sound_effect") {
+      throw new Error("The audio description has no current source.");
+    }
+    return { kind: "source", text, assertCurrent: (signal) => {
+      signal?.throwIfAborted();
+      if (this.audioPreviewOwnerKey(preview) !== ownerKey) throw new Error("The audio description source changed.");
+    } };
+  }
+
+  async readAudioArtwork(preview: Extract<MobileFilePreview, { kind: "media" }>, signal: AbortSignal): Promise<{
+    readonly uri: string; readonly width: number; readonly height: number;
+  }> {
+    const credential = this.#ready(); const ownerKey = this.audioPreviewOwnerKey(preview);
+    const artwork = preview.audioMetadata?.artwork;
+    if (!ownerKey || !artwork || preview.audioMetadata?.kind === "sound_effect") {
+      throw new Error("The audio artwork has no current canonical source.");
+    }
+    const assertCurrent = (): void => {
+      signal.throwIfAborted();
+      if (this.#credential !== credential || this.audioPreviewOwnerKey(preview) !== ownerKey) {
+        throw new Error("The audio artwork source changed.");
+      }
+    };
+    assertCurrent();
+    if (artwork.blob.byteSize > BigInt(MOBILE_FILES_IMAGE_MAXIMUM_BYTES)
+      || !mobileImageGalleryMediaType(artwork.blob.mediaType)) throw new Error("The audio artwork cannot be previewed.");
+    const download = await this.network.downloadBlob(credential, artwork.blob, signal);
+    assertCurrent();
+    if (normalizeMediaType(download.mediaType) !== normalizeMediaType(artwork.blob.mediaType)
+      || BigInt(download.bytes.byteLength) !== artwork.blob.byteSize
+      || bytesToHex(sha256(download.bytes)) !== artwork.blob.sha256Hex) throw new Error("The audio artwork bytes changed.");
+    const decoded = inspectMobileImageGalleryBytes(download.bytes, artwork.blob.mediaType);
+    if (decoded.width !== artwork.width || decoded.height !== artwork.height) throw new Error("The audio artwork canvas changed.");
+    assertCurrent();
+    return { uri: mobileImageGalleryPreviewUri(download.bytes, decoded), width: decoded.width, height: decoded.height };
   }
 
   async shareFilesItem(

@@ -153,6 +153,8 @@ import { timelineRows, type TimelineRow } from "./timeline";
 import { MobileThinkingCard } from "./MobileThinkingCard";
 import { MobileWorkGroupCard } from "./MobileWorkGroupCard";
 import { MobilePlanCard } from "./MobilePlanCard";
+import { MobileAudioMetadataCard } from "./MobileAudioMetadataCard";
+import { useMobileAudioArtwork } from "./use-mobile-audio-artwork";
 import { projectMobileInlinePlans } from "./mobile-plan-projection";
 import { mobilePlanMessage } from "./mobile-plan-messages";
 import { isWorkGroup, mobileWorkContains, mobileWorkExpansionKeys, mobileWorkItems, type MobileWorkItem } from "./mobile-work-projection";
@@ -6448,6 +6450,7 @@ function FilePreviewModal({ colors, preview, source, pager, onNavigate, busy, sh
   onQuoted?: () => void;
 }) {
   const textActions = useMobileFileTextActions({ client, preview, clipboard: filesClipboard, disabled: busy || sharing, onQuoted, locale });
+  const audioArtwork = useMobileAudioArtwork(client, preview);
   const [mediaStatus, setMediaStatus] = useState<MobileMediaPlayerStatus>();
   const [pdfStatus, setPdfStatus] = useState<MobilePdfViewerStatus>();
   const [modelStatus, setModelStatus] = useState<MobileModelViewerStatus>();
@@ -6475,6 +6478,11 @@ function FilePreviewModal({ colors, preview, source, pager, onNavigate, busy, sh
     closeRequestedForRef.current = previewIdentity;
     onClose();
   }, [blocked, onClose, previewIdentity]);
+  const mediaPlayer = preview?.kind === "media" ? <MobileMediaPlayer
+    key={preview.leaseId} background={colors.background} border={colors.border} ink={colors.ink}
+    instanceId={preview.leaseId} kind={preview.mediaKind} locale={locale} mediaType={preview.mediaType}
+    onStatusChange={setMediaStatus} style={styles.mediaPreview} surface={colors.surface}
+    title={preview.title} uri={preview.uri} /> : undefined;
   return <Modal visible={preview !== undefined} animationType="slide" onRequestClose={requestClose}>
     <SafeAreaView accessibilityViewIsModal style={[styles.fill, { backgroundColor: colors.background }]}
       edges={["top", "bottom", "left", "right"]}>
@@ -6549,23 +6557,24 @@ function FilePreviewModal({ colors, preview, source, pager, onNavigate, busy, sh
               })}
             </Text>}
           </ScrollView>
-          : preview.kind === "media" ? <View style={styles.mediaPreviewContainer}>
-            <MobileMediaPlayer
-              key={preview.leaseId}
-              background={colors.background}
-              border={colors.border}
-              ink={colors.ink}
-              instanceId={preview.leaseId}
-              kind={preview.mediaKind}
-              locale={locale}
-              mediaType={preview.mediaType}
-              onStatusChange={setMediaStatus}
-              style={styles.mediaPreview}
-              surface={colors.surface}
-              title={preview.title}
-              uri={preview.uri}
-            />
-          </View>
+          : preview.kind === "media" ? preview.mediaKind === "audio" && preview.audioMetadata
+            ? <ScrollView style={styles.fill} contentContainerStyle={styles.audioPreviewContainer}>
+            <MobileAudioMetadataCard
+              metadata={preview.audioMetadata}
+              ownerKey={audioArtwork.ownerKey ?? JSON.stringify(["unavailable-audio", preview.leaseId])}
+              actualDuration={mediaStatus?.duration ?? undefined}
+              artwork={audioArtwork.artwork}
+              colors={colors} locale={locale} enabled={!blocked && audioArtwork.ownerKey !== undefined}
+              onArtworkDecoded={audioArtwork.onDecoded} onArtworkError={audioArtwork.onError}
+              onCopyDescription={async (_text, signal) => {
+                const result = await filesClipboard.copy(client.prepareAudioDescriptionCopy(preview), signal);
+                signal.throwIfAborted();
+                if (result !== "copied") throw new Error(mobileMessage(locale,
+                  result === "unknown" ? "files.presentation.copyUnknown" : result === "busy" ? "files.presentation.copyBusy" : "files.presentation.copyFailed"));
+              }} />
+            {mediaPlayer}
+          </ScrollView>
+            : <View style={styles.mediaPreviewContainer}>{mediaPlayer}</View>
           : preview.kind === "pdf" ? <View style={styles.pdfPreviewContainer}>
             <MobilePdfViewer
               key={preview.leaseId}
@@ -7312,6 +7321,7 @@ const styles = StyleSheet.create({
   imagePreviewContainer: { flexGrow: 1, alignItems: "center", justifyContent: "center", gap: 12, padding: 16 },
   imagePreview: { width: "100%", minHeight: 320, flex: 1 },
   mediaPreviewContainer: { flex: 1, minHeight: 280, paddingHorizontal: 12, paddingBottom: 12 },
+  audioPreviewContainer: { flexGrow: 1, minHeight: 280, gap: 12, paddingHorizontal: 12, paddingBottom: 12 },
   mediaPreview: { flex: 1, minHeight: 240, overflow: "hidden", borderRadius: 16 },
   pdfPreviewContainer: { flex: 1, minHeight: 320, paddingHorizontal: 12, paddingBottom: 12 },
   pdfPreview: { flex: 1, minHeight: 280, overflow: "hidden", borderRadius: 16 },

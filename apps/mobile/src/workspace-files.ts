@@ -14,6 +14,7 @@ import {
 } from "@joko/contracts";
 import type { MobileModelPreviewLease } from "./mobile-model-preview";
 import type { MobileFilesPreviewPager } from "./mobile-files-preview-pager";
+import type { MobileAudioMetadataView } from "./mobile-audio-metadata";
 
 export type MobileFilesLocation =
   | { readonly kind: "workspace"; readonly path: string }
@@ -81,6 +82,7 @@ export type MobileFilePreview =
       readonly uri: string;
       readonly fileName: string;
       readonly mediaKind: "audio" | "video";
+      readonly audioMetadata?: MobileAudioMetadataView;
       readonly localByteSize: number;
       readonly sha256Hex: string;
     })

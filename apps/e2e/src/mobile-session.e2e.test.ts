@@ -20,11 +20,11 @@ import {
   AppendVoiceAudioRequestSchema, GetVoiceInputCapabilitiesRequestSchema, GetVoiceInputSessionRequestSchema,
   StartVoiceInputRequestSchema, StopVoiceInputRequestSchema, VoiceInputState, VoiceInputTerminalOutcome,
   SubagentService,
-  capabilityNames, nativeSessionTreeRoots, type BackgroundTask, type Event, type EventCursor,
+  capabilityNames, nativeSessionTreeRoots, type Artifact, type BackgroundTask, type BlobRef, type Event, type EventCursor, type Snapshot,
   type Interaction, type OperationMutation, type SubagentRun, type SubagentRunDetail, type SubagentTranscriptEntry
 } from "@joko/contracts";
 import { PI_LIKE_PROFILE } from "@joko/testkit";
-import type { AdapterContext, PromptInput, SubagentRunDetail as CoreSubagentRunDetail } from "@joko/core";
+import type { AdapterContext, AudioArtifactMetadata as CoreAudioArtifactMetadata, PromptInput, SubagentRunDetail as CoreSubagentRunDetail } from "@joko/core";
 import { VoiceInputCoordinator, type VoiceInputProviderFactory } from "@joko/orchestrator";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { InstrumentedFakeAdapter, OrchestratorE2eFixture, waitFor } from "./fixture.js";
@@ -34,6 +34,15 @@ import {
   modelMutation, permissionMutation, planModeMutation, reorderQueuedInputBeforeMutation, resumeQueueMutation, sendInputMutation, sessionIdFrom,
   setQueueInteractionLockMutation, setQueueItemEditLockMutation, submit
 } from "./operations.js";
+
+vi.mock("expo-crypto", () => ({
+  CryptoDigestAlgorithm: { SHA256: "SHA-256" },
+  digest: async (_algorithm: string, bytes: Uint8Array) => Uint8Array.from(createHash("sha256").update(bytes).digest()).buffer
+}));
+vi.mock("../../mobile/node_modules/expo-crypto", () => ({
+  CryptoDigestAlgorithm: { SHA256: "SHA-256" },
+  digest: async (_algorithm: string, bytes: Uint8Array) => Uint8Array.from(createHash("sha256").update(bytes).digest()).buffer
+}));
 
 class MobileMessageFixtureAdapter extends InstrumentedFakeAdapter {
   override async send(input: PromptInput, context: AdapterContext): Promise<void> {
@@ -161,9 +170,169 @@ interface MobileReadingNetwork {
     Promise<{ entries: readonly SubagentTranscriptEntry[]; nextPageToken: string; tailPageToken: string }>;
 }
 
+interface AudioPreview {
+  readonly kind: "media";
+  readonly leaseId: string;
+  readonly uri: string;
+  readonly mediaKind: "audio" | "video";
+  readonly sha256Hex: string;
+  readonly audioMetadata?: {
+    readonly kind: "generic" | "music" | "sound_effect";
+    readonly title: string;
+    readonly description: string;
+    readonly durationSeconds?: number;
+    readonly artwork?: { readonly blob: BlobRef; readonly width: number; readonly height: number; readonly alt: string };
+  };
+}
+
+interface AudioMobileHarness {
+  readonly state: {
+    readonly status: string;
+    readonly detail?: Snapshot;
+    readonly timelinePreview?: AudioPreview | { readonly kind: "loading" | "error" | "unsupported"; readonly reason?: string };
+    readonly files: { readonly status: string; readonly artifacts: readonly Artifact[];
+      readonly preview?: AudioPreview | { readonly kind: "loading" | "error" | "unsupported" } };
+  };
+  start(): Promise<void>;
+  requestPairing(origin: string, name: string): Promise<string>;
+  pair(origin: string, code: string, name: string): Promise<void>;
+  select(sessionId: string): Promise<void>;
+  openFiles(): Promise<void>;
+  openGeneratedFiles(): void;
+  previewArtifact(artifact: Artifact): Promise<void>;
+  previewTimelineArtifact(selected: unknown): Promise<void>;
+  closeTimelinePreview(): void;
+  closeFiles(): void;
+  audioPreviewOwnerKey(preview: AudioPreview): string | undefined;
+  readAudioArtwork(preview: AudioPreview, signal: AbortSignal): Promise<{ readonly uri: string; readonly width: number; readonly height: number }>;
+  prepareAudioDescriptionCopy(preview: AudioPreview): { readonly kind: "source"; readonly text: string; assertCurrent(signal?: AbortSignal): void };
+  dispose(): void;
+}
+
 describe("native mobile device through the durable product chain", () => {
   let fixture: OrchestratorE2eFixture | undefined;
   afterEach(async () => { await fixture?.close(); fixture = undefined; });
+
+  it("reads canonical mobile music and its independent cover through authenticated HTTP and retires exact preview copy leases", async () => {
+    const { mobileNetwork } = await vi.importActual<{ mobileNetwork: unknown }>("../../mobile/src/network.js");
+    const { MobileClient } = await vi.importActual<{ MobileClient: new (...args: unknown[]) => AudioMobileHarness }>("../../mobile/src/mobile-client.js");
+    interface Driver { getItem(key: string): Promise<string | null>; setItem(key: string, value: string): Promise<void>; removeItem(key: string): Promise<void> }
+    const { createMobileStorage } = await vi.importActual<{
+      createMobileStorage(plain: Driver, secure: Driver & { isAvailable(): Promise<boolean> }): unknown
+    }>("../../mobile/src/connection-storage.js");
+    interface CacheFile { readonly uri: string; readonly fileName: string; readonly byteSize: number; readonly bytes: Uint8Array }
+    const { MobileMediaPreviewFiles } = await vi.importActual<{
+      MobileMediaPreviewFiles: new (driver: { prepare(): Promise<void>; write(fileName: string, bytes: Uint8Array): Promise<CacheFile>;
+        remove(file: Pick<CacheFile, "uri" | "fileName">): Promise<void> }, digest: (bytes: Uint8Array) => Promise<string>) => unknown
+    }>("../../mobile/src/mobile-media-preview.js");
+    const { mobileTimelineArtifacts } = await vi.importActual<{
+      mobileTimelineArtifacts(event: Event): readonly { readonly mediaType: string }[]
+    }>("../../mobile/src/mobile-timeline-artifacts.js");
+    const audio = Buffer.alloc(44 + 160);
+    audio.write("RIFF"); audio.writeUInt32LE(audio.length - 8, 4); audio.write("WAVEfmt ", 8); audio.writeUInt32LE(16, 16);
+    audio.writeUInt16LE(1, 20); audio.writeUInt16LE(1, 22); audio.writeUInt32LE(8000, 24); audio.writeUInt32LE(16000, 28);
+    audio.writeUInt16LE(2, 32); audio.writeUInt16LE(16, 34); audio.write("data", 36); audio.writeUInt32LE(160, 40);
+    const cover = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAACXBIWXMAAAPoAAAD6AG1e1JrAAAAFElEQVQImWP4P4Ph/wwGEP4/gwEAMI4GXTG6t9EAAAAASUVORK5CYII=", "base64");
+    const description = "Complete canonical music description\n第二段保留完整内容";
+    let canonicalAudioId = "";
+    const profile = { ...PI_LIKE_PROFILE, capabilities: [...PI_LIKE_PROFILE.capabilities,
+      { key: capabilityNames.workspaceFiles, supported: true as const }] };
+    fixture = await OrchestratorE2eFixture.start({ profiles: [profile], createAdapter: (entry) => new class extends InstrumentedFakeAdapter {
+      override async send(input: PromptInput, context: AdapterContext): Promise<void> {
+        this.sendCalls.push(input);
+        const audioPath = join(context.target.workspaceRoot, "music.wav");
+        const coverPath = join(context.target.workspaceRoot, "cover.png");
+        await writeFile(audioPath, audio); await writeFile(coverPath, cover);
+        const stagedAudio = await fixture!.application.artifacts.ingestPath(audioPath, { fileName: "music.wav", mimeType: "audio/wav", expiresAt: Date.now() + 60_000 });
+        const stagedCover = await fixture!.application.artifacts.ingestPath(coverPath, { fileName: "cover.png", mimeType: "image/png", expiresAt: Date.now() + 60_000 });
+        const adopted = fixture!.application.store.transaction((store) => {
+          const coverArtifact = store.adoptSessionArtifact({ blob: store.getArtifact(stagedCover.id).blob, sessionId: context.sessionId });
+          const audioMetadata: CoreAudioArtifactMetadata = { kind: "music", title: "Canonical music title", description, durationSeconds: 18,
+            artwork: { blob: coverArtifact.blob, width: 2, height: 2, alt: "Independent music cover" } };
+          const track = store.adoptSessionArtifact({ blob: store.getArtifact(stagedAudio.id).blob, sessionId: context.sessionId, audioMetadata });
+          store.appendEvent({ backendId: context.target.backendId, targetId: context.target.id, sessionId: context.sessionId,
+            generation: context.generation, traceId: "mobile-audio-publication",
+            payload: { type: "artifact", artifact: track.blob, purpose: "audio", audioMetadata } });
+          return { blob: track.blob, audioMetadata };
+        });
+        canonicalAudioId = adopted.blob.id;
+        await context.emit({ type: "message_complete", role: "assistant", nativeHistory: { identity: { entryId: "mobile-audio-message" } },
+          blocks: [{ kind: "artifact", blob: adopted.blob, label: "Generic file label", audioMetadata: adopted.audioMetadata }] });
+        await context.emit({ type: "done", outcome: "completed" });
+      }
+    }(entry) });
+    const manager = await fixture.pair("Audio fixture manager");
+    const owner = (await manager.clients.event.getSnapshot({ scope: { kind: { case: "owner", value: {} } } })).snapshot!;
+    const target = owner.targets.find((item) => item.targetId === fixture!.targetId())!;
+    await manager.clients.target.prepareTargetWorkspace({ targetId: target.targetId, expectedTargetRevision: target.version!.revision });
+    const created = await submit(manager.clients.operation, manager.connectionId,
+      createSessionMutation({ backendId: target.backendId, targetId: target.targetId }));
+    const sessionId = sessionIdFrom(created);
+    if (created.result?.payload.case !== "session") throw new Error("The music fixture has no created Session.");
+    const sent = await submit(manager.clients.operation, manager.connectionId,
+      sendInputMutation(sessionId, created.result.payload.value.nativeBinding!.runtimeGeneration, "Publish music"));
+    await waitFor(() => manager.clients.run.getRun({ runId: queueRunIdFrom(sent) }), (value) => value.run?.state === RunState.SUCCEEDED, "canonical music publication");
+    const memoryDriver = (): Driver => {
+      const values = new Map<string, string>();
+      return { getItem: async (key) => values.get(key) ?? null, setItem: async (key, value) => { values.set(key, value); },
+        removeItem: async (key) => { values.delete(key); } };
+    };
+    const cache = new Map<string, CacheFile>();
+    const mediaFiles = new MobileMediaPreviewFiles({ prepare: async () => undefined,
+      write: async (fileName, bytes) => { const file = { fileName, uri: `file:///controlled-cache/${fileName}`, byteSize: bytes.byteLength, bytes: bytes.slice() }; cache.set(fileName, file); return file; },
+      remove: async (file) => { cache.delete(file.fileName); } }, async (bytes) => createHash("sha256").update(bytes).digest("hex"));
+    const requests: { readonly path: string; readonly method: string; readonly authenticated: boolean }[] = [];
+    const actualFetch = globalThis.fetch;
+    const fetchProbe = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const request = new Request(input, init); const url = new URL(request.url);
+      if (url.origin === fixture!.baseUrl) requests.push({ path: url.pathname, method: request.method,
+        authenticated: request.headers.has("authorization") });
+      return actualFetch(input, init);
+    });
+    const phone = new MobileClient(mobileNetwork, createMobileStorage(memoryDriver(), { ...memoryDriver(), isAvailable: async () => true }),
+      { scan: async () => [] }, randomUUID, "android", undefined, undefined, undefined, undefined, undefined, mediaFiles);
+    try {
+      await phone.start();
+      const challenge = await phone.requestPairing(fixture.baseUrl, "Audio reading phone");
+      await phone.pair(fixture.baseUrl, fixture.pairingCode(challenge), "Audio reading phone");
+      await phone.select(sessionId);
+      expect(phone.state.status).toBe("connected");
+      const completed = phone.state.detail!.timeline.find((event) => event.payload?.kind.case === "messageCompleted"
+        && event.payload.kind.value.messageId === "mobile-audio-message")!;
+      const candidate = mobileTimelineArtifacts(completed).find((item) => item.mediaType === "audio/wav")!;
+      await phone.previewTimelineArtifact(candidate);
+      const timeline = phone.state.timelinePreview;
+      if (timeline?.kind !== "media") throw new Error(`The music Timeline preview did not load: ${timeline?.kind ?? "absent"} ${timeline?.reason ?? ""}`);
+      expect(timeline).toMatchObject({ mediaKind: "audio", sha256Hex: createHash("sha256").update(audio).digest("hex"),
+        audioMetadata: { kind: "music", title: "Canonical music title", description, durationSeconds: 18,
+          artwork: { width: 2, height: 2, alt: "Independent music cover", blob: { mediaType: "image/png", sha256Hex: createHash("sha256").update(cover).digest("hex") } } } });
+      expect([...cache.values()][0]?.bytes).toEqual(Uint8Array.from(audio));
+      expect(await phone.readAudioArtwork(timeline, new AbortController().signal)).toEqual({
+        uri: `data:image/png;base64,${cover.toString("base64")}`, width: 2, height: 2 });
+      const timelineCopy = phone.prepareAudioDescriptionCopy(timeline);
+      expect(timelineCopy.text).toBe(description); timelineCopy.assertCurrent();
+      phone.closeTimelinePreview();
+      expect(phone.audioPreviewOwnerKey(timeline)).toBeUndefined();
+      expect(() => timelineCopy.assertCurrent()).toThrow("source changed");
+      const beforeStaleRead = requests.length;
+      await expect(phone.readAudioArtwork(timeline, new AbortController().signal)).rejects.toThrow("current canonical source");
+      expect(requests).toHaveLength(beforeStaleRead);
+      await phone.openFiles(); phone.openGeneratedFiles();
+      const artifact = phone.state.files.artifacts.find((item) => item.artifactId === canonicalAudioId)!;
+      await phone.previewArtifact(artifact);
+      const generated = phone.state.files.preview;
+      if (generated?.kind !== "media") throw new Error("The Generated music preview did not load.");
+      expect(generated.audioMetadata).toEqual(timeline.audioMetadata);
+      expect(await phone.readAudioArtwork(generated, new AbortController().signal)).toEqual({
+        uri: `data:image/png;base64,${cover.toString("base64")}`, width: 2, height: 2 });
+      const generatedCopy = phone.prepareAudioDescriptionCopy(generated); expect(generatedCopy.text).toBe(description); generatedCopy.assertCurrent();
+      const tickets = requests.filter((request) => request.path.endsWith("/GetBlobDownloadTicket"));
+      expect(tickets).toHaveLength(4); expect(tickets.every((request) => request.authenticated)).toBe(true);
+      expect(requests.filter((request) => request.method === "GET")).toHaveLength(4);
+      phone.closeFiles(); expect(() => generatedCopy.assertCurrent()).toThrow("source changed");
+      await vi.waitFor(() => expect(cache.size).toBe(0));
+    } finally { phone.dispose(); fetchProbe.mockRestore(); }
+  });
 
   it("streams mobile PCM through the authenticated ephemeral Voice Input service without sending a task", async () => {
     let voice!: ReturnType<typeof createMobileVoiceHarness>;
