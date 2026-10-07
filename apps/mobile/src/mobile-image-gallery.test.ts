@@ -120,6 +120,90 @@ describe("mobile image gallery", () => {
     expect(() => inspectMobileImageGalleryBytes(outside, "image/webp")).toThrow(/signature/u);
   });
 
+  it("preserves real animated WebP frames with bounded unknown trailers after their bitstream", async () => {
+    const pixels = Buffer.from([
+      ...Array.from({ length: 4 }, () => [255, 0, 0, 255]).flat(),
+      ...Array.from({ length: 4 }, () => [0, 255, 0, 255]).flat()
+    ]);
+    const source = await sharp(pixels, { raw: { width: 2, height: 4, channels: 4, pageHeight: 2 } })
+      .webp({ lossless: true, loop: 0, delay: [100, 125] }).toBuffer();
+    const frameOffset = source.indexOf("ANMF");
+    expect(frameOffset).toBeGreaterThan(0);
+    const frameLength = source.readUInt32LE(frameOffset + 4);
+    const bitstream = source.subarray(frameOffset + 24, frameOffset + 8 + frameLength);
+    const chunk = (type: string, payload: Uint8Array): Buffer => {
+      const bytes = Buffer.alloc(8 + payload.length + payload.length % 2);
+      bytes.write(type); bytes.writeUInt32LE(payload.length, 4); bytes.set(payload, 8);
+      return bytes;
+    };
+    const withFrameData = (data: Uint8Array, encoded = source): Buffer => {
+      const offset = encoded.indexOf("ANMF"); const length = encoded.readUInt32LE(offset + 4);
+      const header = encoded.subarray(offset + 8, offset + 24);
+      const bytes = Buffer.concat([encoded.subarray(0, offset), chunk("ANMF", Buffer.concat([header, data])),
+        encoded.subarray(offset + 8 + length + length % 2)]);
+      bytes.writeUInt32LE(bytes.length - 8, 4);
+      return bytes;
+    };
+    const unknown = chunk("JUNK", Uint8Array.from([1, 2, 3]));
+    const original = withFrameData(Buffer.concat([bitstream, unknown, chunk("DATA", new Uint8Array())]));
+    const preserved = Buffer.from(original);
+    const inspected = inspectMobileImageGalleryBytes(original, "image/webp");
+    expect(inspected).toEqual({ mediaType: "image/webp", width: 2, height: 2, animated: true });
+    const decoded = await sharp(original, { animated: true }).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
+    expect(decoded.info).toMatchObject({ width: 2, height: 4, pageHeight: 2, pages: 2, channels: 4 });
+    expect(decoded.data).toEqual(pixels);
+    expect((await sharp(original).metadata())).toMatchObject({ width: 2, height: 2, pages: 2, delay: [100, 125], loop: 0 });
+    expect(decoded.data).toEqual(await sharp(source, { animated: true }).ensureAlpha().raw().toBuffer());
+
+    const alphaPixels = Buffer.from(pixels);
+    for (let index = 3; index < alphaPixels.length; index += 4) alphaPixels[index] = index < 16 ? 128 : 64;
+    const alphaSource = await sharp(alphaPixels, { raw: { width: 2, height: 4, channels: 4, pageHeight: 2 } })
+      .webp({ loop: 0, delay: [100, 125] }).toBuffer();
+    const alphaFrame = alphaSource.indexOf("ANMF"); const alphaFrameLength = alphaSource.readUInt32LE(alphaFrame + 4);
+    const alphaData = alphaSource.subarray(alphaFrame + 24, alphaFrame + 8 + alphaFrameLength);
+    expect(alphaData.toString("ascii", 0, 4)).toBe("ALPH");
+    const alphaChunkLength = 8 + alphaData.readUInt32LE(4) + alphaData.readUInt32LE(4) % 2;
+    expect(alphaData.toString("ascii", alphaChunkLength, alphaChunkLength + 4)).toBe("VP8 ");
+    const alphaOriginal = withFrameData(Buffer.concat([alphaData, unknown]), alphaSource);
+    expect(inspectMobileImageGalleryBytes(alphaOriginal, "image/webp")).toEqual(inspected);
+    const alphaDecoded = await sharp(alphaOriginal, { animated: true }).ensureAlpha().raw().toBuffer();
+    expect(alphaDecoded).toEqual(await sharp(alphaSource, { animated: true }).ensureAlpha().raw().toBuffer());
+    expect(Array.from(alphaDecoded.filter((_, index) => index % 4 === 3)))
+      .toEqual(Array.from(alphaPixels.filter((_, index) => index % 4 === 3)));
+    expect((await sharp(alphaOriginal).metadata())).toMatchObject({ pages: 2, delay: [100, 125], loop: 0 });
+
+    const require = createRequire(import.meta.url);
+    const canvasPrimitives = createRequire(require.resolve("pdfjs-dist/package.json"))("@napi-rs/canvas") as {
+      readonly loadImage: (bytes: Uint8Array) => Promise<{ readonly width: number; readonly height: number }>;
+      readonly createCanvas: (width: number, height: number) => {
+        readonly getContext: (kind: "2d") => {
+          readonly drawImage: (image: { readonly width: number; readonly height: number }, x: number, y: number) => void;
+          readonly getImageData: (x: number, y: number, width: number, height: number) => { readonly data: Uint8ClampedArray };
+        };
+      };
+    };
+    const nativeImage = await canvasPrimitives.loadImage(original);
+    expect(confirmMobileImageGalleryCanvas(inspected, nativeImage)).toEqual(inspected);
+    const nativeCanvas = canvasPrimitives.createCanvas(nativeImage.width, nativeImage.height);
+    const context = nativeCanvas.getContext("2d"); context.drawImage(nativeImage, 0, 0);
+    expect(Array.from(context.getImageData(0, 0, 2, 2).data)).toEqual(Array.from(pixels.subarray(0, 16)));
+    expect(original).toEqual(preserved);
+
+    const oversized = Buffer.from(unknown); oversized.writeUInt32LE(0xffff_ffff, 4);
+    const invalid = [
+      withFrameData(Buffer.concat([unknown, bitstream])),
+      withFrameData(Buffer.concat([bitstream, unknown, bitstream])),
+      withFrameData(unknown),
+      withFrameData(Buffer.concat([bitstream, unknown.subarray(0, -1)])),
+      withFrameData(Buffer.concat([bitstream, oversized])),
+      withFrameData(Buffer.concat([bitstream, unknown.subarray(0, 7)])),
+      withFrameData(Buffer.concat([chunk("ALPH", Uint8Array.from([0])), bitstream])),
+      ...["VP8X", "ICCP", "ANIM", "ANMF", "EXIF", "XMP ", "ALPH"].map((type) =>
+        withFrameData(Buffer.concat([bitstream, chunk(type, Uint8Array.from([1, 2, 3]))])))
+    ];
+    for (const bytes of invalid) expect(() => inspectMobileImageGalleryBytes(bytes, "image/webp")).toThrow(/signature/u);
+  });
+
   it("bounds self-contained SVG previews and gives both native decoders the same canvas", () => {
     const decoded = inspectMobileImageGalleryBytes(svgBytes('<defs><linearGradient id="paint"/></defs><rect width="20" height="10" fill="url(#paint)"/>'), "image/svg+xml");
     expect(decoded).toMatchObject({ mediaType: "image/svg+xml", width: 40, height: 20 });
