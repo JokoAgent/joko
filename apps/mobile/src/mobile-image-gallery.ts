@@ -305,8 +305,8 @@ function pngDimensions(bytes: Uint8Array): { readonly width: number; readonly he
         || bytes[data + 24]! > 2 || bytes[data + 25]! > 1 || ++frames > animationFrames) return undefined;
       inFrame = true; frameData = false;
     } else if (type === "fdAT") {
-      if (!animationFrames || !inFrame || length <= 4 || readU32Be(bytes, data) !== sequence++) return undefined;
-      frameData = true;
+      if (!animationFrames || !inFrame || length < 4 || readU32Be(bytes, data) !== sequence++) return undefined;
+      if (length > 4) frameData = true;
     } else if (type === "IDAT") {
       imageData = true; if (inFrame) frameData = true;
     }

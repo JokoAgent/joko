@@ -1,6 +1,7 @@
 import { create } from "@bufbuild/protobuf";
 import { EventSchema, MessageRole } from "@joko/contracts";
 import { createRequire } from "node:module";
+import { inflateSync } from "node:zlib";
 import { describe, expect, it } from "vitest";
 import sharp from "sharp";
 import { animatedPngBytes, gifBytes, svgBytes, bmpBytes, tiffBytes, isoImageBytes, iconBytes, iconDibBytes } from "./test/image-formats";
@@ -107,6 +108,82 @@ describe("mobile image gallery", () => {
     expect(() => inspectMobileImageGalleryBytes(animatedPngBytes().slice(0, -1), "image/png")).toThrow(/signature/u);
     const outside = gifBytes(); outside[33] = 2;
     expect(() => inspectMobileImageGalleryBytes(outside, "image/gif")).toThrow(/frame dimensions/u);
+  });
+
+  it("preserves complete APNG frame streams across empty fdAT fragments before and after their data", async () => {
+    const source = Buffer.from(animatedPngBytes());
+    const frameOffset = source.indexOf("fdAT") - 4; const frameLength = source.readUInt32BE(frameOffset);
+    const compressed = source.subarray(frameOffset + 12, frameOffset + 8 + frameLength);
+    const chunk = (type: string, payload: Uint8Array): Buffer => {
+      const bytes = Buffer.alloc(12 + payload.length);
+      bytes.writeUInt32BE(payload.length); bytes.write(type, 4); bytes.set(payload, 8);
+      let crc = 0xffff_ffff;
+      for (const byte of bytes.subarray(4, -4)) {
+        crc ^= byte;
+        for (let bit = 0; bit < 8; bit++) crc = crc >>> 1 ^ (crc & 1 ? 0xedb8_8320 : 0);
+      }
+      bytes.writeUInt32BE((crc ^ 0xffff_ffff) >>> 0, bytes.length - 4);
+      return bytes;
+    };
+    const fdAT = (sequence: number, data: Uint8Array = new Uint8Array()): Buffer => {
+      const payload = Buffer.alloc(4 + data.length); payload.writeUInt32BE(sequence); payload.set(data, 4);
+      return chunk("fdAT", payload);
+    };
+    const replaceFrameData = (fragments: readonly Uint8Array[]): Buffer => Buffer.concat([
+      source.subarray(0, frameOffset), ...fragments, source.subarray(frameOffset + 12 + frameLength)
+    ]);
+    const readChunks = (bytes: Buffer): { readonly type: string; readonly data: Buffer }[] => {
+      const chunks = [];
+      for (let offset = 8; offset < bytes.length;) {
+        const length = bytes.readUInt32BE(offset);
+        chunks.push({ type: bytes.toString("ascii", offset + 4, offset + 8), data: bytes.subarray(offset + 8, offset + 8 + length) });
+        offset += 12 + length;
+      }
+      return chunks;
+    };
+    const require = createRequire(import.meta.url);
+    const canvasPrimitives = createRequire(require.resolve("pdfjs-dist/package.json"))("@napi-rs/canvas") as {
+      readonly loadImage: (bytes: Uint8Array) => Promise<{ readonly width: number; readonly height: number }>;
+      readonly createCanvas: (width: number, height: number) => {
+        readonly getContext: (kind: "2d") => {
+          readonly drawImage: (image: { readonly width: number; readonly height: number }, x: number, y: number) => void;
+          readonly getImageData: (x: number, y: number, width: number, height: number) => { readonly data: Uint8ClampedArray };
+        };
+      };
+    };
+    for (const [before, after] of [[true, false], [false, true], [true, true]] as const) {
+      let sequence = 2; const fragments = [];
+      if (before) fragments.push(fdAT(sequence++));
+      fragments.push(fdAT(sequence++, compressed));
+      if (after) fragments.push(fdAT(sequence));
+      const bytes = replaceFrameData(fragments); const preserved = Buffer.from(bytes);
+      const inspected = inspectMobileImageGalleryBytes(bytes, "image/png");
+      expect(inspected).toEqual({ mediaType: "image/png", width: 1, height: 1, animated: true });
+      expect(inspectMobileImageGalleryBytes(bytes, "image/apng")).toMatchObject({ mediaType: "image/apng", previewMediaType: "image/png", animated: true });
+      const chunks = readChunks(bytes);
+      expect(inflateSync(Buffer.concat(chunks.filter((part) => part.type === "IDAT").map((part) => part.data))))
+        .toEqual(Buffer.from([0, 255, 0, 0, 255]));
+      expect(inflateSync(Buffer.concat(chunks.filter((part) => part.type === "fdAT").map((part) => part.data.subarray(4)))))
+        .toEqual(Buffer.from([0, 0, 255, 0, 255]));
+      const controls = chunks.filter((part) => part.type === "fcTL");
+      expect(controls.map((part) => part.data)).toEqual(readChunks(source).filter((part) => part.type === "fcTL").map((part) => part.data));
+      expect(controls.map((part) => part.data.readUInt16BE(20) * 1_000 / part.data.readUInt16BE(22))).toEqual([100, 100]);
+      expect(chunks.find((part) => part.type === "acTL")!.data.readUInt32BE(4)).toBe(0);
+      const nativeImage = await canvasPrimitives.loadImage(bytes);
+      expect(confirmMobileImageGalleryCanvas(inspected, nativeImage)).toEqual(inspected);
+      const context = canvasPrimitives.createCanvas(nativeImage.width, nativeImage.height).getContext("2d");
+      context.drawImage(nativeImage, 0, 0);
+      expect(Array.from(context.getImageData(0, 0, 1, 1).data)).toEqual([255, 0, 0, 255]);
+      expect(bytes).toEqual(preserved);
+    }
+    const truncated = Buffer.from(fdAT(2, compressed)); truncated.writeUInt32BE(truncated.length, 0);
+    for (const bytes of [
+      replaceFrameData([chunk("fdAT", Uint8Array.from([0, 0, 2]))]),
+      replaceFrameData([fdAT(3, compressed)]),
+      replaceFrameData([fdAT(2), fdAT(2, compressed)]),
+      replaceFrameData([fdAT(2), fdAT(3)]),
+      replaceFrameData([truncated])
+    ]) expect(() => inspectMobileImageGalleryBytes(bytes, "image/png")).toThrow(/signature/u);
   });
 
   it("accepts real extended static and animated WebP while checking each frame rectangle", async () => {
