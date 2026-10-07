@@ -19,6 +19,7 @@ import {
   type PendingExtensionUseView
 } from "../model.js";
 import type { DelayedNewSessionDraft } from "../new-session-flow.js";
+import type { NewSessionSubmissionOwner } from "../new-session-flow.js";
 import { NewSessionPage } from "./NewSessionPage.js";
 import { SESSION_LINK_DRAG_MIME } from "./composer-internal-drop.js";
 
@@ -87,6 +88,89 @@ afterEach(async () => {
 });
 
 describe("NewSessionPage typed slash commands", () => {
+  it("advertises /learn only for a Skill-capable selected Target", async () => {
+    const onSubmit = vi.fn(async (_session: DelayedNewSessionDraft, _input: ComposerDraft, _owner: NewSessionSubmissionOwner) => undefined);
+    await renderPage(onSubmit);
+    await edit("/lea", 4, false);
+    expect(commandOptions()).toHaveLength(0);
+    expect(onSubmit).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { text: "/learn", instruction: "", evidence: "createdSession" },
+    { text: "/learn Preserve the release checklist", instruction: "Preserve the release checklist", evidence: "freeText" }
+  ] as const)("submits a typed local learning disposition without flattening $evidence evidence", async ({ text, instruction, evidence }) => {
+    const onSubmit = vi.fn(async (_session: DelayedNewSessionDraft, _input: ComposerDraft, _owner: NewSessionSubmissionOwner) => undefined);
+    await renderPage(onSubmit, { skillCapable: true });
+    await edit(text, text.length, false);
+    if (text === "/learn") await key("Escape");
+    await key("Enter");
+
+    expect(onSubmit).toHaveBeenCalledOnce();
+    const [created, input, owner] = onSubmit.mock.calls[0]!;
+    expect(created.selection).toEqual({ kind: "target", targetId: "target-1" });
+    expect(input).toMatchObject({ text, attachments: [], browserComments: [], mentions: [] });
+    expect(owner.firstInputDisposition).toEqual({
+      kind: "learn",
+      requestId: expect.any(String),
+      backendId: "backend-1",
+      instruction,
+      evidence,
+      application: { kind: "eligible" }
+    });
+  });
+
+  it("lets a loaded runtime Skill /learn command win ordinary first-input send", async () => {
+    const onSubmit = vi.fn(async (_session: DelayedNewSessionDraft, _input: ComposerDraft, _owner: NewSessionSubmissionOwner) => undefined);
+    await renderPage(onSubmit, {
+      skillCapable: true,
+      commands: [{
+        id: "runtime-learn", name: "learn", description: "Runtime learning", source: "skill", loaded: true
+      }]
+    });
+    await edit("/learn runtime-owned", 20, false);
+    await key("Enter");
+
+    expect(onSubmit).toHaveBeenCalledOnce();
+    expect(onSubmit.mock.calls[0]![1].text).toBe("/learn runtime-owned");
+    expect(onSubmit.mock.calls[0]![2].firstInputDisposition).toMatchObject({
+      kind: "learn",
+      instruction: "runtime-owned",
+      application: { kind: "eligible" }
+    });
+  });
+
+  it.each([
+    { text: "/learn hub:catalog-skill", message: "Catalog Skill identifiers", structured: false },
+    { text: "/learn preserve this", message: "accepts text only", structured: true }
+  ] as const)("marks out-of-scope or structured learning input for post-create runtime reconciliation", async ({ text, structured }) => {
+    const onSubmit = vi.fn(async (_session: DelayedNewSessionDraft, _input: ComposerDraft, _owner: NewSessionSubmissionOwner) => undefined);
+    await renderPage(onSubmit, { skillCapable: true });
+    if (structured === true) {
+      const element = required(editorElement);
+      element.textContent = text;
+      setCaret(element, text.length);
+      await act(async () => {
+        required(editorProps).onDocumentChange({
+          type: "doc",
+          content: [{
+            type: "paragraph",
+            content: [{ type: "composerPastedText", attrs: { text, display: "Pasted text" } }]
+          }]
+        }, false, (ranges) => ranges);
+        await flush();
+      });
+    } else await edit(text, text.length, false);
+    await key("Enter");
+
+    expect(onSubmit).toHaveBeenCalledOnce();
+    expect(editorElement?.textContent).toBe(text);
+    expect(onSubmit.mock.calls[0]![2].firstInputDisposition).toMatchObject({
+      kind: "learn",
+      application: { kind: "rejected", reason: structured ? "structured" : "hub" }
+    });
+  });
+
   it("hydrates and retires an exact one-shot Extension Use handoff", async () => {
     const pending: PendingExtensionUseView = {
       extensionId: "extension_0123456789abcdef0123456789abcdef",
@@ -243,15 +327,17 @@ describe("NewSessionPage typed slash commands", () => {
 });
 
 async function renderPage(
-  onSubmit: (session: DelayedNewSessionDraft, input: ComposerDraft) => Promise<void>,
+  onSubmit: (session: DelayedNewSessionDraft, input: ComposerDraft, owner: NewSessionSubmissionOwner) => Promise<void>,
   options: {
     readonly pending?: PendingExtensionUseView;
     readonly getExtension?: AppController["getExtension"];
     readonly clearPendingExtensionUse?: AppController["clearPendingExtensionUse"];
     readonly attachmentActions?: boolean;
+    readonly skillCapable?: boolean;
+    readonly commands?: AppSnapshot["commands"];
   } = {}
 ): Promise<void> {
-  const snapshotValue = snapshot(options.attachmentActions === true);
+  const snapshotValue = snapshot(options.attachmentActions === true, options.skillCapable === true, options.commands);
   const controller = {
     state: {
       connectionState: "connected",
@@ -371,7 +457,11 @@ const visionModel: ModelView = {
   currencyCode: "USD"
 };
 
-function snapshot(attachmentActions = false): AppSnapshot {
+function snapshot(
+  attachmentActions = false,
+  skillCapable = false,
+  commands?: AppSnapshot["commands"]
+): AppSnapshot {
   const initial = emptySnapshot();
   return {
     ...initial,
@@ -386,6 +476,9 @@ function snapshot(attachmentActions = false): AppSnapshot {
       capabilities: new Map([
         ["input.text", { name: "input.text", supported: true, options: [] }],
         ["runtime.commands", { name: "runtime.commands", supported: true, options: [] }],
+        ...(skillCapable ? [
+          ["runtime.resources", { name: "runtime.resources", supported: true, options: ["skill"] }]
+        ] as const : []),
         ["permission.modes", { name: "permission.modes", supported: true, options: ["ask"] }],
         ...(attachmentActions ? [
           ["model.switch", { name: "model.switch", supported: true, options: [] }],
@@ -402,7 +495,7 @@ function snapshot(attachmentActions = false): AppSnapshot {
       id: "workspace-1", targetId: "target-1", name: "Workspace", kind: "userProject",
       serverPath: "/workspace", trusted: true, dirty: false, revision: "workspace-1", entries: []
     }],
-    commands: [
+    commands: commands ?? [
       { id: "review", name: "review", description: "Review changes", source: "backend", loaded: true },
       { id: "replace", name: "replace", description: "Replace a run", source: "backend", loaded: true }
     ]

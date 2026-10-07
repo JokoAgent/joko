@@ -50,8 +50,10 @@ import type {
   WorkspaceEntryView
 } from "../model.js";
 import type { TargetDraft } from "../model.js";
-import type { DelayedNewSessionDraft, NewSessionSubmissionOwner } from "../new-session-flow.js";
+import type { DelayedNewSessionDraft, FirstInputDisposition, NewSessionSubmissionOwner } from "../new-session-flow.js";
 import { randomUuid } from "../web-crypto.js";
+import { resourceKindsForBackend } from "../resource-capabilities.js";
+import { composerDocumentIsPlainTextInvocation } from "../skill-learning-command.js";
 import { resolveRecentProject, subscribeRecentProjectsChange, type RecentProject } from "../recent-projects.js";
 import { homeSuggestionPromptKey, type HomeSuggestionId } from "../home-suggestions.js";
 import {
@@ -62,6 +64,7 @@ import {
   resolveTypedComposerPalette
 } from "./composer-behavior.js";
 import {
+  composerBuiltInCommand,
   composerCommandItems,
   composerMentionItems,
   detectComposerCommandActivation,
@@ -746,9 +749,15 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
         ...(matchingWorkspaceMentionIndex?.paths ?? [])
       ])], [matchingWorkspaceMentionIndex?.paths, usableWorkspace]);
   const globalCommands = snapshot.commands.filter((command) => command.sessionId === undefined);
-  const commandItems = composerCommandItems(
-    backend?.capabilities.get("runtime.commands")?.supported === true ? globalCommands : []
-  );
+  const availableGlobalCommands = backend?.capabilities.get("runtime.commands")?.supported === true
+    ? globalCommands
+    : [];
+  const learnCommandSupported = controller.state.connectionState === "connected"
+    && targetStaticReady
+    && targetWorkspaceReady
+    && resourceKindsForBackend(backend).includes("skill");
+  const commandOptions = { learnSupported: learnCommandSupported } as const;
+  const commandItems = composerCommandItems(availableGlobalCommands, commandOptions);
   const commandCatalogKey = commandItems.map((item) => `${item.id}\u0000${item.value}\u0000${item.meta}`).join("\u0001");
   const selectableExtraDirectories = snapshot.extraDirectories.filter((directory) => directory.workspaceId === usableWorkspace?.id && directory.trusted);
   const canSelectExtraDirectories = usableWorkspace !== undefined && backend?.capabilities.get("workspace.extra_dirs")?.supported === true;
@@ -1863,6 +1872,9 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
     const sourceRanges = restoreComposerInlineMentionRanges(sourceText, mentionsRef.current, inlineMentionRangesRef.current);
     const sourceMentions = composerMentionsFromRanges(mentionsRef.current, sourceRanges);
     const sourceBrowserComments = browserCommentsRef.current;
+    const sourceAttachments = attachmentsRef.current;
+    const parsedCommand = composerBuiltInCommand(sourceText, commandOptions);
+    const learnCommand = parsedCommand?.kind === "learn" ? parsedCommand : undefined;
     const activeCanSend = validContext
       && modelRouteReady
       && (!composerDocumentIsEmpty(sourceEditorDocument) || attachments.length > 0 || sourceBrowserComments.length > 0)
@@ -1880,13 +1892,42 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
     const ownerWindow = ownerDocument?.defaultView;
     if (ownerDocument === undefined || ownerWindow === null || ownerWindow === undefined || sourceEpoch === undefined) return;
     const sourceDraft = editorDocumentRef.current;
-    const sourceAttachments = attachmentsRef.current;
+    const sourceInput: ComposerDraft = {
+      text: sourceText,
+      editorDocument: sourceEditorDocument,
+      attachments: sourceAttachments,
+      browserComments: sourceBrowserComments,
+      mentions: sourceMentions,
+      inlineMentionRanges: sourceRanges,
+      deliveryMode: "prompt",
+      ...(canSelectExtraDirectories ? { extraDirectoryIds } : {})
+    };
+    const firstInputDisposition: FirstInputDisposition | undefined = learnCommand === undefined
+      ? undefined
+      : {
+          kind: "learn",
+          requestId: randomUuid(),
+          backendId: backend!.id,
+          instruction: learnCommand.instruction,
+          evidence: learnCommand.instruction === "" ? "createdSession" : "freeText",
+          application: /^hub:\S*/iu.test(learnCommand.instruction)
+            ? { kind: "rejected", reason: "hub" }
+            : !composerDocumentIsPlainTextInvocation(sourceEditorDocument)
+              || sourceAttachments.length > 0
+              || sourceBrowserComments.length > 0
+              || sourceMentions.length > 0
+              || sourceRanges.length > 0
+              || extraDirectoryIds.length > 0
+              ? { kind: "rejected", reason: "structured" }
+              : { kind: "eligible" }
+        };
     const attempt = {}; submissionRef.current = attempt;
     const request = new AbortController(); submissionAbortRef.current = request;
     const owner: NewSessionSubmissionOwner = {
       ownerDocument,
       signal: request.signal,
       ...(beforeFirstInput === undefined ? {} : { beforeFirstInput }),
+      ...(firstInputDisposition === undefined ? {} : { firstInputDisposition }),
       ...(onAccepted === undefined ? {} : { onFirstInputAccepted: onAccepted }),
       isCurrent: () => submissionScopeRef.current === sourceScope && submissionEpochRef.current === sourceEpoch && submissionRef.current === attempt
         && !request.signal.aborted && submissionValidityRef.current && voiceRoot?.isConnected === true && voiceRoot.ownerDocument === ownerDocument && !ownerWindow.closed
@@ -1923,16 +1964,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
         permissionMode: resolvedPermission,
         planMode: execution.planModeSupported && planMode,
         ...(worktree === undefined ? {} : { worktree })
-      }, {
-        text: sourceText,
-        editorDocument: sourceEditorDocument,
-        attachments: sourceAttachments,
-        browserComments: sourceBrowserComments,
-        mentions: sourceMentions,
-        inlineMentionRanges: sourceRanges,
-        deliveryMode: "prompt",
-        ...(canSelectExtraDirectories ? { extraDirectoryIds } : {})
-      }, owner);
+      }, sourceInput, owner);
     } catch {
       // App owns the operation banner; the persistent draft intentionally remains.
     } finally {

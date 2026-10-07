@@ -60,6 +60,7 @@ import { collectConversationMarkdown, ConversationMarkdownError } from "../conve
 import { writeClipboardText } from "../clipboard-action.js";
 import { modelSourceAccess } from "../model-source-access.js";
 import { randomUuid } from "../web-crypto.js";
+import { requireStartedSkillLearningRun } from "../skill-learning-command.js";
 import { portableSessionExportSupported } from "../portable-session-ui.js";
 import type { SessionProjectNavigationPlacement } from "../session-project-navigation.js";
 import { sanitizeExtensionStatusText } from "../extension-ui-presentation.js";
@@ -1807,15 +1808,17 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
               controller.navigate({ kind: "session", sessionId });
             }) : undefined}
             onLearnFromSession={!reviewReadOnly && controller.state.connectionState === "connected" ? () => runAction(`learn:${session.id}`, async () => {
-              const run = await controller.startSkillLearning({
+              const run = requireStartedSkillLearningRun(await controller.startSkillLearning({
                 requestId: randomUuid(),
                 targetId: session.targetId,
                 sourceSessionId: session.id,
                 instruction: ""
+              }), {
+                backendId: session.backendId,
+                targetId: session.targetId,
+                source: { kind: "session", sessionId: session.id }
               });
-              controller.navigate(run.distillationSessionId === undefined
-                ? { kind: "tools", tab: "skills" }
-                : { kind: "session", sessionId: run.distillationSessionId });
+              controller.navigate({ kind: "session", sessionId: run.distillationSessionId });
             }) : undefined}
             onSplitSession={onSplitSession}
             onOpenSessionWindow={onOpenSessionWindow}

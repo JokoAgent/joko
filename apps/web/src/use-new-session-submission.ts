@@ -46,11 +46,13 @@ export function useNewSessionSubmission(
     let navigationRevision = original.state.navigationRevision;
     let expectedSession: string | undefined;
     let revealed = false;
+    const effectLifetime = new AbortController();
     const clearBusy = (): void => setBusy((value) => value === actionKey ? undefined : value);
     const view: SubmissionView = {
       retire() {
         if (!live) return;
         live = false;
+        effectLifetime.abort();
         win.removeEventListener("pagehide", view.retire);
         owner.signal.removeEventListener("abort", sourceRetired);
         if (activeView.current === view) activeView.current = undefined;
@@ -97,7 +99,18 @@ export function useNewSessionSubmission(
         if (!isCurrent()) return;
         expectedSession = sessionId;
         original.navigate({ kind: "session", sessionId });
-      }, undefined, { beforeFirstInput: owner.beforeFirstInput, onAccepted: owner.onFirstInputAccepted });
+      }, undefined, {
+        beforeFirstInput: owner.beforeFirstInput,
+        disposition: owner.firstInputDisposition,
+        signal: effectLifetime.signal,
+        onAccepted: (acceptance) => {
+          try { owner.onFirstInputAccepted?.(acceptance); } catch { /* Usage history cannot block accepted-input presentation. */ }
+          if (acceptance.kind !== "learned" || !isCurrent()) return;
+          const distillationSessionId = acceptance.run.distillationSessionId;
+          expectedSession = distillationSessionId;
+          original.navigate({ kind: "session", sessionId: distillationSessionId });
+        }
+      });
     } catch (error) {
       if (isCurrent()) setError(describeError(error));
       throw error;

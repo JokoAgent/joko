@@ -2300,6 +2300,8 @@ export function useAppController(): AppController {
       inspectDevicePeerDirectory: async (...args: Parameters<OperationApi["inspectDevicePeerDirectory"]>) => original().inspectDevicePeerDirectory(...args),
       listProjectDirectories: async (...args: Parameters<OperationApi["listProjectDirectories"]>) => original().listProjectDirectories(...args),
       prepareTargetWorkspace: async (...args: Parameters<OperationApi["prepareTargetWorkspace"]>) => original().prepareTargetWorkspace(...args),
+      listCommands: async (...args: Parameters<OperationApi["listCommands"]>) => original().listCommands(...args),
+      startSkillLearning: async (...args: Parameters<OperationApi["startSkillLearning"]>) => original().startSkillLearning(...args),
       createSession: async (draft: NewSessionDraft) => original().createSession(sessionDraftWithPersonalization(
         draft,
         personalizationPromptForOwner(preferencesRef.current.personalizationPrompts, inputOwnerId)
@@ -2706,7 +2708,6 @@ export function useAppController(): AppController {
     setResourceEnabled: (resourceId, enabled) => gateway().setResourceEnabled(resourceId, enabled),
     removeResource: (resourceId) => gateway().removeResource(resourceId),
     listSkills: (options) => gateway().listSkills(options),
-    startSkillLearning: (draft, signal) => gateway().startSkillLearning(draft, signal),
     listSkillLearningRuns: (signal) => gateway().listSkillLearningRuns(signal),
     getSkillLearningRun: (runId, signal) => gateway().getSkillLearningRun(runId, signal),
     applySkillLearning: (run, confirmReplace, signal) => gateway().applySkillLearning(run, confirmReplace, signal),
@@ -2770,7 +2771,6 @@ export function useAppController(): AppController {
     startSkillPublication: (preview, metadata, access, signal) => gateway().startSkillPublication(preview, metadata, access, signal),
     cancelSkillPublication: (job, signal) => gateway().cancelSkillPublication(job, signal),
     retrySkillPublication: (job, signal) => gateway().retrySkillPublication(job, signal),
-    listCommands: (sessionId) => gateway().listCommands(sessionId),
     listSessionResources: (sessionId, signal) => gateway().listSessionResources(sessionId, signal),
     listRuntimeProcesses: (backendId, signal) => gateway().listRuntimeProcesses(backendId, signal),
     getUsageHistory: (days, backendId, providerId, signal) => gateway().getUsageHistory(days, backendId, providerId, signal),

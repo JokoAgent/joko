@@ -33,6 +33,12 @@ function api() {
     createTarget: vi.fn(async () => "dialogue-target"),
     refresh: vi.fn(async () => undefined),
     send: vi.fn(async () => undefined),
+    listCommands: vi.fn(async () => []),
+    startSkillLearning: vi.fn(async () => ({
+      id: "skill_learning_0123456789abcdef0123456789abcdef", revision: 1n, state: "distilling",
+      sourceKind: "session", backendId: "backend", targetId: "target", sourceSessionId: "created",
+      distillationSessionId: "distilled", summary: "Learning", createdAt: 1, updatedAt: 1, expiresAt: 2
+    })),
     restoreFirstInputDraft: vi.fn(async () => undefined),
     clearNewSessionDraft: vi.fn(async () => undefined),
     recordRecentProject: vi.fn(async () => []),
@@ -168,7 +174,7 @@ it("forwards the first-runtime guard and records usage only after actual input a
   const original = api();
   const probe = await mount(original);
   const beforeFirstInput = vi.fn(async (_sessionId: string) => { throw new Error("Runtime command changed"); });
-  const accepted = vi.fn();
+  const accepted = vi.fn(() => { throw new Error("Usage history failed"); });
   const owner = { ownerDocument: document, signal: new AbortController().signal, isCurrent: () => true,
     beforeFirstInput, onFirstInputAccepted: accepted };
   await act(async () => { await expect(probe.submit(draft, input, owner)).rejects.toThrow("Runtime command changed"); });
@@ -179,4 +185,115 @@ it("forwards the first-runtime guard and records usage only after actual input a
   expect(accepted).not.toHaveBeenCalled();
   await act(async () => { await probe.submit(draft, input, { ...owner, beforeFirstInput: async () => undefined }); });
   expect(original.send).toHaveBeenCalledOnce(); expect(accepted).toHaveBeenCalledOnce();
+});
+
+it("reveals the created task, accepts local learning without a message, then opens its distillation task", async () => {
+  const original = api();
+  const probe = await mount(original);
+  const accepted = vi.fn(() => { throw new Error("Usage history failed"); });
+  const draftLifetime = new AbortController();
+  const owner = {
+    ownerDocument: document,
+    signal: draftLifetime.signal,
+    isCurrent: () => true,
+    firstInputDisposition: {
+      kind: "learn" as const,
+      requestId: "new-task-learn",
+      backendId: "backend",
+      instruction: "",
+      evidence: "createdSession" as const,
+      application: { kind: "eligible" as const }
+    },
+    onFirstInputAccepted: accepted
+  };
+  vi.mocked(original.navigate).mockImplementation((route) => {
+    if (route.kind === "session" && route.sessionId === "created") draftLifetime.abort();
+  });
+
+  await act(async () => { await probe.submit(draft, { ...input, text: "/learn" }, owner); });
+
+  expect(original.navigate).toHaveBeenNthCalledWith(1, { kind: "session", sessionId: "created" });
+  expect(original.navigate).toHaveBeenNthCalledWith(2, { kind: "session", sessionId: "distilled" });
+  const commandSignal = vi.mocked(original.listCommands).mock.calls[0]?.[1];
+  expect(commandSignal).toBeInstanceOf(AbortSignal);
+  expect(commandSignal).not.toBe(owner.signal);
+  expect(original.listCommands).toHaveBeenCalledExactlyOnceWith("created", commandSignal);
+  expect(original.startSkillLearning).toHaveBeenCalledExactlyOnceWith({
+    requestId: "new-task-learn", targetId: "target", instruction: "", sourceSessionId: "created"
+  }, commandSignal);
+  expect(original.send).not.toHaveBeenCalled();
+  expect(original.restoreFirstInputDraft).not.toHaveBeenCalled();
+  expect(accepted).toHaveBeenCalledWith(expect.objectContaining({ kind: "learned", sessionId: "created" }));
+});
+
+it("does not re-dispatch local learning after its owner retires while durable creation is pending", async () => {
+  const original = api();
+  const creation = deferred<{ sessionId: string; generation: bigint }>();
+  vi.mocked(original.createSession).mockReturnValue(creation.promise);
+  const probe = await mount(original);
+  let current = true;
+  const lifetime = new AbortController();
+  let pending!: Promise<unknown>;
+  await act(async () => {
+    pending = probe.submit(draft, { ...input, text: "/learn keep this" }, {
+      ownerDocument: document,
+      signal: lifetime.signal,
+      isCurrent: () => current,
+      firstInputDisposition: {
+        kind: "learn", requestId: "retired-learn", backendId: "backend", instruction: "keep this", evidence: "freeText",
+        application: { kind: "eligible" }
+      }
+    }).catch((error: unknown) => error);
+  });
+  await act(async () => { current = false; lifetime.abort(); });
+  let result: unknown;
+  await act(async () => { creation.resolve({ sessionId: "created", generation: 4n }); result = await pending; });
+
+  expect(result).toMatchObject({ name: "AbortError" });
+  expect(original.listCommands).not.toHaveBeenCalled();
+  expect(original.startSkillLearning).not.toHaveBeenCalled();
+  expect(original.send).not.toHaveBeenCalled();
+  expect(original.restoreFirstInputDraft).toHaveBeenCalledExactlyOnceWith("created", expect.objectContaining({ text: "/learn keep this" }));
+  expect(original.navigate).not.toHaveBeenCalled();
+});
+
+it("aborts fresh runtime reconciliation on an unexpected route and restores the complete invocation", async () => {
+  const original = api();
+  const catalog = deferred<readonly []>();
+  vi.mocked(original.listCommands).mockImplementation(async (_sessionId, signal) => {
+    return await new Promise<readonly []>((resolve, reject) => {
+      const abort = (): void => reject(signal?.reason ?? new DOMException("Aborted", "AbortError"));
+      if (signal?.aborted === true) { abort(); return; }
+      signal?.addEventListener("abort", abort, { once: true });
+      void catalog.promise.then(resolve, reject);
+    });
+  });
+  const probe = await mount(original);
+  const invocation = { ...input, text: "/learn keep this" };
+  const owner = {
+    ownerDocument: document,
+    signal: new AbortController().signal,
+    isCurrent: () => true,
+    firstInputDisposition: {
+      kind: "learn" as const,
+      requestId: "route-retired-learn",
+      backendId: "backend",
+      instruction: "keep this",
+      evidence: "freeText" as const,
+      application: { kind: "eligible" as const }
+    }
+  };
+  let failure!: Promise<unknown>;
+  await act(async () => {
+    failure = probe.submit(draft, invocation, owner).catch((error: unknown) => error);
+  });
+  expect(original.navigate).toHaveBeenCalledWith({ kind: "session", sessionId: "created" });
+  await probe.render({ ...original, state: { ...original.state, route: { kind: "settings" }, navigationRevision: 1 } });
+  let result: unknown;
+  await act(async () => { result = await failure; });
+
+  expect(result).toMatchObject({ name: "AbortError" });
+  expect(original.startSkillLearning).not.toHaveBeenCalled();
+  expect(original.send).not.toHaveBeenCalled();
+  expect(original.restoreFirstInputDraft).toHaveBeenCalledExactlyOnceWith("created", invocation);
 });

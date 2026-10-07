@@ -409,6 +409,93 @@ describe("Backend-neutral runtime commands", () => {
     }]);
     gateway.disconnect();
   });
+
+  it.each(["caller", "connection"] as const)(
+    "rejects a late runtime-command catalog after %s cancellation",
+    async (cancellation) => {
+      let resolveCommands!: () => void;
+      let dispatchedSignal: AbortSignal | undefined;
+      const transport = {
+        unary: vi.fn(async (method: any, signal: AbortSignal | undefined) => {
+          if (method.localName === "getSnapshot") return response(method, create(GetSnapshotResponseSchema, {
+            snapshot: create(SnapshotSchema, { generation: 1n, resumeCursor: { generation: 1n, sequence: 0n } })
+          }));
+          if (method.localName !== "listRuntimeCommands") throw new Error(`Unexpected method: ${method.localName}`);
+          dispatchedSignal = signal;
+          await new Promise<void>((resolve) => { resolveCommands = resolve; });
+          return response(method, create(ListRuntimeCommandsResponseSchema, {
+            commands: [{
+              commandId: "late-skill",
+              sessionId: "session-commands",
+              name: "learn",
+              source: RuntimeCommandSource.SKILL,
+              loaded: true
+            }]
+          }));
+        }),
+        stream: vi.fn(async (method: any) => response(method, idleStream(), true))
+      } as unknown as Transport;
+      const gateway = createOrchestratorGateway(
+        { id: "connection-command-cancel", deviceId: "device-test", name: "Browser", origin: "https://orchestrator.example", serverId: "server-test" },
+        "secret",
+        {},
+        () => transport
+      );
+      await gateway.connect();
+      try {
+        const cancelledBeforeDispatch = new AbortController();
+        cancelledBeforeDispatch.abort();
+        await expect(gateway.listCommands("session-commands", cancelledBeforeDispatch.signal))
+          .rejects.toMatchObject({ name: "AbortError" });
+        expect(vi.mocked(transport.unary).mock.calls.filter(([method]) => method.localName === "listRuntimeCommands"))
+          .toHaveLength(0);
+
+        const caller = new AbortController();
+        const pending = gateway.listCommands("session-commands", caller.signal);
+        await vi.waitFor(() => expect(dispatchedSignal).toBeDefined());
+        expect(dispatchedSignal!.aborted).toBe(false);
+        if (cancellation === "caller") caller.abort();
+        else gateway.disconnect();
+        expect(dispatchedSignal!.aborted).toBe(true);
+        resolveCommands();
+        await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+        expect(vi.mocked(transport.unary).mock.calls.filter(([method]) => method.localName === "listRuntimeCommands"))
+          .toHaveLength(1);
+      } finally {
+        gateway.disconnect();
+      }
+    }
+  );
+
+  it("rejects a runtime command scoped to a different task", async () => {
+    const transport = {
+      unary: vi.fn(async (method: any) => {
+        if (method.localName === "getSnapshot") return response(method, create(GetSnapshotResponseSchema, {
+          snapshot: create(SnapshotSchema, { generation: 1n, resumeCursor: { generation: 1n, sequence: 0n } })
+        }));
+        return response(method, create(ListRuntimeCommandsResponseSchema, {
+          commands: [{
+            commandId: "foreign-skill",
+            sessionId: "another-session",
+            name: "learn",
+            source: RuntimeCommandSource.SKILL,
+            loaded: true
+          }]
+        }));
+      }),
+      stream: vi.fn(async (method: any) => response(method, idleStream(), true))
+    } as unknown as Transport;
+    const gateway = createOrchestratorGateway(
+      { id: "connection-command-owner", deviceId: "device-test", name: "Browser", origin: "https://orchestrator.example", serverId: "server-test" },
+      "secret",
+      {},
+      () => transport
+    );
+    await gateway.connect();
+    await expect(gateway.listCommands("session-commands"))
+      .rejects.toThrow("runtime command for a different task");
+    gateway.disconnect();
+  });
 });
 
 describe("Backend-neutral live runtime tools", () => {

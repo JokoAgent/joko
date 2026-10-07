@@ -8,7 +8,8 @@ import {
   filterComposerPaletteItems,
   insertComposerPaletteValue,
   mentionsStillPresent,
-  replaceComposerCommandRun
+  replaceComposerCommandRun,
+  runtimeCommandOwnsApplicationCommand
 } from "./composer-palette.js";
 
 describe("shared composer palettes", () => {
@@ -80,6 +81,34 @@ describe("shared composer palettes", () => {
     const items = composerCommandItems(commands);
 
     expect(items.map((item) => item.value)).toEqual(["/review"]);
+  });
+
+  it("parses application learning and lets an exact loaded runtime skill own the same command", () => {
+    const runtimeLearn: RuntimeCommandView = {
+      id: "learn-skill",
+      name: "learn",
+      description: "Runtime learning skill",
+      source: "skill",
+      resourceId: "skill-learn",
+      loaded: true
+    };
+    expect(composerBuiltInCommand("/learn", { learnSupported: true })).toEqual({ kind: "learn", instruction: "" });
+    expect(composerBuiltInCommand("/LEARN  distill this workflow\ncarefully ", { learnSupported: true }))
+      .toEqual({ kind: "learn", instruction: "distill this workflow\ncarefully" });
+    expect(composerBuiltInCommand(" /learn", { learnSupported: true })).toBeUndefined();
+    expect(composerBuiltInCommand("/learner", { learnSupported: true })).toBeUndefined();
+    expect(composerBuiltInCommand("/learn", { learnSupported: false })).toBeUndefined();
+
+    expect(composerCommandItems([], { learnSupported: true })).toEqual([
+      expect.objectContaining({ id: "builtin:learn", value: "/learn" })
+    ]);
+    expect(composerCommandItems([runtimeLearn], { learnSupported: true })).toEqual([
+      expect.objectContaining({ id: "command:learn-skill", value: "/learn" })
+    ]);
+    expect(runtimeCommandOwnsApplicationCommand([runtimeLearn], "learn")).toBe(true);
+    expect(runtimeCommandOwnsApplicationCommand([{ ...runtimeLearn, loaded: false }], "learn")).toBe(false);
+    expect(runtimeCommandOwnsApplicationCommand([{ ...runtimeLearn, source: "backend" }], "learn")).toBe(false);
+    expect(runtimeCommandOwnsApplicationCommand([{ ...runtimeLearn, name: "learning" }], "learn")).toBe(false);
   });
 
   it("tracks a slash query at a token boundary and owns the complete run around the caret", () => {

@@ -4431,10 +4431,19 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     }, true, [], scope.signal);
   }
 
-  async listCommands(sessionId: string): Promise<readonly RuntimeCommandView[]> {
-    const client = createClient(SessionService, this.requireTransport());
-    const response = await client.listRuntimeCommands({ sessionId }, this.#abort === undefined ? undefined : { signal: this.#abort.signal });
-    return response.commands.map(mapRuntimeCommand);
+  async listCommands(sessionId: string, signal?: AbortSignal): Promise<readonly RuntimeCommandView[]> {
+    const scope = this.captureActionScope(signal);
+    const client = createClient(SessionService, scope.transport);
+    const response = await client.listRuntimeCommands(
+      { sessionId },
+      { signal: scope.signal }
+    );
+    scope.signal.throwIfAborted();
+    const commands = response.commands.map(mapRuntimeCommand);
+    if (commands.some((command) => command.sessionId !== undefined && command.sessionId !== sessionId)) {
+      throw new GatewayError("Orchestrator returned a runtime command for a different task.");
+    }
+    return commands;
   }
 
   async listSessionResources(sessionId: string, signal?: AbortSignal): Promise<readonly SessionResourceView[]> {

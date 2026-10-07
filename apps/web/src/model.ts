@@ -5880,7 +5880,7 @@ export interface OperationApi extends VoiceDictionaryPeerApi {
   startSkillPublication(preview: SkillPublicationPreviewView, metadata: SkillPublicationMetadataView, access: SkillPublicationAccessSelectionView, signal?: AbortSignal): Promise<void>;
   cancelSkillPublication(job: SkillPublicationJobView, signal?: AbortSignal): Promise<void>;
   retrySkillPublication(job: SkillPublicationJobView, signal?: AbortSignal): Promise<void>;
-  listCommands(sessionId: string): Promise<readonly RuntimeCommandView[]>;
+  listCommands(sessionId: string, signal?: AbortSignal): Promise<readonly RuntimeCommandView[]>;
   listSessionResources(sessionId: string, signal?: AbortSignal): Promise<readonly SessionResourceView[]>;
   listRuntimeProcesses(backendId: string, signal?: AbortSignal): Promise<RuntimeProcessUsageSnapshotView>;
   getUsageHistory(days?: number, backendId?: string, providerId?: string, signal?: AbortSignal): Promise<UsageHistoryView>;

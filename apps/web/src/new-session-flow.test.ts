@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import type { ComposerDraft, NewSessionDraft } from "./model.js";
+import type { ComposerDraft, NewSessionDraft, SkillLearningRunView } from "./model.js";
 import { createDelayedSessionFromFirstInput, createSessionFromFirstInput } from "./new-session-flow.js";
 
 const session: NewSessionDraft = {
@@ -22,6 +22,193 @@ const input: ComposerDraft = {
 };
 
 describe("lazy new-session dispatch", () => {
+  it.each([
+    { evidence: "createdSession" as const, instruction: "", sourceSessionId: "learn-source" },
+    { evidence: "freeText" as const, instruction: "Preserve the release checklist", sourceSessionId: undefined }
+  ])("accepts /learn locally after revealing the new Session; evidence=$evidence", async ({ evidence, instruction, sourceSessionId }) => {
+    const order: string[] = [];
+    const accepted = vi.fn((value) => { order.push(`accepted:${value.kind}`); });
+    const api = {
+      createSession: vi.fn(async () => { order.push("create"); return { sessionId: "learn-source", generation: 11n }; }),
+      listCommands: vi.fn(async () => { order.push("commands"); return []; }),
+      startSkillLearning: vi.fn(async () => {
+        order.push("learn");
+        return learningRun("distilled", evidence === "createdSession"
+          ? {}
+          : { sourceKind: "text", sourceSessionId: undefined });
+      }),
+      send: vi.fn(async () => { order.push("send"); }),
+      restoreFirstInputDraft: vi.fn(async () => { order.push("restore"); })
+    };
+
+    await expect(createSessionFromFirstInput(api, session, input, () => { order.push("reveal"); }, {
+      disposition: { kind: "learn", requestId: "learn-request", backendId: "backend-1", instruction, evidence, application: { kind: "eligible" } },
+      onAccepted: accepted
+    })).resolves.toBe("learn-source");
+
+    expect(order).toEqual(["create", "reveal", "commands", "learn", "accepted:learned"]);
+    expect(api.send).not.toHaveBeenCalled();
+    expect(api.restoreFirstInputDraft).not.toHaveBeenCalled();
+    expect(api.startSkillLearning).toHaveBeenCalledExactlyOnceWith({
+      requestId: "learn-request",
+      targetId: session.targetId,
+      instruction,
+      ...(sourceSessionId === undefined ? {} : { sourceSessionId })
+    }, undefined);
+    expect(accepted).toHaveBeenCalledWith(expect.objectContaining({
+      kind: "learned",
+      sessionId: "learn-source",
+      run: expect.objectContaining({ distillationSessionId: "distilled" })
+    }));
+  });
+
+  it("sends the full invocation when the created runtime owns loaded /learn as a Skill command", async () => {
+    const api = {
+      createSession: vi.fn(async () => ({ sessionId: "runtime-learn", generation: 12n })),
+      listCommands: vi.fn(async () => [{
+        id: "runtime-learn-command", name: "/learn", description: "Runtime Skill command",
+        source: "skill" as const, loaded: true
+      }]),
+      startSkillLearning: vi.fn(async () => learningRun("unused")),
+      send: vi.fn(async () => undefined),
+      restoreFirstInputDraft: vi.fn(async () => undefined)
+    };
+    const accepted = vi.fn();
+
+    await createSessionFromFirstInput(api, session, input, vi.fn(), {
+      disposition: {
+        kind: "learn", requestId: "runtime-request", backendId: "backend-1", instruction: "Use runtime",
+        evidence: "freeText", application: { kind: "rejected", reason: "structured" }
+      },
+      onAccepted: accepted
+    });
+
+    expect(api.listCommands).toHaveBeenCalledExactlyOnceWith("runtime-learn", undefined);
+    expect(api.send).toHaveBeenCalledExactlyOnceWith("runtime-learn", input, { expectedGeneration: 12n });
+    expect(api.startSkillLearning).not.toHaveBeenCalled();
+    expect(api.restoreFirstInputDraft).not.toHaveBeenCalled();
+    expect(accepted).toHaveBeenCalledWith({ kind: "sent", sessionId: "runtime-learn" });
+  });
+
+  it.each([
+    { reason: "hub" as const, message: "Catalog Skill identifiers" },
+    { reason: "structured" as const, message: "accepts text only" }
+  ])("restores an app-ineligible $reason invocation when the fresh runtime does not own /learn", async ({ reason, message }) => {
+    const sourceInput = { ...input, text: reason === "hub" ? "/learn hub:catalog" : "/learn preserve" };
+    const api = {
+      createSession: vi.fn(async () => ({ sessionId: "rejected-app-learn", generation: 16n })),
+      listCommands: vi.fn(async () => []),
+      startSkillLearning: vi.fn(async () => learningRun("unused")),
+      send: vi.fn(async () => undefined),
+      restoreFirstInputDraft: vi.fn(async () => undefined)
+    };
+    await expect(createSessionFromFirstInput(api, session, sourceInput, vi.fn(), {
+      disposition: {
+        kind: "learn", requestId: "rejected-app-request", backendId: "backend-1",
+        instruction: reason === "hub" ? "hub:catalog" : "preserve", evidence: "freeText",
+        application: { kind: "rejected", reason }
+      }
+    })).rejects.toThrow(message);
+    expect(api.listCommands).toHaveBeenCalledOnce();
+    expect(api.startSkillLearning).not.toHaveBeenCalled();
+    expect(api.send).not.toHaveBeenCalled();
+    expect(api.restoreFirstInputDraft).toHaveBeenCalledExactlyOnceWith("rejected-app-learn", sourceInput);
+  });
+
+  it.each(["catalog", "learning"] as const)("restores the complete invocation after post-create %s failure without retrying", async (stage) => {
+    const failure = new Error(`${stage} unknown`);
+    const api = {
+      createSession: vi.fn(async () => ({ sessionId: "recover-learn", generation: 13n })),
+      listCommands: vi.fn(async () => {
+        if (stage === "catalog") throw failure;
+        return [];
+      }),
+      startSkillLearning: vi.fn(async () => {
+        if (stage === "learning") throw failure;
+        return learningRun("unused");
+      }),
+      send: vi.fn(async () => undefined),
+      restoreFirstInputDraft: vi.fn(async () => undefined)
+    };
+
+    await expect(createSessionFromFirstInput(api, session, input, vi.fn(), {
+      disposition: {
+        kind: "learn", requestId: "recover-request", backendId: "backend-1", instruction: "Keep all input",
+        evidence: "freeText", application: { kind: "eligible" }
+      }
+    })).rejects.toBe(failure);
+
+    expect(api.restoreFirstInputDraft).toHaveBeenCalledExactlyOnceWith("recover-learn", input);
+    expect(api.send).not.toHaveBeenCalled();
+    expect(api.listCommands).toHaveBeenCalledOnce();
+    expect(api.startSkillLearning).toHaveBeenCalledTimes(stage === "learning" ? 1 : 0);
+  });
+
+  it("treats a fulfilled failed learning run as rejection and restores the invocation", async () => {
+    const failed = { ...learningRun("partial-distillation"), state: "failed" as const, error: "Learning could not start." };
+    const api = {
+      createSession: vi.fn(async () => ({ sessionId: "failed-learn", generation: 14n })),
+      listCommands: vi.fn(async () => []),
+      startSkillLearning: vi.fn(async () => failed),
+      send: vi.fn(async () => undefined),
+      restoreFirstInputDraft: vi.fn(async () => undefined)
+    };
+
+    await expect(createSessionFromFirstInput(api, session, input, vi.fn(), {
+      disposition: {
+        kind: "learn", requestId: "failed-request", backendId: "backend-1", instruction: "",
+        evidence: "createdSession", application: { kind: "eligible" }
+      }
+    })).rejects.toThrow("Learning could not start.");
+    expect(api.restoreFirstInputDraft).toHaveBeenCalledExactlyOnceWith("failed-learn", input);
+    expect(api.send).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { label: "Target", run: learningRun("wrong-target", { targetId: "other-target" }) },
+    { label: "source", run: learningRun("wrong-source", { sourceKind: "text", sourceSessionId: undefined }) }
+  ])("rejects a fulfilled learning run with mismatched $label authority", async ({ run }) => {
+    const api = {
+      createSession: vi.fn(async () => ({ sessionId: "authority-source", generation: 15n })),
+      listCommands: vi.fn(async () => []),
+      startSkillLearning: vi.fn(async () => run),
+      send: vi.fn(async () => undefined),
+      restoreFirstInputDraft: vi.fn(async () => undefined)
+    };
+    const sourceInput = { ...input, text: "/learn" };
+    await expect(createSessionFromFirstInput(api, session, sourceInput, vi.fn(), {
+      disposition: {
+        kind: "learn", requestId: "authority-request", backendId: "backend-1",
+        instruction: "", evidence: "createdSession", application: { kind: "eligible" }
+      }
+    })).rejects.toThrow("did not return an active distillation task");
+    expect(api.restoreFirstInputDraft).toHaveBeenCalledExactlyOnceWith("authority-source", sourceInput);
+    expect(api.send).not.toHaveBeenCalled();
+  });
+
+  it("rejects a local /learn disposition for a managed dialogue before creating an orphan Target", async () => {
+    const api = {
+      createTarget: vi.fn(async () => "dialogue-target"),
+      refresh: vi.fn(async () => undefined),
+      createSession: vi.fn(async () => ({ sessionId: "unused", generation: 1n })),
+      listCommands: vi.fn(async () => []),
+      startSkillLearning: vi.fn(async () => learningRun("unused")),
+      send: vi.fn(async () => undefined),
+      restoreFirstInputDraft: vi.fn(async () => undefined)
+    };
+    await expect(createDelayedSessionFromFirstInput(api, {
+      ...session,
+      selection: { kind: "dialogue", backendId: "backend" }
+    }, input, vi.fn(), undefined, {
+      disposition: {
+        kind: "learn", requestId: "invalid-dialogue", backendId: "backend-1", instruction: "",
+        evidence: "createdSession", application: { kind: "eligible" }
+      }
+    })).rejects.toThrow("selected task environment");
+    expect(api.createTarget).not.toHaveBeenCalled();
+    expect(api.createSession).not.toHaveBeenCalled();
+  });
+
   it.each([true, false])("validates the actual new runtime before first input; valid=%s", async (valid) => {
     const order: string[] = [];
     const api = {
@@ -173,3 +360,24 @@ describe("lazy new-session dispatch", () => {
     expect(api.send).not.toHaveBeenCalled();
   });
 });
+
+function learningRun(
+  distillationSessionId: string,
+  overrides: Partial<SkillLearningRunView> = {}
+): SkillLearningRunView {
+  return {
+    id: "skill_learning_0123456789abcdef0123456789abcdef",
+    revision: 1n,
+    state: "distilling",
+    sourceKind: "session",
+    backendId: "backend-1",
+    targetId: session.targetId,
+    sourceSessionId: "learn-source",
+    distillationSessionId,
+    summary: "Learning",
+    createdAt: 1,
+    updatedAt: 1,
+    expiresAt: 2,
+    ...overrides
+  };
+}
