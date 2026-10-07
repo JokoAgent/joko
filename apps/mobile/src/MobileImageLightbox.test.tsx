@@ -9,7 +9,7 @@ import { mobileMessage } from "./mobile-messages";
 
 const native = vi.hoisted(() => ({ state: "active", listeners: new Set<(state: string) => void>(),
   images: new Map<string, ImageProps>(), layout: undefined as ((event: unknown) => void) | undefined,
-  gestures: undefined as PanResponderCallbacks | undefined, offset: 0, spring: vi.fn(), burn: vi.fn(), valueIndex: 0, pageOffset: 0,
+  gestures: undefined as PanResponderCallbacks | undefined, offset: 0, spring: vi.fn(), burn: vi.fn(), raster: vi.fn(), valueIndex: 0, pageOffset: 0,
   autoAnimate: true, timing: vi.fn(), finishAnimation: undefined as ((result: { finished: boolean }) => void) | undefined }));
 vi.mock("react-native", () => {
   const box = ({ children, testID, pointerEvents, accessibilityElementsHidden, importantForAccessibility }: {
@@ -46,6 +46,7 @@ vi.mock("expo-image", () => ({ Image: (props: ImageProps) => {
 vi.mock("react-native-safe-area-context", () => ({ SafeAreaView: ({ children }: { children?: ReactNode }) => createElement("div", {}, children) }));
 vi.mock("react-native-svg", () => ({ SvgXml: () => null }));
 vi.mock("./use-mobile-annotation-burn", () => ({ useMobileAnnotationBurn: () => ({ burnIn: native.burn, host: null }) }));
+vi.mock("./mobile-annotation-raster", () => ({ prepareMobileAnnotationRaster: native.raster }));
 import { MobileImageLightbox } from "./MobileImageLightbox";
 
 let host: HTMLDivElement; let root: Root;
@@ -55,6 +56,7 @@ const decoded = vi.fn(); const output = vi.fn(); const save = vi.fn(); const nat
 const nativeFailed = vi.fn(); const retry = vi.fn(); const previewFailed = vi.fn();
 beforeEach(() => {
   Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true }); native.state = "active"; native.images.clear(); native.burn.mockReset();
+  native.raster.mockReset(); native.raster.mockImplementation(async ({ base64, mediaType }) => ({ base64, mediaType }));
   close.mockReset(); share.mockReset(); share.mockImplementation(async (_signal, onDispatch) => onDispatch()); add.mockReset(); add.mockResolvedValue(undefined);
   copySource.mockReset(); copySource.mockResolvedValue("Copied.");
   decoded.mockReset(); output.mockReset(); save.mockReset(); nativeActivity.mockReset();
@@ -276,6 +278,48 @@ describe("lightbox dismissal and gesture ownership", () => {
 });
 
 describe("native image gallery formats and ownership", () => {
+  it.each([
+    { mediaType: "image/tiff", action: "copy" },
+    { mediaType: "image/tiff", action: "save" },
+    { mediaType: "image/heic", action: "copy" },
+    { mediaType: "image/heic", action: "save" },
+    { mediaType: "image/heif", action: "copy" },
+    { mediaType: "image/heif", action: "save" }
+  ] as const)("rasterizes an unmarked $mediaType original before bitmap $action", async ({ mediaType, action }) => {
+    const page = { ...session(mediaType, false), fileName: "design", addable: false, annotatable: true };
+    native.raster.mockResolvedValue({ base64: "AA==", mediaType: "image/png" });
+    native.burn.mockResolvedValue({ base64: "AA==", mediaType: "image/png", width: 1, height: 1 });
+    await render(page); await load(page);
+    await act(async () => button(action === "save" ? "image.save" : "image.copy")!.click());
+    expect(native.raster).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+      mediaType: page.sourceMediaType, width: 1, height: 1
+    }), expect.any(AbortSignal));
+    expect(native.burn).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ mediaType: "image/png", strokes: [] }));
+    expect(output).toHaveBeenCalledWith(action, expect.anything(), expect.objectContaining({
+      mediaType: "image/png", width: 1, height: 1
+    }), expect.any(AbortSignal));
+    expect(share).not.toHaveBeenCalled(); expect(page.sourceBase64).toBe("AA==");
+  });
+
+  it.each(["image/tiff", "image/heic", "image/heif"])(
+    "renders %s to PNG after clearing its previous marks in the Composer editor",
+    async (mediaType) => {
+      const page = { ...session(mediaType, false), annotatable: true,
+        initialStrokes: [{ points: [{ x: 0.2, y: 0.3 }] }] };
+      native.raster.mockResolvedValue({ base64: "AA==", mediaType: "image/png" });
+      native.burn.mockResolvedValue({ base64: "AA==", mediaType: "image/png", width: 1, height: 1 });
+      await act(async () => root.render(createElement(MobileImageLightbox, {
+        session: page, locale: "en", onClose: close, onSave: save
+      })));
+      await act(async () => native.layout?.({ nativeEvent: { layout: { width: 400, height: 300 } } }));
+      await load(page);
+      await act(async () => button("image.undo")!.click());
+      await act(async () => button("common.save")!.click());
+      expect(native.burn).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ mediaType: "image/png", strokes: [] }));
+      expect(save).toHaveBeenCalledWith([], expect.objectContaining({ mediaType: "image/png" }), expect.any(AbortSignal));
+    }
+  );
+
   it("draws and burns against the confirmed EXIF canvas and rejects unrelated dimensions", async () => {
     const page = { ...session("image/png", false), annotatable: true, nativeQuarterTurn: true as const,
       expectedWidthPixels: 6, expectedHeightPixels: 4 };
@@ -362,15 +406,16 @@ describe("native image gallery formats and ownership", () => {
     expect(share).toHaveBeenCalledOnce(); expect(output).not.toHaveBeenCalled(); expect(native.burn).not.toHaveBeenCalled();
   });
 
-  it("keeps the ICO preview and multiple-page TIFF original-only while forwarding the actual native preview MIME", async () => {
-    for (const mediaType of ["image/x-icon", "image/tiff", "image/apng"]) {
+  it("keeps ICO and APNG container originals free of static effects", async () => {
+    for (const mediaType of ["image/x-icon", "image/apng"]) {
       const page = { ...session(mediaType, mediaType === "image/apng", mediaType), originalOnly: true,
-        previewMediaType: mediaType === "image/tiff" ? "image/tiff" : "image/png" };
+        previewMediaType: "image/png" };
       await render(page); await load(page);
       expect(decoded).toHaveBeenLastCalledWith(expect.objectContaining({ mediaType: page.previewMediaType }));
       expect(button("image.copy")).toBeUndefined(); expect(button("image.save")).toBeUndefined(); expect(button("image.annotate")).toBeUndefined();
       expect(button("image.share")!.disabled).toBe(false);
     }
+    expect(native.raster).not.toHaveBeenCalled(); expect(native.burn).not.toHaveBeenCalled(); expect(output).not.toHaveBeenCalled();
   });
 
   it("cancels preparation on inactivity before dispatch and refuses a late native share effect", async () => {

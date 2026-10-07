@@ -29,6 +29,7 @@ import {
   MOBILE_ANNOTATION_STROKE_COLOR,
   decodeMobileBase64,
   mobileAnnotationDisplayRect,
+  mobileImageRequiresNativeRaster,
   mobileAnnotationStrokePath,
   mobileAnnotationStrokeWidth,
   normalizeMobileAnnotationPoint,
@@ -36,6 +37,7 @@ import {
   type MobileImageAnnotationPoint,
   type MobileImageAnnotationStroke
 } from "./mobile-image-annotation";
+import { prepareMobileAnnotationRaster } from "./mobile-annotation-raster";
 import {
   MOBILE_LIGHTBOX_DOUBLE_TAP_MILLISECONDS,
   MOBILE_LIGHTBOX_MAX_SCALE,
@@ -712,10 +714,16 @@ export function MobileImageLightbox({
     try {
       const exactStrokes = cloneStrokes(strokesRef.current);
       let burned: MobileBurnedImage | undefined;
-      if (exactStrokes.length > 0) {
-        const result = await burnIn({
+      if (exactStrokes.length > 0 || mobileImageRequiresNativeRaster(session.sourceMediaType)) {
+        const raster = await prepareMobileAnnotationRaster({
           base64: session.sourceBase64,
           mediaType: session.sourceMediaType,
+          width: decodedRef.current!.width,
+          height: decodedRef.current!.height
+        }, controller.signal);
+        controller.signal.throwIfAborted();
+        const result = await burnIn({
+          ...raster,
           strokes: exactStrokes
         });
         controller.signal.throwIfAborted();
@@ -770,12 +778,19 @@ export function MobileImageLightbox({
       const exactStrokes = originalShare ? [] : cloneStrokes(strokesRef.current);
       const sourceMediaType = session.sourceMediaType.trim().toLowerCase();
       const requiresRender = !originalShare && (exactStrokes.length > 0
+        || mobileImageRequiresNativeRaster(sourceMediaType)
         || action === "copy" && sourceMediaType !== "image/jpeg" && sourceMediaType !== "image/png");
       let rendered: MobileImageOutputRenderedImage | undefined;
       if (requiresRender) {
-        const result = await burnIn({
+        const raster = await prepareMobileAnnotationRaster({
           base64: session.sourceBase64,
           mediaType: session.sourceMediaType,
+          width: exactDecoded.width,
+          height: exactDecoded.height
+        }, controller.signal);
+        controller.signal.throwIfAborted();
+        const result = await burnIn({
+          ...raster,
           strokes: exactStrokes
         });
         controller.signal.throwIfAborted();

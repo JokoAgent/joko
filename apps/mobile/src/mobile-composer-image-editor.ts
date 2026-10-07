@@ -34,7 +34,14 @@ export interface MobileComposerImageCommitResult {
 }
 
 export function mobileAnnotatedImageFileName(fileName: string, mediaType: "image/jpeg" | "image/png"): string {
+  return `${mobileImageFileStem(fileName)}-annotated.${mediaType === "image/jpeg" ? "jpg" : "png"}`;
+}
+
+export function mobileRasterizedImageFileName(fileName: string, mediaType: "image/jpeg" | "image/png"): string {
+  return `${mobileImageFileStem(fileName)}.${mediaType === "image/jpeg" ? "jpg" : "png"}`;
+}
+
+function mobileImageFileStem(fileName: string): string {
   const leaf = fileName.split(/[\\/]/u).at(-1)?.trim() || "image";
-  const base = leaf.replace(/\.[^.]+$/u, "").trim().slice(0, 480) || "image";
-  return `${base}-annotated.${mediaType === "image/jpeg" ? "jpg" : "png"}`;
+  return leaf.replace(/\.[^.]+$/u, "").trim().slice(0, 480) || "image";
 }

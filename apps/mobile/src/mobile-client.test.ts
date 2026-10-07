@@ -9567,8 +9567,7 @@ describe("native current-task Files ownership", () => {
     { format: "SVG", fileName: "vector.svg", mediaType: "image/svg+xml", bytes: svgBytes(), animated: false, width: 40, height: 20 },
     { format: "animated PNG", fileName: "moving.png", mediaType: "image/png", bytes: animatedPngBytes(), animated: true, width: 1, height: 1 },
     { format: "registered APNG", fileName: "moving.apng", mediaType: "image/apng", bytes: animatedPngBytes(), animated: true, width: 1, height: 1 },
-    { format: "ICO", fileName: "icon.ico", mediaType: "image/x-icon", bytes: iconBytes([{ bytes: iconDibBytes(3, 2), width: 3, height: 2 }]), animated: false, width: 3, height: 2 },
-    { format: "static TIFF", fileName: "scan.tiff", mediaType: "image/tiff", bytes: tiffBytes(3, 2), animated: false, width: 3, height: 2 }
+    { format: "ICO", fileName: "icon.ico", mediaType: "image/x-icon", bytes: iconBytes([{ bytes: iconDibBytes(3, 2), width: 3, height: 2 }]), animated: false, width: 3, height: 2 }
   ])("previews canonical $format, system-shares and appends original bytes, and rejects static rendering", async ({ fileName, mediaType, bytes, animated, width, height }) => {
     const message = timelinePreviewEvent(fileName, mediaType, bytes, "b".repeat(64));
     const projected = clone(SnapshotSchema, timelineGallerySnapshot(message));
@@ -9703,6 +9702,67 @@ describe("native current-task Files ownership", () => {
     expect(editor).toMatchObject({ expectedWidthPixels: headerWidth, expectedHeightPixels: headerHeight,
       sourceBase64: bytes.toString("base64"), annotatable: true,
       ...(format === "jpeg" ? {} : { nativeQuarterTurn: true }) });
+    expect(network.submit).not.toHaveBeenCalled(); expect(network.uploadBlob).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { mediaType: "image/tiff", fileName: "design.tiff", bytes: () => tiffBytes(6, 4) },
+    { mediaType: "image/heic", fileName: "design.heic", bytes: () => isoImageBytes(["heic", "mif1"], 6, 4) },
+    { mediaType: "image/heif", fileName: "design.heif", bytes: () => isoImageBytes(["mif1"], 6, 4) }
+  ])("retains a native image original ($mediaType) through PNG-only Composer annotation and restores an unmarked PNG after editing", async ({ mediaType, fileName, bytes: fixtureBytes }) => {
+    const bytes = fixtureBytes();
+    const sha256Hex = createHash("sha256").update(bytes).digest("hex");
+    const blob = create(BlobRefSchema, { blobId: "native-raster-blob", fileName, mediaType,
+      byteSize: BigInt(bytes.byteLength), sha256Hex, disposition: BlobDisposition.INLINE });
+    const artifact = create(ArtifactSchema, { artifactId: "native-raster-artifact", sessionId: "session",
+      kind: ArtifactKind.IMAGE, title: "Design", blob });
+    const snapshot = clone(SnapshotSchema, handoffSnapshot);
+    const input = snapshot.backends[0]!.capabilities!.capabilities
+      .find((item) => item.name === capabilityNames.inputImage)!.options!.kind;
+    if (input.case !== "input") throw new Error("fixture");
+    input.value.mediaTypes = ["image/png"];
+    input.value.maximumBytes = 4_096n;
+    const network = fakeNetwork(); configureFiles(network, snapshot);
+    vi.mocked(network.listSessionArtifacts).mockResolvedValue({ artifacts: [artifact], revision: "native-raster-catalog" });
+    vi.mocked(network.downloadBlob).mockResolvedValue({ bytes, mediaType });
+    const fixture = attachmentFileFixture(); const drafts = memoryDraftStores(); let id = 0;
+    const files = new MobileAttachmentFiles(fixture.driver,
+      async (value) => createHash("sha256").update(value).digest("hex"));
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined,
+      () => "native-raster-" + ++id, undefined, drafts, files);
+    await app.start(); await app.openFiles(); app.openGeneratedFiles(); await app.previewArtifact(artifact);
+    expect(app.state.files.preview).toMatchObject({ kind: "image", mediaType, widthPixels: 6, heightPixels: 4 });
+    const descriptor = await app.openFilesImageGallery({ kind: "artifact", artifact });
+    const page = await app.loadImageGalleryPage(descriptor.leaseId, 0);
+    expect(page).toMatchObject({ sourceMediaType: mediaType, annotatable: true, addable: false });
+    app.confirmImageGalleryPageDecoded(descriptor.leaseId, page.leaseId, page.pageId,
+      { width: 6, height: 4, mediaType, isAnimated: false });
+    const original = await app.prepareImageOutput(page.leaseId,
+      { width: 6, height: 4, mediaType, isAnimated: false });
+    expect(original.bytes).toEqual(bytes); expect(original.sha256Hex).toBe(sha256Hex);
+    await expect(app.addImageGalleryPageToComposer(descriptor.leaseId, page.leaseId))
+      .rejects.toThrow(/attachment policy/u);
+    const rendered = Uint8Array.from(await sharp({
+      create: { width: 6, height: 4, channels: 3, background: "#ff9800" }
+    }).png().toBuffer());
+    const strokes = [{ points: [{ x: 0.2, y: 0.3 }, { x: 0.8, y: 0.7 }] }];
+    const committed = await app.commitImageGalleryPageToComposer(descriptor.leaseId, page.leaseId, strokes,
+      { bytes: rendered, mediaType: "image/png", width: 6, height: 4 });
+    const attachment = committed.attachments[0]!;
+    expect(attachment).toMatchObject({ mediaType: "image/png", fileName: "design-annotated.png",
+      annotation: { strokes, source: { mediaType, fileName, byteSize: bytes.byteLength, sha256Hex } } });
+    expect(attachment.annotation).toBeDefined();
+    expect(fixture.bytes.get(attachment.annotation!.source.storageId)).toEqual(bytes);
+    const editor = await app.openComposerImageEditor({ surface: "task", attachmentId: attachment.attachmentId });
+    expect(editor).toMatchObject({ sourceMediaType: mediaType, sourceBase64: Buffer.from(bytes).toString("base64"),
+      initialStrokes: strokes, annotatable: true });
+    await expect(app.commitComposerImageEditor(editor.leaseId, [])).rejects.toThrow(/cannot be rendered/u);
+    const restored = await app.commitComposerImageEditor(editor.leaseId, [], {
+      bytes: rendered, mediaType: "image/png", width: 6, height: 4
+    });
+    expect(restored.draft.attachments[0]).toMatchObject({ mediaType: "image/png", fileName: "design.png" });
+    expect(restored.draft.attachments[0]!.annotation).toBeUndefined();
+    expect(blob).toMatchObject({ mediaType, fileName, sha256Hex });
     expect(network.submit).not.toHaveBeenCalled(); expect(network.uploadBlob).not.toHaveBeenCalled();
   });
 

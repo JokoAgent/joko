@@ -141,6 +141,11 @@ export function canAnnotateMobileImage(mediaType: string): boolean {
   return normalized.startsWith("image/") && normalized !== "image/gif" && normalized !== "image/svg+xml";
 }
 
+export function mobileImageRequiresNativeRaster(mediaType: string): boolean {
+  const normalized = mediaType.trim().toLowerCase();
+  return normalized === "image/tiff" || normalized === "image/heic" || normalized === "image/heif";
+}
+
 export function mobileAnnotationOutputMediaType(sourceMediaType: string): "image/jpeg" | "image/png" {
   return sourceMediaType.trim().toLowerCase() === "image/jpeg" ? "image/jpeg" : "image/png";
 }

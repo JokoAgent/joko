@@ -263,6 +263,7 @@ import {
   MOBILE_ANNOTATION_MAX_BURN_DIMENSION,
   canAnnotateMobileImage,
   encodeMobileBase64,
+  mobileImageRequiresNativeRaster,
   mobileAnnotationOutputMediaType,
   normalizeMobileAnnotationStrokes,
   sniffMobileImageMediaType,
@@ -270,6 +271,7 @@ import {
 } from "./mobile-image-annotation";
 import {
   mobileAnnotatedImageFileName,
+  mobileRasterizedImageFileName,
   type MobileBurnedImage,
   type MobileComposerImageCommitResult,
   type MobileComposerImageEditorRequest,
@@ -5340,10 +5342,15 @@ export class MobileClient {
       ? filesAttachmentMetadata(page.blob.fileName || page.title, page.mediaType, BigInt(page.byteSize), lease.draft.attachments, controls)
       : undefined;
     let annotatable = false;
-    if (metadata && controls && !decoded.animated && !decoded.originalOnly && canAnnotateMobileImage(page.mediaType)) {
+    if (controls && controls.surfaceOwnerKey === lease.attachmentOwnerKey
+      && (metadata !== undefined || mobileImageRequiresNativeRaster(page.mediaType))
+      && !decoded.animated && !decoded.originalOnly && canAnnotateMobileImage(page.mediaType)) {
       try {
         assertMobileAttachmentCandidate({
-          fileName: mobileAnnotatedImageFileName(metadata.fileName, mobileAnnotationOutputMediaType(page.mediaType)),
+          fileName: mobileAnnotatedImageFileName(
+            metadata?.fileName ?? mobileImageOutputFileName(page.blob.fileName || page.title, page.mediaType),
+            mobileAnnotationOutputMediaType(page.mediaType)
+          ),
           mediaType: mobileAnnotationOutputMediaType(page.mediaType),
           byteSize: 1
         }, controls.policy);
@@ -7126,7 +7133,7 @@ export class MobileClient {
     let outputMediaType: string;
     let outputFileName: string;
     let outputSha256Hex: string;
-    if (exactStrokes.length === 0) {
+    if (exactStrokes.length === 0 && !mobileImageRequiresNativeRaster(lease.source.mediaType)) {
       outputBytes = Uint8Array.from(lease.sourceBytes);
       outputMediaType = lease.source.mediaType;
       outputFileName = lease.source.fileName;
@@ -7149,7 +7156,9 @@ export class MobileClient {
       }
       outputBytes = Uint8Array.from(burned.bytes);
       outputMediaType = burned.mediaType;
-      outputFileName = mobileAnnotatedImageFileName(lease.source.fileName, burned.mediaType);
+      outputFileName = exactStrokes.length > 0
+        ? mobileAnnotatedImageFileName(lease.source.fileName, burned.mediaType)
+        : mobileRasterizedImageFileName(lease.source.fileName, burned.mediaType);
       outputSha256Hex = await this.attachmentFiles.digestOwnedBytes(outputBytes, signal);
     }
     assertMobileAttachmentCandidate({
@@ -9781,15 +9790,21 @@ export class MobileClient {
       lease.draft.attachments,
       controls
     );
-    if (!originalMetadata) throw new Error("This gallery image no longer fits the current attachment policy.");
+    if (!originalMetadata
+      && (!mobileImageRequiresNativeRaster(loaded.page.mediaType) || exactStrokes.length === 0)) {
+      throw new Error("This gallery image no longer fits the current attachment policy.");
+    }
+    const originalFileName = originalMetadata?.fileName
+      ?? mobileImageOutputFileName(loaded.page.blob.fileName || loaded.page.title, loaded.page.mediaType);
+    const originalMediaType = originalMetadata?.mediaType ?? loaded.page.mediaType;
     if (this.#imageGallery !== lease || lease.operationInFlight) {
       throw new Error("This gallery image is already being added or no longer owns the composer.");
     }
     lease.operationInFlight = true;
     try {
       let outputBytes = Uint8Array.from(loaded.bytes);
-      let outputMediaType: string = originalMetadata.mediaType;
-      let outputFileName = originalMetadata.fileName;
+      let outputMediaType: string = originalMediaType;
+      let outputFileName = originalFileName;
       let outputSha256Hex = loaded.page.sha256Hex;
       if (exactStrokes.length > 0) {
         if (loaded.decoded.animated || loaded.decoded.originalOnly || !canAnnotateMobileImage(loaded.page.mediaType) || !burned) {
@@ -9807,7 +9822,7 @@ export class MobileClient {
         }
         outputBytes = Uint8Array.from(burned.bytes);
         outputMediaType = burned.mediaType;
-        outputFileName = mobileAnnotatedImageFileName(originalMetadata.fileName, burned.mediaType);
+        outputFileName = mobileAnnotatedImageFileName(originalFileName, burned.mediaType);
         outputSha256Hex = await this.attachmentFiles.digestOwnedBytes(outputBytes, signal);
       }
       assertMobileAttachmentCandidate({
@@ -9821,8 +9836,8 @@ export class MobileClient {
           this.newId,
           ...mobileComposerAttachmentStorageIds(lease.draft.attachments)
         ),
-        fileName: originalMetadata.fileName,
-        mediaType: originalMetadata.mediaType,
+        fileName: originalFileName,
+        mediaType: originalMediaType,
         byteSize: loaded.page.byteSize,
         sha256Hex: loaded.page.sha256Hex,
         capturedAtUnixMs: this.now()

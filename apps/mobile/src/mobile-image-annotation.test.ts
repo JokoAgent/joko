@@ -7,6 +7,7 @@ import {
   decodeMobileBase64,
   encodeMobileBase64,
   mobileAnnotationDisplayRect,
+  mobileImageRequiresNativeRaster,
   mobileAnnotationStrokePath,
   normalizeMobileAnnotationPoint,
   normalizeMobileAnnotationStrokes,
@@ -47,6 +48,15 @@ describe("mobile image annotation", () => {
     expect(canAnnotateMobileImage("image/gif")).toBe(false);
     expect(canAnnotateMobileImage("image/svg+xml")).toBe(false);
     expect(canAnnotateMobileImage("video/mp4")).toBe(false);
+  });
+
+  it("uses native SDK rasterization only for supported static containers", () => {
+    for (const mediaType of ["image/tiff", "image/heic", "image/heif"]) {
+      expect(mobileImageRequiresNativeRaster(mediaType)).toBe(true);
+    }
+    for (const mediaType of ["image/png", "image/avif", "image/gif", "image/bmp", "image/x-unknown"]) {
+      expect(mobileImageRequiresNativeRaster(mediaType)).toBe(false);
+    }
   });
 
   it("uses a bounded isolated burn protocol", () => {
