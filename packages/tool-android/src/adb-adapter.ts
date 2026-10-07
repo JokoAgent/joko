@@ -576,12 +576,20 @@ function readXmlAttribute(attributes: string, name: string): string | undefined 
 }
 
 function decodeXml(value: string): string {
-  return value
-    .replace(/&quot;/gu, "\"")
-    .replace(/&apos;/gu, "'")
-    .replace(/&lt;/gu, "<")
-    .replace(/&gt;/gu, ">")
-    .replace(/&amp;/gu, "&");
+  return value.replace(/&(?:quot|apos|lt|gt|amp|#[0-9]+|#x[0-9a-fA-F]+);/gu, (reference) => {
+    if (reference === "&quot;") return "\"";
+    if (reference === "&apos;") return "'";
+    if (reference === "&lt;") return "<";
+    if (reference === "&gt;") return ">";
+    if (reference === "&amp;") return "&";
+    const hexadecimal = reference.startsWith("&#x");
+    const scalar = Number.parseInt(reference.slice(hexadecimal ? 3 : 2, -1), hexadecimal ? 16 : 10);
+    const legal = scalar === 0x9 || scalar === 0xa || scalar === 0xd
+      || scalar >= 0x20 && scalar <= 0xd7ff
+      || scalar >= 0xe000 && scalar <= 0xfffd
+      || scalar >= 0x10000 && scalar <= 0x10ffff;
+    return legal ? String.fromCodePoint(scalar) : reference;
+  });
 }
 
 function isPng(buffer: Buffer): boolean {
