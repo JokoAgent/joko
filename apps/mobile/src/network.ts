@@ -12,6 +12,7 @@ import {
   projectVoiceDictionaryReadOnly, type VoiceDictionaryReadOnlyView,
   WorktreeEligibility, WorktreeService,
   TransferDirection, WorkspaceEntryListingPolicy, WorkspaceFileChangeKind, WorkspaceService,
+  SubagentService, type BackgroundTask, type SubagentRun, type SubagentRunDetail, type SubagentTranscriptEntry,
   JOKO_API_VERSION, SessionMessageSearchSemanticMode, SessionMessageSearchSessionStatus,
   isPrivateLanDiscoveryHost, validateDiscoveredNode,
   type Artifact, type BlobRef, type BlobTransferTicket, type Connection, type Device, type DeviceNameSource, type DiscoveredNodeRecord, type ImageThumbnail,
@@ -123,6 +124,10 @@ export interface MobileNetwork {
   unregisterMobilePush(origin: string, ticket: MobilePushRevocationTicket, signal?: AbortSignal): Promise<void>;
   readSession(credential: PairedCredential, sessionId: string, signal?: AbortSignal): Promise<Snapshot>;
   readNativeSessionTree(credential: PairedCredential, sessionId: string, signal?: AbortSignal): Promise<NativeSessionTree>;
+  listBackgroundTasks(credential: PairedCredential, sessionId: string, pageToken?: string, signal?: AbortSignal): Promise<{ tasks: readonly BackgroundTask[]; nextPageToken: string }>;
+  listSubagentRuns(credential: PairedCredential, sessionId: string, pageToken?: string, signal?: AbortSignal): Promise<{ runs: readonly SubagentRun[]; nextPageToken: string }>;
+  getSubagentRun(credential: PairedCredential, sessionId: string, runId: string, signal?: AbortSignal): Promise<SubagentRunDetail>;
+  listSubagentTranscript(credential: PairedCredential, sessionId: string, runId: string, childId?: string, pageToken?: string, signal?: AbortSignal): Promise<{ entries: readonly SubagentTranscriptEntry[]; nextPageToken: string; tailPageToken: string }>;
   readHistory(credential: PairedCredential, sessionId: string, before?: EventCursor, signal?: AbortSignal): Promise<{ events: Event[]; before?: EventCursor }>;
   readAround(credential: PairedCredential, sessionId: string, eventId: string, signal?: AbortSignal): Promise<Event[]>;
   searchSessionMessages(credential: PairedCredential, query: string, status: SessionMessageSearchSessionStatus, signal?: AbortSignal): Promise<readonly SessionMessageSearchMatch[]>;
@@ -1207,6 +1212,44 @@ export const mobileNetwork: MobileNetwork = {
       .getNativeSessionTree({ sessionId }, options(signal));
     if (!response.tree) throw new Error("The Joko node returned no native branch tree.");
     return response.tree;
+  },
+  async listBackgroundTasks(credential, sessionId, pageToken = "", signal) {
+    signal?.throwIfAborted();
+    if (!sessionId) throw new Error("A current task is required for background activity.");
+    const response = await createClient(SessionService, transport(credential.origin, credential.authKey))
+      .listBackgroundTasks({ sessionId, page: { pageToken, pageSize: 100 } }, options(signal));
+    if (response.backgroundTasks.some((task) => !task.backgroundTaskId || task.sessionId !== sessionId)) {
+      throw new Error("The background activity response belongs to another task.");
+    }
+    return { tasks: response.backgroundTasks, nextPageToken: response.page?.nextPageToken ?? "" };
+  },
+  async listSubagentRuns(credential, sessionId, pageToken = "", signal) {
+    signal?.throwIfAborted();
+    if (!sessionId) throw new Error("A current task is required for delegated activity.");
+    const response = await createClient(SubagentService, transport(credential.origin, credential.authKey))
+      .listSubagentRuns({ sessionId, page: { pageToken, pageSize: 100 } }, options(signal));
+    if (response.runs.some((run) => !run.subagentRunId || run.sessionId !== sessionId)) {
+      throw new Error("The delegated activity response belongs to another task.");
+    }
+    return { runs: response.runs, nextPageToken: response.page?.nextPageToken ?? "" };
+  },
+  async getSubagentRun(credential, sessionId, runId, signal) {
+    signal?.throwIfAborted();
+    if (!sessionId || !runId) throw new Error("An exact delegated run is required.");
+    const response = await createClient(SubagentService, transport(credential.origin, credential.authKey))
+      .getSubagentRun({ sessionId, subagentRunId: runId }, options(signal));
+    if (!response.run?.run || response.run.run.sessionId !== sessionId || response.run.run.subagentRunId !== runId) {
+      throw new Error("The delegated detail response belongs to another run.");
+    }
+    return response.run;
+  },
+  async listSubagentTranscript(credential, sessionId, runId, childId = "", pageToken = "", signal) {
+    signal?.throwIfAborted();
+    if (!sessionId || !runId) throw new Error("An exact delegated run is required.");
+    const response = await createClient(SubagentService, transport(credential.origin, credential.authKey))
+      .listSubagentTranscript({ sessionId, subagentRunId: runId, childId, page: { pageToken, pageSize: 200 } }, options(signal));
+    if (response.entries.some((entry) => !entry.entryId || entry.sequence < 0n)) throw new Error("The delegated transcript contains an invalid entry.");
+    return { entries: response.entries, nextPageToken: response.page?.nextPageToken ?? "", tailPageToken: response.tailPageToken };
   },
   async readHistory(credential, sessionId, before, signal) {
     const response = await createClient(SessionService, transport(credential.origin, credential.authKey)).listSessionTimeline({

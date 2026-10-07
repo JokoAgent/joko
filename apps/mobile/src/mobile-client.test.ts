@@ -1,4 +1,5 @@
 import { clone, create, fromBinary, toBinary } from "@bufbuild/protobuf";
+import { BackgroundTaskSchema, SubagentRunSchema, SubagentRunDetailSchema, SubagentTranscriptEntrySchema } from "@joko/contracts";
 import { Code } from "@connectrpc/connect";
 import { createHash } from "node:crypto";
 import sharp from "sharp";
@@ -950,6 +951,10 @@ function fakeNetwork(): MobileNetwork {
     })),
     unregisterMobilePush: vi.fn(async () => undefined),
     readSession: vi.fn(async () => snapshot),
+    listBackgroundTasks: vi.fn(async () => ({ tasks: [], nextPageToken: "" })),
+    listSubagentRuns: vi.fn(async () => ({ runs: [], nextPageToken: "" })),
+    getSubagentRun: vi.fn(async () => { throw new Error("No delegated run fixture was configured."); }),
+    listSubagentTranscript: vi.fn(async () => ({ entries: [], nextPageToken: "", tailPageToken: "" })),
     readNativeSessionTree: vi.fn(async () => create(NativeSessionTreeSchema, {
       sessionId: "session",
       activeEntryId: "native-current",
@@ -1646,6 +1651,59 @@ function committedAttachment(attachment: MobileLocalComposerAttachment) {
     disposition: BlobDisposition.ATTACHMENT
   });
 }
+
+describe("mobile current task delegated reads", () => {
+  function delegatedNetwork() {
+    const network = fakeNetwork();
+    const owner = create(SnapshotSchema, { ...snapshot, scope: create(SnapshotScopeSchema, { kind: { case: "owner", value: create(OwnerSnapshotScopeSchema) } }),
+      backends: [create(BackendDescriptorSchema, { ...snapshot.backends[0]!, capabilities: create(CapabilityManifestSchema, { capabilities: [capabilityNames.backgroundTasks, capabilityNames.subagentsList,
+        capabilityNames.subagentsDetail, capabilityNames.subagentsTranscript].map((name) => create(CapabilitySchema, { name, support: CapabilitySupport.SUPPORTED })) }) })] });
+    const detail = create(SnapshotSchema, { ...owner, scope: create(SnapshotScopeSchema, { kind: { case: "session", value: create(SessionSnapshotScopeSchema, { sessionId: "session" }) } }) });
+    network.readOwner = vi.fn(async () => ({ connection, device, snapshot: owner }));
+    network.readSession = vi.fn(async () => detail);
+    return { network, owner, detail };
+  }
+
+  it("reads typed Session scoped background/run/detail/child pages only through the current authenticated owner", async () => {
+    const { network } = delegatedNetwork();
+    network.listBackgroundTasks = vi.fn(async () => ({ tasks: [create(BackgroundTaskSchema, { backgroundTaskId: "background", sessionId: "session" })], nextPageToken: "background-next" }));
+    network.listSubagentRuns = vi.fn(async () => ({ runs: [create(SubagentRunSchema, { subagentRunId: "run", sessionId: "session" })], nextPageToken: "runs-next" }));
+    network.getSubagentRun = vi.fn(async () => create(SubagentRunDetailSchema, { run: { subagentRunId: "run", sessionId: "session" } }));
+    network.listSubagentTranscript = vi.fn(async () => ({ entries: [create(SubagentTranscriptEntrySchema, { entryId: "entry", sequence: 2n })], nextPageToken: "more", tailPageToken: "tail" }));
+    const app = client(network, memoryStorage(credential).storage); await app.start();
+    const controls = app.taskDelegatedControls(); expect(controls).toBeDefined();
+    expect(await app.loadTaskBackgroundTasks(controls!.authorityKey, "background-token")).toMatchObject({ nextPageToken: "background-next" });
+    expect(await app.loadTaskDelegatedRuns(controls!.authorityKey, "run-token")).toMatchObject({ nextPageToken: "runs-next" });
+    await app.loadTaskDelegatedDetail(controls!.authorityKey, "run");
+    await app.loadTaskDelegatedTranscript(controls!.authorityKey, "run", "child", "page-token");
+    expect(network.listBackgroundTasks).toHaveBeenCalledExactlyOnceWith(credential, "session", "background-token", expect.any(AbortSignal));
+    expect(network.listSubagentRuns).toHaveBeenCalledExactlyOnceWith(credential, "session", "run-token", expect.any(AbortSignal));
+    expect(network.getSubagentRun).toHaveBeenCalledExactlyOnceWith(credential, "session", "run", expect.any(AbortSignal));
+    expect(network.listSubagentTranscript).toHaveBeenCalledExactlyOnceWith(credential, "session", "run", "child", "page-token", expect.any(AbortSignal));
+    await expect(app.loadTaskDelegatedRuns("other-owner")).rejects.toThrow("owner");
+    expect(network.listSubagentRuns).toHaveBeenCalledOnce();
+  });
+
+  it("cancels caller reads and rejects late responses after foreground retirement without granting unsupported detail", async () => {
+    const { network, owner, detail } = delegatedNetwork();
+    network.getSubagentRun = vi.fn(() => { throw new Error("must not read unsupported detail"); });
+    owner.backends[0]!.capabilities!.capabilities = owner.backends[0]!.capabilities!.capabilities.filter((value) => value.name !== capabilityNames.subagentsDetail);
+    detail.backends = owner.backends;
+    const app = client(network, memoryStorage(credential).storage); await app.start();
+    const controls = app.taskDelegatedControls()!; expect(controls.canReadDetail).toBe(false);
+    await expect(app.loadTaskDelegatedDetail(controls.authorityKey, "run")).rejects.toThrow("unavailable");
+    expect(network.getSubagentRun).not.toHaveBeenCalled();
+    let resolve!: (page: { runs: ReturnType<typeof create<typeof SubagentRunSchema>>[]; nextPageToken: string }) => void;
+    let signal!: AbortSignal;
+    network.listSubagentRuns = vi.fn((_credential, _sessionId, _token, activeSignal) => {
+      signal = activeSignal!; return new Promise<Awaited<ReturnType<MobileNetwork["listSubagentRuns"]>>>((finish) => { resolve = finish; });
+    });
+    const caller = new AbortController(); const pending = app.loadTaskDelegatedRuns(controls.authorityKey, "", caller.signal);
+    caller.abort(); expect(signal.aborted).toBe(true); app.setForeground(false);
+    expect(app.taskDelegatedControls()).toBeUndefined(); resolve({ runs: [], nextPageToken: "" });
+    await expect(pending).rejects.toThrow("owner changed");
+  });
+});
 
 const clients: MobileClient[] = [];
 function client(

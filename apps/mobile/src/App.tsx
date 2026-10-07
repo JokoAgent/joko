@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore, type RefObject } from "react";
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore, type ReactElement, type ReactNode, type RefObject } from "react";
 import {
   AccessibilityInfo, ActivityIndicator, Alert, AppState, BackHandler, FlatList, Keyboard, Linking, Modal, PanResponder, Platform,
   Image, Pressable, ScrollView, SectionList, StyleSheet, Text, TextInput, findNodeHandle, useColorScheme,
@@ -150,7 +150,15 @@ import {
 } from "./composer-layout";
 import { MobileKeyboardAvoidingView, useMobileKeyboardState } from "./MobileKeyboardAvoidingView";
 import { timelineRows, type TimelineRow } from "./timeline";
+import { MobileThinkingCard } from "./MobileThinkingCard";
+import { MobileWorkGroupCard } from "./MobileWorkGroupCard";
+import { isWorkGroup, mobileWorkContains, mobileWorkExpansionKeys, mobileWorkItems, type MobileWorkItem } from "./mobile-work-projection";
+import { mobileExpandedBlockStore } from "./mobile-expanded-block-memory";
 import { MobileToolCallCard } from "./MobileToolCallCard";
+import { MobileDelegatedTaskCard } from "./MobileDelegatedTaskCard";
+import { mobileDelegatedTimelineAffinity, projectMobileDelegated, type MobileDelegatedEntry } from "./mobile-delegated";
+import { useMobileDelegatedTasks } from "./mobile-delegated-reader";
+import { mobileDelegatedTaskMessage } from "./mobile-delegated-task-messages";
 import {
   appendMobileOptimisticUserRow,
   markMobileOptimisticUserRowSubmitted,
@@ -3224,13 +3232,14 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
   const taskMountedRef = useRef(true);
   const copyGenerationRef = useRef(0);
   const copyInFlightRef = useRef(false);
-  const timelineListRef = useRef<FlatList<TimelineRow>>(null);
+  const timelineListRef = useRef<FlatList<MobileWorkItem<TimelineRow>>>(null);
   const timelineViewportRef = useRef<View>(null);
   const [imageViewportPulse, setImageViewportPulse] = useState(0);
   const [visibleImageRows, setVisibleImageRows] = useState<ReadonlySet<string>>(new Set());
   const imageViewability = useRef({ itemVisiblePercentThreshold: 1, minimumViewTime: 80 }).current;
-  const onImageRowsVisible = useRef(({ viewableItems }: { readonly viewableItems: readonly { readonly item: TimelineRow; readonly isViewable: boolean }[] }) => {
-    const next = new Set(viewableItems.filter((item) => item.isViewable).map((item) => item.item.id));
+  const onImageRowsVisible = useRef(({ viewableItems }: { readonly viewableItems: readonly { readonly item: MobileWorkItem<TimelineRow>; readonly isViewable: boolean }[] }) => {
+    const rowIds = (item: MobileWorkItem<TimelineRow>): string[] => isWorkGroup(item) ? item.children.flatMap(rowIds) : [item.id];
+    const next = new Set(viewableItems.filter((item) => item.isViewable).flatMap((item) => rowIds(item.item)));
     setVisibleImageRows((previous) => previous.size === next.size && [...next].every((id) => previous.has(id)) ? previous : next);
   }).current;
   const screenshotMessageViewsRef = useRef(new Map<string, View>());
@@ -3332,11 +3341,23 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
   const pendingDrawerActionRef = useRef<(() => void) | undefined>(undefined);
   const session = state.detail?.sessions.find((item) => item.sessionId === state.selectedId)
     || state.owner?.sessions.find((item) => item.sessionId === state.selectedId);
-  const latestObservedRows = useMemo(() => timelineRows([
+  const actualSessionStreaming = state.status === "connected" && session?.state === SessionState.RUNNING;
+  const blockOwnerKey = JSON.stringify([state.activeProfileId ?? "", state.selectedId ?? "", session?.backendId ?? "",
+    session?.targetId ?? "", session?.nativeBinding?.runtimeGeneration.toString() ?? ""]);
+  const delegatedControls = state.status === "connected" ? client.taskDelegatedControls() : undefined;
+  const taskTimelineEvents = useMemo(() => [
     ...(state.window === undefined ? state.older : []),
     ...(state.detail?.timeline ?? []),
     ...state.live
-  ]), [state.detail?.timeline, state.live, state.older, state.window]);
+  ], [state.detail?.timeline, state.live, state.older, state.window]);
+  const delegated = useMobileDelegatedTasks(client, delegatedControls, taskTimelineEvents, state.detail?.backgroundTasks);
+  const delegatedEntries = useMemo(() => delegatedControls && delegated.ownerKey === delegatedControls.surfaceOwnerKey
+    ? delegated.entries : [], [delegated.entries, delegated.ownerKey, delegatedControls?.surfaceOwnerKey]);
+  const delegatedAffinity = useMemo(() => mobileDelegatedTimelineAffinity(state.selectedId ?? "",
+    delegatedControls?.generation ?? state.detail?.generation ?? 0n, state.window ?? taskTimelineEvents, delegatedEntries),
+  [delegatedControls?.generation, delegatedEntries, state.detail?.generation, state.selectedId, state.window, taskTimelineEvents]);
+  const latestObservedRows = useMemo(() => timelineRows(taskTimelineEvents, actualSessionStreaming),
+    [actualSessionStreaming, taskTimelineEvents]);
   const observedRows = useMemo(() => state.window === undefined
     ? latestObservedRows
     : timelineRows(state.window), [latestObservedRows, state.window]);
@@ -3347,7 +3368,7 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
       ? []
       : optimisticUserRows.filter((entry) => entry.ownerKey === optimisticOwnerKey),
   [optimisticOwnerKey, optimisticUserRows, state.status]);
-  const rows = useMemo(() => state.window !== undefined
+  const messageRows = useMemo(() => state.window !== undefined
     ? observedRows
     : optimisticOwnerKey === undefined && state.status !== "connecting"
       ? observedRows
@@ -3357,6 +3378,14 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
         optimisticOwnerKey ?? ownerOptimisticRows[0]?.ownerKey ?? "",
         state.selectedId ?? ""
       ), [observedRows, optimisticOwnerKey, ownerOptimisticRows, state.selectedId, state.status, state.window]);
+  const rows = useMemo(() => messageRows.flatMap((row) => {
+    const attached = delegatedAffinity.byEventId.get(row.eventId);
+    if (delegatedAffinity.suppressedMetadataEventIds.has(row.eventId) && !attached?.length) return [];
+    const persistentTask = attached?.some((entry) => ["queued", "running", "waiting"].includes(projectMobileDelegated(entry).state));
+    return [persistentTask ? { ...row, persistentTask: true } : row];
+  }), [delegatedAffinity, messageRows]);
+  const displayRows = useMemo(() => mobileWorkItems(rows, actualSessionStreaming && state.window === undefined),
+    [actualSessionStreaming, rows, state.window]);
   const activeOptimisticOperationIds = useMemo(() => new Set([
     ...state.pending.filter((item) => item.kind === "send" && item.sessionId === state.selectedId
       && item.state === "accepted").map((item) => item.operationId),
@@ -3380,10 +3409,16 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
   const activeMessageFocus = messageFocus?.sessionId === state.selectedId ? messageFocus : undefined;
   const messageFocusIndex = activeMessageFocus === undefined
     ? -1
-    : rows.findIndex((row) => mobileNativeIntentMessageMatches(activeMessageFocus, row));
+    : displayRows.findIndex((item) => mobileWorkContains(item,
+      (row) => mobileNativeIntentMessageMatches(activeMessageFocus, row)));
   const messageFocusKey = messageFocus && messageFocusIndex >= 0
     ? `${messageFocus.requestId}\u001f${messageFocus.messageId}\u001f${messageFocus.messageEventId ?? ""}`
     : undefined;
+  const focusedWorkKey = JSON.stringify(activeMessageFocus === undefined ? [] : mobileWorkExpansionKeys(displayRows,
+    (row) => mobileNativeIntentMessageMatches(activeMessageFocus, row)));
+  useEffect(() => {
+    for (const key of JSON.parse(focusedWorkKey) as string[]) mobileExpandedBlockStore.setExpanded(blockOwnerKey, key, true);
+  }, [blockOwnerKey, focusedWorkKey]);
   useEffect(() => {
     if (messageFocusKey === undefined || messageFocusIndex < 0) {
       setMessageFocusHighlight(undefined);
@@ -5268,6 +5303,152 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
     pendingDrawerActionRef.current = action;
     setDrawerOpen(false);
   };
+  const renderTimelineImage = (item: TimelineRow, image: NonNullable<TimelineRow["images"]>[number], index: number): ReactNode => <MobileTimelineImage key={image.pageId} client={client} page={image}
+            eventId={image.sourceEventId ?? item.eventId} ownerKey={client.timelineImagePreviewOwnerKey()}
+            eligible={visibleImageRows.has(item.id) && state.status === "connected" && !drawerOpen && !messageActionsVisible && !taskActionsVisible
+              && !interactionVisible && !contextVisible && imageGallery.view === undefined && imageEditorLease === undefined && photoLibraryLease === undefined}
+            viewportRef={timelineViewportRef} viewportPulse={imageViewportPulse} maximumWidth={width - safeArea.left - safeArea.right - 64}
+            colors={colors} locale={locale} openLabel={mobileMessage(locale, "task.openImage", { index: index + 1, count: (item.images?.length ?? 1), name: image.title })}
+            disabled={galleryOpening || imageGallery.view !== undefined || state.status !== "connected" || attachmentBusy || voice.busy}
+            onOpen={() => openTimelineImage(item, image)} />;
+  const renderTimelineArtifact = (artifact: NonNullable<TimelineRow["artifacts"]>[number]): ReactNode => {
+            const disabled = state.timelinePreview !== undefined || galleryOpening || imageGallery.view !== undefined
+              || state.status !== "connected" || state.busy || attachmentBusy || voice.busy || fileShareBusy;
+            const detail = <>
+              <Text style={styles.messageImageGlyph}>{artifact.previewKind === "pdf" ? "▤"
+                : artifact.previewKind === "model" ? "⬡" : artifact.previewKind === "media" ? "▶" : "◆"}</Text>
+              <View style={styles.fill}>
+                <Text style={[styles.label, { color: colors.ink }]} numberOfLines={1}>{artifact.title}</Text>
+                <Text style={[styles.caption, { color: colors.muted }]} numberOfLines={1}>
+                  {artifact.mediaType} · {formatByteSize(artifact.byteSize)}
+                </Text>
+              </View>
+              <Text style={[styles.caption, { color: artifact.previewKind ? colors.accent : colors.muted }]}>
+                {mobileMessage(locale, artifact.previewKind ? "common.open" : "task.fileFallback")}
+              </Text>
+            </>;
+            return <View key={artifact.artifactId} style={styles.fileActionRow}>
+              {artifact.previewKind ? <Pressable accessibilityRole="button"
+                accessibilityLabel={mobileMessage(locale, "task.openFile", { name: artifact.title, type: artifact.mediaType })}
+                accessibilityHint={mobileMessage(locale, "task.openFileHint")}
+                disabled={disabled} onPress={() => openTimelineArtifact(artifact)}
+                style={[styles.messageImageTile, styles.fileRowMain,
+                  { borderColor: colors.border, backgroundColor: colors.background }, disabled && styles.disabled]}>
+                {detail}
+              </Pressable> : <View accessible accessibilityLabel={`${artifact.title}, ${artifact.mediaType}`}
+                style={[styles.messageImageTile, styles.fileRowMain,
+                  { borderColor: colors.border, backgroundColor: colors.background }, disabled && styles.disabled]}>
+                {detail}
+              </View>}
+              <Action label={mobileMessage(locale, fileShareBusy ? "image.sharing" : "common.share")}
+                accessibilityLabel={mobileMessage(locale, "task.shareFile", { name: artifact.title })} compact colors={colors} disabled={disabled}
+                onPress={() => shareTimelineArtifact(artifact)} />
+            </View>;
+
+  };
+  const renderDelegatedCard = (entry: MobileDelegatedEntry): ReactElement | undefined => delegatedControls
+    ? <MobileDelegatedTaskCard key={entry.key} entry={entry} entries={delegatedEntries} readClient={client}
+      controls={delegatedControls} colors={colors} locale={locale} enabled={state.status === "connected"} />
+    : undefined;
+  const renderTimelineItem = (item: MobileWorkItem<TimelineRow>, compactThinking = false): ReactElement => {
+    if (isWorkGroup(item)) return <MobileWorkGroupCard blockKey={item.id} ownerKey={blockOwnerKey} streaming={item.streaming}
+      enabled={state.status === "connected" || state.status === "offline"} colors={colors} locale={locale}>
+      {item.children.map((child) => <Fragment key={child.id}>{renderTimelineItem(child, true)}</Fragment>)}
+    </MobileWorkGroupCard>;
+        const delegatedCards = delegatedAffinity.byEventId.get(item.eventId) ?? [];
+        const delegatedOnly = delegatedCards.length > 0 && item.tool === undefined;
+        const linked = item.optimistic !== true && messageFocusHighlight === messageFocusKey && messageFocus !== undefined
+          && mobileNativeIntentMessageMatches(messageFocus, item);
+        const markdownOwnerKey = `${state.activeProfileId}/${state.selectedId}/${session?.nativeBinding?.runtimeGeneration}/${item.id}`;
+        return <View accessibilityLiveRegion={linked ? "polite" : undefined}
+          collapsable={false} ref={(view) => {
+            if (view && mobileMessageShareable(item)) screenshotMessageViewsRef.current.set(item.id, view);
+            else screenshotMessageViewsRef.current.delete(item.id);
+          }}
+          style={[styles.message, linked && styles.messageFocused,
+            { backgroundColor: linked ? colors.brandBackground : colors.surface,
+              borderColor: linked ? colors.accent : colors.border }]}>
+        {linked && <Text style={[styles.caption, { color: colors.accent }]}>
+          {mobileMessage(locale, "intent.linkedMessage", { label: item.label })}
+        </Text>}
+        {!delegatedOnly && <View style={styles.statusTitle}>
+          <Text style={[styles.caption, { color: colors.muted }]}>{item.label}{item.optimistic
+            ? ` · ${mobileMessage(locale, "common.sending")}` : ""}</Text>
+          {item.optimistic && <ActivityIndicator size="small" color={colors.accent} />}
+          {conversationShare.active && mobileMessageShareable(item) && <Pressable accessibilityRole="checkbox"
+            accessibilityLabel={mobileMessage(locale, "share.selectMessage")}
+            accessibilityState={{ checked: conversationShare.selectedIds.includes(item.id), disabled: conversationShare.busy }}
+            disabled={conversationShare.busy} onPress={() => conversationShare.toggle(item.id)}
+            style={styles.inlineTouchAction}>
+            <Text style={[styles.label, { color: colors.accent }]}>{conversationShare.selectedIds.includes(item.id) ? "☑" : "☐"}</Text>
+          </Pressable>}
+        </View>}
+        <View pointerEvents={conversationShare.active ? "none" : "auto"}>
+        {delegatedOnly ? undefined : item.messageParts ? item.messageParts.map((part) => {
+          if (part.kind === "thinking") return <MobileThinkingCard key={part.thinking.key} thinking={part.thinking}
+            ownerKey={blockOwnerKey} colors={colors} locale={locale} enabled={state.status === "connected" || state.status === "offline"}
+            compact={compactThinking} />;
+          if (part.kind === "image") return renderTimelineImage(item, part.image,
+            item.images?.findIndex((image) => image.pageId === part.image.pageId) ?? 0);
+          if (part.kind === "artifact") return renderTimelineArtifact(part.artifact);
+          return <MobileMarkdownMessage key={`${markdownOwnerKey}/part/${part.contentIndex}`} text={part.text}
+            colors={colors} locale={locale} ownerKey={`${markdownOwnerKey}/part/${part.contentIndex}`}
+            resourceClient={client} messageId={item.id}
+            resourceOwnerKey={item.completed && !item.optimistic ? client.markdownResourceOwnerKey() : undefined}
+            onOpenImage={openMarkdownImage} onOpenPath={openMarkdownPath} />;
+        }) : item.tool ? <MobileToolCallCard key={markdownOwnerKey} call={item.tool} ownerKey={markdownOwnerKey} colors={colors} locale={locale}
+          enabled={state.status === "connected" || state.status === "offline"} />
+          : item.kind === "assistant" ? <MobileMarkdownMessage key={markdownOwnerKey} text={item.text} colors={colors} locale={locale}
+          ownerKey={markdownOwnerKey} resourceClient={client} messageId={item.id}
+          resourceOwnerKey={item.completed && !item.optimistic ? client.markdownResourceOwnerKey() : undefined}
+          onOpenImage={openMarkdownImage} onOpenPath={openMarkdownPath} />
+          : <Text selectable={!item.optimistic} style={[styles.body, { color: colors.ink }]}>{item.text}</Text>}
+        {delegatedCards.map(renderDelegatedCard)}
+        {item.partnerPrivatePreview && <Pressable accessibilityRole="button"
+          accessibilityLabel={`${mobileMessage(locale, "partner.openThread")} · ${item.partnerPrivatePreview.targetName}`}
+          accessibilityHint={mobileMessage(locale, "partner.readOnly")}
+          disabled={state.status !== "connected" || state.selectedId === undefined}
+          onPress={() => onOpenPartnerThread(item.partnerPrivatePreview!)}
+          style={[styles.messageImageTile, { borderColor: colors.border, backgroundColor: colors.background },
+            (state.status !== "connected" || state.selectedId === undefined) && styles.disabled]}>
+          <View style={styles.fill}>
+            <Text style={[styles.label, { color: colors.ink }]} numberOfLines={1}>
+              {item.partnerPrivatePreview.targetName}
+            </Text>
+            {item.partnerPrivatePreview.preview && <Text style={[styles.caption, { color: colors.muted }]} numberOfLines={2}>
+              {item.partnerPrivatePreview.preview}
+            </Text>}
+          </View>
+          <Text style={[styles.caption, { color: colors.accent }]}>{mobileMessage(locale, "partner.openThread")}</Text>
+        </Pressable>}
+        {!item.messageParts && item.images && item.images.length > 0 && <View accessibilityLabel={`${item.label} · ${mobileMessage(locale, "task.images", { count: item.images.length })}`} style={styles.messageImages}>
+          {item.images.map((image, index) => renderTimelineImage(item, image, index))}
+        </View>}
+        {!item.messageParts && item.artifacts && item.artifacts.length > 0 && <View accessibilityLabel={`${item.label} · ${mobileMessage(locale, "task.filesCount", { count: item.artifacts.length })}`} style={styles.messageImages}>
+          {item.artifacts.map((artifact) => renderTimelineArtifact(artifact))}
+        </View>}
+        {!delegatedOnly && !item.optimistic && !conversationShare.active && <View style={styles.messageActions}>
+          <Pressable accessibilityRole="button" accessibilityLabel={mobileMessage(locale, "task.viewContextFor", { name: item.label })}
+            disabled={state.historyBusy || state.status !== "connected"}
+            onPress={() => { setLocalError(""); void client.around(item.eventId).catch((error) => setLocalError(errorText(error))); }}
+            style={styles.inlineTouchAction}>
+            <Text style={[styles.caption, { color: colors.accent }]}>{mobileMessage(locale, "task.viewContext")}</Text>
+          </Pressable>
+           {buildMobileMessageActions(item, { canDelete: client.canDeleteMessage(item.eventId), locale, copyDisabled: copyBusy }).length > 0
+            && <Pressable accessibilityRole="button" accessibilityLabel={mobileMessage(locale, "task.moreFor", { name: item.label })}
+              disabled={(state.status !== "connected" && state.status !== "offline")
+                || (state.status === "connected" && voice.busy)}
+              onPress={() => openMessageActions(item)}
+              style={[styles.inlineTouchAction,
+                ((state.status !== "connected" && state.status !== "offline")
+                  || (state.status === "connected" && voice.busy)) && styles.disabled]}>
+              <Text style={[styles.caption, { color: (state.status !== "connected" && state.status !== "offline")
+                || (state.status === "connected" && voice.busy) ? colors.muted : colors.accent }]}>{mobileMessage(locale, "common.more")}</Text>
+            </Pressable>}
+        </View>}
+        </View>
+      </View>;
+  };
   return <View style={styles.fill}>
     <MobileKeyboardAvoidingView style={styles.fill} keyboard={keyboard} consumedBottomInset={safeArea.bottom}
       behavior={Platform.OS === "android" ? "height" : undefined}
@@ -5315,7 +5496,7 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
     </View>}
     {conversationShare.notice && <Banner text={conversationShare.notice} colors={colors} />}
     <View ref={timelineViewportRef} collapsable={false} style={styles.fill} onLayout={() => setImageViewportPulse((value) => value + 1)}>
-    <FlatList key={draftIdentityKey} ref={timelineListRef} data={rows}
+    <FlatList key={draftIdentityKey} ref={timelineListRef} data={displayRows}
       extraData={{ selection: conversationShare.selectedIds, visibleImageRows, imageViewportPulse }} keyExtractor={(row) => row.id} style={styles.fill} contentContainerStyle={styles.list}
       viewabilityConfig={imageViewability} onViewableItemsChanged={onImageRowsVisible}
       scrollEventThrottle={100} onScroll={() => setImageViewportPulse((value) => value + 1)}
@@ -5344,126 +5525,20 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
       </View>}
       ListEmptyComponent={<Centered label={mobileMessage(locale, state.status === "offline"
         ? state.detail ? "task.offlineEmpty" : "task.offlineMissing" : "task.empty")} colors={colors} />}
-      renderItem={({ item }) => {
-        const linked = item.optimistic !== true && messageFocusHighlight === messageFocusKey && messageFocus !== undefined
-          && mobileNativeIntentMessageMatches(messageFocus, item);
-        const markdownOwnerKey = `${state.activeProfileId}/${state.selectedId}/${session?.nativeBinding?.runtimeGeneration}/${item.id}`;
-        return <View accessibilityLiveRegion={linked ? "polite" : undefined}
-          collapsable={false} ref={(view) => {
-            if (view && mobileMessageShareable(item)) screenshotMessageViewsRef.current.set(item.id, view);
-            else screenshotMessageViewsRef.current.delete(item.id);
-          }}
-          style={[styles.message, linked && styles.messageFocused,
-            { backgroundColor: linked ? colors.brandBackground : colors.surface,
-              borderColor: linked ? colors.accent : colors.border }]}>
-        {linked && <Text style={[styles.caption, { color: colors.accent }]}>
-          {mobileMessage(locale, "intent.linkedMessage", { label: item.label })}
-        </Text>}
-        <View style={styles.statusTitle}>
-          <Text style={[styles.caption, { color: colors.muted }]}>{item.label}{item.optimistic
-            ? ` · ${mobileMessage(locale, "common.sending")}` : ""}</Text>
-          {item.optimistic && <ActivityIndicator size="small" color={colors.accent} />}
-          {conversationShare.active && mobileMessageShareable(item) && <Pressable accessibilityRole="checkbox"
-            accessibilityLabel={mobileMessage(locale, "share.selectMessage")}
-            accessibilityState={{ checked: conversationShare.selectedIds.includes(item.id), disabled: conversationShare.busy }}
-            disabled={conversationShare.busy} onPress={() => conversationShare.toggle(item.id)}
-            style={styles.inlineTouchAction}>
-            <Text style={[styles.label, { color: colors.accent }]}>{conversationShare.selectedIds.includes(item.id) ? "☑" : "☐"}</Text>
-          </Pressable>}
-        </View>
-        <View pointerEvents={conversationShare.active ? "none" : "auto"}>
-        {item.tool ? <MobileToolCallCard key={markdownOwnerKey} call={item.tool} ownerKey={markdownOwnerKey} colors={colors} locale={locale}
-          enabled={state.status === "connected" || state.status === "offline"} />
-          : item.kind === "assistant" ? <MobileMarkdownMessage key={markdownOwnerKey} text={item.text} colors={colors} locale={locale}
-          ownerKey={markdownOwnerKey} resourceClient={client} messageId={item.id}
-          resourceOwnerKey={item.completed && !item.optimistic ? client.markdownResourceOwnerKey() : undefined}
-          onOpenImage={openMarkdownImage} onOpenPath={openMarkdownPath} />
-          : <Text selectable={!item.optimistic} style={[styles.body, { color: colors.ink }]}>{item.text}</Text>}
-        {item.partnerPrivatePreview && <Pressable accessibilityRole="button"
-          accessibilityLabel={`${mobileMessage(locale, "partner.openThread")} · ${item.partnerPrivatePreview.targetName}`}
-          accessibilityHint={mobileMessage(locale, "partner.readOnly")}
-          disabled={state.status !== "connected" || state.selectedId === undefined}
-          onPress={() => onOpenPartnerThread(item.partnerPrivatePreview!)}
-          style={[styles.messageImageTile, { borderColor: colors.border, backgroundColor: colors.background },
-            (state.status !== "connected" || state.selectedId === undefined) && styles.disabled]}>
-          <View style={styles.fill}>
-            <Text style={[styles.label, { color: colors.ink }]} numberOfLines={1}>
-              {item.partnerPrivatePreview.targetName}
-            </Text>
-            {item.partnerPrivatePreview.preview && <Text style={[styles.caption, { color: colors.muted }]} numberOfLines={2}>
-              {item.partnerPrivatePreview.preview}
-            </Text>}
-          </View>
-          <Text style={[styles.caption, { color: colors.accent }]}>{mobileMessage(locale, "partner.openThread")}</Text>
-        </Pressable>}
-        {item.images && item.images.length > 0 && <View accessibilityLabel={`${item.label} · ${mobileMessage(locale, "task.images", { count: item.images.length })}`} style={styles.messageImages}>
-          {item.images.map((image, index) => <MobileTimelineImage key={image.pageId} client={client} page={image}
-            eventId={image.sourceEventId ?? item.eventId} ownerKey={client.timelineImagePreviewOwnerKey()}
-            eligible={visibleImageRows.has(item.id) && state.status === "connected" && !drawerOpen && !messageActionsVisible && !taskActionsVisible
-              && !interactionVisible && !contextVisible && imageGallery.view === undefined && imageEditorLease === undefined && photoLibraryLease === undefined}
-            viewportRef={timelineViewportRef} viewportPulse={imageViewportPulse} maximumWidth={width - safeArea.left - safeArea.right - 64}
-            colors={colors} locale={locale} openLabel={mobileMessage(locale, "task.openImage", { index: index + 1, count: item.images!.length, name: image.title })}
-            disabled={galleryOpening || imageGallery.view !== undefined || state.status !== "connected" || attachmentBusy || voice.busy}
-            onOpen={() => openTimelineImage(item, image)} />)}
+      ListFooterComponent={delegatedControls ? <View style={styles.list} pointerEvents={conversationShare.active ? "none" : "auto"}>
+        {delegatedAffinity.orphanEntries.map(renderDelegatedCard)}
+        {delegated.phase === "loading" && <View accessibilityLiveRegion="polite" style={styles.connectionNotice}>
+          <ActivityIndicator color={colors.muted} />
+          <Text style={[styles.caption, styles.fill, { color: colors.muted }]}>{mobileDelegatedTaskMessage(locale, "loading")}</Text>
+          <Action label={mobileDelegatedTaskMessage(locale, "cancel")} colors={colors} compact onPress={delegated.cancel} />
         </View>}
-        {item.artifacts && item.artifacts.length > 0 && <View accessibilityLabel={`${item.label} · ${mobileMessage(locale, "task.filesCount", { count: item.artifacts.length })}`} style={styles.messageImages}>
-          {item.artifacts.map((artifact) => {
-            const disabled = state.timelinePreview !== undefined || galleryOpening || imageGallery.view !== undefined
-              || state.status !== "connected" || state.busy || attachmentBusy || voice.busy || fileShareBusy;
-            const detail = <>
-              <Text style={styles.messageImageGlyph}>{artifact.previewKind === "pdf" ? "▤"
-                : artifact.previewKind === "model" ? "⬡" : artifact.previewKind === "media" ? "▶" : "◆"}</Text>
-              <View style={styles.fill}>
-                <Text style={[styles.label, { color: colors.ink }]} numberOfLines={1}>{artifact.title}</Text>
-                <Text style={[styles.caption, { color: colors.muted }]} numberOfLines={1}>
-                  {artifact.mediaType} · {formatByteSize(artifact.byteSize)}
-                </Text>
-              </View>
-              <Text style={[styles.caption, { color: artifact.previewKind ? colors.accent : colors.muted }]}>
-                {mobileMessage(locale, artifact.previewKind ? "common.open" : "task.fileFallback")}
-              </Text>
-            </>;
-            return <View key={artifact.artifactId} style={styles.fileActionRow}>
-              {artifact.previewKind ? <Pressable accessibilityRole="button"
-                accessibilityLabel={mobileMessage(locale, "task.openFile", { name: artifact.title, type: artifact.mediaType })}
-                accessibilityHint={mobileMessage(locale, "task.openFileHint")}
-                disabled={disabled} onPress={() => openTimelineArtifact(artifact)}
-                style={[styles.messageImageTile, styles.fileRowMain,
-                  { borderColor: colors.border, backgroundColor: colors.background }, disabled && styles.disabled]}>
-                {detail}
-              </Pressable> : <View accessible accessibilityLabel={`${artifact.title}, ${artifact.mediaType}`}
-                style={[styles.messageImageTile, styles.fileRowMain,
-                  { borderColor: colors.border, backgroundColor: colors.background }, disabled && styles.disabled]}>
-                {detail}
-              </View>}
-              <Action label={mobileMessage(locale, fileShareBusy ? "image.sharing" : "common.share")}
-                accessibilityLabel={mobileMessage(locale, "task.shareFile", { name: artifact.title })} compact colors={colors} disabled={disabled}
-                onPress={() => shareTimelineArtifact(artifact)} />
-            </View>;
-          })}
+        {(delegated.phase === "error" || delegated.phase === "cancelled") && <View accessibilityLiveRegion="polite" style={styles.connectionNotice}>
+          <Text style={[styles.caption, styles.fill, { color: colors.muted }]}>{mobileDelegatedTaskMessage(locale,
+            delegated.phase === "cancelled" ? "cancelled" : delegated.error ?? "readFailed")}</Text>
+          <Action label={mobileDelegatedTaskMessage(locale, "retry")} colors={colors} compact onPress={delegated.retry} />
         </View>}
-        {!item.optimistic && !conversationShare.active && <View style={styles.messageActions}>
-          <Pressable accessibilityRole="button" accessibilityLabel={mobileMessage(locale, "task.viewContextFor", { name: item.label })}
-            disabled={state.historyBusy || state.status !== "connected"}
-            onPress={() => { setLocalError(""); void client.around(item.eventId).catch((error) => setLocalError(errorText(error))); }}
-            style={styles.inlineTouchAction}>
-            <Text style={[styles.caption, { color: colors.accent }]}>{mobileMessage(locale, "task.viewContext")}</Text>
-          </Pressable>
-           {buildMobileMessageActions(item, { canDelete: client.canDeleteMessage(item.eventId), locale, copyDisabled: copyBusy }).length > 0
-            && <Pressable accessibilityRole="button" accessibilityLabel={mobileMessage(locale, "task.moreFor", { name: item.label })}
-              disabled={(state.status !== "connected" && state.status !== "offline")
-                || (state.status === "connected" && voice.busy)}
-              onPress={() => openMessageActions(item)}
-              style={[styles.inlineTouchAction,
-                ((state.status !== "connected" && state.status !== "offline")
-                  || (state.status === "connected" && voice.busy)) && styles.disabled]}>
-              <Text style={[styles.caption, { color: (state.status !== "connected" && state.status !== "offline")
-                || (state.status === "connected" && voice.busy) ? colors.muted : colors.accent }]}>{mobileMessage(locale, "common.more")}</Text>
-            </Pressable>}
-        </View>}
-        </View>
-      </View>;
-      }} />
+      </View> : undefined}
+      renderItem={({ item }) => renderTimelineItem(item)} />
     </View>
     {queueItems.length > 0 && <View style={styles.queueRegion}>
       <Text style={[styles.section, { color: colors.muted }]}>{mobileMessage(locale, "task.queue")}</Text>

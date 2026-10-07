@@ -3,7 +3,8 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import { create } from "@bufbuild/protobuf";
-import { Code } from "@connectrpc/connect";
+import { Code, createClient } from "@connectrpc/connect";
+import { createConnectTransport } from "@connectrpc/connect-node";
 import {
   BlobDisposition, CapabilitySupport, CompactSessionOutcome, CompactionState, ConnectionState, DeviceKind,
   DismissInteractionMutationSchema, EntityKind, EntityRefSchema,
@@ -18,10 +19,12 @@ import {
   StartReviewMutationSchema,
   AppendVoiceAudioRequestSchema, GetVoiceInputCapabilitiesRequestSchema, GetVoiceInputSessionRequestSchema,
   StartVoiceInputRequestSchema, StopVoiceInputRequestSchema, VoiceInputState, VoiceInputTerminalOutcome,
-  capabilityNames, nativeSessionTreeRoots, type Interaction, type OperationMutation
+  SubagentService,
+  capabilityNames, nativeSessionTreeRoots, type BackgroundTask, type Event, type EventCursor,
+  type Interaction, type OperationMutation, type SubagentRun, type SubagentRunDetail, type SubagentTranscriptEntry
 } from "@joko/contracts";
 import { PI_LIKE_PROFILE } from "@joko/testkit";
-import type { AdapterContext, PromptInput } from "@joko/core";
+import type { AdapterContext, PromptInput, SubagentRunDetail as CoreSubagentRunDetail } from "@joko/core";
 import { VoiceInputCoordinator, type VoiceInputProviderFactory } from "@joko/orchestrator";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { InstrumentedFakeAdapter, OrchestratorE2eFixture, waitFor } from "./fixture.js";
@@ -98,6 +101,64 @@ class MobileRuntimeCommandFixtureAdapter extends InstrumentedFakeAdapter {
       }
     ];
   }
+}
+
+class MobileReadingFixtureAdapter extends InstrumentedFakeAdapter {
+  override async send(input: PromptInput, context: AdapterContext): Promise<void> {
+    this.sendCalls.push(input);
+    const messageId = `mobile-thinking-${context.sessionId}`;
+    await context.emit({ type: "thinking_delta", blockId: messageId, contentIndex: 0, delta: "Transient reasoning" });
+    const observedAt = Date.now();
+    for (const index of [1, 2]) {
+      const taskId = `mobile-background-${index}`;
+      await context.emit({ type: "background_task", taskId, title: `Background ${index}`, state: "completed",
+        detail: `Background result ${index}`, startedAt: observedAt, endedAt: observedAt + index });
+      const run: CoreSubagentRunDetail = {
+        id: `mobile-delegate-${index}`, sessionId: context.sessionId, parentTaskId: taskId,
+        logicalAgentId: `mobile-worker-${index}`, identityAliases: [`mobile-provider-${index}`],
+        providerRunIds: [`provider-run-${index}`], state: "completed", title: `Worker ${index}`,
+        assignment: `Read section ${index}`, summary: `Checked section ${index}`,
+        capabilities: { viewActivity: true, viewReturnedResult: true, viewFullTranscript: true,
+          stop: false, steer: false, followUp: false, resume: false, parentContext: "snapshot" },
+        startedAt: observedAt, updatedAt: observedAt + index, endedAt: observedAt + index,
+        activity: [{ sequence: 1, kind: "completed", state: "completed", summary: `Checked section ${index}`, occurredAt: observedAt + index }],
+        children: [{ id: `mobile-child-${index}`, identityAliases: [`provider-child-${index}`], role: "reader",
+          state: "completed", assignment: `Read section ${index}`, result: `Child result ${index}` }],
+        returnedResult: `Delegated result ${index}`
+      };
+      await context.emit({ type: "subagent_run", run });
+      for (const sequence of [1, 2, 3]) {
+        await context.emit({ type: "subagent_transcript", subagentRunId: run.id,
+          entry: { id: `mobile-entry-${index}-${sequence}`, sequence, role: "subagent",
+            content: `Section ${index} observation ${sequence}`, childId: `mobile-child-${index}`,
+            occurredAt: observedAt + sequence } });
+      }
+    }
+    await context.emit({ type: "message_complete", role: "assistant", nativeHistory: { identity: { entryId: messageId } },
+      blocks: [
+        { kind: "thinking", text: "Final ordered reasoning", redacted: false },
+        { kind: "text", text: "The sections are checked." },
+        { kind: "thinking", text: "", redacted: true },
+        { kind: "thinking", text: "Final second reasoning", redacted: false }
+      ] });
+    await context.emit({ type: "done", outcome: "completed" });
+  }
+}
+
+interface MobileReadCredential {
+  readonly origin: string;
+  readonly authKey: string;
+  readonly connectionId: string;
+  readonly deviceId: string;
+}
+
+interface MobileReadingNetwork {
+  readHistory(credential: MobileReadCredential, sessionId: string, before?: EventCursor): Promise<{ events: Event[]; before?: EventCursor }>;
+  listBackgroundTasks(credential: MobileReadCredential, sessionId: string, pageToken?: string): Promise<{ tasks: readonly BackgroundTask[]; nextPageToken: string }>;
+  listSubagentRuns(credential: MobileReadCredential, sessionId: string, pageToken?: string): Promise<{ runs: readonly SubagentRun[]; nextPageToken: string }>;
+  getSubagentRun(credential: MobileReadCredential, sessionId: string, runId: string): Promise<SubagentRunDetail>;
+  listSubagentTranscript(credential: MobileReadCredential, sessionId: string, runId: string, childId?: string, pageToken?: string):
+    Promise<{ entries: readonly SubagentTranscriptEntry[]; nextPageToken: string; tailPageToken: string }>;
 }
 
 describe("native mobile device through the durable product chain", () => {
@@ -364,6 +425,116 @@ describe("native mobile device through the durable product chain", () => {
     }));
     expect(loggedOut.state).toBe(OperationState.SUCCEEDED);
     await expect(logoutClients.event.getSnapshot({ scope: { kind: { case: "owner", value: {} } } })).rejects.toBeDefined();
+  });
+
+  it("reads final ordered thinking and paged delegated activity through the mobile HTTP network and durable Session Host", async () => {
+    const { mobileNetwork } = await vi.importActual<{ mobileNetwork: MobileReadingNetwork }>("../../mobile/src/network.js");
+    const { mobileThinkingViews } = await vi.importActual<{
+      mobileThinkingViews(events: readonly Event[]): readonly {
+        sessionId: string; messageId: string; contentIndex: number; text: string;
+        redacted: boolean; completed: boolean; streaming: boolean
+      }[]
+    }>("../../mobile/src/mobile-thinking-projection.js");
+    const readingCapabilities = [capabilityNames.backgroundTasks, capabilityNames.subagentsList,
+      capabilityNames.subagentsDetail, capabilityNames.subagentsTranscript];
+    const readingProfile = {
+      ...PI_LIKE_PROFILE,
+      id: "mobile-reading",
+      displayName: "Mobile reading",
+      capabilities: [
+        ...PI_LIKE_PROFILE.capabilities.filter((capability) => !readingCapabilities.some((key) => key === capability.key)),
+        ...readingCapabilities.map((key) => ({ key, supported: true as const }))
+      ]
+    };
+    fixture = await OrchestratorE2eFixture.start({ profiles: [readingProfile], createAdapter: (profile) => new MobileReadingFixtureAdapter(profile) });
+    const begun = await fixture.anonymous.connection.beginPairing({
+      deviceDisplayName: "Joko reading phone", deviceKind: DeviceKind.MOBILE,
+      deviceNameSource: { defaultDisplayName: "Fixture reading phone" }, platform: "android", appVersion: "0.1.0"
+    });
+    const challengeId = begun.challenge?.challengeId;
+    if (!challengeId) throw new Error("The mobile reading fixture did not return a pairing challenge.");
+    const paired = (await fixture.anonymous.connection.completePairing({
+      challengeId, humanCode: fixture.pairingCode(challengeId), deviceDisplayName: "Joko reading phone",
+      deviceKind: DeviceKind.MOBILE, deviceNameSource: { defaultDisplayName: "Fixture reading phone" }, platform: "android", appVersion: "0.1.0"
+    })).result;
+    if (!paired?.authKey || !paired.connection || !paired.device) throw new Error("The mobile reading fixture did not pair.");
+    expect(paired.device.kind).toBe(DeviceKind.MOBILE);
+    expect(paired.connection.deviceId).toBe(paired.device.deviceId);
+    const credential: MobileReadCredential = { origin: fixture.baseUrl, authKey: paired.authKey,
+      connectionId: paired.connection.connectionId, deviceId: paired.device.deviceId };
+    const clients = fixture.clients(credential.authKey);
+    const owner = (await clients.event.getSnapshot({ scope: { kind: { case: "owner", value: {} } } })).snapshot!;
+    const target = owner.targets.find((item) => item.targetId === fixture!.targetId(readingProfile.id))!;
+    await clients.target.prepareTargetWorkspace({ targetId: target.targetId, expectedTargetRevision: target.version!.revision });
+    const created = await submit(clients.operation, credential.connectionId,
+      createSessionMutation({ backendId: target.backendId, targetId: target.targetId, displayName: "Read on the phone" }));
+    const sessionId = sessionIdFrom(created);
+    if (created.result?.payload.case !== "session") throw new Error("The mobile reading fixture did not create a Session.");
+    const sent = await submit(clients.operation, credential.connectionId,
+      sendInputMutation(sessionId, created.result.payload.value.nativeBinding!.runtimeGeneration, "Read the sections"));
+    const runId = queueRunIdFrom(sent);
+    await waitFor(async () => (await clients.run.getRun({ runId })).run,
+      (run) => run?.state === RunState.SUCCEEDED, "mobile reading run completion");
+
+    const history = await mobileNetwork.readHistory(credential, sessionId);
+    expect(history.events.every((event) => event.identity?.sessionId === sessionId)).toBe(true);
+    const messageId = `mobile-thinking-${sessionId}`;
+    const completed = history.events.find((event) => event.payload?.kind.case === "messageCompleted"
+      && event.payload.kind.value.messageId === messageId)!;
+    expect(completed.payload?.kind.case).toBe("messageCompleted");
+    if (completed.payload?.kind.case !== "messageCompleted") throw new Error("The final thinking message was not read from durable history.");
+    expect(completed.payload.kind.value.blocks.map((block) => block.content.case)).toEqual(["thinking", "text", "thinking", "thinking"]);
+    expect(history.events.some((event) => event.payload?.kind.case === "thinkingDelta"
+      && event.payload.kind.value.delta === "Transient reasoning")).toBe(true);
+    expect(mobileThinkingViews(history.events).map((view) => ({ sessionId: view.sessionId, messageId: view.messageId,
+      index: view.contentIndex, text: view.text, redacted: view.redacted, completed: view.completed, streaming: view.streaming }))).toEqual([
+      { sessionId, messageId, index: 0, text: "Final ordered reasoning", redacted: false, completed: true, streaming: false },
+      { sessionId, messageId, index: 2, text: "", redacted: true, completed: true, streaming: false },
+      { sessionId, messageId, index: 3, text: "Final second reasoning", redacted: false, completed: true, streaming: false }
+    ]);
+
+    const backgroundFirst = await clients.session.listBackgroundTasks({ sessionId, page: { pageSize: 1 } });
+    expect(backgroundFirst.backgroundTasks).toHaveLength(1);
+    expect(backgroundFirst.page?.nextPageToken).toBeTruthy();
+    const backgroundRest = await mobileNetwork.listBackgroundTasks(credential, sessionId, backgroundFirst.page!.nextPageToken);
+    expect(backgroundRest.tasks).toHaveLength(1);
+    expect(backgroundRest.nextPageToken).toBe("");
+    const background = [...backgroundFirst.backgroundTasks, ...backgroundRest.tasks];
+    expect(background.map((task) => task.backgroundTaskId).sort()).toEqual(["mobile-background-1", "mobile-background-2"]);
+    expect(background.every((task) => task.sessionId === sessionId && task.runId === runId && task.targetId === target.targetId)).toBe(true);
+
+    const subagents = createClient(SubagentService, createConnectTransport({ baseUrl: fixture.baseUrl,
+      httpVersion: "1.1", useBinaryFormat: true, defaultTimeoutMs: 10_000,
+      interceptors: [(next) => (request) => { request.header.set("authorization", `Bearer ${credential.authKey}`); return next(request); }] }));
+    const delegatedFirst = await subagents.listSubagentRuns({ sessionId, page: { pageSize: 1 } });
+    expect(delegatedFirst.runs).toHaveLength(1);
+    expect(delegatedFirst.page?.nextPageToken).toBeTruthy();
+    const delegatedRest = await mobileNetwork.listSubagentRuns(credential, sessionId, delegatedFirst.page!.nextPageToken);
+    expect(delegatedRest.runs).toHaveLength(1);
+    expect(delegatedRest.nextPageToken).toBe("");
+    const delegated = [...delegatedFirst.runs, ...delegatedRest.runs];
+    expect(delegated.map((run) => run.subagentRunId).sort()).toEqual(["mobile-delegate-1", "mobile-delegate-2"]);
+    expect(delegated.every((run) => run.sessionId === sessionId)).toBe(true);
+    const detail = await mobileNetwork.getSubagentRun(credential, sessionId, "mobile-delegate-1");
+    expect(detail.run).toMatchObject({ sessionId, subagentRunId: "mobile-delegate-1", parentTaskId: "mobile-background-1",
+      identityAliases: ["mobile-provider-1"], providerRunIds: ["provider-run-1"], assignment: "Read section 1" });
+    expect(detail.returnedResult).toBe("Delegated result 1");
+    expect(detail.children[0]).toMatchObject({ childId: "mobile-child-1", identityAliases: ["provider-child-1"], result: "Child result 1" });
+    const transcriptFirst = await subagents.listSubagentTranscript({ sessionId, subagentRunId: "mobile-delegate-1",
+      childId: "mobile-child-1", page: { pageSize: 1 } });
+    expect(transcriptFirst.entries).toHaveLength(1);
+    expect(transcriptFirst.page?.nextPageToken).toBeTruthy();
+    const transcriptRest = await mobileNetwork.listSubagentTranscript(credential, sessionId, "mobile-delegate-1",
+      "mobile-child-1", transcriptFirst.page!.nextPageToken);
+    expect(transcriptRest.nextPageToken).toBe("");
+    expect(transcriptRest.tailPageToken).toBeTruthy();
+    const transcript = [...transcriptFirst.entries, ...transcriptRest.entries];
+    expect(transcript.map((entry) => [entry.entryId, entry.sequence, entry.childId, entry.content])).toEqual([
+      ["mobile-entry-1-1", 1n, "mobile-child-1", "Section 1 observation 1"],
+      ["mobile-entry-1-2", 2n, "mobile-child-1", "Section 1 observation 2"],
+      ["mobile-entry-1-3", 3n, "mobile-child-1", "Section 1 observation 3"]
+    ]);
+    expect(fixture.adapter(readingProfile.id).sendCalls).toHaveLength(1);
   });
 
   it("lists an exact mobile runtime command catalog and dispatches the selected slash through HTTP, SQLite, and the Session Host", async () => {

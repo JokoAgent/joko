@@ -11,6 +11,14 @@ import {
   mobileTimelineArtifacts,
   type MobileTimelineArtifact
 } from "./mobile-timeline-artifacts";
+import { mobileEventTimestamp, mobileMessageEventScope, mobileMessageScope, mobileThinkingViews,
+  type MobileThinkingView } from "./mobile-thinking-projection";
+
+export type MobileTimelineMessagePart =
+  | { readonly kind: "text"; readonly contentIndex: number; readonly text: string }
+  | { readonly kind: "thinking"; readonly contentIndex: number; readonly thinking: MobileThinkingView }
+  | { readonly kind: "image"; readonly contentIndex: number; readonly image: MobileImageGalleryPageSummary }
+  | { readonly kind: "artifact"; readonly contentIndex: number; readonly artifact: MobileTimelineArtifact };
 
 /** A display and navigation hint. The Partner service must authorize every open. */
 export interface MobilePartnerPrivatePreviewCandidate {
@@ -41,6 +49,18 @@ export interface TimelineRow {
   readonly artifacts?: readonly MobileTimelineArtifact[];
   readonly partnerPrivatePreview?: MobilePartnerPrivatePreviewCandidate;
   readonly tool?: MobileToolCallView;
+  /** Ordered presentation remains inside this canonical message and keeps its actions. */
+  readonly messageParts?: readonly MobileTimelineMessagePart[];
+  readonly ownerScope?: string;
+  readonly runScope?: string;
+  readonly startedAtMs?: number;
+  readonly lastActivityAtMs?: number;
+  readonly turnFinal?: boolean;
+  readonly compactBoundary?: boolean;
+  readonly workActivity?: boolean;
+  readonly workStreaming?: boolean;
+  readonly persistentTask?: boolean;
+  readonly answerSequence?: bigint;
 }
 
 const PARTNER_PRIVATE_TOOL_NAMES = new Set([
@@ -52,7 +72,7 @@ const PARTNER_AVATAR = /^[a-z][a-z0-9-]{0,31}$/u;
 const FORBIDDEN_INLINE = /[\u0000-\u001f\u007f\u200e\u200f\u202a-\u202e\u2066-\u2069]/u;
 const FORBIDDEN_MULTILINE = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f\u200e\u200f\u202a-\u202e\u2066-\u2069]/u;
 
-export function timelineRows(events: readonly Event[]): TimelineRow[] {
+export function timelineRows(events: readonly Event[], sessionStreaming = false): TimelineRow[] {
   const byId = new Map<string, TimelineRow>();
   const toolStarts = new Map<string, Event[]>();
   const acceptedUserInputs = new Set<string>();
@@ -68,6 +88,7 @@ export function timelineRows(events: readonly Event[]): TimelineRow[] {
       case "runtimeCommandsChanged":
       case "runChanged":
       case "queueItemChanged":
+      case "thinkingDelta":
         break;
       case "messageStarted": {
         const message = kind.value;
@@ -84,7 +105,7 @@ export function timelineRows(events: readonly Event[]): TimelineRow[] {
       }
       case "textDelta": {
         const previous = byId.get(kind.value.messageId);
-        if (previous) byId.set(previous.id, { ...previous, text: previous.text === "…" ? kind.value.delta : previous.text + kind.value.delta });
+        if (previous && !previous.completed) byId.set(previous.id, { ...previous, text: previous.text === "…" ? kind.value.delta : previous.text + kind.value.delta });
         break;
       }
       case "messageCompleted": {
@@ -182,7 +203,90 @@ export function timelineRows(events: readonly Event[]): TimelineRow[] {
       byId.delete(event.eventId);
     }
   }
+  attachThinkingParts(byId, ordered, sessionStreaming);
   return [...byId.values()].sort((a, b) => a.sequence < b.sequence ? -1 : a.sequence > b.sequence ? 1 : a.id.localeCompare(b.id));
+}
+
+function attachThinkingParts(rows: Map<string, TimelineRow>, ordered: readonly Event[], sessionStreaming: boolean): void {
+  const events = new Map(ordered.map((event) => [event.eventId, event]));
+  const views = mobileThinkingViews(ordered, sessionStreaming);
+  const byMessage = new Map<string, MobileThinkingView[]>();
+  const textParts = new Map<string, Map<number, string>>();
+  const starts = new Map<string, number>();
+  const stoppedRuns = new Set<string>();
+  const sealedMessages = new Set<string>();
+  for (const view of views) byMessage.set(view.messageScope, [...(byMessage.get(view.messageScope) ?? []), view]);
+  for (const event of ordered) {
+    const scope = mobileMessageEventScope(event);
+    const kind = event.payload?.kind;
+    if (!scope || !kind?.case) continue;
+    if (kind.case === "runDone" || kind.case === "runAborted" || kind.case === "terminalError") {
+      if (event.identity?.runId) stoppedRuns.add(scope.runScope);
+    }
+    if (kind.case === "messageStarted") {
+      const at = mobileEventTimestamp(event);
+      if (at !== undefined) starts.set(mobileMessageScope(scope, kind.value.messageId), at);
+    }
+    if (kind.case === "messageCompleted") sealedMessages.add(mobileMessageScope(scope, kind.value.messageId));
+    if (kind.case !== "textDelta" || !Number.isSafeInteger(kind.value.contentIndex) || kind.value.contentIndex < 0) continue;
+    const key = mobileMessageScope(scope, kind.value.messageId);
+    if (sealedMessages.has(key) || stoppedRuns.has(scope.runScope)) continue;
+    const parts = textParts.get(key) ?? new Map<number, string>();
+    parts.set(kind.value.contentIndex, (parts.get(kind.value.contentIndex) ?? "") + kind.value.delta);
+    textParts.set(key, parts);
+  }
+  // A window can start inside a message. Thinking deltas still own the real message ID.
+  for (const view of views) if (!view.completed && !rows.has(view.messageId)) rows.set(view.messageId, {
+    id: view.messageId, label: "Assistant", text: "", kind: "assistant", eventId: view.eventId,
+    sequence: view.sequence, completed: false
+  });
+  for (const [id, row] of rows) {
+    const event = events.get(row.eventId);
+    const scope = event && mobileMessageEventScope(event);
+    if (!event || !scope) continue;
+    const messageKey = mobileMessageScope(scope, id);
+    const thinking = byMessage.get(messageKey) ?? [];
+    const parts: MobileTimelineMessagePart[] = [];
+    const payload = event.payload?.kind;
+    if (row.kind === "assistant" && payload?.case === "messageCompleted" && payload.value.blocks.length > 0
+      && payload.value.blocks.every((block) => block.content.case === "thinking") && thinking.length === 0) {
+      rows.delete(id);
+      continue;
+    }
+    if (row.kind === "assistant" && thinking.length) {
+      if (payload?.case === "messageCompleted") {
+        const pages = mobileTimelineGalleryPages(event);
+        for (let contentIndex = 0; contentIndex < payload.value.blocks.length; contentIndex++) {
+          const block = payload.value.blocks[contentIndex]!;
+          if (block.content.case === "thinking") {
+            const view = thinking.find((item) => item.contentIndex === contentIndex);
+            if (view) parts.push({ kind: "thinking", contentIndex, thinking: view });
+          } else if (block.content.case === "text") parts.push({ kind: "text", contentIndex, text: block.content.value });
+          else if (block.content.case === "image" || block.content.case === "artifact") {
+            const page = pages.find((item) => item.source.kind === "timeline" && item.source.contentIndex === contentIndex);
+            const artifact = row.artifacts?.find((item) => item.source.kind === "timeline" && item.source.contentIndex === contentIndex);
+            if (page) parts.push({ kind: "image", contentIndex, image: mobileImageGalleryPageSummary(page) });
+            else if (artifact) parts.push({ kind: "artifact", contentIndex, artifact });
+            else parts.push({ kind: "text", contentIndex, text: block.content.case === "image" ? "[Image]" : "[Artifact]" });
+          } else if (block.content.case === "toolCall") parts.push({ kind: "text", contentIndex, text: "[Tool call]" });
+        }
+      } else {
+        parts.push(...thinking.map((view): MobileTimelineMessagePart => ({ kind: "thinking", contentIndex: view.contentIndex, thinking: view })));
+        for (const [contentIndex, text] of textParts.get(messageKey) ?? []) parts.push({ kind: "text", contentIndex, text });
+        parts.sort((a, b) => a.contentIndex - b.contentIndex);
+      }
+    }
+    const startedAtMs = starts.get(messageKey) ?? row.tool?.startedAtMs ?? mobileEventTimestamp(event);
+    const thoughtOnly = parts.length > 0 && parts.every((part) => part.kind === "thinking" || part.kind === "text" && part.text.trim() === "");
+    rows.set(id, { ...row, ownerScope: scope.ownerScope, runScope: scope.runScope,
+      ...(startedAtMs === undefined ? {} : { startedAtMs }),
+      ...(mobileEventTimestamp(event) === undefined ? {} : { lastActivityAtMs: mobileEventTimestamp(event) }),
+      ...(row.kind === "assistant" && row.completed && stoppedRuns.has(scope.runScope) ? { turnFinal: true } : {}),
+      ...(row.kind === "assistant" && row.completed && !thoughtOnly ? { answerSequence: event.cursor!.sequence } : {}),
+      ...(payload?.case === "compactionChanged" ? { compactBoundary: true } : {}),
+      ...(parts.length ? { messageParts: parts, workActivity: thoughtOnly, workStreaming: thinking.some((view) => view.streaming) } : {})
+    });
+  }
 }
 
 function timelineMedia(events: readonly Event[]): Pick<TimelineRow, "images" | "artifacts"> {

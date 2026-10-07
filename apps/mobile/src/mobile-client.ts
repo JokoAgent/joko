@@ -8497,6 +8497,64 @@ export class MobileClient {
     return current();
   }
 
+  taskDelegatedControls(): import("./mobile-delegated-reader").MobileDelegatedControls | undefined {
+    const authorityKey = this.#taskAuthorityKey();
+    const sessionId = this.#state.selectedId;
+    const detail = this.#state.detail;
+    const owner = this.#state.owner;
+    if (!authorityKey || !sessionId || owner?.scope?.kind.case !== "owner"
+      || detail?.scope?.kind.case !== "session" || detail.scope.kind.value.sessionId !== sessionId) return undefined;
+    const session = detail.sessions.find((candidate) => candidate.sessionId === sessionId)!;
+    const backend = detail.backends.find((candidate) => candidate.backendId === session.backendId)!;
+    const supported = (name: string): boolean => backend.capabilities?.capabilities.some((capability) =>
+      capability.name === name && capability.support === CapabilitySupport.SUPPORTED) === true;
+    const canListBackground = supported(capabilityNames.backgroundTasks);
+    const canListRuns = supported(capabilityNames.subagentsList);
+    if (!canListBackground && !canListRuns) return undefined;
+    return { authorityKey, surfaceOwnerKey: JSON.stringify([this.#credential!.profileId, this.#credential!.serverId,
+      this.#credential!.connectionId, this.#credential!.deviceId, owner.generation.toString(), sessionId,
+      session.backendId, session.targetId, session.nativeBinding!.runtimeGeneration.toString()]),
+      sessionId, generation: owner.generation, canListBackground, canListRuns,
+      canReadDetail: supported(capabilityNames.subagentsDetail), canReadTranscript: supported(capabilityNames.subagentsTranscript) };
+  }
+
+  async #readDelegated<T>(authorityKey: string, signal: AbortSignal | undefined,
+    read: (credential: PairedCredential, sessionId: string, signal: AbortSignal) => Promise<T>): Promise<T> {
+    const controls = this.taskDelegatedControls();
+    if (!controls || controls.authorityKey !== authorityKey) throw new Error("The delegated task owner is no longer current.");
+    const credential = this.#ready(); const epoch = this.#epoch;
+    const combined = signal === undefined ? this.#abort!.signal : AbortSignal.any([this.#abort!.signal, signal]);
+    if (combined.aborted) throw new Error("Delegated task reading was cancelled.");
+    const result = await read(credential, controls.sessionId, combined);
+    if (combined.aborted || !this.#current(epoch) || this.#credential !== credential
+      || this.taskDelegatedControls()?.authorityKey !== authorityKey) throw new Error("The delegated task owner changed while reading.");
+    return result;
+  }
+
+  async loadTaskBackgroundTasks(authorityKey: string, pageToken = "", signal?: AbortSignal) {
+    if (!this.taskDelegatedControls()?.canListBackground) throw new Error("Background activity is unavailable for this task.");
+    return this.#readDelegated(authorityKey, signal, (credential, sessionId, activeSignal) =>
+      this.network.listBackgroundTasks(credential, sessionId, pageToken, activeSignal));
+  }
+
+  async loadTaskDelegatedRuns(authorityKey: string, pageToken = "", signal?: AbortSignal) {
+    if (!this.taskDelegatedControls()?.canListRuns) throw new Error("Delegated activity is unavailable for this task.");
+    return this.#readDelegated(authorityKey, signal, (credential, sessionId, activeSignal) =>
+      this.network.listSubagentRuns(credential, sessionId, pageToken, activeSignal));
+  }
+
+  async loadTaskDelegatedDetail(authorityKey: string, runId: string, signal?: AbortSignal) {
+    if (!this.taskDelegatedControls()?.canReadDetail) throw new Error("Delegated details are unavailable for this task.");
+    return this.#readDelegated(authorityKey, signal, (credential, sessionId, activeSignal) =>
+      this.network.getSubagentRun(credential, sessionId, runId, activeSignal));
+  }
+
+  async loadTaskDelegatedTranscript(authorityKey: string, runId: string, childId = "", pageToken = "", signal?: AbortSignal) {
+    if (!this.taskDelegatedControls()?.canReadTranscript) throw new Error("Delegated content is unavailable for this task.");
+    return this.#readDelegated(authorityKey, signal, (credential, sessionId, activeSignal) =>
+      this.network.listSubagentTranscript(credential, sessionId, runId, childId, pageToken, activeSignal));
+  }
+
   taskNativeTreeControls(): MobileNativeTreeControls | undefined {
     const credential = this.#credential;
     if (!credential || !this.#taskAuthorityKey()) return undefined;
