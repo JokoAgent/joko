@@ -1,5 +1,5 @@
 import { create } from "@bufbuild/protobuf";
-import { EventCursorSchema, EventSchema, MessageRole, ToolCallOutputMode, ToolCallState, ToolFileAction, ToolResultSchema } from "@joko/contracts";
+import { EventCursorSchema, EventIdentitySchema, EventSchema, MessageRole, ToolCallOutputMode, ToolCallState, ToolFileAction, ToolResultSchema } from "@joko/contracts";
 import { describe, expect, it } from "vitest";
 import { timelineRows } from "./timeline";
 import { producedArtifactEvent, producedImageEvent, toolMediaEvent } from "./test/timeline-media";
@@ -16,6 +16,73 @@ function completed(blocks: any[], role = MessageRole.ASSISTANT) {
     } } }
   });
 }
+
+describe("mobile Timeline metadata events", () => {
+  function metadataEvents() {
+    return [
+      create(EventSchema, { eventId: "session-metadata", identity: { sessionId: "session-one" },
+        cursor: { generation: 1n, sequence: 1n },
+        payload: { kind: { case: "sessionChanged", value: { session: { sessionId: "session-one", displayName: "Updated task" } } } } }),
+      create(EventSchema, { eventId: "command-catalog", identity: { sessionId: "session-one" },
+        cursor: { generation: 1n, sequence: 10n },
+        payload: { kind: { case: "runtimeCommandsChanged", value: { commands: [{
+          commandId: "command-one", name: "Inspect", sessionId: "session-one", loaded: true
+        }] } } } })
+    ];
+  }
+
+  it("leaves a control-only window empty while preserving its metadata and real cursors", () => {
+    const events = metadataEvents(); const original = structuredClone(events);
+    expect(timelineRows(events)).toEqual([]);
+    expect(events).toEqual(original);
+    expect(events.at(-1)?.cursor?.sequence).toBe(10n);
+  });
+
+  it("merges visible history and live content across metadata updates without using visible rows as the window edge", () => {
+    const metadata = metadataEvents();
+    const history = [metadata[0]!,
+      create(EventSchema, { eventId: "accepted-user", identity: { sessionId: "session-one", operationId: "send-one" },
+        cursor: { generation: 1n, sequence: 2n }, payload: { kind: { case: "messageStarted", value: {
+          messageId: "user-one", role: MessageRole.USER, userInputAccepted: true,
+          userInput: { parts: [{ content: { case: "text", value: "Hello" } }] }
+        } } } }),
+      create(EventSchema, { eventId: "assistant-start", identity: { sessionId: "session-one" },
+        cursor: { generation: 1n, sequence: 3n }, payload: { kind: { case: "messageStarted", value: {
+          messageId: "message", role: MessageRole.ASSISTANT
+        } } } })];
+    expect(timelineRows(history)).toMatchObject([
+      { id: "user-one", kind: "user", text: "Hello", sequence: 2n, operationId: "send-one", completed: true },
+      { id: "message", kind: "assistant", text: "…", sequence: 3n, completed: false }
+    ]);
+    const live = [
+      create(EventSchema, { eventId: "assistant-delta", identity: { sessionId: "session-one" },
+        cursor: { generation: 1n, sequence: 4n }, payload: { kind: { case: "textDelta", value: { messageId: "message", delta: "Working" } } } }),
+      create(EventSchema, { ...toolCompleted(), cursor: create(EventCursorSchema, { generation: 1n, sequence: 5n }) }),
+      create(EventSchema, { eventId: "recoverable-error", cursor: { generation: 1n, sequence: 6n },
+        payload: { kind: { case: "recoverableError", value: { error: { message: "Try again" } } } } }),
+      create(EventSchema, { eventId: "task-status", cursor: { generation: 1n, sequence: 7n },
+        payload: { kind: { case: "statusStream", value: { label: "Running", detail: "Checking" } } } }),
+      create(EventSchema, { eventId: "run-finished", cursor: { generation: 1n, sequence: 8n },
+        payload: { kind: { case: "runDone", value: { runId: "run-one" } } } }),
+      create(EventSchema, { ...completed([{ content: { case: "text", value: "Finished." } }]),
+        identity: create(EventIdentitySchema, { sessionId: "session-one" }),
+        cursor: create(EventCursorSchema, { generation: 1n, sequence: 9n }) }), metadata[1]!
+    ];
+    expect(timelineRows([...history, live[0]!])[1]).toMatchObject({ text: "Working", sequence: 3n, completed: false });
+    const events = [...history, ...live]; const original = structuredClone(events);
+    expect(timelineRows(events)).toMatchObject([
+      { id: "user-one", kind: "user", text: "Hello", sequence: 2n, operationId: "send-one" },
+      { id: "message", kind: "assistant", text: "Finished.", sequence: 3n, eventId: "complete", completed: true },
+      { kind: "tool", eventId: "tool-completed", sequence: 5n, completed: true },
+      { kind: "error", eventId: "recoverable-error", text: "Try again", sequence: 6n },
+      { kind: "status", eventId: "task-status", text: "Running · Checking", sequence: 7n },
+      { kind: "activity", eventId: "run-finished", text: "Run finished", sequence: 8n }
+    ]);
+    expect(events).toEqual(original);
+    expect(events.at(-1)?.cursor?.sequence).toBe(10n);
+    expect(timelineRows(events).at(-1)?.sequence).toBe(8n);
+  });
+});
 
 describe("mobile Timeline quote source", () => {
   it("exposes exact completed assistant pure text and nothing else as quote authority", () => {

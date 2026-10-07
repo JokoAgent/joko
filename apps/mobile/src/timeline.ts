@@ -64,6 +64,9 @@ export function timelineRows(events: readonly Event[]): TimelineRow[] {
     const sequence = event.cursor?.sequence ?? 0n;
     if (!kind?.case) continue;
     switch (kind.case) {
+      case "sessionChanged":
+      case "runtimeCommandsChanged":
+        break;
       case "messageStarted": {
         const message = kind.value;
         if (message.role === MessageRole.USER && message.userInputAccepted) acceptedUserInputs.add(message.messageId);
