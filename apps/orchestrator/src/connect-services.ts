@@ -10401,7 +10401,12 @@ function extensionSearchText(entry: NativeExtensionCatalogDescriptor): string {
     entry.description,
     entry.author ?? "",
     ...entry.tools.flatMap((tool) => [tool.name, tool.description]),
-    ...entry.permissions.flatMap((permission) => [permission.label, permission.description])
+    ...entry.permissions.flatMap((permission) => [permission.label, permission.description]),
+    ...(entry.recommendations ?? []).flatMap((recommendation) => [
+      recommendation.label,
+      recommendation.prompt,
+      ...Object.values(recommendation.locales ?? {}).flatMap((translation) => [translation.label, translation.prompt])
+    ])
   ].join("\n").toLocaleLowerCase("en-US");
 }
 
@@ -10462,6 +10467,22 @@ function mapExtensionCatalogEntry(item: NativeExtensionCatalogDescriptor): contr
       description: command.description,
       sessionId: command.sessionId
     })),
+    recommendations: (item.recommendations ?? []).map((recommendation) => create(
+      contract.ExtensionRecommendationDescriptorSchema,
+      {
+        id: recommendation.id,
+        label: recommendation.label,
+        prompt: recommendation.prompt,
+        ...(recommendation.command === undefined ? {} : { command: recommendation.command }),
+        locales: Object.entries(recommendation.locales ?? {})
+          .sort(([left], [right]) => left.localeCompare(right, "en"))
+          .map(([locale, translation]) => create(contract.ExtensionRecommendationLocaleSchema, {
+            locale,
+            label: translation.label,
+            prompt: translation.prompt
+          }))
+      }
+    )),
     setup: create(contract.ExtensionSetupDescriptorSchema, {
       state: protoExtensionSetupState(item.setup.state),
       ...(item.setup.attemptId === undefined ? {} : { attemptId: item.setup.attemptId }),

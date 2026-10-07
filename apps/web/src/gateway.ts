@@ -3,6 +3,7 @@ import { createClient, ConnectError, Code, type Interceptor, type Transport } fr
 import { createConnectTransport } from "@connectrpc/connect-web";
 import { createTerminalGateway } from "./terminal-gateway.js";
 import { createSimulatorViewerGateway } from "./simulator-viewer-gateway.js";
+import { normalizeExtensionRecommendation } from "./extension-suggestion-handoff.js";
 import { UsageReportGroup } from "@joko/contracts";
 import { projectVoiceInputSaucSettings, protoVoiceInputSaucSettings, type VoiceInputRecognitionContextView } from "@joko/contracts";
 import { nextVoiceDictionaryWatchSequence, projectVoiceDictionaryPeerStatus, readVoiceDictionaryPeerInvitation, type VoiceDictionaryPeerListener, type VoiceDictionaryPeerStatusView } from "@joko/contracts";
@@ -15590,6 +15591,7 @@ function mapExtensionCatalogEntry(extension: ProtoExtensionCatalogEntry): Extens
     : extension.library.schemaVersion === 1
       ? { schemaVersion: 1 as const }
       : (() => { throw new GatewayError("Orchestrator returned an invalid Extension Library capability."); })();
+  const recommendations = mapExtensionRecommendations(extension.recommendations);
   return {
     id: extension.extensionId,
     revision,
@@ -15627,6 +15629,7 @@ function mapExtensionCatalogEntry(extension: ProtoExtensionCatalogEntry): Extens
       description: command.description,
       sessionId: command.sessionId
     })),
+    ...(recommendations === undefined ? {} : { recommendations }),
     setup: {
       state: extensionSetupState(setup.state),
       ...(setup.attemptId === undefined ? {} : { attemptId: setup.attemptId }),
@@ -15652,6 +15655,57 @@ function mapExtensionCatalogEntry(extension: ProtoExtensionCatalogEntry): Extens
     useSupported: extension.useSupported,
     ...(extension.error === undefined ? {} : { error: extension.error })
   };
+}
+
+function mapExtensionRecommendations(
+  values: ProtoExtensionCatalogEntry["recommendations"]
+): ExtensionCatalogEntryView["recommendations"] {
+  if (values.length === 0) return undefined;
+  if (values.length > 24) throw new GatewayError("Orchestrator returned too many Extension recommendations.");
+  try {
+    const wireProjection = values.map((value) => ({
+      id: value.id,
+      label: value.label,
+      prompt: value.prompt,
+      ...(value.command === undefined ? {} : { command: value.command }),
+      locales: value.locales.map((localized) => ({
+        locale: localized.locale,
+        label: localized.label,
+        prompt: localized.prompt
+      }))
+    }));
+    if (new TextEncoder().encode(JSON.stringify(wireProjection)).byteLength > 65_536) {
+      throw new GatewayError("Orchestrator returned oversized Extension recommendations.");
+    }
+  } catch (error) {
+    if (error instanceof GatewayError) throw error;
+    throw new GatewayError("Orchestrator returned invalid Extension recommendation encoding.");
+  }
+  const ids = new Set<string>();
+  const recommendations: NonNullable<ExtensionCatalogEntryView["recommendations"]>[number][] = [];
+  for (const value of values) {
+    if (ids.has(value.id)) throw new GatewayError("Orchestrator returned duplicate Extension recommendation identities.");
+    const locales: Record<string, { readonly label: string; readonly prompt: string }> = {};
+    const localeIds = new Set<string>();
+    for (const localized of value.locales) {
+      if ((localized.locale !== "en" && localized.locale !== "zh-CN") || localeIds.has(localized.locale)) {
+        throw new GatewayError("Orchestrator returned invalid Extension recommendation locales.");
+      }
+      localeIds.add(localized.locale);
+      locales[localized.locale] = { label: localized.label, prompt: localized.prompt };
+    }
+    const recommendation = normalizeExtensionRecommendation({
+      id: value.id,
+      label: value.label,
+      prompt: value.prompt,
+      ...(value.command === undefined ? {} : { command: value.command }),
+      ...(value.locales.length === 0 ? {} : { locales })
+    });
+    if (recommendation === undefined) throw new GatewayError("Orchestrator returned an invalid Extension recommendation.");
+    ids.add(recommendation.id);
+    recommendations.push(recommendation);
+  }
+  return recommendations;
 }
 
 function mapExtensionMainViewSurface(surface: ProtoExtensionMainViewSurface): ExtensionMainViewSurfaceView {

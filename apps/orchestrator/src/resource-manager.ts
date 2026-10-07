@@ -25,7 +25,12 @@ import {
   type PiPackageRuntimeRequirement,
   type PiPackageWarning
 } from "./pi-package-compatibility.js";
-import { isExtensionLibraryDescriptor, isExtensionMainViewDescriptor } from "./extension-surface-manifest.js";
+import {
+  isExtensionLibraryDescriptor,
+  isExtensionMainViewDescriptor,
+  validateExtensionRecommendations,
+  type ExtensionRecommendationDescriptor
+} from "./extension-surface-manifest.js";
 
 export type PiResourceKind = "extension" | "skill" | "prompt" | "theme" | "package";
 export type PiResourceScope = "user" | "global" | "project" | "managed";
@@ -4716,12 +4721,29 @@ function copyResourceDetail(detail: PiPackageResourceDetail): PiPackageResourceD
     ...(detail.entryPath === undefined ? {} : { entryPath: detail.entryPath }),
     ...(detail.mainView === undefined ? {} : { mainView: { ...detail.mainView } }),
     ...(detail.library === undefined ? {} : { library: { ...detail.library } }),
+    ...(detail.recommendations === undefined ? {} : { recommendations: copyRecommendations(detail.recommendations) }),
     compatibility: detail.compatibility,
     compatibilityIssues: [...detail.compatibilityIssues],
     detectedApis: [...detail.detectedApis],
     adaptedApis: [...detail.adaptedApis],
     unsupportedApis: [...detail.unsupportedApis]
   };
+}
+
+function copyRecommendations(
+  recommendations: readonly ExtensionRecommendationDescriptor[]
+): readonly ExtensionRecommendationDescriptor[] {
+  return recommendations.map((recommendation) => ({
+    ...recommendation,
+    ...(recommendation.locales === undefined
+      ? {}
+      : {
+          locales: Object.fromEntries(Object.entries(recommendation.locales).map(([locale, translation]) => [
+            locale,
+            { ...translation }
+          ])) as ExtensionRecommendationDescriptor["locales"]
+        })
+  }));
 }
 
 function resourceCompatibilityIdentity(record: StoredResource): string {
@@ -4788,7 +4810,7 @@ function validateStoredResourceDetails(value: readonly PiPackageResourceDetail[]
       !detail || typeof detail !== "object" || !kinds.has(detail.kind) || !compatibility.has(detail.compatibility)
       || typeof detail.name !== "string" || detail.name.trim() === "" || detail.name.length > 256
       || Object.keys(detail).some((key) => ![
-        "kind", "name", "entryPath", "mainView", "library", "compatibility", "compatibilityIssues", "detectedApis", "adaptedApis", "unsupportedApis"
+        "kind", "name", "entryPath", "mainView", "library", "recommendations", "compatibility", "compatibilityIssues", "detectedApis", "adaptedApis", "unsupportedApis"
       ].includes(key))
       || detail.kind === "extension" !== (typeof detail.entryPath === "string")
       || detail.entryPath !== undefined && !isStoredPackageRelativePath(detail.entryPath)
@@ -4799,12 +4821,19 @@ function validateStoredResourceDetails(value: readonly PiPackageResourceDetail[]
     const detectedApis = validateStringEnumList(detail.detectedApis, apis, "detected API");
     const adaptedApis = validateStringEnumList(detail.adaptedApis, apis, "adapted API");
     const unsupportedApis = validateStringEnumList(detail.unsupportedApis, apis, "unsupported API");
+    const recommendations = detail.recommendations === undefined
+      ? undefined
+      : validateExtensionRecommendations(detail.recommendations);
+    if (recommendations !== undefined && (detail.kind !== "extension" || !recommendations.ok)) {
+      throw new Error("Stored resource compatibility recommendations are malformed.");
+    }
     return {
       kind: detail.kind,
       name: detail.name,
       ...(detail.entryPath === undefined ? {} : { entryPath: detail.entryPath }),
       ...(detail.mainView === undefined ? {} : { mainView: { ...detail.mainView } }),
       ...(detail.library === undefined ? {} : { library: { ...detail.library } }),
+      ...(recommendations === undefined ? {} : { recommendations: recommendations.items }),
       compatibility: detail.compatibility,
       compatibilityIssues: compatibilityIssues as PiPackageResourceDetail["compatibilityIssues"],
       detectedApis: detectedApis as PiPackageResourceDetail["detectedApis"],

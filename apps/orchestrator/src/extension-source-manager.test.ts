@@ -13,6 +13,7 @@ import {
   type ExtensionSourceGitExecutor
 } from "./extension-source-manager.js";
 import { inspectPiPackageCatalog } from "./pi-package-compatibility.js";
+import type { ExtensionRecommendationDescriptor } from "./extension-surface-manifest.js";
 import { mkdtemp } from "./test-paths.js";
 
 const roots: string[] = [];
@@ -32,7 +33,13 @@ async function makeRoot(label: string): Promise<string> {
 async function writeMarket(
   root: string,
   marketName: string,
-  packages: readonly { readonly path: string; readonly label: string; readonly version?: string; readonly entry?: string }[]
+  packages: readonly {
+    readonly path: string;
+    readonly label: string;
+    readonly version?: string;
+    readonly entry?: string;
+    readonly recommendations?: readonly ExtensionRecommendationDescriptor[];
+  }[]
 ): Promise<void> {
   await mkdir(join(root, ".agents", "plugins"), { recursive: true });
   await writeFile(join(root, ".agents", "plugins", "marketplace.json"), JSON.stringify({
@@ -49,7 +56,17 @@ async function writeMarket(
       version: item.version ?? "1.0.0",
       author: "Package Author",
       description: `${item.label} package`,
-      pi: { extensions: [extension] }
+      pi: { extensions: [extension] },
+      ...(item.recommendations === undefined
+        ? {}
+        : {
+            joko: {
+              extensionSurfaces: {
+                schemaVersion: 1,
+                extensions: [{ entry: extension, recommendations: item.recommendations }]
+              }
+            }
+          })
     }), "utf8");
     await writeFile(join(packageRoot, ...extension.split("/")), "export default function setup() {}\n", "utf8");
   }
@@ -114,7 +131,14 @@ describe("ExtensionSourceManager", () => {
     const { root, store, manager } = await fixture("local");
     try {
       const market = join(root, "catalog");
-      await writeMarket(market, "local-catalog", [{ path: "packages/review", label: "Review", version: "2.1.0" }]);
+      const recommendations = [{
+        id: "review-workspace",
+        label: "Review workspace",
+        prompt: "Review the workspace for correctness.",
+        command: "review",
+        locales: { "zh-CN": { label: "审查工作区", prompt: "审查工作区的正确性。" } }
+      }] as const;
+      await writeMarket(market, "local-catalog", [{ path: "packages/review", label: "Review", version: "2.1.0", recommendations }]);
       const source = await manager.add({ kind: "local", path: market }, 0n);
       expect(source).toMatchObject({
         revision: 1n,
@@ -132,7 +156,8 @@ describe("ExtensionSourceManager", () => {
         bindingName: "index.ts",
         bindingOrdinal: 0,
         packageRelativePath: "packages/review",
-        extensionRelativePath: "extensions/index.ts"
+        extensionRelativePath: "extensions/index.ts",
+        recommendations
       }]);
       expect(source.entries[0]!.id).toMatch(/^extension_source_entry_[a-f0-9]{32}$/u);
       expect(source.entries[0]!.resourceId).toMatch(/^resource_market_[a-f0-9]{32}$/u);
@@ -140,7 +165,16 @@ describe("ExtensionSourceManager", () => {
       await expect(manager.add({ kind: "local", path: market }, 1n)).rejects.toMatchObject({ code: "SOURCE_DUPLICATE" });
       await expect(manager.add({ kind: "local", path: join(root, "missing") }, 1n)).rejects.toBeInstanceOf(Error);
       expect(manager.snapshot().sources).toHaveLength(1);
-      await writeFile(join(market, "packages", "review", "extensions", "index.ts"), "export default function changed() {}\n", "utf8");
+      const changedRecommendations = [{
+        ...recommendations[0],
+        prompt: "Review the workspace and propose concrete fixes."
+      }] as const;
+      await writeMarket(market, "local-catalog", [{
+        path: "packages/review",
+        label: "Review",
+        version: "2.1.0",
+        recommendations: changedRecommendations
+      }]);
       await expect(manager.withEntry({
         sourceId: source.id,
         sourceRevision: source.revision,
@@ -151,11 +185,16 @@ describe("ExtensionSourceManager", () => {
       expect(refreshed).toMatchObject({ revision: 2n, state: "ready" });
       expect(refreshed.entries[0]!.packageContentRevision).not.toBe(source.entries[0]!.packageContentRevision);
       expect(refreshed.entries[0]!.contentRevision).not.toBe(source.entries[0]!.contentRevision);
+      expect(refreshed.entries[0]!.recommendations).toEqual(changedRecommendations);
 
       const restarted = new ExtensionSourceManager({ store, cacheRoot: join(root, "source-cache"), homeDirectory: root, now: () => NOW });
       await restarted.initialize();
       expect(restarted.snapshot()).toMatchObject({ revision: 2n, recoveredFromCorruption: false });
-      expect(restarted.snapshot().sources[0]?.entries[0]).toMatchObject({ id: source.entries[0]!.id, resourceId: source.entries[0]!.resourceId });
+      expect(restarted.snapshot().sources[0]?.entries[0]).toMatchObject({
+        id: source.entries[0]!.id,
+        resourceId: source.entries[0]!.resourceId,
+        recommendations: changedRecommendations
+      });
     } finally {
       store.close();
     }

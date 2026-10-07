@@ -1,7 +1,17 @@
 import { describe, expect, it } from "vitest";
 
-import { DEFAULT_UI_PREFERENCES, normalizeComposerMentions, normalizeNewSessionLocalDraft, normalizePendingExtensionUse, normalizeUiPreferences } from "./local-state.js";
+import {
+  DEFAULT_UI_PREFERENCES,
+  LocalState,
+  normalizeComposerMentions,
+  normalizeNewSessionLocalDraft,
+  normalizePendingExtensionSuggestion,
+  normalizePendingExtensionUse,
+  normalizeRecentExtensionSuggestions,
+  normalizeUiPreferences
+} from "./local-state.js";
 import { plainTextToComposerDocument } from "./composer-quote-document.js";
+import type { PendingExtensionSuggestionView } from "./model.js";
 
 describe("durable UI preferences", () => {
   it("accepts the complete current preferences shape", () => {
@@ -121,6 +131,103 @@ describe("owner-scoped delayed-create drafts", () => {
     expect(normalizePendingExtensionUse({ ...handoff, extensionRevision: "0" })).toBeUndefined();
     expect(normalizePendingExtensionUse({ ...handoff, runtimeSessionId: " bad\nsession " })).toBeUndefined();
     expect(normalizePendingExtensionUse({ ...handoff, owner: { ...handoff.owner, discoveredRevision: "" } })).toBeUndefined();
+  });
+
+  it("retains the exact current Extension suggestion shape and bounded recent identities", () => {
+    const handoff = pendingExtensionSuggestion();
+    expect(normalizePendingExtensionSuggestion({ ...handoff, secret: "must-not-survive" })).toEqual(handoff);
+    expect(normalizePendingExtensionSuggestion({ ...handoff, nonce: "not-a-nonce" })).toBeUndefined();
+    expect(normalizePendingExtensionSuggestion({ ...handoff, selectedPrompt: "Changed after selection" })).toBeUndefined();
+    expect(normalizePendingExtensionSuggestion({
+      ...handoff,
+      recommendation: { ...handoff.recommendation, command: "review" },
+      runtimeSessionId: undefined
+    })?.recommendation.command).toBe("review");
+    expect(normalizeRecentExtensionSuggestions([
+      handoff.extensionId,
+      "extension_11111111111111111111111111111111",
+      handoff.extensionId,
+      "invalid",
+      "extension_22222222222222222222222222222222",
+      "extension_33333333333333333333333333333333",
+      "extension_44444444444444444444444444444444",
+      "extension_55555555555555555555555555555555"
+    ])).toEqual([
+      handoff.extensionId,
+      "extension_11111111111111111111111111111111",
+      "extension_22222222222222222222222222222222",
+      "extension_33333333333333333333333333333333",
+      "extension_44444444444444444444444444444444"
+    ]);
+  });
+
+  it("persists the frozen draft and atomically CASes and consumes one exact nonce", async () => {
+    const memory = memoryDatabase();
+    const state = Reflect.construct(LocalState as unknown as Function, [memory.database]) as LocalState;
+    const setup = { ...pendingExtensionSuggestion(), phase: "setup" as const };
+    await state.savePendingExtensionSuggestion("owner", setup);
+
+    const restored = await state.readPendingExtensionSuggestion("owner", setup.nonce);
+    expect(restored).toMatchObject({
+      nonce: setup.nonce,
+      phase: "setup",
+      draft: {
+        text: "Review the draft",
+        attachments: [{ id: "attachment-1", kind: "file" }],
+        browserComments: [{ id: "comment-1", screenshot: { id: "comment-image-1", kind: "image" } }],
+        extraDirectoryIds: ["extra-1"]
+      }
+    });
+    expect(await restored!.draft.attachments[0]!.file.text()).toBe("attachment bytes");
+
+    expect(await state.compareAndSetPendingExtensionSuggestion("owner", {
+      ...setup,
+      contextKey: JSON.stringify([1, "server", "another-profile", 3, "target", "target-1"])
+    }, { ...setup, phase: "ready" })).toBe(false);
+    expect(await state.compareAndSetPendingExtensionSuggestion("owner", setup, { ...setup, phase: "ready" })).toBe(true);
+
+    const consumed = await state.consumePendingExtensionSuggestion("owner", setup.nonce, setup.contextKey);
+    expect(consumed?.phase).toBe("ready");
+    expect(await state.consumePendingExtensionSuggestion("owner", setup.nonce, setup.contextKey)).toBeUndefined();
+    const consumeTransaction = memory.operations.filter((entry) => entry.transaction === memory.lastTransaction());
+    expect(consumeTransaction.map((entry) => entry.kind)).toEqual(["get"]);
+    const successfulConsume = memory.operations.filter((entry) => entry.transaction === memory.lastDeleteTransaction());
+    expect(successfulConsume.map((entry) => entry.kind)).toEqual(["get", "delete"]);
+    expect(successfulConsume.every((entry) => entry.mode === "readwrite")).toBe(true);
+  });
+
+  it("does not clear a newer nonce and clears only exact invalid durable data", async () => {
+    const memory = memoryDatabase();
+    const state = Reflect.construct(LocalState as unknown as Function, [memory.database]) as LocalState;
+    const current = pendingExtensionSuggestion();
+    await state.savePendingExtensionSuggestion("owner", current);
+    expect(await state.consumePendingExtensionSuggestion(
+      "owner",
+      "11111111-1111-4111-8111-111111111111",
+      current.contextKey
+    )).toBeUndefined();
+    expect((await state.readPendingExtensionSuggestion("owner"))?.nonce).toBe(current.nonce);
+
+    memory.failNextRead();
+    await expect(state.readPendingExtensionSuggestion("owner", current.nonce)).rejects.toThrow("transient IndexedDB read");
+    expect((await state.readPendingExtensionSuggestion("owner"))?.nonce).toBe(current.nonce);
+
+    const key = memory.records.keys().find((candidate) => String(candidate).includes("pending-extension-suggestion"));
+    expect(key).toBeDefined();
+    memory.records.set(key!, { ...(memory.records.get(key!) as Record<string, unknown>), phase: "old-shape" });
+    expect(await state.readPendingExtensionSuggestion("owner", current.nonce)).toBeUndefined();
+    expect(memory.records.has(key!)).toBe(false);
+  });
+
+  it("records at most five most-recent Extension uses without duplicate identities", async () => {
+    const memory = memoryDatabase();
+    const state = Reflect.construct(LocalState as unknown as Function, [memory.database]) as LocalState;
+    const ids = Array.from({ length: 6 }, (_, index) => `extension_${index.toString(16).padStart(32, "0")}`);
+    for (const id of ids) await state.recordExtensionSuggestionUse("owner", id);
+    await state.recordExtensionSuggestionUse("owner", ids[2]!);
+    expect(await state.readRecentExtensionSuggestions("owner")).toEqual([
+      ids[2], ids[5], ids[4], ids[3], ids[1]
+    ]);
   });
 
   it("restores bounded attachment bytes and opaque approved-directory IDs without paths", () => {
@@ -311,3 +418,128 @@ describe("structured composer message references", () => {
     ])).toEqual([]);
   });
 });
+
+function pendingExtensionSuggestion(): PendingExtensionSuggestionView {
+  const attachment = new File(["attachment bytes"], "notes.txt", { type: "text/plain", lastModified: 7 });
+  const screenshot = new File([new Uint8Array([1, 2, 3])], "comment.png", { type: "image/png", lastModified: 8 });
+  return {
+    nonce: "01234567-89ab-4cde-8fab-0123456789ab",
+    phase: "ready",
+    extensionId: "extension_0123456789abcdef0123456789abcdef",
+    extensionRevision: "7",
+    owner: {
+      kind: "resource",
+      resourceId: "resource-1",
+      discoveredRevision: "sha256:resource",
+      resourceRevision: "4"
+    },
+    recommendation: {
+      id: "review-mail",
+      label: "Review mail",
+      prompt: "Review the messages needing attention.",
+      locales: { "zh-CN": { label: "检查邮件", prompt: "检查需要处理的邮件。" } }
+    },
+    selectedLabel: "Review mail",
+    selectedPrompt: "Review the messages needing attention.",
+    contextKey: JSON.stringify([1, "server", "profile", 3, "target", "target-1", "7", "backend-1", 2, "1.0", "", ""]),
+    draft: {
+      selection: { kind: "target", targetId: "target-1" },
+      nativeStart: { kind: "fresh" },
+      providerId: "provider-1",
+      modelId: "model-1",
+      fastMode: false,
+      permissionMode: "ask",
+      planMode: false,
+      text: "Review the draft",
+      editorDocument: plainTextToComposerDocument("Review the draft"),
+      mentions: [],
+      attachments: [{ id: "attachment-1", kind: "file", file: attachment }],
+      browserComments: [{
+        id: "comment-1",
+        markerNumber: 1,
+        pageUrl: "https://example.com/design",
+        target: { kind: "element", point: { x: 10, y: 20 }, viewport: { width: 800, height: 600 } },
+        comment: "Check this",
+        screenshot: { id: "comment-image-1", kind: "image", file: screenshot }
+      }],
+      extraDirectoryIds: ["extra-1"]
+    },
+    backendId: "backend-1",
+    targetId: "target-1"
+  };
+}
+
+interface MemoryOperation {
+  readonly transaction: number;
+  readonly mode: IDBTransactionMode;
+  readonly kind: "get" | "put" | "delete";
+  readonly key: IDBValidKey;
+}
+
+function memoryDatabase(): {
+  readonly database: IDBDatabase;
+  readonly records: Map<IDBValidKey, unknown>;
+  readonly operations: MemoryOperation[];
+  readonly lastTransaction: () => number;
+  readonly lastDeleteTransaction: () => number;
+  readonly failNextRead: () => void;
+} {
+  const records = new Map<IDBValidKey, unknown>();
+  const operations: MemoryOperation[] = [];
+  let sequence = 0;
+  let nextReadFails = false;
+  const database = {
+    transaction: (_store: string, mode: IDBTransactionMode) => {
+      const transactionId = ++sequence;
+      const transaction = {
+        error: null,
+        oncomplete: null as ((event: Event) => void) | null,
+        onabort: null as ((event: Event) => void) | null,
+        onerror: null as ((event: Event) => void) | null,
+        abort: () => setTimeout(() => transaction.onabort?.(new Event("abort")), 0),
+        objectStore: () => ({
+          get: (key: IDBValidKey) => {
+            operations.push({ transaction: transactionId, mode, kind: "get", key });
+            const request = {
+              result: undefined as unknown,
+              error: null as DOMException | null,
+              onsuccess: null as ((event: Event) => void) | null,
+              onerror: null as ((event: Event) => void) | null
+            };
+            queueMicrotask(() => {
+              if (nextReadFails) {
+                nextReadFails = false;
+                request.error = new DOMException("transient IndexedDB read", "UnknownError");
+                request.onerror?.(new Event("error"));
+                return;
+              }
+              request.result = records.get(key);
+              request.onsuccess?.(new Event("success"));
+            });
+            return request as unknown as IDBRequest<unknown>;
+          },
+          put: (value: unknown, key: IDBValidKey) => {
+            operations.push({ transaction: transactionId, mode, kind: "put", key });
+            records.set(key, value);
+            return {} as IDBRequest<IDBValidKey>;
+          },
+          delete: (key: IDBValidKey) => {
+            operations.push({ transaction: transactionId, mode, kind: "delete", key });
+            records.delete(key);
+            return {} as IDBRequest<undefined>;
+          }
+        })
+      };
+      setTimeout(() => transaction.oncomplete?.(new Event("complete")), 0);
+      return transaction as unknown as IDBTransaction;
+    }
+  } as unknown as IDBDatabase;
+  return {
+    database,
+    records,
+    operations,
+    lastTransaction: () => sequence,
+    lastDeleteTransaction: () => operations.findLast((entry) => entry.kind === "delete")?.transaction ?? -1,
+    failNextRead: () => { nextReadFails = true; }
+  };
+}

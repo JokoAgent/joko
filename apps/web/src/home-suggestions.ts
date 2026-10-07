@@ -45,6 +45,8 @@ export interface HomeSuggestionCandidate {
   readonly category: string;
   readonly extensionId?: string;
   readonly needsInstall?: boolean;
+  /** An explicit intermediate Extension action owned by the host UI. */
+  readonly guide?: "install" | "enable" | "setup";
 }
 
 export interface HomeSuggestionBatchOptions<T extends HomeSuggestionCandidate> {
@@ -66,7 +68,7 @@ export function selectHomeSuggestionBatch<T extends HomeSuggestionCandidate>(
   const ids = new Set<string>();
   const categories = new Set<string>();
   const extensions = new Set<string>();
-  let installGuideSelected = false;
+  let extensionGuideSelected = false;
   // A withdrawn candidate cannot be revived merely because its old ID was pinned.
   const pinned = candidates.find(({ id }) => id === pinnedId);
   for (const candidate of [...(pinned === undefined ? [] : [pinned]), ...candidates, ...fallback]) {
@@ -74,7 +76,7 @@ export function selectHomeSuggestionBatch<T extends HomeSuggestionCandidate>(
       ids.has(candidate.id)
       || categories.has(candidate.category)
       || candidate.extensionId !== undefined && extensions.has(candidate.extensionId)
-      || candidate.needsInstall === true && installGuideSelected
+      || (candidate.guide !== undefined || candidate.needsInstall === true) && extensionGuideSelected
     ) {
       continue;
     }
@@ -82,7 +84,7 @@ export function selectHomeSuggestionBatch<T extends HomeSuggestionCandidate>(
     ids.add(candidate.id);
     categories.add(candidate.category);
     if (candidate.extensionId !== undefined) extensions.add(candidate.extensionId);
-    if (candidate.needsInstall === true) installGuideSelected = true;
+    if (candidate.guide !== undefined || candidate.needsInstall === true) extensionGuideSelected = true;
     if (selected.length === size) break;
   }
   return selected;

@@ -34,6 +34,9 @@ import type {
   InteractionView,
   McpServerView,
   NewSessionDraft,
+  NewSessionLocalDraft,
+  PendingExtensionSuggestionView,
+  PendingExtensionUseView,
   PermissionMode,
   ProviderLoginFlowView,
   ScheduleDeletionResultView,
@@ -110,6 +113,10 @@ export function VisualHarness(): JSX.Element {
   } : undefined, []);
   const drafts = useRef(new Map<string, ComposerDraft>(protectedStorageDraft === undefined ? [] : [["session-1", protectedStorageDraft]]));
   const draftRevisions = useRef(new Map<string, number>());
+  const newSessionDraft = useRef<NewSessionLocalDraft | undefined>(undefined);
+  const pendingExtensionUse = useRef<PendingExtensionUseView | undefined>(undefined);
+  const pendingExtensionSuggestion = useRef<PendingExtensionSuggestionView | undefined>(undefined);
+  const recentExtensionSuggestions = useRef<readonly string[]>([]);
   const draftActions = useMemo(() => ({
     readDraft: async (sessionId: string): Promise<ComposerDraft | undefined> => drafts.current.get(sessionId),
     saveDraft: async (sessionId: string, draft: ComposerDraft): Promise<void> => {
@@ -133,6 +140,13 @@ export function VisualHarness(): JSX.Element {
   const sequence = useRef(100);
   const extensionPackageExports = useRef(new Map<string, ExtensionPackageExportJobView>());
   const [state, setState] = useState<ControllerState>(() => initialControllerState(scenario, files));
+  const sessionFixture = useRef(state.snapshot.sessions);
+  sessionFixture.current = state.snapshot.sessions;
+  const extensionFixture = useRef({
+    catalogRevision: state.snapshot.extensionCatalogRevision,
+    extensions: state.snapshot.extensions,
+    resources: state.snapshot.resources
+  });
   const interactionFixture = useMemo(() => new VisualInteractionFixture(visualInteractionJourney()), []);
   const historyMaintenance = useMemo(() => new VisualHistoryMaintenanceFixture(), []);
   const artifactStorage = useMemo(() => new VisualArtifactStorageFixture(), []);
@@ -269,6 +283,50 @@ export function VisualHarness(): JSX.Element {
   const updateSnapshot = (change: (snapshot: AppSnapshot) => AppSnapshot): void => {
     setState((current) => ({ ...current, snapshot: change(current.snapshot) }));
   };
+  const publishExtensionFixture = (change: (current: {
+    readonly catalogRevision: bigint;
+    readonly extensions: readonly ExtensionCatalogEntryView[];
+    readonly resources: AppSnapshot["resources"];
+  }) => {
+    readonly catalogRevision: bigint;
+    readonly extensions: readonly ExtensionCatalogEntryView[];
+    readonly resources: AppSnapshot["resources"];
+  }): void => {
+    const next = change(extensionFixture.current);
+    extensionFixture.current = next;
+    setState((current) => ({
+      ...current,
+      snapshot: {
+        ...current.snapshot,
+        revision: current.snapshot.revision + 1n,
+        extensionCatalogRevision: next.catalogRevision,
+        extensions: next.extensions,
+        resources: next.resources
+      }
+    }));
+  };
+  const mutateVisualExtension = (
+    extensionId: string,
+    expectedRevision: bigint,
+    change: (extension: ExtensionCatalogEntryView) => ExtensionCatalogEntryView,
+    changeResources: (
+      resources: AppSnapshot["resources"],
+      extension: ExtensionCatalogEntryView
+    ) => AppSnapshot["resources"] = (resources) => resources
+  ): void => {
+    publishExtensionFixture((current) => {
+      const extension = current.extensions.find((candidate) => candidate.id === extensionId);
+      if (extension === undefined || extension.revision !== expectedRevision) {
+        throw new Error("The visual extension changed. Refresh and try again.");
+      }
+      const next = change(extension);
+      return {
+        catalogRevision: current.catalogRevision + 1n,
+        extensions: current.extensions.map((candidate) => candidate.id === extensionId ? next : candidate),
+        resources: changeResources(current.resources, next)
+      };
+    });
+  };
   const providerStateRef = useRef(state);
   providerStateRef.current = state;
   const providerActions = useMemo(() => ({
@@ -287,6 +345,25 @@ export function VisualHarness(): JSX.Element {
         credentials: [...snapshot.settings.credentials.filter((item) => item.id !== id), { id, name, kind, providerId, configured: true }] } }));
     }
   }), []);
+  const send = useMemo<AppController["send"]>(() => async (sessionId, draft, admission) => {
+    if (sessionFixture.current.find((session) => session.id === sessionId)?.generation !== admission.expectedGeneration) {
+      throw new Error("The source task generation has changed.");
+    }
+    record(`send:${sessionId}:${draft.deliveryMode}${scenario.artifact
+      ? `:artifacts:${JSON.stringify(draft.mentions.filter((mention) => mention.kind === "artifact").map((mention) => mention.reference))}` : ""}`);
+    setState((current) => {
+      const timeline = current.snapshot.timelineBySession.get(sessionId) ?? [];
+      const timelineBySession = new Map(current.snapshot.timelineBySession);
+      timelineBySession.set(sessionId, [...timeline, {
+        id: `harness-message-${sequence.current}`,
+        sequence: BigInt(sequence.current++),
+        kind: "user" as const,
+        createdAt: FIXED_NOW,
+        text: draft.text
+      }]);
+      return { ...current, snapshot: { ...current.snapshot, timelineBySession } };
+    });
+  }, []);
   const updateSession = (sessionId: string, change: (session: SessionView) => SessionView): void => {
     updateSnapshot((snapshot) => ({
       ...snapshot,
@@ -440,28 +517,31 @@ export function VisualHarness(): JSX.Element {
       listExtensions: async (options = {}): Promise<ExtensionCatalogView> => {
         options.signal?.throwIfAborted();
         const query = options.query?.trim().toLocaleLowerCase("en-US") ?? "";
-        const extensions = state.snapshot.extensions
+        const fixture = extensionFixture.current;
+        const extensions = visualExtensionsForSession(fixture.extensions, options.sessionId, sessionFixture.current)
           .filter((extension) => options.source === undefined || extension.source === options.source)
           .filter((extension) => options.installed === undefined || extension.installed === options.installed)
           .filter((extension) => query === "" || [extension.name, extension.description, extension.author ?? ""]
             .join("\n").toLocaleLowerCase("en-US").includes(query));
         return {
-          revision: state.snapshot.extensionCatalogRevision,
+          revision: fixture.catalogRevision,
           extensions,
           recoveredFromCorruption: state.snapshot.extensionCatalogRecovered
         };
       },
       getExtension: async (extensionId, _sessionId, signal): Promise<ExtensionCatalogView> => {
         signal?.throwIfAborted();
+        const fixture = extensionFixture.current;
         return {
-          revision: state.snapshot.extensionCatalogRevision,
-          extensions: state.snapshot.extensions.filter((extension) => extension.id === extensionId),
+          revision: fixture.catalogRevision,
+          extensions: visualExtensionsForSession(fixture.extensions, _sessionId, sessionFixture.current)
+            .filter((extension) => extension.id === extensionId),
           recoveredFromCorruption: state.snapshot.extensionCatalogRecovered
         };
       },
       openExtensionMainView: async (extensionId, expectedRevision, signal): Promise<ExtensionMainViewSurfaceView> => {
         signal?.throwIfAborted();
-        const extension = state.snapshot.extensions.find((candidate) => candidate.id === extensionId);
+        const extension = extensionFixture.current.extensions.find((candidate) => candidate.id === extensionId);
         if (extension === undefined || extension.revision !== expectedRevision || extension.owner.kind !== "resource"
           || extension.mainView === undefined) throw new Error("The visual Extension main view changed.");
         record(`extension-main-view:open:${extensionId}`);
@@ -469,7 +549,7 @@ export function VisualHarness(): JSX.Element {
       },
       getExtensionMainViewSurface: async (surfaceId, signal): Promise<ExtensionMainViewSurfaceView> => {
         signal?.throwIfAborted();
-        const extension = state.snapshot.extensions.find((candidate) => candidate.id === "extension_0123456789abcdef0123456789abcdef");
+        const extension = extensionFixture.current.extensions.find((candidate) => candidate.id === "extension_0123456789abcdef0123456789abcdef");
         if (extension === undefined || extension.owner.kind !== "resource" || extension.mainView === undefined
           || surfaceId !== "extension_surface_0123456789abcdef0123456789abcdef") {
           throw new Error("The visual Extension main view is unavailable.");
@@ -482,17 +562,92 @@ export function VisualHarness(): JSX.Element {
       },
       getExtensionPackagePreview: async (extensionId, expectedRevision, backendId, signal): Promise<ExtensionPackagePreviewView> => {
         signal?.throwIfAborted();
-        const extension = state.snapshot.extensions.find((candidate) => candidate.id === extensionId);
+        const extension = extensionFixture.current.extensions.find((candidate) => candidate.id === extensionId);
         if (extension === undefined || extension.revision !== expectedRevision) throw new Error("The visual extension changed. Refresh and try again.");
         if (!state.snapshot.backends.some((backend) => backend.id === backendId)) throw new Error("The visual backend is unavailable.");
         return visualExtensionPackagePreview(extension, backendId);
       },
-      adoptExtensionPackage: async (preview, allowSourceReplacement): Promise<void> => {
+      adoptExtensionPackage: async (preview, allowSourceReplacement, signal): Promise<void> => {
+        signal?.throwIfAborted();
         if (preview.sourceReplacement && allowSourceReplacement !== true) throw new Error("Confirm the visual source replacement first.");
+        if (!state.snapshot.backends.some((backend) => backend.id === preview.backendId)) {
+          throw new Error("The visual backend is unavailable.");
+        }
+        const current = extensionFixture.current;
+        const extension = current.extensions.find((candidate) => candidate.id === preview.extensionId);
+        if (extension === undefined || extension.revision !== preview.extensionRevision) {
+          throw new Error("The visual extension changed. Refresh and try again.");
+        }
+        if (preview.action === "install" && extension.owner.kind !== "source") {
+          throw new Error("The visual extension is already installed.");
+        }
+        if (preview.action !== "install" && (extension.owner.kind !== "resource"
+          || extension.owner.resourceId !== preview.resourceId
+          || preview.currentResource?.resourceId !== preview.resourceId
+          || preview.currentResource.resourceRevision !== extension.owner.resourceRevision)) {
+          throw new Error("The visual installed extension changed. Refresh and try again.");
+        }
+        const discoveredRevision = preview.action === "install"
+          ? `sha256:${"d".repeat(64)}`
+          : `sha256:${"e".repeat(64)}`;
+        const resourceRevision = extension.owner.kind === "resource" ? extension.owner.resourceRevision + 1n : 1n;
+        const enabled = preview.action === "install" ? false : preview.preservesEnabled;
+        const setup: ExtensionCatalogEntryView["setup"] = preview.action === "install"
+          ? {
+              state: "required",
+              revision: 0n,
+              fields: [{
+                id: "workspace-read-confirmation",
+                label: "Workspace access",
+                description: "Confirm access to committed workspace changes for release-note preparation.",
+                kind: "confirmation",
+                required: true,
+                configured: false,
+                options: []
+              }]
+            }
+          : extension.setup;
+        const { update: _update, ...descriptor } = extension;
+        const nextExtension: ExtensionCatalogEntryView = {
+          ...descriptor,
+          revision: extension.revision + 1n,
+          owner: { kind: "resource", resourceId: preview.resourceId, discoveredRevision, resourceRevision },
+          installed: true,
+          installState: "installed",
+          ...(preview.availableVersion === undefined ? {} : { version: preview.availableVersion }),
+          enabled,
+          setup,
+          useSupported: enabled && (setup.state === "ready" || setup.state === "notRequired")
+        };
+        const previousResource = current.resources.find((resource) => resource.id === preview.resourceId);
+        const resource: AppSnapshot["resources"][number] = {
+          id: preview.resourceId,
+          backendId: preview.backendId,
+          name: preview.packageName,
+          ...(preview.availableVersion === undefined ? {} : { version: preview.availableVersion }),
+          kind: "package",
+          scope: previousResource?.scope ?? "managed",
+          state: enabled ? "loaded" : "disabled",
+          enabled,
+          source: previousResource?.source ?? "Community tools / packages/release-notes",
+          discoveredRevision,
+          compatibilityDetails: preview.compatibilityDetails,
+          runtimeRequirements: preview.runtimeRequirements,
+          warnings: preview.warnings,
+          disabledLifecycleScripts: preview.disabledLifecycleScripts,
+          canToggle: preview.canToggle,
+          requiresExtensionApproval: false,
+          postMutationNotice: true
+        };
+        publishExtensionFixture(() => ({
+          catalogRevision: current.catalogRevision + 1n,
+          extensions: current.extensions.map((candidate) => candidate.id === extension.id ? nextExtension : candidate),
+          resources: [...current.resources.filter((candidate) => candidate.id !== resource.id), resource]
+        }));
         record(`extension-package:${preview.action}:${preview.resourceId}`);
       },
       removeExtensionPackage: async (extensionId, expectedRevision): Promise<void> => {
-        const extension = state.snapshot.extensions.find((candidate) => candidate.id === extensionId);
+        const extension = extensionFixture.current.extensions.find((candidate) => candidate.id === extensionId);
         if (extension === undefined || extension.revision !== expectedRevision || extension.owner.kind !== "resource") {
           throw new Error("The visual extension changed. Refresh and try again.");
         }
@@ -500,7 +655,7 @@ export function VisualHarness(): JSX.Element {
       },
       getExtensionPackageExportPreview: async (extensionId, expectedRevision, signal): Promise<ExtensionPackageExportPreviewView> => {
         signal?.throwIfAborted();
-        const extension = state.snapshot.extensions.find((candidate) => candidate.id === extensionId);
+        const extension = extensionFixture.current.extensions.find((candidate) => candidate.id === extensionId);
         if (extension === undefined || extension.revision !== expectedRevision || extension.owner.kind !== "resource") {
           throw new Error("The visual installed extension changed. Refresh and try again.");
         }
@@ -613,7 +768,219 @@ export function VisualHarness(): JSX.Element {
       addExtensionSource: async (source, revision): Promise<void> => { record(`extension-source:add:${source.kind}:${revision.toString(10)}`); },
       refreshExtensionSource: async (sourceId, revision): Promise<void> => { record(`extension-source:refresh:${sourceId}:${revision.toString(10)}`); },
       removeExtensionSource: async (sourceId, revision): Promise<void> => { record(`extension-source:remove:${sourceId}:${revision.toString(10)}`); },
-      savePendingExtensionUse: async (value): Promise<void> => { record(`extension-use:${value.extensionId}:${value.commandName}`); },
+      setExtensionEnabled: async (extensionId, enabled, expectedRevision): Promise<void> => {
+        mutateVisualExtension(extensionId, expectedRevision, (extension) => {
+          if (!extension.installed || extension.owner.kind === "source") {
+            throw new Error("The visual extension is not installed.");
+          }
+          return {
+            ...extension,
+            revision: extension.revision + 1n,
+            owner: advanceVisualExtensionOwner(extension.owner),
+            enabled,
+            useSupported: enabled && (extension.setup.state === "ready" || extension.setup.state === "notRequired")
+          };
+        }, (resources, extension) => {
+          const owner = extension.owner;
+          return owner.kind !== "resource" ? resources : resources.map((resource) => (
+            resource.id === owner.resourceId
+              ? { ...resource, enabled, state: enabled ? "loaded" as const : "disabled" as const }
+              : resource
+          ));
+        });
+        record(`extension-enabled:${extensionId}:${enabled ? "on" : "off"}`);
+      },
+      setExtensionSidebarVisible: async (extensionId, visible, expectedRevision): Promise<void> => {
+        mutateVisualExtension(extensionId, expectedRevision, (extension) => {
+          if (!extension.installed || !extension.sidebarSupported || extension.owner.kind === "source") {
+            throw new Error("The visual Extension sidebar is unavailable.");
+          }
+          return {
+            ...extension,
+            revision: extension.revision + 1n,
+            owner: advanceVisualExtensionOwner(extension.owner),
+            sidebarVisible: visible
+          };
+        });
+        record(`extension-sidebar:${extensionId}:${visible ? "shown" : "hidden"}`);
+      },
+      beginExtensionSetup: async (extensionId, expectedRevision): Promise<void> => {
+        const attemptId = `visual-extension-setup-${sequence.current++}`;
+        mutateVisualExtension(extensionId, expectedRevision, (extension) => {
+          if (!extension.installed || extension.owner.kind === "source" || extension.setup.state === "notRequired") {
+            throw new Error("The visual Extension setup is unavailable.");
+          }
+          return {
+            ...extension,
+            revision: extension.revision + 1n,
+            owner: advanceVisualExtensionOwner(extension.owner),
+            setup: {
+              ...extension.setup,
+              state: "inProgress",
+              attemptId,
+              revision: extension.setup.revision + 1n
+            },
+            useSupported: false
+          };
+        });
+        record(`extension-setup:begin:${extensionId}:${attemptId}`);
+      },
+      submitExtensionSetupInteraction: async (extensionId, attemptId, fieldId, value, expectedRevision): Promise<void> => {
+        mutateVisualExtension(extensionId, expectedRevision, (extension) => {
+          if (extension.setup.state !== "inProgress" || extension.setup.attemptId !== attemptId) {
+            throw new Error("The visual Extension setup attempt changed.");
+          }
+          const field = extension.setup.fields.find((candidate) => candidate.id === fieldId);
+          if (field === undefined || field.kind === "secret" || field.kind === "oauth") {
+            throw new Error("The visual Extension setup field is unavailable.");
+          }
+          const configured = typeof value === "boolean" ? value : value.trim().length > 0;
+          return {
+            ...extension,
+            revision: extension.revision + 1n,
+            owner: advanceVisualExtensionOwner(extension.owner),
+            setup: {
+              ...extension.setup,
+              revision: extension.setup.revision + 1n,
+              fields: extension.setup.fields.map((candidate) => candidate.id === fieldId
+                ? { ...candidate, configured }
+                : candidate)
+            }
+          };
+        });
+        record(`extension-setup:field:${extensionId}:${fieldId}`);
+      },
+      saveExtensionSetupCredential: async (extensionId, attemptId, fieldId, _kind, secret, expectedRevision, signal): Promise<void> => {
+        signal?.throwIfAborted();
+        mutateVisualExtension(extensionId, expectedRevision, (extension) => {
+          if (extension.setup.state !== "inProgress" || extension.setup.attemptId !== attemptId) {
+            throw new Error("The visual Extension setup attempt changed.");
+          }
+          const field = extension.setup.fields.find((candidate) => candidate.id === fieldId);
+          if (field === undefined || field.kind !== "secret" || secret.trim().length === 0) {
+            throw new Error("The visual Extension credential is unavailable.");
+          }
+          return {
+            ...extension,
+            revision: extension.revision + 1n,
+            owner: advanceVisualExtensionOwner(extension.owner),
+            setup: {
+              ...extension.setup,
+              revision: extension.setup.revision + 1n,
+              fields: extension.setup.fields.map((candidate) => candidate.id === fieldId
+                ? { ...candidate, configured: true }
+                : candidate)
+            }
+          };
+        });
+        record(`extension-setup:credential:${extensionId}:${fieldId}`);
+      },
+      completeExtensionSetup: async (extensionId, attemptId, expectedRevision): Promise<void> => {
+        mutateVisualExtension(extensionId, expectedRevision, (extension) => {
+          if (extension.setup.state !== "inProgress" || extension.setup.attemptId !== attemptId
+            || extension.setup.fields.some((field) => field.required && !field.configured)) {
+            throw new Error("Complete every required visual Extension setup field first.");
+          }
+          const { attemptId: _attemptId, error: _error, ...setup } = extension.setup;
+          return {
+            ...extension,
+            revision: extension.revision + 1n,
+            owner: advanceVisualExtensionOwner(extension.owner),
+            setup: { ...setup, state: "ready", revision: extension.setup.revision + 1n },
+            useSupported: extension.enabled
+          };
+        });
+        record(`extension-setup:complete:${extensionId}`);
+      },
+      cancelExtensionSetup: async (extensionId, attemptId, expectedRevision): Promise<void> => {
+        mutateVisualExtension(extensionId, expectedRevision, (extension) => {
+          if (extension.setup.state !== "inProgress" || extension.setup.attemptId !== attemptId) {
+            throw new Error("The visual Extension setup attempt changed.");
+          }
+          const { attemptId: _attemptId, error: _error, ...setup } = extension.setup;
+          return {
+            ...extension,
+            revision: extension.revision + 1n,
+            owner: advanceVisualExtensionOwner(extension.owner),
+            setup: { ...setup, state: "cancelled", revision: extension.setup.revision + 1n },
+            useSupported: false
+          };
+        });
+        record(`extension-setup:cancel:${extensionId}`);
+      },
+      revokeExtensionSetup: async (extensionId, expectedRevision): Promise<void> => {
+        mutateVisualExtension(extensionId, expectedRevision, (extension) => {
+          if (!extension.installed || extension.owner.kind === "source" || extension.setup.state === "notRequired") {
+            throw new Error("The visual Extension setup is unavailable.");
+          }
+          const { attemptId: _attemptId, error: _error, ...setup } = extension.setup;
+          return {
+            ...extension,
+            revision: extension.revision + 1n,
+            owner: advanceVisualExtensionOwner(extension.owner),
+            setup: {
+              ...setup,
+              state: "required",
+              revision: extension.setup.revision + 1n,
+              fields: extension.setup.fields.map((field) => ({ ...field, configured: false }))
+            },
+            useSupported: false
+          };
+        });
+        record(`extension-setup:revoke:${extensionId}`);
+      },
+      readNewSessionDraft: async (): Promise<NewSessionLocalDraft | undefined> => newSessionDraft.current,
+      saveNewSessionDraft: async (draft): Promise<void> => {
+        newSessionDraft.current = draft;
+      },
+      clearNewSessionDraft: async (): Promise<void> => {
+        newSessionDraft.current = undefined;
+        pendingExtensionUse.current = undefined;
+        record("new-session-draft:clear");
+      },
+      readPendingExtensionUse: async (): Promise<PendingExtensionUseView | undefined> => pendingExtensionUse.current,
+      savePendingExtensionUse: async (value): Promise<void> => {
+        pendingExtensionUse.current = value;
+        record(`extension-use:${value.extensionId}:${value.commandName}`);
+      },
+      clearPendingExtensionUse: async (): Promise<void> => {
+        pendingExtensionUse.current = undefined;
+        record("extension-use:clear");
+      },
+      readPendingExtensionSuggestion: async (nonce): Promise<PendingExtensionSuggestionView | undefined> => {
+        const current = pendingExtensionSuggestion.current;
+        return current !== undefined && (nonce === undefined || current.nonce === nonce) ? current : undefined;
+      },
+      savePendingExtensionSuggestion: async (value): Promise<void> => {
+        pendingExtensionSuggestion.current = value;
+        record(`extension-recommendation:save:${value.nonce}`);
+      },
+      compareAndSetPendingExtensionSuggestion: async (expected, next): Promise<boolean> => {
+        const current = pendingExtensionSuggestion.current;
+        if (current === undefined || !sameVisualPendingExtensionSuggestion(current, expected)) return false;
+        if (next !== undefined && next.nonce !== expected.nonce) {
+          throw new Error("A visual Extension recommendation cannot change its nonce.");
+        }
+        pendingExtensionSuggestion.current = next;
+        record(`extension-recommendation:${next === undefined ? "clear" : `advance:${next.phase}`}:${expected.nonce}`);
+        return true;
+      },
+      consumePendingExtensionSuggestion: async (nonce, contextKey): Promise<PendingExtensionSuggestionView | undefined> => {
+        const current = pendingExtensionSuggestion.current;
+        if (current?.nonce !== nonce) return undefined;
+        pendingExtensionSuggestion.current = undefined;
+        const consumed = current.phase === "ready" && current.contextKey === contextKey ? current : undefined;
+        record(`extension-recommendation:${consumed === undefined ? "discard" : "consume"}:${nonce}`);
+        return consumed;
+      },
+      readRecentExtensionSuggestions: async (): Promise<readonly string[]> => recentExtensionSuggestions.current,
+      recordExtensionSuggestionUse: async (extensionId): Promise<void> => {
+        recentExtensionSuggestions.current = [
+          extensionId,
+          ...recentExtensionSuggestions.current.filter((candidate) => candidate !== extensionId)
+        ].slice(0, 5);
+        record(`extension-recommendation:used:${extensionId}`);
+      },
       beginProviderLogin: async (_backendId, providerId, method): Promise<ProviderLoginFlowView> => {
         const now = FIXED_NOW + sequence.current++;
         const id = `visual-provider-login-${sequence.current}`;
@@ -1123,25 +1490,7 @@ export function VisualHarness(): JSX.Element {
         }));
       },
       dismissExtensionNotification: (): void => undefined,
-      send: async (sessionId: string, draft: ComposerDraft, admission: { readonly expectedGeneration: bigint }): Promise<void> => {
-        if (state.snapshot.sessions.find(session => session.id === sessionId)?.generation !== admission.expectedGeneration) {
-          throw new Error("The source task generation has changed.");
-        }
-        record(`send:${sessionId}:${draft.deliveryMode}${scenario.artifact
-          ? `:artifacts:${JSON.stringify(draft.mentions.filter((mention) => mention.kind === "artifact").map((mention) => mention.reference))}` : ""}`);
-        updateSnapshot((snapshot) => {
-          const current = snapshot.timelineBySession.get(sessionId) ?? [];
-          const timelineBySession = new Map(snapshot.timelineBySession);
-          timelineBySession.set(sessionId, [...current, {
-            id: `harness-message-${sequence.current}`,
-            sequence: BigInt(sequence.current++),
-            kind: "user" as const,
-            createdAt: FIXED_NOW,
-            text: draft.text
-          }]);
-          return { ...snapshot, timelineBySession };
-        });
-      },
+      send,
       reobserveReview: async (reviewRunId: string): Promise<void> => {
         record(`review:reobserve:${reviewRunId}`);
         updateSnapshot((snapshot) => {
@@ -1937,6 +2286,7 @@ export function VisualHarness(): JSX.Element {
           planMode: draft.planMode,
           updatedAt: FIXED_NOW + sequence.current
         };
+        sessionFixture.current = [...sessionFixture.current, next];
         updateSnapshot((snapshot) => ({ ...snapshot, sessions: [...snapshot.sessions, next] }));
         record(`session-create:${id}`);
         return { sessionId: id, generation: next.generation };
@@ -1949,7 +2299,7 @@ export function VisualHarness(): JSX.Element {
         return async (): Promise<undefined> => undefined;
       }
     }) as unknown as AppController;
-  }, [artifactActions, artifactStorage, draftActions, historyMaintenance, interactionFixture, mcpActions, remoteHosts, state, toolPolicy, usageHistory]);
+  }, [artifactActions, artifactStorage, draftActions, historyMaintenance, interactionFixture, mcpActions, remoteHosts, send, state, toolPolicy, usageHistory]);
 
   if (scenario.scenario === "usage") return <main style={{ maxWidth: 1040, margin: "0 auto" }}>
     <UsageHistorySection controller={controller} t={(key, values) => translate(state.effectiveLocale, key, values)} />
@@ -1961,6 +2311,51 @@ export function VisualHarness(): JSX.Element {
       ? { sessionId: VISUAL_SUBAGENT_SESSION_ID, runId: "", requestId: 1 }
       : undefined}
   />;
+}
+
+function advanceVisualExtensionOwner(
+  owner: ExtensionCatalogEntryView["owner"]
+): ExtensionCatalogEntryView["owner"] {
+  switch (owner.kind) {
+    case "resource":
+      return { ...owner, resourceRevision: owner.resourceRevision + 1n };
+    case "mcp":
+      return { ...owner, serverRevision: owner.serverRevision + 1n };
+    case "source":
+      return owner;
+  }
+}
+
+function visualExtensionsForSession(
+  extensions: readonly ExtensionCatalogEntryView[],
+  sessionId: string | undefined,
+  sessions: readonly SessionView[]
+): readonly ExtensionCatalogEntryView[] {
+  if (sessionId === undefined) return extensions;
+  const sessionExists = sessions.some((session) => session.id === sessionId && !session.archived && session.state !== "closed");
+  return extensions.map((extension) => ({
+    ...extension,
+    commands: sessionExists
+      ? extension.commands.map((command) => ({ ...command, sessionId }))
+      : []
+  }));
+}
+
+function sameVisualPendingExtensionSuggestion(
+  left: PendingExtensionSuggestionView,
+  right: PendingExtensionSuggestionView
+): boolean {
+  return visualPendingExtensionSuggestionJson(left) === visualPendingExtensionSuggestionJson(right);
+}
+
+function visualPendingExtensionSuggestionJson(value: PendingExtensionSuggestionView): string {
+  return JSON.stringify(value, (_key, item: unknown) => {
+    if (typeof item === "bigint") return { $bigint: item.toString(10) };
+    if (typeof File !== "undefined" && item instanceof File) {
+      return { $file: [item.name, item.type, item.size, item.lastModified] };
+    }
+    return item;
+  });
 }
 
 const VISUAL_SUBAGENT_LONG_REPORT = [
@@ -3198,6 +3593,7 @@ function visualSnapshot(parameters: HarnessParameters, files: VisualWorkspaceFil
     capabilities.set("input.mention", capability("input.mention", ["artifact"]));
   }
   if (parameters.scenario === "extensions") {
+    capabilities.set("input.text", capability("input.text"));
     capabilities.set("runtime.resources", capability("runtime.resources", ["package", "extension"]));
   }
   const providerConfiguration: AppSnapshot["settings"]["providers"][number] = {
@@ -3964,7 +4360,7 @@ function visualExtensions(): readonly ExtensionCatalogEntryView[] {
     owner: {
       kind: "resource",
       resourceId: "visual-extension-resource",
-      discoveredRevision: "sha256:visual-extension-owner",
+      discoveredRevision: `sha256:${"c".repeat(64)}`,
       resourceRevision: 4n
     },
     source: "local",
@@ -3981,6 +4377,39 @@ function visualExtensions(): readonly ExtensionCatalogEntryView[] {
     tools: [{ name: "find_workspace_entry", description: "Find an exact file or directory in the active workspace.", requiresPermission: true }],
     permissions: [{ id: "workspace-read", label: "Workspace read", description: "Reads project names and file metadata after task permission checks.", required: true, granted: true }],
     commands: [{ name: "open-nav", description: "Start a task with the workspace navigator.", sessionId: "session-1" }],
+    recommendations: [
+      {
+        id: "map-workspace",
+        label: "Map this workspace",
+        prompt: "Map the workspace structure and identify the most important entry points.",
+        locales: {
+          en: {
+            label: "Map this workspace",
+            prompt: "Map the workspace structure and identify the most important entry points."
+          },
+          "zh-CN": {
+            label: "梳理工作区结构",
+            prompt: "梳理工作区结构，并找出最重要的入口点。"
+          }
+        }
+      },
+      {
+        id: "open-workspace-map",
+        label: "Open a workspace map",
+        prompt: "Map the current workspace and highlight its main entry points.",
+        command: "open-nav",
+        locales: {
+          en: {
+            label: "Open a workspace map",
+            prompt: "Map the current workspace and highlight its main entry points."
+          },
+          "zh-CN": {
+            label: "打开工作区地图",
+            prompt: "梳理当前工作区，并突出显示主要入口点。"
+          }
+        }
+      }
+    ],
     setup: { state: "notRequired", revision: 0n, fields: [] },
     update: {
       source: {
@@ -4040,6 +4469,21 @@ function visualExtensions(): readonly ExtensionCatalogEntryView[] {
     tools: [{ name: "draft_release_notes", description: "Draft release notes for the selected revision range.", requiresPermission: true }],
     permissions: [{ id: "workspace-read", label: "Workspace read", description: "Reads committed changes after task permission checks.", required: true, granted: false }],
     commands: [],
+    recommendations: [{
+      id: "prepare-release-brief",
+      label: "Prepare a release brief",
+      prompt: "Prepare concise release notes from the selected revision range.",
+      locales: {
+        en: {
+          label: "Prepare a release brief",
+          prompt: "Prepare concise release notes from the selected revision range."
+        },
+        "zh-CN": {
+          label: "整理发布摘要",
+          prompt: "根据选定的版本范围整理简洁的发布说明。"
+        }
+      }
+    }],
     setup: { state: "notRequired", revision: 0n, fields: [] },
     useSupported: false
   }];

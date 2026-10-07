@@ -3778,6 +3778,19 @@ export interface McpEnvironmentVariableView {
   readonly value: string;
 }
 
+/** Optional author-supplied task entry. It is user content, not a capability
+ * grant or a model-system instruction. */
+export interface ExtensionRecommendationView {
+  readonly id: string;
+  readonly label: string;
+  readonly prompt: string;
+  readonly command?: string;
+  readonly locales?: Readonly<Partial<Record<"en" | "zh-CN", {
+    readonly label: string;
+    readonly prompt: string;
+  }>>>;
+}
+
 export interface ExtensionCatalogEntryView {
   readonly id: string;
   readonly revision: bigint;
@@ -3815,6 +3828,7 @@ export interface ExtensionCatalogEntryView {
     readonly granted: boolean;
   }[];
   readonly commands: readonly { readonly name: string; readonly description: string; readonly sessionId: string }[];
+  readonly recommendations?: readonly ExtensionRecommendationView[];
   readonly setup: {
     readonly state: "notRequired" | "required" | "inProgress" | "ready" | "cancelled" | "failed";
     readonly attemptId?: string;
@@ -4142,6 +4156,36 @@ export interface PendingExtensionUseView {
   readonly owner:
     | { readonly kind: "resource"; readonly resourceId: string; readonly discoveredRevision: string; readonly resourceRevision: string }
     | { readonly kind: "mcp"; readonly serverId: string; readonly serverRevision: string };
+}
+
+/** Owner-scoped durable one-shot handoff for an Extension-authored task
+ * recommendation. The original descriptor and the localized selection are
+ * both frozen so a later catalog refresh cannot silently replace user input. */
+export interface PendingExtensionSuggestionView {
+  readonly nonce: string;
+  readonly phase: "setup" | "ready";
+  readonly extensionId: string;
+  readonly extensionRevision: string;
+  readonly owner:
+    | { readonly kind: "resource"; readonly resourceId: string; readonly discoveredRevision: string; readonly resourceRevision: string }
+    | { readonly kind: "mcp"; readonly serverId: string; readonly serverRevision: string }
+    | {
+        readonly kind: "source";
+        readonly sourceId: string;
+        readonly sourceRevision: string;
+        readonly entryId: string;
+        readonly contentRevision: string;
+      };
+  /** Complete descriptor as selected, before localization. */
+  readonly recommendation: ExtensionRecommendationView;
+  readonly selectedLabel: string;
+  readonly selectedPrompt: string;
+  /** Stable owner/selection/runtime JSON tuple; process-local generations stay outside. */
+  readonly contextKey: string;
+  readonly runtimeSessionId?: string;
+  readonly draft: NewSessionLocalDraft;
+  readonly backendId: string;
+  readonly targetId?: string;
 }
 
 export interface BrowserSettingsView {

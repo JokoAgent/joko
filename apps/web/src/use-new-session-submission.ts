@@ -97,7 +97,7 @@ export function useNewSessionSubmission(
         if (!isCurrent()) return;
         expectedSession = sessionId;
         original.navigate({ kind: "session", sessionId });
-      });
+      }, undefined, { beforeFirstInput: owner.beforeFirstInput, onAccepted: owner.onFirstInputAccepted });
     } catch (error) {
       if (isCurrent()) setError(describeError(error));
       throw error;

@@ -10,7 +10,8 @@ import { minimatch } from "minimatch";
 import {
   parseExtensionSurfaceManifest,
   type ExtensionLibraryDescriptor,
-  type ExtensionMainViewDescriptor
+  type ExtensionMainViewDescriptor,
+  type ExtensionRecommendationDescriptor
 } from "./extension-surface-manifest.js";
 
 export type PiPackageCompatibility = "supported" | "partial" | "unsupported" | "unknown";
@@ -80,6 +81,7 @@ export interface PiPackageResourceDetail {
   readonly entryPath?: string;
   readonly mainView?: ExtensionMainViewDescriptor;
   readonly library?: ExtensionLibraryDescriptor;
+  readonly recommendations?: readonly ExtensionRecommendationDescriptor[];
   readonly compatibility: PiPackageCompatibility;
   readonly compatibilityIssues: readonly PiPackageCompatibilityIssue[];
   readonly detectedApis: readonly PiExtensionUiApi[];
@@ -126,6 +128,7 @@ export interface PiPackageCatalogInspection {
     readonly resourceName: string;
     readonly mainView?: ExtensionMainViewDescriptor;
     readonly library?: ExtensionLibraryDescriptor;
+    readonly recommendations?: readonly ExtensionRecommendationDescriptor[];
   }[];
 }
 
@@ -442,7 +445,8 @@ export async function inspectPiPackageCatalog(packagePath: string): Promise<PiPa
       relativePath,
       resourceName: boundedDisplay(basename(entry)),
       ...(surface?.mainView === undefined ? {} : { mainView: surface.mainView }),
-      ...(surface?.library === undefined ? {} : { library: surface.library })
+      ...(surface?.library === undefined ? {} : { library: surface.library }),
+      ...(surface?.recommendations === undefined ? {} : { recommendations: copyRecommendations(surface.recommendations) })
     };
   });
   if (extensions.length === 0) throw new Error("Catalog package does not expose a Pi extension.");
@@ -561,7 +565,11 @@ async function extensionDetail(
   root: string,
   entry: string,
   entryPath = toPosix(relative(root, entry)),
-  surface?: { readonly mainView?: ExtensionMainViewDescriptor; readonly library?: ExtensionLibraryDescriptor }
+  surface?: {
+    readonly mainView?: ExtensionMainViewDescriptor;
+    readonly library?: ExtensionLibraryDescriptor;
+    readonly recommendations?: readonly ExtensionRecommendationDescriptor[];
+  }
 ): Promise<PiPackageResourceDetail> {
   try {
     const analysis = await analyzePiExtensionCompatibility(entry, root);
@@ -571,6 +579,7 @@ async function extensionDetail(
       entryPath,
       ...(surface?.mainView === undefined ? {} : { mainView: surface.mainView }),
       ...(surface?.library === undefined ? {} : { library: surface.library }),
+      ...(surface?.recommendations === undefined ? {} : { recommendations: copyRecommendations(surface.recommendations) }),
       compatibility: analysis.compatibility,
       compatibilityIssues: analysis.compatibilityIssues,
       detectedApis: analysis.detectedApis,
@@ -582,9 +591,26 @@ async function extensionDetail(
       ...basicResourceDetail("extension", basename(entry), "unknown", ["analysis-incomplete"]),
       entryPath,
       ...(surface?.mainView === undefined ? {} : { mainView: surface.mainView }),
-      ...(surface?.library === undefined ? {} : { library: surface.library })
+      ...(surface?.library === undefined ? {} : { library: surface.library }),
+      ...(surface?.recommendations === undefined ? {} : { recommendations: copyRecommendations(surface.recommendations) })
     };
   }
+}
+
+function copyRecommendations(
+  recommendations: readonly ExtensionRecommendationDescriptor[]
+): readonly ExtensionRecommendationDescriptor[] {
+  return recommendations.map((recommendation) => ({
+    ...recommendation,
+    ...(recommendation.locales === undefined
+      ? {}
+      : {
+          locales: Object.fromEntries(Object.entries(recommendation.locales).map(([locale, translation]) => [
+            locale,
+            { ...translation }
+          ])) as ExtensionRecommendationDescriptor["locales"]
+        })
+  }));
 }
 
 function parseSource(source: string): ParsedSource {

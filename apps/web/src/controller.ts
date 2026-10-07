@@ -51,6 +51,7 @@ import type {
   NativeSessionTreeView,
   NewSessionDraft,
   NewSessionLocalDraft,
+  PendingExtensionSuggestionView,
   PendingExtensionUseView,
   SessionMessageSearchCollectionOptions,
   SystemLocale,
@@ -116,11 +117,11 @@ const TOOLS_TABS: readonly ToolsTab[] = ["browser", "extensions", "skills", "res
 export type AppRoute =
   | { readonly kind: "session"; readonly profileId?: string; readonly sessionId?: string; readonly messageId?: string; readonly messageEventId?: string }
   | { readonly kind: "files"; readonly sessionId: string; readonly file?: string; readonly search?: string; readonly line?: number }
-  | { readonly kind: "newSession"; readonly targetId?: string; readonly dialogueBackendId?: string }
+  | { readonly kind: "newSession"; readonly targetId?: string; readonly dialogueBackendId?: string; readonly recommendationNonce?: string }
   | { readonly kind: "projects"; readonly projectId?: string }
   | { readonly kind: "partners"; readonly partnerId?: string }
   | { readonly kind: "schedules"; readonly scheduleId?: string }
-  | { readonly kind: "tools"; readonly tab?: ToolsTab; readonly extensionId?: string }
+  | { readonly kind: "tools"; readonly tab?: ToolsTab; readonly extensionId?: string; readonly recommendationNonce?: string }
   | { readonly kind: "extensionMainView"; readonly extensionId: string }
   | { readonly kind: "settings" };
 
@@ -267,6 +268,12 @@ export interface AppController extends OperationApi {
   readPendingExtensionUse(): Promise<PendingExtensionUseView | undefined>;
   savePendingExtensionUse(value: PendingExtensionUseView): Promise<void>;
   clearPendingExtensionUse(): Promise<void>;
+  readPendingExtensionSuggestion(nonce?: string): Promise<PendingExtensionSuggestionView | undefined>;
+  savePendingExtensionSuggestion(value: PendingExtensionSuggestionView): Promise<void>;
+  compareAndSetPendingExtensionSuggestion(expected: PendingExtensionSuggestionView, next?: PendingExtensionSuggestionView): Promise<boolean>;
+  consumePendingExtensionSuggestion(nonce: string, contextKey: string): Promise<PendingExtensionSuggestionView | undefined>;
+  readRecentExtensionSuggestions(): Promise<readonly string[]>;
+  recordExtensionSuggestionUse(extensionId: string): Promise<void>;
 }
 
 export interface ConnectionSelectionOptions {
@@ -2153,7 +2160,29 @@ export function useAppController(): AppController {
       removeRecentProject: (entry: RecentProject): Promise<readonly RecentProject[]> => requireLocal(draftStore).removeRecentProject(scope(), entry),
       readPendingExtensionUse: (): Promise<PendingExtensionUseView | undefined> => requireLocal(draftStore).readPendingExtensionUse(scope()),
       savePendingExtensionUse: (value: PendingExtensionUseView): Promise<void> => requireLocal(draftStore).savePendingExtensionUse(scope(), value),
-      clearPendingExtensionUse: (): Promise<void> => requireLocal(draftStore).clearPendingExtensionUse(scope())
+      clearPendingExtensionUse: (): Promise<void> => requireLocal(draftStore).clearPendingExtensionUse(scope()),
+      readPendingExtensionSuggestion: (nonce?: string): Promise<PendingExtensionSuggestionView | undefined> =>
+        requireLocal(draftStore).readPendingExtensionSuggestion(scope(), nonce),
+      savePendingExtensionSuggestion: (value: PendingExtensionSuggestionView): Promise<void> =>
+        requireLocal(draftStore).savePendingExtensionSuggestion(scope(), value),
+      compareAndSetPendingExtensionSuggestion: (
+        expected: PendingExtensionSuggestionView,
+        next?: PendingExtensionSuggestionView
+      ): Promise<boolean> => requireLocal(draftStore).compareAndSetPendingExtensionSuggestion(scope(), expected, next),
+      consumePendingExtensionSuggestion: (
+        nonce: string,
+        contextKey: string
+      ): Promise<PendingExtensionSuggestionView | undefined> =>
+        requireLocal(draftStore).consumePendingExtensionSuggestion(scope(), nonce, contextKey),
+      readRecentExtensionSuggestions: (): Promise<readonly string[]> =>
+        requireLocal(draftStore).readRecentExtensionSuggestions(scope()).catch(() => []),
+      recordExtensionSuggestionUse: async (extensionId: string): Promise<void> => {
+        try {
+          await requireLocal(draftStore).recordExtensionSuggestionUse(scope(), extensionId);
+        } catch {
+          // Usage hints are optional ordering metadata; submission already succeeded.
+        }
+      }
     };
   }, [draftStore, newTaskDraftScope, artifactGateway]);
   const readDraft = useCallback<AppController["readDraft"]>((sessionId) => {
@@ -3785,7 +3814,11 @@ export function routeFromHash(hash: string): AppRoute {
   if (parts[0] === "partners") return { kind: "partners", ...(parts[1] === undefined ? {} : { partnerId: parts[1] }) };
   if (parts[0] === "tools") {
     const extensionId = query.get("extension")?.trim();
-    if (extensionId !== undefined && /^extension_[a-f0-9]{32}$/u.test(extensionId)) return { kind: "tools", extensionId };
+    const recommendationNonce = routeRecommendationNonce(query);
+    if (extensionId !== undefined && /^extension_[a-f0-9]{32}$/u.test(extensionId)) return {
+      kind: "tools", extensionId,
+      ...(recommendationNonce === undefined ? {} : { recommendationNonce })
+    };
     const tab = query.get("tab");
     return {
       kind: "tools",
@@ -3799,8 +3832,10 @@ export function routeFromHash(hash: string): AppRoute {
   if (parts[0] === "tasks" && parts[1] === "new") {
     const targetId = query.get("target")?.trim();
     const dialogueBackendId = query.get("dialogue")?.trim();
+    const recommendationNonce = routeRecommendationNonce(query);
     return {
       kind: "newSession",
+      ...(recommendationNonce === undefined ? {} : { recommendationNonce }),
       ...(targetId === undefined || targetId === "" ? {} : { targetId }),
       ...(targetId !== undefined && targetId !== "" || dialogueBackendId === undefined || dialogueBackendId === "" ? {} : { dialogueBackendId })
     };
@@ -3834,6 +3869,12 @@ export function sessionRouteHash(route: Extract<AppRoute, { readonly kind: "sess
   return `#/tasks/${encodeURIComponent(route.sessionId)}${suffix}`;
 }
 
+function routeRecommendationNonce(query: URLSearchParams): string | undefined {
+  const values = query.getAll("recommendation");
+  return values.length === 1 && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u.test(values[0]!)
+    ? values[0] : undefined;
+}
+
 export function appRouteHash(route: AppRoute): string {
   if (route.kind === "session") return sessionRouteHash(route);
   if (route.kind === "files") return workspaceFilesHash(route);
@@ -3841,6 +3882,7 @@ export function appRouteHash(route: AppRoute): string {
     const query = new URLSearchParams();
     if (route.targetId !== undefined) query.set("target", route.targetId);
     else if (route.dialogueBackendId !== undefined) query.set("dialogue", route.dialogueBackendId);
+    if (route.recommendationNonce !== undefined) query.set("recommendation", route.recommendationNonce);
     return `#/tasks/new${query.size === 0 ? "" : `?${query.toString()}`}`;
   }
   if (route.kind === "projects") return route.projectId === undefined ? "#/projects" : `#/projects/${encodeURIComponent(route.projectId)}`;
@@ -3854,6 +3896,7 @@ export function appRouteHash(route: AppRoute): string {
     const query = new URLSearchParams();
     if (route.extensionId !== undefined) query.set("extension", route.extensionId);
     else if (route.tab !== undefined && route.tab !== "browser") query.set("tab", route.tab);
+    if (route.extensionId !== undefined && route.recommendationNonce !== undefined) query.set("recommendation", route.recommendationNonce);
     return `#/tools${query.size === 0 ? "" : `?${query.toString()}`}`;
   }
   if (route.kind === "extensionMainView") return `#/extensions/${encodeURIComponent(route.extensionId)}`;

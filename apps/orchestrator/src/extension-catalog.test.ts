@@ -236,6 +236,54 @@ describe("ExtensionCatalogManager", () => {
     }
   });
 
+  it("projects exact recommendations across Source-to-Resource ownership and revisions author text changes", async () => {
+    const { store, catalog } = await fixture();
+    const recommendations = [{
+      id: "review-workspace",
+      label: "Review workspace",
+      prompt: "Review this workspace for correctness.",
+      command: "review",
+      locales: { "zh-CN": { label: "审查工作区", prompt: "审查此工作区的正确性。" } }
+    }, {
+      id: "plan-work",
+      label: "Plan work",
+      prompt: "Create a concrete implementation plan."
+    }] as const;
+    try {
+      const sourceEntry = source({ entries: [{ ...source().entries[0]!, recommendations }] });
+      const available = catalog.reconcile([], [], [sourceEntry]).entries[0]!;
+      expect(available.recommendations).toEqual(recommendations);
+
+      const installedResource = resource({
+        resourceDetails: [{
+          ...resource().resourceDetails[0]!,
+          entryPath: "extensions/navigation.ts",
+          recommendations
+        }]
+      });
+      const installed = catalog.reconcile([installedResource], [], [sourceEntry]).entries[0]!;
+      expect(installed.id).toBe(available.id);
+      expect(installed.recommendations).toEqual(recommendations);
+
+      const changedRecommendations = [{
+        ...recommendations[0],
+        prompt: "Review this workspace and propose concrete fixes."
+      }] as const;
+      const changed = catalog.reconcile([resource({
+        resourceDetails: [{
+          ...resource().resourceDetails[0]!,
+          entryPath: "extensions/navigation.ts",
+          recommendations: changedRecommendations
+        }]
+      })], [], [sourceEntry]).entries[0]!;
+      expect(changed.id).toBe(installed.id);
+      expect(changed.revision).toBeGreaterThan(installed.revision);
+      expect(changed.recommendations).toEqual(changedRecommendations);
+    } finally {
+      store.close();
+    }
+  });
+
   it("projects same-source updates and treats a removed then re-added source as explicit replacement provenance", async () => {
     const { store, catalog } = await fixture();
     try {

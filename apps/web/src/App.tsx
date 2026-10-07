@@ -2290,6 +2290,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
             snapshot={state.snapshot}
             initialTargetId={state.route.targetId}
             initialDialogueBackendId={state.route.dialogueBackendId}
+            recommendationNonce={state.route.recommendationNonce}
             projectPickerRequest={projectPickerRequest}
             onProjectPickerRequestConsumed={(requestId) => setProjectPickerRequest((current) => current?.requestId === requestId ? undefined : current)}
             navigationOpen={navigationOpen}
@@ -2335,11 +2336,12 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
             snapshot={state.snapshot}
             runtimeSessionId={lastRuntimeSessionIdRef.current}
             selectedExtensionId={state.route.extensionId}
+            recommendationNonce={state.route.recommendationNonce}
             selectedTab={state.route.tab}
             locale={state.effectiveLocale}
             t={t}
             runAction={runAction}
-            onSelectExtension={(extensionId) => controller.navigate({ kind: "tools", ...(extensionId === undefined ? { tab: "extensions" } : { extensionId }) })}
+            onSelectExtension={(extensionId) => controller.navigate({ kind: "tools", ...(extensionId === undefined ? { tab: "extensions" } : { extensionId }), ...(state.route.kind === "tools" && extensionId === state.route.extensionId && state.route.recommendationNonce !== undefined ? { recommendationNonce: state.route.recommendationNonce } : {}) })}
             onSelectTab={(tab) => controller.navigate({ kind: "tools", ...(tab === "browser" ? {} : { tab }) })}
             onOpenNavigation={() => setWindowNavigationOpen(true)}
           />}

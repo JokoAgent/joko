@@ -163,3 +163,20 @@ it("does not record a recent project before Session creation or for a managed di
   expect(original.createTarget).toHaveBeenCalledOnce();
   expect(original.recordRecentProject).not.toHaveBeenCalled();
 });
+
+it("forwards the first-runtime guard and records usage only after actual input acceptance", async () => {
+  const original = api();
+  const probe = await mount(original);
+  const beforeFirstInput = vi.fn(async (_sessionId: string) => { throw new Error("Runtime command changed"); });
+  const accepted = vi.fn();
+  const owner = { ownerDocument: document, signal: new AbortController().signal, isCurrent: () => true,
+    beforeFirstInput, onFirstInputAccepted: accepted };
+  await act(async () => { await expect(probe.submit(draft, input, owner)).rejects.toThrow("Runtime command changed"); });
+  expect(beforeFirstInput).toHaveBeenCalledExactlyOnceWith("created");
+  expect(original.navigate).toHaveBeenCalledExactlyOnceWith({ kind: "session", sessionId: "created" });
+  expect(original.send).not.toHaveBeenCalled();
+  expect(original.restoreFirstInputDraft).toHaveBeenCalledExactlyOnceWith("created", input);
+  expect(accepted).not.toHaveBeenCalled();
+  await act(async () => { await probe.submit(draft, input, { ...owner, beforeFirstInput: async () => undefined }); });
+  expect(original.send).toHaveBeenCalledOnce(); expect(accepted).toHaveBeenCalledOnce();
+});

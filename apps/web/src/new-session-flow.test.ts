@@ -22,6 +22,27 @@ const input: ComposerDraft = {
 };
 
 describe("lazy new-session dispatch", () => {
+  it.each([true, false])("validates the actual new runtime before first input; valid=%s", async (valid) => {
+    const order: string[] = [];
+    const api = {
+      createSession: vi.fn(async () => { order.push("create"); return { sessionId: "new-runtime", generation: 2n }; }),
+      send: vi.fn(async () => { order.push("send"); }),
+      restoreFirstInputDraft: vi.fn(async () => { order.push("restore"); })
+    };
+    const accepted = vi.fn(() => { order.push("accepted"); });
+    const beforeFirstInput = vi.fn(async (id: string) => { order.push(`validate:${id}`); if (!valid) throw new Error("Extension command changed"); });
+    const result = createSessionFromFirstInput(api, session, input, () => { order.push("reveal"); }, { beforeFirstInput, onAccepted: accepted });
+    if (valid) {
+      await expect(result).resolves.toBe("new-runtime");
+      expect(order).toEqual(["create", "reveal", "validate:new-runtime", "send", "accepted"]);
+      expect(api.restoreFirstInputDraft).not.toHaveBeenCalled();
+    } else {
+      await expect(result).rejects.toThrow("Extension command changed");
+      expect(order).toEqual(["create", "reveal", "validate:new-runtime", "restore"]);
+      expect(api.send).not.toHaveBeenCalled(); expect(accepted).not.toHaveBeenCalled();
+      expect(api.restoreFirstInputDraft).toHaveBeenCalledExactlyOnceWith("new-runtime", input);
+    }
+  });
   it("carries only the prepared Target revision into project task creation", async () => {
     const api = {
       createTarget: vi.fn(async () => "unused"),
@@ -115,10 +136,12 @@ describe("lazy new-session dispatch", () => {
       send: vi.fn(async () => undefined),
       restoreFirstInputDraft: vi.fn(async () => undefined)
     };
+    const accepted = vi.fn();
     await expect(createSessionFromFirstInput(api, session, input, () => {
       throw new Error("Navigation failed");
-    })).rejects.toThrow("Navigation failed");
+    }, { onAccepted: accepted })).rejects.toThrow("Navigation failed");
     expect(api.send).toHaveBeenCalledExactlyOnceWith("created", input, { expectedGeneration: 3n });
+    expect(accepted).toHaveBeenCalledOnce();
   });
 
   it("creates and refreshes a durable managed-dialogue target before Session creation", async () => {

@@ -5,6 +5,11 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { HOME_SUGGESTIONS_HIDDEN_KEY, type HomeSuggestionId } from "../home-suggestions.js";
+import type {
+  ExtensionCatalogEntryWithRecommendations,
+  HomeTaskHints,
+  HomeTaskSuggestion
+} from "../extension-home-suggestions.js";
 import { HomeSuggestionList } from "./HomeSuggestionList.js";
 import type { Translator } from "./types.js";
 
@@ -81,6 +86,46 @@ describe("HomeSuggestionList", () => {
     expect(current.some((id) => previous.includes(id))).toBe(false);
   });
 
+  it("renders localized Extension tasks and routes them through the separate callback", async () => {
+    installMatchMedia(false);
+    vi.spyOn(Math, "random").mockReturnValue(0);
+    const onSelect = vi.fn<(id: HomeSuggestionId) => void>();
+    const onExtensionSelect = vi.fn<(suggestion: HomeTaskSuggestion) => void>();
+    const entry = extensionEntry();
+    const { container } = await renderList({
+      onSelect,
+      onExtensionSelect,
+      extensionEntries: [entry],
+      locale: "zh-CN",
+      hints: { newlyInstalledId: entry.id }
+    });
+    const extensionButton = container.querySelector<HTMLButtonElement>(`[data-home-extension-id="${entry.id}"]`);
+
+    expect(extensionButton?.textContent).toContain("整理邮件");
+    expect(extensionButton?.dataset.homeSuggestionId).toBe(`extension:${entry.id}:mail`);
+    await act(async () => extensionButton?.click());
+    expect(onExtensionSelect).toHaveBeenCalledTimes(1);
+    expect(onExtensionSelect.mock.calls[0]?.[0]).toMatchObject({
+      extensionId: entry.id,
+      recommendationId: "mail",
+      command: "mail-review",
+      prompt: "整理需要回复的邮件。"
+    });
+    expect(onSelect).not.toHaveBeenCalled();
+  });
+
+  it("does not expose inert Extension rows without an Extension callback", async () => {
+    installMatchMedia(false);
+    vi.spyOn(Math, "random").mockReturnValue(0);
+    const entry = extensionEntry();
+    const { container } = await renderList({
+      extensionEntries: [entry],
+      hints: { newlyInstalledId: entry.id }
+    });
+    expect(container.querySelector("[data-home-extension-id]")).toBeNull();
+    expect(suggestionButtons(container)).toHaveLength(4);
+  });
+
   it("disables every action without selecting, shuffling, or dismissing", async () => {
     installMatchMedia(false);
     vi.spyOn(Math, "random").mockReturnValue(0);
@@ -122,17 +167,66 @@ describe("HomeSuggestionList", () => {
 
 async function renderList({
   disabled = false,
-  onSelect = vi.fn<(id: HomeSuggestionId) => void>()
+  onSelect = vi.fn<(id: HomeSuggestionId) => void>(),
+  extensionEntries = [],
+  locale = "en",
+  hints,
+  onExtensionSelect
 }: {
   readonly disabled?: boolean;
   readonly onSelect?: (id: HomeSuggestionId) => void;
+  readonly extensionEntries?: readonly ExtensionCatalogEntryWithRecommendations[];
+  readonly locale?: string;
+  readonly hints?: HomeTaskHints;
+  readonly onExtensionSelect?: (suggestion: HomeTaskSuggestion) => void;
 } = {}) {
   const container = document.createElement("div");
   document.body.append(container);
   const root = createRoot(container);
   roots.push(root);
-  await act(async () => root.render(<HomeSuggestionList t={t} disabled={disabled} onSelect={onSelect} />));
+  await act(async () => root.render(<HomeSuggestionList
+    t={t}
+    disabled={disabled}
+    onSelect={onSelect}
+    extensionEntries={extensionEntries}
+    locale={locale}
+    hints={hints}
+    onExtensionSelect={onExtensionSelect}
+  />));
   return { container, root };
+}
+
+function extensionEntry(): ExtensionCatalogEntryWithRecommendations {
+  return {
+    id: "extension_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    revision: 4n,
+    owner: {
+      kind: "resource",
+      resourceId: "resource-mail",
+      discoveredRevision: `sha256:${"a".repeat(64)}`,
+      resourceRevision: 3n
+    },
+    source: "local",
+    installed: true,
+    installState: "installed",
+    name: "Mail",
+    description: "Mail tools",
+    enabled: true,
+    sidebarSupported: false,
+    sidebarVisible: false,
+    tools: [],
+    permissions: [],
+    commands: [],
+    setup: { state: "notRequired", revision: 0n, fields: [] },
+    useSupported: false,
+    recommendations: [{
+      id: "mail",
+      label: "Review mail",
+      prompt: "Review mail that needs a reply.",
+      command: "mail-review",
+      locales: { "zh-CN": { label: "整理邮件", prompt: "整理需要回复的邮件。" } }
+    }]
+  };
 }
 
 function installMatchMedia(initialMatches: boolean) {

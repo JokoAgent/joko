@@ -137,6 +137,23 @@ describe("home suggestions", () => {
     ]);
   });
 
+  it("allows only one Extension action guide regardless of its step", () => {
+    const candidates = [
+      { id: "install", category: "email", extensionId: "mail", needsInstall: true, guide: "install" as const },
+      { id: "enable", category: "photos", extensionId: "photos", guide: "enable" as const },
+      { id: "setup", category: "calendar", extensionId: "calendar", guide: "setup" as const },
+      { id: "cleanup", category: "computer" },
+      { id: "build", category: "create" },
+      { id: "documents", category: "documents" }
+    ];
+    expect(selectHomeSuggestionBatch(candidates).map(({ id }) => id)).toEqual([
+      "install",
+      "cleanup",
+      "build",
+      "documents"
+    ]);
+  });
+
   it("does not relax category quotas merely to fill a batch", () => {
     const candidates = HOME_SUGGESTION_CATALOG.filter(({ category }) => category === "computer");
     expect(selectHomeSuggestionBatch(candidates)).toEqual([candidates[0]]);

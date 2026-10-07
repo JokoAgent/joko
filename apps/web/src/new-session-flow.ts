@@ -13,6 +13,15 @@ export interface NewSessionSubmissionOwner {
   readonly ownerDocument: Document;
   readonly signal: AbortSignal;
   readonly isCurrent: () => boolean;
+  /** Validate an authored command against the newly created runtime, before
+   * the first input can be accepted. A pre-existing task is not required. */
+  readonly beforeFirstInput?: (sessionId: string) => Promise<void>;
+  readonly onFirstInputAccepted?: () => void;
+}
+
+export interface FirstInputLifecycle {
+  readonly beforeFirstInput?: (sessionId: string) => Promise<void>;
+  readonly onAccepted?: () => void;
 }
 
 /**
@@ -24,7 +33,8 @@ export async function createSessionFromFirstInput(
   api: NewSessionFlowApi,
   session: NewSessionDraft,
   input: ComposerDraft,
-  onCreated: (sessionId: string) => void | Promise<void>
+  onCreated: (sessionId: string) => void | Promise<void>,
+  lifecycle?: FirstInputLifecycle
 ): Promise<string> {
   const { sessionId, generation } = await api.createSession(session);
   let presentationFailure: { readonly error: unknown } | undefined;
@@ -34,6 +44,7 @@ export async function createSessionFromFirstInput(
     presentationFailure = { error };
   }
   try {
+    await lifecycle?.beforeFirstInput?.(sessionId);
     await api.send(sessionId, input, { expectedGeneration: generation });
   } catch (error) {
     try {
@@ -46,6 +57,7 @@ export async function createSessionFromFirstInput(
     }
     throw error;
   }
+  try { lifecycle?.onAccepted?.(); } catch { /* Local usage history cannot undo accepted input. */ }
   if (presentationFailure !== undefined) throw presentationFailure.error;
   return sessionId;
 }
@@ -61,7 +73,8 @@ export async function createDelayedSessionFromFirstInput(
   draft: DelayedNewSessionDraft,
   input: ComposerDraft,
   onCreated: (sessionId: string) => void | Promise<void>,
-  onManagedTargetCreated?: (targetId: string) => void
+  onManagedTargetCreated?: (targetId: string) => void,
+  lifecycle?: FirstInputLifecycle
 ): Promise<string> {
   if (draft.selection.kind === "target") {
     if (draft.expectedTargetRevision === undefined || draft.expectedTargetRevision < 1n) {
@@ -71,7 +84,7 @@ export async function createDelayedSessionFromFirstInput(
       ...sessionDraft(draft),
       targetId: draft.selection.targetId,
       expectedTargetRevision: draft.expectedTargetRevision
-    }, input, onCreated);
+    }, input, onCreated, lifecycle);
   }
   const targetId = await api.createTarget({
     backendId: draft.selection.backendId,
@@ -82,7 +95,7 @@ export async function createDelayedSessionFromFirstInput(
   });
   await api.refresh();
   onManagedTargetCreated?.(targetId);
-  return createSessionFromFirstInput(api, { ...sessionDraft(draft), targetId }, input, onCreated);
+  return createSessionFromFirstInput(api, { ...sessionDraft(draft), targetId }, input, onCreated, lifecycle);
 }
 
 function sessionDraft(draft: DelayedNewSessionDraft): Omit<NewSessionDraft, "targetId"> {

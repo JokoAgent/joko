@@ -5,9 +5,13 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
 import type { AppController } from "../controller.js";
+import { plainTextToComposerDocument } from "../composer-quote-document.js";
+import { serializeExtensionSuggestionOwner } from "../extension-suggestion-handoff.js";
 import { translate } from "../i18n.js";
+import { pendingExtensionSuggestionContext } from "../new-session-suggestion-context.js";
 import {
   emptySnapshot,
+  type AppSnapshot,
   type BackendView,
   type ExtensionCatalogEntryView,
   type ExtensionCatalogView,
@@ -15,6 +19,7 @@ import {
   type ExtensionPackageExportPreviewView,
   type ExtensionPackagePreviewView,
   type ExtensionSourceCatalogView,
+  type PendingExtensionSuggestionView,
   type ResourceView
 } from "../model.js";
 import { ToolsPage } from "./ToolsPage.js";
@@ -112,6 +117,136 @@ describe("Extension catalog interactions", () => {
     expect(navigate).toHaveBeenCalledWith({ kind: "newSession", targetId: "target-1" });
   });
 
+  it("revision-fences a suggested task enable step and exposes the one-shot return only after CAS readiness", async () => {
+    const recommendation = { id: "review-mail", label: "Review the inbox", prompt: "Review messages needing attention." } as const;
+    let extension: ExtensionCatalogEntryView = {
+      ...readyExtension(),
+      enabled: false,
+      recommendations: [recommendation]
+    };
+    const pending = pendingSuggestion(extension, recommendation);
+    let stored: PendingExtensionSuggestionView | undefined = pending;
+    const setExtensionEnabled = vi.fn(async (_id: string, _enabled: boolean, revision: bigint) => {
+      if (revision !== 7n) throw new Error("stale test mutation");
+      extension = { ...extension, enabled: true, revision: 8n };
+    });
+    const compareAndSetPendingExtensionSuggestion = vi.fn(async (expected: PendingExtensionSuggestionView, next?: PendingExtensionSuggestionView) => {
+      if (stored !== expected) return false;
+      stored = next;
+      return true;
+    });
+    const navigate = vi.fn();
+    const { container, controller, snapshot } = await renderExtensions({
+      extension,
+      recommendationNonce: pending.nonce,
+      snapshot: suggestionSnapshot(),
+      controller: {
+        listExtensions: vi.fn(async () => catalog(extension)),
+        getExtension: vi.fn(async () => catalog(extension)),
+        readPendingExtensionSuggestion: vi.fn(async () => stored),
+        compareAndSetPendingExtensionSuggestion,
+        setExtensionEnabled,
+        navigate
+      }
+    });
+
+    expect(pendingExtensionSuggestionContext(controller, snapshot, pending)).toBe(pending.contextKey);
+    expect(container.textContent).toContain("Continue your suggested task");
+    expect(container.textContent).toContain("Enable this Extension to continue your task.");
+    const enable = buttonWithText(container, "Enable");
+    expect(enable.disabled).toBe(false);
+    await act(async () => enable.click());
+    await settleMany();
+    expect(setExtensionEnabled).toHaveBeenCalledWith(extension.id, true, 7n);
+    expect(compareAndSetPendingExtensionSuggestion).toHaveBeenCalledWith(
+      pending,
+      expect.objectContaining({ phase: "ready", extensionRevision: "8" })
+    );
+    expect(container.textContent).toContain("This Extension is ready.");
+
+    await act(async () => buttonWithText(container, "Continue task").click());
+    expect(navigate).toHaveBeenCalledWith({
+      kind: "newSession",
+      targetId: "target-1",
+      recommendationNonce: pending.nonce
+    });
+  });
+
+  it("advances a source suggestion only from the exact package preview adoption proof", async () => {
+    const recommendation = { id: "review-mail", label: "Review the inbox", prompt: "Review messages needing attention." } as const;
+    const source = { ...sourceExtension(), recommendations: [recommendation] };
+    let extension: ExtensionCatalogEntryView = source;
+    const pending = pendingSuggestion(source, recommendation);
+    let stored: PendingExtensionSuggestionView | undefined = pending;
+    const preview = packagePreview(source, "install", "resource-1");
+    const adoptExtensionPackage = vi.fn(async (captured: ExtensionPackagePreviewView) => {
+      extension = {
+        ...source,
+        revision: 8n,
+        owner: {
+          kind: "resource",
+          resourceId: captured.resourceId,
+          discoveredRevision: "sha256:owner",
+          resourceRevision: 1n
+        },
+        installed: true,
+        installState: "installed",
+        enabled: false
+      };
+    });
+    const compareAndSetPendingExtensionSuggestion = vi.fn(async (expected: PendingExtensionSuggestionView, next?: PendingExtensionSuggestionView) => {
+      if (stored !== expected) return false;
+      stored = next;
+      return true;
+    });
+    const refresh = vi.fn(async () => undefined);
+    const getExtensionPackagePreview = vi.fn(async () => preview);
+    const suggestionAuthority = suggestionSnapshot();
+    const { container, controller, snapshot } = await renderExtensions({
+      extension: source,
+      recommendationNonce: pending.nonce,
+      snapshot: {
+        ...suggestionAuthority,
+        backends: [packageBackend("foreign-backend"), ...(suggestionAuthority.backends ?? [])]
+      },
+      controller: {
+        listExtensions: vi.fn(async () => catalog(extension)),
+        getExtension: vi.fn(async () => catalog(extension)),
+        readPendingExtensionSuggestion: vi.fn(async () => stored),
+        compareAndSetPendingExtensionSuggestion,
+        getExtensionPackagePreview,
+        adoptExtensionPackage,
+        refresh
+      }
+    });
+
+    expect(pendingExtensionSuggestionContext(controller, snapshot, pending)).toBe(pending.contextKey);
+    expect(container.textContent).toContain("Install this Extension to continue.");
+    const install = buttonWithText(container, "Install");
+    expect(install.disabled).toBe(false);
+    await act(async () => install.click());
+    await settle();
+    const dialog = requiredDialog();
+    expect(getExtensionPackagePreview).toHaveBeenCalledWith(source.id, source.revision, "backend-1", expect.any(AbortSignal));
+    const backend = dialog.querySelector<HTMLSelectElement>("select");
+    expect(backend?.value).toBe("backend-1");
+    expect(backend?.disabled).toBe(true);
+    await act(async () => buttonWithText(dialog, "Install").click());
+    await settleMany();
+
+    expect(adoptExtensionPackage).toHaveBeenCalledWith(preview, false);
+    expect(refresh).toHaveBeenCalledTimes(1);
+    expect(compareAndSetPendingExtensionSuggestion).toHaveBeenCalledWith(
+      pending,
+      expect.objectContaining({
+        phase: "setup",
+        extensionRevision: "8",
+        owner: expect.objectContaining({ kind: "resource", resourceId: preview.resourceId })
+      })
+    );
+    expect(container.textContent).toContain("Enable this Extension to continue your task.");
+  });
+
   it("gates Use on setup and sends secret fields only through the credential operation", async () => {
     let extension: ExtensionCatalogEntryView = {
       ...readyExtension(),
@@ -142,7 +277,7 @@ describe("Extension catalog interactions", () => {
     const submitExtensionSetupInteraction = vi.fn(async () => undefined);
     const savePendingExtensionUse = vi.fn(async () => undefined);
     const navigate = vi.fn();
-    const { container } = await renderExtensions({
+    const { container, controller, rerenderController } = await renderExtensions({
       extension,
       controller: {
         listExtensions: async () => catalog(extension),
@@ -161,6 +296,8 @@ describe("Extension catalog interactions", () => {
     await act(async () => buttonWithText(document.body, "Begin setup").click());
     await settle();
     expect(beginExtensionSetup).toHaveBeenCalledWith(extension.id, 7n);
+
+    await rerenderController({ ...controller } as AppController);
 
     const secret = document.body.querySelector<HTMLInputElement>('input[type="password"]');
     if (secret === null) throw new Error("Secret setup input was not rendered.");
@@ -274,7 +411,10 @@ describe("Extension catalog interactions", () => {
     const source = sourceExtension();
     let current = source;
     const preview = packagePreview(source, "install", "resource-catalog");
-    const getExtensionPackagePreview = vi.fn(async () => preview);
+    const getExtensionPackagePreview = vi.fn(async () => {
+      if (current.owner.kind === "resource") throw new Error("The visual extension changed. Refresh and try again.");
+      return preview;
+    });
     const adoptExtensionPackage = vi.fn(async () => {
       current = {
         ...source,
@@ -285,7 +425,7 @@ describe("Extension catalog interactions", () => {
         version: "2.0.0"
       };
     });
-    const { container } = await renderExtensions({
+    const { container, controller, rerenderController } = await renderExtensions({
       extension: source,
       controller: {
         listExtensions: async () => catalog(current),
@@ -312,6 +452,11 @@ describe("Extension catalog interactions", () => {
     await settleMany();
     expect(adoptExtensionPackage).toHaveBeenCalledWith(preview, false);
     expect(dialog.textContent).toContain("The package operation completed");
+
+    await rerenderController({ ...controller } as AppController);
+    expect(getExtensionPackagePreview).toHaveBeenCalledTimes(1);
+    expect(dialog.textContent).toContain("The package operation completed");
+    expect(dialog.textContent).not.toContain("The visual extension changed");
   });
 
   it("requires explicit confirmation for a package source replacement", async () => {
@@ -528,8 +673,15 @@ async function renderExtensions(input: {
   readonly extensions?: readonly ExtensionCatalogEntryView[];
   readonly resources?: readonly ResourceView[];
   readonly backends?: readonly BackendView[];
+  readonly recommendationNonce?: string;
+  readonly snapshot?: Partial<AppSnapshot>;
   readonly controller: Partial<AppController>;
-}): Promise<{ readonly container: HTMLDivElement }> {
+}): Promise<{
+  readonly container: HTMLDivElement;
+  readonly controller: AppController;
+  readonly snapshot: AppSnapshot;
+  readonly rerenderController: (next: AppController, nextSnapshot?: AppSnapshot) => Promise<void>;
+}> {
   const container = document.createElement("div");
   document.body.append(container);
   const root = createRoot(container);
@@ -557,25 +709,36 @@ async function renderExtensions(input: {
       canToggle: true,
       requiresExtensionApproval: false,
       postMutationNotice: false
-    }]
+    }],
+    ...input.snapshot
   };
   const controller = {
-    state: { preferences: { navigationOpen: true } },
+    state: {
+      preferences: { navigationOpen: true },
+      activeProfile: { id: "profile", serverId: "server", deviceId: "device", name: "Node", origin: "http://node" },
+      connectionState: "connected",
+      connectionGeneration: 4,
+      snapshot
+    },
     ...input.controller
   } as unknown as AppController;
-  await act(async () => root.render(<ToolsPage
-    controller={controller}
-    snapshot={snapshot}
-    runtimeSessionId="runtime-session"
-    selectedExtensionId={input.extension.id}
-    locale="en"
-    t={(key, values) => translate("en", key, values)}
-    runAction={(_key, action) => { void action(); }}
-    onSelectExtension={() => undefined}
-    onOpenNavigation={() => undefined}
-  />));
-  await settle();
-  return { container };
+  const render = async (nextController: AppController, nextSnapshot = snapshot): Promise<void> => {
+    await act(async () => root.render(<ToolsPage
+      controller={nextController}
+      snapshot={nextSnapshot}
+      runtimeSessionId="runtime-session"
+      selectedExtensionId={input.extension.id}
+      recommendationNonce={input.recommendationNonce}
+      locale="en"
+      t={(key, values) => translate("en", key, values)}
+      runAction={(_key, action) => { void action(); }}
+      onSelectExtension={() => undefined}
+      onOpenNavigation={() => undefined}
+    />));
+    await settle();
+  };
+  await render(controller);
+  return { container, controller, snapshot, rerenderController: render };
 }
 
 function packageBackend(id: string): BackendView {
@@ -641,6 +804,64 @@ function readyExtension(): ExtensionCatalogEntryView {
     commands: [{ name: "review", description: "Review a change", sessionId: "runtime-session" }],
     setup: { state: "ready", attemptId: "ready-attempt", revision: 2n, fields: [] },
     useSupported: true
+  };
+}
+
+function pendingSuggestion(
+  extension: ExtensionCatalogEntryView,
+  recommendation: NonNullable<ExtensionCatalogEntryView["recommendations"]>[number]
+): PendingExtensionSuggestionView {
+  return {
+    nonce: "01234567-89ab-4cde-8fab-0123456789ab",
+    phase: "setup",
+    extensionId: extension.id,
+    extensionRevision: extension.revision.toString(10),
+    owner: serializeExtensionSuggestionOwner(extension.owner),
+    recommendation,
+    selectedLabel: recommendation.label,
+    selectedPrompt: recommendation.prompt,
+    contextKey: JSON.stringify([1, "server", "profile", 4, "0", "target", "target-1", "3", "backend-1", 2, "0.84.4", "", ""]),
+    draft: {
+      selection: { kind: "target", targetId: "target-1" },
+      nativeStart: { kind: "fresh" },
+      providerId: "provider",
+      modelId: "model",
+      fastMode: false,
+      permissionMode: "ask",
+      planMode: false,
+      text: "Original draft",
+      editorDocument: plainTextToComposerDocument("Original draft"),
+      mentions: [],
+      attachments: []
+    },
+    backendId: "backend-1",
+    targetId: "target-1"
+  };
+}
+
+function suggestionSnapshot(): Partial<AppSnapshot> {
+  return {
+    generation: 0n,
+    backends: [{
+      ...packageBackend("backend-1"),
+      instanceGeneration: 2,
+      capabilities: new Map([
+        ["runtime.resources", { name: "runtime.resources", supported: true, options: ["package", "extension"], maximumItems: 1_000 }],
+        ["input.text", { name: "input.text", supported: true, options: [] }]
+      ])
+    }],
+    targets: [{
+      id: "target-1",
+      revision: 3n,
+      backendId: "backend-1",
+      name: "Project",
+      workspaceId: "workspace-1",
+      workspaceName: "Project",
+      trusted: true,
+      pinned: false,
+      archived: false
+    }],
+    resources: [managedResource("resource-1")].map((resource) => ({ ...resource, targetId: "target-1", discoveredRevision: "sha256:owner" }))
   };
 }
 

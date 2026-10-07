@@ -28,6 +28,9 @@ import { remapComposerInlineMentionReplacement } from "../composer-mention-range
 import { composerMentionsAllowed, resolveComposerMentionPolicy } from "../composer-mention-policy.js";
 import { browserCommentPreviewTag, removeBrowserCommentAndRepairChains } from "../browser-comment-draft.js";
 import { applyPendingExtensionUse, resolvePendingExtensionUse } from "../extension-use-handoff.js";
+import { extensionSuggestionApplicable, extensionSuggestionPrompt, resolvePendingExtensionSuggestion, sameExtensionRecommendation, sameExtensionSuggestionOwner, serializeExtensionSuggestionOwner } from "../extension-suggestion-handoff.js";
+import { newSessionSuggestionContext, pendingExtensionSuggestionContext } from "../new-session-suggestion-context.js";
+import type { HomeTaskSuggestion } from "../extension-home-suggestions.js";
 import type {
   AppSnapshot,
   AttachmentDraft,
@@ -39,6 +42,7 @@ import type {
   NewSessionDraftSelection,
   NewSessionLocalDraft,
   PermissionMode,
+  PendingExtensionSuggestionView,
   SessionView,
   TargetWorktreeProbeView,
   WorktreeEligibilityView,
@@ -88,6 +92,7 @@ import { ComposerAttachmentTray } from "./ComposerAttachmentTray.js";
 import { ComposerInlineMentionPanel } from "./composer-inline-mention-panel.js";
 import { HomeUsageDashboard } from "./HomeUsageDashboard.js";
 import { HomeSuggestionList } from "./HomeSuggestionList.js";
+import { useNewSessionExtensionSuggestions } from "./use-new-session-extension-suggestions.js";
 import { ComposerPastedTextDialog, type ComposerPastedTextDialogTarget } from "./ComposerPastedTextDialog.js";
 import { ComposerRichTextEditor, type ComposerRichTextEditorHandle } from "./ComposerRichTextEditor.js";
 import { VoiceInputOverlay } from "./VoiceInputOverlay.js";
@@ -128,6 +133,7 @@ interface NewSessionPageProps {
   readonly snapshot: AppSnapshot;
   readonly initialTargetId?: string;
   readonly initialDialogueBackendId?: string;
+  readonly recommendationNonce?: string;
   readonly projectPickerRequest?: NewSessionProjectPickerRequest;
   readonly onProjectPickerRequestConsumed?: (requestId: number) => void;
   readonly navigationOpen: boolean;
@@ -164,7 +170,7 @@ interface NewTaskInlineMentionActivation extends ComposerInlineMentionActivation
 }
 
 /** Delayed-create route rendered within Joko's visual language. */
-export function NewSessionPage({ controller, snapshot, initialTargetId, initialDialogueBackendId, projectPickerRequest, onProjectPickerRequestConsumed, navigationOpen, t, onOpenNavigation, onClose, onSubmit }: NewSessionPageProps): JSX.Element {
+export function NewSessionPage({ controller, snapshot, initialTargetId, initialDialogueBackendId, recommendationNonce, projectPickerRequest, onProjectPickerRequestConsumed, navigationOpen, t, onOpenNavigation, onClose, onSubmit }: NewSessionPageProps): JSX.Element {
   const projectTargets = snapshot.targets.filter((target) => !target.archived);
   const activeTargets = newSessionTargets(projectTargets, snapshot.settings.backendSettings).filter((target) => {
     const candidate = snapshot.backends.find((backend) => backend.id === target.backendId);
@@ -247,6 +253,14 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
   const [hydrated, setHydrated] = useState(false);
   const [hydratedProfileScope, setHydratedProfileScope] = useState<string>();
   const [hydrationRevision, setHydrationRevision] = useState(0);
+  const [recommendationReturn, setRecommendationReturn] = useState<PendingExtensionSuggestionView>();
+  const [recommendationBusy, setRecommendationBusy] = useState(false);
+  const [recommendationRetry, setRecommendationRetry] = useState(false);
+  const [recommendationRetryRevision, setRecommendationRetryRevision] = useState(0);
+  const [recommendationHydrationRetryRevision, setRecommendationHydrationRetryRevision] = useState(0);
+  const [recommendationRestored, setRecommendationRestored] = useState(false);
+  const [newlyInstalledExtensionId, setNewlyInstalledExtensionId] = useState<string>();
+  const recommendationFlightRef = useRef<object | undefined>(undefined);
   const [workspacePreparationOwnerScope, setWorkspacePreparationOwnerScope] = useState<object>();
   const [workspacePreparationState, setWorkspacePreparationState] = useState<"idle" | "loading" | "ready" | "error">("idle");
   const [workspacePreparationError, setWorkspacePreparationError] = useState<string>();
@@ -534,6 +548,19 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
   const backend = selection?.kind === "dialogue"
     ? eligibleDialogueBackends.find((candidate) => candidate.id === selection.backendId)
     : snapshot.backends.find((candidate) => candidate.id === selected?.backendId);
+  const suggestionCatalogRuntimeSessionId = snapshot.sessions.find((item) => item.backendId === backend?.id
+    && item.runtimeAttached === true && item.state !== "closed" && !item.archived
+    && (selection?.kind === "target" ? item.targetId === selection.targetId : item.projectId === undefined))?.id;
+  const suggestionContextKey = selection === undefined ? undefined : newSessionSuggestionContext(controller, snapshot, selection, recommendationReturn?.runtimeSessionId);
+  const suggestionContextRef = useRef(suggestionContextKey); suggestionContextRef.current = suggestionContextKey;
+  const extensionSuggestions = useNewSessionExtensionSuggestions(controller, suggestionContextKey, suggestionCatalogRuntimeSessionId, newlyInstalledExtensionId, snapshot.extensionCatalogRevision);
+  const applicableExtensionSuggestions = useMemo(() => backend === undefined ? [] : extensionSuggestions.extensions.filter((entry) =>
+    extensionSuggestionApplicable(entry, { backendId: backend.id, ...(selected === undefined ? {} : { targetId: selected.id }), resources: snapshot.resources })
+  ), [extensionSuggestions.extensions, backend?.id, selected?.id, snapshot.resources]);
+  useLayoutEffect(() => {
+    recommendationFlightRef.current = undefined;
+    setRecommendationBusy(false);
+  }, [suggestionContextKey]);
   const workspace = selected === undefined ? undefined : snapshot.workspaces.find((candidate) => candidate.id === selected.workspaceId);
   const targetStaticReady = selection?.kind === "target"
     && selected !== undefined
@@ -953,6 +980,9 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
     const hydrationOwnerScope = profileScope;
     setHydrated(false);
     setHydratedProfileScope(undefined);
+    setRecommendationReturn(undefined);
+    setRecommendationRetry(false);
+    setRecommendationRestored(false);
     worktreeAuthorityTargetRef.current = undefined;
     setDraftError(undefined);
     setSelection(requestedSelection ?? defaultNewSessionSelection(activeTargets, eligibleDialogueBackends));
@@ -960,16 +990,28 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
       const pendingReader = typeof controllerRef.current.readPendingExtensionUse === "function"
         ? controllerRef.current.readPendingExtensionUse()
         : Promise.resolve(undefined);
-      const [draftResult, pendingResult] = await Promise.allSettled([
+      const [draftResult, pendingResult, suggestionResult] = await Promise.allSettled([
         controllerRef.current.readNewSessionDraft(),
-        pendingReader
+        pendingReader,
+        recommendationNonce === undefined ? Promise.resolve(undefined) : controllerRef.current.readPendingExtensionSuggestion(recommendationNonce)
       ]);
       if (cancelled) return;
-      const draft = draftResult.status === "fulfilled" ? draftResult.value : undefined;
-      const pending = pendingResult.status === "fulfilled" ? pendingResult.value : undefined;
+      const suggestion = suggestionResult.status === "fulfilled" ? suggestionResult.value : undefined;
+      const draft = suggestion?.draft ?? (draftResult.status === "fulfilled" ? draftResult.value : undefined);
+      const pending = recommendationNonce === undefined && pendingResult.status === "fulfilled" ? pendingResult.value : undefined;
       let hydrationError = draftResult.status === "rejected"
         ? messageOf(draftResult.reason)
         : pendingResult.status === "rejected" ? messageOf(pendingResult.reason) : undefined;
+      if (recommendationNonce !== undefined) {
+        if (suggestionResult.status === "rejected") {
+          hydrationError = messageOf(suggestionResult.reason);
+          setRecommendationRetry(true);
+        } else if (suggestion === undefined || suggestion.phase !== "ready"
+          || pendingExtensionSuggestionContext(controllerRef.current, snapshot, suggestion) !== suggestion.contextKey) {
+          hydrationError = translatorRef.current("extensions.recommendationExpired");
+          if (suggestion !== undefined) await controllerRef.current.compareAndSetPendingExtensionSuggestion(suggestion);
+        } else setRecommendationReturn(suggestion);
+      }
       const restoredSelection = draft === undefined
         ? requestedSelection ?? defaultNewSessionSelection(activeTargets, eligibleDialogueBackends)
         : requestedSelection
@@ -1049,7 +1091,13 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
       cancelled = true;
       requestController.abort();
     };
-  }, [initialDialogueBackendId, initialTargetId, profileScope]);
+  }, [initialDialogueBackendId, initialTargetId, profileScope, recommendationNonce, recommendationHydrationRetryRevision]);
+
+  useEffect(() => {
+    if (!hydrated) return;
+    const frame = window.requestAnimationFrame(() => setRecommendationRestored(true));
+    return () => window.cancelAnimationFrame(frame);
+  }, [hydrated, hydrationRevision]);
 
   useEffect(() => {
     if (!hydrated || projectPickerRequest !== undefined || openPickerRequestId !== undefined) return;
@@ -1313,7 +1361,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
   useLayoutEffect(() => {
     if (submissionOriginRef.current !== undefined && !submissionOriginRef.current.isCurrent()) submissionAbortRef.current?.abort();
   });
-  const submitRef = useRef<(document?: JSONContent) => Promise<void>>(async () => undefined);
+  const submitRef = useRef<(document?: JSONContent, onAccepted?: () => void, beforeFirstInput?: (sessionId: string) => Promise<void>) => Promise<void>>(async () => undefined);
   const voiceSendFlight = useRef<object | undefined>(undefined);
   const finishVoiceAndSend = (): void => {
     if (!canFinishVoiceSend || voiceSendFlight.current !== undefined) return;
@@ -1809,7 +1857,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
     });
   };
 
-  const submit = async (activeDocument: JSONContent = editorDocumentRef.current): Promise<void> => {
+  const submit = async (activeDocument: JSONContent = editorDocumentRef.current, onAccepted?: () => void, beforeFirstInput?: (sessionId: string) => Promise<void>): Promise<void> => {
     const sourceEditorDocument = normalizeComposerDocument(activeDocument, textRef.current);
     const sourceText = composerDocumentPlainText(sourceEditorDocument);
     const sourceRanges = restoreComposerInlineMentionRanges(sourceText, mentionsRef.current, inlineMentionRangesRef.current);
@@ -1838,6 +1886,8 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
     const owner: NewSessionSubmissionOwner = {
       ownerDocument,
       signal: request.signal,
+      ...(beforeFirstInput === undefined ? {} : { beforeFirstInput }),
+      ...(onAccepted === undefined ? {} : { onFirstInputAccepted: onAccepted }),
       isCurrent: () => submissionScopeRef.current === sourceScope && submissionEpochRef.current === sourceEpoch && submissionRef.current === attempt
         && !request.signal.aborted && submissionValidityRef.current && voiceRoot?.isConnected === true && voiceRoot.ownerDocument === ownerDocument && !ownerWindow.closed
         && editorDocumentRef.current === sourceDraft && attachmentsRef.current === sourceAttachments && browserCommentsRef.current === sourceBrowserComments
@@ -1899,17 +1949,137 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
 
   submitRef.current = submit;
 
-  const selectHomeSuggestion = (id: HomeSuggestionId): void => {
-    if (submittingRef.current || submissionRef.current !== undefined) return;
+  const replaceSuggestionPrompt = (prompt: string): JSONContent => {
     voiceDictionaryLearning.clear();
-    const nextDocument = plainTextToComposerDocument(t(homeSuggestionPromptKey(id)));
-    const nextText = composerDocumentPlainText(nextDocument);
+    const nextDocument = plainTextToComposerDocument(prompt);
     editorDocumentRef.current = nextDocument;
+    textRef.current = prompt;
     setEditorDocument(nextDocument);
-    textRef.current = nextText;
-    setText(nextText);
+    setText(prompt);
     replaceMentions([], []);
     closePalette();
+    const latest = latestDraftRef.current;
+    if (latest !== undefined) latestDraftRef.current = { ...latest, draft: { ...latest.draft, text: prompt, editorDocument: nextDocument, mentions: [], inlineMentionRanges: [] } };
+    return nextDocument;
+  };
+
+  const suggestionFirstInputGuard = (pending: PendingExtensionSuggestionView, sourceController: AppController): ((sessionId: string) => Promise<void>) | undefined => {
+    if (pending.recommendation.command === undefined) return undefined;
+    return async (sessionId) => {
+      const catalog = await sourceController.getExtension(pending.extensionId, sessionId);
+      const extension = resolvePendingExtensionSuggestion({ ...pending, phase: "ready", runtimeSessionId: sessionId }, catalog, {
+        backendId: pending.backendId, ...(pending.targetId === undefined ? {} : { targetId: pending.targetId }),
+        targets: snapshot.targets, resources: snapshot.resources
+      });
+      if (extension === undefined) throw new Error(t("extensions.recommendationExpired"));
+    };
+  };
+
+  const selectExtensionSuggestion = (item: HomeTaskSuggestion): void => {
+    if (!hydrated || hydratedProfileScope !== profileScope || voice.isActive() || submittingRef.current || submissionRef.current !== undefined
+      || recommendationFlightRef.current !== undefined || item.extensionId === undefined || item.recommendationId === undefined
+      || item.extensionRevision === undefined || item.owner === undefined || selection === undefined || backend === undefined
+      || suggestionContextKey === undefined || latestDraftRef.current === undefined) return;
+    const sourceController = controller;
+    const contextKey = suggestionContextKey;
+    const sourceScope = submissionScopeRef.current;
+    const sourceDocument = editorDocumentRef.current;
+    const sourceEpoch = submissionEpochRef.current;
+    const flight = {}; recommendationFlightRef.current = flight;
+    setRecommendationBusy(true);
+    setDraftError(undefined);
+    const frozenDraft = { ...latestDraftRef.current.draft, editorDocument: editorDocumentRef.current, text: textRef.current,
+      mentions: mentionsRef.current, inlineMentionRanges: inlineMentionRangesRef.current, attachments: attachmentsRef.current, browserComments: browserCommentsRef.current };
+    const isCurrent = (): boolean => mountedRef.current && recommendationFlightRef.current === flight
+      && suggestionContextRef.current === contextKey && submissionScopeRef.current === sourceScope
+      && submissionEpochRef.current === sourceEpoch && sourceEpoch !== undefined && pageRef.current?.isConnected === true
+      && editorDocumentRef.current === sourceDocument && !voice.isActive() && !submittingRef.current;
+    void (async () => {
+      const catalog = await sourceController.getExtension(item.extensionId!, suggestionCatalogRuntimeSessionId);
+      if (!isCurrent()) return;
+      const extension = catalog.extensions.find((entry) => entry.id === item.extensionId);
+      const recommendation = extension?.recommendations?.find((entry) => entry.id === item.recommendationId);
+      const displayed = extensionSuggestions.extensions.find((entry) => entry.id === item.extensionId)?.recommendations?.find((entry) => entry.id === item.recommendationId);
+      if (extension === undefined || extension.revision !== item.extensionRevision || recommendation === undefined || displayed === undefined
+        || !sameExtensionRecommendation(recommendation, displayed) || !sameExtensionSuggestionOwner(extension.owner, serializeExtensionSuggestionOwner(item.owner!))) {
+        setDraftError(t("extensions.recommendationExpired")); return;
+      }
+      const pending: PendingExtensionSuggestionView = {
+        nonce: randomUuid(), phase: "ready", extensionId: extension.id, extensionRevision: extension.revision.toString(10),
+        owner: serializeExtensionSuggestionOwner(extension.owner), recommendation, selectedLabel: item.label, selectedPrompt: item.prompt,
+        contextKey, draft: frozenDraft, backendId: backend.id,
+        ...(selected === undefined ? {} : { targetId: selected.id })
+      };
+      const ready = resolvePendingExtensionSuggestion(pending, catalog, { backendId: backend.id, ...(selected === undefined ? {} : { targetId: selected.id }), targets: snapshot.targets, resources: snapshot.resources });
+      if (!extensionSuggestionApplicable(extension, { backendId: backend.id, ...(selected === undefined ? {} : { targetId: selected.id }), resources: snapshot.resources })) {
+        setDraftError(t("extensions.recommendationExpired")); return;
+      }
+      if (ready !== undefined) {
+        const nextDocument = replaceSuggestionPrompt(extensionSuggestionPrompt(extension, recommendation, item.prompt));
+        await submit(nextDocument, () => { void sourceController.recordExtensionSuggestionUse(extension.id).catch(() => undefined); }, suggestionFirstInputGuard(pending, sourceController));
+        return;
+      }
+      await enqueueNewSessionDraftSave(draftSaveChainRef, { current: sourceController }, frozenDraft);
+      if (!isCurrent()) return;
+      await sourceController.savePendingExtensionSuggestion({ ...pending, phase: "setup" });
+      if (!isCurrent()) {
+        await sourceController.compareAndSetPendingExtensionSuggestion({ ...pending, phase: "setup" }); return;
+      }
+      sourceController.navigate({ kind: "tools", extensionId: extension.id, recommendationNonce: pending.nonce });
+    })().catch((error: unknown) => { if (isCurrent()) setDraftError(messageOf(error)); }).finally(() => {
+      if (recommendationFlightRef.current === flight) { recommendationFlightRef.current = undefined; if (mountedRef.current) setRecommendationBusy(false); }
+    });
+  };
+
+  useEffect(() => {
+    if (recommendationReturn === undefined || !hydrated || !recommendationRestored || hydratedProfileScope !== profileScope
+      || recommendationFlightRef.current !== undefined) return;
+    if (suggestionContextKey === recommendationReturn.contextKey && (!canFinishVoiceSend || voice.active)) return;
+    const pending = recommendationReturn;
+    const sourceController = controller;
+    const sourceScope = submissionScopeRef.current;
+    const sourceDocument = editorDocumentRef.current;
+    const sourceEpoch = submissionEpochRef.current;
+    const flight = {}; recommendationFlightRef.current = flight;
+    const request = new AbortController();
+    setRecommendationBusy(true);
+    const isCurrent = (): boolean => !request.signal.aborted && mountedRef.current && recommendationFlightRef.current === flight
+      && suggestionContextRef.current === pending.contextKey && submissionScopeRef.current === sourceScope
+      && submissionEpochRef.current === sourceEpoch && sourceEpoch !== undefined && pageRef.current?.isConnected === true
+      && editorDocumentRef.current === sourceDocument;
+    void (async () => {
+      if (suggestionContextRef.current !== pending.contextKey) {
+        await sourceController.compareAndSetPendingExtensionSuggestion(pending);
+        if (!request.signal.aborted) { setRecommendationReturn(undefined); setDraftError(t("extensions.recommendationExpired")); }
+        return;
+      }
+      const catalog = await sourceController.getExtension(pending.extensionId, pending.runtimeSessionId, request.signal);
+      if (!isCurrent()) return;
+      const extension = resolvePendingExtensionSuggestion(pending, catalog, { backendId: pending.backendId,
+        ...(pending.targetId === undefined ? {} : { targetId: pending.targetId }), targets: snapshot.targets, resources: snapshot.resources });
+      if (extension === undefined) {
+        await sourceController.compareAndSetPendingExtensionSuggestion(pending);
+        if (isCurrent()) { setRecommendationReturn(undefined); setDraftError(t("extensions.recommendationExpired")); }
+        return;
+      }
+      const consumed = await sourceController.consumePendingExtensionSuggestion(pending.nonce, pending.contextKey);
+      if (!isCurrent()) return;
+      setRecommendationReturn(undefined);
+      if (consumed === undefined) { setDraftError(t("extensions.recommendationExpired")); return; }
+      setNewlyInstalledExtensionId(extension.id);
+      const nextDocument = replaceSuggestionPrompt(extensionSuggestionPrompt(extension, pending.recommendation, pending.selectedPrompt));
+      await submitRef.current(nextDocument, () => { void sourceController.recordExtensionSuggestionUse(extension.id).catch(() => undefined); }, suggestionFirstInputGuard(pending, sourceController));
+    })().catch((error: unknown) => {
+      if (isCurrent()) { setDraftError(messageOf(error)); setRecommendationRetry(true); }
+    }).finally(() => {
+      if (recommendationFlightRef.current === flight) { recommendationFlightRef.current = undefined; if (mountedRef.current) setRecommendationBusy(false); }
+    });
+    return () => { request.abort(); if (recommendationFlightRef.current === flight) recommendationFlightRef.current = undefined; };
+  }, [recommendationReturn, recommendationRestored, hydrated, hydratedProfileScope, profileScope, recommendationRetryRevision, suggestionContextKey, canFinishVoiceSend, voice.active]);
+
+  const selectHomeSuggestion = (id: HomeSuggestionId): void => {
+    if (submittingRef.current || submissionRef.current !== undefined) return;
+    const nextDocument = replaceSuggestionPrompt(t(homeSuggestionPromptKey(id)));
     void submit(nextDocument);
   };
 
@@ -2088,6 +2258,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
         {selection?.kind === "target" && !workspacePreparationLoading && (targetStaticUnavailableReason ?? currentWorkspacePreparationError) !== undefined && <div className="new-task-warning" role="alert"><AlertTriangle aria-hidden="true" /><span>{targetStaticUnavailableReason ?? currentWorkspacePreparationError}</span>{targetStaticReady && currentWorkspacePreparationError !== undefined && <Button tone="ghost" disabled={submitting} onClick={() => setWorkspacePreparationRevision((value) => value + 1)}>{t("common.retry")}</Button>}</div>}
         {selected !== undefined && targetWorkspaceReady && !selected.trusted && <div className="new-task-warning" role="status"><AlertTriangle aria-hidden="true" /><span>{t("session.projectInert")}</span></div>}
         {draftError !== undefined && <div className="new-task-warning" role="alert"><AlertTriangle aria-hidden="true" /><span>{draftError}</span></div>}
+        {recommendationRetry && <Button disabled={recommendationBusy} onClick={() => { setRecommendationRetry(false); if (recommendationReturn === undefined) setRecommendationHydrationRetryRevision((value) => value + 1); else setRecommendationRetryRevision((value) => value + 1); }}>{t("common.retry")}</Button>}
         {projectBrowseError !== undefined && <div className="new-task-warning" role="alert"><AlertTriangle aria-hidden="true" /><span>{projectBrowseError}</span></div>}
         {showWorktreeControls && <section className="new-task-worktree" aria-labelledby="new-task-worktree-title">
           <header>
@@ -2414,8 +2585,12 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
 
         <HomeSuggestionList
           t={t}
-          disabled={!hydrated || hydratedProfileScope !== profileScope || submitting || voice.active}
+          extensionEntries={applicableExtensionSuggestions}
+          locale={controller.state.effectiveLocale}
+          hints={extensionSuggestions.hints}
+          disabled={!hydrated || hydratedProfileScope !== profileScope || submitting || voice.active || recommendationBusy}
           onSelect={selectHomeSuggestion}
+          onExtensionSelect={selectExtensionSuggestion}
         />
         <HomeUsageDashboard controller={controller} ownerId={pickerOwnerId} locale={controller.state.effectiveLocale} t={t} />
       </section>

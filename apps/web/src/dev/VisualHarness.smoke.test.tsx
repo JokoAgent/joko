@@ -7,7 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { VisualHarness } from "./VisualHarness.js";
 
 interface SmokeCase {
-  readonly scenario: "question" | "long-question" | "files" | "connections" | "background";
+  readonly scenario: "question" | "long-question" | "files" | "connections" | "background" | "extensions";
   readonly url: string;
   readonly width: number;
   readonly landmark: string;
@@ -55,6 +55,14 @@ const cases: readonly SmokeCase[] = [
     landmark: ".session-running-status[data-running-status='true']",
     expectedText: "1 background tasks running",
     theme: "dark"
+  },
+  {
+    scenario: "extensions",
+    url: "/__visual-harness__?scenario=extensions&theme=light",
+    width: 1_440,
+    landmark: ".extension-browser",
+    expectedText: "Workspace navigator",
+    theme: "light"
   }
 ];
 
@@ -99,12 +107,39 @@ describe("Visual harness smoke matrix", () => {
     window.history.replaceState(null, "", url);
     const container = await renderHarness();
 
+    await vi.waitFor(() => expect(container.querySelector(landmark)).not.toBeNull());
     expect(document.documentElement.dataset.visualHarness).toBe(scenario);
     expect(document.documentElement.dataset.theme).toBe(theme);
-    expect(container.querySelector(landmark)).not.toBeNull();
     expect(container.textContent).toContain(expectedText);
     expect(container.querySelector(".full-state__error")).toBeNull();
     expect(container.textContent).not.toContain("Cannot read properties of undefined");
+  }, 10_000);
+
+  it("keeps delayed task creation alive across the Extension fixture snapshot update", async () => {
+    setViewport(1_440, 900);
+    window.history.replaceState(null, "", "/__visual-harness__?scenario=extensions&theme=light");
+    const container = await renderHarness();
+    const newTask = [...container.querySelectorAll<HTMLButtonElement>("button")]
+      .find((button) => button.textContent?.trim().startsWith("New task"));
+    expect(newTask).toBeDefined();
+
+    await act(async () => {
+      newTask!.click();
+      await new Promise((resolve) => window.setTimeout(resolve, 0));
+    });
+    await vi.waitFor(() => expect(container.querySelector("[data-testid='home-suggestions']")).not.toBeNull());
+    const suggestion = [...container.querySelectorAll<HTMLButtonElement>("[data-home-suggestion-id]")]
+      .find((button) => !button.dataset.homeSuggestionId?.startsWith("extension:"));
+    expect(suggestion).toBeDefined();
+
+    await act(async () => {
+      suggestion!.click();
+      await new Promise((resolve) => window.setTimeout(resolve, 0));
+    });
+    await vi.waitFor(() => expect(container.querySelector("[data-session-id='session-100']")).not.toBeNull());
+    expect(container.querySelector("h1")?.textContent).not.toBe("New task");
+    await vi.waitFor(() => expect(document.documentElement.dataset.harnessLastAction).toMatch(/^send:session-100:prompt/u));
+    expect(container.querySelector(".full-state__error")).toBeNull();
   }, 10_000);
 });
 
