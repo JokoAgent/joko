@@ -198,10 +198,8 @@ import {
   type DedicatedHardwareMainController,
   type DedicatedHardwareProjectedState
 } from "./dedicated-hardware-main-controller.js";
-import {
-  dedicatedHardwareSdkStagingDirectory,
-  resolveDedicatedHardwareSdkIdentity
-} from "./dedicated-hardware-sdk.js";
+import { dedicatedHardwareSdkStagingDirectory } from "./dedicated-hardware-sdk.js";
+import { resolveDedicatedHardwareRuntime } from "./dedicated-hardware-runtime.js";
 import {
   DEDICATED_HARDWARE_MODEL_IDS,
   createDedicatedHardwareHostClient,
@@ -8851,8 +8849,9 @@ async function initializeDedicatedHardwareInput(): Promise<void> {
     factory: createElectronDedicatedHardwareUtilityFactory({
       entryPath: resolve(sourceDirectory, "dedicated-hardware", "utility-entry.js")
     }),
-    resolveSdkIdentity: () => resolveDedicatedHardwareSdkIdentity({
-      stagingDirectory: dedicatedHardwareSdkStagingDirectory(process.resourcesPath)
+    resolveSdkIdentity: () => resolveDedicatedHardwareRuntime({
+      stagingDirectory: dedicatedHardwareSdkStagingDirectory(process.resourcesPath),
+      nativeDirectory: app.isPackaged ? join(process.resourcesPath, "native-hardware") : join(sourceDirectory, "native-hardware")
     }),
     keymapBackupDirectory: join(app.getPath("userData"), "hardware-input", "private-keymap")
   });

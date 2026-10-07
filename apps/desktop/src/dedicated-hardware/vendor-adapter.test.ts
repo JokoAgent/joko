@@ -432,7 +432,7 @@ describe("dedicated hardware vendor adapter", () => {
     const handler = createDedicatedHardwareUtilityRequestHandler({
       postMessage: (message) => messages.push(message),
       openKeymapBackupStore: async () => backup.store,
-      loadStagedAdapter: async (_identity, sink) => createDedicatedHardwareVendorAdapter({
+      loadAdapter: async (_identity, sink) => createDedicatedHardwareVendorAdapter({
         sdk: fixture.sdk,
         sink,
         platform: "win32",

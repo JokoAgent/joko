@@ -116,6 +116,7 @@ module.exports = async function auditPackaged(context) {
   );
   await auditNativeSystemFrontmostInput(resolve(resourcesRoot, "native-system-frontmost-input"),
     context.electronPlatformName, targetArch);
+  await auditNativeHardware(resolve(resourcesRoot, "native-hardware"), context.electronPlatformName, targetArch);
   await auditNativeSimulatorHelper(nativeSimulatorHidRoot, context.electronPlatformName,
     targetArch, "Simulator HID", "joko-simulator-hid");
   await auditNativeSimulatorHelper(nativeSimulatorH264Root, context.electronPlatformName,
@@ -306,6 +307,7 @@ function isDedicatedHardwareSdkLock(value) {
 
 module.exports.auditDedicatedHardwareSdkDirectory = auditDedicatedHardwareSdkDirectory;
 module.exports.auditNativeSystemFrontmostInput = auditNativeSystemFrontmostInput;
+module.exports.auditNativeHardware = auditNativeHardware;
 module.exports.createDedicatedHardwareSdkDirectoryIntegrity = createDedicatedHardwareSdkDirectoryIntegrity;
 module.exports.createDedicatedHardwareSdkManifestIntegrity = createDedicatedHardwareSdkManifestIntegrity;
 module.exports.dedicatedHardwareSdkHandshakeBytes = dedicatedHardwareSdkHandshakeBytes;
@@ -856,6 +858,36 @@ async function auditNativeSystemFrontmostInput(root, platform, targetArch) {
   if (info.size <= 0 || info.size > 2 * 1024 * 1024
     || createHash("sha256").update(await readFile(path)).digest("hex") !== manifest.sha256) {
     throw new Error("The packaged native foreground input failed integrity verification.");
+  }
+}
+
+async function auditNativeHardware(root, platform, targetArch) {
+  const helper = platform === "win32" ? "joko-windows-micro-helper.exe" : null;
+  const expected = ["manifest.json", ...(helper === null ? [] : [helper])].sort();
+  const entries = await readdir(root, { withFileTypes: true });
+  const names = entries.map(entry => entry.name).sort();
+  if (names.join(",") !== expected.join(",")) throw new Error("The packaged native USB helper directory is incomplete.");
+  for (const entry of entries) {
+    await assertCanonicalRegularFile(resolve(root, entry.name), "The packaged native USB helper file is unsafe.");
+  }
+  const manifest = await readJsonManifest(resolve(root, "manifest.json"), "native USB helper");
+  if (Object.keys(manifest).sort().join(",") !== "architecture,helper,platform,protocolVersion,sha256" ||
+      manifest.platform !== platform || manifest.architecture !== targetArch || manifest.protocolVersion !== 1 ||
+      manifest.helper !== helper || (helper === null ? manifest.sha256 !== null :
+        typeof manifest.sha256 !== "string" || !/^[a-f0-9]{64}$/u.test(manifest.sha256))) {
+    throw new Error("The packaged native USB helper identity does not match the artifact target.");
+  }
+  if (helper === null) return;
+  if (!["x64", "arm64"].includes(targetArch)) throw new Error("The native USB helper architecture is unsupported.");
+  const path = resolve(root, helper);
+  const info = await lstat(path);
+  if (info.size < 64 || info.size > 8 * 1024 * 1024) throw new Error("The native USB helper size is invalid.");
+  const bytes = await readFile(path);
+  const offset = bytes.readUInt32LE(0x3c);
+  if (createHash("sha256").update(bytes).digest("hex") !== manifest.sha256 ||
+      bytes.readUInt16LE(0) !== 0x5a4d || offset > bytes.length - 6 || bytes.readUInt32LE(offset) !== 0x4550 ||
+      bytes.readUInt16LE(offset + 4) !== (targetArch === "arm64" ? 0xaa64 : 0x8664)) {
+    throw new Error("The packaged native USB helper binary does not match its identity.");
   }
 }
 

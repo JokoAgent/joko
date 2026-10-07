@@ -85,6 +85,14 @@
       ]
     },
     {
+      "from": "dist/native-hardware",
+      "to": "native-hardware",
+      "filter": [
+        "manifest.json",
+        "joko-windows-micro-helper.exe"
+      ]
+    },
+    {
       "from": "dist/native-simulator-hid",
       "to": "native-simulator-hid",
       "filter": [

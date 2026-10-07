@@ -58,6 +58,7 @@ type AuditDedicatedHardwareSdkDirectory = (
 
 const require = createRequire(import.meta.url);
 const packagedAudit = require("../scripts/audit-packaged.cjs") as {
+  readonly auditNativeHardware: (root: string, platform: "win32" | "darwin" | "linux", targetArch: string) => Promise<void>;
   readonly auditNativeSystemFrontmostInput: (root: string, platform: "win32" | "darwin" | "linux", targetArch: string) => Promise<void>;
   readonly auditDedicatedHardwareSdkDirectory: AuditDedicatedHardwareSdkDirectory;
   readonly createDedicatedHardwareSdkDirectoryIntegrity: (entries: readonly Readonly<{
@@ -81,6 +82,26 @@ const runtimeTarget: DedicatedHardwareSdkRuntimeTarget = {
 
 afterEach(() => {
   for (const path of cleanups.splice(0).reverse()) rmSync(path, { recursive: true, force: true });
+});
+
+describe("packaged native USB hardware audit", () => {
+  it("requires the target binary and integrity in the packaged resource", async () => {
+    const root = temporaryDirectory();
+    const bytes = Buffer.alloc(128);
+    bytes.writeUInt16LE(0x5a4d, 0);
+    bytes.writeUInt32LE(64, 0x3c);
+    bytes.writeUInt32LE(0x4550, 64);
+    bytes.writeUInt16LE(0x8664, 68);
+    const helper = "joko-windows-micro-helper.exe";
+    writeFileSync(join(root, helper), bytes);
+    writeFileSync(join(root, "manifest.json"), JSON.stringify({ protocolVersion: 1,
+      platform: "win32", architecture: "x64", helper, sha256: createHash("sha256").update(bytes).digest("hex") }));
+    await expect(packagedAudit.auditNativeHardware(root, "win32", "x64")).resolves.toBeUndefined();
+    await expect(packagedAudit.auditNativeHardware(root, "win32", "arm64")).rejects.toThrow("artifact target");
+    bytes[100] = 1;
+    writeFileSync(join(root, helper), bytes);
+    await expect(packagedAudit.auditNativeHardware(root, "win32", "x64")).rejects.toThrow("does not match its identity");
+  });
 });
 
 describe("packaged native foreground input audit", () => {
