@@ -109,13 +109,13 @@ describe("Connect service composition", () => {
     const requestPairing = vi.fn(() => ({ id: "mobile-pair", code: "204816", expiresAt: Date.now() + 60_000 }));
     const services = createConnectServices(stubApplication({ connections: { requestPairing } }));
     const beginPairing = services.connection.beginPairing as unknown as (
-      request: { deviceDisplayName: string; deviceKind: number; platform: string; appVersion: string },
+      request: { deviceDisplayName: string; deviceKind: number; platform: string; appVersion: string; deviceNameSource: { defaultDisplayName: string } },
       context: unknown
     ) => { challenge?: { humanCode: string } };
-    beginPairing({ deviceDisplayName: "Phone", deviceKind: contract.DeviceKind.MOBILE, platform: "android", appVersion: "0.1.0" },
+    beginPairing({ deviceDisplayName: "Phone", deviceKind: contract.DeviceKind.MOBILE, deviceNameSource: { defaultDisplayName: "Fixture phone" }, platform: "android", appVersion: "0.1.0" },
       { requestHeader: new Headers() });
     expect(requestPairing).toHaveBeenCalledWith("Phone", {
-      name: "Phone", kind: "mobile", platform: "android", appVersion: "0.1.0"
+      defaultName: "Fixture phone", manualName: "Phone", kind: "mobile", platform: "android", appVersion: "0.1.0"
     });
   });
 

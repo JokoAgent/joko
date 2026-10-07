@@ -782,6 +782,7 @@ message BeginPairingRequest {
   DeviceKind device_kind = 2;
   string platform = 3;
   string app_version = 4;
+  DeviceNameSource device_name_source = 5;
 }
 
 message BeginPairingResponse {
@@ -800,6 +801,7 @@ message CompletePairingRequest {
   // Connection already belongs to this same Device. Anonymous pairing omits
   // the field and always creates a new Device.
   optional string device_id = 7;
+  DeviceNameSource device_name_source = 8;
 }
 
 message CompletePairingResponse {
@@ -856,6 +858,9 @@ message ListDeviceControlRelationsResponse {
 
 message GetSnapshotRequest {
   SnapshotScope scope = 1;
+  // Mobile and Desktop callers report only their own current native name.
+  // Desktop uses its Main metadata producer; agent Hello is also authoritative.
+  DeviceNameSource current_device_name_source = 2;
 }
 
 message GetSnapshotResponse {

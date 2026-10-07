@@ -225,6 +225,7 @@ import type {
   BackendProviderCredentialSurface,
   BlobRef,
   Capability,
+  DeviceContentProjection,
   EventPayload,
   InlineTextRange as CoreInlineTextRange,
   InputMentionRange as CoreInputMentionRange,
@@ -2726,6 +2727,28 @@ export function fromProtoRuntimeCommand(item: contract.RuntimeCommand): CoreRunt
   };
 }
 
+export function toProtoDeviceContent(device: DeviceContentProjection): contract.Device {
+  return message<contract.Device>("joko.v1.Device", {
+    deviceId: device.id,
+    displayName: device.name,
+    defaultDisplayName: device.defaultName,
+    ...(device.manualName === undefined ? {} : { manualDisplayName: device.manualName }),
+    kind: device.kind === "web" ? contract.DeviceKind.WEB
+      : device.kind === "desktop" ? contract.DeviceKind.DESKTOP
+      : device.kind === "service" ? contract.DeviceKind.SERVICE
+      : device.kind === "mobile" ? contract.DeviceKind.MOBILE : contract.DeviceKind.UNSPECIFIED,
+    platform: device.platform,
+    appVersion: device.appVersion,
+    revoked: device.revoked,
+    pairedAt: toProtoTimestamp(device.pairedAt),
+    lastSeenAt: device.lastSeenAt === undefined ? undefined : toProtoTimestamp(device.lastSeenAt),
+    connectionIds: [...device.connectionIds],
+    remoteControlEnabled: device.remoteControlEnabled,
+    presence: device.online ? contract.DevicePresenceState.ONLINE : contract.DevicePresenceState.OFFLINE,
+    version: toProtoEntityVersion(BigInt(device.revision), 0, device.versionUpdatedAt)
+  });
+}
+
 export function toProtoEvent(event: PersistedEvent, context: EventMappingContext = {}): ProtoEvent {
   const identity = message<EventIdentity>("joko.v1.EventIdentity", {
     backendId: event.backendId,
@@ -2784,6 +2807,10 @@ export function fromProtoEvent(event: ProtoEvent): AppendEventInput {
 function toProtoEventPayload(event: PersistedEvent, context: EventMappingContext): ProtoEventPayload {
   const payload = event.payload;
   switch (payload.type) {
+    case "device_changed":
+      return protoPayload("deviceChanged", message<contract.DeviceChangedEvent>("joko.v1.DeviceChangedEvent", {
+        device: toProtoDeviceContent(payload.device)
+      }));
     case "run_state": {
       if (context.run === undefined) throw missingPayload("event.context.run");
       if (context.target === undefined) throw missingPayload("event.context.target");
@@ -3206,6 +3233,8 @@ function fromProtoEventPayload(
   occurredAt?: number
 ): EventPayload {
   switch (payload.kind.case) {
+    case "deviceChanged":
+      throw new ProtoMappingError("invalid_argument", "event.payload.device_changed", "Device content is owned by the Store and cannot be imported as a Session event.");
     case "sessionChanged":
       return { type: "session_changed" };
     case "runChanged": {

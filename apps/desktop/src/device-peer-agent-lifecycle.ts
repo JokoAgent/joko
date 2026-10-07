@@ -27,6 +27,7 @@ export interface DesktopDevicePeerAgentLifecycleOptions {
   ) => DevicePeerAgentExecutor | Promise<DevicePeerAgentExecutor>;
   /** Renderer-profile bearer used only for the authenticated identity probe. */
   readonly readAuthKey: (profileId: string) => Promise<string | undefined>;
+  readonly readDefaultDeviceName: () => string;
   /** Main-only bootstrap authority; never backed by renderer credential IPC. */
   readonly readRouteAuthorization: (profileId: string) => Promise<string | undefined>;
   readonly isAuthorityCurrent: (
@@ -51,6 +52,7 @@ export class DesktopDevicePeerAgentLifecycle {
     const lifecycleOptions: NodeDevicePeerAgentLifecycleOptions = {
       createExecutor: () => options.createExecutor(this.#requireDesired()),
       readAuthKey: options.readAuthKey,
+      readDefaultDeviceName: options.readDefaultDeviceName,
       readRouteAuthorization: options.readRouteAuthorization,
       isAuthorityCurrent: () => options.isAuthorityCurrent(this.#requireDesired()),
       runRoute: async (nodeOptions) => {
@@ -60,6 +62,7 @@ export class DesktopDevicePeerAgentLifecycle {
           executor: nodeOptions.executor,
           signal: nodeOptions.signal,
           readAuthKey: nodeOptions.readAuthKey,
+          readDefaultDeviceName: nodeOptions.readDefaultDeviceName,
           readRouteAuthorization: nodeOptions.readRouteAuthorization
             ?? (() => Promise.resolve(undefined)),
           isAuthorityCurrent: (candidate) => sameConnection(candidate, desktop)

@@ -35,6 +35,7 @@ describe("Desktop Device peer agent lifecycle", () => {
         return executor;
       },
       readAuthKey: async () => "A".repeat(43),
+      readDefaultDeviceName: () => "Native Desktop",
       readRouteAuthorization: async () => "R".repeat(43),
       isAuthorityCurrent: () => true,
       async runRoute(options) {
@@ -70,19 +71,24 @@ describe("Desktop Device peer agent lifecycle", () => {
     const delays: number[] = [];
     let authorityCurrent = true;
     let attempts = 0;
+    let nativeName = "First OS host";
+    const sources: string[] = [];
     const lifecycle = new DesktopDevicePeerAgentLifecycle({
       createExecutor: () => fakeExecutor(),
       readAuthKey: async () => "B".repeat(43),
+      readDefaultDeviceName: () => nativeName,
       readRouteAuthorization: async () => "R".repeat(43),
       isAuthorityCurrent: (candidate) => authorityCurrent && candidate === FIRST,
-      async runRoute() {
+      async runRoute(options) {
         attempts += 1;
+        sources.push(options.readDefaultDeviceName());
         throw new Error("transport detail that must stay private");
       },
       retryBaseDelayMs: 10,
       retryMaximumDelayMs: 25,
       async wait(milliseconds) {
         delays.push(milliseconds);
+        nativeName = "Updated OS host";
         if (delays.length === 4) authorityCurrent = false;
       }
     });
@@ -93,6 +99,7 @@ describe("Desktop Device peer agent lifecycle", () => {
     await lifecycle.stop();
     expect(delays).toEqual([10, 20, 25, 25]);
     expect(attempts).toBe(4);
+    expect(sources).toEqual(["First OS host", "Updated OS host", "Updated OS host", "Updated OS host"]);
   });
 
   it("interrupts a failed-route backoff immediately when the exact authority is replaced", async () => {
@@ -102,6 +109,7 @@ describe("Desktop Device peer agent lifecycle", () => {
     const lifecycle = new DesktopDevicePeerAgentLifecycle({
       createExecutor: () => fakeExecutor(),
       readAuthKey: async () => "D".repeat(43),
+      readDefaultDeviceName: () => "Native Desktop",
       readRouteAuthorization: async () => "R".repeat(43),
       isAuthorityCurrent: () => true,
       async runRoute(options) {
@@ -134,6 +142,7 @@ describe("Desktop Device peer agent lifecycle", () => {
     const lifecycle = new DesktopDevicePeerAgentLifecycle({
       createExecutor,
       readAuthKey,
+      readDefaultDeviceName: () => "Native Desktop",
       readRouteAuthorization,
       isAuthorityCurrent: () => false,
       runRoute,

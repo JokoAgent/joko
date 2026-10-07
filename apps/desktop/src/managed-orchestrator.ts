@@ -111,7 +111,7 @@ export interface StartManagedOrchestratorOptions {
   readonly dataDirectory: string;
   readonly workspaceRoot: string;
   readonly deviceId: string;
-  readonly deviceName: string;
+  readonly defaultDeviceName: string;
   readonly appVersion: string;
   readonly platform?: string;
   readonly parentPid?: number;
@@ -196,7 +196,7 @@ export async function startManagedOrchestrator(options: StartManagedOrchestrator
   const request = createDesktopBootstrapRequest({
     parentPid,
     deviceId: options.deviceId,
-    deviceName: options.deviceName,
+    defaultDeviceName: options.defaultDeviceName,
     platform: options.platform ?? process.platform,
     appVersion: options.appVersion,
     ttlMs: MANAGED_ORCHESTRATOR_START_TIMEOUT_MS,

@@ -3,6 +3,7 @@ import { lstat, open, readFile, realpath } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
+import { hostname } from "node:os";
 
 import { locateClaudeNativeRuntime } from "@joko/adapter-claude-code";
 import {
@@ -32,6 +33,7 @@ export interface ServiceDevicePeerAgentOptions {
   readonly createExecutor?: NodeDevicePeerAgentLifecycleOptions["createExecutor"];
   readonly validateCredential?: (credentialPath: string) => Promise<void>;
   readonly readAuthKey?: (credentialPath: string) => Promise<string | undefined>;
+  readonly readDefaultDeviceName?: () => string;
   readonly runRoute?: NodeDevicePeerAgentLifecycleOptions["runRoute"];
   readonly wait?: NodeDevicePeerAgentLifecycleOptions["wait"];
   readonly retryBaseDelayMs?: number;
@@ -72,6 +74,7 @@ export class ServiceDevicePeerAgent {
     }));
     this.#lifecycle = new NodeDevicePeerAgentLifecycle({
       createExecutor,
+      readDefaultDeviceName: options.readDefaultDeviceName ?? (() => hostname().trim() || "Unknown Device"),
       readAuthKey: (credentialId) => credentialId === this.#connection.credentialId
         ? this.#readAuthKey(this.#credentialPath)
         : Promise.resolve(undefined),

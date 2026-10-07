@@ -8,6 +8,7 @@ interface JokoDesktopFile {
 
 interface JokoDesktopAppInfo {
   readonly name: string;
+  readonly defaultDeviceName: string;
   readonly version: string;
   readonly platform: string;
   readonly electronVersion: string;

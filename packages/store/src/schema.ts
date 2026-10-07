@@ -12,6 +12,7 @@ const DURABLE_JSON_SHAPE_BASELINE = [
   "interaction-question-request:single/multiple.allowOther=required",
   "interaction-question-decision:text|single(choice|other)|multiple(choiceIds+optionalOtherText)|boolean",
   "resource-usage-event:exact-v1",
+  "device-content-event:owner-routing-null+exact-default/manual/effective-projection-v1",
   "native-derivation-remote-worktree-plan:exact-v1",
   "native-derivation-worktree:optional-remote-owner-exact-v1"
 ].join("\n");
@@ -171,7 +172,8 @@ CREATE TABLE device_control_relations (
 
 CREATE TABLE devices (
         id TEXT PRIMARY KEY,
-        name TEXT NOT NULL,
+        default_name TEXT NOT NULL,
+        manual_name TEXT,
         kind TEXT NOT NULL CHECK (kind IN ('unspecified', 'web', 'desktop', 'service', 'mobile')),
         platform TEXT NOT NULL,
         app_version TEXT NOT NULL,
@@ -266,9 +268,9 @@ CREATE TABLE events (
         revision INTEGER NOT NULL CHECK (revision >= 1),
         session_sequence INTEGER NOT NULL CHECK (session_sequence >= 1),
         emitted_at INTEGER NOT NULL,
-        backend_id TEXT NOT NULL REFERENCES backends(id) ON DELETE RESTRICT,
-        target_id TEXT NOT NULL REFERENCES targets(id) ON DELETE RESTRICT,
-        session_id TEXT NOT NULL REFERENCES product_sessions(id) ON DELETE CASCADE,
+        backend_id TEXT REFERENCES backends(id) ON DELETE RESTRICT,
+        target_id TEXT REFERENCES targets(id) ON DELETE RESTRICT,
+        session_id TEXT REFERENCES product_sessions(id) ON DELETE CASCADE,
         run_id TEXT REFERENCES runs(id) ON DELETE SET NULL,
         attempt_id TEXT REFERENCES attempts(id) ON DELETE SET NULL,
         operation_id TEXT REFERENCES operations(id) ON DELETE SET NULL,
@@ -277,7 +279,16 @@ CREATE TABLE events (
         payload_json TEXT NOT NULL,
         namespace TEXT,
         metadata_json TEXT,
-        UNIQUE(session_id, session_sequence)
+        UNIQUE(session_id, session_sequence),
+        CHECK (
+          (backend_id IS NOT NULL AND target_id IS NOT NULL AND session_id IS NOT NULL
+            AND json_extract(payload_json, '$.payload.type') IS NOT 'device_changed')
+          OR
+          (backend_id IS NULL AND target_id IS NULL AND session_id IS NULL
+            AND json_extract(payload_json, '$.payload.type') IS 'device_changed'
+            AND run_id IS NULL AND attempt_id IS NULL AND operation_id IS NULL
+            AND generation = 0 AND namespace IS NULL AND metadata_json IS NULL)
+        )
       ) STRICT;
 
 CREATE TABLE desktop_host_authorizations (
@@ -704,7 +715,8 @@ CREATE TABLE pairings (
         code_digest TEXT NOT NULL UNIQUE,
         label TEXT,
         device_id TEXT,
-        device_name TEXT,
+        device_default_name TEXT,
+        device_manual_name TEXT,
         device_kind TEXT CHECK (device_kind IS NULL OR device_kind IN ('unspecified', 'web', 'desktop', 'service', 'mobile')),
         device_platform TEXT,
         device_app_version TEXT,
@@ -714,8 +726,8 @@ CREATE TABLE pairings (
         created_at INTEGER NOT NULL,
         revision INTEGER NOT NULL CHECK (revision >= 1),
         CHECK (
-          (device_id IS NULL AND device_name IS NULL AND device_kind IS NULL AND device_platform IS NULL AND device_app_version IS NULL)
-          OR (device_id IS NOT NULL AND device_name IS NOT NULL AND device_kind IS NOT NULL AND device_platform IS NOT NULL AND device_app_version IS NOT NULL)
+          (device_id IS NULL AND device_default_name IS NULL AND device_manual_name IS NULL AND device_kind IS NULL AND device_platform IS NULL AND device_app_version IS NULL)
+          OR (device_id IS NOT NULL AND device_default_name IS NOT NULL AND device_kind IS NOT NULL AND device_platform IS NOT NULL AND device_app_version IS NOT NULL)
         )
       ) STRICT;
 

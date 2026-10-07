@@ -45,6 +45,8 @@ import {
   ResourceUsageReportQueryError,
   ResourceUsageReportCapacityError,
   MESSAGE_SEARCH_EMBEDDING_MODEL_ID,
+  deviceContentProjection,
+  normalizeDeviceName,
   operationBodyHash
 } from "@joko/store";
 import type {
@@ -224,6 +226,7 @@ import {
   toProtoContextUsage,
   toProtoDuration,
   toProtoEntityVersion,
+  toProtoDeviceContent,
   toProtoEvent,
   toProtoEventCursor,
   toProtoInteraction,
@@ -1122,7 +1125,6 @@ const DEFAULT_MESSAGE_SEARCH_PAGE_SIZE = 25;
 const MAX_MESSAGE_SEARCH_PAGE_SIZE = 100;
 const EVENT_STREAM_PAGE_SIZE = 1_000;
 const STORE_QUERY_PAGE_SIZE = 100_000;
-const DEVICE_PRESENCE_WINDOW_MS = 75_000;
 const BROWSER_PROVIDER_ID = "browser";
 const MANAGED_PROVIDER_CATALOG_CAPABILITY = "provider.managed_catalog";
 const SILENT_ENCRYPTED_RETRY_SETTING_KEY = "settings.personalization.silent_encrypted_retry";
@@ -1428,7 +1430,8 @@ export function createConnectServices(application: OrchestratorApplication, proj
         dependencies.connections.openPairingWindow();
       }
       const challenge = dependencies.connections.requestPairing(request.deviceDisplayName, {
-        name: request.deviceDisplayName,
+        defaultName: pairingDefaultDeviceName(request.deviceKind, request.deviceNameSource),
+        manualName: boundedDeviceDisplayName(request.deviceDisplayName),
         kind: request.deviceKind === contract.DeviceKind.WEB
           ? "web"
           : request.deviceKind === contract.DeviceKind.DESKTOP
@@ -1470,12 +1473,25 @@ export function createConnectServices(application: OrchestratorApplication, proj
         ...(existingDevice === undefined ? {} : {
           device: {
             id: existingDevice.id,
-            name: existingDevice.name,
+            defaultName: existingDevice.defaultName,
+            ...(existingDevice.manualName === undefined ? {} : { manualName: existingDevice.manualName }),
             kind: existingDevice.kind,
             platform: existingDevice.platform,
             appVersion: existingDevice.appVersion
           }
-        })
+        }),
+        ...(existingDevice === undefined ? {
+          device: {
+            defaultName: pairingDefaultDeviceName(request.deviceKind, request.deviceNameSource),
+            manualName: boundedDeviceDisplayName(request.deviceDisplayName),
+            kind: request.deviceKind === contract.DeviceKind.WEB ? "web"
+              : request.deviceKind === contract.DeviceKind.DESKTOP ? "desktop"
+                : request.deviceKind === contract.DeviceKind.SERVICE ? "service"
+                  : request.deviceKind === contract.DeviceKind.MOBILE ? "mobile" : "unspecified",
+            platform: request.platform,
+            appVersion: request.appVersion
+          }
+        } : {})
       });
       const mapped = toProtoConnection(completed.connection);
       return {
@@ -1599,7 +1615,16 @@ export function createConnectServices(application: OrchestratorApplication, proj
 
   const event = {
     getSnapshot: async (request, context) => {
-      authenticate(context);
+      const authenticated = authenticate(context);
+      if (request.currentDeviceNameSource !== undefined) {
+        const kind = dependencies.store.getDevice(authenticated.deviceId).kind;
+        if (kind !== "mobile" && kind !== "desktop") {
+          throw new ConnectError("Only a Mobile or Desktop Device reports its native name through Snapshot.", Code.PermissionDenied);
+        }
+        dependencies.connections.refreshDeviceNameSource(
+          authenticated, boundedDeviceDisplayName(request.currentDeviceNameSource.defaultDisplayName)
+        );
+      }
       if (typeof (dependencies.store as Partial<OperationalStore>).listSessions === "function") {
         sessionCodeHostContext.refreshSessionsInBackground(dependencies.store
           .listSessions({ includeArchived: true, includeDeleted: false })
@@ -6698,31 +6723,7 @@ function deviceFromRecord(
   connections: readonly ConnectionRecord[],
   observedAt = Date.now()
 ): contract.Device {
-  const online = record.state === "active" && connections.some((connection) =>
-    connection.state === "active" && connection.lastSeenAt !== undefined &&
-    observedAt - connection.lastSeenAt <= DEVICE_PRESENCE_WINDOW_MS);
-  return create(contract.DeviceSchema, {
-    deviceId: record.id,
-    displayName: record.name,
-    kind: record.kind === "web"
-      ? contract.DeviceKind.WEB
-      : record.kind === "desktop"
-        ? contract.DeviceKind.DESKTOP
-        : record.kind === "service"
-          ? contract.DeviceKind.SERVICE
-          : record.kind === "mobile"
-            ? contract.DeviceKind.MOBILE
-          : contract.DeviceKind.UNSPECIFIED,
-    platform: record.platform,
-    appVersion: record.appVersion,
-    revoked: record.state === "revoked",
-    pairedAt: toProtoTimestamp(record.pairedAt),
-    lastSeenAt: record.lastSeenAt === undefined ? undefined : toProtoTimestamp(record.lastSeenAt),
-    connectionIds: connections.map((connection) => connection.id),
-    remoteControlEnabled: record.remoteControlEnabled,
-    presence: online ? contract.DevicePresenceState.ONLINE : contract.DevicePresenceState.OFFLINE,
-    version: toProtoEntityVersion(record.revision, 0, record.lastSeenAt ?? record.revokedAt ?? record.pairedAt)
-  });
+  return toProtoDeviceContent(deviceContentProjection(record, connections, observedAt));
 }
 
 function nativeMobilePushEnvironment(
@@ -6776,11 +6777,18 @@ function deviceControlRelationId(controllerDeviceId: string, targetDeviceId: str
 }
 
 function boundedDeviceDisplayName(value: string): string {
-  const normalized = value.trim();
-  if (normalized === "" || normalized.length > 80 || /[\u0000-\u001f\u007f]/u.test(normalized)) {
-    throw invalidArgument("display_name is invalid");
+  try { return normalizeDeviceName(value); }
+  catch { throw invalidArgument("display_name is invalid"); }
+}
+
+function pairingDefaultDeviceName(kind: contract.DeviceKind, source: contract.DeviceNameSource | undefined): string {
+  if (kind === contract.DeviceKind.WEB) return "Joko Browser";
+  if (kind === contract.DeviceKind.UNSPECIFIED) return "Joko Device";
+  if (kind !== contract.DeviceKind.DESKTOP && kind !== contract.DeviceKind.MOBILE && kind !== contract.DeviceKind.SERVICE) {
+    throw invalidArgument("device_kind is invalid");
   }
-  return normalized;
+  if (source === undefined) throw invalidArgument("device_name_source is required for a native Device");
+  return boundedDeviceDisplayName(source.defaultDisplayName);
 }
 
 function requireControllableDevice(device: DeviceRecord): void {
@@ -6970,6 +6978,7 @@ function eventContext(
   item: PersistedEvent,
   dependencies: ConnectServiceDependencies
 ): Parameters<typeof toProtoEvent>[1] {
+  if (item.payload.type === "device_changed") return {};
   const store = dependencies.store;
   let session: StoredSession | undefined;
   let target: StoredTarget | undefined;
@@ -7017,6 +7026,7 @@ function eventContext(
 }
 
 function eventMatchesScope(item: PersistedEvent, scope: contract.SnapshotScope | undefined, dependencies: ConnectServiceDependencies): boolean {
+  if (item.payload.type === "device_changed") return scope?.kind.case === undefined || scope.kind.case === "owner";
   switch (scope?.kind.case) {
     case undefined:
     case "owner": return true;
@@ -15376,6 +15386,20 @@ async function dispatchMutation(
         body: mutation,
         commit: (store) => {
           const device = store.renameDevice(deviceId, displayName);
+          return { accepted: true, resultCase: "device", entityId: device.id } satisfies OperationOutcome;
+        }
+      }));
+    }
+    case "resetDeviceName": {
+      const deviceId = payload.value.deviceId.trim();
+      if (deviceId === "") throw invalidArgument("device_id is required");
+      return presented(await host.mutate({
+        operationId,
+        connection,
+        kind: payload.case,
+        body: mutation,
+        commit: (store) => {
+          const device = store.resetDeviceName(deviceId);
           return { accepted: true, resultCase: "device", entityId: device.id } satisfies OperationOutcome;
         }
       }));

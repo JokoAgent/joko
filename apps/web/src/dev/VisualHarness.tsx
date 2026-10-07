@@ -1816,7 +1816,8 @@ export function VisualHarness(): JSX.Element {
         updateSnapshot((snapshot) => ({ ...snapshot, sessions: [...snapshot.sessions, next] }));
         record(`session-create:${id}`);
         return { sessionId: id, generation: next.generation };
-      }
+      },
+      hasPendingDeviceNameUpdate: () => false
     } satisfies Partial<AppController>;
     return new Proxy(implemented, {
       get(target, property, receiver) {
@@ -3682,6 +3683,8 @@ function visualSnapshot(parameters: HarnessParameters, files: VisualWorkspaceFil
       ? [{
           id: "visual-desktop",
           name: "Desktop",
+          defaultDisplayName: "Desktop",
+          revision: 1n,
           kind: "desktop",
           platform: "win32",
           appVersion: "0.1.0",

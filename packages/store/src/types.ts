@@ -132,6 +132,8 @@ export type DeviceKind = "unspecified" | "web" | "desktop" | "service" | "mobile
 export interface DeviceRecord {
   readonly id: string;
   readonly name: string;
+  readonly defaultName: string;
+  readonly manualName?: string;
   readonly kind: DeviceKind;
   readonly platform: string;
   readonly appVersion: string;
@@ -146,7 +148,8 @@ export interface DeviceRecord {
 
 export interface CreateDeviceInput {
   readonly id: string;
-  readonly name: string;
+  readonly defaultName: string;
+  readonly manualName?: string;
   readonly kind?: DeviceKind;
   readonly platform?: string;
   readonly appVersion?: string;
@@ -1329,13 +1332,31 @@ export interface AppendEventInput {
   };
 }
 
-export interface PersistedEvent extends EventEnvelope {
+export interface PersistedSessionEvent extends EventEnvelope {
+  readonly payload: Exclude<EventEnvelope["payload"], { readonly type: "device_changed" }>;
   readonly globalCursor: bigint;
   readonly metadata?: {
     readonly namespace: string;
     readonly fields: Readonly<Record<string, string | number | boolean>>;
   };
 }
+
+/** Owner routing is empty at the public boundary; durable routing columns are NULL. */
+export interface PersistedDeviceEvent extends Omit<EventEnvelope, "payload" | "runId" | "attemptId" | "operationId" | "pi"> {
+  readonly backendId: "";
+  readonly targetId: "";
+  readonly sessionId: "";
+  readonly generation: 0;
+  readonly payload: Extract<EventEnvelope["payload"], { readonly type: "device_changed" }>;
+  readonly globalCursor: bigint;
+  readonly runId?: never;
+  readonly attemptId?: never;
+  readonly operationId?: never;
+  readonly pi?: never;
+  readonly metadata?: never;
+}
+
+export type PersistedEvent = PersistedSessionEvent | PersistedDeviceEvent;
 
 export interface EventQuery {
   readonly afterCursor?: bigint;

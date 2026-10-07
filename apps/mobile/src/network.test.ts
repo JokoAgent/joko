@@ -7,6 +7,10 @@ import {
   BlobDisposition,
   BlobRefSchema,
   BlobTransferTicketSchema,
+  BeginPairingRequestSchema, BeginPairingResponseSchema,
+  CompletePairingRequestSchema, CompletePairingResponseSchema,
+  ConnectionSchema, ConnectionState, DeviceKind, DeviceSchema,
+  GetServerInfoResponseSchema, GetSnapshotRequestSchema, GetSnapshotResponseSchema, SnapshotSchema,
   GetImageThumbnailRequestSchema, GetImageThumbnailResponseSchema, ImageThumbnailUnavailableReason,
   ReadWorkspaceHtmlSnapshotRequestSchema, ReadWorkspaceHtmlSnapshotResponseSchema,
   FileKind,
@@ -75,6 +79,77 @@ import {
   mobileNetwork,
   type PairedCredential
 } from "./network";
+import { mobileDeviceNameSource } from "./mobile-device-name";
+
+describe("mobile device name handshake", () => {
+  const credential: PairedCredential = { profileId: "profile", origin: "https://node.example", serverId: "server",
+    connectionId: "connection", deviceId: "phone", displayName: "Joko node", authKey: "device-name-fixture-key" };
+  const server = { serverId: "server", displayName: "Joko node", apiVersion: "joko.v1", version: "0.1.0", pairingEnabled: true };
+  const connection = create(ConnectionSchema, { connectionId: "connection", connectionProfileId: "profile", deviceId: "phone",
+    state: ConnectionState.CONNECTED, version: { revision: { value: 2n } } });
+  const device = create(DeviceSchema, { deviceId: "phone", displayName: "Manual phone", defaultDisplayName: "Current phone",
+    manualDisplayName: "Manual phone", kind: DeviceKind.MOBILE, connectionIds: ["connection"], version: { revision: { value: 3n } } });
+
+  it("reports each explicit native source and returns the current Device from the same authenticated owner Snapshot", async () => {
+    const calls: string[] = [];
+    const fetcher = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const path = new URL(String(input)).pathname;
+      calls.push(path);
+      const binary = new Uint8Array(init!.body as Uint8Array);
+      const headers = { "content-type": "application/proto" };
+      if (path.endsWith("/GetServerInfo")) return new Response(toBinary(GetServerInfoResponseSchema,
+        create(GetServerInfoResponseSchema, { server })), { headers });
+      if (path.endsWith("/BeginPairing")) {
+        expect(fromBinary(BeginPairingRequestSchema, binary)).toMatchObject({
+          deviceDisplayName: "Manual phone", deviceNameSource: { defaultDisplayName: "First phone" }
+        });
+        return new Response(toBinary(BeginPairingResponseSchema,
+          create(BeginPairingResponseSchema, { challenge: { challengeId: "challenge" } })), { headers });
+      }
+      if (path.endsWith("/CompletePairing")) {
+        expect(fromBinary(CompletePairingRequestSchema, binary)).toMatchObject({
+          deviceDisplayName: "Manual phone", humanCode: "123456", deviceNameSource: { defaultDisplayName: "Second phone" }
+        });
+        return new Response(toBinary(CompletePairingResponseSchema,
+          create(CompletePairingResponseSchema, { result: { connection, device, authKey: credential.authKey } })), { headers });
+      }
+      expect(path).toBe("/joko.v1.EventService/GetSnapshot");
+      expect(new Headers(init?.headers).get("authorization")).toBe(`Bearer ${credential.authKey}`);
+      expect(fromBinary(GetSnapshotRequestSchema, binary)).toMatchObject({
+        scope: { kind: { case: "owner" } }, currentDeviceNameSource: { defaultDisplayName: "Current phone" }
+      });
+      return new Response(toBinary(GetSnapshotResponseSchema, create(GetSnapshotResponseSchema, {
+        snapshot: { server, connections: [connection], devices: [device] }
+      })), { headers });
+    });
+    try {
+      await mobileNetwork.requestPairing(credential.origin, " Manual phone ", "android", mobileDeviceNameSource("First phone", "android"));
+      await mobileNetwork.completePairing(credential.origin, "challenge", " 123456 ", "Manual phone", "android",
+        mobileDeviceNameSource("Second phone", "android"));
+      const owner = await mobileNetwork.readOwner(credential, mobileDeviceNameSource("Current phone", "android"));
+      expect(owner.device).toBe(owner.snapshot.devices[0]);
+      expect(owner.connection).toBe(owner.snapshot.connections[0]);
+      expect(owner.device.version?.revision?.value).toBe(3n);
+      expect(calls.filter((path) => path.endsWith("/GetSnapshot"))).toHaveLength(1);
+      expect(calls.some((path) => path.endsWith("/GetDevice") || path.endsWith("/GetConnection"))).toBe(false);
+    } finally { fetcher.mockRestore(); }
+  });
+
+  it.each(["missing connection", "duplicate connection", "missing device", "duplicate device"] as const)(
+    "rejects an owner Snapshot with %s", async (invalid) => {
+      const snapshot = create(SnapshotSchema, { server,
+        connections: invalid === "missing connection" ? [] : invalid === "duplicate connection" ? [connection, connection] : [connection],
+        devices: invalid === "missing device" ? [] : invalid === "duplicate device" ? [device, device] : [device]
+      });
+      const fetcher = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(toBinary(GetSnapshotResponseSchema,
+        create(GetSnapshotResponseSchema, { snapshot })), { headers: { "content-type": "application/proto" } }));
+      try {
+        await expect(mobileNetwork.readOwner(credential, mobileDeviceNameSource("Current phone", "android")))
+          .rejects.toThrow(/incomplete or ambiguous owner snapshot/u);
+      } finally { fetcher.mockRestore(); }
+    }
+  );
+});
 
 describe("canonical image thumbnail network", () => {
   it("uses the authenticated generated source request and accepts only explicit bounded thumbnail or original-file outcomes", async () => {

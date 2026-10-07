@@ -114,7 +114,7 @@ describe("native mobile device through the durable product chain", () => {
     });
     const begun = await fixture.anonymous.connection.beginPairing({
       deviceDisplayName: "Joko voice phone",
-      deviceKind: DeviceKind.MOBILE,
+      deviceKind: DeviceKind.MOBILE, deviceNameSource: { defaultDisplayName: "Fixture phone" },
       platform: "android",
       appVersion: "0.1.0"
     });
@@ -123,7 +123,7 @@ describe("native mobile device through the durable product chain", () => {
       challengeId,
       humanCode: fixture.pairingCode(challengeId),
       deviceDisplayName: "Joko voice phone",
-      deviceKind: DeviceKind.MOBILE,
+      deviceKind: DeviceKind.MOBILE, deviceNameSource: { defaultDisplayName: "Fixture phone" },
       platform: "android",
       appVersion: "0.1.0"
     })).result!;
@@ -195,13 +195,13 @@ describe("native mobile device through the durable product chain", () => {
     const server = (await fixture.anonymous.connection.getServerInfo({})).server;
     expect(server?.serverId).toBeTruthy();
     const begun = await fixture.anonymous.connection.beginPairing({
-      deviceDisplayName: "Joko phone", deviceKind: DeviceKind.MOBILE, platform: "android", appVersion: "0.1.0"
+      deviceDisplayName: "Joko phone", deviceKind: DeviceKind.MOBILE, deviceNameSource: { defaultDisplayName: "Fixture phone" }, platform: "android", appVersion: "0.1.0"
     });
     const challengeId = begun.challenge?.challengeId;
     expect(challengeId).toBeTruthy();
     const result = (await fixture.anonymous.connection.completePairing({
       challengeId, humanCode: fixture.pairingCode(challengeId!), deviceDisplayName: "Joko phone",
-      deviceKind: DeviceKind.MOBILE, platform: "android", appVersion: "0.1.0"
+      deviceKind: DeviceKind.MOBILE, deviceNameSource: { defaultDisplayName: "Fixture phone" }, platform: "android", appVersion: "0.1.0"
     })).result;
     expect(result?.connection?.deviceId).toBe(result?.device?.deviceId);
     expect(result?.device?.kind).toBe(DeviceKind.MOBILE);
@@ -339,14 +339,14 @@ describe("native mobile device through the durable product chain", () => {
     expect((await ownerClient.clients.connection.getConnection({ connectionId })).connection?.state).toBe(ConnectionState.REVOKED);
 
     const logoutMobile = await fixture.anonymous.connection.beginPairing({
-      deviceDisplayName: "Joko tablet", deviceKind: DeviceKind.MOBILE, platform: "ios", appVersion: "0.1.0"
+      deviceDisplayName: "Joko tablet", deviceKind: DeviceKind.MOBILE, deviceNameSource: { defaultDisplayName: "Fixture phone" }, platform: "ios", appVersion: "0.1.0"
     });
     const logoutChallengeId = logoutMobile.challenge!.challengeId;
     const logoutResult = (await fixture.anonymous.connection.completePairing({
       challengeId: logoutChallengeId,
       humanCode: fixture.pairingCode(logoutChallengeId),
       deviceDisplayName: "Joko tablet",
-      deviceKind: DeviceKind.MOBILE,
+      deviceKind: DeviceKind.MOBILE, deviceNameSource: { defaultDisplayName: "Fixture phone" },
       platform: "ios",
       appVersion: "0.1.0"
     })).result!;
@@ -382,7 +382,7 @@ describe("native mobile device through the durable product chain", () => {
     });
     const begun = await fixture.anonymous.connection.beginPairing({
       deviceDisplayName: "Joko command phone",
-      deviceKind: DeviceKind.MOBILE,
+      deviceKind: DeviceKind.MOBILE, deviceNameSource: { defaultDisplayName: "Fixture phone" },
       platform: "android",
       appVersion: "0.1.0"
     });
@@ -392,7 +392,7 @@ describe("native mobile device through the durable product chain", () => {
       challengeId,
       humanCode: fixture.pairingCode(challengeId),
       deviceDisplayName: "Joko command phone",
-      deviceKind: DeviceKind.MOBILE,
+      deviceKind: DeviceKind.MOBILE, deviceNameSource: { defaultDisplayName: "Fixture phone" },
       platform: "android",
       appVersion: "0.1.0"
     })).result;
@@ -618,7 +618,7 @@ describe("native mobile device through the durable product chain", () => {
     });
     const begunPairing = await fixture.anonymous.connection.beginPairing({
       deviceDisplayName: "Joko attachment phone",
-      deviceKind: DeviceKind.MOBILE,
+      deviceKind: DeviceKind.MOBILE, deviceNameSource: { defaultDisplayName: "Fixture phone" },
       platform: "android",
       appVersion: "0.1.0"
     });
@@ -628,7 +628,7 @@ describe("native mobile device through the durable product chain", () => {
       challengeId,
       humanCode: fixture.pairingCode(challengeId),
       deviceDisplayName: "Joko attachment phone",
-      deviceKind: DeviceKind.MOBILE,
+      deviceKind: DeviceKind.MOBILE, deviceNameSource: { defaultDisplayName: "Fixture phone" },
       platform: "android",
       appVersion: "0.1.0"
     })).result;
@@ -770,7 +770,7 @@ describe("native mobile device through the durable product chain", () => {
     });
     const begun = await fixture.anonymous.connection.beginPairing({
       deviceDisplayName: "Joko structured-composer phone",
-      deviceKind: DeviceKind.MOBILE,
+      deviceKind: DeviceKind.MOBILE, deviceNameSource: { defaultDisplayName: "Fixture phone" },
       platform: "android",
       appVersion: "0.1.0"
     });
@@ -780,7 +780,7 @@ describe("native mobile device through the durable product chain", () => {
       challengeId,
       humanCode: fixture.pairingCode(challengeId),
       deviceDisplayName: "Joko structured-composer phone",
-      deviceKind: DeviceKind.MOBILE,
+      deviceKind: DeviceKind.MOBILE, deviceNameSource: { defaultDisplayName: "Fixture phone" },
       platform: "android",
       appVersion: "0.1.0"
     })).result;
@@ -929,7 +929,7 @@ describe("native mobile device through the durable product chain", () => {
     });
     const begun = await fixture.anonymous.connection.beginPairing({
       deviceDisplayName: "Joko reference phone",
-      deviceKind: DeviceKind.MOBILE,
+      deviceKind: DeviceKind.MOBILE, deviceNameSource: { defaultDisplayName: "Fixture phone" },
       platform: "android",
       appVersion: "0.1.0"
     });
@@ -939,7 +939,7 @@ describe("native mobile device through the durable product chain", () => {
       challengeId,
       humanCode: fixture.pairingCode(challengeId),
       deviceDisplayName: "Joko reference phone",
-      deviceKind: DeviceKind.MOBILE,
+      deviceKind: DeviceKind.MOBILE, deviceNameSource: { defaultDisplayName: "Fixture phone" },
       platform: "android",
       appVersion: "0.1.0"
     })).result;
@@ -1055,7 +1055,7 @@ describe("native mobile device through the durable product chain", () => {
 
     const begun = await fixture.anonymous.connection.beginPairing({
       deviceDisplayName: "Joko Workspace phone",
-      deviceKind: DeviceKind.MOBILE,
+      deviceKind: DeviceKind.MOBILE, deviceNameSource: { defaultDisplayName: "Fixture phone" },
       platform: "android",
       appVersion: "0.1.0"
     });
@@ -1065,7 +1065,7 @@ describe("native mobile device through the durable product chain", () => {
       challengeId,
       humanCode: fixture.pairingCode(challengeId),
       deviceDisplayName: "Joko Workspace phone",
-      deviceKind: DeviceKind.MOBILE,
+      deviceKind: DeviceKind.MOBILE, deviceNameSource: { defaultDisplayName: "Fixture phone" },
       platform: "android",
       appVersion: "0.1.0"
     })).result;
@@ -1319,7 +1319,7 @@ describe("native mobile device through the durable product chain", () => {
     });
     const begun = await fixture.anonymous.connection.beginPairing({
       deviceDisplayName: "Joko interaction phone",
-      deviceKind: DeviceKind.MOBILE,
+      deviceKind: DeviceKind.MOBILE, deviceNameSource: { defaultDisplayName: "Fixture phone" },
       platform: "android",
       appVersion: "0.1.0"
     });
@@ -1329,7 +1329,7 @@ describe("native mobile device through the durable product chain", () => {
       challengeId,
       humanCode: fixture.pairingCode(challengeId),
       deviceDisplayName: "Joko interaction phone",
-      deviceKind: DeviceKind.MOBILE,
+      deviceKind: DeviceKind.MOBILE, deviceNameSource: { defaultDisplayName: "Fixture phone" },
       platform: "android",
       appVersion: "0.1.0"
     })).result;

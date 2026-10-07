@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { BlobRef, PromptInput } from "@joko/core";
-import type { PersistedEvent } from "@joko/store";
+import type { PersistedEvent, PersistedSessionEvent } from "@joko/store";
 import {
   MAXIMUM_PORTABLE_SESSION_MESSAGES,
   PortableSessionProjectionError,
@@ -37,7 +37,7 @@ const sourceArtifact = {
   fileName: "report.pdf"
 } as const;
 
-function event(overrides: Partial<PersistedEvent> = {}): PersistedEvent {
+function event(overrides: Partial<PersistedSessionEvent> = {}): PersistedSessionEvent {
   return {
     id: "event-1",
     globalCursor: 1n,

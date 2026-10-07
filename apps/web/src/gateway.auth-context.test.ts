@@ -4,9 +4,13 @@ import {
   BeginPairingResponseSchema,
   BackgroundTaskState,
   CompletePairingResponseSchema,
+  DeviceKind,
   DiscoverNativeSessionsResponseSchema,
   EventSchema,
   GetRuntimeToolCatalogResponseSchema,
+  GetConnectionResponseSchema,
+  GetDeviceResponseSchema,
+  type GetSnapshotRequest,
   GetServerInfoResponseSchema,
   GetSnapshotResponseSchema,
   ListRuntimeCommandsResponseSchema,
@@ -164,6 +168,90 @@ describe("connection credential lifecycle", () => {
     expect(factoryAuthKeys).toEqual([undefined, "old-secret"]);
     expect(requests.find((request) => request.method === "completePairing")?.input.deviceId).toBe("device-1");
     expect(paired.profile.deviceId).toBe("device-1");
+    expect(requests.find((request) => request.method === "beginPairing")?.input.deviceNameSource).toBeUndefined();
+    expect(requests.find((request) => request.method === "completePairing")?.input.deviceNameSource).toBeUndefined();
+  });
+
+  it("samples the native default name once and sends the same source in both Desktop pairing requests", async () => {
+    const getInfo = vi.fn(async () => ({
+      name: "Joko", defaultDeviceName: "Actual workstation", version: "0.1.0", platform: "win32", electronVersion: "41", persistentCredentialStorage: true
+    }));
+    vi.stubGlobal("window", { jokoDesktop: { appInfo: { get: getInfo } } });
+    vi.stubGlobal("navigator", { platform: "test" });
+    const requests: Array<{ method: string; input: Record<string, unknown> }> = [];
+    const transport = {
+      unary: vi.fn(async (method: Parameters<Transport["unary"]>[0], _signal: unknown, _timeout: unknown, _headers: unknown, input: unknown) => {
+        requests.push({ method: method.localName, input: input as Record<string, unknown> });
+        if (method.localName === "getServerInfo") return response(method, serverInfoResponse());
+        if (method.localName === "beginPairing") {
+          getInfo.mockResolvedValue({ name: "Joko", defaultDeviceName: "Later OS name", version: "0.1.0", platform: "win32", electronVersion: "41", persistentCredentialStorage: true });
+          return response(method, create(BeginPairingResponseSchema, { challenge: { challengeId: "challenge-native" } }));
+        }
+        return response(method, create(CompletePairingResponseSchema, { result: {
+          connection: { connectionId: "native-connection", deviceId: "native-device", displayName: "Connection label" },
+          device: { deviceId: "native-device", displayName: "Chosen name" }, authKey: "native-key"
+        } }));
+      })
+    } as unknown as Transport;
+    const gateway = createOrchestratorGateway(undefined, undefined, {}, () => transport);
+    await gateway.pair("https://orchestrator.example", "123456", "Chosen name");
+    expect(getInfo).toHaveBeenCalledOnce();
+    for (const method of ["beginPairing", "completePairing"]) {
+      expect(requests.find((request) => request.method === method)?.input).toMatchObject({
+        deviceKind: DeviceKind.DESKTOP, deviceDisplayName: "Chosen name", deviceNameSource: { defaultDisplayName: "Actual workstation" }
+      });
+    }
+  });
+
+  it.each([DeviceKind.DESKTOP, DeviceKind.WEB])("reports live native default names only for an authenticated Desktop Device %s", async (kind) => {
+    const getInfo = vi.fn(async () => ({ defaultDeviceName: "First OS name" }));
+    vi.stubGlobal("window", { jokoDesktop: { appInfo: { get: getInfo } } });
+    const requests: GetSnapshotRequest[] = [];
+    const snapshots: ReturnType<typeof mapSnapshot>[] = [];
+    const calls: string[] = [];
+    const transport = {
+      unary: vi.fn(async (method: Parameters<Transport["unary"]>[0], _signal: unknown, _timeout: unknown, _headers: unknown, input: unknown) => {
+        calls.push(method.localName);
+        if (method.localName === "getConnection") return response(method, create(GetConnectionResponseSchema, {
+          connection: { connectionId: "native-source-connection", deviceId: "native-source-device" }
+        }));
+        if (method.localName === "getDevice") return response(method, create(GetDeviceResponseSchema, {
+          device: { deviceId: "native-source-device", kind, defaultDisplayName: "Previous name", displayName: "Manual", manualDisplayName: "Manual", version: { revision: { value: 1n } } }
+        }));
+        if (method.localName === "getSnapshot") {
+          const request = input as GetSnapshotRequest;
+          requests.push(request);
+          return response(method, create(GetSnapshotResponseSchema, { snapshot: {
+            generation: 1n, resumeCursor: { generation: 1n, sequence: BigInt(requests.length) }, devices: [{
+              deviceId: "native-source-device", kind, defaultDisplayName: request.currentDeviceNameSource?.defaultDisplayName ?? "Web Device",
+              displayName: "Manual", manualDisplayName: "Manual", version: { revision: { value: BigInt(requests.length + 1) } }
+            }]
+          } }));
+        }
+        throw new Error(`Unexpected method: ${method.localName}`);
+      }),
+      stream: vi.fn(async (method: Parameters<Transport["stream"]>[0]) => response(method, idleStream(), true))
+    } as unknown as Transport;
+    const gateway = createOrchestratorGateway(
+      { id: "native-source-connection", deviceId: "native-source-device", serverId: "server-test", name: "Local", origin: "https://orchestrator.example" },
+      "secret", { onSnapshot: (snapshot) => snapshots.push(snapshot) }, () => transport
+    );
+    try {
+      await gateway.connect();
+      getInfo.mockResolvedValue({ defaultDeviceName: "Updated OS name" });
+      await gateway.refresh();
+      expect(calls.filter((call) => call === "getConnection")).toHaveLength(1);
+      expect(calls.filter((call) => call === "getDevice")).toHaveLength(1);
+      if (kind === DeviceKind.DESKTOP) {
+        expect(getInfo).toHaveBeenCalledTimes(2);
+        expect(requests.map((request) => request.currentDeviceNameSource?.defaultDisplayName)).toEqual(["First OS name", "Updated OS name"]);
+        expect(snapshots.at(-1)?.devices[0]).toMatchObject({ name: "Manual", defaultDisplayName: "Updated OS name", manualDisplayName: "Manual", revision: 3n });
+      } else {
+        expect(getInfo).not.toHaveBeenCalled();
+        expect(requests.every((request) => request.currentDeviceNameSource === undefined)).toBe(true);
+        expect(snapshots.at(-1)?.devices[0]).toMatchObject({ name: "Manual", defaultDisplayName: "Web Device", revision: 3n });
+      }
+    } finally { gateway.disconnect(); }
   });
 
   it.each([

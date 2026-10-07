@@ -9,7 +9,7 @@ import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
 import { PiBackendAdapter } from "@joko/adapter-pi";
 import type { CodeHostProvider } from "@joko/code-host";
 import * as contract from "@joko/contracts";
-import { NotFoundError, OperationConflictError, OperationPreviouslyFailedError, OperationalStore, StoreError, operationBodyHash, type PersistedEvent } from "@joko/store";
+import { NotFoundError, OperationConflictError, OperationPreviouslyFailedError, OperationalStore, StoreError, operationBodyHash, type PersistedEvent, type PersistedSessionEvent } from "@joko/store";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { OrchestratorApplication } from "./application.js";
@@ -98,7 +98,7 @@ function revocableConnections() {
   };
 }
 
-function persistedStatus(cursor = 1n): PersistedEvent {
+function persistedStatus(cursor = 1n): PersistedSessionEvent {
   return {
     id: `event-${cursor}`,
     sequence: cursor,

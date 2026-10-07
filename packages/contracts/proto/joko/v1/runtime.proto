@@ -94,6 +94,14 @@ message Device {
   // service node. Pairing alone does not enable inbound control.
   bool remote_control_enabled = 11;
   DevicePresenceState presence = 12;
+  string default_display_name = 13;
+  optional string manual_display_name = 14;
+}
+
+// A native producer's current self name, independent of the owner's manual
+// display-name override. The authenticated Connection owns the target Device.
+message DeviceNameSource {
+  string default_display_name = 1;
 }
 
 enum DevicePresenceState {

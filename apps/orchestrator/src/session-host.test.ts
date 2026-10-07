@@ -10692,14 +10692,14 @@ describe("SessionHost", () => {
       fixture.store.createConnection({
         id: "remote-resume-controller-connection",
         deviceId: binding.controllerDeviceId,
-        device: { name: "Controller", kind: "web", platform: "web" },
+        device: { defaultName: "Controller", kind: "web", platform: "web" },
         name: "Controller",
         authKeyDigest: "controller-digest"
       });
       fixture.store.createConnection({
         id: "remote-resume-target-connection",
         deviceId: binding.targetDeviceId,
-        device: { name: "Target", kind: "desktop", platform: "windows" },
+        device: { defaultName: "Target", kind: "desktop", platform: "windows" },
         name: "Target",
         authKeyDigest: "target-digest"
       });

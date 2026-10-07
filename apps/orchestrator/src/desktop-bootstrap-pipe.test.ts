@@ -23,6 +23,19 @@ const INSTANCE_ID = "4e56f4d8-c6ee-4a17-9a89-56e059b7e592";
 const DEVICE_ID = "d6a365ef-ef33-4fb7-a0f1-a02eb57fef75";
 
 describe("Desktop bootstrap pipe", () => {
+  it("rejects a bootstrap frame with the obsolete ambiguous device name field", async () => {
+    const request = createRequest();
+    const { defaultDeviceName, ...rest } = request;
+    const payload = Buffer.from(JSON.stringify({ ...rest, deviceName: defaultDeviceName }));
+    const frame = Buffer.alloc(4 + payload.length);
+    frame.writeUInt32BE(payload.length);
+    payload.copy(frame, 4);
+    const pipe = new PassThrough();
+    const received = receiveDesktopBootstrapRequest(pipe);
+    pipe.end(frame);
+    await expect(received).rejects.toThrow(/unavailable/u);
+  });
+
   it("receives one split frame and retains the request pipe as parent liveness", async () => {
     const pipe = new PassThrough();
     const request = createRequest();
@@ -114,7 +127,7 @@ function createRequest() {
     parentPid: 321,
     instanceId: INSTANCE_ID,
     deviceId: DEVICE_ID,
-    deviceName: "Joko Desktop",
+    defaultDeviceName: "Joko Desktop",
     platform: "win32",
     appVersion: "0.1.0"
   }, {

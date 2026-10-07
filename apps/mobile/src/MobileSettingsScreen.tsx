@@ -24,6 +24,7 @@ import {
   type MobileSupportedLocale
 } from "./mobile-locale-preference";
 import { mobileMessage, type MobileMessageKey } from "./mobile-messages";
+import { validMobileDeviceName } from "./mobile-device-name";
 import { MobileVoiceDictionaryScreen } from "./MobileVoiceDictionaryScreen";
 import { MobileVoiceDictionaryReadOnlyScreen } from "./MobileVoiceDictionaryReadOnlyScreen";
 import type { MobileVoiceDictionaryReadOnlyController } from "./mobile-voice-dictionary-readonly-controller";
@@ -51,7 +52,7 @@ export interface MobileSettingsColors {
 }
 
 export type MobileSettingsClient = Pick<MobileClient,
-  "renameCurrentDevice" | "reconcile" | "dismissUnconfirmed">;
+  "renameCurrentDevice" | "resetCurrentDevice" | "reconcile" | "dismissUnconfirmed">;
 
 export interface MobileSettingsScreenProps {
   readonly colors: MobileSettingsColors;
@@ -133,7 +134,7 @@ export function MobileSettingsScreen(props: MobileSettingsScreenProps) {
   const resolvedAppVersion = appVersion || Constants.expoConfig?.version || t("common.unknown");
   const [editor, setEditor] = useState<{ readonly ownerKey: string; readonly original: string; readonly draft: string }>();
   const [savingName, setSavingName] = useState(false);
-  const [renameUnknown, setRenameUnknown] = useState(false);
+  const [renameUnknown, setRenameUnknown] = useState<"rename" | "reset">();
   const [localError, setLocalError] = useState("");
   const [notice, setNotice] = useState("");
   const [diagnosticsExpanded, setDiagnosticsExpanded] = useState(false);
@@ -159,7 +160,7 @@ export function MobileSettingsScreen(props: MobileSettingsScreenProps) {
     if (!editor || editor.ownerKey === currentOwnerKey) return;
     saveGeneration.current += 1;
     setSavingName(false);
-    setRenameUnknown(false);
+    setRenameUnknown(undefined);
     unknownReceiptSeen.current = false;
     setEditor(undefined);
     setLocalError(t("settings.rename.ownerChanged"));
@@ -172,10 +173,17 @@ export function MobileSettingsScreen(props: MobileSettingsScreenProps) {
       return;
     }
     if (!unknownReceiptSeen.current || !current || current.ownerKey !== editor.ownerKey) return;
-    setRenameUnknown(false);
+    setRenameUnknown(undefined);
     unknownReceiptSeen.current = false;
-    if (current.device.displayName === editor.draft.trim()) {
+    if (renameUnknown === "reset" && current.device.manualDisplayName === undefined
+      && current.device.defaultDisplayName.trim() && current.device.displayName === current.device.defaultDisplayName) {
+      setEditor({ ...editor, original: current.device.displayName, draft: current.device.displayName });
+      setLocalError("");
+      setNotice(t("settings.rename.restored"));
+    } else if (renameUnknown === "rename" && current.device.manualDisplayName === editor.draft.trim()
+      && current.device.displayName === editor.draft.trim()) {
       setEditor(undefined);
+      setLocalError("");
       setNotice(t("settings.rename.saved"));
     }
   }, [current, editor, locale.effectiveLocale, pendingRename, renameUnknown]);
@@ -214,7 +222,7 @@ export function MobileSettingsScreen(props: MobileSettingsScreenProps) {
   const saveName = async (): Promise<void> => {
     if (!editor || !current || editor.ownerKey !== current.ownerKey || !canRename) return;
     const value = editor.draft.trim();
-    if (!value || value.length > 128) {
+    if (!validMobileDeviceName(value)) {
       setLocalError(t("settings.rename.invalid"));
       return;
     }
@@ -222,19 +230,47 @@ export function MobileSettingsScreen(props: MobileSettingsScreenProps) {
     const ownerKey = editor.ownerKey;
     setSavingName(true);
     setLocalError("");
+    setNotice("");
     try {
       const confirmed = await client.renameCurrentDevice(current.device.deviceId, value);
       if (saveGeneration.current !== generation || currentOwnerKeyRef.current !== ownerKey) return;
       if (!confirmed) {
-        setRenameUnknown(true);
+        setRenameUnknown("rename");
         unknownReceiptSeen.current = pendingRename !== undefined;
         setLocalError(t("settings.rename.unknown"));
         return;
       }
-      setRenameUnknown(false);
+      setRenameUnknown(undefined);
       unknownReceiptSeen.current = false;
       setEditor(undefined);
       setNotice(t("settings.rename.saved"));
+    } catch (error) {
+      if (saveGeneration.current === generation) setLocalError(errorText(error, locale.effectiveLocale));
+    } finally {
+      if (saveGeneration.current === generation) setSavingName(false);
+    }
+  };
+
+  const resetName = async (): Promise<void> => {
+    if (!editor || !current || editor.ownerKey !== current.ownerKey || !canRename) return;
+    const generation = ++saveGeneration.current;
+    const ownerKey = editor.ownerKey;
+    setSavingName(true);
+    setLocalError("");
+    setNotice("");
+    try {
+      const confirmed = await client.resetCurrentDevice(current.device.deviceId);
+      if (saveGeneration.current !== generation || currentOwnerKeyRef.current !== ownerKey) return;
+      if (!confirmed) {
+        setRenameUnknown("reset");
+        unknownReceiptSeen.current = pendingRename !== undefined;
+        setLocalError(t("settings.rename.unknown"));
+        return;
+      }
+      setRenameUnknown(undefined);
+      unknownReceiptSeen.current = false;
+      setEditor({ ...editor, original: confirmed.displayName, draft: confirmed.displayName });
+      setNotice(t("settings.rename.restored"));
     } catch (error) {
       if (saveGeneration.current === generation) setLocalError(errorText(error, locale.effectiveLocale));
     } finally {
@@ -309,12 +345,16 @@ export function MobileSettingsScreen(props: MobileSettingsScreenProps) {
       </View>
       <Text style={[styles.caption, { color: colors.muted }]}>{editor.draft.trim().length}/128</Text>
       {(localError || state.error) && <ErrorNotice colors={colors} text={localError || state.error || ""} />}
+      {notice && <Notice colors={colors} text={notice} />}
       <View style={styles.actionRow}>
         <Button label={t("common.cancel")} colors={colors} disabled={savingName} onPress={requestCloseEditor} />
         <Button label={savingName ? t("settings.rename.saving") : t("settings.rename.save")} colors={colors}
-          disabled={!editable || !editor.draft.trim() || editor.draft.trim().length > 128
-            || editor.draft.trim() === editor.original}
+          disabled={!editable || !validMobileDeviceName(editor.draft)
+            || editor.draft.trim() === current?.device.manualDisplayName}
           onPress={() => void saveName()} />
+        <Button label={t("settings.rename.restore")} colors={colors}
+          disabled={!editable || current?.device.manualDisplayName === undefined}
+          onPress={() => void resetName()} />
       </View>
     </ScrollView>;
   }
@@ -372,7 +412,7 @@ export function MobileSettingsScreen(props: MobileSettingsScreenProps) {
         <Button label={t("settings.renamePhone")} colors={colors} disabled={!canRename} onPress={() => {
           setLocalError("");
           setNotice("");
-          setRenameUnknown(false);
+          setRenameUnknown(undefined);
           unknownReceiptSeen.current = false;
           setEditor({ ownerKey: current.ownerKey, original: current.device.displayName, draft: current.device.displayName });
         }} />

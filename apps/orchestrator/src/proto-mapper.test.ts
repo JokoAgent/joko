@@ -1493,7 +1493,7 @@ describe("proto mapper", () => {
     const audioMetadata = { kind: "music" as const, title: "A title", description: "Piano", durationSeconds: 12,
       artwork: { blob: { id: "cover", sha256: "b".repeat(64), byteLength: 99, mimeType: "image/png" }, width: 2, height: 2, alt: "Independent cover" } };
     const artifact = { kind: "artifact" as const, blob, label: "Track", audioMetadata };
-    const payloads: EventPayload[] = [
+    const payloads: Exclude<EventPayload, { type: "device_changed" }>[] = [
       { type: "artifact", artifact: blob, purpose: "audio", audioMetadata },
       { type: "message_complete", role: "assistant", blocks: [artifact] },
       { type: "tool_result", callId: "tracks", name: "tracks", output: "Published", parts: [{ kind: "text", text: "Published" }, artifact], isError: false }

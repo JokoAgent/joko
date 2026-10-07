@@ -243,14 +243,14 @@ function setup(): {
   const controller = store.createConnection({
     id: "connection-controller",
     deviceId: "device-controller",
-    device: { name: "Controller", kind: "web", platform: "web" },
+    device: { defaultName: "Controller", kind: "web", platform: "web" },
     name: "Controller",
     authKeyDigest: "controller-digest"
   });
   const target = store.createConnection({
     id: "connection-target",
     deviceId: "device-target",
-    device: { name: "Target Desktop", kind: "desktop", platform: "windows" },
+    device: { defaultName: "Target Desktop", kind: "desktop", platform: "windows" },
     name: "Target Desktop",
     authKeyDigest: "target-digest"
   });

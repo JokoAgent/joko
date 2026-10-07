@@ -563,6 +563,7 @@ class ProductFixture {
     const begun = await this.anonymous.connection.beginPairing({
       deviceDisplayName: input.name,
       deviceKind: input.kind,
+      deviceNameSource: { defaultDisplayName: "Fixture peer device" },
       platform: input.platform,
       appVersion: "device-peer-e2e"
     });
@@ -575,6 +576,7 @@ class ProductFixture {
       humanCode: code,
       deviceDisplayName: input.name,
       deviceKind: input.kind,
+      deviceNameSource: { defaultDisplayName: "Fixture peer device" },
       platform: input.platform,
       appVersion: "device-peer-e2e"
     });
@@ -642,6 +644,7 @@ class RunningPeerAgent {
       port: observingRoutePort(observation, routePort),
       signal: controller.signal,
       heartbeatIntervalMs: 15_000,
+      readDefaultDeviceName: () => "Fixture service host",
       readAuthKey: credentialId => Promise.resolve(
         credentialId === input.target.connectionId ? input.target.authKey : undefined
       ),

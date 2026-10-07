@@ -40,6 +40,8 @@ export type * from "./partner-types.js";
 export {
   MESSAGE_SEARCH_EMBEDDING_MODEL_ID,
   messagingConversationContextAad,
+  deviceContentProjection,
+  normalizeDeviceName,
   OperationalStore
 } from "./operational-store.js";
 export {

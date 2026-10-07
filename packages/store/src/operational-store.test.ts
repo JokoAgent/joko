@@ -25,6 +25,7 @@ import {
   StaleGenerationError,
   StoreError
 } from "./index.js";
+import type { PersistedEvent } from "./types.js";
 
 const cleanups: Array<() => void> = [];
 
@@ -33,6 +34,103 @@ afterEach(() => {
 });
 
 describe("OperationalStore", () => {
+  it("publishes immutable owner Device content only after commit and keeps Session routing strict", () => {
+    const { store } = createFixture();
+    store.createConnection({ id: "name-connection", deviceId: "name-device", name: "Unchanged label",
+      device: { defaultName: "Native A", kind: "desktop" }, authKeyDigest: "device-name-digest" });
+    const published: PersistedEvent[] = [];
+    store.subscribe((event) => {
+      expect(store.findEvent(event.id)).toEqual(event);
+      published.push(event);
+    });
+    store.transaction((transaction) => {
+      const changed = transaction.renameDevice("name-device", "Native A");
+      const event = transaction.listEvents().at(-1)!;
+      expect(event.payload).toMatchObject({ type: "device_changed", device: {
+        name: "Native A", defaultName: "Native A", manualName: "Native A", revision: changed.revision.toString(),
+        connectionIds: ["name-connection"] } });
+      expect(event.revision).toBe(changed.revision);
+      expect(published).toEqual([]);
+    });
+    expect(published).toHaveLength(1);
+    const defaultB = store.refreshDeviceDefaultName("name-device", "Native B");
+    expect(published.at(-1)!.payload).toMatchObject({ device: { name: "Native A", defaultName: "Native B",
+      manualName: "Native A", revision: defaultB.revision.toString() } });
+    const before = store.health();
+    store.refreshDeviceDefaultName("name-device", "Native B");
+    store.touchConnection("name-connection", Date.now());
+    expect(store.health().revision).toBe(before.revision);
+    expect(store.health().globalCursor).toBe(before.globalCursor);
+    const observed = store.getDevice("name-device");
+    expect(() => store.transaction((transaction) => {
+      transaction.resetDeviceName("name-device");
+      throw new Error("Device rollback");
+    })).toThrow("Device rollback");
+    expect(store.getDevice("name-device")).toEqual(observed);
+    expect(published).toHaveLength(2);
+    const reset = store.resetDeviceName("name-device");
+    const resetEvent = published.at(-1)!;
+    expect(resetEvent.payload).toMatchObject({ type: "device_changed", device: {
+      name: "Native B", defaultName: "Native B", revision: reset.revision.toString() } });
+    if (resetEvent.payload.type !== "device_changed") throw new Error("Device event is missing.");
+    expect(resetEvent.payload.device.manualName).toBeUndefined();
+    expect(store.listEvents({ sessionId: "session-1" }).every((event) => event.payload.type !== "device_changed")).toBe(true);
+    expect(published[0]!.payload).toMatchObject({ device: { defaultName: "Native A", manualName: "Native A" } });
+    expect(() => store.appendEvent({ backendId: "pi", targetId: "target-1", sessionId: "session-1",
+      generation: 0, traceId: "adapter-forgery", payload: resetEvent.payload })).toThrow(/owned by the Store/u);
+    store.close();
+    const database = new DatabaseSync(store.filePath);
+    try {
+      expect(database.prepare("SELECT backend_id, target_id, session_id FROM events WHERE id = ?").get(resetEvent.id))
+        .toMatchObject({ backend_id: null, target_id: null, session_id: null });
+      expect(() => database.prepare("UPDATE events SET target_id = 'target-1' WHERE id = ?").run(resetEvent.id)).toThrow(/CHECK/u);
+      expect(() => database.prepare("UPDATE events SET payload_json = ? WHERE id = ?")
+        .run(JSON.stringify({ payload: { type: "status", key: "forged-owner" } }), resetEvent.id)).toThrow(/CHECK/u);
+    } finally { database.close(); }
+    const reopened = new OperationalStore(store.filePath);
+    try { expect(reopened.findEvent(resetEvent.id)).toEqual(resetEvent); } finally { reopened.close(); }
+  });
+
+  it("persists default and manual Device names with reset and deferred pairing across reopen", () => {
+    const directory = mkdtempSync(path.join(tmpdir(), "joko-device-name-"));
+    const fileName = path.join(directory, "operational.sqlite");
+    let store = new OperationalStore(fileName);
+    cleanups.push(() => { store.close(); rmSync(directory, { recursive: true, force: true }); });
+    const connection = store.createConnection({ id: "phone-connection", deviceId: "phone", name: "Connection label",
+      device: { defaultName: "Native phone", kind: "mobile" }, authKeyDigest: "phone-digest" });
+    const initial = store.getDevice("phone");
+    expect(initial).toMatchObject({ name: "Native phone", defaultName: "Native phone" });
+    expect(initial.manualName).toBeUndefined();
+    const manual = store.renameDevice("phone", " Native phone ", initial.revision);
+    expect(manual.manualName).toBe("Native phone");
+    expect(manual.revision).toBeGreaterThan(initial.revision);
+    const updated = store.refreshDeviceDefaultName("phone", "Latest native phone");
+    expect(updated).toMatchObject({ name: "Native phone", manualName: "Native phone", defaultName: "Latest native phone" });
+    store.createPairing({ id: "pending-phone", codeDigest: "pairing-digest", expiresAt: Date.now() + 60_000,
+      device: { id: "other-phone", defaultName: "Other native phone", manualName: "Other phone label", kind: "mobile" } });
+    store.close();
+    store = new OperationalStore(fileName);
+    expect(store.getDevice("phone")).toEqual(updated);
+    expect(store.getPairing("pending-phone").device).toMatchObject({ defaultName: "Other native phone", manualName: "Other phone label" });
+    expect(() => store.resetDeviceName("phone", initial.revision)).toThrow(RevisionConflictError);
+    const reset = store.resetDeviceName("phone", updated.revision);
+    expect(reset).toMatchObject({ name: "Latest native phone", defaultName: "Latest native phone" });
+    expect(reset.manualName).toBeUndefined();
+    expect(reset.revision).toBeGreaterThan(updated.revision);
+    const current = store.refreshDeviceDefaultName("phone", "Current native phone");
+    expect(current.name).toBe("Current native phone");
+    expect(store.getSnapshot().devices.find((device) => device.id === "phone")).toEqual(current);
+    expect(store.getConnection(connection.id).name).toBe("Connection label");
+    expect(() => store.renameDevice("phone", "x".repeat(129))).toThrow(/invalid/u);
+    expect(store.renameDevice("phone", "x".repeat(128)).manualName).toHaveLength(128);
+    const other = store.consumePairing({ pairingId: "pending-phone", codeDigest: "pairing-digest",
+      connectionId: "other-connection", connectionName: "Other connection label", authKeyDigest: "other-digest" });
+    expect(store.getDevice(other.deviceId)).toMatchObject({ name: "Other phone label", defaultName: "Other native phone", manualName: "Other phone label" });
+    store.revokeDevice("phone");
+    expect(() => store.resetDeviceName("phone")).toThrow(AuthorizationError);
+    expect(() => store.refreshDeviceDefaultName("phone", "Late source")).toThrow(AuthorizationError);
+  });
+
   it("persists maintenance scan, job, and effect receipts without invalidating the product revision fence", async () => {
     const fixture = createFixture();
     const filePath = fixture.store.filePath;
@@ -3442,7 +3540,7 @@ describe("OperationalStore", () => {
       id: "connection-device-a",
       deviceId: "device-shared",
       device: {
-        name: "Shared desktop",
+        defaultName: "Shared desktop",
         kind: "desktop",
         platform: "windows",
         appVersion: "1.2.3"
@@ -3483,7 +3581,7 @@ describe("OperationalStore", () => {
     const store = createStore();
     const connection = store.createConnection({
       id: "mobile-connection", deviceId: "mobile-device", name: "Joko phone",
-      device: { name: "Joko phone", kind: "mobile", platform: "android", appVersion: "0.1.0" },
+      device: { defaultName: "Joko phone", kind: "mobile", platform: "android", appVersion: "0.1.0" },
       authKeyDigest: "mobile-digest"
     });
     expect(store.getDevice(connection.deviceId)).toMatchObject({ kind: "mobile", platform: "android", state: "active" });
@@ -3497,14 +3595,14 @@ describe("OperationalStore", () => {
     store.createConnection({
       id: "connection-controller",
       deviceId: "device-controller",
-      device: { name: "Desk controller", kind: "desktop" },
+      device: { defaultName: "Desk controller", kind: "desktop" },
       name: "Controller",
       authKeyDigest: "controller-digest"
     });
     store.createConnection({
       id: "connection-target",
       deviceId: "device-target",
-      device: { name: "Workstation", kind: "desktop" },
+      device: { defaultName: "Workstation", kind: "desktop" },
       name: "Target",
       authKeyDigest: "target-digest"
     });

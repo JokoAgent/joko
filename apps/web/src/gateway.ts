@@ -101,6 +101,8 @@ import {
   DevicePeerDirectoryKind,
   DevicePeerService,
   DeviceKind,
+  DeviceNameSourceSchema,
+  type DeviceNameSource,
   DevicePresenceState,
   ConnectionState,
   DiagnosticLevel,
@@ -1009,6 +1011,10 @@ type LocalUserInputMatcher = (event: Event) => boolean;
 // Retain exact attempts across reconnects and uncertain responses for this
 // renderer lifetime. Only operation and connection identities enter this map.
 const localUserInputOperations = new Map<string, LocalUserInputOperation>();
+// An uncertain device-name attempt keeps only its public receipt identity.
+// Reconnecting the same authenticated owner may read that receipt, never resend
+// a new business operation because a displayed name happens to match.
+const deviceNameOperationIds = new Map<string, string>();
 
 class ConnectOrchestratorGateway implements OrchestratorGateway {
   readonly #profile: ConnectionProfile | undefined;
@@ -1038,6 +1044,8 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
   }
 
   async pair(origin: string, humanCode: string, deviceName: string): Promise<PairingOutcome> {
+    const desktop = desktopAvailable();
+    const deviceNameSource = desktop ? await readDesktopDeviceNameSource() : undefined;
     // Identity discovery must never carry a saved bearer. Only after the
     // anonymous response matches the profile's durable node identity may a
     // credentialed transport be created for same-device pairing.
@@ -1051,7 +1059,8 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     try {
       const challengeResponse = await client.beginPairing({
         deviceDisplayName: deviceName,
-        deviceKind: desktopAvailable() ? DeviceKind.DESKTOP : DeviceKind.WEB,
+        deviceKind: desktop ? DeviceKind.DESKTOP : DeviceKind.WEB,
+        ...(deviceNameSource === undefined ? {} : { deviceNameSource }),
         platform: navigator.platform || "web",
         appVersion: APP_VERSION
       });
@@ -1069,7 +1078,8 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
       challengeId,
       humanCode: humanCode.trim(),
       deviceDisplayName: deviceName,
-      deviceKind: desktopAvailable() ? DeviceKind.DESKTOP : DeviceKind.WEB,
+      deviceKind: desktop ? DeviceKind.DESKTOP : DeviceKind.WEB,
+      ...(deviceNameSource === undefined ? {} : { deviceNameSource }),
       platform: navigator.platform || "web",
       appVersion: APP_VERSION,
       ...(reusableDeviceId === undefined ? {} : { deviceId: reusableDeviceId })
@@ -1739,9 +1749,13 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
   private async loadSnapshot(): Promise<void> {
     const transport = this.requireTransport();
     const signal = this.#abort?.signal;
+    const currentDeviceNameSource = await this.currentDeviceNameSource(transport, signal);
+    signal?.throwIfAborted();
     const eventClient = createClient(EventService, transport);
     const [response, managedModelRuntimes] = await Promise.all([
-      eventClient.getSnapshot({ scope: OWNER_SCOPE }, signal === undefined ? undefined : { signal }),
+      eventClient.getSnapshot({ scope: OWNER_SCOPE,
+        ...(currentDeviceNameSource === undefined ? {} : { currentDeviceNameSource })
+      }, signal === undefined ? undefined : { signal }),
       loadManagedModelRuntimes(transport, signal)
     ]);
     if (response.snapshot === undefined) throw new GatewayError("Orchestrator returned an empty snapshot.");
@@ -1781,6 +1795,28 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     this.#rawSnapshot = raw;
     this.#snapshot = mapped;
     this.#callbacks.onSnapshot?.(mapped);
+  }
+
+  private async currentDeviceNameSource(transport: Transport, signal?: AbortSignal): Promise<DeviceNameSource | undefined> {
+    if (!desktopAvailable()) return undefined;
+    const profile = this.#profile;
+    if (profile === undefined) throw new GatewayError("A connected device identity is required.");
+    let device = this.#rawSnapshot?.devices.find((entry) => entry.deviceId === profile.deviceId);
+    if (device === undefined) {
+      const client = createClient(ConnectionService, transport);
+      const connection = (await client.getConnection({ connectionId: profile.id }, { signal })).connection;
+      signal?.throwIfAborted();
+      if (connection?.connectionId !== profile.id || connection.deviceId !== profile.deviceId) {
+        throw new GatewayError("The desktop connection does not identify its owning device.");
+      }
+      device = (await client.getDevice({ deviceId: connection.deviceId }, { signal })).device;
+      signal?.throwIfAborted();
+      if (device?.deviceId !== profile.deviceId) throw new GatewayError("The desktop connection has no owning device.");
+    }
+    if (device.kind !== DeviceKind.DESKTOP) return undefined;
+    const source = await readDesktopDeviceNameSource();
+    signal?.throwIfAborted();
+    return source;
   }
 
   async send(sessionId: string, draft: ComposerDraft, admission: { readonly expectedGeneration: bigint }): Promise<void> {
@@ -6070,10 +6106,82 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     await this.submit({ case: "revokeDevice", value: { deviceId, reason: "Revoked by owner" } }, true);
   }
 
-  async renameDevice(deviceId: string, name: string): Promise<void> {
+  async renameDevice(deviceId: string, name: string, expectedRevision: bigint): Promise<DeviceView> {
     const displayName = name.trim();
     if (displayName.length === 0) throw new GatewayError("A device name is required.");
-    await this.submit({ case: "renameDevice", value: { deviceId, displayName } }, true);
+    return this.updateDeviceName(deviceId, expectedRevision, displayName);
+  }
+
+  async resetDeviceName(deviceId: string, expectedRevision: bigint): Promise<DeviceView> {
+    return this.updateDeviceName(deviceId, expectedRevision);
+  }
+
+  private deviceNameReceiptKey(deviceId: string): string {
+    if (this.#profile === undefined || deviceId.trim().length === 0) throw new GatewayError("A connected device identity is required.");
+    return `${this.#profile.serverId}\u0000${this.#profile.origin}\u0000${this.#profile.id}\u0000${deviceId}`;
+  }
+
+  hasPendingDeviceNameUpdate(deviceId: string): boolean {
+    return deviceNameOperationIds.has(this.deviceNameReceiptKey(deviceId));
+  }
+
+  private async updateDeviceName(deviceId: string, expectedRevision: bigint, manualDisplayName?: string): Promise<DeviceView> {
+    const scope = this.captureActionScope();
+    const receiptKey = this.deviceNameReceiptKey(deviceId);
+    if (deviceNameOperationIds.has(receiptKey)) throw deviceNameUnconfirmed();
+    if (expectedRevision <= 0n) throw new GatewayError("The device name update requires its current revision.");
+    let received: Operation | undefined;
+    try {
+      const operation = await this.submit(manualDisplayName === undefined
+        ? { case: "resetDeviceName", value: { deviceId } }
+        : { case: "renameDevice", value: { deviceId, displayName: manualDisplayName } }, true, [
+        { entity: { kind: EntityKind.DEVICE, id: deviceId }, expectedRevision: { value: expectedRevision } }
+      ], scope.signal, (operationId, result) => {
+        deviceNameOperationIds.set(receiptKey, operationId);
+        received = result;
+      });
+      const result = deviceNameOutcome(operation, deviceId, manualDisplayName);
+      deviceNameOperationIds.delete(receiptKey);
+      return result;
+    } catch (error) {
+      if ((received !== undefined && failedDeviceNameOperation(received)) || (
+        received === undefined && error instanceof ConnectError
+        && [Code.InvalidArgument, Code.PermissionDenied, Code.Unauthenticated, Code.NotFound, Code.FailedPrecondition].includes(error.code)
+      )) {
+        deviceNameOperationIds.delete(receiptKey);
+        throw error;
+      }
+      if (!deviceNameOperationIds.has(receiptKey)) throw error;
+      throw deviceNameUnconfirmed(error);
+    }
+  }
+
+  async checkDeviceNameUpdate(deviceId: string): Promise<DeviceView> {
+    const scope = this.captureActionScope();
+    const receiptKey = this.deviceNameReceiptKey(deviceId);
+    const operationId = deviceNameOperationIds.get(receiptKey);
+    if (operationId === undefined) throw new GatewayError("There is no pending device name receipt.");
+    try {
+      const response = await createClient(OperationService, scope.transport).getOperation({ operationId }, { signal: scope.signal });
+      scope.signal.throwIfAborted();
+      const operation = response.operation;
+      if (operation === undefined || operation.operationId !== operationId || operation.connectionId !== this.#profile?.id) throw deviceNameUnconfirmed();
+      if (failedDeviceNameOperation(operation)) {
+        deviceNameOperationIds.delete(receiptKey);
+        throw new GatewayError(operation.error?.message || "The device name update failed.", {
+          ...(operation.error?.code ? { code: operation.error.code } : {})
+        });
+      }
+      const mutation = operation.mutation?.payload;
+      if ((mutation?.case !== "renameDevice" && mutation?.case !== "resetDeviceName") || mutation.value.deviceId !== deviceId) throw deviceNameUnconfirmed();
+      const result = deviceNameOutcome(operation, deviceId, mutation.case === "renameDevice" ? mutation.value.displayName : undefined);
+      deviceNameOperationIds.delete(receiptKey);
+      void this.refresh().catch((error: unknown) => { if (!scope.signal.aborted) this.#callbacks.onError?.(normalizeError(error)); });
+      return result;
+    } catch (error) {
+      if (!deviceNameOperationIds.has(receiptKey)) throw error;
+      throw deviceNameUnconfirmed(error);
+    }
   }
 
   async setDeviceRemoteControlEnabled(enabled: boolean): Promise<void> {
@@ -9063,7 +9171,8 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     payload: MutationPayload,
     waitForTerminal = false,
     preconditions: readonly MutationPrecondition[] = [],
-    callerSignal?: AbortSignal
+    callerSignal?: AbortSignal,
+    observeReceipt?: (operationId: string, operation?: Operation) => void
   ): Promise<Operation> {
     callerSignal?.throwIfAborted();
     const transport = this.requireTransport();
@@ -9078,6 +9187,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     const options = signal === undefined ? undefined : { signal };
     const submitOnce = () => {
       signal?.throwIfAborted();
+      observeReceipt?.(operationId);
       if (payload.case === "sendInput" && this.#profile !== undefined) {
         const generation = request.mutation.preconditions.find((precondition) =>
           precondition.entity?.kind === EntityKind.SESSION
@@ -9108,6 +9218,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     callerSignal?.throwIfAborted();
     if (response.operation === undefined) throw new GatewayError("Orchestrator accepted no operation.");
     let operation = response.operation;
+    observeReceipt?.(operationId, operation);
     if (waitForTerminal && !TERMINAL_OPERATION_STATES.has(operation.state)) {
       const timeout = AbortSignal.timeout(OPERATION_TERMINAL_WAIT_TIMEOUT_MS);
       for await (const update of client.watchOperation({
@@ -9129,6 +9240,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
         throw new GatewayError("Orchestrator stopped watching the operation before it reached a terminal state.");
       }
     }
+    observeReceipt?.(operationId, operation);
     if (operation.state === OperationState.FAILED || operation.state === OperationState.CONFLICT || operation.state === OperationState.CANCELLED) {
       throw new GatewayError(operation.error?.message || `Operation ${operation.state} failed.`, {
         ...(operation.error?.code ? { code: operation.error.code } : {})
@@ -9403,6 +9515,16 @@ export function projectSnapshotEvent(
       if (connection !== undefined) {
         raw = { ...raw, connections: upsertBy(raw.connections, connection, (value) => value.connectionId) };
         projected = { ...projected, remoteConnections: upsertBy(projected.remoteConnections, mapRemoteConnection(connection), (value) => value.id) };
+      }
+      break;
+    }
+    case "deviceChanged": {
+      const device = kind.value.device;
+      if (device !== undefined) {
+        const previous = raw.devices.find((entry) => entry.deviceId === device.deviceId);
+        if (previous !== undefined && (device.version?.revision?.value ?? 0n) <= (previous.version?.revision?.value ?? 0n)) break;
+        raw = { ...raw, devices: upsertBy(raw.devices, device, (value) => value.deviceId) };
+        projected = { ...projected, devices: upsertBy(projected.devices, mapDevice(device), (value) => value.id) };
       }
       break;
     }
@@ -16456,6 +16578,9 @@ function mapDevice(device: Device): DeviceView {
   return {
     id: device.deviceId,
     name: device.displayName,
+    defaultDisplayName: device.defaultDisplayName,
+    ...(device.manualDisplayName === undefined ? {} : { manualDisplayName: device.manualDisplayName }),
+    revision: device.version?.revision?.value ?? 0n,
     kind: device.kind === DeviceKind.WEB ? "web" : device.kind === DeviceKind.DESKTOP ? "desktop" : device.kind === DeviceKind.SERVICE ? "service" : device.kind === DeviceKind.MOBILE ? "mobile" : "unknown",
     platform: device.platform,
     appVersion: device.appVersion,
@@ -16464,6 +16589,31 @@ function mapDevice(device: Device): DeviceView {
     presence: device.presence === DevicePresenceState.ONLINE ? "online" : "offline",
     ...(device.lastSeenAt === undefined ? {} : { lastSeenAt: timestampMs(device.lastSeenAt) })
   };
+}
+
+function deviceNameOutcome(operation: Operation, deviceId: string, manualDisplayName?: string): DeviceView {
+  const payload = operation.result?.payload;
+  if (operation.state !== OperationState.SUCCEEDED || payload?.case !== "device" || payload.value.deviceId !== deviceId) {
+    throw new GatewayError("The device name update has no confirmed device outcome.");
+  }
+  const device = payload.value;
+  if (
+    device.defaultDisplayName.trim().length === 0
+    || device.version?.revision === undefined
+    || device.manualDisplayName !== manualDisplayName
+    || device.displayName !== (manualDisplayName ?? device.defaultDisplayName)
+  ) throw new GatewayError("The device name update returned an invalid device outcome.");
+  return mapDevice(device);
+}
+
+function failedDeviceNameOperation(operation: Operation): boolean {
+  return operation.state === OperationState.FAILED || operation.state === OperationState.CONFLICT || operation.state === OperationState.CANCELLED;
+}
+
+function deviceNameUnconfirmed(cause?: unknown): GatewayError {
+  return new GatewayError("The device name update is not confirmed. Check its status before making another change.", {
+    code: "DEVICE_NAME_UNCONFIRMED", cause
+  });
 }
 
 function mapDeviceControlRelation(relation: DeviceControlRelation): DeviceControlRelationView {
@@ -18223,7 +18373,15 @@ function abortableDelay(milliseconds: number, signal: AbortSignal): Promise<void
 }
 
 function desktopAvailable(): boolean {
-  return "jokoDesktop" in window;
+  return typeof window !== "undefined" && "jokoDesktop" in window;
+}
+
+async function readDesktopDeviceNameSource(): Promise<DeviceNameSource> {
+  const info = await window.jokoDesktop?.appInfo.get();
+  if (info === undefined || typeof info.defaultDeviceName !== "string" || info.defaultDeviceName.trim().length === 0) {
+    throw new GatewayError("The desktop did not provide its default device name.");
+  }
+  return create(DeviceNameSourceSchema, { defaultDisplayName: info.defaultDeviceName });
 }
 
 function payloadCase(event: Event): string | undefined {

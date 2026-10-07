@@ -1,5 +1,5 @@
 import type { EventPayload } from "@joko/core";
-import type { PersistedEvent } from "@joko/store";
+import type { PersistedSessionEvent } from "@joko/store";
 import { ToolCallState } from "@joko/contracts";
 import { describe, expect, it } from "vitest";
 
@@ -64,7 +64,7 @@ describe("Tool Call projector", () => {
   });
 });
 
-function event(cursor: number, payload: EventPayload, backendId = "pi"): PersistedEvent {
+function event(cursor: number, payload: Exclude<EventPayload, { type: "device_changed" }>, backendId = "pi"): PersistedSessionEvent {
   return {
     id: `event-${cursor}`,
     sequence: BigInt(cursor),

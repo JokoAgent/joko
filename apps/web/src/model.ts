@@ -3451,6 +3451,9 @@ export interface RemoteConnectionView {
 export interface DeviceView {
   readonly id: string;
   readonly name: string;
+  readonly defaultDisplayName: string;
+  readonly manualDisplayName?: string;
+  readonly revision: bigint;
   readonly kind: "web" | "desktop" | "service" | "mobile" | "unknown";
   readonly platform: string;
   readonly appVersion: string;
@@ -5944,7 +5947,10 @@ export interface OperationApi extends VoiceDictionaryPeerApi {
   executeWorkspaceRewind(workspaceId: string, previewId: string, changeSetId: string, dialogueOnly: boolean): Promise<void>;
   restartBackend(backendId: string): Promise<void>;
   updateBackendSettings(backendId: string, patch: BackendSettingsUpdate): Promise<void>;
-  renameDevice(deviceId: string, name: string): Promise<void>;
+  renameDevice(deviceId: string, name: string, expectedRevision: bigint): Promise<DeviceView>;
+  resetDeviceName(deviceId: string, expectedRevision: bigint): Promise<DeviceView>;
+  checkDeviceNameUpdate(deviceId: string): Promise<DeviceView>;
+  hasPendingDeviceNameUpdate(deviceId: string): boolean;
   setDeviceRemoteControlEnabled(enabled: boolean): Promise<void>;
   setDeviceControlTargetEnabled(targetDeviceId: string, enabled: boolean): Promise<void>;
   setDeviceControllerAllowed(controllerDeviceId: string, allowed: boolean): Promise<void>;

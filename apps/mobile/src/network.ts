@@ -14,7 +14,7 @@ import {
   TransferDirection, WorkspaceEntryListingPolicy, WorkspaceFileChangeKind, WorkspaceService,
   JOKO_API_VERSION, SessionMessageSearchSemanticMode, SessionMessageSearchSessionStatus,
   isPrivateLanDiscoveryHost, validateDiscoveredNode,
-  type Artifact, type BlobRef, type BlobTransferTicket, type Connection, type Device, type DiscoveredNodeRecord, type ImageThumbnail,
+  type Artifact, type BlobRef, type BlobTransferTicket, type Connection, type Device, type DeviceNameSource, type DiscoveredNodeRecord, type ImageThumbnail,
   type Event, type EventCursor, type FilePreview, type FileRevision, type Operation, type OperationMutation,
   type NativeSessionTree, type PendingBlobUpload, type RuntimeCommand, type Schedule, type ScheduleRunHistory,
   type SchedulerRuntimeSnapshot, type SessionMessageSearchMatch, type SessionResource, type Snapshot, type Target,
@@ -108,9 +108,9 @@ export interface MobilePushCapabilityResult {
 export interface MobileNetwork {
   inspect(origin: string, signal?: AbortSignal): Promise<NodeIdentity>;
   discover(origin: string, signal?: AbortSignal): Promise<readonly DiscoveredNodeRecord[]>;
-  requestPairing(origin: string, deviceName: string, platform: string, signal?: AbortSignal): Promise<{ identity: NodeIdentity; challengeId: string }>;
-  completePairing(origin: string, challengeId: string, code: string, deviceName: string, platform: string, signal?: AbortSignal): Promise<{ credential: PairedCredential; identity: NodeIdentity }>;
-  readOwner(credential: PairedCredential, signal?: AbortSignal): Promise<{ connection: Connection; device: Device; snapshot: Snapshot }>;
+  requestPairing(origin: string, deviceName: string, platform: string, deviceNameSource: DeviceNameSource, signal?: AbortSignal): Promise<{ identity: NodeIdentity; challengeId: string }>;
+  completePairing(origin: string, challengeId: string, code: string, deviceName: string, platform: string, deviceNameSource: DeviceNameSource, signal?: AbortSignal): Promise<{ credential: PairedCredential; identity: NodeIdentity }>;
+  readOwner(credential: PairedCredential, deviceNameSource: DeviceNameSource, signal?: AbortSignal): Promise<{ connection: Connection; device: Device; snapshot: Snapshot }>;
   listPartners(credential: PairedCredential, signal?: AbortSignal): Promise<readonly MobilePartner[]>;
   listPartnerSessions(credential: PairedCredential, partnerId: string, signal?: AbortSignal): Promise<ListPartnerSessionsResponse>;
   listPartnerPrivateThreads(credential: PairedCredential, partnerId: string, signal?: AbortSignal): Promise<readonly MobilePrivateThread[]>;
@@ -1052,21 +1052,21 @@ export const mobileNetwork: MobileNetwork = {
       return value;
     });
   },
-  async requestPairing(rawOrigin, deviceName, platform, signal) {
+  async requestPairing(rawOrigin, deviceName, platform, deviceNameSource, signal) {
     const origin = normalizeNodeOrigin(rawOrigin);
     const client = createClient(ConnectionService, transport(origin));
     const node = parseNodeIdentity((await client.getServerInfo({}, options(signal))).server);
     if (!node.pairingEnabled) throw new Error("Pairing is closed on this Joko node. Ask the node owner to open pairing.");
-    const args = { deviceDisplayName: deviceName.trim(), deviceKind: DeviceKind.MOBILE, platform, appVersion: "0.1.0" };
+    const args = { deviceDisplayName: deviceName.trim(), deviceKind: DeviceKind.MOBILE, platform, appVersion: "0.1.0", deviceNameSource };
     const challenge = (await client.beginPairing(args, options(signal))).challenge;
     if (!challenge?.challengeId) throw new Error("The Joko node did not return a pairing challenge.");
     return { identity: node, challengeId: challenge.challengeId };
   },
-  async completePairing(rawOrigin, challengeId, code, deviceName, platform, signal) {
+  async completePairing(rawOrigin, challengeId, code, deviceName, platform, deviceNameSource, signal) {
     const origin = normalizeNodeOrigin(rawOrigin);
     const client = createClient(ConnectionService, transport(origin));
     const node = parseNodeIdentity((await client.getServerInfo({}, options(signal))).server);
-    const args = { deviceDisplayName: deviceName.trim(), deviceKind: DeviceKind.MOBILE, platform, appVersion: "0.1.0" };
+    const args = { deviceDisplayName: deviceName.trim(), deviceKind: DeviceKind.MOBILE, platform, appVersion: "0.1.0", deviceNameSource };
     const result = (await client.completePairing({ ...args, challengeId, humanCode: code.trim() }, options(signal))).result;
     if (!result?.connection?.connectionId || !result.connection.connectionProfileId || !result.device?.deviceId
       || result.connection.deviceId !== result.device.deviceId || !result.authKey) {
@@ -1081,15 +1081,17 @@ export const mobileNetwork: MobileNetwork = {
       }
     };
   },
-  async readOwner(credential, signal) {
-    const client = createClient(ConnectionService, transport(credential.origin, credential.authKey));
-    const [connection, device, snapshot] = await Promise.all([
-      client.getConnection({ connectionId: credential.connectionId }, options(signal)),
-      client.getDevice({ deviceId: credential.deviceId }, options(signal)),
-      createClient(EventService, transport(credential.origin, credential.authKey)).getSnapshot({ scope: { kind: { case: "owner", value: {} } } }, options(signal))
-    ]);
-    if (!connection.connection || !device.device || !snapshot.snapshot) throw new Error("The Joko node returned an incomplete owner snapshot.");
-    return { connection: connection.connection, device: device.device, snapshot: snapshot.snapshot };
+  async readOwner(credential, currentDeviceNameSource, signal) {
+    const response = await createClient(EventService, transport(credential.origin, credential.authKey)).getSnapshot({
+      scope: { kind: { case: "owner", value: {} } }, currentDeviceNameSource
+    }, options(signal));
+    const snapshot = response.snapshot;
+    const connections = snapshot?.connections.filter((item) => item.connectionId === credential.connectionId) ?? [];
+    const devices = snapshot?.devices.filter((item) => item.deviceId === credential.deviceId) ?? [];
+    if (!snapshot || connections.length !== 1 || devices.length !== 1) {
+      throw new Error("The Joko node returned an incomplete or ambiguous owner snapshot.");
+    }
+    return { connection: connections[0]!, device: devices[0]!, snapshot };
   },
   async listPartners(credential, signal) {
     const response = await createClient(PartnerService, transport(credential.origin, credential.authKey))

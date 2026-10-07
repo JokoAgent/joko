@@ -18,6 +18,7 @@ import type {
   ArtifactReferenceSnapshot,
   BackendDescriptor,
   Capability,
+  DeviceContentProjection,
   EventPayload,
   InteractionDecision,
   PromptInput,
@@ -1785,7 +1786,8 @@ export class OperationalStore {
       if (device === undefined) {
         this.createDevice({
           id: deviceId,
-          name: input.device?.name ?? input.name,
+          defaultName: input.device?.defaultName ?? "Joko Device",
+          ...(input.device?.manualName === undefined ? {} : { manualName: input.device.manualName }),
           ...(input.device?.kind === undefined ? {} : { kind: input.device.kind }),
           ...(input.device?.platform === undefined ? {} : { platform: input.device.platform }),
           ...(input.device?.appVersion === undefined ? {} : { appVersion: input.device.appVersion }),
@@ -1808,11 +1810,12 @@ export class OperationalStore {
       const pairedAt = input.pairedAt ?? this.now();
       this.database.prepare(`
         INSERT INTO devices(
-          id, name, kind, platform, app_version, state, remote_control_enabled, paired_at, revision
-        ) VALUES (?, ?, ?, ?, ?, 'active', 0, ?, ?)
+          id, default_name, manual_name, kind, platform, app_version, state, remote_control_enabled, paired_at, revision
+        ) VALUES (?, ?, ?, ?, ?, ?, 'active', 0, ?, ?)
       `).run(
         nonBlank(input.id, "Device id"),
-        nonBlank(input.name, "Device name"),
+        normalizeDeviceName(input.defaultName),
+        input.manualName === undefined ? null : normalizeDeviceName(input.manualName),
         input.kind ?? "unspecified",
         input.platform ?? "",
         input.appVersion ?? "",
@@ -2376,15 +2379,16 @@ export class OperationalStore {
       if (input.expiresAt <= createdAt) throw new PairingError("Pairing expiry must be in the future.");
       this.database.prepare(`
         INSERT INTO pairings(
-          id, code_digest, label, device_id, device_name, device_kind,
+          id, code_digest, label, device_id, device_default_name, device_manual_name, device_kind,
           device_platform, device_app_version, expires_at, created_at, revision
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         input.id,
         nonBlank(input.codeDigest, "Pairing code digest"),
         input.label ?? null,
         input.device?.id ?? null,
-        input.device?.name ?? null,
+        input.device === undefined ? null : normalizeDeviceName(input.device.defaultName),
+        input.device?.manualName === undefined ? null : normalizeDeviceName(input.device.manualName),
         input.device === undefined ? null : input.device.kind ?? "unspecified",
         input.device === undefined ? null : input.device.platform ?? "",
         input.device === undefined ? null : input.device.appVersion ?? "",
@@ -2789,18 +2793,71 @@ export class OperationalStore {
       if (expectedRevision !== undefined && current.revision !== expectedRevision) {
         throw new RevisionConflictError("Device", id, expectedRevision, current.revision);
       }
-      const normalized = nonBlank(name, "Device name");
-      if (current.name === normalized) return current;
+      const normalized = normalizeDeviceName(name);
+      if (current.state !== "active") throw new AuthorizationError("The device has been revoked.");
+      if (current.manualName === normalized) return current;
       const result = this.database.prepare(`
-        UPDATE devices SET name = ?, revision = ?
+        UPDATE devices SET manual_name = ?, revision = ?
         WHERE id = ? AND revision = ?
       `).run(normalized, asSqlInteger(this.requireActiveRevision()), id, asSqlInteger(current.revision));
       if (result.changes !== 1) {
         const changed = this.getDevice(id);
         throw new RevisionConflictError("Device", id, current.revision, changed.revision);
       }
-      return this.getDevice(id);
+      const changed = this.getDevice(id);
+      this.appendDeviceContentEvent(changed);
+      return changed;
     });
+  }
+
+  resetDeviceName(id: string, expectedRevision?: bigint): DeviceRecord {
+    return this.write(() => {
+      const current = this.getDevice(id);
+      if (expectedRevision !== undefined && current.revision !== expectedRevision) {
+        throw new RevisionConflictError("Device", id, expectedRevision, current.revision);
+      }
+      if (current.state !== "active") throw new AuthorizationError("The device has been revoked.");
+      if (current.manualName === undefined) return current;
+      this.database.prepare("UPDATE devices SET manual_name = NULL, revision = ? WHERE id = ?")
+        .run(asSqlInteger(this.requireActiveRevision()), id);
+      const changed = this.getDevice(id);
+      this.appendDeviceContentEvent(changed);
+      return changed;
+    });
+  }
+
+  refreshDeviceDefaultName(id: string, name: string): DeviceRecord {
+    const normalized = normalizeDeviceName(name);
+    const observed = this.getDevice(id);
+    if (observed.state !== "active") throw new AuthorizationError("The device has been revoked.");
+    if (observed.defaultName === normalized) return observed;
+    return this.write(() => {
+      const current = this.getDevice(id);
+      if (current.state !== "active") throw new AuthorizationError("The device has been revoked.");
+      if (current.defaultName === normalized) return current;
+      this.database.prepare("UPDATE devices SET default_name = ?, revision = ? WHERE id = ?")
+        .run(normalized, asSqlInteger(this.requireActiveRevision()), id);
+      const changed = this.getDevice(id);
+      this.appendDeviceContentEvent(changed);
+      return changed;
+    });
+  }
+
+  private appendDeviceContentEvent(device: DeviceRecord): void {
+    const revision = this.requireActiveRevision();
+    const emittedAt = this.now();
+    const id = this.idFactory();
+    const traceId = `device-content:${device.id}`;
+    const payloadJson = serializeJson({ payload: { type: "device_changed",
+      device: deviceContentProjection(device, this.listDeviceConnections(device.id), emittedAt) } });
+    const payload = parseDeviceContentEvent(parseJson<{ payload: unknown }>(payloadJson).payload);
+    const inserted = this.database.prepare(`
+      INSERT INTO events(id, revision, session_sequence, emitted_at, backend_id, target_id, session_id,
+        generation, trace_id, payload_json)
+      VALUES (?, ?, 1, ?, NULL, NULL, NULL, 0, ?, ?)
+    `).run(id, asSqlInteger(revision), emittedAt, traceId, payloadJson);
+    this.currentFrame().events.push({ id, globalCursor: toBigInt(inserted.lastInsertRowid), sequence: 1n,
+      revision, emittedAt, backendId: "", targetId: "", sessionId: "", generation: 0, traceId, payload });
   }
 
   setDeviceRemoteControlEnabled(id: string, enabled: boolean, expectedRevision?: bigint): DeviceRecord {
@@ -9459,6 +9516,9 @@ export class OperationalStore {
 
   appendEvent(input: AppendEventInput): PersistedEvent {
     return this.write(() => {
+      if (input.payload.type === "device_changed") {
+        throw new StoreError("Device content observations are owned by the Store, not Session adapters.");
+      }
       const session = this.getSession(input.sessionId);
       if (
         session.descriptor.backendId !== input.backendId ||
@@ -9488,6 +9548,7 @@ export class OperationalStore {
       const payload = parseCurrentResourceUsageEventPayload(
         parseCurrentInteractionEventPayload(redactSubagentEventPayload(input.payload))
       );
+      if (payload.type === "device_changed") throw new StoreError("Device content cannot use Session routing.");
       if (payload.type === "resource_usage" && (
         input.runId === undefined || payload.runtimeGeneration !== input.generation
       )) {
@@ -9546,7 +9607,7 @@ export class OperationalStore {
         ...(input.operationId === undefined ? {} : { operationId: input.operationId }),
         generation: input.generation,
         traceId,
-        payload: parseJson<{ payload: EventPayload }>(serializeJson({ payload })).payload,
+        payload: parseJson<{ payload: typeof payload }>(serializeJson({ payload })).payload,
         ...(input.pi === undefined
           ? {}
           : { pi: parseJson<{ pi: NonNullable<AppendEventInput["pi"]> }>(serializeJson({ pi: input.pi })).pi }),
@@ -17939,9 +18000,13 @@ function connectionFromRow(row: Row): ConnectionRecord {
 }
 
 function deviceFromRow(row: Row): DeviceRecord {
+  const defaultName = stringValue(row["default_name"]);
+  const manualName = optionalString("manualName", row["manual_name"]).manualName;
   return {
     id: stringValue(row["id"]),
-    name: stringValue(row["name"]),
+    name: manualName ?? defaultName,
+    defaultName,
+    ...(manualName === undefined ? {} : { manualName }),
     kind: enumValue(row["kind"], ["unspecified", "web", "desktop", "service", "mobile"] as const),
     platform: stringValue(row["platform"]),
     appVersion: stringValue(row["app_version"]),
@@ -18020,11 +18085,12 @@ function mobilePushDeliveryFromRow(row: Row): MobilePushDeliveryRecord {
 
 function pairingFromRow(row: Row): PairingRecord {
   const deviceId = optionalString("deviceId", row["device_id"]).deviceId;
-  const deviceName = optionalString("deviceName", row["device_name"]).deviceName;
+  const deviceDefaultName = optionalString("deviceDefaultName", row["device_default_name"]).deviceDefaultName;
+  const deviceManualName = optionalString("deviceManualName", row["device_manual_name"]).deviceManualName;
   const deviceKind = optionalString("deviceKind", row["device_kind"]).deviceKind;
   const devicePlatform = optionalString("devicePlatform", row["device_platform"]).devicePlatform;
   const deviceAppVersion = optionalString("deviceAppVersion", row["device_app_version"]).deviceAppVersion;
-  const deviceFields = [deviceId, deviceName, deviceKind, devicePlatform, deviceAppVersion];
+  const deviceFields = [deviceId, deviceDefaultName, deviceKind, devicePlatform, deviceAppVersion];
   if (deviceFields.some((value) => value === undefined) && deviceFields.some((value) => value !== undefined)) {
     throw new StoreError("Stored Pairing Device metadata is incomplete.");
   }
@@ -18035,7 +18101,8 @@ function pairingFromRow(row: Row): PairingRecord {
     ...(deviceId === undefined ? {} : {
       device: {
         id: deviceId,
-        name: deviceName!,
+        defaultName: deviceDefaultName!,
+        ...(deviceManualName === undefined ? {} : { manualName: deviceManualName }),
         kind: enumValue(deviceKind, ["unspecified", "web", "desktop", "service", "mobile"] as const),
         platform: devicePlatform!,
         appVersion: deviceAppVersion!
@@ -19804,6 +19871,16 @@ function eventFromRow(row: Row): PersistedEvent {
     readonly pi?: NonNullable<AppendEventInput["pi"]> | null;
   }>(stringValue(row["payload_json"]));
   const payload = parseCurrentInteractionEventPayload(stored.payload);
+  if (payload.type === "device_changed") {
+    if (row["backend_id"] !== null || row["target_id"] !== null || row["session_id"] !== null
+      || row["run_id"] !== null || row["attempt_id"] !== null || row["operation_id"] !== null
+      || row["generation"] !== 0 || row["namespace"] !== null || row["metadata_json"] !== null
+      || stored.pi !== undefined) throw new StoreError("Stored Device event routing is invalid.");
+    return { id: stringValue(row["id"]), globalCursor: toBigInt(row["global_cursor"]),
+      sequence: toBigInt(row["session_sequence"]), revision: toBigInt(row["revision"]),
+      emittedAt: numberValue(row["emitted_at"]), backendId: "", targetId: "", sessionId: "", generation: 0,
+      traceId: stringValue(row["trace_id"]), payload: parseDeviceContentEvent(stored.payload) };
+  }
   return {
     id: stringValue(row["id"]),
     globalCursor: toBigInt(row["global_cursor"]),
@@ -21022,6 +21099,55 @@ function normalizeOffset(value: number | undefined): number {
     throw new RangeError("Query offset must be a non-negative safe integer.");
   }
   return normalized;
+}
+
+export function normalizeDeviceName(value: string): string {
+  const normalized = value.trim();
+  if (normalized === "" || normalized.length > 128 || /[\u0000-\u001f\u007f]/u.test(normalized)) {
+    throw new StoreError("Device display name is invalid.");
+  }
+  return normalized;
+}
+
+export function deviceContentProjection(
+  record: DeviceRecord,
+  connections: readonly ConnectionRecord[],
+  observedAt: number
+): DeviceContentProjection {
+  return { id: record.id, name: record.name, defaultName: record.defaultName,
+    ...(record.manualName === undefined ? {} : { manualName: record.manualName }),
+    kind: record.kind, platform: record.platform, appVersion: record.appVersion,
+    revoked: record.state === "revoked", remoteControlEnabled: record.remoteControlEnabled,
+    pairedAt: record.pairedAt, ...(record.lastSeenAt === undefined ? {} : { lastSeenAt: record.lastSeenAt }),
+    connectionIds: connections.map((connection) => connection.id),
+    online: record.state === "active" && connections.some((connection) => connection.state === "active"
+      && connection.lastSeenAt !== undefined && observedAt - connection.lastSeenAt <= 75_000),
+    revision: record.revision.toString(), versionUpdatedAt: record.lastSeenAt ?? record.revokedAt ?? record.pairedAt };
+}
+
+function parseDeviceContentEvent(value: unknown): Extract<EventPayload, { readonly type: "device_changed" }> {
+  const invalid = (): never => { throw new StoreError("Stored Device content does not match its current-v1 shape."); };
+  if (!isRecord(value) || value["type"] !== "device_changed" || Object.keys(value).length !== 2
+    || !isRecord(value["device"])) return invalid();
+  const device = value["device"];
+  const required = ["id", "name", "defaultName", "kind", "platform", "appVersion", "revoked", "remoteControlEnabled",
+    "pairedAt", "connectionIds", "online", "revision", "versionUpdatedAt"];
+  if (required.some((key) => !Object.hasOwn(device, key))
+    || Object.keys(device).some((key) => !required.includes(key) && key !== "manualName" && key !== "lastSeenAt")) return invalid();
+  for (const key of ["name", "defaultName", ...(Object.hasOwn(device, "manualName") ? ["manualName"] : [])]) {
+    const name = device[key];
+    if (typeof name !== "string" || normalizeDeviceName(name) !== name) return invalid();
+  }
+  if (device["name"] !== (device["manualName"] ?? device["defaultName"])
+    || typeof device["id"] !== "string" || device["id"].trim() === ""
+    || typeof device["kind"] !== "string" || !["unspecified", "web", "desktop", "service", "mobile"].includes(device["kind"])
+    || typeof device["platform"] !== "string" || typeof device["appVersion"] !== "string"
+    || typeof device["revision"] !== "string" || !/^[1-9][0-9]*$/u.test(device["revision"])
+    || ["revoked", "remoteControlEnabled", "online"].some((key) => typeof device[key] !== "boolean")
+    || ["pairedAt", "versionUpdatedAt", ...(Object.hasOwn(device, "lastSeenAt") ? ["lastSeenAt"] : [])]
+      .some((key) => typeof device[key] !== "number" || !Number.isSafeInteger(device[key]) || device[key] < 0)
+    || !Array.isArray(device["connectionIds"]) || device["connectionIds"].some((id) => typeof id !== "string" || id.trim() === "")) return invalid();
+  return value as unknown as Extract<EventPayload, { readonly type: "device_changed" }>;
 }
 
 function nonBlank(value: string, label: string): string {

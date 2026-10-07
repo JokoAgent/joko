@@ -56,10 +56,12 @@ describe("standalone Service Device peer agent", () => {
     let admittedCredential: string | undefined;
     let unrelatedCredential: string | undefined;
     let exactAuthority = false;
+    let nativeName = "Service OS host";
     const agent = new ServiceDevicePeerAgent({
       config: fixtureConfig("C:\\protected\\service-auth-key"),
       validateCredential: async () => { ordering.push("metadata"); },
       readAuthKey,
+      readDefaultDeviceName: () => nativeName,
       createExecutor: () => ({
         capabilities: [DevicePeerCapabilityKind.FILES],
         execute: vi.fn(async () => undefined),
@@ -88,6 +90,9 @@ describe("standalone Service Device peer agent", () => {
     expect(admittedCredential).toBe(AUTH_KEY);
     expect(unrelatedCredential).toBeUndefined();
     expect(exactAuthority).toBe(true);
+    expect(attempt?.readDefaultDeviceName()).toBe("Service OS host");
+    nativeName = "Updated Service OS host";
+    expect(attempt?.readDefaultDeviceName()).toBe("Updated Service OS host");
     expect(readAuthKey).toHaveBeenCalledOnce();
     expect(ordering).toEqual(["metadata", "route", "credential"]);
 

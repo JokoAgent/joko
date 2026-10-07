@@ -890,8 +890,8 @@ function fixture(remote: boolean | "device_peer" = false) {
           targetDeviceId: "peer-device", workspaceRoot: "D:\\peer\\project" }
       : undefined;
   if (remote === "device_peer") {
-    store.createDevice({ id: "controller-device", name: "Controller", kind: "web", platform: "web", appVersion: "test" });
-    store.createDevice({ id: "peer-device", name: "Peer", kind: "desktop", platform: "win32", appVersion: "test" });
+    store.createDevice({ id: "controller-device", defaultName: "Controller", kind: "web", platform: "web", appVersion: "test" });
+    store.createDevice({ id: "peer-device", defaultName: "Peer", kind: "desktop", platform: "win32", appVersion: "test" });
     const peer = store.getDevice("peer-device");
     store.setDeviceRemoteControlEnabled(peer.id, true, peer.revision);
   }

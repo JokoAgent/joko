@@ -6,6 +6,22 @@ import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
 
 import * as contract from "../dist/index.js";
 
+test("Device name contracts preserve manual presence and typed self sources", () => {
+  const roundTrip = (schema, value) => fromBinary(schema, toBinary(schema, create(schema, value)));
+  const plain = roundTrip(contract.DeviceSchema, { deviceId: "phone", displayName: "Native phone", defaultDisplayName: "Native phone" });
+  assert.equal(plain.manualDisplayName, undefined);
+  const manual = roundTrip(contract.DeviceSchema, { ...plain, manualDisplayName: "Native phone" });
+  assert.equal(manual.manualDisplayName, "Native phone");
+  const source = { defaultDisplayName: "Current native phone" };
+  for (const schema of [contract.BeginPairingRequestSchema, contract.CompletePairingRequestSchema, contract.DevicePeerAgentHelloSchema]) {
+    assert.equal(roundTrip(schema, { deviceNameSource: source }).deviceNameSource.defaultDisplayName, source.defaultDisplayName);
+  }
+  assert.equal(roundTrip(contract.GetSnapshotRequestSchema, { currentDeviceNameSource: source }).currentDeviceNameSource.defaultDisplayName,
+    source.defaultDisplayName);
+  assert.equal(roundTrip(contract.OperationMutationSchema, { payload: { case: "resetDeviceName", value: { deviceId: "phone" } } })
+    .payload.value.deviceId, "phone");
+});
+
 test("binary text previews preserve BOM content and exact UTF-8 byte windows", () => {
   for (const text of ["\uFEFFfirst\r\nfocus line — 文本\r\n", "\uFEFF\uFEFF😀\n", "plain\n"]) {
     const byteSize = BigInt(new TextEncoder().encode(text).byteLength);

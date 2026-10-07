@@ -1,4 +1,4 @@
-import { clone, create, toBinary } from "@bufbuild/protobuf";
+import { clone, create, equals, toBinary } from "@bufbuild/protobuf";
 import { sha256 } from "@noble/hashes/sha2.js";
 import { bytesToHex } from "@noble/hashes/utils.js";
 import { Code } from "@connectrpc/connect";
@@ -14,7 +14,7 @@ import {
   OperationPreconditionSchema, OperationState, OperationMutationSchema, RewindSafety,
   MessageRole, PermissionMode, PinSessionMutationSchema, QueueDeliveryMode, QueueItemState, RenameSessionMutationSchema,
   ReorderQueueItemMutationSchema, ResetSessionMutationSchema, ResolveInteractionMutationSchema, RestartScheduleRunMutationSchema,
-  RenameDeviceMutationSchema, RevisionSchema, RevokeDeviceMutationSchema,
+  DeviceSchema, RenameDeviceMutationSchema, ResetDeviceNameMutationSchema, RevisionSchema, RevokeDeviceMutationSchema,
   CloneProjectScheduleToUserMutationSchema, PromoteScheduleToProjectMutationSchema,
   ReconcileProjectAutomationsMutationSchema, RemoveProjectScheduleMutationSchema,
   ReviewAttachmentInputSchema, ReviewAttachmentKind, ReviewRunState, RunState, SendInputMutationSchema, SessionMessageSearchSessionStatus,
@@ -23,11 +23,12 @@ import {
   StartReviewMutationSchema, TriggerScheduleMutationSchema, UpdateScheduleMutationSchema,
   UpdateVoiceInputServiceSettingsMutationSchema, VoiceInputServiceSettingsPatchSchema,
   FileKind, ImageRefSchema,
-  type Artifact, type BackendDescriptor, type BlobRef, type DiscoveredNodeRecord, type Event, type EventCursor, type FilePreview, type FileRevision, type Interaction,
+  type Artifact, type BackendDescriptor, type BlobRef, type Device, type DiscoveredNodeRecord, type Event, type EventCursor, type FilePreview, type FileRevision, type Interaction,
   type Operation, type OperationMutation, type QueueControl, type QueueItem, type Schedule, type Session, type Snapshot, type Target,
   type WorkspaceEntry, type WorkspaceSearchMatch
 } from "@joko/contracts";
 import { mobileVoiceCredentialBindingChanged, type MobileVoiceSettingsTransport } from "./mobile-voice-service-settings";
+import { mobileDeviceNameSource, validMobileDeviceName, type MobileDeviceNameSourceProvider } from "./mobile-device-name";
 import { resolveMobileMessageForkSource, type MobileMessageForkSource } from "./mobile-message-fork";
 import {
   assertMobileWorkspaceRewindPreview, mobileMessageChangeSet, mobileMessageRewindIdle, mobileRewindCapability,
@@ -660,6 +661,18 @@ const textOnlyIncomingSharePolicy: MobileAttachmentControls["policy"] = {
   fileMediaTypes: []
 };
 
+function confirmedMobileDeviceName(operation: Operation, deviceId: string, connectionId: string): Device {
+  const confirmed = operation.result?.payload.case === "device" ? operation.result.payload.value : undefined;
+  if (operation.state !== OperationState.SUCCEEDED || !confirmed || confirmed.deviceId !== deviceId
+    || confirmed.kind !== DeviceKind.MOBILE || confirmed.revoked || !confirmed.connectionIds.includes(connectionId)
+    || (confirmed.version?.revision?.value ?? 0n) < 1n || !validMobileDeviceName(confirmed.defaultDisplayName)
+    || (confirmed.manualDisplayName !== undefined && !validMobileDeviceName(confirmed.manualDisplayName))
+    || confirmed.displayName !== (confirmed.manualDisplayName ?? confirmed.defaultDisplayName)) {
+    throw new Error("The Joko node completed the device name change without the expected Device result.");
+  }
+  return confirmed;
+}
+
 export class MobileClient {
   #state: MobileState = { status: "starting", busy: false, saved: [], connectionMode: "nearby",
     discoveryState: "idle", nearby: [], older: [], live: [], liveStatus: "paused",
@@ -764,7 +777,8 @@ export class MobileClient {
     private readonly fileShare?: Pick<MobileFileShare, "perform">,
     private readonly offlineCache?: Pick<MobileOfflineCache, "load" | "save" | "clear">,
     private readonly readOnlyDictionaryCache?: Pick<MobileVoiceDictionaryReadOnlyCache, "clear">,
-    filesThumbnailDisk?: Pick<MobileFilesThumbnailCache, "get" | "put" | "remove">
+    filesThumbnailDisk?: Pick<MobileFilesThumbnailCache, "get" | "put" | "remove">,
+    private readonly deviceNameSource: MobileDeviceNameSourceProvider = () => mobileDeviceNameSource(undefined, platform)
   ) { this.#filesThumbnails = new MobileFilesThumbnailReader(filesThumbnailDisk); }
 
   get state(): MobileState { return this.#state; }
@@ -1558,7 +1572,7 @@ export class MobileClient {
     const { generation, controller } = this.#beginConnectionAttempt();
     this.#set({ challenge: undefined });
     try {
-      const request = await this.network.requestPairing(origin, deviceName, this.platform, controller.signal);
+      const request = await this.network.requestPairing(origin, deviceName, this.platform, this.deviceNameSource(), controller.signal);
       if (!this.#connectionAttemptCurrent(generation, controller)) return "";
       const candidate = this.#state.candidate;
       if (candidate && (candidate.origin !== origin || candidate.node.serverId !== request.identity.serverId)) {
@@ -1583,7 +1597,7 @@ export class MobileClient {
     }
     const { generation, controller } = this.#beginConnectionAttempt();
     try {
-      const result = await this.network.completePairing(origin, challenge.id, code, deviceName, this.platform, controller.signal);
+      const result = await this.network.completePairing(origin, challenge.id, code, deviceName, this.platform, this.deviceNameSource(), controller.signal);
       if (!this.#connectionAttemptCurrent(generation, controller)) return;
       const candidate = this.#state.candidate;
       if (candidate && (candidate.origin !== origin || candidate.node.serverId !== result.identity.serverId)) {
@@ -1593,7 +1607,7 @@ export class MobileClient {
       const observed = await this.network.inspect(origin, controller.signal);
       if (!this.#connectionAttemptCurrent(generation, controller)) return;
       if (observed.serverId !== result.credential.serverId) throw new Error("The Joko node identity changed during pairing.");
-      const owner = await this.network.readOwner(result.credential, controller.signal);
+      const owner = await this.network.readOwner(result.credential, this.deviceNameSource(), controller.signal);
       this.#assertOwner(result.credential, owner, observed);
       if (!this.#connectionAttemptCurrent(generation, controller)) return;
       await this.storage.saveConnection(result.credential);
@@ -1717,7 +1731,7 @@ export class MobileClient {
         });
         throw new Error(detail);
       }
-      const owner = await this.network.readOwner(credential, controller.signal);
+      const owner = await this.network.readOwner(credential, this.deviceNameSource(), controller.signal);
       if (!this.#connectionAttemptCurrent(generation, controller)) return;
       this.#assertOwner(credential, owner, node);
       const selected = selection !== undefined && owner.snapshot.sessions.some((session) => session.sessionId === selection)
@@ -2244,7 +2258,7 @@ export class MobileClient {
           "The saved Joko node identity changed. Its credential was not read again; forget it or pair this node explicitly.");
         return;
       }
-      const owner = await this.network.readOwner(credential, this.#abort?.signal);
+      const owner = await this.network.readOwner(credential, this.deviceNameSource(), this.#abort?.signal);
       if (!this.#current(epoch)) return;
       this.#assertOwner(credential, owner, node);
       const selectedId = this.#state.selectedId;
@@ -2299,10 +2313,13 @@ export class MobileClient {
     if (owner.connection.state !== ConnectionState.CONNECTED || owner.device.revoked) {
       throw new RevokedError();
     }
-    const projectedConnection = owner.snapshot.connections.find((item) => item.connectionId === credential.connectionId);
-    const projectedDevice = owner.snapshot.devices.find((item) => item.deviceId === credential.deviceId);
+    const projectedConnections = owner.snapshot.connections.filter((item) => item.connectionId === credential.connectionId);
+    const projectedDevices = owner.snapshot.devices.filter((item) => item.deviceId === credential.deviceId);
+    const projectedConnection = projectedConnections.length === 1 ? projectedConnections[0] : undefined;
+    const projectedDevice = projectedDevices.length === 1 ? projectedDevices[0] : undefined;
     if (projectedConnection?.connectionProfileId !== credential.profileId
-      || projectedConnection.deviceId !== credential.deviceId || projectedDevice?.kind !== DeviceKind.MOBILE) {
+      || projectedConnection.deviceId !== credential.deviceId || projectedDevice?.kind !== DeviceKind.MOBILE
+      || !equals(DeviceSchema, projectedDevice, owner.device)) {
       throw new CredentialIdentityError("The authenticated Joko snapshot did not prove the exact saved connection and device. The credential was kept but suspended.");
     }
     if (projectedConnection.state !== ConnectionState.CONNECTED || projectedDevice.revoked) throw new RevokedError();
@@ -2480,7 +2497,7 @@ export class MobileClient {
         }
       }
       const [owner, detail] = await Promise.all([
-        this.network.readOwner(credential, this.#abort?.signal),
+        this.network.readOwner(credential, this.deviceNameSource(), this.#abort?.signal),
         selectedId ? this.network.readSession(credential, selectedId, this.#abort?.signal) : Promise.resolve(undefined)
       ]);
       if (!this.#current(epoch) || credential !== this.#credential || selectedId !== this.#state.selectedId) return;
@@ -5793,9 +5810,18 @@ export class MobileClient {
   }
 
   async renameCurrentDevice(deviceId: string, displayName: string): Promise<boolean> {
+    return await this.#changeCurrentDeviceName(deviceId, displayName.trim()) !== undefined;
+  }
+
+  async resetCurrentDevice(deviceId: string): Promise<Device | undefined> {
+    return this.#changeCurrentDeviceName(deviceId);
+  }
+
+  async #changeCurrentDeviceName(deviceId: string, value?: string): Promise<Device | undefined> {
     const credential = this.#ready();
-    const value = displayName.trim();
-    if (!value || value.length > 128) throw new Error("Use a device name between 1 and 128 characters.");
+    if (value !== undefined && !validMobileDeviceName(value)) {
+      throw new Error("Use a device name between 1 and 128 characters.");
+    }
     if (deviceId !== credential.deviceId) throw new Error("Only the device authorizing this mobile connection can be renamed here.");
     const profiles = this.#profiles.filter((candidate) => candidate.profileId === this.#activeProfileId);
     const profile = profiles.length === 1 ? profiles[0] : undefined;
@@ -5819,7 +5845,17 @@ export class MobileClient {
     if (this.#state.pending.some((item) => item.kind === "device-rename" && item.targetDeviceId === deviceId)) {
       throw new Error("A previous change to this device still has an unresolved result.");
     }
-    if (device.displayName === value) return true;
+    if (value !== undefined && device.manualDisplayName === value) return device;
+    const epoch = this.#epoch;
+    const signal = this.#abort?.signal;
+    if (!signal) throw new Error("The current device read authority is unavailable.");
+    const confirmedDevice = (operation: Operation): Device => {
+      const confirmed = confirmedMobileDeviceName(operation, deviceId, credential.connectionId);
+      if (value === undefined ? confirmed.manualDisplayName !== undefined : confirmed.manualDisplayName !== value) {
+        throw new Error("The Joko node completed the device name change without the expected Device result.");
+      }
+      return confirmed;
+    };
     const action = this.#claimMutation();
     try {
       const result = await this.#submitTerminal(create(OperationMutationSchema, {
@@ -5827,22 +5863,22 @@ export class MobileClient {
           entity: create(EntityRefSchema, { kind: EntityKind.DEVICE, id: deviceId }),
           expectedRevision: revision
         })],
-        payload: { case: "renameDevice", value: create(RenameDeviceMutationSchema, {
-          deviceId,
-          displayName: value
-        }) }
-      }), { kind: "device-rename", targetDeviceId: deviceId });
-      if (!result.definitive) return false;
+        payload: value === undefined
+          ? { case: "resetDeviceName", value: create(ResetDeviceNameMutationSchema, { deviceId }) }
+          : { case: "renameDevice", value: create(RenameDeviceMutationSchema, { deviceId, displayName: value }) }
+      }), { kind: "device-rename", targetDeviceId: deviceId }, undefined, true, true, {
+        signal,
+        isCurrent: () => this.#current(epoch) && this.#credential === credential,
+        beforeTerminalReceipt: async (operation) => {
+          if (operation.state === OperationState.SUCCEEDED) confirmedDevice(operation);
+        }
+      });
+      if (!result.definitive) return undefined;
       if (!result.accepted) {
         throw new Error(result.operation?.error?.message || "The device rename was rejected.");
       }
-      if (result.operation?.state !== OperationState.SUCCEEDED
-        || result.operation.result?.payload.case !== "device"
-        || result.operation.result.payload.value.deviceId !== deviceId
-        || result.operation.result.payload.value.displayName !== value) {
-        throw new Error("The Joko node completed the device rename without the expected Device result.");
-      }
-      return true;
+      if (!result.operation) throw new Error("The device name operation returned no receipt.");
+      return confirmedDevice(result.operation);
     } finally { this.#releaseMutation(action); }
   }
 
@@ -7400,7 +7436,7 @@ export class MobileClient {
         const saved = await this.storage.loadCredential(profileId);
         request.throwIfAborted(); assertCurrent();
         if (!saved || !credentialMatchesProfile(saved, profile)) throw new CredentialIdentityError();
-        const owner = await this.network.readOwner(saved, request);
+        const owner = await this.network.readOwner(saved, this.deviceNameSource(), request);
         assertCurrent(); this.#assertOwner(saved, owner, observed);
         if (owner.snapshot.connections.filter((item) => item.connectionId === saved.connectionId).length !== 1
           || owner.snapshot.devices.filter((item) => item.deviceId === saved.deviceId).length !== 1
@@ -7416,7 +7452,7 @@ export class MobileClient {
     const subscribe = this.subscribe.bind(this);
     const network = this.network;
     const recheck = async (request: AbortSignal): Promise<void> => {
-      const owner = await network.readOwner(credential, request);
+      const owner = await network.readOwner(credential, this.deviceNameSource(), request);
       assertCurrent(); this.#assertOwner(credential, owner, node);
       if (owner.snapshot.generation !== generation) throw new Error("The dictionary source generation changed. Refresh to revalidate it.");
     };
@@ -8158,7 +8194,7 @@ export class MobileClient {
     const credential = this.#ready(); const profileId = this.#activeProfileId!;
     const current = (): boolean => this.#current(epoch) && this.#foreground && this.#credential === credential && this.#activeProfileId === profileId
       && (isCurrent?.() ?? true);
-    const owner = await this.network.readOwner(credential, this.#abort?.signal);
+    const owner = await this.network.readOwner(credential, this.deviceNameSource(), this.#abort?.signal);
     if (!current()) return;
     this.#assertOwner(credential, owner, this.#state.node!);
     const sessions = owner.snapshot.sessions.filter((value) => value.sessionId === pending.sessionId);
@@ -8234,7 +8270,7 @@ export class MobileClient {
     };
     try {
       const [owner, detail] = await Promise.all([
-        this.network.readOwner(credential, operationSignal), this.network.readSession(credential, session.sessionId, operationSignal)
+        this.network.readOwner(credential, this.deviceNameSource(), operationSignal), this.network.readSession(credential, session.sessionId, operationSignal)
       ]);
       if (!current() || !validOwner(owner)) return undefined;
       const child = detailSession(detail, session.sessionId);
@@ -8274,7 +8310,7 @@ export class MobileClient {
         }
       }
       // Availability may have been revoked while the source history was being read.
-      const finalOwner = await this.network.readOwner(credential, operationSignal);
+      const finalOwner = await this.network.readOwner(credential, this.deviceNameSource(), operationSignal);
       if (!current() || !validOwner(finalOwner)) return undefined;
       const url = new URL(target.messageId ? buildMobileMessageDeepLink(source.sessionId, target.messageId, focusEventId)
         : buildMobileTaskDeepLink(source.sessionId));
@@ -8447,7 +8483,7 @@ export class MobileClient {
 
   async #refreshDerivedTaskList(child: Session, current: () => boolean, signal?: AbortSignal): Promise<boolean> {
     const credential = this.#ready();
-    const owner = await this.network.readOwner(credential, signal === undefined ? this.#abort?.signal
+    const owner = await this.network.readOwner(credential, this.deviceNameSource(), signal === undefined ? this.#abort?.signal
       : this.#abort === undefined ? signal : AbortSignal.any([this.#abort.signal, signal]));
     if (!current() || signal?.aborted) return false;
     this.#assertOwner(credential, owner, this.#state.node!);
@@ -8939,7 +8975,7 @@ export class MobileClient {
     if (!node || profileId !== credential.profileId) {
       throw new Error("Reconnect to the exact saved Joko node before checking new-task references.");
     }
-    const owner = await this.network.readOwner(credential, signal ?? this.#abort?.signal);
+    const owner = await this.network.readOwner(credential, this.deviceNameSource(), signal ?? this.#abort?.signal);
     if (this.#credential !== credential || this.#activeProfileId !== profileId
       || this.#state.node?.serverId !== node.serverId || !this.#foreground) {
       throw new Error("The saved Joko connection changed while new-task references were being checked.");
@@ -11165,6 +11201,9 @@ export class MobileClient {
       const next = this.#state.pending.filter((item) => item.operationId !== pending.operationId);
       if (await this.#persistPending(next, epoch)) this.#set({ pending: next, error: operation.error?.message || "The operation was rejected." });
       return;
+    }
+    if (operation.state === OperationState.SUCCEEDED && pending.kind === "device-rename") {
+      confirmedMobileDeviceName(operation, pending.targetDeviceId!, pending.connectionId);
     }
     const next = isTerminal(operation.state)
       ? this.#state.pending.filter((item) => item.operationId !== pending.operationId)

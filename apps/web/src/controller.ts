@@ -2201,6 +2201,18 @@ export function useAppController(): AppController {
     return artifactGateway.executeWorkspaceRewind(workspaceId, previewId, changeSetId, dialogueOnly);
   }, [artifactGateway]);
   const inputOwnerId = state.activeProfile?.serverId;
+  const deviceNameApi = useMemo(() => {
+    const original = (): OrchestratorGateway => {
+      if (artifactGateway === undefined) throw new Error("Connect to Joko before managing device names.");
+      return artifactGateway;
+    };
+    return {
+      renameDevice: (...args: Parameters<OperationApi["renameDevice"]>) => original().renameDevice(...args),
+      resetDeviceName: (...args: Parameters<OperationApi["resetDeviceName"]>) => original().resetDeviceName(...args),
+      checkDeviceNameUpdate: (...args: Parameters<OperationApi["checkDeviceNameUpdate"]>) => original().checkDeviceNameUpdate(...args),
+      hasPendingDeviceNameUpdate: (deviceId: string) => artifactGateway?.hasPendingDeviceNameUpdate(deviceId) ?? false
+    };
+  }, [artifactGateway]);
   const remoteHostApi = useMemo(() => {
     const original = (): OrchestratorGateway => {
       if (artifactGateway === undefined) throw new Error("Connect to Joko before managing remote workspaces.");
@@ -2835,7 +2847,7 @@ export function useAppController(): AppController {
     executeWorkspaceRewind,
     restartBackend: (backendId) => gateway().restartBackend(backendId),
     updateBackendSettings: (backendId, patch) => gateway().updateBackendSettings(backendId, patch),
-    renameDevice: (deviceId, name) => gateway().renameDevice(deviceId, name),
+    ...deviceNameApi,
     setDeviceRemoteControlEnabled: (enabled) => gateway().setDeviceRemoteControlEnabled(enabled),
     setDeviceControlTargetEnabled: (targetDeviceId, enabled) => gateway().setDeviceControlTargetEnabled(targetDeviceId, enabled),
     setDeviceControllerAllowed: (controllerDeviceId, allowed) => gateway().setDeviceControllerAllowed(controllerDeviceId, allowed),
@@ -3137,7 +3149,7 @@ export function useAppController(): AppController {
     copyArtifactFile,
     openArtifactFile,
     revealArtifactSource
-  }), [saveProvider, openHttpLink, openWorkspaceHtml, readWorkspaceHtmlSnapshot, remoteHostApi, newTaskDraftApi, inputApi, mcpApi, terminalApi, simulatorViewerApi, readDraftSnapshot, saveDraftIfRevision, restoreFirstInputDraft, listWorkspaceChangeSets, previewWorkspaceRewind, executeWorkspaceRewind, readDraft, saveDraft, navigateSessionBranch, copyArtifactFile, openArtifactFile, revealArtifactSource, voiceApi, downloadArtifact, exportSession, exportPortableSession, getArtifactUrl, readWorkspaceFile, releaseArtifactUrl, updateAuxiliaryTextSettings, predictNextPrompt, cancelAutomaticConnectionAttempt, connect, disconnect, forgetProfile, gateway, logoutConnection, logoutProfile, mutatePreferences, navigate, openMachineSession, pair, probeRuntimeActivity, refreshDiscoveredNodes, refreshMachines, retryManagedOrchestrator, revokeDevice, searchRemoteSessionMessages, setAutomaticConnectionEnabled, setCodeFamily, setCodeSize, setComposerSendShortcut, setLocale, setMachineSelection, setSessionNotificationsEnabled, setUiFamily, setUiSize, state, switchMachine, updatePreferences]);
+  }), [deviceNameApi, saveProvider, openHttpLink, openWorkspaceHtml, readWorkspaceHtmlSnapshot, remoteHostApi, newTaskDraftApi, inputApi, mcpApi, terminalApi, simulatorViewerApi, readDraftSnapshot, saveDraftIfRevision, restoreFirstInputDraft, listWorkspaceChangeSets, previewWorkspaceRewind, executeWorkspaceRewind, readDraft, saveDraft, navigateSessionBranch, copyArtifactFile, openArtifactFile, revealArtifactSource, voiceApi, downloadArtifact, exportSession, exportPortableSession, getArtifactUrl, readWorkspaceFile, releaseArtifactUrl, updateAuxiliaryTextSettings, predictNextPrompt, cancelAutomaticConnectionAttempt, connect, disconnect, forgetProfile, gateway, logoutConnection, logoutProfile, mutatePreferences, navigate, openMachineSession, pair, probeRuntimeActivity, refreshDiscoveredNodes, refreshMachines, retryManagedOrchestrator, revokeDevice, searchRemoteSessionMessages, setAutomaticConnectionEnabled, setCodeFamily, setCodeSize, setComposerSendShortcut, setLocale, setMachineSelection, setSessionNotificationsEnabled, setUiFamily, setUiSize, state, switchMachine, updatePreferences]);
 }
 
 function upsertMachineCache(caches: readonly MachineCacheView[], cache: MachineCacheView): readonly MachineCacheView[] {

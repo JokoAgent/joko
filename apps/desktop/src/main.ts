@@ -31,7 +31,7 @@ import { broadcastDesktopUpdateSettings } from "./update-settings-broadcast.js";
 import { promoteExternalWindowActivation } from "./external-window-activation.js";
 import { basename, extname, isAbsolute, join, resolve } from "node:path";
 import { spawn } from "node:child_process";
-import { release as operatingSystemRelease } from "node:os";
+import { hostname, release as operatingSystemRelease } from "node:os";
 import { appendFileSync, writeFileSync } from "node:fs";
 import { readdir, stat, unlink } from "node:fs/promises";
 import { createHash, randomUUID } from "node:crypto";
@@ -6757,6 +6757,7 @@ function initializeDesktopDevicePeerAgentLifecycle(): void {
     },
     readAuthKey: readCredential,
     readRouteAuthorization: readDesktopDevicePeerAgentRouteAuthorization,
+    readDefaultDeviceName: () => hostname().trim() || "Unknown Device",
     isAuthorityCurrent: isDesktopDevicePeerAgentAuthorityCurrent
   });
   reconcileDesktopDevicePeerAgentLifecycle();
@@ -7153,6 +7154,7 @@ function registerIpc(): void {
     return {
       name: app.getName(),
       version: app.getVersion(),
+      defaultDeviceName: hostname().trim() || "Unknown Device",
       platform: process.platform,
       electronVersion: process.versions.electron,
       persistentCredentialStorage: secureStorageAvailable()
@@ -8604,7 +8606,7 @@ async function launchManagedOrchestratorBootstrap(
       dataDirectory: join(app.getPath("userData"), "orchestrator"),
       workspaceRoot: app.getPath("documents"),
       deviceId,
-      deviceName: `${app.getName()} Desktop`,
+      defaultDeviceName: hostname().trim() || "Unknown Device",
       appVersion: app.getVersion(),
       platform: process.platform,
       publicPort: ports.publicPort,

@@ -23,6 +23,7 @@ export interface NodeDevicePeerAgentLifecycleOptions {
   ) => DevicePeerAgentExecutor | Promise<DevicePeerAgentExecutor>;
   /** Owning Connection bearer used for the authenticated identity probe. */
   readonly readAuthKey: (credentialId: string) => Promise<string | undefined>;
+  readonly readDefaultDeviceName: () => string;
   readonly readRouteAuthorization?: (credentialId: string) => Promise<string | undefined>;
   readonly isAuthorityCurrent: (
     connection: NodeDevicePeerAgentConnection
@@ -58,7 +59,7 @@ interface RetryBackoff {
 export class NodeDevicePeerAgentLifecycle {
   readonly #options: Required<Pick<
     NodeDevicePeerAgentLifecycleOptions,
-    "createExecutor" | "readAuthKey" | "isAuthorityCurrent"
+    "createExecutor" | "readAuthKey" | "readDefaultDeviceName" | "isAuthorityCurrent"
   >> & {
     readonly readRouteAuthorization?: (credentialId: string) => Promise<string | undefined>;
     readonly runRoute: DevicePeerAgentRouteRunner;
@@ -83,6 +84,7 @@ export class NodeDevicePeerAgentLifecycle {
     this.#options = {
       createExecutor: options.createExecutor,
       readAuthKey: options.readAuthKey,
+      readDefaultDeviceName: options.readDefaultDeviceName,
       ...(options.readRouteAuthorization === undefined
         ? {}
         : { readRouteAuthorization: options.readRouteAuthorization }),
@@ -181,6 +183,7 @@ export class NodeDevicePeerAgentLifecycle {
           executor,
           signal: controller.signal,
           readAuthKey: this.#options.readAuthKey,
+          readDefaultDeviceName: this.#options.readDefaultDeviceName,
           ...(this.#options.readRouteAuthorization === undefined
             ? {}
             : { readRouteAuthorization: this.#options.readRouteAuthorization }),

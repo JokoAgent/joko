@@ -27,7 +27,7 @@ describe("Mobile Settings product chain", () => {
     fixture = await OrchestratorE2eFixture.start();
     const begun = await fixture.anonymous.connection.beginPairing({
       deviceDisplayName: "Joko Settings phone",
-      deviceKind: DeviceKind.MOBILE,
+      deviceKind: DeviceKind.MOBILE, deviceNameSource: { defaultDisplayName: "Fixture phone" },
       platform: "android",
       appVersion: "0.1.0"
     });
@@ -37,7 +37,7 @@ describe("Mobile Settings product chain", () => {
       challengeId,
       humanCode: fixture.pairingCode(challengeId),
       deviceDisplayName: "Joko Settings phone",
-      deviceKind: DeviceKind.MOBILE,
+      deviceKind: DeviceKind.MOBILE, deviceNameSource: { defaultDisplayName: "Fixture phone" },
       platform: "android",
       appVersion: "0.1.0"
     })).result;

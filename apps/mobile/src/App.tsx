@@ -56,6 +56,7 @@ import {
   type ConnectionArtworkVariant
 } from "./connection-artwork";
 import { MOBILE_FILE_SHARE_MAXIMUM_BYTES, mobileNetwork } from "./network";
+import { mobileDeviceNameSource } from "./mobile-device-name";
 import { mobileDiscovery } from "./native-lan-discovery";
 import {
   mobileAttachmentCamera,
@@ -319,7 +320,8 @@ const client = new MobileClient(
   mobileFileShare,
   mobileOfflineCache,
   mobileReadOnlyDictionaryCache,
-  mobileFilesThumbnailCache
+  mobileFilesThumbnailCache,
+  () => mobileDeviceNameSource(Constants.deviceName, Platform.OS)
 );
 const readOnlyDictionary = new MobileVoiceDictionaryReadOnlyController(mobileReadOnlyDictionaryCache,
   (profileId, signal) => client.voiceDictionaryReadOnlyTransport(profileId, signal));
@@ -953,7 +955,7 @@ function ConnectionScreen({ colors, state, locale, dark, onBack, onConnected }: 
   dark: boolean; onBack?: () => void; onConnected: () => void;
 }) {
   const [origin, setOrigin] = useState(state.candidate?.origin ?? "");
-  const [deviceName, setDeviceName] = useState(`${Platform.OS === "ios" ? "iPhone/iPad" : "Android"} Joko`);
+  const [deviceName, setDeviceName] = useState(() => mobileDeviceNameSource(Constants.deviceName, Platform.OS).defaultDisplayName);
   const [code, setCode] = useState("");
   const [inspected, setInspected] = useState(false);
   const [localError, setLocalError] = useState("");

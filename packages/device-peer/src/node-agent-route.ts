@@ -14,6 +14,7 @@ import {
   DevicePeerRetireReason,
   DevicePeerService,
   DeviceKind,
+  DeviceNameSourceSchema,
   type OpenDevicePeerAgentCommandRouteResponse,
   OpenDevicePeerAgentCommandRouteRequestSchema,
   type OpenDevicePeerAgentRouteRequest,
@@ -66,6 +67,8 @@ export interface NodeDevicePeerAgentRouteOptions {
   readonly executor: Pick<NodeDevicePeerAgentExecutor, "capabilities" | "execute" | "retire">;
   readonly signal: AbortSignal;
   readonly readAuthKey: (credentialId: string) => Promise<string | undefined>;
+  /** Read the current name in the trusted native host on every route attempt. */
+  readonly readDefaultDeviceName: () => string;
   /** Desktop supplies its independent Main-only bootstrap authorization. */
   readonly readRouteAuthorization?: (credentialId: string) => Promise<string | undefined>;
   readonly isAuthorityCurrent: (
@@ -140,6 +143,10 @@ export async function runNodeDevicePeerAgentRoute(
     }
     await assertAuthority(options, routeController.signal);
 
+    const defaultDisplayName = options.readDefaultDeviceName().trim();
+    if (defaultDisplayName.length === 0 || defaultDisplayName.length > 128 || /[\u0000-\u001f\u007f]/u.test(defaultDisplayName)) {
+      throw routeFailure();
+    }
     const helloRequestId = freshRequestId(requestIds);
     queue.push(create(OpenDevicePeerAgentRouteRequestSchema, {
       targetDeviceId: options.connection.deviceId,
@@ -148,7 +155,8 @@ export async function runNodeDevicePeerAgentRoute(
       payload: {
         case: "hello",
         value: create(DevicePeerAgentHelloSchema, {
-          capabilities: [...options.executor.capabilities]
+          capabilities: [...options.executor.capabilities],
+          deviceNameSource: create(DeviceNameSourceSchema, { defaultDisplayName })
         })
       }
     }));

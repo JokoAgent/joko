@@ -88,8 +88,29 @@ export interface ResourceUsageEventPayload {
   readonly action: ResourceUsageAction;
 }
 
+/** Immutable owner-level Device content, independent of any Session routing. */
+export interface DeviceContentProjection {
+  readonly id: string;
+  readonly name: string;
+  readonly defaultName: string;
+  readonly manualName?: string;
+  readonly kind: "unspecified" | "web" | "desktop" | "service" | "mobile";
+  readonly platform: string;
+  readonly appVersion: string;
+  readonly revoked: boolean;
+  readonly remoteControlEnabled: boolean;
+  readonly pairedAt: number;
+  readonly lastSeenAt?: number;
+  readonly connectionIds: readonly string[];
+  readonly online: boolean;
+  readonly revision: string;
+  readonly versionUpdatedAt: number;
+}
+
 export type EventPayload =
   | { readonly type: "run_state"; readonly state: RunState; readonly error?: PublicError }
+  /** Store-owned observation; never emitted by a Session adapter. */
+  | { readonly type: "device_changed"; readonly device: DeviceContentProjection }
   /** Content-free signal that the durable Session projection changed. */
   | { readonly type: "session_changed" }
   | { readonly type: "text_delta"; readonly blockId: string; readonly delta: string; readonly contentIndex?: number; readonly nativeHistory?: NativeHistoryEventContext }

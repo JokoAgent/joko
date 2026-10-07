@@ -329,6 +329,7 @@ export type DesktopUpdateRelaunchResult =
 
 export interface DesktopAppInfo {
   readonly name: string;
+  readonly defaultDeviceName: string;
   readonly version: string;
   readonly platform: NodeJS.Platform;
   readonly electronVersion: string;

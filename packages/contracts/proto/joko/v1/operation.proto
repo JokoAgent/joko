@@ -233,6 +233,7 @@ message OperationMutation {
     CreateCollaborationScopeMutation create_collaboration_scope = 212;
     UpdateCollaborationScopeMutation update_collaboration_scope = 213;
     DeleteCollaborationScopeMutation delete_collaboration_scope = 214;
+    ResetDeviceNameMutation reset_device_name = 217;
   }
 }
 
@@ -530,6 +531,10 @@ message UpdateTargetMutation {
 message RenameDeviceMutation {
   string device_id = 1;
   string display_name = 2;
+}
+
+message ResetDeviceNameMutation {
+  string device_id = 1;
 }
 
 message SetDeviceRemoteControlEnabledMutation {

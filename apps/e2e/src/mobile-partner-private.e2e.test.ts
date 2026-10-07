@@ -24,8 +24,8 @@ interface MobileCredential {
 }
 
 interface MobilePartnerNetwork {
-  requestPairing(origin: string, deviceName: string, platform: string): Promise<{ challengeId: string }>;
-  completePairing(origin: string, challengeId: string, code: string, deviceName: string, platform: string):
+  requestPairing(origin: string, deviceName: string, platform: string, deviceNameSource: { defaultDisplayName: string }): Promise<{ challengeId: string }>;
+  completePairing(origin: string, challengeId: string, code: string, deviceName: string, platform: string, deviceNameSource: { defaultDisplayName: string }):
     Promise<{ credential: MobileCredential }>;
   readOwner(credential: MobileCredential): Promise<{ connection: { connectionId: string }; device: { deviceId: string } }>;
   listPartners(credential: MobileCredential): Promise<readonly {
@@ -85,9 +85,10 @@ describe("mobile Partner private HTTP product chain", () => {
     const second = await createPartner(fixture, manager, "Beryl", "spark");
     targetPartnerId = second.partnerId;
 
-    const begun = await mobileNetwork.requestPairing(fixture.baseUrl, "Partner phone", "android");
+    const deviceNameSource = { defaultDisplayName: "Fixture partner phone" };
+    const begun = await mobileNetwork.requestPairing(fixture.baseUrl, "Partner phone", "android", deviceNameSource);
     const { credential } = await mobileNetwork.completePairing(
-      fixture.baseUrl, begun.challengeId, fixture.pairingCode(begun.challengeId), "Partner phone", "android"
+      fixture.baseUrl, begun.challengeId, fixture.pairingCode(begun.challengeId), "Partner phone", "android", deviceNameSource
     );
     const owner = await mobileNetwork.readOwner(credential);
     expect(owner.connection.connectionId).toBe(credential.connectionId);

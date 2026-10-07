@@ -41,6 +41,7 @@ import {
   type PairedCredential
 } from "./network";
 import type { Event, Operation, Schedule, ScheduleInput, SessionMessageSearchMatch, Snapshot, WorkspaceEntry, WorkspaceFileChange } from "@joko/contracts";
+import { mobileDeviceNameSource, type MobileDeviceNameSourceProvider } from "./mobile-device-name";
 import type { MobileInteractionDraftIdentity } from "./interaction-draft-store";
 import { MobileComposerDraftStore } from "./composer-draft-store";
 import { MobileNewTaskDraftStore } from "./new-task-draft-store";
@@ -95,7 +96,7 @@ const connection = create(ConnectionSchema, {
   state: ConnectionState.CONNECTED, version: { revision: { value: 4n } }
 });
 const device = create(DeviceSchema, {
-  deviceId: credential.deviceId, displayName: "Phone", kind: DeviceKind.MOBILE, platform: "android",
+  deviceId: credential.deviceId, displayName: "Phone", defaultDisplayName: "Phone", kind: DeviceKind.MOBILE, platform: "android",
   connectionIds: [credential.connectionId], presence: DevicePresenceState.ONLINE, version: { revision: { value: 5n } }
 });
 const otherCredential: PairedCredential = {
@@ -112,7 +113,7 @@ const otherConnection = create(ConnectionSchema, {
   state: ConnectionState.CONNECTED, version: { revision: { value: 6n } }
 });
 const otherDevice = create(DeviceSchema, {
-  deviceId: otherCredential.deviceId, displayName: otherCredential.displayName, kind: DeviceKind.MOBILE,
+  deviceId: otherCredential.deviceId, displayName: otherCredential.displayName, defaultDisplayName: otherCredential.displayName, kind: DeviceKind.MOBILE,
   platform: "ios", connectionIds: [otherCredential.connectionId], presence: DevicePresenceState.OFFLINE,
   version: { revision: { value: 7n } }
 });
@@ -1047,7 +1048,11 @@ function fakeNetwork(): MobileNetwork {
 
 function projectedNetwork(projected: Snapshot): MobileNetwork {
   const network = fakeNetwork();
-  network.readOwner = vi.fn(async () => ({ connection, device, snapshot: projected }));
+  network.readOwner = vi.fn(async () => ({
+    connection: projected.connections.find((item) => item.connectionId === credential.connectionId) ?? connection,
+    device: projected.devices.find((item) => item.deviceId === credential.deviceId) ?? device,
+    snapshot: projected
+  }));
   network.readSession = vi.fn(async () => projected);
   return network;
 }
@@ -1657,11 +1662,12 @@ function client(
   modelPreviewFiles?: MobileModelPreviewFiles,
   fileShare?: Pick<MobileFileShare, "perform">,
   offlineCache?: Pick<MobileOfflineCache, "load" | "save" | "clear">,
-  readOnlyDictionaryCache?: { clear(profileId: string): Promise<void> }
+  readOnlyDictionaryCache?: { clear(profileId: string): Promise<void> },
+  deviceNameSource: MobileDeviceNameSourceProvider = () => mobileDeviceNameSource(undefined, "android")
 ) {
   const instance = new MobileClient(network, storage, discovery ?? { scan: vi.fn(async () => []) }, newId, "android", now,
     clearInteractionDraft, drafts.newTask, drafts.composer, attachmentFiles, mediaPreviewFiles, pdfPreviewFiles,
-    modelPreviewFiles, fileShare, offlineCache, readOnlyDictionaryCache);
+    modelPreviewFiles, fileShare, offlineCache, readOnlyDictionaryCache, undefined, deviceNameSource);
   clients.push(instance);
   return instance;
 }
@@ -2685,7 +2691,7 @@ describe("native mobile connection and operation ownership", () => {
     expect(app.state.automaticProfileId).toBe(otherCredential.profileId);
     expect(saved.storage.loadCredential).toHaveBeenCalledWith(otherCredential.profileId);
     expect(saved.storage.loadCredential).not.toHaveBeenCalledWith(credential.profileId);
-    expect(network.readOwner).toHaveBeenCalledWith(otherCredential, expect.any(AbortSignal));
+    expect(network.readOwner).toHaveBeenCalledWith(otherCredential, expect.objectContaining({ defaultDisplayName: "Joko android" }), expect.any(AbortSignal));
   });
 
   it("restores a current-v1 task copy before anonymous inspection and retries into authoritative online state", async () => {
@@ -2929,7 +2935,7 @@ describe("native mobile connection and operation ownership", () => {
     vi.mocked(network.readOwner).mockImplementationOnce(() => new Promise((resolve) => { resolveCandidate = resolve; }));
 
     const switching = app.connectSaved(otherCredential.profileId, false);
-    await vi.waitFor(() => expect(network.readOwner).toHaveBeenCalledWith(otherCredential, expect.any(AbortSignal)));
+    await vi.waitFor(() => expect(network.readOwner).toHaveBeenCalledWith(otherCredential, expect.objectContaining({ defaultDisplayName: "Joko android" }), expect.any(AbortSignal)));
     expect(app.state).toMatchObject({
       status: "connected",
       activeProfileId: credential.profileId,
@@ -3131,7 +3137,7 @@ describe("native mobile connection and operation ownership", () => {
 
     await vi.waitFor(() => expect(network.readOwner).toHaveBeenCalledOnce());
     expect(network.inspect).toHaveBeenCalledWith(credential.origin, expect.any(AbortSignal));
-    expect(network.readOwner).toHaveBeenCalledWith(credential, expect.any(AbortSignal));
+    expect(network.readOwner).toHaveBeenCalledWith(credential, expect.objectContaining({ defaultDisplayName: "Joko android" }), expect.any(AbortSignal));
     expect(app.state.status).toBe("connected");
   });
 
@@ -3331,6 +3337,7 @@ describe("native mobile connection and operation ownership", () => {
       result: { payload: { case: "device", value: create(DeviceSchema, {
         ...device,
         displayName: "Field phone",
+        manualDisplayName: "Field phone",
         version: create(EntityVersionSchema, { revision: create(RevisionSchema, { value: 6n }) })
       }) } }
     }));
@@ -3369,7 +3376,10 @@ describe("native mobile connection and operation ownership", () => {
     vi.mocked(network.getOperation).mockResolvedValueOnce(create(OperationSchema, {
       operationId: "operation-1",
       connectionId: credential.connectionId,
-      state: OperationState.SUCCEEDED
+      state: OperationState.SUCCEEDED,
+      result: { payload: { case: "device", value: create(DeviceSchema, {
+        ...device, displayName: "Private phone label", manualDisplayName: "Private phone label"
+      }) } }
     }));
 
     await app.reconcile();
@@ -3379,6 +3389,124 @@ describe("native mobile connection and operation ownership", () => {
     expect(network.readOwner).toHaveBeenCalledTimes(2);
   });
 
+  it("reports a fresh current-device native source on Begin, Complete and owner reads", async () => {
+    const network = fakeNetwork();
+    const saved = memoryStorage();
+    let nativeName = "First native phone";
+    const app = client(network, saved.storage, undefined, undefined, undefined, undefined, undefined,
+      undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+      () => mobileDeviceNameSource(nativeName, "android"));
+    await app.start();
+    await app.requestPairing(credential.origin, "Manual phone");
+    expect(network.requestPairing).toHaveBeenLastCalledWith(credential.origin, "Manual phone", "android",
+      expect.objectContaining({ defaultDisplayName: "First native phone" }), expect.any(AbortSignal));
+    nativeName = "Second native phone";
+    await app.pair(credential.origin, "123456", "Manual phone");
+    expect(network.completePairing).toHaveBeenLastCalledWith(credential.origin, "challenge", "123456", "Manual phone", "android",
+      expect.objectContaining({ defaultDisplayName: "Second native phone" }), expect.any(AbortSignal));
+    nativeName = "Third native phone";
+    await app.refresh();
+    expect(network.readOwner).toHaveBeenLastCalledWith(credential,
+      expect.objectContaining({ defaultDisplayName: "Third native phone" }), expect.any(AbortSignal));
+  });
+
+  it.each([false, true])("preserves explicit current-device default-name overrides, existing override=%s", async (alreadyManual) => {
+    const current = create(DeviceSchema, { ...device, manualDisplayName: alreadyManual ? "Phone" : undefined });
+    const network = projectedNetwork(create(SnapshotSchema, { ...snapshot, devices: [current] }));
+    const saved = memoryStorage(credential);
+    const app = client(network, saved.storage);
+    await app.start();
+    vi.mocked(network.submit).mockImplementationOnce(async (_credential, operationId, mutation) => create(OperationSchema, {
+      operationId, connectionId: credential.connectionId, state: OperationState.SUCCEEDED, mutation,
+      result: { payload: { case: "device", value: create(DeviceSchema, { ...current, manualDisplayName: "Phone" }) } }
+    }));
+    expect(await app.renameCurrentDevice(credential.deviceId, "Phone")).toBe(true);
+    expect(network.submit).toHaveBeenCalledTimes(alreadyManual ? 0 : 1);
+  });
+
+  it("resets only the current-device manual name through CAS and the shared body-free receipt", async () => {
+    let current = create(DeviceSchema, { ...device, displayName: "Manual phone", manualDisplayName: "Manual phone" });
+    const network = fakeNetwork();
+    vi.mocked(network.readOwner).mockImplementation(async () => ({ connection, device: current,
+      snapshot: create(SnapshotSchema, { ...snapshot, devices: [current] }) }));
+    const saved = memoryStorage(credential);
+    const app = client(network, saved.storage);
+    await app.start();
+    vi.mocked(network.submit).mockImplementationOnce(async (_credential, operationId, mutation) => {
+      current = create(DeviceSchema, { ...device, version: create(EntityVersionSchema, { revision: { value: 6n } }) });
+      return create(OperationSchema, { operationId, connectionId: credential.connectionId, state: OperationState.SUCCEEDED, mutation,
+        result: { payload: { case: "device", value: current } } });
+    });
+    expect(await app.resetCurrentDevice(credential.deviceId)).toMatchObject({ defaultDisplayName: "Phone", displayName: "Phone" });
+    expect(vi.mocked(network.submit).mock.calls[0]?.[2]).toMatchObject({
+      preconditions: [{ entity: { kind: EntityKind.DEVICE, id: credential.deviceId }, expectedRevision: { value: 5n } }],
+      payload: { case: "resetDeviceName", value: { deviceId: credential.deviceId } }
+    });
+    expect(network.readOwner).toHaveBeenCalledTimes(2);
+    expect(app.state.error).toBeUndefined();
+    expect(app.state.owner?.devices[0]?.manualDisplayName).toBeUndefined();
+    expect(saved.pending()).toEqual([]);
+    await expect(app.resetCurrentDevice(otherCredential.deviceId)).rejects.toThrow(/Only the device/u);
+    expect(network.submit).toHaveBeenCalledOnce();
+  });
+
+  it("retains an unknown current-device reset across restart and blocks rename/reset replay", async () => {
+    const network = fakeNetwork();
+    const saved = memoryStorage(credential);
+    const app = client(network, saved.storage);
+    await app.start();
+    vi.mocked(network.submit).mockRejectedValueOnce(new Error("reply lost"));
+    expect(await app.resetCurrentDevice(credential.deviceId)).toBeUndefined();
+    expect(saved.pending()).toEqual([{ operationId: "operation-1", connectionId: credential.connectionId,
+      kind: "device-rename", targetDeviceId: credential.deviceId, state: "unknown" }]);
+    await expect(app.renameCurrentDevice(credential.deviceId, "Manual phone")).rejects.toThrow(/unresolved result/u);
+    await expect(app.resetCurrentDevice(credential.deviceId)).rejects.toThrow(/unresolved result/u);
+    app.dispose();
+    vi.mocked(network.getOperation).mockResolvedValue(create(OperationSchema, {
+      operationId: "operation-1", connectionId: credential.connectionId, state: OperationState.SUCCEEDED,
+      result: { payload: { case: "device", value: device } }
+    }));
+    const restarted = client(network, saved.storage);
+    await restarted.start();
+    expect(saved.pending()).toEqual([]);
+    expect(restarted.state.owner?.devices[0]?.displayName).toBe("Phone");
+    expect(network.submit).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    { invalid: "wrong Device", patch: { deviceId: "other-device" } },
+    { invalid: "manual still present", patch: { manualDisplayName: "Phone" } },
+    { invalid: "empty default", patch: { defaultDisplayName: "" } },
+    { invalid: "different effective name", patch: { displayName: "Different" } },
+    { invalid: "missing revision", patch: { version: undefined } }
+  ])("rejects a current-device reset with $invalid before consuming its receipt", async ({ patch }) => {
+    const network = fakeNetwork();
+    const saved = memoryStorage(credential);
+    const app = client(network, saved.storage);
+    await app.start();
+    vi.mocked(network.submit).mockImplementationOnce(async (_credential, operationId) => create(OperationSchema, {
+      operationId, connectionId: credential.connectionId, state: OperationState.SUCCEEDED,
+      result: { payload: { case: "device", value: create(DeviceSchema, { ...device, ...patch }) } }
+    }));
+    await expect(app.resetCurrentDevice(credential.deviceId)).rejects.toThrow(/expected Device result/u);
+    expect(saved.pending()).toMatchObject([{ kind: "device-rename", state: "unknown", targetDeviceId: credential.deviceId }]);
+    await expect(app.renameCurrentDevice(credential.deviceId, "Manual phone")).rejects.toThrow(/unresolved result/u);
+    expect(network.submit).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    { invalid: "revision", patch: { version: create(EntityVersionSchema, { revision: { value: 6n } }) } },
+    { invalid: "default source", patch: { defaultDisplayName: "Other source" } },
+    { invalid: "manual presence", patch: { manualDisplayName: "Phone" } }
+  ])("rejects a current-device owner read mixed with a different Snapshot $invalid", async ({ patch }) => {
+    const network = fakeNetwork();
+    vi.mocked(network.readOwner).mockResolvedValue({ connection, device: create(DeviceSchema, { ...device, ...patch }), snapshot });
+    const app = client(network, memoryStorage(credential).storage);
+    await app.start();
+    expect(app.state.status).not.toBe("connected");
+    expect(network.submit).not.toHaveBeenCalled();
+  });
+
   it("fails current-device rename closed for ambiguous owner identity or a missing Device revision", async () => {
     const ambiguous = projectedNetwork(create(SnapshotSchema, {
       ...snapshot,
@@ -3386,9 +3514,7 @@ describe("native mobile connection and operation ownership", () => {
     }));
     const ambiguousApp = client(ambiguous, memoryStorage(credential).storage);
     await ambiguousApp.start();
-    expect(ambiguousApp.state.status).toBe("connected");
-    await expect(ambiguousApp.renameCurrentDevice(credential.deviceId, "Renamed"))
-      .rejects.toThrow(/exact current profile, connection, mobile device, server/);
+    expect(ambiguousApp.state.status).not.toBe("connected");
     expect(ambiguous.submit).not.toHaveBeenCalled();
 
     const noRevision = projectedNetwork(create(SnapshotSchema, {
