@@ -42,6 +42,9 @@ describe("timeline text attachment eligibility", () => {
     expect(timelineArtifactSupportsTextPreview(artifact)).toBe(true);
     expect(timelineArtifactSupportsTextPreview({ kind: "tool", fileName: "payload.bin", mediaType: "application/problem+json" })).toBe(true);
     expect(timelineArtifactSupportsTextPreview({ kind: "file", fileName: "Dockerfile", mediaType: "application/octet-stream" })).toBe(true);
+    for (const fileName of ["main.zig", "events.jsonl", "movie.srt", "Gemfile", ".gitignore", ".env", "production.env.local"]) {
+      expect(timelineArtifactSupportsTextPreview({ kind: "file", fileName, mediaType: "application/octet-stream" })).toBe(true);
+    }
     expect(timelineArtifactSupportsTextPreview({ kind: "file", fileName: "archive.zip", mediaType: "application/zip" })).toBe(false);
     expect(timelineArtifactSupportsTextPreview({ kind: "image", fileName: "image.svg", mediaType: "image/svg+xml" })).toBe(false);
   });
@@ -79,18 +82,19 @@ describe("timeline text attachment lightbox", () => {
     const onClose = vi.fn();
     const onDownload = vi.fn();
     const loadUrl = vi.fn(async () => "blob:https://joko.test/preview");
-    await mount({ artifact, loadUrl, onDownload, onClose });
+    const sourceArtifact = { ...artifact, fileName: "main.zig", mediaType: "application/octet-stream" };
+    await mount({ artifact: sourceArtifact, loadUrl, onDownload, onClose });
 
     await flush();
     expect(document.body.textContent).toContain(text);
     expect(loadUrl).toHaveBeenCalledWith("blob-1");
 
-    await click(button(`${labels.preview}: notes.md`));
-    expect(writeText).toHaveBeenCalledWith("notes.md");
+    await click(button(`${labels.preview}: main.zig`));
+    expect(writeText).toHaveBeenCalledWith("main.zig");
     await click(button(labels.copy));
     expect(writeText).toHaveBeenCalledWith(text);
     await click(button(labels.download));
-    expect(onDownload).toHaveBeenCalledWith("blob-1", "notes.md", { ownerDocument: document, signal: expect.any(AbortSignal) });
+    expect(onDownload).toHaveBeenCalledWith("blob-1", "main.zig", { ownerDocument: document, signal: expect.any(AbortSignal) });
 
     act(() => document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true })));
     expect(onClose).toHaveBeenCalledOnce();

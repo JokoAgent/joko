@@ -9,38 +9,7 @@ export const WORKSPACE_SEARCH_MAX_MATCHES = 1_000;
 const WORKSPACE_SEARCH_MAX_MATCHES_PER_FILE = 200;
 const KILL_GRACE_MS = 200;
 
-// This whitelist is the single product-owned text-file surface. Search is a product capability,
-// not an arbitrary ripgrep pass over PDFs, Office documents, or binaries.
-export const WORKSPACE_SUPPORTED_TEXT_EXTENSIONS = [
-  ".js", ".ts", ".tsx", ".jsx", ".mjs", ".cjs", ".py", ".go", ".rs", ".java",
-  ".c", ".cpp", ".cc", ".cxx", ".h", ".hpp", ".hh", ".cs", ".rb", ".php",
-  ".swift", ".kt", ".kts", ".scala", ".groovy", ".coffee",
-  ".lua", ".dart", ".r", ".pl", ".pm", ".ex", ".exs", ".elm",
-  ".clj", ".cljs", ".cljc", ".fs", ".fsi", ".fsx", ".ml", ".mli",
-  ".hs", ".erl", ".hrl", ".zig", ".nim", ".vim", ".applescript",
-  ".sh", ".bash", ".zsh", ".fish", ".ps1", ".psm1", ".bat", ".cmd",
-  ".html", ".htm", ".xhtml", ".css", ".scss", ".sass", ".less", ".styl",
-  ".vue", ".svelte", ".astro", ".svg",
-  ".json", ".json5", ".jsonc", ".jsonl", ".ndjson", ".geojson",
-  ".yaml", ".yml", ".xml", ".toml", ".ini", ".conf", ".cfg", ".properties",
-  ".plist", ".tf", ".tfvars", ".hcl", ".gradle", ".cmake", ".mk", ".mak",
-  ".lock", ".csv", ".tsv",
-  ".md", ".markdown", ".mdx", ".rst", ".tex", ".bib", ".cls", ".sty",
-  ".adoc", ".asciidoc", ".org", ".txt", ".text",
-  ".log", ".diff", ".patch", ".srt", ".vtt", ".po", ".pot",
-  ".sln", ".csproj", ".vbproj", ".fsproj", ".gemspec", ".podspec", ".cabal",
-  ".sql", ".graphql", ".proto", ".dockerfile", ".rss", ".atom",
-  ".gitignore", ".gitattributes", ".gitconfig", ".gitmodules", ".gitkeep",
-  ".dockerignore", ".eslintignore", ".prettierignore", ".npmignore",
-  ".editorconfig", ".env", ".env.local", ".env.development", ".env.production", ".env.example",
-  ".prettierrc", ".eslintrc", ".babelrc", ".npmrc", ".yarnrc",
-  ".stylelintrc", ".huskyrc", ".lintstagedrc", ".browserslistrc",
-  ".nvmrc", ".node-version", ".python-version", ".ruby-version", ".tool-versions"
-] as const;
-
-export const WORKSPACE_KNOWN_TEXT_FILENAMES = [
-  "dockerfile", "makefile", "gemfile", "rakefile", "procfile", "vagrantfile", "jenkinsfile", "cmakelists"
-] as const;
+import { textFileExtensions, textFileNames } from "@joko/contracts";
 
 export interface WorkspaceFileIndex {
   readonly paths: readonly string[];
@@ -79,8 +48,8 @@ export function workspaceTextSearchArguments(query: string, caseSensitive: boole
     `--max-count=${WORKSPACE_SEARCH_MAX_MATCHES_PER_FILE}`,
     "--hidden"
   ];
-  for (const extension of WORKSPACE_SUPPORTED_TEXT_EXTENSIONS) args.push("--glob", `*${extension}`);
-  for (const filename of WORKSPACE_KNOWN_TEXT_FILENAMES) args.push("--iglob", filename);
+  for (const extension of textFileExtensions) args.push("--glob", `*${extension}`);
+  for (const filename of textFileNames) args.push("--iglob", filename);
   if (!caseSensitive) args.push("-i");
   args.push("--", query, ".");
   return args;

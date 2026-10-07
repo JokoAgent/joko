@@ -10,6 +10,18 @@ import type {
   MobilePickedAttachmentCandidate
 } from "./mobile-attachments";
 
+vi.mock("expo-crypto", async () => {
+  const { createHash } = await import("node:crypto");
+  return {
+    CryptoDigestAlgorithm: { SHA256: "SHA-256" },
+    digest: vi.fn(async (algorithm: string, bytes: unknown) => {
+      if (!(bytes instanceof Uint8Array)) throw new Error("The native digest bridge requires a TypedArray.");
+      if (algorithm !== "SHA-256") throw new Error("Unsupported fixture digest algorithm.");
+      return Uint8Array.from(createHash("sha256").update(bytes).digest()).buffer;
+    })
+  };
+});
+
 const policy: MobileAttachmentPolicy = {
   images: true,
   files: true,
@@ -54,6 +66,28 @@ function fileFixture(files: readonly MobilePickedAttachmentCandidate[], sources:
 const digest = async (bytes: Uint8Array): Promise<string> => bytes[0] === 1 ? "a".repeat(64) : "b".repeat(64);
 
 describe("mobile durable attachment files", () => {
+  it("stages and re-verifies a known SHA-256 vector through the default native TypedArray digest bridge", async () => {
+    const bytes = Uint8Array.from([97, 98, 99]);
+    const expectedSha256 = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+    const fixture = fileFixture([{
+      uri: "content://picker/vector", fileName: "vector.pdf", mediaType: "application/pdf", byteSize: bytes.length
+    }], { "content://picker/vector": bytes });
+    const { CryptoDigestAlgorithm, digest: nativeDigest } = await import("expo-crypto");
+    vi.mocked(nativeDigest).mockClear();
+    const files = new MobileAttachmentFiles(fixture.driver);
+    const [staged] = await files.pickAndStage("profile", [], policy, () => "native-vector");
+    expect(staged).toMatchObject({ attachmentId: "native-vector", sha256Hex: expectedSha256 });
+    const restarted = new MobileAttachmentFiles(fixture.driver);
+    await expect(restarted.verifyForUpload("profile", staged!)).resolves.toMatchObject({
+      byteSize: bytes.length, sha256Hex: expectedSha256
+    });
+    expect(nativeDigest).toHaveBeenNthCalledWith(1, CryptoDigestAlgorithm.SHA256, bytes);
+    expect(nativeDigest).toHaveBeenNthCalledWith(2, CryptoDigestAlgorithm.SHA256, bytes);
+    fixture.stored.get(fixture.key("profile", "native-vector"))!.bytes[0] = 100;
+    await expect(restarted.verifyForUpload("profile", staged!)).rejects.toThrow(/SHA-256/u);
+    expect(nativeDigest).toHaveBeenCalledTimes(3);
+  });
+
   it("treats picker cancellation as no change without allocating an identity", async () => {
     const fixture = fileFixture([], {});
     vi.mocked(fixture.driver.pick).mockResolvedValue({ canceled: true, files: [] });

@@ -50,6 +50,7 @@ export function MobileComposerAtomSheet({
           </Pressable>
         </View>
         {atom.kind === "quote" && <Text style={[styles.help, { color: colors.muted }]}>{mobileMessage(locale, "atom.quoteSource", { task: atom.sourceSessionId })}</Text>}
+        {atom.kind === "file-quote" && <Text selectable style={[styles.help, { color: colors.muted }]}>{atom.sourcePath}</Text>}
         {atom.kind === "route-reference" && <Text style={[styles.help, { color: colors.muted }]}>
           {atom.routeKind === "path"
             ? mobileMessage(locale, "atom.workspace", {
@@ -64,7 +65,7 @@ export function MobileComposerAtomSheet({
             })} {mobileMessage(locale, "atom.noNavigation")}
         </Text>}
         <ScrollView keyboardShouldPersistTaps="handled" contentContainerStyle={styles.content}>
-          {atom.kind === "quote"
+          {atom.kind === "quote" || atom.kind === "file-quote"
             ? <Text selectable accessibilityLabel={mobileMessage(locale, "atom.quotedText")}
                 style={[styles.readText, { color: colors.ink, backgroundColor: colors.background, borderColor: colors.border }]}>{atom.text}</Text>
             : atom.kind === "pasted-text"

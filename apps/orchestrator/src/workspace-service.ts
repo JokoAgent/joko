@@ -2,11 +2,17 @@ import { createHash, randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import type { Stats } from "node:fs";
 import { type FileHandle, lstat, mkdir, open, readdir, readFile, realpath, rename, rm, stat, unlink } from "node:fs/promises";
-import { basename, dirname, extname, isAbsolute, relative, resolve, sep } from "node:path";
+import { dirname, extname, isAbsolute, relative, resolve, sep } from "node:path";
 import { reviewImageRasterMimeByExtension, workspaceEntryAbsentRevision } from "@joko/contracts";
 import { JokoError, type RemoteWorkspaceBinding } from "@joko/core";
 import { isWithin } from "@joko/core/policy";
 import createIgnore from "ignore";
+import {
+  decodeWorkspaceTextPreview,
+  isWorkspaceTextMediaType as isTextMediaType,
+  workspaceMediaTypeForPath as inferMediaType,
+  workspaceRasterMediaTypes
+} from "./workspace-file-media.js";
 
 import {
   InMemoryWorkspaceChangeJournal,
@@ -704,23 +710,21 @@ export class WorkspaceService {
     );
     const stableObservedRevision = metadataFileRevision(snapshot.info);
     if (content.includes(0)) return { entry, observedRevision: stableObservedRevision, mediaType: "application/octet-stream", truncated: false };
-    if (content.byteLength === snapshot.info.size) {
-      try {
-        new TextDecoder("utf-8", { fatal: true }).decode(content);
-      } catch {
-        return { entry, observedRevision: stableObservedRevision, mediaType: "application/octet-stream", truncated: false };
-      }
-    } else if (mediaType === "application/octet-stream") {
-      // An unknown, oversized file cannot be proven to be complete UTF-8
-      // within the bounded preview and therefore stays binary/fail-closed.
+    if (content.byteLength !== snapshot.info.size && mediaType === "application/octet-stream") {
+      // Unknown oversized files still require complete UTF-8 proof.
       return { entry, observedRevision: stableObservedRevision, mediaType, truncated: false };
+    }
+    try {
+      decodeWorkspaceTextPreview(content, content.byteLength < snapshot.info.size);
+    } catch {
+      return { entry, observedRevision: stableObservedRevision, mediaType: "application/octet-stream", truncated: false };
     }
     const visible = content.subarray(0, Math.min(content.byteLength, visibleMaximum));
     return {
       entry,
       observedRevision: stableObservedRevision,
       mediaType: mediaType === "application/octet-stream" ? "text/plain" : mediaType,
-      text: visible.toString("utf8"),
+      text: decodeWorkspaceTextPreview(visible, visible.byteLength < snapshot.info.size),
       truncated: snapshot.info.size > visible.byteLength
     };
   }
@@ -4165,89 +4169,11 @@ export function selectDiffHunkPatch(raw: string, hunkIndex: number): string {
   return `${[...header, ...selected].join("\n")}\n`;
 }
 
-/**
- * Exact audited FileBodyView inline-image set. Git Review intentionally accepts
- * additional raster extensions, so its broader shared map must not be reused.
- */
-const WORKSPACE_RASTER_MEDIA_BY_EXTENSION: ReadonlyMap<string, string> = new Map([
-  [".png", "image/png"],
-  [".jpg", "image/jpeg"],
-  [".jpeg", "image/jpeg"],
-  [".gif", "image/gif"],
-  [".webp", "image/webp"],
-  [".bmp", "image/bmp"],
-  [".ico", "image/x-icon"]
-]);
-
-const WORKSPACE_BINARY_MEDIA_BY_EXTENSION: ReadonlyMap<string, string> = new Map([
-  [".wasm", "application/wasm"],
-  [".woff", "font/woff"],
-  [".woff2", "font/woff2"],
-  [".ttf", "font/ttf"],
-  [".otf", "font/otf"],
-  [".mp3", "audio/mpeg"],
-  [".wav", "audio/wav"],
-  [".ogg", "audio/ogg"],
-  [".oga", "audio/ogg"],
-  [".m4a", "audio/mp4"],
-  [".aac", "audio/aac"],
-  [".flac", "audio/flac"],
-  [".opus", "audio/ogg"],
-  [".mp4", "video/mp4"],
-  [".m4v", "video/x-m4v"],
-  [".mov", "video/quicktime"],
-  [".webm", "video/webm"],
-  [".avi", "video/x-msvideo"],
-  [".mkv", "video/x-matroska"]
-]);
-
-/** The code/Markdown filename surface must remain text even when a
- * preview window is shorter than the file. Unknown extensions still use the
- * bounded UTF-8 probe below and therefore remain fail-closed when oversized. */
-const WORKSPACE_KNOWN_TEXT_EXTENSIONS = new Set([
-  ".txt", ".log", ".csv", ".tsv",
-  ".json", ".jsonc", ".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx",
-  ".py", ".rb", ".go", ".rs", ".java", ".kt", ".swift",
-  ".c", ".h", ".cpp", ".cc", ".cxx", ".hpp", ".cs", ".scala", ".sc",
-  ".groovy", ".gradle", ".pl", ".pm", ".r", ".hs", ".proto", ".php",
-  ".dart", ".lua", ".sh", ".bash", ".zsh", ".ps1",
-  ".yaml", ".yml", ".toml", ".ini",
-  ".html", ".htm", ".vue", ".svelte",
-  ".css", ".scss", ".sass", ".less", ".sql", ".graphql", ".gql",
-  ".diff", ".patch", ".dockerfile", ".makefile", ".mk"
-]);
-const WORKSPACE_MARKDOWN_EXTENSIONS = new Set([".md", ".markdown", ".mdown", ".mkd", ".mdx"]);
-
 function workspaceMediaPreviewLimit(path: string): number | undefined {
   const extension = extname(path).toLowerCase();
-  if (WORKSPACE_RASTER_MEDIA_BY_EXTENSION.has(extension)) return WORKSPACE_RASTER_PREVIEW_MAXIMUM_BYTES;
+  if (workspaceRasterMediaTypes.has(extension)) return WORKSPACE_RASTER_PREVIEW_MAXIMUM_BYTES;
   if (extension === ".pdf") return WORKSPACE_PDF_PREVIEW_MAXIMUM_BYTES;
   return undefined;
-}
-
-function inferMediaType(path: string): string {
-  const extension = extname(path).toLowerCase();
-  const fileName = basename(path).toLowerCase();
-  if (fileName === "dockerfile" || fileName === "makefile") return "text/plain";
-  if (WORKSPACE_MARKDOWN_EXTENSIONS.has(extension)) return "text/markdown";
-  if (extension === ".html" || extension === ".htm") return "text/html";
-  if (extension === ".json" || extension === ".jsonc") return "application/json";
-  if (WORKSPACE_KNOWN_TEXT_EXTENSIONS.has(extension)) return "text/plain";
-  if (extension === ".xml" || extension === ".drawio") return "application/xml";
-  if (extension === ".svg") return "image/svg+xml";
-  if (extension === ".glb") return "model/gltf-binary";
-  if (extension === ".gltf") return "model/gltf+json";
-  if (extension === ".ktx2") return "image/ktx2";
-  const rasterMediaType = WORKSPACE_RASTER_MEDIA_BY_EXTENSION.get(extension);
-  if (rasterMediaType !== undefined) return rasterMediaType;
-  if (extension === ".pdf") return "application/pdf";
-  const binaryMediaType = WORKSPACE_BINARY_MEDIA_BY_EXTENSION.get(extension);
-  if (binaryMediaType !== undefined) return binaryMediaType;
-  return "application/octet-stream";
-}
-
-function isTextMediaType(value: string): boolean {
-  return value.startsWith("text/") || value === "application/json" || value === "application/xml" || value === "image/svg+xml";
 }
 
 function isGeneratedPath(path: string): boolean {

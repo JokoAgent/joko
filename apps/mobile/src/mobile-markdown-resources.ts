@@ -3,8 +3,9 @@ import { bytesToHex } from "@noble/hashes/utils.js";
 import { FileKind, type BlobRef, type FilePreview, type WorkspaceEntry } from "@joko/contracts";
 import { parseMobileMarkdown, type MobileMarkdownInline } from "./mobile-markdown";
 import { classifyChatPathLinkTarget, classifyInlineCodePathCandidate, resolveChatAbsPath, splitChatPathLineSuffix, toWorkdirRel } from "./mobile-markdown-path-candidate";
-import { bytesToDataUri, canonicalWorkspacePath, normalizeMediaType, workspaceEntryRevisionKey, workspaceParentPath } from "./workspace-files";
-import { inspectMobileImageGalleryBytes, mobileImageGalleryPage, type MobileImageGalleryPage } from "./mobile-image-gallery";
+import { canonicalWorkspacePath, normalizeMediaType, workspaceEntryRevisionKey, workspaceParentPath } from "./workspace-files";
+import { inspectMobileImageGalleryBytes, mobileImageGalleryDimensionsMatch, mobileImageGalleryPage, mobileImageGalleryPreviewUri,
+  type MobileImageGalleryPage } from "./mobile-image-gallery";
 import { assertWorkspaceFilePreview } from "./network";
 
 export interface MobileMarkdownResourceCandidate {
@@ -21,7 +22,8 @@ export interface MobileMarkdownResourceReference {
   readonly kind: "file" | "directory" | "image";
   readonly label: string;
   readonly relativePath: string;
-  readonly image?: { readonly uri: string; readonly width: number; readonly height: number };
+  readonly image?: { readonly uri: string; readonly width: number; readonly height: number;
+    readonly nativeQuarterTurn?: true };
 }
 export interface MobileMarkdownResourceDescriptor {
   readonly leaseId: string;
@@ -30,6 +32,8 @@ export interface MobileMarkdownResourceDescriptor {
 export interface MobileMarkdownResourceContext {
   readonly workspaceId: string;
   readonly workdir: string;
+  readonly baseDirectory?: string;
+  readonly maximumSourceCharacters?: number;
   assertCurrent(signal?: AbortSignal): void;
   revalidateSource(signal: AbortSignal): Promise<void>;
   listDirectory(parent: string, signal: AbortSignal): Promise<{ readonly entries: readonly WorkspaceEntry[]; readonly revision: string }>;
@@ -54,8 +58,8 @@ export function mobileMarkdownResourceKey(inline: MobileMarkdownInline): string 
     : inline.type === "code" ? JSON.stringify(["code", inline.text]) : undefined;
 }
 
-export function collectMobileMarkdownResourceCandidates(text: string, workdir: string): readonly MobileMarkdownResourceCandidate[] {
-  if (text.length > 200_000) return [];
+export function collectMobileMarkdownResourceCandidates(text: string, workdir: string, baseDirectory?: string, maximumSourceCharacters = 200_000): readonly MobileMarkdownResourceCandidate[] {
+  if (!Number.isSafeInteger(maximumSourceCharacters) || maximumSourceCharacters < 1 || text.length > Math.min(2_097_152, maximumSourceCharacters)) return [];
   const candidates = new Map<string, MobileMarkdownResourceCandidate>();
   const collect = (inlines: readonly MobileMarkdownInline[]) => {
     for (const inline of inlines) {
@@ -80,7 +84,9 @@ export function collectMobileMarkdownResourceCandidates(text: string, workdir: s
       else {
         try { href = decodeURIComponent(href); } catch { /* Literal percent filenames remain valid candidates. */ }
       }
-      const relative = toWorkdirRel(workdir, resolveChatAbsPath(href, workdir));
+      const absolute = /^[\\/]|^[A-Za-z]:[\\/]/u.test(href);
+      const relative = baseDirectory !== undefined && !absolute ? fileRelativePath(baseDirectory, href, workdir)
+        : toWorkdirRel(workdir, resolveChatAbsPath(href, workdir));
       if (relative === null) continue;
       let path: string;
       try { path = canonicalWorkspacePath(relative.replace(/\/+$/u, "")); } catch { continue; }
@@ -97,6 +103,17 @@ export function collectMobileMarkdownResourceCandidates(text: string, workdir: s
   return [...candidates.values()];
 }
 
+function fileRelativePath(baseDirectory: string, href: string, workdir: string): string | null {
+  const segments = canonicalWorkspacePath(baseDirectory).split("/").filter(Boolean);
+  const relative = /^[A-Za-z]:[\\/]/u.test(workdir) ? href.replace(/\\/gu, "/") : href;
+  for (const segment of relative.split("/")) {
+    if (!segment || segment === ".") continue;
+    if (segment === "..") { if (!segments.length) return null; segments.pop(); }
+    else segments.push(segment);
+  }
+  return segments.join("/");
+}
+
 export class MobileMarkdownResourceReader {
   #leases = new Map<string, Lease>();
   #activeReads = 0;
@@ -104,7 +121,7 @@ export class MobileMarkdownResourceReader {
 
   async prepare(id: string, text: string, context: MobileMarkdownResourceContext, signal: AbortSignal): Promise<MobileMarkdownResourceDescriptor> {
     context.assertCurrent(signal);
-    const candidates = collectMobileMarkdownResourceCandidates(text, context.workdir);
+    const candidates = collectMobileMarkdownResourceCandidates(text, context.workdir, context.baseDirectory, context.maximumSourceCharacters);
     if (!candidates.length) return { leaseId: id, references: new Map() };
     if (this.#leases.size >= 64 || this.#leases.has(id)) throw new Error("The message resource limit was reached.");
     const lease: Lease = { id, context, controller: new AbortController(), candidates,
@@ -280,7 +297,7 @@ export class MobileMarkdownResourceReader {
       if (downloaded.bytes.byteLength !== page.byteSize || normalizeMediaType(downloaded.mediaType) !== page.mediaType
         || bytesToHex(sha256(downloaded.bytes)) !== page.sha256Hex) throw new Error("The downloaded image changed.");
       const decoded = inspectMobileImageGalleryBytes(downloaded.bytes, page.mediaType);
-      if (page.widthPixels !== undefined && (page.widthPixels !== decoded.width || page.heightPixels !== decoded.height)) {
+      if (page.widthPixels !== undefined && !mobileImageGalleryDimensionsMatch(decoded, page.widthPixels, page.heightPixels!)) {
         throw new Error("The image dimensions changed.");
       }
       const pixels = [...this.#leases.values()].reduce((total, item) => total + item.pixels, 0);
@@ -288,7 +305,8 @@ export class MobileMarkdownResourceReader {
       lease.pixels += decoded.width * decoded.height;
       lease.pages.set(candidate.key, page);
       lease.references.set(candidate.key, { key: candidate.key, kind: "image", label: candidate.label, relativePath: entry.relativePath,
-        image: { uri: bytesToDataUri(downloaded.bytes, page.mediaType), width: decoded.width, height: decoded.height } });
+        image: { uri: mobileImageGalleryPreviewUri(downloaded.bytes, decoded), width: decoded.width, height: decoded.height,
+          ...(decoded.nativeQuarterTurn ? { nativeQuarterTurn: true } : {}) } });
       adopted = true;
     } finally { if (!adopted) lease.bytes -= Number(revision.byteSize); }
   }

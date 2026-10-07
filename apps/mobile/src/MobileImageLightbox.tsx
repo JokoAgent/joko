@@ -1,11 +1,14 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ComponentType } from "react";
 import {
   ActivityIndicator,
+  Animated,
   AppState,
   Modal,
   PanResponder,
+  Platform,
   Pressable,
   StyleSheet,
+  StatusBar,
   Text,
   View,
   type GestureResponderEvent,
@@ -26,6 +29,7 @@ import {
   MOBILE_ANNOTATION_STROKE_COLOR,
   decodeMobileBase64,
   mobileAnnotationDisplayRect,
+  mobileImageRequiresNativeRaster,
   mobileAnnotationStrokePath,
   mobileAnnotationStrokeWidth,
   normalizeMobileAnnotationPoint,
@@ -33,6 +37,7 @@ import {
   type MobileImageAnnotationPoint,
   type MobileImageAnnotationStroke
 } from "./mobile-image-annotation";
+import { prepareMobileAnnotationRaster } from "./mobile-annotation-raster";
 import {
   MOBILE_LIGHTBOX_DOUBLE_TAP_MILLISECONDS,
   MOBILE_LIGHTBOX_MAX_SCALE,
@@ -42,8 +47,11 @@ import {
   mobileAccessibleZoomTransform,
   mobileContainedImageSize,
   mobileDoubleTapTransform,
+  mobileLightboxCanStartDismiss,
   mobileLightboxIsTap,
+  mobileLightboxIsZoomed,
   mobileLightboxPointerIntent,
+  mobileLightboxShouldDismiss,
   mobileLightboxSwipePageIndex,
   mobilePinchTransform,
   mobileTouchCentroid,
@@ -54,7 +62,9 @@ import {
   type MobileTouchPoint
 } from "./mobile-image-lightbox";
 import { useMobileAnnotationBurn } from "./use-mobile-annotation-burn";
-import type { MobileImageGalleryNativeDecode, MobileImageGalleryPageSession } from "./mobile-image-gallery";
+import { mobileImageGalleryDimensionsMatch, mobileImageGalleryNativeAnimationMatches,
+  type MobileImageGalleryNativeDecode, type MobileImageGalleryDescriptor, type MobileImageGalleryPageSession } from "./mobile-image-gallery";
+import type { MobileTimelineImagePreview } from "./mobile-timeline-images";
 import type { MobileImageOutputAction, MobileImageOutputRenderedImage } from "./mobile-image-output";
 import { mobileImageOutputMediaType } from "./mobile-image-output-format";
 import type { MobileSupportedLocale } from "./mobile-locale-preference";
@@ -62,20 +72,28 @@ import { mobileMessage } from "./mobile-messages";
 import { MOBILE_BLOB_PREVIEW_MAXIMUM_BYTES } from "./network";
 
 interface MobileImageLightboxGalleryControls {
-  readonly session: MobileImageGalleryPageSession;
+  readonly descriptor: MobileImageGalleryDescriptor;
+  readonly pageIndex: number;
+  readonly pageKey: string;
+  readonly preview?: MobileTimelineImagePreview;
+  readonly adjacentPreviews?: readonly { readonly pageIndex: number; readonly preview: MobileTimelineImagePreview }[];
   readonly busy: boolean;
   readonly error?: string;
+  readonly onRetry: () => void;
+  readonly onNativeFailed: (loadId: string, automatically?: boolean) => void;
+  readonly onPreviewFailed: (previewId: string) => void;
   readonly onNavigate: (pageIndex: number) => void;
+  readonly copySourceLabel?: string;
+  readonly onCopySource?: (signal: AbortSignal) => Promise<string>;
   readonly onAddOriginal: (signal: AbortSignal) => Promise<void>;
+  readonly onShareOriginal: (signal: AbortSignal, onDispatch: () => void) => Promise<void>;
   readonly onDecoded: (decoded: MobileImageGalleryNativeDecode) => void;
 }
 
 const PreviewImage = ExpoImage as unknown as ComponentType<ExpoImageProps>;
 
-interface MobileImageLightboxProps {
-  readonly session: MobileComposerImageEditorSession;
+interface MobileImageLightboxBaseProps {
   readonly locale: MobileSupportedLocale;
-  readonly gallery?: MobileImageLightboxGalleryControls;
   readonly onClose: () => void;
   readonly onSave: (
     strokes: readonly MobileImageAnnotationStroke[],
@@ -91,6 +109,11 @@ interface MobileImageLightboxProps {
   readonly onNativeActivityChange?: (active: boolean) => void;
 }
 
+type MobileImageLightboxProps = MobileImageLightboxBaseProps & (
+  | { readonly session: MobileComposerImageEditorSession; readonly gallery?: never }
+  | { readonly session?: MobileImageGalleryPageSession; readonly gallery: MobileImageLightboxGalleryControls }
+);
+
 interface ActiveGesture {
   mode: MobileLightboxPointerIntent;
   startedAt: number;
@@ -99,6 +122,8 @@ interface ActiveGesture {
   initialTransform: MobileImageTransform;
   initialCentroid: MobileTouchPoint;
   initialDistance: number;
+  maxDistance: number;
+  dismissRejected: boolean;
 }
 
 const initialTransform: MobileImageTransform = { scale: 1, translateX: 0, translateY: 0 };
@@ -113,7 +138,12 @@ export function MobileImageLightbox({
   onOutputAction,
   onNativeActivityChange
 }: MobileImageLightboxProps) {
-  const initialStrokes = useMemo(() => cloneStrokes(session.initialStrokes), [session.leaseId]);
+  const page = gallery?.descriptor.pages[gallery.pageIndex];
+  const loadKey = session?.leaseId ?? gallery?.pageKey ?? "";
+  const fileName = session?.fileName ?? page?.title ?? "";
+  const sourceMediaType = session?.sourceMediaType ?? page?.mediaType ?? "";
+  const annotatable = session?.annotatable === true;
+  const initialStrokes = useMemo(() => cloneStrokes(session?.initialStrokes ?? []), [loadKey]);
   const [strokes, setStrokes] = useState<readonly MobileImageAnnotationStroke[]>(initialStrokes);
   const [draftStroke, setDraftStroke] = useState<MobileImageAnnotationStroke>();
   const [annotating, setAnnotating] = useState(false);
@@ -121,10 +151,13 @@ export function MobileImageLightbox({
   const [container, setContainer] = useState<MobileImageSize>(emptySize);
   const [natural, setNatural] = useState<MobileImageSize>(emptySize);
   const [decoded, setDecoded] = useState<MobileImageGalleryNativeDecode>();
+  const [decodedFor, setDecodedFor] = useState<string>();
   const [busy, setBusy] = useState(false);
   const [outputAction, setOutputAction] = useState<MobileImageOutputAction>();
   const [notice, setNotice] = useState("");
   const [error, setError] = useState("");
+  const [foreground, setForeground] = useState(AppState.currentState === "active");
+  const [chromeBusy, setChromeBusy] = useState(false);
   const { burnIn, host } = useMobileAnnotationBurn();
   const strokesRef = useRef(strokes);
   const draftStrokeRef = useRef(draftStroke);
@@ -135,12 +168,20 @@ export function MobileImageLightbox({
   const decodedRef = useRef(decoded);
   const gestureRef = useRef<ActiveGesture | undefined>(undefined);
   const lastTapRef = useRef<{ readonly at: number; readonly point: MobileTouchPoint } | undefined>(undefined);
+  const tapTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const dismissResetTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const dismissY = useRef(new Animated.Value(0)).current;
+  const pageX = useRef(new Animated.Value(0)).current;
+  const pageAnimationRef = useRef<{ readonly id: object; readonly timer: ReturnType<typeof setTimeout> } | undefined>(undefined);
   const saveControllerRef = useRef<AbortController | undefined>(undefined);
   const closedRef = useRef(false);
   const nativeActivityRef = useRef(false);
   const sawExpectedInactiveRef = useRef(false);
   const nativeActivityCallbackRef = useRef(onNativeActivityChange);
   const galleryRef = useRef(gallery);
+  const closeCallbackRef = useRef(onClose);
+  const loadOwnerRef = useRef(loadKey);
+  loadOwnerRef.current = loadKey;
   strokesRef.current = strokes;
   draftStrokeRef.current = draftStroke;
   annotatingRef.current = annotating;
@@ -149,10 +190,42 @@ export function MobileImageLightbox({
   naturalRef.current = natural;
   decodedRef.current = decoded;
   galleryRef.current = gallery;
+  closeCallbackRef.current = onClose;
   nativeActivityCallbackRef.current = onNativeActivityChange;
 
+  const clearPendingTap = useCallback((clearLast = true) => {
+    clearTimeout(tapTimerRef.current);
+    tapTimerRef.current = undefined;
+    if (clearLast) lastTapRef.current = undefined;
+  }, []);
+  const resetDismiss = useCallback(() => {
+    clearTimeout(dismissResetTimerRef.current);
+    dismissResetTimerRef.current = undefined;
+    dismissY.stopAnimation();
+    dismissY.setValue(0);
+  }, [dismissY]);
+  const resetPage = useCallback(() => {
+    if (pageAnimationRef.current) clearTimeout(pageAnimationRef.current.timer);
+    pageAnimationRef.current = undefined;
+    pageX.stopAnimation(); pageX.setValue(0);
+  }, [pageX]);
+  const cancelGesture = useCallback(() => {
+    clearPendingTap();
+    resetDismiss();
+    resetPage();
+    gestureRef.current = undefined;
+    setChromeBusy(false);
+    draftStrokeRef.current = undefined;
+    setDraftStroke(undefined);
+  }, [clearPendingTap, resetDismiss, resetPage]);
+  const canInteract = useCallback(() => !closedRef.current && loadOwnerRef.current === loadKey
+    && AppState.currentState === "active" && !saveControllerRef.current && !nativeActivityRef.current && !pageAnimationRef.current, [loadKey]);
+
   useEffect(() => {
-    const nextStrokes = cloneStrokes(session.initialStrokes);
+    cancelGesture();
+    saveControllerRef.current?.abort();
+    saveControllerRef.current = undefined;
+    const nextStrokes = cloneStrokes(initialStrokes);
     strokesRef.current = nextStrokes;
     draftStrokeRef.current = undefined;
     annotatingRef.current = false;
@@ -171,26 +244,37 @@ export function MobileImageLightbox({
     sawExpectedInactiveRef.current = false;
     nativeActivityCallbackRef.current?.(false);
     setDecoded(undefined);
+    setDecodedFor(undefined);
     setBusy(false);
     setOutputAction(undefined);
     setNotice("");
     setError("");
-  }, [session.leaseId]);
+  }, [loadKey, cancelGesture]);
+
+  const backdrop = gallery?.preview;
+  useEffect(() => {
+    if (!decodedRef.current && backdrop) {
+      const size = { width: backdrop.width, height: backdrop.height }; naturalRef.current = size; setNatural(size);
+    }
+  }, [loadKey, backdrop?.leaseId]);
 
   const close = useCallback(() => {
     if (closedRef.current) return;
     closedRef.current = true;
+    cancelGesture();
     saveControllerRef.current?.abort();
     if (nativeActivityRef.current) {
       nativeActivityRef.current = false;
       nativeActivityCallbackRef.current?.(false);
     }
-    onClose();
-  }, [onClose]);
+    closeCallbackRef.current();
+  }, [cancelGesture]);
 
   useEffect(() => {
     const subscription = AppState.addEventListener("change", (status) => {
+      setForeground(status === "active");
       if (status === "active") return;
+      cancelGesture();
       if (nativeActivityRef.current) {
         sawExpectedInactiveRef.current = true;
         return;
@@ -198,6 +282,11 @@ export function MobileImageLightbox({
       close();
     });
     return () => {
+      closedRef.current = true;
+      clearPendingTap();
+      resetDismiss();
+      resetPage();
+      gestureRef.current = undefined;
       subscription.remove();
       saveControllerRef.current?.abort();
       if (nativeActivityRef.current) {
@@ -205,7 +294,7 @@ export function MobileImageLightbox({
         nativeActivityCallbackRef.current?.(false);
       }
     };
-  }, [close]);
+  }, [close, cancelGesture, clearPendingTap, resetDismiss, resetPage]);
 
   useEffect(() => {
     const next = clampMobileImageTransform(transformRef.current, container, natural);
@@ -214,14 +303,20 @@ export function MobileImageLightbox({
   }, [container, natural]);
 
   const panResponder = useMemo(() => PanResponder.create({
-    onStartShouldSetPanResponder: () => !saveControllerRef.current && galleryRef.current?.busy !== true,
-    onMoveShouldSetPanResponder: () => !saveControllerRef.current && galleryRef.current?.busy !== true,
+    onStartShouldSetPanResponder: canInteract,
+    onMoveShouldSetPanResponder: canInteract,
     onPanResponderGrant: (event) => {
+      if (!canInteract()) return;
+      clearPendingTap(false);
+      resetDismiss();
+      resetPage();
       setError("");
       const points = responderTouches(event);
       const first = points[0] ?? { x: event.nativeEvent.locationX, y: event.nativeEvent.locationY };
-      const intent = mobileLightboxPointerIntent(annotatingRef.current && session.annotatable, points.length || 1);
+      const intent = mobileLightboxPointerIntent(annotatingRef.current && annotatable, points.length || 1);
       if (intent === "transform") {
+        clearPendingTap();
+        setChromeBusy(true);
         const centroid = mobileTouchCentroid(points.slice(0, 2));
         gestureRef.current = {
           mode: "transform",
@@ -230,7 +325,9 @@ export function MobileImageLightbox({
           last: centroid,
           initialTransform: transformRef.current,
           initialCentroid: centroid,
-          initialDistance: mobileTouchDistance(points[0]!, points[1]!)
+          initialDistance: mobileTouchDistance(points[0]!, points[1]!),
+          maxDistance: 0,
+          dismissRejected: true
         };
         return;
       }
@@ -241,7 +338,9 @@ export function MobileImageLightbox({
         last: first,
         initialTransform: transformRef.current,
         initialCentroid: first,
-        initialDistance: 0
+        initialDistance: 0,
+        maxDistance: 0,
+        dismissRejected: false
       };
       if (intent === "draw") {
         const point = annotationPoint(first, containerRef.current, naturalRef.current, transformRef.current);
@@ -261,14 +360,20 @@ export function MobileImageLightbox({
       gestureRef.current = base;
     },
     onPanResponderMove: (event, gestureState) => {
+      if (loadOwnerRef.current !== loadKey) return;
+      if (!canInteract()) { cancelGesture(); return; }
       const touches = responderTouches(event);
       let active = gestureRef.current;
       if (!active) return;
       if (touches.length >= 2) {
+        setChromeBusy(true);
         const points = touches.slice(0, 2);
         const centroid = mobileTouchCentroid(points);
         const distance = mobileTouchDistance(points[0]!, points[1]!);
         if (active.mode !== "transform") {
+          clearPendingTap();
+          resetDismiss();
+          resetPage();
           draftStrokeRef.current = undefined;
           setDraftStroke(undefined);
           active = {
@@ -278,7 +383,9 @@ export function MobileImageLightbox({
             last: centroid,
             initialTransform: transformRef.current,
             initialCentroid: centroid,
-            initialDistance: distance
+            initialDistance: distance,
+            maxDistance: active.maxDistance,
+            dismissRejected: true
           };
           gestureRef.current = active;
           return;
@@ -302,6 +409,8 @@ export function MobileImageLightbox({
         y: active.start.y + gestureState.dy
       };
       active.last = point;
+      active.maxDistance = Math.max(active.maxDistance, Math.hypot(gestureState.dx, gestureState.dy), mobileTouchDistance(active.start, point));
+      if (active.maxDistance > MOBILE_LIGHTBOX_TAP_DISTANCE) clearPendingTap();
       if (active.mode === "draw") {
         const normalized = annotationPoint(point, containerRef.current, naturalRef.current, transformRef.current);
         const draft = draftStrokeRef.current;
@@ -316,6 +425,24 @@ export function MobileImageLightbox({
         return;
       }
       if (active.mode === "pan") {
+        if (mobileLightboxIsZoomed(transformRef.current.scale) && active.maxDistance >= 1) setChromeBusy(true);
+        if (Math.abs(gestureState.dx) > 12) active.dismissRejected = true;
+        const activeGallery = galleryRef.current;
+        if (!annotatingRef.current && !mobileLightboxIsZoomed(transformRef.current.scale) && activeGallery
+          && activeGallery.descriptor.pages.length > 1 && Math.abs(gestureState.dx) > 12
+          && Math.abs(gestureState.dx) > Math.abs(gestureState.dy) * 1.2) active.mode = "page";
+        if (active.mode === "page") {
+          clearPendingTap(); setChromeBusy(true);
+          const hasPage = gestureState.dx < 0 ? activeGallery!.pageIndex + 1 < activeGallery!.descriptor.pages.length : activeGallery!.pageIndex > 0;
+          pageX.setValue(Math.max(-containerRef.current.width, Math.min(containerRef.current.width, gestureState.dx * (hasPage ? 1 : 0.25))));
+          return;
+        }
+        if (!active.dismissRejected && !annotatingRef.current
+          && mobileLightboxCanStartDismiss(gestureState.dx, gestureState.dy, transformRef.current.scale)) {
+          active.mode = "dismiss";
+          dismissY.setValue(gestureState.dy);
+          return;
+        }
         const next = clampMobileImageTransform({
           scale: active.initialTransform.scale,
           translateX: active.initialTransform.translateX + gestureState.dx,
@@ -323,12 +450,54 @@ export function MobileImageLightbox({
         }, containerRef.current, naturalRef.current);
         transformRef.current = next;
         setTransform(next);
+      } else if (active.mode === "dismiss") {
+        dismissY.setValue(gestureState.dy);
+      } else if (active.mode === "page") {
+        const current = galleryRef.current!;
+        const hasPage = gestureState.dx < 0 ? current.pageIndex + 1 < current.descriptor.pages.length : current.pageIndex > 0;
+        pageX.setValue(Math.max(-containerRef.current.width, Math.min(containerRef.current.width, gestureState.dx * (hasPage ? 1 : 0.25))));
       }
     },
     onPanResponderRelease: (_event, gestureState) => {
+      if (loadOwnerRef.current !== loadKey) return;
+      if (!canInteract()) { cancelGesture(); return; }
       const active = gestureRef.current;
       gestureRef.current = undefined;
+      setChromeBusy(false);
       if (!active) return;
+      if (active.mode === "page") {
+        const current = galleryRef.current!;
+        const nextPage = mobileLightboxSwipePageIndex({ currentIndex: current.pageIndex, pageCount: current.descriptor.pages.length,
+          translationX: gestureState.dx, translationY: gestureState.dy, velocityX: gestureState.vx * 1_000,
+          scale: transformRef.current.scale, annotating: annotatingRef.current });
+        const id = {};
+        const timer = setTimeout(() => { if (pageAnimationRef.current?.id === id) { resetPage(); setChromeBusy(false); } }, 1_000);
+        pageAnimationRef.current = { id, timer }; setChromeBusy(true);
+        const animation = nextPage === undefined
+          ? Animated.spring(pageX, { toValue: 0, damping: 20, stiffness: 240, useNativeDriver: true })
+          : Animated.timing(pageX, { toValue: nextPage < current.pageIndex ? containerRef.current.width : -containerRef.current.width,
+            duration: 180, useNativeDriver: true });
+        animation.start(({ finished }) => {
+          if (pageAnimationRef.current?.id !== id || loadOwnerRef.current !== loadKey) return;
+          resetPage(); setChromeBusy(false);
+          if (finished && nextPage !== undefined && canInteract() && galleryRef.current?.pageKey === current.pageKey) current.onNavigate(nextPage);
+        });
+        return;
+      }
+      if (active.mode === "dismiss") {
+        clearPendingTap();
+        // PanResponder velocity is points per millisecond; the dismissal threshold uses points per second.
+        if (mobileLightboxShouldDismiss(gestureState.dy, gestureState.vy * 1_000, transformRef.current.scale)) {
+          close();
+        } else {
+          Animated.spring(dismissY, { toValue: 0, damping: 20, stiffness: 240, useNativeDriver: true }).start();
+          const deadline = setTimeout(() => {
+            if (dismissResetTimerRef.current === deadline && loadOwnerRef.current === loadKey && !closedRef.current) resetDismiss();
+          }, 1_000);
+          dismissResetTimerRef.current = deadline;
+        }
+        return;
+      }
       if (active.mode === "draw") {
         const draft = draftStrokeRef.current;
         draftStrokeRef.current = undefined;
@@ -346,16 +515,16 @@ export function MobileImageLightbox({
       }
       const activeGallery = galleryRef.current;
       const nextPage = activeGallery ? mobileLightboxSwipePageIndex({
-        currentIndex: activeGallery.session.pageIndex,
-        pageCount: activeGallery.session.pageCount,
+        currentIndex: activeGallery.pageIndex,
+        pageCount: activeGallery.descriptor.pages.length,
         translationX: gestureState.dx,
         translationY: gestureState.dy,
         scale: transformRef.current.scale,
         annotating: annotatingRef.current
       }) : undefined;
       if (nextPage !== undefined && activeGallery) {
-        lastTapRef.current = undefined;
-        strokesRef.current = cloneStrokes(session.initialStrokes);
+        cancelGesture();
+        strokesRef.current = cloneStrokes(initialStrokes);
         draftStrokeRef.current = undefined;
         annotatingRef.current = false;
         transformRef.current = initialTransform;
@@ -367,7 +536,7 @@ export function MobileImageLightbox({
         return;
       }
       const now = Date.now();
-      const distance = Math.hypot(gestureState.dx, gestureState.dy);
+      const distance = Math.max(active.maxDistance, Math.hypot(gestureState.dx, gestureState.dy));
       if (!mobileLightboxIsTap(active.startedAt, now, distance)) {
         lastTapRef.current = undefined;
         return;
@@ -384,37 +553,58 @@ export function MobileImageLightbox({
         );
         transformRef.current = next;
         setTransform(next);
-        lastTapRef.current = undefined;
+        clearPendingTap();
       } else {
-        lastTapRef.current = { at: now, point: tap };
+        const pending = { at: now, point: tap };
+        lastTapRef.current = pending;
+        if (!annotatingRef.current && !mobileLightboxIsZoomed(transformRef.current.scale)) {
+          tapTimerRef.current = setTimeout(() => {
+            if (!canInteract() || gestureRef.current || lastTapRef.current !== pending
+              || annotatingRef.current || mobileLightboxIsZoomed(transformRef.current.scale)) return;
+            clearPendingTap();
+            close();
+          }, MOBILE_LIGHTBOX_DOUBLE_TAP_MILLISECONDS);
+        }
       }
     },
     onPanResponderTerminate: () => {
-      gestureRef.current = undefined;
-      draftStrokeRef.current = undefined;
-      setDraftStroke(undefined);
-      lastTapRef.current = undefined;
+      if (loadOwnerRef.current === loadKey) cancelGesture();
     }
-  }), [locale, session.annotatable, session.initialStrokes]);
+  }), [locale, annotatable, initialStrokes, canInteract, cancelGesture, clearPendingTap, resetDismiss, resetPage, dismissY, pageX, close, loadKey]);
 
   const displayed = mobileContainedImageSize(container, natural);
   const paths = [...strokes, ...(draftStroke ? [draftStroke] : [])];
   const dirty = !annotationStrokesEqual(strokes, initialStrokes);
   const interactionBusy = busy || gallery?.busy === true;
   const visibleError = error || gallery?.error || "";
-  const drawingReady = decoded !== undefined && natural.width > 0 && natural.height > 0
+  const drawingReady = session !== undefined && decodedFor === loadKey && decoded !== undefined && natural.width > 0 && natural.height > 0
     && container.width > 0 && container.height > 0;
-  const outputReady = drawingReady && decoded?.isAnimated === false
-    && mobileImageOutputMediaType(session.sourceMediaType) !== undefined;
+  const gallerySession = gallery ? session : undefined;
+  const originalOnly = session?.originalOnly === true || session?.animated === true || gallerySession?.expectedAnimated === true
+    || mobileImageOutputMediaType(sourceMediaType) === undefined;
+  const canAnnotate = annotatable && session?.originalOnly !== true && session?.animated !== true
+    && gallerySession?.expectedAnimated !== true && decoded?.isAnimated !== true;
+  const outputReady = drawingReady && !originalOnly && decoded?.isAnimated === false
+    && mobileImageOutputMediaType(sourceMediaType) !== undefined;
+  useEffect(() => {
+    if (!gallery || !session || gallery.busy || decodedFor === loadKey) return;
+    const deadline = setTimeout(() => {
+      if (!closedRef.current && loadOwnerRef.current === loadKey) galleryRef.current?.onNativeFailed(session.leaseId, false);
+    }, 12_000);
+    return () => clearTimeout(deadline);
+  }, [loadKey, decodedFor, gallery?.busy]);
   const updateContainer = (event: LayoutChangeEvent): void => {
+    if (closedRef.current || loadOwnerRef.current !== loadKey) return;
     const next = {
       width: event.nativeEvent.layout.width,
       height: event.nativeEvent.layout.height
     };
+    if (next.width !== containerRef.current.width || next.height !== containerRef.current.height) cancelGesture();
     containerRef.current = next;
     setContainer(next);
   };
   const zoom = (delta: number): void => {
+    cancelGesture();
     const next = mobileAccessibleZoomTransform(
       transformRef.current,
       delta,
@@ -425,10 +615,12 @@ export function MobileImageLightbox({
     setTransform(next);
   };
   const resetTransform = (): void => {
+    cancelGesture();
     transformRef.current = initialTransform;
     setTransform(initialTransform);
   };
   const undo = (): void => {
+    cancelGesture();
     const next = strokesRef.current.slice(0, -1);
     strokesRef.current = next;
     draftStrokeRef.current = undefined;
@@ -437,6 +629,7 @@ export function MobileImageLightbox({
     setError("");
   };
   const discard = (): void => {
+    cancelGesture();
     const next = cloneStrokes(initialStrokes);
     strokesRef.current = next;
     draftStrokeRef.current = undefined;
@@ -446,9 +639,10 @@ export function MobileImageLightbox({
     setError("");
   };
   const navigate = (pageIndex: number): void => {
-    if (!gallery || interactionBusy || pageIndex < 0 || pageIndex >= gallery.session.pageCount
-      || pageIndex === gallery.session.pageIndex) return;
-    const next = cloneStrokes(session.initialStrokes);
+    if (!gallery || busy || pageIndex < 0 || pageIndex >= gallery.descriptor.pages.length
+      || pageIndex === gallery.pageIndex) return;
+    cancelGesture();
+    const next = cloneStrokes(initialStrokes);
     strokesRef.current = next;
     draftStrokeRef.current = undefined;
     annotatingRef.current = false;
@@ -457,11 +651,36 @@ export function MobileImageLightbox({
     setDraftStroke(undefined);
     setAnnotating(false);
     setTransform(initialTransform);
+    setNotice("");
     setError("");
     gallery.onNavigate(pageIndex);
   };
+  const copySource = async (): Promise<void> => {
+    if (!gallery?.onCopySource || saveControllerRef.current || gallery.busy) return;
+    cancelGesture();
+    const controller = new AbortController();
+    saveControllerRef.current = controller;
+    setBusy(true);
+    setNotice("");
+    setError("");
+    try {
+      const message = await gallery.onCopySource(controller.signal);
+      controller.signal.throwIfAborted();
+      if (saveControllerRef.current === controller) setNotice(message);
+    } catch (failure) {
+      if (!controller.signal.aborted) {
+        setError(failure instanceof Error ? failure.message : mobileMessage(locale, "files.presentation.copyFailed"));
+      }
+    } finally {
+      if (saveControllerRef.current === controller) {
+        saveControllerRef.current = undefined;
+        setBusy(false);
+      }
+    }
+  };
   const addOriginal = async (): Promise<void> => {
-    if (!gallery || saveControllerRef.current || !gallery.session.addable || !drawingReady) return;
+    if (!gallery || saveControllerRef.current || !gallerySession?.addable || !drawingReady) return;
+    cancelGesture();
     const controller = new AbortController();
     saveControllerRef.current = controller;
     setBusy(true);
@@ -486,7 +705,8 @@ export function MobileImageLightbox({
     }
   };
   const save = async (): Promise<void> => {
-    if (saveControllerRef.current || !dirty || gallery?.busy) return;
+    if (!session || saveControllerRef.current || !dirty || gallery?.busy || !canAnnotate) return;
+    cancelGesture();
     const controller = new AbortController();
     saveControllerRef.current = controller;
     setBusy(true);
@@ -494,10 +714,16 @@ export function MobileImageLightbox({
     try {
       const exactStrokes = cloneStrokes(strokesRef.current);
       let burned: MobileBurnedImage | undefined;
-      if (exactStrokes.length > 0) {
-        const result = await burnIn({
+      if (exactStrokes.length > 0 || mobileImageRequiresNativeRaster(session.sourceMediaType)) {
+        const raster = await prepareMobileAnnotationRaster({
           base64: session.sourceBase64,
           mediaType: session.sourceMediaType,
+          width: decodedRef.current!.width,
+          height: decodedRef.current!.height
+        }, controller.signal);
+        controller.signal.throwIfAborted();
+        const result = await burnIn({
+          ...raster,
           strokes: exactStrokes
         });
         controller.signal.throwIfAborted();
@@ -528,7 +754,10 @@ export function MobileImageLightbox({
   };
   const output = async (action: MobileImageOutputAction): Promise<void> => {
     const exactDecoded = decodedRef.current;
-    if (!onOutputAction || saveControllerRef.current || !exactDecoded || !outputReady || gallery?.busy) return;
+    const originalShare = action === "share" && originalOnly && gallery?.onShareOriginal;
+    if (!session || (!originalShare && (!onOutputAction || !outputReady)) || saveControllerRef.current || !exactDecoded
+      || !drawingReady || gallery?.busy) return;
+    cancelGesture();
     const controller = new AbortController();
     saveControllerRef.current = controller;
     setBusy(true);
@@ -536,16 +765,32 @@ export function MobileImageLightbox({
     setNotice("");
     setError("");
     const invokesNativeUi = action === "save" || action === "share";
+    const nativeDispatch = (): void => {
+      controller.signal.throwIfAborted();
+      if (closedRef.current || loadOwnerRef.current !== session.leaseId || AppState.currentState !== "active") {
+        throw new Error(mobileMessage(locale, "image.outputError"));
+      }
+      nativeActivityRef.current = true;
+      sawExpectedInactiveRef.current = false;
+      nativeActivityCallbackRef.current?.(true);
+    };
     try {
-      const exactStrokes = cloneStrokes(strokesRef.current);
+      const exactStrokes = originalShare ? [] : cloneStrokes(strokesRef.current);
       const sourceMediaType = session.sourceMediaType.trim().toLowerCase();
-      const requiresRender = exactStrokes.length > 0
-        || action === "copy" && sourceMediaType !== "image/jpeg" && sourceMediaType !== "image/png";
+      const requiresRender = !originalShare && (exactStrokes.length > 0
+        || mobileImageRequiresNativeRaster(sourceMediaType)
+        || action === "copy" && sourceMediaType !== "image/jpeg" && sourceMediaType !== "image/png");
       let rendered: MobileImageOutputRenderedImage | undefined;
       if (requiresRender) {
-        const result = await burnIn({
+        const raster = await prepareMobileAnnotationRaster({
           base64: session.sourceBase64,
           mediaType: session.sourceMediaType,
+          width: exactDecoded.width,
+          height: exactDecoded.height
+        }, controller.signal);
+        controller.signal.throwIfAborted();
+        const result = await burnIn({
+          ...raster,
           strokes: exactStrokes
         });
         controller.signal.throwIfAborted();
@@ -556,12 +801,9 @@ export function MobileImageLightbox({
           height: result.height
         };
       }
-      if (invokesNativeUi) {
-        nativeActivityRef.current = true;
-        sawExpectedInactiveRef.current = false;
-        nativeActivityCallbackRef.current?.(true);
-      }
-      const message = await onOutputAction(action, exactDecoded, rendered, controller.signal);
+      if (invokesNativeUi && !originalShare) nativeDispatch();
+      const message = originalShare ? await originalShare(controller.signal, nativeDispatch)
+        : await onOutputAction!(action, exactDecoded, rendered, controller.signal);
       controller.signal.throwIfAborted();
       setNotice(message || imageOutputSuccessMessage(action, locale));
     } catch (failure) {
@@ -582,48 +824,67 @@ export function MobileImageLightbox({
     }
   };
 
-  return <Modal visible animationType="fade" presentationStyle="fullScreen" statusBarTranslucent
+  return <Modal visible transparent animationType="fade" presentationStyle="overFullScreen" statusBarTranslucent
     onRequestClose={close} supportedOrientations={["portrait", "landscape"]}>
-    <SafeAreaView style={styles.root} edges={["top", "right", "bottom", "left"]}>
-      <View style={styles.header}>
-        <ToolButton label={mobileMessage(locale, "image.close")} onPress={close} disabled={false} />
-        <View style={styles.heading}>
-          <Text numberOfLines={1} style={styles.fileName}>{session.fileName}</Text>
-          <Text style={styles.meta}>{gallery
-            ? mobileMessage(locale, "image.galleryMeta", {
-              source: gallery.session.sourceLabel,
-              index: gallery.session.pageIndex + 1,
-              count: gallery.session.pageCount,
-              scale: transform.scale.toFixed(1)
-            })
-            : mobileMessage(locale, "image.zoomMeta", { scale: transform.scale.toFixed(1) })}</Text>
-        </View>
-      </View>
-      <View accessibilityRole="image" accessibilityLabel={mobileMessage(locale, "image.previewLabel", { name: session.fileName })}
+    {Platform.OS === "android" && <StatusBar hidden />}
+    <View style={styles.root} onAccessibilityEscape={close}>
+      <Animated.View pointerEvents="none" style={[styles.backdrop, { opacity: dismissY.interpolate({
+        inputRange: [-300, 0, 300], outputRange: [0.4, 1, 0.4], extrapolate: "clamp"
+      }) }]} />
+      <View accessibilityRole="image" accessibilityLabel={mobileMessage(locale, "image.previewLabel", { name: fileName })}
         style={styles.canvas} onLayout={updateContainer} {...panResponder.panHandlers}>
-        {displayed.width > 0 && displayed.height > 0 && <View pointerEvents="none" style={[
+        <Animated.View pointerEvents="none" style={[styles.pageStrip, { transform: [{ translateX: pageX }] }]}>
+        {gallery && [-1, 1].map((delta) => {
+          const index = gallery.pageIndex + delta; const neighbor = gallery.descriptor.pages[index];
+          if (!neighbor) return null;
+          const preview = gallery.adjacentPreviews?.find((item) => item.pageIndex === index)?.preview;
+          return <View key={neighbor.pageId} accessibilityElementsHidden importantForAccessibility="no-hide-descendants"
+            style={[styles.adjacentPage, { left: delta * container.width, width: container.width }]}>
+            {preview ? <PreviewImage key={preview.leaseId} accessible={false} source={{ uri: preview.uri }} contentFit="contain"
+              cachePolicy="none" autoplay={false} style={styles.image}
+              onError={() => { if (!closedRef.current && loadOwnerRef.current === loadKey
+                && galleryRef.current?.adjacentPreviews?.some((item) => item.pageIndex === index && item.preview.leaseId === preview.leaseId)) galleryRef.current.onPreviewFailed(preview.leaseId); }} />
+              : <View style={styles.adjacentLoading}><ActivityIndicator color="#ff9800" /><Text numberOfLines={1} style={styles.meta}>{neighbor.title}</Text></View>}
+          </View>;
+        })}
+        {displayed.width > 0 && displayed.height > 0 && <Animated.View pointerEvents="none" style={[
           styles.imagePosition,
           {
             width: displayed.width,
             height: displayed.height,
             left: (container.width - displayed.width) / 2 + transform.translateX,
-            top: (container.height - displayed.height) / 2 + transform.translateY
+            top: (container.height - displayed.height) / 2 + transform.translateY,
+            transform: [{ translateY: dismissY }, { scale: dismissY.interpolate({
+              inputRange: [-300, 0, 300], outputRange: [0.9, 1, 0.9], extrapolate: "clamp"
+            }) }]
           }
         ]}>
           <View style={[styles.imageScale, { transform: [{ scale: transform.scale }] }]}>
-            <PreviewImage accessible={false} source={{ uri: session.previewUri }} contentFit="fill" style={styles.image}
+            {backdrop && !drawingReady && <PreviewImage key={backdrop.leaseId} accessible={false} source={{ uri: backdrop.uri }} contentFit="fill"
+              cachePolicy="none" autoplay={foreground && !closedRef.current} style={styles.image}
+              onError={() => { if (!closedRef.current && galleryRef.current?.preview?.leaseId === backdrop.leaseId) galleryRef.current.onPreviewFailed(backdrop.leaseId); }} />}
+            {session && <PreviewImage key={session.leaseId} accessible={false} source={{ uri: session.previewUri }} contentFit="fill"
+              cachePolicy="none" style={[styles.image, { opacity: drawingReady ? 1 : 0 }]}
+              autoplay={foreground && !closedRef.current && gallery?.busy !== true}
               onLoad={(event: ImageLoadEventData) => {
+                if (closedRef.current || loadOwnerRef.current !== session.leaseId || galleryRef.current?.busy) return;
                 const { width, height, mediaType, isAnimated } = event.source;
                 try {
                   if (!Number.isFinite(width) || width <= 0 || !Number.isFinite(height) || height <= 0) {
                     throw new Error(mobileMessage(locale, "image.decoderDimensions"));
                   }
                   if (gallery) {
-                    if (width !== gallery.session.expectedWidthPixels || height !== gallery.session.expectedHeightPixels
-                      || isAnimated === true) {
+                    if (!gallerySession || !mobileImageGalleryDimensionsMatch({ width: gallerySession.expectedWidthPixels,
+                      height: gallerySession.expectedHeightPixels, nativeQuarterTurn: gallerySession.nativeQuarterTurn }, width, height)
+                      || !mobileImageGalleryNativeAnimationMatches(session.sourceMediaType, gallerySession.expectedAnimated, isAnimated)) {
                       throw new Error(mobileMessage(locale, "image.galleryMetadata"));
                     }
                     gallery.onDecoded({ width, height, mediaType, isAnimated });
+                  } else if ((session.expectedWidthPixels === undefined) !== (session.expectedHeightPixels === undefined)
+                    || (session.expectedWidthPixels !== undefined
+                      && !mobileImageGalleryDimensionsMatch({ width: session.expectedWidthPixels, height: session.expectedHeightPixels!,
+                        nativeQuarterTurn: session.nativeQuarterTurn }, width, height))) {
+                    throw new Error(mobileMessage(locale, "image.decoderDimensions"));
                   }
                   const next = { width, height };
                   naturalRef.current = next;
@@ -631,64 +892,97 @@ export function MobileImageLightbox({
                   const exactDecoded = { width, height, mediaType, isAnimated };
                   decodedRef.current = exactDecoded;
                   setDecoded(exactDecoded);
+                  setDecodedFor(loadKey);
                   setError("");
                 } catch (failure) {
                   decodedRef.current = undefined;
                   setDecoded(undefined);
                   setError(failure instanceof Error ? failure.message : mobileMessage(locale, "image.verifyError"));
+                  gallery?.onNativeFailed(session.leaseId, false);
                 }
               }}
               onError={() => {
+                if (closedRef.current || loadOwnerRef.current !== session.leaseId || galleryRef.current?.busy) return;
                 decodedRef.current = undefined;
                 setDecoded(undefined);
                 setError(mobileMessage(locale, "image.displayError"));
-              }} />
+                gallery?.onNativeFailed(session.leaseId);
+              }} />}
             {natural.width > 0 && natural.height > 0 && paths.length > 0 && <View
               pointerEvents="none" style={styles.annotation}>
               <SvgXml xml={annotationSvgXml(paths, natural)} width="100%" height="100%" />
             </View>}
           </View>
-        </View>}
-        {!drawingReady && !error && <View pointerEvents="none" style={styles.loading}>
+        </Animated.View>}
+        {!drawingReady && !visibleError && <View pointerEvents="none" style={styles.loading}>
           <ActivityIndicator color="#ff9800" />
         </View>}
+        </Animated.View>
       </View>
+      <Animated.View testID="image-lightbox-chrome" pointerEvents={chromeBusy ? "none" : "box-none"}
+        accessibilityElementsHidden={chromeBusy} importantForAccessibility={chromeBusy ? "no-hide-descendants" : "auto"}
+        style={[styles.chrome, { opacity: chromeBusy ? 0 : dismissY.interpolate({
+          inputRange: [-300, 0, 300], outputRange: [0.4, 1, 0.4], extrapolate: "clamp"
+        }) }]}>
+      <SafeAreaView pointerEvents="box-none" style={styles.chromeSafeArea} edges={["top", "right", "bottom", "left"]}>
+      <View style={styles.header}>
+        <ToolButton label={mobileMessage(locale, "image.close")} onPress={close} disabled={false} />
+        <View pointerEvents="none" style={styles.heading}>
+          <Text numberOfLines={1} style={styles.fileName}>{fileName}</Text>
+          <Text style={styles.meta}>{gallery
+            ? mobileMessage(locale, "image.galleryMeta", {
+              source: gallery.descriptor.sourceLabel,
+              index: gallery.pageIndex + 1,
+              count: gallery.descriptor.pages.length,
+              scale: transform.scale.toFixed(1)
+            })
+            : mobileMessage(locale, "image.zoomMeta", { scale: transform.scale.toFixed(1) })}</Text>
+        </View>
+      </View>
+      <View pointerEvents="box-none" style={styles.footer}>
       {visibleError !== "" && <Text accessibilityRole="alert" style={styles.error}>{visibleError}</Text>}
       {notice !== "" && <Text accessibilityLiveRegion="polite" style={styles.notice}>{notice}</Text>}
       <View style={styles.toolbar}>
-        {gallery && <ToolButton label={mobileMessage(locale, "image.previous")} onPress={() => navigate(gallery.session.pageIndex - 1)}
-          disabled={interactionBusy || gallery.session.pageIndex === 0} />}
+        {gallery && <ToolButton label={mobileMessage(locale, "image.previous")} onPress={() => navigate(gallery.pageIndex - 1)}
+          disabled={busy || gallery.pageIndex === 0} />}
         {gallery && <Text accessibilityLiveRegion="polite" style={styles.pageCount}>
-          {gallery.session.pageIndex + 1} / {gallery.session.pageCount}
+          {gallery.pageIndex + 1} / {gallery.descriptor.pages.length}
         </Text>}
-        {gallery && <ToolButton label={mobileMessage(locale, "image.next")} onPress={() => navigate(gallery.session.pageIndex + 1)}
-          disabled={interactionBusy || gallery.session.pageIndex + 1 >= gallery.session.pageCount} />}
-        {onOutputAction && <ToolButton label={mobileMessage(locale, outputAction === "copy" ? "image.copying" : "image.copy")}
+        {gallery && <ToolButton label={mobileMessage(locale, "image.next")} onPress={() => navigate(gallery.pageIndex + 1)}
+          disabled={busy || gallery.pageIndex + 1 >= gallery.descriptor.pages.length} />}
+        {gallery && visibleError && <ToolButton label={mobileMessage(locale, "image.previewRetry", { name: fileName })}
+          onPress={() => { cancelGesture(); gallery.onRetry(); }} disabled={busy || gallery.busy} />}
+        {gallery?.copySourceLabel && gallery.onCopySource && <ToolButton label={gallery.copySourceLabel}
+          onPress={() => void copySource()} disabled={interactionBusy} />}
+        {onOutputAction && !originalOnly && <ToolButton label={mobileMessage(locale, outputAction === "copy" ? "image.copying" : "image.copy")}
           onPress={() => void output("copy")} disabled={interactionBusy || !outputReady} />}
-        {onOutputAction && <ToolButton label={mobileMessage(locale, outputAction === "save" ? "image.saving" : "image.save")}
+        {onOutputAction && !originalOnly && <ToolButton label={mobileMessage(locale, outputAction === "save" ? "image.saving" : "image.save")}
           onPress={() => void output("save")} disabled={interactionBusy || !outputReady} />}
-        {onOutputAction && <ToolButton label={mobileMessage(locale, outputAction === "share" ? "image.sharing" : "image.share")}
-          onPress={() => void output("share")} disabled={interactionBusy || !outputReady} />}
+        {(originalOnly ? gallery?.onShareOriginal : onOutputAction) && <ToolButton label={mobileMessage(locale, outputAction === "share" ? "image.sharing" : "image.share")}
+          onPress={() => void output("share")} disabled={interactionBusy || !(originalOnly ? drawingReady : outputReady)} />}
         <ToolButton label={mobileMessage(locale, "image.zoomOut")} onPress={() => zoom(-0.5)}
           disabled={interactionBusy || transform.scale <= MOBILE_LIGHTBOX_MIN_SCALE} />
         <ToolButton label={mobileMessage(locale, "image.zoomIn")} onPress={() => zoom(0.5)}
           disabled={interactionBusy || transform.scale >= MOBILE_LIGHTBOX_MAX_SCALE} />
         <ToolButton label={mobileMessage(locale, "image.reset")} onPress={resetTransform}
           disabled={interactionBusy || transform.scale === 1 && transform.translateX === 0 && transform.translateY === 0} />
-        {gallery && gallery.session.addable && <ToolButton label={mobileMessage(locale, busy ? "image.adding" : "image.addOriginal")}
+        {gallery && gallerySession?.addable && <ToolButton label={mobileMessage(locale, busy ? "image.adding" : "image.addOriginal")}
           onPress={() => void addOriginal()} disabled={interactionBusy || !drawingReady} emphasized />}
-        {session.annotatable && <ToolButton label={mobileMessage(locale, "image.annotate")} selected={annotating}
-          onPress={() => { setAnnotating((value) => !value); setError(""); }} disabled={interactionBusy || !drawingReady} />}
-        {session.annotatable && <ToolButton label={mobileMessage(locale, "image.undo")} onPress={undo} disabled={interactionBusy || strokes.length === 0} />}
-        {session.annotatable && <ToolButton label={mobileMessage(locale, "common.discard")} onPress={discard} disabled={interactionBusy || !dirty} />}
-        {session.annotatable && <ToolButton label={mobileMessage(locale, busy ? "common.saving" : gallery ? "image.addMarked" : "common.save")}
+        {canAnnotate && <ToolButton label={mobileMessage(locale, "image.annotate")} selected={annotating}
+          onPress={() => { cancelGesture(); annotatingRef.current = !annotatingRef.current; setAnnotating(annotatingRef.current); setError(""); }} disabled={interactionBusy || !drawingReady} />}
+        {canAnnotate && <ToolButton label={mobileMessage(locale, "image.undo")} onPress={undo} disabled={interactionBusy || strokes.length === 0} />}
+        {canAnnotate && <ToolButton label={mobileMessage(locale, "common.discard")} onPress={discard} disabled={interactionBusy || !dirty} />}
+        {canAnnotate && <ToolButton label={mobileMessage(locale, busy ? "common.saving" : gallery ? "image.addMarked" : "common.save")}
           onPress={() => void save()} disabled={interactionBusy || !dirty || !drawingReady} emphasized />}
       </View>
       {annotating && <Text accessibilityLiveRegion="polite" style={styles.hint}>
         {mobileMessage(locale, "image.drawHint")}
       </Text>}
-      {host}
+      </View>
     </SafeAreaView>
+      </Animated.View>
+      {host}
+    </View>
   </Modal>;
 }
 
@@ -773,12 +1067,19 @@ function annotationSvgXml(
 }
 
 const styles = StyleSheet.create({
-  root: { flex: 1, backgroundColor: "#050607" },
-  header: { minHeight: 64, paddingHorizontal: 12, paddingVertical: 8, flexDirection: "row", alignItems: "center", gap: 12 },
+  root: { flex: 1 },
+  backdrop: { position: "absolute", inset: 0, backgroundColor: "#050607" },
+  chrome: { position: "absolute", inset: 0 },
+  chromeSafeArea: { flex: 1, justifyContent: "space-between" },
+  footer: { backgroundColor: "#050607b3" },
+  header: { minHeight: 64, paddingHorizontal: 12, paddingVertical: 8, flexDirection: "row", alignItems: "center", gap: 12, backgroundColor: "#050607b3" },
   heading: { flex: 1, minWidth: 0 },
   fileName: { color: "#f7f6f3", fontSize: 16, lineHeight: 21, fontWeight: "700" },
   meta: { color: "#adb6b7", fontSize: 12, lineHeight: 17 },
   canvas: { flex: 1, overflow: "hidden" },
+  pageStrip: { position: "absolute", inset: 0 },
+  adjacentPage: { position: "absolute", top: 0, bottom: 0 },
+  adjacentLoading: { flex: 1, alignItems: "center", justifyContent: "center", padding: 24, gap: 12 },
   imagePosition: { position: "absolute" },
   imageScale: { flex: 1 },
   image: { position: "absolute", inset: 0 },

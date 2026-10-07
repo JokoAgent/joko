@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { mkdir, readFile, realpath, stat } from "node:fs/promises";
 import { basename, isAbsolute, join, resolve } from "node:path";
 import { Readable } from "node:stream";
+import { workspaceMediaTypeForPath as mediaTypeForPath } from "./workspace-file-media.js";
 import { listProjectDirectories } from "./project-directory-browser.js";
 import { inspectRemoteHostDirectory, validateRemoteHostDirectoryPath } from "./remote-host-directory-browser.js";
 import { fromBinary, toBinary } from "@bufbuild/protobuf";
@@ -87,6 +88,7 @@ import {
   type BrowserTakeoverInput
 } from "@joko/tool-browser";
 import type { ArtifactRecord, ArtifactRepository, ArtifactStore } from "./artifact-store.js";
+import { ImageThumbnailRenderer, ThumbnailSourceError } from "./image-thumbnail.js";
 import { readWorkspaceHtmlSnapshot } from "./workspace-html-snapshot.js";
 import {
   ArtifactMaintenanceScanChangedError,
@@ -3343,6 +3345,7 @@ export function createConnectServices(application: OrchestratorApplication, proj
     }
   } satisfies ServiceImpl<typeof contract.WorkspaceService>;
 
+  const imageThumbnailRenderer = new ImageThumbnailRenderer(dependencies.artifactStore);
   const artifact = {
     listArtifacts: (request, context) => {
       authenticate(context);
@@ -3524,6 +3527,34 @@ export function createConnectServices(application: OrchestratorApplication, proj
           requiredMediaType: artifactRecord.blob.mimeType
         })
       };
+    },
+    getImageThumbnail: async (request, context) => {
+      const authenticated = authenticate(context);
+      const expected = request.expectedSourceBlob;
+      if (!expected?.blobId || !/^[0-9a-f]{64}$/u.test(expected.sha256Hex) || expected.byteSize < 1n
+        || ![256, 1024].includes(request.maximumEdgePixels)) throw invalidArgument("A canonical source Blob and a 256 or 1024 pixel thumbnail edge are required.");
+      const revoked = new AbortController();
+      const stopRevocation = dependencies.connections.onRevoked(authenticated.id, () => revoked.abort());
+      const signal = AbortSignal.any([context.signal, revoked.signal]);
+      const assertSource = (source: ArtifactRecord) => {
+        if (source.id !== expected.blobId || source.sha256 !== expected.sha256Hex || BigInt(source.byteLength) !== expected.byteSize
+          || source.mimeType !== expected.mediaType || (source.fileName ?? "") !== expected.fileName) throw new ThumbnailSourceError();
+      };
+      try {
+        signal.throwIfAborted();
+        const source = await dependencies.artifactStore.get(expected.blobId); assertSource(source);
+        const result = await imageThumbnailRenderer.read(source, request.maximumEdgePixels, signal);
+        signal.throwIfAborted();
+        if (authenticate(context).id !== authenticated.id) throw new ConnectError("Thumbnail connection changed.", Code.Unauthenticated);
+        assertSource(await dependencies.artifactStore.get(expected.blobId)); signal.throwIfAborted();
+        return { sourceBlob: directArtifactBlob(source), result: "thumbnail" in result
+          ? { case: "thumbnail" as const, value: create(contract.ImageThumbnailSchema, result.thumbnail) }
+          : { case: "unavailable" as const, value: result.unavailable } };
+      } catch (failure) {
+        if (signal.aborted) throw new ConnectError("Image thumbnail read was cancelled.", Code.Canceled);
+        if (failure instanceof ConnectError) throw failure;
+        throw new ConnectError("The canonical image thumbnail source is unavailable or changed.", Code.FailedPrecondition);
+      } finally { stopRevocation(); }
     },
     getArtifactStorageStats: async (request, context) => {
       authenticate(context);
@@ -7767,7 +7798,7 @@ async function mapFilePreview(
     };
   }
   return create(contract.FilePreviewSchema, {
-    entry: mapWorkspaceEntry(workspaceId, mappedEntry),
+    entry: mapWorkspaceEntry(workspaceId, mappedEntry, preview.mediaType),
     content,
     truncated: materialized === undefined && (preview.truncated || byteWindowTruncated)
   });
@@ -23376,30 +23407,7 @@ async function pathExists(path: string): Promise<boolean> {
   }
 }
 
-function mediaTypeForPath(path: string): string {
-  const extension = /(?:\.([^.\/]+))$/u.exec(path)?.[1]?.toLowerCase();
-  switch (extension) {
-    case "md": return "text/markdown";
-    case "txt": return "text/plain";
-    case "json": return "application/json";
-    case "js": case "mjs": case "cjs": return "text/javascript";
-    case "ts": case "tsx": return "text/typescript";
-    case "html": return "text/html";
-    case "css": return "text/css";
-    case "yaml": case "yml": return "application/yaml";
-    case "xml": return "application/xml";
-    case "svg": return "image/svg+xml";
-    case "glb": return "model/gltf-binary";
-    case "gltf": return "model/gltf+json";
-    case "ktx2": return "image/ktx2";
-    case "png": return "image/png";
-    case "jpg": case "jpeg": return "image/jpeg";
-    case "gif": return "image/gif";
-    case "webp": return "image/webp";
-    case "pdf": return "application/pdf";
-    default: return "application/octet-stream";
-  }
-}
+
 
 function languageForPath(path: string): string {
   const fileName = basename(path).toLowerCase();

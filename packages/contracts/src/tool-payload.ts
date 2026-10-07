@@ -22,7 +22,7 @@ const NEW_KEYS = ["newString", "new_string", "newText", "new_text"] as const;
 /**
  * Finds file-oriented diff payloads without changing the raw payload shown to
  * the user. Scanning is bounded; the full value always remains available in
- * the native text control even when structured discovery is skipped.
+ * the client text control even when structured discovery is skipped.
  */
 export function toolPayloadDiffFiles(text: string): readonly ToolPayloadDiffFile[] {
   if (text.length > TOOL_PAYLOAD_DIFF_SCAN_LIMIT) return [];

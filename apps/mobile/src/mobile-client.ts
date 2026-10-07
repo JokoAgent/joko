@@ -4,31 +4,51 @@ import { bytesToHex } from "@noble/hashes/utils.js";
 import { Code } from "@connectrpc/connect";
 import {
   ArchiveSessionMutationSchema, BlobDisposition, BlobRefSchema, CancelQueueItemMutationSchema, CapabilitySupport, CompactSessionMutationSchema, CompactSessionOutcome,
-  ConnectionState, CreateScheduleMutationSchema, CreateSessionMutationSchema,
+  ConnectionState, CreateScheduleMutationSchema, CreateSessionMutationSchema, CloneSessionMutationSchema, ForkSessionMutationSchema, SessionDerivationKind,
   DeleteScheduleMutationSchema, DeleteSessionMessageMutationSchema, DeleteSessionMutationSchema, DeviceKind, DismissInteractionMutationSchema,
-  EditQueueItemMutationSchema, EntityKind, EntityRefSchema, EventSchema, ExecuteUserShellMutationSchema,
+  EditQueueItemMutationSchema, EntityKind, EntityRefSchema, EventSchema, ExecuteUserShellMutationSchema, ExecuteWorkspaceRewindMutationSchema,
   LAN_DISCOVERY_PEER_TTL_MS,
   ModelKeySchema, ModelSelectionSchema, NativeSessionPlacement, NativeSessionStartSchema, NewNativeSessionSchema,
   DeleteScheduleRunMutationSchema, LogoutConnectionMutationSchema, MarkAllScheduleRunsReadMutationSchema,
   MarkScheduleRunReadMutationSchema, MarkScheduleRunsReadMutationSchema, NavigateSessionBranchMutationSchema,
-  OperationPreconditionSchema, OperationState, OperationMutationSchema,
+  OperationPreconditionSchema, OperationState, OperationMutationSchema, RewindSafety,
   MessageRole, PermissionMode, PinSessionMutationSchema, QueueDeliveryMode, QueueItemState, RenameSessionMutationSchema,
   ReorderQueueItemMutationSchema, ResetSessionMutationSchema, ResolveInteractionMutationSchema, RestartScheduleRunMutationSchema,
   RenameDeviceMutationSchema, RevisionSchema, RevokeDeviceMutationSchema,
   CloneProjectScheduleToUserMutationSchema, PromoteScheduleToProjectMutationSchema,
   ReconcileProjectAutomationsMutationSchema, RemoveProjectScheduleMutationSchema,
-  ReviewAttachmentInputSchema, ReviewAttachmentKind, ReviewRunState, SendInputMutationSchema, SessionMessageSearchSessionStatus,
+  ReviewAttachmentInputSchema, ReviewAttachmentKind, ReviewRunState, RunState, SendInputMutationSchema, SessionMessageSearchSessionStatus,
   SessionState, SetQueueInteractionLockMutationSchema, SetQueueItemEditLockMutationSchema, SetScheduleEnabledMutationSchema, SetSessionModelMutationSchema,
   SetSessionPermissionMutationSchema, SetSessionPlanModeMutationSchema, TargetState, capabilityNames,
   StartReviewMutationSchema, TriggerScheduleMutationSchema, UpdateScheduleMutationSchema,
   UpdateVoiceInputServiceSettingsMutationSchema, VoiceInputServiceSettingsPatchSchema,
-  FileKind,
+  FileKind, ImageRefSchema,
   type Artifact, type BackendDescriptor, type BlobRef, type DiscoveredNodeRecord, type Event, type EventCursor, type FilePreview, type FileRevision, type Interaction,
   type Operation, type OperationMutation, type QueueControl, type QueueItem, type Schedule, type Session, type Snapshot, type Target,
   type WorkspaceEntry, type WorkspaceSearchMatch
 } from "@joko/contracts";
 import { mobileVoiceCredentialBindingChanged, type MobileVoiceSettingsTransport } from "./mobile-voice-service-settings";
+import { resolveMobileMessageForkSource, type MobileMessageForkSource } from "./mobile-message-fork";
+import {
+  assertMobileWorkspaceRewindPreview, mobileMessageChangeSet, mobileMessageRewindIdle, mobileRewindCapability,
+  mobileRewindToStartSupported, mobileWorkspaceRewindExpiresAt, resolveMobileMessageRewindSource,
+  type MobileMessageRewindControls, type MobileMessageRewindPreview, type MobileMessageRewindResult
+} from "./mobile-message-rewind";
+import {
+  mobileSessionOriginKey, mobileSessionOriginSessionKey, mobileSessionOriginSourceAvailable,
+  projectMobileSessionOrigin, type MobileSessionOriginControls
+} from "./mobile-session-origin";
+import { buildMobileMessageDeepLink, buildMobileTaskDeepLink, parseMobileNativeIntent } from "./mobile-native-intent";
 import { awaitMobileMarkdownResourceRead, MobileMarkdownResourceReader, type MobileMarkdownResourceContext, type MobileMarkdownResourceDescriptor } from "./mobile-markdown-resources";
+import { mobileFileTextSource } from "./mobile-file-text-source";
+import { MobileFileHtmlReader, type MobileFileHtmlContext, type MobileFileHtmlDescriptor } from "./mobile-file-html-reader";
+import { mobileFileHtmlComplete } from "./mobile-file-html";
+import { HtmlResourceBudgetError } from "./mobile-file-html-resources";
+import { mobileGeneratedPreviewPages, mobileWorkspacePreviewPages, type MobileFilesPreviewPage, type MobileFilesPreviewPager } from "./mobile-files-preview-pager";
+import { MobileTimelineImageReader, type MobileTimelineImageContext, type MobileTimelineImagePreview } from "./mobile-timeline-images";
+import { MobileFilesThumbnailReader, mobileFilesThumbnailKind, mobileFilesThumbnailSourceKey, mobileFilesDocumentBytes,
+  MOBILE_FILES_DOCUMENT_MAXIMUM_BYTES, MOBILE_FILES_IMAGE_MAXIMUM_BYTES, type MobileFilesThumbnailContext, type MobileFilesThumbnailPreview } from "./mobile-files-thumbnails";
+import type { MobileFilesThumbnailCache } from "./mobile-files-thumbnail-cache";
 import {
   MobileCredentialStorageError, profileFromCredential,
   type MobileConnectionProfile, type MobileStorage, type PendingOperation
@@ -54,6 +74,7 @@ import {
   emptyMobileFilesState,
   filterWorkspaceFileNames,
   isTextMediaType,
+  isTextFilePreviewMetadata,
   normalizeMediaType,
   resolveMobileWorkspaceAuthority,
   sortArtifacts,
@@ -69,6 +90,8 @@ import {
   type MobileFilesState,
   type MobileWorkspaceAuthority
 } from "./workspace-files";
+import { sortMobileGeneratedArtifacts, sortMobileWorkspaceEntries, type MobileFilesSortMode } from "./mobile-files-presentation";
+import type { MobileFilesClipboardLease } from "./mobile-files-clipboard";
 import {
   mobileMediaPreviewKind,
   type MobileMediaPreviewFiles,
@@ -108,6 +131,7 @@ import type {
 } from "./composer-draft-store";
 import {
   emptyMobileComposerDraft,
+  appendMobileFileSelectionQuote,
   insertMobileArtifactMention,
   insertMobileWorkspaceMention,
   mobileComposerDraftWithoutPrefix,
@@ -239,6 +263,7 @@ import {
   MOBILE_ANNOTATION_MAX_BURN_DIMENSION,
   canAnnotateMobileImage,
   encodeMobileBase64,
+  mobileImageRequiresNativeRaster,
   mobileAnnotationOutputMediaType,
   normalizeMobileAnnotationStrokes,
   sniffMobileImageMediaType,
@@ -246,6 +271,7 @@ import {
 } from "./mobile-image-annotation";
 import {
   mobileAnnotatedImageFileName,
+  mobileRasterizedImageFileName,
   type MobileBurnedImage,
   type MobileComposerImageCommitResult,
   type MobileComposerImageEditorRequest,
@@ -253,11 +279,14 @@ import {
 } from "./mobile-composer-image-editor";
 import {
   assertMobileImageGalleryDimensions,
+  confirmMobileImageGalleryCanvas,
   inspectMobileImageGalleryBytes,
+  mobileImageGalleryDimensionsMatch,
   mobileImageGalleryMediaType,
+  mobileImageGalleryNativeAnimationMatches,
+  mobileImageGalleryPreviewUri,
   mobileImageGalleryPage,
   mobileImageGalleryPageSummary,
-  mobileTimelineGalleryMessage,
   mobileTimelineGalleryPages,
   mobileTimelineGalleryWindowKey,
   sameMobileImageGalleryPage,
@@ -320,6 +349,24 @@ import {
 
 export type { MobileStorage, PendingOperation } from "./connection-storage";
 
+export interface MobileTaskCloneControls {
+  readonly authorityKey: string;
+  readonly surfaceOwnerKey: string;
+  readonly sourceSessionId: string;
+  readonly sourceName: string;
+  readonly canClone: boolean;
+}
+
+export type MobileTaskCloneResult = { readonly kind: "cloned"; readonly sessionId: string }
+  | { readonly kind: "unknown" | "rejected" | "retired" };
+
+export interface MobileMessageForkControls extends Omit<MobileTaskCloneControls, "canClone"> {
+  readonly canFork: boolean;
+  readonly source: MobileMessageForkSource;
+}
+export type MobileMessageForkResult = { readonly kind: "forked"; readonly sessionId: string; readonly draftRestored: boolean }
+  | { readonly kind: "unknown" | "rejected" | "retired" };
+
 export type SavedCredentialState = "unknown" | "checking" | "available" | "missing" | "unreadable" | "unavailable" | "identity-conflict" | "offline";
 
 export interface SavedMobileConnection extends MobileConnectionProfile {
@@ -359,6 +406,7 @@ export interface MobileState {
   readonly historyEnd: boolean;
   readonly before?: EventCursor;
   readonly pending: readonly PendingOperation[];
+  readonly restoredComposerDraft?: { readonly profileId: string; readonly sessionId: string; readonly sequence: number };
   readonly homeSearchQuery: string;
   readonly homeSearchFilter: MobileHomeStatusFilter;
   readonly homeSearchStatus: "idle" | "searching" | "ready" | "error";
@@ -399,6 +447,12 @@ interface MobileFilesContext {
   readonly authority: MobileWorkspaceAuthority;
   readonly key: string;
 }
+interface MobileFilesPreviewPagerLease {
+  readonly context: MobileFilesContext; readonly epoch: number; readonly controller: AbortController;
+  readonly window: { readonly kind: "workspace"; readonly parent: string; readonly revision: string } | { readonly kind: "generated"; readonly revision: string };
+  descriptor: MobileFilesPreviewPager;
+  original?: WorkspaceEntry;
+}
 
 interface MobileWorkspaceModelObservation {
   readonly revisionKey: string;
@@ -434,6 +488,7 @@ interface MobileComposerImageEditLease {
 }
 
 interface MobileImageGalleryLease {
+  previewLeaseIds?: Set<string>;
   readonly leaseId: string;
   readonly profileId: string;
   readonly credentialKey: string;
@@ -454,7 +509,7 @@ interface MobileImageGalleryLease {
     | {
         readonly kind: "timeline";
         readonly eventId: string;
-        readonly messageId: string;
+        readonly pageId: string;
         readonly windowKey: string;
       }
     | {
@@ -466,10 +521,11 @@ interface MobileImageGalleryLease {
     readonly page: MobileImageGalleryPage;
     readonly pageIndex: number;
     readonly bytes: Uint8Array;
-    readonly decoded: MobileImageGalleryDecodedImage;
+    decoded: MobileImageGalleryDecodedImage;
     confirmed: boolean;
   };
   operationInFlight: boolean;
+  shareController?: AbortController;
 }
 
 interface MobileTimelinePreviewLease {
@@ -642,9 +698,15 @@ export class MobileClient {
   #homeSearchEpoch = 0;
   #homeSearchAbort?: AbortController;
   #filesEpoch = 0;
+  #filesCopyEpoch = 0;
   #filesListAbort?: AbortController;
   #filesSearchAbort?: AbortController;
   #filesPreviewAbort?: AbortController;
+  #filesPreviewPager?: MobileFilesPreviewPagerLease;
+  #filesPagerOpeningAbort?: AbortController;
+  #filesPagerNavigationAbort?: AbortController;
+  #filesPagerReadActive = false;
+  #filesPagerReadWaiting?: { grant(): void; cancel(): void };
   #filesMediaPreview?: MobileMediaPreviewLease;
   #filesPdfPreview?: MobilePdfPreviewLease;
   #filesModelPreview?: MobileModelPreviewLease;
@@ -659,6 +721,11 @@ export class MobileClient {
   #imageGallery?: MobileImageGalleryLease;
   #conversationShare?: MobileConversationShareLease;
   #markdownResources = new MobileMarkdownResourceReader();
+  #fileHtmlResources = new MobileFileHtmlReader();
+  #timelineImages = new MobileTimelineImageReader();
+  #galleryBlobRead: ReturnType<MobileNetwork["downloadBlob"]> | undefined;
+  #filesThumbnails: MobileFilesThumbnailReader;
+  #messageRewindPreviews = new WeakSet<MobileMessageRewindPreview>();
   #automationEpoch = 0;
   #automationAbort?: AbortController;
   #automationHistoryAbort?: AbortController;
@@ -696,8 +763,9 @@ export class MobileClient {
     private readonly modelPreviewFiles?: MobileModelPreviewFiles,
     private readonly fileShare?: Pick<MobileFileShare, "perform">,
     private readonly offlineCache?: Pick<MobileOfflineCache, "load" | "save" | "clear">,
-    private readonly readOnlyDictionaryCache?: Pick<MobileVoiceDictionaryReadOnlyCache, "clear">
-  ) {}
+    private readonly readOnlyDictionaryCache?: Pick<MobileVoiceDictionaryReadOnlyCache, "clear">,
+    filesThumbnailDisk?: Pick<MobileFilesThumbnailCache, "get" | "put" | "remove">
+  ) { this.#filesThumbnails = new MobileFilesThumbnailReader(filesThumbnailDisk); }
 
   get state(): MobileState { return this.#state; }
 
@@ -856,7 +924,16 @@ export class MobileClient {
       next = { ...next, timelinePreview: undefined };
     }
     this.#state = next;
+    if ((this.#filesPreviewPager && !this.#filesPreviewPagerCurrent(this.#filesPreviewPager)) || (next.files.previewPager && !this.#filesPreviewPager)) {
+      this.#retireFilesPreviewPager(); this.#filesPreviewAbort?.abort();
+      this.#state = { ...next, files: { ...next.files, preview: undefined, previewPager: undefined } };
+    }
     this.#markdownResources.retireStale();
+    this.#fileHtmlResources.retireStale();
+    this.#timelineImages.retainOwner(this.#taskAuthorityKey());
+    this.#timelineImages.retireStale();
+    this.#filesThumbnails.retainOwner(next.files.open ? this.filesAuthorityKey() : undefined);
+    this.#filesThumbnails.retireStale();
     if (this.#fileShareLease?.phase === "preparing"
       && !this.#fileShareLeaseCurrent(this.#fileShareLease)) {
       this.#fileShareLease.controller.abort();
@@ -903,6 +980,9 @@ export class MobileClient {
     this.#retireImageGallery();
     if (this.#conversationShare) this.releaseConversationShare(this.#conversationShare.leaseId);
     this.#markdownResources.releaseAll();
+    this.#fileHtmlResources.releaseAll();
+    this.#timelineImages.releaseAll();
+    this.#filesThumbnails.releaseAll();
     if (this.#timer !== undefined) clearTimeout(this.#timer);
     if (this.#proofTimer !== undefined) clearTimeout(this.#proofTimer);
     if (this.#projectionTimer !== undefined) clearTimeout(this.#projectionTimer);
@@ -3380,6 +3460,156 @@ export class MobileClient {
 
   filesAuthorityKey(): string | undefined { return this.#filesAuthorityKey(this.#state); }
 
+  async prepareFilesThumbnail(ownerKey: string, source: MobileFilesComposerSource, signal: AbortSignal): Promise<MobileFilesThumbnailPreview> {
+    signal.throwIfAborted(); const context = this.#filesContext(); const epoch = this.#filesEpoch;
+    const windowKey = mobileFilesGalleryWindowKey(this.#state.files); const kind = mobileFilesThumbnailKind(source);
+    if (!kind || source.kind === "search-result" || context.key !== ownerKey) throw new Error("The file miniature has no current source.");
+    const assertCurrent = (currentSignal?: AbortSignal): void => {
+      currentSignal?.throwIfAborted();
+      if (!this.#currentFiles(epoch, ownerKey) || this.#credential !== context.credential || this.#state.files.status !== "ready"
+        || mobileFilesGalleryWindowKey(this.#state.files) !== windowKey || this.#state.files.preview || this.#imageGallery
+        || !filesComposerSourceIsCurrent(this.#state.files, source)) throw new Error("The file miniature source changed.");
+    };
+    assertCurrent(signal);
+    const maximum = BigInt(kind === "image" ? MOBILE_FILES_IMAGE_MAXIMUM_BYTES : MOBILE_FILES_DOCUMENT_MAXIMUM_BYTES);
+    const revision = source.kind === "workspace-entry" ? source.entry.revision : undefined;
+    const blob = source.kind === "artifact" ? source.artifact.blob : undefined;
+    const size = revision?.byteSize ?? blob?.byteSize;
+    if (size === undefined || size < 0n) throw new Error("The file miniature source metadata is unavailable.");
+    const directoryRevision = this.#state.files.directoryRevision; const artifactsRevision = this.#state.files.artifactsRevision;
+    const thumbnailContext: MobileFilesThumbnailContext = { ownerKey, sourceKey: mobileFilesThumbnailSourceKey(source), assertCurrent,
+      revalidate: async (currentSignal) => {
+        assertCurrent(currentSignal);
+        if (source.kind === "workspace-entry") {
+          if (!revision || source.entry.workspaceId !== context.authority.workspace.workspaceId || !directoryRevision) throw new Error("The miniature Workspace source is unfenced.");
+          const directory = await this.network.listWorkspaceDirectory(context.credential, source.entry.workspaceId, workspaceParentPath(source.entry.relativePath), currentSignal);
+          assertCurrent(currentSignal);
+          const matches = directory.entries.filter((entry) => entry.relativePath === source.entry.relativePath);
+          if (directory.revision !== directoryRevision || matches.length !== 1 || !sameFilesWorkspaceEntry(matches[0]!, source.entry)) throw new Error("The authenticated miniature Workspace source changed.");
+        } else {
+          if (!artifactsRevision) throw new Error("The miniature Generated source is unfenced.");
+          await this.#revalidateGeneratedShareArtifact(context, source.artifact, artifactsRevision, currentSignal); assertCurrent(currentSignal);
+        }
+      },
+      read: async (currentSignal) => {
+        assertCurrent(currentSignal); if (size > maximum) return undefined;
+        let imageBlob = blob;
+        if (source.kind === "workspace-entry") {
+          const entry = source.entry;
+          if (kind === "text") {
+            const preview = await this.network.readWorkspaceFile(context.credential, entry.workspaceId, entry.relativePath, revision!, currentSignal);
+            assertCurrent(currentSignal); assertWorkspaceFilePreview(entry.workspaceId, entry.relativePath, revision!, preview);
+            if (preview.entry?.kind !== FileKind.REGULAR || normalizeMediaType(preview.entry.mediaType) !== normalizeMediaType(entry.mediaType)) throw new Error("The miniature document source changed.");
+            return preview.content.case === "text" && preview.content.value.startByte === 0n && !preview.truncated
+              && new TextEncoder().encode(preview.content.value.utf8Text).length <= MOBILE_FILES_DOCUMENT_MAXIMUM_BYTES
+              ? { kind: "text", text: preview.content.value.utf8Text } : undefined;
+          }
+          const materialized = await this.network.materializeWorkspaceFileBlob(context.credential, entry.workspaceId, entry.relativePath, revision!, currentSignal);
+          assertCurrent(currentSignal); const fresh = materialized.entry; imageBlob = materialized.blob;
+          if (fresh.workspaceId !== entry.workspaceId || fresh.relativePath !== entry.relativePath || fresh.kind !== FileKind.REGULAR
+            || normalizeMediaType(fresh.mediaType) !== normalizeMediaType(entry.mediaType) || !fresh.revision || !workspaceComposerRevisionMatches(revision!, fresh.revision)
+            || fresh.revision.byteSize !== imageBlob.byteSize || fresh.revision.sha256Hex !== imageBlob.sha256Hex
+            || imageBlob.fileName !== workspaceBasename(entry.relativePath) || normalizeMediaType(imageBlob.mediaType) !== normalizeMediaType(entry.mediaType)) throw new Error("The miniature Workspace Blob changed.");
+        }
+        if (!imageBlob) throw new Error("The miniature canonical Blob is unavailable.");
+        if (kind === "text") {
+          const download = await this.network.downloadBlob(context.credential, imageBlob, currentSignal); assertCurrent(currentSignal);
+          const text = mobileFilesDocumentBytes(imageBlob, download); return text === undefined ? undefined : { kind: "text", text };
+        }
+        const thumbnail = await this.network.readImageThumbnail(context.credential, imageBlob, 256, currentSignal); assertCurrent(currentSignal);
+        if (thumbnail) return { kind: "image", blob: imageBlob, bytes: thumbnail.data, mediaType: thumbnail.mediaType, thumbnail };
+        const original = await this.network.downloadBlob(context.credential, imageBlob, currentSignal); assertCurrent(currentSignal);
+        return { kind: "image", blob: imageBlob, ...original };
+      } };
+    return this.#filesThumbnails.prepare(thumbnailContext, signal);
+  }
+
+  confirmFilesThumbnail(leaseId: string, native: MobileImageGalleryNativeDecode): void { this.#filesThumbnails.confirm(leaseId, native); }
+  releaseFilesThumbnail(leaseId: string, discard = false): void { this.#filesThumbnails.release(leaseId, discard); }
+
+  prepareFilesPathCopy(expectedFiles: MobileFilesState, source?: MobileFilesComposerSource): MobileFilesClipboardLease {
+    if (this.#state.files !== expectedFiles) throw new Error("The displayed Files copy surface has changed.");
+    const context = this.#filesContext(); const epoch = this.#filesEpoch;
+    const copyEpoch = this.#filesCopyEpoch;
+    const windowKey = mobileFilesGalleryWindowKey(this.#state.files);
+    const location = this.#state.files.location;
+    const assertCurrent = (signal?: AbortSignal): void => {
+      signal?.throwIfAborted();
+      if (!this.#currentFiles(epoch, context.key) || this.#state.files.status !== "ready" || this.#filesCopyEpoch !== copyEpoch || mobileFilesGalleryWindowKey(this.#state.files) !== windowKey
+        || this.#state.files.preview || this.#imageGallery
+        || (source && !filesComposerSourceIsCurrent(this.#state.files, source))) throw new Error("The Files copy source is no longer current.");
+    };
+    assertCurrent();
+    if (!source) {
+      if (location.kind !== "workspace" || !this.#state.files.directoryRevision) throw new Error("Select a known Workspace directory before copying its path.");
+      return { text: canonicalWorkspacePath(location.path, true) || ".", kind: "path", assertCurrent };
+    }
+    if (source.kind === "workspace-entry") return { ...mobileFilesWorkspaceClipboardValue(source.entry.relativePath), assertCurrent };
+    if (source.kind !== "artifact") throw new Error("Select a current browse item before copying its path.");
+    return { ...mobileFilesGeneratedClipboardValue(source.artifact.blob?.fileName), assertCurrent };
+  }
+
+  prepareFilesPreviewPathCopy(
+    expectedFiles: MobileFilesState,
+    pagerId: string,
+    pageKey: string
+  ): MobileFilesClipboardLease {
+    if (this.#state.files !== expectedFiles) throw new Error("The displayed Files preview surface has changed.");
+    const lease = this.#filesPreviewPager;
+    const copyEpoch = this.#filesCopyEpoch;
+    if (!lease || lease.descriptor.id !== pagerId || expectedFiles.previewPager !== lease.descriptor
+      || !this.#filesPreviewPagerCurrent(lease)) throw new Error("The Files preview window is no longer current.");
+    const descriptor = lease.descriptor;
+    const page = descriptor.pages[descriptor.index];
+    if (!page || page.key !== pageKey || expectedFiles.preview?.kind === "loading") {
+      throw new Error("Select a resolved current file preview before copying its path.");
+    }
+    const value = page.kind === "workspace"
+      ? mobileFilesWorkspaceClipboardValue(page.entry.relativePath)
+      : mobileFilesGeneratedClipboardValue(page.artifact.blob?.fileName);
+    const assertCurrent = (signal?: AbortSignal): void => {
+      signal?.throwIfAborted();
+      if (this.#filesCopyEpoch !== copyEpoch || this.#filesPreviewPager !== lease || lease.descriptor !== descriptor
+        || !this.#filesPreviewPagerCurrent(lease) || this.#imageGallery
+        || descriptor.pages[descriptor.index] !== page || this.#state.files.preview?.kind === "loading") {
+        throw new Error("The visible Files preview page changed before its path was copied.");
+      }
+    };
+    assertCurrent();
+    return { ...value, assertCurrent };
+  }
+
+  prepareFilesImageGalleryPathCopy(
+    galleryLeaseId: string,
+    loadId: string,
+    pageId: string
+  ): MobileFilesClipboardLease {
+    const lease = this.#imageGallery;
+    const loaded = lease?.loaded;
+    const copyEpoch = this.#filesCopyEpoch;
+    if (!lease || lease.leaseId !== galleryLeaseId || lease.source.kind !== "files" || lease.operationInFlight
+      || !loaded || loaded.loadId !== loadId || loaded.page.pageId !== pageId || !this.imageGalleryCurrent(galleryLeaseId)) {
+      throw new Error("The Files image gallery page is no longer current.");
+    }
+    const source = loaded.page.source;
+    const value = source.kind === "workspace"
+      ? mobileFilesWorkspaceClipboardValue(source.relativePath)
+      : source.kind === "artifact"
+        ? mobileFilesGeneratedClipboardValue(loaded.page.blob.fileName)
+        : undefined;
+    if (!value) throw new Error("The current gallery page does not belong to Files.");
+    const assertCurrent = (signal?: AbortSignal): void => {
+      signal?.throwIfAborted();
+      if (this.#filesCopyEpoch !== copyEpoch || this.#imageGallery !== lease || lease.source.kind !== "files"
+        || lease.operationInFlight || lease.loaded !== loaded || loaded.loadId !== loadId
+        || loaded.page.pageId !== pageId || !this.imageGalleryCurrent(galleryLeaseId)) {
+        throw new Error("The visible Files image changed before its path was copied.");
+      }
+    };
+    assertCurrent();
+    return { ...value, assertCurrent };
+  }
+
   async openFiles(): Promise<void> {
     await this.#openFilesAt("");
   }
@@ -3415,6 +3645,7 @@ export class MobileClient {
 
   async refreshFiles(): Promise<void> {
     if (!this.#state.files.open) return;
+    this.#filesCopyEpoch++;
     let context: MobileFilesContext;
     try { context = this.#filesContext(); }
     catch {
@@ -3559,6 +3790,166 @@ export class MobileClient {
     }
   }
 
+  async openFilesPreviewPager(source: MobileFilesComposerSource, sort: MobileFilesSortMode = "name"): Promise<void> {
+    const context = this.#filesContext(); const epoch = this.#filesEpoch;
+    if (!this.#state.files.open || !filesComposerSourceIsCurrent(this.#state.files, source)) throw new Error("Select a current Files item before previewing it.");
+    const prior = this.#state.files.preview;
+    this.#retireFilesPreviewPager(); this.#filesPreviewAbort?.abort();
+    const controller = new AbortController(); this.#filesPagerOpeningAbort = controller;
+    const assertCurrent = () => {
+      controller.signal.throwIfAborted();
+      if (this.#filesPagerOpeningAbort !== controller || !this.#currentFiles(epoch, context.key)) throw new Error("The Files preview owner changed.");
+    };
+    const artifact = filesComposerArtifact(source);
+    const path = artifact ? "" : canonicalWorkspacePath(source.kind === "workspace-entry" ? source.entry.relativePath
+      : source.kind === "search-result" && source.result.kind !== "artifact" ? source.result.kind === "workspace-content" ? source.result.match.relativePath : source.result.relativePath : "");
+    const title = artifact ? artifactTitle(artifact) : workspaceBasename(path);
+    this.#set({ files: { ...this.#state.files, previewPager: undefined,
+      preview: prior?.kind === "text" && prior.sourceLabel === path ? prior : { title, sourceLabel: artifact ? "Generated" : path,
+        mediaType: artifact?.blob?.mediaType ?? "application/octet-stream", byteSize: artifact?.blob?.byteSize ?? 0n, revisionKey: "resolving:" + title, kind: "loading" } } });
+    let timedOut = false;
+    const deadline = setTimeout(() => { timedOut = true; controller.abort(); }, 15_000);
+    try {
+      let pages: readonly MobileFilesPreviewPage[]; let window: MobileFilesPreviewPagerLease["window"]; let selectedKey: string;
+      let directory: Awaited<ReturnType<MobileNetwork["listWorkspaceDirectory"]>> | undefined;
+      let catalog: Awaited<ReturnType<MobileNetwork["listSessionArtifacts"]>> | undefined;
+      if (artifact) {
+        catalog = await this.#readFilesPager(() => this.network.listSessionArtifacts(context.credential, context.authority.sessionId, controller.signal), controller.signal);
+        assertCurrent();
+        const matches = catalog.artifacts.filter((item) => item.artifactId === artifact.artifactId);
+        if (!catalog.revision || matches.length !== 1 || !sameFilesComposerArtifact(matches[0]!, artifact)) throw new Error("The Generated file changed before its preview opened.");
+        pages = mobileGeneratedPreviewPages(catalog.artifacts, sort, artifact.artifactId);
+        window = { kind: "generated", revision: catalog.revision }; selectedKey = JSON.stringify(["artifact", artifact.artifactId]);
+      } else {
+        const parent = workspaceParentPath(path);
+        directory = await this.#readFilesPager(() => this.network.listWorkspaceDirectory(context.credential, context.authority.workspace.workspaceId, parent, controller.signal), controller.signal);
+        assertCurrent(); const seen = new Set<string>();
+        for (const item of directory.entries) {
+          const canonical = canonicalWorkspacePath(item.relativePath);
+          if (item.workspaceId !== context.authority.workspace.workspaceId || workspaceParentPath(canonical) !== parent || seen.has(canonical)) throw new Error("The preview directory returned an ambiguous canonical file.");
+          seen.add(canonical);
+        }
+        const entry = directory.entries.find((item) => item.relativePath === path);
+        if (!directory.revision || !entry?.revision || entry.kind !== FileKind.REGULAR) throw new Error("The selected preview file is no longer available.");
+        if (source.kind === "workspace-entry" && !sameFilesWorkspaceEntry(entry, source.entry)) throw new Error("The selected preview file changed.");
+        if (source.kind === "search-result" && source.result.kind === "workspace-content"
+          && (!source.result.match.revision || workspaceEntryRevisionKey(source.result.match.revision) !== workspaceEntryRevisionKey(entry.revision))) throw new Error("The file search result changed.");
+        pages = mobileWorkspacePreviewPages(directory.entries, sort, entry, source.kind === "search-result" ? source : { kind: "workspace-entry", entry });
+        window = { kind: "workspace", parent, revision: directory.revision }; selectedKey = JSON.stringify(["workspace", entry.workspaceId, path]);
+      }
+      assertCurrent();
+      const index = pages.findIndex((page) => page.key === selectedKey);
+      if (index < 0) throw new Error("The selected file left its preview window.");
+      const descriptor: MobileFilesPreviewPager = { id: this.newId(), pages, index, sort };
+      const lease: MobileFilesPreviewPagerLease = { context, epoch, controller, descriptor, window };
+      this.#filesPreviewPager = lease;
+      const files = this.#state.files;
+      this.#set({ files: { ...files, previewPager: descriptor,
+        ...(catalog ? { artifacts: catalog.artifacts, artifactsRevision: catalog.revision } : {}),
+        ...(directory && window.kind === "workspace" && files.location.kind === "workspace" && files.location.path === window.parent
+          ? { entries: directory.entries, directoryRevision: directory.revision } : {}) } });
+      const selected = pages[index]!;
+      if (prior?.kind === "text" && selected.kind === "workspace" && prior.workspaceEntry?.revision
+        && prior.sourceLabel === path && workspaceComposerRevisionMatches(selected.entry.revision!, prior.workspaceEntry.revision)) { lease.original = prior.workspaceEntry; return; }
+      await this.selectFilesPreviewPage(descriptor.id, selectedKey, false);
+      if (timedOut) throw new Error("The file preview timed out. Open Files again.");
+    } catch (error) {
+      if (!this.#currentFiles(epoch, context.key) || this.#filesPagerOpeningAbort !== controller || controller.signal.aborted && !timedOut) return;
+      this.#retireFilesPreviewPager();
+      this.#set({ files: { ...this.#state.files, previewPager: undefined, preview: { title, sourceLabel: artifact ? "Generated" : path,
+        mediaType: artifact?.blob?.mediaType ?? "application/octet-stream", byteSize: artifact?.blob?.byteSize ?? 0n,
+        revisionKey: "unavailable:" + title, kind: "error", reason: timedOut ? "The file preview timed out. Open Files again." : message(error) } } });
+    } finally { clearTimeout(deadline); if (this.#filesPagerOpeningAbort === controller) this.#filesPagerOpeningAbort = undefined; }
+  }
+
+  async selectFilesPreviewPage(pagerId: string, pageKey: string, revalidate = true): Promise<void> {
+    const lease = this.#filesPreviewPager;
+    if (!lease || lease.descriptor.id !== pagerId || !this.#filesPreviewPagerCurrent(lease)) throw new Error("The Files preview window was retired.");
+    const index = lease.descriptor.pages.findIndex((page) => page.key === pageKey);
+    if (index < 0) throw new Error("Select a file from the current preview window.");
+    const page = lease.descriptor.pages[index]!;
+    this.#filesPagerNavigationAbort?.abort(); this.#filesPreviewAbort?.abort();
+    const retiredBinary = this.#releaseFilesBinaryPreviews().then(() => ({ ok: true as const }), (error: unknown) => ({ ok: false as const, error }));
+    lease.original = undefined;
+    const controller = new AbortController(); this.#filesPagerNavigationAbort = controller;
+    const abort = () => controller.abort(); lease.controller.signal.addEventListener("abort", abort, { once: true });
+    lease.descriptor = { ...lease.descriptor, index };
+    const base = { title: page.title, sourceLabel: page.kind === "workspace" ? page.entry.relativePath : "Generated",
+      mediaType: page.mediaType, byteSize: page.byteSize, revisionKey: page.key };
+    this.#set({ files: { ...this.#state.files, previewPager: lease.descriptor, preview: { ...base, kind: "loading" } } });
+    let timedOut = false; let windowChanged: string | undefined; const deadline = setTimeout(() => { timedOut = true; controller.abort(); }, 15_000);
+    const assertCurrent = () => {
+      controller.signal.throwIfAborted();
+      if (this.#filesPagerNavigationAbort !== controller || !this.#filesPreviewPagerCurrent(lease) || lease.descriptor.pages[lease.descriptor.index]?.key !== page.key) {
+        throw new Error("The visible file preview changed.");
+      }
+    };
+    try {
+      await this.#readFilesPager(async () => {
+        assertCurrent();
+        const release = await retiredBinary; if (!release.ok) throw release.error;
+        assertCurrent();
+        if (revalidate) {
+          if (lease.window.kind === "workspace") {
+            const directory = await this.network.listWorkspaceDirectory(lease.context.credential, lease.context.authority.workspace.workspaceId, lease.window.parent, controller.signal);
+            assertCurrent();
+            if (directory.revision !== lease.window.revision) { windowChanged = "The Files directory changed. Open the file again."; this.closeFilesPreview(); throw new Error(windowChanged); }
+          } else {
+            const catalog = await this.network.listSessionArtifacts(lease.context.credential, lease.context.authority.sessionId, controller.signal);
+            assertCurrent();
+            if (catalog.revision !== lease.window.revision) { windowChanged = "The Generated catalog changed. Open the file again."; this.closeFilesPreview(); throw new Error(windowChanged); }
+          }
+        }
+        assertCurrent(); await this.#releaseFilesBinaryPreviews(); assertCurrent();
+        if (page.kind === "workspace") await this.#previewWorkspaceFile(page.entry.relativePath, page.entry.revision!, page.title, controller.signal);
+        else await this.previewArtifact(page.artifact, controller.signal);
+      }, controller.signal);
+    } catch (error) {
+      if (windowChanged) throw new Error(windowChanged);
+      if (this.#filesPagerNavigationAbort !== controller || !this.#filesPreviewPagerCurrent(lease)) return;
+      if (controller.signal.aborted && !timedOut) return;
+      this.#set({ files: { ...this.#state.files, preview: { ...base, kind: "error", reason: timedOut ? "The file preview timed out. Try another page or open Files again." : message(error) } } });
+    } finally {
+      clearTimeout(deadline); lease.controller.signal.removeEventListener("abort", abort);
+      if (this.#filesPagerNavigationAbort === controller) this.#filesPagerNavigationAbort = undefined;
+    }
+  }
+
+  #filesPreviewPagerCurrent(lease: MobileFilesPreviewPagerLease): boolean {
+    const files = this.#state.files;
+    return this.#filesPreviewPager === lease && !lease.controller.signal.aborted && this.#credential === lease.context.credential
+      && this.#currentFiles(lease.epoch, lease.context.key) && files.status === "ready" && !!files.preview && files.previewPager === lease.descriptor
+      && (lease.window.kind !== "generated" || files.artifactsRevision === lease.window.revision)
+      && (lease.window.kind !== "workspace" || files.location.kind !== "workspace" || files.location.path !== lease.window.parent || files.directoryRevision === lease.window.revision);
+  }
+  #retireFilesPreviewPager(): void {
+    this.#filesPagerOpeningAbort?.abort(); this.#filesPagerOpeningAbort = undefined;
+    this.#filesPagerNavigationAbort?.abort(); this.#filesPagerNavigationAbort = undefined;
+    this.#filesPreviewPager?.controller.abort(); this.#filesPreviewPager = undefined;
+    void this.#releaseFilesBinaryPreviews().catch(() => undefined);
+  }
+  async #readFilesPager<T>(read: () => Promise<T>, signal: AbortSignal): Promise<T> {
+    signal.throwIfAborted();
+    if (this.#filesPagerReadActive) await new Promise<void>((resolve, reject) => {
+      const waiting = { grant: () => { signal.removeEventListener("abort", waiting.cancel); resolve(); },
+        cancel: () => { signal.removeEventListener("abort", waiting.cancel); if (this.#filesPagerReadWaiting === waiting) this.#filesPagerReadWaiting = undefined;
+          reject(new Error("The file preview was cancelled.")); } };
+      this.#filesPagerReadWaiting?.cancel(); this.#filesPagerReadWaiting = waiting; signal.addEventListener("abort", waiting.cancel, { once: true });
+    });
+    if (signal.aborted) {
+      this.#filesPagerReadActive = false; const waiting = this.#filesPagerReadWaiting; this.#filesPagerReadWaiting = undefined;
+      if (waiting) { this.#filesPagerReadActive = true; waiting.grant(); }
+      signal.throwIfAborted();
+    }
+    this.#filesPagerReadActive = true;
+    const release = () => {
+      this.#filesPagerReadActive = false; const waiting = this.#filesPagerReadWaiting; this.#filesPagerReadWaiting = undefined;
+      if (waiting) { this.#filesPagerReadActive = true; waiting.grant(); }
+    };
+    let raw: Promise<T>; try { raw = read(); } catch (error) { release(); throw error; }
+    void raw.then(release, release);
+    return awaitMobileMarkdownResourceRead(raw, signal);
+  }
   async previewWorkspaceEntry(entry: WorkspaceEntry): Promise<void> {
     if (entry.kind === FileKind.DIRECTORY) {
       await this.openFilesDirectory(entry.relativePath);
@@ -3593,7 +3984,7 @@ export class MobileClient {
     await this.#previewIndexedWorkspaceFile(result.relativePath);
   }
 
-  async previewArtifact(artifact: Artifact): Promise<void> {
+  async previewArtifact(artifact: Artifact, signal?: AbortSignal): Promise<void> {
     const current = this.#state.files.artifacts.find((candidate) => candidate.artifactId === artifact.artifactId);
     if (!current || current !== artifact || current.sessionId !== this.#state.files.sessionId) {
       throw new Error("Select a Generated file from the current task.");
@@ -3603,12 +3994,14 @@ export class MobileClient {
     this.#filesPreviewAbort?.abort();
     const controller = new AbortController();
     this.#filesPreviewAbort = controller;
+    const abort = () => controller.abort(); signal?.addEventListener("abort", abort, { once: true }); if (signal?.aborted) abort();
     const epoch = this.#filesEpoch;
     const blob = current.blob;
     const mediaType = normalizeMediaType(blob?.mediaType ?? "application/octet-stream") || "application/octet-stream";
     const byteSize = blob?.byteSize ?? 0n;
     const base = {
       title: artifactTitle(current),
+      fileName: blob?.fileName,
       sourceLabel: "Generated",
       mediaType,
       byteSize,
@@ -3630,8 +4023,9 @@ export class MobileClient {
           reason: `This ${mediaType} file is ${blob.byteSize.toString(10)} bytes and exceeds the mobile preview limit.` };
       } else if (mediaType.startsWith("image/")) {
         const download = await this.network.downloadBlob(context.credential, blob, controller.signal);
-        preview = { ...base, kind: "image", dataUri: bytesToDataUri(download.bytes, download.mediaType),
-          altText: current.description.trim() || artifactTitle(current), widthPixels: 0, heightPixels: 0 };
+        const decoded = mobileImageGalleryMediaType(mediaType) ? inspectMobileImageGalleryBytes(download.bytes, mediaType) : undefined;
+        preview = { ...base, kind: "image", dataUri: decoded ? mobileImageGalleryPreviewUri(download.bytes, decoded) : bytesToDataUri(download.bytes, download.mediaType),
+          altText: current.description.trim() || artifactTitle(current), widthPixels: decoded?.width ?? 0, heightPixels: decoded?.height ?? 0 };
       } else if (mobileModelPreviewKind(mediaType, blob.fileName)) {
         if (!this.modelPreviewFiles) {
           preview = { ...base, kind: "unsupported", reason: "3D model preview is unavailable on this mobile runtime." };
@@ -3651,13 +4045,14 @@ export class MobileClient {
           });
           preview = { ...base, kind: "model", ...stagedModel };
         }
-      } else if (isTextMediaType(mediaType)) {
+      } else if (isTextFilePreviewMetadata(mediaType, blob.fileName)) {
         if (blob.byteSize > 2_097_152n) {
           preview = { ...base, kind: "unsupported",
             reason: `This text file is ${blob.byteSize.toString(10)} bytes and exceeds the 2097152-byte text preview window.` };
         } else {
           const download = await this.network.downloadBlob(context.credential, blob, controller.signal);
-          const text = new TextDecoder("utf-8", { fatal: true }).decode(download.bytes);
+          const text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(download.bytes);
+          if (text.includes("\0")) throw new Error("The Generated text file contains binary data.");
           preview = { ...base, kind: "text", text, languageId: "", startByte: 0n,
             endByte: blob.byteSize, totalLines: text === "" ? 0 : text.split(/\r?\n/gu).length, truncated: false };
         }
@@ -3726,14 +4121,16 @@ export class MobileClient {
         preview: { ...base, kind: "error", reason: message(error) } } });
     } finally {
       if (this.#filesPreviewAbort === controller) this.#filesPreviewAbort = undefined;
+      signal?.removeEventListener("abort", abort);
     }
   }
 
   closeFilesPreview(): void {
+    this.#retireFilesPreviewPager();
     this.#filesPreviewAbort?.abort();
     this.#filesPreviewAbort = undefined;
     void this.#releaseFilesBinaryPreviews().catch(() => undefined);
-    if (this.#state.files.open) this.#set({ files: { ...this.#state.files, preview: undefined } });
+    if (this.#state.files.open) this.#set({ files: { ...this.#state.files, preview: undefined, previewPager: undefined } });
   }
 
   async previewTimelineArtifact(selected: MobileTimelineArtifact): Promise<void> {
@@ -3764,6 +4161,7 @@ export class MobileClient {
     this.#timelinePreview = lease;
     const base = {
       title: source.artifact.title,
+      fileName: source.blob.fileName,
       sourceLabel: "Timeline message file",
       mediaType: source.artifact.mediaType,
       byteSize: source.blob.byteSize,
@@ -3779,7 +4177,15 @@ export class MobileClient {
         throw new Error("The downloaded media type did not match the canonical Timeline Blob.");
       }
       let preview: MobileFilePreview;
-      if (source.artifact.previewKind === "media") {
+      if (source.artifact.previewKind === "text") {
+        if (BigInt(download.bytes.byteLength) !== source.blob.byteSize || bytesToHex(sha256(download.bytes)) !== source.blob.sha256Hex) {
+          throw new Error("The Timeline text bytes do not match their canonical Blob.");
+        }
+        const text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(download.bytes);
+        if (text.includes("\0")) throw new Error("The Timeline text file contains binary data.");
+        preview = { ...base, kind: "text", text, languageId: "", startByte: 0n,
+          endByte: source.blob.byteSize, totalLines: text === "" ? 0 : text.split(/\r?\n/gu).length, truncated: false };
+      } else if (source.artifact.previewKind === "media") {
         if (!this.mediaPreviewFiles) throw new Error("Audio/video preview is unavailable on this mobile runtime.");
         stagedMedia = await this.mediaPreviewFiles.stage(
           credential.profileId,
@@ -3991,6 +4397,92 @@ export class MobileClient {
     }
   }
 
+  async prepareFileTextSourceCopy(preview: Extract<MobileFilePreview, { kind: "text" }>, signal: AbortSignal): Promise<MobileFilesClipboardLease> {
+    const source = this.#fileTextActionSource(preview);
+    source.assertCurrent(signal);
+    await this.#readFilesPager(() => source.revalidate(signal), signal);
+    source.assertCurrent(signal);
+    return { kind: "source", text: mobileFileTextSource(preview.text).text, assertCurrent: (effectSignal) => { signal.throwIfAborted(); source.assertCurrent(effectSignal); } };
+  }
+
+  async addFileTextQuoteToComposer(preview: Extract<MobileFilePreview, { kind: "text" }>, selectedText: string, signal: AbortSignal): Promise<void> {
+    if (!this.composerDrafts) throw new Error("Retained task drafts are unavailable on this mobile client.");
+    const source = this.#fileTextActionSource(preview);
+    const identity = { profileId: this.#ready().profileId, sessionId: this.#state.selectedId! };
+    const snapshot = await this.composerDrafts.readSnapshot(identity);
+    source.assertCurrent(signal);
+    const next = appendMobileFileSelectionQuote(snapshot.draft ?? emptyMobileComposerDraft(), {
+      sourceSessionId: identity.sessionId, sourcePath: source.path, text: selectedText
+    }, this.newId()).draft;
+    await this.#readFilesPager(() => source.revalidate(signal), signal);
+    source.assertCurrent(signal);
+    if (!this.composerDrafts.saveIfRevision(identity, next, snapshot.revision)) throw new Error("The task composer changed. The original draft was retained.");
+    try {
+      await this.composerDrafts.flush(identity);
+      source.assertCurrent(signal);
+    } catch (error) { await this.#restoreFilesComposerDraft(identity, snapshot, next); throw error; }
+  }
+
+  #fileTextActionSource(preview: Extract<MobileFilePreview, { kind: "text" }>): {
+    readonly path: string; assertCurrent(signal?: AbortSignal): void; revalidate(signal: AbortSignal): Promise<void>
+  } {
+    const credential = this.#ready(); const task = this.#taskAuthorityKey();
+    const owner = this.filesHtmlResourceOwnerKey(preview);
+    const timeline = this.#state.timelinePreview === preview ? this.#timelinePreview : undefined;
+    const pager = timeline ? undefined : this.#filesPreviewPager;
+    const page = pager?.descriptor.pages[pager.descriptor.index];
+    const windowKey = timeline ? undefined : mobileFilesGalleryWindowKey(this.#state.files);
+    const entry = preview.workspaceEntry;
+    const path = canonicalWorkspacePath(entry?.relativePath ?? preview.fileName ?? "");
+    if (!task || !owner || !path || entry && (!entry.revision || workspaceEntryRevisionKey(entry.revision) !== preview.revisionKey)) {
+      throw new Error("The file text has no current canonical source.");
+    }
+    const assertCurrent = (signal?: AbortSignal): void => {
+      signal?.throwIfAborted();
+      if (this.#disposed || this.#credential !== credential || this.#taskAuthorityKey() !== task || this.filesHtmlResourceOwnerKey(preview) !== owner
+        || pager && (this.#filesPreviewPager !== pager || !this.#filesPreviewPagerCurrent(pager) || pager.descriptor.pages[pager.descriptor.index] !== page)
+        || !timeline && mobileFilesGalleryWindowKey(this.#state.files) !== windowKey) throw new Error("The file text source changed.");
+    };
+    assertCurrent();
+    const revalidate = async (signal: AbortSignal): Promise<void> => {
+      assertCurrent(signal);
+      if (timeline) {
+        const around = await this.network.readAround(credential, timeline.sessionId, timeline.artifact.eventId, signal);
+        assertCurrent(signal);
+        const current = resolveMobileTimelinePreviewArtifact(around, timeline.artifact);
+        if (!current || current.event.identity?.sessionId !== timeline.sessionId || current.event.cursor?.generation !== this.#state.owner?.generation
+          || !sameMobileTimelinePreviewArtifact(current.artifact, timeline.artifact)) throw new Error("The canonical Timeline text file changed.");
+      } else if (entry) {
+        const context = this.#filesContext();
+        const directory = await this.network.listWorkspaceDirectory(credential, entry.workspaceId, workspaceParentPath(entry.relativePath), signal);
+        assertCurrent(signal);
+        const matches = directory.entries.filter((item) => item.relativePath === entry.relativePath); const current = matches.length === 1 ? matches[0] : undefined;
+        if (!directory.revision || pager?.window.kind === "workspace" && directory.revision !== pager.window.revision
+          || !current?.revision || current.kind !== FileKind.REGULAR || current.workspaceId !== context.authority.workspace.workspaceId
+          || normalizeMediaType(current.mediaType) !== normalizeMediaType(preview.mediaType)
+          || !workspaceComposerRevisionMatches(current.revision, entry.revision!)) throw new Error("The canonical Workspace text file changed.");
+        const read = await this.network.readWorkspaceFile(credential, entry.workspaceId, entry.relativePath, entry.revision!, signal);
+        assertCurrent(signal);
+        assertWorkspaceFilePreview(entry.workspaceId, entry.relativePath, entry.revision!, read);
+        if (!read.entry?.revision || workspaceEntryRevisionKey(read.entry.revision) !== preview.revisionKey || read.entry.relativePath !== path
+          || read.entry.workspaceId !== entry.workspaceId || read.entry.kind !== FileKind.REGULAR || read.content.case !== "text"
+          || read.content.value.utf8Text !== preview.text || read.content.value.startByte !== preview.startByte || read.content.value.endByte !== preview.endByte
+          || read.truncated !== preview.truncated) throw new Error("The canonical Workspace text bytes changed.");
+      } else {
+        const catalog = await this.network.listSessionArtifacts(credential, this.#state.selectedId!, signal);
+        assertCurrent(signal);
+        const candidates = catalog.artifacts.filter((item) => item.blob && item.sessionId === this.#state.selectedId
+          && [item.artifactId, item.blob.blobId, item.blob.sha256Hex, item.blob.byteSize.toString(10)].join(":") === preview.revisionKey);
+        const artifact = candidates.length === 1 ? candidates[0] : undefined;
+        if (!catalog.revision || pager?.window.kind === "generated" && catalog.revision !== pager.window.revision || !artifact?.blob
+          || artifact.blob.fileName !== path || artifact.blob.byteSize !== preview.byteSize || normalizeMediaType(artifact.blob.mediaType) !== normalizeMediaType(preview.mediaType)
+          || page?.kind === "artifact" && !sameFilesComposerArtifact(page.artifact, artifact)) throw new Error("The canonical Generated text file changed.");
+      }
+      assertCurrent(signal);
+    };
+    return { path, assertCurrent, revalidate };
+  }
+
   async addFilesItemToComposer(
     source: MobileFilesComposerSource,
     signal?: AbortSignal
@@ -4095,7 +4587,8 @@ export class MobileClient {
 
   async openFilesImageGallery(
     source: MobileFilesComposerSource,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    sort: MobileFilesSortMode = "name"
   ): Promise<MobileImageGalleryDescriptor> {
     signal?.throwIfAborted();
     if (!this.composerDrafts) throw new Error("Retained task drafts are unavailable on this mobile client.");
@@ -4141,7 +4634,7 @@ export class MobileClient {
       const observedArtifactCounts = countArtifactIds(this.#state.files.artifacts);
       const currentById = new Map(refreshed.artifacts.map((candidate) => [candidate.artifactId, candidate]));
       const seen = new Set<string>();
-      pages = this.#state.files.artifacts.flatMap((observed) => {
+      pages = sortMobileGeneratedArtifacts(this.#state.files.artifacts, sort).flatMap((observed) => {
         if (currentArtifactCounts.get(observed.artifactId) !== 1
           || observedArtifactCounts.get(observed.artifactId) !== 1) return [];
         const current = currentById.get(observed.artifactId);
@@ -4167,7 +4660,7 @@ export class MobileClient {
       }
       const observedEntries = source.kind === "workspace-entry"
         && this.#state.files.location.kind === "workspace"
-        ? this.#state.files.entries
+        ? sortMobileWorkspaceEntries(this.#state.files.entries, sort)
         : [selected];
       const collected: MobileImageGalleryPage[] = [];
       const seen = new Set<string>();
@@ -4176,13 +4669,15 @@ export class MobileClient {
         if (entry.kind !== FileKind.REGULAR || !entry.revision || !mobileImageGalleryMediaType(entry.mediaType)) continue;
         let page: MobileImageGalleryPage | undefined;
         try {
-          const preview = await this.network.readWorkspaceFile(
+          const rawPreview = await this.network.readWorkspaceFile(
             context.credential,
             context.authority.workspace.workspaceId,
             entry.relativePath,
             entry.revision,
             signal
           );
+          assertCurrent();
+          const preview = await this.#canonicalWorkspaceImagePreview(context.credential, entry.workspaceId, rawPreview, signal);
           assertCurrent();
           if (!preview.truncated && preview.content.case === "image") {
             const blob = workspaceComposerBlob(context.authority.workspace.workspaceId, entry, preview);
@@ -4206,7 +4701,7 @@ export class MobileClient {
         }
         if (!page) {
           if (sameFilesWorkspaceEntry(entry, selected)) {
-            throw new Error("The selected Workspace file is not a canonical static gallery image.");
+            throw new Error("The selected Workspace file is not a canonical gallery image.");
           }
           continue;
         }
@@ -4286,8 +4781,169 @@ export class MobileClient {
     return this.#markdownResources.prepare(this.newId(), text, this.#markdownResourceContext(messageId, text), signal);
   }
 
+  filesMarkdownResourceOwnerKey(preview: Extract<MobileFilePreview, { kind: "text" }>): string | undefined {
+    const owner = this.filesAuthorityKey();
+    return owner && this.#state.files.open && this.#state.files.status === "ready" && this.#state.files.preview === preview
+      && preview.workspaceEntry && !this.#imageGallery ? JSON.stringify([owner, this.#filesEpoch, preview.sourceLabel, preview.revisionKey]) : undefined;
+  }
+
+  async prepareFilesMarkdownResources(preview: Extract<MobileFilePreview, { kind: "text" }>, signal: AbortSignal): Promise<MobileMarkdownResourceDescriptor> {
+    const files = this.#filesContext(); const credential = this.#ready();
+    const ownerKey = this.filesMarkdownResourceOwnerKey(preview); const entry = preview.workspaceEntry;
+    if (!ownerKey || !entry?.revision || entry.kind !== FileKind.REGULAR || entry.workspaceId !== files.authority.workspace.workspaceId
+      || entry.relativePath !== preview.sourceLabel || workspaceEntryRevisionKey(entry.revision) !== preview.revisionKey) {
+      throw new Error("The file Markdown has no current Workspace source.");
+    }
+    const assertCurrent = (currentSignal?: AbortSignal): void => {
+      currentSignal?.throwIfAborted();
+      if (this.#disposed || this.#credential !== credential || this.filesMarkdownResourceOwnerKey(preview) !== ownerKey) {
+        throw new Error("The file Markdown source changed.");
+      }
+    };
+    const revalidateSource = async (currentSignal: AbortSignal): Promise<void> => {
+      assertCurrent(currentSignal);
+      const directory = await this.network.listWorkspaceDirectory(credential, entry.workspaceId, workspaceParentPath(entry.relativePath), currentSignal);
+      assertCurrent(currentSignal);
+      const matches = directory.entries.filter((current) => current.relativePath === entry.relativePath);
+      const fresh = matches.length === 1 ? matches[0] : undefined;
+      if (!directory.revision || !fresh?.revision || fresh.kind !== FileKind.REGULAR || fresh.workspaceId !== entry.workspaceId
+        || normalizeMediaType(fresh.mediaType) !== normalizeMediaType(entry.mediaType) || fresh.revision.byteSize !== entry.revision!.byteSize
+        || !workspaceComposerRevisionMatches(fresh.revision, entry.revision!)) throw new Error("The authenticated Markdown file changed.");
+    };
+    const context: MobileMarkdownResourceContext = { workspaceId: entry.workspaceId, workdir: files.authority.workspace.serverPathDisplay,
+      baseDirectory: workspaceParentPath(entry.relativePath), maximumSourceCharacters: 2_097_152, assertCurrent, revalidateSource,
+      listDirectory: (parent, currentSignal) => this.network.listWorkspaceDirectory(credential, entry.workspaceId, parent, currentSignal),
+      readFile: async (resource, currentSignal) => this.#canonicalWorkspaceImagePreview(credential, entry.workspaceId,
+        await this.network.readWorkspaceFile(credential, entry.workspaceId, resource.relativePath, resource.revision!, currentSignal), currentSignal),
+      download: (blob, currentSignal) => this.network.downloadBlob(credential, blob, currentSignal) };
+    await revalidateSource(signal);
+    const descriptor = await this.#markdownResources.prepare(this.newId(), mobileFileTextSource(preview.text).lines.join("\n"), context, signal);
+    try { await revalidateSource(signal); assertCurrent(signal); return descriptor; }
+    catch (error) { this.#markdownResources.release(descriptor.leaseId); throw error; }
+  }
+
   assertMarkdownResourcesCurrent(leaseId: string): void { this.#markdownResources.assertCurrent(leaseId); }
   releaseMarkdownResources(leaseId: string): void { this.#markdownResources.release(leaseId); }
+
+  filesHtmlResourceOwnerKey(preview: Extract<MobileFilePreview, { kind: "text" }>): string | undefined {
+    const timeline = this.#timelinePreview;
+    if (this.#state.timelinePreview === preview && timeline && this.#timelinePreviewLeaseCurrent(timeline)) {
+      return JSON.stringify(["timeline", timeline.taskAuthorityKey, timeline.windowKey, preview.sourceLabel, preview.revisionKey]);
+    }
+    const owner = this.filesAuthorityKey();
+    return owner && this.#state.files.open && this.#state.files.status === "ready" && this.#state.files.preview === preview
+      && !this.#imageGallery ? JSON.stringify([owner, this.#filesEpoch, preview.sourceLabel, preview.revisionKey]) : undefined;
+  }
+
+  async prepareFilesHtmlResources(preview: Extract<MobileFilePreview, { kind: "text" }>, signal: AbortSignal): Promise<MobileFileHtmlDescriptor> {
+    const credential = this.#ready(); const ownerKey = this.filesHtmlResourceOwnerKey(preview);
+    if (!ownerKey || !mobileFileHtmlComplete(preview)) throw new Error("The HTML page has no current complete file source.");
+    const assertCurrent = (currentSignal?: AbortSignal): void => {
+      currentSignal?.throwIfAborted();
+      if (this.#disposed || this.#credential !== credential || this.filesHtmlResourceOwnerKey(preview) !== ownerKey) {
+        throw new Error("The HTML file source changed.");
+      }
+    };
+    const entry = preview.workspaceEntry; let context: MobileFileHtmlContext = { assertCurrent };
+    if (entry) {
+      const files = this.#filesContext();
+      if (!entry.revision || entry.kind !== FileKind.REGULAR || entry.workspaceId !== files.authority.workspace.workspaceId
+        || entry.relativePath !== preview.sourceLabel || workspaceEntryRevisionKey(entry.revision) !== preview.revisionKey) {
+        throw new Error("The HTML page has no canonical Workspace source.");
+      }
+      const revalidateEntry = async (currentSignal: AbortSignal): Promise<void> => {
+        assertCurrent(currentSignal);
+        const directory = await this.network.listWorkspaceDirectory(credential, entry.workspaceId, workspaceParentPath(entry.relativePath), currentSignal);
+        assertCurrent(currentSignal);
+        const matches = directory.entries.filter((candidate) => candidate.relativePath === entry.relativePath);
+        const fresh = matches.length === 1 ? matches[0] : undefined;
+        if (!directory.revision || !fresh?.revision || fresh.kind !== FileKind.REGULAR || fresh.workspaceId !== entry.workspaceId
+          || normalizeMediaType(fresh.mediaType) !== normalizeMediaType(entry.mediaType) || fresh.revision.byteSize !== entry.revision!.byteSize
+          || !workspaceComposerRevisionMatches(fresh.revision, entry.revision!)) throw new Error("The authenticated HTML file changed.");
+      };
+      let snapshotRevision = "";
+      const revalidateSource = async (currentSignal: AbortSignal): Promise<void> => {
+        await revalidateEntry(currentSignal);
+        const snapshot = await this.network.readWorkspaceHtmlSnapshot(credential, files.authority.sessionId,
+          { workspaceId: entry.workspaceId, relativePath: entry.relativePath, expectedRevision: snapshotRevision }, currentSignal);
+        assertCurrent(currentSignal);
+        if (snapshot.file.workspaceId !== entry.workspaceId || snapshot.file.relativePath !== entry.relativePath
+          || !/^workspace-html:[0-9a-f]{64}$/u.test(snapshot.file.expectedRevision)
+          || snapshotRevision !== "" && snapshot.file.expectedRevision !== snapshotRevision || snapshot.html !== preview.text) {
+          throw new Error("The authenticated HTML snapshot changed.");
+        }
+        snapshotRevision = snapshot.file.expectedRevision;
+      };
+      context = { baseDirectory: workspaceParentPath(entry.relativePath), assertCurrent, revalidateSource,
+        readResource: async (target, maximumBytes, currentSignal) => {
+          await revalidateEntry(currentSignal);
+          const path = canonicalWorkspacePath(target.relativePath); const parent = workspaceParentPath(path);
+          const base = workspaceParentPath(entry.relativePath);
+          if (base && !path.startsWith(base + "/")) throw new Error("The HTML resource left its parent directory.");
+          const directory = await this.network.listWorkspaceDirectory(credential, entry.workspaceId, parent, currentSignal);
+          assertCurrent(currentSignal);
+          const matches = directory.entries.filter((candidate) => candidate.relativePath === path);
+          const resource = matches.length === 1 ? matches[0] : undefined;
+          if (!directory.revision || !resource?.revision || resource.kind !== FileKind.REGULAR || resource.workspaceId !== entry.workspaceId) {
+            throw new Error("The HTML resource has no current canonical file.");
+          }
+          if (resource.revision.byteSize < 0n || resource.revision.byteSize > BigInt(maximumBytes)) {
+            throw new HtmlResourceBudgetError("The HTML resource exceeded its byte budget.");
+          }
+          const materialized = await this.network.materializeWorkspaceFileBlob(credential, entry.workspaceId, path, resource.revision, currentSignal);
+          assertCurrent(currentSignal);
+          const blob = workspaceComposerBlob(entry.workspaceId, resource, { $typeName: "joko.v1.FilePreview", entry: materialized.entry,
+            content: { case: "blob", value: materialized.blob }, truncated: false });
+          if (!blob || blob.byteSize !== resource.revision.byteSize || blob.byteSize > BigInt(maximumBytes)) throw new Error("The HTML resource Blob changed.");
+          const downloaded = await this.network.downloadBlob(credential, blob, currentSignal); assertCurrent(currentSignal);
+          await revalidateEntry(currentSignal);
+          return { blob, ...downloaded };
+        } };
+    }
+    return this.#fileHtmlResources.prepare(this.newId(), preview.text, context, signal);
+  }
+
+  assertFilesHtmlResourcesCurrent(leaseId: string): void { this.#fileHtmlResources.assertCurrent(leaseId); }
+  releaseFilesHtmlResources(leaseId: string): void { this.#fileHtmlResources.release(leaseId); }
+
+  timelineImagePreviewOwnerKey(): string | undefined { return this.#taskAuthorityKey(); }
+
+  async prepareTimelineImagePreview(eventId: string, pageId: string, signal: AbortSignal): Promise<MobileTimelineImagePreview> {
+    signal.throwIfAborted();
+    const credential = this.#ready(); const ownerKey = this.#taskAuthorityKey(); const sessionId = this.#state.selectedId;
+    if (!ownerKey || !sessionId) throw new Error("The inline image has no current task owner.");
+    const currentPage = (events: readonly Event[]): MobileImageGalleryPage | undefined => {
+      const sources = events.filter((event) => event.eventId === eventId && event.identity?.sessionId === sessionId
+        && event.cursor?.generation === this.#state.owner?.generation);
+      return sources.length === 1 ? timelineGalleryPagesForSelection(events, eventId, pageId).find((page) => page.pageId === pageId) : undefined;
+    };
+    const page = currentPage(this.#timelineEvents());
+    if (!page) throw new Error("The inline image is not in the current canonical Timeline window.");
+    const assertCurrent = (currentSignal?: AbortSignal) => {
+      currentSignal?.throwIfAborted();
+      const current = currentPage(this.#timelineEvents());
+      if (this.#disposed || this.#credential !== credential || this.#taskAuthorityKey() !== ownerKey
+        || !current || !sameMobileImageGalleryPage(current, page)) throw new Error("The inline image source changed.");
+    };
+    const context: MobileTimelineImageContext = { ownerKey, page, assertCurrent,
+      // A cached bitmap is presentation only; remounts also reauthorize the exact source through authenticated history.
+      revalidate: async (currentSignal) => {
+        const around = await this.network.readAround(credential, sessionId, eventId, currentSignal);
+        assertCurrent(currentSignal);
+        const fresh = currentPage(around);
+        if (!fresh || !sameMobileImageGalleryPage(fresh, page)) throw new Error("The authenticated inline image source changed.");
+      },
+      download: async (blob, currentSignal) => {
+        const thumbnail = await this.network.readImageThumbnail(credential, blob, 1024, currentSignal);
+        assertCurrent(currentSignal);
+        return thumbnail ? { bytes: thumbnail.data, mediaType: thumbnail.mediaType, thumbnail }
+          : this.network.downloadBlob(credential, blob, currentSignal);
+      } };
+    return this.#timelineImages.prepare(context, signal);
+  }
+
+  confirmTimelineImagePreview(leaseId: string, native: MobileImageGalleryNativeDecode): MobileTimelineImagePreview { return this.#timelineImages.confirm(leaseId, native); }
+  releaseTimelineImagePreview(leaseId: string, discard = false): void { this.#timelineImages.release(leaseId, discard); }
 
   #markdownResourceContext(messageId: string, text: string): MobileMarkdownResourceContext {
     const files = this.#filesContext();
@@ -4327,7 +4983,8 @@ export class MobileClient {
         }
       },
       listDirectory: (parent, signal) => this.network.listWorkspaceDirectory(credential, files.authority.workspace.workspaceId, parent, signal),
-      readFile: (entry, signal) => this.network.readWorkspaceFile(credential, files.authority.workspace.workspaceId, entry.relativePath, entry.revision!, signal),
+      readFile: async (entry, signal) => this.#canonicalWorkspaceImagePreview(credential, files.authority.workspace.workspaceId,
+        await this.network.readWorkspaceFile(credential, files.authority.workspace.workspaceId, entry.relativePath, entry.revision!, signal), signal),
       download: (blob, signal) => this.network.downloadBlob(credential, blob, signal)
     };
   }
@@ -4478,8 +5135,10 @@ export class MobileClient {
               || bytesToHex(sha256(download.bytes)) !== page.sha256Hex) throw new Error("The canonical message image changed.");
             const decoded = inspectMobileImageGalleryBytes(download.bytes, page.mediaType);
             if (decoded.width * decoded.height > remainingPixels || (page.widthPixels !== undefined
-              && (decoded.width !== page.widthPixels || decoded.height !== page.heightPixels))) continue;
-            images.set(page.pageId, { uri: bytesToDataUri(download.bytes, page.mediaType), width: decoded.width, height: decoded.height });
+              && !mobileImageGalleryDimensionsMatch(decoded, page.widthPixels, page.heightPixels!))) continue;
+            images.set(page.pageId, { uri: mobileImageGalleryPreviewUri(download.bytes, decoded),
+              width: decoded.width, height: decoded.height,
+              ...(decoded.nativeQuarterTurn ? { nativeQuarterTurn: true } : {}) });
             remainingBytes -= download.bytes.byteLength;
             remainingPixels -= decoded.width * decoded.height;
           } catch {
@@ -4583,14 +5242,13 @@ export class MobileClient {
     const events = this.#timelineEvents();
     const matches = events.filter((event) => event.eventId === eventId);
     const event = matches.length === 1 ? matches[0] : undefined;
-    const message = event ? mobileTimelineGalleryMessage(event) : undefined;
-    if (!event || event.identity?.sessionId !== sessionId || !message) {
-      throw new Error("The durable message image is no longer in the current Timeline window.");
+    if (!event || event.identity?.sessionId !== sessionId) {
+      throw new Error("The durable image is no longer in the current Timeline window.");
     }
-    const pages = mobileTimelineGalleryPages(event);
+    const pages = timelineGalleryPagesForSelection(events, eventId, pageId);
     const initialIndex = pages.findIndex((page) => page.pageId === pageId);
     if (initialIndex < 0 || pages.length === 0) {
-      throw new Error("The selected message image is not in its durable completed message.");
+      throw new Error("The selected image is not in its current durable Timeline source.");
     }
     const identity = { profileId: credential.profileId, sessionId };
     const snapshot = await this.composerDrafts.readSnapshot(identity);
@@ -4604,7 +5262,11 @@ export class MobileClient {
     const descriptor: MobileImageGalleryDescriptor = {
       leaseId,
       sourceKind: "timeline",
-      sourceLabel: message.role === MessageRole.USER ? "Your message" : "Task message",
+      sourceLabel: event.payload?.kind.case === "messageStarted" && event.payload.kind.value.role === MessageRole.USER
+        || event.payload?.kind.case === "messageCompleted" && event.payload.kind.value.role === MessageRole.USER
+        ? "Your message" : event.payload?.kind.case === "toolCallStarted" || event.payload?.kind.case === "toolCallUpdated"
+          || event.payload?.kind.case === "toolCallCompleted" ? "Tool result"
+          : event.payload?.kind.case === "artifactProduced" ? "Generated file" : "Task message",
       pages: pages.map(mobileImageGalleryPageSummary),
       initialIndex
     };
@@ -4622,7 +5284,7 @@ export class MobileClient {
       source: {
         kind: "timeline",
         eventId,
-        messageId: message.messageId,
+        pageId,
         windowKey: mobileTimelineGalleryWindowKey(events)
       },
       operationInFlight: false
@@ -4650,16 +5312,19 @@ export class MobileClient {
     if (!Number.isSafeInteger(pageIndex) || pageIndex < 0 || pageIndex >= lease.pages.length) {
       throw new Error("The requested image gallery page is out of range.");
     }
+    lease.loaded = undefined;
     await this.#assertImageGalleryCurrent(lease, undefined, signal);
     const page = lease.pages[pageIndex]!;
     const credential = this.#ready();
-    const download = await this.network.downloadBlob(credential, page.blob, signal);
+    const download = await this.#downloadGalleryBlob(credential, page.blob, () => {
+      if (this.#imageGallery !== lease || !this.imageGalleryCurrent(leaseId) || lease.operationInFlight) throw new Error("The gallery image source changed before download.");
+    }, signal);
     signal?.throwIfAborted();
     if (normalizeMediaType(download.mediaType) !== page.mediaType || download.bytes.byteLength !== page.byteSize) {
       throw new Error("The authenticated gallery image changed media type or size.");
     }
     const decoded = inspectMobileImageGalleryBytes(download.bytes, page.mediaType);
-    if (page.widthPixels !== undefined && (decoded.width !== page.widthPixels || decoded.height !== page.heightPixels)) {
+    if (page.widthPixels !== undefined && !mobileImageGalleryDimensionsMatch(decoded, page.widthPixels, page.heightPixels!)) {
       throw new Error("The gallery image dimensions do not match their canonical metadata.");
     }
     await this.#assertImageGalleryCurrent(lease, undefined, signal);
@@ -4677,10 +5342,15 @@ export class MobileClient {
       ? filesAttachmentMetadata(page.blob.fileName || page.title, page.mediaType, BigInt(page.byteSize), lease.draft.attachments, controls)
       : undefined;
     let annotatable = false;
-    if (metadata && controls && canAnnotateMobileImage(page.mediaType)) {
+    if (controls && controls.surfaceOwnerKey === lease.attachmentOwnerKey
+      && (metadata !== undefined || mobileImageRequiresNativeRaster(page.mediaType))
+      && !decoded.animated && !decoded.originalOnly && canAnnotateMobileImage(page.mediaType)) {
       try {
         assertMobileAttachmentCandidate({
-          fileName: mobileAnnotatedImageFileName(metadata.fileName, mobileAnnotationOutputMediaType(page.mediaType)),
+          fileName: mobileAnnotatedImageFileName(
+            metadata?.fileName ?? mobileImageOutputFileName(page.blob.fileName || page.title, page.mediaType),
+            mobileAnnotationOutputMediaType(page.mediaType)
+          ),
           mediaType: mobileAnnotationOutputMediaType(page.mediaType),
           byteSize: 1
         }, controls.policy);
@@ -4695,7 +5365,7 @@ export class MobileClient {
       pageCount: lease.pages.length,
       sourceKind: lease.descriptor.sourceKind,
       sourceLabel: lease.descriptor.sourceLabel,
-      previewUri: bytesToDataUri(download.bytes, page.mediaType),
+      previewUri: mobileImageGalleryPreviewUri(download.bytes, decoded),
       sourceBase64: encodeMobileBase64(download.bytes),
       sourceMediaType: page.mediaType,
       fileName: metadata?.fileName ?? (page.blob.fileName || page.title),
@@ -4704,8 +5374,93 @@ export class MobileClient {
       addable: metadata !== undefined,
       maximumBytes: controls?.policy.maximumBytes ?? MOBILE_BLOB_PREVIEW_MAXIMUM_BYTES,
       expectedWidthPixels: decoded.width,
-      expectedHeightPixels: decoded.height
+      expectedHeightPixels: decoded.height,
+      ...(decoded.nativeQuarterTurn ? { nativeQuarterTurn: true } : {}),
+      expectedAnimated: decoded.animated === true,
+      originalOnly: decoded.originalOnly === true,
+      ...(decoded.previewMediaType ? { previewMediaType: decoded.previewMediaType } : {})
     };
+  }
+
+  async #downloadGalleryBlob(credential: PairedCredential, blob: BlobRef, assertCurrent: () => void, signal?: AbortSignal): ReturnType<MobileNetwork["downloadBlob"]> {
+    while (this.#galleryBlobRead) {
+      await awaitMobileMarkdownResourceRead(this.#galleryBlobRead.catch(() => undefined), signal ?? new AbortController().signal);
+    }
+    signal?.throwIfAborted();
+    assertCurrent();
+    const raw = this.network.downloadBlob(credential, blob, signal); this.#galleryBlobRead = raw;
+    void raw.then(() => { if (this.#galleryBlobRead === raw) this.#galleryBlobRead = undefined; },
+      () => { if (this.#galleryBlobRead === raw) this.#galleryBlobRead = undefined; });
+    return raw;
+  }
+
+  async prepareImageGalleryAdjacentPreview(leaseId: string, pageIndex: number, signal: AbortSignal): Promise<MobileTimelineImagePreview> {
+    signal.throwIfAborted();
+    const lease = this.#imageGallery; const currentIndex = lease?.loaded?.pageIndex; const page = lease?.pages[pageIndex];
+    if (!lease || lease.leaseId !== leaseId || currentIndex === undefined || !Number.isSafeInteger(pageIndex)
+      || Math.abs(currentIndex - pageIndex) !== 1 || !page) throw new Error("The adjacent image has no current gallery owner.");
+    const credential = this.#ready();
+    const assertCurrent = (currentSignal?: AbortSignal) => {
+      currentSignal?.throwIfAborted();
+      if (this.#imageGallery !== lease || this.#credential !== credential || !this.imageGalleryCurrent(leaseId)
+        || lease.loaded?.pageIndex !== currentIndex || lease.pages[pageIndex] !== page) throw new Error("The adjacent image source changed.");
+    };
+    const revalidate = async (currentSignal: AbortSignal) => {
+      await this.#assertImageGalleryCurrent(lease, undefined, currentSignal);
+      await this.#revalidateGalleryImageSource(lease, { page }, currentSignal); assertCurrent(currentSignal);
+    };
+    let preview: MobileTimelineImagePreview | undefined;
+    try {
+      preview = await this.#timelineImages.prepare({ ownerKey: lease.taskAuthorityKey, page, assertCurrent, revalidate,
+        download: (blob, currentSignal) => this.#downloadGalleryBlob(credential, blob, () => assertCurrent(currentSignal), currentSignal) }, signal);
+      await revalidate(signal);
+      lease.previewLeaseIds ??= new Set(); lease.previewLeaseIds.add(preview.leaseId);
+      return preview;
+    } catch (failure) { if (preview) this.#timelineImages.release(preview.leaseId, true); throw failure; }
+  }
+
+  async pinImageGalleryCachedPreview(leaseId: string, pageIndex: number, signal: AbortSignal): Promise<MobileTimelineImagePreview | undefined> {
+    signal.throwIfAborted(); const lease = this.#imageGallery;
+    if (!lease || lease.leaseId !== leaseId || !Number.isSafeInteger(pageIndex) || !lease.pages[pageIndex]) return undefined;
+    await this.#assertImageGalleryCurrent(lease, undefined, signal);
+    const page = lease.pages[pageIndex]!;
+    const preview = this.#timelineImages.pinCached({ ownerKey: lease.taskAuthorityKey, page, assertCurrent: (currentSignal) => {
+      currentSignal?.throwIfAborted();
+      if (this.#imageGallery !== lease || this.#taskAuthorityKey() !== lease.taskAuthorityKey || lease.pages[pageIndex] !== page) {
+        throw new Error("The cached gallery preview source changed.");
+      }
+      if (lease.source.kind === "timeline" && (mobileTimelineGalleryWindowKey(this.#timelineEvents()) !== lease.source.windowKey
+        || !timelineGalleryPagesForSelection(this.#timelineEvents(), lease.source.eventId, lease.source.pageId).some((current) => sameMobileImageGalleryPage(current, page)))) {
+        throw new Error("The cached Timeline gallery preview changed.");
+      }
+    } }, signal);
+    if (preview) { lease.previewLeaseIds ??= new Set(); lease.previewLeaseIds.add(preview.leaseId); }
+    return preview;
+  }
+
+  imageGalleryCurrent(leaseId: string): boolean {
+    const lease = this.#imageGallery; const credential = this.#credential;
+    if (!lease || lease.leaseId !== leaseId || !credential || this.#taskAuthorityKey() !== lease.taskAuthorityKey
+      || mobileCredentialKey(credential) !== lease.credentialKey || this.taskAttachmentControls()?.surfaceOwnerKey !== lease.attachmentOwnerKey) return false;
+    const source = lease.source;
+    if (source.kind === "files") return this.#currentFiles(source.filesEpoch, source.filesAuthorityKey)
+      && mobileFilesGalleryWindowKey(this.#state.files) === source.filesWindowKey;
+    if (source.kind === "markdown") {
+      try { this.#markdownResources.assertCurrent(source.resourceLeaseId); return true; } catch { return false; }
+    }
+    const events = this.#timelineEvents(); const pages = timelineGalleryPagesForSelection(events, source.eventId, source.pageId);
+    return mobileTimelineGalleryWindowKey(events) === source.windowKey && pages.length === lease.pages.length
+      && pages.every((page, index) => sameMobileImageGalleryPage(page, lease.pages[index]!));
+  }
+
+  releaseImageGalleryPreview(leaseId: string, previewLeaseId: string, discard = false): void {
+    if (this.#imageGallery?.leaseId === leaseId) this.#imageGallery.previewLeaseIds?.delete(previewLeaseId);
+    this.#timelineImages.release(previewLeaseId, discard);
+  }
+
+  discardImageGalleryPage(leaseId: string, loadId?: string): void {
+    const lease = this.#imageGallery;
+    if (lease?.leaseId === leaseId && !lease.operationInFlight && (loadId === undefined || lease.loaded?.loadId === loadId)) lease.loaded = undefined;
   }
 
   confirmImageGalleryPageDecoded(
@@ -4717,12 +5472,13 @@ export class MobileClient {
     const lease = this.#imageGallery;
     const loaded = lease?.loaded;
     if (!lease || lease.leaseId !== galleryLeaseId || !loaded || loaded.loadId !== loadId
-      || loaded.page.pageId !== pageId || decoded.isAnimated === true
-      || decoded.width !== loaded.decoded.width || decoded.height !== loaded.decoded.height
-      || decoded.mediaType && normalizeMediaType(decoded.mediaType) !== loaded.decoded.mediaType) {
+      || loaded.page.pageId !== pageId || !mobileImageGalleryNativeAnimationMatches(loaded.page.mediaType, loaded.decoded.animated === true, decoded.isAnimated)
+      || !mobileImageGalleryDimensionsMatch(loaded.decoded, decoded.width, decoded.height)
+      || decoded.mediaType && normalizeMediaType(decoded.mediaType) !== (loaded.decoded.previewMediaType ?? loaded.decoded.mediaType)) {
       throw new Error("The decoded image no longer matches this gallery page.");
     }
     if (loaded.confirmed) return;
+    loaded.decoded = confirmMobileImageGalleryCanvas(loaded.decoded, decoded);
     loaded.confirmed = true;
   }
 
@@ -4767,6 +5523,9 @@ export class MobileClient {
     if (!galleryLease || !loaded || loaded.loadId !== leaseId || !loaded.confirmed || galleryLease.operationInFlight) {
       throw new Error("The decoded image no longer owns this output action.");
     }
+    if (!mobileImageGalleryDimensionsMatch(loaded.decoded, decoded.width, decoded.height)) {
+      throw new Error("The native output canvas no longer matches the confirmed gallery image.");
+    }
     const parsed = inspectMobileImageOutputBytes(loaded.bytes, loaded.page.mediaType, decoded);
     const exactDecoded = assertMobileImageOutputDecode(
       decoded,
@@ -4785,8 +5544,8 @@ export class MobileClient {
     }
     return {
       leaseId,
-      fileName: mobileImageOutputFileName(loaded.page.blob.fileName || loaded.page.title, loaded.page.mediaType),
-      mediaType: loaded.page.mediaType,
+      fileName: mobileImageOutputFileName(loaded.page.blob.fileName || loaded.page.title, parsed.mediaType),
+      mediaType: parsed.mediaType,
       byteSize: loaded.page.byteSize,
       sha256Hex: loaded.page.sha256Hex,
       bytes: Uint8Array.from(loaded.bytes),
@@ -4799,7 +5558,40 @@ export class MobileClient {
     if (this.#imageGallery?.leaseId === leaseId) this.#retireImageGallery();
   }
 
+  async shareImageGalleryPageOriginal(galleryLeaseId: string, loadId: string, signal?: AbortSignal, onDispatch?: () => void): Promise<void> {
+    signal?.throwIfAborted();
+    const lease = this.#imageGallery; const loaded = lease?.loaded;
+    if (!this.fileShare) throw new Error("System file sharing is unavailable on this mobile runtime.");
+    if (!lease || lease.leaseId !== galleryLeaseId || !loaded || loaded.loadId !== loadId
+      || !loaded.confirmed || lease.operationInFlight || this.#fileShareLease) {
+      throw new Error("The decoded image no longer owns this sharing action.");
+    }
+    const controller = new AbortController();
+    const operationSignal = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
+    lease.shareController = controller; lease.operationInFlight = true;
+    const assertCurrent = async (): Promise<void> => {
+      await this.#assertImageGalleryCurrent(lease, undefined, operationSignal);
+      if (lease.loaded !== loaded || !loaded.confirmed) throw new Error("The gallery page changed before system sharing began.");
+      await this.#revalidateGalleryImageSource(lease, loaded, operationSignal);
+      await this.#assertImageGalleryCurrent(lease, undefined, operationSignal);
+    };
+    try {
+      await assertCurrent();
+      const authorized = await this.network.authorizeBlobDownload(this.#ready(), loaded.page.blob, operationSignal);
+      if (authorized.blobId !== loaded.page.blob.blobId || authorized.byteSize !== loaded.page.byteSize
+        || authorized.sha256Hex !== loaded.page.sha256Hex || normalizeMediaType(authorized.mediaType) !== loaded.page.mediaType) {
+        throw new Error("The authorized sharing bytes changed from this gallery image.");
+      }
+      await this.#assertImageGalleryCurrent(lease, undefined, operationSignal);
+      await this.fileShare.perform({ source: authorized, signal: operationSignal, assertCurrent, ...(onDispatch ? { onDispatch } : {}) });
+    } finally {
+      if (lease.shareController === controller) { lease.shareController = undefined; lease.operationInFlight = false; }
+    }
+  }
+
   #retireImageGallery(): void {
+    this.#imageGallery?.shareController?.abort();
+    for (const id of this.#imageGallery?.previewLeaseIds ?? []) this.#timelineImages.release(id);
     if (this.#imageGallery?.source.kind === "markdown") this.#markdownResources.release(this.#imageGallery.source.resourceLeaseId);
     this.#imageGallery = undefined;
   }
@@ -6247,6 +7039,10 @@ export class MobileClient {
       sourceUri = bytesToDataUri(sourceBytes, attachment.mediaType);
     }
 
+    const galleryImage = mobileImageGalleryMediaType(source.mediaType) ? inspectMobileImageGalleryBytes(sourceBytes, source.mediaType) : undefined;
+    if (galleryImage?.previewMarkup || galleryImage?.previewBytes || galleryImage?.previewMediaType) {
+      sourceUri = mobileImageGalleryPreviewUri(sourceBytes, galleryImage);
+    }
     const lease: MobileComposerImageEditLease = {
       leaseId: distinctAttachmentStorageId(this.newId, attachment.attachmentId, source.storageId),
       request,
@@ -6265,7 +7061,7 @@ export class MobileClient {
     try {
       await this.#assertComposerImageEditCurrent(lease, undefined, signal);
       const outputMediaType = mobileAnnotationOutputMediaType(source.mediaType);
-      let annotatable = canAnnotateMobileImage(source.mediaType);
+      let annotatable = !galleryImage?.animated && !galleryImage?.originalOnly && canAnnotateMobileImage(source.mediaType);
       if (annotatable) {
         try {
           assertMobileAttachmentCandidate({
@@ -6287,6 +7083,14 @@ export class MobileClient {
           points: stroke.points.map((point) => ({ ...point }))
         })),
         annotatable,
+        ...(galleryImage ? {
+          expectedWidthPixels: galleryImage.width,
+          expectedHeightPixels: galleryImage.height
+        } : {}),
+        ...(galleryImage?.nativeQuarterTurn ? { nativeQuarterTurn: true } : {}),
+        animated: galleryImage?.animated === true,
+        originalOnly: galleryImage?.originalOnly === true,
+        ...(galleryImage?.previewMediaType ? { previewMediaType: galleryImage.previewMediaType } : {}),
         maximumBytes: controls.policy.maximumBytes
       };
     } catch (error) {
@@ -6329,13 +7133,15 @@ export class MobileClient {
     let outputMediaType: string;
     let outputFileName: string;
     let outputSha256Hex: string;
-    if (exactStrokes.length === 0) {
+    if (exactStrokes.length === 0 && !mobileImageRequiresNativeRaster(lease.source.mediaType)) {
       outputBytes = Uint8Array.from(lease.sourceBytes);
       outputMediaType = lease.source.mediaType;
       outputFileName = lease.source.fileName;
       outputSha256Hex = lease.source.sha256Hex;
     } else {
-      if (!canAnnotateMobileImage(lease.source.mediaType) || !burned) {
+      const sourceImage = mobileImageGalleryMediaType(lease.source.mediaType) !== undefined
+        ? inspectMobileImageGalleryBytes(lease.sourceBytes, lease.source.mediaType) : undefined;
+      if (!canAnnotateMobileImage(lease.source.mediaType) || !burned || sourceImage?.animated || sourceImage?.originalOnly) {
         throw new Error("This image cannot be rendered with annotations.");
       }
       const expectedMediaType = mobileAnnotationOutputMediaType(lease.source.mediaType);
@@ -6350,7 +7156,9 @@ export class MobileClient {
       }
       outputBytes = Uint8Array.from(burned.bytes);
       outputMediaType = burned.mediaType;
-      outputFileName = mobileAnnotatedImageFileName(lease.source.fileName, burned.mediaType);
+      outputFileName = exactStrokes.length > 0
+        ? mobileAnnotatedImageFileName(lease.source.fileName, burned.mediaType)
+        : mobileRasterizedImageFileName(lease.source.fileName, burned.mediaType);
       outputSha256Hex = await this.attachmentFiles.digestOwnedBytes(outputBytes, signal);
     }
     assertMobileAttachmentCandidate({
@@ -7203,6 +8011,456 @@ export class MobileClient {
     } finally { this.#releaseMutation(action); }
   }
 
+  taskCloneControls(): MobileTaskCloneControls | undefined {
+    const context = this.#taskDerivationContext(capabilityNames.sessionClone);
+    return context ? { ...context.controls, canClone: context.canDerive } : undefined;
+  }
+
+  taskMessageRewindControls(eventId: string): MobileMessageRewindControls | undefined {
+    const context = this.#taskDerivationContext(capabilityNames.sessionRewind);
+    if (!context) return undefined;
+    const { session, backend } = context.runtime;
+    const detail = this.#state.detail!; const owner = this.#state.owner!;
+    const target = owner.targets.find((value) => value.targetId === session.targetId)!;
+    const events = this.#state.window ?? [...this.#state.older, ...detail.timeline, ...this.#state.live];
+    const source = resolveMobileMessageRewindSource(events, session.sessionId, eventId, owner.generation,
+      mobileRewindToStartSupported(backend, target));
+    if (!source || !timelineRows(events).some((row) => row.id === source.messageId && row.eventId === eventId && row.completed && row.kind === "user")) return undefined;
+    const workspaceId = session.worktree?.workspaceId || target.workspaceId;
+    const workspaces = owner.workspaces.filter((value) => value.workspaceId === workspaceId && value.targetId === session.targetId);
+    const detailWorkspaces = detail.workspaces.filter((value) => value.workspaceId === workspaceId && value.targetId === session.targetId);
+    const workspace = workspaceId && workspaces.length === 1 && detailWorkspaces.length === 1
+      && (workspaces[0]!.version?.revision?.value ?? 0n) > 0n && (workspaces[0]!.version?.generation ?? 0n) > 0n
+      && entityVersionKey(workspaces[0]!.version) === entityVersionKey(detailWorkspaces[0]!.version) ? workspaces[0] : undefined;
+    const idle = mobileMessageRewindIdle(session, detail)
+      && !this.#state.pending.some((value) => value.sessionId === session.sessionId
+        && (value.kind.startsWith("session-") || value.kind === "workspace-rewind"));
+    const canDialogue = idle && source.target !== undefined && mobileRewindCapability(backend, capabilityNames.sessionRewind);
+    const canFiles = idle && workspace !== undefined && source.runId !== undefined && mobileRewindCapability(backend, "workspace.rewind");
+    return { authorityKey: JSON.stringify([context.controls.authorityKey, source.sourceKey, workspace?.workspaceId ?? "",
+      entityVersionKey(workspace?.version), workspace?.serverPathDisplay ?? "", workspace?.location?.kind ?? null]),
+      surfaceOwnerKey: context.controls.surfaceOwnerKey, sessionId: session.sessionId, source,
+      ...(workspace ? { workspace } : {}), canDialogue, canFiles, canRewind: canDialogue || canFiles };
+  }
+
+  async loadTaskMessageRewindPreview(authorityKey: string, eventId: string, signal: AbortSignal): Promise<MobileMessageRewindPreview | undefined> {
+    const controls = this.taskMessageRewindControls(eventId);
+    if (!controls?.canRewind || controls.authorityKey !== authorityKey || signal.aborted) return undefined;
+    const credential = this.#ready(); const epoch = this.#epoch;
+    const current = (): boolean => !signal.aborted && this.#current(epoch)
+      && this.taskMessageRewindControls(eventId)?.authorityKey === authorityKey;
+    const operationSignal = this.#abort ? AbortSignal.any([signal, this.#abort.signal]) : signal;
+    let preview: MobileMessageRewindPreview = { controls };
+    if (controls.canFiles && controls.workspace && controls.source.runId) {
+      try {
+        const sets = await this.network.listWorkspaceChangeSets(credential, controls.workspace.workspaceId, controls.sessionId, operationSignal);
+        if (!current()) return undefined;
+        const changeSet = mobileMessageChangeSet(sets, controls.workspace.workspaceId, controls.sessionId, controls.source.runId);
+        if (changeSet) {
+          const files = await this.network.previewWorkspaceRewind(credential, controls.workspace.workspaceId, changeSet.changeSetId, operationSignal);
+          if (!current()) return undefined;
+          assertMobileWorkspaceRewindPreview(files, controls.workspace.workspaceId, changeSet.changeSetId);
+          preview = { controls, files };
+        }
+      } catch {
+        if (!current()) return undefined;
+        preview = { controls, fileError: true };
+      }
+    }
+    if (!current()) return undefined;
+    this.#messageRewindPreviews.add(preview);
+    return preview;
+  }
+
+  async commitTaskMessageRewind(preview: MobileMessageRewindPreview, mode: "dialogue" | "files", signal: AbortSignal): Promise<MobileMessageRewindResult> {
+    const original = preview.controls; const eventId = original.source.eventId;
+    const controls = this.taskMessageRewindControls(eventId);
+    if (signal.aborted || !this.#messageRewindPreviews.has(preview) || controls?.authorityKey !== original.authorityKey
+      || (mode === "dialogue" ? !controls.canDialogue : !controls.canFiles)) throw new Error("The message rewind preview changed. Open it again from the current message.");
+    const files = preview.files;
+    const fileCurrent = (): boolean => files !== undefined && files.safety !== RewindSafety.BLOCKED
+      && mobileWorkspaceRewindExpiresAt(files) > this.now();
+    if (mode === "files" && !fileCurrent()) throw new Error("The Workspace rewind preview is blocked or expired. Open a new preview.");
+    const credential = this.#ready(); const epoch = this.#epoch; const profileId = this.#activeProfileId!;
+    const session = this.#selectedSession()!; const operationId = this.newId(); const identity = { profileId, sessionId: session.sessionId };
+    const current = (): boolean => !signal.aborted && this.#current(epoch) && this.#foreground && this.#credential === credential
+      && this.#state.status === "connected" && this.#state.selectedId === session.sessionId
+      && this.#selectedSession()?.backendId === session.backendId && this.#selectedSession()?.targetId === session.targetId;
+    const dispatchCurrent = (): boolean => current() && this.taskMessageRewindControls(eventId)?.authorityKey === original.authorityKey
+      && mobileMessageRewindIdle(this.#selectedSession()!, this.#state.detail!) && (mode !== "files" || fileCurrent());
+    this.#assertNoPendingRuntimeControl(session.sessionId);
+    const action = this.#claimMutation(); let retained = false;
+    try {
+      if (mode === "dialogue") {
+        if (!this.composerDrafts) throw new Error("Retained task drafts are unavailable on this mobile client.");
+        await this.composerDrafts.flush(identity);
+        if (!dispatchCurrent()) return { kind: "retired" };
+        await this.composerDrafts.retainOperationInput(identity, operationId, original.source.draft);
+        retained = true;
+        if (!dispatchCurrent()) { await this.composerDrafts.clearOperationInput(identity, operationId); return { kind: "retired" }; }
+      }
+      const mutation = create(OperationMutationSchema, {
+        preconditions: [this.#sessionRuntimePrecondition(session)],
+        payload: mode === "dialogue" ? { case: "navigateSessionBranch", value: create(NavigateSessionBranchMutationSchema, {
+          sessionId: session.sessionId, target: original.source.target!, summarize: false, customInstructions: ""
+        }) } : { case: "executeWorkspaceRewind", value: create(ExecuteWorkspaceRewindMutationSchema, {
+          workspaceId: controls.workspace!.workspaceId, previewId: files!.previewId, changeSetId: files!.changeSetId,
+          confirmFileRestore: true, allowDialogueOnly: false
+        }) }
+      });
+      const receipt = { kind: mode === "dialogue" ? "session-rewind" as const : "workspace-rewind" as const,
+        sessionId: session.sessionId, eventId, backendId: session.backendId, targetId: session.targetId,
+        sourceGeneration: session.nativeBinding!.runtimeGeneration.toString(),
+        ...(mode === "files" ? { workspaceId: controls.workspace!.workspaceId, changeSetId: files!.changeSetId } : {}) };
+      const result = await this.#submitTerminal(mutation, receipt, operationId, true, false, {
+        signal, isCurrent: current, beforeDispatch: dispatchCurrent,
+        beforeTerminalReceipt: async (operation) => {
+          if (operation.state !== OperationState.SUCCEEDED) return;
+          await this.#recoverMessageRewindReceipt({ ...receipt, operationId, connectionId: credential.connectionId, state: "unknown" }, operation, epoch, current);
+        }
+      });
+      if (!current()) return { kind: "retired" };
+      if (!result.definitive) return { kind: "unknown" };
+      let cleanupError: string | undefined;
+      if (retained) {
+        try { await this.composerDrafts!.clearOperationInput(identity, operationId); }
+        catch (error) { cleanupError = message(error); }
+      }
+      if (!result.accepted) return { kind: "rejected" };
+      this.#messageRewindPreviews.delete(preview);
+      this.#clearHistory(); await this.refresh();
+      if (cleanupError && this.#foreground && this.#activeProfileId === profileId) this.#set({ error: cleanupError });
+      return this.#foreground && this.#activeProfileId === profileId && this.#state.selectedId === session.sessionId
+        ? { kind: "rewound", mode } : { kind: "retired" };
+    } catch (error) {
+      if (current() && this.#state.pending.some((value) => value.operationId === operationId)) {
+        this.#set({ busy: false, error: `Operation ${operationId}: ${message(error)}. Check its saved result; it was not resent.` });
+        return { kind: "unknown" };
+      }
+      if (!current()) return { kind: "retired" };
+      throw error;
+    } finally { this.#releaseMutation(action); }
+  }
+
+  #assertMessageRewindResult(operation: Operation, pending: Pick<PendingOperation, "kind" | "workspaceId" | "changeSetId">): void {
+    const payload = operation.result?.payload;
+    if (pending.kind === "session-rewind") {
+      if (payload?.case === "acknowledgement" && payload.value.accepted === true) return;
+    } else if (pending.kind === "workspace-rewind" && payload?.case === "workspaceRewind"
+      && payload.value.workspaceId === pending.workspaceId && payload.value.changeSetId === pending.changeSetId
+      && payload.value.filesRewound && !payload.value.dialogueRewound) return;
+    throw new Error("The Joko node completed rewind without the exact typed outcome. Its operation was not resent.");
+  }
+
+  async #recoverMessageRewindReceipt(pending: PendingOperation, operation: Operation, epoch: number, isCurrent?: () => boolean): Promise<void> {
+    this.#assertMessageRewindResult(operation, pending);
+    if (pending.kind !== "session-rewind") return;
+    const credential = this.#ready(); const profileId = this.#activeProfileId!;
+    const current = (): boolean => this.#current(epoch) && this.#foreground && this.#credential === credential && this.#activeProfileId === profileId
+      && (isCurrent?.() ?? true);
+    const owner = await this.network.readOwner(credential, this.#abort?.signal);
+    if (!current()) return;
+    this.#assertOwner(credential, owner, this.#state.node!);
+    const sessions = owner.snapshot.sessions.filter((value) => value.sessionId === pending.sessionId);
+    const session = sessions[0];
+    if (sessions.length !== 1 || !session || session.backendId !== pending.backendId || session.targetId !== pending.targetId
+      || session.nativeBinding?.backendId !== pending.backendId || !session.nativeBinding.opaqueReference
+      || !mobileSessionOriginSourceAvailable(session) || !pending.sourceGeneration
+      || (session.nativeBinding?.runtimeGeneration ?? 0n) <= BigInt(pending.sourceGeneration) || !this.composerDrafts) {
+      throw new Error("The saved conversation rewind no longer has its exact task authority. Its operation was not resent.");
+    }
+    const draft = await this.composerDrafts.readOperationInput({ profileId, sessionId: session.sessionId }, pending.operationId);
+    if (!current()) return;
+    if (!draft || !await this.#restoreForkDraft(draft, profileId, session.sessionId, current)) {
+      throw new Error("The conversation was rewound, but its retained input could not be restored safely. The newer draft was kept.");
+    }
+    if (current()) this.#notifyRewindDraftRestored(profileId, session.sessionId);
+  }
+
+  #notifyRewindDraftRestored(profileId: string, sessionId: string): void {
+    this.#set({ restoredComposerDraft: { profileId, sessionId, sequence: (this.#state.restoredComposerDraft?.sequence ?? 0) + 1 } });
+  }
+
+  taskDerivationOriginControls(): MobileSessionOriginControls | undefined {
+    const session = this.#selectedSession();
+    if (!session) return undefined;
+    const projected = projectMobileSessionOrigin(session, this.#state.owner?.sessions ?? []);
+    if (!projected) return undefined;
+    const ownerKey = this.taskPresentationOwnerKey();
+    const ownerSession = this.#state.owner?.sessions.find((candidate) => candidate.sessionId === session.sessionId);
+    const source = this.#state.owner?.sessions.find((candidate) => candidate.sessionId === projected.source?.sessionId);
+    const ownerOrigin = ownerSession ? projectMobileSessionOrigin(ownerSession, this.#state.owner!.sessions) : undefined;
+    const owner = this.#state.owner; const detail = this.#state.detail;
+    const canOpen = projected.canOpen && ownerOrigin?.canOpen === true && ownerOrigin.originKey === projected.originKey
+      && owner?.scope?.kind.case === "owner" && owner.generation > 0n && (owner.revision?.value ?? 0n) > 0n
+      && detail?.scope?.kind.case === "session" && detail.scope.kind.value.sessionId === session.sessionId
+      && (detail.revision?.value ?? 0n) > 0n
+      && ownerKey !== undefined && mobileSessionOriginSessionKey(ownerSession) === mobileSessionOriginSessionKey(session)
+      && Boolean(source?.backendId && source.targetId && source.nativeBinding?.runtimeGeneration && source.nativeBinding.runtimeGeneration > 0n);
+    return { ...projected, canOpen, ...(canOpen ? { authorityKey: JSON.stringify([
+      ownerKey, mobileSessionOriginSessionKey(session), projected.originKey, mobileSessionOriginSessionKey(source)
+    ]) } : {}) };
+  }
+
+  /** Revalidates lineage through authenticated APIs before offering the existing native navigation controller a URL. */
+  async prepareTaskDerivationOrigin(authorityKey: string, signal?: AbortSignal): Promise<string | undefined> {
+    const controls = this.taskDerivationOriginControls();
+    if (signal?.aborted || !controls?.canOpen || controls.authorityKey !== authorityKey || !controls.source) return undefined;
+    const credential = this.#ready(); const epoch = this.#epoch;
+    const session = this.#selectedSession()!; const generation = this.#state.owner!.generation;
+    const source = this.#state.owner!.sessions.find((candidate) => candidate.sessionId === controls.source!.sessionId)!;
+    const current = (): boolean => !signal?.aborted && this.#current(epoch) && this.#foreground && this.#credential === credential
+      && this.taskDerivationOriginControls()?.authorityKey === authorityKey;
+    const operationSignal = signal === undefined ? this.#abort?.signal
+      : this.#abort === undefined ? signal : AbortSignal.any([this.#abort.signal, signal]);
+    const sourceMatches = (value: Session | undefined): value is Session => value !== undefined
+      && mobileSessionOriginSourceAvailable(value) && mobileSessionOriginSessionKey(value) === mobileSessionOriginSessionKey(source);
+    const validOwner = (owner: Awaited<ReturnType<MobileNetwork["readOwner"]>>): boolean => {
+      this.#assertOwner(credential, owner, this.#state.node!);
+      const snapshot = owner.snapshot;
+      const children = snapshot.sessions.filter((candidate) => candidate.sessionId === session.sessionId);
+      const sources = snapshot.sessions.filter((candidate) => candidate.sessionId === source.sessionId);
+      if (snapshot.scope?.kind.case !== "owner" || snapshot.generation !== generation || !snapshot.snapshotId
+        || !snapshot.revision || snapshot.revision.value < 1n || children.length !== 1 || sources.length !== 1
+        || mobileSessionOriginSessionKey(children[0]) !== mobileSessionOriginSessionKey(session) || !sourceMatches(sources[0])) return false;
+      const origin = projectMobileSessionOrigin(children[0]!, snapshot.sessions);
+      return origin?.canOpen === true && origin.originKey === controls.originKey;
+    };
+    const detailSession = (detail: Snapshot, id: string): Session | undefined => {
+      const matches = detail.sessions.filter((candidate) => candidate.sessionId === id);
+      return detail.server?.serverId === credential.serverId && detail.server.apiVersion === this.#state.node?.apiVersion && detail.generation === generation
+        && detail.scope?.kind.case === "session" && detail.scope.kind.value.sessionId === id
+        && detail.snapshotId && detail.revision && detail.revision.value > 0n && matches.length === 1 ? matches[0] : undefined;
+    };
+    try {
+      const [owner, detail] = await Promise.all([
+        this.network.readOwner(credential, operationSignal), this.network.readSession(credential, session.sessionId, operationSignal)
+      ]);
+      if (!current() || !validOwner(owner)) return undefined;
+      const child = detailSession(detail, session.sessionId);
+      if (!child || mobileSessionOriginSessionKey(child) !== mobileSessionOriginSessionKey(session)) return undefined;
+      const origin = projectMobileSessionOrigin(child, owner.snapshot.sessions);
+      if (!origin?.canOpen || origin.originKey !== controls.originKey) return undefined;
+      const target = controls.source;
+      const [sourceDetail, events] = await Promise.all([
+        this.network.readSession(credential, source.sessionId, operationSignal),
+        target.eventId ? this.network.readAround(credential, source.sessionId, target.eventId, operationSignal) : Promise.resolve(undefined)
+      ]);
+      if (!current() || !sourceMatches(detailSession(sourceDetail, source.sessionId))) return undefined;
+      let focusEventId = target.eventId;
+      if (events !== undefined) {
+        validateHistory(events, source.sessionId, generation);
+        const matches = events.filter((event) => event.eventId === target.eventId);
+        if (matches.length !== 1) return undefined;
+        const payload = matches[0]!.payload?.kind;
+        if ((payload?.case !== "messageCompleted" && payload?.case !== "messageStarted")
+          || payload.value.messageId !== target.messageId
+          || (payload.value.role !== MessageRole.USER && payload.value.role !== MessageRole.ASSISTANT)
+          || payload.case === "messageStarted" && (payload.value.role !== MessageRole.USER || !payload.value.userInputAccepted)) return undefined;
+        const completed = events.filter((event) => event.payload?.kind.case === "messageCompleted"
+          && event.payload.kind.value.messageId === target.messageId);
+        if (completed.length > 1) return undefined;
+        if (payload.case === "messageStarted" && completed.length === 1) {
+          const completion = completed[0]!; const message = completion.payload!.kind;
+          if (message.case !== "messageCompleted" || message.value.role !== payload.value.role
+            || (completion.cursor?.sequence ?? 0n) <= (matches[0]!.cursor?.sequence ?? 0n)
+            || ["entryId", "parentEntryId"].some((key) => {
+              const field = key as "entryId" | "parentEntryId";
+              const before = payload.value.nativeIdentity?.[field]; const after = message.value.nativeIdentity?.[field];
+              return before && after && before !== after;
+            })) return undefined;
+          // The durable origin still names the accepted input. Native focus uses its verified completed row.
+          focusEventId = completion.eventId;
+        }
+      }
+      // Availability may have been revoked while the source history was being read.
+      const finalOwner = await this.network.readOwner(credential, operationSignal);
+      if (!current() || !validOwner(finalOwner)) return undefined;
+      const url = new URL(target.messageId ? buildMobileMessageDeepLink(source.sessionId, target.messageId, focusEventId)
+        : buildMobileTaskDeepLink(source.sessionId));
+      url.searchParams.set("profile", credential.profileId);
+      const value = url.toString(); const parsed = parseMobileNativeIntent(value);
+      return current() && parsed?.kind === "session" && parsed.profileId === credential.profileId
+        && parsed.sessionId === source.sessionId && parsed.messageId === target.messageId && parsed.messageEventId === focusEventId
+        ? value : undefined;
+    } catch (error) {
+      if (!current() || operationSignal?.aborted) return undefined;
+      throw error;
+    }
+  }
+
+  #taskDerivationContext(capability: string) {
+    const runtime = this.taskRuntimeControls();
+    const target = this.#state.owner?.targets.find((candidate) => candidate.targetId === runtime?.session.targetId);
+    if (!runtime || !target) return undefined;
+    const supported = (name: string): boolean => {
+      const matches = runtime.backend.capabilities?.capabilities.filter((capability) => capability.name === name) ?? [];
+      return matches.length === 1 && matches[0]!.support === CapabilitySupport.SUPPORTED;
+    };
+    const canDerive = supported(capability)
+      && (!runtime.session.worktree || supported("workspace.derive"))
+      && !this.#state.detail?.reviewRuns.some((review) => review.reviewerSessionId === runtime.session.sessionId)
+      && !this.#state.pending.some((pending) => pending.sessionId === runtime.session.sessionId
+        && (pending.kind.startsWith("session-") || pending.kind === "workspace-rewind"));
+    const controls = {
+      authorityKey: runtime.authorityKey,
+      surfaceOwnerKey: JSON.stringify([runtime.surfaceOwnerKey, this.#state.owner!.generation.toString(10),
+        entityVersionKey(target.version), backendAuthorityKey(runtime.backend), runtime.session.nativeBinding?.opaqueReference,
+        runtime.session.worktree?.leaseId ?? "", runtime.session.worktree?.workspaceId ?? "", runtime.session.worktree?.state ?? 0]),
+      sourceSessionId: runtime.session.sessionId, sourceName: runtime.session.displayName
+    };
+    return { controls, canDerive, runtime };
+  }
+
+  async cloneTask(authorityKey: string, name: string, signal?: AbortSignal): Promise<MobileTaskCloneResult> {
+    signal?.throwIfAborted();
+    const controls = this.taskCloneControls();
+    const session = this.taskRuntimeControls()?.session;
+    if (!controls?.canClone || !session || controls.authorityKey !== authorityKey) {
+      throw new Error("The task clone owner changed. Reopen the confirmation from the current task.");
+    }
+    const displayName = name.trim();
+    if (!displayName || displayName.length > 120 || /[\u0000-\u001f\u007f]/u.test(displayName)) {
+      throw new Error("Use a task name between 1 and 120 characters.");
+    }
+    this.#assertNoPendingRuntimeControl(session.sessionId);
+    const action = this.#claimMutation();
+    const epoch = this.#epoch;
+    const surfaceOwnerKey = controls.surfaceOwnerKey;
+    const current = (): boolean => this.#current(epoch) && this.#foreground
+      && this.#state.selectedId === session.sessionId
+      && this.taskCloneControls()?.surfaceOwnerKey === surfaceOwnerKey;
+    try {
+      const result = await this.#submitTerminal(create(OperationMutationSchema, {
+        preconditions: [this.#sessionRuntimePrecondition(session)],
+        payload: { case: "cloneSession", value: create(CloneSessionMutationSchema, {
+          sourceSessionId: session.sessionId, newDisplayName: displayName
+        }) }
+      }), { kind: "session-clone", sessionId: session.sessionId }, undefined, true, false,
+      { signal: signal ?? new AbortController().signal, isCurrent: current });
+      if (!current() || signal?.aborted) return { kind: "retired" };
+      if (!result.definitive) return { kind: "unknown" };
+      if (!result.accepted) return { kind: "rejected" };
+      const child = this.#derivedTaskResult(result.operation, session, SessionDerivationKind.CLONE);
+      return await this.#refreshDerivedTaskList(child, current, signal)
+        ? { kind: "cloned", sessionId: child.sessionId } : { kind: "retired" };
+    } finally { this.#releaseMutation(action); }
+  }
+
+  taskMessageForkControls(eventId: string): MobileMessageForkControls | undefined {
+    const context = this.#taskDerivationContext(capabilityNames.sessionFork);
+    if (!context) return undefined;
+    const events = this.#timelineEvents();
+    const active = [SessionState.CREATING, SessionState.RUNNING, SessionState.WAITING, SessionState.RECOVERING]
+      .includes(context.runtime.session.state) || this.#state.detail?.runs.some((run) => run.sessionId === context.runtime.session.sessionId
+        && [RunState.ACCEPTED, RunState.QUEUED, RunState.DISPATCHING, RunState.DISPATCH_UNKNOWN, RunState.RUNNING, RunState.WAITING, RunState.RETRYING].includes(run.state)) === true;
+    const source = resolveMobileMessageForkSource(events, context.controls.sourceSessionId, eventId,
+      this.#state.owner!.generation, active);
+    if (!source || !timelineRows(events).some((row) => row.id === source.messageId && row.eventId === source.eventId && row.completed)) return undefined;
+    return { ...context.controls, source, canFork: context.canDerive,
+      authorityKey: JSON.stringify([context.controls.authorityKey, source.sourceKey]),
+      surfaceOwnerKey: JSON.stringify([context.controls.surfaceOwnerKey, source.sourceKey]) };
+  }
+
+  async forkTaskMessage(authorityKey: string, eventId: string, name: string, signal?: AbortSignal): Promise<MobileMessageForkResult> {
+    signal?.throwIfAborted();
+    const controls = this.taskMessageForkControls(eventId);
+    const session = this.taskRuntimeControls()?.session;
+    if (!controls?.canFork || !session || controls.authorityKey !== authorityKey) {
+      throw new Error("The message fork owner or native boundary changed. Reopen the current message confirmation.");
+    }
+    const displayName = name.trim();
+    if (!displayName || displayName.length > 120 || /[\u0000-\u001f\u007f]/u.test(displayName)) throw new Error("Use a task name between 1 and 120 characters.");
+    this.#assertNoPendingRuntimeControl(session.sessionId);
+    const action = this.#claimMutation(); const epoch = this.#epoch;
+    const profileId = this.#activeProfileId!;
+    const current = (): boolean => this.#current(epoch) && this.#foreground && !signal?.aborted
+      && this.taskMessageForkControls(eventId)?.surfaceOwnerKey === controls.surfaceOwnerKey;
+    let draftRestored = controls.source.draft === undefined;
+    try {
+      const result = await this.#submitTerminal(create(OperationMutationSchema, {
+        preconditions: [this.#sessionRuntimePrecondition(session)],
+        payload: { case: "forkSession", value: create(ForkSessionMutationSchema, {
+          sourceSessionId: session.sessionId, nativeEntryId: controls.source.nativeEntryId,
+          sourceMessageId: controls.source.messageId, sourceEventId: controls.source.eventId, newDisplayName: displayName
+        }) }
+      }), { kind: "session-fork", sessionId: session.sessionId, eventId }, undefined, true, false,
+      { signal: signal ?? new AbortController().signal, isCurrent: current,
+        beforeTerminalReceipt: async (operation) => {
+          if (operation.state !== OperationState.SUCCEEDED) return;
+          const child = this.#derivedTaskResult(operation, session, SessionDerivationKind.FORK, controls.source);
+          draftRestored = await this.#restoreForkDraft(controls.source.draft, profileId, child.sessionId, current);
+        } });
+      if (!current()) return { kind: "retired" };
+      if (!result.definitive) return { kind: "unknown" };
+      if (!result.accepted) return { kind: "rejected" };
+      const child = this.#derivedTaskResult(result.operation, session, SessionDerivationKind.FORK, controls.source);
+      if (!current() || !await this.#refreshDerivedTaskList(child, current, signal)) return { kind: "retired" };
+      return { kind: "forked", sessionId: child.sessionId, draftRestored };
+    } finally { this.#releaseMutation(action); }
+  }
+
+  async #restoreForkDraft(draft: MobileComposerDraft | undefined, profileId: string, sessionId: string,
+    current: () => boolean): Promise<boolean> {
+    if (!draft) return true;
+    if (!this.composerDrafts) return false;
+    const identity = { profileId, sessionId };
+    try {
+      const snapshot = await this.composerDrafts.readSnapshot(identity);
+      if (!current()) return false;
+      const restored = recoverMobileComposerDraft(draft, snapshot.draft ?? emptyMobileComposerDraft());
+      if (!this.composerDrafts.saveIfRevision(identity, restored, snapshot.revision)) return false;
+      await this.composerDrafts.flush(identity);
+      return true;
+    } catch { return false; }
+  }
+
+  async #recoverForkReceipt(pending: PendingOperation, operation: Operation, epoch: number): Promise<void> {
+    const credential = this.#ready(); const profileId = this.#activeProfileId!;
+    const sources = this.#state.owner?.sessions.filter((candidate) => candidate.sessionId === pending.sessionId) ?? [];
+    if (sources.length !== 1 || !pending.eventId) throw new Error("The saved fork source is unavailable. Its operation was not resent.");
+    const current = (): boolean => this.#current(epoch) && this.#foreground && this.#activeProfileId === profileId
+      && this.#credential?.connectionId === pending.connectionId;
+    const around = await this.network.readAround(credential, sources[0]!.sessionId, pending.eventId, this.#abort?.signal);
+    if (!current()) return;
+    const source = resolveMobileMessageForkSource(around, sources[0]!.sessionId, pending.eventId, this.#state.owner!.generation, false);
+    if (!source) throw new Error("The saved fork input or native source is unavailable. Its operation was not resent.");
+    const child = this.#derivedTaskResult(operation, sources[0]!, SessionDerivationKind.FORK, source);
+    const restored = await this.#restoreForkDraft(source.draft, profileId, child.sessionId, current);
+    if (current() && !restored) this.#set({ error: "The branch was created, but its draft could not be restored. Open it to review before sending." });
+  }
+
+  #derivedTaskResult(operation: Operation | undefined, source: Session, kind: SessionDerivationKind,
+    message?: MobileMessageForkSource): Session {
+    const child = operation?.result?.payload.case === "session" ? operation.result.payload.value : undefined;
+    if (operation?.state !== OperationState.SUCCEEDED || !child?.sessionId || child.sessionId === source.sessionId
+      || child.sessionId.length > 512 || /[\u0000-\u001f\u007f]/u.test(child.sessionId)
+      || child.backendId !== source.backendId || child.nativeBinding?.backendId !== source.backendId
+      || !child.nativeBinding.opaqueReference || child.nativeBinding.opaqueReference === source.nativeBinding?.opaqueReference
+      || child.nativeBinding.runtimeGeneration < 1n || child.derivationOrigin?.kind !== kind
+      || child.derivationOrigin.sourceSessionId !== source.sessionId
+      || (message && (child.derivationOrigin.sourceMessageId !== message.messageId || child.derivationOrigin.sourceEventId !== message.eventId))) {
+      throw new Error("The Joko node completed task derivation without the exact derived Session identity.");
+    }
+    return child;
+  }
+
+  async #refreshDerivedTaskList(child: Session, current: () => boolean, signal?: AbortSignal): Promise<boolean> {
+    const credential = this.#ready();
+    const owner = await this.network.readOwner(credential, signal === undefined ? this.#abort?.signal
+      : this.#abort === undefined ? signal : AbortSignal.any([this.#abort.signal, signal]));
+    if (!current() || signal?.aborted) return false;
+    this.#assertOwner(credential, owner, this.#state.node!);
+    const derived = owner.snapshot.sessions.filter((candidate) => candidate.sessionId === child.sessionId);
+    if (derived.length !== 1 || derived[0]!.backendId !== child.backendId || derived[0]!.targetId !== child.targetId
+      || derived[0]!.nativeBinding?.opaqueReference !== child.nativeBinding?.opaqueReference
+      || derived[0]!.nativeBinding?.runtimeGeneration !== child.nativeBinding?.runtimeGeneration) {
+      throw new Error("The derived task is not available in the current authenticated task list.");
+    }
+    this.#set({ owner: owner.snapshot });
+    return current();
+  }
+
   taskNativeTreeControls(): MobileNativeTreeControls | undefined {
     const credential = this.#credential;
     if (!credential || !this.#taskAuthorityKey()) return undefined;
@@ -7922,7 +9180,7 @@ export class MobileClient {
   #assertNoPendingRuntimeControl(sessionId: string): void {
     if (this.#state.pending.some((item) => item.sessionId === sessionId
       && ["session-model", "session-permission", "session-plan", "session-compact", "session-branch",
-        "session-shell", "session-reset", "session-review"].includes(item.kind))) {
+        "session-shell", "session-reset", "session-review", "session-clone", "session-fork", "session-rewind", "workspace-rewind"].includes(item.kind))) {
       throw new Error("A previous task control change is still pending. Check its operation before changing another setting.");
     }
   }
@@ -8447,11 +9705,10 @@ export class MobileClient {
       if (mobileTimelineGalleryWindowKey(events) !== source.windowKey) {
         throw new Error("The Timeline source window changed while the gallery was open.");
       }
-      const matches = events.filter((event) => event.eventId === source.eventId);
-      const currentPages = matches.length === 1 ? mobileTimelineGalleryPages(matches[0]!) : [];
+      const currentPages = timelineGalleryPagesForSelection(events, source.eventId, source.pageId);
       if (currentPages.length !== lease.pages.length
         || currentPages.some((page, index) => !sameMobileImageGalleryPage(page, lease.pages[index]!))) {
-        throw new Error("The completed message images changed while the gallery was open.");
+        throw new Error("The durable Timeline images changed while the gallery was open.");
       }
     }
     const snapshot = await this.composerDrafts!.readSnapshot(lease.identity);
@@ -8469,6 +9726,41 @@ export class MobileClient {
     }
     if (controls) assertMobileAttachmentPolicy(current.attachments, controls.policy);
     return controls;
+  }
+
+  async #revalidateGalleryImageSource(lease: MobileImageGalleryLease, loaded: Pick<NonNullable<MobileImageGalleryLease["loaded"]>, "page">, signal: AbortSignal): Promise<void> {
+    signal.throwIfAborted();
+    if (lease.source.kind === "markdown") return; // The resource owner revalidates its exact message and Workspace revision above.
+    const page = loaded.page; const source = page.source; const credential = this.#ready();
+    if (lease.source.kind === "files") {
+      const context = this.#filesContext();
+      if (context.key !== lease.source.filesAuthorityKey) throw new Error("The Files image authority changed.");
+      if (source.kind === "artifact") {
+        const artifacts = await this.network.listSessionArtifacts(credential, source.sessionId, signal);
+        const matches = artifacts.artifacts.filter((item) => item.artifactId === source.artifactId && item.sessionId === source.sessionId);
+        if (artifacts.revision !== this.#state.files.artifactsRevision || matches.length !== 1
+          || !matches[0]?.blob || !sameFilesComposerBlob(matches[0].blob, page.blob)) throw new Error("The Generated image changed before system sharing began.");
+      } else if (source.kind === "workspace") {
+        const path = source.relativePath;
+        const directory = await this.network.listWorkspaceDirectory(credential, context.authority.workspace.workspaceId, workspaceParentPath(path), signal);
+        const matches = directory.entries.filter((item) => item.workspaceId === context.authority.workspace.workspaceId && item.relativePath === path);
+        const entry = matches.length === 1 ? matches[0] : undefined;
+        if (!entry?.revision || entry.kind !== FileKind.REGULAR || workspaceEntryRevisionKey(entry.revision) !== source.revisionKey
+          || normalizeMediaType(entry.mediaType) !== page.mediaType) throw new Error("The Workspace image changed before system sharing began.");
+        const preview = await this.#canonicalWorkspaceImagePreview(credential, entry.workspaceId,
+          await this.network.readWorkspaceFile(credential, entry.workspaceId, path, entry.revision, signal), signal);
+        const blob = workspaceComposerBlob(entry.workspaceId, entry, preview);
+        if (!blob || !sameFilesComposerBlob(blob, page.blob)) throw new Error("The Workspace image Blob changed before system sharing began.");
+      } else throw new Error("The Files gallery returned an invalid source identity.");
+    } else {
+      if (!("eventId" in source)) throw new Error("The Timeline image returned an invalid source identity.");
+      const around = await this.network.readAround(credential, lease.identity.sessionId, source.eventId, signal);
+      const matches = around.filter((event) => event.eventId === source.eventId && event.identity?.sessionId === lease.identity.sessionId
+        && event.cursor?.generation === this.#state.owner?.generation);
+      const current = matches.length === 1 ? timelineGalleryPagesForSelection(around, source.eventId, page.pageId).find((item) => item.pageId === page.pageId) : undefined;
+      if (!current || !sameMobileImageGalleryPage(current, page)) throw new Error("The Timeline image changed before system sharing began.");
+    }
+    signal.throwIfAborted();
   }
 
   async #commitImageGalleryPage(
@@ -8498,18 +9790,24 @@ export class MobileClient {
       lease.draft.attachments,
       controls
     );
-    if (!originalMetadata) throw new Error("This gallery image no longer fits the current attachment policy.");
+    if (!originalMetadata
+      && (!mobileImageRequiresNativeRaster(loaded.page.mediaType) || exactStrokes.length === 0)) {
+      throw new Error("This gallery image no longer fits the current attachment policy.");
+    }
+    const originalFileName = originalMetadata?.fileName
+      ?? mobileImageOutputFileName(loaded.page.blob.fileName || loaded.page.title, loaded.page.mediaType);
+    const originalMediaType = originalMetadata?.mediaType ?? loaded.page.mediaType;
     if (this.#imageGallery !== lease || lease.operationInFlight) {
       throw new Error("This gallery image is already being added or no longer owns the composer.");
     }
     lease.operationInFlight = true;
     try {
       let outputBytes = Uint8Array.from(loaded.bytes);
-      let outputMediaType: string = originalMetadata.mediaType;
-      let outputFileName = originalMetadata.fileName;
+      let outputMediaType: string = originalMediaType;
+      let outputFileName = originalFileName;
       let outputSha256Hex = loaded.page.sha256Hex;
       if (exactStrokes.length > 0) {
-        if (!canAnnotateMobileImage(loaded.page.mediaType) || !burned) {
+        if (loaded.decoded.animated || loaded.decoded.originalOnly || !canAnnotateMobileImage(loaded.page.mediaType) || !burned) {
           throw new Error("This gallery image cannot be rendered with annotations.");
         }
         const expectedMediaType = mobileAnnotationOutputMediaType(loaded.page.mediaType);
@@ -8524,7 +9822,7 @@ export class MobileClient {
         }
         outputBytes = Uint8Array.from(burned.bytes);
         outputMediaType = burned.mediaType;
-        outputFileName = mobileAnnotatedImageFileName(originalMetadata.fileName, burned.mediaType);
+        outputFileName = mobileAnnotatedImageFileName(originalFileName, burned.mediaType);
         outputSha256Hex = await this.attachmentFiles.digestOwnedBytes(outputBytes, signal);
       }
       assertMobileAttachmentCandidate({
@@ -8538,8 +9836,8 @@ export class MobileClient {
           this.newId,
           ...mobileComposerAttachmentStorageIds(lease.draft.attachments)
         ),
-        fileName: originalMetadata.fileName,
-        mediaType: originalMetadata.mediaType,
+        fileName: originalFileName,
+        mediaType: originalMediaType,
         byteSize: loaded.page.byteSize,
         sha256Hex: loaded.page.sha256Hex,
         capturedAtUnixMs: this.now()
@@ -8713,7 +10011,7 @@ export class MobileClient {
         throw new Error("The selected Workspace search result changed before it could be shared.");
       }
     }
-    return entry;
+    return this.#filesPreviewOriginalEntry(source, entry);
   }
 
   #assertFilesShareSourceCurrent(
@@ -8841,15 +10139,16 @@ export class MobileClient {
         draft.attachments,
         attachmentControls
       )) {
+      const original = this.#filesPreviewOriginalEntry(source, entry);
       const preview = await this.network.readWorkspaceFile(
         context.credential,
         context.authority.workspace.workspaceId,
         path,
-        entry.revision,
+        original.revision!,
         signal
       );
       assertCurrent();
-      const blob = workspaceComposerBlob(context.authority.workspace.workspaceId, entry, preview);
+      const blob = workspaceComposerBlob(context.authority.workspace.workspaceId, original, preview);
       if (blob) {
         const metadata = filesAttachmentMetadata(
           blob.fileName || entry.displayName || workspaceBasename(path),
@@ -9027,6 +10326,17 @@ export class MobileClient {
     return { draft: insertion.draft, result: "reference" };
   }
 
+  #filesPreviewOriginalEntry(source: MobileFilesComposerSource, observed: WorkspaceEntry): WorkspaceEntry {
+    const lease = this.#filesPreviewPager;
+    if (!lease || !this.#filesPreviewPagerCurrent(lease) || lease.descriptor.pages[lease.descriptor.index]?.source !== source || !lease.original) return observed;
+    const original = lease.original;
+    if (!original.revision || !observed.revision || original.relativePath !== observed.relativePath || original.workspaceId !== observed.workspaceId
+      || normalizeMediaType(original.mediaType) !== normalizeMediaType(observed.mediaType) || !workspaceComposerRevisionMatches(observed.revision, original.revision)) {
+      throw new Error("The visible original file changed before its action began.");
+    }
+    return { ...observed, revision: original.revision };
+  }
+
   async #resolveFilesComposerWorkspaceEntry(
     context: MobileFilesContext,
     source: MobileFilesComposerSource,
@@ -9128,6 +10438,7 @@ export class MobileClient {
   }
 
   #cancelFilesRequests(): void {
+    this.#retireFilesPreviewPager();
     if (this.#imageGallery?.source.kind === "files") this.#retireImageGallery();
     this.#cancelPreparingFileShare("files");
     void this.#releaseFilesBinaryPreviews().catch(() => undefined);
@@ -9339,7 +10650,7 @@ export class MobileClient {
     }
   }
 
-  async #previewWorkspaceFile(relativePath: string, revision: FileRevision, title: string): Promise<void> {
+  async #previewWorkspaceFile(relativePath: string, revision: FileRevision, title: string, signal?: AbortSignal): Promise<void> {
     const path = canonicalWorkspacePath(relativePath);
     workspaceEntryRevisionKey(revision);
     const context = this.#filesContext();
@@ -9347,9 +10658,11 @@ export class MobileClient {
     this.#filesPreviewAbort?.abort();
     const controller = new AbortController();
     this.#filesPreviewAbort = controller;
+    const abort = () => controller.abort(); signal?.addEventListener("abort", abort, { once: true }); if (signal?.aborted) abort();
     const epoch = this.#filesEpoch;
+    const page = this.#filesPreviewPager?.descriptor.pages[this.#filesPreviewPager.descriptor.index];
     const provisional = {
-      title, sourceLabel: path, mediaType: "application/octet-stream",
+      title, sourceLabel: path, mediaType: page?.kind === "workspace" && page.entry.relativePath === path ? page.mediaType : "application/octet-stream",
       byteSize: revision.byteSize, revisionKey: workspaceEntryRevisionKey(revision)
     };
     this.#set({ files: { ...this.#state.files, preview: { ...provisional, kind: "loading" } } });
@@ -9364,6 +10677,7 @@ export class MobileClient {
         preview: { ...provisional, kind: "error", reason: message(error) } } });
     } finally {
       if (this.#filesPreviewAbort === controller) this.#filesPreviewAbort = undefined;
+      signal?.removeEventListener("abort", abort);
     }
   }
 
@@ -9396,7 +10710,24 @@ export class MobileClient {
     this.#filesMediaPreview = preview.kind === "media" ? preview : undefined;
     this.#filesPdfPreview = preview.kind === "pdf" ? preview : undefined;
     this.#filesModelPreview = preview.kind === "model" ? preview : undefined;
+    if (this.#filesPreviewPager && this.#filesPreviewPagerCurrent(this.#filesPreviewPager)) {
+      const page = this.#filesPreviewPager.descriptor.pages[this.#filesPreviewPager.descriptor.index];
+      if (page?.kind === "workspace" && page.entry.relativePath === relativePath) this.#filesPreviewPager.original = result.entry;
+    }
     this.#set({ files: { ...this.#state.files, preview } });
+  }
+
+  async #canonicalWorkspaceImagePreview(credential: PairedCredential, workspaceId: string, preview: FilePreview, signal?: AbortSignal): Promise<FilePreview> {
+    const entry = preview.entry;
+    if (normalizeMediaType(entry?.mediaType ?? "") !== "image/svg+xml" || preview.content.case !== "text" || preview.truncated) return preview;
+    if (!entry?.revision || entry.workspaceId !== workspaceId || entry.kind !== FileKind.REGULAR) throw new Error("The SVG Workspace source is invalid.");
+    const materialized = await this.network.materializeWorkspaceFileBlob(credential, workspaceId, entry.relativePath, entry.revision, signal);
+    signal?.throwIfAborted();
+    if (!sameFilesWorkspaceEntry(materialized.entry, entry) || normalizeMediaType(materialized.blob.mediaType) !== "image/svg+xml"
+      || materialized.blob.byteSize !== entry.revision.byteSize || materialized.blob.sha256Hex !== entry.revision.sha256Hex) {
+      throw new Error("The SVG Workspace revision changed before image preview.");
+    }
+    return { ...preview, entry: materialized.entry, content: { case: "image", value: create(ImageRefSchema, { blob: materialized.blob, altText: entry.displayName }) } };
   }
 
   async #workspacePreview(
@@ -9405,6 +10736,7 @@ export class MobileClient {
     title: string,
     signal: AbortSignal
   ): Promise<MobileFilePreview> {
+    preview = await this.#canonicalWorkspaceImagePreview(context.credential, context.authority.workspace.workspaceId, preview, signal);
     const entry = preview.entry;
     const revision = entry?.revision;
     if (!entry || !revision || entry.kind === FileKind.DIRECTORY
@@ -9415,6 +10747,7 @@ export class MobileClient {
     const base = {
       title,
       sourceLabel: entry.relativePath,
+      fileName: workspaceBasename(entry.relativePath),
       mediaType,
       byteSize: revision.byteSize,
       revisionKey: workspaceEntryRevisionKey(revision)
@@ -9429,7 +10762,7 @@ export class MobileClient {
       if (visibleBytes !== text.endByte - text.startByte) {
         throw new Error("The Joko node returned a text preview with a mismatched byte window.");
       }
-      return { ...base, kind: "text", text: text.utf8Text, languageId: text.languageId,
+      return { ...base, kind: "text", workspaceEntry: entry, text: text.utf8Text, languageId: text.languageId,
         startByte: text.startByte, endByte: text.endByte, totalLines: text.totalLines,
         truncated: preview.truncated };
     }
@@ -9442,8 +10775,12 @@ export class MobileClient {
         throw new Error("The Joko node returned mismatched image preview metadata.");
       }
       const download = await this.network.downloadBlob(context.credential, blob, signal);
-      return { ...base, kind: "image", dataUri: bytesToDataUri(download.bytes, download.mediaType),
-        altText: image.altText || title, widthPixels: image.widthPixels, heightPixels: image.heightPixels };
+      const decoded = mobileImageGalleryMediaType(mediaType) ? inspectMobileImageGalleryBytes(download.bytes, mediaType) : undefined;
+      if (decoded && image.widthPixels > 0 && !mobileImageGalleryDimensionsMatch(decoded, image.widthPixels, image.heightPixels)) {
+        throw new Error("The Workspace image dimensions do not match the canonical image bytes.");
+      }
+      return { ...base, kind: "image", dataUri: decoded ? mobileImageGalleryPreviewUri(download.bytes, decoded) : bytesToDataUri(download.bytes, download.mediaType),
+        altText: image.altText || title, widthPixels: decoded?.width ?? image.widthPixels, heightPixels: decoded?.height ?? image.heightPixels };
     }
     if (preview.content.case === "blob") {
       const blob = preview.content.value;
@@ -9721,7 +11058,7 @@ export class MobileClient {
 
   async #submit(
     mutation: OperationMutation,
-    identity: Pick<PendingOperation, "kind" | "sessionId" | "eventId" | "queueItemId" | "interactionId" | "interactionGeneration" | "interactionRevision" | "interactionDraftKind" | "targetConnectionId" | "targetDeviceId" | "scheduleId" | "triggerId" | "targetId">,
+    identity: Pick<PendingOperation, "kind" | "sessionId" | "eventId" | "queueItemId" | "interactionId" | "interactionGeneration" | "interactionRevision" | "interactionDraftKind" | "targetConnectionId" | "targetDeviceId" | "scheduleId" | "triggerId" | "targetId" | "backendId" | "sourceGeneration" | "workspaceId" | "changeSetId">,
     operationId?: string
   ): Promise<boolean> {
     return (await this.#submitTracked(mutation, identity, false, operationId)).accepted;
@@ -9729,23 +11066,27 @@ export class MobileClient {
 
   async #submitTerminal(
     mutation: OperationMutation,
-    identity: Pick<PendingOperation, "kind" | "sessionId" | "eventId" | "queueItemId" | "interactionId" | "interactionGeneration" | "interactionRevision" | "interactionDraftKind" | "targetConnectionId" | "targetDeviceId" | "scheduleId" | "triggerId" | "targetId">,
+    identity: Pick<PendingOperation, "kind" | "sessionId" | "eventId" | "queueItemId" | "interactionId" | "interactionGeneration" | "interactionRevision" | "interactionDraftKind" | "targetConnectionId" | "targetDeviceId" | "scheduleId" | "triggerId" | "targetId" | "backendId" | "sourceGeneration" | "workspaceId" | "changeSetId">,
     operationId?: string,
     markBusy = true,
     refreshAfter = true,
-    authority?: { readonly signal: AbortSignal; readonly isCurrent: () => boolean }
+    authority?: { readonly signal: AbortSignal; readonly isCurrent: () => boolean;
+      readonly beforeDispatch?: () => boolean;
+      readonly beforeTerminalReceipt?: (operation: Operation) => Promise<void> }
   ): Promise<TrackedMutationResult> {
     return this.#submitTracked(mutation, identity, true, operationId, markBusy, refreshAfter, authority);
   }
 
   async #submitTracked(
     mutation: OperationMutation,
-    identity: Pick<PendingOperation, "kind" | "sessionId" | "eventId" | "queueItemId" | "interactionId" | "interactionGeneration" | "interactionRevision" | "interactionDraftKind" | "targetConnectionId" | "targetDeviceId" | "scheduleId" | "triggerId" | "targetId">,
+    identity: Pick<PendingOperation, "kind" | "sessionId" | "eventId" | "queueItemId" | "interactionId" | "interactionGeneration" | "interactionRevision" | "interactionDraftKind" | "targetConnectionId" | "targetDeviceId" | "scheduleId" | "triggerId" | "targetId" | "backendId" | "sourceGeneration" | "workspaceId" | "changeSetId">,
     waitForTerminal: boolean,
     operationId = this.newId(),
     markBusy = true,
     refreshAfter = true,
-    authority?: { readonly signal: AbortSignal; readonly isCurrent: () => boolean }
+    authority?: { readonly signal: AbortSignal; readonly isCurrent: () => boolean;
+      readonly beforeDispatch?: () => boolean;
+      readonly beforeTerminalReceipt?: (operation: Operation) => Promise<void> }
   ): Promise<TrackedMutationResult> {
     const requestCurrent = (): boolean => authority === undefined || !authority.signal.aborted && authority.isCurrent();
     if (!requestCurrent()) return { accepted: false, definitive: false };
@@ -9762,7 +11103,7 @@ export class MobileClient {
       throw error;
     }
     let operation: Operation;
-    if (!requestCurrent()) return { accepted: false, definitive: false };
+    if (!requestCurrent() || authority?.beforeDispatch?.() === false) return { accepted: false, definitive: false };
     const operationSignal = authority === undefined ? this.#abort?.signal
       : this.#abort === undefined ? authority.signal : AbortSignal.any([this.#abort.signal, authority.signal]);
     try {
@@ -9776,6 +11117,8 @@ export class MobileClient {
       this.#set({ ...(markBusy ? { busy: false } : {}), error: `Operation ${pending.operationId} returned with the wrong durable identity. Its receipt was retained and no input was resent.` });
       return { accepted: false, definitive: false };
     }
+    if (isTerminal(operation.state)) await authority?.beforeTerminalReceipt?.(operation);
+    if (!this.#current(epoch) || !requestCurrent()) return { accepted: false, definitive: false };
     await this.#receipt(operation, pending, epoch);
     if (waitForTerminal && !isTerminal(operation.state)) {
       try {
@@ -9792,6 +11135,8 @@ export class MobileClient {
         this.#set({ ...(markBusy ? { busy: false } : {}), error: `Operation ${pending.operationId} completed with the wrong durable identity. Its receipt was retained and no input was resent.` });
         return { accepted: false, definitive: false };
       }
+      if (isTerminal(operation.state)) await authority?.beforeTerminalReceipt?.(operation);
+      if (!this.#current(epoch) || !requestCurrent()) return { accepted: false, definitive: false };
       await this.#receipt(operation, pending, epoch);
     }
     const rejected = operation.state === OperationState.FAILED
@@ -9866,7 +11211,23 @@ export class MobileClient {
         const operation = await this.network.getOperation(credential, pending.operationId, this.#abort?.signal);
         if (!this.#current(epoch)) return;
         if (operation) {
+          if (pending.kind === "session-fork" && operation.state === OperationState.SUCCEEDED
+            && operation.operationId === pending.operationId && operation.connectionId === pending.connectionId) {
+            await this.#recoverForkReceipt(pending, operation, epoch);
+            if (!this.#current(epoch)) return;
+          }
+          const messageRewind = pending.kind === "session-rewind" || pending.kind === "workspace-rewind";
+          const exactOperation = operation.operationId === pending.operationId && operation.connectionId === pending.connectionId;
+          if (messageRewind && exactOperation && operation.state === OperationState.SUCCEEDED) {
+            await this.#recoverMessageRewindReceipt(pending, operation, epoch);
+            if (!this.#current(epoch)) return;
+          }
           await this.#receipt(operation, pending, epoch);
+          if (pending.kind === "session-rewind" && exactOperation && isTerminal(operation.state) && this.#current(epoch)
+            && !this.#state.pending.some((value) => value.operationId === pending.operationId)) {
+            await this.composerDrafts?.clearOperationInput({ profileId: credential.profileId, sessionId: pending.sessionId! }, pending.operationId);
+            if (!this.#current(epoch)) return;
+          }
           const scheduleMutation = ["schedule-run", "schedule-enable", "schedule-run-restart",
             "schedule-run-read", "schedule-runs-read", "schedule-all-read", "schedule-run-delete",
             "schedule-create", "schedule-update", "schedule-delete", "schedule-promote", "schedule-clone",
@@ -9884,10 +11245,10 @@ export class MobileClient {
             && ["device-rename", "rename", "pin", "archive", "delete", "message-delete", "queue-cancel", "queue-edit-lock",
               "queue-edit", "queue-interaction-lock", "queue-reorder", "interaction-resolve", "interaction-dismiss",
               "session-model", "session-permission", "session-plan", "session-compact", "session-branch",
-              "session-shell", "session-reset", "session-review"].includes(pending.kind)
+              "session-shell", "session-reset", "session-review", "session-clone", "session-fork", "session-rewind", "workspace-rewind"].includes(pending.kind)
             && this.#current(epoch)) {
             await this.refresh();
-            if (pending.kind === "message-delete" && this.#foreground
+            if ((pending.kind === "message-delete" || messageRewind) && this.#foreground
               && this.#state.selectedId === pending.sessionId) this.#clearHistory();
             return;
           }
@@ -10175,9 +11536,22 @@ function mobileCredentialKey(credential: PairedCredential): string {
 }
 
 function filesComposerSourceIsCurrent(files: MobileFilesState, source: MobileFilesComposerSource): boolean {
+  if (files.previewPager) return files.preview?.kind !== "loading" && files.previewPager.pages[files.previewPager.index]?.source === source;
   if (source.kind === "workspace-entry") return files.entries.includes(source.entry);
   if (source.kind === "artifact") return files.artifacts.includes(source.artifact);
   return files.searchResults.includes(source.result);
+}
+
+function mobileFilesWorkspaceClipboardValue(relativePath: string): Pick<MobileFilesClipboardLease, "text" | "kind"> {
+  const path = canonicalWorkspacePath(relativePath);
+  if (!path) throw new Error("The canonical Workspace file path is unavailable.");
+  return { text: path, kind: "path" };
+}
+
+function mobileFilesGeneratedClipboardValue(fileName: string | undefined): Pick<MobileFilesClipboardLease, "text" | "kind"> {
+  if (!fileName || fileName === "." || fileName === ".." || fileName.length > 4096
+    || /[\\/\u0000-\u001f\u007f]/u.test(fileName)) throw new Error("The canonical Generated filename is unavailable.");
+  return { text: fileName, kind: "file-name" };
 }
 
 function filesAttachmentMetadata(
@@ -10555,6 +11929,23 @@ function composerRouteOwnerKey(
     session.nativeBinding?.opaqueReference ?? "",
     session.nativeBinding?.runtimeGeneration.toString(10) ?? ""
   ]);
+}
+
+function timelineGalleryPagesForSelection(
+  events: readonly Event[],
+  eventId: string,
+  pageId: string
+): readonly MobileImageGalleryPage[] {
+  const rows = timelineRows(events).filter((row) => row.images?.some((image) =>
+    image.sourceEventId === eventId && image.pageId === pageId));
+  if (rows.length !== 1) return [];
+  const images = rows[0]!.images ?? [];
+  const pages = images.flatMap((image) => {
+    const sources = events.filter((event) => event.eventId === image.sourceEventId);
+    if (sources.length !== 1) return [];
+    return mobileTimelineGalleryPages(sources[0]!).filter((page) => page.pageId === image.pageId);
+  });
+  return pages.length === images.length ? pages : [];
 }
 
 function historyInvalidated(event: Event): boolean {

@@ -419,7 +419,7 @@ async function sha256Hex(bytes: Uint8Array): Promise<string> {
   const { CryptoDigestAlgorithm, digest } = await import("expo-crypto");
   const value = new Uint8Array(await digest(
     CryptoDigestAlgorithm.SHA256,
-    Uint8Array.from(bytes).buffer
+    Uint8Array.from(bytes)
   ));
   return [...value].map((byte) => byte.toString(16).padStart(2, "0")).join("");
 }

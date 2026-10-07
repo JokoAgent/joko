@@ -1,7 +1,7 @@
 import { Code, ConnectError, createClient, type Interceptor, type Transport } from "@connectrpc/connect";
 import { createConnectTransport } from "@connectrpc/connect-web";
 import {
-  ArtifactKind, ArtifactService, BlobDisposition, ConnectionService, DeviceKind, EventService, FileKind,
+  ArtifactKind, ArtifactService, BlobDisposition, ConnectionService, DeviceKind, EventService, FileKind, ImageThumbnailUnavailableReason,
   MobilePushEnvironment as WireMobilePushEnvironment, MobilePushLocale as WireMobilePushLocale,
   MobilePushProvider, OperationService, OperationState, PartnerService,
   ResourceKind, SchedulerService, SessionService, TargetService, VoiceInputService, SettingsService, CredentialService, CredentialKind,
@@ -14,12 +14,12 @@ import {
   TransferDirection, WorkspaceEntryListingPolicy, WorkspaceFileChangeKind, WorkspaceService,
   JOKO_API_VERSION, SessionMessageSearchSemanticMode, SessionMessageSearchSessionStatus,
   isPrivateLanDiscoveryHost, validateDiscoveredNode,
-  type Artifact, type BlobRef, type BlobTransferTicket, type Connection, type Device, type DiscoveredNodeRecord,
+  type Artifact, type BlobRef, type BlobTransferTicket, type Connection, type Device, type DiscoveredNodeRecord, type ImageThumbnail,
   type Event, type EventCursor, type FilePreview, type FileRevision, type Operation, type OperationMutation,
   type NativeSessionTree, type PendingBlobUpload, type RuntimeCommand, type Schedule, type ScheduleRunHistory,
   type SchedulerRuntimeSnapshot, type SessionMessageSearchMatch, type SessionResource, type Snapshot, type Target,
-  type WorkspaceEntry, type WorkspaceFileChange, type ListPartnerSessionsResponse,
-  type WorkspaceSearchMatch
+  type WorkspaceEntry, type WorkspaceFileChange, type WorkspaceHtmlReference, type ListPartnerSessionsResponse,
+  type WorkspaceSearchMatch, type WorkspaceChangeSet, type WorkspaceRewindPreview
 } from "@joko/contracts";
 import {
   canonicalWorkspacePath,
@@ -128,10 +128,14 @@ export interface MobileNetwork {
   searchSessionMessages(credential: PairedCredential, query: string, status: SessionMessageSearchSessionStatus, signal?: AbortSignal): Promise<readonly SessionMessageSearchMatch[]>;
   streamOwner(credential: PairedCredential, after: EventCursor, signal: AbortSignal): AsyncIterable<Event>;
   listWorkspaceDirectory(credential: PairedCredential, workspaceId: string, parentPath: string, signal?: AbortSignal): Promise<WorkspaceDirectorySnapshot>;
+  listWorkspaceChangeSets(credential: PairedCredential, workspaceId: string, sessionId: string, signal?: AbortSignal): Promise<readonly WorkspaceChangeSet[]>;
+  previewWorkspaceRewind(credential: PairedCredential, workspaceId: string, changeSetId: string, signal?: AbortSignal): Promise<WorkspaceRewindPreview>;
   listWorkspaceFileIndex(credential: PairedCredential, workspaceId: string, signal?: AbortSignal): Promise<WorkspaceFileIndexSnapshot>;
   searchWorkspace(credential: PairedCredential, workspaceId: string, query: string, caseSensitive: boolean, signal?: AbortSignal): Promise<WorkspaceSearchSnapshot>;
   watchWorkspace(credential: PairedCredential, workspaceId: string, signal: AbortSignal): AsyncIterable<WorkspaceFileChange>;
   readWorkspaceFile(credential: PairedCredential, workspaceId: string, relativePath: string, revision: FileRevision, signal?: AbortSignal): Promise<FilePreview>;
+  readWorkspaceHtmlSnapshot(credential: PairedCredential, sessionId: string, file: Pick<WorkspaceHtmlReference, "workspaceId" | "relativePath" | "expectedRevision">,
+    signal?: AbortSignal): Promise<{ readonly file: WorkspaceHtmlReference; readonly html: string }>;
   materializeWorkspaceFileBlob(credential: PairedCredential, workspaceId: string, relativePath: string, revision: FileRevision, signal?: AbortSignal): Promise<MaterializedWorkspaceBlob>;
   listSessionArtifacts(credential: PairedCredential, sessionId: string, signal?: AbortSignal): Promise<ArtifactCatalogSnapshot>;
   listRuntimeCommands(credential: PairedCredential, sessionId: string, signal?: AbortSignal): Promise<readonly RuntimeCommand[]>;
@@ -144,6 +148,7 @@ export interface MobileNetwork {
   probeTargetWorktree(credential: PairedCredential, targetId: string, signal?: AbortSignal): Promise<MobileTargetWorktreeProbe>;
   listTargetWorktreeSources(credential: PairedCredential, targetId: string, signal?: AbortSignal): Promise<readonly MobileTargetWorktreeSource[]>;
   downloadBlob(credential: PairedCredential, blob: BlobRef, signal?: AbortSignal): Promise<VerifiedBlobDownload>;
+  readImageThumbnail(credential: PairedCredential, blob: BlobRef, edge: 256 | 1024, signal?: AbortSignal): Promise<ImageThumbnail | undefined>;
   authorizeBlobDownload(credential: PairedCredential, blob: BlobRef, signal?: AbortSignal): Promise<AuthorizedBlobDownload>;
   uploadBlob(credential: PairedCredential, source: MobileBlobUploadSource, signal?: AbortSignal): Promise<BlobRef>;
   getVoiceInputCapabilities(credential: PairedCredential, signal?: AbortSignal): Promise<MobileVoiceCapability>;
@@ -393,6 +398,38 @@ export async function collectTargetWorktreeSourcePages(
     pageTokens.add(page.nextPageToken);
     pageToken = page.nextPageToken;
   }
+}
+
+export async function collectWorkspaceChangeSetPages(workspaceId: string, sessionId: string,
+  readPage: (pageToken: string) => Promise<{ readonly changeSets: readonly WorkspaceChangeSet[]; readonly nextPageToken: string; readonly totalSize: bigint }>
+): Promise<readonly WorkspaceChangeSet[]> {
+  const values: WorkspaceChangeSet[] = []; const identities = new Set<string>(); const tokens = new Set<string>();
+  let token = ""; let total: bigint | undefined;
+  for (let index = 0; index < 256; index++) {
+    const page = await readPage(token);
+    if (page.totalSize < 0n || page.totalSize > 30_000n || page.changeSets.length > WORKSPACE_PAGE_SIZE
+      || !validSchedulePageToken(page.nextPageToken) || total !== undefined && page.totalSize !== total) {
+      throw new Error("The Joko node returned invalid or changing Workspace checkpoint metadata.");
+    }
+    total = page.totalSize;
+    for (const value of page.changeSets) {
+      if (!validCatalogIdentity(value.changeSetId) || identities.has(value.changeSetId)
+        || value.workspaceId !== workspaceId || value.sessionId !== sessionId || !value.capturedAt
+        || value.capturedAt.seconds < 0n || value.capturedAt.nanos < 0 || value.capturedAt.nanos >= 1_000_000_000) {
+        throw new Error("The Joko node returned a duplicate or foreign Workspace checkpoint.");
+      }
+      identities.add(value.changeSetId); values.push(value);
+    }
+    if (!page.nextPageToken) {
+      if (BigInt(values.length) !== total) throw new Error("The Workspace checkpoint catalog is incomplete.");
+      return values;
+    }
+    if (!page.changeSets.length || page.nextPageToken === token || tokens.has(page.nextPageToken)) {
+      throw new Error("The Workspace checkpoint catalog has a cyclic page token.");
+    }
+    tokens.add(page.nextPageToken); token = page.nextPageToken;
+  }
+  throw new Error("The Workspace checkpoint catalog exceeds the safe paging limit.");
 }
 
 export function validateScheduleHistoryPage(
@@ -1220,6 +1257,26 @@ export const mobileNetwork: MobileNetwork = {
       };
     });
   },
+  async listWorkspaceChangeSets(credential, workspaceId, sessionId, signal) {
+    signal?.throwIfAborted();
+    if (!workspaceId || !sessionId) throw new Error("A current Workspace and task are required.");
+    const client = createClient(WorkspaceService, transport(credential.origin, credential.authKey));
+    return collectWorkspaceChangeSetPages(workspaceId, sessionId, async (pageToken) => {
+      signal?.throwIfAborted();
+      const response = await client.listWorkspaceChangeSets({ workspaceId, sessionId,
+        page: { pageSize: WORKSPACE_PAGE_SIZE, pageToken } }, options(signal));
+      if (!response.page) throw new Error("The Joko node did not return Workspace checkpoint page metadata.");
+      return { changeSets: response.changeSets, nextPageToken: response.page.nextPageToken, totalSize: response.page.totalSize };
+    });
+  },
+  async previewWorkspaceRewind(credential, workspaceId, changeSetId, signal) {
+    signal?.throwIfAborted();
+    if (!workspaceId || !changeSetId) throw new Error("A current Workspace checkpoint is required.");
+    const response = await createClient(WorkspaceService, transport(credential.origin, credential.authKey))
+      .previewWorkspaceRewind({ workspaceId, changeSetId }, options(signal));
+    if (!response.preview) throw new Error("The Joko node did not return a Workspace rewind preview.");
+    return response.preview;
+  },
   async listWorkspaceFileIndex(credential, workspaceId, signal) {
     if (!workspaceId) throw new Error("A current Workspace is required.");
     const response = await createClient(WorkspaceService, transport(credential.origin, credential.authKey))
@@ -1298,6 +1355,22 @@ export const mobileNetwork: MobileNetwork = {
       requireBlob: true
     }, options(signal));
     return assertMaterializedWorkspaceBlob(workspaceId, path, revision, response.preview);
+  },
+  async readWorkspaceHtmlSnapshot(credential, sessionId, file, signal) {
+    const relativePath = canonicalWorkspacePath(file.relativePath);
+    if (!sessionId || !file.workspaceId || file.expectedRevision !== "" && !/^workspace-html:[0-9a-f]{64}$/u.test(file.expectedRevision)) {
+      throw new Error("A current task and canonical HTML snapshot reference are required.");
+    }
+    const response = await createClient(WorkspaceService, transport(credential.origin, credential.authKey))
+      .readWorkspaceHtmlSnapshot({ sessionId, file: { ...file, relativePath } }, options(signal));
+    signal?.throwIfAborted();
+    if (!response.file || response.file.workspaceId !== file.workspaceId || response.file.relativePath !== relativePath
+      || !/^workspace-html:[0-9a-f]{64}$/u.test(response.file.expectedRevision)
+      || file.expectedRevision !== "" && response.file.expectedRevision !== file.expectedRevision
+      || new TextEncoder().encode(response.utf8Html).byteLength > 2_097_152) {
+      throw new Error("The Joko node returned a mismatched complete HTML snapshot.");
+    }
+    return { file: response.file, html: response.utf8Html };
   },
   async listSessionArtifacts(credential, sessionId, signal) {
     if (!sessionId) throw new Error("A current task is required for Generated files.");
@@ -1431,6 +1504,27 @@ export const mobileNetwork: MobileNetwork = {
     const response = await createClient(ArtifactService, transport(credential.origin, credential.authKey))
       .getBlobDownloadTicket({ blobId: blob.blobId }, options(signal));
     return downloadVerifiedBlob(credential, blob, response.ticket, signal);
+  },
+  async readImageThumbnail(credential, blob, edge, signal) {
+    assertDownloadBlob(blob);
+    const response = await createClient(ArtifactService, transport(credential.origin, credential.authKey))
+      .getImageThumbnail({ expectedSourceBlob: blob, maximumEdgePixels: edge }, options(signal));
+    signal?.throwIfAborted(); const source = response.sourceBlob;
+    if (!source || source.blobId !== blob.blobId || source.sha256Hex !== blob.sha256Hex || source.byteSize !== blob.byteSize
+      || source.mediaType !== blob.mediaType || source.fileName !== blob.fileName) throw new Error("The thumbnail belongs to another canonical Blob.");
+    if (response.result.case === "unavailable") {
+      if (![ImageThumbnailUnavailableReason.UNSUPPORTED, ImageThumbnailUnavailableReason.INPUT_TOO_LARGE,
+        ImageThumbnailUnavailableReason.RENDER_FAILED, ImageThumbnailUnavailableReason.BUSY].includes(response.result.value)) throw new Error("The image thumbnail outcome is unknown.");
+      return undefined;
+    }
+    if (response.result.case !== "thumbnail") throw new Error("The image thumbnail result is missing.");
+    const value = response.result.value;
+    if (value.mediaType !== "image/webp" || !/^[0-9a-f]{64}$/u.test(value.sha256Hex) || !value.data.length || value.data.length > 700 * 1024
+      || !Number.isSafeInteger(value.widthPixels) || !Number.isSafeInteger(value.heightPixels) || value.widthPixels < 1 || value.heightPixels < 1
+      || value.widthPixels > edge || value.heightPixels > edge || value.sourceWidthPixels < 1 || value.sourceHeightPixels < 1
+      || value.sourceWidthPixels > 16_384 || value.sourceHeightPixels > 16_384 || value.sourceWidthPixels * value.sourceHeightPixels > 64 * 1024 * 1024
+      || Math.max(value.widthPixels, value.heightPixels) > Math.max(value.sourceWidthPixels, value.sourceHeightPixels)) throw new Error("The image thumbnail exceeds its presentation bounds.");
+    return value;
   },
   async authorizeBlobDownload(credential, blob, signal) {
     assertShareBlob(blob);

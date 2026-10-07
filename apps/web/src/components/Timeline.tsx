@@ -112,10 +112,10 @@ import {
   shouldUnpinTimelineOnWheel
 } from "./timeline-follow-intent.js";
 import { ToolPayloadLightbox, ToolPayloadOpenButton } from "./ToolPayloadLightbox.js";
-import { parseToolFileChangeSet, type ToolFileChangeView } from "./tool-file-change.js";
-import { describeToolPresentation, type ToolPresentationAction } from "./tool-presentation.js";
+import { parseToolFileChangeSet, type ToolFileChangeView } from "@joko/contracts";
+import { describeToolPresentation, type ToolPresentationAction } from "@joko/contracts";
 import { WorkspaceImageLightbox } from "./WorkspaceImageLightbox.js";
-import type { ToolPayloadSection } from "./tool-payload.js";
+import type { ToolPayloadSection } from "@joko/contracts";
 import { SentMessageReferenceChips, SentMessageReferenceText, TimelineLinkSourceContext, TimelineMarkdownImage, TimelineMarkdownLink, type TimelineReferenceActions, type TimelineWorkspaceAsset } from "./TimelineReferenceContent.js";
 import { validSentInputMentionRanges } from "./timeline-references.js";
 import { normalizeTimelineMathDelimiters, remarkStrictTimelineInlineMath } from "./timeline-markdown-math.js";

@@ -94,9 +94,31 @@ describe("RemoteWorkspaceService", () => {
     expect(listing.map((entry) => entry.path)).toEqual(["src", "src/main.ts", "README.md", "scene.gltf"]);
     expect(listing.some((entry) => entry.path.startsWith(".git"))).toBe(false);
 
+    for (const [name, mediaType] of [["motion.apng", "image/apng"], ["photo.AVIF", "image/avif"],
+      ["photo.heic", "image/heic"], ["photo.heif", "image/heif"], ["scan.tif", "image/tiff"], ["scan.tiff", "image/tiff"]] as const) {
+      const bytes = Buffer.from([0, 1, 2, 3]);
+      await files.write({ path: `/workspace/${name}`, content: bytes, mode: 0o644 });
+      expect(await workspaces.preview("workspace-a", name, 32)).toMatchObject({ mediaType, bytes, truncated: false,
+        entry: { path: name, size: bytes.length, revision: expect.stringMatching(/^sha256:/u) } });
+    }
+
     const prefix = await workspaces.preview("workspace-a", "README.md", 5);
     expect(prefix).toMatchObject({ text: "hello", truncated: true, mediaType: "text/markdown" });
+    await files.write({ path: "/workspace/unicode.zig", content: Buffer.from("a漢"), mode: 0o644 });
+    expect(await workspaces.preview("workspace-a", "unicode.zig", 2)).toMatchObject({ text: "a", truncated: true });
+    await files.write({ path: "/workspace/invalid.zig", content: Buffer.from([0xff, 0x78, 0x78]), mode: 0o644 });
+    await expect(workspaces.preview("workspace-a", "invalid.zig", 2)).rejects.toMatchObject({ kind: "unsupported" });
+    for (const [name, mediaType] of [["guide.mdown", "text/markdown"], ["Makefile", "text/plain"],
+      ["data.xml", "application/xml"], ["settings.yml", "application/yaml"],
+      ["styles.css", "text/css"], ["script.mjs", "text/javascript"], ["source.ts", "text/typescript"]] as const) {
+      await files.write({ path: `/workspace/${name}`, content: Buffer.from("hello remote"), mode: 0o644 });
+      expect(await workspaces.preview("workspace-a", name, 5)).toMatchObject({ mediaType, text: "hello", truncated: true });
+    }
     const model = await workspaces.preview("workspace-a", "scene.gltf", 5);
+    for (const name of ["main.zig", "events.jsonl", "movie.srt", "Gemfile", ".gitignore", ".env", "production.env.local", "layout.xhtml"]) {
+      await files.write({ path: `/workspace/${name}`, content: Buffer.from("remote file text"), mode: 0o644 });
+      expect(await workspaces.preview("workspace-a", name, 5)).toMatchObject({ mediaType: "text/plain", text: "remot", truncated: true });
+    }
     expect(model).toMatchObject({ mediaType: "model/gltf+json", truncated: false });
     expect(model.text).toBeUndefined();
     expect(model.bytes).toBeUndefined();

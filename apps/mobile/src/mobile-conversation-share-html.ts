@@ -56,8 +56,11 @@ function imageHtml(message: MobileConversationShareMessage, key: string, label: 
   if (!image || !/^data:image\/(?:png|jpeg|webp);base64,[A-Za-z0-9+/]+={0,2}$/u.test(image.uri)
     || !Number.isSafeInteger(image.width) || !Number.isSafeInteger(image.height)
     || image.width <= 0 || image.height <= 0 || image.width * image.height > 12_000_000) return undefined;
-  return '<img class="share-image" src="' + image.uri + '" width="' + image.width + '" height="' + image.height
-    + '" alt="' + escapeHtml(redactShareMessageText(label)) + '">';
+  const dimensions = image.nativeQuarterTurn
+    ? ' style="max-width:100%;max-height:320px;width:auto;height:auto;object-fit:contain"'
+    : ' width="' + image.width + '" height="' + image.height + '"';
+  return '<img class="share-image" src="' + image.uri + '"' + dimensions
+    + ' alt="' + escapeHtml(redactShareMessageText(label)) + '">';
 }
 
 function imageFallback(label: string): string {

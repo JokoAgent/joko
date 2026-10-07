@@ -52,6 +52,12 @@ describe("mobile message action sheet", () => {
       { id: "copy-link", label: "复制消息链接" },
       { id: "share-image", label: "分享为图片" }
     ]);
+    expect(buildMobileMessageActions(row, { canDelete: false, canFork: true, locale: "en" }).at(-1))
+      .toEqual({ id: "fork", label: "Fork at message" });
+    expect(buildMobileMessageActions(row, { canDelete: false, canRewind: true, locale: "en" }).at(-1))
+      .toEqual({ id: "rewind", label: "Rewind before message" });
+    expect(buildMobileMessageActions({ ...row, kind: "assistant" }, { canDelete: false, canRewind: true, locale: "en" })
+      .some((item) => item.id === "rewind")).toBe(false);
   });
 
   it("runs a choice only after its matching close and cancels an old choice on reopen", () => {

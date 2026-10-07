@@ -19,6 +19,12 @@ const rasterAndPdfFixtures = [
   { name: "modern.webp", mediaType: "image/webp", bytes: Buffer.from("524946460400000057454250", "hex") },
   { name: "sample.bmp", mediaType: "image/bmp", bytes: Buffer.from("424d0a00000000000000", "hex") },
   { name: "favicon.ico", mediaType: "image/x-icon", bytes: Buffer.from("0000010001000101", "hex") },
+  { name: "motion.apng", mediaType: "image/apng", bytes: Buffer.from("89504e470d0a1a0a00000000", "hex") },
+  { name: "modern.AVIF", mediaType: "image/avif", bytes: Buffer.from("00000018667479706176696600000000", "hex") },
+  { name: "photo.heic", mediaType: "image/heic", bytes: Buffer.from("00000018667479706865696300000000", "hex") },
+  { name: "photo.heif", mediaType: "image/heif", bytes: Buffer.from("00000018667479706d69663100000000", "hex") },
+  { name: "scan.tif", mediaType: "image/tiff", bytes: Buffer.from("49492a00080000000000", "hex") },
+  { name: "scan.tiff", mediaType: "image/tiff", bytes: Buffer.from("4d4d002a000000080000", "hex") },
   { name: "manual.pdf", mediaType: "application/pdf", bytes: Buffer.from("%PDF-1.7\n%%EOF\n", "utf8") }
 ] as const;
 
@@ -85,15 +91,15 @@ describe("WorkspaceService media previews", () => {
     }
   });
 
-  it("does not widen formal Workspace image support to Git Review-only extensions", async () => {
+  it("keeps unregistered image extensions binary independently of Git Review", async () => {
     const root = await mkdtemp(join(tmpdir(), "joko-workspace-media-subset-"));
-    for (const name of ["animation.apng", "photo.jfif", "picture.avif"]) {
+    for (const name of ["picture.unknown", "photo.jfif"]) {
       await writeFile(join(root, name), Buffer.from([0, 1, 2, 3]));
     }
     const service = new WorkspaceService();
     await service.register({ id: "subset", root, displayName: "Subset", trusted: true });
 
-    for (const name of ["animation.apng", "photo.jfif", "picture.avif"]) {
+    for (const name of ["picture.unknown", "photo.jfif"]) {
       const preview = await service.preview("subset", name);
       expect(preview).toMatchObject({ mediaType: "application/octet-stream", truncated: false });
       expect(preview.text).toBeUndefined();

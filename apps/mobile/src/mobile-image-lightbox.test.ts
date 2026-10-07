@@ -8,9 +8,11 @@ import {
   mobileAccessibleZoomTransform,
   mobileContainedImageSize,
   mobileDoubleTapTransform,
+  mobileLightboxCanStartDismiss,
   mobileLightboxPointerIntent,
   mobileLightboxIsTap,
   mobileLightboxIsZoomed,
+  mobileLightboxShouldDismiss,
   mobileLightboxSwipePageIndex,
   mobilePinchTransform,
   mobileTouchCentroid,
@@ -104,5 +106,19 @@ describe("mobile image lightbox", () => {
     expect(mobileLightboxSwipePageIndex({
       currentIndex: 1, pageCount: 3, translationX: -80, translationY: 0, scale: 1, annotating: true
     })).toBeUndefined();
+  });
+
+  it("recognizes vertical dismissal outside horizontal paging and applies distance or velocity in both directions at 1x", () => {
+    expect(mobileLightboxCanStartDismiss(12, 16, 1)).toBe(false);
+    expect(mobileLightboxCanStartDismiss(12, 17, 1)).toBe(true);
+    expect(mobileLightboxCanStartDismiss(13, 200, 1)).toBe(false);
+    expect(mobileLightboxCanStartDismiss(0, -17, 2)).toBe(false);
+    expect(mobileLightboxShouldDismiss(120, 800, 1)).toBe(false);
+    expect(mobileLightboxShouldDismiss(-121, 0, 1)).toBe(true);
+    expect(mobileLightboxShouldDismiss(20, -801, 1)).toBe(true);
+    expect(mobileLightboxShouldDismiss(200, 1_000, 1.5)).toBe(false);
+    expect(mobileLightboxShouldDismiss(Number.NaN, 900, 1)).toBe(false);
+    expect(mobileLightboxShouldDismiss(121, Number.NaN, 1)).toBe(true);
+    expect(mobileLightboxShouldDismiss(20, Number.POSITIVE_INFINITY, 1)).toBe(false);
   });
 });

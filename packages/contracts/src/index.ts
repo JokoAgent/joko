@@ -1,3 +1,5 @@
+import "./protobuf-text-encoding.js";
+
 export * from "./gen/joko/v1/capability_pb.js";
 export * from "./gen/joko/v1/code_host_pb.js";
 export * from "./gen/joko/v1/collaboration_pb.js";
@@ -31,6 +33,10 @@ export * from "./gen/joko/v1/terminal_pb.js";
 export * from "./gen/joko/v1/voice_pb.js";
 export * from "./gen/joko/v1/workspace_pb.js";
 export * from "./well-known.js";
+export * from "./file-preview.js";
+export * from "./tool-presentation.js";
+export * from "./tool-file-change.js";
+export * from "./tool-payload.js";
 export * from "./lan-discovery.js";
 export * from "./protobuf-tree-wire.js";
 export * from "./voice-dictionary-peer-status.js";

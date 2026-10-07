@@ -191,7 +191,6 @@ describe("iOS incoming-share native boundary", () => {
     expect(extension).toContain('url = URL(string: "\\(hostAppScheme)://expo-sharing")');
     expect(surface).toContain("void mobileIncomingShare.refresh()");
     expect(surface).toContain('AppState.addEventListener("change"');
-    expect(surface).toContain("installMobileNativeIntentLinking(Linking, offerUrl)");
     expect(surface).toContain("isMobileIncomingShareUrl(url)");
     expect(surface).toContain("nativeIntentDeliveryRef.current!.invalidate()");
     expect(nativeIntent).toContain('source.addEventListener("url"');

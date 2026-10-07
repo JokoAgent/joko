@@ -1,11 +1,12 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { createReadStream, createWriteStream } from "node:fs";
 import { copyFile, type FileHandle, lstat, mkdir, open, realpath, rename, rm, stat } from "node:fs/promises";
-import { basename, dirname, extname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { pipeline } from "node:stream/promises";
 import type { Readable } from "node:stream";
 import { isWithin } from "@joko/core/policy";
 import type { BlobRef } from "@joko/core";
+import { workspaceMediaTypeForPath as inferMediaType } from "./workspace-file-media.js";
 
 export interface ArtifactRecord extends BlobRef {
   readonly storagePath: string;
@@ -349,8 +350,8 @@ export class ArtifactStore {
       if (!(await exists(storagePath))) throw error;
       await rm(temporaryPath, { force: true });
     }
-    const mimeType = input.mimeType ?? "application/octet-stream";
     const fileName = input.fileName === undefined ? undefined : sanitizeFileName(input.fileName);
+    const mimeType = input.mimeType ?? inferMediaType(fileName ?? "");
     const persist = async (): Promise<ArtifactRecord> => {
       if (input.expiresAt === undefined) {
         const existing = await this.#options.repository.findPermanentArtifact({
@@ -450,21 +451,6 @@ function hashText(value: string): string {
   return createHash("sha256").update(value).digest("hex");
 }
 
-function inferMediaType(path: string): string {
-  switch (extname(path).toLowerCase()) {
-    case ".png": return "image/png";
-    case ".jpg":
-    case ".jpeg": return "image/jpeg";
-    case ".gif": return "image/gif";
-    case ".svg": return "image/svg+xml";
-    case ".html": return "text/html";
-    case ".json": return "application/json";
-    case ".md": return "text/markdown";
-    case ".txt": return "text/plain";
-    case ".pdf": return "application/pdf";
-    default: return "application/octet-stream";
-  }
-}
 
 function sanitizeFileName(value: string): string {
   const safe = basename(value).replace(/[<>:"/\\|?*\u0000-\u001f]/g, "_").trim();

@@ -63,7 +63,7 @@ export interface MobileNewTaskDraftSnapshot {
   readonly draft?: MobileNewTaskDraft;
 }
 
-const storagePrefix = "joko.mobile.new-task-draft.v8";
+const storagePrefix = "joko.mobile.new-task-draft.v9";
 const persistDebounceMilliseconds = 400;
 const maximumStoredCharacters = 12_110_000;
 
@@ -477,7 +477,7 @@ function normalizeSubmission(value: MobileNewTaskSubmission): MobileNewTaskSubmi
 function serializeRecord(identity: MobileNewTaskDraftIdentity, draft: MobileNewTaskDraft): string {
   const exact = normalizeDraft(draft);
   const serialized = JSON.stringify({
-    version: 8,
+    version: 9,
     identity: normalizeIdentity(identity),
     draft: exact.submission === undefined
       ? exact
@@ -490,7 +490,7 @@ function serializeRecord(identity: MobileNewTaskDraftIdentity, draft: MobileNewT
 function readRecord(serialized: string, identity: MobileNewTaskDraftIdentity): MobileNewTaskDraft {
   if (serialized.length > maximumStoredCharacters) throw new Error("saved new-task draft is too large");
   const value: unknown = JSON.parse(serialized);
-  if (!isRecord(value) || value["version"] !== 8 || !isRecord(value["identity"])
+  if (!isRecord(value) || value["version"] !== 9 || !isRecord(value["identity"])
     || value["identity"]["profileId"] !== identity.profileId) {
     throw new Error("new-task draft identity mismatch");
   }

@@ -304,7 +304,16 @@ describe("current-v1 mobile connection storage", () => {
       { operationId: "compact", connectionId: first.connectionId, kind: "session-compact" as const,
         sessionId: "session-one", state: "accepted" as const },
       { operationId: "branch", connectionId: first.connectionId, kind: "session-branch" as const,
-        sessionId: "session-one", state: "accepted" as const }
+        sessionId: "session-one", state: "accepted" as const },
+      { operationId: "clone", connectionId: first.connectionId, kind: "session-clone" as const,
+        sessionId: "session-one", state: "accepted" as const },
+      { operationId: "fork", connectionId: first.connectionId, kind: "session-fork" as const,
+        sessionId: "session-one", eventId: "event-one", state: "unknown" as const },
+      { operationId: "rewind", connectionId: first.connectionId, kind: "session-rewind" as const,
+        sessionId: "session-one", eventId: "event-one", backendId: "backend", targetId: "target", sourceGeneration: "8", state: "unknown" as const },
+      { operationId: "files-rewind", connectionId: first.connectionId, kind: "workspace-rewind" as const,
+        sessionId: "session-one", eventId: "event-one", backendId: "backend", targetId: "target", sourceGeneration: "8",
+        workspaceId: "workspace", changeSetId: "checkpoint", state: "unknown" as const }
     ];
 
     await storage.savePending(receipts);
@@ -315,11 +324,16 @@ describe("current-v1 mobile connection storage", () => {
     expect(persisted).not.toContain("fastMode");
     expect(persisted).not.toContain("customInstructions");
     expect(persisted).not.toContain("nativeEntryId");
+    expect(persisted).not.toContain("newDisplayName");
 
     memory.plainValues.set("joko.mobile.pending.v1", JSON.stringify([
       ...receipts,
       { operationId: "missing-session", connectionId: first.connectionId, kind: "session-model", state: "unknown" },
-      { operationId: "branch-without-session", connectionId: first.connectionId, kind: "session-branch", state: "unknown" }
+      { operationId: "branch-without-session", connectionId: first.connectionId, kind: "session-branch", state: "unknown" },
+      { operationId: "clone-without-session", connectionId: first.connectionId, kind: "session-clone", state: "unknown" },
+      { operationId: "fork-without-event", connectionId: first.connectionId, kind: "session-fork", sessionId: "session-one", state: "unknown" },
+      { ...receipts[7], operationId: "rewind-no-generation", sourceGeneration: undefined },
+      { ...receipts[8], operationId: "files-no-checkpoint", changeSetId: undefined }
     ]));
     await expect(storage.loadPending()).resolves.toEqual(receipts);
   });

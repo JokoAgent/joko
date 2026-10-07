@@ -4,8 +4,10 @@ import { sha256 } from "@noble/hashes/sha2.js";
 import { bytesToHex } from "@noble/hashes/utils.js";
 import { BlobRefSchema, FileKind, FilePreviewSchema, FileRevisionSchema, WorkspaceEntrySchema, type WorkspaceEntry } from "@joko/contracts";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import sharp from "sharp";
 import { collectMobileMarkdownResourceCandidates, MobileMarkdownResourceReader, type MobileMarkdownResourceContext } from "./mobile-markdown-resources";
 import { installMobileAbortSignalRuntime } from "./mobile-abort-runtime";
+import { paddedPngBytes } from "./test/image-formats";
 
 const sdkRequire = createRequire(createRequire(import.meta.url).resolve("react-native/package.json"));
 const nativeSignals = sdkRequire("abort-controller") as { AbortController: typeof AbortController; AbortSignal: typeof AbortSignal };
@@ -32,6 +34,25 @@ function context(entries: readonly WorkspaceEntry[] = [image, file, folder]): Mo
 afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); });
 
 describe("canonical message Markdown resources", () => {
+  it.each(["png", "webp"] as const)("retains original EXIF %s bytes and bounded native canvas choices", async (format) => {
+    const bytes = await sharp({ create: { width: 6, height: 4, channels: 3, background: "orange" } })
+      .withMetadata({ orientation: 6 }).toFormat(format).toBuffer();
+    const exactRevision = create(FileRevisionSchema, { opaqueRevision: "portrait-r1", sha256Hex: bytesToHex(sha256(bytes)), byteSize: BigInt(bytes.length) });
+    const entry = create(WorkspaceEntrySchema, { ...image, relativePath: "images/portrait." + format, displayName: "portrait." + format,
+      mediaType: "image/" + format, revision: exactRevision });
+    const exactBlob = create(BlobRefSchema, { ...blob, fileName: entry.displayName, mediaType: entry.mediaType,
+      byteSize: exactRevision.byteSize, sha256Hex: exactRevision.sha256Hex });
+    const source = context([entry]);
+    vi.mocked(source.readFile).mockResolvedValue(create(FilePreviewSchema, { entry,
+      content: { case: "image", value: { blob: exactBlob, widthPixels: 4, heightPixels: 6 } } }));
+    vi.mocked(source.download).mockResolvedValue({ bytes, mediaType: entry.mediaType });
+    const reader = new MobileMarkdownResourceReader();
+    const descriptor = await reader.prepare("portrait", "![portrait](" + entry.relativePath + ")", source, new AbortController().signal);
+    expect([...descriptor.references.values()][0]?.image).toEqual({ width: 6, height: 4, nativeQuarterTurn: true,
+      uri: "data:" + entry.mediaType + ";base64," + bytes.toString("base64") });
+    reader.releaseAll();
+  });
+
   it("resolves code, explicit, bare and file-URI paths inside the exact Workspace and retains line targets", () => {
     const candidates = collectMobileMarkdownResourceCandidates(
       '`README.md:7:3` [source](src/)\nD:\\repo\\README.md:8\n\n![one](images/a.png) ![two](file:///D:/repo/images/a.png)\n\n'
@@ -114,7 +135,7 @@ describe("canonical message Markdown resources", () => {
 
   it("bounds cached image bytes across mounted messages and restores capacity when the owner releases them", async () => {
     const reader = new MobileMarkdownResourceReader();
-    const bytes = new Uint8Array(8 * 1_024 * 1_024); bytes.set(png);
+    const bytes = paddedPngBytes(png, 8 * 1_024 * 1_024);
     const largeRevision = create(FileRevisionSchema, { ...revision, byteSize: BigInt(bytes.length), sha256Hex: bytesToHex(sha256(bytes)) });
     const largeImage = create(WorkspaceEntrySchema, { ...image, revision: largeRevision });
     const largeBlob = create(BlobRefSchema, { ...blob, byteSize: largeRevision.byteSize, sha256Hex: largeRevision.sha256Hex });

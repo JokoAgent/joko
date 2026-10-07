@@ -21,7 +21,7 @@ export interface MobileComposerDraftSnapshot {
   readonly draft?: MobileComposerDraft;
 }
 
-const storagePrefix = "joko.mobile.composer-draft.v8";
+const storagePrefix = "joko.mobile.composer-draft.v9";
 const persistDebounceMilliseconds = 400;
 const maximumStoredCharacters = 12_100_000;
 
@@ -90,6 +90,28 @@ export class MobileComposerDraftStore {
       this.#notify(exact, error);
       throw error;
     }
+  }
+
+  /** An accepted rewind can hide its original Event, so retain approved input separately from the live draft. */
+  async retainOperationInput(identity: MobileComposerDraftIdentity, operationId: string, draft: MobileComposerDraft): Promise<void> {
+    const exact = normalizeIdentity(identity); assertLocalId(operationId, "operation");
+    const value = normalizeMobileComposerDraft(draft);
+    if (value.attachments.length !== 0 || value.slashCommands.length !== 0) throw new Error("Historical operation input must not retain attachment leases or commands.");
+    await this.#enqueue(exact, () => this.driver.setItem(operationInputKey(exact, operationId), serializeRecord(exact, value)));
+  }
+
+  async readOperationInput(identity: MobileComposerDraftIdentity, operationId: string): Promise<MobileComposerDraft | null> {
+    const exact = normalizeIdentity(identity); assertLocalId(operationId, "operation");
+    const raw = await this.driver.getItem(operationInputKey(exact, operationId));
+    if (raw === null) return null;
+    const value = readRecord(raw, exact);
+    if (value.attachments.length !== 0 || value.slashCommands.length !== 0) throw new Error("Saved operation input contains unavailable attachment leases or commands.");
+    return cloneMobileComposerDraft(value);
+  }
+
+  async clearOperationInput(identity: MobileComposerDraftIdentity, operationId: string): Promise<void> {
+    const exact = normalizeIdentity(identity); assertLocalId(operationId, "operation");
+    await this.#enqueue(exact, () => this.driver.removeItem(operationInputKey(exact, operationId)));
   }
 
   save(identity: MobileComposerDraftIdentity, draft: MobileComposerDraft): void {
@@ -271,8 +293,12 @@ function storageKey(identity: MobileComposerDraftIdentity): string {
   return `${storagePrefix}.${encodeURIComponent(exact.profileId)}.${encodeURIComponent(exact.sessionId)}`;
 }
 
+function operationInputKey(identity: MobileComposerDraftIdentity, operationId: string): string {
+  return `${storageKey(identity)}.operation-input.${encodeURIComponent(operationId)}`;
+}
+
 function serializeRecord(identity: MobileComposerDraftIdentity, draft: MobileComposerDraft): string {
-  const serialized = JSON.stringify({ version: 8, identity: normalizeIdentity(identity), draft: normalizeMobileComposerDraft(draft) });
+  const serialized = JSON.stringify({ version: 9, identity: normalizeIdentity(identity), draft: normalizeMobileComposerDraft(draft) });
   if (serialized.length > maximumStoredCharacters) throw new Error("The local Joko structured task draft is too large.");
   return serialized;
 }
@@ -280,7 +306,7 @@ function serializeRecord(identity: MobileComposerDraftIdentity, draft: MobileCom
 function readRecord(serialized: string, identity: MobileComposerDraftIdentity): MobileComposerDraft {
   if (serialized.length > maximumStoredCharacters) throw new Error("saved task draft is too large");
   const value: unknown = JSON.parse(serialized);
-  if (!isRecord(value) || value["version"] !== 8 || !isRecord(value["identity"])
+  if (!isRecord(value) || value["version"] !== 9 || !isRecord(value["identity"])
     || value["identity"]["profileId"] !== identity.profileId || value["identity"]["sessionId"] !== identity.sessionId
     || !isRecord(value["draft"]) || typeof value["draft"]["text"] !== "string"
     || !Array.isArray(value["draft"]["mentions"]) || !Array.isArray(value["draft"]["atoms"])

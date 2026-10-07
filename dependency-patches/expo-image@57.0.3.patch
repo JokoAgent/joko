@@ -1,0 +1,34 @@
+diff --git a/android/src/main/java/expo/modules/image/events/GlideRequestListener.kt b/android/src/main/java/expo/modules/image/events/GlideRequestListener.kt
+index f453e4a10e2b9e0388e1959bdc7df2e6de7fa3c1..b0a5f0afc67281d4a0f898268d4f9fe4b12a0f5f 100644
+--- a/android/src/main/java/expo/modules/image/events/GlideRequestListener.kt
++++ b/android/src/main/java/expo/modules/image/events/GlideRequestListener.kt
+@@ -7,6 +7,7 @@ import com.bumptech.glide.load.DataSource
+ import com.bumptech.glide.load.engine.GlideException
+ import com.bumptech.glide.request.RequestListener
+ import com.bumptech.glide.request.target.Target
++import com.github.penfeizhou.animation.avif.AVIFDrawable
+ import expo.modules.image.ExpoImageModule
+ import expo.modules.image.ExpoImageViewWrapper
+ import expo.modules.image.decodedsource.DecodedModel
+@@ -60,4 +61,12 @@ class GlideRequestListener(
+     val imageWrapper = expoImageViewWrapper.get() ?: return false
++    // AVIF still images also use an Animatable drawable. Report decoded frames,
++    // not the wrapper's playback interface, and never publish an empty decoder.
++    val avifFrameCount = (resource as? AVIFDrawable)?.frameSeqDecoder?.frameCount
++    if (avifFrameCount != null && avifFrameCount < 1) {
++      imageWrapper.onError.invoke(ImageErrorEvent("The AVIF decoder returned no frames"))
++      return false
++    }
++    val isAnimated = avifFrameCount?.let { it > 1 } ?: (resource is Animatable)
+     val appContext = imageWrapper.appContext
+     appContext.mainQueue.launch {
+       imageWrapper.onLoad.invoke(
+@@ -68,7 +77,7 @@ class GlideRequestListener(
+             width = intrinsicWidth,
+             height = intrinsicHeight,
+             mediaType = null, // TODO(@lukmccall): add mediaType
+-            isAnimated = resource is Animatable
++            isAnimated = isAnimated
+           )
+         )
+       )

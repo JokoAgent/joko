@@ -14,6 +14,8 @@ export interface MobileImageStatDriver {
   stat(uri: string): Promise<number>;
 }
 
+export type MobileImageImportMediaType = "image/jpeg" | "image/png";
+
 export const mobileRasterMediaTypes = new Set([
   "image/jpeg",
   "image/png",
@@ -72,6 +74,7 @@ export function mobileImageMediaType(
   if (["png", "gif", "webp", "heic", "heif"].includes(extension)) return `image/${extension}`;
   if (extension === "bmp") return "image/bmp";
   if (extension === "tif" || extension === "tiff") return "image/tiff";
+  if (extension === "svg") return "image/svg+xml";
   return undefined;
 }
 
@@ -98,6 +101,12 @@ export function mobileImageFileName(
 export function mobileImageMediaTypeAccepted(mediaType: string, policy: MobileAttachmentPolicy): boolean {
   try { return classifyMobileAttachment(mediaType, policy) === "image"; }
   catch { return false; }
+}
+
+export function selectMobileImageImportMediaType(policy: MobileAttachmentPolicy): MobileImageImportMediaType | undefined {
+  if (mobileImageMediaTypeAccepted("image/jpeg", policy)) return "image/jpeg";
+  if (mobileImageMediaTypeAccepted("image/png", policy)) return "image/png";
+  return undefined;
 }
 
 export function normalizeMobileImageFileExtension(fileName: string, mediaType: string): string {

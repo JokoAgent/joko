@@ -53,7 +53,7 @@ function toolDisplayPayload(input: string, maximumChars = MAXIMUM_SUMMARY_INPUT_
   return payload;
 }
 
-/** Returns a bounded, capability-neutral heading for recognized current tools. */
+/** Returns a bounded display heading; recognized names never grant a tool capability. */
 export function describeToolPresentation(toolName: string, input: string): ToolPresentation | undefined {
   if (toolName.length === 0 || toolName.length > 512 || /[\u0000-\u001f\u007f]/u.test(toolName)) return undefined;
   const namespaced = namespacedToolIdentity(toolName);
