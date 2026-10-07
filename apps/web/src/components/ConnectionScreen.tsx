@@ -1,50 +1,88 @@
-import { useMemo, useReducer, useState } from "react";
+import { useEffect, useMemo, useReducer, useRef, useState } from "react";
 import type { JSX } from "react";
 import { AlertTriangle, ArrowRight, KeyRound, Laptop, Moon, RefreshCcw, Server, Sun, Trash2, Wifi } from "lucide-react";
 import { connectionArtworkGroupAt, nextConnectionArtworkGroupIndex } from "../connection-artwork.js";
 import type { ConnectionArtworkVariant } from "../connection-artwork.js";
-import type { AppController } from "../controller.js";
+import type { ConnectionScreenController, ConnectionScreenManagedStatus, ConnectionScreenMode, ConnectionScreenProfile } from "../connection-contract.js";
 import { isInsecureLanOrigin, normalizeOrchestratorOrigin } from "../connection-origin.js";
-import type { ConnectionProfile } from "../model.js";
 import { persistentWebSecretEncryptionAvailable } from "../web-crypto.js";
 import type { Translator } from "./types.js";
 import { Button, ErrorBanner, IconButton, Pill, Spinner, formatRelativeTime, CheckboxControl } from "./ui.js";
 
-export function ConnectionScreen({ controller, t }: { readonly controller: AppController; readonly t: Translator }): JSX.Element {
+export function ConnectionScreen({ controller, t }: { readonly controller: ConnectionScreenController; readonly t: Translator }): JSX.Element {
   const { state } = controller;
   const remoteProfiles = useMemo(() => state.profiles.filter((profile) => profile.managedLocal !== true), [state.profiles]);
   const [{ mode, artworkGroupIndex, artworkVariant }, dispatchView] = useReducer(connectionViewReducer, {
-    mode: remoteProfiles.length === 0 ? "nearby" : "saved",
+    mode: state.initialMode ?? (remoteProfiles.length === 0 ? "nearby" : "saved"),
     artworkGroupIndex: 0,
     artworkVariant: "base"
   });
   const artworkGroup = connectionArtworkGroupAt(artworkGroupIndex);
   const artwork = artworkGroup[artworkVariant];
   const selectMode = (nextMode: ConnectionMode): void => {
-    controller.cancelAutomaticConnectionAttempt();
-    dispatchView({ type: "selectMode", mode: nextMode });
+    if (actionsDisabled || actionRef.current !== undefined) return;
+    try {
+      controller.cancelAutomaticConnectionAttempt();
+      controller.selectMode?.(nextMode);
+      if (challengePairing) setCode("");
+      setLocalError(undefined);
+      dispatchView({ type: "selectMode", mode: nextMode });
+    } catch (error) {
+      setLocalError(messageOf(error, t("error.unexpected")));
+    }
   };
-  const [origin, setOrigin] = useState("http://127.0.0.1:4318");
+  const [origin, setOrigin] = useState(state.candidate?.origin ?? (state.capabilities?.challengePairing === true ? "" : "http://127.0.0.1:4318"));
   const [code, setCode] = useState("");
-  const [deviceName, setDeviceName] = useState(() => defaultDeviceName());
+  const [deviceName, setDeviceName] = useState(() => state.defaultDeviceName ?? defaultDeviceName());
   const [insecureConfirmed, setInsecureConfirmed] = useState(false);
   const [localError, setLocalError] = useState<string>();
   const [busy, setBusy] = useState<string>();
+  const actionRef = useRef<number | undefined>(undefined);
+  const actionSequence = useRef(0);
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => { mountedRef.current = false; actionRef.current = undefined; };
+  }, []);
+  const [savedAutomaticChoices, setSavedAutomaticChoices] = useState<Readonly<Record<string, boolean>>>({});
   const [rememberAutomatically, setRememberAutomatically] = useState(
-    state.preferences.automaticConnectionTarget !== undefined
+    state.capabilities?.challengePairing === true ? false : state.preferences.automaticConnectionTarget !== undefined
       || (state.automaticConnectionAvailable && state.managedOrchestratorStatus !== undefined && state.managedOrchestratorStatus.state !== "disabled")
   );
   const isConnecting = state.connectionState === "connecting";
+  const actionsDisabled = busy !== undefined || state.busy === true || state.interactive === false;
+  const challengePairing = state.capabilities?.challengePairing === true;
   const insecureLan = isInsecureLanOrigin(origin);
-  const sessionOnlySecret = insecureLan && window.jokoDesktop === undefined && !persistentWebSecretEncryptionAvailable();
+  const sessionOnlySecret = insecureLan && (state.sessionOnlyCredential ?? (window.jokoDesktop === undefined && !persistentWebSecretEncryptionAvailable()));
   const automaticEntryAvailable = state.automaticConnectionAvailable;
   const darkThemeActive = state.preferences.theme === "dark" || (state.preferences.theme === "system" && window.matchMedia("(prefers-color-scheme: dark)").matches);
   const themeTarget = darkThemeActive ? "light" : "dark";
   const themeToggleLabel = `${t("settings.theme")}: ${t(themeTarget === "light" ? "settings.light" : "settings.dark")}`;
   const toggleArtwork = (): void => dispatchView({ type: "toggleArtwork" });
+  const runAction = (key: string, action: () => Promise<void>, onFailure?: () => void, onSuccess?: () => void): void => {
+    if (actionRef.current !== undefined || state.interactive === false || (state.busy === true && key !== "cancel")) return;
+    const request = ++actionSequence.current;
+    actionRef.current = request;
+    setLocalError(undefined);
+    setBusy(key);
+    void Promise.resolve().then(() => {
+      if (mountedRef.current && actionRef.current === request) return action();
+    }).then(() => {
+      if (mountedRef.current && actionRef.current === request) onSuccess?.();
+    }).catch((error: unknown) => {
+      if (!mountedRef.current || actionRef.current !== request) return;
+      onFailure?.();
+      setLocalError(messageOf(error, t("error.unexpected")));
+    }).finally(() => {
+      if (actionRef.current !== request) return;
+      actionRef.current = undefined;
+      if (mountedRef.current) setBusy(undefined);
+    });
+  };
   const cycleTitleArtworkAndTheme = (): void => {
+    if (actionsDisabled || actionRef.current !== undefined) return;
     dispatchView({ type: "nextArtworkGroup" });
-    void controller.setTheme(themeTarget);
+    runAction("theme", () => controller.setTheme(themeTarget));
   };
 
   const sortedProfiles = useMemo(() => [...remoteProfiles].sort((a, b) => (b.lastConnectedAt ?? 0) - (a.lastConnectedAt ?? 0)), [remoteProfiles]);
@@ -57,6 +95,7 @@ export function ConnectionScreen({ controller, t }: { readonly controller: AppCo
     ? state.discoveredNodes.filter((node) => node.serverId !== managedStatus.connection.serverId)
     : state.discoveredNodes;
   const automaticTarget = state.preferences.automaticConnectionTarget;
+  const rememberedProfile = automaticTarget?.kind === "profile" ? remoteProfiles.find((profile) => profile.id === automaticTarget.profileId) : undefined;
   const rememberedTargetUnavailable = automaticTarget?.kind === "profile"
     ? !remoteProfiles.some((profile) => profile.id === automaticTarget.profileId)
     : automaticTarget?.kind === "managedLocal"
@@ -76,25 +115,23 @@ export function ConnectionScreen({ controller, t }: { readonly controller: AppCo
     selectMode("pair");
   };
 
-  const connect = (profile: ConnectionProfile): void => {
-    setLocalError(undefined);
-    setBusy(profile.id);
-    void controller.connect(profile, { automatic: automaticEntryAvailable ? rememberAutomatically : undefined }).catch((error: unknown) => setLocalError(messageOf(error, t("error.unexpected")))).finally(() => setBusy(undefined));
+  const connect = (profile: ConnectionScreenProfile): void => {
+    const automatic = profile.automatic === undefined ? rememberAutomatically : savedAutomaticChoices[profile.id] ?? profile.automatic;
+    runAction(profile.id, () => controller.connect(profile, { automatic: automaticEntryAvailable ? automatic : undefined }));
   };
 
   const pair = (): void => {
-    setLocalError(undefined);
-    setBusy("pair");
-    void controller.pair(origin, code, deviceName, { automatic: automaticEntryAvailable ? rememberAutomatically : undefined }).catch((error: unknown) => setLocalError(messageOf(error, t("error.unexpected")))).finally(() => setBusy(undefined));
+    if (!code.trim() || !deviceName.trim() || !origin.trim() || (insecureLan && !insecureConfirmed)
+      || (challengePairing && !challengeMatches)) return;
+    runAction("pair", () => controller.pair(origin, code, deviceName, { automatic: automaticEntryAvailable ? rememberAutomatically : undefined }),
+      undefined, () => setCode(""));
   };
 
   const setAutomaticChoice = (automatic: boolean): void => {
+    if (actionsDisabled || actionRef.current !== undefined) return;
     setRememberAutomatically(automatic);
     if (automatic || state.preferences.automaticConnectionTarget === undefined) return;
-    void controller.setAutomaticConnectionEnabled(false).catch((error: unknown) => {
-      setRememberAutomatically(true);
-      setLocalError(messageOf(error, t("error.unexpected")));
-    });
+    runAction("automatic", () => controller.setAutomaticConnectionEnabled(false), () => setRememberAutomatically(true));
   };
 
   const selectDiscovered = (selectedOrigin: string): void => {
@@ -102,10 +139,31 @@ export function ConnectionScreen({ controller, t }: { readonly controller: AppCo
     setInsecureConfirmed(false);
     selectMode("pair");
   };
+  let normalizedOrigin: string | undefined;
+  try { normalizedOrigin = normalizeOrchestratorOrigin(origin); } catch { /* Invalid drafts remain editable. */ }
+  const candidate = state.candidate !== undefined && normalizedOrigin !== undefined && state.candidate.origin === normalizedOrigin ? state.candidate.node : undefined;
+  const challengeMatches = candidate?.pairingEnabled === true && state.challenge !== undefined && state.challenge.origin === normalizedOrigin
+    && state.challenge.deviceName === deviceName;
+  const invalidatePairing = (): void => {
+    if (!challengePairing) return;
+    setCode("");
+    try { controller.cancelPairing?.(); }
+    catch (error) { setLocalError(messageOf(error, t("error.unexpected"))); }
+  };
+  const cancelConnection = (): void => {
+    actionRef.current = undefined;
+    runAction("cancel", () => controller.disconnect());
+  };
+  const cancelPairing = (): void => {
+    actionRef.current = undefined;
+    setCode("");
+    runAction("cancel", async () => { controller.cancelPairing?.(); });
+  };
+  const connectingProfile = state.activeProfile ?? state.profiles.find((profile) => profile.id === busy);
 
   return (
     <main className="connection-screen">
-      <IconButton className="connection-theme-toggle" label={themeToggleLabel} onClick={() => void controller.setTheme(themeTarget)}>
+      <IconButton className="connection-theme-toggle" label={themeToggleLabel} disabled={actionsDisabled} onClick={() => runAction("theme", () => controller.setTheme(themeTarget))}>
         {darkThemeActive ? <Sun aria-hidden="true" /> : <Moon aria-hidden="true" />}
       </IconButton>
       <span className="connection-curve-clip" aria-hidden="true"><span className="connection-curve-traces" /></span>
@@ -130,7 +188,7 @@ export function ConnectionScreen({ controller, t }: { readonly controller: AppCo
       <div className="connection-panel">
         <div className="connection-hero__copy">
           <div className="connection-title-lockup">
-            <button className="connection-title-icon" type="button" aria-label={t("connection.nextArtworkGroup")} onClick={cycleTitleArtworkAndTheme} />
+            <button className="connection-title-icon" type="button" aria-label={t("connection.nextArtworkGroup")} disabled={actionsDisabled} onClick={cycleTitleArtworkAndTheme} />
             <div className="connection-title-copy">
               <h1 id="joko-title">{t("app.name")}</h1>
               <p className="connection-hero__tagline">{t("app.tagline")}</p>
@@ -138,7 +196,16 @@ export function ConnectionScreen({ controller, t }: { readonly controller: AppCo
           </div>
         </div>
 
-        <section className="connection-card" aria-label={t("connection.method")} aria-busy={isConnecting}>
+        <section className="connection-card" aria-label={t("connection.method")} aria-busy={isConnecting || actionsDisabled}>
+        {state.capabilities?.back === true && controller.goBack !== undefined && <Button tone="ghost" disabled={actionsDisabled || isConnecting}
+          onClick={() => runAction("back", () => controller.goBack!())}>{state.labels?.back ?? t("common.back")}</Button>}
+        {challengePairing && automaticTarget !== undefined && <div className="local-connection-card" data-automatic-connection>
+          <div className="profile-card__icon"><Server aria-hidden="true" /></div>
+          <div className="profile-card__body"><small>{state.labels?.automaticEntry ?? t("connection.rememberAutomatically")}</small>
+            <strong>{rememberedProfile?.name ?? t(automaticTarget.kind === "managedLocal" ? "connection.thisComputer" : "connection.rememberedTargetUnavailable")}</strong></div>
+          <Button disabled={actionsDisabled || isConnecting} onClick={() => runAction("automatic", () => controller.setAutomaticConnectionEnabled(false))}>
+            {state.labels?.turnOff ?? t("common.disable")}</Button>
+        </div>}
         {managedStatus !== undefined && managedStatus.state !== "disabled" && <div className="local-connection-card" data-state={managedStatus.state}>
           <div className="profile-card__icon"><Laptop aria-hidden="true" /></div>
           <div className="profile-card__body">
@@ -150,40 +217,40 @@ export function ConnectionScreen({ controller, t }: { readonly controller: AppCo
             tone="primary"
             data-managed-local-connect
             onClick={() => connect(readyManagedProfile)}
-            disabled={busy !== undefined}
+            disabled={actionsDisabled}
           >
             {busy === readyManagedProfile.id ? <Spinner label={t("connection.connecting")} /> : <ArrowRight aria-hidden="true" />}
             {t("connection.connectLocal")}
           </Button> : managedStatus.state === "starting" ? <Button disabled><Spinner label={t("managedOrchestrator.startingTitle")} />{t("managedOrchestrator.startingTitle")}</Button> : managedStatus.state === "recoveryRequired" ? <div className="local-connection-card__actions">
-            <Button onClick={() => void controller.retryManagedOrchestrator()}><RefreshCcw aria-hidden="true" />{t("common.retry")}</Button>
-            <Button tone="primary" onClick={openManagedRecovery}><KeyRound aria-hidden="true" />{t("managedOrchestrator.recoverAccess")}</Button>
-          </div> : <Button onClick={() => void controller.retryManagedOrchestrator()}><RefreshCcw aria-hidden="true" />{t("common.retry")}</Button>}
+            <Button disabled={actionsDisabled} onClick={() => runAction("managed", () => controller.retryManagedOrchestrator())}><RefreshCcw aria-hidden="true" />{t("common.retry")}</Button>
+            <Button tone="primary" disabled={actionsDisabled} onClick={openManagedRecovery}><KeyRound aria-hidden="true" />{t("managedOrchestrator.recoverAccess")}</Button>
+          </div> : <Button disabled={actionsDisabled} onClick={() => runAction("managed", () => controller.retryManagedOrchestrator())}><RefreshCcw aria-hidden="true" />{t("common.retry")}</Button>}
         </div>}
         <div className="connection-tabs" aria-label={t("connection.method")}>
-          <button type="button" aria-pressed={mode === "nearby"} className={mode === "nearby" ? "is-active" : ""} onClick={() => selectMode("nearby")} disabled={isConnecting}>
+          <button type="button" aria-pressed={mode === "nearby"} className={mode === "nearby" ? "is-active" : ""} onClick={() => selectMode("nearby")} disabled={actionsDisabled || isConnecting}>
             <Wifi aria-hidden="true" /> {t("connection.nearby")}
           </button>
-          <button type="button" aria-pressed={mode === "saved"} className={mode === "saved" ? "is-active" : ""} onClick={() => selectMode("saved")} disabled={isConnecting || remoteProfiles.length === 0}>
+          <button type="button" aria-pressed={mode === "saved"} className={mode === "saved" ? "is-active" : ""} onClick={() => selectMode("saved")} disabled={actionsDisabled || isConnecting || (remoteProfiles.length === 0 && state.capabilities?.recheckSaved !== true)}>
             <Server aria-hidden="true" /> {t("connection.savedNodes")}
           </button>
-          <button type="button" aria-pressed={mode === "pair"} className={mode === "pair" ? "is-active" : ""} onClick={() => selectMode("pair")} disabled={isConnecting}>
+          <button type="button" aria-pressed={mode === "pair"} className={mode === "pair" ? "is-active" : ""} onClick={() => selectMode("pair")} disabled={actionsDisabled || isConnecting}>
             <KeyRound aria-hidden="true" /> {t("connection.add")}
           </button>
         </div>
 
         {visibleError !== undefined && <ErrorBanner message={visibleError} />}
 
-        {isConnecting && state.activeProfile !== undefined ? (
+        {isConnecting ? (
           <div className="connecting-state" role="status">
             <Spinner label={t("connection.connecting")} />
-            <div><strong>{t("connection.connecting")}</strong><span>{state.activeProfile.name} · {state.activeProfile.origin}</span></div>
-            <Button tone="ghost" onClick={() => void controller.disconnect()}>{t("common.cancel")}</Button>
+            <div><strong>{t("connection.connecting")}</strong><span>{connectingProfile?.name ?? candidate?.name ?? deviceName} · {connectingProfile?.origin ?? candidate?.origin ?? origin}</span></div>
+            <Button tone="ghost" disabled={state.interactive === false || busy === "cancel"} onClick={cancelConnection}>{t("common.cancel")}</Button>
           </div>
         ) : mode === "nearby" ? (
           <div className="discovery-panel">
             <header className="discovery-panel__header">
               <strong>{t("connection.discovered")}</strong>
-              <Button tone="ghost" onClick={() => void controller.refreshDiscoveredNodes()} disabled={state.discoveryState === "discovering"}>
+              <Button tone="ghost" onClick={() => runAction("discovery", () => controller.refreshDiscoveredNodes())} disabled={actionsDisabled || state.discoveryState === "discovering"}>
                 {state.discoveryState === "discovering" ? <Spinner label={t("connection.discovering")} /> : <RefreshCcw aria-hidden="true" />}
                 {t("common.refresh")}
               </Button>
@@ -192,7 +259,7 @@ export function ConnectionScreen({ controller, t }: { readonly controller: AppCo
             {state.discoveryState === "discovering" && discoveredNodes.length === 0 ? (
               <div className="discovery-empty" role="status"><Spinner label={t("connection.discovering")} /><span>{t("connection.discovering")}</span></div>
             ) : discoveredNodes.length === 0 ? (
-              <div className="discovery-empty"><Wifi aria-hidden="true" /><strong>{t("connection.noneDiscovered")}</strong><span>{t("connection.discoveryFallback")}</span><Button onClick={() => selectMode("pair")}>{t("connection.enterManually")}</Button></div>
+              <div className="discovery-empty"><Wifi aria-hidden="true" /><strong>{t("connection.noneDiscovered")}</strong><span>{t("connection.discoveryFallback")}</span><Button disabled={actionsDisabled} onClick={() => selectMode("pair")}>{t("connection.enterManually")}</Button></div>
             ) : (
               <div className="profile-list">
                 {discoveredNodes.map((node) => (
@@ -204,7 +271,7 @@ export function ConnectionScreen({ controller, t }: { readonly controller: AppCo
                       <small>{node.version} · {node.pairingEnabled ? t("connection.pairingOpen") : t("connection.pairingClosed")}</small>
                     </div>
                     <Pill tone={node.transport === "https" ? "success" : node.transport === "lanHttp" ? "warning" : "neutral"}>{node.transport === "https" ? "HTTPS" : node.transport === "lanHttp" ? t("connection.lanHttp") : t("connection.localHttp")}</Pill>
-                    <Button tone="primary" onClick={() => selectDiscovered(node.origin)}>{t("connection.useNode")}</Button>
+                    <Button tone="primary" disabled={actionsDisabled} onClick={() => selectDiscovered(node.origin)}>{t("connection.useNode")}</Button>
                   </article>
                 ))}
               </div>
@@ -212,19 +279,34 @@ export function ConnectionScreen({ controller, t }: { readonly controller: AppCo
           </div>
         ) : mode === "saved" ? (
           <div className="profile-list">
+            {state.capabilities?.recheckSaved === true && controller.recheckSavedProfiles !== undefined && <header className="discovery-panel__header">
+              <strong>{t("connection.savedNodes")}</strong><Button tone="ghost" disabled={actionsDisabled || sortedProfiles.some((profile) => profile.credentialState === "checking")}
+                onClick={() => runAction("recheck", () => controller.recheckSavedProfiles!())}><RefreshCcw aria-hidden="true" />{state.labels?.recheckSaved ?? t("common.refresh")}</Button>
+            </header>}
+            {sortedProfiles.length === 0 && <div className="discovery-empty">{t("connection.empty")}</div>}
             {sortedProfiles.map((profile) => (
               <article className="profile-card" key={profile.id}>
                 <div className="profile-card__icon"><Server aria-hidden="true" /></div>
                 <div className="profile-card__body">
                   <strong>{profile.name}</strong>
                   <span>{profile.origin}</span>
-                  {profile.lastConnectedAt !== undefined && <small>{t("connection.lastUsed", { time: formatRelativeTime(profile.lastConnectedAt, state.effectiveLocale) })}</small>}
+                  {profile.identityLabel !== undefined && <small>{profile.identityLabel}</small>}
+                  {profile.lastConnectedAt !== undefined && <small>{t("connection.lastUsed", { time: formatRelativeTime(profile.lastConnectedAt, state.effectiveLocale ?? "en") })}</small>}
+                  {profile.statusLabel !== undefined && <small role="status">{profile.statusLabel}</small>}
+                  {profile.error !== undefined && <small role="alert">{profile.error}</small>}
+                  {(profile.pendingCount ?? 0) > 0 && <small role="alert">{profile.pendingLabel ?? String(profile.pendingCount)}</small>}
+                  {profile.automatic !== undefined && <label className="connection-auto-choice">
+                    <CheckboxControl checked={savedAutomaticChoices[profile.id] ?? profile.automatic} disabled={actionsDisabled || isConnecting || !automaticEntryAvailable}
+                      onChange={(event) => setSavedAutomaticChoices((choices) => ({ ...choices, [profile.id]: event.target.checked }))} />
+                    <span><strong>{t("connection.rememberAutomatically")}</strong><small>{t("connection.rememberAutomaticallyHelp")}</small></span>
+                  </label>}
                 </div>
-                <Button tone="primary" onClick={() => connect(profile)} disabled={busy !== undefined}>
+                <Button tone="primary" onClick={() => connect(profile)} disabled={actionsDisabled || profile.credentialState === "checking"}>
                   {busy === profile.id ? <Spinner label={t("connection.connecting")} /> : <ArrowRight aria-hidden="true" />}
                   {t("connection.connect")}
                 </Button>
-                {profile.managedLocal !== true && <IconButton className="profile-card__forget" label={t("connection.forget", { name: profile.name })} onClick={() => void controller.forgetProfile(profile.id)}>
+                {profile.managedLocal !== true && <IconButton className="profile-card__forget" label={t("connection.forget", { name: profile.name })} disabled={actionsDisabled}
+                  onClick={() => runAction("forget", () => controller.forgetProfile(profile.id))}>
                   <Trash2 aria-hidden="true" />
                 </IconButton>}
               </article>
@@ -234,11 +316,11 @@ export function ConnectionScreen({ controller, t }: { readonly controller: AppCo
           <form className="pair-form" onSubmit={(event) => { event.preventDefault(); pair(); }}>
             <div className="pair-form__intro">
               <Laptop aria-hidden="true" />
-              <div><strong>{t("connection.pair")}</strong><p>{t("connection.pairHelp")}</p></div>
+              <div><strong>{t("connection.pair")}</strong><p>{state.labels?.pairingHelp ?? t("connection.pairHelp")}</p></div>
             </div>
             <label>
               <span>{t("connection.origin")}</span>
-              <input type="url" inputMode="url" required value={origin} onChange={(event) => { setOrigin(event.target.value); setInsecureConfirmed(false); }} placeholder="http://192.168.1.20:4318" autoComplete="url" />
+              <input type="url" inputMode="url" required disabled={actionsDisabled} value={origin} onChange={(event) => { setOrigin(event.target.value); setInsecureConfirmed(false); invalidatePairing(); }} placeholder="http://192.168.1.20:4318" autoComplete="url" />
               <small>{t("connection.secureHint")}</small>
             </label>
             {insecureLan && <div className="lan-http-warning" role="note">
@@ -246,40 +328,57 @@ export function ConnectionScreen({ controller, t }: { readonly controller: AppCo
               <div><strong>{t("connection.insecureLanTitle")}</strong><p>{t("connection.insecureLanBody")}</p>{sessionOnlySecret && <p>{t("connection.sessionOnlySecret")}</p>}</div>
             </div>}
             {insecureLan && <label className="lan-http-confirm">
-              <CheckboxControl checked={insecureConfirmed} onChange={(event) => setInsecureConfirmed(event.target.checked)} />
+              <CheckboxControl checked={insecureConfirmed} disabled={actionsDisabled} onChange={(event) => setInsecureConfirmed(event.target.checked)} />
               <span>{t("connection.insecureLanConfirm")}</span>
             </label>}
+            {challengePairing && <>
+              <Button disabled={actionsDisabled || normalizedOrigin === undefined || controller.inspect === undefined}
+                onClick={() => runAction("inspect", () => controller.inspect!(origin))}>{busy === "inspect" && <Spinner label={state.labels?.checking ?? t("connection.connecting")} />}{state.labels?.inspect ?? t("connection.properties")}</Button>
+              {candidate !== undefined && <div className="profile-card__body" role="status">
+                <strong>{candidate.name}</strong><span>{candidate.identityLabel ?? candidate.serverId}</span>
+                <small>{candidate.summaryLabel ?? `${candidate.version} · ${t(candidate.pairingEnabled ? "connection.pairingOpen" : "connection.pairingClosed")}`}</small>
+              </div>}
+            </>}
             <div className="pair-form__row">
-              <label>
+              {(!challengePairing || challengeMatches) && <label>
                 <span>{t("connection.code")}</span>
-                <input required value={code} onChange={(event) => setCode(event.target.value)} placeholder="XXXX-XXXX" autoComplete="one-time-code" spellCheck={false} />
-              </label>
+                <input required disabled={actionsDisabled} value={code} onChange={(event) => setCode(event.target.value)} placeholder="XXXX-XXXX" autoComplete="one-time-code" spellCheck={false} />
+              </label>}
               <label>
                 <span>{t("connection.deviceName")}</span>
-                <input required value={deviceName} onChange={(event) => setDeviceName(event.target.value)} autoComplete="off" />
+                <input required disabled={actionsDisabled} value={deviceName} onChange={(event) => { setDeviceName(event.target.value); invalidatePairing(); }} autoComplete="off" />
               </label>
             </div>
-            <Button type="submit" tone="primary" className="pair-form__submit" disabled={busy !== undefined || origin.trim() === "" || code.trim() === "" || deviceName.trim() === "" || (insecureLan && !insecureConfirmed)}>
+            {challengePairing && <>
+              <Button disabled={actionsDisabled || candidate?.pairingEnabled !== true || !deviceName.trim() || controller.requestPairing === undefined}
+                onClick={() => { setCode(""); runAction("challenge", () => controller.requestPairing!(origin, deviceName)); }}>
+                {busy === "challenge" && <Spinner label={t("connection.connecting")} />}{state.labels?.requestPairing ?? t("connection.pair")}
+              </Button>
+              {challengeMatches && <p role="status">{state.labels?.challengeHint ?? t("connection.pairHelp")}</p>}
+            </>}
+            <Button type="submit" tone="primary" className="pair-form__submit" disabled={actionsDisabled || origin.trim() === "" || code.trim() === "" || deviceName.trim() === "" || (insecureLan && !insecureConfirmed) || (challengePairing && !challengeMatches)}>
               {busy === "pair" ? <Spinner label={t("connection.connecting")} /> : <KeyRound aria-hidden="true" />}
               {t("connection.pair")}
             </Button>
+            {challengePairing && controller.cancelPairing !== undefined && (busy === "inspect" || busy === "challenge" || busy === "pair") && <Button tone="ghost"
+              disabled={state.interactive === false} onClick={cancelPairing}>{t("common.cancel")}</Button>}
           </form>
         )}
-        <label className="connection-auto-choice">
+        {(!challengePairing || mode !== "saved") && <label className="connection-auto-choice">
           <CheckboxControl
             checked={rememberAutomatically}
-            disabled={busy !== undefined || isConnecting || (!automaticEntryAvailable && !rememberAutomatically)}
+            disabled={actionsDisabled || isConnecting || (!automaticEntryAvailable && !rememberAutomatically)}
             onChange={(event) => setAutomaticChoice(event.target.checked)}
           />
           <span><strong>{t("connection.rememberAutomatically")}</strong><small>{t(automaticEntryAvailable ? "connection.rememberAutomaticallyHelp" : "connection.rememberAutomaticallyUnavailable")}</small></span>
-        </label>
+        </label>}
         </section>
       </div>
     </main>
   );
 }
 
-function managedOrchestratorStatusText(status: JokoDesktopManagedOrchestratorStatus, t: Translator): string {
+function managedOrchestratorStatusText(status: ConnectionScreenManagedStatus, t: Translator): string {
   if (status.state === "ready") return t("connection.localReady");
   if (status.state === "disabled") return t("common.disabled");
   if (status.state === "starting") return t("managedOrchestrator.startingTitle");
@@ -290,7 +389,7 @@ function managedOrchestratorStatusText(status: JokoDesktopManagedOrchestratorSta
   return t("managedOrchestrator.identityConflict");
 }
 
-type ConnectionMode = "nearby" | "saved" | "pair";
+type ConnectionMode = ConnectionScreenMode;
 
 interface ConnectionViewState {
   readonly mode: ConnectionMode;

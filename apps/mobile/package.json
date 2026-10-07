@@ -66,6 +66,7 @@
     "three": "0.183.2"
   },
   "devDependencies": {
+    "@joko/web": "workspace:*",
     "@types/react": "19.2.2",
     "@types/react-dom": "19.2.2",
     "esbuild": "0.28.2",

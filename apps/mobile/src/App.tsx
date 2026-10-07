@@ -14,7 +14,7 @@ import {
   CapabilitySupport, ConnectionState, DeviceKind, DevicePresenceState, FileKind, QueueItemState, SessionState, TargetState, capabilityNames,
   type QueueItem, type Session
 } from "@joko/contracts";
-import { MobileConnectionStage } from "./MobileConnectionStage";
+import { MobileSharedConnectionScreen } from "./MobileSharedConnectionScreen";
 import { MobileFileTextPreview } from "./MobileFileTextPreview";
 import { useMobileFileTextActions } from "./use-mobile-file-text-actions";
 import { MobileFilesPreviewPager } from "./MobileFilesPreviewPager";
@@ -25,7 +25,6 @@ import { MobileNativeIntentNotice } from "./MobileNativeIntentNotice";
 import {
   MobileClient,
   type MobileQueueEditLease,
-  type NearbyMobileNode,
   type SavedMobileConnection
 } from "./mobile-client";
 import {
@@ -50,10 +49,7 @@ import {
 } from "./mobile-copy-link";
 import {
   mobileConnectionAppIcon,
-  mobileConnectionArtworkFrame,
   mobileLoadingIllustration,
-  nextConnectionArtworkGroupIndex,
-  type ConnectionArtworkVariant
 } from "./connection-artwork";
 import { MOBILE_FILE_SHARE_MAXIMUM_BYTES, mobileNetwork } from "./network";
 import { mobileDeviceNameSource } from "./mobile-device-name";
@@ -964,171 +960,18 @@ function mobileComposerRichTheme(colors: Colors) {
   };
 }
 
-function ConnectionScreen({ colors, state, locale, dark, onBack, onConnected }: ScreenProps & {
+function ConnectionScreen({ state, locale, dark, onBack, onConnected }: ScreenProps & {
   dark: boolean; onBack?: () => void; onConnected: () => void;
 }) {
-  const [origin, setOrigin] = useState(state.candidate?.origin ?? "");
-  const [deviceName, setDeviceName] = useState(() => mobileDeviceNameSource(Constants.deviceName, Platform.OS).defaultDisplayName);
-  const [code, setCode] = useState("");
-  const [inspected, setInspected] = useState(false);
-  const [localError, setLocalError] = useState("");
-  const [newAutomatic, setNewAutomatic] = useState(false);
-  const [savedAutomaticChoices, setSavedAutomaticChoices] = useState<Record<string, boolean>>({});
-  const [artworkGroupIndex, setArtworkGroupIndex] = useState(0);
-  const [artworkVariant, setArtworkVariant] = useState<ConnectionArtworkVariant>("base");
-  const theme = dark ? "dark" : "light";
-  const artwork = mobileConnectionArtworkFrame(artworkGroupIndex, artworkVariant, theme);
-  const appIcon = mobileConnectionAppIcon(theme);
-  const inspect = async () => {
-    setLocalError("");
-    try { await client.inspect(origin); setInspected(true); } catch (error) { setLocalError(errorText(error, locale)); setInspected(false); }
-  };
-  const pair = async () => {
-    setLocalError("");
-    try { await client.pair(origin, code, deviceName, newAutomatic); setCode(""); onConnected(); } catch (error) { setLocalError(errorText(error, locale)); }
-  };
   useEffect(() => {
     if (state.busy || state.connectionAttemptError) return;
     if (state.connectionMode === "nearby") void client.refreshNearby();
     if (state.connectionMode === "saved") void client.refreshSaved();
   }, [state.connectionMode, state.busy, state.connectionAttemptError]);
-  const selectNearby = (node: NearbyMobileNode) => {
-    setOrigin(node.origin);
-    setCode("");
-    setInspected(false);
-    setLocalError("");
-    void client.inspectNearby(node).then(() => setInspected(true)).catch((error) => setLocalError(errorText(error, locale)));
-  };
-  const selectMode = (mode: MobileClient["state"]["connectionMode"]) => {
-    setInspected(false);
-    setCode("");
-    setLocalError("");
-    client.setConnectionMode(mode);
-  };
-  const forget = (profile: SavedMobileConnection) => Alert.alert(
-    mobileMessage(locale, "connection.forgetTitle", { name: profile.displayName }),
-    mobileMessage(locale, "connection.forgetBody"),
-    [{ text: mobileMessage(locale, "common.keep"), style: "cancel" },
-      { text: mobileMessage(locale, "common.forget"), style: "destructive", onPress: () => {
-      setLocalError("");
-      void client.forgetConnection(profile.profileId).catch((error) => setLocalError(errorText(error, locale)));
-    } }]
-  );
-  return <MobileConnectionStage
-    artworkId={artwork.id}
-    artworkSource={artwork.source}
-    iconSource={appIcon}
-    locale={locale}
-    colors={{ brandBackground: colors.brandBackground, ink: colors.ink, muted: colors.muted }}
-    onArtworkPress={() => setArtworkVariant((current) => current === "base" ? "alt" : "base")}
-    onIconPress={() => { setArtworkGroupIndex((current) => nextConnectionArtworkGroupIndex(current)); setArtworkVariant("base"); }}
-  >
-    {onBack && !state.busy && <Back label="Joko" accessibilityLabel={mobileMessage(locale, "common.backTo", { label: "Joko" })}
-      onPress={onBack} colors={colors} />}
-    <Text style={[styles.title, { color: colors.ink }]}>{mobileMessage(locale, "connection.title")}</Text>
-    <Text style={[styles.description, { color: colors.muted }]}>{mobileMessage(locale, "connection.description")}</Text>
-    <View style={[styles.modeTabs, { backgroundColor: colors.surface, borderColor: colors.border }]}>
-      <ModeTab label={mobileMessage(locale, "connection.mode.nearby")} selected={state.connectionMode === "nearby"}
-        onPress={() => selectMode("nearby")} colors={colors} />
-      <ModeTab label={state.saved.length
-        ? mobileMessage(locale, "connection.mode.savedCount", { count: state.saved.length })
-        : mobileMessage(locale, "connection.mode.saved")} selected={state.connectionMode === "saved"}
-        onPress={() => selectMode("saved")} colors={colors} />
-      <ModeTab label={mobileMessage(locale, "connection.mode.add")} selected={state.connectionMode === "add"}
-        onPress={() => selectMode("add")} colors={colors} />
-    </View>
-    {state.status === "revoked" && <Banner text={state.error || mobileMessage(locale, "connection.repair")} colors={colors} />}
-    {state.automaticProfileId && <View style={[styles.notice, { backgroundColor: colors.surface, borderColor: colors.border }]}>
-      <View style={styles.fill}><Text style={[styles.caption, { color: colors.muted }]}>{mobileMessage(locale, "connection.automaticEntry")}</Text>
-        <Text style={[styles.label, { color: colors.ink }]}>{state.saved.find((item) => item.profileId === state.automaticProfileId)?.displayName
-          || mobileMessage(locale, "connection.missingSaved")}</Text></View>
-      <Action label={mobileMessage(locale, "common.turnOff")} compact disabled={state.busy}
-        onPress={() => void client.disableAutomaticEntry().catch((error) => setLocalError(errorText(error, locale)))} colors={colors} />
-    </View>}
-    {state.connectionMode === "nearby" && <>
-      <View style={styles.sectionHeader}><Text style={[styles.section, { color: colors.muted }]}>{mobileMessage(locale, "connection.nearbyTitle")}</Text>
-        <Action label={mobileMessage(locale, state.discoveryState === "refreshing" ? "common.refreshing" : "common.refresh")} compact
-          disabled={state.busy || state.discoveryState === "refreshing"} onPress={() => void client.refreshNearby()} colors={colors} /></View>
-      {state.discoveryState === "refreshing" && state.nearby.length === 0 && <ActivityIndicator color={colors.accent} />}
-      {state.discoveryError && <Banner text={state.discoveryError} colors={colors} />}
-      {state.discoveryState !== "refreshing" && state.nearby.length === 0 && <Text style={[styles.description, { color: colors.muted }]}>{mobileMessage(locale, "connection.nearbyEmpty")}</Text>}
-      {state.nearby.map((nearby) => <Pressable key={`${nearby.serverId}:${nearby.origin}`} accessibilityRole="button"
-        accessibilityLabel={mobileMessage(locale, "connection.pairWith", { name: nearby.displayName })} onPress={() => selectNearby(nearby)}
-        style={[styles.row, { backgroundColor: colors.surface, borderColor: colors.border }]}>
-        <View style={styles.fill}><Text style={[styles.label, { color: colors.ink }]}>{nearby.displayName}</Text>
-          <Text selectable style={[styles.caption, { color: colors.muted }]}>{nearby.origin}</Text>
-          <Text style={[styles.caption, { color: colors.muted }]}>{nearby.pairingEnabled
-            ? mobileMessage(locale, "connection.pairingAvailable") : mobileMessage(locale, "connection.pairingClosed")} · v{nearby.version
-              || mobileMessage(locale, "common.unknown")}</Text></View>
-        <Text style={[styles.chevron, { color: colors.muted }]}>›</Text>
-      </Pressable>)}
-    </>}
-    {state.connectionMode === "saved" && <>
-      <View style={styles.sectionHeader}><Text style={[styles.section, { color: colors.muted }]}>{mobileMessage(locale, "connection.savedTitle")}</Text>
-        <Action label={mobileMessage(locale, "connection.recheck")} compact disabled={state.busy || state.saved.some((profile) => profile.credentialState === "checking")}
-          onPress={() => void client.refreshSaved()} colors={colors} /></View>
-      {state.saved.length === 0 && <Text style={[styles.description, { color: colors.muted }]}>{mobileMessage(locale, "connection.savedEmpty")}</Text>}
-      {state.saved.map((profile) => {
-        const automatic = savedAutomaticChoices[profile.profileId] ?? profile.automatic;
-        return <View key={profile.profileId} style={[styles.card, { backgroundColor: colors.surface, borderColor: colors.border }]}>
-        <View style={styles.statusTitle}><Text style={[styles.label, { color: colors.ink }]}>{profile.displayName}</Text>
-          {profile.automatic && <Text style={[styles.badge, { color: colors.ink, backgroundColor: colors.brandBackground }]}>{mobileMessage(locale, "connection.automaticEntry")}</Text>}</View>
-        <Text selectable style={[styles.caption, { color: colors.muted }]}>{profile.origin}</Text>
-        <Text selectable style={[styles.caption, { color: colors.muted }]}>{mobileMessage(locale, "connection.identity", { id: profile.serverId })}</Text>
-        <Text style={[styles.caption, { color: profile.credentialState === "available" ? colors.muted : colors.negative }]}>{savedStatus(profile, locale)}</Text>
-        {profile.error && <Text accessibilityRole="alert" style={[styles.caption, { color: colors.negative }]}>{profile.error}</Text>}
-        <SavedPendingOperations profile={profile} colors={colors} locale={locale} />
-        <AutomaticEntryChoice checked={automatic} disabled={state.busy || state.status === "connecting"}
-          onPress={() => setSavedAutomaticChoices((choices) => ({ ...choices, [profile.profileId]: !automatic }))}
-          colors={colors} locale={locale} />
-        <View style={styles.actionRow}>
-          <Action label={mobileMessage(locale, state.status === "connecting" ? "common.connecting" : "common.connect")} onPress={() => {
-            setLocalError("");
-            void client.connectSaved(profile.profileId, automatic).then(() => {
-              if (client.state.activeProfileId === profile.profileId) onConnected();
-            }).catch((error) => setLocalError(errorText(error, locale)));
-          }} colors={colors} disabled={state.busy || state.status === "connecting" || profile.credentialState === "checking"} />
-          <Action label={mobileMessage(locale, "common.forget")} onPress={() => forget(profile)} colors={colors} danger disabled={state.busy} />
-        </View>
-      </View>;
-      })}
-    </>}
-    {state.connectionMode === "add" && <>
-      <AutomaticEntryChoice checked={newAutomatic} disabled={state.busy || state.status === "connecting"}
-        onPress={() => setNewAutomatic((value) => !value)} colors={colors} locale={locale} />
-      <Field label={mobileMessage(locale, "connection.address")} value={origin}
-        onChange={(value) => { setOrigin(value); setInspected(false); client.cancel(); }}
-        placeholder="http://192.168.1.20:4318" colors={colors} autoCapitalize="none" keyboardType="url" />
-      {origin.trim().startsWith("http://") && <Text style={[styles.warning, { color: colors.negative }]}>{mobileMessage(locale, "connection.httpWarning")}</Text>}
-      <Action label={mobileMessage(locale, state.busy ? "connection.checking" : "connection.checkIdentity")}
-        onPress={inspect} colors={colors} disabled={state.busy || !origin.trim()} />
-      {inspected && state.candidate && <View style={[styles.card, { backgroundColor: colors.surface, borderColor: colors.border }]}>
-        <Text style={[styles.label, { color: colors.ink }]}>{state.candidate.node.displayName}</Text>
-        <Text selectable style={[styles.caption, { color: colors.muted }]}>{mobileMessage(locale, "connection.identity", { id: state.candidate.node.serverId })}</Text>
-        <Text style={[styles.caption, { color: colors.muted }]}>{mobileMessage(locale, "connection.candidateSummary", {
-          version: state.candidate.node.version || mobileMessage(locale, "common.unknown"),
-          api: state.candidate.node.apiVersion,
-          pairing: mobileMessage(locale, state.candidate.node.pairingEnabled ? "connection.pairingAvailable" : "connection.pairingClosed")
-        })}</Text>
-      </View>}
-      {inspected && state.candidate?.node.pairingEnabled && <>
-        <Field label={mobileMessage(locale, "connection.deviceName")} value={deviceName} onChange={setDeviceName}
-          placeholder={mobileMessage(locale, "connection.devicePlaceholder")} colors={colors} />
-        <Action label={mobileMessage(locale, state.busy ? "connection.requesting" : "connection.requestPairing")} onPress={() => {
-          setLocalError(""); void client.requestPairing(origin, deviceName).catch((error) => setLocalError(errorText(error, locale)));
-        }} colors={colors} disabled={state.busy || !deviceName.trim()} />
-        {state.challenge && <>
-          <Text style={[styles.description, { color: colors.muted }]}>{mobileMessage(locale, "connection.challenge")}</Text>
-          <Field label={mobileMessage(locale, "connection.pairingCode")} value={code} onChange={setCode}
-            placeholder={mobileMessage(locale, "connection.pairingCodePlaceholder")} colors={colors} keyboardType="number-pad" />
-          <Action label={mobileMessage(locale, state.busy ? "connection.pairing" : "connection.pairDevice")}
-            onPress={pair} colors={colors} disabled={state.busy || !code.trim()} />
-        </>}
-      </>}
-    </>}
-    {(localError || state.connectionAttemptError || (!state.activeProfileId && state.error)) &&
-      <Banner text={localError || state.connectionAttemptError || state.error || ""} colors={colors} />}
-  </MobileConnectionStage>;
+  return <MobileSharedConnectionScreen client={client} state={state} locale={locale} dark={dark}
+    defaultDeviceName={mobileDeviceNameSource(Constants.deviceName, Platform.OS).defaultDisplayName}
+    onThemeChange={(preference) => mobileThemePreferences.setPreference(preference)}
+    onBack={onBack} onConnected={onConnected} />;
 }
 
 function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu, incomingShare, onOpenShare,

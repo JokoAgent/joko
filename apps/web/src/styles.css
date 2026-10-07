@@ -4107,6 +4107,18 @@ html[data-desktop-platform="darwin"] .runtime-process-window__titlebar { padding
   .session-header__actions .icon-button:last-child { display: grid; }.session-heading__status .pill { display: none; }.timeline__virtual { width: calc(100% - 18px); }.control-toggle { font-size: 0; }.control-toggle svg { margin: 0; }.composer__tools .icon-button:nth-of-type(n+3) { display: none; }.attachment-chip { max-width: 165px; }.question-wizard__progress progress { width: min(96px, 32vw); }.question-wizard__actions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }.question-wizard__actions .button:only-child { grid-column: 1 / -1; }.question-choice-grid > label { min-height: 48px; padding: 9px 10px; }.interaction-minimized { width: calc(100vw - 24px); min-width: 0; right: 12px; bottom: 12px; }.schedule-card > header .switch { margin-left: 4px; }.connection-hero__copy h1 { font-size: 42px; }.connection-title-lockup { gap: 10px; }.connection-hero__tagline { font-size: var(--text-14); white-space: nowrap; }.connection-tabs button { gap: 4px; padding-inline: 5px; font-size: var(--text-11); }.connection-tabs button svg { width: 15px; height: 15px; }.error-boundary__actions { width: 100%; display: grid; }.error-boundary__action { width: 100%; }
 }
 
+.connection-screen { height: 100%; }
+.connection-tabs button { white-space: nowrap; }
+
+@media (max-width: 480px) {
+  .connection-tabs { grid-template-columns: auto auto auto; }
+}
+
+@media (pointer: coarse) {
+  .connection-card .button, .connection-tabs button { min-height: 44px; }
+  .connection-auto-choice, .pair-form .lan-http-confirm { min-height: 44px; }
+}
+
 @media (orientation: portrait), (max-width: 720px) {
   .connection-screen {
     grid-template-columns: minmax(0, 760px);
