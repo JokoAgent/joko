@@ -74,6 +74,9 @@ import { VISUAL_EXTENSION_MAIN_VIEW_ENDPOINT } from "./visual-extension-surface-
 import { VisualInteractionFixture, VISUAL_INTERACTION_SETTLE_EVENT } from "./VisualInteractionFixture.js";
 import { VisualHistoryMaintenanceFixture, VISUAL_HISTORY_MAINTENANCE_SETTLE_EVENT } from "./VisualHistoryMaintenanceFixture.js";
 import { VisualArtifactStorageFixture, VISUAL_ARTIFACT_STORAGE_DRAFT_TEXT, VISUAL_ARTIFACT_STORAGE_SETTLE_EVENT } from "./VisualArtifactStorageFixture.js";
+import { VisualToolPolicyFixture, visualToolPolicyInitialPolicy, VISUAL_TOOL_POLICY_SETTLE_EVENT,
+  PROVIDER_ID as VISUAL_TOOL_POLICY_PROVIDER_ID, TARGET_A_ID as VISUAL_TOOL_POLICY_TARGET_A_ID,
+  TARGET_B_ID as VISUAL_TOOL_POLICY_TARGET_B_ID } from "./VisualToolPolicyFixture.js";
 
 const FIXED_NOW = Date.UTC(2026, 7, 22, 4, 0, 0);
 const VISUAL_WORKSPACE_ID = "visual-workspace";
@@ -133,6 +136,16 @@ export function VisualHarness(): JSX.Element {
   const interactionFixture = useMemo(() => new VisualInteractionFixture(visualInteractionJourney()), []);
   const historyMaintenance = useMemo(() => new VisualHistoryMaintenanceFixture(), []);
   const artifactStorage = useMemo(() => new VisualArtifactStorageFixture(), []);
+  const toolPolicy = useMemo(() => new VisualToolPolicyFixture((policy) => {
+    setState((current) => ({ ...current, snapshot: { ...current.snapshot,
+      revision: current.snapshot.revision + 1n,
+      settings: { ...current.snapshot.settings, revision: current.snapshot.settings.revision + 1n,
+        toolPolicies: current.snapshot.settings.toolPolicies.map((value) =>
+          value.toolProviderId === policy.toolProviderId ? policy : value) }
+    } }));
+  }), []);
+  const toolPolicySnapshotRef = useRef(state.snapshot);
+  toolPolicySnapshotRef.current = state.snapshot;
   const remoteHosts = useMemo(() => new VisualRemoteHostFixture(state.snapshot.targets, target => {
     setState(current => ({ ...current, snapshot: { ...current.snapshot, targets: current.snapshot.targets.map(value => value.id === target.id ? target : value) } }));
   }), []);
@@ -188,6 +201,32 @@ export function VisualHarness(): JSX.Element {
       delete document.documentElement.dataset.harnessArtifactStorageState;
     };
   }, [artifactStorage, scenario.scenario]);
+
+  useEffect(() => {
+    if (scenario.scenario !== "tool-policy") return;
+    const unsubscribe = toolPolicy.subscribe(() => {
+      document.documentElement.dataset.harnessToolPolicyState = JSON.stringify({
+        ...toolPolicy.state, ...visualToolPolicySnapshotObservation(toolPolicySnapshotRef.current)
+      });
+    });
+    const settle = (event: Event): void => {
+      if (event instanceof CustomEvent) toolPolicy.settle(event.detail);
+    };
+    window.addEventListener(VISUAL_TOOL_POLICY_SETTLE_EVENT, settle);
+    return () => {
+      window.removeEventListener(VISUAL_TOOL_POLICY_SETTLE_EVENT, settle);
+      unsubscribe();
+      toolPolicy.cancelPending();
+      delete document.documentElement.dataset.harnessToolPolicyState;
+    };
+  }, [toolPolicy, scenario.scenario]);
+
+  useEffect(() => {
+    if (scenario.scenario !== "tool-policy") return;
+    document.documentElement.dataset.harnessToolPolicyState = JSON.stringify({
+      ...toolPolicy.state, ...visualToolPolicySnapshotObservation(state.snapshot)
+    });
+  }, [toolPolicy, scenario.scenario, state.snapshot]);
 
   useEffect(() => {
     if (scenario.scenario !== "automation" || automationSettingsEnteredRef.current) return;
@@ -320,6 +359,9 @@ export function VisualHarness(): JSX.Element {
         reconcileArtifactStorage: artifactStorage.reconcileArtifactStorage,
         beginArtifactStorageCleanup: artifactStorage.beginArtifactStorageCleanup,
         getArtifactStorageCleanup: artifactStorage.getArtifactStorageCleanup
+      } : {}),
+      ...(scenario.scenario === "tool-policy" ? {
+        updateToolPolicySettings: toolPolicy.updateToolPolicySettings
       } : {}),
       getRemoteHostCapabilities: remoteHosts.getRemoteHostCapabilities,
       listSshKeys: remoteHosts.listSshKeys,
@@ -1907,7 +1949,7 @@ export function VisualHarness(): JSX.Element {
         return async (): Promise<undefined> => undefined;
       }
     }) as unknown as AppController;
-  }, [artifactActions, artifactStorage, draftActions, historyMaintenance, interactionFixture, mcpActions, remoteHosts, state, usageHistory]);
+  }, [artifactActions, artifactStorage, draftActions, historyMaintenance, interactionFixture, mcpActions, remoteHosts, state, toolPolicy, usageHistory]);
 
   if (scenario.scenario === "usage") return <main style={{ maxWidth: 1040, margin: "0 auto" }}>
     <UsageHistorySection controller={controller} t={(key, values) => translate(state.effectiveLocale, key, values)} />
@@ -2902,8 +2944,27 @@ function abortError(): Error {
     : new DOMException("The workspace search was cancelled.", "AbortError");
 }
 
+function visualToolPolicySnapshotObservation(snapshot: AppSnapshot) {
+  return {
+    snapshotRevision: snapshot.revision.toString(), settingsRevision: snapshot.settings.revision.toString(),
+    snapshotPolicy: snapshot.settings.toolPolicies.find((policy) => policy.toolProviderId === VISUAL_TOOL_POLICY_PROVIDER_ID),
+    activity: {
+      cursor: snapshot.cursor.toString(), generation: snapshot.generation.toString(),
+      sessions: snapshot.sessions.map((session) => ({ id: session.id, generation: session.generation.toString(),
+        state: session.state, ...(session.activeRunId === undefined ? {} : { activeRunId: session.activeRunId }) })),
+      queue: snapshot.queue.map((item) => ({ id: item.id, sessionId: item.sessionId,
+        revision: item.revision.toString(), generation: item.generation.toString(), state: item.state })),
+      queueControls: snapshot.queueControls.map((control) => ({ sessionId: control.sessionId,
+        revision: control.revision.toString(), generation: control.generation.toString(),
+        state: control.state, queuedItemCount: control.queuedItemCount })),
+      timelines: [...snapshot.timelineBySession].map(([sessionId, rows]) => ({ sessionId,
+        rows: rows.map((row) => ({ id: row.id, sequence: row.sequence.toString(), kind: row.kind })) }))
+    }
+  };
+}
+
 interface HarnessParameters {
-  readonly scenario: "session" | "interaction" | "maintenance" | "artifact-storage" | "question" | "long-question" | "files" | "audio" | "review" | "personalization" | "providers" | "voice" | "automation" | "scheduler" | "connection" | "connections" | "browser" | "extensions" | "background" | "subagents" | "usage";
+  readonly scenario: "session" | "interaction" | "maintenance" | "artifact-storage" | "tool-policy" | "question" | "long-question" | "files" | "audio" | "review" | "personalization" | "providers" | "voice" | "automation" | "scheduler" | "connection" | "connections" | "browser" | "extensions" | "background" | "subagents" | "usage";
   readonly usageState: "ready" | "empty" | "error";
   readonly theme: Theme;
   readonly richCopy: boolean;
@@ -2932,6 +2993,7 @@ function harnessParameters(): HarnessParameters {
     scenario: scenarioValue === "interaction"
       || scenarioValue === "maintenance"
       || scenarioValue === "artifact-storage"
+      || scenarioValue === "tool-policy"
       || scenarioValue === "question"
       || scenarioValue === "long-question"
       || scenarioValue === "files"
@@ -3036,7 +3098,7 @@ function initialControllerState(parameters: HarnessParameters, files: VisualWork
     snapshot: visualSnapshot(parameters, files),
     route: parameters.scenario === "files"
       ? { kind: "files", sessionId: "session-1", file: "src/App.tsx" }
-      : parameters.scenario === "personalization" || parameters.scenario === "providers" || parameters.scenario === "voice" || parameters.scenario === "connections" || parameters.scenario === "maintenance" || parameters.scenario === "artifact-storage"
+      : parameters.scenario === "personalization" || parameters.scenario === "providers" || parameters.scenario === "voice" || parameters.scenario === "connections" || parameters.scenario === "maintenance" || parameters.scenario === "artifact-storage" || parameters.scenario === "tool-policy"
         ? { kind: "settings" }
         : parameters.scenario === "automation"
           ? { kind: "session", sessionId: "session-1" }
@@ -3460,7 +3522,9 @@ function visualSnapshot(parameters: HarnessParameters, files: VisualWorkspaceFil
       canRecover: true
     }
   };
-  const settings = parameters.scenario === "providers"
+  const settings = parameters.scenario === "tool-policy"
+    ? { ...base.settings, revision: 1n, toolPolicies: [visualToolPolicyInitialPolicy()] }
+    : parameters.scenario === "providers"
     ? {
         ...base.settings,
         revision: 1n,
@@ -3736,7 +3800,10 @@ function visualSnapshot(parameters: HarnessParameters, files: VisualWorkspaceFil
       transfers: [],
       revision: 0n
     }] : [],
-    targets: [{ id: "visual-target", backendId: "visual-backend", name: "Joko workspace", workspaceId: "visual-workspace", revision: 1n, workspaceName: "Joko workspace", trusted: true, pinned: !parameters.project, archived: false }],
+    targets: parameters.scenario === "tool-policy"
+      ? [{ id: VISUAL_TOOL_POLICY_TARGET_A_ID, backendId: "visual-backend", name: "Project A", workspaceId: "visual-workspace", revision: 1n, workspaceName: "Project A", trusted: true, pinned: true, archived: false },
+        { id: VISUAL_TOOL_POLICY_TARGET_B_ID, backendId: "visual-backend", name: "Project B", workspaceId: "visual-workspace-b", revision: 1n, workspaceName: "Project B", trusted: true, pinned: false, archived: false }]
+      : [{ id: "visual-target", backendId: "visual-backend", name: "Joko workspace", workspaceId: "visual-workspace", revision: 1n, workspaceName: "Joko workspace", trusted: true, pinned: !parameters.project, archived: false }],
     sessions,
     schedules: parameters.scenario === "scheduler" ? visualSchedulerSchedules() : [],
     timelineBySession,
