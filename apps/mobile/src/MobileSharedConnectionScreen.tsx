@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type ForwardRefExoticComponent, type RefAttributes } from "react";
-import { Alert, AppState, StyleSheet, Text } from "react-native";
-import { SafeAreaView } from "react-native-safe-area-context";
+import { Alert, AppState, Platform, StyleSheet, Text } from "react-native";
+import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
 import { WebView, type WebViewMessageEvent, type WebViewProps } from "react-native-webview";
 import type { MobileClient, MobileState } from "./mobile-client";
 import type { MobileSupportedLocale } from "./mobile-locale-preference";
@@ -9,6 +9,7 @@ import { mobileMessage } from "./mobile-messages";
 import { mobileConnectionMessages, projectMobileConnection } from "./mobile-connection-presentation";
 import { mobileConnectionJson, parseMobileConnectionMessage, type MobileConnectionMessage } from "./mobile-connection-protocol";
 import connectionRuntime from "./connection-runtime.connjs";
+import { MobileKeyboardAvoidingView, useMobileKeyboardState } from "./MobileKeyboardAvoidingView";
 
 interface ConnectionWebViewHandle { injectJavaScript(script: string): void }
 const ConnectionWebView = WebView as unknown as ForwardRefExoticComponent<WebViewProps & RefAttributes<ConnectionWebViewHandle>>;
@@ -28,6 +29,8 @@ interface MobileSharedConnectionScreenProps {
 
 /** Native authority adapter; layout, controls and gestures run the Web page itself. */
 export function MobileSharedConnectionScreen(props: MobileSharedConnectionScreenProps) {
+  const keyboard = useMobileKeyboardState();
+  const safeArea = useSafeAreaInsets();
   const [surface, setSurface] = useState(() => `joko-connection-${++surfaceSequence}`);
   const [foreground, setForeground] = useState(AppState.currentState === "active");
   const [notice, setNotice] = useState("");
@@ -99,7 +102,9 @@ export function MobileSharedConnectionScreen(props: MobileSharedConnectionScreen
     });
   };
 
-  return <SafeAreaView style={[styles.fill, { backgroundColor: props.dark ? "#17130e" : "#fef9ef" }]}>
+  return <MobileKeyboardAvoidingView style={[styles.fill, { backgroundColor: props.dark ? "#17130e" : "#fef9ef" }]}
+    keyboard={keyboard} consumedBottomInset={safeArea.bottom} behavior={Platform.OS === "android" ? "height" : undefined}>
+    <SafeAreaView style={styles.fill}>
     {notice !== "" && <Text accessibilityRole="alert" style={[styles.notice, { color: props.dark ? "#f2f2f2" : "#0d0d0d" }]}>{notice}</Text>}
     <ConnectionWebView key={surface} ref={webView}
       source={{ html: initialHtml.current.html, baseUrl: connectionBaseUrl }}
@@ -117,7 +122,8 @@ export function MobileSharedConnectionScreen(props: MobileSharedConnectionScreen
       hideKeyboardAccessoryView={false} textInteractionEnabled
       containerStyle={styles.fill} style={styles.fill}
     />
-  </SafeAreaView>;
+    </SafeAreaView>
+  </MobileKeyboardAvoidingView>;
 }
 
 async function executeConnectionAction(message: Extract<MobileConnectionMessage, { type: "action" }>,
