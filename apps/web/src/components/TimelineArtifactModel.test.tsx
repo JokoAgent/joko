@@ -137,6 +137,21 @@ describe("Timeline model previews", () => {
     expect(document.querySelector('[role="status"]')?.textContent).toBe("media.fileOpened");
   });
 
+  it("reuses the canonical native-file menu across attachment, Artifact row, and text-preview surfaces", async () => {
+    Object.defineProperty(window, "jokoDesktop", { configurable: true, value: { capabilities: ["files.open"] } });
+    const openFile = vi.fn<import("../model.js").OperationApi["openArtifactFile"]>().mockResolvedValue({ status: "opened" });
+    const text = artifact("text", "report.md", "text/markdown");
+    const standalone = artifact("standalone", "archive.bin", "application/octet-stream");
+    await mount(<NativeFileActionsContext.Provider value={{ openFile }}>
+      <MessageAttachment artifact={text} t={t} onArtifactUrl={async () => "blob:text"} onArtifactDownload={vi.fn()} />
+      <ArtifactBlock item={item(standalone)} icon={<span />} locale="en" t={t} onArtifactUrl={async () => "blob:standalone"} onArtifactDownload={vi.fn()} />
+    </NativeFileActionsContext.Provider>);
+    expect(document.querySelector(".message-attachment > .native-file-actions")).not.toBeNull();
+    expect(document.querySelector(".artifact-block__row > .native-file-actions")).not.toBeNull();
+    await act(async () => document.querySelector<HTMLButtonElement>(".message-attachment__preview--text")!.click());
+    expect(document.querySelector('[role="dialog"] .native-file-actions')).not.toBeNull();
+  });
+
   it("retires pending materialization and the open viewer on task changes without disturbing the next owner", async () => {
     const late = deferred<string>();
     const acquire = vi.fn(async () => `blob:lease-${acquire.mock.calls.length}`);

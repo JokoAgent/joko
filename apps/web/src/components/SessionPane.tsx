@@ -1849,7 +1849,12 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
       <ExtensionStatuses statuses={extensionStatuses} />
 
       {exportDownload.failed && <p className="danger-text" role="alert">{t("portable.exportFailed")}</p>}
-      <NativeFileActionsContext.Provider value={controller.state.ready && controller.state.connectionState === "connected" ? { copyFile: controller.copyArtifactFile, openFile: controller.openArtifactFile, revealSource: controller.revealArtifactSource } : undefined}>
+      <NativeFileActionsContext.Provider value={controller.state.ready && controller.state.connectionState === "connected" ? {
+        copyFile: controller.copyArtifactFile,
+        openFile: controller.openArtifactFile,
+        openFileWithApplication: controller.openArtifactFileWithApplication,
+        revealSource: controller.revealArtifactSource
+      } : undefined}>
       <Timeline
         key={timelineResourceOwnerKey}
         ownerKey={`${timelineResourceOwnerKey}:${session.generation}:${controller.state.connectionState}`}

@@ -289,6 +289,7 @@ function controller(overrides: Record<string, unknown> = {}, owner = "owner-one"
     listSessionArtifacts: vi.fn(async () => []),
     copyArtifactFile: vi.fn(),
     openArtifactFile: vi.fn(),
+    openArtifactFileWithApplication: vi.fn(),
     revealArtifactSource: vi.fn(),
     ...overrides
   } as unknown as AppController;

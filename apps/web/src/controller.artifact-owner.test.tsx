@@ -161,7 +161,7 @@ it("keeps resource and auxiliary operations bound to the controller snapshot's g
       ...inputOperations, ...workspaceOperations, ...voiceOperations, ...queueOperations, ...remoteOperations, ...loginOperations, ...sshOperations,
       watchRemoteHosts: async function* () { if (disposed) throw new Error("Remote workspace owner disconnected"); yield []; },
       readWorkspaceFile: read, readWorkspaceHtmlSnapshot, performBrowserTakeoverAction, getArtifactUrl: get, releaseArtifactUrl: release,
-      navigateSessionBranch: navigate, copyArtifactFile: download, openArtifactFile: download, downloadArtifact: download, exportSession: download, exportPortableSession: download,
+      navigateSessionBranch: navigate, copyArtifactFile: download, openArtifactFile: download, openArtifactFileWithApplication: download, downloadArtifact: download, exportSession: download, exportPortableSession: download,
       updateAuxiliaryTextSettings: save, predictNextPrompt: predict, openBrowserPage
     } as unknown as OrchestratorGateway;
   });
@@ -198,6 +198,7 @@ it("keeps resource and auxiliary operations bound to the controller snapshot's g
   await firstController.createSession(attachedTaskDraft);
   expect(inputCalls.get(first.id)!.createSession.mock.lastCall?.[0]).not.toHaveProperty("appendSystemPrompt");
   expect(current.openArtifactFile).toBe(firstController.openArtifactFile);
+  expect(current.openArtifactFileWithApplication).toBe(firstController.openArtifactFileWithApplication);
   expect(current.openHttpLink).toBe(firstController.openHttpLink);
   expect(current.navigateSessionBranch).toBe(firstController.navigateSessionBranch);
   expect(current.readDraft).toBe(firstController.readDraft);

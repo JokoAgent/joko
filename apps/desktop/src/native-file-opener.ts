@@ -2,7 +2,11 @@ import { createHash, randomUUID } from "node:crypto";
 import { lstat, open, realpath, rmdir, unlink } from "node:fs/promises";
 import { isAbsolute, join, resolve } from "node:path";
 
-import type { DesktopOpenFileRequest, DesktopOpenFileResult } from "./channels.js";
+import type {
+  DesktopOpenFileRequest,
+  DesktopOpenFileResult,
+  DesktopOpenFileWithAppIpcRequest
+} from "./channels.js";
 import type { NativeFileActionScope } from "./native-file-clipboard.js";
 import { atomicWritePrivateFile, ensurePrivateDirectory, readPrivateFile } from "./secure-files.js";
 
@@ -27,6 +31,14 @@ interface Request {
   readonly abort: AbortController;
   readonly result: Promise<DesktopOpenFileResult>;
 }
+
+export type NativeFileOpenWithDispatcher = (
+  path: string
+) => Promise<string>;
+
+export type NativeFileOpenWithDispatcherFactory = (
+  request: DesktopOpenFileWithAppIpcRequest
+) => NativeFileOpenWithDispatcher;
 
 export interface NativeFileOpenerOptions {
   readonly directory: string;
@@ -58,8 +70,36 @@ export class NativeFileOpener {
 
   open(value: unknown, scope: NativeFileActionScope): Promise<DesktopOpenFileResult> {
     const input = parseDesktopOpenFileRequest(value);
+    return this.#enqueue(input, scope, "default", () => this.#options.openPath);
+  }
+
+  openWith(
+    value: unknown,
+    scope: NativeFileActionScope,
+    createDispatch: NativeFileOpenWithDispatcherFactory
+  ): Promise<DesktopOpenFileResult> {
+    const input = parseDesktopOpenFileWithAppRequest(value);
+    if (input.documentOccurrence !== scope.id) {
+      return Promise.reject(new Error("The file open-with request belongs to another Document occurrence."));
+    }
+    return this.#enqueue(
+      input,
+      scope,
+      `open-with\0${input.documentOccurrence}\0${input.listOccurrence}\0${input.appId}`,
+      () => createDispatch(input)
+    );
+  }
+
+  #enqueue(
+    input: DesktopOpenFileRequest,
+    scope: NativeFileActionScope,
+    actionIdentity: string,
+    createDispatch: () => (path: string) => Promise<string>
+  ): Promise<DesktopOpenFileResult> {
     const key = `${scope.id}\0${input.requestId}`;
     const digest = createHash("sha256")
+      .update(actionIdentity)
+      .update("\0")
       .update(input.file.name)
       .update("\0")
       .update(input.file.mediaType)
@@ -78,6 +118,12 @@ export class NativeFileOpener {
       this.#pendingBytes + input.file.bytes.byteLength > FILE_OPEN_TOTAL_BYTES) {
       return Promise.resolve({ status: "failed", reason: "capacity" });
     }
+    let dispatch: (path: string) => Promise<string>;
+    try {
+      dispatch = createDispatch();
+    } catch (error) {
+      return Promise.reject(error);
+    }
     const bytes = Uint8Array.from(input.file.bytes);
     const abort = new AbortController();
     this.#pendingBytes += bytes.byteLength;
@@ -93,7 +139,7 @@ export class NativeFileOpener {
           this.#entries.reduce((total, entry) => total + entry.bytes, 0) + this.#pendingBytes > FILE_OPEN_TOTAL_BYTES) {
           return { status: "failed", reason: "capacity" };
         }
-        return await this.#execute(input.file.name, bytes, current);
+        return await this.#execute(input.file.name, bytes, current, dispatch);
       } catch {
         return { status: "failed", reason: "storage" };
       }
@@ -174,7 +220,12 @@ export class NativeFileOpener {
     }
   }
 
-  async #execute(name: string, bytes: Uint8Array, current: () => boolean): Promise<DesktopOpenFileResult> {
+  async #execute(
+    name: string,
+    bytes: Uint8Array,
+    current: () => boolean,
+    dispatch: (path: string) => Promise<string>
+  ): Promise<DesktopOpenFileResult> {
     let entry: Entry = { id: randomUUID(), name, bytes: bytes.byteLength, state: "prepared" };
     this.#entries.push(entry);
     await this.#persist();
@@ -191,16 +242,18 @@ export class NativeFileOpener {
       } finally {
         await file.close();
       }
+      await verifyMaterializedFile(path, bytes.byteLength);
       if (!current()) return { status: "cancelled" };
       const retained: Entry = { ...entry, state: "retained", retainUntil: this.#now() + FILE_OPEN_RETENTION_MS };
       this.#entries[this.#entries.indexOf(entry)] = retained;
       entry = retained;
       await this.#persist();
       if (!current()) return { status: "cancelled" };
+      await verifyMaterializedFile(path, bytes.byteLength);
       dispatched = true;
       let errorMessage: string;
       try {
-        errorMessage = await this.#options.openPath(path);
+        errorMessage = await dispatch(path);
       } catch {
         return { status: "unknown" };
       }
@@ -224,7 +277,7 @@ export function parseDesktopOpenFileRequest(value: unknown): DesktopOpenFileRequ
   }
   const file = value.file;
   if (Object.keys(file).sort().join(",") !== "bytes,mediaType,name" || typeof file.name !== "string" ||
-    !safeFileName(file.name) || typeof file.mediaType !== "string" || file.mediaType.length > 255 ||
+    !isSafeNativeFileName(file.name) || typeof file.mediaType !== "string" || file.mediaType.length > 255 ||
     !/^[\w.+-]+\/[\w.+-]+$/u.test(file.mediaType) || !(file.bytes instanceof Uint8Array) ||
     file.bytes.byteLength > FILE_OPEN_MAXIMUM_BYTES) {
     throw new TypeError("Invalid file open payload.");
@@ -232,7 +285,23 @@ export function parseDesktopOpenFileRequest(value: unknown): DesktopOpenFileRequ
   return { requestId: value.requestId, file: { name: file.name, mediaType: file.mediaType, bytes: file.bytes } };
 }
 
-function safeFileName(name: string): boolean {
+export function parseDesktopOpenFileWithAppRequest(value: unknown): DesktopOpenFileWithAppIpcRequest {
+  if (!isRecord(value) || Object.keys(value).sort().join(",") !==
+    "appId,documentOccurrence,file,listOccurrence,requestId" ||
+    !UUID.test(String(value.appId)) || !UUID.test(String(value.documentOccurrence)) ||
+    !UUID.test(String(value.listOccurrence))) {
+    throw new TypeError("Invalid file open-with request.");
+  }
+  const base = parseDesktopOpenFileRequest({ requestId: value.requestId, file: value.file });
+  return {
+    ...base,
+    appId: value.appId as string,
+    documentOccurrence: value.documentOccurrence as string,
+    listOccurrence: value.listOccurrence as string
+  };
+}
+
+export function isSafeNativeFileName(name: string): boolean {
   return name.length > 0 && name.trim() === name && Buffer.byteLength(name, "utf8") <= 240 &&
     !/[\x00-\x1f\x7f<>:"/\\|?*]/u.test(name) && !/[. ]$/u.test(name) && name !== "." && name !== ".." &&
     !/^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/iu.test(name);
@@ -247,7 +316,7 @@ function parseManifest(bytes: Uint8Array): Entry[] {
   let total = 0;
   for (const entry of value.entries) {
     if (!isRecord(entry) || typeof entry.id !== "string" || !UUID.test(entry.id) || ids.has(entry.id) ||
-      typeof entry.name !== "string" || !safeFileName(entry.name) || typeof entry.bytes !== "number" ||
+      typeof entry.name !== "string" || !isSafeNativeFileName(entry.name) || typeof entry.bytes !== "number" ||
       !Number.isSafeInteger(entry.bytes) || entry.bytes < 0 || entry.bytes > FILE_OPEN_MAXIMUM_BYTES ||
       (entry.state !== "prepared" && entry.state !== "retained") ||
       (entry.state === "retained"
@@ -268,4 +337,12 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function samePath(left: string, right: string): boolean {
   return process.platform === "win32" ? left.toLowerCase() === right.toLowerCase() : left === right;
+}
+
+async function verifyMaterializedFile(path: string, expectedBytes: number): Promise<void> {
+  const info = await lstat(path);
+  if (!info.isFile() || info.isSymbolicLink() || info.size !== expectedBytes ||
+    !samePath(await realpath(path), path)) {
+    throw new Error("Opened file changed before dispatch.");
+  }
 }

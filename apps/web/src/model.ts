@@ -6294,6 +6294,14 @@ export interface OperationApi extends VoiceDictionaryPeerApi {
   downloadArtifact(blobId: string, fileName: string, context: ArtifactDownloadContext): Promise<ArtifactDownloadOutcome>;
   copyArtifactFile(blobId: string, fileName: string, byteSize: number, context: ArtifactDownloadContext): Promise<import("./native-file-actions.js").NativeFileCopyOutcome>;
   openArtifactFile(blobId: string, fileName: string, byteSize: number, context: ArtifactDownloadContext): Promise<import("./native-file-actions.js").NativeFileOpenOutcome>;
+  openArtifactFileWithApplication(
+    blobId: string,
+    fileName: string,
+    byteSize: number,
+    list: import("./native-file-actions.js").NativeFileOpenApplicationList,
+    application: import("./native-file-actions.js").NativeFileOpenApplication,
+    context: ArtifactDownloadContext
+  ): Promise<import("./native-file-actions.js").NativeFileOpenOutcome>;
   revealArtifactSource(sessionId: string, artifactId: string, context: ArtifactDownloadContext): Promise<import("./native-file-actions.js").NativeArtifactSourceRevealOutcome>;
 }
 

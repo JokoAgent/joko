@@ -120,6 +120,10 @@ export const DESKTOP_CHANNELS = {
   cancelFileCopy: "joko:files:copy-cancel",
   openFile: "joko:files:open",
   cancelFileOpen: "joko:files:open-cancel",
+  openWithCaptureDocument: "joko:files:open-with:document:capture",
+  listOpenWithApps: "joko:files:open-with:list",
+  retireOpenWithApps: "joko:files:open-with:retire",
+  openFileWithApp: "joko:files:open-with:open",
   revealArtifactSource: "joko:files:reveal-artifact-source",
   cancelArtifactSourceReveal: "joko:files:reveal-artifact-source-cancel",
   credentialGet: "joko:credential:get",
@@ -828,6 +832,43 @@ export interface DesktopOpenFileRequest {
 export type DesktopOpenFileResult =
   | { readonly status: "opened" | "cancelled" | "unknown" | "unavailable" }
   | { readonly status: "failed"; readonly reason: "capacity" | "storage" | "open" };
+
+export interface DesktopOpenWithApp {
+  readonly appId: string;
+  readonly label: string;
+  readonly iconDataUrl?: string;
+}
+
+export interface DesktopListOpenWithAppsRequest {
+  readonly listOccurrence: string;
+  readonly name: string;
+}
+
+export interface DesktopListOpenWithAppsIpcRequest extends DesktopListOpenWithAppsRequest {
+  readonly documentOccurrence: string;
+}
+
+export type DesktopListOpenWithAppsResult =
+  | {
+      readonly status: "listed";
+      readonly listOccurrence: string;
+      readonly apps: readonly DesktopOpenWithApp[];
+    }
+  | { readonly status: "cancelled" | "unavailable" | "failed" };
+
+export interface DesktopRetireOpenWithAppsIpcRequest {
+  readonly documentOccurrence: string;
+  readonly listOccurrence: string;
+}
+
+export interface DesktopOpenFileWithAppRequest extends DesktopOpenFileRequest {
+  readonly listOccurrence: string;
+  readonly appId: string;
+}
+
+export interface DesktopOpenFileWithAppIpcRequest extends DesktopOpenFileWithAppRequest {
+  readonly documentOccurrence: string;
+}
 
 export interface DesktopRevealArtifactSourceRequest {
   readonly requestId: string;

@@ -542,7 +542,9 @@ import {
   copyNativeArtifactFile,
   NATIVE_FILE_COPY_MAXIMUM_BYTES,
   NATIVE_FILE_OPEN_MAXIMUM_BYTES,
+  nativeFileOpenApplicationAvailable,
   openNativeArtifactFile,
+  openNativeArtifactFileWithApplication,
   revealNativeArtifactSource
 } from "./native-file-actions.js";
 import type {
@@ -9039,6 +9041,21 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     if (!Number.isSafeInteger(byteSize) || byteSize < 0 || byteSize > NATIVE_FILE_OPEN_MAXIMUM_BYTES) return { status: "failed", reason: "capacity" };
     const blob = await this.fetchArtifact(blobId, ownedContext.signal);
     return openNativeArtifactFile(blob, fileName, ownedContext, host);
+  }
+
+  async openArtifactFileWithApplication(
+    blobId: string,
+    fileName: string,
+    byteSize: number,
+    list: import("./native-file-actions.js").NativeFileOpenApplicationList,
+    application: import("./native-file-actions.js").NativeFileOpenApplication,
+    context: ArtifactDownloadContext
+  ): Promise<import("./native-file-actions.js").NativeFileOpenOutcome> {
+    const ownedContext = this.artifactDownloadContext(context);
+    if (!nativeFileOpenApplicationAvailable(list, application)) return { status: "unavailable" };
+    if (!Number.isSafeInteger(byteSize) || byteSize < 0 || byteSize > NATIVE_FILE_OPEN_MAXIMUM_BYTES) return { status: "failed", reason: "capacity" };
+    const blob = await this.fetchArtifact(blobId, ownedContext.signal);
+    return openNativeArtifactFileWithApplication(blob, fileName, list, application, ownedContext);
   }
 
   async revealArtifactSource(sessionId: string, artifactId: string, context: ArtifactDownloadContext): Promise<import("./native-file-actions.js").NativeArtifactSourceRevealOutcome> {

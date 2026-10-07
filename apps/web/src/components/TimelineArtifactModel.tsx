@@ -6,7 +6,7 @@ import type { Translator } from "./types.js";
 import { IconButton } from "./ui.js";
 import { WorkspaceModelLightbox } from "./WorkspaceModelLightbox.js";
 import { materializeWorkspaceModelSource } from "./workspace-gltf-source.js";
-import { NativeFileActionsContext, NativeFileActionsMenu } from "./NativeFileCopyMenu.js";
+import { NativeArtifactFileActionsMenu, NativeFileActionsContext } from "./NativeFileCopyMenu.js";
 
 interface TimelineArtifactModelProps {
   readonly artifact: ArtifactView;
@@ -102,7 +102,7 @@ function ArtifactModelLightbox({ artifact, ownerKey, trigger, loadUrl, onDownloa
       interactionHint: t("workspace.modelInteractionHint")
     }}
     returnFocus={trigger}
-    actions={<NativeFileActionsMenu actions={fileActions} artifactId={artifact.id} blobId={artifact.blobId} name={artifact.fileName} byteSize={artifact.byteSize} {...(artifact.sourceSessionId === undefined ? {} : { sourceSessionId: artifact.sourceSessionId })} sourceRevealAvailable={artifact.sourceRevealAvailable} ownerKey={JSON.stringify([ownerKey, artifact.blobId, "native-file"])} t={t} />}
+    actions={<NativeArtifactFileActionsMenu actions={fileActions} artifact={artifact} ownerKey={JSON.stringify([ownerKey, artifact.blobId, "native-file"])} t={t} />}
     onDownload={(context) => onDownload(artifact.blobId, artifact.fileName, context)}
     onClose={onClose}
   />;

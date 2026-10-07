@@ -1,7 +1,7 @@
 import { useArtifactDownload } from "./use-artifact-download.js";
 import type { ArtifactDownloadContext } from "../model.js";
 import { AlertTriangle, Check, Clipboard, Download, FileText, X } from "lucide-react";
-import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type JSX } from "react";
+import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type JSX, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { writeClipboardText } from "../clipboard-action.js";
 import { useClipboardAction } from "./use-clipboard-action.js";
@@ -28,6 +28,7 @@ export interface TimelineTextAttachmentLightboxProps {
   readonly artifact: ArtifactView;
   readonly labels: TimelineTextAttachmentLightboxLabels;
   readonly returnFocus?: HTMLElement | null;
+  readonly toolbarActions?: ReactNode;
   readonly loadUrl: (blobId: string) => Promise<string>;
   readonly onDownload: (blobId: string, fileName: string, context: ArtifactDownloadContext) => unknown | Promise<unknown>;
   readonly onClose: () => void;
@@ -46,6 +47,7 @@ export function TimelineTextAttachmentLightbox({
   artifact,
   labels,
   returnFocus,
+  toolbarActions,
   loadUrl,
   onDownload,
   onClose
@@ -178,6 +180,7 @@ export function TimelineTextAttachmentLightbox({
           <span><strong id={titleId}>{artifact.title || artifact.fileName}</strong><small>{artifact.fileName} · {formatBytes(state.phase === "ready" || state.phase === "oversize" ? state.byteSize : artifact.byteSize)}</small></span>
         </button>
         <div className="text-attachment-lightbox__actions">
+          {toolbarActions}
           {state.phase === "ready" && <IconButton label={labels.copy} aria-disabled={copy.pending} aria-busy={copy.pending} onClick={(event) => { if (!closingRef.current) copy.run(event.currentTarget.ownerDocument, (context) => writeClipboardText(state.text, context)); }}><Clipboard aria-hidden="true" /></IconButton>}
           <IconButton label={labels.download} aria-disabled={download.pending} aria-busy={download.pending} onClick={(event) => download.run(event.currentTarget.ownerDocument, (context) => onDownload(artifact.blobId, artifact.fileName, context))}><Download aria-hidden="true" /></IconButton>
           <IconButton label={labels.close} onClick={close}><X aria-hidden="true" /></IconButton>

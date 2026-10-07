@@ -7,7 +7,7 @@ import type { Translator } from "./types.js";
 import { Spinner, cx } from "./ui.js";
 import { VideoPreview } from "./VideoPreview.js";
 import { AudioPreview } from "./AudioPreview.js";
-import { NativeFileActionsContext, NativeFileActionsMenu } from "./NativeFileCopyMenu.js";
+import { NativeArtifactFileActionsMenu, NativeFileActionsContext } from "./NativeFileCopyMenu.js";
 import { RENDERED_SHARE_CONTENT_PENDING_ATTRIBUTE } from "./rendered-share-dom.js";
 
 export type TimelineArtifactMediaKind = "audio" | "video";
@@ -62,7 +62,7 @@ export function TimelineArtifactMedia({ artifact, playbackOwnerKey, loadUrl, t, 
   return <div {...(urlState.status === "loading" ? { [RENDERED_SHARE_CONTENT_PENDING_ATTRIBUTE]: "" } : {})} className={cx("timeline-artifact-media", `timeline-artifact-media--${kind}`, className)}>
     {urlState.status === "loading" && <div className="timeline-artifact-media__state"><Spinner label={t("timeline.mediaLoading")} /></div>}
     {urlState.status === "error" && <div className="timeline-artifact-media__state is-error" role="alert"><AlertCircle aria-hidden="true" /><span>{t("timeline.mediaUnavailable")}</span></div>}
-    {urlState.status === "error" && kind === "video" && <NativeFileActionsMenu actions={fileActions} artifactId={artifact.id} blobId={artifact.blobId} name={artifact.fileName} byteSize={artifact.byteSize} {...(artifact.sourceSessionId === undefined ? {} : { sourceSessionId: artifact.sourceSessionId })} sourceRevealAvailable={artifact.sourceRevealAvailable} ownerKey={sourceKey} t={t} />}
+    {urlState.status === "error" && kind === "video" && <NativeArtifactFileActionsMenu actions={fileActions} artifact={artifact} ownerKey={sourceKey} t={t} />}
     {urlState.status === "ready" && <>
       {kind === "audio"
         ? <AudioPreview
@@ -73,7 +73,7 @@ export function TimelineArtifactMedia({ artifact, playbackOwnerKey, loadUrl, t, 
           metadata={artifact.audioMetadata}
           labels={{ player: playerLabel, loading: t("timeline.mediaLoading"), unavailable: t("timeline.mediaUnavailable"), copyDescription: t("media.copyDescription"), copying: t("media.copyingDescription"), copied: t("media.descriptionCopied"), copyFailed: t("media.descriptionCopyFailed") }}
         />
-        : <VideoPreview src={urlState.url} ownerKey={sourceKey} labels={{ open: t("media.openVideo", { name: artifact.title || artifact.fileName }), player: playerLabel, loading: t("timeline.mediaLoading"), unavailable: t("timeline.mediaUnavailable"), close: t("common.close"), playBlocked: t("media.playBlocked") }} onError={failMedia} actions={<NativeFileActionsMenu actions={fileActions} artifactId={artifact.id} blobId={artifact.blobId} name={artifact.fileName} byteSize={artifact.byteSize} {...(artifact.sourceSessionId === undefined ? {} : { sourceSessionId: artifact.sourceSessionId })} sourceRevealAvailable={artifact.sourceRevealAvailable} ownerKey={sourceKey} t={t} />} />}
+        : <VideoPreview src={urlState.url} ownerKey={sourceKey} labels={{ open: t("media.openVideo", { name: artifact.title || artifact.fileName }), player: playerLabel, loading: t("timeline.mediaLoading"), unavailable: t("timeline.mediaUnavailable"), close: t("common.close"), playBlocked: t("media.playBlocked") }} onError={failMedia} actions={<NativeArtifactFileActionsMenu actions={fileActions} artifact={artifact} ownerKey={sourceKey} t={t} />} />}
     </>}
   </div>;
 }

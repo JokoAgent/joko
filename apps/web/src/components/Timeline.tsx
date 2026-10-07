@@ -92,7 +92,7 @@ import { TimelineTextAttachmentLightbox } from "./TimelineTextAttachmentLightbox
 import { timelineArtifactSupportsTextPreview } from "./timeline-text-attachment.js";
 import { TimelineArtifactMedia, timelineArtifactMediaKind } from "./TimelineArtifactMedia.js";
 import { TimelineArtifactModel, timelineArtifactModelKind } from "./TimelineArtifactModel.js";
-import { NativeFileActionsContext, NativeFileActionsMenu } from "./NativeFileCopyMenu.js";
+import { NativeArtifactFileActionsMenu, NativeFileActionsContext } from "./NativeFileCopyMenu.js";
 import { useTimelineArtifactUrlCache } from "./timeline-artifact-url-cache.js";
 import { AudioArtworkContext } from "./AudioArtwork.js";
 import { timelineErrorCopy } from "../timeline-error-copy.js";
@@ -1634,6 +1634,7 @@ function MessageMoreMenu({ item, copying, onCopyLink, align, t, onAddMessageToCo
 export function MessageAttachment({ artifact, galleryId, t, onArtifactUrl, onArtifactDownload }: { readonly artifact: NonNullable<TimelineItemView["attachments"]>[number]; readonly galleryId?: string; readonly t: Translator; readonly onArtifactUrl: (blobId: string) => Promise<string>; readonly onArtifactDownload: OperationApi["downloadArtifact"] }): JSX.Element {
   const renderForShare = useRenderedShareSelection();
   const gallery = useContext(TimelineImageGalleryContext);
+  const fileActions = useContext(NativeFileActionsContext);
   const { ownerKey } = useContext(TimelinePersonalizationContext);
   const [textPreviewTrigger, setTextPreviewTrigger] = useState<HTMLElement>();
   const mediaKind = timelineArtifactMediaKind(artifact.mediaType);
@@ -1652,7 +1653,7 @@ export function MessageAttachment({ artifact, galleryId, t, onArtifactUrl, onArt
       ? <button className="message-attachment__preview" type="button" data-gallery-image-id={galleryId} aria-label={t("timeline.openImage", { name: artifact.title })} onClick={(event) => gallery.open(galleryId, event.currentTarget)}><img src={image.url} alt={artifact.title} loading={renderForShare ? "eager" : "lazy"} onError={markImageFailed} /></button>
       : <span {...(artifact.kind === "image" && image.status === "loading" ? { [RENDERED_SHARE_CONTENT_PENDING_ATTRIBUTE]: "" } : {})} className={cx("message-attachment__icon", image.status === "error" && "image-preview--failed")} aria-hidden="true">{image.status === "error" ? <ImageOff /> : <ImageIcon />}</span>;
   return <>
-    <article className={cx("message-attachment", mediaKind !== undefined && "message-attachment--media")}>{imagePreview}<span className="message-attachment__copy"><strong>{artifact.title}</strong><small>{artifact.fileName} · {formatBytes(artifact.byteSize)}</small>{mediaKind === undefined && image.status === "error" && <small className="image-preview__failure-label">{t("timeline.imageUnavailable")}</small>}</span><ArtifactDownloadButton iconOnly ownerKey={JSON.stringify([ownerKey, artifact.blobId, artifact.fileName])} connectionOwner={onArtifactUrl} label={t("timeline.downloadArtifact", { name: artifact.fileName })} errorLabel={t("workspace.downloadUnavailable")} action={(context) => onArtifactDownload(artifact.blobId, artifact.fileName, context)} /></article>
+    <article className={cx("message-attachment", mediaKind !== undefined && "message-attachment--media")}>{imagePreview}<span className="message-attachment__copy"><strong>{artifact.title}</strong><small>{artifact.fileName} · {formatBytes(artifact.byteSize)}</small>{mediaKind === undefined && image.status === "error" && <small className="image-preview__failure-label">{t("timeline.imageUnavailable")}</small>}</span><NativeArtifactFileActionsMenu actions={fileActions} artifact={artifact} ownerKey={JSON.stringify([ownerKey, artifact.id, artifact.blobId, "attachment-native-file"])} t={t} /><ArtifactDownloadButton iconOnly ownerKey={JSON.stringify([ownerKey, artifact.blobId, artifact.fileName])} connectionOwner={onArtifactUrl} label={t("timeline.downloadArtifact", { name: artifact.fileName })} errorLabel={t("workspace.downloadUnavailable")} action={(context) => onArtifactDownload(artifact.blobId, artifact.fileName, context)} /></article>
     {textPreviewTrigger !== undefined && <TimelineTextAttachmentLightbox
       ownerKey={JSON.stringify([ownerKey, artifact.id])}
       artifact={artifact}
@@ -1668,6 +1669,7 @@ export function MessageAttachment({ artifact, galleryId, t, onArtifactUrl, onArt
         close: t("common.close")
       }}
       returnFocus={textPreviewTrigger}
+      toolbarActions={<NativeArtifactFileActionsMenu actions={fileActions} artifact={artifact} ownerKey={JSON.stringify([ownerKey, artifact.id, artifact.blobId, "text-preview-native-file"])} t={t} />}
       loadUrl={onArtifactUrl}
       onDownload={onArtifactDownload}
       onClose={() => setTextPreviewTrigger(undefined)}
@@ -1684,8 +1686,10 @@ function TimelineArtifactReferencePreview({ artifact, trigger, ownerKey, t, onAr
   readonly onArtifactDownload: OperationApi["downloadArtifact"];
   readonly onClose: () => void;
 }): JSX.Element {
+  const fileActions = useContext(NativeFileActionsContext);
   if (timelineArtifactSupportsTextPreview(artifact)) return <TimelineTextAttachmentLightbox
     ownerKey={JSON.stringify([ownerKey, artifact.id])} artifact={artifact} returnFocus={trigger}
+    toolbarActions={<NativeArtifactFileActionsMenu actions={fileActions} artifact={artifact} ownerKey={JSON.stringify([ownerKey, artifact.id, artifact.blobId, "reference-text-native-file"])} t={t} />}
     loadUrl={onArtifactUrl} onDownload={onArtifactDownload} onClose={onClose}
     labels={{ preview: t("workspace.preview"), loading: t("workspace.loadingPreview"), unavailable: t("workspace.filePreviewUnavailable"),
       tooLarge: t("workspace.previewTruncated"), copy: t("timeline.copy"), copied: t("timeline.blockCopied"),
@@ -1908,6 +1912,7 @@ function toolFileChangePath(change: ToolFileChangeView): string {
 export function ArtifactBlock({ item, icon, locale, t, onArtifactUrl, onArtifactDownload }: { readonly item: TimelineItemView; readonly icon: JSX.Element; readonly locale: string; readonly t: Translator; readonly onArtifactUrl: (blobId: string) => Promise<string>; readonly onArtifactDownload: OperationApi["downloadArtifact"] }): JSX.Element {
   const artifact = item.artifact;
   const gallery = useContext(TimelineImageGalleryContext);
+  const fileActions = useContext(NativeFileActionsContext);
   const { ownerKey } = useContext(TimelinePersonalizationContext);
   const mediaKind = artifact === undefined ? undefined : timelineArtifactMediaKind(artifact.mediaType);
   const modelKind = artifact === undefined ? undefined : timelineArtifactModelKind(artifact);
@@ -1924,6 +1929,7 @@ export function ArtifactBlock({ item, icon, locale, t, onArtifactUrl, onArtifact
         <div><strong>{artifact?.title ?? item.title ?? t("timeline.artifact")}</strong><span>{artifact === undefined ? item.text : `${artifact.fileName} · ${formatBytes(artifact.byteSize)}`}</span></div>
         <time>{formatDateTime(item.createdAt, locale)}</time>
         {modelKind !== undefined && artifact !== undefined && <TimelineArtifactModel artifact={artifact} ownerKey={ownerKey} loadUrl={onArtifactUrl} onDownload={onArtifactDownload} t={t} />}
+        {artifact !== undefined && <NativeArtifactFileActionsMenu actions={fileActions} artifact={artifact} ownerKey={JSON.stringify([ownerKey, artifact.id, artifact.blobId, "artifact-native-file"])} t={t} />}
         {artifact !== undefined && <ArtifactDownloadButton iconOnly ownerKey={JSON.stringify([ownerKey, artifact.blobId, artifact.fileName])} connectionOwner={onArtifactUrl} label={t("timeline.downloadArtifact", { name: artifact.fileName })} errorLabel={t("workspace.downloadUnavailable")} action={(context) => onArtifactDownload(artifact.blobId, artifact.fileName, context)} />}
       </div>
     </article>
@@ -1970,17 +1976,14 @@ function TimelineImageLightbox({ images, startImageId, returnFocus, t, loadUrl, 
     gallery={{ index, total: images.length, onPrevious: showPrevious, onNext: showNext }}
     showZoomControls
     returnFocus={returnFocus}
-    toolbarActions={<NativeFileActionsMenu
-      actions={fileActions}
-      artifactId={current.artifactId}
-      blobId={current.blobId}
-      name={current.fileName}
-      byteSize={current.byteSize}
-      {...(current.sourceSessionId === undefined ? {} : { sourceSessionId: current.sourceSessionId })}
-      sourceRevealAvailable={current.sourceRevealAvailable}
-      ownerKey={JSON.stringify([ownerKey, current.id, current.blobId, "native-file"])}
-      t={t}
-    />}
+    toolbarActions={<NativeArtifactFileActionsMenu actions={fileActions} artifact={{
+      id: current.artifactId,
+      blobId: current.blobId,
+      ...(current.sourceSessionId === undefined ? {} : { sourceSessionId: current.sourceSessionId }),
+      sourceRevealAvailable: current.sourceRevealAvailable,
+      fileName: current.fileName,
+      byteSize: current.byteSize
+    }} ownerKey={JSON.stringify([ownerKey, current.id, current.blobId, "native-file"])} t={t} />}
     onClose={onClose}
     onDownload={(context) => onDownload(current.blobId, current.fileName, context)}
     onImageError={markImageFailed}
