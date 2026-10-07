@@ -11,6 +11,7 @@ const sharedMessageKeys = {
   "connection.method": "connection.title",
   "connection.nearby": "connection.mode.nearby",
   "connection.savedNodes": "connection.mode.saved",
+  "connection.empty": "connection.savedEmpty",
   "connection.add": "connection.mode.add",
   "connection.discovered": "connection.nearbyTitle",
   "connection.noneDiscovered": "connection.nearbyEmpty",

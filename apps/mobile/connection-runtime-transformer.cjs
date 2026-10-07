@@ -3,8 +3,9 @@ const fs = require("node:fs");
 const path = require("node:path");
 const esbuild = require("esbuild");
 
-const workspaceRoot = path.resolve(__dirname, "../..");
-const runtimeEntry = path.join(__dirname, "src", "connection-runtime.connjs");
+const mobileRoot = __dirname;
+const workspaceRoot = path.resolve(mobileRoot, "../..");
+const runtimeEntry = path.join(mobileRoot, "src", "connection-runtime.connjs");
 const stylesFile = path.join(workspaceRoot, "apps", "web", "src", "styles.css");
 const artworkRoot = path.join(workspaceRoot, "packages", "brand-assets", "src", "landing-artwork");
 
@@ -13,9 +14,10 @@ function sha256(bytes) {
 }
 
 function connectionBuildOptions(src, filename) {
+  const entryFilename = path.resolve(mobileRoot, filename);
   return {
     absWorkingDir: workspaceRoot,
-    stdin: { contents: src, loader: "js", resolveDir: path.dirname(filename), sourcefile: filename },
+    stdin: { contents: src, loader: "js", resolveDir: path.dirname(entryFilename), sourcefile: entryFilename },
     bundle: true,
     format: "iife",
     platform: "browser",
@@ -50,7 +52,8 @@ function getConnectionRuntimeCacheKey() {
 }
 
 async function buildConnectionRuntimeModule(src, filename) {
-  if (path.relative(path.dirname(runtimeEntry), path.resolve(filename)) !== path.basename(runtimeEntry)
+  const entryFilename = path.resolve(mobileRoot, filename);
+  if (entryFilename !== runtimeEntry
     || src.trim() !== 'import "@joko/web/connection-embedded";') {
     throw new Error("Only the Joko shared connection page entry may use the .connjs transformer.");
   }
@@ -78,7 +81,7 @@ async function buildConnectionRuntimeModule(src, filename) {
     return `data:${mime};base64,${bytes.toString("base64")}`;
   }
   const result = await esbuild.build({
-    ...connectionBuildOptions(src, filename),
+    ...connectionBuildOptions(src, entryFilename),
     plugins: [{
       name: "offline-connection-assets",
       setup(build) {
