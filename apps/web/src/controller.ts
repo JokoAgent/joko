@@ -3181,6 +3181,7 @@ export function useAppController(): AppController {
     updateAuxiliaryTextSettings,
     updateSubagentModelSettings: (backendId, model, expectedRevision) => gateway().updateSubagentModelSettings(backendId, model, expectedRevision),
     updateSubagentSmartRouting: (backendId, enabled, expectedRevision) => gateway().updateSubagentSmartRouting(backendId, enabled, expectedRevision),
+    updateModelFavorites: (change, expectedRevision) => gateway().updateModelFavorites(change, expectedRevision),
     resetPromptRecommendationSettings: () => gateway().resetPromptRecommendationSettings(),
     updateLanguageToolSettings: (enabled) => gateway().updateLanguageToolSettings(enabled),
     updateToolPolicySettings: (toolProviderId, targetId, patch) => gateway().updateToolPolicySettings(toolProviderId, targetId, patch),

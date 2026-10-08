@@ -789,6 +789,19 @@ function runtimeControlProjection(currentSession = runtimeSession, detail = fals
       providers: runtimeProviders,
       settings: create(SettingsSnapshotSchema, {
         revision: create(RevisionSchema, { value: 6n }),
+        modelFavorites: {
+          favorites: [{
+            favoriteId: "favorite-alpha",
+            backendId: "backend",
+            selection: {
+              model: { providerId: "alpha", modelId: "a" },
+              effortId: "low",
+              fastMode: false
+            }
+          }],
+          seeded: true,
+          revision: { value: 7n }
+        },
         backends: [create(BackendSettingsSchema, {
           backendId: "backend", enabled: true, modelAccess: create(BackendModelAccessSettingsSchema, {})
         })]
@@ -6966,6 +6979,52 @@ describe("native current-task runtime controls", () => {
     await expect(app.setTaskPlanMode(authorityKey, true)).rejects.toThrow(/still pending/u);
     expect(network.submit).toHaveBeenCalledTimes(1);
     expect(network.waitOperation).toHaveBeenCalledTimes(1);
+  });
+
+  it("submits a shared model favorite with the exact settings revision and a body-free receipt", async () => {
+    const network = fakeNetwork();
+    const saved = memoryStorage(credential);
+    network.readOwner = vi.fn(async () => ({ connection, device, snapshot: runtimeControlProjection(runtimeSession, false) }));
+    network.readSession = vi.fn(async () => runtimeControlProjection(runtimeSession, true));
+    const app = client(network, saved.storage, undefined, undefined, ids());
+    await app.start();
+    const controls = app.taskRuntimeControls()!;
+
+    await expect(app.mutateTaskModelFavorite(controls.surfaceOwnerKey, controls.favoriteRevision, {
+      kind: "add",
+      item: {
+        favoriteId: "favorite-beta",
+        backendId: "backend",
+        providerId: "beta",
+        modelId: "b",
+        effortId: "high",
+        fastMode: true
+      }
+    })).resolves.toBe(true);
+
+    expect(saved.storage.savePending).toHaveBeenCalledBefore(network.submit as ReturnType<typeof vi.fn>);
+    expect(vi.mocked(network.submit).mock.calls[0]?.[2]).toMatchObject({
+      preconditions: [],
+      payload: {
+        case: "updateModelFavorites",
+        value: {
+          expectedRevision: { value: 7n },
+          change: {
+            case: "add",
+            value: {
+              favoriteId: "favorite-beta",
+              backendId: "backend",
+              selection: {
+                model: { providerId: "beta", modelId: "b" },
+                effortId: "high",
+                fastMode: true
+              }
+            }
+          }
+        }
+      }
+    });
+    expect(saved.pending()).toEqual([]);
   });
 
   it("reconciles a saved control receipt after restart without dispatching it again", async () => {

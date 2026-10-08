@@ -9076,6 +9076,30 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     }, true);
   }
 
+  async updateModelFavorites(
+    change: Parameters<OperationApi["updateModelFavorites"]>[0],
+    expectedRevision: bigint
+  ): Promise<void> {
+    const mapped = change.kind === "remove"
+      ? { case: "removeFavoriteId" as const, value: change.favoriteId }
+      : {
+          case: change.kind,
+          value: {
+            favoriteId: change.item.uid,
+            backendId: change.item.backendId,
+            selection: {
+              model: { providerId: change.item.providerId, modelId: change.item.modelId },
+              effortId: change.item.effort ?? "",
+              fastMode: change.item.fast === true
+            }
+          }
+        };
+    await this.submit({
+      case: "updateModelFavorites",
+      value: { expectedRevision: { value: expectedRevision }, change: mapped }
+    }, true);
+  }
+
   async resetPromptRecommendationSettings(): Promise<void> {
     await this.submit({
       case: "updatePromptRecommendationSettings",
@@ -17201,6 +17225,9 @@ function mapSettings(settings: SettingsSnapshot | undefined): SettingsView {
   if (settings.auxiliaryText?.revision === undefined) {
     throw new Error("Orchestrator returned incomplete auxiliary text settings.");
   }
+  if (settings.modelFavorites?.revision === undefined) {
+    throw new Error("Orchestrator returned incomplete model favorite settings.");
+  }
   return {
     revision: settings?.revision?.value ?? 0n,
     providers: (settings?.providers ?? []).map(mapProviderConfiguration),
@@ -17468,6 +17495,24 @@ function mapSettings(settings: SettingsSnapshot | undefined): SettingsView {
         revision: setting.revision.value
       };
     }),
+    modelFavorites: {
+      favorites: settings.modelFavorites.favorites.map((favorite) => {
+        if (favorite.favoriteId === "" || favorite.backendId === "" || favorite.selection?.model === undefined
+          || favorite.selection.model.providerId === "" || favorite.selection.model.modelId === "") {
+          throw new Error("Orchestrator returned an incomplete model favorite configuration.");
+        }
+        return {
+          uid: favorite.favoriteId,
+          backendId: favorite.backendId,
+          providerId: favorite.selection.model.providerId,
+          modelId: favorite.selection.model.modelId,
+          ...(favorite.selection.effortId === "" ? {} : { effort: favorite.selection.effortId }),
+          ...(favorite.selection.fastMode ? { fast: true as const } : {})
+        };
+      }),
+      seeded: settings.modelFavorites.seeded,
+      revision: settings.modelFavorites.revision.value
+    },
     auxiliaryText: {
       models: settings.auxiliaryText.models.map(({ backendId, providerId, modelId }) => ({ backendId, providerId, modelId })),
       automaticModels: settings.auxiliaryText.automaticModels.map(({ backendId, providerId, modelId }) => ({ backendId, providerId, modelId })),

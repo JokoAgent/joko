@@ -20,6 +20,7 @@ describe("MCP gateway", () => {
         auxiliaryText: { revision: { value: 0n }, runtimeRevision: "fixture:0" }, agentResource: {},
         collaboration: {},
         gitSafety: {},
+        modelFavorites: { revision: { value: 0n } },
         mcpServers: [{
           mcpServerId: "local-tools",
           displayName: "Local tools",

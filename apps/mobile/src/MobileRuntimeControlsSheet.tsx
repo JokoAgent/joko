@@ -18,19 +18,22 @@ import type { MobileSupportedLocale } from "./mobile-locale-preference";
 import { mobileMessage } from "./mobile-messages";
 import {
   assertMobileModelSelection,
+  assertMobileModelFavoriteMutation,
   defaultMobileModelSelection,
   filterMobileModelRoutes,
   formatMobileTokenLimit,
   mobilePermissionModeDescription,
   mobilePermissionModeLabel,
   type MobileModelControlSelection,
+  type MobileModelFavoriteConfiguration,
+  type MobileModelFavoriteMutation,
   type MobileModelRoute,
   type MobileRuntimeControls
 } from "./mobile-runtime-controls";
 
 type RuntimeControlsView =
   | { readonly kind: "root" }
-  | { readonly kind: "model"; readonly routeKey: string }
+  | { readonly kind: "model"; readonly routeKey: string; readonly favoriteId?: string }
   | { readonly kind: "permission" }
   | { readonly kind: "permission-confirm" };
 
@@ -42,6 +45,8 @@ export function MobileRuntimeControlsSheet({
   locale,
   onClose,
   onSetModel,
+  onMutateFavorite,
+  newFavoriteId,
   onSetPermission,
   onSetPlanMode,
   onError
@@ -53,6 +58,12 @@ export function MobileRuntimeControlsSheet({
   readonly locale: MobileSupportedLocale;
   readonly onClose: () => void;
   readonly onSetModel: (authorityKey: string, selection: MobileModelControlSelection) => Promise<boolean>;
+  readonly onMutateFavorite: (
+    surfaceOwnerKey: string,
+    expectedRevision: bigint,
+    change: MobileModelFavoriteMutation
+  ) => Promise<boolean>;
+  readonly newFavoriteId: () => string;
   readonly onSetPermission: (authorityKey: string, mode: PermissionMode) => Promise<boolean>;
   readonly onSetPlanMode: (authorityKey: string, enabled: boolean) => Promise<boolean>;
   readonly onError: (message: string) => void;
@@ -62,6 +73,8 @@ export function MobileRuntimeControlsSheet({
   const [selection, setSelection] = useState<MobileModelControlSelection>();
   const [settling, setSettling] = useState(false);
   const mountedRef = useRef(true);
+  const scrollRef = useRef<ScrollView>(null);
+  const rootScrollOffsetRef = useRef(0);
   const surfaceOwnerRef = useRef(controls?.surfaceOwnerKey);
   surfaceOwnerRef.current = controls?.surfaceOwnerKey;
   const keyboard = useMobileKeyboardState();
@@ -72,6 +85,9 @@ export function MobileRuntimeControlsSheet({
   );
   const activeRoute = view.kind === "model"
     ? controls?.models.find((route) => route.key === view.routeKey)
+    : undefined;
+  const activeFavorite = view.kind === "model" && view.favoriteId !== undefined
+    ? controls?.favorites.find((favorite) => favorite.favoriteId === view.favoriteId)
     : undefined;
   const disabled = busy || settling;
 
@@ -85,14 +101,21 @@ export function MobileRuntimeControlsSheet({
     setQuery("");
     setSelection(undefined);
     setSettling(false);
+    rootScrollOffsetRef.current = 0;
   }, [controls?.surfaceOwnerKey, visible]);
 
   useEffect(() => {
-    if (view.kind === "model" && activeRoute === undefined) {
+    if (view.kind === "model" && (activeRoute === undefined
+      || view.favoriteId !== undefined && activeFavorite === undefined)) {
       setView({ kind: "root" });
       setSelection(undefined);
     }
-  }, [activeRoute, view.kind]);
+  }, [activeFavorite, activeRoute, view]);
+
+  useEffect(() => {
+    if (view.kind !== "root") return;
+    requestAnimationFrame(() => scrollRef.current?.scrollTo({ y: rootScrollOffsetRef.current, animated: false }));
+  }, [view.kind]);
 
   if (!controls) return null;
 
@@ -105,10 +128,13 @@ export function MobileRuntimeControlsSheet({
     }
   };
 
-  const openModel = (route: MobileModelRoute): void => {
+  const openModel = (route: MobileModelRoute, favorite?: MobileModelFavoriteConfiguration): void => {
     if (disabled) return;
-    setSelection(defaultMobileModelSelection(controls, route));
-    setView({ kind: "model", routeKey: route.key });
+    setSelection(favorite === undefined
+      ? defaultMobileModelSelection(controls, route)
+      : favoriteModelSelection(controls, route, favorite));
+    setView({ kind: "model", routeKey: route.key,
+      ...(favorite === undefined ? {} : { favoriteId: favorite.favoriteId }) });
   };
 
   const settle = async (action: (authorityKey: string) => Promise<boolean>): Promise<void> => {
@@ -135,6 +161,24 @@ export function MobileRuntimeControlsSheet({
     } catch {
       onError(mobileMessage(locale, "controls.modelInvalid"));
     }
+  };
+
+  const mutateFavorite = (change: MobileModelFavoriteMutation): void => {
+    if (disabled) return;
+    let validated: MobileModelFavoriteMutation;
+    try { validated = assertMobileModelFavoriteMutation(controls, change); }
+    catch { onError(mobileMessage(locale, "controls.favoriteInvalid")); return; }
+    const surfaceOwnerKey = controls.surfaceOwnerKey;
+    const expectedRevision = controls.favoriteRevision;
+    setSettling(true);
+    onError("");
+    void onMutateFavorite(surfaceOwnerKey, expectedRevision, validated).then((completed) => {
+      if (!completed || !mountedRef.current || surfaceOwnerRef.current !== surfaceOwnerKey) return;
+      setView({ kind: "root" });
+      setSelection(undefined);
+    }).catch((error) => {
+      if (mountedRef.current && surfaceOwnerRef.current === surfaceOwnerKey) onError(errorText(error, locale));
+    }).finally(() => { if (mountedRef.current) setSettling(false); });
   };
 
   const choosePermission = (mode: PermissionMode): void => {
@@ -170,14 +214,24 @@ export function MobileRuntimeControlsSheet({
           </View>
           <IconButton label={mobileMessage(locale, "controls.close")} text="×" disabled={disabled} colors={colors} onPress={onClose} />
         </View>
-        <ScrollView keyboardShouldPersistTaps="handled" contentContainerStyle={styles.content}>
+        <ScrollView ref={scrollRef} keyboardShouldPersistTaps="handled" contentContainerStyle={styles.content}
+          scrollEventThrottle={16} onScroll={(event) => {
+            if (view.kind === "root") rootScrollOffsetRef.current = event.nativeEvent.contentOffset.y;
+          }}>
           {view.kind === "root" && <RootControls controls={controls} routes={routes} query={query}
             disabled={disabled} colors={colors} locale={locale} onQuery={setQuery} onOpenModel={openModel}
             onOpenPermission={() => setView({ kind: "permission" })}
             onSetPlanMode={(enabled) => void settle((authorityKey) => onSetPlanMode(authorityKey, enabled))} />}
           {view.kind === "model" && activeRoute && selection && <ModelOptions route={activeRoute}
-            controls={controls} selection={selection} disabled={disabled} colors={colors} locale={locale}
-            onSelection={setSelection} onApply={applyModel} />}
+            controls={controls} selection={selection} favorite={activeFavorite} disabled={disabled} colors={colors} locale={locale}
+            onSelection={setSelection} onApply={applyModel}
+            onSaveFavorite={() => activeFavorite && mutateFavorite({ kind: "replace", item: {
+              favoriteId: activeFavorite.favoriteId, backendId: activeFavorite.backendId, ...selection
+            } })}
+            onAddFavorite={() => mutateFavorite({ kind: "add", item: {
+              favoriteId: newFavoriteId(), backendId: controls.backend.backendId, ...selection
+            } })}
+            onRemoveFavorite={() => activeFavorite && mutateFavorite({ kind: "remove", favoriteId: activeFavorite.favoriteId })} />}
           {view.kind === "permission" && <PermissionOptions controls={controls} disabled={disabled} locale={locale}
             colors={colors} onSelect={choosePermission} />}
           {view.kind === "permission-confirm" && <PermissionConfirmation disabled={disabled} colors={colors} locale={locale}
@@ -197,13 +251,19 @@ function RootControls({ controls, routes, query, disabled, colors, locale, onQue
   readonly colors: MobileInteractionSheetColors;
   readonly locale: MobileSupportedLocale;
   readonly onQuery: (query: string) => void;
-  readonly onOpenModel: (route: MobileModelRoute) => void;
+  readonly onOpenModel: (route: MobileModelRoute, favorite?: MobileModelFavoriteConfiguration) => void;
   readonly onOpenPermission: () => void;
   readonly onSetPlanMode: (enabled: boolean) => void;
 }) {
   const current = controls.currentModel;
   const configurableCurrent = current?.route !== undefined && current.selectable
     && (controls.canSetEffort || controls.canSetFastMode);
+  const favoriteRows = controls.favorites.flatMap((favorite) => {
+    const route = controls.models.find((candidate) => candidate.providerId === favorite.providerId
+      && candidate.modelId === favorite.modelId);
+    if (route === undefined || !mobileModelRouteMatchesQuery(route, query)) return [];
+    return [{ favorite, route }];
+  });
   let previousProvider = "";
   return <View style={styles.stack}>
     <SectionTitle label={mobileMessage(locale, "common.model")} colors={colors} />
@@ -229,6 +289,24 @@ function RootControls({ controls, routes, query, disabled, colors, locale, onQue
       <TextInput accessibilityLabel={mobileMessage(locale, "controls.searchModelsLabel")} value={query} editable={!disabled}
         onChangeText={onQuery} placeholder={mobileMessage(locale, "controls.searchModels")} placeholderTextColor={colors.muted}
         style={[styles.search, { color: colors.ink, borderColor: colors.border, backgroundColor: colors.background }]} />
+      {favoriteRows.length > 0 && <>
+        <Text style={[styles.providerHeading, { color: colors.muted }]}>{mobileMessage(locale, "controls.favorites")}</Text>
+        {favoriteRows.map(({ favorite, route }) => {
+          const selected = sameModelConfiguration(current, favorite);
+          return <Pressable key={favorite.favoriteId} accessibilityRole="radio" accessibilityState={{ selected, disabled }}
+            disabled={disabled} accessibilityLabel={`${route.displayName}, ${mobileMessage(locale, "controls.savedFavorite")}`}
+            onPress={() => onOpenModel(route, favorite)}
+            style={[styles.routeRow, { borderColor: selected ? colors.accent : colors.border }, disabled && styles.disabled]}>
+            <View style={styles.flex}>
+              <Text style={[styles.rowLabel, { color: colors.ink }]}>★ {route.displayName}</Text>
+              <Text style={[styles.caption, { color: colors.muted }]}>{favorite.effortId
+                ? mobileMessage(locale, "controls.effortValue", { effort: favorite.effortId })
+                : mobileMessage(locale, "controls.defaultEffort")}{favorite.fastMode ? mobileMessage(locale, "controls.fastSuffix") : ""}</Text>
+            </View>
+            <Text style={[styles.disclosure, { color: selected ? colors.accent : colors.muted }]}>{selected ? "✓" : "›"}</Text>
+          </Pressable>;
+        })}
+      </>}
       {routes.map((route) => {
         const showProvider = route.providerId !== previousProvider;
         previousProvider = route.providerId;
@@ -281,15 +359,20 @@ function RootControls({ controls, routes, query, disabled, colors, locale, onQue
   </View>;
 }
 
-function ModelOptions({ route, controls, selection, disabled, colors, locale, onSelection, onApply }: {
+function ModelOptions({ route, controls, selection, favorite, disabled, colors, locale, onSelection, onApply,
+  onSaveFavorite, onAddFavorite, onRemoveFavorite }: {
   readonly route: MobileModelRoute;
   readonly controls: MobileRuntimeControls;
   readonly selection: MobileModelControlSelection;
+  readonly favorite?: MobileModelFavoriteConfiguration;
   readonly disabled: boolean;
   readonly colors: MobileInteractionSheetColors;
   readonly locale: MobileSupportedLocale;
   readonly onSelection: (selection: MobileModelControlSelection) => void;
   readonly onApply: () => void;
+  readonly onSaveFavorite: () => void;
+  readonly onAddFavorite: () => void;
+  readonly onRemoveFavorite: () => void;
 }) {
   let selectionValid = true;
   let validationError: string | undefined;
@@ -302,6 +385,18 @@ function ModelOptions({ route, controls, selection, disabled, colors, locale, on
       && (current.fastMode ?? false) === selection.fastMode;
     if (!unchanged) validationError = mobileMessage(locale, "controls.modelInvalid");
   }
+  const favoriteConfiguration = {
+    favoriteId: favorite?.favoriteId ?? "",
+    backendId: controls.backend.backendId,
+    ...selection
+  } satisfies MobileModelFavoriteConfiguration;
+  const duplicateFavorite = controls.favorites.some((candidate) => candidate.favoriteId !== favorite?.favoriteId
+    && sameModelConfiguration(candidate, favoriteConfiguration));
+  const favoriteUnchanged = favorite !== undefined && sameModelConfiguration(favorite, favoriteConfiguration);
+  const favoriteSelectionValid = route.providerId === selection.providerId && route.modelId === selection.modelId
+    && (selection.effortId === undefined || controls.canSetEffort
+      && route.efforts.some((effort) => effort.id === selection.effortId))
+    && (!selection.fastMode || controls.canSetFastMode && route.supportsFastMode);
   return <View style={styles.stack}>
     <View style={[styles.currentCard, { borderColor: colors.border, backgroundColor: colors.background }]}>
       <Text style={[styles.modelTitle, { color: colors.ink }]}>{route.displayName}</Text>
@@ -332,8 +427,20 @@ function ModelOptions({ route, controls, selection, disabled, colors, locale, on
       </View>
     </>}
     {validationError && <Text accessibilityRole="alert" style={[styles.warning, { color: colors.negative }]}>{validationError}</Text>}
-    <SheetButton label={mobileMessage(locale, "controls.applyModel")} disabled={disabled || !selectionValid}
-      colors={colors} onPress={onApply} />
+    <View style={styles.actions}>
+      <SheetButton label={mobileMessage(locale, "controls.applyModel")} disabled={disabled || !selectionValid}
+        colors={colors} onPress={onApply} />
+      {favorite === undefined
+        ? <SheetButton label={mobileMessage(locale, "controls.addFavorite")}
+            disabled={disabled || !favoriteSelectionValid || duplicateFavorite} colors={colors} onPress={onAddFavorite} />
+        : <>
+            <SheetButton label={mobileMessage(locale, "controls.saveFavorite")}
+              disabled={disabled || !favoriteSelectionValid || favoriteUnchanged || duplicateFavorite}
+              colors={colors} onPress={onSaveFavorite} />
+            <SheetButton label={mobileMessage(locale, "controls.removeFavorite")} quiet disabled={disabled}
+              colors={colors} onPress={onRemoveFavorite} />
+          </>}
+    </View>
   </View>;
 }
 
@@ -423,6 +530,48 @@ function SheetButton({ label, disabled, quiet, danger, colors, onPress }: {
     style={[styles.button, quiet && { borderWidth: 1, borderColor: colors.border }, { backgroundColor }]}>
     <Text style={[styles.buttonText, { color }]}>{label}</Text>
   </Pressable>;
+}
+
+function favoriteModelSelection(
+  controls: MobileRuntimeControls,
+  route: MobileModelRoute,
+  favorite: MobileModelFavoriteConfiguration
+): MobileModelControlSelection {
+  const favoriteEffort = controls.canSetEffort && favorite.effortId !== undefined
+    && route.efforts.some((effort) => effort.id === favorite.effortId)
+    ? favorite.effortId
+    : undefined;
+  const defaultEffort = route.efforts.find((effort) => effort.default)?.id ?? route.efforts[0]?.id;
+  return {
+    providerId: route.providerId,
+    modelId: route.modelId,
+    ...(controls.canSetEffort && (favoriteEffort ?? defaultEffort) !== undefined
+      ? { effortId: favoriteEffort ?? defaultEffort }
+      : {}),
+    fastMode: controls.canSetFastMode && route.supportsFastMode && favorite.fastMode
+  };
+}
+
+function mobileModelRouteMatchesQuery(route: MobileModelRoute, query: string): boolean {
+  const needle = query.trim().toLocaleLowerCase("en-US");
+  return needle.length === 0 || [
+    route.displayName,
+    route.modelId,
+    route.providerName,
+    route.providerId,
+    route.family
+  ].some((value) => value.toLocaleLowerCase("en-US").includes(needle));
+}
+
+function sameModelConfiguration(
+  left: Pick<MobileModelControlSelection, "providerId" | "modelId" | "effortId" | "fastMode"> | undefined,
+  right: Pick<MobileModelControlSelection, "providerId" | "modelId" | "effortId" | "fastMode">
+): boolean {
+  return left !== undefined
+    && left.providerId === right.providerId
+    && left.modelId === right.modelId
+    && (left.effortId ?? "") === (right.effortId ?? "")
+    && left.fastMode === right.fastMode;
 }
 
 function errorText(error: unknown, locale: MobileSupportedLocale): string {

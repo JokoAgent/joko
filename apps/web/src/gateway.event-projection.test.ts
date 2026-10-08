@@ -2490,13 +2490,18 @@ describe("incremental event projection", () => {
 });
 
 describe("provider and model projection", () => {
+  const currentSettings = {
+    auxiliaryText: { revision: { value: 0n }, runtimeRevision: "fixture:0" },
+    agentResource: {},
+    collaboration: {},
+    gitSafety: {},
+    modelFavorites: { revision: { value: 0n } }
+  } as const;
+
   it("accepts only exact Browser automation targets from settings snapshots", () => {
     const snapshotFor = (automationTarget: BrowserAutomationTarget) => create(SnapshotSchema, {
       settings: {
-        auxiliaryText: { revision: { value: 0n }, runtimeRevision: "fixture:0" },
-        agentResource: {},
-        collaboration: {},
-        gitSafety: {},
+        ...currentSettings,
         browsers: [{ browserProviderId: "browser", automationTarget }]
       }
     });
@@ -2511,7 +2516,7 @@ describe("provider and model projection", () => {
     const snapshot = mapSnapshot(create(SnapshotSchema, {
       providers: [{ backendId: "backend-custom", providerId: "custom", displayName: "Custom", kind: ProviderKind.CUSTOM_ENDPOINT, apiCompatibility: ProviderApiCompatibility.OPENAI_RESPONSES, authenticationState: AuthenticationState.AUTHENTICATED, endpointDisplay: "https://example.test/v1", supportsLogin: true, loginMethods: [ProviderLoginMethod.API_KEY], supportsLogout: true, supportsRefresh: true, capabilities: { schemaVersion: "joko.provider.v1", capabilities: [{ name: "provider.account_usage", support: CapabilitySupport.SUPPORTED }] }, accountUsage: { providerId: "custom", primaryWindow: { usedPercent: 42, windowMinutes: 300, resetAt: { seconds: 1_800_003_600n } }, secondaryWindow: { usedPercent: 75, windowMinutes: 10_080 }, limitReached: false, planType: "pro", credits: { hasCredits: true, unlimited: false, balance: "4.50", observedAt: { seconds: 1_800_000_000n } }, observedAt: { seconds: 1_800_000_000n } }, rateLimit: { limited: false, requestLimit: 100n, requestsRemaining: 77n, tokenLimit: 1_000n, tokensRemaining: 800n }, usage: { providerId: "custom", usage: { inputTokens: 12n, outputTokens: 8n, costMicros: 25_000n, currencyCode: "USD" }, estimated: true } }],
       models: [{ backendId: "backend-custom", key: { providerId: "custom", modelId: "model-a" }, displayName: "Model A", contextWindowTokens: 128_000n, maximumOutputTokens: 16_000n, inputModalities: [ModelInputModality.TEXT, ModelInputModality.IMAGE, ModelInputModality.FILE], outputModalities: [ModelOutputModality.TEXT], supportsFastMode: true, available: true, inputCostMicrosPerMillion: 10n, outputCostMicrosPerMillion: 20n, currencyCode: "USD", effortLevels: [{ effortId: "high", order: 1 }] }],
-      settings: { auxiliaryText: { revision: { value: 0n }, runtimeRevision: "fixture:0" }, agentResource: {}, collaboration: {}, gitSafety: {}, providers: [{ providerId: "custom", displayName: "Custom", kind: ProviderKind.CUSTOM_ENDPOINT, enabled: true, version: { revision: { value: 3n } }, runtimes: [{ backendId: "backend-custom", credentialOrigin: "https://example.test", apiCompatibility: ProviderApiCompatibility.OPENAI_RESPONSES, endpoint: "https://example.test/v1", authHeader: true, headers: [{ headerName: "X-Key", environmentName: "CUSTOM_KEY" }], models: [{ modelId: "model-a", displayName: "Model A", reasoning: true, inputModalities: [ModelInputModality.TEXT, ModelInputModality.IMAGE], contextWindowTokens: 128_000n, maximumOutputTokens: 16_000n, inputCostMicrosPerMillion: 10n, outputCostMicrosPerMillion: 20n, cacheReadCostMicrosPerMillion: 2n, cacheWriteCostMicrosPerMillion: 3n, thinkingLevels: [{ effortId: "high", nativeLevel: "xhigh" }], sampling: { temperature: 0.2, topP: 0.9, seed: 4n }, compatibility: { supportsDeveloperRole: true, supportsStrictTools: false, thinkingFormat: "openai" }, supportsFastMode: true, supportsTools: false }] }] }] }
+      settings: { ...currentSettings, providers: [{ providerId: "custom", displayName: "Custom", kind: ProviderKind.CUSTOM_ENDPOINT, enabled: true, version: { revision: { value: 3n } }, runtimes: [{ backendId: "backend-custom", credentialOrigin: "https://example.test", apiCompatibility: ProviderApiCompatibility.OPENAI_RESPONSES, endpoint: "https://example.test/v1", authHeader: true, headers: [{ headerName: "X-Key", environmentName: "CUSTOM_KEY" }], models: [{ modelId: "model-a", displayName: "Model A", reasoning: true, inputModalities: [ModelInputModality.TEXT, ModelInputModality.IMAGE], contextWindowTokens: 128_000n, maximumOutputTokens: 16_000n, inputCostMicrosPerMillion: 10n, outputCostMicrosPerMillion: 20n, cacheReadCostMicrosPerMillion: 2n, cacheWriteCostMicrosPerMillion: 3n, thinkingLevels: [{ effortId: "high", nativeLevel: "xhigh" }], sampling: { temperature: 0.2, topP: 0.9, seed: 4n }, compatibility: { supportsDeveloperRole: true, supportsStrictTools: false, thinkingFormat: "openai" }, supportsFastMode: true, supportsTools: false }] }] }] }
     }));
     expect(snapshot.providers[0]).toMatchObject({ backendId: "backend-custom", authenticationState: "authenticated", supportsLogin: true, loginMethods: ["apiKey"], supportsLogout: true, supportsRefresh: true, capabilities: new Set(["provider.account_usage"]), accountUsage: { planType: "pro", limitReached: false, primaryWindow: { usedPercent: 42, windowMinutes: 300, resetAt: 1_800_003_600_000 }, secondaryWindow: { usedPercent: 75, windowMinutes: 10_080 }, credits: { hasCredits: true, unlimited: false, balance: "4.50", observedAt: 1_800_000_000_000 } }, rateLimit: { requestLimit: 100, requestsRemaining: 77 }, usage: { inputTokens: 12, outputTokens: 8, cost: 0.025, currency: "USD", estimated: true } });
     expect(snapshot.models[0]).toMatchObject({ backendId: "backend-custom", inputModalities: ["text", "image", "file"], outputModalities: ["text"], maximumOutputTokens: 16_000, inputCostMicrosPerMillion: 10, supportsFast: true });
@@ -2555,9 +2560,7 @@ describe("provider and model projection", () => {
         { backendId: "backend-access", key: { providerId: "provider-enabled", modelId: "model-b" }, displayName: "Model B", available: true }
       ],
       settings: {
-        auxiliaryText: { revision: { value: 0n }, runtimeRevision: "fixture:0" }, agentResource: {},
-        collaboration: {},
-        gitSafety: {},
+        ...currentSettings,
         backends: [{
           backendId: "backend-access",
           enabled: true,
@@ -2584,9 +2587,7 @@ describe("provider and model projection", () => {
       providers: [{ backendId: "backend-access", providerId: "provider-disabled", displayName: "Disabled Provider", ownerManaged: true }],
       models: [{ backendId: "backend-access", key: { providerId: "provider-disabled", modelId: "model-a" }, displayName: "Model A", available: true }],
       settings: {
-        auxiliaryText: { revision: { value: 0n }, runtimeRevision: "fixture:0" }, agentResource: {},
-        collaboration: {},
-        gitSafety: {},
+        ...currentSettings,
         providers: [{
           providerId: "provider-disabled",
           displayName: "Disabled Provider",
@@ -2616,15 +2617,13 @@ describe("provider and model projection", () => {
       resumeCursor: { generation: 1n, sequence: 0n },
       providers: [{ backendId: "backend-event", providerId: provider.providerId, displayName: provider.displayName, ownerManaged: true }],
       models: [{ backendId: "backend-event", key: { providerId: provider.providerId, modelId: "model-event" }, displayName: "Event Model", available: true }],
-      settings: { auxiliaryText: { revision: { value: 0n }, runtimeRevision: "fixture:0" }, agentResource: {}, collaboration: {}, gitSafety: {}, providers: [provider] }
+      settings: { ...currentSettings, providers: [provider] }
     });
     const event = create(EventSchema, {
       eventId: "settings-provider-disabled",
       cursor: { generation: 1n, sequence: 1n },
       payload: { kind: { case: "settingsChanged", value: { settings: {
-        auxiliaryText: { revision: { value: 0n }, runtimeRevision: "fixture:0" }, agentResource: {},
-        collaboration: {},
-        gitSafety: {},
+        ...currentSettings,
         providers: [{ ...provider, enabled: false, version: { revision: { value: 2n } } }]
       } } } }
     });
@@ -2646,9 +2645,7 @@ describe("provider and model projection", () => {
         { backendId: "backend-native", key: { providerId: "provider-shared", modelId: "native-model" }, displayName: "Native Model", available: true }
       ],
       settings: {
-        auxiliaryText: { revision: { value: 0n }, runtimeRevision: "fixture:0" }, agentResource: {},
-        collaboration: {},
-        gitSafety: {},
+        ...currentSettings,
         providers: [{
           providerId: "provider-shared",
           displayName: "Managed Provider",
@@ -2690,15 +2687,13 @@ describe("provider and model projection", () => {
         { backendId: "backend-managed", key: { providerId: configuredProvider.providerId, modelId: "managed-model" }, displayName: "Managed Model", available: true },
         { backendId: "backend-native", key: { providerId: configuredProvider.providerId, modelId: "native-model" }, displayName: "Native Model", available: true }
       ],
-      settings: { auxiliaryText: { revision: { value: 0n }, runtimeRevision: "fixture:0" }, agentResource: {}, collaboration: {}, gitSafety: {}, providers: [configuredProvider] }
+      settings: { ...currentSettings, providers: [configuredProvider] }
     });
     const event = create(EventSchema, {
       eventId: "settings-shared-provider-disabled",
       cursor: { generation: 1n, sequence: 1n },
       payload: { kind: { case: "settingsChanged", value: { settings: {
-        auxiliaryText: { revision: { value: 0n }, runtimeRevision: "fixture:0" }, agentResource: {},
-        collaboration: {},
-        gitSafety: {},
+        ...currentSettings,
         providers: [{ ...configuredProvider, enabled: false, version: { revision: { value: 2n } } }]
       } } } }
     });

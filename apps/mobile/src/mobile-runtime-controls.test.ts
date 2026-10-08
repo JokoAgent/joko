@@ -29,6 +29,7 @@ import {
 } from "@joko/contracts";
 import { describe, expect, it } from "vitest";
 import {
+  assertMobileModelFavoriteMutation,
   assertMobileModelSelection,
   assertMobilePermissionMode,
   assertMobilePlanMode,
@@ -187,6 +188,44 @@ describe("mobile runtime controls", () => {
     })).toThrow(/Fast Mode/u);
   });
 
+  it("projects shared favorites and validates one exact favorite mutation", () => {
+    const { owner, detail } = snapshots();
+    const controls = resolveMobileRuntimeControls(identity, owner, detail, "session")!;
+    expect(controls.favorites).toEqual([{
+      favoriteId: "favorite-alpha",
+      backendId: "backend",
+      providerId: "alpha",
+      modelId: "a",
+      effortId: "low",
+      fastMode: false
+    }]);
+    expect(controls.favoriteRevision).toBe(9n);
+    expect(controls.favoritesSeeded).toBe(true);
+    expect(assertMobileModelFavoriteMutation(controls, {
+      kind: "remove",
+      favoriteId: "favorite-alpha"
+    })).toEqual({ kind: "remove", favoriteId: "favorite-alpha" });
+    expect(assertMobileModelFavoriteMutation(controls, {
+      kind: "replace",
+      item: { ...controls.favorites[0]!, effortId: "high" }
+    })).toEqual({
+      kind: "replace",
+      item: { ...controls.favorites[0]!, effortId: "high" }
+    });
+    expect(() => assertMobileModelFavoriteMutation(controls, {
+      kind: "add",
+      item: { ...controls.favorites[0]!, favoriteId: "duplicate-configuration" }
+    })).toThrow(/already saved/u);
+    expect(() => assertMobileModelFavoriteMutation(controls, {
+      kind: "replace",
+      item: { ...controls.favorites[0]!, favoriteId: "stale-favorite" }
+    })).toThrow(/no longer available/u);
+    expect(() => assertMobileModelFavoriteMutation(controls, {
+      kind: "replace",
+      item: { ...controls.favorites[0]!, providerId: "different-provider" }
+    })).toThrow(/route identity cannot change/u);
+  });
+
   it("trusts image input only from one exact current or frozen default model route", () => {
     const vision = model("alpha", "a", "Alpha Vision", {
       inputs: [ModelInputModality.TEXT, ModelInputModality.IMAGE]
@@ -270,6 +309,19 @@ function snapshots(input: {
   };
   const settings = {
     revision: { value: 6n },
+    modelFavorites: {
+      favorites: [{
+        favoriteId: "favorite-alpha",
+        backendId: "backend",
+        selection: {
+          model: { providerId: "alpha", modelId: "a" },
+          effortId: "low",
+          fastMode: false
+        }
+      }],
+      seeded: true,
+      revision: { value: 9n }
+    },
     backends: [{
       backendId: "backend",
       enabled: true,

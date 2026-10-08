@@ -4722,6 +4722,25 @@ export interface VoiceInputRefinementContextView {
   readonly instructions?: string;
 }
 
+export interface ModelFavoriteConfigurationView {
+  readonly uid: string;
+  readonly backendId: string;
+  readonly providerId: string;
+  readonly modelId: string;
+  readonly effort?: string;
+  readonly fast?: true;
+}
+
+export interface ModelFavoriteSettingsView {
+  readonly favorites: readonly ModelFavoriteConfigurationView[];
+  readonly seeded: boolean;
+  readonly revision: bigint;
+}
+
+export type ModelFavoriteMutationView =
+  | { readonly kind: "add" | "replace" | "seed"; readonly item: ModelFavoriteConfigurationView }
+  | { readonly kind: "remove"; readonly favoriteId: string };
+
 export interface SettingsView {
   readonly revision: bigint;
   readonly providers: readonly ProviderConfigurationView[];
@@ -4790,6 +4809,7 @@ export interface SettingsView {
   };
   readonly auxiliaryText: AuxiliaryTextSettingsView;
   readonly subagentModels: readonly SubagentModelSettingsView[];
+  readonly modelFavorites: ModelFavoriteSettingsView;
   readonly promptRecommendation: {
     readonly enabled: boolean;
     readonly available: boolean;
@@ -6383,6 +6403,7 @@ export interface OperationApi extends VoiceDictionaryPeerApi {
   updateAuxiliaryTextSettings(models: readonly ModelRouteRefView[], expectedRevision: bigint): Promise<void>;
   updateSubagentModelSettings(backendId: string, model: SubagentModelSettingsView["model"], expectedRevision: bigint): Promise<void>;
   updateSubagentSmartRouting(backendId: string, enabled: boolean, expectedRevision: bigint): Promise<void>;
+  updateModelFavorites(change: ModelFavoriteMutationView, expectedRevision: bigint): Promise<void>;
   resetPromptRecommendationSettings(): Promise<void>;
   updateLanguageToolSettings(enabled: boolean): Promise<void>;
   updateToolPolicySettings(
@@ -6577,6 +6598,7 @@ export function emptySnapshot(): AppSnapshot {
         customizedFields: []
       },
       subagentModels: [],
+      modelFavorites: { favorites: [], seeded: false, revision: 0n },
       auxiliaryText: {
         models: [], automaticModels: [], options: [], available: false,
         unavailableReason: "Auxiliary text routing is unavailable.", revision: 0n, runtimeRevision: ""

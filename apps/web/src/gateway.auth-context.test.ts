@@ -949,7 +949,13 @@ describe("Backend-neutral native session discovery", () => {
 });
 
 describe("authoritative session context state", () => {
-  const governance = { auxiliaryText: { revision: { value: 0n }, runtimeRevision: "fixture:0" }, agentResource: {}, collaboration: {}, gitSafety: {} } as const;
+  const governance = {
+    auxiliaryText: { revision: { value: 0n }, runtimeRevision: "fixture:0" },
+    agentResource: {},
+    collaboration: {},
+    gitSafety: {},
+    modelFavorites: { revision: { value: 0n } }
+  } as const;
   const session = {
     sessionId: "session-1",
     backendId: "pi-1",

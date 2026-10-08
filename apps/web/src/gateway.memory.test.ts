@@ -22,6 +22,7 @@ describe("OrchestratorGateway Memory reset scopes", () => {
         agentResource: {},
         collaboration: {},
         gitSafety: {},
+        modelFavorites: { revision: { value: 0n } },
         memory: {
           makerEnabled: false,
           makerSupport: CapabilitySupport.SUPPORTED,
@@ -55,6 +56,7 @@ describe("OrchestratorGateway Memory reset scopes", () => {
         agentResource: {},
         collaboration: {},
         gitSafety: {},
+        modelFavorites: { revision: { value: 0n } },
         memory: {
           backends: [{
             backendId: "claude-code",

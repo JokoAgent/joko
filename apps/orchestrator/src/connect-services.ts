@@ -398,6 +398,7 @@ import {
 import type { SessionNavigationCoordinator } from "./session-navigation-coordinator.js";
 import type { AuxiliaryTextRouting } from "./auxiliary-text-routing.js";
 import type { SubagentModelSettings } from "./subagent-model-settings.js";
+import type { ModelFavoriteSettings } from "./model-favorite-settings.js";
 import {
   evaluateSessionProjectPlacement,
   SessionProjectPlacementError,
@@ -535,6 +536,7 @@ interface ConnectServiceDependencies {
   readonly promptPrediction?: PromptPredictionService;
   readonly auxiliaryText?: AuxiliaryTextRouting;
   readonly subagentModels?: SubagentModelSettings;
+  readonly modelFavorites?: ModelFavoriteSettings;
   readonly holdSubagentSmartRoutingDispatch?: (backendId: string) => void;
   readonly refreshSubagentSmartRouting?: (backendId: string) => Promise<void>;
   readonly sessionNavigation?: SessionNavigationCoordinator;
@@ -1271,6 +1273,7 @@ export function createConnectServices(application: OrchestratorApplication, proj
     ...(application.promptPrediction === undefined ? {} : { promptPrediction: application.promptPrediction }),
     ...(application.auxiliaryText === undefined ? {} : { auxiliaryText: application.auxiliaryText }),
     ...(application.subagentModels === undefined ? {} : { subagentModels: application.subagentModels }),
+    modelFavorites: application.modelFavorites,
     ...(application.sessionNavigation === undefined ? {} : { sessionNavigation: application.sessionNavigation }),
     ...(application.reviewCoordinator === undefined ? {} : { reviewCoordinator: application.reviewCoordinator }),
     ...(application.remoteHosts === undefined ? {} : { remoteHosts: application.remoteHosts }),
@@ -13427,6 +13430,25 @@ function settingsSnapshot(dependencies: ConnectServiceDependencies): contract.Se
       runtimeRevision: setting.runtimeRevision,
       revision: toProtoRevision(setting.revision)
     })),
+    modelFavorites: (() => {
+      const settings = dependencies.modelFavorites?.snapshot() ?? { favorites: [], seeded: false, revision: 0n };
+      return create(contract.ModelFavoriteSettingsSchema, {
+        favorites: settings.favorites.map((favorite) => create(contract.ModelFavoriteConfigurationSchema, {
+          favoriteId: favorite.favoriteId,
+          backendId: favorite.backendId,
+          selection: create(contract.ModelSelectionSchema, {
+            model: create(contract.ModelKeySchema, {
+              providerId: favorite.providerId,
+              modelId: favorite.modelId
+            }),
+            effortId: favorite.effortId ?? "",
+            fastMode: favorite.fastMode
+          })
+        })),
+        seeded: settings.seeded,
+        revision: toProtoRevision(settings.revision)
+      });
+    })(),
     promptRecommendation: create(contract.PromptRecommendationSettingsSchema, {
       enabled: promptRecommendation.enabled,
       available: promptRecommendation.available,
@@ -19437,6 +19459,40 @@ async function dispatchMutation(
       if (!execution.replayed && smartRoutingEnabled !== undefined) {
         await dependencies.refreshSubagentSmartRouting?.(backendId);
       }
+      return presented(execution);
+    }
+    case "updateModelFavorites": {
+      const owner = dependencies.modelFavorites;
+      const expectedRevision = payload.value.expectedRevision?.value;
+      if (expectedRevision === undefined) throw invalidArgument("update_model_favorites.expected_revision is required");
+      if (owner === undefined) {
+        return unsupportedOperation(dependencies, operationId, connection, mutation, payload.case,
+          "Model favorite settings are not configured on this Orchestrator node.");
+      }
+      const change = payload.value.change;
+      if (change.case === undefined) throw invalidArgument("update_model_favorites.change is required");
+      const item = change.case === "removeFavoriteId" ? undefined : change.value;
+      if (item !== undefined && (item.selection === undefined || item.selection.model === undefined)) {
+        throw invalidArgument(`update_model_favorites.${change.case}.selection.model is required`);
+      }
+      const modelFavorite = item === undefined ? undefined : {
+        favoriteId: item.favoriteId,
+        backendId: item.backendId,
+        providerId: item.selection!.model!.providerId,
+        modelId: item.selection!.model!.modelId,
+        ...(item.selection!.effortId === "" ? {} : { effortId: item.selection!.effortId }),
+        fastMode: item.selection!.fastMode
+      };
+      const requested = change.case === "removeFavoriteId"
+        ? { kind: "remove" as const, favoriteId: change.value }
+        : { kind: change.case, item: modelFavorite! };
+      const execution = await host.mutate({
+        operationId, connection, kind: payload.case, body: mutation,
+        commit: () => {
+          owner.mutate(requested, expectedRevision);
+          return { accepted: true, resultCase: "settings" } satisfies OperationOutcome;
+        }
+      });
       return presented(execution);
     }
     case "updatePromptRecommendationSettings": {

@@ -3457,6 +3457,7 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
   const composerOperationPending = appCommandRunning || appCommandReceiptPending;
   const runtimeControlPending = state.pending.some((item) => item.sessionId === state.selectedId
     && ["session-model", "session-permission", "session-plan", "session-compact", "session-branch"].includes(item.kind));
+  const modelFavoritePending = state.pending.some((item) => item.kind === "model-favorite");
   const contextPending = runtimeControlPending;
   const nativeTreePending = runtimeControlPending;
   const runtimeControlsAvailable = runtimeControls !== undefined && (runtimeControls.canSwitchModel
@@ -5898,9 +5899,15 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
       }}
       onError={setLocalError} />
     <MobileRuntimeControlsSheet visible={runtimeControlsVisible && runtimeControls !== undefined} locale={locale}
-      controls={runtimeControls} busy={state.busy || runtimeControlPending || attachmentBusy} colors={colors}
+      controls={runtimeControls} busy={state.busy || runtimeControlPending || modelFavoritePending || attachmentBusy} colors={colors}
       onClose={() => setRuntimeControlsVisible(false)}
       onSetModel={(authorityKey, selection) => client.setTaskModel(authorityKey, selection)}
+      onMutateFavorite={(surfaceOwnerKey, expectedRevision, change) => client.mutateTaskModelFavorite(
+        surfaceOwnerKey,
+        expectedRevision,
+        change
+      )}
+      newFavoriteId={() => client.newModelFavoriteId()}
       onSetPermission={(authorityKey, mode) => client.setTaskPermission(authorityKey, mode)}
       onSetPlanMode={(authorityKey, enabled) => client.setTaskPlanMode(authorityKey, enabled)}
       onError={setLocalError} />

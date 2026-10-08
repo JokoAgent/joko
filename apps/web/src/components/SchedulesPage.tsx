@@ -1018,6 +1018,8 @@ function ScheduleEditor({ controller, open, schedule, initialDraft, targets, ses
               ? execution.availableModels
               : execution.selectedModel === undefined ? [] : [execution.selectedModel]}
             ownerId={modelPreferenceOwnerId(controller.state.activeProfile?.serverId)}
+            favoriteSettings={controller.state.snapshot.settings.modelFavorites}
+            onMutateFavorite={controller.updateModelFavorites}
             value={draft.modelId.length === 0 ? undefined : {
               backendId: draft.backendId,
               providerId: draft.providerId,

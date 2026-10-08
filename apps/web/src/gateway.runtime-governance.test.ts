@@ -37,7 +37,8 @@ describe("runtime governance gateway", () => {
           cleanupAvailable: false,
           customized: true,
           version: { revision: { value: 9n } }
-        }
+        },
+        modelFavorites: { revision: { value: 0n } }
       }
     }));
 

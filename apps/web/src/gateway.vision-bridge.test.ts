@@ -16,6 +16,7 @@ describe("Vision Bridge UI event projection", () => {
         auxiliaryText: { revision: { value: 0n }, runtimeRevision: "fixture:0" }, agentResource: {},
         collaboration: {},
         gitSafety: {},
+        modelFavorites: { revision: { value: 0n } },
         visionBridge: {
           enabled: true,
           targetModels: [

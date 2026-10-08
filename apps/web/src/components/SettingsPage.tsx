@@ -3328,6 +3328,8 @@ function BackendSettings({ controller, snapshot, runAction, showHeading = true, 
           <div className="backend-setting__permission"><span>{t("settings.backendDefaultModel")}</span><ModelPicker
             models={backendModels}
             ownerId={modelPreferenceOwnerId(controller.state.activeProfile?.serverId)}
+            favoriteSettings={snapshot.settings.modelFavorites}
+            onMutateFavorite={controller.updateModelFavorites}
             value={selectedModel === undefined ? undefined : {
               backendId: selectedModel.backendId,
               providerId: selectedModel.providerId,

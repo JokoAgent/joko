@@ -36,7 +36,12 @@ import {
   type ModelFavoriteConfiguration,
   type ModelPickerLayout
 } from "../model-picker-preferences.js";
-import type { ModelView } from "../model.js";
+import type {
+  ModelFavoriteMutationView,
+  ModelFavoriteSettingsView,
+  ModelView
+} from "../model.js";
+import { randomUuid } from "../web-crypto.js";
 import { isConversationModel, isRoutableConversationModel } from "../model-capabilities.js";
 import { applyProviderDisplayOrder } from "../provider-display-order.js";
 import { placeModelPickerConfigFlyout, type ModelPickerConfigFlyoutRect } from "./model-picker-config-flyout.js";
@@ -71,6 +76,8 @@ export interface ModelPickerProps {
   readonly ariaLabel?: string;
   readonly className?: string;
   readonly seedDefault?: ModelPickerSelection;
+  readonly favoriteSettings?: ModelFavoriteSettingsView;
+  readonly onMutateFavorite?: (change: ModelFavoriteMutationView, expectedRevision: bigint) => Promise<void>;
   readonly effortEnabled?: boolean;
   readonly fastEnabled?: boolean;
   readonly useMorphPopover?: boolean;
@@ -112,6 +119,8 @@ export function ModelPicker({
   ariaLabel,
   className,
   seedDefault,
+  favoriteSettings,
+  onMutateFavorite,
   effortEnabled = true,
   fastEnabled = true,
   useMorphPopover = false
@@ -132,7 +141,16 @@ export function ModelPicker({
   const [configRowKey, setConfigRowKey] = useState<string>();
   const [rowConfigurations, setRowConfigurations] = useState<ReadonlyMap<string, RowConfiguration>>(new Map());
   const [justFavoritedKey, setJustFavoritedKey] = useState<string>();
+  const [favoriteBusy, setFavoriteBusy] = useState(false);
+  const [favoriteError, setFavoriteError] = useState(false);
   const [panelStyle, setPanelStyle] = useState<CSSProperties>();
+  const favoriteFlightRef = useRef(0);
+  const favoriteSeedAttemptRef = useRef<string | undefined>(undefined);
+  const favoriteOwnerRef = useRef(ownerId);
+  favoriteOwnerRef.current = ownerId;
+  const favorites = favoriteSettings?.favorites ?? preferences.favorites;
+  const favoritesSeeded = favoriteSettings?.seeded ?? preferences.seeded;
+  const remoteFavorites = favoriteSettings !== undefined && onMutateFavorite !== undefined;
 
   const modelsByKey = useMemo(() => new Map(models.map((model) => [modelKey(model), model] as const)), [models]);
   const visibleModels = useMemo(() => models.filter((model) =>
@@ -160,9 +178,25 @@ export function ModelPicker({
   );
 
   useEffect(() => {
-    if (seedDefault === undefined || preferences.seeded) return;
+    if (seedDefault === undefined || favoritesSeeded || favoriteBusy) return;
     const model = modelsByKey.get(modelKey(seedDefault));
     if (model === undefined || !model.available) return;
+    const item = favoriteItem(model, seedDefault.effort, seedDefault.fastMode && model.supportsFast);
+    if (remoteFavorites) {
+      const attempt = JSON.stringify([
+        ownerId ?? "",
+        favoriteSettings?.revision.toString() ?? "",
+        item.backendId,
+        item.providerId,
+        item.modelId,
+        item.effort ?? "",
+        item.fast === true
+      ]);
+      if (favoriteSeedAttemptRef.current === attempt) return;
+      favoriteSeedAttemptRef.current = attempt;
+      void mutateRemoteFavorite({ kind: "seed", item });
+      return;
+    }
     seedModelFavorite(ownerId, {
       backendId: model.backendId,
       providerId: model.providerId,
@@ -170,9 +204,9 @@ export function ModelPicker({
       ...(!effortEnabled || seedDefault.effort === undefined ? {} : { effort: seedDefault.effort }),
       ...(fastEnabled && seedDefault.fastMode && model.supportsFast ? { fast: true } : {})
     });
-  }, [modelsByKey, ownerId, preferences.seeded, seedDefault]);
+  }, [favoriteBusy, favoritesSeeded, modelsByKey, ownerId, remoteFavorites, seedDefault]);
 
-  const favoriteRows = useMemo(() => preferences.favorites.flatMap((favorite): PickerRow[] => {
+  const favoriteRows = useMemo(() => favorites.flatMap((favorite): PickerRow[] => {
     const model = modelsByKey.get(modelKey(favorite));
     if (model === undefined || !isConversationModel(model) || !model.available || model.routingEnabled === false || !isModelVisible(
       preferences,
@@ -189,7 +223,7 @@ export function ModelPicker({
       ...(effort === undefined ? {} : { effort }),
       fastMode: fastEnabled && favorite.fast === true && model.supportsFast
     }];
-  }), [modelsByKey, preferences]);
+  }), [favorites, modelsByKey, preferences]);
 
   const regularRows = useMemo(() => orderedVisibleModels.map((model): PickerRow => {
     const key = `model:${modelKey(model)}`;
@@ -320,6 +354,13 @@ export function ModelPicker({
   }, []);
 
   useEffect(() => {
+    favoriteFlightRef.current += 1;
+    favoriteSeedAttemptRef.current = undefined;
+    setFavoriteBusy(false);
+    setFavoriteError(false);
+  }, [ownerId]);
+
+  useEffect(() => {
     if (activeRowKey === undefined) return;
     rowRefs.current.get(activeRowKey)?.scrollIntoView?.({ block: "nearest" });
   }, [activeRowKey]);
@@ -338,21 +379,21 @@ export function ModelPicker({
   };
 
   const configureRow = (row: PickerRow, patch: Partial<RowConfiguration>): void => {
+    if (favoriteBusy && row.favorite !== undefined) return;
     const effort = effortEnabled && patch.effort === undefined ? row.effort : effortEnabled ? validEffort(row.model, patch.effort) : undefined;
     const fastMode = fastEnabled && (patch.fastMode === undefined ? row.fastMode : patch.fastMode && row.model.supportsFast);
     if (row.favorite !== undefined) {
-      updateModelFavorite(ownerId, row.favorite.uid, {
-        ...(effortEnabled ? { effort: effort ?? null } : {}),
-        ...(fastEnabled ? { fast: fastMode } : {})
-      });
-      if (isSelectedRow(row, value)) onSelect({
-        backendId: row.model.backendId,
-        providerId: row.model.providerId,
-        modelId: row.model.modelId,
-        ...(effort === undefined ? {} : { effort }),
-        fastMode,
-        favoriteUid: row.favorite.uid
-      });
+      if (remoteFavorites) {
+        void mutateRemoteFavorite({
+          kind: "replace",
+          item: favoriteItem(row.model, effort, fastMode, row.favorite.uid)
+        });
+      } else {
+        updateModelFavorite(ownerId, row.favorite.uid, {
+          ...(effortEnabled ? { effort: effort ?? null } : {}),
+          ...(fastEnabled ? { fast: fastMode } : {})
+        });
+      }
       return;
     }
     const storedConfiguration = readModelConfiguration(preferences, row.model.backendId, row.model.providerId, row.model.modelId);
@@ -376,9 +417,20 @@ export function ModelPicker({
 
   const toggleFavorite = (event: MouseEvent, row: PickerRow): void => {
     event.stopPropagation();
+    if (favoriteBusy) return;
     if (row.favorite !== undefined) {
-      removeModelFavorite(ownerId, row.favorite.uid);
+      if (remoteFavorites) void mutateRemoteFavorite({ kind: "remove", favoriteId: row.favorite.uid });
+      else removeModelFavorite(ownerId, row.favorite.uid);
       if (configRowKey === row.key) setConfigRowKey(undefined);
+      return;
+    }
+    const remoteItem = favoriteItem(row.model, row.effort, row.fastMode);
+    if (remoteFavorites) {
+      if (favorites.some((favorite) => sameFavoriteConfiguration(favorite, remoteItem))) return;
+      void mutateRemoteFavorite({ kind: "add", item: remoteItem });
+      setJustFavoritedKey(row.key);
+      if (feedbackTimerRef.current !== undefined) window.clearTimeout(feedbackTimerRef.current);
+      feedbackTimerRef.current = window.setTimeout(() => setJustFavoritedKey(undefined), 700);
       return;
     }
     const added = addModelFavorite(ownerId, {
@@ -393,6 +445,22 @@ export function ModelPicker({
     if (feedbackTimerRef.current !== undefined) window.clearTimeout(feedbackTimerRef.current);
     feedbackTimerRef.current = window.setTimeout(() => setJustFavoritedKey(undefined), 700);
   };
+
+  async function mutateRemoteFavorite(change: ModelFavoriteMutationView): Promise<void> {
+    if (!remoteFavorites || favoriteBusy || ownerId === undefined
+      || favoriteSettings === undefined || onMutateFavorite === undefined) return;
+    const token = ++favoriteFlightRef.current;
+    const owner = ownerId;
+    setFavoriteBusy(true);
+    setFavoriteError(false);
+    try {
+      await onMutateFavorite(change, favoriteSettings.revision);
+    } catch {
+      if (favoriteFlightRef.current === token && favoriteOwnerRef.current === owner) setFavoriteError(true);
+    } finally {
+      if (favoriteFlightRef.current === token && favoriteOwnerRef.current === owner) setFavoriteBusy(false);
+    }
+  }
 
   const handlePanelKey = (event: KeyboardEvent): void => {
     if (event.nativeEvent.isComposing || event.altKey || event.ctrlKey || event.metaKey) return;
@@ -476,6 +544,7 @@ export function ModelPicker({
           />)}
         </nav>
         <div className="model-picker__content">
+          {favoriteError && <p className="inline-error" role="alert">{t("modelPicker.favoriteSaveFailed")}</p>}
           {allowDefault && query.trim() === "" && rail === "all" && <button
             type="button"
             className={cx("model-picker__default-row", value === undefined && "is-selected")}
@@ -502,6 +571,7 @@ export function ModelPicker({
               onChangeConfiguration={configureRow}
               effortEnabled={effortEnabled}
               fastEnabled={fastEnabled}
+              favoriteActionsDisabled={favoriteBusy}
             />
             {filteredRows.length === 0 && (routableModels.length === 0 && onConnectSource !== undefined
               ? <div className="model-picker__empty"><Unplug aria-hidden="true" /><strong>{t("modelPicker.noSources")}</strong><span>{t("modelPicker.noSourcesBody")}</span><Button tone="primary" onClick={() => { close(false); onConnectSource(); }}>{t("modelPicker.connectSource")}</Button></div>
@@ -600,7 +670,8 @@ function ModelRows({
   onToggleFavorite,
   onChangeConfiguration,
   effortEnabled,
-  fastEnabled
+  fastEnabled,
+  favoriteActionsDisabled
 }: {
   readonly rows: readonly PickerRow[];
   readonly value: ModelPickerSelection | undefined;
@@ -621,6 +692,7 @@ function ModelRows({
   readonly onChangeConfiguration: (row: PickerRow, patch: Partial<RowConfiguration>) => void;
   readonly effortEnabled: boolean;
   readonly fastEnabled: boolean;
+  readonly favoriteActionsDisabled: boolean;
 }): JSX.Element {
   let previousSection = "";
   return <>{rows.map((row) => {
@@ -677,9 +749,9 @@ function ModelRows({
         </span>
         <IconButton
           className={cx("model-picker__star", (row.favorite !== undefined || justFavoritedKey === row.key) && "is-on")}
-          disabled={!row.model.available}
+          disabled={!row.model.available || favoriteActionsDisabled}
           label={row.favorite === undefined ? t("modelPicker.addFavorite") : t("modelPicker.removeFavorite")}
-          disabledReason={!row.model.available ? t("common.unavailable") : undefined}
+          disabledReason={!row.model.available ? t("common.unavailable") : favoriteActionsDisabled ? t("common.working") : undefined}
           onClick={(event) => onToggleFavorite(event, row)}
         ><Star aria-hidden="true" fill={row.favorite !== undefined || justFavoritedKey === row.key ? "currentColor" : "none"} /></IconButton>
         {(effortEnabled && row.model.efforts.length > 0 || fastEnabled && row.model.supportsFast) && <IconButton
@@ -699,6 +771,7 @@ function ModelRows({
           t={t}
           effortEnabled={effortEnabled}
           fastEnabled={fastEnabled}
+          disabled={favoriteActionsDisabled && row.favorite !== undefined}
           onChange={(patch) => onChangeConfiguration(row, patch)}
         />}
       </div>
@@ -706,7 +779,7 @@ function ModelRows({
   })}</>;
 }
 
-function RowConfigurationFlyout({ row, anchorElement, panelElement, flyoutRef, t, effortEnabled, fastEnabled, onChange }: {
+function RowConfigurationFlyout({ row, anchorElement, panelElement, flyoutRef, t, effortEnabled, fastEnabled, disabled, onChange }: {
   readonly row: PickerRow;
   readonly anchorElement: HTMLDivElement | null;
   readonly panelElement: HTMLDivElement | null;
@@ -714,6 +787,7 @@ function RowConfigurationFlyout({ row, anchorElement, panelElement, flyoutRef, t
   readonly t: Translator;
   readonly effortEnabled: boolean;
   readonly fastEnabled: boolean;
+  readonly disabled: boolean;
   readonly onChange: (patch: Partial<RowConfiguration>) => void;
 }): JSX.Element | null {
   const thinkingEfforts = effortEnabled ? binaryThinkingEfforts(row.model) : undefined;
@@ -776,6 +850,7 @@ function RowConfigurationFlyout({ row, anchorElement, panelElement, flyoutRef, t
     {thinkingEfforts !== undefined && <label>
       <span>{t("controls.thinking")}</span>
       <CheckboxControl
+        disabled={disabled}
         checked={row.effort === thinkingEfforts.enabled}
         onChange={(event) => onChange({ effort: event.target.checked ? thinkingEfforts.enabled : thinkingEfforts.disabled })}
       />
@@ -784,13 +859,14 @@ function RowConfigurationFlyout({ row, anchorElement, panelElement, flyoutRef, t
       type="button"
       className={row.effort === effort ? "is-selected" : undefined}
       aria-pressed={row.effort === effort}
+      disabled={disabled}
       key={effort}
       onClick={() => onChange({ effort })}
     >{effort}</button>)}</div></fieldset>}
     {fastEnabled && <label className={cx(!row.model.supportsFast && "is-disabled")}>
       <span><Zap aria-hidden="true" />{t("controls.fast")}</span>
       <CheckboxControl
-        disabled={!row.model.supportsFast}
+        disabled={disabled || !row.model.supportsFast}
         checked={row.fastMode}
         onChange={(event) => onChange({ fastMode: event.target.checked })}
       />
@@ -900,6 +976,27 @@ function isSelectedRow(row: PickerRow, value: ModelPickerSelection | undefined):
   if (row.favorite === undefined) return true;
   return row.favorite.uid === value.favoriteUid ||
     (row.effort === value.effort && row.fastMode === value.fastMode);
+}
+
+function favoriteItem(
+  model: ModelView,
+  effort: string | undefined,
+  fastMode: boolean,
+  uid = `favorite-${randomUuid()}`
+): ModelFavoriteConfiguration {
+  return {
+    uid,
+    backendId: model.backendId,
+    providerId: model.providerId,
+    modelId: model.modelId,
+    ...(effort === undefined ? {} : { effort }),
+    ...(fastMode ? { fast: true } : {})
+  };
+}
+
+function sameFavoriteConfiguration(left: ModelFavoriteConfiguration, right: ModelFavoriteConfiguration): boolean {
+  return left.backendId === right.backendId && left.providerId === right.providerId
+    && left.modelId === right.modelId && left.effort === right.effort && left.fast === right.fast;
 }
 
 function modelKey(value: Pick<ModelView, "backendId" | "providerId" | "modelId"> | Pick<ModelPickerSelection, "backendId" | "providerId" | "modelId"> | Pick<ModelFavoriteConfiguration, "backendId" | "providerId" | "modelId">): string {

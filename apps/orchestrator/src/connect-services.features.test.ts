@@ -2773,6 +2773,93 @@ describe("Connect typed feature boundaries", () => {
     expect(replaceSmartRouting).toHaveBeenCalledTimes(1);
   });
 
+  it("projects and mutates one shared model favorite through generated settings contracts", async () => {
+    const store = new OperationalStore(":memory:");
+    const snapshot = vi.fn(() => ({
+      favorites: [{
+        favoriteId: "favorite-a",
+        backendId: "backend-a",
+        providerId: "provider-a",
+        modelId: "model-a",
+        effortId: "high",
+        fastMode: true
+      }],
+      seeded: true,
+      revision: 5n
+    }));
+    const mutate = vi.fn();
+    try {
+      const services = createConnectServices(stubApplication({
+        store,
+        sessionHost: immediateHost(store),
+        modelFavorites: { snapshot, mutate }
+      }));
+      const response = await invoke<{ settings?: contract.SettingsSnapshot }>(services.settings.getSettings, {});
+      const settings = fromBinary(contract.SettingsSnapshotSchema,
+        toBinary(contract.SettingsSnapshotSchema, response.settings!));
+      expect(settings.modelFavorites).toMatchObject({
+        seeded: true,
+        revision: { value: 5n },
+        favorites: [{
+          favoriteId: "favorite-a",
+          backendId: "backend-a",
+          selection: {
+            model: { providerId: "provider-a", modelId: "model-a" },
+            effortId: "high",
+            fastMode: true
+          }
+        }]
+      });
+
+      await invoke(services.operation.submitOperation, {
+        operationId: "model-favorite-replace",
+        connectionId: connection.id,
+        mutation: create(contract.OperationMutationSchema, {
+          payload: { case: "updateModelFavorites", value: create(contract.UpdateModelFavoritesMutationSchema, {
+            expectedRevision: { value: 5n },
+            change: { case: "replace", value: create(contract.ModelFavoriteConfigurationSchema, {
+              favoriteId: "favorite-a",
+              backendId: "backend-a",
+              selection: {
+                model: { providerId: "provider-a", modelId: "model-a" },
+                effortId: "low",
+                fastMode: false
+              }
+            }) }
+          }) }
+        })
+      });
+      expect(mutate).toHaveBeenCalledExactlyOnceWith({
+        kind: "replace",
+        item: {
+          favoriteId: "favorite-a",
+          backendId: "backend-a",
+          providerId: "provider-a",
+          modelId: "model-a",
+          effortId: "low",
+          fastMode: false
+        }
+      }, 5n);
+
+      await expect(invoke(services.operation.submitOperation, {
+        operationId: "model-favorite-invalid",
+        connectionId: connection.id,
+        mutation: create(contract.OperationMutationSchema, {
+          payload: { case: "updateModelFavorites", value: create(contract.UpdateModelFavoritesMutationSchema, {
+            expectedRevision: { value: 5n },
+            change: { case: "add", value: create(contract.ModelFavoriteConfigurationSchema, {
+              favoriteId: "favorite-b",
+              backendId: "backend-a"
+            }) }
+          }) }
+        })
+      })).rejects.toMatchObject({ code: Code.InvalidArgument });
+      expect(mutate).toHaveBeenCalledTimes(1);
+    } finally {
+      store.close();
+    }
+  });
+
   it("restores optional personalization defaults while their runtime owners are absent", async () => {
     const deleteSetting = vi.fn();
     const store = { findOperation: () => undefined, deleteSetting };

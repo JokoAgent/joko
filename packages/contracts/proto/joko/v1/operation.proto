@@ -239,6 +239,7 @@ message OperationMutation {
     ReorderTaskTagsMutation reorder_task_tags = 220;
     SetSessionTaskTagsMutation set_session_task_tags = 221;
     DeleteTaskTagMutation delete_task_tag = 222;
+    UpdateModelFavoritesMutation update_model_favorites = 223;
   }
 }
 
@@ -1275,6 +1276,16 @@ message UpdateSubagentModelSettingsMutation {
   // Explicitly distinguishes default reset from a smart-routing-only update.
   bool clear_default_model = 4;
   optional bool smart_routing_enabled = 5;
+}
+
+message UpdateModelFavoritesMutation {
+  Revision expected_revision = 1;
+  oneof change {
+    ModelFavoriteConfiguration add = 2;
+    ModelFavoriteConfiguration replace = 3;
+    string remove_favorite_id = 4;
+    ModelFavoriteConfiguration seed = 5;
+  }
 }
 
 // Backend-neutral user shell surface.

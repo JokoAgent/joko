@@ -10,6 +10,7 @@ import {
   EditQueueItemMutationSchema, EntityKind, EntityRefSchema, EventSchema, ExecuteUserShellMutationSchema, ExecuteWorkspaceRewindMutationSchema,
   LAN_DISCOVERY_PEER_TTL_MS,
   ModelKeySchema, ModelSelectionSchema, NativeSessionPlacement, NativeSessionStartSchema, NewNativeSessionSchema,
+  ModelFavoriteConfigurationSchema, UpdateModelFavoritesMutationSchema,
   DeleteScheduleRunMutationSchema, LogoutConnectionMutationSchema, MarkAllScheduleRunsReadMutationSchema,
   MarkScheduleRunReadMutationSchema, MarkScheduleRunsReadMutationSchema, NavigateSessionBranchMutationSchema,
   OperationPreconditionSchema, OperationState, OperationMutationSchema, RewindSafety,
@@ -226,6 +227,7 @@ import {
 } from "./new-task-draft-store";
 import {
   assertMobileModelSelection,
+  assertMobileModelFavoriteMutation,
   assertMobilePermissionMode,
   assertMobilePlanMode,
   resolveMobileExplicitNewTaskModelAuthority,
@@ -233,6 +235,7 @@ import {
   resolveMobileRuntimeControls,
   resolveMobileSessionModelAuthority,
   type MobileModelControlSelection,
+  type MobileModelFavoriteMutation,
   type MobileRuntimeControls
 } from "./mobile-runtime-controls";
 import {
@@ -8125,6 +8128,56 @@ export class MobileClient {
     } finally { this.#releaseMutation(action); }
   }
 
+  newModelFavoriteId(): string {
+    return `favorite-${this.newId()}`;
+  }
+
+  async mutateTaskModelFavorite(
+    surfaceOwnerKey: string,
+    expectedRevision: bigint,
+    change: MobileModelFavoriteMutation
+  ): Promise<boolean> {
+    this.#ready();
+    const controls = this.taskRuntimeControls();
+    if (!controls || controls.surfaceOwnerKey !== surfaceOwnerKey) {
+      throw new Error("The task controls changed. Reopen them from the current task.");
+    }
+    if (controls.favoriteRevision !== expectedRevision) {
+      throw new Error("Model favorites changed on another client. Refresh before saving again.");
+    }
+    if (this.#state.pending.some((item) => item.kind === "model-favorite")) {
+      throw new Error("A previous model favorite change is still pending. Check its operation before saving again.");
+    }
+    const normalized = assertMobileModelFavoriteMutation(controls, change);
+    const mapped = normalized.kind === "remove"
+      ? { case: "removeFavoriteId" as const, value: normalized.favoriteId }
+      : {
+          case: normalized.kind,
+          value: create(ModelFavoriteConfigurationSchema, {
+            favoriteId: normalized.item.favoriteId,
+            backendId: normalized.item.backendId,
+            selection: create(ModelSelectionSchema, {
+              model: create(ModelKeySchema, {
+                providerId: normalized.item.providerId,
+                modelId: normalized.item.modelId
+              }),
+              effortId: normalized.item.effortId ?? "",
+              fastMode: normalized.item.fastMode
+            })
+          })
+        };
+    const action = this.#claimMutation();
+    try {
+      const result = await this.#submitTerminal(create(OperationMutationSchema, {
+        payload: { case: "updateModelFavorites", value: create(UpdateModelFavoritesMutationSchema, {
+          expectedRevision: create(RevisionSchema, { value: expectedRevision }),
+          change: mapped
+        }) }
+      }), { kind: "model-favorite" });
+      return result.accepted && result.definitive;
+    } finally { this.#releaseMutation(action); }
+  }
+
   async setTaskPermission(authorityKey: string, mode: PermissionMode): Promise<boolean> {
     const controls = this.#runtimeControlContext(authorityKey);
     const selected = assertMobilePermissionMode(controls, mode);
@@ -9506,7 +9559,7 @@ export class MobileClient {
   }
 
   #assertNoPendingRuntimeControl(sessionId: string): void {
-    if (this.#state.pending.some((item) => item.sessionId === sessionId
+    if (this.#state.pending.some((item) => item.kind === "model-favorite" || item.sessionId === sessionId
       && ["session-model", "session-permission", "session-plan", "session-compact", "session-branch",
         "session-shell", "session-reset", "session-review", "session-clone", "session-fork", "session-rewind", "workspace-rewind"].includes(item.kind))) {
       throw new Error("A previous task control change is still pending. Check its operation before changing another setting.");
@@ -11576,7 +11629,7 @@ export class MobileClient {
             && ["device-rename", "rename", "pin", "archive", "delete", "message-delete", "queue-cancel", "queue-edit-lock",
               "queue-edit", "queue-interaction-lock", "queue-reorder", "interaction-resolve", "interaction-dismiss",
               "session-model", "session-permission", "session-plan", "session-compact", "session-branch",
-              "session-shell", "session-reset", "session-review", "session-clone", "session-fork", "session-rewind", "workspace-rewind", "task-tag"].includes(pending.kind)
+              "session-shell", "session-reset", "session-review", "session-clone", "session-fork", "session-rewind", "workspace-rewind", "task-tag", "model-favorite"].includes(pending.kind)
             && this.#current(epoch)) {
             await this.refresh();
             if ((pending.kind === "message-delete" || messageRewind) && this.#foreground

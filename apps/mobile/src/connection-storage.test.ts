@@ -394,7 +394,9 @@ describe("current-v1 mobile connection storage", () => {
       { operationId: "schedule-project-remove", connectionId: first.connectionId, kind: "schedule-project-remove" as const,
         scheduleId: "schedule-one", state: "accepted" as const },
       { operationId: "schedule-project-reconcile", connectionId: first.connectionId,
-        kind: "schedule-project-reconcile" as const, targetId: "target-one", state: "unknown" as const }
+        kind: "schedule-project-reconcile" as const, targetId: "target-one", state: "unknown" as const },
+      { operationId: "model-favorite", connectionId: first.connectionId,
+        kind: "model-favorite" as const, state: "accepted" as const }
     ];
 
     await storage.savePending(receipts);

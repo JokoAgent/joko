@@ -183,6 +183,7 @@ import {
 import { SessionNavigationCoordinator } from "./session-navigation-coordinator.js";
 import { AuxiliaryTextRouting } from "./auxiliary-text-routing.js";
 import { SubagentModelSettings } from "./subagent-model-settings.js";
+import { ModelFavoriteSettings } from "./model-favorite-settings.js";
 import { DeferredBackendRestartCoordinator } from "./deferred-backend-restart.js";
 import { VisionBridgeToolProvider } from "./vision-bridge-tool-provider.js";
 import { OperationalBrowserState } from "./operational-browser-state.js";
@@ -441,6 +442,7 @@ export interface OrchestratorApplication {
   readonly promptPrediction?: PromptPredictionService;
   readonly auxiliaryText?: AuxiliaryTextRouting;
   readonly subagentModels?: SubagentModelSettings;
+  readonly modelFavorites: ModelFavoriteSettings;
   readonly sessionNavigation?: SessionNavigationCoordinator;
   /** Capability-owned code-host adapters; each resolves its own credential reference. */
   readonly codeHostProviders?: readonly CodeHostProvider[];
@@ -594,6 +596,7 @@ export async function createOrchestratorApplication(
       };
     }
   });
+  const modelFavorites = new ModelFavoriteSettings(store);
   const codeHostProviders = composeCodeHostProviders(
     dependencies.codeHostProviders,
     new OperationalCodeHostSessionAuthorization(store)
@@ -2623,6 +2626,7 @@ export async function createOrchestratorApplication(
     promptPrediction,
     auxiliaryText,
     subagentModels,
+    modelFavorites,
     sessionNavigation,
     codeHostProviders,
     refreshPiGeneration,

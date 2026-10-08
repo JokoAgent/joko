@@ -1725,6 +1725,8 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
         className="control-select"
         models={canSwitchModel ? backendModels : session.model === undefined ? [] : [session.model]}
         ownerId={modelPreferenceOwnerId(controller.state.activeProfile?.serverId)}
+        favoriteSettings={controller.state.snapshot.settings.modelFavorites}
+        onMutateFavorite={controller.updateModelFavorites}
         value={session.model === undefined ? undefined : {
           backendId: session.backendId,
           providerId: session.model.providerId,

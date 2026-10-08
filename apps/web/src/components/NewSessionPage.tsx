@@ -2729,6 +2729,8 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
                   className="new-task-composer__select--model"
                   models={snapshot.models.filter((model) => model.backendId === backend?.id)}
                   ownerId={pickerOwnerId}
+                  favoriteSettings={snapshot.settings.modelFavorites}
+                  onMutateFavorite={controller.updateModelFavorites}
                   value={modelSelection === undefined ? undefined : {
                     ...modelSelection,
                     ...(effort.length === 0 ? {} : { effort }),
