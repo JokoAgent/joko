@@ -256,6 +256,7 @@ import {
   TaskHistoryMaintenancePhase,
   TaskHistoryMaintenanceStatus,
   TaskHistoryRetention,
+  TaskTagColor as ProtoTaskTagColor,
   TargetService,
   RewindSafety,
   RunState,
@@ -472,6 +473,7 @@ import {
   type RemoteBackendRuntime as ProtoRemoteBackendRuntime,
   type SessionMessageSearchMatch,
   type Session,
+  type TaskTag as ProtoTaskTag,
   type SessionStatistics as ProtoSessionStatistics,
   type SkillDescriptor as ProtoSkillDescriptor,
   type SkillDiff as ProtoSkillDiff,
@@ -759,6 +761,9 @@ import type {
   SessionView,
   SessionWorktreeRemovalPreviewView,
   SessionWorktreeView,
+  TaskTagColorView,
+  TaskTagDeletePreviewView,
+  TaskTagView,
   TargetView,
   SkillCatalogView,
   CollaborationDirectoryView,
@@ -2016,6 +2021,102 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
 
   async renameSession(sessionId: string, name: string): Promise<void> {
     await this.submit({ case: "renameSession", value: { sessionId, displayName: name.trim() } });
+  }
+
+  async createTaskTag(
+    originSessionId: string,
+    name: string,
+    color: TaskTagColorView,
+    expectedCatalogRevision: bigint,
+    presetId?: string
+  ): Promise<void> {
+    await this.submit({
+      case: "createTaskTag",
+      value: {
+        originSessionId,
+        name,
+        color: protoTaskTagColor(color),
+        expectedCatalogRevision: { value: expectedCatalogRevision },
+        ...(presetId === undefined ? {} : { presetId })
+      }
+    }, true);
+    await this.refresh();
+  }
+
+  async updateTaskTag(
+    originSessionId: string,
+    tagId: string,
+    expectedRevision: bigint,
+    patch: { readonly name?: string; readonly color?: TaskTagColorView }
+  ): Promise<void> {
+    await this.submit({
+      case: "updateTaskTag",
+      value: {
+        originSessionId,
+        taskTagId: tagId,
+        expectedRevision: { value: expectedRevision },
+        ...(patch.name === undefined ? {} : { name: patch.name }),
+        ...(patch.color === undefined ? {} : { color: protoTaskTagColor(patch.color) })
+      }
+    }, true);
+    await this.refresh();
+  }
+
+  async reorderTaskTags(
+    originSessionId: string,
+    taskTagIds: readonly string[],
+    expectedCatalogRevision: bigint
+  ): Promise<void> {
+    await this.submit({
+      case: "reorderTaskTags",
+      value: { originSessionId, taskTagIds: [...taskTagIds], expectedCatalogRevision: { value: expectedCatalogRevision } }
+    }, true);
+    await this.refresh();
+  }
+
+  async setSessionTaskTags(
+    originSessionId: string,
+    sessionIds: readonly string[],
+    taskTagIds: readonly string[],
+    attached: boolean
+  ): Promise<void> {
+    await this.submit({
+      case: "setSessionTaskTags",
+      value: { originSessionId, sessionIds: [...sessionIds], taskTagIds: [...taskTagIds], attached }
+    }, true);
+    await this.refresh();
+  }
+
+  async previewTaskTagDeletion(taskTagId: string, signal?: AbortSignal): Promise<TaskTagDeletePreviewView> {
+    const response = await createClient(SessionService, this.requireTransport()).previewTaskTagDeletion(
+      { taskTagId },
+      signal === undefined ? undefined : { signal }
+    );
+    const preview = response.preview;
+    if (
+      preview === undefined || preview.tagRevision === undefined ||
+      preview.associationRevision === undefined
+    ) throw new GatewayError("Orchestrator returned an incomplete task tag deletion preview.");
+    return {
+      tagId: preview.taskTagId,
+      affectedSessionCount: numberValue(preview.affectedSessionCount),
+      tagRevision: preview.tagRevision.value,
+      associationRevision: preview.associationRevision.value
+    };
+  }
+
+  async deleteTaskTag(originSessionId: string, preview: TaskTagDeletePreviewView): Promise<void> {
+    await this.submit({
+      case: "deleteTaskTag",
+      value: {
+        originSessionId,
+        taskTagId: preview.tagId,
+        affectedSessionCount: BigInt(preview.affectedSessionCount),
+        expectedTagRevision: { value: preview.tagRevision },
+        expectedAssociationRevision: { value: preview.associationRevision }
+      }
+    }, true);
+    await this.refresh();
   }
 
   async suggestSessionTitle(
@@ -8975,6 +9076,30 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     }, true);
   }
 
+  async updateModelFavorites(
+    change: Parameters<OperationApi["updateModelFavorites"]>[0],
+    expectedRevision: bigint
+  ): Promise<void> {
+    const mapped = change.kind === "remove"
+      ? { case: "removeFavoriteId" as const, value: change.favoriteId }
+      : {
+          case: change.kind,
+          value: {
+            favoriteId: change.item.uid,
+            backendId: change.item.backendId,
+            selection: {
+              model: { providerId: change.item.providerId, modelId: change.item.modelId },
+              effortId: change.item.effort ?? "",
+              fastMode: change.item.fast === true
+            }
+          }
+        };
+    await this.submit({
+      case: "updateModelFavorites",
+      value: { expectedRevision: { value: expectedRevision }, change: mapped }
+    }, true);
+  }
+
   async resetPromptRecommendationSettings(): Promise<void> {
     await this.submit({
       case: "updatePromptRecommendationSettings",
@@ -9772,6 +9897,27 @@ export function projectSnapshotEvent(
         raw = { ...raw, sessions: upsertBy(raw.sessions, session, (value) => value.sessionId) };
         projected = remapSessionProjection(raw, projected, session.sessionId);
         diagnosticsChanged = true;
+      }
+      break;
+    }
+    case "taskTagCatalogChanged": {
+      const catalog = kind.value.catalog;
+      if (catalog !== undefined) {
+        const sessions = raw.sessions.map((session) => {
+          const attached = new Set(session.taskTags.map((tag) => tag.taskTagId));
+          return { ...session, taskTags: catalog.taskTags.filter((tag) => attached.has(tag.taskTagId)) };
+        });
+        const sessionById = new Map(sessions.map((session) => [session.sessionId, session] as const));
+        raw = { ...raw, sessions, taskTagCatalog: catalog };
+        projected = {
+          ...projected,
+          taskTags: catalog.taskTags.map(mapTaskTag),
+          taskTagCatalogRevision: catalog.revision?.value ?? 0n,
+          sessions: projected.sessions.map((session) => ({
+            ...session,
+            taskTags: sessionById.get(session.id)?.taskTags.map(mapTaskTag) ?? session.taskTags
+          }))
+        };
       }
       break;
     }
@@ -11467,6 +11613,8 @@ export function mapSnapshot(
       ),
       timelineBySession.get(session.sessionId) ?? []
     )),
+    taskTags: snapshot.taskTagCatalog?.taskTags.map(mapTaskTag) ?? [],
+    taskTagCatalogRevision: snapshot.taskTagCatalog?.revision?.value ?? 0n,
     backgroundTasks: snapshot.backgroundTasks.map(mapBackgroundTaskActivity),
     timelineBySession,
     timelineHistoryRevisionBySession: new Map(),
@@ -12268,6 +12416,65 @@ function safeDurationMilliseconds(
   return milliseconds;
 }
 
+function mapTaskTag(tag: ProtoTaskTag): TaskTagView {
+  if (
+    tag.taskTagId.trim() === "" || tag.taskTagId.length > 128 ||
+    tag.name.trim() === "" || tag.name.length > 80 ||
+    tag.revision === undefined || tag.associationRevision === undefined ||
+    !Number.isSafeInteger(tag.sortOrder) || tag.sortOrder < 0 || tag.sortOrder > 255
+  ) throw new GatewayError("Orchestrator returned an invalid task tag.");
+  const createdAt = timestampMs(tag.createdAt);
+  const updatedAt = timestampMs(tag.updatedAt);
+  if (updatedAt < createdAt) throw new GatewayError("Orchestrator returned invalid task tag timestamps.");
+  return {
+    id: tag.taskTagId,
+    name: tag.name,
+    color: taskTagColor(tag.color),
+    ...(tag.presetKey === undefined ? {} : { presetKey: tag.presetKey }),
+    nameCustomized: tag.nameCustomized,
+    sortOrder: tag.sortOrder,
+    revision: tag.revision.value,
+    associationRevision: tag.associationRevision.value,
+    createdAt,
+    updatedAt
+  };
+}
+
+function taskTagColor(value: ProtoTaskTagColor): TaskTagColorView {
+  switch (value) {
+    case ProtoTaskTagColor.RED: return "red";
+    case ProtoTaskTagColor.ORANGE: return "orange";
+    case ProtoTaskTagColor.YELLOW: return "yellow";
+    case ProtoTaskTagColor.GREEN: return "green";
+    case ProtoTaskTagColor.BLUE: return "blue";
+    case ProtoTaskTagColor.PURPLE: return "purple";
+    case ProtoTaskTagColor.GRAY: return "gray";
+    case ProtoTaskTagColor.PINK: return "pink";
+    case ProtoTaskTagColor.CORAL: return "coral";
+    case ProtoTaskTagColor.TEAL: return "teal";
+    case ProtoTaskTagColor.INDIGO: return "indigo";
+    case ProtoTaskTagColor.WHITE: return "white";
+    default: throw new GatewayError("Orchestrator returned an unspecified task tag color.");
+  }
+}
+
+function protoTaskTagColor(value: TaskTagColorView): ProtoTaskTagColor {
+  switch (value) {
+    case "red": return ProtoTaskTagColor.RED;
+    case "orange": return ProtoTaskTagColor.ORANGE;
+    case "yellow": return ProtoTaskTagColor.YELLOW;
+    case "green": return ProtoTaskTagColor.GREEN;
+    case "blue": return ProtoTaskTagColor.BLUE;
+    case "purple": return ProtoTaskTagColor.PURPLE;
+    case "gray": return ProtoTaskTagColor.GRAY;
+    case "pink": return ProtoTaskTagColor.PINK;
+    case "coral": return ProtoTaskTagColor.CORAL;
+    case "teal": return ProtoTaskTagColor.TEAL;
+    case "indigo": return ProtoTaskTagColor.INDIGO;
+    case "white": return ProtoTaskTagColor.WHITE;
+  }
+}
+
 function mapSession(
   session: Session,
   providers: ReadonlyMap<string, ProviderDescriptor>,
@@ -12325,6 +12532,7 @@ function mapSession(
     permissionMode: uiPermission(session.permissionMode),
     planMode: session.planMode,
     ...(session.worktree === undefined ? {} : { worktree: mapSessionWorktree(session.worktree) }),
+    taskTags: session.taskTags.map(mapTaskTag),
     ...(attention === undefined || attentionKind === undefined || attention.attentionCursor === undefined
       ? {}
       : {
@@ -17017,6 +17225,9 @@ function mapSettings(settings: SettingsSnapshot | undefined): SettingsView {
   if (settings.auxiliaryText?.revision === undefined) {
     throw new Error("Orchestrator returned incomplete auxiliary text settings.");
   }
+  if (settings.modelFavorites?.revision === undefined) {
+    throw new Error("Orchestrator returned incomplete model favorite settings.");
+  }
   return {
     revision: settings?.revision?.value ?? 0n,
     providers: (settings?.providers ?? []).map(mapProviderConfiguration),
@@ -17284,6 +17495,24 @@ function mapSettings(settings: SettingsSnapshot | undefined): SettingsView {
         revision: setting.revision.value
       };
     }),
+    modelFavorites: {
+      favorites: settings.modelFavorites.favorites.map((favorite) => {
+        if (favorite.favoriteId === "" || favorite.backendId === "" || favorite.selection?.model === undefined
+          || favorite.selection.model.providerId === "" || favorite.selection.model.modelId === "") {
+          throw new Error("Orchestrator returned an incomplete model favorite configuration.");
+        }
+        return {
+          uid: favorite.favoriteId,
+          backendId: favorite.backendId,
+          providerId: favorite.selection.model.providerId,
+          modelId: favorite.selection.model.modelId,
+          ...(favorite.selection.effortId === "" ? {} : { effort: favorite.selection.effortId }),
+          ...(favorite.selection.fastMode ? { fast: true as const } : {})
+        };
+      }),
+      seeded: settings.modelFavorites.seeded,
+      revision: settings.modelFavorites.revision.value
+    },
     auxiliaryText: {
       models: settings.auxiliaryText.models.map(({ backendId, providerId, modelId }) => ({ backendId, providerId, modelId })),
       automaticModels: settings.auxiliaryText.automaticModels.map(({ backendId, providerId, modelId }) => ({ backendId, providerId, modelId })),

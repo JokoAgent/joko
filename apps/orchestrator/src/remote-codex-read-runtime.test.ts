@@ -305,7 +305,7 @@ class FakeRemoteProcesses implements RemoteProcessTransportPort {
 
   constructor(options: FixtureOptions) {
     this.#daemonReady = options.daemonInitiallyReady ?? true;
-    this.#probeVersion = options.probeVersion ?? "codex-cli 0.153.4";
+    this.#probeVersion = options.probeVersion ?? "codex-cli 0.159.2";
     this.#stderr = options.stderr ?? "";
     this.#disconnectOnMethod = options.disconnectOnMethod;
     this.#peerWin32 = options.peerWin32 === true;
@@ -327,7 +327,7 @@ class FakeRemoteProcesses implements RemoteProcessTransportPort {
           "/home/test/.joko/runtime/v1/codex-home",
           "/home/test/.joko/runtime/v1/codex-home/packages/standalone/current/codex",
           this.#probeVersion,
-          this.#probeVersion === "codex-cli 0.153.4" ? "ready" : "not_installed",
+          this.#probeVersion === "codex-cli 0.159.2" ? "ready" : "not_installed",
           ""
         ].join("\0"), "utf8"));
         processHandle.finish(0);
@@ -400,7 +400,7 @@ class FakeRemoteProcesses implements RemoteProcessTransportPort {
     }
     const result = message.method === "initialize"
       ? {
-          userAgent: "codex-cli/0.153.4 (linux; x86_64) joko/0.1.0",
+          userAgent: "codex-cli/0.159.2 (linux; x86_64) joko/0.1.0",
           codexHome: "/home/test/.joko/runtime/v1/codex-home",
           platformFamily: "unix",
           platformOs: "linux"

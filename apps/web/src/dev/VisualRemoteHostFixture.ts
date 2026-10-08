@@ -152,8 +152,8 @@ export class VisualRemoteHostFixture {
     if (target === undefined || target.revision !== targetRevision || host.status.state !== "ready" || host.trust === undefined) throw new Error("The runtime authority changed.");
     const installed = this.#runtimeInstalled.get(`${targetId}\0${hostId}`) ?? true;
     return {
-      targetId, hostId, displayName: "Agent runtime", expectedVersion: "0.153.4",
-      ...(installed ? { installedVersion: "0.153.4" } : {}),
+      targetId, hostId, displayName: "Agent runtime", expectedVersion: "0.159.2",
+      ...(installed ? { installedVersion: "0.159.2" } : {}),
       state: installed ? "ready" : "notInstalled",
       canInstall: !installed, canReinstall: installed, canUninstall: installed,
       observedAt: Date.now(), targetRevision, hostRevision

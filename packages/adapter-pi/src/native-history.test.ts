@@ -106,6 +106,7 @@ describe("Pi native history projection", () => {
           cacheReadTokens: 2,
           cacheWriteTokens: 1,
           totalTokens: 10,
+          pricingContext: { inputTokens: 7 },
           cost: 0.0025
         },
         generationDurationMs: 850,

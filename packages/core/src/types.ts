@@ -427,6 +427,10 @@ export interface ProviderModel {
     readonly longContext?: {
       /** Applies to the whole request only when its input exceeds this limit. */
       readonly inputTokenThreshold: number;
+      /** Optional Fast-tier boundary when the provider publishes a different band. */
+      readonly fastInputTokenThreshold?: number;
+      /** Optional Fast multiplier inside this band; otherwise the top-level value applies. */
+      readonly fastModeMultiplier?: number;
       readonly inputMultiplier: number;
       readonly outputMultiplier: number;
       readonly cacheReadMultiplier: number;
@@ -737,6 +741,45 @@ export interface NativeSessionCatalogResult {
   readonly rejectedCount: number;
 }
 
+export const TASK_TAG_COLORS = [
+  "red",
+  "orange",
+  "yellow",
+  "green",
+  "blue",
+  "purple",
+  "gray",
+  "pink",
+  "coral",
+  "teal",
+  "indigo",
+  "white"
+] as const;
+
+export type TaskTagColor = typeof TASK_TAG_COLORS[number];
+
+/** Owner-scoped task label. Preset identity is presentation metadata only. */
+export interface TaskTagDescriptor {
+  readonly id: string;
+  readonly name: string;
+  readonly color: TaskTagColor;
+  readonly presetKey?: string;
+  readonly nameCustomized: boolean;
+  readonly sortOrder: number;
+  /** Name, color, and display-order conflict fence. */
+  readonly revision: bigint;
+  /** Attach/detach conflict fence used by destructive previews. */
+  readonly associationRevision: bigint;
+  readonly createdAt: UnixMillis;
+  readonly updatedAt: UnixMillis;
+}
+
+export interface TaskTagCatalog {
+  readonly tags: readonly TaskTagDescriptor[];
+  /** Create/delete/reorder conflict fence. */
+  readonly revision: bigint;
+}
+
 export interface SessionDescriptor {
   readonly id: SessionId;
   readonly backendId: BackendId;
@@ -766,6 +809,8 @@ export interface SessionDescriptor {
   readonly effort?: string;
   readonly fastMode: boolean;
   readonly worktree?: SessionWorktreeBinding;
+  /** Owner-scoped labels in catalog order. */
+  readonly taskTags?: readonly TaskTagDescriptor[];
   /** Immutable creation-time copy of the Target's Remote workspace binding. */
   readonly remoteWorkspace?: RemoteWorkspaceBinding;
   /**

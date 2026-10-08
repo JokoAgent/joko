@@ -93,6 +93,10 @@ service TargetService {
 service SessionService {
   rpc ListSessions(ListSessionsRequest) returns (ListSessionsResponse);
   rpc GetSession(GetSessionRequest) returns (GetSessionResponse);
+  rpc ListTaskTags(ListTaskTagsRequest) returns (ListTaskTagsResponse);
+  rpc GetSessionTaskTags(GetSessionTaskTagsRequest) returns (GetSessionTaskTagsResponse);
+  rpc FindSessionsByTaskTag(FindSessionsByTaskTagRequest) returns (FindSessionsByTaskTagResponse);
+  rpc PreviewTaskTagDeletion(PreviewTaskTagDeletionRequest) returns (PreviewTaskTagDeletionResponse);
   rpc DiscoverNativeSessions(DiscoverNativeSessionsRequest) returns (DiscoverNativeSessionsResponse);
   rpc ScanNativeSessionCatalog(ScanNativeSessionCatalogRequest) returns (ScanNativeSessionCatalogResponse);
   rpc ListNativeCatalogAdoptions(ListNativeCatalogAdoptionsRequest) returns (ListNativeCatalogAdoptionsResponse);
@@ -1213,6 +1217,38 @@ message GetSessionRequest {
 
 message GetSessionResponse {
   Session session = 1;
+}
+
+message ListTaskTagsRequest {}
+
+message ListTaskTagsResponse {
+  TaskTagCatalog catalog = 1;
+}
+
+message GetSessionTaskTagsRequest {
+  repeated string session_ids = 1;
+}
+
+message GetSessionTaskTagsResponse {
+  repeated SessionTaskTags sessions = 1;
+}
+
+message FindSessionsByTaskTagRequest {
+  string task_tag_id = 1;
+  PageRequest page = 2;
+}
+
+message FindSessionsByTaskTagResponse {
+  repeated Session sessions = 1;
+  PageInfo page = 2;
+}
+
+message PreviewTaskTagDeletionRequest {
+  string task_tag_id = 1;
+}
+
+message PreviewTaskTagDeletionResponse {
+  TaskTagDeletePreview preview = 1;
 }
 
 message GetNativeSessionTreeRequest {

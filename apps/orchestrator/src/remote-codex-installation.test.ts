@@ -11,12 +11,12 @@ import {
 
 describe("remote Codex installation", () => {
   it("requires the Joko sentinel, managed standalone layout, and exact fixed version", async () => {
-    const processes = new ScriptedProcesses([probeOutput("ready", "codex-cli 0.153.4")]);
+    const processes = new ScriptedProcesses([probeOutput("ready", "codex-cli 0.159.2")]);
     await expect(probeRemoteCodexInstallation(processes, "/srv/project", () => undefined)).resolves.toMatchObject({
       state: "ready",
       workspaceRoot: "/srv/project-real",
       profileRoot: "/home/test/.joko/runtime/v1/codex-home",
-      installedVersion: "0.153.4"
+      installedVersion: "0.159.2"
     });
     expect(processes.requests[0]).toMatchObject({ executable: "/bin/sh", cwd: "/srv/project", args: ["-c", expect.stringContaining(".joko-runtime-ready-v1")] });
 
@@ -27,7 +27,7 @@ describe("remote Codex installation", () => {
   it("uses only the fixed release and a staged managed HOME while streaming bounded phases", async () => {
     const processes = new ScriptedProcesses([
       { stdout: "JOKO_PHASE probing\nJOKO_PHASE downloading\nJOKO_PHASE installing\nJOKO_PHASE validating\nJOKO_PHASE complete\n", exitCode: 0 },
-      probeOutput("ready", "codex-cli 0.153.4")
+      probeOutput("ready", "codex-cli 0.159.2")
     ]);
     const phases: string[] = [];
     await expect(installRemoteCodex(processes, {
@@ -37,7 +37,7 @@ describe("remote Codex installation", () => {
     })).resolves.toMatchObject({ state: "ready" });
     expect(phases).toEqual(["probing", "downloading", "installing", "validating", "complete"]);
     const script = processes.inputs[0] ?? "";
-    expect(script).toContain("rust-v0.153.4/install.sh");
+    expect(script).toContain("rust-v0.159.2/install.sh");
     expect(script).toContain("HOME=\"$stage/home\"");
     expect(script).toContain("CODEX_NON_INTERACTIVE=1");
     expect(script).toContain(".joko-install-lock");
@@ -45,7 +45,7 @@ describe("remote Codex installation", () => {
     expect(script).toContain('mv "$profile/packages" "$previous"');
     expect(script).toContain('if [ "$new_moved" -eq 1 ]; then rm -rf "$profile/packages"; fi');
     expect(script).toContain('if [ "$old_moved" -eq 1 ] && [ -e "$previous" ]; then mv "$previous" "$profile/packages"');
-    const finalValidation = script.indexOf('= "codex-cli 0.153.4" ] || exit 47');
+    const finalValidation = script.indexOf('= "codex-cli 0.159.2" ] || exit 47');
     const sentinelCommit = script.indexOf(".joko-runtime-ready-v1.tmp");
     expect(finalValidation).toBeGreaterThan(-1);
     expect(sentinelCommit).toBeGreaterThan(finalValidation);
@@ -57,7 +57,7 @@ describe("remote Codex installation", () => {
   it("uninstalls only the admission sentinel and confirms the result with the shared probe", async () => {
     const processes = new ScriptedProcesses([
       { stdout: "", exitCode: 0 },
-      probeOutput("not_installed", "codex-cli 0.153.4")
+      probeOutput("not_installed", "codex-cli 0.159.2")
     ]);
     await expect(uninstallRemoteCodex(processes, () => undefined)).resolves.toMatchObject({ state: "not_installed" });
     const script = processes.requests[0]?.args[1] ?? "";

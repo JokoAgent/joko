@@ -61,7 +61,7 @@ export class ControlledClaudeRuntime implements ClaudeSdkRuntime {
     return {
       installed: true,
       packageVersion: this.packageVersion,
-      cliVersion: "2.1.259",
+      cliVersion: "2.1.280",
       initialization
     };
   }
@@ -158,7 +158,7 @@ export class ControlledClaudeQuery implements ClaudeSdkQuery {
         subtype: "init",
         session_id: this.#sessionId,
         uuid: randomUUID(),
-        claude_code_version: "2.1.259",
+        claude_code_version: "2.1.280",
         apiKeySource: "managed-provider",
         cwd: this.params.options.cwd,
         model: "claude-remote-fixture",

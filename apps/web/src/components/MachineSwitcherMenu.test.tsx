@@ -85,6 +85,7 @@ describe("MachineSwitcherMenu", () => {
         targetName: "Offline workspace",
         pinned: false,
         archived: false,
+        taskTags: [],
         lastActivityAt: Date.now() - 10_000
       }]
     };

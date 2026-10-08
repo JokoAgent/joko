@@ -3593,7 +3593,7 @@ async function startPairedFixture(
           sessionRoot: join(root, "pi-sessions"),
           externalSessionRoots: [],
           providers: authenticationSnapshot?.providers ?? [provider],
-          versionProbe: async () => "pi 0.84.4",
+          versionProbe: async () => "pi 0.85.1",
           ...(authenticationSnapshot === undefined ? {} : {
             environment: authenticationSnapshot.environment,
             secretEnvironmentNames: authenticationSnapshot.secretEnvironmentNames,

@@ -49,6 +49,7 @@ import {
   toProtoSchedule,
   toProtoSession,
   toProtoTarget,
+  toProtoTaskTagCatalog,
   toProtoTimestamp,
   toProtoToolLease,
   toProtoWorkspace,
@@ -463,7 +464,8 @@ export class SnapshotProjector {
       const timeline = timelineLimit === 0
         ? []
         : activeNativeTimeline(
-            this.readTimeline(store, normalized.sessionId, base.globalCursor),
+            this.readTimeline(store, normalized.sessionId, base.globalCursor)
+              .filter((event) => event.payload.type !== "task_tag_catalog_changed"),
             base.session.descriptor.binding
           ).slice(-timelineLimit);
       const scope = proto<SnapshotScope>("joko.v1.SnapshotScope", {
@@ -795,6 +797,9 @@ export class SnapshotProjector {
           updatedAt: status.updatedAt
         }));
       }),
+      taskTagCatalog: input.scope.kind.case === "owner"
+        ? toProtoTaskTagCatalog(this.store.getTaskTagCatalog())
+        : undefined,
       reviewRuns: []
     });
   }

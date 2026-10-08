@@ -45,6 +45,7 @@ import {
   Search,
   Sparkles,
   Settings,
+  Tags,
   SlidersHorizontal,
   SquarePen,
   Rows2,
@@ -154,12 +155,13 @@ import type { GeneratedSessionDisposition, ScheduleDeletionPreview } from "../sc
 import { CodeHostPullRequestSidebarBadge, codeHostPullRequestTooltip } from "./CodeHostPullRequestSummary.js";
 import { dialogueBackends } from "./new-session-options.js";
 import { SidebarHoverCard, type SidebarHoverCardTriggerProps } from "./SidebarHoverCard.js";
+import { TaskTagDot, TaskTagDots, taskTagDisplayName } from "./TaskTags.js";
 
 export const CONVERSATION_KEYWORD_DEBOUNCE_MS = 250;
 export const CONVERSATION_HYBRID_DEBOUNCE_MS = 900;
 const MESSAGE_SEARCH_DAY_MS = 24 * 60 * 60 * 1_000;
 const SESSION_ACTION_MENU_WIDTH = 180;
-const SESSION_ACTION_MENU_ESTIMATED_HEIGHT = 326;
+const SESSION_ACTION_MENU_ESTIMATED_HEIGHT = 560;
 const SESSION_ACTION_MENU_OFFSET = 4;
 const SESSION_ACTION_MENU_VIEWPORT_MARGIN = 8;
 const SESSION_PROJECT_MENU_WIDTH = 224;
@@ -296,6 +298,8 @@ export interface SidebarProps {
   readonly onNewTaskInTarget?: (target: TargetView) => void;
   readonly onNewDialogue?: (backendId: string) => void;
   readonly onRename: (session: SessionView, name: string) => void;
+  readonly onToggleTaskTag?: (session: SessionView, tagId: string, attached: boolean) => void;
+  readonly onManageTaskTags?: (session: SessionView) => void;
   readonly onPin: (session: SessionView) => void;
   readonly onPinTarget: (target: TargetView) => void;
   readonly onRenameTarget?: (target: TargetView, name: string) => void;
@@ -2359,6 +2363,7 @@ export function projectRemoteMachineSearchResults(
       state: "idle",
       pinned: false,
       archived: filters.status === "archived",
+      taskTags: [],
       lastActivityAt: contentMatch.match.createdAt
     };
     const hits = [...(previous?.hits ?? []), contentMatch.match]
@@ -2649,6 +2654,9 @@ function sessionCallbacks(
       props.onClose();
     },
     onRename: props.onRename,
+    taskTags: props.snapshot.taskTags,
+    onToggleTaskTag: props.onToggleTaskTag ?? (() => undefined),
+    onManageTaskTags: props.onManageTaskTags ?? (() => undefined),
     onPin: props.onPin,
     onArchive: props.onArchive,
     onPrefetchRemoval: props.onPrefetchRemoval ?? (() => undefined),
@@ -2670,6 +2678,9 @@ interface SessionSectionCallbacks {
   readonly onSelect: (session: SessionView, modifiers?: SessionSelectionModifiers) => void;
   readonly onBrowseFiles: (session: SessionView) => void;
   readonly onRename: (session: SessionView, name: string) => void;
+  readonly taskTags: AppSnapshot["taskTags"];
+  readonly onToggleTaskTag: (session: SessionView, tagId: string, attached: boolean) => void;
+  readonly onManageTaskTags: (session: SessionView) => void;
   readonly onPin: (session: SessionView) => void;
   readonly onArchive: (session: SessionView) => void;
   readonly onPrefetchRemoval: (session: SessionView) => void;
@@ -3406,7 +3417,7 @@ function RemoteMachineSessionRow({ cache, session, presence, locale, t, onOpen }
       onClick={() => onOpen(cache.profileId, session.id)}
     >
       <MessageSquare className="session-row__agent" aria-hidden="true" />
-      <span className="session-row__copy"><SidebarTitleMarquee title={session.name}>{session.name}</SidebarTitleMarquee><small>{session.targetName ?? cache.name} · {stateLabel}</small></span>
+      <span className="session-row__copy"><span className="session-row__title-line"><SidebarTitleMarquee title={session.name}>{session.name}</SidebarTitleMarquee><TaskTagDots tags={session.taskTags} t={t} /></span><small>{session.targetName ?? cache.name} · {stateLabel}</small></span>
       {session.pinned && <Pin className="session-row__pin" aria-label={t("session.pin")} />}
       <span className="session-row__right-slot">{cachedStatus === undefined ? <span
         className={cx("remote-machine-session__presence", presence !== "online" && "is-offline")}
@@ -4250,7 +4261,7 @@ function SessionSection({ title, sessions, targets, activeSessionId, locale, col
   );
 }
 
-function SessionRow({ session, active, locale, targetName, match, t, priorityContext, sessionInfoFields, sessionProfileId, projectNameFor, environmentNameFor, onSelect, onRename, onPin, onArchive, onPrefetchRemoval, onDelete, onCopyTaskLink, onExportPortableSession, canExportPortableSession, onSplitSession, onOpenSessionWindow, projectMenuTargets, movingSessionProjectIds, onMoveSessionProject, selectedSessionIds }: { readonly session: SessionView; readonly active: boolean; readonly locale: string; readonly targetName?: string; readonly match?: SidebarFuzzyMatch; readonly t: Translator } & SessionSectionCallbacks & SessionPriorityProps & SessionDisplayProps): JSX.Element {
+function SessionRow({ session, active, locale, targetName, match, t, priorityContext, sessionInfoFields, sessionProfileId, projectNameFor, environmentNameFor, onSelect, onRename, taskTags, onToggleTaskTag, onManageTaskTags, onPin, onArchive, onPrefetchRemoval, onDelete, onCopyTaskLink, onExportPortableSession, canExportPortableSession, onSplitSession, onOpenSessionWindow, projectMenuTargets, movingSessionProjectIds, onMoveSessionProject, selectedSessionIds }: { readonly session: SessionView; readonly active: boolean; readonly locale: string; readonly targetName?: string; readonly match?: SidebarFuzzyMatch; readonly t: Translator } & SessionSectionCallbacks & SessionPriorityProps & SessionDisplayProps): JSX.Element {
   const indicator = sidebarSessionIndicatorState(session, priorityContext);
   const stateLabel = indicator === undefined
     ? sessionStateLabel(session.state, t)
@@ -4427,7 +4438,7 @@ function SessionRow({ session, active, locale, targetName, match, t, priorityCon
         }}
       >
         <MessageSquare className="session-row__agent" aria-hidden="true" />
-        <span className="session-row__copy"><SidebarTitleMarquee title={session.name}><HighlightedText value={session.name} ranges={match?.nameRanges ?? []} /></SidebarTitleMarquee>{session.pinned && session.summary !== undefined && <span className="session-row__summary">{session.summary}</span>}<small>{targetName !== undefined && <><HighlightedText value={targetName} ranges={match?.targetRanges ?? []} /> · </>}{stateLabel}</small></span>
+        <span className="session-row__copy"><span className="session-row__title-line"><SidebarTitleMarquee title={session.name}><HighlightedText value={session.name} ranges={match?.nameRanges ?? []} /></SidebarTitleMarquee><TaskTagDots tags={session.taskTags} t={t} /></span>{session.pinned && session.summary !== undefined && <span className="session-row__summary">{session.summary}</span>}<small>{targetName !== undefined && <><HighlightedText value={targetName} ranges={match?.targetRanges ?? []} /> · </>}{stateLabel}</small></span>
         {session.pinned && <Pin className="session-row__pin" aria-label={t("session.pin")} />}
         <span className="session-row__right-slot">{indicator === undefined
           ? infoPieces.map((piece) => <span className={cx("session-row__metadata", `session-row__metadata--${piece.field}`)} key={piece.field}>{piece.field === "pr"
@@ -4460,6 +4471,9 @@ function SessionRow({ session, active, locale, targetName, match, t, priorityCon
         session={session}
         t={t}
         onStartRename={beginRename}
+        taskTags={taskTags}
+        onToggleTaskTag={onToggleTaskTag}
+        onManageTaskTags={onManageTaskTags}
         onPin={onPin}
         onArchive={onArchive}
         onPrefetchRemoval={onPrefetchRemoval}
@@ -4492,10 +4506,13 @@ interface SessionMenuContextRequest {
   readonly sequence: number;
 }
 
-function SessionActionsMenu({ session, t, onStartRename, onPin, onArchive, onPrefetchRemoval, onDelete, onCopyTaskLink, onExportPortableSession, onSplitSession, onOpenSessionWindow, projectMenuTargets, moving, onMoveSessionProject, contextMenuRequest, onContextMenuRequestHandled }: {
+function SessionActionsMenu({ session, t, onStartRename, taskTags, onToggleTaskTag, onManageTaskTags, onPin, onArchive, onPrefetchRemoval, onDelete, onCopyTaskLink, onExportPortableSession, onSplitSession, onOpenSessionWindow, projectMenuTargets, moving, onMoveSessionProject, contextMenuRequest, onContextMenuRequestHandled }: {
   readonly session: SessionView;
   readonly t: Translator;
   readonly onStartRename: () => void;
+  readonly taskTags: AppSnapshot["taskTags"];
+  readonly onToggleTaskTag: (session: SessionView, tagId: string, attached: boolean) => void;
+  readonly onManageTaskTags: (session: SessionView) => void;
   readonly onPin: (session: SessionView) => void;
   readonly onArchive: (session: SessionView) => void;
   readonly onPrefetchRemoval: (session: SessionView) => void;
@@ -4600,7 +4617,7 @@ function SessionActionsMenu({ session, t, onStartRename, onPin, onArchive, onPre
         );
     if (clamped.x !== position.x || clamped.y !== position.y) setPosition(clamped);
     const frame = ownerWindow.requestAnimationFrame(() => {
-      const items = menu.querySelectorAll<HTMLButtonElement>("[role='menuitem']:not([disabled])");
+      const items = menu.querySelectorAll<HTMLButtonElement>("[role='menuitem']:not([disabled]), [role='menuitemcheckbox']:not([disabled])");
       (focusTargetRef.current === "last" ? items.item(items.length - 1) : items.item(0))?.focus({ preventScroll: true });
     });
     return () => ownerWindow.cancelAnimationFrame(frame);
@@ -4658,7 +4675,7 @@ function SessionActionsMenu({ session, t, onStartRename, onPin, onArchive, onPre
     action(session);
   };
   const onMenuKeyDown = (event: KeyboardEvent<HTMLDivElement>): void => {
-    const items = [...event.currentTarget.querySelectorAll<HTMLButtonElement>("[role='menuitem']:not([disabled])")];
+    const items = [...event.currentTarget.querySelectorAll<HTMLButtonElement>("[role='menuitem']:not([disabled]), [role='menuitemcheckbox']:not([disabled])")];
     const activeIndex = items.indexOf(event.currentTarget.ownerDocument.activeElement as HTMLButtonElement);
     if (event.key === "ArrowRight" && event.currentTarget.ownerDocument.activeElement === projectTriggerRef.current) {
       event.preventDefault();
@@ -4751,6 +4768,16 @@ function SessionActionsMenu({ session, t, onStartRename, onPin, onArchive, onPre
       >
         {!session.archived && <button type="button" role="menuitem" onClick={() => run(onPin)}>{session.pinned ? t("session.unpin") : t("session.pin")}</button>}
         <button type="button" role="menuitem" onClick={() => { close(false); onStartRename(); }}>{t("session.rename")}</button>
+        {taskTags.length > 0 && <>
+          <div className="menu-separator" role="separator" />
+          {taskTags.slice(0, 7).map((tag) => {
+            const attached = session.taskTags?.some((candidate) => candidate.id === tag.id) === true;
+            return <button key={tag.id} type="button" role="menuitemcheckbox" aria-checked={attached} className="task-tag-menu-item" onClick={() => run((selected) => onToggleTaskTag(selected, tag.id, !attached))}>
+              <TaskTagDot tag={tag} t={t} /><span>{taskTagDisplayName(tag, t)}</span>{attached && <Check aria-hidden="true" />}
+            </button>;
+          })}
+        </>}
+        <button type="button" role="menuitem" onClick={() => run(onManageTaskTags)}><Tags aria-hidden="true" />{t("taskTags.manage")}</button>
         {!session.archived && session.remoteWorkspace === undefined && <button
           ref={projectTriggerRef}
           type="button"

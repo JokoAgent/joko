@@ -32,6 +32,8 @@ import type {
   SubagentRunDetail,
   SubagentRunState,
   SubagentTranscriptEntry,
+  TaskTagColor,
+  TaskTagDescriptor,
   TargetDescriptor,
   TargetId,
   TurnExecutionOverrides,
@@ -468,6 +470,64 @@ export function remoteHostFailureIsRetryable(code: RemoteHostFailureCode): boole
 export interface StoredSession {
   readonly descriptor: SessionDescriptor;
   readonly revision: bigint;
+}
+
+export interface TaskTagRecord extends TaskTagDescriptor {}
+
+export interface TaskTagDeletePreview {
+  readonly tagId: string;
+  readonly affectedSessionCount: number;
+  readonly tagRevision: bigint;
+  readonly associationRevision: bigint;
+}
+
+export interface CreateTaskTagInput {
+  readonly originSessionId: SessionId;
+  readonly name: string;
+  readonly color: TaskTagColor;
+  readonly expectedCatalogRevision: bigint;
+  readonly presetId?: string;
+  readonly createdAt?: UnixMillis;
+}
+
+export interface UpdateTaskTagInput {
+  readonly originSessionId: SessionId;
+  readonly tagId: string;
+  readonly expectedRevision: bigint;
+  readonly name?: string;
+  readonly color?: TaskTagColor;
+  readonly updatedAt?: UnixMillis;
+}
+
+export interface ReorderTaskTagsInput {
+  readonly originSessionId: SessionId;
+  readonly tagIds: readonly string[];
+  readonly expectedCatalogRevision: bigint;
+  readonly updatedAt?: UnixMillis;
+}
+
+export interface SetSessionTaskTagsInput {
+  readonly originSessionId: SessionId;
+  readonly sessionIds: readonly SessionId[];
+  readonly tagIds: readonly string[];
+  readonly attached: boolean;
+  readonly updatedAt?: UnixMillis;
+}
+
+export interface DeleteTaskTagInput extends TaskTagDeletePreview {
+  readonly originSessionId: SessionId;
+  readonly deletedAt?: UnixMillis;
+}
+
+export interface TaskTagSessionResult {
+  readonly sessionId: SessionId;
+  readonly tags: readonly TaskTagRecord[];
+}
+
+export interface TaskTagSessionPage {
+  readonly sessions: readonly StoredSession[];
+  readonly hasMore: boolean;
+  readonly totalSize: number;
 }
 
 export type ObjectiveStatus =

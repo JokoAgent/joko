@@ -2570,7 +2570,11 @@ export class PiBackendAdapter implements
       if (!sameNativeBinding(shadow.binding, binding)) throw new Error("Pi changed the reserved navigation identity.");
       const nativeHistory = await this.getNativeHistoryProjection(shadowContext);
       const emptyHistory = await this.#getEntriesRaw(undefined, shadow, context.signal);
-      if (emptyHistory.leafId !== null || emptyHistory.entries.length !== 0
+      // Pi 0.85 persists the selected model and thinking level while opening a
+      // brand-new Session. They configure an otherwise empty conversation and
+      // are safe to hydrate as status; any content-bearing or unknown entry is
+      // still a failed detached-start confirmation.
+      if (emptyHistory.entries.some((entry) => entry.type !== "model_change" && entry.type !== "thinking_level_change")
         || nativeHistory.events.some((event) => event.payload.type !== "status")) {
         throw new Error("Pi did not confirm an empty native conversation.");
       }
@@ -4866,6 +4870,7 @@ export class PiBackendAdapter implements
         context,
         artifactDirectory,
         wasAbortRequested: () => runtime.abortRequested,
+        isFastMode: () => runtime.control.fastMode,
         redactValues,
         artifactCache: this.#artifactRefsBySession.get(context.sessionId) ?? this.#createArtifactRefCache(context.sessionId)
       });

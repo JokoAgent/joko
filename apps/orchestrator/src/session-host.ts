@@ -12925,7 +12925,7 @@ export class SessionHost {
             : { cacheWriteMicrosPerMillion: priceOverride.cacheWriteCostMicrosPerMillion })
         };
     const currencyCode = reportedCostMicros === undefined
-      ? priceOverride?.currencyCode ?? "USD"
+      ? priceOverride?.currencyCode ?? model?.pricing?.currencyCode ?? "USD"
       : "USD";
     const result = store.recordUsageObservation({
       ownerId: this.#usageOwnerId,
@@ -15888,11 +15888,22 @@ function backendAuthenticationRequiredFailure(backend: BackendDescriptor): Publi
 }
 
 function modelUsageCostRates(model: ProviderModel, usage: UsageSnapshot) {
+  if (model.pricing === undefined
+    && model.cost.input === 0
+    && model.cost.output === 0
+    && model.cost.cacheRead === 0
+    && model.cost.cacheWrite === 0) return undefined;
   const pricingContext = usage.pricingContext;
   const longContext = model.pricing?.longContext;
+  const fastMode = pricingContext?.fastMode === true;
+  const inputTokenThreshold = fastMode
+    ? longContext?.fastInputTokenThreshold ?? longContext?.inputTokenThreshold
+    : longContext?.inputTokenThreshold;
   const tier = longContext !== undefined && pricingContext !== undefined
-    && pricingContext.inputTokens > longContext.inputTokenThreshold ? longContext : undefined;
-  const fastMultiplier = pricingContext?.fastMode === true ? model.pricing?.fastModeMultiplier ?? 1 : 1;
+    && inputTokenThreshold !== undefined && pricingContext.inputTokens > inputTokenThreshold ? longContext : undefined;
+  const fastMultiplier = fastMode
+    ? tier?.fastModeMultiplier ?? model.pricing?.fastModeMultiplier ?? 1
+    : 1;
   return {
     inputMicrosPerMillion: modelCostMicros(model.cost.input * fastMultiplier * (tier?.inputMultiplier ?? 1)),
     outputMicrosPerMillion: modelCostMicros(model.cost.output * fastMultiplier * (tier?.outputMultiplier ?? 1)),

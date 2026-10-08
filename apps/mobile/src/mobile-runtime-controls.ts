@@ -69,6 +69,9 @@ export interface MobileRuntimeControls {
   readonly permissionModes: readonly PermissionMode[];
   readonly canSetPermission: boolean;
   readonly canSetPlanMode: boolean;
+  readonly favorites: readonly MobileModelFavoriteConfiguration[];
+  readonly favoriteRevision: bigint;
+  readonly favoritesSeeded: boolean;
 }
 
 export interface MobileModelControlSelection {
@@ -77,6 +80,15 @@ export interface MobileModelControlSelection {
   readonly effortId?: string;
   readonly fastMode: boolean;
 }
+
+export interface MobileModelFavoriteConfiguration extends MobileModelControlSelection {
+  readonly favoriteId: string;
+  readonly backendId: string;
+}
+
+export type MobileModelFavoriteMutation =
+  | { readonly kind: "add" | "replace" | "seed"; readonly item: MobileModelFavoriteConfiguration }
+  | { readonly kind: "remove"; readonly favoriteId: string };
 
 export interface MobileTrustedModelAuthority {
   readonly selection: MobileModelControlSelection;
@@ -154,7 +166,10 @@ export function resolveMobileRuntimeControls(
   if (targets[0]!.backendId !== session.backendId || ownerTargets[0]!.backendId !== session.backendId
     || !sameBackendAuthority(ownerBackend, backend)) return undefined;
   const backendSettings = owner.settings?.backends.filter((candidate) => candidate.backendId === session.backendId) ?? [];
-  if (backendSettings.length > 1) return undefined;
+  const favoriteSettings = owner.settings.modelFavorites;
+  if (backendSettings.length > 1 || favoriteSettings?.revision === undefined) return undefined;
+  const favorites = mobileModelFavorites(favoriteSettings.favorites);
+  if (favorites === undefined) return undefined;
 
   const modelList = typedModelCapability(backend, capabilityNames.modelList);
   const modelSwitch = typedModelCapability(backend, capabilityNames.modelSwitch);
@@ -260,7 +275,10 @@ export function resolveMobileRuntimeControls(
     canSetFastMode,
     permissionModes,
     canSetPermission,
-    canSetPlanMode
+    canSetPlanMode,
+    favorites: favorites.filter((favorite) => favorite.backendId === session.backendId),
+    favoriteRevision: favoriteSettings.revision.value,
+    favoritesSeeded: favoriteSettings.seeded
   };
 }
 
@@ -430,6 +448,57 @@ export function assertMobileModelSelection(
     ...(effortId ? { effortId } : {}),
     fastMode: selection.fastMode
   };
+}
+
+export function assertMobileModelFavoriteMutation(
+  controls: MobileRuntimeControls,
+  change: MobileModelFavoriteMutation
+): MobileModelFavoriteMutation {
+  if (change.kind === "remove") {
+    if (!strictText(change.favoriteId)
+      || !controls.favorites.some((favorite) => favorite.favoriteId === change.favoriteId)) {
+      throw new Error("This model favorite is no longer available.");
+    }
+    return { kind: "remove", favoriteId: change.favoriteId };
+  }
+  const item = change.item;
+  if (!strictText(item.favoriteId) || item.favoriteId.length > 128 || item.backendId !== controls.backend.backendId) {
+    throw new Error("The model favorite identity is invalid for this Backend.");
+  }
+  const existing = controls.favorites.find((favorite) => favorite.favoriteId === item.favoriteId);
+  if ((change.kind === "replace") !== (existing !== undefined)) {
+    throw new Error(change.kind === "replace" ? "This model favorite is no longer available." : "Model favorite identity already exists.");
+  }
+  if (existing !== undefined && (existing.backendId !== item.backendId || existing.providerId !== item.providerId
+    || existing.modelId !== item.modelId)) {
+    throw new Error("Model favorite route identity cannot change.");
+  }
+  if (change.kind === "seed" && controls.favoritesSeeded) {
+    throw new Error("The default model favorite was already considered.");
+  }
+  const route = controls.models.find((candidate) => candidate.providerId === item.providerId
+    && candidate.modelId === item.modelId);
+  if (route === undefined) throw new Error("This model route is no longer available.");
+  if (item.effortId !== undefined && (!controls.canSetEffort
+    || !route.efforts.some((effort) => effort.id === item.effortId))) {
+    throw new Error("This effort is not available for model favorites.");
+  }
+  if (item.fastMode && (!controls.canSetFastMode || !route.supportsFastMode)) {
+    throw new Error("Fast Mode is not available for model favorites.");
+  }
+  const normalized: MobileModelFavoriteConfiguration = {
+    favoriteId: item.favoriteId,
+    backendId: item.backendId,
+    providerId: route.providerId,
+    modelId: route.modelId,
+    ...(item.effortId === undefined ? {} : { effortId: item.effortId }),
+    fastMode: item.fastMode
+  };
+  if (controls.favorites.some((favorite) => favorite.favoriteId !== normalized.favoriteId
+    && sameFavoriteConfiguration(favorite, normalized))) {
+    throw new Error("The same model favorite configuration is already saved.");
+  }
+  return { kind: change.kind, item: normalized };
 }
 
 export function assertMobilePermissionMode(
@@ -654,6 +723,43 @@ function modelKey(model: ModelDescriptor): string | undefined {
 
 function modelRouteKey(providerId: string, modelId: string): string {
   return JSON.stringify([providerId, modelId]);
+}
+
+function mobileModelFavorites(
+  values: NonNullable<NonNullable<Snapshot["settings"]>["modelFavorites"]>["favorites"]
+): readonly MobileModelFavoriteConfiguration[] | undefined {
+  const result: MobileModelFavoriteConfiguration[] = [];
+  const ids = new Set<string>();
+  for (const value of values) {
+    const model = value.selection?.model;
+    if (!strictText(value.favoriteId) || value.favoriteId.length > 128 || ids.has(value.favoriteId)
+      || !strictText(value.backendId) || value.backendId.length > 128
+      || !strictText(model?.providerId) || model.providerId.length > 128
+      || !strictText(model.modelId) || model.modelId.length > 256
+      || (value.selection!.effortId !== "" && (!strictText(value.selection!.effortId) || value.selection!.effortId.length > 128))) {
+      return undefined;
+    }
+    const item: MobileModelFavoriteConfiguration = {
+      favoriteId: value.favoriteId,
+      backendId: value.backendId,
+      providerId: model.providerId,
+      modelId: model.modelId,
+      ...(value.selection!.effortId === "" ? {} : { effortId: value.selection!.effortId }),
+      fastMode: value.selection!.fastMode
+    };
+    if (result.some((candidate) => sameFavoriteConfiguration(candidate, item))) return undefined;
+    ids.add(item.favoriteId);
+    result.push(item);
+  }
+  return result;
+}
+
+function sameFavoriteConfiguration(
+  left: MobileModelFavoriteConfiguration,
+  right: MobileModelFavoriteConfiguration
+): boolean {
+  return left.backendId === right.backendId && left.providerId === right.providerId
+    && left.modelId === right.modelId && left.effortId === right.effortId && left.fastMode === right.fastMode;
 }
 
 function compareModelRoutes(left: MobileModelRoute, right: MobileModelRoute): number {

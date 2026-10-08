@@ -49,7 +49,7 @@ export async function createAuditedDesktopDevicePeerRuntimeExecutables(options: 
   const piRoot = resolve(runtimeRoot, "node_modules/@earendil-works/pi-coding-agent");
   const piManifest = await readManifest(piRoot, "package.json");
   if (piManifest["name"] !== "@earendil-works/pi-coding-agent"
-    || piManifest["version"] !== "0.84.4"
+    || piManifest["version"] !== "0.85.1"
     || !isRecord(piManifest["bin"])
     || piManifest["bin"]["pi"] !== "dist/bundle/cli.js") {
     throw new Error("The staged Device peer Pi runtime has an unexpected identity.");

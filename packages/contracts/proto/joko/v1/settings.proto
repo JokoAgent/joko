@@ -858,6 +858,21 @@ message ToolPolicySettings {
   EntityVersion version = 9;
 }
 
+// One saved model configuration. The favorite identity is stable across edits;
+// the route remains the exact current-v1 Backend/Provider/Model tuple.
+message ModelFavoriteConfiguration {
+  string favorite_id = 1;
+  string backend_id = 2;
+  ModelSelection selection = 3;
+}
+
+message ModelFavoriteSettings {
+  repeated ModelFavoriteConfiguration favorites = 1;
+  // Retains the one-time default seed decision even after its row is removed.
+  bool seeded = 2;
+  Revision revision = 3;
+}
+
 enum DiagnosticLevel {
   DIAGNOSTIC_LEVEL_UNSPECIFIED = 0;
   DIAGNOSTIC_LEVEL_ERRORS = 1;
@@ -892,6 +907,7 @@ message SettingsSnapshot {
   VoiceInputServiceSettings voice_input = 29;
   AuxiliaryTextSettings auxiliary_text = 30;
   repeated SubagentModelSettings subagent_models = 31;
+  ModelFavoriteSettings model_favorites = 32;
 }
 
 message AppearanceSettingsPatch {

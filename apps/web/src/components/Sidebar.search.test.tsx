@@ -238,7 +238,7 @@ describe("Sidebar progressive conversation search", () => {
           name: "East",
           origin: "https://east.example.test",
           updatedAt: 1,
-          sessions: [{ id: "session-a", name: "Remote task", state: "idle", pinned: false, archived: false, lastActivityAt: 1 }]
+          sessions: [{ id: "session-a", name: "Remote task", state: "idle", pinned: false, archived: false, taskTags: [], lastActivityAt: 1 }]
         }],
         selection: "all",
         onSelectionChange: vi.fn(),
@@ -500,7 +500,7 @@ function remoteMachineControl(): NonNullable<SidebarProps["machineControl"]> {
       name: "East",
       origin: "https://east.example.test",
       updatedAt: 1,
-      sessions: [{ id: "session-a", name: "Remote task", state: "idle", pinned: false, archived: false, lastActivityAt: 1 }]
+      sessions: [{ id: "session-a", name: "Remote task", state: "idle", pinned: false, archived: false, taskTags: [], lastActivityAt: 1 }]
     }],
     selection: "all",
     onSelectionChange: vi.fn(),

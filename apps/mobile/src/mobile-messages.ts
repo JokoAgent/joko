@@ -8,6 +8,7 @@ import { mobileUpdateMessages } from "./mobile-update-messages";
 import { mobileVoiceMessages } from "./mobile-voice-messages";
 import { mobileVoiceReadOnlyMessages } from "./mobile-voice-readonly-messages";
 import { mobileFilesMessages } from "./mobile-files-messages";
+import { mobileTaskTagMessages } from "./mobile-task-tag-messages";
 
 const en = {
   "common.about": "About",
@@ -317,6 +318,7 @@ const en = {
   "settings.connection.none": "Not connected",
   "settings.error": "The Settings action failed.",
   ...mobileTaskMessages.en,
+  ...mobileTaskTagMessages.en,
   ...mobileAutomationMessages.en,
   ...mobileNativeIntentMessages.en,
   ...mobilePartnerMessages.en,
@@ -638,6 +640,7 @@ const zhCN: MobileMessageCatalog = {
   "settings.connection.none": "未连接",
   "settings.error": "设置操作失败。",
   ...mobileTaskMessages["zh-CN"],
+  ...mobileTaskTagMessages["zh-CN"],
   ...mobileAutomationMessages["zh-CN"],
   ...mobileNativeIntentMessages["zh-CN"],
   ...mobilePartnerMessages["zh-CN"],
@@ -956,6 +959,7 @@ const zhTW: MobileMessageCatalog = {
   "settings.connection.none": "未連線",
   "settings.error": "設定操作失敗。",
   ...mobileTaskMessages["zh-TW"],
+  ...mobileTaskTagMessages["zh-TW"],
   ...mobileAutomationMessages["zh-TW"],
   ...mobileNativeIntentMessages["zh-TW"],
   ...mobilePartnerMessages["zh-TW"],
@@ -1274,6 +1278,7 @@ const ja: MobileMessageCatalog = {
   "settings.connection.none": "未接続",
   "settings.error": "設定操作に失敗しました。",
   ...mobileTaskMessages.ja,
+  ...mobileTaskTagMessages.ja,
   ...mobileAutomationMessages.ja,
   ...mobileNativeIntentMessages.ja,
   ...mobilePartnerMessages.ja,
@@ -1592,6 +1597,7 @@ const ko: MobileMessageCatalog = {
   "settings.connection.none": "연결되지 않음",
   "settings.error": "설정 작업에 실패했습니다.",
   ...mobileTaskMessages.ko,
+  ...mobileTaskTagMessages.ko,
   ...mobileAutomationMessages.ko,
   ...mobileNativeIntentMessages.ko,
   ...mobilePartnerMessages.ko,

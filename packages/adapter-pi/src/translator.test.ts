@@ -121,6 +121,7 @@ describe("PiEventTranslator", () => {
         cacheReadTokens: 1,
         cacheWriteTokens: 0,
         totalTokens: 10,
+        pricingContext: { inputTokens: 8 },
         cost: 0.01
       },
       generationDurationMs: 1_200,

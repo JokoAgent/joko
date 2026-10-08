@@ -15,6 +15,7 @@ import {
   LanDiscoveryService,
   DurableWorkspaceRunCapture,
   HistoryMaintenance,
+  ModelFavoriteSettings,
   cleanHistoryMaintenanceCopy,
   OperationalWorkspaceSnapshotRepository,
   OperationalArtifactRepository,
@@ -423,6 +424,7 @@ export class OrchestratorE2eFixture {
       vault: await CredentialVault.open(join(dataDirectory, "credentials", "master.key"))
     });
     await voiceDictionaryPeers?.initialize();
+    const modelFavorites = new ModelFavoriteSettings(store);
     const application: OrchestratorApplication = {
       config,
       store,
@@ -451,6 +453,7 @@ export class OrchestratorE2eFixture {
       projectBackendProviderAuthentication,
       holdSubagentSmartRoutingDispatch: () => undefined,
       refreshSubagentSmartRouting: restartBackend,
+      modelFavorites,
       browserActivity: [],
       contacts,
       ...(options.terminals === undefined ? {} : { terminals: options.terminals }),
