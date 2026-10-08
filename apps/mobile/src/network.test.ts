@@ -163,6 +163,7 @@ describe("mobile Extension network", () => {
     const first = extensionWire(1, "Mail");
     const second = extensionWire(2, "Calendar");
     const tokens: string[] = [];
+    const detailSessions: (string | undefined)[] = [];
     let listCall = 0;
     let detail = first;
     const fetcher = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
@@ -186,7 +187,9 @@ describe("mobile Extension network", () => {
         })), { headers });
       }
       expect(path).toBe("/joko.v1.ExtensionService/GetExtension");
-      expect(fromBinary(GetExtensionRequestSchema, body)).toMatchObject({ extensionId: first.extensionId });
+      const request = fromBinary(GetExtensionRequestSchema, body);
+      expect(request).toMatchObject({ extensionId: first.extensionId });
+      detailSessions.push(request.sessionId);
       return new Response(toBinary(GetExtensionResponseSchema, create(GetExtensionResponseSchema, {
         extension: detail,
         catalogRevision: create(RevisionSchema, { value: 9n })
@@ -201,6 +204,9 @@ describe("mobile Extension network", () => {
         extensionId: first.extensionId,
         name: "Mail"
       });
+      await expect(mobileNetwork.getExtensionForRuntime(credential, first.extensionId, "session-one"))
+        .resolves.toMatchObject({ extensionId: first.extensionId, name: "Mail" });
+      expect(detailSessions).toEqual([undefined, "session-one"]);
 
       detail = second;
       await expect(mobileNetwork.getExtension(credential, first.extensionId)).rejects.toThrow(/mismatched/u);

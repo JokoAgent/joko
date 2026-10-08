@@ -54,6 +54,7 @@ vi.mock("react-native", async () => {
       ListEmptyComponent?: React.ReactNode;
     }) => React.createElement("div", {}, data.length === 0 ? ListEmptyComponent
       : data.map((item, index) => React.createElement(React.Fragment, { key: index }, renderItem({ item, index })))),
+    Modal: element("div"),
     Pressable: element("button"),
     ScrollView: element("div"),
     StyleSheet: { create: <T,>(value: T) => value, hairlineWidth: 1 },
@@ -120,6 +121,10 @@ function transport(ownerKey = "owner-a", value = catalog()): MobileExtensionTran
     completeSetup: vi.fn(async (expected) => ({ catalog: value, extension: expected })),
     cancelSetup: vi.fn(async (expected) => ({ catalog: value, extension: expected })),
     revokeSetup: vi.fn(async (expected) => ({ catalog: value, extension: expected })),
+    tasks: vi.fn(() => []),
+    useCommand: vi.fn(async (_expected, _command, destination) => destination.kind === "newTask"
+      ? { kind: "newTask" as const }
+      : { kind: "task" as const, sessionId: destination.sessionId }),
     reconcile: vi.fn(async () => undefined),
     dismiss: vi.fn(async () => undefined)
   };
@@ -128,6 +133,8 @@ function transport(ownerKey = "owner-a", value = catalog()): MobileExtensionTran
 let container: HTMLDivElement;
 let root: Root;
 const onBack = vi.fn();
+const onOpenNewTask = vi.fn();
+const onOpenTask = vi.fn();
 
 async function render(active?: MobileExtensionTransport) {
   if (!root) {
@@ -137,7 +144,7 @@ async function render(active?: MobileExtensionTransport) {
   }
   await act(async () => {
     root.render(createElement(MobileExtensionsScreen, {
-      colors, locale: "en", transport: active, onBack
+      colors, locale: "en", transport: active, onBack, onOpenNewTask, onOpenTask
     }));
   });
 }
@@ -174,6 +181,8 @@ afterEach(() => {
   native.back = undefined;
   native.alert.mockReset();
   onBack.mockReset();
+  onOpenNewTask.mockReset();
+  onOpenTask.mockReset();
 });
 
 describe("MobileExtensionsScreen", () => {
@@ -408,6 +417,106 @@ describe("MobileExtensionsScreen", () => {
     await act(async () => finish({ catalog: catalog([disabled]), extension: disabled }));
     expect(container.textContent).toContain("Calendar");
     expect(container.textContent).not.toContain("Review messages that need attention");
+  });
+
+  it("prefills a new task through the exact command handoff without sending", async () => {
+    const usable = extensionFixture({
+      commands: [{ name: "review", description: "Review mail", sessionId: "advertising-task" }]
+    });
+    const active = transport("owner-use-new", catalog([usable]));
+    vi.mocked(active.tasks).mockReturnValue([{ sessionId: "advertising-task", displayName: "Inbox", targetName: "Mail project" }]);
+    await render(active);
+    await press("View Mail");
+    await press("Use /review");
+
+    expect(container.textContent).toContain("never sent automatically");
+    expect(container.textContent).toContain("Inbox");
+    await press("Use in new task");
+
+    expect(active.useCommand).toHaveBeenCalledExactlyOnceWith(
+      usable,
+      usable.commands[0],
+      { kind: "newTask" },
+      expect.any(AbortSignal)
+    );
+    expect(onOpenNewTask).toHaveBeenCalledOnce();
+    expect(onOpenTask).not.toHaveBeenCalled();
+  });
+
+  it("searches applicable live tasks and opens the selected command draft", async () => {
+    const usable = extensionFixture({
+      commands: [{ name: "review", description: "Review mail", sessionId: "advertising-task" }]
+    });
+    const active = transport("owner-use-task", catalog([usable]));
+    vi.mocked(active.tasks).mockReturnValue([
+      { sessionId: "task-alpha", displayName: "Alpha", targetName: "Project One" },
+      { sessionId: "task-beta", displayName: "Beta", targetName: "Project Two" }
+    ]);
+    await render(active);
+    await press("View Mail");
+    await press("Use /review");
+    await changeInput("Search current tasks", "beta");
+
+    expect(container.textContent).not.toContain("Alpha");
+    expect(container.textContent).toContain("Beta");
+    await press("Use /review in Beta");
+
+    expect(active.useCommand).toHaveBeenCalledExactlyOnceWith(
+      usable,
+      usable.commands[0],
+      { kind: "task", sessionId: "task-beta" },
+      expect.any(AbortSignal)
+    );
+    expect(onOpenTask).toHaveBeenCalledOnce();
+    expect(onOpenNewTask).not.toHaveBeenCalled();
+  });
+
+  it("keeps a failed handoff actionable and retires an in-flight handoff with its owner", async () => {
+    const usable = extensionFixture({
+      commands: [{ name: "review", description: "Review mail", sessionId: "advertising-task" }]
+    });
+    const active = transport("owner-use-old", catalog([usable]));
+    vi.mocked(active.tasks).mockReturnValue([{ sessionId: "task-one", displayName: "Inbox", targetName: "Mail project" }]);
+    vi.mocked(active.useCommand).mockRejectedValueOnce(new Error("runtime changed"));
+    await render(active);
+    await press("View Mail");
+    await press("Use /review");
+    await press("Use /review in Inbox");
+    expect(container.textContent).toContain("runtime changed");
+    expect(onOpenTask).not.toHaveBeenCalled();
+
+    let fail!: (error: Error) => void;
+    vi.mocked(active.useCommand).mockImplementationOnce(() => new Promise((_resolve, reject) => { fail = reject; }));
+    await press("Use /review in Inbox");
+    const signal = vi.mocked(active.useCommand).mock.calls.at(-1)?.[3];
+    const next = transport("owner-use-new", catalog([calendar]));
+    await render(next);
+    expect(signal?.aborted).toBe(false);
+    await act(async () => fail(new Error("owner changed")));
+    expect(onOpenTask).not.toHaveBeenCalled();
+    expect(container.textContent).not.toContain("runtime changed");
+  });
+
+  it("keeps an authenticated task handoff alive through its intentional selection refresh", async () => {
+    const usable = extensionFixture({
+      commands: [{ name: "review", description: "Review mail", sessionId: "advertising-task" }]
+    });
+    const active = transport("owner-use-refresh", catalog([usable]));
+    vi.mocked(active.tasks).mockReturnValue([{ sessionId: "task-one", displayName: "Inbox", targetName: "Mail project" }]);
+    let finish!: (value: { readonly kind: "task"; readonly sessionId: string }) => void;
+    vi.mocked(active.useCommand).mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+    await render(active);
+    await press("View Mail");
+    await press("Use /review");
+    await press("Use /review in Inbox");
+    const signal = vi.mocked(active.useCommand).mock.calls[0]?.[3];
+
+    await render(undefined);
+    expect(signal?.aborted).toBe(false);
+    expect(container.textContent).toContain("Preparing the command draft");
+    await act(async () => finish({ kind: "task", sessionId: "task-one" }));
+
+    expect(onOpenTask).toHaveBeenCalledOnce();
   });
 
   it("shows a bounded offline state", async () => {

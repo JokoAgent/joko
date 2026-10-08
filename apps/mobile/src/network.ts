@@ -168,6 +168,12 @@ export interface MobileNetwork {
   listPartnerSessions(credential: PairedCredential, partnerId: string, signal?: AbortSignal): Promise<ListPartnerSessionsResponse>;
   listExtensions(credential: PairedCredential, signal?: AbortSignal): Promise<MobileExtensionCatalog>;
   getExtension(credential: PairedCredential, extensionId: string, signal?: AbortSignal): Promise<MobileExtension>;
+  getExtensionForRuntime(
+    credential: PairedCredential,
+    extensionId: string,
+    sessionId: string,
+    signal?: AbortSignal
+  ): Promise<MobileExtension>;
   uploadExtensionSetupCredential(
     credential: PairedCredential,
     extensionId: string,
@@ -1427,6 +1433,20 @@ export const mobileNetwork: MobileNetwork = {
     if (!/^extension_[a-f0-9]{32}$/u.test(extensionId)) throw new Error("A current Extension is required.");
     const response = await createClient(ExtensionService, transport(credential.origin, credential.authKey))
       .getExtension({ extensionId }, options(signal));
+    signal?.throwIfAborted();
+    if (response.catalogRevision?.value === undefined || response.catalogRevision.value < 0n
+      || response.extension === undefined || response.extension.extensionId !== extensionId) {
+      throw new Error("The Joko node returned a mismatched Extension detail.");
+    }
+    const extension = projectMobileExtension(response.extension);
+    if (!extension.installed) throw new Error("The selected Extension is no longer installed on this Joko node.");
+    return extension;
+  },
+  async getExtensionForRuntime(credential, extensionId, sessionId, signal) {
+    if (!/^extension_[a-f0-9]{32}$/u.test(extensionId)) throw new Error("A current Extension is required.");
+    if (!/^[a-zA-Z0-9_-]{1,128}$/u.test(sessionId)) throw new Error("A current task runtime is required.");
+    const response = await createClient(ExtensionService, transport(credential.origin, credential.authKey))
+      .getExtension({ extensionId, sessionId }, options(signal));
     signal?.throwIfAborted();
     if (response.catalogRevision?.value === undefined || response.catalogRevision.value < 0n
       || response.extension === undefined || response.extension.extensionId !== extensionId) {

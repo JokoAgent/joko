@@ -67,11 +67,7 @@ export interface MobileExtension {
     readonly required: boolean;
     readonly granted: boolean;
   }[];
-  readonly commands: readonly {
-    readonly name: string;
-    readonly description: string;
-    readonly sessionId: string;
-  }[];
+  readonly commands: readonly MobileExtensionCommand[];
   readonly setup: {
     readonly state: "notRequired" | "required" | "inProgress" | "ready" | "cancelled" | "failed";
     readonly attemptId?: string;
@@ -130,6 +126,26 @@ export interface MobileExtensionMutationResult {
   readonly extension: MobileExtension;
 }
 
+export interface MobileExtensionCommand {
+  readonly name: string;
+  readonly description: string;
+  readonly sessionId: string;
+}
+
+export interface MobileExtensionTaskChoice {
+  readonly sessionId: string;
+  readonly displayName: string;
+  readonly targetName: string;
+}
+
+export type MobileExtensionUseDestination =
+  | { readonly kind: "newTask" }
+  | { readonly kind: "task"; readonly sessionId: string };
+
+export type MobileExtensionUseResult =
+  | { readonly kind: "newTask" }
+  | { readonly kind: "task"; readonly sessionId: string };
+
 export interface MobileExtensionTransport {
   readonly ownerKey: string;
   readonly pending: readonly MobileExtensionPendingMutation[];
@@ -154,6 +170,13 @@ export interface MobileExtensionTransport {
   completeSetup(expected: MobileExtension, signal: AbortSignal): Promise<MobileExtensionMutationResult>;
   cancelSetup(expected: MobileExtension, signal: AbortSignal): Promise<MobileExtensionMutationResult>;
   revokeSetup(expected: MobileExtension, signal: AbortSignal): Promise<MobileExtensionMutationResult>;
+  tasks(expected: MobileExtension): readonly MobileExtensionTaskChoice[];
+  useCommand(
+    expected: MobileExtension,
+    command: MobileExtensionCommand,
+    destination: MobileExtensionUseDestination,
+    signal: AbortSignal
+  ): Promise<MobileExtensionUseResult>;
   reconcile(operationId: string, signal: AbortSignal): Promise<void>;
   dismiss(operationId: string, signal: AbortSignal): Promise<void>;
 }

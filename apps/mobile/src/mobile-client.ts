@@ -83,11 +83,21 @@ import {
 import {
   mobileExtensionKey,
   type MobileExtension,
+  type MobileExtensionCommand,
   type MobileExtensionCredentialKind,
   type MobileExtensionMutationResult,
   type MobileExtensionPendingMutationKind,
-  type MobileExtensionTransport
+  type MobileExtensionTransport,
+  type MobileExtensionUseDestination,
+  type MobileExtensionUseResult
 } from "./mobile-extensions";
+import {
+  applyMobileExtensionUseCommand,
+  assertMobileExtensionTaskChoice,
+  mobileExtensionNewTaskTarget,
+  projectMobileExtensionTaskChoices,
+  resolveMobileExtensionUseCommand
+} from "./mobile-extension-use-handoff";
 import {
   artifactTitle,
   bytesToDataUri,
@@ -1226,6 +1236,126 @@ export class MobileClient {
       },
       signal
     );
+    const useCommand = (
+      expected: MobileExtension,
+      command: MobileExtensionCommand,
+      destination: MobileExtensionUseDestination,
+      signal: AbortSignal
+    ): Promise<MobileExtensionUseResult> => {
+      if (destination.kind === "newTask") return owned(signal, async (current) => {
+        if (pendingForExtension(expected.extensionId)) {
+          throw new Error("A previous change to this Extension still has an unresolved result. Check its operation receipt first.");
+        }
+        if (!this.newTaskDrafts) throw new Error("Retained new-task drafts are unavailable on this mobile client.");
+        const profileId = context.credential.profileId;
+        assertMobileExtensionTaskChoice(this.#state.owner, expected, command.sessionId);
+        const fresh = await this.network.getExtensionForRuntime(
+          context.credential,
+          expected.extensionId,
+          command.sessionId,
+          current
+        );
+        const resolved = resolveMobileExtensionUseCommand(expected, command, fresh, command.sessionId);
+        assertMobileExtensionTaskChoice(this.#state.owner, fresh, command.sessionId);
+        const targetId = mobileExtensionNewTaskTarget(this.#state.owner, fresh);
+        const identity = { profileId };
+        const snapshot = await this.newTaskDrafts.readSnapshot(identity);
+        requireCurrent(current);
+        if (snapshot.draft?.submission !== undefined) {
+          throw new Error("The current new-task draft is already being submitted.");
+        }
+        const original = snapshot.draft ?? { targetId: "", name: "", input: emptyMobileComposerDraft() };
+        const next = {
+          targetId: targetId ?? original.targetId,
+          name: original.name,
+          input: applyMobileExtensionUseCommand(original.input, resolved.name, false)
+        };
+        if (!this.newTaskDrafts.saveIfRevision(identity, next, snapshot.revision)) {
+          throw new Error("The new-task draft changed. The Extension command was not inserted.");
+        }
+        try {
+          await this.newTaskDrafts.flush(identity);
+          requireCurrent(current);
+          if (mobileExtensionNewTaskTarget(this.#state.owner, fresh) !== targetId) {
+            throw new Error("The Extension project changed before its command handoff completed.");
+          }
+        } catch (failure) {
+          try {
+            const committed = await this.newTaskDrafts.readSnapshot(identity);
+            if (committed.draft?.submission === undefined
+              && committed.draft?.targetId === next.targetId && committed.draft.name === next.name
+              && mobileComposerDraftsEqual(committed.draft.input, next.input)) {
+              const original = snapshot.draft ?? { targetId: "", name: "", input: emptyMobileComposerDraft() };
+              if (this.newTaskDrafts.saveIfRevision(identity, original, committed.revision)) {
+                await this.newTaskDrafts.flush(identity);
+              }
+            }
+          } catch {
+            // A concurrent draft edit owns the newer state and must not be overwritten.
+          }
+          throw failure;
+        }
+        return { kind: "newTask" };
+      });
+
+      return (async (): Promise<MobileExtensionUseResult> => {
+        if (!this.composerDrafts) throw new Error("Retained task drafts are unavailable on this mobile client.");
+        const prepared = await owned(signal, async (current) => {
+          if (pendingForExtension(expected.extensionId)) {
+            throw new Error("A previous change to this Extension still has an unresolved result. Check its operation receipt first.");
+          }
+          const profileId = context.credential.profileId;
+          assertMobileExtensionTaskChoice(this.#state.owner, expected, destination.sessionId);
+          const fresh = await this.network.getExtensionForRuntime(
+            context.credential,
+            expected.extensionId,
+            destination.sessionId,
+            current
+          );
+          const resolved = resolveMobileExtensionUseCommand(expected, command, fresh, destination.sessionId);
+          assertMobileExtensionTaskChoice(this.#state.owner, fresh, destination.sessionId);
+          const identity = { profileId, sessionId: destination.sessionId };
+          const snapshot = await this.composerDrafts!.readSnapshot(identity);
+          requireCurrent(current);
+          assertMobileExtensionTaskChoice(this.#state.owner, fresh, destination.sessionId);
+          const next = applyMobileExtensionUseCommand(snapshot.draft ?? emptyMobileComposerDraft(), resolved.name, true);
+          if (!this.composerDrafts!.saveIfRevision(identity, next, snapshot.revision)) {
+            throw new Error("The task draft changed. The Extension command was not inserted.");
+          }
+          await this.composerDrafts!.flush(identity);
+          requireCurrent(current);
+          return { fresh, identity, snapshot, next };
+        });
+        try {
+          if (signal.aborted || this.#credential !== context.credential
+            || this.#activeProfileId !== context.credential.profileId) {
+            throw new Error("The Extension catalog owner changed or the request was cancelled.");
+          }
+          assertMobileExtensionTaskChoice(this.#state.owner, prepared.fresh, destination.sessionId);
+          await this.select(destination.sessionId);
+          if (signal.aborted || this.#credential !== context.credential
+            || this.#activeProfileId !== context.credential.profileId
+            || this.#state.status !== "connected" || this.#state.selectedId !== destination.sessionId) {
+            throw new Error("The selected task did not remain current after the Extension command was inserted.");
+          }
+          assertMobileExtensionTaskChoice(this.#state.owner, prepared.fresh, destination.sessionId);
+        } catch (failure) {
+          try {
+            const committed = await this.composerDrafts.readSnapshot(prepared.identity);
+            if (committed.draft && mobileComposerDraftsEqual(committed.draft, prepared.next)) {
+              const restored = prepared.snapshot.draft
+                ? this.composerDrafts.saveIfRevision(prepared.identity, prepared.snapshot.draft, committed.revision)
+                : await this.composerDrafts.clearIfRevision(prepared.identity, committed.revision);
+              if (restored) await this.composerDrafts.flush(prepared.identity);
+            }
+          } catch {
+            // A concurrent draft edit owns the newer state and must not be overwritten.
+          }
+          throw failure;
+        }
+        return { kind: "task", sessionId: destination.sessionId };
+      })();
+    };
     const exactPending = (operationId: string) => {
       const matches = this.#state.pending.filter((receipt) => receipt.operationId === operationId
         && receipt.connectionId === context.credential.connectionId
@@ -1251,6 +1381,8 @@ export class MobileClient {
       completeSetup,
       cancelSetup,
       revokeSetup,
+      tasks: (expected) => isCurrent() ? projectMobileExtensionTaskChoices(this.#state.owner, expected) : [],
+      useCommand,
       reconcile: (operationId, signal) => owned(signal, async (current) => {
         exactPending(operationId);
         await this.reconcile();

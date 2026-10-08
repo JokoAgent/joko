@@ -15,10 +15,10 @@ import {
   EventCursorSchema, EventSchema, ImageRefSchema, MessageInputDelivery, MessageRole, ModelDescriptorSchema, ModelInputModality, ModelKeySchema, ModelOutputModality, ModelSelectionSchema,
   OperationMutationSchema, OperationState, OwnerSnapshotScopeSchema, PermissionMode,
   ProviderDescriptorSchema, ProviderKind, RevisionSchema, SessionMessageSearchMatchSchema, SessionSnapshotScopeSchema,
-  SettingsSnapshotSchema, SnapshotScopeSchema, UsageSchema,
+  SettingsSnapshotSchema, SnapshotScopeSchema, UsageSchema, ManagedResourceSchema,
   VoiceInputServiceSettingsSchema, VoiceInputServiceSettingsPatchSchema, VoiceInputTranscriptionProtocol,
   VoiceInputSaucSettingsSchema, VoiceInputSaucMode, VoiceInputSaucAuthentication,
-  QueueControlSchema, QueueDeliveryMode, QueueDispatchState, QueueItemSchema, QueueItemState, QueueSourceKind, ResourceKind,
+  QueueControlSchema, QueueDeliveryMode, QueueDispatchState, QueueItemSchema, QueueItemState, QueueSourceKind, ResourceKind, ResourceState,
   ReviewRunSchema, ReviewRunState, RuntimeCommandSchema, RuntimeCommandSource, SessionResourceSchema,
   RunState, ScheduleExecutionMode, ScheduleFireSource, ScheduleMisfirePolicy, ScheduleOverlapPolicy,
   ScheduleGeneratedSessionDisposition,
@@ -951,6 +951,7 @@ function fakeNetwork(): MobileNetwork {
     listPartnerSessions: vi.fn(async () => create(ListPartnerSessionsResponseSchema, { sessions: [] })),
     listExtensions: vi.fn(async () => ({ revision: 1n, recoveredFromCorruption: false, extensions: [] })),
     getExtension: vi.fn(async () => { throw new Error("No Extension fixture was configured."); }),
+    getExtensionForRuntime: vi.fn(async () => { throw new Error("No runtime-scoped Extension fixture was configured."); }),
     uploadExtensionSetupCredential: vi.fn(async () => { throw new Error("No Extension credential fixture was configured."); }),
     listPartnerPrivateThreads: vi.fn(async () => []),
     getPartnerPrivateThread: vi.fn(async () => { throw new Error("No private thread fixture was configured."); }),
@@ -2280,6 +2281,137 @@ describe("mobile Extension catalog authority", () => {
     })]);
     expect(network.listExtensions).not.toHaveBeenCalled();
   });
+
+  it("projects exact live task destinations and durably prefills a Resource-owned new task", async () => {
+    const network = fakeNetwork();
+    const owner = mobileExtensionOwnerSnapshot();
+    const command = { name: "review", description: "Review mail.", sessionId: "session" };
+    const extension = { ...mobileExtensionFixture(), commands: [command] };
+    network.readOwner = vi.fn(async () => ({ connection, device, snapshot: owner }));
+    network.readSession = vi.fn(async () => owner);
+    network.getExtensionForRuntime = vi.fn(async (_credential, _extensionId, sessionId) => ({
+      ...extension,
+      commands: [{ ...command, sessionId }]
+    }));
+    const drafts = memoryDraftStores();
+    drafts.newTask.save({ profileId: credential.profileId }, {
+      targetId: "",
+      name: "Keep title",
+      input: plainTextMobileComposerDraft("/old keep this")
+    });
+    await drafts.newTask.flush({ profileId: credential.profileId });
+    const saved = memoryStorage(credential);
+    vi.mocked(saved.storage.loadSelection).mockResolvedValue(undefined);
+    const app = client(network, saved.storage, undefined, undefined, undefined, undefined, drafts);
+    await app.start();
+    const transport = app.extensionCatalogTransport()!;
+
+    expect(transport.tasks(extension)).toEqual([{
+      sessionId: "session",
+      displayName: "Task",
+      targetName: "Project"
+    }]);
+    await expect(transport.useCommand(
+      extension,
+      command,
+      { kind: "newTask" },
+      new AbortController().signal
+    )).resolves.toEqual({ kind: "newTask" });
+
+    expect(await drafts.newTask.read({ profileId: credential.profileId })).toMatchObject({
+      targetId: "target",
+      name: "Keep title",
+      input: { text: "/review keep this", slashCommands: [] }
+    });
+    expect(network.getExtensionForRuntime).toHaveBeenCalledExactlyOnceWith(
+      credential,
+      extension.extensionId,
+      "session",
+      expect.any(AbortSignal)
+    );
+    expect(network.submit).not.toHaveBeenCalled();
+  });
+
+  it("revalidates in the destination runtime, preserves the task draft, and selects it without auto-send", async () => {
+    const network = fakeNetwork();
+    const owner = mobileExtensionOwnerSnapshot();
+    const command = { name: "review", description: "Review mail.", sessionId: "session" };
+    const extension = { ...mobileExtensionFixture(), commands: [command] };
+    network.readOwner = vi.fn(async () => ({ connection, device, snapshot: owner }));
+    network.readSession = vi.fn(async () => owner);
+    network.getExtensionForRuntime = vi.fn(async (_credential, _extensionId, sessionId) => ({
+      ...extension,
+      commands: [{ ...command, sessionId }]
+    }));
+    const drafts = memoryDraftStores();
+    const identity = { profileId: credential.profileId, sessionId: "session" };
+    const original = localAttachmentDraft("/old keep this");
+    drafts.composer.save(identity, original);
+    await drafts.composer.flush(identity);
+    const app = client(network, memoryStorage(credential).storage,
+      undefined, undefined, undefined, undefined, drafts);
+    await app.start();
+
+    await expect(app.extensionCatalogTransport()!.useCommand(
+      extension,
+      command,
+      { kind: "task", sessionId: "session" },
+      new AbortController().signal
+    )).resolves.toEqual({ kind: "task", sessionId: "session" });
+
+    const retained = await drafts.composer.read(identity);
+    expect(retained).toMatchObject({
+      text: "/review keep this",
+      slashCommands: [{ text: "/review", start: 0, end: 7 }]
+    });
+    expect(retained?.attachments).toEqual(original.attachments);
+    expect(app.state.selectedId).toBe("session");
+    expect(network.getExtensionForRuntime).toHaveBeenCalledExactlyOnceWith(
+      credential,
+      extension.extensionId,
+      "session",
+      expect.any(AbortSignal)
+    );
+    expect(network.submit).not.toHaveBeenCalled();
+  });
+
+  it("rejects runtime drift before editing and rolls back an exact draft when selection fails", async () => {
+    const network = fakeNetwork();
+    const owner = mobileExtensionOwnerSnapshot();
+    const command = { name: "review", description: "Review mail.", sessionId: "session" };
+    const extension = { ...mobileExtensionFixture(), commands: [command] };
+    network.readOwner = vi.fn(async () => ({ connection, device, snapshot: owner }));
+    network.readSession = vi.fn(async () => owner);
+    const drafts = memoryDraftStores();
+    const identity = { profileId: credential.profileId, sessionId: "session" };
+    const original = plainTextMobileComposerDraft("Keep this exact draft");
+    drafts.composer.save(identity, original);
+    await drafts.composer.flush(identity);
+    const saved = memoryStorage(credential);
+    const app = client(network, saved.storage, undefined, undefined, undefined, undefined, drafts);
+    await app.start();
+
+    network.getExtensionForRuntime = vi.fn(async () => ({ ...extension, revision: 2n,
+      commands: [{ ...command, sessionId: "session" }] }));
+    await expect(app.extensionCatalogTransport()!.useCommand(
+      extension,
+      command,
+      { kind: "task", sessionId: "session" },
+      new AbortController().signal
+    )).rejects.toThrow(/changed/u);
+    expect(await drafts.composer.read(identity)).toEqual(original);
+
+    network.getExtensionForRuntime = vi.fn(async () => extension);
+    vi.mocked(saved.storage.saveSelection).mockRejectedValueOnce(new Error("selection storage unavailable"));
+    await expect(app.extensionCatalogTransport()!.useCommand(
+      extension,
+      command,
+      { kind: "task", sessionId: "session" },
+      new AbortController().signal
+    )).rejects.toThrow(/selection storage unavailable/u);
+    expect(await drafts.composer.read(identity)).toEqual(original);
+    expect(network.submit).not.toHaveBeenCalled();
+  });
 });
 
 describe("mobile Partner private authority", () => {
@@ -2460,6 +2592,22 @@ function mobileExtensionFixture(): MobileExtension {
     useSupported: true,
     updateAvailable: false
   };
+}
+
+function mobileExtensionOwnerSnapshot(): Snapshot {
+  return create(SnapshotSchema, {
+    ...snapshot,
+    resources: [create(ManagedResourceSchema, {
+      resourceId: "resource-1",
+      backendId: "backend",
+      targetId: "target",
+      name: "Mail",
+      state: ResourceState.LOADED,
+      enabled: true,
+      discoveredRevision: `sha256:${"a".repeat(64)}`,
+      entityVersion: create(EntityVersionSchema, { revision: create(RevisionSchema, { value: 3n }) })
+    })]
+  });
 }
 
 describe("native mobile push authority", () => {

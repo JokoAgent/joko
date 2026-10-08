@@ -4,6 +4,7 @@ import {
   Alert,
   BackHandler,
   FlatList,
+  Modal,
   Pressable,
   ScrollView,
   StyleSheet,
@@ -18,9 +19,13 @@ import {
   filterMobileExtensions,
   type MobileExtension,
   type MobileExtensionCatalog,
+  type MobileExtensionCommand,
   type MobileExtensionCredentialKind,
-  type MobileExtensionTransport
+  type MobileExtensionTaskChoice,
+  type MobileExtensionTransport,
+  type MobileExtensionUseDestination
 } from "./mobile-extensions";
+import { mobileExtensionUseReady } from "./mobile-extension-use-handoff";
 import type { MobilePartnersColors } from "./MobilePartnersScreen";
 
 export interface MobileExtensionsScreenProps {
@@ -28,6 +33,8 @@ export interface MobileExtensionsScreenProps {
   readonly locale: MobileSupportedLocale;
   readonly transport?: MobileExtensionTransport;
   readonly onBack: () => void;
+  readonly onOpenNewTask: () => void;
+  readonly onOpenTask: () => void;
 }
 
 type DirectoryState = {
@@ -51,6 +58,12 @@ type MutationState = {
   readonly ownerKey: string;
   readonly extensionId: string;
   readonly kind: "enabled" | "sidebar" | "setup" | "receipt";
+};
+
+type UseSelection = {
+  readonly ownerKey: string;
+  readonly extension: MobileExtension;
+  readonly command: MobileExtensionCommand;
 };
 
 function errorText(error: unknown): string {
@@ -118,7 +131,14 @@ function Capability({ label, available, colors, locale }: {
   </View>;
 }
 
-export function MobileExtensionsScreen({ colors, locale, transport, onBack }: MobileExtensionsScreenProps) {
+export function MobileExtensionsScreen({
+  colors,
+  locale,
+  transport,
+  onBack,
+  onOpenNewTask,
+  onOpenTask
+}: MobileExtensionsScreenProps) {
   const { width } = useWindowDimensions();
   const wide = width >= 780;
   const transportRef = useRef(transport);
@@ -128,6 +148,9 @@ export function MobileExtensionsScreen({ colors, locale, transport, onBack }: Mo
   const detailOccurrence = useRef<symbol | undefined>(undefined);
   const mutationAbort = useRef<AbortController | undefined>(undefined);
   const mutationOccurrence = useRef<symbol | undefined>(undefined);
+  const useAbort = useRef<AbortController | undefined>(undefined);
+  const useOccurrence = useRef<symbol | undefined>(undefined);
+  const useInFlight = useRef(false);
   const [attempt, setAttempt] = useState(0);
   const [query, setQuery] = useState("");
   const [directory, setDirectory] = useState<DirectoryState>(emptyDirectory);
@@ -136,6 +159,10 @@ export function MobileExtensionsScreen({ colors, locale, transport, onBack }: Mo
   const [mutationError, setMutationError] = useState<string | undefined>();
   const [setupValues, setSetupValues] = useState<Readonly<Record<string, string>>>({});
   const [credentialKinds, setCredentialKinds] = useState<Readonly<Record<string, MobileExtensionCredentialKind>>>({});
+  const [useSelection, setUseSelection] = useState<UseSelection | undefined>();
+  const [taskQuery, setTaskQuery] = useState("");
+  const [useBusy, setUseBusy] = useState(false);
+  const [useError, setUseError] = useState<string | undefined>();
   const ownerKey = transport?.ownerKey;
 
   useEffect(() => {
@@ -152,6 +179,14 @@ export function MobileExtensionsScreen({ colors, locale, transport, onBack }: Mo
     setDetail(emptyDetail);
     setMutation(undefined);
     setMutationError(undefined);
+    if (!useInFlight.current) {
+      useAbort.current?.abort();
+      useOccurrence.current = undefined;
+      setUseSelection(undefined);
+      setTaskQuery("");
+      setUseBusy(false);
+      setUseError(undefined);
+    }
     if (!transport || !ownerKey) {
       setDirectory(emptyDirectory);
       return;
@@ -177,8 +212,11 @@ export function MobileExtensionsScreen({ colors, locale, transport, onBack }: Mo
     listAbort.current?.abort();
     detailAbort.current?.abort();
     mutationAbort.current?.abort();
+    useAbort.current?.abort();
+    useInFlight.current = false;
     detailOccurrence.current = undefined;
     mutationOccurrence.current = undefined;
+    useOccurrence.current = undefined;
   }, []);
 
   const closeDetail = () => {
@@ -188,14 +226,27 @@ export function MobileExtensionsScreen({ colors, locale, transport, onBack }: Mo
     setMutationError(undefined);
   };
 
+  const closeUseSelection = () => {
+    useAbort.current?.abort();
+    useInFlight.current = false;
+    useAbort.current = undefined;
+    useOccurrence.current = undefined;
+    setUseSelection(undefined);
+    setTaskQuery("");
+    setUseBusy(false);
+    setUseError(undefined);
+  };
+
   useEffect(() => {
     const subscription = BackHandler.addEventListener("hardwareBackPress", () => {
-      if (detail.extensionId && !wide) closeDetail();
+      if (useSelection) {
+        if (!useBusy) closeUseSelection();
+      } else if (detail.extensionId && !wide) closeDetail();
       else onBack();
       return true;
     });
     return () => subscription.remove();
-  }, [detail.extensionId, onBack, wide]);
+  }, [detail.extensionId, onBack, useBusy, useSelection, wide]);
 
   const openDetail = (expected: MobileExtension) => {
     const currentTransport = transportRef.current;
@@ -311,6 +362,58 @@ export function MobileExtensionsScreen({ colors, locale, transport, onBack }: Mo
     });
   };
 
+  const openUseSelection = (extension: MobileExtension, command: MobileExtensionCommand) => {
+    const currentTransport = transportRef.current;
+    if (!currentTransport || mutation !== undefined || useBusy
+      || currentTransport.pending.some((receipt) => receipt.extensionId === extension.extensionId)) return;
+    useAbort.current?.abort();
+    useOccurrence.current = undefined;
+    setUseSelection({ ownerKey: currentTransport.ownerKey, extension, command });
+    setTaskQuery("");
+    setUseError(undefined);
+  };
+
+  const runCommandHandoff = (destination: MobileExtensionUseDestination) => {
+    const currentTransport = transportRef.current;
+    const selection = useSelection;
+    if (!currentTransport || !selection || selection.ownerKey !== currentTransport.ownerKey || useBusy) return;
+    const controller = new AbortController();
+    const occurrence = Symbol("extension-command-handoff");
+    useAbort.current = controller;
+    useOccurrence.current = occurrence;
+    useInFlight.current = true;
+    setUseBusy(true);
+    setUseError(undefined);
+    void currentTransport.useCommand(selection.extension, selection.command, destination, controller.signal).then((result) => {
+      if (controller.signal.aborted || useOccurrence.current !== occurrence) return;
+      useInFlight.current = false;
+      useOccurrence.current = undefined;
+      useAbort.current = undefined;
+      setUseSelection(undefined);
+      setTaskQuery("");
+      setUseBusy(false);
+      setUseError(undefined);
+      if (result.kind === "newTask") onOpenNewTask();
+      else onOpenTask();
+    }, (error) => {
+      if (controller.signal.aborted || useOccurrence.current !== occurrence) return;
+      useInFlight.current = false;
+      if (transportRef.current?.ownerKey !== selection.ownerKey) {
+        setUseSelection(undefined);
+        setTaskQuery("");
+        setUseError(undefined);
+        return;
+      }
+      setUseError(errorText(error));
+    }).finally(() => {
+      if (useOccurrence.current !== occurrence) return;
+      useInFlight.current = false;
+      useOccurrence.current = undefined;
+      useAbort.current = undefined;
+      setUseBusy(false);
+    });
+  };
+
   const visibleDirectory = directory.ownerKey === ownerKey ? directory : emptyDirectory;
   const visibleDetail = detail.ownerKey === ownerKey ? detail : emptyDetail;
   const extensions = visibleDirectory.catalog?.extensions ?? [];
@@ -325,6 +428,15 @@ export function MobileExtensionsScreen({ colors, locale, transport, onBack }: Mo
     && mutation.extensionId === selected.extensionId;
   const setupStartable = extensionSetupStartable(visibleDetail.extension);
   const setupComplete = visibleDetail.extension?.setup.fields.every((field) => !field.required || field.configured) ?? false;
+  const taskChoices: readonly MobileExtensionTaskChoice[] = useSelection !== undefined
+    && transport !== undefined && transport.ownerKey === useSelection.ownerKey
+    ? transport.tasks(useSelection.extension)
+    : [];
+  const filteredTaskChoices = useMemo(() => {
+    const needle = taskQuery.trim().normalize("NFKC").toLocaleLowerCase();
+    return needle.length === 0 ? taskChoices : taskChoices.filter((choice) => [choice.displayName, choice.targetName]
+      .some((value) => value.normalize("NFKC").toLocaleLowerCase().includes(needle)));
+  }, [taskChoices, taskQuery]);
 
   const directoryPane = <View style={[styles.pane, wide && styles.directoryPane]} testID="extensions.directory">
     <View style={styles.header}>
@@ -646,16 +758,111 @@ export function MobileExtensionsScreen({ colors, locale, transport, onBack }: Mo
               ? <Text style={[styles.body, { color: colors.muted }]}>{mobileMessage(locale, "extension.noCommands")}</Text>
               : extension.commands.map((command) => <View key={command.name}
                 style={[styles.card, { backgroundColor: colors.surface, borderColor: colors.border }]}>
-                <Text style={[styles.label, { color: colors.ink }]}>/{command.name}</Text>
-                {command.description.length > 0 && <Text style={[styles.caption, { color: colors.muted }]}>{command.description}</Text>}
+                <View style={styles.controlRow}>
+                  <View style={styles.grow}>
+                    <Text style={[styles.label, { color: colors.ink }]}>/{command.name}</Text>
+                    {command.description.length > 0 && <Text style={[styles.caption, { color: colors.muted }]}>{command.description}</Text>}
+                  </View>
+                  <Action label={mobileMessage(locale, "extension.useCommand", { command: command.name })}
+                    colors={colors} disabled={!mobileExtensionUseReady(extension) || selectedBusy
+                      || mutation !== undefined || useBusy || pending.length > 0}
+                    onPress={() => openUseSelection(extension, command)}
+                    testID={`extensions.command.use.${command.name}`} />
+                </View>
+                {!mobileExtensionUseReady(extension) && <Text style={[styles.caption, { color: colors.muted }]}>
+                  {mobileMessage(locale, "extension.useSetupRequired")}
+                </Text>}
               </View>)}
           </ScrollView>}
   </View>;
 
-  return <View style={[styles.screen, { backgroundColor: colors.background }]}>
-    {wide ? <View style={styles.wide}>{directoryPane}{detailPane}</View>
-      : visibleDetail.extensionId ? detailPane : directoryPane}
-  </View>;
+  const visibleUseSelection = useSelection !== undefined && (useSelection.ownerKey === ownerKey || useBusy)
+    ? useSelection
+    : undefined;
+  const newTaskRuntimeAvailable = visibleUseSelection !== undefined
+    && taskChoices.some((choice) => choice.sessionId === visibleUseSelection.command.sessionId);
+
+  return <>
+    <View style={[styles.screen, { backgroundColor: colors.background }]}>
+      {wide ? <View style={styles.wide}>{directoryPane}{detailPane}</View>
+        : visibleDetail.extensionId ? detailPane : directoryPane}
+    </View>
+    <Modal visible={visibleUseSelection !== undefined} transparent animationType="fade"
+      onRequestClose={() => { if (!useBusy) closeUseSelection(); }}>
+      <View style={styles.modalBackdrop}>
+        {visibleUseSelection && <View style={[styles.useSheet, {
+          backgroundColor: colors.background,
+          borderColor: colors.border
+        }]} testID="extensions.command.destination">
+          <View style={styles.header}>
+            <View style={styles.grow}>
+              <Text style={[styles.heading, { color: colors.ink }]}>{mobileMessage(locale,
+                "extension.useTitle", { command: visibleUseSelection.command.name })}</Text>
+              <Text style={[styles.caption, { color: colors.muted }]}>{mobileMessage(locale,
+                "extension.useDescription")}</Text>
+            </View>
+            <Action label={mobileMessage(locale, "common.cancel")} colors={colors}
+              disabled={useBusy} onPress={closeUseSelection} />
+          </View>
+          <ScrollView contentContainerStyle={styles.useContent}>
+            <View style={[styles.card, { backgroundColor: colors.surface, borderColor: colors.border }]}>
+              <View style={styles.controlRow}>
+                <View style={styles.grow}>
+                  <Text style={[styles.label, { color: colors.ink }]}>{mobileMessage(locale, "common.newTask")}</Text>
+                  <Text style={[styles.caption, { color: colors.muted }]}>{mobileMessage(locale,
+                    newTaskRuntimeAvailable
+                      ? "extension.useNewTaskBody"
+                      : "extension.useRuntimeRequired")}</Text>
+                </View>
+                <Action label={mobileMessage(locale, "extension.useNewTask")}
+                  colors={colors} disabled={useBusy || !newTaskRuntimeAvailable}
+                  onPress={() => runCommandHandoff({ kind: "newTask" })}
+                  testID="extensions.command.newTask" />
+              </View>
+            </View>
+
+            <Text style={[styles.section, { color: colors.muted }]}>{mobileMessage(locale,
+              "extension.useExistingTasks", { count: taskChoices.length })}</Text>
+            <View style={[styles.search, styles.useSearch, { backgroundColor: colors.surface, borderColor: colors.border }]}>
+              <TextInput accessibilityLabel={mobileMessage(locale, "extension.useSearchTasks")}
+                autoCorrect={false} value={taskQuery} onChangeText={setTaskQuery}
+                editable={!useBusy} placeholder={mobileMessage(locale, "extension.useSearchTasks")}
+                placeholderTextColor={colors.muted} style={[styles.searchInput, { color: colors.ink }]} />
+              {taskQuery.length > 0 && <Action label={mobileMessage(locale, "common.clear")}
+                colors={colors} disabled={useBusy} onPress={() => setTaskQuery("")} />}
+            </View>
+            {filteredTaskChoices.length === 0
+              ? <Text style={[styles.body, { color: colors.muted }]}>{mobileMessage(locale,
+                taskQuery.trim().length > 0 ? "extension.useNoTaskResults" : "extension.useNoTasks")}</Text>
+              : filteredTaskChoices.map((choice) => <View key={choice.sessionId}
+                style={[styles.card, { backgroundColor: colors.surface, borderColor: colors.border }]}>
+                <View style={styles.controlRow}>
+                  <View style={styles.grow}>
+                    <Text style={[styles.label, { color: colors.ink }]}>{choice.displayName}</Text>
+                    <Text style={[styles.caption, { color: colors.muted }]}>{choice.targetName}</Text>
+                  </View>
+                  <Action label={mobileMessage(locale, "extension.useCommandIn", {
+                    command: visibleUseSelection.command.name,
+                    task: choice.displayName
+                  })} colors={colors} disabled={useBusy}
+                  onPress={() => runCommandHandoff({ kind: "task", sessionId: choice.sessionId })}
+                  testID={`extensions.command.task.${choice.sessionId}`} />
+                </View>
+              </View>)}
+            {useBusy && <View style={styles.progress} accessibilityLiveRegion="polite">
+              <ActivityIndicator color={colors.accent} />
+              <Text style={[styles.caption, { color: colors.muted }]}>{mobileMessage(locale, "extension.useWorking")}</Text>
+            </View>}
+            {useError && <View accessibilityRole="alert"
+              style={[styles.notice, styles.receipt, { backgroundColor: colors.surface, borderColor: colors.negative }]}>
+              <Text style={[styles.body, { color: colors.negative }]}>{mobileMessage(locale,
+                "extension.useFailed", { error: useError })}</Text>
+            </View>}
+          </ScrollView>
+        </View>}
+      </View>
+    </Modal>
+  </>;
 }
 
 const styles = StyleSheet.create({
@@ -699,5 +906,11 @@ const styles = StyleSheet.create({
   controlRow: { alignItems: "center", flexDirection: "row", gap: 12, minHeight: 52 },
   progress: { alignItems: "center", flexDirection: "row", gap: 8, minHeight: 44 },
   receipt: { marginHorizontal: 0, marginBottom: 0, gap: 8 },
-  actionRow: { flexDirection: "row", flexWrap: "wrap", gap: 8 }
+  actionRow: { flexDirection: "row", flexWrap: "wrap", gap: 8 },
+  modalBackdrop: { alignItems: "center", backgroundColor: "rgba(16, 18, 24, 0.48)", flex: 1,
+    justifyContent: "flex-end", padding: 12 },
+  useSheet: { borderRadius: 20, borderWidth: StyleSheet.hairlineWidth, maxHeight: "88%", maxWidth: 680,
+    overflow: "hidden", width: "100%" },
+  useContent: { gap: 10, padding: 16 },
+  useSearch: { marginHorizontal: 0, marginBottom: 0 }
 });

@@ -887,7 +887,12 @@ export function App() {
                   onBack={() => setPage("home")} onOpenTask={() => setPage("task")} /> :
                 page === "extensions" ? <MobileExtensionsScreen colors={colors}
                   locale={locale.effectiveLocale} transport={client.extensionCatalogTransport()}
-                  onBack={() => setPage("home")} /> :
+                  onBack={() => setPage("home")}
+                  onOpenNewTask={() => setPage("new")}
+                  onOpenTask={() => {
+                    setFocusTaskComposer(true);
+                    setPage("task");
+                  }} /> :
                 page === "partner-resources" ? <MobilePartnerResourcesScreen colors={colors}
                   locale={locale.effectiveLocale} transport={client.partnerResourceTransport()}
                   onBack={() => setPage("home")} onOpenTask={() => setPage("task")} /> :
