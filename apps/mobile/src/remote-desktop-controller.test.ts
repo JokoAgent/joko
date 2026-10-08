@@ -13,6 +13,8 @@ import {
   RemoteDesktopClipboardContentResultSchema,
   RemoteDesktopClipboardTextResultSchema,
   RemoteDesktopControlStateSchema,
+  RemoteDesktopCursorSchema,
+  RemoteDesktopDisplayModeSchema,
   RemoteDesktopDisplaySchema,
   RemoteDesktopFailureReason,
   RemoteDesktopFailureSchema,
@@ -32,6 +34,7 @@ import {
 } from "@joko/contracts";
 import { mobileRemoteDesktopNetworkTesting } from "./network";
 import {
+  MOBILE_REMOTE_DESKTOP_LEASE_MS,
   MobileRemoteDesktopController,
   mobileRemoteDesktopTesting,
   type MobileRemoteDesktopTransport
@@ -52,7 +55,7 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
-function fixture(webrtcVideo = true, controlling = false, mediaFeatures = false) {
+function fixture(webrtcVideo = true, controlling = false, mediaFeatures = false, rd01Features = false) {
   const targetRevision = create(RevisionSchema, { value: 1n, etag: "target" });
   const relationRevision = create(RevisionSchema, { value: 0n, etag: "relation" });
   const route = create(DevicePeerRouteIdentitySchema, {
@@ -72,7 +75,8 @@ function fixture(webrtcVideo = true, controlling = false, mediaFeatures = false)
     protocolVersion: 1, enabled: true, canControl: true, platform: "darwin", displays: [display], permissions,
     automaticReconnect: true, connectionTakeover: true, webrtcVideo, trickleIce: true, jpegFallback: true,
     clipboardText: true, clipboardContent: true, videoSettings: mediaFeatures,
-    systemAudio: mediaFeatures, backgroundViewing: mediaFeatures
+    systemAudio: mediaFeatures, backgroundViewing: mediaFeatures,
+    displayModes: rd01Features, cursorOverlay: rd01Features
   });
   const lease = create(RemoteDesktopLeaseSchema, {
     leaseId: "lease-1", display, controlling, controlGeneration: 1n
@@ -90,6 +94,15 @@ function fixture(webrtcVideo = true, controlling = false, mediaFeatures = false)
     $typeName: "joko.v1.RemoteDesktopOfferResult" as const, attemptId, answerSdp: "answer"
   }));
   const frame = vi.fn<MobileRemoteDesktopTransport["frame"]>(async () => create(RemoteDesktopFrameResultSchema, {}));
+  const listDisplayModes = vi.fn<MobileRemoteDesktopTransport["listDisplayModes"]>(async () => [
+    create(RemoteDesktopDisplayModeSchema, {
+      modeId: "10", width: 1920, height: 1080, current: true, native: true
+    }),
+    create(RemoteDesktopDisplayModeSchema, {
+      modeId: "20", width: 1280, height: 720, current: false, native: false
+    })
+  ]);
+  const setDisplayMode = vi.fn<MobileRemoteDesktopTransport["setDisplayMode"]>(async () => undefined);
   const clipboardText = vi.fn<MobileRemoteDesktopTransport["clipboardText"]>(async () =>
     create(RemoteDesktopClipboardTextResultSchema, {}));
   const clipboardContent = vi.fn<MobileRemoteDesktopTransport["clipboardContent"]>(async () =>
@@ -102,10 +115,10 @@ function fixture(webrtcVideo = true, controlling = false, mediaFeatures = false)
     offer, ice: vi.fn(async (_host, _leaseId, attemptId, candidates, after) => ({
       $typeName: "joko.v1.RemoteDesktopIceExchangeResult" as const,
       attemptId, candidates: [...candidates], next: after + candidates.length, complete: true
-    })), frame, clipboardText, clipboardContent
+    })), frame, listDisplayModes, setDisplayMode, clipboardText, clipboardContent
   };
-  return { route, host, transport, start, heartbeat, stop, control, presentation, input, offer, frame,
-    clipboardText, clipboardContent, lease };
+  return { route, host, capabilities, transport, start, heartbeat, stop, control, presentation, input, offer, frame,
+    listDisplayModes, setDisplayMode, clipboardText, clipboardContent, lease };
 }
 
 function clipboardFixture(richAvailable = true) {
@@ -140,6 +153,16 @@ async function flushAsync(): Promise<void> {
   await Promise.resolve();
   await Promise.resolve();
   await Promise.resolve();
+}
+
+function cursorPng(width = 32, height = 32): Uint8Array {
+  return Uint8Array.from([
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+    0, 0, 0, 13, 0x49, 0x48, 0x44, 0x52,
+    (width >>> 24) & 0xff, (width >>> 16) & 0xff, (width >>> 8) & 0xff, width & 0xff,
+    (height >>> 24) & 0xff, (height >>> 16) & 0xff, (height >>> 8) & 0xff, height & 0xff,
+    8, 6, 0, 0, 0, 0, 0, 0, 0
+  ]);
 }
 
 describe("MobileRemoteDesktopController", () => {
@@ -238,7 +261,7 @@ describe("MobileRemoteDesktopController", () => {
     await flushAsync();
     expect(value.offer).toHaveBeenCalledTimes(1);
     expect(value.offer).toHaveBeenCalledWith(value.host, value.lease.leaseId,
-      "current", "current-offer", undefined, expect.any(AbortSignal));
+      "current", "current-offer", undefined, false, expect.any(AbortSignal));
     await controller.close();
   });
 
@@ -319,6 +342,246 @@ describe("MobileRemoteDesktopController", () => {
     await vi.advanceTimersByTimeAsync(250);
     expect(value.frame).toHaveBeenCalledTimes(2);
     expect(controller.snapshot.hasFrame).toBe(true);
+    await controller.close();
+  });
+
+  it("negotiates cursor overlay for offers and JPEG frames and forwards a bounded cursor", async () => {
+    vi.useFakeTimers();
+    const value = fixture(false, false, false, true);
+    value.frame.mockResolvedValue(create(RemoteDesktopFrameResultSchema, {
+      frame: create(RemoteDesktopFrameSchema, {
+        jpeg: Uint8Array.from([0xff, 0xd8, 0xff, 0xd9]),
+        cursor: create(RemoteDesktopCursorSchema, {
+          visible: true, x: 0.25, y: 0.75, width: 16, height: 20, hotX: 2, hotY: 3, png: cursorPng()
+        })
+      })
+    }));
+    const commands: Record<string, unknown>[] = [];
+    const controller = new MobileRemoteDesktopController(value.transport);
+    controller.setViewerSink((command) => commands.push(command as Record<string, unknown>));
+    await controller.open();
+    await flushAsync();
+    controller.viewerMessage({ type: "ready" });
+    const init = commands.find((command) => command.type === "init")!;
+    expect(init).toMatchObject({ cursorOverlay: true, webrtc: false });
+    controller.viewerMessage({ type: "fallback", epoch: init.epoch, attemptId: null });
+    await flushAsync();
+    expect(value.frame).toHaveBeenCalledWith(value.host, value.lease.leaseId, true, expect.any(AbortSignal));
+    expect(commands.find((command) => command.type === "frame")).toMatchObject({
+      cursor: { visible: true, x: 0.25, y: 0.75, width: 16, height: 20, hotX: 2, hotY: 3 }
+    });
+    await controller.close();
+  });
+
+  it("loads and retries display modes without disturbing the active lease", async () => {
+    const value = fixture(true, true, false, true);
+    value.listDisplayModes.mockRejectedValueOnce(new Error("temporary"));
+    const controller = new MobileRemoteDesktopController(value.transport);
+    await controller.open();
+    await flushAsync();
+    expect(controller.snapshot).toMatchObject({
+      status: "live", displayModesStatus: "error", displayModeNotice: "load-failed"
+    });
+    await controller.loadDisplayModes();
+    expect(controller.snapshot.displayModesStatus).toBe("ready");
+    expect(controller.snapshot.displayModes.map((mode) => mode.modeId)).toEqual(["10", "20"]);
+    expect(value.stop).not.toHaveBeenCalled();
+    await controller.close();
+  });
+
+  it("keeps the lease for a typed pre-effect display failure but retires and reconnects after success", async () => {
+    vi.useFakeTimers();
+    const rejected = fixture(true, true, false, true);
+    rejected.setDisplayMode.mockRejectedValueOnce(failure(RemoteDesktopFailureReason.DISPLAY_BUSY));
+    const first = new MobileRemoteDesktopController(rejected.transport);
+    await first.open();
+    await flushAsync();
+    await first.setDisplayMode("20");
+    expect(first.snapshot).toMatchObject({
+      status: "live", controlling: true, displayModeBusy: false, displayModeNotice: "change-failed"
+    });
+    expect(rejected.start).toHaveBeenCalledTimes(1);
+    expect(rejected.stop).not.toHaveBeenCalled();
+    await first.close();
+
+    const changed = fixture(true, true, false, true);
+    const commands: Record<string, unknown>[] = [];
+    const second = new MobileRemoteDesktopController(changed.transport);
+    second.setViewerSink((command) => commands.push(command as Record<string, unknown>));
+    await second.open();
+    await flushAsync();
+    await second.setDisplayMode("20");
+    expect(changed.setDisplayMode).toHaveBeenCalledWith(changed.host, changed.lease.leaseId, 1n,
+      "20", expect.any(AbortSignal));
+    expect(second.snapshot).toMatchObject({ status: "reconnecting", controlling: false, hasFrame: false });
+    expect(commands).toContainEqual({ type: "stop", preserveFrame: true });
+    expect(changed.stop).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(499);
+    expect(changed.start).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(changed.start.mock.calls[1]?.[2]).toBe(RemoteDesktopStartMode.NEW);
+    await second.close();
+  });
+
+  it("restores control after a display mode reconnect whose NEW lease starts view-only", async () => {
+    vi.useFakeTimers();
+    const value = fixture(true, true, false, true);
+    const replacementLease = create(RemoteDesktopLeaseSchema, {
+      leaseId: "lease-2", display: value.lease.display, controlling: false, controlGeneration: 2n
+    });
+    value.start.mockResolvedValueOnce(value.lease).mockResolvedValueOnce(replacementLease);
+    value.control.mockResolvedValueOnce(create(RemoteDesktopControlStateSchema, {
+      controlling: true, controlGeneration: 3n
+    }));
+    const controller = new MobileRemoteDesktopController(value.transport);
+    await controller.open();
+    await flushAsync();
+
+    await controller.setDisplayMode("20");
+    await vi.advanceTimersByTimeAsync(500);
+
+    expect(value.start.mock.calls[1]?.[2]).toBe(RemoteDesktopStartMode.NEW);
+    expect(value.control).toHaveBeenCalledWith(value.host, replacementLease.leaseId, true,
+      expect.any(AbortSignal));
+    expect(controller.snapshot).toMatchObject({ status: "live", controlling: true, wantedControl: true });
+    await controller.close();
+  });
+
+  it("keeps WebRTC and restores PiP after a typed pre-effect display failure without JPEG polling", async () => {
+    vi.useFakeTimers();
+    const value = fixture(true, true, true, true);
+    value.setDisplayMode.mockRejectedValueOnce(failure(RemoteDesktopFailureReason.DISPLAY_BUSY));
+    const commands: Record<string, unknown>[] = [];
+    const controller = new MobileRemoteDesktopController(value.transport, undefined, undefined, {
+      nativePictureInPicture: true,
+      requiresPlaybackSession: false,
+      playback: async () => undefined
+    });
+    controller.setViewerSink((command) => commands.push(command as Record<string, unknown>));
+    await controller.open();
+    await flushAsync();
+    controller.viewerMessage({ type: "ready" });
+    const epoch = commands.find((command) => command.type === "init")?.epoch;
+    controller.viewerMessage({ type: "iceConfig", epoch, attemptId: "display-mode" });
+    controller.viewerMessage({ type: "streaming", epoch, attemptId: "display-mode" });
+    controller.viewerMessage({ type: "pipCapability", epoch, supported: true });
+    expect(controller.snapshot).toMatchObject({ media: "webrtc", pipAvailable: true });
+    const timerCount = vi.getTimerCount();
+    value.frame.mockClear();
+
+    await controller.setDisplayMode("20");
+
+    expect(controller.snapshot).toMatchObject({
+      status: "live", media: "webrtc", pipAvailable: true, displayModeNotice: "change-failed"
+    });
+    expect(vi.getTimerCount()).toBe(timerCount);
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(value.frame).not.toHaveBeenCalled();
+    await controller.close();
+  });
+
+  it("retires the old display lease after an outcome-unknown mode mutation", async () => {
+    vi.useFakeTimers();
+    const value = fixture(true, true, false, true);
+    value.setDisplayMode.mockRejectedValueOnce(new Error("response lost"));
+    const controller = new MobileRemoteDesktopController(value.transport);
+    await controller.open();
+    await flushAsync();
+    await controller.setDisplayMode("20");
+    expect(controller.snapshot).toMatchObject({ status: "reconnecting", displayModeNotice: "change-failed" });
+    await vi.advanceTimersByTimeAsync(500);
+    expect(value.start.mock.calls[1]?.[2]).toBe(RemoteDesktopStartMode.NEW);
+    await controller.close();
+
+    const stopped = fixture(true, true, false, true);
+    stopped.setDisplayMode.mockRejectedValueOnce(failure(RemoteDesktopFailureReason.STOPPED));
+    const recovering = new MobileRemoteDesktopController(stopped.transport);
+    await recovering.open();
+    await flushAsync();
+    await recovering.setDisplayMode("20");
+    expect(recovering.snapshot.status).toBe("reconnecting");
+    await vi.advanceTimersByTimeAsync(500);
+    expect(stopped.start.mock.calls[1]?.[2]).toBe(RemoteDesktopStartMode.NEW);
+    await recovering.close();
+  });
+
+  it("retries outcome-unknown mode reconnects through the retired lease TTL without takeover", async () => {
+    vi.useFakeTimers();
+    const value = fixture(true, true, false, true);
+    value.setDisplayMode.mockRejectedValueOnce(new Error("response lost"));
+    const controller = new MobileRemoteDesktopController(value.transport);
+    await controller.open();
+    await flushAsync();
+    value.start
+      .mockRejectedValueOnce(failure(RemoteDesktopFailureReason.BUSY))
+      .mockRejectedValueOnce(failure(RemoteDesktopFailureReason.BUSY))
+      .mockRejectedValueOnce(failure(RemoteDesktopFailureReason.BUSY));
+    await controller.setDisplayMode("20");
+
+    await vi.advanceTimersByTimeAsync(500 + 1_000 + 3_000);
+    expect(controller.snapshot.status).toBe("reconnecting");
+    expect(value.start).toHaveBeenCalledTimes(4);
+    await vi.advanceTimersByTimeAsync(7_999);
+    expect(value.start).toHaveBeenCalledTimes(4);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(value.start).toHaveBeenCalledTimes(5);
+    expect(value.start.mock.calls.slice(1).every((call) => call[2] === RemoteDesktopStartMode.NEW)).toBe(true);
+    expect(controller.snapshot.status).toBe("live");
+    await controller.close();
+  });
+
+  it("bounds outcome-unknown mode BUSY retries after crossing the retired lease TTL", async () => {
+    vi.useFakeTimers();
+    const value = fixture(true, true, false, true);
+    value.setDisplayMode.mockRejectedValueOnce(new Error("response lost"));
+    const controller = new MobileRemoteDesktopController(value.transport);
+    await controller.open();
+    await flushAsync();
+    value.start.mockRejectedValue(failure(RemoteDesktopFailureReason.BUSY));
+    await controller.setDisplayMode("20");
+
+    await vi.advanceTimersByTimeAsync(12_500);
+    expect(controller.snapshot).toMatchObject({ status: "busy", takeoverAvailable: true, notice: "busy" });
+    expect(value.start).toHaveBeenCalledTimes(5);
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(value.start).toHaveBeenCalledTimes(5);
+    await controller.close();
+  });
+
+  it("waits for a pending heartbeat before bounding an unknown mode reconnect from its renewed TTL", async () => {
+    vi.useFakeTimers();
+    const value = fixture(true, true, false, true);
+    let resolveHeartbeat!: (state: RemoteDesktopControlState) => void;
+    value.heartbeat.mockImplementationOnce(() => new Promise((resolve) => { resolveHeartbeat = resolve; }));
+    value.setDisplayMode.mockRejectedValueOnce(new Error("response lost"));
+    const controller = new MobileRemoteDesktopController(value.transport);
+    await controller.open();
+    await flushAsync();
+    await vi.advanceTimersByTimeAsync(3_000);
+    expect(value.heartbeat).toHaveBeenCalledTimes(1);
+
+    const renewedAt = Date.now() + 2_000;
+    value.start.mockImplementation(async () => {
+      if (Date.now() < renewedAt + MOBILE_REMOTE_DESKTOP_LEASE_MS) {
+        throw failure(RemoteDesktopFailureReason.BUSY);
+      }
+      return value.lease;
+    });
+    const change = controller.setDisplayMode("20");
+    await flushAsync();
+    expect(value.setDisplayMode).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(2_000);
+    resolveHeartbeat(create(RemoteDesktopControlStateSchema, {
+      controlling: true, controlGeneration: 1n
+    }));
+    await change;
+    expect(value.setDisplayMode).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(MOBILE_REMOTE_DESKTOP_LEASE_MS + 499);
+    expect(controller.snapshot.status).toBe("reconnecting");
+    await vi.advanceTimersByTimeAsync(1);
+    expect(controller.snapshot.status).toBe("live");
+    expect(value.start.mock.calls.slice(1).every((call) => call[2] === RemoteDesktopStartMode.NEW)).toBe(true);
     await controller.close();
   });
 
@@ -715,6 +978,42 @@ describe("Remote Desktop boundaries", () => {
     ]);
   });
 
+  it("admits RD-01 capabilities only on a known macOS host", () => {
+    const { capabilities } = fixture(true, true, false, true);
+    expect(mobileRemoteDesktopTesting.validCapabilities(capabilities)).toBe(true);
+    expect(mobileRemoteDesktopTesting.validCapabilities(create(RemoteDesktopCapabilitiesSchema, {
+      ...capabilities, platform: "win32", displayModes: false, cursorOverlay: false
+    }))).toBe(true);
+    expect(mobileRemoteDesktopTesting.validCapabilities(create(RemoteDesktopCapabilitiesSchema, {
+      ...capabilities, platform: "win32"
+    }))).toBe(false);
+    expect(mobileRemoteDesktopTesting.validCapabilities(create(RemoteDesktopCapabilitiesSchema, {
+      ...capabilities, platform: "freebsd", displayModes: false, cursorOverlay: false
+    }))).toBe(false);
+  });
+
+  it("bounds cursor PNG geometry and display mode identity at both mobile trust boundaries", () => {
+    const cursor = create(RemoteDesktopCursorSchema, {
+      visible: true, x: 0.5, y: 0.5, width: 32, height: 32, hotX: 1, hotY: 2, png: cursorPng(64, 64)
+    });
+    expect(mobileRemoteDesktopNetworkTesting.validRemoteDesktopCursor(cursor)).toBe(true);
+    expect(mobileRemoteDesktopTesting.validRemoteDesktopCursor(cursor)).toBe(true);
+    const truncatedIhdr = create(RemoteDesktopCursorSchema, { ...cursor, png: cursor.png.slice(0, 32) });
+    expect(mobileRemoteDesktopNetworkTesting.validRemoteDesktopCursor(truncatedIhdr)).toBe(false);
+    expect(mobileRemoteDesktopTesting.validRemoteDesktopCursor(truncatedIhdr)).toBe(false);
+    const oversizedRaster = create(RemoteDesktopCursorSchema, { ...cursor, png: cursorPng(513, 32) });
+    expect(mobileRemoteDesktopNetworkTesting.validRemoteDesktopCursor(oversizedRaster)).toBe(false);
+    expect(mobileRemoteDesktopTesting.validRemoteDesktopCursor(oversizedRaster)).toBe(false);
+    const modes = [create(RemoteDesktopDisplayModeSchema, {
+      modeId: "7", width: 1920, height: 1080, current: true, native: true
+    })];
+    expect(mobileRemoteDesktopNetworkTesting.validRemoteDesktopDisplayModes(modes)).toBe(true);
+    expect(mobileRemoteDesktopTesting.validDisplayModes(modes)).toBe(true);
+    expect(mobileRemoteDesktopTesting.validDisplayModes([
+      modes[0]!, create(RemoteDesktopDisplayModeSchema, { ...modes[0], current: false })
+    ])).toBe(false);
+  });
+
   it("requires viewer epochs and bounds input while retaining ordered WebRTC and JPEG fallback", () => {
     expect(mobileRemoteDesktopTesting.parseViewerMessage({ type: "streaming" })).toBeUndefined();
     expect(mobileRemoteDesktopTesting.parseViewerMessage({ type: "streaming", epoch: "lease-1" })).toBeUndefined();
@@ -734,6 +1033,15 @@ describe("Remote Desktop boundaries", () => {
     expect(html).toContain("addTransceiver('audio',{direction:'recvonly'})");
     expect(html).toContain("presentationActive()&&message.type==='viewPing'");
     expect(html).toContain("dc.send(message.challenge)");
+    expect(html).toContain("message.type==='cursor'");
+    expect(html).toContain("keys.length===8");
+    expect(html).toContain("width>=1&&width<=512&&height>=1&&height<=512");
+    expect(html).toContain("!cursorOverlay&&control&&mode==='trackpad'");
+    expect(html).toContain("performance.now()-lastLocalMove>200");
+    expect(html).toContain("token!==localCursorGeneration||epoch!==cursorEpoch");
+    expect(html).toContain("localCursorTimer=setTimeout");
+    expect(html).toContain("if(remoteCursor){cx=remoteCursor.x;cy=remoteCursor.y;}");
+    expect(html).not.toContain("!remoteCursor||!control||mode!=='trackpad'");
     expect(mobileRemoteDesktopViewerTesting.RTC_NETWORK.retryMs).toEqual([1_000, 3_000, 8_000]);
   });
 

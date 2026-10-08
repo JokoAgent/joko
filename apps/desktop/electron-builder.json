@@ -105,6 +105,7 @@
       "to": "native-remote-desktop",
       "filter": [
         "manifest.json",
+        "joko-macos-remote-desktop-capture",
         "joko-macos-remote-desktop-input",
         "joko-windows-remote-desktop-input.exe"
       ]

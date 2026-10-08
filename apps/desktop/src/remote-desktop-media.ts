@@ -4,6 +4,7 @@ import {
   BrowserWindow,
   desktopCapturer,
   ipcMain,
+  nativeImage,
   screen,
   session,
   systemPreferences,
@@ -38,6 +39,10 @@ import {
   type DesktopRemoteDesktopVideoSettings
 } from "./remote-desktop-media-settings.js";
 import type { DesktopRemoteDesktopMediaPort } from "./remote-desktop-host.js";
+import {
+  DesktopRemoteDesktopNativeCapture,
+  type DesktopRemoteDesktopNativeFrame
+} from "./remote-desktop-native-capture.js";
 
 const CAPTURE_URL = "https://remote-desktop.joko.invalid/capture";
 const CAPTURE_HTML = "<!doctype html><html><head><meta charset=\"utf-8\"></head><body></body></html>";
@@ -70,10 +75,20 @@ export class DesktopRemoteDesktopMedia implements DesktopRemoteDesktopMediaPort 
     readonly current: () => boolean;
   } | undefined;
   #pending: PendingCaptureRequest | undefined;
-  #attempt: { readonly leaseId: string; readonly attemptId: string } | undefined;
+  #attempt: {
+    readonly leaseId: string;
+    readonly attemptId: string;
+    readonly displayId: string;
+    readonly nativeCapture: boolean;
+    readonly cursorOverlay: boolean;
+    readonly settings?: DesktopRemoteDesktopVideoSettings;
+    readonly current: () => boolean;
+  } | undefined;
+  readonly #nativeCapture = new DesktopRemoteDesktopNativeCapture();
   #inputHandler: ((leaseId: string, sequence: number, events: readonly RemoteDesktopInput[]) => void) | undefined;
   #presentationPongHandler: ((leaseId: string) => void) | undefined;
   #presentationLease: string | undefined;
+  #nativeOnly = false;
   #generation = 0;
   #retired = false;
 
@@ -86,6 +101,10 @@ export class DesktopRemoteDesktopMedia implements DesktopRemoteDesktopMediaPort 
     ipcMain.handle(REMOTE_DESKTOP_CAPTURE_CHANNELS.input, (event, leaseId, sequence, events) => {
       this.#receiveInput(event, leaseId, sequence, events);
     });
+    ipcMain.handle(
+      REMOTE_DESKTOP_CAPTURE_CHANNELS.nativeFrame,
+      (event, leaseId, attemptId) => this.#nativeFrame(event, leaseId, attemptId)
+    );
     ipcMain.handle(
       REMOTE_DESKTOP_CAPTURE_CHANNELS.presentationPong,
       (event, leaseId, attemptId) => {
@@ -126,13 +145,34 @@ export class DesktopRemoteDesktopMedia implements DesktopRemoteDesktopMediaPort 
     };
   }
 
-  async frame(displayId: string, signal: AbortSignal): Promise<RemoteDesktopJpegFrame | null> {
+  setSessionState(nativeOnly: boolean): void {
+    this.stop();
+    this.#nativeOnly = nativeOnly;
+  }
+
+  async frame(
+    displayId: string,
+    cursorOverlay: boolean,
+    signal: AbortSignal
+  ): Promise<RemoteDesktopJpegFrame | null> {
     this.#assertAvailable();
     assertCapturePermission();
-    const sources = await enumerateDesktopSources(true, signal);
-    const source = exactDesktopSource(sources, displayId);
-    throwIfAborted(signal);
-    return source === null ? null : encodeDesktopFrame(source.thumbnail);
+    if (process.platform === "darwin" && (this.#nativeOnly || cursorOverlay)) {
+      const frame = await this.#nativeCapture.frame(displayId, cursorOverlay, cursorOverlay);
+      throwIfAborted(signal);
+      return encodeNativeRelayFrame(frame);
+    }
+    try {
+      const sources = await enumerateDesktopSources(true, signal);
+      const source = exactDesktopSource(sources, displayId);
+      throwIfAborted(signal);
+      return source === null ? null : encodeDesktopFrame(source.thumbnail);
+    } catch (error) {
+      if (process.platform !== "darwin" || !capturePermissionGranted()) throw error;
+      const frame = await this.#nativeCapture.frame(displayId, cursorOverlay, cursorOverlay);
+      throwIfAborted(signal);
+      return encodeNativeRelayFrame(frame);
+    }
   }
 
   async offer(request: {
@@ -140,6 +180,7 @@ export class DesktopRemoteDesktopMedia implements DesktopRemoteDesktopMediaPort 
     readonly leaseId: string;
     readonly attemptId: string;
     readonly offerSdp: string;
+    readonly cursorOverlay: boolean;
     readonly settings?: DesktopRemoteDesktopVideoSettings;
     readonly current: () => boolean;
     readonly signal: AbortSignal;
@@ -153,9 +194,19 @@ export class DesktopRemoteDesktopMedia implements DesktopRemoteDesktopMediaPort 
     if (settings?.audio === true && !readDesktopSystemAudioSupport()) {
       throw new Error("REMOTE_DESKTOP_AUDIO_UNAVAILABLE");
     }
-    const sources = await enumerateDesktopSources(false, request.signal);
-    const source = exactDesktopSource(sources, request.displayId);
-    if (source === null) throw new Error("REMOTE_DESKTOP_VIDEO_UNAVAILABLE");
+    let source: DesktopCapturerSource | null = null;
+    const nativeAvailable = process.platform === "darwin";
+    const nativeVideo = nativeAvailable && (this.#nativeOnly || request.cursorOverlay);
+    if (!nativeVideo || settings?.audio === true) {
+      try {
+        const sources = await enumerateDesktopSources(false, request.signal,
+          nativeAvailable ? 2_000 : REMOTE_DESKTOP_OFFER_BUDGET.sourcesMs);
+        source = exactDesktopSource(sources, request.displayId);
+      } catch (error) {
+        if (!nativeAvailable || !capturePermissionGranted()) throw error;
+      }
+    }
+    if (source === null && !nativeAvailable) throw new Error("REMOTE_DESKTOP_VIDEO_UNAVAILABLE");
     throwIfAborted(request.signal);
     if (!request.current()) throw new Error("REMOTE_DESKTOP_VIDEO_STOPPED");
     await this.#startWindow(generation, request.signal);
@@ -163,7 +214,7 @@ export class DesktopRemoteDesktopMedia implements DesktopRemoteDesktopMediaPort 
       throw new Error("REMOTE_DESKTOP_VIDEO_STOPPED");
     }
     const requestId = randomUUID();
-    this.#grant = {
+    this.#grant = source === null || (nativeVideo && settings?.audio !== true) ? undefined : {
       source,
       leaseId: request.leaseId,
       attemptId: request.attemptId,
@@ -171,7 +222,15 @@ export class DesktopRemoteDesktopMedia implements DesktopRemoteDesktopMediaPort 
       audio: settings?.audio === true,
       current: request.current
     };
-    this.#attempt = { leaseId: request.leaseId, attemptId: request.attemptId };
+    this.#attempt = {
+      leaseId: request.leaseId,
+      attemptId: request.attemptId,
+      displayId: request.displayId,
+      nativeCapture: nativeAvailable,
+      cursorOverlay: request.cursorOverlay && process.platform === "darwin",
+      ...(settings === undefined ? {} : { settings }),
+      current: request.current
+    };
     try {
       const reply = await this.#command({
         op: "offer",
@@ -180,6 +239,10 @@ export class DesktopRemoteDesktopMedia implements DesktopRemoteDesktopMediaPort 
         attemptId: request.attemptId,
         offerSdp: request.offerSdp,
         iceServers: REMOTE_DESKTOP_STUN_SERVERS.map((server) => ({ urls: server.urls })),
+        nativeCapture: nativeAvailable,
+        nativeVideo,
+        chromiumCapture: this.#grant !== undefined,
+        cursorOverlay: request.cursorOverlay && process.platform === "darwin",
         ...(settings === undefined ? {} : { settings })
       }, REMOTE_DESKTOP_OFFER_BUDGET.hostMs, request.signal);
       if (reply.kind !== "offer" || Buffer.byteLength(reply.answerSdp, "utf8") > 64 * 1_024) {
@@ -239,6 +302,7 @@ export class DesktopRemoteDesktopMedia implements DesktopRemoteDesktopMediaPort 
 
   stop(): void {
     this.#generation += 1;
+    this.#nativeCapture.stop();
     this.#grant = undefined;
     this.#attempt = undefined;
     this.#presentationLease = undefined;
@@ -268,6 +332,7 @@ export class DesktopRemoteDesktopMedia implements DesktopRemoteDesktopMediaPort 
     ipcMain.removeHandler(REMOTE_DESKTOP_CAPTURE_CHANNELS.ready);
     ipcMain.removeHandler(REMOTE_DESKTOP_CAPTURE_CHANNELS.reply);
     ipcMain.removeHandler(REMOTE_DESKTOP_CAPTURE_CHANNELS.input);
+    ipcMain.removeHandler(REMOTE_DESKTOP_CAPTURE_CHANNELS.nativeFrame);
     ipcMain.removeHandler(REMOTE_DESKTOP_CAPTURE_CHANNELS.presentationPong);
     ipcMain.removeHandler(REMOTE_DESKTOP_CAPTURE_CHANNELS.stopped);
     const captureSession = this.#captureSession;
@@ -426,6 +491,34 @@ export class DesktopRemoteDesktopMedia implements DesktopRemoteDesktopMediaPort 
     this.#inputHandler?.(leaseId, request.sequence, request.events);
   }
 
+  async #nativeFrame(
+    event: IpcMainInvokeEvent,
+    leaseId: unknown,
+    attemptId: unknown
+  ): Promise<DesktopRemoteDesktopNativeFrame | null> {
+    this.#assertSender(event);
+    const attempt = this.#attempt;
+    if (typeof leaseId !== "string" || typeof attemptId !== "string"
+      || attempt?.leaseId !== leaseId || attempt.attemptId !== attemptId
+      || !attempt.nativeCapture) {
+      throw new Error("Remote Desktop native frame request is stale.");
+    }
+    let current = false;
+    try { current = attempt.current(); } catch { /* Authority lookup failed closed. */ }
+    if (!current) throw new Error("Remote Desktop native frame request is stale.");
+    const generation = this.#generation;
+    const frame = await this.#nativeCapture.frame(
+      attempt.displayId,
+      true,
+      attempt.cursorOverlay,
+      attempt.settings
+    );
+    let stillCurrent = false;
+    try { stillCurrent = attempt.current(); } catch { /* Authority lookup failed closed. */ }
+    if (generation !== this.#generation || this.#attempt !== attempt || !stillCurrent) return null;
+    return frame;
+  }
+
   #receivePresentationPong(
     event: IpcMainInvokeEvent,
     leaseId: unknown,
@@ -500,7 +593,8 @@ export class DesktopRemoteDesktopMedia implements DesktopRemoteDesktopMediaPort 
 
 async function enumerateDesktopSources(
   thumbnail: boolean,
-  signal: AbortSignal
+  signal: AbortSignal,
+  timeoutMs: number = REMOTE_DESKTOP_OFFER_BUDGET.sourcesMs
 ): Promise<DesktopCapturerSource[]> {
   throwIfAborted(signal);
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -514,8 +608,7 @@ async function enumerateDesktopSources(
         fetchWindowIcons: false
       }),
       new Promise<never>((_resolve, reject) => {
-        timer = setTimeout(() => reject(new Error("REMOTE_DESKTOP_VIDEO_TIMEOUT")),
-          REMOTE_DESKTOP_OFFER_BUDGET.sourcesMs);
+        timer = setTimeout(() => reject(new Error("REMOTE_DESKTOP_VIDEO_TIMEOUT")), timeoutMs);
       }),
       abortPromise(signal)
     ]);
@@ -553,6 +646,22 @@ export function encodeDesktopFrame(thumbnail: NativeImage): RemoteDesktopJpegFra
     image = image.resize({ width: Math.max(1, Math.floor(size.width * 0.75)) });
   }
   return null;
+}
+
+/** Native WebRTC pixels may be 4096px/1MiB; relay frames stay 1280/180KiB. */
+export function encodeNativeRelayFrame(
+  frame: DesktopRemoteDesktopNativeFrame | null
+): RemoteDesktopJpegFrame | null {
+  if (frame === null) return null;
+  let bytes: Buffer;
+  try { bytes = Buffer.from(frame.jpeg, "base64"); }
+  catch { return null; }
+  const encoded = encodeDesktopFrame(nativeImage.createFromBuffer(bytes));
+  bytes.fill(0);
+  return encoded === null ? null : Object.freeze({
+    ...encoded,
+    ...(frame.cursor === null ? {} : { cursor: frame.cursor })
+  });
 }
 
 function parseCaptureReply(
@@ -599,9 +708,15 @@ function exactKeys(value: Record<string, unknown>, keys: readonly string[]): boo
 }
 
 function assertCapturePermission(): void {
-  if (process.platform === "darwin" && systemPreferences.getMediaAccessStatus("screen") !== "granted") {
+  if (!capturePermissionGranted()) {
     throw new Error("REMOTE_DESKTOP_SCREEN_PERMISSION_REQUIRED");
   }
+}
+
+function capturePermissionGranted(): boolean {
+  if (process.platform !== "darwin") return true;
+  try { return systemPreferences.getMediaAccessStatus("screen") === "granted"; }
+  catch { return false; }
 }
 
 function abortPromise(signal: AbortSignal): Promise<never> {

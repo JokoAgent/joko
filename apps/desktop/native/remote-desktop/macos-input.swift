@@ -1,6 +1,7 @@
 import Foundation
 import ApplicationServices
 import AppKit
+import IOKit.graphics
 import Security
 
 guard let inputCaller = DesktopInputCaller.authenticate() else { exit(77) }
@@ -9,8 +10,9 @@ func unlockedSession() -> Bool {
   guard let state = CGSessionCopyCurrentDictionary() as? [String: Any],
     (state[kCGSessionUserIDKey as String] as? NSNumber)?.uint32Value == geteuid(),
     state[kCGSessionOnConsoleKey as String] as? Bool == true,
-    state[kCGSessionLoginDoneKey as String] as? Bool == true else { return false }
-  return state["CGSSessionScreenIsLocked"] as? Bool != true
+    state[kCGSessionLoginDoneKey as String] as? Bool == true,
+    let locked = state["CGSSessionScreenIsLocked"] as? Bool else { return false }
+  return !locked
 }
 
 // Expose only the change counter. Clipboard bytes never cross the helper's
@@ -63,11 +65,84 @@ if CommandLine.arguments.count == 2 &&
   exit(0)
 }
 
+// Display configuration is a separate authenticated one-shot command. It
+// never acquires input ownership or prompts for Accessibility permission.
+// Only a mode from a fresh enumeration may be applied and it lasts only for
+// the current login session.
+if (CommandLine.arguments.count == 3 && CommandLine.arguments[1] == "--display-modes") ||
+  (CommandLine.arguments.count == 4 && CommandLine.arguments[1] == "--display-mode") {
+  guard let display = UInt32(CommandLine.arguments[2]), CGDisplayIsOnline(display) != 0,
+    let modes = CGDisplayCopyAllDisplayModes(
+      display,
+      [kCGDisplayShowDuplicateLowResolutionModes: true] as CFDictionary
+    ) as? [CGDisplayMode],
+    let current = CGDisplayCopyDisplayMode(display) else { exit(2) }
+  if CommandLine.arguments[1] == "--display-modes" {
+    var preferred: [String: CGDisplayMode] = [:]
+    for mode in modes where mode.isUsableForDesktopGUI() {
+      let key = "\(mode.width)x\(mode.height)"
+      if let prior = preferred[key],
+        prior.ioDisplayModeID == current.ioDisplayModeID ||
+          (mode.ioDisplayModeID != current.ioDisplayModeID &&
+            prior.pixelWidth >= mode.pixelWidth && prior.refreshRate >= mode.refreshRate) {
+        continue
+      }
+      preferred[key] = mode
+    }
+    let result = preferred.values.sorted {
+      $0.width == $1.width ? $0.height < $1.height : $0.width < $1.width
+    }.map {
+      [
+        "id": String($0.ioDisplayModeID),
+        "width": $0.width,
+        "height": $0.height,
+        "current": $0.ioDisplayModeID == current.ioDisplayModeID,
+        "native": ($0.ioFlags & UInt32(kDisplayModeNativeFlag)) != 0
+      ] as [String: Any]
+    }
+    guard let data = try? JSONSerialization.data(withJSONObject: result),
+      let json = String(data: data, encoding: .utf8) else { exit(2) }
+    print(json)
+    exit(0)
+  }
+  guard unlockedSession(), let modeID = UInt32(CommandLine.arguments[3]),
+    let mode = modes.first(where: {
+      $0.ioDisplayModeID == modeID && $0.isUsableForDesktopGUI()
+    }) else { exit(2) }
+  var configuration: CGDisplayConfigRef?
+  guard CGBeginDisplayConfiguration(&configuration) == .success,
+    let configuration = configuration else { exit(3) }
+  guard CGConfigureDisplayWithDisplayMode(configuration, display, mode, nil) == .success else {
+    CGCancelDisplayConfiguration(configuration)
+    exit(3)
+  }
+  guard CGCompleteDisplayConfiguration(configuration, .forSession) == .success else { exit(3) }
+  print("ready")
+  exit(0)
+}
+
 if CommandLine.arguments.count == 2 && CommandLine.arguments[1] == "--check" {
   print(AXIsProcessTrusted() ? "ready" : "permission")
   exit(0)
 }
 
+// Positive proof only. Missing login ownership, the pre-login/FileVault UI,
+// another console user, or an unreadable lock bit is never treated as an
+// unlocked desktop.
+if CommandLine.arguments.count == 2 && CommandLine.arguments[1] == "--lock-state" {
+  guard let state = CGSessionCopyCurrentDictionary() as? [String: Any],
+    (state[kCGSessionUserIDKey as String] as? NSNumber)?.uint32Value == geteuid(),
+    state[kCGSessionOnConsoleKey as String] as? Bool == true,
+    state[kCGSessionLoginDoneKey as String] as? Bool == true,
+    let locked = state["CGSSessionScreenIsLocked"] as? Bool else {
+    print("unsupported")
+    exit(0)
+  }
+  print(locked ? "locked-logged-in" : "unlocked")
+  exit(0)
+}
+
+guard CommandLine.arguments.count == 1 else { exit(2) }
 guard unlockedSession() else { print("locked"); fflush(stdout); exit(2) }
 guard AXIsProcessTrusted() else { print("permission"); fflush(stdout); exit(2) }
 

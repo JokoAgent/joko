@@ -1,19 +1,29 @@
 import { spawn, execFile, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { createHash, timingSafeEqual } from "node:crypto";
-import { access, copyFile, lstat, mkdir, mkdtemp, readFile, realpath, rename, rm, writeFile } from "node:fs/promises";
-import { dirname, join, resolve, sep } from "node:path";
+import { createHash } from "node:crypto";
+import { access, copyFile, mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
 
 import { app, screen } from "electron";
-import type { RemoteDesktopDisplay, RemoteDesktopInput } from "@joko/device-peer";
+import type {
+  RemoteDesktopDisplay,
+  RemoteDesktopDisplayMode,
+  RemoteDesktopInput
+} from "@joko/device-peer";
 
 import type { DesktopRemoteDesktopInputPort } from "./remote-desktop-host.js";
+import { verifyPackagedDesktopRemoteDesktopBinary } from "./remote-desktop-native-manifest.js";
 
 const exec = promisify(execFile);
 const MAXIMUM_QUEUE_BYTES = 32_768;
 const HELPER_READY_MS = 8_000;
 const HELPER_STOP_MS = 1_500;
-const MAXIMUM_HELPER_BYTES = 16 * 1024 * 1024;
+
+export type DesktopRemoteDesktopSessionState =
+  | "unknown"
+  | "unlocked"
+  | "locked-logged-in"
+  | "unsupported";
 
 export interface DesktopRemoteDesktopInputRuntime {
   readonly platform: NodeJS.Platform;
@@ -212,6 +222,138 @@ export async function readDesktopRemoteDesktopInputPermission(
   }
 }
 
+/**
+ * Positive native proof of the current macOS console session. Unknown helper
+ * output, pre-login/FileVault/loginwindow, another user and process errors are
+ * never promoted to a viewable state.
+ */
+export async function readDesktopRemoteDesktopSessionState(
+  signal: AbortSignal,
+  resolveBinary: (prepare?: boolean) => Promise<string> = resolveDesktopRemoteDesktopInputBinary
+): Promise<DesktopRemoteDesktopSessionState> {
+  if (process.platform !== "darwin") return "unsupported";
+  throwIfAborted(signal);
+  try {
+    const binary = await resolveBinary();
+    throwIfAborted(signal);
+    const { stdout } = await exec(binary, ["--lock-state"], {
+      timeout: 5_000,
+      maxBuffer: 1_024,
+      windowsHide: true,
+      signal
+    });
+    throwIfAborted(signal);
+    const value = stdout.trim();
+    return value === "unlocked" || value === "locked-logged-in" || value === "unsupported"
+      ? value
+      : "unknown";
+  } catch {
+    if (signal.aborted) throw signal.reason ?? new Error("Remote Desktop session probe was aborted.");
+    return "unknown";
+  }
+}
+
+/** Enumerates only bounded, desktop-usable modes from the selected display. */
+export async function readDesktopRemoteDesktopDisplayModes(
+  displayId: string,
+  signal: AbortSignal,
+  resolveBinary: (prepare?: boolean) => Promise<string> = resolveDesktopRemoteDesktopInputBinary
+): Promise<readonly RemoteDesktopDisplayMode[]> {
+  if (process.platform !== "darwin" || !/^[0-9]{1,10}$/u.test(displayId)) {
+    throw new Error("REMOTE_DESKTOP_DISPLAY_MODES_UNAVAILABLE");
+  }
+  throwIfAborted(signal);
+  try {
+    const binary = await resolveBinary();
+    throwIfAborted(signal);
+    const { stdout } = await exec(binary, ["--display-modes", displayId], {
+      timeout: 5_000,
+      maxBuffer: 64_000,
+      windowsHide: true,
+      signal
+    });
+    throwIfAborted(signal);
+    const value: unknown = JSON.parse(stdout);
+    if (!Array.isArray(value) || value.length < 1 || value.length > 256) throw new Error("invalid");
+    const modes = value.map((candidate): RemoteDesktopDisplayMode => {
+      if (typeof candidate !== "object" || candidate === null || Array.isArray(candidate)
+        || Object.keys(candidate).sort().join(",") !== "current,height,id,native,width") {
+        throw new Error("invalid");
+      }
+      const mode = candidate as Record<string, unknown>;
+      if (typeof mode["id"] !== "string" || !/^[0-9]{1,10}$/u.test(mode["id"])
+        || !Number.isSafeInteger(mode["width"]) || !Number.isSafeInteger(mode["height"])
+        || (mode["width"] as number) < 1 || (mode["width"] as number) > 32_768
+        || (mode["height"] as number) < 1 || (mode["height"] as number) > 32_768
+        || typeof mode["current"] !== "boolean" || typeof mode["native"] !== "boolean") {
+        throw new Error("invalid");
+      }
+      return Object.freeze({
+        id: mode["id"],
+        width: mode["width"] as number,
+        height: mode["height"] as number,
+        current: mode["current"],
+        native: mode["native"]
+      });
+    });
+    if (new Set(modes.map((mode) => mode.id)).size !== modes.length
+      || modes.filter((mode) => mode.current).length !== 1) {
+      throw new Error("invalid");
+    }
+    return Object.freeze(modes);
+  } catch (error) {
+    if (signal.aborted) throw signal.reason ?? new Error("Remote Desktop display mode request was aborted.");
+    if (error instanceof Error && error.message === "REMOTE_DESKTOP_DISPLAY_MODES_UNAVAILABLE") throw error;
+    throw new Error("REMOTE_DESKTOP_DISPLAY_MODES_UNAVAILABLE");
+  }
+}
+
+let changingDisplayMode = false;
+
+/** Re-enumerates immediately before the session-scoped native effect. */
+export async function setDesktopRemoteDesktopDisplayMode(
+  displayId: string,
+  modeId: string,
+  beforeChange: () => void,
+  signal: AbortSignal,
+  resolveBinary: (prepare?: boolean) => Promise<string> = resolveDesktopRemoteDesktopInputBinary
+): Promise<void> {
+  if (changingDisplayMode) throw new Error("REMOTE_DESKTOP_DISPLAY_BUSY");
+  changingDisplayMode = true;
+  try {
+    const modes = await readDesktopRemoteDesktopDisplayModes(displayId, signal, resolveBinary);
+    if (!modes.some((mode) => mode.id === modeId)) {
+      throw new Error("REMOTE_DESKTOP_DISPLAY_MODE_MISSING");
+    }
+    const binary = await resolveBinary();
+    throwIfAborted(signal);
+    // This callback revalidates exact control authority and ends the old lease;
+    // the geometry-changing native effect can therefore never race old input.
+    beforeChange();
+    const { stdout } = await exec(binary, ["--display-mode", displayId, modeId], {
+      timeout: 5_000,
+      maxBuffer: 1_024,
+      windowsHide: true,
+      signal
+    });
+    if (stdout.trim() !== "ready") throw new Error("REMOTE_DESKTOP_DISPLAY_MODES_UNAVAILABLE");
+  } catch (error) {
+    if (signal.aborted) {
+      throw signal.reason ?? new Error("Remote Desktop display mode request was aborted.");
+    }
+    const code = error instanceof Error ? error.message : "";
+    if (code === "REMOTE_DESKTOP_DISPLAY_BUSY"
+      || code === "REMOTE_DESKTOP_DISPLAY_MODE_MISSING"
+      || code === "REMOTE_DESKTOP_DISPLAY_MODES_UNAVAILABLE"
+      || code === "REMOTE_DESKTOP_LEASE_EXPIRED"
+      || code === "REMOTE_DESKTOP_VIEW_ONLY"
+      || code === "REMOTE_DESKTOP_LOCKED_SESSION_UNSUPPORTED") throw error;
+    throw new Error("REMOTE_DESKTOP_DISPLAY_MODES_UNAVAILABLE");
+  } finally {
+    changingDisplayMode = false;
+  }
+}
+
 /** Reads only the native clipboard change counter; clipboard content never enters helper output. */
 export async function readDesktopRemoteDesktopClipboardVersion(
   portable: boolean,
@@ -308,12 +450,17 @@ export async function resolveDesktopRemoteDesktopInputBinary(prepare = true): Pr
     ? "joko-macos-remote-desktop-input"
     : "joko-windows-remote-desktop-input.exe";
   if (app.isPackaged) {
-    return verifyPackagedDesktopRemoteDesktopInputBinary(
-      join(process.resourcesPath, "native-remote-desktop"),
-      binaryName,
-      platform,
-      process.arch
-    );
+    try {
+      return await verifyPackagedDesktopRemoteDesktopBinary(
+        join(process.resourcesPath, "native-remote-desktop"),
+        "input",
+        binaryName,
+        platform,
+        process.arch
+      );
+    } catch {
+      throw new Error("REMOTE_DESKTOP_INPUT_UNAVAILABLE");
+    }
   }
   if (inputBuild !== undefined && prepare) return inputBuild;
   const build = async (): Promise<string> => {
@@ -356,6 +503,7 @@ export async function resolveDesktopRemoteDesktopInputBinary(prepare = true): Pr
           await writeFile(main, program, { mode: 0o600 });
           await exec("xcrun", ["--sdk", "macosx", "swiftc", "-D", "REMOTE_DESKTOP_INPUT_DEVELOPMENT",
             main, "-O", "-framework", "ApplicationServices", "-framework", "AppKit", "-framework", "Security",
+            "-framework", "IOKit",
             "-o", temporary], { timeout: 120_000, windowsHide: true });
         } finally {
           await rm(buildDirectory, { recursive: true, force: true });
@@ -392,52 +540,6 @@ export async function resolveDesktopRemoteDesktopInputBinary(prepare = true): Pr
   if (!prepare) return build();
   inputBuild = build().finally(() => { inputBuild = undefined; });
   return inputBuild;
-}
-
-async function verifyPackagedDesktopRemoteDesktopInputBinary(
-  directory: string,
-  binaryName: string,
-  platform: NodeJS.Platform,
-  architecture: string
-): Promise<string> {
-  const manifestPath = join(directory, "manifest.json");
-  const [directoryPath, manifestMetadata, manifestBytes] = await Promise.all([
-    realpath(directory),
-    lstat(manifestPath),
-    readFile(manifestPath)
-  ]);
-  if (!manifestMetadata.isFile() || manifestMetadata.isSymbolicLink() || manifestBytes.byteLength > 4_096) {
-    throw new Error("REMOTE_DESKTOP_INPUT_UNAVAILABLE");
-  }
-  let manifest: unknown;
-  try { manifest = JSON.parse(manifestBytes.toString("utf8")); }
-  finally { manifestBytes.fill(0); }
-  if (typeof manifest !== "object" || manifest === null || Array.isArray(manifest)
-    || Object.keys(manifest).sort().join(",") !== "architecture,helper,platform,protocolVersion,sha256") {
-    throw new Error("REMOTE_DESKTOP_INPUT_UNAVAILABLE");
-  }
-  const record = manifest as Record<string, unknown>;
-  if (record["protocolVersion"] !== 1 || record["platform"] !== platform
-    || record["architecture"] !== architecture || record["helper"] !== binaryName
-    || typeof record["sha256"] !== "string" || !/^[0-9a-f]{64}$/u.test(record["sha256"])) {
-    throw new Error("REMOTE_DESKTOP_INPUT_UNAVAILABLE");
-  }
-  const binary = join(directoryPath, binaryName);
-  const [binaryPath, metadata, bytes] = await Promise.all([realpath(binary), lstat(binary), readFile(binary)]);
-  try {
-    if (!binaryPath.startsWith(`${directoryPath}${sep}`) || !metadata.isFile() || metadata.isSymbolicLink()
-      || bytes.byteLength < 1 || bytes.byteLength > MAXIMUM_HELPER_BYTES) {
-      throw new Error("REMOTE_DESKTOP_INPUT_UNAVAILABLE");
-    }
-    const actual = Buffer.from(createHash("sha256").update(bytes).digest("hex"), "utf8");
-    const expected = Buffer.from(record["sha256"], "utf8");
-    if (actual.byteLength !== expected.byteLength || !timingSafeEqual(actual, expected)) {
-      throw new Error("REMOTE_DESKTOP_INPUT_UNAVAILABLE");
-    }
-    return binaryPath;
-  } finally {
-    bytes.fill(0);
-  }
 }
 
 function electronInputRuntime(): DesktopRemoteDesktopInputRuntime {

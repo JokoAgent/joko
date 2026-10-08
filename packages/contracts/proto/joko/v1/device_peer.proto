@@ -399,6 +399,7 @@ message DevicePeerCreateRemoteDesktopOfferAction {
   string attempt_id = 2;
   string offer_sdp = 3;
   RemoteDesktopVideoSettings settings = 4;
+  bool cursor_overlay = 5;
 }
 
 message DevicePeerExchangeRemoteDesktopIceAction {
@@ -410,6 +411,17 @@ message DevicePeerExchangeRemoteDesktopIceAction {
 
 message DevicePeerGetRemoteDesktopFrameAction {
   string lease_id = 1;
+  bool cursor_overlay = 2;
+}
+
+message DevicePeerListRemoteDesktopDisplayModesAction {
+  string lease_id = 1;
+}
+
+message DevicePeerSetRemoteDesktopDisplayModeAction {
+  string lease_id = 1;
+  uint64 control_generation = 2;
+  string mode_id = 3;
 }
 
 message DevicePeerCommand {
@@ -461,6 +473,8 @@ message DevicePeerCommand {
     RemoteDesktopClipboardContentRequest transfer_remote_desktop_clipboard_content = 62;
     DevicePeerSetRemoteDesktopPresentationAction set_remote_desktop_presentation = 63;
     DevicePeerProbeRemoteDesktopPresentationAction probe_remote_desktop_presentation = 64;
+    DevicePeerListRemoteDesktopDisplayModesAction list_remote_desktop_display_modes = 65;
+    DevicePeerSetRemoteDesktopDisplayModeAction set_remote_desktop_display_mode = 66;
   }
 }
 
@@ -598,6 +612,10 @@ message DevicePeerLoopbackListenerClosedResult {
 
 message DevicePeerAcknowledgement {}
 
+message DevicePeerRemoteDesktopDisplayModesResult {
+  repeated RemoteDesktopDisplayMode modes = 1;
+}
+
 // Sequence starts at one and increases strictly for every frame with the same
 // request_id. Output/data payloads are progress frames and are valid only with
 // STARTED; they never establish a terminal completion. COMPLETED, FAILED,
@@ -640,6 +658,7 @@ message DevicePeerAgentResult {
     RemoteDesktopClipboardTextResult remote_desktop_clipboard_text = 47;
     RemoteDesktopClipboardContentResult remote_desktop_clipboard_content = 48;
     RemoteDesktopPresentationProof remote_desktop_presentation_proof = 49;
+    DevicePeerRemoteDesktopDisplayModesResult remote_desktop_display_modes = 50;
     DevicePeerFailure failure = 30;
   }
 }

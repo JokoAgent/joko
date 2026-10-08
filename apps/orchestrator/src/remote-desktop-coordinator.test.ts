@@ -176,6 +176,177 @@ describe("RemoteDesktopCoordinator", () => {
     });
   });
 
+  it("lists lease-bound modes and retires the exact controlling lease after a successful mode write", async () => {
+    const fake = new FakeDevicePeerOwner();
+    const coordinator = fakeCoordinator(fake).coordinator;
+    const lease = await start(coordinator);
+
+    await expect(coordinator.listDisplayModes(
+      connection,
+      identity,
+      lease.leaseId,
+      signal
+    )).resolves.toMatchObject([
+      { modeId: "101", width: 1920, height: 1080, current: true, native: true }
+    ]);
+    expect(fake.calls.at(-1)?.input).toMatchObject({
+      action: "listRemoteDesktopDisplayModes",
+      effectKind: "read_only"
+    });
+
+    await expect(coordinator.setDisplayMode(connection, identity, {
+      leaseId: lease.leaseId,
+      controlGeneration: lease.controlGeneration + 1n,
+      modeId: "101"
+    }, signal)).rejects.toMatchObject({
+      detail: { reason: contract.RemoteDesktopFailureReason.LEASE_EXPIRED }
+    });
+    expect(fake.actions().filter((action) => action === "setRemoteDesktopDisplayMode")).toHaveLength(0);
+
+    await expect(coordinator.setDisplayMode(connection, identity, {
+      leaseId: lease.leaseId,
+      controlGeneration: lease.controlGeneration,
+      modeId: "101"
+    }, signal)).resolves.toBeUndefined();
+    const command = fake.calls.at(-1)?.input.payload as contract.DevicePeerCommand;
+    expect(command).toMatchObject({
+      action: {
+        case: "setRemoteDesktopDisplayMode",
+        value: {
+          leaseId: lease.leaseId,
+          controlGeneration: lease.controlGeneration,
+          modeId: "101"
+        }
+      }
+    });
+    await expect(coordinator.heartbeat(connection, identity, lease.leaseId, signal)).rejects.toMatchObject({
+      detail: { reason: contract.RemoteDesktopFailureReason.STOPPED }
+    });
+  });
+
+  it("keeps the lease only for a typed pre-effect display-mode failure", async () => {
+    const fake = new FakeDevicePeerOwner();
+    const coordinator = fakeCoordinator(fake).coordinator;
+    const lease = await start(coordinator);
+    const previousDispatch = fake.dispatchHandler;
+    fake.dispatchHandler = async (authority, input) => input.action === "setRemoteDesktopDisplayMode"
+      ? failedRemoteDesktop(contract.RemoteDesktopFailureReason.DISPLAY_MODE_MISSING)
+      : previousDispatch(authority, input);
+
+    await expect(coordinator.setDisplayMode(connection, identity, {
+      leaseId: lease.leaseId,
+      controlGeneration: lease.controlGeneration,
+      modeId: "999"
+    }, signal)).rejects.toMatchObject({
+      code: "not_found",
+      detail: { reason: contract.RemoteDesktopFailureReason.DISPLAY_MODE_MISSING }
+    });
+    await expect(coordinator.heartbeat(connection, identity, lease.leaseId, signal)).resolves.toMatchObject({
+      controlling: true,
+      controlGeneration: lease.controlGeneration
+    });
+  });
+
+  it("allows only one display-mode write in flight for a lease", async () => {
+    const fake = new FakeDevicePeerOwner();
+    const coordinator = fakeCoordinator(fake).coordinator;
+    const lease = await start(coordinator);
+    const previousDispatch = fake.dispatchHandler;
+    let finish: ((response: DevicePeerResponseFrame) => void) | undefined;
+    fake.dispatchHandler = (authority, input) => input.action === "setRemoteDesktopDisplayMode"
+      ? new Promise<DevicePeerResponseFrame>((resolve) => { finish = resolve; })
+      : previousDispatch(authority, input);
+
+    const first = coordinator.setDisplayMode(connection, identity, {
+      leaseId: lease.leaseId,
+      controlGeneration: lease.controlGeneration,
+      modeId: "101"
+    }, signal);
+    await vi.waitFor(() => expect(finish).toBeTypeOf("function"));
+    await expect(coordinator.setDisplayMode(connection, identity, {
+      leaseId: lease.leaseId,
+      controlGeneration: lease.controlGeneration,
+      modeId: "101"
+    }, signal)).rejects.toMatchObject({
+      detail: { reason: contract.RemoteDesktopFailureReason.DISPLAY_BUSY }
+    });
+    expect(fake.actions().filter((action) => action === "setRemoteDesktopDisplayMode")).toHaveLength(1);
+    finish?.(completed(acknowledgementResult()));
+    await expect(first).resolves.toBeUndefined();
+  });
+
+  it.each([
+    ["unavailable", contract.DevicePeerFailureCode.UNAVAILABLE],
+    ["cancelled", contract.DevicePeerFailureCode.CANCELLED]
+  ] as const)("retires the old lease after a post-dispatch %s result without domain proof", async (
+    errorCode,
+    failureCode
+  ) => {
+    const fake = new FakeDevicePeerOwner();
+    const coordinator = fakeCoordinator(fake).coordinator;
+    const lease = await start(coordinator);
+    const previousDispatch = fake.dispatchHandler;
+    fake.dispatchHandler = async (authority, input) => input.action === "setRemoteDesktopDisplayMode"
+      ? {
+          protocolVersion: 1,
+          kind: "response",
+          requestId: "mode-failed",
+          targetDeviceId: identity.targetDeviceId,
+          routeGeneration: identity.routeGeneration,
+          outcome: "failed",
+          errorCode,
+          failure: create(contract.DevicePeerFailureSchema, {
+            code: failureCode,
+            retryable: true
+          })
+        }
+      : previousDispatch(authority, input);
+
+    await expect(coordinator.setDisplayMode(connection, identity, {
+      leaseId: lease.leaseId,
+      controlGeneration: lease.controlGeneration,
+      modeId: "101"
+    }, signal)).rejects.toMatchObject({ code: errorCode });
+    await expect(coordinator.heartbeat(connection, identity, lease.leaseId, signal)).rejects.toMatchObject({
+      detail: { reason: contract.RemoteDesktopFailureReason.STOPPED }
+    });
+  });
+
+  it("retires an outcome-unknown mode write even when it carries a pre-effect-looking detail", async () => {
+    const fake = new FakeDevicePeerOwner();
+    const coordinator = fakeCoordinator(fake).coordinator;
+    const lease = await start(coordinator);
+    const previousDispatch = fake.dispatchHandler;
+    fake.dispatchHandler = async (authority, input) => input.action === "setRemoteDesktopDisplayMode"
+      ? {
+          protocolVersion: 1,
+          kind: "response",
+          requestId: "mode-unknown",
+          targetDeviceId: identity.targetDeviceId,
+          routeGeneration: identity.routeGeneration,
+          outcome: "outcome_unknown",
+          errorCode: "receipt_lost",
+          failure: create(contract.DevicePeerFailureSchema, {
+            code: contract.DevicePeerFailureCode.NOT_FOUND,
+            retryable: false,
+            remoteDesktop: create(contract.RemoteDesktopFailureSchema, {
+              reason: contract.RemoteDesktopFailureReason.DISPLAY_MODE_MISSING,
+              retryable: false
+            })
+          })
+        }
+      : previousDispatch(authority, input);
+
+    await expect(coordinator.setDisplayMode(connection, identity, {
+      leaseId: lease.leaseId,
+      controlGeneration: lease.controlGeneration,
+      modeId: "101"
+    }, signal)).rejects.toMatchObject({ code: "aborted" });
+    await expect(coordinator.heartbeat(connection, identity, lease.leaseId, signal)).rejects.toMatchObject({
+      detail: { reason: contract.RemoteDesktopFailureReason.STOPPED }
+    });
+  });
+
   it("never returns a lower control generation when concurrent control replies arrive out of order", async () => {
     const fake = new FakeDevicePeerOwner();
     const coordinator = fakeCoordinator(fake).coordinator;
@@ -725,7 +896,8 @@ describe("RemoteDesktopCoordinator", () => {
     await expect(coordinator.createOffer(connection, identity, {
       leaseId: "lease-1",
       attemptId: "attempt-1",
-      offerSdp: "s".repeat(64 * 1024 + 1)
+      offerSdp: "s".repeat(64 * 1024 + 1),
+      cursorOverlay: false
     }, signal)).rejects.toMatchObject({ code: "invalid_argument" });
     await expect(coordinator.createOffer(connection, identity, {
       leaseId: "lease-1",
@@ -735,7 +907,8 @@ describe("RemoteDesktopCoordinator", () => {
         fps: 24,
         bitrate: 8_000_000,
         audio: true
-      })
+      }),
+      cursorOverlay: false
     }, signal)).rejects.toMatchObject({ code: "invalid_argument" });
     const candidate = create(contract.RemoteDesktopIceCandidateSchema, {
       candidate: "candidate:1 1 UDP 2122260223 192.0.2.1 5000 typ host"
@@ -754,9 +927,34 @@ describe("RemoteDesktopCoordinator", () => {
         frame: create(contract.RemoteDesktopFrameSchema, { jpeg: new Uint8Array(180_001) })
       }))))
       : previousDispatch(authority, input);
-    await expect(coordinator.getFrame(connection, identity, "lease-1", signal)).rejects.toMatchObject({
+    await expect(coordinator.getFrame(connection, identity, {
+      leaseId: "lease-1",
+      cursorOverlay: false
+    }, signal)).rejects.toMatchObject({
       code: "internal"
     });
+
+    fake.dispatchHandler = (authority, input) => input.action === "getRemoteDesktopFrame"
+      ? Promise.resolve(completed(result("remoteDesktopFrame", create(contract.RemoteDesktopFrameResultSchema, {
+          frame: create(contract.RemoteDesktopFrameSchema, {
+            jpeg: new Uint8Array([0xff, 0xd8, 0xff, 0xd9]),
+            cursor: create(contract.RemoteDesktopCursorSchema, {
+              visible: true,
+              x: 0.5,
+              y: 0.25,
+              width: 32,
+              height: 32,
+              hotX: 4,
+              hotY: 5,
+              png: cursorPngBytes(513, 32)
+            })
+          })
+        }))))
+      : previousDispatch(authority, input);
+    await expect(coordinator.getFrame(connection, identity, {
+      leaseId: "lease-1",
+      cursorOverlay: true
+    }, signal)).rejects.toMatchObject({ code: "internal" });
   });
 
   it("removes leases and revocation subscriptions on revoke and close", async () => {
@@ -1017,6 +1215,21 @@ function defaultResponse(input: DispatchInput): DevicePeerResponseFrame {
       return completed(result("remoteDesktopFrame", create(contract.RemoteDesktopFrameResultSchema, {
         frame: create(contract.RemoteDesktopFrameSchema, { jpeg: new Uint8Array([0xff, 0xd8, 0xff, 0xd9]) })
       })));
+    case "listRemoteDesktopDisplayModes":
+      return completed(result("remoteDesktopDisplayModes", create(
+        contract.DevicePeerRemoteDesktopDisplayModesResultSchema,
+        {
+          modes: [create(contract.RemoteDesktopDisplayModeSchema, {
+            modeId: "101",
+            width: 1920,
+            height: 1080,
+            current: true,
+            native: true
+          })]
+        }
+      )));
+    case "setRemoteDesktopDisplayMode":
+      return completed(acknowledgementResult());
     case "transferRemoteDesktopClipboardText":
       return completed(result("remoteDesktopClipboardText", create(
         contract.RemoteDesktopClipboardTextResultSchema,
@@ -1051,6 +1264,23 @@ function completed(value: unknown): DevicePeerResponseFrame {
   };
 }
 
+function failedRemoteDesktop(reason: contract.RemoteDesktopFailureReason): DevicePeerResponseFrame {
+  return {
+    protocolVersion: 1,
+    kind: "response",
+    requestId: "request-failed",
+    targetDeviceId: identity.targetDeviceId,
+    routeGeneration: identity.routeGeneration,
+    outcome: "failed",
+    errorCode: "failed_precondition",
+    failure: create(contract.DevicePeerFailureSchema, {
+      code: contract.DevicePeerFailureCode.CONFLICT,
+      retryable: false,
+      remoteDesktop: create(contract.RemoteDesktopFailureSchema, { reason, retryable: false })
+    })
+  };
+}
+
 function result(caseName: contract.DevicePeerAgentResult["payload"]["case"], value: unknown): unknown {
   return { case: caseName, value };
 }
@@ -1078,6 +1308,16 @@ function stoppedLeaseIds(fake: FakeDevicePeerOwner): string[] {
     const command = input.payload as contract.DevicePeerCommand;
     return command.action.case === "stopRemoteDesktop" ? [command.action.value.leaseId] : [];
   });
+}
+
+function cursorPngBytes(width = 32, height = 32): Uint8Array {
+  const png = Buffer.alloc(33);
+  png.set([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+  png.writeUInt32BE(13, 8);
+  png.write("IHDR", 12, "ascii");
+  png.writeUInt32BE(width, 16);
+  png.writeUInt32BE(height, 20);
+  return png;
 }
 
 function connectionRecord(

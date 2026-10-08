@@ -952,12 +952,17 @@ async function auditNativeGamepad(root, platform, targetArch) {
 }
 
 async function auditNativeRemoteDesktop(root, platform, targetArch) {
-  const helper = platform === "darwin"
+  const inputHelper = platform === "darwin"
     ? "joko-macos-remote-desktop-input"
     : platform === "win32"
       ? "joko-windows-remote-desktop-input.exe"
       : null;
-  const expected = ["manifest.json", ...(helper === null ? [] : [helper])].sort();
+  const captureHelper = platform === "darwin" ? "joko-macos-remote-desktop-capture" : null;
+  const expected = [
+    "manifest.json",
+    ...(inputHelper === null ? [] : [inputHelper]),
+    ...(captureHelper === null ? [] : [captureHelper])
+  ].sort();
   const entries = await readdir(root, { withFileTypes: true }).catch(() => []);
   const names = entries.map(entry => entry.name).sort();
   if (names.length !== expected.length || names.some((name, index) => name !== expected[index])) {
@@ -968,36 +973,47 @@ async function auditNativeRemoteDesktop(root, platform, targetArch) {
       "The packaged Remote Desktop helper file is unsafe.");
   }
   const manifest = await readJsonManifest(resolve(root, "manifest.json"), "Remote Desktop helper");
-  if (Object.keys(manifest).sort().join(",") !== "architecture,helper,platform,protocolVersion,sha256"
+  if (Object.keys(manifest).sort().join(",") !== [
+    "architecture", "captureHelper", "captureSha256", "inputHelper", "inputSha256",
+    "platform", "protocolVersion"
+  ].sort().join(",")
     || manifest.platform !== platform || manifest.architecture !== targetArch
-    || manifest.protocolVersion !== 1 || manifest.helper !== helper
-    || (helper === null ? manifest.sha256 !== null
-      : typeof manifest.sha256 !== "string" || !/^[a-f0-9]{64}$/u.test(manifest.sha256))) {
+    || manifest.protocolVersion !== 1 || manifest.inputHelper !== inputHelper
+    || manifest.captureHelper !== captureHelper
+    || (inputHelper === null ? manifest.inputSha256 !== null
+      : typeof manifest.inputSha256 !== "string" || !/^[a-f0-9]{64}$/u.test(manifest.inputSha256))
+    || (captureHelper === null ? manifest.captureSha256 !== null
+      : typeof manifest.captureSha256 !== "string" || !/^[a-f0-9]{64}$/u.test(manifest.captureSha256))) {
     throw new Error("The packaged Remote Desktop helper identity does not match the artifact target.");
   }
-  if (helper === null) return;
-  const path = resolve(root, helper);
-  const info = await lstat(path);
-  if (info.size < 64 || info.size > 16 * 1024 * 1024
-    || (platform === "darwin" && (info.mode & 0o111) === 0)) {
-    throw new Error("The packaged Remote Desktop helper binary does not match its identity.");
-  }
-  const bytes = await readFile(path);
-  if (createHash("sha256").update(bytes).digest("hex") !== manifest.sha256) {
-    throw new Error("The packaged Remote Desktop helper digest does not match its manifest.");
-  }
-  if (platform === "darwin") {
-    if (bytes.readUInt32LE(0) !== 0xfeedfacf
-      || bytes.readUInt32LE(4) !== (targetArch === "arm64" ? 0x0100000c : 0x01000007)) {
-      throw new Error("The packaged Remote Desktop helper does not match the macOS target.");
+  for (const [helper, digest] of [
+    [inputHelper, manifest.inputSha256],
+    [captureHelper, manifest.captureSha256]
+  ]) {
+    if (helper === null) continue;
+    const path = resolve(root, helper);
+    const info = await lstat(path);
+    if (info.size < 64 || info.size > 16 * 1024 * 1024
+      || (platform === "darwin" && (info.mode & 0o111) === 0)) {
+      throw new Error("The packaged Remote Desktop helper binary does not match its identity.");
     }
-    return;
-  }
-  const offset = bytes.readUInt32LE(0x3c);
-  const expectedMachine = targetArch === "arm64" ? 0xaa64 : targetArch === "x64" ? 0x8664 : -1;
-  if (offset + 6 > bytes.length || bytes.readUInt32LE(offset) !== 0x00004550
-    || bytes.readUInt16LE(offset + 4) !== expectedMachine) {
-    throw new Error("The packaged Remote Desktop helper does not match the Windows target.");
+    const bytes = await readFile(path);
+    if (createHash("sha256").update(bytes).digest("hex") !== digest) {
+      throw new Error("The packaged Remote Desktop helper digest does not match its manifest.");
+    }
+    if (platform === "darwin") {
+      if (bytes.readUInt32LE(0) !== 0xfeedfacf
+        || bytes.readUInt32LE(4) !== (targetArch === "arm64" ? 0x0100000c : 0x01000007)) {
+        throw new Error("The packaged Remote Desktop helper does not match the macOS target.");
+      }
+      continue;
+    }
+    const offset = bytes.readUInt32LE(0x3c);
+    const expectedMachine = targetArch === "arm64" ? 0xaa64 : targetArch === "x64" ? 0x8664 : -1;
+    if (offset + 6 > bytes.length || bytes.readUInt32LE(offset) !== 0x00004550
+      || bytes.readUInt16LE(offset + 4) !== expectedMachine) {
+      throw new Error("The packaged Remote Desktop helper does not match the Windows target.");
+    }
   }
 }
 

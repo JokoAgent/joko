@@ -1047,7 +1047,8 @@ function commandMetadata(command: contract.DevicePeerCommand): {
     || action === "inspectDirectory" || action === "realpath" || action === "statFile"
     || action === "listFiles" || action === "readFile"
     || action === "getRemoteDesktopCapabilities" || action === "getRemoteDesktopPermissions"
-    || action === "getRemoteDesktopFrame" || action === "probeRemoteDesktopPresentation";
+    || action === "getRemoteDesktopFrame" || action === "probeRemoteDesktopPresentation"
+    || action === "listRemoteDesktopDisplayModes";
   const capability: DevicePeerCapability = action === "startProcess" || action === "writeProcess" || action === "signalProcess"
     ? "process"
     : action === "openTerminal" || action === "writeTerminal" || action === "resizeTerminal"
@@ -1066,6 +1067,7 @@ function commandMetadata(command: contract.DevicePeerCommand): {
           || action === "createRemoteDesktopOffer" || action === "exchangeRemoteDesktopIce"
           || action === "getRemoteDesktopFrame" || action === "transferRemoteDesktopClipboardText"
           || action === "transferRemoteDesktopClipboardContent"
+          || action === "listRemoteDesktopDisplayModes" || action === "setRemoteDesktopDisplayMode"
           ? "remote_desktop"
           : "files";
   const effectKind: DevicePeerEffectKind = readOnly ? "read_only" : "side_effect";
@@ -1107,6 +1109,7 @@ function completedPayloadCase(
     case "getRemoteDesktopFrame": return "remoteDesktopFrame";
     case "transferRemoteDesktopClipboardText": return "remoteDesktopClipboardText";
     case "transferRemoteDesktopClipboardContent": return "remoteDesktopClipboardContent";
+    case "listRemoteDesktopDisplayModes": return "remoteDesktopDisplayModes";
     case "writeProcess":
     case "signalProcess":
     case "writeTerminal":
@@ -1122,6 +1125,7 @@ function completedPayloadCase(
     case "showRemoteDesktopPermissionGuide":
     case "stopRemoteDesktop":
     case "sendRemoteDesktopInput": return "acknowledgement";
+    case "setRemoteDesktopDisplayMode": return "acknowledgement";
     case undefined: throw protocolViolation("The Device peer command action is required.");
   }
 }

@@ -72,7 +72,10 @@ import {
   RemoteDesktopCapabilitiesSchema,
   type RemoteDesktopControlState,
   RemoteDesktopControlStateSchema,
+  type RemoteDesktopCursor,
   type RemoteDesktopDisplay,
+  type RemoteDesktopDisplayMode,
+  DevicePeerRemoteDesktopDisplayModesResultSchema,
   RemoteDesktopFailureReason,
   RemoteDesktopFailureSchema,
   type RemoteDesktopFrameResult,
@@ -110,6 +113,7 @@ import {
 } from "./ports.js";
 import { atomicWritePrivateFile, readPrivateFile, sameFileIdentity, sameStableFile } from "./private-files.js";
 import {
+  isBoundedRemoteDesktopCursorPng,
   parseRemoteDesktopClipboardContentJson,
   REMOTE_DESKTOP_CLIPBOARD_CHUNK_CHARACTERS,
   REMOTE_DESKTOP_CLIPBOARD_MAX_CHARACTERS,
@@ -155,6 +159,8 @@ const MAXIMUM_REMOTE_DESKTOP_ICE_MID_CHARACTERS = 128;
 const MAXIMUM_REMOTE_DESKTOP_ICE_USERNAME_FRAGMENT_CHARACTERS = 256;
 const MAXIMUM_REMOTE_DESKTOP_FRAME_BYTES = 180_000;
 const MAXIMUM_REMOTE_DESKTOP_DIMENSION = 32_768;
+const MAXIMUM_REMOTE_DESKTOP_DISPLAY_MODES = 256;
+const MAXIMUM_REMOTE_DESKTOP_CURSOR_DIMENSION = 256;
 const RESOURCE_RETIRE_TIMEOUT_MS = 5_000;
 const REMOTE_DESKTOP_KEY_CODES = new Set([
   ..."ABCDEFGHIJKLMNOPQRSTUVWXYZ".split("").map((key) => `Key${key}`),
@@ -611,6 +617,7 @@ export class NodeDevicePeerAgentExecutor {
           ...(command.action.value.settings === undefined
             ? {}
             : { settings: clone(RemoteDesktopVideoSettingsSchema, command.action.value.settings) }),
+          cursorOverlay: command.action.value.cursorOverlay,
           signal
         });
         validateRemoteDesktopOffer(value, command.action.value.attemptId);
@@ -639,6 +646,7 @@ export class NodeDevicePeerAgentExecutor {
         const value = await this.#requireRemoteDesktop().getFrame({
           controllerDeviceId: command.controllerDeviceId,
           leaseId: command.action.value.leaseId,
+          cursorOverlay: command.action.value.cursorOverlay,
           signal
         });
         validateRemoteDesktopFrameResult(value);
@@ -647,6 +655,28 @@ export class NodeDevicePeerAgentExecutor {
           value: clone(RemoteDesktopFrameResultSchema, value)
         };
       }
+      case "listRemoteDesktopDisplayModes": {
+        const value = await this.#requireRemoteDesktop().listDisplayModes({
+          controllerDeviceId: command.controllerDeviceId,
+          leaseId: command.action.value.leaseId,
+          signal
+        });
+        validateRemoteDesktopDisplayModes(value);
+        return {
+          case: "remoteDesktopDisplayModes",
+          value: create(DevicePeerRemoteDesktopDisplayModesResultSchema, { modes: [...value] })
+        };
+      }
+      case "setRemoteDesktopDisplayMode":
+        this.#resetRemoteDesktopClipboardTransferForLease(command.action.value.leaseId);
+        await this.#requireRemoteDesktop().setDisplayMode({
+          controllerDeviceId: command.controllerDeviceId,
+          leaseId: command.action.value.leaseId,
+          controlGeneration: command.action.value.controlGeneration,
+          modeId: command.action.value.modeId,
+          signal
+        });
+        return acknowledgement();
       case "transferRemoteDesktopClipboardText":
       {
         const request = command.action.value as RemoteDesktopClipboardTextRequest;
@@ -1627,6 +1657,8 @@ function commandSpecification(
     createRemoteDesktopOffer: effect(DevicePeerCapabilityKind.REMOTE_DESKTOP),
     exchangeRemoteDesktopIce: effect(DevicePeerCapabilityKind.REMOTE_DESKTOP),
     getRemoteDesktopFrame: readOnly(DevicePeerCapabilityKind.REMOTE_DESKTOP),
+    listRemoteDesktopDisplayModes: readOnly(DevicePeerCapabilityKind.REMOTE_DESKTOP),
+    setRemoteDesktopDisplayMode: effect(DevicePeerCapabilityKind.REMOTE_DESKTOP),
     transferRemoteDesktopClipboardText: effect(DevicePeerCapabilityKind.REMOTE_DESKTOP),
     transferRemoteDesktopClipboardContent: effect(DevicePeerCapabilityKind.REMOTE_DESKTOP)
   };
@@ -1756,8 +1788,19 @@ function validateCommandInput(command: DevicePeerCommand): void {
     case "stopRemoteDesktop":
     case "getRemoteDesktopFrame":
     case "probeRemoteDesktopPresentation":
+    case "listRemoteDesktopDisplayModes":
       remoteDesktopControllerId(command.controllerDeviceId);
       remoteDesktopLeaseId(command.action.value.leaseId);
+      if (command.action.case === "getRemoteDesktopFrame"
+        && typeof command.action.value.cursorOverlay !== "boolean") {
+        throw agentError(DevicePeerFailureCode.INVALID_REQUEST, false);
+      }
+      return;
+    case "setRemoteDesktopDisplayMode":
+      remoteDesktopControllerId(command.controllerDeviceId);
+      remoteDesktopLeaseId(command.action.value.leaseId);
+      remoteDesktopControlGeneration(command.action.value.controlGeneration);
+      remoteDesktopDisplayModeId(command.action.value.modeId);
       return;
     case "setRemoteDesktopControl":
     case "setRemoteDesktopPresentation":
@@ -1775,6 +1818,9 @@ function validateCommandInput(command: DevicePeerCommand): void {
       remoteDesktopLeaseId(command.action.value.leaseId);
       remoteDesktopAttemptId(command.action.value.attemptId);
       remoteDesktopSdp(command.action.value.offerSdp);
+      if (typeof command.action.value.cursorOverlay !== "boolean") {
+        throw agentError(DevicePeerFailureCode.INVALID_REQUEST, false);
+      }
       if (command.action.value.settings !== undefined) {
         validateRemoteDesktopVideoSettings(command.action.value.settings);
       }
@@ -1844,6 +1890,12 @@ function remoteDesktopControllerId(value: string): void {
 
 function remoteDesktopDisplayId(value: string): void {
   if (!validRemoteDesktopIdentifier(value, MAXIMUM_REMOTE_DESKTOP_DISPLAY_ID_CHARACTERS)) {
+    throw agentError(DevicePeerFailureCode.INVALID_REQUEST, false);
+  }
+}
+
+function remoteDesktopDisplayModeId(value: string): void {
+  if (typeof value !== "string" || !/^[0-9]{1,10}$/u.test(value)) {
     throw agentError(DevicePeerFailureCode.INVALID_REQUEST, false);
   }
 }
@@ -2023,7 +2075,11 @@ function validateRemoteDesktopCapabilities(value: RemoteDesktopCapabilities): vo
     || typeof value.jpegFallback !== "boolean" || typeof value.clipboardText !== "boolean"
     || typeof value.clipboardContent !== "boolean" || typeof value.videoSettings !== "boolean"
     || typeof value.systemAudio !== "boolean" || typeof value.backgroundViewing !== "boolean"
+    || typeof value.displayModes !== "boolean" || typeof value.cursorOverlay !== "boolean"
     || value.permissions === undefined) {
+    throw invalidRemoteDesktopHostResult();
+  }
+  if (value.platform !== "darwin" && (value.displayModes || value.cursorOverlay)) {
     throw invalidRemoteDesktopHostResult();
   }
   if (value.enabled && value.displays.length === 0) throw invalidRemoteDesktopHostResult();
@@ -2108,6 +2164,40 @@ function validateRemoteDesktopFrameResult(value: RemoteDesktopFrameResult): void
     || value.frame.jpeg.byteLength > MAXIMUM_REMOTE_DESKTOP_FRAME_BYTES) {
     throw invalidRemoteDesktopHostResult();
   }
+  if (value.frame.cursor !== undefined) validateRemoteDesktopCursor(value.frame.cursor);
+}
+
+function validateRemoteDesktopDisplayModes(values: readonly RemoteDesktopDisplayMode[]): void {
+  if (!Array.isArray(values) || values.length < 1 || values.length > MAXIMUM_REMOTE_DESKTOP_DISPLAY_MODES) {
+    throw invalidRemoteDesktopHostResult();
+  }
+  const ids = new Set<string>();
+  let current = 0;
+  for (const value of values) {
+    if (!/^[0-9]{1,10}$/u.test(value.modeId)
+      || !Number.isInteger(value.width) || value.width < 1 || value.width > MAXIMUM_REMOTE_DESKTOP_DIMENSION
+      || !Number.isInteger(value.height) || value.height < 1 || value.height > MAXIMUM_REMOTE_DESKTOP_DIMENSION
+      || typeof value.current !== "boolean" || typeof value.native !== "boolean"
+      || ids.has(value.modeId)) {
+      throw invalidRemoteDesktopHostResult();
+    }
+    ids.add(value.modeId);
+    if (value.current) current += 1;
+  }
+  if (current !== 1) throw invalidRemoteDesktopHostResult();
+}
+
+function validateRemoteDesktopCursor(value: RemoteDesktopCursor): void {
+  if (typeof value.visible !== "boolean"
+    || !Number.isFinite(value.x) || value.x < 0 || value.x > 1
+    || !Number.isFinite(value.y) || value.y < 0 || value.y > 1
+    || !Number.isFinite(value.width) || value.width <= 0 || value.width > MAXIMUM_REMOTE_DESKTOP_CURSOR_DIMENSION
+    || !Number.isFinite(value.height) || value.height <= 0 || value.height > MAXIMUM_REMOTE_DESKTOP_CURSOR_DIMENSION
+    || !Number.isFinite(value.hotX) || value.hotX < 0 || value.hotX > value.width
+    || !Number.isFinite(value.hotY) || value.hotY < 0 || value.hotY > value.height
+    || !isBoundedRemoteDesktopCursorPng(value.png)) {
+    throw invalidRemoteDesktopHostResult();
+  }
 }
 
 function validRemoteDesktopPermissionStatus(value: RemoteDesktopPermissionStatus): boolean {
@@ -2140,7 +2230,10 @@ function validRemoteDesktopFailureReason(value: RemoteDesktopFailureReason): boo
     || value === RemoteDesktopFailureReason.CLIPBOARD_TOO_LARGE
     || value === RemoteDesktopFailureReason.CLIPBOARD_UNSUPPORTED
     || value === RemoteDesktopFailureReason.CLIPBOARD_EXPIRED
-    || value === RemoteDesktopFailureReason.AUDIO_UNAVAILABLE;
+    || value === RemoteDesktopFailureReason.AUDIO_UNAVAILABLE
+    || value === RemoteDesktopFailureReason.DISPLAY_MODES_UNAVAILABLE
+    || value === RemoteDesktopFailureReason.DISPLAY_MODE_MISSING
+    || value === RemoteDesktopFailureReason.DISPLAY_BUSY;
 }
 
 function remoteDesktopFailureCode(reason: RemoteDesktopFailureReason): DevicePeerFailureCode {
@@ -2150,11 +2243,13 @@ function remoteDesktopFailureCode(reason: RemoteDesktopFailureReason): DevicePee
     case RemoteDesktopFailureReason.UNSUPPORTED:
     case RemoteDesktopFailureReason.LOCKED_SESSION_UNSUPPORTED:
     case RemoteDesktopFailureReason.CLIPBOARD_UNAVAILABLE:
+    case RemoteDesktopFailureReason.DISPLAY_MODES_UNAVAILABLE:
       return DevicePeerFailureCode.CAPABILITY_UNAVAILABLE;
     case RemoteDesktopFailureReason.BUSY:
     case RemoteDesktopFailureReason.INPUT_BUSY:
     case RemoteDesktopFailureReason.VIDEO_BUSY:
     case RemoteDesktopFailureReason.CLIPBOARD_BUSY:
+    case RemoteDesktopFailureReason.DISPLAY_BUSY:
     case RemoteDesktopFailureReason.AUTHORITY_CHANGED:
       return DevicePeerFailureCode.CONFLICT;
     case RemoteDesktopFailureReason.STOPPED:
@@ -2162,6 +2257,7 @@ function remoteDesktopFailureCode(reason: RemoteDesktopFailureReason): DevicePee
     case RemoteDesktopFailureReason.DISPLAY_MISSING:
     case RemoteDesktopFailureReason.CLIPBOARD_EMPTY:
     case RemoteDesktopFailureReason.CLIPBOARD_EXPIRED:
+    case RemoteDesktopFailureReason.DISPLAY_MODE_MISSING:
       return DevicePeerFailureCode.NOT_FOUND;
     case RemoteDesktopFailureReason.SCREEN_PERMISSION_REQUIRED:
     case RemoteDesktopFailureReason.ACCESSIBILITY_PERMISSION_REQUIRED:

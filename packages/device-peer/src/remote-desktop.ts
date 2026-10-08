@@ -11,8 +11,12 @@ export const REMOTE_DESKTOP_LEASE_MS = 12_000;
 export const REMOTE_DESKTOP_HEARTBEAT_MS = 3_000;
 export const REMOTE_DESKTOP_MAX_FRAME_BYTES = 180_000;
 export const REMOTE_DESKTOP_MAX_FRAME_DIMENSION = 1_280;
+export const REMOTE_DESKTOP_MAX_CURSOR_DIMENSION = 256;
+export const REMOTE_DESKTOP_MAX_CURSOR_RASTER_DIMENSION = 512;
+export const REMOTE_DESKTOP_MAX_CURSOR_PNG_BYTES = 48 * 1_024;
 export const REMOTE_DESKTOP_MAX_DISPLAY_DIMENSION = 32_768;
 export const REMOTE_DESKTOP_MAX_DISPLAYS = 32;
+export const REMOTE_DESKTOP_MAX_DISPLAY_MODES = 256;
 export const REMOTE_DESKTOP_FRAME_INTERVAL_MS = 250;
 export const REMOTE_DESKTOP_MAX_CLIPBOARD_TEXT_CHARACTERS = 16_384;
 export const REMOTE_DESKTOP_CLIPBOARD_CHUNK_CHARACTERS = 64 * 1_024;
@@ -62,6 +66,25 @@ export interface RemoteDesktopDisplay {
   readonly height: number;
 }
 
+export interface RemoteDesktopDisplayMode {
+  readonly id: string;
+  readonly width: number;
+  readonly height: number;
+  readonly current: boolean;
+  readonly native: boolean;
+}
+
+export interface RemoteDesktopCursor {
+  readonly visible: boolean;
+  readonly x: number;
+  readonly y: number;
+  readonly width: number;
+  readonly height: number;
+  readonly hotX: number;
+  readonly hotY: number;
+  readonly png: string;
+}
+
 export interface RemoteDesktopCapabilities {
   readonly version: typeof REMOTE_DESKTOP_PROTOCOL_VERSION;
   readonly enabled: boolean;
@@ -79,6 +102,8 @@ export interface RemoteDesktopCapabilities {
   readonly videoSettings: boolean;
   readonly systemAudio: boolean;
   readonly backgroundViewing: boolean;
+  readonly displayModes: boolean;
+  readonly cursorOverlay: boolean;
 }
 
 export interface RemoteDesktopVideoSettings {
@@ -108,6 +133,7 @@ export interface RemoteDesktopJpegFrame {
   readonly jpeg: string;
   readonly width: number;
   readonly height: number;
+  readonly cursor?: RemoteDesktopCursor | null;
 }
 
 export type RemoteDesktopRequest =
@@ -117,7 +143,7 @@ export type RemoteDesktopRequest =
   | { readonly op: "start"; readonly displayId: string; readonly resume?: boolean; readonly takeover?: boolean }
   | { readonly op: "heartbeat"; readonly lease: string }
   | { readonly op: "stop"; readonly lease: string }
-  | { readonly op: "frame"; readonly lease: string }
+  | { readonly op: "frame"; readonly lease: string; readonly cursorOverlay: boolean }
   | { readonly op: "control"; readonly lease: string; readonly enabled: boolean }
   | { readonly op: "presentation"; readonly lease: string; readonly enabled: boolean }
   | {
@@ -132,6 +158,14 @@ export type RemoteDesktopRequest =
       readonly sdp: string;
       readonly attemptId: string;
       readonly settings?: RemoteDesktopVideoSettings;
+      readonly cursorOverlay: boolean;
+    }
+  | { readonly op: "displayModes"; readonly lease: string }
+  | {
+      readonly op: "resolution";
+      readonly lease: string;
+      readonly controlGeneration: number;
+      readonly modeId: string;
     };
 
 export function isRemoteDesktopPermission(value: unknown): value is RemoteDesktopPermission {
@@ -166,11 +200,16 @@ export function parseRemoteDesktopHostCapabilities(value: unknown): RemoteDeskto
     || typeof value.videoSettings !== "boolean"
     || typeof value.systemAudio !== "boolean"
     || typeof value.backgroundViewing !== "boolean"
+    || typeof value.displayModes !== "boolean"
+    || typeof value.cursorOverlay !== "boolean"
     || (value.platform !== "darwin" && value.platform !== "win32" && value.platform !== "linux")
     || !Array.isArray(value.displays)
     || value.displays.length > REMOTE_DESKTOP_MAX_DISPLAYS
     || (value.enabled && value.displays.length === 0)
     || value.permissions === undefined) {
+    throw new Error("INVALID_REMOTE_DESKTOP_CAPABILITIES");
+  }
+  if (value.platform !== "darwin" && (value.displayModes || value.cursorOverlay)) {
     throw new Error("INVALID_REMOTE_DESKTOP_CAPABILITIES");
   }
   const displays = value.displays.map(parseRemoteDesktopDisplay);
@@ -186,6 +225,8 @@ export function parseRemoteDesktopHostCapabilities(value: unknown): RemoteDeskto
     videoSettings: value.videoSettings,
     systemAudio: value.systemAudio,
     backgroundViewing: value.backgroundViewing,
+    displayModes: value.displayModes,
+    cursorOverlay: value.cursorOverlay,
     platform: value.platform,
     displays: Object.freeze(displays),
     permissions: parseRemoteDesktopPermissions(value.permissions)
@@ -254,9 +295,35 @@ export function parseRemoteDesktopRequest(value: unknown): RemoteDesktopRequest 
   switch (value.op) {
     case "heartbeat":
     case "stop":
-    case "frame":
       requireExactKeys(value, ["op", "lease"]);
       return Object.freeze({ op: value.op, lease });
+    case "frame":
+      requireExactKeys(value, ["op", "lease", "cursorOverlay"]);
+      if (typeof value.cursorOverlay !== "boolean") {
+        throw new Error("INVALID_REMOTE_DESKTOP_REQUEST");
+      }
+      return Object.freeze({
+        op: "frame",
+        lease,
+        cursorOverlay: value.cursorOverlay
+      });
+    case "displayModes":
+      requireExactKeys(value, ["op", "lease"]);
+      return Object.freeze({ op: "displayModes", lease });
+    case "resolution":
+      requireExactKeys(value, ["op", "lease", "controlGeneration", "modeId"]);
+      if (!Number.isSafeInteger(value.controlGeneration)
+        || (value.controlGeneration as number) < 1
+        || typeof value.modeId !== "string"
+        || !/^[0-9]{1,10}$/u.test(value.modeId)) {
+        throw new Error("INVALID_REMOTE_DESKTOP_REQUEST");
+      }
+      return Object.freeze({
+        op: "resolution",
+        lease,
+        controlGeneration: value.controlGeneration as number,
+        modeId: value.modeId
+      });
     case "control":
     case "presentation":
       requireExactKeys(value, ["op", "lease", "enabled"]);
@@ -281,11 +348,12 @@ export function parseRemoteDesktopRequest(value: unknown): RemoteDesktopRequest 
       });
     }
     case "offer":
-      requireExactKeys(value, ["op", "lease", "sdp", "attemptId"], ["settings"]);
+      requireExactKeys(value, ["op", "lease", "sdp", "attemptId", "cursorOverlay"], ["settings"]);
       if (typeof value.sdp !== "string"
         || value.sdp.length < 1
         || value.sdp.length > 64_000
-        || !isRemoteDesktopAttemptId(value.attemptId)) {
+        || !isRemoteDesktopAttemptId(value.attemptId)
+        || typeof value.cursorOverlay !== "boolean") {
         throw new Error("INVALID_REMOTE_DESKTOP_REQUEST");
       }
       return Object.freeze({
@@ -293,6 +361,7 @@ export function parseRemoteDesktopRequest(value: unknown): RemoteDesktopRequest 
         lease,
         sdp: value.sdp,
         attemptId: value.attemptId,
+        cursorOverlay: value.cursorOverlay,
         ...(value.settings === undefined
           ? {}
           : { settings: parseRemoteDesktopVideoSettings(value.settings) })
@@ -332,17 +401,73 @@ export function parseRemoteDesktopVideoSettings(value: unknown): RemoteDesktopVi
 
 export function isBoundedRemoteDesktopJpegFrame(value: unknown): value is RemoteDesktopJpegFrame {
   if (!isRecord(value)
-    || !hasExactKeys(value, ["jpeg", "width", "height"])
+    || !hasExactKeys(value, ["jpeg", "width", "height"], ["cursor"])
     || typeof value.jpeg !== "string"
     || !Number.isSafeInteger(value.width)
     || !Number.isSafeInteger(value.height)
     || (value.width as number) < 1
     || (value.height as number) < 1
     || (value.width as number) > REMOTE_DESKTOP_MAX_FRAME_DIMENSION
-    || (value.height as number) > REMOTE_DESKTOP_MAX_FRAME_DIMENSION) {
+    || (value.height as number) > REMOTE_DESKTOP_MAX_FRAME_DIMENSION
+    || (value.cursor !== undefined && value.cursor !== null && !isRemoteDesktopCursor(value.cursor))) {
     return false;
   }
   return remoteDesktopBase64Bytes(value.jpeg) <= REMOTE_DESKTOP_MAX_FRAME_BYTES;
+}
+
+export function isRemoteDesktopCursor(value: unknown): value is RemoteDesktopCursor {
+  if (!isRecord(value)
+    || !hasExactKeys(value, ["visible", "x", "y", "width", "height", "hotX", "hotY", "png"])
+    || typeof value.visible !== "boolean"
+    || !unit(value.x)
+    || !unit(value.y)
+    || typeof value.width !== "number"
+    || !Number.isFinite(value.width)
+    || value.width <= 0
+    || value.width > REMOTE_DESKTOP_MAX_CURSOR_DIMENSION
+    || typeof value.height !== "number"
+    || !Number.isFinite(value.height)
+    || value.height <= 0
+    || value.height > REMOTE_DESKTOP_MAX_CURSOR_DIMENSION
+    || typeof value.hotX !== "number"
+    || !Number.isFinite(value.hotX)
+    || value.hotX < 0
+    || value.hotX > value.width
+    || typeof value.hotY !== "number"
+    || !Number.isFinite(value.hotY)
+    || value.hotY < 0
+    || value.hotY > value.height
+    || typeof value.png !== "string") {
+    return false;
+  }
+  return remoteDesktopPngBase64Bytes(value.png) <= REMOTE_DESKTOP_MAX_CURSOR_PNG_BYTES;
+}
+
+/** Bounds the native raster carried by a portable cursor before decode/render. */
+export function isBoundedRemoteDesktopCursorPng(value: Uint8Array): boolean {
+  if (value.byteLength < 33 || value.byteLength > REMOTE_DESKTOP_MAX_CURSOR_PNG_BYTES
+    || value[0] !== 0x89 || value[1] !== 0x50 || value[2] !== 0x4e || value[3] !== 0x47
+    || value[4] !== 0x0d || value[5] !== 0x0a || value[6] !== 0x1a || value[7] !== 0x0a
+    || value[8] !== 0 || value[9] !== 0 || value[10] !== 0 || value[11] !== 13
+    || value[12] !== 0x49 || value[13] !== 0x48 || value[14] !== 0x44 || value[15] !== 0x52) {
+    return false;
+  }
+  const width = readUint32Be(value, 16);
+  const height = readUint32Be(value, 20);
+  return width >= 1 && width <= REMOTE_DESKTOP_MAX_CURSOR_RASTER_DIMENSION
+    && height >= 1 && height <= REMOTE_DESKTOP_MAX_CURSOR_RASTER_DIMENSION;
+}
+
+export function parseRemoteDesktopDisplayModes(value: unknown): readonly RemoteDesktopDisplayMode[] {
+  if (!Array.isArray(value) || value.length < 1 || value.length > REMOTE_DESKTOP_MAX_DISPLAY_MODES) {
+    throw new Error("INVALID_REMOTE_DESKTOP_DISPLAY_MODES");
+  }
+  const modes = value.map(parseRemoteDesktopDisplayMode);
+  if (new Set(modes.map((mode) => mode.id)).size !== modes.length
+    || modes.filter((mode) => mode.current).length !== 1) {
+    throw new Error("INVALID_REMOTE_DESKTOP_DISPLAY_MODES");
+  }
+  return Object.freeze(modes);
 }
 
 /**
@@ -421,6 +546,30 @@ function parseRemoteDesktopDisplay(value: unknown): RemoteDesktopDisplay {
   });
 }
 
+function parseRemoteDesktopDisplayMode(value: unknown): RemoteDesktopDisplayMode {
+  if (!isRecord(value)
+    || !hasExactKeys(value, ["id", "width", "height", "current", "native"])
+    || typeof value.id !== "string"
+    || !/^[0-9]{1,10}$/u.test(value.id)
+    || !Number.isSafeInteger(value.width)
+    || !Number.isSafeInteger(value.height)
+    || (value.width as number) < 1
+    || (value.height as number) < 1
+    || (value.width as number) > REMOTE_DESKTOP_MAX_DISPLAY_DIMENSION
+    || (value.height as number) > REMOTE_DESKTOP_MAX_DISPLAY_DIMENSION
+    || typeof value.current !== "boolean"
+    || typeof value.native !== "boolean") {
+    throw new Error("INVALID_REMOTE_DESKTOP_DISPLAY_MODES");
+  }
+  return Object.freeze({
+    id: value.id,
+    width: value.width as number,
+    height: value.height as number,
+    current: value.current,
+    native: value.native
+  });
+}
+
 function permissionStatus(value: unknown): value is RemoteDesktopPermissionStatus {
   return value === "granted"
     || value === "missing"
@@ -437,6 +586,33 @@ function remoteDesktopBase64Bytes(value: string): number {
   }
   const padding = value.endsWith("==") ? 2 : value.endsWith("=") ? 1 : 0;
   return Math.floor((value.length * 3) / 4) - padding;
+}
+
+function remoteDesktopPngBase64Bytes(value: string): number {
+  const length = base64Bytes(value, REMOTE_DESKTOP_MAX_CURSOR_PNG_BYTES);
+  if (!Number.isFinite(length)) return Number.POSITIVE_INFINITY;
+  const decoded = Buffer.from(value, "base64");
+  return decoded.byteLength === length && isBoundedRemoteDesktopCursorPng(decoded)
+    ? length
+    : Number.POSITIVE_INFINITY;
+}
+
+function base64Bytes(value: string, maximum: number): number {
+  if (value.length === 0
+    || value.length > Math.ceil(maximum / 3) * 4
+    || value.length % 4 === 1
+    || !/^[A-Za-z0-9+/]*={0,2}$/u.test(value)) {
+    return Number.POSITIVE_INFINITY;
+  }
+  const padding = value.endsWith("==") ? 2 : value.endsWith("=") ? 1 : 0;
+  return Math.floor((value.length * 3) / 4) - padding;
+}
+
+function readUint32Be(value: Uint8Array, offset: number): number {
+  return ((value[offset]! * 0x1000000)
+    + (value[offset + 1]! << 16)
+    + (value[offset + 2]! << 8)
+    + value[offset + 3]!) >>> 0;
 }
 
 function unit(value: unknown): value is number {
@@ -459,10 +635,14 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function hasExactKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
+function hasExactKeys(
+  value: Record<string, unknown>,
+  keys: readonly string[],
+  optional: readonly string[] = []
+): boolean {
   const actual = Object.keys(value).sort();
-  const expected = [...keys].sort();
-  return actual.length === expected.length && actual.every((key, index) => key === expected[index]);
+  const allowed = new Set([...keys, ...optional]);
+  return keys.every((key) => actual.includes(key)) && actual.every((key) => allowed.has(key));
 }
 
 function requireExactKeys(

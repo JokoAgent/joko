@@ -27,6 +27,11 @@ interface MobileRemoteDesktopCopy {
   readonly audioOn: string;
   readonly audioOff: string;
   readonly pictureInPicture: string;
+  readonly resolution: string;
+  readonly nativeResolution: string;
+  readonly displayModesLoading: string;
+  readonly displayModesFailed: string;
+  readonly displayModeFailed: string;
   readonly copyToPhone: string;
   readonly pasteFromPhone: string;
   readonly clipboardTransferring: string;
@@ -70,7 +75,9 @@ const EN: MobileRemoteDesktopCopy = {
   view: "View", control: "Control", touch: "Touch", trackpad: "Trackpad", pan: "Pan",
   keyboard: "Keyboard", fit: "Fit", left: "Left", right: "Right", release: "Release",
   frameRate: "Frame rate", bitrate: "Quality", auto: "Auto", audioOn: "Audio on", audioOff: "Audio off",
-  pictureInPicture: "Picture in Picture",
+  pictureInPicture: "Picture in Picture", resolution: "Resolution", nativeResolution: "Native",
+  displayModesLoading: "Loading resolutions…", displayModesFailed: "Could not load resolutions.",
+  displayModeFailed: "The resolution could not be changed. The desktop connection is unchanged when the host rejected it.",
   copyToPhone: "Copy to phone", pasteFromPhone: "Paste from phone",
   clipboardTransferring: "Transferring clipboard…", clipboardCopied: "Copied to this phone.",
   clipboardPasted: "Pasted on the desktop.", clipboardEmpty: "The clipboard is empty.",
@@ -101,7 +108,9 @@ const ZH_CN: MobileRemoteDesktopCopy = {
   view: "查看", control: "控制", touch: "触控", trackpad: "触控板", pan: "平移",
   keyboard: "键盘", fit: "适合屏幕", left: "左键", right: "右键", release: "释放输入",
   frameRate: "帧率", bitrate: "画质", auto: "自动", audioOn: "声音已开启", audioOff: "声音已关闭",
-  pictureInPicture: "画中画",
+  pictureInPicture: "画中画", resolution: "分辨率", nativeResolution: "原生",
+  displayModesLoading: "正在加载分辨率…", displayModesFailed: "无法加载分辨率。",
+  displayModeFailed: "无法更改分辨率。若桌面已开始切换，将自动重新连接。",
   copyToPhone: "复制到手机", pasteFromPhone: "从手机粘贴", clipboardTransferring: "正在传输剪贴板…",
   clipboardCopied: "已复制到此手机。", clipboardPasted: "已粘贴到桌面。", clipboardEmpty: "剪贴板为空。",
   clipboardUnsupported: "不支持此剪贴板项目。", clipboardTooLarge: "此剪贴板项目过大。",
@@ -126,7 +135,9 @@ const ZH_TW: MobileRemoteDesktopCopy = {
   control: "控制", touch: "觸控", trackpad: "觸控板", pan: "平移", keyboard: "鍵盤",
   fit: "符合螢幕", left: "左鍵", right: "右鍵", release: "釋放輸入", retry: "重試",
   frameRate: "影格率", bitrate: "畫質", auto: "自動", audioOn: "聲音已開啟", audioOff: "聲音已關閉",
-  pictureInPicture: "子母畫面",
+  pictureInPicture: "子母畫面", resolution: "解析度", nativeResolution: "原生",
+  displayModesLoading: "正在載入解析度…", displayModesFailed: "無法載入解析度。",
+  displayModeFailed: "無法變更解析度。若桌面已開始切換，將自動重新連線。",
   copyToPhone: "複製到手機", pasteFromPhone: "從手機貼上", clipboardTransferring: "正在傳輸剪貼簿…",
   clipboardCopied: "已複製到此手機。", clipboardPasted: "已貼到桌面。", clipboardEmpty: "剪貼簿是空的。",
   clipboardUnsupported: "不支援此剪貼簿項目。", clipboardTooLarge: "此剪貼簿項目過大。",
@@ -152,7 +163,9 @@ const JA: MobileRemoteDesktopCopy = {
   trackpad: "トラックパッド", pan: "移動", keyboard: "キーボード", fit: "画面に合わせる",
   left: "左クリック", right: "右クリック", release: "入力を解放", retry: "再試行", takeover: "引き継ぐ",
   frameRate: "フレームレート", bitrate: "画質", auto: "自動", audioOn: "音声オン", audioOff: "音声オフ",
-  pictureInPicture: "ピクチャ・イン・ピクチャ",
+  pictureInPicture: "ピクチャ・イン・ピクチャ", resolution: "解像度", nativeResolution: "ネイティブ",
+  displayModesLoading: "解像度を読み込み中…", displayModesFailed: "解像度を読み込めませんでした。",
+  displayModeFailed: "解像度を変更できませんでした。切り替えが始まっている場合は自動的に再接続します。",
   copyToPhone: "スマートフォンにコピー", pasteFromPhone: "スマートフォンから貼り付け",
   clipboardTransferring: "クリップボードを転送中…", clipboardCopied: "このスマートフォンにコピーしました。",
   clipboardPasted: "デスクトップに貼り付けました。", clipboardEmpty: "クリップボードは空です。",
@@ -179,7 +192,9 @@ const KO: MobileRemoteDesktopCopy = {
   view: "보기", control: "제어", touch: "터치", trackpad: "트랙패드", pan: "이동", keyboard: "키보드",
   fit: "화면 맞춤", left: "왼쪽", right: "오른쪽", release: "입력 해제", retry: "다시 시도",
   frameRate: "프레임 속도", bitrate: "화질", auto: "자동", audioOn: "오디오 켜짐", audioOff: "오디오 꺼짐",
-  pictureInPicture: "화면 속 화면",
+  pictureInPicture: "화면 속 화면", resolution: "해상도", nativeResolution: "기본",
+  displayModesLoading: "해상도 불러오는 중…", displayModesFailed: "해상도를 불러오지 못했습니다.",
+  displayModeFailed: "해상도를 변경하지 못했습니다. 전환이 시작된 경우 자동으로 다시 연결합니다.",
   copyToPhone: "휴대전화로 복사", pasteFromPhone: "휴대전화에서 붙여넣기",
   clipboardTransferring: "클립보드 전송 중…", clipboardCopied: "이 휴대전화에 복사했습니다.",
   clipboardPasted: "데스크톱에 붙여넣었습니다.", clipboardEmpty: "클립보드가 비어 있습니다.",

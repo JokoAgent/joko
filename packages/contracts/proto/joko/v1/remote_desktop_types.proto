@@ -27,6 +27,16 @@ message RemoteDesktopDisplay {
   uint32 height = 4;
 }
 
+// A host-enumerated macOS display mode. IDs are opaque to controllers and are
+// valid only for the exact display and lease that produced this list.
+message RemoteDesktopDisplayMode {
+  string mode_id = 1;
+  uint32 width = 2;
+  uint32 height = 3;
+  bool current = 4;
+  bool native = 5;
+}
+
 message RemoteDesktopCapabilities {
   uint32 protocol_version = 1;
   bool enabled = 2;
@@ -44,6 +54,8 @@ message RemoteDesktopCapabilities {
   bool video_settings = 14;
   bool system_audio = 15;
   bool background_viewing = 16;
+  bool display_modes = 17;
+  bool cursor_overlay = 18;
 }
 
 enum RemoteDesktopStartMode {
@@ -233,6 +245,22 @@ message RemoteDesktopIceExchangeResult {
 
 message RemoteDesktopFrame {
   bytes jpeg = 1;
+  // Absent hides the native cursor overlay. Cursor pixels never contain a URL
+  // or markup and are bounded independently from the JPEG frame.
+  RemoteDesktopCursor cursor = 2;
+}
+
+// Coordinates are normalized to the selected display. Size and hotspot are
+// measured in desktop points; png is a bounded raster image.
+message RemoteDesktopCursor {
+  bool visible = 1;
+  double x = 2;
+  double y = 3;
+  double width = 4;
+  double height = 5;
+  double hot_x = 6;
+  double hot_y = 7;
+  bytes png = 8;
 }
 
 // An absent frame means the bounded JPEG fallback is throttled or already has
@@ -266,6 +294,9 @@ enum RemoteDesktopFailureReason {
   REMOTE_DESKTOP_FAILURE_REASON_CLIPBOARD_UNSUPPORTED = 21;
   REMOTE_DESKTOP_FAILURE_REASON_CLIPBOARD_EXPIRED = 22;
   REMOTE_DESKTOP_FAILURE_REASON_AUDIO_UNAVAILABLE = 23;
+  REMOTE_DESKTOP_FAILURE_REASON_DISPLAY_MODES_UNAVAILABLE = 24;
+  REMOTE_DESKTOP_FAILURE_REASON_DISPLAY_MODE_MISSING = 25;
+  REMOTE_DESKTOP_FAILURE_REASON_DISPLAY_BUSY = 26;
 }
 
 message RemoteDesktopFailure {

@@ -16,7 +16,14 @@ import {
   type DesktopRemoteDesktopState
 } from "./remote-desktop-host.js";
 import { DesktopRemoteDesktopClipboard } from "./remote-desktop-clipboard.js";
-import { DesktopRemoteDesktopInput, readDesktopRemoteDesktopInputPermission } from "./remote-desktop-input.js";
+import {
+  DesktopRemoteDesktopInput,
+  readDesktopRemoteDesktopDisplayModes,
+  readDesktopRemoteDesktopInputPermission,
+  readDesktopRemoteDesktopSessionState,
+  setDesktopRemoteDesktopDisplayMode,
+  type DesktopRemoteDesktopSessionState
+} from "./remote-desktop-input.js";
 import { DesktopRemoteDesktopMedia } from "./remote-desktop-media.js";
 import { readDesktopSystemAudioSupport } from "./remote-desktop-media-settings.js";
 import type { DesktopRemoteDesktopSettingsStore } from "./remote-desktop-settings.js";
@@ -66,9 +73,9 @@ export function createDesktopRemoteDesktopMainHost(
         screen.removeListener("display-metrics-changed", changed);
       };
     },
-    session: (listener: (unlocked: boolean) => void): (() => void) => {
-      const locked = (): void => { listener(false); };
-      const unlocked = (): void => { listener(desktopSessionUnlocked()); };
+    session: (listener: () => void): (() => void) => {
+      const locked = (): void => { listener(); };
+      const unlocked = (): void => { listener(); };
       powerMonitor.on("lock-screen", locked);
       powerMonitor.on("unlock-screen", unlocked);
       return () => {
@@ -81,13 +88,17 @@ export function createDesktopRemoteDesktopMainHost(
     platform: process.platform,
     systemAudio: readDesktopSystemAudioSupport(),
     enabled: () => options.settings.get().enabled,
-    sessionUnlocked: desktopSessionUnlocked,
+    sessionState: desktopSessionState,
     displays: desktopDisplays,
     permissions: readDesktopRemoteDesktopPermissions,
     showPermissionGuide: (signal) => showDesktopRemoteDesktopPermissionGuide(options.getMainWindow(), signal),
     media,
     input,
     ...(clipboard === undefined ? {} : { clipboard }),
+    ...(process.platform === "darwin" ? {
+      displayModes: readDesktopRemoteDesktopDisplayModes,
+      setDisplayMode: setDesktopRemoteDesktopDisplayMode
+    } : {}),
     changed: (state) => {
       if (state !== undefined && displayAwake === undefined) {
         displayAwake = powerSaveBlocker.start("prevent-display-sleep");
@@ -104,13 +115,19 @@ export function createDesktopRemoteDesktopMainHost(
   return host;
 }
 
-function desktopSessionUnlocked(): boolean {
+async function desktopSessionState(signal: AbortSignal): Promise<DesktopRemoteDesktopSessionState> {
+  if (process.platform === "darwin") return readDesktopRemoteDesktopSessionState(signal);
+  throwIfAborted(signal);
   try {
     const state = powerMonitor.getSystemIdleState(1);
-    return state === "active" || state === "idle";
+    return state === "active" || state === "idle"
+      ? "unlocked"
+      : state === "locked"
+        ? "unsupported"
+        : "unknown";
   } catch {
     // Unknown current session ownership is never allowed to expose pixels.
-    return false;
+    return "unknown";
   }
 }
 

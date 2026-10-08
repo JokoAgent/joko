@@ -2,11 +2,13 @@ import {
   REMOTE_DESKTOP_FRAME_INTERVAL_MS,
   REMOTE_DESKTOP_LEASE_MS,
   isBoundedRemoteDesktopJpegFrame,
+  parseRemoteDesktopDisplayModes,
   parseRemoteDesktopHostCapabilities,
   parseRemoteDesktopPermissions,
   parseRemoteDesktopRequest,
   remoteDesktopPermissionReady,
   type RemoteDesktopCapabilities,
+  type RemoteDesktopDisplayMode,
   type RemoteDesktopHostCapabilities,
   type RemoteDesktopInput,
   type RemoteDesktopJpegFrame,
@@ -49,6 +51,7 @@ export interface RemoteDesktopControllerDependencies {
   ): Promise<RemoteDesktopPermissions>;
   frame(
     displayId: string,
+    cursorOverlay: boolean,
     authority: RemoteDesktopAuthority
   ): Promise<RemoteDesktopJpegFrame | null>;
   startInput(displayId: string, authority: RemoteDesktopAuthority): Promise<void>;
@@ -60,12 +63,23 @@ export interface RemoteDesktopControllerDependencies {
     sdp: string,
     attemptId: string,
     settings: RemoteDesktopVideoSettings | undefined,
+    cursorOverlay: boolean,
     authority: RemoteDesktopAuthority
   ): Promise<string>;
   ice?(
     request: RemoteDesktopIceRequest,
     authority: RemoteDesktopAuthority
   ): Promise<RemoteDesktopIceReply>;
+  displayModes?(
+    displayId: string,
+    authority: RemoteDesktopAuthority
+  ): Promise<readonly RemoteDesktopDisplayMode[]>;
+  setDisplayMode?(
+    displayId: string,
+    modeId: string,
+    beforeChange: () => void,
+    authority: RemoteDesktopAuthority
+  ): Promise<void>;
   changed(): void;
   now?(): number;
   createLeaseId?(): string;
@@ -75,6 +89,8 @@ interface ActiveRemoteDesktopLease {
   readonly lease: string;
   readonly display: RemoteDesktopLease["display"];
   readonly canControl: boolean;
+  readonly displayModes: boolean;
+  readonly cursorOverlay: boolean;
   controlling: boolean;
   controlGeneration: number;
   readonly authority: RemoteDesktopAuthority;
@@ -95,6 +111,7 @@ export class RemoteDesktopController {
   #startingPeer: string | undefined;
   #inputStarting = false;
   #framePending = false;
+  #displayModePending = false;
   #lastFrameAt = Number.NEGATIVE_INFINITY;
   #controlGeneration = 0;
   #locallyStopped = new Map<string, string>();
@@ -202,7 +219,7 @@ export class RemoteDesktopController {
   /** Input failure is control-scoped: preserve the lease, picture and viewer. */
   releaseControl(): void {
     const active = this.#active;
-    if (active === undefined || !active.controlling) return;
+    if (active === undefined || (!active.controlling && !this.#inputStarting)) return;
     active.controlling = false;
     active.controlGeneration = ++this.#controlGeneration;
     this.#dependencies.stopInput();
@@ -280,8 +297,25 @@ export class RemoteDesktopController {
         this.input(authority, request.lease, request.sequence, request.events);
         return Object.freeze({ ok: true });
       case "frame":
-        return this.#frame(authority, active);
+        if (request.cursorOverlay && !active.cursorOverlay) {
+          throw new Error("REMOTE_DESKTOP_VIDEO_UNAVAILABLE");
+        }
+        return this.#frame(authority, active, request.cursorOverlay);
+      case "displayModes":
+        if (!active.displayModes) throw new Error("REMOTE_DESKTOP_DISPLAY_MODES_UNAVAILABLE");
+        return this.#displayModes(authority, active);
+      case "resolution":
+        if (!active.displayModes) throw new Error("REMOTE_DESKTOP_DISPLAY_MODES_UNAVAILABLE");
+        return this.#setDisplayMode(
+          authority,
+          active,
+          request.controlGeneration,
+          request.modeId
+        );
       case "offer": {
+        if (request.cursorOverlay && !active.cursorOverlay) {
+          throw new Error("REMOTE_DESKTOP_VIDEO_UNAVAILABLE");
+        }
         const answer = await this.#runChecked(
           authority,
           active,
@@ -290,6 +324,7 @@ export class RemoteDesktopController {
             request.sdp,
             request.attemptId,
             request.settings,
+            request.cursorOverlay,
             authority
           )
         );
@@ -328,7 +363,9 @@ export class RemoteDesktopController {
       && this.#active !== undefined
       && sameAuthority(this.#active.authority, authority)
       && this.#active.display.id === request.displayId;
-    if (this.#starting || (this.#active !== undefined && request.takeover !== true && !resumesActive)) {
+    if (this.#displayModePending) throw new Error("REMOTE_DESKTOP_DISPLAY_BUSY");
+    if (this.#starting
+      || (this.#active !== undefined && request.takeover !== true && !resumesActive)) {
       throw new Error("REMOTE_DESKTOP_BUSY");
     }
     this.#starting = true;
@@ -359,6 +396,8 @@ export class RemoteDesktopController {
         lease: this.#createLeaseId(),
         display: Object.freeze({ ...display }),
         canControl: capabilities.canControl,
+        displayModes: capabilities.displayModes,
+        cursorOverlay: capabilities.cursorOverlay,
         controlling: false,
         controlGeneration: ++this.#controlGeneration,
         authority: Object.freeze({ ...authority }),
@@ -442,8 +481,12 @@ export class RemoteDesktopController {
 
   async #frame(
     authority: RemoteDesktopAuthority,
-    active: ActiveRemoteDesktopLease
-  ): Promise<{ readonly jpeg: string | null }> {
+    active: ActiveRemoteDesktopLease,
+    cursorOverlay: boolean
+  ): Promise<{
+    readonly jpeg: string | null;
+    readonly cursor?: RemoteDesktopJpegFrame["cursor"];
+  }> {
     if (this.#framePending || this.#now() - this.#lastFrameAt < REMOTE_DESKTOP_FRAME_INTERVAL_MS) {
       return Object.freeze({ jpeg: null });
     }
@@ -453,11 +496,83 @@ export class RemoteDesktopController {
       const frame = await this.#runChecked(
         authority,
         active,
-        () => this.#dependencies.frame(active.display.id, authority)
+        () => this.#dependencies.frame(active.display.id, cursorOverlay, authority)
       );
-      return Object.freeze({ jpeg: frame !== null && isBoundedRemoteDesktopJpegFrame(frame) ? frame.jpeg : null });
+      if (frame === null || !isBoundedRemoteDesktopJpegFrame(frame)) {
+        return Object.freeze({ jpeg: null });
+      }
+      return Object.freeze({
+        jpeg: frame.jpeg,
+        ...(frame.cursor === undefined ? {} : {
+          cursor: frame.cursor === null ? null : Object.freeze({ ...frame.cursor })
+        })
+      });
     } finally {
       this.#framePending = false;
+    }
+  }
+
+  async #displayModes(
+    authority: RemoteDesktopAuthority,
+    active: ActiveRemoteDesktopLease
+  ): Promise<readonly RemoteDesktopDisplayMode[]> {
+    if (this.#dependencies.displayModes === undefined) {
+      throw new Error("REMOTE_DESKTOP_DISPLAY_MODES_UNAVAILABLE");
+    }
+    return parseRemoteDesktopDisplayModes(await this.#runChecked(
+      authority,
+      active,
+      () => this.#dependencies.displayModes!(active.display.id, authority)
+    ));
+  }
+
+  async #setDisplayMode(
+    authority: RemoteDesktopAuthority,
+    active: ActiveRemoteDesktopLease,
+    controlGeneration: number,
+    modeId: string
+  ): Promise<{ readonly ok: true }> {
+    if (!active.controlling) throw new Error("REMOTE_DESKTOP_VIEW_ONLY");
+    if (active.controlGeneration !== controlGeneration) {
+      throw new Error("REMOTE_DESKTOP_LEASE_EXPIRED");
+    }
+    if (this.#dependencies.displayModes === undefined || this.#dependencies.setDisplayMode === undefined) {
+      throw new Error("REMOTE_DESKTOP_DISPLAY_MODES_UNAVAILABLE");
+    }
+    if (this.#displayModePending) throw new Error("REMOTE_DESKTOP_DISPLAY_BUSY");
+    this.#displayModePending = true;
+    let committed = false;
+    try {
+      const modes = await this.#displayModes(authority, active);
+      if (!modes.some((mode) => mode.id === modeId)) {
+        throw new Error("REMOTE_DESKTOP_DISPLAY_MODE_MISSING");
+      }
+      const beforeChange = () => {
+        if (committed) throw new Error("REMOTE_DESKTOP_DISPLAY_BUSY");
+        this.tick();
+        if (this.#active !== active
+          || !active.controlling
+          || active.controlGeneration !== controlGeneration
+          || !this.#authorityCurrent(authority)) {
+          throw new Error("REMOTE_DESKTOP_LEASE_EXPIRED");
+        }
+        committed = true;
+        // Geometry, video and input all belong to this lease. Retire it before
+        // the native write. New starts remain fenced until the effect settles.
+        this.stop(authority);
+      };
+      try {
+        await this.#dependencies.setDisplayMode(active.display.id, modeId, beforeChange, authority);
+      } catch (error) {
+        // Once beforeChange retires the coordinate/media authority, no native
+        // error can prove that the geometry write did not happen.
+        if (committed) throw new Error("REMOTE_DESKTOP_LEASE_EXPIRED");
+        throw error;
+      }
+      if (!committed) throw new Error("REMOTE_DESKTOP_DISPLAY_MODES_UNAVAILABLE");
+      return Object.freeze({ ok: true as const });
+    } finally {
+      this.#displayModePending = false;
     }
   }
 

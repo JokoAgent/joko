@@ -5,6 +5,7 @@ import {
   type RemoteDesktopClipboardContent,
   type RemoteDesktopCapabilities,
   type RemoteDesktopControlState,
+  type RemoteDesktopDisplayMode,
   type RemoteDesktopFrameResult,
   type RemoteDesktopIceCandidate,
   type RemoteDesktopIceExchangeResult,
@@ -171,13 +172,26 @@ export interface DevicePeerRemoteDesktopHostPort {
     readonly attemptId: string;
     readonly offerSdp: string;
     readonly settings?: RemoteDesktopVideoSettings;
+    readonly cursorOverlay: boolean;
   }): Promise<RemoteDesktopOfferResult>;
   exchangeIce(request: DevicePeerRemoteDesktopLeaseRequest & {
     readonly attemptId: string;
     readonly candidates: readonly RemoteDesktopIceCandidate[];
     readonly after: number;
   }): Promise<RemoteDesktopIceExchangeResult>;
-  getFrame(request: DevicePeerRemoteDesktopLeaseRequest): Promise<RemoteDesktopFrameResult>;
+  getFrame(request: DevicePeerRemoteDesktopLeaseRequest & {
+    readonly cursorOverlay: boolean;
+  }): Promise<RemoteDesktopFrameResult>;
+  listDisplayModes(request: DevicePeerRemoteDesktopLeaseRequest): Promise<readonly RemoteDesktopDisplayMode[]>;
+  /**
+   * A display-mode write is terminal for the exact old lease. The host must
+   * retire that lease before mutating native display state and must keep new
+   * starts fenced until the native result is known.
+   */
+  setDisplayMode(request: DevicePeerRemoteDesktopLeaseRequest & {
+    readonly controlGeneration: bigint;
+    readonly modeId: string;
+  }): Promise<void>;
   /**
    * Synchronous target-side fence for control-scoped effects. This must read
    * the host's current authority directly and must not perform the effect.

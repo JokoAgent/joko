@@ -21,7 +21,8 @@ import {
   type NativeSessionTree, type PendingBlobUpload, type RuntimeCommand, type Schedule, type ScheduleRunHistory,
   type SchedulerRuntimeSnapshot, type SessionMessageSearchMatch, type SessionResource, type Snapshot, type Target,
   type WorkspaceEntry, type WorkspaceFileChange, type WorkspaceHtmlReference, type ListPartnerSessionsResponse,
-  type RemoteDesktopCapabilities, type RemoteDesktopControlState, type RemoteDesktopFrameResult,
+  type RemoteDesktopCapabilities, type RemoteDesktopControlState, type RemoteDesktopCursor,
+  type RemoteDesktopDisplayMode, type RemoteDesktopFrameResult,
   type RemoteDesktopClipboardContentRequest, type RemoteDesktopClipboardContentResult,
   type RemoteDesktopClipboardTextRequest, type RemoteDesktopClipboardTextResult,
   type RemoteDesktopIceCandidate, type RemoteDesktopIceExchangeResult, type RemoteDesktopIceServer,
@@ -142,12 +143,16 @@ export interface MobileNetwork {
     signal?: AbortSignal): Promise<readonly RemoteDesktopIceServer[]>;
   createRemoteDesktopOffer?(credential: PairedCredential, peer: DevicePeerRouteIdentity, leaseId: string,
     attemptId: string, offerSdp: string, settings: RemoteDesktopVideoSettings | undefined,
-    signal?: AbortSignal): Promise<RemoteDesktopOfferResult>;
+    cursorOverlay: boolean, signal?: AbortSignal): Promise<RemoteDesktopOfferResult>;
   exchangeRemoteDesktopIce?(credential: PairedCredential, peer: DevicePeerRouteIdentity, leaseId: string,
     attemptId: string, candidates: readonly RemoteDesktopIceCandidate[], after: number,
     signal?: AbortSignal): Promise<RemoteDesktopIceExchangeResult>;
   getRemoteDesktopFrame?(credential: PairedCredential, peer: DevicePeerRouteIdentity, leaseId: string,
-    signal?: AbortSignal): Promise<RemoteDesktopFrameResult>;
+    cursorOverlay: boolean, signal?: AbortSignal): Promise<RemoteDesktopFrameResult>;
+  listRemoteDesktopDisplayModes?(credential: PairedCredential, peer: DevicePeerRouteIdentity, leaseId: string,
+    signal?: AbortSignal): Promise<readonly RemoteDesktopDisplayMode[]>;
+  setRemoteDesktopDisplayMode?(credential: PairedCredential, peer: DevicePeerRouteIdentity, leaseId: string,
+    controlGeneration: bigint, modeId: string, signal?: AbortSignal): Promise<void>;
   transferRemoteDesktopClipboardText?(credential: PairedCredential, peer: DevicePeerRouteIdentity,
     transfer: RemoteDesktopClipboardTextRequest, signal?: AbortSignal): Promise<RemoteDesktopClipboardTextResult>;
   transferRemoteDesktopClipboardContent?(credential: PairedCredential, peer: DevicePeerRouteIdentity,
@@ -1094,6 +1099,39 @@ function assertRemoteDesktopPeer(expected: DevicePeerRouteIdentity, actual: Devi
   }
 }
 
+const REMOTE_DESKTOP_MODE_ID = /^[0-9]{1,10}$/u;
+const REMOTE_DESKTOP_CURSOR_PNG_LIMIT = 49_152;
+
+function validRemoteDesktopCursor(cursor: RemoteDesktopCursor): boolean {
+  const png = cursor.png;
+  return typeof cursor.visible === "boolean"
+    && [cursor.x, cursor.y, cursor.width, cursor.height, cursor.hotX, cursor.hotY].every(Number.isFinite)
+    && cursor.x >= 0 && cursor.x <= 1 && cursor.y >= 0 && cursor.y <= 1
+    && cursor.width > 0 && cursor.width <= 256 && cursor.height > 0 && cursor.height <= 256
+    && cursor.hotX >= 0 && cursor.hotX <= cursor.width && cursor.hotY >= 0 && cursor.hotY <= cursor.height
+    && png instanceof Uint8Array && png.length >= 33 && png.length <= REMOTE_DESKTOP_CURSOR_PNG_LIMIT
+    && png[0] === 0x89 && png[1] === 0x50 && png[2] === 0x4e && png[3] === 0x47
+    && png[4] === 0x0d && png[5] === 0x0a && png[6] === 0x1a && png[7] === 0x0a
+    && png[8] === 0 && png[9] === 0 && png[10] === 0 && png[11] === 13
+    && png[12] === 0x49 && png[13] === 0x48 && png[14] === 0x44 && png[15] === 0x52
+    && pngDimension(png, 16) >= 1 && pngDimension(png, 16) <= 512
+    && pngDimension(png, 20) >= 1 && pngDimension(png, 20) <= 512;
+}
+
+function pngDimension(png: Uint8Array, offset: number): number {
+  return png[offset]! * 0x1000000 + png[offset + 1]! * 0x10000 + png[offset + 2]! * 0x100 + png[offset + 3]!;
+}
+
+function validRemoteDesktopDisplayModes(modes: readonly RemoteDesktopDisplayMode[]): boolean {
+  return modes.length >= 1 && modes.length <= 256
+    && modes.filter((mode) => mode.current).length === 1
+    && new Set(modes.map((mode) => mode.modeId)).size === modes.length
+    && modes.every((mode) => REMOTE_DESKTOP_MODE_ID.test(mode.modeId)
+      && Number.isInteger(mode.width) && mode.width >= 1 && mode.width <= 32_768
+      && Number.isInteger(mode.height) && mode.height >= 1 && mode.height <= 32_768
+      && typeof mode.current === "boolean" && typeof mode.native === "boolean");
+}
+
 export const mobileNetwork: MobileNetwork = {
   async inspect(origin, signal) {
     const response = await createClient(ConnectionService, transport(normalizeNodeOrigin(origin))).getServerInfo({}, options(signal));
@@ -1248,9 +1286,9 @@ export const mobileNetwork: MobileNetwork = {
     assertRemoteDesktopPeer(peer, response.peer);
     return Object.freeze([...response.iceServers]);
   },
-  async createRemoteDesktopOffer(credential, peer, leaseId, attemptId, offerSdp, settings, signal) {
+  async createRemoteDesktopOffer(credential, peer, leaseId, attemptId, offerSdp, settings, cursorOverlay, signal) {
     const response = await createClient(RemoteDesktopService, transport(credential.origin, credential.authKey))
-      .createRemoteDesktopOffer({ peer, leaseId, attemptId, offerSdp, settings }, options(signal));
+      .createRemoteDesktopOffer({ peer, leaseId, attemptId, offerSdp, settings, cursorOverlay }, options(signal));
     assertRemoteDesktopPeer(peer, response.peer);
     if (!response.offer || response.offer.attemptId !== attemptId || !response.offer.answerSdp) {
       throw new Error("The Joko node returned an invalid Remote Desktop answer.");
@@ -1266,9 +1304,9 @@ export const mobileNetwork: MobileNetwork = {
     }
     return response.exchange;
   },
-  async getRemoteDesktopFrame(credential, peer, leaseId, signal) {
+  async getRemoteDesktopFrame(credential, peer, leaseId, cursorOverlay, signal) {
     const response = await createClient(RemoteDesktopService, transport(credential.origin, credential.authKey))
-      .getRemoteDesktopFrame({ peer, leaseId }, options(signal));
+      .getRemoteDesktopFrame({ peer, leaseId, cursorOverlay }, options(signal));
     assertRemoteDesktopPeer(peer, response.peer);
     if (!response.result) throw new Error("The Joko node returned no Remote Desktop frame result.");
     const jpeg = response.result.frame?.jpeg;
@@ -1276,7 +1314,28 @@ export const mobileNetwork: MobileNetwork = {
       || jpeg[jpeg.length - 2] !== 0xff || jpeg[jpeg.length - 1] !== 0xd9)) {
       throw new Error("The Remote Desktop frame exceeds its portable JPEG bounds.");
     }
+    const cursor = response.result.frame?.cursor;
+    if (cursor !== undefined && !validRemoteDesktopCursor(cursor)) {
+      throw new Error("The Remote Desktop cursor exceeds its portable bounds.");
+    }
     return response.result;
+  },
+  async listRemoteDesktopDisplayModes(credential, peer, leaseId, signal) {
+    const response = await createClient(RemoteDesktopService, transport(credential.origin, credential.authKey))
+      .listRemoteDesktopDisplayModes({ peer, leaseId }, options(signal));
+    assertRemoteDesktopPeer(peer, response.peer);
+    if (!validRemoteDesktopDisplayModes(response.modes)) {
+      throw new Error("The Joko node returned invalid Remote Desktop display modes.");
+    }
+    return Object.freeze([...response.modes]);
+  },
+  async setRemoteDesktopDisplayMode(credential, peer, leaseId, controlGeneration, modeId, signal) {
+    if (!REMOTE_DESKTOP_MODE_ID.test(modeId) || controlGeneration < 1n) {
+      throw new Error("A current Remote Desktop display mode authority is required.");
+    }
+    const response = await createClient(RemoteDesktopService, transport(credential.origin, credential.authKey))
+      .setRemoteDesktopDisplayMode({ peer, leaseId, controlGeneration, modeId }, options(signal));
+    assertRemoteDesktopPeer(peer, response.peer);
   },
   async transferRemoteDesktopClipboardText(credential, peer, transferValue, signal) {
     const response = await createClient(RemoteDesktopService, transport(credential.origin, credential.authKey))
@@ -2165,4 +2224,8 @@ export const mobileVoiceNetworkTesting = {
   projectAdvice: projectMobileVoiceDictionaryAdvice
 };
 
-export const mobileRemoteDesktopNetworkTesting = Object.freeze({ remoteDesktopPeerKey });
+export const mobileRemoteDesktopNetworkTesting = Object.freeze({
+  remoteDesktopPeerKey,
+  validRemoteDesktopCursor,
+  validRemoteDesktopDisplayModes
+});

@@ -18,12 +18,14 @@ import {
   DevicePeerGetRemoteDesktopPermissionsActionSchema,
   DevicePeerHeartbeatRemoteDesktopActionSchema,
   DevicePeerListRecentDirectoriesActionSchema,
+  DevicePeerListRemoteDesktopDisplayModesActionSchema,
   DevicePeerOpenTerminalActionSchema,
   DevicePeerRealpathActionSchema,
   DevicePeerResponsePhase,
   DevicePeerSendRemoteDesktopInputActionSchema,
   DevicePeerSetRemoteDesktopControlActionSchema,
   DevicePeerSetRemoteDesktopPresentationActionSchema,
+  DevicePeerSetRemoteDesktopDisplayModeActionSchema,
   DevicePeerProbeRemoteDesktopPresentationActionSchema,
   DevicePeerShowRemoteDesktopPermissionGuideActionSchema,
   DevicePeerStartRemoteDesktopActionSchema,
@@ -44,7 +46,9 @@ import {
   type RemoteDesktopClipboardTextRequest,
   RemoteDesktopClipboardTextRequestSchema,
   RemoteDesktopControlStateSchema,
+  RemoteDesktopCursorSchema,
   RemoteDesktopDisplaySchema,
+  RemoteDesktopDisplayModeSchema,
   RemoteDesktopFailureReason,
   RemoteDesktopFrameResultSchema,
   RemoteDesktopFrameSchema,
@@ -273,6 +277,42 @@ describe("Node Device peer Remote Desktop host ownership", () => {
     await expect(execute(executor, invalidVideoSettings)).rejects.toBeDefined();
     await expect(execute(executor, oversizedInput)).rejects.toBeDefined();
     expect(fixture.state.calls).toEqual([]);
+
+    const frame = remoteDesktopCommands().find((item) => item.method === "getFrame")!;
+    const results = await execute(executor, frame.command);
+    expect(results.at(-1)).toMatchObject({
+      phase: DevicePeerResponsePhase.FAILED,
+      payload: {
+        case: "failure",
+        value: { code: DevicePeerFailureCode.INTERNAL, retryable: false }
+      }
+    });
+    await executor.retire();
+  });
+
+  it("rejects a cursor PNG whose first IHDR declares an over-bound raster", async () => {
+    const root = await testRoot();
+    const fixture = remoteDesktopHost({
+      getFrame: async () => create(RemoteDesktopFrameResultSchema, {
+        frame: create(RemoteDesktopFrameSchema, {
+          jpeg: new Uint8Array([0xff, 0xd8, 0xff, 0xd9]),
+          cursor: create(RemoteDesktopCursorSchema, {
+            visible: true,
+            x: 0.5,
+            y: 0.25,
+            width: 32,
+            height: 32,
+            hotX: 4,
+            hotY: 5,
+            png: cursorPngBytes(513, 32)
+          })
+        })
+      })
+    });
+    const executor = new NodeDevicePeerAgentExecutor({
+      recentDirectoriesPath: join(root, "cursor-raster-host.json"),
+      remoteDesktop: fixture.port
+    });
 
     const frame = remoteDesktopCommands().find((item) => item.method === "getFrame")!;
     const results = await execute(executor, frame.command);
@@ -620,7 +660,7 @@ function remoteDesktopHost(overrides: Partial<DevicePeerRemoteDesktopHostPort> =
         protocolVersion: 1,
         enabled: true,
         canControl: true,
-        platform: "test",
+        platform: "darwin",
         displays: [display],
         permissions,
         automaticReconnect: true,
@@ -632,7 +672,9 @@ function remoteDesktopHost(overrides: Partial<DevicePeerRemoteDesktopHostPort> =
         clipboardContent: true,
         videoSettings: true,
         systemAudio: true,
-        backgroundViewing: true
+        backgroundViewing: true,
+        displayModes: true,
+        cursorOverlay: true
       });
     },
     async getPermissions(request) {
@@ -695,9 +737,32 @@ function remoteDesktopHost(overrides: Partial<DevicePeerRemoteDesktopHostPort> =
     async getFrame(request) {
       record("getFrame", request);
       return create(RemoteDesktopFrameResultSchema, {
-        frame: create(RemoteDesktopFrameSchema, { jpeg: new Uint8Array([0xff, 0xd8, 0xff, 0xd9]) })
+        frame: create(RemoteDesktopFrameSchema, {
+          jpeg: new Uint8Array([0xff, 0xd8, 0xff, 0xd9]),
+          cursor: create(RemoteDesktopCursorSchema, {
+            visible: true,
+            x: 0.5,
+            y: 0.25,
+            width: 32,
+            height: 32,
+            hotX: 4,
+            hotY: 5,
+            png: cursorPngBytes()
+          })
+        })
       });
     },
+    async listDisplayModes(request) {
+      record("listDisplayModes", request);
+      return [create(RemoteDesktopDisplayModeSchema, {
+        modeId: "101",
+        width: 1920,
+        height: 1080,
+        current: true,
+        native: true
+      })];
+    },
+    async setDisplayMode(request) { record("setDisplayMode", request); },
     isControlCurrent() { return true; },
     async copyClipboardText(request) { record("copyClipboardText", request); return "text"; },
     async pasteClipboardText(request) { record("pasteClipboardText", request); },
@@ -822,6 +887,7 @@ function remoteDesktopCommands(): readonly {
           leaseId: "lease-1",
           attemptId: "attempt-1",
           offerSdp: "v=0\r\n",
+          cursorOverlay: false,
           settings: create(RemoteDesktopVideoSettingsSchema, { fps: 60, bitrate: 8_000_000, audio: true })
         })
       }, DevicePeerEffectKind.SIDE_EFFECT)
@@ -844,8 +910,31 @@ function remoteDesktopCommands(): readonly {
       payload: "remoteDesktopFrame",
       command: remoteDesktopCommand({
         case: "getRemoteDesktopFrame",
-        value: create(DevicePeerGetRemoteDesktopFrameActionSchema, { leaseId: "lease-1" })
+        value: create(DevicePeerGetRemoteDesktopFrameActionSchema, {
+          leaseId: "lease-1",
+          cursorOverlay: false
+        })
       }, DevicePeerEffectKind.READ_ONLY)
+    },
+    {
+      method: "listDisplayModes",
+      payload: "remoteDesktopDisplayModes",
+      command: remoteDesktopCommand({
+        case: "listRemoteDesktopDisplayModes",
+        value: create(DevicePeerListRemoteDesktopDisplayModesActionSchema, { leaseId: "lease-1" })
+      }, DevicePeerEffectKind.READ_ONLY)
+    },
+    {
+      method: "setDisplayMode",
+      payload: "acknowledgement",
+      command: remoteDesktopCommand({
+        case: "setRemoteDesktopDisplayMode",
+        value: create(DevicePeerSetRemoteDesktopDisplayModeActionSchema, {
+          leaseId: "lease-1",
+          controlGeneration: 1n,
+          modeId: "101"
+        })
+      }, DevicePeerEffectKind.SIDE_EFFECT)
     }
   ];
 }
@@ -897,6 +986,16 @@ function remoteDesktopIceCandidate() {
     sdpMLineIndex: 0,
     usernameFragment: "fragment"
   });
+}
+
+function cursorPngBytes(width = 32, height = 32): Uint8Array {
+  const png = Buffer.alloc(33);
+  png.set([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+  png.writeUInt32BE(13, 8);
+  png.write("IHDR", 12, "ascii");
+  png.writeUInt32BE(width, 16);
+  png.writeUInt32BE(height, 20);
+  return png;
 }
 
 class TestProcessHandle extends EventEmitter implements DevicePeerProcessHandle {

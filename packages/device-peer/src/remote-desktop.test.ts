@@ -3,11 +3,14 @@ import { describe, expect, it, vi } from "vitest";
 import {
   REMOTE_DESKTOP_FRAME_INTERVAL_MS,
   REMOTE_DESKTOP_LEASE_MS,
+  REMOTE_DESKTOP_MAX_CURSOR_RASTER_DIMENSION,
   REMOTE_DESKTOP_MAX_FRAME_BYTES,
   isBoundedRemoteDesktopJpegFrame,
+  isRemoteDesktopCursor,
   isRemoteDesktopInput,
   parseRemoteDesktopClipboardContentJson,
   parseRemoteDesktopHostCapabilities,
+  parseRemoteDesktopDisplayModes,
   parseRemoteDesktopRequest,
   parseRemoteDesktopVideoSettings,
   stringifyRemoteDesktopClipboardContent,
@@ -54,7 +57,9 @@ const CAPABILITIES: RemoteDesktopHostCapabilities = Object.freeze({
   clipboardContent: true,
   videoSettings: true,
   systemAudio: true,
-  backgroundViewing: true
+  backgroundViewing: true,
+  displayModes: true,
+  cursorOverlay: true
 });
 
 describe("remote desktop portable protocol", () => {
@@ -73,6 +78,27 @@ describe("remote desktop portable protocol", () => {
       .toThrowError("INVALID_REMOTE_DESKTOP_REQUEST");
     expect(() => parseRemoteDesktopRequest({ op: "offer", lease: "lease-1", sdp: "offer" }))
       .toThrowError("INVALID_REMOTE_DESKTOP_REQUEST");
+    expect(parseRemoteDesktopRequest({
+      op: "offer",
+      lease: "lease-1",
+      sdp: "offer",
+      attemptId: "attempt-1",
+      cursorOverlay: false
+    })).toEqual({
+      op: "offer",
+      lease: "lease-1",
+      sdp: "offer",
+      attemptId: "attempt-1",
+      cursorOverlay: false
+    });
+    expect(() => parseRemoteDesktopRequest({
+      op: "offer", lease: "lease-1", sdp: "offer", attemptId: "attempt-1"
+    })).toThrowError("INVALID_REMOTE_DESKTOP_REQUEST");
+    expect(parseRemoteDesktopRequest({
+      op: "frame", lease: "lease-1", cursorOverlay: false
+    })).toEqual({ op: "frame", lease: "lease-1", cursorOverlay: false });
+    expect(() => parseRemoteDesktopRequest({ op: "frame", lease: "lease-1" }))
+      .toThrowError("INVALID_REMOTE_DESKTOP_REQUEST");
     expect(parseRemoteDesktopVideoSettings({ fps: 60, bitrate: 8_000_000, audio: true }))
       .toEqual({ fps: 60, bitrate: 8_000_000, audio: true });
     expect(() => parseRemoteDesktopVideoSettings({ fps: 24, bitrate: 8_000_000, audio: true }))
@@ -88,6 +114,14 @@ describe("remote desktop portable protocol", () => {
     })).toThrowError("INVALID_REMOTE_DESKTOP_REQUEST");
     expect(() => parseRemoteDesktopRequest({
       op: "input", lease: "lease-1", sequence: 1, events: []
+    })).toThrowError("INVALID_REMOTE_DESKTOP_REQUEST");
+    expect(parseRemoteDesktopRequest({
+      op: "resolution", lease: "lease-1", controlGeneration: 2, modeId: "101"
+    })).toEqual({
+      op: "resolution", lease: "lease-1", controlGeneration: 2, modeId: "101"
+    });
+    expect(() => parseRemoteDesktopRequest({
+      op: "resolution", lease: "lease-1", controlGeneration: 0, modeId: "101"
     })).toThrowError("INVALID_REMOTE_DESKTOP_REQUEST");
   });
 
@@ -109,15 +143,20 @@ describe("remote desktop portable protocol", () => {
       .toThrowError("REMOTE_DESKTOP_CLIPBOARD_UNSUPPORTED");
   });
 
-  it("sanitizes host capabilities to the admitted media surface", () => {
+  it("sanitizes host capabilities to the admitted macOS media surface", () => {
     expect(parseRemoteDesktopHostCapabilities({
       ...CAPABILITIES,
-      clipboardText: true,
-      cursorOverlay: true
+      ignoredFutureFlag: true
     })).toEqual(CAPABILITIES);
     expect(() => parseRemoteDesktopHostCapabilities({
       ...CAPABILITIES,
       permissions: undefined
+    })).toThrowError("INVALID_REMOTE_DESKTOP_CAPABILITIES");
+    expect(() => parseRemoteDesktopHostCapabilities({
+      ...CAPABILITIES,
+      platform: "linux",
+      displayModes: true,
+      cursorOverlay: false
     })).toThrowError("INVALID_REMOTE_DESKTOP_CAPABILITIES");
   });
 
@@ -133,6 +172,46 @@ describe("remote desktop portable protocol", () => {
       height: 720
     })).toBe(false);
     expect(isBoundedRemoteDesktopJpegFrame({ jpeg: "YWJj", width: 1_281, height: 720 })).toBe(false);
+  });
+
+  it("bounds macOS display modes and raster cursor metadata", () => {
+    expect(parseRemoteDesktopDisplayModes([
+      { id: "101", width: 2560, height: 1600, current: true, native: true },
+      { id: "102", width: 1920, height: 1200, current: false, native: false }
+    ])).toHaveLength(2);
+    expect(() => parseRemoteDesktopDisplayModes([
+      { id: "101", width: 2560, height: 1600, current: false, native: true }
+    ])).toThrowError("INVALID_REMOTE_DESKTOP_DISPLAY_MODES");
+    expect(isRemoteDesktopCursor({
+      visible: true,
+      x: 0.5,
+      y: 0.25,
+      width: 32,
+      height: 32,
+      hotX: 4,
+      hotY: 5,
+      png: cursorPng()
+    })).toBe(true);
+    expect(isRemoteDesktopCursor({
+      visible: true,
+      x: 0.5,
+      y: 0.25,
+      width: 257,
+      height: 32,
+      hotX: 4,
+      hotY: 5,
+      png: cursorPng()
+    })).toBe(false);
+    expect(isRemoteDesktopCursor({
+      visible: true,
+      x: 0.5,
+      y: 0.25,
+      width: 32,
+      height: 32,
+      hotX: 4,
+      hotY: 5,
+      png: cursorPng(REMOTE_DESKTOP_MAX_CURSOR_RASTER_DIMENSION + 1, 32)
+    })).toBe(false);
   });
 
   it("bounds trickle ICE attempts, candidates and replies", () => {
@@ -322,12 +401,40 @@ describe("remote desktop finite authority controller", () => {
     expect(fixture.dependencies.stopVideo).not.toHaveBeenCalled();
   });
 
+  it("fences an in-flight input start when the host releases control", async () => {
+    const fixture = controllerFixture();
+    const lease = await start(fixture);
+    let finishInput!: () => void;
+    vi.mocked(fixture.dependencies.startInput).mockImplementationOnce(() => new Promise((resolve) => {
+      finishInput = resolve;
+    }));
+
+    const pending = fixture.controller.request(AUTHORITY, {
+      op: "control", lease: lease.lease, enabled: true
+    });
+    await vi.waitFor(() => expect(fixture.dependencies.startInput).toHaveBeenCalledOnce());
+    const pendingGeneration = fixture.controller.state!.controlGeneration;
+
+    fixture.controller.releaseControl();
+    expect(fixture.controller.state).toMatchObject({ lease: lease.lease, controlling: false });
+    expect(fixture.controller.state!.controlGeneration).toBeGreaterThan(pendingGeneration);
+    expect(fixture.dependencies.stopInput).toHaveBeenCalledOnce();
+
+    finishInput();
+    await expect(pending).rejects.toThrowError("REMOTE_DESKTOP_LEASE_EXPIRED");
+    expect(fixture.controller.state).toMatchObject({ lease: lease.lease, controlling: false });
+    expect(fixture.dependencies.stopInput).toHaveBeenCalledTimes(3);
+    expect(fixture.dependencies.stopVideo).not.toHaveBeenCalled();
+  });
+
   it("keeps a non-controlling platform view-only without touching native input", async () => {
     const fixture = controllerFixture();
     vi.mocked(fixture.dependencies.capabilities).mockResolvedValue({
       ...CAPABILITIES,
       platform: "linux",
       canControl: false,
+      displayModes: false,
+      cursorOverlay: false,
       permissions: { screenRecording: "granted", accessibility: "notRequired" }
     });
     const lease = await start(fixture);
@@ -346,23 +453,127 @@ describe("remote desktop finite authority controller", () => {
     vi.mocked(fixture.dependencies.frame).mockImplementationOnce(() => new Promise((resolve) => {
       releaseFrame = resolve;
     }));
-    const first = fixture.controller.request(AUTHORITY, { op: "frame", lease: lease.lease });
+    const first = fixture.controller.request(AUTHORITY, {
+      op: "frame", lease: lease.lease, cursorOverlay: false
+    });
     await vi.waitFor(() => expect(fixture.dependencies.frame).toHaveBeenCalledTimes(1));
     await expect(fixture.controller.request(AUTHORITY, {
-      op: "frame", lease: lease.lease
+      op: "frame", lease: lease.lease, cursorOverlay: false
     })).resolves.toEqual({ jpeg: null });
     releaseFrame({ jpeg: "YWJj", width: 3, height: 1 });
     await expect(first).resolves.toEqual({ jpeg: "YWJj" });
 
     fixture.now += REMOTE_DESKTOP_FRAME_INTERVAL_MS - 1;
     await expect(fixture.controller.request(AUTHORITY, {
-      op: "frame", lease: lease.lease
+      op: "frame", lease: lease.lease, cursorOverlay: false
     })).resolves.toEqual({ jpeg: null });
     fixture.now += 1;
     vi.mocked(fixture.dependencies.frame).mockResolvedValueOnce({ jpeg: "YWJj", width: 1_281, height: 1 });
     await expect(fixture.controller.request(AUTHORITY, {
-      op: "frame", lease: lease.lease
+      op: "frame", lease: lease.lease, cursorOverlay: false
     })).resolves.toEqual({ jpeg: null });
+  });
+
+  it("forwards a bounded native cursor only for an explicit overlay request", async () => {
+    const fixture = controllerFixture();
+    const lease = await start(fixture);
+    vi.mocked(fixture.dependencies.frame).mockResolvedValueOnce({
+      jpeg: "YWJj",
+      width: 3,
+      height: 1,
+      cursor: {
+        visible: true,
+        x: 0.5,
+        y: 0.25,
+        width: 32,
+        height: 32,
+        hotX: 4,
+        hotY: 5,
+        png: cursorPng()
+      }
+    });
+    await expect(fixture.controller.request(AUTHORITY, {
+      op: "frame", lease: lease.lease, cursorOverlay: true
+    })).resolves.toMatchObject({
+      jpeg: "YWJj",
+      cursor: { visible: true, x: 0.5, y: 0.25, png: cursorPng() }
+    });
+    expect(fixture.dependencies.frame).toHaveBeenCalledWith("display-1", true, AUTHORITY);
+
+    fixture.now += REMOTE_DESKTOP_FRAME_INTERVAL_MS;
+    vi.mocked(fixture.dependencies.frame).mockResolvedValueOnce({
+      jpeg: "YWJj",
+      width: 3,
+      height: 1,
+      cursor: null
+    });
+    await expect(fixture.controller.request(AUTHORITY, {
+      op: "frame", lease: lease.lease, cursorOverlay: true
+    })).resolves.toEqual({ jpeg: "YWJj", cursor: null });
+  });
+
+  it("lists lease-bound modes and makes a mode write terminal before native mutation", async () => {
+    const fixture = controllerFixture();
+    const lease = await start(fixture);
+    const controlled = await fixture.controller.request(AUTHORITY, {
+      op: "control", lease: lease.lease, enabled: true
+    }) as { readonly controlGeneration: number };
+    await expect(fixture.controller.request(AUTHORITY, {
+      op: "displayModes", lease: lease.lease
+    })).resolves.toEqual([
+      { id: "101", width: 1_280, height: 800, current: true, native: true },
+      { id: "102", width: 1_024, height: 640, current: false, native: false }
+    ]);
+
+    let finish!: () => void;
+    vi.mocked(fixture.dependencies.setDisplayMode!).mockImplementationOnce(
+      async (_displayId, _modeId, beforeChange) => {
+        beforeChange();
+        await new Promise<void>((resolve) => { finish = resolve; });
+      }
+    );
+    const pending = fixture.controller.request(AUTHORITY, {
+      op: "resolution",
+      lease: lease.lease,
+      controlGeneration: controlled.controlGeneration,
+      modeId: "102"
+    });
+    await vi.waitFor(() => expect(fixture.controller.state).toBeUndefined());
+    await expect(fixture.controller.request(AUTHORITY, {
+      op: "start", displayId: "display-1"
+    })).rejects.toThrowError("REMOTE_DESKTOP_DISPLAY_BUSY");
+    finish();
+    await expect(pending).resolves.toEqual({ ok: true });
+    await expect(start(fixture)).resolves.toMatchObject({ display: { id: "display-1" } });
+  });
+
+  it("keeps pre-effect mode failures but hides a domain error after native mutation becomes possible", async () => {
+    const fixture = controllerFixture();
+    const lease = await start(fixture);
+    const controlled = await fixture.controller.request(AUTHORITY, {
+      op: "control", lease: lease.lease, enabled: true
+    }) as { readonly controlGeneration: number };
+    await expect(fixture.controller.request(AUTHORITY, {
+      op: "resolution",
+      lease: lease.lease,
+      controlGeneration: controlled.controlGeneration,
+      modeId: "999"
+    })).rejects.toThrowError("REMOTE_DESKTOP_DISPLAY_MODE_MISSING");
+    expect(fixture.controller.state).toMatchObject({ lease: lease.lease, controlling: true });
+
+    vi.mocked(fixture.dependencies.setDisplayMode!).mockImplementationOnce(
+      async (_displayId, _modeId, beforeChange) => {
+        beforeChange();
+        throw new Error("REMOTE_DESKTOP_DISPLAY_MODES_UNAVAILABLE");
+      }
+    );
+    await expect(fixture.controller.request(AUTHORITY, {
+      op: "resolution",
+      lease: lease.lease,
+      controlGeneration: controlled.controlGeneration,
+      modeId: "102"
+    })).rejects.toThrowError("REMOTE_DESKTOP_LEASE_EXPIRED");
+    expect(fixture.controller.state).toBeUndefined();
   });
 
   it("revalidates exact authority after asynchronous signaling and tears down stale capture", async () => {
@@ -373,7 +584,7 @@ describe("remote desktop finite authority controller", () => {
       answer = resolve;
     }));
     const pending = fixture.controller.request(AUTHORITY, {
-      op: "offer", lease: lease.lease, attemptId: "attempt-1", sdp: "offer"
+      op: "offer", lease: lease.lease, attemptId: "attempt-1", sdp: "offer", cursorOverlay: false
     });
     await vi.waitFor(() => expect(fixture.dependencies.offer).toHaveBeenCalledTimes(1));
     fixture.currentAuthorities.delete(authorityKey(AUTHORITY));
@@ -410,14 +621,14 @@ describe("remote desktop finite authority controller", () => {
       releaseFrame = resolve;
     }));
     const oldFrame = fixture.controller.request(AUTHORITY, {
-      op: "frame", lease: firstLease.lease
+      op: "frame", lease: firstLease.lease, cursorOverlay: false
     });
     await vi.waitFor(() => expect(fixture.dependencies.frame).toHaveBeenCalledTimes(1));
     await fixture.controller.request(AUTHORITY, { op: "stop", lease: firstLease.lease });
     const replacement = await start(fixture);
 
     await expect(fixture.controller.request(AUTHORITY, {
-      op: "frame", lease: replacement.lease
+      op: "frame", lease: replacement.lease, cursorOverlay: false
     })).resolves.toEqual({ jpeg: null });
     expect(fixture.dependencies.frame).toHaveBeenCalledTimes(1);
     releaseFrame({ jpeg: "YWJj", width: 3, height: 1 });
@@ -448,6 +659,11 @@ function controllerFixture() {
     stopInput: vi.fn(),
     stopVideo: vi.fn(),
     offer: vi.fn(async () => "answer"),
+    displayModes: vi.fn(async () => [
+      { id: "101", width: 1_280, height: 800, current: true, native: true },
+      { id: "102", width: 1_024, height: 640, current: false, native: false }
+    ]),
+    setDisplayMode: vi.fn(async (_displayId, _modeId, beforeChange) => { beforeChange(); }),
     ice: vi.fn(async (request) => ({
       attemptId: request.attemptId,
       candidates: [],
@@ -477,4 +693,14 @@ async function start(fixture: ReturnType<typeof controllerFixture>) {
 function authorityKey(authority: RemoteDesktopAuthority): string {
   const lifecycle = authority.lifecycleToken === LIFECYCLE_TOKEN ? "current" : "retired";
   return `${authority.controllerDeviceId}|${lifecycle}`;
+}
+
+function cursorPng(width = 32, height = 32): string {
+  const png = Buffer.alloc(33);
+  png.set([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+  png.writeUInt32BE(13, 8);
+  png.write("IHDR", 12, "ascii");
+  png.writeUInt32BE(width, 16);
+  png.writeUInt32BE(height, 20);
+  return png.toString("base64");
 }

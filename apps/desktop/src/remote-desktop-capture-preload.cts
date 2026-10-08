@@ -2,8 +2,10 @@
 
 import type {
   DesktopRemoteDesktopCaptureCommand,
+  DesktopRemoteDesktopCaptureNativeFrame,
   DesktopRemoteDesktopCaptureReply
 } from "./remote-desktop-capture-protocol.js";
+import type { DesktopRemoteDesktopCursor } from "./remote-desktop-native-capture.js";
 import type { RemoteDesktopIceCandidate } from "@joko/device-peer";
 import type { IpcRendererEvent } from "electron";
 
@@ -14,6 +16,7 @@ const CHANNELS = Object.freeze({
   command: "joko:remote-desktop-capture:command",
   reply: "joko:remote-desktop-capture:reply",
   input: "joko:remote-desktop-capture:input",
+  nativeFrame: "joko:remote-desktop-capture:native-frame",
   presentationPong: "joko:remote-desktop-capture:presentation-pong",
   stopped: "joko:remote-desktop-capture:stopped"
 });
@@ -30,17 +33,27 @@ let presentationLease: string | undefined;
 let presentationChallenge: string | undefined;
 let inputChannel: RTCDataChannel | undefined;
 let exchanging = false;
+let native: Awaited<ReturnType<typeof nativeCaptureStream>> | undefined;
+let recoverCapture: (() => void) | undefined;
+let latestCursor: DesktopRemoteDesktopCursor | null | undefined;
+let cursorTimer: ReturnType<typeof setInterval> | undefined;
 
 function stop(): void {
   generation += 1;
   exchanging = false;
   clearTimeout(disconnectedTimer);
   clearInterval(presentationTimer);
+  clearInterval(cursorTimer);
   disconnectedTimer = undefined;
   presentationTimer = undefined;
+  cursorTimer = undefined;
   presentationLease = undefined;
   presentationChallenge = undefined;
   inputChannel = undefined;
+  latestCursor = undefined;
+  native?.stop();
+  native = undefined;
+  recoverCapture = undefined;
   attempt = undefined;
   candidates = [];
   remoteCandidates = new Set();
@@ -74,10 +87,83 @@ async function createAnswer(command: Extract<DesktopRemoteDesktopCaptureCommand,
   attempt = { leaseId: command.leaseId, attemptId: command.attemptId };
   try {
     const settings = videoSettings(command.settings);
-    const captured = await navigator.mediaDevices.getDisplayMedia({
+    const capture = (): Promise<MediaStream> => navigator.mediaDevices.getDisplayMedia({
       audio: settings.audio,
       video: { frameRate: { ideal: settings.fps, max: settings.fps } }
     });
+    const boundedCapture = async (): Promise<MediaStream> => {
+      if (!command.chromiumCapture) throw new Error("unavailable");
+      let abandoned = false;
+      let timeout: ReturnType<typeof setTimeout> | undefined;
+      try {
+        return await Promise.race([
+          capture().then((value) => {
+            if (abandoned || current !== generation) {
+              value.getTracks().forEach((track) => track.stop());
+              throw new Error("stopped");
+            }
+            return value;
+          }),
+          new Promise<never>((_resolve, reject) => {
+            timeout = setTimeout(() => {
+              abandoned = true;
+              reject(new Error("timeout"));
+            }, command.nativeCapture ? 2_000 : 10_000);
+          })
+        ]);
+      } finally {
+        clearTimeout(timeout);
+      }
+    };
+    const captureNative = async (): Promise<MediaStream> => {
+      const result = await nativeCaptureStream(
+        () => ipcRenderer.invoke(
+          CHANNELS.nativeFrame,
+          command.leaseId,
+          command.attemptId
+        ) as Promise<DesktopRemoteDesktopCaptureNativeFrame | null>,
+        () => current === generation,
+        () => {
+          stop();
+          void ipcRenderer.invoke(CHANNELS.stopped).catch(() => undefined);
+        },
+        (cursor) => { if (current === generation) latestCursor = cursor; },
+        command.cursorOverlay ? settings.fps : 15
+      );
+      if (current !== generation) {
+        result.stop();
+        throw new Error("stopped");
+      }
+      native = result;
+      return result.stream;
+    };
+    let captured: MediaStream;
+    if (command.nativeVideo) {
+      // Chromium exposes no reliable cursor exclusion constraint in this
+      // runtime. Native video is always cursor-free; a Chromium stream, when
+      // requested, contributes only its loopback audio track.
+      let audioSource: MediaStream | undefined;
+      try {
+        if (settings.audio) {
+          try { audioSource = await boundedCapture(); }
+          catch (error) { if (current !== generation) throw error; }
+        }
+        captured = await captureNative();
+        if (current !== generation) throw new Error("stopped");
+        for (const track of audioSource?.getAudioTracks() ?? []) captured.addTrack(track);
+        audioSource?.getVideoTracks().forEach((track) => track.stop());
+      } catch (error) {
+        audioSource?.getTracks().forEach((track) => track.stop());
+        throw error;
+      }
+    } else {
+      try {
+        captured = await boundedCapture();
+      } catch (error) {
+        if (!command.nativeCapture || current !== generation) throw error;
+        captured = await captureNative();
+      }
+    }
     if (current !== generation) {
       captured.getTracks().forEach((track) => track.stop());
       return;
@@ -127,12 +213,51 @@ async function createAnswer(command: Extract<DesktopRemoteDesktopCaptureCommand,
         disconnectedTimer = undefined;
       }
     };
+    let recovering = false;
+    recoverCapture = () => {
+      if (!command.nativeCapture || native !== undefined || recovering || current !== generation) return;
+      recovering = true;
+      void (async () => {
+        const replacement = await captureNative();
+        const sender = rtc.getSenders().find((candidate) => candidate.track?.kind === "video");
+        const track = replacement.getVideoTracks()[0];
+        if (sender === undefined || track === undefined || current !== generation) {
+          throw new Error("stopped");
+        }
+        await sender.replaceTrack(track);
+        captured.getVideoTracks().forEach((oldTrack) => {
+          oldTrack.onended = null;
+          oldTrack.onmute = null;
+          oldTrack.stop();
+        });
+      })().catch(() => {
+        if (current === generation) {
+          stop();
+          void ipcRenderer.invoke(CHANNELS.stopped).catch(() => undefined);
+        }
+      }).finally(() => {
+        if (current === generation) recovering = false;
+      });
+    };
     rtc.ondatachannel = ({ channel }) => {
       if (channel.label !== "input-v1" || channel.ordered !== true) {
         channel.close();
         return;
       }
       inputChannel = channel;
+      if (command.cursorOverlay) {
+        let previous = "";
+        cursorTimer = setInterval(() => {
+          if (latestCursor === undefined || current !== generation
+            || channel.readyState !== "open" || channel.bufferedAmount > 65_536) return;
+          const message = JSON.stringify({ type: "cursor", cursor: latestCursor });
+          if (message === previous) return;
+          try {
+            channel.send(message);
+            previous = message;
+          } catch { channel.close(); }
+        }, 50);
+      }
       let pending = 0;
       channel.onmessage = ({ data }) => {
         if (current !== generation || typeof data !== "string" || data.length > 32_768) {
@@ -183,10 +308,15 @@ async function createAnswer(command: Extract<DesktopRemoteDesktopCaptureCommand,
     captured.getTracks().forEach((track) => {
       track.onended = () => {
         if (current === generation) {
-          stop();
-          void ipcRenderer.invoke(CHANNELS.stopped).catch(() => undefined);
+          if (track.kind === "video" && native === undefined && command.nativeCapture) {
+            recoverCapture?.();
+          } else {
+            stop();
+            void ipcRenderer.invoke(CHANNELS.stopped).catch(() => undefined);
+          }
         }
       };
+      if (track.kind === "video") track.onmute = () => recoverCapture?.();
       rtc.addTrack(track, captured);
     });
     await rtc.setRemoteDescription({ type: "offer", sdp: command.offerSdp });
@@ -310,6 +440,130 @@ function videoSettings(value: unknown): {
     bitrate: value["bitrate"],
     audio: value["audio"]
   });
+}
+
+/** Serial native pulls and image decode to keep IPC and canvas memory bounded. */
+async function nativeCaptureStream(
+  read: () => Promise<DesktopRemoteDesktopCaptureNativeFrame | null>,
+  alive: () => boolean,
+  failed: () => void,
+  cursor: (value: DesktopRemoteDesktopCursor | null) => void,
+  fps: number
+): Promise<{ readonly stream: MediaStream; stop(): void }> {
+  const canvas = document.createElement("canvas");
+  const context = canvas.getContext("2d");
+  if (context === null) throw new Error("unavailable");
+  let stopped = false;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let lastFrame = performance.now();
+  const draw = async (): Promise<boolean> => {
+    const frame = await read();
+    if (frame === null || stopped || !alive()) return false;
+    const parsed = nativeFrame(frame);
+    const bytes = Uint8Array.from(atob(parsed.jpeg), (character) => character.charCodeAt(0));
+    const bitmap = await createImageBitmap(new Blob([bytes], { type: "image/jpeg" }));
+    try {
+      if (stopped || !alive()) return false;
+      if (bitmap.width !== parsed.width || bitmap.height !== parsed.height
+        || bitmap.width < 1 || bitmap.height < 1 || bitmap.width > 4_096 || bitmap.height > 4_096) {
+        throw new Error("unavailable");
+      }
+      if (canvas.width !== bitmap.width || canvas.height !== bitmap.height) {
+        canvas.width = bitmap.width;
+        canvas.height = bitmap.height;
+      }
+      context.drawImage(bitmap, 0, 0);
+      cursor(parsed.cursor);
+      lastFrame = performance.now();
+      return true;
+    } finally {
+      bitmap.close();
+    }
+  };
+  if (!(await draw())) throw new Error("unavailable");
+  const captured = canvas.captureStream(fps);
+  const stopNative = (): void => {
+    if (stopped) return;
+    stopped = true;
+    clearTimeout(timer);
+    captured.getTracks().forEach((track) => track.stop());
+    context.clearRect(0, 0, canvas.width, canvas.height);
+    canvas.width = canvas.height = 1;
+    cursor(null);
+  };
+  const pull = async (): Promise<void> => {
+    if (stopped || !alive()) {
+      stopNative();
+      return;
+    }
+    try {
+      await draw();
+      if (performance.now() - lastFrame > 5_000) throw new Error("unavailable");
+      if (!stopped && alive()) timer = setTimeout(() => void pull(), Math.round(1_000 / fps));
+      else stopNative();
+    } catch {
+      stopNative();
+      if (alive()) failed();
+    }
+  };
+  timer = setTimeout(() => void pull(), Math.round(1_000 / fps));
+  return Object.freeze({
+    stream: captured,
+    stop: stopNative
+  });
+}
+
+function nativeFrame(value: unknown): DesktopRemoteDesktopCaptureNativeFrame {
+  if (!record(value) || !exactKeys(value, ["jpeg", "width", "height", "cursor"])
+    || typeof value["jpeg"] !== "string" || value["jpeg"].length < 1
+    || value["jpeg"].length > 1_333_336 || !/^[A-Za-z0-9+/]*={0,2}$/u.test(value["jpeg"])
+    || !Number.isSafeInteger(value["width"]) || !Number.isSafeInteger(value["height"])
+    || (value["width"] as number) < 1 || (value["width"] as number) > 4_096
+    || (value["height"] as number) < 1 || (value["height"] as number) > 4_096
+    || (value["cursor"] !== null && !cursorValue(value["cursor"]))) {
+    throw new Error("unavailable");
+  }
+  return value as unknown as DesktopRemoteDesktopCaptureNativeFrame;
+}
+
+function cursorValue(value: unknown): value is DesktopRemoteDesktopCursor {
+  if (!record(value) || !exactKeys(value,
+    ["visible", "x", "y", "width", "height", "hotX", "hotY", "png"])) return false;
+  return typeof value["visible"] === "boolean"
+    && finiteRange(value["x"], 0, 1) && finiteRange(value["y"], 0, 1)
+    && finiteRange(value["width"], Number.MIN_VALUE, 256)
+    && finiteRange(value["height"], Number.MIN_VALUE, 256)
+    && finiteRange(value["hotX"], 0, value["width"] as number)
+    && finiteRange(value["hotY"], 0, value["height"] as number)
+    && typeof value["png"] === "string"
+    && validCursorPng(value["png"]);
+}
+
+function validCursorPng(value: string): boolean {
+  if (value.length < 44 || value.length > 65_536 || value.length % 4 === 1
+    || !/^[A-Za-z0-9+/]*={0,2}$/u.test(value)) return false;
+  let decoded: string;
+  try { decoded = atob(value); }
+  catch { return false; }
+  if (decoded.length < 33 || decoded.length > 49_152) return false;
+  const expectedSignature = [137, 80, 78, 71, 13, 10, 26, 10] as const;
+  if (!expectedSignature.every((byte, index) => decoded.charCodeAt(index) === byte)
+    || decoded.charCodeAt(8) !== 0 || decoded.charCodeAt(9) !== 0
+    || decoded.charCodeAt(10) !== 0 || decoded.charCodeAt(11) !== 13
+    || decoded.slice(12, 16) !== "IHDR") return false;
+  const dimension = (offset: number): number => (
+    decoded.charCodeAt(offset) * 0x1_00_00_00
+    + decoded.charCodeAt(offset + 1) * 0x1_00_00
+    + decoded.charCodeAt(offset + 2) * 0x1_00
+    + decoded.charCodeAt(offset + 3)
+  );
+  const width = dimension(16);
+  const height = dimension(20);
+  return width >= 1 && width <= 512 && height >= 1 && height <= 512;
+}
+
+function finiteRange(value: unknown, minimum: number, maximum: number): value is number {
+  return typeof value === "number" && Number.isFinite(value) && value >= minimum && value <= maximum;
 }
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;

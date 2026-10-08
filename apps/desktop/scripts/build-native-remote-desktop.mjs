@@ -19,6 +19,7 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const source = join(root, "native", "remote-desktop");
 const defaultOutput = join(root, "dist", "native-remote-desktop");
 const macHelper = "joko-macos-remote-desktop-input";
+const macCaptureHelper = "joko-macos-remote-desktop-capture";
 const windowsHelper = "joko-windows-remote-desktop-input.exe";
 
 export function nativeRemoteDesktopMacTarget(architecture) {
@@ -37,11 +38,18 @@ export function buildNativeRemoteDesktop({
 } = {}) {
   const artifactOutput = resolve(output);
   mkdirSync(artifactOutput, { recursive: true });
-  for (const name of [macHelper, windowsHelper, `${macHelper}.staged`, `${windowsHelper}.staged`]) {
+  for (const name of [
+    macHelper,
+    macCaptureHelper,
+    windowsHelper,
+    `${macHelper}.staged`,
+    `${macCaptureHelper}.staged`,
+    `${windowsHelper}.staged`
+  ]) {
     rmSync(join(artifactOutput, name), { force: true });
   }
   rmSync(join(artifactOutput, "manifest.json"), { force: true });
-  writeManifest(artifactOutput, platform, architecture, null, null);
+  writeManifest(artifactOutput, platform, architecture, null, null, null, null);
   if (platform !== "darwin" && platform !== "win32") return;
   if (platform !== process.platform) {
     throw new Error("The Remote Desktop native helper must be compiled on its target operating system.");
@@ -49,8 +57,9 @@ export function buildNativeRemoteDesktop({
 
   const cache = mkdtempSync(join(tmpdir(), "joko-native-remote-desktop-build-"));
   try {
-    const helper = platform === "darwin" ? macHelper : windowsHelper;
-    const binary = join(cache, helper);
+    const inputHelper = platform === "darwin" ? macHelper : windowsHelper;
+    const inputBinary = join(cache, inputHelper);
+    let captureBinary = null;
     if (platform === "darwin") {
       const target = nativeRemoteDesktopMacTarget(architecture);
       run("xcrun", [
@@ -59,9 +68,19 @@ export function buildNativeRemoteDesktop({
         join(source, "macos-input.swift"),
         "-O", "-target", target.triple,
         "-framework", "ApplicationServices", "-framework", "AppKit", "-framework", "Security",
-        "-o", binary
+        "-framework", "IOKit",
+        "-o", inputBinary
       ], "The Remote Desktop input helper requires the macOS Swift command-line developer tools.");
-      assertMachOArchitecture(readFileSync(binary), architecture);
+      assertMachOArchitecture(readFileSync(inputBinary), architecture);
+      captureBinary = join(cache, macCaptureHelper);
+      run("xcrun", [
+        "--sdk", "macosx", "clang", join(source, "macos-capture.m"),
+        "-O2", "-target", target.triple, "-fobjc-arc", "-fblocks",
+        "-framework", "Foundation", "-framework", "AppKit", "-framework", "CoreGraphics",
+        "-framework", "CoreImage", "-framework", "IOSurface", "-framework", "ImageIO",
+        "-framework", "IOKit", "-o", captureBinary
+      ], "The Remote Desktop capture helper requires the macOS command-line developer tools.");
+      assertMachOArchitecture(readFileSync(captureBinary), architecture);
     } else {
       const target = windowsRustTarget(architecture);
       const portableCargo = resolve(root, "..", "..", ".runtime", "rust-toolchain", "bin", "cargo.exe");
@@ -77,22 +96,37 @@ export function buildNativeRemoteDesktop({
         ...process.env,
         PATH: `${dirname(cargo)};${process.env.PATH ?? process.env.Path ?? ""}`
       });
-      copyFileSync(join(targetDirectory, target, "release", windowsHelper), binary);
-      assertPortableExecutable(readFileSync(binary), architecture);
+      copyFileSync(join(targetDirectory, target, "release", windowsHelper), inputBinary);
+      assertPortableExecutable(readFileSync(inputBinary), architecture);
     }
-    const bytes = readFileSync(binary);
-    if (bytes.length < 1 || bytes.length > 16 * 1024 * 1024) {
-      throw new Error("The Remote Desktop input helper has an invalid size.");
-    }
-    const staged = join(artifactOutput, `${helper}.staged`);
-    copyFileSync(binary, staged);
-    chmodSync(staged, 0o755);
-    renameSync(staged, join(artifactOutput, helper));
-    writeManifest(artifactOutput, platform, architecture, helper,
-      createHash("sha256").update(bytes).digest("hex"));
+    const inputSha256 = stageHelper(artifactOutput, inputHelper, inputBinary);
+    const captureSha256 = captureBinary === null
+      ? null
+      : stageHelper(artifactOutput, macCaptureHelper, captureBinary);
+    writeManifest(
+      artifactOutput,
+      platform,
+      architecture,
+      inputHelper,
+      inputSha256,
+      captureBinary === null ? null : macCaptureHelper,
+      captureSha256
+    );
   } finally {
     rmSync(cache, { recursive: true, force: true });
   }
+}
+
+function stageHelper(output, helper, binary) {
+  const bytes = readFileSync(binary);
+  if (bytes.length < 1 || bytes.length > 16 * 1024 * 1024) {
+    throw new Error(`The Remote Desktop ${helper} helper has an invalid size.`);
+  }
+  const staged = join(output, `${helper}.staged`);
+  copyFileSync(binary, staged);
+  chmodSync(staged, 0o755);
+  renameSync(staged, join(output, helper));
+  return createHash("sha256").update(bytes).digest("hex");
 }
 
 function run(command, arguments_, message, environment = process.env) {
@@ -133,13 +167,23 @@ function assertPortableExecutable(bytes, architecture) {
   }
 }
 
-function writeManifest(output, platform, architecture, helper, sha256) {
+function writeManifest(
+  output,
+  platform,
+  architecture,
+  inputHelper,
+  inputSha256,
+  captureHelper,
+  captureSha256
+) {
   writeFileSync(join(output, "manifest.json"), `${JSON.stringify({
     protocolVersion: 1,
     platform,
     architecture,
-    helper,
-    sha256
+    inputHelper,
+    inputSha256,
+    captureHelper,
+    captureSha256
   }, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
 }
 

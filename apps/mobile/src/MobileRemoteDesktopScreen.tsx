@@ -202,6 +202,33 @@ function RemoteDesktopSession({ transport, preferredDeviceId, interactive, foreg
             onPress={() => void controller.startPictureInPicture()} />}
         </View>
       </>}
+      {snapshot.capabilities?.displayModes && snapshot.controlling && <View style={styles.displayModeSection}>
+        <Text style={[styles.controlLabel, { color: colors.muted }]}>{copy.resolution}</Text>
+        {snapshot.displayModesStatus === "loading" && <View style={styles.displayModeLoading}>
+          <ActivityIndicator size="small" color={colors.accent} />
+          <Text style={[styles.controlLabel, { color: colors.muted }]}>{copy.displayModesLoading}</Text>
+        </View>}
+        {snapshot.displayModesStatus === "error" && <View style={styles.displayModeLoading}>
+          <Text accessibilityRole="alert" style={[styles.controlLabel, { color: colors.negative }]}>
+            {copy.displayModesFailed}
+          </Text>
+          <Button label={copy.retry} colors={colors} disabled={snapshot.displayModeBusy}
+            onPress={() => void controller.loadDisplayModes()} />
+        </View>}
+        {snapshot.displayModesStatus === "ready" && <ScrollView horizontal
+          showsHorizontalScrollIndicator={false} contentContainerStyle={styles.displayModeList}>
+          {snapshot.displayModes.map((mode) => <Button key={mode.modeId}
+            label={`${mode.width} × ${mode.height}${mode.native ? ` · ${copy.nativeResolution}` : ""}`}
+            colors={colors} selected={mode.current}
+            disabled={snapshot.displayModeBusy || snapshot.clipboardBusy || snapshot.videoSettingsBusy
+              || snapshot.status !== "live" || mode.current}
+            onPress={() => void controller.setDisplayMode(mode.modeId)} />)}
+        </ScrollView>}
+      </View>}
+      {snapshot.displayModeNotice === "change-failed" && <Text accessibilityLiveRegion="polite" numberOfLines={3}
+        style={[styles.clipboardNotice, { color: colors.negative }]}>
+        {copy.displayModeFailed}
+      </Text>}
       <View style={styles.controlRow}>
         <Button label={copy.left} colors={colors} disabled={!snapshot.controlling} onPress={() => controller.click(0)} />
         <Button label={copy.right} colors={colors} disabled={!snapshot.controlling} onPress={() => controller.click(2)} />
@@ -305,6 +332,9 @@ const styles = StyleSheet.create({
   controls: { borderTopWidth: StyleSheet.hairlineWidth, padding: 8, gap: 7 },
   controlRow: { flexDirection: "row", flexWrap: "wrap", gap: 6, justifyContent: "center" },
   controlLabel: { fontSize: 12, lineHeight: 17, alignSelf: "center", paddingHorizontal: 3 },
+  displayModeSection: { gap: 6 },
+  displayModeLoading: { minHeight: 36, flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 7 },
+  displayModeList: { flexGrow: 1, gap: 6, justifyContent: "center", paddingHorizontal: 2 },
   clipboardNotice: { fontSize: 12, lineHeight: 17, minHeight: 17, textAlign: "center" },
   button: { minHeight: 36, minWidth: 52, maxWidth: 160, paddingHorizontal: 11, paddingVertical: 7,
     alignItems: "center", justifyContent: "center", borderWidth: StyleSheet.hairlineWidth, borderRadius: 10 },

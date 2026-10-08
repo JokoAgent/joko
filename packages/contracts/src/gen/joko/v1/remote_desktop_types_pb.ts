@@ -12,7 +12,7 @@ import type { Message } from "@bufbuild/protobuf";
  * Describes the file joko/v1/remote_desktop_types.proto.
  */
 export const file_joko_v1_remote_desktop_types: GenFile = /*@__PURE__*/
-  fileDesc("CiJqb2tvL3YxL3JlbW90ZV9kZXNrdG9wX3R5cGVzLnByb3RvEgdqb2tvLnYxIpsBChhSZW1vdGVEZXNrdG9wUGVybWlzc2lvbnMSQAoQc2NyZWVuX3JlY29yZGluZxgBIAEoDjImLmpva28udjEuUmVtb3RlRGVza3RvcFBlcm1pc3Npb25TdGF0dXMSPQoNYWNjZXNzaWJpbGl0eRgCIAEoDjImLmpva28udjEuUmVtb3RlRGVza3RvcFBlcm1pc3Npb25TdGF0dXMiVwoUUmVtb3RlRGVza3RvcERpc3BsYXkSEgoKZGlzcGxheV9pZBgBIAEoCRIMCgRuYW1lGAIgASgJEg0KBXdpZHRoGAMgASgNEg4KBmhlaWdodBgEIAEoDSLPAwoZUmVtb3RlRGVza3RvcENhcGFiaWxpdGllcxIYChBwcm90b2NvbF92ZXJzaW9uGAEgASgNEg8KB2VuYWJsZWQYAiABKAgSEwoLY2FuX2NvbnRyb2wYAyABKAgSEAoIcGxhdGZvcm0YBCABKAkSLwoIZGlzcGxheXMYBSADKAsyHS5qb2tvLnYxLlJlbW90ZURlc2t0b3BEaXNwbGF5EjYKC3Blcm1pc3Npb25zGAYgASgLMiEuam9rby52MS5SZW1vdGVEZXNrdG9wUGVybWlzc2lvbnMSGwoTYXV0b21hdGljX3JlY29ubmVjdBgHIAEoCBIbChNjb25uZWN0aW9uX3Rha2VvdmVyGAggASgIEhQKDHdlYnJ0Y192aWRlbxgJIAEoCBITCgt0cmlja2xlX2ljZRgKIAEoCBIVCg1qcGVnX2ZhbGxiYWNrGAsgASgIEhYKDmNsaXBib2FyZF90ZXh0GAwgASgIEhkKEWNsaXBib2FyZF9jb250ZW50GA0gASgIEhYKDnZpZGVvX3NldHRpbmdzGA4gASgIEhQKDHN5c3RlbV9hdWRpbxgPIAEoCBIaChJiYWNrZ3JvdW5kX3ZpZXdpbmcYECABKAgiNQodUmVtb3RlRGVza3RvcFBvaW50ZXJNb3ZlSW5wdXQSCQoBeBgBIAEoARIJCgF5GAIgASgBIngKH1JlbW90ZURlc2t0b3BQb2ludGVyQnV0dG9uSW5wdXQSMQoGYnV0dG9uGAEgASgOMiEuam9rby52MS5SZW1vdGVEZXNrdG9wTW91c2VCdXR0b24SDAoEZG93bhgCIAEoCBIJCgF4GAMgASgBEgkKAXkYBCABKAEiPAoYUmVtb3RlRGVza3RvcFNjcm9sbElucHV0Eg8KB2RlbHRhX3gYASABKAESDwoHZGVsdGFfeRgCIAEoASIzChVSZW1vdGVEZXNrdG9wS2V5SW5wdXQSDAoEY29kZRgBIAEoCRIMCgRkb3duGAIgASgIIiYKFlJlbW90ZURlc2t0b3BUZXh0SW5wdXQSDAoEdGV4dBgBIAEoCSIbChlSZW1vdGVEZXNrdG9wUmVsZWFzZUlucHV0IuICChdSZW1vdGVEZXNrdG9wSW5wdXRFdmVudBI2CgRtb3ZlGAEgASgLMiYuam9rby52MS5SZW1vdGVEZXNrdG9wUG9pbnRlck1vdmVJbnB1dEgAEjoKBmJ1dHRvbhgCIAEoCzIoLmpva28udjEuUmVtb3RlRGVza3RvcFBvaW50ZXJCdXR0b25JbnB1dEgAEjMKBnNjcm9sbBgDIAEoCzIhLmpva28udjEuUmVtb3RlRGVza3RvcFNjcm9sbElucHV0SAASLQoDa2V5GAQgASgLMh4uam9rby52MS5SZW1vdGVEZXNrdG9wS2V5SW5wdXRIABIvCgR0ZXh0GAUgASgLMh8uam9rby52MS5SZW1vdGVEZXNrdG9wVGV4dElucHV0SAASNQoHcmVsZWFzZRgGIAEoCzIiLmpva28udjEuUmVtb3RlRGVza3RvcFJlbGVhc2VJbnB1dEgAQgcKBWV2ZW50IroBChlSZW1vdGVEZXNrdG9wSWNlQ2FuZGlkYXRlEhEKCWNhbmRpZGF0ZRgBIAEoCRIUCgdzZHBfbWlkGAIgASgJSACIAQESHQoQc2RwX21fbGluZV9pbmRleBgDIAEoDUgBiAEBEh4KEXVzZXJuYW1lX2ZyYWdtZW50GAQgASgJSAKIAQFCCgoIX3NkcF9taWRCEwoRX3NkcF9tX2xpbmVfaW5kZXhCFAoSX3VzZXJuYW1lX2ZyYWdtZW50IqIBChZSZW1vdGVEZXNrdG9wSWNlU2VydmVyEgwKBHVybHMYASADKAkSFQoIdXNlcm5hbWUYAiABKAlIAIgBARIXCgpjcmVkZW50aWFsGAMgASgJSAGIAQESLgoKZXhwaXJlc19hdBgEIAEoCzIaLmdvb2dsZS5wcm90b2J1Zi5UaW1lc3RhbXBCCwoJX3VzZXJuYW1lQg0KC19jcmVkZW50aWFsIocBChJSZW1vdGVEZXNrdG9wTGVhc2USEAoIbGVhc2VfaWQYASABKAkSLgoHZGlzcGxheRgCIAEoCzIdLmpva28udjEuUmVtb3RlRGVza3RvcERpc3BsYXkSEwoLY29udHJvbGxpbmcYAyABKAgSGgoSY29udHJvbF9nZW5lcmF0aW9uGAQgASgEIkwKGVJlbW90ZURlc2t0b3BDb250cm9sU3RhdGUSEwoLY29udHJvbGxpbmcYASABKAgSGgoSY29udHJvbF9nZW5lcmF0aW9uGAIgASgEIkkKGlJlbW90ZURlc2t0b3BWaWRlb1NldHRpbmdzEgsKA2ZwcxgBIAEoDRIPCgdiaXRyYXRlGAIgASgNEg0KBWF1ZGlvGAMgASgIIkoKHlJlbW90ZURlc2t0b3BQcmVzZW50YXRpb25Qcm9vZhIQCghsZWFzZV9pZBgBIAEoCRIWCg5wcm9vZl9zZXF1ZW5jZRgCIAEoBCImCiRSZW1vdGVEZXNrdG9wQ2xpcGJvYXJkVGV4dENvcHlBY3Rpb24iNQolUmVtb3RlRGVza3RvcENsaXBib2FyZFRleHRQYXN0ZUFjdGlvbhIMCgR0ZXh0GAEgASgJItsBCiFSZW1vdGVEZXNrdG9wQ2xpcGJvYXJkVGV4dFJlcXVlc3QSEAoIbGVhc2VfaWQYASABKAkSGgoSY29udHJvbF9nZW5lcmF0aW9uGAIgASgEEj0KBGNvcHkYCiABKAsyLS5qb2tvLnYxLlJlbW90ZURlc2t0b3BDbGlwYm9hcmRUZXh0Q29weUFjdGlvbkgAEj8KBXBhc3RlGAsgASgLMi4uam9rby52MS5SZW1vdGVEZXNrdG9wQ2xpcGJvYXJkVGV4dFBhc3RlQWN0aW9uSABCCAoGYWN0aW9uIj4KIFJlbW90ZURlc2t0b3BDbGlwYm9hcmRUZXh0UmVzdWx0EhEKBHRleHQYASABKAlIAIgBAUIHCgVfdGV4dCKlAQodUmVtb3RlRGVza3RvcENsaXBib2FyZENvbnRlbnQSEQoEdGV4dBgBIAEoCUgAiAEBEhEKBGh0bWwYAiABKAlIAYgBARIQCgNydGYYAyABKAlIAogBARIQCgN1cmwYBCABKAlIA4gBARIQCgNwbmcYBSABKAlIBIgBAUIHCgVfdGV4dEIHCgVfaHRtbEIGCgRfcnRmQgYKBF91cmxCBgoEX3BuZyIpCidSZW1vdGVEZXNrdG9wQ2xpcGJvYXJkQ29udGVudENvcHlBY3Rpb24iOgooUmVtb3RlRGVza3RvcENsaXBib2FyZENvbnRlbnRCZWdpbkFjdGlvbhIOCgZsZW5ndGgYASABKA0iTgonUmVtb3RlRGVza3RvcENsaXBib2FyZENvbnRlbnRSZWFkQWN0aW9uEhMKC3RyYW5zZmVyX2lkGAEgASgJEg4KBm9mZnNldBgCIAEoDSJdCihSZW1vdGVEZXNrdG9wQ2xpcGJvYXJkQ29udGVudFdyaXRlQWN0aW9uEhMKC3RyYW5zZmVyX2lkGAEgASgJEg4KBm9mZnNldBgCIAEoDRIMCgRkYXRhGAMgASgJIkAKKVJlbW90ZURlc2t0b3BDbGlwYm9hcmRDb250ZW50Q29tbWl0QWN0aW9uEhMKC3RyYW5zZmVyX2lkGAEgASgJIkAKKVJlbW90ZURlc2t0b3BDbGlwYm9hcmRDb250ZW50Q2FuY2VsQWN0aW9uEhMKC3RyYW5zZmVyX2lkGAEgASgJIvYDCiRSZW1vdGVEZXNrdG9wQ2xpcGJvYXJkQ29udGVudFJlcXVlc3QSEAoIbGVhc2VfaWQYASABKAkSGgoSY29udHJvbF9nZW5lcmF0aW9uGAIgASgEEkAKBGNvcHkYCiABKAsyMC5qb2tvLnYxLlJlbW90ZURlc2t0b3BDbGlwYm9hcmRDb250ZW50Q29weUFjdGlvbkgAEkIKBWJlZ2luGAsgASgLMjEuam9rby52MS5SZW1vdGVEZXNrdG9wQ2xpcGJvYXJkQ29udGVudEJlZ2luQWN0aW9uSAASQAoEcmVhZBgMIAEoCzIwLmpva28udjEuUmVtb3RlRGVza3RvcENsaXBib2FyZENvbnRlbnRSZWFkQWN0aW9uSAASQgoFd3JpdGUYDSABKAsyMS5qb2tvLnYxLlJlbW90ZURlc2t0b3BDbGlwYm9hcmRDb250ZW50V3JpdGVBY3Rpb25IABJECgZjb21taXQYDiABKAsyMi5qb2tvLnYxLlJlbW90ZURlc2t0b3BDbGlwYm9hcmRDb250ZW50Q29tbWl0QWN0aW9uSAASRAoGY2FuY2VsGA8gASgLMjIuam9rby52MS5SZW1vdGVEZXNrdG9wQ2xpcGJvYXJkQ29udGVudENhbmNlbEFjdGlvbkgAQggKBmFjdGlvbiKLAQojUmVtb3RlRGVza3RvcENsaXBib2FyZENvbnRlbnRSZXN1bHQSGAoLdHJhbnNmZXJfaWQYASABKAlIAIgBARITCgZsZW5ndGgYAiABKA1IAYgBARIRCgRkYXRhGAMgASgJSAKIAQFCDgoMX3RyYW5zZmVyX2lkQgkKB19sZW5ndGhCBwoFX2RhdGEiQgoYUmVtb3RlRGVza3RvcE9mZmVyUmVzdWx0EhIKCmF0dGVtcHRfaWQYASABKAkSEgoKYW5zd2VyX3NkcBgCIAEoCSKMAQoeUmVtb3RlRGVza3RvcEljZUV4Y2hhbmdlUmVzdWx0EhIKCmF0dGVtcHRfaWQYASABKAkSNgoKY2FuZGlkYXRlcxgCIAMoCzIiLmpva28udjEuUmVtb3RlRGVza3RvcEljZUNhbmRpZGF0ZRIMCgRuZXh0GAMgASgNEhAKCGNvbXBsZXRlGAQgASgIIiIKElJlbW90ZURlc2t0b3BGcmFtZRIMCgRqcGVnGAEgASgMIkYKGFJlbW90ZURlc2t0b3BGcmFtZVJlc3VsdBIqCgVmcmFtZRgBIAEoCzIbLmpva28udjEuUmVtb3RlRGVza3RvcEZyYW1lIl4KFFJlbW90ZURlc2t0b3BGYWlsdXJlEjMKBnJlYXNvbhgBIAEoDjIjLmpva28udjEuUmVtb3RlRGVza3RvcEZhaWx1cmVSZWFzb24SEQoJcmV0cnlhYmxlGAIgASgIKo4CCh1SZW1vdGVEZXNrdG9wUGVybWlzc2lvblN0YXR1cxIwCixSRU1PVEVfREVTS1RPUF9QRVJNSVNTSU9OX1NUQVRVU19VTlNQRUNJRklFRBAAEiwKKFJFTU9URV9ERVNLVE9QX1BFUk1JU1NJT05fU1RBVFVTX0dSQU5URUQQARIsCihSRU1PVEVfREVTS1RPUF9QRVJNSVNTSU9OX1NUQVRVU19NSVNTSU5HEAISLAooUkVNT1RFX0RFU0tUT1BfUEVSTUlTU0lPTl9TVEFUVVNfVU5LTk9XThADEjEKLVJFTU9URV9ERVNLVE9QX1BFUk1JU1NJT05fU1RBVFVTX05PVF9SRVFVSVJFRBAEKrQBChZSZW1vdGVEZXNrdG9wU3RhcnRNb2RlEikKJVJFTU9URV9ERVNLVE9QX1NUQVJUX01PREVfVU5TUEVDSUZJRUQQABIhCh1SRU1PVEVfREVTS1RPUF9TVEFSVF9NT0RFX05FVxABEiQKIFJFTU9URV9ERVNLVE9QX1NUQVJUX01PREVfUkVTVU1FEAISJgoiUkVNT1RFX0RFU0tUT1BfU1RBUlRfTU9ERV9UQUtFT1ZFUhADKrwBChhSZW1vdGVEZXNrdG9wTW91c2VCdXR0b24SKwonUkVNT1RFX0RFU0tUT1BfTU9VU0VfQlVUVE9OX1VOU1BFQ0lGSUVEEAASJAogUkVNT1RFX0RFU0tUT1BfTU9VU0VfQlVUVE9OX0xFRlQQARImCiJSRU1PVEVfREVTS1RPUF9NT1VTRV9CVVRUT05fTUlERExFEAISJQohUkVNT1RFX0RFU0tUT1BfTU9VU0VfQlVUVE9OX1JJR0hUEAMq7wkKGlJlbW90ZURlc2t0b3BGYWlsdXJlUmVhc29uEi0KKVJFTU9URV9ERVNLVE9QX0ZBSUxVUkVfUkVBU09OX1VOU1BFQ0lGSUVEEAASKgomUkVNT1RFX0RFU0tUT1BfRkFJTFVSRV9SRUFTT05fRElTQUJMRUQQARImCiJSRU1PVEVfREVTS1RPUF9GQUlMVVJFX1JFQVNPTl9CVVNZEAISKQolUkVNT1RFX0RFU0tUT1BfRkFJTFVSRV9SRUFTT05fU1RPUFBFRBADEi8KK1JFTU9URV9ERVNLVE9QX0ZBSUxVUkVfUkVBU09OX0xFQVNFX0VYUElSRUQQBBIxCi1SRU1PVEVfREVTS1RPUF9GQUlMVVJFX1JFQVNPTl9ESVNQTEFZX01JU1NJTkcQBRI8CjhSRU1PVEVfREVTS1RPUF9GQUlMVVJFX1JFQVNPTl9TQ1JFRU5fUEVSTUlTU0lPTl9SRVFVSVJFRBAGEkMKP1JFTU9URV9ERVNLVE9QX0ZBSUxVUkVfUkVBU09OX0FDQ0VTU0lCSUxJVFlfUEVSTUlTU0lPTl9SRVFVSVJFRBAHEjMKL1JFTU9URV9ERVNLVE9QX0ZBSUxVUkVfUkVBU09OX0lOUFVUX1VOQVZBSUxBQkxFEAgSLAooUkVNT1RFX0RFU0tUT1BfRkFJTFVSRV9SRUFTT05fSU5QVVRfQlVTWRAJEisKJ1JFTU9URV9ERVNLVE9QX0ZBSUxVUkVfUkVBU09OX1ZJRVdfT05MWRAKEjMKL1JFTU9URV9ERVNLVE9QX0ZBSUxVUkVfUkVBU09OX1ZJREVPX1VOQVZBSUxBQkxFEAsSLAooUkVNT1RFX0RFU0tUT1BfRkFJTFVSRV9SRUFTT05fVklERU9fQlVTWRAMEi8KK1JFTU9URV9ERVNLVE9QX0ZBSUxVUkVfUkVBU09OX1ZJREVPX1RJTUVPVVQQDRIzCi9SRU1PVEVfREVTS1RPUF9GQUlMVVJFX1JFQVNPTl9BVVRIT1JJVFlfQ0hBTkdFRBAOEi0KKVJFTU9URV9ERVNLVE9QX0ZBSUxVUkVfUkVBU09OX1VOU1VQUE9SVEVEEA8SPAo4UkVNT1RFX0RFU0tUT1BfRkFJTFVSRV9SRUFTT05fTE9DS0VEX1NFU1NJT05fVU5TVVBQT1JURUQQEBI3CjNSRU1PVEVfREVTS1RPUF9GQUlMVVJFX1JFQVNPTl9DTElQQk9BUkRfVU5BVkFJTEFCTEUQERIwCixSRU1PVEVfREVTS1RPUF9GQUlMVVJFX1JFQVNPTl9DTElQQk9BUkRfQlVTWRASEjEKLVJFTU9URV9ERVNLVE9QX0ZBSUxVUkVfUkVBU09OX0NMSVBCT0FSRF9FTVBUWRATEjUKMVJFTU9URV9ERVNLVE9QX0ZBSUxVUkVfUkVBU09OX0NMSVBCT0FSRF9UT09fTEFSR0UQFBI3CjNSRU1PVEVfREVTS1RPUF9GQUlMVVJFX1JFQVNPTl9DTElQQk9BUkRfVU5TVVBQT1JURUQQFRIzCi9SRU1PVEVfREVTS1RPUF9GQUlMVVJFX1JFQVNPTl9DTElQQk9BUkRfRVhQSVJFRBAWEjMKL1JFTU9URV9ERVNLVE9QX0ZBSUxVUkVfUkVBU09OX0FVRElPX1VOQVZBSUxBQkxFEBdiBnByb3RvMw", [file_google_protobuf_timestamp]);
+  fileDesc("CiJqb2tvL3YxL3JlbW90ZV9kZXNrdG9wX3R5cGVzLnByb3RvEgdqb2tvLnYxIpsBChhSZW1vdGVEZXNrdG9wUGVybWlzc2lvbnMSQAoQc2NyZWVuX3JlY29yZGluZxgBIAEoDjImLmpva28udjEuUmVtb3RlRGVza3RvcFBlcm1pc3Npb25TdGF0dXMSPQoNYWNjZXNzaWJpbGl0eRgCIAEoDjImLmpva28udjEuUmVtb3RlRGVza3RvcFBlcm1pc3Npb25TdGF0dXMiVwoUUmVtb3RlRGVza3RvcERpc3BsYXkSEgoKZGlzcGxheV9pZBgBIAEoCRIMCgRuYW1lGAIgASgJEg0KBXdpZHRoGAMgASgNEg4KBmhlaWdodBgEIAEoDSJrChhSZW1vdGVEZXNrdG9wRGlzcGxheU1vZGUSDwoHbW9kZV9pZBgBIAEoCRINCgV3aWR0aBgCIAEoDRIOCgZoZWlnaHQYAyABKA0SDwoHY3VycmVudBgEIAEoCBIOCgZuYXRpdmUYBSABKAgi/gMKGVJlbW90ZURlc2t0b3BDYXBhYmlsaXRpZXMSGAoQcHJvdG9jb2xfdmVyc2lvbhgBIAEoDRIPCgdlbmFibGVkGAIgASgIEhMKC2Nhbl9jb250cm9sGAMgASgIEhAKCHBsYXRmb3JtGAQgASgJEi8KCGRpc3BsYXlzGAUgAygLMh0uam9rby52MS5SZW1vdGVEZXNrdG9wRGlzcGxheRI2CgtwZXJtaXNzaW9ucxgGIAEoCzIhLmpva28udjEuUmVtb3RlRGVza3RvcFBlcm1pc3Npb25zEhsKE2F1dG9tYXRpY19yZWNvbm5lY3QYByABKAgSGwoTY29ubmVjdGlvbl90YWtlb3ZlchgIIAEoCBIUCgx3ZWJydGNfdmlkZW8YCSABKAgSEwoLdHJpY2tsZV9pY2UYCiABKAgSFQoNanBlZ19mYWxsYmFjaxgLIAEoCBIWCg5jbGlwYm9hcmRfdGV4dBgMIAEoCBIZChFjbGlwYm9hcmRfY29udGVudBgNIAEoCBIWCg52aWRlb19zZXR0aW5ncxgOIAEoCBIUCgxzeXN0ZW1fYXVkaW8YDyABKAgSGgoSYmFja2dyb3VuZF92aWV3aW5nGBAgASgIEhUKDWRpc3BsYXlfbW9kZXMYESABKAgSFgoOY3Vyc29yX292ZXJsYXkYEiABKAgiNQodUmVtb3RlRGVza3RvcFBvaW50ZXJNb3ZlSW5wdXQSCQoBeBgBIAEoARIJCgF5GAIgASgBIngKH1JlbW90ZURlc2t0b3BQb2ludGVyQnV0dG9uSW5wdXQSMQoGYnV0dG9uGAEgASgOMiEuam9rby52MS5SZW1vdGVEZXNrdG9wTW91c2VCdXR0b24SDAoEZG93bhgCIAEoCBIJCgF4GAMgASgBEgkKAXkYBCABKAEiPAoYUmVtb3RlRGVza3RvcFNjcm9sbElucHV0Eg8KB2RlbHRhX3gYASABKAESDwoHZGVsdGFfeRgCIAEoASIzChVSZW1vdGVEZXNrdG9wS2V5SW5wdXQSDAoEY29kZRgBIAEoCRIMCgRkb3duGAIgASgIIiYKFlJlbW90ZURlc2t0b3BUZXh0SW5wdXQSDAoEdGV4dBgBIAEoCSIbChlSZW1vdGVEZXNrdG9wUmVsZWFzZUlucHV0IuICChdSZW1vdGVEZXNrdG9wSW5wdXRFdmVudBI2CgRtb3ZlGAEgASgLMiYuam9rby52MS5SZW1vdGVEZXNrdG9wUG9pbnRlck1vdmVJbnB1dEgAEjoKBmJ1dHRvbhgCIAEoCzIoLmpva28udjEuUmVtb3RlRGVza3RvcFBvaW50ZXJCdXR0b25JbnB1dEgAEjMKBnNjcm9sbBgDIAEoCzIhLmpva28udjEuUmVtb3RlRGVza3RvcFNjcm9sbElucHV0SAASLQoDa2V5GAQgASgLMh4uam9rby52MS5SZW1vdGVEZXNrdG9wS2V5SW5wdXRIABIvCgR0ZXh0GAUgASgLMh8uam9rby52MS5SZW1vdGVEZXNrdG9wVGV4dElucHV0SAASNQoHcmVsZWFzZRgGIAEoCzIiLmpva28udjEuUmVtb3RlRGVza3RvcFJlbGVhc2VJbnB1dEgAQgcKBWV2ZW50IroBChlSZW1vdGVEZXNrdG9wSWNlQ2FuZGlkYXRlEhEKCWNhbmRpZGF0ZRgBIAEoCRIUCgdzZHBfbWlkGAIgASgJSACIAQESHQoQc2RwX21fbGluZV9pbmRleBgDIAEoDUgBiAEBEh4KEXVzZXJuYW1lX2ZyYWdtZW50GAQgASgJSAKIAQFCCgoIX3NkcF9taWRCEwoRX3NkcF9tX2xpbmVfaW5kZXhCFAoSX3VzZXJuYW1lX2ZyYWdtZW50IqIBChZSZW1vdGVEZXNrdG9wSWNlU2VydmVyEgwKBHVybHMYASADKAkSFQoIdXNlcm5hbWUYAiABKAlIAIgBARIXCgpjcmVkZW50aWFsGAMgASgJSAGIAQESLgoKZXhwaXJlc19hdBgEIAEoCzIaLmdvb2dsZS5wcm90b2J1Zi5UaW1lc3RhbXBCCwoJX3VzZXJuYW1lQg0KC19jcmVkZW50aWFsIocBChJSZW1vdGVEZXNrdG9wTGVhc2USEAoIbGVhc2VfaWQYASABKAkSLgoHZGlzcGxheRgCIAEoCzIdLmpva28udjEuUmVtb3RlRGVza3RvcERpc3BsYXkSEwoLY29udHJvbGxpbmcYAyABKAgSGgoSY29udHJvbF9nZW5lcmF0aW9uGAQgASgEIkwKGVJlbW90ZURlc2t0b3BDb250cm9sU3RhdGUSEwoLY29udHJvbGxpbmcYASABKAgSGgoSY29udHJvbF9nZW5lcmF0aW9uGAIgASgEIkkKGlJlbW90ZURlc2t0b3BWaWRlb1NldHRpbmdzEgsKA2ZwcxgBIAEoDRIPCgdiaXRyYXRlGAIgASgNEg0KBWF1ZGlvGAMgASgIIkoKHlJlbW90ZURlc2t0b3BQcmVzZW50YXRpb25Qcm9vZhIQCghsZWFzZV9pZBgBIAEoCRIWCg5wcm9vZl9zZXF1ZW5jZRgCIAEoBCImCiRSZW1vdGVEZXNrdG9wQ2xpcGJvYXJkVGV4dENvcHlBY3Rpb24iNQolUmVtb3RlRGVza3RvcENsaXBib2FyZFRleHRQYXN0ZUFjdGlvbhIMCgR0ZXh0GAEgASgJItsBCiFSZW1vdGVEZXNrdG9wQ2xpcGJvYXJkVGV4dFJlcXVlc3QSEAoIbGVhc2VfaWQYASABKAkSGgoSY29udHJvbF9nZW5lcmF0aW9uGAIgASgEEj0KBGNvcHkYCiABKAsyLS5qb2tvLnYxLlJlbW90ZURlc2t0b3BDbGlwYm9hcmRUZXh0Q29weUFjdGlvbkgAEj8KBXBhc3RlGAsgASgLMi4uam9rby52MS5SZW1vdGVEZXNrdG9wQ2xpcGJvYXJkVGV4dFBhc3RlQWN0aW9uSABCCAoGYWN0aW9uIj4KIFJlbW90ZURlc2t0b3BDbGlwYm9hcmRUZXh0UmVzdWx0EhEKBHRleHQYASABKAlIAIgBAUIHCgVfdGV4dCKlAQodUmVtb3RlRGVza3RvcENsaXBib2FyZENvbnRlbnQSEQoEdGV4dBgBIAEoCUgAiAEBEhEKBGh0bWwYAiABKAlIAYgBARIQCgNydGYYAyABKAlIAogBARIQCgN1cmwYBCABKAlIA4gBARIQCgNwbmcYBSABKAlIBIgBAUIHCgVfdGV4dEIHCgVfaHRtbEIGCgRfcnRmQgYKBF91cmxCBgoEX3BuZyIpCidSZW1vdGVEZXNrdG9wQ2xpcGJvYXJkQ29udGVudENvcHlBY3Rpb24iOgooUmVtb3RlRGVza3RvcENsaXBib2FyZENvbnRlbnRCZWdpbkFjdGlvbhIOCgZsZW5ndGgYASABKA0iTgonUmVtb3RlRGVza3RvcENsaXBib2FyZENvbnRlbnRSZWFkQWN0aW9uEhMKC3RyYW5zZmVyX2lkGAEgASgJEg4KBm9mZnNldBgCIAEoDSJdCihSZW1vdGVEZXNrdG9wQ2xpcGJvYXJkQ29udGVudFdyaXRlQWN0aW9uEhMKC3RyYW5zZmVyX2lkGAEgASgJEg4KBm9mZnNldBgCIAEoDRIMCgRkYXRhGAMgASgJIkAKKVJlbW90ZURlc2t0b3BDbGlwYm9hcmRDb250ZW50Q29tbWl0QWN0aW9uEhMKC3RyYW5zZmVyX2lkGAEgASgJIkAKKVJlbW90ZURlc2t0b3BDbGlwYm9hcmRDb250ZW50Q2FuY2VsQWN0aW9uEhMKC3RyYW5zZmVyX2lkGAEgASgJIvYDCiRSZW1vdGVEZXNrdG9wQ2xpcGJvYXJkQ29udGVudFJlcXVlc3QSEAoIbGVhc2VfaWQYASABKAkSGgoSY29udHJvbF9nZW5lcmF0aW9uGAIgASgEEkAKBGNvcHkYCiABKAsyMC5qb2tvLnYxLlJlbW90ZURlc2t0b3BDbGlwYm9hcmRDb250ZW50Q29weUFjdGlvbkgAEkIKBWJlZ2luGAsgASgLMjEuam9rby52MS5SZW1vdGVEZXNrdG9wQ2xpcGJvYXJkQ29udGVudEJlZ2luQWN0aW9uSAASQAoEcmVhZBgMIAEoCzIwLmpva28udjEuUmVtb3RlRGVza3RvcENsaXBib2FyZENvbnRlbnRSZWFkQWN0aW9uSAASQgoFd3JpdGUYDSABKAsyMS5qb2tvLnYxLlJlbW90ZURlc2t0b3BDbGlwYm9hcmRDb250ZW50V3JpdGVBY3Rpb25IABJECgZjb21taXQYDiABKAsyMi5qb2tvLnYxLlJlbW90ZURlc2t0b3BDbGlwYm9hcmRDb250ZW50Q29tbWl0QWN0aW9uSAASRAoGY2FuY2VsGA8gASgLMjIuam9rby52MS5SZW1vdGVEZXNrdG9wQ2xpcGJvYXJkQ29udGVudENhbmNlbEFjdGlvbkgAQggKBmFjdGlvbiKLAQojUmVtb3RlRGVza3RvcENsaXBib2FyZENvbnRlbnRSZXN1bHQSGAoLdHJhbnNmZXJfaWQYASABKAlIAIgBARITCgZsZW5ndGgYAiABKA1IAYgBARIRCgRkYXRhGAMgASgJSAKIAQFCDgoMX3RyYW5zZmVyX2lkQgkKB19sZW5ndGhCBwoFX2RhdGEiQgoYUmVtb3RlRGVza3RvcE9mZmVyUmVzdWx0EhIKCmF0dGVtcHRfaWQYASABKAkSEgoKYW5zd2VyX3NkcBgCIAEoCSKMAQoeUmVtb3RlRGVza3RvcEljZUV4Y2hhbmdlUmVzdWx0EhIKCmF0dGVtcHRfaWQYASABKAkSNgoKY2FuZGlkYXRlcxgCIAMoCzIiLmpva28udjEuUmVtb3RlRGVza3RvcEljZUNhbmRpZGF0ZRIMCgRuZXh0GAMgASgNEhAKCGNvbXBsZXRlGAQgASgIIlAKElJlbW90ZURlc2t0b3BGcmFtZRIMCgRqcGVnGAEgASgMEiwKBmN1cnNvchgCIAEoCzIcLmpva28udjEuUmVtb3RlRGVza3RvcEN1cnNvciKGAQoTUmVtb3RlRGVza3RvcEN1cnNvchIPCgd2aXNpYmxlGAEgASgIEgkKAXgYAiABKAESCQoBeRgDIAEoARINCgV3aWR0aBgEIAEoARIOCgZoZWlnaHQYBSABKAESDQoFaG90X3gYBiABKAESDQoFaG90X3kYByABKAESCwoDcG5nGAggASgMIkYKGFJlbW90ZURlc2t0b3BGcmFtZVJlc3VsdBIqCgVmcmFtZRgBIAEoCzIbLmpva28udjEuUmVtb3RlRGVza3RvcEZyYW1lIl4KFFJlbW90ZURlc2t0b3BGYWlsdXJlEjMKBnJlYXNvbhgBIAEoDjIjLmpva28udjEuUmVtb3RlRGVza3RvcEZhaWx1cmVSZWFzb24SEQoJcmV0cnlhYmxlGAIgASgIKo4CCh1SZW1vdGVEZXNrdG9wUGVybWlzc2lvblN0YXR1cxIwCixSRU1PVEVfREVTS1RPUF9QRVJNSVNTSU9OX1NUQVRVU19VTlNQRUNJRklFRBAAEiwKKFJFTU9URV9ERVNLVE9QX1BFUk1JU1NJT05fU1RBVFVTX0dSQU5URUQQARIsCihSRU1PVEVfREVTS1RPUF9QRVJNSVNTSU9OX1NUQVRVU19NSVNTSU5HEAISLAooUkVNT1RFX0RFU0tUT1BfUEVSTUlTU0lPTl9TVEFUVVNfVU5LTk9XThADEjEKLVJFTU9URV9ERVNLVE9QX1BFUk1JU1NJT05fU1RBVFVTX05PVF9SRVFVSVJFRBAEKrQBChZSZW1vdGVEZXNrdG9wU3RhcnRNb2RlEikKJVJFTU9URV9ERVNLVE9QX1NUQVJUX01PREVfVU5TUEVDSUZJRUQQABIhCh1SRU1PVEVfREVTS1RPUF9TVEFSVF9NT0RFX05FVxABEiQKIFJFTU9URV9ERVNLVE9QX1NUQVJUX01PREVfUkVTVU1FEAISJgoiUkVNT1RFX0RFU0tUT1BfU1RBUlRfTU9ERV9UQUtFT1ZFUhADKrwBChhSZW1vdGVEZXNrdG9wTW91c2VCdXR0b24SKwonUkVNT1RFX0RFU0tUT1BfTU9VU0VfQlVUVE9OX1VOU1BFQ0lGSUVEEAASJAogUkVNT1RFX0RFU0tUT1BfTU9VU0VfQlVUVE9OX0xFRlQQARImCiJSRU1PVEVfREVTS1RPUF9NT1VTRV9CVVRUT05fTUlERExFEAISJQohUkVNT1RFX0RFU0tUT1BfTU9VU0VfQlVUVE9OX1JJR0hUEAMqlAsKGlJlbW90ZURlc2t0b3BGYWlsdXJlUmVhc29uEi0KKVJFTU9URV9ERVNLVE9QX0ZBSUxVUkVfUkVBU09OX1VOU1BFQ0lGSUVEEAASKgomUkVNT1RFX0RFU0tUT1BfRkFJTFVSRV9SRUFTT05fRElTQUJMRUQQARImCiJSRU1PVEVfREVTS1RPUF9GQUlMVVJFX1JFQVNPTl9CVVNZEAISKQolUkVNT1RFX0RFU0tUT1BfRkFJTFVSRV9SRUFTT05fU1RPUFBFRBADEi8KK1JFTU9URV9ERVNLVE9QX0ZBSUxVUkVfUkVBU09OX0xFQVNFX0VYUElSRUQQBBIxCi1SRU1PVEVfREVTS1RPUF9GQUlMVVJFX1JFQVNPTl9ESVNQTEFZX01JU1NJTkcQBRI8CjhSRU1PVEVfREVTS1RPUF9GQUlMVVJFX1JFQVNPTl9TQ1JFRU5fUEVSTUlTU0lPTl9SRVFVSVJFRBAGEkMKP1JFTU9URV9ERVNLVE9QX0ZBSUxVUkVfUkVBU09OX0FDQ0VTU0lCSUxJVFlfUEVSTUlTU0lPTl9SRVFVSVJFRBAHEjMKL1JFTU9URV9ERVNLVE9QX0ZBSUxVUkVfUkVBU09OX0lOUFVUX1VOQVZBSUxBQkxFEAgSLAooUkVNT1RFX0RFU0tUT1BfRkFJTFVSRV9SRUFTT05fSU5QVVRfQlVTWRAJEisKJ1JFTU9URV9ERVNLVE9QX0ZBSUxVUkVfUkVBU09OX1ZJRVdfT05MWRAKEjMKL1JFTU9URV9ERVNLVE9QX0ZBSUxVUkVfUkVBU09OX1ZJREVPX1VOQVZBSUxBQkxFEAsSLAooUkVNT1RFX0RFU0tUT1BfRkFJTFVSRV9SRUFTT05fVklERU9fQlVTWRAMEi8KK1JFTU9URV9ERVNLVE9QX0ZBSUxVUkVfUkVBU09OX1ZJREVPX1RJTUVPVVQQDRIzCi9SRU1PVEVfREVTS1RPUF9GQUlMVVJFX1JFQVNPTl9BVVRIT1JJVFlfQ0hBTkdFRBAOEi0KKVJFTU9URV9ERVNLVE9QX0ZBSUxVUkVfUkVBU09OX1VOU1VQUE9SVEVEEA8SPAo4UkVNT1RFX0RFU0tUT1BfRkFJTFVSRV9SRUFTT05fTE9DS0VEX1NFU1NJT05fVU5TVVBQT1JURUQQEBI3CjNSRU1PVEVfREVTS1RPUF9GQUlMVVJFX1JFQVNPTl9DTElQQk9BUkRfVU5BVkFJTEFCTEUQERIwCixSRU1PVEVfREVTS1RPUF9GQUlMVVJFX1JFQVNPTl9DTElQQk9BUkRfQlVTWRASEjEKLVJFTU9URV9ERVNLVE9QX0ZBSUxVUkVfUkVBU09OX0NMSVBCT0FSRF9FTVBUWRATEjUKMVJFTU9URV9ERVNLVE9QX0ZBSUxVUkVfUkVBU09OX0NMSVBCT0FSRF9UT09fTEFSR0UQFBI3CjNSRU1PVEVfREVTS1RPUF9GQUlMVVJFX1JFQVNPTl9DTElQQk9BUkRfVU5TVVBQT1JURUQQFRIzCi9SRU1PVEVfREVTS1RPUF9GQUlMVVJFX1JFQVNPTl9DTElQQk9BUkRfRVhQSVJFRBAWEjMKL1JFTU9URV9ERVNLVE9QX0ZBSUxVUkVfUkVBU09OX0FVRElPX1VOQVZBSUxBQkxFEBcSOwo3UkVNT1RFX0RFU0tUT1BfRkFJTFVSRV9SRUFTT05fRElTUExBWV9NT0RFU19VTkFWQUlMQUJMRRAYEjYKMlJFTU9URV9ERVNLVE9QX0ZBSUxVUkVfUkVBU09OX0RJU1BMQVlfTU9ERV9NSVNTSU5HEBkSLgoqUkVNT1RFX0RFU0tUT1BfRkFJTFVSRV9SRUFTT05fRElTUExBWV9CVVNZEBpiBnByb3RvMw", [file_google_protobuf_timestamp]);
 
 /**
  * @generated from message joko.v1.RemoteDesktopPermissions
@@ -67,6 +67,46 @@ export type RemoteDesktopDisplay = Message<"joko.v1.RemoteDesktopDisplay"> & {
  */
 export const RemoteDesktopDisplaySchema: GenMessage<RemoteDesktopDisplay> = /*@__PURE__*/
   messageDesc(file_joko_v1_remote_desktop_types, 1);
+
+/**
+ * A host-enumerated macOS display mode. IDs are opaque to controllers and are
+ * valid only for the exact display and lease that produced this list.
+ *
+ * @generated from message joko.v1.RemoteDesktopDisplayMode
+ */
+export type RemoteDesktopDisplayMode = Message<"joko.v1.RemoteDesktopDisplayMode"> & {
+  /**
+   * @generated from field: string mode_id = 1;
+   */
+  modeId: string;
+
+  /**
+   * @generated from field: uint32 width = 2;
+   */
+  width: number;
+
+  /**
+   * @generated from field: uint32 height = 3;
+   */
+  height: number;
+
+  /**
+   * @generated from field: bool current = 4;
+   */
+  current: boolean;
+
+  /**
+   * @generated from field: bool native = 5;
+   */
+  native: boolean;
+};
+
+/**
+ * Describes the message joko.v1.RemoteDesktopDisplayMode.
+ * Use `create(RemoteDesktopDisplayModeSchema)` to create a new message.
+ */
+export const RemoteDesktopDisplayModeSchema: GenMessage<RemoteDesktopDisplayMode> = /*@__PURE__*/
+  messageDesc(file_joko_v1_remote_desktop_types, 2);
 
 /**
  * @generated from message joko.v1.RemoteDesktopCapabilities
@@ -151,6 +191,16 @@ export type RemoteDesktopCapabilities = Message<"joko.v1.RemoteDesktopCapabiliti
    * @generated from field: bool background_viewing = 16;
    */
   backgroundViewing: boolean;
+
+  /**
+   * @generated from field: bool display_modes = 17;
+   */
+  displayModes: boolean;
+
+  /**
+   * @generated from field: bool cursor_overlay = 18;
+   */
+  cursorOverlay: boolean;
 };
 
 /**
@@ -158,7 +208,7 @@ export type RemoteDesktopCapabilities = Message<"joko.v1.RemoteDesktopCapabiliti
  * Use `create(RemoteDesktopCapabilitiesSchema)` to create a new message.
  */
 export const RemoteDesktopCapabilitiesSchema: GenMessage<RemoteDesktopCapabilities> = /*@__PURE__*/
-  messageDesc(file_joko_v1_remote_desktop_types, 2);
+  messageDesc(file_joko_v1_remote_desktop_types, 3);
 
 /**
  * @generated from message joko.v1.RemoteDesktopPointerMoveInput
@@ -180,7 +230,7 @@ export type RemoteDesktopPointerMoveInput = Message<"joko.v1.RemoteDesktopPointe
  * Use `create(RemoteDesktopPointerMoveInputSchema)` to create a new message.
  */
 export const RemoteDesktopPointerMoveInputSchema: GenMessage<RemoteDesktopPointerMoveInput> = /*@__PURE__*/
-  messageDesc(file_joko_v1_remote_desktop_types, 3);
+  messageDesc(file_joko_v1_remote_desktop_types, 4);
 
 /**
  * @generated from message joko.v1.RemoteDesktopPointerButtonInput
@@ -212,7 +262,7 @@ export type RemoteDesktopPointerButtonInput = Message<"joko.v1.RemoteDesktopPoin
  * Use `create(RemoteDesktopPointerButtonInputSchema)` to create a new message.
  */
 export const RemoteDesktopPointerButtonInputSchema: GenMessage<RemoteDesktopPointerButtonInput> = /*@__PURE__*/
-  messageDesc(file_joko_v1_remote_desktop_types, 4);
+  messageDesc(file_joko_v1_remote_desktop_types, 5);
 
 /**
  * @generated from message joko.v1.RemoteDesktopScrollInput
@@ -234,7 +284,7 @@ export type RemoteDesktopScrollInput = Message<"joko.v1.RemoteDesktopScrollInput
  * Use `create(RemoteDesktopScrollInputSchema)` to create a new message.
  */
 export const RemoteDesktopScrollInputSchema: GenMessage<RemoteDesktopScrollInput> = /*@__PURE__*/
-  messageDesc(file_joko_v1_remote_desktop_types, 5);
+  messageDesc(file_joko_v1_remote_desktop_types, 6);
 
 /**
  * @generated from message joko.v1.RemoteDesktopKeyInput
@@ -256,7 +306,7 @@ export type RemoteDesktopKeyInput = Message<"joko.v1.RemoteDesktopKeyInput"> & {
  * Use `create(RemoteDesktopKeyInputSchema)` to create a new message.
  */
 export const RemoteDesktopKeyInputSchema: GenMessage<RemoteDesktopKeyInput> = /*@__PURE__*/
-  messageDesc(file_joko_v1_remote_desktop_types, 6);
+  messageDesc(file_joko_v1_remote_desktop_types, 7);
 
 /**
  * @generated from message joko.v1.RemoteDesktopTextInput
@@ -273,7 +323,7 @@ export type RemoteDesktopTextInput = Message<"joko.v1.RemoteDesktopTextInput"> &
  * Use `create(RemoteDesktopTextInputSchema)` to create a new message.
  */
 export const RemoteDesktopTextInputSchema: GenMessage<RemoteDesktopTextInput> = /*@__PURE__*/
-  messageDesc(file_joko_v1_remote_desktop_types, 7);
+  messageDesc(file_joko_v1_remote_desktop_types, 8);
 
 /**
  * @generated from message joko.v1.RemoteDesktopReleaseInput
@@ -286,7 +336,7 @@ export type RemoteDesktopReleaseInput = Message<"joko.v1.RemoteDesktopReleaseInp
  * Use `create(RemoteDesktopReleaseInputSchema)` to create a new message.
  */
 export const RemoteDesktopReleaseInputSchema: GenMessage<RemoteDesktopReleaseInput> = /*@__PURE__*/
-  messageDesc(file_joko_v1_remote_desktop_types, 8);
+  messageDesc(file_joko_v1_remote_desktop_types, 9);
 
 /**
  * @generated from message joko.v1.RemoteDesktopInputEvent
@@ -339,7 +389,7 @@ export type RemoteDesktopInputEvent = Message<"joko.v1.RemoteDesktopInputEvent">
  * Use `create(RemoteDesktopInputEventSchema)` to create a new message.
  */
 export const RemoteDesktopInputEventSchema: GenMessage<RemoteDesktopInputEvent> = /*@__PURE__*/
-  messageDesc(file_joko_v1_remote_desktop_types, 9);
+  messageDesc(file_joko_v1_remote_desktop_types, 10);
 
 /**
  * @generated from message joko.v1.RemoteDesktopIceCandidate
@@ -371,7 +421,7 @@ export type RemoteDesktopIceCandidate = Message<"joko.v1.RemoteDesktopIceCandida
  * Use `create(RemoteDesktopIceCandidateSchema)` to create a new message.
  */
 export const RemoteDesktopIceCandidateSchema: GenMessage<RemoteDesktopIceCandidate> = /*@__PURE__*/
-  messageDesc(file_joko_v1_remote_desktop_types, 10);
+  messageDesc(file_joko_v1_remote_desktop_types, 11);
 
 /**
  * Credentials, when present, are short lived and returned only for an active
@@ -406,7 +456,7 @@ export type RemoteDesktopIceServer = Message<"joko.v1.RemoteDesktopIceServer"> &
  * Use `create(RemoteDesktopIceServerSchema)` to create a new message.
  */
 export const RemoteDesktopIceServerSchema: GenMessage<RemoteDesktopIceServer> = /*@__PURE__*/
-  messageDesc(file_joko_v1_remote_desktop_types, 11);
+  messageDesc(file_joko_v1_remote_desktop_types, 12);
 
 /**
  * @generated from message joko.v1.RemoteDesktopLease
@@ -438,7 +488,7 @@ export type RemoteDesktopLease = Message<"joko.v1.RemoteDesktopLease"> & {
  * Use `create(RemoteDesktopLeaseSchema)` to create a new message.
  */
 export const RemoteDesktopLeaseSchema: GenMessage<RemoteDesktopLease> = /*@__PURE__*/
-  messageDesc(file_joko_v1_remote_desktop_types, 12);
+  messageDesc(file_joko_v1_remote_desktop_types, 13);
 
 /**
  * @generated from message joko.v1.RemoteDesktopControlState
@@ -460,7 +510,7 @@ export type RemoteDesktopControlState = Message<"joko.v1.RemoteDesktopControlSta
  * Use `create(RemoteDesktopControlStateSchema)` to create a new message.
  */
 export const RemoteDesktopControlStateSchema: GenMessage<RemoteDesktopControlState> = /*@__PURE__*/
-  messageDesc(file_joko_v1_remote_desktop_types, 13);
+  messageDesc(file_joko_v1_remote_desktop_types, 14);
 
 /**
  * Exact WebRTC capture settings. v1 intentionally admits only the fixed
@@ -490,7 +540,7 @@ export type RemoteDesktopVideoSettings = Message<"joko.v1.RemoteDesktopVideoSett
  * Use `create(RemoteDesktopVideoSettingsSchema)` to create a new message.
  */
 export const RemoteDesktopVideoSettingsSchema: GenMessage<RemoteDesktopVideoSettings> = /*@__PURE__*/
-  messageDesc(file_joko_v1_remote_desktop_types, 14);
+  messageDesc(file_joko_v1_remote_desktop_types, 15);
 
 /**
  * Internal target proof that a trusted capture renderer observed a fresh
@@ -515,7 +565,7 @@ export type RemoteDesktopPresentationProof = Message<"joko.v1.RemoteDesktopPrese
  * Use `create(RemoteDesktopPresentationProofSchema)` to create a new message.
  */
 export const RemoteDesktopPresentationProofSchema: GenMessage<RemoteDesktopPresentationProof> = /*@__PURE__*/
-  messageDesc(file_joko_v1_remote_desktop_types, 15);
+  messageDesc(file_joko_v1_remote_desktop_types, 16);
 
 /**
  * Legacy explicit text Copy/Paste remains a first-class route for controllers
@@ -532,7 +582,7 @@ export type RemoteDesktopClipboardTextCopyAction = Message<"joko.v1.RemoteDeskto
  * Use `create(RemoteDesktopClipboardTextCopyActionSchema)` to create a new message.
  */
 export const RemoteDesktopClipboardTextCopyActionSchema: GenMessage<RemoteDesktopClipboardTextCopyAction> = /*@__PURE__*/
-  messageDesc(file_joko_v1_remote_desktop_types, 16);
+  messageDesc(file_joko_v1_remote_desktop_types, 17);
 
 /**
  * @generated from message joko.v1.RemoteDesktopClipboardTextPasteAction
@@ -549,7 +599,7 @@ export type RemoteDesktopClipboardTextPasteAction = Message<"joko.v1.RemoteDeskt
  * Use `create(RemoteDesktopClipboardTextPasteActionSchema)` to create a new message.
  */
 export const RemoteDesktopClipboardTextPasteActionSchema: GenMessage<RemoteDesktopClipboardTextPasteAction> = /*@__PURE__*/
-  messageDesc(file_joko_v1_remote_desktop_types, 17);
+  messageDesc(file_joko_v1_remote_desktop_types, 18);
 
 /**
  * @generated from message joko.v1.RemoteDesktopClipboardTextRequest
@@ -588,7 +638,7 @@ export type RemoteDesktopClipboardTextRequest = Message<"joko.v1.RemoteDesktopCl
  * Use `create(RemoteDesktopClipboardTextRequestSchema)` to create a new message.
  */
 export const RemoteDesktopClipboardTextRequestSchema: GenMessage<RemoteDesktopClipboardTextRequest> = /*@__PURE__*/
-  messageDesc(file_joko_v1_remote_desktop_types, 18);
+  messageDesc(file_joko_v1_remote_desktop_types, 19);
 
 /**
  * @generated from message joko.v1.RemoteDesktopClipboardTextResult
@@ -605,7 +655,7 @@ export type RemoteDesktopClipboardTextResult = Message<"joko.v1.RemoteDesktopCli
  * Use `create(RemoteDesktopClipboardTextResultSchema)` to create a new message.
  */
 export const RemoteDesktopClipboardTextResultSchema: GenMessage<RemoteDesktopClipboardTextResult> = /*@__PURE__*/
-  messageDesc(file_joko_v1_remote_desktop_types, 19);
+  messageDesc(file_joko_v1_remote_desktop_types, 20);
 
 /**
  * One portable clipboard item. The rich transfer serializes this exact shape
@@ -646,7 +696,7 @@ export type RemoteDesktopClipboardContent = Message<"joko.v1.RemoteDesktopClipbo
  * Use `create(RemoteDesktopClipboardContentSchema)` to create a new message.
  */
 export const RemoteDesktopClipboardContentSchema: GenMessage<RemoteDesktopClipboardContent> = /*@__PURE__*/
-  messageDesc(file_joko_v1_remote_desktop_types, 20);
+  messageDesc(file_joko_v1_remote_desktop_types, 21);
 
 /**
  * @generated from message joko.v1.RemoteDesktopClipboardContentCopyAction
@@ -659,7 +709,7 @@ export type RemoteDesktopClipboardContentCopyAction = Message<"joko.v1.RemoteDes
  * Use `create(RemoteDesktopClipboardContentCopyActionSchema)` to create a new message.
  */
 export const RemoteDesktopClipboardContentCopyActionSchema: GenMessage<RemoteDesktopClipboardContentCopyAction> = /*@__PURE__*/
-  messageDesc(file_joko_v1_remote_desktop_types, 21);
+  messageDesc(file_joko_v1_remote_desktop_types, 22);
 
 /**
  * @generated from message joko.v1.RemoteDesktopClipboardContentBeginAction
@@ -676,7 +726,7 @@ export type RemoteDesktopClipboardContentBeginAction = Message<"joko.v1.RemoteDe
  * Use `create(RemoteDesktopClipboardContentBeginActionSchema)` to create a new message.
  */
 export const RemoteDesktopClipboardContentBeginActionSchema: GenMessage<RemoteDesktopClipboardContentBeginAction> = /*@__PURE__*/
-  messageDesc(file_joko_v1_remote_desktop_types, 22);
+  messageDesc(file_joko_v1_remote_desktop_types, 23);
 
 /**
  * @generated from message joko.v1.RemoteDesktopClipboardContentReadAction
@@ -698,7 +748,7 @@ export type RemoteDesktopClipboardContentReadAction = Message<"joko.v1.RemoteDes
  * Use `create(RemoteDesktopClipboardContentReadActionSchema)` to create a new message.
  */
 export const RemoteDesktopClipboardContentReadActionSchema: GenMessage<RemoteDesktopClipboardContentReadAction> = /*@__PURE__*/
-  messageDesc(file_joko_v1_remote_desktop_types, 23);
+  messageDesc(file_joko_v1_remote_desktop_types, 24);
 
 /**
  * @generated from message joko.v1.RemoteDesktopClipboardContentWriteAction
@@ -725,7 +775,7 @@ export type RemoteDesktopClipboardContentWriteAction = Message<"joko.v1.RemoteDe
  * Use `create(RemoteDesktopClipboardContentWriteActionSchema)` to create a new message.
  */
 export const RemoteDesktopClipboardContentWriteActionSchema: GenMessage<RemoteDesktopClipboardContentWriteAction> = /*@__PURE__*/
-  messageDesc(file_joko_v1_remote_desktop_types, 24);
+  messageDesc(file_joko_v1_remote_desktop_types, 25);
 
 /**
  * @generated from message joko.v1.RemoteDesktopClipboardContentCommitAction
@@ -742,7 +792,7 @@ export type RemoteDesktopClipboardContentCommitAction = Message<"joko.v1.RemoteD
  * Use `create(RemoteDesktopClipboardContentCommitActionSchema)` to create a new message.
  */
 export const RemoteDesktopClipboardContentCommitActionSchema: GenMessage<RemoteDesktopClipboardContentCommitAction> = /*@__PURE__*/
-  messageDesc(file_joko_v1_remote_desktop_types, 25);
+  messageDesc(file_joko_v1_remote_desktop_types, 26);
 
 /**
  * @generated from message joko.v1.RemoteDesktopClipboardContentCancelAction
@@ -759,7 +809,7 @@ export type RemoteDesktopClipboardContentCancelAction = Message<"joko.v1.RemoteD
  * Use `create(RemoteDesktopClipboardContentCancelActionSchema)` to create a new message.
  */
 export const RemoteDesktopClipboardContentCancelActionSchema: GenMessage<RemoteDesktopClipboardContentCancelAction> = /*@__PURE__*/
-  messageDesc(file_joko_v1_remote_desktop_types, 26);
+  messageDesc(file_joko_v1_remote_desktop_types, 27);
 
 /**
  * @generated from message joko.v1.RemoteDesktopClipboardContentRequest
@@ -822,7 +872,7 @@ export type RemoteDesktopClipboardContentRequest = Message<"joko.v1.RemoteDeskto
  * Use `create(RemoteDesktopClipboardContentRequestSchema)` to create a new message.
  */
 export const RemoteDesktopClipboardContentRequestSchema: GenMessage<RemoteDesktopClipboardContentRequest> = /*@__PURE__*/
-  messageDesc(file_joko_v1_remote_desktop_types, 27);
+  messageDesc(file_joko_v1_remote_desktop_types, 28);
 
 /**
  * @generated from message joko.v1.RemoteDesktopClipboardContentResult
@@ -849,7 +899,7 @@ export type RemoteDesktopClipboardContentResult = Message<"joko.v1.RemoteDesktop
  * Use `create(RemoteDesktopClipboardContentResultSchema)` to create a new message.
  */
 export const RemoteDesktopClipboardContentResultSchema: GenMessage<RemoteDesktopClipboardContentResult> = /*@__PURE__*/
-  messageDesc(file_joko_v1_remote_desktop_types, 28);
+  messageDesc(file_joko_v1_remote_desktop_types, 29);
 
 /**
  * @generated from message joko.v1.RemoteDesktopOfferResult
@@ -871,7 +921,7 @@ export type RemoteDesktopOfferResult = Message<"joko.v1.RemoteDesktopOfferResult
  * Use `create(RemoteDesktopOfferResultSchema)` to create a new message.
  */
 export const RemoteDesktopOfferResultSchema: GenMessage<RemoteDesktopOfferResult> = /*@__PURE__*/
-  messageDesc(file_joko_v1_remote_desktop_types, 29);
+  messageDesc(file_joko_v1_remote_desktop_types, 30);
 
 /**
  * @generated from message joko.v1.RemoteDesktopIceExchangeResult
@@ -903,7 +953,7 @@ export type RemoteDesktopIceExchangeResult = Message<"joko.v1.RemoteDesktopIceEx
  * Use `create(RemoteDesktopIceExchangeResultSchema)` to create a new message.
  */
 export const RemoteDesktopIceExchangeResultSchema: GenMessage<RemoteDesktopIceExchangeResult> = /*@__PURE__*/
-  messageDesc(file_joko_v1_remote_desktop_types, 30);
+  messageDesc(file_joko_v1_remote_desktop_types, 31);
 
 /**
  * @generated from message joko.v1.RemoteDesktopFrame
@@ -913,6 +963,14 @@ export type RemoteDesktopFrame = Message<"joko.v1.RemoteDesktopFrame"> & {
    * @generated from field: bytes jpeg = 1;
    */
   jpeg: Uint8Array;
+
+  /**
+   * Absent hides the native cursor overlay. Cursor pixels never contain a URL
+   * or markup and are bounded independently from the JPEG frame.
+   *
+   * @generated from field: joko.v1.RemoteDesktopCursor cursor = 2;
+   */
+  cursor?: RemoteDesktopCursor | undefined;
 };
 
 /**
@@ -920,7 +978,62 @@ export type RemoteDesktopFrame = Message<"joko.v1.RemoteDesktopFrame"> & {
  * Use `create(RemoteDesktopFrameSchema)` to create a new message.
  */
 export const RemoteDesktopFrameSchema: GenMessage<RemoteDesktopFrame> = /*@__PURE__*/
-  messageDesc(file_joko_v1_remote_desktop_types, 31);
+  messageDesc(file_joko_v1_remote_desktop_types, 32);
+
+/**
+ * Coordinates are normalized to the selected display. Size and hotspot are
+ * measured in desktop points; png is a bounded raster image.
+ *
+ * @generated from message joko.v1.RemoteDesktopCursor
+ */
+export type RemoteDesktopCursor = Message<"joko.v1.RemoteDesktopCursor"> & {
+  /**
+   * @generated from field: bool visible = 1;
+   */
+  visible: boolean;
+
+  /**
+   * @generated from field: double x = 2;
+   */
+  x: number;
+
+  /**
+   * @generated from field: double y = 3;
+   */
+  y: number;
+
+  /**
+   * @generated from field: double width = 4;
+   */
+  width: number;
+
+  /**
+   * @generated from field: double height = 5;
+   */
+  height: number;
+
+  /**
+   * @generated from field: double hot_x = 6;
+   */
+  hotX: number;
+
+  /**
+   * @generated from field: double hot_y = 7;
+   */
+  hotY: number;
+
+  /**
+   * @generated from field: bytes png = 8;
+   */
+  png: Uint8Array;
+};
+
+/**
+ * Describes the message joko.v1.RemoteDesktopCursor.
+ * Use `create(RemoteDesktopCursorSchema)` to create a new message.
+ */
+export const RemoteDesktopCursorSchema: GenMessage<RemoteDesktopCursor> = /*@__PURE__*/
+  messageDesc(file_joko_v1_remote_desktop_types, 33);
 
 /**
  * An absent frame means the bounded JPEG fallback is throttled or already has
@@ -940,7 +1053,7 @@ export type RemoteDesktopFrameResult = Message<"joko.v1.RemoteDesktopFrameResult
  * Use `create(RemoteDesktopFrameResultSchema)` to create a new message.
  */
 export const RemoteDesktopFrameResultSchema: GenMessage<RemoteDesktopFrameResult> = /*@__PURE__*/
-  messageDesc(file_joko_v1_remote_desktop_types, 32);
+  messageDesc(file_joko_v1_remote_desktop_types, 34);
 
 /**
  * @generated from message joko.v1.RemoteDesktopFailure
@@ -962,7 +1075,7 @@ export type RemoteDesktopFailure = Message<"joko.v1.RemoteDesktopFailure"> & {
  * Use `create(RemoteDesktopFailureSchema)` to create a new message.
  */
 export const RemoteDesktopFailureSchema: GenMessage<RemoteDesktopFailure> = /*@__PURE__*/
-  messageDesc(file_joko_v1_remote_desktop_types, 33);
+  messageDesc(file_joko_v1_remote_desktop_types, 35);
 
 /**
  * Portable Remote Desktop values shared by the authenticated controller
@@ -1189,6 +1302,21 @@ export enum RemoteDesktopFailureReason {
    * @generated from enum value: REMOTE_DESKTOP_FAILURE_REASON_AUDIO_UNAVAILABLE = 23;
    */
   AUDIO_UNAVAILABLE = 23,
+
+  /**
+   * @generated from enum value: REMOTE_DESKTOP_FAILURE_REASON_DISPLAY_MODES_UNAVAILABLE = 24;
+   */
+  DISPLAY_MODES_UNAVAILABLE = 24,
+
+  /**
+   * @generated from enum value: REMOTE_DESKTOP_FAILURE_REASON_DISPLAY_MODE_MISSING = 25;
+   */
+  DISPLAY_MODE_MISSING = 25,
+
+  /**
+   * @generated from enum value: REMOTE_DESKTOP_FAILURE_REASON_DISPLAY_BUSY = 26;
+   */
+  DISPLAY_BUSY = 26,
 }
 
 /**

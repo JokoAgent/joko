@@ -798,6 +798,7 @@ export class MobileClient {
       || !this.network.sendRemoteDesktopInput
       || !this.network.getRemoteDesktopIceConfiguration || !this.network.createRemoteDesktopOffer
       || !this.network.exchangeRemoteDesktopIce || !this.network.getRemoteDesktopFrame
+      || !this.network.listRemoteDesktopDisplayModes || !this.network.setRemoteDesktopDisplayMode
       || !this.network.transferRemoteDesktopClipboardText
       || !this.network.transferRemoteDesktopClipboardContent) return undefined;
     const authoritySame = (): boolean => !this.#disposed && this.#credential === credential
@@ -837,12 +838,17 @@ export class MobileClient {
         this.network.sendRemoteDesktopInput!(credential, route(host), leaseId, sequence, events, signal)),
       iceConfiguration: (host, leaseId, signal) => checked(() =>
         this.network.getRemoteDesktopIceConfiguration!(credential, route(host), leaseId, signal)),
-      offer: (host, leaseId, attemptId, sdp, settings, signal) => checked(() =>
-        this.network.createRemoteDesktopOffer!(credential, route(host), leaseId, attemptId, sdp, settings, signal)),
+      offer: (host, leaseId, attemptId, sdp, settings, cursorOverlay, signal) => checked(() =>
+        this.network.createRemoteDesktopOffer!(credential, route(host), leaseId, attemptId, sdp, settings,
+          cursorOverlay, signal)),
       ice: (host, leaseId, attemptId, candidates, after, signal) => checked(() =>
         this.network.exchangeRemoteDesktopIce!(credential, route(host), leaseId, attemptId, candidates, after, signal)),
-      frame: (host, leaseId, signal) => checked(() =>
-        this.network.getRemoteDesktopFrame!(credential, route(host), leaseId, signal)),
+      frame: (host, leaseId, cursorOverlay, signal) => checked(() =>
+        this.network.getRemoteDesktopFrame!(credential, route(host), leaseId, cursorOverlay, signal)),
+      listDisplayModes: (host, leaseId, signal) => checked(() =>
+        this.network.listRemoteDesktopDisplayModes!(credential, route(host), leaseId, signal)),
+      setDisplayMode: (host, leaseId, controlGeneration, modeId, signal) => checked(() =>
+        this.network.setRemoteDesktopDisplayMode!(credential, route(host), leaseId, controlGeneration, modeId, signal)),
       clipboardText: (host, transferValue, signal) => checked(() =>
         this.network.transferRemoteDesktopClipboardText!(credential, route(host), transferValue, signal)),
       clipboardContent: (host, transferValue, signal) => checked(() =>

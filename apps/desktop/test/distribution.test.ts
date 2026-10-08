@@ -127,7 +127,8 @@ describe("Desktop distribution", () => {
       "manifest.json", "joko-macos-gamepad-helper"
     ]);
     expect(config.extraResources.find(item => item.to === "native-remote-desktop")?.filter).toEqual([
-      "manifest.json", "joko-macos-remote-desktop-input", "joko-windows-remote-desktop-input.exe"
+      "manifest.json", "joko-macos-remote-desktop-capture", "joko-macos-remote-desktop-input",
+      "joko-windows-remote-desktop-input.exe"
     ]);
     expect(config.extraResources.find(item => item.to === "native-simulator-h264")?.filter).toEqual([
       "manifest.json", "joko-simulator-h264"
@@ -208,13 +209,15 @@ describe("Desktop distribution", () => {
       .toBeLessThan(packagedGamepadAudit.indexOf("const bytes = await readFile(path)"));
   });
 
-  it("builds and audits only the fixed Remote Desktop input helpers", () => {
+  it("builds and audits only the fixed Remote Desktop native helpers", () => {
     expect(manifest.scripts?.["build:native-remote-desktop"])
       .toBe("node scripts/build-native-remote-desktop.mjs");
     expect(manifest.scripts?.build).toContain("pnpm build:native-remote-desktop");
     expect(manifest.scripts?.["package:dir"]).toContain("node scripts/build-native-remote-desktop.mjs");
     expect(manifest.scripts?.["package:artifacts"]).toContain("node scripts/build-native-remote-desktop.mjs");
     expect(nativeRemoteDesktopBuild).toContain('const macHelper = "joko-macos-remote-desktop-input"');
+    expect(nativeRemoteDesktopBuild)
+      .toContain('const macCaptureHelper = "joko-macos-remote-desktop-capture"');
     expect(nativeRemoteDesktopBuild).toContain('const windowsHelper = "joko-windows-remote-desktop-input.exe"');
     expect(nativeRemoteDesktopBuild).toContain("export function buildNativeRemoteDesktop(");
     expect(packagedAudit).toContain("buildNativeRemoteDesktop({");

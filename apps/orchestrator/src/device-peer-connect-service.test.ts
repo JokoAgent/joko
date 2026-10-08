@@ -674,6 +674,135 @@ describe("DevicePeerService Connect boundary", () => {
     await expect(downlink.next()).resolves.toMatchObject({ done: true });
   });
 
+  it("routes display-mode list as read-only and display-mode set as an acknowledged side effect", async () => {
+    const fixture = setup();
+    const request = remoteDesktopHello(fixture.target.deviceId, "hello-display-modes");
+    const downlink = openCommandRoute(fixture.service, request, context(fixture.targetKey));
+    await downlink.next();
+    const uplink = new TestInput<contract.PublishDevicePeerAgentRouteRequest>();
+    uplink.push(attachment(fixture.target.deviceId, 1n, "hello-display-modes"));
+    const published = publishRoute(fixture.service, uplink, context(fixture.targetKey));
+    await expect.poll(() => fixture.routes.getRoute(fixture.target.deviceId)).toBeDefined();
+    const lease = fixture.routes.getRoute(fixture.target.deviceId)!;
+
+    const listCommand = create(contract.DevicePeerCommandSchema, {
+      capability: contract.DevicePeerCapabilityKind.REMOTE_DESKTOP,
+      effect: contract.DevicePeerEffectKind.READ_ONLY,
+      controllerDeviceId: fixture.controller.deviceId,
+      action: {
+        case: "listRemoteDesktopDisplayModes",
+        value: create(contract.DevicePeerListRemoteDesktopDisplayModesActionSchema, { leaseId: "lease-1" })
+      }
+    });
+    const listClaim = fixture.routes.registerClaim({
+      requestId: "display-modes-list",
+      controllerDeviceId: fixture.controller.deviceId,
+      targetDeviceId: fixture.target.deviceId,
+      routeGeneration: lease.routeGeneration,
+      capability: "remote_desktop",
+      effectKind: "read_only",
+      action: "listRemoteDesktopDisplayModes",
+      payload: listCommand
+    });
+    const listed = fixture.routes.dispatch(listClaim);
+    await expect(downlink.next()).resolves.toMatchObject({
+      value: {
+        requestId: "display-modes-list",
+        payload: {
+          case: "command",
+          value: {
+            effect: contract.DevicePeerEffectKind.READ_ONLY,
+            action: { case: "listRemoteDesktopDisplayModes" }
+          }
+        }
+      }
+    });
+    uplink.push(publishAgentResult(fixture.target.deviceId, 1n, "display-modes-list", {
+      phase: contract.DevicePeerResponsePhase.ACCEPTED,
+      sequence: 1n,
+      payload: { case: "acknowledgement", value: create(contract.DevicePeerAcknowledgementSchema) }
+    }));
+    uplink.push(publishAgentResult(fixture.target.deviceId, 1n, "display-modes-list", {
+      phase: contract.DevicePeerResponsePhase.COMPLETED,
+      sequence: 2n,
+      payload: {
+        case: "remoteDesktopDisplayModes",
+        value: create(contract.DevicePeerRemoteDesktopDisplayModesResultSchema, {
+          modes: [create(contract.RemoteDesktopDisplayModeSchema, {
+            modeId: "101",
+            width: 1920,
+            height: 1080,
+            current: true,
+            native: true
+          })]
+        })
+      }
+    }));
+    await expect(listed).resolves.toMatchObject({
+      outcome: "completed",
+      value: { case: "remoteDesktopDisplayModes", value: { modes: [{ modeId: "101" }] } }
+    });
+
+    const setCommand = create(contract.DevicePeerCommandSchema, {
+      capability: contract.DevicePeerCapabilityKind.REMOTE_DESKTOP,
+      effect: contract.DevicePeerEffectKind.SIDE_EFFECT,
+      controllerDeviceId: fixture.controller.deviceId,
+      action: {
+        case: "setRemoteDesktopDisplayMode",
+        value: create(contract.DevicePeerSetRemoteDesktopDisplayModeActionSchema, {
+          leaseId: "lease-1",
+          controlGeneration: 7n,
+          modeId: "101"
+        })
+      }
+    });
+    const setClaim = fixture.routes.registerClaim({
+      requestId: "display-mode-set",
+      controllerDeviceId: fixture.controller.deviceId,
+      targetDeviceId: fixture.target.deviceId,
+      routeGeneration: lease.routeGeneration,
+      capability: "remote_desktop",
+      effectKind: "side_effect",
+      action: "setRemoteDesktopDisplayMode",
+      payload: setCommand
+    });
+    const changed = fixture.routes.dispatch(setClaim);
+    await expect(downlink.next()).resolves.toMatchObject({
+      value: {
+        requestId: "display-mode-set",
+        payload: {
+          case: "command",
+          value: {
+            effect: contract.DevicePeerEffectKind.SIDE_EFFECT,
+            action: {
+              case: "setRemoteDesktopDisplayMode",
+              value: { leaseId: "lease-1", controlGeneration: 7n, modeId: "101" }
+            }
+          }
+        }
+      }
+    });
+    uplink.push(publishAgentResult(fixture.target.deviceId, 1n, "display-mode-set", {
+      phase: contract.DevicePeerResponsePhase.ACCEPTED,
+      sequence: 1n,
+      payload: { case: "acknowledgement", value: create(contract.DevicePeerAcknowledgementSchema) }
+    }));
+    uplink.push(publishAgentResult(fixture.target.deviceId, 1n, "display-mode-set", {
+      phase: contract.DevicePeerResponsePhase.COMPLETED,
+      sequence: 2n,
+      payload: { case: "acknowledgement", value: create(contract.DevicePeerAcknowledgementSchema) }
+    }));
+    await expect(changed).resolves.toMatchObject({
+      outcome: "completed",
+      value: { case: "acknowledgement" }
+    });
+
+    uplink.close();
+    await expect(published).resolves.toBeDefined();
+    await downlink.next();
+    await expect(downlink.next()).resolves.toMatchObject({ done: true });
+  });
+
   it("fences split attachment across replacement and revocation and bounds unattached lifetime", async () => {
     const fixture = setup({ splitRouteAttachmentTimeoutMs: 30 });
     const first = openCommandRoute(

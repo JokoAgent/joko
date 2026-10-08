@@ -168,6 +168,7 @@ export function createRemoteDesktopConnectService(
         leaseId: request.leaseId,
         attemptId: request.attemptId,
         offerSdp: request.offerSdp,
+        cursorOverlay: request.cursorOverlay,
         ...(request.settings === undefined ? {} : { settings: request.settings })
       }, context.signal);
       dependencies.connections.fence(connection);
@@ -196,11 +197,44 @@ export function createRemoteDesktopConnectService(
     getRemoteDesktopFrame: (request, context) => remoteDesktopRpc(async () => {
       const connection = authenticate(dependencies.connections, context);
       const peer = fromProtoRouteIdentity(request.peer);
-      const result = await dependencies.coordinator.getFrame(connection, peer, request.leaseId, context.signal);
+      const result = await dependencies.coordinator.getFrame(connection, peer, {
+        leaseId: request.leaseId,
+        cursorOverlay: request.cursorOverlay
+      }, context.signal);
       dependencies.connections.fence(connection);
       return create(contract.GetRemoteDesktopFrameResponseSchema, {
         peer: toProtoRouteIdentity(peer),
         result
+      });
+    }),
+
+    listRemoteDesktopDisplayModes: (request, context) => remoteDesktopRpc(async () => {
+      const connection = authenticate(dependencies.connections, context);
+      const peer = fromProtoRouteIdentity(request.peer);
+      const modes = await dependencies.coordinator.listDisplayModes(
+        connection,
+        peer,
+        request.leaseId,
+        context.signal
+      );
+      dependencies.connections.fence(connection);
+      return create(contract.ListRemoteDesktopDisplayModesResponseSchema, {
+        peer: toProtoRouteIdentity(peer),
+        modes: [...modes]
+      });
+    }),
+
+    setRemoteDesktopDisplayMode: (request, context) => remoteDesktopRpc(async () => {
+      const connection = authenticate(dependencies.connections, context);
+      const peer = fromProtoRouteIdentity(request.peer);
+      await dependencies.coordinator.setDisplayMode(connection, peer, {
+        leaseId: request.leaseId,
+        controlGeneration: request.controlGeneration,
+        modeId: request.modeId
+      }, context.signal);
+      dependencies.connections.fence(connection);
+      return create(contract.SetRemoteDesktopDisplayModeResponseSchema, {
+        peer: toProtoRouteIdentity(peer)
       });
     }),
 

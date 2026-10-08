@@ -1,6 +1,10 @@
 import { create, toBinary } from "@bufbuild/protobuf";
 import * as contract from "@joko/contracts";
-import type { DevicePeerMultiplexEvent, DevicePeerResponseFrame } from "@joko/device-peer";
+import {
+  isBoundedRemoteDesktopCursorPng,
+  type DevicePeerMultiplexEvent,
+  type DevicePeerResponseFrame
+} from "@joko/device-peer";
 import type { ConnectionRecord } from "@joko/store";
 
 import {
@@ -27,6 +31,8 @@ const MAXIMUM_ICE_CANDIDATES = 16;
 const MAXIMUM_ICE_CURSOR = 128;
 const MAXIMUM_ICE_CANDIDATE_LENGTH = 2_048;
 const MAXIMUM_JPEG_BYTES = 180_000;
+const MAXIMUM_DISPLAY_MODES = 256;
+const MAXIMUM_CURSOR_EDGE = 256;
 const MAXIMUM_ICE_SERVERS = 8;
 const MAXIMUM_ICE_URLS = 8;
 const MAXIMUM_ICE_FIELD_LENGTH = 2_048;
@@ -64,6 +70,12 @@ export class RemoteDesktopCoordinatorError extends Error {
   }
 }
 
+/** A Device-peer ABORTED frame proves the target did not accept the effect. */
+class RemoteDesktopDispatchAbortedError extends RemoteDesktopCoordinatorError {}
+
+/** Once accepted, even a typed failure detail cannot make an unknown outcome reusable. */
+class RemoteDesktopOutcomeUnknownError extends RemoteDesktopCoordinatorError {}
+
 export interface RemoteDesktopIceConfigurationProvider {
   getConfiguration(input: {
     readonly controllerDeviceId: string;
@@ -98,6 +110,7 @@ interface RemoteDesktopLeaseState {
   presentationProofSequence: bigint;
   presentationTimer?: ReturnType<typeof setTimeout>;
   presentationAbort?: AbortController;
+  displayModePending: boolean;
 }
 
 interface RemoteDesktopStartFence {
@@ -263,7 +276,8 @@ export class RemoteDesktopCoordinator {
         timer: setTimeout(() => undefined, REMOTE_DESKTOP_LEASE_MS),
         presentation: false,
         presentationEpoch: 0,
-        presentationProofSequence: 0n
+        presentationProofSequence: 0n,
+        displayModePending: false
       };
       clearTimeout(state.timer);
       state.timer = this.#leaseTimer(state);
@@ -447,6 +461,7 @@ export class RemoteDesktopCoordinator {
       readonly attemptId: string;
       readonly offerSdp: string;
       readonly settings?: contract.RemoteDesktopVideoSettings;
+      readonly cursorOverlay: boolean;
     },
     signal: AbortSignal
   ): Promise<contract.RemoteDesktopOfferResult> {
@@ -454,6 +469,9 @@ export class RemoteDesktopCoordinator {
     validateAttemptId(input.attemptId);
     validateSdp(input.offerSdp, "offer_sdp");
     if (input.settings !== undefined) validateVideoSettings(input.settings);
+    if (typeof input.cursorOverlay !== "boolean") {
+      throw invalidArgument("Remote Desktop cursor overlay selection is invalid.");
+    }
     const authority = this.#capture(connection, identity);
     const value = await this.#runLeaseBound(state, connection, identity, authority, () =>
       this.#dispatch<contract.RemoteDesktopOfferResult>(authority, remoteDesktopCommand(
@@ -500,22 +518,104 @@ export class RemoteDesktopCoordinator {
   async getFrame(
     connection: ConnectionRecord,
     identity: DevicePeerSelectionIdentity,
-    leaseId: string,
+    input: { readonly leaseId: string; readonly cursorOverlay: boolean },
     signal: AbortSignal
   ): Promise<contract.RemoteDesktopFrameResult> {
-    const state = this.#requireLease(connection, identity, leaseId);
+    const state = this.#requireLease(connection, identity, input.leaseId);
+    if (typeof input.cursorOverlay !== "boolean") {
+      throw invalidArgument("Remote Desktop cursor overlay selection is invalid.");
+    }
     const authority = this.#capture(connection, identity);
     const value = await this.#runLeaseBound(state, connection, identity, authority, () =>
       this.#dispatch<contract.RemoteDesktopFrameResult>(authority, remoteDesktopCommand(
         "getRemoteDesktopFrame",
-        create(contract.DevicePeerGetRemoteDesktopFrameActionSchema, { leaseId }),
+        create(contract.DevicePeerGetRemoteDesktopFrameActionSchema, input),
         "read_only"
       ), signal, "remoteDesktopFrame", "joko.v1.RemoteDesktopFrameResult"));
     if (value.frame !== undefined
       && (value.frame.jpeg.byteLength < 1 || value.frame.jpeg.byteLength > MAXIMUM_JPEG_BYTES)) {
       throw invalidTargetResponse();
     }
+    if (value.frame?.cursor !== undefined) validateCursor(value.frame.cursor);
     return value;
+  }
+
+  async listDisplayModes(
+    connection: ConnectionRecord,
+    identity: DevicePeerSelectionIdentity,
+    leaseId: string,
+    signal: AbortSignal
+  ): Promise<readonly contract.RemoteDesktopDisplayMode[]> {
+    const state = this.#requireLease(connection, identity, leaseId);
+    const authority = this.#capture(connection, identity);
+    const value = await this.#runLeaseBound(state, connection, identity, authority, () =>
+      this.#dispatch<contract.DevicePeerRemoteDesktopDisplayModesResult>(
+        authority,
+        remoteDesktopCommand(
+          "listRemoteDesktopDisplayModes",
+          create(contract.DevicePeerListRemoteDesktopDisplayModesActionSchema, { leaseId }),
+          "read_only"
+        ),
+        signal,
+        "remoteDesktopDisplayModes",
+        "joko.v1.DevicePeerRemoteDesktopDisplayModesResult"
+      ));
+    validateDisplayModes(value.modes);
+    return Object.freeze([...value.modes]);
+  }
+
+  async setDisplayMode(
+    connection: ConnectionRecord,
+    identity: DevicePeerSelectionIdentity,
+    input: {
+      readonly leaseId: string;
+      readonly controlGeneration: bigint;
+      readonly modeId: string;
+    },
+    signal: AbortSignal
+  ): Promise<void> {
+    const state = this.#requireControlLease(
+      connection,
+      identity,
+      input.leaseId,
+      input.controlGeneration,
+      contract.RemoteDesktopFailureReason.LEASE_EXPIRED
+    );
+    validateDisplayModeId(input.modeId);
+    if (state.displayModePending) {
+      throw leaseFailure(contract.RemoteDesktopFailureReason.DISPLAY_BUSY);
+    }
+    const authority = this.#capture(connection, identity);
+    state.displayModePending = true;
+    try {
+      await this.#runControlBound(
+        state,
+        connection,
+        identity,
+        authority,
+        input.controlGeneration,
+        () => this.#dispatch<contract.DevicePeerAcknowledgement>(
+          authority,
+          remoteDesktopCommand(
+            "setRemoteDesktopDisplayMode",
+            create(contract.DevicePeerSetRemoteDesktopDisplayModeActionSchema, input),
+            "side_effect"
+          ),
+          signal,
+          "acknowledgement",
+          "joko.v1.DevicePeerAcknowledgement"
+        )
+      );
+    } catch (error) {
+      if (displayModeFailureRequiresRetirement(error)) this.#forget(state);
+      throw error;
+    } finally {
+      state.displayModePending = false;
+    }
+    // A geometry write is terminal for its old coordinate/media authority.
+    // The target retires before native mutation; mirror that only after a
+    // completed response so known pre-effect failures can leave the lease.
+    this.#forget(state);
   }
 
   async transferClipboardText(
@@ -631,7 +731,8 @@ export class RemoteDesktopCoordinator {
     connection: ConnectionRecord,
     identity: DevicePeerSelectionIdentity,
     leaseId: string,
-    controlGeneration: bigint
+    controlGeneration: bigint,
+    staleReason = contract.RemoteDesktopFailureReason.CLIPBOARD_EXPIRED
   ): RemoteDesktopLeaseState {
     if (controlGeneration < 1n) {
       throw invalidArgument("Remote Desktop control generation is required.");
@@ -639,7 +740,7 @@ export class RemoteDesktopCoordinator {
     const state = this.#requireLease(connection, identity, leaseId);
     if (!state.controlling) throw leaseFailure(contract.RemoteDesktopFailureReason.VIEW_ONLY);
     if (state.controlGeneration !== controlGeneration) {
-      throw leaseFailure(contract.RemoteDesktopFailureReason.CLIPBOARD_EXPIRED);
+      throw leaseFailure(staleReason);
     }
     return state;
   }
@@ -977,7 +1078,8 @@ type RemoteDesktopActionCase = Extract<
     | `stopRemoteDesktop` | `setRemoteDesktopControl` | `sendRemoteDesktopInput`
     | `setRemoteDesktopPresentation` | `probeRemoteDesktopPresentation`
     | `createRemoteDesktopOffer` | `exchangeRemoteDesktopIce`
-    | `transferRemoteDesktopClipboardText` | `transferRemoteDesktopClipboardContent` }
+    | `transferRemoteDesktopClipboardText` | `transferRemoteDesktopClipboardContent`
+    | `listRemoteDesktopDisplayModes` | `setRemoteDesktopDisplayMode` }
 >["case"];
 
 function remoteDesktopCommand<TCase extends RemoteDesktopActionCase>(
@@ -1007,10 +1109,10 @@ function responseValue<T>(
       return value as T;
     }
     case "aborted":
-      throw new RemoteDesktopCoordinatorError("cancelled", "Remote Desktop request was cancelled.");
+      throw new RemoteDesktopDispatchAbortedError("cancelled", "Remote Desktop request was cancelled.");
     case "outcome_unknown": {
       const detail = remoteDesktopFailureDetail(response.failure);
-      throw new RemoteDesktopCoordinatorError(
+      throw new RemoteDesktopOutcomeUnknownError(
         "aborted",
         "Remote Desktop request outcome is unknown.",
         detail
@@ -1033,10 +1135,12 @@ function remoteDesktopFailureDetail(value: unknown): contract.RemoteDesktopFailu
 
 function remoteDesktopTargetFailure(detail: contract.RemoteDesktopFailure): RemoteDesktopCoordinatorError {
   const code: RemoteDesktopCoordinatorErrorCode = detail.reason === contract.RemoteDesktopFailureReason.DISPLAY_MISSING
+    || detail.reason === contract.RemoteDesktopFailureReason.DISPLAY_MODE_MISSING
     ? "not_found"
     : detail.reason === contract.RemoteDesktopFailureReason.AUTHORITY_CHANGED
       ? "aborted"
       : detail.reason === contract.RemoteDesktopFailureReason.UNSUPPORTED
+        || detail.reason === contract.RemoteDesktopFailureReason.DISPLAY_MODES_UNAVAILABLE
         ? "unimplemented"
         : detail.reason === contract.RemoteDesktopFailureReason.VIDEO_TIMEOUT
           || detail.reason === contract.RemoteDesktopFailureReason.AUDIO_UNAVAILABLE
@@ -1060,7 +1164,11 @@ function validateCapabilities(value: contract.RemoteDesktopCapabilities): void {
     || value.displays.length > MAXIMUM_DISPLAYS || value.permissions === undefined
     || typeof value.clipboardText !== "boolean" || typeof value.clipboardContent !== "boolean"
     || typeof value.videoSettings !== "boolean" || typeof value.systemAudio !== "boolean"
-    || typeof value.backgroundViewing !== "boolean") {
+    || typeof value.backgroundViewing !== "boolean" || typeof value.displayModes !== "boolean"
+    || typeof value.cursorOverlay !== "boolean") {
+    throw invalidTargetResponse();
+  }
+  if (value.platform !== "darwin" && (value.displayModes || value.cursorOverlay)) {
     throw invalidTargetResponse();
   }
   for (const display of value.displays) validateDisplay(display);
@@ -1221,6 +1329,41 @@ function validateDisplay(value: contract.RemoteDesktopDisplay): void {
     || value.width > MAXIMUM_DISPLAY_EDGE || value.height > MAXIMUM_DISPLAY_EDGE) throw invalidTargetResponse();
 }
 
+function validateDisplayModeId(value: string): void {
+  if (!/^[0-9]{1,10}$/u.test(value)) {
+    throw invalidArgument("Remote Desktop display mode is invalid.");
+  }
+}
+
+function validateDisplayModes(values: readonly contract.RemoteDesktopDisplayMode[]): void {
+  if (values.length < 1 || values.length > MAXIMUM_DISPLAY_MODES) throw invalidTargetResponse();
+  const ids = new Set<string>();
+  let current = 0;
+  for (const value of values) {
+    if (!/^[0-9]{1,10}$/u.test(value.modeId)
+      || !Number.isInteger(value.width) || value.width < 1 || value.width > MAXIMUM_DISPLAY_EDGE
+      || !Number.isInteger(value.height) || value.height < 1 || value.height > MAXIMUM_DISPLAY_EDGE
+      || typeof value.current !== "boolean" || typeof value.native !== "boolean"
+      || ids.has(value.modeId)) throw invalidTargetResponse();
+    ids.add(value.modeId);
+    if (value.current) current += 1;
+  }
+  if (current !== 1) throw invalidTargetResponse();
+}
+
+function validateCursor(value: contract.RemoteDesktopCursor): void {
+  if (typeof value.visible !== "boolean"
+    || !Number.isFinite(value.x) || value.x < 0 || value.x > 1
+    || !Number.isFinite(value.y) || value.y < 0 || value.y > 1
+    || !Number.isFinite(value.width) || value.width <= 0 || value.width > MAXIMUM_CURSOR_EDGE
+    || !Number.isFinite(value.height) || value.height <= 0 || value.height > MAXIMUM_CURSOR_EDGE
+    || !Number.isFinite(value.hotX) || value.hotX < 0 || value.hotX > value.width
+    || !Number.isFinite(value.hotY) || value.hotY < 0 || value.hotY > value.height
+    || !isBoundedRemoteDesktopCursorPng(value.png)) {
+    throw invalidTargetResponse();
+  }
+}
+
 function validateInput(sequence: bigint, events: readonly contract.RemoteDesktopInputEvent[]): void {
   if (sequence < 1n || events.length < 1 || events.length > MAXIMUM_INPUT_EVENTS) {
     throw invalidArgument("Remote Desktop input sequence or event count is invalid.");
@@ -1379,4 +1522,14 @@ function presentationProbeRequiresRetirement(error: unknown): boolean {
   return error.detail?.reason === contract.RemoteDesktopFailureReason.STOPPED
     || error.detail?.reason === contract.RemoteDesktopFailureReason.LEASE_EXPIRED
     || error.detail?.reason === contract.RemoteDesktopFailureReason.AUTHORITY_CHANGED;
+}
+
+function displayModeFailureRequiresRetirement(error: unknown): boolean {
+  if (error instanceof RemoteDesktopOutcomeUnknownError) return true;
+  if (error instanceof RemoteDesktopDispatchAbortedError) return false;
+  if (!(error instanceof RemoteDesktopCoordinatorError)) return true;
+  return error.detail?.reason !== contract.RemoteDesktopFailureReason.DISPLAY_MODES_UNAVAILABLE
+    && error.detail?.reason !== contract.RemoteDesktopFailureReason.DISPLAY_MODE_MISSING
+    && error.detail?.reason !== contract.RemoteDesktopFailureReason.DISPLAY_BUSY
+    && error.detail?.reason !== contract.RemoteDesktopFailureReason.VIEW_ONLY;
 }

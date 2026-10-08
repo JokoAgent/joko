@@ -299,7 +299,8 @@ test("device-peer contracts fence exact authority and keep workspace locations d
     "stop_remote_desktop", "set_remote_desktop_control", "send_remote_desktop_input",
     "create_remote_desktop_offer", "exchange_remote_desktop_ice", "get_remote_desktop_frame",
     "transfer_remote_desktop_clipboard_text", "transfer_remote_desktop_clipboard_content",
-    "set_remote_desktop_presentation", "probe_remote_desktop_presentation"
+    "set_remote_desktop_presentation", "probe_remote_desktop_presentation",
+    "list_remote_desktop_display_modes", "set_remote_desktop_display_mode"
   ]);
   assert.deepEqual(oneofMembers(contract.DevicePeerAgentResultSchema, "payload"), [
     "acknowledgement", "recent_directories", "directories", "directory_inspection", "directory_created",
@@ -312,7 +313,8 @@ test("device-peer contracts fence exact authority and keep workspace locations d
     "remote_desktop_capabilities", "remote_desktop_permissions", "remote_desktop_lease",
     "remote_desktop_control_state", "remote_desktop_offer", "remote_desktop_ice",
     "remote_desktop_frame", "remote_desktop_clipboard_text",
-    "remote_desktop_clipboard_content", "remote_desktop_presentation_proof", "failure"
+    "remote_desktop_clipboard_content", "remote_desktop_presentation_proof",
+    "remote_desktop_display_modes", "failure"
   ]);
   assert.deepEqual([...fieldNames(contract.OpenDevicePeerAgentRouteRequestSchema)], [
     "target_device_id", "route_generation", "request_id", "hello", "result", "heartbeat"
@@ -384,6 +386,8 @@ test("Remote Desktop keeps public controller identity implicit and target comman
       ["createRemoteDesktopOffer", "unary"],
       ["exchangeRemoteDesktopIce", "unary"],
       ["getRemoteDesktopFrame", "unary"],
+      ["listRemoteDesktopDisplayModes", "unary"],
+      ["setRemoteDesktopDisplayMode", "unary"],
       ["transferRemoteDesktopClipboardText", "unary"],
       ["transferRemoteDesktopClipboardContent", "unary"]
     ]
@@ -403,6 +407,8 @@ test("Remote Desktop keeps public controller identity implicit and target comman
     contract.CreateRemoteDesktopOfferRequestSchema,
     contract.ExchangeRemoteDesktopIceRequestSchema,
     contract.GetRemoteDesktopFrameRequestSchema,
+    contract.ListRemoteDesktopDisplayModesRequestSchema,
+    contract.SetRemoteDesktopDisplayModeRequestSchema,
     contract.TransferRemoteDesktopClipboardTextRequestSchema,
     contract.TransferRemoteDesktopClipboardContentRequestSchema
   ];
@@ -434,17 +440,28 @@ test("Remote Desktop keeps public controller identity implicit and target comman
   assert.equal(field(contract.RemoteDesktopControlStateSchema, "control_generation").number, 2);
   assert.deepEqual([...fieldNames(contract.RemoteDesktopVideoSettingsSchema)], ["fps", "bitrate", "audio"]);
   assert.deepEqual([...fieldNames(contract.RemoteDesktopPresentationProofSchema)], ["lease_id", "proof_sequence"]);
+  assert.deepEqual([...fieldNames(contract.RemoteDesktopDisplayModeSchema)], [
+    "mode_id", "width", "height", "current", "native"
+  ]);
+  assert.deepEqual([...fieldNames(contract.RemoteDesktopCursorSchema)], [
+    "visible", "x", "y", "width", "height", "hot_x", "hot_y", "png"
+  ]);
+  assert.equal(field(contract.RemoteDesktopFrameSchema, "cursor").message.typeName,
+    "joko.v1.RemoteDesktopCursor");
   assert.equal(field(contract.CreateRemoteDesktopOfferRequestSchema, "settings").message.typeName,
     "joko.v1.RemoteDesktopVideoSettings");
   assert.equal(field(contract.DevicePeerCreateRemoteDesktopOfferActionSchema, "settings").message.typeName,
     "joko.v1.RemoteDesktopVideoSettings");
   assert.equal(contract.RemoteDesktopFailureReason.AUDIO_UNAVAILABLE, 23);
+  assert.equal(contract.RemoteDesktopFailureReason.DISPLAY_MODES_UNAVAILABLE, 24);
+  assert.equal(contract.RemoteDesktopFailureReason.DISPLAY_MODE_MISSING, 25);
+  assert.equal(contract.RemoteDesktopFailureReason.DISPLAY_BUSY, 26);
   assert.deepEqual(
-    ["video_settings", "system_audio", "background_viewing"].map((name) => field(
+    ["video_settings", "system_audio", "background_viewing", "display_modes", "cursor_overlay"].map((name) => field(
       contract.RemoteDesktopCapabilitiesSchema,
       name
     ).number),
-    [14, 15, 16]
+    [14, 15, 16, 17, 18]
   );
   assertNoFields([
     contract.StartRemoteDesktopRequestSchema,

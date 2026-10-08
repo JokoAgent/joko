@@ -24,6 +24,8 @@ service RemoteDesktopService {
   rpc CreateRemoteDesktopOffer(CreateRemoteDesktopOfferRequest) returns (CreateRemoteDesktopOfferResponse);
   rpc ExchangeRemoteDesktopIce(ExchangeRemoteDesktopIceRequest) returns (ExchangeRemoteDesktopIceResponse);
   rpc GetRemoteDesktopFrame(GetRemoteDesktopFrameRequest) returns (GetRemoteDesktopFrameResponse);
+  rpc ListRemoteDesktopDisplayModes(ListRemoteDesktopDisplayModesRequest) returns (ListRemoteDesktopDisplayModesResponse);
+  rpc SetRemoteDesktopDisplayMode(SetRemoteDesktopDisplayModeRequest) returns (SetRemoteDesktopDisplayModeResponse);
   rpc TransferRemoteDesktopClipboardText(TransferRemoteDesktopClipboardTextRequest) returns (TransferRemoteDesktopClipboardTextResponse);
   rpc TransferRemoteDesktopClipboardContent(TransferRemoteDesktopClipboardContentRequest) returns (TransferRemoteDesktopClipboardContentResponse);
 }
@@ -143,6 +145,7 @@ message CreateRemoteDesktopOfferRequest {
   string attempt_id = 3;
   string offer_sdp = 4;
   RemoteDesktopVideoSettings settings = 5;
+  bool cursor_overlay = 6;
 }
 
 message CreateRemoteDesktopOfferResponse {
@@ -166,11 +169,35 @@ message ExchangeRemoteDesktopIceResponse {
 message GetRemoteDesktopFrameRequest {
   DevicePeerRouteIdentity peer = 1;
   string lease_id = 2;
+  bool cursor_overlay = 3;
 }
 
 message GetRemoteDesktopFrameResponse {
   DevicePeerRouteIdentity peer = 1;
   RemoteDesktopFrameResult result = 2;
+}
+
+message ListRemoteDesktopDisplayModesRequest {
+  DevicePeerRouteIdentity peer = 1;
+  string lease_id = 2;
+}
+
+message ListRemoteDesktopDisplayModesResponse {
+  DevicePeerRouteIdentity peer = 1;
+  repeated RemoteDesktopDisplayMode modes = 2;
+}
+
+// Changing display geometry is terminal for the old lease. The caller must
+// start a fresh lease after either success or an outcome-unknown response.
+message SetRemoteDesktopDisplayModeRequest {
+  DevicePeerRouteIdentity peer = 1;
+  string lease_id = 2;
+  uint64 control_generation = 3;
+  string mode_id = 4;
+}
+
+message SetRemoteDesktopDisplayModeResponse {
+  DevicePeerRouteIdentity peer = 1;
 }
 
 message TransferRemoteDesktopClipboardTextRequest {
