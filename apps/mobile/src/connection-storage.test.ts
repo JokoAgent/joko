@@ -371,12 +371,20 @@ describe("current-v1 mobile connection storage", () => {
       { operationId: "extension-enabled", connectionId: first.connectionId, kind: "extension-enabled" as const,
         extensionId, extensionRevision: "7", state: "unknown" as const },
       { operationId: "extension-sidebar", connectionId: first.connectionId, kind: "extension-sidebar" as const,
-        extensionId, extensionRevision: "8", state: "accepted" as const }
+        extensionId, extensionRevision: "8", state: "accepted" as const },
+      ...(["begin", "interaction", "credential", "complete", "cancel", "revoke"] as const).map((kind, index) => ({
+        operationId: `extension-setup-${kind}`,
+        connectionId: first.connectionId,
+        kind: `extension-setup-${kind}` as const,
+        extensionId,
+        extensionRevision: String(9 + index),
+        state: index % 2 === 0 ? "unknown" as const : "accepted" as const
+      }))
     ];
 
     await storage.savePending(receipts);
     await expect(storage.loadPending()).resolves.toEqual(receipts);
-    expect(memory.plainValues.get("joko.mobile.pending.v1")).not.toContain("enabledValue");
+    expect(memory.plainValues.get("joko.mobile.pending.v1")).not.toMatch(/enabledValue|secret-value|ticket-id|field-id/u);
 
     memory.plainValues.set("joko.mobile.pending.v1", JSON.stringify([
       ...receipts,
@@ -386,6 +394,9 @@ describe("current-v1 mobile connection storage", () => {
       { ...receipts[0], operationId: "zero-revision", extensionRevision: "0" },
       { ...receipts[0], operationId: "unexpected-session", sessionId: "session-one" },
       { ...receipts[0], operationId: "unexpected-body", enabledValue: false },
+      { ...receipts[4], operationId: "setup-secret", secret: "secret-value" },
+      { ...receipts[4], operationId: "setup-ticket", credentialUploadTicketId: "ticket-id" },
+      { ...receipts[3], operationId: "setup-field", fieldId: "field-id" },
       { operationId: "metadata-on-send", connectionId: first.connectionId, kind: "send",
         sessionId: "session-one", extensionId, extensionRevision: "7", state: "unknown" }
     ]));

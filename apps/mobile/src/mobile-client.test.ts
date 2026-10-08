@@ -951,6 +951,7 @@ function fakeNetwork(): MobileNetwork {
     listPartnerSessions: vi.fn(async () => create(ListPartnerSessionsResponseSchema, { sessions: [] })),
     listExtensions: vi.fn(async () => ({ revision: 1n, recoveredFromCorruption: false, extensions: [] })),
     getExtension: vi.fn(async () => { throw new Error("No Extension fixture was configured."); }),
+    uploadExtensionSetupCredential: vi.fn(async () => { throw new Error("No Extension credential fixture was configured."); }),
     listPartnerPrivateThreads: vi.fn(async () => []),
     getPartnerPrivateThread: vi.fn(async () => { throw new Error("No private thread fixture was configured."); }),
     markPartnerPrivateThreadRead: vi.fn(async () => { throw new Error("No private read fixture was configured."); }),
@@ -1912,6 +1913,264 @@ describe("mobile Extension catalog authority", () => {
     expect(saved.pending()).toEqual([]);
     expect(network.getExtension).toHaveBeenCalledTimes(4);
     expect(network.listExtensions).toHaveBeenCalledTimes(2);
+  });
+
+  it("runs the complete Extension setup, protected credential, completion, revoke, retry, and cancel lifecycle", async () => {
+    const network = fakeNetwork();
+    const saved = memoryStorage(credential);
+    let attemptSequence = 0;
+    let extension: MobileExtension = {
+      ...mobileExtensionFixture(),
+      setup: {
+        state: "required",
+        revision: 0n,
+        fields: [
+          { fieldId: "region", label: "Region", description: "Service region", kind: "text", required: true,
+            configured: false, options: ["east", "west"] },
+          { fieldId: "terms", label: "Terms", description: "Accept terms", kind: "confirmation", required: true,
+            configured: false, options: [] },
+          { fieldId: "token", label: "Token", description: "Protected token", kind: "secret", required: true,
+            configured: false, options: [] }
+        ]
+      }
+    };
+    network.listExtensions = vi.fn(async () => ({
+      revision: extension.revision,
+      recoveredFromCorruption: false,
+      extensions: [extension]
+    }));
+    network.getExtension = vi.fn(async () => extension);
+    network.uploadExtensionSetupCredential = vi.fn(async (
+      exactCredential,
+      extensionId,
+      attemptId,
+      fieldId,
+      kind,
+      secret
+    ) => {
+      expect(exactCredential).toBe(credential);
+      expect({ extensionId, attemptId, fieldId, kind, secret }).toEqual({
+        extensionId: extension.extensionId,
+        attemptId: extension.setup.attemptId,
+        fieldId: "token",
+        kind: "apiKey",
+        secret: "temporary-private-value"
+      });
+      return "credential-ticket";
+    });
+    const receipts: PendingOperation[] = [];
+    network.submit = vi.fn(async (_credential, operationId, mutation) => {
+      toBinary(OperationMutationSchema, mutation);
+      const receipt = saved.pending()[0]!;
+      receipts.push({ ...receipt });
+      expect(Object.keys(receipt).sort()).toEqual([
+        "connectionId", "extensionId", "extensionRevision", "kind", "operationId", "state"
+      ]);
+      const revision = extension.revision;
+      const setupRevision = extension.setup.revision + 1n;
+      const fields = extension.setup.fields.map((field) => ({ ...field }));
+      switch (mutation.payload.case) {
+        case "beginExtensionSetup": {
+          expect(mutation.payload.value).toMatchObject({
+            extensionId: extension.extensionId,
+            expectedRevision: { value: revision }
+          });
+          attemptSequence += 1;
+          extension = { ...extension, revision: revision + 1n, setup: {
+            state: "inProgress", attemptId: `attempt-${attemptSequence}`, revision: setupRevision,
+            fields: fields.map((field) => ({ ...field, configured: false }))
+          } };
+          break;
+        }
+        case "submitExtensionSetupInteraction": {
+          expect(mutation.payload.value).toMatchObject({
+            extensionId: extension.extensionId,
+            attemptId: extension.setup.attemptId,
+            expectedRevision: { value: revision }
+          });
+          const fieldId = mutation.payload.value.fieldId;
+          const configured = mutation.payload.value.value.case === "confirmed"
+            ? mutation.payload.value.value.value
+            : true;
+          extension = { ...extension, revision: revision + 1n, setup: { ...extension.setup,
+            revision: setupRevision,
+            fields: fields.map((field) => field.fieldId === fieldId ? { ...field, configured } : field)
+          } };
+          break;
+        }
+        case "commitExtensionSetupCredential": {
+          expect(mutation.payload.value).toMatchObject({
+            extensionId: extension.extensionId,
+            attemptId: extension.setup.attemptId,
+            fieldId: "token",
+            credentialUploadTicketId: "credential-ticket",
+            expectedRevision: { value: revision }
+          });
+          extension = { ...extension, revision: revision + 1n, setup: { ...extension.setup,
+            revision: setupRevision,
+            fields: fields.map((field) => field.fieldId === "token" ? { ...field, configured: true } : field)
+          } };
+          break;
+        }
+        case "completeExtensionSetup":
+          expect(mutation.payload.value).toMatchObject({ attemptId: extension.setup.attemptId,
+            expectedRevision: { value: revision } });
+          extension = { ...extension, revision: revision + 1n,
+            setup: { ...extension.setup, state: "ready", revision: setupRevision } };
+          break;
+        case "revokeExtensionSetup":
+          expect(mutation.payload.value.expectedRevision?.value).toBe(revision);
+          extension = { ...extension, revision: revision + 1n, setup: { state: "required", revision: setupRevision,
+            fields: fields.map((field) => ({ ...field, configured: false })) } };
+          break;
+        case "cancelExtensionSetup":
+          expect(mutation.payload.value).toMatchObject({ attemptId: extension.setup.attemptId,
+            expectedRevision: { value: revision } });
+          extension = { ...extension, revision: revision + 1n,
+            setup: { ...extension.setup, state: "cancelled", revision: setupRevision } };
+          break;
+        default: throw new Error(`Unexpected Extension setup mutation: ${mutation.payload.case}`);
+      }
+      return create(OperationSchema, {
+        operationId,
+        connectionId: credential.connectionId,
+        state: OperationState.SUCCEEDED,
+        result: { payload: { case: "acknowledgement", value: create(AcknowledgementSchema, { accepted: true }) } }
+      });
+    });
+    let sequence = 0;
+    const app = client(network, saved.storage, undefined, undefined, () => `extension-setup-${++sequence}`);
+    await app.start();
+    const signal = new AbortController().signal;
+
+    let result = await app.extensionCatalogTransport()!.beginSetup(extension, signal);
+    expect(result.extension.setup).toMatchObject({ state: "inProgress", attemptId: "attempt-1" });
+    result = await app.extensionCatalogTransport()!.submitSetupInteraction(result.extension, "region", " west ", signal);
+    result = await app.extensionCatalogTransport()!.submitSetupInteraction(result.extension, "terms", true, signal);
+    result = await app.extensionCatalogTransport()!.saveSetupCredential(
+      result.extension, "token", "apiKey", "temporary-private-value", signal
+    );
+    expect(result.extension.setup.fields.every((field) => field.configured)).toBe(true);
+    result = await app.extensionCatalogTransport()!.completeSetup(result.extension, signal);
+    expect(result.extension.setup.state).toBe("ready");
+    result = await app.extensionCatalogTransport()!.revokeSetup(result.extension, signal);
+    expect(result.extension.setup).toMatchObject({ state: "required" });
+    result = await app.extensionCatalogTransport()!.beginSetup(result.extension, signal);
+    result = await app.extensionCatalogTransport()!.cancelSetup(result.extension, signal);
+    expect(result.extension.setup.state).toBe("cancelled");
+
+    expect(receipts.map((receipt) => receipt.kind)).toEqual([
+      "extension-setup-begin",
+      "extension-setup-interaction",
+      "extension-setup-interaction",
+      "extension-setup-credential",
+      "extension-setup-complete",
+      "extension-setup-revoke",
+      "extension-setup-begin",
+      "extension-setup-cancel"
+    ]);
+    expect(JSON.stringify(receipts)).not.toMatch(/temporary-private-value|credential-ticket|region|terms|token|west/u);
+    expect(saved.pending()).toEqual([]);
+    expect(network.uploadExtensionSetupCredential).toHaveBeenCalledOnce();
+  });
+
+  it("retains an unknown setup credential commit without retaining or replaying its secret or ticket", async () => {
+    const network = fakeNetwork();
+    const saved = memoryStorage(credential);
+    const extension: MobileExtension = { ...mobileExtensionFixture(), setup: {
+      state: "inProgress",
+      attemptId: "attempt-1",
+      revision: 1n,
+      fields: [{ fieldId: "token", label: "Token", description: "Protected token", kind: "secret",
+        required: true, configured: false, options: [] }]
+    } };
+    network.getExtension = vi.fn(async () => extension);
+    network.listExtensions = vi.fn(async () => ({ revision: 2n, recoveredFromCorruption: false, extensions: [extension] }));
+    network.uploadExtensionSetupCredential = vi.fn(async () => "credential-ticket");
+    vi.mocked(network.submit).mockRejectedValueOnce(new Error("transport closed"));
+    const app = client(network, saved.storage, undefined, undefined, () => "extension-setup-unknown");
+    await app.start();
+    const signal = new AbortController().signal;
+
+    await expect(app.extensionCatalogTransport()!.saveSetupCredential(
+      extension, "token", "apiKey", "temporary-private-value", signal
+    )).rejects.toThrow(/unknown/u);
+    expect(saved.pending()).toEqual([expect.objectContaining({
+      operationId: "extension-setup-unknown",
+      kind: "extension-setup-credential",
+      extensionId: extension.extensionId,
+      extensionRevision: "1",
+      state: "unknown"
+    })]);
+    expect(JSON.stringify(saved.pending())).not.toMatch(/temporary-private-value|credential-ticket|token/u);
+
+    await expect(app.extensionCatalogTransport()!.saveSetupCredential(
+      extension, "token", "apiKey", "temporary-private-value", signal
+    )).rejects.toThrow(/unresolved result/u);
+    expect(network.uploadExtensionSetupCredential).toHaveBeenCalledOnce();
+    expect(network.submit).toHaveBeenCalledOnce();
+  });
+
+  it("fails closed on incomplete or mismatched setup fields before upload or durable dispatch", async () => {
+    const network = fakeNetwork();
+    const extension: MobileExtension = { ...mobileExtensionFixture(), setup: {
+      state: "inProgress",
+      attemptId: "attempt-1",
+      revision: 1n,
+      fields: [
+        { fieldId: "region", label: "Region", description: "Region", kind: "text", required: true,
+          configured: false, options: ["east", "west"] },
+        { fieldId: "oauth", label: "OAuth", description: "OAuth token", kind: "oauth", required: true,
+          configured: false, options: [] }
+      ]
+    } };
+    network.getExtension = vi.fn(async () => extension);
+    const app = client(network, memoryStorage(credential).storage);
+    await app.start();
+    const transport = app.extensionCatalogTransport()!;
+    const signal = new AbortController().signal;
+
+    await expect(transport.completeSetup(extension, signal)).rejects.toThrow(/required/u);
+    await expect(transport.submitSetupInteraction(extension, "region", "north", signal)).rejects.toThrow(/choices/u);
+    await expect(transport.saveSetupCredential(
+      extension, "oauth", "apiKey", "temporary-private-value", signal
+    )).rejects.toThrow(/OAuth/u);
+    expect(network.uploadExtensionSetupCredential).not.toHaveBeenCalled();
+    expect(network.submit).not.toHaveBeenCalled();
+  });
+
+  it("retires a setup credential ticket response when its authenticated owner changes before commit", async () => {
+    const network = fakeNetwork();
+    const saved = memoryStorage(credential);
+    const extension: MobileExtension = { ...mobileExtensionFixture(), setup: {
+      state: "inProgress",
+      attemptId: "attempt-1",
+      revision: 1n,
+      fields: [{ fieldId: "token", label: "Token", description: "Protected token", kind: "secret",
+        required: true, configured: false, options: [] }]
+    } };
+    network.getExtension = vi.fn(async () => extension);
+    let finish!: (ticketId: string) => void;
+    let uploadSignal: AbortSignal | undefined;
+    network.uploadExtensionSetupCredential = vi.fn((_credential, _extensionId, _attemptId, _fieldId, _kind,
+      _secret, signal) => {
+      uploadSignal = signal;
+      return new Promise<string>((resolve) => { finish = resolve; });
+    });
+    const app = client(network, saved.storage);
+    await app.start();
+
+    const change = app.extensionCatalogTransport()!.saveSetupCredential(
+      extension, "token", "apiKey", "temporary-private-value", new AbortController().signal
+    );
+    await vi.waitFor(() => expect(network.uploadExtensionSetupCredential).toHaveBeenCalledOnce());
+    app.setForeground(false);
+    expect(uploadSignal?.aborted).toBe(true);
+    finish("credential-ticket");
+
+    await expect(change).rejects.toThrow(/owner changed|cancelled/u);
+    expect(network.submit).not.toHaveBeenCalled();
+    expect(saved.pending()).toEqual([]);
   });
 
   it("retains an unknown Extension receipt, blocks replay, and only clears it from a typed terminal acknowledgement", async () => {

@@ -58,11 +58,16 @@ vi.mock("react-native", async () => {
     ScrollView: element("div"),
     StyleSheet: { create: <T,>(value: T) => value, hairlineWidth: 1 },
     Text: element("span"),
-    TextInput: ({ accessibilityLabel, onChangeText, value, ...props }: {
+    TextInput: ({ accessibilityLabel, onChangeText, value, editable = true, secureTextEntry = false, testID,
+      ...props }: {
       accessibilityLabel?: string;
       onChangeText?: (value: string) => void;
       value?: string;
-    }) => React.createElement("input", { ...props, value, "aria-label": accessibilityLabel,
+      editable?: boolean;
+      secureTextEntry?: boolean;
+      testID?: string;
+    }) => React.createElement("input", { ...props, value, disabled: !editable,
+      type: secureTextEntry ? "password" : "text", "data-testid": testID, "aria-label": accessibilityLabel,
       onChange: (event: React.ChangeEvent<HTMLInputElement>) => onChangeText?.(event.target.value), style: undefined }),
     View: element("div"),
     useWindowDimensions: () => ({ width: native.width, height: 844, scale: 1, fontScale: 1 })
@@ -109,6 +114,12 @@ function transport(ownerKey = "owner-a", value = catalog()): MobileExtensionTran
         ? { ...extension, revision: extension.revision + 1n, sidebarVisible } : extension)),
       extension: { ...expected, revision: expected.revision + 1n, sidebarVisible }
     })),
+    beginSetup: vi.fn(async (expected) => ({ catalog: value, extension: expected })),
+    submitSetupInteraction: vi.fn(async (expected) => ({ catalog: value, extension: expected })),
+    saveSetupCredential: vi.fn(async (expected) => ({ catalog: value, extension: expected })),
+    completeSetup: vi.fn(async (expected) => ({ catalog: value, extension: expected })),
+    cancelSetup: vi.fn(async (expected) => ({ catalog: value, extension: expected })),
+    revokeSetup: vi.fn(async (expected) => ({ catalog: value, extension: expected })),
     reconcile: vi.fn(async () => undefined),
     dismiss: vi.fn(async () => undefined)
   };
@@ -135,6 +146,23 @@ async function press(label: string) {
   const button = Array.from(container.querySelectorAll("button"))
     .find((candidate) => candidate.getAttribute("aria-label") === label);
   expect(button, `Missing accessible button ${label}`).toBeTruthy();
+  await act(async () => button!.dispatchEvent(new MouseEvent("click", { bubbles: true })));
+}
+
+async function changeInput(label: string, value: string) {
+  const input = container.querySelector(`input[aria-label="${label}"]`) as HTMLInputElement | null;
+  expect(input, `Missing accessible input ${label}`).toBeTruthy();
+  await act(async () => {
+    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
+    setter?.call(input, value);
+    input!.dispatchEvent(new Event("input", { bubbles: true }));
+    input!.dispatchEvent(new Event("change", { bubbles: true }));
+  });
+}
+
+async function pressTestId(testID: string) {
+  const button = container.querySelector(`[testid="${testID}"], [data-testid="${testID}"]`);
+  expect(button, `Missing test control ${testID}`).toBeTruthy();
   await act(async () => button!.dispatchEvent(new MouseEvent("click", { bubbles: true })));
 }
 
@@ -210,6 +238,104 @@ describe("MobileExtensionsScreen", () => {
     expect(container.textContent).toContain("Extension change failed: revision conflict");
     expect(container.textContent).toContain("Enabled");
     expect(container.textContent).not.toContain("Disabled");
+  });
+
+  it("configures fields, clears protected input before upload, completes, revokes, and cancels setup", async () => {
+    const setupFields: MobileExtension["setup"]["fields"] = [
+      { fieldId: "region", label: "Region", description: "Choose a region", kind: "text", required: true,
+        configured: false, options: ["east", "west"] },
+      { fieldId: "terms", label: "Terms", description: "Accept the terms", kind: "confirmation", required: true,
+        configured: false, options: [] },
+      { fieldId: "token", label: "Token", description: "Protected token", kind: "secret", required: true,
+        configured: false, options: [] }
+    ];
+    let current = extensionFixture({ setup: { state: "required", revision: 0n, fields: setupFields } });
+    const active = transport("owner-setup", catalog([current, calendar]));
+    vi.mocked(active.detail).mockImplementation(async () => current);
+    const result = (next: MobileExtension) => {
+      current = next;
+      return { catalog: catalog([current, calendar]), extension: current };
+    };
+    vi.mocked(active.beginSetup).mockImplementation(async (expected) => result({
+      ...expected,
+      revision: expected.revision + 1n,
+      setup: { state: "inProgress", attemptId: "attempt-1", revision: 1n, fields: setupFields }
+    }));
+    vi.mocked(active.submitSetupInteraction).mockImplementation(async (expected, fieldId, value) => result({
+      ...expected,
+      revision: expected.revision + 1n,
+      setup: { ...expected.setup, revision: expected.setup.revision + 1n,
+        fields: expected.setup.fields.map((field) => field.fieldId === fieldId
+          ? { ...field, configured: field.kind === "confirmation" ? value === true : true }
+          : field) }
+    }));
+    let finishCredential!: () => void;
+    vi.mocked(active.saveSetupCredential).mockImplementation((expected, fieldId, kind, secret) => {
+      expect({ fieldId, kind, secret }).toEqual({
+        fieldId: "token", kind: "headerSecret", secret: "temporary-private-value"
+      });
+      return new Promise((resolve) => { finishCredential = () => resolve(result({
+        ...expected,
+        revision: expected.revision + 1n,
+        setup: { ...expected.setup, revision: expected.setup.revision + 1n,
+          fields: expected.setup.fields.map((field) => field.fieldId === fieldId
+            ? { ...field, configured: true }
+            : field) }
+      })); });
+    });
+    vi.mocked(active.completeSetup).mockImplementation(async (expected) => result({
+      ...expected,
+      revision: expected.revision + 1n,
+      setup: { ...expected.setup, state: "ready", revision: expected.setup.revision + 1n }
+    }));
+    vi.mocked(active.revokeSetup).mockImplementation(async (expected) => result({
+      ...expected,
+      revision: expected.revision + 1n,
+      setup: { state: "required", revision: expected.setup.revision + 1n,
+        fields: expected.setup.fields.map((field) => ({ ...field, configured: false })) }
+    }));
+    vi.mocked(active.cancelSetup).mockImplementation(async (expected) => result({
+      ...expected,
+      revision: expected.revision + 1n,
+      setup: { ...expected.setup, state: "cancelled", revision: expected.setup.revision + 1n }
+    }));
+
+    await render(active);
+    await press("View Mail");
+    expect(container.textContent).toContain("must be configured");
+    await press("Begin setup");
+    expect(active.beginSetup).toHaveBeenCalledWith(expect.objectContaining({ setup: expect.objectContaining({ state: "required" }) }),
+      expect.any(AbortSignal));
+    expect(container.textContent).toContain("Choose a region");
+    expect((container.querySelector('[testid="extensions.setup.complete"]') as HTMLButtonElement).disabled).toBe(true);
+
+    await press("west");
+    await pressTestId("extensions.setup.save.region");
+    expect(active.submitSetupInteraction).toHaveBeenLastCalledWith(expect.anything(), "region", "west", expect.any(AbortSignal));
+    await press("Confirm");
+    expect(active.submitSetupInteraction).toHaveBeenLastCalledWith(expect.anything(), "terms", true, expect.any(AbortSignal));
+    await press("Header secret");
+    await changeInput("Token", "temporary-private-value");
+    await pressTestId("extensions.setup.save.token");
+    expect((container.querySelector('input[aria-label="Token"]') as HTMLInputElement).value).toBe("");
+    expect(container.textContent).toContain("Saving Extension change");
+    await act(async () => finishCredential());
+    expect(active.saveSetupCredential).toHaveBeenCalledOnce();
+    expect((container.querySelector('[testid="extensions.setup.complete"]') as HTMLButtonElement).disabled).toBe(false);
+
+    await press("Complete setup");
+    expect(container.textContent).toContain("Setup is ready");
+    await press("Revoke setup");
+    expect(native.alert).toHaveBeenCalledOnce();
+    const revokeButtons = native.alert.mock.calls[0]?.[2] as undefined | { onPress?: () => void }[];
+    await act(async () => revokeButtons?.[1]?.onPress?.());
+    expect(active.revokeSetup).toHaveBeenCalledOnce();
+    expect(container.textContent).toContain("must be configured");
+
+    await press("Begin setup");
+    await press("Cancel setup");
+    expect(active.cancelSetup).toHaveBeenCalledOnce();
+    expect(container.textContent).toContain("previous setup attempt was cancelled");
   });
 
   it("shows unresolved receipts, checks them without replay, and confirms authoritative clearing", async () => {

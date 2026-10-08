@@ -27,7 +27,9 @@ export interface PendingOperation {
     | "schedule-runs-read" | "schedule-all-read" | "schedule-run-delete"
     | "schedule-create" | "schedule-update" | "schedule-delete" | "schedule-promote"
     | "schedule-clone" | "schedule-project-remove" | "schedule-project-reconcile" | "voice-settings" | "model-favorite"
-    | "extension-enabled" | "extension-sidebar";
+    | "extension-enabled" | "extension-sidebar"
+    | "extension-setup-begin" | "extension-setup-interaction" | "extension-setup-credential"
+    | "extension-setup-complete" | "extension-setup-cancel" | "extension-setup-revoke";
   readonly sessionId?: string;
   readonly eventId?: string;
   readonly backendId?: string;
@@ -404,7 +406,9 @@ function isPending(value: unknown): value is PendingOperation {
       "schedule-run-restart", "schedule-run-read", "schedule-runs-read", "schedule-all-read",
       "schedule-run-delete", "schedule-create", "schedule-update", "schedule-delete", "schedule-promote",
       "schedule-clone", "schedule-project-remove", "schedule-project-reconcile", "voice-settings", "model-favorite",
-      "extension-enabled", "extension-sidebar"].includes(String(record.kind))
+      "extension-enabled", "extension-sidebar", "extension-setup-begin", "extension-setup-interaction",
+      "extension-setup-credential", "extension-setup-complete", "extension-setup-cancel",
+      "extension-setup-revoke"].includes(String(record.kind))
     || (record.state !== "unknown" && record.state !== "accepted")) return false;
   if (record.sessionId !== undefined && typeof record.sessionId !== "string") return false;
   if (record.eventId !== undefined && typeof record.eventId !== "string") return false;
@@ -463,9 +467,9 @@ function isPending(value: unknown): value is PendingOperation {
     && !validReceiptIdentity(record.scheduleId)) return false;
   if (record.kind === "schedule-project-reconcile"
     && (!validReceiptIdentity(record.targetId) || record.scheduleId !== undefined)) return false;
-  if (["extension-enabled", "extension-sidebar"].includes(String(record.kind))
+  if (isExtensionReceiptKind(record.kind)
     && (!/^extension_[a-f0-9]{32}$/u.test(String(record.extensionId)) || record.extensionRevision === undefined)) return false;
-  if (["extension-enabled", "extension-sidebar"].includes(String(record.kind))
+  if (isExtensionReceiptKind(record.kind)
     && (record.sessionId !== undefined || record.eventId !== undefined || record.backendId !== undefined
       || record.sourceGeneration !== undefined || record.workspaceId !== undefined || record.changeSetId !== undefined
       || record.queueItemId !== undefined || record.interactionId !== undefined
@@ -473,7 +477,7 @@ function isPending(value: unknown): value is PendingOperation {
       || record.interactionDraftKind !== undefined || record.targetConnectionId !== undefined
       || record.targetDeviceId !== undefined || record.scheduleId !== undefined || record.triggerId !== undefined
       || record.targetId !== undefined)) return false;
-  if (["extension-enabled", "extension-sidebar"].includes(String(record.kind))
+  if (isExtensionReceiptKind(record.kind)
     && Object.keys(record).some((key) => ![
       "operationId", "connectionId", "kind", "extensionId", "extensionRevision", "state"
     ].includes(key))) return false;
@@ -491,9 +495,22 @@ function isPending(value: unknown): value is PendingOperation {
   if (!["interaction-resolve", "interaction-dismiss"].includes(String(record.kind))
     && (record.interactionId !== undefined || record.interactionGeneration !== undefined
       || record.interactionRevision !== undefined || record.interactionDraftKind !== undefined)) return false;
-  if (!["extension-enabled", "extension-sidebar"].includes(String(record.kind))
+  if (!isExtensionReceiptKind(record.kind)
     && (record.extensionId !== undefined || record.extensionRevision !== undefined)) return false;
   return true;
+}
+
+function isExtensionReceiptKind(value: unknown): boolean {
+  return [
+    "extension-enabled",
+    "extension-sidebar",
+    "extension-setup-begin",
+    "extension-setup-interaction",
+    "extension-setup-credential",
+    "extension-setup-complete",
+    "extension-setup-cancel",
+    "extension-setup-revoke"
+  ].includes(String(value));
 }
 
 function validReceiptIdentity(value: unknown): value is string {

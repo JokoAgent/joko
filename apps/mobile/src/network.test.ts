@@ -9,9 +9,10 @@ import {
   BlobTransferTicketSchema,
   BeginPairingRequestSchema, BeginPairingResponseSchema,
   CompletePairingRequestSchema, CompletePairingResponseSchema,
-  ConnectionSchema, ConnectionState, DeviceKind, DeviceSchema,
+  ConnectionSchema, ConnectionState, CredentialKind, DeviceKind, DeviceSchema,
   ExtensionCatalogEntrySchema, ExtensionCatalogSource, ExtensionInstallState, ExtensionOwnerSchema,
   ExtensionResourceOwnerSchema, ExtensionSetupDescriptorSchema, ExtensionSetupState,
+  BeginExtensionSetupCredentialUploadRequestSchema, BeginExtensionSetupCredentialUploadResponseSchema,
   GetExtensionRequestSchema, GetExtensionResponseSchema, ListExtensionsRequestSchema, ListExtensionsResponseSchema,
   RevisionSchema,
   GetServerInfoResponseSchema, GetSnapshotRequestSchema, GetSnapshotResponseSchema, SnapshotSchema,
@@ -204,6 +205,81 @@ describe("mobile Extension network", () => {
       detail = second;
       await expect(mobileNetwork.getExtension(credential, first.extensionId)).rejects.toThrow(/mismatched/u);
     } finally { fetcher.mockRestore(); }
+  });
+
+  it("uploads setup credentials through an exact same-origin short-lived ticket and zeroes encoded bytes", async () => {
+    const credential: PairedCredential = { profileId: "profile", origin: "https://node.example", serverId: "server",
+      connectionId: "connection", deviceId: "phone", displayName: "Phone", authKey: "extension-fixture-key" };
+    const extensionId = "extension_0123456789abcdef0123456789abcdef";
+    let ticket = {
+      ticketId: "setup-ticket",
+      relativeEndpoint: "/credentials/input/setup-ticket",
+      expiresAt: create(TimestampSchema, { seconds: BigInt(Math.ceil(Date.now() / 1_000) + 60) }),
+      maximumBytes: 65_536n
+    };
+    let uploadedBytes: Uint8Array | undefined;
+    let uploadedCopy: Uint8Array | undefined;
+    let requestedKind = CredentialKind.HEADER_SECRET;
+    const fetcher = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      expect(new Headers(init?.headers).get("authorization")).toBe(`Bearer ${credential.authKey}`);
+      if (init?.method === "PUT") {
+        expect(String(input)).toBe("https://node.example/credentials/input/setup-ticket");
+        expect(new Headers(init.headers).get("content-type")).toBe("application/octet-stream");
+        expect(init.cache).toBe("no-store");
+        uploadedBytes = init.body as Uint8Array;
+        uploadedCopy = Uint8Array.from(uploadedBytes);
+        return new Response(null, { status: 204 });
+      }
+      expect(new URL(String(input)).pathname).toBe(
+        "/joko.v1.ExtensionService/BeginExtensionSetupCredentialUpload"
+      );
+      const request = fromBinary(BeginExtensionSetupCredentialUploadRequestSchema,
+        new Uint8Array(init?.body as Uint8Array));
+      expect(request).toMatchObject({
+        extensionId,
+        attemptId: "attempt-1",
+        fieldId: "api-token",
+        kind: requestedKind
+      });
+      return new Response(toBinary(BeginExtensionSetupCredentialUploadResponseSchema,
+        create(BeginExtensionSetupCredentialUploadResponseSchema, { ticket })), {
+        status: 200,
+        headers: { "content-type": "application/proto" }
+      });
+    });
+    try {
+      await expect(mobileNetwork.uploadExtensionSetupCredential!(
+        credential,
+        extensionId,
+        "attempt-1",
+        "api-token",
+        "headerSecret",
+        "temporary-private-value"
+      )).resolves.toBe("setup-ticket");
+      expect(new TextDecoder().decode(uploadedCopy)).toBe("temporary-private-value");
+      expect(uploadedBytes?.every((byte) => byte === 0)).toBe(true);
+
+      ticket = { ...ticket, relativeEndpoint: "//other.example/credentials/input/setup-ticket" };
+      requestedKind = CredentialKind.API_KEY;
+      await expect(mobileNetwork.uploadExtensionSetupCredential!(
+        credential, extensionId, "attempt-1", "api-token", "apiKey", "private-value"
+      )).rejects.toThrow(/non-root-relative/u);
+      expect(fetcher.mock.calls.filter((call) => String(call[0]).includes("other.example"))).toHaveLength(0);
+
+      ticket = { ...ticket, relativeEndpoint: "/credentials/input/setup-ticket", maximumBytes: 2n };
+      requestedKind = CredentialKind.OAUTH;
+      await expect(mobileNetwork.uploadExtensionSetupCredential!(
+        credential, extensionId, "attempt-1", "api-token", "oauth", "private-value"
+      )).rejects.toThrow(/unavailable/u);
+
+      ticket = { ...ticket, maximumBytes: 65_536n,
+        expiresAt: create(TimestampSchema, { seconds: BigInt(Math.floor(Date.now() / 1_000) - 1) }) };
+      await expect(mobileNetwork.uploadExtensionSetupCredential!(
+        credential, extensionId, "attempt-1", "api-token", "oauth", "private-value"
+      )).rejects.toThrow(/expired/u);
+    } finally {
+      fetcher.mockRestore();
+    }
   });
 });
 

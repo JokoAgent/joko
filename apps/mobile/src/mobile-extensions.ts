@@ -106,10 +106,22 @@ export interface MobileExtensionCatalogPage {
   readonly totalSize: number;
 }
 
+export type MobileExtensionCredentialKind = "apiKey" | "oauth" | "headerSecret";
+
+export type MobileExtensionPendingMutationKind =
+  | "enabled"
+  | "sidebar"
+  | "setupBegin"
+  | "setupInteraction"
+  | "setupCredential"
+  | "setupComplete"
+  | "setupCancel"
+  | "setupRevoke";
+
 export interface MobileExtensionPendingMutation {
   readonly operationId: string;
   readonly extensionId: string;
-  readonly kind: "enabled" | "sidebar";
+  readonly kind: MobileExtensionPendingMutationKind;
   readonly state: "unknown" | "accepted";
 }
 
@@ -125,6 +137,23 @@ export interface MobileExtensionTransport {
   detail(expected: MobileExtension, signal: AbortSignal): Promise<MobileExtension>;
   setEnabled(expected: MobileExtension, enabled: boolean, signal: AbortSignal): Promise<MobileExtensionMutationResult>;
   setSidebarVisible(expected: MobileExtension, visible: boolean, signal: AbortSignal): Promise<MobileExtensionMutationResult>;
+  beginSetup(expected: MobileExtension, signal: AbortSignal): Promise<MobileExtensionMutationResult>;
+  submitSetupInteraction(
+    expected: MobileExtension,
+    fieldId: string,
+    value: string | boolean,
+    signal: AbortSignal
+  ): Promise<MobileExtensionMutationResult>;
+  saveSetupCredential(
+    expected: MobileExtension,
+    fieldId: string,
+    kind: MobileExtensionCredentialKind,
+    secret: string,
+    signal: AbortSignal
+  ): Promise<MobileExtensionMutationResult>;
+  completeSetup(expected: MobileExtension, signal: AbortSignal): Promise<MobileExtensionMutationResult>;
+  cancelSetup(expected: MobileExtension, signal: AbortSignal): Promise<MobileExtensionMutationResult>;
+  revokeSetup(expected: MobileExtension, signal: AbortSignal): Promise<MobileExtensionMutationResult>;
   reconcile(operationId: string, signal: AbortSignal): Promise<void>;
   dismiss(operationId: string, signal: AbortSignal): Promise<void>;
 }
@@ -137,7 +166,22 @@ export function mobileExtensionKey(extension: MobileExtension): string {
     extension.installState,
     extension.enabled ? "enabled" : "disabled",
     extension.sidebarSupported ? "sidebar" : "no-sidebar",
-    extension.sidebarVisible ? "visible" : "hidden"
+    extension.sidebarVisible ? "visible" : "hidden",
+    JSON.stringify({
+      state: extension.setup.state,
+      attemptId: extension.setup.attemptId ?? "",
+      revision: extension.setup.revision.toString(10),
+      fields: extension.setup.fields.map((field) => ({
+        fieldId: field.fieldId,
+        label: field.label,
+        description: field.description,
+        kind: field.kind,
+        required: field.required,
+        configured: field.configured,
+        options: field.options
+      })),
+      error: extension.setup.error ?? ""
+    })
   ].join("\u001f");
 }
 
@@ -244,6 +288,19 @@ export function projectMobileExtension(value: ExtensionCatalogEntry): MobileExte
   const attemptId = setup.attemptId === undefined
     ? undefined
     : identity(setup.attemptId, 256, "Extension setup attempt identity");
+  const setupRevision = nonNegativeRevision(setup.revision?.value, "Extension setup revision");
+  if ((setupState === "inProgress" || setupState === "cancelled" || setupState === "failed")
+    && attemptId === undefined) invalid("Extension setup attempt");
+  if ((setupState === "notRequired" && (attemptId !== undefined || setupFields.length !== 0 || setupRevision !== 0n))
+    || (setupState !== "notRequired" && setupFields.length === 0)
+    || (setupState === "required" && (attemptId !== undefined || setupFields.length === 0 || setupRevision !== 0n))
+    || (attemptId === undefined && setupRevision !== 0n)
+    || (attemptId !== undefined && setupRevision === 0n)) {
+    invalid("Extension setup state");
+  }
+  if (setupFields.some((field) => field.kind !== "text" && field.options.length > 0)) {
+    invalid("Extension setup options");
+  }
 
   validateRecommendations(value);
   if (value.update !== undefined) {
@@ -275,7 +332,7 @@ export function projectMobileExtension(value: ExtensionCatalogEntry): MobileExte
     setup: {
       state: setupState,
       ...(attemptId === undefined ? {} : { attemptId }),
-      revision: nonNegativeRevision(setup.revision?.value, "Extension setup revision"),
+      revision: setupRevision,
       fields: setupFields,
       ...(setupError === undefined ? {} : { error: setupError })
     },

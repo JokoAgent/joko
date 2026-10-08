@@ -65,7 +65,8 @@ import {
   collectMobileExtensionCatalog,
   projectMobileExtension,
   type MobileExtension,
-  type MobileExtensionCatalog
+  type MobileExtensionCatalog,
+  type MobileExtensionCredentialKind
 } from "./mobile-extensions";
 
 export interface PairedCredential {
@@ -167,6 +168,15 @@ export interface MobileNetwork {
   listPartnerSessions(credential: PairedCredential, partnerId: string, signal?: AbortSignal): Promise<ListPartnerSessionsResponse>;
   listExtensions(credential: PairedCredential, signal?: AbortSignal): Promise<MobileExtensionCatalog>;
   getExtension(credential: PairedCredential, extensionId: string, signal?: AbortSignal): Promise<MobileExtension>;
+  uploadExtensionSetupCredential(
+    credential: PairedCredential,
+    extensionId: string,
+    attemptId: string,
+    fieldId: string,
+    kind: MobileExtensionCredentialKind,
+    secret: string,
+    signal?: AbortSignal
+  ): Promise<string>;
   listPartnerPrivateThreads(credential: PairedCredential, partnerId: string, signal?: AbortSignal): Promise<readonly MobilePrivateThread[]>;
   getPartnerPrivateThread(credential: PairedCredential, partnerId: string, threadId: string, signal?: AbortSignal): Promise<MobilePrivateDetail>;
   markPartnerPrivateThreadRead(credential: PairedCredential, partnerId: string, threadId: string,
@@ -878,6 +888,25 @@ function authorizedBlobEndpoint(origin: string, relativeEndpoint: string): strin
   return endpoint.toString();
 }
 
+function authorizedExtensionCredentialEndpoint(origin: string, relativeEndpoint: string): string {
+  if (!relativeEndpoint.startsWith("/") || relativeEndpoint.startsWith("//") || relativeEndpoint.includes("\\")
+    || relativeEndpoint.includes("?") || relativeEndpoint.includes("#")) {
+    throw new Error("The Joko node returned a non-root-relative Extension credential endpoint.");
+  }
+  const base = new URL(normalizeNodeOrigin(origin));
+  const endpoint = new URL(relativeEndpoint, base);
+  if (endpoint.origin !== base.origin || endpoint.pathname !== relativeEndpoint
+    || endpoint.username !== "" || endpoint.password !== "") {
+    throw new Error("The Joko node returned a cross-origin Extension credential endpoint.");
+  }
+  return endpoint.toString();
+}
+
+function validExtensionSetupIdentity(value: string): boolean {
+  return value.length > 0 && value.length <= 512 && value === value.trim()
+    && !/[\u0000-\u001f\u007f]/u.test(value);
+}
+
 function assertDownloadBlob(blob: BlobRef): void {
   if (!blob.blobId || !normalizeMediaType(blob.mediaType) || !/^[0-9a-f]{64}$/u.test(blob.sha256Hex)
     || blob.byteSize < 0n || blob.byteSize > BigInt(MOBILE_BLOB_PREVIEW_MAXIMUM_BYTES)) {
@@ -1406,6 +1435,58 @@ export const mobileNetwork: MobileNetwork = {
     const extension = projectMobileExtension(response.extension);
     if (!extension.installed) throw new Error("The selected Extension is no longer installed on this Joko node.");
     return extension;
+  },
+  async uploadExtensionSetupCredential(credential, extensionId, attemptId, fieldId, kind, secret, signal) {
+    signal?.throwIfAborted();
+    if (!/^extension_[a-f0-9]{32}$/u.test(extensionId)
+      || !validExtensionSetupIdentity(attemptId) || !validExtensionSetupIdentity(fieldId)) {
+      throw new Error("A current Extension setup field is required.");
+    }
+    const credentialKind = kind === "oauth" ? CredentialKind.OAUTH
+      : kind === "headerSecret" ? CredentialKind.HEADER_SECRET
+        : kind === "apiKey" ? CredentialKind.API_KEY
+          : undefined;
+    if (credentialKind === undefined) throw new Error("A supported Extension credential kind is required.");
+    const bytes = new TextEncoder().encode(secret);
+    try {
+      if (bytes.byteLength === 0 || bytes.byteLength > 64 * 1024 || secret.includes("\0")) {
+        throw new Error("The Extension credential input is invalid.");
+      }
+      const response = await createClient(ExtensionService, transport(credential.origin, credential.authKey))
+        .beginExtensionSetupCredentialUpload({ extensionId, attemptId, fieldId, kind: credentialKind }, options(signal));
+      signal?.throwIfAborted();
+      const ticket = response.ticket;
+      if (!ticket || !validExtensionSetupIdentity(ticket.ticketId)
+        || ticket.maximumBytes <= 0n
+        || BigInt(bytes.byteLength) > ticket.maximumBytes || ticket.expiresAt === undefined) {
+        throw new Error("The Extension credential channel is unavailable.");
+      }
+      const expirySeconds = Number(ticket.expiresAt.seconds);
+      if (!Number.isSafeInteger(expirySeconds) || expirySeconds < 0
+        || !Number.isInteger(ticket.expiresAt.nanos) || ticket.expiresAt.nanos < 0
+        || ticket.expiresAt.nanos >= 1_000_000_000) {
+        throw new Error("The Extension credential channel returned an invalid expiry.");
+      }
+      if ((expirySeconds * 1_000 + Math.floor(ticket.expiresAt.nanos / 1_000_000)) <= Date.now()) {
+        throw new Error("The Extension credential channel has expired.");
+      }
+      const endpoint = authorizedExtensionCredentialEndpoint(credential.origin, ticket.relativeEndpoint);
+      const upload = await fetch(endpoint, {
+        method: "PUT",
+        headers: {
+          authorization: `Bearer ${credential.authKey}`,
+          "content-type": "application/octet-stream"
+        },
+        body: bytes,
+        cache: "no-store",
+        signal
+      });
+      signal?.throwIfAborted();
+      if (!upload.ok) throw new Error(`Extension credential upload failed (${upload.status}).`);
+      return ticket.ticketId;
+    } finally {
+      bytes.fill(0);
+    }
   },
   async listPartnerPrivateThreads(credential, partnerId, signal) {
     if (!validMobilePartnerId(partnerId)) throw new Error("A valid Partner is required.");

@@ -18,6 +18,7 @@ import {
   filterMobileExtensions,
   type MobileExtension,
   type MobileExtensionCatalog,
+  type MobileExtensionCredentialKind,
   type MobileExtensionTransport
 } from "./mobile-extensions";
 import type { MobilePartnersColors } from "./MobilePartnersScreen";
@@ -49,7 +50,7 @@ const emptyDetail: DetailState = { status: "idle" };
 type MutationState = {
   readonly ownerKey: string;
   readonly extensionId: string;
-  readonly kind: "enabled" | "sidebar" | "receipt";
+  readonly kind: "enabled" | "sidebar" | "setup" | "receipt";
 };
 
 function errorText(error: unknown): string {
@@ -57,16 +58,21 @@ function errorText(error: unknown): string {
   return (value.trim() || "Unknown error").slice(0, 1_024);
 }
 
-function Action({ label, colors, onPress, disabled = false, testID }: {
+function Action({ label, colors, onPress, disabled = false, selected, testID }: {
   readonly label: string;
   readonly colors: MobilePartnersColors;
   readonly onPress: () => void;
   readonly disabled?: boolean;
+  readonly selected?: boolean;
   readonly testID?: string;
 }) {
-  return <Pressable accessibilityRole="button" accessibilityLabel={label} accessibilityState={{ disabled }}
+  return <Pressable accessibilityRole="button" accessibilityLabel={label}
+    accessibilityState={{ disabled, ...(selected === undefined ? {} : { selected }) }}
     disabled={disabled} onPress={onPress} testID={testID}
-    style={[styles.action, { borderColor: colors.border, backgroundColor: colors.surface }, disabled && styles.disabled]}>
+    style={[styles.action, {
+      borderColor: selected ? colors.accent : colors.border,
+      backgroundColor: selected ? colors.brandBackground : colors.surface
+    }, disabled && styles.disabled]}>
     <Text style={[styles.actionText, { color: colors.ink }]}>{label}</Text>
   </Pressable>;
 }
@@ -85,6 +91,11 @@ function Centered({ text, colors, loading = false, error = false }: {
 
 function setupState(extension: MobileExtension, locale: MobileSupportedLocale): string {
   return mobileMessage(locale, `extension.setup.${extension.setup.state}`);
+}
+
+function extensionSetupStartable(extension: MobileExtension | undefined): boolean {
+  return extension?.setup.state === "required" || extension?.setup.state === "cancelled"
+    || extension?.setup.state === "failed";
 }
 
 function source(extension: MobileExtension, locale: MobileSupportedLocale): string {
@@ -123,7 +134,14 @@ export function MobileExtensionsScreen({ colors, locale, transport, onBack }: Mo
   const [detail, setDetail] = useState<DetailState>(emptyDetail);
   const [mutation, setMutation] = useState<MutationState | undefined>();
   const [mutationError, setMutationError] = useState<string | undefined>();
+  const [setupValues, setSetupValues] = useState<Readonly<Record<string, string>>>({});
+  const [credentialKinds, setCredentialKinds] = useState<Readonly<Record<string, MobileExtensionCredentialKind>>>({});
   const ownerKey = transport?.ownerKey;
+
+  useEffect(() => {
+    setSetupValues({});
+    setCredentialKinds({});
+  }, [detail.ownerKey, detail.extension?.extensionId, detail.extension?.setup.attemptId]);
 
   useEffect(() => {
     listAbort.current?.abort();
@@ -226,7 +244,14 @@ export function MobileExtensionsScreen({ colors, locale, transport, onBack }: Mo
     return { catalog, extension: await currentTransport.detail(matches[0]!, signal) };
   };
 
-  const changeExtension = (expected: MobileExtension, kind: "enabled" | "sidebar", value: boolean) => {
+  const runExtensionMutation = (
+    expected: MobileExtension,
+    kind: MutationState["kind"],
+    request: (current: MobileExtensionTransport, signal: AbortSignal) => Promise<{
+      readonly catalog: MobileExtensionCatalog;
+      readonly extension: MobileExtension;
+    }>
+  ) => {
     const currentTransport = transportRef.current;
     if (!currentTransport || mutation !== undefined
       || currentTransport.pending.some((pending) => pending.extensionId === expected.extensionId)) return;
@@ -236,10 +261,7 @@ export function MobileExtensionsScreen({ colors, locale, transport, onBack }: Mo
     mutationOccurrence.current = occurrence;
     setMutation({ ownerKey: currentTransport.ownerKey, extensionId: expected.extensionId, kind });
     setMutationError(undefined);
-    const request = kind === "enabled"
-      ? currentTransport.setEnabled(expected, value, controller.signal)
-      : currentTransport.setSidebarVisible(expected, value, controller.signal);
-    void request.then((result) => {
+    void request(currentTransport, controller.signal).then((result) => {
       if (controller.signal.aborted || mutationOccurrence.current !== occurrence
         || transportRef.current?.ownerKey !== currentTransport.ownerKey) return;
       adoptCurrent(currentTransport.ownerKey, expected.extensionId, result.catalog, result.extension);
@@ -253,6 +275,12 @@ export function MobileExtensionsScreen({ colors, locale, transport, onBack }: Mo
       mutationAbort.current = undefined;
       setMutation(undefined);
     });
+  };
+
+  const changeExtension = (expected: MobileExtension, kind: "enabled" | "sidebar", value: boolean) => {
+    runExtensionMutation(expected, kind, (current, signal) => kind === "enabled"
+      ? current.setEnabled(expected, value, signal)
+      : current.setSidebarVisible(expected, value, signal));
   };
 
   const checkReceipt = (extensionId: string, operationId: string, dismiss: boolean) => {
@@ -295,6 +323,8 @@ export function MobileExtensionsScreen({ colors, locale, transport, onBack }: Mo
     : [];
   const selectedBusy = selected !== undefined && mutation !== undefined && mutation.ownerKey === ownerKey
     && mutation.extensionId === selected.extensionId;
+  const setupStartable = extensionSetupStartable(visibleDetail.extension);
+  const setupComplete = visibleDetail.extension?.setup.fields.every((field) => !field.required || field.configured) ?? false;
 
   const directoryPane = <View style={[styles.pane, wide && styles.directoryPane]} testID="extensions.directory">
     <View style={styles.header}>
@@ -425,6 +455,129 @@ export function MobileExtensionsScreen({ colors, locale, transport, onBack }: Mo
                 <Text style={[styles.caption, { color: colors.muted }]}>{mobileMessage(locale, "extension.changing")}</Text>
               </View>}
             </View>
+
+            <Text style={[styles.section, { color: colors.muted }]}>{mobileMessage(locale, "extension.setupSection")}</Text>
+            <View style={[styles.card, { backgroundColor: colors.surface, borderColor: colors.border }]}
+              testID="extensions.setup">
+              <View style={styles.controlRow}>
+                <View style={styles.grow}>
+                  <Text style={[styles.label, { color: colors.ink }]}>{setupState(extension, locale)}</Text>
+                  <Text style={[styles.caption, { color: colors.muted }]}>{mobileMessage(locale,
+                    "extension.setupRevision", { revision: extension.setup.revision.toString(10) })}</Text>
+                </View>
+                {setupStartable && <Action label={mobileMessage(locale,
+                  extension.setup.state === "required" ? "extension.beginSetup" : "common.retry")}
+                  colors={colors} disabled={selectedBusy || pending.length > 0}
+                  onPress={() => runExtensionMutation(extension, "setup", (current, signal) =>
+                    current.beginSetup(extension, signal))} testID="extensions.setup.begin" />}
+              </View>
+              {extension.setup.state === "required" && <Text style={[styles.body, { color: colors.muted }]}>
+                {mobileMessage(locale, "extension.setupRequiredBody")}
+              </Text>}
+              {extension.setup.state === "cancelled" && <Text style={[styles.body, { color: colors.muted }]}>
+                {mobileMessage(locale, "extension.setupCancelledBody")}
+              </Text>}
+              {extension.setup.state === "failed" && <Text style={[styles.body, { color: colors.muted }]}>
+                {mobileMessage(locale, "extension.setupFailedBody")}
+              </Text>}
+              {extension.setup.state === "notRequired" && <Text style={[styles.body, { color: colors.muted }]}>
+                {mobileMessage(locale, "extension.setupNotRequiredBody")}
+              </Text>}
+              {extension.setup.state === "ready" && <>
+                <Text style={[styles.body, { color: colors.muted }]}>{mobileMessage(locale, "extension.setupReadyBody")}</Text>
+                <View style={styles.actionRow}>
+                  <Action label={mobileMessage(locale, "extension.revokeSetup")} colors={colors}
+                    disabled={selectedBusy || pending.length > 0} testID="extensions.setup.revoke"
+                    onPress={() => Alert.alert(
+                      mobileMessage(locale, "extension.revokeSetupTitle"),
+                      mobileMessage(locale, "extension.revokeSetupBody"),
+                      [
+                        { text: mobileMessage(locale, "common.cancel"), style: "cancel" },
+                        { text: mobileMessage(locale, "extension.revokeSetup"), style: "destructive", onPress: () => {
+                          runExtensionMutation(extension, "setup", (current, signal) => current.revokeSetup(extension, signal));
+                        } }
+                      ]
+                    )} />
+                </View>
+              </>}
+              {extension.setup.state === "inProgress" && <>
+                <View style={styles.setupFields}>{extension.setup.fields.map((field) => {
+                  const value = setupValues[field.fieldId] ?? "";
+                  const secret = field.kind === "secret" || field.kind === "oauth";
+                  const credentialKind: MobileExtensionCredentialKind = field.kind === "oauth"
+                    ? "oauth"
+                    : credentialKinds[field.fieldId] ?? "apiKey";
+                  return <View key={field.fieldId} style={[styles.setupField, { borderColor: colors.border }]}
+                    testID={`extensions.setup.field.${field.fieldId}`}>
+                    <View style={styles.controlRow}>
+                      <View style={styles.grow}>
+                        <Text style={[styles.label, { color: colors.ink }]}>{field.label}</Text>
+                        <Text style={[styles.caption, { color: colors.muted }]}>{[
+                          mobileMessage(locale, field.required ? "extension.setupRequired" : "extension.setupOptional"),
+                          mobileMessage(locale, field.configured ? "extension.configured" : "extension.notConfigured")
+                        ].join(" · ")}</Text>
+                      </View>
+                      {field.kind === "confirmation" && <Action label={mobileMessage(locale,
+                        field.configured ? "extension.withdrawConfirmation" : "extension.confirmSetup")}
+                        colors={colors} selected={field.configured} disabled={selectedBusy || pending.length > 0}
+                        onPress={() => runExtensionMutation(extension, "setup", (current, signal) =>
+                          current.submitSetupInteraction(extension, field.fieldId, !field.configured, signal))}
+                        testID={`extensions.setup.confirm.${field.fieldId}`} />}
+                    </View>
+                    {field.description.length > 0 && <Text style={[styles.body, { color: colors.muted }]}>{field.description}</Text>}
+                    {field.kind !== "confirmation" && <>
+                      {field.kind === "secret" && <View style={styles.actionRow}>
+                        {(["apiKey", "headerSecret", "oauth"] as const).map((candidate) => <Action
+                          key={candidate} label={mobileMessage(locale, `extension.credential.${candidate}`)}
+                          colors={colors} selected={credentialKind === candidate}
+                          disabled={selectedBusy || pending.length > 0}
+                          onPress={() => setCredentialKinds((current) => ({ ...current, [field.fieldId]: candidate }))}
+                          testID={`extensions.setup.kind.${field.fieldId}.${candidate}`} />)}
+                      </View>}
+                      {field.options.length > 0
+                        ? <View style={styles.actionRow}>{field.options.map((option) => <Action key={option}
+                          label={option} colors={colors} selected={value === option}
+                          disabled={selectedBusy || pending.length > 0}
+                          onPress={() => setSetupValues((current) => ({ ...current, [field.fieldId]: option }))} />)}</View>
+                        : <TextInput accessibilityLabel={field.label} autoCapitalize="none" autoCorrect={false}
+                          secureTextEntry={secret} value={value}
+                          maxLength={secret ? 64 * 1024 : 8_192}
+                          onChangeText={(next) => setSetupValues((current) => ({ ...current, [field.fieldId]: next }))}
+                          editable={!selectedBusy && pending.length === 0}
+                          placeholder={mobileMessage(locale, secret ? "extension.credentialPlaceholder" : "extension.valuePlaceholder")}
+                          placeholderTextColor={colors.muted}
+                          style={[styles.setupInput, { color: colors.ink, borderColor: colors.border,
+                            backgroundColor: colors.background }]}
+                          testID={`extensions.setup.input.${field.fieldId}`} />}
+                      <View style={styles.actionRow}>
+                        <Action label={mobileMessage(locale, "common.save")} colors={colors}
+                          disabled={selectedBusy || pending.length > 0 || value.trim().length === 0}
+                          onPress={() => {
+                            if (secret) {
+                              setSetupValues((current) => ({ ...current, [field.fieldId]: "" }));
+                              runExtensionMutation(extension, "setup", (current, signal) =>
+                                current.saveSetupCredential(extension, field.fieldId, credentialKind, value, signal));
+                            } else {
+                              runExtensionMutation(extension, "setup", (current, signal) =>
+                                current.submitSetupInteraction(extension, field.fieldId, value, signal));
+                            }
+                          }} testID={`extensions.setup.save.${field.fieldId}`} />
+                      </View>
+                    </>}
+                  </View>;
+                })}</View>
+                <View style={styles.actionRow}>
+                  <Action label={mobileMessage(locale, "extension.cancelSetup")} colors={colors}
+                    disabled={selectedBusy || pending.length > 0}
+                    onPress={() => runExtensionMutation(extension, "setup", (current, signal) =>
+                      current.cancelSetup(extension, signal))} testID="extensions.setup.cancel" />
+                  <Action label={mobileMessage(locale, "extension.completeSetup")} colors={colors}
+                    disabled={selectedBusy || pending.length > 0 || !setupComplete}
+                    onPress={() => runExtensionMutation(extension, "setup", (current, signal) =>
+                      current.completeSetup(extension, signal))} testID="extensions.setup.complete" />
+                </View>
+              </>}
+            </View>
             {pending.map((receipt) => <View key={receipt.operationId} accessibilityRole="alert"
               style={[styles.notice, styles.receipt, { backgroundColor: colors.surface, borderColor: colors.negative }]}>
               <Text style={[styles.body, { color: colors.negative }]}>{mobileMessage(locale,
@@ -538,6 +691,10 @@ const styles = StyleSheet.create({
   chevron: { fontSize: 28 },
   detailContent: { gap: 12, padding: 16 },
   card: { borderRadius: 14, borderWidth: StyleSheet.hairlineWidth, gap: 4, padding: 14 },
+  setupFields: { gap: 12 },
+  setupField: { borderTopWidth: StyleSheet.hairlineWidth, gap: 10, paddingTop: 12 },
+  setupInput: { borderRadius: 12, borderWidth: StyleSheet.hairlineWidth, fontSize: 15, minHeight: 46,
+    paddingHorizontal: 12, paddingVertical: 10 },
   capability: { alignItems: "center", flexDirection: "row", gap: 12, minHeight: 30 },
   controlRow: { alignItems: "center", flexDirection: "row", gap: 12, minHeight: 52 },
   progress: { alignItems: "center", flexDirection: "row", gap: 8, minHeight: 44 },

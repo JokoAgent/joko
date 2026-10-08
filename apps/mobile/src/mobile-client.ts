@@ -83,7 +83,9 @@ import {
 import {
   mobileExtensionKey,
   type MobileExtension,
+  type MobileExtensionCredentialKind,
   type MobileExtensionMutationResult,
+  type MobileExtensionPendingMutationKind,
   type MobileExtensionTransport
 } from "./mobile-extensions";
 import {
@@ -627,6 +629,36 @@ const isTerminal = (state: OperationState): boolean => [
   OperationState.SUCCEEDED, OperationState.FAILED, OperationState.CANCELLED, OperationState.CONFLICT
 ].includes(state);
 
+type MobileExtensionReceiptKind = Extract<PendingOperation["kind"],
+  | "extension-enabled"
+  | "extension-sidebar"
+  | "extension-setup-begin"
+  | "extension-setup-interaction"
+  | "extension-setup-credential"
+  | "extension-setup-complete"
+  | "extension-setup-cancel"
+  | "extension-setup-revoke">;
+
+function isMobileExtensionReceiptKind(kind: PendingOperation["kind"]): kind is MobileExtensionReceiptKind {
+  return kind === "extension-enabled" || kind === "extension-sidebar"
+    || kind === "extension-setup-begin" || kind === "extension-setup-interaction"
+    || kind === "extension-setup-credential" || kind === "extension-setup-complete"
+    || kind === "extension-setup-cancel" || kind === "extension-setup-revoke";
+}
+
+function mobileExtensionPendingMutationKind(kind: MobileExtensionReceiptKind): MobileExtensionPendingMutationKind {
+  switch (kind) {
+    case "extension-enabled": return "enabled";
+    case "extension-sidebar": return "sidebar";
+    case "extension-setup-begin": return "setupBegin";
+    case "extension-setup-interaction": return "setupInteraction";
+    case "extension-setup-credential": return "setupCredential";
+    case "extension-setup-complete": return "setupComplete";
+    case "extension-setup-cancel": return "setupCancel";
+    case "extension-setup-revoke": return "setupRevoke";
+  }
+}
+
 function trackedOperation(operation: Operation): TrackedMutationResult {
   const rejected = operation.state === OperationState.FAILED
     || operation.state === OperationState.CONFLICT
@@ -933,7 +965,38 @@ export class MobileClient {
     };
     const pendingForExtension = (extensionId: string): boolean => this.#state.pending.some((receipt) =>
       receipt.connectionId === context.credential.connectionId && receipt.extensionId === extensionId
-      && (receipt.kind === "extension-enabled" || receipt.kind === "extension-sidebar"));
+      && isMobileExtensionReceiptKind(receipt.kind));
+    const submitExtensionMutation = async (
+      extension: MobileExtension,
+      receiptKind: MobileExtensionReceiptKind,
+      mutation: OperationMutation,
+      signal: AbortSignal,
+      verify: (current: MobileExtension) => boolean
+    ): Promise<MobileExtensionMutationResult> => {
+      const result = await this.#submitTerminal(mutation, {
+        kind: receiptKind,
+        extensionId: extension.extensionId,
+        extensionRevision: extension.revision.toString(10)
+      }, undefined, false, false, {
+        signal,
+        isCurrent,
+        beforeTerminalReceipt: async (operation) => {
+          if (operation.state === OperationState.SUCCEEDED) this.#assertExtensionMutationAcknowledgement(operation);
+        }
+      });
+      requireCurrent(signal);
+      if (!result.definitive) {
+        throw new Error("The Extension change result is unknown. Check its operation receipt; the change was not resent.");
+      }
+      if (!result.accepted || result.operation?.state !== OperationState.SUCCEEDED) {
+        throw new Error(result.operation?.error?.message || "The Extension change was rejected.");
+      }
+      const refreshed = await refreshExact(extension.extensionId, signal);
+      if (!verify(refreshed.extension)) {
+        throw new Error("The Extension changed again before its updated state could be confirmed.");
+      }
+      return refreshed;
+    };
     const mutate = (
       expected: MobileExtension,
       kind: "enabled" | "sidebar",
@@ -965,53 +1028,229 @@ export class MobileClient {
                 expectedRevision: { value: extension.revision }
               } }
         });
-        const result = await this.#submitTerminal(mutation, {
-          kind: kind === "enabled" ? "extension-enabled" : "extension-sidebar",
-          extensionId: extension.extensionId,
-          extensionRevision: extension.revision.toString(10)
-        }, undefined, false, false, {
-          signal: current,
-          isCurrent,
-          beforeTerminalReceipt: async (operation) => {
-            if (operation.state === OperationState.SUCCEEDED) this.#assertExtensionMutationAcknowledgement(operation);
-          }
-        });
-        requireCurrent(current);
-        if (!result.definitive) {
-          throw new Error("The Extension change result is unknown. Check its operation receipt; the change was not resent.");
-        }
-        if (!result.accepted || result.operation?.state !== OperationState.SUCCEEDED) {
-          throw new Error(result.operation?.error?.message || "The Extension change was rejected.");
-        }
-        const refreshed = await refreshExact(extension.extensionId, current);
-        const applied = kind === "enabled"
-          ? refreshed.extension.enabled === value
-          : refreshed.extension.sidebarVisible === value;
-        if (!applied) throw new Error("The Extension changed again before its updated state could be confirmed.");
-        return refreshed;
+        return submitExtensionMutation(
+          extension,
+          kind === "enabled" ? "extension-enabled" : "extension-sidebar",
+          mutation,
+          current,
+          (refreshed) => kind === "enabled" ? refreshed.enabled === value : refreshed.sidebarVisible === value
+        );
       } finally {
         this.#releaseMutation(action);
       }
     });
+    const activeSetupAttempt = (extension: MobileExtension): string => {
+      if (extension.setup.state !== "inProgress" || extension.setup.attemptId === undefined) {
+        throw new Error("Begin a current Extension setup attempt before changing its fields.");
+      }
+      return extension.setup.attemptId;
+    };
+    const setupField = (extension: MobileExtension, fieldId: string) => {
+      const matches = extension.setup.fields.filter((field) => field.fieldId === fieldId);
+      if (matches.length !== 1) throw new Error("Select a current Extension setup field.");
+      return matches[0]!;
+    };
+    const setupMutation = (
+      expected: MobileExtension,
+      receiptKind: Exclude<MobileExtensionReceiptKind, "extension-enabled" | "extension-sidebar">,
+      prepare: (
+        extension: MobileExtension,
+        signal: AbortSignal
+      ) => Promise<{ readonly mutation: OperationMutation; readonly verify: (current: MobileExtension) => boolean }>
+        | { readonly mutation: OperationMutation; readonly verify: (current: MobileExtension) => boolean },
+      signal: AbortSignal
+    ): Promise<MobileExtensionMutationResult> => owned(signal, async (current) => {
+      const extension = await readExactDetail(expected, current);
+      if (pendingForExtension(extension.extensionId)) {
+        throw new Error("A previous change to this Extension still has an unresolved result. Check its operation receipt first.");
+      }
+      const action = this.#claimMutation();
+      try {
+        const prepared = await prepare(extension, current);
+        requireCurrent(current);
+        return await submitExtensionMutation(extension, receiptKind, prepared.mutation, current, prepared.verify);
+      } finally {
+        this.#releaseMutation(action);
+      }
+    });
+    const beginSetup = (expected: MobileExtension, signal: AbortSignal) => setupMutation(
+      expected,
+      "extension-setup-begin",
+      (extension) => {
+        if (extension.setup.state !== "required" && extension.setup.state !== "cancelled"
+          && extension.setup.state !== "failed") {
+          throw new Error("This Extension setup cannot be started from its current state.");
+        }
+        return {
+          mutation: create(OperationMutationSchema, { payload: { case: "beginExtensionSetup", value: {
+            extensionId: extension.extensionId,
+            expectedRevision: { value: extension.revision }
+          } } }),
+          verify: (current) => current.setup.state === "inProgress" && current.setup.attemptId !== undefined
+        };
+      },
+      signal
+    );
+    const submitSetupInteraction = (
+      expected: MobileExtension,
+      fieldId: string,
+      value: string | boolean,
+      signal: AbortSignal
+    ) => setupMutation(expected, "extension-setup-interaction", (extension) => {
+      const attemptId = activeSetupAttempt(extension);
+      const field = setupField(extension, fieldId);
+      let wireValue: { readonly case: "text"; readonly value: string }
+        | { readonly case: "confirmed"; readonly value: boolean };
+      let expectedConfigured: boolean;
+      if (field.kind === "confirmation") {
+        if (typeof value !== "boolean") throw new Error("This Extension setup confirmation requires a yes or no value.");
+        wireValue = { case: "confirmed", value };
+        expectedConfigured = value;
+      } else {
+        if (field.kind !== "text" || typeof value !== "string") {
+          throw new Error("This Extension setup field must use its protected credential channel.");
+        }
+        const normalized = value.trim();
+        if (normalized.length === 0 || normalized.length > 8_192 || normalized.includes("\0")) {
+          throw new Error("The Extension setup value is invalid.");
+        }
+        if (field.options.length > 0 && !field.options.includes(normalized)) {
+          throw new Error("Select one of the current Extension setup choices.");
+        }
+        wireValue = { case: "text", value: normalized };
+        expectedConfigured = true;
+      }
+      return {
+        mutation: create(OperationMutationSchema, { payload: { case: "submitExtensionSetupInteraction", value: {
+          extensionId: extension.extensionId,
+          attemptId,
+          fieldId: field.fieldId,
+          value: wireValue,
+          expectedRevision: { value: extension.revision }
+        } } }),
+        verify: (current) => current.setup.state === "inProgress"
+          && current.setup.attemptId === attemptId
+          && current.setup.fields.find((candidate) => candidate.fieldId === field.fieldId)?.configured === expectedConfigured
+      };
+    }, signal);
+    const saveSetupCredential = (
+      expected: MobileExtension,
+      fieldId: string,
+      kind: MobileExtensionCredentialKind,
+      secret: string,
+      signal: AbortSignal
+    ) => setupMutation(expected, "extension-setup-credential", async (extension, current) => {
+      const attemptId = activeSetupAttempt(extension);
+      const field = setupField(extension, fieldId);
+      if (field.kind !== "secret" && field.kind !== "oauth") {
+        throw new Error("This Extension setup field does not accept a protected credential.");
+      }
+      if (field.kind === "oauth" && kind !== "oauth") {
+        throw new Error("This Extension setup field requires an OAuth credential.");
+      }
+      if (secret.length === 0 || secret.length > 64 * 1024 || secret.includes("\0")) {
+        throw new Error("The Extension credential input is invalid.");
+      }
+      const ticketId = await this.network.uploadExtensionSetupCredential(
+        context.credential,
+        extension.extensionId,
+        attemptId,
+        field.fieldId,
+        kind,
+        secret,
+        current
+      );
+      requireCurrent(current);
+      return {
+        mutation: create(OperationMutationSchema, { payload: { case: "commitExtensionSetupCredential", value: {
+          extensionId: extension.extensionId,
+          attemptId,
+          fieldId: field.fieldId,
+          credentialUploadTicketId: ticketId,
+          expectedRevision: { value: extension.revision }
+        } } }),
+        verify: (refreshed) => refreshed.setup.state === "inProgress"
+          && refreshed.setup.attemptId === attemptId
+          && refreshed.setup.fields.find((candidate) => candidate.fieldId === field.fieldId)?.configured === true
+      };
+    }, signal);
+    const completeSetup = (expected: MobileExtension, signal: AbortSignal) => setupMutation(
+      expected,
+      "extension-setup-complete",
+      (extension) => {
+        const attemptId = activeSetupAttempt(extension);
+        if (extension.setup.fields.some((field) => field.required && !field.configured)) {
+          throw new Error("Complete every required Extension setup field first.");
+        }
+        return {
+          mutation: create(OperationMutationSchema, { payload: { case: "completeExtensionSetup", value: {
+            extensionId: extension.extensionId,
+            attemptId,
+            expectedRevision: { value: extension.revision }
+          } } }),
+          verify: (current) => current.setup.state === "ready"
+        };
+      },
+      signal
+    );
+    const cancelSetup = (expected: MobileExtension, signal: AbortSignal) => setupMutation(
+      expected,
+      "extension-setup-cancel",
+      (extension) => {
+        const attemptId = activeSetupAttempt(extension);
+        return {
+          mutation: create(OperationMutationSchema, { payload: { case: "cancelExtensionSetup", value: {
+            extensionId: extension.extensionId,
+            attemptId,
+            expectedRevision: { value: extension.revision }
+          } } }),
+          verify: (current) => current.setup.state === "cancelled"
+        };
+      },
+      signal
+    );
+    const revokeSetup = (expected: MobileExtension, signal: AbortSignal) => setupMutation(
+      expected,
+      "extension-setup-revoke",
+      (extension) => {
+        if (extension.setup.state !== "ready") throw new Error("Only a ready Extension setup can be revoked.");
+        return {
+          mutation: create(OperationMutationSchema, { payload: { case: "revokeExtensionSetup", value: {
+            extensionId: extension.extensionId,
+            expectedRevision: { value: extension.revision }
+          } } }),
+          verify: (current) => current.setup.state === "required"
+            && current.setup.attemptId === undefined
+            && current.setup.fields.every((field) => !field.configured)
+        };
+      },
+      signal
+    );
     const exactPending = (operationId: string) => {
       const matches = this.#state.pending.filter((receipt) => receipt.operationId === operationId
         && receipt.connectionId === context.credential.connectionId
-        && (receipt.kind === "extension-enabled" || receipt.kind === "extension-sidebar"));
+        && isMobileExtensionReceiptKind(receipt.kind));
       if (matches.length !== 1) throw new Error("Select a current Extension operation receipt.");
       return matches[0]!;
     };
     return {
       ownerKey,
       pending: Object.freeze(this.#state.pending.flatMap((receipt) => receipt.connectionId === context.credential.connectionId
-        && receipt.extensionId !== undefined && (receipt.kind === "extension-enabled" || receipt.kind === "extension-sidebar")
+        && receipt.extensionId !== undefined && isMobileExtensionReceiptKind(receipt.kind)
         ? [{ operationId: receipt.operationId, extensionId: receipt.extensionId,
-            kind: receipt.kind === "extension-enabled" ? "enabled" as const : "sidebar" as const,
+            kind: mobileExtensionPendingMutationKind(receipt.kind),
             state: receipt.state }]
         : [])),
       list: (signal) => owned(signal, (current) => this.network.listExtensions(context.credential, current)),
       detail: (expected, signal) => owned(signal, (current) => readExactDetail(expected, current)),
       setEnabled: (expected, enabled, signal) => mutate(expected, "enabled", enabled, signal),
       setSidebarVisible: (expected, visible, signal) => mutate(expected, "sidebar", visible, signal),
+      beginSetup,
+      submitSetupInteraction,
+      saveSetupCredential,
+      completeSetup,
+      cancelSetup,
+      revokeSetup,
       reconcile: (operationId, signal) => owned(signal, async (current) => {
         exactPending(operationId);
         await this.reconcile();
@@ -11843,7 +12082,7 @@ export class MobileClient {
           }
           const messageRewind = pending.kind === "session-rewind" || pending.kind === "workspace-rewind";
           const exactOperation = operation.operationId === pending.operationId && operation.connectionId === pending.connectionId;
-          if ((pending.kind === "extension-enabled" || pending.kind === "extension-sidebar")
+          if (isMobileExtensionReceiptKind(pending.kind)
             && exactOperation && operation.state === OperationState.SUCCEEDED) {
             this.#assertExtensionMutationAcknowledgement(operation);
           }

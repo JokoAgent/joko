@@ -62,6 +62,13 @@ describe("mobile Extension catalog projection", () => {
     ["missing owner", (value: ExtensionCatalogEntry) => { value.owner = undefined; }],
     ["duplicate tools", (value: ExtensionCatalogEntry) => { value.tools.push(value.tools[0]!); }],
     ["unknown setup field", (value: ExtensionCatalogEntry) => { value.setup!.fields[0]!.kind = 99 as ExtensionSetupFieldKind; }],
+    ["active setup without attempt", (value: ExtensionCatalogEntry) => {
+      value.setup!.state = ExtensionSetupState.IN_PROGRESS;
+      value.setup!.revision = create(RevisionSchema, { value: 1n });
+    }],
+    ["secret setup choices", (value: ExtensionCatalogEntry) => {
+      value.setup!.fields[0]!.kind = ExtensionSetupFieldKind.SECRET;
+    }],
     ["inconsistent main view", (value: ExtensionCatalogEntry) => { value.sidebarSupported = false; }],
     ["unknown Library schema", (value: ExtensionCatalogEntry) => { value.library!.schemaVersion = 2; }]
   ])("rejects %s", (_name, mutate) => {
@@ -70,12 +77,16 @@ describe("mobile Extension catalog projection", () => {
     expect(() => projectMobileExtension(value)).toThrow(/invalid Extension/u);
   });
 
-  it("binds the visible row key to revision, owner, state, and enabled status", () => {
+  it("binds the visible row key to revision, owner, control state, and exact setup attempt", () => {
     const first = projectMobileExtension(fixture(1));
     const changed = projectMobileExtension(fixture(1));
     changed.owner.kind === "resource" && Object.assign(changed.owner, { resourceRevision: 4n });
+    const setupChanged = projectMobileExtension(fixture(1));
+    Object.assign(setupChanged.setup, { revision: 1n, state: "inProgress", attemptId: "attempt-1" });
+    Object.assign(setupChanged.setup.fields[0]!, { configured: false });
 
     expect(mobileExtensionKey(first)).not.toBe(mobileExtensionKey(changed));
+    expect(mobileExtensionKey(first)).not.toBe(mobileExtensionKey(setupChanged));
   });
 });
 
