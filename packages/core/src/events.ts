@@ -113,6 +113,8 @@ export type EventPayload =
   | { readonly type: "device_changed"; readonly device: DeviceContentProjection }
   /** Content-free signal that the durable Session projection changed. */
   | { readonly type: "session_changed" }
+  /** Immutable owner catalog snapshot after a committed label mutation. */
+  | { readonly type: "task_tag_catalog_changed"; readonly catalog: import("./types.js").TaskTagCatalog }
   | { readonly type: "text_delta"; readonly blockId: string; readonly delta: string; readonly contentIndex?: number; readonly nativeHistory?: NativeHistoryEventContext }
   | { readonly type: "thinking_delta"; readonly blockId: string; readonly delta: string; readonly contentIndex?: number; readonly nativeHistory?: NativeHistoryEventContext }
   | {

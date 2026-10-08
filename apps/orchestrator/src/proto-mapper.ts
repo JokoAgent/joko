@@ -251,6 +251,9 @@ import type {
   SessionAttention as CoreSessionAttention,
   SessionDescriptor,
   SessionWorktreeBinding,
+  TaskTagCatalog as CoreTaskTagCatalog,
+  TaskTagColor as CoreTaskTagColor,
+  TaskTagDescriptor,
   SubagentActivityEntry,
   SubagentChildRun,
   SubagentRun,
@@ -303,6 +306,7 @@ import {
   type StoredRun,
   type StoredSession,
   type StoredTarget,
+  type TaskTagDeletePreview,
   type ToolLeaseRecord,
   type UpsertScheduleInput
 } from "@joko/store";
@@ -707,6 +711,7 @@ export function toProtoSession(record: StoredSession, context: SessionMappingCon
           autoRetry: context.contextState.autoRetry
         }),
     codeHostPullRequests: (context.codeHostPullRequests ?? []).map(toProtoCodeHostPullRequest),
+    taskTags: (session.taskTags ?? []).map(toProtoTaskTag),
     attention: session.attention === undefined ? undefined : toProtoSessionAttention(session.attention),
     worktree: session.worktree === undefined ? undefined : toProtoSessionWorktree(session.worktree),
     location: toProtoWorkspaceLocation(session.remoteWorkspace),
@@ -865,9 +870,108 @@ export function fromProtoSession(session: ProtoSession): SessionDescriptor {
       : { effort: session.model.effortId }),
     fastMode: session.model?.fastMode ?? false,
     ...(session.attention === undefined ? {} : { attention: fromProtoSessionAttention(session.attention) }),
+    taskTags: session.taskTags.map(fromProtoTaskTag),
     createdAt,
     updatedAt
   };
+}
+
+export function toProtoTaskTag(tag: TaskTagDescriptor): contract.TaskTag {
+  return message<contract.TaskTag>("joko.v1.TaskTag", {
+    taskTagId: tag.id,
+    name: tag.name,
+    color: toProtoTaskTagColor(tag.color),
+    ...(tag.presetKey === undefined ? {} : { presetKey: tag.presetKey }),
+    nameCustomized: tag.nameCustomized,
+    sortOrder: tag.sortOrder,
+    revision: toProtoRevision(tag.revision),
+    associationRevision: toProtoRevision(tag.associationRevision),
+    createdAt: toProtoTimestamp(tag.createdAt),
+    updatedAt: toProtoTimestamp(tag.updatedAt)
+  });
+}
+
+export function toProtoTaskTagCatalog(catalog: CoreTaskTagCatalog): contract.TaskTagCatalog {
+  return message<contract.TaskTagCatalog>("joko.v1.TaskTagCatalog", {
+    taskTags: catalog.tags.map(toProtoTaskTag),
+    revision: toProtoRevision(catalog.revision)
+  });
+}
+
+export function fromProtoTaskTagCatalog(catalog: contract.TaskTagCatalog): CoreTaskTagCatalog {
+  const tags = catalog.taskTags.map(fromProtoTaskTag);
+  if (new Set(tags.map((tag) => tag.id)).size !== tags.length) {
+    throw new ProtoMappingError("invalid_argument", "task_tag_catalog.task_tags", "Task tag catalog contains duplicate IDs.");
+  }
+  return {
+    tags,
+    revision: fromProtoRevision(catalog.revision, "task_tag_catalog.revision")
+  };
+}
+
+export function toProtoTaskTagDeletePreview(preview: TaskTagDeletePreview): contract.TaskTagDeletePreview {
+  return message<contract.TaskTagDeletePreview>("joko.v1.TaskTagDeletePreview", {
+    taskTagId: preview.tagId,
+    affectedSessionCount: BigInt(preview.affectedSessionCount),
+    tagRevision: toProtoRevision(preview.tagRevision),
+    associationRevision: toProtoRevision(preview.associationRevision)
+  });
+}
+
+function fromProtoTaskTag(tag: contract.TaskTag): TaskTagDescriptor {
+  const createdAt = fromProtoTimestamp(tag.createdAt, "task_tag.created_at") ?? 0;
+  const updatedAt = fromProtoTimestamp(tag.updatedAt, "task_tag.updated_at") ?? createdAt;
+  if (!Number.isSafeInteger(tag.sortOrder) || tag.sortOrder < 0 || tag.sortOrder > 255) {
+    throw new ProtoMappingError("out_of_range", "task_tag.sort_order", "Task tag order is invalid.");
+  }
+  return {
+    id: requireText(tag.taskTagId, "task_tag.task_tag_id"),
+    name: requireText(tag.name, "task_tag.name"),
+    color: fromProtoTaskTagColor(tag.color),
+    ...(tag.presetKey === undefined ? {} : { presetKey: requireText(tag.presetKey, "task_tag.preset_key") }),
+    nameCustomized: tag.nameCustomized,
+    sortOrder: tag.sortOrder,
+    revision: fromProtoRevision(tag.revision, "task_tag.revision"),
+    associationRevision: fromProtoRevision(tag.associationRevision, "task_tag.association_revision"),
+    createdAt,
+    updatedAt
+  };
+}
+
+function toProtoTaskTagColor(color: CoreTaskTagColor): contract.TaskTagColor {
+  switch (color) {
+    case "red": return contract.TaskTagColor.RED;
+    case "orange": return contract.TaskTagColor.ORANGE;
+    case "yellow": return contract.TaskTagColor.YELLOW;
+    case "green": return contract.TaskTagColor.GREEN;
+    case "blue": return contract.TaskTagColor.BLUE;
+    case "purple": return contract.TaskTagColor.PURPLE;
+    case "gray": return contract.TaskTagColor.GRAY;
+    case "pink": return contract.TaskTagColor.PINK;
+    case "coral": return contract.TaskTagColor.CORAL;
+    case "teal": return contract.TaskTagColor.TEAL;
+    case "indigo": return contract.TaskTagColor.INDIGO;
+    case "white": return contract.TaskTagColor.WHITE;
+  }
+}
+
+export function fromProtoTaskTagColor(color: contract.TaskTagColor): CoreTaskTagColor {
+  switch (color) {
+    case contract.TaskTagColor.RED: return "red";
+    case contract.TaskTagColor.ORANGE: return "orange";
+    case contract.TaskTagColor.YELLOW: return "yellow";
+    case contract.TaskTagColor.GREEN: return "green";
+    case contract.TaskTagColor.BLUE: return "blue";
+    case contract.TaskTagColor.PURPLE: return "purple";
+    case contract.TaskTagColor.GRAY: return "gray";
+    case contract.TaskTagColor.PINK: return "pink";
+    case contract.TaskTagColor.CORAL: return "coral";
+    case contract.TaskTagColor.TEAL: return "teal";
+    case contract.TaskTagColor.INDIGO: return "indigo";
+    case contract.TaskTagColor.WHITE: return "white";
+    default:
+      throw new ProtoMappingError("invalid_argument", "task_tag.color", "Task tag color is required.");
+  }
 }
 
 export function toProtoAttempt(record: StoredAttempt, run: StoredRun): Attempt {
@@ -2827,6 +2931,13 @@ function toProtoEventPayload(event: PersistedEvent, context: EventMappingContext
       return protoPayload("sessionChanged", message<contract.SessionChangedEvent>("joko.v1.SessionChangedEvent", {
         session: toProtoSession(context.session, context.sessionContext)
       }));
+    case "task_tag_catalog_changed":
+      return protoPayload(
+        "taskTagCatalogChanged",
+        message<contract.TaskTagCatalogChangedEvent>("joko.v1.TaskTagCatalogChangedEvent", {
+          catalog: toProtoTaskTagCatalog(payload.catalog)
+        })
+      );
     case "text_delta":
       return protoPayload("textDelta", message<TextDeltaEvent>("joko.v1.TextDeltaEvent", {
         messageId: payload.blockId,
@@ -3254,6 +3365,11 @@ function fromProtoEventPayload(
       throw new ProtoMappingError("invalid_argument", "event.payload.device_changed", "Device content is owned by the Store and cannot be imported as a Session event.");
     case "sessionChanged":
       return { type: "session_changed" };
+    case "taskTagCatalogChanged": {
+      const catalog = payload.kind.value.catalog;
+      if (catalog === undefined) throw missingPayload("task_tag_catalog_changed.catalog");
+      return { type: "task_tag_catalog_changed", catalog: fromProtoTaskTagCatalog(catalog) };
+    }
     case "runChanged": {
       const run = payload.kind.value.run;
       if (run === undefined) throw missingPayload("run_changed.run");

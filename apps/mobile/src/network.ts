@@ -19,7 +19,7 @@ import {
   type DevicePeerRouteIdentity, type DiscoveredNodeRecord, type ImageThumbnail,
   type Event, type EventCursor, type FilePreview, type FileRevision, type Operation, type OperationMutation,
   type NativeSessionTree, type PendingBlobUpload, type RuntimeCommand, type Schedule, type ScheduleRunHistory,
-  type SchedulerRuntimeSnapshot, type SessionMessageSearchMatch, type SessionResource, type Snapshot, type Target,
+  type SchedulerRuntimeSnapshot, type SessionMessageSearchMatch, type SessionResource, type Snapshot, type Target, type TaskTagDeletePreview,
   type WorkspaceEntry, type WorkspaceFileChange, type WorkspaceHtmlReference, type ListPartnerSessionsResponse,
   type RemoteDesktopCapabilities, type RemoteDesktopControlState, type RemoteDesktopCursor,
   type RemoteDesktopDisplayMode, type RemoteDesktopFrameResult,
@@ -169,6 +169,7 @@ export interface MobileNetwork {
   unregisterMobilePush(origin: string, ticket: MobilePushRevocationTicket, signal?: AbortSignal): Promise<void>;
   readSession(credential: PairedCredential, sessionId: string, signal?: AbortSignal): Promise<Snapshot>;
   readNativeSessionTree(credential: PairedCredential, sessionId: string, signal?: AbortSignal): Promise<NativeSessionTree>;
+  previewTaskTagDeletion(credential: PairedCredential, taskTagId: string, signal?: AbortSignal): Promise<TaskTagDeletePreview>;
   listBackgroundTasks(credential: PairedCredential, sessionId: string, pageToken?: string, signal?: AbortSignal): Promise<{ tasks: readonly BackgroundTask[]; nextPageToken: string }>;
   listSubagentRuns(credential: PairedCredential, sessionId: string, pageToken?: string, signal?: AbortSignal): Promise<{ runs: readonly SubagentRun[]; nextPageToken: string }>;
   getSubagentRun(credential: PairedCredential, sessionId: string, runId: string, signal?: AbortSignal): Promise<SubagentRunDetail>;
@@ -1465,6 +1466,15 @@ export const mobileNetwork: MobileNetwork = {
       .getNativeSessionTree({ sessionId }, options(signal));
     if (!response.tree) throw new Error("The Joko node returned no native branch tree.");
     return response.tree;
+  },
+  async previewTaskTagDeletion(credential, taskTagId, signal) {
+    if (!taskTagId) throw new Error("An exact task tag is required.");
+    const response = await createClient(SessionService, transport(credential.origin, credential.authKey))
+      .previewTaskTagDeletion({ taskTagId }, options(signal));
+    if (!response.preview || response.preview.taskTagId !== taskTagId) {
+      throw new Error("The Joko node returned a mismatched task-tag delete preview.");
+    }
+    return response.preview;
   },
   async listBackgroundTasks(credential, sessionId, pageToken = "", signal) {
     signal?.throwIfAborted();

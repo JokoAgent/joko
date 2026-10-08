@@ -322,6 +322,93 @@ describe("ModelPicker", () => {
     expect(onSelect).toHaveBeenLastCalledWith(undefined);
   });
 
+  it("does not repeat a shared default seed while the refreshed snapshot is still arriving", async () => {
+    let release!: () => void;
+    const terminal = new Promise<void>((resolve) => { release = resolve; });
+    const onMutateFavorite = vi.fn(() => terminal);
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    roots.push(root);
+    await act(async () => root.render(<ModelPicker
+      models={models}
+      ownerId="owner-one"
+      value={undefined}
+      seedDefault={{
+        backendId: "backend-picker",
+        providerId: "provider-a",
+        modelId: "model-small",
+        effort: "high",
+        fastMode: true
+      }}
+      favoriteSettings={{ favorites: [], seeded: false, revision: 4n }}
+      onMutateFavorite={onMutateFavorite}
+      t={(key, values) => translate("en", key, values)}
+      onSelect={vi.fn()}
+    />));
+
+    expect(onMutateFavorite).toHaveBeenCalledTimes(1);
+    await act(async () => { release(); await terminal; });
+    await act(async () => Promise.resolve());
+
+    expect(onMutateFavorite).toHaveBeenCalledTimes(1);
+    expect(onMutateFavorite).toHaveBeenCalledWith({
+      kind: "seed",
+      item: expect.objectContaining({
+        backendId: "backend-picker",
+        providerId: "provider-a",
+        modelId: "model-small",
+        effort: "high",
+        fast: true
+      })
+    }, 4n);
+  });
+
+  it("persists shared favorite edits without applying them to the current task", async () => {
+    const onSelect = vi.fn<(selection: ModelPickerSelection | undefined) => void>();
+    const onMutateFavorite = vi.fn().mockResolvedValue(undefined);
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    roots.push(root);
+    await act(async () => root.render(<ModelPicker
+      models={models}
+      ownerId="owner-one"
+      value={{
+        backendId: "backend-picker", providerId: "provider-a", modelId: "model-small",
+        effort: "low", fastMode: false, favoriteUid: "favorite-shared"
+      }}
+      favoriteSettings={{
+        favorites: [{
+          uid: "favorite-shared", backendId: "backend-picker", providerId: "provider-a",
+          modelId: "model-small", effort: "low"
+        }],
+        seeded: true,
+        revision: 4n
+      }}
+      onMutateFavorite={onMutateFavorite}
+      t={(key, values) => translate("en", key, values)}
+      onSelect={onSelect}
+    />));
+    await openPicker();
+    const favorite = required([...document.body.querySelectorAll<HTMLElement>(".model-picker__row.is-favorite")]
+      .find((row) => row.textContent?.includes("Small")));
+    await act(async () => required(favorite.querySelector<HTMLButtonElement>(".model-picker__configure")).click());
+    const flyout = required(document.body.querySelector<HTMLElement>(".model-picker__config-flyout"));
+    await act(async () => required([...flyout.querySelectorAll<HTMLButtonElement>("button")]
+      .find((button) => button.textContent === "high")).click());
+    await act(async () => Promise.resolve());
+
+    expect(onMutateFavorite).toHaveBeenCalledWith({
+      kind: "replace",
+      item: {
+        uid: "favorite-shared", backendId: "backend-picker", providerId: "provider-a",
+        modelId: "model-small", effort: "high"
+      }
+    }, 4n);
+    expect(onSelect).not.toHaveBeenCalled();
+  });
+
 });
 
 async function renderPicker(

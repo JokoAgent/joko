@@ -823,7 +823,7 @@ interface ControlledNativeQueryParams {
  * public `.mts` Worker entry because the packaged `.mjs` asset is not built. */
 class StoredLocalSessionRuntime implements ClaudeSdkRuntime {
   readonly packageVersion = CLAUDE_AGENT_SDK_VERSION;
-  readonly bundledCliVersion = "2.1.259";
+  readonly bundledCliVersion = "2.1.280";
   readonly supportsWorkspaceDerivation = true;
   readonly storedSessions: ClaudeSdkStoredSessionRuntime;
   readonly #sessionOwner: SessionSdkOwner;
@@ -1175,7 +1175,7 @@ function controlledClaudeInit(nativeSessionId: string, options: ControlledNative
     subtype: "init",
     session_id: nativeSessionId,
     uuid: randomUUID(),
-    claude_code_version: "2.1.259",
+    claude_code_version: "2.1.280",
     apiKeySource: "none",
     cwd: options.cwd,
     model: options.model ?? "fixture-model",
@@ -1247,7 +1247,7 @@ class LocalSessionRuntime implements ClaudeSdkRuntime {
     });
   }
 
-  async probe() { return { installed: true, packageVersion: this.packageVersion, cliVersion: "2.1.259", initialization }; }
+  async probe() { return { installed: true, packageVersion: this.packageVersion, cliVersion: "2.1.280", initialization }; }
   async query(_params: ClaudeSdkQueryParams): Promise<ClaudeSdkQuery> { return new IdleQuery(); }
   async retireQuery(): Promise<void> { throw new Error("This Session fixture does not perform live Query replacement."); }
   async getSessionInfo(sessionId: string, options: { dir: string; signal?: AbortSignal }) {

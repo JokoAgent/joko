@@ -19,7 +19,7 @@ lines.on("line", (line) => {
     return;
   }
   if (message.method === "initialize") {
-    write({ id: message.id, result: { userAgent: "codex/0.153.4", platformFamily: "fixture", platformOs: "fixture" } });
+    write({ id: message.id, result: { userAgent: "codex/0.159.2", platformFamily: "fixture", platformOs: "fixture" } });
     return;
   }
   if (message.method === "notifications-before-response") {

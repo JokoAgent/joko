@@ -22,10 +22,11 @@ export interface PendingOperation {
     | "queue-interaction-lock" | "queue-reorder" | "interaction-resolve" | "interaction-dismiss"
     | "session-model" | "session-permission" | "session-plan" | "session-compact" | "session-branch"
     | "session-shell" | "session-reset" | "session-review" | "session-clone" | "session-fork" | "session-rewind" | "workspace-rewind"
+    | "task-tag"
     | "schedule-run" | "schedule-enable" | "schedule-run-restart" | "schedule-run-read"
     | "schedule-runs-read" | "schedule-all-read" | "schedule-run-delete"
     | "schedule-create" | "schedule-update" | "schedule-delete" | "schedule-promote"
-    | "schedule-clone" | "schedule-project-remove" | "schedule-project-reconcile" | "voice-settings";
+    | "schedule-clone" | "schedule-project-remove" | "schedule-project-reconcile" | "voice-settings" | "model-favorite";
   readonly sessionId?: string;
   readonly eventId?: string;
   readonly backendId?: string;
@@ -399,7 +400,7 @@ function isPending(value: unknown): value is PendingOperation {
       "session-branch", "session-shell", "session-reset", "session-review", "session-clone", "session-fork", "session-rewind", "workspace-rewind", "schedule-run", "schedule-enable",
       "schedule-run-restart", "schedule-run-read", "schedule-runs-read", "schedule-all-read",
       "schedule-run-delete", "schedule-create", "schedule-update", "schedule-delete", "schedule-promote",
-      "schedule-clone", "schedule-project-remove", "schedule-project-reconcile", "voice-settings"].includes(String(record.kind))
+      "schedule-clone", "schedule-project-remove", "schedule-project-reconcile", "voice-settings", "model-favorite"].includes(String(record.kind))
     || (record.state !== "unknown" && record.state !== "accepted")) return false;
   if (record.sessionId !== undefined && typeof record.sessionId !== "string") return false;
   if (record.eventId !== undefined && typeof record.eventId !== "string") return false;

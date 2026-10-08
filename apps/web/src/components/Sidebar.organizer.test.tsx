@@ -780,10 +780,10 @@ describe("Sidebar organizer display controls", () => {
         origin: "https://remote.example",
         updatedAt: now,
         sessions: [
-          { id: "remote-fresh", name: "Fresh", state: "idle", pinned: false, archived: false, lastActivityAt: now - 1_000 },
-          { id: "remote-old", name: "Old", state: "idle", pinned: false, archived: false, lastActivityAt: now - 60 * 86_400_000 },
-          { id: "remote-pinned", name: "Pinned", state: "idle", pinned: true, archived: false, lastActivityAt: now - 60 * 86_400_000 },
-          { id: "remote-archived", name: "Archived", state: "idle", pinned: false, archived: true, lastActivityAt: now - 1_000 }
+          { id: "remote-fresh", name: "Fresh", state: "idle", pinned: false, archived: false, taskTags: [], lastActivityAt: now - 1_000 },
+          { id: "remote-old", name: "Old", state: "idle", pinned: false, archived: false, taskTags: [], lastActivityAt: now - 60 * 86_400_000 },
+          { id: "remote-pinned", name: "Pinned", state: "idle", pinned: true, archived: false, taskTags: [], lastActivityAt: now - 60 * 86_400_000 },
+          { id: "remote-archived", name: "Archived", state: "idle", pinned: false, archived: true, taskTags: [], lastActivityAt: now - 1_000 }
         ]
       }],
       selection: "all",

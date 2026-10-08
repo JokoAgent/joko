@@ -297,7 +297,7 @@ describe("Remote Host gateway", () => {
       requests.push({ method, input });
       if (method === "probeRemoteBackendRuntime") return create(ProbeRemoteBackendRuntimeResponseSchema, { runtime: runtime() });
       if (method === "uninstallRemoteBackendRuntime") return create(UninstallRemoteBackendRuntimeResponseSchema, {
-        runtime: runtime({ state: RemoteBackendRuntimeState.NOT_INSTALLED, installedVersion: "0.153.4", canInstall: true, canReinstall: false, canUninstall: false })
+        runtime: runtime({ state: RemoteBackendRuntimeState.NOT_INSTALLED, installedVersion: "0.159.2", canInstall: true, canReinstall: false, canUninstall: false })
       });
       throw new Error(`Unexpected method: ${method}`);
     });
@@ -326,7 +326,7 @@ describe("Remote Host gateway", () => {
     await gateway.connect();
 
     await expect(gateway.probeRemoteBackendRuntime("target-one", "build-box", 7n, 4n)).resolves.toMatchObject({
-      displayName: "Codex", expectedVersion: "0.153.4", installedVersion: "0.153.4", state: "ready",
+      displayName: "Codex", expectedVersion: "0.159.2", installedVersion: "0.159.2", state: "ready",
       targetRevision: 7n, hostRevision: 4n
     });
     const progress = [];
@@ -714,8 +714,8 @@ function runtime(patch: Record<string, unknown> = {}): any {
     targetId: "target-one",
     hostId: "build-box",
     displayName: "Codex",
-    expectedVersion: "0.153.4",
-    installedVersion: "0.153.4",
+    expectedVersion: "0.159.2",
+    installedVersion: "0.159.2",
     state: RemoteBackendRuntimeState.READY,
     canInstall: false,
     canReinstall: true,

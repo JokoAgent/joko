@@ -25,7 +25,7 @@ import {
   ScheduleDeletionResultSchema, ScheduleRunCostAttribution, ScheduleRunHistorySchema, ScheduleRunOutcome, ScheduleRunPhase, ScheduleSchema,
   ScheduleSessionMode, ScheduleSource, ScheduleState, SchedulerRuntimeSnapshotSchema,
   SessionContextStateSchema, SessionDerivationKind, SessionDerivationOriginSchema, SessionMessageSearchSessionStatus, SessionSchema, SessionState, SnapshotSchema,
-  SessionWorktreeSchema, TargetState, ToolCallOutputMode, WorkspaceKind, WorkspaceLocationSchema, capabilityNames, nativeSessionTreeWireFields
+  SessionWorktreeSchema, TargetState, TaskTagColor, TaskTagDeletePreviewSchema, ToolCallOutputMode, WorkspaceKind, WorkspaceLocationSchema, capabilityNames, nativeSessionTreeWireFields
 } from "@joko/contracts";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MobileClient, type MobileStorage, type PendingOperation } from "./mobile-client";
@@ -789,6 +789,19 @@ function runtimeControlProjection(currentSession = runtimeSession, detail = fals
       providers: runtimeProviders,
       settings: create(SettingsSnapshotSchema, {
         revision: create(RevisionSchema, { value: 6n }),
+        modelFavorites: {
+          favorites: [{
+            favoriteId: "favorite-alpha",
+            backendId: "backend",
+            selection: {
+              model: { providerId: "alpha", modelId: "a" },
+              effortId: "low",
+              fastMode: false
+            }
+          }],
+          seeded: true,
+          revision: { value: 7n }
+        },
         backends: [create(BackendSettingsSchema, {
           backendId: "backend", enabled: true, modelAccess: create(BackendModelAccessSettingsSchema, {})
         })]
@@ -969,6 +982,11 @@ function fakeNetwork(): MobileNetwork {
         }),
         children: []
       }])
+    })),
+    previewTaskTagDeletion: vi.fn(async (_credential, taskTagId) => create(TaskTagDeletePreviewSchema, {
+      taskTagId,
+      tagRevision: create(RevisionSchema, { value: 1n }),
+      associationRevision: create(RevisionSchema, { value: 1n })
     })),
     readHistory: vi.fn(async () => ({ events: [], before: undefined })),
     readAround: vi.fn(async () => []),
@@ -4753,6 +4771,49 @@ describe("mobile Home search and task mutations", () => {
     expect(saved.pending()).toEqual([]);
   });
 
+  it("submits the current host task-tag operations and preserves exact deletion fences", async () => {
+    const network = fakeNetwork();
+    const saved = memoryStorage(credential);
+    const app = client(network, saved.storage);
+    await app.start();
+
+    await expect(app.createTaskTag("session", "Release", TaskTagColor.TEAL, 4n)).resolves.toBe(true);
+    await expect(app.updateTaskTag("session", "tag-release", 5n, { name: "Launch", color: TaskTagColor.INDIGO }))
+      .resolves.toBe(true);
+    await expect(app.reorderTaskTags("session", ["tag-release", "preset:work"], 6n)).resolves.toBe(true);
+    await expect(app.setSessionTaskTag("session", "tag-release", true)).resolves.toBe(true);
+    await expect(app.setSessionTaskTag("session", "tag-release", false)).resolves.toBe(true);
+    const preview = await app.previewTaskTagDeletion("tag-release");
+    await expect(app.deleteTaskTag("session", preview)).resolves.toBe(true);
+
+    const mutations = vi.mocked(network.submit).mock.calls.map((call) => call[2]);
+    expect(mutations.map((mutation) => mutation.payload.case)).toEqual([
+      "createTaskTag", "updateTaskTag", "reorderTaskTags", "setSessionTaskTags", "setSessionTaskTags", "deleteTaskTag"
+    ]);
+    expect(mutations[0]?.payload.value).toMatchObject({
+      originSessionId: "session", name: "Release", color: TaskTagColor.TEAL,
+      expectedCatalogRevision: { value: 4n }
+    });
+    expect(mutations[1]?.payload.value).toMatchObject({
+      originSessionId: "session", taskTagId: "tag-release", name: "Launch", color: TaskTagColor.INDIGO,
+      expectedRevision: { value: 5n }
+    });
+    expect(mutations[2]?.payload.value).toMatchObject({
+      originSessionId: "session", taskTagIds: ["tag-release", "preset:work"],
+      expectedCatalogRevision: { value: 6n }
+    });
+    expect(mutations[3]?.payload.value).toMatchObject({
+      originSessionId: "session", sessionIds: ["session"], taskTagIds: ["tag-release"], attached: true
+    });
+    expect(mutations[4]?.payload.value).toMatchObject({ attached: false });
+    expect(mutations[5]?.payload.value).toMatchObject({
+      originSessionId: "session", taskTagId: "tag-release",
+      expectedTagRevision: { value: 1n }, expectedAssociationRevision: { value: 1n }
+    });
+    expect(network.previewTaskTagDeletion).toHaveBeenCalledWith(credential, "tag-release", undefined);
+    expect(saved.pending()).toEqual([]);
+  });
+
   it("persists an unknown task action before dispatch and never resends it", async () => {
     const network = fakeNetwork();
     const saved = memoryStorage(credential);
@@ -6918,6 +6979,52 @@ describe("native current-task runtime controls", () => {
     await expect(app.setTaskPlanMode(authorityKey, true)).rejects.toThrow(/still pending/u);
     expect(network.submit).toHaveBeenCalledTimes(1);
     expect(network.waitOperation).toHaveBeenCalledTimes(1);
+  });
+
+  it("submits a shared model favorite with the exact settings revision and a body-free receipt", async () => {
+    const network = fakeNetwork();
+    const saved = memoryStorage(credential);
+    network.readOwner = vi.fn(async () => ({ connection, device, snapshot: runtimeControlProjection(runtimeSession, false) }));
+    network.readSession = vi.fn(async () => runtimeControlProjection(runtimeSession, true));
+    const app = client(network, saved.storage, undefined, undefined, ids());
+    await app.start();
+    const controls = app.taskRuntimeControls()!;
+
+    await expect(app.mutateTaskModelFavorite(controls.surfaceOwnerKey, controls.favoriteRevision, {
+      kind: "add",
+      item: {
+        favoriteId: "favorite-beta",
+        backendId: "backend",
+        providerId: "beta",
+        modelId: "b",
+        effortId: "high",
+        fastMode: true
+      }
+    })).resolves.toBe(true);
+
+    expect(saved.storage.savePending).toHaveBeenCalledBefore(network.submit as ReturnType<typeof vi.fn>);
+    expect(vi.mocked(network.submit).mock.calls[0]?.[2]).toMatchObject({
+      preconditions: [],
+      payload: {
+        case: "updateModelFavorites",
+        value: {
+          expectedRevision: { value: 7n },
+          change: {
+            case: "add",
+            value: {
+              favoriteId: "favorite-beta",
+              backendId: "backend",
+              selection: {
+                model: { providerId: "beta", modelId: "b" },
+                effortId: "high",
+                fastMode: true
+              }
+            }
+          }
+        }
+      }
+    });
+    expect(saved.pending()).toEqual([]);
   });
 
   it("reconciles a saved control receipt after restart without dispatching it again", async () => {

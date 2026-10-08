@@ -5,17 +5,11 @@ import {
   mergeObservedProviderDisplayOrder,
   normalizeProviderDisplayOrder
 } from "./provider-display-order.js";
+import type { ModelFavoriteConfigurationView } from "./model.js";
 
 export type ModelPickerLayout = "original" | "classic" | "badge";
 
-export interface ModelFavoriteConfiguration {
-  readonly uid: string;
-  readonly backendId: string;
-  readonly providerId: string;
-  readonly modelId: string;
-  readonly effort?: string;
-  readonly fast?: true;
-}
+export type ModelFavoriteConfiguration = ModelFavoriteConfigurationView;
 
 export interface ModelRowConfiguration {
   readonly effort?: string;

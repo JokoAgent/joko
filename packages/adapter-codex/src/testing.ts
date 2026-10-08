@@ -140,6 +140,24 @@ export class FakeCodexAppServer {
     rateLimitsByLimitId: null,
     rateLimitResetCredits: null
   };
+  modelList: readonly JsonObject[] = [{
+    id: "model-record",
+    model: "gpt-test",
+    displayName: "GPT Test",
+    hidden: false,
+    supportedReasoningEfforts: [
+      { reasoningEffort: "medium", description: "" },
+      { reasoningEffort: "high", description: "" }
+    ],
+    defaultReasoningEffort: "medium",
+    inputModalities: ["text", "image"],
+    serviceTiers: [
+      { id: "default", name: "Default", description: "" },
+      { id: "fast", name: "Fast", description: "" }
+    ],
+    defaultServiceTier: "default",
+    isDefault: true
+  }];
   failNextAccountRead = false;
   failNextModelList = false;
   failNextThreadResumeCode: number | undefined;
@@ -151,7 +169,7 @@ export class FakeCodexAppServer {
   nextNativeMemoryStatusResponse: JsonValue | undefined;
   nativeMemoryResetCount = 0;
   nativeMemoryEnabled = false;
-  userAgent = "joko/0.153.4 (Windows 10.0.26200; x86_64) unknown (joko; 0.1.0)";
+  userAgent = "joko/0.159.2 (Windows 10.0.26200; x86_64) unknown (joko; 0.1.0)";
   codexHome = "/private";
   readonly reviewSkills: JsonObject[] = [];
   readonly reviewSkillErrors: JsonObject[] = [];
@@ -362,24 +380,7 @@ export class FakeCodexAppServer {
           throw new RpcRemoteFault(-32001);
         }
         return {
-          data: [{
-            id: "model-record",
-            model: "gpt-test",
-            displayName: "GPT Test",
-            hidden: false,
-            supportedReasoningEfforts: [
-              { reasoningEffort: "medium", description: "" },
-              { reasoningEffort: "high", description: "" }
-            ],
-            defaultReasoningEffort: "medium",
-            inputModalities: ["text", "image"],
-            serviceTiers: [
-              { id: "default", name: "Default", description: "" },
-              { id: "fast", name: "Fast", description: "" }
-            ],
-            defaultServiceTier: "default",
-            isDefault: true
-          }],
+          data: [...this.modelList],
           nextCursor: this.modelNextCursor
         };
       case "thread/start": {

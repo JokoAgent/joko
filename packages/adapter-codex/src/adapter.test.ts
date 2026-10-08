@@ -351,9 +351,9 @@ describe("CodexBackendAdapter", () => {
   });
 
   it.each([
-    ["codex/0.153.3", true, 1, false, false, "requires the audited Codex app-server"],
-    ["codex/0.153.4", true, 2, true, true, ""],
-    ["codex/0.153.4", false, 1, false, true, "native account is unavailable"]
+    ["codex/0.159.1", true, 1, false, false, "requires the audited Codex app-server"],
+    ["codex/0.159.2", true, 2, true, true, ""],
+    ["codex/0.159.2", false, 1, false, true, "native account is unavailable"]
   ] as const)("probes runtime %s without smart flags before deciding its process generation", async (
     userAgent,
     nativeAccountAvailable,
@@ -618,7 +618,7 @@ describe("CodexBackendAdapter", () => {
       id: "codex-test",
       adapterKind: "codex",
       instanceGeneration: 7,
-      version: "0.153.4",
+      version: "0.159.2",
       health: "healthy",
       authenticationState: "authenticated"
     });
@@ -695,6 +695,45 @@ describe("CodexBackendAdapter", () => {
     }));
     expect(events).toContainEqual(expect.objectContaining({ type: "usage" }));
     expect(events.at(-1)).toEqual({ type: "done", outcome: "completed" });
+  });
+
+  it("enriches only runtime-returned GPT-6 models and default-hides the superseded family", async () => {
+    const setup = await createSetup();
+    const nativeModel = (model: string, displayName: string): JsonObject => ({
+      id: `record-${model}`,
+      model,
+      displayName,
+      hidden: false,
+      supportedReasoningEfforts: [{ reasoningEffort: "high", description: "" }],
+      defaultReasoningEffort: "high",
+      inputModalities: ["text", "image"],
+      serviceTiers: [{ id: "default", name: "Default", description: "" }],
+      defaultServiceTier: "default",
+      isDefault: model === "gpt-6.1-sol"
+    });
+    setup.fake.modelList = [
+      nativeModel("gpt-6.1-sol", "GPT-6.1 Sol"),
+      nativeModel("gpt-6-sol", "GPT-6 Sol"),
+      nativeModel("gpt-6-luna", "GPT-6 Luna"),
+      nativeModel("gpt-5.6-sol", "GPT-5.6 Sol")
+    ];
+
+    const descriptor = await setup.adapter.describe();
+    expect(descriptor.models.find((model) => model.modelId === "gpt-6.1-sol")).toMatchObject({
+      contextWindow: 272_000,
+      maxOutputTokens: 128_000,
+      supportsFastMode: true,
+      defaultVisible: true,
+      cost: { input: 2, output: 10, cacheRead: 0.1, cacheWrite: 2.5 },
+      pricing: { currencyCode: "USD", fastModeMultiplier: 2, longContext: { inputTokenThreshold: 272_000 } }
+    });
+    expect(descriptor.models.find((model) => model.modelId === "gpt-6-sol")?.cost)
+      .toEqual({ input: 2, output: 10, cacheRead: 0.2, cacheWrite: 2.5 });
+    expect(descriptor.models.find((model) => model.modelId === "gpt-6-luna")?.cost)
+      .toEqual({ input: 0.1, output: 0.5, cacheRead: 0.01, cacheWrite: 0.125 });
+    expect(descriptor.models.find((model) => model.modelId === "gpt-5.6-sol"))
+      .toMatchObject({ defaultVisible: false });
+    expect(descriptor.models.some((model) => model.modelId === "gpt-6-astra")).toBe(false);
   });
 
   it("continues an existing yielded exec cell without publishing an intermediate product terminal", async () => {
@@ -4498,12 +4537,12 @@ describe("CodexBackendAdapter", () => {
   });
 
   it.each([
-    "codex/0.151.0-alpha.7.2",
-    "codex/0.153.3",
-    "codex/0.153.4-alpha.1",
-    "codex/0.153.4+unverified",
-    "codex/0.153.5",
-    "codex/0.154.0",
+    "codex/0.153.4",
+    "codex/0.159.1",
+    "codex/0.159.2-alpha.1",
+    "codex/0.159.2+unverified",
+    "codex/0.159.3",
+    "codex/0.160.0",
     "unknown"
   ])("fails audited capabilities closed for runtime %s", async (userAgent) => {
     const old = await createSetup();

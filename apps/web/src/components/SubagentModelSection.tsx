@@ -119,6 +119,7 @@ function SubagentModelControl({ controller, snapshot, setting: incoming, ownerDo
       <div className="subagent-model-actions">
         <ModelPicker models={snapshot.models.filter((model) => model.backendId === setting.backendId)}
         ownerId={controller.state.activeProfile?.id} value={selected === undefined ? undefined : { backendId: setting.backendId, ...selected, fastMode: false }}
+        favoriteSettings={snapshot.settings.modelFavorites} onMutateFavorite={controller.updateModelFavorites}
         t={t} allowDefault defaultLabel={t("settings.subagentModels.unspecified")} ariaLabel={`${backend?.name ?? setting.backendId} ${t("settings.subagentModels.default")}`}
         disabled={blocked || !supports} effortEnabled={false} fastEnabled={false}
         onSelect={(value) => {

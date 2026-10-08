@@ -1,4 +1,4 @@
-import type { AppSnapshot, ConnectionProfile, MachineCacheView, MachinePresenceView, MachineSessionCacheView } from "./model.js";
+import type { AppSnapshot, ConnectionProfile, MachineCacheView, MachinePresenceView, MachineSessionCacheView, TaskTagColorView, TaskTagDisplayView } from "./model.js";
 
 export type MachineSelection = "all" | readonly string[];
 
@@ -7,6 +7,10 @@ const MAX_CACHED_SESSIONS = 500;
 const MAX_ID_LENGTH = 256;
 const MAX_NAME_LENGTH = 512;
 const SESSION_STATES = new Set<MachineSessionCacheView["state"]>(["idle", "running", "waiting", "retrying", "error", "closed"]);
+const TASK_TAG_COLORS = new Set<TaskTagColorView>([
+  "red", "orange", "yellow", "green", "blue", "purple",
+  "gray", "pink", "coral", "teal", "indigo", "white"
+]);
 
 export function normalizeMachineSelection(value: unknown): MachineSelection {
   if (value === "all") return "all";
@@ -70,7 +74,14 @@ export function machineCacheFromSnapshot(profile: ConnectionProfile, snapshot: A
           attentionKind: session.attention.kind,
           attentionUnread: session.attention.unread
         }),
-        ...(interactions.get(session.id) === undefined ? {} : { interactionKind: interactions.get(session.id) })
+        ...(interactions.get(session.id) === undefined ? {} : { interactionKind: interactions.get(session.id) }),
+        taskTags: (session.taskTags ?? []).map(({ id, name, color, presetKey, nameCustomized }) => ({
+          id,
+          name,
+          color,
+          ...(presetKey === undefined ? {} : { presetKey }),
+          nameCustomized
+        }))
       }))
   };
 }
@@ -137,12 +148,12 @@ export function selectedReachableRemoteProfileIds(
 function normalizeCachedSession(value: unknown): MachineSessionCacheView | undefined {
   if (value === null || typeof value !== "object" || Array.isArray(value)) return undefined;
   const record = value as Record<string, unknown>;
-  const required = ["archived", "id", "lastActivityAt", "name", "pinned", "state"];
+  const required = ["archived", "id", "lastActivityAt", "name", "pinned", "state", "taskTags"];
   const allowed = new Set([...required, "attentionKind", "attentionUnread", "interactionKind", "targetName"]);
   if (required.some((key) => !Object.hasOwn(record, key)) || Object.keys(record).some((key) => !allowed.has(key)) ||
     !safeIdentifier(record["id"]) || !SESSION_STATES.has(record["state"] as MachineSessionCacheView["state"]) ||
     boundedText(record["name"], MAX_NAME_LENGTH) === "" || boundedText(record["name"], MAX_NAME_LENGTH) !== record["name"] || typeof record["pinned"] !== "boolean" ||
-    typeof record["archived"] !== "boolean") return undefined;
+    typeof record["archived"] !== "boolean" || !Array.isArray(record["taskTags"]) || record["taskTags"].length > 32) return undefined;
   const lastActivityAt = record["lastActivityAt"];
   if (typeof lastActivityAt !== "number" || !Number.isSafeInteger(lastActivityAt) || lastActivityAt < 0) return undefined;
   const attentionKind = record["attentionKind"];
@@ -159,6 +170,12 @@ function normalizeCachedSession(value: unknown): MachineSessionCacheView | undef
     || (hasAttentionUnread && typeof record["attentionUnread"] !== "boolean")
     || (hasInteractionKind && interactionKind !== "permission" && interactionKind !== "question" && interactionKind !== "plan" && interactionKind !== "select" && interactionKind !== "confirm" && interactionKind !== "input" && interactionKind !== "editor")
   ) return undefined;
+  const taskTags: TaskTagDisplayView[] = [];
+  for (const rawTag of record["taskTags"]) {
+    const taskTag = normalizeCachedTaskTag(rawTag);
+    if (taskTag === undefined || taskTags.some((candidate) => candidate.id === taskTag.id)) return undefined;
+    taskTags.push(taskTag);
+  }
   return {
     id: record["id"],
     name: boundedText(record["name"], MAX_NAME_LENGTH),
@@ -172,7 +189,28 @@ function normalizeCachedSession(value: unknown): MachineSessionCacheView | undef
       : {}),
     ...(hasInteractionKind
       ? { interactionKind: interactionKind as NonNullable<MachineSessionCacheView["interactionKind"]> }
-      : {})
+      : {}),
+    taskTags
+  };
+}
+
+function normalizeCachedTaskTag(value: unknown): TaskTagDisplayView | undefined {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  const required = ["color", "id", "name", "nameCustomized"];
+  const allowed = new Set([...required, "presetKey"]);
+  if (required.some((key) => !Object.hasOwn(record, key)) || Object.keys(record).some((key) => !allowed.has(key))
+    || !safeIdentifier(record["id"]) || typeof record["name"] !== "string" || record["name"].trim() !== record["name"]
+    || record["name"].length === 0 || record["name"].length > 80 || !TASK_TAG_COLORS.has(record["color"] as TaskTagColorView)
+    || typeof record["nameCustomized"] !== "boolean") return undefined;
+  const presetKey = record["presetKey"];
+  if (presetKey !== undefined && !safeIdentifier(presetKey)) return undefined;
+  return {
+    id: record["id"],
+    name: record["name"],
+    color: record["color"] as TaskTagColorView,
+    ...(presetKey === undefined ? {} : { presetKey }),
+    nameCustomized: record["nameCustomized"]
   };
 }
 

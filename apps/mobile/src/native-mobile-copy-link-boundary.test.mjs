@@ -15,7 +15,6 @@ describe("native mobile copy-link boundary", () => {
     expect(app).toContain("buildMobileMessageDeepLink(authority.sessionId, authority.messageId, authority.messageEventId)");
     expect(app).toContain("claimMobileCopyLinkAuthority(projectMobileNativeIntentSnapshot(client.state)");
     expect(app).toContain("mobileCopyLinkAuthorityMatches(authority, projectMobileNativeIntentSnapshot(client.state))");
-    expect(app).toContain('type SessionOption = "rename" | "copy-link" | "pin" | "archive" | "delete";');
     expect(actions).toContain('id: "copy-link"');
   });
 

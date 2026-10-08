@@ -605,7 +605,7 @@ describe("PiBackendAdapter", () => {
   it("rejects start navigation without an active owner and structured workspace references without spawning a runtime", async () => {
     const directory = await mkdtemp(join(tmpdir(), "joko-pi-start-boundary-"));
     const processFactory = vi.fn((): PiProcessHandle => { throw new Error("No native runtime should start"); });
-    const adapter = createPiAdapter({ agentHome: directory, sessionRoot: directory, versionProbe: async () => "pi 0.84.4", processFactory });
+    const adapter = createPiAdapter({ agentHome: directory, sessionRoot: directory, versionProbe: async () => "pi 0.85.1", processFactory });
     try {
       expect((await adapter.describe()).capabilities.get("session.rewind_to_start")).toMatchObject({ supported: true, options: ["service_node_only"] });
       const target: TargetDescriptor = { id: "target-start", backendId: adapter.id, displayName: "Start", workspaceRoot: directory, managed: false, trusted: true };

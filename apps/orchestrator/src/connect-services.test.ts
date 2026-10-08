@@ -81,6 +81,66 @@ describe("Connect service composition", () => {
     }
   });
 
+  it("projects the owner task-tag catalog, Session associations, and deletion fence", async () => {
+    const tag = {
+      id: "preset:work",
+      name: "Work",
+      color: "indigo" as const,
+      presetKey: "work",
+      nameCustomized: false,
+      sortOrder: 0,
+      revision: 7n,
+      associationRevision: 9n,
+      createdAt: 1_000,
+      updatedAt: 2_000
+    };
+    const authenticate = vi.fn(() => ({ id: "owner-connection" }));
+    const getTaskTagCatalog = vi.fn(() => ({ tags: [tag], revision: 11n }));
+    const listTaskTagsForSessions = vi.fn(() => [{ sessionId: "session-a", tags: [tag] }]);
+    const previewTaskTagDeletion = vi.fn(() => ({
+      tagId: tag.id,
+      affectedSessionCount: 3,
+      tagRevision: tag.revision,
+      associationRevision: tag.associationRevision
+    }));
+    const services = createConnectServices(stubApplication({
+      connections: { authenticate },
+      store: { getTaskTagCatalog, listTaskTagsForSessions, previewTaskTagDeletion }
+    }));
+    const context = { requestHeader: new Headers({ authorization: "Bearer owner-key" }) };
+
+    const catalog = await (services.session.listTaskTags as any)({}, context);
+    expect(catalog.catalog).toMatchObject({
+      revision: { value: 11n },
+      taskTags: [{
+        taskTagId: tag.id,
+        name: "Work",
+        color: contract.TaskTagColor.INDIGO,
+        presetKey: "work",
+        revision: { value: 7n },
+        associationRevision: { value: 9n }
+      }]
+    });
+
+    const associations = await (services.session.getSessionTaskTags as any)({ sessionIds: ["session-a"] }, context);
+    expect(listTaskTagsForSessions).toHaveBeenCalledWith(["session-a"]);
+    expect(associations.sessions).toEqual([
+      expect.objectContaining({
+        sessionId: "session-a",
+        taskTags: [expect.objectContaining({ taskTagId: tag.id })]
+      })
+    ]);
+
+    const deletion = await (services.session.previewTaskTagDeletion as any)({ taskTagId: tag.id }, context);
+    expect(deletion.preview).toMatchObject({
+      taskTagId: tag.id,
+      affectedSessionCount: 3n,
+      tagRevision: { value: 7n },
+      associationRevision: { value: 9n }
+    });
+    expect(authenticate).toHaveBeenCalledTimes(3);
+  });
+
   it("does not disclose the owner-visible pairing code to a remote caller", async () => {
     const requestPairing = vi.fn(() => ({
       id: "pairing-1",

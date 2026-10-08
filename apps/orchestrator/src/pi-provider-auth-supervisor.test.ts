@@ -353,16 +353,40 @@ describe("PiProviderAuthSupervisor", () => {
     expect(nativeModels.some((model) => model.cost.input > 0 && model.cost.output > 0)).toBe(true);
     expect(nativeModels.some((model) => model.supportsFastMode === true)).toBe(true);
     expect(nativeModels.filter((model) => model.supportsFastMode === true).every((model) =>
-      model.api === "openai-codex-responses" || (model.providerId === "openai" && model.modelId === "gpt-6-astra"))).toBe(true);
-    for (const [providerId, contextWindow] of [["openai", 1_050_000], ["openai-codex", 272_000]] as const) {
+      model.api === "openai-codex-responses"
+      || (model.providerId === "openai" && model.modelId === "gpt-6-astra")
+      || (model.providerId === "xai" && model.modelId === "grok-4.7"))).toBe(true);
+    for (const [providerId, thinkingLevels] of [
+      ["openai", ["low", "medium", "high", "xhigh", "max"]],
+      ["openai-codex", ["minimal", "low", "medium", "high", "xhigh", "max"]]
+    ] as const) {
       expect(nativeModels.find((model) => model.providerId === providerId && model.modelId === "gpt-6-astra")).toMatchObject({
-        contextWindow,
+        contextWindow: 272_000,
         maxOutputTokens: 128_000,
-        thinkingLevels: ["low", "medium", "high", "xhigh", "max"],
+        thinkingLevels,
         supportsFastMode: true,
         pricing: { source: "providerReference", fastModeMultiplier: 2, longContext: { inputTokenThreshold: 272_000 } }
       });
     }
+    expect(nativeModels.find((model) => model.providerId === "kimi-coding" && model.modelId === "kimi-for-coding"))
+      .toMatchObject({ displayName: "Kimi K2.8 Preview", contextWindow: 1_048_576, supportsImages: true,
+        thinkingLevels: ["low", "high", "max"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } });
+    expect(nativeModels.some((model) => model.providerId === "deepseek" && model.modelId === "deepseek-v4-flash"))
+      .toBe(false);
+    expect(nativeModels.find((model) => model.providerId === "deepseek" && model.modelId === "deepseek-flash"))
+      .toMatchObject({ contextWindow: 1_048_576, supportsImages: true,
+        cost: { input: 0.3, output: 1.2, cacheRead: 0.006, cacheWrite: 0 } });
+    expect(nativeModels.find((model) => model.providerId === "xiaomi" && model.modelId === "mimo-v2.6-pro"))
+      .toMatchObject({ contextWindow: 1_048_576, maxOutputTokens: 131_072, supportsImages: true,
+        thinkingLevels: [], pricing: { currencyCode: "CNY" } });
+    expect(nativeModels.find((model) => model.providerId === "xiaomi" && model.modelId === "mimo-v2.5"))
+      .toMatchObject({ defaultVisible: false });
+    expect(nativeModels.find((model) => model.providerId === "xiaomi-token-plan-cn" && model.modelId === "mimo-v2.6-pro"))
+      .toMatchObject({ contextWindow: 1_048_576, maxOutputTokens: 131_072, supportsImages: true,
+        thinkingLevels: [], pricing: { currencyCode: "CNY" } });
+    expect(nativeModels.find((model) => model.providerId === "xai" && model.modelId === "grok-4.7"))
+      .toMatchObject({ contextWindow: 500_000, supportsFastMode: true,
+        pricing: { longContext: { inputTokenThreshold: 199_999, fastInputTokenThreshold: 200_000 } } });
     for (const model of nativeModels) {
       expect(model.api).not.toBe("");
       expect(model.contextWindow).toBeGreaterThan(0);

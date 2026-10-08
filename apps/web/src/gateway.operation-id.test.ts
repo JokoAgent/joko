@@ -28,7 +28,7 @@ describe("operation ID lifecycle", () => {
   it("maps language tools off by default and preserves an explicit owner opt-in", () => {
     expect(mapSnapshot(create(SnapshotSchema, {})).settings.languageTools).toEqual({ enabled: false });
     expect(mapSnapshot(create(SnapshotSchema, {
-      settings: { auxiliaryText: { revision: { value: 0n }, runtimeRevision: "fixture:0" }, agentResource: {}, collaboration: {}, gitSafety: {}, languageTools: { enabled: true } }
+      settings: { auxiliaryText: { revision: { value: 0n }, runtimeRevision: "fixture:0" }, modelFavorites: { revision: { value: 0n } }, agentResource: {}, collaboration: {}, gitSafety: {}, languageTools: { enabled: true } }
     })).settings.languageTools).toEqual({ enabled: true });
   });
 
@@ -325,10 +325,78 @@ describe("operation ID lifecycle", () => {
     gateway.disconnect();
   });
 
+  it("maps model favorites and submits one exact favorite change per operation", async () => {
+    const mapped = mapSnapshot(create(SnapshotSchema, {
+      settings: {
+        auxiliaryText: { revision: { value: 0n }, runtimeRevision: "fixture:0" },
+        modelFavorites: {
+          seeded: true,
+          revision: { value: 7n },
+          favorites: [{
+            favoriteId: "favorite-a",
+            backendId: "backend-a",
+            selection: {
+              model: { providerId: "provider-a", modelId: "model-a" },
+              effortId: "high",
+              fastMode: true
+            }
+          }]
+        },
+        agentResource: {}, collaboration: {}, gitSafety: {}
+      }
+    }));
+    expect(mapped.settings.modelFavorites).toEqual({
+      favorites: [{
+        uid: "favorite-a", backendId: "backend-a", providerId: "provider-a", modelId: "model-a",
+        effort: "high", fast: true
+      }],
+      seeded: true,
+      revision: 7n
+    });
+
+    const payloads: any[] = [];
+    const gateway = createOrchestratorGateway(
+      { id: "connection-1", deviceId: "device-test", name: "Desktop", origin: "https://orchestrator.example", serverId: "server-test" },
+      "secret",
+      {},
+      () => operationTransport(async (method, input) => {
+        payloads.push(input.mutation.payload);
+        return response(method, create(SubmitOperationResponseSchema, {
+          operation: {
+            operationId: input.operationId,
+            connectionId: input.connectionId,
+            state: OperationState.SUCCEEDED,
+            result: { payload: { case: "settings", value: {} } }
+          }
+        }));
+      })
+    );
+    await gateway.connect();
+    const item = mapped.settings.modelFavorites.favorites[0]!;
+    await gateway.updateModelFavorites({ kind: "add", item }, 7n);
+    await gateway.updateModelFavorites({ kind: "replace", item: { ...item, effort: "low", fast: undefined } }, 8n);
+    await gateway.updateModelFavorites({ kind: "remove", favoriteId: item.uid }, 9n);
+
+    expect(payloads).toMatchObject([
+      { case: "updateModelFavorites", value: { expectedRevision: { value: 7n }, change: { case: "add", value: {
+        favoriteId: "favorite-a", backendId: "backend-a",
+        selection: { model: { providerId: "provider-a", modelId: "model-a" }, effortId: "high", fastMode: true }
+      } } } },
+      { case: "updateModelFavorites", value: { expectedRevision: { value: 8n }, change: { case: "replace", value: {
+        favoriteId: "favorite-a", selection: { effortId: "low", fastMode: false }
+      } } } },
+      { case: "updateModelFavorites", value: { expectedRevision: { value: 9n }, change: {
+        case: "removeFavoriteId", value: "favorite-a"
+      } } }
+    ]);
+    gateway.disconnect();
+  });
+
   it("maps smart-routing desired, pending, applied, and generation state without backend inference", () => {
     const snapshot = mapSnapshot(create(SnapshotSchema, {
       settings: {
         auxiliaryText: { revision: { value: 0n }, runtimeRevision: "fixture:0" },
+        modelFavorites: { revision: { value: 0n } },
         agentResource: {}, collaboration: {}, gitSafety: {},
         subagentModels: [{
           backendId: "codex",

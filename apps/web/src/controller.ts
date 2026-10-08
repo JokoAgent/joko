@@ -2624,6 +2624,16 @@ export function useAppController(): AppController {
     resetSession: (sessionId) => gateway().resetSession(sessionId),
     deleteSessionMessage: (sessionId, eventId) => gateway().deleteSessionMessage(sessionId, eventId),
     renameSession: (sessionId, name) => gateway().renameSession(sessionId, name),
+    createTaskTag: (originSessionId, name, color, expectedCatalogRevision, presetId) =>
+      gateway().createTaskTag(originSessionId, name, color, expectedCatalogRevision, presetId),
+    updateTaskTag: (originSessionId, tagId, expectedRevision, patch) =>
+      gateway().updateTaskTag(originSessionId, tagId, expectedRevision, patch),
+    reorderTaskTags: (originSessionId, taskTagIds, expectedCatalogRevision) =>
+      gateway().reorderTaskTags(originSessionId, taskTagIds, expectedCatalogRevision),
+    setSessionTaskTags: (originSessionId, sessionIds, taskTagIds, attached) =>
+      gateway().setSessionTaskTags(originSessionId, sessionIds, taskTagIds, attached),
+    previewTaskTagDeletion: (taskTagId, signal) => gateway().previewTaskTagDeletion(taskTagId, signal),
+    deleteTaskTag: (originSessionId, preview) => gateway().deleteTaskTag(originSessionId, preview),
     suggestSessionTitle: (sessionId, signal) => gateway().suggestSessionTitle(sessionId, signal),
     pinSession: (sessionId, pinned) => gateway().pinSession(sessionId, pinned),
     archiveSession: (sessionId, archived) => gateway().archiveSession(sessionId, archived),
@@ -3171,6 +3181,7 @@ export function useAppController(): AppController {
     updateAuxiliaryTextSettings,
     updateSubagentModelSettings: (backendId, model, expectedRevision) => gateway().updateSubagentModelSettings(backendId, model, expectedRevision),
     updateSubagentSmartRouting: (backendId, enabled, expectedRevision) => gateway().updateSubagentSmartRouting(backendId, enabled, expectedRevision),
+    updateModelFavorites: (change, expectedRevision) => gateway().updateModelFavorites(change, expectedRevision),
     resetPromptRecommendationSettings: () => gateway().resetPromptRecommendationSettings(),
     updateLanguageToolSettings: (enabled) => gateway().updateLanguageToolSettings(enabled),
     updateToolPolicySettings: (toolProviderId, targetId, patch) => gateway().updateToolPolicySettings(toolProviderId, targetId, patch),

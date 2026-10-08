@@ -28,6 +28,8 @@ export interface PiEventTranslatorOptions {
   readonly context: AdapterContext;
   readonly artifactDirectory: string;
   readonly wasAbortRequested: () => boolean;
+  /** Generation-fenced dispatch tier sampled when native usage completes. */
+  readonly isFastMode?: () => boolean;
   readonly redactValues?: readonly string[];
   /** Shared for one product session so online and native hydration reuse one BlobRef. */
   readonly artifactCache?: Map<string, BlobRef>;
@@ -37,6 +39,7 @@ export class PiEventTranslator {
   #context: AdapterContext;
   readonly #artifactDirectory: string;
   readonly #wasAbortRequested: () => boolean;
+  readonly #isFastMode: (() => boolean) | undefined;
   readonly #redactValues: readonly string[];
   readonly #artifactCache: Map<string, BlobRef>;
   readonly #messageNamespace = randomUUID();
@@ -56,6 +59,7 @@ export class PiEventTranslator {
     this.#context = options.context;
     this.#artifactDirectory = options.artifactDirectory;
     this.#wasAbortRequested = options.wasAbortRequested;
+    this.#isFastMode = options.isFastMode;
     this.#redactValues = options.redactValues ?? [];
     this.#artifactCache = options.artifactCache ?? new Map();
   }
@@ -517,7 +521,9 @@ export class PiEventTranslator {
       }
     }
     const blocks = await this.#messageBlocks(record.message);
-    const usage = role === "assistant" ? projectMessageUsage(record.message.usage) : undefined;
+    const usage = role === "assistant"
+      ? projectMessageUsage(record.message.usage, this.#isFastMode?.())
+      : undefined;
     const generationTiming = usage === undefined
       ? undefined
       : projectMessageGenerationTiming(record.message.duration);
