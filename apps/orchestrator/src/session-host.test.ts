@@ -70,6 +70,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { OperationalArtifactRepository } from "./artifact-repository.js";
 import { ArtifactStore } from "./artifact-store.js";
 import { BackendInstanceRegistry } from "./backend-instance-registry.js";
+import { ObjectiveManager } from "./objective-manager.js";
 import {
   createPortableSessionManifest,
   decodePortableSessionPackage,
@@ -298,6 +299,83 @@ describe("SessionHost", () => {
       }
     });
     expect(observed[0]!.event.revision).toBe(observed[0]!.visibleRevision);
+  });
+
+  it("rebinds an exact Objective pending Attempt when inactive Queue dispatch renews the Session generation", async () => {
+    const fixture = await createFixture();
+    const sessionId = (await fixture.host.createSession({
+      operationId: "create-objective-attempt-renewal",
+      connection: fixture.connection,
+      targetId: "target-one",
+      title: "Objective Attempt renewal",
+      fastMode: false,
+      permissionMode: "ask",
+      planMode: false
+    })).value.sessionId;
+    await fixture.host.closeIfActive(sessionId);
+    fixture.store.setQueuePaused({
+      sessionId,
+      paused: true,
+      traceId: "test:objective-attempt-renewal:pause"
+    });
+    const objective = fixture.store.putObjective({
+      sessionId,
+      text: "Complete after runtime activation."
+    });
+    const admitted = fixture.host.enqueueServiceInput({
+      operationId: "objective-attempt-renewal-turn",
+      sessionId,
+      source: "system",
+      prompt: {
+        text: "Continue the objective.",
+        images: [],
+        files: [],
+        mentions: [],
+        disposition: "prompt",
+        objectiveContinuation: { ownerGeneration: objective.ownerGeneration, turn: 1 }
+      },
+      onAdmitted: (store, result) => {
+        store.updateObjective({
+          sessionId,
+          expectedRevision: objective.revision,
+          expectedOwnerGeneration: objective.ownerGeneration,
+          expectedSessionGeneration: objective.sessionGeneration,
+          pending: {
+            ownerGeneration: objective.ownerGeneration,
+            operationId: "objective-attempt-renewal-turn",
+            runId: result.runId,
+            attemptId: result.attemptId,
+            queueItemId: result.queueItemId
+          }
+        });
+      }
+    }).value;
+    const initialGeneration = fixture.store.getSession(sessionId).descriptor.binding.generation;
+
+    fixture.store.setQueuePaused({
+      sessionId,
+      paused: false,
+      traceId: "test:objective-attempt-renewal:resume"
+    });
+    fixture.host.requestQueueDrain(sessionId);
+    await eventually(() => fixture.store.getQueueItem(admitted.queueItemId).state === "completed");
+
+    const queue = fixture.store.getQueueItem(admitted.queueItemId);
+    const attempts = fixture.store.listAttempts(admitted.runId);
+    expect(attempts.map((attempt) => attempt.descriptor.generation))
+      .toEqual([initialGeneration, initialGeneration + 1]);
+    expect(attempts[0]!.descriptor.endedAt).toEqual(expect.any(Number));
+    expect(queue.attemptId).toBe(attempts[1]!.descriptor.id);
+    expect(fixture.store.getObjective(sessionId)).toMatchObject({
+      status: "active",
+      ownerGeneration: objective.ownerGeneration,
+      pendingOwnerGeneration: objective.ownerGeneration,
+      pendingOperationId: "objective-attempt-renewal-turn",
+      pendingRunId: admitted.runId,
+      pendingAttemptId: attempts[1]!.descriptor.id,
+      pendingQueueItemId: admitted.queueItemId,
+      sessionGeneration: initialGeneration + 1
+    });
   });
 
   it.each([undefined, [], ["workspace_file"], ["workspace_line_range"], ["resource"], ["artifact"], ["workspace_directory", "workspace_file", "workspace_line_range", "resource", "artifact"]])(
@@ -13570,6 +13648,67 @@ describe("SessionHost", () => {
     expect(fixture.store.findPendingContextRebuild(sessionId)).toBeUndefined();
   });
 
+  it("publishes a context-rebuild generation only with the exact renewed Objective Attempt", async () => {
+    const adapter = new HeldMessageDeleteFakeAdapter();
+    const fixture = await createFixture(adapter);
+    const manager = new ObjectiveManager({ store: fixture.store, sessionHost: fixture.host });
+    cleanups.push(() => manager.close());
+    await manager.initialize();
+    const sessionId = (await fixture.host.createSession({
+      operationId: "create-objective-context-rebuild",
+      connection: fixture.connection,
+      targetId: "target-one",
+      title: "Objective context rebuild",
+      fastMode: false,
+      permissionMode: "ask",
+      planMode: false
+    })).value.sessionId;
+    appendSessionEvent(fixture.store, sessionId, "objective-context-rebuild-user", 10, {
+      type: "message_complete",
+      role: "user",
+      blocks: [{ kind: "text", text: "remove before the objective turn" }]
+    });
+    await fixture.host.deleteSessionMessage({
+      operationId: "delete-before-objective-context-rebuild",
+      connection: fixture.connection,
+      sessionId,
+      eventId: "objective-context-rebuild-user",
+      body: { sessionId, eventId: "objective-context-rebuild-user" },
+      result: (eventIds) => eventIds
+    });
+    const initialGeneration = fixture.store.getSession(sessionId).descriptor.binding.generation;
+
+    const objective = await manager.set({
+      operationId: "set-objective-context-rebuild",
+      sessionId,
+      text: "Continue after rebuilding native context.",
+      maximumTurns: 2,
+      expectedSessionGeneration: initialGeneration
+    });
+    await eventually(() => adapter.heldInputs.length === 1);
+
+    const queue = fixture.store.getQueueItem(objective.pendingQueueItemId!);
+    const current = fixture.store.getObjective(sessionId);
+    const attempts = fixture.store.listAttempts(objective.pendingRunId!);
+    expect(adapter.rebuildInputs).toHaveLength(1);
+    expect(attempts.map((attempt) => attempt.descriptor.generation)).toEqual([
+      initialGeneration,
+      initialGeneration + 1,
+      initialGeneration + 2
+    ]);
+    expect(current).toMatchObject({
+      status: "active",
+      ownerGeneration: objective.ownerGeneration,
+      pendingOwnerGeneration: objective.ownerGeneration,
+      pendingRunId: objective.pendingRunId,
+      pendingQueueItemId: objective.pendingQueueItemId,
+      pendingAttemptId: queue.attemptId,
+      sessionGeneration: initialGeneration + 2
+    });
+    expect(queue.state).toBe("backend_accepted");
+    expect(queue.attemptId).toBe(attempts.at(-1)!.descriptor.id);
+  });
+
   it("rebuilds a context-window failure and replays one unchanged safe user prompt", async () => {
     const adapter = new NativeContextRecoveryFakeAdapter(["context_overflow", "success"]);
     const fixture = await createFixture(adapter);
@@ -15294,6 +15433,15 @@ class MessageDeleteFakeAdapter extends FakeBackendAdapter {
   override async send(input: PromptInput, context: AdapterContext): Promise<void> {
     this.sequence.push(`send:${input.text}`);
     await super.send(input, context);
+  }
+}
+
+class HeldMessageDeleteFakeAdapter extends MessageDeleteFakeAdapter {
+  readonly heldInputs: Array<{ readonly input: PromptInput; readonly context: AdapterContext }> = [];
+
+  override async send(input: PromptInput, context: AdapterContext): Promise<void> {
+    this.sequence.push(`send:${input.text}`);
+    this.heldInputs.push({ input, context });
   }
 }
 

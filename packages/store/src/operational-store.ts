@@ -8711,6 +8711,18 @@ export class OperationalStore {
       if (currentAttempt !== undefined && currentAttempt.descriptor.runId !== item.runId) {
         throw new StoreError("Queue item attempt does not belong to its run.");
       }
+      const objective = this.findObjective(item.sessionId);
+      if (objective?.pendingQueueItemId === item.id) {
+        const exactOwner = objective.status === "active" &&
+          objective.pendingOwnerGeneration === objective.ownerGeneration &&
+          objective.pendingOperationId === item.operationId &&
+          objective.pendingRunId === item.runId &&
+          objective.pendingAttemptId === currentAttempt?.descriptor.id &&
+          objective.sessionGeneration === input.generation;
+        if (!exactOwner || currentAttempt === undefined) {
+          throw new StoreError("Objective pending work does not exactly own the renewed Queue Attempt.");
+        }
+      }
       if (
         currentAttempt?.descriptor.generation === input.generation &&
         currentAttempt.descriptor.backendInstanceGeneration === item.backendInstanceGeneration
@@ -8746,6 +8758,38 @@ export class OperationalStore {
         asSqlInteger(this.requireActiveRevision()),
         item.id
       );
+      if (objective?.pendingQueueItemId === item.id) {
+        if (currentAttempt === undefined) throw new StoreError("Objective pending Queue Attempt is missing.");
+        const rebound = this.database.prepare(`
+          UPDATE session_objectives
+          SET pending_attempt_id = ?, session_generation = ?, updated_at = ?, revision = ?
+          WHERE session_id = ?
+            AND status = 'active'
+            AND revision = ?
+            AND owner_generation = ?
+            AND pending_owner_generation = ?
+            AND pending_operation_id = ?
+            AND pending_run_id = ?
+            AND pending_attempt_id = ?
+            AND pending_queue_item_id = ?
+        `).run(
+          input.attemptId,
+          input.generation,
+          Math.max(objective.updatedAt, at),
+          asSqlInteger(this.requireActiveRevision()),
+          objective.sessionId,
+          asSqlInteger(objective.revision),
+          objective.ownerGeneration,
+          objective.ownerGeneration,
+          item.operationId,
+          item.runId,
+          currentAttempt.descriptor.id,
+          item.id
+        );
+        if (rebound.changes !== 1) {
+          throw new StoreError("Objective pending Queue Attempt changed before it could be renewed.");
+        }
+      }
       return this.getQueueItem(item.id);
     });
   }

@@ -170,6 +170,77 @@ describe("ObjectiveManager", () => {
     expect(fixture.host.admissions).toHaveLength(1);
   });
 
+  it("waits through the claimed activation window and observes the exact renewed Objective Attempt", async () => {
+    const fixture = createFixture();
+    await fixture.manager.initialize();
+    const observed: Array<ReturnType<typeof fixture.store.getObjective>> = [];
+    fixture.manager.subscribe(fixture.sessionId, (objective) => {
+      if (objective !== undefined) observed.push(objective);
+    });
+    const objective = await fixture.manager.set(setInput("generation-renewal", fixture));
+    const pending = fixture.host.admissions[0]!;
+    fixture.store.claimNextQueueItem({
+      sessionId: fixture.sessionId,
+      backendInstanceGeneration: 1,
+      traceId: "generation-renewal:claim"
+    });
+    const session = fixture.store.getSession(fixture.sessionId);
+    fixture.store.updateSession(fixture.sessionId, {
+      binding: { ...session.descriptor.binding, generation: 2 }
+    }, session.revision);
+
+    await vi.waitFor(() => {
+      expect(observed.at(-1)).toMatchObject({
+        status: "active",
+        sessionGeneration: 2,
+        pendingAttemptId: pending.attemptId
+      });
+    });
+    const renewed = fixture.store.renewQueueAttemptGeneration({
+      queueItemId: pending.queueItemId,
+      attemptId: "attempt-generation-renewed",
+      generation: 2,
+      at: Date.now()
+    });
+
+    expect(renewed.attemptId).toBe("attempt-generation-renewed");
+    expect(fixture.store.getAttempt(pending.attemptId).descriptor.endedAt).toEqual(expect.any(Number));
+    expect(fixture.store.getObjective(fixture.sessionId)).toMatchObject({
+      status: "active",
+      ownerGeneration: objective.ownerGeneration,
+      pendingOwnerGeneration: objective.ownerGeneration,
+      pendingAttemptId: "attempt-generation-renewed",
+      sessionGeneration: 2
+    });
+  });
+
+  it("observes an accepted context-rebuild generation only after its exact Attempt is atomically renewed", async () => {
+    const fixture = createFixture();
+    await fixture.manager.initialize();
+    const objective = await fixture.manager.set(setInput("accepted-generation-gap", fixture));
+    const pending = fixture.host.admissions[0]!;
+    const session = fixture.store.getSession(fixture.sessionId);
+    fixture.store.transaction((store) => {
+      store.updateSession(fixture.sessionId, {
+        binding: { ...session.descriptor.binding, generation: 2 }
+      }, session.revision);
+      store.renewQueueAttemptGeneration({
+        queueItemId: pending.queueItemId,
+        attemptId: "attempt-context-rebuild-renewed",
+        generation: 2
+      });
+    });
+
+    await vi.waitFor(() => {
+      expect(fixture.store.getObjective(fixture.sessionId)).toMatchObject({
+        status: "active",
+        ownerGeneration: objective.ownerGeneration,
+        pendingAttemptId: "attempt-context-rebuild-renewed",
+        sessionGeneration: 2
+      });
+    });
+  });
+
   it("re-arms a reset timer beyond the platform maximum delay", async () => {
     vi.useFakeTimers();
     const now = new Date("2030-01-01T00:00:00.000Z").getTime();

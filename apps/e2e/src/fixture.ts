@@ -18,6 +18,7 @@ import {
   cleanHistoryMaintenanceCopy,
   OperationalWorkspaceSnapshotRepository,
   OperationalArtifactRepository,
+  ObjectiveManager,
   DurableReviewEvidenceProvider,
   ReviewCoordinator,
   RemoteExecutionRouter,
@@ -283,11 +284,15 @@ export class OrchestratorE2eFixture {
       storageRoot: join(dataDirectory, "worktrees")
     });
     await sessionWorktrees.initialize();
+    let objectives: ObjectiveManager | undefined;
     const sessionHost = new SessionHost(store, artifacts, backendInstances.availableAdapters(), {
       backendDescriptors: backendInstances.descriptors(),
       backendDescriptorsAlreadyPublished: true,
       workspaceCapture: new DurableWorkspaceRunCapture(store, workspaceChanges),
       worktrees: sessionWorktrees,
+      onUserInputAdmitted: (transactionStore, result) =>
+        objectives?.onUserInputAdmitted(transactionStore, result),
+      onServiceRunSettled: (input) => objectives?.onRunSettled(input),
       ...(auxiliaryServices?.providers === undefined ? {} : {
         sessionRuntimeFallbackContext: (backendId: string) => ({
           availableProviderIds: availableBackendProviderIds(
@@ -297,6 +302,7 @@ export class OrchestratorE2eFixture {
         })
       })
     });
+    objectives = new ObjectiveManager({ store, sessionHost });
     const reviewCoordinator = new ReviewCoordinator({
       store,
       runtime: sessionHost,
@@ -332,6 +338,7 @@ export class OrchestratorE2eFixture {
         trusted: true
       }, { workspaceId: "workspace-main" });
     }
+    await objectives.initialize();
     await historyMaintenance.initialize();
     const scheduler = new ScheduleCoordinator(store, sessionHost, { tickMs: 25 });
     scheduler.start();
@@ -433,6 +440,7 @@ export class OrchestratorE2eFixture {
       workspaceChanges,
       sessionWorktrees,
       sessionHost,
+      objectives,
       reviewCoordinator,
       scheduler,
       get adapters() {
@@ -464,6 +472,7 @@ export class OrchestratorE2eFixture {
         await attempt(() => options.terminals?.dispose());
         await attempt(() => artifactMaintenance.close());
         await attempt(() => historyMaintenance.close());
+        await attempt(() => objectives?.close());
         await attempt(() => sessionHost.dispose());
         await attempt(() => backendInstances.disposeRetainedCleanups());
         await attempt(() => auxiliaryServices?.mcpRouter?.dispose());

@@ -889,19 +889,29 @@ function inspectPending(store: OperationalStore, objective: ObjectiveRecord): Pe
     queue.attemptId === objective.pendingAttemptId && queue.operationId === objective.pendingOperationId &&
     run.descriptor.sessionId === objective.sessionId && attemptRunId === run.descriptor.id;
   if (!matches) return { queue, run, clear: false, unknown: true };
+  const unknown = !terminalRunState(run.descriptor.state) &&
+    (queue.state === "dispatch_unknown" || run.descriptor.state === "dispatch_unknown");
+  if (unknown) return { queue, run, clear: false, unknown: true };
   if (
     !terminalRunState(run.descriptor.state) &&
     (attemptGeneration !== objective.sessionGeneration || currentSessionGeneration !== objective.sessionGeneration)
-  ) return { queue, run, clear: false, unknown: true };
-  const unknown = !terminalRunState(run.descriptor.state) &&
-    (queue.state === "dispatch_unknown" || run.descriptor.state === "dispatch_unknown");
+  ) {
+    // Session activation advances its durable generation after Queue claim and
+    // before SessionHost atomically renews the exact Attempt. Only that narrow
+    // same-Attempt dispatch window is recoverable; every other mismatch fails
+    // closed as an unknown dispatch outcome.
+    const awaitingExactAttemptRenewal = queue.state === "dispatching" &&
+      currentSessionGeneration === objective.sessionGeneration &&
+      attemptGeneration < objective.sessionGeneration;
+    if (!awaitingExactAttemptRenewal) return { queue, run, clear: false, unknown: true };
+  }
   const clear = ["cancelled", "completed", "failed"].includes(queue.state) ||
     terminalRunState(run.descriptor.state);
-  const abortRunId = !unknown && ["dispatching", "backend_accepted"].includes(queue.state) &&
+  const abortRunId = ["dispatching", "backend_accepted"].includes(queue.state) &&
     !terminalRunState(run.descriptor.state)
       ? run.descriptor.id
       : undefined;
-  return { queue, run, clear, ...(abortRunId === undefined ? {} : { abortRunId }), unknown };
+  return { queue, run, clear, ...(abortRunId === undefined ? {} : { abortRunId }), unknown: false };
 }
 
 function clearsAfterKnownCancellation(pending: PendingInspection): boolean {

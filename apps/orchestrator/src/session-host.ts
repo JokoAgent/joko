@@ -11398,14 +11398,27 @@ export class SessionHost {
       this.deleteActiveSession(sessionId, active);
       this.#nativeCompactions.delete(sessionId);
       this.clearTurnOverrideLeases(sessionId);
-      this.#store.completePendingContextRebuild({
-        sessionId,
-        claimToken: claim.claimToken,
-        binding: nextBinding,
-        operationId: claim.latestDeletionOperationId,
-        handoff: rebuildInput.handoff,
-        replayScheduled: claim.replaySafe && this.hasContextOverflowReplay(claim),
-        traceId: `context-rebuild:${claim.latestDeletionOperationId}`
+      this.#store.transaction((store) => {
+        store.completePendingContextRebuild({
+          sessionId,
+          claimToken: claim.claimToken,
+          binding: nextBinding,
+          operationId: claim.latestDeletionOperationId,
+          handoff: rebuildInput.handoff,
+          replayScheduled: claim.replaySafe && this.hasContextOverflowReplay(claim),
+          traceId: `context-rebuild:${claim.latestDeletionOperationId}`
+        });
+        const accepted = store.listQueueItems({ sessionId, states: ["accepted"], limit: 1 })[0];
+        if (accepted !== undefined) {
+          store.renewQueueAttemptGeneration({
+            queueItemId: accepted.id,
+            attemptId: stableId(
+              "attempt",
+              `${accepted.operationId}:context-rebuild-generation:${nextBinding.generation}`
+            ),
+            generation: nextBinding.generation
+          });
+        }
       });
       return true;
     } catch (error) {

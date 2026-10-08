@@ -3262,6 +3262,24 @@ describe("OperationalStore", () => {
         return { accepted: true };
       }
     );
+    const objective = fixture.store.putObjective({
+      sessionId: "session-1",
+      text: "Keep the exact pending turn across activation.",
+      updatedAt: 2
+    });
+    const pendingObjective = fixture.store.updateObjective({
+      sessionId: objective.sessionId,
+      expectedRevision: objective.revision,
+      expectedOwnerGeneration: objective.ownerGeneration,
+      pending: {
+        ownerGeneration: objective.ownerGeneration,
+        operationId: "operation-instance-claim",
+        runId: "run-1",
+        attemptId: "attempt-before-instance-claim",
+        queueItemId: "queue-instance-claim"
+      },
+      updatedAt: 2
+    });
     const backend = fixture.store.getBackend("pi").descriptor;
     const reservation = fixture.store.reserveBackendInstanceGeneration({
       backendId: backend.id,
@@ -3313,6 +3331,16 @@ describe("OperationalStore", () => {
     expect(fixture.store.getAttempt("attempt-instance-1").descriptor).toMatchObject({
       generation: 1,
       backendInstanceGeneration: 1
+    });
+    expect(fixture.store.getAttempt("attempt-before-instance-claim").descriptor.endedAt).toBe(3);
+    expect(fixture.store.getObjective("session-1")).toMatchObject({
+      ownerGeneration: pendingObjective.ownerGeneration,
+      pendingOwnerGeneration: pendingObjective.ownerGeneration,
+      pendingOperationId: "operation-instance-claim",
+      pendingRunId: "run-1",
+      pendingAttemptId: "attempt-instance-1",
+      pendingQueueItemId: "queue-instance-claim",
+      sessionGeneration: 1
     });
     expect(fixture.store.updateQueueState({
       queueItemId: "queue-instance-claim",
@@ -3369,6 +3397,89 @@ describe("OperationalStore", () => {
       attemptId: "attempt-instance-projection",
       generation: 2,
       payload: { type: "queue_update" }
+    });
+  });
+
+  it("rolls back Attempt renewal when an Objective no longer owns the exact pending generation", () => {
+    const fixture = createFixture();
+    fixture.store.createAttempt({
+      id: "attempt-objective-stale-owner",
+      runId: "run-1",
+      ordinal: 1,
+      generation: 0,
+      startedAt: 2
+    });
+    fixture.store.runOperation(
+      { id: "operation-objective-stale-owner", kind: "prompt", body: fixture.prompt },
+      (store) => {
+        store.enqueueQueueItem({
+          id: "queue-objective-stale-owner",
+          sessionId: "session-1",
+          runId: "run-1",
+          attemptId: "attempt-objective-stale-owner",
+          operationId: "operation-objective-stale-owner",
+          disposition: "prompt",
+          body: fixture.prompt
+        });
+        return { accepted: true };
+      }
+    );
+    let objective = fixture.store.putObjective({
+      sessionId: "session-1",
+      text: "Fence a replaced pending owner."
+    });
+    objective = fixture.store.updateObjective({
+      sessionId: objective.sessionId,
+      expectedRevision: objective.revision,
+      expectedOwnerGeneration: objective.ownerGeneration,
+      pending: {
+        ownerGeneration: objective.ownerGeneration,
+        operationId: "operation-objective-stale-owner",
+        runId: "run-1",
+        attemptId: "attempt-objective-stale-owner",
+        queueItemId: "queue-objective-stale-owner"
+      }
+    });
+    fixture.store.claimNextQueueItem({
+      sessionId: "session-1",
+      backendInstanceGeneration: 0,
+      traceId: "objective-stale-owner:claim"
+    });
+    objective = fixture.store.updateObjective({
+      sessionId: objective.sessionId,
+      expectedRevision: objective.revision,
+      expectedOwnerGeneration: objective.ownerGeneration,
+      status: "dispatch_unknown",
+      advanceOwnerGeneration: true
+    });
+    expect(() => fixture.store.renewQueueAttemptGeneration({
+      queueItemId: "queue-objective-stale-owner",
+      attemptId: "attempt-objective-noop-mismatch",
+      generation: 0,
+      at: 9
+    })).toThrow(/does not exactly own/u);
+    expect(() => fixture.store.getAttempt("attempt-objective-noop-mismatch")).toThrow();
+    const session = fixture.store.getSession("session-1");
+    fixture.store.updateSession("session-1", {
+      binding: { ...session.descriptor.binding, generation: 1 }
+    }, session.revision);
+
+    expect(() => fixture.store.renewQueueAttemptGeneration({
+      queueItemId: "queue-objective-stale-owner",
+      attemptId: "attempt-objective-stale-owner-renewed",
+      generation: 1,
+      at: 10
+    })).toThrow(/does not exactly own/u);
+    expect(fixture.store.getQueueItem("queue-objective-stale-owner").attemptId)
+      .toBe("attempt-objective-stale-owner");
+    expect(fixture.store.getAttempt("attempt-objective-stale-owner").descriptor.endedAt).toBeUndefined();
+    expect(() => fixture.store.getAttempt("attempt-objective-stale-owner-renewed")).toThrow();
+    expect(fixture.store.getObjective("session-1")).toMatchObject({
+      ownerGeneration: objective.ownerGeneration,
+      pendingOwnerGeneration: objective.ownerGeneration - 1,
+      pendingAttemptId: "attempt-objective-stale-owner",
+      sessionGeneration: 1,
+      status: "dispatch_unknown"
     });
   });
 
