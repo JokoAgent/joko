@@ -42,6 +42,7 @@ import { ContextCapacityRing } from "./ContextCapacityRing.js";
 import { SessionUsageChip } from "./SessionUsageChip.js";
 import { ComposerRichTextEditor, type ComposerRichTextEditorHandle } from "./ComposerRichTextEditor.js";
 import { ComposerPastedTextDialog, type ComposerPastedTextDialogTarget } from "./ComposerPastedTextDialog.js";
+import { objectiveDialogRequestMatchesOwner, type ObjectiveDialogHandoffRequest } from "./ObjectiveIndicator.js";
 import { countComposerPasteLines } from "./composer-paste-pipeline.js";
 import { resolveComposerRouteReferenceFromRuntime } from "./composer-route-reference-runtime.js";
 import { classifyComposerInternalDrop } from "./composer-internal-drop.js";
@@ -92,7 +93,7 @@ interface PendingComposerDraftSave {
   queued: boolean;
 }
 
-export function Composer({ controller, session, backend, sessionUsage, readOnly = false, autoFocus = true, focusRequest = 0, queue, queueControl, workspace, extraDirectories, resources, artifacts, sessions, commands, messageHistory, controls, runningStatus, messageMentionInsertion, selectionQuoteInsertion, attachmentInsertion, draftReplacement, t, runAction, onLocalSend, onDraftMutation, onOpenObjective, onStop, stopInFlight = false, onCompact }: {
+export function Composer({ controller, session, backend, sessionUsage, readOnly = false, autoFocus = true, focusRequest = 0, queue, queueControl, workspace, extraDirectories, resources, artifacts, sessions, commands, messageHistory, controls, runningStatus, messageMentionInsertion, selectionQuoteInsertion, attachmentInsertion, draftReplacement, objectiveDialogHandoff, t, runAction, onLocalSend, onDraftMutation, onOpenObjective, onObjectiveDialogHandoffRejected, onStop, stopInFlight = false, onCompact }: {
   readonly controller: AppController;
   readonly session: SessionView;
   readonly backend?: BackendView;
@@ -117,11 +118,13 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
   readonly selectionQuoteInsertion?: { readonly id: number; readonly sessionId: string; readonly quote: ComposerSelectionQuoteDraft };
   readonly attachmentInsertion?: { readonly id: number; readonly sessionId: string; readonly file: File };
   readonly draftReplacement?: { readonly id: number; readonly sessionId: string; readonly text: string; readonly editorDocument?: JSONContent; readonly attachments?: readonly AttachmentDraft[] };
+  readonly objectiveDialogHandoff?: ObjectiveDialogHandoffRequest;
   readonly t: Translator;
   readonly runAction: RunAction;
   readonly onLocalSend: (sessionId: string) => void;
   readonly onDraftMutation?: () => void;
-  readonly onOpenObjective?: (onSaved: () => void) => void;
+  readonly onOpenObjective?: (onSaved: () => void, handoff?: ObjectiveDialogHandoffRequest) => void;
+  readonly onObjectiveDialogHandoffRejected?: (requestId: string) => void;
   readonly onStop?: () => void;
   readonly stopInFlight?: boolean;
   readonly onCompact?: () => void;
@@ -218,7 +221,12 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
   const appliedSelectionQuoteInsertionRef = useRef<number | undefined>(undefined);
   const appliedAttachmentInsertionRef = useRef<number | undefined>(undefined);
   const appliedDraftReplacementRef = useRef<number | undefined>(undefined);
+  const appliedObjectiveDialogHandoffRef = useRef<string | undefined>(undefined);
+  const restoringObjectiveDialogHandoffRef = useRef<string | undefined>(undefined);
+  const objectiveDialogHandoffRef = useRef(objectiveDialogHandoff);
+  objectiveDialogHandoffRef.current = objectiveDialogHandoff;
   const appliedRejectedFirstInputRecoveryRef = useRef<number | undefined>(undefined);
+  const restoredObjectiveDialogHandoffRecoveryRef = useRef<{ readonly eventId: number; readonly requestId: string } | undefined>(undefined);
   const promptRecommendationRevision = useSyncExternalStore(
     promptRecommendationStore.subscribe,
     promptRecommendationStore.getRevision
@@ -678,6 +686,15 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
       ...(extraDirectoryIds === undefined ? {} : { extraDirectoryIds })
     };
     const restored = mergeRejectedComposerDraft(rejectedFirstInputRecovery.input, current);
+    const pendingObjectiveDialogHandoff = objectiveDialogHandoffRef.current;
+    if (pendingObjectiveDialogHandoff !== undefined
+      && pendingObjectiveDialogHandoff.sessionId === session.id
+      && sameObjectiveInvocationDraft(rejectedFirstInputRecovery.input, pendingObjectiveDialogHandoff.expectedDraft)) {
+      restoredObjectiveDialogHandoffRecoveryRef.current = {
+        eventId: rejectedFirstInputRecovery.eventId,
+        requestId: pendingObjectiveDialogHandoff.id
+      };
+    }
     const restoredDocument = normalizeComposerDocument(restored.editorDocument, restored.text);
     const restoredText = composerDocumentPlainText(restoredDocument);
     markDraftEdited(session.id);
@@ -869,6 +886,131 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
       ownerWindow.clearTimeout(timer);
     };
   }, [controller.saveDraft, attachments, browserComments, deliveryMode, editorDocument, extraDirectoriesSupported, extraDirectoryIds, hydratedSession, mentions, inlineMentionRanges, readOnly, session.id, submissionKind, text, voiceDictionaryOwnerKey]);
+
+  useEffect(() => {
+    const handoff = objectiveDialogHandoff;
+    if (readOnly || handoff === undefined || onOpenObjective === undefined
+      || hydratedSession !== session.id || hydratedDraftOwnerRef.current !== voiceDictionaryOwnerKey
+      || appliedObjectiveDialogHandoffRef.current === handoff.id
+      || !objectiveDialogRequestMatchesOwner(handoff, controller, session)) return;
+    const sourceGuard = operationGuardRef.current;
+    const owner = sourceGuard.capture(session.id);
+    const sourceController = controllerRef.current;
+    const sourceOwnerKey = voiceDictionaryOwnerKey;
+    const sourceDraft = {
+      text,
+      editorDocument,
+      deliveryMode,
+      mentions,
+      inlineMentionRanges,
+      attachments,
+      browserComments,
+      ...(extraDirectoriesSupported && extraDirectoryIds !== undefined ? { extraDirectoryIds } : {})
+    } satisfies ComposerDraft;
+    const matchesExpectedDraft = sameObjectiveInvocationDraft(sourceDraft, handoff.expectedDraft);
+    if (!matchesExpectedDraft) {
+      const justRestoredRecovery = restoredObjectiveDialogHandoffRecoveryRef.current;
+      if (justRestoredRecovery?.requestId === handoff.id
+        && rejectedFirstInputRecovery?.eventId === justRestoredRecovery.eventId
+        && sameObjectiveInvocationDraft(rejectedFirstInputRecovery.input, handoff.expectedDraft)) {
+        restoredObjectiveDialogHandoffRecoveryRef.current = undefined;
+        return;
+      }
+      if (owner.draftRevision === 0 && objectiveInvocationDraftIsEmpty(sourceDraft)) {
+        if (restoringObjectiveDialogHandoffRef.current !== handoff.id) {
+          restoringObjectiveDialogHandoffRef.current = handoff.id;
+          sourceGuard.markDraftEdited(session.id);
+          onDraftMutation?.();
+          editorRevisionRef.current += 1;
+          const restoredDocument = normalizeComposerDocument(handoff.expectedDraft.editorDocument, handoff.expectedDraft.text);
+          const restoredText = composerDocumentPlainText(restoredDocument);
+          const restoredMentions = handoff.expectedDraft.mentions;
+          editorDocumentRef.current = restoredDocument;
+          textRef.current = restoredText;
+          mentionsRef.current = restoredMentions;
+          attachmentsRef.current = handoff.expectedDraft.attachments;
+          browserCommentsRef.current = handoff.expectedDraft.browserComments ?? [];
+          setEditorDocument(restoredDocument);
+          setText(restoredText);
+          setMentions(restoredMentions);
+          replaceInlineMentionRanges(restoreComposerInlineMentionRanges(restoredText, restoredMentions, handoff.expectedDraft.inlineMentionRanges));
+          setExtraDirectoryIds(handoff.expectedDraft.extraDirectoryIds);
+          setDeliveryMode(supportedModes.includes(handoff.expectedDraft.deliveryMode) ? handoff.expectedDraft.deliveryMode : supportedModes[0] ?? "prompt");
+          setAttachments((current) => {
+            revokeAttachments(current);
+            return handoff.expectedDraft.attachments.map(withAttachmentPreview);
+          });
+          setBrowserComments((current) => {
+            revokeBrowserCommentPreviews(current);
+            return (handoff.expectedDraft.browserComments ?? []).map(withBrowserCommentPreview);
+          });
+          void enqueueDraftSave(draftSaveChainRef, { current: sourceController }, session.id, handoff.expectedDraft).catch(() => undefined);
+        }
+        return;
+      }
+      appliedObjectiveDialogHandoffRef.current = handoff.id;
+      onObjectiveDialogHandoffRejected?.(handoff.id);
+      return;
+    }
+    restoredObjectiveDialogHandoffRecoveryRef.current = undefined;
+    restoringObjectiveDialogHandoffRef.current = undefined;
+    appliedObjectiveDialogHandoffRef.current = handoff.id;
+    onOpenObjective(() => {
+      const currentHandoff = objectiveDialogHandoffRef.current;
+      if (!matchesExpectedDraft || currentHandoff?.id !== handoff.id
+        || hydratedDraftOwnerRef.current !== sourceOwnerKey
+        || operationGuardRef.current !== sourceGuard || !sourceGuard.ownsActivation(owner)
+        || !objectiveDialogRequestMatchesOwner(handoff, controllerRef.current, session)
+        || !sourceGuard.consumeUnchangedDraft(owner)) return;
+      resetHistoryNavigation();
+      closePalette();
+      editorRevisionRef.current += 1;
+      const clearedDocument = emptyComposerDocument();
+      editorDocumentRef.current = clearedDocument;
+      textRef.current = "";
+      mentionsRef.current = [];
+      attachmentsRef.current = [];
+      browserCommentsRef.current = [];
+      setEditorDocument(clearedDocument);
+      setText("");
+      setMentions([]);
+      replaceInlineMentionRanges([]);
+      setExtraDirectoryIds(undefined);
+      setAttachments((current) => { revokeAttachments(current); return []; });
+      setBrowserComments((current) => { revokeBrowserCommentPreviews(current); return []; });
+      setAttachmentError(undefined);
+      requestComposerFrame(() => richEditorRef.current?.focus());
+      void enqueueDraftSave(draftSaveChainRef, { current: sourceController }, session.id, {
+        text: "",
+        editorDocument: clearedDocument,
+        deliveryMode,
+        mentions: [],
+        attachments: [],
+        browserComments: []
+      }).catch(() => undefined);
+    }, handoff);
+  }, [
+    attachments,
+    browserComments,
+    controller,
+    deliveryMode,
+    editorDocument,
+    extraDirectoriesSupported,
+    extraDirectoryIds,
+    hydratedSession,
+    inlineMentionRanges,
+    mentions,
+    objectiveDialogHandoff,
+    onDraftMutation,
+    onOpenObjective,
+    onObjectiveDialogHandoffRejected,
+    readOnly,
+    rejectedFirstInputRecovery,
+    session,
+    supportedModes,
+    text,
+    voiceDictionaryOwnerKey
+  ]);
 
   useEffect(() => () => {
     revokeAttachments(attachmentsRef.current);
@@ -2894,6 +3036,51 @@ function withBrowserCommentPreview(item: BrowserCommentDraftItem): BrowserCommen
 
 function revokeBrowserCommentPreviews(items: readonly BrowserCommentDraftItem[]): void {
   revokeAttachments(items.map((item) => item.screenshot));
+}
+
+/** Compare the durable invocation that opened a cross-route Objective dialog.
+ * Preview URLs are renderer-local, while File metadata and every authored
+ * structured field remain part of the consumption fence. */
+export function sameObjectiveInvocationDraft(left: ComposerDraft, right: ComposerDraft): boolean {
+  const comparable = (draft: ComposerDraft) => {
+    const document = normalizeComposerDocument(draft.editorDocument, draft.text);
+    return {
+      text: composerDocumentPlainText(document),
+      editorDocument: document,
+      deliveryMode: draft.deliveryMode,
+      mentions: draft.mentions,
+      inlineMentionRanges: draft.inlineMentionRanges ?? [],
+      extraDirectoryIds: draft.extraDirectoryIds ?? null,
+      attachments: draft.attachments.map(comparableAttachment),
+      browserComments: (draft.browserComments ?? []).map(({ screenshot, ...comment }) => ({
+        ...comment,
+        screenshot: comparableAttachment(screenshot)
+      }))
+    };
+  };
+  return JSON.stringify(comparable(left)) === JSON.stringify(comparable(right));
+}
+
+function objectiveInvocationDraftIsEmpty(draft: ComposerDraft): boolean {
+  return composerDocumentIsEmpty(normalizeComposerDocument(draft.editorDocument, draft.text))
+    && draft.attachments.length === 0
+    && (draft.browserComments?.length ?? 0) === 0
+    && draft.mentions.length === 0
+    && (draft.inlineMentionRanges?.length ?? 0) === 0
+    && (draft.extraDirectoryIds?.length ?? 0) === 0;
+}
+
+function comparableAttachment(attachment: AttachmentDraft): object {
+  return {
+    id: attachment.id,
+    kind: attachment.kind,
+    file: {
+      name: attachment.file.name,
+      type: attachment.file.type,
+      size: attachment.file.size,
+      lastModified: attachment.file.lastModified
+    }
+  };
 }
 
 function browserCommentPageLabel(value: string): string {

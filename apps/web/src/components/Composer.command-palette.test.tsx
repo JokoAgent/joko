@@ -11,6 +11,7 @@ import { GAMEPAD_SKILL_EVENT } from "../gamepad-client.js";
 import { emptySnapshot, type BackendView, type ComposerDraft, type ComposerInlineMentionRange, type ObjectiveView, type RuntimeCommandView, type SessionView } from "../model.js";
 import { replaceComposerDocumentTextRange } from "./composer-inline-mention.js";
 import { Composer } from "./Composer.js";
+import type { ObjectiveDialogHandoffRequest } from "./ObjectiveIndicator.js";
 import { WORKSPACE_ENTRY_DRAG_MIME, encodeWorkspaceEntryDragPayload } from "./workspace-tree-state.js";
 
 const editorHarness = vi.hoisted(() => ({
@@ -307,6 +308,72 @@ it("sets, clears, and opens the application-owned /goal with fresh ownership and
   await settleActions(failed.actions);
   expect(failed.editor().value).toBe("/goal Keep this draft");
   expect(failed.actionErrors).toEqual([expect.objectContaining({ message: "Objective busy" })]);
+});
+
+it("opens a fenced Home /goal handoff after hydration and consumes only its unchanged durable draft", async () => {
+  const attachment = { id: "home-goal-file", file: new File(["evidence"], "evidence.txt", { type: "text/plain" }), kind: "file" as const };
+  const expectedDraft = { ...draft("/goal"), attachments: [attachment] };
+  const handoff: ObjectiveDialogHandoffRequest = {
+    id: "home-goal-request",
+    serverId: "server-one",
+    profileId: "profile-one",
+    connectionGeneration: 1,
+    sessionId: baseSession.id,
+    sessionGeneration: baseSession.generation,
+    expectedDraft
+  };
+  const view = await mount(expectedDraft, document, true, handoff);
+  await vi.waitFor(() => expect(view.openObjective).toHaveBeenCalledWith(expect.any(Function), handoff));
+  expect(view.editor().value).toBe("/goal");
+  expect(view.drafts.get(baseSession.id)?.attachments).toEqual([attachment]);
+
+  await act(async () => view.completeObjectiveDialog());
+  await vi.waitFor(() => expect(view.editor().value).toBe(""));
+  await vi.waitFor(() => expect(view.drafts.get(baseSession.id)?.text).toBe(""));
+  expect(view.drafts.get(baseSession.id)?.attachments).toEqual([]);
+
+  const changed = await mount(expectedDraft, document, true, { ...handoff, id: "changed-home-goal" });
+  await vi.waitFor(() => expect(changed.openObjective).toHaveBeenCalledTimes(1));
+  await input(changed.editor(), "A newer draft", 13);
+  await act(async () => changed.completeObjectiveDialog());
+  expect(changed.editor().value).toBe("A newer draft");
+
+  const raced = await mount(draft(""), document, true, { ...handoff, id: "raced-home-goal" });
+  await vi.waitFor(() => expect(raced.openObjective).toHaveBeenCalledTimes(1));
+  expect(raced.editor().value).toBe("/goal");
+  expect(raced.drafts.get(baseSession.id)?.attachments).toEqual([attachment]);
+});
+
+it("waits for the matching rejected first-input recovery before opening a Home /goal handoff", async () => {
+  const attachment = { id: "restored-home-goal-file", file: new File(["evidence"], "evidence.txt", { type: "text/plain" }), kind: "file" as const };
+  const expectedDraft = { ...draft("/goal"), attachments: [attachment] };
+  const handoff: ObjectiveDialogHandoffRequest = {
+    id: "restored-home-goal-request",
+    serverId: "server-one",
+    profileId: "profile-one",
+    connectionGeneration: 1,
+    sessionId: baseSession.id,
+    sessionGeneration: baseSession.generation,
+    expectedDraft
+  };
+  const recovery = {
+    eventId: 1,
+    sessionId: baseSession.id,
+    input: expectedDraft,
+    draft: expectedDraft,
+    revision: 2
+  } satisfies NonNullable<AppController["state"]["rejectedFirstInputRecovery"]>;
+  const view = await mount(draft(""), document, true);
+  view.drafts.set(baseSession.id, expectedDraft);
+  await view.render(baseSession, {
+    ...view.api,
+    state: { ...view.api.state, rejectedFirstInputRecovery: recovery }
+  }, view.backend, handoff);
+
+  await vi.waitFor(() => expect(view.openObjective).toHaveBeenCalledWith(expect.any(Function), handoff));
+  expect(view.rejectObjectiveDialogHandoff).not.toHaveBeenCalled();
+  expect(view.editor().value).toBe("/goal");
+  expect(view.drafts.get(baseSession.id)?.attachments).toEqual([attachment]);
 });
 
 it("hands a freshly loaded runtime /goal Skill the complete invocation exactly once", async () => {
@@ -861,13 +928,19 @@ it("does not clear a new mounted owner after the old reset completes", async () 
   expect(view.editor().value).toBe("Fresh draft");
 });
 
-async function mount(initialDraft: ComposerDraft, ownerDocument: Document = document, objectiveEnabled = false) {
+async function mount(
+  initialDraft: ComposerDraft,
+  ownerDocument: Document = document,
+  objectiveEnabled = false,
+  objectiveDialogHandoff?: ObjectiveDialogHandoffRequest,
+  rejectedFirstInputRecovery?: NonNullable<AppController["state"]["rejectedFirstInputRecovery"]>
+) {
   const drafts = new Map<string, ComposerDraft>([
     [baseSession.id, initialDraft],
     ["task-two", draft("second task")]
   ]);
   const api = {
-    state: { connectionState: "connected", activeProfile: { serverId: "server-one", id: "profile-one" }, snapshot: { ...emptySnapshot(), targets: [baseTarget] }, preferences: DEFAULT_UI_PREFERENCES },
+    state: { connectionState: "connected", connectionGeneration: 1, activeProfile: { serverId: "server-one", id: "profile-one" }, snapshot: { ...emptySnapshot(), targets: [baseTarget] }, preferences: DEFAULT_UI_PREFERENCES, ...(rejectedFirstInputRecovery === undefined ? {} : { rejectedFirstInputRecovery }) },
     readDraft: vi.fn(async (sessionId: string) => drafts.get(sessionId)),
     readDraftSnapshot: vi.fn(async (sessionId: string) => ({ revision: 1, draft: drafts.get(sessionId) })),
     saveDraft: vi.fn(async (sessionId: string, draftValue: ComposerDraft) => { drafts.set(sessionId, draftValue); }),
@@ -922,9 +995,17 @@ async function mount(initialDraft: ComposerDraft, ownerDocument: Document = docu
   const actionErrors: unknown[] = [];
   let completeObjectiveDialog = (): void => undefined;
   const openObjective = vi.fn((onSaved: () => void) => { completeObjectiveDialog = onSaved; });
+  const rejectObjectiveDialogHandoff = vi.fn();
   let activeController = api;
-  const render = async (session: SessionView, nextController: AppController = activeController, nextBackend: BackendView = backend) => {
+  let activeObjectiveDialogHandoff = objectiveDialogHandoff;
+  const render = async (
+    session: SessionView,
+    nextController: AppController = activeController,
+    nextBackend: BackendView = backend,
+    nextObjectiveDialogHandoff: ObjectiveDialogHandoffRequest | undefined = activeObjectiveDialogHandoff
+  ) => {
     activeController = nextController;
+    activeObjectiveDialogHandoff = nextObjectiveDialogHandoff;
     await act(async () => root.render(<Composer
       controller={activeController}
       session={session}
@@ -943,11 +1024,13 @@ async function mount(initialDraft: ComposerDraft, ownerDocument: Document = docu
         runtimeGeneration: 1
       }]}
       commands={commands}
+      objectiveDialogHandoff={activeObjectiveDialogHandoff}
       messageHistory={[]}
       t={(key) => key}
       runAction={(_key, action) => { actions.push(action().catch((error: unknown) => { actionErrors.push(error); })); }}
       onLocalSend={() => undefined}
       onOpenObjective={objectiveEnabled ? openObjective : undefined}
+      onObjectiveDialogHandoffRejected={rejectObjectiveDialogHandoff}
     />));
   };
   await render(baseSession);
@@ -958,6 +1041,7 @@ async function mount(initialDraft: ComposerDraft, ownerDocument: Document = docu
     actions,
     actionErrors,
     openObjective,
+    rejectObjectiveDialogHandoff,
     completeObjectiveDialog: () => completeObjectiveDialog(),
     render,
     hide: async () => { await act(async () => root.render(null)); },

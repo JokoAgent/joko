@@ -39,7 +39,8 @@ import { WorkspaceFilesRoute } from "./components/WorkspaceFilesRoute.js";
 import { createInspectorTurnReviewRequest, type InspectorTurnReviewRequest } from "./components/inspector-review-focus.js";
 import { activateDetachedInspectorWindow } from "./components/inspector-detach.js";
 import { requestWorkspaceDocumentLeave } from "./workspace-document-lifecycle.js";
-import { useNewSessionSubmission } from "./use-new-session-submission.js";
+import { useNewSessionSubmission, type NewSessionAcceptanceOwner } from "./use-new-session-submission.js";
+import type { FirstInputAcceptance } from "./new-session-flow.js";
 import { currentAppShortcutPlatform, type AppShortcutId, type AppShortcutOverrides } from "./app-shortcuts.js";
 import {
   createDesktopApplicationMenuCommandQueue,
@@ -112,6 +113,7 @@ import { isRuntimeProcessMonitorWindow } from "./runtime-process-monitor-window.
 import { ExtensionMainViewPage } from "./components/ExtensionMainViewPage.js";
 import { createProviderModelRefreshLifecycle } from "./provider-model-refresh-lifecycle.js";
 import type { NewSessionProjectPickerRequest } from "./components/NewSessionPage.js";
+import type { ObjectiveDialogHandoffRequest } from "./components/ObjectiveIndicator.js";
 import type { DedicatedHardwareCommand, DedicatedHardwareTaskCatalog } from "./dedicated-hardware.js";
 import {
   createDedicatedHardwareTaskCatalog,
@@ -186,6 +188,12 @@ interface SessionRemovalDialogRequest {
   readonly sessions: readonly SessionView[];
   readonly preflight: WorktreeRemovalPreflightSummary;
   readonly onArchived?: () => void;
+}
+
+interface PendingObjectiveDialogHandoff extends ObjectiveDialogHandoffRequest {
+  /** Allows the acceptance callback and its already-issued navigation to land
+   * in either React batch, while retiring any later return to Home. */
+  readonly acceptedNavigationRevision: number;
 }
 
 interface DesktopApplicationMenuActionTarget {
@@ -350,6 +358,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
   const [inspectorDetached, setInspectorDetached] = useState(false);
   const [fileSelectionQuoteInsertion, setFileSelectionQuoteInsertion] = useState<FileSelectionQuoteInsertion>();
   const [fileAttachmentInsertion, setFileAttachmentInsertion] = useState<FileAttachmentInsertion>();
+  const [objectiveDialogHandoff, setObjectiveDialogHandoff] = useState<PendingObjectiveDialogHandoff>();
   const timelineFocusRequestIdRef = useRef(0);
   const inspectorSubagentFocusRequestIdRef = useRef(0);
   const inspectorTurnReviewFocusRequestIdRef = useRef(0);
@@ -776,7 +785,26 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
   }, [pendingDesktopDeepLinkDelivery, portableImportRequest?.id, state.navigationRevision, state.route]);
 
   const describeSubmissionError = useCallback((error: unknown) => messageOf(error, t("error.unexpected")), [t]);
-  const submitNewSession = useNewSessionSubmission(controller, setActionError, setBusyAction, describeSubmissionError);
+  const observeFirstInputAcceptance = useCallback((acceptance: FirstInputAcceptance, owner: NewSessionAcceptanceOwner): void => {
+    if (acceptance.kind !== "objectiveDialog") return;
+    const current = controllerRef.current.state;
+    const profile = current.activeProfile;
+    const connectionGeneration = current.connectionGeneration;
+    if (current.connectionState !== "connected" || profile === undefined || connectionGeneration === undefined
+      || profile.serverId !== owner.serverId || profile.id !== owner.profileId
+      || connectionGeneration !== owner.connectionGeneration) return;
+    setObjectiveDialogHandoff({
+      id: acceptance.requestId,
+      serverId: owner.serverId,
+      profileId: owner.profileId,
+      connectionGeneration: owner.connectionGeneration,
+      sessionId: acceptance.sessionId,
+      sessionGeneration: acceptance.sessionGeneration,
+      expectedDraft: acceptance.expectedDraft,
+      acceptedNavigationRevision: current.navigationRevision ?? 0
+    });
+  }, []);
+  const submitNewSession = useNewSessionSubmission(controller, setActionError, setBusyAction, describeSubmissionError, observeFirstInputAcceptance);
 
   const activeSession = useMemo(() => {
     if (state.route.kind !== "session" && state.route.kind !== "files") return undefined;
@@ -793,6 +821,31 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
     && state.error === undefined
     && (state.route.profileId !== state.activeProfile?.id
       || state.connectionState !== "connected");
+  useEffect(() => {
+    setObjectiveDialogHandoff((request) => {
+      if (request === undefined) return undefined;
+      const profile = state.activeProfile;
+      if (state.connectionState !== "connected" || profile === undefined
+        || request.serverId !== profile.serverId || request.profileId !== profile.id
+        || request.connectionGeneration !== state.connectionGeneration) return undefined;
+      if (state.route.kind === "session" || state.route.kind === "files") {
+        if (state.route.sessionId !== undefined && state.route.sessionId !== request.sessionId) return undefined;
+        const ownedSession = state.snapshot.sessions.find((candidate) => candidate.id === request.sessionId);
+        if (ownedSession !== undefined && ownedSession.generation !== request.sessionGeneration) return undefined;
+        return request;
+      }
+      if (state.route.kind === "newSession"
+        && (state.navigationRevision ?? 0) === request.acceptedNavigationRevision) return request;
+      return undefined;
+    });
+  }, [
+    state.activeProfile,
+    state.connectionGeneration,
+    state.connectionState,
+    state.navigationRevision,
+    state.route,
+    state.snapshot.sessions
+  ]);
   const lastRuntimeSessionIdRef = useRef<string | undefined>(activeSession?.id);
   if (activeSession !== undefined) lastRuntimeSessionIdRef.current = activeSession.id;
   else if (lastRuntimeSessionIdRef.current !== undefined
@@ -958,6 +1011,16 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
   const settingsTargetIdRef = useRef<string | undefined>(activeTarget?.id);
   if (state.route.kind !== "settings") settingsTargetIdRef.current = activeTarget?.id;
   const activeBackend = activeSession === undefined ? undefined : state.snapshot.backends.find((backend) => backend.id === activeSession.backendId);
+  const activeObjectiveDialogHandoff = objectiveDialogHandoff !== undefined
+    && activeSession !== undefined
+    && state.connectionState === "connected"
+    && objectiveDialogHandoff.serverId === state.activeProfile?.serverId
+    && objectiveDialogHandoff.profileId === state.activeProfile?.id
+    && objectiveDialogHandoff.connectionGeneration === state.connectionGeneration
+    && objectiveDialogHandoff.sessionId === activeSession.id
+    && objectiveDialogHandoff.sessionGeneration === activeSession.generation
+    ? objectiveDialogHandoff
+    : undefined;
   const acknowledgedAttentionRef = useRef(new Set<string>());
   const attentionAckRetryTimerRef = useRef<{
     readonly key: string;
@@ -1775,6 +1838,8 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
       inspectorAvailable={!embeddedInFiles}
       selectionQuoteInsertion={fileSelectionQuoteInsertion?.sessionId === activeSession.id ? fileSelectionQuoteInsertion : undefined}
       attachmentInsertion={fileAttachmentInsertion?.sessionId === activeSession.id ? fileAttachmentInsertion : undefined}
+      objectiveDialogHandoff={activeObjectiveDialogHandoff}
+      onObjectiveDialogHandoffHandled={(requestId) => setObjectiveDialogHandoff((current) => current?.id === requestId ? undefined : current)}
       t={t}
       runAction={runAction}
       onOpenNavigation={() => { if (!embeddedInFiles) setWindowNavigationOpen(true); }}

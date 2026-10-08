@@ -36,7 +36,7 @@ describe("ObjectiveIndicator", () => {
 
     await render(controller, undefined, handled);
     await vi.waitFor(() => expect(controller.getObjective).toHaveBeenCalledTimes(1));
-    const request: ObjectiveDialogRequest = { id: 1, onSaved: vi.fn() };
+    const request = dialogRequest(1);
     await render(controller, request, handled);
     expect(document.querySelector(".objective-dialog")).toBeNull();
     expect(document.body.textContent).toContain("objective.loading");
@@ -87,7 +87,7 @@ describe("ObjectiveIndicator", () => {
     });
     await render(controller);
     await vi.waitFor(() => expect(controller.watchObjective).toHaveBeenCalledTimes(1));
-    await render(controller, { id: 2, onSaved: vi.fn() });
+    await render(controller, dialogRequest(2));
     const textarea = await waitForTextarea();
     await act(async () => changeValue(textarea, "Create-owner draft"));
 
@@ -128,6 +128,37 @@ describe("ObjectiveIndicator", () => {
     );
     expect(controller.updateObjective).not.toHaveBeenCalled();
   });
+
+  it("keeps a valid mount-time handoff until the initial Objective snapshot is ready", async () => {
+    let resolveInitial!: (value: ObjectiveView | undefined) => void;
+    const initial = new Promise<ObjectiveView | undefined>((resolve) => { resolveInitial = resolve; });
+    const controller = objectiveController({
+      getObjective: vi.fn(() => initial)
+    });
+    const handled = vi.fn();
+
+    await render(controller, dialogRequest("home-goal"), handled);
+    expect(handled).not.toHaveBeenCalled();
+    expect(document.querySelector(".objective-dialog")).toBeNull();
+    expect(document.body.textContent).toContain("objective.loading");
+
+    await act(async () => resolveInitial(undefined));
+    await waitForTextarea();
+    expect(handled).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["profile", { profileId: "profile-two" }],
+    ["session", { sessionId: "task-two" }],
+    ["session generation", { sessionGeneration: 10n }],
+    ["connection", { connectionGeneration: 2 }]
+  ] as const)("retires a %s-mismatched handoff without opening it", async (_label, overrides) => {
+    const controller = objectiveController();
+    const handled = vi.fn();
+    await render(controller, dialogRequest("stale", overrides), handled);
+    await vi.waitFor(() => expect(handled).toHaveBeenCalledTimes(1));
+    expect(document.querySelector(".objective-dialog")).toBeNull();
+  });
 });
 
 const session: SessionView = {
@@ -145,6 +176,22 @@ const session: SessionView = {
   updatedAt: 1
 };
 const t = (key: string): string => key;
+
+function dialogRequest(
+  id: string | number,
+  overrides: Partial<ObjectiveDialogRequest> = {}
+): ObjectiveDialogRequest {
+  return {
+    id,
+    serverId: "server-one",
+    profileId: "profile-one",
+    connectionGeneration: 1,
+    sessionId: session.id,
+    sessionGeneration: session.generation,
+    onSaved: vi.fn(),
+    ...overrides
+  };
+}
 
 async function render(
   controller: AppController,
@@ -179,7 +226,7 @@ function objective(text: string, revision: bigint): ObjectiveView {
   };
 }
 
-function objectiveController(overrides: Partial<AppController>): AppController {
+function objectiveController(overrides: Partial<AppController> = {}): AppController {
   const current = objective("Current", 1n);
   return {
     state: {

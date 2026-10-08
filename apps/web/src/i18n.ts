@@ -5583,6 +5583,7 @@ const en = {
   ,"messaging.status.conflict": "Conflict"
   ,"messaging.status.authLoss": "Authorization lost"
   ,"messaging.status.error": "Error"
+  ,"objective.newAction": "New objective"
   ,"objective.createTitle": "Start an objective"
   ,"objective.editTitle": "Edit objective"
   ,"objective.dialogDescription": "Joko will keep working on this objective in the current task until it completes or needs your attention."
@@ -9280,6 +9281,7 @@ const zhBase: Record<MessageKey, string> = {
     "projects.browseServiceDisconnected": "服务连接已断开。重新连接后可重试此目录。",
     "projects.createLocalBody": "选择本机目录，或填写本机受管服务的路径。",
     "projects.localPathHelp": "选择本机目录，或输入本机服务节点上的路径。",
+    "objective.newAction": "新建目标",
     "objective.createTitle": "开始目标",
     "objective.editTitle": "编辑目标",
     "objective.dialogDescription": "Joko 会在当前任务中持续推进此目标，直到完成或需要你处理。",

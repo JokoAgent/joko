@@ -33,6 +33,12 @@ interface MockEditorProps {
   readonly onKeyDown: (event: KeyboardEvent, document: JSONContent) => boolean;
 }
 
+interface RenderedNewSessionPage {
+  readonly controller: AppController;
+  readonly snapshot: AppSnapshot;
+  readonly render: (snapshot: AppSnapshot) => Promise<void>;
+}
+
 let editorProps: MockEditorProps | undefined;
 let editorElement: HTMLDivElement | null = null;
 const newSessionEditorHarness = vi.hoisted(() => ({ routeDropActions: [] as Array<Record<string, unknown>> }));
@@ -141,6 +147,188 @@ describe("NewSessionPage typed slash commands", () => {
   });
 
   it.each([
+    { text: "/goal", action: "open", expectedText: undefined },
+    { text: "/goal Ship the complete release", action: "set", expectedText: "Ship the complete release" },
+    { text: "/goal clear", action: "clear", expectedText: undefined }
+  ] as const)("submits the Home $action objective command for fresh-runtime ownership reconciliation", async ({ text, action, expectedText }) => {
+    const onSubmit = vi.fn(async (_session: DelayedNewSessionDraft, _input: ComposerDraft, _owner: NewSessionSubmissionOwner) => undefined);
+    await renderPage(onSubmit);
+    await edit(text, text.length, false);
+    if (text === "/goal") await key("Escape");
+    await key("Enter");
+
+    expect(onSubmit).toHaveBeenCalledOnce();
+    const [, input, owner] = onSubmit.mock.calls[0]!;
+    expect(input.text).toBe(text);
+    expect(owner.firstInputDisposition).toMatchObject({
+      kind: "objective",
+      source: "slash",
+      action,
+      ...(expectedText === undefined ? {} : { text: expectedText, limits: { noProgressTurnLimit: 3 } })
+    });
+  });
+
+  it("offers /goal for managed dialogue creation", async () => {
+    const onSubmit = vi.fn(async (_session: DelayedNewSessionDraft, _input: ComposerDraft, _owner: NewSessionSubmissionOwner) => undefined);
+    await renderPage(onSubmit, { dialogue: true });
+    await edit("/goal Keep the dialogue moving", 30, false);
+    await key("Enter");
+
+    expect(onSubmit).toHaveBeenCalledOnce();
+    expect(onSubmit.mock.calls[0]![0].selection).toEqual({ kind: "dialogue", backendId: "backend-1" });
+    expect(onSubmit.mock.calls[0]![2].firstInputDisposition).toMatchObject({
+      kind: "objective",
+      source: "slash",
+      action: "set",
+      text: "Keep the dialogue moving"
+    });
+  });
+
+  it("opens New objective from Add with a trimmed prefill and keeps the composer on failure", async () => {
+    const onSubmit = vi.fn(async (_session: DelayedNewSessionDraft, _input: ComposerDraft, _owner: NewSessionSubmissionOwner) => { throw new Error("Objective set failed"); });
+    await renderPage(onSubmit, { attachmentActions: true });
+    await edit("  Preserve this draft  ", 23, false);
+    await attachFile("context.txt");
+
+    await openNewObjectiveDialog();
+    let textarea = required(document.querySelector<HTMLTextAreaElement>(".objective-dialog textarea"));
+    expect(textarea.value).toBe("Preserve this draft");
+    await clickButton("common.cancel");
+    expect(document.querySelector(".objective-dialog")).toBeNull();
+    expect(editorElement?.textContent).toBe("Preserve this draft");
+    expect(document.body.textContent).toContain("context.txt");
+
+    await openNewObjectiveDialog();
+    textarea = required(document.querySelector<HTMLTextAreaElement>(".objective-dialog textarea"));
+    await changeValue(textarea, "Finish from the explicit dialog");
+    await clickButton("objective.start");
+    await act(async () => vi.waitFor(() => expect(document.querySelector(".objective-dialog [role='alert']")?.textContent).toContain("Objective set failed")));
+
+    expect(document.querySelector(".objective-dialog")).not.toBeNull();
+    expect(editorElement?.textContent).toBe("Preserve this draft");
+    expect(document.body.textContent).toContain("context.txt");
+    expect(onSubmit).toHaveBeenCalledOnce();
+    const [, input, owner] = onSubmit.mock.calls[0]!;
+    expect(input).toMatchObject({ text: "/goal Finish from the explicit dialog", attachments: [expect.objectContaining({ file: expect.objectContaining({ name: "context.txt" }) })] });
+    expect(owner.firstInputDisposition).toMatchObject({
+      kind: "objective",
+      source: "dialog",
+      action: "set",
+      text: "Finish from the explicit dialog",
+      limits: { noProgressTurnLimit: 3 }
+    });
+  });
+
+  it("lets the explicit Add action bypass a loaded /goal Skill, accepts an empty composer, and clears accepted draft media", async () => {
+    const runtimeGoal = { id: "goal-skill", name: "goal", description: "Runtime objective", source: "skill" as const, loaded: true, resourceId: "skill-goal" };
+    const onSubmit = vi.fn(async (_session: DelayedNewSessionDraft, _input: ComposerDraft, owner: NewSessionSubmissionOwner) => {
+      expect(owner.firstInputDisposition).toMatchObject({ kind: "objective", source: "dialog", action: "set", text: "Finish autonomously" });
+      owner.onFirstInputAccepted?.({ kind: "sent", sessionId: "session-1" });
+    });
+    await renderPage(onSubmit, { attachmentActions: true, commands: [runtimeGoal] });
+    await attachFile("evidence.txt");
+    await openNewObjectiveDialog();
+    const textarea = required(document.querySelector<HTMLTextAreaElement>(".objective-dialog textarea"));
+    expect(textarea.value).toBe("");
+    await changeValue(textarea, "Finish autonomously");
+    await clickButton("objective.start");
+    await act(async () => vi.waitFor(() => expect(onSubmit).toHaveBeenCalledOnce()));
+
+    expect(editorElement?.textContent).toBe("");
+    expect(document.body.textContent).not.toContain("evidence.txt");
+    expect(document.querySelector(".objective-dialog")).toBeNull();
+  });
+
+  it("keeps an explicit Objective submission alive across createSession's unrelated snapshot refresh", async () => {
+    let view!: Awaited<ReturnType<typeof renderPage>>;
+    const onSubmit = vi.fn(async (_session: DelayedNewSessionDraft, _input: ComposerDraft, owner: NewSessionSubmissionOwner) => {
+      await view.render({
+        ...view.snapshot,
+        revision: view.snapshot.revision + 1n,
+        sessions: [...view.snapshot.sessions, {
+          id: "session-1",
+          backendId: "backend-1",
+          targetId: "target-1",
+          name: "New task",
+          state: "idle",
+          pinned: false,
+          archived: false,
+          generation: 1n,
+          fastMode: false,
+          permissionMode: "ask",
+          planMode: false,
+          updatedAt: 1
+        }]
+      });
+      expect(owner.signal.aborted).toBe(false);
+      expect(owner.isCurrent()).toBe(true);
+      owner.onFirstInputAccepted?.({
+        kind: "objectiveSet",
+        requestId: "dialog-objective",
+        sessionId: "session-1",
+        sessionGeneration: 1n,
+        objective: {
+          sessionId: "session-1",
+          text: "Finish after refresh",
+          status: "active",
+          noProgressTurnLimit: 3,
+          turnsUsed: 0,
+          tokensUsed: 0,
+          noProgressTurns: 0,
+          ownerGeneration: 1n,
+          sessionGeneration: 1n,
+          startedAt: 1,
+          revision: 1n
+        }
+      });
+    });
+    view = await renderPage(onSubmit);
+    await openNewObjectiveDialog();
+    await changeValue(required(document.querySelector<HTMLTextAreaElement>(".objective-dialog textarea")), "Finish after refresh");
+    await clickButton("objective.start");
+
+    await vi.waitFor(() => expect(onSubmit).toHaveBeenCalledOnce());
+    await vi.waitFor(() => expect(document.querySelector(".objective-dialog")).toBeNull());
+    expect(editorElement?.textContent).toBe("");
+  });
+
+  it("retires an in-flight explicit Objective when text input capability is revoked", async () => {
+    let owner!: NewSessionSubmissionOwner;
+    const onSubmit = vi.fn(async (_session: DelayedNewSessionDraft, _input: ComposerDraft, currentOwner: NewSessionSubmissionOwner) => {
+      owner = currentOwner;
+      await new Promise<void>((_resolve, reject) => currentOwner.signal.addEventListener("abort", () => reject(new DOMException("Retired", "AbortError")), { once: true }));
+    });
+    const view = await renderPage(onSubmit);
+    await openNewObjectiveDialog();
+    await changeValue(required(document.querySelector<HTMLTextAreaElement>(".objective-dialog textarea")), "Must stop on capability drift");
+    await clickButton("objective.start");
+    await vi.waitFor(() => expect(onSubmit).toHaveBeenCalledOnce());
+
+    const currentBackend = required(view.snapshot.backends[0]);
+    const capabilities = new Map(currentBackend.capabilities);
+    capabilities.set("input.text", { name: "input.text", supported: false, options: [] });
+    await act(async () => view.render({
+      ...view.snapshot,
+      revision: view.snapshot.revision + 1n,
+      backends: [{ ...currentBackend, capabilities }]
+    }));
+
+    await vi.waitFor(() => expect(owner.signal.aborted).toBe(true));
+    expect(document.querySelector(".objective-dialog")).toBeNull();
+  });
+
+  it("retires the Add objective dialog with the initiating Document epoch", async () => {
+    const onSubmit = vi.fn(async () => undefined);
+    await renderPage(onSubmit);
+    await openNewObjectiveDialog();
+    expect(document.querySelector(".objective-dialog")).not.toBeNull();
+
+    await act(async () => window.dispatchEvent(new Event("pagehide")));
+    expect(document.querySelector(".objective-dialog")).toBeNull();
+    expect(onSubmit).not.toHaveBeenCalled();
+  });
+
+  it.each([
     { text: "/learn hub:catalog-skill", message: "Catalog Skill identifiers", structured: false },
     { text: "/learn preserve this", message: "accepts text only", structured: true }
   ] as const)("marks out-of-scope or structured learning input for post-create runtime reconciliation", async ({ text, structured }) => {
@@ -236,9 +424,10 @@ describe("NewSessionPage typed slash commands", () => {
 
     await edit("/", 1, false);
     await moveCaret(1);
-    expect(commandOptions()).toHaveLength(2);
+    expect(commandOptions()).toHaveLength(3);
     await key("ArrowDown");
-    expect(commandOptions()[1]?.getAttribute("aria-selected")).toBe("true");
+    await key("ArrowDown");
+    expect(commandOptions()[2]?.getAttribute("aria-selected")).toBe("true");
     await key("Enter");
 
     expect(editorElement?.textContent).toBe("/replace");
@@ -335,12 +524,16 @@ async function renderPage(
     readonly attachmentActions?: boolean;
     readonly skillCapable?: boolean;
     readonly commands?: AppSnapshot["commands"];
+    readonly dialogue?: boolean;
   } = {}
-): Promise<void> {
+): Promise<RenderedNewSessionPage> {
   const snapshotValue = snapshot(options.attachmentActions === true, options.skillCapable === true, options.commands);
-  const controller = {
+  const controllerValue = {
     state: {
       connectionState: "connected",
+      connectionGeneration: 1,
+      activeProfile: { id: "profile-one", serverId: "server-one", deviceId: "device-one", name: "Local", origin: "https://localhost" },
+      route: { kind: "newSession" as const },
       snapshot: snapshotValue,
       preferences: { locale: "en", composerSendShortcut: "enter", newSessionWorktreeEnabled: false }
     },
@@ -353,23 +546,37 @@ async function renderPage(
     probeTargetWorktree: vi.fn(async (targetId: string) => ({ targetId, eligibility: "unavailable", canRefreshRemote: false })),
     listTargetWorktreeSources: vi.fn(async () => []),
     setNewSessionWorktreeEnabled: vi.fn(async () => undefined)
-  } as unknown as AppController;
+  };
+  const controller = controllerValue as unknown as AppController;
   const container = document.body.appendChild(document.createElement("div"));
   const root = createRoot(container);
   roots.push(root);
-  await act(async () => {
+  const renderNode = (nextSnapshot: AppSnapshot): void => {
+    controllerValue.state.snapshot = nextSnapshot;
     root.render(<NewSessionPage
       controller={controller}
-      snapshot={snapshotValue}
+      snapshot={nextSnapshot}
+      initialDialogueBackendId={options.dialogue === true ? "backend-1" : undefined}
       navigationOpen
       t={(key) => key}
       onOpenNavigation={vi.fn()}
       onClose={vi.fn()}
       onSubmit={onSubmit}
     />);
+  };
+  const render = async (nextSnapshot: AppSnapshot): Promise<void> => {
+    renderNode(nextSnapshot);
+    await flush();
+  };
+  await act(async () => {
+    renderNode(snapshotValue);
     await flush();
   });
+  await vi.waitFor(() => {
+    expect(editorElement).not.toBeNull();
+  });
   required(editorElement).focus();
+  return { controller, snapshot: snapshotValue, render };
 }
 
 function extension(): ExtensionCatalogEntryView {
@@ -419,6 +626,53 @@ async function moveCaret(caret: number): Promise<void> {
 async function key(value: string): Promise<void> {
   await act(async () => {
     required(editorElement).dispatchEvent(new KeyboardEvent("keydown", { key: value, bubbles: true, cancelable: true }));
+    await flush();
+  });
+}
+
+async function attachFile(name: string): Promise<void> {
+  const input = required(document.querySelector<HTMLInputElement>(".new-task-composer input[type='file']"));
+  await act(async () => {
+    dispatchGamepadOwnedAction(document, "add-files");
+    await flush();
+  });
+  Object.defineProperty(input, "files", {
+    configurable: true,
+    value: [new File(["evidence"], name, { type: "text/plain" })]
+  });
+  await act(async () => {
+    input.dispatchEvent(new Event("change", { bubbles: true }));
+    await flush();
+  });
+}
+
+async function openNewObjectiveDialog(): Promise<void> {
+  await act(async () => {
+    required(document.querySelector<HTMLButtonElement>(".composer-add-menu__trigger")).click();
+    await flush();
+  });
+  const action = [...document.querySelectorAll<HTMLButtonElement>(".composer-add-menu__action")]
+    .find((button) => button.textContent?.includes("objective.newAction"));
+  await act(async () => {
+    required(action).click();
+    await flush();
+  });
+}
+
+async function changeValue(element: HTMLTextAreaElement, value: string): Promise<void> {
+  const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")?.set;
+  await act(async () => {
+    setter?.call(element, value);
+    element.dispatchEvent(new Event("input", { bubbles: true }));
+    await flush();
+  });
+}
+
+async function clickButton(text: string): Promise<void> {
+  const button = [...document.querySelectorAll<HTMLButtonElement>("button")]
+    .find((candidate) => candidate.textContent?.trim() === text);
+  await act(async () => {
+    required(button).click();
     await flush();
   });
 }

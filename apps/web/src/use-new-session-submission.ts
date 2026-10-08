@@ -2,7 +2,12 @@ import { useCallback, useLayoutEffect, useRef } from "react";
 import type { Dispatch, SetStateAction } from "react";
 import type { AppController, AppRoute } from "./controller.js";
 import type { ComposerDraft } from "./model.js";
-import { createDelayedSessionFromFirstInput, type DelayedNewSessionDraft, type NewSessionSubmissionOwner } from "./new-session-flow.js";
+import {
+  createDelayedSessionFromFirstInput,
+  type DelayedNewSessionDraft,
+  type FirstInputAcceptance,
+  type NewSessionSubmissionOwner
+} from "./new-session-flow.js";
 import { recentProjectForTarget } from "./recent-projects.js";
 
 interface SubmissionView {
@@ -10,18 +15,27 @@ interface SubmissionView {
   retire(): void;
 }
 
+export interface NewSessionAcceptanceOwner {
+  readonly serverId: string;
+  readonly profileId: string;
+  readonly connectionGeneration: number;
+}
+
 /** Keep accepted input on its original connection while presentation follows only its own navigation. */
 export function useNewSessionSubmission(
   controller: AppController,
   setError: Dispatch<SetStateAction<string | undefined>>,
   setBusy: Dispatch<SetStateAction<string | undefined>>,
-  describeError: (error: unknown) => string
+  describeError: (error: unknown) => string,
+  onFirstInputAccepted?: (acceptance: FirstInputAcceptance, owner: NewSessionAcceptanceOwner) => void
 ): (draft: DelayedNewSessionDraft, input: ComposerDraft, owner: NewSessionSubmissionOwner) => Promise<void> {
   const currentController = useRef(controller);
+  const acceptedObserver = useRef(onFirstInputAccepted);
   const activeView = useRef<SubmissionView | undefined>(undefined);
   const sequence = useRef(0);
   useLayoutEffect(() => {
     currentController.current = controller;
+    acceptedObserver.current = onFirstInputAccepted;
     activeView.current?.observe(controller);
   });
   useLayoutEffect(() => () => activeView.current?.retire(), []);
@@ -33,11 +47,19 @@ export function useNewSessionSubmission(
       : undefined;
     const doc = owner.ownerDocument;
     const win = doc.defaultView;
+    const sourceProfile = original.state.activeProfile;
+    const sourceConnectionGeneration = original.state.connectionGeneration;
     owner.signal.throwIfAborted();
     if (!owner.isCurrent() || original.state.route.kind !== "newSession"
-      || original.state.connectionState !== "connected" || win === null || win.closed || win.document !== doc) {
+      || original.state.connectionState !== "connected" || sourceProfile === undefined
+      || sourceConnectionGeneration === undefined || win === null || win.closed || win.document !== doc) {
       throw new DOMException("The initiating draft is no longer available.", "AbortError");
     }
+    const acceptanceOwner: NewSessionAcceptanceOwner = {
+      serverId: sourceProfile.serverId,
+      profileId: sourceProfile.id,
+      connectionGeneration: sourceConnectionGeneration
+    };
     activeView.current?.observe(original);
     if (activeView.current !== undefined) throw new Error("Task creation is already in progress.");
     const actionKey = `create-session:${++sequence.current}`;
@@ -60,7 +82,15 @@ export function useNewSessionSubmission(
       },
       observe(current) {
         if (!live) return;
-        if (current.send !== original.send || current.state.connectionState !== "connected") { view.retire(); return; }
+        const currentProfile = current.state.activeProfile;
+        if (current.send !== original.send || current.state.connectionState !== "connected"
+          || currentProfile === undefined
+          || currentProfile.id !== acceptanceOwner.profileId
+          || currentProfile.serverId !== acceptanceOwner.serverId
+          || current.state.connectionGeneration !== acceptanceOwner.connectionGeneration) {
+          view.retire();
+          return;
+        }
         const next = current.state.route;
         if (next !== route || current.state.navigationRevision !== navigationRevision) {
           if (expectedSession !== undefined && next.kind === "session" && next.sessionId === expectedSession
@@ -105,6 +135,7 @@ export function useNewSessionSubmission(
         signal: effectLifetime.signal,
         onAccepted: (acceptance) => {
           try { owner.onFirstInputAccepted?.(acceptance); } catch { /* Usage history cannot block accepted-input presentation. */ }
+          try { acceptedObserver.current?.(acceptance, acceptanceOwner); } catch { /* Shell presentation cannot undo accepted input. */ }
           if (acceptance.kind !== "learned" || !isCurrent()) return;
           const distillationSessionId = acceptance.run.distillationSessionId;
           expectedSession = distillationSessionId;

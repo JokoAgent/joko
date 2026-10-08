@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import type { ComposerDraft, NewSessionDraft, SkillLearningRunView } from "./model.js";
+import type { ComposerDraft, NewSessionDraft, ObjectiveView, SkillLearningRunView } from "./model.js";
 import { createDelayedSessionFromFirstInput, createSessionFromFirstInput } from "./new-session-flow.js";
 
 const session: NewSessionDraft = {
@@ -22,6 +22,258 @@ const input: ComposerDraft = {
 };
 
 describe("lazy new-session dispatch", () => {
+  it("reveals a slash Objective task, refreshes its runtime catalog, then sets the application Objective", async () => {
+    const order: string[] = [];
+    const objective = objectiveView("objective-session", 21n, "Ship the release");
+    const api = {
+      createSession: vi.fn(async () => { order.push("create"); return { sessionId: "objective-session", generation: 21n }; }),
+      listCommands: vi.fn(async () => { order.push("commands"); return []; }),
+      setObjective: vi.fn(async () => { order.push("objective"); return objective; }),
+      send: vi.fn(async () => { order.push("send"); }),
+      restoreFirstInputDraft: vi.fn(async () => { order.push("restore"); })
+    };
+    const accepted = vi.fn((value) => { order.push(`accepted:${value.kind}`); });
+
+    await expect(createSessionFromFirstInput(api, session, { ...input, text: "/goal Ship the release" }, () => {
+      order.push("reveal");
+    }, {
+      disposition: {
+        kind: "objective", source: "slash", requestId: "objective-request", action: "set",
+        text: "Ship the release", limits: { noProgressTurnLimit: 3 }
+      },
+      onAccepted: accepted
+    })).resolves.toBe("objective-session");
+
+    expect(order).toEqual(["create", "reveal", "commands", "objective", "accepted:objectiveSet"]);
+    expect(api.setObjective).toHaveBeenCalledExactlyOnceWith(
+      "objective-session", 21n, "Ship the release", { noProgressTurnLimit: 3 }, undefined
+    );
+    expect(api.send).not.toHaveBeenCalled();
+    expect(api.restoreFirstInputDraft).not.toHaveBeenCalled();
+    expect(accepted).toHaveBeenCalledWith({
+      kind: "objectiveSet", requestId: "objective-request", sessionId: "objective-session",
+      sessionGeneration: 21n, objective
+    });
+  });
+
+  it("sends the complete slash invocation when the created runtime owns loaded /goal", async () => {
+    const attachment = { id: "notes", kind: "file" as const, file: { name: "notes.txt" } as File };
+    const invocation: ComposerDraft = { ...input, text: "/goal Runtime owned", attachments: [attachment] };
+    const api = {
+      createSession: vi.fn(async () => ({ sessionId: "runtime-goal", generation: 22n })),
+      listCommands: vi.fn(async () => [{
+        id: "runtime-goal-command", name: "/goal", description: "Runtime goal",
+        source: "skill" as const, loaded: true
+      }]),
+      setObjective: vi.fn(async () => objectiveView("runtime-goal", 22n, "unused")),
+      send: vi.fn(async () => undefined),
+      restoreFirstInputDraft: vi.fn(async () => undefined)
+    };
+    const accepted = vi.fn();
+
+    await createSessionFromFirstInput(api, session, invocation, vi.fn(), {
+      disposition: {
+        kind: "objective", source: "slash", requestId: "runtime-goal-request", action: "set",
+        text: "Runtime owned", limits: { noProgressTurnLimit: 3 }
+      },
+      onAccepted: accepted
+    });
+
+    expect(api.listCommands).toHaveBeenCalledExactlyOnceWith("runtime-goal", undefined);
+    expect(api.send).toHaveBeenCalledExactlyOnceWith("runtime-goal", invocation, { expectedGeneration: 22n });
+    expect(api.setObjective).not.toHaveBeenCalled();
+    expect(api.restoreFirstInputDraft).not.toHaveBeenCalled();
+    expect(accepted).toHaveBeenCalledWith({ kind: "sent", sessionId: "runtime-goal" });
+  });
+
+  it("installs the complete bare /goal draft before accepting its exact dialog handoff", async () => {
+    const invocation: ComposerDraft = {
+      ...input,
+      text: "/goal",
+      attachments: [{ id: "context", kind: "file", file: { name: "context.txt" } as File }]
+    };
+    const order: string[] = [];
+    const api = {
+      createSession: vi.fn(async () => { order.push("create"); return { sessionId: "dialog-session", generation: 23n }; }),
+      listCommands: vi.fn(async () => { order.push("commands"); return []; }),
+      send: vi.fn(async () => { order.push("send"); }),
+      restoreFirstInputDraft: vi.fn(async () => { order.push("restore"); })
+    };
+    const accepted = vi.fn((value) => { order.push(`accepted:${value.kind}`); });
+
+    await createSessionFromFirstInput(api, session, invocation, () => { order.push("reveal"); }, {
+      disposition: { kind: "objective", source: "slash", requestId: "dialog-request", action: "open" },
+      onAccepted: accepted
+    });
+
+    expect(order).toEqual(["create", "reveal", "commands", "restore", "accepted:objectiveDialog"]);
+    expect(api.restoreFirstInputDraft).toHaveBeenCalledExactlyOnceWith("dialog-session", invocation);
+    expect(api.send).not.toHaveBeenCalled();
+    const acceptance = accepted.mock.calls[0]![0];
+    expect(acceptance).toMatchObject({
+      kind: "objectiveDialog", requestId: "dialog-request", sessionId: "dialog-session", sessionGeneration: 23n
+    });
+    expect(acceptance.kind === "objectiveDialog" && acceptance.expectedDraft).toBe(invocation);
+  });
+
+  it.each([false, true])("treats application /goal clear as an accepted exact-owner operation; existing=%s", async (existing) => {
+    const current = existing ? objectiveView("clear-session", 24n, "Obsolete") : undefined;
+    const api = {
+      createSession: vi.fn(async () => ({ sessionId: "clear-session", generation: 24n })),
+      listCommands: vi.fn(async () => []),
+      getObjective: vi.fn(async () => current),
+      clearObjective: vi.fn(async () => undefined),
+      send: vi.fn(async () => undefined),
+      restoreFirstInputDraft: vi.fn(async () => undefined)
+    };
+    const accepted = vi.fn();
+
+    await createSessionFromFirstInput(api, session, { ...input, text: "/goal clear" }, vi.fn(), {
+      disposition: { kind: "objective", source: "slash", requestId: "clear-request", action: "clear" },
+      onAccepted: accepted
+    });
+
+    expect(api.getObjective).toHaveBeenCalledExactlyOnceWith("clear-session", undefined);
+    expect(api.clearObjective).toHaveBeenCalledTimes(existing ? 1 : 0);
+    if (existing) expect(api.clearObjective).toHaveBeenCalledWith(current, undefined);
+    expect(api.send).not.toHaveBeenCalled();
+    expect(accepted).toHaveBeenCalledWith({
+      kind: "objectiveCleared", requestId: "clear-request", sessionId: "clear-session",
+      sessionGeneration: 24n, cleared: existing
+    });
+  });
+
+  it("fails closed and restores the invocation when /goal clear observes another Session generation", async () => {
+    const invocation = { ...input, text: "/goal clear" };
+    const api = {
+      createSession: vi.fn(async () => ({ sessionId: "changed-clear-session", generation: 25n })),
+      listCommands: vi.fn(async () => []),
+      getObjective: vi.fn(async () => objectiveView("changed-clear-session", 26n, "New owner")),
+      clearObjective: vi.fn(async () => undefined),
+      send: vi.fn(async () => undefined),
+      restoreFirstInputDraft: vi.fn(async () => undefined)
+    };
+
+    await expect(createSessionFromFirstInput(api, session, invocation, vi.fn(), {
+      disposition: { kind: "objective", source: "slash", requestId: "changed-clear", action: "clear" }
+    })).rejects.toThrow("owner changed");
+    expect(api.clearObjective).not.toHaveBeenCalled();
+    expect(api.restoreFirstInputDraft).toHaveBeenCalledExactlyOnceWith("changed-clear-session", invocation);
+  });
+
+  it("bypasses runtime command ownership for an explicit dialog and reveals only after Objective acceptance", async () => {
+    const order: string[] = [];
+    const objective = objectiveView("explicit-dialog", 27n, "Dialog objective");
+    const api = {
+      createSession: vi.fn(async () => { order.push("create"); return { sessionId: "explicit-dialog", generation: 27n }; }),
+      listCommands: vi.fn(async () => { order.push("commands"); return []; }),
+      setObjective: vi.fn(async () => { order.push("objective"); return objective; }),
+      send: vi.fn(async () => { order.push("send"); }),
+      restoreFirstInputDraft: vi.fn(async () => { order.push("restore"); })
+    };
+    const accepted = vi.fn((value) => { order.push(`accepted:${value.kind}`); });
+
+    await createSessionFromFirstInput(api, session, input, () => { order.push("reveal"); }, {
+      disposition: {
+        kind: "objective", source: "dialog", requestId: "explicit-dialog-request", action: "set",
+        text: "Dialog objective", limits: { maximumTurns: 20 }
+      },
+      onAccepted: accepted
+    });
+
+    expect(order).toEqual(["create", "objective", "reveal", "accepted:objectiveSet"]);
+    expect(api.listCommands).not.toHaveBeenCalled();
+    expect(api.send).not.toHaveBeenCalled();
+    expect(api.restoreFirstInputDraft).not.toHaveBeenCalled();
+  });
+
+  it("keeps an explicit dialog owner visible and restores its created task draft once when set fails", async () => {
+    const failure = new Error("Objective unavailable");
+    const api = {
+      createSession: vi.fn(async () => ({ sessionId: "failed-dialog", generation: 28n })),
+      listCommands: vi.fn(async () => []),
+      setObjective: vi.fn(async () => { throw failure; }),
+      send: vi.fn(async () => undefined),
+      restoreFirstInputDraft: vi.fn(async () => undefined)
+    };
+    const revealed = vi.fn();
+
+    await expect(createSessionFromFirstInput(api, session, input, revealed, {
+      disposition: {
+        kind: "objective", source: "dialog", requestId: "failed-dialog-request", action: "set",
+        text: "Keep this goal", limits: {}
+      }
+    })).rejects.toBe(failure);
+
+    expect(revealed).not.toHaveBeenCalled();
+    expect(api.listCommands).not.toHaveBeenCalled();
+    expect(api.restoreFirstInputDraft).toHaveBeenCalledExactlyOnceWith("failed-dialog", input);
+  });
+
+  it("does not retry a failed bare-dialog draft installation", async () => {
+    const recoveryFailure = new Error("Draft storage unavailable");
+    const api = {
+      createSession: vi.fn(async () => ({ sessionId: "failed-open", generation: 29n })),
+      listCommands: vi.fn(async () => []),
+      send: vi.fn(async () => undefined),
+      restoreFirstInputDraft: vi.fn(async () => { throw recoveryFailure; })
+    };
+
+    await expect(createSessionFromFirstInput(api, session, { ...input, text: "/goal" }, vi.fn(), {
+      disposition: { kind: "objective", source: "slash", requestId: "failed-open-request", action: "open" }
+    })).rejects.toBe(recoveryFailure);
+    expect(api.restoreFirstInputDraft).toHaveBeenCalledOnce();
+  });
+
+  it("allows an explicit Objective for a managed Dialogue while /learn remains Target-only", async () => {
+    const order: string[] = [];
+    const api = {
+      createTarget: vi.fn(async () => { order.push("target"); return "dialogue-target"; }),
+      refresh: vi.fn(async () => { order.push("refresh"); }),
+      createSession: vi.fn(async () => { order.push("session"); return { sessionId: "dialogue-objective", generation: 30n }; }),
+      listCommands: vi.fn(async () => { order.push("commands"); return []; }),
+      setObjective: vi.fn(async () => { order.push("objective"); return objectiveView("dialogue-objective", 30n, "Dialogue goal"); }),
+      send: vi.fn(async () => { order.push("send"); }),
+      restoreFirstInputDraft: vi.fn(async () => { order.push("restore"); })
+    };
+
+    await createDelayedSessionFromFirstInput(api, {
+      ...session,
+      selection: { kind: "dialogue", backendId: "backend-1" }
+    }, input, () => { order.push("reveal"); }, undefined, {
+      disposition: {
+        kind: "objective", source: "dialog", requestId: "dialogue-objective-request", action: "set",
+        text: "Dialogue goal", limits: {}
+      }
+    });
+
+    expect(order).toEqual(["target", "refresh", "session", "objective", "reveal"]);
+    expect(api.listCommands).not.toHaveBeenCalled();
+    expect(api.send).not.toHaveBeenCalled();
+  });
+
+  it("validates Objective ownership before creating a managed Dialogue Target", async () => {
+    const api = {
+      createTarget: vi.fn(async () => "orphan-target"),
+      refresh: vi.fn(async () => undefined),
+      createSession: vi.fn(async () => ({ sessionId: "orphan-session", generation: 1n })),
+      send: vi.fn(async () => undefined),
+      restoreFirstInputDraft: vi.fn(async () => undefined)
+    };
+
+    await expect(createDelayedSessionFromFirstInput(api, {
+      ...session,
+      selection: { kind: "dialogue", backendId: "backend-1" }
+    }, input, vi.fn(), undefined, {
+      disposition: {
+        kind: "objective", source: "dialog", requestId: "unavailable-objective", action: "set",
+        text: "Do not orphan a Target", limits: {}
+      }
+    })).rejects.toThrow("Objectives are unavailable");
+    expect(api.createTarget).not.toHaveBeenCalled();
+    expect(api.createSession).not.toHaveBeenCalled();
+  });
+
   it.each([
     { evidence: "createdSession" as const, instruction: "", sourceSessionId: "learn-source" },
     { evidence: "freeText" as const, instruction: "Preserve the release checklist", sourceSessionId: undefined }
@@ -379,5 +631,20 @@ function learningRun(
     updatedAt: 1,
     expiresAt: 2,
     ...overrides
+  };
+}
+
+function objectiveView(sessionId: string, sessionGeneration: bigint, text: string): ObjectiveView {
+  return {
+    sessionId,
+    sessionGeneration,
+    text,
+    status: "active",
+    turnsUsed: 0,
+    tokensUsed: 0,
+    noProgressTurns: 0,
+    ownerGeneration: 1n,
+    startedAt: 1,
+    revision: 1n
   };
 }

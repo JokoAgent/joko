@@ -3,7 +3,7 @@ import type { JSX } from "react";
 import { AlertTriangle, Pause, Pencil, Play, RotateCcw, Target, Trash2 } from "lucide-react";
 
 import type { AppController } from "../controller.js";
-import type { ObjectiveView, SessionView } from "../model.js";
+import type { ComposerDraft, ObjectiveView, SessionView } from "../model.js";
 import type { Translator } from "./types.js";
 import { Button, IconButton, Pill, Spinner, cx } from "./ui.js";
 import {
@@ -12,9 +12,52 @@ import {
   type ObjectiveDialogLimits
 } from "./ObjectiveDialog.js";
 
-export interface ObjectiveDialogRequest {
-  readonly id: number;
+export interface ObjectiveDialogOwnerFence {
+  readonly serverId: string;
+  readonly profileId: string;
+  readonly connectionGeneration: number;
+  readonly sessionId: string;
+  readonly sessionGeneration: bigint;
+}
+
+export interface ObjectiveDialogHandoffRequest extends ObjectiveDialogOwnerFence {
+  readonly id: string;
+  readonly expectedDraft: ComposerDraft;
+}
+
+export interface ObjectiveDialogRequest extends ObjectiveDialogOwnerFence {
+  readonly id: string | number;
   readonly onSaved: () => void;
+}
+
+export function objectiveDialogOwnerFence(
+  controller: Pick<AppController, "state">,
+  session: SessionView
+): ObjectiveDialogOwnerFence | undefined {
+  const profile = controller.state.activeProfile;
+  const connectionGeneration = controller.state.connectionGeneration;
+  if (controller.state.connectionState !== "connected" || profile === undefined || connectionGeneration === undefined) return undefined;
+  return {
+    serverId: profile.serverId,
+    profileId: profile.id,
+    connectionGeneration,
+    sessionId: session.id,
+    sessionGeneration: session.generation
+  };
+}
+
+export function objectiveDialogRequestMatchesOwner(
+  request: ObjectiveDialogOwnerFence,
+  controller: Pick<AppController, "state">,
+  session: SessionView
+): boolean {
+  const owner = objectiveDialogOwnerFence(controller, session);
+  return owner !== undefined
+    && request.serverId === owner.serverId
+    && request.profileId === owner.profileId
+    && request.connectionGeneration === owner.connectionGeneration
+    && request.sessionId === owner.sessionId
+    && request.sessionGeneration === owner.sessionGeneration;
 }
 
 type ObjectiveDialogFence =
@@ -38,7 +81,7 @@ export function ObjectiveIndicator({
   readonly session: SessionView;
   readonly readOnly: boolean;
   readonly dialogRequest?: ObjectiveDialogRequest;
-  readonly onDialogRequestHandled: () => void;
+  readonly onDialogRequestHandled: (requestId?: string | number) => void;
   readonly t: Translator;
 }): JSX.Element {
   const [host, setHost] = useState<HTMLDivElement | null>(null);
@@ -92,8 +135,13 @@ export function ObjectiveIndicator({
     setPending(undefined);
     setActionError(undefined);
     setEditRequestId(undefined);
-    onDialogRequestHandled();
   }, [ownerKey]);
+
+  useEffect(() => {
+    if (dialogRequest !== undefined && !objectiveDialogRequestMatchesOwner(dialogRequest, controller, session)) {
+      onDialogRequestHandled(dialogRequest.id);
+    }
+  }, [controller, dialogRequest, onDialogRequestHandled, ownerKey, session]);
 
   useEffect(() => {
     const owner = {};
@@ -247,7 +295,8 @@ export function ObjectiveIndicator({
   };
   const attention = objective !== undefined && ["blocked", "budgetLimited", "usageLimited", "dispatchUnknown"].includes(objective.status);
   const objectiveReady = loadState.ownerKey === ownerKey && loadState.phase === "ready";
-  const dialogOpen = !readOnly && objectiveReady && (dialogRequest !== undefined || editRequestId !== undefined);
+  const dialogRequestCurrent = dialogRequest !== undefined && objectiveDialogRequestMatchesOwner(dialogRequest, controller, session);
+  const dialogOpen = !readOnly && objectiveReady && (dialogRequestCurrent || editRequestId !== undefined);
   const dialogInvocationKey = `${ownerKey}:${dialogRequest === undefined ? `edit:${editRequestId ?? 0}` : `command:${dialogRequest.id}`}`;
   if (!dialogOpen) {
     dialogFenceRef.current = undefined;
@@ -310,7 +359,7 @@ export function ObjectiveIndicator({
       t={t}
       onClose={() => {
         setEditRequestId(undefined);
-        onDialogRequestHandled();
+        onDialogRequestHandled(dialogRequest?.id);
       }}
       onSubmit={submitDialog}
       onSaved={dialogRequest?.onSaved}

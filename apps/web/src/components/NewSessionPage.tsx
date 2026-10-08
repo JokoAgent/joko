@@ -13,6 +13,7 @@ import {
   Send,
   Shield,
   Sparkles,
+  Target as TargetIcon,
   X
 } from "lucide-react";
 import type { AppController } from "../controller.js";
@@ -50,7 +51,7 @@ import type {
   WorkspaceEntryView
 } from "../model.js";
 import type { TargetDraft } from "../model.js";
-import type { DelayedNewSessionDraft, FirstInputDisposition, NewSessionSubmissionOwner } from "../new-session-flow.js";
+import type { DelayedNewSessionDraft, FirstInputAcceptance, FirstInputDisposition, NewSessionSubmissionOwner } from "../new-session-flow.js";
 import { randomUuid } from "../web-crypto.js";
 import { resourceKindsForBackend } from "../resource-capabilities.js";
 import { composerDocumentIsPlainTextInvocation } from "../skill-learning-command.js";
@@ -91,6 +92,7 @@ import { ModelSourceNotice } from "./ModelSourceNotice.js";
 import { modelSourceAccess, type ModelSourceSelection } from "../model-source-access.js";
 import { PermissionSelector, permissionLabel } from "./PermissionSelector.js";
 import { ComposerAddMenu } from "./ComposerAddMenu.js";
+import { ObjectiveDialog, objectiveLimitsFromDialog, type ObjectiveDialogLimits } from "./ObjectiveDialog.js";
 import { ComposerAttachmentTray } from "./ComposerAttachmentTray.js";
 import { ComposerInlineMentionPanel } from "./composer-inline-mention-panel.js";
 import { HomeUsageDashboard } from "./HomeUsageDashboard.js";
@@ -166,6 +168,13 @@ interface NewTaskWorkspaceMentionIndex {
 interface FullAccessConfirmation {
   readonly scope: object;
   readonly ownerDocument: Document;
+}
+
+interface NewTaskSubmitOptions {
+  readonly firstInputDisposition?: FirstInputDisposition;
+  readonly allowEmpty?: boolean;
+  readonly propagateError?: boolean;
+  readonly clearDraftOnAccepted?: boolean;
 }
 
 interface NewTaskInlineMentionActivation extends ComposerInlineMentionActivation {
@@ -245,6 +254,12 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
   const [draftError, setDraftError] = useState<string>();
   const [dragging, setDragging] = useState(false);
   const [submitting, setSubmitting] = useState(false);
+  const [objectiveDialog, setObjectiveDialog] = useState<{
+    readonly initialText: string;
+    readonly ownerDocument: Document;
+    readonly submissionScope: object;
+    readonly submissionEpoch: object;
+  }>();
   const [palette, setPalette] = useState<"add" | "mention" | "commands">();
   const [inlineMentionActivation, setInlineMentionActivation] = useState<NewTaskInlineMentionActivation>();
   const [inlineMentionActiveIndex, setInlineMentionActiveIndex] = useState(0);
@@ -756,12 +771,16 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
     && targetStaticReady
     && targetWorkspaceReady
     && resourceKindsForBackend(backend).includes("skill");
-  const commandOptions = { learnSupported: learnCommandSupported } as const;
+  const goalCommandSupported = controller.state.connectionState === "connected"
+    && backend?.health !== "unavailable"
+    && backend?.capabilities.get("input.text")?.supported === true
+    && (selection?.kind === "dialogue" || targetStaticReady && targetWorkspaceReady);
+  const commandOptions = { learnSupported: learnCommandSupported, goalSupported: goalCommandSupported } as const;
   const commandItems = composerCommandItems(availableGlobalCommands, commandOptions);
   const commandCatalogKey = commandItems.map((item) => `${item.id}\u0000${item.value}\u0000${item.meta}`).join("\u0001");
   const selectableExtraDirectories = snapshot.extraDirectories.filter((directory) => directory.workspaceId === usableWorkspace?.id && directory.trusted);
   const canSelectExtraDirectories = usableWorkspace !== undefined && backend?.capabilities.get("workspace.extra_dirs")?.supported === true;
-  const canUseAddMenu = attachmentPolicy.images || attachmentPolicy.files || canMention || commandItems.length > 0
+  const canUseAddMenu = goalCommandSupported || attachmentPolicy.images || attachmentPolicy.files || canMention || commandItems.length > 0
     || canSelectExtraDirectories && selectableExtraDirectories.length > 0;
   const worktreeApplicable = selected !== undefined && startKind === "fresh"
     && usableWorkspace?.kind === "userProject" && selected.remoteWorkspace === undefined;
@@ -1353,7 +1372,31 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
   );
   const canFinishVoiceSend = hydrated && controller.state.connectionState === "connected" && validContext && modelRouteReady && attachmentsAllowed && mentionsAllowed && worktreeDecisionReady && fullAccessConfirmation === undefined && !submitting;
   const canSend = canFinishVoiceSend && hasInput && !voice.active;
-  const submissionScope = useMemo(() => ({}), [profileScope, selectionKey, startKind, nativeReference, modelKey, selectedModel?.providerId, selectedModel?.modelId, effort, fastMode, permissionMode, planMode, effectiveWorktreeEnabled, worktreeSourceRef, refreshWorktreeRemote, snapshot.generation, controller.getArtifactUrl, voiceRoot]);
+  const submissionScope = useMemo(() => ({}), [
+    profileScope,
+    controller.state.connectionGeneration,
+    selectionKey,
+    selected?.revision,
+    backend?.id,
+    backend?.instanceGeneration,
+    backend?.health,
+    backend?.capabilities.get("input.text")?.supported,
+    usableWorkspace?.id,
+    startKind,
+    nativeReference,
+    modelKey,
+    selectedModel?.providerId,
+    selectedModel?.modelId,
+    effort,
+    fastMode,
+    permissionMode,
+    planMode,
+    effectiveWorktreeEnabled,
+    worktreeSourceRef,
+    refreshWorktreeRemote,
+    controller.getArtifactUrl,
+    voiceRoot
+  ]);
   const submissionEpochRef = useRef<object | undefined>(undefined);
   const submissionScopeRef = useRef(submissionScope); submissionScopeRef.current = submissionScope;
   const submissionValidityRef = useRef(false);
@@ -1361,7 +1404,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
   useLayoutEffect(() => {
     const ownerWindow = voiceRoot?.ownerDocument.defaultView;
     const activate = (): void => { submissionEpochRef.current = {}; };
-    const retire = (): void => { submissionEpochRef.current = undefined; submissionRef.current = undefined; submissionAbortRef.current?.abort(); submissionAbortRef.current = undefined; submissionOriginRef.current = undefined; setSubmitting(false); };
+    const retire = (): void => { submissionEpochRef.current = undefined; submissionRef.current = undefined; submissionAbortRef.current?.abort(); submissionAbortRef.current = undefined; submissionOriginRef.current = undefined; setObjectiveDialog(undefined); setSubmitting(false); };
     activate();
     ownerWindow?.addEventListener("pagehide", retire); ownerWindow?.addEventListener("pageshow", activate);
     return () => { retire(); ownerWindow?.removeEventListener("pagehide", retire); ownerWindow?.removeEventListener("pageshow", activate); };
@@ -1370,7 +1413,12 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
   useLayoutEffect(() => {
     if (submissionOriginRef.current !== undefined && !submissionOriginRef.current.isCurrent()) submissionAbortRef.current?.abort();
   });
-  const submitRef = useRef<(document?: JSONContent, onAccepted?: () => void, beforeFirstInput?: (sessionId: string) => Promise<void>) => Promise<void>>(async () => undefined);
+  const submitRef = useRef<(
+    document?: JSONContent,
+    onAccepted?: (acceptance: FirstInputAcceptance) => void,
+    beforeFirstInput?: (sessionId: string) => Promise<void>,
+    options?: NewTaskSubmitOptions
+  ) => Promise<void>>(async () => undefined);
   const voiceSendFlight = useRef<object | undefined>(undefined);
   const finishVoiceAndSend = (): void => {
     if (!canFinishVoiceSend || voiceSendFlight.current !== undefined) return;
@@ -1866,7 +1914,12 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
     });
   };
 
-  const submit = async (activeDocument: JSONContent = editorDocumentRef.current, onAccepted?: () => void, beforeFirstInput?: (sessionId: string) => Promise<void>): Promise<void> => {
+  const submit = async (
+    activeDocument: JSONContent = editorDocumentRef.current,
+    onAccepted?: (acceptance: FirstInputAcceptance) => void,
+    beforeFirstInput?: (sessionId: string) => Promise<void>,
+    options: NewTaskSubmitOptions = {}
+  ): Promise<void> => {
     const sourceEditorDocument = normalizeComposerDocument(activeDocument, textRef.current);
     const sourceText = composerDocumentPlainText(sourceEditorDocument);
     const sourceRanges = restoreComposerInlineMentionRanges(sourceText, mentionsRef.current, inlineMentionRangesRef.current);
@@ -1875,22 +1928,29 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
     const sourceAttachments = attachmentsRef.current;
     const parsedCommand = composerBuiltInCommand(sourceText, commandOptions);
     const learnCommand = parsedCommand?.kind === "learn" ? parsedCommand : undefined;
+    const objectiveCommand = parsedCommand?.kind === "objective" ? parsedCommand : undefined;
     const activeCanSend = validContext
       && modelRouteReady
-      && (!composerDocumentIsEmpty(sourceEditorDocument) || attachments.length > 0 || sourceBrowserComments.length > 0)
+      && (options.allowEmpty === true || !composerDocumentIsEmpty(sourceEditorDocument) || sourceAttachments.length > 0 || sourceBrowserComments.length > 0)
       && attachmentsAllowed
       && newTaskMentionsAllowed(sourceMentions, mentionPolicy, usableWorkspace?.id)
       && worktreeDecisionReady
       && !(worktreePreferenceRelevant && worktreePreferenceSavingRef.current)
       && fullAccessConfirmationRef.current === undefined
       && !submitting && !voice.isActive();
-    if (!activeCanSend || selection === undefined || submissionRef.current) return;
+    if (!activeCanSend || selection === undefined || submissionRef.current) {
+      if (options.propagateError === true) throw new Error(t("composer.inputUnavailable"));
+      return;
+    }
     voiceDictionaryLearning.clear();
     const sourceScope = submissionScope;
     const sourceEpoch = submissionEpochRef.current;
     const ownerDocument = voiceRoot?.ownerDocument;
     const ownerWindow = ownerDocument?.defaultView;
-    if (ownerDocument === undefined || ownerWindow === null || ownerWindow === undefined || sourceEpoch === undefined) return;
+    if (ownerDocument === undefined || ownerWindow === null || ownerWindow === undefined || sourceEpoch === undefined) {
+      if (options.propagateError === true) throw new Error(t("composer.inputUnavailable"));
+      return;
+    }
     const sourceDraft = editorDocumentRef.current;
     const sourceInput: ComposerDraft = {
       text: sourceText,
@@ -1902,9 +1962,8 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
       deliveryMode: "prompt",
       ...(canSelectExtraDirectories ? { extraDirectoryIds } : {})
     };
-    const firstInputDisposition: FirstInputDisposition | undefined = learnCommand === undefined
-      ? undefined
-      : {
+    const firstInputDisposition: FirstInputDisposition | undefined = options.firstInputDisposition ?? (learnCommand !== undefined
+      ? {
           kind: "learn",
           requestId: randomUuid(),
           backendId: backend!.id,
@@ -1920,7 +1979,57 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
               || extraDirectoryIds.length > 0
               ? { kind: "rejected", reason: "structured" }
               : { kind: "eligible" }
-        };
+        }
+      : objectiveCommand === undefined
+        ? undefined
+        : objectiveCommand.action === "open"
+          ? {
+              kind: "objective",
+              source: "slash",
+              requestId: randomUuid(),
+              action: "open"
+            }
+          : objectiveCommand.action === "clear"
+            ? {
+                kind: "objective",
+                source: "slash",
+                requestId: randomUuid(),
+                action: "clear"
+              }
+            : {
+              kind: "objective",
+              source: "slash",
+              requestId: randomUuid(),
+              action: "set",
+              text: objectiveCommand.text ?? "",
+              limits: { noProgressTurnLimit: 3 }
+            });
+    const clearDraftOnAccepted = options.clearDraftOnAccepted === true || objectiveCommand !== undefined;
+    const clearAcceptedSource = (): void => {
+      if (!clearDraftOnAccepted || !mountedRef.current
+        || editorDocumentRef.current !== sourceDraft || attachmentsRef.current !== sourceAttachments
+        || browserCommentsRef.current !== sourceBrowserComments) return;
+      const clearedDocument = emptyComposerDocument();
+      revokeAttachments([...sourceAttachments, ...sourceBrowserComments.map((item) => item.screenshot)]);
+      editorDocumentRef.current = clearedDocument;
+      textRef.current = "";
+      attachmentsRef.current = [];
+      browserCommentsRef.current = [];
+      setEditorDocument(clearedDocument);
+      setText("");
+      replaceMentions([], []);
+      setAttachments([]);
+      replaceBrowserComments([]);
+      setExtraDirectoryIds([]);
+      setAttachmentError(undefined);
+      setDraftError(undefined);
+      voiceDictionaryLearning.clear();
+    };
+    const acceptFirstInput = (acceptance?: FirstInputAcceptance): void => {
+      if (acceptance === undefined) return;
+      clearAcceptedSource();
+      onAccepted?.(acceptance);
+    };
     const attempt = {}; submissionRef.current = attempt;
     const request = new AbortController(); submissionAbortRef.current = request;
     const owner: NewSessionSubmissionOwner = {
@@ -1928,7 +2037,9 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
       signal: request.signal,
       ...(beforeFirstInput === undefined ? {} : { beforeFirstInput }),
       ...(firstInputDisposition === undefined ? {} : { firstInputDisposition }),
-      ...(onAccepted === undefined ? {} : { onFirstInputAccepted: onAccepted }),
+      ...(onAccepted === undefined && !clearDraftOnAccepted
+        ? {}
+        : { onFirstInputAccepted: acceptFirstInput }),
       isCurrent: () => submissionScopeRef.current === sourceScope && submissionEpochRef.current === sourceEpoch && submissionRef.current === attempt
         && !request.signal.aborted && submissionValidityRef.current && voiceRoot?.isConnected === true && voiceRoot.ownerDocument === ownerDocument && !ownerWindow.closed
         && editorDocumentRef.current === sourceDraft && attachmentsRef.current === sourceAttachments && browserCommentsRef.current === sourceBrowserComments
@@ -1965,8 +2076,9 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
         planMode: execution.planModeSupported && planMode,
         ...(worktree === undefined ? {} : { worktree })
       }, sourceInput, owner);
-    } catch {
+    } catch (error) {
       // App owns the operation banner; the persistent draft intentionally remains.
+      if (options.propagateError === true) throw error;
     } finally {
       if (submissionRef.current === attempt) {
         submissionRef.current = undefined;
@@ -1980,6 +2092,50 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
   };
 
   submitRef.current = submit;
+
+  const openObjectiveDialog = (): void => {
+    const ownerDocument = voiceRoot?.ownerDocument;
+    const submissionEpoch = submissionEpochRef.current;
+    if (!goalCommandSupported || ownerDocument === undefined || submissionEpoch === undefined || submittingRef.current) return;
+    closePalette(false);
+    setObjectiveDialog({
+      initialText: composerDocumentPlainText(editorDocumentRef.current).trim(),
+      ownerDocument,
+      submissionScope,
+      submissionEpoch
+    });
+  };
+
+  const submitObjectiveDialog = async (objectiveText: string, limits: ObjectiveDialogLimits): Promise<void> => {
+    const dialog = objectiveDialog;
+    if (dialog === undefined || dialog.ownerDocument !== voiceRoot?.ownerDocument || !goalCommandSupported
+      || dialog.submissionScope !== submissionScopeRef.current
+      || dialog.submissionEpoch !== submissionEpochRef.current) {
+      throw new Error(t("composer.inputUnavailable"));
+    }
+    await submitRef.current(plainTextToComposerDocument(`/goal ${objectiveText}`), undefined, undefined, {
+      firstInputDisposition: {
+        kind: "objective",
+        source: "dialog",
+        requestId: randomUuid(),
+        action: "set",
+        text: objectiveText,
+        limits: objectiveLimitsFromDialog(limits)
+      },
+      allowEmpty: true,
+      propagateError: true,
+      clearDraftOnAccepted: true
+    });
+  };
+
+  useLayoutEffect(() => {
+    if (objectiveDialog !== undefined && (
+      objectiveDialog.ownerDocument !== voiceRoot?.ownerDocument
+      || objectiveDialog.submissionScope !== submissionScope
+      || objectiveDialog.submissionEpoch !== submissionEpochRef.current
+      || !goalCommandSupported
+    )) setObjectiveDialog(undefined);
+  }, [goalCommandSupported, objectiveDialog, submissionScope, voiceRoot?.ownerDocument]);
 
   const replaceSuggestionPrompt = (prompt: string): JSONContent => {
     voiceDictionaryLearning.clear();
@@ -2461,6 +2617,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
                     count={extraDirectoryIds.length}
                   >
                     {palette === "add" && <><div className="composer-add-menu__actions" role="menu">
+                      {goalCommandSupported && <button className="composer-add-menu__action" type="button" role="menuitem" onClick={openObjectiveDialog}><TargetIcon aria-hidden="true" /><span><strong>{t("objective.newAction")}</strong><small>{t("objective.dialogDescription")}</small></span></button>}
                       {(attachmentPolicy.images || attachmentPolicy.files) && <button className="composer-add-menu__action" type="button" role="menuitem" onClick={() => openAttachmentPicker()}><Paperclip aria-hidden="true" /><span><strong>{t("composer.attach")}</strong><small>{t("composer.attachments")}</small></span></button>}
                       {canMention && <button className="composer-add-menu__action" type="button" role="menuitem" onClick={() => {
                         if (mentionPolicy.directories) {
@@ -2651,6 +2808,14 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
         </div>
       </div>
     </Modal>
+    <ObjectiveDialog
+      open={objectiveDialog !== undefined}
+      initialText={objectiveDialog?.initialText}
+      ownerDocument={objectiveDialog?.ownerDocument}
+      t={t}
+      onClose={() => { if (!submittingRef.current) setObjectiveDialog(undefined); }}
+      onSubmit={submitObjectiveDialog}
+    />
     <ComposerPastedTextDialog
       target={pastedTextTarget}
       title={t("composer.pastedTextEditTitle")}

@@ -3,7 +3,7 @@ import { act, useState } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeAll, expect, it, vi } from "vitest";
 import type { AppController, AppRoute } from "./controller.js";
-import type { ComposerDraft } from "./model.js";
+import type { ComposerDraft, ObjectiveView } from "./model.js";
 import { emptySnapshot } from "./model.js";
 import type { DelayedNewSessionDraft } from "./new-session-flow.js";
 import { useNewSessionSubmission } from "./use-new-session-submission.js";
@@ -24,7 +24,8 @@ function deferred<T>() {
 
 function api() {
   return {
-    state: { route: { kind: "newSession" }, connectionState: "connected", activeProfile: { id: "profile" }, navigationRevision: 0,
+    state: { route: { kind: "newSession" }, connectionState: "connected", connectionGeneration: 2,
+      activeProfile: { id: "profile", serverId: "server" }, navigationRevision: 0,
       snapshot: { ...emptySnapshot(), targets: [{ id: "target", workspaceId: "workspace", backendId: "backend", name: "Project",
         workspaceName: "Project", revision: 1n, trusted: true, pinned: false, archived: false }],
         workspaces: [{ id: "workspace", targetId: "target", name: "Project", kind: "userProject", serverPath: "/srv/project",
@@ -34,6 +35,9 @@ function api() {
     refresh: vi.fn(async () => undefined),
     send: vi.fn(async () => undefined),
     listCommands: vi.fn(async () => []),
+    getObjective: vi.fn(async () => undefined),
+    setObjective: vi.fn(async (sessionId: string, generation: bigint, text: string) => objectiveView(sessionId, generation, text)),
+    clearObjective: vi.fn(async () => undefined),
     startSkillLearning: vi.fn(async () => ({
       id: "skill_learning_0123456789abcdef0123456789abcdef", revision: 1n, state: "distilling",
       sourceKind: "session", backendId: "backend", targetId: "target", sourceSessionId: "created",
@@ -46,7 +50,7 @@ function api() {
   } as unknown as AppController;
 }
 
-async function mount(controller: AppController) {
+async function mount(controller: AppController, onFirstInputAccepted?: Parameters<typeof useNewSessionSubmission>[4]) {
   let submit!: ReturnType<typeof useNewSessionSubmission>;
   let error: string | undefined;
   let busy: string | undefined;
@@ -55,7 +59,7 @@ async function mount(controller: AppController) {
     const [action, setAction] = useState<string>();
     error = message;
     busy = action;
-    submit = useNewSessionSubmission(value, setMessage, setAction, describe);
+    submit = useNewSessionSubmission(value, setMessage, setAction, describe, onFirstInputAccepted);
     return null;
   }
   root = createRoot(document.body.appendChild(document.createElement("div")));
@@ -63,6 +67,109 @@ async function mount(controller: AppController) {
   await render(controller);
   return { render, submit: (...args: Parameters<typeof submit>) => submit(...args), error: () => error, busy: () => busy };
 }
+
+it("forwards an exact bare /goal dialog handoff after revealing and installing the created task draft", async () => {
+  const original = api();
+  const shellAccepted = vi.fn();
+  const ownerAccepted = vi.fn();
+  const probe = await mount(original, shellAccepted);
+  const invocation: ComposerDraft = {
+    ...input,
+    text: "/goal",
+    attachments: [{ id: "goal-context", kind: "file", file: { name: "goal.txt" } as File }]
+  };
+
+  await act(async () => { await probe.submit(draft, invocation, {
+    ownerDocument: document,
+    signal: new AbortController().signal,
+    isCurrent: () => true,
+    firstInputDisposition: { kind: "objective", source: "slash", requestId: "home-goal-dialog", action: "open" },
+    onFirstInputAccepted: ownerAccepted
+  }); });
+
+  expect(original.navigate).toHaveBeenCalledExactlyOnceWith({ kind: "session", sessionId: "created" });
+  expect(original.clearNewSessionDraft).toHaveBeenCalledOnce();
+  expect(original.restoreFirstInputDraft).toHaveBeenCalledExactlyOnceWith("created", invocation);
+  expect(original.send).not.toHaveBeenCalled();
+  const acceptance = shellAccepted.mock.calls[0]![0];
+  expect(acceptance).toMatchObject({
+    kind: "objectiveDialog", requestId: "home-goal-dialog", sessionId: "created", sessionGeneration: 4n
+  });
+  expect(acceptance.kind === "objectiveDialog" && acceptance.expectedDraft).toBe(invocation);
+  expect(shellAccepted).toHaveBeenCalledWith(acceptance, {
+    serverId: "server", profileId: "profile", connectionGeneration: 2
+  });
+  expect(ownerAccepted).toHaveBeenCalledWith(acceptance);
+});
+
+it("keeps Home visible and restores the complete created-task draft once when explicit Objective set fails", async () => {
+  const original = api();
+  const failure = new Error("Objective service unavailable");
+  vi.mocked(original.setObjective).mockRejectedValue(failure);
+  const shellAccepted = vi.fn();
+  const probe = await mount(original, shellAccepted);
+  const recovery: ComposerDraft = { ...input, text: "/goal Keep the final dialog text" };
+  let result: unknown;
+
+  await act(async () => {
+    result = await probe.submit(draft, recovery, {
+      ownerDocument: document,
+      signal: new AbortController().signal,
+      isCurrent: () => true,
+      firstInputDisposition: {
+        kind: "objective", source: "dialog", requestId: "home-goal-set", action: "set",
+        text: "Keep the final dialog text", limits: { maximumTurns: 50 }
+      }
+    }).catch((error: unknown) => error);
+  });
+
+  expect(result).toBe(failure);
+  expect(original.listCommands).not.toHaveBeenCalled();
+  expect(original.navigate).not.toHaveBeenCalled();
+  expect(original.clearNewSessionDraft).not.toHaveBeenCalled();
+  expect(original.restoreFirstInputDraft).toHaveBeenCalledExactlyOnceWith("created", recovery);
+  expect(shellAccepted).not.toHaveBeenCalled();
+  expect(probe.error()).toBe("Objective service unavailable");
+});
+
+it("retires a pending Objective before dispatch when the exact connection owner changes", async () => {
+  const original = api();
+  const creation = deferred<{ sessionId: string; generation: bigint }>();
+  vi.mocked(original.createSession).mockReturnValue(creation.promise);
+  const shellAccepted = vi.fn();
+  const probe = await mount(original, shellAccepted);
+  let pending!: Promise<unknown>;
+  await act(async () => {
+    pending = probe.submit(draft, { ...input, text: "/goal Keep working" }, {
+      ownerDocument: document,
+      signal: new AbortController().signal,
+      isCurrent: () => true,
+      firstInputDisposition: {
+        kind: "objective", source: "slash", requestId: "retired-goal", action: "set",
+        text: "Keep working", limits: { noProgressTurnLimit: 3 }
+      }
+    }).catch((error: unknown) => error);
+  });
+  await probe.render({
+    ...original,
+    state: {
+      ...original.state,
+      activeProfile: { ...original.state.activeProfile!, id: "replacement-profile" },
+      connectionGeneration: 3
+    }
+  });
+  let result: unknown;
+  await act(async () => { creation.resolve({ sessionId: "retired-created", generation: 9n }); result = await pending; });
+
+  expect(result).toMatchObject({ name: "AbortError" });
+  expect(original.listCommands).not.toHaveBeenCalled();
+  expect(original.setObjective).not.toHaveBeenCalled();
+  expect(original.restoreFirstInputDraft).toHaveBeenCalledExactlyOnceWith(
+    "retired-created", expect.objectContaining({ text: "/goal Keep working" })
+  );
+  expect(original.navigate).not.toHaveBeenCalled();
+  expect(shellAccepted).not.toHaveBeenCalled();
+});
 
 it.each(["draft", "route", "pagehide"] as const)("keeps accepted creation on its original API while retiring %s presentation", async (cause) => {
   const original = api();
@@ -297,3 +404,18 @@ it("aborts fresh runtime reconciliation on an unexpected route and restores the 
   expect(original.send).not.toHaveBeenCalled();
   expect(original.restoreFirstInputDraft).toHaveBeenCalledExactlyOnceWith("created", invocation);
 });
+
+function objectiveView(sessionId: string, sessionGeneration: bigint, text: string): ObjectiveView {
+  return {
+    sessionId,
+    sessionGeneration,
+    text,
+    status: "active",
+    turnsUsed: 0,
+    tokensUsed: 0,
+    noProgressTurns: 0,
+    ownerGeneration: 1n,
+    startedAt: 1,
+    revision: 1n
+  };
+}

@@ -81,7 +81,13 @@ import {
 import { sessionDerivationOriginRoute } from "./session-derivation-origin.js";
 import { CollaborationGoalPanel } from "./CollaborationGoalPanel.js";
 import { PortableReplacementCleanupNotice } from "./PortableReplacementCleanupNotice.js";
-import { ObjectiveIndicator, type ObjectiveDialogRequest } from "./ObjectiveIndicator.js";
+import {
+  ObjectiveIndicator,
+  objectiveDialogOwnerFence,
+  objectiveDialogRequestMatchesOwner,
+  type ObjectiveDialogHandoffRequest,
+  type ObjectiveDialogRequest
+} from "./ObjectiveIndicator.js";
 import { objectiveSessionAccess } from "../objective-access.js";
 
 // First-stage contracts do not expose a durable dismissal mutation. Keep this bounded and
@@ -134,7 +140,7 @@ interface ActiveMessageFork {
 
 export type SessionPanePresentation = "standard" | "filesRail";
 
-export function SessionPane({ controller, session, target, backend, reviewReadOnly = false, presentation = "standard", composerAutoFocus = true, models, timeline, timelineHasEarlier, timelineHistoryLoading, timelineHistoryError, onLoadEarlierTimeline, timelineFocusRequest, extensionWidgets, extensionStatuses, queue, queueControl, workspace, extraDirectories, resources, commandRefreshSignal, interaction, remainingInteractions, navigationOpen, inspectorOpen, inspectorAvailable = true, selectionQuoteInsertion, attachmentInsertion, t, runAction, onOpenNavigation, onOpenInspector, onOpenSubagent, onOpenTurnReview, onRename, onPin, onArchive, onPrefetchRemoval, onDelete, onMoveSessionProject, movingSessionProject = false, onCopyTaskLink, onExportPortableSession, onSplitSession, onOpenSessionWindow }: {
+export function SessionPane({ controller, session, target, backend, reviewReadOnly = false, presentation = "standard", composerAutoFocus = true, models, timeline, timelineHasEarlier, timelineHistoryLoading, timelineHistoryError, onLoadEarlierTimeline, timelineFocusRequest, extensionWidgets, extensionStatuses, queue, queueControl, workspace, extraDirectories, resources, commandRefreshSignal, interaction, remainingInteractions, navigationOpen, inspectorOpen, inspectorAvailable = true, selectionQuoteInsertion, attachmentInsertion, objectiveDialogHandoff, onObjectiveDialogHandoffHandled, t, runAction, onOpenNavigation, onOpenInspector, onOpenSubagent, onOpenTurnReview, onRename, onPin, onArchive, onPrefetchRemoval, onDelete, onMoveSessionProject, movingSessionProject = false, onCopyTaskLink, onExportPortableSession, onSplitSession, onOpenSessionWindow }: {
   readonly controller: AppController;
   readonly session: SessionView;
   readonly target?: TargetView;
@@ -164,6 +170,8 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
   readonly inspectorAvailable?: boolean;
   readonly selectionQuoteInsertion?: { readonly id: number; readonly sessionId: string; readonly quote: ComposerSelectionQuoteDraft };
   readonly attachmentInsertion?: { readonly id: number; readonly sessionId: string; readonly file: File };
+  readonly objectiveDialogHandoff?: ObjectiveDialogHandoffRequest;
+  readonly onObjectiveDialogHandoffHandled?: (requestId: string) => void;
   readonly t: Translator;
   readonly runAction: RunAction;
   readonly onOpenNavigation: () => void;
@@ -218,7 +226,7 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
   const [backgroundStopping, setBackgroundStopping] = useState(false);
   const [backgroundStopError, setBackgroundStopError] = useState<string>();
   const [collaborationOpen, setCollaborationOpen] = useState(false);
-  const [objectiveDialogRequest, setObjectiveDialogRequest] = useState<ObjectiveDialogRequest>();
+  const [objectiveDialogRequest, setObjectiveDialogRequest] = useState<(ObjectiveDialogRequest & { readonly handoffId?: string })>();
   const objectiveDialogRequestIdRef = useRef(0);
   const collaborationButtonRef = useRef<HTMLButtonElement>(null);
   const [timelineSubagentRuns, setTimelineSubagentRuns] = useState<{
@@ -462,6 +470,24 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
   });
   const objectiveReadable = objectiveAccess !== "hidden";
   const objectiveSupported = objectiveAccess === "write";
+  useEffect(() => {
+    const retiredHandoffs = new Set<string>();
+    if (objectiveDialogHandoff !== undefined && (
+      !objectiveSupported || !objectiveDialogRequestMatchesOwner(objectiveDialogHandoff, controller, session)
+    )) retiredHandoffs.add(objectiveDialogHandoff.id);
+    if (objectiveDialogRequest !== undefined && (
+      !objectiveSupported || !objectiveDialogRequestMatchesOwner(objectiveDialogRequest, controller, session)
+    )) {
+      setObjectiveDialogRequest((current) => current === objectiveDialogRequest ? undefined : current);
+      if (objectiveDialogRequest.handoffId !== undefined) retiredHandoffs.add(objectiveDialogRequest.handoffId);
+    }
+    for (const requestId of retiredHandoffs) onObjectiveDialogHandoffHandled?.(requestId);
+  }, [controller, objectiveDialogHandoff, objectiveDialogRequest, objectiveSupported, onObjectiveDialogHandoffHandled, session]);
+  const activeObjectiveDialogRequest = objectiveDialogRequest !== undefined
+    && objectiveSupported
+    && objectiveDialogRequestMatchesOwner(objectiveDialogRequest, controller, session)
+    ? objectiveDialogRequest
+    : undefined;
   const canListSessionResources = !reviewReadOnly
     && controller.state.connectionState === "connected"
     && backend?.capabilities.get("runtime.resources")?.supported === true
@@ -2039,11 +2065,27 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
           controller={controller}
           session={session}
           readOnly={!objectiveSupported}
-          dialogRequest={objectiveDialogRequest}
-          onDialogRequestHandled={() => setObjectiveDialogRequest(undefined)}
+          dialogRequest={activeObjectiveDialogRequest}
+          onDialogRequestHandled={(requestId) => {
+            if (requestId === undefined || activeObjectiveDialogRequest?.id !== requestId) return;
+            const handoffId = activeObjectiveDialogRequest.handoffId;
+            setObjectiveDialogRequest((current) => current?.id === requestId ? undefined : current);
+            if (handoffId !== undefined) onObjectiveDialogHandoffHandled?.(handoffId);
+          }}
           t={t}
         />}
-        <Composer artifacts={canListSessionArtifacts ? liveArtifacts : []} sessions={historicalSessionMentionCandidates} controller={controller} session={session} backend={backend} sessionUsage={effectiveSessionUsage} readOnly={reviewReadOnly} autoFocus={composerAutoFocus && presentation === "standard" && currentShareSelection === undefined} focusRequest={composerFocusRequest} queue={queue} queueControl={queueControl} workspace={workspace} extraDirectories={extraDirectories} resources={canListSessionResources ? liveResources : []} commands={canListRuntimeCommands ? liveCommands : []} messageHistory={messageHistory} controls={composerControls} runningStatus={<SessionRunningStatusBar session={session} items={recoveryPresentationTimeline} backgroundTaskIds={backgroundTaskIds} canStopBackgroundTasks={canStopBackgroundTasks} backgroundStopping={backgroundStopping} backgroundStopError={backgroundStopError} suppressed={reviewReadOnly} t={t} onStopBackgroundTasks={stopAllBackgroundTasks} />} messageMentionInsertion={composerMessageMentionInsertion} selectionQuoteInsertion={composerSelectionQuoteInsertion} attachmentInsertion={composerAttachmentInsertion} draftReplacement={composerDraftReplacement} onDraftMutation={noteComposerDraftMutation} t={t} runAction={runAction} onLocalSend={(sourceSessionId) => { if (activeSessionIdRef.current === sourceSessionId) setFollowLatestSignal((current) => current + 1); }} onOpenObjective={objectiveSupported ? (onSaved) => setObjectiveDialogRequest({ id: ++objectiveDialogRequestIdRef.current, onSaved }) : undefined} onStop={canStop ? stopRun : undefined} stopInFlight={stopInFlight} onCompact={canCompact && !running && activeCompaction === undefined && !compactInFlight && (session.context?.usedTokens ?? 0) > 0 ? requestCompact : undefined} />
+        <Composer artifacts={canListSessionArtifacts ? liveArtifacts : []} sessions={historicalSessionMentionCandidates} controller={controller} session={session} backend={backend} sessionUsage={effectiveSessionUsage} readOnly={reviewReadOnly} autoFocus={composerAutoFocus && presentation === "standard" && currentShareSelection === undefined} focusRequest={composerFocusRequest} queue={queue} queueControl={queueControl} workspace={workspace} extraDirectories={extraDirectories} resources={canListSessionResources ? liveResources : []} commands={canListRuntimeCommands ? liveCommands : []} messageHistory={messageHistory} controls={composerControls} runningStatus={<SessionRunningStatusBar session={session} items={recoveryPresentationTimeline} backgroundTaskIds={backgroundTaskIds} canStopBackgroundTasks={canStopBackgroundTasks} backgroundStopping={backgroundStopping} backgroundStopError={backgroundStopError} suppressed={reviewReadOnly} t={t} onStopBackgroundTasks={stopAllBackgroundTasks} />} messageMentionInsertion={composerMessageMentionInsertion} selectionQuoteInsertion={composerSelectionQuoteInsertion} attachmentInsertion={composerAttachmentInsertion} draftReplacement={composerDraftReplacement} objectiveDialogHandoff={objectiveDialogHandoff} onObjectiveDialogHandoffRejected={onObjectiveDialogHandoffHandled} onDraftMutation={noteComposerDraftMutation} t={t} runAction={runAction} onLocalSend={(sourceSessionId) => { if (activeSessionIdRef.current === sourceSessionId) setFollowLatestSignal((current) => current + 1); }} onOpenObjective={objectiveSupported ? (onSaved, handoff) => {
+          if (handoff !== undefined) {
+            if (!objectiveDialogRequestMatchesOwner(handoff, controller, session)) {
+              onObjectiveDialogHandoffHandled?.(handoff.id);
+              return;
+            }
+            setObjectiveDialogRequest({ ...handoff, handoffId: handoff.id, onSaved });
+            return;
+          }
+          const owner = objectiveDialogOwnerFence(controller, session);
+          if (owner !== undefined) setObjectiveDialogRequest({ ...owner, id: ++objectiveDialogRequestIdRef.current, onSaved });
+        } : undefined} onStop={canStop ? stopRun : undefined} stopInFlight={stopInFlight} onCompact={canCompact && !running && activeCompaction === undefined && !compactInFlight && (session.context?.usedTokens ?? 0) > 0 ? requestCompact : undefined} />
       </div>}
       <ExtensionWidgets widgets={extensionWidgets.filter((widget) => widget.placement === "belowEditor")} label={t("a11y.extensionWidgets")} />
       </div>
