@@ -318,6 +318,7 @@ export function assertMobileCanonicalPartnerSession(
   const matches = response.sessions.filter((session) => session.sessionId === sessionId);
   if (matches.length !== 1 || matches[0]?.partnerId !== partner.partnerId
     || matches[0].role !== PartnerSessionRole.CANONICAL || !matches[0].available
+    || matches[0].profileVersion !== BigInt(partner.profileVersion)
     || matches[0].readOnly || matches[0].deleted || matches[0].archived) {
     throw new Error("The selected task is not this Partner's available canonical Session.");
   }

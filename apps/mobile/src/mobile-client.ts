@@ -72,8 +72,14 @@ import {
 } from "./network";
 import {
   assertMobileCanonicalPartnerSession, emptyMobilePartnerPrivateState,
-  validMobilePartnerId, type MobilePartnerPrivateState, type MobilePrivateDetail
+  validMobilePartnerId, type MobilePartner, type MobilePartnerPrivateState, type MobilePrivateDetail
 } from "./mobile-partner-private";
+import {
+  mobilePartnerResourceKey,
+  projectMobilePartnerResourcePreview,
+  type MobilePartnerResourcePreview,
+  type MobilePartnerResourceTransport
+} from "./mobile-partner-resources";
 import {
   artifactTitle,
   bytesToDataUri,
@@ -791,6 +797,77 @@ export class MobileClient {
   ) { this.#filesThumbnails = new MobileFilesThumbnailReader(filesThumbnailDisk); }
 
   get state(): MobileState { return this.#state; }
+
+  partnerResourceTransport(): MobilePartnerResourceTransport | undefined {
+    const context = this.#partnerPrivateContext();
+    if (!context) return undefined;
+    const ownerKey = context.authorityKey;
+    const current = (): boolean => this.#partnerPrivateAuthorityKey(this.#state) === ownerKey
+      && this.#credential === context.credential;
+    const requireCurrent = (signal: AbortSignal): void => {
+      signal.throwIfAborted();
+      if (!current()) throw new Error("The Partner Resource owner changed.");
+    };
+    const readPartners = async (signal: AbortSignal): Promise<readonly MobilePartner[]> => {
+      requireCurrent(signal);
+      const partners = await this.network.listPartners(context.credential, signal);
+      requireCurrent(signal);
+      return partners;
+    };
+    const exactPartner = (partners: readonly MobilePartner[], partnerId: string): MobilePartner => {
+      if (!validMobilePartnerId(partnerId)) throw new Error("Select a current Partner Resource.");
+      const matches = partners.filter((partner) => partner.partnerId === partnerId);
+      if (matches.length !== 1) throw new Error("The selected Partner Resource is no longer available.");
+      const partner = matches[0]!;
+      if (partner.lifecycle !== "active" || partner.initializationState !== "ready"
+        || partner.canonicalSessionId === undefined) {
+        throw new Error("The selected Partner Resource does not have an available canonical task.");
+      }
+      return partner;
+    };
+    return {
+      ownerKey,
+      list: readPartners,
+      preview: async (partnerId, signal) => {
+        const initial = exactPartner(await readPartners(signal), partnerId);
+        const sessions = await this.network.listPartnerSessions(context.credential, initial.partnerId, signal);
+        requireCurrent(signal);
+        assertMobileCanonicalPartnerSession(initial, initial.canonicalSessionId!, sessions);
+        const catalog = await this.network.listSessionArtifacts(context.credential, initial.canonicalSessionId!, signal);
+        requireCurrent(signal);
+        const finalPartner = exactPartner(await readPartners(signal), partnerId);
+        if (mobilePartnerResourceKey(finalPartner) !== mobilePartnerResourceKey(initial)) {
+          throw new Error("The Partner Resource changed while its preview was loading.");
+        }
+        const finalSessions = await this.network.listPartnerSessions(context.credential, finalPartner.partnerId, signal);
+        requireCurrent(signal);
+        return projectMobilePartnerResourcePreview(finalPartner, finalSessions, catalog);
+      },
+      open: async (preview: MobilePartnerResourcePreview, signal) => {
+        requireCurrent(signal);
+        const partner = exactPartner(await readPartners(signal), preview.partner.partnerId);
+        if (mobilePartnerResourceKey(partner) !== preview.resourceKey
+          || partner.canonicalSessionId !== preview.session.sessionId) {
+          throw new Error("The Partner Resource changed; refresh its preview before opening it.");
+        }
+        const sessions = await this.network.listPartnerSessions(context.credential, partner.partnerId, signal);
+        requireCurrent(signal);
+        assertMobileCanonicalPartnerSession(partner, preview.session.sessionId, sessions);
+        const visible = this.#state.owner?.sessions.filter((session) => session.sessionId === preview.session.sessionId) ?? [];
+        if (visible.length !== 1 || visible[0]!.archived
+          || visible[0]!.state === SessionState.ARCHIVED || visible[0]!.state === SessionState.CLOSED) {
+          throw new Error("The Partner canonical task is not available in the current task directory.");
+        }
+        requireCurrent(signal);
+        await this.select(preview.session.sessionId);
+        requireCurrent(signal);
+        if (this.#state.selectedId !== preview.session.sessionId) {
+          throw new Error("The Partner canonical task was not selected by the current owner.");
+        }
+        return preview.session.sessionId;
+      }
+    };
+  }
 
   remoteDesktopTransport(): MobileRemoteDesktopTransport | undefined {
     const credential = this.#credential;

@@ -1772,6 +1772,92 @@ function iosClient(network: MobileNetwork, storage: MobileStorage): MobileClient
 afterEach(() => { for (const item of clients.splice(0)) item.dispose(); vi.useRealTimers(); });
 
 describe("mobile Partner private authority", () => {
+  it("previews authorized Partner Artifacts and opens only the revalidated canonical task", async () => {
+    const network = fakeNetwork();
+    const partner = { partnerId: "partner-a", displayName: "A", avatar: "standard",
+      lifecycle: "active" as const, initializationState: "ready" as const, profileVersion: 3,
+      canonicalSessionId: "session" };
+    network.listPartners = vi.fn(async () => [partner]);
+    network.listPartnerSessions = vi.fn(async () => create(ListPartnerSessionsResponseSchema, {
+      sessions: [{ partnerId: "partner-a", sessionId: "session", role: PartnerSessionRole.CANONICAL,
+        profileVersion: 3n, displayName: "A task", available: true, readOnly: false, deleted: false,
+        archived: false, createdAt: { seconds: 1n }, lastActivityAt: { seconds: 2n } }]
+    }));
+    network.listSessionArtifacts = vi.fn(async () => ({ artifacts: [create(ArtifactSchema, {
+      artifactId: "partner-report", sessionId: "session", kind: ArtifactKind.FILE, title: "Report",
+      createdAt: { seconds: 2n }, blob: create(BlobRefSchema, {
+        blobId: "partner-report-blob", fileName: "report.txt", mediaType: "text/plain",
+        byteSize: 4n, sha256Hex: "a".repeat(64), disposition: BlobDisposition.ARTIFACT
+      })
+    })], revision: "partner-artifacts-r1" }));
+    const app = client(network, memoryStorage(credential).storage);
+    await app.start();
+
+    const transport = app.partnerResourceTransport()!;
+    expect(await transport.list(new AbortController().signal)).toEqual([partner]);
+    const preview = await transport.preview("partner-a", new AbortController().signal);
+    expect(preview).toMatchObject({ session: { sessionId: "session", profileVersion: 3 },
+      artifacts: [{ artifactId: "partner-report", title: "Report" }] });
+    await expect(transport.open(preview, new AbortController().signal)).resolves.toBe("session");
+    expect(app.state.selectedId).toBe("session");
+    expect(network.listPartnerSessions).toHaveBeenCalledTimes(3);
+  });
+
+  it("retires late Partner Resource reads and refuses a changed preview before selection", async () => {
+    const network = fakeNetwork();
+    const partner = { partnerId: "partner-a", displayName: "A", avatar: "standard",
+      lifecycle: "active" as const, initializationState: "ready" as const, profileVersion: 3,
+      canonicalSessionId: "session" };
+    let finish!: (value: Awaited<ReturnType<MobileNetwork["listPartners"]>>) => void;
+    network.listPartners = vi.fn(() => new Promise<Awaited<ReturnType<MobileNetwork["listPartners"]>>>(
+      (resolve) => { finish = resolve; }
+    ));
+    const app = client(network, memoryStorage(credential).storage);
+    await app.start();
+    const transport = app.partnerResourceTransport()!;
+    const late = transport.list(new AbortController().signal);
+    app.setForeground(false);
+    finish([partner]);
+    await expect(late).rejects.toThrow(/owner changed/u);
+
+    app.setForeground(true);
+    await app.refresh();
+    network.listPartners = vi.fn(async () => [partner]);
+    network.listPartnerSessions = vi.fn(async () => create(ListPartnerSessionsResponseSchema, {
+      sessions: [{ partnerId: "partner-a", sessionId: "session", role: PartnerSessionRole.CANONICAL,
+        profileVersion: 3n, displayName: "A task", available: true, readOnly: false, deleted: false,
+        archived: false, createdAt: { seconds: 1n } }]
+    }));
+    network.listSessionArtifacts = vi.fn(async () => ({ artifacts: [], revision: "partner-artifacts-r1" }));
+    const current = app.partnerResourceTransport()!;
+    const preview = await current.preview("partner-a", new AbortController().signal);
+    network.listPartners = vi.fn(async () => [{ ...partner, profileVersion: 4 }]);
+    const select = vi.spyOn(app, "select");
+    await expect(current.open(preview, new AbortController().signal)).rejects.toThrow(/changed/u);
+    expect(select).not.toHaveBeenCalled();
+  });
+
+  it("does not report a Partner Resource open after selection retires its owner", async () => {
+    const network = fakeNetwork();
+    const partner = { partnerId: "partner-a", displayName: "A", avatar: "standard",
+      lifecycle: "active" as const, initializationState: "ready" as const, profileVersion: 3,
+      canonicalSessionId: "session" };
+    network.listPartners = vi.fn(async () => [partner]);
+    network.listPartnerSessions = vi.fn(async () => create(ListPartnerSessionsResponseSchema, {
+      sessions: [{ partnerId: "partner-a", sessionId: "session", role: PartnerSessionRole.CANONICAL,
+        profileVersion: 3n, displayName: "A task", available: true, readOnly: false, deleted: false,
+        archived: false, createdAt: { seconds: 1n } }]
+    }));
+    network.listSessionArtifacts = vi.fn(async () => ({ artifacts: [], revision: "partner-artifacts-r1" }));
+    const app = client(network, memoryStorage(credential).storage);
+    await app.start();
+    const transport = app.partnerResourceTransport()!;
+    const preview = await transport.preview("partner-a", new AbortController().signal);
+    vi.spyOn(app, "select").mockImplementation(async () => { app.setForeground(false); });
+
+    await expect(transport.open(preview, new AbortController().signal)).rejects.toThrow(/owner changed/u);
+  });
+
   it("revalidates a task preview against its exact canonical Partner Session and target participant", async () => {
     const network = fakeNetwork();
     network.listPartners = vi.fn(async () => [{ partnerId: "partner-a", displayName: "A", avatar: "standard",
@@ -1779,7 +1865,7 @@ describe("mobile Partner private authority", () => {
       canonicalSessionId: "session" }]);
     network.listPartnerSessions = vi.fn(async () => create(ListPartnerSessionsResponseSchema, {
       sessions: [{ partnerId: "partner-a", sessionId: "session", role: PartnerSessionRole.CANONICAL,
-        available: true, readOnly: false, deleted: false, archived: false }]
+        profileVersion: 1n, available: true, readOnly: false, deleted: false, archived: false }]
     }));
     network.listPartnerPrivateThreads = vi.fn(async () => [{
       threadId: "private-thread", firstPartnerId: "partner-a", secondPartnerId: "partner-b",
