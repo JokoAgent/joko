@@ -15,10 +15,10 @@ import {
   EventCursorSchema, EventSchema, ImageRefSchema, MessageInputDelivery, MessageRole, ModelDescriptorSchema, ModelInputModality, ModelKeySchema, ModelOutputModality, ModelSelectionSchema,
   OperationMutationSchema, OperationState, OwnerSnapshotScopeSchema, PermissionMode,
   ProviderDescriptorSchema, ProviderKind, RevisionSchema, SessionMessageSearchMatchSchema, SessionSnapshotScopeSchema,
-  SettingsSnapshotSchema, SnapshotScopeSchema, UsageSchema,
+  SettingsSnapshotSchema, SnapshotScopeSchema, UsageSchema, ManagedResourceSchema,
   VoiceInputServiceSettingsSchema, VoiceInputServiceSettingsPatchSchema, VoiceInputTranscriptionProtocol,
   VoiceInputSaucSettingsSchema, VoiceInputSaucMode, VoiceInputSaucAuthentication,
-  QueueControlSchema, QueueDeliveryMode, QueueDispatchState, QueueItemSchema, QueueItemState, QueueSourceKind, ResourceKind,
+  QueueControlSchema, QueueDeliveryMode, QueueDispatchState, QueueItemSchema, QueueItemState, QueueSourceKind, ResourceKind, ResourceState,
   ReviewRunSchema, ReviewRunState, RuntimeCommandSchema, RuntimeCommandSource, SessionResourceSchema,
   RunState, ScheduleExecutionMode, ScheduleFireSource, ScheduleMisfirePolicy, ScheduleOverlapPolicy,
   ScheduleGeneratedSessionDisposition,
@@ -69,6 +69,7 @@ import type { MobileFileShare } from "./mobile-file-share";
 import { MobileOfflineCache, type MobileOfflineCacheStorage } from "./mobile-offline-cache";
 import type { MobileLocalComposerAttachment } from "./mobile-attachments";
 import type { MobilePlainStorageDriver } from "./connection-storage";
+import type { MobileExtensionLibrarySession } from "./mobile-extension-library-runtime";
 import type { MobileVoiceCapability, MobileVoiceSession } from "./mobile-voice-input";
 import { timelineRows } from "./timeline";
 import {
@@ -84,6 +85,13 @@ import {
 } from "./mobile-composer-document";
 import { createMobileAutomationDraft } from "./mobile-automation-authoring";
 import { parseMobileNativeIntent } from "./mobile-native-intent";
+import type { MobileExtension, MobileExtensionMainViewSurface } from "./mobile-extensions";
+import type {
+  MobileExtensionLibraryLocationValidation,
+  MobileExtensionLibraryOverview,
+  MobileExtensionLibrarySnapshot,
+  MobileExtensionLibraryTrashEntry
+} from "./mobile-extension-library";
 
 const credential: PairedCredential = {
   profileId: "mobile-profile", origin: "http://192.168.1.20:4318", serverId: "node-1", connectionId: "mobile-connection",
@@ -948,6 +956,29 @@ function fakeNetwork(): MobileNetwork {
     readOwner: vi.fn(async () => ({ connection, device, snapshot })),
     listPartners: vi.fn(async () => []),
     listPartnerSessions: vi.fn(async () => create(ListPartnerSessionsResponseSchema, { sessions: [] })),
+    listExtensions: vi.fn(async () => ({ revision: 1n, recoveredFromCorruption: false, extensions: [] })),
+    getExtension: vi.fn(async () => { throw new Error("No Extension fixture was configured."); }),
+    getExtensionForRuntime: vi.fn(async () => { throw new Error("No runtime-scoped Extension fixture was configured."); }),
+    openExtensionMainView: vi.fn(async () => { throw new Error("No Extension main-view fixture was configured."); }),
+    getExtensionMainViewSurface: vi.fn(async () => { throw new Error("No Extension main-view fixture was configured."); }),
+    closeExtensionMainView: vi.fn(async () => true),
+    openExtensionLibrary: vi.fn(async () => { throw new Error("No Library session fixture was configured."); }),
+    callExtensionLibrary: vi.fn(async () => { throw new Error("No Library call fixture was configured."); }),
+    closeExtensionLibrary: vi.fn(async () => true),
+    getExtensionLibraryOverview: vi.fn(async () => { throw new Error("No Extension Library fixture was configured."); }),
+    validateExtensionLibraryLocation: vi.fn(async () => { throw new Error("No Extension Library fixture was configured."); }),
+    relocateExtensionLibrary: vi.fn(async () => { throw new Error("No Extension Library fixture was configured."); }),
+    rebindExtensionLibrary: vi.fn(async () => { throw new Error("No Extension Library fixture was configured."); }),
+    unbindExtensionLibrary: vi.fn(async () => { throw new Error("No Extension Library fixture was configured."); }),
+    repairExtensionLibraryState: vi.fn(async () => { throw new Error("No Extension Library fixture was configured."); }),
+    repairExtensionLibraryMetadata: vi.fn(async () => { throw new Error("No Extension Library fixture was configured."); }),
+    trashExtensionLibrary: vi.fn(async () => { throw new Error("No Extension Library fixture was configured."); }),
+    listExtensionLibraryTrash: vi.fn(async () => []),
+    restoreExtensionLibraryTrash: vi.fn(async () => { throw new Error("No Extension Library fixture was configured."); }),
+    purgeExtensionLibraryTrash: vi.fn(async () => { throw new Error("No Extension Library fixture was configured."); }),
+    listExtensionLibraryGrace: vi.fn(async () => []),
+    rollbackExtensionLibrary: vi.fn(async () => { throw new Error("No Extension Library fixture was configured."); }),
+    uploadExtensionSetupCredential: vi.fn(async () => { throw new Error("No Extension credential fixture was configured."); }),
     listPartnerPrivateThreads: vi.fn(async () => []),
     getPartnerPrivateThread: vi.fn(async () => { throw new Error("No private thread fixture was configured."); }),
     markPartnerPrivateThreadRead: vi.fn(async () => { throw new Error("No private read fixture was configured."); }),
@@ -1771,7 +1802,998 @@ function iosClient(network: MobileNetwork, storage: MobileStorage): MobileClient
 }
 afterEach(() => { for (const item of clients.splice(0)) item.dispose(); vi.useRealTimers(); });
 
+describe("mobile Extension catalog authority", () => {
+  it("lists and opens only an exact current installed descriptor", async () => {
+    const network = fakeNetwork();
+    const extension = mobileExtensionFixture();
+    network.listExtensions = vi.fn(async () => ({
+      revision: 4n,
+      recoveredFromCorruption: false,
+      extensions: [extension]
+    }));
+    network.getExtension = vi.fn(async () => extension);
+    const app = client(network, memoryStorage(credential).storage);
+    await app.start();
+
+    const transport = app.extensionCatalogTransport()!;
+    await expect(transport.list(new AbortController().signal)).resolves.toMatchObject({
+      revision: 4n,
+      extensions: [{ extensionId: extension.extensionId }]
+    });
+    await expect(transport.detail(extension, new AbortController().signal)).resolves.toBe(extension);
+    expect(network.listExtensions).toHaveBeenCalledExactlyOnceWith(credential, expect.any(AbortSignal));
+    expect(network.getExtension).toHaveBeenCalledExactlyOnceWith(
+      credential,
+      extension.extensionId,
+      expect.any(AbortSignal)
+    );
+  });
+
+  it("rejects changed detail and retires late catalog responses with their owner", async () => {
+    const network = fakeNetwork();
+    const extension = mobileExtensionFixture();
+    network.getExtension = vi.fn(async () => ({ ...extension, revision: 2n }));
+    const app = client(network, memoryStorage(credential).storage);
+    await app.start();
+    const transport = app.extensionCatalogTransport()!;
+
+    await expect(transport.detail(extension, new AbortController().signal)).rejects.toThrow(/changed/u);
+
+    let finish!: (catalog: Awaited<ReturnType<MobileNetwork["listExtensions"]>>) => void;
+    network.listExtensions = vi.fn(() => new Promise<Awaited<ReturnType<MobileNetwork["listExtensions"]>>>(
+      (resolve) => { finish = resolve; }
+    ));
+    const pending = transport.list(new AbortController().signal);
+    app.setForeground(false);
+    finish({ revision: 4n, recoveredFromCorruption: false, extensions: [extension] });
+    await expect(pending).rejects.toThrow(/owner changed/u);
+    expect(app.extensionCatalogTransport()).toBeUndefined();
+  });
+
+  it("rejects a late detail response after foreground retirement", async () => {
+    const network = fakeNetwork();
+    const extension = mobileExtensionFixture();
+    let finish!: (value: MobileExtension) => void;
+    network.getExtension = vi.fn(() => new Promise<MobileExtension>((resolve) => { finish = resolve; }));
+    const app = client(network, memoryStorage(credential).storage);
+    await app.start();
+    const transport = app.extensionCatalogTransport()!;
+    const pending = transport.detail(extension, new AbortController().signal);
+
+    app.setForeground(false);
+    finish(extension);
+    await expect(pending).rejects.toThrow(/owner changed/u);
+  });
+
+  it("changes enabled and sidebar state through exact durable operations before adopting fresh descriptors", async () => {
+    const network = fakeNetwork();
+    const saved = memoryStorage(credential);
+    let extension = { ...mobileExtensionFixture(), mainView: { title: "Mail", icon: "layout" as const },
+      sidebarSupported: true, sidebarVisible: true };
+    let catalogRevision = 4n;
+    network.listExtensions = vi.fn(async () => ({
+      revision: catalogRevision,
+      recoveredFromCorruption: false,
+      extensions: [extension]
+    }));
+    network.getExtension = vi.fn(async () => extension);
+    const receipts: PendingOperation[] = [];
+    network.submit = vi.fn(async (_credential, operationId, mutation) => {
+      toBinary(OperationMutationSchema, mutation);
+      receipts.push(saved.pending()[0]!);
+      if (mutation.payload.case === "setExtensionEnabled") {
+        expect(mutation.payload.value).toMatchObject({
+          extensionId: extension.extensionId,
+          enabled: false,
+          expectedRevision: { value: 1n }
+        });
+        extension = { ...extension, revision: 2n, enabled: false };
+      } else if (mutation.payload.case === "setExtensionSidebarVisible") {
+        expect(mutation.payload.value).toMatchObject({
+          extensionId: extension.extensionId,
+          visible: false,
+          expectedRevision: { value: 2n }
+        });
+        extension = { ...extension, revision: 3n, sidebarVisible: false };
+      } else throw new Error("Unexpected Extension mutation.");
+      catalogRevision += 1n;
+      return create(OperationSchema, {
+        operationId,
+        connectionId: credential.connectionId,
+        state: OperationState.SUCCEEDED,
+        result: { payload: { case: "acknowledgement", value: create(AcknowledgementSchema, { accepted: true }) } }
+      });
+    });
+    let sequence = 0;
+    const app = client(network, saved.storage, undefined, undefined, () => `extension-operation-${++sequence}`);
+    await app.start();
+
+    const transport = app.extensionCatalogTransport()!;
+    const disabled = await transport.setEnabled(extension, false, new AbortController().signal);
+    expect(disabled.extension).toMatchObject({ revision: 2n, enabled: false, sidebarVisible: true });
+    const hidden = await app.extensionCatalogTransport()!.setSidebarVisible(
+      disabled.extension,
+      false,
+      new AbortController().signal
+    );
+    expect(hidden).toMatchObject({
+      catalog: { revision: 6n },
+      extension: { revision: 3n, enabled: false, sidebarVisible: false }
+    });
+    expect(receipts).toEqual([
+      expect.objectContaining({
+        operationId: "extension-operation-1",
+        kind: "extension-enabled",
+        extensionId: extension.extensionId,
+        extensionRevision: "1",
+        state: "unknown"
+      }),
+      expect.objectContaining({
+        operationId: "extension-operation-2",
+        kind: "extension-sidebar",
+        extensionId: extension.extensionId,
+        extensionRevision: "2",
+        state: "unknown"
+      })
+    ]);
+    expect(saved.storage.savePending).toHaveBeenCalledBefore(network.submit as ReturnType<typeof vi.fn>);
+    expect(saved.pending()).toEqual([]);
+    expect(network.getExtension).toHaveBeenCalledTimes(4);
+    expect(network.listExtensions).toHaveBeenCalledTimes(2);
+  });
+
+  it("runs the complete Extension setup, protected credential, completion, revoke, retry, and cancel lifecycle", async () => {
+    const network = fakeNetwork();
+    const saved = memoryStorage(credential);
+    let attemptSequence = 0;
+    let extension: MobileExtension = {
+      ...mobileExtensionFixture(),
+      setup: {
+        state: "required",
+        revision: 0n,
+        fields: [
+          { fieldId: "region", label: "Region", description: "Service region", kind: "text", required: true,
+            configured: false, options: ["east", "west"] },
+          { fieldId: "terms", label: "Terms", description: "Accept terms", kind: "confirmation", required: true,
+            configured: false, options: [] },
+          { fieldId: "token", label: "Token", description: "Protected token", kind: "secret", required: true,
+            configured: false, options: [] }
+        ]
+      }
+    };
+    network.listExtensions = vi.fn(async () => ({
+      revision: extension.revision,
+      recoveredFromCorruption: false,
+      extensions: [extension]
+    }));
+    network.getExtension = vi.fn(async () => extension);
+    network.uploadExtensionSetupCredential = vi.fn(async (
+      exactCredential,
+      extensionId,
+      attemptId,
+      fieldId,
+      kind,
+      secret
+    ) => {
+      expect(exactCredential).toBe(credential);
+      expect({ extensionId, attemptId, fieldId, kind, secret }).toEqual({
+        extensionId: extension.extensionId,
+        attemptId: extension.setup.attemptId,
+        fieldId: "token",
+        kind: "apiKey",
+        secret: "temporary-private-value"
+      });
+      return "credential-ticket";
+    });
+    const receipts: PendingOperation[] = [];
+    network.submit = vi.fn(async (_credential, operationId, mutation) => {
+      toBinary(OperationMutationSchema, mutation);
+      const receipt = saved.pending()[0]!;
+      receipts.push({ ...receipt });
+      expect(Object.keys(receipt).sort()).toEqual([
+        "connectionId", "extensionId", "extensionRevision", "kind", "operationId", "state"
+      ]);
+      const revision = extension.revision;
+      const setupRevision = extension.setup.revision + 1n;
+      const fields = extension.setup.fields.map((field) => ({ ...field }));
+      switch (mutation.payload.case) {
+        case "beginExtensionSetup": {
+          expect(mutation.payload.value).toMatchObject({
+            extensionId: extension.extensionId,
+            expectedRevision: { value: revision }
+          });
+          attemptSequence += 1;
+          extension = { ...extension, revision: revision + 1n, setup: {
+            state: "inProgress", attemptId: `attempt-${attemptSequence}`, revision: setupRevision,
+            fields: fields.map((field) => ({ ...field, configured: false }))
+          } };
+          break;
+        }
+        case "submitExtensionSetupInteraction": {
+          expect(mutation.payload.value).toMatchObject({
+            extensionId: extension.extensionId,
+            attemptId: extension.setup.attemptId,
+            expectedRevision: { value: revision }
+          });
+          const fieldId = mutation.payload.value.fieldId;
+          const configured = mutation.payload.value.value.case === "confirmed"
+            ? mutation.payload.value.value.value
+            : true;
+          extension = { ...extension, revision: revision + 1n, setup: { ...extension.setup,
+            revision: setupRevision,
+            fields: fields.map((field) => field.fieldId === fieldId ? { ...field, configured } : field)
+          } };
+          break;
+        }
+        case "commitExtensionSetupCredential": {
+          expect(mutation.payload.value).toMatchObject({
+            extensionId: extension.extensionId,
+            attemptId: extension.setup.attemptId,
+            fieldId: "token",
+            credentialUploadTicketId: "credential-ticket",
+            expectedRevision: { value: revision }
+          });
+          extension = { ...extension, revision: revision + 1n, setup: { ...extension.setup,
+            revision: setupRevision,
+            fields: fields.map((field) => field.fieldId === "token" ? { ...field, configured: true } : field)
+          } };
+          break;
+        }
+        case "completeExtensionSetup":
+          expect(mutation.payload.value).toMatchObject({ attemptId: extension.setup.attemptId,
+            expectedRevision: { value: revision } });
+          extension = { ...extension, revision: revision + 1n,
+            setup: { ...extension.setup, state: "ready", revision: setupRevision } };
+          break;
+        case "revokeExtensionSetup":
+          expect(mutation.payload.value.expectedRevision?.value).toBe(revision);
+          extension = { ...extension, revision: revision + 1n, setup: { state: "required", revision: setupRevision,
+            fields: fields.map((field) => ({ ...field, configured: false })) } };
+          break;
+        case "cancelExtensionSetup":
+          expect(mutation.payload.value).toMatchObject({ attemptId: extension.setup.attemptId,
+            expectedRevision: { value: revision } });
+          extension = { ...extension, revision: revision + 1n,
+            setup: { ...extension.setup, state: "cancelled", revision: setupRevision } };
+          break;
+        default: throw new Error(`Unexpected Extension setup mutation: ${mutation.payload.case}`);
+      }
+      return create(OperationSchema, {
+        operationId,
+        connectionId: credential.connectionId,
+        state: OperationState.SUCCEEDED,
+        result: { payload: { case: "acknowledgement", value: create(AcknowledgementSchema, { accepted: true }) } }
+      });
+    });
+    let sequence = 0;
+    const app = client(network, saved.storage, undefined, undefined, () => `extension-setup-${++sequence}`);
+    await app.start();
+    const signal = new AbortController().signal;
+
+    let result = await app.extensionCatalogTransport()!.beginSetup(extension, signal);
+    expect(result.extension.setup).toMatchObject({ state: "inProgress", attemptId: "attempt-1" });
+    result = await app.extensionCatalogTransport()!.submitSetupInteraction(result.extension, "region", " west ", signal);
+    result = await app.extensionCatalogTransport()!.submitSetupInteraction(result.extension, "terms", true, signal);
+    result = await app.extensionCatalogTransport()!.saveSetupCredential(
+      result.extension, "token", "apiKey", "temporary-private-value", signal
+    );
+    expect(result.extension.setup.fields.every((field) => field.configured)).toBe(true);
+    result = await app.extensionCatalogTransport()!.completeSetup(result.extension, signal);
+    expect(result.extension.setup.state).toBe("ready");
+    result = await app.extensionCatalogTransport()!.revokeSetup(result.extension, signal);
+    expect(result.extension.setup).toMatchObject({ state: "required" });
+    result = await app.extensionCatalogTransport()!.beginSetup(result.extension, signal);
+    result = await app.extensionCatalogTransport()!.cancelSetup(result.extension, signal);
+    expect(result.extension.setup.state).toBe("cancelled");
+
+    expect(receipts.map((receipt) => receipt.kind)).toEqual([
+      "extension-setup-begin",
+      "extension-setup-interaction",
+      "extension-setup-interaction",
+      "extension-setup-credential",
+      "extension-setup-complete",
+      "extension-setup-revoke",
+      "extension-setup-begin",
+      "extension-setup-cancel"
+    ]);
+    expect(JSON.stringify(receipts)).not.toMatch(/temporary-private-value|credential-ticket|region|terms|token|west/u);
+    expect(saved.pending()).toEqual([]);
+    expect(network.uploadExtensionSetupCredential).toHaveBeenCalledOnce();
+  });
+
+  it("retains an unknown setup credential commit without retaining or replaying its secret or ticket", async () => {
+    const network = fakeNetwork();
+    const saved = memoryStorage(credential);
+    const extension: MobileExtension = { ...mobileExtensionFixture(), setup: {
+      state: "inProgress",
+      attemptId: "attempt-1",
+      revision: 1n,
+      fields: [{ fieldId: "token", label: "Token", description: "Protected token", kind: "secret",
+        required: true, configured: false, options: [] }]
+    } };
+    network.getExtension = vi.fn(async () => extension);
+    network.listExtensions = vi.fn(async () => ({ revision: 2n, recoveredFromCorruption: false, extensions: [extension] }));
+    network.uploadExtensionSetupCredential = vi.fn(async () => "credential-ticket");
+    vi.mocked(network.submit).mockRejectedValueOnce(new Error("transport closed"));
+    const app = client(network, saved.storage, undefined, undefined, () => "extension-setup-unknown");
+    await app.start();
+    const signal = new AbortController().signal;
+
+    await expect(app.extensionCatalogTransport()!.saveSetupCredential(
+      extension, "token", "apiKey", "temporary-private-value", signal
+    )).rejects.toThrow(/unknown/u);
+    expect(saved.pending()).toEqual([expect.objectContaining({
+      operationId: "extension-setup-unknown",
+      kind: "extension-setup-credential",
+      extensionId: extension.extensionId,
+      extensionRevision: "1",
+      state: "unknown"
+    })]);
+    expect(JSON.stringify(saved.pending())).not.toMatch(/temporary-private-value|credential-ticket|token/u);
+
+    await expect(app.extensionCatalogTransport()!.saveSetupCredential(
+      extension, "token", "apiKey", "temporary-private-value", signal
+    )).rejects.toThrow(/unresolved result/u);
+    expect(network.uploadExtensionSetupCredential).toHaveBeenCalledOnce();
+    expect(network.submit).toHaveBeenCalledOnce();
+  });
+
+  it("fails closed on incomplete or mismatched setup fields before upload or durable dispatch", async () => {
+    const network = fakeNetwork();
+    const extension: MobileExtension = { ...mobileExtensionFixture(), setup: {
+      state: "inProgress",
+      attemptId: "attempt-1",
+      revision: 1n,
+      fields: [
+        { fieldId: "region", label: "Region", description: "Region", kind: "text", required: true,
+          configured: false, options: ["east", "west"] },
+        { fieldId: "oauth", label: "OAuth", description: "OAuth token", kind: "oauth", required: true,
+          configured: false, options: [] }
+      ]
+    } };
+    network.getExtension = vi.fn(async () => extension);
+    const app = client(network, memoryStorage(credential).storage);
+    await app.start();
+    const transport = app.extensionCatalogTransport()!;
+    const signal = new AbortController().signal;
+
+    await expect(transport.completeSetup(extension, signal)).rejects.toThrow(/required/u);
+    await expect(transport.submitSetupInteraction(extension, "region", "north", signal)).rejects.toThrow(/choices/u);
+    await expect(transport.saveSetupCredential(
+      extension, "oauth", "apiKey", "temporary-private-value", signal
+    )).rejects.toThrow(/OAuth/u);
+    expect(network.uploadExtensionSetupCredential).not.toHaveBeenCalled();
+    expect(network.submit).not.toHaveBeenCalled();
+  });
+
+  it("retires a setup credential ticket response when its authenticated owner changes before commit", async () => {
+    const network = fakeNetwork();
+    const saved = memoryStorage(credential);
+    const extension: MobileExtension = { ...mobileExtensionFixture(), setup: {
+      state: "inProgress",
+      attemptId: "attempt-1",
+      revision: 1n,
+      fields: [{ fieldId: "token", label: "Token", description: "Protected token", kind: "secret",
+        required: true, configured: false, options: [] }]
+    } };
+    network.getExtension = vi.fn(async () => extension);
+    let finish!: (ticketId: string) => void;
+    let uploadSignal: AbortSignal | undefined;
+    network.uploadExtensionSetupCredential = vi.fn((_credential, _extensionId, _attemptId, _fieldId, _kind,
+      _secret, signal) => {
+      uploadSignal = signal;
+      return new Promise<string>((resolve) => { finish = resolve; });
+    });
+    const app = client(network, saved.storage);
+    await app.start();
+
+    const change = app.extensionCatalogTransport()!.saveSetupCredential(
+      extension, "token", "apiKey", "temporary-private-value", new AbortController().signal
+    );
+    await vi.waitFor(() => expect(network.uploadExtensionSetupCredential).toHaveBeenCalledOnce());
+    app.setForeground(false);
+    expect(uploadSignal?.aborted).toBe(true);
+    finish("credential-ticket");
+
+    await expect(change).rejects.toThrow(/owner changed|cancelled/u);
+    expect(network.submit).not.toHaveBeenCalled();
+    expect(saved.pending()).toEqual([]);
+  });
+
+  it("retains an unknown Extension receipt, blocks replay, and only clears it from a typed terminal acknowledgement", async () => {
+    const network = fakeNetwork();
+    const saved = memoryStorage(credential);
+    let extension = mobileExtensionFixture();
+    network.listExtensions = vi.fn(async () => ({ revision: 4n, recoveredFromCorruption: false, extensions: [extension] }));
+    network.getExtension = vi.fn(async () => extension);
+    vi.mocked(network.submit).mockRejectedValueOnce(new Error("transport closed"));
+    const app = client(network, saved.storage, undefined, undefined, () => "extension-unknown");
+    await app.start();
+
+    await expect(app.extensionCatalogTransport()!.setEnabled(
+      extension,
+      false,
+      new AbortController().signal
+    )).rejects.toThrow(/unknown/u);
+    expect(extension.enabled).toBe(true);
+    expect(saved.pending()).toEqual([expect.objectContaining({
+      operationId: "extension-unknown",
+      kind: "extension-enabled",
+      extensionId: extension.extensionId,
+      extensionRevision: "1",
+      state: "unknown"
+    })]);
+    await expect(app.extensionCatalogTransport()!.setEnabled(
+      extension,
+      false,
+      new AbortController().signal
+    )).rejects.toThrow(/unresolved result/u);
+    expect(network.submit).toHaveBeenCalledTimes(1);
+
+    extension = { ...extension, revision: 2n, enabled: false };
+    network.getOperation = vi.fn(async (_credential, operationId) => create(OperationSchema, {
+      operationId,
+      connectionId: credential.connectionId,
+      state: OperationState.SUCCEEDED,
+      result: { payload: { case: "acknowledgement", value: create(AcknowledgementSchema, { accepted: true }) } }
+    }));
+    await app.extensionCatalogTransport()!.reconcile("extension-unknown", new AbortController().signal);
+    expect(saved.pending()).toEqual([]);
+    expect(network.submit).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps the receipt when a successful Extension operation lacks its accepted acknowledgement", async () => {
+    const network = fakeNetwork();
+    const saved = memoryStorage(credential);
+    const extension = mobileExtensionFixture();
+    network.getExtension = vi.fn(async () => extension);
+    network.submit = vi.fn(async (_credential, operationId) => create(OperationSchema, {
+      operationId,
+      connectionId: credential.connectionId,
+      state: OperationState.SUCCEEDED
+    }));
+    const app = client(network, saved.storage, undefined, undefined, () => "extension-malformed");
+    await app.start();
+
+    await expect(app.extensionCatalogTransport()!.setEnabled(
+      extension,
+      false,
+      new AbortController().signal
+    )).rejects.toThrow(/accepted acknowledgement/u);
+    expect(saved.pending()).toEqual([expect.objectContaining({
+      operationId: "extension-malformed",
+      kind: "extension-enabled",
+      extensionId: extension.extensionId
+    })]);
+
+    network.getOperation = vi.fn(async () => create(OperationSchema, {
+      operationId: "extension-malformed",
+      connectionId: credential.connectionId,
+      state: OperationState.SUCCEEDED
+    }));
+    await app.extensionCatalogTransport()!.reconcile("extension-malformed", new AbortController().signal);
+    expect(saved.pending()).toHaveLength(1);
+    expect(app.state.error).toMatch(/accepted acknowledgement/u);
+  });
+
+  it("retires a late Extension mutation result with its authenticated owner", async () => {
+    const network = fakeNetwork();
+    const saved = memoryStorage(credential);
+    const extension = mobileExtensionFixture();
+    network.getExtension = vi.fn(async () => extension);
+    let finish!: (operation: Operation) => void;
+    network.submit = vi.fn((_credential, operationId) => new Promise<Operation>((resolve) => {
+      expect(operationId).toBe("extension-late");
+      finish = resolve;
+    }));
+    const app = client(network, saved.storage, undefined, undefined, () => "extension-late");
+    await app.start();
+    const change = app.extensionCatalogTransport()!.setEnabled(extension, false, new AbortController().signal);
+    await vi.waitFor(() => expect(network.submit).toHaveBeenCalledOnce());
+
+    app.setForeground(false);
+    finish(create(OperationSchema, {
+      operationId: "extension-late",
+      connectionId: credential.connectionId,
+      state: OperationState.SUCCEEDED,
+      result: { payload: { case: "acknowledgement", value: create(AcknowledgementSchema, { accepted: true }) } }
+    }));
+
+    await expect(change).rejects.toThrow(/owner changed|cancelled/u);
+    expect(saved.pending()).toEqual([expect.objectContaining({
+      operationId: "extension-late",
+      kind: "extension-enabled",
+      state: "unknown"
+    })]);
+    expect(network.listExtensions).not.toHaveBeenCalled();
+  });
+
+  it("projects exact live task destinations and durably prefills a Resource-owned new task", async () => {
+    const network = fakeNetwork();
+    const owner = mobileExtensionOwnerSnapshot();
+    const command = { name: "review", description: "Review mail.", sessionId: "session" };
+    const extension = { ...mobileExtensionFixture(), commands: [command] };
+    network.readOwner = vi.fn(async () => ({ connection, device, snapshot: owner }));
+    network.readSession = vi.fn(async () => owner);
+    network.getExtensionForRuntime = vi.fn(async (_credential, _extensionId, sessionId) => ({
+      ...extension,
+      commands: [{ ...command, sessionId }]
+    }));
+    const drafts = memoryDraftStores();
+    drafts.newTask.save({ profileId: credential.profileId }, {
+      targetId: "",
+      name: "Keep title",
+      input: plainTextMobileComposerDraft("/old keep this")
+    });
+    await drafts.newTask.flush({ profileId: credential.profileId });
+    const saved = memoryStorage(credential);
+    vi.mocked(saved.storage.loadSelection).mockResolvedValue(undefined);
+    const app = client(network, saved.storage, undefined, undefined, undefined, undefined, drafts);
+    await app.start();
+    const transport = app.extensionCatalogTransport()!;
+
+    expect(transport.tasks(extension)).toEqual([{
+      sessionId: "session",
+      displayName: "Task",
+      targetName: "Project"
+    }]);
+    await expect(transport.useCommand(
+      extension,
+      command,
+      { kind: "newTask" },
+      new AbortController().signal
+    )).resolves.toEqual({ kind: "newTask" });
+
+    expect(await drafts.newTask.read({ profileId: credential.profileId })).toMatchObject({
+      targetId: "target",
+      name: "Keep title",
+      input: { text: "/review keep this", slashCommands: [] }
+    });
+    expect(network.getExtensionForRuntime).toHaveBeenCalledExactlyOnceWith(
+      credential,
+      extension.extensionId,
+      "session",
+      expect.any(AbortSignal)
+    );
+    expect(network.submit).not.toHaveBeenCalled();
+  });
+
+  it("revalidates in the destination runtime, preserves the task draft, and selects it without auto-send", async () => {
+    const network = fakeNetwork();
+    const owner = mobileExtensionOwnerSnapshot();
+    const command = { name: "review", description: "Review mail.", sessionId: "session" };
+    const extension = { ...mobileExtensionFixture(), commands: [command] };
+    network.readOwner = vi.fn(async () => ({ connection, device, snapshot: owner }));
+    network.readSession = vi.fn(async () => owner);
+    network.getExtensionForRuntime = vi.fn(async (_credential, _extensionId, sessionId) => ({
+      ...extension,
+      commands: [{ ...command, sessionId }]
+    }));
+    const drafts = memoryDraftStores();
+    const identity = { profileId: credential.profileId, sessionId: "session" };
+    const original = localAttachmentDraft("/old keep this");
+    drafts.composer.save(identity, original);
+    await drafts.composer.flush(identity);
+    const app = client(network, memoryStorage(credential).storage,
+      undefined, undefined, undefined, undefined, drafts);
+    await app.start();
+
+    await expect(app.extensionCatalogTransport()!.useCommand(
+      extension,
+      command,
+      { kind: "task", sessionId: "session" },
+      new AbortController().signal
+    )).resolves.toEqual({ kind: "task", sessionId: "session" });
+
+    const retained = await drafts.composer.read(identity);
+    expect(retained).toMatchObject({
+      text: "/review keep this",
+      slashCommands: [{ text: "/review", start: 0, end: 7 }]
+    });
+    expect(retained?.attachments).toEqual(original.attachments);
+    expect(app.state.selectedId).toBe("session");
+    expect(network.getExtensionForRuntime).toHaveBeenCalledExactlyOnceWith(
+      credential,
+      extension.extensionId,
+      "session",
+      expect.any(AbortSignal)
+    );
+    expect(network.submit).not.toHaveBeenCalled();
+  });
+
+  it("rejects runtime drift before editing and rolls back an exact draft when selection fails", async () => {
+    const network = fakeNetwork();
+    const owner = mobileExtensionOwnerSnapshot();
+    const command = { name: "review", description: "Review mail.", sessionId: "session" };
+    const extension = { ...mobileExtensionFixture(), commands: [command] };
+    network.readOwner = vi.fn(async () => ({ connection, device, snapshot: owner }));
+    network.readSession = vi.fn(async () => owner);
+    const drafts = memoryDraftStores();
+    const identity = { profileId: credential.profileId, sessionId: "session" };
+    const original = plainTextMobileComposerDraft("Keep this exact draft");
+    drafts.composer.save(identity, original);
+    await drafts.composer.flush(identity);
+    const saved = memoryStorage(credential);
+    const app = client(network, saved.storage, undefined, undefined, undefined, undefined, drafts);
+    await app.start();
+
+    network.getExtensionForRuntime = vi.fn(async () => ({ ...extension, revision: 2n,
+      commands: [{ ...command, sessionId: "session" }] }));
+    await expect(app.extensionCatalogTransport()!.useCommand(
+      extension,
+      command,
+      { kind: "task", sessionId: "session" },
+      new AbortController().signal
+    )).rejects.toThrow(/changed/u);
+    expect(await drafts.composer.read(identity)).toEqual(original);
+
+    network.getExtensionForRuntime = vi.fn(async () => extension);
+    vi.mocked(saved.storage.saveSelection).mockRejectedValueOnce(new Error("selection storage unavailable"));
+    await expect(app.extensionCatalogTransport()!.useCommand(
+      extension,
+      command,
+      { kind: "task", sessionId: "session" },
+      new AbortController().signal
+    )).rejects.toThrow(/selection storage unavailable/u);
+    expect(await drafts.composer.read(identity)).toEqual(original);
+    expect(network.submit).not.toHaveBeenCalled();
+  });
+
+  it("opens, probes, and closes a main-view lease only for the exact ready Resource authority", async () => {
+    const network = fakeNetwork();
+    const extension: MobileExtension = {
+      ...mobileExtensionFixture(),
+      sidebarSupported: true,
+      sidebarVisible: true,
+      mainView: { title: "Mail", icon: "layout" }
+    };
+    const surface = mobileExtensionMainViewSurface(extension);
+    network.getExtension = vi.fn(async () => extension);
+    network.openExtensionMainView = vi.fn(async () => surface);
+    network.getExtensionMainViewSurface = vi.fn(async () => surface);
+    const app = client(network, memoryStorage(credential).storage);
+    await app.start();
+    const transport = app.extensionCatalogTransport()!;
+
+    const opened = await transport.openMainView(extension, new AbortController().signal);
+    expect(opened).toEqual(surface);
+    expect(network.openExtensionMainView).toHaveBeenCalledWith(
+      credential,
+      extension.extensionId,
+      extension.revision,
+      expect.any(AbortSignal)
+    );
+    await expect(transport.probeMainView(opened, new AbortController().signal)).resolves.toEqual(surface);
+    await expect(transport.closeMainView(opened)).resolves.toBe(true);
+    expect(network.closeExtensionMainView).toHaveBeenCalledWith(credential, surface.surfaceId);
+
+    network.getExtension = vi.fn(async () => ({ ...extension, enabled: false }));
+    await expect(app.extensionCatalogTransport()!.openMainView(extension, new AbortController().signal))
+      .rejects.toThrow(/changed/u);
+    expect(network.openExtensionMainView).toHaveBeenCalledTimes(1);
+  });
+
+  it("closes a late main-view lease after owner retirement and rejects a changed probe", async () => {
+    const network = fakeNetwork();
+    const extension: MobileExtension = {
+      ...mobileExtensionFixture(),
+      sidebarSupported: true,
+      sidebarVisible: true,
+      mainView: { title: "Mail", icon: "layout" }
+    };
+    const surface = mobileExtensionMainViewSurface(extension);
+    network.getExtension = vi.fn(async () => extension);
+    let finish!: (surface: MobileExtensionMainViewSurface) => void;
+    network.openExtensionMainView = vi.fn(() => new Promise<MobileExtensionMainViewSurface>(
+      (resolve) => { finish = resolve; }
+    ));
+    const app = client(network, memoryStorage(credential).storage);
+    await app.start();
+    const opening = app.extensionCatalogTransport()!.openMainView(extension, new AbortController().signal);
+    await vi.waitFor(() => expect(network.openExtensionMainView).toHaveBeenCalledOnce());
+    app.setForeground(false);
+    finish(surface);
+    await expect(opening).rejects.toThrow(/owner changed|cancelled/u);
+    expect(network.closeExtensionMainView).toHaveBeenCalledWith(credential, surface.surfaceId);
+
+    app.setForeground(true);
+    await app.refresh();
+    network.getExtensionMainViewSurface = vi.fn(async () => ({ ...surface, backendGeneration: 8 }));
+    await expect(app.extensionCatalogTransport()!.probeMainView(surface, new AbortController().signal))
+      .rejects.toThrow(/changed|expired/u);
+  });
+
+  it("fences Library sessions and calls by exact Extension, surface occurrence and original connection", async () => {
+    const network = fakeNetwork();
+    const extension: MobileExtension = { ...mobileExtensionFixture(), sidebarSupported: true,
+      mainView: { title: "Mail" }, library: { schemaVersion: 1 } };
+    const surface = mobileExtensionMainViewSurface(extension);
+    const session: MobileExtensionLibrarySession = { id: `library_session_${"a".repeat(32)}`, extensionId: extension.extensionId,
+      expiresAt: Date.now() + 60_000, bindingGeneration: 2n, limits: {
+        maximumReadBytes: 16n * 1024n ** 2n, maximumWriteBytes: 16n * 1024n ** 2n, maximumStreamBytes: 8n * 1024n ** 3n,
+        maximumPathCharacters: 512, maximumPathSegments: 32, maximumListPageSize: 500, maximumFiles: 50_000,
+        softLimitBytes: 8n * 1024n ** 3n, diskReserveBytes: 1024n ** 3n
+      } };
+    network.getExtension = vi.fn(async () => extension);
+    network.getExtensionMainViewSurface = vi.fn(async () => surface);
+    network.openExtensionLibrary = vi.fn(async () => session);
+    network.callExtensionLibrary = vi.fn(async () => ({ kind: "read" as const, path: "mail", content: Uint8Array.of(1), sha256: "f".repeat(64) }));
+    const app = client(network, memoryStorage(credential).storage);
+    await app.start();
+    const transport = app.extensionCatalogTransport()!, signal = new AbortController().signal;
+    const opened = await transport.openLibrary(extension, surface, signal);
+    await expect(transport.callLibrary(extension, surface, opened, { kind: "read", path: "mail" }, signal))
+      .resolves.toMatchObject({ kind: "read", path: "mail" });
+    await expect(transport.callLibrary(extension, surface, { ...opened }, { kind: "read", path: "mail" }, signal))
+      .rejects.toThrow(/not owned/u);
+    expect(network.callExtensionLibrary).toHaveBeenCalledTimes(1);
+    network.getExtensionMainViewSurface = vi.fn(async () => ({ ...surface, backendGeneration: surface.backendGeneration + 1 }));
+    await expect(transport.callLibrary(extension, surface, opened, { kind: "read", path: "mail" }, signal))
+      .rejects.toThrow(/changed/u);
+    expect(network.closeExtensionLibrary).toHaveBeenCalledExactlyOnceWith(credential, session.id);
+
+    network.getExtensionMainViewSurface = vi.fn(async () => surface);
+    let finish!: (value: MobileExtensionLibrarySession) => void;
+    network.openExtensionLibrary = vi.fn(() => new Promise<MobileExtensionLibrarySession>((resolve) => { finish = resolve; }));
+    const opening = app.extensionCatalogTransport()!.openLibrary(extension, surface, signal);
+    await vi.waitFor(() => expect(network.openExtensionLibrary).toHaveBeenCalledOnce());
+    app.setForeground(false);
+    finish(session);
+    await expect(opening).rejects.toThrow(/owner changed|cancelled/u);
+    expect(network.closeExtensionLibrary).toHaveBeenCalledTimes(2);
+  });
+
+  it("loads active Library state only when ready while retaining exact recovery records", async () => {
+    const network = fakeNetwork();
+    const extension = { ...mobileExtensionFixture(), library: { schemaVersion: 1 as const } };
+    const overview = mobileExtensionLibraryOverview(extension);
+    const trash = mobileExtensionLibraryTrash(extension);
+    network.getExtension = vi.fn(async () => extension);
+    network.getExtensionLibraryOverview = vi.fn(async () => overview);
+    network.listExtensionLibraryTrash = vi.fn(async () => [trash]);
+    network.listExtensionLibraryGrace = vi.fn(async () => []);
+    const app = client(network, memoryStorage(credential).storage);
+    await app.start();
+
+    await expect(app.extensionCatalogTransport()!.loadLibrary(extension, new AbortController().signal))
+      .resolves.toEqual({ overview, trash: [trash], grace: [] });
+    expect(network.getExtensionLibraryOverview).toHaveBeenCalledExactlyOnceWith(
+      credential,
+      extension.extensionId,
+      extension.revision,
+      expect.any(AbortSignal)
+    );
+
+    const disabled = { ...extension, enabled: false };
+    network.getExtension = vi.fn(async () => disabled);
+    await expect(app.extensionCatalogTransport()!.loadLibrary(disabled, new AbortController().signal))
+      .resolves.toEqual({ trash: [trash], grace: [] });
+    expect(network.getExtensionLibraryOverview).toHaveBeenCalledTimes(1);
+  });
+
+  it("revalidates a custom Library destination and complete snapshot before a non-optimistic move", async () => {
+    const network = fakeNetwork();
+    const extension = { ...mobileExtensionFixture(), library: { schemaVersion: 1 as const } };
+    const overview = mobileExtensionLibraryOverview(extension);
+    const snapshot: MobileExtensionLibrarySnapshot = { overview, trash: [], grace: [] };
+    const validation: MobileExtensionLibraryLocationValidation = {
+      libraryRoot: "E:\\Libraries\\mail",
+      warnings: ["cloud_sync_location"],
+      diskFreeBytes: 8_192n
+    };
+    network.getExtension = vi.fn(async () => extension);
+    network.getExtensionLibraryOverview = vi.fn(async () => overview);
+    network.listExtensionLibraryTrash = vi.fn(async () => []);
+    network.listExtensionLibraryGrace = vi.fn(async () => []);
+    network.validateExtensionLibraryLocation = vi.fn(async () => validation);
+    network.relocateExtensionLibrary = vi.fn(async () => undefined);
+    const app = client(network, memoryStorage(credential).storage);
+    await app.start();
+    const transport = app.extensionCatalogTransport()!;
+
+    await expect(transport.validateLibraryLocation(extension, " E:\\Libraries ", new AbortController().signal))
+      .resolves.toBe(validation);
+    await expect(transport.mutateLibrary(extension, snapshot, {
+      kind: "relocate",
+      destination: { kind: "custom", candidate: "E:\\Libraries", validation }
+    }, new AbortController().signal)).resolves.toEqual(snapshot);
+    expect(network.validateExtensionLibraryLocation).toHaveBeenLastCalledWith(
+      credential,
+      extension.extensionId,
+      extension.revision,
+      "E:\\Libraries",
+      expect.any(AbortSignal)
+    );
+    expect(network.relocateExtensionLibrary).toHaveBeenCalledExactlyOnceWith(
+      credential,
+      extension.extensionId,
+      extension.revision,
+      { kind: "custom", candidate: "E:\\Libraries" },
+      expect.any(AbortSignal)
+    );
+
+    await expect(transport.mutateLibrary(extension, snapshot, {
+      kind: "relocate",
+      destination: { kind: "custom", candidate: "E:\\Libraries", validation: { ...validation, warnings: [] } }
+    }, new AbortController().signal)).rejects.toThrow(/validation changed/u);
+    expect(network.relocateExtensionLibrary).toHaveBeenCalledTimes(1);
+
+    network.getExtensionLibraryOverview = vi.fn(async () => ({ ...overview, bytes: 99n }));
+    await expect(transport.mutateLibrary(extension, snapshot, {
+      kind: "relocate",
+      destination: { kind: "default" }
+    }, new AbortController().signal)).rejects.toThrow(/changed/u);
+    expect(network.relocateExtensionLibrary).toHaveBeenCalledTimes(1);
+  });
+
+  it("restores only an exact current trash record and retires a late Library action with its owner", async () => {
+    const network = fakeNetwork();
+    const extension = { ...mobileExtensionFixture(), library: { schemaVersion: 1 as const } };
+    const overview = mobileExtensionLibraryOverview(extension);
+    const trash = mobileExtensionLibraryTrash(extension);
+    let trashRecords: readonly MobileExtensionLibraryTrashEntry[] = [trash];
+    network.getExtension = vi.fn(async () => extension);
+    network.getExtensionLibraryOverview = vi.fn(async () => overview);
+    network.listExtensionLibraryTrash = vi.fn(async () => trashRecords);
+    network.listExtensionLibraryGrace = vi.fn(async () => []);
+    network.restoreExtensionLibraryTrash = vi.fn(async () => { trashRecords = []; });
+    const app = client(network, memoryStorage(credential).storage);
+    await app.start();
+    const transport = app.extensionCatalogTransport()!;
+    const snapshot: MobileExtensionLibrarySnapshot = { overview, trash: [trash], grace: [] };
+
+    await expect(transport.mutateLibrary(extension, snapshot, {
+      kind: "restore",
+      entry: trash,
+      confirmation: trash.name,
+      destination: "original"
+    }, new AbortController().signal)).resolves.toEqual({ overview, trash: [], grace: [] });
+    expect(network.restoreExtensionLibraryTrash).toHaveBeenCalledExactlyOnceWith(
+      credential,
+      extension.extensionId,
+      trash.id,
+      trash.name,
+      "original",
+      expect.any(AbortSignal)
+    );
+
+    trashRecords = [trash];
+    let finish!: () => void;
+    network.relocateExtensionLibrary = vi.fn(() => new Promise<void>((resolve) => { finish = resolve; }));
+    const pending = app.extensionCatalogTransport()!.mutateLibrary(extension, snapshot, {
+      kind: "relocate",
+      destination: { kind: "default" }
+    }, new AbortController().signal);
+    await vi.waitFor(() => expect(network.relocateExtensionLibrary).toHaveBeenCalledOnce());
+    app.setForeground(false);
+    finish();
+    await expect(pending).rejects.toThrow(/owner changed|cancelled|not confirmed/u);
+    expect(network.relocateExtensionLibrary).toHaveBeenCalledTimes(1);
+  });
+
+  it("marks a dispatched Library action unknown when authoritative refresh fails but preserves local precondition errors", async () => {
+    const network = fakeNetwork();
+    const extension = { ...mobileExtensionFixture(), library: { schemaVersion: 1 as const } };
+    const overview = mobileExtensionLibraryOverview(extension);
+    const snapshot: MobileExtensionLibrarySnapshot = { overview, trash: [], grace: [] };
+    network.getExtension = vi.fn(async () => extension);
+    network.getExtensionLibraryOverview = vi.fn()
+      .mockResolvedValueOnce(overview)
+      .mockRejectedValueOnce(new Error("refresh offline"));
+    network.listExtensionLibraryTrash = vi.fn(async () => []);
+    network.listExtensionLibraryGrace = vi.fn(async () => []);
+    network.relocateExtensionLibrary = vi.fn(async () => undefined);
+    const app = client(network, memoryStorage(credential).storage);
+    await app.start();
+    const transport = app.extensionCatalogTransport()!;
+
+    await expect(transport.mutateLibrary(extension, snapshot, {
+      kind: "relocate",
+      destination: { kind: "default" }
+    }, new AbortController().signal)).rejects.toThrow(/could not be confirmed.*not resent.*refresh offline/u);
+    expect(network.relocateExtensionLibrary).toHaveBeenCalledOnce();
+
+    const unavailable = {
+      ...overview,
+      state: "unavailable" as const,
+      unavailableReason: "io" as const
+    };
+    network.getExtensionLibraryOverview = vi.fn(async () => unavailable);
+    await expect(transport.mutateLibrary(extension, { ...snapshot, overview: unavailable }, {
+      kind: "relocate",
+      destination: { kind: "default" }
+    }, new AbortController().signal)).rejects.toThrow(/^Repair or rebind/u);
+    expect(network.relocateExtensionLibrary).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe("mobile Partner private authority", () => {
+  it("previews authorized Partner Artifacts and opens only the revalidated canonical task", async () => {
+    const network = fakeNetwork();
+    const partner = { partnerId: "partner-a", displayName: "A", avatar: "standard",
+      lifecycle: "active" as const, initializationState: "ready" as const, profileVersion: 3,
+      canonicalSessionId: "session" };
+    network.listPartners = vi.fn(async () => [partner]);
+    network.listPartnerSessions = vi.fn(async () => create(ListPartnerSessionsResponseSchema, {
+      sessions: [{ partnerId: "partner-a", sessionId: "session", role: PartnerSessionRole.CANONICAL,
+        profileVersion: 3n, displayName: "A task", available: true, readOnly: false, deleted: false,
+        archived: false, createdAt: { seconds: 1n }, lastActivityAt: { seconds: 2n } }]
+    }));
+    network.listSessionArtifacts = vi.fn(async () => ({ artifacts: [create(ArtifactSchema, {
+      artifactId: "partner-report", sessionId: "session", kind: ArtifactKind.FILE, title: "Report",
+      createdAt: { seconds: 2n }, blob: create(BlobRefSchema, {
+        blobId: "partner-report-blob", fileName: "report.txt", mediaType: "text/plain",
+        byteSize: 4n, sha256Hex: "a".repeat(64), disposition: BlobDisposition.ARTIFACT
+      })
+    })], revision: "partner-artifacts-r1" }));
+    const app = client(network, memoryStorage(credential).storage);
+    await app.start();
+
+    const transport = app.partnerResourceTransport()!;
+    expect(await transport.list(new AbortController().signal)).toEqual([partner]);
+    const preview = await transport.preview("partner-a", new AbortController().signal);
+    expect(preview).toMatchObject({ session: { sessionId: "session", profileVersion: 3 },
+      artifacts: [{ artifactId: "partner-report", title: "Report" }] });
+    await expect(transport.open(preview, new AbortController().signal)).resolves.toBe("session");
+    expect(app.state.selectedId).toBe("session");
+    expect(network.listPartnerSessions).toHaveBeenCalledTimes(3);
+  });
+
+  it("retires late Partner Resource reads and refuses a changed preview before selection", async () => {
+    const network = fakeNetwork();
+    const partner = { partnerId: "partner-a", displayName: "A", avatar: "standard",
+      lifecycle: "active" as const, initializationState: "ready" as const, profileVersion: 3,
+      canonicalSessionId: "session" };
+    let finish!: (value: Awaited<ReturnType<MobileNetwork["listPartners"]>>) => void;
+    network.listPartners = vi.fn(() => new Promise<Awaited<ReturnType<MobileNetwork["listPartners"]>>>(
+      (resolve) => { finish = resolve; }
+    ));
+    const app = client(network, memoryStorage(credential).storage);
+    await app.start();
+    const transport = app.partnerResourceTransport()!;
+    const late = transport.list(new AbortController().signal);
+    app.setForeground(false);
+    finish([partner]);
+    await expect(late).rejects.toThrow(/owner changed/u);
+
+    app.setForeground(true);
+    await app.refresh();
+    network.listPartners = vi.fn(async () => [partner]);
+    network.listPartnerSessions = vi.fn(async () => create(ListPartnerSessionsResponseSchema, {
+      sessions: [{ partnerId: "partner-a", sessionId: "session", role: PartnerSessionRole.CANONICAL,
+        profileVersion: 3n, displayName: "A task", available: true, readOnly: false, deleted: false,
+        archived: false, createdAt: { seconds: 1n } }]
+    }));
+    network.listSessionArtifacts = vi.fn(async () => ({ artifacts: [], revision: "partner-artifacts-r1" }));
+    const current = app.partnerResourceTransport()!;
+    const preview = await current.preview("partner-a", new AbortController().signal);
+    network.listPartners = vi.fn(async () => [{ ...partner, profileVersion: 4 }]);
+    const select = vi.spyOn(app, "select");
+    await expect(current.open(preview, new AbortController().signal)).rejects.toThrow(/changed/u);
+    expect(select).not.toHaveBeenCalled();
+  });
+
+  it("does not report a Partner Resource open after selection retires its owner", async () => {
+    const network = fakeNetwork();
+    const partner = { partnerId: "partner-a", displayName: "A", avatar: "standard",
+      lifecycle: "active" as const, initializationState: "ready" as const, profileVersion: 3,
+      canonicalSessionId: "session" };
+    network.listPartners = vi.fn(async () => [partner]);
+    network.listPartnerSessions = vi.fn(async () => create(ListPartnerSessionsResponseSchema, {
+      sessions: [{ partnerId: "partner-a", sessionId: "session", role: PartnerSessionRole.CANONICAL,
+        profileVersion: 3n, displayName: "A task", available: true, readOnly: false, deleted: false,
+        archived: false, createdAt: { seconds: 1n } }]
+    }));
+    network.listSessionArtifacts = vi.fn(async () => ({ artifacts: [], revision: "partner-artifacts-r1" }));
+    const app = client(network, memoryStorage(credential).storage);
+    await app.start();
+    const transport = app.partnerResourceTransport()!;
+    const preview = await transport.preview("partner-a", new AbortController().signal);
+    vi.spyOn(app, "select").mockImplementation(async () => { app.setForeground(false); });
+
+    await expect(transport.open(preview, new AbortController().signal)).rejects.toThrow(/owner changed/u);
+  });
+
   it("revalidates a task preview against its exact canonical Partner Session and target participant", async () => {
     const network = fakeNetwork();
     network.listPartners = vi.fn(async () => [{ partnerId: "partner-a", displayName: "A", avatar: "standard",
@@ -1779,7 +2801,7 @@ describe("mobile Partner private authority", () => {
       canonicalSessionId: "session" }]);
     network.listPartnerSessions = vi.fn(async () => create(ListPartnerSessionsResponseSchema, {
       sessions: [{ partnerId: "partner-a", sessionId: "session", role: PartnerSessionRole.CANONICAL,
-        available: true, readOnly: false, deleted: false, archived: false }]
+        profileVersion: 1n, available: true, readOnly: false, deleted: false, archived: false }]
     }));
     network.listPartnerPrivateThreads = vi.fn(async () => [{
       threadId: "private-thread", firstPartnerId: "partner-a", secondPartnerId: "partner-b",
@@ -1837,6 +2859,95 @@ describe("mobile Partner private authority", () => {
     expect(app.state.partnerPrivate.status).toBe("offline");
   });
 });
+
+function mobileExtensionFixture(): MobileExtension {
+  return {
+    extensionId: "extension_0123456789abcdef0123456789abcdef",
+    revision: 1n,
+    owner: {
+      kind: "resource",
+      resourceId: "resource-1",
+      discoveredRevision: `sha256:${"a".repeat(64)}`,
+      resourceRevision: 3n
+    },
+    source: "local",
+    installed: true,
+    installState: "installed",
+    name: "Mail",
+    description: "Review mail.",
+    enabled: true,
+    sidebarSupported: false,
+    sidebarVisible: false,
+    tools: [],
+    permissions: [],
+    commands: [],
+    setup: { state: "notRequired", revision: 0n, fields: [] },
+    useSupported: true,
+    updateAvailable: false
+  };
+}
+
+function mobileExtensionMainViewSurface(extension: MobileExtension): MobileExtensionMainViewSurface {
+  if (extension.owner.kind !== "resource") throw new Error("Resource Extension fixture required.");
+  const surfaceId = "extension_surface_11111111111111111111111111111111";
+  return {
+    surfaceId,
+    extensionId: extension.extensionId,
+    owner: extension.owner,
+    backendId: "backend",
+    backendRevision: 4n,
+    backendGeneration: 7,
+    url: `${credential.origin}/v1/extensions/main-views/${surfaceId}/${"b".repeat(64)}/index.html`,
+    ...(extension.mainView?.title === undefined ? {} : { title: extension.mainView.title }),
+    ...(extension.mainView?.icon === undefined ? {} : { icon: extension.mainView.icon }),
+    expiresAt: Date.now() + 60_000
+  };
+}
+
+function mobileExtensionLibraryOverview(extension: MobileExtension): MobileExtensionLibraryOverview {
+  return {
+    extensionId: extension.extensionId,
+    name: extension.name,
+    state: "ready",
+    location: { kind: "default", path: "D:\\Joko\\Libraries\\mail", generation: 1n },
+    files: 2,
+    bytes: 12n,
+    diskFreeBytes: 8_192n,
+    softLimitBytes: 1_024n,
+    softLimitExceeded: false,
+    orphaned: false,
+    trashCount: 1,
+    graceCount: 0
+  };
+}
+
+function mobileExtensionLibraryTrash(extension: MobileExtension): MobileExtensionLibraryTrashEntry {
+  return {
+    id: `library_trash_${"c".repeat(32)}`,
+    extensionId: extension.extensionId,
+    name: extension.name,
+    deletedAt: 1_000,
+    expiresAt: 2_000,
+    files: 2,
+    bytes: 12n
+  };
+}
+
+function mobileExtensionOwnerSnapshot(): Snapshot {
+  return create(SnapshotSchema, {
+    ...snapshot,
+    resources: [create(ManagedResourceSchema, {
+      resourceId: "resource-1",
+      backendId: "backend",
+      targetId: "target",
+      name: "Mail",
+      state: ResourceState.LOADED,
+      enabled: true,
+      discoveredRevision: `sha256:${"a".repeat(64)}`,
+      entityVersion: create(EntityVersionSchema, { revision: create(RevisionSchema, { value: 3n }) })
+    })]
+  });
+}
 
 describe("native mobile push authority", () => {
   it("binds registration to the exact current iOS profile, Connection, Device revision, and late-response fence", async () => {

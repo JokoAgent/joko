@@ -2477,6 +2477,7 @@ message PurgeExpiredExtensionLibrariesResponse {
 message OpenExtensionLibraryRequest {
   string extension_id = 1;
   Revision expected_revision = 2;
+  string surface_id = 3;
 }
 
 message OpenExtensionLibraryResponse {

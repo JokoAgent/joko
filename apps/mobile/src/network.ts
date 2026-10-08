@@ -3,7 +3,8 @@ import { createConnectTransport } from "@connectrpc/connect-web";
 import {
   ArtifactKind, ArtifactService, BlobDisposition, ConnectionService, DeviceKind, EventService, FileKind, ImageThumbnailUnavailableReason,
   MobilePushEnvironment as WireMobilePushEnvironment, MobilePushLocale as WireMobilePushLocale,
-  MobilePushProvider, OperationService, OperationState, PartnerService, RemoteDesktopService,
+  MobilePushProvider, OperationService, OperationState, PartnerService, RemoteDesktopService, ExtensionService,
+  ExtensionLibraryLocationKind,
   ResourceKind, SchedulerService, SessionService, TargetService, VoiceInputService, SettingsService, CredentialService, CredentialKind,
   type VoiceInputServiceSettings, type TestVoiceInputConnectionResponse,
   VoiceInputDictionaryEntrySource, VoiceInputDictionaryLearningActionType,
@@ -61,6 +62,38 @@ import {
   type MobilePartner, type MobilePrivateDetail, type MobilePrivateReadState,
   type MobilePrivateThread
 } from "./mobile-partner-private";
+import {
+  collectMobileExtensionCatalog,
+  projectMobileExtension,
+  projectMobileExtensionMainViewSurface,
+  type MobileExtension,
+  type MobileExtensionCatalog,
+  type MobileExtensionCredentialKind,
+  type MobileExtensionMainViewSurface
+} from "./mobile-extensions";
+import {
+  normalizeMobileExtensionLibraryCandidate,
+  projectMobileExtensionLibraryGraceList,
+  projectMobileExtensionLibraryLocation,
+  projectMobileExtensionLibraryLocationValidation,
+  projectMobileExtensionLibraryOverview,
+  projectMobileExtensionLibraryTrash,
+  projectMobileExtensionLibraryTrashList,
+  projectMobileExtensionLibraryWarnings,
+  type MobileExtensionLibraryGraceEntry,
+  type MobileExtensionLibraryLocationValidation,
+  type MobileExtensionLibraryOverview,
+  type MobileExtensionLibraryTrashEntry
+} from "./mobile-extension-library";
+import {
+  assertMobileExtensionLibraryCallResult,
+  mapMobileExtensionLibraryCall,
+  projectMobileExtensionLibraryCallResult,
+  projectMobileExtensionLibrarySession,
+  type MobileExtensionLibraryCall,
+  type MobileExtensionLibraryCallResult,
+  type MobileExtensionLibrarySession
+} from "./mobile-extension-library-runtime";
 
 export interface PairedCredential {
   readonly profileId: string;
@@ -159,6 +192,125 @@ export interface MobileNetwork {
     transfer: RemoteDesktopClipboardContentRequest, signal?: AbortSignal): Promise<RemoteDesktopClipboardContentResult>;
   listPartners(credential: PairedCredential, signal?: AbortSignal): Promise<readonly MobilePartner[]>;
   listPartnerSessions(credential: PairedCredential, partnerId: string, signal?: AbortSignal): Promise<ListPartnerSessionsResponse>;
+  listExtensions(credential: PairedCredential, signal?: AbortSignal): Promise<MobileExtensionCatalog>;
+  getExtension(credential: PairedCredential, extensionId: string, signal?: AbortSignal): Promise<MobileExtension>;
+  getExtensionForRuntime(
+    credential: PairedCredential,
+    extensionId: string,
+    sessionId: string,
+    signal?: AbortSignal
+  ): Promise<MobileExtension>;
+  openExtensionMainView(
+    credential: PairedCredential,
+    extensionId: string,
+    expectedRevision: bigint,
+    signal?: AbortSignal
+  ): Promise<MobileExtensionMainViewSurface>;
+  getExtensionMainViewSurface(
+    credential: PairedCredential,
+    surfaceId: string,
+    signal?: AbortSignal
+  ): Promise<MobileExtensionMainViewSurface>;
+  closeExtensionMainView(
+    credential: PairedCredential,
+    surfaceId: string,
+    signal?: AbortSignal
+  ): Promise<boolean>;
+  openExtensionLibrary(
+    credential: PairedCredential, extensionId: string, expectedRevision: bigint, surfaceId: string, signal?: AbortSignal
+  ): Promise<MobileExtensionLibrarySession>;
+  callExtensionLibrary(
+    credential: PairedCredential, sessionId: string, call: MobileExtensionLibraryCall, signal?: AbortSignal
+  ): Promise<MobileExtensionLibraryCallResult>;
+  closeExtensionLibrary(credential: PairedCredential, sessionId: string, signal?: AbortSignal): Promise<boolean>;
+  getExtensionLibraryOverview(
+    credential: PairedCredential,
+    extensionId: string,
+    expectedRevision: bigint,
+    signal?: AbortSignal
+  ): Promise<MobileExtensionLibraryOverview>;
+  validateExtensionLibraryLocation(
+    credential: PairedCredential,
+    extensionId: string,
+    expectedRevision: bigint,
+    candidate: string,
+    signal?: AbortSignal
+  ): Promise<MobileExtensionLibraryLocationValidation>;
+  relocateExtensionLibrary(
+    credential: PairedCredential,
+    extensionId: string,
+    expectedRevision: bigint,
+    destination: { readonly kind: "default" } | { readonly kind: "custom"; readonly candidate: string },
+    signal?: AbortSignal
+  ): Promise<void>;
+  rebindExtensionLibrary(
+    credential: PairedCredential,
+    extensionId: string,
+    expectedRevision: bigint,
+    candidate: string,
+    signal?: AbortSignal
+  ): Promise<void>;
+  unbindExtensionLibrary(
+    credential: PairedCredential,
+    extensionId: string,
+    expectedRevision: bigint,
+    signal?: AbortSignal
+  ): Promise<void>;
+  repairExtensionLibraryState(credential: PairedCredential, signal?: AbortSignal): Promise<void>;
+  repairExtensionLibraryMetadata(
+    credential: PairedCredential,
+    extensionId: string,
+    expectedRevision: bigint,
+    signal?: AbortSignal
+  ): Promise<void>;
+  trashExtensionLibrary(
+    credential: PairedCredential,
+    extensionId: string,
+    expectedRevision: bigint,
+    confirmation: string,
+    signal?: AbortSignal
+  ): Promise<void>;
+  listExtensionLibraryTrash(
+    credential: PairedCredential,
+    extensionId: string,
+    signal?: AbortSignal
+  ): Promise<readonly MobileExtensionLibraryTrashEntry[]>;
+  restoreExtensionLibraryTrash(
+    credential: PairedCredential,
+    extensionId: string,
+    trashId: string,
+    confirmation: string,
+    destination: "original" | "default",
+    signal?: AbortSignal
+  ): Promise<void>;
+  purgeExtensionLibraryTrash(
+    credential: PairedCredential,
+    extensionId: string,
+    trashId: string,
+    confirmation: string,
+    signal?: AbortSignal
+  ): Promise<void>;
+  listExtensionLibraryGrace(
+    credential: PairedCredential,
+    extensionId: string,
+    signal?: AbortSignal
+  ): Promise<readonly MobileExtensionLibraryGraceEntry[]>;
+  rollbackExtensionLibrary(
+    credential: PairedCredential,
+    extensionId: string,
+    expectedRevision: bigint,
+    graceId: string,
+    signal?: AbortSignal
+  ): Promise<void>;
+  uploadExtensionSetupCredential(
+    credential: PairedCredential,
+    extensionId: string,
+    attemptId: string,
+    fieldId: string,
+    kind: MobileExtensionCredentialKind,
+    secret: string,
+    signal?: AbortSignal
+  ): Promise<string>;
   listPartnerPrivateThreads(credential: PairedCredential, partnerId: string, signal?: AbortSignal): Promise<readonly MobilePrivateThread[]>;
   getPartnerPrivateThread(credential: PairedCredential, partnerId: string, threadId: string, signal?: AbortSignal): Promise<MobilePrivateDetail>;
   markPartnerPrivateThreadRead(credential: PairedCredential, partnerId: string, threadId: string,
@@ -870,6 +1022,38 @@ function authorizedBlobEndpoint(origin: string, relativeEndpoint: string): strin
   return endpoint.toString();
 }
 
+function authorizedExtensionCredentialEndpoint(origin: string, relativeEndpoint: string): string {
+  if (!relativeEndpoint.startsWith("/") || relativeEndpoint.startsWith("//") || relativeEndpoint.includes("\\")
+    || relativeEndpoint.includes("?") || relativeEndpoint.includes("#")) {
+    throw new Error("The Joko node returned a non-root-relative Extension credential endpoint.");
+  }
+  const base = new URL(normalizeNodeOrigin(origin));
+  const endpoint = new URL(relativeEndpoint, base);
+  if (endpoint.origin !== base.origin || endpoint.pathname !== relativeEndpoint
+    || endpoint.username !== "" || endpoint.password !== "") {
+    throw new Error("The Joko node returned a cross-origin Extension credential endpoint.");
+  }
+  return endpoint.toString();
+}
+
+function validExtensionSetupIdentity(value: string): boolean {
+  return value.length > 0 && value.length <= 512 && value === value.trim()
+    && !/[\u0000-\u001f\u007f]/u.test(value);
+}
+
+function assertExtensionLibraryAuthority(extensionId: string, expectedRevision: bigint): void {
+  if (!/^extension_[a-f0-9]{32}$/u.test(extensionId) || expectedRevision < 1n) {
+    throw new Error("A current Extension Library is required.");
+  }
+}
+
+function assertExtensionLibraryConfirmation(value: string): void {
+  if (value.length === 0 || value.length > 256 || value !== value.trim()
+    || /[\u0000-\u001f\u007f]/u.test(value)) {
+    throw new Error("Enter the exact current Extension Library name.");
+  }
+}
+
 function assertDownloadBlob(blob: BlobRef): void {
   if (!blob.blobId || !normalizeMediaType(blob.mediaType) || !/^[0-9a-f]{64}$/u.test(blob.sha256Hex)
     || blob.byteSize < 0n || blob.byteSize > BigInt(MOBILE_BLOB_PREVIEW_MAXIMUM_BYTES)) {
@@ -1361,6 +1545,337 @@ export const mobileNetwork: MobileNetwork = {
     if (!validMobilePartnerId(partnerId)) throw new Error("A valid Partner is required.");
     return createClient(PartnerService, transport(credential.origin, credential.authKey))
       .listPartnerSessions({ partnerId }, options(signal));
+  },
+  async listExtensions(credential, signal) {
+    const client = createClient(ExtensionService, transport(credential.origin, credential.authKey));
+    const requestSignal = signal ?? new AbortController().signal;
+    return collectMobileExtensionCatalog(async (pageToken, catalogSignal) => {
+      const response = await client.listExtensions({
+        installed: true,
+        query: "",
+        page: { pageSize: 500, pageToken }
+      }, options(catalogSignal));
+      catalogSignal.throwIfAborted();
+      const totalSize = response.page?.totalSize;
+      if (response.catalogRevision === undefined || response.page === undefined
+        || totalSize === undefined || totalSize > BigInt(Number.MAX_SAFE_INTEGER)) {
+        throw new Error("The Joko node did not return valid Extension catalog page metadata.");
+      }
+      return {
+        revision: response.catalogRevision.value,
+        recoveredFromCorruption: response.recoveredFromCorruption,
+        extensions: response.extensions,
+        nextPageToken: response.page.nextPageToken,
+        totalSize: Number(totalSize)
+      };
+    }, requestSignal);
+  },
+  async getExtension(credential, extensionId, signal) {
+    if (!/^extension_[a-f0-9]{32}$/u.test(extensionId)) throw new Error("A current Extension is required.");
+    const response = await createClient(ExtensionService, transport(credential.origin, credential.authKey))
+      .getExtension({ extensionId }, options(signal));
+    signal?.throwIfAborted();
+    if (response.catalogRevision?.value === undefined || response.catalogRevision.value < 0n
+      || response.extension === undefined || response.extension.extensionId !== extensionId) {
+      throw new Error("The Joko node returned a mismatched Extension detail.");
+    }
+    const extension = projectMobileExtension(response.extension);
+    if (!extension.installed) throw new Error("The selected Extension is no longer installed on this Joko node.");
+    return extension;
+  },
+  async getExtensionForRuntime(credential, extensionId, sessionId, signal) {
+    if (!/^extension_[a-f0-9]{32}$/u.test(extensionId)) throw new Error("A current Extension is required.");
+    if (!/^[a-zA-Z0-9_-]{1,128}$/u.test(sessionId)) throw new Error("A current task runtime is required.");
+    const response = await createClient(ExtensionService, transport(credential.origin, credential.authKey))
+      .getExtension({ extensionId, sessionId }, options(signal));
+    signal?.throwIfAborted();
+    if (response.catalogRevision?.value === undefined || response.catalogRevision.value < 0n
+      || response.extension === undefined || response.extension.extensionId !== extensionId) {
+      throw new Error("The Joko node returned a mismatched Extension detail.");
+    }
+    const extension = projectMobileExtension(response.extension);
+    if (!extension.installed) throw new Error("The selected Extension is no longer installed on this Joko node.");
+    return extension;
+  },
+  async openExtensionMainView(credential, extensionId, expectedRevision, signal) {
+    if (!/^extension_[a-f0-9]{32}$/u.test(extensionId) || expectedRevision < 1n) {
+      throw new Error("A current Extension main view is required.");
+    }
+    const response = await createClient(ExtensionService, transport(credential.origin, credential.authKey))
+      .openExtensionMainView({ extensionId, expectedRevision: { value: expectedRevision } }, options(signal));
+    signal?.throwIfAborted();
+    if (response.surface === undefined) throw new Error("The Joko node returned an empty Extension main-view surface.");
+    const surface = projectMobileExtensionMainViewSurface(response.surface, credential.origin);
+    if (surface.extensionId !== extensionId) throw new Error("The Joko node returned a mismatched Extension main-view surface.");
+    return surface;
+  },
+  async getExtensionMainViewSurface(credential, surfaceId, signal) {
+    if (!/^extension_surface_[a-f0-9]{32}$/u.test(surfaceId)) {
+      throw new Error("A current Extension main-view surface is required.");
+    }
+    const response = await createClient(ExtensionService, transport(credential.origin, credential.authKey))
+      .getExtensionMainViewSurface({ surfaceId }, options(signal));
+    signal?.throwIfAborted();
+    if (response.surface === undefined) throw new Error("The Joko node returned an empty Extension main-view probe.");
+    const surface = projectMobileExtensionMainViewSurface(response.surface, credential.origin);
+    if (surface.surfaceId !== surfaceId) throw new Error("The Joko node returned a mismatched Extension main-view probe.");
+    return surface;
+  },
+  async closeExtensionMainView(credential, surfaceId, signal) {
+    if (!/^extension_surface_[a-f0-9]{32}$/u.test(surfaceId)) {
+      throw new Error("A current Extension main-view surface is required.");
+    }
+    const response = await createClient(ExtensionService, transport(credential.origin, credential.authKey))
+      .closeExtensionMainView({ surfaceId }, options(signal));
+    signal?.throwIfAborted();
+    return response.closed;
+  },
+  async getExtensionLibraryOverview(credential, extensionId, expectedRevision, signal) {
+    assertExtensionLibraryAuthority(extensionId, expectedRevision);
+    const response = await createClient(ExtensionService, transport(credential.origin, credential.authKey))
+      .getExtensionLibraryOverview({ extensionId, expectedRevision: { value: expectedRevision } }, options(signal));
+    signal?.throwIfAborted();
+    if (response.library === undefined) throw new Error("The Joko node returned an empty Extension Library overview.");
+    return projectMobileExtensionLibraryOverview(response.library, extensionId);
+  },
+  async openExtensionLibrary(credential, extensionId, expectedRevision, surfaceId, signal) {
+    assertExtensionLibraryAuthority(extensionId, expectedRevision);
+    if (!/^extension_surface_[a-f0-9]{32}$/u.test(surfaceId)) throw new Error("A current Extension Library surface is required.");
+    const client = createClient(ExtensionService, transport(credential.origin, credential.authKey));
+    const response = await client.openExtensionLibrary({ extensionId, expectedRevision: { value: expectedRevision }, surfaceId }, options(signal));
+    try {
+      signal?.throwIfAborted();
+      if (response.library === undefined) throw new Error("The Joko node returned an empty Extension Library session.");
+      return projectMobileExtensionLibrarySession(response.library, extensionId);
+    } catch (error) {
+      if (/^library_session_[a-f0-9]{32}$/u.test(response.library?.sessionId ?? "")) {
+        void client.closeExtensionLibrary({ sessionId: response.library!.sessionId }, { timeoutMs: 5_000 }).catch(() => undefined);
+      }
+      throw error;
+    }
+  },
+  async callExtensionLibrary(credential, sessionId, call, signal) {
+    if (!/^library_session_[a-f0-9]{32}$/u.test(sessionId)) throw new Error("A current Extension Library session is required.");
+    const response = await createClient(ExtensionService, transport(credential.origin, credential.authKey))
+      .callExtensionLibrary({ sessionId, call: mapMobileExtensionLibraryCall(call) }, options(signal));
+    signal?.throwIfAborted();
+    if (response.result === undefined) throw new Error("The Joko node returned an empty Extension Library call result.");
+    const result = projectMobileExtensionLibraryCallResult(response.result);
+    assertMobileExtensionLibraryCallResult(result, call);
+    return result;
+  },
+  async closeExtensionLibrary(credential, sessionId, signal) {
+    if (!/^library_session_[a-f0-9]{32}$/u.test(sessionId)) throw new Error("A current Extension Library session is required.");
+    const response = await createClient(ExtensionService, transport(credential.origin, credential.authKey))
+      .closeExtensionLibrary({ sessionId }, { ...options(signal), timeoutMs: 5_000 });
+    signal?.throwIfAborted();
+    return response.closed;
+  },
+  async validateExtensionLibraryLocation(credential, extensionId, expectedRevision, candidate, signal) {
+    assertExtensionLibraryAuthority(extensionId, expectedRevision);
+    const exactCandidate = normalizeMobileExtensionLibraryCandidate(candidate);
+    const response = await createClient(ExtensionService, transport(credential.origin, credential.authKey))
+      .validateExtensionLibraryLocation({
+        extensionId,
+        expectedRevision: { value: expectedRevision },
+        candidate: exactCandidate
+      }, options(signal));
+    signal?.throwIfAborted();
+    if (response.validation === undefined) {
+      throw new Error("The Joko node returned an empty Extension Library location validation.");
+    }
+    return projectMobileExtensionLibraryLocationValidation(response.validation);
+  },
+  async relocateExtensionLibrary(credential, extensionId, expectedRevision, destination, signal) {
+    assertExtensionLibraryAuthority(extensionId, expectedRevision);
+    const candidate = destination.kind === "custom"
+      ? normalizeMobileExtensionLibraryCandidate(destination.candidate)
+      : undefined;
+    const response = await createClient(ExtensionService, transport(credential.origin, credential.authKey))
+      .relocateExtensionLibrary({
+        extensionId,
+        expectedRevision: { value: expectedRevision },
+        destinationKind: destination.kind === "default"
+          ? ExtensionLibraryLocationKind.DEFAULT
+          : ExtensionLibraryLocationKind.CUSTOM,
+        ...(candidate === undefined ? {} : { candidate })
+      }, options(signal));
+    signal?.throwIfAborted();
+    if (response.location === undefined || !Number.isSafeInteger(response.files) || response.files < 0
+      || response.bytes < 0n
+      || response.migrationId !== undefined && !/^library_migration_[a-f0-9]{32}$/u.test(response.migrationId)
+      || response.graceId !== undefined && !/^library_grace_[a-f0-9]{32}$/u.test(response.graceId)) {
+      throw new Error("The Joko node returned an invalid Extension Library relocation result.");
+    }
+    projectMobileExtensionLibraryLocation(response.location);
+    projectMobileExtensionLibraryWarnings(response.warnings);
+  },
+  async rebindExtensionLibrary(credential, extensionId, expectedRevision, candidate, signal) {
+    assertExtensionLibraryAuthority(extensionId, expectedRevision);
+    const exactCandidate = normalizeMobileExtensionLibraryCandidate(candidate);
+    const response = await createClient(ExtensionService, transport(credential.origin, credential.authKey))
+      .rebindExtensionLibrary({
+        extensionId,
+        expectedRevision: { value: expectedRevision },
+        candidate: exactCandidate
+      }, options(signal));
+    signal?.throwIfAborted();
+    if (response.location === undefined) throw new Error("The Joko node returned an empty Extension Library rebind result.");
+    projectMobileExtensionLibraryLocation(response.location);
+    projectMobileExtensionLibraryWarnings(response.warnings);
+  },
+  async unbindExtensionLibrary(credential, extensionId, expectedRevision, signal) {
+    assertExtensionLibraryAuthority(extensionId, expectedRevision);
+    const response = await createClient(ExtensionService, transport(credential.origin, credential.authKey))
+      .unbindExtensionLibrary({ extensionId, expectedRevision: { value: expectedRevision } }, options(signal));
+    signal?.throwIfAborted();
+    if (response.detachedPath !== undefined && (response.detachedPath.trim().length === 0
+      || response.detachedPath.length > 32_768 || response.detachedPath.includes("\0")
+      || response.detachedPath.includes("\r") || response.detachedPath.includes("\n"))) {
+      throw new Error("The Joko node returned an invalid detached Extension Library path.");
+    }
+  },
+  async repairExtensionLibraryState(credential, signal) {
+    const response = await createClient(ExtensionService, transport(credential.origin, credential.authKey))
+      .repairExtensionLibraryState({}, options(signal));
+    signal?.throwIfAborted();
+    if (!Number.isSafeInteger(response.bindings) || response.bindings < 0
+      || !Number.isSafeInteger(response.trash) || response.trash < 0) {
+      throw new Error("The Joko node returned an invalid Extension Library repair result.");
+    }
+  },
+  async repairExtensionLibraryMetadata(credential, extensionId, expectedRevision, signal) {
+    assertExtensionLibraryAuthority(extensionId, expectedRevision);
+    const response = await createClient(ExtensionService, transport(credential.origin, credential.authKey))
+      .repairExtensionLibraryMetadata({ extensionId, expectedRevision: { value: expectedRevision } }, options(signal));
+    signal?.throwIfAborted();
+    if (response.library === undefined) throw new Error("The Joko node returned an empty repaired Extension Library.");
+    projectMobileExtensionLibraryOverview(response.library, extensionId);
+  },
+  async trashExtensionLibrary(credential, extensionId, expectedRevision, confirmation, signal) {
+    assertExtensionLibraryAuthority(extensionId, expectedRevision);
+    assertExtensionLibraryConfirmation(confirmation);
+    const response = await createClient(ExtensionService, transport(credential.origin, credential.authKey))
+      .trashExtensionLibrary({
+        extensionId,
+        expectedRevision: { value: expectedRevision },
+        confirmation
+      }, options(signal));
+    signal?.throwIfAborted();
+    if (response.trash === undefined) throw new Error("The Joko node returned an empty Extension Library trash record.");
+    projectMobileExtensionLibraryTrash(response.trash, extensionId);
+  },
+  async listExtensionLibraryTrash(credential, extensionId, signal) {
+    if (!/^extension_[a-f0-9]{32}$/u.test(extensionId)) throw new Error("A current Extension Library is required.");
+    const response = await createClient(ExtensionService, transport(credential.origin, credential.authKey))
+      .listExtensionLibraryTrash({ extensionId }, options(signal));
+    signal?.throwIfAborted();
+    return projectMobileExtensionLibraryTrashList(response.trash, extensionId);
+  },
+  async restoreExtensionLibraryTrash(credential, extensionId, trashId, confirmation, destination, signal) {
+    if (!/^extension_[a-f0-9]{32}$/u.test(extensionId) || !/^library_trash_[a-f0-9]{32}$/u.test(trashId)) {
+      throw new Error("A current Extension Library trash record is required.");
+    }
+    assertExtensionLibraryConfirmation(confirmation);
+    const response = await createClient(ExtensionService, transport(credential.origin, credential.authKey))
+      .restoreExtensionLibraryTrash({
+        trashId,
+        confirmation,
+        destinationKind: destination === "default"
+          ? ExtensionLibraryLocationKind.DEFAULT
+          : ExtensionLibraryLocationKind.UNSPECIFIED
+      }, options(signal));
+    signal?.throwIfAborted();
+    if (response.extensionId !== extensionId || response.location === undefined) {
+      throw new Error("The Joko node returned a mismatched Extension Library restore result.");
+    }
+    projectMobileExtensionLibraryLocation(response.location);
+  },
+  async purgeExtensionLibraryTrash(credential, extensionId, trashId, confirmation, signal) {
+    if (!/^extension_[a-f0-9]{32}$/u.test(extensionId) || !/^library_trash_[a-f0-9]{32}$/u.test(trashId)) {
+      throw new Error("A current Extension Library trash record is required.");
+    }
+    assertExtensionLibraryConfirmation(confirmation);
+    const response = await createClient(ExtensionService, transport(credential.origin, credential.authKey))
+      .purgeExtensionLibraryTrash({ trashId, confirmation }, options(signal));
+    signal?.throwIfAborted();
+    if (!response.purged) throw new Error("The Extension Library trash record was not purged.");
+  },
+  async listExtensionLibraryGrace(credential, extensionId, signal) {
+    if (!/^extension_[a-f0-9]{32}$/u.test(extensionId)) throw new Error("A current Extension Library is required.");
+    const response = await createClient(ExtensionService, transport(credential.origin, credential.authKey))
+      .listExtensionLibraryGrace({ extensionId }, options(signal));
+    signal?.throwIfAborted();
+    return projectMobileExtensionLibraryGraceList(response.grace, extensionId);
+  },
+  async rollbackExtensionLibrary(credential, extensionId, expectedRevision, graceId, signal) {
+    assertExtensionLibraryAuthority(extensionId, expectedRevision);
+    if (!/^library_grace_[a-f0-9]{32}$/u.test(graceId)) {
+      throw new Error("A current Extension Library grace record is required.");
+    }
+    const response = await createClient(ExtensionService, transport(credential.origin, credential.authKey))
+      .rollbackExtensionLibrary({
+        extensionId,
+        expectedRevision: { value: expectedRevision },
+        graceId
+      }, options(signal));
+    signal?.throwIfAborted();
+    if (response.graceId !== graceId || response.location === undefined) {
+      throw new Error("The Joko node returned a mismatched Extension Library rollback result.");
+    }
+    projectMobileExtensionLibraryLocation(response.location);
+  },
+  async uploadExtensionSetupCredential(credential, extensionId, attemptId, fieldId, kind, secret, signal) {
+    signal?.throwIfAborted();
+    if (!/^extension_[a-f0-9]{32}$/u.test(extensionId)
+      || !validExtensionSetupIdentity(attemptId) || !validExtensionSetupIdentity(fieldId)) {
+      throw new Error("A current Extension setup field is required.");
+    }
+    const credentialKind = kind === "oauth" ? CredentialKind.OAUTH
+      : kind === "headerSecret" ? CredentialKind.HEADER_SECRET
+        : kind === "apiKey" ? CredentialKind.API_KEY
+          : undefined;
+    if (credentialKind === undefined) throw new Error("A supported Extension credential kind is required.");
+    const bytes = new TextEncoder().encode(secret);
+    try {
+      if (bytes.byteLength === 0 || bytes.byteLength > 64 * 1024 || secret.includes("\0")) {
+        throw new Error("The Extension credential input is invalid.");
+      }
+      const response = await createClient(ExtensionService, transport(credential.origin, credential.authKey))
+        .beginExtensionSetupCredentialUpload({ extensionId, attemptId, fieldId, kind: credentialKind }, options(signal));
+      signal?.throwIfAborted();
+      const ticket = response.ticket;
+      if (!ticket || !validExtensionSetupIdentity(ticket.ticketId)
+        || ticket.maximumBytes <= 0n
+        || BigInt(bytes.byteLength) > ticket.maximumBytes || ticket.expiresAt === undefined) {
+        throw new Error("The Extension credential channel is unavailable.");
+      }
+      const expirySeconds = Number(ticket.expiresAt.seconds);
+      if (!Number.isSafeInteger(expirySeconds) || expirySeconds < 0
+        || !Number.isInteger(ticket.expiresAt.nanos) || ticket.expiresAt.nanos < 0
+        || ticket.expiresAt.nanos >= 1_000_000_000) {
+        throw new Error("The Extension credential channel returned an invalid expiry.");
+      }
+      if ((expirySeconds * 1_000 + Math.floor(ticket.expiresAt.nanos / 1_000_000)) <= Date.now()) {
+        throw new Error("The Extension credential channel has expired.");
+      }
+      const endpoint = authorizedExtensionCredentialEndpoint(credential.origin, ticket.relativeEndpoint);
+      const upload = await fetch(endpoint, {
+        method: "PUT",
+        headers: {
+          authorization: `Bearer ${credential.authKey}`,
+          "content-type": "application/octet-stream"
+        },
+        body: bytes,
+        cache: "no-store",
+        signal
+      });
+      signal?.throwIfAborted();
+      if (!upload.ok) throw new Error(`Extension credential upload failed (${upload.status}).`);
+      return ticket.ticketId;
+    } finally {
+      bytes.fill(0);
+    }
   },
   async listPartnerPrivateThreads(credential, partnerId, signal) {
     if (!validMobilePartnerId(partnerId)) throw new Error("A valid Partner is required.");

@@ -1,6 +1,8 @@
 import { mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { webcrypto } from "node:crypto";
+import { Script } from "node:vm";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -33,7 +35,8 @@ afterEach(async () => {
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
 });
 
-async function fixture(options: { readonly now?: () => number; readonly ttlMs?: number } = {}) {
+async function fixture(options: { readonly now?: () => number; readonly ttlMs?: number;
+  readonly onSurfaceRevoked?: (surfaceId: string, connectionId: string) => void } = {}) {
   const root = await mkdtemp(join(tmpdir(), "joko-extension-main-view-"));
   roots.push(root);
   let current = true;
@@ -73,7 +76,8 @@ async function fixture(options: { readonly now?: () => number; readonly ttlMs?: 
     resources: { acquireInstalledPackage } as Pick<PiResourceManager, "acquireInstalledPackage">,
     rootDirectory: join(root, "surfaces"),
     ...(options.now === undefined ? {} : { now: options.now }),
-    ...(options.ttlMs === undefined ? {} : { ttlMs: options.ttlMs })
+    ...(options.ttlMs === undefined ? {} : { ttlMs: options.ttlMs }),
+    ...(options.onSurfaceRevoked === undefined ? {} : { onSurfaceRevoked: options.onSurfaceRevoked })
   });
   await manager.initialize();
   return {
@@ -173,9 +177,25 @@ describe("ExtensionMainViewManager", () => {
         surfaceId: surfaceId!, token: token!, assetPath: "__joko_extension_library_bridge__.js", method: "GET"
       });
       const bootstrapText = bootstrap.body?.toString("utf8") ?? "";
-      expect(bootstrapText).toContain("joko:extension-library-request");
-      expect(bootstrapText).toContain("Object.freeze({...d.result,ok:true})");
-      expect(bootstrapText).toContain("errorCode:d.error.code");
+      const page = libraryPage(bootstrapText);
+      const response = page.window.joko!.library({ kind: "read", path: "mail" });
+      expect(page.parent.postMessage).toHaveBeenCalledTimes(1);
+      const request = page.parent.postMessage.mock.calls[0]![0] as { id: string };
+      page.dispatch("message", { source: page.parent, data: { type: "joko:extension-library-response", version: 1,
+        id: request.id, ok: true, result: { kind: "read", content: Uint8Array.of(128) } } });
+      await expect(response).resolves.toMatchObject({ kind: "read", ok: true, content: Uint8Array.of(128) });
+
+      const mobile = libraryPage(bootstrapText, true);
+      const opening = mobile.window.joko!.library({ kind: "open" });
+      expect(mobile.parent.postMessage).not.toHaveBeenCalled();
+      mobile.window[Symbol.for("joko.extension-library-mobile.transport")] = true;
+      mobile.dispatch("joko:extension-library-transport-ready", {});
+      mobile.dispatch("joko:extension-library-transport-ready", {});
+      expect(mobile.parent.postMessage).toHaveBeenCalledTimes(1);
+      const mobileRequest = mobile.parent.postMessage.mock.calls[0]![0] as { id: string };
+      mobile.dispatch("message", { source: mobile.parent, data: { type: "joko:extension-library-response", version: 1,
+        id: mobileRequest.id, ok: false, error: { code: "result-unknown", message: "Refresh the main view." } } });
+      await expect(opening).resolves.toEqual({ ok: false, errorCode: "result-unknown", message: "Refresh the main view." });
       expect(bootstrap.headers["content-security-policy"]).toContain("script-src 'self'");
 
       const secondary = await manager.serve({
@@ -189,7 +209,8 @@ describe("ExtensionMainViewManager", () => {
 
   it("revokes immediately when Resource authority changes and expires idle leases", async () => {
     let now = 1_800_000_000_000;
-    const { manager, setCurrent, releases } = await fixture({ now: () => now, ttlMs: 1_000 });
+    const onSurfaceRevoked = vi.fn();
+    const { manager, setCurrent, releases } = await fixture({ now: () => now, ttlMs: 1_000, onSurfaceRevoked });
     try {
       const first = await manager.open({ authority, connectionId: "connection-a", assertAuthorityCurrent: () => undefined });
       const [, firstId, firstToken] = /main-views\/([^/]+)\/([^/]+)/u.exec(first.endpoint)!;
@@ -197,6 +218,7 @@ describe("ExtensionMainViewManager", () => {
       await expect(manager.serve({ surfaceId: firstId!, token: firstToken!, assetPath: "index.html", method: "GET" }))
         .rejects.toEqual(expect.objectContaining<Partial<ExtensionMainViewError>>({ statusCode: 410 }));
       expect(releases()).toBe(1);
+      expect(onSurfaceRevoked).toHaveBeenCalledExactlyOnceWith(firstId, "connection-a");
 
       setCurrent(true);
       const second = await manager.open({ authority, connectionId: "connection-a", assertAuthorityCurrent: () => undefined });
@@ -205,6 +227,7 @@ describe("ExtensionMainViewManager", () => {
       await expect(manager.serve({ surfaceId: secondId!, token: secondToken!, assetPath: "index.html", method: "GET" }))
         .rejects.toMatchObject({ statusCode: 404 });
       expect(releases()).toBe(2);
+      expect(onSurfaceRevoked).toHaveBeenLastCalledWith(secondId, "connection-a");
     } finally {
       await manager.close();
     }
@@ -234,3 +257,20 @@ describe("ExtensionMainViewManager", () => {
     }
   });
 });
+
+function libraryPage(source: string, mobile = false) {
+  const listeners = new Map<string, Set<(event: unknown) => void>>();
+  const page: { joko?: { library(operation: unknown): Promise<unknown> }; ReactNativeWebView?: object; [key: symbol]: unknown } = {};
+  if (mobile) page.ReactNativeWebView = {};
+  const frameParent = { postMessage: vi.fn((_data: unknown, _origin: string) => undefined) };
+  new Script(source).runInNewContext({ window: page, parent: frameParent, crypto: webcrypto, Uint8Array, Symbol,
+    setTimeout, clearTimeout,
+    addEventListener: (type: string, listener: (event: unknown) => void) => {
+      const current = listeners.get(type) ?? new Set();
+      current.add(listener); listeners.set(type, current);
+    },
+    removeEventListener: (type: string, listener: (event: unknown) => void) => listeners.get(type)?.delete(listener)
+  });
+  return { window: page, parent: frameParent, dispatch: (type: string, event: unknown) =>
+    listeners.get(type)?.forEach((listener) => listener(event)) };
+}

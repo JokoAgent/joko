@@ -72,8 +72,50 @@ import {
 } from "./network";
 import {
   assertMobileCanonicalPartnerSession, emptyMobilePartnerPrivateState,
-  validMobilePartnerId, type MobilePartnerPrivateState, type MobilePrivateDetail
+  validMobilePartnerId, type MobilePartner, type MobilePartnerPrivateState, type MobilePrivateDetail
 } from "./mobile-partner-private";
+import {
+  mobilePartnerResourceKey,
+  projectMobilePartnerResourcePreview,
+  type MobilePartnerResourcePreview,
+  type MobilePartnerResourceTransport
+} from "./mobile-partner-resources";
+import {
+  assertMobileExtensionMainViewSurface,
+  mobileExtensionKey,
+  sameMobileExtensionMainViewSurface,
+  type MobileExtension,
+  type MobileExtensionCommand,
+  type MobileExtensionCredentialKind,
+  type MobileExtensionMainViewSurface,
+  type MobileExtensionMutationResult,
+  type MobileExtensionPendingMutationKind,
+  type MobileExtensionTransport,
+  type MobileExtensionUseDestination,
+  type MobileExtensionUseResult
+} from "./mobile-extensions";
+import {
+  mobileExtensionLibraryReady,
+  mobileExtensionLibrarySupported,
+  normalizeMobileExtensionLibraryCandidate,
+  sameMobileExtensionLibraryGraceEntry,
+  sameMobileExtensionLibrarySnapshot,
+  sameMobileExtensionLibraryTrashEntry,
+  sameMobileExtensionLibraryValidation,
+  type MobileExtensionLibraryLocationValidation,
+  type MobileExtensionLibraryMutation,
+  type MobileExtensionLibrarySnapshot
+} from "./mobile-extension-library";
+import type {
+  MobileExtensionLibraryCall, MobileExtensionLibraryCallResult, MobileExtensionLibrarySession
+} from "./mobile-extension-library-runtime";
+import {
+  applyMobileExtensionUseCommand,
+  assertMobileExtensionTaskChoice,
+  mobileExtensionNewTaskTarget,
+  projectMobileExtensionTaskChoices,
+  resolveMobileExtensionUseCommand
+} from "./mobile-extension-use-handoff";
 import {
   artifactTitle,
   bytesToDataUri,
@@ -615,6 +657,36 @@ const isTerminal = (state: OperationState): boolean => [
   OperationState.SUCCEEDED, OperationState.FAILED, OperationState.CANCELLED, OperationState.CONFLICT
 ].includes(state);
 
+type MobileExtensionReceiptKind = Extract<PendingOperation["kind"],
+  | "extension-enabled"
+  | "extension-sidebar"
+  | "extension-setup-begin"
+  | "extension-setup-interaction"
+  | "extension-setup-credential"
+  | "extension-setup-complete"
+  | "extension-setup-cancel"
+  | "extension-setup-revoke">;
+
+function isMobileExtensionReceiptKind(kind: PendingOperation["kind"]): kind is MobileExtensionReceiptKind {
+  return kind === "extension-enabled" || kind === "extension-sidebar"
+    || kind === "extension-setup-begin" || kind === "extension-setup-interaction"
+    || kind === "extension-setup-credential" || kind === "extension-setup-complete"
+    || kind === "extension-setup-cancel" || kind === "extension-setup-revoke";
+}
+
+function mobileExtensionPendingMutationKind(kind: MobileExtensionReceiptKind): MobileExtensionPendingMutationKind {
+  switch (kind) {
+    case "extension-enabled": return "enabled";
+    case "extension-sidebar": return "sidebar";
+    case "extension-setup-begin": return "setupBegin";
+    case "extension-setup-interaction": return "setupInteraction";
+    case "extension-setup-credential": return "setupCredential";
+    case "extension-setup-complete": return "setupComplete";
+    case "extension-setup-cancel": return "setupCancel";
+    case "extension-setup-revoke": return "setupRevoke";
+  }
+}
+
 function trackedOperation(operation: Operation): TrackedMutationResult {
   const rejected = operation.state === OperationState.FAILED
     || operation.state === OperationState.CONFLICT
@@ -791,6 +863,955 @@ export class MobileClient {
   ) { this.#filesThumbnails = new MobileFilesThumbnailReader(filesThumbnailDisk); }
 
   get state(): MobileState { return this.#state; }
+
+  partnerResourceTransport(): MobilePartnerResourceTransport | undefined {
+    const context = this.#partnerPrivateContext();
+    if (!context) return undefined;
+    const ownerKey = context.authorityKey;
+    const current = (): boolean => this.#partnerPrivateAuthorityKey(this.#state) === ownerKey
+      && this.#credential === context.credential;
+    const requireCurrent = (signal: AbortSignal): void => {
+      signal.throwIfAborted();
+      if (!current()) throw new Error("The Partner Resource owner changed.");
+    };
+    const readPartners = async (signal: AbortSignal): Promise<readonly MobilePartner[]> => {
+      requireCurrent(signal);
+      const partners = await this.network.listPartners(context.credential, signal);
+      requireCurrent(signal);
+      return partners;
+    };
+    const exactPartner = (partners: readonly MobilePartner[], partnerId: string): MobilePartner => {
+      if (!validMobilePartnerId(partnerId)) throw new Error("Select a current Partner Resource.");
+      const matches = partners.filter((partner) => partner.partnerId === partnerId);
+      if (matches.length !== 1) throw new Error("The selected Partner Resource is no longer available.");
+      const partner = matches[0]!;
+      if (partner.lifecycle !== "active" || partner.initializationState !== "ready"
+        || partner.canonicalSessionId === undefined) {
+        throw new Error("The selected Partner Resource does not have an available canonical task.");
+      }
+      return partner;
+    };
+    return {
+      ownerKey,
+      list: readPartners,
+      preview: async (partnerId, signal) => {
+        const initial = exactPartner(await readPartners(signal), partnerId);
+        const sessions = await this.network.listPartnerSessions(context.credential, initial.partnerId, signal);
+        requireCurrent(signal);
+        assertMobileCanonicalPartnerSession(initial, initial.canonicalSessionId!, sessions);
+        const catalog = await this.network.listSessionArtifacts(context.credential, initial.canonicalSessionId!, signal);
+        requireCurrent(signal);
+        const finalPartner = exactPartner(await readPartners(signal), partnerId);
+        if (mobilePartnerResourceKey(finalPartner) !== mobilePartnerResourceKey(initial)) {
+          throw new Error("The Partner Resource changed while its preview was loading.");
+        }
+        const finalSessions = await this.network.listPartnerSessions(context.credential, finalPartner.partnerId, signal);
+        requireCurrent(signal);
+        return projectMobilePartnerResourcePreview(finalPartner, finalSessions, catalog);
+      },
+      open: async (preview: MobilePartnerResourcePreview, signal) => {
+        requireCurrent(signal);
+        const partner = exactPartner(await readPartners(signal), preview.partner.partnerId);
+        if (mobilePartnerResourceKey(partner) !== preview.resourceKey
+          || partner.canonicalSessionId !== preview.session.sessionId) {
+          throw new Error("The Partner Resource changed; refresh its preview before opening it.");
+        }
+        const sessions = await this.network.listPartnerSessions(context.credential, partner.partnerId, signal);
+        requireCurrent(signal);
+        assertMobileCanonicalPartnerSession(partner, preview.session.sessionId, sessions);
+        const visible = this.#state.owner?.sessions.filter((session) => session.sessionId === preview.session.sessionId) ?? [];
+        if (visible.length !== 1 || visible[0]!.archived
+          || visible[0]!.state === SessionState.ARCHIVED || visible[0]!.state === SessionState.CLOSED) {
+          throw new Error("The Partner canonical task is not available in the current task directory.");
+        }
+        requireCurrent(signal);
+        await this.select(preview.session.sessionId);
+        requireCurrent(signal);
+        if (this.#state.selectedId !== preview.session.sessionId) {
+          throw new Error("The Partner canonical task was not selected by the current owner.");
+        }
+        return preview.session.sessionId;
+      }
+    };
+  }
+
+  extensionCatalogTransport(): MobileExtensionTransport | undefined {
+    const context = this.#partnerPrivateContext();
+    if (!context) return undefined;
+    const ownerKey = context.authorityKey;
+    let retired = false;
+    const isCurrent = (): boolean => !retired && this.#partnerPrivateAuthorityKey(this.#state) === ownerKey
+      && this.#credential === context.credential;
+    const requireCurrent = (signal: AbortSignal): void => {
+      if (signal.aborted || !isCurrent()) {
+        throw new Error("The Extension catalog owner changed or the request was cancelled.");
+      }
+    };
+    const owned = async <T>(signal: AbortSignal, effect: (current: AbortSignal) => Promise<T>): Promise<T> => {
+      const request = new AbortController();
+      const cancel = (): void => request.abort();
+      if (signal.aborted) request.abort();
+      else signal.addEventListener("abort", cancel, { once: true });
+      const unsubscribe = this.subscribe(() => {
+        if (!isCurrent()) {
+          retired = true;
+          request.abort();
+        }
+      });
+      try {
+        requireCurrent(request.signal);
+        const value = await effect(request.signal);
+        requireCurrent(request.signal);
+        return value;
+      } finally {
+        request.abort();
+        unsubscribe();
+        signal.removeEventListener("abort", cancel);
+      }
+    };
+    const readExactDetail = async (expected: MobileExtension, signal: AbortSignal): Promise<MobileExtension> => {
+      requireCurrent(signal);
+      if (!expected.installed) throw new Error("Select an installed Extension.");
+      const extension = await this.network.getExtension(context.credential, expected.extensionId, signal);
+      requireCurrent(signal);
+      if (mobileExtensionKey(extension) !== mobileExtensionKey(expected)) {
+        throw new Error("The Extension changed; refresh the catalog before using its details.");
+      }
+      return extension;
+    };
+    const refreshExact = async (extensionId: string, signal: AbortSignal): Promise<MobileExtensionMutationResult> => {
+      const catalog = await this.network.listExtensions(context.credential, signal);
+      requireCurrent(signal);
+      const matches = catalog.extensions.filter((extension) => extension.extensionId === extensionId);
+      if (matches.length !== 1) throw new Error("The changed Extension is no longer in the installed catalog.");
+      const extension = await this.network.getExtension(context.credential, extensionId, signal);
+      requireCurrent(signal);
+      if (mobileExtensionKey(extension) !== mobileExtensionKey(matches[0]!)) {
+        throw new Error("The Extension changed while its current state was being refreshed.");
+      }
+      return { catalog, extension };
+    };
+    const pendingForExtension = (extensionId: string): boolean => this.#state.pending.some((receipt) =>
+      receipt.connectionId === context.credential.connectionId && receipt.extensionId === extensionId
+      && isMobileExtensionReceiptKind(receipt.kind));
+    const submitExtensionMutation = async (
+      extension: MobileExtension,
+      receiptKind: MobileExtensionReceiptKind,
+      mutation: OperationMutation,
+      signal: AbortSignal,
+      verify: (current: MobileExtension) => boolean
+    ): Promise<MobileExtensionMutationResult> => {
+      const result = await this.#submitTerminal(mutation, {
+        kind: receiptKind,
+        extensionId: extension.extensionId,
+        extensionRevision: extension.revision.toString(10)
+      }, undefined, false, false, {
+        signal,
+        isCurrent,
+        beforeTerminalReceipt: async (operation) => {
+          if (operation.state === OperationState.SUCCEEDED) this.#assertExtensionMutationAcknowledgement(operation);
+        }
+      });
+      requireCurrent(signal);
+      if (!result.definitive) {
+        throw new Error("The Extension change result is unknown. Check its operation receipt; the change was not resent.");
+      }
+      if (!result.accepted || result.operation?.state !== OperationState.SUCCEEDED) {
+        throw new Error(result.operation?.error?.message || "The Extension change was rejected.");
+      }
+      const refreshed = await refreshExact(extension.extensionId, signal);
+      if (!verify(refreshed.extension)) {
+        throw new Error("The Extension changed again before its updated state could be confirmed.");
+      }
+      return refreshed;
+    };
+    const mutate = (
+      expected: MobileExtension,
+      kind: "enabled" | "sidebar",
+      value: boolean,
+      signal: AbortSignal
+    ): Promise<MobileExtensionMutationResult> => owned(signal, async (current) => {
+      const extension = await readExactDetail(expected, current);
+      if (kind === "sidebar" && !extension.sidebarSupported) {
+        throw new Error("This Extension does not provide a sidebar main view.");
+      }
+      if (pendingForExtension(extension.extensionId)) {
+        throw new Error("A previous change to this Extension still has an unresolved result. Check its operation receipt first.");
+      }
+      if (kind === "enabled" ? extension.enabled === value : extension.sidebarVisible === value) {
+        return refreshExact(extension.extensionId, current);
+      }
+      const action = this.#claimMutation();
+      try {
+        const mutation = create(OperationMutationSchema, {
+          payload: kind === "enabled"
+            ? { case: "setExtensionEnabled", value: {
+                extensionId: extension.extensionId,
+                enabled: value,
+                expectedRevision: { value: extension.revision }
+              } }
+            : { case: "setExtensionSidebarVisible", value: {
+                extensionId: extension.extensionId,
+                visible: value,
+                expectedRevision: { value: extension.revision }
+              } }
+        });
+        return submitExtensionMutation(
+          extension,
+          kind === "enabled" ? "extension-enabled" : "extension-sidebar",
+          mutation,
+          current,
+          (refreshed) => kind === "enabled" ? refreshed.enabled === value : refreshed.sidebarVisible === value
+        );
+      } finally {
+        this.#releaseMutation(action);
+      }
+    });
+    const activeSetupAttempt = (extension: MobileExtension): string => {
+      if (extension.setup.state !== "inProgress" || extension.setup.attemptId === undefined) {
+        throw new Error("Begin a current Extension setup attempt before changing its fields.");
+      }
+      return extension.setup.attemptId;
+    };
+    const setupField = (extension: MobileExtension, fieldId: string) => {
+      const matches = extension.setup.fields.filter((field) => field.fieldId === fieldId);
+      if (matches.length !== 1) throw new Error("Select a current Extension setup field.");
+      return matches[0]!;
+    };
+    const setupMutation = (
+      expected: MobileExtension,
+      receiptKind: Exclude<MobileExtensionReceiptKind, "extension-enabled" | "extension-sidebar">,
+      prepare: (
+        extension: MobileExtension,
+        signal: AbortSignal
+      ) => Promise<{ readonly mutation: OperationMutation; readonly verify: (current: MobileExtension) => boolean }>
+        | { readonly mutation: OperationMutation; readonly verify: (current: MobileExtension) => boolean },
+      signal: AbortSignal
+    ): Promise<MobileExtensionMutationResult> => owned(signal, async (current) => {
+      const extension = await readExactDetail(expected, current);
+      if (pendingForExtension(extension.extensionId)) {
+        throw new Error("A previous change to this Extension still has an unresolved result. Check its operation receipt first.");
+      }
+      const action = this.#claimMutation();
+      try {
+        const prepared = await prepare(extension, current);
+        requireCurrent(current);
+        return await submitExtensionMutation(extension, receiptKind, prepared.mutation, current, prepared.verify);
+      } finally {
+        this.#releaseMutation(action);
+      }
+    });
+    const beginSetup = (expected: MobileExtension, signal: AbortSignal) => setupMutation(
+      expected,
+      "extension-setup-begin",
+      (extension) => {
+        if (extension.setup.state !== "required" && extension.setup.state !== "cancelled"
+          && extension.setup.state !== "failed") {
+          throw new Error("This Extension setup cannot be started from its current state.");
+        }
+        return {
+          mutation: create(OperationMutationSchema, { payload: { case: "beginExtensionSetup", value: {
+            extensionId: extension.extensionId,
+            expectedRevision: { value: extension.revision }
+          } } }),
+          verify: (current) => current.setup.state === "inProgress" && current.setup.attemptId !== undefined
+        };
+      },
+      signal
+    );
+    const submitSetupInteraction = (
+      expected: MobileExtension,
+      fieldId: string,
+      value: string | boolean,
+      signal: AbortSignal
+    ) => setupMutation(expected, "extension-setup-interaction", (extension) => {
+      const attemptId = activeSetupAttempt(extension);
+      const field = setupField(extension, fieldId);
+      let wireValue: { readonly case: "text"; readonly value: string }
+        | { readonly case: "confirmed"; readonly value: boolean };
+      let expectedConfigured: boolean;
+      if (field.kind === "confirmation") {
+        if (typeof value !== "boolean") throw new Error("This Extension setup confirmation requires a yes or no value.");
+        wireValue = { case: "confirmed", value };
+        expectedConfigured = value;
+      } else {
+        if (field.kind !== "text" || typeof value !== "string") {
+          throw new Error("This Extension setup field must use its protected credential channel.");
+        }
+        const normalized = value.trim();
+        if (normalized.length === 0 || normalized.length > 8_192 || normalized.includes("\0")) {
+          throw new Error("The Extension setup value is invalid.");
+        }
+        if (field.options.length > 0 && !field.options.includes(normalized)) {
+          throw new Error("Select one of the current Extension setup choices.");
+        }
+        wireValue = { case: "text", value: normalized };
+        expectedConfigured = true;
+      }
+      return {
+        mutation: create(OperationMutationSchema, { payload: { case: "submitExtensionSetupInteraction", value: {
+          extensionId: extension.extensionId,
+          attemptId,
+          fieldId: field.fieldId,
+          value: wireValue,
+          expectedRevision: { value: extension.revision }
+        } } }),
+        verify: (current) => current.setup.state === "inProgress"
+          && current.setup.attemptId === attemptId
+          && current.setup.fields.find((candidate) => candidate.fieldId === field.fieldId)?.configured === expectedConfigured
+      };
+    }, signal);
+    const saveSetupCredential = (
+      expected: MobileExtension,
+      fieldId: string,
+      kind: MobileExtensionCredentialKind,
+      secret: string,
+      signal: AbortSignal
+    ) => setupMutation(expected, "extension-setup-credential", async (extension, current) => {
+      const attemptId = activeSetupAttempt(extension);
+      const field = setupField(extension, fieldId);
+      if (field.kind !== "secret" && field.kind !== "oauth") {
+        throw new Error("This Extension setup field does not accept a protected credential.");
+      }
+      if (field.kind === "oauth" && kind !== "oauth") {
+        throw new Error("This Extension setup field requires an OAuth credential.");
+      }
+      if (secret.length === 0 || secret.length > 64 * 1024 || secret.includes("\0")) {
+        throw new Error("The Extension credential input is invalid.");
+      }
+      const ticketId = await this.network.uploadExtensionSetupCredential(
+        context.credential,
+        extension.extensionId,
+        attemptId,
+        field.fieldId,
+        kind,
+        secret,
+        current
+      );
+      requireCurrent(current);
+      return {
+        mutation: create(OperationMutationSchema, { payload: { case: "commitExtensionSetupCredential", value: {
+          extensionId: extension.extensionId,
+          attemptId,
+          fieldId: field.fieldId,
+          credentialUploadTicketId: ticketId,
+          expectedRevision: { value: extension.revision }
+        } } }),
+        verify: (refreshed) => refreshed.setup.state === "inProgress"
+          && refreshed.setup.attemptId === attemptId
+          && refreshed.setup.fields.find((candidate) => candidate.fieldId === field.fieldId)?.configured === true
+      };
+    }, signal);
+    const completeSetup = (expected: MobileExtension, signal: AbortSignal) => setupMutation(
+      expected,
+      "extension-setup-complete",
+      (extension) => {
+        const attemptId = activeSetupAttempt(extension);
+        if (extension.setup.fields.some((field) => field.required && !field.configured)) {
+          throw new Error("Complete every required Extension setup field first.");
+        }
+        return {
+          mutation: create(OperationMutationSchema, { payload: { case: "completeExtensionSetup", value: {
+            extensionId: extension.extensionId,
+            attemptId,
+            expectedRevision: { value: extension.revision }
+          } } }),
+          verify: (current) => current.setup.state === "ready"
+        };
+      },
+      signal
+    );
+    const cancelSetup = (expected: MobileExtension, signal: AbortSignal) => setupMutation(
+      expected,
+      "extension-setup-cancel",
+      (extension) => {
+        const attemptId = activeSetupAttempt(extension);
+        return {
+          mutation: create(OperationMutationSchema, { payload: { case: "cancelExtensionSetup", value: {
+            extensionId: extension.extensionId,
+            attemptId,
+            expectedRevision: { value: extension.revision }
+          } } }),
+          verify: (current) => current.setup.state === "cancelled"
+        };
+      },
+      signal
+    );
+    const revokeSetup = (expected: MobileExtension, signal: AbortSignal) => setupMutation(
+      expected,
+      "extension-setup-revoke",
+      (extension) => {
+        if (extension.setup.state !== "ready") throw new Error("Only a ready Extension setup can be revoked.");
+        return {
+          mutation: create(OperationMutationSchema, { payload: { case: "revokeExtensionSetup", value: {
+            extensionId: extension.extensionId,
+            expectedRevision: { value: extension.revision }
+          } } }),
+          verify: (current) => current.setup.state === "required"
+            && current.setup.attemptId === undefined
+            && current.setup.fields.every((field) => !field.configured)
+        };
+      },
+      signal
+    );
+    const useCommand = (
+      expected: MobileExtension,
+      command: MobileExtensionCommand,
+      destination: MobileExtensionUseDestination,
+      signal: AbortSignal
+    ): Promise<MobileExtensionUseResult> => {
+      if (destination.kind === "newTask") return owned(signal, async (current) => {
+        if (pendingForExtension(expected.extensionId)) {
+          throw new Error("A previous change to this Extension still has an unresolved result. Check its operation receipt first.");
+        }
+        if (!this.newTaskDrafts) throw new Error("Retained new-task drafts are unavailable on this mobile client.");
+        const profileId = context.credential.profileId;
+        assertMobileExtensionTaskChoice(this.#state.owner, expected, command.sessionId);
+        const fresh = await this.network.getExtensionForRuntime(
+          context.credential,
+          expected.extensionId,
+          command.sessionId,
+          current
+        );
+        const resolved = resolveMobileExtensionUseCommand(expected, command, fresh, command.sessionId);
+        assertMobileExtensionTaskChoice(this.#state.owner, fresh, command.sessionId);
+        const targetId = mobileExtensionNewTaskTarget(this.#state.owner, fresh);
+        const identity = { profileId };
+        const snapshot = await this.newTaskDrafts.readSnapshot(identity);
+        requireCurrent(current);
+        if (snapshot.draft?.submission !== undefined) {
+          throw new Error("The current new-task draft is already being submitted.");
+        }
+        const original = snapshot.draft ?? { targetId: "", name: "", input: emptyMobileComposerDraft() };
+        const next = {
+          targetId: targetId ?? original.targetId,
+          name: original.name,
+          input: applyMobileExtensionUseCommand(original.input, resolved.name, false)
+        };
+        if (!this.newTaskDrafts.saveIfRevision(identity, next, snapshot.revision)) {
+          throw new Error("The new-task draft changed. The Extension command was not inserted.");
+        }
+        try {
+          await this.newTaskDrafts.flush(identity);
+          requireCurrent(current);
+          if (mobileExtensionNewTaskTarget(this.#state.owner, fresh) !== targetId) {
+            throw new Error("The Extension project changed before its command handoff completed.");
+          }
+        } catch (failure) {
+          try {
+            const committed = await this.newTaskDrafts.readSnapshot(identity);
+            if (committed.draft?.submission === undefined
+              && committed.draft?.targetId === next.targetId && committed.draft.name === next.name
+              && mobileComposerDraftsEqual(committed.draft.input, next.input)) {
+              const original = snapshot.draft ?? { targetId: "", name: "", input: emptyMobileComposerDraft() };
+              if (this.newTaskDrafts.saveIfRevision(identity, original, committed.revision)) {
+                await this.newTaskDrafts.flush(identity);
+              }
+            }
+          } catch {
+            // A concurrent draft edit owns the newer state and must not be overwritten.
+          }
+          throw failure;
+        }
+        return { kind: "newTask" };
+      });
+
+      return (async (): Promise<MobileExtensionUseResult> => {
+        if (!this.composerDrafts) throw new Error("Retained task drafts are unavailable on this mobile client.");
+        const prepared = await owned(signal, async (current) => {
+          if (pendingForExtension(expected.extensionId)) {
+            throw new Error("A previous change to this Extension still has an unresolved result. Check its operation receipt first.");
+          }
+          const profileId = context.credential.profileId;
+          assertMobileExtensionTaskChoice(this.#state.owner, expected, destination.sessionId);
+          const fresh = await this.network.getExtensionForRuntime(
+            context.credential,
+            expected.extensionId,
+            destination.sessionId,
+            current
+          );
+          const resolved = resolveMobileExtensionUseCommand(expected, command, fresh, destination.sessionId);
+          assertMobileExtensionTaskChoice(this.#state.owner, fresh, destination.sessionId);
+          const identity = { profileId, sessionId: destination.sessionId };
+          const snapshot = await this.composerDrafts!.readSnapshot(identity);
+          requireCurrent(current);
+          assertMobileExtensionTaskChoice(this.#state.owner, fresh, destination.sessionId);
+          const next = applyMobileExtensionUseCommand(snapshot.draft ?? emptyMobileComposerDraft(), resolved.name, true);
+          if (!this.composerDrafts!.saveIfRevision(identity, next, snapshot.revision)) {
+            throw new Error("The task draft changed. The Extension command was not inserted.");
+          }
+          await this.composerDrafts!.flush(identity);
+          requireCurrent(current);
+          return { fresh, identity, snapshot, next };
+        });
+        try {
+          if (signal.aborted || this.#credential !== context.credential
+            || this.#activeProfileId !== context.credential.profileId) {
+            throw new Error("The Extension catalog owner changed or the request was cancelled.");
+          }
+          assertMobileExtensionTaskChoice(this.#state.owner, prepared.fresh, destination.sessionId);
+          await this.select(destination.sessionId);
+          if (signal.aborted || this.#credential !== context.credential
+            || this.#activeProfileId !== context.credential.profileId
+            || this.#state.status !== "connected" || this.#state.selectedId !== destination.sessionId) {
+            throw new Error("The selected task did not remain current after the Extension command was inserted.");
+          }
+          assertMobileExtensionTaskChoice(this.#state.owner, prepared.fresh, destination.sessionId);
+        } catch (failure) {
+          try {
+            const committed = await this.composerDrafts.readSnapshot(prepared.identity);
+            if (committed.draft && mobileComposerDraftsEqual(committed.draft, prepared.next)) {
+              const restored = prepared.snapshot.draft
+                ? this.composerDrafts.saveIfRevision(prepared.identity, prepared.snapshot.draft, committed.revision)
+                : await this.composerDrafts.clearIfRevision(prepared.identity, committed.revision);
+              if (restored) await this.composerDrafts.flush(prepared.identity);
+            }
+          } catch {
+            // A concurrent draft edit owns the newer state and must not be overwritten.
+          }
+          throw failure;
+        }
+        return { kind: "task", sessionId: destination.sessionId };
+      })();
+    };
+    const openMainView = async (
+      expected: MobileExtension,
+      signal: AbortSignal
+    ): Promise<MobileExtensionMainViewSurface> => {
+      let opened: MobileExtensionMainViewSurface | undefined;
+      try {
+        return await owned(signal, async (current) => {
+          if (pendingForExtension(expected.extensionId)) {
+            throw new Error("A previous change to this Extension still has an unresolved result. Check its operation receipt first.");
+          }
+          const extension = await readExactDetail(expected, current);
+          opened = await this.network.openExtensionMainView(
+            context.credential,
+            extension.extensionId,
+            extension.revision,
+            current
+          );
+          requireCurrent(current);
+          assertMobileExtensionMainViewSurface(extension, opened);
+          return opened;
+        });
+      } catch (error) {
+        if (opened !== undefined) {
+          await this.network.closeExtensionMainView(context.credential, opened.surfaceId).catch(() => undefined);
+        }
+        throw error;
+      }
+    };
+    const probeMainView = (
+      expected: MobileExtensionMainViewSurface,
+      signal: AbortSignal
+    ): Promise<MobileExtensionMainViewSurface> => owned(signal, async (current) => {
+      const surface = await this.network.getExtensionMainViewSurface(context.credential, expected.surfaceId, current);
+      requireCurrent(current);
+      if (!sameMobileExtensionMainViewSurface(expected, surface) || surface.expiresAt <= Date.now()) {
+        throw new Error("The Extension main-view surface changed or expired.");
+      }
+      return surface;
+    });
+    const readLibrarySnapshot = async (
+      expected: MobileExtension,
+      signal: AbortSignal
+    ): Promise<{ readonly extension: MobileExtension; readonly snapshot: MobileExtensionLibrarySnapshot }> => {
+      const extension = await readExactDetail(expected, signal);
+      if (!mobileExtensionLibrarySupported(extension)) {
+        throw new Error("This Extension does not own a current Resource Library.");
+      }
+      const overview = mobileExtensionLibraryReady(extension)
+        ? this.network.getExtensionLibraryOverview(
+          context.credential,
+          extension.extensionId,
+          extension.revision,
+          signal
+        )
+        : Promise.resolve(undefined);
+      const [currentOverview, trash, grace] = await Promise.all([
+        overview,
+        this.network.listExtensionLibraryTrash(context.credential, extension.extensionId, signal),
+        this.network.listExtensionLibraryGrace(context.credential, extension.extensionId, signal)
+      ]);
+      requireCurrent(signal);
+      return {
+        extension,
+        snapshot: {
+          ...(currentOverview === undefined ? {} : { overview: currentOverview }),
+          trash,
+          grace
+        }
+      };
+    };
+    const libraryLeases = new Map<MobileExtensionLibrarySession, {
+      readonly extensionKey: string; readonly surface: MobileExtensionMainViewSurface;
+    }>();
+    const requireLibrarySurface = async (
+      expected: MobileExtension, surface: MobileExtensionMainViewSurface, signal: AbortSignal
+    ): Promise<MobileExtension> => {
+      if (pendingForExtension(expected.extensionId)) {
+        throw new Error("Check the unresolved Extension change before using its Library.");
+      }
+      const extension = await readExactDetail(expected, signal);
+      if (!mobileExtensionLibraryReady(extension)) throw new Error("The Extension Library is not ready.");
+      assertMobileExtensionMainViewSurface(extension, surface);
+      const fresh = await this.network.getExtensionMainViewSurface(context.credential, surface.surfaceId, signal);
+      requireCurrent(signal);
+      if (!sameMobileExtensionMainViewSurface(surface, fresh)) throw new Error("The Library main-view surface changed.");
+      assertMobileExtensionMainViewSurface(extension, fresh);
+      return extension;
+    };
+    const closeLibrary = async (session: MobileExtensionLibrarySession): Promise<boolean> => {
+      if (!libraryLeases.delete(session)) return false;
+      return this.network.closeExtensionLibrary(context.credential, session.id);
+    };
+    const openLibrary = async (
+      expected: MobileExtension, surface: MobileExtensionMainViewSurface, signal: AbortSignal
+    ): Promise<MobileExtensionLibrarySession> => {
+      let opened: MobileExtensionLibrarySession | undefined;
+      try {
+        return await owned(signal, async (current) => {
+          const extension = await requireLibrarySurface(expected, surface, current);
+          opened = await this.network.openExtensionLibrary(context.credential, extension.extensionId, extension.revision, surface.surfaceId, current);
+          requireCurrent(current);
+          if (opened.extensionId !== extension.extensionId || opened.expiresAt <= Date.now()) {
+            throw new Error("The Extension Library session changed or expired.");
+          }
+          libraryLeases.set(opened, { extensionKey: mobileExtensionKey(extension), surface });
+          return opened;
+        });
+      } catch (error) {
+        if (opened !== undefined) {
+          libraryLeases.delete(opened);
+          await this.network.closeExtensionLibrary(context.credential, opened.id).catch(() => undefined);
+        }
+        throw error;
+      }
+    };
+    const callLibrary = async (
+      expected: MobileExtension, surface: MobileExtensionMainViewSurface, session: MobileExtensionLibrarySession,
+      call: MobileExtensionLibraryCall, signal: AbortSignal
+    ): Promise<MobileExtensionLibraryCallResult> => {
+      try {
+        return await owned(signal, async (current) => {
+          const lease = libraryLeases.get(session);
+          if (lease === undefined || lease.extensionKey !== mobileExtensionKey(expected)
+            || !sameMobileExtensionMainViewSurface(lease.surface, surface) || session.expiresAt <= Date.now()) {
+            throw new Error("The Extension Library session is not owned by this surface.");
+          }
+          await requireLibrarySurface(expected, surface, current);
+          requireCurrent(current);
+          if (libraryLeases.get(session) !== lease) throw new Error("The Extension Library session was closed.");
+          const result = await this.network.callExtensionLibrary(context.credential, session.id, call, current);
+          requireCurrent(current);
+          if (libraryLeases.get(session) !== lease) throw new Error("The Extension Library call result was retired.");
+          return result;
+        });
+      } catch (error) {
+        await closeLibrary(session).catch(() => undefined);
+        throw error;
+      }
+    };
+    const libraryStatus = (expected: MobileExtension, surface: MobileExtensionMainViewSurface, signal: AbortSignal) =>
+      owned(signal, async (current) => {
+        const extension = await requireLibrarySurface(expected, surface, current);
+        const overview = await this.network.getExtensionLibraryOverview(context.credential, extension.extensionId, extension.revision, current);
+        requireCurrent(current);
+        return overview;
+      });
+    const loadLibrary = (
+      expected: MobileExtension,
+      signal: AbortSignal
+    ): Promise<MobileExtensionLibrarySnapshot> => owned(signal, async (current) =>
+      (await readLibrarySnapshot(expected, current)).snapshot);
+    const validateLibraryLocation = (
+      expected: MobileExtension,
+      candidate: string,
+      signal: AbortSignal
+    ): Promise<MobileExtensionLibraryLocationValidation> => owned(signal, async (current) => {
+      const extension = await readExactDetail(expected, current);
+      if (!mobileExtensionLibraryReady(extension)) {
+        throw new Error("Enable and finish setting up this Extension before changing its Library location.");
+      }
+      if (pendingForExtension(extension.extensionId)) {
+        throw new Error("A previous change to this Extension still has an unresolved result. Check its operation receipt first.");
+      }
+      const exactCandidate = normalizeMobileExtensionLibraryCandidate(candidate);
+      const validation = await this.network.validateExtensionLibraryLocation(
+        context.credential,
+        extension.extensionId,
+        extension.revision,
+        exactCandidate,
+        current
+      );
+      requireCurrent(current);
+      return validation;
+    });
+    const mutateLibrary = (
+      expected: MobileExtension,
+      snapshot: MobileExtensionLibrarySnapshot,
+      mutation: MobileExtensionLibraryMutation,
+      signal: AbortSignal
+    ): Promise<MobileExtensionLibrarySnapshot> => owned(signal, async (current) => {
+      const fresh = await readLibrarySnapshot(expected, current);
+      const extension = fresh.extension;
+      if (!sameMobileExtensionLibrarySnapshot(snapshot, fresh.snapshot)) {
+        throw new Error("The Extension Library changed; refresh it before performing this action.");
+      }
+      if (pendingForExtension(extension.extensionId)) {
+        throw new Error("A previous change to this Extension still has an unresolved result. Check its operation receipt first.");
+      }
+      const overview = fresh.snapshot.overview;
+      const requireReadyOverview = (): NonNullable<MobileExtensionLibrarySnapshot["overview"]> => {
+        if (!mobileExtensionLibraryReady(extension) || overview === undefined) {
+          throw new Error("Enable and finish setting up this Extension before changing its Library.");
+        }
+        return overview;
+      };
+      let customValidation: MobileExtensionLibraryLocationValidation | undefined;
+      if (mutation.kind === "relocate" && mutation.destination.kind === "custom") {
+        requireReadyOverview();
+        const candidate = normalizeMobileExtensionLibraryCandidate(mutation.destination.candidate);
+        customValidation = await this.network.validateExtensionLibraryLocation(
+          context.credential,
+          extension.extensionId,
+          extension.revision,
+          candidate,
+          current
+        );
+        requireCurrent(current);
+        if (!sameMobileExtensionLibraryValidation(mutation.destination.validation, customValidation)) {
+          throw new Error("The Extension Library location validation changed; validate the path again.");
+        }
+      } else if (mutation.kind === "rebind") {
+        const currentOverview = requireReadyOverview();
+        if (currentOverview.state !== "unavailable"
+          || currentOverview.unavailableReason !== "diskMissing"
+            && currentOverview.unavailableReason !== "bindingMoved") {
+          throw new Error("This Extension Library can no longer be rebound from its current state.");
+        }
+        const candidate = normalizeMobileExtensionLibraryCandidate(mutation.candidate);
+        customValidation = await this.network.validateExtensionLibraryLocation(
+          context.credential,
+          extension.extensionId,
+          extension.revision,
+          candidate,
+          current
+        );
+        requireCurrent(current);
+        if (!sameMobileExtensionLibraryValidation(mutation.validation, customValidation)) {
+          throw new Error("The Extension Library location validation changed; validate the path again.");
+        }
+      }
+
+      const action = this.#claimMutation();
+      let dispatched = false;
+      try {
+        try {
+          switch (mutation.kind) {
+            case "relocate": {
+              const currentOverview = requireReadyOverview();
+              if (currentOverview.state === "unavailable") {
+                throw new Error("Repair or rebind this unavailable Extension Library before moving it.");
+              }
+              dispatched = true;
+              await this.network.relocateExtensionLibrary(
+                context.credential,
+                extension.extensionId,
+                extension.revision,
+                mutation.destination.kind === "default"
+                  ? { kind: "default" }
+                  : {
+                      kind: "custom",
+                      candidate: normalizeMobileExtensionLibraryCandidate(mutation.destination.candidate)
+                    },
+                current
+              );
+              break;
+            }
+            case "rebind":
+              dispatched = true;
+              await this.network.rebindExtensionLibrary(
+                context.credential,
+                extension.extensionId,
+                extension.revision,
+                normalizeMobileExtensionLibraryCandidate(mutation.candidate),
+                current
+              );
+              break;
+            case "unbind": {
+              const currentOverview = requireReadyOverview();
+              if (currentOverview.location === undefined) throw new Error("This Extension Library is already unbound.");
+              dispatched = true;
+              await this.network.unbindExtensionLibrary(
+                context.credential,
+                extension.extensionId,
+                extension.revision,
+                current
+              );
+              break;
+            }
+            case "repairState": {
+              const currentOverview = requireReadyOverview();
+              if (currentOverview.state !== "unavailable" || currentOverview.unavailableReason !== "stateCorrupt") {
+                throw new Error("The Extension Library state no longer requires repair.");
+              }
+              dispatched = true;
+              await this.network.repairExtensionLibraryState(context.credential, current);
+              break;
+            }
+            case "repairMetadata": {
+              const currentOverview = requireReadyOverview();
+              if (currentOverview.state !== "unavailable" || currentOverview.unavailableReason !== "metadataCorrupt") {
+                throw new Error("The Extension Library metadata no longer requires repair.");
+              }
+              dispatched = true;
+              await this.network.repairExtensionLibraryMetadata(
+                context.credential,
+                extension.extensionId,
+                extension.revision,
+                current
+              );
+              break;
+            }
+            case "trash": {
+              const currentOverview = requireReadyOverview();
+              if (currentOverview.state === "unavailable" || currentOverview.location === undefined
+                || mutation.confirmation !== extension.name) {
+                throw new Error("Enter the exact current Extension name before moving its Library to trash.");
+              }
+              dispatched = true;
+              await this.network.trashExtensionLibrary(
+                context.credential,
+                extension.extensionId,
+                extension.revision,
+                mutation.confirmation,
+                current
+              );
+              break;
+            }
+            case "restore": {
+              const entries = fresh.snapshot.trash.filter((entry) => entry.id === mutation.entry.id);
+              if (entries.length !== 1 || !sameMobileExtensionLibraryTrashEntry(entries[0]!, mutation.entry)
+                || mutation.confirmation !== mutation.entry.name) {
+                throw new Error("The Extension Library trash record changed; refresh before restoring it.");
+              }
+              dispatched = true;
+              await this.network.restoreExtensionLibraryTrash(
+                context.credential,
+                extension.extensionId,
+                mutation.entry.id,
+                mutation.confirmation,
+                mutation.destination,
+                current
+              );
+              break;
+            }
+            case "purge": {
+              const entries = fresh.snapshot.trash.filter((entry) => entry.id === mutation.entry.id);
+              if (entries.length !== 1 || !sameMobileExtensionLibraryTrashEntry(entries[0]!, mutation.entry)
+                || mutation.confirmation !== mutation.entry.name) {
+                throw new Error("The Extension Library trash record changed; refresh before purging it.");
+              }
+              dispatched = true;
+              await this.network.purgeExtensionLibraryTrash(
+                context.credential,
+                extension.extensionId,
+                mutation.entry.id,
+                mutation.confirmation,
+                current
+              );
+              break;
+            }
+            case "rollback": {
+              requireReadyOverview();
+              const entries = fresh.snapshot.grace.filter((entry) => entry.id === mutation.entry.id);
+              if (entries.length !== 1 || !sameMobileExtensionLibraryGraceEntry(entries[0]!, mutation.entry)) {
+                throw new Error("The Extension Library grace record changed; refresh before rolling it back.");
+              }
+              dispatched = true;
+              await this.network.rollbackExtensionLibrary(
+                context.credential,
+                extension.extensionId,
+                extension.revision,
+                mutation.entry.id,
+                current
+              );
+              break;
+            }
+          }
+          requireCurrent(current);
+          return (await readLibrarySnapshot(expected, current)).snapshot;
+        } catch (cause) {
+          if (!dispatched) throw cause;
+          const detail = cause instanceof Error && cause.message.trim().length > 0 ? ` ${cause.message}` : "";
+          throw new Error(`The Extension Library action could not be confirmed. Refresh before trying another action; it was not resent.${detail}`);
+        }
+      } finally {
+        this.#releaseMutation(action);
+      }
+    });
+    const exactPending = (operationId: string) => {
+      const matches = this.#state.pending.filter((receipt) => receipt.operationId === operationId
+        && receipt.connectionId === context.credential.connectionId
+        && isMobileExtensionReceiptKind(receipt.kind));
+      if (matches.length !== 1) throw new Error("Select a current Extension operation receipt.");
+      return matches[0]!;
+    };
+    return {
+      ownerKey,
+      pending: Object.freeze(this.#state.pending.flatMap((receipt) => receipt.connectionId === context.credential.connectionId
+        && receipt.extensionId !== undefined && isMobileExtensionReceiptKind(receipt.kind)
+        ? [{ operationId: receipt.operationId, extensionId: receipt.extensionId,
+            kind: mobileExtensionPendingMutationKind(receipt.kind),
+            state: receipt.state }]
+        : [])),
+      list: (signal) => owned(signal, (current) => this.network.listExtensions(context.credential, current)),
+      detail: (expected, signal) => owned(signal, (current) => readExactDetail(expected, current)),
+      setEnabled: (expected, enabled, signal) => mutate(expected, "enabled", enabled, signal),
+      setSidebarVisible: (expected, visible, signal) => mutate(expected, "sidebar", visible, signal),
+      beginSetup,
+      submitSetupInteraction,
+      saveSetupCredential,
+      completeSetup,
+      cancelSetup,
+      revokeSetup,
+      tasks: (expected) => isCurrent() ? projectMobileExtensionTaskChoices(this.#state.owner, expected) : [],
+      useCommand,
+      openMainView,
+      probeMainView,
+      closeMainView: (expected) => this.network.closeExtensionMainView(
+        context.credential,
+        expected.surfaceId
+      ),
+      openLibrary,
+      callLibrary,
+      closeLibrary,
+      libraryStatus,
+      loadLibrary,
+      validateLibraryLocation,
+      mutateLibrary,
+      reconcile: (operationId, signal) => owned(signal, async (current) => {
+        exactPending(operationId);
+        await this.reconcile();
+        requireCurrent(current);
+      }),
+      dismiss: (operationId, signal) => owned(signal, async (current) => {
+        const pending = exactPending(operationId);
+        if (pending.state !== "unknown") throw new Error("Only an unconfirmed Extension operation can be cleared.");
+        await this.dismissUnconfirmed(operationId);
+        requireCurrent(current);
+      })
+    };
+  }
+
+  #assertExtensionMutationAcknowledgement(operation: Operation): void {
+    const payload = operation.result?.payload;
+    if (payload?.case !== "acknowledgement" || payload.value.accepted !== true) {
+      throw new Error("The Joko node completed the Extension change without an accepted acknowledgement.");
+    }
+  }
 
   remoteDesktopTransport(): MobileRemoteDesktopTransport | undefined {
     const credential = this.#credential;
@@ -11439,7 +12460,7 @@ export class MobileClient {
 
   async #submit(
     mutation: OperationMutation,
-    identity: Pick<PendingOperation, "kind" | "sessionId" | "eventId" | "queueItemId" | "interactionId" | "interactionGeneration" | "interactionRevision" | "interactionDraftKind" | "targetConnectionId" | "targetDeviceId" | "scheduleId" | "triggerId" | "targetId" | "backendId" | "sourceGeneration" | "workspaceId" | "changeSetId">,
+    identity: Pick<PendingOperation, "kind" | "sessionId" | "eventId" | "queueItemId" | "interactionId" | "interactionGeneration" | "interactionRevision" | "interactionDraftKind" | "targetConnectionId" | "targetDeviceId" | "scheduleId" | "triggerId" | "targetId" | "backendId" | "sourceGeneration" | "workspaceId" | "changeSetId" | "extensionId" | "extensionRevision">,
     operationId?: string
   ): Promise<boolean> {
     return (await this.#submitTracked(mutation, identity, false, operationId)).accepted;
@@ -11447,7 +12468,7 @@ export class MobileClient {
 
   async #submitTerminal(
     mutation: OperationMutation,
-    identity: Pick<PendingOperation, "kind" | "sessionId" | "eventId" | "queueItemId" | "interactionId" | "interactionGeneration" | "interactionRevision" | "interactionDraftKind" | "targetConnectionId" | "targetDeviceId" | "scheduleId" | "triggerId" | "targetId" | "backendId" | "sourceGeneration" | "workspaceId" | "changeSetId">,
+    identity: Pick<PendingOperation, "kind" | "sessionId" | "eventId" | "queueItemId" | "interactionId" | "interactionGeneration" | "interactionRevision" | "interactionDraftKind" | "targetConnectionId" | "targetDeviceId" | "scheduleId" | "triggerId" | "targetId" | "backendId" | "sourceGeneration" | "workspaceId" | "changeSetId" | "extensionId" | "extensionRevision">,
     operationId?: string,
     markBusy = true,
     refreshAfter = true,
@@ -11460,7 +12481,7 @@ export class MobileClient {
 
   async #submitTracked(
     mutation: OperationMutation,
-    identity: Pick<PendingOperation, "kind" | "sessionId" | "eventId" | "queueItemId" | "interactionId" | "interactionGeneration" | "interactionRevision" | "interactionDraftKind" | "targetConnectionId" | "targetDeviceId" | "scheduleId" | "triggerId" | "targetId" | "backendId" | "sourceGeneration" | "workspaceId" | "changeSetId">,
+    identity: Pick<PendingOperation, "kind" | "sessionId" | "eventId" | "queueItemId" | "interactionId" | "interactionGeneration" | "interactionRevision" | "interactionDraftKind" | "targetConnectionId" | "targetDeviceId" | "scheduleId" | "triggerId" | "targetId" | "backendId" | "sourceGeneration" | "workspaceId" | "changeSetId" | "extensionId" | "extensionRevision">,
     waitForTerminal: boolean,
     operationId = this.newId(),
     markBusy = true,
@@ -11602,6 +12623,10 @@ export class MobileClient {
           }
           const messageRewind = pending.kind === "session-rewind" || pending.kind === "workspace-rewind";
           const exactOperation = operation.operationId === pending.operationId && operation.connectionId === pending.connectionId;
+          if (isMobileExtensionReceiptKind(pending.kind)
+            && exactOperation && operation.state === OperationState.SUCCEEDED) {
+            this.#assertExtensionMutationAcknowledgement(operation);
+          }
           if (messageRewind && exactOperation && operation.state === OperationState.SUCCEEDED) {
             await this.#recoverMessageRewindReceipt(pending, operation, epoch);
             if (!this.#current(epoch)) return;

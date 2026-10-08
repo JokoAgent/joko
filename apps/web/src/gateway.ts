@@ -5233,11 +5233,13 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
   async openExtensionLibrary(
     extensionId: string,
     expectedRevision: bigint,
+    surfaceId: string,
     signal?: AbortSignal
   ): Promise<ExtensionLibrarySessionView> {
     const scope = this.captureActionScope(signal);
     const response = await createClient(ExtensionService, scope.transport).openExtensionLibrary({
       extensionId,
+      surfaceId,
       expectedRevision: { value: expectedRevision }
     }, { signal: scope.signal });
     if (response.library === undefined) throw new GatewayError("Orchestrator returned an empty Extension Library session.");
