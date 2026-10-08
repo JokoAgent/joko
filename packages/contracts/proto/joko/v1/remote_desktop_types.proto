@@ -1,0 +1,312 @@
+syntax = "proto3";
+
+package joko.v1;
+
+import "google/protobuf/timestamp.proto";
+
+// Portable Remote Desktop values shared by the authenticated controller
+// service and the target-side DevicePeer command route. Screen, signaling,
+// input, and lease payloads are ephemeral and must never be persisted.
+enum RemoteDesktopPermissionStatus {
+  REMOTE_DESKTOP_PERMISSION_STATUS_UNSPECIFIED = 0;
+  REMOTE_DESKTOP_PERMISSION_STATUS_GRANTED = 1;
+  REMOTE_DESKTOP_PERMISSION_STATUS_MISSING = 2;
+  REMOTE_DESKTOP_PERMISSION_STATUS_UNKNOWN = 3;
+  REMOTE_DESKTOP_PERMISSION_STATUS_NOT_REQUIRED = 4;
+}
+
+message RemoteDesktopPermissions {
+  RemoteDesktopPermissionStatus screen_recording = 1;
+  RemoteDesktopPermissionStatus accessibility = 2;
+}
+
+message RemoteDesktopDisplay {
+  string display_id = 1;
+  string name = 2;
+  uint32 width = 3;
+  uint32 height = 4;
+}
+
+// A host-enumerated macOS display mode. IDs are opaque to controllers and are
+// valid only for the exact display and lease that produced this list.
+message RemoteDesktopDisplayMode {
+  string mode_id = 1;
+  uint32 width = 2;
+  uint32 height = 3;
+  bool current = 4;
+  bool native = 5;
+}
+
+message RemoteDesktopCapabilities {
+  uint32 protocol_version = 1;
+  bool enabled = 2;
+  bool can_control = 3;
+  string platform = 4;
+  repeated RemoteDesktopDisplay displays = 5;
+  RemoteDesktopPermissions permissions = 6;
+  bool automatic_reconnect = 7;
+  bool connection_takeover = 8;
+  bool webrtc_video = 9;
+  bool trickle_ice = 10;
+  bool jpeg_fallback = 11;
+  bool clipboard_text = 12;
+  bool clipboard_content = 13;
+  bool video_settings = 14;
+  bool system_audio = 15;
+  bool background_viewing = 16;
+  bool display_modes = 17;
+  bool cursor_overlay = 18;
+}
+
+enum RemoteDesktopStartMode {
+  REMOTE_DESKTOP_START_MODE_UNSPECIFIED = 0;
+  REMOTE_DESKTOP_START_MODE_NEW = 1;
+  REMOTE_DESKTOP_START_MODE_RESUME = 2;
+  REMOTE_DESKTOP_START_MODE_TAKEOVER = 3;
+}
+
+enum RemoteDesktopMouseButton {
+  REMOTE_DESKTOP_MOUSE_BUTTON_UNSPECIFIED = 0;
+  REMOTE_DESKTOP_MOUSE_BUTTON_LEFT = 1;
+  REMOTE_DESKTOP_MOUSE_BUTTON_MIDDLE = 2;
+  REMOTE_DESKTOP_MOUSE_BUTTON_RIGHT = 3;
+}
+
+message RemoteDesktopPointerMoveInput {
+  double x = 1;
+  double y = 2;
+}
+
+message RemoteDesktopPointerButtonInput {
+  RemoteDesktopMouseButton button = 1;
+  bool down = 2;
+  double x = 3;
+  double y = 4;
+}
+
+message RemoteDesktopScrollInput {
+  double delta_x = 1;
+  double delta_y = 2;
+}
+
+message RemoteDesktopKeyInput {
+  string code = 1;
+  bool down = 2;
+}
+
+message RemoteDesktopTextInput {
+  string text = 1;
+}
+
+message RemoteDesktopReleaseInput {}
+
+message RemoteDesktopInputEvent {
+  oneof event {
+    RemoteDesktopPointerMoveInput move = 1;
+    RemoteDesktopPointerButtonInput button = 2;
+    RemoteDesktopScrollInput scroll = 3;
+    RemoteDesktopKeyInput key = 4;
+    RemoteDesktopTextInput text = 5;
+    RemoteDesktopReleaseInput release = 6;
+  }
+}
+
+message RemoteDesktopIceCandidate {
+  string candidate = 1;
+  optional string sdp_mid = 2;
+  optional uint32 sdp_m_line_index = 3;
+  optional string username_fragment = 4;
+}
+
+// Credentials, when present, are short lived and returned only for an active
+// lease. They must not enter Settings, Event, Session, logs, or diagnostics.
+message RemoteDesktopIceServer {
+  repeated string urls = 1;
+  optional string username = 2;
+  optional string credential = 3;
+  google.protobuf.Timestamp expires_at = 4;
+}
+
+message RemoteDesktopLease {
+  string lease_id = 1;
+  RemoteDesktopDisplay display = 2;
+  bool controlling = 3;
+  uint64 control_generation = 4;
+}
+
+message RemoteDesktopControlState {
+  bool controlling = 1;
+  uint64 control_generation = 2;
+}
+
+// Viewer intent for exact WebRTC capture settings. The host owns all concrete
+// capture and encoder parameters for these fixed v1 product choices.
+enum RemoteDesktopVideoQuality {
+  REMOTE_DESKTOP_VIDEO_QUALITY_UNSPECIFIED = 0;
+  REMOTE_DESKTOP_VIDEO_QUALITY_AUTO = 1;
+  REMOTE_DESKTOP_VIDEO_QUALITY_SAVER = 2;
+  REMOTE_DESKTOP_VIDEO_QUALITY_HD = 3;
+}
+
+message RemoteDesktopVideoSettings {
+  uint32 fps = 1;
+  RemoteDesktopVideoQuality quality = 2;
+  bool audio = 3;
+}
+
+// Internal target proof that a trusted capture renderer observed a fresh
+// DataChannel pong while the exact lease was in system presentation mode.
+message RemoteDesktopPresentationProof {
+  string lease_id = 1;
+  uint64 proof_sequence = 2;
+}
+
+// Legacy explicit text Copy/Paste remains a first-class route for controllers
+// without a native rich-clipboard module. Text is bounded to 16,384 UTF-16
+// code units by every boundary and is never synchronized automatically.
+message RemoteDesktopClipboardTextCopyAction {}
+
+message RemoteDesktopClipboardTextPasteAction {
+  string text = 1;
+}
+
+message RemoteDesktopClipboardTextRequest {
+  string lease_id = 1;
+  uint64 control_generation = 2;
+  oneof action {
+    RemoteDesktopClipboardTextCopyAction copy = 10;
+    RemoteDesktopClipboardTextPasteAction paste = 11;
+  }
+}
+
+message RemoteDesktopClipboardTextResult {
+  optional string text = 1;
+}
+
+// One portable clipboard item. The rich transfer serializes this exact shape
+// as JSON and chunks that JSON; no paths, private formats, external fetches,
+// or asset dereferences are representable. url is portable content only.
+message RemoteDesktopClipboardContent {
+  optional string text = 1;
+  optional string html = 2;
+  optional string rtf = 3;
+  optional string url = 4;
+  optional string png = 5;
+}
+
+message RemoteDesktopClipboardContentCopyAction {}
+
+message RemoteDesktopClipboardContentBeginAction {
+  uint32 length = 1;
+}
+
+message RemoteDesktopClipboardContentReadAction {
+  string transfer_id = 1;
+  uint32 offset = 2;
+}
+
+message RemoteDesktopClipboardContentWriteAction {
+  string transfer_id = 1;
+  uint32 offset = 2;
+  string data = 3;
+}
+
+message RemoteDesktopClipboardContentCommitAction {
+  string transfer_id = 1;
+}
+
+message RemoteDesktopClipboardContentCancelAction {
+  string transfer_id = 1;
+}
+
+message RemoteDesktopClipboardContentRequest {
+  string lease_id = 1;
+  uint64 control_generation = 2;
+  oneof action {
+    RemoteDesktopClipboardContentCopyAction copy = 10;
+    RemoteDesktopClipboardContentBeginAction begin = 11;
+    RemoteDesktopClipboardContentReadAction read = 12;
+    RemoteDesktopClipboardContentWriteAction write = 13;
+    RemoteDesktopClipboardContentCommitAction commit = 14;
+    RemoteDesktopClipboardContentCancelAction cancel = 15;
+  }
+}
+
+message RemoteDesktopClipboardContentResult {
+  optional string transfer_id = 1;
+  optional uint32 length = 2;
+  optional string data = 3;
+}
+
+message RemoteDesktopOfferResult {
+  string attempt_id = 1;
+  string answer_sdp = 2;
+}
+
+message RemoteDesktopIceExchangeResult {
+  string attempt_id = 1;
+  repeated RemoteDesktopIceCandidate candidates = 2;
+  uint32 next = 3;
+  bool complete = 4;
+}
+
+message RemoteDesktopFrame {
+  bytes jpeg = 1;
+  // Absent hides the native cursor overlay. Cursor pixels never contain a URL
+  // or markup and are bounded independently from the JPEG frame.
+  RemoteDesktopCursor cursor = 2;
+}
+
+// Coordinates are normalized to the selected display. Size and hotspot are
+// measured in desktop points; png is a bounded raster image.
+message RemoteDesktopCursor {
+  bool visible = 1;
+  double x = 2;
+  double y = 3;
+  double width = 4;
+  double height = 5;
+  double hot_x = 6;
+  double hot_y = 7;
+  bytes png = 8;
+}
+
+// An absent frame means the bounded JPEG fallback is throttled or already has
+// one capture in flight; it never means that an older frame may be replayed.
+message RemoteDesktopFrameResult {
+  RemoteDesktopFrame frame = 1;
+}
+
+enum RemoteDesktopFailureReason {
+  REMOTE_DESKTOP_FAILURE_REASON_UNSPECIFIED = 0;
+  REMOTE_DESKTOP_FAILURE_REASON_DISABLED = 1;
+  REMOTE_DESKTOP_FAILURE_REASON_BUSY = 2;
+  REMOTE_DESKTOP_FAILURE_REASON_STOPPED = 3;
+  REMOTE_DESKTOP_FAILURE_REASON_LEASE_EXPIRED = 4;
+  REMOTE_DESKTOP_FAILURE_REASON_DISPLAY_MISSING = 5;
+  REMOTE_DESKTOP_FAILURE_REASON_SCREEN_PERMISSION_REQUIRED = 6;
+  REMOTE_DESKTOP_FAILURE_REASON_ACCESSIBILITY_PERMISSION_REQUIRED = 7;
+  REMOTE_DESKTOP_FAILURE_REASON_INPUT_UNAVAILABLE = 8;
+  REMOTE_DESKTOP_FAILURE_REASON_INPUT_BUSY = 9;
+  REMOTE_DESKTOP_FAILURE_REASON_VIEW_ONLY = 10;
+  REMOTE_DESKTOP_FAILURE_REASON_VIDEO_UNAVAILABLE = 11;
+  REMOTE_DESKTOP_FAILURE_REASON_VIDEO_BUSY = 12;
+  REMOTE_DESKTOP_FAILURE_REASON_VIDEO_TIMEOUT = 13;
+  REMOTE_DESKTOP_FAILURE_REASON_AUTHORITY_CHANGED = 14;
+  REMOTE_DESKTOP_FAILURE_REASON_UNSUPPORTED = 15;
+  REMOTE_DESKTOP_FAILURE_REASON_LOCKED_SESSION_UNSUPPORTED = 16;
+  REMOTE_DESKTOP_FAILURE_REASON_CLIPBOARD_UNAVAILABLE = 17;
+  REMOTE_DESKTOP_FAILURE_REASON_CLIPBOARD_BUSY = 18;
+  REMOTE_DESKTOP_FAILURE_REASON_CLIPBOARD_EMPTY = 19;
+  REMOTE_DESKTOP_FAILURE_REASON_CLIPBOARD_TOO_LARGE = 20;
+  REMOTE_DESKTOP_FAILURE_REASON_CLIPBOARD_UNSUPPORTED = 21;
+  REMOTE_DESKTOP_FAILURE_REASON_CLIPBOARD_EXPIRED = 22;
+  REMOTE_DESKTOP_FAILURE_REASON_AUDIO_UNAVAILABLE = 23;
+  REMOTE_DESKTOP_FAILURE_REASON_DISPLAY_MODES_UNAVAILABLE = 24;
+  REMOTE_DESKTOP_FAILURE_REASON_DISPLAY_MODE_MISSING = 25;
+  REMOTE_DESKTOP_FAILURE_REASON_DISPLAY_BUSY = 26;
+}
+
+message RemoteDesktopFailure {
+  RemoteDesktopFailureReason reason = 1;
+  bool retryable = 2;
+}

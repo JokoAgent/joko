@@ -31,6 +31,8 @@ import type {
   DesktopSystemLocale,
   DesktopManagedOrchestratorConnection,
   DesktopManagedOrchestratorStatus,
+  DesktopRemoteDesktopPermissions,
+  DesktopRemoteDesktopSnapshot,
   DesktopMicrophonePermissionSnapshot,
   DesktopMicrophoneReleaseReason,
   DesktopNativeTaskStatusAction,
@@ -225,6 +227,12 @@ const DESKTOP_CHANNELS = {
   managedOrchestratorRetry: "joko:managed-orchestrator:retry",
   managedOrchestratorAdoptConnection: "joko:managed-orchestrator:adopt-connection",
   managedOrchestratorCompleteLogout: "joko:managed-orchestrator:complete-logout",
+  remoteDesktopGetState: "joko:remote-desktop:get-state",
+  remoteDesktopSetEnabled: "joko:remote-desktop:set-enabled",
+  remoteDesktopDisconnect: "joko:remote-desktop:disconnect",
+  remoteDesktopGetPermissions: "joko:remote-desktop:get-permissions",
+  remoteDesktopShowPermissionGuide: "joko:remote-desktop:show-permission-guide",
+  remoteDesktopStateChanged: "joko:remote-desktop:state-changed",
   openExternal: "joko:external:open",
   updateGetStatus: "joko:update:get-status",
   updateStatus: "joko:update:status",
@@ -304,6 +312,7 @@ const desktopCapabilities = Object.freeze([
   "selection.quote.contextMenu",
   "runtime.desktopProcessUsage",
   "runtime.processMonitorWindow",
+  "remote.desktopHost",
   "session.windows",
   "extension.windows",
   "extension.libraryLocationPicker",
@@ -935,6 +944,43 @@ const desktopApi = Object.freeze({
     completeLogout: (): Promise<DesktopManagedOrchestratorStatus> =>
       ipcRenderer.invoke(DESKTOP_CHANNELS.managedOrchestratorCompleteLogout)
   }),
+  remoteDesktop: Object.freeze({
+    getState: (): Promise<DesktopRemoteDesktopSnapshot> => mainDocumentOccurrence === undefined
+      ? Promise.reject(new Error("Remote Desktop settings are unavailable outside the main Joko window."))
+      : ipcRenderer.invoke(DESKTOP_CHANNELS.remoteDesktopGetState, mainDocumentOccurrence)
+        .then(parseDesktopRemoteDesktopSnapshot),
+    setEnabled: (enabled: boolean): Promise<DesktopRemoteDesktopSnapshot> => {
+      if (typeof enabled !== "boolean") {
+        return Promise.reject(new TypeError("Remote Desktop enabled state must be boolean."));
+      }
+      if (mainDocumentOccurrence === undefined) {
+        return Promise.reject(new Error("Remote Desktop settings are unavailable outside the main Joko window."));
+      }
+      return ipcRenderer.invoke(DESKTOP_CHANNELS.remoteDesktopSetEnabled, mainDocumentOccurrence, enabled)
+        .then(parseDesktopRemoteDesktopSnapshot);
+    },
+    disconnect: (): Promise<DesktopRemoteDesktopSnapshot> => mainDocumentOccurrence === undefined
+      ? Promise.reject(new Error("Remote Desktop settings are unavailable outside the main Joko window."))
+      : ipcRenderer.invoke(DESKTOP_CHANNELS.remoteDesktopDisconnect, mainDocumentOccurrence)
+        .then(parseDesktopRemoteDesktopSnapshot),
+    getPermissions: (): Promise<DesktopRemoteDesktopPermissions> => mainDocumentOccurrence === undefined
+      ? Promise.reject(new Error("Remote Desktop settings are unavailable outside the main Joko window."))
+      : ipcRenderer.invoke(DESKTOP_CHANNELS.remoteDesktopGetPermissions, mainDocumentOccurrence)
+        .then(parseDesktopRemoteDesktopPermissions),
+    showPermissionGuide: (): Promise<DesktopRemoteDesktopPermissions> => mainDocumentOccurrence === undefined
+      ? Promise.reject(new Error("Remote Desktop settings are unavailable outside the main Joko window."))
+      : ipcRenderer.invoke(DESKTOP_CHANNELS.remoteDesktopShowPermissionGuide, mainDocumentOccurrence)
+        .then(parseDesktopRemoteDesktopPermissions),
+    onStateChanged: (listener: (state: DesktopRemoteDesktopSnapshot) => void): (() => void) => {
+      if (typeof listener !== "function") throw new TypeError("Remote Desktop state listener must be a function.");
+      const wrapped = (_event: IpcRendererEvent, value: unknown): void => {
+        try { listener(parseDesktopRemoteDesktopSnapshot(value)); }
+        catch { /* Ignore malformed host messages; the next get remains authoritative. */ }
+      };
+      ipcRenderer.on(DESKTOP_CHANNELS.remoteDesktopStateChanged, wrapped);
+      return () => ipcRenderer.removeListener(DESKTOP_CHANNELS.remoteDesktopStateChanged, wrapped);
+    }
+  }),
   credentials: Object.freeze({
     get: (profileId: string): Promise<string | undefined> => ipcRenderer.invoke(DESKTOP_CHANNELS.credentialGet, profileId),
     set: (profileId: string, secret: string): Promise<void> => ipcRenderer.invoke(DESKTOP_CHANNELS.credentialSet, profileId, secret),
@@ -1005,6 +1051,75 @@ const desktopApi = Object.freeze({
 });
 
 contextBridge.exposeInMainWorld("jokoDesktop", desktopApi);
+
+function parseDesktopRemoteDesktopPermissions(value: unknown): DesktopRemoteDesktopPermissions {
+  if (!exactRemoteDesktopRecord(value, ["screenRecording", "accessibility"])
+    || !isRemoteDesktopPermissionStatus(value["screenRecording"])
+    || !isRemoteDesktopPermissionStatus(value["accessibility"])) {
+    throw new TypeError("Remote Desktop permissions are invalid.");
+  }
+  return Object.freeze({
+    screenRecording: value["screenRecording"],
+    accessibility: value["accessibility"]
+  });
+}
+
+function parseDesktopRemoteDesktopSnapshot(value: unknown): DesktopRemoteDesktopSnapshot {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new TypeError("Remote Desktop state is invalid.");
+  }
+  const candidate = value as Record<string, unknown>;
+  const keys = candidate["active"] === true
+    ? ["enabled", "active", "controlling", "controllerDeviceId", "displayId", "permissions"]
+    : ["enabled", "active", "controlling", "permissions"];
+  if (!exactRemoteDesktopRecord(candidate, keys)
+    || typeof candidate["enabled"] !== "boolean"
+    || typeof candidate["active"] !== "boolean"
+    || typeof candidate["controlling"] !== "boolean"
+    || (!candidate["active"] && candidate["controlling"])
+    || (candidate["active"] && (!boundedRemoteDesktopIdentity(candidate["controllerDeviceId"])
+      || !boundedRemoteDesktopIdentity(candidate["displayId"])))) {
+    throw new TypeError("Remote Desktop state is invalid.");
+  }
+  const permissions = parseDesktopRemoteDesktopPermissions(candidate["permissions"]);
+  return candidate["active"]
+    ? Object.freeze({
+        enabled: candidate["enabled"],
+        active: true,
+        controlling: candidate["controlling"],
+        controllerDeviceId: candidate["controllerDeviceId"] as string,
+        displayId: candidate["displayId"] as string,
+        permissions
+      })
+    : Object.freeze({
+        enabled: candidate["enabled"],
+        active: false,
+        controlling: false,
+        permissions
+      });
+}
+
+function exactRemoteDesktopRecord(
+  value: unknown,
+  keys: readonly string[]
+): value is Record<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const actual = Object.keys(value).sort();
+  const expected = [...keys].sort();
+  return actual.length === expected.length
+    && actual.every((key, index) => key === expected[index]);
+}
+
+function isRemoteDesktopPermissionStatus(
+  value: unknown
+): value is DesktopRemoteDesktopPermissions["screenRecording"] {
+  return value === "granted" || value === "missing" || value === "unknown" || value === "notRequired";
+}
+
+function boundedRemoteDesktopIdentity(value: unknown): value is string {
+  return typeof value === "string" && value.length >= 1 && value.length <= 256
+    && value.trim() === value && !/[\u0000-\u001f\u007f]/u.test(value);
+}
 
 function readPreferredSystemLocale(): DesktopSystemLocale {
   try {

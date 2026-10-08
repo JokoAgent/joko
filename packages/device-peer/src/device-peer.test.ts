@@ -67,6 +67,7 @@ describe("current-v1 device peer route ownership", () => {
     expect(live.retirements).toEqual([]);
     expect(() => registry.registerClaim({
       requestId: "pending-command",
+      controllerDeviceId: "controller-a",
       targetDeviceId: "target-a",
       routeGeneration: pendingLease.routeGeneration,
       capability: "files",
@@ -90,6 +91,7 @@ describe("current-v1 device peer route ownership", () => {
       protocolVersion: DEVICE_PEER_PROTOCOL_VERSION,
       kind: "claim",
       requestId: "unregistered",
+      controllerDeviceId: "controller-a",
       targetDeviceId: "target-a",
       routeGeneration: lease.routeGeneration,
       capability: "files",
@@ -103,6 +105,7 @@ describe("current-v1 device peer route ownership", () => {
 
     const claim = registry.registerClaim({
       requestId: "read-1",
+      controllerDeviceId: "controller-a",
       targetDeviceId: "target-a",
       routeGeneration: lease.routeGeneration,
       capability: "files",
@@ -131,6 +134,7 @@ describe("current-v1 device peer route ownership", () => {
 
     expect(() => registry.registerClaim({
       requestId: "terminal-without-capability",
+      controllerDeviceId: "controller-a",
       targetDeviceId: "target-a",
       routeGeneration: lease.routeGeneration,
       capability: "terminal",
@@ -156,6 +160,7 @@ describe("current-v1 device peer route ownership", () => {
     const lease = registry.registerRoute("target-a", target.transport);
     const claim = registry.registerClaim({
       requestId: "mkdir-1",
+      controllerDeviceId: "controller-a",
       targetDeviceId: "target-a",
       routeGeneration: lease.routeGeneration,
       capability: "files",
@@ -187,6 +192,7 @@ describe("current-v1 device peer route ownership", () => {
     const mismatchLease = mismatchRegistry.registerRoute("target-a", mismatch.transport);
     const mismatchClaim = mismatchRegistry.registerClaim({
       requestId: "process-1",
+      controllerDeviceId: "controller-a",
       targetDeviceId: "target-a",
       routeGeneration: mismatchLease.routeGeneration,
       capability: "process",
@@ -214,6 +220,7 @@ describe("current-v1 device peer route ownership", () => {
     const lease = registry.registerRoute("target-a", target.transport);
     const claim = registry.registerClaim({
       requestId: "process-start",
+      controllerDeviceId: "controller-a",
       targetDeviceId: "target-a",
       routeGeneration: lease.routeGeneration,
       capability: "process",
@@ -242,6 +249,7 @@ describe("current-v1 device peer route ownership", () => {
     const abortEffect = deferred<DevicePeerAgentOutcome>();
     const abortClaim = registry.registerClaim({
       requestId: "process-abort",
+      controllerDeviceId: "controller-a",
       targetDeviceId: "target-a",
       routeGeneration: 2,
       capability: "process",
@@ -263,6 +271,7 @@ describe("current-v1 device peer route ownership", () => {
 
     const liveAbortClaim = registry.registerClaim({
       requestId: "process-abort-live",
+      controllerDeviceId: "controller-a",
       targetDeviceId: "target-a",
       routeGeneration: 3,
       capability: "process",
@@ -286,6 +295,7 @@ describe("current-v1 device peer route ownership", () => {
     registry.subscribe(firstLease, (event) => firstEvents.push(event));
     const firstClaim = registry.registerClaim({
       requestId: "terminal-1",
+      controllerDeviceId: "controller-a",
       targetDeviceId: "target-a",
       routeGeneration: firstLease.routeGeneration,
       capability: "terminal",
@@ -332,6 +342,7 @@ describe("current-v1 device peer route ownership", () => {
     registry.subscribe(secondLease, (event) => secondEvents.push(event));
     const secondClaim = registry.registerClaim({
       requestId: "process-2",
+      controllerDeviceId: "controller-a",
       targetDeviceId: "target-a",
       routeGeneration: 2,
       capability: "process",
@@ -385,6 +396,7 @@ describe("current-v1 device peer route ownership", () => {
     registry.subscribe(lease, (event) => events.push(event));
     const claim = registry.registerClaim({
       requestId: "listener-1",
+      controllerDeviceId: "controller-a",
       targetDeviceId: "target-a",
       routeGeneration: lease.routeGeneration,
       capability: "forwarding",

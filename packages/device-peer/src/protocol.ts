@@ -2,7 +2,7 @@ export const DEVICE_PEER_PROTOCOL_VERSION = 1 as const;
 /** Public route RPCs accept only this host-owned authorization purpose. */
 export const DEVICE_PEER_AGENT_AUTHORIZATION_HEADER = "x-joko-device-peer-agent-authorization";
 
-export const DEVICE_PEER_CAPABILITIES = ["files", "process", "terminal", "forwarding"] as const;
+export const DEVICE_PEER_CAPABILITIES = ["files", "process", "terminal", "forwarding", "remote_desktop"] as const;
 export type DevicePeerCapability = (typeof DEVICE_PEER_CAPABILITIES)[number];
 export type DevicePeerEffectKind = "read_only" | "side_effect";
 
@@ -28,6 +28,8 @@ export interface DevicePeerRequestFrame extends DevicePeerRouteIdentity {
   readonly protocolVersion: typeof DEVICE_PEER_PROTOCOL_VERSION;
   readonly kind: "request";
   readonly requestId: string;
+  /** Injected by the authenticated service owner; never accepted from a public request. */
+  readonly controllerDeviceId: string;
   readonly capability: DevicePeerCapability;
   readonly effectKind: DevicePeerEffectKind;
   readonly action: string;
@@ -89,16 +91,16 @@ interface DevicePeerResponseIdentity extends DevicePeerRouteIdentity {
 
 export type DevicePeerResponseFrame = DevicePeerResponseIdentity & (
   | { readonly outcome: "completed"; readonly value: unknown }
-  | { readonly outcome: "failed"; readonly errorCode: string }
+  | { readonly outcome: "failed"; readonly errorCode: string; readonly failure?: unknown }
   | { readonly outcome: "aborted" }
-  | { readonly outcome: "outcome_unknown"; readonly errorCode: string }
+  | { readonly outcome: "outcome_unknown"; readonly errorCode: string; readonly failure?: unknown }
 );
 
 export type DevicePeerAgentOutcome =
   | { readonly outcome: "completed"; readonly value: unknown }
-  | { readonly outcome: "failed"; readonly errorCode: string }
+  | { readonly outcome: "failed"; readonly errorCode: string; readonly failure?: unknown }
   | { readonly outcome: "aborted" }
-  | { readonly outcome: "outcome_unknown"; readonly errorCode: string };
+  | { readonly outcome: "outcome_unknown"; readonly errorCode: string; readonly failure?: unknown };
 
 export interface DevicePeerDispatchControl {
   readonly signal: AbortSignal;
@@ -150,11 +152,12 @@ export function assertDevicePeerHelloFrame(value: unknown): asserts value is Dev
 
 export function assertDevicePeerRequestFrame(value: unknown): asserts value is DevicePeerRequestFrame {
   const frame = strictRecord(value, [
-    "protocolVersion", "kind", "requestId", "targetDeviceId", "routeGeneration",
+    "protocolVersion", "kind", "requestId", "controllerDeviceId", "targetDeviceId", "routeGeneration",
     "capability", "effectKind", "action", "payload"
   ]);
   assertVersionAndKind(frame, "request");
   assertIdentifier(frame.requestId, "requestId");
+  assertIdentifier(frame.controllerDeviceId, "controllerDeviceId");
   assertRouteIdentity(frame);
   if (!isCapability(frame.capability)) throw invalidFrame("capability is unknown");
   if (frame.effectKind !== "read_only" && frame.effectKind !== "side_effect") {
@@ -184,10 +187,12 @@ export function assertDevicePeerRouteAcceptedFrame(value: unknown): asserts valu
 export function assertDevicePeerResponseFrame(value: unknown): asserts value is DevicePeerResponseFrame {
   if (!isRecord(value)) throw invalidFrame("frame must be an object");
   const outcome = value.outcome;
+  const hasFailure = "failure" in value;
   const keys = outcome === "completed"
     ? ["protocolVersion", "kind", "requestId", "targetDeviceId", "routeGeneration", "outcome", "value"]
     : outcome === "failed" || outcome === "outcome_unknown"
-      ? ["protocolVersion", "kind", "requestId", "targetDeviceId", "routeGeneration", "outcome", "errorCode"]
+      ? ["protocolVersion", "kind", "requestId", "targetDeviceId", "routeGeneration", "outcome", "errorCode",
+        ...(hasFailure ? ["failure"] : [])]
       : outcome === "aborted"
         ? ["protocolVersion", "kind", "requestId", "targetDeviceId", "routeGeneration", "outcome"]
         : undefined;
@@ -197,6 +202,7 @@ export function assertDevicePeerResponseFrame(value: unknown): asserts value is 
   assertIdentifier(frame.requestId, "requestId");
   assertRouteIdentity(frame);
   if (outcome === "failed" || outcome === "outcome_unknown") assertIdentifier(frame.errorCode, "errorCode", 128);
+  if (hasFailure && !isRecord(frame.failure)) throw invalidFrame("failure detail must be an object");
 }
 
 export function assertDevicePeerAbortFrame(value: unknown): asserts value is DevicePeerAbortFrame {
@@ -299,7 +305,8 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function isCapability(value: unknown): value is DevicePeerCapability {
-  return value === "files" || value === "process" || value === "terminal" || value === "forwarding";
+  return value === "files" || value === "process" || value === "terminal" || value === "forwarding"
+    || value === "remote_desktop";
 }
 
 function assertIdentifier(value: unknown, name: string, maximumLength = 256): asserts value is string {
