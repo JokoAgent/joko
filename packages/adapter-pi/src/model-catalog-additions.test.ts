@@ -14,12 +14,12 @@ async function nativeRuntime() {
 }
 
 describe("Pi model catalog additions", () => {
-  it("registers both native Astra routes while preserving authentication, existing models and future runtime metadata", async () => {
+  it("preserves both native Astra routes and their fixed installed-runtime metadata", async () => {
     const runtime = await nativeRuntime();
     const additions = createPiModelCatalogAdditions();
-    for (const [providerId, api, contextWindow] of [
-      ["openai", "openai-responses", 1_050_000],
-      ["openai-codex", "openai-codex-responses", 272_000]
+    for (const [providerId, api, minimal] of [
+      ["openai", "openai-responses", null],
+      ["openai-codex", "openai-codex-responses", "low"]
     ] as const) {
       const provider = runtime.getProvider(providerId)!;
       const extended = additions.extendProvider(provider);
@@ -29,8 +29,8 @@ describe("Pi model catalog additions", () => {
       expect(extended.getModels()).toEqual(expect.arrayContaining([...provider.getModels()]));
       runtime.registerNativeProvider(extended);
       const astra = runtime.getModel(providerId, "gpt-6-astra")!;
-      expect(astra).toMatchObject({ api, contextWindow, maxTokens: 128_000, input: ["text", "image"],
-        thinkingLevelMap: { off: null, minimal: null, xhigh: "xhigh", max: "max" },
+      expect(astra).toMatchObject({ api, contextWindow: 272_000, maxTokens: 128_000, input: ["text", "image"],
+        thinkingLevelMap: { off: null, minimal, xhigh: "xhigh", max: "max" },
         cost: { input: 10, output: 50, cacheRead: 1, cacheWrite: 12.5,
           tiers: [{ inputTokensAbove: 272_000, input: 20, output: 75, cacheRead: 2, cacheWrite: 25 }] } });
       const future = { ...astra, contextWindow: 872_000, maxTokens: 160_000 };
@@ -40,6 +40,101 @@ describe("Pi model catalog additions", () => {
       const custom = { ...provider, baseUrl: "https://gateway.example.test/v1" };
       expect(additions.extendProvider(custom)).toBe(custom);
     }
+  });
+
+  it("projects only the admitted exact provider routes and keeps unknown subscription pricing unknown", async () => {
+    const runtime = await nativeRuntime();
+    const additions = createPiModelCatalogAdditions();
+    const models = (providerId: string) => additions.extendProvider(runtime.getProvider(providerId)!).getModels();
+
+    expect(models("kimi-coding").find((model) => model.id === "kimi-for-coding")).toMatchObject({
+      name: "Kimi K2.8 Preview",
+      contextWindow: 1_048_576,
+      maxTokens: 32_768,
+      input: ["text", "image"],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      thinkingLevelMap: { low: "low", high: "high", max: "max" }
+    });
+    expect(additions.referenceCatalogMetadata(models("kimi-coding").find((model) => model.id === "kimi-for-coding")!))
+      .toEqual({ cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } });
+
+    const deepSeek = models("deepseek");
+    expect(deepSeek.some((model) => model.id === "deepseek-v4-flash")).toBe(false);
+    expect(deepSeek.find((model) => model.id === "deepseek-flash")).toMatchObject({
+      contextWindow: 1_048_576,
+      maxTokens: 384_000,
+      input: ["text", "image"],
+      cost: { input: 0.3, output: 1.2, cacheRead: 0.006, cacheWrite: 0 }
+    });
+    expect(deepSeek.find((model) => model.id === "deepseek-v4-pro")?.cost)
+      .toEqual({ input: 1.32, output: 3.96, cacheRead: 0.044, cacheWrite: 0 });
+
+    const xiaomi = models("xiaomi");
+    expect(xiaomi.filter((model) => model.id.startsWith("mimo-v2.6")).map((model) => model.id)).toEqual([
+      "mimo-v2.6-pro", "mimo-v2.6-flash", "mimo-v2.6-pro-ultraspeed"
+    ]);
+    expect(xiaomi.find((model) => model.id === "mimo-v2.6-pro")).toMatchObject({
+      contextWindow: 1_048_576,
+      maxTokens: 131_072,
+      reasoning: true,
+      input: ["text", "image"],
+      thinkingLevelMap: { off: null, minimal: null, low: null, medium: null, high: null, xhigh: null, max: null }
+    });
+    expect(xiaomi.find((model) => model.id === "mimo-v2.6-pro-ultraspeed")?.input).toEqual(["text"]);
+    expect(additions.referenceCatalogMetadata(xiaomi.find((model) => model.id === "mimo-v2.6-flash")!))
+      .toMatchObject({
+        cost: { input: 1, output: 2, cacheRead: 0.02, cacheWrite: 0 },
+        pricing: { currencyCode: "CNY" }
+      });
+    expect(additions.referenceCatalogMetadata(xiaomi.find((model) => model.id === "mimo-v2.5")!))
+      .toEqual({ defaultVisible: false });
+
+    const xiaomiTokenPlan = models("xiaomi-token-plan-cn");
+    expect(xiaomiTokenPlan.filter((model) => model.id.startsWith("mimo-v2.6")).map((model) => model.id)).toEqual([
+      "mimo-v2.6-pro", "mimo-v2.6-flash"
+    ]);
+    expect(xiaomiTokenPlan.find((model) => model.id === "mimo-v2.6-pro")).toMatchObject({
+      provider: "xiaomi-token-plan-cn",
+      baseUrl: "https://token-plan-cn.xiaomimimo.com/v1",
+      input: ["text", "image"]
+    });
+    expect(additions.referenceCatalogMetadata(
+      xiaomiTokenPlan.find((model) => model.id === "mimo-v2.6-pro")!
+    )).toMatchObject({ pricing: { currencyCode: "CNY" } });
+
+    const globalK3 = models("moonshotai").find((model) => model.id === "kimi-k3")!;
+    const chinaK3 = models("moonshotai-cn").find((model) => model.id === "kimi-k3")!;
+    expect(globalK3.cost).toEqual({ input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3 });
+    expect(additions.referenceCatalogMetadata(chinaK3)).toMatchObject({
+      cost: { input: 20, output: 100, cacheRead: 2, cacheWrite: 20 },
+      pricing: { currencyCode: "CNY" }
+    });
+
+    const custom = { ...runtime.getProvider("xiaomi")!, baseUrl: "https://gateway.example.test/v1" };
+    expect(additions.extendProvider(custom)).toBe(custom);
+  });
+
+  it("exposes the fixed xAI Fast target and rewrites that exact route without a service tier", async () => {
+    const runtime = await nativeRuntime();
+    const additions = createPiModelCatalogAdditions();
+    const native = runtime.getProvider("xai")!;
+    const projected = additions.extendProvider(native).getModels();
+    const parent = projected.find((model) => model.id === "grok-4.7")!;
+    expect(parent).toMatchObject({ contextWindow: 500_000, maxTokens: 500_000, input: ["text", "image"] });
+    expect(projected.some((model) => model.id === "grok-4.7-build-fast")).toBe(false);
+    expect(additions.referenceCatalogMetadata(parent)).toMatchObject({
+      supportsFastMode: true,
+      pricing: {
+        fastModeMultiplier: 2,
+        longContext: { inputTokenThreshold: 199_999, fastInputTokenThreshold: 200_000, fastModeMultiplier: 1.5 }
+      }
+    });
+    expect(additions.prepareProviderPayload(parent, {
+      model: "grok-4.7", service_tier: "priority", input: "hello"
+    }, true)).toEqual({ model: "grok-4.7-build-fast", input: "hello" });
+    expect(additions.prepareProviderPayload({ ...parent, baseUrl: "https://gateway.example.test/v1" }, {
+      model: "grok-4.7", input: "hello"
+    }, true)).toEqual({ model: "grok-4.7", input: "hello", service_tier: "priority" });
   });
 
   it("loads the provisioned module and normalizes only Astra Responses requests without mutating caller options", async () => {

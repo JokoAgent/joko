@@ -1100,13 +1100,15 @@ function nativeModelCatalog(runtime: PiProviderAuthRuntime): readonly ProviderMo
       if (input.length === 0 || input.some((modality) => modality !== "text" && modality !== "image")) {
         throw new Error("Pi native model registry contains an unsupported input modality.");
       }
-      const cost = {
+      const nativeCost = {
         input: nonNegativeNativeModelNumber(model.cost?.input ?? 0, "input cost"),
         output: nonNegativeNativeModelNumber(model.cost?.output ?? 0, "output cost"),
         cacheRead: nonNegativeNativeModelNumber(model.cost?.cacheRead ?? 0, "cache-read cost"),
         cacheWrite: nonNegativeNativeModelNumber(model.cost?.cacheWrite ?? 0, "cache-write cost")
       };
-      const pricing = additions.referencePricing(model);
+      const metadata = additions.referenceCatalogMetadata(model);
+      const cost = metadata?.cost ?? nativeCost;
+      const pricing = metadata?.pricing;
       models.push({
         providerId,
         modelId,
@@ -1118,7 +1120,8 @@ function nativeModelCatalog(runtime: PiProviderAuthRuntime): readonly ProviderMo
         // This is authoritative installed Pi registry metadata, not an
         // endpoint heuristic. Pi's openai-codex-responses implementation
         // exposes serviceTier and maps it to the Provider request payload.
-        supportsFastMode: api === "openai-codex-responses" || pricing?.fastModeMultiplier !== undefined,
+        ...(metadata?.defaultVisible === undefined ? {} : { defaultVisible: metadata.defaultVisible }),
+        supportsFastMode: api === "openai-codex-responses" || metadata?.supportsFastMode === true,
         thinkingLevels: nativeThinkingLevels(model.reasoning === true, model.thinkingLevelMap),
         cost,
         ...(pricing === undefined ? {} : { pricing })

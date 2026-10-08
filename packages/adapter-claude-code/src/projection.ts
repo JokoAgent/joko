@@ -7,6 +7,7 @@ import {
   type UsageSnapshot
 } from "@joko/core";
 import type { ClaudeSdkModelInfo } from "./sdk-runtime.js";
+import { claudeModelEstimate } from "./model-estimates.js";
 
 const MAX_DISPLAY_TEXT = 64 * 1024;
 const MAX_TOOL_TEXT = 32 * 1024;
@@ -283,17 +284,31 @@ export class PartialMessageBuffer {
 }
 
 export function providerModel(model: ClaudeSdkModelInfo, projection: SafeProjection): ProviderModel {
+  const modelId = projection.identifier(model.value, "unknown-model");
+  const estimate = claudeModelEstimate(modelId);
   return {
     providerId: "claude-code",
-    modelId: projection.identifier(model.value, "unknown-model"),
+    modelId,
     displayName: projection.identifier(model.displayName, "Unknown model"),
     api: "anthropic-messages",
-    contextWindow: 0,
-    maxOutputTokens: 0,
-    supportsImages: false,
-    supportsFastMode: model.supportsFastMode ?? false,
-    thinkingLevels: model.supportsEffort ? [...(model.supportedEffortLevels ?? ["low", "medium", "high"])] : [],
-    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
+    contextWindow: estimate?.contextWindow ?? 0,
+    maxOutputTokens: estimate?.maximumOutputTokens ?? 0,
+    supportsImages: estimate?.supportsImages ?? false,
+    ...(estimate?.defaultVisible === undefined ? {} : { defaultVisible: estimate.defaultVisible }),
+    supportsFastMode: model.supportsFastMode === true || estimate?.fastModeMultiplier !== undefined,
+    thinkingLevels: estimate?.thinkingLevels
+      ?? (model.supportsEffort ? [...(model.supportedEffortLevels ?? ["low", "medium", "high"])] : []),
+    cost: estimate?.price ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    ...(estimate?.price === undefined ? {} : {
+      pricing: {
+        source: "providerReference" as const,
+        currencyCode: "USD",
+        updatedAt: estimate.updatedAt,
+        cacheReadAvailable: true,
+        cacheWriteAvailable: true,
+        ...(estimate.fastModeMultiplier === undefined ? {} : { fastModeMultiplier: estimate.fastModeMultiplier })
+      }
+    })
   };
 }
 

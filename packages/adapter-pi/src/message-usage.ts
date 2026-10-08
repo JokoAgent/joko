@@ -8,7 +8,7 @@ export interface ProjectedMessageGenerationTiming {
 }
 
 /** Project one native assistant-message accounting record without inventing partial values. */
-export function projectMessageUsage(value: unknown): UsageSnapshot | undefined {
+export function projectMessageUsage(value: unknown, fastMode?: boolean): UsageSnapshot | undefined {
   if (!isRecord(value)) return undefined;
   const inputTokens = tokenCount(value.input);
   const outputTokens = tokenCount(value.output);
@@ -31,6 +31,10 @@ export function projectMessageUsage(value: unknown): UsageSnapshot | undefined {
     cacheReadTokens,
     cacheWriteTokens,
     totalTokens,
+    pricingContext: {
+      inputTokens: inputTokens + cacheReadTokens + cacheWriteTokens,
+      ...(fastMode === undefined ? {} : { fastMode })
+    },
     cost
   };
 }

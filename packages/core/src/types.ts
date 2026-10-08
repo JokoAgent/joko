@@ -427,6 +427,10 @@ export interface ProviderModel {
     readonly longContext?: {
       /** Applies to the whole request only when its input exceeds this limit. */
       readonly inputTokenThreshold: number;
+      /** Optional Fast-tier boundary when the provider publishes a different band. */
+      readonly fastInputTokenThreshold?: number;
+      /** Optional Fast multiplier inside this band; otherwise the top-level value applies. */
+      readonly fastModeMultiplier?: number;
       readonly inputMultiplier: number;
       readonly outputMultiplier: number;
       readonly cacheReadMultiplier: number;

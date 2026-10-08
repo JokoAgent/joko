@@ -7422,8 +7422,9 @@ function modelFromNative(model: NativeModel, providerId: string): ProviderModel 
     contextWindow: estimate?.contextWindow ?? 0,
     maxOutputTokens: estimate?.maximumOutputTokens ?? 0,
     supportsImages: model.inputModalities.includes("image"),
-    defaultVisible: !model.hidden,
-    supportsFastMode: model.serviceTiers.some((tier) => tier.id === "fast" || tier.id === "priority"),
+    defaultVisible: estimate?.defaultVisible ?? !model.hidden,
+    supportsFastMode: model.serviceTiers.some((tier) => tier.id === "fast" || tier.id === "priority")
+      || estimate?.fastModeMultiplier !== undefined,
     thinkingLevels: model.supportedReasoningEfforts.map((effort) => effort.reasoningEffort),
     cost: estimate?.price === undefined ? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } : {
       input: estimate.price.input,

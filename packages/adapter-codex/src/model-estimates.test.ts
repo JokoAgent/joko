@@ -24,6 +24,7 @@ describe("Codex model estimates", () => {
     expect(codexModelEstimate("gpt-5.6-sol")).toEqual({
       contextWindow: 272_000,
       maximumOutputTokens: 128_000,
+      defaultVisible: false,
       price: { input: 4, output: 20, cacheRead: 0.4, cacheWrite: 5 }
     });
     expect(codexModelEstimate("gpt-5.5")).toEqual({
@@ -32,6 +33,27 @@ describe("Codex model estimates", () => {
       price: { input: 5, output: 30, cacheRead: 0.5 }
     });
     expect(new Date(CODEX_MODEL_ESTIMATES_UPDATED_AT).toISOString()).toBe("2026-08-29T01:20:00.000Z");
+  });
+
+  it.each([
+    ["gpt-6.1-sol", { input: 2, output: 10, cacheRead: 0.1, cacheWrite: 2.5 }, Date.UTC(2026, 8, 29)],
+    ["gpt-6-sol", { input: 2, output: 10, cacheRead: 0.2, cacheWrite: 2.5 }, Date.UTC(2026, 8, 23)],
+    ["gpt-6-luna", { input: 0.1, output: 0.5, cacheRead: 0.01, cacheWrite: 0.125 }, Date.UTC(2026, 8, 23)]
+  ] as const)("projects the fixed %s price bands", (modelId, price, updatedAt) => {
+    expect(codexModelEstimate(modelId)).toEqual({
+      contextWindow: 272_000,
+      maximumOutputTokens: 128_000,
+      price,
+      updatedAt,
+      fastModeMultiplier: 2,
+      longContext: {
+        inputTokenThreshold: 272_000,
+        inputMultiplier: 2,
+        outputMultiplier: 1.5,
+        cacheReadMultiplier: 2,
+        cacheWriteMultiplier: 2
+      }
+    });
   });
 
   it("keeps catalog-only models priced as unknown instead of free", () => {

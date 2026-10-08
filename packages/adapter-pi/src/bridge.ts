@@ -576,11 +576,7 @@ export default async function jokoManagedBridge(pi: ExtensionAPI): Promise<void>
   // prompt, steer, follow-up, retry, and queued turn. Orchestrator validates model
   // eligibility before toggling the generation-fenced control value.
   pi.on("before_provider_request", (event, ctx) => {
-    if (!event.payload || typeof event.payload !== "object" || Array.isArray(event.payload)) return event.payload;
-    const payload = { ...(event.payload as Record<string, unknown>) };
-    if (readControl().fastMode) payload.service_tier = "priority";
-    else delete payload.service_tier;
-    return modelCatalog.normalizeResponsesPayload(ctx.model, payload);
+    return modelCatalog.prepareProviderPayload(ctx.model, event.payload, readControl().fastMode);
   });
 
   // Override model and direct-user bash execution so provider/MCP credentials

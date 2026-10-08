@@ -16,8 +16,11 @@ describe("message usage projection", () => {
       cacheReadTokens: 4,
       cacheWriteTokens: 1,
       totalTokens: 10,
+      pricingContext: { inputTokens: 7 },
       cost: 0
     });
+    expect(projectMessageUsage({ input: 2, output: 3, cacheRead: 4, cacheWrite: 1 }, true))
+      .toMatchObject({ pricingContext: { inputTokens: 7, fastMode: true } });
     expect(projectMessageUsage({ input: -1, output: 1, cost: { total: 0 } })).toBeUndefined();
     expect(projectMessageUsage({ input: 1, output: 1, cost: { total: Number.NaN } })).toBeUndefined();
   });

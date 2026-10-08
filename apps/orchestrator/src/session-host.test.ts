@@ -39,6 +39,7 @@ import {
   type PolicySnapshot,
   type PortableNativeSession,
   type PromptInput,
+  type ProviderModel,
   type RuntimeCommand,
   type RuntimeToolCatalog,
   type SubagentControlInput,
@@ -4204,6 +4205,85 @@ describe("SessionHost", () => {
       totalTokens: (testCase.requestInput + 1_000) * 2,
       costMicros: testCase.costMicros, estimated: true
     })]);
+  });
+
+  it.each([
+    { name: "standard below its boundary", requestInput: 199_999, fastMode: false, costMicros: 503_996 },
+    { name: "standard at its long band", requestInput: 200_000, fastMode: false, costMicros: 1_008_000 },
+    { name: "Fast at its separate boundary", requestInput: 200_000, fastMode: true, costMicros: 1_008_000 },
+    { name: "Fast above its separate boundary", requestInput: 200_001, fastMode: true, costMicros: 1_512_012 }
+  ])("prices xAI $name from the exact target and request bands", async (testCase) => {
+    const fixture = await createFixture(new TieredUsageFakeAdapter({
+      ...testCase,
+      modelCost: { input: 2, output: 6, cacheRead: 0.5, cacheWrite: 0 },
+      pricing: {
+        source: "providerReference", currencyCode: "USD", fastModeMultiplier: 2,
+        longContext: {
+          inputTokenThreshold: 199_999,
+          fastInputTokenThreshold: 200_000,
+          fastModeMultiplier: 1.5,
+          inputMultiplier: 2,
+          outputMultiplier: 2,
+          cacheReadMultiplier: 2,
+          cacheWriteMultiplier: 1
+        }
+      }
+    }), { usageMoneyKind: () => "reference-value" });
+    const sessionId = (await fixture.host.createSession({
+      operationId: "create-xai-tiered-usage", connection: fixture.connection, targetId: "target-one", title: "xAI usage",
+      providerId: "test", modelId: "text", fastMode: testCase.fastMode, permissionMode: "ask", planMode: false
+    })).value.sessionId;
+    const queued = fixture.host.enqueueInput({
+      operationId: "send-xai-tiered-usage", connection: fixture.connection, sessionId,
+      prompt: { text: "measure", images: [], files: [], mentions: [], disposition: "prompt" }
+    });
+    await eventually(() => fixture.store.getRun(queued.value.runId).descriptor.state === "completed");
+    expect(fixture.store.listUsageLedger({ ownerId: "orchestrator" })).toEqual([
+      expect.objectContaining({ costMicros: testCase.costMicros, currencyCode: "USD", costComplete: true })
+    ]);
+  });
+
+  it.each([
+    {
+      name: "keeps a CNY reference in CNY",
+      modelCost: { input: 1, output: 2, cacheRead: 0.02, cacheWrite: 0 },
+      pricing: { source: "providerReference", currencyCode: "CNY", cacheReadAvailable: true, cacheWriteAvailable: false },
+      costMicros: 204_000,
+      currencyCode: "CNY",
+      costComplete: true
+    },
+    {
+      name: "keeps an unknown subscription price incomplete",
+      modelCost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      pricing: null,
+      costMicros: 0,
+      currencyCode: "USD",
+      costComplete: false
+    }
+  ] as const)("$name", async (testCase) => {
+    const fixture = await createFixture(new TieredUsageFakeAdapter({
+      requestInput: 200_000,
+      fastMode: false,
+      modelCost: testCase.modelCost,
+      pricing: testCase.pricing
+    }), { usageMoneyKind: () => "reference-value" });
+    const sessionId = (await fixture.host.createSession({
+      operationId: "create-currency-usage", connection: fixture.connection, targetId: "target-one", title: "Currency usage",
+      providerId: "test", modelId: "text", fastMode: false, permissionMode: "ask", planMode: false
+    })).value.sessionId;
+    const queued = fixture.host.enqueueInput({
+      operationId: "send-currency-usage", connection: fixture.connection, sessionId,
+      prompt: { text: "measure", images: [], files: [], mentions: [], disposition: "prompt" }
+    });
+    await eventually(() => fixture.store.getRun(queued.value.runId).descriptor.state === "completed");
+    expect(fixture.store.listUsageLedger({ ownerId: "orchestrator" })).toEqual([
+      expect.objectContaining({
+        costMicros: testCase.costMicros,
+        currencyCode: testCase.currencyCode,
+        costComplete: testCase.costComplete,
+        estimated: true
+      })
+    ]);
   });
 
   it("applies a model price override only to the matching Backend identity", async () => {
@@ -15291,7 +15371,15 @@ class TieredUsageFakeAdapter extends FakeBackendAdapter {
     readonly fastMode: boolean | undefined;
     readonly omitPricingContext?: boolean;
     readonly reportedCost?: boolean;
+    readonly modelCost?: ProviderModel["cost"];
+    readonly pricing?: ProviderModel["pricing"] | null;
   }) {
+    const defaultPricing: NonNullable<ProviderModel["pricing"]> = {
+      source: "providerReference", currencyCode: "USD", fastModeMultiplier: 2,
+      longContext: { inputTokenThreshold: 272_000, inputMultiplier: 2, outputMultiplier: 1.5,
+        cacheReadMultiplier: 2, cacheWriteMultiplier: 2 }
+    };
+    const pricing = observation.pricing === undefined ? defaultPricing : observation.pricing;
     super({
       ...PI_LIKE_PROFILE,
       id: "tiered-usage-fake",
@@ -15300,11 +15388,8 @@ class TieredUsageFakeAdapter extends FakeBackendAdapter {
       models: PI_LIKE_PROFILE.models.map((model) => ({
         ...model,
         supportsFastMode: true,
-        cost: { input: 10, output: 50, cacheRead: 1, cacheWrite: 12.5 },
-        pricing: {
-          source: "providerReference", currencyCode: "USD", fastModeMultiplier: 2,
-          longContext: { inputTokenThreshold: 272_000, inputMultiplier: 2, outputMultiplier: 1.5, cacheReadMultiplier: 2, cacheWriteMultiplier: 2 }
-        }
+        cost: observation.modelCost ?? { input: 10, output: 50, cacheRead: 1, cacheWrite: 12.5 },
+        ...(pricing === null ? {} : { pricing })
       }))
     });
   }

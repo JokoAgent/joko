@@ -140,6 +140,24 @@ export class FakeCodexAppServer {
     rateLimitsByLimitId: null,
     rateLimitResetCredits: null
   };
+  modelList: readonly JsonObject[] = [{
+    id: "model-record",
+    model: "gpt-test",
+    displayName: "GPT Test",
+    hidden: false,
+    supportedReasoningEfforts: [
+      { reasoningEffort: "medium", description: "" },
+      { reasoningEffort: "high", description: "" }
+    ],
+    defaultReasoningEffort: "medium",
+    inputModalities: ["text", "image"],
+    serviceTiers: [
+      { id: "default", name: "Default", description: "" },
+      { id: "fast", name: "Fast", description: "" }
+    ],
+    defaultServiceTier: "default",
+    isDefault: true
+  }];
   failNextAccountRead = false;
   failNextModelList = false;
   failNextThreadResumeCode: number | undefined;
@@ -362,24 +380,7 @@ export class FakeCodexAppServer {
           throw new RpcRemoteFault(-32001);
         }
         return {
-          data: [{
-            id: "model-record",
-            model: "gpt-test",
-            displayName: "GPT Test",
-            hidden: false,
-            supportedReasoningEfforts: [
-              { reasoningEffort: "medium", description: "" },
-              { reasoningEffort: "high", description: "" }
-            ],
-            defaultReasoningEffort: "medium",
-            inputModalities: ["text", "image"],
-            serviceTiers: [
-              { id: "default", name: "Default", description: "" },
-              { id: "fast", name: "Fast", description: "" }
-            ],
-            defaultServiceTier: "default",
-            isDefault: true
-          }],
+          data: [...this.modelList],
           nextCursor: this.modelNextCursor
         };
       case "thread/start": {

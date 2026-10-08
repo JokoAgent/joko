@@ -3,6 +3,7 @@ import type { ProviderModel } from "@joko/core";
 export interface CodexModelEstimate {
   readonly contextWindow: number;
   readonly maximumOutputTokens: number;
+  readonly defaultVisible?: boolean;
   readonly updatedAt?: number;
   readonly fastModeMultiplier?: NonNullable<ProviderModel["pricing"]>["fastModeMultiplier"];
   readonly longContext?: NonNullable<ProviderModel["pricing"]>["longContext"];
@@ -31,9 +32,12 @@ const MODEL_ESTIMATES: Readonly<Record<string, CodexModelEstimate>> = Object.fre
       cacheWriteMultiplier: 2
     }
   },
-  "gpt-5.6-sol": estimate(272_000, 128_000, 4, 20, 0.4, 5),
-  "gpt-5.6-terra": estimate(272_000, 128_000, 2, 12, 0.2, 2.5),
-  "gpt-5.6-luna": estimate(272_000, 128_000, 0.2, 1.2, 0.02, 0.25),
+  "gpt-6.1-sol": gpt6Estimate(2, 10, 0.1, 2.5, Date.UTC(2026, 8, 29)),
+  "gpt-6-sol": gpt6Estimate(2, 10, 0.2, 2.5, Date.UTC(2026, 8, 23)),
+  "gpt-6-luna": gpt6Estimate(0.1, 0.5, 0.01, 0.125, Date.UTC(2026, 8, 23)),
+  "gpt-5.6-sol": { ...estimate(272_000, 128_000, 4, 20, 0.4, 5), defaultVisible: false },
+  "gpt-5.6-terra": { ...estimate(272_000, 128_000, 2, 12, 0.2, 2.5), defaultVisible: false },
+  "gpt-5.6-luna": { ...estimate(272_000, 128_000, 0.2, 1.2, 0.02, 0.25), defaultVisible: false },
   "gpt-5.5": estimate(272_000, 128_000, 5, 30, 0.5),
   "gpt-5.4": estimate(272_000, 128_000, 2.5, 15, 0.25),
   "gpt-5.4-mini": estimate(272_000, 128_000, 0.75, 4.5, 0.075),
@@ -48,6 +52,27 @@ const MODEL_ESTIMATES: Readonly<Record<string, CodexModelEstimate>> = Object.fre
 
 export function codexModelEstimate(modelId: string): CodexModelEstimate | undefined {
   return MODEL_ESTIMATES[modelId.trim().toLocaleLowerCase()];
+}
+
+function gpt6Estimate(
+  input: number,
+  output: number,
+  cacheRead: number,
+  cacheWrite: number,
+  updatedAt: number
+): CodexModelEstimate {
+  return {
+    ...estimate(272_000, 128_000, input, output, cacheRead, cacheWrite),
+    updatedAt,
+    fastModeMultiplier: 2,
+    longContext: {
+      inputTokenThreshold: 272_000,
+      inputMultiplier: 2,
+      outputMultiplier: 1.5,
+      cacheReadMultiplier: 2,
+      cacheWriteMultiplier: 2
+    }
+  };
 }
 
 function estimate(
