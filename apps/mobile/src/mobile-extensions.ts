@@ -12,6 +12,8 @@ import type {
   MobileExtensionLibraryMutation,
   MobileExtensionLibrarySnapshot
 } from "./mobile-extension-library";
+import type { MobileExtensionLibraryOverview } from "./mobile-extension-library";
+import type { MobileExtensionLibraryCall, MobileExtensionLibraryCallResult, MobileExtensionLibrarySession } from "./mobile-extension-library-runtime";
 
 const EXTENSION_ID = /^extension_[a-f0-9]{32}$/u;
 const SOURCE_ID = /^extension_source_[a-f0-9]{32}$/u;
@@ -200,6 +202,11 @@ export interface MobileExtensionTransport {
   openMainView(expected: MobileExtension, signal: AbortSignal): Promise<MobileExtensionMainViewSurface>;
   probeMainView(expected: MobileExtensionMainViewSurface, signal: AbortSignal): Promise<MobileExtensionMainViewSurface>;
   closeMainView(expected: MobileExtensionMainViewSurface): Promise<boolean>;
+  openLibrary(expected: MobileExtension, surface: MobileExtensionMainViewSurface, signal: AbortSignal): Promise<MobileExtensionLibrarySession>;
+  callLibrary(expected: MobileExtension, surface: MobileExtensionMainViewSurface, session: MobileExtensionLibrarySession,
+    call: MobileExtensionLibraryCall, signal: AbortSignal): Promise<MobileExtensionLibraryCallResult>;
+  closeLibrary(session: MobileExtensionLibrarySession): Promise<boolean>;
+  libraryStatus(expected: MobileExtension, surface: MobileExtensionMainViewSurface, signal: AbortSignal): Promise<MobileExtensionLibraryOverview>;
   loadLibrary(expected: MobileExtension, signal: AbortSignal): Promise<MobileExtensionLibrarySnapshot>;
   validateLibraryLocation(
     expected: MobileExtension,

@@ -106,6 +106,9 @@ import {
   type MobileExtensionLibraryMutation,
   type MobileExtensionLibrarySnapshot
 } from "./mobile-extension-library";
+import type {
+  MobileExtensionLibraryCall, MobileExtensionLibraryCallResult, MobileExtensionLibrarySession
+} from "./mobile-extension-library-runtime";
 import {
   applyMobileExtensionUseCommand,
   assertMobileExtensionTaskChoice,
@@ -1441,6 +1444,82 @@ export class MobileClient {
         }
       };
     };
+    const libraryLeases = new Map<MobileExtensionLibrarySession, {
+      readonly extensionKey: string; readonly surface: MobileExtensionMainViewSurface;
+    }>();
+    const requireLibrarySurface = async (
+      expected: MobileExtension, surface: MobileExtensionMainViewSurface, signal: AbortSignal
+    ): Promise<MobileExtension> => {
+      if (pendingForExtension(expected.extensionId)) {
+        throw new Error("Check the unresolved Extension change before using its Library.");
+      }
+      const extension = await readExactDetail(expected, signal);
+      if (!mobileExtensionLibraryReady(extension)) throw new Error("The Extension Library is not ready.");
+      assertMobileExtensionMainViewSurface(extension, surface);
+      const fresh = await this.network.getExtensionMainViewSurface(context.credential, surface.surfaceId, signal);
+      requireCurrent(signal);
+      if (!sameMobileExtensionMainViewSurface(surface, fresh)) throw new Error("The Library main-view surface changed.");
+      assertMobileExtensionMainViewSurface(extension, fresh);
+      return extension;
+    };
+    const closeLibrary = async (session: MobileExtensionLibrarySession): Promise<boolean> => {
+      if (!libraryLeases.delete(session)) return false;
+      return this.network.closeExtensionLibrary(context.credential, session.id);
+    };
+    const openLibrary = async (
+      expected: MobileExtension, surface: MobileExtensionMainViewSurface, signal: AbortSignal
+    ): Promise<MobileExtensionLibrarySession> => {
+      let opened: MobileExtensionLibrarySession | undefined;
+      try {
+        return await owned(signal, async (current) => {
+          const extension = await requireLibrarySurface(expected, surface, current);
+          opened = await this.network.openExtensionLibrary(context.credential, extension.extensionId, extension.revision, surface.surfaceId, current);
+          requireCurrent(current);
+          if (opened.extensionId !== extension.extensionId || opened.expiresAt <= Date.now()) {
+            throw new Error("The Extension Library session changed or expired.");
+          }
+          libraryLeases.set(opened, { extensionKey: mobileExtensionKey(extension), surface });
+          return opened;
+        });
+      } catch (error) {
+        if (opened !== undefined) {
+          libraryLeases.delete(opened);
+          await this.network.closeExtensionLibrary(context.credential, opened.id).catch(() => undefined);
+        }
+        throw error;
+      }
+    };
+    const callLibrary = async (
+      expected: MobileExtension, surface: MobileExtensionMainViewSurface, session: MobileExtensionLibrarySession,
+      call: MobileExtensionLibraryCall, signal: AbortSignal
+    ): Promise<MobileExtensionLibraryCallResult> => {
+      try {
+        return await owned(signal, async (current) => {
+          const lease = libraryLeases.get(session);
+          if (lease === undefined || lease.extensionKey !== mobileExtensionKey(expected)
+            || !sameMobileExtensionMainViewSurface(lease.surface, surface) || session.expiresAt <= Date.now()) {
+            throw new Error("The Extension Library session is not owned by this surface.");
+          }
+          await requireLibrarySurface(expected, surface, current);
+          requireCurrent(current);
+          if (libraryLeases.get(session) !== lease) throw new Error("The Extension Library session was closed.");
+          const result = await this.network.callExtensionLibrary(context.credential, session.id, call, current);
+          requireCurrent(current);
+          if (libraryLeases.get(session) !== lease) throw new Error("The Extension Library call result was retired.");
+          return result;
+        });
+      } catch (error) {
+        await closeLibrary(session).catch(() => undefined);
+        throw error;
+      }
+    };
+    const libraryStatus = (expected: MobileExtension, surface: MobileExtensionMainViewSurface, signal: AbortSignal) =>
+      owned(signal, async (current) => {
+        const extension = await requireLibrarySurface(expected, surface, current);
+        const overview = await this.network.getExtensionLibraryOverview(context.credential, extension.extensionId, extension.revision, current);
+        requireCurrent(current);
+        return overview;
+      });
     const loadLibrary = (
       expected: MobileExtension,
       signal: AbortSignal
@@ -1706,6 +1785,10 @@ export class MobileClient {
         context.credential,
         expected.surfaceId
       ),
+      openLibrary,
+      callLibrary,
+      closeLibrary,
+      libraryStatus,
       loadLibrary,
       validateLibraryLocation,
       mutateLibrary,

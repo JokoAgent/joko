@@ -511,7 +511,7 @@ describe("Extension catalog gateway", () => {
     await expect(gateway.listExtensionLibraryGrace(extensionId)).resolves.toMatchObject([{ id: grace.graceId }]);
     await gateway.rollbackExtensionLibrary(extensionId, 7n, grace.graceId);
     await expect(gateway.purgeExpiredExtensionLibraries()).resolves.toEqual({ trash: 1, grace: 2 });
-    const opened = await gateway.openExtensionLibrary(extensionId, 7n);
+    const opened = await gateway.openExtensionLibrary(extensionId, 7n, `extension_surface_${"3".repeat(32)}`);
     expect(opened).toMatchObject({ id: sessionId, bindingGeneration: 4n, limits: { maximumFiles: 50_000 } });
     expect(opened).not.toHaveProperty("path");
     await expect(gateway.callExtensionLibrary(sessionId, {

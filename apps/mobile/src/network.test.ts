@@ -20,6 +20,8 @@ import {
   OpenExtensionMainViewRequestSchema, OpenExtensionMainViewResponseSchema,
   GetExtensionMainViewSurfaceRequestSchema, GetExtensionMainViewSurfaceResponseSchema,
   CloseExtensionMainViewRequestSchema, CloseExtensionMainViewResponseSchema,
+  ExtensionLibrarySessionSchema, OpenExtensionLibraryRequestSchema, OpenExtensionLibraryResponseSchema,
+  CallExtensionLibraryRequestSchema, CallExtensionLibraryResponseSchema, CloseExtensionLibraryRequestSchema, CloseExtensionLibraryResponseSchema,
   GetExtensionLibraryOverviewRequestSchema, GetExtensionLibraryOverviewResponseSchema,
   ValidateExtensionLibraryLocationRequestSchema, ValidateExtensionLibraryLocationResponseSchema,
   RelocateExtensionLibraryRequestSchema, RelocateExtensionLibraryResponseSchema,
@@ -360,6 +362,67 @@ describe("mobile Extension network", () => {
       await expect(mobileNetwork.getExtensionMainViewSurface(credential, surfaceId)).resolves.toEqual(opened);
       await expect(mobileNetwork.closeExtensionMainView(credential, surfaceId)).resolves.toBe(true);
       expect(methods).toEqual(["OpenExtensionMainView", "GetExtensionMainViewSurface", "CloseExtensionMainView"]);
+    } finally { fetcher.mockRestore(); }
+  });
+
+  it("opens a connection-owned Library and carries binary and SQLite values through generated RPCs", async () => {
+    const credential: PairedCredential = { profileId: "profile", origin: "https://node.example", serverId: "server",
+      connectionId: "connection", deviceId: "phone", displayName: "Phone", authKey: "library-fixture-key" };
+    const extensionId = `extension_${"1".repeat(32)}`, sessionId = `library_session_${"2".repeat(32)}`;
+    let resultCase: "write" | "sqlResult" = "write";
+    const methods: string[] = [];
+    const fetcher = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      expect(new Headers(init?.headers).get("authorization")).toBe(`Bearer ${credential.authKey}`);
+      const method = new URL(String(input)).pathname.split("/").at(-1)!;
+      const body = new Uint8Array(init?.body as Uint8Array), headers = { "content-type": "application/proto" };
+      methods.push(method);
+      if (method === "OpenExtensionLibrary") {
+        expect(fromBinary(OpenExtensionLibraryRequestSchema, body)).toMatchObject({ extensionId, expectedRevision: { value: 3n },
+          surfaceId: `extension_surface_${"3".repeat(32)}` });
+        return new Response(toBinary(OpenExtensionLibraryResponseSchema, create(OpenExtensionLibraryResponseSchema, {
+          library: create(ExtensionLibrarySessionSchema, { sessionId, extensionId, bindingGeneration: { value: 2n },
+            expiresAt: { seconds: BigInt(Math.ceil(Date.now() / 1000) + 60) }, limits: {
+              maximumReadBytes: 16n * 1024n ** 2n, maximumWriteBytes: 16n * 1024n ** 2n, maximumStreamBytes: 8n * 1024n ** 3n,
+              maximumPathCharacters: 512, maximumPathSegments: 32, maximumListPageSize: 500, maximumFiles: 50_000,
+              softLimitBytes: 8n * 1024n ** 3n, diskReserveBytes: 1024n ** 3n
+            } })
+        })), { headers });
+      }
+      if (method === "CallExtensionLibrary") {
+        const request = fromBinary(CallExtensionLibraryRequestSchema, body);
+        expect(request.sessionId).toBe(sessionId);
+        if (resultCase === "write") {
+          expect(request.call?.operation).toMatchObject({ case: "write", value: { path: "mail", content: Uint8Array.of(0, 128, 255) } });
+          return new Response(toBinary(CallExtensionLibraryResponseSchema, create(CallExtensionLibraryResponseSchema, {
+            result: { result: { case: "write", value: { path: "mail", bytes: 3n, sha256: "a".repeat(64) } } }
+          })), { headers });
+        }
+        expect(request.call?.operation).toMatchObject({ case: "sqlExecute", value: { handleId: "db",
+          statement: { sql: "SELECT ?", parameters: [{ value: { case: "integerValue", value: "9007199254740993" } }] } } });
+        return new Response(toBinary(CallExtensionLibraryResponseSchema, create(CallExtensionLibraryResponseSchema, {
+          result: { result: { case: "sqlResult", value: { changes: "0", rows: [{ cells: [
+            { name: "integer", value: { value: { case: "integerValue", value: "9007199254740993" } } },
+            { name: "bytes", value: { value: { case: "blobValue", value: Uint8Array.of(128) } } }
+          ] }] } } }
+        })), { headers });
+      }
+      expect(method).toBe("CloseExtensionLibrary");
+      expect(fromBinary(CloseExtensionLibraryRequestSchema, body)).toMatchObject({ sessionId });
+      return new Response(toBinary(CloseExtensionLibraryResponseSchema, create(CloseExtensionLibraryResponseSchema, { closed: true })), { headers });
+    });
+    try {
+      const session = await mobileNetwork.openExtensionLibrary(credential, extensionId, 3n, `extension_surface_${"3".repeat(32)}`);
+      await expect(mobileNetwork.callExtensionLibrary(credential, session.id, { kind: "write", path: "mail", content: Uint8Array.of(0, 128, 255) }))
+        .resolves.toMatchObject({ kind: "write", path: "mail", bytes: 3n });
+      resultCase = "sqlResult";
+      await expect(mobileNetwork.callExtensionLibrary(credential, session.id, { kind: "sqlExecute", handleId: "db",
+        statement: { sql: "SELECT ?", parameters: [{ kind: "integer", value: 9_007_199_254_740_993n }] } }))
+        .resolves.toMatchObject({ kind: "sqlResult", value: { rows: [{ cells: [
+          { name: "integer", value: { kind: "integer", value: 9_007_199_254_740_993n } },
+          { name: "bytes", value: { kind: "blob", value: Uint8Array.of(128) } }
+        ] }] } });
+      await expect(mobileNetwork.closeExtensionLibrary(credential, session.id)).resolves.toBe(true);
+      expect(methods).toEqual(["OpenExtensionLibrary", "CallExtensionLibrary", "CallExtensionLibrary", "CloseExtensionLibrary"]);
     } finally { fetcher.mockRestore(); }
   });
 

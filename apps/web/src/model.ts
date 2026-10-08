@@ -6056,7 +6056,7 @@ export interface OperationApi extends VoiceDictionaryPeerApi {
   listExtensionLibraryGrace(extensionId?: string, signal?: AbortSignal): Promise<readonly ExtensionLibraryGraceEntryView[]>;
   rollbackExtensionLibrary(extensionId: string, expectedRevision: bigint, graceId: string, signal?: AbortSignal): Promise<{ readonly location: ExtensionLibraryLocationView; readonly graceId: string }>;
   purgeExpiredExtensionLibraries(signal?: AbortSignal): Promise<{ readonly trash: number; readonly grace: number }>;
-  openExtensionLibrary(extensionId: string, expectedRevision: bigint, signal?: AbortSignal): Promise<ExtensionLibrarySessionView>;
+  openExtensionLibrary(extensionId: string, expectedRevision: bigint, surfaceId: string, signal?: AbortSignal): Promise<ExtensionLibrarySessionView>;
   callExtensionLibrary(sessionId: string, call: ExtensionLibraryCallView, signal?: AbortSignal): Promise<ExtensionLibraryCallResultView>;
   closeExtensionLibrary(sessionId: string, signal?: AbortSignal): Promise<boolean>;
   getExtensionPackagePreview(extensionId: string, expectedRevision: bigint, backendId: string, signal?: AbortSignal): Promise<ExtensionPackagePreviewView>;

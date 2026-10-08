@@ -900,7 +900,10 @@ export async function createOrchestratorApplication(
   });
   const extensionMainViews = new ExtensionMainViewManager({
     resources: piResources,
-    rootDirectory: join(config.dataDirectory, "extension-main-views")
+    rootDirectory: join(config.dataDirectory, "extension-main-views"),
+    onSurfaceRevoked: (surfaceId, connectionId) => {
+      void extensionLibraries.closeSurface(surfaceId, connectionId).catch(() => undefined);
+    }
   });
   await extensionMainViews.initialize();
   const imageGenerationBridge = new ImageGenerationBridgeToolProvider({

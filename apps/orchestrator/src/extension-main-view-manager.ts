@@ -74,6 +74,7 @@ export interface ExtensionMainViewManagerOptions {
   readonly ttlMs?: number;
   readonly maximumSurfaces?: number;
   readonly maximumAssetBytes?: number;
+  readonly onSurfaceRevoked?: (surfaceId: string, connectionId: string) => void;
 }
 
 interface ActiveSurface {
@@ -97,7 +98,51 @@ const DEFAULT_TTL_MS = 10 * 60_000;
 const DEFAULT_MAXIMUM_SURFACES = 32;
 const DEFAULT_MAXIMUM_ASSET_BYTES = 256 * 1024 * 1024;
 const LIBRARY_BRIDGE_ASSET = "__joko_extension_library_bridge__.js";
-const LIBRARY_BRIDGE_SCRIPT = Buffer.from(`(()=>{"use strict";const p=new Map();let n=0;addEventListener("message",e=>{if(e.source!==parent)return;const d=e.data;if(!d||d.type!=="joko:extension-library-response"||d.version!==1||typeof d.id!=="string")return;const f=p.get(d.id);if(!f)return;const v=d.ok===true&&d.result&&typeof d.result==="object"?Object.freeze({...d.result,ok:true}):d.ok===false&&d.error&&typeof d.error.code==="string"&&typeof d.error.message==="string"?Object.freeze({ok:false,errorCode:d.error.code,message:d.error.message}):null;if(!v)return;p.delete(d.id);clearTimeout(f.t);f.r(v)});const library=operation=>new Promise(r=>{const b=new Uint8Array(16);crypto.getRandomValues(b);const id="library_"+(++n).toString(36)+"_"+Array.from(b,x=>x.toString(16).padStart(2,"0")).join("");const t=setTimeout(()=>{p.delete(id);r(Object.freeze({ok:false,errorCode:"TIMEOUT",message:"Extension Library request timed out."}))},60000);p.set(id,{r,t});parent.postMessage({type:"joko:extension-library-request",version:1,id,operation},"*")});Object.defineProperty(window,"joko",{value:Object.freeze({library}),writable:false,configurable:false})})();`, "utf8");
+const LIBRARY_BRIDGE_SCRIPT = Buffer.from(String.raw`(() => {
+  "use strict";
+  const pending = new Map();
+  const transportReady = "joko:extension-library-transport-ready";
+  const transportMarker = Symbol.for("joko.extension-library-mobile.transport");
+  let sequence = 0;
+  addEventListener("message", event => {
+    if (event.source !== parent) return;
+    const data = event.data;
+    if (!data || data.type !== "joko:extension-library-response" || data.version !== 1 || typeof data.id !== "string") return;
+    const entry = pending.get(data.id);
+    if (!entry) return;
+    const value = data.ok === true && data.result && typeof data.result === "object"
+      ? Object.freeze({ ...data.result, ok: true })
+      : data.ok === false && data.error && typeof data.error.code === "string" && typeof data.error.message === "string"
+        ? Object.freeze({ ok: false, errorCode: data.error.code, message: data.error.message })
+        : null;
+    if (!value) return;
+    pending.delete(data.id);
+    clearTimeout(entry.timer);
+    if (entry.ready) removeEventListener(transportReady, entry.ready);
+    entry.resolve(value);
+  });
+  const library = operation => new Promise(resolve => {
+    const bytes = new Uint8Array(16);
+    crypto.getRandomValues(bytes);
+    const id = "library_" + (++sequence).toString(36) + "_" + Array.from(bytes, byte => byte.toString(16).padStart(2, "0")).join("");
+    const timer = setTimeout(() => {
+      const entry = pending.get(id);
+      pending.delete(id);
+      if (entry && entry.ready) removeEventListener(transportReady, entry.ready);
+      resolve(Object.freeze({ ok: false, errorCode: "TIMEOUT", message: "Extension Library request timed out." }));
+    }, 60000);
+    const send = () => {
+      if (pending.has(id)) parent.postMessage({ type: "joko:extension-library-request", version: 1, id, operation }, "*");
+    };
+    const entry = { resolve, timer };
+    pending.set(id, entry);
+    if (window.ReactNativeWebView && !window[transportMarker]) {
+      entry.ready = () => { removeEventListener(transportReady, entry.ready); send(); };
+      addEventListener(transportReady, entry.ready);
+    } else send();
+  });
+  Object.defineProperty(window, "joko", { value: Object.freeze({ library }), writable: false, configurable: false });
+})();`, "utf8");
 
 const MIME_TYPES: Readonly<Record<string, string>> = {
   ".css": "text/css; charset=utf-8",
@@ -132,6 +177,7 @@ export class ExtensionMainViewManager {
   readonly #ttlMs: number;
   readonly #maximumSurfaces: number;
   readonly #maximumAssetBytes: number;
+  readonly #onSurfaceRevoked: ExtensionMainViewManagerOptions["onSurfaceRevoked"];
   readonly #surfaces = new Map<string, ActiveSurface>();
   #tail: Promise<void> = Promise.resolve();
   #expirationTimer?: NodeJS.Timeout;
@@ -148,6 +194,7 @@ export class ExtensionMainViewManager {
     this.#ttlMs = positiveInteger(options.ttlMs ?? DEFAULT_TTL_MS, "Extension main-view TTL");
     this.#maximumSurfaces = positiveInteger(options.maximumSurfaces ?? DEFAULT_MAXIMUM_SURFACES, "Extension main-view surface limit");
     this.#maximumAssetBytes = positiveInteger(options.maximumAssetBytes ?? DEFAULT_MAXIMUM_ASSET_BYTES, "Extension main-view asset limit");
+    this.#onSurfaceRevoked = options.onSurfaceRevoked;
   }
 
   async initialize(): Promise<void> {
@@ -362,7 +409,10 @@ export class ExtensionMainViewManager {
   }
 
   async #destroy(surface: ActiveSurface): Promise<void> {
-    if (this.#surfaces.get(surface.id) === surface) this.#surfaces.delete(surface.id);
+    if (this.#surfaces.get(surface.id) === surface) {
+      this.#surfaces.delete(surface.id);
+      this.#onSurfaceRevoked?.(surface.id, surface.connectionId);
+    }
     await surface.lease.release().catch(() => undefined);
     await removeOwnedSurfacePath(this.#rootDirectory, surface.root).catch(() => undefined);
   }

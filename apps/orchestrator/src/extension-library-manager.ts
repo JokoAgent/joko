@@ -271,6 +271,7 @@ type TrashManifest = MovingTrashManifest | ReadyTrashManifest | RestoringTrashMa
 
 interface ActiveSession {
   readonly sessionId: string;
+  readonly surfaceId: string;
   readonly connectionId: string;
   readonly authority: ExtensionLibraryAuthority;
   readonly authorityKey: string;
@@ -458,11 +459,17 @@ export class ExtensionLibraryManager {
   async openSession(input: {
     readonly authority: ExtensionLibraryAuthority;
     readonly connectionId: string;
+    readonly surfaceId: string;
+    readonly surfaceExpiresAt: number;
     readonly assertAuthorityCurrent: () => void | Promise<void>;
   }): Promise<ExtensionLibrarySessionDescriptor> {
     this.#assertReady();
     validateAuthority(input.authority);
     if (!CONNECTION_ID.test(input.connectionId)) throw new ExtensionLibraryError("PATH_INVALID", "Library connection identity is invalid.");
+    if (!/^extension_surface_[a-f0-9]{32}$/u.test(input.surfaceId)
+      || !Number.isSafeInteger(input.surfaceExpiresAt) || input.surfaceExpiresAt <= this.#now()) {
+      throw new ExtensionLibraryError("UNAVAILABLE", "Library surface identity is invalid or expired.");
+    }
     return this.#mutate(async () => {
       this.#assertStateAvailable();
       await this.#expireInternal();
@@ -493,9 +500,12 @@ export class ExtensionLibraryManager {
       if (migrating) vault.setReadonly(true);
       else await vault.clearOrphaned();
       const sessionId = `library_session_${randomUUID().replaceAll("-", "")}`;
-      const expiresAt = this.#now() + this.#sessionTtlMilliseconds;
+      await input.assertAuthorityCurrent();
+      if (input.surfaceExpiresAt <= this.#now()) throw new ExtensionLibraryError("UNAVAILABLE", "Library surface expired while opening.");
+      const expiresAt = Math.min(this.#now() + this.#sessionTtlMilliseconds, input.surfaceExpiresAt);
       this.#sessions.set(sessionId, {
         sessionId,
+        surfaceId: input.surfaceId,
         connectionId: input.connectionId,
         authority: copyAuthority(input.authority),
         authorityKey: authorityKey(input.authority),
@@ -545,6 +555,18 @@ export class ExtensionLibraryManager {
     await this.#mutate(async () => {
       for (const session of [...this.#sessions.values()]) {
         if (session.connectionId === connectionId) await this.#destroySession(session);
+      }
+    });
+  }
+
+  async closeSurface(surfaceId: string, connectionId: string): Promise<void> {
+    this.#assertReady();
+    for (const session of this.#sessions.values()) {
+      if (session.surfaceId === surfaceId && session.connectionId === connectionId) this.#signalSessionRevoked(session);
+    }
+    await this.#mutate(async () => {
+      for (const session of [...this.#sessions.values()]) {
+        if (session.surfaceId === surfaceId && session.connectionId === connectionId) await this.#destroySession(session);
       }
     });
   }

@@ -1,13 +1,15 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ActivityIndicator, Pressable, StyleSheet, Text, View } from "react-native";
 import { WebView } from "react-native-webview";
 import {
   allowMobileExtensionMainViewNavigation,
+  mobileExtensionKey,
   sameMobileExtensionMainViewSurface,
   type MobileExtension,
   type MobileExtensionMainViewSurface,
   type MobileExtensionTransport
 } from "./mobile-extensions";
+import { MobileExtensionLibraryBridge, mobileExtensionLibraryBootstrap } from "./mobile-extension-library-bridge";
 import type { MobileSupportedLocale } from "./mobile-locale-preference";
 import { mobileMessage } from "./mobile-messages";
 import type { MobilePartnersColors } from "./MobilePartnersScreen";
@@ -30,13 +32,20 @@ export function MobileExtensionMainView({ colors, extension, locale, onBack, tra
   const surfaceRef = useRef<MobileExtensionMainViewSurface | undefined>(undefined);
   const occurrence = useRef<symbol | undefined>(undefined);
   const reloadAbort = useRef<AbortController | undefined>(undefined);
+  const webRef = useRef<WebView>(null);
+  const bridgeRef = useRef<MobileExtensionLibraryBridge | undefined>(undefined);
+  const frameOwner = useRef<{ readonly id: string; readonly url: string; started: boolean } | undefined>(undefined);
   const [attempt, setAttempt] = useState(0);
   const [frameRevision, setFrameRevision] = useState(0);
   const [frameLoaded, setFrameLoaded] = useState(false);
+  const [frameUrl, setFrameUrl] = useState<string | undefined>(undefined);
   const [reloading, setReloading] = useState(false);
   const [state, setState] = useState<SurfaceState>({ phase: "opening" });
 
   const release = useCallback((surface: MobileExtensionMainViewSurface | undefined): void => {
+    bridgeRef.current?.dispose();
+    bridgeRef.current = undefined;
+    frameOwner.current = undefined;
     if (surface === undefined) return;
     if (surfaceRef.current?.surfaceId === surface.surfaceId) surfaceRef.current = undefined;
     const owner = leaseTransport.current;
@@ -51,6 +60,7 @@ export function MobileExtensionMainView({ colors, extension, locale, onBack, tra
     occurrence.current = request;
     release(surfaceRef.current);
     setFrameLoaded(false);
+    setFrameUrl(undefined);
     setReloading(false);
     setState({ phase: "opening" });
     void currentTransport.openMainView(extension, controller.signal).then((surface) => {
@@ -111,6 +121,9 @@ export function MobileExtensionMainView({ colors, extension, locale, onBack, tra
     const expected = state.surface;
     const currentTransport = leaseTransport.current;
     if (currentTransport === undefined) return;
+    bridgeRef.current?.dispose();
+    bridgeRef.current = undefined;
+    frameOwner.current = undefined;
     reloadAbort.current?.abort();
     const controller = new AbortController();
     reloadAbort.current = controller;
@@ -132,6 +145,39 @@ export function MobileExtensionMainView({ colors, extension, locale, onBack, tra
     ? state.surface.title ?? extension.mainView?.title ?? extension.name
     : extension.mainView?.title ?? extension.name;
   const readySurface = state.phase === "ready" ? state.surface : undefined;
+  const frame = useMemo(() => readySurface === undefined ? undefined : {
+    id: `${readySurface.surfaceId}:${frameRevision}`, url: frameUrl ?? readySurface.url, started: false
+  }, [readySurface, frameRevision, frameUrl]);
+  // The marker also fences native callbacks delivered after a remount.
+  if (!reloading) frameOwner.current = frame;
+  const extensionKey = mobileExtensionKey(extension);
+  useEffect(() => {
+    const owner = leaseTransport.current;
+    if (frame === undefined || readySurface === undefined || extension.library === undefined || owner === undefined) return undefined;
+    const bridge = new MobileExtensionLibraryBridge({
+      extension, surface: readySurface, frameId: frame.id, transport: owner,
+      current: () => frameOwner.current === frame && surfaceRef.current?.surfaceId === readySurface.surfaceId
+        && transportRef.current.ownerKey === owner.ownerKey,
+      send: (message) => {
+        if (webRef.current === null) throw new Error("The Extension page is no longer mounted.");
+        webRef.current.postMessage(message);
+      }
+    });
+    bridgeRef.current = bridge;
+    return () => {
+      bridge.dispose();
+      if (bridgeRef.current === bridge) bridgeRef.current = undefined;
+    };
+  }, [extensionKey, frame, readySurface, transport.ownerKey]);
+  const currentFrame = (): boolean => frame !== undefined && frameOwner.current === frame
+    && surfaceRef.current?.surfaceId === readySurface?.surfaceId;
+  const retireFrame = (): void => {
+    bridgeRef.current?.dispose();
+    bridgeRef.current = undefined;
+    frameOwner.current = undefined;
+    setFrameLoaded(false);
+    setFrameRevision((value) => value + 1);
+  };
 
   return <View style={[styles.root, { backgroundColor: colors.background }]} testID="extensions.mainView.surface">
     <View style={[styles.header, { borderColor: colors.border }]}>
@@ -173,24 +219,42 @@ export function MobileExtensionMainView({ colors, extension, locale, onBack, tra
             <Status colors={colors} loading text={mobileMessage(locale,
               reloading ? "extension.mainViewReloading" : "extension.mainViewLoadingContent")} />
           </View>}
-          <WebView key={`${readySurface.surfaceId}:${frameRevision}`} source={{ uri: readySurface.url }}
+          <WebView ref={webRef} key={frame?.id} source={{ uri: frame?.url ?? readySurface.url }}
             originWhitelist={[new URL(readySurface.url).origin]} style={[styles.frame, { backgroundColor: colors.background }]}
             scrollEnabled javaScriptEnabled javaScriptCanOpenWindowsAutomatically={false} setSupportMultipleWindows={false}
             allowFileAccess={false} allowFileAccessFromFileURLs={false} allowUniversalAccessFromFileURLs={false}
             mediaCapturePermissionGrantType="deny" sharedCookiesEnabled={false} thirdPartyCookiesEnabled={false}
             domStorageEnabled={false} incognito cacheEnabled={false} mixedContentMode="never"
-            onShouldStartLoadWithRequest={(request) => surfaceRef.current?.surfaceId === readySurface.surfaceId
-              && allowMobileExtensionMainViewNavigation(readySurface, request.url ?? "")}
+            injectedJavaScriptBeforeContentLoaded={extension.library && frame
+              ? mobileExtensionLibraryBootstrap(frame.id, readySurface.surfaceId) : undefined}
+            injectedJavaScript={extension.library && frame
+              ? mobileExtensionLibraryBootstrap(frame.id, readySurface.surfaceId) : undefined}
+            injectedJavaScriptBeforeContentLoadedForMainFrameOnly injectedJavaScriptForMainFrameOnly
+            onMessage={extension.library ? (event) => {
+              if (currentFrame()) bridgeRef.current?.receive(event.nativeEvent.data, event.nativeEvent.url);
+            } : undefined}
+            onShouldStartLoadWithRequest={(request) => {
+              if (!currentFrame() || request.isTopFrame === false
+                || !allowMobileExtensionMainViewNavigation(readySurface, request.url ?? "")) return false;
+              const destination = new URL(request.url);
+              const current = new URL(frame!.url);
+              if (destination.pathname === current.pathname && destination.hash !== current.hash) return true;
+              if (destination.pathname === current.pathname && !frame!.started) return true;
+              retireFrame();
+              setFrameUrl(request.url);
+              return false;
+            }}
+            onLoadStart={() => { if (currentFrame()) frame!.started = true; }}
             onLoadEnd={() => {
-              if (surfaceRef.current?.surfaceId === readySurface.surfaceId) {
+              if (currentFrame()) {
                 setFrameLoaded(true);
                 setReloading(false);
               }
             }}
-            onError={() => revoke(readySurface, "error")}
-            onHttpError={() => revoke(readySurface, "revoked")}
-            onContentProcessDidTerminate={() => revoke(readySurface, "revoked")}
-            onRenderProcessGone={() => revoke(readySurface, "revoked")} />
+            onError={() => { if (currentFrame()) revoke(readySurface, "error"); }}
+            onHttpError={() => { if (currentFrame()) revoke(readySurface, "revoked"); }}
+            onContentProcessDidTerminate={() => { if (currentFrame()) revoke(readySurface, "revoked"); }}
+            onRenderProcessGone={() => { if (currentFrame()) revoke(readySurface, "revoked"); }} />
         </View>}
   </View>;
 }

@@ -2831,8 +2831,8 @@ export function useAppController(): AppController {
     rollbackExtensionLibrary: (extensionId, expectedRevision, graceId, signal) =>
       gateway().rollbackExtensionLibrary(extensionId, expectedRevision, graceId, signal),
     purgeExpiredExtensionLibraries: (signal) => gateway().purgeExpiredExtensionLibraries(signal),
-    openExtensionLibrary: (extensionId, expectedRevision, signal) =>
-      gateway().openExtensionLibrary(extensionId, expectedRevision, signal),
+    openExtensionLibrary: (extensionId, expectedRevision, surfaceId, signal) =>
+      gateway().openExtensionLibrary(extensionId, expectedRevision, surfaceId, signal),
     callExtensionLibrary: (sessionId, call, signal) => gateway().callExtensionLibrary(sessionId, call, signal),
     closeExtensionLibrary: (sessionId, signal) => gateway().closeExtensionLibrary(sessionId, signal),
     getExtensionPackagePreview: (extensionId, expectedRevision, backendId, signal) =>

@@ -85,6 +85,15 @@ import {
   type MobileExtensionLibraryOverview,
   type MobileExtensionLibraryTrashEntry
 } from "./mobile-extension-library";
+import {
+  assertMobileExtensionLibraryCallResult,
+  mapMobileExtensionLibraryCall,
+  projectMobileExtensionLibraryCallResult,
+  projectMobileExtensionLibrarySession,
+  type MobileExtensionLibraryCall,
+  type MobileExtensionLibraryCallResult,
+  type MobileExtensionLibrarySession
+} from "./mobile-extension-library-runtime";
 
 export interface PairedCredential {
   readonly profileId: string;
@@ -207,6 +216,13 @@ export interface MobileNetwork {
     surfaceId: string,
     signal?: AbortSignal
   ): Promise<boolean>;
+  openExtensionLibrary(
+    credential: PairedCredential, extensionId: string, expectedRevision: bigint, surfaceId: string, signal?: AbortSignal
+  ): Promise<MobileExtensionLibrarySession>;
+  callExtensionLibrary(
+    credential: PairedCredential, sessionId: string, call: MobileExtensionLibraryCall, signal?: AbortSignal
+  ): Promise<MobileExtensionLibraryCallResult>;
+  closeExtensionLibrary(credential: PairedCredential, sessionId: string, signal?: AbortSignal): Promise<boolean>;
   getExtensionLibraryOverview(
     credential: PairedCredential,
     extensionId: string,
@@ -1621,6 +1637,39 @@ export const mobileNetwork: MobileNetwork = {
     signal?.throwIfAborted();
     if (response.library === undefined) throw new Error("The Joko node returned an empty Extension Library overview.");
     return projectMobileExtensionLibraryOverview(response.library, extensionId);
+  },
+  async openExtensionLibrary(credential, extensionId, expectedRevision, surfaceId, signal) {
+    assertExtensionLibraryAuthority(extensionId, expectedRevision);
+    if (!/^extension_surface_[a-f0-9]{32}$/u.test(surfaceId)) throw new Error("A current Extension Library surface is required.");
+    const client = createClient(ExtensionService, transport(credential.origin, credential.authKey));
+    const response = await client.openExtensionLibrary({ extensionId, expectedRevision: { value: expectedRevision }, surfaceId }, options(signal));
+    try {
+      signal?.throwIfAborted();
+      if (response.library === undefined) throw new Error("The Joko node returned an empty Extension Library session.");
+      return projectMobileExtensionLibrarySession(response.library, extensionId);
+    } catch (error) {
+      if (/^library_session_[a-f0-9]{32}$/u.test(response.library?.sessionId ?? "")) {
+        void client.closeExtensionLibrary({ sessionId: response.library!.sessionId }, { timeoutMs: 5_000 }).catch(() => undefined);
+      }
+      throw error;
+    }
+  },
+  async callExtensionLibrary(credential, sessionId, call, signal) {
+    if (!/^library_session_[a-f0-9]{32}$/u.test(sessionId)) throw new Error("A current Extension Library session is required.");
+    const response = await createClient(ExtensionService, transport(credential.origin, credential.authKey))
+      .callExtensionLibrary({ sessionId, call: mapMobileExtensionLibraryCall(call) }, options(signal));
+    signal?.throwIfAborted();
+    if (response.result === undefined) throw new Error("The Joko node returned an empty Extension Library call result.");
+    const result = projectMobileExtensionLibraryCallResult(response.result);
+    assertMobileExtensionLibraryCallResult(result, call);
+    return result;
+  },
+  async closeExtensionLibrary(credential, sessionId, signal) {
+    if (!/^library_session_[a-f0-9]{32}$/u.test(sessionId)) throw new Error("A current Extension Library session is required.");
+    const response = await createClient(ExtensionService, transport(credential.origin, credential.authKey))
+      .closeExtensionLibrary({ sessionId }, { ...options(signal), timeoutMs: 5_000 });
+    signal?.throwIfAborted();
+    return response.closed;
   },
   async validateExtensionLibraryLocation(credential, extensionId, expectedRevision, candidate, signal) {
     assertExtensionLibraryAuthority(extensionId, expectedRevision);

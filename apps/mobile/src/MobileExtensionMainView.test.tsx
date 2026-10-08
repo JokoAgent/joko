@@ -3,6 +3,8 @@ import { act, createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MobileExtensionMainView } from "./MobileExtensionMainView";
+import { decodeMobileLibraryMessage, encodeMobileLibraryMessage } from "./mobile-extension-library-bridge";
+import type { MobileExtensionLibrarySession } from "./mobile-extension-library-runtime";
 import type {
   MobileExtension,
   MobileExtensionMainViewSurface,
@@ -12,7 +14,7 @@ import type {
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
 const native = vi.hoisted(() => ({
-  web: undefined as undefined | Record<string, unknown>
+  web: undefined as undefined | Record<string, unknown>, messages: [] as string[]
 }));
 
 vi.mock("react-native", async () => {
@@ -50,6 +52,9 @@ vi.mock("react-native-webview", async () => {
   return {
     WebView: (props: Record<string, unknown>) => {
       native.web = props;
+      React.useImperativeHandle(props.ref as React.Ref<{ postMessage(message: string): void }>, () => ({
+        postMessage: (message: string) => native.messages.push(message)
+      }));
       return React.createElement("div", { "data-testid": "extension-webview" });
     }
   };
@@ -85,6 +90,7 @@ afterEach(() => {
   container?.remove();
   root = undefined as unknown as Root;
   native.web = undefined;
+  native.messages = [];
 });
 
 describe("MobileExtensionMainView", () => {
@@ -113,12 +119,15 @@ describe("MobileExtensionMainView", () => {
     expect(native.web?.onHttpError).toBeTypeOf("function");
     const allow = native.web!.onShouldStartLoadWithRequest as (request: { readonly url: string }) => boolean;
     expect(allow({ url: surface.url })).toBe(true);
-    expect(allow({ url: surface.url.replace("index.html", "asset.js#loaded") })).toBe(true);
     expect(allow({ url: "https://node.example/v1/other" })).toBe(false);
     expect(allow({ url: "https://attacker.example/" })).toBe(false);
 
     await act(async () => (native.web!.onLoadEnd as () => void)());
     expect(container.textContent).not.toContain("Loading Extension content");
+    await act(async () => {
+      expect(allow({ url: surface.url.replace("index.html", "asset.js#loaded") })).toBe(false);
+    });
+    expect(native.web).toMatchObject({ source: { uri: surface.url.replace("index.html", "asset.js#loaded") } });
     const reload = container.querySelector('button[aria-label="Reload main view"]') as HTMLButtonElement;
     await act(async () => reload.dispatchEvent(new MouseEvent("click", { bubbles: true })));
     expect(active.probeMainView).toHaveBeenCalledWith(surface, expect.any(AbortSignal));
@@ -149,6 +158,39 @@ describe("MobileExtensionMainView", () => {
     await act(async () => (native.web!.onRenderProcessGone as () => void)());
     expect(container.textContent).toContain("changed, expired, or lost its owner");
     expect(active.closeMainView).toHaveBeenCalledWith(second);
+  });
+
+  it("delivers Library results to the current document and retires requests before reload or navigation", async () => {
+    const extension = { ...fixtureExtension(), library: { schemaVersion: 1 as const } };
+    const surface = fixtureSurface(extension), active = fixtureTransport(surface);
+    const session: MobileExtensionLibrarySession = { id: `library_session_${"c".repeat(32)}`, extensionId: extension.extensionId,
+      expiresAt: Date.now() + 60_000, bindingGeneration: 1n, limits: {
+        maximumReadBytes: 16n * 1024n ** 2n, maximumWriteBytes: 16n * 1024n ** 2n, maximumStreamBytes: 8n * 1024n ** 3n,
+        maximumPathCharacters: 512, maximumPathSegments: 32, maximumListPageSize: 500, maximumFiles: 50_000,
+        softLimitBytes: 8n * 1024n ** 3n, diskReserveBytes: 1024n ** 3n
+      } };
+    vi.mocked(active.openLibrary).mockResolvedValue(session);
+    vi.mocked(active.callLibrary).mockResolvedValue({ kind: "read", path: "mail", content: Uint8Array.of(128), sha256: "a".repeat(64) });
+    await render(active, extension);
+    const old = native.web!;
+    const onMessage = old.onMessage as (event: { nativeEvent: { data: string; url: string } }) => void;
+    const request = { nativeEvent: { data: encodeMobileLibraryMessage({ surfaceId: surface.surfaceId,
+      frameId: `${surface.surfaceId}:0`, request: { type: "joko:extension-library-request", version: 1,
+        id: "read", operation: { kind: "read", path: "mail" } } }), url: surface.url } };
+    await act(async () => onMessage(request));
+    expect(active.callLibrary).toHaveBeenCalledWith(extension, surface, session, { kind: "read", path: "mail" }, expect.any(AbortSignal));
+    expect(decodeMobileLibraryMessage(native.messages[0]!)).toMatchObject({ frameId: `${surface.surfaceId}:0`,
+      response: { ok: true, result: { kind: "read", content: Uint8Array.of(128) } } });
+    const reload = container.querySelector('button[aria-label="Reload main view"]') as HTMLButtonElement;
+    await act(async () => reload.dispatchEvent(new MouseEvent("click", { bubbles: true })));
+    expect(active.closeLibrary).toHaveBeenCalledWith(session);
+    await act(async () => {
+      onMessage(request);
+      (old.onError as () => void)();
+    });
+    expect(active.callLibrary).toHaveBeenCalledTimes(1);
+    expect(container.textContent).not.toContain("unavailable");
+    expect(native.web!.injectedJavaScriptBeforeContentLoaded).toContain(`${surface.surfaceId}:1`);
   });
 
   it("closes a lease that arrives after the surface has been unmounted", async () => {
@@ -225,6 +267,10 @@ function fixtureTransport(surface: MobileExtensionMainViewSurface): MobileExtens
     openMainView: vi.fn(async () => surface),
     probeMainView: vi.fn(async () => surface),
     closeMainView: vi.fn(async () => true),
+    openLibrary: vi.fn(async () => { throw new Error("unused"); }),
+    callLibrary: vi.fn(async () => { throw new Error("unused"); }),
+    closeLibrary: vi.fn(async () => true),
+    libraryStatus: vi.fn(async () => { throw new Error("unused"); }),
     loadLibrary: vi.fn(async () => ({ trash: [], grace: [] })),
     validateLibraryLocation: vi.fn(async () => { throw new Error("unused"); }),
     mutateLibrary: vi.fn(async (_expected, snapshot) => snapshot),

@@ -69,6 +69,7 @@ import type { MobileFileShare } from "./mobile-file-share";
 import { MobileOfflineCache, type MobileOfflineCacheStorage } from "./mobile-offline-cache";
 import type { MobileLocalComposerAttachment } from "./mobile-attachments";
 import type { MobilePlainStorageDriver } from "./connection-storage";
+import type { MobileExtensionLibrarySession } from "./mobile-extension-library-runtime";
 import type { MobileVoiceCapability, MobileVoiceSession } from "./mobile-voice-input";
 import { timelineRows } from "./timeline";
 import {
@@ -961,6 +962,9 @@ function fakeNetwork(): MobileNetwork {
     openExtensionMainView: vi.fn(async () => { throw new Error("No Extension main-view fixture was configured."); }),
     getExtensionMainViewSurface: vi.fn(async () => { throw new Error("No Extension main-view fixture was configured."); }),
     closeExtensionMainView: vi.fn(async () => true),
+    openExtensionLibrary: vi.fn(async () => { throw new Error("No Library session fixture was configured."); }),
+    callExtensionLibrary: vi.fn(async () => { throw new Error("No Library call fixture was configured."); }),
+    closeExtensionLibrary: vi.fn(async () => true),
     getExtensionLibraryOverview: vi.fn(async () => { throw new Error("No Extension Library fixture was configured."); }),
     validateExtensionLibraryLocation: vi.fn(async () => { throw new Error("No Extension Library fixture was configured."); }),
     relocateExtensionLibrary: vi.fn(async () => { throw new Error("No Extension Library fixture was configured."); }),
@@ -2497,6 +2501,46 @@ describe("mobile Extension catalog authority", () => {
     network.getExtensionMainViewSurface = vi.fn(async () => ({ ...surface, backendGeneration: 8 }));
     await expect(app.extensionCatalogTransport()!.probeMainView(surface, new AbortController().signal))
       .rejects.toThrow(/changed|expired/u);
+  });
+
+  it("fences Library sessions and calls by exact Extension, surface occurrence and original connection", async () => {
+    const network = fakeNetwork();
+    const extension: MobileExtension = { ...mobileExtensionFixture(), sidebarSupported: true,
+      mainView: { title: "Mail" }, library: { schemaVersion: 1 } };
+    const surface = mobileExtensionMainViewSurface(extension);
+    const session: MobileExtensionLibrarySession = { id: `library_session_${"a".repeat(32)}`, extensionId: extension.extensionId,
+      expiresAt: Date.now() + 60_000, bindingGeneration: 2n, limits: {
+        maximumReadBytes: 16n * 1024n ** 2n, maximumWriteBytes: 16n * 1024n ** 2n, maximumStreamBytes: 8n * 1024n ** 3n,
+        maximumPathCharacters: 512, maximumPathSegments: 32, maximumListPageSize: 500, maximumFiles: 50_000,
+        softLimitBytes: 8n * 1024n ** 3n, diskReserveBytes: 1024n ** 3n
+      } };
+    network.getExtension = vi.fn(async () => extension);
+    network.getExtensionMainViewSurface = vi.fn(async () => surface);
+    network.openExtensionLibrary = vi.fn(async () => session);
+    network.callExtensionLibrary = vi.fn(async () => ({ kind: "read" as const, path: "mail", content: Uint8Array.of(1), sha256: "f".repeat(64) }));
+    const app = client(network, memoryStorage(credential).storage);
+    await app.start();
+    const transport = app.extensionCatalogTransport()!, signal = new AbortController().signal;
+    const opened = await transport.openLibrary(extension, surface, signal);
+    await expect(transport.callLibrary(extension, surface, opened, { kind: "read", path: "mail" }, signal))
+      .resolves.toMatchObject({ kind: "read", path: "mail" });
+    await expect(transport.callLibrary(extension, surface, { ...opened }, { kind: "read", path: "mail" }, signal))
+      .rejects.toThrow(/not owned/u);
+    expect(network.callExtensionLibrary).toHaveBeenCalledTimes(1);
+    network.getExtensionMainViewSurface = vi.fn(async () => ({ ...surface, backendGeneration: surface.backendGeneration + 1 }));
+    await expect(transport.callLibrary(extension, surface, opened, { kind: "read", path: "mail" }, signal))
+      .rejects.toThrow(/changed/u);
+    expect(network.closeExtensionLibrary).toHaveBeenCalledExactlyOnceWith(credential, session.id);
+
+    network.getExtensionMainViewSurface = vi.fn(async () => surface);
+    let finish!: (value: MobileExtensionLibrarySession) => void;
+    network.openExtensionLibrary = vi.fn(() => new Promise<MobileExtensionLibrarySession>((resolve) => { finish = resolve; }));
+    const opening = app.extensionCatalogTransport()!.openLibrary(extension, surface, signal);
+    await vi.waitFor(() => expect(network.openExtensionLibrary).toHaveBeenCalledOnce());
+    app.setForeground(false);
+    finish(session);
+    await expect(opening).rejects.toThrow(/owner changed|cancelled/u);
+    expect(network.closeExtensionLibrary).toHaveBeenCalledTimes(2);
   });
 
   it("loads active Library state only when ready while retaining exact recovery records", async () => {
