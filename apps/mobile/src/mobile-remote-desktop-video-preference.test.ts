@@ -22,7 +22,7 @@ describe("MobileRemoteDesktopVideoPreferenceStore", () => {
 
     expect(store.snapshot).toEqual({
       status: "ready",
-      settings: { fps: 30, bitrate: 0, audio: false },
+      settings: { fps: 30, quality: "auto", audio: false },
       saving: false
     });
   });
@@ -35,25 +35,25 @@ describe("MobileRemoteDesktopVideoPreferenceStore", () => {
     const loading = store.hydrate();
     await Promise.resolve();
 
-    store.update({ fps: 60, bitrate: 8_000_000, audio: false });
+    store.update({ fps: 60, quality: "saver", audio: false });
     resolve(JSON.stringify({ version: 1, audio: true }));
     await loading;
 
-    expect(store.snapshot.settings).toEqual({ fps: 60, bitrate: 8_000_000, audio: false });
+    expect(store.snapshot.settings).toEqual({ fps: 60, quality: "saver", audio: false });
     expect(storage.setItem).toHaveBeenCalledWith(
       "joko.mobile.remote-desktop.audio.v1",
       JSON.stringify({ version: 1, audio: false })
     );
   });
 
-  it("persists audio only while FPS and bitrate remain session-local", async () => {
+  it("persists audio only while FPS and quality remain session-local", async () => {
     const storage = driver();
     const store = new MobileRemoteDesktopVideoPreferenceStore(storage);
     await store.hydrate();
 
-    store.update({ fps: 60, bitrate: 20_000_000, audio: true });
+    store.update({ fps: 60, quality: "hd", audio: true });
     expect(storage.setItem).not.toHaveBeenCalled();
-    store.update({ fps: 60, bitrate: 20_000_000, audio: false });
+    store.update({ fps: 60, quality: "hd", audio: false });
     await vi.waitFor(() => expect(store.snapshot.saving).toBe(false));
 
     expect(storage.setItem).toHaveBeenCalledOnce();

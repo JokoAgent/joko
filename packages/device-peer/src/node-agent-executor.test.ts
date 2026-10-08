@@ -63,6 +63,7 @@ import {
   RemoteDesktopPointerMoveInputSchema,
   RemoteDesktopTextInputSchema,
   RemoteDesktopStartMode,
+  RemoteDesktopVideoQuality,
   RemoteDesktopVideoSettingsSchema
 } from "@joko/contracts";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -255,7 +256,24 @@ describe("Node Device peer Remote Desktop host ownership", () => {
         leaseId: "lease-1",
         attemptId: "attempt-1",
         offerSdp: "v=0\r\n",
-        settings: create(RemoteDesktopVideoSettingsSchema, { fps: 24, bitrate: 8_000_000, audio: true })
+        settings: create(RemoteDesktopVideoSettingsSchema, {
+          fps: 24,
+          quality: RemoteDesktopVideoQuality.HD,
+          audio: true
+        })
+      })
+    }, DevicePeerEffectKind.SIDE_EFFECT);
+    const invalidVideoQuality = remoteDesktopCommand({
+      case: "createRemoteDesktopOffer",
+      value: create(DevicePeerCreateRemoteDesktopOfferActionSchema, {
+        leaseId: "lease-1",
+        attemptId: "attempt-1",
+        offerSdp: "v=0\r\n",
+        settings: create(RemoteDesktopVideoSettingsSchema, {
+          fps: 30,
+          quality: RemoteDesktopVideoQuality.UNSPECIFIED,
+          audio: false
+        })
       })
     }, DevicePeerEffectKind.SIDE_EFFECT);
     const oversizedInput = remoteDesktopCommand({
@@ -275,6 +293,7 @@ describe("Node Device peer Remote Desktop host ownership", () => {
     await expect(execute(executor, oversizedOffer)).rejects.toBeDefined();
     await expect(execute(executor, zeroSequence)).rejects.toBeDefined();
     await expect(execute(executor, invalidVideoSettings)).rejects.toBeDefined();
+    await expect(execute(executor, invalidVideoQuality)).rejects.toBeDefined();
     await expect(execute(executor, oversizedInput)).rejects.toBeDefined();
     expect(fixture.state.calls).toEqual([]);
 
@@ -888,7 +907,11 @@ function remoteDesktopCommands(): readonly {
           attemptId: "attempt-1",
           offerSdp: "v=0\r\n",
           cursorOverlay: false,
-          settings: create(RemoteDesktopVideoSettingsSchema, { fps: 60, bitrate: 8_000_000, audio: true })
+          settings: create(RemoteDesktopVideoSettingsSchema, {
+            fps: 60,
+            quality: RemoteDesktopVideoQuality.HD,
+            audio: true
+          })
         })
       }, DevicePeerEffectKind.SIDE_EFFECT)
     },

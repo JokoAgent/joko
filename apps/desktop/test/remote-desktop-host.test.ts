@@ -2,6 +2,7 @@ import {
   RemoteDesktopClipboardContentSchema,
   RemoteDesktopFailureReason,
   RemoteDesktopStartMode,
+  RemoteDesktopVideoQuality,
   RemoteDesktopVideoSettingsSchema
 } from "@joko/contracts";
 import { create } from "@bufbuild/protobuf";
@@ -292,14 +293,14 @@ describe("Desktop Remote Desktop host", () => {
       cursorOverlay: false,
       settings: create(RemoteDesktopVideoSettingsSchema, {
         fps: 60,
-        bitrate: 8_000_000,
+        quality: RemoteDesktopVideoQuality.SAVER,
         audio: true
       })
     });
     expect(value.media.offer).toHaveBeenLastCalledWith(expect.objectContaining({
       leaseId: lease.leaseId,
       attemptId: "attempt-settings",
-      settings: { fps: 60, bitrate: 8_000_000, audio: true }
+      settings: { fps: 60, quality: "saver", audio: true }
     }));
 
     vi.mocked(value.media.offer).mockRejectedValueOnce(
@@ -313,7 +314,7 @@ describe("Desktop Remote Desktop host", () => {
       cursorOverlay: false,
       settings: create(RemoteDesktopVideoSettingsSchema, {
         fps: 30,
-        bitrate: 0,
+        quality: RemoteDesktopVideoQuality.AUTO,
         audio: true
       })
     })).rejects.toMatchObject({ reason: RemoteDesktopFailureReason.AUDIO_UNAVAILABLE });

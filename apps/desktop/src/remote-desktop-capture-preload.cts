@@ -87,9 +87,29 @@ async function createAnswer(command: Extract<DesktopRemoteDesktopCaptureCommand,
   attempt = { leaseId: command.leaseId, attemptId: command.attemptId };
   try {
     const settings = videoSettings(command.settings);
+    const profile = videoProfile(command.profile, settings.quality);
+    const fps = Math.min(settings.fps, profile.maxFramerate) as 30 | 60;
+    let moving = true;
+    let videoSender: RTCRtpSender | undefined;
+    let preference = Promise.resolve();
+    const degradation = (): "maintain-framerate" | "maintain-resolution" => (
+      moving ? profile.degradation : "maintain-resolution"
+    );
+    const onMotion = (next: boolean): void => {
+      moving = next;
+      preference = preference.then(async () => {
+        const sender = videoSender;
+        if (sender === undefined || current !== generation) return;
+        const parameters = sender.getParameters();
+        if (parameters.encodings.length === 0
+          || parameters.degradationPreference === degradation()) return;
+        parameters.degradationPreference = degradation();
+        await sender.setParameters(parameters);
+      }).catch(() => undefined);
+    };
     const capture = (): Promise<MediaStream> => navigator.mediaDevices.getDisplayMedia({
       audio: settings.audio,
-      video: { frameRate: { ideal: settings.fps, max: settings.fps } }
+      video: { frameRate: { ideal: fps, max: fps } }
     });
     const boundedCapture = async (): Promise<MediaStream> => {
       if (!command.chromiumCapture) throw new Error("unavailable");
@@ -128,7 +148,9 @@ async function createAnswer(command: Extract<DesktopRemoteDesktopCaptureCommand,
           void ipcRenderer.invoke(CHANNELS.stopped).catch(() => undefined);
         },
         (cursor) => { if (current === generation) latestCursor = cursor; },
-        command.cursorOverlay ? settings.fps : 15
+        command.cursorOverlay ? fps : 15,
+        profile.maxFrameBytes,
+        profile.sharpWhenStill ? onMotion : undefined
       );
       if (current !== generation) {
         result.stop();
@@ -224,6 +246,7 @@ async function createAnswer(command: Extract<DesktopRemoteDesktopCaptureCommand,
         if (sender === undefined || track === undefined || current !== generation) {
           throw new Error("stopped");
         }
+        track.contentHint = profile.contentHint;
         await sender.replaceTrack(track);
         captured.getVideoTracks().forEach((oldTrack) => {
           oldTrack.onended = null;
@@ -317,19 +340,21 @@ async function createAnswer(command: Extract<DesktopRemoteDesktopCaptureCommand,
         }
       };
       if (track.kind === "video") track.onmute = () => recoverCapture?.();
+      if (track.kind === "video") track.contentHint = profile.contentHint;
       rtc.addTrack(track, captured);
     });
     await rtc.setRemoteDescription({ type: "offer", sdp: command.offerSdp });
     await rtc.setLocalDescription(await rtc.createAnswer());
     if (current !== generation) return;
     for (const sender of rtc.getSenders()) {
-      if (sender.track?.kind !== "video") continue;
+      if (sender.track?.kind !== "video" || command.settings === undefined) continue;
       const parameters = sender.getParameters();
       if (parameters.encodings.length === 0) continue;
+      parameters.degradationPreference = degradation();
+      videoSender = sender;
       for (const encoding of parameters.encodings) {
-        encoding.maxFramerate = settings.fps;
-        if (settings.bitrate === 0) delete encoding.maxBitrate;
-        else encoding.maxBitrate = settings.bitrate;
+        encoding.maxFramerate = fps;
+        encoding.maxBitrate = profile.maxBitrate;
       }
       await sender.setParameters(parameters);
     }
@@ -424,22 +449,67 @@ function validCandidate(value: RemoteDesktopIceCandidate): boolean {
 
 function videoSettings(value: unknown): {
   readonly fps: 30 | 60;
-  readonly bitrate: 0 | 2_000_000 | 8_000_000 | 20_000_000;
+  readonly quality: "auto" | "saver" | "hd";
   readonly audio: boolean;
 } {
-  if (value === undefined) return Object.freeze({ fps: 30, bitrate: 0, audio: false });
-  if (!record(value) || !exactKeys(value, ["fps", "bitrate", "audio"])
+  if (value === undefined) return Object.freeze({ fps: 30, quality: "auto", audio: false });
+  if (!record(value) || !exactKeys(value, ["fps", "quality", "audio"])
     || (value["fps"] !== 30 && value["fps"] !== 60)
-    || (value["bitrate"] !== 0 && value["bitrate"] !== 2_000_000
-      && value["bitrate"] !== 8_000_000 && value["bitrate"] !== 20_000_000)
+    || (value["quality"] !== "auto" && value["quality"] !== "saver"
+      && value["quality"] !== "hd")
     || typeof value["audio"] !== "boolean") {
     throw new Error("unavailable");
   }
   return Object.freeze({
     fps: value["fps"],
-    bitrate: value["bitrate"],
+    quality: value["quality"],
     audio: value["audio"]
   });
+}
+
+interface CaptureVideoProfile {
+  readonly maxBitrate: number;
+  readonly minBitrateKbps: number;
+  readonly startBitrateKbps: number;
+  readonly maxFramerate: 30 | 60;
+  readonly degradation: "maintain-framerate" | "maintain-resolution";
+  readonly sharpWhenStill: boolean;
+  readonly contentHint: "" | "text";
+  readonly jpegQuality: number;
+  readonly physicalMaxEdge: number;
+  readonly maxFrameBytes: number;
+}
+
+function videoProfile(
+  value: unknown,
+  quality: "auto" | "saver" | "hd"
+): CaptureVideoProfile {
+  const expected: CaptureVideoProfile = quality === "saver"
+    ? {
+        maxBitrate: 2_000_000, minBitrateKbps: 500, startBitrateKbps: 1_500,
+        maxFramerate: 30, degradation: "maintain-framerate", sharpWhenStill: true,
+        contentHint: "", jpegQuality: 0.65, physicalMaxEdge: 0, maxFrameBytes: 1_000_000
+      }
+    : quality === "hd"
+      ? {
+          maxBitrate: 20_000_000, minBitrateKbps: 1_000, startBitrateKbps: 4_000,
+          maxFramerate: 60, degradation: "maintain-resolution", sharpWhenStill: false,
+          contentHint: "text", jpegQuality: 0.9, physicalMaxEdge: 3_840,
+          maxFrameBytes: 3_000_000
+        }
+      : {
+          maxBitrate: 20_000_000, minBitrateKbps: 1_000, startBitrateKbps: 4_000,
+          maxFramerate: 60, degradation: "maintain-framerate", sharpWhenStill: true,
+          contentHint: "", jpegQuality: 0.8, physicalMaxEdge: 2_560,
+          maxFrameBytes: 1_500_000
+        };
+  if (!record(value) || !exactKeys(value, [
+    "maxBitrate", "minBitrateKbps", "startBitrateKbps", "maxFramerate", "degradation",
+    "sharpWhenStill", "contentHint", "jpegQuality", "physicalMaxEdge", "maxFrameBytes"
+  ]) || Object.entries(expected).some(([key, expectedValue]) => value[key] !== expectedValue)) {
+    throw new Error("unavailable");
+  }
+  return Object.freeze(expected);
 }
 
 /** Serial native pulls and image decode to keep IPC and canvas memory bounded. */
@@ -448,18 +518,43 @@ async function nativeCaptureStream(
   alive: () => boolean,
   failed: () => void,
   cursor: (value: DesktopRemoteDesktopCursor | null) => void,
-  fps: number
+  fps: number,
+  maxFrameBytes: number,
+  onMotion?: (moving: boolean) => void
 ): Promise<{ readonly stream: MediaStream; stop(): void }> {
   const canvas = document.createElement("canvas");
   const context = canvas.getContext("2d");
   if (context === null) throw new Error("unavailable");
+  const thumbnail = onMotion === undefined ? undefined : document.createElement("canvas");
+  const thumbnailContext = thumbnail?.getContext("2d", { willReadFrequently: true });
+  if (thumbnail !== undefined) {
+    thumbnail.width = 64;
+    thumbnail.height = 36;
+  }
+  let previousThumbnail: Uint8ClampedArray | undefined;
+  let lastMotion = 0;
+  let moving = true;
+  const observeMotion = (bitmap: ImageBitmap): void => {
+    if (thumbnailContext === null || thumbnailContext === undefined || onMotion === undefined) return;
+    thumbnailContext.drawImage(bitmap, 0, 0, 64, 36);
+    const next = thumbnailContext.getImageData(0, 0, 64, 36).data;
+    const now = performance.now();
+    if (previousThumbnail === undefined
+      || frameChange(previousThumbnail, next) > 0.02) lastMotion = now;
+    previousThumbnail = next;
+    const nextMoving = now - lastMotion < 1_000;
+    if (nextMoving !== moving) {
+      moving = nextMoving;
+      onMotion(moving);
+    }
+  };
   let stopped = false;
   let timer: ReturnType<typeof setTimeout> | undefined;
   let lastFrame = performance.now();
   const draw = async (): Promise<boolean> => {
     const frame = await read();
     if (frame === null || stopped || !alive()) return false;
-    const parsed = nativeFrame(frame);
+    const parsed = nativeFrame(frame, maxFrameBytes);
     const bytes = Uint8Array.from(atob(parsed.jpeg), (character) => character.charCodeAt(0));
     const bitmap = await createImageBitmap(new Blob([bytes], { type: "image/jpeg" }));
     try {
@@ -473,6 +568,7 @@ async function nativeCaptureStream(
         canvas.height = bitmap.height;
       }
       context.drawImage(bitmap, 0, 0);
+      observeMotion(bitmap);
       cursor(parsed.cursor);
       lastFrame = performance.now();
       return true;
@@ -513,10 +609,23 @@ async function nativeCaptureStream(
   });
 }
 
-function nativeFrame(value: unknown): DesktopRemoteDesktopCaptureNativeFrame {
+function frameChange(previous: Uint8ClampedArray, next: Uint8ClampedArray): number {
+  if (previous.length !== next.length || next.length === 0) return 1;
+  let changed = 0;
+  for (let index = 0; index < next.length; index += 4) {
+    if (Math.abs(previous[index]! - next[index]!) > 10
+      || Math.abs(previous[index + 1]! - next[index + 1]!) > 10
+      || Math.abs(previous[index + 2]! - next[index + 2]!) > 10) changed += 1;
+  }
+  return changed / (next.length / 4);
+}
+
+function nativeFrame(value: unknown, maxFrameBytes: number): DesktopRemoteDesktopCaptureNativeFrame {
+  const maxEncodedBytes = Math.ceil(maxFrameBytes / 3) * 4;
   if (!record(value) || !exactKeys(value, ["jpeg", "width", "height", "cursor"])
     || typeof value["jpeg"] !== "string" || value["jpeg"].length < 1
-    || value["jpeg"].length > 1_333_336 || !/^[A-Za-z0-9+/]*={0,2}$/u.test(value["jpeg"])
+    || value["jpeg"].length > maxEncodedBytes || !/^[A-Za-z0-9+/]*={0,2}$/u.test(value["jpeg"])
+    || base64ByteLength(value["jpeg"]) > maxFrameBytes
     || !Number.isSafeInteger(value["width"]) || !Number.isSafeInteger(value["height"])
     || (value["width"] as number) < 1 || (value["width"] as number) > 4_096
     || (value["height"] as number) < 1 || (value["height"] as number) > 4_096
@@ -524,6 +633,12 @@ function nativeFrame(value: unknown): DesktopRemoteDesktopCaptureNativeFrame {
     throw new Error("unavailable");
   }
   return value as unknown as DesktopRemoteDesktopCaptureNativeFrame;
+}
+
+function base64ByteLength(value: string): number {
+  if (value.length % 4 === 1) return Number.POSITIVE_INFINITY;
+  const padding = value.endsWith("==") ? 2 : value.endsWith("=") ? 1 : 0;
+  return Math.floor((value.length * 3) / 4) - padding;
 }
 
 function cursorValue(value: unknown): value is DesktopRemoteDesktopCursor {

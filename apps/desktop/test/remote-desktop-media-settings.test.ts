@@ -6,25 +6,25 @@ import {
 } from "../src/remote-desktop-media-settings.js";
 
 describe("Desktop Remote Desktop media settings", () => {
-  it("accepts only the fixed frame-rate and bitrate choices", () => {
+  it("accepts only the fixed frame-rate and host-owned quality choices", () => {
     expect(parseDesktopRemoteDesktopVideoSettings({
       fps: 30,
-      bitrate: 0,
+      quality: "auto",
       audio: false
-    })).toEqual({ fps: 30, bitrate: 0, audio: false });
+    })).toEqual({ fps: 30, quality: "auto", audio: false });
     expect(parseDesktopRemoteDesktopVideoSettings({
       fps: 60,
-      bitrate: 20_000_000,
+      quality: "hd",
       audio: true
-    })).toEqual({ fps: 60, bitrate: 20_000_000, audio: true });
+    })).toEqual({ fps: 60, quality: "hd", audio: true });
     expect(() => parseDesktopRemoteDesktopVideoSettings({
       fps: 24,
-      bitrate: 8_000_000,
+      quality: "saver",
       audio: false
     })).toThrowError("video settings are invalid");
     expect(() => parseDesktopRemoteDesktopVideoSettings({
       fps: 60,
-      bitrate: 4_000_000,
+      quality: "ultra",
       audio: false
     })).toThrowError("video settings are invalid");
   });

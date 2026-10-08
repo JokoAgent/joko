@@ -1,10 +1,13 @@
+import { EventEmitter } from "node:events";
 import { readFile } from "node:fs/promises";
+import { PassThrough } from "node:stream";
+import type { ChildProcessWithoutNullStreams } from "node:child_process";
 
 import { describe, expect, it, vi } from "vitest";
 
 vi.mock("electron", () => ({ app: {} }));
 
-import { parseDesktopRemoteDesktopNativeFrame } from
+import { DesktopRemoteDesktopNativeCapture, parseDesktopRemoteDesktopNativeFrame } from
   "../src/remote-desktop-native-capture.js";
 
 describe("Remote Desktop native capture boundary", () => {
@@ -35,6 +38,58 @@ describe("Remote Desktop native capture boundary", () => {
       true,
       false
     )).toThrowError("invalid");
+  });
+
+  it("enforces the host-owned native frame budget for the selected tier", () => {
+    const frame = { jpeg: "A".repeat(4_000_000), width: 1, height: 1, cursor: null };
+    expect(parseDesktopRemoteDesktopNativeFrame(
+      frame,
+      true,
+      false,
+      { fps: 60, quality: "hd", audio: false }
+    )).toEqual(frame);
+    expect(() => parseDesktopRemoteDesktopNativeFrame(
+      frame,
+      true,
+      false,
+      { fps: 60, quality: "auto", audio: false }
+    )).toThrowError("invalid");
+  });
+
+  it("passes the effective saver profile to the native helper", async () => {
+    const stdin = new PassThrough();
+    const stdout = new PassThrough();
+    const stderr = new PassThrough();
+    const child = Object.assign(new EventEmitter(), {
+      stdin,
+      stdout,
+      stderr,
+      kill: vi.fn(() => true)
+    }) as unknown as ChildProcessWithoutNullStreams;
+    stdin.once("data", () => stdout.write(`${JSON.stringify({
+      jpeg: "AQ==",
+      width: 1,
+      height: 1,
+      cursor: null
+    })}\n`));
+    let arguments_: readonly string[] = [];
+    const capture = new DesktopRemoteDesktopNativeCapture({
+      platform: "darwin",
+      resolveBinary: async () => "/capture",
+      spawn: (_binary, next) => {
+        arguments_ = next;
+        return child;
+      }
+    });
+
+    await expect(capture.frame(
+      "1",
+      true,
+      false,
+      { fps: 60, quality: "saver", audio: false }
+    )).resolves.toMatchObject({ width: 1, height: 1, cursor: null });
+    expect(arguments_).toEqual(["1", "native-video", "30", "0.65", "0", "1000000"]);
+    capture.stop();
   });
 
   it("duplicates the same strict IHDR/raster checks at the isolated preload boundary", async () => {

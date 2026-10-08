@@ -182,13 +182,16 @@ function RemoteDesktopSession({ transport, preferredDeviceId, interactive, foreg
             selected={videoPreference.settings.fps === fps}
             disabled={snapshot.status !== "live" || snapshot.videoSettingsBusy}
             onPress={() => updateVideoPreference(videoPreferences, videoPreference.settings, { fps })} />)}
-          <Text style={[styles.controlLabel, { color: colors.muted }]}>{copy.bitrate}</Text>
-          {([0, 2_000_000, 8_000_000, 20_000_000] as const).map((bitrate) => <Button key={bitrate}
-            label={bitrate === 0 ? copy.auto : `${bitrate / 1_000_000} Mbps`} colors={colors}
-            selected={videoPreference.settings.bitrate === bitrate}
-            disabled={snapshot.status !== "live" || snapshot.videoSettingsBusy}
-            onPress={() => updateVideoPreference(videoPreferences, videoPreference.settings, { bitrate })} />)}
         </View>
+        <View style={styles.controlRow}>
+          <Text style={[styles.controlLabel, { color: colors.muted }]}>{copy.quality}</Text>
+          {(["auto", "saver", "hd"] as const).map((quality) => <Button key={quality}
+            label={quality === "auto" ? copy.auto : quality === "saver" ? copy.saver : copy.hd}
+            colors={colors} selected={videoPreference.settings.quality === quality}
+            disabled={snapshot.status !== "live" || snapshot.videoSettingsBusy}
+            onPress={() => updateVideoPreference(videoPreferences, videoPreference.settings, { quality })} />)}
+        </View>
+        <Text style={[styles.controlLabel, { color: colors.muted }]}>{copy.qualityHint}</Text>
         <View style={styles.controlRow}>
           {snapshot.capabilities.systemAudio && <Button
             label={videoPreference.settings.audio ? copy.audioOn : copy.audioOff} colors={colors}
@@ -262,7 +265,7 @@ function updateVideoPreference(
 ): void {
   store.update({
     fps: patch.fps ?? settings.fps,
-    bitrate: patch.bitrate ?? settings.bitrate,
+    quality: patch.quality ?? settings.quality,
     audio: patch.audio ?? settings.audio
   });
 }

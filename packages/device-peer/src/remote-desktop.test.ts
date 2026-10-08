@@ -99,9 +99,11 @@ describe("remote desktop portable protocol", () => {
     })).toEqual({ op: "frame", lease: "lease-1", cursorOverlay: false });
     expect(() => parseRemoteDesktopRequest({ op: "frame", lease: "lease-1" }))
       .toThrowError("INVALID_REMOTE_DESKTOP_REQUEST");
-    expect(parseRemoteDesktopVideoSettings({ fps: 60, bitrate: 8_000_000, audio: true }))
-      .toEqual({ fps: 60, bitrate: 8_000_000, audio: true });
-    expect(() => parseRemoteDesktopVideoSettings({ fps: 24, bitrate: 8_000_000, audio: true }))
+    expect(parseRemoteDesktopVideoSettings({ fps: 60, quality: "hd", audio: true }))
+      .toEqual({ fps: 60, quality: "hd", audio: true });
+    expect(() => parseRemoteDesktopVideoSettings({ fps: 24, quality: "hd", audio: true }))
+      .toThrowError("INVALID_REMOTE_DESKTOP_VIDEO_SETTINGS");
+    expect(() => parseRemoteDesktopVideoSettings({ fps: 60, quality: "ultra", audio: true }))
       .toThrowError("INVALID_REMOTE_DESKTOP_VIDEO_SETTINGS");
     expect(() => parseRemoteDesktopRequest({
       op: "input",

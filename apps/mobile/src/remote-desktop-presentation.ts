@@ -22,8 +22,11 @@ interface MobileRemoteDesktopCopy {
   readonly right: string;
   readonly release: string;
   readonly frameRate: string;
-  readonly bitrate: string;
+  readonly quality: string;
   readonly auto: string;
+  readonly saver: string;
+  readonly hd: string;
+  readonly qualityHint: string;
   readonly audioOn: string;
   readonly audioOff: string;
   readonly pictureInPicture: string;
@@ -74,7 +77,9 @@ const EN: MobileRemoteDesktopCopy = {
   title: "Remote Desktop", back: "Back", chooseDesktop: "Choose a desktop", chooseDisplay: "Choose a display",
   view: "View", control: "Control", touch: "Touch", trackpad: "Trackpad", pan: "Pan",
   keyboard: "Keyboard", fit: "Fit", left: "Left", right: "Right", release: "Release",
-  frameRate: "Frame rate", bitrate: "Quality", auto: "Auto", audioOn: "Audio on", audioOff: "Audio off",
+  frameRate: "Frame rate", quality: "Quality", auto: "Auto", saver: "Data saver", hd: "HD",
+  qualityHint: "Auto keeps motion smooth and sharpens when the network allows. Data saver limits usage to 30 FPS. HD keeps text sharp and lowers frame rate when bandwidth is limited.",
+  audioOn: "Audio on", audioOff: "Audio off",
   pictureInPicture: "Picture in Picture", resolution: "Resolution", nativeResolution: "Native",
   displayModesLoading: "Loading resolutions…", displayModesFailed: "Could not load resolutions.",
   displayModeFailed: "The resolution could not be changed. The desktop connection is unchanged when the host rejected it.",
@@ -107,7 +112,9 @@ const ZH_CN: MobileRemoteDesktopCopy = {
   title: "远程桌面", back: "返回", chooseDesktop: "选择桌面", chooseDisplay: "选择显示器",
   view: "查看", control: "控制", touch: "触控", trackpad: "触控板", pan: "平移",
   keyboard: "键盘", fit: "适合屏幕", left: "左键", right: "右键", release: "释放输入",
-  frameRate: "帧率", bitrate: "画质", auto: "自动", audioOn: "声音已开启", audioOff: "声音已关闭",
+  frameRate: "帧率", quality: "画质", auto: "自动", saver: "省流", hd: "高清",
+  qualityHint: "自动优先保证流畅，网络允许时尽量清晰；省流将流量与帧率限制在 30 FPS；高清优先保证文字清晰，带宽不足时会降低帧率。",
+  audioOn: "声音已开启", audioOff: "声音已关闭",
   pictureInPicture: "画中画", resolution: "分辨率", nativeResolution: "原生",
   displayModesLoading: "正在加载分辨率…", displayModesFailed: "无法加载分辨率。",
   displayModeFailed: "无法更改分辨率。若桌面已开始切换，将自动重新连接。",
@@ -134,7 +141,9 @@ const ZH_TW: MobileRemoteDesktopCopy = {
   ...ZH_CN, title: "遠端桌面", back: "返回", chooseDesktop: "選擇桌面", chooseDisplay: "選擇顯示器", view: "檢視",
   control: "控制", touch: "觸控", trackpad: "觸控板", pan: "平移", keyboard: "鍵盤",
   fit: "符合螢幕", left: "左鍵", right: "右鍵", release: "釋放輸入", retry: "重試",
-  frameRate: "影格率", bitrate: "畫質", auto: "自動", audioOn: "聲音已開啟", audioOff: "聲音已關閉",
+  frameRate: "影格率", quality: "畫質", auto: "自動", saver: "省流量", hd: "高清",
+  qualityHint: "自動優先確保流暢，網路允許時盡量清晰；省流量將用量與影格率限制在 30 FPS；高清優先確保文字清晰，頻寬不足時會降低影格率。",
+  audioOn: "聲音已開啟", audioOff: "聲音已關閉",
   pictureInPicture: "子母畫面", resolution: "解析度", nativeResolution: "原生",
   displayModesLoading: "正在載入解析度…", displayModesFailed: "無法載入解析度。",
   displayModeFailed: "無法變更解析度。若桌面已開始切換，將自動重新連線。",
@@ -162,7 +171,9 @@ const JA: MobileRemoteDesktopCopy = {
   chooseDisplay: "ディスプレイを選択", view: "表示", control: "操作", touch: "タッチ",
   trackpad: "トラックパッド", pan: "移動", keyboard: "キーボード", fit: "画面に合わせる",
   left: "左クリック", right: "右クリック", release: "入力を解放", retry: "再試行", takeover: "引き継ぐ",
-  frameRate: "フレームレート", bitrate: "画質", auto: "自動", audioOn: "音声オン", audioOff: "音声オフ",
+  frameRate: "フレームレート", quality: "画質", auto: "自動", saver: "データ節約", hd: "高画質",
+  qualityHint: "自動は滑らかさを優先し、通信に余裕があれば鮮明にします。データ節約は通信量とフレームレートを 30 FPS に抑えます。高画質は文字の鮮明さを優先し、帯域が足りないときはフレームレートを下げます。",
+  audioOn: "音声オン", audioOff: "音声オフ",
   pictureInPicture: "ピクチャ・イン・ピクチャ", resolution: "解像度", nativeResolution: "ネイティブ",
   displayModesLoading: "解像度を読み込み中…", displayModesFailed: "解像度を読み込めませんでした。",
   displayModeFailed: "解像度を変更できませんでした。切り替えが始まっている場合は自動的に再接続します。",
@@ -191,7 +202,9 @@ const KO: MobileRemoteDesktopCopy = {
   ...EN, title: "원격 데스크톱", back: "뒤로", chooseDesktop: "데스크톱 선택", chooseDisplay: "디스플레이 선택",
   view: "보기", control: "제어", touch: "터치", trackpad: "트랙패드", pan: "이동", keyboard: "키보드",
   fit: "화면 맞춤", left: "왼쪽", right: "오른쪽", release: "입력 해제", retry: "다시 시도",
-  frameRate: "프레임 속도", bitrate: "화질", auto: "자동", audioOn: "오디오 켜짐", audioOff: "오디오 꺼짐",
+  frameRate: "프레임 속도", quality: "화질", auto: "자동", saver: "데이터 절약", hd: "고화질",
+  qualityHint: "자동은 부드러움을 우선하고 네트워크가 허용하면 더 선명하게 표시합니다. 데이터 절약은 사용량과 프레임 속도를 30 FPS로 제한합니다. 고화질은 글자 선명도를 우선하며 대역폭이 부족하면 프레임 속도를 낮춥니다.",
+  audioOn: "오디오 켜짐", audioOff: "오디오 꺼짐",
   pictureInPicture: "화면 속 화면", resolution: "해상도", nativeResolution: "기본",
   displayModesLoading: "해상도 불러오는 중…", displayModesFailed: "해상도를 불러오지 못했습니다.",
   displayModeFailed: "해상도를 변경하지 못했습니다. 전환이 시작된 경우 자동으로 다시 연결합니다.",

@@ -1201,8 +1201,9 @@ function validateControlState(value: contract.RemoteDesktopControlState): void {
 
 function validateVideoSettings(value: contract.RemoteDesktopVideoSettings): void {
   if ((value.fps !== 30 && value.fps !== 60)
-    || (value.bitrate !== 0 && value.bitrate !== 2_000_000
-      && value.bitrate !== 8_000_000 && value.bitrate !== 20_000_000)
+    || (value.quality !== contract.RemoteDesktopVideoQuality.AUTO
+      && value.quality !== contract.RemoteDesktopVideoQuality.SAVER
+      && value.quality !== contract.RemoteDesktopVideoQuality.HD)
     || typeof value.audio !== "boolean") {
     throw invalidArgument("Remote Desktop video settings are invalid.");
   }

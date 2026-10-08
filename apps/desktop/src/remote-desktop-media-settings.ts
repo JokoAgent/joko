@@ -1,15 +1,12 @@
 export const REMOTE_DESKTOP_VIDEO_FRAME_RATES = Object.freeze([30, 60] as const);
-export const REMOTE_DESKTOP_VIDEO_BITRATES = Object.freeze([
-  0,
-  2_000_000,
-  8_000_000,
-  20_000_000
-] as const);
+export const REMOTE_DESKTOP_VIDEO_QUALITIES = Object.freeze(["auto", "saver", "hd"] as const);
+
+export type DesktopRemoteDesktopVideoQuality = typeof REMOTE_DESKTOP_VIDEO_QUALITIES[number];
 
 export interface DesktopRemoteDesktopVideoSettings {
   readonly fps: 30 | 60;
-  /** Zero leaves the WebRTC sender on automatic bitrate selection. */
-  readonly bitrate: 0 | 2_000_000 | 8_000_000 | 20_000_000;
+  /** Viewer intent only; the host owns concrete capture and encoder parameters. */
+  readonly quality: DesktopRemoteDesktopVideoQuality;
   readonly audio: boolean;
 }
 
@@ -21,17 +18,17 @@ export function parseDesktopRemoteDesktopVideoSettings(
     throw new TypeError("Remote Desktop video settings are invalid.");
   }
   const record = value as Record<string, unknown>;
-  if (!exactKeys(record, ["fps", "bitrate", "audio"])
+  if (!exactKeys(record, ["fps", "quality", "audio"])
     || !REMOTE_DESKTOP_VIDEO_FRAME_RATES.includes(record["fps"] as 30 | 60)
-    || !REMOTE_DESKTOP_VIDEO_BITRATES.includes(
-      record["bitrate"] as 0 | 2_000_000 | 8_000_000 | 20_000_000
+    || !REMOTE_DESKTOP_VIDEO_QUALITIES.includes(
+      record["quality"] as DesktopRemoteDesktopVideoQuality
     )
     || typeof record["audio"] !== "boolean") {
     throw new TypeError("Remote Desktop video settings are invalid.");
   }
   return Object.freeze({
     fps: record["fps"] as 30 | 60,
-    bitrate: record["bitrate"] as 0 | 2_000_000 | 8_000_000 | 20_000_000,
+    quality: record["quality"] as DesktopRemoteDesktopVideoQuality,
     audio: record["audio"]
   });
 }

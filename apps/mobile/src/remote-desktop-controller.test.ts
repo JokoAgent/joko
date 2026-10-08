@@ -25,6 +25,7 @@ import {
   RemoteDesktopPermissionStatus,
   RemoteDesktopPermissionsSchema,
   RemoteDesktopStartMode,
+  RemoteDesktopVideoQuality,
   RevisionSchema,
   SessionSchema,
   TargetSchema,
@@ -635,19 +636,23 @@ describe("MobileRemoteDesktopController", () => {
     controller.viewerMessage({ type: "offer", epoch, attemptId: "initial", sdp: "offer-initial" });
     await flushAsync();
 
-    controller.updateVideoSettings({ fps: 60, bitrate: 2_000_000, audio: true });
-    controller.updateVideoSettings({ fps: 60, bitrate: 20_000_000, audio: false });
+    controller.updateVideoSettings({ fps: 60, quality: "saver", audio: true });
+    controller.updateVideoSettings({ fps: 60, quality: "hd", audio: false });
     expect(commands.filter((command) => command.type === "videoSettings")).toHaveLength(0);
     resolveOffer({ $typeName: "joko.v1.RemoteDesktopOfferResult", attemptId: "initial", answerSdp: "answer" });
     await vi.waitFor(() => expect(commands.filter((command) => command.type === "videoSettings")).toHaveLength(1));
     expect(commands.filter((command) => command.type === "videoSettings")).toEqual([
       { type: "videoSettings", audio: false }
     ]);
-    expect(controller.snapshot.videoSettings).toEqual({ fps: 60, bitrate: 20_000_000, audio: false });
+    expect(controller.snapshot.videoSettings).toEqual({ fps: 60, quality: "hd", audio: false });
     controller.viewerMessage({ type: "iceConfig", epoch, attemptId: "latest" });
     controller.viewerMessage({ type: "offer", epoch, attemptId: "latest", sdp: "offer-latest" });
     await flushAsync();
-    expect(value.offer.mock.calls.at(-1)?.[4]).toMatchObject({ fps: 60, bitrate: 20_000_000, audio: false });
+    expect(value.offer.mock.calls.at(-1)?.[4]).toMatchObject({
+      fps: 60,
+      quality: RemoteDesktopVideoQuality.HD,
+      audio: false
+    });
     await controller.close();
   });
 

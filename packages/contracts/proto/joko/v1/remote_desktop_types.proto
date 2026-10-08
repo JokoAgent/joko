@@ -139,11 +139,18 @@ message RemoteDesktopControlState {
   uint64 control_generation = 2;
 }
 
-// Exact WebRTC capture settings. v1 intentionally admits only the fixed
-// product choices; zero bitrate means automatic sender allocation.
+// Viewer intent for exact WebRTC capture settings. The host owns all concrete
+// capture and encoder parameters for these fixed v1 product choices.
+enum RemoteDesktopVideoQuality {
+  REMOTE_DESKTOP_VIDEO_QUALITY_UNSPECIFIED = 0;
+  REMOTE_DESKTOP_VIDEO_QUALITY_AUTO = 1;
+  REMOTE_DESKTOP_VIDEO_QUALITY_SAVER = 2;
+  REMOTE_DESKTOP_VIDEO_QUALITY_HD = 3;
+}
+
 message RemoteDesktopVideoSettings {
   uint32 fps = 1;
-  uint32 bitrate = 2;
+  RemoteDesktopVideoQuality quality = 2;
   bool audio = 3;
 }
 

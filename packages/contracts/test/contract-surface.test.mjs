@@ -438,7 +438,14 @@ test("Remote Desktop keeps public controller identity implicit and target comman
   ]);
   assert.equal(field(contract.RemoteDesktopLeaseSchema, "control_generation").number, 4);
   assert.equal(field(contract.RemoteDesktopControlStateSchema, "control_generation").number, 2);
-  assert.deepEqual([...fieldNames(contract.RemoteDesktopVideoSettingsSchema)], ["fps", "bitrate", "audio"]);
+  assert.deepEqual([...fieldNames(contract.RemoteDesktopVideoSettingsSchema)], ["fps", "quality", "audio"]);
+  assert.equal(field(contract.RemoteDesktopVideoSettingsSchema, "quality").enum.typeName,
+    "joko.v1.RemoteDesktopVideoQuality");
+  assert.deepEqual([
+    contract.RemoteDesktopVideoQuality.AUTO,
+    contract.RemoteDesktopVideoQuality.SAVER,
+    contract.RemoteDesktopVideoQuality.HD
+  ], [1, 2, 3]);
   assert.deepEqual([...fieldNames(contract.RemoteDesktopPresentationProofSchema)], ["lease_id", "proof_sequence"]);
   assert.deepEqual([...fieldNames(contract.RemoteDesktopDisplayModeSchema)], [
     "mode_id", "width", "height", "current", "native"

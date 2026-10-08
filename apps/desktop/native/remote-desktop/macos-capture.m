@@ -67,12 +67,16 @@ static NSDictionary *readCursor(CGDirectDisplayID display) {
 
 int main(int argc, const char *argv[]) {
   @autoreleasepool {
-    BOOL nativeVideo = argc == 5 &&
+    // Stream: <display> <native-video|cursor-overlay> <fps> <quality>
+    //         <physical max edge, 0 = logical> <max JPEG bytes>
+    BOOL nativeVideo = argc == 7 &&
       (strcmp(argv[2], "native-video") == 0 || strcmp(argv[2], "cursor-overlay") == 0);
     BOOL overlay = nativeVideo && strcmp(argv[2], "cursor-overlay") == 0;
     if ((argc != 2 && !nativeVideo) || !ownedLoggedInSession()) return 2;
     int fps = 15;
     double quality = 0.55;
+    long physicalMaxEdge = 0;
+    long frameLimit = 180000;
     if (nativeVideo) {
       if (strcmp(argv[3], "30") == 0) fps = 30;
       else if (strcmp(argv[3], "60") == 0) fps = 60;
@@ -80,6 +84,12 @@ int main(int argc, const char *argv[]) {
       char *qualityEnd = NULL;
       quality = strtod(argv[4], &qualityEnd);
       if (!*argv[4] || *qualityEnd || quality < 0.1 || quality > 1) return 2;
+      char *physicalEnd = NULL;
+      physicalMaxEdge = strtol(argv[5], &physicalEnd, 10);
+      char *frameEnd = NULL;
+      frameLimit = strtol(argv[6], &frameEnd, 10);
+      if (!*argv[5] || *physicalEnd || physicalMaxEdge < 0 || physicalMaxEdge > 8192
+          || !*argv[6] || *frameEnd || frameLimit < 100000 || frameLimit > 4000000) return 2;
     }
     char *end = NULL;
     unsigned long value = strtoul(argv[1], &end, 10);
@@ -106,10 +116,25 @@ int main(int argc, const char *argv[]) {
     // Every native stream is cursor-free. Cursor-overlay mode reports the
     // independently bounded current shape/location; compatibility fallback
     // reports null and never bakes an un-fenceable stale cursor into pixels.
-    // Native WebRTC video keeps the selected display up to 4096 pixels while ordinary
-    // compatibility fallback stays at the existing inexpensive 1280-pixel bound.
+    // Native WebRTC video may use backing pixels under a tier-owned long-edge
+    // target. Compatibility fallback stays at the inexpensive 1280-pixel bound.
     BOOL separateCursor = overlay;
-    double scale = MIN(1.0, (nativeVideo ? 4096.0 : 1280.0) / MAX(width, height));
+    double edgeLimit = nativeVideo ? 4096.0 : 1280.0;
+    if (nativeVideo && physicalMaxEdge) {
+      CGDisplayModeRef mode = CGDisplayCopyDisplayMode(display);
+      if (mode) {
+        size_t pixelWidth = CGDisplayModeGetPixelWidth(mode);
+        size_t pixelHeight = CGDisplayModeGetPixelHeight(mode);
+        CGDisplayModeRelease(mode);
+        if (pixelWidth > width && pixelHeight > height) {
+          width = pixelWidth;
+          height = pixelHeight;
+        }
+      }
+      double logicalEdge = (double)MAX(CGDisplayPixelsWide(display), CGDisplayPixelsHigh(display));
+      edgeLimit = MAX((double)physicalMaxEdge, MIN(edgeLimit, logicalEdge));
+    }
+    double scale = MIN(1.0, edgeLimit / MAX(width, height));
     width = MAX(1, (size_t)(width * scale));
     height = MAX(1, (size_t)(height * scale));
     dispatch_queue_t queue = dispatch_queue_create("joko.desktop.capture", DISPATCH_QUEUE_SERIAL);
@@ -164,7 +189,7 @@ int main(int argc, const char *argv[]) {
           CIImage *image = [CIImage imageWithIOSurface:surface];
           NSData *jpeg = [context JPEGRepresentationOfImage:image colorSpace:color
             options:@{ (__bridge NSString *)kCGImageDestinationLossyCompressionQuality: @(quality) }];
-          NSUInteger limit = nativeVideo ? 1000000 : 180000;
+          NSUInteger limit = (NSUInteger)frameLimit;
           if (jpeg.length > limit) {
             for (NSNumber *q in @[@0.45, @0.25, @0.1]) {
               if (jpeg.length <= limit) break;

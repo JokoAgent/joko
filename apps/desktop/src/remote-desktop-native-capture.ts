@@ -8,12 +8,14 @@ import { app } from "electron";
 
 import type { DesktopRemoteDesktopVideoSettings } from "./remote-desktop-media-settings.js";
 import { verifyPackagedDesktopRemoteDesktopBinary } from "./remote-desktop-native-manifest.js";
+import {
+  desktopRemoteDesktopVideoFramerate,
+  desktopRemoteDesktopVideoProfile
+} from "./remote-desktop-quality.js";
 
 const exec = promisify(execFile);
 const CAPTURE_HELPER = "joko-macos-remote-desktop-capture";
-const MAXIMUM_NATIVE_FRAME_BYTES = 1_000_000;
 const MAXIMUM_NATIVE_FRAME_DIMENSION = 4_096;
-const MAXIMUM_NATIVE_MESSAGE_BYTES = 1_500_000;
 const MAXIMUM_CURSOR_PNG_BYTES = 49_152;
 
 export interface DesktopRemoteDesktopCursor {
@@ -61,8 +63,10 @@ export class DesktopRemoteDesktopNativeCapture {
     settings?: DesktopRemoteDesktopVideoSettings
   ): Promise<DesktopRemoteDesktopNativeFrame | null> {
     if (this.#runtime.platform !== "darwin" || !/^[0-9]{1,10}$/u.test(displayId)) return null;
+    const profile = desktopRemoteDesktopVideoProfile(settings);
+    const fps = desktopRemoteDesktopVideoFramerate(settings);
     const configuration = streaming
-      ? `${settings?.fps ?? 30}:${settings?.bitrate ?? 0}:${cursorOverlay ? "cursor" : "video"}`
+      ? `${fps}:${settings?.quality ?? "auto"}:${cursorOverlay ? "cursor" : "video"}`
       : "compatibility";
     if (this.#child !== undefined
       && (this.#displayId !== displayId || this.#configuration !== configuration)) {
@@ -75,14 +79,10 @@ export class DesktopRemoteDesktopNativeCapture {
       if (this.#child === undefined) {
         const binary = await this.#runtime.resolveBinary();
         if (generation !== this.#generation) return null;
-        const quality = settings?.bitrate === 20_000_000
-          ? 0.95
-          : settings?.bitrate === 8_000_000
-            ? 0.8
-            : 0.65;
         const arguments_ = streaming
           ? [displayId, cursorOverlay ? "cursor-overlay" : "native-video",
-              String(settings?.fps ?? 30), String(quality)]
+              String(fps), String(profile.jpegQuality), String(profile.physicalMaxEdge),
+              String(profile.maxFrameBytes)]
           : [displayId];
         const child = this.#runtime.spawn(binary, arguments_);
         this.#child = child;
@@ -101,6 +101,9 @@ export class DesktopRemoteDesktopNativeCapture {
       }
       const child = this.#child;
       if (child === undefined) return null;
+      const frameBytes = streaming ? profile.maxFrameBytes : 180_000;
+      const encodedFrameBytes = Math.ceil(frameBytes / 3) * 4;
+      const messageBytes = encodedFrameBytes + (streaming ? 166_664 : 4_096);
       return await new Promise<DesktopRemoteDesktopNativeFrame | null>((resolveFrame, rejectFrame) => {
         let bytes = 0;
         let text = "";
@@ -117,7 +120,7 @@ export class DesktopRemoteDesktopNativeCapture {
         const cancel = (error?: Error): void => finish(null, error);
         const receive = (chunk: Buffer): void => {
           bytes += chunk.byteLength;
-          if (bytes > MAXIMUM_NATIVE_MESSAGE_BYTES) {
+          if (bytes > messageBytes) {
             this.stop();
             return;
           }
@@ -132,7 +135,8 @@ export class DesktopRemoteDesktopNativeCapture {
             const frame = parseDesktopRemoteDesktopNativeFrame(
               JSON.parse(text.slice(0, -1)),
               streaming,
-              cursorOverlay
+              cursorOverlay,
+              settings
             );
             finish(generation === this.#generation ? frame : null);
           } catch {
@@ -222,7 +226,8 @@ function nativeCaptureRuntime(): DesktopRemoteDesktopNativeCaptureRuntime {
 export function parseDesktopRemoteDesktopNativeFrame(
   value: unknown,
   streaming: boolean,
-  cursorOverlay: boolean
+  cursorOverlay: boolean,
+  settings?: DesktopRemoteDesktopVideoSettings
 ): DesktopRemoteDesktopNativeFrame {
   if (!record(value) || !exactKeys(value, ["jpeg", "width", "height", "cursor"])
     || typeof value["jpeg"] !== "string"
@@ -230,7 +235,9 @@ export function parseDesktopRemoteDesktopNativeFrame(
     throw new Error("invalid");
   }
   const dimension = streaming ? MAXIMUM_NATIVE_FRAME_DIMENSION : 1_280;
-  const byteLimit = streaming ? MAXIMUM_NATIVE_FRAME_BYTES : 180_000;
+  const byteLimit = streaming
+    ? desktopRemoteDesktopVideoProfile(settings).maxFrameBytes
+    : 180_000;
   const width = value["width"] as number;
   const height = value["height"] as number;
   if (width < 1 || height < 1 || width > dimension || height > dimension

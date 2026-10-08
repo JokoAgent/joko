@@ -38,6 +38,10 @@ import {
   readDesktopSystemAudioSupport,
   type DesktopRemoteDesktopVideoSettings
 } from "./remote-desktop-media-settings.js";
+import {
+  desktopRemoteDesktopVideoProfile,
+  withDesktopRemoteDesktopBitrateHints
+} from "./remote-desktop-quality.js";
 import type { DesktopRemoteDesktopMediaPort } from "./remote-desktop-host.js";
 import {
   DesktopRemoteDesktopNativeCapture,
@@ -188,6 +192,7 @@ export class DesktopRemoteDesktopMedia implements DesktopRemoteDesktopMediaPort 
     this.#assertAvailable();
     if (this.#pending !== undefined) throw new Error("REMOTE_DESKTOP_VIDEO_BUSY");
     const settings = parseDesktopRemoteDesktopVideoSettings(request.settings);
+    const profile = desktopRemoteDesktopVideoProfile(settings);
     assertCapturePermission();
     this.stop();
     const generation = this.#generation;
@@ -237,12 +242,15 @@ export class DesktopRemoteDesktopMedia implements DesktopRemoteDesktopMediaPort 
         id: requestId,
         leaseId: request.leaseId,
         attemptId: request.attemptId,
-        offerSdp: request.offerSdp,
+        offerSdp: settings === undefined
+          ? request.offerSdp
+          : withDesktopRemoteDesktopBitrateHints(request.offerSdp, profile),
         iceServers: REMOTE_DESKTOP_STUN_SERVERS.map((server) => ({ urls: server.urls })),
         nativeCapture: nativeAvailable,
         nativeVideo,
         chromiumCapture: this.#grant !== undefined,
         cursorOverlay: request.cursorOverlay && process.platform === "darwin",
+        profile,
         ...(settings === undefined ? {} : { settings })
       }, REMOTE_DESKTOP_OFFER_BUDGET.hostMs, request.signal);
       if (reply.kind !== "offer" || Buffer.byteLength(reply.answerSdp, "utf8") > 64 * 1_024) {

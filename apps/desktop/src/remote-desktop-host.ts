@@ -20,6 +20,7 @@ import {
   RemoteDesktopPermissionStatus,
   RemoteDesktopPresentationProofSchema,
   RemoteDesktopStartMode,
+  RemoteDesktopVideoQuality,
   type RemoteDesktopClipboardContent,
   type RemoteDesktopInputEvent,
   type RemoteDesktopVideoSettings as ContractRemoteDesktopVideoSettings
@@ -41,7 +42,10 @@ import {
 } from "@joko/device-peer";
 
 import type { DesktopRemoteDesktopClipboardContent } from "./remote-desktop-clipboard.js";
-import type { DesktopRemoteDesktopVideoSettings } from "./remote-desktop-media-settings.js";
+import type {
+  DesktopRemoteDesktopVideoQuality,
+  DesktopRemoteDesktopVideoSettings
+} from "./remote-desktop-media-settings.js";
 import type { DesktopRemoteDesktopSessionState } from "./remote-desktop-input.js";
 
 export interface DesktopRemoteDesktopMediaPort {
@@ -453,7 +457,7 @@ export class DesktopRemoteDesktopHost implements DevicePeerRemoteDesktopHostPort
       ...(request.settings === undefined ? {} : {
         settings: Object.freeze({
           fps: request.settings.fps,
-          bitrate: request.settings.bitrate,
+          quality: desktopVideoQualityFromContract(request.settings.quality),
           audio: request.settings.audio
         })
       })
@@ -852,6 +856,17 @@ export class DesktopRemoteDesktopHost implements DevicePeerRemoteDesktopHostPort
 
   #authority(controllerDeviceId: string): RemoteDesktopAuthority {
     return Object.freeze({ controllerDeviceId, lifecycleToken: this.#lifecycleToken });
+  }
+}
+
+function desktopVideoQualityFromContract(
+  value: RemoteDesktopVideoQuality
+): DesktopRemoteDesktopVideoQuality {
+  switch (value) {
+    case RemoteDesktopVideoQuality.AUTO: return "auto";
+    case RemoteDesktopVideoQuality.SAVER: return "saver";
+    case RemoteDesktopVideoQuality.HD: return "hd";
+    default: throw new TypeError("Remote Desktop video quality is invalid.");
   }
 }
 

@@ -22,6 +22,7 @@ import {
   RemoteDesktopReleaseInputSchema,
   RemoteDesktopScrollInputSchema,
   RemoteDesktopStartMode,
+  RemoteDesktopVideoQuality,
   RemoteDesktopTextInputSchema,
   RemoteDesktopVideoSettingsSchema,
   type DevicePeerDescriptor,
@@ -1294,7 +1295,11 @@ export class MobileRemoteDesktopController {
     if (!this.#snapshot.capabilities?.videoSettings) return undefined;
     return create(RemoteDesktopVideoSettingsSchema, {
       fps: this.#snapshot.videoSettings.fps,
-      bitrate: this.#snapshot.videoSettings.bitrate,
+      quality: this.#snapshot.videoSettings.quality === "auto"
+        ? RemoteDesktopVideoQuality.AUTO
+        : this.#snapshot.videoSettings.quality === "saver"
+          ? RemoteDesktopVideoQuality.SAVER
+          : RemoteDesktopVideoQuality.HD,
       audio: this.#negotiatedAudio()
     });
   }
@@ -2070,7 +2075,7 @@ function sameVideoSettings(
   left: MobileRemoteDesktopVideoSettings,
   right: MobileRemoteDesktopVideoSettings
 ): boolean {
-  return left.fps === right.fps && left.bitrate === right.bitrate && left.audio === right.audio;
+  return left.fps === right.fps && left.quality === right.quality && left.audio === right.audio;
 }
 
 function encodeBase64(bytes: Uint8Array): string {

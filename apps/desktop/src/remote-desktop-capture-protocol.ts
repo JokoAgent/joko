@@ -1,6 +1,7 @@
 import type { RemoteDesktopIceCandidate, RemoteDesktopInput } from "@joko/device-peer";
 import type { DesktopRemoteDesktopVideoSettings } from "./remote-desktop-media-settings.js";
 import type { DesktopRemoteDesktopNativeFrame } from "./remote-desktop-native-capture.js";
+import type { DesktopRemoteDesktopVideoProfile } from "./remote-desktop-quality.js";
 
 export const REMOTE_DESKTOP_CAPTURE_CHANNELS = Object.freeze({
   ready: "joko:remote-desktop-capture:ready",
@@ -24,6 +25,7 @@ export type DesktopRemoteDesktopCaptureCommand =
       readonly nativeVideo: boolean;
       readonly chromiumCapture: boolean;
       readonly cursorOverlay: boolean;
+      readonly profile: DesktopRemoteDesktopVideoProfile;
       readonly settings?: DesktopRemoteDesktopVideoSettings;
     }
   | {

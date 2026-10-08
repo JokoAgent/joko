@@ -2,7 +2,7 @@ import AsyncStorage from "@react-native-async-storage/async-storage";
 
 export interface MobileRemoteDesktopVideoSettings {
   readonly fps: 30 | 60;
-  readonly bitrate: 0 | 2_000_000 | 8_000_000 | 20_000_000;
+  readonly quality: "auto" | "saver" | "hd";
   readonly audio: boolean;
 }
 
@@ -19,7 +19,7 @@ export interface MobileRemoteDesktopVideoPreferenceStorage {
 }
 
 export const MOBILE_REMOTE_DESKTOP_DEFAULT_VIDEO_SETTINGS: MobileRemoteDesktopVideoSettings =
-  Object.freeze({ fps: 30, bitrate: 0, audio: true });
+  Object.freeze({ fps: 30, quality: "auto", audio: true });
 
 const STORAGE_KEY = "joko.mobile.remote-desktop.audio.v1";
 
@@ -118,8 +118,7 @@ export function isMobileRemoteDesktopVideoSettings(
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const settings = value as Record<string, unknown>;
   return (settings.fps === 30 || settings.fps === 60)
-    && (settings.bitrate === 0 || settings.bitrate === 2_000_000
-      || settings.bitrate === 8_000_000 || settings.bitrate === 20_000_000)
+    && (settings.quality === "auto" || settings.quality === "saver" || settings.quality === "hd")
     && typeof settings.audio === "boolean";
 }
 

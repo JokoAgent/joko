@@ -98,6 +98,7 @@ import {
   RemoteDesktopPresentationProofSchema,
   RemoteDesktopStartMode,
   type RemoteDesktopVideoSettings,
+  RemoteDesktopVideoQuality,
   RemoteDesktopVideoSettingsSchema
 } from "@joko/contracts";
 import {
@@ -2130,8 +2131,9 @@ function validateRemoteDesktopPresentationProof(value: RemoteDesktopPresentation
 
 function validateRemoteDesktopVideoSettings(value: RemoteDesktopVideoSettings): void {
   if ((value.fps !== 30 && value.fps !== 60)
-    || (value.bitrate !== 0 && value.bitrate !== 2_000_000
-      && value.bitrate !== 8_000_000 && value.bitrate !== 20_000_000)
+    || (value.quality !== RemoteDesktopVideoQuality.AUTO
+      && value.quality !== RemoteDesktopVideoQuality.SAVER
+      && value.quality !== RemoteDesktopVideoQuality.HD)
     || typeof value.audio !== "boolean") {
     throw agentError(DevicePeerFailureCode.INVALID_REQUEST, false);
   }

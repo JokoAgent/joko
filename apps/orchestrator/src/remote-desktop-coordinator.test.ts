@@ -905,8 +905,19 @@ describe("RemoteDesktopCoordinator", () => {
       offerSdp: "v=0\r\n",
       settings: create(contract.RemoteDesktopVideoSettingsSchema, {
         fps: 24,
-        bitrate: 8_000_000,
+        quality: contract.RemoteDesktopVideoQuality.HD,
         audio: true
+      }),
+      cursorOverlay: false
+    }, signal)).rejects.toMatchObject({ code: "invalid_argument" });
+    await expect(coordinator.createOffer(connection, identity, {
+      leaseId: "lease-1",
+      attemptId: "attempt-1",
+      offerSdp: "v=0\r\n",
+      settings: create(contract.RemoteDesktopVideoSettingsSchema, {
+        fps: 30,
+        quality: contract.RemoteDesktopVideoQuality.UNSPECIFIED,
+        audio: false
       }),
       cursorOverlay: false
     }, signal)).rejects.toMatchObject({ code: "invalid_argument" });

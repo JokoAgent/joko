@@ -108,7 +108,7 @@ export interface RemoteDesktopCapabilities {
 
 export interface RemoteDesktopVideoSettings {
   readonly fps: 30 | 60;
-  readonly bitrate: 0 | 2_000_000 | 8_000_000 | 20_000_000;
+  readonly quality: "auto" | "saver" | "hd";
   readonly audio: boolean;
 }
 
@@ -385,16 +385,15 @@ export function parseRemoteDesktopRequest(value: unknown): RemoteDesktopRequest 
 
 export function parseRemoteDesktopVideoSettings(value: unknown): RemoteDesktopVideoSettings {
   if (!isRecord(value)
-    || !hasExactKeys(value, ["fps", "bitrate", "audio"])
+    || !hasExactKeys(value, ["fps", "quality", "audio"])
     || (value.fps !== 30 && value.fps !== 60)
-    || (value.bitrate !== 0 && value.bitrate !== 2_000_000
-      && value.bitrate !== 8_000_000 && value.bitrate !== 20_000_000)
+    || (value.quality !== "auto" && value.quality !== "saver" && value.quality !== "hd")
     || typeof value.audio !== "boolean") {
     throw new Error("INVALID_REMOTE_DESKTOP_VIDEO_SETTINGS");
   }
   return Object.freeze({
     fps: value.fps,
-    bitrate: value.bitrate,
+    quality: value.quality,
     audio: value.audio
   });
 }
