@@ -1122,13 +1122,17 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     }
     if (smartRoute !== undefined) (request.params as JsonObject)["modelProvider"] = smartRoute.modelProviderId;
     const managedConfiguration = this.#nativeRouteConfiguration(managedRoute, smartRoute);
-    const initialConfiguration = managedConfiguration === undefined && nativeConfiguration === undefined
-      ? undefined
-      : { ...managedConfiguration, ...nativeConfiguration };
-    if (initialConfiguration !== undefined) {
-      const previousConfig = (request.params as JsonObject)["config"];
-      Object.assign(request.params, { config: { ...(isJsonObject(previousConfig) ? previousConfig : {}), ...initialConfiguration } });
-    }
+    const initialConfiguration: JsonObject = {
+      ...(managedConfiguration ?? {}),
+      ...(nativeConfiguration ?? {}),
+      // Product Objectives own continuation, budgets, and pause/resume. A
+      // native goal would create a second loop outside the durable Queue owner.
+      "features.goals": false
+    };
+    const previousConfig = (request.params as JsonObject)["config"];
+    Object.assign(request.params, {
+      config: { ...(isJsonObject(previousConfig) ? previousConfig : {}), ...initialConfiguration }
+    });
     let response;
     try {
       response = await scope.host.request(request.method, request.params, {
@@ -2802,9 +2806,11 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     };
     assertCurrent();
     const managedConfiguration = this.#nativeRouteConfiguration(managedRoute, smartRoute);
-    const configuration = managedConfiguration === undefined && nativeConfiguration === undefined
-      ? undefined
-      : { ...managedConfiguration, ...nativeConfiguration };
+    const configuration: JsonObject = {
+      ...(managedConfiguration ?? {}),
+      ...(nativeConfiguration ?? {}),
+      "features.goals": false
+    };
     const response = await scope.host.request("thread/resume", {
       threadId,
       cwd: workspaceRoot,
@@ -2813,7 +2819,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
         ? smartRoute === undefined ? {} : { modelProvider: smartRoute.modelProviderId }
         : { modelProvider: smartRoute?.modelProviderId ?? selection.providerId, model: selection.modelId }),
       ...(developerInstructions === undefined ? {} : { developerInstructions }),
-      ...(configuration === undefined ? {} : { config: configuration })
+      config: configuration
     }, { mutation: false, beforeDispatch: assertCurrent });
     assertCurrent();
     if (response.hostGeneration !== expectedHostGeneration) {

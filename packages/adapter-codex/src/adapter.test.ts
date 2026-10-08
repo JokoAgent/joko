@@ -39,6 +39,35 @@ afterEach(async () => {
 });
 
 describe("CodexBackendAdapter", () => {
+  it("keeps Objective continuation under product ownership for start, fork, and resume", async () => {
+    const setup = await createSetup();
+    const sourceContext = context(setup.target, [], { backendInstanceGeneration: 7 });
+    const source = await setup.adapter.createSession(sessionInput(setup.target), sourceContext);
+
+    expect(setup.fake.transport!.requests.find((request) => request.method === "thread/start")?.params)
+      .toMatchObject({ config: { "features.goals": false } });
+
+    const derivedContext = {
+      ...context(setup.target, [], { backendInstanceGeneration: 7 }),
+      sessionId: "derived-goal-owner"
+    };
+    await setup.adapter.createSession({
+      ...sessionInput(setup.target),
+      nativeStart: { kind: "new", parentNativeReference: source.opaqueRef }
+    }, derivedContext);
+    expect(setup.fake.transport!.requests.find((request) => request.method === "thread/fork")?.params)
+      .toMatchObject({ config: { "features.goals": false } });
+
+    const bound = context(setup.target, [], {
+      binding: source,
+      backendInstanceGeneration: 7
+    });
+    await setup.adapter.closeSession(source, bound);
+    await setup.adapter.resumeSession(source, bound);
+    expect(setup.fake.transport!.requests.findLast((request) => request.method === "thread/resume")?.params)
+      .toMatchObject({ config: { "features.goals": false } });
+  });
+
   it("projects the shared local app-server as a read-only control-plane process", async () => {
     const fake = new FakeCodexAppServer();
     const inspectProcessUsage = vi.fn(async () => [{
@@ -5013,7 +5042,8 @@ describe("CodexBackendAdapter", () => {
       .toEqual({
         threadId: original.nativeSessionId,
         cwd: setup.target.workspaceRoot,
-        excludeTurns: true
+        excludeTurns: true,
+        config: { "features.goals": false }
       });
     expect(setup.fake.transport?.requests.filter((request) => request.method === "thread/settings/update"))
       .toHaveLength(settingsBefore);
