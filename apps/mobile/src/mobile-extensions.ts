@@ -106,10 +106,27 @@ export interface MobileExtensionCatalogPage {
   readonly totalSize: number;
 }
 
+export interface MobileExtensionPendingMutation {
+  readonly operationId: string;
+  readonly extensionId: string;
+  readonly kind: "enabled" | "sidebar";
+  readonly state: "unknown" | "accepted";
+}
+
+export interface MobileExtensionMutationResult {
+  readonly catalog: MobileExtensionCatalog;
+  readonly extension: MobileExtension;
+}
+
 export interface MobileExtensionTransport {
   readonly ownerKey: string;
+  readonly pending: readonly MobileExtensionPendingMutation[];
   list(signal: AbortSignal): Promise<MobileExtensionCatalog>;
   detail(expected: MobileExtension, signal: AbortSignal): Promise<MobileExtension>;
+  setEnabled(expected: MobileExtension, enabled: boolean, signal: AbortSignal): Promise<MobileExtensionMutationResult>;
+  setSidebarVisible(expected: MobileExtension, visible: boolean, signal: AbortSignal): Promise<MobileExtensionMutationResult>;
+  reconcile(operationId: string, signal: AbortSignal): Promise<void>;
+  dismiss(operationId: string, signal: AbortSignal): Promise<void>;
 }
 
 export function mobileExtensionKey(extension: MobileExtension): string {
@@ -118,7 +135,9 @@ export function mobileExtensionKey(extension: MobileExtension): string {
     extension.revision.toString(10),
     mobileExtensionOwnerKey(extension.owner),
     extension.installState,
-    extension.enabled ? "enabled" : "disabled"
+    extension.enabled ? "enabled" : "disabled",
+    extension.sidebarSupported ? "sidebar" : "no-sidebar",
+    extension.sidebarVisible ? "visible" : "hidden"
   ].join("\u001f");
 }
 

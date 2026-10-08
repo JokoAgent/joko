@@ -26,7 +26,8 @@ export interface PendingOperation {
     | "schedule-run" | "schedule-enable" | "schedule-run-restart" | "schedule-run-read"
     | "schedule-runs-read" | "schedule-all-read" | "schedule-run-delete"
     | "schedule-create" | "schedule-update" | "schedule-delete" | "schedule-promote"
-    | "schedule-clone" | "schedule-project-remove" | "schedule-project-reconcile" | "voice-settings" | "model-favorite";
+    | "schedule-clone" | "schedule-project-remove" | "schedule-project-reconcile" | "voice-settings" | "model-favorite"
+    | "extension-enabled" | "extension-sidebar";
   readonly sessionId?: string;
   readonly eventId?: string;
   readonly backendId?: string;
@@ -43,6 +44,8 @@ export interface PendingOperation {
   readonly scheduleId?: string;
   readonly triggerId?: string;
   readonly targetId?: string;
+  readonly extensionId?: string;
+  readonly extensionRevision?: string;
   readonly state: "unknown" | "accepted";
 }
 
@@ -400,7 +403,8 @@ function isPending(value: unknown): value is PendingOperation {
       "session-branch", "session-shell", "session-reset", "session-review", "session-clone", "session-fork", "session-rewind", "workspace-rewind", "schedule-run", "schedule-enable",
       "schedule-run-restart", "schedule-run-read", "schedule-runs-read", "schedule-all-read",
       "schedule-run-delete", "schedule-create", "schedule-update", "schedule-delete", "schedule-promote",
-      "schedule-clone", "schedule-project-remove", "schedule-project-reconcile", "voice-settings", "model-favorite"].includes(String(record.kind))
+      "schedule-clone", "schedule-project-remove", "schedule-project-reconcile", "voice-settings", "model-favorite",
+      "extension-enabled", "extension-sidebar"].includes(String(record.kind))
     || (record.state !== "unknown" && record.state !== "accepted")) return false;
   if (record.sessionId !== undefined && typeof record.sessionId !== "string") return false;
   if (record.eventId !== undefined && typeof record.eventId !== "string") return false;
@@ -419,6 +423,11 @@ function isPending(value: unknown): value is PendingOperation {
   if (record.scheduleId !== undefined && !validReceiptIdentity(record.scheduleId)) return false;
   if (record.triggerId !== undefined && !validReceiptIdentity(record.triggerId)) return false;
   if (record.targetId !== undefined && !validReceiptIdentity(record.targetId)) return false;
+  if (record.extensionId !== undefined && (typeof record.extensionId !== "string"
+    || !/^extension_[a-f0-9]{32}$/u.test(record.extensionId))) return false;
+  if (record.extensionRevision !== undefined && (typeof record.extensionRevision !== "string"
+    || record.extensionRevision.length > 20 || !/^[1-9][0-9]*$/u.test(record.extensionRevision)
+    || BigInt(record.extensionRevision) > 18_446_744_073_709_551_615n)) return false;
   if (record.kind === "logout" && typeof record.targetConnectionId !== "string") return false;
   if (["revoke", "device-rename"].includes(String(record.kind)) && typeof record.targetDeviceId !== "string") return false;
   if (record.kind === "device-rename" && (record.sessionId !== undefined || record.eventId !== undefined
@@ -454,6 +463,20 @@ function isPending(value: unknown): value is PendingOperation {
     && !validReceiptIdentity(record.scheduleId)) return false;
   if (record.kind === "schedule-project-reconcile"
     && (!validReceiptIdentity(record.targetId) || record.scheduleId !== undefined)) return false;
+  if (["extension-enabled", "extension-sidebar"].includes(String(record.kind))
+    && (!/^extension_[a-f0-9]{32}$/u.test(String(record.extensionId)) || record.extensionRevision === undefined)) return false;
+  if (["extension-enabled", "extension-sidebar"].includes(String(record.kind))
+    && (record.sessionId !== undefined || record.eventId !== undefined || record.backendId !== undefined
+      || record.sourceGeneration !== undefined || record.workspaceId !== undefined || record.changeSetId !== undefined
+      || record.queueItemId !== undefined || record.interactionId !== undefined
+      || record.interactionGeneration !== undefined || record.interactionRevision !== undefined
+      || record.interactionDraftKind !== undefined || record.targetConnectionId !== undefined
+      || record.targetDeviceId !== undefined || record.scheduleId !== undefined || record.triggerId !== undefined
+      || record.targetId !== undefined)) return false;
+  if (["extension-enabled", "extension-sidebar"].includes(String(record.kind))
+    && Object.keys(record).some((key) => ![
+      "operationId", "connectionId", "kind", "extensionId", "extensionRevision", "state"
+    ].includes(key))) return false;
   if (!["schedule-run", "schedule-enable", "schedule-run-restart", "schedule-run-read", "schedule-runs-read",
     "schedule-run-delete", "schedule-update", "schedule-delete", "schedule-promote", "schedule-clone",
     "schedule-project-remove"].includes(String(record.kind))
@@ -468,6 +491,8 @@ function isPending(value: unknown): value is PendingOperation {
   if (!["interaction-resolve", "interaction-dismiss"].includes(String(record.kind))
     && (record.interactionId !== undefined || record.interactionGeneration !== undefined
       || record.interactionRevision !== undefined || record.interactionDraftKind !== undefined)) return false;
+  if (!["extension-enabled", "extension-sidebar"].includes(String(record.kind))
+    && (record.extensionId !== undefined || record.extensionRevision !== undefined)) return false;
   return true;
 }
 

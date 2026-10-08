@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   ActivityIndicator,
+  Alert,
   BackHandler,
   FlatList,
   Pressable,
@@ -44,6 +45,17 @@ type DetailState = {
 
 const emptyDirectory: DirectoryState = { status: "offline", refreshing: false };
 const emptyDetail: DetailState = { status: "idle" };
+
+type MutationState = {
+  readonly ownerKey: string;
+  readonly extensionId: string;
+  readonly kind: "enabled" | "sidebar" | "receipt";
+};
+
+function errorText(error: unknown): string {
+  const value = error instanceof Error ? error.message : String(error);
+  return (value.trim() || "Unknown error").slice(0, 1_024);
+}
 
 function Action({ label, colors, onPress, disabled = false, testID }: {
   readonly label: string;
@@ -103,17 +115,25 @@ export function MobileExtensionsScreen({ colors, locale, transport, onBack }: Mo
   const listAbort = useRef<AbortController | undefined>(undefined);
   const detailAbort = useRef<AbortController | undefined>(undefined);
   const detailOccurrence = useRef<symbol | undefined>(undefined);
+  const mutationAbort = useRef<AbortController | undefined>(undefined);
+  const mutationOccurrence = useRef<symbol | undefined>(undefined);
   const [attempt, setAttempt] = useState(0);
   const [query, setQuery] = useState("");
   const [directory, setDirectory] = useState<DirectoryState>(emptyDirectory);
   const [detail, setDetail] = useState<DetailState>(emptyDetail);
+  const [mutation, setMutation] = useState<MutationState | undefined>();
+  const [mutationError, setMutationError] = useState<string | undefined>();
   const ownerKey = transport?.ownerKey;
 
   useEffect(() => {
     listAbort.current?.abort();
     detailAbort.current?.abort();
+    mutationAbort.current?.abort();
     detailOccurrence.current = undefined;
+    mutationOccurrence.current = undefined;
     setDetail(emptyDetail);
+    setMutation(undefined);
+    setMutationError(undefined);
     if (!transport || !ownerKey) {
       setDirectory(emptyDirectory);
       return;
@@ -138,13 +158,16 @@ export function MobileExtensionsScreen({ colors, locale, transport, onBack }: Mo
   useEffect(() => () => {
     listAbort.current?.abort();
     detailAbort.current?.abort();
+    mutationAbort.current?.abort();
     detailOccurrence.current = undefined;
+    mutationOccurrence.current = undefined;
   }, []);
 
   const closeDetail = () => {
     detailAbort.current?.abort();
     detailOccurrence.current = undefined;
     setDetail(emptyDetail);
+    setMutationError(undefined);
   };
 
   useEffect(() => {
@@ -164,6 +187,7 @@ export function MobileExtensionsScreen({ colors, locale, transport, onBack }: Mo
     const occurrence = Symbol("extension-detail");
     detailAbort.current = controller;
     detailOccurrence.current = occurrence;
+    setMutationError(undefined);
     setDetail({ ownerKey: currentTransport.ownerKey, extensionId: expected.extensionId, status: "loading" });
     void currentTransport.detail(expected, controller.signal).then((extension) => {
       if (controller.signal.aborted || detailOccurrence.current !== occurrence
@@ -176,6 +200,89 @@ export function MobileExtensionsScreen({ colors, locale, transport, onBack }: Mo
     });
   };
 
+  const adoptCurrent = (
+    currentOwnerKey: string,
+    extensionId: string,
+    catalog: MobileExtensionCatalog,
+    extension?: MobileExtension
+  ) => {
+    setDirectory({ ownerKey: currentOwnerKey, status: "ready", refreshing: false, catalog });
+    setDetail((current) => current.ownerKey === currentOwnerKey && current.extensionId === extensionId
+      ? extension === undefined
+        ? emptyDetail
+        : { ownerKey: currentOwnerKey, extensionId, status: "ready", extension }
+      : current);
+  };
+
+  const refreshCurrent = async (
+    currentTransport: MobileExtensionTransport,
+    extensionId: string,
+    signal: AbortSignal
+  ): Promise<{ readonly catalog: MobileExtensionCatalog; readonly extension?: MobileExtension }> => {
+    const catalog = await currentTransport.list(signal);
+    const matches = catalog.extensions.filter((candidate) => candidate.extensionId === extensionId);
+    if (matches.length === 0) return { catalog };
+    if (matches.length !== 1) throw new Error("The Extension catalog contains an ambiguous identity.");
+    return { catalog, extension: await currentTransport.detail(matches[0]!, signal) };
+  };
+
+  const changeExtension = (expected: MobileExtension, kind: "enabled" | "sidebar", value: boolean) => {
+    const currentTransport = transportRef.current;
+    if (!currentTransport || mutation !== undefined
+      || currentTransport.pending.some((pending) => pending.extensionId === expected.extensionId)) return;
+    const controller = new AbortController();
+    const occurrence = Symbol("extension-mutation");
+    mutationAbort.current = controller;
+    mutationOccurrence.current = occurrence;
+    setMutation({ ownerKey: currentTransport.ownerKey, extensionId: expected.extensionId, kind });
+    setMutationError(undefined);
+    const request = kind === "enabled"
+      ? currentTransport.setEnabled(expected, value, controller.signal)
+      : currentTransport.setSidebarVisible(expected, value, controller.signal);
+    void request.then((result) => {
+      if (controller.signal.aborted || mutationOccurrence.current !== occurrence
+        || transportRef.current?.ownerKey !== currentTransport.ownerKey) return;
+      adoptCurrent(currentTransport.ownerKey, expected.extensionId, result.catalog, result.extension);
+    }, (error) => {
+      if (controller.signal.aborted || mutationOccurrence.current !== occurrence
+        || transportRef.current?.ownerKey !== currentTransport.ownerKey) return;
+      setMutationError(errorText(error));
+    }).finally(() => {
+      if (mutationOccurrence.current !== occurrence) return;
+      mutationOccurrence.current = undefined;
+      mutationAbort.current = undefined;
+      setMutation(undefined);
+    });
+  };
+
+  const checkReceipt = (extensionId: string, operationId: string, dismiss: boolean) => {
+    const currentTransport = transportRef.current;
+    if (!currentTransport || mutation !== undefined) return;
+    const controller = new AbortController();
+    const occurrence = Symbol("extension-receipt");
+    mutationAbort.current = controller;
+    mutationOccurrence.current = occurrence;
+    setMutation({ ownerKey: currentTransport.ownerKey, extensionId, kind: "receipt" });
+    setMutationError(undefined);
+    const check = dismiss
+      ? currentTransport.dismiss(operationId, controller.signal)
+      : currentTransport.reconcile(operationId, controller.signal);
+    void check.then(() => refreshCurrent(currentTransport, extensionId, controller.signal)).then((result) => {
+      if (controller.signal.aborted || mutationOccurrence.current !== occurrence
+        || transportRef.current?.ownerKey !== currentTransport.ownerKey) return;
+      adoptCurrent(currentTransport.ownerKey, extensionId, result.catalog, result.extension);
+    }, (error) => {
+      if (controller.signal.aborted || mutationOccurrence.current !== occurrence
+        || transportRef.current?.ownerKey !== currentTransport.ownerKey) return;
+      setMutationError(errorText(error));
+    }).finally(() => {
+      if (mutationOccurrence.current !== occurrence) return;
+      mutationOccurrence.current = undefined;
+      mutationAbort.current = undefined;
+      setMutation(undefined);
+    });
+  };
+
   const visibleDirectory = directory.ownerKey === ownerKey ? directory : emptyDirectory;
   const visibleDetail = detail.ownerKey === ownerKey ? detail : emptyDetail;
   const extensions = visibleDirectory.catalog?.extensions ?? [];
@@ -183,6 +290,11 @@ export function MobileExtensionsScreen({ colors, locale, transport, onBack }: Mo
   const selected = visibleDetail.extensionId
     ? extensions.find((extension) => extension.extensionId === visibleDetail.extensionId)
     : undefined;
+  const pending = selected !== undefined && transport !== undefined && transport.ownerKey === ownerKey
+    ? transport.pending.filter((receipt) => receipt.extensionId === selected.extensionId)
+    : [];
+  const selectedBusy = selected !== undefined && mutation !== undefined && mutation.ownerKey === ownerKey
+    && mutation.extensionId === selected.extensionId;
 
   const directoryPane = <View style={[styles.pane, wide && styles.directoryPane]} testID="extensions.directory">
     <View style={styles.header}>
@@ -192,7 +304,7 @@ export function MobileExtensionsScreen({ colors, locale, transport, onBack }: Mo
         <Text style={[styles.caption, { color: colors.muted }]}>{mobileMessage(locale, "extension.menuDescription")}</Text>
       </View>
       <Action label={mobileMessage(locale, "extension.refresh")} colors={colors}
-        onPress={() => setAttempt((value) => value + 1)} disabled={!transport || visibleDirectory.refreshing}
+        onPress={() => setAttempt((value) => value + 1)} disabled={!transport || visibleDirectory.refreshing || mutation !== undefined}
         testID="extensions.refresh" />
     </View>
     {visibleDirectory.status === "offline"
@@ -255,7 +367,7 @@ export function MobileExtensionsScreen({ colors, locale, transport, onBack }: Mo
         {selected && <Text style={[styles.caption, { color: colors.muted }]}>{source(selected, locale)}</Text>}
       </View>
       {selected && <Action label={mobileMessage(locale, "common.refresh")} colors={colors}
-        disabled={visibleDetail.status === "loading"} onPress={() => openDetail(selected)} />}
+        disabled={visibleDetail.status === "loading" || mutation !== undefined} onPress={() => openDetail(selected)} />}
     </View>
     {!selected
       ? <Centered colors={colors} text={mobileMessage(locale, "extension.empty")} />
@@ -285,6 +397,58 @@ export function MobileExtensionsScreen({ colors, locale, transport, onBack }: Mo
             {extension.setup.error && <Text accessibilityRole="alert" style={[styles.body, { color: colors.negative }]}>
               {mobileMessage(locale, "extension.setupError", { error: extension.setup.error })}
             </Text>}
+
+            <Text style={[styles.section, { color: colors.muted }]}>{mobileMessage(locale, "extension.controls")}</Text>
+            <View style={[styles.card, { backgroundColor: colors.surface, borderColor: colors.border }]}>
+              <View style={styles.controlRow}>
+                <View style={styles.grow}>
+                  <Text style={[styles.label, { color: colors.ink }]}>{mobileMessage(locale,
+                    extension.enabled ? "extension.enabled" : "extension.disabled")}</Text>
+                </View>
+                <Action label={mobileMessage(locale, extension.enabled ? "extension.disable" : "extension.enable")}
+                  colors={colors} disabled={mutation !== undefined || pending.length > 0}
+                  onPress={() => changeExtension(extension, "enabled", !extension.enabled)}
+                  testID="extensions.enabled" />
+              </View>
+              {extension.sidebarSupported && <View style={styles.controlRow}>
+                <View style={styles.grow}>
+                  <Text style={[styles.label, { color: colors.ink }]}>{mobileMessage(locale,
+                    extension.sidebarVisible ? "extension.sidebarVisible" : "extension.sidebarHidden")}</Text>
+                </View>
+                <Action label={mobileMessage(locale, extension.sidebarVisible ? "extension.hideSidebar" : "extension.showSidebar")}
+                  colors={colors} disabled={mutation !== undefined || pending.length > 0}
+                  onPress={() => changeExtension(extension, "sidebar", !extension.sidebarVisible)}
+                  testID="extensions.sidebar" />
+              </View>}
+              {selectedBusy && <View style={styles.progress} accessibilityLiveRegion="polite">
+                <ActivityIndicator color={colors.accent} />
+                <Text style={[styles.caption, { color: colors.muted }]}>{mobileMessage(locale, "extension.changing")}</Text>
+              </View>}
+            </View>
+            {pending.map((receipt) => <View key={receipt.operationId} accessibilityRole="alert"
+              style={[styles.notice, styles.receipt, { backgroundColor: colors.surface, borderColor: colors.negative }]}>
+              <Text style={[styles.body, { color: colors.negative }]}>{mobileMessage(locale,
+                receipt.state === "unknown" ? "extension.receiptUnknown" : "extension.receiptAccepted")}</Text>
+              <Text selectable style={[styles.caption, { color: colors.muted }]}>{receipt.operationId}</Text>
+              <View style={styles.actionRow}>
+                <Action label={mobileMessage(locale, "extension.checkReceipt")} colors={colors}
+                  disabled={mutation !== undefined} onPress={() => checkReceipt(extension.extensionId, receipt.operationId, false)} />
+                {receipt.state === "unknown" && <Action label={mobileMessage(locale, "common.verifyClear")} colors={colors}
+                  disabled={mutation !== undefined} onPress={() => Alert.alert(
+                    mobileMessage(locale, "extension.clearReceiptTitle"),
+                    mobileMessage(locale, "extension.clearReceiptBody"),
+                    [{ text: mobileMessage(locale, "common.cancel"), style: "cancel" },
+                      { text: mobileMessage(locale, "common.verifyClear"), onPress: () => {
+                        checkReceipt(extension.extensionId, receipt.operationId, true);
+                      } }]
+                  )} />}
+              </View>
+            </View>)}
+            {mutationError && <View accessibilityRole="alert"
+              style={[styles.notice, styles.receipt, { backgroundColor: colors.surface, borderColor: colors.negative }]}>
+              <Text style={[styles.body, { color: colors.negative }]}>{mobileMessage(locale,
+                "extension.changeFailed", { error: mutationError })}</Text>
+            </View>}
 
             <Text style={[styles.section, { color: colors.muted }]}>{mobileMessage(locale, "extension.capabilities")}</Text>
             <View style={[styles.card, { backgroundColor: colors.surface, borderColor: colors.border }]}>
@@ -374,5 +538,9 @@ const styles = StyleSheet.create({
   chevron: { fontSize: 28 },
   detailContent: { gap: 12, padding: 16 },
   card: { borderRadius: 14, borderWidth: StyleSheet.hairlineWidth, gap: 4, padding: 14 },
-  capability: { alignItems: "center", flexDirection: "row", gap: 12, minHeight: 30 }
+  capability: { alignItems: "center", flexDirection: "row", gap: 12, minHeight: 30 },
+  controlRow: { alignItems: "center", flexDirection: "row", gap: 12, minHeight: 52 },
+  progress: { alignItems: "center", flexDirection: "row", gap: 8, minHeight: 44 },
+  receipt: { marginHorizontal: 0, marginBottom: 0, gap: 8 },
+  actionRow: { flexDirection: "row", flexWrap: "wrap", gap: 8 }
 });

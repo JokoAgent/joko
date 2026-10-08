@@ -363,6 +363,35 @@ describe("current-v1 mobile connection storage", () => {
     await expect(storage.loadPending()).resolves.toEqual([receipt]);
   });
 
+  it("round-trips Extension change receipts only with exact identity and revision authority", async () => {
+    const memory = drivers();
+    const storage = createMobileStorage(memory.plain, memory.secure);
+    const extensionId = "extension_0123456789abcdef0123456789abcdef";
+    const receipts = [
+      { operationId: "extension-enabled", connectionId: first.connectionId, kind: "extension-enabled" as const,
+        extensionId, extensionRevision: "7", state: "unknown" as const },
+      { operationId: "extension-sidebar", connectionId: first.connectionId, kind: "extension-sidebar" as const,
+        extensionId, extensionRevision: "8", state: "accepted" as const }
+    ];
+
+    await storage.savePending(receipts);
+    await expect(storage.loadPending()).resolves.toEqual(receipts);
+    expect(memory.plainValues.get("joko.mobile.pending.v1")).not.toContain("enabledValue");
+
+    memory.plainValues.set("joko.mobile.pending.v1", JSON.stringify([
+      ...receipts,
+      { ...receipts[0], operationId: "missing-id", extensionId: undefined },
+      { ...receipts[0], operationId: "wrong-id", extensionId: "extension-mail" },
+      { ...receipts[0], operationId: "missing-revision", extensionRevision: undefined },
+      { ...receipts[0], operationId: "zero-revision", extensionRevision: "0" },
+      { ...receipts[0], operationId: "unexpected-session", sessionId: "session-one" },
+      { ...receipts[0], operationId: "unexpected-body", enabledValue: false },
+      { operationId: "metadata-on-send", connectionId: first.connectionId, kind: "send",
+        sessionId: "session-one", extensionId, extensionRevision: "7", state: "unknown" }
+    ]));
+    await expect(storage.loadPending()).resolves.toEqual(receipts);
+  });
+
   it("round-trips body-free Automation receipts only with exact Schedule and trigger identities", async () => {
     const memory = drivers();
     const storage = createMobileStorage(memory.plain, memory.secure);

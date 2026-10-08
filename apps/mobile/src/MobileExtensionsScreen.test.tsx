@@ -13,12 +13,14 @@ import type {
 
 const native = vi.hoisted(() => ({
   width: 390,
-  back: undefined as undefined | (() => boolean)
+  back: undefined as undefined | (() => boolean),
+  alert: vi.fn()
 }));
 
 vi.mock("react-native", async () => {
   const React = await import("react");
   const element = (tag: string) => ({ accessibilityLabel, accessibilityRole, accessibilityState,
+    accessibilityLiveRegion: _accessibilityLiveRegion, selectable: _selectable,
     onPress, disabled, numberOfLines: _numberOfLines, contentContainerStyle: _contentContainerStyle,
     ...props }: Record<string, unknown> & {
       children?: React.ReactNode;
@@ -41,6 +43,7 @@ vi.mock("react-native", async () => {
     }, props.children);
   return {
     ActivityIndicator: () => React.createElement("span", { "data-loading": true }),
+    Alert: { alert: native.alert },
     BackHandler: { addEventListener: (_name: string, handler: () => boolean) => {
       native.back = handler;
       return { remove: () => { if (native.back === handler) native.back = undefined; } };
@@ -93,8 +96,21 @@ function catalog(extensions: readonly MobileExtension[] = [mail, calendar], reco
 function transport(ownerKey = "owner-a", value = catalog()): MobileExtensionTransport {
   return {
     ownerKey,
+    pending: [],
     list: vi.fn(async () => value),
-    detail: vi.fn(async (expected) => expected)
+    detail: vi.fn(async (expected) => expected),
+    setEnabled: vi.fn(async (expected, enabled) => ({
+      catalog: catalog(value.extensions.map((extension) => extension.extensionId === expected.extensionId
+        ? { ...extension, revision: extension.revision + 1n, enabled } : extension)),
+      extension: { ...expected, revision: expected.revision + 1n, enabled }
+    })),
+    setSidebarVisible: vi.fn(async (expected, sidebarVisible) => ({
+      catalog: catalog(value.extensions.map((extension) => extension.extensionId === expected.extensionId
+        ? { ...extension, revision: extension.revision + 1n, sidebarVisible } : extension)),
+      extension: { ...expected, revision: expected.revision + 1n, sidebarVisible }
+    })),
+    reconcile: vi.fn(async () => undefined),
+    dismiss: vi.fn(async () => undefined)
   };
 }
 
@@ -128,6 +144,7 @@ afterEach(() => {
   root = undefined as unknown as Root;
   native.width = 390;
   native.back = undefined;
+  native.alert.mockReset();
   onBack.mockReset();
 });
 
@@ -158,6 +175,64 @@ describe("MobileExtensionsScreen", () => {
     });
     expect(container.textContent).not.toContain("Review Mail");
     expect(container.textContent).toContain("Calendar");
+  });
+
+  it("keeps the authoritative descriptor visible while enabled and sidebar changes are pending", async () => {
+    const active = transport();
+    let finish!: (value: Awaited<ReturnType<MobileExtensionTransport["setEnabled"]>>) => void;
+    vi.mocked(active.setEnabled).mockImplementation(() => new Promise((resolve) => { finish = resolve; }));
+    await render(active);
+    await press("View Mail");
+
+    await press("Disable Extension");
+    expect(active.setEnabled).toHaveBeenCalledWith(mail, false, expect.any(AbortSignal));
+    expect(container.textContent).toContain("Saving Extension change");
+    expect(container.textContent).toContain("Enabled");
+    expect((container.querySelector('button[aria-label="Disable Extension"]') as HTMLButtonElement).disabled).toBe(true);
+
+    const disabled = { ...mail, revision: 2n, enabled: false };
+    await act(async () => finish({ catalog: catalog([disabled, calendar]), extension: disabled }));
+    expect(container.textContent).toContain("Disabled");
+    expect(container.textContent).not.toContain("Saving Extension change");
+
+    await press("Hide from sidebar");
+    expect(active.setSidebarVisible).toHaveBeenCalledWith(disabled, false, expect.any(AbortSignal));
+    expect(container.textContent).toContain("Hidden from sidebar");
+  });
+
+  it("keeps the previous state and exposes an actionable error when a change fails", async () => {
+    const active = transport();
+    vi.mocked(active.setEnabled).mockRejectedValueOnce(new Error("revision conflict"));
+    await render(active);
+    await press("View Mail");
+    await press("Disable Extension");
+
+    expect(container.textContent).toContain("Extension change failed: revision conflict");
+    expect(container.textContent).toContain("Enabled");
+    expect(container.textContent).not.toContain("Disabled");
+  });
+
+  it("shows unresolved receipts, checks them without replay, and confirms authoritative clearing", async () => {
+    const active = {
+      ...transport(),
+      pending: [{ operationId: "extension-operation", extensionId: mail.extensionId,
+        kind: "enabled" as const, state: "unknown" as const }]
+    } satisfies MobileExtensionTransport;
+    await render(active);
+    await press("View Mail");
+    expect(container.textContent).toContain("unknown durable result");
+    expect((container.querySelector('button[aria-label="Disable Extension"]') as HTMLButtonElement).disabled).toBe(true);
+
+    await press("Check result");
+    expect(active.reconcile).toHaveBeenCalledWith("extension-operation", expect.any(AbortSignal));
+    expect(active.setEnabled).not.toHaveBeenCalled();
+
+    await press("Verify and clear");
+    expect(native.alert).toHaveBeenCalledOnce();
+    const buttons = native.alert.mock.calls[0]?.[2] as undefined | { onPress?: () => void }[];
+    await act(async () => buttons?.[1]?.onPress?.());
+    expect(active.dismiss).toHaveBeenCalledWith("extension-operation", expect.any(AbortSignal));
+    expect(active.setEnabled).not.toHaveBeenCalled();
   });
 
   it("shows recovery evidence and does not adopt a late directory from a retired owner", async () => {
@@ -191,6 +266,22 @@ describe("MobileExtensionsScreen", () => {
     expect(container.querySelector('input[aria-label="Search Extensions"]')).not.toBeNull();
     act(() => expect(native.back?.()).toBe(true));
     expect(onBack).toHaveBeenCalledOnce();
+  });
+
+  it("does not adopt a late mutation result from a retired owner", async () => {
+    let finish!: (value: Awaited<ReturnType<MobileExtensionTransport["setEnabled"]>>) => void;
+    const old = transport("owner-old");
+    vi.mocked(old.setEnabled).mockImplementation(() => new Promise((resolve) => { finish = resolve; }));
+    await render(old);
+    await press("View Mail");
+    await press("Disable Extension");
+
+    const next = transport("owner-new", catalog([calendar]));
+    await render(next);
+    const disabled = { ...mail, revision: 2n, enabled: false };
+    await act(async () => finish({ catalog: catalog([disabled]), extension: disabled }));
+    expect(container.textContent).toContain("Calendar");
+    expect(container.textContent).not.toContain("Review messages that need attention");
   });
 
   it("shows a bounded offline state", async () => {

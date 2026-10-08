@@ -1836,6 +1836,191 @@ describe("mobile Extension catalog authority", () => {
     finish(extension);
     await expect(pending).rejects.toThrow(/owner changed/u);
   });
+
+  it("changes enabled and sidebar state through exact durable operations before adopting fresh descriptors", async () => {
+    const network = fakeNetwork();
+    const saved = memoryStorage(credential);
+    let extension = { ...mobileExtensionFixture(), mainView: { title: "Mail", icon: "layout" as const },
+      sidebarSupported: true, sidebarVisible: true };
+    let catalogRevision = 4n;
+    network.listExtensions = vi.fn(async () => ({
+      revision: catalogRevision,
+      recoveredFromCorruption: false,
+      extensions: [extension]
+    }));
+    network.getExtension = vi.fn(async () => extension);
+    const receipts: PendingOperation[] = [];
+    network.submit = vi.fn(async (_credential, operationId, mutation) => {
+      toBinary(OperationMutationSchema, mutation);
+      receipts.push(saved.pending()[0]!);
+      if (mutation.payload.case === "setExtensionEnabled") {
+        expect(mutation.payload.value).toMatchObject({
+          extensionId: extension.extensionId,
+          enabled: false,
+          expectedRevision: { value: 1n }
+        });
+        extension = { ...extension, revision: 2n, enabled: false };
+      } else if (mutation.payload.case === "setExtensionSidebarVisible") {
+        expect(mutation.payload.value).toMatchObject({
+          extensionId: extension.extensionId,
+          visible: false,
+          expectedRevision: { value: 2n }
+        });
+        extension = { ...extension, revision: 3n, sidebarVisible: false };
+      } else throw new Error("Unexpected Extension mutation.");
+      catalogRevision += 1n;
+      return create(OperationSchema, {
+        operationId,
+        connectionId: credential.connectionId,
+        state: OperationState.SUCCEEDED,
+        result: { payload: { case: "acknowledgement", value: create(AcknowledgementSchema, { accepted: true }) } }
+      });
+    });
+    let sequence = 0;
+    const app = client(network, saved.storage, undefined, undefined, () => `extension-operation-${++sequence}`);
+    await app.start();
+
+    const transport = app.extensionCatalogTransport()!;
+    const disabled = await transport.setEnabled(extension, false, new AbortController().signal);
+    expect(disabled.extension).toMatchObject({ revision: 2n, enabled: false, sidebarVisible: true });
+    const hidden = await app.extensionCatalogTransport()!.setSidebarVisible(
+      disabled.extension,
+      false,
+      new AbortController().signal
+    );
+    expect(hidden).toMatchObject({
+      catalog: { revision: 6n },
+      extension: { revision: 3n, enabled: false, sidebarVisible: false }
+    });
+    expect(receipts).toEqual([
+      expect.objectContaining({
+        operationId: "extension-operation-1",
+        kind: "extension-enabled",
+        extensionId: extension.extensionId,
+        extensionRevision: "1",
+        state: "unknown"
+      }),
+      expect.objectContaining({
+        operationId: "extension-operation-2",
+        kind: "extension-sidebar",
+        extensionId: extension.extensionId,
+        extensionRevision: "2",
+        state: "unknown"
+      })
+    ]);
+    expect(saved.storage.savePending).toHaveBeenCalledBefore(network.submit as ReturnType<typeof vi.fn>);
+    expect(saved.pending()).toEqual([]);
+    expect(network.getExtension).toHaveBeenCalledTimes(4);
+    expect(network.listExtensions).toHaveBeenCalledTimes(2);
+  });
+
+  it("retains an unknown Extension receipt, blocks replay, and only clears it from a typed terminal acknowledgement", async () => {
+    const network = fakeNetwork();
+    const saved = memoryStorage(credential);
+    let extension = mobileExtensionFixture();
+    network.listExtensions = vi.fn(async () => ({ revision: 4n, recoveredFromCorruption: false, extensions: [extension] }));
+    network.getExtension = vi.fn(async () => extension);
+    vi.mocked(network.submit).mockRejectedValueOnce(new Error("transport closed"));
+    const app = client(network, saved.storage, undefined, undefined, () => "extension-unknown");
+    await app.start();
+
+    await expect(app.extensionCatalogTransport()!.setEnabled(
+      extension,
+      false,
+      new AbortController().signal
+    )).rejects.toThrow(/unknown/u);
+    expect(extension.enabled).toBe(true);
+    expect(saved.pending()).toEqual([expect.objectContaining({
+      operationId: "extension-unknown",
+      kind: "extension-enabled",
+      extensionId: extension.extensionId,
+      extensionRevision: "1",
+      state: "unknown"
+    })]);
+    await expect(app.extensionCatalogTransport()!.setEnabled(
+      extension,
+      false,
+      new AbortController().signal
+    )).rejects.toThrow(/unresolved result/u);
+    expect(network.submit).toHaveBeenCalledTimes(1);
+
+    extension = { ...extension, revision: 2n, enabled: false };
+    network.getOperation = vi.fn(async (_credential, operationId) => create(OperationSchema, {
+      operationId,
+      connectionId: credential.connectionId,
+      state: OperationState.SUCCEEDED,
+      result: { payload: { case: "acknowledgement", value: create(AcknowledgementSchema, { accepted: true }) } }
+    }));
+    await app.extensionCatalogTransport()!.reconcile("extension-unknown", new AbortController().signal);
+    expect(saved.pending()).toEqual([]);
+    expect(network.submit).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps the receipt when a successful Extension operation lacks its accepted acknowledgement", async () => {
+    const network = fakeNetwork();
+    const saved = memoryStorage(credential);
+    const extension = mobileExtensionFixture();
+    network.getExtension = vi.fn(async () => extension);
+    network.submit = vi.fn(async (_credential, operationId) => create(OperationSchema, {
+      operationId,
+      connectionId: credential.connectionId,
+      state: OperationState.SUCCEEDED
+    }));
+    const app = client(network, saved.storage, undefined, undefined, () => "extension-malformed");
+    await app.start();
+
+    await expect(app.extensionCatalogTransport()!.setEnabled(
+      extension,
+      false,
+      new AbortController().signal
+    )).rejects.toThrow(/accepted acknowledgement/u);
+    expect(saved.pending()).toEqual([expect.objectContaining({
+      operationId: "extension-malformed",
+      kind: "extension-enabled",
+      extensionId: extension.extensionId
+    })]);
+
+    network.getOperation = vi.fn(async () => create(OperationSchema, {
+      operationId: "extension-malformed",
+      connectionId: credential.connectionId,
+      state: OperationState.SUCCEEDED
+    }));
+    await app.extensionCatalogTransport()!.reconcile("extension-malformed", new AbortController().signal);
+    expect(saved.pending()).toHaveLength(1);
+    expect(app.state.error).toMatch(/accepted acknowledgement/u);
+  });
+
+  it("retires a late Extension mutation result with its authenticated owner", async () => {
+    const network = fakeNetwork();
+    const saved = memoryStorage(credential);
+    const extension = mobileExtensionFixture();
+    network.getExtension = vi.fn(async () => extension);
+    let finish!: (operation: Operation) => void;
+    network.submit = vi.fn((_credential, operationId) => new Promise<Operation>((resolve) => {
+      expect(operationId).toBe("extension-late");
+      finish = resolve;
+    }));
+    const app = client(network, saved.storage, undefined, undefined, () => "extension-late");
+    await app.start();
+    const change = app.extensionCatalogTransport()!.setEnabled(extension, false, new AbortController().signal);
+    await vi.waitFor(() => expect(network.submit).toHaveBeenCalledOnce());
+
+    app.setForeground(false);
+    finish(create(OperationSchema, {
+      operationId: "extension-late",
+      connectionId: credential.connectionId,
+      state: OperationState.SUCCEEDED,
+      result: { payload: { case: "acknowledgement", value: create(AcknowledgementSchema, { accepted: true }) } }
+    }));
+
+    await expect(change).rejects.toThrow(/owner changed|cancelled/u);
+    expect(saved.pending()).toEqual([expect.objectContaining({
+      operationId: "extension-late",
+      kind: "extension-enabled",
+      state: "unknown"
+    })]);
+    expect(network.listExtensions).not.toHaveBeenCalled();
+  });
 });
 
 describe("mobile Partner private authority", () => {
