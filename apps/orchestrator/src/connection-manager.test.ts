@@ -20,6 +20,43 @@ afterEach(() => {
 });
 
 describe("ConnectionManager", () => {
+  it("refreshes only the authenticated Device source and preserves manual names across pairing and native bootstrap", () => {
+    const store = new OperationalStore(":memory:", { now: () => 1_000 });
+    cleanups.push(() => store.close());
+    const manager = new ConnectionManager(store, { now: () => 1_000 });
+    const challenge = manager.issuePairing("Phone label", { defaultName: "Native phone", kind: "mobile" });
+    const pendingDeviceId = store.getPairing(challenge.id).device!.id;
+    const first = manager.completePairing({ challengeId: challenge.id, code: challenge.code, connectionName: "Phone connection",
+      device: { defaultName: "Native phone", manualName: "Phone label", kind: "mobile" } });
+    expect(first.connection.deviceId).toBe(pendingDeviceId);
+    const renamed = store.renameDevice(first.connection.deviceId, "My phone");
+    const refreshed = manager.refreshDeviceNameSource(first.connection, " Renamed native phone ");
+    expect(refreshed).toMatchObject({ name: "My phone", defaultName: "Renamed native phone", manualName: "My phone" });
+    expect(refreshed.revision).toBeGreaterThan(renamed.revision);
+    const unchangedRevision = store.health().revision;
+    manager.refreshDeviceNameSource(first.connection, "Renamed native phone");
+    expect(store.health().revision).toBe(unchangedRevision);
+    expect(() => manager.refreshDeviceNameSource({ ...first.connection, authKeyDigest: "wrong" }, "Other"))
+      .toThrow(/revoked/u);
+    expect(() => manager.refreshDeviceNameSource(first.connection, "bad\nname")).toThrow(/invalid/u);
+    const secondChallenge = manager.issuePairing("New connection label");
+    manager.completePairing({ challengeId: secondChallenge.id, code: secondChallenge.code, connectionName: "Other connection",
+      device: { id: first.connection.deviceId, defaultName: refreshed.defaultName, manualName: refreshed.manualName!, kind: "mobile" } });
+    expect(store.getDevice(first.connection.deviceId)).toMatchObject(refreshed);
+    manager.revokeDevice(first.connection.deviceId);
+    expect(() => manager.refreshDeviceNameSource(first.connection, "Late source")).toThrow(/revoked/u);
+    const deviceId = "d6a365ef-ef33-4fb7-a0f1-a02eb57fef75";
+    const desktop = manager.issueTrustedDesktopConnection({ desktopInstanceId: "4e56f4d8-c6ee-4a17-9a89-56e059b7e592",
+      desktopDeviceId: deviceId, defaultDeviceName: "Host A", platform: "win32", appVersion: "1" });
+    manager.confirmTrustedDesktopConnection(desktop.connection.id, desktop.authKey);
+    store.renameDevice(deviceId, "Work machine");
+    const next = manager.issueTrustedDesktopConnection({ desktopInstanceId: "1870865f-014e-4b3e-a63f-6a26dfa611b7",
+      desktopDeviceId: deviceId, defaultDeviceName: "Host B", platform: "win32", appVersion: "1",
+      previousConnectionId: desktop.connection.id, previousAuthKey: desktop.authKey });
+    expect(store.getDevice(next.connection.deviceId)).toMatchObject({ defaultName: "Host B", manualName: "Work machine", name: "Work machine" });
+    expect(store.resetDeviceName(deviceId).name).toBe("Host B");
+  });
+
   it("announces out-of-band pairing codes, consumes them once, and enforces revocation", () => {
     const directory = mkdtempSync(join(tmpdir(), "joko-connection-manager-"));
     const store = new OperationalStore(join(directory, "orchestrator.db"), { now: () => 1_000 });
@@ -181,7 +218,7 @@ describe("ConnectionManager", () => {
       code: challenge.code,
       connectionName: "Recovered browser",
       device: {
-        name: "Recovered browser",
+        defaultName: "Recovered browser",
         kind: "web",
         platform: "test",
         appVersion: "0.1.0"
@@ -214,7 +251,7 @@ describe("ConnectionManager", () => {
     const manager = new ConnectionManager(store, { now: () => now });
     const firstChallenge = manager.issuePairing("Desktop", {
       id: "device-shared",
-      name: "Desktop",
+      defaultName: "Desktop",
       kind: "desktop",
       platform: "windows",
       appVersion: "1"
@@ -226,7 +263,7 @@ describe("ConnectionManager", () => {
     });
     const secondChallenge = manager.issuePairing("Desktop secondary", {
       id: "device-shared",
-      name: "Desktop",
+      defaultName: "Desktop",
       kind: "desktop",
       platform: "windows",
       appVersion: "1"
@@ -270,7 +307,7 @@ describe("ConnectionManager", () => {
     const issued = manager.issueTrustedDesktopConnection({
       desktopInstanceId: instanceId,
       desktopDeviceId: deviceId,
-      deviceName: "Joko Desktop",
+      defaultDeviceName: "Joko Desktop",
       platform: "win32",
       appVersion: "0.1.0",
       desktopHostAuthKey
@@ -297,7 +334,7 @@ describe("ConnectionManager", () => {
     expect(() => manager.issueTrustedDesktopConnection({
       desktopInstanceId: "a482cafa-4d69-48dc-9203-57e41f72d6fc",
       desktopDeviceId: deviceId,
-      deviceName: "Joko Desktop",
+      defaultDeviceName: "Joko Desktop",
       platform: "win32",
       appVersion: "0.1.0",
       previousConnectionId: issued.connection.id,
@@ -311,7 +348,7 @@ describe("ConnectionManager", () => {
     expect(() => manager.issueTrustedDesktopConnection({
       desktopInstanceId: "ec5aed18-78df-4f0b-a1db-cff4bb8f9e30",
       desktopDeviceId: deviceId,
-      deviceName: "Joko Desktop",
+      defaultDeviceName: "Joko Desktop",
       platform: "win32",
       appVersion: "0.1.0",
       previousConnectionId: issued.connection.id,
@@ -324,7 +361,7 @@ describe("ConnectionManager", () => {
     const replacement = manager.issueTrustedDesktopConnection({
       desktopInstanceId: nextInstanceId,
       desktopDeviceId: deviceId,
-      deviceName: "Joko Desktop",
+      defaultDeviceName: "Joko Desktop",
       platform: "win32",
       appVersion: "0.1.0",
       previousConnectionId: issued.connection.id,
@@ -344,7 +381,7 @@ describe("ConnectionManager", () => {
     expect(() => manager.issueTrustedDesktopConnection({
       desktopInstanceId: nextInstanceId,
       desktopDeviceId: deviceId,
-      deviceName: "Joko Desktop",
+      defaultDeviceName: "Joko Desktop",
       platform: "win32",
       appVersion: "0.1.0"
     })).toThrow(/already used/u);
@@ -355,7 +392,7 @@ describe("ConnectionManager", () => {
     expect(() => manager.issueTrustedDesktopConnection({
       desktopInstanceId: "9050c5c7-8919-4f76-b9ef-eac0a8e6ecb1",
       desktopDeviceId: deviceId,
-      deviceName: "Joko Desktop",
+      defaultDeviceName: "Joko Desktop",
       platform: "win32",
       appVersion: "0.1.0"
     })).toThrowError(ConnectionAuthenticationError);
@@ -365,7 +402,7 @@ describe("ConnectionManager", () => {
     expect(() => manager.issueTrustedDesktopConnection({
       desktopInstanceId: "a482cafa-4d69-48dc-9203-57e41f72d6fc",
       desktopDeviceId: deviceId,
-      deviceName: "Joko Desktop",
+      defaultDeviceName: "Joko Desktop",
       platform: "win32",
       appVersion: "0.1.0"
     })).toThrowError(ConnectionAuthenticationError);
@@ -381,14 +418,14 @@ describe("ConnectionManager", () => {
     store.createConnection({
       id: "web-connection",
       deviceId: "web-device",
-      device: { name: "Web", kind: "web", platform: "web" },
+      device: { defaultName: "Web", kind: "web", platform: "web" },
       name: "Web",
       authKeyDigest: digestAuthKey(webKey)
     });
     const service = store.createConnection({
       id: "service-connection",
       deviceId: "service-device",
-      device: { name: "Service", kind: "service", platform: "linux" },
+      device: { defaultName: "Service", kind: "service", platform: "linux" },
       name: "Service",
       authKeyDigest: digestAuthKey(serviceKey)
     });
@@ -400,7 +437,7 @@ describe("ConnectionManager", () => {
     const desktop = manager.issueTrustedDesktopConnection({
       desktopInstanceId: "4e56f4d8-c6ee-4a17-9a89-56e059b7e592",
       desktopDeviceId: "d6a365ef-ef33-4fb7-a0f1-a02eb57fef75",
-      deviceName: "Desktop",
+      defaultDeviceName: "Desktop",
       platform: "win32",
       appVersion: "0.1.0",
       desktopHostAuthKey: desktopHostKey
@@ -429,7 +466,7 @@ describe("ConnectionManager", () => {
     const issued = manager.issueTrustedDesktopConnection({
       desktopInstanceId: "11da880c-d0a8-43ec-b3e2-2fd4ee4d7e49",
       desktopDeviceId: deviceId,
-      deviceName: "Joko Desktop",
+      defaultDeviceName: "Joko Desktop",
       platform: "win32",
       appVersion: "0.1.0"
     });
@@ -444,7 +481,7 @@ describe("ConnectionManager", () => {
     const restarted = manager.issueTrustedDesktopConnection({
       desktopInstanceId: "1cf292f2-85bb-4708-812d-9c2279e3838a",
       desktopDeviceId: deviceId,
-      deviceName: "Joko Desktop",
+      defaultDeviceName: "Joko Desktop",
       platform: "win32",
       appVersion: "0.1.0"
     });
@@ -454,7 +491,7 @@ describe("ConnectionManager", () => {
     expect(() => manager.issueTrustedDesktopConnection({
       desktopInstanceId: "f56a38b8-51f6-4179-9329-d99a4f95584f",
       desktopDeviceId: deviceId,
-      deviceName: "Joko Desktop",
+      defaultDeviceName: "Joko Desktop",
       platform: "win32",
       appVersion: "0.1.0"
     })).toThrowError(ConnectionAuthenticationError);
@@ -472,7 +509,7 @@ describe("ConnectionManager", () => {
     const managed = manager.issueTrustedDesktopConnection({
       desktopInstanceId: "bcb236a1-6703-4adc-a651-c5f50b95b4eb",
       desktopDeviceId: deviceId,
-      deviceName: "Joko Desktop",
+      defaultDeviceName: "Joko Desktop",
       platform: "win32",
       appVersion: "0.1.0"
     });
@@ -488,7 +525,7 @@ describe("ConnectionManager", () => {
     expect(() => manager.issueTrustedDesktopConnection({
       desktopInstanceId: "ff8ebebf-6922-47e7-a22e-347775a1dca5",
       desktopDeviceId: deviceId,
-      deviceName: "Joko Desktop",
+      defaultDeviceName: "Joko Desktop",
       platform: "win32",
       appVersion: "0.1.0"
     })).toThrowError(ConnectionAuthenticationError);
@@ -506,7 +543,7 @@ describe("ConnectionManager", () => {
     const managed = manager.issueTrustedDesktopConnection({
       desktopInstanceId: "20f57ccb-ea16-48f0-98c2-f1ec25d8bd15",
       desktopDeviceId: deviceId,
-      deviceName: "Joko Desktop",
+      defaultDeviceName: "Joko Desktop",
       platform: "win32",
       appVersion: "0.1.0"
     });
@@ -516,7 +553,7 @@ describe("ConnectionManager", () => {
     expect(() => manager.issueTrustedDesktopConnection({
       desktopInstanceId: "342321cb-e5c7-4870-aebf-7bbf103f053b",
       desktopDeviceId: deviceId,
-      deviceName: "Joko Desktop",
+      defaultDeviceName: "Joko Desktop",
       platform: "win32",
       appVersion: "0.1.0"
     })).toThrowError(ConnectionAuthenticationError);
@@ -534,7 +571,7 @@ describe("ConnectionManager", () => {
     const managed = manager.issueTrustedDesktopConnection({
       desktopInstanceId: "2b594bd8-fe96-4494-a647-8117475c7e23",
       desktopDeviceId: deviceId,
-      deviceName: "Joko Desktop",
+      defaultDeviceName: "Joko Desktop",
       platform: "win32",
       appVersion: "0.1.0"
     });
@@ -545,7 +582,7 @@ describe("ConnectionManager", () => {
     expect(() => manager.issueTrustedDesktopConnection({
       desktopInstanceId: "ca050098-840e-41ca-ae4a-888054380ea8",
       desktopDeviceId: deviceId,
-      deviceName: "Joko Desktop",
+      defaultDeviceName: "Joko Desktop",
       platform: "win32",
       appVersion: "0.1.0"
     })).toThrowError(ConnectionAuthenticationError);
@@ -564,11 +601,11 @@ describe("ConnectionManager", () => {
       challengeId: challenge.id,
       code: challenge.code,
       connectionName: "Recovered Desktop",
-      device: { name: "Recovered Desktop", kind: "desktop", platform: "win32", appVersion: "0.1.0" }
+      device: { defaultName: "Recovered Desktop", kind: "desktop", platform: "win32", appVersion: "0.1.0" }
     });
     const base = {
       desktopDeviceId: paired.connection.deviceId,
-      deviceName: "Joko Desktop",
+      defaultDeviceName: "Joko Desktop",
       platform: "win32",
       appVersion: "0.1.0"
     } as const;
@@ -625,11 +662,11 @@ describe("ConnectionManager", () => {
       challengeId: challenge.id,
       code: challenge.code,
       connectionName: "Recovered Desktop",
-      device: { name: "Recovered Desktop", kind: "desktop", platform: "win32", appVersion: "0.1.0" }
+      device: { defaultName: "Recovered Desktop", kind: "desktop", platform: "win32", appVersion: "0.1.0" }
     });
     const base = {
       desktopDeviceId: paired.connection.deviceId,
-      deviceName: "Joko Desktop",
+      defaultDeviceName: "Joko Desktop",
       platform: "win32",
       appVersion: "0.1.0"
     } as const;
@@ -670,7 +707,7 @@ describe("ConnectionManager", () => {
     const committed = manager.issueTrustedDesktopConnection({
       desktopInstanceId: "9a2c1984-9c8e-4cba-90a8-400bf17dce31",
       desktopDeviceId: deviceId,
-      deviceName: "Joko Desktop",
+      defaultDeviceName: "Joko Desktop",
       platform: "win32",
       appVersion: "0.1.0"
     });
@@ -679,7 +716,7 @@ describe("ConnectionManager", () => {
     const orphan = manager.issueTrustedDesktopConnection({
       desktopInstanceId: "ccf2f981-d61d-436d-8ef3-dc4e47f5bb37",
       desktopDeviceId: deviceId,
-      deviceName: "Joko Desktop",
+      defaultDeviceName: "Joko Desktop",
       platform: "win32",
       appVersion: "0.1.0",
       previousConnectionId: committed.connection.id,
@@ -691,7 +728,7 @@ describe("ConnectionManager", () => {
     const recovered = manager.issueTrustedDesktopConnection({
       desktopInstanceId: "fa92ac3f-f42e-43f2-95cb-e80509cff7e4",
       desktopDeviceId: deviceId,
-      deviceName: "Joko Desktop",
+      defaultDeviceName: "Joko Desktop",
       platform: "win32",
       appVersion: "0.1.0",
       // Desktop crashed before replacing its durable C0 metadata, so it still
@@ -716,14 +753,14 @@ describe("ConnectionManager", () => {
     const orphan = manager.issueTrustedDesktopConnection({
       desktopInstanceId: "1870865f-014e-4b3e-a63f-6a26dfa611b7",
       desktopDeviceId: deviceId,
-      deviceName: "Joko Desktop",
+      defaultDeviceName: "Joko Desktop",
       platform: "win32",
       appVersion: "0.1.0"
     });
     const recovered = manager.issueTrustedDesktopConnection({
       desktopInstanceId: "eaff9190-c967-46b1-8826-3c87eac5aadc",
       desktopDeviceId: deviceId,
-      deviceName: "Joko Desktop",
+      defaultDeviceName: "Joko Desktop",
       platform: "win32",
       appVersion: "0.1.0"
     });

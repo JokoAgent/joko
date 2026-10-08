@@ -98,14 +98,14 @@ describe("RemoteHostToolBridgeProvider", () => {
 
     fixture.store.createDevice({
       id: "controller-device",
-      name: "Controller",
+      defaultName: "Controller",
       kind: "web",
       platform: "web",
       appVersion: "test"
     });
     fixture.store.createDevice({
       id: "peer-device",
-      name: "Peer",
+      defaultName: "Peer",
       kind: "desktop",
       platform: "win32",
       appVersion: "test"

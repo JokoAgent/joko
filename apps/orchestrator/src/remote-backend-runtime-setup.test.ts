@@ -144,6 +144,7 @@ function setupFixture(overrides: Partial<RemoteBackendRuntimeSetupProvider> = {}
   const host: RemoteHostRecord = {
     ownerId: "owner-a", targetId: "target-a", id: "host-a", hostname: "host.test", port: 22, user: "user",
     source: "manual", authenticationMode: "system_agent",
+    autoConnect: false, autoConnectRevision: 1n,
     trust: { algorithm: "ssh-ed25519", fingerprint: "SHA256:fixture", pinnedAt: 1 },
     status: { state: "ready", changedAt: 1 }, createdAt: 1, updatedAt: 1, revision: 5n
   };

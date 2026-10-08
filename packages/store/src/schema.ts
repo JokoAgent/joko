@@ -12,6 +12,7 @@ const DURABLE_JSON_SHAPE_BASELINE = [
   "interaction-question-request:single/multiple.allowOther=required",
   "interaction-question-decision:text|single(choice|other)|multiple(choiceIds+optionalOtherText)|boolean",
   "resource-usage-event:exact-v1",
+  "device-content-event:owner-routing-null+exact-default/manual/effective-projection-v1",
   "native-derivation-remote-worktree-plan:exact-v1",
   "native-derivation-worktree:optional-remote-owner-exact-v1"
 ].join("\n");
@@ -171,7 +172,8 @@ CREATE TABLE device_control_relations (
 
 CREATE TABLE devices (
         id TEXT PRIMARY KEY,
-        name TEXT NOT NULL,
+        default_name TEXT NOT NULL,
+        manual_name TEXT,
         kind TEXT NOT NULL CHECK (kind IN ('unspecified', 'web', 'desktop', 'service', 'mobile')),
         platform TEXT NOT NULL,
         app_version TEXT NOT NULL,
@@ -266,9 +268,9 @@ CREATE TABLE events (
         revision INTEGER NOT NULL CHECK (revision >= 1),
         session_sequence INTEGER NOT NULL CHECK (session_sequence >= 1),
         emitted_at INTEGER NOT NULL,
-        backend_id TEXT NOT NULL REFERENCES backends(id) ON DELETE RESTRICT,
-        target_id TEXT NOT NULL REFERENCES targets(id) ON DELETE RESTRICT,
-        session_id TEXT NOT NULL REFERENCES product_sessions(id) ON DELETE CASCADE,
+        backend_id TEXT REFERENCES backends(id) ON DELETE RESTRICT,
+        target_id TEXT REFERENCES targets(id) ON DELETE RESTRICT,
+        session_id TEXT REFERENCES product_sessions(id) ON DELETE CASCADE,
         run_id TEXT REFERENCES runs(id) ON DELETE SET NULL,
         attempt_id TEXT REFERENCES attempts(id) ON DELETE SET NULL,
         operation_id TEXT REFERENCES operations(id) ON DELETE SET NULL,
@@ -277,7 +279,16 @@ CREATE TABLE events (
         payload_json TEXT NOT NULL,
         namespace TEXT,
         metadata_json TEXT,
-        UNIQUE(session_id, session_sequence)
+        UNIQUE(session_id, session_sequence),
+        CHECK (
+          (backend_id IS NOT NULL AND target_id IS NOT NULL AND session_id IS NOT NULL
+            AND json_extract(payload_json, '$.payload.type') IS NOT 'device_changed')
+          OR
+          (backend_id IS NULL AND target_id IS NULL AND session_id IS NULL
+            AND json_extract(payload_json, '$.payload.type') IS 'device_changed'
+            AND run_id IS NULL AND attempt_id IS NULL AND operation_id IS NULL
+            AND generation = 0 AND namespace IS NULL AND metadata_json IS NULL)
+        )
       ) STRICT;
 
 CREATE TABLE desktop_host_authorizations (
@@ -704,7 +715,8 @@ CREATE TABLE pairings (
         code_digest TEXT NOT NULL UNIQUE,
         label TEXT,
         device_id TEXT,
-        device_name TEXT,
+        device_default_name TEXT,
+        device_manual_name TEXT,
         device_kind TEXT CHECK (device_kind IS NULL OR device_kind IN ('unspecified', 'web', 'desktop', 'service', 'mobile')),
         device_platform TEXT,
         device_app_version TEXT,
@@ -714,8 +726,8 @@ CREATE TABLE pairings (
         created_at INTEGER NOT NULL,
         revision INTEGER NOT NULL CHECK (revision >= 1),
         CHECK (
-          (device_id IS NULL AND device_name IS NULL AND device_kind IS NULL AND device_platform IS NULL AND device_app_version IS NULL)
-          OR (device_id IS NOT NULL AND device_name IS NOT NULL AND device_kind IS NOT NULL AND device_platform IS NOT NULL AND device_app_version IS NOT NULL)
+          (device_id IS NULL AND device_default_name IS NULL AND device_manual_name IS NULL AND device_kind IS NULL AND device_platform IS NULL AND device_app_version IS NULL)
+          OR (device_id IS NOT NULL AND device_default_name IS NOT NULL AND device_kind IS NOT NULL AND device_platform IS NOT NULL AND device_app_version IS NOT NULL)
         )
       ) STRICT;
 
@@ -970,6 +982,8 @@ CREATE TABLE remote_hosts (
           AND instr(username, char(13)) = 0
         ),
         source TEXT NOT NULL CHECK (source IN ('manual', 'ssh_config')),
+        auto_connect INTEGER NOT NULL CHECK (auto_connect IN (0, 1)),
+        auto_connect_revision INTEGER NOT NULL CHECK (auto_connect_revision >= 1),
         credential_reference_id TEXT CHECK (
           credential_reference_id IS NULL OR (
             length(credential_reference_id) BETWEEN 1 AND 512
@@ -1262,6 +1276,13 @@ CREATE TABLE session_event_counters (
         last_sequence INTEGER NOT NULL CHECK (last_sequence >= 0)
       ) STRICT;
 
+CREATE TABLE session_objective_generations (
+        session_id TEXT PRIMARY KEY REFERENCES product_sessions(id) ON DELETE CASCADE,
+        owner_generation INTEGER NOT NULL CHECK (
+          owner_generation BETWEEN 1 AND 9007199254740991
+        )
+      ) STRICT;
+
 CREATE TABLE session_objectives (
         session_id TEXT PRIMARY KEY REFERENCES product_sessions(id) ON DELETE CASCADE,
         objective_text TEXT NOT NULL CHECK (
@@ -1272,6 +1293,12 @@ CREATE TABLE session_objectives (
           'active', 'paused', 'blocked', 'complete', 'budget_limited',
           'usage_limited', 'dispatch_unknown'
         )),
+        usage_reset_at INTEGER CHECK (
+          usage_reset_at IS NULL OR (
+            usage_reset_at BETWEEN 0 AND 9007199254740991
+            AND status = 'usage_limited'
+          )
+        ),
         token_budget INTEGER CHECK (token_budget IS NULL OR token_budget BETWEEN 1 AND 9007199254740991),
         maximum_turns INTEGER CHECK (maximum_turns IS NULL OR maximum_turns BETWEEN 1 AND 10000),
         no_progress_turn_limit INTEGER CHECK (
@@ -2527,6 +2554,7 @@ CREATE TRIGGER enqueue_visible_message_embedding
             json_extract(NEW.payload_json, '$.payload.type') = 'message_complete'
             AND json_extract(NEW.payload_json, '$.payload.role') IN ('user', 'assistant')
             AND json_extract(NEW.payload_json, '$.payload.automaticContinuation') IS NULL
+            AND json_extract(NEW.payload_json, '$.payload.objectiveContinuation') IS NULL
           )
           OR (
             json_extract(NEW.payload_json, '$.payload.type') = 'interaction_opened'
@@ -2676,6 +2704,17 @@ CREATE TRIGGER session_objectives_generation_insert
         SELECT RAISE(ABORT, 'objective session generation is stale');
       END;
 
+CREATE TRIGGER session_objectives_owner_generation_insert
+      BEFORE INSERT ON session_objectives
+      WHEN NOT EXISTS (
+        SELECT 1 FROM session_objective_generations generation
+        WHERE generation.session_id = NEW.session_id
+          AND generation.owner_generation = NEW.owner_generation
+      )
+      BEGIN
+        SELECT RAISE(ABORT, 'objective owner generation is stale');
+      END;
+
 CREATE TRIGGER session_objectives_generation_update
       BEFORE UPDATE ON session_objectives
       WHEN NOT EXISTS (
@@ -2685,6 +2724,24 @@ CREATE TRIGGER session_objectives_generation_update
       )
       BEGIN
         SELECT RAISE(ABORT, 'objective session generation is stale');
+      END;
+
+CREATE TRIGGER session_objectives_owner_generation_update
+      BEFORE UPDATE OF owner_generation ON session_objectives
+      WHEN NOT EXISTS (
+        SELECT 1 FROM session_objective_generations generation
+        WHERE generation.session_id = NEW.session_id
+          AND generation.owner_generation = NEW.owner_generation
+      )
+      BEGIN
+        SELECT RAISE(ABORT, 'objective owner generation is stale');
+      END;
+
+CREATE TRIGGER session_objective_generations_monotonic_update
+      BEFORE UPDATE OF owner_generation ON session_objective_generations
+      WHEN NEW.owner_generation <= OLD.owner_generation
+      BEGIN
+        SELECT RAISE(ABORT, 'objective owner generation must advance');
       END;
 
 CREATE TRIGGER collaboration_goals_owner_insert

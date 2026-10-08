@@ -7,6 +7,9 @@ import type { Readable, Writable } from "node:stream";
 import { fileURLToPath } from "node:url";
 
 import { afterEach, describe, expect, it } from "vitest";
+import { createClient } from "@connectrpc/connect";
+import { createConnectTransport } from "@connectrpc/connect-node";
+import { ConnectionService, EntityKind, EventService, OperationService, OperationState, type Device } from "@joko/contracts";
 
 import {
   probeManagedOrchestratorConnection,
@@ -31,6 +34,21 @@ describe("real managed Orchestrator child", () => {
     const runtime = await startRealManagedOrchestrator(fixture);
     const authKey = runtime.takeAuthKey();
     await runtime.commit();
+    const clients = authenticatedClients(runtime, authKey);
+    const initial = (await clients.connections.getDevice({ deviceId: fixture.deviceId })).device!;
+    expect(initial).toMatchObject({ displayName: "Joko Desktop integration", defaultDisplayName: "Joko Desktop integration" });
+    expect(initial.manualDisplayName).toBeUndefined();
+    await updateName(clients, runtime, initial, "Manual desktop");
+    const sourceSnapshot = (await clients.events.getSnapshot({
+      scope: { kind: { case: "owner", value: {} } },
+      currentDeviceNameSource: { defaultDisplayName: "Changed OS hostname" }
+    })).snapshot!;
+    const latest = sourceSnapshot.devices.find((device) => device.deviceId === fixture.deviceId)!;
+    expect(latest).toMatchObject({ displayName: "Manual desktop", manualDisplayName: "Manual desktop", defaultDisplayName: "Changed OS hostname" });
+    const reset = await updateName(clients, runtime, latest);
+    expect(reset.displayName).toBe("Changed OS hostname");
+    expect(reset.manualDisplayName).toBeUndefined();
+    await updateName(clients, runtime, reset, reset.displayName);
     runtime.release();
 
     const probe = await probeManagedOrchestratorConnection({
@@ -49,7 +67,17 @@ describe("real managed Orchestrator child", () => {
 
     await runtime.stop();
     await expectEventuallyAbsent(runtime);
-  }, 30_000);
+    const restarted = await startRealManagedOrchestrator(fixture, {
+      defaultDeviceName: "Second OS hostname",
+      previousConnection: { connectionId: runtime.connection.profileId, authKey }
+    });
+    const restartedClients = authenticatedClients(restarted, restarted.takeAuthKey());
+    await restarted.commit();
+    const retained = (await restartedClients.connections.getDevice({ deviceId: fixture.deviceId })).device!;
+    expect(retained).toMatchObject({ displayName: "Changed OS hostname", manualDisplayName: "Changed OS hostname", defaultDisplayName: "Second OS hostname" });
+    expect((await updateName(restartedClients, restarted, retained)).displayName).toBe("Second OS hostname");
+    await restarted.stop();
+  }, 45_000);
 
   it("recovers persisted metadata when the commit ACK was lost and fences an ephemeral smoke child", async () => {
     const fixture = createFixture();
@@ -100,6 +128,7 @@ async function startRealManagedOrchestrator(
   options: {
     readonly previousConnection?: { readonly connectionId: string; readonly authKey: string };
     readonly ephemeral?: boolean;
+    readonly defaultDeviceName?: string;
   } = {}
 ): Promise<ManagedOrchestratorRuntime> {
   const ports = await selectManagedOrchestratorPorts();
@@ -108,7 +137,7 @@ async function startRealManagedOrchestrator(
     dataDirectory: fixture.dataDirectory,
     workspaceRoot: fixture.workspaceRoot,
     deviceId: fixture.deviceId,
-    deviceName: "Joko Desktop integration",
+    defaultDeviceName: options.defaultDeviceName ?? "Joko Desktop integration",
     appVersion: "0.1.0-test",
     publicPort: ports.publicPort,
     internalPort: ports.internalPort,
@@ -144,6 +173,33 @@ async function expectEventuallyAbsent(runtime: ManagedOrchestratorRuntime): Prom
     await new Promise((resolvePromise) => setTimeout(resolvePromise, 50));
   } while (Date.now() < deadline);
   throw new Error("Managed Orchestrator remained reachable after confirmed shutdown.");
+}
+
+function authenticatedClients(runtime: ManagedOrchestratorRuntime, authKey: string) {
+  const transport = createConnectTransport({ baseUrl: runtime.connection.origin, httpVersion: "1.1", interceptors: [
+    (next) => async (request) => { request.header.set("authorization", `Bearer ${authKey}`); return next(request); }
+  ] });
+  return {
+    connections: createClient(ConnectionService, transport),
+    events: createClient(EventService, transport),
+    operations: createClient(OperationService, transport)
+  };
+}
+
+async function updateName(clients: ReturnType<typeof authenticatedClients>, runtime: ManagedOrchestratorRuntime, device: Device, manualName?: string): Promise<Device> {
+  const result = (await clients.operations.submitOperation({
+    operationId: randomUUID(), connectionId: runtime.connection.profileId,
+    mutation: {
+      payload: manualName === undefined
+        ? { case: "resetDeviceName", value: { deviceId: device.deviceId } }
+        : { case: "renameDevice", value: { deviceId: device.deviceId, displayName: manualName } },
+      preconditions: [{ entity: { kind: EntityKind.DEVICE, id: device.deviceId }, expectedRevision: { value: device.version!.revision!.value } }]
+    }
+  })).operation!;
+  expect(result.state).toBe(OperationState.SUCCEEDED);
+  expect(result.result?.payload.case).toBe("device");
+  if (result.result?.payload.case !== "device") throw new Error("Device name result is missing.");
+  return result.result.payload.value;
 }
 
 function isWritable(value: ChildProcess["stdio"][number]): value is Writable {

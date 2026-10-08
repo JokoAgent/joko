@@ -259,12 +259,22 @@ describe("OperationalStore visible message search", () => {
       blocks: [{ kind: "text", text: "internal continuation search marker" }],
       automaticContinuation: { recoveryId: "recovery-a" }
     });
+    appendMessage(fixture.store, "event-objective-continuation", "session-a", 15, {
+      type: "message_complete",
+      role: "user",
+      blocks: [{ kind: "text", text: "objective continuation search marker" }],
+      objectiveContinuation: { ownerGeneration: 1, turn: 1 }
+    });
     appendMessage(fixture.store, "event-visible-continuation-control", "session-a", 20, visible("visible control marker"));
 
     expect(fixture.store.searchSessionMessages({
       scope: { sessionId: "session-a" },
       query: "internal continuation search marker"
     }).matches.map((match) => match.eventId)).not.toContain("event-internal-continuation");
+    expect(fixture.store.searchSessionMessages({
+      scope: { sessionId: "session-a" },
+      query: "objective continuation search marker"
+    }).matches.map((match) => match.eventId)).not.toContain("event-objective-continuation");
     expect(fixture.store.claimMessageEmbeddingJobs(8, 30).map((job) => job.eventId))
       .toEqual(["event-visible-continuation-control"]);
   });

@@ -61,7 +61,7 @@ describe("DeviceControlSettings", () => {
   });
 
   it("renames the current device and changes its global receive opt-in", async () => {
-    const renameDevice = vi.fn(async () => undefined);
+    const renameDevice = vi.fn(async () => device("self", "Main desk", "online", { manualDisplayName: "Main desk", revision: 2n }));
     const setDeviceRemoteControlEnabled = vi.fn(async () => undefined);
     const rendered = await renderSettings(
       snapshot([device("self", "Desk", "online", { kind: "desktop" })]),
@@ -75,9 +75,9 @@ describe("DeviceControlSettings", () => {
     await clickControl(rendered.container, 'button[aria-label="Allow remote control of this device"]');
     await rendered.flush();
 
-    expect(renameDevice).toHaveBeenCalledWith("self", "Main desk");
+    expect(renameDevice).toHaveBeenCalledWith("self", "Main desk", 1n);
     expect(setDeviceRemoteControlEnabled).toHaveBeenCalledWith(true);
-    expect(rendered.actionKeys).toEqual(["rename-device:self", "device-remote-control"]);
+    expect(rendered.actionKeys).toEqual(["device-remote-control"]);
   });
 
   it("keeps outbound intent and inbound permission as separate, peer-directed actions", async () => {
@@ -131,6 +131,114 @@ describe("DeviceControlSettings", () => {
     ]);
   });
 
+  it.each(["self", "peer"])("lets %s explicitly save the effective name as a manual override and reset to the returned default", async (targetId) => {
+    const renameDevice = vi.fn(async (id: string, name: string) => device(id, name, "online", {
+      defaultDisplayName: "System name", manualDisplayName: name, revision: 2n
+    }));
+    const resetDeviceName = vi.fn(async (id: string) => device(id, "Updated system name", "online", {
+      defaultDisplayName: "Updated system name", revision: 4n
+    }));
+    const initial = snapshot([
+      device("self", "System name", "online"),
+      device("peer", "System name", "offline")
+    ]);
+    const rendered = await renderSettings(initial, { renameDevice, resetDeviceName });
+    const row = rendered.container.querySelector<HTMLElement>(targetId === "self" ? ".device-control-self" : ".device-control-peer");
+    if (row === null) throw new Error("Device row missing");
+    await clickButton(row, "Save");
+    await rendered.flush();
+    expect(renameDevice).toHaveBeenCalledWith(targetId, "System name", 1n);
+    expect(row.textContent).toContain("Custom name · Default: System name");
+    expect([...row.querySelectorAll<HTMLButtonElement>("button")].find((button) => button.textContent === "Save")?.disabled).toBe(true);
+
+    await clickButton(row, "Restore default name");
+    await rendered.flush();
+    expect(resetDeviceName).toHaveBeenCalledWith(targetId, 2n);
+    expect(row.querySelector<HTMLInputElement>("input")?.value).toBe("Updated system name");
+    expect(row.textContent).toContain("Default name: Updated system name");
+    await rendered.rerender(initial);
+    expect(row.querySelector<HTMLInputElement>("input")?.value).toBe("Updated system name");
+  });
+
+  it("keeps a dirty name and its exact Device revision across live updates and failed CAS", async () => {
+    const renameDevice = vi.fn().mockRejectedValueOnce(new Error("Device changed")).mockResolvedValueOnce(
+      device("self", "Reviewed name", "online", { defaultDisplayName: "OS renamed", manualDisplayName: "Reviewed name", revision: 3n })
+    );
+    const rendered = await renderSettings(snapshot([device("self", "Desk", "online", { manualDisplayName: "Desk" })]), { renameDevice });
+    const input = rendered.container.querySelector<HTMLInputElement>(".device-control-self input");
+    if (input === null) throw new Error("Name input missing");
+    await setInputValue(input, "My draft");
+    await rendered.rerender(snapshot([device("self", "Desk", "online", {
+      defaultDisplayName: "OS renamed", manualDisplayName: "Desk", revision: 2n
+    })]));
+    expect(input.value).toBe("My draft");
+    await clickButton(rendered.container, "Save");
+    await rendered.flush();
+    expect(renameDevice).toHaveBeenCalledExactlyOnceWith("self", "My draft", 1n);
+    expect(input.value).toBe("My draft");
+    expect(rendered.container.querySelector('[role="alert"]')?.textContent).toContain("draft has been kept");
+    await clickButton(rendered.container, "Cancel");
+    expect(input.value).toBe("Desk");
+    await setInputValue(input, "Reviewed name");
+    await clickButton(rendered.container, "Save");
+    await rendered.flush();
+    expect(renameDevice).toHaveBeenLastCalledWith("self", "Reviewed name", 2n);
+  });
+
+  it("gates a name attempt synchronously and checks an unknown receipt without a second mutation", async () => {
+    const nameAttempt = deferred<DeviceView>();
+    const receiptCheck = deferred<DeviceView>();
+    const renameDevice = vi.fn(() => nameAttempt.promise);
+    const resetDeviceName = vi.fn();
+    const checkDeviceNameUpdate = vi.fn(() => receiptCheck.promise);
+    const rendered = await renderSettings(snapshot([device("self", "Desk", "online", { manualDisplayName: "Desk" })]), {
+      renameDevice, resetDeviceName, checkDeviceNameUpdate
+    });
+    const input = rendered.container.querySelector<HTMLInputElement>(".device-control-self input");
+    if (input === null) throw new Error("Name input missing");
+    await setInputValue(input, "My draft");
+    await act(async () => input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", isComposing: true, bubbles: true })));
+    expect(renameDevice).not.toHaveBeenCalled();
+    const save = [...rendered.container.querySelectorAll<HTMLButtonElement>("button")].find((button) => button.textContent === "Save");
+    if (save === undefined) throw new Error("Save missing");
+    await act(async () => { save.click(); save.click(); });
+    expect(renameDevice).toHaveBeenCalledExactlyOnceWith("self", "My draft", 1n);
+    expect(input.disabled).toBe(true);
+    await act(async () => nameAttempt.reject(Object.assign(new Error("Response unknown"), { code: "DEVICE_NAME_UNCONFIRMED" })));
+    expect(input.value).toBe("My draft");
+    expect(save.disabled).toBe(true);
+    const check = [...rendered.container.querySelectorAll<HTMLButtonElement>("button")].find((button) => button.textContent === "Check status");
+    if (check === undefined) throw new Error("Receipt check missing");
+    await act(async () => { check.click(); check.click(); });
+    expect(checkDeviceNameUpdate).toHaveBeenCalledExactlyOnceWith("self");
+    await act(async () => receiptCheck.resolve(device("self", "My draft", "online", {
+      defaultDisplayName: "Actual OS name", manualDisplayName: "My draft", revision: 2n
+    })));
+    expect(rendered.container.textContent).toContain("Device name saved.");
+    expect(renameDevice).toHaveBeenCalledOnce();
+    expect(resetDeviceName).not.toHaveBeenCalled();
+  });
+
+  it("retires old owner continuations while retaining that owner's dirty draft", async () => {
+    const attempt = deferred<DeviceView>();
+    const renameDevice = vi.fn(() => attempt.promise);
+    const oldSnapshot = snapshot([device("self", "Desk", "online", { manualDisplayName: "Desk" })]);
+    const rendered = await renderSettings(oldSnapshot, { renameDevice });
+    const oldInput = rendered.container.querySelector<HTMLInputElement>(".device-control-self input");
+    if (oldInput === null) throw new Error("Name input missing");
+    await setInputValue(oldInput, "Old owner draft");
+    await clickButton(rendered.container, "Save");
+    await rendered.rerender(snapshot([device("self", "Other node", "online")]), {
+      activeProfile: { id: "other", deviceId: "self", serverId: "other-server", name: "Other", origin: "https://other.example" },
+      connectionGeneration: 2
+    });
+    await act(async () => attempt.resolve(device("self", "Old owner draft", "online", { manualDisplayName: "Old owner draft", revision: 2n })));
+    expect(rendered.container.querySelector<HTMLInputElement>(".device-control-self input")?.value).toBe("Other node");
+    expect(rendered.container.textContent).not.toContain("Device name saved.");
+    await rendered.rerender(oldSnapshot);
+    expect(rendered.container.querySelector<HTMLInputElement>(".device-control-self input")?.value).toBe("Old owner draft");
+  });
+
   it("fails closed for controller-only clients and controller-only targets", async () => {
     const setDeviceRemoteControlEnabled = vi.fn(async () => undefined);
     const setDeviceControllerAllowed = vi.fn(async () => undefined);
@@ -174,6 +282,8 @@ function device(
   return {
     id,
     name,
+    defaultDisplayName: name,
+    revision: 1n,
     kind: "desktop",
     platform: "test",
     appVersion: "1.0.0",
@@ -195,11 +305,14 @@ async function renderSettings(snapshotValue: AppSnapshot, methods: Record<string
   readonly container: HTMLDivElement;
   readonly actionKeys: string[];
   readonly flush: () => Promise<void>;
+  readonly rerender: (snapshot: AppSnapshot, state?: Partial<AppController["state"]>) => Promise<void>;
 }> {
   const work: Promise<void>[] = [];
   const actionKeys: string[] = [];
   const controller = {
     state: {
+      connectionGeneration: 1,
+      connectionState: "connected",
       activeProfile: {
         id: "profile",
         deviceId: "self",
@@ -209,15 +322,16 @@ async function renderSettings(snapshotValue: AppSnapshot, methods: Record<string
       }
     },
     refresh: vi.fn(async () => undefined),
+    hasPendingDeviceNameUpdate: () => false,
     ...methods
   } as unknown as AppController;
   const container = document.createElement("div");
   document.body.append(container);
   const root = createRoot(container);
   roots.push(root);
-  await act(async () => root.render(<DeviceControlSettings
-    controller={controller}
-    snapshot={snapshotValue}
+  const render = (snapshot: AppSnapshot, state: Partial<AppController["state"]> = {}): Promise<void> => act(async () => root.render(<DeviceControlSettings
+    controller={{ ...controller, state: { ...controller.state, ...state } }}
+    snapshot={snapshot}
     locale="en"
     runAction={(key, action) => {
       actionKeys.push(key);
@@ -225,14 +339,17 @@ async function renderSettings(snapshotValue: AppSnapshot, methods: Record<string
     }}
     t={(key, values) => translate("en", key, values)}
   />));
+  await render(snapshotValue);
   return {
     container,
     actionKeys,
     flush: async () => {
       await act(async () => {
         await Promise.all(work.splice(0));
+        await Promise.resolve();
       });
-    }
+    },
+    rerender: render
   };
 }
 
@@ -254,4 +371,11 @@ async function clickControl(container: HTMLElement, selector: string): Promise<v
   const control = container.querySelector<HTMLButtonElement>(selector);
   if (control === null) throw new Error(`Control not found: ${selector}`);
   await act(async () => control.click());
+}
+
+function deferred<T>(): { readonly promise: Promise<T>; readonly resolve: (value: T) => void; readonly reject: (error: unknown) => void } {
+  let resolve!: (value: T) => void;
+  let reject!: (error: unknown) => void;
+  const promise = new Promise<T>((accept, decline) => { resolve = accept; reject = decline; });
+  return { promise, resolve, reject };
 }

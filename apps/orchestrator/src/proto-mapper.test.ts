@@ -1493,7 +1493,7 @@ describe("proto mapper", () => {
     const audioMetadata = { kind: "music" as const, title: "A title", description: "Piano", durationSeconds: 12,
       artwork: { blob: { id: "cover", sha256: "b".repeat(64), byteLength: 99, mimeType: "image/png" }, width: 2, height: 2, alt: "Independent cover" } };
     const artifact = { kind: "artifact" as const, blob, label: "Track", audioMetadata };
-    const payloads: EventPayload[] = [
+    const payloads: Exclude<EventPayload, { type: "device_changed" }>[] = [
       { type: "artifact", artifact: blob, purpose: "audio", audioMetadata },
       { type: "message_complete", role: "assistant", blocks: [artifact] },
       { type: "tool_result", callId: "tracks", name: "tracks", output: "Published", parts: [{ kind: "text", text: "Published" }, artifact], isError: false }
@@ -1543,6 +1543,21 @@ describe("proto mapper", () => {
         case: "toolCallUpdated",
         value: { outputMode: protoMode }
       });
+      expect(fromProtoEvent(proto).payload).toEqual(payload);
+    }
+  });
+
+  it("round-trips authoritative tool input replacement separately from omission and empty input", () => {
+    for (const input of [undefined, "", '{"plan":[{"step":"Inspect","status":"pending"}]}']) {
+      const payload: EventPayload = { type: "tool_update", callId: "plan-turn", name: "update_plan", output: "", parts: [{ kind: "text", text: "" }],
+        ...(input === undefined ? {} : { input }) };
+      const event: PersistedEvent = { id: "input-event", sequence: 1n, globalCursor: 1n, revision: 1n,
+        emittedAt: 1000, backendId: "backend", targetId: "target", sessionId: "session", runId: "run",
+        generation: 1, traceId: "trace", payload };
+      const proto = fromBinary(EventSchema, toBinary(EventSchema, toProtoEvent(event)));
+      expect(proto.payload?.kind).toMatchObject({ case: "toolCallUpdated", value: {
+        toolCall: { arguments: input === undefined ? [] : [{ fieldPath: "$", value: { case: "text", value: input } }] }
+      } });
       expect(fromProtoEvent(proto).payload).toEqual(payload);
     }
   });

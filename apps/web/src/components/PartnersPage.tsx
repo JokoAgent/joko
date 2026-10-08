@@ -36,7 +36,7 @@ import type {
   PartnerSessionView,
   PartnerTemplateView
 } from "../model.js";
-import { NativeFileActionsMenu } from "./NativeFileCopyMenu.js";
+import { NativeArtifactFileActionsMenu } from "./NativeFileCopyMenu.js";
 import { formatPartnerDuration, partnerDelegationActive } from "./PartnerDelegationInlineCard.js";
 import { Button, CheckboxControl, IconButton, Modal, Pill, SelectControl, Spinner, cx, formatBytes } from "./ui.js";
 import type { Translator } from "./types.js";
@@ -696,6 +696,7 @@ function PartnerActivityPanel({ partner, partners, controller, ownerKey, t, onPa
   const actions = {
     copyFile: controller.copyArtifactFile,
     openFile: controller.openArtifactFile,
+    openFileWithApplication: controller.openArtifactFileWithApplication,
     revealSource: controller.revealArtifactSource
   };
   return <div className="partner-activity">
@@ -760,7 +761,7 @@ function PartnerActivityPanel({ partner, partners, controller, ownerKey, t, onPa
       {data.artifactFailures > 0 && <p className="partner-activity__warning" role="status">{t("partners.artifactsPartial", { count: data.artifactFailures })}</p>}
       <div className="partner-artifact-list">{data.artifacts.map(({ artifact, sessionId, sessionTitle }) => <article key={`${sessionId}:${artifact.id}`}>
         <div><strong>{artifact.title || artifact.fileName}</strong><small>{sessionTitle} · {formatBytes(artifact.byteSize)}</small></div>
-        <NativeFileActionsMenu actions={actions} artifactId={artifact.id} blobId={artifact.blobId} name={artifact.fileName} byteSize={artifact.byteSize} {...(artifact.sourceSessionId === undefined ? {} : { sourceSessionId: artifact.sourceSessionId })} sourceRevealAvailable={artifact.sourceRevealAvailable} ownerKey={`${ownerKey}:${sessionId}:${artifact.id}`} t={t} />
+        <NativeArtifactFileActionsMenu actions={actions} artifact={artifact} ownerKey={`${ownerKey}:${sessionId}:${artifact.id}`} t={t} />
       </article>)}{data.artifacts.length === 0 && <p className="partner-activity__empty">{t("partners.noArtifacts")}</p>}</div>
     </section>
   </div>;

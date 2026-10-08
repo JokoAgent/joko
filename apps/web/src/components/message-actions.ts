@@ -1,4 +1,5 @@
 import type { ComposerMessageMentionDraft, TimelineItemView } from "../model.js";
+import { isInternalContinuationTimelineItem } from "../runtime-recovery.js";
 
 export interface MessageForkTarget {
   readonly entryId: string;
@@ -20,6 +21,7 @@ export function messageForkBlocked(
   item: TimelineItemView,
   sessionActive: boolean
 ): boolean {
+  if (isInternalContinuationTimelineItem(item)) return true;
   if (!sessionActive) return false;
   if (item.kind === "user") return item.inputDelivery === "steer";
   return item.kind === "assistant" && assistantForkBlockedMessageIds(items, true).has(item.id);
@@ -35,6 +37,7 @@ export function assistantForkBlockedMessageIds(
   let hasFollowingUserBoundary = false;
   for (let index = items.length - 1; index >= 0; index -= 1) {
     const item = items[index];
+    if (item !== undefined && isInternalContinuationTimelineItem(item)) continue;
     if (item?.kind === "user") {
       if (item.inputDelivery !== "steer") hasFollowingUserBoundary = true;
       continue;
@@ -51,6 +54,8 @@ export function assistantForkBlockedMessageIds(
  */
 export function resolveMessageDeleteTarget(item: TimelineItemView): MessageDeleteTarget | undefined {
   if (
+    isInternalContinuationTimelineItem(item)
+    ||
     (item.kind !== "user" && item.kind !== "assistant")
     || item.streaming === true
     || !boundedIdentity(item.id)
@@ -62,6 +67,7 @@ export function resolveMessageDeleteTarget(item: TimelineItemView): MessageDelet
 
 /** Resolve only forks whose native boundary is exact. */
 export function resolveMessageForkTarget(item: TimelineItemView): MessageForkTarget | undefined {
+  if (isInternalContinuationTimelineItem(item)) return undefined;
   if (item.kind === "assistant" && item.nativeEntryId !== undefined) {
     return { entryId: item.nativeEntryId };
   }
@@ -86,6 +92,8 @@ export function createMessageComposerMention(
   item: TimelineItemView
 ): ComposerMessageMentionDraft | undefined {
   if (
+    isInternalContinuationTimelineItem(item)
+    ||
     (item.kind !== "user" && item.kind !== "assistant")
     || !boundedIdentity(sessionId)
     || !boundedIdentity(item.id)
@@ -110,6 +118,7 @@ export function finalAssistantMessageIds(items: readonly TimelineItemView[]): Re
   const lastByRun = new Map<string, string>();
   let unscopedLast: string | undefined;
   for (const item of items) {
+    if (isInternalContinuationTimelineItem(item)) continue;
     if (item.kind === "user") {
       if (item.inputDelivery === "steer") continue;
       if (unscopedLast !== undefined) result.add(unscopedLast);

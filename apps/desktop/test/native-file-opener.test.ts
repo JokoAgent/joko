@@ -70,6 +70,32 @@ describe("native file open ownership", () => {
     owner.dispose();
   });
 
+  it("adopts one exact list/app selection before materialization and binds it into request replay", async () => {
+    const caller = scope();
+    const listOccurrence = randomUUID();
+    const appId = randomUUID();
+    const dispatch = vi.fn(async () => "");
+    const createDispatch = vi.fn(() => dispatch);
+    const owner = new NativeFileOpener({ directory: await root(), openPath: async () => "" });
+    const request = {
+      ...input("report.xlsx"),
+      documentOccurrence: caller.id,
+      listOccurrence,
+      appId
+    };
+
+    const pending = owner.openWith(request, caller, createDispatch);
+    expect(createDispatch).toHaveBeenCalledOnce();
+    await expect(pending).resolves.toEqual({ status: "opened" });
+    expect(owner.openWith(request, caller, createDispatch)).toBe(pending);
+    expect(createDispatch).toHaveBeenCalledOnce();
+    await expect(owner.openWith({ ...request, appId: randomUUID() }, caller, createDispatch))
+      .rejects.toThrow(/different content/u);
+    await expect(owner.openWith({ ...request, listOccurrence: randomUUID() }, caller, createDispatch))
+      .rejects.toThrow(/different content/u);
+    owner.dispose();
+  });
+
   it("releases an explicit OS failure but retains an uncertain post-dispatch result", async () => {
     const directory = await root();
     const openPath = vi.fn().mockResolvedValueOnce("No associated application").mockRejectedValueOnce(new Error("IPC lost"));

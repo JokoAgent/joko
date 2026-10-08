@@ -27,6 +27,10 @@ export interface ComposerCommandActivation {
 export interface ComposerCommandItemOptions {
   /** Application-owned help surface; independent of the selected Backend. */
   readonly helpSupported?: boolean;
+  /** Application-owned Skill learning command for the selected writable Target. */
+  readonly learnSupported?: boolean;
+  /** Application-owned autonomous Objective command for the current writable Session. */
+  readonly goalSupported?: boolean;
   /** Application-owned exact task navigation command. */
   readonly jumpSessionSupported?: boolean;
   /** Derived from the selected Backend's public runtime.user_shell capability. */
@@ -39,6 +43,8 @@ export interface ComposerCommandItemOptions {
 
 export type ComposerBuiltInCommand =
   | { readonly kind: "help" }
+  | { readonly kind: "learn"; readonly instruction: string }
+  | { readonly kind: "objective"; readonly action: "open" | "clear" | "set"; readonly text?: string }
   | { readonly kind: "jumpSession"; readonly sessionId: string }
   | { readonly kind: "userShell"; readonly command: string }
   | { readonly kind: "sessionReset" }
@@ -98,6 +104,12 @@ export function composerCommandItems(
   const items: ComposerPaletteItem[] = [
     ...(options.helpSupported === true
       ? [{ id: "builtin:help", label: "/help", value: "/help", meta: "Show every available command and skill" }]
+      : []),
+    ...(options.learnSupported === true && !runtimeCommandOwnsApplicationCommand(commands, "learn")
+      ? [{ id: "builtin:learn", label: "/learn", value: "/learn", meta: "Distill a reusable skill from this task or an instruction" }]
+      : []),
+    ...(options.goalSupported === true && !runtimeCommandOwnsApplicationCommand(commands, "goal")
+      ? [{ id: "builtin:goal", label: "/goal", value: "/goal", meta: "Start, edit, pause, or clear an autonomous objective" }]
       : []),
     ...(options.jumpSessionSupported === true
       ? [{ id: "builtin:jump-session", label: "/jump-session", value: "/jump-session", meta: "Open an exact task by ID" }]
@@ -194,6 +206,21 @@ export function composerBuiltInCommand(
   options: ComposerCommandItemOptions = {}
 ): ComposerBuiltInCommand | undefined {
   if (options.helpSupported === true && /^\/help\s*$/iu.test(text)) return { kind: "help" };
+  if (options.learnSupported === true) {
+    const learn = text.match(/^\/learn(?:\s+([\s\S]*?))?\s*$/iu);
+    if (learn !== null) return { kind: "learn", instruction: (learn[1] ?? "").trim() };
+  }
+  if (options.goalSupported === true) {
+    const goal = text.match(/^\/goal(?:\s+([\s\S]*?))?\s*$/iu);
+    if (goal !== null) {
+      const value = (goal[1] ?? "").trim();
+      if (value === "") return { kind: "objective", action: "open" };
+      if (/^(?:clear|stop|off|cancel|reset|none)$/iu.test(value)) {
+        return { kind: "objective", action: "clear" };
+      }
+      return { kind: "objective", action: "set", text: value };
+    }
+  }
   if (options.jumpSessionSupported === true) {
     const jump = text.match(/^\/jump-session(?:\s+([^\s]+))?\s*$/iu);
     if (jump !== null) return { kind: "jumpSession", sessionId: (jump[1] ?? "").trim() };
@@ -256,6 +283,17 @@ function flattenWorkspaceEntries(
 
 function slashName(value: string): string {
   return `/${value.replace(/^\/+/, "")}`;
+}
+
+/** A loaded runtime Skill takes precedence over an application command with the same name. */
+export function runtimeCommandOwnsApplicationCommand(
+  commands: readonly RuntimeCommandView[],
+  name: string
+): boolean {
+  const expected = slashName(name).toLocaleLowerCase();
+  return commands.some((command) => command.source === "skill"
+    && command.loaded
+    && slashName(command.name).toLocaleLowerCase() === expected);
 }
 
 function uniquePaletteItems(items: readonly ComposerPaletteItem[]): readonly ComposerPaletteItem[] {

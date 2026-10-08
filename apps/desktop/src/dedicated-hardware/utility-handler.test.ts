@@ -95,7 +95,7 @@ describe("dedicated hardware utility request handler", () => {
     const load = vi.fn();
     const handler = createDedicatedHardwareUtilityRequestHandler({
       postMessage: (message) => messages.push(message),
-      loadStagedAdapter: load,
+      loadAdapter: load,
       openKeymapBackupStore: async () => backupStore()
     });
     await expect(handler.handle({
@@ -141,7 +141,7 @@ describe("dedicated hardware utility request handler", () => {
     };
     const handler = createDedicatedHardwareUtilityRequestHandler({
       postMessage: (message) => messages.push(message),
-      loadStagedAdapter: vi.fn(async (_identity, providedSink) => { sink = providedSink; return adapter; }),
+      loadAdapter: vi.fn(async (_identity, providedSink) => { sink = providedSink; return adapter; }),
       openKeymapBackupStore: async () => backupStore()
     });
     const sdk = stagedSdk;
@@ -204,7 +204,7 @@ describe("dedicated hardware utility request handler", () => {
     const handler = createDedicatedHardwareUtilityRequestHandler({
       postMessage: (message) => messages.push(message),
       openKeymapBackupStore: async () => backupStore(),
-      loadStagedAdapter: async (_identity, sink) => {
+      loadAdapter: async (_identity, sink) => {
         sink.publishState(connected("codex-micro"));
         sink.publishInput("codex-micro", { kind: "key", key: "AG00", pressed: true });
         return {
@@ -239,7 +239,7 @@ describe("dedicated hardware utility request handler", () => {
     });
     const handler = createDedicatedHardwareUtilityRequestHandler({
       postMessage: (message) => messages.push(message),
-      loadStagedAdapter: vi.fn(),
+      loadAdapter: vi.fn(),
       openKeymapBackupStore: async () => store
     });
 
@@ -292,7 +292,7 @@ describe("dedicated hardware utility request handler", () => {
     };
     const handler = createDedicatedHardwareUtilityRequestHandler({
       postMessage: (message) => messages.push(message),
-      loadStagedAdapter: vi.fn(async (_identity, providedSink) => { sink = providedSink; return adapter; }),
+      loadAdapter: vi.fn(async (_identity, providedSink) => { sink = providedSink; return adapter; }),
       openKeymapBackupStore: async () => backupStore()
     });
     await handler.handle({
@@ -341,7 +341,7 @@ describe("dedicated hardware utility request handler", () => {
     };
     const handler = createDedicatedHardwareUtilityRequestHandler({
       postMessage: (message) => messages.push(message),
-      loadStagedAdapter: vi.fn(async () => adapter),
+      loadAdapter: vi.fn(async () => adapter),
       openKeymapBackupStore: async () => backupStore()
     });
     await handler.handle({
@@ -397,7 +397,7 @@ describe("dedicated hardware utility request handler", () => {
     };
     const handler = createDedicatedHardwareUtilityRequestHandler({
       postMessage: (message) => messages.push(message),
-      loadStagedAdapter: vi.fn(async () => adapter),
+      loadAdapter: vi.fn(async () => adapter),
       openKeymapBackupStore: async () => backupStore()
     });
     await handler.handle({
@@ -446,7 +446,7 @@ describe("dedicated hardware utility request handler", () => {
     };
     const handler = createDedicatedHardwareUtilityRequestHandler({
       postMessage: (message) => messages.push(message),
-      loadStagedAdapter: vi.fn(async () => adapter),
+      loadAdapter: vi.fn(async () => adapter),
       openKeymapBackupStore: async () => store
     });
     await handler.handle({
@@ -509,7 +509,7 @@ describe("dedicated hardware utility request handler", () => {
     };
     const handler = createDedicatedHardwareUtilityRequestHandler({
       postMessage: (message) => messages.push(message),
-      loadStagedAdapter: vi.fn(async (_identity, providedSink) => { sink = providedSink; return adapter; }),
+      loadAdapter: vi.fn(async (_identity, providedSink) => { sink = providedSink; return adapter; }),
       openKeymapBackupStore: async () => store
     });
     await handler.handle({
@@ -560,7 +560,7 @@ describe("dedicated hardware utility request handler", () => {
     };
     const handler = createDedicatedHardwareUtilityRequestHandler({
       postMessage: (message) => messages.push(message),
-      loadStagedAdapter: vi.fn(async (_identity, providedSink) => { sink = providedSink; return adapter; }),
+      loadAdapter: vi.fn(async (_identity, providedSink) => { sink = providedSink; return adapter; }),
       openKeymapBackupStore: async () => backupStore({
         version: 1,
         deviceFirmwareIdentity: "creator-a@firmware-1",
@@ -593,7 +593,7 @@ describe("dedicated hardware utility request handler", () => {
   it("terminates on malformed, replayed, out-of-generation, or post-stop requests", async () => {
     const create = () => createDedicatedHardwareUtilityRequestHandler({
       postMessage: vi.fn(),
-      loadStagedAdapter: vi.fn(async () => { throw new Error("missing"); }),
+      loadAdapter: vi.fn(async () => { throw new Error("missing"); }),
       openKeymapBackupStore: async () => backupStore()
     });
     await expect(create().handle({ version: 1, generation: 1, requestId: "bad", kind: "shutdown" })).resolves.toBe("terminate");
@@ -618,7 +618,7 @@ describe("dedicated hardware utility request handler", () => {
     const messages: unknown[] = [];
     const handler = createDedicatedHardwareUtilityRequestHandler({
       postMessage: (message) => messages.push(message),
-      loadStagedAdapter: async () => { throw new Error("secret native path"); },
+      loadAdapter: async () => { throw new Error("secret native path"); },
       openKeymapBackupStore: async () => backupStore()
     });
     await handler.handle({

@@ -5,7 +5,9 @@
   "type": "module",
   "exports": {
     ".": "./src/App.tsx",
-    "./bootstrap": "./src/main.tsx"
+    "./bootstrap": "./src/main.tsx",
+    "./connection-contract": "./src/connection-contract.ts",
+    "./connection-embedded": "./src/connection-embedded.tsx"
   },
   "scripts": {
     "build": "vite build",

@@ -1,5 +1,6 @@
-import type { AttachmentDraft, BrowserCommentDraftItem, ComposerDraft, ComposerMentionDraft, ConnectionProfile, LocalePreference, MachineCacheView, NewSessionLocalDraft, PendingExtensionUseView, PermissionMode, Theme } from "./model.js";
+import type { AttachmentDraft, BrowserCommentDraftItem, ComposerDraft, ComposerMentionDraft, ConnectionProfile, LocalePreference, MachineCacheView, NewSessionLocalDraft, PendingExtensionSuggestionView, PendingExtensionUseView, PermissionMode, Theme } from "./model.js";
 import { normalizeBrowserCommentStyleChanges, normalizeBrowserCommentTarget, sanitizeBrowserCommentPageUrl } from "./browser-comment-draft.js";
+import { normalizeExtensionRecommendation, sameExtensionRecommendation } from "./extension-suggestion-handoff.js";
 import { normalizeRecentProjects, publishRecentProjectsChange, withRecentProject, withoutRecentProject, type RecentProject } from "./recent-projects.js";
 import { normalizeMachineCache, normalizeMachineSelection, type MachineSelection } from "./machine-federation.js";
 import {
@@ -45,6 +46,8 @@ const DRAFT_STORE = "drafts";
 const NEW_SESSION_DRAFT_PREFIX = "new-session\u0000";
 const RECENT_PROJECTS_PREFIX = "recent-projects\u0000";
 const PENDING_EXTENSION_USE_PREFIX = "pending-extension-use\u0000";
+const PENDING_EXTENSION_SUGGESTION_PREFIX = "pending-extension-suggestion\u0000";
+const RECENT_EXTENSION_SUGGESTIONS_PREFIX = "recent-extension-suggestions\u0000";
 const PREFERENCE_STORE = "preferences";
 const MACHINE_CACHE_STORE = "machine-caches";
 const CURRENT_OBJECT_STORES = [
@@ -80,6 +83,10 @@ interface PersistedComposerDraft extends Omit<ComposerDraft, "attachments" | "br
 interface PersistedNewSessionLocalDraft extends Omit<NewSessionLocalDraft, "attachments" | "browserComments"> {
   readonly attachments: readonly PersistedAttachment[];
   readonly browserComments: readonly PersistedBrowserCommentDraftItem[];
+}
+
+interface PersistedPendingExtensionSuggestion extends Omit<PendingExtensionSuggestionView, "draft"> {
+  readonly draft: PersistedNewSessionLocalDraft;
 }
 
 interface EncryptedSecret {
@@ -600,24 +607,11 @@ export class LocalState {
   async saveNewSessionDraft(scope: string, draft: NewSessionLocalDraft): Promise<void> {
     const normalized = normalizeNewSessionLocalDraft(draft);
     if (normalized === undefined) throw new Error("The new-task draft is invalid.");
-    const persisted: PersistedNewSessionLocalDraft = {
-      ...normalized,
-      attachments: normalized.attachments.map(persistAttachment),
-      browserComments: (normalized.browserComments ?? []).map((item) => ({
-        ...item,
-        screenshot: persistAttachment(item.screenshot)
-      }))
-    };
-    await this.put(DRAFT_STORE, newSessionDraftKey(scope), persisted);
+    await this.put(DRAFT_STORE, newSessionDraftKey(scope), persistNewSessionLocalDraft(normalized));
   }
 
   async readNewSessionDraft(scope: string): Promise<NewSessionLocalDraft | undefined> {
-    const value = await this.get<unknown>(DRAFT_STORE, newSessionDraftKey(scope));
-    if (value === null || typeof value !== "object" || Array.isArray(value)) return undefined;
-    const record = value as Record<string, unknown>;
-    const attachments = restorePersistedAttachments(record["attachments"]);
-    const browserComments = restorePersistedBrowserComments(record["browserComments"]);
-    return normalizeNewSessionLocalDraft({ ...record, attachments, browserComments });
+    return restoreNewSessionLocalDraft(await this.get<unknown>(DRAFT_STORE, newSessionDraftKey(scope)));
   }
 
   async readRecentProjects(scope: string): Promise<readonly RecentProject[]> {
@@ -662,6 +656,89 @@ export class LocalState {
   async clearPendingExtensionUse(scope: string): Promise<void> {
     const transaction = this.#database.transaction(DRAFT_STORE, "readwrite");
     transaction.objectStore(DRAFT_STORE).delete(pendingExtensionUseKey(scope));
+    await transactionDone(transaction);
+  }
+
+  async savePendingExtensionSuggestion(scope: string, value: PendingExtensionSuggestionView): Promise<void> {
+    const normalized = normalizePendingExtensionSuggestion(value);
+    if (normalized === undefined) throw new Error("The Extension suggestion handoff is invalid.");
+    await this.put(DRAFT_STORE, pendingExtensionSuggestionKey(scope), persistPendingExtensionSuggestion(normalized));
+  }
+
+  async readPendingExtensionSuggestion(scope: string, nonce?: string): Promise<PendingExtensionSuggestionView | undefined> {
+    const key = pendingExtensionSuggestionKey(scope);
+    if (nonce === undefined) {
+      return restorePendingExtensionSuggestion(await this.get<unknown>(DRAFT_STORE, key));
+    }
+    const transaction = this.#database.transaction(DRAFT_STORE, "readwrite");
+    const store = transaction.objectStore(DRAFT_STORE);
+    const raw = await requestResult<unknown>(store.get(key));
+    const current = restorePendingExtensionSuggestion(raw);
+    if (current === undefined && rawPendingExtensionSuggestionNonce(raw) === nonce) store.delete(key);
+    await transactionDone(transaction);
+    return current?.nonce === nonce ? current : undefined;
+  }
+
+  async compareAndSetPendingExtensionSuggestion(
+    scope: string,
+    expected: PendingExtensionSuggestionView,
+    next?: PendingExtensionSuggestionView
+  ): Promise<boolean> {
+    const normalizedExpected = normalizePendingExtensionSuggestion(expected);
+    const normalizedNext = next === undefined ? undefined : normalizePendingExtensionSuggestion(next);
+    if (normalizedExpected === undefined || next !== undefined && normalizedNext === undefined) {
+      throw new Error("The Extension suggestion handoff is invalid.");
+    }
+    if (normalizedNext !== undefined && normalizedNext.nonce !== normalizedExpected.nonce) {
+      throw new Error("An Extension suggestion handoff cannot change its nonce.");
+    }
+    const transaction = this.#database.transaction(DRAFT_STORE, "readwrite");
+    const store = transaction.objectStore(DRAFT_STORE);
+    const key = pendingExtensionSuggestionKey(scope);
+    const raw = await requestResult<unknown>(store.get(key));
+    const current = restorePendingExtensionSuggestion(raw);
+    if (current === undefined || !samePendingExtensionSuggestionState(current, normalizedExpected)) {
+      if (current === undefined && rawPendingExtensionSuggestionNonce(raw) === normalizedExpected.nonce) store.delete(key);
+      await transactionDone(transaction);
+      return false;
+    }
+    if (normalizedNext === undefined) store.delete(key);
+    else store.put(persistPendingExtensionSuggestion(normalizedNext), key);
+    await transactionDone(transaction);
+    return true;
+  }
+
+  /** Atomically takes one ready handoff. A matching invalid/stale nonce is
+   * deleted; unrelated newer handoffs are left untouched. */
+  async consumePendingExtensionSuggestion(
+    scope: string,
+    nonce: string,
+    contextKey: string
+  ): Promise<PendingExtensionSuggestionView | undefined> {
+    const transaction = this.#database.transaction(DRAFT_STORE, "readwrite");
+    const store = transaction.objectStore(DRAFT_STORE);
+    const key = pendingExtensionSuggestionKey(scope);
+    const raw = await requestResult<unknown>(store.get(key));
+    const current = restorePendingExtensionSuggestion(raw);
+    const rawNonce = rawPendingExtensionSuggestionNonce(raw);
+    if (current?.nonce === nonce || current === undefined && rawNonce === nonce) store.delete(key);
+    await transactionDone(transaction);
+    return current?.nonce === nonce && current.phase === "ready" && current.contextKey === contextKey
+      ? current
+      : undefined;
+  }
+
+  async readRecentExtensionSuggestions(scope: string): Promise<readonly string[]> {
+    return normalizeRecentExtensionSuggestions(await this.get<unknown>(DRAFT_STORE, recentExtensionSuggestionsKey(scope)));
+  }
+
+  async recordExtensionSuggestionUse(scope: string, extensionId: string): Promise<void> {
+    if (!validExtensionId(extensionId)) throw new Error("A valid Extension identity is required.");
+    const transaction = this.#database.transaction(DRAFT_STORE, "readwrite");
+    const store = transaction.objectStore(DRAFT_STORE);
+    const key = recentExtensionSuggestionsKey(scope);
+    const current = normalizeRecentExtensionSuggestions(await requestResult<unknown>(store.get(key)));
+    store.put([extensionId, ...current.filter((candidate) => candidate !== extensionId)].slice(0, 5), key);
     await transactionDone(transaction);
   }
 
@@ -875,6 +952,122 @@ export function normalizePendingExtensionUse(value: unknown): PendingExtensionUs
     displayName: record["displayName"],
     owner
   };
+}
+
+export function normalizePendingExtensionSuggestion(value: unknown): PendingExtensionSuggestionView | undefined {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  const owner = normalizePendingExtensionSuggestionOwner(record["owner"]);
+  const recommendation = normalizeExtensionRecommendation(record["recommendation"]);
+  const draft = normalizeNewSessionLocalDraft(record["draft"]);
+  const runtimeSessionId = record["runtimeSessionId"];
+  const selectedLabel = record["selectedLabel"];
+  const selectedPrompt = record["selectedPrompt"];
+  if (owner === undefined || recommendation === undefined || draft === undefined
+    || !validRecommendationNonce(record["nonce"])
+    || record["phase"] !== "setup" && record["phase"] !== "ready"
+    || !validExtensionId(record["extensionId"])
+    || !validExtensionRevision(record["extensionRevision"])
+    || typeof selectedLabel !== "string" || typeof selectedPrompt !== "string"
+    || !selectedRecommendationMatches(recommendation, selectedLabel, selectedPrompt)
+    || !validExtensionSuggestionContextKey(record["contextKey"])
+    || runtimeSessionId !== undefined && !validExtensionIdentity(runtimeSessionId)
+    || !validExtensionIdentity(record["backendId"])
+    || record["targetId"] !== undefined && !validExtensionIdentity(record["targetId"])) return undefined;
+  return {
+    nonce: record["nonce"],
+    phase: record["phase"],
+    extensionId: record["extensionId"],
+    extensionRevision: record["extensionRevision"],
+    owner,
+    recommendation,
+    selectedLabel,
+    selectedPrompt,
+    contextKey: record["contextKey"],
+    ...(runtimeSessionId === undefined ? {} : { runtimeSessionId }),
+    draft,
+    backendId: record["backendId"],
+    ...(record["targetId"] === undefined ? {} : { targetId: record["targetId"] })
+  };
+}
+
+export function normalizeRecentExtensionSuggestions(value: unknown): readonly string[] {
+  if (!Array.isArray(value)) return [];
+  const result: string[] = [];
+  for (const candidate of value) {
+    if (!validExtensionId(candidate) || result.includes(candidate)) continue;
+    result.push(candidate);
+    if (result.length === 5) break;
+  }
+  return result;
+}
+
+function normalizePendingExtensionSuggestionOwner(value: unknown): PendingExtensionSuggestionView["owner"] | undefined {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const owner = value as Record<string, unknown>;
+  if (owner["kind"] === "resource" && validExtensionIdentity(owner["resourceId"])
+    && validExtensionIdentity(owner["discoveredRevision"]) && validExtensionRevision(owner["resourceRevision"])) {
+    return {
+      kind: "resource",
+      resourceId: owner["resourceId"],
+      discoveredRevision: owner["discoveredRevision"],
+      resourceRevision: owner["resourceRevision"]
+    };
+  }
+  if (owner["kind"] === "mcp" && validExtensionIdentity(owner["serverId"])
+    && validExtensionRevision(owner["serverRevision"])) {
+    return { kind: "mcp", serverId: owner["serverId"], serverRevision: owner["serverRevision"] };
+  }
+  if (owner["kind"] === "source" && /^extension_source_[a-f0-9]{32}$/u.test(String(owner["sourceId"] ?? ""))
+    && validExtensionRevision(owner["sourceRevision"])
+    && /^extension_source_entry_[a-f0-9]{32}$/u.test(String(owner["entryId"] ?? ""))
+    && /^sha256:[a-f0-9]{64}$/u.test(String(owner["contentRevision"] ?? ""))) {
+    return {
+      kind: "source",
+      sourceId: String(owner["sourceId"]),
+      sourceRevision: owner["sourceRevision"],
+      entryId: String(owner["entryId"]),
+      contentRevision: String(owner["contentRevision"])
+    };
+  }
+  return undefined;
+}
+
+function selectedRecommendationMatches(
+  recommendation: PendingExtensionSuggestionView["recommendation"],
+  label: unknown,
+  prompt: unknown
+): boolean {
+  if (typeof label !== "string" || typeof prompt !== "string") return false;
+  return recommendation.label === label && recommendation.prompt === prompt
+    || Object.values(recommendation.locales ?? {}).some((localized) => localized?.label === label && localized.prompt === prompt);
+}
+
+function validRecommendationNonce(value: unknown): value is string {
+  return typeof value === "string"
+    && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u.test(value);
+}
+
+function validExtensionSuggestionContextKey(value: unknown): value is string {
+  if (typeof value !== "string" || value.length === 0 || value.length > 16_384 || /[\u0000-\u001f\u007f]/u.test(value)) return false;
+  try {
+    const parsed: unknown = JSON.parse(value);
+    return Array.isArray(parsed) && parsed.length >= 6 && parsed.length <= 16
+      && parsed.every((part) => typeof part === "string" && part.length <= 4_096 && !/[\u0000-\u001f\u007f]/u.test(part)
+        || typeof part === "number" && Number.isSafeInteger(part) && part >= 0)
+      && JSON.stringify(parsed) === value;
+  } catch {
+    return false;
+  }
+}
+
+function validExtensionId(value: unknown): value is string {
+  return typeof value === "string" && /^extension_[a-f0-9]{32}$/u.test(value);
+}
+
+function validExtensionRevision(value: unknown): value is string {
+  return typeof value === "string" && value.length <= 20 && /^[1-9][0-9]*$/u.test(value)
+    && BigInt(value) <= 18_446_744_073_709_551_615n;
 }
 
 function validExtensionIdentity(value: unknown): value is string {
@@ -1177,6 +1370,111 @@ function restorePersistedAttachments(value: unknown): readonly AttachmentDraft[]
   return attachments;
 }
 
+function persistNewSessionLocalDraft(draft: NewSessionLocalDraft): PersistedNewSessionLocalDraft {
+  return {
+    ...draft,
+    attachments: draft.attachments.map(persistAttachment),
+    browserComments: (draft.browserComments ?? []).map((item) => ({
+      ...item,
+      screenshot: persistAttachment(item.screenshot)
+    }))
+  };
+}
+
+function restoreNewSessionLocalDraft(value: unknown): NewSessionLocalDraft | undefined {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  return normalizeNewSessionLocalDraft({
+    ...record,
+    attachments: restorePersistedAttachments(record["attachments"]),
+    browserComments: restorePersistedBrowserComments(record["browserComments"])
+  });
+}
+
+function persistPendingExtensionSuggestion(value: PendingExtensionSuggestionView): PersistedPendingExtensionSuggestion {
+  return { ...value, draft: persistNewSessionLocalDraft(value.draft) };
+}
+
+function restorePendingExtensionSuggestion(value: unknown): PendingExtensionSuggestionView | undefined {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  const draft = restoreNewSessionLocalDraft(record["draft"]);
+  return draft === undefined ? undefined : normalizePendingExtensionSuggestion({ ...record, draft });
+}
+
+function rawPendingExtensionSuggestionNonce(value: unknown): string | undefined {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const nonce = (value as Record<string, unknown>)["nonce"];
+  return validRecommendationNonce(nonce) ? nonce : undefined;
+}
+
+function samePendingExtensionSuggestionState(
+  left: PendingExtensionSuggestionView,
+  right: PendingExtensionSuggestionView
+): boolean {
+  return left.nonce === right.nonce
+    && left.phase === right.phase
+    && left.extensionId === right.extensionId
+    && left.extensionRevision === right.extensionRevision
+    && samePendingExtensionSuggestionOwner(left.owner, right.owner)
+    && sameExtensionRecommendation(left.recommendation, right.recommendation)
+    && left.selectedLabel === right.selectedLabel
+    && left.selectedPrompt === right.selectedPrompt
+    && left.contextKey === right.contextKey
+    && left.runtimeSessionId === right.runtimeSessionId
+    && left.backendId === right.backendId
+    && left.targetId === right.targetId
+    && sameNewSessionLocalDraft(left.draft, right.draft);
+}
+
+function samePendingExtensionSuggestionOwner(
+  left: PendingExtensionSuggestionView["owner"],
+  right: PendingExtensionSuggestionView["owner"]
+): boolean {
+  if (left.kind !== right.kind) return false;
+  if (left.kind === "resource" && right.kind === "resource") {
+    return left.resourceId === right.resourceId && left.discoveredRevision === right.discoveredRevision
+      && left.resourceRevision === right.resourceRevision;
+  }
+  if (left.kind === "mcp" && right.kind === "mcp") {
+    return left.serverId === right.serverId && left.serverRevision === right.serverRevision;
+  }
+  return left.kind === "source" && right.kind === "source"
+    && left.sourceId === right.sourceId && left.sourceRevision === right.sourceRevision
+    && left.entryId === right.entryId && left.contentRevision === right.contentRevision;
+}
+
+function sameNewSessionLocalDraft(left: NewSessionLocalDraft, right: NewSessionLocalDraft): boolean {
+  return JSON.stringify(newSessionDraftScalarProjection(left)) === JSON.stringify(newSessionDraftScalarProjection(right))
+    && sameAttachmentList(left.attachments, right.attachments)
+    && sameBrowserCommentList(left.browserComments ?? [], right.browserComments ?? []);
+}
+
+function newSessionDraftScalarProjection(draft: NewSessionLocalDraft): Omit<NewSessionLocalDraft, "attachments" | "browserComments"> {
+  const { attachments: _attachments, browserComments: _browserComments, ...projection } = draft;
+  return projection;
+}
+
+function sameAttachmentList(left: readonly AttachmentDraft[], right: readonly AttachmentDraft[]): boolean {
+  return left.length === right.length && left.every((attachment, index) => {
+    const candidate = right[index];
+    return candidate !== undefined && attachment.id === candidate.id && attachment.kind === candidate.kind
+      && attachment.file.name === candidate.file.name && attachment.file.type === candidate.file.type
+      && attachment.file.size === candidate.file.size && attachment.file.lastModified === candidate.file.lastModified;
+  });
+}
+
+function sameBrowserCommentList(left: readonly BrowserCommentDraftItem[], right: readonly BrowserCommentDraftItem[]): boolean {
+  return left.length === right.length && left.every((item, index) => {
+    const candidate = right[index];
+    if (candidate === undefined) return false;
+    const { screenshot: leftScreenshot, ...leftScalar } = item;
+    const { screenshot: rightScreenshot, ...rightScalar } = candidate;
+    return JSON.stringify(leftScalar) === JSON.stringify(rightScalar)
+      && sameAttachmentList([leftScreenshot], [rightScreenshot]);
+  });
+}
+
 function persistAttachment(attachment: AttachmentDraft): PersistedAttachment {
   return {
     id: attachment.id,
@@ -1215,6 +1513,16 @@ function recentProjectsKey(scope: string): string {
 function pendingExtensionUseKey(scope: string): string {
   if (scope.length === 0) throw new Error("A new-task draft scope is required.");
   return `${PENDING_EXTENSION_USE_PREFIX}${scope}`;
+}
+
+function pendingExtensionSuggestionKey(scope: string): string {
+  if (scope.length === 0) throw new Error("A new-task draft scope is required.");
+  return `${PENDING_EXTENSION_SUGGESTION_PREFIX}${scope}`;
+}
+
+function recentExtensionSuggestionsKey(scope: string): string {
+  if (scope.length === 0) throw new Error("A new-task draft scope is required.");
+  return `${RECENT_EXTENSION_SUGGESTIONS_PREFIX}${scope}`;
 }
 
 function openCurrentDatabase(): Promise<IDBDatabase> {

@@ -88,8 +88,29 @@ export interface ResourceUsageEventPayload {
   readonly action: ResourceUsageAction;
 }
 
+/** Immutable owner-level Device content, independent of any Session routing. */
+export interface DeviceContentProjection {
+  readonly id: string;
+  readonly name: string;
+  readonly defaultName: string;
+  readonly manualName?: string;
+  readonly kind: "unspecified" | "web" | "desktop" | "service" | "mobile";
+  readonly platform: string;
+  readonly appVersion: string;
+  readonly revoked: boolean;
+  readonly remoteControlEnabled: boolean;
+  readonly pairedAt: number;
+  readonly lastSeenAt?: number;
+  readonly connectionIds: readonly string[];
+  readonly online: boolean;
+  readonly revision: string;
+  readonly versionUpdatedAt: number;
+}
+
 export type EventPayload =
   | { readonly type: "run_state"; readonly state: RunState; readonly error?: PublicError }
+  /** Store-owned observation; never emitted by a Session adapter. */
+  | { readonly type: "device_changed"; readonly device: DeviceContentProjection }
   /** Content-free signal that the durable Session projection changed. */
   | { readonly type: "session_changed" }
   | { readonly type: "text_delta"; readonly blockId: string; readonly delta: string; readonly contentIndex?: number; readonly nativeHistory?: NativeHistoryEventContext }
@@ -114,6 +135,11 @@ export type EventPayload =
       readonly automaticContinuation?: {
         readonly recoveryId: string;
       };
+      /** Host-authored Objective continuation; hidden from user-message UI. */
+      readonly objectiveContinuation?: {
+        readonly ownerGeneration: number;
+        readonly turn: number;
+      };
       /** Opaque Backend-owned history semantics used only for branch navigation/reconciliation. */
       readonly nativeHistory?: NativeHistoryEventContext;
     }
@@ -130,6 +156,21 @@ export type EventPayload =
       readonly routeChanged?: boolean;
       readonly error: PublicError;
     }
+  | {
+      /** Durable, Host-authored Objective lifecycle marker for Timeline UI. */
+      readonly type: "objective_lifecycle";
+      readonly action: "started" | "replaced" | "paused" | "resumed" | "completed" |
+        "blocked" | "limited" | "dispatch_unknown" | "cleared";
+      readonly status?: "active" | "paused" | "blocked" | "complete" | "budget_limited" |
+        "usage_limited" | "dispatch_unknown";
+      readonly ownerGeneration: number;
+      readonly turnsUsed: number;
+      readonly tokensUsed: number;
+      readonly elapsedMs: number;
+      /** Snapshot required for started/replaced markers. */
+      readonly objectiveText?: string;
+      readonly reason?: string;
+    }
   | { readonly type: "status"; readonly key: string; readonly text?: string; readonly nativeHistory?: NativeHistoryEventContext }
   | {
       /** Already-redacted one-shot UI effect emitted by any capable Backend. */
@@ -144,6 +185,8 @@ export type EventPayload =
       readonly callId: string;
       /** Backend-neutral display identity retained across update-only projections. */
       readonly name: string;
+      /** Authoritative input replacement; omission preserves the current input. */
+      readonly input?: string;
       /** Whether output is a delta or an authoritative replacement. */
       readonly outputMode?: "append" | "replace";
       readonly output: string;

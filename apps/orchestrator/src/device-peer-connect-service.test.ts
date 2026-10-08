@@ -19,6 +19,25 @@ afterEach(() => {
 });
 
 describe("DevicePeerService Connect boundary", () => {
+  it.each([false, true])("persists the trusted native default while preserving the manual name (split=%s)", async (split) => {
+    const fixture = setup({ targetKind: "desktop" });
+    const device = fixture.store.getDevice(fixture.target.deviceId);
+    const manual = fixture.store.renameDevice(device.id, "My workstation", device.revision);
+    const request = hello(device.id, "hello-native-name", "Renamed OS host");
+    const input = new TestInput<contract.OpenDevicePeerAgentRouteRequest>();
+    input.push(request);
+    const handler = context(fixture.targetKey, new AbortController().signal, fixture.targetHostKey!);
+    const output = split
+      ? openCommandRoute(fixture.service, request, handler)
+      : openRoute(fixture.service, input, handler);
+    await expect(output.next()).resolves.toMatchObject({ value: { payload: { case: "accepted" } } });
+    const refreshed = fixture.store.getDevice(device.id);
+    expect(refreshed).toMatchObject({ defaultName: "Renamed OS host", manualName: "My workstation", name: "My workstation" });
+    expect(refreshed.revision).toBe(manual.revision + 1n);
+    await output.return?.(undefined);
+    input.close();
+  });
+
   it("requires the Main-only Desktop host authorization on every public agent-route half", async () => {
     const fixture = setup({ targetKind: "desktop" });
     const deniedInput = new TestInput<contract.OpenDevicePeerAgentRouteRequest>();
@@ -656,7 +675,7 @@ function setup(options: {
   const controller = store.createConnection({
     id: "connection-controller",
     deviceId: "device-controller",
-    device: { name: "Controller", kind: "web", platform: "web" },
+    device: { defaultName: "Controller", kind: "web", platform: "web" },
     name: "Controller",
     authKeyDigest: digestAuthKey(controllerKey)
   });
@@ -668,7 +687,7 @@ function setup(options: {
         const issued = connections.issueTrustedDesktopConnection({
           desktopInstanceId: "4e56f4d8-c6ee-4a17-9a89-56e059b7e592",
           desktopDeviceId: "d6a365ef-ef33-4fb7-a0f1-a02eb57fef75",
-          deviceName: "Target Desktop",
+          defaultDeviceName: "Target Desktop",
           platform: "windows",
           appVersion: "0.1.0",
           desktopHostAuthKey: targetHostKey
@@ -680,7 +699,7 @@ function setup(options: {
     : store.createConnection({
         id: "connection-target",
         deviceId: "device-target",
-        device: { name: "Target Service", kind: "service", platform: "windows" },
+        device: { defaultName: "Target Service", kind: "service", platform: "windows" },
         name: "Target Service",
         authKeyDigest: digestAuthKey(targetKey)
       });
@@ -705,7 +724,7 @@ function setup(options: {
   };
 }
 
-function hello(targetDeviceId: string, requestId: string): contract.OpenDevicePeerAgentRouteRequest {
+function hello(targetDeviceId: string, requestId: string, defaultDisplayName = "Target Service"): contract.OpenDevicePeerAgentRouteRequest {
   return create(contract.OpenDevicePeerAgentRouteRequestSchema, {
     targetDeviceId,
     routeGeneration: 0n,
@@ -713,6 +732,7 @@ function hello(targetDeviceId: string, requestId: string): contract.OpenDevicePe
     payload: {
       case: "hello",
       value: create(contract.DevicePeerAgentHelloSchema, {
+        deviceNameSource: create(contract.DeviceNameSourceSchema, { defaultDisplayName }),
         capabilities: [
           contract.DevicePeerCapabilityKind.FILES,
           contract.DevicePeerCapabilityKind.PROCESS,

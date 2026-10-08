@@ -1,8 +1,17 @@
 import { create } from "@bufbuild/protobuf";
 import type { Transport } from "@connectrpc/connect";
-import { GetBlobDownloadTicketResponseSchema, GetSnapshotResponseSchema, SnapshotSchema, TransferDirection } from "@joko/contracts";
+import {
+  DeviceKind,
+  GetBlobDownloadTicketResponseSchema,
+  GetConnectionResponseSchema,
+  GetDeviceResponseSchema,
+  GetSnapshotResponseSchema,
+  SnapshotSchema,
+  TransferDirection
+} from "@joko/contracts";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createOrchestratorGateway } from "./gateway.js";
+import { listNativeFileOpenApplications, retireNativeFileOpenApplicationList } from "./native-file-actions.js";
 
 afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 
@@ -74,6 +83,54 @@ describe("artifact download ownership", () => {
     vi.stubGlobal("window", { jokoDesktop: { capabilities: ["files.open"], openFile: vi.fn(), cancelFileOpen: vi.fn() } });
     await expect(gateway.openArtifactFile("shared", "video.mp4", 256 * 1024 * 1024 + 1, context)).resolves.toEqual({ status: "failed", reason: "capacity" });
     expect(fetchBlob).not.toHaveBeenCalled();
+    gateway.disconnect();
+  });
+  it("opens canonical bytes with the exact captured application list without exposing a path or switching hosts", async () => {
+    const openFileWithApp = vi.fn<NonNullable<Window["jokoDesktop"]>["openFileWithApp"]>(async () => ({ status: "opened" }));
+    const retireOpenWithApps = vi.fn<NonNullable<Window["jokoDesktop"]>["retireOpenWithApps"]>(async () => undefined);
+    const original = {
+      capabilities: ["files.openWith" as const],
+      listOpenWithApps: vi.fn<NonNullable<Window["jokoDesktop"]>["listOpenWithApps"]>(async ({ listOccurrence }) => ({
+        status: "listed",
+        listOccurrence,
+        apps: [{ appId: "11111111-1111-4111-8111-111111111111", label: "Editor" }]
+      })),
+      retireOpenWithApps,
+      openFileWithApp,
+      cancelFileOpen: vi.fn(async () => undefined)
+    };
+    vi.stubGlobal("window", { jokoDesktop: original });
+    const owner = downloadDocument();
+    Object.assign(owner.document.defaultView!, { document: owner.document, crypto: globalThis.crypto });
+    const action = { ownerDocument: owner.document, signal: new AbortController().signal };
+    const listed = await listNativeFileOpenApplications("report.txt", action);
+    expect(listed.status).toBe("listed");
+    if (listed.status !== "listed") throw new Error("Expected a native application list.");
+    const application = listed.list.applications[0]!;
+    const bytes = deferred<Blob>();
+    const fetchBlob = vi.fn(async () => ({ ok: true, blob: () => bytes.promise }) as Response);
+    vi.stubGlobal("fetch", fetchBlob);
+    const gateway = await connected();
+    const pending = gateway.openArtifactFileWithApplication("shared", "report.txt", 12, listed.list, application, action);
+    await vi.waitFor(() => expect(fetchBlob).toHaveBeenCalledOnce());
+    const replacement = { ...original, openFileWithApp: vi.fn<typeof openFileWithApp>() };
+    vi.stubGlobal("window", { jokoDesktop: replacement });
+    bytes.resolve(new Blob(["report bytes"], { type: "text/plain" }));
+    await expect(pending).resolves.toEqual({ status: "opened" });
+    expect(openFileWithApp).toHaveBeenCalledOnce();
+    expect(replacement.openFileWithApp).not.toHaveBeenCalled();
+    expect(openFileWithApp.mock.calls[0]?.[0]).toEqual({
+      requestId: expect.any(String),
+      listOccurrence: listed.list.listOccurrence,
+      appId: application.appId,
+      file: { name: "report.txt", mediaType: "text/plain", bytes: expect.any(Uint8Array) }
+    });
+    expect(openFileWithApp.mock.calls[0]?.[0]).not.toHaveProperty("path");
+    retireNativeFileOpenApplicationList(listed.list);
+    expect(retireOpenWithApps).toHaveBeenCalledExactlyOnceWith(listed.list.listOccurrence);
+    const fetchCount = fetchBlob.mock.calls.length;
+    await expect(gateway.openArtifactFileWithApplication("shared", "report.txt", 12, listed.list, application, action)).resolves.toEqual({ status: "unavailable" });
+    expect(fetchBlob).toHaveBeenCalledTimes(fetchCount);
     gateway.disconnect();
   });
   it("reveals an opaque Artifact identity through the captured native host without retrieving bytes or accepting a path", async () => {
@@ -204,9 +261,13 @@ async function connected(beforeTicket?: (signal: AbortSignal) => Promise<void>) 
   const transport = {
     unary: vi.fn(async (method: any, signal: AbortSignal) => {
       if (method.localName === "getBlobDownloadTicket") await beforeTicket?.(signal);
-      const message = method.localName === "getSnapshot"
-        ? create(GetSnapshotResponseSchema, { snapshot: create(SnapshotSchema, { generation: 1n, resumeCursor: { generation: 1n, sequence: 0n } }) })
-        : create(GetBlobDownloadTicketResponseSchema, { ticket: { ticketId: "ticket", blobId: "shared", direction: TransferDirection.DOWNLOAD, relativeEndpoint: "/blob/shared" } });
+      const message = method.localName === "getConnection"
+        ? create(GetConnectionResponseSchema, { connection: { connectionId: "owner", deviceId: "device" } })
+        : method.localName === "getDevice"
+          ? create(GetDeviceResponseSchema, { device: { deviceId: "device", kind: DeviceKind.WEB } })
+          : method.localName === "getSnapshot"
+            ? create(GetSnapshotResponseSchema, { snapshot: create(SnapshotSchema, { generation: 1n, resumeCursor: { generation: 1n, sequence: 0n } }) })
+            : create(GetBlobDownloadTicketResponseSchema, { ticket: { ticketId: "ticket", blobId: "shared", direction: TransferDirection.DOWNLOAD, relativeEndpoint: "/blob/shared" } });
       return { stream: false, service: method.parent, method, header: new Headers(), trailer: new Headers(), message };
     }),
     stream: vi.fn(async (method: any) => ({ stream: true, service: method.parent, method, header: new Headers(), trailer: new Headers(), message: idleStream() }))

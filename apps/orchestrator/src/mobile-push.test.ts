@@ -130,7 +130,7 @@ describe("mobile push Orchestrator boundary", () => {
       id: "foreign-connection",
       name: "Other iPhone",
       authKeyDigest: "foreign-digest",
-      device: { name: "Other iPhone", kind: "mobile", platform: "ios", appVersion: "1.0.0" }
+      device: { defaultName: "Other iPhone", kind: "mobile", platform: "ios", appVersion: "1.0.0" }
     });
     let authenticated = fixture.connection;
     const connections = {
@@ -253,7 +253,7 @@ async function createFixture(): Promise<{
     id: "mobile-connection",
     name: "iPhone",
     authKeyDigest: "mobile-digest",
-    device: { name: "iPhone", kind: "mobile", platform: "ios", appVersion: "1.0.0" }
+    device: { defaultName: "iPhone", kind: "mobile", platform: "ios", appVersion: "1.0.0" }
   });
   return {
     store,

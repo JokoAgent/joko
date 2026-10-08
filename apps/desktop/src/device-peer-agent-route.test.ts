@@ -52,6 +52,7 @@ describe("Desktop Device peer agent route", () => {
       },
       signal: new AbortController().signal,
       readAuthKey: async () => AUTH_KEY,
+      readDefaultDeviceName: () => "Native Desktop",
       readRouteAuthorization: async () => AUTH_KEY,
       isAuthorityCurrent: () => true,
       port: {
@@ -101,6 +102,7 @@ describe("Desktop Device peer agent route", () => {
         expect(hello.targetDeviceId).toBe(CONNECTION.deviceId);
         expect(hello.routeGeneration).toBe(0n);
         expect(hello.payload.case).toBe("hello");
+        expect(hello.payload.case === "hello" && hello.payload.value.deviceNameSource?.defaultDisplayName).toBe("Native Desktop");
 
         yield accepted(hello, 7n);
         yield create(OpenDevicePeerAgentRouteResponseSchema, {
@@ -151,6 +153,7 @@ describe("Desktop Device peer agent route", () => {
         ordering.push("credential");
         return AUTH_KEY;
       },
+      readDefaultDeviceName: () => " Native Desktop ",
       async readRouteAuthorization(profileId) {
         expect(profileId).toBe(CONNECTION.profileId);
         ordering.push("route-authorization");
@@ -249,6 +252,7 @@ describe("Desktop Device peer agent route", () => {
       connection: CONNECTION,
       executor,
       signal: new AbortController().signal,
+      readDefaultDeviceName: () => "Native Desktop",
       readAuthKey: async () => AUTH_KEY,
       readRouteAuthorization: async () => ROUTE_AUTHORIZATION,
       isAuthorityCurrent: () => true,
@@ -292,6 +296,7 @@ describe("Desktop Device peer agent route", () => {
         connection: CONNECTION,
         executor,
         signal: new AbortController().signal,
+        readDefaultDeviceName: () => "Native Desktop",
         readAuthKey: async () => AUTH_KEY,
         readRouteAuthorization: async () => ROUTE_AUTHORIZATION,
         isAuthorityCurrent: () => true,

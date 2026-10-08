@@ -19,7 +19,7 @@ describe("mobile push durable boundary", () => {
       id: "mobile-connection",
       name: "iPhone",
       authKeyDigest: "mobile-auth-digest",
-      device: { name: "iPhone", kind: "mobile", platform: "iOS", appVersion: "1.0.0" },
+      device: { defaultName: "iPhone", kind: "mobile", platform: "iOS", appVersion: "1.0.0" },
       pairedAt: 10
     });
     const device = store.getDevice(connection.deviceId);
@@ -65,6 +65,22 @@ describe("mobile push durable boundary", () => {
         type: "message_complete",
         role: "assistant",
         blocks: [{ kind: "text", text: "Finished" }]
+      }
+    });
+    store.appendEvent({
+      id: "objective-continuation-message",
+      backendId: "pi",
+      targetId: "target-1",
+      sessionId: "session-1",
+      runId: "push-run",
+      generation: 0,
+      emittedAt: 1_250,
+      traceId: "push:objective-continuation",
+      payload: {
+        type: "message_complete",
+        role: "assistant",
+        blocks: [{ kind: "text", text: "Internal objective output" }],
+        objectiveContinuation: { ownerGeneration: 1, turn: 1 }
       }
     });
     store.appendEvent({
@@ -188,7 +204,7 @@ describe("mobile push durable boundary", () => {
       id: "android-connection",
       name: "Android",
       authKeyDigest: "android-auth-digest",
-      device: { name: "Android", kind: "mobile", platform: "android", appVersion: "1.0.0" }
+      device: { defaultName: "Android", kind: "mobile", platform: "android", appVersion: "1.0.0" }
     });
     const androidDevice = store.getDevice(android.deviceId);
     expect(() => store.putMobilePushRegistration({
@@ -209,7 +225,7 @@ describe("mobile push durable boundary", () => {
       id: "ios-connection",
       name: "iPhone",
       authKeyDigest: "ios-auth-digest",
-      device: { name: "iPhone", kind: "mobile", platform: "ios", appVersion: "1.0.0" }
+      device: { defaultName: "iPhone", kind: "mobile", platform: "ios", appVersion: "1.0.0" }
     });
     const iosDevice = store.getDevice(ios.deviceId);
     expect(() => store.putMobilePushRegistration({

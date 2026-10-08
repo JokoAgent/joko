@@ -26,7 +26,7 @@ export interface DesktopBootstrapRequest {
   readonly previousAuthKey: string | null;
   readonly issuedAt: number;
   readonly expiresAt: number;
-  readonly deviceName: string;
+  readonly defaultDeviceName: string;
   readonly platform: string;
   readonly appVersion: string;
 }
@@ -72,7 +72,7 @@ export interface DesktopBootstrapCommitted {
 export interface TrustedDesktopConnectionInput {
   readonly desktopInstanceId: string;
   readonly desktopDeviceId: string;
-  readonly deviceName: string;
+  readonly defaultDeviceName: string;
   readonly platform: string;
   readonly appVersion: string;
   readonly previousConnectionId?: string;
@@ -99,7 +99,7 @@ interface DesktopBootstrapRequestDependencies {
  */
 export function createDesktopBootstrapRequest(input: {
   readonly parentPid: number;
-  readonly deviceName: string;
+  readonly defaultDeviceName: string;
   readonly platform: string;
   readonly appVersion: string;
   readonly deviceId: string;
@@ -129,7 +129,7 @@ export function createDesktopBootstrapRequest(input: {
     previousAuthKey: input.previousConnection?.authKey ?? null,
     issuedAt: now,
     expiresAt: now + ttlMs,
-    deviceName: input.deviceName,
+    defaultDeviceName: input.defaultDeviceName,
     platform: input.platform,
     appVersion: input.appVersion
   };
@@ -161,7 +161,7 @@ export class DesktopBootstrapGrant {
       previousConnectionId: request.previousConnectionId,
       issuedAt: request.issuedAt,
       expiresAt: request.expiresAt,
-      deviceName: request.deviceName,
+      defaultDeviceName: request.defaultDeviceName,
       platform: request.platform,
       appVersion: request.appVersion
     };
@@ -219,7 +219,7 @@ export class DesktopBootstrapGrant {
         result = input.issueConnection({
           desktopInstanceId: this.request.instanceId,
           desktopDeviceId: this.request.deviceId,
-          deviceName: this.request.deviceName,
+          defaultDeviceName: this.request.defaultDeviceName,
           platform: this.request.platform,
           appVersion: this.request.appVersion,
           desktopHostAuthKey,
@@ -421,7 +421,7 @@ export function encodeDesktopBootstrapRequestFrame(value: DesktopBootstrapReques
     previousAuthKey: request.previousAuthKey,
     issuedAt: request.issuedAt,
     expiresAt: request.expiresAt,
-    deviceName: request.deviceName,
+    defaultDeviceName: request.defaultDeviceName,
     platform: request.platform,
     appVersion: request.appVersion
   });
@@ -506,7 +506,7 @@ export function parseDesktopBootstrapRequest(value: unknown): DesktopBootstrapRe
   if (!isExactRecord(value, [
     "kind", "protocolVersion", "instanceId", "deviceId", "parentPid", "capability", "previousConnectionId",
     "previousAuthKey", "issuedAt", "expiresAt",
-    "deviceName", "platform", "appVersion"
+    "defaultDeviceName", "platform", "appVersion"
   ])) throw invalidRequest();
   if (
     value["kind"] !== REQUEST_KIND ||
@@ -518,7 +518,7 @@ export function parseDesktopBootstrapRequest(value: unknown): DesktopBootstrapRe
     !validOptionalPreviousConnection(value["previousConnectionId"], value["previousAuthKey"]) ||
     !validTimestamp(value["issuedAt"]) ||
     !validTimestamp(value["expiresAt"]) ||
-    typeof value["deviceName"] !== "string" || !validBoundedText(value["deviceName"], 128) ||
+    typeof value["defaultDeviceName"] !== "string" || !validBoundedText(value["defaultDeviceName"], 128) ||
     typeof value["platform"] !== "string" || !validBoundedText(value["platform"], 64) ||
     typeof value["appVersion"] !== "string" || !validBoundedText(value["appVersion"], 64)
   ) throw invalidRequest();

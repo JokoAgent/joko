@@ -33,6 +33,18 @@ describe("public route contract", () => {
     expect(routeFromHash("#/tasks/session-1")).toEqual({ kind: "session", sessionId: "session-1" });
   });
 
+  it("carries only one bounded recommendation nonce on its two continuation routes", () => {
+    const nonce = "12345678-abcd-4abc-8abc-123456789abc";
+    for (const route of [
+      { kind: "newSession", targetId: "target", recommendationNonce: nonce } as const,
+      { kind: "tools", extensionId: "extension_0123456789abcdef0123456789abcdef", recommendationNonce: nonce } as const
+    ]) expect(routeFromHash(appRouteHash(route))).toEqual(route);
+    for (const value of ["bad", ` ${nonce}`, `${nonce}&recommendation=${nonce}`]) {
+      expect(routeFromHash(`#/tasks/new?recommendation=${value}`)).toEqual({ kind: "newSession" });
+    }
+    expect(routeFromHash(`#/tools?recommendation=${nonce}`)).toEqual({ kind: "tools" });
+  });
+
   it("keeps message focus scoped to a task and strips stale URL state when sharing", () => {
     expect(routeFromHash("#/tasks/task%2Fone?event=event%2F9&message=entry%3A42")).toEqual({
       kind: "session",

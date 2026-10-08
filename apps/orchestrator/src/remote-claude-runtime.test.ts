@@ -755,6 +755,8 @@ function createFixture(options: FixtureOptions = {}) {
       : { kind: "ssh", hostTargetId: "target-claude", hostId: "host-a", workspaceRoot }
   };
   const host: RemoteHostRecord = {
+    autoConnect: false,
+    autoConnectRevision: 1n,
     ownerId: "owner-a",
     targetId: target.id,
     id: "host-a",

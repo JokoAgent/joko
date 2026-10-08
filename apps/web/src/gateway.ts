@@ -3,6 +3,7 @@ import { createClient, ConnectError, Code, type Interceptor, type Transport } fr
 import { createConnectTransport } from "@connectrpc/connect-web";
 import { createTerminalGateway } from "./terminal-gateway.js";
 import { createSimulatorViewerGateway } from "./simulator-viewer-gateway.js";
+import { normalizeExtensionRecommendation } from "./extension-suggestion-handoff.js";
 import { UsageReportGroup } from "@joko/contracts";
 import { projectVoiceInputSaucSettings, protoVoiceInputSaucSettings, type VoiceInputRecognitionContextView } from "@joko/contracts";
 import { nextVoiceDictionaryWatchSequence, projectVoiceDictionaryPeerStatus, readVoiceDictionaryPeerInvitation, type VoiceDictionaryPeerListener, type VoiceDictionaryPeerStatusView } from "@joko/contracts";
@@ -101,6 +102,8 @@ import {
   DevicePeerDirectoryKind,
   DevicePeerService,
   DeviceKind,
+  DeviceNameSourceSchema,
+  type DeviceNameSource,
   DevicePresenceState,
   ConnectionState,
   DiagnosticLevel,
@@ -178,6 +181,9 @@ import {
   McpServerState,
   McpTransport,
   NativeSessionStartSchema,
+  ObjectiveService,
+  ObjectiveLifecycleAction as ProtoObjectiveLifecycleAction,
+  ObjectiveStatus as ProtoObjectiveStatus,
   OperationService,
   OperationState,
   OperationMutationSchema,
@@ -443,6 +449,8 @@ import {
   type ModelPriceQuote as ProtoModelPriceQuote,
   type NativeSessionCandidate,
   type NativeSessionCatalogEntry,
+  type Objective as ProtoObjective,
+  type ObjectiveLifecycleEvent as ProtoObjectiveLifecycleEvent,
   type Operation,
   type ProviderDescriptor,
   type ProviderConfiguration,
@@ -539,7 +547,9 @@ import {
   copyNativeArtifactFile,
   NATIVE_FILE_COPY_MAXIMUM_BYTES,
   NATIVE_FILE_OPEN_MAXIMUM_BYTES,
+  nativeFileOpenApplicationAvailable,
   openNativeArtifactFile,
+  openNativeArtifactFileWithApplication,
   revealNativeArtifactSource
 } from "./native-file-actions.js";
 import type {
@@ -656,6 +666,10 @@ import type {
   WeChatMessagingConfigurationView,
   SlackMessagingConfigurationView,
   OperationApi,
+  ObjectiveLimitsView,
+  ObjectiveUpdatePatchView,
+  ObjectiveView,
+  ObjectiveWatchUpdateView,
   PartnerCapabilitiesView,
   PartnerActivityView,
   PartnerDelegationStatusView,
@@ -815,6 +829,7 @@ import type {
   TimelineHistoryPageView,
   TimelineItemView,
   TimelineMessageUsageView,
+  TimelineObjectiveLifecycleView,
   UsageCurrencyTotalView,
   UsageHistorySummaryView,
   UsageHistoryView,
@@ -1009,6 +1024,10 @@ type LocalUserInputMatcher = (event: Event) => boolean;
 // Retain exact attempts across reconnects and uncertain responses for this
 // renderer lifetime. Only operation and connection identities enter this map.
 const localUserInputOperations = new Map<string, LocalUserInputOperation>();
+// An uncertain device-name attempt keeps only its public receipt identity.
+// Reconnecting the same authenticated owner may read that receipt, never resend
+// a new business operation because a displayed name happens to match.
+const deviceNameOperationIds = new Map<string, string>();
 
 class ConnectOrchestratorGateway implements OrchestratorGateway {
   readonly #profile: ConnectionProfile | undefined;
@@ -1038,6 +1057,8 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
   }
 
   async pair(origin: string, humanCode: string, deviceName: string): Promise<PairingOutcome> {
+    const desktop = desktopAvailable();
+    const deviceNameSource = desktop ? await readDesktopDeviceNameSource() : undefined;
     // Identity discovery must never carry a saved bearer. Only after the
     // anonymous response matches the profile's durable node identity may a
     // credentialed transport be created for same-device pairing.
@@ -1051,7 +1072,8 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     try {
       const challengeResponse = await client.beginPairing({
         deviceDisplayName: deviceName,
-        deviceKind: desktopAvailable() ? DeviceKind.DESKTOP : DeviceKind.WEB,
+        deviceKind: desktop ? DeviceKind.DESKTOP : DeviceKind.WEB,
+        ...(deviceNameSource === undefined ? {} : { deviceNameSource }),
         platform: navigator.platform || "web",
         appVersion: APP_VERSION
       });
@@ -1069,7 +1091,8 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
       challengeId,
       humanCode: humanCode.trim(),
       deviceDisplayName: deviceName,
-      deviceKind: desktopAvailable() ? DeviceKind.DESKTOP : DeviceKind.WEB,
+      deviceKind: desktop ? DeviceKind.DESKTOP : DeviceKind.WEB,
+      ...(deviceNameSource === undefined ? {} : { deviceNameSource }),
       platform: navigator.platform || "web",
       appVersion: APP_VERSION,
       ...(reusableDeviceId === undefined ? {} : { deviceId: reusableDeviceId })
@@ -1739,9 +1762,13 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
   private async loadSnapshot(): Promise<void> {
     const transport = this.requireTransport();
     const signal = this.#abort?.signal;
+    const currentDeviceNameSource = await this.currentDeviceNameSource(transport, signal);
+    signal?.throwIfAborted();
     const eventClient = createClient(EventService, transport);
     const [response, managedModelRuntimes] = await Promise.all([
-      eventClient.getSnapshot({ scope: OWNER_SCOPE }, signal === undefined ? undefined : { signal }),
+      eventClient.getSnapshot({ scope: OWNER_SCOPE,
+        ...(currentDeviceNameSource === undefined ? {} : { currentDeviceNameSource })
+      }, signal === undefined ? undefined : { signal }),
       loadManagedModelRuntimes(transport, signal)
     ]);
     if (response.snapshot === undefined) throw new GatewayError("Orchestrator returned an empty snapshot.");
@@ -1781,6 +1808,28 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     this.#rawSnapshot = raw;
     this.#snapshot = mapped;
     this.#callbacks.onSnapshot?.(mapped);
+  }
+
+  private async currentDeviceNameSource(transport: Transport, signal?: AbortSignal): Promise<DeviceNameSource | undefined> {
+    if (!desktopAvailable()) return undefined;
+    const profile = this.#profile;
+    if (profile === undefined) throw new GatewayError("A connected device identity is required.");
+    let device = this.#rawSnapshot?.devices.find((entry) => entry.deviceId === profile.deviceId);
+    if (device === undefined) {
+      const client = createClient(ConnectionService, transport);
+      const connection = (await client.getConnection({ connectionId: profile.id }, { signal })).connection;
+      signal?.throwIfAborted();
+      if (connection?.connectionId !== profile.id || connection.deviceId !== profile.deviceId) {
+        throw new GatewayError("The desktop connection does not identify its owning device.");
+      }
+      device = (await client.getDevice({ deviceId: connection.deviceId }, { signal })).device;
+      signal?.throwIfAborted();
+      if (device?.deviceId !== profile.deviceId) throw new GatewayError("The desktop connection has no owning device.");
+    }
+    if (device.kind !== DeviceKind.DESKTOP) return undefined;
+    const source = await readDesktopDeviceNameSource();
+    signal?.throwIfAborted();
+    return source;
   }
 
   async send(sessionId: string, draft: ComposerDraft, admission: { readonly expectedGeneration: bigint }): Promise<void> {
@@ -4392,10 +4441,184 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     }, true, [], scope.signal);
   }
 
-  async listCommands(sessionId: string): Promise<readonly RuntimeCommandView[]> {
-    const client = createClient(SessionService, this.requireTransport());
-    const response = await client.listRuntimeCommands({ sessionId }, this.#abort === undefined ? undefined : { signal: this.#abort.signal });
-    return response.commands.map(mapRuntimeCommand);
+  async listCommands(sessionId: string, signal?: AbortSignal): Promise<readonly RuntimeCommandView[]> {
+    const scope = this.captureActionScope(signal);
+    const client = createClient(SessionService, scope.transport);
+    const response = await client.listRuntimeCommands(
+      { sessionId },
+      { signal: scope.signal }
+    );
+    scope.signal.throwIfAborted();
+    const commands = response.commands.map(mapRuntimeCommand);
+    if (commands.some((command) => command.sessionId !== undefined && command.sessionId !== sessionId)) {
+      throw new GatewayError("Orchestrator returned a runtime command for a different task.");
+    }
+    return commands;
+  }
+
+  async getObjective(sessionId: string, signal?: AbortSignal): Promise<ObjectiveView | undefined> {
+    requireObjectiveSessionId(sessionId);
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ObjectiveService, scope.transport).getObjective(
+      { sessionId },
+      { signal: scope.signal }
+    );
+    scope.signal.throwIfAborted();
+    return response.objective === undefined ? undefined : mapObjective(response.objective, sessionId);
+  }
+
+  async *watchObjective(
+    sessionId: string,
+    afterRevision?: bigint,
+    signal?: AbortSignal
+  ): AsyncIterable<ObjectiveWatchUpdateView> {
+    requireObjectiveSessionId(sessionId);
+    if (afterRevision !== undefined && afterRevision < 1n) {
+      throw new GatewayError("An Objective watch requires a valid revision.");
+    }
+    const request = new AbortController();
+    const requestSignal = signal === undefined ? request.signal : AbortSignal.any([signal, request.signal]);
+    const scope = this.captureActionScope(requestSignal);
+    try {
+      const stream = createClient(ObjectiveService, scope.transport).watchObjective({
+        sessionId,
+        ...(afterRevision === undefined ? {} : { afterRevision: { value: afterRevision } })
+      }, { signal: scope.signal });
+      for await (const response of stream) {
+        scope.signal.throwIfAborted();
+        if (response.objective !== undefined && response.cleared) {
+          throw new GatewayError("Orchestrator returned an ambiguous Objective update.");
+        }
+        if (response.objective !== undefined) {
+          yield { kind: "objective", objective: mapObjective(response.objective, sessionId) };
+        } else if (response.cleared) {
+          yield { kind: "cleared" };
+        }
+      }
+    } finally {
+      request.abort();
+    }
+  }
+
+  async setObjective(
+    sessionId: string,
+    expectedSessionGeneration: bigint,
+    text: string,
+    limits: ObjectiveLimitsView = {},
+    signal?: AbortSignal
+  ): Promise<ObjectiveView> {
+    requireObjectiveSessionId(sessionId);
+    if (expectedSessionGeneration < 1n) throw new GatewayError("An Objective requires a valid task generation.");
+    const objectiveText = requireObjectiveText(text);
+    const normalizedLimits = normalizeObjectiveLimits(limits);
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ObjectiveService, scope.transport).setObjective({
+      requestId: randomUuid(),
+      sessionId,
+      text: objectiveText,
+      limits: {
+        ...(normalizedLimits.tokenBudget === undefined ? {} : { tokenBudget: BigInt(normalizedLimits.tokenBudget) }),
+        ...(normalizedLimits.maximumTurns === undefined ? {} : { maximumTurns: normalizedLimits.maximumTurns }),
+        ...(normalizedLimits.noProgressTurnLimit === undefined ? {} : { noProgressTurnLimit: normalizedLimits.noProgressTurnLimit })
+      },
+      expectedSessionGeneration
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    const objective = mapObjectiveMutation(response.objective, sessionId);
+    if (objective.text !== objectiveText || objective.sessionGeneration !== expectedSessionGeneration
+      || !objectiveLimitsEqual(objective, normalizedLimits)) {
+      throw new GatewayError("Orchestrator returned a mismatched Objective.");
+    }
+    return objective;
+  }
+
+  async updateObjective(
+    current: ObjectiveView,
+    patch: ObjectiveUpdatePatchView,
+    signal?: AbortSignal
+  ): Promise<ObjectiveView> {
+    requireObjectiveMutationOwner(current);
+    if (!objectivePatchHasUpdate(patch)) throw new GatewayError("An Objective update requires a change.");
+    const text = patch.text === undefined ? undefined : requireObjectiveText(patch.text);
+    const tokenBudgetUpdate = !Object.prototype.hasOwnProperty.call(patch, "tokenBudget")
+      ? { case: undefined } as const
+      : patch.tokenBudget === null
+        ? { case: "clearTokenBudget", value: true } as const
+        : { case: "tokenBudget", value: BigInt(requireObjectiveLimit(patch.tokenBudget, "token budget", Number.MAX_SAFE_INTEGER)) } as const;
+    const maximumTurnsUpdate = !Object.prototype.hasOwnProperty.call(patch, "maximumTurns")
+      ? { case: undefined } as const
+      : patch.maximumTurns === null
+        ? { case: "clearMaximumTurns", value: true } as const
+        : { case: "maximumTurns", value: requireObjectiveLimit(patch.maximumTurns, "maximum turns", 10_000) } as const;
+    const noProgressTurnLimitUpdate = !Object.prototype.hasOwnProperty.call(patch, "noProgressTurnLimit")
+      ? { case: undefined } as const
+      : patch.noProgressTurnLimit === null
+        ? { case: "clearNoProgressTurnLimit", value: true } as const
+        : { case: "noProgressTurnLimit", value: requireObjectiveLimit(patch.noProgressTurnLimit, "no-progress turn limit", 1_000) } as const;
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ObjectiveService, scope.transport).updateObjective({
+      requestId: randomUuid(),
+      sessionId: current.sessionId,
+      expectedRevision: { value: current.revision },
+      expectedOwnerGeneration: current.ownerGeneration,
+      ...(text === undefined ? {} : { text }),
+      tokenBudgetUpdate,
+      maximumTurnsUpdate,
+      noProgressTurnLimitUpdate
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    const objective = mapObjectiveMutation(response.objective, current.sessionId);
+    if (objective.ownerGeneration < current.ownerGeneration || objective.sessionGeneration !== current.sessionGeneration
+      || objective.revision <= current.revision
+      || text !== undefined && objective.text !== text
+      || Object.prototype.hasOwnProperty.call(patch, "tokenBudget") && objective.tokenBudget !== (patch.tokenBudget ?? undefined)
+      || Object.prototype.hasOwnProperty.call(patch, "maximumTurns") && objective.maximumTurns !== (patch.maximumTurns ?? undefined)
+      || Object.prototype.hasOwnProperty.call(patch, "noProgressTurnLimit") && objective.noProgressTurnLimit !== (patch.noProgressTurnLimit ?? undefined)) {
+      throw new GatewayError("Orchestrator returned a mismatched Objective update.");
+    }
+    return objective;
+  }
+
+  async pauseObjective(current: ObjectiveView, reason: string, signal?: AbortSignal): Promise<ObjectiveView> {
+    requireObjectiveMutationOwner(current);
+    const normalizedReason = reason.trim();
+    if (normalizedReason.length === 0) throw new GatewayError("An Objective pause reason is required.");
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ObjectiveService, scope.transport).pauseObjective({
+      requestId: randomUuid(),
+      sessionId: current.sessionId,
+      expectedRevision: { value: current.revision },
+      expectedOwnerGeneration: current.ownerGeneration,
+      reason: normalizedReason
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return requireObjectiveMutationResult(response.objective, current, "paused");
+  }
+
+  async resumeObjective(current: ObjectiveView, signal?: AbortSignal): Promise<ObjectiveView> {
+    requireObjectiveMutationOwner(current);
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ObjectiveService, scope.transport).resumeObjective({
+      requestId: randomUuid(),
+      sessionId: current.sessionId,
+      expectedRevision: { value: current.revision },
+      expectedOwnerGeneration: current.ownerGeneration
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return requireObjectiveMutationResult(response.objective, current);
+  }
+
+  async clearObjective(current: ObjectiveView, signal?: AbortSignal): Promise<void> {
+    requireObjectiveMutationOwner(current);
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ObjectiveService, scope.transport).clearObjective({
+      requestId: randomUuid(),
+      sessionId: current.sessionId,
+      expectedRevision: { value: current.revision },
+      expectedOwnerGeneration: current.ownerGeneration
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    if (!response.cleared) throw new GatewayError("Orchestrator did not confirm that the Objective was cleared.");
   }
 
   async listSessionResources(sessionId: string, signal?: AbortSignal): Promise<readonly SessionResourceView[]> {
@@ -6070,10 +6293,82 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     await this.submit({ case: "revokeDevice", value: { deviceId, reason: "Revoked by owner" } }, true);
   }
 
-  async renameDevice(deviceId: string, name: string): Promise<void> {
+  async renameDevice(deviceId: string, name: string, expectedRevision: bigint): Promise<DeviceView> {
     const displayName = name.trim();
     if (displayName.length === 0) throw new GatewayError("A device name is required.");
-    await this.submit({ case: "renameDevice", value: { deviceId, displayName } }, true);
+    return this.updateDeviceName(deviceId, expectedRevision, displayName);
+  }
+
+  async resetDeviceName(deviceId: string, expectedRevision: bigint): Promise<DeviceView> {
+    return this.updateDeviceName(deviceId, expectedRevision);
+  }
+
+  private deviceNameReceiptKey(deviceId: string): string {
+    if (this.#profile === undefined || deviceId.trim().length === 0) throw new GatewayError("A connected device identity is required.");
+    return `${this.#profile.serverId}\u0000${this.#profile.origin}\u0000${this.#profile.id}\u0000${deviceId}`;
+  }
+
+  hasPendingDeviceNameUpdate(deviceId: string): boolean {
+    return deviceNameOperationIds.has(this.deviceNameReceiptKey(deviceId));
+  }
+
+  private async updateDeviceName(deviceId: string, expectedRevision: bigint, manualDisplayName?: string): Promise<DeviceView> {
+    const scope = this.captureActionScope();
+    const receiptKey = this.deviceNameReceiptKey(deviceId);
+    if (deviceNameOperationIds.has(receiptKey)) throw deviceNameUnconfirmed();
+    if (expectedRevision <= 0n) throw new GatewayError("The device name update requires its current revision.");
+    let received: Operation | undefined;
+    try {
+      const operation = await this.submit(manualDisplayName === undefined
+        ? { case: "resetDeviceName", value: { deviceId } }
+        : { case: "renameDevice", value: { deviceId, displayName: manualDisplayName } }, true, [
+        { entity: { kind: EntityKind.DEVICE, id: deviceId }, expectedRevision: { value: expectedRevision } }
+      ], scope.signal, (operationId, result) => {
+        deviceNameOperationIds.set(receiptKey, operationId);
+        received = result;
+      });
+      const result = deviceNameOutcome(operation, deviceId, manualDisplayName);
+      deviceNameOperationIds.delete(receiptKey);
+      return result;
+    } catch (error) {
+      if ((received !== undefined && failedDeviceNameOperation(received)) || (
+        received === undefined && error instanceof ConnectError
+        && [Code.InvalidArgument, Code.PermissionDenied, Code.Unauthenticated, Code.NotFound, Code.FailedPrecondition].includes(error.code)
+      )) {
+        deviceNameOperationIds.delete(receiptKey);
+        throw error;
+      }
+      if (!deviceNameOperationIds.has(receiptKey)) throw error;
+      throw deviceNameUnconfirmed(error);
+    }
+  }
+
+  async checkDeviceNameUpdate(deviceId: string): Promise<DeviceView> {
+    const scope = this.captureActionScope();
+    const receiptKey = this.deviceNameReceiptKey(deviceId);
+    const operationId = deviceNameOperationIds.get(receiptKey);
+    if (operationId === undefined) throw new GatewayError("There is no pending device name receipt.");
+    try {
+      const response = await createClient(OperationService, scope.transport).getOperation({ operationId }, { signal: scope.signal });
+      scope.signal.throwIfAborted();
+      const operation = response.operation;
+      if (operation === undefined || operation.operationId !== operationId || operation.connectionId !== this.#profile?.id) throw deviceNameUnconfirmed();
+      if (failedDeviceNameOperation(operation)) {
+        deviceNameOperationIds.delete(receiptKey);
+        throw new GatewayError(operation.error?.message || "The device name update failed.", {
+          ...(operation.error?.code ? { code: operation.error.code } : {})
+        });
+      }
+      const mutation = operation.mutation?.payload;
+      if ((mutation?.case !== "renameDevice" && mutation?.case !== "resetDeviceName") || mutation.value.deviceId !== deviceId) throw deviceNameUnconfirmed();
+      const result = deviceNameOutcome(operation, deviceId, mutation.case === "renameDevice" ? mutation.value.displayName : undefined);
+      deviceNameOperationIds.delete(receiptKey);
+      void this.refresh().catch((error: unknown) => { if (!scope.signal.aborted) this.#callbacks.onError?.(normalizeError(error)); });
+      return result;
+    } catch (error) {
+      if (!deviceNameOperationIds.has(receiptKey)) throw error;
+      throw deviceNameUnconfirmed(error);
+    }
   }
 
   async setDeviceRemoteControlEnabled(enabled: boolean): Promise<void> {
@@ -8091,6 +8386,24 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     );
   }
 
+  async setRemoteHostAutoConnect(
+    targetId: string,
+    hostId: string,
+    expectedHostRevision: bigint,
+    expectedAutoConnectRevision: bigint,
+    enabled: boolean
+  ): Promise<RemoteHostView> {
+    const client = createClient(RemoteHostService, this.requireTransport());
+    const response = await client.setRemoteHostAutoConnect({
+      targetId,
+      hostId,
+      expectedHostRevision: { value: expectedHostRevision },
+      expectedAutoConnectRevision: { value: expectedAutoConnectRevision },
+      enabled
+    }, remoteHostRpcOptions(this.#abort?.signal));
+    return requireRemoteHost(response.host);
+  }
+
   async connectRemoteHost(targetId: string, hostId: string, expectedRevision: bigint): Promise<RemoteHostView> {
     const client = createClient(RemoteHostService, this.requireTransport());
     const response = await client.connectRemoteHost(
@@ -8914,6 +9227,21 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     return openNativeArtifactFile(blob, fileName, ownedContext, host);
   }
 
+  async openArtifactFileWithApplication(
+    blobId: string,
+    fileName: string,
+    byteSize: number,
+    list: import("./native-file-actions.js").NativeFileOpenApplicationList,
+    application: import("./native-file-actions.js").NativeFileOpenApplication,
+    context: ArtifactDownloadContext
+  ): Promise<import("./native-file-actions.js").NativeFileOpenOutcome> {
+    const ownedContext = this.artifactDownloadContext(context);
+    if (!nativeFileOpenApplicationAvailable(list, application)) return { status: "unavailable" };
+    if (!Number.isSafeInteger(byteSize) || byteSize < 0 || byteSize > NATIVE_FILE_OPEN_MAXIMUM_BYTES) return { status: "failed", reason: "capacity" };
+    const blob = await this.fetchArtifact(blobId, ownedContext.signal);
+    return openNativeArtifactFileWithApplication(blob, fileName, list, application, ownedContext);
+  }
+
   async revealArtifactSource(sessionId: string, artifactId: string, context: ArtifactDownloadContext): Promise<import("./native-file-actions.js").NativeArtifactSourceRevealOutcome> {
     const ownedContext = this.artifactDownloadContext(context);
     const host = captureNativeArtifactSourceReveal();
@@ -9063,7 +9391,8 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     payload: MutationPayload,
     waitForTerminal = false,
     preconditions: readonly MutationPrecondition[] = [],
-    callerSignal?: AbortSignal
+    callerSignal?: AbortSignal,
+    observeReceipt?: (operationId: string, operation?: Operation) => void
   ): Promise<Operation> {
     callerSignal?.throwIfAborted();
     const transport = this.requireTransport();
@@ -9078,6 +9407,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     const options = signal === undefined ? undefined : { signal };
     const submitOnce = () => {
       signal?.throwIfAborted();
+      observeReceipt?.(operationId);
       if (payload.case === "sendInput" && this.#profile !== undefined) {
         const generation = request.mutation.preconditions.find((precondition) =>
           precondition.entity?.kind === EntityKind.SESSION
@@ -9108,6 +9438,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     callerSignal?.throwIfAborted();
     if (response.operation === undefined) throw new GatewayError("Orchestrator accepted no operation.");
     let operation = response.operation;
+    observeReceipt?.(operationId, operation);
     if (waitForTerminal && !TERMINAL_OPERATION_STATES.has(operation.state)) {
       const timeout = AbortSignal.timeout(OPERATION_TERMINAL_WAIT_TIMEOUT_MS);
       for await (const update of client.watchOperation({
@@ -9129,6 +9460,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
         throw new GatewayError("Orchestrator stopped watching the operation before it reached a terminal state.");
       }
     }
+    observeReceipt?.(operationId, operation);
     if (operation.state === OperationState.FAILED || operation.state === OperationState.CONFLICT || operation.state === OperationState.CANCELLED) {
       throw new GatewayError(operation.error?.message || `Operation ${operation.state} failed.`, {
         ...(operation.error?.code ? { code: operation.error.code } : {})
@@ -9403,6 +9735,16 @@ export function projectSnapshotEvent(
       if (connection !== undefined) {
         raw = { ...raw, connections: upsertBy(raw.connections, connection, (value) => value.connectionId) };
         projected = { ...projected, remoteConnections: upsertBy(projected.remoteConnections, mapRemoteConnection(connection), (value) => value.id) };
+      }
+      break;
+    }
+    case "deviceChanged": {
+      const device = kind.value.device;
+      if (device !== undefined) {
+        const previous = raw.devices.find((entry) => entry.deviceId === device.deviceId);
+        if (previous !== undefined && (device.version?.revision?.value ?? 0n) <= (previous.version?.revision?.value ?? 0n)) break;
+        raw = { ...raw, devices: upsertBy(raw.devices, device, (value) => value.deviceId) };
+        projected = { ...projected, devices: upsertBy(projected.devices, mapDevice(device), (value) => value.id) };
       }
       break;
     }
@@ -9875,6 +10217,7 @@ export function projectSnapshotEvent(
     case "recoverableError":
     case "contextRebuilt":
     case "browserActivity":
+    case "objectiveLifecycle":
       break;
     case "nativeSessionChanged":
       // A marker can remove the whole active prefix; only the service owns
@@ -10020,7 +10363,8 @@ function isTimelineEvent(kind: NonNullable<NonNullable<Event["payload"]>["kind"]
     || kind === "runAborted"
     || kind === "recoverableError"
     || kind === "terminalError"
-    || kind === "runtimeRecoveryChanged";
+    || kind === "runtimeRecoveryChanged"
+    || kind === "objectiveLifecycle";
 }
 
 function projectTimelineEvent(
@@ -10069,6 +10413,15 @@ function projectTimelineEvent(
         : existing?.automationOrigin;
       const inputDelivery = uiMessageInputDelivery(kind.value.inputDelivery);
       const inputOperationId = kind.value.role === 1 ? event.identity?.operationId : undefined;
+      const rawObjectiveContinuation = kind.value.objectiveContinuation;
+      if (rawObjectiveContinuation !== undefined && (
+        kind.value.role !== 1
+        || rawObjectiveContinuation.ownerGeneration <= 0n
+        || !Number.isSafeInteger(rawObjectiveContinuation.turn)
+        || rawObjectiveContinuation.turn < 1
+      )) {
+        throw new GatewayError("Orchestrator returned an invalid Objective continuation marker.");
+      }
       replaceOrAppend({
         id: kind.value.messageId,
         messageId: kind.value.messageId,
@@ -10092,6 +10445,12 @@ function projectTimelineEvent(
         ...(kind.value.role === 1 && kind.value.automaticContinuation && kind.value.runtimeRecoveryId.trim().length > 0
           ? { automaticContinuation: { recoveryId: kind.value.runtimeRecoveryId } }
           : {}),
+        ...(rawObjectiveContinuation === undefined
+          ? {}
+          : { objectiveContinuation: {
+              ownerGeneration: rawObjectiveContinuation.ownerGeneration,
+              turn: rawObjectiveContinuation.turn
+            } }),
         streaming: kind.value.role !== 1
       });
       break;
@@ -10386,6 +10745,18 @@ function projectTimelineEvent(
           error: mapError(recovery.error, recovery.continuationRunId || recovery.sourceRunId)
         }
       }, (candidate) => candidate.runtimeRecovery?.id === recovery.recoveryId);
+      break;
+    }
+    case "objectiveLifecycle": {
+      const lifecycle = mapObjectiveLifecycle(kind.value);
+      replaceOrAppend({
+        id: event.eventId,
+        sourceEventId: event.eventId,
+        sequence,
+        kind: "objective",
+        createdAt,
+        objectiveLifecycle: lifecycle
+      });
       break;
     }
     case "reviewRunChanged": {
@@ -15468,6 +15839,7 @@ function mapExtensionCatalogEntry(extension: ProtoExtensionCatalogEntry): Extens
     : extension.library.schemaVersion === 1
       ? { schemaVersion: 1 as const }
       : (() => { throw new GatewayError("Orchestrator returned an invalid Extension Library capability."); })();
+  const recommendations = mapExtensionRecommendations(extension.recommendations);
   return {
     id: extension.extensionId,
     revision,
@@ -15505,6 +15877,7 @@ function mapExtensionCatalogEntry(extension: ProtoExtensionCatalogEntry): Extens
       description: command.description,
       sessionId: command.sessionId
     })),
+    ...(recommendations === undefined ? {} : { recommendations }),
     setup: {
       state: extensionSetupState(setup.state),
       ...(setup.attemptId === undefined ? {} : { attemptId: setup.attemptId }),
@@ -15530,6 +15903,57 @@ function mapExtensionCatalogEntry(extension: ProtoExtensionCatalogEntry): Extens
     useSupported: extension.useSupported,
     ...(extension.error === undefined ? {} : { error: extension.error })
   };
+}
+
+function mapExtensionRecommendations(
+  values: ProtoExtensionCatalogEntry["recommendations"]
+): ExtensionCatalogEntryView["recommendations"] {
+  if (values.length === 0) return undefined;
+  if (values.length > 24) throw new GatewayError("Orchestrator returned too many Extension recommendations.");
+  try {
+    const wireProjection = values.map((value) => ({
+      id: value.id,
+      label: value.label,
+      prompt: value.prompt,
+      ...(value.command === undefined ? {} : { command: value.command }),
+      locales: value.locales.map((localized) => ({
+        locale: localized.locale,
+        label: localized.label,
+        prompt: localized.prompt
+      }))
+    }));
+    if (new TextEncoder().encode(JSON.stringify(wireProjection)).byteLength > 65_536) {
+      throw new GatewayError("Orchestrator returned oversized Extension recommendations.");
+    }
+  } catch (error) {
+    if (error instanceof GatewayError) throw error;
+    throw new GatewayError("Orchestrator returned invalid Extension recommendation encoding.");
+  }
+  const ids = new Set<string>();
+  const recommendations: NonNullable<ExtensionCatalogEntryView["recommendations"]>[number][] = [];
+  for (const value of values) {
+    if (ids.has(value.id)) throw new GatewayError("Orchestrator returned duplicate Extension recommendation identities.");
+    const locales: Record<string, { readonly label: string; readonly prompt: string }> = {};
+    const localeIds = new Set<string>();
+    for (const localized of value.locales) {
+      if ((localized.locale !== "en" && localized.locale !== "zh-CN") || localeIds.has(localized.locale)) {
+        throw new GatewayError("Orchestrator returned invalid Extension recommendation locales.");
+      }
+      localeIds.add(localized.locale);
+      locales[localized.locale] = { label: localized.label, prompt: localized.prompt };
+    }
+    const recommendation = normalizeExtensionRecommendation({
+      id: value.id,
+      label: value.label,
+      prompt: value.prompt,
+      ...(value.command === undefined ? {} : { command: value.command }),
+      ...(value.locales.length === 0 ? {} : { locales })
+    });
+    if (recommendation === undefined) throw new GatewayError("Orchestrator returned an invalid Extension recommendation.");
+    ids.add(recommendation.id);
+    recommendations.push(recommendation);
+  }
+  return recommendations;
 }
 
 function mapExtensionMainViewSurface(surface: ProtoExtensionMainViewSurface): ExtensionMainViewSurfaceView {
@@ -16456,6 +16880,9 @@ function mapDevice(device: Device): DeviceView {
   return {
     id: device.deviceId,
     name: device.displayName,
+    defaultDisplayName: device.defaultDisplayName,
+    ...(device.manualDisplayName === undefined ? {} : { manualDisplayName: device.manualDisplayName }),
+    revision: device.version?.revision?.value ?? 0n,
     kind: device.kind === DeviceKind.WEB ? "web" : device.kind === DeviceKind.DESKTOP ? "desktop" : device.kind === DeviceKind.SERVICE ? "service" : device.kind === DeviceKind.MOBILE ? "mobile" : "unknown",
     platform: device.platform,
     appVersion: device.appVersion,
@@ -16464,6 +16891,31 @@ function mapDevice(device: Device): DeviceView {
     presence: device.presence === DevicePresenceState.ONLINE ? "online" : "offline",
     ...(device.lastSeenAt === undefined ? {} : { lastSeenAt: timestampMs(device.lastSeenAt) })
   };
+}
+
+function deviceNameOutcome(operation: Operation, deviceId: string, manualDisplayName?: string): DeviceView {
+  const payload = operation.result?.payload;
+  if (operation.state !== OperationState.SUCCEEDED || payload?.case !== "device" || payload.value.deviceId !== deviceId) {
+    throw new GatewayError("The device name update has no confirmed device outcome.");
+  }
+  const device = payload.value;
+  if (
+    device.defaultDisplayName.trim().length === 0
+    || device.version?.revision === undefined
+    || device.manualDisplayName !== manualDisplayName
+    || device.displayName !== (manualDisplayName ?? device.defaultDisplayName)
+  ) throw new GatewayError("The device name update returned an invalid device outcome.");
+  return mapDevice(device);
+}
+
+function failedDeviceNameOperation(operation: Operation): boolean {
+  return operation.state === OperationState.FAILED || operation.state === OperationState.CONFLICT || operation.state === OperationState.CANCELLED;
+}
+
+function deviceNameUnconfirmed(cause?: unknown): GatewayError {
+  return new GatewayError("The device name update is not confirmed. Check its status before making another change.", {
+    code: "DEVICE_NAME_UNCONFIRMED", cause
+  });
 }
 
 function mapDeviceControlRelation(relation: DeviceControlRelation): DeviceControlRelationView {
@@ -17181,10 +17633,12 @@ function requireRemoteHost(host: ProtoRemoteHost | undefined): RemoteHostView {
 
 function mapRemoteHost(host: ProtoRemoteHost): RemoteHostView {
   const revision = host.revision?.value ?? 0n;
+  const autoConnectRevision = host.autoConnectRevision?.value ?? 0n;
   const status = host.status;
   if (
     host.targetId.trim() === "" || host.hostId.trim() === "" || host.hostname.trim() === "" ||
     host.user.trim() === "" || host.port < 1 || host.port > 65_535 || revision <= 0n ||
+    host.autoConnect === undefined || autoConnectRevision <= 0n ||
     status === undefined || status.changedAt === undefined
   ) throw new GatewayError("Orchestrator returned an incomplete Remote Host.");
   const state = remoteHostStatus(status.state);
@@ -17240,6 +17694,8 @@ function mapRemoteHost(host: ProtoRemoteHost): RemoteHostView {
         failure: { code: remoteHostFailureCode(failure.code), retryable: failure.retryable }
       })
     },
+    autoConnect: host.autoConnect,
+    autoConnectRevision,
     revision
   };
 }
@@ -18223,7 +18679,15 @@ function abortableDelay(milliseconds: number, signal: AbortSignal): Promise<void
 }
 
 function desktopAvailable(): boolean {
-  return "jokoDesktop" in window;
+  return typeof window !== "undefined" && "jokoDesktop" in window;
+}
+
+async function readDesktopDeviceNameSource(): Promise<DeviceNameSource> {
+  const info = await window.jokoDesktop?.appInfo.get();
+  if (info === undefined || typeof info.defaultDeviceName !== "string" || info.defaultDeviceName.trim().length === 0) {
+    throw new GatewayError("The desktop did not provide its default device name.");
+  }
+  return create(DeviceNameSourceSchema, { defaultDisplayName: info.defaultDeviceName });
 }
 
 function payloadCase(event: Event): string | undefined {
@@ -18549,6 +19013,221 @@ function toolResultAttachments(result: any): readonly ArtifactView[] {
     }
   }
   return attachments;
+}
+
+function requireObjectiveSessionId(value: string): void {
+  if (value.trim() === "" || value !== value.trim()) {
+    throw new GatewayError("An Objective requires an exact task ID.");
+  }
+}
+
+function requireObjectiveText(value: string): string {
+  const normalized = value.normalize("NFC").replace(/\r\n?/gu, "\n").trim();
+  if (normalized.length === 0 || [...normalized].length > 32_000 || normalized.includes("\0")) {
+    throw new GatewayError("Objective text must contain between 1 and 32000 safe characters.");
+  }
+  return normalized;
+}
+
+function requireObjectiveLimit(value: number | undefined, label: string, maximum: number): number {
+  if (value === undefined || !Number.isSafeInteger(value) || value < 1 || value > maximum) {
+    throw new GatewayError(`Objective ${label} must be an integer between 1 and ${maximum}.`);
+  }
+  return value;
+}
+
+function normalizeObjectiveLimits(value: ObjectiveLimitsView): ObjectiveLimitsView {
+  return {
+    ...(value.tokenBudget === undefined ? {} : {
+      tokenBudget: requireObjectiveLimit(value.tokenBudget, "token budget", Number.MAX_SAFE_INTEGER)
+    }),
+    ...(value.maximumTurns === undefined ? {} : {
+      maximumTurns: requireObjectiveLimit(value.maximumTurns, "maximum turns", 10_000)
+    }),
+    ...(value.noProgressTurnLimit === undefined ? {} : {
+      noProgressTurnLimit: requireObjectiveLimit(value.noProgressTurnLimit, "no-progress turn limit", 1_000)
+    })
+  };
+}
+
+function objectiveStatus(value: ProtoObjectiveStatus): ObjectiveView["status"] {
+  switch (value) {
+    case ProtoObjectiveStatus.ACTIVE: return "active";
+    case ProtoObjectiveStatus.PAUSED: return "paused";
+    case ProtoObjectiveStatus.BLOCKED: return "blocked";
+    case ProtoObjectiveStatus.COMPLETE: return "complete";
+    case ProtoObjectiveStatus.BUDGET_LIMITED: return "budgetLimited";
+    case ProtoObjectiveStatus.USAGE_LIMITED: return "usageLimited";
+    case ProtoObjectiveStatus.DISPATCH_UNKNOWN: return "dispatchUnknown";
+    default: throw new GatewayError("Orchestrator returned an unknown Objective status.");
+  }
+}
+
+function objectiveLifecycleAction(value: ProtoObjectiveLifecycleAction): TimelineObjectiveLifecycleView["action"] {
+  switch (value) {
+    case ProtoObjectiveLifecycleAction.STARTED: return "started";
+    case ProtoObjectiveLifecycleAction.REPLACED: return "replaced";
+    case ProtoObjectiveLifecycleAction.PAUSED: return "paused";
+    case ProtoObjectiveLifecycleAction.RESUMED: return "resumed";
+    case ProtoObjectiveLifecycleAction.COMPLETED: return "completed";
+    case ProtoObjectiveLifecycleAction.BLOCKED: return "blocked";
+    case ProtoObjectiveLifecycleAction.LIMITED: return "limited";
+    case ProtoObjectiveLifecycleAction.DISPATCH_UNKNOWN: return "dispatchUnknown";
+    case ProtoObjectiveLifecycleAction.CLEARED: return "cleared";
+    default: throw new GatewayError("Orchestrator returned an unknown Objective lifecycle action.");
+  }
+}
+
+function mapObjectiveLifecycle(value: ProtoObjectiveLifecycleEvent): TimelineObjectiveLifecycleView {
+  const action = objectiveLifecycleAction(value.action);
+  const status = value.status === ProtoObjectiveStatus.UNSPECIFIED ? undefined : objectiveStatus(value.status);
+  const tokensUsed = exactSafeUnsignedNumber(value.tokensUsed);
+  const elapsedMs = exactSafeUnsignedNumber(value.elapsedMs);
+  const objectiveText = value.objectiveText;
+  const reason = value.reason;
+  const actionStatusMatches = action === "started" || action === "resumed"
+    ? status === "active"
+    : action === "replaced"
+      ? status !== undefined
+      : action === "paused"
+        ? status === "paused"
+        : action === "completed"
+          ? status === "complete"
+          : action === "blocked"
+            ? status === "blocked"
+            : action === "limited"
+              ? status === "budgetLimited" || status === "usageLimited"
+              : action === "dispatchUnknown"
+                ? status === "dispatchUnknown"
+                : status === undefined;
+  const hasObjectiveText = action === "started" || action === "replaced";
+  const normalizedObjectiveText = hasObjectiveText ? requireObjectiveText(objectiveText) : undefined;
+  if (
+    value.ownerGeneration < 1n
+    || value.ownerGeneration > BigInt(Number.MAX_SAFE_INTEGER)
+    || !Number.isSafeInteger(value.turnsUsed)
+    || value.turnsUsed < 0
+    || value.turnsUsed > 10_000
+    || tokensUsed === undefined
+    || elapsedMs === undefined
+    || !actionStatusMatches
+    || hasObjectiveText && normalizedObjectiveText !== objectiveText
+    || !hasObjectiveText && objectiveText !== ""
+    || reason !== reason.trim()
+    || reason.includes("\0")
+    || [...reason].length > 2_048
+  ) throw new GatewayError("Orchestrator returned an invalid Objective lifecycle event.");
+  return {
+    action,
+    ...(status === undefined ? {} : { status }),
+    ownerGeneration: value.ownerGeneration,
+    turnsUsed: value.turnsUsed,
+    tokensUsed,
+    elapsedMs,
+    ...(normalizedObjectiveText === undefined ? {} : { objectiveText: normalizedObjectiveText }),
+    ...(reason === "" ? {} : { reason })
+  };
+}
+
+function requiredObjectiveTimestamp(
+  value: { readonly seconds: bigint; readonly nanos: number } | undefined,
+  label: string
+): number {
+  if (value === undefined || value.seconds < 0n || value.nanos < 0 || value.nanos >= 1_000_000_000
+    || value.nanos % 1_000_000 !== 0) {
+    throw new GatewayError(`Orchestrator returned an invalid Objective ${label}.`);
+  }
+  const milliseconds = value.seconds * 1_000n + BigInt(value.nanos / 1_000_000);
+  if (milliseconds > BigInt(Number.MAX_SAFE_INTEGER)) {
+    throw new GatewayError(`Orchestrator returned an invalid Objective ${label}.`);
+  }
+  return Number(milliseconds);
+}
+
+function mapObjective(value: ProtoObjective, expectedSessionId: string): ObjectiveView {
+  const revision = value.version?.revision?.value;
+  const tokensUsed = exactSafeUnsignedNumber(value.tokensUsed);
+  const tokenBudget = value.tokenBudget === undefined ? undefined : exactSafeUnsignedNumber(value.tokenBudget);
+  const usageResetAt = (value as ProtoObjective & {
+    readonly usageResetAt?: { readonly seconds: bigint; readonly nanos: number };
+  }).usageResetAt;
+  const normalizedText = requireObjectiveText(value.text);
+  const pendingRunId = value.pendingRunId;
+  const pendingQueueItemId = value.pendingQueueItemId;
+  if (value.sessionId !== expectedSessionId || normalizedText !== value.text || revision === undefined || revision < 1n
+    || value.ownerGeneration < 1n || value.ownerGeneration > BigInt(Number.MAX_SAFE_INTEGER)
+    || value.sessionGeneration < 1n || value.sessionGeneration > BigInt(Number.MAX_SAFE_INTEGER)
+    || !Number.isSafeInteger(value.turnsUsed) || value.turnsUsed < 0 || value.turnsUsed > 10_000
+    || tokensUsed === undefined
+    || !Number.isSafeInteger(value.noProgressTurns) || value.noProgressTurns < 0 || value.noProgressTurns > 1_000
+    || tokenBudget === undefined && value.tokenBudget !== undefined
+    || value.maximumTurns !== undefined && (!Number.isSafeInteger(value.maximumTurns) || value.maximumTurns < 1 || value.maximumTurns > 10_000)
+    || value.noProgressTurnLimit !== undefined && (!Number.isSafeInteger(value.noProgressTurnLimit) || value.noProgressTurnLimit < 1 || value.noProgressTurnLimit > 1_000)
+    || (pendingRunId === undefined) !== (pendingQueueItemId === undefined)
+    || pendingRunId !== undefined && (pendingRunId.trim() === "" || pendingQueueItemId?.trim() === "")) {
+    throw new GatewayError("Orchestrator returned an invalid Objective.");
+  }
+  const lastReason = value.lastReason.trim();
+  if ([...lastReason].length > 2_048 || lastReason.includes("\0")) {
+    throw new GatewayError("Orchestrator returned an invalid Objective reason.");
+  }
+  return {
+    sessionId: value.sessionId,
+    text: value.text,
+    status: objectiveStatus(value.status),
+    ...(tokenBudget === undefined ? {} : { tokenBudget }),
+    ...(value.maximumTurns === undefined ? {} : { maximumTurns: value.maximumTurns }),
+    ...(value.noProgressTurnLimit === undefined ? {} : { noProgressTurnLimit: value.noProgressTurnLimit }),
+    turnsUsed: value.turnsUsed,
+    tokensUsed,
+    noProgressTurns: value.noProgressTurns,
+    ...(lastReason === "" ? {} : { lastReason }),
+    ownerGeneration: value.ownerGeneration,
+    sessionGeneration: value.sessionGeneration,
+    ...(pendingRunId === undefined ? {} : { pendingRunId, pendingQueueItemId: pendingQueueItemId! }),
+    startedAt: requiredObjectiveTimestamp(value.startedAt, "start time"),
+    ...(usageResetAt === undefined ? {} : { usageResetAt: requiredObjectiveTimestamp(usageResetAt, "usage reset time") }),
+    revision
+  };
+}
+
+function mapObjectiveMutation(value: ProtoObjective | undefined, expectedSessionId: string): ObjectiveView {
+  if (value === undefined) throw new GatewayError("Orchestrator returned no Objective mutation result.");
+  return mapObjective(value, expectedSessionId);
+}
+
+function objectiveLimitsEqual(value: ObjectiveView, limits: ObjectiveLimitsView): boolean {
+  return value.tokenBudget === limits.tokenBudget
+    && value.maximumTurns === limits.maximumTurns
+    && value.noProgressTurnLimit === limits.noProgressTurnLimit;
+}
+
+function objectivePatchHasUpdate(value: ObjectiveUpdatePatchView): boolean {
+  return Object.prototype.hasOwnProperty.call(value, "text")
+    || Object.prototype.hasOwnProperty.call(value, "tokenBudget")
+    || Object.prototype.hasOwnProperty.call(value, "maximumTurns")
+    || Object.prototype.hasOwnProperty.call(value, "noProgressTurnLimit");
+}
+
+function requireObjectiveMutationOwner(value: ObjectiveView): void {
+  requireObjectiveSessionId(value.sessionId);
+  if (value.revision < 1n || value.ownerGeneration < 1n || value.sessionGeneration < 1n) {
+    throw new GatewayError("The Objective mutation owner is no longer valid.");
+  }
+}
+
+function requireObjectiveMutationResult(
+  value: ProtoObjective | undefined,
+  previous: ObjectiveView,
+  status?: ObjectiveView["status"]
+): ObjectiveView {
+  const objective = mapObjectiveMutation(value, previous.sessionId);
+  if ((status !== undefined && objective.status !== status) || objective.revision <= previous.revision
+    || objective.ownerGeneration < previous.ownerGeneration
+    || objective.sessionGeneration !== previous.sessionGeneration) {
+    throw new GatewayError("Orchestrator returned a mismatched Objective mutation.");
+  }
+  return objective;
 }
 
 function requiredCollaborationRevision(value: { readonly value: bigint } | undefined, label: string): bigint {

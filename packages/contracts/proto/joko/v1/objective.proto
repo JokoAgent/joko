@@ -25,6 +25,9 @@ message Objective {
   optional string pending_queue_item_id = 14;
   google.protobuf.Timestamp started_at = 15;
   EntityVersion version = 16;
+  // Durable reset boundary for automatic recovery from a usage limit. It is
+  // absent when the Provider did not publish a reliable reset time.
+  optional google.protobuf.Timestamp usage_reset_at = 17;
 }
 
 enum ObjectiveStatus {
@@ -115,7 +118,19 @@ message ClearObjectiveRequest {
   uint64 expected_owner_generation = 4;
 }
 
-message ObjectiveMutationResponse {
+message SetObjectiveResponse {
+  Objective objective = 1;
+}
+
+message UpdateObjectiveResponse {
+  Objective objective = 1;
+}
+
+message PauseObjectiveResponse {
+  Objective objective = 1;
+}
+
+message ResumeObjectiveResponse {
   Objective objective = 1;
 }
 

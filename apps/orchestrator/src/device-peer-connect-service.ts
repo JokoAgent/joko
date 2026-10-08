@@ -19,7 +19,7 @@ import {
   type DevicePeerRouteTransport,
   type DevicePeerStreamEventFrame
 } from "@joko/device-peer";
-import { AuthorizationError, type ConnectionRecord, type OperationalStore } from "@joko/store";
+import { AuthorizationError, normalizeDeviceName, type ConnectionRecord, type OperationalStore } from "@joko/store";
 
 import { ConnectionAuthenticationError, type ConnectionManager } from "./connection-manager.js";
 import {
@@ -46,7 +46,7 @@ const DEFAULT_MAXIMUM_UNATTACHED_SPLIT_ROUTES = 128;
 
 type PeerConnections = Pick<
   ConnectionManager,
-  "authenticate" | "authenticateDevicePeerAgent" | "fence" | "onRevoked"
+  "authenticate" | "authenticateDevicePeerAgent" | "fence" | "onRevoked" | "refreshDeviceNameSource"
 >;
 type PeerStore = Pick<OperationalStore, "touchConnection">;
 
@@ -242,6 +242,7 @@ async function* openDevicePeerAgentRoute(
   const first = await nextWithSignal(iterator, context.signal);
   if (first.done) throw new ConnectError("The Device peer agent route requires a hello frame.", Code.InvalidArgument);
   const hello = parseHello(first.value, connection);
+  dependencies.connections.refreshDeviceNameSource(connection, hello.defaultDisplayName);
   const transport = new ConnectDevicePeerRouteTransport(hello);
   let lease: DevicePeerRouteLease | undefined;
   let stopRevocation: (() => void) | undefined;
@@ -297,6 +298,7 @@ async function* openDevicePeerAgentCommandRoute(
   if (unattachedCount >= maximumUnattachedRoutes) {
     throw new ConnectError("The Device peer attachment budget is exhausted.", Code.ResourceExhausted);
   }
+  dependencies.connections.refreshDeviceNameSource(connection, hello.defaultDisplayName);
   const transport = new ConnectDevicePeerRouteTransport(hello);
   let entry: SplitDevicePeerRoute | undefined;
   let stopRevocation: (() => void) | undefined;
@@ -1140,7 +1142,7 @@ function responseFrame(
 function parseHello(
   request: contract.OpenDevicePeerAgentRouteRequest | contract.OpenDevicePeerAgentCommandRouteRequest,
   connection: ConnectionRecord
-): { readonly hello: DevicePeerHelloFrame; readonly requestId: string } {
+): { readonly hello: DevicePeerHelloFrame; readonly requestId: string; readonly defaultDisplayName: string } {
   validatePublicIdentifier(request.requestId, "request_id");
   if (request.targetDeviceId !== connection.deviceId || request.routeGeneration !== 0n
     || request.payload.case !== "hello") {
@@ -1150,8 +1152,17 @@ function parseHello(
   if (capabilities.length === 0 || new Set(capabilities).size !== capabilities.length) {
     throw new ConnectError("The Device peer hello capabilities are invalid.", Code.InvalidArgument);
   }
+  const source = request.payload.value.deviceNameSource;
+  let defaultDisplayName: string;
+  try {
+    if (source === undefined) throw new TypeError("Device name source is required.");
+    defaultDisplayName = normalizeDeviceName(source.defaultDisplayName);
+  } catch {
+    throw new ConnectError("The Device peer native name source is invalid.", Code.InvalidArgument);
+  }
   return {
     requestId: request.requestId,
+    defaultDisplayName,
     hello: Object.freeze({
       protocolVersion: DEVICE_PEER_PROTOCOL_VERSION,
       kind: "hello",

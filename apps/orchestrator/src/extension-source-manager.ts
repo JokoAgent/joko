@@ -11,8 +11,10 @@ import { inspectPiPackageCatalog } from "./pi-package-compatibility.js";
 import {
   isExtensionLibraryDescriptor,
   isExtensionMainViewDescriptor,
+  validateExtensionRecommendations,
   type ExtensionLibraryDescriptor,
-  type ExtensionMainViewDescriptor
+  type ExtensionMainViewDescriptor,
+  type ExtensionRecommendationDescriptor
 } from "./extension-surface-manifest.js";
 
 export type ExtensionSourceInput =
@@ -38,6 +40,7 @@ export interface ExtensionSourceEntryDescriptor {
   readonly bindingOrdinal: number;
   readonly mainView?: ExtensionMainViewDescriptor;
   readonly library?: ExtensionLibraryDescriptor;
+  readonly recommendations?: readonly ExtensionRecommendationDescriptor[];
   readonly name: string;
   readonly packageName: string;
   readonly version?: string;
@@ -768,6 +771,7 @@ async function discoverMarketplace(
           description: inspection.description,
           mainView: extension.mainView ?? null,
           library: extension.library ?? null,
+          recommendations: extension.recommendations ?? null,
           packageContentRevision
         });
         entries.push({
@@ -782,6 +786,7 @@ async function discoverMarketplace(
           bindingOrdinal: ordinal,
           ...(extension.mainView === undefined ? {} : { mainView: { ...extension.mainView } }),
           ...(extension.library === undefined ? {} : { library: { ...extension.library } }),
+          ...(extension.recommendations === undefined ? {} : { recommendations: copyRecommendations(extension.recommendations) }),
           name: inspection.extensions.length === 1 ? packageLabel : `${packageLabel} · ${basename(extension.relativePath)}`,
           packageName: inspection.name,
           ...(inspection.version === undefined ? {} : { version: inspection.version }),
@@ -1039,8 +1044,25 @@ function copyEntry(entry: StoredExtensionSourceEntry): ExtensionSourceEntryDescr
   return {
     ...entry,
     ...(entry.mainView === undefined ? {} : { mainView: { ...entry.mainView } }),
-    ...(entry.library === undefined ? {} : { library: { ...entry.library } })
+    ...(entry.library === undefined ? {} : { library: { ...entry.library } }),
+    ...(entry.recommendations === undefined ? {} : { recommendations: copyRecommendations(entry.recommendations) })
   };
+}
+
+function copyRecommendations(
+  recommendations: readonly ExtensionRecommendationDescriptor[]
+): readonly ExtensionRecommendationDescriptor[] {
+  return recommendations.map((recommendation) => ({
+    ...recommendation,
+    ...(recommendation.locales === undefined
+      ? {}
+      : {
+          locales: Object.fromEntries(Object.entries(recommendation.locales).map(([locale, translation]) => [
+            locale,
+            { ...translation }
+          ])) as ExtensionRecommendationDescriptor["locales"]
+        })
+  }));
 }
 
 function validateStoredSources(value: unknown): StoredExtensionSources {
@@ -1097,7 +1119,7 @@ function validateStoredSource(value: unknown): StoredExtensionSource {
 function validateStoredEntry(value: unknown): StoredExtensionSourceEntry {
   if (!plainObject(value) || !exactKeys(value, [
     "id", "revision", "contentRevision", "packageContentRevision", "resourceId", "packageRelativePath", "extensionRelativePath", "bindingName", "bindingOrdinal",
-    "mainView", "library", "name", "packageName", "version", "author", "description"
+    "mainView", "library", "recommendations", "name", "packageName", "version", "author", "description"
   ]) || typeof value.id !== "string" || !ENTRY_ID.test(value.id) || typeof value.revision !== "string" || !CONTENT_REVISION.test(value.revision)
     || typeof value.contentRevision !== "string" || value.contentRevision !== value.revision
     || typeof value.packageContentRevision !== "string" || !CONTENT_REVISION.test(value.packageContentRevision)
@@ -1110,7 +1132,14 @@ function validateStoredEntry(value: unknown): StoredExtensionSourceEntry {
     || value.version !== undefined && (typeof value.version !== "string" || value.version.trim() === "")
     || value.author !== undefined && (typeof value.author !== "string" || value.author.trim() === "")
     || typeof value.description !== "string") throw new Error("Stored Extension source entry is invalid.");
-  return value as unknown as StoredExtensionSourceEntry;
+  const recommendations = value.recommendations === undefined
+    ? undefined
+    : validateExtensionRecommendations(value.recommendations);
+  if (recommendations !== undefined && !recommendations.ok) throw new Error("Stored Extension source recommendations are invalid.");
+  return {
+    ...value,
+    ...(recommendations === undefined ? {} : { recommendations: recommendations.items })
+  } as unknown as StoredExtensionSourceEntry;
 }
 
 function safeCount(value: unknown, maximum: number): boolean {

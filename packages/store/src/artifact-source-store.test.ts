@@ -62,7 +62,7 @@ describe("private Desktop host authorization", () => {
     fixture.store.createConnection({
       id: "desktop-connection",
       deviceId: "desktop-device",
-      device: { name: "Desktop", kind: "desktop", platform: "win32", appVersion: "1" },
+      device: { defaultName: "Desktop", kind: "desktop", platform: "win32", appVersion: "1" },
       name: "Desktop local instance",
       authKeyDigest: "c".repeat(64)
     });
@@ -89,7 +89,7 @@ describe("private Desktop host authorization", () => {
     fixture.store.createConnection({
       id: "web-connection",
       deviceId: "web-device",
-      device: { name: "Web", kind: "web", platform: "browser", appVersion: "1" },
+      device: { defaultName: "Web", kind: "web", platform: "browser", appVersion: "1" },
       name: "Web",
       authKeyDigest: "c".repeat(64)
     });

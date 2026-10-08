@@ -1,4 +1,5 @@
 import { pathToFileURL } from "node:url";
+import { createRequire } from "node:module";
 import type { ParentPort } from "electron";
 
 import {
@@ -6,6 +7,8 @@ import {
   reverifyDedicatedHardwareSdkIdentity
 } from "../dedicated-hardware-sdk.js";
 import type { DedicatedHardwareSdkIdentity } from "./protocol.js";
+import { reverifyDedicatedHardwareRuntime } from "../dedicated-hardware-runtime.js";
+import { createDedicatedHardwareNativeUsbAdapter } from "./native-usb-adapter.js";
 import { createDedicatedHardwareKeymapBackupStore } from "./keymap-backup-store.js";
 import {
   createDedicatedHardwareUtilityRequestHandler,
@@ -26,10 +29,24 @@ export async function loadDedicatedHardwareStagedAdapter(
   return createDedicatedHardwareVendorAdapter({ sdk: loaded, sink, platform: process.platform });
 }
 
+export async function loadDedicatedHardwareAdapter(
+  identity: Exclude<DedicatedHardwareSdkIdentity, { kind: "unavailable" }>,
+  sink: DedicatedHardwareUtilityAdapterSink
+): Promise<DedicatedHardwareUtilityAdapter> {
+  if (identity.kind === "staged") return loadDedicatedHardwareStagedAdapter(identity, sink);
+  if (!await reverifyDedicatedHardwareRuntime(identity)) throw new Error("The hardware runtime changed before loading.");
+  if (identity.kind === "native-usb") {
+    return createDedicatedHardwareNativeUsbAdapter({ executablePath: identity.executablePath, sink,
+      onFatalError: () => { setImmediate(() => process.exit(1)); } });
+  }
+  const loaded: unknown = createRequire(import.meta.url)(identity.entryPath);
+  return createDedicatedHardwareVendorAdapter({ sdk: loaded, sink, platform: process.platform });
+}
+
 export function startDedicatedHardwareUtility(port: ParentPort): void {
   const handler = createDedicatedHardwareUtilityRequestHandler({
     postMessage: (message) => port.postMessage(message),
-    loadStagedAdapter: loadDedicatedHardwareStagedAdapter,
+    loadAdapter: loadDedicatedHardwareAdapter,
     openKeymapBackupStore: async (directory) => createDedicatedHardwareKeymapBackupStore({ directory })
   });
   let exiting = false;

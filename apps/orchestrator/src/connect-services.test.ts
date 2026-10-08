@@ -87,20 +87,21 @@ describe("Connect service composition", () => {
     }));
     const services = createConnectServices(stubApplication({ connections: { requestPairing } }));
     const beginPairing = services.connection.beginPairing as unknown as (
-      request: { deviceDisplayName: string },
+      request: contract.BeginPairingRequest,
       context: unknown
     ) => Promise<{ challenge?: { humanCode: string } }> | { challenge?: { humanCode: string } };
 
     const response = await beginPairing(
-      { deviceDisplayName: "Remote device" },
+      create(contract.BeginPairingRequestSchema, { deviceDisplayName: "Remote device", deviceKind: contract.DeviceKind.WEB }),
       { requestHeader: new Headers() }
     );
 
     expect(requestPairing).toHaveBeenCalledWith("Remote device", {
-      name: "Remote device",
-      kind: "unspecified",
-      platform: undefined,
-      appVersion: undefined
+      defaultName: "Joko Browser",
+      manualName: "Remote device",
+      kind: "web",
+      platform: "",
+      appVersion: ""
     });
     expect(response.challenge?.humanCode).toBe("");
   });
@@ -109,13 +110,13 @@ describe("Connect service composition", () => {
     const requestPairing = vi.fn(() => ({ id: "mobile-pair", code: "204816", expiresAt: Date.now() + 60_000 }));
     const services = createConnectServices(stubApplication({ connections: { requestPairing } }));
     const beginPairing = services.connection.beginPairing as unknown as (
-      request: { deviceDisplayName: string; deviceKind: number; platform: string; appVersion: string },
+      request: contract.BeginPairingRequest,
       context: unknown
     ) => { challenge?: { humanCode: string } };
-    beginPairing({ deviceDisplayName: "Phone", deviceKind: contract.DeviceKind.MOBILE, platform: "android", appVersion: "0.1.0" },
+    beginPairing(create(contract.BeginPairingRequestSchema, { deviceDisplayName: "Phone", deviceKind: contract.DeviceKind.MOBILE, deviceNameSource: { defaultDisplayName: "Fixture phone" }, platform: "android", appVersion: "0.1.0" }),
       { requestHeader: new Headers() });
     expect(requestPairing).toHaveBeenCalledWith("Phone", {
-      name: "Phone", kind: "mobile", platform: "android", appVersion: "0.1.0"
+      defaultName: "Fixture phone", manualName: "Phone", kind: "mobile", platform: "android", appVersion: "0.1.0"
     });
   });
 
@@ -125,12 +126,12 @@ describe("Connect service composition", () => {
     const requestPairing = vi.fn(() => ({ id: "pairing-2", code: "384201", expiresAt: Date.now() + 60_000 }));
     const services = createConnectServices(stubApplication({ connections: { authenticate, openPairingWindow, requestPairing } }));
     const beginPairing = services.connection.beginPairing as unknown as (
-      request: { deviceDisplayName: string },
+      request: contract.BeginPairingRequest,
       context: unknown
     ) => { challenge?: { humanCode: string } };
 
     const response = beginPairing(
-      { deviceDisplayName: "Owner-provisioned device" },
+      create(contract.BeginPairingRequestSchema, { deviceDisplayName: "Owner-provisioned device", deviceKind: contract.DeviceKind.WEB }),
       { requestHeader: new Headers({ authorization: "Bearer owner-key" }) }
     );
 

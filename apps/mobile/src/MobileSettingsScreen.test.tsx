@@ -144,6 +144,8 @@ const connection = create(ConnectionSchema, {
 const device = create(DeviceSchema, {
   deviceId: profile.deviceId,
   displayName: "Field phone",
+  defaultDisplayName: "Native phone",
+  manualDisplayName: "Field phone",
   kind: DeviceKind.MOBILE,
   platform: "android",
   appVersion: "0.1.0",
@@ -204,6 +206,9 @@ function mobileState(patch: Partial<MobileState> = {}): MobileState {
 function mobileClient(patch: Partial<MobileSettingsClient> = {}): MobileSettingsClient {
   return {
     renameCurrentDevice: vi.fn(async () => true),
+    resetCurrentDevice: vi.fn(async () => create(DeviceSchema, {
+      ...device, displayName: device.defaultDisplayName, manualDisplayName: undefined
+    })),
     reconcile: vi.fn(async () => undefined),
     dismissUnconfirmed: vi.fn(async () => undefined),
     ...patch
@@ -571,6 +576,98 @@ describe("MobileSettingsScreen", () => {
     expect(mounted.container.querySelector('input[aria-label="Device name"]')).toBeNull();
     expect(mounted.container.textContent).toContain("unfinished device-name draft was retired");
     expect(client.renameCurrentDevice).toHaveBeenCalledTimes(1);
+  });
+
+  it("lets the current default name become an explicit manual override", async () => {
+    const defaultDevice = create(DeviceSchema, {
+      ...device, displayName: device.defaultDisplayName, manualDisplayName: undefined
+    });
+    const state = mobileState();
+    const client = mobileClient();
+    const mounted = mount({ client, state: { ...state,
+      owner: create(SnapshotSchema, { ...state.owner!, devices: [defaultDevice] }) } });
+    act(() => button(mounted.container, "Rename this phone").click());
+    expect(input(mounted.container, "Device name").value).toBe("Native phone");
+    expect(button(mounted.container, "Save name").disabled).toBe(false);
+    expect(button(mounted.container, "Restore default name").disabled).toBe(true);
+    await act(async () => button(mounted.container, "Save name").click());
+    expect(client.renameCurrentDevice).toHaveBeenCalledWith(profile.deviceId, "Native phone");
+  });
+
+  it("restores a same-value manual override and keeps the editor on the authoritative default name", async () => {
+    const sameName = create(DeviceSchema, { ...device, displayName: "Native phone", manualDisplayName: "Native phone" });
+    const restored = create(DeviceSchema, { ...sameName, manualDisplayName: undefined });
+    const state = mobileState();
+    const client = mobileClient({ resetCurrentDevice: vi.fn(async () => restored) });
+    const mounted = mount({ client, state: { ...state,
+      owner: create(SnapshotSchema, { ...state.owner!, devices: [sameName] }) } });
+    act(() => button(mounted.container, "Rename this phone").click());
+    expect(button(mounted.container, "Save name").disabled).toBe(true);
+    expect(button(mounted.container, "Restore default name").disabled).toBe(false);
+    await act(async () => button(mounted.container, "Restore default name").click());
+    expect(client.resetCurrentDevice).toHaveBeenCalledWith(profile.deviceId);
+    expect(input(mounted.container, "Device name").value).toBe("Native phone");
+    expect(mounted.container.textContent).toContain("Default device name restored.");
+    mounted.rerender({ state: { ...state, owner: create(SnapshotSchema, { ...state.owner!, devices: [restored] }) } });
+    expect(button(mounted.container, "Restore default name").disabled).toBe(true);
+    expect(button(mounted.container, "Save name").disabled).toBe(false);
+  });
+
+  it("shares the name mutation flight while restoring and uses the returned name instead of the old draft", async () => {
+    const restored = create(DeviceSchema, {
+      ...device, defaultDisplayName: "Newest native phone", displayName: "Newest native phone", manualDisplayName: undefined
+    });
+    const flight = deferred<typeof restored | undefined>();
+    const client = mobileClient({ resetCurrentDevice: vi.fn(() => flight.promise) });
+    const mounted = mount({ client });
+    act(() => button(mounted.container, "Rename this phone").click());
+    act(() => changeInput(input(mounted.container, "Device name"), "Unsent draft"));
+    await act(async () => button(mounted.container, "Restore default name").click());
+    expect(client.resetCurrentDevice).toHaveBeenCalledOnce();
+    expect(button(mounted.container, "Restore default name").disabled).toBe(true);
+    expect(button(mounted.container, "Saving…").disabled).toBe(true);
+    expect(button(mounted.container, "Back to Settings").disabled).toBe(true);
+    expect(input(mounted.container, "Device name").disabled).toBe(true);
+    expect(native.hardwareBack?.()).toBe(true);
+    act(() => button(mounted.container, "Restore default name").click());
+    expect(client.resetCurrentDevice).toHaveBeenCalledOnce();
+    expect(client.renameCurrentDevice).not.toHaveBeenCalled();
+    await act(async () => flight.resolve(restored));
+    expect(input(mounted.container, "Device name").value).toBe("Newest native phone");
+    expect(mounted.container.textContent).toContain("Default device name restored.");
+  });
+
+  it("keeps the edited draft when restoring is rejected", async () => {
+    const client = mobileClient({ resetCurrentDevice: vi.fn(async () => { throw new Error("Device changed. Try again."); }) });
+    const mounted = mount({ client });
+    act(() => button(mounted.container, "Rename this phone").click());
+    act(() => changeInput(input(mounted.container, "Device name"), "Unsent draft"));
+    await act(async () => button(mounted.container, "Restore default name").click());
+    expect(input(mounted.container, "Device name").value).toBe("Unsent draft");
+    expect(mounted.container.textContent).toContain("Device changed. Try again.");
+    expect(button(mounted.container, "Save name").disabled).toBe(false);
+    expect(button(mounted.container, "Restore default name").disabled).toBe(false);
+  });
+
+  it("keeps an unknown restore read-only until its shared receipt is reconciled", async () => {
+    const client = mobileClient({ resetCurrentDevice: vi.fn(async () => undefined) });
+    const state = mobileState();
+    const mounted = mount({ client, state });
+    act(() => button(mounted.container, "Rename this phone").click());
+    act(() => changeInput(input(mounted.container, "Device name"), "Unsent draft"));
+    await act(async () => button(mounted.container, "Restore default name").click());
+    expect(input(mounted.container, "Device name").value).toBe("Unsent draft");
+    expect(button(mounted.container, "Save name").disabled).toBe(true);
+    expect(button(mounted.container, "Restore default name").disabled).toBe(true);
+    mounted.rerender({ state: { ...state, pending: [{ operationId: "reset-receipt", connectionId: profile.connectionId,
+      kind: "device-rename", targetDeviceId: profile.deviceId, state: "unknown" }] } });
+    const restored = create(DeviceSchema, { ...device, displayName: device.defaultDisplayName, manualDisplayName: undefined });
+    mounted.rerender({ state: { ...state, owner: create(SnapshotSchema, { ...state.owner!, devices: [restored] }) } });
+    expect(input(mounted.container, "Device name").value).toBe("Native phone");
+    expect(mounted.container.textContent).toContain("Default device name restored.");
+    expect(button(mounted.container, "Save name").disabled).toBe(false);
+    expect(client.resetCurrentDevice).toHaveBeenCalledOnce();
+    expect(client.renameCurrentDevice).not.toHaveBeenCalled();
   });
 
   it("requires one exact active profile, connection, and current mobile device", () => {

@@ -52,7 +52,7 @@ export const WORKSPACE_DEPENDENCY_ALLOWLIST: Readonly<Record<string, ReadonlySet
   "@joko/e2e": new Set(["@joko/adapter-claude-code", "@joko/adapter-codex", "@joko/adapter-pi", "@joko/contracts", "@joko/core", "@joko/device-peer", "@joko/messaging", "@joko/orchestrator", "@joko/remote-ssh", "@joko/store", "@joko/testkit", "@joko/tool-android", "@joko/tool-browser", "@joko/tool-terminal"]),
   "@joko/orchestrator": new Set(["@joko/code-host", "@joko/contracts", "@joko/core", "@joko/device-peer", "@joko/git-safety", "@joko/local-model-runtime", "@joko/messaging", "@joko/node-sync", "@joko/outbound-network", "@joko/remote-ssh", "@joko/runtime-governance", "@joko/store", "@joko/adapter-claude-code", "@joko/adapter-codex", "@joko/adapter-dictation-refinement", "@joko/adapter-pi", "@joko/adapter-transcription-openai", "@joko/adapter-transcription-realtime", "@joko/adapter-transcription-scribe", "@joko/adapter-transcription-sauc", "@joko/tool-android", "@joko/tool-browser", "@joko/tool-computer", "@joko/tool-document", "@joko/tool-ios-simulator", "@joko/tool-lsp", "@joko/tool-terminal", "@joko/voice-input", "@joko/worktree", "@joko/testkit"]),
   "@joko/web": new Set(["@joko/brand-assets", "@joko/contracts"]),
-  "@joko/mobile": new Set(["@joko/brand-assets", "@joko/contracts"]),
+  "@joko/mobile": new Set(["@joko/brand-assets", "@joko/contracts", "@joko/web"]),
   "@joko/desktop": new Set(["@joko/brand-assets", "@joko/contracts", "@joko/device-peer", "@joko/web"])
 };
 

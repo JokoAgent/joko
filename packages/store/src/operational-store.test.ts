@@ -25,6 +25,7 @@ import {
   StaleGenerationError,
   StoreError
 } from "./index.js";
+import type { PersistedEvent } from "./types.js";
 
 const cleanups: Array<() => void> = [];
 
@@ -33,6 +34,103 @@ afterEach(() => {
 });
 
 describe("OperationalStore", () => {
+  it("publishes immutable owner Device content only after commit and keeps Session routing strict", () => {
+    const { store } = createFixture();
+    store.createConnection({ id: "name-connection", deviceId: "name-device", name: "Unchanged label",
+      device: { defaultName: "Native A", kind: "desktop" }, authKeyDigest: "device-name-digest" });
+    const published: PersistedEvent[] = [];
+    store.subscribe((event) => {
+      expect(store.findEvent(event.id)).toEqual(event);
+      published.push(event);
+    });
+    store.transaction((transaction) => {
+      const changed = transaction.renameDevice("name-device", "Native A");
+      const event = transaction.listEvents().at(-1)!;
+      expect(event.payload).toMatchObject({ type: "device_changed", device: {
+        name: "Native A", defaultName: "Native A", manualName: "Native A", revision: changed.revision.toString(),
+        connectionIds: ["name-connection"] } });
+      expect(event.revision).toBe(changed.revision);
+      expect(published).toEqual([]);
+    });
+    expect(published).toHaveLength(1);
+    const defaultB = store.refreshDeviceDefaultName("name-device", "Native B");
+    expect(published.at(-1)!.payload).toMatchObject({ device: { name: "Native A", defaultName: "Native B",
+      manualName: "Native A", revision: defaultB.revision.toString() } });
+    const before = store.health();
+    store.refreshDeviceDefaultName("name-device", "Native B");
+    store.touchConnection("name-connection", Date.now());
+    expect(store.health().revision).toBe(before.revision);
+    expect(store.health().globalCursor).toBe(before.globalCursor);
+    const observed = store.getDevice("name-device");
+    expect(() => store.transaction((transaction) => {
+      transaction.resetDeviceName("name-device");
+      throw new Error("Device rollback");
+    })).toThrow("Device rollback");
+    expect(store.getDevice("name-device")).toEqual(observed);
+    expect(published).toHaveLength(2);
+    const reset = store.resetDeviceName("name-device");
+    const resetEvent = published.at(-1)!;
+    expect(resetEvent.payload).toMatchObject({ type: "device_changed", device: {
+      name: "Native B", defaultName: "Native B", revision: reset.revision.toString() } });
+    if (resetEvent.payload.type !== "device_changed") throw new Error("Device event is missing.");
+    expect(resetEvent.payload.device.manualName).toBeUndefined();
+    expect(store.listEvents({ sessionId: "session-1" }).every((event) => event.payload.type !== "device_changed")).toBe(true);
+    expect(published[0]!.payload).toMatchObject({ device: { defaultName: "Native A", manualName: "Native A" } });
+    expect(() => store.appendEvent({ backendId: "pi", targetId: "target-1", sessionId: "session-1",
+      generation: 0, traceId: "adapter-forgery", payload: resetEvent.payload })).toThrow(/owned by the Store/u);
+    store.close();
+    const database = new DatabaseSync(store.filePath);
+    try {
+      expect(database.prepare("SELECT backend_id, target_id, session_id FROM events WHERE id = ?").get(resetEvent.id))
+        .toMatchObject({ backend_id: null, target_id: null, session_id: null });
+      expect(() => database.prepare("UPDATE events SET target_id = 'target-1' WHERE id = ?").run(resetEvent.id)).toThrow(/CHECK/u);
+      expect(() => database.prepare("UPDATE events SET payload_json = ? WHERE id = ?")
+        .run(JSON.stringify({ payload: { type: "status", key: "forged-owner" } }), resetEvent.id)).toThrow(/CHECK/u);
+    } finally { database.close(); }
+    const reopened = new OperationalStore(store.filePath);
+    try { expect(reopened.findEvent(resetEvent.id)).toEqual(resetEvent); } finally { reopened.close(); }
+  });
+
+  it("persists default and manual Device names with reset and deferred pairing across reopen", () => {
+    const directory = mkdtempSync(path.join(tmpdir(), "joko-device-name-"));
+    const fileName = path.join(directory, "operational.sqlite");
+    let store = new OperationalStore(fileName);
+    cleanups.push(() => { store.close(); rmSync(directory, { recursive: true, force: true }); });
+    const connection = store.createConnection({ id: "phone-connection", deviceId: "phone", name: "Connection label",
+      device: { defaultName: "Native phone", kind: "mobile" }, authKeyDigest: "phone-digest" });
+    const initial = store.getDevice("phone");
+    expect(initial).toMatchObject({ name: "Native phone", defaultName: "Native phone" });
+    expect(initial.manualName).toBeUndefined();
+    const manual = store.renameDevice("phone", " Native phone ", initial.revision);
+    expect(manual.manualName).toBe("Native phone");
+    expect(manual.revision).toBeGreaterThan(initial.revision);
+    const updated = store.refreshDeviceDefaultName("phone", "Latest native phone");
+    expect(updated).toMatchObject({ name: "Native phone", manualName: "Native phone", defaultName: "Latest native phone" });
+    store.createPairing({ id: "pending-phone", codeDigest: "pairing-digest", expiresAt: Date.now() + 60_000,
+      device: { id: "other-phone", defaultName: "Other native phone", manualName: "Other phone label", kind: "mobile" } });
+    store.close();
+    store = new OperationalStore(fileName);
+    expect(store.getDevice("phone")).toEqual(updated);
+    expect(store.getPairing("pending-phone").device).toMatchObject({ defaultName: "Other native phone", manualName: "Other phone label" });
+    expect(() => store.resetDeviceName("phone", initial.revision)).toThrow(RevisionConflictError);
+    const reset = store.resetDeviceName("phone", updated.revision);
+    expect(reset).toMatchObject({ name: "Latest native phone", defaultName: "Latest native phone" });
+    expect(reset.manualName).toBeUndefined();
+    expect(reset.revision).toBeGreaterThan(updated.revision);
+    const current = store.refreshDeviceDefaultName("phone", "Current native phone");
+    expect(current.name).toBe("Current native phone");
+    expect(store.getSnapshot().devices.find((device) => device.id === "phone")).toEqual(current);
+    expect(store.getConnection(connection.id).name).toBe("Connection label");
+    expect(() => store.renameDevice("phone", "x".repeat(129))).toThrow(/invalid/u);
+    expect(store.renameDevice("phone", "x".repeat(128)).manualName).toHaveLength(128);
+    const other = store.consumePairing({ pairingId: "pending-phone", codeDigest: "pairing-digest",
+      connectionId: "other-connection", connectionName: "Other connection label", authKeyDigest: "other-digest" });
+    expect(store.getDevice(other.deviceId)).toMatchObject({ name: "Other phone label", defaultName: "Other native phone", manualName: "Other phone label" });
+    store.revokeDevice("phone");
+    expect(() => store.resetDeviceName("phone")).toThrow(AuthorizationError);
+    expect(() => store.refreshDeviceDefaultName("phone", "Late source")).toThrow(AuthorizationError);
+  });
+
   it("persists maintenance scan, job, and effect receipts without invalidating the product revision fence", async () => {
     const fixture = createFixture();
     const filePath = fixture.store.filePath;
@@ -236,6 +334,74 @@ describe("OperationalStore", () => {
     })).toThrow(StaleGenerationError);
   });
 
+  it("persists Objective usage reset boundaries and keeps them coupled to usage-limited state", () => {
+    const fixture = createFixture();
+    const created = fixture.store.putObjective({
+      sessionId: "session-1",
+      text: "Wait for capacity and continue.",
+      updatedAt: 20
+    });
+    expect(created.usageResetAt).toBeUndefined();
+    expect(() => fixture.store.updateObjective({
+      sessionId: created.sessionId,
+      expectedRevision: created.revision,
+      expectedOwnerGeneration: created.ownerGeneration,
+      usageResetAt: 3_600_000,
+      updatedAt: 21
+    })).toThrow(/usage reset time requires usage-limited status/u);
+
+    const limited = fixture.store.updateObjective({
+      sessionId: created.sessionId,
+      expectedRevision: created.revision,
+      expectedOwnerGeneration: created.ownerGeneration,
+      status: "usage_limited",
+      usageResetAt: 3_600_000,
+      lastReason: "Provider capacity resets later.",
+      updatedAt: 22
+    });
+    expect(limited).toMatchObject({ status: "usage_limited", usageResetAt: 3_600_000 });
+
+    const filePath = fixture.store.filePath;
+    fixture.store.close();
+    const reopened = new OperationalStore(filePath);
+    fixture.replaceStore(reopened);
+    expect(reopened.getObjective(created.sessionId)).toEqual(limited);
+    expect(() => reopened.updateObjective({
+      sessionId: limited.sessionId,
+      expectedRevision: limited.revision,
+      expectedOwnerGeneration: limited.ownerGeneration,
+      status: "active",
+      updatedAt: 23
+    })).toThrow(/usage reset time requires usage-limited status/u);
+
+    const resumed = reopened.updateObjective({
+      sessionId: limited.sessionId,
+      expectedRevision: limited.revision,
+      expectedOwnerGeneration: limited.ownerGeneration,
+      status: "active",
+      usageResetAt: null,
+      updatedAt: 24
+    });
+    expect(resumed.status).toBe("active");
+    expect(resumed.usageResetAt).toBeUndefined();
+
+    const limitedAgain = reopened.updateObjective({
+      sessionId: resumed.sessionId,
+      expectedRevision: resumed.revision,
+      expectedOwnerGeneration: resumed.ownerGeneration,
+      status: "usage_limited",
+      usageResetAt: 7_200_000,
+      updatedAt: 25
+    });
+    const replacement = reopened.putObjective({
+      sessionId: limitedAgain.sessionId,
+      text: "Replacement starts without an inherited reset boundary.",
+      updatedAt: 26
+    });
+    expect(replacement.status).toBe("active");
+    expect(replacement.usageResetAt).toBeUndefined();
+  });
+
   it("fences Objective mutations by revision and owner generation", () => {
     const { store } = createFixture();
     const created = store.putObjective({
@@ -308,6 +474,47 @@ describe("OperationalStore", () => {
       expectedOwnerGeneration: replacement.ownerGeneration
     })).toEqual(replacement);
     expect(store.findObjective(replacement.sessionId)).toBeUndefined();
+
+    const recreated = store.putObjective({
+      sessionId: replacement.sessionId,
+      text: "First objective",
+      updatedAt: 13
+    });
+    expect(recreated).toMatchObject({
+      text: "First objective",
+      ownerGeneration: replacement.ownerGeneration + 1,
+      turnsUsed: 0,
+      tokensUsed: 0
+    });
+    expect(() => store.updateObjective({
+      sessionId: recreated.sessionId,
+      expectedRevision: recreated.revision,
+      expectedOwnerGeneration: replacement.ownerGeneration,
+      status: "paused"
+    })).toThrow(StaleGenerationError);
+  });
+
+  it("removes Objective state and its generation checkpoint when the Session is deleted", () => {
+    const fixture = createFixture();
+    fixture.store.putObjective({ sessionId: "session-1", text: "Deleted session objective" });
+    const session = fixture.store.getSession("session-1");
+
+    fixture.store.updateSession("session-1", {
+      archived: true,
+      deletedAt: 20
+    }, session.revision, 20);
+
+    expect(fixture.store.findObjective("session-1")).toBeUndefined();
+    const filePath = fixture.store.filePath;
+    fixture.store.close();
+    const database = new DatabaseSync(filePath, { readOnly: true });
+    try {
+      expect(database.prepare(
+        "SELECT COUNT(*) AS count FROM session_objective_generations WHERE session_id = ?"
+      ).get("session-1")).toMatchObject({ count: 0 });
+    } finally {
+      database.close();
+    }
   });
 
   it("persists one isolated workspace binding per Session and updates only its lifecycle state", () => {
@@ -511,7 +718,7 @@ describe("OperationalStore", () => {
     expect(store.getSession(scheduled.descriptor.id).descriptor.automationOrigin).toBeUndefined();
   });
 
-  it("does not expose a service-owned continuation as a visible message origin", () => {
+  it("does not expose service-owned continuations as visible message origins", () => {
     const { store } = createFixture();
     store.appendEvent({
       id: "internal-continuation-origin",
@@ -531,6 +738,26 @@ describe("OperationalStore", () => {
     expect(store.findVisibleSessionMessageOrigin({
       sessionId: "session-1",
       eventId: "internal-continuation-origin"
+    })).toBeUndefined();
+
+    store.appendEvent({
+      id: "objective-continuation-origin",
+      backendId: "pi",
+      targetId: "target-1",
+      sessionId: "session-1",
+      generation: 0,
+      traceId: "objective:internal-origin",
+      payload: {
+        type: "message_complete",
+        role: "user",
+        blocks: [{ kind: "text", text: "Continue the objective" }],
+        objectiveContinuation: { ownerGeneration: 1, turn: 1 }
+      }
+    });
+
+    expect(store.findVisibleSessionMessageOrigin({
+      sessionId: "session-1",
+      eventId: "objective-continuation-origin"
     })).toBeUndefined();
   });
 
@@ -3035,6 +3262,24 @@ describe("OperationalStore", () => {
         return { accepted: true };
       }
     );
+    const objective = fixture.store.putObjective({
+      sessionId: "session-1",
+      text: "Keep the exact pending turn across activation.",
+      updatedAt: 2
+    });
+    const pendingObjective = fixture.store.updateObjective({
+      sessionId: objective.sessionId,
+      expectedRevision: objective.revision,
+      expectedOwnerGeneration: objective.ownerGeneration,
+      pending: {
+        ownerGeneration: objective.ownerGeneration,
+        operationId: "operation-instance-claim",
+        runId: "run-1",
+        attemptId: "attempt-before-instance-claim",
+        queueItemId: "queue-instance-claim"
+      },
+      updatedAt: 2
+    });
     const backend = fixture.store.getBackend("pi").descriptor;
     const reservation = fixture.store.reserveBackendInstanceGeneration({
       backendId: backend.id,
@@ -3086,6 +3331,16 @@ describe("OperationalStore", () => {
     expect(fixture.store.getAttempt("attempt-instance-1").descriptor).toMatchObject({
       generation: 1,
       backendInstanceGeneration: 1
+    });
+    expect(fixture.store.getAttempt("attempt-before-instance-claim").descriptor.endedAt).toBe(3);
+    expect(fixture.store.getObjective("session-1")).toMatchObject({
+      ownerGeneration: pendingObjective.ownerGeneration,
+      pendingOwnerGeneration: pendingObjective.ownerGeneration,
+      pendingOperationId: "operation-instance-claim",
+      pendingRunId: "run-1",
+      pendingAttemptId: "attempt-instance-1",
+      pendingQueueItemId: "queue-instance-claim",
+      sessionGeneration: 1
     });
     expect(fixture.store.updateQueueState({
       queueItemId: "queue-instance-claim",
@@ -3142,6 +3397,89 @@ describe("OperationalStore", () => {
       attemptId: "attempt-instance-projection",
       generation: 2,
       payload: { type: "queue_update" }
+    });
+  });
+
+  it("rolls back Attempt renewal when an Objective no longer owns the exact pending generation", () => {
+    const fixture = createFixture();
+    fixture.store.createAttempt({
+      id: "attempt-objective-stale-owner",
+      runId: "run-1",
+      ordinal: 1,
+      generation: 0,
+      startedAt: 2
+    });
+    fixture.store.runOperation(
+      { id: "operation-objective-stale-owner", kind: "prompt", body: fixture.prompt },
+      (store) => {
+        store.enqueueQueueItem({
+          id: "queue-objective-stale-owner",
+          sessionId: "session-1",
+          runId: "run-1",
+          attemptId: "attempt-objective-stale-owner",
+          operationId: "operation-objective-stale-owner",
+          disposition: "prompt",
+          body: fixture.prompt
+        });
+        return { accepted: true };
+      }
+    );
+    let objective = fixture.store.putObjective({
+      sessionId: "session-1",
+      text: "Fence a replaced pending owner."
+    });
+    objective = fixture.store.updateObjective({
+      sessionId: objective.sessionId,
+      expectedRevision: objective.revision,
+      expectedOwnerGeneration: objective.ownerGeneration,
+      pending: {
+        ownerGeneration: objective.ownerGeneration,
+        operationId: "operation-objective-stale-owner",
+        runId: "run-1",
+        attemptId: "attempt-objective-stale-owner",
+        queueItemId: "queue-objective-stale-owner"
+      }
+    });
+    fixture.store.claimNextQueueItem({
+      sessionId: "session-1",
+      backendInstanceGeneration: 0,
+      traceId: "objective-stale-owner:claim"
+    });
+    objective = fixture.store.updateObjective({
+      sessionId: objective.sessionId,
+      expectedRevision: objective.revision,
+      expectedOwnerGeneration: objective.ownerGeneration,
+      status: "dispatch_unknown",
+      advanceOwnerGeneration: true
+    });
+    expect(() => fixture.store.renewQueueAttemptGeneration({
+      queueItemId: "queue-objective-stale-owner",
+      attemptId: "attempt-objective-noop-mismatch",
+      generation: 0,
+      at: 9
+    })).toThrow(/does not exactly own/u);
+    expect(() => fixture.store.getAttempt("attempt-objective-noop-mismatch")).toThrow();
+    const session = fixture.store.getSession("session-1");
+    fixture.store.updateSession("session-1", {
+      binding: { ...session.descriptor.binding, generation: 1 }
+    }, session.revision);
+
+    expect(() => fixture.store.renewQueueAttemptGeneration({
+      queueItemId: "queue-objective-stale-owner",
+      attemptId: "attempt-objective-stale-owner-renewed",
+      generation: 1,
+      at: 10
+    })).toThrow(/does not exactly own/u);
+    expect(fixture.store.getQueueItem("queue-objective-stale-owner").attemptId)
+      .toBe("attempt-objective-stale-owner");
+    expect(fixture.store.getAttempt("attempt-objective-stale-owner").descriptor.endedAt).toBeUndefined();
+    expect(() => fixture.store.getAttempt("attempt-objective-stale-owner-renewed")).toThrow();
+    expect(fixture.store.getObjective("session-1")).toMatchObject({
+      ownerGeneration: objective.ownerGeneration,
+      pendingOwnerGeneration: objective.ownerGeneration - 1,
+      pendingAttemptId: "attempt-objective-stale-owner",
+      sessionGeneration: 1,
+      status: "dispatch_unknown"
     });
   });
 
@@ -3367,7 +3705,7 @@ describe("OperationalStore", () => {
     })).toThrow("cannot page after and before a cursor at the same time");
   });
 
-  it("projects latest visible user activity without counting automatic continuations", () => {
+  it("projects latest visible user activity without counting service-owned continuations", () => {
     const { store } = createFixture();
     expect(store.findLatestVisibleUserMessageAt("session-1")).toBeUndefined();
 
@@ -3414,6 +3752,21 @@ describe("OperationalStore", () => {
         automaticContinuation: { recoveryId: "user-activity-recovery" }
       }
     });
+    store.appendEvent({
+      id: "objective-continuation-after-user-activity",
+      backendId: "pi",
+      targetId: "target-1",
+      sessionId: "session-1",
+      generation: 0,
+      emittedAt: 400,
+      traceId: "user-activity:objective-continuation",
+      payload: {
+        type: "message_complete",
+        role: "user",
+        blocks: [{ kind: "text", text: "Continue the objective" }],
+        objectiveContinuation: { ownerGeneration: 1, turn: 1 }
+      }
+    });
 
     expect(store.findLatestVisibleUserMessageAt("session-1")).toBe(200);
   });
@@ -3442,7 +3795,7 @@ describe("OperationalStore", () => {
       id: "connection-device-a",
       deviceId: "device-shared",
       device: {
-        name: "Shared desktop",
+        defaultName: "Shared desktop",
         kind: "desktop",
         platform: "windows",
         appVersion: "1.2.3"
@@ -3483,7 +3836,7 @@ describe("OperationalStore", () => {
     const store = createStore();
     const connection = store.createConnection({
       id: "mobile-connection", deviceId: "mobile-device", name: "Joko phone",
-      device: { name: "Joko phone", kind: "mobile", platform: "android", appVersion: "0.1.0" },
+      device: { defaultName: "Joko phone", kind: "mobile", platform: "android", appVersion: "0.1.0" },
       authKeyDigest: "mobile-digest"
     });
     expect(store.getDevice(connection.deviceId)).toMatchObject({ kind: "mobile", platform: "android", state: "active" });
@@ -3497,14 +3850,14 @@ describe("OperationalStore", () => {
     store.createConnection({
       id: "connection-controller",
       deviceId: "device-controller",
-      device: { name: "Desk controller", kind: "desktop" },
+      device: { defaultName: "Desk controller", kind: "desktop" },
       name: "Controller",
       authKeyDigest: "controller-digest"
     });
     store.createConnection({
       id: "connection-target",
       deviceId: "device-target",
-      device: { name: "Workstation", kind: "desktop" },
+      device: { defaultName: "Workstation", kind: "desktop" },
       name: "Target",
       authKeyDigest: "target-digest"
     });

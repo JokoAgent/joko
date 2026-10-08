@@ -30,10 +30,10 @@ import { toggleApplicationWindowFullscreen } from "./window-fullscreen.js";
 import { broadcastDesktopUpdateSettings } from "./update-settings-broadcast.js";
 import { promoteExternalWindowActivation } from "./external-window-activation.js";
 import { basename, extname, isAbsolute, join, resolve } from "node:path";
-import { spawn } from "node:child_process";
-import { release as operatingSystemRelease } from "node:os";
+import { execFile, spawn } from "node:child_process";
+import { hostname, release as operatingSystemRelease } from "node:os";
 import { appendFileSync, writeFileSync } from "node:fs";
-import { readdir, stat, unlink } from "node:fs/promises";
+import { lstat, readdir, realpath, stat, unlink } from "node:fs/promises";
 import { createHash, randomUUID } from "node:crypto";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
@@ -59,6 +59,7 @@ import {
   type DesktopNativeTaskStatusDisplay,
   type DesktopNativeTaskStatusSoundChoice,
   type DesktopNativeTaskStatusSettings,
+  type DesktopNativeGamepadSnapshot,
   type DesktopPageSearchResult,
   type DesktopRuntimeProcessMonitorOwner,
   type DesktopSaveFileRequest,
@@ -81,6 +82,7 @@ import {
   requireCurrentDesktopMainDocumentOccurrence,
   parseDesktopGlobalVoiceCommitRequest,
   parseDesktopGlobalVoiceStatus,
+  parseDesktopNativeGamepadClientState,
   parseDesktopPageSearchRequest,
   parseDesktopPageSearchStopAction
 } from "./channels.js";
@@ -190,6 +192,15 @@ import {
 import { SystemFrontmostVoiceController } from "./dedicated-hardware-action/system-frontmost-voice.js";
 import { loadNativeSystemFrontmostInput } from "./native-system-frontmost-input.js";
 import {
+  createNativeGamepadRuntime,
+  resolveNativeGamepadDirectory,
+  type NativeGamepadRuntime
+} from "./native-gamepad.js";
+import {
+  DesktopNativeGamepadDocumentAuthority,
+  type DesktopNativeGamepadDocumentOwner
+} from "./native-gamepad-document.js";
+import {
   createDedicatedHardwareMainActionRuntime,
   type DedicatedHardwareMainActionRuntime
 } from "./dedicated-hardware-main-actions.js";
@@ -198,10 +209,8 @@ import {
   type DedicatedHardwareMainController,
   type DedicatedHardwareProjectedState
 } from "./dedicated-hardware-main-controller.js";
-import {
-  dedicatedHardwareSdkStagingDirectory,
-  resolveDedicatedHardwareSdkIdentity
-} from "./dedicated-hardware-sdk.js";
+import { dedicatedHardwareSdkStagingDirectory } from "./dedicated-hardware-sdk.js";
+import { resolveDedicatedHardwareRuntime } from "./dedicated-hardware-runtime.js";
 import {
   DEDICATED_HARDWARE_MODEL_IDS,
   createDedicatedHardwareHostClient,
@@ -353,6 +362,17 @@ import {
 import { installSelectionContextMenu, setSelectionContextMenuLocale } from "./selection-context-menu.js";
 import { NativeFileClipboard, type NativeFileActionScope } from "./native-file-clipboard.js";
 import { NativeFileOpener } from "./native-file-opener.js";
+import {
+  decodeWindowsRegistryOutput,
+  isLocalWindowsDrivePath,
+  parseWindowsConsoleCodepage,
+  WindowsOpenWithApps,
+  type WindowsExecutableSnapshot
+} from "./windows-open-with-apps.js";
+import {
+  DesktopOpenWithDocumentAuthority,
+  type DesktopOpenWithDocumentOwner
+} from "./desktop-open-with-document.js";
 import { NativeArtifactSourceRevealer } from "./native-artifact-source-revealer.js";
 import { resolveManagedArtifactSource } from "./managed-artifact-source.js";
 import { bundledElectronUpdater, createElectronUpdateDriver } from "./electron-update-driver.js";
@@ -634,6 +654,7 @@ interface DedicatedHardwareCatalogOwner {
   readonly contents: WebContents;
   readonly documentOccurrence: string;
 }
+type NativeGamepadClientOwner = DesktopNativeGamepadDocumentOwner<WebContents>;
 type DedicatedHardwareControllerOwner = WebContents | DedicatedHardwareCatalogOwner;
 let dedicatedHardwareController: DedicatedHardwareMainController<DedicatedHardwareControllerOwner> | undefined;
 let dedicatedHardwareCatalogOwner: DedicatedHardwareCatalogOwner | undefined;
@@ -643,6 +664,12 @@ let dedicatedHardwareSystemVoiceController: SystemFrontmostVoiceController | und
 const dedicatedHardwareTaskFocusFence = new DedicatedHardwareTaskFocusFence<WebContents>();
 const dedicatedHardwareWindowLifecycles = new WeakMap<WebContents, { readonly retire: () => void }>();
 let dedicatedHardwarePowerLifecycleInstalled = false;
+let nativeGamepadRuntime: NativeGamepadRuntime<NativeGamepadClientOwner> | undefined;
+const nativeGamepadDocuments = new DesktopNativeGamepadDocumentAuthority<WebContents>(
+  () => randomUUID(),
+  (owner) => nativeGamepadRuntime?.retireClient(owner)
+);
+const nativeGamepadWindowLifecycles = new WeakMap<WebContents, { readonly retire: () => void }>();
 const pageSearchTokensByContents = new WeakMap<WebContents, Map<number, number>>();
 const pageSearchResultBindings = new WeakSet<WebContents>();
 const sessionWindowStates = new Map<string, windowStateKeeper.State>();
@@ -741,7 +768,17 @@ const MAXIMUM_NATIVE_FILE_BYTES = 256 * 1024 * 1024;
 let nativeFileClipboard: NativeFileClipboard | undefined;
 let nativeFileOpener: NativeFileOpener | undefined;
 let nativeArtifactSourceRevealer: NativeArtifactSourceRevealer | undefined;
+let windowsOpenWithApps: WindowsOpenWithApps | undefined;
 const nativeFileActionScopes = new WeakMap<WebContents, NativeFileActionScope>();
+type DesktopOpenWithDocumentOwnerForWindow = DesktopOpenWithDocumentOwner<WebContents>;
+const desktopOpenWithDocuments = new DesktopOpenWithDocumentAuthority<WebContents>(
+  () => randomUUID(),
+  (owner: DesktopOpenWithDocumentOwnerForWindow) => {
+    windowsOpenWithApps?.retireDocument(owner.occurrence);
+    nativeFileOpener?.retireScope(owner.occurrence);
+  }
+);
+const desktopOpenWithWindowLifecycles = new WeakMap<WebContents, { readonly retire: () => void }>();
 const extensionLibraryGestures = new ExtensionLibraryGestureCoordinator<WebContents>();
 const extensionLibraryGestureScopes = new WeakSet<WebContents>();
 const TRAY_ICON_DATA_URL_PREFIX = "data:image/png;base64,";
@@ -809,6 +846,7 @@ if (!app.requestSingleInstanceLock()) {
   app.on("before-quit", (event) => {
     nativeFileClipboard?.cancelPending();
     nativeFileOpener?.cancelPending();
+    windowsOpenWithApps?.cancelPending();
     nativeArtifactSourceRevealer?.cancelPending();
     mainWindowCloseController?.cancelPending();
     quitting = true;
@@ -868,6 +906,7 @@ if (!app.requestSingleInstanceLock()) {
     void desktopDevicePeerAgentLifecycle?.dispose();
     nativeFileClipboard?.dispose();
     nativeFileOpener?.dispose();
+    windowsOpenWithApps?.dispose();
     nativeArtifactSourceRevealer?.dispose();
     globalVoiceShortcutRecovery.dispose();
     unregisterGlobalVoiceShortcut();
@@ -936,6 +975,7 @@ if (!app.requestSingleInstanceLock()) {
     await initializeDesktopNativeTaskStatus();
     if (shouldRunDesktopUpdateStartup()) desktopUpdateStartupPhase = { kind: "checking" };
     await initializeDesktopKeepAwake();
+    initializeNativeGamepad();
     await initializeDedicatedHardwareInput();
     registerIpc();
     installMicrophoneLifecycle();
@@ -6757,6 +6797,7 @@ function initializeDesktopDevicePeerAgentLifecycle(): void {
     },
     readAuthKey: readCredential,
     readRouteAuthorization: readDesktopDevicePeerAgentRouteAuthorization,
+    readDefaultDeviceName: () => hostname().trim() || "Unknown Device",
     isAuthorityCurrent: isDesktopDevicePeerAgentAuthorityCurrent
   });
   reconcileDesktopDevicePeerAgentLifecycle();
@@ -6892,6 +6933,7 @@ async function stopManagedOrchestratorForCompleteExit(): Promise<void> {
     () => desktopDevicePeerAgentLifecycle?.stop() ?? Promise.resolve(),
     () => managedOrchestratorExitFence.stop(),
     stopDedicatedHardwareForQuitHandoff,
+    stopNativeGamepadForQuitHandoff,
     () => externalTextInsertionCoordinator.waitForIdle(),
     () => globalVoiceSystemAudio.releaseAll().catch(() => undefined)
   ]);
@@ -6902,6 +6944,7 @@ async function recoverManagedOrchestratorAfterUpdateApplyFailure(): Promise<void
   desktopUpdateNativeInstallQuitHandoffPending = false;
   if (nativeInstallQuitWasPending) quitting = false;
   if (quitting || desktopUpdateLifecycleDisposed) return;
+  recoverNativeGamepadAfterQuitFailure();
   await recoverDedicatedHardwareAfterQuitFailure();
   managedOrchestratorExitFence.releaseForRecovery();
   globalVoiceExitAdmissionClosed = false;
@@ -7074,6 +7117,18 @@ function registerIpc(): void {
       ? captureMainApplicationDocumentOccurrenceForSender(event, parameters[0])
       : undefined;
   });
+  ipcMain.on(DESKTOP_CHANNELS.nativeGamepadCaptureDocument, (event, ...parameters: unknown[]) => {
+    event.returnValue = process.platform === "darwin" && parameters.length === 1
+      && isDesktopMainDocumentClaim(parameters[0])
+      ? captureNativeGamepadDocumentForSender(event, parameters[0])
+      : undefined;
+  });
+  ipcMain.on(DESKTOP_CHANNELS.openWithCaptureDocument, (event, ...parameters: unknown[]) => {
+    event.returnValue = process.platform === "win32" && parameters.length === 1
+      && isDesktopMainDocumentClaim(parameters[0])
+      ? captureDesktopOpenWithDocumentForSender(event, parameters[0])
+      : undefined;
+  });
   ipcMain.handle(DESKTOP_CHANNELS.deepLinkTakePending, (event, ...parameters: unknown[]) => {
     if (parameters.length !== 1) {
       throw new TypeError("Desktop deep-link pull requires its captured Document occurrence.");
@@ -7153,6 +7208,7 @@ function registerIpc(): void {
     return {
       name: app.getName(),
       version: app.getVersion(),
+      defaultDeviceName: hostname().trim() || "Unknown Device",
       platform: process.platform,
       electronVersion: process.versions.electron,
       persistentCredentialStorage: secureStorageAvailable()
@@ -7623,6 +7679,30 @@ function registerIpc(): void {
     assertCurrentMainApplicationDocumentSender(event, parameters[0]);
     requireDesktopAttentionBadgeController().clear(event.sender.id, parseDesktopAttentionKey(parameters[1]));
   });
+  ipcMain.handle(DESKTOP_CHANNELS.nativeGamepadGetSnapshot, (event, ...parameters: unknown[]) => {
+    if (parameters.length !== 1) {
+      throw new TypeError("Native gamepad snapshot requires its captured Document occurrence.");
+    }
+    assertNativeGamepadSender(event, parameters[0]);
+    return requireNativeGamepadRuntime().snapshot();
+  });
+  ipcMain.handle(DESKTOP_CHANNELS.nativeGamepadSetClientState, (event, ...parameters: unknown[]) => {
+    if (parameters.length !== 2) {
+      throw new TypeError("Native gamepad client state requires its captured Document occurrence and one request.");
+    }
+    const owner = assertNativeGamepadSender(event, parameters[0]);
+    return requireNativeGamepadRuntime().setClientState(
+      owner,
+      parseDesktopNativeGamepadClientState(parameters[1])
+    );
+  });
+  ipcMain.handle(DESKTOP_CHANNELS.nativeGamepadProbe, (event, ...parameters: unknown[]) => {
+    if (parameters.length !== 1) {
+      throw new TypeError("Native gamepad probe requires its captured Document occurrence.");
+    }
+    assertNativeGamepadSender(event, parameters[0]);
+    return requireNativeGamepadRuntime().probe();
+  });
   ipcMain.handle(DESKTOP_CHANNELS.dedicatedHardwareGetState, (event, ...parameters: unknown[]) => {
     assertDedicatedHardwareSender(event);
     if (parameters.length !== 0) throw new TypeError("Dedicated hardware state does not accept parameters.");
@@ -8033,11 +8113,40 @@ function registerIpc(): void {
     });
     return nativeFileOpener.open(parameters[0], nativeFileActionScope(event));
   });
+  ipcMain.handle(DESKTOP_CHANNELS.listOpenWithApps, (event, ...parameters: unknown[]) => {
+    if (parameters.length !== 1) throw new TypeError("Open-with application listing requires one request object.");
+    const scope = desktopOpenWithActionScope(event, openWithDocumentOccurrence(parameters[0]));
+    windowsOpenWithApps ??= createWindowsOpenWithApps();
+    return windowsOpenWithApps.list(parameters[0], scope);
+  });
+  ipcMain.handle(DESKTOP_CHANNELS.retireOpenWithApps, (event, ...parameters: unknown[]) => {
+    if (parameters.length !== 1) throw new TypeError("Open-with retirement requires one request object.");
+    const scope = desktopOpenWithActionScope(event, openWithDocumentOccurrence(parameters[0]));
+    windowsOpenWithApps ??= createWindowsOpenWithApps();
+    windowsOpenWithApps.retire(parameters[0], scope);
+  });
+  ipcMain.handle(DESKTOP_CHANNELS.openFileWithApp, (event, ...parameters: unknown[]) => {
+    if (parameters.length !== 1) throw new TypeError("Native file open-with requires one request object.");
+    const scope = desktopOpenWithActionScope(event, openWithDocumentOccurrence(parameters[0]));
+    windowsOpenWithApps ??= createWindowsOpenWithApps();
+    nativeFileOpener ??= new NativeFileOpener({
+      directory: join(app.getPath("userData"), "opened-files"),
+      openPath: (path) => shell.openPath(path)
+    });
+    const owner = windowsOpenWithApps;
+    return nativeFileOpener.openWith(parameters[0], scope, (request) => owner.claim(request, scope));
+  });
   ipcMain.handle(DESKTOP_CHANNELS.cancelFileOpen, (event, ...parameters: unknown[]) => {
     assertTrustedIpcSender(event);
-    if (parameters.length !== 1 || typeof parameters[0] !== "string") throw new TypeError("Native file open cancellation requires one identity.");
+    if ((parameters.length !== 1 && parameters.length !== 2) || typeof parameters[0] !== "string") {
+      throw new TypeError("Native file open cancellation requires one identity.");
+    }
     const scope = nativeFileActionScopes.get(event.sender);
     if (scope !== undefined) nativeFileOpener?.cancel(parameters[0], scope.id);
+    if (parameters.length === 2) {
+      const openWithScope = desktopOpenWithActionScope(event, parameters[1]);
+      nativeFileOpener?.cancel(parameters[0], openWithScope.id);
+    }
   });
   ipcMain.handle(DESKTOP_CHANNELS.revealArtifactSource, (event, ...parameters: unknown[]) => {
     assertTrustedIpcSender(event);
@@ -8604,7 +8713,7 @@ async function launchManagedOrchestratorBootstrap(
       dataDirectory: join(app.getPath("userData"), "orchestrator"),
       workspaceRoot: app.getPath("documents"),
       deviceId,
-      deviceName: `${app.getName()} Desktop`,
+      defaultDeviceName: hostname().trim() || "Unknown Device",
       appVersion: app.getVersion(),
       platform: process.platform,
       publicPort: ports.publicPort,
@@ -8749,6 +8858,20 @@ async function openExternalSafely(value: string): Promise<void> {
   await shell.openExternal(canonicalExternalUrl(value));
 }
 
+function initializeNativeGamepad(): void {
+  if (nativeGamepadRuntime !== undefined) return;
+  nativeGamepadRuntime = createNativeGamepadRuntime<NativeGamepadClientOwner>({
+    platform: process.platform,
+    architecture: process.arch,
+    directory: resolveNativeGamepadDirectory({
+      packaged: app.isPackaged,
+      resourcesPath: process.resourcesPath,
+      sourceDirectory
+    }),
+    onSnapshot: broadcastNativeGamepadSnapshot
+  });
+}
+
 async function initializeDedicatedHardwareInput(): Promise<void> {
   dedicatedHardwareTaskFocusFence.clear();
   dedicatedHardwareSystemVoiceController?.retire();
@@ -8849,8 +8972,9 @@ async function initializeDedicatedHardwareInput(): Promise<void> {
     factory: createElectronDedicatedHardwareUtilityFactory({
       entryPath: resolve(sourceDirectory, "dedicated-hardware", "utility-entry.js")
     }),
-    resolveSdkIdentity: () => resolveDedicatedHardwareSdkIdentity({
-      stagingDirectory: dedicatedHardwareSdkStagingDirectory(process.resourcesPath)
+    resolveSdkIdentity: () => resolveDedicatedHardwareRuntime({
+      stagingDirectory: dedicatedHardwareSdkStagingDirectory(process.resourcesPath),
+      nativeDirectory: app.isPackaged ? join(process.resourcesPath, "native-hardware") : join(sourceDirectory, "native-hardware")
     }),
     keymapBackupDirectory: join(app.getPath("userData"), "hardware-input", "private-keymap")
   });
@@ -8905,6 +9029,14 @@ async function stopDedicatedHardwareForQuitHandoff(): Promise<void> {
   await controller?.dispose();
 }
 
+async function stopNativeGamepadForQuitHandoff(): Promise<void> {
+  await nativeGamepadRuntime?.stop();
+}
+
+function recoverNativeGamepadAfterQuitFailure(): void {
+  nativeGamepadRuntime?.recover();
+}
+
 async function recoverDedicatedHardwareAfterQuitFailure(): Promise<void> {
   if (quitting || dedicatedHardwareController !== undefined) return;
   await initializeDedicatedHardwareInput();
@@ -8943,6 +9075,69 @@ function requireDedicatedHardwareController(): DedicatedHardwareMainController<D
   return dedicatedHardwareController;
 }
 
+function requireNativeGamepadRuntime(): NativeGamepadRuntime<NativeGamepadClientOwner> {
+  if (nativeGamepadRuntime === undefined) throw new Error("Native gamepad runtime is unavailable.");
+  return nativeGamepadRuntime;
+}
+
+function broadcastNativeGamepadSnapshot(snapshot: DesktopNativeGamepadSnapshot): void {
+  const runtime = nativeGamepadRuntime;
+  if (runtime === undefined) return;
+  for (const client of runtime.clients()) {
+    const { endpoint: contents, occurrence } = client;
+    if (contents.isDestroyed() || !nativeGamepadDocuments.isCurrent(contents, occurrence)) continue;
+    const window = dedicatedHardwareWindowForContents(contents);
+    if (window === undefined || !isDedicatedHardwareActionWindowReady(window)) continue;
+    try { contents.send(DESKTOP_CHANNELS.nativeGamepadSnapshot, snapshot); } catch { /* Best effort. */ }
+  }
+}
+
+function installNativeGamepadWindowLifecycle(contents: WebContents): void {
+  if (nativeGamepadWindowLifecycles.has(contents)) return;
+  let retired = false;
+  const onProcessGone = (): void => retire();
+  const onDestroyed = (): void => retire();
+  const retire = (): void => {
+    if (retired) return;
+    retired = true;
+    contents.removeListener("render-process-gone", onProcessGone);
+    contents.removeListener("destroyed", onDestroyed);
+    if (nativeGamepadWindowLifecycles.get(contents)?.retire === retire) {
+      nativeGamepadWindowLifecycles.delete(contents);
+    }
+    nativeGamepadDocuments.retire(contents);
+  };
+  nativeGamepadWindowLifecycles.set(contents, { retire });
+  contents.once("render-process-gone", onProcessGone);
+  contents.once("destroyed", onDestroyed);
+}
+
+function captureNativeGamepadDocumentForSender(
+  event: Pick<IpcMainInvokeEvent, "sender" | "senderFrame">,
+  claim: string
+): string | undefined {
+  const window = nativeGamepadApplicationWindowForContents(event.sender);
+  if (window === undefined) return undefined;
+  if (!isTrustedDesktopIpcSender(event)) {
+    nativeGamepadDocuments.retire(event.sender);
+    return undefined;
+  }
+  installNativeGamepadWindowLifecycle(event.sender);
+  return nativeGamepadDocuments.capture(event.sender, claim).current.occurrence;
+}
+
+function assertNativeGamepadSender(
+  event: IpcMainInvokeEvent,
+  occurrence: unknown
+): NativeGamepadClientOwner {
+  assertTrustedIpcSender(event);
+  const owner = dedicatedHardwareWindowForContents(event.sender);
+  if (owner === undefined) {
+    throw new Error("Native gamepad IPC is restricted to an exact Joko application window.");
+  }
+  return nativeGamepadDocuments.requireCurrent(event.sender, occurrence);
+}
+
 function broadcastDedicatedHardwareState(state: DedicatedHardwareProjectedState): void {
   for (const window of dedicatedHardwareActionWindows()) {
     if (!isDedicatedHardwareActionWindowReady(window)) continue;
@@ -8969,6 +9164,16 @@ function dedicatedHardwareWindowForContents(contents: WebContents): BrowserWindo
   return sessionOwner !== undefined
     && sessionWindows.get(sessionWindowOwnerKey(sessionOwner)) === owner
     && isAllowedSessionWindowNavigation(contents.getURL(), sessionOwner.sessionId, navigationPolicy)
+    ? owner
+    : undefined;
+}
+
+function nativeGamepadApplicationWindowForContents(contents: WebContents): BrowserWindow | undefined {
+  const owner = BrowserWindow.fromWebContents(contents);
+  if (owner === null || owner.isDestroyed() || owner.webContents !== contents) return undefined;
+  if (owner === mainWindow) return owner;
+  const sessionOwner = sessionWindowOwnersByContents.get(contents);
+  return sessionOwner !== undefined && sessionWindows.get(sessionWindowOwnerKey(sessionOwner)) === owner
     ? owner
     : undefined;
 }
@@ -9190,6 +9395,195 @@ function assertFocusedTrustedIpcSender(event: IpcMainInvokeEvent): BrowserWindow
     throw new Error("Desktop user gesture requires a focused trusted Joko application window.");
   }
   return owner;
+}
+
+function openWithDocumentOccurrence(value: unknown): unknown {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)["documentOccurrence"]
+    : undefined;
+}
+
+function desktopOpenWithActionScope(
+  event: IpcMainInvokeEvent,
+  occurrence: unknown
+): NativeFileActionScope {
+  assertTrustedIpcSender(event);
+  if (desktopOpenWithApplicationWindowForContents(event.sender, true) === undefined) {
+    throw new Error("Open-with IPC is restricted to a primary or Task application window.");
+  }
+  const owner = desktopOpenWithDocuments.requireCurrent(event.sender, occurrence);
+  return Object.freeze({
+    id: owner.occurrence,
+    isCurrent: () => !quitting && !event.sender.isDestroyed() &&
+      desktopOpenWithDocuments.isCurrent(event.sender, owner.occurrence) &&
+      desktopOpenWithApplicationWindowForContents(event.sender, true) !== undefined
+  });
+}
+
+function captureDesktopOpenWithDocumentForSender(
+  event: Pick<IpcMainInvokeEvent, "sender" | "senderFrame">,
+  claim: string
+): string | undefined {
+  if (desktopOpenWithApplicationWindowForContents(event.sender, false) === undefined) return undefined;
+  if (!isTrustedDesktopIpcSender(event)) {
+    desktopOpenWithDocuments.retire(event.sender);
+    return undefined;
+  }
+  installDesktopOpenWithWindowLifecycle(event.sender);
+  return desktopOpenWithDocuments.capture(event.sender, claim).current.occurrence;
+}
+
+function installDesktopOpenWithWindowLifecycle(contents: WebContents): void {
+  if (desktopOpenWithWindowLifecycles.has(contents)) return;
+  let retired = false;
+  const verifyCommittedDocument = (): void => {
+    if (desktopOpenWithApplicationWindowForContents(contents, true) === undefined) retire();
+  };
+  const retire = (): void => {
+    if (retired) return;
+    retired = true;
+    contents.removeListener("did-navigate", verifyCommittedDocument);
+    contents.removeListener("did-frame-finish-load", verifyCommittedDocument);
+    contents.removeListener("render-process-gone", retire);
+    contents.removeListener("destroyed", retire);
+    if (desktopOpenWithWindowLifecycles.get(contents)?.retire === retire) {
+      desktopOpenWithWindowLifecycles.delete(contents);
+    }
+    desktopOpenWithDocuments.retire(contents);
+  };
+  desktopOpenWithWindowLifecycles.set(contents, { retire });
+  // These events occur after a replacement commits. Merely starting a
+  // navigation is intentionally not a retirement boundary.
+  contents.on("did-navigate", verifyCommittedDocument);
+  contents.on("did-frame-finish-load", verifyCommittedDocument);
+  contents.once("render-process-gone", retire);
+  contents.once("destroyed", retire);
+}
+
+function desktopOpenWithApplicationWindowForContents(
+  contents: WebContents,
+  requireTrustedNavigation: boolean
+): BrowserWindow | undefined {
+  const owner = BrowserWindow.fromWebContents(contents);
+  if (owner === null || owner.isDestroyed() || owner.webContents !== contents) return undefined;
+  const owned = owner === mainWindow || (() => {
+    const sessionOwner = sessionWindowOwnersByContents.get(contents);
+    return sessionOwner !== undefined && sessionWindows.get(sessionWindowOwnerKey(sessionOwner)) === owner;
+  })();
+  if (!owned) return undefined;
+  return !requireTrustedNavigation || trustedApplicationWindowForContents(contents) === owner ? owner : undefined;
+}
+
+function createWindowsOpenWithApps(): WindowsOpenWithApps {
+  let consoleCodepage: Promise<number | undefined> | undefined;
+  const iconCache = new Map<string, string | null>();
+  const windowsRoot = process.env["SystemRoot"] ?? process.env["WINDIR"];
+  const systemExecutable = (name: string): string | undefined => {
+    if (windowsRoot === undefined) return undefined;
+    const candidate = join(windowsRoot, "System32", name);
+    return isLocalWindowsDrivePath(candidate) ? candidate : undefined;
+  };
+  const chcpExecutable = systemExecutable("chcp.com");
+  const registryExecutable = systemExecutable("reg.exe");
+  const readConsoleCodepage = (): Promise<number | undefined> => {
+    if (chcpExecutable === undefined) return Promise.resolve(undefined);
+    consoleCodepage ??= new Promise((resolveCodepage) => {
+      execFile(chcpExecutable, [], { windowsHide: true, timeout: 3_000, encoding: "utf8" }, (error, stdout) => {
+        resolveCodepage(error === null ? parseWindowsConsoleCodepage(String(stdout ?? "")) : undefined);
+      });
+    });
+    return consoleCodepage;
+  };
+  return new WindowsOpenWithApps({
+    platform: process.platform,
+    environment: process.env,
+    queryRegistry: async (keyPath, arguments_, signal) => {
+      if (registryExecutable === undefined) return "";
+      const codepage = await readConsoleCodepage();
+      if (signal.aborted) return "";
+      const bytes = await new Promise<Buffer | undefined>((resolveOutput) => {
+        execFile(
+          registryExecutable,
+          ["query", keyPath, ...arguments_],
+          { windowsHide: true, timeout: 5_000, maxBuffer: 1024 * 1024, encoding: "buffer", signal },
+          (error, stdout) => {
+            resolveOutput(error === null && Buffer.isBuffer(stdout) ? stdout : undefined);
+          }
+        );
+      });
+      return bytes === undefined ? "" : decodeWindowsRegistryOutput(bytes, codepage);
+    },
+    inspectExecutable: inspectWindowsOpenWithExecutable,
+    getAppIcon: async (executable) => {
+      const key = executable.toLowerCase();
+      if (iconCache.has(key)) return iconCache.get(key) ?? null;
+      let timeout: NodeJS.Timeout | undefined;
+      try {
+        const icon = await Promise.race([
+          app.getFileIcon(executable, { size: "small" }),
+          new Promise<undefined>((resolveTimeout) => {
+            timeout = setTimeout(() => resolveTimeout(undefined), 4_000);
+          })
+        ]);
+        const value = icon !== undefined && !icon.isEmpty() ? icon.toDataURL() : null;
+        iconCache.set(key, value);
+        return value;
+      } catch {
+        iconCache.set(key, null);
+        return null;
+      } finally {
+        if (timeout !== undefined) clearTimeout(timeout);
+      }
+    },
+    spawnDetached: spawnWindowsOpenWithApplication
+  });
+}
+
+async function inspectWindowsOpenWithExecutable(candidate: string): Promise<WindowsExecutableSnapshot | undefined> {
+  try {
+    if (process.platform !== "win32" || !isLocalWindowsDrivePath(candidate)) return undefined;
+    const canonicalPath = await realpath(candidate);
+    if (!isLocalWindowsDrivePath(canonicalPath) ||
+      !sameWindowsPath(await realpath(canonicalPath), canonicalPath)) return undefined;
+    const info = await lstat(canonicalPath, { bigint: true });
+    if (!info.isFile() || info.isSymbolicLink()) return undefined;
+    const identity = createHash("sha256").update([
+      info.dev,
+      info.ino,
+      info.size,
+      info.mtimeNs,
+      info.ctimeNs,
+      info.birthtimeNs
+    ].map((value) => value.toString()).join(":"), "utf8").digest("hex");
+    return Object.freeze({ canonicalPath, identity });
+  } catch {
+    return undefined;
+  }
+}
+
+function spawnWindowsOpenWithApplication(executable: string, file: string): Promise<string> {
+  return new Promise((resolveSpawn) => {
+    let settled = false;
+    const settle = (result: string): void => {
+      if (settled) return;
+      settled = true;
+      resolveSpawn(result);
+    };
+    try {
+      const child = spawn(executable, [file], { detached: true, stdio: "ignore", windowsHide: false });
+      child.once("error", () => settle("The selected application could not be started."));
+      child.once("spawn", () => {
+        child.unref();
+        settle("");
+      });
+    } catch {
+      settle("The selected application could not be started.");
+    }
+  });
+}
+
+function sameWindowsPath(left: string, right: string): boolean {
+  return left.toLowerCase() === right.toLowerCase();
 }
 
 function nativeFileActionScope(event: IpcMainInvokeEvent): NativeFileActionScope {

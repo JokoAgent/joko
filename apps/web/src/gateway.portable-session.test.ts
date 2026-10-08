@@ -5,8 +5,11 @@ import {
   BlobDisposition,
   CommitPortableSessionImportResponseSchema,
   CompleteBlobUploadResponseSchema,
+  DeviceKind,
   ExportPortableSessionResponseSchema,
   GetBlobDownloadTicketResponseSchema,
+  GetConnectionResponseSchema,
+  GetDeviceResponseSchema,
   GetPortableReplacementCleanupResponseSchema,
   GetSnapshotResponseSchema,
   InspectPortableSessionImportResponseSchema,
@@ -385,6 +388,18 @@ function createGateway(transport: Transport) {
 function portableTransport(handler: (method: any, input: any) => Promise<any>): Transport {
   return {
     unary: vi.fn(async (method: any, _signal: unknown, _timeout: unknown, _headers: unknown, input: any) => {
+      if (method.localName === "getConnection") {
+        expect(input).toEqual({ connectionId: "connection-1" });
+        return response(method, create(GetConnectionResponseSchema, {
+          connection: { connectionId: "connection-1", deviceId: "device-test" }
+        }));
+      }
+      if (method.localName === "getDevice") {
+        expect(input).toEqual({ deviceId: "device-test" });
+        return response(method, create(GetDeviceResponseSchema, {
+          device: { deviceId: "device-test", kind: DeviceKind.WEB }
+        }));
+      }
       if (method.localName === "getSnapshot") {
         return response(method, create(GetSnapshotResponseSchema, {
           snapshot: create(SnapshotSchema, {

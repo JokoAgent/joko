@@ -276,6 +276,9 @@ importers:
         specifier: 0.183.2
         version: 0.183.2
     devDependencies:
+      '@joko/web':
+        specifier: workspace:*
+        version: link:../web
       '@types/react':
         specifier: 19.2.2
         version: 19.2.2

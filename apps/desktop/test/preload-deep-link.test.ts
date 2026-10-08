@@ -14,6 +14,24 @@ interface KeepAwakeApi {
   onKeepAwakeChanged(listener: (settings: { readonly enabled: boolean }) => void): () => void;
 }
 
+interface NativeGamepadApi {
+  getSnapshot(): Promise<unknown>;
+  setClientState(value: unknown): Promise<unknown>;
+  probe(): Promise<unknown>;
+}
+
+interface OpenWithApi {
+  listOpenWithApps(request: { readonly listOccurrence: string; readonly name: string }): Promise<unknown>;
+  retireOpenWithApps(listOccurrence: string): Promise<void>;
+  openFileWithApp(request: {
+    readonly requestId: string;
+    readonly listOccurrence: string;
+    readonly appId: string;
+    readonly file: { readonly name: string; readonly mediaType: string; readonly bytes: Uint8Array };
+  }): Promise<unknown>;
+  cancelFileOpen(requestId: string): Promise<void>;
+}
+
 const MAIN_DOCUMENT_CLAIM = "00000000-0000-4000-8000-000000000001";
 
 function delivery(documentOccurrence: string, deliveryOccurrence = 1): unknown {
@@ -30,11 +48,16 @@ function loadPreload(
     readonly randomUUID?: () => string;
     readonly getRandomValues?: (bytes: Uint8Array) => Uint8Array;
   } = { randomUUID: () => MAIN_DOCUMENT_CLAIM },
-  preferredSystemLocale: unknown = "zh-CN"
+  preferredSystemLocale: unknown = "zh-CN",
+  platform: NodeJS.Platform = "win32",
+  nativeGamepadOccurrence: unknown = "native-gamepad-document",
+  openWithOccurrence: unknown = "00000000-0000-4000-8000-000000000010"
 ): {
   readonly exposed: Readonly<Record<string, unknown>>;
   readonly deepLinks: DeepLinkApi;
   readonly power: KeepAwakeApi;
+  readonly nativeGamepad: NativeGamepadApi;
+  readonly openWith: OpenWithApi;
   readonly invoke: ReturnType<typeof vi.fn>;
   readonly synchronousChannels: readonly string[];
   readonly listeners: Map<string, (...parameters: unknown[]) => void>;
@@ -46,9 +69,16 @@ function loadPreload(
   }).outputText;
   const listeners = new Map<string, (...parameters: unknown[]) => void>();
   let pending: unknown;
-  const invoke = vi.fn(async (channel: string): Promise<unknown> => {
+  const invoke = vi.fn(async (channel: string, ..._parameters: unknown[]): Promise<unknown> => {
     if (channel === "joko:deep-link:take-pending") return pending;
     if (channel === "joko:deep-link:acknowledge") return true;
+    if (channel.startsWith("joko:native-gamepad:")) {
+      return { version: 1, revision: 0, status: "idle", devices: [] };
+    }
+    if (channel === DESKTOP_CHANNELS.listOpenWithApps) {
+      return { status: "listed", listOccurrence: "00000000-0000-4000-8000-000000000011", apps: [] };
+    }
+    if (channel === DESKTOP_CHANNELS.openFileWithApp) return { status: "opened" };
     return undefined;
   });
   let exposed: unknown;
@@ -64,6 +94,14 @@ function loadPreload(
           expect(parameters).toEqual([MAIN_DOCUMENT_CLAIM]);
         }
         if (channel === "joko:main-document:occurrence:get") return documentOccurrence;
+        if (channel === "joko:native-gamepad:document:capture") {
+          expect(parameters).toEqual([MAIN_DOCUMENT_CLAIM]);
+          return nativeGamepadOccurrence;
+        }
+        if (channel === DESKTOP_CHANNELS.openWithCaptureDocument) {
+          expect(parameters).toEqual([MAIN_DOCUMENT_CLAIM]);
+          return openWithOccurrence;
+        }
         if (channel === "joko:locale:preferred-system:get") return preferredSystemLocale;
         return false;
       },
@@ -83,7 +121,7 @@ function loadPreload(
       if (specifier !== "electron") throw new Error(`Unexpected preload dependency: ${specifier}`);
       return electron;
     },
-    process: { platform: "win32" },
+    process: { platform },
     crypto,
     console,
     Object,
@@ -100,6 +138,7 @@ function loadPreload(
     RegExp,
     URL,
     URLSearchParams,
+    TextEncoder,
     Uint8Array,
     ArrayBuffer,
     structuredClone
@@ -107,11 +146,14 @@ function loadPreload(
   const desktop = exposed as Readonly<Record<string, unknown>> & {
     readonly deepLinks: DeepLinkApi;
     readonly power: KeepAwakeApi;
-  };
+    readonly nativeGamepad: NativeGamepadApi;
+  } & OpenWithApi;
   return {
     exposed: desktop,
     deepLinks: desktop.deepLinks,
     power: desktop.power,
+    nativeGamepad: desktop.nativeGamepad,
+    openWith: desktop,
     invoke,
     synchronousChannels,
     listeners,
@@ -125,6 +167,7 @@ describe("main application preload deep-link occurrence fence", () => {
 
     expect(loaded.synchronousChannels).toEqual([
       "joko:main-document:occurrence:get",
+      "joko:files:open-with:document:capture",
       "joko:native-task-status:availability:get",
       "joko:locale:preferred-system:get"
     ]);
@@ -173,6 +216,132 @@ describe("main application preload deep-link occurrence fence", () => {
       documentOccurrence: "document-current",
       deliveryOccurrence: 2
     })).resolves.toBe(true);
+  });
+});
+
+describe("application preload open-with Document occurrence fence", () => {
+  const LIST = "00000000-0000-4000-8000-000000000011";
+  const REQUEST = "00000000-0000-4000-8000-000000000012";
+  const APP = "00000000-0000-4000-8000-000000000013";
+
+  it("advertises only after Windows capture and privately binds list/open/retire/cancel", async () => {
+    const loaded = loadPreload("document-current");
+    expect(loaded.exposed["capabilities"]).toContain("files.openWith");
+    expect(Reflect.has(loaded.exposed, "openWithDocumentOccurrence")).toBe(false);
+
+    await loaded.openWith.listOpenWithApps({ listOccurrence: LIST, name: "report.txt" });
+    await loaded.openWith.openFileWithApp({
+      requestId: REQUEST,
+      listOccurrence: LIST,
+      appId: APP,
+      file: { name: "report.txt", mediaType: "text/plain", bytes: new Uint8Array([1]) }
+    });
+    await loaded.openWith.retireOpenWithApps(LIST);
+    await loaded.openWith.cancelFileOpen(REQUEST);
+
+    expect(loaded.invoke).toHaveBeenCalledWith(DESKTOP_CHANNELS.listOpenWithApps, {
+      documentOccurrence: "00000000-0000-4000-8000-000000000010",
+      listOccurrence: LIST,
+      name: "report.txt"
+    });
+    expect(loaded.invoke).toHaveBeenCalledWith(DESKTOP_CHANNELS.openFileWithApp, {
+      appId: APP,
+      documentOccurrence: "00000000-0000-4000-8000-000000000010",
+      file: { name: "report.txt", mediaType: "text/plain", bytes: expect.any(Uint8Array) },
+      listOccurrence: LIST,
+      requestId: REQUEST
+    });
+    expect(loaded.invoke).toHaveBeenCalledWith(DESKTOP_CHANNELS.retireOpenWithApps, {
+      documentOccurrence: "00000000-0000-4000-8000-000000000010",
+      listOccurrence: LIST
+    });
+    expect(loaded.invoke).toHaveBeenCalledWith(
+      DESKTOP_CHANNELS.cancelFileOpen,
+      REQUEST,
+      "00000000-0000-4000-8000-000000000010"
+    );
+  });
+
+  it("fails closed off Windows or when the capture is rejected", async () => {
+    const linux = loadPreload("document-current", { randomUUID: () => MAIN_DOCUMENT_CLAIM }, "en", "linux");
+    expect(linux.exposed["capabilities"]).not.toContain("files.openWith");
+    await expect(linux.openWith.listOpenWithApps({ listOccurrence: LIST, name: "report.txt" }))
+      .rejects.toThrow(/unavailable/u);
+
+    const rejected = loadPreload(
+      "document-current",
+      { randomUUID: () => MAIN_DOCUMENT_CLAIM },
+      "en",
+      "win32",
+      undefined,
+      null
+    );
+    expect(rejected.exposed["capabilities"]).not.toContain("files.openWith");
+    await expect(rejected.openWith.openFileWithApp({
+      requestId: REQUEST,
+      listOccurrence: LIST,
+      appId: APP,
+      file: { name: "report.txt", mediaType: "text/plain", bytes: new Uint8Array([1]) }
+    })).rejects.toThrow(/unavailable/u);
+  });
+});
+
+describe("application preload native gamepad Document occurrence fence", () => {
+  it("advertises the capability only after capture and privately binds every request", async () => {
+    const loaded = loadPreload(
+      "document-current",
+      { randomUUID: () => MAIN_DOCUMENT_CLAIM },
+      "en",
+      "darwin",
+      "native-gamepad-current"
+    );
+
+    expect(loaded.synchronousChannels).toEqual([
+      "joko:main-document:occurrence:get",
+      "joko:native-gamepad:document:capture",
+      "joko:native-task-status:availability:get",
+      "joko:locale:preferred-system:get"
+    ]);
+    expect(loaded.exposed["capabilities"]).toContain("hardware.nativeGamepad");
+    expect(Reflect.has(loaded.exposed, "nativeGamepadDocumentOccurrence")).toBe(false);
+
+    await expect(loaded.nativeGamepad.getSnapshot()).resolves.toEqual({
+      version: 1, revision: 0, status: "idle", devices: []
+    });
+    await expect(loaded.nativeGamepad.setClientState({ version: 1, enabled: true, preview: false }))
+      .resolves.toMatchObject({ status: "idle" });
+    await expect(loaded.nativeGamepad.probe()).resolves.toMatchObject({ status: "idle" });
+    expect(loaded.invoke).toHaveBeenCalledWith(
+      DESKTOP_CHANNELS.nativeGamepadGetSnapshot,
+      "native-gamepad-current"
+    );
+    expect(loaded.invoke).toHaveBeenCalledWith(
+      DESKTOP_CHANNELS.nativeGamepadSetClientState,
+      "native-gamepad-current",
+      { version: 1, enabled: true, preview: false }
+    );
+    expect(loaded.invoke).toHaveBeenCalledWith(
+      DESKTOP_CHANNELS.nativeGamepadProbe,
+      "native-gamepad-current"
+    );
+  });
+
+  it("fails closed without advertising or invoking when capture is rejected", async () => {
+    const loaded = loadPreload(
+      "document-current",
+      { randomUUID: () => MAIN_DOCUMENT_CLAIM },
+      "en",
+      "darwin",
+      null
+    );
+
+    expect(loaded.exposed["capabilities"]).not.toContain("hardware.nativeGamepad");
+    await expect(loaded.nativeGamepad.getSnapshot()).rejects.toThrow(/unavailable/u);
+    await expect(loaded.nativeGamepad.setClientState({ version: 1, enabled: true, preview: false }))
+      .rejects.toThrow(/unavailable/u);
+    await expect(loaded.nativeGamepad.probe()).rejects.toThrow(/unavailable/u);
+    expect(loaded.invoke.mock.calls.some(([channel]) => String(channel).startsWith("joko:native-gamepad:")))
+      .toBe(false);
   });
 });
 

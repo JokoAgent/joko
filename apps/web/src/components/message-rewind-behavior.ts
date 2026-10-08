@@ -1,4 +1,5 @@
 import type { CapabilityView, NativeNavigationTargetView, TargetView, TimelineItemView, WorkspaceChangeSetView } from "../model.js";
+import { isInternalContinuationTimelineItem } from "../runtime-recovery.js";
 
 export function canRewindToSessionStart(capability: CapabilityView | undefined, target: TargetView | undefined): boolean {
   if (capability?.supported !== true) return false;
@@ -10,19 +11,20 @@ export function canRewindToSessionStart(capability: CapabilityView | undefined, 
 export function lastVisibleUserMessage(items: readonly TimelineItemView[]): TimelineItemView | undefined {
   for (let index = items.length - 1; index >= 0; index -= 1) {
     const item = items[index];
-    if (item?.kind === "user") return item;
+    if (item?.kind === "user" && !isInternalContinuationTimelineItem(item)) return item;
   }
   return undefined;
 }
 
 export function canEditVisibleUserMessage(item: TimelineItemView | undefined, allowStart = false): item is TimelineItemView {
   return item?.kind === "user"
+    && !isInternalContinuationTimelineItem(item)
     && messageDialogueRewindTarget(item, allowStart) !== undefined
     && (item.text?.trim().length ?? 0) > 0;
 }
 
 export function messageDialogueRewindTarget(item: TimelineItemView, allowStart = false): NativeNavigationTargetView | undefined {
-  if (item.kind !== "user") return undefined;
+  if (item.kind !== "user" || isInternalContinuationTimelineItem(item)) return undefined;
   const target = item.nativeRewindBefore;
   if (target?.kind === "session_start") return allowStart ? target : undefined;
   return target?.kind === "native_entry" && target.entryId.length > 0 ? target : undefined;
@@ -34,13 +36,13 @@ export function sameNativeNavigationTarget(left: NativeNavigationTargetView | un
 }
 
 export function messageRoundRunId(items: readonly TimelineItemView[], userMessageId: string): string | undefined {
-  const start = items.findIndex((item) => item.id === userMessageId && item.kind === "user");
+  const start = items.findIndex((item) => item.id === userMessageId && item.kind === "user" && !isInternalContinuationTimelineItem(item));
   if (start < 0) return undefined;
   const userRunId = items[start]?.runId;
   if (userRunId !== undefined && userRunId.length > 0) return userRunId;
   for (let index = start + 1; index < items.length; index += 1) {
     const item = items[index];
-    if (item === undefined || item.kind === "user") break;
+    if (item === undefined || item.kind === "user" && !isInternalContinuationTimelineItem(item)) break;
     if (item.runId !== undefined && item.runId.length > 0) return item.runId;
   }
   return undefined;

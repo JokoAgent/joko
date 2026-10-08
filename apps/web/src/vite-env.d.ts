@@ -8,6 +8,7 @@ interface JokoDesktopFile {
 
 interface JokoDesktopAppInfo {
   readonly name: string;
+  readonly defaultDeviceName: string;
   readonly version: string;
   readonly platform: string;
   readonly electronVersion: string;
@@ -124,6 +125,16 @@ type JokoDesktopOpenFileResult =
   | { readonly status: "opened" | "cancelled" | "unknown" | "unavailable" }
   | { readonly status: "failed"; readonly reason: "capacity" | "storage" | "open" };
 
+interface JokoDesktopOpenWithApp {
+  readonly appId: string;
+  readonly label: string;
+  readonly iconDataUrl?: string;
+}
+
+type JokoDesktopListOpenWithAppsResult =
+  | { readonly status: "listed"; readonly listOccurrence: string; readonly apps: readonly JokoDesktopOpenWithApp[] }
+  | { readonly status: "cancelled" | "unavailable" | "failed" };
+
 type JokoDesktopRevealArtifactSourceResult =
   | { readonly status: "revealed" | "cancelled" | "unknown" | "unavailable" }
   | { readonly status: "failed"; readonly reason: "capacity" | "reveal" };
@@ -211,8 +222,10 @@ type JokoDesktopNativeTaskStatusAction =
 type JokoDesktopCapability =
   | "files.copy"
   | "files.open"
+  | "files.openWith"
   | "files.revealSource"
   | "hardware.dedicatedInput"
+  | "hardware.nativeGamepad"
   | "app.info"
   | "app.update"
   | "attention.badge"
@@ -584,6 +597,7 @@ interface JokoDesktopApi {
     onCommand(listener: (command: JokoDesktopGlobalVoiceCommand) => void): () => void;
   };
   readonly dedicatedHardware: import("./dedicated-hardware.js").DedicatedHardwareBridge;
+  readonly nativeGamepad?: import("./native-gamepad.js").NativeGamepadBridge;
   chooseFiles(): Promise<readonly JokoDesktopFile[]>;
   choosePortableSessionFile(): Promise<JokoDesktopFile | undefined>;
   readonly deepLinks: {
@@ -596,6 +610,14 @@ interface JokoDesktopApi {
   cancelFileCopy(requestId: string): Promise<void>;
   openFile(request: { readonly requestId: string; readonly file: JokoDesktopFile }): Promise<JokoDesktopOpenFileResult>;
   cancelFileOpen(requestId: string): Promise<void>;
+  listOpenWithApps(request: { readonly listOccurrence: string; readonly name: string }): Promise<JokoDesktopListOpenWithAppsResult>;
+  retireOpenWithApps(listOccurrence: string): Promise<void>;
+  openFileWithApp(request: {
+    readonly requestId: string;
+    readonly listOccurrence: string;
+    readonly appId: string;
+    readonly file: JokoDesktopFile;
+  }): Promise<JokoDesktopOpenFileResult>;
   revealArtifactSource(request: {
     readonly requestId: string;
     readonly profileId: string;

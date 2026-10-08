@@ -12,9 +12,10 @@ import {
   projectVoiceDictionaryReadOnly, type VoiceDictionaryReadOnlyView,
   WorktreeEligibility, WorktreeService,
   TransferDirection, WorkspaceEntryListingPolicy, WorkspaceFileChangeKind, WorkspaceService,
+  SubagentService, type BackgroundTask, type SubagentRun, type SubagentRunDetail, type SubagentTranscriptEntry,
   JOKO_API_VERSION, SessionMessageSearchSemanticMode, SessionMessageSearchSessionStatus,
   isPrivateLanDiscoveryHost, validateDiscoveredNode,
-  type Artifact, type BlobRef, type BlobTransferTicket, type Connection, type Device, type DiscoveredNodeRecord, type ImageThumbnail,
+  type Artifact, type BlobRef, type BlobTransferTicket, type Connection, type Device, type DeviceNameSource, type DiscoveredNodeRecord, type ImageThumbnail,
   type Event, type EventCursor, type FilePreview, type FileRevision, type Operation, type OperationMutation,
   type NativeSessionTree, type PendingBlobUpload, type RuntimeCommand, type Schedule, type ScheduleRunHistory,
   type SchedulerRuntimeSnapshot, type SessionMessageSearchMatch, type SessionResource, type Snapshot, type Target,
@@ -108,9 +109,9 @@ export interface MobilePushCapabilityResult {
 export interface MobileNetwork {
   inspect(origin: string, signal?: AbortSignal): Promise<NodeIdentity>;
   discover(origin: string, signal?: AbortSignal): Promise<readonly DiscoveredNodeRecord[]>;
-  requestPairing(origin: string, deviceName: string, platform: string, signal?: AbortSignal): Promise<{ identity: NodeIdentity; challengeId: string }>;
-  completePairing(origin: string, challengeId: string, code: string, deviceName: string, platform: string, signal?: AbortSignal): Promise<{ credential: PairedCredential; identity: NodeIdentity }>;
-  readOwner(credential: PairedCredential, signal?: AbortSignal): Promise<{ connection: Connection; device: Device; snapshot: Snapshot }>;
+  requestPairing(origin: string, deviceName: string, platform: string, deviceNameSource: DeviceNameSource, signal?: AbortSignal): Promise<{ identity: NodeIdentity; challengeId: string }>;
+  completePairing(origin: string, challengeId: string, code: string, deviceName: string, platform: string, deviceNameSource: DeviceNameSource, signal?: AbortSignal): Promise<{ credential: PairedCredential; identity: NodeIdentity }>;
+  readOwner(credential: PairedCredential, deviceNameSource: DeviceNameSource, signal?: AbortSignal): Promise<{ connection: Connection; device: Device; snapshot: Snapshot }>;
   listPartners(credential: PairedCredential, signal?: AbortSignal): Promise<readonly MobilePartner[]>;
   listPartnerSessions(credential: PairedCredential, partnerId: string, signal?: AbortSignal): Promise<ListPartnerSessionsResponse>;
   listPartnerPrivateThreads(credential: PairedCredential, partnerId: string, signal?: AbortSignal): Promise<readonly MobilePrivateThread[]>;
@@ -123,6 +124,10 @@ export interface MobileNetwork {
   unregisterMobilePush(origin: string, ticket: MobilePushRevocationTicket, signal?: AbortSignal): Promise<void>;
   readSession(credential: PairedCredential, sessionId: string, signal?: AbortSignal): Promise<Snapshot>;
   readNativeSessionTree(credential: PairedCredential, sessionId: string, signal?: AbortSignal): Promise<NativeSessionTree>;
+  listBackgroundTasks(credential: PairedCredential, sessionId: string, pageToken?: string, signal?: AbortSignal): Promise<{ tasks: readonly BackgroundTask[]; nextPageToken: string }>;
+  listSubagentRuns(credential: PairedCredential, sessionId: string, pageToken?: string, signal?: AbortSignal): Promise<{ runs: readonly SubagentRun[]; nextPageToken: string }>;
+  getSubagentRun(credential: PairedCredential, sessionId: string, runId: string, signal?: AbortSignal): Promise<SubagentRunDetail>;
+  listSubagentTranscript(credential: PairedCredential, sessionId: string, runId: string, childId?: string, pageToken?: string, signal?: AbortSignal): Promise<{ entries: readonly SubagentTranscriptEntry[]; nextPageToken: string; tailPageToken: string }>;
   readHistory(credential: PairedCredential, sessionId: string, before?: EventCursor, signal?: AbortSignal): Promise<{ events: Event[]; before?: EventCursor }>;
   readAround(credential: PairedCredential, sessionId: string, eventId: string, signal?: AbortSignal): Promise<Event[]>;
   searchSessionMessages(credential: PairedCredential, query: string, status: SessionMessageSearchSessionStatus, signal?: AbortSignal): Promise<readonly SessionMessageSearchMatch[]>;
@@ -1052,21 +1057,21 @@ export const mobileNetwork: MobileNetwork = {
       return value;
     });
   },
-  async requestPairing(rawOrigin, deviceName, platform, signal) {
+  async requestPairing(rawOrigin, deviceName, platform, deviceNameSource, signal) {
     const origin = normalizeNodeOrigin(rawOrigin);
     const client = createClient(ConnectionService, transport(origin));
     const node = parseNodeIdentity((await client.getServerInfo({}, options(signal))).server);
     if (!node.pairingEnabled) throw new Error("Pairing is closed on this Joko node. Ask the node owner to open pairing.");
-    const args = { deviceDisplayName: deviceName.trim(), deviceKind: DeviceKind.MOBILE, platform, appVersion: "0.1.0" };
+    const args = { deviceDisplayName: deviceName.trim(), deviceKind: DeviceKind.MOBILE, platform, appVersion: "0.1.0", deviceNameSource };
     const challenge = (await client.beginPairing(args, options(signal))).challenge;
     if (!challenge?.challengeId) throw new Error("The Joko node did not return a pairing challenge.");
     return { identity: node, challengeId: challenge.challengeId };
   },
-  async completePairing(rawOrigin, challengeId, code, deviceName, platform, signal) {
+  async completePairing(rawOrigin, challengeId, code, deviceName, platform, deviceNameSource, signal) {
     const origin = normalizeNodeOrigin(rawOrigin);
     const client = createClient(ConnectionService, transport(origin));
     const node = parseNodeIdentity((await client.getServerInfo({}, options(signal))).server);
-    const args = { deviceDisplayName: deviceName.trim(), deviceKind: DeviceKind.MOBILE, platform, appVersion: "0.1.0" };
+    const args = { deviceDisplayName: deviceName.trim(), deviceKind: DeviceKind.MOBILE, platform, appVersion: "0.1.0", deviceNameSource };
     const result = (await client.completePairing({ ...args, challengeId, humanCode: code.trim() }, options(signal))).result;
     if (!result?.connection?.connectionId || !result.connection.connectionProfileId || !result.device?.deviceId
       || result.connection.deviceId !== result.device.deviceId || !result.authKey) {
@@ -1081,15 +1086,17 @@ export const mobileNetwork: MobileNetwork = {
       }
     };
   },
-  async readOwner(credential, signal) {
-    const client = createClient(ConnectionService, transport(credential.origin, credential.authKey));
-    const [connection, device, snapshot] = await Promise.all([
-      client.getConnection({ connectionId: credential.connectionId }, options(signal)),
-      client.getDevice({ deviceId: credential.deviceId }, options(signal)),
-      createClient(EventService, transport(credential.origin, credential.authKey)).getSnapshot({ scope: { kind: { case: "owner", value: {} } } }, options(signal))
-    ]);
-    if (!connection.connection || !device.device || !snapshot.snapshot) throw new Error("The Joko node returned an incomplete owner snapshot.");
-    return { connection: connection.connection, device: device.device, snapshot: snapshot.snapshot };
+  async readOwner(credential, currentDeviceNameSource, signal) {
+    const response = await createClient(EventService, transport(credential.origin, credential.authKey)).getSnapshot({
+      scope: { kind: { case: "owner", value: {} } }, currentDeviceNameSource
+    }, options(signal));
+    const snapshot = response.snapshot;
+    const connections = snapshot?.connections.filter((item) => item.connectionId === credential.connectionId) ?? [];
+    const devices = snapshot?.devices.filter((item) => item.deviceId === credential.deviceId) ?? [];
+    if (!snapshot || connections.length !== 1 || devices.length !== 1) {
+      throw new Error("The Joko node returned an incomplete or ambiguous owner snapshot.");
+    }
+    return { connection: connections[0]!, device: devices[0]!, snapshot };
   },
   async listPartners(credential, signal) {
     const response = await createClient(PartnerService, transport(credential.origin, credential.authKey))
@@ -1205,6 +1212,44 @@ export const mobileNetwork: MobileNetwork = {
       .getNativeSessionTree({ sessionId }, options(signal));
     if (!response.tree) throw new Error("The Joko node returned no native branch tree.");
     return response.tree;
+  },
+  async listBackgroundTasks(credential, sessionId, pageToken = "", signal) {
+    signal?.throwIfAborted();
+    if (!sessionId) throw new Error("A current task is required for background activity.");
+    const response = await createClient(SessionService, transport(credential.origin, credential.authKey))
+      .listBackgroundTasks({ sessionId, page: { pageToken, pageSize: 100 } }, options(signal));
+    if (response.backgroundTasks.some((task) => !task.backgroundTaskId || task.sessionId !== sessionId)) {
+      throw new Error("The background activity response belongs to another task.");
+    }
+    return { tasks: response.backgroundTasks, nextPageToken: response.page?.nextPageToken ?? "" };
+  },
+  async listSubagentRuns(credential, sessionId, pageToken = "", signal) {
+    signal?.throwIfAborted();
+    if (!sessionId) throw new Error("A current task is required for delegated activity.");
+    const response = await createClient(SubagentService, transport(credential.origin, credential.authKey))
+      .listSubagentRuns({ sessionId, page: { pageToken, pageSize: 100 } }, options(signal));
+    if (response.runs.some((run) => !run.subagentRunId || run.sessionId !== sessionId)) {
+      throw new Error("The delegated activity response belongs to another task.");
+    }
+    return { runs: response.runs, nextPageToken: response.page?.nextPageToken ?? "" };
+  },
+  async getSubagentRun(credential, sessionId, runId, signal) {
+    signal?.throwIfAborted();
+    if (!sessionId || !runId) throw new Error("An exact delegated run is required.");
+    const response = await createClient(SubagentService, transport(credential.origin, credential.authKey))
+      .getSubagentRun({ sessionId, subagentRunId: runId }, options(signal));
+    if (!response.run?.run || response.run.run.sessionId !== sessionId || response.run.run.subagentRunId !== runId) {
+      throw new Error("The delegated detail response belongs to another run.");
+    }
+    return response.run;
+  },
+  async listSubagentTranscript(credential, sessionId, runId, childId = "", pageToken = "", signal) {
+    signal?.throwIfAborted();
+    if (!sessionId || !runId) throw new Error("An exact delegated run is required.");
+    const response = await createClient(SubagentService, transport(credential.origin, credential.authKey))
+      .listSubagentTranscript({ sessionId, subagentRunId: runId, childId, page: { pageToken, pageSize: 200 } }, options(signal));
+    if (response.entries.some((entry) => !entry.entryId || entry.sequence < 0n)) throw new Error("The delegated transcript contains an invalid entry.");
+    return { entries: response.entries, nextPageToken: response.page?.nextPageToken ?? "", tailPageToken: response.tailPageToken };
   },
   async readHistory(credential, sessionId, before, signal) {
     const response = await createClient(SessionService, transport(credential.origin, credential.authKey)).listSessionTimeline({

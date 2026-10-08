@@ -3793,7 +3793,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       await this.#releaseRuntimeSubscription(previous, false);
       this.#assertNativeAuthenticationAdmission(input.nativeAuthenticationAdmission);
     }
-    const state = createTranslatorState();
+    const state = createTranslatorState(input.thread.id);
     if (input.thread.status?.["type"] === "active") {
       const lastTurn = input.thread.turns.at(-1);
       if (lastTurn?.status === "inProgress") state.activeTurnId = lastTurn.id;
@@ -4447,6 +4447,11 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       );
       this.#cancelPendingMcpCalls(runtime, (pending) => pending.threadId === runtime.threadId);
       return true;
+    }
+    if (method === "turn/plan/updated") {
+      return isJsonObject(params) && params["threadId"] === runtime.threadId
+        && turnId !== undefined && runtime.state.activeTurnId === turnId
+        && !runtime.state.terminalTurnIds.has(turnId);
     }
     if (method.startsWith("item/")) {
       return turnId !== undefined

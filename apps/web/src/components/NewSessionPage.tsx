@@ -4,19 +4,16 @@ import type { DragEvent, JSX } from "react";
 import {
   AlertTriangle,
   AtSign,
-  Code2,
   FolderKanban,
   GitBranch,
-  Hammer,
   Image as ImageIcon,
   Menu,
   MessageSquarePlus,
-  MessageSquareCode,
   Paperclip,
-  SearchCode,
   Send,
   Shield,
   Sparkles,
+  Target as TargetIcon,
   X
 } from "lucide-react";
 import type { AppController } from "../controller.js";
@@ -32,6 +29,9 @@ import { remapComposerInlineMentionReplacement } from "../composer-mention-range
 import { composerMentionsAllowed, resolveComposerMentionPolicy } from "../composer-mention-policy.js";
 import { browserCommentPreviewTag, removeBrowserCommentAndRepairChains } from "../browser-comment-draft.js";
 import { applyPendingExtensionUse, resolvePendingExtensionUse } from "../extension-use-handoff.js";
+import { extensionSuggestionApplicable, extensionSuggestionPrompt, resolvePendingExtensionSuggestion, sameExtensionRecommendation, sameExtensionSuggestionOwner, serializeExtensionSuggestionOwner } from "../extension-suggestion-handoff.js";
+import { newSessionSuggestionContext, pendingExtensionSuggestionContext } from "../new-session-suggestion-context.js";
+import type { HomeTaskSuggestion } from "../extension-home-suggestions.js";
 import type {
   AppSnapshot,
   AttachmentDraft,
@@ -43,6 +43,7 @@ import type {
   NewSessionDraftSelection,
   NewSessionLocalDraft,
   PermissionMode,
+  PendingExtensionSuggestionView,
   SessionView,
   TargetWorktreeProbeView,
   WorktreeEligibilityView,
@@ -50,9 +51,12 @@ import type {
   WorkspaceEntryView
 } from "../model.js";
 import type { TargetDraft } from "../model.js";
-import type { DelayedNewSessionDraft, NewSessionSubmissionOwner } from "../new-session-flow.js";
+import type { DelayedNewSessionDraft, FirstInputAcceptance, FirstInputDisposition, NewSessionSubmissionOwner } from "../new-session-flow.js";
 import { randomUuid } from "../web-crypto.js";
+import { resourceKindsForBackend } from "../resource-capabilities.js";
+import { composerDocumentIsPlainTextInvocation } from "../skill-learning-command.js";
 import { resolveRecentProject, subscribeRecentProjectsChange, type RecentProject } from "../recent-projects.js";
+import { homeSuggestionPromptKey, type HomeSuggestionId } from "../home-suggestions.js";
 import {
   currentComposerPlatform,
   resolveComposerAttachmentPolicy,
@@ -61,6 +65,7 @@ import {
   resolveTypedComposerPalette
 } from "./composer-behavior.js";
 import {
+  composerBuiltInCommand,
   composerCommandItems,
   composerMentionItems,
   detectComposerCommandActivation,
@@ -87,9 +92,12 @@ import { ModelSourceNotice } from "./ModelSourceNotice.js";
 import { modelSourceAccess, type ModelSourceSelection } from "../model-source-access.js";
 import { PermissionSelector, permissionLabel } from "./PermissionSelector.js";
 import { ComposerAddMenu } from "./ComposerAddMenu.js";
+import { ObjectiveDialog, objectiveLimitsFromDialog, type ObjectiveDialogLimits } from "./ObjectiveDialog.js";
 import { ComposerAttachmentTray } from "./ComposerAttachmentTray.js";
 import { ComposerInlineMentionPanel } from "./composer-inline-mention-panel.js";
 import { HomeUsageDashboard } from "./HomeUsageDashboard.js";
+import { HomeSuggestionList } from "./HomeSuggestionList.js";
+import { useNewSessionExtensionSuggestions } from "./use-new-session-extension-suggestions.js";
 import { ComposerPastedTextDialog, type ComposerPastedTextDialogTarget } from "./ComposerPastedTextDialog.js";
 import { ComposerRichTextEditor, type ComposerRichTextEditorHandle } from "./ComposerRichTextEditor.js";
 import { VoiceInputOverlay } from "./VoiceInputOverlay.js";
@@ -130,6 +138,7 @@ interface NewSessionPageProps {
   readonly snapshot: AppSnapshot;
   readonly initialTargetId?: string;
   readonly initialDialogueBackendId?: string;
+  readonly recommendationNonce?: string;
   readonly projectPickerRequest?: NewSessionProjectPickerRequest;
   readonly onProjectPickerRequestConsumed?: (requestId: number) => void;
   readonly navigationOpen: boolean;
@@ -161,19 +170,19 @@ interface FullAccessConfirmation {
   readonly ownerDocument: Document;
 }
 
+interface NewTaskSubmitOptions {
+  readonly firstInputDisposition?: FirstInputDisposition;
+  readonly allowEmpty?: boolean;
+  readonly propagateError?: boolean;
+  readonly clearDraftOnAccepted?: boolean;
+}
+
 interface NewTaskInlineMentionActivation extends ComposerInlineMentionActivation {
   readonly source: "typed" | "button";
 }
 
-const QUICK_STARTS = [
-  { key: "explore", label: "newTask.quickExplore", icon: SearchCode },
-  { key: "build", label: "newTask.quickBuild", icon: Code2 },
-  { key: "review", label: "newTask.quickReview", icon: MessageSquareCode },
-  { key: "fix", label: "newTask.quickFix", icon: Hammer }
-] as const;
-
 /** Delayed-create route rendered within Joko's visual language. */
-export function NewSessionPage({ controller, snapshot, initialTargetId, initialDialogueBackendId, projectPickerRequest, onProjectPickerRequestConsumed, navigationOpen, t, onOpenNavigation, onClose, onSubmit }: NewSessionPageProps): JSX.Element {
+export function NewSessionPage({ controller, snapshot, initialTargetId, initialDialogueBackendId, recommendationNonce, projectPickerRequest, onProjectPickerRequestConsumed, navigationOpen, t, onOpenNavigation, onClose, onSubmit }: NewSessionPageProps): JSX.Element {
   const projectTargets = snapshot.targets.filter((target) => !target.archived);
   const activeTargets = newSessionTargets(projectTargets, snapshot.settings.backendSettings).filter((target) => {
     const candidate = snapshot.backends.find((backend) => backend.id === target.backendId);
@@ -245,6 +254,12 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
   const [draftError, setDraftError] = useState<string>();
   const [dragging, setDragging] = useState(false);
   const [submitting, setSubmitting] = useState(false);
+  const [objectiveDialog, setObjectiveDialog] = useState<{
+    readonly initialText: string;
+    readonly ownerDocument: Document;
+    readonly submissionScope: object;
+    readonly submissionEpoch: object;
+  }>();
   const [palette, setPalette] = useState<"add" | "mention" | "commands">();
   const [inlineMentionActivation, setInlineMentionActivation] = useState<NewTaskInlineMentionActivation>();
   const [inlineMentionActiveIndex, setInlineMentionActiveIndex] = useState(0);
@@ -256,6 +271,14 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
   const [hydrated, setHydrated] = useState(false);
   const [hydratedProfileScope, setHydratedProfileScope] = useState<string>();
   const [hydrationRevision, setHydrationRevision] = useState(0);
+  const [recommendationReturn, setRecommendationReturn] = useState<PendingExtensionSuggestionView>();
+  const [recommendationBusy, setRecommendationBusy] = useState(false);
+  const [recommendationRetry, setRecommendationRetry] = useState(false);
+  const [recommendationRetryRevision, setRecommendationRetryRevision] = useState(0);
+  const [recommendationHydrationRetryRevision, setRecommendationHydrationRetryRevision] = useState(0);
+  const [recommendationRestored, setRecommendationRestored] = useState(false);
+  const [newlyInstalledExtensionId, setNewlyInstalledExtensionId] = useState<string>();
+  const recommendationFlightRef = useRef<object | undefined>(undefined);
   const [workspacePreparationOwnerScope, setWorkspacePreparationOwnerScope] = useState<object>();
   const [workspacePreparationState, setWorkspacePreparationState] = useState<"idle" | "loading" | "ready" | "error">("idle");
   const [workspacePreparationError, setWorkspacePreparationError] = useState<string>();
@@ -543,6 +566,19 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
   const backend = selection?.kind === "dialogue"
     ? eligibleDialogueBackends.find((candidate) => candidate.id === selection.backendId)
     : snapshot.backends.find((candidate) => candidate.id === selected?.backendId);
+  const suggestionCatalogRuntimeSessionId = snapshot.sessions.find((item) => item.backendId === backend?.id
+    && item.runtimeAttached === true && item.state !== "closed" && !item.archived
+    && (selection?.kind === "target" ? item.targetId === selection.targetId : item.projectId === undefined))?.id;
+  const suggestionContextKey = selection === undefined ? undefined : newSessionSuggestionContext(controller, snapshot, selection, recommendationReturn?.runtimeSessionId);
+  const suggestionContextRef = useRef(suggestionContextKey); suggestionContextRef.current = suggestionContextKey;
+  const extensionSuggestions = useNewSessionExtensionSuggestions(controller, suggestionContextKey, suggestionCatalogRuntimeSessionId, newlyInstalledExtensionId, snapshot.extensionCatalogRevision);
+  const applicableExtensionSuggestions = useMemo(() => backend === undefined ? [] : extensionSuggestions.extensions.filter((entry) =>
+    extensionSuggestionApplicable(entry, { backendId: backend.id, ...(selected === undefined ? {} : { targetId: selected.id }), resources: snapshot.resources })
+  ), [extensionSuggestions.extensions, backend?.id, selected?.id, snapshot.resources]);
+  useLayoutEffect(() => {
+    recommendationFlightRef.current = undefined;
+    setRecommendationBusy(false);
+  }, [suggestionContextKey]);
   const workspace = selected === undefined ? undefined : snapshot.workspaces.find((candidate) => candidate.id === selected.workspaceId);
   const targetStaticReady = selection?.kind === "target"
     && selected !== undefined
@@ -728,13 +764,23 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
         ...(matchingWorkspaceMentionIndex?.paths ?? [])
       ])], [matchingWorkspaceMentionIndex?.paths, usableWorkspace]);
   const globalCommands = snapshot.commands.filter((command) => command.sessionId === undefined);
-  const commandItems = composerCommandItems(
-    backend?.capabilities.get("runtime.commands")?.supported === true ? globalCommands : []
-  );
+  const availableGlobalCommands = backend?.capabilities.get("runtime.commands")?.supported === true
+    ? globalCommands
+    : [];
+  const learnCommandSupported = controller.state.connectionState === "connected"
+    && targetStaticReady
+    && targetWorkspaceReady
+    && resourceKindsForBackend(backend).includes("skill");
+  const goalCommandSupported = controller.state.connectionState === "connected"
+    && backend?.health !== "unavailable"
+    && backend?.capabilities.get("input.text")?.supported === true
+    && (selection?.kind === "dialogue" || targetStaticReady && targetWorkspaceReady);
+  const commandOptions = { learnSupported: learnCommandSupported, goalSupported: goalCommandSupported } as const;
+  const commandItems = composerCommandItems(availableGlobalCommands, commandOptions);
   const commandCatalogKey = commandItems.map((item) => `${item.id}\u0000${item.value}\u0000${item.meta}`).join("\u0001");
   const selectableExtraDirectories = snapshot.extraDirectories.filter((directory) => directory.workspaceId === usableWorkspace?.id && directory.trusted);
   const canSelectExtraDirectories = usableWorkspace !== undefined && backend?.capabilities.get("workspace.extra_dirs")?.supported === true;
-  const canUseAddMenu = attachmentPolicy.images || attachmentPolicy.files || canMention || commandItems.length > 0
+  const canUseAddMenu = goalCommandSupported || attachmentPolicy.images || attachmentPolicy.files || canMention || commandItems.length > 0
     || canSelectExtraDirectories && selectableExtraDirectories.length > 0;
   const worktreeApplicable = selected !== undefined && startKind === "fresh"
     && usableWorkspace?.kind === "userProject" && selected.remoteWorkspace === undefined;
@@ -962,6 +1008,9 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
     const hydrationOwnerScope = profileScope;
     setHydrated(false);
     setHydratedProfileScope(undefined);
+    setRecommendationReturn(undefined);
+    setRecommendationRetry(false);
+    setRecommendationRestored(false);
     worktreeAuthorityTargetRef.current = undefined;
     setDraftError(undefined);
     setSelection(requestedSelection ?? defaultNewSessionSelection(activeTargets, eligibleDialogueBackends));
@@ -969,16 +1018,28 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
       const pendingReader = typeof controllerRef.current.readPendingExtensionUse === "function"
         ? controllerRef.current.readPendingExtensionUse()
         : Promise.resolve(undefined);
-      const [draftResult, pendingResult] = await Promise.allSettled([
+      const [draftResult, pendingResult, suggestionResult] = await Promise.allSettled([
         controllerRef.current.readNewSessionDraft(),
-        pendingReader
+        pendingReader,
+        recommendationNonce === undefined ? Promise.resolve(undefined) : controllerRef.current.readPendingExtensionSuggestion(recommendationNonce)
       ]);
       if (cancelled) return;
-      const draft = draftResult.status === "fulfilled" ? draftResult.value : undefined;
-      const pending = pendingResult.status === "fulfilled" ? pendingResult.value : undefined;
+      const suggestion = suggestionResult.status === "fulfilled" ? suggestionResult.value : undefined;
+      const draft = suggestion?.draft ?? (draftResult.status === "fulfilled" ? draftResult.value : undefined);
+      const pending = recommendationNonce === undefined && pendingResult.status === "fulfilled" ? pendingResult.value : undefined;
       let hydrationError = draftResult.status === "rejected"
         ? messageOf(draftResult.reason)
         : pendingResult.status === "rejected" ? messageOf(pendingResult.reason) : undefined;
+      if (recommendationNonce !== undefined) {
+        if (suggestionResult.status === "rejected") {
+          hydrationError = messageOf(suggestionResult.reason);
+          setRecommendationRetry(true);
+        } else if (suggestion === undefined || suggestion.phase !== "ready"
+          || pendingExtensionSuggestionContext(controllerRef.current, snapshot, suggestion) !== suggestion.contextKey) {
+          hydrationError = translatorRef.current("extensions.recommendationExpired");
+          if (suggestion !== undefined) await controllerRef.current.compareAndSetPendingExtensionSuggestion(suggestion);
+        } else setRecommendationReturn(suggestion);
+      }
       const restoredSelection = draft === undefined
         ? requestedSelection ?? defaultNewSessionSelection(activeTargets, eligibleDialogueBackends)
         : requestedSelection
@@ -1058,7 +1119,13 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
       cancelled = true;
       requestController.abort();
     };
-  }, [initialDialogueBackendId, initialTargetId, profileScope]);
+  }, [initialDialogueBackendId, initialTargetId, profileScope, recommendationNonce, recommendationHydrationRetryRevision]);
+
+  useEffect(() => {
+    if (!hydrated) return;
+    const frame = window.requestAnimationFrame(() => setRecommendationRestored(true));
+    return () => window.cancelAnimationFrame(frame);
+  }, [hydrated, hydrationRevision]);
 
   useEffect(() => {
     if (!hydrated || projectPickerRequest !== undefined || openPickerRequestId !== undefined) return;
@@ -1104,9 +1171,13 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
       setWorktreeEnabled(controllerRef.current.state.preferences.newSessionWorktreeEnabled);
       setWorktreeSourceRef(restored.worktree?.sourceRef);
       setRefreshWorktreeRemote(restored.worktree?.refreshRemote ?? false);
-      setExtraDirectoryIds(canSelectExtraDirectories
-        ? (restored.extraDirectoryIds ?? []).filter((id) => selectableExtraDirectories.some((directory) => directory.id === id))
-        : []);
+      const restoredExtraDirectories = selection.kind === "target"
+        && backend.capabilities.get("workspace.extra_dirs")?.supported === true
+        ? snapshot.extraDirectories.filter((directory) => directory.workspaceId === selected?.workspaceId && directory.trusted)
+        : [];
+      setExtraDirectoryIds((restored.extraDirectoryIds ?? []).filter((id) =>
+        restoredExtraDirectories.some((directory) => directory.id === id)
+      ));
       if (selection.kind === "dialogue") {
         setStartKind("fresh");
         setNativeReference("");
@@ -1301,7 +1372,31 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
   );
   const canFinishVoiceSend = hydrated && controller.state.connectionState === "connected" && validContext && modelRouteReady && attachmentsAllowed && mentionsAllowed && worktreeDecisionReady && fullAccessConfirmation === undefined && !submitting;
   const canSend = canFinishVoiceSend && hasInput && !voice.active;
-  const submissionScope = useMemo(() => ({}), [profileScope, selectionKey, startKind, nativeReference, modelKey, selectedModel?.providerId, selectedModel?.modelId, effort, fastMode, permissionMode, planMode, effectiveWorktreeEnabled, worktreeSourceRef, refreshWorktreeRemote, snapshot.generation, controller.getArtifactUrl, voiceRoot]);
+  const submissionScope = useMemo(() => ({}), [
+    profileScope,
+    controller.state.connectionGeneration,
+    selectionKey,
+    selected?.revision,
+    backend?.id,
+    backend?.instanceGeneration,
+    backend?.health,
+    backend?.capabilities.get("input.text")?.supported,
+    usableWorkspace?.id,
+    startKind,
+    nativeReference,
+    modelKey,
+    selectedModel?.providerId,
+    selectedModel?.modelId,
+    effort,
+    fastMode,
+    permissionMode,
+    planMode,
+    effectiveWorktreeEnabled,
+    worktreeSourceRef,
+    refreshWorktreeRemote,
+    controller.getArtifactUrl,
+    voiceRoot
+  ]);
   const submissionEpochRef = useRef<object | undefined>(undefined);
   const submissionScopeRef = useRef(submissionScope); submissionScopeRef.current = submissionScope;
   const submissionValidityRef = useRef(false);
@@ -1309,7 +1404,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
   useLayoutEffect(() => {
     const ownerWindow = voiceRoot?.ownerDocument.defaultView;
     const activate = (): void => { submissionEpochRef.current = {}; };
-    const retire = (): void => { submissionEpochRef.current = undefined; submissionRef.current = undefined; submissionAbortRef.current?.abort(); submissionAbortRef.current = undefined; submissionOriginRef.current = undefined; setSubmitting(false); };
+    const retire = (): void => { submissionEpochRef.current = undefined; submissionRef.current = undefined; submissionAbortRef.current?.abort(); submissionAbortRef.current = undefined; submissionOriginRef.current = undefined; setObjectiveDialog(undefined); setSubmitting(false); };
     activate();
     ownerWindow?.addEventListener("pagehide", retire); ownerWindow?.addEventListener("pageshow", activate);
     return () => { retire(); ownerWindow?.removeEventListener("pagehide", retire); ownerWindow?.removeEventListener("pageshow", activate); };
@@ -1318,7 +1413,12 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
   useLayoutEffect(() => {
     if (submissionOriginRef.current !== undefined && !submissionOriginRef.current.isCurrent()) submissionAbortRef.current?.abort();
   });
-  const submitRef = useRef<(document?: JSONContent) => Promise<void>>(async () => undefined);
+  const submitRef = useRef<(
+    document?: JSONContent,
+    onAccepted?: (acceptance: FirstInputAcceptance) => void,
+    beforeFirstInput?: (sessionId: string) => Promise<void>,
+    options?: NewTaskSubmitOptions
+  ) => Promise<void>>(async () => undefined);
   const voiceSendFlight = useRef<object | undefined>(undefined);
   const finishVoiceAndSend = (): void => {
     if (!canFinishVoiceSend || voiceSendFlight.current !== undefined) return;
@@ -1814,35 +1914,132 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
     });
   };
 
-  const submit = async (activeDocument: JSONContent = editorDocumentRef.current): Promise<void> => {
+  const submit = async (
+    activeDocument: JSONContent = editorDocumentRef.current,
+    onAccepted?: (acceptance: FirstInputAcceptance) => void,
+    beforeFirstInput?: (sessionId: string) => Promise<void>,
+    options: NewTaskSubmitOptions = {}
+  ): Promise<void> => {
     const sourceEditorDocument = normalizeComposerDocument(activeDocument, textRef.current);
     const sourceText = composerDocumentPlainText(sourceEditorDocument);
     const sourceRanges = restoreComposerInlineMentionRanges(sourceText, mentionsRef.current, inlineMentionRangesRef.current);
     const sourceMentions = composerMentionsFromRanges(mentionsRef.current, sourceRanges);
     const sourceBrowserComments = browserCommentsRef.current;
+    const sourceAttachments = attachmentsRef.current;
+    const parsedCommand = composerBuiltInCommand(sourceText, commandOptions);
+    const learnCommand = parsedCommand?.kind === "learn" ? parsedCommand : undefined;
+    const objectiveCommand = parsedCommand?.kind === "objective" ? parsedCommand : undefined;
     const activeCanSend = validContext
       && modelRouteReady
-      && (!composerDocumentIsEmpty(sourceEditorDocument) || attachments.length > 0 || sourceBrowserComments.length > 0)
+      && (options.allowEmpty === true || !composerDocumentIsEmpty(sourceEditorDocument) || sourceAttachments.length > 0 || sourceBrowserComments.length > 0)
       && attachmentsAllowed
       && newTaskMentionsAllowed(sourceMentions, mentionPolicy, usableWorkspace?.id)
       && worktreeDecisionReady
       && !(worktreePreferenceRelevant && worktreePreferenceSavingRef.current)
       && fullAccessConfirmationRef.current === undefined
       && !submitting && !voice.isActive();
-    if (!activeCanSend || selection === undefined || submissionRef.current) return;
+    if (!activeCanSend || selection === undefined || submissionRef.current) {
+      if (options.propagateError === true) throw new Error(t("composer.inputUnavailable"));
+      return;
+    }
     voiceDictionaryLearning.clear();
     const sourceScope = submissionScope;
     const sourceEpoch = submissionEpochRef.current;
     const ownerDocument = voiceRoot?.ownerDocument;
     const ownerWindow = ownerDocument?.defaultView;
-    if (ownerDocument === undefined || ownerWindow === null || ownerWindow === undefined || sourceEpoch === undefined) return;
+    if (ownerDocument === undefined || ownerWindow === null || ownerWindow === undefined || sourceEpoch === undefined) {
+      if (options.propagateError === true) throw new Error(t("composer.inputUnavailable"));
+      return;
+    }
     const sourceDraft = editorDocumentRef.current;
-    const sourceAttachments = attachmentsRef.current;
+    const sourceInput: ComposerDraft = {
+      text: sourceText,
+      editorDocument: sourceEditorDocument,
+      attachments: sourceAttachments,
+      browserComments: sourceBrowserComments,
+      mentions: sourceMentions,
+      inlineMentionRanges: sourceRanges,
+      deliveryMode: "prompt",
+      ...(canSelectExtraDirectories ? { extraDirectoryIds } : {})
+    };
+    const firstInputDisposition: FirstInputDisposition | undefined = options.firstInputDisposition ?? (learnCommand !== undefined
+      ? {
+          kind: "learn",
+          requestId: randomUuid(),
+          backendId: backend!.id,
+          instruction: learnCommand.instruction,
+          evidence: learnCommand.instruction === "" ? "createdSession" : "freeText",
+          application: /^hub:\S*/iu.test(learnCommand.instruction)
+            ? { kind: "rejected", reason: "hub" }
+            : !composerDocumentIsPlainTextInvocation(sourceEditorDocument)
+              || sourceAttachments.length > 0
+              || sourceBrowserComments.length > 0
+              || sourceMentions.length > 0
+              || sourceRanges.length > 0
+              || extraDirectoryIds.length > 0
+              ? { kind: "rejected", reason: "structured" }
+              : { kind: "eligible" }
+        }
+      : objectiveCommand === undefined
+        ? undefined
+        : objectiveCommand.action === "open"
+          ? {
+              kind: "objective",
+              source: "slash",
+              requestId: randomUuid(),
+              action: "open"
+            }
+          : objectiveCommand.action === "clear"
+            ? {
+                kind: "objective",
+                source: "slash",
+                requestId: randomUuid(),
+                action: "clear"
+              }
+            : {
+              kind: "objective",
+              source: "slash",
+              requestId: randomUuid(),
+              action: "set",
+              text: objectiveCommand.text ?? "",
+              limits: { noProgressTurnLimit: 3 }
+            });
+    const clearDraftOnAccepted = options.clearDraftOnAccepted === true || objectiveCommand !== undefined;
+    const clearAcceptedSource = (): void => {
+      if (!clearDraftOnAccepted || !mountedRef.current
+        || editorDocumentRef.current !== sourceDraft || attachmentsRef.current !== sourceAttachments
+        || browserCommentsRef.current !== sourceBrowserComments) return;
+      const clearedDocument = emptyComposerDocument();
+      revokeAttachments([...sourceAttachments, ...sourceBrowserComments.map((item) => item.screenshot)]);
+      editorDocumentRef.current = clearedDocument;
+      textRef.current = "";
+      attachmentsRef.current = [];
+      browserCommentsRef.current = [];
+      setEditorDocument(clearedDocument);
+      setText("");
+      replaceMentions([], []);
+      setAttachments([]);
+      replaceBrowserComments([]);
+      setExtraDirectoryIds([]);
+      setAttachmentError(undefined);
+      setDraftError(undefined);
+      voiceDictionaryLearning.clear();
+    };
+    const acceptFirstInput = (acceptance?: FirstInputAcceptance): void => {
+      if (acceptance === undefined) return;
+      clearAcceptedSource();
+      onAccepted?.(acceptance);
+    };
     const attempt = {}; submissionRef.current = attempt;
     const request = new AbortController(); submissionAbortRef.current = request;
     const owner: NewSessionSubmissionOwner = {
       ownerDocument,
       signal: request.signal,
+      ...(beforeFirstInput === undefined ? {} : { beforeFirstInput }),
+      ...(firstInputDisposition === undefined ? {} : { firstInputDisposition }),
+      ...(onAccepted === undefined && !clearDraftOnAccepted
+        ? {}
+        : { onFirstInputAccepted: acceptFirstInput }),
       isCurrent: () => submissionScopeRef.current === sourceScope && submissionEpochRef.current === sourceEpoch && submissionRef.current === attempt
         && !request.signal.aborted && submissionValidityRef.current && voiceRoot?.isConnected === true && voiceRoot.ownerDocument === ownerDocument && !ownerWindow.closed
         && editorDocumentRef.current === sourceDraft && attachmentsRef.current === sourceAttachments && browserCommentsRef.current === sourceBrowserComments
@@ -1878,18 +2075,10 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
         permissionMode: resolvedPermission,
         planMode: execution.planModeSupported && planMode,
         ...(worktree === undefined ? {} : { worktree })
-      }, {
-        text: sourceText,
-        editorDocument: sourceEditorDocument,
-        attachments: sourceAttachments,
-        browserComments: sourceBrowserComments,
-        mentions: sourceMentions,
-        inlineMentionRanges: sourceRanges,
-        deliveryMode: "prompt",
-        ...(canSelectExtraDirectories ? { extraDirectoryIds } : {})
-      }, owner);
-    } catch {
+      }, sourceInput, owner);
+    } catch (error) {
       // App owns the operation banner; the persistent draft intentionally remains.
+      if (options.propagateError === true) throw error;
     } finally {
       if (submissionRef.current === attempt) {
         submissionRef.current = undefined;
@@ -1903,6 +2092,184 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
   };
 
   submitRef.current = submit;
+
+  const openObjectiveDialog = (): void => {
+    const ownerDocument = voiceRoot?.ownerDocument;
+    const submissionEpoch = submissionEpochRef.current;
+    if (!goalCommandSupported || ownerDocument === undefined || submissionEpoch === undefined || submittingRef.current) return;
+    closePalette(false);
+    setObjectiveDialog({
+      initialText: composerDocumentPlainText(editorDocumentRef.current).trim(),
+      ownerDocument,
+      submissionScope,
+      submissionEpoch
+    });
+  };
+
+  const submitObjectiveDialog = async (objectiveText: string, limits: ObjectiveDialogLimits): Promise<void> => {
+    const dialog = objectiveDialog;
+    if (dialog === undefined || dialog.ownerDocument !== voiceRoot?.ownerDocument || !goalCommandSupported
+      || dialog.submissionScope !== submissionScopeRef.current
+      || dialog.submissionEpoch !== submissionEpochRef.current) {
+      throw new Error(t("composer.inputUnavailable"));
+    }
+    await submitRef.current(plainTextToComposerDocument(`/goal ${objectiveText}`), undefined, undefined, {
+      firstInputDisposition: {
+        kind: "objective",
+        source: "dialog",
+        requestId: randomUuid(),
+        action: "set",
+        text: objectiveText,
+        limits: objectiveLimitsFromDialog(limits)
+      },
+      allowEmpty: true,
+      propagateError: true,
+      clearDraftOnAccepted: true
+    });
+  };
+
+  useLayoutEffect(() => {
+    if (objectiveDialog !== undefined && (
+      objectiveDialog.ownerDocument !== voiceRoot?.ownerDocument
+      || objectiveDialog.submissionScope !== submissionScope
+      || objectiveDialog.submissionEpoch !== submissionEpochRef.current
+      || !goalCommandSupported
+    )) setObjectiveDialog(undefined);
+  }, [goalCommandSupported, objectiveDialog, submissionScope, voiceRoot?.ownerDocument]);
+
+  const replaceSuggestionPrompt = (prompt: string): JSONContent => {
+    voiceDictionaryLearning.clear();
+    const nextDocument = plainTextToComposerDocument(prompt);
+    editorDocumentRef.current = nextDocument;
+    textRef.current = prompt;
+    setEditorDocument(nextDocument);
+    setText(prompt);
+    replaceMentions([], []);
+    closePalette();
+    const latest = latestDraftRef.current;
+    if (latest !== undefined) latestDraftRef.current = { ...latest, draft: { ...latest.draft, text: prompt, editorDocument: nextDocument, mentions: [], inlineMentionRanges: [] } };
+    return nextDocument;
+  };
+
+  const suggestionFirstInputGuard = (pending: PendingExtensionSuggestionView, sourceController: AppController): ((sessionId: string) => Promise<void>) | undefined => {
+    if (pending.recommendation.command === undefined) return undefined;
+    return async (sessionId) => {
+      const catalog = await sourceController.getExtension(pending.extensionId, sessionId);
+      const extension = resolvePendingExtensionSuggestion({ ...pending, phase: "ready", runtimeSessionId: sessionId }, catalog, {
+        backendId: pending.backendId, ...(pending.targetId === undefined ? {} : { targetId: pending.targetId }),
+        targets: snapshot.targets, resources: snapshot.resources
+      });
+      if (extension === undefined) throw new Error(t("extensions.recommendationExpired"));
+    };
+  };
+
+  const selectExtensionSuggestion = (item: HomeTaskSuggestion): void => {
+    if (!hydrated || hydratedProfileScope !== profileScope || voice.isActive() || submittingRef.current || submissionRef.current !== undefined
+      || recommendationFlightRef.current !== undefined || item.extensionId === undefined || item.recommendationId === undefined
+      || item.extensionRevision === undefined || item.owner === undefined || selection === undefined || backend === undefined
+      || suggestionContextKey === undefined || latestDraftRef.current === undefined) return;
+    const sourceController = controller;
+    const contextKey = suggestionContextKey;
+    const sourceScope = submissionScopeRef.current;
+    const sourceDocument = editorDocumentRef.current;
+    const sourceEpoch = submissionEpochRef.current;
+    const flight = {}; recommendationFlightRef.current = flight;
+    setRecommendationBusy(true);
+    setDraftError(undefined);
+    const frozenDraft = { ...latestDraftRef.current.draft, editorDocument: editorDocumentRef.current, text: textRef.current,
+      mentions: mentionsRef.current, inlineMentionRanges: inlineMentionRangesRef.current, attachments: attachmentsRef.current, browserComments: browserCommentsRef.current };
+    const isCurrent = (): boolean => mountedRef.current && recommendationFlightRef.current === flight
+      && suggestionContextRef.current === contextKey && submissionScopeRef.current === sourceScope
+      && submissionEpochRef.current === sourceEpoch && sourceEpoch !== undefined && pageRef.current?.isConnected === true
+      && editorDocumentRef.current === sourceDocument && !voice.isActive() && !submittingRef.current;
+    void (async () => {
+      const catalog = await sourceController.getExtension(item.extensionId!, suggestionCatalogRuntimeSessionId);
+      if (!isCurrent()) return;
+      const extension = catalog.extensions.find((entry) => entry.id === item.extensionId);
+      const recommendation = extension?.recommendations?.find((entry) => entry.id === item.recommendationId);
+      const displayed = extensionSuggestions.extensions.find((entry) => entry.id === item.extensionId)?.recommendations?.find((entry) => entry.id === item.recommendationId);
+      if (extension === undefined || extension.revision !== item.extensionRevision || recommendation === undefined || displayed === undefined
+        || !sameExtensionRecommendation(recommendation, displayed) || !sameExtensionSuggestionOwner(extension.owner, serializeExtensionSuggestionOwner(item.owner!))) {
+        setDraftError(t("extensions.recommendationExpired")); return;
+      }
+      const pending: PendingExtensionSuggestionView = {
+        nonce: randomUuid(), phase: "ready", extensionId: extension.id, extensionRevision: extension.revision.toString(10),
+        owner: serializeExtensionSuggestionOwner(extension.owner), recommendation, selectedLabel: item.label, selectedPrompt: item.prompt,
+        contextKey, draft: frozenDraft, backendId: backend.id,
+        ...(selected === undefined ? {} : { targetId: selected.id })
+      };
+      const ready = resolvePendingExtensionSuggestion(pending, catalog, { backendId: backend.id, ...(selected === undefined ? {} : { targetId: selected.id }), targets: snapshot.targets, resources: snapshot.resources });
+      if (!extensionSuggestionApplicable(extension, { backendId: backend.id, ...(selected === undefined ? {} : { targetId: selected.id }), resources: snapshot.resources })) {
+        setDraftError(t("extensions.recommendationExpired")); return;
+      }
+      if (ready !== undefined) {
+        const nextDocument = replaceSuggestionPrompt(extensionSuggestionPrompt(extension, recommendation, item.prompt));
+        await submit(nextDocument, () => { void sourceController.recordExtensionSuggestionUse(extension.id).catch(() => undefined); }, suggestionFirstInputGuard(pending, sourceController));
+        return;
+      }
+      await enqueueNewSessionDraftSave(draftSaveChainRef, { current: sourceController }, frozenDraft);
+      if (!isCurrent()) return;
+      await sourceController.savePendingExtensionSuggestion({ ...pending, phase: "setup" });
+      if (!isCurrent()) {
+        await sourceController.compareAndSetPendingExtensionSuggestion({ ...pending, phase: "setup" }); return;
+      }
+      sourceController.navigate({ kind: "tools", extensionId: extension.id, recommendationNonce: pending.nonce });
+    })().catch((error: unknown) => { if (isCurrent()) setDraftError(messageOf(error)); }).finally(() => {
+      if (recommendationFlightRef.current === flight) { recommendationFlightRef.current = undefined; if (mountedRef.current) setRecommendationBusy(false); }
+    });
+  };
+
+  useEffect(() => {
+    if (recommendationReturn === undefined || !hydrated || !recommendationRestored || hydratedProfileScope !== profileScope
+      || recommendationFlightRef.current !== undefined) return;
+    if (suggestionContextKey === recommendationReturn.contextKey && (!canFinishVoiceSend || voice.active)) return;
+    const pending = recommendationReturn;
+    const sourceController = controller;
+    const sourceScope = submissionScopeRef.current;
+    const sourceDocument = editorDocumentRef.current;
+    const sourceEpoch = submissionEpochRef.current;
+    const flight = {}; recommendationFlightRef.current = flight;
+    const request = new AbortController();
+    setRecommendationBusy(true);
+    const isCurrent = (): boolean => !request.signal.aborted && mountedRef.current && recommendationFlightRef.current === flight
+      && suggestionContextRef.current === pending.contextKey && submissionScopeRef.current === sourceScope
+      && submissionEpochRef.current === sourceEpoch && sourceEpoch !== undefined && pageRef.current?.isConnected === true
+      && editorDocumentRef.current === sourceDocument;
+    void (async () => {
+      if (suggestionContextRef.current !== pending.contextKey) {
+        await sourceController.compareAndSetPendingExtensionSuggestion(pending);
+        if (!request.signal.aborted) { setRecommendationReturn(undefined); setDraftError(t("extensions.recommendationExpired")); }
+        return;
+      }
+      const catalog = await sourceController.getExtension(pending.extensionId, pending.runtimeSessionId, request.signal);
+      if (!isCurrent()) return;
+      const extension = resolvePendingExtensionSuggestion(pending, catalog, { backendId: pending.backendId,
+        ...(pending.targetId === undefined ? {} : { targetId: pending.targetId }), targets: snapshot.targets, resources: snapshot.resources });
+      if (extension === undefined) {
+        await sourceController.compareAndSetPendingExtensionSuggestion(pending);
+        if (isCurrent()) { setRecommendationReturn(undefined); setDraftError(t("extensions.recommendationExpired")); }
+        return;
+      }
+      const consumed = await sourceController.consumePendingExtensionSuggestion(pending.nonce, pending.contextKey);
+      if (!isCurrent()) return;
+      setRecommendationReturn(undefined);
+      if (consumed === undefined) { setDraftError(t("extensions.recommendationExpired")); return; }
+      setNewlyInstalledExtensionId(extension.id);
+      const nextDocument = replaceSuggestionPrompt(extensionSuggestionPrompt(extension, pending.recommendation, pending.selectedPrompt));
+      await submitRef.current(nextDocument, () => { void sourceController.recordExtensionSuggestionUse(extension.id).catch(() => undefined); }, suggestionFirstInputGuard(pending, sourceController));
+    })().catch((error: unknown) => {
+      if (isCurrent()) { setDraftError(messageOf(error)); setRecommendationRetry(true); }
+    }).finally(() => {
+      if (recommendationFlightRef.current === flight) { recommendationFlightRef.current = undefined; if (mountedRef.current) setRecommendationBusy(false); }
+    });
+    return () => { request.abort(); if (recommendationFlightRef.current === flight) recommendationFlightRef.current = undefined; };
+  }, [recommendationReturn, recommendationRestored, hydrated, hydratedProfileScope, profileScope, recommendationRetryRevision, suggestionContextKey, canFinishVoiceSend, voice.active]);
+
+  const selectHomeSuggestion = (id: HomeSuggestionId): void => {
+    if (submittingRef.current || submissionRef.current !== undefined) return;
+    const nextDocument = replaceSuggestionPrompt(t(homeSuggestionPromptKey(id)));
+    void submit(nextDocument);
+  };
 
   const handleEditorKeyDown = (event: KeyboardEvent, activeDocument: JSONContent): boolean => {
     if (captureInlineMentionKey(event)) return true;
@@ -2079,6 +2446,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
         {selection?.kind === "target" && !workspacePreparationLoading && (targetStaticUnavailableReason ?? currentWorkspacePreparationError) !== undefined && <div className="new-task-warning" role="alert"><AlertTriangle aria-hidden="true" /><span>{targetStaticUnavailableReason ?? currentWorkspacePreparationError}</span>{targetStaticReady && currentWorkspacePreparationError !== undefined && <Button tone="ghost" disabled={submitting} onClick={() => setWorkspacePreparationRevision((value) => value + 1)}>{t("common.retry")}</Button>}</div>}
         {selected !== undefined && targetWorkspaceReady && !selected.trusted && <div className="new-task-warning" role="status"><AlertTriangle aria-hidden="true" /><span>{t("session.projectInert")}</span></div>}
         {draftError !== undefined && <div className="new-task-warning" role="alert"><AlertTriangle aria-hidden="true" /><span>{draftError}</span></div>}
+        {recommendationRetry && <Button disabled={recommendationBusy} onClick={() => { setRecommendationRetry(false); if (recommendationReturn === undefined) setRecommendationHydrationRetryRevision((value) => value + 1); else setRecommendationRetryRevision((value) => value + 1); }}>{t("common.retry")}</Button>}
         {projectBrowseError !== undefined && <div className="new-task-warning" role="alert"><AlertTriangle aria-hidden="true" /><span>{projectBrowseError}</span></div>}
         {showWorktreeControls && <section className="new-task-worktree" aria-labelledby="new-task-worktree-title">
           <header>
@@ -2249,6 +2617,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
                     count={extraDirectoryIds.length}
                   >
                     {palette === "add" && <><div className="composer-add-menu__actions" role="menu">
+                      {goalCommandSupported && <button className="composer-add-menu__action" type="button" role="menuitem" onClick={openObjectiveDialog}><TargetIcon aria-hidden="true" /><span><strong>{t("objective.newAction")}</strong><small>{t("objective.dialogDescription")}</small></span></button>}
                       {(attachmentPolicy.images || attachmentPolicy.files) && <button className="composer-add-menu__action" type="button" role="menuitem" onClick={() => openAttachmentPicker()}><Paperclip aria-hidden="true" /><span><strong>{t("composer.attach")}</strong><small>{t("composer.attachments")}</small></span></button>}
                       {canMention && <button className="composer-add-menu__action" type="button" role="menuitem" onClick={() => {
                         if (mentionPolicy.directories) {
@@ -2403,23 +2772,15 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
           <div className="new-task-composer__meta"><span>{selection?.kind === "dialogue" ? t("newTask.dialogue") : selected?.workspaceName ?? t("session.noProjects")}</span><span>{backend?.name ?? ""}</span></div>
         </div>
 
-        <section className="new-task-quick" aria-labelledby="new-task-quick-title">
-          <h2 id="new-task-quick-title">{t("newTask.quickStart")}</h2>
-          <div className="new-task-quick__grid">
-            {QUICK_STARTS.map(({ key, label, icon: Icon }) => <button type="button" key={key} disabled={submitting} onClick={() => {
-              voiceDictionaryLearning.clear();
-              const nextDocument = plainTextToComposerDocument(t(label));
-              const nextText = composerDocumentPlainText(nextDocument);
-              editorDocumentRef.current = nextDocument;
-              setEditorDocument(nextDocument);
-              textRef.current = nextText;
-              setText(nextText);
-              replaceMentions([], []);
-              closePalette();
-              requestAnimationFrame(() => richEditorRef.current?.focus());
-            }}><span><Icon aria-hidden="true" /></span><strong>{t(label)}</strong></button>)}
-          </div>
-        </section>
+        <HomeSuggestionList
+          t={t}
+          extensionEntries={applicableExtensionSuggestions}
+          locale={controller.state.effectiveLocale}
+          hints={extensionSuggestions.hints}
+          disabled={!hydrated || hydratedProfileScope !== profileScope || submitting || voice.active || recommendationBusy}
+          onSelect={selectHomeSuggestion}
+          onExtensionSelect={selectExtensionSuggestion}
+        />
         <HomeUsageDashboard controller={controller} ownerId={pickerOwnerId} locale={controller.state.effectiveLocale} t={t} />
       </section>
     </div>
@@ -2447,6 +2808,14 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
         </div>
       </div>
     </Modal>
+    <ObjectiveDialog
+      open={objectiveDialog !== undefined}
+      initialText={objectiveDialog?.initialText}
+      ownerDocument={objectiveDialog?.ownerDocument}
+      t={t}
+      onClose={() => { if (!submittingRef.current) setObjectiveDialog(undefined); }}
+      onSubmit={submitObjectiveDialog}
+    />
     <ComposerPastedTextDialog
       target={pastedTextTarget}
       title={t("composer.pastedTextEditTitle")}

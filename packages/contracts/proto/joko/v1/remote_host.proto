@@ -123,6 +123,7 @@ service RemoteHostService {
   rpc RefreshRemoteHostCatalog(RefreshRemoteHostCatalogRequest) returns (RefreshRemoteHostCatalogResponse);
   rpc CreateRemoteHost(CreateRemoteHostRequest) returns (CreateRemoteHostResponse);
   rpc UpdateRemoteHost(UpdateRemoteHostRequest) returns (UpdateRemoteHostResponse);
+  rpc SetRemoteHostAutoConnect(SetRemoteHostAutoConnectRequest) returns (SetRemoteHostAutoConnectResponse);
   rpc DeleteRemoteHost(DeleteRemoteHostRequest) returns (DeleteRemoteHostResponse);
   rpc ConnectRemoteHost(ConnectRemoteHostRequest) returns (ConnectRemoteHostResponse);
   rpc DisconnectRemoteHost(DisconnectRemoteHostRequest) returns (DisconnectRemoteHostResponse);
@@ -242,6 +243,8 @@ message RemoteHost {
   Revision revision = 12;
   RemoteHostAuthenticationMode authentication_mode = 13;
   SshKeyReference node_key = 14;
+  optional bool auto_connect = 15;
+  Revision auto_connect_revision = 16;
 }
 
 message GetRemoteHostCapabilitiesRequest {
@@ -390,6 +393,18 @@ message UpdateRemoteHostRequest {
 }
 
 message UpdateRemoteHostResponse {
+  RemoteHost host = 1;
+}
+
+message SetRemoteHostAutoConnectRequest {
+  string target_id = 1;
+  string host_id = 2;
+  Revision expected_host_revision = 3;
+  Revision expected_auto_connect_revision = 4;
+  optional bool enabled = 5;
+}
+
+message SetRemoteHostAutoConnectResponse {
   RemoteHost host = 1;
 }
 
