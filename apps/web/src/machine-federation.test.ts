@@ -77,6 +77,10 @@ describe("machine federation cache", () => {
       targets: [{ id: "target-1", name: "Workspace A" } as AppSnapshot["targets"][number]],
       sessions: sessions.map((candidate) => candidate.id === "tie-a" ? {
         ...candidate,
+        taskTags: [{
+          id: "preset:work", name: "Work", color: "indigo", presetKey: "work", nameCustomized: false,
+          sortOrder: 8, revision: 1n, associationRevision: 1n, createdAt: 1, updatedAt: 1
+        }],
         attention: {
           kind: "awaiting",
           unread: true,
@@ -115,7 +119,8 @@ describe("machine federation cache", () => {
     expect(cache.sessions.find((candidate) => candidate.id === "tie-a")).toMatchObject({
       attentionKind: "awaiting",
       attentionUnread: true,
-      interactionKind: "permission"
+      interactionKind: "permission",
+      taskTags: [{ id: "preset:work", name: "Work", color: "indigo", presetKey: "work", nameCustomized: false }]
     });
   });
 
@@ -126,7 +131,8 @@ describe("machine federation cache", () => {
         state: "closed",
         pinned: false,
         archived: index % 2 === 0,
-        lastActivityAt: index
+        lastActivityAt: index,
+        taskTags: index === 0 ? [{ id: "work", name: "Work", color: "blue", presetKey: "work", nameCustomized: false }] : []
       } as const));
 
     const cache = normalizeMachineCache({
@@ -141,10 +147,12 @@ describe("machine federation cache", () => {
     expect(cache).toBeDefined();
     expect(cache?.name).toBe("Remote A");
     expect(cache?.sessions).toHaveLength(500);
+    expect(cache?.sessions[0]?.taskTags).toEqual([{ id: "work", name: "Work", color: "blue", presetKey: "work", nameCustomized: false }]);
     expect(normalizeMachineCache({ ...cache, name: " Remote A " })).toBeUndefined();
     expect(normalizeMachineCache({ ...cache, sessions: [...rawSessions, rawSessions[0]] })).toBeUndefined();
     expect(normalizeMachineCache({ ...cache, sessions: [{ ...rawSessions[0], state: "unknown" }] })).toBeUndefined();
     expect(normalizeMachineCache({ ...cache, sessions: [{ ...rawSessions[0], lastActivityAt: undefined }] })).toBeUndefined();
+    expect(normalizeMachineCache({ ...cache, sessions: [{ ...rawSessions[0], taskTags: [{ id: "work", name: "Work", color: "unknown", nameCustomized: false }] }] })).toBeUndefined();
     expect(normalizeMachineCache({ profileId: "bad\nid", origin: "https://example.test", updatedAt: 0, sessions: [] })).toBeUndefined();
   });
 
@@ -211,6 +219,7 @@ function session(id: string, updatedAt: number): AppSnapshot["sessions"][number]
     fastMode: false,
     permissionMode: "ask",
     planMode: false,
+    taskTags: [],
     updatedAt
   };
 }

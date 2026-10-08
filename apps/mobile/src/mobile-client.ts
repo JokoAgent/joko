@@ -5,6 +5,7 @@ import { Code } from "@connectrpc/connect";
 import {
   ArchiveSessionMutationSchema, BlobDisposition, BlobRefSchema, CancelQueueItemMutationSchema, CapabilitySupport, CompactSessionMutationSchema, CompactSessionOutcome,
   ConnectionState, CreateScheduleMutationSchema, CreateSessionMutationSchema, CloneSessionMutationSchema, ForkSessionMutationSchema, SessionDerivationKind,
+  CreateTaskTagMutationSchema, UpdateTaskTagMutationSchema, ReorderTaskTagsMutationSchema, SetSessionTaskTagsMutationSchema, DeleteTaskTagMutationSchema,
   DeleteScheduleMutationSchema, DeleteSessionMessageMutationSchema, DeleteSessionMutationSchema, DeviceKind, DismissInteractionMutationSchema,
   EditQueueItemMutationSchema, EntityKind, EntityRefSchema, EventSchema, ExecuteUserShellMutationSchema, ExecuteWorkspaceRewindMutationSchema,
   LAN_DISCOVERY_PEER_TTL_MS,
@@ -12,7 +13,7 @@ import {
   DeleteScheduleRunMutationSchema, LogoutConnectionMutationSchema, MarkAllScheduleRunsReadMutationSchema,
   MarkScheduleRunReadMutationSchema, MarkScheduleRunsReadMutationSchema, NavigateSessionBranchMutationSchema,
   OperationPreconditionSchema, OperationState, OperationMutationSchema, RewindSafety,
-  MessageRole, PermissionMode, PinSessionMutationSchema, QueueDeliveryMode, QueueItemState, RenameSessionMutationSchema,
+  MessageRole, PermissionMode, PinSessionMutationSchema, QueueDeliveryMode, QueueItemState, RenameSessionMutationSchema, TaskTagColor,
   ReorderQueueItemMutationSchema, ResetSessionMutationSchema, ResolveInteractionMutationSchema, RestartScheduleRunMutationSchema,
   DeviceSchema, RenameDeviceMutationSchema, ResetDeviceNameMutationSchema, RevisionSchema, RevokeDeviceMutationSchema,
   CloneProjectScheduleToUserMutationSchema, PromoteScheduleToProjectMutationSchema,
@@ -24,7 +25,7 @@ import {
   UpdateVoiceInputServiceSettingsMutationSchema, VoiceInputServiceSettingsPatchSchema,
   FileKind, ImageRefSchema,
   type Artifact, type BackendDescriptor, type BlobRef, type Device, type DiscoveredNodeRecord, type Event, type EventCursor, type FilePreview, type FileRevision, type Interaction,
-  type Operation, type OperationMutation, type QueueControl, type QueueItem, type Schedule, type Session, type Snapshot, type Target,
+  type Operation, type OperationMutation, type QueueControl, type QueueItem, type Schedule, type Session, type Snapshot, type Target, type TaskTagDeletePreview,
   type WorkspaceEntry, type WorkspaceSearchMatch
 } from "@joko/contracts";
 import { mobileVoiceCredentialBindingChanged, type MobileVoiceSettingsTransport } from "./mobile-voice-service-settings";
@@ -2509,7 +2510,8 @@ export class MobileClient {
         const cursor = event.cursor;
         if (!event.eventId || !cursor || !cursor.opaqueToken || cursor.generation !== this.#streamGeneration
           || cursor.sequence > (this.#streamSequence ?? 0n) + 1n
-          || event.payload?.kind.case === "projectionInvalidated") {
+          || event.payload?.kind.case === "projectionInvalidated"
+          || event.payload?.kind.case === "taskTagCatalogChanged") {
           this.#clearHistory();
           void this.refresh();
           return;
@@ -9008,6 +9010,90 @@ export class MobileClient {
     });
   }
 
+  async createTaskTag(sessionId: string, name: string, color: TaskTagColor, expectedCatalogRevision: bigint): Promise<boolean> {
+    const value = name.trim();
+    if (!value || value.length > 80) throw new Error("Use a task-tag name between 1 and 80 characters.");
+    return this.#mutateTaskTags(sessionId, create(OperationMutationSchema, {
+      payload: { case: "createTaskTag", value: create(CreateTaskTagMutationSchema, {
+        originSessionId: sessionId,
+        name: value,
+        color,
+        expectedCatalogRevision: create(RevisionSchema, { value: expectedCatalogRevision })
+      }) }
+    }));
+  }
+
+  async updateTaskTag(sessionId: string, taskTagId: string, expectedRevision: bigint,
+    patch: { readonly name?: string; readonly color?: TaskTagColor }): Promise<boolean> {
+    const name = patch.name?.trim();
+    if (name !== undefined && (!name || name.length > 80)) throw new Error("Use a task-tag name between 1 and 80 characters.");
+    if (name === undefined && patch.color === undefined) return true;
+    return this.#mutateTaskTags(sessionId, create(OperationMutationSchema, {
+      payload: { case: "updateTaskTag", value: create(UpdateTaskTagMutationSchema, {
+        originSessionId: sessionId,
+        taskTagId,
+        expectedRevision: create(RevisionSchema, { value: expectedRevision }),
+        ...(name === undefined ? {} : { name }),
+        ...(patch.color === undefined ? {} : { color: patch.color })
+      }) }
+    }));
+  }
+
+  async reorderTaskTags(sessionId: string, taskTagIds: readonly string[], expectedCatalogRevision: bigint): Promise<boolean> {
+    return this.#mutateTaskTags(sessionId, create(OperationMutationSchema, {
+      payload: { case: "reorderTaskTags", value: create(ReorderTaskTagsMutationSchema, {
+        originSessionId: sessionId,
+        taskTagIds: [...taskTagIds],
+        expectedCatalogRevision: create(RevisionSchema, { value: expectedCatalogRevision })
+      }) }
+    }));
+  }
+
+  async setSessionTaskTag(sessionId: string, taskTagId: string, attached: boolean): Promise<boolean> {
+    return this.#mutateTaskTags(sessionId, create(OperationMutationSchema, {
+      payload: { case: "setSessionTaskTags", value: create(SetSessionTaskTagsMutationSchema, {
+        originSessionId: sessionId,
+        sessionIds: [sessionId],
+        taskTagIds: [taskTagId],
+        attached
+      }) }
+    }));
+  }
+
+  async previewTaskTagDeletion(taskTagId: string, signal?: AbortSignal): Promise<TaskTagDeletePreview> {
+    return this.network.previewTaskTagDeletion(this.#ready(), taskTagId, signal);
+  }
+
+  async deleteTaskTag(sessionId: string, preview: TaskTagDeletePreview): Promise<boolean> {
+    if (!preview.tagRevision || !preview.associationRevision) {
+      throw new Error("A current task-tag delete preview is required.");
+    }
+    return this.#mutateTaskTags(sessionId, create(OperationMutationSchema, {
+      payload: { case: "deleteTaskTag", value: create(DeleteTaskTagMutationSchema, {
+        originSessionId: sessionId,
+        taskTagId: preview.taskTagId,
+        affectedSessionCount: preview.affectedSessionCount,
+        expectedTagRevision: create(RevisionSchema, preview.tagRevision),
+        expectedAssociationRevision: create(RevisionSchema, preview.associationRevision)
+      }) }
+    }));
+  }
+
+  async #mutateTaskTags(sessionId: string, mutation: OperationMutation): Promise<boolean> {
+    if (!this.#state.owner?.sessions.some((candidate) => candidate.sessionId === sessionId)) {
+      throw new Error("A current task is required to change task tags.");
+    }
+    if (this.#state.pending.some((item) => item.kind === "task-tag")) {
+      throw new Error("A previous task-tag change is still pending.");
+    }
+    this.#ready();
+    const action = this.#claimMutation();
+    try {
+      const result = await this.#submitTerminal(mutation, { kind: "task-tag", sessionId });
+      return result.accepted && result.definitive;
+    } finally { this.#releaseMutation(action); }
+  }
+
   async setSessionPinned(sessionId: string, pinned: boolean): Promise<boolean> {
     return this.#mutateSession(sessionId, "pin", {
       case: "pinSession",
@@ -11490,7 +11576,7 @@ export class MobileClient {
             && ["device-rename", "rename", "pin", "archive", "delete", "message-delete", "queue-cancel", "queue-edit-lock",
               "queue-edit", "queue-interaction-lock", "queue-reorder", "interaction-resolve", "interaction-dismiss",
               "session-model", "session-permission", "session-plan", "session-compact", "session-branch",
-              "session-shell", "session-reset", "session-review", "session-clone", "session-fork", "session-rewind", "workspace-rewind"].includes(pending.kind)
+              "session-shell", "session-reset", "session-review", "session-clone", "session-fork", "session-rewind", "workspace-rewind", "task-tag"].includes(pending.kind)
             && this.#current(epoch)) {
             await this.refresh();
             if ((pending.kind === "message-delete" || messageRewind) && this.#foreground

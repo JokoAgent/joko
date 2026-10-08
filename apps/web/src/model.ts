@@ -34,6 +34,7 @@ export interface MachineSessionCacheView {
   readonly attentionKind?: SessionAttentionView["kind"];
   readonly attentionUnread?: boolean;
   readonly interactionKind?: InteractionView["kind"];
+  readonly taskTags: readonly TaskTagDisplayView[];
 }
 
 /** Content-light owner cache used only to keep remote task navigation available while a node is offline. */
@@ -1221,6 +1222,33 @@ export interface ModelPriceOverrideView {
   readonly revision?: bigint;
 }
 
+export type TaskTagColorView =
+  | "red" | "orange" | "yellow" | "green" | "blue" | "purple"
+  | "gray" | "pink" | "coral" | "teal" | "indigo" | "white";
+
+export interface TaskTagDisplayView {
+  readonly id: string;
+  readonly name: string;
+  readonly color: TaskTagColorView;
+  readonly presetKey?: string;
+  readonly nameCustomized: boolean;
+}
+
+export interface TaskTagView extends TaskTagDisplayView {
+  readonly sortOrder: number;
+  readonly revision: bigint;
+  readonly associationRevision: bigint;
+  readonly createdAt: number;
+  readonly updatedAt: number;
+}
+
+export interface TaskTagDeletePreviewView {
+  readonly tagId: string;
+  readonly affectedSessionCount: number;
+  readonly tagRevision: bigint;
+  readonly associationRevision: bigint;
+}
+
 export interface SessionView {
   readonly id: string;
   readonly backendId: string;
@@ -1241,6 +1269,7 @@ export interface SessionView {
   readonly permissionMode: PermissionMode;
   readonly planMode: boolean;
   readonly worktree?: SessionWorktreeView;
+  readonly taskTags?: readonly TaskTagView[];
   readonly attention?: SessionAttentionView;
   readonly createdAt?: number;
   readonly updatedAt: number;
@@ -4845,6 +4874,8 @@ export interface AppSnapshot {
   readonly managedModelRuntimes?: readonly ManagedModelRuntimeView[];
   readonly targets: readonly TargetView[];
   readonly sessions: readonly SessionView[];
+  readonly taskTags: readonly TaskTagView[];
+  readonly taskTagCatalogRevision: bigint;
   readonly backgroundTasks: readonly BackgroundTaskActivityView[];
   readonly timelineBySession: ReadonlyMap<string, readonly TimelineItemView[]>;
   /**
@@ -5752,6 +5783,12 @@ export interface OperationApi extends VoiceDictionaryPeerApi {
   resetSession(sessionId: string): Promise<void>;
   deleteSessionMessage(sessionId: string, eventId: string): Promise<void>;
   renameSession(sessionId: string, name: string): Promise<void>;
+  createTaskTag(originSessionId: string, name: string, color: TaskTagColorView, expectedCatalogRevision: bigint, presetId?: string): Promise<void>;
+  updateTaskTag(originSessionId: string, tagId: string, expectedRevision: bigint, patch: { readonly name?: string; readonly color?: TaskTagColorView }): Promise<void>;
+  reorderTaskTags(originSessionId: string, taskTagIds: readonly string[], expectedCatalogRevision: bigint): Promise<void>;
+  setSessionTaskTags(originSessionId: string, sessionIds: readonly string[], taskTagIds: readonly string[], attached: boolean): Promise<void>;
+  previewTaskTagDeletion(taskTagId: string, signal?: AbortSignal): Promise<TaskTagDeletePreviewView>;
+  deleteTaskTag(originSessionId: string, preview: TaskTagDeletePreviewView): Promise<void>;
   suggestSessionTitle(sessionId: string, signal?: AbortSignal): Promise<SessionTitleSuggestionView>;
   pinSession(sessionId: string, pinned: boolean): Promise<void>;
   archiveSession(sessionId: string, archived: boolean): Promise<void>;
@@ -6395,6 +6432,8 @@ export function emptySnapshot(): AppSnapshot {
     providers: [],
     targets: [],
     sessions: [],
+    taskTags: [],
+    taskTagCatalogRevision: 0n,
     backgroundTasks: [],
     timelineBySession: new Map(),
     timelineHistoryRevisionBySession: new Map(),

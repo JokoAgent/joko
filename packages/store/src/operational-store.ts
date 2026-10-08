@@ -32,6 +32,8 @@ import type {
   SessionDescriptor,
   SessionReferenceSnapshot,
   SessionWorktreeBinding,
+  TaskTagCatalog,
+  TaskTagColor,
   SubagentRunDetail,
   SubagentRunState,
   SubagentTranscriptEntry,
@@ -39,6 +41,7 @@ import type {
 } from "@joko/core";
 import {
   JokoError,
+  TASK_TAG_COLORS,
   assertAudioArtifactMetadata,
   type AudioArtifactMetadata,
   type BlobRef,
@@ -69,6 +72,7 @@ import {
   parseCurrentInteractionPayload
 } from "./interaction-shape.js";
 import { parseCurrentResourceUsageEventPayload } from "./resource-usage-shape.js";
+import { parseCurrentTaskTagEventPayload } from "./task-tag-shape.js";
 import { configureDatabase, initializeDatabase, SCHEMA_VERSION } from "./schema.js";
 import {
   projectResourceUsageStream,
@@ -110,12 +114,14 @@ import type {
   ClaimMessagingConnectionOwnerInput,
   CreateMessagingInboundRequestInput,
   CreateRemoteHostInput,
+  CreateTaskTagInput,
   CreateDeviceInput,
   CreatePairingInput,
   DeviceControlRelationRecord,
   DeviceRecord,
   DesktopHostAuthorizationRecord,
   DeleteRemoteHostInput,
+  DeleteTaskTagInput,
   DiagnosticRecord,
   DeferredEffectOperationClaim,
   DurableRuntimeActivitySnapshot,
@@ -212,6 +218,7 @@ import type {
   QueueItemRecord,
   QueuePlacement,
   RevokedDeviceResult,
+  ReorderTaskTagsInput,
   RemoteHostFailureCode,
   RemoteHostAuthenticationMode,
   RemoteHostRecord,
@@ -256,9 +263,13 @@ import type {
   StoredSubagentRunProjection,
   StoredTarget,
   StoreHealth,
+  SetSessionTaskTagsInput,
   SubagentRunPage,
   SubagentTranscriptPage,
   ToolLeaseRecord,
+  TaskTagDeletePreview,
+  TaskTagRecord,
+  TaskTagSessionPage,
   RecordUsageObservationInput,
   UsageLedgerDailyRecord,
   UsageLedgerQuery,
@@ -271,6 +282,7 @@ import type {
   UpdateMessagingConnectionRuntimeInput,
   UpdateRemoteHostInput,
   UpdateRemoteHostStatusInput,
+  UpdateTaskTagInput,
   UpdateQueueStateInput,
   UpdateObjectiveInput,
   UpdateRunStateInput,
@@ -3654,8 +3666,345 @@ export class OperationalStore {
     return withSessionPresentation(
       sessionFromRow(row),
       this.findSessionAttention(id),
-      this.findSessionWorktree(id)
+      this.findSessionWorktree(id),
+      this.listSessionTaskTags(id)
     );
+  }
+
+  listTaskTags(): TaskTagRecord[] {
+    this.assertOpen();
+    return (this.database.prepare(
+      "SELECT * FROM task_tags ORDER BY sort_order, id"
+    ).all() as Row[]).map(taskTagFromRow);
+  }
+
+  getTaskTagCatalog(): TaskTagCatalog {
+    this.assertOpen();
+    const row = this.database.prepare(
+      "SELECT revision FROM task_tag_catalog_state WHERE singleton = 1"
+    ).get() as Row | undefined;
+    if (row === undefined) throw new StoreError("Task tag catalog state is missing.");
+    return { tags: this.listTaskTags(), revision: toBigInt(row["revision"]) };
+  }
+
+  getTaskTag(tagId: string): TaskTagRecord {
+    this.assertOpen();
+    const id = taskTagIdentifier(tagId, "Task tag ID");
+    const row = this.database.prepare("SELECT * FROM task_tags WHERE id = ?").get(id) as Row | undefined;
+    if (row === undefined) throw new NotFoundError("Task tag", id);
+    return taskTagFromRow(row);
+  }
+
+  listSessionTaskTags(sessionId: string): TaskTagRecord[] {
+    this.assertOpen();
+    const id = nonBlank(sessionId, "Session ID");
+    return (this.database.prepare(`
+      SELECT tag.*
+      FROM task_tags AS tag
+      INNER JOIN session_task_tags AS association ON association.tag_id = tag.id
+      WHERE association.session_id = ?
+      ORDER BY tag.sort_order, tag.id
+    `).all(id) as Row[]).map(taskTagFromRow);
+  }
+
+  listTaskTagsForSessions(sessionIds: readonly string[]): Array<{
+    readonly sessionId: string;
+    readonly tags: readonly TaskTagRecord[];
+  }> {
+    const ids = uniqueBoundedIdentifiers(sessionIds, 100, 1_024, "Session IDs");
+    return ids.map((sessionId) => {
+      const session = this.getSession(sessionId);
+      if (session.descriptor.deletedAt !== undefined) throw new StoreError("Deleted tasks do not expose labels.");
+      return { sessionId, tags: this.listSessionTaskTags(sessionId) };
+    });
+  }
+
+  findSessionsByTaskTag(tagId: string, offset = 0, limit = 50): TaskTagSessionPage {
+    this.assertOpen();
+    const tag = this.getTaskTag(tagId);
+    if (!Number.isSafeInteger(offset) || offset < 0) throw new StoreError("Task tag offset is invalid.");
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) {
+      throw new StoreError("Task tag page size must be between 1 and 100.");
+    }
+    const rows = this.database.prepare(`
+      SELECT session.id
+      FROM product_sessions AS session
+      INNER JOIN session_task_tags AS association ON association.session_id = session.id
+      WHERE association.tag_id = ? AND session.deleted_at IS NULL
+      ORDER BY session.updated_at DESC, session.id
+      LIMIT ? OFFSET ?
+    `).all(tag.id, limit + 1, offset) as Row[];
+    const count = this.database.prepare(`
+      SELECT count(*) AS total_size
+      FROM product_sessions AS session
+      INNER JOIN session_task_tags AS association ON association.session_id = session.id
+      WHERE association.tag_id = ? AND session.deleted_at IS NULL
+    `).get(tag.id) as Row;
+    return {
+      sessions: rows.slice(0, limit).map((row) => this.getSession(stringValue(row["id"]))),
+      hasMore: rows.length > limit,
+      totalSize: numberValue(count["total_size"])
+    };
+  }
+
+  createTaskTag(input: CreateTaskTagInput): TaskTagRecord {
+    return this.write(() => {
+      const origin = this.requireMutableTaskTagOrigin(input.originSessionId);
+      const catalog = this.getTaskTagCatalog();
+      if (catalog.revision !== input.expectedCatalogRevision) {
+        throw new RevisionConflictError(
+          "Task tag catalog",
+          "owner",
+          input.expectedCatalogRevision,
+          catalog.revision
+        );
+      }
+      if (catalog.tags.length >= 256) throw new StoreError("The task tag catalog cannot exceed 256 labels.");
+      const name = taskTagName(input.name);
+      const color = taskTagColor(input.color);
+      const preset = input.presetId === undefined ? undefined : taskTagPreset(input.presetId);
+      if (preset !== undefined && (preset.name !== name || preset.color !== color)) {
+        throw new StoreError("A preset task tag must use its canonical name and color.");
+      }
+      const id = preset?.id ?? taskTagIdentifier(this.idFactory(), "Task tag ID");
+      const nameKey = taskTagNameKey(name);
+      if (this.database.prepare("SELECT 1 FROM task_tags WHERE name_key = ? OR id = ?").get(nameKey, id) !== undefined) {
+        throw new StoreError("A task tag with that name or ID already exists.");
+      }
+      const at = taskTagTimestamp(input.createdAt ?? this.now(), "creation time");
+      const revision = this.requireActiveRevision();
+      this.database.prepare(`
+        INSERT INTO task_tags(
+          id, name, name_key, color, preset_key, name_customized, sort_order,
+          revision, association_revision, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+      `).run(
+        id,
+        name,
+        nameKey,
+        color,
+        preset?.key ?? null,
+        preset === undefined ? 1 : 0,
+        catalog.tags.length,
+        asSqlInteger(revision),
+        at,
+        at
+      );
+      this.database.prepare(
+        "UPDATE task_tag_catalog_state SET revision = ? WHERE singleton = 1"
+      ).run(asSqlInteger(revision));
+      const created = this.getTaskTag(id);
+      this.appendTaskTagCatalogEvent(origin, `task-tag-create:${id}:${revision.toString(10)}`);
+      return created;
+    });
+  }
+
+  updateTaskTag(input: UpdateTaskTagInput): TaskTagRecord {
+    return this.write(() => {
+      const origin = this.requireMutableTaskTagOrigin(input.originSessionId);
+      const current = this.getTaskTag(input.tagId);
+      if (current.revision !== input.expectedRevision) {
+        throw new RevisionConflictError("Task tag", current.id, input.expectedRevision, current.revision);
+      }
+      if (input.name === undefined && input.color === undefined) {
+        throw new StoreError("A task tag update must change its name or color.");
+      }
+      const name = input.name === undefined ? current.name : taskTagName(input.name);
+      const color = input.color === undefined ? current.color : taskTagColor(input.color);
+      const nameCustomized = input.name === undefined ? current.nameCustomized : true;
+      if (name === current.name && color === current.color && nameCustomized === current.nameCustomized) return current;
+      const nameKey = taskTagNameKey(name);
+      if (this.database.prepare(
+        "SELECT 1 FROM task_tags WHERE name_key = ? AND id <> ?"
+      ).get(nameKey, current.id) !== undefined) {
+        throw new StoreError("A task tag with that name already exists.");
+      }
+      const at = taskTagTimestamp(input.updatedAt ?? this.now(), "update time");
+      const revision = this.requireActiveRevision();
+      const changed = this.database.prepare(`
+        UPDATE task_tags
+        SET name = ?, name_key = ?, color = ?, name_customized = ?, revision = ?, updated_at = ?
+        WHERE id = ? AND revision = ?
+      `).run(
+        name,
+        nameKey,
+        color,
+        nameCustomized ? 1 : 0,
+        asSqlInteger(revision),
+        at,
+        current.id,
+        asSqlInteger(current.revision)
+      );
+      if (changed.changes !== 1) {
+        throw new RevisionConflictError("Task tag", current.id, current.revision, this.getTaskTag(current.id).revision);
+      }
+      const updated = this.getTaskTag(current.id);
+      this.appendTaskTagCatalogEvent(origin, `task-tag-update:${current.id}:${revision.toString(10)}`);
+      return updated;
+    });
+  }
+
+  reorderTaskTags(input: ReorderTaskTagsInput): TaskTagCatalog {
+    return this.write(() => {
+      const origin = this.requireMutableTaskTagOrigin(input.originSessionId);
+      const catalog = this.getTaskTagCatalog();
+      if (catalog.revision !== input.expectedCatalogRevision) {
+        throw new RevisionConflictError(
+          "Task tag catalog",
+          "owner",
+          input.expectedCatalogRevision,
+          catalog.revision
+        );
+      }
+      const ids = uniqueBoundedIdentifiers(input.tagIds, 256, 128, "Task tag order");
+      const currentIds = catalog.tags.map((tag) => tag.id);
+      if (ids.length !== currentIds.length || ids.some((id) => !currentIds.includes(id))) {
+        throw new StoreError("Task tag order must contain every catalog label exactly once.");
+      }
+      if (ids.every((id, index) => id === currentIds[index])) return catalog;
+      const at = taskTagTimestamp(input.updatedAt ?? this.now(), "reorder time");
+      const revision = this.requireActiveRevision();
+      ids.forEach((id, sortOrder) => {
+        if (catalog.tags.find((tag) => tag.id === id)?.sortOrder !== sortOrder) {
+          this.database.prepare(
+            "UPDATE task_tags SET sort_order = ?, revision = ?, updated_at = ? WHERE id = ?"
+          ).run(sortOrder, asSqlInteger(revision), at, id);
+        }
+      });
+      this.database.prepare(
+        "UPDATE task_tag_catalog_state SET revision = ? WHERE singleton = 1"
+      ).run(asSqlInteger(revision));
+      this.appendTaskTagCatalogEvent(origin, `task-tag-reorder:${revision.toString(10)}`);
+      return this.getTaskTagCatalog();
+    });
+  }
+
+  setSessionTaskTags(input: SetSessionTaskTagsInput): readonly {
+    readonly sessionId: string;
+    readonly tags: readonly TaskTagRecord[];
+  }[] {
+    return this.write(() => {
+      const origin = this.requireMutableTaskTagOrigin(input.originSessionId);
+      const sessionIds = uniqueBoundedIdentifiers(input.sessionIds, 100, 1_024, "Session IDs");
+      const tagIds = uniqueBoundedIdentifiers(input.tagIds, 32, 128, "Task tag IDs");
+      const sessions = sessionIds.map((sessionId) => this.getSession(sessionId));
+      if (sessions.some((session) => session.descriptor.deletedAt !== undefined)) {
+        throw new StoreError("Deleted tasks cannot change labels.");
+      }
+      tagIds.forEach((tagId) => this.getTaskTag(tagId));
+      if (input.attached) {
+        for (const sessionId of sessionIds) {
+          const existing = this.listSessionTaskTags(sessionId).map((tag) => tag.id);
+          if (new Set([...existing, ...tagIds]).size > 32) {
+            throw new StoreError("A task cannot have more than 32 labels.");
+          }
+        }
+      }
+      const at = taskTagTimestamp(input.updatedAt ?? this.now(), "association time");
+      const revision = this.requireActiveRevision();
+      const changedSessions = new Set<string>();
+      const changedTags = new Set<string>();
+      for (const sessionId of sessionIds) {
+        for (const tagId of tagIds) {
+          const result = input.attached
+            ? this.database.prepare(`
+                INSERT OR IGNORE INTO session_task_tags(session_id, tag_id, created_at, revision)
+                VALUES (?, ?, ?, ?)
+              `).run(sessionId, tagId, at, asSqlInteger(revision))
+            : this.database.prepare(
+                "DELETE FROM session_task_tags WHERE session_id = ? AND tag_id = ?"
+              ).run(sessionId, tagId);
+          if (result.changes === 1) {
+            changedSessions.add(sessionId);
+            changedTags.add(tagId);
+          }
+        }
+      }
+      if (changedSessions.size > 0) {
+        for (const tagId of changedTags) {
+          this.database.prepare(`
+            UPDATE task_tags SET association_revision = ?, updated_at = ? WHERE id = ?
+          `).run(asSqlInteger(revision), at, tagId);
+        }
+        this.bumpTaskTagSessions([...changedSessions]);
+        this.appendTaskTagCatalogEvent(origin, `task-tag-association:${revision.toString(10)}`);
+      }
+      return sessionIds.map((sessionId) => ({ sessionId, tags: this.listSessionTaskTags(sessionId) }));
+    });
+  }
+
+  previewTaskTagDeletion(tagId: string): TaskTagDeletePreview {
+    const tag = this.getTaskTag(tagId);
+    const row = this.database.prepare(`
+      SELECT count(*) AS affected_count
+      FROM session_task_tags AS association
+      INNER JOIN product_sessions AS session ON session.id = association.session_id
+      WHERE association.tag_id = ? AND session.deleted_at IS NULL
+    `).get(tag.id) as Row;
+    return {
+      tagId: tag.id,
+      affectedSessionCount: numberValue(row["affected_count"]),
+      tagRevision: tag.revision,
+      associationRevision: tag.associationRevision
+    };
+  }
+
+  deleteTaskTag(input: DeleteTaskTagInput): TaskTagCatalog {
+    return this.write(() => {
+      const origin = this.requireMutableTaskTagOrigin(input.originSessionId);
+      const preview = this.previewTaskTagDeletion(input.tagId);
+      if (
+        preview.tagRevision !== input.tagRevision ||
+        preview.associationRevision !== input.associationRevision ||
+        preview.affectedSessionCount !== input.affectedSessionCount
+      ) {
+        throw new StoreError("Task tag deletion preview is stale; preview the deletion again.");
+      }
+      const revision = this.requireActiveRevision();
+      const deleted = this.database.prepare("DELETE FROM task_tags WHERE id = ?").run(preview.tagId);
+      if (deleted.changes !== 1) throw new NotFoundError("Task tag", preview.tagId);
+      const remaining = this.listTaskTags();
+      remaining.forEach((tag, sortOrder) => {
+        if (tag.sortOrder !== sortOrder) {
+          this.database.prepare("UPDATE task_tags SET sort_order = ? WHERE id = ?").run(sortOrder, tag.id);
+        }
+      });
+      this.database.prepare(
+        "UPDATE task_tag_catalog_state SET revision = ? WHERE singleton = 1"
+      ).run(asSqlInteger(revision));
+      this.appendTaskTagCatalogEvent(origin, `task-tag-delete:${preview.tagId}:${revision.toString(10)}`);
+      return this.getTaskTagCatalog();
+    });
+  }
+
+  private requireMutableTaskTagOrigin(sessionId: string): StoredSession {
+    const session = this.getSession(nonBlank(sessionId, "Task tag origin Session ID"));
+    if (session.descriptor.deletedAt !== undefined) throw new StoreError("A deleted task cannot mutate labels.");
+    return session;
+  }
+
+  private taskTagSessionIds(tagId: string): string[] {
+    return (this.database.prepare(`
+      SELECT association.session_id
+      FROM session_task_tags AS association
+      INNER JOIN product_sessions AS session ON session.id = association.session_id
+      WHERE association.tag_id = ? AND session.deleted_at IS NULL
+      ORDER BY association.session_id
+    `).all(tagId) as Row[]).map((row) => stringValue(row["session_id"]));
+  }
+
+  private bumpTaskTagSessions(sessionIds: readonly string[]): void {
+    if (sessionIds.length === 0) return;
+    const revision = this.requireActiveRevision();
+    for (const sessionId of [...new Set(sessionIds)]) {
+      this.database.prepare(
+        "UPDATE product_sessions SET revision = ? WHERE id = ? AND deleted_at IS NULL"
+      ).run(asSqlInteger(revision), sessionId);
+      this.appendSessionProjectionEvent(
+        this.getSession(sessionId),
+        `session-task-tags:${sessionId}:${revision.toString(10)}`
+      );
+    }
   }
 
   findObjective(sessionId: string): ObjectiveRecord | undefined {
@@ -6942,7 +7291,8 @@ export class OperationalStore {
       return withSessionPresentation(
         session,
         this.findSessionAttention(session.descriptor.id),
-        this.findSessionWorktree(session.descriptor.id)
+        this.findSessionWorktree(session.descriptor.id),
+        this.listSessionTaskTags(session.descriptor.id)
       );
     });
   }
@@ -6960,7 +7310,8 @@ export class OperationalStore {
     return withSessionPresentation(
       session,
       this.findSessionAttention(session.descriptor.id),
-      this.findSessionWorktree(session.descriptor.id)
+      this.findSessionWorktree(session.descriptor.id),
+      this.listSessionTaskTags(session.descriptor.id)
     );
   }
 
@@ -8119,6 +8470,17 @@ export class OperationalStore {
       generation: session.descriptor.binding.generation,
       traceId,
       payload: { type: "session_changed" }
+    });
+  }
+
+  private appendTaskTagCatalogEvent(session: StoredSession, traceId: string): PersistedEvent {
+    return this.appendEvent({
+      backendId: session.descriptor.backendId,
+      targetId: session.descriptor.targetId,
+      sessionId: session.descriptor.id,
+      generation: session.descriptor.binding.generation,
+      traceId,
+      payload: { type: "task_tag_catalog_changed", catalog: this.getTaskTagCatalog() }
     });
   }
 
@@ -9683,9 +10045,9 @@ export class OperationalStore {
         }
       }
       if (input.operationId !== undefined) this.getOperation(input.operationId);
-      const payload = parseCurrentResourceUsageEventPayload(
+      const payload = parseCurrentTaskTagEventPayload(parseCurrentResourceUsageEventPayload(
         parseCurrentInteractionEventPayload(redactSubagentEventPayload(input.payload))
-      );
+      ));
       if (payload.type === "device_changed") throw new StoreError("Device content cannot use Session routing.");
       if (payload.type === "resource_usage" && (
         input.runId === undefined || payload.runtimeGeneration !== input.generation
@@ -18963,13 +19325,17 @@ function sessionWorktreeFromRow(row: Row): SessionWorktreeBinding {
 function withSessionPresentation(
   session: StoredSession,
   attention: SessionAttentionRecord | undefined,
-  worktree: SessionWorktreeBinding | undefined
+  worktree: SessionWorktreeBinding | undefined,
+  taskTags: readonly TaskTagRecord[]
 ): StoredSession {
   const attended = withSessionAttention(session, attention);
-  if (worktree === undefined) return attended;
   return {
     ...attended,
-    descriptor: { ...attended.descriptor, worktree }
+    descriptor: {
+      ...attended.descriptor,
+      ...(worktree === undefined ? {} : { worktree }),
+      taskTags
+    }
   };
 }
 
@@ -20016,7 +20382,7 @@ function eventFromRow(row: Row): PersistedEvent {
     readonly payload: unknown;
     readonly pi?: NonNullable<AppendEventInput["pi"]> | null;
   }>(stringValue(row["payload_json"]));
-  const payload = parseCurrentInteractionEventPayload(stored.payload);
+  const payload = parseCurrentTaskTagEventPayload(parseCurrentInteractionEventPayload(stored.payload));
   if (payload.type === "device_changed") {
     if (row["backend_id"] !== null || row["target_id"] !== null || row["session_id"] !== null
       || row["run_id"] !== null || row["attempt_id"] !== null || row["operation_id"] !== null
@@ -22475,6 +22841,113 @@ function usageCurrency(value: string): string {
 
 function modelPriceCurrency(value: string): "USD" | "CNY" {
   if (value !== "USD" && value !== "CNY") throw new StoreError("Model price currency is invalid.");
+  return value;
+}
+
+const TASK_TAG_PRESETS = [
+  { id: "default:red", key: "red", name: "Red", color: "red" },
+  { id: "default:orange", key: "orange", name: "Orange", color: "orange" },
+  { id: "default:yellow", key: "yellow", name: "Yellow", color: "yellow" },
+  { id: "default:green", key: "green", name: "Green", color: "green" },
+  { id: "default:blue", key: "blue", name: "Blue", color: "blue" },
+  { id: "default:purple", key: "purple", name: "Purple", color: "purple" },
+  { id: "preset:important", key: "important", name: "Important", color: "coral" },
+  { id: "preset:follow-up", key: "follow-up", name: "Follow up", color: "pink" },
+  { id: "preset:work", key: "work", name: "Work", color: "indigo" },
+  { id: "preset:life", key: "life", name: "Life", color: "teal" },
+  { id: "preset:ideas", key: "ideas", name: "Ideas", color: "white" },
+  { id: "preset:reference", key: "reference", name: "Reference", color: "gray" }
+] as const satisfies readonly {
+  readonly id: string;
+  readonly key: string;
+  readonly name: string;
+  readonly color: TaskTagColor;
+}[];
+
+function taskTagPreset(id: string): typeof TASK_TAG_PRESETS[number] {
+  const normalized = taskTagIdentifier(id, "Task tag preset ID");
+  const preset = TASK_TAG_PRESETS.find((candidate) => candidate.id === normalized);
+  if (preset === undefined) throw new StoreError("Task tag preset is not supported.");
+  return preset;
+}
+
+function taskTagFromRow(row: Row): TaskTagRecord {
+  return {
+    id: taskTagIdentifier(stringValue(row["id"]), "Stored task tag ID"),
+    name: taskTagName(stringValue(row["name"])),
+    color: taskTagColor(stringValue(row["color"])),
+    ...(row["preset_key"] === null || row["preset_key"] === undefined
+      ? {}
+      : { presetKey: stringValue(row["preset_key"]) }),
+    nameCustomized: booleanValue(row["name_customized"]),
+    sortOrder: taskTagSortOrder(numberValue(row["sort_order"])),
+    revision: toBigInt(row["revision"]),
+    associationRevision: toBigInt(row["association_revision"]),
+    createdAt: taskTagTimestamp(numberValue(row["created_at"]), "stored creation time"),
+    updatedAt: taskTagTimestamp(numberValue(row["updated_at"]), "stored update time")
+  };
+}
+
+function taskTagIdentifier(value: string, label: string): string {
+  if (
+    typeof value !== "string"
+    || value.trim() !== value
+    || value.length < 1
+    || value.length > 128
+    || /[\u0000-\u001f\u007f]/u.test(value)
+  ) throw new StoreError(`${label} is invalid.`);
+  return value;
+}
+
+function uniqueBoundedIdentifiers(
+  values: readonly string[],
+  maximumCount: number,
+  maximumLength: number,
+  label: string
+): string[] {
+  if (!Array.isArray(values) || values.length < 1 || values.length > maximumCount) {
+    throw new StoreError(`${label} must contain between 1 and ${maximumCount} values.`);
+  }
+  const normalized = values.map((value) => {
+    if (
+      typeof value !== "string"
+      || value.trim() !== value
+      || value.length < 1
+      || value.length > maximumLength
+      || /[\u0000-\u001f\u007f]/u.test(value)
+    ) throw new StoreError(`${label} contains an invalid value.`);
+    return value;
+  });
+  if (new Set(normalized).size !== normalized.length) throw new StoreError(`${label} contains duplicates.`);
+  return normalized;
+}
+
+function taskTagName(value: string): string {
+  const normalized = value.trim();
+  if (
+    normalized.length < 1
+    || normalized.length > 80
+    || /[\u0000-\u001f\u007f]/u.test(normalized)
+  ) throw new StoreError("Task tag name is invalid.");
+  return normalized;
+}
+
+function taskTagNameKey(value: string): string {
+  return value.normalize("NFKC").toLocaleLowerCase("en-US");
+}
+
+function taskTagColor(value: string): TaskTagColor {
+  if (!TASK_TAG_COLORS.includes(value as TaskTagColor)) throw new StoreError("Task tag color is invalid.");
+  return value as TaskTagColor;
+}
+
+function taskTagSortOrder(value: number): number {
+  if (!Number.isSafeInteger(value) || value < 0 || value > 255) throw new StoreError("Task tag order is invalid.");
+  return value;
+}
+
+function taskTagTimestamp(value: number, label: string): number {
+  if (!Number.isSafeInteger(value) || value < 0) throw new StoreError(`Task tag ${label} is invalid.`);
   return value;
 }
 

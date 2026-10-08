@@ -17,15 +17,17 @@ import {
   Pencil,
   Pin,
   Sparkles,
+  Tags,
   Rows2,
   Trash2,
   Undo2
 } from "lucide-react";
-import type { SessionView, TargetView } from "../model.js";
+import type { SessionView, TargetView, TaskTagView } from "../model.js";
 import type { SessionProjectNavigationPlacement } from "../session-project-navigation.js";
 import type { Translator } from "./types.js";
 import { TipSummary } from "./ui.js";
 import { CodeHostPullRequestSummary } from "./CodeHostPullRequestSummary.js";
+import { TaskTagDot, taskTagDisplayName } from "./TaskTags.js";
 
 export interface SessionHeaderActionsMenuProps {
   readonly session: SessionView;
@@ -33,6 +35,9 @@ export interface SessionHeaderActionsMenuProps {
   readonly movingProject?: boolean;
   readonly t: Translator;
   readonly onRename: () => void;
+  readonly taskTags?: readonly TaskTagView[];
+  readonly onToggleTaskTag?: (tagId: string, attached: boolean) => void;
+  readonly onManageTaskTags?: () => void;
   readonly onPin: () => void;
   readonly onArchive: () => void;
   readonly onPrefetchRemoval?: () => void;
@@ -56,6 +61,9 @@ export function SessionHeaderActionsMenu({
   movingProject = false,
   t,
   onRename,
+  taskTags = [],
+  onToggleTaskTag = () => undefined,
+  onManageTaskTags = () => undefined,
   onPin,
   onArchive,
   onPrefetchRemoval,
@@ -136,7 +144,7 @@ export function SessionHeaderActionsMenu({
       setProjectMenuOpen(false);
       return;
     }
-    const items = [...event.currentTarget.querySelectorAll<HTMLButtonElement>("[role='menuitem']:not([disabled])")];
+    const items = [...event.currentTarget.querySelectorAll<HTMLButtonElement>("[role='menuitem']:not([disabled]), [role='menuitemcheckbox']:not([disabled])")];
     const activeIndex = items.indexOf(event.currentTarget.ownerDocument.activeElement as HTMLButtonElement);
     const nextIndex = event.key === "ArrowDown"
       ? (activeIndex + 1 + items.length) % items.length
@@ -172,7 +180,7 @@ export function SessionHeaderActionsMenu({
         const details = event.currentTarget.parentElement as HTMLDetailsElement | null;
         if (details !== null) details.open = true;
         event.currentTarget.ownerDocument.defaultView?.requestAnimationFrame(() => {
-          const items = detailsRef.current?.querySelectorAll<HTMLButtonElement>("[role='menuitem']:not([disabled])");
+          const items = detailsRef.current?.querySelectorAll<HTMLButtonElement>("[role='menuitem']:not([disabled]), [role='menuitemcheckbox']:not([disabled])");
           const item = event.key === "ArrowUp" ? items?.item((items?.length ?? 1) - 1) : items?.item(0);
           item?.focus({ preventScroll: true });
         });
@@ -227,6 +235,16 @@ export function SessionHeaderActionsMenu({
           <Pencil aria-hidden="true" />
           {t("session.rename")}
         </button>
+        {taskTags.length > 0 && <>
+          <div className="menu-separator" role="separator" />
+          {taskTags.slice(0, 7).map((tag) => {
+            const attached = session.taskTags?.some((candidate) => candidate.id === tag.id) === true;
+            return <button key={tag.id} type="button" role="menuitemcheckbox" aria-checked={attached} className="task-tag-menu-item" onClick={() => run(() => onToggleTaskTag(tag.id, !attached))}>
+              <TaskTagDot tag={tag} t={t} /><span>{taskTagDisplayName(tag, t)}</span>{attached && <Check aria-hidden="true" />}
+            </button>;
+          })}
+        </>}
+        <button type="button" role="menuitem" onClick={() => run(onManageTaskTags)}><Tags aria-hidden="true" /><span>{t("taskTags.manage")}</span></button>
         {canMove && <button
           type="button"
           role="menuitem"

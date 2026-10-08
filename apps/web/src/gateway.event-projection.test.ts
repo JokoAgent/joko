@@ -50,6 +50,7 @@ import {
   SessionState,
   SnapshotInvalidationReason,
   SnapshotSchema,
+  TaskTagColor,
   ToolCallOutputMode,
   ToolCallState,
   type Event
@@ -301,6 +302,68 @@ describe("browser takeover projection", () => {
 });
 
 describe("incremental event projection", () => {
+  it("reconciles loaded Session labels from one bounded owner catalog event", () => {
+    const work = {
+      taskTagId: "preset:work",
+      name: "Work",
+      color: TaskTagColor.INDIGO,
+      presetKey: "work",
+      sortOrder: 0,
+      revision: { value: 1n },
+      associationRevision: { value: 2n }
+    };
+    const life = {
+      taskTagId: "preset:life",
+      name: "Life",
+      color: TaskTagColor.TEAL,
+      presetKey: "life",
+      sortOrder: 1,
+      revision: { value: 1n },
+      associationRevision: { value: 2n }
+    };
+    const raw = create(SnapshotSchema, {
+      generation: 4n,
+      resumeCursor: { generation: 4n, sequence: 5n },
+      taskTagCatalog: { taskTags: [work, life], revision: { value: 3n } },
+      sessions: [{
+        sessionId: "session-tags",
+        backendId: "pi",
+        targetId: "target",
+        location: serviceNodeLocation,
+        state: SessionState.IDLE,
+        taskTags: [work, life]
+      }]
+    });
+    const event = create(EventSchema, {
+      eventId: "task-tag-catalog-update",
+      cursor: { generation: 4n, sequence: 6n },
+      payload: { kind: { case: "taskTagCatalogChanged", value: { catalog: {
+        taskTags: [{
+          ...life,
+          name: "Personal",
+          color: TaskTagColor.PINK,
+          nameCustomized: true,
+          sortOrder: 0,
+          revision: { value: 6n }
+        }],
+        revision: { value: 6n }
+      } } } }
+    });
+
+    const result = projectSnapshotEvent(raw, mapSnapshot(raw), event);
+
+    expect(result.refresh).toBe("none");
+    expect(result.rawSnapshot.sessions[0]?.taskTags).toEqual([
+      expect.objectContaining({ taskTagId: "preset:life", name: "Personal", color: TaskTagColor.PINK })
+    ]);
+    expect(result.snapshot.taskTags).toEqual([
+      expect.objectContaining({ id: "preset:life", name: "Personal", color: "pink", sortOrder: 0 })
+    ]);
+    expect(result.snapshot.sessions[0]?.taskTags).toEqual([
+      expect.objectContaining({ id: "preset:life", name: "Personal", color: "pink", sortOrder: 0 })
+    ]);
+  });
+
   it("projects owner-snapshot background activity and its terminal stream edge", () => {
     const raw = create(SnapshotSchema, {
       generation: 8n,

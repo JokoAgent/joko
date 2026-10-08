@@ -90,6 +90,7 @@ message EventPayload {
     HistoryPrunedEvent history_pruned = 72;
     ResourceUsageRecordedEvent resource_usage_recorded = 73;
     ObjectiveLifecycleEvent objective_lifecycle = 74;
+    TaskTagCatalogChangedEvent task_tag_catalog_changed = 75;
   }
 }
 
@@ -135,6 +136,10 @@ message TargetChangedEvent {
 
 message SessionChangedEvent {
   Session session = 1;
+}
+
+message TaskTagCatalogChangedEvent {
+  TaskTagCatalog catalog = 1;
 }
 
 message RunChangedEvent {

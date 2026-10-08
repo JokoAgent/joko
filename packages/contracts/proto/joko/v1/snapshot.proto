@@ -97,6 +97,7 @@ message Snapshot {
   repeated ReviewRun review_runs = 40;
   repeated DeviceControlRelation device_control_relations = 41;
   ExtensionCatalogSnapshot extension_catalog = 42;
+  TaskTagCatalog task_tag_catalog = 43;
   // Optional Pi-native authority for Pi-capable scopes. Public fields above
   // remain the backend-neutral source consumed by shared reducers.
   PiSnapshot pi = 100;

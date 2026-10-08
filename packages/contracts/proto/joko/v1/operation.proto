@@ -234,6 +234,11 @@ message OperationMutation {
     UpdateCollaborationScopeMutation update_collaboration_scope = 213;
     DeleteCollaborationScopeMutation delete_collaboration_scope = 214;
     ResetDeviceNameMutation reset_device_name = 217;
+    CreateTaskTagMutation create_task_tag = 218;
+    UpdateTaskTagMutation update_task_tag = 219;
+    ReorderTaskTagsMutation reorder_task_tags = 220;
+    SetSessionTaskTagsMutation set_session_task_tags = 221;
+    DeleteTaskTagMutation delete_task_tag = 222;
   }
 }
 
@@ -654,6 +659,43 @@ message DeleteSessionMutation {
   string session_id = 1;
   bool delete_native_session = 2;
   bool delete_artifacts = 3;
+}
+
+message CreateTaskTagMutation {
+  string origin_session_id = 1;
+  string name = 2;
+  TaskTagColor color = 3;
+  Revision expected_catalog_revision = 4;
+  optional string preset_id = 5;
+}
+
+message UpdateTaskTagMutation {
+  string origin_session_id = 1;
+  string task_tag_id = 2;
+  Revision expected_revision = 3;
+  optional string name = 4;
+  optional TaskTagColor color = 5;
+}
+
+message ReorderTaskTagsMutation {
+  string origin_session_id = 1;
+  repeated string task_tag_ids = 2;
+  Revision expected_catalog_revision = 3;
+}
+
+message SetSessionTaskTagsMutation {
+  string origin_session_id = 1;
+  repeated string session_ids = 2;
+  repeated string task_tag_ids = 3;
+  bool attached = 4;
+}
+
+message DeleteTaskTagMutation {
+  string origin_session_id = 1;
+  string task_tag_id = 2;
+  uint64 affected_session_count = 3;
+  Revision expected_tag_revision = 4;
+  Revision expected_association_revision = 5;
 }
 
 message ForkSessionMutation {

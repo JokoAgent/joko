@@ -177,6 +177,7 @@ import { MobileTaskDerivationSheet } from "./MobileTaskDerivationSheet";
 import { MobileMessageRewindSheet } from "./MobileMessageRewindSheet";
 import { MobileSessionDerivationMarker } from "./MobileSessionDerivationMarker";
 import { MobileTaskHeader } from "./MobileTaskHeader";
+import { MobileTaskTagDots, MobileTaskTagsSheet, mobileTaskTagName } from "./MobileTaskTags";
 import { MobileComposerAtomSheet } from "./MobileComposerAtomSheet";
 import {
   MobileComposerRichInput,
@@ -593,7 +594,7 @@ export function App() {
     background: dark ? "#15191d" : "#f7f6f3", surface: dark ? "#24292d" : "#ffffff",
     ink: dark ? "#f4f4f2" : "#242a2d", muted: dark ? "#adb6b7" : "#637073",
     border: dark ? "#394246" : "#e1e2df", accent: "#ff9800", negative: "#cc634e",
-    brandBackground: dark ? "#302920" : "#fff1db"
+    brandBackground: dark ? "#302920" : "#fff1db", dark
   }), [dark]);
 
   useEffect(() => {
@@ -967,7 +968,7 @@ export function App() {
   );
 }
 
-type Colors = { background: string; surface: string; ink: string; muted: string; border: string; accent: string; negative: string; brandBackground: string };
+type Colors = { background: string; surface: string; ink: string; muted: string; border: string; accent: string; negative: string; brandBackground: string; dark: boolean };
 type ScreenProps = { colors: Colors; state: MobileClient["state"]; locale: MobileSupportedLocale };
 
 function mobileHomeSectionLabels(locale: MobileSupportedLocale) {
@@ -1026,6 +1027,7 @@ function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu, incomi
   const copyInFlightRef = useRef(false);
   const mountedRef = useRef(true);
   const [renameSession, setRenameSession] = useState<Session>();
+  const [taskTagSessionId, setTaskTagSessionId] = useState<string>();
   const [renameDraft, setRenameDraft] = useState("");
   const searchRef = useRef<TextInput>(null);
   const swipeRegistry = useMemo(() => createSwipeRowRegistry(), []);
@@ -1125,6 +1127,12 @@ function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu, incomi
     } else if (action === "rename") {
       setRenameDraft(session.displayName);
       setRenameSession(session);
+    } else if (action === "tags") {
+      setTaskTagSessionId(session.sessionId);
+    } else if (action.startsWith("tag:")) {
+      const taskTagId = action.slice(4);
+      const attached = session.taskTags.some((tag) => tag.taskTagId === taskTagId);
+      runMutation(() => client.setSessionTaskTag(session.sessionId, taskTagId, !attached));
     } else if (action === "pin") togglePin(session);
     else if (action === "archive") toggleArchive(session);
     else Alert.alert(
@@ -1152,6 +1160,7 @@ function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu, incomi
     if (state.status !== "connected") {
       swipeRegistry.closeOpenRow();
       setRenameSession(undefined);
+      setTaskTagSessionId(undefined);
     }
     if (state.status === "connected" || state.status === "offline") return;
     optionsGenerationRef.current += 1;
@@ -1248,6 +1257,7 @@ function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu, incomi
             <View style={styles.fill}><View style={styles.statusTitle}>
               <Text style={[styles.label, { color: colors.ink }]} numberOfLines={1}>{item.session.displayName
                 || mobileMessage(locale, "home.untitledTask")}</Text>
+              <MobileTaskTagDots tags={item.session.taskTags} locale={locale} dark={colors.dark} />
               {item.session.pinned && <Text style={[styles.badge, { color: colors.ink, backgroundColor: colors.brandBackground }]}>{mobileMessage(locale, "common.pinned")}</Text>}
             </View>
               <Text style={[styles.caption, { color: colors.muted }]} numberOfLines={1}>{item.targetName} · {sessionState(item.session.state, locale)}</Text></View>
@@ -1274,6 +1284,11 @@ function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu, incomi
           <Text style={[styles.label, { color: colors.ink }]} numberOfLines={1}>{optionsSession?.displayName
             || mobileMessage(locale, "home.taskOptions")}</Text>
           <MenuRow label={mobileMessage(locale, "common.rename")} onPress={() => scheduleOption("rename")} colors={colors}
+            disabled={state.status !== "connected"} />
+          {(state.owner?.taskTagCatalog?.taskTags ?? []).slice(0, 7).map((tag) => <MenuRow key={tag.taskTagId}
+            label={`${optionsSession?.taskTags.some((candidate) => candidate.taskTagId === tag.taskTagId) === true ? "✓ " : ""}${mobileTaskTagName(tag, locale)}`}
+            onPress={() => scheduleOption(`tag:${tag.taskTagId}`)} colors={colors} disabled={state.status !== "connected"} />)}
+          <MenuRow label={mobileMessage(locale, "taskTags.manage")} onPress={() => scheduleOption("tags")} colors={colors}
             disabled={state.status !== "connected"} />
           <MenuRow label={mobileMessage(locale, copyBusy ? "actions.copyingLink" : "actions.copyTaskLink")}
             onPress={() => scheduleOption("copy-link")} colors={colors}
@@ -1307,10 +1322,19 @@ function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu, incomi
         </View>
       </View>
     </Modal>
+    <MobileTaskTagsSheet
+      visible={state.status === "connected" && taskTagSessionId !== undefined}
+      session={state.owner?.sessions.find((session) => session.sessionId === taskTagSessionId)}
+      catalog={state.owner?.taskTagCatalog}
+      client={client}
+      colors={colors}
+      locale={locale}
+      onClose={() => setTaskTagSessionId(undefined)}
+    />
   </View>;
 }
 
-type SessionOption = "rename" | "copy-link" | "pin" | "archive" | "delete";
+type SessionOption = "rename" | "copy-link" | "pin" | "archive" | "delete" | "tags" | `tag:${string}`;
 
 function HomeMenu({ visible, colors, state, locale, onClose, onClosed, onMountedChange, onSearch, onAutomations, onPartners, onSwitch, onSettings, onDevices }: ScreenProps & {
   visible: boolean; onClose: () => void; onClosed: () => void; onMountedChange: (mounted: boolean) => void;
@@ -3078,6 +3102,7 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
   const [selectedInteractionId, setSelectedInteractionId] = useState<string | undefined>(initialInteractions[0]?.interactionId);
   const [interactionVisible, setInteractionVisible] = useState(initialInteractions.length > 0);
   const [runtimeControlsVisible, setRuntimeControlsVisible] = useState(false);
+  const [taskTagsVisible, setTaskTagsVisible] = useState(false);
   const [contextVisible, setContextVisible] = useState(false);
   const [nativeTreeVisible, setNativeTreeVisible] = useState(false);
   const [sessionMentionsVisible, setSessionMentionsVisible] = useState(false);
@@ -5374,6 +5399,7 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
       accessibilityElementsHidden={drawerMounted} importantForAccessibility={drawerMounted ? "no-hide-descendants" : "auto"}>
     <MobileTaskHeader key={`${state.activeProfileId}/${state.selectedId}/${session?.backendId}/${session?.targetId}/${session?.nativeBinding?.runtimeGeneration}`}
       title={session?.displayName || mobileMessage(locale, "task.titleFallback")}
+      titleAccessory={<MobileTaskTagDots tags={session?.taskTags} locale={locale} dark={colors.dark} />}
       subtitle={session ? sessionState(session.state, locale) : mobileMessage(locale, "task.loading")}
       navigationRef={drawerMenuRef} drawerNavigation={wideNavigation.enabled}
       navigationLabel={wideNavigation.enabled ? mobileMessage(locale, "task.openList")
@@ -5382,6 +5408,19 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
         ? () => { pendingDrawerActionRef.current = undefined; setDrawerOpen(true); } : onBack}
       disabled={session === undefined} colors={colors} locale={locale} onMenuVisibilityChange={setTaskActionsVisible}
       actions={[
+        ...(state.owner?.taskTagCatalog?.taskTags ?? []).slice(0, 7).map((tag) => ({
+          id: `tag:${tag.taskTagId}` as const,
+          label: `${session?.taskTags.some((candidate) => candidate.taskTagId === tag.taskTagId) === true ? "✓ " : ""}${mobileTaskTagName(tag, locale)}`,
+          onPress: () => {
+            if (!session) return;
+            const attached = session.taskTags.some((candidate) => candidate.taskTagId === tag.taskTagId);
+            void client.setSessionTaskTag(session.sessionId, tag.taskTagId, !attached).catch((error) => setLocalError(errorText(error)));
+          },
+          disabled: state.status !== "connected" || state.busy || attachmentBusy || voice.busy
+        })),
+        { id: "tags", label: mobileMessage(locale, "taskTags.manage"),
+          onPress: () => setTaskTagsVisible(true),
+          disabled: state.status !== "connected" || session === undefined || state.busy || attachmentBusy || voice.busy },
         { id: "clone", label: mobileMessage(locale, "clone.title"),
           onPress: () => { setSessionMentionsVisible(false); setWorkspaceMentionsVisible(false); setCatalogMentionsVisible(false); setContextVisible(false); setRuntimeControlsVisible(false); setNativeTreeVisible(false); setForkEventId(undefined); setRewindEventId(undefined); setCloneVisible(true); },
           disabled: !cloneControls?.canClone || state.busy || attachmentBusy || voice.busy },
@@ -5896,6 +5935,9 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
       onClose={() => setCatalogMentionsVisible(false)}
       onLoad={(surfaceOwnerKey, signal) => client.listTaskCatalogMentionCatalog(surfaceOwnerKey, signal)}
       onSelect={insertCatalogMention} />
+    <MobileTaskTagsSheet visible={taskTagsVisible && state.status === "connected"} session={session}
+      catalog={state.owner?.taskTagCatalog} client={client} colors={colors} locale={locale}
+      onClose={() => setTaskTagsVisible(false)} />
     <MobileDrawer visible={drawerOpen} width={drawerWidthRef.current} backgroundColor={colors.surface}
       borderColor={colors.border} locale={locale}
       onClose={() => setDrawerOpen(false)} onMountedChange={setDrawerMounted} initialFocusRef={drawerCloseRef}

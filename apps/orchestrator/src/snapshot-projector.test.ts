@@ -80,6 +80,7 @@ describe("SnapshotProjector", () => {
     expect(snapshot.backends.map((backend) => backend.backendId)).toEqual(["pi"]);
     expect(snapshot.targets.map((target) => target.targetId)).toEqual(["target-1"]);
     expect(snapshot.sessions.map((session) => session.sessionId)).toEqual(["session-1"]);
+    expect(snapshot.taskTagCatalog).toBeUndefined();
     expect(snapshot.runs.map((run) => run.runId)).toContain("run-1");
     expect(snapshot.runs[0]?.attempts.map((attempt) => attempt.attemptId)).toContain("attempt-1");
     expect(snapshot.queueItems.map((item) => item.queueItemId)).toContain("queue-1");
@@ -119,8 +120,37 @@ describe("SnapshotProjector", () => {
     expect(snapshot.nativeSessionTree).toBeUndefined();
   });
 
+  it("projects task tag associations in Session scope without the owner catalog", () => {
+    const fixture = createFixture();
+    fixture.store.setSessionTaskTags({
+      originSessionId: "session-1",
+      sessionIds: ["session-1"],
+      tagIds: ["preset:work"],
+      attached: true,
+      updatedAt: 9_400
+    });
+
+    const snapshot = createProjector(fixture.store).projectSessionSnapshot({
+      sessionId: "session-1",
+      recentTimelineItems: 100
+    });
+
+    expect(snapshot.sessions[0]?.taskTags).toEqual([
+      expect.objectContaining({ taskTagId: "preset:work", presetKey: "work", nameCustomized: false })
+    ]);
+    expect(snapshot.taskTagCatalog).toBeUndefined();
+    expect(snapshot.timeline.some((event) => event.payload?.kind.case === "taskTagCatalogChanged")).toBe(false);
+  });
+
   it("projects the owner inventory without inventing a Pi timeline or context", () => {
     const fixture = createFixture();
+    fixture.store.setSessionTaskTags({
+      originSessionId: "session-1",
+      sessionIds: ["session-1"],
+      tagIds: ["preset:work"],
+      attached: true,
+      updatedAt: 9_400
+    });
     const snapshot = createProjector(fixture.store).projectOwnerSnapshot();
 
     expect(snapshot.scope?.kind.case).toBe("owner");
@@ -129,6 +159,10 @@ describe("SnapshotProjector", () => {
     expect(snapshot.backends.map((backend) => backend.backendId)).toContain("pi");
     expect(snapshot.targets.map((target) => target.targetId)).toContain("target-1");
     expect(snapshot.sessions.map((session) => session.sessionId)).toContain("session-1");
+    expect(snapshot.sessions.find((session) => session.sessionId === "session-1")?.taskTags)
+      .toEqual([expect.objectContaining({ taskTagId: "preset:work", presetKey: "work" })]);
+    expect(snapshot.taskTagCatalog?.taskTags).toHaveLength(12);
+    expect(snapshot.taskTagCatalog?.taskTags.map((tag) => tag.presetKey)).toContain("work");
     expect(snapshot.runs.map((run) => run.runId)).toContain("run-1");
     expect(snapshot.queueItems.map((item) => item.queueItemId)).toContain("queue-1");
     expect(snapshot.schedules.map((schedule) => schedule.scheduleId)).toContain("schedule-1");

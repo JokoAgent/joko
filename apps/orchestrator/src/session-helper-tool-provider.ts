@@ -1,7 +1,7 @@
 import { createHmac, randomBytes, randomUUID } from "node:crypto";
 import { resolve as resolvePath } from "node:path";
 
-import type { PromptInput, SessionDescriptor } from "@joko/core";
+import { TASK_TAG_COLORS, type PromptInput, type SessionDescriptor, type TaskTagColor } from "@joko/core";
 import {
   InvalidStateTransitionError,
   NotFoundError,
@@ -10,7 +10,8 @@ import {
   StoreError,
   type PersistedEvent,
   type QueueItemRecord,
-  type StoredSession
+  type StoredSession,
+  type TaskTagRecord
 } from "@joko/store";
 
 import type { MessageSearchEmbeddingCoordinator } from "./message-search-embedding.js";
@@ -137,6 +138,84 @@ export const SESSION_HELPER_NESTED_TOOLS: readonly NestedToolDescriptor[] = Obje
       dry_run: { type: "boolean", default: true },
       confirmation_token: { type: "string", minLength: 1, maxLength: 32_768 }
     }, ["changes"]),
+    false
+  ),
+  nestedTool(
+    "list_task_tags",
+    "history",
+    "List task-tag IDs, names, colors, display positions, and revisions in display order. The first seven appear in task menus. Scope is the owner store hosting the current task.",
+    objectSchema({}),
+    true
+  ),
+  nestedTool(
+    "get_task_tags",
+    "history",
+    "Read task tags for up to 100 task IDs in this owner store. Omit session_ids to read the authenticated current task.",
+    objectSchema({ session_ids: idArraySchema(100) }),
+    true
+  ),
+  nestedTool(
+    "find_tasks_by_tag",
+    "history",
+    "Find active or archived tasks carrying one tag in this owner store. Follow has_more for bounded pagination.",
+    objectSchema({
+      tag_id: ID_SCHEMA,
+      offset: { type: "integer", minimum: 0, maximum: 9_007_199_254_740_991, default: 0 },
+      limit: { type: "integer", minimum: 1, maximum: 100, default: 50 }
+    }, ["tag_id"]),
+    true
+  ),
+  nestedTool(
+    "create_task_tag",
+    "control",
+    "Create a named task tag at the end of the owner catalog. Only change tags when the human user requested it.",
+    objectSchema({
+      name: { type: "string", minLength: 1, maxLength: 80 },
+      color: { type: "string", enum: TASK_TAG_COLORS }
+    }, ["name", "color"]),
+    false
+  ),
+  nestedTool(
+    "update_task_tag",
+    "control",
+    "Rename or recolor one task tag without changing its order. Use the current revision from list_task_tags. Only change tags when the human user requested it.",
+    objectSchema({
+      tag_id: ID_SCHEMA,
+      revision: { type: "integer", minimum: 0, maximum: 9_007_199_254_740_991 },
+      name: { type: "string", minLength: 1, maxLength: 80 },
+      color: { type: "string", enum: TASK_TAG_COLORS }
+    }, ["tag_id", "revision"]),
+    false
+  ),
+  nestedTool(
+    "add_task_tags",
+    "control",
+    "Attach up to 32 tags atomically to up to 100 tasks in this owner store, preserving every other tag. Omit session_ids for the current task. Only change tags when the human user requested it.",
+    objectSchema({ tag_ids: idArraySchema(32), session_ids: idArraySchema(100) }, ["tag_ids"]),
+    false
+  ),
+  nestedTool(
+    "remove_task_tags",
+    "control",
+    "Detach up to 32 tags atomically from up to 100 tasks in this owner store, preserving every other tag. Omit session_ids for the current task. Only change tags when the human user requested it.",
+    objectSchema({ tag_ids: idArraySchema(32), session_ids: idArraySchema(100) }, ["tag_ids"]),
+    false
+  ),
+  nestedTool(
+    "reorder_task_tags",
+    "control",
+    "Reorder the complete task-tag catalog. tag_ids is the requested order and expected_order must exactly match the current complete order. Only change tags when the human user requested it.",
+    objectSchema({ tag_ids: idArraySchema(256), expected_order: idArraySchema(256) }, ["tag_ids", "expected_order"]),
+    false
+  ),
+  nestedTool(
+    "delete_task_tag",
+    "control",
+    "Preview deletion when confirmation_token is omitted. After the human user explicitly approves global deletion, repeat with the returned token. The token expires in ten minutes; target metadata or association changes invalidate it.",
+    objectSchema({
+      tag_id: ID_SCHEMA,
+      confirmation_token: { type: "string", minLength: 1, maxLength: 4_096 }
+    }, ["tag_id"]),
     false
   ),
   nestedTool(
@@ -365,6 +444,16 @@ interface RenameConfirmation {
   }[];
 }
 
+interface TaskTagDeleteConfirmation {
+  readonly v: 1;
+  readonly callerId: string;
+  readonly tagId: string;
+  readonly affectedSessionCount: number;
+  readonly tagRevision: string;
+  readonly associationRevision: string;
+  readonly expiresAt: number;
+}
+
 /**
  * Owner-scoped helper exposed through a two-tool progressive-discovery
  * surface. Every call is authenticated from the immutable Pi bridge grant;
@@ -387,8 +476,8 @@ export class SessionHelperToolBridgeProvider implements BridgeToolProvider {
     this.#host = options.host;
     this.#messageSearch = options.messageSearch ?? (() => undefined);
     this.#now = options.now ?? Date.now;
-    if (SESSION_HELPER_NESTED_TOOLS.length !== 18) {
-      throw new Error("The task helper catalog must expose exactly eighteen applicable nested tools.");
+    if (SESSION_HELPER_NESTED_TOOLS.length !== 27) {
+      throw new Error("The task helper catalog must expose exactly twenty-seven applicable nested tools.");
     }
   }
 
@@ -498,6 +587,15 @@ export class SessionHelperToolBridgeProvider implements BridgeToolProvider {
       case "get_current_session_id": return this.#getCurrentSessionId(input, caller);
       case "set_current_session_title": return this.#setCurrentSessionTitle(input, caller);
       case "rename_sessions": return this.#renameSessions(input);
+      case "list_task_tags": return this.#listTaskTags(input);
+      case "get_task_tags": return this.#getTaskTags(input, caller);
+      case "find_tasks_by_tag": return this.#findTasksByTag(input);
+      case "create_task_tag": return this.#createTaskTag(input, caller);
+      case "update_task_tag": return this.#updateTaskTag(input, caller);
+      case "add_task_tags": return this.#setTaskTags(input, caller, true);
+      case "remove_task_tags": return this.#setTaskTags(input, caller, false);
+      case "reorder_task_tags": return this.#reorderTaskTags(input, caller);
+      case "delete_task_tag": return this.#deleteTaskTag(input, caller);
       case "archive_sessions": return this.#setArchived(input, caller, true);
       case "unarchive_sessions": return this.#setArchived(input, caller, false);
       case "update_session_queued_message": return this.#updateQueuedMessage(input, caller);
@@ -738,6 +836,208 @@ export class SessionHelperToolBridgeProvider implements BridgeToolProvider {
     try {
       const value = JSON.parse(Buffer.from(encoded, "base64url").toString("utf8")) as unknown;
       return validRenameConfirmation(value) ? value : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  #listTaskTags(input: Readonly<Record<string, unknown>>): unknown {
+    assertKeys(input, []);
+    const catalog = this.#store.getTaskTagCatalog();
+    return {
+      supported_colors: TASK_TAG_COLORS,
+      catalog_revision: catalog.revision.toString(10),
+      tags: catalog.tags.map(taskTagPayload)
+    };
+  }
+
+  #getTaskTags(
+    input: Readonly<Record<string, unknown>>,
+    caller: SessionDescriptor
+  ): unknown {
+    assertKeys(input, ["session_ids"]);
+    const requested = optionalIdArray(input["session_ids"], "session_ids", 100);
+    if (requested?.length === 0) throw new SessionHelperError("INVALID_ARGS", "session_ids cannot be empty.");
+    const sessionIds = requested ?? [caller.id];
+    return {
+      sessions: this.#store.listTaskTagsForSessions(sessionIds).map((entry) => ({
+        session_id: entry.sessionId,
+        tags: entry.tags.map(taskTagPayload)
+      }))
+    };
+  }
+
+  #findTasksByTag(input: Readonly<Record<string, unknown>>): unknown {
+    assertKeys(input, ["tag_id", "offset", "limit"]);
+    const tagId = requiredId(input, "tag_id");
+    const offset = optionalInteger(input["offset"], "offset", 0, Number.MAX_SAFE_INTEGER) ?? 0;
+    const limit = optionalInteger(input["limit"], "limit", 1, 100) ?? 50;
+    const page = this.#store.findSessionsByTaskTag(tagId, offset, limit);
+    return {
+      sessions: page.sessions.map((session) => ({
+        session_id: session.descriptor.id,
+        tags: (session.descriptor.taskTags ?? []).map(taskTagDescriptorPayload)
+      })),
+      has_more: page.hasMore,
+      total_size: page.totalSize,
+      next_offset: page.hasMore ? offset + page.sessions.length : null
+    };
+  }
+
+  #createTaskTag(
+    input: Readonly<Record<string, unknown>>,
+    caller: SessionDescriptor
+  ): unknown {
+    assertKeys(input, ["name", "color"]);
+    const name = requiredText(input, "name", 80).trim();
+    if (name === "") throw new SessionHelperError("INVALID_ARGS", "name cannot be blank.");
+    const color = taskTagColorInput(input["color"]);
+    const catalog = this.#store.getTaskTagCatalog();
+    const created = this.#store.createTaskTag({
+      originSessionId: caller.id,
+      name,
+      color,
+      expectedCatalogRevision: catalog.revision
+    });
+    return { tag: taskTagPayload(created) };
+  }
+
+  #updateTaskTag(
+    input: Readonly<Record<string, unknown>>,
+    caller: SessionDescriptor
+  ): unknown {
+    assertKeys(input, ["tag_id", "revision", "name", "color"]);
+    const nameValue = optionalText(input["name"], "name", 80)?.trim();
+    if (nameValue !== undefined && nameValue === "") {
+      throw new SessionHelperError("INVALID_ARGS", "name cannot be blank.");
+    }
+    const color = input["color"] === undefined ? undefined : taskTagColorInput(input["color"]);
+    if (nameValue === undefined && color === undefined) {
+      throw new SessionHelperError("INVALID_ARGS", "Provide name or color.");
+    }
+    const revision = optionalInteger(input["revision"], "revision", 0, Number.MAX_SAFE_INTEGER);
+    if (revision === undefined) throw new SessionHelperError("INVALID_ARGS", "revision is required.");
+    const updated = this.#store.updateTaskTag({
+      originSessionId: caller.id,
+      tagId: requiredId(input, "tag_id"),
+      expectedRevision: BigInt(revision),
+      ...(nameValue === undefined ? {} : { name: nameValue }),
+      ...(color === undefined ? {} : { color })
+    });
+    return { tag: taskTagPayload(updated) };
+  }
+
+  #setTaskTags(
+    input: Readonly<Record<string, unknown>>,
+    caller: SessionDescriptor,
+    attached: boolean
+  ): unknown {
+    assertKeys(input, ["tag_ids", "session_ids"]);
+    const tagIds = requiredIdArray(input["tag_ids"], "tag_ids", 32);
+    const requested = optionalIdArray(input["session_ids"], "session_ids", 100);
+    if (requested?.length === 0) throw new SessionHelperError("INVALID_ARGS", "session_ids cannot be empty.");
+    const sessions = this.#store.setSessionTaskTags({
+      originSessionId: caller.id,
+      sessionIds: requested ?? [caller.id],
+      tagIds,
+      attached
+    });
+    return {
+      sessions: sessions.map((entry) => ({
+        session_id: entry.sessionId,
+        tags: entry.tags.map(taskTagPayload)
+      }))
+    };
+  }
+
+  #reorderTaskTags(
+    input: Readonly<Record<string, unknown>>,
+    caller: SessionDescriptor
+  ): unknown {
+    assertKeys(input, ["tag_ids", "expected_order"]);
+    const tagIds = requiredIdArray(input["tag_ids"], "tag_ids", 256);
+    const expectedOrder = requiredIdArray(input["expected_order"], "expected_order", 256);
+    const catalog = this.#store.getTaskTagCatalog();
+    const currentOrder = catalog.tags.map((tag) => tag.id);
+    if (!sameStrings(expectedOrder, currentOrder)) {
+      throw new SessionHelperError("PRECONDITION_FAILED", "Task-tag order changed; call list_task_tags again.", {
+        current_order: currentOrder
+      });
+    }
+    const updated = this.#store.reorderTaskTags({
+      originSessionId: caller.id,
+      tagIds,
+      expectedCatalogRevision: catalog.revision
+    });
+    return {
+      catalog_revision: updated.revision.toString(10),
+      tags: updated.tags.map(taskTagPayload)
+    };
+  }
+
+  #deleteTaskTag(
+    input: Readonly<Record<string, unknown>>,
+    caller: SessionDescriptor
+  ): unknown {
+    assertKeys(input, ["tag_id", "confirmation_token"]);
+    const tagId = requiredId(input, "tag_id");
+    const token = optionalText(input["confirmation_token"], "confirmation_token", 4_096);
+    if (token === undefined) {
+      const preview = this.#store.previewTaskTagDeletion(tagId);
+      const confirmation: TaskTagDeleteConfirmation = {
+        v: 1,
+        callerId: caller.id,
+        tagId: preview.tagId,
+        affectedSessionCount: preview.affectedSessionCount,
+        tagRevision: preview.tagRevision.toString(10),
+        associationRevision: preview.associationRevision.toString(10),
+        expiresAt: this.#now() + 600_000
+      };
+      return {
+        preview: {
+          tag_id: preview.tagId,
+          affected_session_count: preview.affectedSessionCount
+        },
+        confirmation_token: this.#encodeTaskTagDeleteConfirmation(confirmation)
+      };
+    }
+    const confirmation = this.#decodeTaskTagDeleteConfirmation(token);
+    if (
+      confirmation === undefined ||
+      confirmation.callerId !== caller.id ||
+      confirmation.tagId !== tagId ||
+      confirmation.expiresAt < this.#now()
+    ) {
+      throw new SessionHelperError("INVALID_CONFIRMATION", "Repeat the task-tag deletion preview.");
+    }
+    const updated = this.#store.deleteTaskTag({
+      originSessionId: caller.id,
+      tagId,
+      affectedSessionCount: confirmation.affectedSessionCount,
+      tagRevision: BigInt(confirmation.tagRevision),
+      associationRevision: BigInt(confirmation.associationRevision)
+    });
+    return {
+      deleted_tag_id: tagId,
+      catalog_revision: updated.revision.toString(10),
+      tags: updated.tags.map(taskTagPayload)
+    };
+  }
+
+  #encodeTaskTagDeleteConfirmation(value: TaskTagDeleteConfirmation): string {
+    const encoded = Buffer.from(JSON.stringify(value), "utf8").toString("base64url");
+    const digest = createHmac("sha256", this.#confirmationSecret).update(`task-tag.${encoded}`).digest("base64url");
+    return `tt1.${encoded}.${digest}`;
+  }
+
+  #decodeTaskTagDeleteConfirmation(token: string): TaskTagDeleteConfirmation | undefined {
+    const [version, encoded, digest, extra] = token.split(".");
+    if (version !== "tt1" || encoded === undefined || digest === undefined || extra !== undefined) return undefined;
+    const expected = createHmac("sha256", this.#confirmationSecret).update(`task-tag.${encoded}`).digest("base64url");
+    if (digest !== expected) return undefined;
+    try {
+      const value = JSON.parse(Buffer.from(encoded, "base64url").toString("utf8")) as unknown;
+      return validTaskTagDeleteConfirmation(value) ? value : undefined;
     } catch {
       return undefined;
     }
@@ -2085,6 +2385,47 @@ function publicRenamePreview(preview: RenamePreview): Readonly<Record<string, un
     working_dir: preview.workingDir,
     updated_at: preview.updatedAt
   };
+}
+
+function taskTagPayload(tag: TaskTagRecord): Readonly<Record<string, unknown>> {
+  return {
+    tag_id: tag.id,
+    name: tag.name,
+    color: tag.color,
+    preset_key: tag.presetKey ?? null,
+    name_customized: tag.nameCustomized,
+    sort_order: tag.sortOrder,
+    revision: Number(tag.revision),
+    association_revision: Number(tag.associationRevision)
+  };
+}
+
+function taskTagDescriptorPayload(
+  tag: NonNullable<SessionDescriptor["taskTags"]>[number]
+): Readonly<Record<string, unknown>> {
+  return taskTagPayload(tag);
+}
+
+function taskTagColorInput(value: unknown): TaskTagColor {
+  if (typeof value !== "string" || !TASK_TAG_COLORS.includes(value as TaskTagColor)) {
+    throw new SessionHelperError("INVALID_ARGS", `color must be one of: ${TASK_TAG_COLORS.join(", ")}.`);
+  }
+  return value as TaskTagColor;
+}
+
+function sameStrings(left: readonly string[], right: readonly string[]): boolean {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
+}
+
+function validTaskTagDeleteConfirmation(value: unknown): value is TaskTagDeleteConfirmation {
+  return isRecord(value) &&
+    value["v"] === 1 &&
+    typeof value["callerId"] === "string" && value["callerId"] !== "" &&
+    typeof value["tagId"] === "string" && value["tagId"] !== "" &&
+    Number.isSafeInteger(value["affectedSessionCount"]) && (value["affectedSessionCount"] as number) >= 0 &&
+    typeof value["tagRevision"] === "string" && /^\d+$/u.test(value["tagRevision"]) &&
+    typeof value["associationRevision"] === "string" && /^\d+$/u.test(value["associationRevision"]) &&
+    Number.isSafeInteger(value["expiresAt"]) && (value["expiresAt"] as number) > 0;
 }
 
 function validRenameConfirmation(value: unknown): value is RenameConfirmation {

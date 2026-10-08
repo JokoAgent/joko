@@ -214,6 +214,7 @@ import {
   fromProtoBlobRef,
   fromProtoInputContent,
   fromProtoRevision,
+  fromProtoTaskTagColor,
   fromProtoNativeNavigationTarget,
   fromProtoWorkspaceLocation,
   fromProtoTimestamp,
@@ -246,6 +247,9 @@ import {
   toProtoSubagentRun,
   toProtoSubagentRunDetail,
   toProtoSubagentTranscriptEntry,
+  toProtoTaskTag,
+  toProtoTaskTagCatalog,
+  toProtoTaskTagDeletePreview,
   toProtoTarget,
   toProtoTimestamp,
   toProtoToolLease,
@@ -2372,6 +2376,37 @@ export function createConnectServices(application: OrchestratorApplication, proj
       sessionCodeHostContext.refreshSessionInBackground(request.sessionId);
       const stored = dependencies.store.getSession(request.sessionId);
       return { session: mapSession(dependencies, stored) };
+    },
+    listTaskTags: (_request, context) => {
+      authenticate(context);
+      return { catalog: toProtoTaskTagCatalog(dependencies.store.getTaskTagCatalog()) };
+    },
+    getSessionTaskTags: (request, context) => {
+      authenticate(context);
+      const sessions = dependencies.store.listTaskTagsForSessions(request.sessionIds);
+      return {
+        sessions: sessions.map((entry) => create(contract.SessionTaskTagsSchema, {
+          sessionId: entry.sessionId,
+          taskTags: entry.tags.map(toProtoTaskTag)
+        }))
+      };
+    },
+    findSessionsByTaskTag: (request, context) => {
+      authenticate(context);
+      const page = storePageWindow(request.page);
+      const result = dependencies.store.findSessionsByTaskTag(request.taskTagId, page.offset, page.limit);
+      const next = page.offset + result.sessions.length;
+      return {
+        sessions: result.sessions.map((item) => mapSession(dependencies, item)),
+        page: create(contract.PageInfoSchema, {
+          nextPageToken: result.hasMore ? encodePageToken(next) : "",
+          totalSize: BigInt(result.totalSize)
+        })
+      };
+    },
+    previewTaskTagDeletion: (request, context) => {
+      authenticate(context);
+      return { preview: toProtoTaskTagDeletePreview(dependencies.store.previewTaskTagDeletion(request.taskTagId)) };
     },
     discoverNativeSessions: async (request, context) => {
       authenticate(context);
@@ -7051,6 +7086,7 @@ function eventContext(
 
 function eventMatchesScope(item: PersistedEvent, scope: contract.SnapshotScope | undefined, dependencies: ConnectServiceDependencies): boolean {
   if (item.payload.type === "device_changed") return scope?.kind.case === undefined || scope.kind.case === "owner";
+  if (item.payload.type === "task_tag_catalog_changed") return scope?.kind.case === undefined || scope.kind.case === "owner";
   switch (scope?.kind.case) {
     case undefined:
     case "owner": return true;
@@ -16257,6 +16293,116 @@ async function dispatchMutation(
         body: mutation,
         precondition: (store) => validatePreconditions(store, mutation),
         result: () => ({ accepted: true, resultCase: "acknowledgement" } satisfies OperationOutcome)
+      });
+      return presented(execution);
+    }
+    case "createTaskTag": {
+      const execution = await host.mutate({
+        operationId,
+        connection,
+        kind: payload.case,
+        body: mutation,
+        commit: (store) => {
+          store.createTaskTag({
+            originSessionId: payload.value.originSessionId,
+            name: payload.value.name,
+            color: fromProtoTaskTagColor(payload.value.color),
+            expectedCatalogRevision: fromProtoRevision(
+              payload.value.expectedCatalogRevision,
+              "create_task_tag.expected_catalog_revision"
+            ),
+            ...(payload.value.presetId === undefined ? {} : { presetId: payload.value.presetId })
+          });
+          return { accepted: true, resultCase: "acknowledgement" } satisfies OperationOutcome;
+        }
+      });
+      return presented(execution);
+    }
+    case "updateTaskTag": {
+      const execution = await host.mutate({
+        operationId,
+        connection,
+        kind: payload.case,
+        body: mutation,
+        commit: (store) => {
+          store.updateTaskTag({
+            originSessionId: payload.value.originSessionId,
+            tagId: payload.value.taskTagId,
+            expectedRevision: fromProtoRevision(
+              payload.value.expectedRevision,
+              "update_task_tag.expected_revision"
+            ),
+            ...(payload.value.name === undefined ? {} : { name: payload.value.name }),
+            ...(payload.value.color === undefined ? {} : { color: fromProtoTaskTagColor(payload.value.color) })
+          });
+          return { accepted: true, resultCase: "acknowledgement" } satisfies OperationOutcome;
+        }
+      });
+      return presented(execution);
+    }
+    case "reorderTaskTags": {
+      const execution = await host.mutate({
+        operationId,
+        connection,
+        kind: payload.case,
+        body: mutation,
+        commit: (store) => {
+          store.reorderTaskTags({
+            originSessionId: payload.value.originSessionId,
+            tagIds: payload.value.taskTagIds,
+            expectedCatalogRevision: fromProtoRevision(
+              payload.value.expectedCatalogRevision,
+              "reorder_task_tags.expected_catalog_revision"
+            )
+          });
+          return { accepted: true, resultCase: "acknowledgement" } satisfies OperationOutcome;
+        }
+      });
+      return presented(execution);
+    }
+    case "setSessionTaskTags": {
+      const execution = await host.mutate({
+        operationId,
+        connection,
+        kind: payload.case,
+        body: mutation,
+        commit: (store) => {
+          store.setSessionTaskTags({
+            originSessionId: payload.value.originSessionId,
+            sessionIds: payload.value.sessionIds,
+            tagIds: payload.value.taskTagIds,
+            attached: payload.value.attached
+          });
+          return { accepted: true, resultCase: "acknowledgement" } satisfies OperationOutcome;
+        }
+      });
+      return presented(execution);
+    }
+    case "deleteTaskTag": {
+      const execution = await host.mutate({
+        operationId,
+        connection,
+        kind: payload.case,
+        body: mutation,
+        commit: (store) => {
+          store.deleteTaskTag({
+            originSessionId: payload.value.originSessionId,
+            tagId: payload.value.taskTagId,
+            affectedSessionCount: safeUnsignedNumber(
+              payload.value.affectedSessionCount,
+              "delete_task_tag.affected_session_count"
+            ),
+            tagRevision: fromProtoRevision(
+              payload.value.expectedTagRevision,
+              "delete_task_tag.expected_tag_revision"
+            ),
+            associationRevision: fromProtoRevision(
+              payload.value.expectedAssociationRevision,
+              "delete_task_tag.expected_association_revision"
+            )
+          });
+          return { accepted: true, resultCase: "acknowledgement" } satisfies OperationOutcome;
+        }
       });
       return presented(execution);
     }

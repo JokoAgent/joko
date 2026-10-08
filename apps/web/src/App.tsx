@@ -22,6 +22,7 @@ import {
   type NavigationMode
 } from "./navigation-layout.js";
 import { ArchiveSessionDialog, BulkDeleteSessionDialog, DeleteSessionDialog, RenameSessionDialog } from "./components/SessionDialogs.js";
+import { TaskTagDialog } from "./components/TaskTags.js";
 import { NewSessionPage } from "./components/NewSessionPage.js";
 import { DesktopWindowControls } from "./components/DesktopWindowControls.js";
 import { DesktopPageSearchBar } from "./components/DesktopPageSearchBar.js";
@@ -256,6 +257,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
     : undefined;
   const t = useCallback((key: Parameters<typeof translate>[1], values?: Parameters<typeof translate>[2]) => translate(state.effectiveLocale, key, values), [state.effectiveLocale]);
   const [renameSession, setRenameSession] = useState<SessionView>();
+  const [taskTagSessionId, setTaskTagSessionId] = useState<string>();
   const [archiveRemoval, setArchiveRemoval] = useState<SessionRemovalDialogRequest>();
   const [deleteRemoval, setDeleteRemoval] = useState<SessionRemovalDialogRequest>();
   const [actionError, setActionError] = useState<string>();
@@ -1859,6 +1861,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
         openInspector();
       }}
       onRename={() => setRenameSession(activeSession)}
+      onManageTaskTags={() => setTaskTagSessionId(activeSession.id)}
       onPin={() => runAction(`pin:${activeSession.id}`, () => controller.pinSession(activeSession.id, !activeSession.pinned))}
       onArchive={() => requestArchiveSession(activeSession)}
       onPrefetchRemoval={() => prefetchRemoval(activeSession)}
@@ -2126,6 +2129,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
       runAction={runAction}
       onOpenNavigation={() => setWindowNavigationOpen(true)}
       onRename={setRenameSession}
+      onManageTaskTags={(session) => setTaskTagSessionId(session.id)}
       onPin={(session) => runAction(`pin:${session.id}`, () => controller.pinSession(session.id, !session.pinned))}
       onArchive={requestArchiveSession}
       onPrefetchRemoval={prefetchRemoval}
@@ -2223,6 +2227,11 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
         onNewTaskInTarget={(target) => controller.navigate({ kind: "newSession", targetId: target.id })}
         onNewDialogue={(backendId) => controller.navigate({ kind: "newSession", dialogueBackendId: backendId })}
         onRename={(session, name) => runAction(`rename:${session.id}`, () => controller.renameSession(session.id, name))}
+        onToggleTaskTag={(session, tagId, attached) => runAction(
+          `task-tag:${session.id}:${tagId}:${attached ? "attach" : "detach"}`,
+          () => controller.setSessionTaskTags(session.id, [session.id], [tagId], attached)
+        )}
+        onManageTaskTags={(session) => setTaskTagSessionId(session.id)}
         onPin={(session) => runAction(`pin:${session.id}`, () => controller.pinSession(session.id, !session.pinned))}
         onPinTarget={(target) => runAction(`project-pin:${target.id}`, () => controller.updateTarget(target.id, { pinned: !target.pinned }, target.revision))}
         onRenameTarget={(target, name) => runAction(`project-rename:${target.id}`, () => controller.updateTarget(target.id, { name }, target.revision))}
@@ -2453,6 +2462,14 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
           if (session !== undefined) runAction(`rename:${session.id}`, () => controller.renameSession(session.id, name));
         }}
       />
+      <TaskTagDialog
+        session={taskTagSessionId === undefined ? undefined : state.snapshot.sessions.find((session) => session.id === taskTagSessionId)}
+        catalog={state.snapshot.taskTags}
+        catalogRevision={state.snapshot.taskTagCatalogRevision}
+        controller={controller}
+        t={t}
+        onClose={() => setTaskTagSessionId(undefined)}
+      />
       <ArchiveSessionDialog
         sessions={archiveRemoval?.sessions ?? []}
         preflight={archiveRemoval?.preflight}
@@ -2544,7 +2561,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
   );
 }
 
-function SplitSessionPaneHost({ controller, sessionId, navigationOpen, t, runAction, onOpenNavigation, onRename, onPin, onArchive, onPrefetchRemoval, onDelete, onMoveSessionProject, movingSessionProject, onCopyTaskLink, onExportPortableSession, onSplitSession, onOpenSessionWindow, onOpenTurnReview }: {
+function SplitSessionPaneHost({ controller, sessionId, navigationOpen, t, runAction, onOpenNavigation, onRename, onManageTaskTags, onPin, onArchive, onPrefetchRemoval, onDelete, onMoveSessionProject, movingSessionProject, onCopyTaskLink, onExportPortableSession, onSplitSession, onOpenSessionWindow, onOpenTurnReview }: {
   readonly controller: AppController;
   readonly sessionId: string;
   readonly navigationOpen: boolean;
@@ -2552,6 +2569,7 @@ function SplitSessionPaneHost({ controller, sessionId, navigationOpen, t, runAct
   readonly runAction: RunAction;
   readonly onOpenNavigation: () => void;
   readonly onRename: (session: SessionView) => void;
+  readonly onManageTaskTags: (session: SessionView) => void;
   readonly onPin: (session: SessionView) => void;
   readonly onArchive: (session: SessionView) => void;
   readonly onPrefetchRemoval: (session: SessionView) => void;
@@ -2656,6 +2674,7 @@ function SplitSessionPaneHost({ controller, sessionId, navigationOpen, t, runAct
     onOpenNavigation={onOpenNavigation}
     onOpenInspector={() => undefined}
     onRename={() => onRename(session)}
+    onManageTaskTags={() => onManageTaskTags(session)}
     onPin={() => onPin(session)}
     onArchive={() => onArchive(session)}
     onPrefetchRemoval={() => onPrefetchRemoval(session)}

@@ -18,8 +18,8 @@ const caches: readonly MachineCacheView[] = [
     origin: "https://east.example.test",
     updatedAt: now,
     sessions: [
-      { id: "shared", name: "Release checklist", state: "idle", targetName: "Launch", pinned: false, archived: false, lastActivityAt: now - 1_000 },
-      { id: "archived", name: "Prior release", state: "closed", pinned: false, archived: true, lastActivityAt: now - 2_000 }
+      { id: "shared", name: "Release checklist", state: "idle", targetName: "Launch", pinned: false, archived: false, taskTags: [], lastActivityAt: now - 1_000 },
+      { id: "archived", name: "Prior release", state: "closed", pinned: false, archived: true, taskTags: [], lastActivityAt: now - 2_000 }
     ]
   },
   {
@@ -29,8 +29,8 @@ const caches: readonly MachineCacheView[] = [
     origin: "https://west.example.test",
     updatedAt: now,
     sessions: [
-      { id: "shared", name: "Release checklist", state: "running", targetName: "Launch", pinned: true, archived: false, lastActivityAt: now - 3_000 },
-      { id: "old", name: "Archived audit", state: "idle", pinned: false, archived: false, lastActivityAt: now - (8 * 24 * 60 * 60 * 1_000) }
+      { id: "shared", name: "Release checklist", state: "running", targetName: "Launch", pinned: true, archived: false, taskTags: [], lastActivityAt: now - 3_000 },
+      { id: "old", name: "Archived audit", state: "idle", pinned: false, archived: false, taskTags: [], lastActivityAt: now - (8 * 24 * 60 * 60 * 1_000) }
     ]
   }
 ];
@@ -127,6 +127,7 @@ describe("remote machine sidebar search", () => {
         state: "idle" as const,
         pinned: false,
         archived: index === 15,
+        taskTags: [],
         lastActivityAt: now - 100 - index
       }))
     }];

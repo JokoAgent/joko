@@ -71,6 +71,7 @@ import {
   type UsageLimitRecoveryHint
 } from "../usage-limit-recovery.js";
 import { SessionHeaderActionsMenu } from "./SessionHeaderActionsMenu.js";
+import { TaskTagDots } from "./TaskTags.js";
 import { codeHostDisplayBranch } from "./CodeHostPullRequestSummary.js";
 import { openCodeHostPullRequestExternal } from "../code-host-pull-request.js";
 import {
@@ -140,7 +141,7 @@ interface ActiveMessageFork {
 
 export type SessionPanePresentation = "standard" | "filesRail";
 
-export function SessionPane({ controller, session, target, backend, reviewReadOnly = false, presentation = "standard", composerAutoFocus = true, models, timeline, timelineHasEarlier, timelineHistoryLoading, timelineHistoryError, onLoadEarlierTimeline, timelineFocusRequest, extensionWidgets, extensionStatuses, queue, queueControl, workspace, extraDirectories, resources, commandRefreshSignal, interaction, remainingInteractions, navigationOpen, inspectorOpen, inspectorAvailable = true, selectionQuoteInsertion, attachmentInsertion, objectiveDialogHandoff, onObjectiveDialogHandoffHandled, t, runAction, onOpenNavigation, onOpenInspector, onOpenSubagent, onOpenTurnReview, onRename, onPin, onArchive, onPrefetchRemoval, onDelete, onMoveSessionProject, movingSessionProject = false, onCopyTaskLink, onExportPortableSession, onSplitSession, onOpenSessionWindow }: {
+export function SessionPane({ controller, session, target, backend, reviewReadOnly = false, presentation = "standard", composerAutoFocus = true, models, timeline, timelineHasEarlier, timelineHistoryLoading, timelineHistoryError, onLoadEarlierTimeline, timelineFocusRequest, extensionWidgets, extensionStatuses, queue, queueControl, workspace, extraDirectories, resources, commandRefreshSignal, interaction, remainingInteractions, navigationOpen, inspectorOpen, inspectorAvailable = true, selectionQuoteInsertion, attachmentInsertion, objectiveDialogHandoff, onObjectiveDialogHandoffHandled, t, runAction, onOpenNavigation, onOpenInspector, onOpenSubagent, onOpenTurnReview, onRename, onManageTaskTags = () => undefined, onPin, onArchive, onPrefetchRemoval, onDelete, onMoveSessionProject, movingSessionProject = false, onCopyTaskLink, onExportPortableSession, onSplitSession, onOpenSessionWindow }: {
   readonly controller: AppController;
   readonly session: SessionView;
   readonly target?: TargetView;
@@ -179,6 +180,7 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
   readonly onOpenSubagent?: (runId: string) => void;
   readonly onOpenTurnReview?: (changeSetId: string, selectedPath?: string) => void;
   readonly onRename: () => void;
+  readonly onManageTaskTags?: () => void;
   readonly onPin?: () => void;
   readonly onArchive: () => void;
   readonly onPrefetchRemoval?: () => void;
@@ -1804,7 +1806,7 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
         <div className="session-header__leading">
           {!navigationOpen && <IconButton className="mobile-panel-toggle" label={t("a11y.openNavigation")} onClick={onOpenNavigation}><Menu aria-hidden="true" /></IconButton>}
           <div className="session-heading">
-            <div className="breadcrumbs"><span>{navigationProjectName}</span><span aria-hidden="true">/</span><button type="button" onClick={onRename}>{session.name}</button></div>
+            <div className="breadcrumbs"><span>{navigationProjectName}</span><span aria-hidden="true">/</span><button type="button" onClick={onRename}>{session.name}</button><TaskTagDots tags={session.taskTags} t={t} /></div>
             <div className="session-heading__status"><StatusDot state={session.state === "retrying" ? "running" : session.state} label={session.state === "retrying" ? "running" : session.state} /><span>{sessionStateLabel(session.state, t)}</span>{displayBranch !== undefined && <Pill className="session-heading__branch" title={t("codeHost.branchBadge", { branch: displayBranch })} aria-label={t("codeHost.branchBadge", { branch: displayBranch })}><GitBranch aria-hidden="true" />{displayBranch}</Pill>}{session.nativeLeafId !== undefined && <Pill><GitBranch aria-hidden="true" />{shortId(session.nativeLeafId)}</Pill>}</div>
           </div>
         </div>
@@ -1823,6 +1825,12 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
             movingProject={movingSessionProject}
             t={t}
             onRename={onRename}
+            taskTags={controller.state.snapshot.taskTags}
+            onToggleTaskTag={(tagId, attached) => runAction(
+              `task-tag:${session.id}:${tagId}:${attached ? "attach" : "detach"}`,
+              () => controller.setSessionTaskTags(session.id, [session.id], [tagId], attached)
+            )}
+            onManageTaskTags={onManageTaskTags}
             onPin={onPin ?? (() => runAction(`pin:${session.id}`, () => controller.pinSession(session.id, !session.pinned)))}
             onArchive={onArchive}
             onPrefetchRemoval={onPrefetchRemoval}

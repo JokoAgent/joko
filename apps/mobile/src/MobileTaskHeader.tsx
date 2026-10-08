@@ -1,4 +1,4 @@
-import { useEffect, useState, type RefObject } from "react";
+import { useEffect, useState, type ReactNode, type RefObject } from "react";
 import { AppState, Pressable, StyleSheet, Text, View, useWindowDimensions } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { MobileActionSheet } from "./MobileActionSheet";
@@ -6,14 +6,14 @@ import type { MobileSupportedLocale } from "./mobile-locale-preference";
 import { mobileMessage } from "./mobile-messages";
 
 export interface MobileTaskHeaderAction {
-  readonly id: "clone" | "branches" | "context" | "controls" | "remote-desktop" | "copy-link" | "files" | "refresh";
+  readonly id: "clone" | "branches" | "context" | "controls" | "remote-desktop" | "copy-link" | "files" | "refresh" | "tags" | `tag:${string}`;
   readonly label: string;
   readonly disabled: boolean;
   readonly onPress: () => void;
 }
 
 export function MobileTaskHeader({ title, subtitle, navigationLabel, navigationRef, drawerNavigation,
-  onNavigate, actions, disabled, colors, locale, onMenuVisibilityChange }: {
+  onNavigate, actions, titleAccessory, disabled, colors, locale, onMenuVisibilityChange }: {
   readonly title: string;
   readonly subtitle: string;
   readonly navigationLabel: string;
@@ -21,6 +21,7 @@ export function MobileTaskHeader({ title, subtitle, navigationLabel, navigationR
   readonly drawerNavigation: boolean;
   readonly onNavigate: () => void;
   readonly actions: readonly MobileTaskHeaderAction[];
+  readonly titleAccessory?: ReactNode;
   readonly disabled: boolean;
   readonly colors: { readonly background: string; readonly surface: string; readonly ink: string;
     readonly muted: string; readonly border: string; readonly negative: string };
@@ -53,8 +54,8 @@ export function MobileTaskHeader({ title, subtitle, navigationLabel, navigationR
         </Text>
       </Pressable>
       <View style={styles.heading}>
-        <Text accessibilityRole="header" numberOfLines={1} ellipsizeMode="tail"
-          style={[styles.title, { color: colors.ink }]}>{title}</Text>
+        <View style={styles.titleRow}><Text accessibilityRole="header" numberOfLines={1} ellipsizeMode="tail"
+          style={[styles.title, { color: colors.ink }]}>{title}</Text>{titleAccessory}</View>
         <Text numberOfLines={1} style={[styles.subtitle, { color: colors.muted }]}>{subtitle}</Text>
       </View>
       <Pressable accessibilityRole="button" accessibilityLabel={mobileMessage(locale, "task.openActions")}
@@ -79,7 +80,8 @@ const styles = StyleSheet.create({
     gap: 8, borderBottomWidth: StyleSheet.hairlineWidth },
   iconButton: { width: 44, minHeight: 44, flexShrink: 0, alignItems: "center", justifyContent: "center", borderRadius: 22 },
   heading: { flex: 1, minWidth: 0 },
-  title: { fontSize: 17, lineHeight: 23, fontWeight: "700" },
+  titleRow: { minWidth: 0, flexDirection: "row", alignItems: "center", gap: 6 },
+  title: { minWidth: 0, flexShrink: 1, fontSize: 17, lineHeight: 23, fontWeight: "700" },
   subtitle: { fontSize: 12, lineHeight: 17 },
   backIcon: { fontSize: 32, lineHeight: 36 },
   menuIcon: { fontSize: 25, lineHeight: 30 },

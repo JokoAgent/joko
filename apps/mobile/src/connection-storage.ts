@@ -22,6 +22,7 @@ export interface PendingOperation {
     | "queue-interaction-lock" | "queue-reorder" | "interaction-resolve" | "interaction-dismiss"
     | "session-model" | "session-permission" | "session-plan" | "session-compact" | "session-branch"
     | "session-shell" | "session-reset" | "session-review" | "session-clone" | "session-fork" | "session-rewind" | "workspace-rewind"
+    | "task-tag"
     | "schedule-run" | "schedule-enable" | "schedule-run-restart" | "schedule-run-read"
     | "schedule-runs-read" | "schedule-all-read" | "schedule-run-delete"
     | "schedule-create" | "schedule-update" | "schedule-delete" | "schedule-promote"

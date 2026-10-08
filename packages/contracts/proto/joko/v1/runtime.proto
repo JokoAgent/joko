@@ -300,6 +300,52 @@ message NativeSessionCatalogEntry {
   google.protobuf.Timestamp created_at = 12;
 }
 
+enum TaskTagColor {
+  TASK_TAG_COLOR_UNSPECIFIED = 0;
+  TASK_TAG_COLOR_RED = 1;
+  TASK_TAG_COLOR_ORANGE = 2;
+  TASK_TAG_COLOR_YELLOW = 3;
+  TASK_TAG_COLOR_GREEN = 4;
+  TASK_TAG_COLOR_BLUE = 5;
+  TASK_TAG_COLOR_PURPLE = 6;
+  TASK_TAG_COLOR_GRAY = 7;
+  TASK_TAG_COLOR_PINK = 8;
+  TASK_TAG_COLOR_CORAL = 9;
+  TASK_TAG_COLOR_TEAL = 10;
+  TASK_TAG_COLOR_INDIGO = 11;
+  TASK_TAG_COLOR_WHITE = 12;
+}
+
+message TaskTag {
+  string task_tag_id = 1;
+  string name = 2;
+  TaskTagColor color = 3;
+  optional string preset_key = 4;
+  bool name_customized = 5;
+  uint32 sort_order = 6;
+  Revision revision = 7;
+  Revision association_revision = 8;
+  google.protobuf.Timestamp created_at = 9;
+  google.protobuf.Timestamp updated_at = 10;
+}
+
+message TaskTagCatalog {
+  repeated TaskTag task_tags = 1;
+  Revision revision = 2;
+}
+
+message SessionTaskTags {
+  string session_id = 1;
+  repeated TaskTag task_tags = 2;
+}
+
+message TaskTagDeletePreview {
+  string task_tag_id = 1;
+  uint64 affected_session_count = 2;
+  Revision tag_revision = 3;
+  Revision association_revision = 4;
+}
+
 message Session {
   string session_id = 1;
   string backend_id = 2;
@@ -345,6 +391,7 @@ message Session {
   // timeline. Service-owned automatic continuations are deliberately excluded.
   // Absence means the Session has no surviving user input.
   google.protobuf.Timestamp last_user_input_at = 27;
+  repeated TaskTag task_tags = 28;
 }
 
 message SessionContextState {

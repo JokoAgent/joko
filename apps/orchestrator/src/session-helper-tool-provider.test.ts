@@ -25,15 +25,15 @@ afterEach(() => {
 });
 
 describe("SessionHelperToolBridgeProvider", () => {
-  it("exposes exactly two public bridge tools and all eighteen applicable nested tools", async () => {
+  it("exposes exactly two public bridge tools and all twenty-seven applicable nested tools", async () => {
     const { provider } = fixture();
     expect(provider.tools.map((tool) => tool.name)).toEqual(["list_tools", "call_tool"]);
     expect(provider.tools.map((tool) => tool.requiresPermission)).toEqual([false, true]);
-    expect(SESSION_HELPER_NESTED_TOOL_NAMES).toHaveLength(18);
-    expect(new Set(SESSION_HELPER_NESTED_TOOL_NAMES).size).toBe(18);
+    expect(SESSION_HELPER_NESTED_TOOL_NAMES).toHaveLength(27);
+    expect(new Set(SESSION_HELPER_NESTED_TOOL_NAMES).size).toBe(27);
     expect(SESSION_HELPER_NESTED_TOOLS.filter((tool) => tool.category === "product")).toHaveLength(2);
-    expect(SESSION_HELPER_NESTED_TOOLS.filter((tool) => tool.category === "control")).toHaveLength(10);
-    expect(SESSION_HELPER_NESTED_TOOLS.filter((tool) => tool.category === "history")).toHaveLength(5);
+    expect(SESSION_HELPER_NESTED_TOOLS.filter((tool) => tool.category === "control")).toHaveLength(16);
+    expect(SESSION_HELPER_NESTED_TOOLS.filter((tool) => tool.category === "history")).toHaveLength(8);
     expect(SESSION_HELPER_NESTED_TOOLS.filter((tool) => tool.category === "handoff")).toHaveLength(1);
     expect(SESSION_HELPER_NESTED_TOOL_NAMES).not.toContain("submit_github_issue");
     expect(SESSION_HELPER_NESTED_TOOL_NAMES).not.toContain("create_worker");
@@ -42,8 +42,8 @@ describe("SessionHelperToolBridgeProvider", () => {
     expect(overview).toEqual({
       categories: [
         { name: "product", tool_count: 2 },
-        { name: "control", tool_count: 10 },
-        { name: "history", tool_count: 5 },
+        { name: "control", tool_count: 16 },
+        { name: "history", tool_count: 8 },
         { name: "handoff", tool_count: 1 }
       ],
       hint: expect.any(String)
@@ -57,6 +57,12 @@ describe("SessionHelperToolBridgeProvider", () => {
     expect(control.tools.map((tool) => tool["name"])).toEqual([
       "set_current_session_title",
       "rename_sessions",
+      "create_task_tag",
+      "update_task_tag",
+      "add_task_tags",
+      "remove_task_tags",
+      "reorder_task_tags",
+      "delete_task_tag",
       "archive_sessions",
       "unarchive_sessions",
       "update_session_queued_message",
@@ -67,6 +73,107 @@ describe("SessionHelperToolBridgeProvider", () => {
       "set_session_runtime"
     ]);
     expect(control.tools.every((tool) => typeof tool["input_schema"] === "object")).toBe(true);
+  });
+
+  it("manages the owner task-tag catalog, archived associations, ordering, and caller-bound deletion previews", async () => {
+    const { store, provider } = fixture();
+    const initial = resultData(await callNested(provider, "list_task_tags", {})) as {
+      catalog_revision: string;
+      tags: Array<Record<string, unknown>>;
+    };
+    expect(initial.tags).toHaveLength(12);
+    expect(initial.tags.map((tag) => tag["preset_key"])).toEqual([
+      "red", "orange", "yellow", "green", "blue", "purple",
+      "important", "follow-up", "work", "life", "ideas", "reference"
+    ]);
+
+    const created = resultData(await callNested(provider, "create_task_tag", {
+      name: "Release",
+      color: "teal"
+    })) as { tag: Record<string, unknown> };
+    const tagId = String(created.tag["tag_id"]);
+    const revision = Number(created.tag["revision"]);
+    expect(created.tag).toMatchObject({ name: "Release", color: "teal", sort_order: 12 });
+
+    const updated = resultData(await callNested(provider, "update_task_tag", {
+      tag_id: tagId,
+      revision,
+      name: "Launch",
+      color: "indigo"
+    })) as { tag: Record<string, unknown> };
+    expect(updated.tag).toMatchObject({ tag_id: tagId, name: "Launch", color: "indigo" });
+
+    const sessionC = store.getSession("session-c");
+    store.updateSession("session-c", { archived: true }, sessionC.revision, NOW + 20_000);
+    const attached = resultData(await callNested(provider, "add_task_tags", {
+      tag_ids: [tagId],
+      session_ids: ["session-b", "session-c"]
+    })) as { sessions: Array<{ session_id: string; tags: Array<Record<string, unknown>> }> };
+    expect(attached.sessions.map((entry) => entry.session_id)).toEqual(["session-b", "session-c"]);
+    expect(attached.sessions.every((entry) => entry.tags.some((tag) => tag["tag_id"] === tagId))).toBe(true);
+
+    const current = resultData(await callNested(provider, "get_task_tags", {
+      session_ids: ["session-b", "session-c"]
+    })) as { sessions: Array<{ session_id: string; tags: Array<Record<string, unknown>> }> };
+    expect(current.sessions).toEqual(attached.sessions);
+    const matches = resultData(await callNested(provider, "find_tasks_by_tag", {
+      tag_id: tagId,
+      limit: 1
+    })) as { sessions: Array<{ session_id: string }>; has_more: boolean; total_size: number; next_offset: number };
+    expect(matches).toMatchObject({ has_more: true, total_size: 2, next_offset: 1 });
+    const secondPage = resultData(await callNested(provider, "find_tasks_by_tag", {
+      tag_id: tagId,
+      offset: matches.next_offset,
+      limit: 1
+    })) as { sessions: Array<{ session_id: string }>; has_more: boolean; total_size: number; next_offset: null };
+    expect(new Set([...matches.sessions, ...secondPage.sessions].map((entry) => entry.session_id)))
+      .toEqual(new Set(["session-b", "session-c"]));
+    expect(secondPage).toMatchObject({ has_more: false, total_size: 2, next_offset: null });
+
+    const beforeReorder = resultData(await callNested(provider, "list_task_tags", {})) as {
+      tags: Array<Record<string, unknown>>;
+    };
+    const order = beforeReorder.tags.map((tag) => String(tag["tag_id"]));
+    expect(errorData(await callNested(provider, "reorder_task_tags", {
+      tag_ids: [...order].reverse(),
+      expected_order: [...order].slice(1)
+    }))).toMatchObject({ errorCode: "PRECONDITION_FAILED" });
+    const reordered = resultData(await callNested(provider, "reorder_task_tags", {
+      tag_ids: [...order].reverse(),
+      expected_order: order
+    })) as { tags: Array<Record<string, unknown>> };
+    expect(reordered.tags[0]?.["tag_id"]).toBe(tagId);
+
+    const deletion = resultData(await callNested(provider, "delete_task_tag", { tag_id: tagId })) as {
+      preview: { affected_session_count: number };
+      confirmation_token: string;
+    };
+    expect(deletion.preview.affected_session_count).toBe(2);
+    expect(errorData(await callNested(
+      provider,
+      "delete_task_tag",
+      { tag_id: tagId, confirmation_token: deletion.confirmation_token },
+      context("session-b", "target-b")
+    ))).toMatchObject({ errorCode: "INVALID_CONFIRMATION" });
+
+    resultData(await callNested(provider, "remove_task_tags", {
+      tag_ids: [tagId],
+      session_ids: ["session-b"]
+    }));
+    expect((await callNested(provider, "delete_task_tag", {
+      tag_id: tagId,
+      confirmation_token: deletion.confirmation_token
+    })).isError).toBe(true);
+
+    const refreshed = resultData(await callNested(provider, "delete_task_tag", { tag_id: tagId })) as {
+      preview: { affected_session_count: number };
+      confirmation_token: string;
+    };
+    expect(refreshed.preview.affected_session_count).toBe(1);
+    expect(resultData(await callNested(provider, "delete_task_tag", {
+      tag_id: tagId,
+      confirmation_token: refreshed.confirmation_token
+    }))).toMatchObject({ deleted_tag_id: tagId, tags: expect.not.arrayContaining([expect.objectContaining({ tag_id: tagId })]) });
   });
 
   it("fences every call to the authenticated trusted task, Target, and generation", async () => {

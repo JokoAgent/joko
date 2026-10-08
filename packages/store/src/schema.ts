@@ -14,7 +14,8 @@ const DURABLE_JSON_SHAPE_BASELINE = [
   "resource-usage-event:exact-v1",
   "device-content-event:owner-routing-null+exact-default/manual/effective-projection-v1",
   "native-derivation-remote-worktree-plan:exact-v1",
-  "native-derivation-worktree:optional-remote-owner-exact-v1"
+  "native-derivation-worktree:optional-remote-owner-exact-v1",
+  "task-tag-catalog-event:exact-v1"
 ].join("\n");
 
 const SCHEMA_MARKER_SCHEMA = `
@@ -832,6 +833,51 @@ CREATE TABLE product_sessions (
         ),
         UNIQUE(id, backend_id, target_id)
       ) STRICT;
+
+CREATE TABLE task_tag_catalog_state (
+        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+        revision INTEGER NOT NULL CHECK (revision >= 0)
+      ) STRICT;
+
+CREATE TABLE task_tags (
+        id TEXT PRIMARY KEY CHECK (
+          length(trim(id)) BETWEEN 1 AND 128
+          AND instr(id, char(0)) = 0
+        ),
+        name TEXT NOT NULL CHECK (
+          length(trim(name)) BETWEEN 1 AND 80
+          AND instr(name, char(0)) = 0
+        ),
+        name_key TEXT NOT NULL UNIQUE CHECK (
+          length(name_key) BETWEEN 1 AND 240
+          AND instr(name_key, char(0)) = 0
+        ),
+        color TEXT NOT NULL CHECK (color IN (
+          'red', 'orange', 'yellow', 'green', 'blue', 'purple',
+          'gray', 'pink', 'coral', 'teal', 'indigo', 'white'
+        )),
+        preset_key TEXT CHECK (preset_key IS NULL OR preset_key IN (
+          'red', 'orange', 'yellow', 'green', 'blue', 'purple',
+          'important', 'follow-up', 'work', 'life', 'ideas', 'reference'
+        )),
+        name_customized INTEGER NOT NULL CHECK (name_customized IN (0, 1)),
+        sort_order INTEGER NOT NULL CHECK (sort_order BETWEEN 0 AND 255),
+        revision INTEGER NOT NULL CHECK (revision >= 0),
+        association_revision INTEGER NOT NULL CHECK (association_revision >= 0),
+        created_at INTEGER NOT NULL CHECK (created_at >= 0),
+        updated_at INTEGER NOT NULL CHECK (updated_at >= created_at)
+      ) STRICT;
+
+CREATE TABLE session_task_tags (
+        session_id TEXT NOT NULL REFERENCES product_sessions(id) ON DELETE CASCADE,
+        tag_id TEXT NOT NULL REFERENCES task_tags(id) ON DELETE CASCADE,
+        created_at INTEGER NOT NULL CHECK (created_at >= 0),
+        revision INTEGER NOT NULL CHECK (revision >= 1),
+        PRIMARY KEY(session_id, tag_id)
+      ) STRICT;
+
+CREATE INDEX session_task_tags_by_tag
+      ON session_task_tags(tag_id, session_id);
 
 CREATE TABLE queue_controls (
         session_id TEXT PRIMARY KEY REFERENCES product_sessions(id) ON DELETE CASCADE,
@@ -3009,6 +3055,20 @@ CREATE TRIGGER targets_remote_binding_update
         SELECT RAISE(ABORT, 'target remote workspace binding is incomplete');
       END;
 
+INSERT INTO task_tag_catalog_state(singleton, revision) VALUES (1, 0);
+INSERT INTO task_tags(id, name, name_key, color, preset_key, name_customized, sort_order, revision, association_revision, created_at, updated_at) VALUES
+  ('default:red', 'Red', 'red', 'red', 'red', 0, 0, 0, 0, 0, 0),
+  ('default:orange', 'Orange', 'orange', 'orange', 'orange', 0, 1, 0, 0, 0, 0),
+  ('default:yellow', 'Yellow', 'yellow', 'yellow', 'yellow', 0, 2, 0, 0, 0, 0),
+  ('default:green', 'Green', 'green', 'green', 'green', 0, 3, 0, 0, 0, 0),
+  ('default:blue', 'Blue', 'blue', 'blue', 'blue', 0, 4, 0, 0, 0, 0),
+  ('default:purple', 'Purple', 'purple', 'purple', 'purple', 0, 5, 0, 0, 0, 0),
+  ('preset:important', 'Important', 'important', 'coral', 'important', 0, 6, 0, 0, 0, 0),
+  ('preset:follow-up', 'Follow up', 'follow up', 'pink', 'follow-up', 0, 7, 0, 0, 0, 0),
+  ('preset:work', 'Work', 'work', 'indigo', 'work', 0, 8, 0, 0, 0, 0),
+  ('preset:life', 'Life', 'life', 'teal', 'life', 0, 9, 0, 0, 0, 0),
+  ('preset:ideas', 'Ideas', 'ideas', 'white', 'ideas', 0, 10, 0, 0, 0, 0),
+  ('preset:reference', 'Reference', 'reference', 'gray', 'reference', 0, 11, 0, 0, 0, 0);
 INSERT INTO store_meta(singleton, revision) VALUES (1, 0);
 INSERT INTO message_embedding_state(singleton, enabled, cutoff_cursor, model_id, dimensions, backend_id, provider_id, cutoff_initialized, provider_generation_id) VALUES (1, 0, 0, 'voyage/voyage-4', 1024, NULL, NULL, 0, NULL);
 `;

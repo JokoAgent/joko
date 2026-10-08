@@ -1,0 +1,72 @@
+export const mobileTaskTagMessages = {
+  en: {
+    "taskTags.title": "Task tags", "taskTags.manage": "Manage tags", "taskTags.help": "Attach tags to this task or edit this node's tag catalog.",
+    "taskTags.empty": "No tags yet.", "taskTags.name": "Tag name", "taskTags.create": "Create tag", "taskTags.save": "Save",
+    "taskTags.attach": "Attach", "taskTags.detach": "Detach", "taskTags.moveUp": "Move up", "taskTags.moveDown": "Move down",
+    "taskTags.delete": "Delete tag", "taskTags.deleteBody": "Deleting a tag removes it from every task and cannot be undone.",
+    "taskTags.affected": "Attached to {count} tasks.", "taskTags.changeFailed": "The tag change could not be saved. Refresh and try again.",
+    "taskTags.previewFailed": "The delete impact could not be verified. Nothing was deleted.", "taskTags.catalogLimit": "The catalog already contains 256 tags.",
+    "taskTags.color": "Color", "taskTags.color.red": "Red", "taskTags.color.orange": "Orange", "taskTags.color.yellow": "Yellow",
+    "taskTags.color.green": "Green", "taskTags.color.blue": "Blue", "taskTags.color.purple": "Purple", "taskTags.color.gray": "Gray",
+    "taskTags.color.pink": "Pink", "taskTags.color.coral": "Coral", "taskTags.color.teal": "Teal", "taskTags.color.indigo": "Indigo", "taskTags.color.white": "White",
+    "taskTags.preset.red": "Red", "taskTags.preset.orange": "Orange", "taskTags.preset.yellow": "Yellow", "taskTags.preset.green": "Green",
+    "taskTags.preset.blue": "Blue", "taskTags.preset.purple": "Purple", "taskTags.preset.important": "Important", "taskTags.preset.followUp": "Follow up",
+    "taskTags.preset.work": "Work", "taskTags.preset.life": "Life", "taskTags.preset.ideas": "Ideas", "taskTags.preset.reference": "Reference"
+  },
+  "zh-CN": {
+    "taskTags.title": "任务标签", "taskTags.manage": "管理标签", "taskTags.help": "为此任务绑定标签，或编辑此节点的标签目录。",
+    "taskTags.empty": "还没有标签。", "taskTags.name": "标签名称", "taskTags.create": "创建标签", "taskTags.save": "保存",
+    "taskTags.attach": "绑定", "taskTags.detach": "移除", "taskTags.moveUp": "上移", "taskTags.moveDown": "下移",
+    "taskTags.delete": "删除标签", "taskTags.deleteBody": "删除后会从所有任务移除此标签，且无法撤销。",
+    "taskTags.affected": "已绑定到 {count} 个任务。", "taskTags.changeFailed": "无法保存标签更改。请刷新后重试。",
+    "taskTags.previewFailed": "无法核实删除影响，因此没有删除任何内容。", "taskTags.catalogLimit": "标签目录已达到 256 个标签的上限。",
+    "taskTags.color": "颜色", "taskTags.color.red": "红色", "taskTags.color.orange": "橙色", "taskTags.color.yellow": "黄色",
+    "taskTags.color.green": "绿色", "taskTags.color.blue": "蓝色", "taskTags.color.purple": "紫色", "taskTags.color.gray": "灰色",
+    "taskTags.color.pink": "粉色", "taskTags.color.coral": "珊瑚色", "taskTags.color.teal": "青绿色", "taskTags.color.indigo": "靛蓝色", "taskTags.color.white": "白色",
+    "taskTags.preset.red": "红色", "taskTags.preset.orange": "橙色", "taskTags.preset.yellow": "黄色", "taskTags.preset.green": "绿色",
+    "taskTags.preset.blue": "蓝色", "taskTags.preset.purple": "紫色", "taskTags.preset.important": "重要", "taskTags.preset.followUp": "待跟进",
+    "taskTags.preset.work": "工作", "taskTags.preset.life": "生活", "taskTags.preset.ideas": "想法", "taskTags.preset.reference": "参考"
+  },
+  "zh-TW": {
+    "taskTags.title": "任務標籤", "taskTags.manage": "管理標籤", "taskTags.help": "為此任務綁定標籤，或編輯此節點的標籤目錄。",
+    "taskTags.empty": "尚無標籤。", "taskTags.name": "標籤名稱", "taskTags.create": "建立標籤", "taskTags.save": "儲存",
+    "taskTags.attach": "綁定", "taskTags.detach": "移除", "taskTags.moveUp": "上移", "taskTags.moveDown": "下移",
+    "taskTags.delete": "刪除標籤", "taskTags.deleteBody": "刪除後會從所有任務移除此標籤，且無法復原。",
+    "taskTags.affected": "已綁定至 {count} 個任務。", "taskTags.changeFailed": "無法儲存標籤變更。請重新整理後再試。",
+    "taskTags.previewFailed": "無法核實刪除影響，因此未刪除任何內容。", "taskTags.catalogLimit": "標籤目錄已達 256 個標籤的上限。",
+    "taskTags.color": "顏色", "taskTags.color.red": "紅色", "taskTags.color.orange": "橙色", "taskTags.color.yellow": "黃色",
+    "taskTags.color.green": "綠色", "taskTags.color.blue": "藍色", "taskTags.color.purple": "紫色", "taskTags.color.gray": "灰色",
+    "taskTags.color.pink": "粉紅色", "taskTags.color.coral": "珊瑚色", "taskTags.color.teal": "藍綠色", "taskTags.color.indigo": "靛藍色", "taskTags.color.white": "白色",
+    "taskTags.preset.red": "紅色", "taskTags.preset.orange": "橙色", "taskTags.preset.yellow": "黃色", "taskTags.preset.green": "綠色",
+    "taskTags.preset.blue": "藍色", "taskTags.preset.purple": "紫色", "taskTags.preset.important": "重要", "taskTags.preset.followUp": "待跟進",
+    "taskTags.preset.work": "工作", "taskTags.preset.life": "生活", "taskTags.preset.ideas": "想法", "taskTags.preset.reference": "參考"
+  },
+  ja: {
+    "taskTags.title": "タスクタグ", "taskTags.manage": "タグを管理", "taskTags.help": "このタスクにタグを付けるか、このノードのタグ一覧を編集します。",
+    "taskTags.empty": "タグはまだありません。", "taskTags.name": "タグ名", "taskTags.create": "タグを作成", "taskTags.save": "保存",
+    "taskTags.attach": "付ける", "taskTags.detach": "外す", "taskTags.moveUp": "上へ", "taskTags.moveDown": "下へ",
+    "taskTags.delete": "タグを削除", "taskTags.deleteBody": "削除すると、すべてのタスクからこのタグが外れます。元に戻せません。",
+    "taskTags.affected": "{count} 件のタスクに付いています。", "taskTags.changeFailed": "タグの変更を保存できませんでした。更新して再試行してください。",
+    "taskTags.previewFailed": "削除の影響を確認できなかったため、削除しませんでした。", "taskTags.catalogLimit": "タグ一覧は上限の 256 件です。",
+    "taskTags.color": "色", "taskTags.color.red": "赤", "taskTags.color.orange": "オレンジ", "taskTags.color.yellow": "黄",
+    "taskTags.color.green": "緑", "taskTags.color.blue": "青", "taskTags.color.purple": "紫", "taskTags.color.gray": "グレー",
+    "taskTags.color.pink": "ピンク", "taskTags.color.coral": "コーラル", "taskTags.color.teal": "ティール", "taskTags.color.indigo": "インディゴ", "taskTags.color.white": "白",
+    "taskTags.preset.red": "赤", "taskTags.preset.orange": "オレンジ", "taskTags.preset.yellow": "黄", "taskTags.preset.green": "緑",
+    "taskTags.preset.blue": "青", "taskTags.preset.purple": "紫", "taskTags.preset.important": "重要", "taskTags.preset.followUp": "フォローアップ",
+    "taskTags.preset.work": "仕事", "taskTags.preset.life": "生活", "taskTags.preset.ideas": "アイデア", "taskTags.preset.reference": "参考"
+  },
+  ko: {
+    "taskTags.title": "작업 태그", "taskTags.manage": "태그 관리", "taskTags.help": "이 작업에 태그를 지정하거나 이 노드의 태그 목록을 편집합니다.",
+    "taskTags.empty": "아직 태그가 없습니다.", "taskTags.name": "태그 이름", "taskTags.create": "태그 만들기", "taskTags.save": "저장",
+    "taskTags.attach": "지정", "taskTags.detach": "제거", "taskTags.moveUp": "위로", "taskTags.moveDown": "아래로",
+    "taskTags.delete": "태그 삭제", "taskTags.deleteBody": "태그를 삭제하면 모든 작업에서 제거되며 되돌릴 수 없습니다.",
+    "taskTags.affected": "{count}개 작업에 지정되어 있습니다.", "taskTags.changeFailed": "태그 변경을 저장하지 못했습니다. 새로 고친 후 다시 시도하세요.",
+    "taskTags.previewFailed": "삭제 영향을 확인할 수 없어 아무것도 삭제하지 않았습니다.", "taskTags.catalogLimit": "태그 목록이 최대 256개에 도달했습니다.",
+    "taskTags.color": "색상", "taskTags.color.red": "빨강", "taskTags.color.orange": "주황", "taskTags.color.yellow": "노랑",
+    "taskTags.color.green": "초록", "taskTags.color.blue": "파랑", "taskTags.color.purple": "보라", "taskTags.color.gray": "회색",
+    "taskTags.color.pink": "분홍", "taskTags.color.coral": "코랄", "taskTags.color.teal": "청록", "taskTags.color.indigo": "남색", "taskTags.color.white": "흰색",
+    "taskTags.preset.red": "빨강", "taskTags.preset.orange": "주황", "taskTags.preset.yellow": "노랑", "taskTags.preset.green": "초록",
+    "taskTags.preset.blue": "파랑", "taskTags.preset.purple": "보라", "taskTags.preset.important": "중요", "taskTags.preset.followUp": "후속 작업",
+    "taskTags.preset.work": "업무", "taskTags.preset.life": "생활", "taskTags.preset.ideas": "아이디어", "taskTags.preset.reference": "참고"
+  }
+} as const;
