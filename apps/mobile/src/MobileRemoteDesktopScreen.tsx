@@ -8,10 +8,12 @@ import {
   type MobileRemoteDesktopTransport
 } from "./remote-desktop-controller";
 import {
+  mobileRemoteDesktopClipboardNoticeLabel,
   mobileRemoteDesktopCopy,
   mobileRemoteDesktopNoticeLabel,
   mobileRemoteDesktopStatusLabel
 } from "./remote-desktop-presentation";
+import { mobileRemoteClipboardSystem } from "./mobile-remote-desktop-clipboard-native";
 import { remoteDesktopViewerCommand, remoteDesktopViewerHtml } from "./remote-desktop-viewer";
 
 export interface MobileRemoteDesktopColors {
@@ -54,7 +56,9 @@ function RemoteDesktopSession({ transport, preferredDeviceId, interactive, foreg
   readonly onClose: () => void;
 }) {
   const copy = mobileRemoteDesktopCopy(locale);
-  const controller = useMemo(() => new MobileRemoteDesktopController(transport, preferredDeviceId),
+  const controller = useMemo(() => new MobileRemoteDesktopController(
+    transport, preferredDeviceId, mobileRemoteClipboardSystem
+  ),
     [transport.ownerKey, preferredDeviceId]);
   const snapshot = useSyncExternalStore(controller.subscribe, () => controller.snapshot);
   const webView = useRef<WebView>(null);
@@ -72,6 +76,9 @@ function RemoteDesktopSession({ transport, preferredDeviceId, interactive, foreg
   useEffect(() => controller.setOnline(online), [controller, online]);
   const status = mobileRemoteDesktopStatusLabel(snapshot, copy);
   const notice = mobileRemoteDesktopNoticeLabel(snapshot.notice, copy);
+  const clipboardNotice = snapshot.clipboardBusy
+    ? copy.clipboardTransferring
+    : mobileRemoteDesktopClipboardNoticeLabel(snapshot.clipboardNotice, copy);
   const selection = snapshot.status === "select-host" || snapshot.status === "select-display";
   const terminal = ["unsupported", "permission", "revoked", "busy", "stopped", "error"].includes(snapshot.status);
   return <View style={[styles.root, { backgroundColor: colors.background }]}>
@@ -150,6 +157,21 @@ function RemoteDesktopSession({ transport, preferredDeviceId, interactive, foreg
         <Button label={copy.release} colors={colors} disabled={!snapshot.controlling} onPress={() => controller.releaseInput()} />
         <Button label={copy.fit} colors={colors} disabled={!snapshot.hasFrame} onPress={() => controller.fit()} />
       </View>
+      <View style={styles.controlRow}>
+        <Button label={copy.copyToPhone} colors={colors}
+          disabled={snapshot.status !== "live" || !snapshot.controlling
+            || !snapshot.clipboardAvailable || snapshot.clipboardBusy}
+          onPress={() => void controller.copyToPhone()} />
+        <Button label={copy.pasteFromPhone} colors={colors}
+          disabled={snapshot.status !== "live" || !snapshot.controlling
+            || !snapshot.clipboardAvailable || snapshot.clipboardBusy}
+          onPress={() => void controller.pasteFromPhone()} />
+      </View>
+      {clipboardNotice && <Text accessibilityLiveRegion="polite" numberOfLines={2}
+        style={[styles.clipboardNotice, { color: snapshot.clipboardNotice === "copied"
+          || snapshot.clipboardNotice === "pasted" ? colors.muted : colors.negative }]}>
+        {clipboardNotice}
+      </Text>}
     </View>
   </View>;
 }
@@ -218,6 +240,7 @@ const styles = StyleSheet.create({
     borderRadius: 12, paddingHorizontal: 12, paddingVertical: 9, flexDirection: "row", alignItems: "center", gap: 9 },
   controls: { borderTopWidth: StyleSheet.hairlineWidth, padding: 8, gap: 7 },
   controlRow: { flexDirection: "row", flexWrap: "wrap", gap: 6, justifyContent: "center" },
+  clipboardNotice: { fontSize: 12, lineHeight: 17, minHeight: 17, textAlign: "center" },
   button: { minHeight: 36, minWidth: 52, maxWidth: 160, paddingHorizontal: 11, paddingVertical: 7,
     alignItems: "center", justifyContent: "center", borderWidth: StyleSheet.hairlineWidth, borderRadius: 10 },
   buttonText: { fontSize: 12, lineHeight: 17, fontWeight: "600" },

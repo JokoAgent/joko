@@ -3,6 +3,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { create } from "@bufbuild/protobuf";
 import {
   RemoteDesktopCapabilitiesSchema,
+  RemoteDesktopClipboardContentSchema,
   RemoteDesktopControlStateSchema,
   RemoteDesktopDisplaySchema,
   RemoteDesktopFailureReason,
@@ -16,6 +17,7 @@ import {
   RemoteDesktopPermissionsSchema,
   RemoteDesktopPermissionStatus,
   RemoteDesktopStartMode,
+  type RemoteDesktopClipboardContent,
   type RemoteDesktopInputEvent
 } from "@joko/contracts";
 import {
@@ -32,6 +34,8 @@ import {
   type RemoteDesktopJpegFrame,
   type RemoteDesktopPermissions
 } from "@joko/device-peer";
+
+import type { DesktopRemoteDesktopClipboardContent } from "./remote-desktop-clipboard.js";
 
 export interface DesktopRemoteDesktopMediaPort {
   frame(displayId: string, signal: AbortSignal): Promise<RemoteDesktopJpegFrame | null>;
@@ -70,6 +74,20 @@ export interface DesktopRemoteDesktopInputPort {
   retire(): Promise<void>;
 }
 
+export interface DesktopRemoteDesktopClipboardPort {
+  copyText(current: () => boolean, signal: AbortSignal): Promise<string>;
+  pasteText(text: string, current: () => boolean, signal: AbortSignal): Promise<void>;
+  copyContent(
+    current: () => boolean,
+    signal: AbortSignal
+  ): Promise<DesktopRemoteDesktopClipboardContent>;
+  pasteContent(
+    content: DesktopRemoteDesktopClipboardContent,
+    current: () => boolean,
+    signal: AbortSignal
+  ): Promise<void>;
+}
+
 export interface DesktopRemoteDesktopHostDependencies {
   readonly platform: "darwin" | "win32" | "linux";
   enabled(): boolean;
@@ -79,6 +97,7 @@ export interface DesktopRemoteDesktopHostDependencies {
   showPermissionGuide(signal: AbortSignal): Promise<void>;
   readonly media: DesktopRemoteDesktopMediaPort;
   readonly input: DesktopRemoteDesktopInputPort;
+  readonly clipboard?: DesktopRemoteDesktopClipboardPort;
   changed(state: DesktopRemoteDesktopState | undefined): void;
   retired?(): void;
   onDisplayChange?(listener: (displayId: string, geometryChanged: boolean) => void): () => void;
@@ -217,6 +236,8 @@ export class DesktopRemoteDesktopHost implements DevicePeerRemoteDesktopHostPort
       readonly webrtcVideo: boolean;
       readonly trickleIce: boolean;
       readonly jpegFallback: boolean;
+      readonly clipboardText: boolean;
+      readonly clipboardContent: boolean;
     };
     return create(RemoteDesktopCapabilitiesSchema, {
       protocolVersion: value.version,
@@ -234,7 +255,9 @@ export class DesktopRemoteDesktopHost implements DevicePeerRemoteDesktopHostPort
       connectionTakeover: value.connectionTakeover,
       webrtcVideo: value.webrtcVideo,
       trickleIce: value.trickleIce,
-      jpegFallback: value.jpegFallback
+      jpegFallback: value.jpegFallback,
+      clipboardText: value.clipboardText,
+      clipboardContent: value.clipboardContent
     });
   }
 
@@ -260,6 +283,7 @@ export class DesktopRemoteDesktopHost implements DevicePeerRemoteDesktopHostPort
       readonly lease: string;
       readonly display: RemoteDesktopDisplay;
       readonly controlling: boolean;
+      readonly controlGeneration: number;
     };
     return create(RemoteDesktopLeaseSchema, {
       leaseId: value.lease,
@@ -269,15 +293,20 @@ export class DesktopRemoteDesktopHost implements DevicePeerRemoteDesktopHostPort
         width: value.display.width,
         height: value.display.height
       }),
-      controlling: value.controlling
+      controlling: value.controlling,
+      controlGeneration: BigInt(value.controlGeneration)
     });
   }
 
   async heartbeat(request: DevicePeerRemoteDesktopLeaseRequest) {
     const value = await this.#request(request, { op: "heartbeat", lease: request.leaseId }) as {
       readonly controlling: boolean;
+      readonly controlGeneration: number;
     };
-    return create(RemoteDesktopControlStateSchema, value);
+    return create(RemoteDesktopControlStateSchema, {
+      controlling: value.controlling,
+      controlGeneration: BigInt(value.controlGeneration)
+    });
   }
 
   async stop(request: DevicePeerRemoteDesktopLeaseRequest): Promise<void> {
@@ -289,8 +318,11 @@ export class DesktopRemoteDesktopHost implements DevicePeerRemoteDesktopHostPort
       op: "control",
       lease: request.leaseId,
       enabled: request.enabled
-    }) as { readonly controlling: boolean };
-    return create(RemoteDesktopControlStateSchema, value);
+    }) as { readonly controlling: boolean; readonly controlGeneration: number };
+    return create(RemoteDesktopControlStateSchema, {
+      controlling: value.controlling,
+      controlGeneration: BigInt(value.controlGeneration)
+    });
   }
 
   async sendInput(request: DevicePeerRemoteDesktopLeaseRequest & {
@@ -373,6 +405,59 @@ export class DesktopRemoteDesktopHost implements DevicePeerRemoteDesktopHostPort
     });
   }
 
+  isControlCurrent(request: DevicePeerRemoteDesktopLeaseRequest & {
+    readonly controlGeneration: bigint;
+  }): boolean {
+    if (this.#retired || request.signal.aborted
+      || request.controlGeneration < 1n
+      || request.controlGeneration > BigInt(Number.MAX_SAFE_INTEGER)) {
+      return false;
+    }
+    return this.#controller.isControlCurrent(
+      this.#authority(request.controllerDeviceId),
+      request.leaseId,
+      Number(request.controlGeneration)
+    );
+  }
+
+  async copyClipboardText(request: DevicePeerRemoteDesktopLeaseRequest & {
+    readonly controlGeneration: bigint;
+  }): Promise<string> {
+    return this.#clipboardRequest(request, (clipboard, current) =>
+      clipboard.copyText(current, request.signal));
+  }
+
+  async pasteClipboardText(request: DevicePeerRemoteDesktopLeaseRequest & {
+    readonly controlGeneration: bigint;
+    readonly text: string;
+  }): Promise<void> {
+    await this.#clipboardRequest(request, (clipboard, current) =>
+      clipboard.pasteText(request.text, current, request.signal));
+  }
+
+  async copyClipboardContent(request: DevicePeerRemoteDesktopLeaseRequest & {
+    readonly controlGeneration: bigint;
+  }): Promise<RemoteDesktopClipboardContent> {
+    const value = await this.#clipboardRequest(request, (clipboard, current) =>
+      clipboard.copyContent(current, request.signal));
+    return create(RemoteDesktopClipboardContentSchema, value);
+  }
+
+  async pasteClipboardContent(request: DevicePeerRemoteDesktopLeaseRequest & {
+    readonly controlGeneration: bigint;
+    readonly content: RemoteDesktopClipboardContent;
+  }): Promise<void> {
+    const content: DesktopRemoteDesktopClipboardContent = Object.freeze({
+      ...(request.content.text === undefined ? {} : { text: request.content.text }),
+      ...(request.content.html === undefined ? {} : { html: request.content.html }),
+      ...(request.content.rtf === undefined ? {} : { rtf: request.content.rtf }),
+      ...(request.content.url === undefined ? {} : { url: request.content.url }),
+      ...(request.content.png === undefined ? {} : { png: request.content.png })
+    });
+    await this.#clipboardRequest(request, (clipboard, current) =>
+      clipboard.pasteContent(content, current, request.signal));
+  }
+
   async retire(): Promise<void> {
     if (this.#retired) return;
     this.#retired = true;
@@ -412,6 +497,8 @@ export class DesktopRemoteDesktopHost implements DevicePeerRemoteDesktopHostPort
         version: 1,
         enabled: false,
         canControl: false,
+        clipboardText: false,
+        clipboardContent: false,
         platform: this.#dependencies.platform,
         displays: Object.freeze([]),
         permissions: disabledPermissions(this.#dependencies.platform)
@@ -424,6 +511,8 @@ export class DesktopRemoteDesktopHost implements DevicePeerRemoteDesktopHostPort
         version: 1,
         enabled: true,
         canControl: this.#dependencies.platform !== "linux",
+        clipboardText: this.#dependencies.clipboard !== undefined,
+        clipboardContent: this.#dependencies.clipboard !== undefined,
         platform: this.#dependencies.platform,
         displays,
         permissions
@@ -433,6 +522,44 @@ export class DesktopRemoteDesktopHost implements DevicePeerRemoteDesktopHostPort
 
   #requireEnabled(): void {
     if (!this.#dependencies.enabled()) throw new Error("REMOTE_DESKTOP_DISABLED");
+  }
+
+  async #clipboardRequest<T>(
+    request: DevicePeerRemoteDesktopLeaseRequest & { readonly controlGeneration: bigint },
+    operation: (
+      clipboard: DesktopRemoteDesktopClipboardPort,
+      current: () => boolean
+    ) => Promise<T>
+  ): Promise<T> {
+    if (this.#retired) throw failure(RemoteDesktopFailureReason.STOPPED, false);
+    throwIfAborted(request.signal);
+    const clipboard = this.#dependencies.clipboard;
+    if (clipboard === undefined) {
+      throw failure(RemoteDesktopFailureReason.CLIPBOARD_UNAVAILABLE, false);
+    }
+    if (request.controlGeneration < 1n
+      || request.controlGeneration > BigInt(Number.MAX_SAFE_INTEGER)) {
+      throw failure(RemoteDesktopFailureReason.CLIPBOARD_EXPIRED, false);
+    }
+    const generation = Number(request.controlGeneration);
+    const authority = this.#authority(request.controllerDeviceId);
+    const current = (): boolean => this.#controller.isControlCurrent(
+      authority,
+      request.leaseId,
+      generation
+    );
+    if (!current()) throw failure(RemoteDesktopFailureReason.CLIPBOARD_EXPIRED, false);
+    try {
+      return await this.#signals.run(request.signal, async () => {
+        const value = await operation(clipboard, current);
+        throwIfAborted(request.signal);
+        if (!current()) throw new Error("REMOTE_DESKTOP_CLIPBOARD_EXPIRED");
+        return value;
+      });
+    } catch (error) {
+      if (request.signal.aborted) throw request.signal.reason;
+      throw translateFailure(error);
+    }
   }
 
   async #whileSessionUnlocked<T>(operation: () => Promise<T>): Promise<T> {
@@ -576,6 +703,20 @@ function translateFailure(error: unknown): unknown {
       return failure(RemoteDesktopFailureReason.UNSUPPORTED, false);
     case "REMOTE_DESKTOP_LOCKED_SESSION_UNSUPPORTED":
       return failure(RemoteDesktopFailureReason.LOCKED_SESSION_UNSUPPORTED, false);
+    case "REMOTE_DESKTOP_CLIPBOARD_UNAVAILABLE":
+    case "REMOTE_DESKTOP_CLIPBOARD_COPY_FAILED":
+    case "REMOTE_DESKTOP_CLIPBOARD_WRITE_FAILED":
+      return failure(RemoteDesktopFailureReason.CLIPBOARD_UNAVAILABLE, true);
+    case "REMOTE_DESKTOP_CLIPBOARD_CHANGED":
+      return failure(RemoteDesktopFailureReason.CLIPBOARD_UNAVAILABLE, true);
+    case "REMOTE_DESKTOP_CLIPBOARD_EMPTY":
+      return failure(RemoteDesktopFailureReason.CLIPBOARD_EMPTY, false);
+    case "REMOTE_DESKTOP_CLIPBOARD_TOO_LARGE":
+      return failure(RemoteDesktopFailureReason.CLIPBOARD_TOO_LARGE, false);
+    case "REMOTE_DESKTOP_CLIPBOARD_UNSUPPORTED":
+      return failure(RemoteDesktopFailureReason.CLIPBOARD_UNSUPPORTED, false);
+    case "REMOTE_DESKTOP_CLIPBOARD_EXPIRED":
+      return failure(RemoteDesktopFailureReason.CLIPBOARD_EXPIRED, false);
     default: return error;
   }
 }

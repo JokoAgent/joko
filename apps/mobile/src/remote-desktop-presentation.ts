@@ -1,5 +1,9 @@
 import type { MobileSupportedLocale } from "./mobile-locale-preference";
-import type { MobileRemoteDesktopNotice, MobileRemoteDesktopSnapshot } from "./remote-desktop-controller";
+import type {
+  MobileRemoteDesktopClipboardNotice,
+  MobileRemoteDesktopNotice,
+  MobileRemoteDesktopSnapshot
+} from "./remote-desktop-controller";
 import type { Session, Target } from "@joko/contracts";
 
 interface MobileRemoteDesktopCopy {
@@ -17,6 +21,17 @@ interface MobileRemoteDesktopCopy {
   readonly left: string;
   readonly right: string;
   readonly release: string;
+  readonly copyToPhone: string;
+  readonly pasteFromPhone: string;
+  readonly clipboardTransferring: string;
+  readonly clipboardCopied: string;
+  readonly clipboardPasted: string;
+  readonly clipboardEmpty: string;
+  readonly clipboardUnsupported: string;
+  readonly clipboardTooLarge: string;
+  readonly clipboardUnavailable: string;
+  readonly clipboardBusy: string;
+  readonly clipboardFailed: string;
   readonly retry: string;
   readonly takeover: string;
   readonly permissionGuide: string;
@@ -45,6 +60,14 @@ const EN: MobileRemoteDesktopCopy = {
   title: "Remote Desktop", back: "Back", chooseDesktop: "Choose a desktop", chooseDisplay: "Choose a display",
   view: "View", control: "Control", touch: "Touch", trackpad: "Trackpad", pan: "Pan",
   keyboard: "Keyboard", fit: "Fit", left: "Left", right: "Right", release: "Release",
+  copyToPhone: "Copy to phone", pasteFromPhone: "Paste from phone",
+  clipboardTransferring: "Transferring clipboard…", clipboardCopied: "Copied to this phone.",
+  clipboardPasted: "Pasted on the desktop.", clipboardEmpty: "The clipboard is empty.",
+  clipboardUnsupported: "This clipboard item is not supported.",
+  clipboardTooLarge: "This clipboard item is too large.",
+  clipboardUnavailable: "Rich clipboard transfer is unavailable on this device.",
+  clipboardBusy: "Another clipboard transfer is in progress.",
+  clipboardFailed: "The clipboard transfer failed.",
   retry: "Retry", takeover: "Take over", permissionGuide: "Show permission guide",
   connecting: "Connecting…", reconnecting: "Reconnecting — the last frame stays visible.", offline: "Offline",
   unsupported: "Remote Desktop is unavailable.", permission: "Desktop permission is required.",
@@ -63,6 +86,11 @@ const ZH_CN: MobileRemoteDesktopCopy = {
   title: "远程桌面", back: "返回", chooseDesktop: "选择桌面", chooseDisplay: "选择显示器",
   view: "查看", control: "控制", touch: "触控", trackpad: "触控板", pan: "平移",
   keyboard: "键盘", fit: "适合屏幕", left: "左键", right: "右键", release: "释放输入",
+  copyToPhone: "复制到手机", pasteFromPhone: "从手机粘贴", clipboardTransferring: "正在传输剪贴板…",
+  clipboardCopied: "已复制到此手机。", clipboardPasted: "已粘贴到桌面。", clipboardEmpty: "剪贴板为空。",
+  clipboardUnsupported: "不支持此剪贴板项目。", clipboardTooLarge: "此剪贴板项目过大。",
+  clipboardUnavailable: "此设备不支持富剪贴板传输。", clipboardBusy: "另一个剪贴板传输正在进行。",
+  clipboardFailed: "剪贴板传输失败。",
   retry: "重试", takeover: "接管", permissionGuide: "显示权限指引",
   connecting: "正在连接…", reconnecting: "正在重新连接，保留最后一帧。", offline: "已离线",
   unsupported: "远程桌面不可用。", permission: "需要桌面权限。", revoked: "远程桌面访问权已变化。",
@@ -78,6 +106,11 @@ const ZH_TW: MobileRemoteDesktopCopy = {
   ...ZH_CN, title: "遠端桌面", back: "返回", chooseDesktop: "選擇桌面", chooseDisplay: "選擇顯示器", view: "檢視",
   control: "控制", touch: "觸控", trackpad: "觸控板", pan: "平移", keyboard: "鍵盤",
   fit: "符合螢幕", left: "左鍵", right: "右鍵", release: "釋放輸入", retry: "重試",
+  copyToPhone: "複製到手機", pasteFromPhone: "從手機貼上", clipboardTransferring: "正在傳輸剪貼簿…",
+  clipboardCopied: "已複製到此手機。", clipboardPasted: "已貼到桌面。", clipboardEmpty: "剪貼簿是空的。",
+  clipboardUnsupported: "不支援此剪貼簿項目。", clipboardTooLarge: "此剪貼簿項目過大。",
+  clipboardUnavailable: "此裝置不支援富剪貼簿傳輸。", clipboardBusy: "另一個剪貼簿傳輸正在進行。",
+  clipboardFailed: "剪貼簿傳輸失敗。",
   takeover: "接管", permissionGuide: "顯示權限指引", connecting: "正在連線…",
   reconnecting: "正在重新連線，保留最後一幀。", offline: "已離線", unsupported: "遠端桌面無法使用。",
   permission: "需要桌面權限。", revoked: "遠端桌面存取權已變更。", busy: "此桌面正在使用中。",
@@ -94,6 +127,13 @@ const JA: MobileRemoteDesktopCopy = {
   chooseDisplay: "ディスプレイを選択", view: "表示", control: "操作", touch: "タッチ",
   trackpad: "トラックパッド", pan: "移動", keyboard: "キーボード", fit: "画面に合わせる",
   left: "左クリック", right: "右クリック", release: "入力を解放", retry: "再試行", takeover: "引き継ぐ",
+  copyToPhone: "スマートフォンにコピー", pasteFromPhone: "スマートフォンから貼り付け",
+  clipboardTransferring: "クリップボードを転送中…", clipboardCopied: "このスマートフォンにコピーしました。",
+  clipboardPasted: "デスクトップに貼り付けました。", clipboardEmpty: "クリップボードは空です。",
+  clipboardUnsupported: "このクリップボード項目には対応していません。",
+  clipboardTooLarge: "このクリップボード項目は大きすぎます。",
+  clipboardUnavailable: "このデバイスではリッチクリップボード転送を利用できません。",
+  clipboardBusy: "別のクリップボード転送が進行中です。", clipboardFailed: "クリップボード転送に失敗しました。",
   permissionGuide: "権限ガイドを表示", connecting: "接続中…", reconnecting: "再接続中 — 最後のフレームを表示しています。",
   offline: "オフライン", unsupported: "リモートデスクトップを利用できません。", permission: "デスクトップ側の権限が必要です。",
   revoked: "アクセス権が変更されました。", busy: "このデスクトップは使用中です。", stopped: "デスクトップがセッションを停止しました。",
@@ -109,6 +149,13 @@ const KO: MobileRemoteDesktopCopy = {
   ...EN, title: "원격 데스크톱", back: "뒤로", chooseDesktop: "데스크톱 선택", chooseDisplay: "디스플레이 선택",
   view: "보기", control: "제어", touch: "터치", trackpad: "트랙패드", pan: "이동", keyboard: "키보드",
   fit: "화면 맞춤", left: "왼쪽", right: "오른쪽", release: "입력 해제", retry: "다시 시도",
+  copyToPhone: "휴대전화로 복사", pasteFromPhone: "휴대전화에서 붙여넣기",
+  clipboardTransferring: "클립보드 전송 중…", clipboardCopied: "이 휴대전화에 복사했습니다.",
+  clipboardPasted: "데스크톱에 붙여넣었습니다.", clipboardEmpty: "클립보드가 비어 있습니다.",
+  clipboardUnsupported: "이 클립보드 항목은 지원되지 않습니다.",
+  clipboardTooLarge: "이 클립보드 항목이 너무 큽니다.",
+  clipboardUnavailable: "이 기기에서는 리치 클립보드 전송을 사용할 수 없습니다.",
+  clipboardBusy: "다른 클립보드 전송이 진행 중입니다.", clipboardFailed: "클립보드 전송에 실패했습니다.",
   takeover: "인계받기", permissionGuide: "권한 안내 표시", connecting: "연결 중…",
   reconnecting: "다시 연결 중 — 마지막 프레임을 유지합니다.", offline: "오프라인",
   unsupported: "원격 데스크톱을 사용할 수 없습니다.", permission: "데스크톱 권한이 필요합니다.",
@@ -158,6 +205,21 @@ export function mobileRemoteDesktopNoticeLabel(
   if (notice === "stopped") return copy.stopped;
   if (notice === "unavailable") return copy.unsupported;
   return copy.error;
+}
+
+export function mobileRemoteDesktopClipboardNoticeLabel(
+  notice: MobileRemoteDesktopClipboardNotice | undefined,
+  copy: MobileRemoteDesktopCopy
+): string | undefined {
+  if (notice === "copied") return copy.clipboardCopied;
+  if (notice === "pasted") return copy.clipboardPasted;
+  if (notice === "empty") return copy.clipboardEmpty;
+  if (notice === "unsupported") return copy.clipboardUnsupported;
+  if (notice === "too-large") return copy.clipboardTooLarge;
+  if (notice === "unavailable") return copy.clipboardUnavailable;
+  if (notice === "busy") return copy.clipboardBusy;
+  if (notice === "failed") return copy.clipboardFailed;
+  return undefined;
 }
 
 export function mobileRemoteDesktopSessionDeviceId(

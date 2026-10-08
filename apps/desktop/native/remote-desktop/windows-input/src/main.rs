@@ -9,6 +9,7 @@ use windows_sys::Win32::Foundation::GetLastError;
 use windows_sys::Win32::UI::{HiDpi::*, Input::KeyboardAndMouse::*, WindowsAndMessaging::*};
 
 mod desktop;
+mod selection;
 
 static FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -105,6 +106,28 @@ fn desktop_ready() -> bool {
 }
 
 fn main() {
+    if matches!(
+        std::env::args().nth(1).as_deref(),
+        Some("--clipboard-selection" | "--clipboard-content-selection")
+    ) {
+        let portable = std::env::args().nth(1).as_deref()
+            == Some("--clipboard-content-selection");
+        match selection::read(portable) {
+            Ok(text) => println!("{}", serde_json::json!({ "text": text })),
+            Err(_) => std::process::exit(2),
+        }
+        return;
+    }
+    if std::env::args().nth(1).as_deref() == Some("--clipboard-version") {
+        if desktop::require_unlocked().is_err() {
+            std::process::exit(2);
+        }
+        let version = unsafe {
+            windows_sys::Win32::System::DataExchange::GetClipboardSequenceNumber()
+        };
+        println!("{version}");
+        return;
+    }
     unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2); }
     if !desktop_ready() { return; }
 

@@ -22,6 +22,8 @@ import {
   type SchedulerRuntimeSnapshot, type SessionMessageSearchMatch, type SessionResource, type Snapshot, type Target,
   type WorkspaceEntry, type WorkspaceFileChange, type WorkspaceHtmlReference, type ListPartnerSessionsResponse,
   type RemoteDesktopCapabilities, type RemoteDesktopControlState, type RemoteDesktopFrameResult,
+  type RemoteDesktopClipboardContentRequest, type RemoteDesktopClipboardContentResult,
+  type RemoteDesktopClipboardTextRequest, type RemoteDesktopClipboardTextResult,
   type RemoteDesktopIceCandidate, type RemoteDesktopIceExchangeResult, type RemoteDesktopIceServer,
   type RemoteDesktopInputEvent, type RemoteDesktopLease, type RemoteDesktopOfferResult,
   type RemoteDesktopPermissions, type RemoteDesktopStartMode,
@@ -143,6 +145,10 @@ export interface MobileNetwork {
     signal?: AbortSignal): Promise<RemoteDesktopIceExchangeResult>;
   getRemoteDesktopFrame?(credential: PairedCredential, peer: DevicePeerRouteIdentity, leaseId: string,
     signal?: AbortSignal): Promise<RemoteDesktopFrameResult>;
+  transferRemoteDesktopClipboardText?(credential: PairedCredential, peer: DevicePeerRouteIdentity,
+    transfer: RemoteDesktopClipboardTextRequest, signal?: AbortSignal): Promise<RemoteDesktopClipboardTextResult>;
+  transferRemoteDesktopClipboardContent?(credential: PairedCredential, peer: DevicePeerRouteIdentity,
+    transfer: RemoteDesktopClipboardContentRequest, signal?: AbortSignal): Promise<RemoteDesktopClipboardContentResult>;
   listPartners(credential: PairedCredential, signal?: AbortSignal): Promise<readonly MobilePartner[]>;
   listPartnerSessions(credential: PairedCredential, partnerId: string, signal?: AbortSignal): Promise<ListPartnerSessionsResponse>;
   listPartnerPrivateThreads(credential: PairedCredential, partnerId: string, signal?: AbortSignal): Promise<readonly MobilePrivateThread[]>;
@@ -1260,6 +1266,20 @@ export const mobileNetwork: MobileNetwork = {
       || jpeg[jpeg.length - 2] !== 0xff || jpeg[jpeg.length - 1] !== 0xd9)) {
       throw new Error("The Remote Desktop frame exceeds its portable JPEG bounds.");
     }
+    return response.result;
+  },
+  async transferRemoteDesktopClipboardText(credential, peer, transferValue, signal) {
+    const response = await createClient(RemoteDesktopService, transport(credential.origin, credential.authKey))
+      .transferRemoteDesktopClipboardText({ peer, transfer: transferValue }, options(signal));
+    assertRemoteDesktopPeer(peer, response.peer);
+    if (!response.result) throw new Error("The Joko node returned no Remote Desktop clipboard text result.");
+    return response.result;
+  },
+  async transferRemoteDesktopClipboardContent(credential, peer, transferValue, signal) {
+    const response = await createClient(RemoteDesktopService, transport(credential.origin, credential.authKey))
+      .transferRemoteDesktopClipboardContent({ peer, transfer: transferValue }, options(signal));
+    assertRemoteDesktopPeer(peer, response.peer);
+    if (!response.result) throw new Error("The Joko node returned no Remote Desktop clipboard content result.");
     return response.result;
   },
   async listPartners(credential, signal) {

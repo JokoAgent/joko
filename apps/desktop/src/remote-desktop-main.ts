@@ -15,6 +15,7 @@ import {
   DesktopRemoteDesktopHost,
   type DesktopRemoteDesktopState
 } from "./remote-desktop-host.js";
+import { DesktopRemoteDesktopClipboard } from "./remote-desktop-clipboard.js";
 import { DesktopRemoteDesktopInput, readDesktopRemoteDesktopInputPermission } from "./remote-desktop-input.js";
 import { DesktopRemoteDesktopMedia } from "./remote-desktop-media.js";
 import type { DesktopRemoteDesktopSettingsStore } from "./remote-desktop-settings.js";
@@ -41,6 +42,9 @@ export function createDesktopRemoteDesktopMainHost(
   let displayAwake: number | undefined;
   const media = new DesktopRemoteDesktopMedia(join(options.sourceDirectory, "remote-desktop-capture-preload.cjs"));
   const input = new DesktopRemoteDesktopInput(() => host?.releaseControl());
+  const clipboard = process.platform === "darwin" || process.platform === "win32"
+    ? new DesktopRemoteDesktopClipboard((events) => input.send(events))
+    : undefined;
   const subscriptions = {
     display: (listener: (displayId: string, geometryChanged: boolean) => void): (() => void) => {
       const removed = (_event: Electron.Event, display: Electron.Display): void => {
@@ -81,6 +85,7 @@ export function createDesktopRemoteDesktopMainHost(
     showPermissionGuide: (signal) => showDesktopRemoteDesktopPermissionGuide(options.getMainWindow(), signal),
     media,
     input,
+    ...(clipboard === undefined ? {} : { clipboard }),
     changed: (state) => {
       if (state !== undefined && displayAwake === undefined) {
         displayAwake = powerSaveBlocker.start("prevent-display-sleep");

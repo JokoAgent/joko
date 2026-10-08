@@ -94,6 +94,133 @@ describe("RemoteDesktopCoordinator", () => {
     });
   });
 
+  it("forwards explicit clipboard requests only for the exact active control generation", async () => {
+    const fake = new FakeDevicePeerOwner();
+    const coordinator = fakeCoordinator(fake).coordinator;
+    const lease = await start(coordinator);
+
+    const copied = await coordinator.transferClipboardText(
+      connection,
+      identity,
+      create(contract.RemoteDesktopClipboardTextRequestSchema, {
+        leaseId: lease.leaseId,
+        controlGeneration: lease.controlGeneration,
+        action: {
+          case: "copy",
+          value: create(contract.RemoteDesktopClipboardTextCopyActionSchema)
+        }
+      }),
+      signal
+    );
+    expect(copied.text).toBe("desktop text");
+    const command = fake.calls.at(-1)?.input.payload as contract.DevicePeerCommand;
+    expect(fake.calls.at(-1)?.authority.controllerDeviceId).toBe(connection.deviceId);
+    expect(command).toMatchObject({
+      action: {
+        case: "transferRemoteDesktopClipboardText",
+        value: { leaseId: lease.leaseId, controlGeneration: lease.controlGeneration }
+      }
+    });
+
+    const begun = await coordinator.transferClipboardContent(
+      connection,
+      identity,
+      create(contract.RemoteDesktopClipboardContentRequestSchema, {
+        leaseId: lease.leaseId,
+        controlGeneration: lease.controlGeneration,
+        action: {
+          case: "begin",
+          value: create(contract.RemoteDesktopClipboardContentBeginActionSchema, { length: 24 })
+        }
+      }),
+      signal
+    );
+    expect(begun.transferId).toBe("transfer-1");
+
+    await expect(coordinator.transferClipboardText(
+      connection,
+      identity,
+      create(contract.RemoteDesktopClipboardTextRequestSchema, {
+        leaseId: lease.leaseId,
+        controlGeneration: lease.controlGeneration + 1n,
+        action: {
+          case: "copy",
+          value: create(contract.RemoteDesktopClipboardTextCopyActionSchema)
+        }
+      }),
+      signal
+    )).rejects.toMatchObject({
+      detail: { reason: contract.RemoteDesktopFailureReason.CLIPBOARD_EXPIRED }
+    });
+    expect(fake.actions().filter((action) => action === "transferRemoteDesktopClipboardText")).toHaveLength(1);
+
+    const stopped = await coordinator.setControl(connection, identity, {
+      leaseId: lease.leaseId,
+      enabled: false
+    }, signal);
+    await expect(coordinator.transferClipboardContent(
+      connection,
+      identity,
+      create(contract.RemoteDesktopClipboardContentRequestSchema, {
+        leaseId: lease.leaseId,
+        controlGeneration: stopped.controlGeneration,
+        action: {
+          case: "copy",
+          value: create(contract.RemoteDesktopClipboardContentCopyActionSchema)
+        }
+      }),
+      signal
+    )).rejects.toMatchObject({
+      detail: { reason: contract.RemoteDesktopFailureReason.VIEW_ONLY }
+    });
+  });
+
+  it("never returns a lower control generation when concurrent control replies arrive out of order", async () => {
+    const fake = new FakeDevicePeerOwner();
+    const coordinator = fakeCoordinator(fake).coordinator;
+    await start(coordinator);
+    const previousDispatch = fake.dispatchHandler;
+    let finishOlder: ((response: DevicePeerResponseFrame) => void) | undefined;
+    let finishNewer: ((response: DevicePeerResponseFrame) => void) | undefined;
+    fake.dispatchHandler = (authority, input) => {
+      if (input.action !== "setRemoteDesktopControl") return previousDispatch(authority, input);
+      const command = input.payload as contract.DevicePeerCommand;
+      if (command.action.case !== "setRemoteDesktopControl") throw new Error("Expected control action.");
+      const enabled = command.action.value.enabled;
+      return new Promise<DevicePeerResponseFrame>((resolve) => {
+        if (enabled) finishNewer = resolve;
+        else finishOlder = resolve;
+      });
+    };
+
+    const older = coordinator.setControl(connection, identity, { leaseId: "lease-1", enabled: false }, signal);
+    const newer = coordinator.setControl(connection, identity, { leaseId: "lease-1", enabled: true }, signal);
+    finishNewer?.(completed(result("remoteDesktopControlState", create(
+      contract.RemoteDesktopControlStateSchema,
+      { controlling: true, controlGeneration: 3n }
+    ))));
+    await expect(newer).resolves.toMatchObject({ controlling: true, controlGeneration: 3n });
+    finishOlder?.(completed(result("remoteDesktopControlState", create(
+      contract.RemoteDesktopControlStateSchema,
+      { controlling: false, controlGeneration: 2n }
+    ))));
+    await expect(older).resolves.toMatchObject({ controlling: true, controlGeneration: 3n });
+
+    await expect(coordinator.transferClipboardText(
+      connection,
+      identity,
+      create(contract.RemoteDesktopClipboardTextRequestSchema, {
+        leaseId: "lease-1",
+        controlGeneration: 3n,
+        action: {
+          case: "copy",
+          value: create(contract.RemoteDesktopClipboardTextCopyActionSchema)
+        }
+      }),
+      signal
+    )).resolves.toMatchObject({ text: "desktop text" });
+  });
+
   it("renews the twelve-second lease on heartbeat and expires it at the exact boundary", async () => {
     let now = 1_000;
     const fake = new FakeDevicePeerOwner();
@@ -139,7 +266,7 @@ describe("RemoteDesktopCoordinator", () => {
     now = 13_000;
     finishHeartbeat?.(completed(result("remoteDesktopControlState", create(
       contract.RemoteDesktopControlStateSchema,
-      { controlling: true }
+      { controlling: true, controlGeneration: 1n }
     ))));
 
     await expect(heartbeat).rejects.toMatchObject({
@@ -726,11 +853,13 @@ function defaultResponse(input: DispatchInput): DevicePeerResponseFrame {
       return completed(result("remoteDesktopLease", remoteDesktopLease()));
     case "heartbeatRemoteDesktop":
       return completed(result("remoteDesktopControlState", create(contract.RemoteDesktopControlStateSchema, {
-        controlling: true
+        controlling: true,
+        controlGeneration: 1n
       })));
     case "setRemoteDesktopControl":
       return completed(result("remoteDesktopControlState", create(contract.RemoteDesktopControlStateSchema, {
-        controlling: command.action.case === "setRemoteDesktopControl" && command.action.value.enabled
+        controlling: command.action.case === "setRemoteDesktopControl" && command.action.value.enabled,
+        controlGeneration: 2n
       })));
     case "stopRemoteDesktop":
     case "sendRemoteDesktopInput":
@@ -739,6 +868,23 @@ function defaultResponse(input: DispatchInput): DevicePeerResponseFrame {
       return completed(result("remoteDesktopFrame", create(contract.RemoteDesktopFrameResultSchema, {
         frame: create(contract.RemoteDesktopFrameSchema, { jpeg: new Uint8Array([0xff, 0xd8, 0xff, 0xd9]) })
       })));
+    case "transferRemoteDesktopClipboardText":
+      return completed(result("remoteDesktopClipboardText", create(
+        contract.RemoteDesktopClipboardTextResultSchema,
+        command.action.case === "transferRemoteDesktopClipboardText"
+          && command.action.value.action.case === "copy" ? { text: "desktop text" } : {}
+      )));
+    case "transferRemoteDesktopClipboardContent": {
+      if (command.action.case !== "transferRemoteDesktopClipboardContent") throw new Error("Unexpected command.");
+      const action = command.action.value.action.case;
+      return completed(result("remoteDesktopClipboardContent", create(
+        contract.RemoteDesktopClipboardContentResultSchema,
+        action === "copy" ? { transferId: "transfer-1", length: 24 }
+          : action === "begin" ? { transferId: "transfer-1" }
+            : action === "read" ? { data: "{\"text\":\"desktop text\"}" }
+              : {}
+      )));
+    }
     default:
       throw new Error(`Unexpected action: ${input.action}`);
   }
@@ -773,7 +919,8 @@ function remoteDesktopLease(leaseId = "lease-1"): contract.RemoteDesktopLease {
       width: 1920,
       height: 1080
     }),
-    controlling: true
+    controlling: true,
+    controlGeneration: 1n
   });
 }
 

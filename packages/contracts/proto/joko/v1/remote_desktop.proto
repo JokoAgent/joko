@@ -23,6 +23,8 @@ service RemoteDesktopService {
   rpc CreateRemoteDesktopOffer(CreateRemoteDesktopOfferRequest) returns (CreateRemoteDesktopOfferResponse);
   rpc ExchangeRemoteDesktopIce(ExchangeRemoteDesktopIceRequest) returns (ExchangeRemoteDesktopIceResponse);
   rpc GetRemoteDesktopFrame(GetRemoteDesktopFrameRequest) returns (GetRemoteDesktopFrameResponse);
+  rpc TransferRemoteDesktopClipboardText(TransferRemoteDesktopClipboardTextRequest) returns (TransferRemoteDesktopClipboardTextResponse);
+  rpc TransferRemoteDesktopClipboardContent(TransferRemoteDesktopClipboardContentRequest) returns (TransferRemoteDesktopClipboardContentResponse);
 }
 
 message ListRemoteDesktopHostsRequest {
@@ -156,4 +158,24 @@ message GetRemoteDesktopFrameRequest {
 message GetRemoteDesktopFrameResponse {
   DevicePeerRouteIdentity peer = 1;
   RemoteDesktopFrameResult result = 2;
+}
+
+message TransferRemoteDesktopClipboardTextRequest {
+  DevicePeerRouteIdentity peer = 1;
+  RemoteDesktopClipboardTextRequest transfer = 2;
+}
+
+message TransferRemoteDesktopClipboardTextResponse {
+  DevicePeerRouteIdentity peer = 1;
+  RemoteDesktopClipboardTextResult result = 2;
+}
+
+message TransferRemoteDesktopClipboardContentRequest {
+  DevicePeerRouteIdentity peer = 1;
+  RemoteDesktopClipboardContentRequest transfer = 2;
+}
+
+message TransferRemoteDesktopClipboardContentResponse {
+  DevicePeerRouteIdentity peer = 1;
+  RemoteDesktopClipboardContentResult result = 2;
 }

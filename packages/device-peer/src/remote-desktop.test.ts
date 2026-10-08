@@ -6,9 +6,12 @@ import {
   REMOTE_DESKTOP_MAX_FRAME_BYTES,
   isBoundedRemoteDesktopJpegFrame,
   isRemoteDesktopInput,
+  parseRemoteDesktopClipboardContentJson,
   parseRemoteDesktopHostCapabilities,
   parseRemoteDesktopRequest,
-  type RemoteDesktopHostCapabilities
+  stringifyRemoteDesktopClipboardContent,
+  type RemoteDesktopHostCapabilities,
+  type RemoteDesktopLease
 } from "./remote-desktop.js";
 import {
   RemoteDesktopController,
@@ -45,7 +48,9 @@ const CAPABILITIES: RemoteDesktopHostCapabilities = Object.freeze({
   displays: Object.freeze([
     Object.freeze({ id: "display-1", name: "Built-in Display", width: 1_280, height: 800 })
   ]),
-  permissions: Object.freeze({ screenRecording: "granted", accessibility: "granted" })
+  permissions: Object.freeze({ screenRecording: "granted", accessibility: "granted" }),
+  clipboardText: true,
+  clipboardContent: true
 });
 
 describe("remote desktop portable protocol", () => {
@@ -76,6 +81,24 @@ describe("remote desktop portable protocol", () => {
     expect(() => parseRemoteDesktopRequest({
       op: "input", lease: "lease-1", sequence: 1, events: []
     })).toThrowError("INVALID_REMOTE_DESKTOP_REQUEST");
+  });
+
+  it("accepts one bounded portable clipboard item without applying the legacy text limit", () => {
+    const longRichText = "x".repeat(20_000);
+    expect(parseRemoteDesktopClipboardContentJson(JSON.stringify({
+      text: longRichText,
+      html: "<p>portable</p>",
+      url: "https://example.test/item",
+      png: "iVBORw0KGgo="
+    }))).toMatchObject({ text: longRichText, url: "https://example.test/item" });
+    expect(stringifyRemoteDesktopClipboardContent({
+      $typeName: "joko.v1.RemoteDesktopClipboardContent",
+      text: "portable"
+    })).toBe(JSON.stringify({ text: "portable" }));
+    expect(() => parseRemoteDesktopClipboardContentJson(JSON.stringify({ privateFormat: "secret" })))
+      .toThrowError("REMOTE_DESKTOP_CLIPBOARD_UNSUPPORTED");
+    expect(() => parseRemoteDesktopClipboardContentJson(JSON.stringify({ url: "file:///private/item" })))
+      .toThrowError("REMOTE_DESKTOP_CLIPBOARD_UNSUPPORTED");
   });
 
   it("sanitizes host capabilities to the admitted first-batch surface", () => {
@@ -176,7 +199,7 @@ describe("remote desktop finite authority controller", () => {
     fixture.now += REMOTE_DESKTOP_LEASE_MS - 1;
     await expect(fixture.controller.request(AUTHORITY, {
       op: "heartbeat", lease: lease.lease
-    })).resolves.toEqual({ controlling: false });
+    })).resolves.toMatchObject({ controlling: false, controlGeneration: lease.controlGeneration });
     fixture.now += REMOTE_DESKTOP_LEASE_MS - 1;
     fixture.controller.tick();
     expect(fixture.controller.state).toBeDefined();
@@ -217,6 +240,8 @@ describe("remote desktop finite authority controller", () => {
       op: "control", lease: lease.lease, enabled: true
     });
     expect(fixture.controller.state?.controlling).toBe(true);
+    const firstGeneration = fixture.controller.state!.controlGeneration;
+    expect(fixture.controller.isControlCurrent(AUTHORITY, lease.lease, firstGeneration)).toBe(true);
 
     vi.mocked(fixture.dependencies.input).mockImplementationOnce(() => {
       throw new Error("native input unavailable");
@@ -228,11 +253,13 @@ describe("remote desktop finite authority controller", () => {
       events: [{ kind: "button", button: 0, down: true, x: 0.5, y: 0.5 }]
     })).rejects.toThrowError("native input unavailable");
     expect(fixture.controller.state).toMatchObject({ lease: lease.lease, controlling: false });
+    expect(fixture.controller.isControlCurrent(AUTHORITY, lease.lease, firstGeneration)).toBe(false);
     expect(fixture.dependencies.stopVideo).not.toHaveBeenCalled();
 
     await fixture.controller.request(AUTHORITY, {
       op: "control", lease: lease.lease, enabled: true
     });
+    expect(fixture.controller.state!.controlGeneration).toBeGreaterThan(firstGeneration);
     await fixture.controller.request(AUTHORITY, {
       op: "input", lease: lease.lease, sequence: 2, events: [{ kind: "release" }]
     });
@@ -406,7 +433,7 @@ function controllerFixture() {
 async function start(fixture: ReturnType<typeof controllerFixture>) {
   return fixture.controller.request(AUTHORITY, {
     op: "start", displayId: "display-1"
-  }) as Promise<{ readonly lease: string }>;
+  }) as Promise<RemoteDesktopLease>;
 }
 
 function authorityKey(authority: RemoteDesktopAuthority): string {

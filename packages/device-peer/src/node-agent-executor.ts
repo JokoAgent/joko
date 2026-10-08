@@ -63,6 +63,11 @@ import {
   DevicePeerTerminalExitedResultSchema,
   DevicePeerTerminalOpenedResultSchema,
   DevicePeerTerminalOutputResultSchema,
+  type RemoteDesktopClipboardContent,
+  RemoteDesktopClipboardContentResultSchema,
+  type RemoteDesktopClipboardContentRequest,
+  type RemoteDesktopClipboardTextRequest,
+  RemoteDesktopClipboardTextResultSchema,
   type RemoteDesktopCapabilities,
   RemoteDesktopCapabilitiesSchema,
   type RemoteDesktopControlState,
@@ -100,6 +105,14 @@ import {
   type DevicePeerTerminalTransportPort
 } from "./ports.js";
 import { atomicWritePrivateFile, readPrivateFile, sameFileIdentity, sameStableFile } from "./private-files.js";
+import {
+  parseRemoteDesktopClipboardContentJson,
+  REMOTE_DESKTOP_CLIPBOARD_CHUNK_CHARACTERS,
+  REMOTE_DESKTOP_CLIPBOARD_MAX_CHARACTERS,
+  REMOTE_DESKTOP_CLIPBOARD_TRANSFER_IDLE_MS,
+  REMOTE_DESKTOP_MAX_CLIPBOARD_TEXT_CHARACTERS,
+  stringifyRemoteDesktopClipboardContent
+} from "./remote-desktop.js";
 
 const MAXIMUM_PATH_BYTES = 16_384;
 const MAXIMUM_PATH_COMPONENTS = 256;
@@ -207,6 +220,8 @@ export class NodeDevicePeerAgentExecutor {
   readonly #activeForwards = new Map<string, Socket>();
   readonly #activeListeners = new Map<string, ReverseListener>();
   readonly #reverseConnections = new Map<string, Socket>();
+  #remoteDesktopClipboardTransfer: RemoteDesktopClipboardTransferState | undefined;
+  #remoteDesktopClipboardBusy = false;
   #retired = false;
 
   constructor(options: NodeDevicePeerAgentExecutorOptions) {
@@ -264,6 +279,7 @@ export class NodeDevicePeerAgentExecutor {
   async retire(): Promise<void> {
     if (this.#retired) return;
     this.#retired = true;
+    this.#resetRemoteDesktopClipboardTransfer();
     const terminals = [...this.#activeTerminals.values()];
     const listeners = [...this.#activeListeners.values()];
     for (const process of this.#activeProcesses.values()) process.kill("SIGTERM");
@@ -494,6 +510,7 @@ export class NodeDevicePeerAgentExecutor {
         });
         return acknowledgement();
       case "startRemoteDesktop": {
+        this.#resetRemoteDesktopClipboardTransfer();
         const value = await this.#requireRemoteDesktop().start({
           controllerDeviceId: command.controllerDeviceId,
           displayId: command.action.value.displayId,
@@ -513,12 +530,17 @@ export class NodeDevicePeerAgentExecutor {
           signal
         });
         validateRemoteDesktopControlState(value);
+        this.#resetRemoteDesktopClipboardTransferForChangedControl(
+          command.action.value.leaseId,
+          value.controlGeneration
+        );
         return {
           case: "remoteDesktopControlState",
           value: clone(RemoteDesktopControlStateSchema, value)
         };
       }
       case "stopRemoteDesktop":
+        this.#resetRemoteDesktopClipboardTransferForLease(command.action.value.leaseId);
         await this.#requireRemoteDesktop().stop({
           controllerDeviceId: command.controllerDeviceId,
           leaseId: command.action.value.leaseId,
@@ -526,6 +548,7 @@ export class NodeDevicePeerAgentExecutor {
         });
         return acknowledgement();
       case "setRemoteDesktopControl": {
+        this.#resetRemoteDesktopClipboardTransferForLease(command.action.value.leaseId);
         const value = await this.#requireRemoteDesktop().setControl({
           controllerDeviceId: command.controllerDeviceId,
           leaseId: command.action.value.leaseId,
@@ -589,8 +612,256 @@ export class NodeDevicePeerAgentExecutor {
           value: clone(RemoteDesktopFrameResultSchema, value)
         };
       }
+      case "transferRemoteDesktopClipboardText":
+      {
+        const request = command.action.value as RemoteDesktopClipboardTextRequest;
+        return this.#withRemoteDesktopClipboard(async () => {
+          const common = {
+            controllerDeviceId: command.controllerDeviceId,
+            leaseId: request.leaseId,
+            controlGeneration: request.controlGeneration,
+            signal
+          };
+          switch (request.action.case) {
+            case "copy": {
+              const text = await this.#requireRemoteDesktop().copyClipboardText(common);
+              if (!validRemoteDesktopClipboardText(text)) throw invalidRemoteDesktopHostResult();
+              return {
+                case: "remoteDesktopClipboardText" as const,
+                value: create(RemoteDesktopClipboardTextResultSchema, { text })
+              };
+            }
+            case "paste":
+              await this.#requireRemoteDesktop().pasteClipboardText({
+                ...common,
+                text: request.action.value.text
+              });
+              return {
+                case: "remoteDesktopClipboardText" as const,
+                value: create(RemoteDesktopClipboardTextResultSchema)
+              };
+            case undefined:
+              throw agentError(DevicePeerFailureCode.INVALID_REQUEST, false);
+          }
+        });
+      }
+      case "transferRemoteDesktopClipboardContent":
+      {
+        const request = command.action.value as RemoteDesktopClipboardContentRequest;
+        return this.#withRemoteDesktopClipboard(() => this.#transferRemoteDesktopClipboardContent(
+          command.controllerDeviceId,
+          request,
+          signal
+        ));
+      }
       default:
         throw agentError(DevicePeerFailureCode.INVALID_REQUEST, false);
+    }
+  }
+
+  async #transferRemoteDesktopClipboardContent(
+    controllerDeviceId: string,
+    request: RemoteDesktopClipboardContentRequest,
+    signal: AbortSignal
+  ): Promise<AgentPayload> {
+    const common = {
+      controllerDeviceId,
+      leaseId: request.leaseId,
+      controlGeneration: request.controlGeneration,
+      signal
+    };
+    // Re-read the target host's exact authority before touching transfer
+    // state. A locally advanced control generation must fence even when the
+    // service has not observed the next heartbeat yet.
+    if (!this.#requireRemoteDesktop().isControlCurrent(common)) {
+      throw new DevicePeerRemoteDesktopHostError(
+        RemoteDesktopFailureReason.CLIPBOARD_EXPIRED,
+        false
+      );
+    }
+    switch (request.action.case) {
+      case "copy": {
+        this.#resetRemoteDesktopClipboardTransfer();
+        const content = await this.#requireRemoteDesktop().copyClipboardContent(common);
+        const data = stringifyRemoteDesktopClipboardContent(content);
+        const state = this.#createRemoteDesktopClipboardTransfer({
+          controllerDeviceId,
+          leaseId: request.leaseId,
+          controlGeneration: request.controlGeneration,
+          direction: "copy",
+          length: data.length,
+          data
+        });
+        return remoteDesktopClipboardContentResult({
+          transferId: state.transferId,
+          length: state.length
+        });
+      }
+      case "begin": {
+        this.#resetRemoteDesktopClipboardTransfer();
+        const state = this.#createRemoteDesktopClipboardTransfer({
+          controllerDeviceId,
+          leaseId: request.leaseId,
+          controlGeneration: request.controlGeneration,
+          direction: "paste",
+          length: request.action.value.length,
+          data: ""
+        });
+        return remoteDesktopClipboardContentResult({ transferId: state.transferId });
+      }
+      case "read": {
+        const state = this.#requireRemoteDesktopClipboardTransfer(
+          controllerDeviceId,
+          request,
+          request.action.value.transferId,
+          "copy"
+        );
+        if (request.action.value.offset >= state.length) {
+          throw agentError(DevicePeerFailureCode.INVALID_REQUEST, false);
+        }
+        this.#refreshRemoteDesktopClipboardTransfer(state);
+        return remoteDesktopClipboardContentResult({
+          data: state.data.slice(
+            request.action.value.offset,
+            request.action.value.offset + REMOTE_DESKTOP_CLIPBOARD_CHUNK_CHARACTERS
+          )
+        });
+      }
+      case "write": {
+        const state = this.#requireRemoteDesktopClipboardTransfer(
+          controllerDeviceId,
+          request,
+          request.action.value.transferId,
+          "paste"
+        );
+        if (request.action.value.offset !== state.data.length
+          || state.data.length + request.action.value.data.length > state.length) {
+          throw agentError(DevicePeerFailureCode.INVALID_REQUEST, false);
+        }
+        state.data += request.action.value.data;
+        this.#refreshRemoteDesktopClipboardTransfer(state);
+        return remoteDesktopClipboardContentResult({});
+      }
+      case "commit": {
+        const state = this.#requireRemoteDesktopClipboardTransfer(
+          controllerDeviceId,
+          request,
+          request.action.value.transferId,
+          "paste"
+        );
+        // Consume before the external clipboard/paste side effect. A repeated
+        // or outcome-unknown commit can never paste the same transfer twice.
+        this.#resetRemoteDesktopClipboardTransfer();
+        if (state.data.length !== state.length) {
+          throw agentError(DevicePeerFailureCode.INVALID_REQUEST, false);
+        }
+        let content: RemoteDesktopClipboardContent;
+        try {
+          content = parseRemoteDesktopClipboardContentJson(state.data);
+        } catch (error) {
+          throw new DevicePeerRemoteDesktopHostError(
+            error instanceof Error && error.message === "REMOTE_DESKTOP_CLIPBOARD_TOO_LARGE"
+              ? RemoteDesktopFailureReason.CLIPBOARD_TOO_LARGE
+              : RemoteDesktopFailureReason.CLIPBOARD_UNSUPPORTED,
+            false
+          );
+        }
+        await this.#requireRemoteDesktop().pasteClipboardContent({ ...common, content });
+        return remoteDesktopClipboardContentResult({});
+      }
+      case "cancel":
+        this.#requireRemoteDesktopClipboardTransfer(
+          controllerDeviceId,
+          request,
+          request.action.value.transferId
+        );
+        this.#resetRemoteDesktopClipboardTransfer();
+        return remoteDesktopClipboardContentResult({});
+      case undefined:
+        throw agentError(DevicePeerFailureCode.INVALID_REQUEST, false);
+    }
+  }
+
+  async #withRemoteDesktopClipboard<T>(operation: () => Promise<T>): Promise<T> {
+    if (this.#remoteDesktopClipboardBusy) {
+      throw new DevicePeerRemoteDesktopHostError(RemoteDesktopFailureReason.CLIPBOARD_BUSY, true);
+    }
+    this.#remoteDesktopClipboardBusy = true;
+    try {
+      return await operation();
+    } finally {
+      this.#remoteDesktopClipboardBusy = false;
+    }
+  }
+
+  #createRemoteDesktopClipboardTransfer(input: Omit<
+    RemoteDesktopClipboardTransferState,
+    "transferId" | "expiresAt" | "timer"
+  >): RemoteDesktopClipboardTransferState {
+    const state: RemoteDesktopClipboardTransferState = {
+      ...input,
+      transferId: randomUUID(),
+      expiresAt: Date.now() + REMOTE_DESKTOP_CLIPBOARD_TRANSFER_IDLE_MS,
+      timer: setTimeout(() => undefined, REMOTE_DESKTOP_CLIPBOARD_TRANSFER_IDLE_MS)
+    };
+    clearTimeout(state.timer);
+    state.timer = this.#remoteDesktopClipboardTimer(state);
+    this.#remoteDesktopClipboardTransfer = state;
+    return state;
+  }
+
+  #requireRemoteDesktopClipboardTransfer(
+    controllerDeviceId: string,
+    request: RemoteDesktopClipboardContentRequest,
+    transferId: string,
+    direction?: "copy" | "paste"
+  ): RemoteDesktopClipboardTransferState {
+    const state = this.#remoteDesktopClipboardTransfer;
+    if (state !== undefined && state.expiresAt <= Date.now()) this.#resetRemoteDesktopClipboardTransfer();
+    if (state === undefined
+      || this.#remoteDesktopClipboardTransfer !== state
+      || state.transferId !== transferId
+      || state.controllerDeviceId !== controllerDeviceId
+      || state.leaseId !== request.leaseId
+      || state.controlGeneration !== request.controlGeneration
+      || direction !== undefined && state.direction !== direction) {
+      throw new DevicePeerRemoteDesktopHostError(RemoteDesktopFailureReason.CLIPBOARD_EXPIRED, false);
+    }
+    return state;
+  }
+
+  #refreshRemoteDesktopClipboardTransfer(state: RemoteDesktopClipboardTransferState): void {
+    if (this.#remoteDesktopClipboardTransfer !== state) return;
+    clearTimeout(state.timer);
+    state.expiresAt = Date.now() + REMOTE_DESKTOP_CLIPBOARD_TRANSFER_IDLE_MS;
+    state.timer = this.#remoteDesktopClipboardTimer(state);
+  }
+
+  #remoteDesktopClipboardTimer(state: RemoteDesktopClipboardTransferState): ReturnType<typeof setTimeout> {
+    const timer = setTimeout(() => {
+      if (this.#remoteDesktopClipboardTransfer === state) this.#resetRemoteDesktopClipboardTransfer();
+    }, REMOTE_DESKTOP_CLIPBOARD_TRANSFER_IDLE_MS);
+    timer.unref?.();
+    return timer;
+  }
+
+  #resetRemoteDesktopClipboardTransferForLease(leaseId: string): void {
+    if (this.#remoteDesktopClipboardTransfer?.leaseId === leaseId) {
+      this.#resetRemoteDesktopClipboardTransfer();
+    }
+  }
+
+  #resetRemoteDesktopClipboardTransferForChangedControl(leaseId: string, controlGeneration: bigint): void {
+    const state = this.#remoteDesktopClipboardTransfer;
+    if (state?.leaseId === leaseId && state.controlGeneration !== controlGeneration) {
+      this.#resetRemoteDesktopClipboardTransfer();
+    }
+  }
+
+  #resetRemoteDesktopClipboardTransfer(): void {
+    if (this.#remoteDesktopClipboardTransfer !== undefined) {
+      clearTimeout(this.#remoteDesktopClipboardTransfer.timer);
+      this.#remoteDesktopClipboardTransfer = undefined;
     }
   }
 
@@ -1263,6 +1534,18 @@ interface TerminalExit {
   readonly signal?: number;
 }
 
+interface RemoteDesktopClipboardTransferState {
+  readonly transferId: string;
+  readonly controllerDeviceId: string;
+  readonly leaseId: string;
+  readonly controlGeneration: bigint;
+  readonly direction: "copy" | "paste";
+  readonly length: number;
+  data: string;
+  expiresAt: number;
+  timer: ReturnType<typeof setTimeout>;
+}
+
 function commandSpecification(
   command: DevicePeerCommand,
   terminalAvailable: boolean,
@@ -1306,7 +1589,9 @@ function commandSpecification(
     sendRemoteDesktopInput: effect(DevicePeerCapabilityKind.REMOTE_DESKTOP),
     createRemoteDesktopOffer: effect(DevicePeerCapabilityKind.REMOTE_DESKTOP),
     exchangeRemoteDesktopIce: effect(DevicePeerCapabilityKind.REMOTE_DESKTOP),
-    getRemoteDesktopFrame: readOnly(DevicePeerCapabilityKind.REMOTE_DESKTOP)
+    getRemoteDesktopFrame: readOnly(DevicePeerCapabilityKind.REMOTE_DESKTOP),
+    transferRemoteDesktopClipboardText: effect(DevicePeerCapabilityKind.REMOTE_DESKTOP),
+    transferRemoteDesktopClipboardContent: effect(DevicePeerCapabilityKind.REMOTE_DESKTOP)
   };
   const specification = command.action.case === undefined ? undefined : byAction[command.action.case];
   const unavailable = specification?.capability === DevicePeerCapabilityKind.TERMINAL && !terminalAvailable
@@ -1462,6 +1747,25 @@ function validateCommandInput(command: DevicePeerCommand): void {
         throw agentError(DevicePeerFailureCode.INVALID_REQUEST, false);
       }
       return;
+    case "transferRemoteDesktopClipboardText":
+      remoteDesktopControllerId(command.controllerDeviceId);
+      remoteDesktopLeaseId(command.action.value.leaseId);
+      remoteDesktopControlGeneration(command.action.value.controlGeneration);
+      switch (command.action.value.action.case) {
+        case "copy":
+          return;
+        case "paste":
+          validateRemoteDesktopClipboardText(command.action.value.action.value.text);
+          return;
+        case undefined:
+          throw agentError(DevicePeerFailureCode.INVALID_REQUEST, false);
+      }
+    case "transferRemoteDesktopClipboardContent":
+      remoteDesktopControllerId(command.controllerDeviceId);
+      remoteDesktopLeaseId(command.action.value.leaseId);
+      remoteDesktopControlGeneration(command.action.value.controlGeneration);
+      validateRemoteDesktopClipboardContentRequest(command.action.value);
+      return;
     default:
       throw agentError(DevicePeerFailureCode.INVALID_REQUEST, false);
   }
@@ -1481,6 +1785,15 @@ function mutationResult(): AgentPayload {
 
 function acknowledgement(): AgentPayload {
   return { case: "acknowledgement", value: create(DevicePeerAcknowledgementSchema) };
+}
+
+function remoteDesktopClipboardContentResult(
+  value: { readonly transferId?: string; readonly length?: number; readonly data?: string }
+): AgentPayload {
+  return {
+    case: "remoteDesktopClipboardContent",
+    value: create(RemoteDesktopClipboardContentResultSchema, value)
+  };
 }
 
 function remoteDesktopControllerId(value: string): void {
@@ -1516,6 +1829,74 @@ function remoteDesktopStartMode(value: RemoteDesktopStartMode): void {
 function remoteDesktopSequence(value: bigint): void {
   if (typeof value !== "bigint" || value < 1n || value > BigInt(Number.MAX_SAFE_INTEGER)) {
     throw agentError(DevicePeerFailureCode.INVALID_REQUEST, false);
+  }
+}
+
+function remoteDesktopControlGeneration(value: bigint): void {
+  if (typeof value !== "bigint" || value < 1n) {
+    throw agentError(DevicePeerFailureCode.INVALID_REQUEST, false);
+  }
+}
+
+function validateRemoteDesktopClipboardText(value: string): void {
+  if (!validRemoteDesktopClipboardText(value)) {
+    throw agentError(DevicePeerFailureCode.INVALID_REQUEST, false);
+  }
+}
+
+function validRemoteDesktopClipboardText(value: unknown): value is string {
+  return typeof value === "string"
+    && value.length >= 1
+    && value.length <= REMOTE_DESKTOP_MAX_CLIPBOARD_TEXT_CHARACTERS
+    && !value.includes("\u0000");
+}
+
+function validateRemoteDesktopClipboardContentRequest(value: RemoteDesktopClipboardContentRequest): void {
+  switch (value.action.case) {
+    case "copy":
+      return;
+    case "begin":
+      boundedInteger(
+        value.action.value.length,
+        1,
+        REMOTE_DESKTOP_CLIPBOARD_MAX_CHARACTERS,
+        "Remote Desktop clipboard length"
+      );
+      return;
+    case "read":
+      requireResourceId(value.action.value.transferId);
+      boundedInteger(
+        value.action.value.offset,
+        0,
+        REMOTE_DESKTOP_CLIPBOARD_MAX_CHARACTERS - 1,
+        "Remote Desktop clipboard offset"
+      );
+      return;
+    case "write":
+      requireResourceId(value.action.value.transferId);
+      boundedInteger(
+        value.action.value.offset,
+        0,
+        REMOTE_DESKTOP_CLIPBOARD_MAX_CHARACTERS - 1,
+        "Remote Desktop clipboard offset"
+      );
+      boundedText(
+        value.action.value.data,
+        1,
+        REMOTE_DESKTOP_CLIPBOARD_CHUNK_CHARACTERS,
+        "Remote Desktop clipboard chunk"
+      );
+      if (value.action.value.offset + value.action.value.data.length
+        > REMOTE_DESKTOP_CLIPBOARD_MAX_CHARACTERS) {
+        throw agentError(DevicePeerFailureCode.INVALID_REQUEST, false);
+      }
+      return;
+    case "commit":
+    case "cancel":
+      requireResourceId(value.action.value.transferId);
+      return;
+    case undefined:
+      throw agentError(DevicePeerFailureCode.INVALID_REQUEST, false);
   }
 }
 
@@ -1597,7 +1978,8 @@ function validateRemoteDesktopCapabilities(value: RemoteDesktopCapabilities): vo
     || !Array.isArray(value.displays) || value.displays.length > MAXIMUM_REMOTE_DESKTOP_DISPLAYS
     || typeof value.automaticReconnect !== "boolean" || typeof value.connectionTakeover !== "boolean"
     || typeof value.webrtcVideo !== "boolean" || typeof value.trickleIce !== "boolean"
-    || typeof value.jpegFallback !== "boolean" || value.permissions === undefined) {
+    || typeof value.jpegFallback !== "boolean" || typeof value.clipboardText !== "boolean"
+    || typeof value.clipboardContent !== "boolean" || value.permissions === undefined) {
     throw invalidRemoteDesktopHostResult();
   }
   if (value.enabled && value.displays.length === 0) throw invalidRemoteDesktopHostResult();
@@ -1628,12 +2010,16 @@ function validateRemoteDesktopDisplay(value: RemoteDesktopDisplay | undefined): 
 
 function validateRemoteDesktopLease(value: RemoteDesktopLease): void {
   if (!validRemoteDesktopIdentifier(value.leaseId, MAXIMUM_REMOTE_DESKTOP_LEASE_ID_CHARACTERS)
-    || typeof value.controlling !== "boolean") throw invalidRemoteDesktopHostResult();
+    || typeof value.controlling !== "boolean" || value.controlGeneration < 1n) {
+    throw invalidRemoteDesktopHostResult();
+  }
   validateRemoteDesktopDisplay(value.display);
 }
 
 function validateRemoteDesktopControlState(value: RemoteDesktopControlState): void {
-  if (typeof value.controlling !== "boolean") throw invalidRemoteDesktopHostResult();
+  if (typeof value.controlling !== "boolean" || value.controlGeneration < 1n) {
+    throw invalidRemoteDesktopHostResult();
+  }
 }
 
 function validateRemoteDesktopOffer(value: RemoteDesktopOfferResult, expectedAttemptId: string): void {
@@ -1688,7 +2074,13 @@ function validRemoteDesktopFailureReason(value: RemoteDesktopFailureReason): boo
     || value === RemoteDesktopFailureReason.VIDEO_TIMEOUT
     || value === RemoteDesktopFailureReason.AUTHORITY_CHANGED
     || value === RemoteDesktopFailureReason.UNSUPPORTED
-    || value === RemoteDesktopFailureReason.LOCKED_SESSION_UNSUPPORTED;
+    || value === RemoteDesktopFailureReason.LOCKED_SESSION_UNSUPPORTED
+    || value === RemoteDesktopFailureReason.CLIPBOARD_UNAVAILABLE
+    || value === RemoteDesktopFailureReason.CLIPBOARD_BUSY
+    || value === RemoteDesktopFailureReason.CLIPBOARD_EMPTY
+    || value === RemoteDesktopFailureReason.CLIPBOARD_TOO_LARGE
+    || value === RemoteDesktopFailureReason.CLIPBOARD_UNSUPPORTED
+    || value === RemoteDesktopFailureReason.CLIPBOARD_EXPIRED;
 }
 
 function remoteDesktopFailureCode(reason: RemoteDesktopFailureReason): DevicePeerFailureCode {
@@ -1697,15 +2089,19 @@ function remoteDesktopFailureCode(reason: RemoteDesktopFailureReason): DevicePee
     case RemoteDesktopFailureReason.VIEW_ONLY:
     case RemoteDesktopFailureReason.UNSUPPORTED:
     case RemoteDesktopFailureReason.LOCKED_SESSION_UNSUPPORTED:
+    case RemoteDesktopFailureReason.CLIPBOARD_UNAVAILABLE:
       return DevicePeerFailureCode.CAPABILITY_UNAVAILABLE;
     case RemoteDesktopFailureReason.BUSY:
     case RemoteDesktopFailureReason.INPUT_BUSY:
     case RemoteDesktopFailureReason.VIDEO_BUSY:
+    case RemoteDesktopFailureReason.CLIPBOARD_BUSY:
     case RemoteDesktopFailureReason.AUTHORITY_CHANGED:
       return DevicePeerFailureCode.CONFLICT;
     case RemoteDesktopFailureReason.STOPPED:
     case RemoteDesktopFailureReason.LEASE_EXPIRED:
     case RemoteDesktopFailureReason.DISPLAY_MISSING:
+    case RemoteDesktopFailureReason.CLIPBOARD_EMPTY:
+    case RemoteDesktopFailureReason.CLIPBOARD_EXPIRED:
       return DevicePeerFailureCode.NOT_FOUND;
     case RemoteDesktopFailureReason.SCREEN_PERMISSION_REQUIRED:
     case RemoteDesktopFailureReason.ACCESSIBILITY_PERMISSION_REQUIRED:
@@ -1715,6 +2111,9 @@ function remoteDesktopFailureCode(reason: RemoteDesktopFailureReason): DevicePee
       return DevicePeerFailureCode.UNAVAILABLE;
     case RemoteDesktopFailureReason.VIDEO_TIMEOUT:
       return DevicePeerFailureCode.TIMEOUT;
+    case RemoteDesktopFailureReason.CLIPBOARD_TOO_LARGE:
+    case RemoteDesktopFailureReason.CLIPBOARD_UNSUPPORTED:
+      return DevicePeerFailureCode.INVALID_REQUEST;
     case RemoteDesktopFailureReason.UNSPECIFIED:
       return DevicePeerFailureCode.INTERNAL;
   }

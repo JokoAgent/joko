@@ -3,6 +3,16 @@ import { ConnectError } from "@connectrpc/connect";
 import {
   RemoteDesktopFailureReason,
   RemoteDesktopFailureSchema,
+  RemoteDesktopClipboardContentBeginActionSchema,
+  RemoteDesktopClipboardContentCancelActionSchema,
+  RemoteDesktopClipboardContentCommitActionSchema,
+  RemoteDesktopClipboardContentCopyActionSchema,
+  RemoteDesktopClipboardContentReadActionSchema,
+  RemoteDesktopClipboardContentRequestSchema,
+  RemoteDesktopClipboardContentWriteActionSchema,
+  RemoteDesktopClipboardTextCopyActionSchema,
+  RemoteDesktopClipboardTextPasteActionSchema,
+  RemoteDesktopClipboardTextRequestSchema,
   RemoteDesktopInputEventSchema,
   RemoteDesktopKeyInputSchema,
   RemoteDesktopMouseButton,
@@ -15,6 +25,10 @@ import {
   RemoteDesktopTextInputSchema,
   type DevicePeerDescriptor,
   type RemoteDesktopCapabilities,
+  type RemoteDesktopClipboardContentRequest,
+  type RemoteDesktopClipboardContentResult,
+  type RemoteDesktopClipboardTextRequest,
+  type RemoteDesktopClipboardTextResult,
   type RemoteDesktopControlState,
   type RemoteDesktopFrameResult,
   type RemoteDesktopIceCandidate,
@@ -25,6 +39,15 @@ import {
   type RemoteDesktopOfferResult,
   type RemoteDesktopPermissions
 } from "@joko/contracts";
+import {
+  MOBILE_REMOTE_CLIPBOARD_CHUNK_CHARS,
+  MOBILE_REMOTE_CLIPBOARD_TRANSFER_CHARS,
+  MOBILE_REMOTE_CLIPBOARD_TRANSFER_MS,
+  MobileRemoteClipboardError,
+  parseMobileRemoteClipboardItem,
+  serializeMobileRemoteClipboardItem,
+  type MobileRemoteClipboardSystem
+} from "./mobile-remote-desktop-clipboard";
 
 export const MOBILE_REMOTE_DESKTOP_HEARTBEAT_MS = 3_000;
 export const MOBILE_REMOTE_DESKTOP_FRAME_MS = 250;
@@ -43,6 +66,10 @@ export type MobileRemoteDesktopNotice =
   | "accessibility-permission" | "input-busy" | "input-unavailable"
   | "busy" | "stopped" | "viewer-restarted" | "generic-error";
 
+export type MobileRemoteDesktopClipboardNotice =
+  | "copied" | "pasted" | "empty" | "unsupported" | "too-large"
+  | "unavailable" | "busy" | "failed";
+
 export interface MobileRemoteDesktopSnapshot {
   readonly status: MobileRemoteDesktopStatus;
   readonly hosts: readonly DevicePeerDescriptor[];
@@ -55,6 +82,9 @@ export interface MobileRemoteDesktopSnapshot {
   readonly media: "none" | "webrtc" | "jpeg";
   readonly hasFrame: boolean;
   readonly takeoverAvailable: boolean;
+  readonly clipboardAvailable: boolean;
+  readonly clipboardBusy: boolean;
+  readonly clipboardNotice?: MobileRemoteDesktopClipboardNotice;
   readonly notice?: MobileRemoteDesktopNotice;
 }
 
@@ -82,6 +112,10 @@ export interface MobileRemoteDesktopTransport {
     candidates: readonly RemoteDesktopIceCandidate[], after: number,
     signal?: AbortSignal): Promise<RemoteDesktopIceExchangeResult>;
   frame(host: DevicePeerDescriptor, leaseId: string, signal?: AbortSignal): Promise<RemoteDesktopFrameResult>;
+  clipboardText(host: DevicePeerDescriptor, request: RemoteDesktopClipboardTextRequest,
+    signal?: AbortSignal): Promise<RemoteDesktopClipboardTextResult>;
+  clipboardContent(host: DevicePeerDescriptor, request: RemoteDesktopClipboardContentRequest,
+    signal?: AbortSignal): Promise<RemoteDesktopClipboardContentResult>;
 }
 
 export class MobileRemoteDesktopAuthorityError extends Error {
@@ -89,6 +123,24 @@ export class MobileRemoteDesktopAuthorityError extends Error {
 }
 
 export type MobileRemoteDesktopViewerCommand = Readonly<Record<string, unknown>>;
+
+interface ClipboardOperation {
+  readonly sequence: number;
+  readonly request: AbortController;
+  readonly ownerSignal: AbortSignal;
+  deadline: number;
+  timeout?: ReturnType<typeof setTimeout>;
+  retired: boolean;
+  readonly retire: () => void;
+}
+
+interface ClipboardContext {
+  readonly operation: ClipboardOperation;
+  readonly host: DevicePeerDescriptor;
+  readonly lease: RemoteDesktopLease;
+  readonly generation: number;
+  readonly controlGeneration: bigint;
+}
 
 const initialSnapshot = (): MobileRemoteDesktopSnapshot => Object.freeze({
   status: "loading",
@@ -98,7 +150,9 @@ const initialSnapshot = (): MobileRemoteDesktopSnapshot => Object.freeze({
   inputMode: "touch",
   media: "none",
   hasFrame: false,
-  takeoverAvailable: false
+  takeoverAvailable: false,
+  clipboardAvailable: false,
+  clipboardBusy: false
 });
 
 const RETRY_MS = Object.freeze([1_000, 3_000, 8_000] as const);
@@ -149,11 +203,15 @@ export class MobileRemoteDesktopController {
   #heartbeatPending = false;
   #inputPending = false;
   #interactionRelease?: Promise<void>;
+  #controlGeneration = 0n;
+  #clipboardSequence = 0;
+  #clipboardOperation?: ClipboardOperation;
   #viewerSink: (message: MobileRemoteDesktopViewerCommand) => void = () => undefined;
 
   constructor(
     readonly transport: MobileRemoteDesktopTransport,
-    private readonly preferredDeviceId?: string
+    private readonly preferredDeviceId?: string,
+    private readonly clipboard?: MobileRemoteClipboardSystem
   ) {}
 
   get snapshot(): MobileRemoteDesktopSnapshot { return this.#snapshot; }
@@ -199,7 +257,8 @@ export class MobileRemoteDesktopController {
     this.#resumeEligible = false;
     this.#set({ ...this.#snapshot, host, capabilities: undefined, selectedDisplayId: undefined,
       status: "loading", controlling: false, wantedControl: false, media: "none",
-      takeoverAvailable: false, notice: undefined });
+      takeoverAvailable: false, clipboardAvailable: false, clipboardBusy: false,
+      clipboardNotice: undefined, notice: undefined });
     try {
       const capabilities = await this.transport.capabilities(host, this.#request.signal);
       if (!this.#ready(generation) || peerKey(this.#snapshot.host) !== peerKey(host)) return;
@@ -215,7 +274,9 @@ export class MobileRemoteDesktopController {
       }
       const first = capabilities.displays[0]!;
       this.#set({ ...this.#snapshot, capabilities, selectedDisplayId: first.displayId,
-        status: capabilities.displays.length > 1 ? "select-display" : "connecting", notice: undefined });
+        status: capabilities.displays.length > 1 ? "select-display" : "connecting",
+        clipboardAvailable: this.#clipboardAvailable(capabilities), clipboardNotice: undefined,
+        notice: undefined });
       if (capabilities.displays.length === 1) await this.#start(RemoteDesktopStartMode.NEW, generation);
     } catch (error) {
       if (this.#ready(generation)) this.#handleFailure(error, "capabilities");
@@ -279,6 +340,8 @@ export class MobileRemoteDesktopController {
     try {
       const state = await this.transport.control(host, lease.leaseId, enabled, this.#request.signal);
       if (!this.#ready(generation) || this.#lease?.leaseId !== lease.leaseId) return;
+      if (!validControlGeneration(state.controlGeneration)) throw new Error("Invalid Remote Desktop control generation.");
+      if (!this.#adoptControlGeneration(state.controlGeneration)) return;
       this.#set({ ...this.#snapshot, controlling: state.controlling,
         wantedControl: enabled && state.controlling, notice: undefined });
       this.#emit({ type: "control", enabled: state.controlling });
@@ -300,6 +363,9 @@ export class MobileRemoteDesktopController {
     if (!this.#snapshot.controlling) return;
     this.#emit({ type: "click", button });
   }
+
+  copyToPhone(): Promise<void> { return this.#transferClipboard("copy"); }
+  pasteFromPhone(): Promise<void> { return this.#transferClipboard("paste"); }
 
   setForeground(foreground: boolean): void {
     if (this.#foreground === foreground || this.#disposed) return;
@@ -439,11 +505,258 @@ export class MobileRemoteDesktopController {
     this.#viewerReady = false;
     this.#retireViewerEpoch();
     this.#lease = undefined;
+    this.#controlGeneration = 0n;
     this.#resumeEligible = false;
     if (host && lease && this.transport.canStop()) {
       await this.transport.stop(host, lease.leaseId).catch(() => undefined);
     }
     this.#listeners.clear();
+  }
+
+  async #transferClipboard(action: "copy" | "paste"): Promise<void> {
+    const context = this.#beginClipboardOperation();
+    if (!context) return;
+    let transferId: string | undefined;
+    let completionNotice: MobileRemoteDesktopClipboardNotice | undefined;
+    try {
+      this.#emit({ type: "releaseInput" });
+      const capabilities = this.#snapshot.capabilities;
+      if (capabilities?.clipboardContent && this.clipboard?.richAvailable) {
+        if (action === "copy") {
+          const started = await this.transport.clipboardContent(context.host,
+            create(RemoteDesktopClipboardContentRequestSchema, {
+              leaseId: context.lease.leaseId,
+              controlGeneration: context.controlGeneration,
+              action: { case: "copy", value: create(RemoteDesktopClipboardContentCopyActionSchema, {}) }
+            }), context.operation.request.signal);
+          this.#markClipboardProgress(context);
+          transferId = validTransferId(started.transferId) ? started.transferId : undefined;
+          const length = started.length;
+          if (!transferId || length === undefined || !Number.isSafeInteger(length)
+            || length < 1 || length > MOBILE_REMOTE_CLIPBOARD_TRANSFER_CHARS) {
+            throw new MobileRemoteClipboardError(length !== undefined
+              && length > MOBILE_REMOTE_CLIPBOARD_TRANSFER_CHARS ? "too-long" : "unsupported");
+          }
+          let json = "";
+          while (json.length < length) {
+            this.#assertClipboardCurrent(context);
+            const chunk = await this.transport.clipboardContent(context.host,
+              create(RemoteDesktopClipboardContentRequestSchema, {
+                leaseId: context.lease.leaseId,
+                controlGeneration: context.controlGeneration,
+                action: { case: "read", value: create(RemoteDesktopClipboardContentReadActionSchema, {
+                  transferId, offset: json.length
+                }) }
+              }), context.operation.request.signal);
+            this.#markClipboardProgress(context);
+            if (typeof chunk.data !== "string" || chunk.data.length < 1
+              || chunk.data.length > MOBILE_REMOTE_CLIPBOARD_CHUNK_CHARS
+              || json.length + chunk.data.length > length) {
+              throw new MobileRemoteClipboardError("unsupported");
+            }
+            json += chunk.data;
+          }
+          const item = parseMobileRemoteClipboardItem(json);
+          await this.clipboard.writePortable(item, () => this.#markClipboardProgress(context));
+        } else {
+          const item = await this.clipboard.readPortable(() => this.#markClipboardProgress(context));
+          const json = serializeMobileRemoteClipboardItem(item);
+          const started = await this.transport.clipboardContent(context.host,
+            create(RemoteDesktopClipboardContentRequestSchema, {
+              leaseId: context.lease.leaseId,
+              controlGeneration: context.controlGeneration,
+              action: { case: "begin", value: create(RemoteDesktopClipboardContentBeginActionSchema, {
+                length: json.length
+              }) }
+            }), context.operation.request.signal);
+          this.#markClipboardProgress(context);
+          transferId = validTransferId(started.transferId) ? started.transferId : undefined;
+          if (!transferId) throw new MobileRemoteClipboardError("unsupported");
+          for (let offset = 0; offset < json.length; offset += MOBILE_REMOTE_CLIPBOARD_CHUNK_CHARS) {
+            this.#assertClipboardCurrent(context);
+            await this.transport.clipboardContent(context.host,
+              create(RemoteDesktopClipboardContentRequestSchema, {
+                leaseId: context.lease.leaseId,
+                controlGeneration: context.controlGeneration,
+                action: { case: "write", value: create(RemoteDesktopClipboardContentWriteActionSchema, {
+                  transferId, offset, data: json.slice(offset, offset + MOBILE_REMOTE_CLIPBOARD_CHUNK_CHARS)
+                }) }
+              }), context.operation.request.signal);
+            this.#markClipboardProgress(context);
+          }
+          this.#assertClipboardCurrent(context);
+          // Commit atomically consumes the staged item before the host injects
+          // paste. An unknown response is never replayed automatically.
+          await this.transport.clipboardContent(context.host,
+            create(RemoteDesktopClipboardContentRequestSchema, {
+              leaseId: context.lease.leaseId,
+              controlGeneration: context.controlGeneration,
+              action: { case: "commit", value: create(RemoteDesktopClipboardContentCommitActionSchema, {
+                transferId
+              }) }
+            }), context.operation.request.signal);
+          this.#markClipboardProgress(context);
+        }
+      } else if (capabilities?.clipboardText && this.clipboard) {
+        if (action === "copy") {
+          const result = await this.transport.clipboardText(context.host,
+            create(RemoteDesktopClipboardTextRequestSchema, {
+              leaseId: context.lease.leaseId,
+              controlGeneration: context.controlGeneration,
+              action: { case: "copy", value: create(RemoteDesktopClipboardTextCopyActionSchema, {}) }
+            }), context.operation.request.signal);
+          this.#markClipboardProgress(context);
+          if (result.text === undefined) throw new MobileRemoteClipboardError("empty");
+          await this.clipboard.writeLegacyText(result.text, () => this.#markClipboardProgress(context));
+        } else {
+          const text = await this.clipboard.readLegacyText(() => this.#markClipboardProgress(context));
+          await this.transport.clipboardText(context.host,
+            create(RemoteDesktopClipboardTextRequestSchema, {
+              leaseId: context.lease.leaseId,
+              controlGeneration: context.controlGeneration,
+              action: { case: "paste", value: create(RemoteDesktopClipboardTextPasteActionSchema, { text }) }
+            }), context.operation.request.signal);
+          this.#markClipboardProgress(context);
+        }
+      } else {
+        throw new MobileRemoteClipboardError("unavailable");
+      }
+      completionNotice = action === "copy" ? "copied" : "pasted";
+    } catch (error) {
+      if (this.#clipboardOperation === context.operation && !context.operation.retired) {
+        this.#handleClipboardFailure(error);
+        completionNotice = this.#snapshot.clipboardNotice ?? "failed";
+      }
+    } finally {
+      if (transferId && this.#clipboardLeaseCurrent(context)) {
+        void this.transport.clipboardContent(context.host,
+          create(RemoteDesktopClipboardContentRequestSchema, {
+            leaseId: context.lease.leaseId,
+            controlGeneration: context.controlGeneration,
+            action: { case: "cancel", value: create(RemoteDesktopClipboardContentCancelActionSchema, {
+              transferId
+            }) }
+          }), this.#request.signal).catch(() => undefined);
+      }
+      this.#settleClipboardOperation(context.operation, completionNotice);
+    }
+  }
+
+  #beginClipboardOperation(): ClipboardContext | undefined {
+    const host = this.#snapshot.host;
+    const lease = this.#lease;
+    if (this.#clipboardOperation) {
+      this.#set({ ...this.#snapshot, clipboardNotice: "busy" });
+      return undefined;
+    }
+    if (!this.clipboard || !host || !lease
+      || !this.#snapshot.clipboardAvailable || !this.#snapshot.controlling
+      || !validControlGeneration(this.#controlGeneration) || !this.#interactive
+      || !this.#ready(this.#generation)) return undefined;
+    const request = new AbortController();
+    const ownerSignal = this.#request.signal;
+    const retire = () => request.abort();
+    ownerSignal.addEventListener("abort", retire, { once: true });
+    const sequence = ++this.#clipboardSequence;
+    const operation = {
+      sequence,
+      request,
+      ownerSignal,
+      deadline: 0,
+      retired: false,
+      retire
+    };
+    this.#clipboardOperation = operation;
+    this.#refreshClipboardIdle(operation);
+    this.#set({ ...this.#snapshot, clipboardBusy: true, clipboardNotice: undefined });
+    return Object.freeze({ operation, host, lease, generation: this.#generation,
+      controlGeneration: this.#controlGeneration });
+  }
+
+  #assertClipboardCurrent(context: ClipboardContext): void {
+    if (!this.#clipboardContextCurrent(context)) throw new MobileRemoteClipboardError("retired");
+  }
+
+  #markClipboardProgress(context: ClipboardContext): void {
+    this.#assertClipboardCurrent(context);
+    this.#refreshClipboardIdle(context.operation);
+  }
+
+  #refreshClipboardIdle(operation: ClipboardOperation): void {
+    if (this.#clipboardOperation !== operation) return;
+    if (operation.timeout !== undefined) clearTimeout(operation.timeout);
+    operation.deadline = Date.now() + MOBILE_REMOTE_CLIPBOARD_TRANSFER_MS;
+    operation.timeout = setTimeout(() => {
+      if (this.#clipboardOperation !== operation || Date.now() < operation.deadline) return;
+      operation.timeout = undefined;
+      operation.retired = true;
+      operation.request.abort();
+      this.#set({ ...this.#snapshot, clipboardBusy: false, clipboardNotice: "failed" });
+    }, MOBILE_REMOTE_CLIPBOARD_TRANSFER_MS);
+  }
+
+  #clipboardContextCurrent(context: ClipboardContext): boolean {
+    return this.#clipboardOperation === context.operation && this.#clipboardLeaseCurrent(context);
+  }
+
+  #clipboardLeaseCurrent(context: ClipboardContext): boolean {
+    return !context.operation.request.signal.aborted && Date.now() <= context.operation.deadline
+      && this.#interactive && this.#ready(context.generation) && this.#lease?.leaseId === context.lease.leaseId
+      && peerKey(this.#snapshot.host) === peerKey(context.host) && this.#snapshot.controlling
+      && this.#controlGeneration === context.controlGeneration;
+  }
+
+  #settleClipboardOperation(
+    operation: ClipboardOperation,
+    notice: MobileRemoteDesktopClipboardNotice | undefined
+  ): void {
+    if (this.#clipboardOperation !== operation) return;
+    if (operation.timeout !== undefined) clearTimeout(operation.timeout);
+    operation.ownerSignal.removeEventListener("abort", operation.retire);
+    this.#clipboardOperation = undefined;
+    if (!operation.retired) {
+      this.#set({ ...this.#snapshot, clipboardBusy: false, clipboardNotice: notice ?? "failed" });
+    }
+  }
+
+  #retireClipboardOperation(clearNotice = true): void {
+    const operation = this.#clipboardOperation;
+    if (!operation) return;
+    if (operation.timeout !== undefined) clearTimeout(operation.timeout);
+    operation.timeout = undefined;
+    operation.retired = true;
+    operation.request.abort();
+    this.#set({ ...this.#snapshot, clipboardBusy: false,
+      ...(clearNotice ? { clipboardNotice: undefined } : {}) });
+  }
+
+  #handleClipboardFailure(error: unknown): void {
+    if (error instanceof MobileRemoteClipboardError) {
+      const notice: MobileRemoteDesktopClipboardNotice = error.code === "empty" ? "empty"
+        : error.code === "unsupported" ? "unsupported"
+        : error.code === "too-long" ? "too-large"
+        : error.code === "unavailable" ? "unavailable" : "failed";
+      this.#set({ ...this.#snapshot, clipboardNotice: notice });
+      return;
+    }
+    const failure = remoteDesktopFailure(error);
+    if (failure?.reason === RemoteDesktopFailureReason.CLIPBOARD_EMPTY) {
+      this.#set({ ...this.#snapshot, clipboardNotice: "empty" });
+    } else if (failure?.reason === RemoteDesktopFailureReason.CLIPBOARD_TOO_LARGE) {
+      this.#set({ ...this.#snapshot, clipboardNotice: "too-large" });
+    } else if (failure?.reason === RemoteDesktopFailureReason.CLIPBOARD_UNSUPPORTED) {
+      this.#set({ ...this.#snapshot, clipboardNotice: "unsupported" });
+    } else if (failure?.reason === RemoteDesktopFailureReason.CLIPBOARD_UNAVAILABLE) {
+      this.#set({ ...this.#snapshot, clipboardNotice: "unavailable" });
+    } else if (failure?.reason === RemoteDesktopFailureReason.CLIPBOARD_BUSY) {
+      this.#set({ ...this.#snapshot, clipboardNotice: "busy" });
+    } else if (failure?.reason === RemoteDesktopFailureReason.AUTHORITY_CHANGED
+      || failure?.reason === RemoteDesktopFailureReason.LEASE_EXPIRED
+      || failure?.reason === RemoteDesktopFailureReason.STOPPED) {
+      this.#handleFailure(error, "clipboard");
+    } else {
+      this.#set({ ...this.#snapshot, clipboardNotice: "failed" });
+    }
   }
 
   async #start(
@@ -461,7 +774,12 @@ export class MobileRemoteDesktopController {
         if (this.transport.canStop()) void this.transport.stop(host, lease.leaseId).catch(() => undefined);
         return;
       }
+      if (!validControlGeneration(lease.controlGeneration)) {
+        if (this.transport.canStop()) void this.transport.stop(host, lease.leaseId).catch(() => undefined);
+        throw new Error("Invalid Remote Desktop control generation.");
+      }
       this.#lease = lease;
+      this.#controlGeneration = lease.controlGeneration;
       this.#resumeEligible = true;
       this.#retryIndex = 0;
       this.#set({ ...this.#snapshot, status: "live", controlling: lease.controlling,
@@ -495,6 +813,8 @@ export class MobileRemoteDesktopController {
     try {
       const state = await this.transport.heartbeat(host, lease.leaseId, this.#request.signal);
       if (!this.#ready(generation) || this.#lease?.leaseId !== lease.leaseId) return;
+      if (!validControlGeneration(state.controlGeneration)) throw new Error("Invalid Remote Desktop control generation.");
+      if (!this.#adoptControlGeneration(state.controlGeneration)) return;
       if (state.controlling !== this.#snapshot.controlling) {
         this.#set({ ...this.#snapshot, controlling: state.controlling,
           wantedControl: state.controlling && this.#snapshot.wantedControl });
@@ -648,7 +968,7 @@ export class MobileRemoteDesktopController {
   }
 
   #handleFailure(error: unknown, operation: "catalog" | "capabilities" | "permissions" | "start"
-    | "heartbeat" | "control" | "input" | "frame"): void {
+    | "heartbeat" | "control" | "input" | "frame" | "clipboard"): void {
     if (error instanceof MobileRemoteDesktopAuthorityError) {
       this.authorityChanged();
       return;
@@ -721,6 +1041,8 @@ export class MobileRemoteDesktopController {
   }
 
   #releaseControl(notice?: MobileRemoteDesktopNotice): void {
+    this.#retireClipboardOperation();
+    this.#controlGeneration = 0n;
     this.#set({ ...this.#snapshot, controlling: false, wantedControl: false, ...(notice ? { notice } : {}) });
     this.#emit({ type: "control", enabled: false });
     this.#emit({ type: "releaseInput" });
@@ -760,6 +1082,7 @@ export class MobileRemoteDesktopController {
     this.#retireRequest();
     this.#stopTimers();
     this.#lease = undefined;
+    this.#controlGeneration = 0n;
     this.#resumeEligible = !stop && lease !== undefined;
     this.#emit({ type: "control", enabled: false });
     this.#emit({ type: "releaseInput" });
@@ -776,6 +1099,7 @@ export class MobileRemoteDesktopController {
     this.#generation += 1;
     this.#stopTimers();
     this.#lease = undefined;
+    this.#controlGeneration = 0n;
     this.#resumeEligible = false;
     this.#emit({ type: "control", enabled: false });
     this.#emit({ type: "releaseInput" });
@@ -791,7 +1115,10 @@ export class MobileRemoteDesktopController {
     return this.#generation;
   }
 
-  #retireRequest(): void { this.#request.abort(); }
+  #retireRequest(): void {
+    this.#retireClipboardOperation();
+    this.#request.abort();
+  }
 
   #beginViewerOccurrence(): void {
     this.#viewerOccurrence += 1;
@@ -845,6 +1172,8 @@ export class MobileRemoteDesktopController {
       try {
         const state = await this.transport.control(host, lease.leaseId, false, this.#request.signal);
         if (!this.#ready(generation) || this.#lease?.leaseId !== lease.leaseId) return;
+        if (!validControlGeneration(state.controlGeneration)) throw new Error("Invalid Remote Desktop control generation.");
+        if (!this.#adoptControlGeneration(state.controlGeneration)) return;
         this.#set({ ...this.#snapshot, controlling: state.controlling,
           wantedControl: false, notice: state.controlling ? "input-unavailable" : this.#snapshot.notice });
       } catch (controlError) {
@@ -864,6 +1193,22 @@ export class MobileRemoteDesktopController {
   #ready(generation: number): boolean {
     return !this.#disposed && this.#foreground && this.#online && !this.#request.signal.aborted
       && generation === this.#generation && this.transport.isCurrent();
+  }
+
+  #adoptControlGeneration(value: bigint): boolean {
+    // Heartbeat and control calls can complete out of order. Never let a stale
+    // response reopen an older control authority for a later clipboard call.
+    if (this.#controlGeneration !== 0n && value < this.#controlGeneration) return false;
+    if (this.#controlGeneration !== 0n && value > this.#controlGeneration) {
+      this.#retireClipboardOperation();
+    }
+    this.#controlGeneration = value;
+    return true;
+  }
+
+  #clipboardAvailable(capabilities: RemoteDesktopCapabilities): boolean {
+    return this.clipboard !== undefined && (capabilities.clipboardText
+      || (capabilities.clipboardContent && this.clipboard.richAvailable));
   }
 
   #stopTimers(): void {
@@ -1040,6 +1385,15 @@ function peerKey(host: DevicePeerDescriptor | undefined): string | undefined {
     route.targetDeviceRevision?.value.toString(), route.targetDeviceRevision?.etag,
     route.relationRevision?.value.toString(), route.relationRevision?.etag,
     route.routeGeneration.toString()]) : undefined;
+}
+
+function validControlGeneration(value: bigint): boolean {
+  return value >= 1n && value <= 18_446_744_073_709_551_615n;
+}
+
+function validTransferId(value: string | undefined): value is string {
+  return typeof value === "string"
+    && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u.test(value);
 }
 
 function encodeBase64(bytes: Uint8Array): string {

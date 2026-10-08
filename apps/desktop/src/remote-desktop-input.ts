@@ -212,6 +212,91 @@ export async function readDesktopRemoteDesktopInputPermission(
   }
 }
 
+/** Reads only the native clipboard change counter; clipboard content never enters helper output. */
+export async function readDesktopRemoteDesktopClipboardVersion(
+  portable: boolean,
+  signal: AbortSignal,
+  resolveBinary: (prepare?: boolean) => Promise<string> = resolveDesktopRemoteDesktopInputBinary
+): Promise<string> {
+  if (process.platform !== "darwin" && process.platform !== "win32") {
+    throw new Error("REMOTE_DESKTOP_CLIPBOARD_UNAVAILABLE");
+  }
+  throwIfAborted(signal);
+  try {
+    const binary = await resolveBinary();
+    throwIfAborted(signal);
+    const { stdout } = await exec(binary, [
+      portable && process.platform === "darwin"
+        ? "--clipboard-content-version"
+        : "--clipboard-version"
+    ], {
+      timeout: 2_000,
+      maxBuffer: 128,
+      windowsHide: true,
+      signal
+    });
+    throwIfAborted(signal);
+    const version = stdout.trim();
+    if (!/^[0-9]+$/u.test(version)) throw new Error("invalid");
+    return version;
+  } catch (error) {
+    if (signal.aborted) {
+      throw signal.reason ?? new Error("Remote Desktop clipboard request was aborted.");
+    }
+    if (portable && process.platform === "darwin"
+      && typeof error === "object" && error !== null && "code" in error
+      && error.code === 3) {
+      throw new Error("REMOTE_DESKTOP_CLIPBOARD_UNSUPPORTED");
+    }
+    // Never preserve native stderr/stdout in a public error: some operating
+    // system failures can include clipboard metadata.
+    throw new Error("REMOTE_DESKTOP_CLIPBOARD_UNAVAILABLE");
+  }
+}
+
+/**
+ * Reads the focused accessibility selection. An empty string is a confirmed
+ * empty selection; every permission/protected/unsupported/error case throws.
+ */
+export async function readDesktopRemoteDesktopSelection(
+  portable: boolean,
+  signal: AbortSignal,
+  resolveBinary: (prepare?: boolean) => Promise<string> = resolveDesktopRemoteDesktopInputBinary
+): Promise<string> {
+  if (process.platform !== "darwin" && process.platform !== "win32") {
+    throw new Error("REMOTE_DESKTOP_CLIPBOARD_UNAVAILABLE");
+  }
+  throwIfAborted(signal);
+  try {
+    const binary = await resolveBinary();
+    throwIfAborted(signal);
+    const { stdout } = await exec(binary, [
+      portable ? "--clipboard-content-selection" : "--clipboard-selection"
+    ], {
+      timeout: 3_000,
+      maxBuffer: 128 * 1_024,
+      windowsHide: true,
+      signal
+    });
+    throwIfAborted(signal);
+    const value: unknown = JSON.parse(stdout);
+    if (typeof value !== "object" || value === null || Array.isArray(value)
+      || Object.keys(value).length !== 1 || !("text" in value)
+      || typeof value.text !== "string"
+      || value.text.length > 16_384) {
+      throw new Error("invalid");
+    }
+    return value.text;
+  } catch (error) {
+    if (signal.aborted) {
+      throw signal.reason ?? new Error("Remote Desktop clipboard request was aborted.");
+    }
+    // execFile and JSON errors may carry stdout. Always replace them so a
+    // selected value can never enter a diagnostic or log through the error.
+    throw new Error("REMOTE_DESKTOP_CLIPBOARD_COPY_FAILED");
+  }
+}
+
 let inputBuild: Promise<string> | undefined;
 
 export async function resolveDesktopRemoteDesktopInputBinary(prepare = true): Promise<string> {
@@ -242,6 +327,7 @@ export async function resolveDesktopRemoteDesktopInputBinary(prepare = true): Pr
     } else {
       for (const file of [
         join(sourceRoot, "windows-input", "src", "desktop.rs"),
+        join(sourceRoot, "windows-input", "src", "selection.rs"),
         join(sourceRoot, "windows-input", "Cargo.toml"),
         join(sourceRoot, "windows-input", "Cargo.lock")
       ]) digest.update(await readFile(file));

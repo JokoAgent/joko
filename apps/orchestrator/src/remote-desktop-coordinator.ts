@@ -27,6 +27,9 @@ const MAXIMUM_JPEG_BYTES = 180_000;
 const MAXIMUM_ICE_SERVERS = 8;
 const MAXIMUM_ICE_URLS = 8;
 const MAXIMUM_ICE_FIELD_LENGTH = 2_048;
+const MAXIMUM_CLIPBOARD_TEXT_CHARACTERS = 16_384;
+const CLIPBOARD_CHUNK_CHARACTERS = 64 * 1_024;
+const CLIPBOARD_MAX_CHARACTERS = 32 * 1_024 * 1_024;
 const ATTEMPT_ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/u;
 const SIMPLE_KEY_CODE_PATTERN = /^(?:Key[A-Z]|Digit[0-9]|F(?:[1-9]|1[0-2]))$/u;
 const NAMED_KEY_CODES = new Set([
@@ -82,6 +85,8 @@ interface RemoteDesktopLeaseState {
   readonly identity: DevicePeerSelectionIdentity;
   readonly cleanupAuthority: DevicePeerAuthority;
   connection: ConnectionRecord;
+  controlling: boolean;
+  controlGeneration: bigint;
   expiresAt: number;
   timer: ReturnType<typeof setTimeout>;
   routeSubscription?: { dispose(): void };
@@ -244,6 +249,8 @@ export class RemoteDesktopCoordinator {
         identity: Object.freeze({ ...identity }),
         cleanupAuthority,
         connection,
+        controlling: value.controlling,
+        controlGeneration: value.controlGeneration,
         expiresAt: this.#now() + REMOTE_DESKTOP_LEASE_MS,
         timer: setTimeout(() => undefined, REMOTE_DESKTOP_LEASE_MS)
       };
@@ -280,10 +287,11 @@ export class RemoteDesktopCoordinator {
         create(contract.DevicePeerHeartbeatRemoteDesktopActionSchema, { leaseId }),
         "side_effect"
       ), signal, "remoteDesktopControlState", "joko.v1.RemoteDesktopControlState"));
+    const current = this.#adoptControlState(state, value);
     state.expiresAt = this.#now() + REMOTE_DESKTOP_LEASE_MS;
     clearTimeout(state.timer);
     state.timer = this.#leaseTimer(state);
-    return value;
+    return current;
   }
 
   async stop(
@@ -312,12 +320,13 @@ export class RemoteDesktopCoordinator {
   ): Promise<contract.RemoteDesktopControlState> {
     const state = this.#requireLease(connection, identity, input.leaseId);
     const authority = this.#capture(connection, identity);
-    return this.#runLeaseBound(state, connection, identity, authority, () =>
+    const value = await this.#runLeaseBound(state, connection, identity, authority, () =>
       this.#dispatch<contract.RemoteDesktopControlState>(authority, remoteDesktopCommand(
         "setRemoteDesktopControl",
         create(contract.DevicePeerSetRemoteDesktopControlActionSchema, input),
         "side_effect"
       ), signal, "remoteDesktopControlState", "joko.v1.RemoteDesktopControlState"));
+    return this.#adoptControlState(state, value);
   }
 
   async sendInput(
@@ -441,6 +450,74 @@ export class RemoteDesktopCoordinator {
     return value;
   }
 
+  async transferClipboardText(
+    connection: ConnectionRecord,
+    identity: DevicePeerSelectionIdentity,
+    input: contract.RemoteDesktopClipboardTextRequest,
+    signal: AbortSignal
+  ): Promise<contract.RemoteDesktopClipboardTextResult> {
+    const state = this.#requireControlLease(
+      connection,
+      identity,
+      input.leaseId,
+      input.controlGeneration
+    );
+    validateClipboardTextRequest(input);
+    const authority = this.#capture(connection, identity);
+    const value = await this.#runControlBound(
+      state,
+      connection,
+      identity,
+      authority,
+      input.controlGeneration,
+      () => this.#dispatch<contract.RemoteDesktopClipboardTextResult>(authority, remoteDesktopCommand(
+        "transferRemoteDesktopClipboardText",
+        create(contract.RemoteDesktopClipboardTextRequestSchema, {
+          leaseId: input.leaseId,
+          controlGeneration: input.controlGeneration,
+          action: input.action
+        }),
+        "side_effect"
+      ), signal, "remoteDesktopClipboardText", "joko.v1.RemoteDesktopClipboardTextResult")
+    );
+    validateClipboardTextResult(input, value);
+    return value;
+  }
+
+  async transferClipboardContent(
+    connection: ConnectionRecord,
+    identity: DevicePeerSelectionIdentity,
+    input: contract.RemoteDesktopClipboardContentRequest,
+    signal: AbortSignal
+  ): Promise<contract.RemoteDesktopClipboardContentResult> {
+    const state = this.#requireControlLease(
+      connection,
+      identity,
+      input.leaseId,
+      input.controlGeneration
+    );
+    validateClipboardContentRequest(input);
+    const authority = this.#capture(connection, identity);
+    const value = await this.#runControlBound(
+      state,
+      connection,
+      identity,
+      authority,
+      input.controlGeneration,
+      () => this.#dispatch<contract.RemoteDesktopClipboardContentResult>(authority, remoteDesktopCommand(
+        "transferRemoteDesktopClipboardContent",
+        create(contract.RemoteDesktopClipboardContentRequestSchema, {
+          leaseId: input.leaseId,
+          controlGeneration: input.controlGeneration,
+          action: input.action
+        }),
+        "side_effect"
+      ), signal, "remoteDesktopClipboardContent", "joko.v1.RemoteDesktopClipboardContentResult")
+    );
+    validateClipboardContentResult(input, value);
+    return value;
+  }
+
   async close(): Promise<void> {
     if (this.#closed) return;
     this.#closed = true;
@@ -479,6 +556,23 @@ export class RemoteDesktopCoordinator {
       throw leaseFailure(contract.RemoteDesktopFailureReason.AUTHORITY_CHANGED, "aborted");
     }
     state.connection = connection;
+    return state;
+  }
+
+  #requireControlLease(
+    connection: ConnectionRecord,
+    identity: DevicePeerSelectionIdentity,
+    leaseId: string,
+    controlGeneration: bigint
+  ): RemoteDesktopLeaseState {
+    if (controlGeneration < 1n) {
+      throw invalidArgument("Remote Desktop control generation is required.");
+    }
+    const state = this.#requireLease(connection, identity, leaseId);
+    if (!state.controlling) throw leaseFailure(contract.RemoteDesktopFailureReason.VIEW_ONLY);
+    if (state.controlGeneration !== controlGeneration) {
+      throw leaseFailure(contract.RemoteDesktopFailureReason.CLIPBOARD_EXPIRED);
+    }
     return state;
   }
 
@@ -618,6 +712,39 @@ export class RemoteDesktopCoordinator {
     return value;
   }
 
+  async #runControlBound<T>(
+    state: RemoteDesktopLeaseState,
+    connection: ConnectionRecord,
+    identity: DevicePeerSelectionIdentity,
+    authority: DevicePeerAuthority,
+    controlGeneration: bigint,
+    operation: () => Promise<T>
+  ): Promise<T> {
+    const value = await this.#runLeaseBound(state, connection, identity, authority, operation);
+    if (!state.controlling || state.controlGeneration !== controlGeneration) {
+      throw leaseFailure(contract.RemoteDesktopFailureReason.CLIPBOARD_EXPIRED);
+    }
+    return value;
+  }
+
+  #adoptControlState(
+    state: RemoteDesktopLeaseState,
+    value: contract.RemoteDesktopControlState
+  ): contract.RemoteDesktopControlState {
+    validateControlState(value);
+    if (value.controlGeneration === state.controlGeneration && value.controlling !== state.controlling) {
+      throw invalidTargetResponse();
+    }
+    if (value.controlGeneration > state.controlGeneration) {
+      state.controlling = value.controlling;
+      state.controlGeneration = value.controlGeneration;
+    }
+    return create(contract.RemoteDesktopControlStateSchema, {
+      controlling: state.controlling,
+      controlGeneration: state.controlGeneration
+    });
+  }
+
   #revalidateLeaseCompletion(
     state: RemoteDesktopLeaseState,
     connection: ConnectionRecord,
@@ -706,7 +833,8 @@ type RemoteDesktopActionCase = Extract<
   contract.DevicePeerCommand["action"],
   { case: `getRemoteDesktop${string}` | `showRemoteDesktop${string}` | `startRemoteDesktop` | `heartbeatRemoteDesktop`
     | `stopRemoteDesktop` | `setRemoteDesktopControl` | `sendRemoteDesktopInput`
-    | `createRemoteDesktopOffer` | `exchangeRemoteDesktopIce` }
+    | `createRemoteDesktopOffer` | `exchangeRemoteDesktopIce`
+    | `transferRemoteDesktopClipboardText` | `transferRemoteDesktopClipboardContent` }
 >["case"];
 
 function remoteDesktopCommand<TCase extends RemoteDesktopActionCase>(
@@ -785,7 +913,10 @@ function genericTargetFailure(errorCode: string): RemoteDesktopCoordinatorError 
 
 function validateCapabilities(value: contract.RemoteDesktopCapabilities): void {
   if (value.protocolVersion !== 1 || !/^(?:darwin|linux|win32)$/u.test(value.platform)
-    || value.displays.length > MAXIMUM_DISPLAYS || value.permissions === undefined) throw invalidTargetResponse();
+    || value.displays.length > MAXIMUM_DISPLAYS || value.permissions === undefined
+    || typeof value.clipboardText !== "boolean" || typeof value.clipboardContent !== "boolean") {
+    throw invalidTargetResponse();
+  }
   for (const display of value.displays) validateDisplay(display);
   validatePermissions(value.permissions);
 }
@@ -804,8 +935,127 @@ function validatePermission(value: contract.RemoteDesktopPermissionStatus): void
 
 function validateLease(value: contract.RemoteDesktopLease): void {
   validateIdentifier(value.leaseId, "lease_id");
-  if (value.display === undefined) throw invalidTargetResponse();
+  if (value.display === undefined || value.controlGeneration < 1n) throw invalidTargetResponse();
   validateDisplay(value.display);
+}
+
+function validateControlState(value: contract.RemoteDesktopControlState): void {
+  if (typeof value.controlling !== "boolean" || value.controlGeneration < 1n) {
+    throw invalidTargetResponse();
+  }
+}
+
+function validateClipboardTextRequest(value: contract.RemoteDesktopClipboardTextRequest): void {
+  validateIdentifier(value.leaseId, "lease_id");
+  if (value.controlGeneration < 1n) throw invalidArgument("Remote Desktop control generation is required.");
+  switch (value.action.case) {
+    case "copy":
+      return;
+    case "paste":
+      validateClipboardText(value.action.value.text);
+      return;
+    case undefined:
+      throw invalidArgument("Remote Desktop clipboard text action is required.");
+  }
+}
+
+function validateClipboardTextResult(
+  request: contract.RemoteDesktopClipboardTextRequest,
+  value: contract.RemoteDesktopClipboardTextResult
+): void {
+  if (request.action.case === "copy") {
+    if (value.text === undefined) throw invalidTargetResponse();
+    try { validateClipboardText(value.text); }
+    catch { throw invalidTargetResponse(); }
+    return;
+  }
+  if (value.text !== undefined) throw invalidTargetResponse();
+}
+
+function validateClipboardText(value: string): void {
+  if (value.length < 1 || value.length > MAXIMUM_CLIPBOARD_TEXT_CHARACTERS || value.includes("\u0000")) {
+    throw invalidArgument("Remote Desktop clipboard text is invalid.");
+  }
+}
+
+function validateClipboardContentRequest(value: contract.RemoteDesktopClipboardContentRequest): void {
+  validateIdentifier(value.leaseId, "lease_id");
+  if (value.controlGeneration < 1n) throw invalidArgument("Remote Desktop control generation is required.");
+  switch (value.action.case) {
+    case "copy":
+      return;
+    case "begin":
+      if (!Number.isInteger(value.action.value.length)
+        || value.action.value.length < 1
+        || value.action.value.length > CLIPBOARD_MAX_CHARACTERS) {
+        throw invalidArgument("Remote Desktop clipboard length is invalid.");
+      }
+      return;
+    case "read":
+      validateIdentifier(value.action.value.transferId, "clipboard transfer_id");
+      validateClipboardOffset(value.action.value.offset);
+      return;
+    case "write":
+      validateIdentifier(value.action.value.transferId, "clipboard transfer_id");
+      validateClipboardOffset(value.action.value.offset);
+      if (value.action.value.data.length < 1
+        || value.action.value.data.length > CLIPBOARD_CHUNK_CHARACTERS
+        || value.action.value.data.includes("\u0000")
+        || value.action.value.offset + value.action.value.data.length > CLIPBOARD_MAX_CHARACTERS) {
+        throw invalidArgument("Remote Desktop clipboard chunk is invalid.");
+      }
+      return;
+    case "commit":
+    case "cancel":
+      validateIdentifier(value.action.value.transferId, "clipboard transfer_id");
+      return;
+    case undefined:
+      throw invalidArgument("Remote Desktop clipboard content action is required.");
+  }
+}
+
+function validateClipboardOffset(value: number): void {
+  if (!Number.isInteger(value) || value < 0 || value >= CLIPBOARD_MAX_CHARACTERS) {
+    throw invalidArgument("Remote Desktop clipboard offset is invalid.");
+  }
+}
+
+function validateClipboardContentResult(
+  request: contract.RemoteDesktopClipboardContentRequest,
+  value: contract.RemoteDesktopClipboardContentResult
+): void {
+  switch (request.action.case) {
+    case "copy":
+      if (value.transferId === undefined || value.length === undefined || value.data !== undefined
+        || value.length < 1 || value.length > CLIPBOARD_MAX_CHARACTERS) throw invalidTargetResponse();
+      validateTargetIdentifier(value.transferId);
+      return;
+    case "begin":
+      if (value.transferId === undefined || value.length !== undefined || value.data !== undefined) {
+        throw invalidTargetResponse();
+      }
+      validateTargetIdentifier(value.transferId);
+      return;
+    case "read":
+      if (value.transferId !== undefined || value.length !== undefined || value.data === undefined
+        || value.data.length < 1 || value.data.length > CLIPBOARD_CHUNK_CHARACTERS
+        || value.data.includes("\u0000")) throw invalidTargetResponse();
+      return;
+    case "write":
+    case "commit":
+    case "cancel":
+      if (value.transferId !== undefined || value.length !== undefined || value.data !== undefined) {
+        throw invalidTargetResponse();
+      }
+      return;
+    case undefined:
+      throw invalidTargetResponse();
+  }
+}
+
+function validateTargetIdentifier(value: string): void {
+  if (value.length < 1 || value.length > MAXIMUM_IDENTIFIER_LENGTH
+    || value.trim() !== value || hasControl(value)) throw invalidTargetResponse();
 }
 
 function validateDisplay(value: contract.RemoteDesktopDisplay): void {

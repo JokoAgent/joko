@@ -1,8 +1,14 @@
-import { RemoteDesktopFailureReason, RemoteDesktopStartMode } from "@joko/contracts";
+import {
+  RemoteDesktopClipboardContentSchema,
+  RemoteDesktopFailureReason,
+  RemoteDesktopStartMode
+} from "@joko/contracts";
+import { create } from "@bufbuild/protobuf";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   DesktopRemoteDesktopHost,
+  type DesktopRemoteDesktopClipboardPort,
   type DesktopRemoteDesktopHostDependencies,
   type DesktopRemoteDesktopInputPort,
   type DesktopRemoteDesktopMediaPort
@@ -71,6 +77,104 @@ describe("Desktop Remote Desktop host", () => {
     expect(value.host.state).toMatchObject({ leaseId: lease.leaseId, controlling: false });
     expect(value.media.stop).not.toHaveBeenCalled();
     expect(value.input.stop).toHaveBeenCalled();
+  });
+
+  it("advertises and executes explicit clipboard effects only for the exact control generation", async () => {
+    const value = fixture({ enabled: true, platform: "win32" });
+    hosts.push(value.host);
+    const capabilities = await value.host.getCapabilities(REQUEST);
+    expect(capabilities.clipboardText).toBe(true);
+    expect(capabilities.clipboardContent).toBe(true);
+    const lease = await value.host.start({
+      ...REQUEST,
+      displayId: "display-1",
+      mode: RemoteDesktopStartMode.NEW
+    });
+    const control = await value.host.setControl({
+      ...REQUEST,
+      leaseId: lease.leaseId,
+      enabled: true
+    });
+    expect(value.host.isControlCurrent({
+      ...REQUEST,
+      leaseId: lease.leaseId,
+      controlGeneration: control.controlGeneration
+    })).toBe(true);
+
+    await expect(value.host.copyClipboardText({
+      ...REQUEST,
+      leaseId: lease.leaseId,
+      controlGeneration: control.controlGeneration
+    })).resolves.toBe("selected text");
+    expect(value.clipboard.copyText).toHaveBeenCalledOnce();
+    const current = vi.mocked(value.clipboard.copyText).mock.calls[0]![0];
+    expect(current()).toBe(true);
+
+    await value.host.pasteClipboardContent({
+      ...REQUEST,
+      leaseId: lease.leaseId,
+      controlGeneration: control.controlGeneration,
+      content: create(RemoteDesktopClipboardContentSchema, {
+        text: "caption",
+        url: "https://example.test/"
+      })
+    });
+    expect(value.clipboard.pasteContent).toHaveBeenCalledWith(
+      { text: "caption", url: "https://example.test/" },
+      expect.any(Function),
+      REQUEST.signal
+    );
+
+    await expect(value.host.copyClipboardText({
+      ...REQUEST,
+      leaseId: lease.leaseId,
+      controlGeneration: lease.controlGeneration
+    })).rejects.toMatchObject({ reason: RemoteDesktopFailureReason.CLIPBOARD_EXPIRED });
+    expect(value.clipboard.copyText).toHaveBeenCalledOnce();
+
+    value.host.releaseControl();
+    expect(value.host.isControlCurrent({
+      ...REQUEST,
+      leaseId: lease.leaseId,
+      controlGeneration: control.controlGeneration
+    })).toBe(false);
+  });
+
+  it("rejects a clipboard completion after control changes", async () => {
+    const value = fixture({ enabled: true, platform: "darwin" });
+    hosts.push(value.host);
+    const lease = await value.host.start({
+      ...REQUEST,
+      displayId: "display-1",
+      mode: RemoteDesktopStartMode.NEW
+    });
+    const control = await value.host.setControl({
+      ...REQUEST,
+      leaseId: lease.leaseId,
+      enabled: true
+    });
+    let resolveCopy!: (text: string) => void;
+    vi.mocked(value.clipboard.copyText).mockImplementationOnce(() =>
+      new Promise((resolve) => { resolveCopy = resolve; }));
+    const pending = value.host.copyClipboardText({
+      ...REQUEST,
+      leaseId: lease.leaseId,
+      controlGeneration: control.controlGeneration
+    });
+    await vi.waitFor(() => expect(value.clipboard.copyText).toHaveBeenCalledOnce());
+    await value.host.setControl({
+      ...REQUEST,
+      leaseId: lease.leaseId,
+      enabled: false
+    });
+    resolveCopy("stale selected text");
+    await expect(pending).rejects.toMatchObject({
+      reason: RemoteDesktopFailureReason.CLIPBOARD_EXPIRED
+    });
+    await expect(value.host.heartbeat({
+      ...REQUEST,
+      leaseId: lease.leaseId
+    })).resolves.toMatchObject({ controlling: false });
   });
 
   it("rejects uint64 input outside JavaScript's exact integer range", async () => {
@@ -247,6 +351,22 @@ function fixture(options: {
     stop: vi.fn(),
     retire: vi.fn(async () => undefined)
   };
+  const clipboard: DesktopRemoteDesktopClipboardPort = {
+    copyText: vi.fn(async (current) => {
+      if (!current()) throw new Error("REMOTE_DESKTOP_CLIPBOARD_EXPIRED");
+      return "selected text";
+    }),
+    pasteText: vi.fn(async (_text, current) => {
+      if (!current()) throw new Error("REMOTE_DESKTOP_CLIPBOARD_EXPIRED");
+    }),
+    copyContent: vi.fn(async (current) => {
+      if (!current()) throw new Error("REMOTE_DESKTOP_CLIPBOARD_EXPIRED");
+      return { text: "selected text" };
+    }),
+    pasteContent: vi.fn(async (_content, current) => {
+      if (!current()) throw new Error("REMOTE_DESKTOP_CLIPBOARD_EXPIRED");
+    })
+  };
   let lease = 0;
   let sessionUnlocked = options.sessionUnlocked ?? true;
   let sessionListener: ((unlocked: boolean) => void) | undefined;
@@ -266,6 +386,7 @@ function fixture(options: {
     showPermissionGuide: vi.fn(async () => undefined),
     media,
     input,
+    ...(options.platform === "linux" ? {} : { clipboard }),
     changed: vi.fn(),
     onSessionStateChange: (listener) => {
       sessionListener = listener;
@@ -277,6 +398,7 @@ function fixture(options: {
     host,
     media,
     input,
+    clipboard,
     permissions,
     displays,
     setSessionUnlocked(unlocked: boolean): void {

@@ -447,6 +447,8 @@ message DevicePeerCommand {
     DevicePeerCreateRemoteDesktopOfferAction create_remote_desktop_offer = 58;
     DevicePeerExchangeRemoteDesktopIceAction exchange_remote_desktop_ice = 59;
     DevicePeerGetRemoteDesktopFrameAction get_remote_desktop_frame = 60;
+    RemoteDesktopClipboardTextRequest transfer_remote_desktop_clipboard_text = 61;
+    RemoteDesktopClipboardContentRequest transfer_remote_desktop_clipboard_content = 62;
   }
 }
 
@@ -623,6 +625,8 @@ message DevicePeerAgentResult {
     RemoteDesktopOfferResult remote_desktop_offer = 44;
     RemoteDesktopIceExchangeResult remote_desktop_ice = 45;
     RemoteDesktopFrameResult remote_desktop_frame = 46;
+    RemoteDesktopClipboardTextResult remote_desktop_clipboard_text = 47;
+    RemoteDesktopClipboardContentResult remote_desktop_clipboard_content = 48;
     DevicePeerFailure failure = 30;
   }
 }

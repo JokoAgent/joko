@@ -796,7 +796,9 @@ export class MobileClient {
       || !this.network.startRemoteDesktop || !this.network.heartbeatRemoteDesktop || !this.network.stopRemoteDesktop
       || !this.network.setRemoteDesktopControl || !this.network.sendRemoteDesktopInput
       || !this.network.getRemoteDesktopIceConfiguration || !this.network.createRemoteDesktopOffer
-      || !this.network.exchangeRemoteDesktopIce || !this.network.getRemoteDesktopFrame) return undefined;
+      || !this.network.exchangeRemoteDesktopIce || !this.network.getRemoteDesktopFrame
+      || !this.network.transferRemoteDesktopClipboardText
+      || !this.network.transferRemoteDesktopClipboardContent) return undefined;
     const authoritySame = (): boolean => !this.#disposed && this.#credential === credential
       && this.#remoteDesktopOwnerKey(false) === ownerKey;
     const current = (): boolean => authoritySame() && this.#foreground && this.#state.status === "connected";
@@ -837,7 +839,11 @@ export class MobileClient {
       ice: (host, leaseId, attemptId, candidates, after, signal) => checked(() =>
         this.network.exchangeRemoteDesktopIce!(credential, route(host), leaseId, attemptId, candidates, after, signal)),
       frame: (host, leaseId, signal) => checked(() =>
-        this.network.getRemoteDesktopFrame!(credential, route(host), leaseId, signal))
+        this.network.getRemoteDesktopFrame!(credential, route(host), leaseId, signal)),
+      clipboardText: (host, transferValue, signal) => checked(() =>
+        this.network.transferRemoteDesktopClipboardText!(credential, route(host), transferValue, signal)),
+      clipboardContent: (host, transferValue, signal) => checked(() =>
+        this.network.transferRemoteDesktopClipboardContent!(credential, route(host), transferValue, signal))
     };
   }
 

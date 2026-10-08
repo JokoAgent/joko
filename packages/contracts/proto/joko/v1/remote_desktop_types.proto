@@ -39,6 +39,8 @@ message RemoteDesktopCapabilities {
   bool webrtc_video = 9;
   bool trickle_ice = 10;
   bool jpeg_fallback = 11;
+  bool clipboard_text = 12;
+  bool clipboard_content = 13;
 }
 
 enum RemoteDesktopStartMode {
@@ -114,10 +116,89 @@ message RemoteDesktopLease {
   string lease_id = 1;
   RemoteDesktopDisplay display = 2;
   bool controlling = 3;
+  uint64 control_generation = 4;
 }
 
 message RemoteDesktopControlState {
   bool controlling = 1;
+  uint64 control_generation = 2;
+}
+
+// Legacy explicit text Copy/Paste remains a first-class route for controllers
+// without a native rich-clipboard module. Text is bounded to 16,384 UTF-16
+// code units by every boundary and is never synchronized automatically.
+message RemoteDesktopClipboardTextCopyAction {}
+
+message RemoteDesktopClipboardTextPasteAction {
+  string text = 1;
+}
+
+message RemoteDesktopClipboardTextRequest {
+  string lease_id = 1;
+  uint64 control_generation = 2;
+  oneof action {
+    RemoteDesktopClipboardTextCopyAction copy = 10;
+    RemoteDesktopClipboardTextPasteAction paste = 11;
+  }
+}
+
+message RemoteDesktopClipboardTextResult {
+  optional string text = 1;
+}
+
+// One portable clipboard item. The rich transfer serializes this exact shape
+// as JSON and chunks that JSON; no paths, private formats, external fetches,
+// or asset dereferences are representable. url is portable content only.
+message RemoteDesktopClipboardContent {
+  optional string text = 1;
+  optional string html = 2;
+  optional string rtf = 3;
+  optional string url = 4;
+  optional string png = 5;
+}
+
+message RemoteDesktopClipboardContentCopyAction {}
+
+message RemoteDesktopClipboardContentBeginAction {
+  uint32 length = 1;
+}
+
+message RemoteDesktopClipboardContentReadAction {
+  string transfer_id = 1;
+  uint32 offset = 2;
+}
+
+message RemoteDesktopClipboardContentWriteAction {
+  string transfer_id = 1;
+  uint32 offset = 2;
+  string data = 3;
+}
+
+message RemoteDesktopClipboardContentCommitAction {
+  string transfer_id = 1;
+}
+
+message RemoteDesktopClipboardContentCancelAction {
+  string transfer_id = 1;
+}
+
+message RemoteDesktopClipboardContentRequest {
+  string lease_id = 1;
+  uint64 control_generation = 2;
+  oneof action {
+    RemoteDesktopClipboardContentCopyAction copy = 10;
+    RemoteDesktopClipboardContentBeginAction begin = 11;
+    RemoteDesktopClipboardContentReadAction read = 12;
+    RemoteDesktopClipboardContentWriteAction write = 13;
+    RemoteDesktopClipboardContentCommitAction commit = 14;
+    RemoteDesktopClipboardContentCancelAction cancel = 15;
+  }
+}
+
+message RemoteDesktopClipboardContentResult {
+  optional string transfer_id = 1;
+  optional uint32 length = 2;
+  optional string data = 3;
 }
 
 message RemoteDesktopOfferResult {
@@ -160,6 +241,12 @@ enum RemoteDesktopFailureReason {
   REMOTE_DESKTOP_FAILURE_REASON_AUTHORITY_CHANGED = 14;
   REMOTE_DESKTOP_FAILURE_REASON_UNSUPPORTED = 15;
   REMOTE_DESKTOP_FAILURE_REASON_LOCKED_SESSION_UNSUPPORTED = 16;
+  REMOTE_DESKTOP_FAILURE_REASON_CLIPBOARD_UNAVAILABLE = 17;
+  REMOTE_DESKTOP_FAILURE_REASON_CLIPBOARD_BUSY = 18;
+  REMOTE_DESKTOP_FAILURE_REASON_CLIPBOARD_EMPTY = 19;
+  REMOTE_DESKTOP_FAILURE_REASON_CLIPBOARD_TOO_LARGE = 20;
+  REMOTE_DESKTOP_FAILURE_REASON_CLIPBOARD_UNSUPPORTED = 21;
+  REMOTE_DESKTOP_FAILURE_REASON_CLIPBOARD_EXPIRED = 22;
 }
 
 message RemoteDesktopFailure {

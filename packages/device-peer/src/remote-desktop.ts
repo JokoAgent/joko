@@ -4,6 +4,7 @@ import {
   parseRemoteDesktopIceCandidates,
   type RemoteDesktopIceRequest
 } from "./remote-desktop-ice.js";
+import type { RemoteDesktopClipboardContent } from "@joko/contracts";
 
 export const REMOTE_DESKTOP_PROTOCOL_VERSION = 1 as const;
 export const REMOTE_DESKTOP_LEASE_MS = 12_000;
@@ -13,6 +14,10 @@ export const REMOTE_DESKTOP_MAX_FRAME_DIMENSION = 1_280;
 export const REMOTE_DESKTOP_MAX_DISPLAY_DIMENSION = 32_768;
 export const REMOTE_DESKTOP_MAX_DISPLAYS = 32;
 export const REMOTE_DESKTOP_FRAME_INTERVAL_MS = 250;
+export const REMOTE_DESKTOP_MAX_CLIPBOARD_TEXT_CHARACTERS = 16_384;
+export const REMOTE_DESKTOP_CLIPBOARD_CHUNK_CHARACTERS = 64 * 1_024;
+export const REMOTE_DESKTOP_CLIPBOARD_MAX_CHARACTERS = 32 * 1_024 * 1_024;
+export const REMOTE_DESKTOP_CLIPBOARD_TRANSFER_IDLE_MS = 60_000;
 
 export type RemoteDesktopInput =
   | { readonly kind: "move"; readonly x: number; readonly y: number }
@@ -69,6 +74,8 @@ export interface RemoteDesktopCapabilities {
   readonly webrtcVideo: boolean;
   readonly trickleIce: boolean;
   readonly jpegFallback: boolean;
+  readonly clipboardText: boolean;
+  readonly clipboardContent: boolean;
 }
 
 export type RemoteDesktopHostCapabilities = Omit<
@@ -84,6 +91,7 @@ export interface RemoteDesktopLease {
   readonly lease: string;
   readonly display: RemoteDesktopDisplay;
   readonly controlling: boolean;
+  readonly controlGeneration: number;
 }
 
 /** Capture-adapter result. Dimensions are checked before pixels may leave the host. */
@@ -137,6 +145,8 @@ export function parseRemoteDesktopHostCapabilities(value: unknown): RemoteDeskto
     || value.version !== REMOTE_DESKTOP_PROTOCOL_VERSION
     || typeof value.enabled !== "boolean"
     || typeof value.canControl !== "boolean"
+    || typeof value.clipboardText !== "boolean"
+    || typeof value.clipboardContent !== "boolean"
     || (value.platform !== "darwin" && value.platform !== "win32" && value.platform !== "linux")
     || !Array.isArray(value.displays)
     || value.displays.length > REMOTE_DESKTOP_MAX_DISPLAYS
@@ -152,6 +162,8 @@ export function parseRemoteDesktopHostCapabilities(value: unknown): RemoteDeskto
     version: REMOTE_DESKTOP_PROTOCOL_VERSION,
     enabled: value.enabled,
     canControl: value.canControl,
+    clipboardText: value.clipboardText,
+    clipboardContent: value.clipboardContent,
     platform: value.platform,
     displays: Object.freeze(displays),
     permissions: parseRemoteDesktopPermissions(value.permissions)
@@ -289,6 +301,60 @@ export function isBoundedRemoteDesktopJpegFrame(value: unknown): value is Remote
     return false;
   }
   return remoteDesktopBase64Bytes(value.jpeg) <= REMOTE_DESKTOP_MAX_FRAME_BYTES;
+}
+
+/**
+ * Parses the single portable rich-clipboard item used by the explicit Remote
+ * Desktop transfer. Paths and application-private formats are deliberately
+ * not representable; an HTTP(S) URL is content and is never fetched here.
+ */
+export function parseRemoteDesktopClipboardContentJson(json: string): RemoteDesktopClipboardContent {
+  if (json.length < 1 || json.length > REMOTE_DESKTOP_CLIPBOARD_MAX_CHARACTERS) {
+    throw new Error("REMOTE_DESKTOP_CLIPBOARD_TOO_LARGE");
+  }
+  let value: unknown;
+  try {
+    value = JSON.parse(json);
+  } catch {
+    throw new Error("REMOTE_DESKTOP_CLIPBOARD_UNSUPPORTED");
+  }
+  if (!isRecord(value) || Object.keys(value).length < 1) {
+    throw new Error("REMOTE_DESKTOP_CLIPBOARD_UNSUPPORTED");
+  }
+  const allowed = new Set(["text", "html", "rtf", "url", "png"]);
+  for (const [key, entry] of Object.entries(value)) {
+    if (!allowed.has(key) || typeof entry !== "string" || entry.length < 1) {
+      throw new Error("REMOTE_DESKTOP_CLIPBOARD_UNSUPPORTED");
+    }
+  }
+  if (value.url !== undefined && !/^https?:\/\//iu.test(value.url as string)) {
+    throw new Error("REMOTE_DESKTOP_CLIPBOARD_UNSUPPORTED");
+  }
+  if (value.png !== undefined && (!/^iVBORw0KGgo[A-Za-z0-9+/]*={0,2}$/u.test(value.png as string)
+    || (value.png as string).length % 4 !== 0)) {
+    throw new Error("REMOTE_DESKTOP_CLIPBOARD_UNSUPPORTED");
+  }
+  return Object.freeze({
+    $typeName: "joko.v1.RemoteDesktopClipboardContent",
+    ...(value.text === undefined ? {} : { text: value.text as string }),
+    ...(value.html === undefined ? {} : { html: value.html as string }),
+    ...(value.rtf === undefined ? {} : { rtf: value.rtf as string }),
+    ...(value.url === undefined ? {} : { url: value.url as string }),
+    ...(value.png === undefined ? {} : { png: value.png as string })
+  });
+}
+
+/** Serializes only the five portable fields, never protobuf runtime metadata. */
+export function stringifyRemoteDesktopClipboardContent(value: RemoteDesktopClipboardContent): string {
+  const json = JSON.stringify({
+    ...(value.text === undefined ? {} : { text: value.text }),
+    ...(value.html === undefined ? {} : { html: value.html }),
+    ...(value.rtf === undefined ? {} : { rtf: value.rtf }),
+    ...(value.url === undefined ? {} : { url: value.url }),
+    ...(value.png === undefined ? {} : { png: value.png })
+  });
+  parseRemoteDesktopClipboardContentJson(json);
+  return json;
 }
 
 function parseRemoteDesktopDisplay(value: unknown): RemoteDesktopDisplay {

@@ -2,6 +2,7 @@ import type { Duplex, Readable, Writable } from "node:stream";
 
 import {
   RemoteDesktopFailureReason,
+  type RemoteDesktopClipboardContent,
   type RemoteDesktopCapabilities,
   type RemoteDesktopControlState,
   type RemoteDesktopFrameResult,
@@ -169,6 +170,27 @@ export interface DevicePeerRemoteDesktopHostPort {
     readonly after: number;
   }): Promise<RemoteDesktopIceExchangeResult>;
   getFrame(request: DevicePeerRemoteDesktopLeaseRequest): Promise<RemoteDesktopFrameResult>;
+  /**
+   * Synchronous target-side fence for control-scoped effects. This must read
+   * the host's current authority directly and must not perform the effect.
+   */
+  isControlCurrent(request: DevicePeerRemoteDesktopLeaseRequest & {
+    readonly controlGeneration: bigint;
+  }): boolean;
+  copyClipboardText(request: DevicePeerRemoteDesktopLeaseRequest & {
+    readonly controlGeneration: bigint;
+  }): Promise<string>;
+  pasteClipboardText(request: DevicePeerRemoteDesktopLeaseRequest & {
+    readonly controlGeneration: bigint;
+    readonly text: string;
+  }): Promise<void>;
+  copyClipboardContent(request: DevicePeerRemoteDesktopLeaseRequest & {
+    readonly controlGeneration: bigint;
+  }): Promise<RemoteDesktopClipboardContent>;
+  pasteClipboardContent(request: DevicePeerRemoteDesktopLeaseRequest & {
+    readonly controlGeneration: bigint;
+    readonly content: RemoteDesktopClipboardContent;
+  }): Promise<void>;
   /** Route retirement is a hard media/input ownership boundary. */
   retire(): Promise<void>;
 }

@@ -187,6 +187,44 @@ export function createRemoteDesktopConnectService(
         peer: toProtoRouteIdentity(peer),
         result
       });
+    }),
+
+    transferRemoteDesktopClipboardText: (request, context) => remoteDesktopRpc(async () => {
+      const connection = authenticate(dependencies.connections, context);
+      const peer = fromProtoRouteIdentity(request.peer);
+      if (request.transfer === undefined) {
+        throw new ConnectError("Remote Desktop clipboard transfer is required.", Code.InvalidArgument);
+      }
+      const result = await dependencies.coordinator.transferClipboardText(
+        connection,
+        peer,
+        request.transfer,
+        context.signal
+      );
+      dependencies.connections.fence(connection);
+      return create(contract.TransferRemoteDesktopClipboardTextResponseSchema, {
+        peer: toProtoRouteIdentity(peer),
+        result
+      });
+    }),
+
+    transferRemoteDesktopClipboardContent: (request, context) => remoteDesktopRpc(async () => {
+      const connection = authenticate(dependencies.connections, context);
+      const peer = fromProtoRouteIdentity(request.peer);
+      if (request.transfer === undefined) {
+        throw new ConnectError("Remote Desktop clipboard transfer is required.", Code.InvalidArgument);
+      }
+      const result = await dependencies.coordinator.transferClipboardContent(
+        connection,
+        peer,
+        request.transfer,
+        context.signal
+      );
+      dependencies.connections.fence(connection);
+      return create(contract.TransferRemoteDesktopClipboardContentResponseSchema, {
+        peer: toProtoRouteIdentity(peer),
+        result
+      });
     })
   };
 }

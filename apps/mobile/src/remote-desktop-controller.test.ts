@@ -10,6 +10,9 @@ import {
   DevicePeerWorkspaceLocationSchema,
   DevicePresenceState,
   RemoteDesktopCapabilitiesSchema,
+  RemoteDesktopClipboardContentResultSchema,
+  RemoteDesktopClipboardTextResultSchema,
+  RemoteDesktopControlStateSchema,
   RemoteDesktopDisplaySchema,
   RemoteDesktopFailureReason,
   RemoteDesktopFailureSchema,
@@ -23,7 +26,9 @@ import {
   RevisionSchema,
   SessionSchema,
   TargetSchema,
-  WorkspaceLocationSchema
+  WorkspaceLocationSchema,
+  type RemoteDesktopClipboardContentResult,
+  type RemoteDesktopControlState
 } from "@joko/contracts";
 import { mobileRemoteDesktopNetworkTesting } from "./network";
 import {
@@ -34,9 +39,14 @@ import {
 import { mobileRemoteDesktopViewerTesting, remoteDesktopViewerHtml } from "./remote-desktop-viewer";
 import {
   mobileRemoteDesktopCopy,
+  mobileRemoteDesktopClipboardNoticeLabel,
   mobileRemoteDesktopNoticeLabel,
   mobileRemoteDesktopSessionDeviceId
 } from "./remote-desktop-presentation";
+import {
+  MOBILE_REMOTE_CLIPBOARD_TRANSFER_MS,
+  type MobileRemoteClipboardSystem
+} from "./mobile-remote-desktop-clipboard";
 
 afterEach(() => {
   vi.useRealTimers();
@@ -60,22 +70,27 @@ function fixture(webrtcVideo = true, controlling = false) {
   const display = create(RemoteDesktopDisplaySchema, { displayId: "display-1", name: "Built-in", width: 1920, height: 1080 });
   const capabilities = create(RemoteDesktopCapabilitiesSchema, {
     protocolVersion: 1, enabled: true, canControl: true, platform: "darwin", displays: [display], permissions,
-    automaticReconnect: true, connectionTakeover: true, webrtcVideo, trickleIce: true, jpegFallback: true
+    automaticReconnect: true, connectionTakeover: true, webrtcVideo, trickleIce: true, jpegFallback: true,
+    clipboardText: true, clipboardContent: true
   });
-  const lease = create(RemoteDesktopLeaseSchema, { leaseId: "lease-1", display, controlling });
+  const lease = create(RemoteDesktopLeaseSchema, {
+    leaseId: "lease-1", display, controlling, controlGeneration: 1n
+  });
   const start = vi.fn<MobileRemoteDesktopTransport["start"]>(async () => lease);
-  const heartbeat = vi.fn<MobileRemoteDesktopTransport["heartbeat"]>(async () => ({
-    $typeName: "joko.v1.RemoteDesktopControlState" as const, controlling: false
-  }));
+  const heartbeat = vi.fn<MobileRemoteDesktopTransport["heartbeat"]>(async () =>
+    create(RemoteDesktopControlStateSchema, { controlling: false, controlGeneration: 1n }));
   const stop = vi.fn<MobileRemoteDesktopTransport["stop"]>(async () => undefined);
-  const control = vi.fn<MobileRemoteDesktopTransport["control"]>(async (_host, _leaseId, enabled) => ({
-    $typeName: "joko.v1.RemoteDesktopControlState" as const, controlling: enabled
-  }));
+  const control = vi.fn<MobileRemoteDesktopTransport["control"]>(async (_host, _leaseId, enabled) =>
+    create(RemoteDesktopControlStateSchema, { controlling: enabled, controlGeneration: 1n }));
   const input = vi.fn<MobileRemoteDesktopTransport["input"]>(async () => undefined);
   const offer = vi.fn<MobileRemoteDesktopTransport["offer"]>(async (_host, _leaseId, attemptId) => ({
     $typeName: "joko.v1.RemoteDesktopOfferResult" as const, attemptId, answerSdp: "answer"
   }));
   const frame = vi.fn<MobileRemoteDesktopTransport["frame"]>(async () => create(RemoteDesktopFrameResultSchema, {}));
+  const clipboardText = vi.fn<MobileRemoteDesktopTransport["clipboardText"]>(async () =>
+    create(RemoteDesktopClipboardTextResultSchema, {}));
+  const clipboardContent = vi.fn<MobileRemoteDesktopTransport["clipboardContent"]>(async () =>
+    create(RemoteDesktopClipboardContentResultSchema, {}));
   const transport: MobileRemoteDesktopTransport = {
     ownerKey: "owner-1", isCurrent: () => true, canStop: () => true,
     listHosts: vi.fn(async () => [host]), capabilities: vi.fn(async () => capabilities),
@@ -84,9 +99,31 @@ function fixture(webrtcVideo = true, controlling = false) {
     offer, ice: vi.fn(async (_host, _leaseId, attemptId, candidates, after) => ({
       $typeName: "joko.v1.RemoteDesktopIceExchangeResult" as const,
       attemptId, candidates: [...candidates], next: after + candidates.length, complete: true
-    })), frame
+    })), frame, clipboardText, clipboardContent
   };
-  return { route, host, transport, start, heartbeat, stop, control, input, offer, frame, lease };
+  return { route, host, transport, start, heartbeat, stop, control, input, offer, frame,
+    clipboardText, clipboardContent, lease };
+}
+
+function clipboardFixture(richAvailable = true) {
+  const readPortable = vi.fn<MobileRemoteClipboardSystem["readPortable"]>(async (check) => {
+    check();
+    return { text: "phone text", html: "<b>phone text</b>" };
+  });
+  const writePortable = vi.fn<MobileRemoteClipboardSystem["writePortable"]>(async (_item, check) => {
+    check();
+  });
+  const readLegacyText = vi.fn<MobileRemoteClipboardSystem["readLegacyText"]>(async (check) => {
+    check();
+    return "phone text";
+  });
+  const writeLegacyText = vi.fn<MobileRemoteClipboardSystem["writeLegacyText"]>(async (_text, check) => {
+    check();
+  });
+  const clipboard: MobileRemoteClipboardSystem = {
+    richAvailable, readPortable, writePortable, readLegacyText, writeLegacyText
+  };
+  return { clipboard, readPortable, writePortable, readLegacyText, writeLegacyText };
 }
 
 function failure(reason: RemoteDesktopFailureReason, retryable = false): ConnectError {
@@ -310,6 +347,204 @@ describe("MobileRemoteDesktopController", () => {
     expect(value.heartbeat).toHaveBeenCalledTimes(1);
     await controller.close();
   });
+
+  it("transfers one rich item explicitly and never retries an uncertain paste commit", async () => {
+    const value = fixture(true, true);
+    const phone = clipboardFixture(true);
+    const transferId = "123e4567-e89b-12d3-a456-426614174000";
+    const desktopJson = JSON.stringify({ text: "desktop text", html: "<b>desktop text</b>" });
+    value.clipboardContent.mockImplementation(async (_host, request) => {
+      if (request.action.case === "copy") {
+        return create(RemoteDesktopClipboardContentResultSchema, {
+          transferId, length: desktopJson.length
+        });
+      }
+      if (request.action.case === "read") {
+        return create(RemoteDesktopClipboardContentResultSchema, {
+          data: desktopJson.slice(request.action.value.offset)
+        });
+      }
+      return create(RemoteDesktopClipboardContentResultSchema, {});
+    });
+    const controller = new MobileRemoteDesktopController(value.transport, undefined, phone.clipboard);
+    await controller.open();
+    expect(controller.snapshot).toMatchObject({
+      status: "live", controlling: true, clipboardAvailable: true
+    });
+
+    await controller.copyToPhone();
+    expect(phone.writePortable).toHaveBeenCalledWith(
+      { text: "desktop text", html: "<b>desktop text</b>" }, expect.any(Function)
+    );
+    expect(controller.snapshot).toMatchObject({ clipboardBusy: false, clipboardNotice: "copied" });
+    expect(value.clipboardContent.mock.calls.map((call) => call[1].action.case))
+      .toEqual(["copy", "read", "cancel"]);
+    expect(value.clipboardContent.mock.calls.every((call) => call[1].leaseId === "lease-1"
+      && call[1].controlGeneration === 1n)).toBe(true);
+
+    value.clipboardContent.mockClear();
+    let commitCalls = 0;
+    value.clipboardContent.mockImplementation(async (_host, request) => {
+      if (request.action.case === "begin") {
+        return create(RemoteDesktopClipboardContentResultSchema, { transferId });
+      }
+      if (request.action.case === "commit") {
+        commitCalls += 1;
+        throw new Error("response lost after consume");
+      }
+      return create(RemoteDesktopClipboardContentResultSchema, {});
+    });
+    await controller.pasteFromPhone();
+    expect(commitCalls).toBe(1);
+    expect(value.clipboardContent.mock.calls.map((call) => call[1].action.case))
+      .toEqual(["begin", "write", "commit", "cancel"]);
+    expect(controller.snapshot).toMatchObject({ clipboardBusy: false, clipboardNotice: "failed" });
+    await controller.close();
+  });
+
+  it("retires an active transfer on a newer control generation and ignores a late older generation", async () => {
+    vi.useFakeTimers();
+    const value = fixture(true, true);
+    const phone = clipboardFixture(true);
+    const transferId = "123e4567-e89b-12d3-a456-426614174001";
+    const json = JSON.stringify({ text: "desktop text" });
+    let resolveRead!: (result: RemoteDesktopClipboardContentResult) => void;
+    value.clipboardContent.mockImplementation(async (_host, request) => {
+      if (request.action.case === "copy") {
+        return create(RemoteDesktopClipboardContentResultSchema, { transferId, length: json.length });
+      }
+      if (request.action.case === "read") {
+        return new Promise((resolve) => { resolveRead = resolve; });
+      }
+      return create(RemoteDesktopClipboardContentResultSchema, {});
+    });
+    let resolveHeartbeat!: (state: RemoteDesktopControlState) => void;
+    value.heartbeat.mockImplementationOnce(() => new Promise((resolve) => { resolveHeartbeat = resolve; }));
+    const controller = new MobileRemoteDesktopController(value.transport, undefined, phone.clipboard);
+    await controller.open();
+    await vi.advanceTimersByTimeAsync(3_000);
+    expect(value.heartbeat).toHaveBeenCalledTimes(1);
+
+    const transfer = controller.copyToPhone();
+    await flushAsync();
+    expect(controller.snapshot.clipboardBusy).toBe(true);
+    value.control.mockResolvedValueOnce(create(RemoteDesktopControlStateSchema, {
+      controlling: true, controlGeneration: 3n
+    }));
+    await controller.setControl(true);
+    expect(controller.snapshot.clipboardBusy).toBe(false);
+    resolveRead(create(RemoteDesktopClipboardContentResultSchema, { data: json }));
+    await transfer;
+    expect(phone.writePortable).not.toHaveBeenCalled();
+
+    resolveHeartbeat(create(RemoteDesktopControlStateSchema, {
+      controlling: false, controlGeneration: 2n
+    }));
+    await flushAsync();
+    expect(controller.snapshot.controlling).toBe(true);
+
+    value.clipboardContent.mockClear();
+    value.clipboardContent.mockImplementation(async (_host, request) =>
+      create(RemoteDesktopClipboardContentResultSchema,
+        request.action.case === "begin" ? { transferId } : {}));
+    await controller.pasteFromPhone();
+    expect(value.clipboardContent.mock.calls.every((call) => call[1].controlGeneration === 3n)).toBe(true);
+    expect(controller.snapshot.clipboardNotice).toBe("pasted");
+    await controller.close();
+  });
+
+  it("refreshes the 60 second idle fence on progress but retires a stalled boundary", async () => {
+    vi.useFakeTimers();
+    const value = fixture(true, true);
+    value.heartbeat.mockResolvedValue(create(RemoteDesktopControlStateSchema, {
+      controlling: true, controlGeneration: 1n
+    }));
+    const phone = clipboardFixture(true);
+    const transferId = "123e4567-e89b-12d3-a456-426614174002";
+    const json = JSON.stringify({ text: "slow desktop text" });
+    const delay = <T,>(result: T): Promise<T> => new Promise((resolve) => {
+      setTimeout(() => resolve(result), 40_000);
+    });
+    value.clipboardContent.mockImplementation(async (_host, request) => {
+      if (request.action.case === "copy") {
+        return delay(create(RemoteDesktopClipboardContentResultSchema, {
+          transferId, length: json.length
+        }));
+      }
+      if (request.action.case === "read") {
+        return delay(create(RemoteDesktopClipboardContentResultSchema, { data: json }));
+      }
+      return create(RemoteDesktopClipboardContentResultSchema, {});
+    });
+    const controller = new MobileRemoteDesktopController(value.transport, undefined, phone.clipboard);
+    await controller.open();
+
+    const progressing = controller.copyToPhone();
+    await vi.advanceTimersByTimeAsync(40_000);
+    expect(controller.snapshot.clipboardBusy).toBe(true);
+    await vi.advanceTimersByTimeAsync(40_000);
+    await progressing;
+    expect(controller.snapshot).toMatchObject({ clipboardBusy: false, clipboardNotice: "copied" });
+
+    value.clipboardContent.mockImplementation((_host, _request, signal) => new Promise((_resolve, reject) => {
+      signal?.addEventListener("abort", () => reject(new Error("idle clipboard request retired")), { once: true });
+    }));
+    const stalled = controller.copyToPhone();
+    await vi.advanceTimersByTimeAsync(MOBILE_REMOTE_CLIPBOARD_TRANSFER_MS - 1);
+    expect(controller.snapshot.clipboardBusy).toBe(true);
+    await vi.advanceTimersByTimeAsync(1);
+    await stalled;
+    expect(controller.snapshot).toMatchObject({ clipboardBusy: false, clipboardNotice: "failed" });
+    await controller.close();
+  });
+
+  it("keeps a timed-out native effect slot owned until the abort-ignoring write settles", async () => {
+    vi.useFakeTimers();
+    const value = fixture(true, true);
+    value.heartbeat.mockResolvedValue(create(RemoteDesktopControlStateSchema, {
+      controlling: true, controlGeneration: 1n
+    }));
+    const phone = clipboardFixture(true);
+    const transferId = "123e4567-e89b-12d3-a456-426614174003";
+    const json = JSON.stringify({ text: "desktop text" });
+    value.clipboardContent.mockImplementation(async (_host, request) => {
+      if (request.action.case === "copy") {
+        return create(RemoteDesktopClipboardContentResultSchema, { transferId, length: json.length });
+      }
+      if (request.action.case === "read") {
+        return create(RemoteDesktopClipboardContentResultSchema, { data: json });
+      }
+      return create(RemoteDesktopClipboardContentResultSchema, {});
+    });
+    let settleWrite!: () => void;
+    phone.writePortable.mockImplementationOnce((_item, check) => {
+      check();
+      return new Promise<void>((resolve, reject) => {
+        settleWrite = () => {
+          try { check(); resolve(); } catch (error) { reject(error); }
+        };
+      });
+    });
+    const controller = new MobileRemoteDesktopController(value.transport, undefined, phone.clipboard);
+    await controller.open();
+
+    const first = controller.copyToPhone();
+    await flushAsync();
+    expect(phone.writePortable).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(MOBILE_REMOTE_CLIPBOARD_TRANSFER_MS);
+    expect(controller.snapshot).toMatchObject({ clipboardBusy: false, clipboardNotice: "failed" });
+
+    await controller.copyToPhone();
+    expect(value.clipboardContent.mock.calls.filter((call) => call[1].action.case === "copy")).toHaveLength(1);
+    expect(controller.snapshot.clipboardNotice).toBe("busy");
+
+    settleWrite();
+    await first;
+    await controller.copyToPhone();
+    expect(value.clipboardContent.mock.calls.filter((call) => call[1].action.case === "copy")).toHaveLength(2);
+    expect(controller.snapshot.clipboardNotice).toBe("copied");
+    await controller.close();
+  });
 });
 
 describe("Remote Desktop boundaries", () => {
@@ -386,6 +621,8 @@ describe("Remote Desktop boundaries", () => {
       const copy = mobileRemoteDesktopCopy(locale);
       expect(mobileRemoteDesktopNoticeLabel("viewer-restarted", copy)).toBe(copy.viewerRestarted);
       expect(mobileRemoteDesktopNoticeLabel("generic-error", copy)).toBe(copy.error);
+      expect(mobileRemoteDesktopClipboardNoticeLabel("copied", copy)).toBe(copy.clipboardCopied);
+      expect(mobileRemoteDesktopClipboardNoticeLabel("too-large", copy)).toBe(copy.clipboardTooLarge);
     }
   });
 });

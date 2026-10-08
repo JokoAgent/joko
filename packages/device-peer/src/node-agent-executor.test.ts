@@ -28,6 +28,19 @@ import {
   DevicePeerStartProcessActionSchema,
   DevicePeerStopRemoteDesktopActionSchema,
   RemoteDesktopCapabilitiesSchema,
+  RemoteDesktopClipboardContentBeginActionSchema,
+  RemoteDesktopClipboardContentCancelActionSchema,
+  RemoteDesktopClipboardContentCommitActionSchema,
+  RemoteDesktopClipboardContentCopyActionSchema,
+  RemoteDesktopClipboardContentSchema,
+  RemoteDesktopClipboardContentReadActionSchema,
+  type RemoteDesktopClipboardContentRequest,
+  RemoteDesktopClipboardContentRequestSchema,
+  RemoteDesktopClipboardContentWriteActionSchema,
+  RemoteDesktopClipboardTextCopyActionSchema,
+  RemoteDesktopClipboardTextPasteActionSchema,
+  type RemoteDesktopClipboardTextRequest,
+  RemoteDesktopClipboardTextRequestSchema,
   RemoteDesktopControlStateSchema,
   RemoteDesktopDisplaySchema,
   RemoteDesktopFailureReason,
@@ -44,7 +57,7 @@ import {
   RemoteDesktopTextInputSchema,
   RemoteDesktopStartMode
 } from "@joko/contracts";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   NodeDevicePeerAgentExecutor,
@@ -63,6 +76,7 @@ import type {
 const roots: string[] = [];
 
 afterEach(async () => {
+  vi.useRealTimers();
   await Promise.all(roots.splice(0).map(root => rm(root, { recursive: true, force: true })));
 });
 
@@ -285,6 +299,200 @@ describe("Node Device peer Remote Desktop host ownership", () => {
     });
     await executor.retire();
   });
+
+  it("keeps explicit text and rich clipboard transfers bounded and consumes paste before effect", async () => {
+    const root = await testRoot();
+    const pasted: unknown[] = [];
+    const fixture = remoteDesktopHost({
+      pasteClipboardContent: async (request) => { pasted.push(request.content); }
+    });
+    const executor = new NodeDevicePeerAgentExecutor({
+      recentDirectoriesPath: join(root, "clipboard-host.json"),
+      remoteDesktop: fixture.port
+    });
+
+    const copiedText = await execute(executor, remoteDesktopClipboardTextCommand({
+      case: "copy",
+      value: create(RemoteDesktopClipboardTextCopyActionSchema)
+    }));
+    expect(copiedText.at(-1)?.payload).toMatchObject({
+      case: "remoteDesktopClipboardText",
+      value: { text: "text" }
+    });
+    await execute(executor, remoteDesktopClipboardTextCommand({
+      case: "paste",
+      value: create(RemoteDesktopClipboardTextPasteActionSchema, { text: "phone text" })
+    }));
+
+    const copiedContent = await execute(executor, remoteDesktopClipboardContentCommand({
+      case: "copy",
+      value: create(RemoteDesktopClipboardContentCopyActionSchema)
+    }));
+    const copyPayload = copiedContent.at(-1)?.payload;
+    if (copyPayload?.case !== "remoteDesktopClipboardContent" || copyPayload.value.transferId === undefined) {
+      throw new Error("Expected a rich clipboard transfer.");
+    }
+    const transferId = copyPayload.value.transferId;
+    const read = await execute(executor, remoteDesktopClipboardContentCommand({
+      case: "read",
+      value: create(RemoteDesktopClipboardContentReadActionSchema, { transferId, offset: 0 })
+    }));
+    expect(read.at(-1)?.payload).toMatchObject({
+      case: "remoteDesktopClipboardContent",
+      value: { data: JSON.stringify({ text: "rich text" }) }
+    });
+    const staleRead = await execute(executor, remoteDesktopClipboardContentCommand({
+      case: "read",
+      value: create(RemoteDesktopClipboardContentReadActionSchema, { transferId, offset: 0 })
+    }, 2n));
+    expect(staleRead.at(-1)?.payload).toMatchObject({
+      case: "failure",
+      value: { remoteDesktop: { reason: RemoteDesktopFailureReason.CLIPBOARD_EXPIRED } }
+    });
+
+    const json = JSON.stringify({ html: "<b>portable</b>", url: "https://example.test/item" });
+    const begun = await execute(executor, remoteDesktopClipboardContentCommand({
+      case: "begin",
+      value: create(RemoteDesktopClipboardContentBeginActionSchema, { length: json.length })
+    }));
+    const beginPayload = begun.at(-1)?.payload;
+    if (beginPayload?.case !== "remoteDesktopClipboardContent" || beginPayload.value.transferId === undefined) {
+      throw new Error("Expected a rich clipboard paste transfer.");
+    }
+    const pasteId = beginPayload.value.transferId;
+    await execute(executor, remoteDesktopClipboardContentCommand({
+      case: "write",
+      value: create(RemoteDesktopClipboardContentWriteActionSchema, {
+        transferId: pasteId,
+        offset: 0,
+        data: json
+      })
+    }));
+    await execute(executor, remoteDesktopClipboardContentCommand({
+      case: "commit",
+      value: create(RemoteDesktopClipboardContentCommitActionSchema, { transferId: pasteId })
+    }));
+    expect(pasted).toMatchObject([{ html: "<b>portable</b>", url: "https://example.test/item" }]);
+
+    const repeated = await execute(executor, remoteDesktopClipboardContentCommand({
+      case: "commit",
+      value: create(RemoteDesktopClipboardContentCommitActionSchema, { transferId: pasteId })
+    }));
+    expect(repeated.at(-1)?.payload).toMatchObject({
+      case: "failure",
+      value: { remoteDesktop: { reason: RemoteDesktopFailureReason.CLIPBOARD_EXPIRED } }
+    });
+    expect(pasted).toHaveLength(1);
+    await executor.retire();
+  });
+
+  it("fences rich transfer state against a target-local control generation change", async () => {
+    vi.useFakeTimers();
+    const root = await testRoot();
+    let current = true;
+    const pasted: unknown[] = [];
+    const fixture = remoteDesktopHost({
+      isControlCurrent: () => current,
+      pasteClipboardContent: async (request) => { pasted.push(request.content); }
+    });
+    const executor = new NodeDevicePeerAgentExecutor({
+      recentDirectoriesPath: join(root, "clipboard-current-host.json"),
+      remoteDesktop: fixture.port
+    });
+
+    const copied = await execute(executor, remoteDesktopClipboardContentCommand({
+      case: "copy",
+      value: create(RemoteDesktopClipboardContentCopyActionSchema)
+    }));
+    const copiedPayload = copied.at(-1)?.payload;
+    if (copiedPayload?.case !== "remoteDesktopClipboardContent"
+      || copiedPayload.value.transferId === undefined) {
+      throw new Error("Expected a rich clipboard copy transfer.");
+    }
+    vi.advanceTimersByTime(59_000);
+    current = false;
+    const staleRead = await execute(executor, remoteDesktopClipboardContentCommand({
+      case: "read",
+      value: create(RemoteDesktopClipboardContentReadActionSchema, {
+        transferId: copiedPayload.value.transferId,
+        offset: 0
+      })
+    }));
+    expect(staleRead.at(-1)?.payload).toMatchObject({
+      case: "failure",
+      value: { remoteDesktop: { reason: RemoteDesktopFailureReason.CLIPBOARD_EXPIRED } }
+    });
+    vi.advanceTimersByTime(1_001);
+    current = true;
+    const expiredRead = await execute(executor, remoteDesktopClipboardContentCommand({
+      case: "read",
+      value: create(RemoteDesktopClipboardContentReadActionSchema, {
+        transferId: copiedPayload.value.transferId,
+        offset: 0
+      })
+    }));
+    expect(expiredRead.at(-1)?.payload).toMatchObject({
+      case: "failure",
+      value: { remoteDesktop: { reason: RemoteDesktopFailureReason.CLIPBOARD_EXPIRED } }
+    });
+
+    const json = JSON.stringify({ text: "kept" });
+    const split = 5;
+    const begun = await execute(executor, remoteDesktopClipboardContentCommand({
+      case: "begin",
+      value: create(RemoteDesktopClipboardContentBeginActionSchema, { length: json.length })
+    }));
+    const begunPayload = begun.at(-1)?.payload;
+    if (begunPayload?.case !== "remoteDesktopClipboardContent"
+      || begunPayload.value.transferId === undefined) {
+      throw new Error("Expected a rich clipboard paste transfer.");
+    }
+    const transferId = begunPayload.value.transferId;
+    await execute(executor, remoteDesktopClipboardContentCommand({
+      case: "write",
+      value: create(RemoteDesktopClipboardContentWriteActionSchema, {
+        transferId,
+        offset: 0,
+        data: json.slice(0, split)
+      })
+    }));
+
+    current = false;
+    const staleWrite = await execute(executor, remoteDesktopClipboardContentCommand({
+      case: "write",
+      value: create(RemoteDesktopClipboardContentWriteActionSchema, {
+        transferId,
+        offset: split,
+        data: "BAD"
+      })
+    }));
+    const staleCancel = await execute(executor, remoteDesktopClipboardContentCommand({
+      case: "cancel",
+      value: create(RemoteDesktopClipboardContentCancelActionSchema, { transferId })
+    }));
+    for (const result of [staleWrite, staleCancel]) {
+      expect(result.at(-1)?.payload).toMatchObject({
+        case: "failure",
+        value: { remoteDesktop: { reason: RemoteDesktopFailureReason.CLIPBOARD_EXPIRED } }
+      });
+    }
+
+    current = true;
+    await execute(executor, remoteDesktopClipboardContentCommand({
+      case: "write",
+      value: create(RemoteDesktopClipboardContentWriteActionSchema, {
+        transferId,
+        offset: split,
+        data: json.slice(split)
+      })
+    }));
+    await execute(executor, remoteDesktopClipboardContentCommand({
+      case: "commit",
+      value: create(RemoteDesktopClipboardContentCommitActionSchema, { transferId })
+    }));
+    expect(pasted).toMatchObject([{ text: "kept" }]);
+    await executor.retire();
+  });
 });
 
 async function testRoot(): Promise<string> {
@@ -396,7 +604,9 @@ function remoteDesktopHost(overrides: Partial<DevicePeerRemoteDesktopHostPort> =
         connectionTakeover: true,
         webrtcVideo: true,
         trickleIce: true,
-        jpegFallback: true
+        jpegFallback: true,
+        clipboardText: true,
+        clipboardContent: true
       });
     },
     async getPermissions(request) {
@@ -406,16 +616,24 @@ function remoteDesktopHost(overrides: Partial<DevicePeerRemoteDesktopHostPort> =
     async showPermissionGuide(request) { record("showPermissionGuide", request); },
     async start(request) {
       record("start", request);
-      return create(RemoteDesktopLeaseSchema, { leaseId: "lease-1", display, controlling: true });
+      return create(RemoteDesktopLeaseSchema, {
+        leaseId: "lease-1",
+        display,
+        controlling: true,
+        controlGeneration: 1n
+      });
     },
     async heartbeat(request) {
       record("heartbeat", request);
-      return create(RemoteDesktopControlStateSchema, { controlling: true });
+      return create(RemoteDesktopControlStateSchema, { controlling: true, controlGeneration: 1n });
     },
     async stop(request) { record("stop", request); },
     async setControl(request) {
       record("setControl", request);
-      return create(RemoteDesktopControlStateSchema, { controlling: request.enabled });
+      return create(RemoteDesktopControlStateSchema, {
+        controlling: request.enabled,
+        controlGeneration: 2n
+      });
     },
     async sendInput(request) { record("sendInput", request); },
     async createOffer(request) {
@@ -440,6 +658,14 @@ function remoteDesktopHost(overrides: Partial<DevicePeerRemoteDesktopHostPort> =
         frame: create(RemoteDesktopFrameSchema, { jpeg: new Uint8Array([0xff, 0xd8, 0xff, 0xd9]) })
       });
     },
+    isControlCurrent() { return true; },
+    async copyClipboardText(request) { record("copyClipboardText", request); return "text"; },
+    async pasteClipboardText(request) { record("pasteClipboardText", request); },
+    async copyClipboardContent(request) {
+      record("copyClipboardContent", request);
+      return create(RemoteDesktopClipboardContentSchema, { text: "rich text" });
+    },
+    async pasteClipboardContent(request) { record("pasteClipboardContent", request); },
     async retire() { state.retireCalls += 1; },
     ...overrides
   };
@@ -574,6 +800,34 @@ function remoteDesktopCommand(
     controllerDeviceId: "controller-device",
     action
   });
+}
+
+function remoteDesktopClipboardTextCommand(
+  action: RemoteDesktopClipboardTextRequest["action"],
+  controlGeneration = 1n
+): DevicePeerCommand {
+  return remoteDesktopCommand({
+    case: "transferRemoteDesktopClipboardText",
+    value: create(RemoteDesktopClipboardTextRequestSchema, {
+      leaseId: "lease-1",
+      controlGeneration,
+      action
+    })
+  }, DevicePeerEffectKind.SIDE_EFFECT);
+}
+
+function remoteDesktopClipboardContentCommand(
+  action: RemoteDesktopClipboardContentRequest["action"],
+  controlGeneration = 1n
+): DevicePeerCommand {
+  return remoteDesktopCommand({
+    case: "transferRemoteDesktopClipboardContent",
+    value: create(RemoteDesktopClipboardContentRequestSchema, {
+      leaseId: "lease-1",
+      controlGeneration,
+      action
+    })
+  }, DevicePeerEffectKind.SIDE_EFFECT);
 }
 
 function remoteDesktopIceCandidate() {

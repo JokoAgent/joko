@@ -35,6 +35,7 @@ export interface RemoteDesktopControllerState {
   readonly lease: string;
   readonly displayId: string;
   readonly controlling: boolean;
+  readonly controlGeneration: number;
 }
 
 export interface RemoteDesktopControllerDependencies {
@@ -73,6 +74,7 @@ interface ActiveRemoteDesktopLease {
   readonly display: RemoteDesktopLease["display"];
   readonly canControl: boolean;
   controlling: boolean;
+  controlGeneration: number;
   readonly authority: RemoteDesktopAuthority;
   expiresAt: number;
   sequence: number;
@@ -106,7 +108,8 @@ export class RemoteDesktopController {
           controllerDeviceId: active.authority.controllerDeviceId,
           lease: active.lease,
           displayId: active.display.id,
-          controlling: active.controlling
+          controlling: active.controlling,
+          controlGeneration: active.controlGeneration
         });
   }
 
@@ -122,6 +125,21 @@ export class RemoteDesktopController {
     if (!validAuthority(authority)) return false;
     this.tick();
     return this.#active?.lease === lease && sameAuthority(this.#active.authority, authority);
+  }
+
+  /** Exact fence for clipboard and other control-scoped asynchronous effects. */
+  isControlCurrent(
+    authority: RemoteDesktopAuthority,
+    lease: string,
+    controlGeneration: number
+  ): boolean {
+    if (!Number.isSafeInteger(controlGeneration) || controlGeneration < 1) return false;
+    try {
+      const active = this.#require(authority, lease);
+      return active.controlling && active.controlGeneration === controlGeneration;
+    } catch {
+      return false;
+    }
   }
 
   /** Route retirement may target only its exact captured authority. */
@@ -158,7 +176,7 @@ export class RemoteDesktopController {
     const active = this.#active;
     if (active === undefined || !active.controlling) return;
     active.controlling = false;
-    this.#controlGeneration += 1;
+    active.controlGeneration = ++this.#controlGeneration;
     this.#dependencies.stopInput();
     this.#dependencies.changed();
   }
@@ -222,7 +240,10 @@ export class RemoteDesktopController {
         return Object.freeze({ ok: true });
       case "heartbeat":
         active.expiresAt = this.#now() + REMOTE_DESKTOP_LEASE_MS;
-        return Object.freeze({ controlling: active.controlling });
+        return Object.freeze({
+          controlling: active.controlling,
+          controlGeneration: active.controlGeneration
+        });
       case "control":
         return this.#control(authority, active, request.enabled);
       case "input":
@@ -308,6 +329,7 @@ export class RemoteDesktopController {
         display: Object.freeze({ ...display }),
         canControl: capabilities.canControl,
         controlling: false,
+        controlGeneration: ++this.#controlGeneration,
         authority: Object.freeze({ ...authority }),
         expiresAt: this.#now() + REMOTE_DESKTOP_LEASE_MS,
         sequence: -1
@@ -325,15 +347,16 @@ export class RemoteDesktopController {
     authority: RemoteDesktopAuthority,
     active: ActiveRemoteDesktopLease,
     enabled: boolean
-  ): Promise<{ readonly controlling: boolean }> {
+  ): Promise<{ readonly controlling: boolean; readonly controlGeneration: number }> {
     if (enabled && !active.canControl) throw new Error("REMOTE_DESKTOP_VIEW_ONLY");
     if (enabled && this.#inputStarting) throw new Error("REMOTE_DESKTOP_INPUT_BUSY");
     const generation = ++this.#controlGeneration;
+    active.controlGeneration = generation;
     if (!enabled) {
       active.controlling = false;
       this.#dependencies.stopInput();
       this.#dependencies.changed();
-      return Object.freeze({ controlling: false });
+      return Object.freeze({ controlling: false, controlGeneration: active.controlGeneration });
     }
     if (!active.controlling) {
       this.#inputStarting = true;
@@ -360,7 +383,10 @@ export class RemoteDesktopController {
       }
     }
     this.#dependencies.changed();
-    return Object.freeze({ controlling: active.controlling });
+    return Object.freeze({
+      controlling: active.controlling,
+      controlGeneration: active.controlGeneration
+    });
   }
 
   async #frame(
@@ -461,7 +487,8 @@ function leaseView(active: ActiveRemoteDesktopLease): RemoteDesktopLease {
   return Object.freeze({
     lease: active.lease,
     display: active.display,
-    controlling: active.controlling
+    controlling: active.controlling,
+    controlGeneration: active.controlGeneration
   });
 }
 

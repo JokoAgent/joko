@@ -13,6 +13,56 @@ func unlockedSession() -> Bool {
   return state["CGSSessionScreenIsLocked"] as? Bool != true
 }
 
+// Expose only the change counter. Clipboard bytes never cross the helper's
+// stdout boundary, and rich transfer refuses multiple pasteboard items.
+if CommandLine.arguments.count == 2 &&
+  ["--clipboard-version", "--clipboard-content-version"].contains(CommandLine.arguments[1]) {
+  guard unlockedSession() else { exit(2) }
+  if CommandLine.arguments[1] == "--clipboard-content-version" &&
+    (NSPasteboard.general.pasteboardItems?.count ?? 0) > 1 { exit(3) }
+  print(NSPasteboard.general.changeCount)
+  exit(0)
+}
+
+// Read the focused accessibility selection instead of attributing an
+// arbitrary background pasteboard change to a synthesized Copy shortcut.
+if CommandLine.arguments.count == 2 &&
+  ["--clipboard-selection", "--clipboard-content-selection"].contains(CommandLine.arguments[1]) {
+  guard unlockedSession(), AXIsProcessTrusted(),
+    let application = NSWorkspace.shared.frontmostApplication else { exit(2) }
+  let root = AXUIElementCreateApplication(application.processIdentifier)
+  var focused: CFTypeRef?
+  guard AXUIElementCopyAttributeValue(
+      root, kAXFocusedUIElementAttribute as CFString, &focused) == .success,
+    let focused = focused, CFGetTypeID(focused) == AXUIElementGetTypeID() else { exit(2) }
+  let element = focused as! AXUIElement
+  var subrole: CFTypeRef?
+  _ = AXUIElementCopyAttributeValue(element, kAXSubroleAttribute as CFString, &subrole)
+  guard subrole as? String != "AXSecureTextField" else { exit(2) }
+  var raw: CFTypeRef?
+  let selectionResult = AXUIElementCopyAttributeValue(
+    element, kAXSelectedTextAttribute as CFString, &raw)
+  var role: CFTypeRef?
+  _ = AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &role)
+  let nonText = CommandLine.arguments[1] == "--clipboard-content-selection" &&
+    selectionResult == .attributeUnsupported &&
+    ["AXImage", "AXButton", "AXGroup", "AXScrollArea", "AXList", "AXTable", "AXOutline",
+      "AXRow", "AXCell"].contains(role as? String ?? "")
+  // A confirmed empty selection is different from an accessibility error.
+  guard selectionResult == .success || selectionResult == .noValue || nonText else { exit(2) }
+  let selectionText: String? = (selectionResult == .noValue || nonText) ? "" : raw as? String
+  guard let text = selectionText, text.utf16.count <= 16_384,
+    NSWorkspace.shared.frontmostApplication?.processIdentifier == application.processIdentifier,
+    let data = try? JSONSerialization.data(withJSONObject: ["text": text]),
+    let json = String(data: data, encoding: .utf8) else { exit(2) }
+  var current: CFTypeRef?
+  guard unlockedSession(), AXUIElementCopyAttributeValue(
+      root, kAXFocusedUIElementAttribute as CFString, &current) == .success,
+    let current = current, CFEqual(current, element) else { exit(2) }
+  print(json)
+  exit(0)
+}
+
 if CommandLine.arguments.count == 2 && CommandLine.arguments[1] == "--check" {
   print(AXIsProcessTrusted() ? "ready" : "permission")
   exit(0)
