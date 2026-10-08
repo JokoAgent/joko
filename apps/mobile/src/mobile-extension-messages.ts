@@ -1,0 +1,67 @@
+import type { MobileSupportedLocale } from "./mobile-locale-preference";
+
+type Row = readonly [key: string, en: string, zhCN: string, zhTW: string, ja: string, ko: string];
+
+const rows = [
+  ["extension.title", "Extensions", "扩展", "擴充功能", "拡張機能", "확장"],
+  ["extension.menuDescription", "Browse installed Extensions and their capabilities", "浏览已安装的扩展及其能力", "瀏覽已安裝的擴充功能及其能力", "インストール済み拡張機能と機能を参照", "설치된 확장과 기능 살펴보기"],
+  ["extension.search", "Search Extensions", "搜索扩展", "搜尋擴充功能", "拡張機能を検索", "확장 검색"],
+  ["extension.loading", "Loading Extensions…", "正在加载扩展…", "正在載入擴充功能…", "拡張機能を読み込み中…", "확장 불러오는 중…"],
+  ["extension.empty", "No Extensions are installed on this Joko node.", "此 Joko 节点尚未安装扩展。", "此 Joko 節點尚未安裝擴充功能。", "この Joko ノードには拡張機能がインストールされていません。", "이 Joko 노드에는 설치된 확장이 없습니다."],
+  ["extension.noResults", "No Extensions match this search.", "没有匹配此搜索的扩展。", "沒有符合此搜尋的擴充功能。", "検索に一致する拡張機能はありません。", "검색과 일치하는 확장이 없습니다."],
+  ["extension.offline", "Reconnect to browse Extensions.", "重新连接后可浏览扩展。", "重新連線後可瀏覽擴充功能。", "再接続して拡張機能を参照してください。", "다시 연결하여 확장을 살펴보세요."],
+  ["extension.error", "Extensions could not be loaded.", "无法加载扩展。", "無法載入擴充功能。", "拡張機能を読み込めませんでした。", "확장을 불러올 수 없습니다."],
+  ["extension.refresh", "Refresh Extensions", "刷新扩展", "重新整理擴充功能", "拡張機能を更新", "확장 새로고침"],
+  ["extension.recovered", "The node recovered its Extension catalog from a damaged saved copy. Review current entries before relying on them.", "节点已从损坏的已保存副本恢复扩展目录。请先检查当前条目。", "節點已從損壞的已儲存副本復原擴充功能目錄。請先檢查目前項目。", "ノードは破損した保存データから拡張機能カタログを復旧しました。現在の項目を確認してください。", "노드가 손상된 저장본에서 확장 카탈로그를 복구했습니다. 현재 항목을 확인하세요."],
+  ["extension.openAccessibility", "View {name}", "查看{name}", "檢視{name}", "{name}を表示", "{name} 보기"],
+  ["extension.detailLoading", "Loading current Extension details…", "正在加载当前扩展详情…", "正在載入目前擴充功能詳細資料…", "現在の拡張機能の詳細を読み込み中…", "현재 확장 세부 정보 불러오는 중…"],
+  ["extension.detailError", "This Extension detail is no longer current. Refresh the catalog and try again.", "此扩展详情已不是当前版本。请刷新目录后重试。", "此擴充功能詳細資料已不是目前版本。請重新整理目錄後再試。", "この拡張機能の詳細は最新ではありません。カタログを更新して再試行してください。", "이 확장 세부 정보는 더 이상 최신이 아닙니다. 카탈로그를 새로고침한 후 다시 시도하세요."],
+  ["extension.backToDirectory", "Back to Extensions", "返回扩展目录", "返回擴充功能目錄", "拡張機能一覧に戻る", "확장 목록으로 돌아가기"],
+  ["extension.enabled", "Enabled", "已启用", "已啟用", "有効", "활성화됨"],
+  ["extension.disabled", "Disabled", "已停用", "已停用", "無効", "비활성화됨"],
+  ["extension.source.local", "Local", "本地", "本機", "ローカル", "로컬"],
+  ["extension.source.market", "Catalog", "目录", "目錄", "カタログ", "카탈로그"],
+  ["extension.version", "Version {version}", "版本 {version}", "版本 {version}", "バージョン {version}", "버전 {version}"],
+  ["extension.author", "By {author}", "作者：{author}", "作者：{author}", "作成者: {author}", "작성자: {author}"],
+  ["extension.setup", "Setup", "设置", "設定", "セットアップ", "설정"],
+  ["extension.setup.notRequired", "Not required", "无需设置", "無需設定", "不要", "필요 없음"],
+  ["extension.setup.required", "Required", "需要设置", "需要設定", "必要", "필요"],
+  ["extension.setup.inProgress", "In progress", "进行中", "進行中", "進行中", "진행 중"],
+  ["extension.setup.ready", "Ready", "已就绪", "已就緒", "準備完了", "준비됨"],
+  ["extension.setup.cancelled", "Cancelled", "已取消", "已取消", "キャンセル済み", "취소됨"],
+  ["extension.setup.failed", "Needs attention", "需要处理", "需要處理", "要確認", "확인 필요"],
+  ["extension.capabilities", "Capabilities", "能力", "能力", "機能", "기능"],
+  ["extension.mainView", "Main view", "主视图", "主檢視", "メインビュー", "기본 보기"],
+  ["extension.library", "Library", "资料库", "資料庫", "ライブラリ", "라이브러리"],
+  ["extension.taskUse", "Task use", "任务中使用", "在任務中使用", "タスクで使用", "작업에서 사용"],
+  ["extension.available", "Available", "可用", "可用", "利用可能", "사용 가능"],
+  ["extension.unavailable", "Unavailable", "不可用", "無法使用", "利用不可", "사용할 수 없음"],
+  ["extension.updateAvailable", "Update available", "有可用更新", "有可用更新", "更新があります", "업데이트 가능"],
+  ["extension.tools", "Tools ({count})", "工具（{count}）", "工具（{count}）", "ツール ({count})", "도구 ({count})"],
+  ["extension.noTools", "No tools advertised.", "未声明工具。", "未宣告工具。", "ツールはありません。", "제공된 도구가 없습니다."],
+  ["extension.permissions", "Permissions ({count})", "权限（{count}）", "權限（{count}）", "権限 ({count})", "권한 ({count})"],
+  ["extension.noPermissions", "No permissions requested.", "未请求权限。", "未要求權限。", "要求された権限はありません。", "요청된 권한이 없습니다."],
+  ["extension.permission.required", "Required", "必需", "必要", "必須", "필수"],
+  ["extension.permission.optional", "Optional", "可选", "選用", "任意", "선택"],
+  ["extension.permission.granted", "Granted", "已授予", "已授予", "許可済み", "허용됨"],
+  ["extension.permission.notGranted", "Not granted", "未授予", "未授予", "未許可", "허용되지 않음"],
+  ["extension.commands", "Commands ({count})", "命令（{count}）", "命令（{count}）", "コマンド ({count})", "명령 ({count})"],
+  ["extension.noCommands", "No task commands advertised.", "未声明任务命令。", "未宣告任務命令。", "タスクコマンドはありません。", "제공된 작업 명령이 없습니다."],
+  ["extension.extensionError", "Extension reports: {error}", "扩展报告：{error}", "擴充功能回報：{error}", "拡張機能の報告: {error}", "확장 보고: {error}"],
+  ["extension.setupError", "Setup reports: {error}", "设置报告：{error}", "設定回報：{error}", "セットアップの報告: {error}", "설정 보고: {error}"]
+] as const satisfies readonly Row[];
+
+const duplicateKeys = rows.map(([key]) => key).filter((key, index, keys) => keys.indexOf(key) !== index);
+if (duplicateKeys.length > 0) throw new Error(`Duplicate mobile Extension messages: ${duplicateKeys.join(", ")}`);
+
+function catalog(column: 1 | 2 | 3 | 4 | 5): Readonly<Record<(typeof rows)[number][0], string>> {
+  return Object.fromEntries(rows.map((row) => [row[0], row[column]])) as Readonly<Record<(typeof rows)[number][0], string>>;
+}
+
+export const mobileExtensionMessages: Readonly<Record<MobileSupportedLocale, Readonly<Record<(typeof rows)[number][0], string>>>> = {
+  en: catalog(1),
+  "zh-CN": catalog(2),
+  "zh-TW": catalog(3),
+  ja: catalog(4),
+  ko: catalog(5)
+};

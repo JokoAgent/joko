@@ -3,7 +3,7 @@ import { createConnectTransport } from "@connectrpc/connect-web";
 import {
   ArtifactKind, ArtifactService, BlobDisposition, ConnectionService, DeviceKind, EventService, FileKind, ImageThumbnailUnavailableReason,
   MobilePushEnvironment as WireMobilePushEnvironment, MobilePushLocale as WireMobilePushLocale,
-  MobilePushProvider, OperationService, OperationState, PartnerService, RemoteDesktopService,
+  MobilePushProvider, OperationService, OperationState, PartnerService, RemoteDesktopService, ExtensionService,
   ResourceKind, SchedulerService, SessionService, TargetService, VoiceInputService, SettingsService, CredentialService, CredentialKind,
   type VoiceInputServiceSettings, type TestVoiceInputConnectionResponse,
   VoiceInputDictionaryEntrySource, VoiceInputDictionaryLearningActionType,
@@ -61,6 +61,12 @@ import {
   type MobilePartner, type MobilePrivateDetail, type MobilePrivateReadState,
   type MobilePrivateThread
 } from "./mobile-partner-private";
+import {
+  collectMobileExtensionCatalog,
+  projectMobileExtension,
+  type MobileExtension,
+  type MobileExtensionCatalog
+} from "./mobile-extensions";
 
 export interface PairedCredential {
   readonly profileId: string;
@@ -159,6 +165,8 @@ export interface MobileNetwork {
     transfer: RemoteDesktopClipboardContentRequest, signal?: AbortSignal): Promise<RemoteDesktopClipboardContentResult>;
   listPartners(credential: PairedCredential, signal?: AbortSignal): Promise<readonly MobilePartner[]>;
   listPartnerSessions(credential: PairedCredential, partnerId: string, signal?: AbortSignal): Promise<ListPartnerSessionsResponse>;
+  listExtensions(credential: PairedCredential, signal?: AbortSignal): Promise<MobileExtensionCatalog>;
+  getExtension(credential: PairedCredential, extensionId: string, signal?: AbortSignal): Promise<MobileExtension>;
   listPartnerPrivateThreads(credential: PairedCredential, partnerId: string, signal?: AbortSignal): Promise<readonly MobilePrivateThread[]>;
   getPartnerPrivateThread(credential: PairedCredential, partnerId: string, threadId: string, signal?: AbortSignal): Promise<MobilePrivateDetail>;
   markPartnerPrivateThreadRead(credential: PairedCredential, partnerId: string, threadId: string,
@@ -1361,6 +1369,43 @@ export const mobileNetwork: MobileNetwork = {
     if (!validMobilePartnerId(partnerId)) throw new Error("A valid Partner is required.");
     return createClient(PartnerService, transport(credential.origin, credential.authKey))
       .listPartnerSessions({ partnerId }, options(signal));
+  },
+  async listExtensions(credential, signal) {
+    const client = createClient(ExtensionService, transport(credential.origin, credential.authKey));
+    const requestSignal = signal ?? new AbortController().signal;
+    return collectMobileExtensionCatalog(async (pageToken, catalogSignal) => {
+      const response = await client.listExtensions({
+        installed: true,
+        query: "",
+        page: { pageSize: 500, pageToken }
+      }, options(catalogSignal));
+      catalogSignal.throwIfAborted();
+      const totalSize = response.page?.totalSize;
+      if (response.catalogRevision === undefined || response.page === undefined
+        || totalSize === undefined || totalSize > BigInt(Number.MAX_SAFE_INTEGER)) {
+        throw new Error("The Joko node did not return valid Extension catalog page metadata.");
+      }
+      return {
+        revision: response.catalogRevision.value,
+        recoveredFromCorruption: response.recoveredFromCorruption,
+        extensions: response.extensions,
+        nextPageToken: response.page.nextPageToken,
+        totalSize: Number(totalSize)
+      };
+    }, requestSignal);
+  },
+  async getExtension(credential, extensionId, signal) {
+    if (!/^extension_[a-f0-9]{32}$/u.test(extensionId)) throw new Error("A current Extension is required.");
+    const response = await createClient(ExtensionService, transport(credential.origin, credential.authKey))
+      .getExtension({ extensionId }, options(signal));
+    signal?.throwIfAborted();
+    if (response.catalogRevision?.value === undefined || response.catalogRevision.value < 0n
+      || response.extension === undefined || response.extension.extensionId !== extensionId) {
+      throw new Error("The Joko node returned a mismatched Extension detail.");
+    }
+    const extension = projectMobileExtension(response.extension);
+    if (!extension.installed) throw new Error("The selected Extension is no longer installed on this Joko node.");
+    return extension;
   },
   async listPartnerPrivateThreads(credential, partnerId, signal) {
     if (!validMobilePartnerId(partnerId)) throw new Error("A valid Partner is required.");

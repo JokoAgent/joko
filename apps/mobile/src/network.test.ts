@@ -10,6 +10,10 @@ import {
   BeginPairingRequestSchema, BeginPairingResponseSchema,
   CompletePairingRequestSchema, CompletePairingResponseSchema,
   ConnectionSchema, ConnectionState, DeviceKind, DeviceSchema,
+  ExtensionCatalogEntrySchema, ExtensionCatalogSource, ExtensionInstallState, ExtensionOwnerSchema,
+  ExtensionResourceOwnerSchema, ExtensionSetupDescriptorSchema, ExtensionSetupState,
+  GetExtensionRequestSchema, GetExtensionResponseSchema, ListExtensionsRequestSchema, ListExtensionsResponseSchema,
+  RevisionSchema,
   GetServerInfoResponseSchema, GetSnapshotRequestSchema, GetSnapshotResponseSchema, SnapshotSchema,
   GetImageThumbnailRequestSchema, GetImageThumbnailResponseSchema, ImageThumbnailUnavailableReason,
   ReadWorkspaceHtmlSnapshotRequestSchema, ReadWorkspaceHtmlSnapshotResponseSchema,
@@ -150,6 +154,88 @@ describe("mobile device name handshake", () => {
     }
   );
 });
+
+describe("mobile Extension network", () => {
+  it("requests the complete installed catalog, restarts revision drift, and gets exact current detail", async () => {
+    const credential: PairedCredential = { profileId: "profile", origin: "https://node.example", serverId: "server",
+      connectionId: "connection", deviceId: "phone", displayName: "Phone", authKey: "extension-fixture-key" };
+    const first = extensionWire(1, "Mail");
+    const second = extensionWire(2, "Calendar");
+    const tokens: string[] = [];
+    let listCall = 0;
+    let detail = first;
+    const fetcher = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      expect(new Headers(init?.headers).get("authorization")).toBe("Bearer extension-fixture-key");
+      const path = new URL(String(input)).pathname;
+      const body = new Uint8Array(init?.body as Uint8Array);
+      const headers = { "content-type": "application/proto" };
+      if (path.endsWith("/ListExtensions")) {
+        const request = fromBinary(ListExtensionsRequestSchema, body);
+        expect(request).toMatchObject({ installed: true, query: "", page: { pageSize: 500 } });
+        const pageToken = request.page!.pageToken;
+        tokens.push(pageToken);
+        listCall += 1;
+        const retry = listCall > 2;
+        const next = pageToken === "next";
+        return new Response(toBinary(ListExtensionsResponseSchema, create(ListExtensionsResponseSchema, {
+          extensions: [next ? second : first],
+          catalogRevision: create(RevisionSchema, { value: retry ? 9n : next ? 8n : 7n }),
+          recoveredFromCorruption: false,
+          page: { totalSize: 2n, nextPageToken: next ? "" : "next" }
+        })), { headers });
+      }
+      expect(path).toBe("/joko.v1.ExtensionService/GetExtension");
+      expect(fromBinary(GetExtensionRequestSchema, body)).toMatchObject({ extensionId: first.extensionId });
+      return new Response(toBinary(GetExtensionResponseSchema, create(GetExtensionResponseSchema, {
+        extension: detail,
+        catalogRevision: create(RevisionSchema, { value: 9n })
+      })), { headers });
+    });
+    try {
+      const catalog = await mobileNetwork.listExtensions(credential);
+      expect(tokens).toEqual(["", "next", "", "next"]);
+      expect(catalog.revision).toBe(9n);
+      expect(catalog.extensions.map((extension) => extension.name)).toEqual(["Calendar", "Mail"]);
+      await expect(mobileNetwork.getExtension(credential, first.extensionId)).resolves.toMatchObject({
+        extensionId: first.extensionId,
+        name: "Mail"
+      });
+
+      detail = second;
+      await expect(mobileNetwork.getExtension(credential, first.extensionId)).rejects.toThrow(/mismatched/u);
+    } finally { fetcher.mockRestore(); }
+  });
+});
+
+function extensionWire(index: number, name: string) {
+  return create(ExtensionCatalogEntrySchema, {
+    extensionId: `extension_${index.toString(16).padStart(32, "0")}`,
+    revision: create(RevisionSchema, { value: BigInt(index) }),
+    owner: create(ExtensionOwnerSchema, {
+      kind: {
+        case: "resource",
+        value: create(ExtensionResourceOwnerSchema, {
+          resourceId: `resource-${index}`,
+          discoveredRevision: `sha256:${index.toString(16).padStart(64, "0")}`,
+          resourceVersion: create(RevisionSchema, { value: BigInt(index) })
+        })
+      }
+    }),
+    source: ExtensionCatalogSource.LOCAL,
+    installed: true,
+    installState: ExtensionInstallState.INSTALLED,
+    name,
+    description: `${name} description`,
+    enabled: true,
+    sidebarSupported: false,
+    sidebarVisible: false,
+    setup: create(ExtensionSetupDescriptorSchema, {
+      state: ExtensionSetupState.NOT_REQUIRED,
+      revision: create(RevisionSchema, { value: 0n })
+    }),
+    useSupported: true
+  });
+}
 
 describe("canonical image thumbnail network", () => {
   it("uses the authenticated generated source request and accepts only explicit bounded thumbnail or original-file outcomes", async () => {

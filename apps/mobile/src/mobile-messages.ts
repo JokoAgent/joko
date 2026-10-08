@@ -9,6 +9,7 @@ import { mobileVoiceMessages } from "./mobile-voice-messages";
 import { mobileVoiceReadOnlyMessages } from "./mobile-voice-readonly-messages";
 import { mobileFilesMessages } from "./mobile-files-messages";
 import { mobileTaskTagMessages } from "./mobile-task-tag-messages";
+import { mobileExtensionMessages } from "./mobile-extension-messages";
 
 const en = {
   "common.about": "About",
@@ -322,6 +323,7 @@ const en = {
   ...mobileAutomationMessages.en,
   ...mobileNativeIntentMessages.en,
   ...mobilePartnerMessages.en,
+  ...mobileExtensionMessages.en,
   ...mobilePushMessages.en,
   ...mobileUpdateMessages.en,
   ...mobileVoiceMessages.en,
@@ -644,6 +646,7 @@ const zhCN: MobileMessageCatalog = {
   ...mobileAutomationMessages["zh-CN"],
   ...mobileNativeIntentMessages["zh-CN"],
   ...mobilePartnerMessages["zh-CN"],
+  ...mobileExtensionMessages["zh-CN"],
   ...mobilePushMessages["zh-CN"],
   ...mobileUpdateMessages["zh-CN"],
   ...mobileVoiceMessages["zh-CN"],
@@ -963,6 +966,7 @@ const zhTW: MobileMessageCatalog = {
   ...mobileAutomationMessages["zh-TW"],
   ...mobileNativeIntentMessages["zh-TW"],
   ...mobilePartnerMessages["zh-TW"],
+  ...mobileExtensionMessages["zh-TW"],
   ...mobilePushMessages["zh-TW"],
   ...mobileUpdateMessages["zh-TW"],
   ...mobileVoiceMessages["zh-TW"],
@@ -1282,6 +1286,7 @@ const ja: MobileMessageCatalog = {
   ...mobileAutomationMessages.ja,
   ...mobileNativeIntentMessages.ja,
   ...mobilePartnerMessages.ja,
+  ...mobileExtensionMessages.ja,
   ...mobilePushMessages.ja,
   ...mobileUpdateMessages.ja,
   ...mobileVoiceMessages.ja,
@@ -1601,6 +1606,7 @@ const ko: MobileMessageCatalog = {
   ...mobileAutomationMessages.ko,
   ...mobileNativeIntentMessages.ko,
   ...mobilePartnerMessages.ko,
+  ...mobileExtensionMessages.ko,
   ...mobilePushMessages.ko,
   ...mobileUpdateMessages.ko,
   ...mobileVoiceMessages.ko,

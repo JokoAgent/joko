@@ -84,6 +84,7 @@ import {
 } from "./mobile-composer-document";
 import { createMobileAutomationDraft } from "./mobile-automation-authoring";
 import { parseMobileNativeIntent } from "./mobile-native-intent";
+import type { MobileExtension } from "./mobile-extensions";
 
 const credential: PairedCredential = {
   profileId: "mobile-profile", origin: "http://192.168.1.20:4318", serverId: "node-1", connectionId: "mobile-connection",
@@ -948,6 +949,8 @@ function fakeNetwork(): MobileNetwork {
     readOwner: vi.fn(async () => ({ connection, device, snapshot })),
     listPartners: vi.fn(async () => []),
     listPartnerSessions: vi.fn(async () => create(ListPartnerSessionsResponseSchema, { sessions: [] })),
+    listExtensions: vi.fn(async () => ({ revision: 1n, recoveredFromCorruption: false, extensions: [] })),
+    getExtension: vi.fn(async () => { throw new Error("No Extension fixture was configured."); }),
     listPartnerPrivateThreads: vi.fn(async () => []),
     getPartnerPrivateThread: vi.fn(async () => { throw new Error("No private thread fixture was configured."); }),
     markPartnerPrivateThreadRead: vi.fn(async () => { throw new Error("No private read fixture was configured."); }),
@@ -1771,6 +1774,70 @@ function iosClient(network: MobileNetwork, storage: MobileStorage): MobileClient
 }
 afterEach(() => { for (const item of clients.splice(0)) item.dispose(); vi.useRealTimers(); });
 
+describe("mobile Extension catalog authority", () => {
+  it("lists and opens only an exact current installed descriptor", async () => {
+    const network = fakeNetwork();
+    const extension = mobileExtensionFixture();
+    network.listExtensions = vi.fn(async () => ({
+      revision: 4n,
+      recoveredFromCorruption: false,
+      extensions: [extension]
+    }));
+    network.getExtension = vi.fn(async () => extension);
+    const app = client(network, memoryStorage(credential).storage);
+    await app.start();
+
+    const transport = app.extensionCatalogTransport()!;
+    await expect(transport.list(new AbortController().signal)).resolves.toMatchObject({
+      revision: 4n,
+      extensions: [{ extensionId: extension.extensionId }]
+    });
+    await expect(transport.detail(extension, new AbortController().signal)).resolves.toBe(extension);
+    expect(network.listExtensions).toHaveBeenCalledExactlyOnceWith(credential, expect.any(AbortSignal));
+    expect(network.getExtension).toHaveBeenCalledExactlyOnceWith(
+      credential,
+      extension.extensionId,
+      expect.any(AbortSignal)
+    );
+  });
+
+  it("rejects changed detail and retires late catalog responses with their owner", async () => {
+    const network = fakeNetwork();
+    const extension = mobileExtensionFixture();
+    network.getExtension = vi.fn(async () => ({ ...extension, revision: 2n }));
+    const app = client(network, memoryStorage(credential).storage);
+    await app.start();
+    const transport = app.extensionCatalogTransport()!;
+
+    await expect(transport.detail(extension, new AbortController().signal)).rejects.toThrow(/changed/u);
+
+    let finish!: (catalog: Awaited<ReturnType<MobileNetwork["listExtensions"]>>) => void;
+    network.listExtensions = vi.fn(() => new Promise<Awaited<ReturnType<MobileNetwork["listExtensions"]>>>(
+      (resolve) => { finish = resolve; }
+    ));
+    const pending = transport.list(new AbortController().signal);
+    app.setForeground(false);
+    finish({ revision: 4n, recoveredFromCorruption: false, extensions: [extension] });
+    await expect(pending).rejects.toThrow(/owner changed/u);
+    expect(app.extensionCatalogTransport()).toBeUndefined();
+  });
+
+  it("rejects a late detail response after foreground retirement", async () => {
+    const network = fakeNetwork();
+    const extension = mobileExtensionFixture();
+    let finish!: (value: MobileExtension) => void;
+    network.getExtension = vi.fn(() => new Promise<MobileExtension>((resolve) => { finish = resolve; }));
+    const app = client(network, memoryStorage(credential).storage);
+    await app.start();
+    const transport = app.extensionCatalogTransport()!;
+    const pending = transport.detail(extension, new AbortController().signal);
+
+    app.setForeground(false);
+    finish(extension);
+    await expect(pending).rejects.toThrow(/owner changed/u);
+  });
+});
+
 describe("mobile Partner private authority", () => {
   it("previews authorized Partner Artifacts and opens only the revalidated canonical task", async () => {
     const network = fakeNetwork();
@@ -1923,6 +1990,33 @@ describe("mobile Partner private authority", () => {
     expect(app.state.partnerPrivate.status).toBe("offline");
   });
 });
+
+function mobileExtensionFixture(): MobileExtension {
+  return {
+    extensionId: "extension_0123456789abcdef0123456789abcdef",
+    revision: 1n,
+    owner: {
+      kind: "resource",
+      resourceId: "resource-1",
+      discoveredRevision: `sha256:${"a".repeat(64)}`,
+      resourceRevision: 3n
+    },
+    source: "local",
+    installed: true,
+    installState: "installed",
+    name: "Mail",
+    description: "Review mail.",
+    enabled: true,
+    sidebarSupported: false,
+    sidebarVisible: false,
+    tools: [],
+    permissions: [],
+    commands: [],
+    setup: { state: "notRequired", revision: 0n, fields: [] },
+    useSupported: true,
+    updateAvailable: false
+  };
+}
 
 describe("native mobile push authority", () => {
   it("binds registration to the exact current iOS profile, Connection, Device revision, and late-response fence", async () => {

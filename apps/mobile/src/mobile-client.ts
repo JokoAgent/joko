@@ -81,6 +81,10 @@ import {
   type MobilePartnerResourceTransport
 } from "./mobile-partner-resources";
 import {
+  mobileExtensionKey,
+  type MobileExtensionTransport
+} from "./mobile-extensions";
+import {
   artifactTitle,
   bytesToDataUri,
   canonicalWorkspacePath,
@@ -865,6 +869,37 @@ export class MobileClient {
           throw new Error("The Partner canonical task was not selected by the current owner.");
         }
         return preview.session.sessionId;
+      }
+    };
+  }
+
+  extensionCatalogTransport(): MobileExtensionTransport | undefined {
+    const context = this.#partnerPrivateContext();
+    if (!context) return undefined;
+    const ownerKey = context.authorityKey;
+    const requireCurrent = (signal: AbortSignal): void => {
+      signal.throwIfAborted();
+      if (this.#partnerPrivateAuthorityKey(this.#state) !== ownerKey || this.#credential !== context.credential) {
+        throw new Error("The Extension catalog owner changed.");
+      }
+    };
+    return {
+      ownerKey,
+      list: async (signal) => {
+        requireCurrent(signal);
+        const catalog = await this.network.listExtensions(context.credential, signal);
+        requireCurrent(signal);
+        return catalog;
+      },
+      detail: async (expected, signal) => {
+        requireCurrent(signal);
+        if (!expected.installed) throw new Error("Select an installed Extension.");
+        const extension = await this.network.getExtension(context.credential, expected.extensionId, signal);
+        requireCurrent(signal);
+        if (mobileExtensionKey(extension) !== mobileExtensionKey(expected)) {
+          throw new Error("The Extension changed; refresh the catalog before opening its details.");
+        }
+        return extension;
       }
     };
   }
