@@ -379,6 +379,15 @@ message DevicePeerSetRemoteDesktopControlAction {
   bool enabled = 2;
 }
 
+message DevicePeerSetRemoteDesktopPresentationAction {
+  string lease_id = 1;
+  bool enabled = 2;
+}
+
+message DevicePeerProbeRemoteDesktopPresentationAction {
+  string lease_id = 1;
+}
+
 message DevicePeerSendRemoteDesktopInputAction {
   string lease_id = 1;
   uint64 sequence = 2;
@@ -389,6 +398,7 @@ message DevicePeerCreateRemoteDesktopOfferAction {
   string lease_id = 1;
   string attempt_id = 2;
   string offer_sdp = 3;
+  RemoteDesktopVideoSettings settings = 4;
 }
 
 message DevicePeerExchangeRemoteDesktopIceAction {
@@ -449,6 +459,8 @@ message DevicePeerCommand {
     DevicePeerGetRemoteDesktopFrameAction get_remote_desktop_frame = 60;
     RemoteDesktopClipboardTextRequest transfer_remote_desktop_clipboard_text = 61;
     RemoteDesktopClipboardContentRequest transfer_remote_desktop_clipboard_content = 62;
+    DevicePeerSetRemoteDesktopPresentationAction set_remote_desktop_presentation = 63;
+    DevicePeerProbeRemoteDesktopPresentationAction probe_remote_desktop_presentation = 64;
   }
 }
 
@@ -627,6 +639,7 @@ message DevicePeerAgentResult {
     RemoteDesktopFrameResult remote_desktop_frame = 46;
     RemoteDesktopClipboardTextResult remote_desktop_clipboard_text = 47;
     RemoteDesktopClipboardContentResult remote_desktop_clipboard_content = 48;
+    RemoteDesktopPresentationProof remote_desktop_presentation_proof = 49;
     DevicePeerFailure failure = 30;
   }
 }

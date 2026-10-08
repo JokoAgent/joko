@@ -9,6 +9,7 @@ import {
   parseRemoteDesktopClipboardContentJson,
   parseRemoteDesktopHostCapabilities,
   parseRemoteDesktopRequest,
+  parseRemoteDesktopVideoSettings,
   stringifyRemoteDesktopClipboardContent,
   type RemoteDesktopHostCapabilities,
   type RemoteDesktopLease
@@ -50,7 +51,10 @@ const CAPABILITIES: RemoteDesktopHostCapabilities = Object.freeze({
   ]),
   permissions: Object.freeze({ screenRecording: "granted", accessibility: "granted" }),
   clipboardText: true,
-  clipboardContent: true
+  clipboardContent: true,
+  videoSettings: true,
+  systemAudio: true,
+  backgroundViewing: true
 });
 
 describe("remote desktop portable protocol", () => {
@@ -69,6 +73,10 @@ describe("remote desktop portable protocol", () => {
       .toThrowError("INVALID_REMOTE_DESKTOP_REQUEST");
     expect(() => parseRemoteDesktopRequest({ op: "offer", lease: "lease-1", sdp: "offer" }))
       .toThrowError("INVALID_REMOTE_DESKTOP_REQUEST");
+    expect(parseRemoteDesktopVideoSettings({ fps: 60, bitrate: 8_000_000, audio: true }))
+      .toEqual({ fps: 60, bitrate: 8_000_000, audio: true });
+    expect(() => parseRemoteDesktopVideoSettings({ fps: 24, bitrate: 8_000_000, audio: true }))
+      .toThrowError("INVALID_REMOTE_DESKTOP_VIDEO_SETTINGS");
     expect(() => parseRemoteDesktopRequest({
       op: "input",
       lease: "lease-1",
@@ -101,10 +109,9 @@ describe("remote desktop portable protocol", () => {
       .toThrowError("REMOTE_DESKTOP_CLIPBOARD_UNSUPPORTED");
   });
 
-  it("sanitizes host capabilities to the admitted first-batch surface", () => {
+  it("sanitizes host capabilities to the admitted media surface", () => {
     expect(parseRemoteDesktopHostCapabilities({
       ...CAPABILITIES,
-      systemAudio: true,
       clipboardText: true,
       cursorOverlay: true
     })).toEqual(CAPABILITIES);
@@ -207,6 +214,37 @@ describe("remote desktop finite authority controller", () => {
     fixture.controller.tick();
     expect(fixture.controller.state).toBeUndefined();
     expect(fixture.dependencies.stopVideo).toHaveBeenCalledTimes(1);
+  });
+
+  it("makes presentation view-only and renews only from trusted monotonic pongs", async () => {
+    const fixture = controllerFixture();
+    const lease = await start(fixture);
+    const controlled = await fixture.controller.request(AUTHORITY, {
+      op: "control", lease: lease.lease, enabled: true
+    }) as { readonly controlGeneration: number };
+    const presentation = await fixture.controller.request(AUTHORITY, {
+      op: "presentation", lease: lease.lease, enabled: true
+    });
+    expect(presentation).toEqual({ controlling: false, controlGeneration: controlled.controlGeneration + 1 });
+    expect(fixture.dependencies.stopInput).toHaveBeenCalled();
+    expect(fixture.controller.probePresentation(AUTHORITY, lease.lease)).toEqual({
+      lease: lease.lease,
+      proofSequence: 0
+    });
+
+    fixture.now += REMOTE_DESKTOP_LEASE_MS - 1;
+    fixture.controller.recordPresentationPong("stale-lease");
+    expect(fixture.controller.probePresentation(AUTHORITY, lease.lease).proofSequence).toBe(0);
+    fixture.controller.recordPresentationPong(lease.lease);
+    expect(fixture.controller.probePresentation(AUTHORITY, lease.lease).proofSequence).toBe(1);
+    fixture.now += REMOTE_DESKTOP_LEASE_MS - 1;
+    fixture.controller.tick();
+    expect(fixture.controller.state).toBeDefined();
+
+    await fixture.controller.request(AUTHORITY, { op: "control", lease: lease.lease, enabled: true });
+    fixture.controller.recordPresentationPong(lease.lease);
+    expect(() => fixture.controller.probePresentation(AUTHORITY, lease.lease))
+      .toThrowError("REMOTE_DESKTOP_LEASE_EXPIRED");
   });
 
   it("fences automatic resume after local Disconnect but permits an explicit fresh start", async () => {

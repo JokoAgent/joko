@@ -26,7 +26,7 @@ import {
   type RemoteDesktopClipboardTextRequest, type RemoteDesktopClipboardTextResult,
   type RemoteDesktopIceCandidate, type RemoteDesktopIceExchangeResult, type RemoteDesktopIceServer,
   type RemoteDesktopInputEvent, type RemoteDesktopLease, type RemoteDesktopOfferResult,
-  type RemoteDesktopPermissions, type RemoteDesktopStartMode,
+  type RemoteDesktopPermissions, type RemoteDesktopStartMode, type RemoteDesktopVideoSettings,
   type WorkspaceSearchMatch, type WorkspaceChangeSet, type WorkspaceRewindPreview
 } from "@joko/contracts";
 import {
@@ -134,12 +134,15 @@ export interface MobileNetwork {
     signal?: AbortSignal): Promise<void>;
   setRemoteDesktopControl?(credential: PairedCredential, peer: DevicePeerRouteIdentity, leaseId: string,
     enabled: boolean, signal?: AbortSignal): Promise<RemoteDesktopControlState>;
+  setRemoteDesktopPresentation?(credential: PairedCredential, peer: DevicePeerRouteIdentity, leaseId: string,
+    enabled: boolean, signal?: AbortSignal): Promise<RemoteDesktopControlState>;
   sendRemoteDesktopInput?(credential: PairedCredential, peer: DevicePeerRouteIdentity, leaseId: string,
     sequence: bigint, events: readonly RemoteDesktopInputEvent[], signal?: AbortSignal): Promise<void>;
   getRemoteDesktopIceConfiguration?(credential: PairedCredential, peer: DevicePeerRouteIdentity, leaseId: string,
     signal?: AbortSignal): Promise<readonly RemoteDesktopIceServer[]>;
   createRemoteDesktopOffer?(credential: PairedCredential, peer: DevicePeerRouteIdentity, leaseId: string,
-    attemptId: string, offerSdp: string, signal?: AbortSignal): Promise<RemoteDesktopOfferResult>;
+    attemptId: string, offerSdp: string, settings: RemoteDesktopVideoSettings | undefined,
+    signal?: AbortSignal): Promise<RemoteDesktopOfferResult>;
   exchangeRemoteDesktopIce?(credential: PairedCredential, peer: DevicePeerRouteIdentity, leaseId: string,
     attemptId: string, candidates: readonly RemoteDesktopIceCandidate[], after: number,
     signal?: AbortSignal): Promise<RemoteDesktopIceExchangeResult>;
@@ -1227,6 +1230,13 @@ export const mobileNetwork: MobileNetwork = {
     if (!response.state) throw new Error("The Joko node returned no Remote Desktop control state.");
     return response.state;
   },
+  async setRemoteDesktopPresentation(credential, peer, leaseId, enabled, signal) {
+    const response = await createClient(RemoteDesktopService, transport(credential.origin, credential.authKey))
+      .setRemoteDesktopPresentation({ peer, leaseId, enabled }, options(signal));
+    assertRemoteDesktopPeer(peer, response.peer);
+    if (!response.state) throw new Error("The Joko node returned no Remote Desktop presentation state.");
+    return response.state;
+  },
   async sendRemoteDesktopInput(credential, peer, leaseId, sequence, events, signal) {
     const response = await createClient(RemoteDesktopService, transport(credential.origin, credential.authKey))
       .sendRemoteDesktopInput({ peer, leaseId, sequence, events: [...events] }, options(signal));
@@ -1238,9 +1248,9 @@ export const mobileNetwork: MobileNetwork = {
     assertRemoteDesktopPeer(peer, response.peer);
     return Object.freeze([...response.iceServers]);
   },
-  async createRemoteDesktopOffer(credential, peer, leaseId, attemptId, offerSdp, signal) {
+  async createRemoteDesktopOffer(credential, peer, leaseId, attemptId, offerSdp, settings, signal) {
     const response = await createClient(RemoteDesktopService, transport(credential.origin, credential.authKey))
-      .createRemoteDesktopOffer({ peer, leaseId, attemptId, offerSdp }, options(signal));
+      .createRemoteDesktopOffer({ peer, leaseId, attemptId, offerSdp, settings }, options(signal));
     assertRemoteDesktopPeer(peer, response.peer);
     if (!response.offer || response.offer.attemptId !== attemptId || !response.offer.answerSdp) {
       throw new Error("The Joko node returned an invalid Remote Desktop answer.");

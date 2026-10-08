@@ -119,6 +119,20 @@ export function createRemoteDesktopConnectService(
       });
     }),
 
+    setRemoteDesktopPresentation: (request, context) => remoteDesktopRpc(async () => {
+      const connection = authenticate(dependencies.connections, context);
+      const peer = fromProtoRouteIdentity(request.peer);
+      const state = await dependencies.coordinator.setPresentation(connection, peer, {
+        leaseId: request.leaseId,
+        enabled: request.enabled
+      }, context.signal);
+      dependencies.connections.fence(connection);
+      return create(contract.SetRemoteDesktopPresentationResponseSchema, {
+        peer: toProtoRouteIdentity(peer),
+        state
+      });
+    }),
+
     sendRemoteDesktopInput: (request, context) => remoteDesktopRpc(async () => {
       const connection = authenticate(dependencies.connections, context);
       const peer = fromProtoRouteIdentity(request.peer);
@@ -153,7 +167,8 @@ export function createRemoteDesktopConnectService(
       const offer = await dependencies.coordinator.createOffer(connection, peer, {
         leaseId: request.leaseId,
         attemptId: request.attemptId,
-        offerSdp: request.offerSdp
+        offerSdp: request.offerSdp,
+        ...(request.settings === undefined ? {} : { settings: request.settings })
       }, context.signal);
       dependencies.connections.fence(connection);
       return create(contract.CreateRemoteDesktopOfferResponseSchema, {

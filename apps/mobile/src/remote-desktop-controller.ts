@@ -23,6 +23,7 @@ import {
   RemoteDesktopScrollInputSchema,
   RemoteDesktopStartMode,
   RemoteDesktopTextInputSchema,
+  RemoteDesktopVideoSettingsSchema,
   type DevicePeerDescriptor,
   type RemoteDesktopCapabilities,
   type RemoteDesktopClipboardContentRequest,
@@ -37,7 +38,8 @@ import {
   type RemoteDesktopInputEvent,
   type RemoteDesktopLease,
   type RemoteDesktopOfferResult,
-  type RemoteDesktopPermissions
+  type RemoteDesktopPermissions,
+  type RemoteDesktopVideoSettings
 } from "@joko/contracts";
 import {
   MOBILE_REMOTE_CLIPBOARD_CHUNK_CHARS,
@@ -48,6 +50,11 @@ import {
   serializeMobileRemoteClipboardItem,
   type MobileRemoteClipboardSystem
 } from "./mobile-remote-desktop-clipboard";
+import {
+  MOBILE_REMOTE_DESKTOP_DEFAULT_VIDEO_SETTINGS,
+  isMobileRemoteDesktopVideoSettings,
+  type MobileRemoteDesktopVideoSettings
+} from "./mobile-remote-desktop-video-preference";
 
 export const MOBILE_REMOTE_DESKTOP_HEARTBEAT_MS = 3_000;
 export const MOBILE_REMOTE_DESKTOP_FRAME_MS = 250;
@@ -64,7 +71,8 @@ export type MobileRemoteDesktopNotice =
   | "no-hosts" | "unavailable" | "screen-permission" | "screen-permission-guide"
   | "authority-changed" | "compatibility" | "input-overflow" | "view-only"
   | "accessibility-permission" | "input-busy" | "input-unavailable"
-  | "busy" | "stopped" | "viewer-restarted" | "generic-error";
+  | "busy" | "stopped" | "viewer-restarted" | "audio-unavailable"
+  | "video-settings-failed" | "pip-unavailable" | "generic-error";
 
 export type MobileRemoteDesktopClipboardNotice =
   | "copied" | "pasted" | "empty" | "unsupported" | "too-large"
@@ -85,7 +93,17 @@ export interface MobileRemoteDesktopSnapshot {
   readonly clipboardAvailable: boolean;
   readonly clipboardBusy: boolean;
   readonly clipboardNotice?: MobileRemoteDesktopClipboardNotice;
+  readonly videoSettings: MobileRemoteDesktopVideoSettings;
+  readonly videoSettingsBusy: boolean;
+  readonly pipAvailable: boolean;
+  readonly presenting: boolean;
   readonly notice?: MobileRemoteDesktopNotice;
+}
+
+export interface MobileRemoteDesktopPresentation {
+  readonly nativePictureInPicture: boolean;
+  readonly requiresPlaybackSession: boolean;
+  playback(enabled: boolean): Promise<void>;
 }
 
 export interface MobileRemoteDesktopTransport {
@@ -102,11 +120,14 @@ export interface MobileRemoteDesktopTransport {
   stop(host: DevicePeerDescriptor, leaseId: string, signal?: AbortSignal): Promise<void>;
   control(host: DevicePeerDescriptor, leaseId: string, enabled: boolean,
     signal?: AbortSignal): Promise<RemoteDesktopControlState>;
+  presentation(host: DevicePeerDescriptor, leaseId: string, enabled: boolean,
+    signal?: AbortSignal): Promise<RemoteDesktopControlState>;
   input(host: DevicePeerDescriptor, leaseId: string, sequence: bigint,
     events: readonly RemoteDesktopInputEvent[], signal?: AbortSignal): Promise<void>;
   iceConfiguration(host: DevicePeerDescriptor, leaseId: string,
     signal?: AbortSignal): Promise<readonly RemoteDesktopIceServer[]>;
   offer(host: DevicePeerDescriptor, leaseId: string, attemptId: string, sdp: string,
+    settings: RemoteDesktopVideoSettings | undefined,
     signal?: AbortSignal): Promise<RemoteDesktopOfferResult>;
   ice(host: DevicePeerDescriptor, leaseId: string, attemptId: string,
     candidates: readonly RemoteDesktopIceCandidate[], after: number,
@@ -152,7 +173,11 @@ const initialSnapshot = (): MobileRemoteDesktopSnapshot => Object.freeze({
   hasFrame: false,
   takeoverAvailable: false,
   clipboardAvailable: false,
-  clipboardBusy: false
+  clipboardBusy: false,
+  videoSettings: MOBILE_REMOTE_DESKTOP_DEFAULT_VIDEO_SETTINGS,
+  videoSettingsBusy: false,
+  pipAvailable: false,
+  presenting: false
 });
 
 const RETRY_MS = Object.freeze([1_000, 3_000, 8_000] as const);
@@ -206,12 +231,24 @@ export class MobileRemoteDesktopController {
   #controlGeneration = 0n;
   #clipboardSequence = 0;
   #clipboardOperation?: ClipboardOperation;
+  #audioUnavailable = false;
+  #playbackActive = false;
+  #playbackDesired = false;
+  #playbackOperation: Promise<void> = Promise.resolve();
+  #presentationState: "idle" | "requesting" | "active" = "idle";
+  #presentationTimer?: ReturnType<typeof setTimeout>;
+  #settingsApplying = false;
+  #pendingSettingsReconnect = false;
+  #offerPending = false;
+  #queuedOffer?: { readonly epoch: string; readonly attemptId: string; readonly sdp: string };
+  #viewerPipSupported = false;
   #viewerSink: (message: MobileRemoteDesktopViewerCommand) => void = () => undefined;
 
   constructor(
     readonly transport: MobileRemoteDesktopTransport,
     private readonly preferredDeviceId?: string,
-    private readonly clipboard?: MobileRemoteClipboardSystem
+    private readonly clipboard?: MobileRemoteClipboardSystem,
+    private readonly presentation?: MobileRemoteDesktopPresentation
   ) {}
 
   get snapshot(): MobileRemoteDesktopSnapshot { return this.#snapshot; }
@@ -351,6 +388,90 @@ export class MobileRemoteDesktopController {
     }
   }
 
+  updateVideoSettings(settings: MobileRemoteDesktopVideoSettings): void {
+    if (!isMobileRemoteDesktopVideoSettings(settings) || this.#disposed) return;
+    const previous = this.#snapshot.videoSettings;
+    if (sameVideoSettings(previous, settings)) return;
+    if (previous.audio !== settings.audio) this.#audioUnavailable = false;
+    this.#set({ ...this.#snapshot, videoSettings: Object.freeze({ ...settings }),
+      pipAvailable: false, notice: undefined });
+    if (!this.#snapshot.capabilities?.videoSettings || !this.#lease) return;
+    this.#pendingSettingsReconnect = true;
+    void this.#flushVideoSettings();
+  }
+
+  async startPictureInPicture(): Promise<void> {
+    const host = this.#snapshot.host;
+    const lease = this.#lease;
+    const generation = this.#generation;
+    if (!host || !lease || this.#presentationState !== "idle" || this.#settingsApplying
+      || !this.#snapshot.pipAvailable || !this.#snapshot.capabilities?.backgroundViewing
+      || !this.presentation?.nativePictureInPicture || this.#snapshot.media !== "webrtc"
+      || !this.#snapshot.hasFrame || !this.#interactive || !this.#ready(generation)) return;
+    this.#settingsApplying = true;
+    this.#set({ ...this.#snapshot, videoSettingsBusy: true, notice: undefined });
+    try {
+      await this.#setPlayback(true);
+    } catch {
+      // Native playback is prepared before changing host authority. Failure is
+      // therefore known-not-dispatched: retain the lease and control, mute this
+      // occurrence, and let the viewer negotiate the degraded settings.
+      this.#audioUnavailable = true;
+      this.#settingsApplying = false;
+      this.#pendingSettingsReconnect = true;
+      this.#set({ ...this.#snapshot, videoSettingsBusy: false, notice: "audio-unavailable" });
+      void this.#setPlayback(false).catch(() => undefined);
+      void this.#flushVideoSettings();
+      return;
+    }
+    let dispatched = false;
+    try {
+      if (!this.#ready(generation) || this.#lease?.leaseId !== lease.leaseId) {
+        await this.#setPlayback(false).catch(() => undefined);
+        return;
+      }
+      dispatched = true;
+      const state = await this.transport.presentation(host, lease.leaseId, true, this.#request.signal);
+      if (!this.#ready(generation) || this.#lease?.leaseId !== lease.leaseId) {
+        await this.#setPlayback(false).catch(() => undefined);
+        if (this.#lease?.leaseId === lease.leaseId) this.#endLease(true);
+        return;
+      }
+      if (!validControlGeneration(state.controlGeneration) || state.controlling) {
+        throw new Error("Invalid Remote Desktop presentation state.");
+      }
+      if (!this.#adoptControlGeneration(state.controlGeneration)) {
+        throw new Error("Stale Remote Desktop presentation state.");
+      }
+      this.#retireClipboardOperation();
+      this.#presentationState = "requesting";
+      this.#set({ ...this.#snapshot, controlling: false, wantedControl: false,
+        presenting: false, videoSettingsBusy: false, pipAvailable: false });
+      this.#emit({ type: "control", enabled: false });
+      this.#emit({ type: "releaseInput" });
+      this.#emit({ type: "presentation", enabled: true });
+      this.#presentationTimer = setTimeout(() => {
+        if (this.#presentationState !== "requesting") return;
+        void this.#presentationFailed();
+      }, 4_000);
+    } catch {
+      if (!this.#lease || this.#lease.leaseId !== lease.leaseId) return;
+      this.#presentationState = "idle";
+      this.#set({ ...this.#snapshot, presenting: false, videoSettingsBusy: false,
+        notice: "pip-unavailable" });
+      void this.#setPlayback(false).catch(() => undefined);
+      if (dispatched) {
+        // A lost response has an unknown host-side control transition. Retire
+        // this lease rather than presenting stale local control authority.
+        this.#resumeEligible = false;
+        this.#endLease(true);
+        if (this.#foreground && this.#online && this.#interactive) this.#scheduleReconnect();
+      }
+    } finally {
+      this.#settingsApplying = false;
+    }
+  }
+
   setInputMode(mode: MobileRemoteDesktopInputMode): void {
     this.#set({ ...this.#snapshot, inputMode: mode });
     this.#emit({ type: "mode", mode });
@@ -371,9 +492,11 @@ export class MobileRemoteDesktopController {
     if (this.#foreground === foreground || this.#disposed) return;
     this.#foreground = foreground;
     if (!foreground) {
-      this.#pause("reconnecting", true);
+      if (this.#presentationState === "active") this.#suspendPresentation();
+      else this.#pause("reconnecting", true);
     } else if (this.#online && this.#interactive) {
-      void this.#resume();
+      if (this.#presentationState === "active") void this.#finishPresentation();
+      else void this.#resume();
     }
   }
 
@@ -387,8 +510,10 @@ export class MobileRemoteDesktopController {
       const releaseSequence = this.#viewerReleaseSequence;
       this.#emit({ type: "control", enabled: false });
       this.#emit({ type: "releaseInput" });
-      this.#emit({ type: "stop", preserveFrame: true });
-      this.#retireViewerEpoch();
+      if (this.#presentationState === "idle") {
+        this.#emit({ type: "stop", preserveFrame: true });
+        this.#retireViewerEpoch();
+      }
       this.#stopFrameLoop();
       if (host && lease && this.#snapshot.controlling && this.#ready(generation)) {
         const pending = this.#releaseInputForInteractionFence(host, lease, generation, releaseSequence);
@@ -400,7 +525,10 @@ export class MobileRemoteDesktopController {
       }
       return;
     }
-    if (this.#foreground && this.#online) void this.#resumeInteraction();
+    if (this.#foreground && this.#online) {
+      if (this.#presentationState === "active") void this.#finishPresentation();
+      else if (this.#presentationState === "idle") void this.#resumeInteraction();
+    }
   }
 
   setOnline(online: boolean): void {
@@ -428,11 +556,39 @@ export class MobileRemoteDesktopController {
       return;
     }
     if (message.epoch !== this.#viewerEpoch) return;
+    if (message.type === "pipCapability") {
+      this.#viewerPipSupported = message.supported;
+      this.#refreshPipAvailability();
+      return;
+    }
+    if (message.type === "presentation") {
+      if (message.active) {
+        if (this.#presentationState !== "requesting") {
+          this.#emit({ type: "presentation", enabled: false });
+          return;
+        }
+        this.#clearPresentationTimer();
+        this.#presentationState = "active";
+        this.#set({ ...this.#snapshot, presenting: true, controlling: false, wantedControl: false });
+      } else if (this.#presentationState !== "idle") {
+        void this.#finishPresentation();
+      }
+      return;
+    }
+    if (message.type === "presentationFailed") {
+      if (this.#presentationState !== "idle") void this.#presentationFailed();
+      return;
+    }
     if (message.type === "streaming") {
       if (!this.#mediaAttemptCurrent(message.attemptId)) return;
       this.#stopFrameLoop();
       this.#retryIndex = 0;
-      this.#set({ ...this.#snapshot, status: "live", media: "webrtc", hasFrame: true, notice: undefined });
+      const settingsApplied = this.#settingsApplying;
+      this.#settingsApplying = false;
+      this.#set({ ...this.#snapshot, status: "live", media: "webrtc", hasFrame: true,
+        videoSettingsBusy: false, notice: this.#audioUnavailable ? "audio-unavailable" : undefined });
+      this.#refreshPipAvailability();
+      if (settingsApplied || this.#pendingSettingsReconnect) void this.#flushVideoSettings();
       return;
     }
     if (message.type === "reconnecting") {
@@ -444,9 +600,16 @@ export class MobileRemoteDesktopController {
     if (message.type === "fallback") {
       if (message.attemptId !== null && !this.#mediaAttemptCurrent(message.attemptId)) return;
       if (message.attemptId === null && this.#snapshot.capabilities?.webrtcVideo !== false) return;
+      const settingsFailed = this.#settingsApplying;
+      this.#settingsApplying = false;
+      this.#viewerPipSupported = false;
+      if (this.#presentationState !== "idle") void this.#presentationFailed();
       this.#startFrameLoop();
       this.#set({ ...this.#snapshot, status: "live", media: "jpeg",
-        notice: this.#snapshot.hasFrame ? undefined : "compatibility" });
+        videoSettingsBusy: false, pipAvailable: false,
+        notice: settingsFailed ? (this.#audioUnavailable ? "audio-unavailable" : "video-settings-failed")
+          : this.#snapshot.hasFrame ? undefined : "compatibility" });
+      if (this.#pendingSettingsReconnect) void this.#flushVideoSettings();
       return;
     }
     if (message.type === "framePresented") {
@@ -477,6 +640,16 @@ export class MobileRemoteDesktopController {
     if (this.#disposed || (!this.#viewerReady && this.#viewerEpoch === undefined)) return;
     this.#viewerReady = false;
     this.#retireViewerEpoch();
+    this.#viewerPipSupported = false;
+    if (this.#presentationState !== "idle") {
+      this.#presentationState = "idle";
+      this.#clearPresentationTimer();
+      void this.#setPlayback(false).catch(() => undefined);
+      this.#resumeEligible = false;
+      this.#endLease(true);
+      if (this.#foreground && this.#online && this.#interactive) this.#scheduleReconnect();
+      return;
+    }
     const host = this.#snapshot.host;
     const lease = this.#lease;
     const generation = this.#generation;
@@ -501,12 +674,14 @@ export class MobileRemoteDesktopController {
     const lease = this.#lease;
     this.#retireRequest();
     this.#stopTimers();
+    this.#resetPresentation();
     this.#emit({ type: "stop", preserveFrame: false });
     this.#viewerReady = false;
     this.#retireViewerEpoch();
     this.#lease = undefined;
     this.#controlGeneration = 0n;
     this.#resumeEligible = false;
+    await this.#setPlayback(false).catch(() => undefined);
     if (host && lease && this.transport.canStop()) {
       await this.transport.stop(host, lease.leaseId).catch(() => undefined);
     }
@@ -782,8 +957,27 @@ export class MobileRemoteDesktopController {
       this.#controlGeneration = lease.controlGeneration;
       this.#resumeEligible = true;
       this.#retryIndex = 0;
+      this.#audioUnavailable = false;
+      if (this.#snapshot.capabilities?.systemAudio && this.#snapshot.videoSettings.audio) {
+        try {
+          await this.#setPlayback(true);
+        } catch {
+          // Audio is optional. A native playback-session failure degrades this
+          // lease occurrence without discarding the saved user preference.
+          this.#audioUnavailable = true;
+          await this.#setPlayback(false).catch(() => undefined);
+        }
+      } else {
+        await this.#setPlayback(false).catch(() => undefined);
+      }
+      if (!this.#ready(generation) || this.#lease?.leaseId !== lease.leaseId) {
+        await this.#setPlayback(false).catch(() => undefined);
+        return;
+      }
       this.#set({ ...this.#snapshot, status: "live", controlling: lease.controlling,
-        wantedControl: lease.controlling, media: "none", takeoverAvailable: false, notice: undefined });
+        wantedControl: lease.controlling, media: "none", hasFrame: false,
+        takeoverAvailable: false, videoSettingsBusy: false, pipAvailable: false,
+        presenting: false, notice: this.#audioUnavailable ? "audio-unavailable" : undefined });
       this.#startHeartbeat();
       this.#sendInit();
       this.#startFrameLoop();
@@ -800,6 +994,7 @@ export class MobileRemoteDesktopController {
   }
 
   #startHeartbeat(): void {
+    if (this.#presentationState !== "idle") return;
     if (this.#heartbeatTimer !== undefined) clearInterval(this.#heartbeatTimer);
     this.#heartbeatTimer = setInterval(() => void this.#heartbeat(), MOBILE_REMOTE_DESKTOP_HEARTBEAT_MS);
   }
@@ -808,7 +1003,8 @@ export class MobileRemoteDesktopController {
     const host = this.#snapshot.host;
     const lease = this.#lease;
     const generation = this.#generation;
-    if (this.#heartbeatPending || !host || !lease || !this.#ready(generation)) return;
+    if (this.#heartbeatPending || this.#presentationState !== "idle"
+      || !host || !lease || !this.#ready(generation)) return;
     this.#heartbeatPending = true;
     try {
       const state = await this.transport.heartbeat(host, lease.leaseId, this.#request.signal);
@@ -828,7 +1024,7 @@ export class MobileRemoteDesktopController {
 
   #startFrameLoop(): void {
     if (!this.#snapshot.capabilities?.jpegFallback || this.#frameTimer !== undefined || this.#disposed
-      || !this.#interactive || this.#viewerEpoch === undefined) return;
+      || this.#presentationState !== "idle" || !this.#interactive || this.#viewerEpoch === undefined) return;
     this.#set({ ...this.#snapshot, media: this.#snapshot.media === "webrtc" ? "webrtc" : "jpeg" });
     void this.#frame();
     this.#frameTimer = setInterval(() => void this.#frame(), MOBILE_REMOTE_DESKTOP_FRAME_MS);
@@ -866,6 +1062,162 @@ export class MobileRemoteDesktopController {
     }
   }
 
+  async #flushVideoSettings(): Promise<void> {
+    const host = this.#snapshot.host;
+    const lease = this.#lease;
+    const generation = this.#generation;
+    if (!this.#pendingSettingsReconnect || this.#settingsApplying || this.#offerPending
+      || this.#presentationState !== "idle" || !host || !lease
+      || !this.#snapshot.capabilities?.videoSettings || !this.#ready(generation)) return;
+    this.#pendingSettingsReconnect = false;
+    this.#settingsApplying = true;
+    this.#set({ ...this.#snapshot, videoSettingsBusy: true,
+      notice: this.#audioUnavailable ? "audio-unavailable" : undefined });
+    if (this.#snapshot.videoSettings.audio && this.#snapshot.capabilities.systemAudio
+      && !this.#audioUnavailable) {
+      try {
+        await this.#setPlayback(true);
+      } catch {
+        this.#audioUnavailable = true;
+        await this.#setPlayback(false).catch(() => undefined);
+      }
+    } else {
+      await this.#setPlayback(false).catch(() => undefined);
+    }
+    if (this.#audioUnavailable && this.#snapshot.notice !== "audio-unavailable") {
+      this.#set({ ...this.#snapshot, notice: "audio-unavailable" });
+    }
+    if (!this.#ready(generation) || this.#lease?.leaseId !== lease.leaseId) {
+      this.#settingsApplying = false;
+      return;
+    }
+    if (!this.#viewerReady || this.#viewerEpoch === undefined) {
+      this.#settingsApplying = false;
+      this.#set({ ...this.#snapshot, videoSettingsBusy: false,
+        notice: this.#audioUnavailable ? "audio-unavailable" : undefined });
+      return;
+    }
+    this.#emit({ type: "videoSettings", audio: this.#negotiatedAudio() });
+  }
+
+  #negotiatedAudio(): boolean {
+    return this.#snapshot.capabilities?.systemAudio === true
+      && this.#snapshot.videoSettings.audio && !this.#audioUnavailable;
+  }
+
+  #negotiatedSettings(): RemoteDesktopVideoSettings | undefined {
+    if (!this.#snapshot.capabilities?.videoSettings) return undefined;
+    return create(RemoteDesktopVideoSettingsSchema, {
+      fps: this.#snapshot.videoSettings.fps,
+      bitrate: this.#snapshot.videoSettings.bitrate,
+      audio: this.#negotiatedAudio()
+    });
+  }
+
+  async #setPlayback(enabled: boolean): Promise<void> {
+    if (!this.presentation?.requiresPlaybackSession) return;
+    this.#playbackDesired = enabled;
+    const operation = this.#playbackOperation.catch(() => undefined).then(async () => {
+      while (this.#playbackDesired !== this.#playbackActive) {
+        const desired = this.#playbackDesired;
+        await this.presentation!.playback(desired);
+        this.#playbackActive = desired;
+      }
+    });
+    this.#playbackOperation = operation;
+    await operation;
+    if (this.#playbackDesired !== enabled || this.#playbackActive !== enabled) {
+      throw new Error("The Remote Desktop playback request was retired.");
+    }
+  }
+
+  #refreshPipAvailability(): void {
+    const available = this.#presentationState === "idle"
+      && this.#viewerPipSupported && this.presentation?.nativePictureInPicture === true
+      && this.#snapshot.capabilities?.backgroundViewing === true
+      && this.#snapshot.status === "live" && this.#snapshot.media === "webrtc"
+      && this.#snapshot.hasFrame && !this.#settingsApplying;
+    if (available !== this.#snapshot.pipAvailable) {
+      this.#set({ ...this.#snapshot, pipAvailable: available });
+    }
+  }
+
+  #suspendPresentation(): void {
+    this.#retireRequest();
+    this.#request = new AbortController();
+    this.#stopTimers();
+    this.#retireClipboardOperation();
+    this.#settingsApplying = false;
+    this.#offerPending = false;
+    this.#queuedOffer = undefined;
+    this.#set({ ...this.#snapshot, controlling: false, wantedControl: false,
+      clipboardBusy: false, videoSettingsBusy: false, pipAvailable: false });
+    this.#emit({ type: "control", enabled: false });
+    this.#emit({ type: "releaseInput" });
+  }
+
+  async #presentationFailed(): Promise<void> {
+    await this.#finishPresentation("pip-unavailable");
+  }
+
+  async #finishPresentation(notice?: MobileRemoteDesktopNotice): Promise<void> {
+    if (this.#presentationState === "idle") return;
+    const host = this.#snapshot.host;
+    const lease = this.#lease;
+    const generation = this.#generation;
+    this.#presentationState = "idle";
+    this.#clearPresentationTimer();
+    this.#emit({ type: "presentation", enabled: false });
+    this.#set({ ...this.#snapshot, presenting: false, pipAvailable: false,
+      controlling: false, wantedControl: false, ...(notice ? { notice } : {}) });
+    // Always release the presentation-owned audio session first. A foreground
+    // viewer that still wants system audio reacquires it below.
+    await this.#setPlayback(false).catch(() => undefined);
+    if (!host || !lease || !this.#foreground || !this.#online || !this.#interactive
+      || !this.transport.isCurrent()) {
+      this.#pause("reconnecting", true);
+      return;
+    }
+    try {
+      const state = await this.transport.presentation(host, lease.leaseId, false, this.#request.signal);
+      if (!this.#ready(generation) || this.#lease?.leaseId !== lease.leaseId) return;
+      if (!validControlGeneration(state.controlGeneration) || state.controlling) {
+        throw new Error("Invalid Remote Desktop presentation state.");
+      }
+      if (!this.#adoptControlGeneration(state.controlGeneration)) return;
+      if (this.#negotiatedAudio()) {
+        try { await this.#setPlayback(true); }
+        catch {
+          this.#audioUnavailable = true;
+          this.#pendingSettingsReconnect = true;
+          this.#set({ ...this.#snapshot, notice: "audio-unavailable" });
+        }
+      }
+      if (!this.#ready(generation) || this.#lease?.leaseId !== lease.leaseId) return;
+      this.#startHeartbeat();
+      this.#refreshPipAvailability();
+      if (this.#pendingSettingsReconnect) void this.#flushVideoSettings();
+    } catch {
+      if (this.#lease?.leaseId !== lease.leaseId) return;
+      await this.#setPlayback(false).catch(() => undefined);
+      this.#resumeEligible = false;
+      this.#endLease(true);
+      if (this.#foreground && this.#online && this.#interactive) this.#scheduleReconnect();
+    }
+  }
+
+  #clearPresentationTimer(): void {
+    if (this.#presentationTimer !== undefined) clearTimeout(this.#presentationTimer);
+    this.#presentationTimer = undefined;
+  }
+
+  #resetPresentation(): void {
+    const active = this.#presentationState !== "idle";
+    this.#presentationState = "idle";
+    this.#clearPresentationTimer();
+    if (active) this.#emit({ type: "presentation", enabled: false });
+  }
+
   async #iceConfiguration(attemptId: string): Promise<void> {
     const context = this.#mediaContext(attemptId);
     if (!context) return;
@@ -883,12 +1235,35 @@ export class MobileRemoteDesktopController {
   async #offer(attemptId: string, sdp: string): Promise<void> {
     const context = this.#mediaContext(attemptId);
     if (!context || !sdp || sdp.length > 64_000) return;
+    if (this.#offerPending) {
+      this.#queuedOffer = Object.freeze({ epoch: context.epoch, attemptId, sdp });
+      return;
+    }
+    this.#offerPending = true;
     try {
-      const answer = await this.transport.offer(context.host, context.lease.leaseId, attemptId, sdp, this.#request.signal);
+      const answer = await this.transport.offer(context.host, context.lease.leaseId, attemptId, sdp,
+        this.#negotiatedSettings(), this.#request.signal);
       if (!this.#mediaCurrent(context) || answer.attemptId !== attemptId) return;
       this.#emit({ type: "answer", epoch: this.#viewerEpoch, attemptId, sdp: answer.answerSdp });
-    } catch {
-      if (this.#mediaCurrent(context)) this.#emit({ type: "fallback", epoch: this.#viewerEpoch, attemptId, retry: true });
+    } catch (error) {
+      if (!this.#mediaCurrent(context)) return;
+      const failure = remoteDesktopFailure(error);
+      if (failure?.reason === RemoteDesktopFailureReason.AUDIO_UNAVAILABLE
+        && this.#negotiatedAudio()) {
+        this.#audioUnavailable = true;
+        this.#settingsApplying = true;
+        this.#set({ ...this.#snapshot, videoSettingsBusy: true, notice: "audio-unavailable" });
+        void this.#setPlayback(false).catch(() => undefined);
+        this.#emit({ type: "videoSettings", audio: false });
+      } else {
+        this.#emit({ type: "fallback", epoch: this.#viewerEpoch, attemptId, retry: true });
+      }
+    } finally {
+      this.#offerPending = false;
+      const queued = this.#queuedOffer;
+      this.#queuedOffer = undefined;
+      if (queued && queued.epoch === this.#viewerEpoch) void this.#offer(queued.attemptId, queued.sdp);
+      else if (this.#pendingSettingsReconnect && !this.#settingsApplying) void this.#flushVideoSettings();
     }
   }
 
@@ -940,6 +1315,7 @@ export class MobileRemoteDesktopController {
     this.#emit({ type: "init", epoch,
       width: display.width, height: display.height, trickleIce: this.#snapshot.capabilities.trickleIce,
       webrtc: this.#snapshot.capabilities.webrtcVideo,
+      audio: this.#negotiatedAudio(),
       sequenceBase: this.#viewerSequenceBase,
       sequenceLimit: this.#viewerSequenceLimit });
     this.#emit({ type: "mode", mode: this.#snapshot.inputMode });
@@ -1050,7 +1426,7 @@ export class MobileRemoteDesktopController {
 
   #scheduleReconnect(): void {
     if (this.#retryTimer !== undefined || !this.#foreground || !this.#interactive
-      || !this.#online || this.#disposed) return;
+      || !this.#online || this.#disposed || this.#presentationState !== "idle") return;
     if (this.#heartbeatTimer !== undefined) clearInterval(this.#heartbeatTimer);
     this.#heartbeatTimer = undefined;
     this.#stopFrameLoop();
@@ -1081,14 +1457,21 @@ export class MobileRemoteDesktopController {
     const lease = this.#lease;
     this.#retireRequest();
     this.#stopTimers();
+    this.#resetPresentation();
+    void this.#setPlayback(false).catch(() => undefined);
     this.#lease = undefined;
     this.#controlGeneration = 0n;
     this.#resumeEligible = !stop && lease !== undefined;
+    this.#settingsApplying = false;
+    this.#pendingSettingsReconnect = false;
+    this.#offerPending = false;
+    this.#queuedOffer = undefined;
     this.#emit({ type: "control", enabled: false });
     this.#emit({ type: "releaseInput" });
     this.#emit({ type: "stop", preserveFrame: true });
     this.#retireViewerEpoch();
-    this.#set({ ...this.#snapshot, status, controlling: false, wantedControl: false, media: "none" });
+    this.#set({ ...this.#snapshot, status, controlling: false, wantedControl: false, media: "none",
+      videoSettingsBusy: false, pipAvailable: false, presenting: false });
     if (stop && host && lease && this.transport.canStop()) void this.transport.stop(host, lease.leaseId).catch(() => undefined);
   }
 
@@ -1098,13 +1481,21 @@ export class MobileRemoteDesktopController {
     this.#retireRequest();
     this.#generation += 1;
     this.#stopTimers();
+    this.#resetPresentation();
+    void this.#setPlayback(false).catch(() => undefined);
     this.#lease = undefined;
     this.#controlGeneration = 0n;
     this.#resumeEligible = false;
+    this.#settingsApplying = false;
+    this.#pendingSettingsReconnect = false;
+    this.#offerPending = false;
+    this.#queuedOffer = undefined;
     this.#emit({ type: "control", enabled: false });
     this.#emit({ type: "releaseInput" });
     this.#emit({ type: "stop", preserveFrame: true });
     this.#retireViewerEpoch();
+    this.#set({ ...this.#snapshot, controlling: false, wantedControl: false,
+      videoSettingsBusy: false, pipAvailable: false, presenting: false });
     if (stop && host && lease && this.transport.canStop()) void this.transport.stop(host, lease.leaseId).catch(() => undefined);
   }
 
@@ -1139,13 +1530,17 @@ export class MobileRemoteDesktopController {
   #retireViewerEpoch(): void {
     this.#viewerEpoch = undefined;
     this.#mediaAttempt = undefined;
+    this.#queuedOffer = undefined;
     this.#frameAwaitingPresentation = undefined;
+    this.#viewerPipSupported = false;
+    if (this.#snapshot.pipAvailable) this.#set({ ...this.#snapshot, pipAvailable: false });
   }
 
   async #resumeInteraction(): Promise<void> {
     const pending = this.#interactionRelease;
     if (pending !== undefined) await pending.catch(() => undefined);
-    if (this.#disposed || !this.#interactive || !this.#foreground || !this.#online
+    if (this.#disposed || this.#presentationState !== "idle"
+      || !this.#interactive || !this.#foreground || !this.#online
       || !this.transport.isCurrent()) return;
     if (!this.#lease) {
       await this.#resume();
@@ -1230,6 +1625,9 @@ export class MobileRemoteDesktopController {
 
 type ViewerMessage =
   | { readonly type: "ready" }
+  | { readonly type: "pipCapability"; readonly epoch: string; readonly supported: boolean }
+  | { readonly type: "presentation"; readonly epoch: string; readonly active: boolean }
+  | { readonly type: "presentationFailed"; readonly epoch: string }
   | { readonly type: "streaming" | "reconnecting"; readonly epoch: string; readonly attemptId: string }
   | { readonly type: "fallback"; readonly epoch: string; readonly attemptId: string | null }
   | { readonly type: "framePresented"; readonly epoch: string; readonly frameId: string; readonly presented: boolean }
@@ -1249,6 +1647,13 @@ function parseViewerMessage(raw: unknown): ViewerMessage | undefined {
   if (!isRecord(value) || typeof value.type !== "string") return undefined;
   if (value.type === "ready") return { type: "ready" };
   if (typeof value.epoch !== "string" || value.epoch.length < 1 || value.epoch.length > 256) return undefined;
+  if (value.type === "pipCapability" && typeof value.supported === "boolean") {
+    return { type: "pipCapability", epoch: value.epoch, supported: value.supported };
+  }
+  if (value.type === "presentation" && typeof value.active === "boolean") {
+    return { type: "presentation", epoch: value.epoch, active: value.active };
+  }
+  if (value.type === "presentationFailed") return { type: "presentationFailed", epoch: value.epoch };
   if (value.type === "inputOverflow") return { type: "inputOverflow", epoch: value.epoch };
   if (value.type === "framePresented" && typeof value.frameId === "string"
     && value.frameId.length >= 1 && value.frameId.length <= 512 && typeof value.presented === "boolean") {
@@ -1394,6 +1799,13 @@ function validControlGeneration(value: bigint): boolean {
 function validTransferId(value: string | undefined): value is string {
   return typeof value === "string"
     && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u.test(value);
+}
+
+function sameVideoSettings(
+  left: MobileRemoteDesktopVideoSettings,
+  right: MobileRemoteDesktopVideoSettings
+): boolean {
+  return left.fps === right.fps && left.bitrate === right.bitrate && left.audio === right.audio;
 }
 
 function encodeBase64(bytes: Uint8Array): string {

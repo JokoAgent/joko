@@ -23,6 +23,8 @@ import {
   DevicePeerResponsePhase,
   DevicePeerSendRemoteDesktopInputActionSchema,
   DevicePeerSetRemoteDesktopControlActionSchema,
+  DevicePeerSetRemoteDesktopPresentationActionSchema,
+  DevicePeerProbeRemoteDesktopPresentationActionSchema,
   DevicePeerShowRemoteDesktopPermissionGuideActionSchema,
   DevicePeerStartRemoteDesktopActionSchema,
   DevicePeerStartProcessActionSchema,
@@ -52,10 +54,12 @@ import {
   RemoteDesktopLeaseSchema,
   RemoteDesktopOfferResultSchema,
   RemoteDesktopPermissionsSchema,
+  RemoteDesktopPresentationProofSchema,
   RemoteDesktopPermissionStatus,
   RemoteDesktopPointerMoveInputSchema,
   RemoteDesktopTextInputSchema,
-  RemoteDesktopStartMode
+  RemoteDesktopStartMode,
+  RemoteDesktopVideoSettingsSchema
 } from "@joko/contracts";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -241,6 +245,15 @@ describe("Node Device peer Remote Desktop host ownership", () => {
         sequence: 0n
       })
     }, DevicePeerEffectKind.SIDE_EFFECT);
+    const invalidVideoSettings = remoteDesktopCommand({
+      case: "createRemoteDesktopOffer",
+      value: create(DevicePeerCreateRemoteDesktopOfferActionSchema, {
+        leaseId: "lease-1",
+        attemptId: "attempt-1",
+        offerSdp: "v=0\r\n",
+        settings: create(RemoteDesktopVideoSettingsSchema, { fps: 24, bitrate: 8_000_000, audio: true })
+      })
+    }, DevicePeerEffectKind.SIDE_EFFECT);
     const oversizedInput = remoteDesktopCommand({
       case: "sendRemoteDesktopInput",
       value: create(DevicePeerSendRemoteDesktopInputActionSchema, {
@@ -257,6 +270,7 @@ describe("Node Device peer Remote Desktop host ownership", () => {
 
     await expect(execute(executor, oversizedOffer)).rejects.toBeDefined();
     await expect(execute(executor, zeroSequence)).rejects.toBeDefined();
+    await expect(execute(executor, invalidVideoSettings)).rejects.toBeDefined();
     await expect(execute(executor, oversizedInput)).rejects.toBeDefined();
     expect(fixture.state.calls).toEqual([]);
 
@@ -346,6 +360,15 @@ describe("Node Device peer Remote Desktop host ownership", () => {
       value: create(RemoteDesktopClipboardContentReadActionSchema, { transferId, offset: 0 })
     }, 2n));
     expect(staleRead.at(-1)?.payload).toMatchObject({
+      case: "failure",
+      value: { remoteDesktop: { reason: RemoteDesktopFailureReason.CLIPBOARD_EXPIRED } }
+    });
+    await execute(executor, remoteDesktopCommands().find((item) => item.method === "setPresentation")!.command);
+    const invalidatedByPresentation = await execute(executor, remoteDesktopClipboardContentCommand({
+      case: "read",
+      value: create(RemoteDesktopClipboardContentReadActionSchema, { transferId, offset: 0 })
+    }));
+    expect(invalidatedByPresentation.at(-1)?.payload).toMatchObject({
       case: "failure",
       value: { remoteDesktop: { reason: RemoteDesktopFailureReason.CLIPBOARD_EXPIRED } }
     });
@@ -606,7 +629,10 @@ function remoteDesktopHost(overrides: Partial<DevicePeerRemoteDesktopHostPort> =
         trickleIce: true,
         jpegFallback: true,
         clipboardText: true,
-        clipboardContent: true
+        clipboardContent: true,
+        videoSettings: true,
+        systemAudio: true,
+        backgroundViewing: true
       });
     },
     async getPermissions(request) {
@@ -633,6 +659,20 @@ function remoteDesktopHost(overrides: Partial<DevicePeerRemoteDesktopHostPort> =
       return create(RemoteDesktopControlStateSchema, {
         controlling: request.enabled,
         controlGeneration: 2n
+      });
+    },
+    async setPresentation(request) {
+      record("setPresentation", request);
+      return create(RemoteDesktopControlStateSchema, {
+        controlling: false,
+        controlGeneration: 2n
+      });
+    },
+    async probePresentation(request) {
+      record("probePresentation", request);
+      return create(RemoteDesktopPresentationProofSchema, {
+        leaseId: request.leaseId,
+        proofSequence: 1n
       });
     },
     async sendInput(request) { record("sendInput", request); },
@@ -738,6 +778,25 @@ function remoteDesktopCommands(): readonly {
       }, DevicePeerEffectKind.SIDE_EFFECT)
     },
     {
+      method: "setPresentation",
+      payload: "remoteDesktopControlState",
+      command: remoteDesktopCommand({
+        case: "setRemoteDesktopPresentation",
+        value: create(DevicePeerSetRemoteDesktopPresentationActionSchema, {
+          leaseId: "lease-1",
+          enabled: true
+        })
+      }, DevicePeerEffectKind.SIDE_EFFECT)
+    },
+    {
+      method: "probePresentation",
+      payload: "remoteDesktopPresentationProof",
+      command: remoteDesktopCommand({
+        case: "probeRemoteDesktopPresentation",
+        value: create(DevicePeerProbeRemoteDesktopPresentationActionSchema, { leaseId: "lease-1" })
+      }, DevicePeerEffectKind.READ_ONLY)
+    },
+    {
       method: "sendInput",
       payload: "acknowledgement",
       command: remoteDesktopCommand({
@@ -762,7 +821,8 @@ function remoteDesktopCommands(): readonly {
         value: create(DevicePeerCreateRemoteDesktopOfferActionSchema, {
           leaseId: "lease-1",
           attemptId: "attempt-1",
-          offerSdp: "v=0\r\n"
+          offerSdp: "v=0\r\n",
+          settings: create(RemoteDesktopVideoSettingsSchema, { fps: 60, bitrate: 8_000_000, audio: true })
         })
       }, DevicePeerEffectKind.SIDE_EFFECT)
     },

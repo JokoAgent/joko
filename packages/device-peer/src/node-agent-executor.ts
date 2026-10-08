@@ -91,7 +91,11 @@ import {
   type RemoteDesktopPermissions,
   RemoteDesktopPermissionsSchema,
   RemoteDesktopPermissionStatus,
-  RemoteDesktopStartMode
+  type RemoteDesktopPresentationProof,
+  RemoteDesktopPresentationProofSchema,
+  RemoteDesktopStartMode,
+  type RemoteDesktopVideoSettings,
+  RemoteDesktopVideoSettingsSchema
 } from "@joko/contracts";
 import {
   DevicePeerRemoteDesktopHostError,
@@ -561,6 +565,34 @@ export class NodeDevicePeerAgentExecutor {
           value: clone(RemoteDesktopControlStateSchema, value)
         };
       }
+      case "setRemoteDesktopPresentation": {
+        if (command.action.value.enabled) {
+          this.#resetRemoteDesktopClipboardTransferForLease(command.action.value.leaseId);
+        }
+        const value = await this.#requireRemoteDesktop().setPresentation({
+          controllerDeviceId: command.controllerDeviceId,
+          leaseId: command.action.value.leaseId,
+          enabled: command.action.value.enabled,
+          signal
+        });
+        validateRemoteDesktopControlState(value);
+        return {
+          case: "remoteDesktopControlState",
+          value: clone(RemoteDesktopControlStateSchema, value)
+        };
+      }
+      case "probeRemoteDesktopPresentation": {
+        const value = await this.#requireRemoteDesktop().probePresentation({
+          controllerDeviceId: command.controllerDeviceId,
+          leaseId: command.action.value.leaseId,
+          signal
+        });
+        validateRemoteDesktopPresentationProof(value, command.action.value.leaseId);
+        return {
+          case: "remoteDesktopPresentationProof",
+          value: clone(RemoteDesktopPresentationProofSchema, value)
+        };
+      }
       case "sendRemoteDesktopInput":
         await this.#requireRemoteDesktop().sendInput({
           controllerDeviceId: command.controllerDeviceId,
@@ -576,6 +608,9 @@ export class NodeDevicePeerAgentExecutor {
           leaseId: command.action.value.leaseId,
           attemptId: command.action.value.attemptId,
           offerSdp: command.action.value.offerSdp,
+          ...(command.action.value.settings === undefined
+            ? {}
+            : { settings: clone(RemoteDesktopVideoSettingsSchema, command.action.value.settings) }),
           signal
         });
         validateRemoteDesktopOffer(value, command.action.value.attemptId);
@@ -1586,6 +1621,8 @@ function commandSpecification(
     heartbeatRemoteDesktop: effect(DevicePeerCapabilityKind.REMOTE_DESKTOP),
     stopRemoteDesktop: effect(DevicePeerCapabilityKind.REMOTE_DESKTOP),
     setRemoteDesktopControl: effect(DevicePeerCapabilityKind.REMOTE_DESKTOP),
+    setRemoteDesktopPresentation: effect(DevicePeerCapabilityKind.REMOTE_DESKTOP),
+    probeRemoteDesktopPresentation: readOnly(DevicePeerCapabilityKind.REMOTE_DESKTOP),
     sendRemoteDesktopInput: effect(DevicePeerCapabilityKind.REMOTE_DESKTOP),
     createRemoteDesktopOffer: effect(DevicePeerCapabilityKind.REMOTE_DESKTOP),
     exchangeRemoteDesktopIce: effect(DevicePeerCapabilityKind.REMOTE_DESKTOP),
@@ -1718,10 +1755,12 @@ function validateCommandInput(command: DevicePeerCommand): void {
     case "heartbeatRemoteDesktop":
     case "stopRemoteDesktop":
     case "getRemoteDesktopFrame":
+    case "probeRemoteDesktopPresentation":
       remoteDesktopControllerId(command.controllerDeviceId);
       remoteDesktopLeaseId(command.action.value.leaseId);
       return;
     case "setRemoteDesktopControl":
+    case "setRemoteDesktopPresentation":
       remoteDesktopControllerId(command.controllerDeviceId);
       remoteDesktopLeaseId(command.action.value.leaseId);
       return;
@@ -1736,6 +1775,9 @@ function validateCommandInput(command: DevicePeerCommand): void {
       remoteDesktopLeaseId(command.action.value.leaseId);
       remoteDesktopAttemptId(command.action.value.attemptId);
       remoteDesktopSdp(command.action.value.offerSdp);
+      if (command.action.value.settings !== undefined) {
+        validateRemoteDesktopVideoSettings(command.action.value.settings);
+      }
       return;
     case "exchangeRemoteDesktopIce":
       remoteDesktopControllerId(command.controllerDeviceId);
@@ -1979,7 +2021,9 @@ function validateRemoteDesktopCapabilities(value: RemoteDesktopCapabilities): vo
     || typeof value.automaticReconnect !== "boolean" || typeof value.connectionTakeover !== "boolean"
     || typeof value.webrtcVideo !== "boolean" || typeof value.trickleIce !== "boolean"
     || typeof value.jpegFallback !== "boolean" || typeof value.clipboardText !== "boolean"
-    || typeof value.clipboardContent !== "boolean" || value.permissions === undefined) {
+    || typeof value.clipboardContent !== "boolean" || typeof value.videoSettings !== "boolean"
+    || typeof value.systemAudio !== "boolean" || typeof value.backgroundViewing !== "boolean"
+    || value.permissions === undefined) {
     throw invalidRemoteDesktopHostResult();
   }
   if (value.enabled && value.displays.length === 0) throw invalidRemoteDesktopHostResult();
@@ -2019,6 +2063,21 @@ function validateRemoteDesktopLease(value: RemoteDesktopLease): void {
 function validateRemoteDesktopControlState(value: RemoteDesktopControlState): void {
   if (typeof value.controlling !== "boolean" || value.controlGeneration < 1n) {
     throw invalidRemoteDesktopHostResult();
+  }
+}
+
+function validateRemoteDesktopPresentationProof(value: RemoteDesktopPresentationProof, expectedLeaseId: string): void {
+  if (value.leaseId !== expectedLeaseId || value.proofSequence < 0n) {
+    throw invalidRemoteDesktopHostResult();
+  }
+}
+
+function validateRemoteDesktopVideoSettings(value: RemoteDesktopVideoSettings): void {
+  if ((value.fps !== 30 && value.fps !== 60)
+    || (value.bitrate !== 0 && value.bitrate !== 2_000_000
+      && value.bitrate !== 8_000_000 && value.bitrate !== 20_000_000)
+    || typeof value.audio !== "boolean") {
+    throw agentError(DevicePeerFailureCode.INVALID_REQUEST, false);
   }
 }
 
@@ -2080,7 +2139,8 @@ function validRemoteDesktopFailureReason(value: RemoteDesktopFailureReason): boo
     || value === RemoteDesktopFailureReason.CLIPBOARD_EMPTY
     || value === RemoteDesktopFailureReason.CLIPBOARD_TOO_LARGE
     || value === RemoteDesktopFailureReason.CLIPBOARD_UNSUPPORTED
-    || value === RemoteDesktopFailureReason.CLIPBOARD_EXPIRED;
+    || value === RemoteDesktopFailureReason.CLIPBOARD_EXPIRED
+    || value === RemoteDesktopFailureReason.AUDIO_UNAVAILABLE;
 }
 
 function remoteDesktopFailureCode(reason: RemoteDesktopFailureReason): DevicePeerFailureCode {
@@ -2108,6 +2168,7 @@ function remoteDesktopFailureCode(reason: RemoteDesktopFailureReason): DevicePee
       return DevicePeerFailureCode.PERMISSION_DENIED;
     case RemoteDesktopFailureReason.INPUT_UNAVAILABLE:
     case RemoteDesktopFailureReason.VIDEO_UNAVAILABLE:
+    case RemoteDesktopFailureReason.AUDIO_UNAVAILABLE:
       return DevicePeerFailureCode.UNAVAILABLE;
     case RemoteDesktopFailureReason.VIDEO_TIMEOUT:
       return DevicePeerFailureCode.TIMEOUT;

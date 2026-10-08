@@ -14,6 +14,7 @@ const CHANNELS = Object.freeze({
   command: "joko:remote-desktop-capture:command",
   reply: "joko:remote-desktop-capture:reply",
   input: "joko:remote-desktop-capture:input",
+  presentationPong: "joko:remote-desktop-capture:presentation-pong",
   stopped: "joko:remote-desktop-capture:stopped"
 });
 
@@ -24,13 +25,22 @@ let attempt: { readonly leaseId: string; readonly attemptId: string } | undefine
 let candidates: RemoteDesktopIceCandidate[] = [];
 let remoteCandidates = new Set<string>();
 let disconnectedTimer: ReturnType<typeof setTimeout> | undefined;
+let presentationTimer: ReturnType<typeof setInterval> | undefined;
+let presentationLease: string | undefined;
+let presentationChallenge: string | undefined;
+let inputChannel: RTCDataChannel | undefined;
 let exchanging = false;
 
 function stop(): void {
   generation += 1;
   exchanging = false;
   clearTimeout(disconnectedTimer);
+  clearInterval(presentationTimer);
   disconnectedTimer = undefined;
+  presentationTimer = undefined;
+  presentationLease = undefined;
+  presentationChallenge = undefined;
+  inputChannel = undefined;
   attempt = undefined;
   candidates = [];
   remoteCandidates = new Set();
@@ -50,6 +60,10 @@ ipcRenderer.on(CHANNELS.command, (_event: IpcRendererEvent, raw: unknown) => {
     void exchangeIce(command);
     return;
   }
+  if (command?.op === "presentation") {
+    setPresentation(command);
+    return;
+  }
   if (command?.op !== "offer") return;
   void createAnswer(command);
 });
@@ -59,10 +73,28 @@ async function createAnswer(command: Extract<DesktopRemoteDesktopCaptureCommand,
   const current = generation;
   attempt = { leaseId: command.leaseId, attemptId: command.attemptId };
   try {
-    const captured = await navigator.mediaDevices.getDisplayMedia({ audio: false, video: true });
+    const settings = videoSettings(command.settings);
+    const captured = await navigator.mediaDevices.getDisplayMedia({
+      audio: settings.audio,
+      video: { frameRate: { ideal: settings.fps, max: settings.fps } }
+    });
     if (current !== generation) {
       captured.getTracks().forEach((track) => track.stop());
       return;
+    }
+    if (captured.getVideoTracks().length === 0) {
+      captured.getTracks().forEach((track) => track.stop());
+      throw new Error("unavailable");
+    }
+    if (settings.audio && captured.getAudioTracks().length === 0) {
+      captured.getTracks().forEach((track) => track.stop());
+      throw new Error("audio-unavailable");
+    }
+    if (!settings.audio) {
+      captured.getAudioTracks().forEach((track) => {
+        captured.removeTrack(track);
+        track.stop();
+      });
     }
     stream = captured;
     const rtc = new RTCPeerConnection({ iceServers: [...command.iceServers] });
@@ -100,9 +132,31 @@ async function createAnswer(command: Extract<DesktopRemoteDesktopCaptureCommand,
         channel.close();
         return;
       }
+      inputChannel = channel;
       let pending = 0;
       channel.onmessage = ({ data }) => {
-        if (current !== generation || typeof data !== "string" || data.length > 32_768 || pending >= 8) {
+        if (current !== generation || typeof data !== "string" || data.length > 32_768) {
+          channel.close();
+          return;
+        }
+        if (presentationChallenge !== undefined && data === presentationChallenge) {
+          presentationChallenge = undefined;
+          const currentAttempt = attempt;
+          if (presentationLease === command.leaseId
+            && currentAttempt?.leaseId === command.leaseId
+            && currentAttempt.attemptId === command.attemptId) {
+            void ipcRenderer.invoke(
+              CHANNELS.presentationPong,
+              command.leaseId,
+              command.attemptId
+            ).catch(() => undefined);
+          }
+          return;
+        }
+        // A pong already in flight when presentation ends has no authority and
+        // must not tear down the input channel after its challenge is retired.
+        if (presentationChallenge === undefined && UUID.test(data)) return;
+        if (pending >= 8) {
           channel.close();
           return;
         }
@@ -138,14 +192,54 @@ async function createAnswer(command: Extract<DesktopRemoteDesktopCaptureCommand,
     await rtc.setRemoteDescription({ type: "offer", sdp: command.offerSdp });
     await rtc.setLocalDescription(await rtc.createAnswer());
     if (current !== generation) return;
+    for (const sender of rtc.getSenders()) {
+      if (sender.track?.kind !== "video") continue;
+      const parameters = sender.getParameters();
+      if (parameters.encodings.length === 0) continue;
+      for (const encoding of parameters.encodings) {
+        encoding.maxFramerate = settings.fps;
+        if (settings.bitrate === 0) delete encoding.maxBitrate;
+        else encoding.maxBitrate = settings.bitrate;
+      }
+      await sender.setParameters(parameters);
+    }
+    if (current !== generation) return;
     const answerSdp = rtc.localDescription?.sdp;
     if (typeof answerSdp !== "string" || answerSdp.length === 0) throw new Error("unavailable");
     await reply(command.id, { kind: "offer", answerSdp });
-  } catch {
+  } catch (error) {
     if (current !== generation) return;
+    const code = error instanceof Error && error.message === "audio-unavailable"
+      ? "audio-unavailable"
+      : "unavailable";
     stop();
-    await reply(command.id, { kind: "error", code: "unavailable" }).catch(() => undefined);
+    await reply(command.id, { kind: "error", code }).catch(() => undefined);
   }
+}
+
+function setPresentation(
+  command: Extract<DesktopRemoteDesktopCaptureCommand, { readonly op: "presentation" }>
+): void {
+  if (attempt?.leaseId !== command.leaseId) return;
+  clearInterval(presentationTimer);
+  presentationTimer = undefined;
+  presentationChallenge = undefined;
+  presentationLease = command.enabled ? command.leaseId : undefined;
+  if (!command.enabled) return;
+  const current = generation;
+  presentationTimer = setInterval(() => {
+    const channel = inputChannel;
+    if (current !== generation || presentationLease !== command.leaseId
+      || channel?.readyState !== "open" || presentationChallenge !== undefined) {
+      return;
+    }
+    presentationChallenge = crypto.randomUUID();
+    try {
+      channel.send(JSON.stringify({ type: "viewPing", challenge: presentationChallenge }));
+    } catch {
+      presentationChallenge = undefined;
+    }
+  }, 2_000);
 }
 
 async function exchangeIce(command: Extract<DesktopRemoteDesktopCaptureCommand, { readonly op: "ice" }>): Promise<void> {
@@ -197,6 +291,28 @@ function validCandidate(value: RemoteDesktopIceCandidate): boolean {
     && (value.sdpMid === null || typeof value.sdpMid === "string")
     && (value.sdpMLineIndex === null || Number.isInteger(value.sdpMLineIndex));
 }
+
+function videoSettings(value: unknown): {
+  readonly fps: 30 | 60;
+  readonly bitrate: 0 | 2_000_000 | 8_000_000 | 20_000_000;
+  readonly audio: boolean;
+} {
+  if (value === undefined) return Object.freeze({ fps: 30, bitrate: 0, audio: false });
+  if (!record(value) || !exactKeys(value, ["fps", "bitrate", "audio"])
+    || (value["fps"] !== 30 && value["fps"] !== 60)
+    || (value["bitrate"] !== 0 && value["bitrate"] !== 2_000_000
+      && value["bitrate"] !== 8_000_000 && value["bitrate"] !== 20_000_000)
+    || typeof value["audio"] !== "boolean") {
+    throw new Error("unavailable");
+  }
+  return Object.freeze({
+    fps: value["fps"],
+    bitrate: value["bitrate"],
+    audio: value["audio"]
+  });
+}
+
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
 
 function record(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);

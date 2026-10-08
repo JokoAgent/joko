@@ -298,7 +298,8 @@ test("device-peer contracts fence exact authority and keep workspace locations d
     "show_remote_desktop_permission_guide", "start_remote_desktop", "heartbeat_remote_desktop",
     "stop_remote_desktop", "set_remote_desktop_control", "send_remote_desktop_input",
     "create_remote_desktop_offer", "exchange_remote_desktop_ice", "get_remote_desktop_frame",
-    "transfer_remote_desktop_clipboard_text", "transfer_remote_desktop_clipboard_content"
+    "transfer_remote_desktop_clipboard_text", "transfer_remote_desktop_clipboard_content",
+    "set_remote_desktop_presentation", "probe_remote_desktop_presentation"
   ]);
   assert.deepEqual(oneofMembers(contract.DevicePeerAgentResultSchema, "payload"), [
     "acknowledgement", "recent_directories", "directories", "directory_inspection", "directory_created",
@@ -311,7 +312,7 @@ test("device-peer contracts fence exact authority and keep workspace locations d
     "remote_desktop_capabilities", "remote_desktop_permissions", "remote_desktop_lease",
     "remote_desktop_control_state", "remote_desktop_offer", "remote_desktop_ice",
     "remote_desktop_frame", "remote_desktop_clipboard_text",
-    "remote_desktop_clipboard_content", "failure"
+    "remote_desktop_clipboard_content", "remote_desktop_presentation_proof", "failure"
   ]);
   assert.deepEqual([...fieldNames(contract.OpenDevicePeerAgentRouteRequestSchema)], [
     "target_device_id", "route_generation", "request_id", "hello", "result", "heartbeat"
@@ -377,6 +378,7 @@ test("Remote Desktop keeps public controller identity implicit and target comman
       ["heartbeatRemoteDesktop", "unary"],
       ["stopRemoteDesktop", "unary"],
       ["setRemoteDesktopControl", "unary"],
+      ["setRemoteDesktopPresentation", "unary"],
       ["sendRemoteDesktopInput", "unary"],
       ["getRemoteDesktopIceConfiguration", "unary"],
       ["createRemoteDesktopOffer", "unary"],
@@ -395,6 +397,7 @@ test("Remote Desktop keeps public controller identity implicit and target comman
     contract.HeartbeatRemoteDesktopRequestSchema,
     contract.StopRemoteDesktopRequestSchema,
     contract.SetRemoteDesktopControlRequestSchema,
+    contract.SetRemoteDesktopPresentationRequestSchema,
     contract.SendRemoteDesktopInputRequestSchema,
     contract.GetRemoteDesktopIceConfigurationRequestSchema,
     contract.CreateRemoteDesktopOfferRequestSchema,
@@ -429,8 +432,21 @@ test("Remote Desktop keeps public controller identity implicit and target comman
   ]);
   assert.equal(field(contract.RemoteDesktopLeaseSchema, "control_generation").number, 4);
   assert.equal(field(contract.RemoteDesktopControlStateSchema, "control_generation").number, 2);
+  assert.deepEqual([...fieldNames(contract.RemoteDesktopVideoSettingsSchema)], ["fps", "bitrate", "audio"]);
+  assert.deepEqual([...fieldNames(contract.RemoteDesktopPresentationProofSchema)], ["lease_id", "proof_sequence"]);
+  assert.equal(field(contract.CreateRemoteDesktopOfferRequestSchema, "settings").message.typeName,
+    "joko.v1.RemoteDesktopVideoSettings");
+  assert.equal(field(contract.DevicePeerCreateRemoteDesktopOfferActionSchema, "settings").message.typeName,
+    "joko.v1.RemoteDesktopVideoSettings");
+  assert.equal(contract.RemoteDesktopFailureReason.AUDIO_UNAVAILABLE, 23);
+  assert.deepEqual(
+    ["video_settings", "system_audio", "background_viewing"].map((name) => field(
+      contract.RemoteDesktopCapabilitiesSchema,
+      name
+    ).number),
+    [14, 15, 16]
+  );
   assertNoFields([
-    contract.RemoteDesktopCapabilitiesSchema,
     contract.StartRemoteDesktopRequestSchema,
     contract.StopRemoteDesktopRequestSchema
   ], [

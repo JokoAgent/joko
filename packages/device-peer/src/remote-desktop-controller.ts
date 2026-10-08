@@ -11,7 +11,8 @@ import {
   type RemoteDesktopInput,
   type RemoteDesktopJpegFrame,
   type RemoteDesktopLease,
-  type RemoteDesktopPermissions
+  type RemoteDesktopPermissions,
+  type RemoteDesktopVideoSettings
 } from "./remote-desktop.js";
 import {
   parseRemoteDesktopIceReply,
@@ -58,6 +59,7 @@ export interface RemoteDesktopControllerDependencies {
     lease: RemoteDesktopLease,
     sdp: string,
     attemptId: string,
+    settings: RemoteDesktopVideoSettings | undefined,
     authority: RemoteDesktopAuthority
   ): Promise<string>;
   ice?(
@@ -78,6 +80,8 @@ interface ActiveRemoteDesktopLease {
   readonly authority: RemoteDesktopAuthority;
   expiresAt: number;
   sequence: number;
+  backgroundViewing: boolean;
+  presentationProofSequence: number;
 }
 
 /**
@@ -125,6 +129,30 @@ export class RemoteDesktopController {
     if (!validAuthority(authority)) return false;
     this.tick();
     return this.#active?.lease === lease && sameAuthority(this.#active.authority, authority);
+  }
+
+  /** Trusted capture-renderer acknowledgement of an actual system presentation. */
+  recordPresentationPong(lease: string): void {
+    const active = this.#active;
+    if (active === undefined || active.lease !== lease
+      || !active.backgroundViewing || active.controlling
+      || !this.#authorityCurrent(active.authority)) return;
+    this.tick();
+    if (this.#active !== active) return;
+    active.expiresAt = this.#now() + REMOTE_DESKTOP_LEASE_MS;
+    active.presentationProofSequence += 1;
+  }
+
+  /** Read-only exact proof probe; probing itself never extends either lease. */
+  probePresentation(authority: RemoteDesktopAuthority, lease: string): {
+    readonly lease: string;
+    readonly proofSequence: number;
+  } {
+    const active = this.#require(authority, lease);
+    if (!active.backgroundViewing || active.controlling) {
+      throw new Error("REMOTE_DESKTOP_LEASE_EXPIRED");
+    }
+    return Object.freeze({ lease: active.lease, proofSequence: active.presentationProofSequence });
   }
 
   /** Exact fence for clipboard and other control-scoped asynchronous effects. */
@@ -246,6 +274,8 @@ export class RemoteDesktopController {
         });
       case "control":
         return this.#control(authority, active, request.enabled);
+      case "presentation":
+        return this.#presentation(active, request.enabled);
       case "input":
         this.input(authority, request.lease, request.sequence, request.events);
         return Object.freeze({ ok: true });
@@ -259,6 +289,7 @@ export class RemoteDesktopController {
             leaseView(active),
             request.sdp,
             request.attemptId,
+            request.settings,
             authority
           )
         );
@@ -332,7 +363,9 @@ export class RemoteDesktopController {
         controlGeneration: ++this.#controlGeneration,
         authority: Object.freeze({ ...authority }),
         expiresAt: this.#now() + REMOTE_DESKTOP_LEASE_MS,
-        sequence: -1
+        sequence: -1,
+        backgroundViewing: false,
+        presentationProofSequence: 0
       };
       this.#active = lease;
       this.#dependencies.changed();
@@ -343,6 +376,23 @@ export class RemoteDesktopController {
     }
   }
 
+  #presentation(
+    active: ActiveRemoteDesktopLease,
+    enabled: boolean
+  ): { readonly controlling: boolean; readonly controlGeneration: number } {
+    active.backgroundViewing = enabled;
+    if (enabled) {
+      active.controlling = false;
+      active.controlGeneration = ++this.#controlGeneration;
+      this.#dependencies.stopInput();
+    }
+    this.#dependencies.changed();
+    return Object.freeze({
+      controlling: active.controlling,
+      controlGeneration: active.controlGeneration
+    });
+  }
+
   async #control(
     authority: RemoteDesktopAuthority,
     active: ActiveRemoteDesktopLease,
@@ -350,6 +400,7 @@ export class RemoteDesktopController {
   ): Promise<{ readonly controlling: boolean; readonly controlGeneration: number }> {
     if (enabled && !active.canControl) throw new Error("REMOTE_DESKTOP_VIEW_ONLY");
     if (enabled && this.#inputStarting) throw new Error("REMOTE_DESKTOP_INPUT_BUSY");
+    if (enabled) active.backgroundViewing = false;
     const generation = ++this.#controlGeneration;
     active.controlGeneration = generation;
     if (!enabled) {

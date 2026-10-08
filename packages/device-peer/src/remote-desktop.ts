@@ -76,6 +76,15 @@ export interface RemoteDesktopCapabilities {
   readonly jpegFallback: boolean;
   readonly clipboardText: boolean;
   readonly clipboardContent: boolean;
+  readonly videoSettings: boolean;
+  readonly systemAudio: boolean;
+  readonly backgroundViewing: boolean;
+}
+
+export interface RemoteDesktopVideoSettings {
+  readonly fps: 30 | 60;
+  readonly bitrate: 0 | 2_000_000 | 8_000_000 | 20_000_000;
+  readonly audio: boolean;
 }
 
 export type RemoteDesktopHostCapabilities = Omit<
@@ -110,13 +119,20 @@ export type RemoteDesktopRequest =
   | { readonly op: "stop"; readonly lease: string }
   | { readonly op: "frame"; readonly lease: string }
   | { readonly op: "control"; readonly lease: string; readonly enabled: boolean }
+  | { readonly op: "presentation"; readonly lease: string; readonly enabled: boolean }
   | {
       readonly op: "input";
       readonly lease: string;
       readonly sequence: number;
       readonly events: readonly RemoteDesktopInput[];
     }
-  | { readonly op: "offer"; readonly lease: string; readonly sdp: string; readonly attemptId: string };
+  | {
+      readonly op: "offer";
+      readonly lease: string;
+      readonly sdp: string;
+      readonly attemptId: string;
+      readonly settings?: RemoteDesktopVideoSettings;
+    };
 
 export function isRemoteDesktopPermission(value: unknown): value is RemoteDesktopPermission {
   return value === "screenRecording" || value === "accessibility";
@@ -147,6 +163,9 @@ export function parseRemoteDesktopHostCapabilities(value: unknown): RemoteDeskto
     || typeof value.canControl !== "boolean"
     || typeof value.clipboardText !== "boolean"
     || typeof value.clipboardContent !== "boolean"
+    || typeof value.videoSettings !== "boolean"
+    || typeof value.systemAudio !== "boolean"
+    || typeof value.backgroundViewing !== "boolean"
     || (value.platform !== "darwin" && value.platform !== "win32" && value.platform !== "linux")
     || !Array.isArray(value.displays)
     || value.displays.length > REMOTE_DESKTOP_MAX_DISPLAYS
@@ -164,6 +183,9 @@ export function parseRemoteDesktopHostCapabilities(value: unknown): RemoteDeskto
     canControl: value.canControl,
     clipboardText: value.clipboardText,
     clipboardContent: value.clipboardContent,
+    videoSettings: value.videoSettings,
+    systemAudio: value.systemAudio,
+    backgroundViewing: value.backgroundViewing,
     platform: value.platform,
     displays: Object.freeze(displays),
     permissions: parseRemoteDesktopPermissions(value.permissions)
@@ -236,9 +258,10 @@ export function parseRemoteDesktopRequest(value: unknown): RemoteDesktopRequest 
       requireExactKeys(value, ["op", "lease"]);
       return Object.freeze({ op: value.op, lease });
     case "control":
+    case "presentation":
       requireExactKeys(value, ["op", "lease", "enabled"]);
       if (typeof value.enabled !== "boolean") throw new Error("INVALID_REMOTE_DESKTOP_REQUEST");
-      return Object.freeze({ op: "control", lease, enabled: value.enabled });
+      return Object.freeze({ op: value.op, lease, enabled: value.enabled });
     case "input": {
       requireExactKeys(value, ["op", "lease", "sequence", "events"]);
       if (!Number.isSafeInteger(value.sequence)
@@ -258,7 +281,7 @@ export function parseRemoteDesktopRequest(value: unknown): RemoteDesktopRequest 
       });
     }
     case "offer":
-      requireExactKeys(value, ["op", "lease", "sdp", "attemptId"]);
+      requireExactKeys(value, ["op", "lease", "sdp", "attemptId"], ["settings"]);
       if (typeof value.sdp !== "string"
         || value.sdp.length < 1
         || value.sdp.length > 64_000
@@ -269,7 +292,10 @@ export function parseRemoteDesktopRequest(value: unknown): RemoteDesktopRequest 
         op: "offer",
         lease,
         sdp: value.sdp,
-        attemptId: value.attemptId
+        attemptId: value.attemptId,
+        ...(value.settings === undefined
+          ? {}
+          : { settings: parseRemoteDesktopVideoSettings(value.settings) })
       });
     case "ice":
       requireExactKeys(value, ["op", "lease", "attemptId", "candidates", "after"]);
@@ -286,6 +312,22 @@ export function parseRemoteDesktopRequest(value: unknown): RemoteDesktopRequest 
     default:
       throw new Error("INVALID_REMOTE_DESKTOP_REQUEST");
   }
+}
+
+export function parseRemoteDesktopVideoSettings(value: unknown): RemoteDesktopVideoSettings {
+  if (!isRecord(value)
+    || !hasExactKeys(value, ["fps", "bitrate", "audio"])
+    || (value.fps !== 30 && value.fps !== 60)
+    || (value.bitrate !== 0 && value.bitrate !== 2_000_000
+      && value.bitrate !== 8_000_000 && value.bitrate !== 20_000_000)
+    || typeof value.audio !== "boolean") {
+    throw new Error("INVALID_REMOTE_DESKTOP_VIDEO_SETTINGS");
+  }
+  return Object.freeze({
+    fps: value.fps,
+    bitrate: value.bitrate,
+    audio: value.audio
+  });
 }
 
 export function isBoundedRemoteDesktopJpegFrame(value: unknown): value is RemoteDesktopJpegFrame {

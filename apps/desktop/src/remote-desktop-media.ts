@@ -32,6 +32,11 @@ import {
   type DesktopRemoteDesktopCaptureCommand,
   type DesktopRemoteDesktopCaptureReply
 } from "./remote-desktop-capture-protocol.js";
+import {
+  parseDesktopRemoteDesktopVideoSettings,
+  readDesktopSystemAudioSupport,
+  type DesktopRemoteDesktopVideoSettings
+} from "./remote-desktop-media-settings.js";
 import type { DesktopRemoteDesktopMediaPort } from "./remote-desktop-host.js";
 
 const CAPTURE_URL = "https://remote-desktop.joko.invalid/capture";
@@ -56,10 +61,19 @@ export class DesktopRemoteDesktopMedia implements DesktopRemoteDesktopMediaPort 
     readonly reject: (error: Error) => void;
     readonly timer: ReturnType<typeof setTimeout>;
   } | undefined;
-  #grant: { readonly source: DesktopCapturerSource; readonly leaseId: string } | undefined;
+  #grant: {
+    readonly source: DesktopCapturerSource;
+    readonly leaseId: string;
+    readonly attemptId: string;
+    readonly requestId: string;
+    readonly audio: boolean;
+    readonly current: () => boolean;
+  } | undefined;
   #pending: PendingCaptureRequest | undefined;
   #attempt: { readonly leaseId: string; readonly attemptId: string } | undefined;
   #inputHandler: ((leaseId: string, sequence: number, events: readonly RemoteDesktopInput[]) => void) | undefined;
+  #presentationPongHandler: ((leaseId: string) => void) | undefined;
+  #presentationLease: string | undefined;
   #generation = 0;
   #retired = false;
 
@@ -72,6 +86,12 @@ export class DesktopRemoteDesktopMedia implements DesktopRemoteDesktopMediaPort 
     ipcMain.handle(REMOTE_DESKTOP_CAPTURE_CHANNELS.input, (event, leaseId, sequence, events) => {
       this.#receiveInput(event, leaseId, sequence, events);
     });
+    ipcMain.handle(
+      REMOTE_DESKTOP_CAPTURE_CHANNELS.presentationPong,
+      (event, leaseId, attemptId) => {
+        this.#receivePresentationPong(event, leaseId, attemptId);
+      }
+    );
     ipcMain.handle(REMOTE_DESKTOP_CAPTURE_CHANNELS.stopped, (event) => {
       this.#assertSender(event);
       this.stop();
@@ -93,6 +113,19 @@ export class DesktopRemoteDesktopMedia implements DesktopRemoteDesktopMediaPort 
     };
   }
 
+  setPresentationPongHandler(handler: (leaseId: string) => void): () => void {
+    if (this.#presentationPongHandler !== undefined) {
+      throw new Error("Remote Desktop presentation pong handler is already installed.");
+    }
+    this.#presentationPongHandler = handler;
+    let active = true;
+    return () => {
+      if (!active) return;
+      active = false;
+      if (this.#presentationPongHandler === handler) this.#presentationPongHandler = undefined;
+    };
+  }
+
   async frame(displayId: string, signal: AbortSignal): Promise<RemoteDesktopJpegFrame | null> {
     this.#assertAvailable();
     assertCapturePermission();
@@ -107,29 +140,47 @@ export class DesktopRemoteDesktopMedia implements DesktopRemoteDesktopMediaPort 
     readonly leaseId: string;
     readonly attemptId: string;
     readonly offerSdp: string;
+    readonly settings?: DesktopRemoteDesktopVideoSettings;
+    readonly current: () => boolean;
     readonly signal: AbortSignal;
   }): Promise<string> {
     this.#assertAvailable();
     if (this.#pending !== undefined) throw new Error("REMOTE_DESKTOP_VIDEO_BUSY");
+    const settings = parseDesktopRemoteDesktopVideoSettings(request.settings);
     assertCapturePermission();
     this.stop();
     const generation = this.#generation;
+    if (settings?.audio === true && !readDesktopSystemAudioSupport()) {
+      throw new Error("REMOTE_DESKTOP_AUDIO_UNAVAILABLE");
+    }
     const sources = await enumerateDesktopSources(false, request.signal);
     const source = exactDesktopSource(sources, request.displayId);
     if (source === null) throw new Error("REMOTE_DESKTOP_VIDEO_UNAVAILABLE");
     throwIfAborted(request.signal);
+    if (!request.current()) throw new Error("REMOTE_DESKTOP_VIDEO_STOPPED");
     await this.#startWindow(generation, request.signal);
-    if (generation !== this.#generation) throw new Error("REMOTE_DESKTOP_VIDEO_STOPPED");
-    this.#grant = { source, leaseId: request.leaseId };
+    if (generation !== this.#generation || !request.current()) {
+      throw new Error("REMOTE_DESKTOP_VIDEO_STOPPED");
+    }
+    const requestId = randomUUID();
+    this.#grant = {
+      source,
+      leaseId: request.leaseId,
+      attemptId: request.attemptId,
+      requestId,
+      audio: settings?.audio === true,
+      current: request.current
+    };
     this.#attempt = { leaseId: request.leaseId, attemptId: request.attemptId };
     try {
       const reply = await this.#command({
         op: "offer",
-        id: randomUUID(),
+        id: requestId,
         leaseId: request.leaseId,
         attemptId: request.attemptId,
         offerSdp: request.offerSdp,
-        iceServers: REMOTE_DESKTOP_STUN_SERVERS.map((server) => ({ urls: server.urls }))
+        iceServers: REMOTE_DESKTOP_STUN_SERVERS.map((server) => ({ urls: server.urls })),
+        ...(settings === undefined ? {} : { settings })
       }, REMOTE_DESKTOP_OFFER_BUDGET.hostMs, request.signal);
       if (reply.kind !== "offer" || Buffer.byteLength(reply.answerSdp, "utf8") > 64 * 1_024) {
         throw new Error("REMOTE_DESKTOP_VIDEO_UNAVAILABLE");
@@ -138,6 +189,22 @@ export class DesktopRemoteDesktopMedia implements DesktopRemoteDesktopMediaPort 
     } catch (error) {
       if (generation === this.#generation) this.stop();
       throw error;
+    }
+  }
+
+  setPresentation(leaseId: string, enabled: boolean): void {
+    const attempt = this.#attempt;
+    const owner = this.#window?.webContents;
+    if (attempt?.leaseId !== leaseId || owner === undefined || owner.isDestroyed()) return;
+    this.#presentationLease = enabled ? leaseId : undefined;
+    try {
+      owner.send(REMOTE_DESKTOP_CAPTURE_CHANNELS.command, {
+        op: "presentation",
+        leaseId,
+        enabled
+      } satisfies DesktopRemoteDesktopCaptureCommand);
+    } catch {
+      this.stop();
     }
   }
 
@@ -174,6 +241,7 @@ export class DesktopRemoteDesktopMedia implements DesktopRemoteDesktopMediaPort 
     this.#generation += 1;
     this.#grant = undefined;
     this.#attempt = undefined;
+    this.#presentationLease = undefined;
     const pending = this.#pending;
     this.#pending = undefined;
     if (pending !== undefined) {
@@ -196,9 +264,11 @@ export class DesktopRemoteDesktopMedia implements DesktopRemoteDesktopMediaPort 
     this.#retired = true;
     this.stop();
     this.#inputHandler = undefined;
+    this.#presentationPongHandler = undefined;
     ipcMain.removeHandler(REMOTE_DESKTOP_CAPTURE_CHANNELS.ready);
     ipcMain.removeHandler(REMOTE_DESKTOP_CAPTURE_CHANNELS.reply);
     ipcMain.removeHandler(REMOTE_DESKTOP_CAPTURE_CHANNELS.input);
+    ipcMain.removeHandler(REMOTE_DESKTOP_CAPTURE_CHANNELS.presentationPong);
     ipcMain.removeHandler(REMOTE_DESKTOP_CAPTURE_CHANNELS.stopped);
     const captureSession = this.#captureSession;
     this.#captureSession = undefined;
@@ -283,15 +353,27 @@ export class DesktopRemoteDesktopMedia implements DesktopRemoteDesktopMediaPort 
     });
     captureSession.setDisplayMediaRequestHandler((request, callback) => {
       const grant = this.#grant;
+      this.#grant = undefined;
       const owner = this.#window?.webContents;
+      const pending = this.#pending;
+      let grantCurrent = false;
+      try { grantCurrent = grant?.current() === true; }
+      catch { /* Current lease lookup failed closed. */ }
       if (grant === undefined || owner === undefined || owner.isDestroyed()
         || request.frame !== owner.mainFrame || !request.videoRequested
-        || this.#attempt?.leaseId !== grant.leaseId) {
+        || request.securityOrigin !== "https://remote-desktop.joko.invalid"
+        || request.audioRequested !== grant.audio
+        || this.#attempt?.leaseId !== grant.leaseId
+        || this.#attempt.attemptId !== grant.attemptId
+        || !grantCurrent
+        || pending?.op !== "offer" || pending.id !== grant.requestId) {
         callback({});
         return;
       }
-      this.#grant = undefined;
-      callback({ video: grant.source });
+      callback({
+        video: grant.source,
+        ...(grant.audio ? { audio: "loopback" as const } : {})
+      });
     });
     captureSession.on("will-download", (event) => { event.preventDefault(); });
     return captureSession;
@@ -344,6 +426,21 @@ export class DesktopRemoteDesktopMedia implements DesktopRemoteDesktopMediaPort 
     this.#inputHandler?.(leaseId, request.sequence, request.events);
   }
 
+  #receivePresentationPong(
+    event: IpcMainInvokeEvent,
+    leaseId: unknown,
+    attemptId: unknown
+  ): void {
+    this.#assertSender(event);
+    const attempt = this.#attempt;
+    if (typeof leaseId !== "string" || typeof attemptId !== "string"
+      || this.#presentationLease !== leaseId
+      || attempt?.leaseId !== leaseId || attempt.attemptId !== attemptId) {
+      throw new Error("Remote Desktop presentation pong is stale.");
+    }
+    this.#presentationPongHandler?.(leaseId);
+  }
+
   #assertSender(event: IpcMainInvokeEvent): void {
     const owner = this.#window?.webContents;
     if (owner === undefined || owner.isDestroyed() || event.sender !== owner
@@ -354,8 +451,7 @@ export class DesktopRemoteDesktopMedia implements DesktopRemoteDesktopMediaPort 
   }
 
   #command(
-    command: Exclude<DesktopRemoteDesktopCaptureCommand, { readonly op: "stop" }>
-      & { readonly id: string },
+    command: Extract<DesktopRemoteDesktopCaptureCommand, { readonly op: "offer" | "ice" }>,
     timeoutMs: number,
     signal: AbortSignal
   ): Promise<DesktopRemoteDesktopCaptureReply> {
@@ -383,11 +479,15 @@ export class DesktopRemoteDesktopMedia implements DesktopRemoteDesktopMediaPort 
       abortPromise(signal)
     ]).then((reply) => {
       if (reply.kind === "error") {
-        throw new Error(reply.code === "timeout"
-          ? "REMOTE_DESKTOP_VIDEO_TIMEOUT"
-          : reply.code === "stopped"
-            ? "REMOTE_DESKTOP_VIDEO_STOPPED"
-            : "REMOTE_DESKTOP_VIDEO_UNAVAILABLE");
+        throw new Error(
+          reply.code === "audio-unavailable"
+            ? "REMOTE_DESKTOP_AUDIO_UNAVAILABLE"
+            : reply.code === "timeout"
+              ? "REMOTE_DESKTOP_VIDEO_TIMEOUT"
+              : reply.code === "stopped"
+                ? "REMOTE_DESKTOP_VIDEO_STOPPED"
+                : "REMOTE_DESKTOP_VIDEO_UNAVAILABLE"
+        );
       }
       return reply;
     });
@@ -461,8 +561,10 @@ function parseCaptureReply(
 ): DesktopRemoteDesktopCaptureReply {
   if (typeof value !== "object" || value === null || Array.isArray(value)) throw new Error("invalid");
   const record = value as Record<string, unknown>;
-  if (record["kind"] === "error" && (record["code"] === "unavailable"
-    || record["code"] === "stopped" || record["code"] === "timeout")
+  if (record["kind"] === "error"
+    && ((expected === "offer" && record["code"] === "audio-unavailable")
+      || record["code"] === "unavailable" || record["code"] === "stopped"
+      || record["code"] === "timeout")
     && exactKeys(record, ["kind", "code"])) {
     return { kind: "error", code: record["code"] };
   }

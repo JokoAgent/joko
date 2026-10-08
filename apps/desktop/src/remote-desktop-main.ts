@@ -18,6 +18,7 @@ import {
 import { DesktopRemoteDesktopClipboard } from "./remote-desktop-clipboard.js";
 import { DesktopRemoteDesktopInput, readDesktopRemoteDesktopInputPermission } from "./remote-desktop-input.js";
 import { DesktopRemoteDesktopMedia } from "./remote-desktop-media.js";
+import { readDesktopSystemAudioSupport } from "./remote-desktop-media-settings.js";
 import type { DesktopRemoteDesktopSettingsStore } from "./remote-desktop-settings.js";
 
 const MAC_SCREEN_SETTINGS = "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture";
@@ -78,6 +79,7 @@ export function createDesktopRemoteDesktopMainHost(
   };
   host = new DesktopRemoteDesktopHost({
     platform: process.platform,
+    systemAudio: readDesktopSystemAudioSupport(),
     enabled: () => options.settings.get().enabled,
     sessionUnlocked: desktopSessionUnlocked,
     displays: desktopDisplays,

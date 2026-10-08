@@ -1,8 +1,15 @@
 import ExpoModulesCore
 import UIKit
+import AVFoundation
 import UniformTypeIdentifiers
 
 public class JokoRemotePresentationModule: Module {
+  private var previousAudio: (
+    AVAudioSession.Category,
+    AVAudioSession.Mode,
+    AVAudioSession.CategoryOptions
+  )?
+
   public func definition() -> ModuleDefinition {
     Name("JokoRemotePresentation")
 
@@ -12,6 +19,37 @@ public class JokoRemotePresentationModule: Module {
 
     AsyncFunction("writeClipboard") { (json: String) in
       try RemoteClipboard.write(json)
+    }.runOnQueue(.main)
+
+    AsyncFunction("playback") { (enabled: Bool) in
+      let session = AVAudioSession.sharedInstance()
+      if enabled {
+        if self.previousAudio == nil {
+          self.previousAudio = (session.category, session.mode, session.categoryOptions)
+        }
+        do {
+          try session.setCategory(.playback, mode: .moviePlayback, options: [.mixWithOthers])
+          try session.setActive(true)
+        } catch {
+          // Enabling is one main-queue transaction. Roll back a partial native
+          // mutation before surfacing the optional-audio failure to JavaScript.
+          if let previous = self.previousAudio {
+            try? session.setActive(false, options: .notifyOthersOnDeactivation)
+            try? session.setCategory(previous.0, mode: previous.1, options: previous.2)
+          }
+          self.previousAudio = nil
+          throw error
+        }
+      } else if let previous = self.previousAudio {
+        // A newer voice or media owner wins. Restore only the exact category
+        // installed by this Remote Desktop occurrence.
+        if session.category == .playback && session.mode == .moviePlayback
+          && session.categoryOptions == [.mixWithOthers] {
+          try session.setActive(false, options: .notifyOthersOnDeactivation)
+          try session.setCategory(previous.0, mode: previous.1, options: previous.2)
+        }
+        self.previousAudio = nil
+      }
     }.runOnQueue(.main)
   }
 }

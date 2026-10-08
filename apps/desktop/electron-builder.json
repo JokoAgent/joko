@@ -174,7 +174,8 @@
     "identity": null,
     "hardenedRuntime": false,
     "extendInfo": {
-      "NSMicrophoneUsageDescription": "Joko uses the microphone only while you choose to dictate into the composer."
+      "NSMicrophoneUsageDescription": "Joko uses the microphone only while you choose to dictate into the composer.",
+      "NSAudioCaptureUsageDescription": "Joko shares computer audio only when you enable audio in Remote Desktop."
     },
     "target": [
       "dmg",

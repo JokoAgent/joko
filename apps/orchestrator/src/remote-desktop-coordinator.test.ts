@@ -28,6 +28,7 @@ const stores: OperationalStore[] = [];
 afterEach(async () => {
   await Promise.allSettled(coordinators.splice(0).map((coordinator) => coordinator.close()));
   for (const store of stores.splice(0)) store.close();
+  vi.useRealTimers();
   vi.restoreAllMocks();
 });
 
@@ -248,6 +249,134 @@ describe("RemoteDesktopCoordinator", () => {
       "setRemoteDesktopControl",
       "stopRemoteDesktop"
     ]);
+  });
+
+  it("does not renew presentation when the exact target proof does not advance", async () => {
+    vi.useFakeTimers();
+    let now = 1_000;
+    const proofSequence = 0n;
+    const fake = new FakeDevicePeerOwner();
+    const previousDispatch = fake.dispatchHandler;
+    fake.dispatchHandler = (authority, input) => input.action === "probeRemoteDesktopPresentation"
+      ? Promise.resolve(completed(result("remoteDesktopPresentationProof", create(
+          contract.RemoteDesktopPresentationProofSchema,
+          { leaseId: "lease-1", proofSequence }
+        ))))
+      : previousDispatch(authority, input);
+    const coordinator = fakeCoordinator(fake, { now: () => now }).coordinator;
+    const lease = await start(coordinator);
+
+    await expect(coordinator.setPresentation(connection, identity, {
+      leaseId: lease.leaseId,
+      enabled: true
+    }, signal)).resolves.toMatchObject({ controlling: false, controlGeneration: 2n });
+    expect(fake.actions()).toEqual([
+      "startRemoteDesktop",
+      "setRemoteDesktopPresentation",
+      "probeRemoteDesktopPresentation"
+    ]);
+
+    now = 4_000;
+    await vi.advanceTimersByTimeAsync(3_000);
+    expect(fake.actions().filter((action) => action === "probeRemoteDesktopPresentation")).toHaveLength(2);
+    expect(fake.actions()).not.toContain("heartbeatRemoteDesktop");
+
+    now = 12_999;
+    await expect(coordinator.heartbeat(connection, identity, lease.leaseId, signal)).resolves.toMatchObject({
+      controlling: false,
+      controlGeneration: 2n
+    });
+    expect(fake.actions()).not.toContain("heartbeatRemoteDesktop");
+
+    now = 13_000;
+    await expect(coordinator.heartbeat(connection, identity, lease.leaseId, signal)).rejects.toMatchObject({
+      detail: { reason: contract.RemoteDesktopFailureReason.LEASE_EXPIRED }
+    });
+  });
+
+  it("renews presentation after a strictly newer target proof", async () => {
+    vi.useFakeTimers();
+    let now = 1_000;
+    let proofSequence = 0n;
+    const fake = new FakeDevicePeerOwner();
+    const previousDispatch = fake.dispatchHandler;
+    fake.dispatchHandler = (authority, input) => input.action === "probeRemoteDesktopPresentation"
+      ? Promise.resolve(completed(result("remoteDesktopPresentationProof", create(
+          contract.RemoteDesktopPresentationProofSchema,
+          { leaseId: "lease-1", proofSequence }
+        ))))
+      : previousDispatch(authority, input);
+    const coordinator = fakeCoordinator(fake, { now: () => now }).coordinator;
+    const lease = await start(coordinator);
+    await coordinator.setPresentation(connection, identity, { leaseId: lease.leaseId, enabled: true }, signal);
+
+    proofSequence = 1n;
+    now = 4_000;
+    await vi.advanceTimersByTimeAsync(3_000);
+    now = 15_999;
+    await expect(coordinator.heartbeat(connection, identity, lease.leaseId, signal)).resolves.toBeDefined();
+    now = 16_000;
+    await expect(coordinator.heartbeat(connection, identity, lease.leaseId, signal)).rejects.toMatchObject({
+      detail: { reason: contract.RemoteDesktopFailureReason.LEASE_EXPIRED }
+    });
+  });
+
+  it("lets a temporary presentation probe failure age out without renewing or immediate retirement", async () => {
+    vi.useFakeTimers();
+    let now = 1_000;
+    let probes = 0;
+    const fake = new FakeDevicePeerOwner();
+    const previousDispatch = fake.dispatchHandler;
+    fake.dispatchHandler = (authority, input) => {
+      if (input.action !== "probeRemoteDesktopPresentation") return previousDispatch(authority, input);
+      probes += 1;
+      if (probes === 1) {
+        return Promise.resolve(completed(result("remoteDesktopPresentationProof", create(
+          contract.RemoteDesktopPresentationProofSchema,
+          { leaseId: "lease-1", proofSequence: 0n }
+        ))));
+      }
+      return Promise.reject(new DOMException("temporary timeout", "TimeoutError"));
+    };
+    const coordinator = fakeCoordinator(fake, { now: () => now }).coordinator;
+    const lease = await start(coordinator);
+    await coordinator.setPresentation(connection, identity, { leaseId: lease.leaseId, enabled: true }, signal);
+
+    now = 4_000;
+    await vi.advanceTimersByTimeAsync(3_000);
+    now = 4_001;
+    await expect(coordinator.heartbeat(connection, identity, lease.leaseId, signal)).resolves.toBeDefined();
+    now = 13_000;
+    await expect(coordinator.heartbeat(connection, identity, lease.leaseId, signal)).rejects.toMatchObject({
+      detail: { reason: contract.RemoteDesktopFailureReason.LEASE_EXPIRED }
+    });
+  });
+
+  it("retires a lease when the presentation side-effect outcome is unknown", async () => {
+    const fake = new FakeDevicePeerOwner();
+    const previousDispatch = fake.dispatchHandler;
+    fake.dispatchHandler = (authority, input) => input.action === "setRemoteDesktopPresentation"
+      ? Promise.resolve({
+          protocolVersion: 1,
+          kind: "response",
+          requestId: "presentation-unknown",
+          targetDeviceId: identity.targetDeviceId,
+          routeGeneration: identity.routeGeneration,
+          outcome: "outcome_unknown",
+          errorCode: "authority_changed"
+        })
+      : previousDispatch(authority, input);
+    const coordinator = fakeCoordinator(fake).coordinator;
+    const lease = await start(coordinator);
+
+    await expect(coordinator.setPresentation(connection, identity, {
+      leaseId: lease.leaseId,
+      enabled: true
+    }, signal)).rejects.toMatchObject({ code: "aborted" });
+    await expect(coordinator.heartbeat(connection, identity, lease.leaseId, signal)).rejects.toMatchObject({
+      detail: { reason: contract.RemoteDesktopFailureReason.STOPPED }
+    });
+    expect(fake.actions()).toContain("stopRemoteDesktop");
   });
 
   it("rejects a heartbeat whose lease expires before the async completion", async () => {
@@ -598,6 +727,16 @@ describe("RemoteDesktopCoordinator", () => {
       attemptId: "attempt-1",
       offerSdp: "s".repeat(64 * 1024 + 1)
     }, signal)).rejects.toMatchObject({ code: "invalid_argument" });
+    await expect(coordinator.createOffer(connection, identity, {
+      leaseId: "lease-1",
+      attemptId: "attempt-1",
+      offerSdp: "v=0\r\n",
+      settings: create(contract.RemoteDesktopVideoSettingsSchema, {
+        fps: 24,
+        bitrate: 8_000_000,
+        audio: true
+      })
+    }, signal)).rejects.toMatchObject({ code: "invalid_argument" });
     const candidate = create(contract.RemoteDesktopIceCandidateSchema, {
       candidate: "candidate:1 1 UDP 2122260223 192.0.2.1 5000 typ host"
     });
@@ -861,6 +1000,16 @@ function defaultResponse(input: DispatchInput): DevicePeerResponseFrame {
         controlling: command.action.case === "setRemoteDesktopControl" && command.action.value.enabled,
         controlGeneration: 2n
       })));
+    case "setRemoteDesktopPresentation":
+      return completed(result("remoteDesktopControlState", create(contract.RemoteDesktopControlStateSchema, {
+        controlling: false,
+        controlGeneration: 2n
+      })));
+    case "probeRemoteDesktopPresentation":
+      return completed(result("remoteDesktopPresentationProof", create(
+        contract.RemoteDesktopPresentationProofSchema,
+        { leaseId: "lease-1", proofSequence: 0n }
+      )));
     case "stopRemoteDesktop":
     case "sendRemoteDesktopInput":
       return completed(acknowledgementResult());

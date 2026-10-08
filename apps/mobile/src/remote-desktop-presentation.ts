@@ -21,6 +21,12 @@ interface MobileRemoteDesktopCopy {
   readonly left: string;
   readonly right: string;
   readonly release: string;
+  readonly frameRate: string;
+  readonly bitrate: string;
+  readonly auto: string;
+  readonly audioOn: string;
+  readonly audioOff: string;
+  readonly pictureInPicture: string;
   readonly copyToPhone: string;
   readonly pasteFromPhone: string;
   readonly clipboardTransferring: string;
@@ -54,12 +60,17 @@ interface MobileRemoteDesktopCopy {
   readonly inputBusy: string;
   readonly inputUnavailable: string;
   readonly viewerRestarted: string;
+  readonly audioUnavailable: string;
+  readonly videoSettingsFailed: string;
+  readonly pipUnavailable: string;
 }
 
 const EN: MobileRemoteDesktopCopy = {
   title: "Remote Desktop", back: "Back", chooseDesktop: "Choose a desktop", chooseDisplay: "Choose a display",
   view: "View", control: "Control", touch: "Touch", trackpad: "Trackpad", pan: "Pan",
   keyboard: "Keyboard", fit: "Fit", left: "Left", right: "Right", release: "Release",
+  frameRate: "Frame rate", bitrate: "Quality", auto: "Auto", audioOn: "Audio on", audioOff: "Audio off",
+  pictureInPicture: "Picture in Picture",
   copyToPhone: "Copy to phone", pasteFromPhone: "Paste from phone",
   clipboardTransferring: "Transferring clipboard…", clipboardCopied: "Copied to this phone.",
   clipboardPasted: "Pasted on the desktop.", clipboardEmpty: "The clipboard is empty.",
@@ -79,13 +90,18 @@ const EN: MobileRemoteDesktopCopy = {
   accessibilityPermission: "Accessibility permission is required on the desktop for control.",
   inputBusy: "Desktop input is busy. Viewing continues.",
   inputUnavailable: "Desktop control is unavailable. Viewing continues.",
-  viewerRestarted: "The viewer restarted safely. Take control again to continue input."
+  viewerRestarted: "The viewer restarted safely. Take control again to continue input.",
+  audioUnavailable: "Desktop audio is unavailable. Video continues without audio.",
+  videoSettingsFailed: "The video setting could not be applied. The current view remains available.",
+  pipUnavailable: "Picture in Picture could not start. Continue viewing here."
 };
 
 const ZH_CN: MobileRemoteDesktopCopy = {
   title: "远程桌面", back: "返回", chooseDesktop: "选择桌面", chooseDisplay: "选择显示器",
   view: "查看", control: "控制", touch: "触控", trackpad: "触控板", pan: "平移",
   keyboard: "键盘", fit: "适合屏幕", left: "左键", right: "右键", release: "释放输入",
+  frameRate: "帧率", bitrate: "画质", auto: "自动", audioOn: "声音已开启", audioOff: "声音已关闭",
+  pictureInPicture: "画中画",
   copyToPhone: "复制到手机", pasteFromPhone: "从手机粘贴", clipboardTransferring: "正在传输剪贴板…",
   clipboardCopied: "已复制到此手机。", clipboardPasted: "已粘贴到桌面。", clipboardEmpty: "剪贴板为空。",
   clipboardUnsupported: "不支持此剪贴板项目。", clipboardTooLarge: "此剪贴板项目过大。",
@@ -99,13 +115,18 @@ const ZH_CN: MobileRemoteDesktopCopy = {
   compatibility: "实时连接恢复期间正在使用兼容视频。", inputOverflow: "输入队列已满，控制已释放。",
   viewOnly: "此桌面仅支持查看。", accessibilityPermission: "控制桌面需要辅助功能权限。",
   inputBusy: "桌面输入正忙，查看仍可继续。", inputUnavailable: "桌面控制不可用，查看仍可继续。",
-  viewerRestarted: "查看器已安全重启，请重新取得控制以继续输入。"
+  viewerRestarted: "查看器已安全重启，请重新取得控制以继续输入。",
+  audioUnavailable: "桌面声音不可用，视频将继续静音播放。",
+  videoSettingsFailed: "无法应用视频设置，当前画面仍可继续查看。",
+  pipUnavailable: "无法启动画中画，请继续在此查看。"
 };
 
 const ZH_TW: MobileRemoteDesktopCopy = {
   ...ZH_CN, title: "遠端桌面", back: "返回", chooseDesktop: "選擇桌面", chooseDisplay: "選擇顯示器", view: "檢視",
   control: "控制", touch: "觸控", trackpad: "觸控板", pan: "平移", keyboard: "鍵盤",
   fit: "符合螢幕", left: "左鍵", right: "右鍵", release: "釋放輸入", retry: "重試",
+  frameRate: "影格率", bitrate: "畫質", auto: "自動", audioOn: "聲音已開啟", audioOff: "聲音已關閉",
+  pictureInPicture: "子母畫面",
   copyToPhone: "複製到手機", pasteFromPhone: "從手機貼上", clipboardTransferring: "正在傳輸剪貼簿…",
   clipboardCopied: "已複製到此手機。", clipboardPasted: "已貼到桌面。", clipboardEmpty: "剪貼簿是空的。",
   clipboardUnsupported: "不支援此剪貼簿項目。", clipboardTooLarge: "此剪貼簿項目過大。",
@@ -119,7 +140,10 @@ const ZH_TW: MobileRemoteDesktopCopy = {
   inputOverflow: "輸入佇列已滿，控制已釋放。", viewOnly: "此桌面僅支援檢視。",
   accessibilityPermission: "控制桌面需要輔助使用權限。", inputBusy: "桌面輸入忙碌中，檢視仍可繼續。",
   inputUnavailable: "桌面控制無法使用，檢視仍可繼續。",
-  viewerRestarted: "檢視器已安全重新啟動，請重新取得控制以繼續輸入。"
+  viewerRestarted: "檢視器已安全重新啟動，請重新取得控制以繼續輸入。",
+  audioUnavailable: "桌面聲音無法使用，視訊將繼續靜音播放。",
+  videoSettingsFailed: "無法套用視訊設定，目前畫面仍可繼續檢視。",
+  pipUnavailable: "無法啟動子母畫面，請繼續在此檢視。"
 };
 
 const JA: MobileRemoteDesktopCopy = {
@@ -127,6 +151,8 @@ const JA: MobileRemoteDesktopCopy = {
   chooseDisplay: "ディスプレイを選択", view: "表示", control: "操作", touch: "タッチ",
   trackpad: "トラックパッド", pan: "移動", keyboard: "キーボード", fit: "画面に合わせる",
   left: "左クリック", right: "右クリック", release: "入力を解放", retry: "再試行", takeover: "引き継ぐ",
+  frameRate: "フレームレート", bitrate: "画質", auto: "自動", audioOn: "音声オン", audioOff: "音声オフ",
+  pictureInPicture: "ピクチャ・イン・ピクチャ",
   copyToPhone: "スマートフォンにコピー", pasteFromPhone: "スマートフォンから貼り付け",
   clipboardTransferring: "クリップボードを転送中…", clipboardCopied: "このスマートフォンにコピーしました。",
   clipboardPasted: "デスクトップに貼り付けました。", clipboardEmpty: "クリップボードは空です。",
@@ -142,13 +168,18 @@ const JA: MobileRemoteDesktopCopy = {
   compatibility: "ライブ接続の回復中は互換映像を使用しています。", inputOverflow: "入力キューが一杯になったため操作を解除しました。",
   viewOnly: "このデスクトップは表示専用です。", accessibilityPermission: "操作するにはデスクトップ側でアクセシビリティ権限が必要です。",
   inputBusy: "デスクトップ入力は使用中です。表示は続行できます。", inputUnavailable: "デスクトップを操作できません。表示は続行できます。",
-  viewerRestarted: "ビューアーを安全に再起動しました。入力を続けるにはもう一度操作を有効にしてください。"
+  viewerRestarted: "ビューアーを安全に再起動しました。入力を続けるにはもう一度操作を有効にしてください。",
+  audioUnavailable: "デスクトップ音声を利用できません。映像は無音で続行します。",
+  videoSettingsFailed: "映像設定を適用できませんでした。現在の表示はそのまま利用できます。",
+  pipUnavailable: "ピクチャ・イン・ピクチャを開始できません。ここで表示を続けてください。"
 };
 
 const KO: MobileRemoteDesktopCopy = {
   ...EN, title: "원격 데스크톱", back: "뒤로", chooseDesktop: "데스크톱 선택", chooseDisplay: "디스플레이 선택",
   view: "보기", control: "제어", touch: "터치", trackpad: "트랙패드", pan: "이동", keyboard: "키보드",
   fit: "화면 맞춤", left: "왼쪽", right: "오른쪽", release: "입력 해제", retry: "다시 시도",
+  frameRate: "프레임 속도", bitrate: "화질", auto: "자동", audioOn: "오디오 켜짐", audioOff: "오디오 꺼짐",
+  pictureInPicture: "화면 속 화면",
   copyToPhone: "휴대전화로 복사", pasteFromPhone: "휴대전화에서 붙여넣기",
   clipboardTransferring: "클립보드 전송 중…", clipboardCopied: "이 휴대전화에 복사했습니다.",
   clipboardPasted: "데스크톱에 붙여넣었습니다.", clipboardEmpty: "클립보드가 비어 있습니다.",
@@ -165,7 +196,10 @@ const KO: MobileRemoteDesktopCopy = {
   inputOverflow: "입력 대기열이 가득 차 제어를 해제했습니다.", viewOnly: "이 데스크톱은 보기 전용입니다.",
   accessibilityPermission: "제어하려면 데스크톱의 손쉬운 사용 권한이 필요합니다.", inputBusy: "데스크톱 입력이 사용 중입니다. 보기는 계속됩니다.",
   inputUnavailable: "데스크톱 제어를 사용할 수 없습니다. 보기는 계속됩니다.",
-  viewerRestarted: "뷰어를 안전하게 다시 시작했습니다. 입력을 계속하려면 제어를 다시 켜세요."
+  viewerRestarted: "뷰어를 안전하게 다시 시작했습니다. 입력을 계속하려면 제어를 다시 켜세요.",
+  audioUnavailable: "데스크톱 오디오를 사용할 수 없습니다. 영상은 음소거 상태로 계속됩니다.",
+  videoSettingsFailed: "영상 설정을 적용하지 못했습니다. 현재 화면은 계속 볼 수 있습니다.",
+  pipUnavailable: "화면 속 화면을 시작하지 못했습니다. 여기에서 계속 시청하세요."
 };
 
 export function mobileRemoteDesktopCopy(locale: MobileSupportedLocale): MobileRemoteDesktopCopy {
@@ -199,6 +233,9 @@ export function mobileRemoteDesktopNoticeLabel(
   if (notice === "input-busy") return copy.inputBusy;
   if (notice === "input-unavailable") return copy.inputUnavailable;
   if (notice === "viewer-restarted") return copy.viewerRestarted;
+  if (notice === "audio-unavailable") return copy.audioUnavailable;
+  if (notice === "video-settings-failed") return copy.videoSettingsFailed;
+  if (notice === "pip-unavailable") return copy.pipUnavailable;
   if (notice === "screen-permission" || notice === "screen-permission-guide") return copy.permission;
   if (notice === "authority-changed") return copy.revoked;
   if (notice === "busy") return copy.busy;

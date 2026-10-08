@@ -8,10 +8,8 @@ const packageJson = JSON.parse(readFileSync(new URL("package.json", moduleRoot),
 const binding = readFileSync(new URL("src/index.ts", moduleRoot), "utf8");
 const swift = readFileSync(new URL("ios/JokoRemotePresentationModule.swift", moduleRoot), "utf8");
 const size = readFileSync(new URL("ios/RemoteClipboardSize.swift", moduleRoot), "utf8");
-const app = JSON.parse(readFileSync(new URL("app.json", project), "utf8")).expo;
-
 describe("native Remote Desktop clipboard boundary", () => {
-  it("autolinks one optional Joko-owned Apple module with only clipboard methods", () => {
+  it("autolinks one optional Joko-owned Apple module with bounded clipboard methods", () => {
     expect(config).toEqual({
       platforms: ["apple"],
       apple: {
@@ -24,10 +22,7 @@ describe("native Remote Desktop clipboard boundary", () => {
     expect(swift).toContain('Name("JokoRemotePresentation")');
     expect(swift).toContain('AsyncFunction("readClipboard")');
     expect(swift).toContain('AsyncFunction("writeClipboard")');
-    expect(swift).not.toContain("AVFoundation");
     expect(swift).not.toContain('AsyncFunction("rotate")');
-    expect(swift).not.toContain('AsyncFunction("playback")');
-    expect(app.ios?.infoPlist?.UIBackgroundModes ?? []).not.toContain("audio");
   });
 
   it("reads and writes one foreground-fenced portable item without file or URL fetching", () => {

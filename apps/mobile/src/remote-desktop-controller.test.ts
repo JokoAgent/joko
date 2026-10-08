@@ -52,7 +52,7 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
-function fixture(webrtcVideo = true, controlling = false) {
+function fixture(webrtcVideo = true, controlling = false, mediaFeatures = false) {
   const targetRevision = create(RevisionSchema, { value: 1n, etag: "target" });
   const relationRevision = create(RevisionSchema, { value: 0n, etag: "relation" });
   const route = create(DevicePeerRouteIdentitySchema, {
@@ -71,7 +71,8 @@ function fixture(webrtcVideo = true, controlling = false) {
   const capabilities = create(RemoteDesktopCapabilitiesSchema, {
     protocolVersion: 1, enabled: true, canControl: true, platform: "darwin", displays: [display], permissions,
     automaticReconnect: true, connectionTakeover: true, webrtcVideo, trickleIce: true, jpegFallback: true,
-    clipboardText: true, clipboardContent: true
+    clipboardText: true, clipboardContent: true, videoSettings: mediaFeatures,
+    systemAudio: mediaFeatures, backgroundViewing: mediaFeatures
   });
   const lease = create(RemoteDesktopLeaseSchema, {
     leaseId: "lease-1", display, controlling, controlGeneration: 1n
@@ -82,6 +83,8 @@ function fixture(webrtcVideo = true, controlling = false) {
   const stop = vi.fn<MobileRemoteDesktopTransport["stop"]>(async () => undefined);
   const control = vi.fn<MobileRemoteDesktopTransport["control"]>(async (_host, _leaseId, enabled) =>
     create(RemoteDesktopControlStateSchema, { controlling: enabled, controlGeneration: 1n }));
+  const presentation = vi.fn<MobileRemoteDesktopTransport["presentation"]>(async () =>
+    create(RemoteDesktopControlStateSchema, { controlling: false, controlGeneration: 1n }));
   const input = vi.fn<MobileRemoteDesktopTransport["input"]>(async () => undefined);
   const offer = vi.fn<MobileRemoteDesktopTransport["offer"]>(async (_host, _leaseId, attemptId) => ({
     $typeName: "joko.v1.RemoteDesktopOfferResult" as const, attemptId, answerSdp: "answer"
@@ -95,13 +98,13 @@ function fixture(webrtcVideo = true, controlling = false) {
     ownerKey: "owner-1", isCurrent: () => true, canStop: () => true,
     listHosts: vi.fn(async () => [host]), capabilities: vi.fn(async () => capabilities),
     permissions: vi.fn(async () => permissions), showPermissionGuide: vi.fn(async () => permissions),
-    start, heartbeat, stop, control, input, iceConfiguration: vi.fn(async () => []),
+    start, heartbeat, stop, control, presentation, input, iceConfiguration: vi.fn(async () => []),
     offer, ice: vi.fn(async (_host, _leaseId, attemptId, candidates, after) => ({
       $typeName: "joko.v1.RemoteDesktopIceExchangeResult" as const,
       attemptId, candidates: [...candidates], next: after + candidates.length, complete: true
     })), frame, clipboardText, clipboardContent
   };
-  return { route, host, transport, start, heartbeat, stop, control, input, offer, frame,
+  return { route, host, transport, start, heartbeat, stop, control, presentation, input, offer, frame,
     clipboardText, clipboardContent, lease };
 }
 
@@ -235,7 +238,7 @@ describe("MobileRemoteDesktopController", () => {
     await flushAsync();
     expect(value.offer).toHaveBeenCalledTimes(1);
     expect(value.offer).toHaveBeenCalledWith(value.host, value.lease.leaseId,
-      "current", "current-offer", expect.any(AbortSignal));
+      "current", "current-offer", undefined, expect.any(AbortSignal));
     await controller.close();
   });
 
@@ -345,6 +348,135 @@ describe("MobileRemoteDesktopController", () => {
     await vi.advanceTimersByTimeAsync(1);
     expect(value.start.mock.calls[1]?.[2]).toBe(RemoteDesktopStartMode.RESUME);
     expect(value.heartbeat).toHaveBeenCalledTimes(1);
+    await controller.close();
+  });
+
+  it("sends the exact video settings and coalesces rapid edits behind one pending offer", async () => {
+    const value = fixture(true, false, true);
+    let resolveOffer!: (result: Awaited<ReturnType<MobileRemoteDesktopTransport["offer"]>>) => void;
+    value.offer.mockImplementationOnce((_host, _leaseId, attemptId) => new Promise((resolve) => {
+      resolveOffer = resolve;
+    })).mockImplementation(async (_host, _leaseId, attemptId) => ({
+      $typeName: "joko.v1.RemoteDesktopOfferResult" as const, attemptId, answerSdp: "answer"
+    }));
+    const playback = vi.fn(async (_enabled: boolean) => undefined);
+    const controller = new MobileRemoteDesktopController(value.transport, undefined, undefined, {
+      nativePictureInPicture: true, requiresPlaybackSession: true, playback
+    });
+    const commands: Record<string, unknown>[] = [];
+    controller.setViewerSink((command) => commands.push(command as Record<string, unknown>));
+    await controller.open();
+    controller.viewerMessage({ type: "ready" });
+    const epoch = commands.find((command) => command.type === "init")?.epoch;
+    controller.viewerMessage({ type: "iceConfig", epoch, attemptId: "initial" });
+    controller.viewerMessage({ type: "offer", epoch, attemptId: "initial", sdp: "offer-initial" });
+    await flushAsync();
+
+    controller.updateVideoSettings({ fps: 60, bitrate: 2_000_000, audio: true });
+    controller.updateVideoSettings({ fps: 60, bitrate: 20_000_000, audio: false });
+    expect(commands.filter((command) => command.type === "videoSettings")).toHaveLength(0);
+    resolveOffer({ $typeName: "joko.v1.RemoteDesktopOfferResult", attemptId: "initial", answerSdp: "answer" });
+    await vi.waitFor(() => expect(commands.filter((command) => command.type === "videoSettings")).toHaveLength(1));
+    expect(commands.filter((command) => command.type === "videoSettings")).toEqual([
+      { type: "videoSettings", audio: false }
+    ]);
+    expect(controller.snapshot.videoSettings).toEqual({ fps: 60, bitrate: 20_000_000, audio: false });
+    controller.viewerMessage({ type: "iceConfig", epoch, attemptId: "latest" });
+    controller.viewerMessage({ type: "offer", epoch, attemptId: "latest", sdp: "offer-latest" });
+    await flushAsync();
+    expect(value.offer.mock.calls.at(-1)?.[4]).toMatchObject({ fps: 60, bitrate: 20_000_000, audio: false });
+    await controller.close();
+  });
+
+  it("keeps only an actual system PiP occurrence alive in background and disables it on return", async () => {
+    vi.useFakeTimers();
+    const value = fixture(true, true, true);
+    const playback = vi.fn(async (_enabled: boolean) => undefined);
+    const controller = new MobileRemoteDesktopController(value.transport, undefined, undefined, {
+      nativePictureInPicture: true, requiresPlaybackSession: true, playback
+    });
+    const commands: Record<string, unknown>[] = [];
+    controller.setViewerSink((command) => commands.push(command as Record<string, unknown>));
+    await controller.open();
+    controller.viewerMessage({ type: "ready" });
+    const epoch = commands.find((command) => command.type === "init")?.epoch;
+    controller.viewerMessage({ type: "iceConfig", epoch, attemptId: "pip" });
+    controller.viewerMessage({ type: "streaming", epoch, attemptId: "pip" });
+    controller.viewerMessage({ type: "pipCapability", epoch, supported: true });
+    expect(controller.snapshot.pipAvailable).toBe(true);
+
+    await controller.startPictureInPicture();
+    expect(value.presentation).toHaveBeenCalledWith(value.host, value.lease.leaseId, true, expect.any(AbortSignal));
+    expect(controller.snapshot.presenting).toBe(false);
+    controller.viewerMessage({ type: "presentation", epoch, active: true });
+    expect(controller.snapshot.presenting).toBe(true);
+    value.stop.mockClear();
+    controller.setInteractive(false);
+    controller.setForeground(false);
+    expect(value.stop).not.toHaveBeenCalled();
+
+    controller.setForeground(true);
+    controller.setInteractive(true);
+    await vi.waitFor(() => expect(value.presentation).toHaveBeenCalledTimes(2));
+    expect(value.presentation).toHaveBeenLastCalledWith(value.host, value.lease.leaseId, false,
+      expect.any(AbortSignal));
+    expect(controller.snapshot.presenting).toBe(false);
+    expect(playback.mock.calls.map(([enabled]) => enabled)).toEqual([true, false, true]);
+    await controller.close();
+  });
+
+  it("retires a lease when the 4 second PiP rollback response is unknown", async () => {
+    vi.useFakeTimers();
+    const value = fixture(true, false, true);
+    value.presentation.mockResolvedValueOnce(create(RemoteDesktopControlStateSchema, {
+      controlling: false, controlGeneration: 2n
+    })).mockRejectedValueOnce(new Error("response lost"));
+    const controller = new MobileRemoteDesktopController(value.transport, undefined, undefined, {
+      nativePictureInPicture: true, requiresPlaybackSession: true, playback: async () => undefined
+    });
+    const commands: Record<string, unknown>[] = [];
+    controller.setViewerSink((command) => commands.push(command as Record<string, unknown>));
+    await controller.open();
+    controller.viewerMessage({ type: "ready" });
+    const epoch = commands.find((command) => command.type === "init")?.epoch;
+    controller.viewerMessage({ type: "iceConfig", epoch, attemptId: "pip-timeout" });
+    controller.viewerMessage({ type: "streaming", epoch, attemptId: "pip-timeout" });
+    controller.viewerMessage({ type: "pipCapability", epoch, supported: true });
+    value.stop.mockClear();
+
+    await controller.startPictureInPicture();
+    await vi.advanceTimersByTimeAsync(4_000);
+    expect(value.presentation.mock.calls.map((call) => call[2])).toEqual([true, false]);
+    expect(value.stop).toHaveBeenCalledTimes(1);
+    expect(controller.snapshot).toMatchObject({ presenting: false, pipAvailable: false });
+    await controller.close();
+  });
+
+  it("degrades audio without retiring control when native playback fails before PiP dispatch", async () => {
+    const value = fixture(true, true, true);
+    const playback = vi.fn(async (enabled: boolean) => {
+      if (enabled) throw new Error("audio session unavailable");
+    });
+    const controller = new MobileRemoteDesktopController(value.transport, undefined, undefined, {
+      nativePictureInPicture: true, requiresPlaybackSession: true, playback
+    });
+    const commands: Record<string, unknown>[] = [];
+    controller.setViewerSink((command) => commands.push(command as Record<string, unknown>));
+    await controller.open();
+    controller.viewerMessage({ type: "ready" });
+    const epoch = commands.find((command) => command.type === "init")?.epoch;
+    controller.viewerMessage({ type: "iceConfig", epoch, attemptId: "audio-degraded" });
+    controller.viewerMessage({ type: "streaming", epoch, attemptId: "audio-degraded" });
+    controller.viewerMessage({ type: "pipCapability", epoch, supported: true });
+    value.stop.mockClear();
+
+    await controller.startPictureInPicture();
+    await vi.waitFor(() => expect(commands.filter((command) => command.type === "videoSettings")).toHaveLength(1));
+    expect(value.presentation).not.toHaveBeenCalled();
+    expect(value.stop).not.toHaveBeenCalled();
+    expect(controller.snapshot).toMatchObject({ controlling: true, notice: "audio-unavailable" });
+    expect(commands.filter((command) => command.type === "videoSettings").at(-1))
+      .toEqual({ type: "videoSettings", audio: false });
     await controller.close();
   });
 
@@ -599,7 +731,9 @@ describe("Remote Desktop boundaries", () => {
     expect(html).toContain("if(videoPresented)post({type:'streaming',attemptId})");
     expect(html).toContain("post({type:'iceConfig',attemptId});if(!window.RTCPeerConnection)");
     expect(html).toContain("image.src='data:image/jpeg;base64,'");
-    expect(html).not.toContain("addTransceiver('audio'");
+    expect(html).toContain("addTransceiver('audio',{direction:'recvonly'})");
+    expect(html).toContain("presentationActive()&&message.type==='viewPing'");
+    expect(html).toContain("dc.send(message.challenge)");
     expect(mobileRemoteDesktopViewerTesting.RTC_NETWORK.retryMs).toEqual([1_000, 3_000, 8_000]);
   });
 
@@ -620,6 +754,9 @@ describe("Remote Desktop boundaries", () => {
     for (const locale of ["en", "zh-CN", "zh-TW", "ja", "ko"] as const) {
       const copy = mobileRemoteDesktopCopy(locale);
       expect(mobileRemoteDesktopNoticeLabel("viewer-restarted", copy)).toBe(copy.viewerRestarted);
+      expect(mobileRemoteDesktopNoticeLabel("audio-unavailable", copy)).toBe(copy.audioUnavailable);
+      expect(mobileRemoteDesktopNoticeLabel("video-settings-failed", copy)).toBe(copy.videoSettingsFailed);
+      expect(mobileRemoteDesktopNoticeLabel("pip-unavailable", copy)).toBe(copy.pipUnavailable);
       expect(mobileRemoteDesktopNoticeLabel("generic-error", copy)).toBe(copy.error);
       expect(mobileRemoteDesktopClipboardNoticeLabel("copied", copy)).toBe(copy.clipboardCopied);
       expect(mobileRemoteDesktopClipboardNoticeLabel("too-large", copy)).toBe(copy.clipboardTooLarge);

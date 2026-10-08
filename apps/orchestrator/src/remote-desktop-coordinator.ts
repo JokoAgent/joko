@@ -4,6 +4,7 @@ import type { DevicePeerMultiplexEvent, DevicePeerResponseFrame } from "@joko/de
 import type { ConnectionRecord } from "@joko/store";
 
 import {
+  DevicePeerAuthorityError,
   type DevicePeerAuthority,
   type DevicePeerOwner,
   type DevicePeerSelectionIdentity
@@ -11,6 +12,8 @@ import {
 import { toProtoTimestamp } from "./proto-mapper.js";
 
 const REMOTE_DESKTOP_LEASE_MS = 12_000;
+const REMOTE_DESKTOP_PRESENTATION_PROBE_MS = 3_000;
+const REMOTE_DESKTOP_PRESENTATION_PROBE_TIMEOUT_MS = 2_500;
 const MAXIMUM_IDENTIFIER_LENGTH = 256;
 const MAXIMUM_DISPLAY_NAME_LENGTH = 256;
 const MAXIMUM_DISPLAYS = 16;
@@ -90,6 +93,11 @@ interface RemoteDesktopLeaseState {
   expiresAt: number;
   timer: ReturnType<typeof setTimeout>;
   routeSubscription?: { dispose(): void };
+  presentation: boolean;
+  presentationEpoch: number;
+  presentationProofSequence: bigint;
+  presentationTimer?: ReturnType<typeof setTimeout>;
+  presentationAbort?: AbortController;
 }
 
 interface RemoteDesktopStartFence {
@@ -252,7 +260,10 @@ export class RemoteDesktopCoordinator {
         controlling: value.controlling,
         controlGeneration: value.controlGeneration,
         expiresAt: this.#now() + REMOTE_DESKTOP_LEASE_MS,
-        timer: setTimeout(() => undefined, REMOTE_DESKTOP_LEASE_MS)
+        timer: setTimeout(() => undefined, REMOTE_DESKTOP_LEASE_MS),
+        presentation: false,
+        presentationEpoch: 0,
+        presentationProofSequence: 0n
       };
       clearTimeout(state.timer);
       state.timer = this.#leaseTimer(state);
@@ -281,6 +292,13 @@ export class RemoteDesktopCoordinator {
   ): Promise<contract.RemoteDesktopControlState> {
     const state = this.#requireLease(connection, identity, leaseId);
     const authority = this.#capture(connection, identity);
+    if (state.presentation) {
+      this.#revalidateLeaseCompletion(state, connection, identity, authority);
+      return create(contract.RemoteDesktopControlStateSchema, {
+        controlling: state.controlling,
+        controlGeneration: state.controlGeneration
+      });
+    }
     const value = await this.#runLeaseBound(state, connection, identity, authority, () =>
       this.#dispatch<contract.RemoteDesktopControlState>(authority, remoteDesktopCommand(
         "heartbeatRemoteDesktop",
@@ -326,7 +344,51 @@ export class RemoteDesktopCoordinator {
         create(contract.DevicePeerSetRemoteDesktopControlActionSchema, input),
         "side_effect"
       ), signal, "remoteDesktopControlState", "joko.v1.RemoteDesktopControlState"));
-    return this.#adoptControlState(state, value);
+    const current = this.#adoptControlState(state, value);
+    if (input.enabled) this.#stopPresentationPolling(state);
+    return current;
+  }
+
+  async setPresentation(
+    connection: ConnectionRecord,
+    identity: DevicePeerSelectionIdentity,
+    input: { readonly leaseId: string; readonly enabled: boolean },
+    signal: AbortSignal
+  ): Promise<contract.RemoteDesktopControlState> {
+    const state = this.#requireLease(connection, identity, input.leaseId);
+    const authority = this.#capture(connection, identity);
+    const previousGeneration = state.controlGeneration;
+    this.#stopPresentationPolling(state);
+    let value: contract.RemoteDesktopControlState;
+    try {
+      value = await this.#runLeaseBound(state, connection, identity, authority, () =>
+        this.#dispatch<contract.RemoteDesktopControlState>(authority, remoteDesktopCommand(
+          "setRemoteDesktopPresentation",
+          create(contract.DevicePeerSetRemoteDesktopPresentationActionSchema, input),
+          "side_effect"
+        ), signal, "remoteDesktopControlState", "joko.v1.RemoteDesktopControlState"));
+    } catch (error) {
+      this.#retireAfterPresentationFailure(state);
+      throw error;
+    }
+    if (input.enabled && (value.controlling || value.controlGeneration <= previousGeneration)) {
+      this.#retireAfterPresentationFailure(state);
+      throw invalidTargetResponse();
+    }
+    const current = this.#adoptControlState(state, value);
+    if (!input.enabled) return current;
+
+    let proof: contract.RemoteDesktopPresentationProof;
+    try {
+      proof = await this.#probePresentation(state, authority, signal);
+    } catch (error) {
+      this.#retireAfterPresentationFailure(state);
+      throw error;
+    }
+    state.presentation = true;
+    state.presentationProofSequence = proof.proofSequence;
+    this.#schedulePresentationProbe(state, state.presentationEpoch);
+    return current;
   }
 
   async sendInput(
@@ -380,12 +442,18 @@ export class RemoteDesktopCoordinator {
   async createOffer(
     connection: ConnectionRecord,
     identity: DevicePeerSelectionIdentity,
-    input: { readonly leaseId: string; readonly attemptId: string; readonly offerSdp: string },
+    input: {
+      readonly leaseId: string;
+      readonly attemptId: string;
+      readonly offerSdp: string;
+      readonly settings?: contract.RemoteDesktopVideoSettings;
+    },
     signal: AbortSignal
   ): Promise<contract.RemoteDesktopOfferResult> {
     const state = this.#requireLease(connection, identity, input.leaseId);
     validateAttemptId(input.attemptId);
     validateSdp(input.offerSdp, "offer_sdp");
+    if (input.settings !== undefined) validateVideoSettings(input.settings);
     const authority = this.#capture(connection, identity);
     const value = await this.#runLeaseBound(state, connection, identity, authority, () =>
       this.#dispatch<contract.RemoteDesktopOfferResult>(authority, remoteDesktopCommand(
@@ -618,6 +686,7 @@ export class RemoteDesktopCoordinator {
   #forget(state: RemoteDesktopLeaseState): void {
     if (this.#leases.get(state.leaseId) !== state) return;
     this.#leases.delete(state.leaseId);
+    this.#stopPresentationPolling(state);
     clearTimeout(state.timer);
     state.routeSubscription?.dispose();
     state.routeSubscription = undefined;
@@ -626,6 +695,79 @@ export class RemoteDesktopCoordinator {
       this.#revocationSubscriptions.get(state.controllerConnectionId)?.();
       this.#revocationSubscriptions.delete(state.controllerConnectionId);
     }
+  }
+
+  #stopPresentationPolling(state: RemoteDesktopLeaseState): void {
+    state.presentation = false;
+    state.presentationEpoch += 1;
+    if (state.presentationTimer !== undefined) clearTimeout(state.presentationTimer);
+    state.presentationTimer = undefined;
+    state.presentationAbort?.abort();
+    state.presentationAbort = undefined;
+  }
+
+  #schedulePresentationProbe(state: RemoteDesktopLeaseState, epoch: number): void {
+    if (this.#leases.get(state.leaseId) !== state || !state.presentation
+      || state.presentationEpoch !== epoch) return;
+    const timer = setTimeout(() => {
+      if (state.presentationTimer === timer) state.presentationTimer = undefined;
+      void this.#pollPresentation(state, epoch);
+    }, REMOTE_DESKTOP_PRESENTATION_PROBE_MS);
+    timer.unref?.();
+    state.presentationTimer = timer;
+  }
+
+  async #pollPresentation(state: RemoteDesktopLeaseState, epoch: number): Promise<void> {
+    if (this.#leases.get(state.leaseId) !== state || !state.presentation
+      || state.presentationEpoch !== epoch) return;
+    const abort = new AbortController();
+    state.presentationAbort = abort;
+    try {
+      const proof = await this.#probePresentation(
+        state,
+        state.cleanupAuthority,
+        AbortSignal.any([abort.signal, AbortSignal.timeout(REMOTE_DESKTOP_PRESENTATION_PROBE_TIMEOUT_MS)])
+      );
+      if (this.#leases.get(state.leaseId) !== state || !state.presentation
+        || state.presentationEpoch !== epoch) return;
+      if (proof.proofSequence < state.presentationProofSequence) throw invalidTargetResponse();
+      if (proof.proofSequence > state.presentationProofSequence) {
+        state.presentationProofSequence = proof.proofSequence;
+        state.expiresAt = this.#now() + REMOTE_DESKTOP_LEASE_MS;
+        clearTimeout(state.timer);
+        state.timer = this.#leaseTimer(state);
+      }
+      this.#schedulePresentationProbe(state, epoch);
+    } catch (error) {
+      if (this.#leases.get(state.leaseId) === state && state.presentation
+        && state.presentationEpoch === epoch) {
+        if (presentationProbeRequiresRetirement(error)) this.#retireAfterPresentationFailure(state);
+        else this.#schedulePresentationProbe(state, epoch);
+      }
+    } finally {
+      if (state.presentationAbort === abort) state.presentationAbort = undefined;
+    }
+  }
+
+  async #probePresentation(
+    state: RemoteDesktopLeaseState,
+    authority: DevicePeerAuthority,
+    signal: AbortSignal
+  ): Promise<contract.RemoteDesktopPresentationProof> {
+    const proof = await this.#runLeaseBound(state, state.connection, state.identity, authority, () =>
+      this.#dispatch<contract.RemoteDesktopPresentationProof>(authority, remoteDesktopCommand(
+        "probeRemoteDesktopPresentation",
+        create(contract.DevicePeerProbeRemoteDesktopPresentationActionSchema, { leaseId: state.leaseId }),
+        "read_only"
+      ), signal, "remoteDesktopPresentationProof", "joko.v1.RemoteDesktopPresentationProof"));
+    if (proof.leaseId !== state.leaseId || proof.proofSequence < 0n) throw invalidTargetResponse();
+    return proof;
+  }
+
+  #retireAfterPresentationFailure(state: RemoteDesktopLeaseState): void {
+    if (this.#leases.get(state.leaseId) !== state) return;
+    this.#forget(state);
+    void this.#bestEffortStop(state);
   }
 
   #ensureRevocationSubscription(connectionId: string): void {
@@ -833,6 +975,7 @@ type RemoteDesktopActionCase = Extract<
   contract.DevicePeerCommand["action"],
   { case: `getRemoteDesktop${string}` | `showRemoteDesktop${string}` | `startRemoteDesktop` | `heartbeatRemoteDesktop`
     | `stopRemoteDesktop` | `setRemoteDesktopControl` | `sendRemoteDesktopInput`
+    | `setRemoteDesktopPresentation` | `probeRemoteDesktopPresentation`
     | `createRemoteDesktopOffer` | `exchangeRemoteDesktopIce`
     | `transferRemoteDesktopClipboardText` | `transferRemoteDesktopClipboardContent` }
 >["case"];
@@ -896,6 +1039,7 @@ function remoteDesktopTargetFailure(detail: contract.RemoteDesktopFailure): Remo
       : detail.reason === contract.RemoteDesktopFailureReason.UNSUPPORTED
         ? "unimplemented"
         : detail.reason === contract.RemoteDesktopFailureReason.VIDEO_TIMEOUT
+          || detail.reason === contract.RemoteDesktopFailureReason.AUDIO_UNAVAILABLE
           ? "unavailable"
           : "failed_precondition";
   return new RemoteDesktopCoordinatorError(code, "Remote Desktop host rejected the request.", detail);
@@ -914,7 +1058,9 @@ function genericTargetFailure(errorCode: string): RemoteDesktopCoordinatorError 
 function validateCapabilities(value: contract.RemoteDesktopCapabilities): void {
   if (value.protocolVersion !== 1 || !/^(?:darwin|linux|win32)$/u.test(value.platform)
     || value.displays.length > MAXIMUM_DISPLAYS || value.permissions === undefined
-    || typeof value.clipboardText !== "boolean" || typeof value.clipboardContent !== "boolean") {
+    || typeof value.clipboardText !== "boolean" || typeof value.clipboardContent !== "boolean"
+    || typeof value.videoSettings !== "boolean" || typeof value.systemAudio !== "boolean"
+    || typeof value.backgroundViewing !== "boolean") {
     throw invalidTargetResponse();
   }
   for (const display of value.displays) validateDisplay(display);
@@ -942,6 +1088,15 @@ function validateLease(value: contract.RemoteDesktopLease): void {
 function validateControlState(value: contract.RemoteDesktopControlState): void {
   if (typeof value.controlling !== "boolean" || value.controlGeneration < 1n) {
     throw invalidTargetResponse();
+  }
+}
+
+function validateVideoSettings(value: contract.RemoteDesktopVideoSettings): void {
+  if ((value.fps !== 30 && value.fps !== 60)
+    || (value.bitrate !== 0 && value.bitrate !== 2_000_000
+      && value.bitrate !== 8_000_000 && value.bitrate !== 20_000_000)
+    || typeof value.audio !== "boolean") {
+    throw invalidArgument("Remote Desktop video settings are invalid.");
   }
 }
 
@@ -1215,4 +1370,13 @@ function invalidArgument(message: string): RemoteDesktopCoordinatorError {
 
 function invalidTargetResponse(): RemoteDesktopCoordinatorError {
   return new RemoteDesktopCoordinatorError("internal", "Remote Desktop host returned an invalid response.");
+}
+
+function presentationProbeRequiresRetirement(error: unknown): boolean {
+  if (error instanceof DevicePeerAuthorityError) return true;
+  if (!(error instanceof RemoteDesktopCoordinatorError)) return false;
+  if (error.code === "internal" || error.code === "permission_denied" || error.code === "not_found") return true;
+  return error.detail?.reason === contract.RemoteDesktopFailureReason.STOPPED
+    || error.detail?.reason === contract.RemoteDesktopFailureReason.LEASE_EXPIRED
+    || error.detail?.reason === contract.RemoteDesktopFailureReason.AUTHORITY_CHANGED;
 }

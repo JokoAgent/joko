@@ -794,7 +794,8 @@ export class MobileClient {
     if (!credential || !ownerKey || !this.network.listRemoteDesktopHosts || !this.network.getRemoteDesktopCapabilities
       || !this.network.getRemoteDesktopPermissions || !this.network.showRemoteDesktopPermissionGuide
       || !this.network.startRemoteDesktop || !this.network.heartbeatRemoteDesktop || !this.network.stopRemoteDesktop
-      || !this.network.setRemoteDesktopControl || !this.network.sendRemoteDesktopInput
+      || !this.network.setRemoteDesktopControl || !this.network.setRemoteDesktopPresentation
+      || !this.network.sendRemoteDesktopInput
       || !this.network.getRemoteDesktopIceConfiguration || !this.network.createRemoteDesktopOffer
       || !this.network.exchangeRemoteDesktopIce || !this.network.getRemoteDesktopFrame
       || !this.network.transferRemoteDesktopClipboardText
@@ -830,12 +831,14 @@ export class MobileClient {
       },
       control: (host, leaseId, enabled, signal) => checked(() =>
         this.network.setRemoteDesktopControl!(credential, route(host), leaseId, enabled, signal)),
+      presentation: (host, leaseId, enabled, signal) => checked(() =>
+        this.network.setRemoteDesktopPresentation!(credential, route(host), leaseId, enabled, signal)),
       input: (host, leaseId, sequence, events, signal) => checked(() =>
         this.network.sendRemoteDesktopInput!(credential, route(host), leaseId, sequence, events, signal)),
       iceConfiguration: (host, leaseId, signal) => checked(() =>
         this.network.getRemoteDesktopIceConfiguration!(credential, route(host), leaseId, signal)),
-      offer: (host, leaseId, attemptId, sdp, signal) => checked(() =>
-        this.network.createRemoteDesktopOffer!(credential, route(host), leaseId, attemptId, sdp, signal)),
+      offer: (host, leaseId, attemptId, sdp, settings, signal) => checked(() =>
+        this.network.createRemoteDesktopOffer!(credential, route(host), leaseId, attemptId, sdp, settings, signal)),
       ice: (host, leaseId, attemptId, candidates, after, signal) => checked(() =>
         this.network.exchangeRemoteDesktopIce!(credential, route(host), leaseId, attemptId, candidates, after, signal)),
       frame: (host, leaseId, signal) => checked(() =>

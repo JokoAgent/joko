@@ -12,7 +12,9 @@ import {
   type RemoteDesktopLease,
   type RemoteDesktopOfferResult,
   type RemoteDesktopPermissions,
-  type RemoteDesktopStartMode
+  type RemoteDesktopPresentationProof,
+  type RemoteDesktopStartMode,
+  type RemoteDesktopVideoSettings
 } from "@joko/contracts";
 
 export type DevicePeerFileKind = "file" | "directory" | "symbolic_link" | "other";
@@ -156,6 +158,11 @@ export interface DevicePeerRemoteDesktopHostPort {
   setControl(request: DevicePeerRemoteDesktopLeaseRequest & {
     readonly enabled: boolean;
   }): Promise<RemoteDesktopControlState>;
+  setPresentation(request: DevicePeerRemoteDesktopLeaseRequest & {
+    readonly enabled: boolean;
+  }): Promise<RemoteDesktopControlState>;
+  /** Read-only current proof; this call must never itself renew the lease. */
+  probePresentation(request: DevicePeerRemoteDesktopLeaseRequest): Promise<RemoteDesktopPresentationProof>;
   sendInput(request: DevicePeerRemoteDesktopLeaseRequest & {
     readonly sequence: bigint;
     readonly events: readonly RemoteDesktopInputEvent[];
@@ -163,6 +170,7 @@ export interface DevicePeerRemoteDesktopHostPort {
   createOffer(request: DevicePeerRemoteDesktopLeaseRequest & {
     readonly attemptId: string;
     readonly offerSdp: string;
+    readonly settings?: RemoteDesktopVideoSettings;
   }): Promise<RemoteDesktopOfferResult>;
   exchangeIce(request: DevicePeerRemoteDesktopLeaseRequest & {
     readonly attemptId: string;

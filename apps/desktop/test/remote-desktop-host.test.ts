@@ -1,7 +1,8 @@
 import {
   RemoteDesktopClipboardContentSchema,
   RemoteDesktopFailureReason,
-  RemoteDesktopStartMode
+  RemoteDesktopStartMode,
+  RemoteDesktopVideoSettingsSchema
 } from "@joko/contracts";
 import { create } from "@bufbuild/protobuf";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -46,6 +47,11 @@ describe("Desktop Remote Desktop host", () => {
       mode: RemoteDesktopStartMode.NEW
     });
     expect((await linux.host.getCapabilities(REQUEST)).canControl).toBe(false);
+    expect(await linux.host.getCapabilities(REQUEST)).toMatchObject({
+      videoSettings: true,
+      systemAudio: false,
+      backgroundViewing: true
+    });
     await expect(linux.host.setControl({
       ...REQUEST,
       leaseId: lease.leaseId,
@@ -53,6 +59,53 @@ describe("Desktop Remote Desktop host", () => {
     })).rejects.toMatchObject({ reason: RemoteDesktopFailureReason.VIEW_ONLY });
     expect(linux.input.start).not.toHaveBeenCalled();
     expect(linux.host.state?.controlling).toBe(false);
+  });
+
+  it("uses only trusted presentation pongs to renew view-only proof", async () => {
+    const value = fixture({ enabled: true, platform: "win32" });
+    hosts.push(value.host);
+    expect(await value.host.getCapabilities(REQUEST)).toMatchObject({
+      videoSettings: true,
+      systemAudio: true,
+      backgroundViewing: true
+    });
+    const lease = await value.host.start({
+      ...REQUEST,
+      displayId: "display-1",
+      mode: RemoteDesktopStartMode.NEW
+    });
+    const control = await value.host.setControl({
+      ...REQUEST,
+      leaseId: lease.leaseId,
+      enabled: true
+    });
+    const presentation = await value.host.setPresentation({
+      ...REQUEST,
+      leaseId: lease.leaseId,
+      enabled: true
+    });
+    expect(presentation.controlling).toBe(false);
+    expect(presentation.controlGeneration).toBeGreaterThan(control.controlGeneration);
+    expect(value.input.stop).toHaveBeenCalled();
+    expect(value.media.setPresentation).toHaveBeenCalledWith(lease.leaseId, true);
+
+    await expect(value.host.probePresentation({
+      ...REQUEST,
+      leaseId: lease.leaseId
+    })).resolves.toMatchObject({ leaseId: lease.leaseId, proofSequence: 0n });
+    value.presentationPong(lease.leaseId);
+    await expect(value.host.probePresentation({
+      ...REQUEST,
+      leaseId: lease.leaseId
+    })).resolves.toMatchObject({ leaseId: lease.leaseId, proofSequence: 1n });
+
+    await value.host.setControl({ ...REQUEST, leaseId: lease.leaseId, enabled: true });
+    expect(value.media.setPresentation).toHaveBeenLastCalledWith(lease.leaseId, false);
+    value.presentationPong(lease.leaseId);
+    await expect(value.host.probePresentation({
+      ...REQUEST,
+      leaseId: lease.leaseId
+    })).rejects.toMatchObject({ reason: RemoteDesktopFailureReason.LEASE_EXPIRED });
   });
 
   it("preserves viewing and reports view-only after native input failure", async () => {
@@ -221,6 +274,47 @@ describe("Desktop Remote Desktop host", () => {
     expect(value.input.retire).toHaveBeenCalledOnce();
   });
 
+  it("passes the fixed video settings and preserves typed system-audio failure", async () => {
+    const value = fixture({ enabled: true, platform: "win32" });
+    hosts.push(value.host);
+    const lease = await value.host.start({
+      ...REQUEST,
+      displayId: "display-1",
+      mode: RemoteDesktopStartMode.NEW
+    });
+    await value.host.createOffer({
+      ...REQUEST,
+      leaseId: lease.leaseId,
+      attemptId: "attempt-settings",
+      offerSdp: "offer",
+      settings: create(RemoteDesktopVideoSettingsSchema, {
+        fps: 60,
+        bitrate: 8_000_000,
+        audio: true
+      })
+    });
+    expect(value.media.offer).toHaveBeenLastCalledWith(expect.objectContaining({
+      leaseId: lease.leaseId,
+      attemptId: "attempt-settings",
+      settings: { fps: 60, bitrate: 8_000_000, audio: true }
+    }));
+
+    vi.mocked(value.media.offer).mockRejectedValueOnce(
+      new Error("REMOTE_DESKTOP_AUDIO_UNAVAILABLE")
+    );
+    await expect(value.host.createOffer({
+      ...REQUEST,
+      leaseId: lease.leaseId,
+      attemptId: "attempt-audio-unavailable",
+      offerSdp: "offer",
+      settings: create(RemoteDesktopVideoSettingsSchema, {
+        fps: 30,
+        bitrate: 0,
+        audio: true
+      })
+    })).rejects.toMatchObject({ reason: RemoteDesktopFailureReason.AUDIO_UNAVAILABLE });
+  });
+
   it("fails closed when initially locked and starts only after the session unlocks", async () => {
     const value = fixture({ enabled: true, platform: "win32", sessionUnlocked: false });
     hosts.push(value.host);
@@ -342,6 +436,11 @@ function fixture(options: {
       complete: true
     })),
     setInputHandler: vi.fn(() => vi.fn()),
+    setPresentationPongHandler: vi.fn((handler) => {
+      presentationPong = handler;
+      return () => { if (presentationPong === handler) presentationPong = undefined; };
+    }),
+    setPresentation: vi.fn(),
     stop: vi.fn(),
     retire: vi.fn(async () => undefined)
   };
@@ -368,6 +467,7 @@ function fixture(options: {
     })
   };
   let lease = 0;
+  let presentationPong: ((leaseId: string) => void) | undefined;
   let sessionUnlocked = options.sessionUnlocked ?? true;
   let sessionListener: ((unlocked: boolean) => void) | undefined;
   const permissions = vi.fn(async () => Object.freeze({
@@ -379,6 +479,7 @@ function fixture(options: {
   ]);
   const host = new DesktopRemoteDesktopHost({
     platform: options.platform,
+    systemAudio: options.platform === "win32",
     enabled: () => options.enabled,
     sessionUnlocked: () => sessionUnlocked,
     displays,
@@ -401,6 +502,9 @@ function fixture(options: {
     clipboard,
     permissions,
     displays,
+    presentationPong(leaseId: string): void {
+      presentationPong?.(leaseId);
+    },
     setSessionUnlocked(unlocked: boolean): void {
       sessionUnlocked = unlocked;
       sessionListener?.(unlocked);

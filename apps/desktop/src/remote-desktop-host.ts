@@ -16,9 +16,11 @@ import {
   RemoteDesktopOfferResultSchema,
   RemoteDesktopPermissionsSchema,
   RemoteDesktopPermissionStatus,
+  RemoteDesktopPresentationProofSchema,
   RemoteDesktopStartMode,
   type RemoteDesktopClipboardContent,
-  type RemoteDesktopInputEvent
+  type RemoteDesktopInputEvent,
+  type RemoteDesktopVideoSettings as ContractRemoteDesktopVideoSettings
 } from "@joko/contracts";
 import {
   DevicePeerRemoteDesktopHostError,
@@ -36,6 +38,7 @@ import {
 } from "@joko/device-peer";
 
 import type { DesktopRemoteDesktopClipboardContent } from "./remote-desktop-clipboard.js";
+import type { DesktopRemoteDesktopVideoSettings } from "./remote-desktop-media-settings.js";
 
 export interface DesktopRemoteDesktopMediaPort {
   frame(displayId: string, signal: AbortSignal): Promise<RemoteDesktopJpegFrame | null>;
@@ -44,6 +47,8 @@ export interface DesktopRemoteDesktopMediaPort {
     readonly leaseId: string;
     readonly attemptId: string;
     readonly offerSdp: string;
+    readonly settings?: DesktopRemoteDesktopVideoSettings;
+    readonly current: () => boolean;
     readonly signal: AbortSignal;
   }): Promise<string>;
   exchangeIce(request: {
@@ -63,6 +68,8 @@ export interface DesktopRemoteDesktopMediaPort {
     sequence: number,
     events: readonly RemoteDesktopInput[]
   ) => void): () => void;
+  setPresentationPongHandler(handler: (leaseId: string) => void): () => void;
+  setPresentation(leaseId: string, enabled: boolean): void;
   stop(): void;
   retire(): Promise<void>;
 }
@@ -90,6 +97,7 @@ export interface DesktopRemoteDesktopClipboardPort {
 
 export interface DesktopRemoteDesktopHostDependencies {
   readonly platform: "darwin" | "win32" | "linux";
+  readonly systemAudio: boolean;
   enabled(): boolean;
   sessionUnlocked(): boolean;
   displays(): readonly RemoteDesktopDisplay[];
@@ -126,6 +134,7 @@ export class DesktopRemoteDesktopHost implements DevicePeerRemoteDesktopHostPort
   readonly #signals = new AsyncLocalStorage<AbortSignal>();
   readonly #lifecycleToken = Object.freeze({});
   readonly #stopInputHandler: () => void;
+  readonly #stopPresentationPongHandler: () => void;
   readonly #stopSubscriptions: readonly (() => void)[];
   readonly #timer: ReturnType<typeof setInterval>;
   #sessionUnlocked: boolean;
@@ -152,12 +161,14 @@ export class DesktopRemoteDesktopHost implements DevicePeerRemoteDesktopHostPort
       input: (events) => dependencies.input.send(events),
       stopInput: () => dependencies.input.stop(),
       stopVideo: () => dependencies.media.stop(),
-      offer: (lease, sdp, attemptId) => this.#whileSessionUnlocked(
+      offer: (lease, sdp, attemptId, settings, authority) => this.#whileSessionUnlocked(
         () => dependencies.media.offer({
           displayId: lease.display.id,
           leaseId: lease.lease,
           attemptId,
           offerSdp: sdp,
+          ...(settings === undefined ? {} : { settings }),
+          current: () => this.#controller.hasLease(authority, lease.lease),
           signal: this.#signal()
         })
       ),
@@ -181,6 +192,10 @@ export class DesktopRemoteDesktopHost implements DevicePeerRemoteDesktopHostPort
         // A rejected DataChannel batch is scoped to the current control bit.
         // The generated heartbeat reports the resulting view-only state.
       }
+    });
+    this.#stopPresentationPongHandler = dependencies.media.setPresentationPongHandler((leaseId) => {
+      if (this.#retired) return;
+      this.#controller.recordPresentationPong(leaseId);
     });
     const subscriptions: (() => void)[] = [];
     if (dependencies.onDisplayChange !== undefined) {
@@ -238,6 +253,9 @@ export class DesktopRemoteDesktopHost implements DevicePeerRemoteDesktopHostPort
       readonly jpegFallback: boolean;
       readonly clipboardText: boolean;
       readonly clipboardContent: boolean;
+      readonly videoSettings: boolean;
+      readonly systemAudio: boolean;
+      readonly backgroundViewing: boolean;
     };
     return create(RemoteDesktopCapabilitiesSchema, {
       protocolVersion: value.version,
@@ -257,7 +275,10 @@ export class DesktopRemoteDesktopHost implements DevicePeerRemoteDesktopHostPort
       trickleIce: value.trickleIce,
       jpegFallback: value.jpegFallback,
       clipboardText: value.clipboardText,
-      clipboardContent: value.clipboardContent
+      clipboardContent: value.clipboardContent,
+      videoSettings: value.videoSettings,
+      systemAudio: value.systemAudio,
+      backgroundViewing: value.backgroundViewing
     });
   }
 
@@ -319,10 +340,45 @@ export class DesktopRemoteDesktopHost implements DevicePeerRemoteDesktopHostPort
       lease: request.leaseId,
       enabled: request.enabled
     }) as { readonly controlling: boolean; readonly controlGeneration: number };
+    if (request.enabled) this.#dependencies.media.setPresentation(request.leaseId, false);
     return create(RemoteDesktopControlStateSchema, {
       controlling: value.controlling,
       controlGeneration: BigInt(value.controlGeneration)
     });
+  }
+
+  async setPresentation(
+    request: DevicePeerRemoteDesktopLeaseRequest & { readonly enabled: boolean }
+  ) {
+    const value = await this.#request(request, {
+      op: "presentation",
+      lease: request.leaseId,
+      enabled: request.enabled
+    }) as { readonly controlling: boolean; readonly controlGeneration: number };
+    this.#dependencies.media.setPresentation(request.leaseId, request.enabled);
+    return create(RemoteDesktopControlStateSchema, {
+      controlling: value.controlling,
+      controlGeneration: BigInt(value.controlGeneration)
+    });
+  }
+
+  async probePresentation(request: DevicePeerRemoteDesktopLeaseRequest) {
+    if (this.#retired) throw failure(RemoteDesktopFailureReason.STOPPED, false);
+    throwIfAborted(request.signal);
+    try {
+      const proof = this.#controller.probePresentation(
+        this.#authority(request.controllerDeviceId),
+        request.leaseId
+      );
+      throwIfAborted(request.signal);
+      return create(RemoteDesktopPresentationProofSchema, {
+        leaseId: proof.lease,
+        proofSequence: BigInt(proof.proofSequence)
+      });
+    } catch (error) {
+      if (request.signal.aborted) throw request.signal.reason;
+      throw translateFailure(error);
+    }
   }
 
   async sendInput(request: DevicePeerRemoteDesktopLeaseRequest & {
@@ -344,12 +400,20 @@ export class DesktopRemoteDesktopHost implements DevicePeerRemoteDesktopHostPort
   async createOffer(request: DevicePeerRemoteDesktopLeaseRequest & {
     readonly attemptId: string;
     readonly offerSdp: string;
+    readonly settings?: ContractRemoteDesktopVideoSettings;
   }) {
     const value = await this.#request(request, {
       op: "offer",
       lease: request.leaseId,
       attemptId: request.attemptId,
-      sdp: request.offerSdp
+      sdp: request.offerSdp,
+      ...(request.settings === undefined ? {} : {
+        settings: Object.freeze({
+          fps: request.settings.fps,
+          bitrate: request.settings.bitrate,
+          audio: request.settings.audio
+        })
+      })
     }) as { readonly sdp: string };
     return create(RemoteDesktopOfferResultSchema, {
       attemptId: request.attemptId,
@@ -463,6 +527,7 @@ export class DesktopRemoteDesktopHost implements DevicePeerRemoteDesktopHostPort
     this.#retired = true;
     clearInterval(this.#timer);
     this.#stopInputHandler();
+    this.#stopPresentationPongHandler();
     for (const stop of this.#stopSubscriptions) stop();
     this.#controller.stop();
     await Promise.allSettled([
@@ -499,6 +564,9 @@ export class DesktopRemoteDesktopHost implements DevicePeerRemoteDesktopHostPort
         canControl: false,
         clipboardText: false,
         clipboardContent: false,
+        videoSettings: true,
+        systemAudio: this.#dependencies.systemAudio,
+        backgroundViewing: true,
         platform: this.#dependencies.platform,
         displays: Object.freeze([]),
         permissions: disabledPermissions(this.#dependencies.platform)
@@ -513,6 +581,9 @@ export class DesktopRemoteDesktopHost implements DevicePeerRemoteDesktopHostPort
         canControl: this.#dependencies.platform !== "linux",
         clipboardText: this.#dependencies.clipboard !== undefined,
         clipboardContent: this.#dependencies.clipboard !== undefined,
+        videoSettings: true,
+        systemAudio: this.#dependencies.systemAudio,
+        backgroundViewing: true,
         platform: this.#dependencies.platform,
         displays,
         permissions
@@ -697,6 +768,7 @@ function translateFailure(error: unknown): unknown {
     case "REMOTE_DESKTOP_VIDEO_BUSY": return failure(RemoteDesktopFailureReason.VIDEO_BUSY, true);
     case "REMOTE_DESKTOP_VIDEO_TIMEOUT": return failure(RemoteDesktopFailureReason.VIDEO_TIMEOUT, true);
     case "REMOTE_DESKTOP_VIDEO_UNAVAILABLE": return failure(RemoteDesktopFailureReason.VIDEO_UNAVAILABLE, true);
+    case "REMOTE_DESKTOP_AUDIO_UNAVAILABLE": return failure(RemoteDesktopFailureReason.AUDIO_UNAVAILABLE, true);
     case "REMOTE_DESKTOP_ACCESS_REVOKED":
       return failure(RemoteDesktopFailureReason.AUTHORITY_CHANGED, false);
     case "REMOTE_DESKTOP_INPUT_UNSUPPORTED":

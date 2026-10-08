@@ -18,6 +18,7 @@ service RemoteDesktopService {
   rpc HeartbeatRemoteDesktop(HeartbeatRemoteDesktopRequest) returns (HeartbeatRemoteDesktopResponse);
   rpc StopRemoteDesktop(StopRemoteDesktopRequest) returns (StopRemoteDesktopResponse);
   rpc SetRemoteDesktopControl(SetRemoteDesktopControlRequest) returns (SetRemoteDesktopControlResponse);
+  rpc SetRemoteDesktopPresentation(SetRemoteDesktopPresentationRequest) returns (SetRemoteDesktopPresentationResponse);
   rpc SendRemoteDesktopInput(SendRemoteDesktopInputRequest) returns (SendRemoteDesktopInputResponse);
   rpc GetRemoteDesktopIceConfiguration(GetRemoteDesktopIceConfigurationRequest) returns (GetRemoteDesktopIceConfigurationResponse);
   rpc CreateRemoteDesktopOffer(CreateRemoteDesktopOfferRequest) returns (CreateRemoteDesktopOfferResponse);
@@ -104,6 +105,17 @@ message SetRemoteDesktopControlResponse {
   RemoteDesktopControlState state = 2;
 }
 
+message SetRemoteDesktopPresentationRequest {
+  DevicePeerRouteIdentity peer = 1;
+  string lease_id = 2;
+  bool enabled = 3;
+}
+
+message SetRemoteDesktopPresentationResponse {
+  DevicePeerRouteIdentity peer = 1;
+  RemoteDesktopControlState state = 2;
+}
+
 message SendRemoteDesktopInputRequest {
   DevicePeerRouteIdentity peer = 1;
   string lease_id = 2;
@@ -130,6 +142,7 @@ message CreateRemoteDesktopOfferRequest {
   string lease_id = 2;
   string attempt_id = 3;
   string offer_sdp = 4;
+  RemoteDesktopVideoSettings settings = 5;
 }
 
 message CreateRemoteDesktopOfferResponse {

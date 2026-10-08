@@ -41,6 +41,9 @@ message RemoteDesktopCapabilities {
   bool jpeg_fallback = 11;
   bool clipboard_text = 12;
   bool clipboard_content = 13;
+  bool video_settings = 14;
+  bool system_audio = 15;
+  bool background_viewing = 16;
 }
 
 enum RemoteDesktopStartMode {
@@ -122,6 +125,21 @@ message RemoteDesktopLease {
 message RemoteDesktopControlState {
   bool controlling = 1;
   uint64 control_generation = 2;
+}
+
+// Exact WebRTC capture settings. v1 intentionally admits only the fixed
+// product choices; zero bitrate means automatic sender allocation.
+message RemoteDesktopVideoSettings {
+  uint32 fps = 1;
+  uint32 bitrate = 2;
+  bool audio = 3;
+}
+
+// Internal target proof that a trusted capture renderer observed a fresh
+// DataChannel pong while the exact lease was in system presentation mode.
+message RemoteDesktopPresentationProof {
+  string lease_id = 1;
+  uint64 proof_sequence = 2;
 }
 
 // Legacy explicit text Copy/Paste remains a first-class route for controllers
@@ -247,6 +265,7 @@ enum RemoteDesktopFailureReason {
   REMOTE_DESKTOP_FAILURE_REASON_CLIPBOARD_TOO_LARGE = 20;
   REMOTE_DESKTOP_FAILURE_REASON_CLIPBOARD_UNSUPPORTED = 21;
   REMOTE_DESKTOP_FAILURE_REASON_CLIPBOARD_EXPIRED = 22;
+  REMOTE_DESKTOP_FAILURE_REASON_AUDIO_UNAVAILABLE = 23;
 }
 
 message RemoteDesktopFailure {

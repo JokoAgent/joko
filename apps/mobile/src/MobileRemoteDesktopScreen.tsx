@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useSyncExternalStore } from "react";
-import { ActivityIndicator, Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
+import { ActivityIndicator, Platform, Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
 import { WebView } from "react-native-webview";
 import type { MobileSupportedLocale } from "./mobile-locale-preference";
 import {
@@ -14,7 +14,12 @@ import {
   mobileRemoteDesktopStatusLabel
 } from "./remote-desktop-presentation";
 import { mobileRemoteClipboardSystem } from "./mobile-remote-desktop-clipboard-native";
+import {
+  createMobileRemoteDesktopVideoPreferenceStore,
+  type MobileRemoteDesktopVideoSettings
+} from "./mobile-remote-desktop-video-preference";
 import { remoteDesktopViewerCommand, remoteDesktopViewerHtml } from "./remote-desktop-viewer";
+import { remotePresentation } from "../modules/joko-remote-presentation/src/index";
 
 export interface MobileRemoteDesktopColors {
   readonly background: string;
@@ -56,10 +61,22 @@ function RemoteDesktopSession({ transport, preferredDeviceId, interactive, foreg
   readonly onClose: () => void;
 }) {
   const copy = mobileRemoteDesktopCopy(locale);
+  const videoPreferences = useMemo(() => createMobileRemoteDesktopVideoPreferenceStore(), []);
+  const videoPreference = useSyncExternalStore(videoPreferences.subscribe, () => videoPreferences.snapshot);
+  const videoPreferenceLoaded = videoPreference.status !== "loading";
+  const nativePresentation = useMemo(() => ({
+    nativePictureInPicture: Platform.OS === "ios" && typeof remotePresentation?.playback === "function",
+    requiresPlaybackSession: Platform.OS === "ios",
+    playback: async (enabled: boolean) => {
+      if (Platform.OS !== "ios") return;
+      if (!remotePresentation?.playback) throw new Error("Native Remote Desktop playback is unavailable.");
+      await remotePresentation.playback(enabled);
+    }
+  }), []);
   const controller = useMemo(() => new MobileRemoteDesktopController(
-    transport, preferredDeviceId, mobileRemoteClipboardSystem
+    transport, preferredDeviceId, mobileRemoteClipboardSystem, nativePresentation
   ),
-    [transport.ownerKey, preferredDeviceId]);
+    [transport.ownerKey, preferredDeviceId, nativePresentation]);
   const snapshot = useSyncExternalStore(controller.subscribe, () => controller.snapshot);
   const webView = useRef<WebView>(null);
   const html = useMemo(() => remoteDesktopViewerHtml(colors.background, colors.ink), [colors.background, colors.ink]);
@@ -68,9 +85,16 @@ function RemoteDesktopSession({ transport, preferredDeviceId, interactive, foreg
     return () => controller.setViewerSink(() => undefined);
   }, [controller]);
   useEffect(() => {
+    void videoPreferences.hydrate();
+  }, [videoPreferences]);
+  useEffect(() => {
+    controller.updateVideoSettings(videoPreference.settings);
+  }, [controller, videoPreference.settings]);
+  useEffect(() => {
+    if (!videoPreferenceLoaded) return;
     void controller.open();
     return () => { void controller.close(); };
-  }, [controller]);
+  }, [controller, videoPreferenceLoaded]);
   useEffect(() => controller.setForeground(foreground), [controller, foreground]);
   useEffect(() => controller.setInteractive(interactive), [controller, interactive]);
   useEffect(() => controller.setOnline(online), [controller, online]);
@@ -105,6 +129,7 @@ function RemoteDesktopSession({ transport, preferredDeviceId, interactive, foreg
         javaScriptEnabled domStorageEnabled={false} sharedCookiesEnabled={false} thirdPartyCookiesEnabled={false}
         allowFileAccess={false} allowFileAccessFromFileURLs={false} allowUniversalAccessFromFileURLs={false}
         mixedContentMode="never" mediaPlaybackRequiresUserAction={false} allowsInlineMediaPlayback
+        allowsPictureInPictureMediaPlayback
         setSupportMultipleWindows={false} onShouldStartLoadWithRequest={(request) => request.url === "about:blank"}
         onMessage={(event) => controller.viewerMessage(event.nativeEvent.data)}
         onError={() => { controller.viewerProcessLost(); webView.current?.reload(); }}
@@ -150,6 +175,33 @@ function RemoteDesktopSession({ transport, preferredDeviceId, interactive, foreg
           colors={colors} selected={snapshot.inputMode === mode} disabled={snapshot.status !== "live"}
           onPress={() => controller.setInputMode(mode)} />)}
       </View>
+      {snapshot.capabilities?.videoSettings && <>
+        <View style={styles.controlRow}>
+          <Text style={[styles.controlLabel, { color: colors.muted }]}>{copy.frameRate}</Text>
+          {([30, 60] as const).map((fps) => <Button key={fps} label={`${fps} FPS`} colors={colors}
+            selected={videoPreference.settings.fps === fps}
+            disabled={snapshot.status !== "live" || snapshot.videoSettingsBusy}
+            onPress={() => updateVideoPreference(videoPreferences, videoPreference.settings, { fps })} />)}
+          <Text style={[styles.controlLabel, { color: colors.muted }]}>{copy.bitrate}</Text>
+          {([0, 2_000_000, 8_000_000, 20_000_000] as const).map((bitrate) => <Button key={bitrate}
+            label={bitrate === 0 ? copy.auto : `${bitrate / 1_000_000} Mbps`} colors={colors}
+            selected={videoPreference.settings.bitrate === bitrate}
+            disabled={snapshot.status !== "live" || snapshot.videoSettingsBusy}
+            onPress={() => updateVideoPreference(videoPreferences, videoPreference.settings, { bitrate })} />)}
+        </View>
+        <View style={styles.controlRow}>
+          {snapshot.capabilities.systemAudio && <Button
+            label={videoPreference.settings.audio ? copy.audioOn : copy.audioOff} colors={colors}
+            selected={videoPreference.settings.audio}
+            disabled={snapshot.status !== "live" || snapshot.videoSettingsBusy}
+            onPress={() => updateVideoPreference(videoPreferences, videoPreference.settings,
+              { audio: !videoPreference.settings.audio })} />}
+          {snapshot.capabilities.backgroundViewing && nativePresentation.nativePictureInPicture && <Button
+            label={copy.pictureInPicture} colors={colors} selected={snapshot.presenting}
+            disabled={!snapshot.pipAvailable || snapshot.videoSettingsBusy}
+            onPress={() => void controller.startPictureInPicture()} />}
+        </View>
+      </>}
       <View style={styles.controlRow}>
         <Button label={copy.left} colors={colors} disabled={!snapshot.controlling} onPress={() => controller.click(0)} />
         <Button label={copy.right} colors={colors} disabled={!snapshot.controlling} onPress={() => controller.click(2)} />
@@ -174,6 +226,18 @@ function RemoteDesktopSession({ transport, preferredDeviceId, interactive, foreg
       </Text>}
     </View>
   </View>;
+}
+
+function updateVideoPreference(
+  store: ReturnType<typeof createMobileRemoteDesktopVideoPreferenceStore>,
+  settings: MobileRemoteDesktopVideoSettings,
+  patch: Partial<MobileRemoteDesktopVideoSettings>
+): void {
+  store.update({
+    fps: patch.fps ?? settings.fps,
+    bitrate: patch.bitrate ?? settings.bitrate,
+    audio: patch.audio ?? settings.audio
+  });
 }
 
 function SelectionList({ title, items, colors, onSelect }: {
@@ -240,6 +304,7 @@ const styles = StyleSheet.create({
     borderRadius: 12, paddingHorizontal: 12, paddingVertical: 9, flexDirection: "row", alignItems: "center", gap: 9 },
   controls: { borderTopWidth: StyleSheet.hairlineWidth, padding: 8, gap: 7 },
   controlRow: { flexDirection: "row", flexWrap: "wrap", gap: 6, justifyContent: "center" },
+  controlLabel: { fontSize: 12, lineHeight: 17, alignSelf: "center", paddingHorizontal: 3 },
   clipboardNotice: { fontSize: 12, lineHeight: 17, minHeight: 17, textAlign: "center" },
   button: { minHeight: 36, minWidth: 52, maxWidth: 160, paddingHorizontal: 11, paddingVertical: 7,
     alignItems: "center", justifyContent: "center", borderWidth: StyleSheet.hairlineWidth, borderRadius: 10 },

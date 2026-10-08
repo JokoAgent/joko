@@ -1047,7 +1047,7 @@ function commandMetadata(command: contract.DevicePeerCommand): {
     || action === "inspectDirectory" || action === "realpath" || action === "statFile"
     || action === "listFiles" || action === "readFile"
     || action === "getRemoteDesktopCapabilities" || action === "getRemoteDesktopPermissions"
-    || action === "getRemoteDesktopFrame";
+    || action === "getRemoteDesktopFrame" || action === "probeRemoteDesktopPresentation";
   const capability: DevicePeerCapability = action === "startProcess" || action === "writeProcess" || action === "signalProcess"
     ? "process"
     : action === "openTerminal" || action === "writeTerminal" || action === "resizeTerminal"
@@ -1061,9 +1061,11 @@ function commandMetadata(command: contract.DevicePeerCommand): {
         : action === "getRemoteDesktopCapabilities" || action === "getRemoteDesktopPermissions"
           || action === "showRemoteDesktopPermissionGuide" || action === "startRemoteDesktop"
           || action === "heartbeatRemoteDesktop" || action === "stopRemoteDesktop"
-          || action === "setRemoteDesktopControl" || action === "sendRemoteDesktopInput"
+          || action === "setRemoteDesktopControl" || action === "setRemoteDesktopPresentation"
+          || action === "probeRemoteDesktopPresentation" || action === "sendRemoteDesktopInput"
           || action === "createRemoteDesktopOffer" || action === "exchangeRemoteDesktopIce"
-          || action === "getRemoteDesktopFrame"
+          || action === "getRemoteDesktopFrame" || action === "transferRemoteDesktopClipboardText"
+          || action === "transferRemoteDesktopClipboardContent"
           ? "remote_desktop"
           : "files";
   const effectKind: DevicePeerEffectKind = readOnly ? "read_only" : "side_effect";
@@ -1097,10 +1099,14 @@ function completedPayloadCase(
     case "getRemoteDesktopPermissions": return "remoteDesktopPermissions";
     case "startRemoteDesktop": return "remoteDesktopLease";
     case "heartbeatRemoteDesktop":
-    case "setRemoteDesktopControl": return "remoteDesktopControlState";
+    case "setRemoteDesktopControl":
+    case "setRemoteDesktopPresentation": return "remoteDesktopControlState";
+    case "probeRemoteDesktopPresentation": return "remoteDesktopPresentationProof";
     case "createRemoteDesktopOffer": return "remoteDesktopOffer";
     case "exchangeRemoteDesktopIce": return "remoteDesktopIce";
     case "getRemoteDesktopFrame": return "remoteDesktopFrame";
+    case "transferRemoteDesktopClipboardText": return "remoteDesktopClipboardText";
+    case "transferRemoteDesktopClipboardContent": return "remoteDesktopClipboardContent";
     case "writeProcess":
     case "signalProcess":
     case "writeTerminal":
