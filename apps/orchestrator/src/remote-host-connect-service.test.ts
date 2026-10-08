@@ -557,7 +557,7 @@ describe("RemoteHostService", () => {
       targetId: "target-a",
       hostId: "build-box",
       state: contract.RemoteBackendRuntimeState.NOT_INSTALLED,
-      expectedVersion: "0.153.4"
+      expectedVersion: "0.159.2"
     });
 
     const installSignal = new AbortController().signal;
@@ -759,8 +759,8 @@ function runtimeSnapshot(
     targetId: "target-a",
     hostId: "build-box",
     displayName: "Codex",
-    expectedVersion: "0.153.4",
-    ...(ready ? { installedVersion: "0.153.4" } : {}),
+    expectedVersion: "0.159.2",
+    ...(ready ? { installedVersion: "0.159.2" } : {}),
     state,
     canInstall: !ready,
     canReinstall: ready,

@@ -10,7 +10,7 @@ import { DEVICE_PEER_RUNTIME_EXECUTABLES } from "@joko/device-peer";
 import type { RemoteProcessHandle, RemoteProcessTransportPort } from "@joko/remote-ssh";
 
 export const REMOTE_CLAUDE_NODE_VERSION = "22.13.0";
-export const REMOTE_CLAUDE_CLI_VERSION = "2.1.259";
+export const REMOTE_CLAUDE_CLI_VERSION = "2.1.280";
 export const REMOTE_CLAUDE_MANAGER_VERSION = "2.0.0";
 export const REMOTE_CLAUDE_PROTOCOL_VERSION = 2;
 export const REMOTE_CLAUDE_EXPECTED_VERSION =
@@ -420,7 +420,7 @@ tar -xzf "$stage/node.tar.gz" --strip-components=1 -C "$stage/current/node" || e
 [ "$(env -i HOME="$stage/home" PATH="$stage/current/node/bin:/usr/bin:/bin" \
   "$stage/current/node/bin/node" -p 'process.versions.node' 2>/dev/null || true)" = "${REMOTE_CLAUDE_NODE_VERSION}" ] || exit 45
 printf '%s\\n' 'JOKO_PHASE installing'
-printf '%s\\n' '{"private":true,"type":"module","dependencies":{"@anthropic-ai/claude-agent-sdk":"${CLAUDE_AGENT_SDK_VERSION}","@anthropic-ai/sdk":"0.120.0","@modelcontextprotocol/sdk":"1.29.0","zod":"4.4.3"}}' > "$stage/current/package.json"
+printf '%s\\n' '{"private":true,"type":"module","dependencies":{"@anthropic-ai/claude-agent-sdk":"${CLAUDE_AGENT_SDK_VERSION}","@anthropic-ai/sdk":"0.123.0","@modelcontextprotocol/sdk":"1.29.0","zod":"4.4.3"}}' > "$stage/current/package.json"
 env -i HOME="$stage/home" PATH="$stage/current/node/bin:/usr/bin:/bin" \
   "$stage/current/node/bin/npm" --prefix "$stage/current" install --omit=dev --ignore-scripts --no-audit --no-fund --save-exact >/dev/null 2>&1 || exit 46
 printf '%s' '${managerBase64}' | env -i HOME="$stage/home" PATH="$stage/current/node/bin:/usr/bin:/bin" \

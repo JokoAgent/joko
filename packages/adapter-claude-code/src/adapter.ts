@@ -157,10 +157,10 @@ const MAX_PERMISSION_RULE_CONTENT = 4_096;
 const EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"] as const;
 const PERSISTED_MODEL_EFFORT_LEVELS = ["low", "medium", "high", "xhigh"] as const;
 const DEFAULT_SETTING_SOURCES = ["user", "project", "local"] as const;
-const ISOLATED_REVIEW_CLI_VERSION = [2, 1, 259] as const;
-const NATIVE_TASK_CLI_VERSION = [2, 1, 259] as const;
-const SUBAGENT_DEFAULT_MODEL_CLI_VERSION = [2, 1, 259] as const;
-const STEER_CLI_VERSION = [2, 1, 259] as const;
+const ISOLATED_REVIEW_CLI_VERSION = [2, 1, 280] as const;
+const NATIVE_TASK_CLI_VERSION = [2, 1, 280] as const;
+const SUBAGENT_DEFAULT_MODEL_CLI_VERSION = [2, 1, 280] as const;
+const STEER_CLI_VERSION = [2, 1, 280] as const;
 const MAX_TURN_INPUTS = 64;
 const REVIEW_READ_TOOLS = ["Read", "Glob", "Grep"] as const;
 const REVIEW_DISALLOWED_TOOLS = [
@@ -7762,7 +7762,7 @@ function validManagedModelIdentity(value: string): boolean {
   return value.length > 0 && value.length <= 512 && !/[\s\x00-\x1f\x7f]/u.test(value);
 }
 
-/** Mirrors the deterministic identity spelling used by the fixed CLI 2.1.259
+/** Mirrors the deterministic identity spelling used by the fixed CLI 2.1.280
  * for settings keys. Native tier aliases depend on account configuration and
  * therefore deliberately fall back to a Query-global effort. */
 function fixedManagedModelSettingsKey(value: string): string | undefined {
@@ -7832,7 +7832,7 @@ function managedQueryLimitEnvironment(
     environment["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] = String(contextWindow);
   }
   if (parent.contextWindow !== undefined) {
-    // Claude 2.1.259 resolves known model capacity before MAX_CONTEXT_TOKENS.
+    // Claude 2.1.280 resolves known model capacity before MAX_CONTEXT_TOKENS.
     // AUTO_COMPACT_WINDOW is the native working-window control. Its 100K floor
     // is compensated with the native percentage override for smaller budgets.
     environment["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = String(parent.contextWindow);

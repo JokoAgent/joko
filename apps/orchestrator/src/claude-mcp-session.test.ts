@@ -169,7 +169,7 @@ class ControlledQuery implements ClaudeSdkQuery {
       this.received.push(message);
       this.push({
         type: "system", subtype: "init", session_id: this.nativeSessionId, uuid: randomUUID(),
-        claude_code_version: "2.1.259", apiKeySource: "none", cwd: this.cwd, model: "model-a",
+        claude_code_version: "2.1.280", apiKeySource: "none", cwd: this.cwd, model: "model-a",
         permissionMode: "default", tools: ["Read"], capabilities: ["interrupt_receipt_v1"]
       });
       this.push({ ...message, isReplay: true, session_id: this.nativeSessionId });
@@ -190,7 +190,7 @@ class ControlledQuery implements ClaudeSdkQuery {
 
 class ControlledSdkRuntime implements ClaudeSdkRuntime {
   readonly packageVersion = CLAUDE_AGENT_SDK_VERSION;
-  readonly bundledCliVersion = "2.1.259";
+  readonly bundledCliVersion = "2.1.280";
   readonly queries: ControlledQuery[] = [];
   readonly retired: ClaudeSdkQuery[] = [];
   readonly sessions = new Map<string, ClaudeSdkSessionInfo>();

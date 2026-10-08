@@ -195,7 +195,7 @@ describe("isolated Orchestrator runtime staging", () => {
     expect(JSON.parse(result.stdout)).toMatchObject({
       ok: true,
       runtimeRoot: realpathSync(fixture.runtimeRoot),
-      version: "0.3.259",
+      version: "0.3.280",
       electronVersion: "43.6.0",
       workerEntry: inspected.workerEntry,
       freshContextOwnerEntry: inspected.freshContextOwnerEntry,

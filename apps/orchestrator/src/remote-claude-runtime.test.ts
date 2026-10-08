@@ -1313,8 +1313,8 @@ function probeOutput(): Buffer {
     `${root}/current/manager.mjs`,
     `${root}/current/node_modules/@anthropic-ai/claude-agent-sdk-linux-x64/claude`,
     `${root}/run/manager.sock`,
-    "0.3.259",
-    "2.1.259",
+    "0.3.280",
+    "2.1.280",
     "ready",
     ""
   ].join("\0"), "utf8");

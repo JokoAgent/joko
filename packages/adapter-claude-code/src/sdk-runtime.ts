@@ -33,11 +33,11 @@ import {
 } from "./claude-session-store.js";
 
 export const CLAUDE_AGENT_SDK_PACKAGE = "@anthropic-ai/claude-agent-sdk";
-export const CLAUDE_AGENT_SDK_VERSION = "0.3.259";
+export const CLAUDE_AGENT_SDK_VERSION = "0.3.280";
 /** The fixed SDK package metadata binds its bundled executable to this exact
  * CLI version. This is authoritative only while no executable override is
  * supplied; an override must still prove its own version through a live init. */
-export const CLAUDE_AGENT_SDK_CLI_VERSION = "2.1.259";
+export const CLAUDE_AGENT_SDK_CLI_VERSION = "2.1.280";
 export const CLAUDE_MANAGED_AGENT_SERVER = "joko_managed_subagent";
 export const CLAUDE_MANAGED_AGENT_TOOL = "delegate";
 export const CLAUDE_MANAGED_AGENT_TOOL_NAME = `mcp__${CLAUDE_MANAGED_AGENT_SERVER}__${CLAUDE_MANAGED_AGENT_TOOL}`;

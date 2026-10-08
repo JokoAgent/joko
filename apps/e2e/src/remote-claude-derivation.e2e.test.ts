@@ -501,7 +501,7 @@ class ControlledProcesses implements RemoteProcessTransportPort {
           request.cwd ?? REMOTE_ROOT, RUNTIME_ROOT,
           `${RUNTIME_ROOT}/current/node/bin/node`, `${RUNTIME_ROOT}/current/manager.mjs`,
           `${RUNTIME_ROOT}/current/node_modules/@anthropic-ai/claude-agent-sdk-linux-x64/claude`,
-          `${RUNTIME_ROOT}/run/manager.sock`, CLAUDE_AGENT_SDK_VERSION, "2.1.259", "ready", ""
+          `${RUNTIME_ROOT}/run/manager.sock`, CLAUDE_AGENT_SDK_VERSION, "2.1.280", "ready", ""
         ].join("\0"));
         process.finish(0);
       });
@@ -610,7 +610,7 @@ function nativeMessage(type: "user" | "assistant", uuid: string, sessionId: stri
 function claudeInit(sessionId: string, cwd: string) {
   return {
     type: "system", subtype: "init", session_id: sessionId, uuid: randomUUID(),
-    claude_code_version: "2.1.259", apiKeySource: "none", cwd, model: "fixture-model",
+    claude_code_version: "2.1.280", apiKeySource: "none", cwd, model: "fixture-model",
     permissionMode: "default", tools: ["Read"], mcp_servers: [], slash_commands: [],
     output_style: "default", skills: [], plugins: [], capabilities: []
   };

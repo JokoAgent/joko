@@ -347,7 +347,7 @@ class ControlledClaudeRuntime implements ClaudeSdkRuntime {
     return {
       installed: true,
       packageVersion: this.packageVersion,
-      cliVersion: "2.1.259",
+      cliVersion: "2.1.280",
       apiKeySource: "none",
       initialization: claudeInitialization
     };
@@ -518,7 +518,7 @@ function claudeSystemInit(nativeSessionId: string, params: ClaudeSdkQueryParams)
     subtype: "init",
     session_id: nativeSessionId,
     uuid: randomUUID(),
-    claude_code_version: "2.1.259",
+    claude_code_version: "2.1.280",
     apiKeySource: "none",
     cwd: params.options.cwd,
     model: params.options.model ?? "fixture-model",

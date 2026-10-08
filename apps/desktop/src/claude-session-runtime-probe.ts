@@ -62,8 +62,8 @@ async function inspectClaudeSessionRuntimeAssets(runtimeArgument: string, depend
   const sdkManifest = JSON.parse(await readFile(await regularFile(sdkRoot, resolve(sdkRoot, "package.json")), "utf8")) as {
     name?: string; version?: string; main?: string;
   };
-  if (sdkManifest.name !== "@anthropic-ai/claude-agent-sdk" || sdkManifest.version !== "0.3.259" || sdkManifest.main !== "sdk.mjs") {
-    throw new Error("The Session SDK runtime requires the audited published SDK 0.3.259.");
+  if (sdkManifest.name !== "@anthropic-ai/claude-agent-sdk" || sdkManifest.version !== "0.3.280" || sdkManifest.main !== "sdk.mjs") {
+    throw new Error("The Session SDK runtime requires the audited published SDK 0.3.280.");
   }
   // Resolve from the actual Worker location, just as its dynamic import does.
   const sdkEntry = await regularFile(sdkRoot, createRequire(workerEntry).resolve("@anthropic-ai/claude-agent-sdk"));

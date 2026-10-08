@@ -351,9 +351,9 @@ describe("CodexBackendAdapter", () => {
   });
 
   it.each([
-    ["codex/0.153.3", true, 1, false, false, "requires the audited Codex app-server"],
-    ["codex/0.153.4", true, 2, true, true, ""],
-    ["codex/0.153.4", false, 1, false, true, "native account is unavailable"]
+    ["codex/0.159.1", true, 1, false, false, "requires the audited Codex app-server"],
+    ["codex/0.159.2", true, 2, true, true, ""],
+    ["codex/0.159.2", false, 1, false, true, "native account is unavailable"]
   ] as const)("probes runtime %s without smart flags before deciding its process generation", async (
     userAgent,
     nativeAccountAvailable,
@@ -618,7 +618,7 @@ describe("CodexBackendAdapter", () => {
       id: "codex-test",
       adapterKind: "codex",
       instanceGeneration: 7,
-      version: "0.153.4",
+      version: "0.159.2",
       health: "healthy",
       authenticationState: "authenticated"
     });
@@ -4498,12 +4498,12 @@ describe("CodexBackendAdapter", () => {
   });
 
   it.each([
-    "codex/0.151.0-alpha.7.2",
-    "codex/0.153.3",
-    "codex/0.153.4-alpha.1",
-    "codex/0.153.4+unverified",
-    "codex/0.153.5",
-    "codex/0.154.0",
+    "codex/0.153.4",
+    "codex/0.159.1",
+    "codex/0.159.2-alpha.1",
+    "codex/0.159.2+unverified",
+    "codex/0.159.3",
+    "codex/0.160.0",
     "unknown"
   ])("fails audited capabilities closed for runtime %s", async (userAgent) => {
     const old = await createSetup();

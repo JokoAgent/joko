@@ -3,7 +3,7 @@ import { TextDecoder } from "node:util";
 
 import type { RemoteProcessHandle, RemoteProcessTransportPort } from "@joko/remote-ssh";
 
-export const REMOTE_CODEX_EXPECTED_VERSION = "0.153.4";
+export const REMOTE_CODEX_EXPECTED_VERSION = "0.159.2";
 export const REMOTE_CODEX_EXPECTED_VERSION_OUTPUT = `codex-cli ${REMOTE_CODEX_EXPECTED_VERSION}`;
 export const REMOTE_CODEX_PROFILE_SUFFIX = ".joko/runtime/v1/codex-home";
 export const REMOTE_CODEX_BINARY_SUFFIX = `${REMOTE_CODEX_PROFILE_SUFFIX}/packages/standalone/current/codex`;
