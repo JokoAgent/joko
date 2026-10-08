@@ -9,12 +9,40 @@ import {
   DevicePeerCapabilityKind,
   type DevicePeerCommand,
   DevicePeerCommandSchema,
+  DevicePeerCreateRemoteDesktopOfferActionSchema,
   DevicePeerEffectKind,
+  DevicePeerExchangeRemoteDesktopIceActionSchema,
+  DevicePeerFailureCode,
+  DevicePeerGetRemoteDesktopCapabilitiesActionSchema,
+  DevicePeerGetRemoteDesktopFrameActionSchema,
+  DevicePeerGetRemoteDesktopPermissionsActionSchema,
+  DevicePeerHeartbeatRemoteDesktopActionSchema,
   DevicePeerListRecentDirectoriesActionSchema,
   DevicePeerOpenTerminalActionSchema,
   DevicePeerRealpathActionSchema,
   DevicePeerResponsePhase,
-  DevicePeerStartProcessActionSchema
+  DevicePeerSendRemoteDesktopInputActionSchema,
+  DevicePeerSetRemoteDesktopControlActionSchema,
+  DevicePeerShowRemoteDesktopPermissionGuideActionSchema,
+  DevicePeerStartRemoteDesktopActionSchema,
+  DevicePeerStartProcessActionSchema,
+  DevicePeerStopRemoteDesktopActionSchema,
+  RemoteDesktopCapabilitiesSchema,
+  RemoteDesktopControlStateSchema,
+  RemoteDesktopDisplaySchema,
+  RemoteDesktopFailureReason,
+  RemoteDesktopFrameResultSchema,
+  RemoteDesktopFrameSchema,
+  RemoteDesktopIceCandidateSchema,
+  RemoteDesktopIceExchangeResultSchema,
+  RemoteDesktopInputEventSchema,
+  RemoteDesktopLeaseSchema,
+  RemoteDesktopOfferResultSchema,
+  RemoteDesktopPermissionsSchema,
+  RemoteDesktopPermissionStatus,
+  RemoteDesktopPointerMoveInputSchema,
+  RemoteDesktopTextInputSchema,
+  RemoteDesktopStartMode
 } from "@joko/contracts";
 import { afterEach, describe, expect, it } from "vitest";
 
@@ -22,9 +50,11 @@ import {
   NodeDevicePeerAgentExecutor,
   type NodeDevicePeerAgentEmission
 } from "./node-agent-executor.js";
+import { DevicePeerRemoteDesktopHostError } from "./ports.js";
 import type {
   DevicePeerProcessHandle,
   DevicePeerProcessTransportPort,
+  DevicePeerRemoteDesktopHostPort,
   DevicePeerTerminalExit,
   DevicePeerTerminalHandle,
   DevicePeerTerminalTransportPort
@@ -140,6 +170,123 @@ describe("Node Device peer account-home ownership", () => {
   });
 });
 
+describe("Node Device peer Remote Desktop host ownership", () => {
+  it("advertises only an installed host port and maps every typed action and result", async () => {
+    const root = await testRoot();
+    const withoutHost = new NodeDevicePeerAgentExecutor({
+      recentDirectoriesPath: join(root, "without-host.json")
+    });
+    expect(withoutHost.capabilities).not.toContain(DevicePeerCapabilityKind.REMOTE_DESKTOP);
+    await expect(execute(withoutHost, remoteDesktopCommands()[0]!.command)).rejects.toBeDefined();
+    await withoutHost.retire();
+
+    const fixture = remoteDesktopHost();
+    const executor = new NodeDevicePeerAgentExecutor({
+      recentDirectoriesPath: join(root, "with-host.json"),
+      remoteDesktop: fixture.port
+    });
+    expect(executor.capabilities).toContain(DevicePeerCapabilityKind.REMOTE_DESKTOP);
+
+    const commands = remoteDesktopCommands();
+    for (const item of commands) {
+      const results = await execute(executor, item.command);
+      expect(results.map((result) => result.payload.case)).toEqual(["acknowledgement", item.payload]);
+      expect(results.at(-1)?.phase).toBe(DevicePeerResponsePhase.COMPLETED);
+    }
+    expect(fixture.state.calls.map((call) => call.method)).toEqual(commands.map((item) => item.method));
+    expect(fixture.state.calls.every((call) => call.request.controllerDeviceId === "controller-device")).toBe(true);
+
+    await executor.retire();
+    await executor.retire();
+    expect(fixture.state.retireCalls).toBe(1);
+  });
+
+  it("rejects over-bound commands before host dispatch and fails closed on over-bound host results", async () => {
+    const root = await testRoot();
+    const fixture = remoteDesktopHost({
+      getFrame: async () => create(RemoteDesktopFrameResultSchema, {
+        frame: create(RemoteDesktopFrameSchema, { jpeg: new Uint8Array(180_001) })
+      })
+    });
+    const executor = new NodeDevicePeerAgentExecutor({
+      recentDirectoriesPath: join(root, "bounded-host.json"),
+      remoteDesktop: fixture.port
+    });
+    const oversizedOffer = remoteDesktopCommand({
+      case: "createRemoteDesktopOffer",
+      value: create(DevicePeerCreateRemoteDesktopOfferActionSchema, {
+        leaseId: "lease-1",
+        attemptId: "attempt-1",
+        offerSdp: "界".repeat(22_000)
+      })
+    }, DevicePeerEffectKind.SIDE_EFFECT);
+    const zeroSequence = remoteDesktopCommand({
+      case: "sendRemoteDesktopInput",
+      value: create(DevicePeerSendRemoteDesktopInputActionSchema, {
+        leaseId: "lease-1",
+        sequence: 0n
+      })
+    }, DevicePeerEffectKind.SIDE_EFFECT);
+    const oversizedInput = remoteDesktopCommand({
+      case: "sendRemoteDesktopInput",
+      value: create(DevicePeerSendRemoteDesktopInputActionSchema, {
+        leaseId: "lease-1",
+        sequence: 1n,
+        events: Array.from({ length: 2 }, () => create(RemoteDesktopInputEventSchema, {
+          event: {
+            case: "text",
+            value: create(RemoteDesktopTextInputSchema, { text: "界".repeat(3_000) })
+          }
+        }))
+      })
+    }, DevicePeerEffectKind.SIDE_EFFECT);
+
+    await expect(execute(executor, oversizedOffer)).rejects.toBeDefined();
+    await expect(execute(executor, zeroSequence)).rejects.toBeDefined();
+    await expect(execute(executor, oversizedInput)).rejects.toBeDefined();
+    expect(fixture.state.calls).toEqual([]);
+
+    const frame = remoteDesktopCommands().find((item) => item.method === "getFrame")!;
+    const results = await execute(executor, frame.command);
+    expect(results.at(-1)).toMatchObject({
+      phase: DevicePeerResponsePhase.FAILED,
+      payload: {
+        case: "failure",
+        value: { code: DevicePeerFailureCode.INTERNAL, retryable: false }
+      }
+    });
+    await executor.retire();
+  });
+
+  it("preserves a bounded typed Remote Desktop domain failure", async () => {
+    const root = await testRoot();
+    const fixture = remoteDesktopHost({
+      start: async () => {
+        throw new DevicePeerRemoteDesktopHostError(RemoteDesktopFailureReason.BUSY, true);
+      }
+    });
+    const executor = new NodeDevicePeerAgentExecutor({
+      recentDirectoriesPath: join(root, "failure-host.json"),
+      remoteDesktop: fixture.port
+    });
+    const start = remoteDesktopCommands().find((item) => item.method === "start")!;
+
+    const results = await execute(executor, start.command);
+    expect(results.at(-1)).toMatchObject({
+      phase: DevicePeerResponsePhase.FAILED,
+      payload: {
+        case: "failure",
+        value: {
+          code: DevicePeerFailureCode.CONFLICT,
+          retryable: true,
+          remoteDesktop: { reason: RemoteDesktopFailureReason.BUSY, retryable: true }
+        }
+      }
+    });
+    await executor.retire();
+  });
+});
+
 async function testRoot(): Promise<string> {
   const root = await mkdtemp(join(tmpdir(), "joko-device-peer-recents-"));
   roots.push(root);
@@ -208,6 +355,233 @@ function realpathCommand(path: string): DevicePeerCommand {
       case: "realpath",
       value: create(DevicePeerRealpathActionSchema, { path })
     }
+  });
+}
+
+function remoteDesktopHost(overrides: Partial<DevicePeerRemoteDesktopHostPort> = {}): {
+  readonly port: DevicePeerRemoteDesktopHostPort;
+  readonly state: {
+    readonly calls: { readonly method: string; readonly request: { readonly controllerDeviceId: string } }[];
+    retireCalls: number;
+  };
+} {
+  const state = {
+    calls: [] as { readonly method: string; readonly request: { readonly controllerDeviceId: string } }[],
+    retireCalls: 0
+  };
+  const display = create(RemoteDesktopDisplaySchema, {
+    displayId: "display-1",
+    name: "Primary display",
+    width: 1920,
+    height: 1080
+  });
+  const permissions = create(RemoteDesktopPermissionsSchema, {
+    screenRecording: RemoteDesktopPermissionStatus.GRANTED,
+    accessibility: RemoteDesktopPermissionStatus.GRANTED
+  });
+  const record = (method: string, request: { readonly controllerDeviceId: string }): void => {
+    state.calls.push({ method, request });
+  };
+  const port: DevicePeerRemoteDesktopHostPort = {
+    async getCapabilities(request) {
+      record("getCapabilities", request);
+      return create(RemoteDesktopCapabilitiesSchema, {
+        protocolVersion: 1,
+        enabled: true,
+        canControl: true,
+        platform: "test",
+        displays: [display],
+        permissions,
+        automaticReconnect: true,
+        connectionTakeover: true,
+        webrtcVideo: true,
+        trickleIce: true,
+        jpegFallback: true
+      });
+    },
+    async getPermissions(request) {
+      record("getPermissions", request);
+      return permissions;
+    },
+    async showPermissionGuide(request) { record("showPermissionGuide", request); },
+    async start(request) {
+      record("start", request);
+      return create(RemoteDesktopLeaseSchema, { leaseId: "lease-1", display, controlling: true });
+    },
+    async heartbeat(request) {
+      record("heartbeat", request);
+      return create(RemoteDesktopControlStateSchema, { controlling: true });
+    },
+    async stop(request) { record("stop", request); },
+    async setControl(request) {
+      record("setControl", request);
+      return create(RemoteDesktopControlStateSchema, { controlling: request.enabled });
+    },
+    async sendInput(request) { record("sendInput", request); },
+    async createOffer(request) {
+      record("createOffer", request);
+      return create(RemoteDesktopOfferResultSchema, {
+        attemptId: request.attemptId,
+        answerSdp: "v=0\r\n"
+      });
+    },
+    async exchangeIce(request) {
+      record("exchangeIce", request);
+      return create(RemoteDesktopIceExchangeResultSchema, {
+        attemptId: request.attemptId,
+        candidates: [remoteDesktopIceCandidate()],
+        next: request.after + 1,
+        complete: false
+      });
+    },
+    async getFrame(request) {
+      record("getFrame", request);
+      return create(RemoteDesktopFrameResultSchema, {
+        frame: create(RemoteDesktopFrameSchema, { jpeg: new Uint8Array([0xff, 0xd8, 0xff, 0xd9]) })
+      });
+    },
+    async retire() { state.retireCalls += 1; },
+    ...overrides
+  };
+  return { port, state };
+}
+
+function remoteDesktopCommands(): readonly {
+  readonly method: string;
+  readonly payload: NodeDevicePeerAgentEmission["payload"]["case"];
+  readonly command: DevicePeerCommand;
+}[] {
+  return [
+    {
+      method: "getCapabilities",
+      payload: "remoteDesktopCapabilities",
+      command: remoteDesktopCommand({
+        case: "getRemoteDesktopCapabilities",
+        value: create(DevicePeerGetRemoteDesktopCapabilitiesActionSchema)
+      }, DevicePeerEffectKind.READ_ONLY)
+    },
+    {
+      method: "getPermissions",
+      payload: "remoteDesktopPermissions",
+      command: remoteDesktopCommand({
+        case: "getRemoteDesktopPermissions",
+        value: create(DevicePeerGetRemoteDesktopPermissionsActionSchema)
+      }, DevicePeerEffectKind.READ_ONLY)
+    },
+    {
+      method: "showPermissionGuide",
+      payload: "acknowledgement",
+      command: remoteDesktopCommand({
+        case: "showRemoteDesktopPermissionGuide",
+        value: create(DevicePeerShowRemoteDesktopPermissionGuideActionSchema)
+      }, DevicePeerEffectKind.SIDE_EFFECT)
+    },
+    {
+      method: "start",
+      payload: "remoteDesktopLease",
+      command: remoteDesktopCommand({
+        case: "startRemoteDesktop",
+        value: create(DevicePeerStartRemoteDesktopActionSchema, {
+          displayId: "display-1",
+          mode: RemoteDesktopStartMode.NEW
+        })
+      }, DevicePeerEffectKind.SIDE_EFFECT)
+    },
+    {
+      method: "heartbeat",
+      payload: "remoteDesktopControlState",
+      command: remoteDesktopCommand({
+        case: "heartbeatRemoteDesktop",
+        value: create(DevicePeerHeartbeatRemoteDesktopActionSchema, { leaseId: "lease-1" })
+      }, DevicePeerEffectKind.SIDE_EFFECT)
+    },
+    {
+      method: "stop",
+      payload: "acknowledgement",
+      command: remoteDesktopCommand({
+        case: "stopRemoteDesktop",
+        value: create(DevicePeerStopRemoteDesktopActionSchema, { leaseId: "lease-1" })
+      }, DevicePeerEffectKind.SIDE_EFFECT)
+    },
+    {
+      method: "setControl",
+      payload: "remoteDesktopControlState",
+      command: remoteDesktopCommand({
+        case: "setRemoteDesktopControl",
+        value: create(DevicePeerSetRemoteDesktopControlActionSchema, { leaseId: "lease-1", enabled: false })
+      }, DevicePeerEffectKind.SIDE_EFFECT)
+    },
+    {
+      method: "sendInput",
+      payload: "acknowledgement",
+      command: remoteDesktopCommand({
+        case: "sendRemoteDesktopInput",
+        value: create(DevicePeerSendRemoteDesktopInputActionSchema, {
+          leaseId: "lease-1",
+          sequence: 1n,
+          events: [create(RemoteDesktopInputEventSchema, {
+            event: {
+              case: "move",
+              value: create(RemoteDesktopPointerMoveInputSchema, { x: 0.25, y: 0.75 })
+            }
+          })]
+        })
+      }, DevicePeerEffectKind.SIDE_EFFECT)
+    },
+    {
+      method: "createOffer",
+      payload: "remoteDesktopOffer",
+      command: remoteDesktopCommand({
+        case: "createRemoteDesktopOffer",
+        value: create(DevicePeerCreateRemoteDesktopOfferActionSchema, {
+          leaseId: "lease-1",
+          attemptId: "attempt-1",
+          offerSdp: "v=0\r\n"
+        })
+      }, DevicePeerEffectKind.SIDE_EFFECT)
+    },
+    {
+      method: "exchangeIce",
+      payload: "remoteDesktopIce",
+      command: remoteDesktopCommand({
+        case: "exchangeRemoteDesktopIce",
+        value: create(DevicePeerExchangeRemoteDesktopIceActionSchema, {
+          leaseId: "lease-1",
+          attemptId: "attempt-1",
+          candidates: [remoteDesktopIceCandidate()],
+          after: 0
+        })
+      }, DevicePeerEffectKind.SIDE_EFFECT)
+    },
+    {
+      method: "getFrame",
+      payload: "remoteDesktopFrame",
+      command: remoteDesktopCommand({
+        case: "getRemoteDesktopFrame",
+        value: create(DevicePeerGetRemoteDesktopFrameActionSchema, { leaseId: "lease-1" })
+      }, DevicePeerEffectKind.READ_ONLY)
+    }
+  ];
+}
+
+function remoteDesktopCommand(
+  action: DevicePeerCommand["action"],
+  effect: DevicePeerEffectKind
+): DevicePeerCommand {
+  return create(DevicePeerCommandSchema, {
+    capability: DevicePeerCapabilityKind.REMOTE_DESKTOP,
+    effect,
+    controllerDeviceId: "controller-device",
+    action
+  });
+}
+
+function remoteDesktopIceCandidate() {
+  return create(RemoteDesktopIceCandidateSchema, {
+    candidate: "candidate:1 1 UDP 2122260223 192.0.2.1 5000 typ host",
+    sdpMid: "0",
+    sdpMLineIndex: 0,
+    usernameFragment: "fragment"
   });
 }
 

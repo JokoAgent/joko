@@ -1,5 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
-import { resolveDesktopTrayMenuLabels } from "../src/i18n/tray-menu.js";
+import {
+  resolveDesktopRemoteDesktopTrayLabels,
+  resolveDesktopTrayMenuLabels
+} from "../src/i18n/tray-menu.js";
 import { TRAY_MENU_CASES } from "./i18n/menu-corpus.js";
 
 import {
@@ -28,6 +31,21 @@ function popupMenu() {
 describe("Desktop tray menu", () => {
   it.each(TRAY_MENU_CASES)("localizes %s tray labels with managed runtime=%s", (locale, managesLocalOrchestrator, open, quit) => {
     expect(resolveDesktopTrayMenuLabels(locale, managesLocalOrchestrator)).toEqual({ open, quit });
+  });
+
+  it("localizes the Remote Desktop status and actions", () => {
+    expect(resolveDesktopRemoteDesktopTrayLabels("en")).toEqual({
+      allow: "Allow Remote Desktop",
+      viewing: "Remote Desktop: Viewing",
+      controlling: "Remote Desktop: Controlling",
+      disconnect: "Disconnect Remote Desktop"
+    });
+    expect(resolveDesktopRemoteDesktopTrayLabels("zh-CN")).toEqual({
+      allow: "允许远程桌面",
+      viewing: "远程桌面：正在查看",
+      controlling: "远程桌面：正在控制",
+      disconnect: "断开远程桌面"
+    });
   });
 
   it("uses the JavaScript popup path only on Windows", () => {

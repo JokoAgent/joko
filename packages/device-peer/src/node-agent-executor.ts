@@ -20,7 +20,7 @@ import {
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, parse, resolve } from "node:path";
-import { create } from "@bufbuild/protobuf";
+import { clone, create, toBinary } from "@bufbuild/protobuf";
 import { timestampFromDate } from "@bufbuild/protobuf/wkt";
 import {
   DevicePeerAcknowledgementSchema,
@@ -53,6 +53,8 @@ import {
   DevicePeerRealpathResultSchema,
   DevicePeerRecentDirectoriesResultSchema,
   DevicePeerResponsePhase,
+  type DevicePeerSendRemoteDesktopInputAction,
+  DevicePeerSendRemoteDesktopInputActionSchema,
   type DevicePeerAgentResult,
   DevicePeerAgentResultSchema,
   DevicePeerReverseForwardConnectionClosedResultSchema,
@@ -60,16 +62,42 @@ import {
   DevicePeerReverseForwardDataResultSchema,
   DevicePeerTerminalExitedResultSchema,
   DevicePeerTerminalOpenedResultSchema,
-  DevicePeerTerminalOutputResultSchema
+  DevicePeerTerminalOutputResultSchema,
+  type RemoteDesktopCapabilities,
+  RemoteDesktopCapabilitiesSchema,
+  type RemoteDesktopControlState,
+  RemoteDesktopControlStateSchema,
+  type RemoteDesktopDisplay,
+  RemoteDesktopFailureReason,
+  RemoteDesktopFailureSchema,
+  type RemoteDesktopFrameResult,
+  RemoteDesktopFrameResultSchema,
+  type RemoteDesktopIceCandidate,
+  RemoteDesktopIceCandidateSchema,
+  type RemoteDesktopIceExchangeResult,
+  RemoteDesktopIceExchangeResultSchema,
+  type RemoteDesktopInputEvent,
+  RemoteDesktopInputEventSchema,
+  type RemoteDesktopLease,
+  RemoteDesktopLeaseSchema,
+  RemoteDesktopMouseButton,
+  type RemoteDesktopOfferResult,
+  RemoteDesktopOfferResultSchema,
+  type RemoteDesktopPermissions,
+  RemoteDesktopPermissionsSchema,
+  RemoteDesktopPermissionStatus,
+  RemoteDesktopStartMode
 } from "@joko/contracts";
-import type {
-  DevicePeerFileStat,
-  DevicePeerFileTransportPort,
-  DevicePeerProcessHandle,
-  DevicePeerProcessStartRequest,
-  DevicePeerProcessTransportPort,
-  DevicePeerTerminalHandle,
-  DevicePeerTerminalTransportPort
+import {
+  DevicePeerRemoteDesktopHostError,
+  type DevicePeerRemoteDesktopHostPort,
+  type DevicePeerFileStat,
+  type DevicePeerFileTransportPort,
+  type DevicePeerProcessHandle,
+  type DevicePeerProcessStartRequest,
+  type DevicePeerProcessTransportPort,
+  type DevicePeerTerminalHandle,
+  type DevicePeerTerminalTransportPort
 } from "./ports.js";
 import { atomicWritePrivateFile, readPrivateFile, sameFileIdentity, sameStableFile } from "./private-files.js";
 
@@ -92,7 +120,34 @@ const MAXIMUM_ACTIVE_LISTENERS = 32;
 const MAXIMUM_REVERSE_CONNECTIONS = 256;
 const MAXIMUM_RECENT_DIRECTORIES = 100;
 const MAXIMUM_REMOVE_DEPTH = 128;
+const MAXIMUM_REMOTE_DESKTOP_DISPLAYS = 32;
+const MAXIMUM_REMOTE_DESKTOP_DISPLAY_ID_CHARACTERS = 128;
+const MAXIMUM_REMOTE_DESKTOP_DISPLAY_NAME_CHARACTERS = 256;
+const MAXIMUM_REMOTE_DESKTOP_PLATFORM_CHARACTERS = 64;
+const MAXIMUM_REMOTE_DESKTOP_LEASE_ID_CHARACTERS = 128;
+const MAXIMUM_REMOTE_DESKTOP_ATTEMPT_ID_CHARACTERS = 128;
+const MAXIMUM_REMOTE_DESKTOP_SDP_BYTES = 64 * 1_024;
+const MAXIMUM_REMOTE_DESKTOP_INPUT_EVENTS = 64;
+const MAXIMUM_REMOTE_DESKTOP_INPUT_BYTES = 16_384;
+const MAXIMUM_REMOTE_DESKTOP_TEXT_CHARACTERS = 4_096;
+const MAXIMUM_REMOTE_DESKTOP_SCROLL_DELTA = 2_000;
+const MAXIMUM_REMOTE_DESKTOP_ICE_CANDIDATES = 16;
+const MAXIMUM_REMOTE_DESKTOP_ICE_TOTAL = 128;
+const MAXIMUM_REMOTE_DESKTOP_ICE_CANDIDATE_CHARACTERS = 2_048;
+const MAXIMUM_REMOTE_DESKTOP_ICE_MID_CHARACTERS = 128;
+const MAXIMUM_REMOTE_DESKTOP_ICE_USERNAME_FRAGMENT_CHARACTERS = 256;
+const MAXIMUM_REMOTE_DESKTOP_FRAME_BYTES = 180_000;
+const MAXIMUM_REMOTE_DESKTOP_DIMENSION = 32_768;
 const RESOURCE_RETIRE_TIMEOUT_MS = 5_000;
+const REMOTE_DESKTOP_KEY_CODES = new Set([
+  ..."ABCDEFGHIJKLMNOPQRSTUVWXYZ".split("").map((key) => `Key${key}`),
+  ..."0123456789".split("").map((key) => `Digit${key}`),
+  ...Array.from({ length: 12 }, (_, index) => `F${index + 1}`),
+  "Enter", "Escape", "Tab", "Space", "Backspace", "Delete", "Insert",
+  "Home", "End", "PageUp", "PageDown", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight",
+  "ShiftLeft", "ControlLeft", "AltLeft", "MetaLeft", "Minus", "Equal", "BracketLeft",
+  "BracketRight", "Backslash", "Semicolon", "Quote", "Backquote", "Comma", "Period", "Slash"
+]);
 
 type AgentPayload = DevicePeerAgentResult["payload"];
 
@@ -105,6 +160,8 @@ export interface NodeDevicePeerAgentExecutorOptions {
   readonly processes?: DevicePeerProcessTransportPort;
   /** Omit when the packaged runtime has no audited native PTY. */
   readonly terminals?: DevicePeerTerminalTransportPort;
+  /** Omit outside the trusted Desktop Main host or while local opt-in is off. */
+  readonly remoteDesktop?: DevicePeerRemoteDesktopHostPort;
   /** Process-local executable identities. Reserved runtime tokens are resolved
    * only here and are never persisted in Target or Session bindings. */
   readonly runtimeExecutables?: NodeDevicePeerRuntimeExecutableMap;
@@ -143,6 +200,7 @@ export class NodeDevicePeerAgentExecutor {
   readonly #files: DevicePeerFileTransportPort;
   readonly #processes: DevicePeerProcessTransportPort;
   readonly #terminals: DevicePeerTerminalTransportPort | undefined;
+  readonly #remoteDesktop: DevicePeerRemoteDesktopHostPort | undefined;
   readonly #runtimeExecutables: NodeDevicePeerRuntimeExecutableMap;
   readonly #activeProcesses = new Map<string, DevicePeerProcessHandle>();
   readonly #activeTerminals = new Map<string, DevicePeerTerminalHandle>();
@@ -156,6 +214,7 @@ export class NodeDevicePeerAgentExecutor {
     this.#files = options.files ?? new LocalDevicePeerFileTransport();
     this.#processes = options.processes ?? new LocalDevicePeerProcessTransport();
     this.#terminals = options.terminals;
+    this.#remoteDesktop = options.remoteDesktop;
     this.#runtimeExecutables = validateRuntimeExecutables(options.runtimeExecutables ?? {});
   }
 
@@ -164,7 +223,8 @@ export class NodeDevicePeerAgentExecutor {
       DevicePeerCapabilityKind.FILES,
       DevicePeerCapabilityKind.PROCESS,
       ...(this.#terminals === undefined ? [] : [DevicePeerCapabilityKind.TERMINAL]),
-      DevicePeerCapabilityKind.FORWARDING
+      DevicePeerCapabilityKind.FORWARDING,
+      ...(this.#remoteDesktop === undefined ? [] : [DevicePeerCapabilityKind.REMOTE_DESKTOP])
     ]);
   }
 
@@ -178,7 +238,11 @@ export class NodeDevicePeerAgentExecutor {
     const output = new AgentOutput(emit);
     this.#assertActive();
     signal.throwIfAborted();
-    const specification = commandSpecification(command, this.#terminals !== undefined);
+    const specification = commandSpecification(
+      command,
+      this.#terminals !== undefined,
+      this.#remoteDesktop !== undefined
+    );
     validateCommandInput(command);
 
     await output.emit(DevicePeerResponsePhase.ACCEPTED, {
@@ -208,6 +272,9 @@ export class NodeDevicePeerAgentExecutor {
     await Promise.race([
       Promise.allSettled([
         ...terminals.map((terminal) => terminal.kill()),
+        ...(this.#remoteDesktop === undefined
+          ? []
+          : [Promise.resolve().then(() => this.#remoteDesktop!.retire())]),
         ...listeners.map(async (listener) => {
           for (const key of listener.connections) this.#reverseConnections.get(key)?.destroy();
           await closeServer(listener.server);
@@ -397,6 +464,130 @@ export class NodeDevicePeerAgentExecutor {
         for (const key of listener.connections) this.#reverseConnections.get(key)?.destroy();
         listener.server.close();
         return acknowledgement();
+      }
+      case "getRemoteDesktopCapabilities": {
+        const value = await this.#requireRemoteDesktop().getCapabilities({
+          controllerDeviceId: command.controllerDeviceId,
+          signal
+        });
+        validateRemoteDesktopCapabilities(value);
+        return {
+          case: "remoteDesktopCapabilities",
+          value: clone(RemoteDesktopCapabilitiesSchema, value)
+        };
+      }
+      case "getRemoteDesktopPermissions": {
+        const value = await this.#requireRemoteDesktop().getPermissions({
+          controllerDeviceId: command.controllerDeviceId,
+          signal
+        });
+        validateRemoteDesktopPermissions(value);
+        return {
+          case: "remoteDesktopPermissions",
+          value: clone(RemoteDesktopPermissionsSchema, value)
+        };
+      }
+      case "showRemoteDesktopPermissionGuide":
+        await this.#requireRemoteDesktop().showPermissionGuide({
+          controllerDeviceId: command.controllerDeviceId,
+          signal
+        });
+        return acknowledgement();
+      case "startRemoteDesktop": {
+        const value = await this.#requireRemoteDesktop().start({
+          controllerDeviceId: command.controllerDeviceId,
+          displayId: command.action.value.displayId,
+          mode: command.action.value.mode,
+          signal
+        });
+        validateRemoteDesktopLease(value);
+        return {
+          case: "remoteDesktopLease",
+          value: clone(RemoteDesktopLeaseSchema, value)
+        };
+      }
+      case "heartbeatRemoteDesktop": {
+        const value = await this.#requireRemoteDesktop().heartbeat({
+          controllerDeviceId: command.controllerDeviceId,
+          leaseId: command.action.value.leaseId,
+          signal
+        });
+        validateRemoteDesktopControlState(value);
+        return {
+          case: "remoteDesktopControlState",
+          value: clone(RemoteDesktopControlStateSchema, value)
+        };
+      }
+      case "stopRemoteDesktop":
+        await this.#requireRemoteDesktop().stop({
+          controllerDeviceId: command.controllerDeviceId,
+          leaseId: command.action.value.leaseId,
+          signal
+        });
+        return acknowledgement();
+      case "setRemoteDesktopControl": {
+        const value = await this.#requireRemoteDesktop().setControl({
+          controllerDeviceId: command.controllerDeviceId,
+          leaseId: command.action.value.leaseId,
+          enabled: command.action.value.enabled,
+          signal
+        });
+        validateRemoteDesktopControlState(value);
+        return {
+          case: "remoteDesktopControlState",
+          value: clone(RemoteDesktopControlStateSchema, value)
+        };
+      }
+      case "sendRemoteDesktopInput":
+        await this.#requireRemoteDesktop().sendInput({
+          controllerDeviceId: command.controllerDeviceId,
+          leaseId: command.action.value.leaseId,
+          sequence: command.action.value.sequence,
+          events: command.action.value.events.map((event) => clone(RemoteDesktopInputEventSchema, event)),
+          signal
+        });
+        return acknowledgement();
+      case "createRemoteDesktopOffer": {
+        const value = await this.#requireRemoteDesktop().createOffer({
+          controllerDeviceId: command.controllerDeviceId,
+          leaseId: command.action.value.leaseId,
+          attemptId: command.action.value.attemptId,
+          offerSdp: command.action.value.offerSdp,
+          signal
+        });
+        validateRemoteDesktopOffer(value, command.action.value.attemptId);
+        return {
+          case: "remoteDesktopOffer",
+          value: clone(RemoteDesktopOfferResultSchema, value)
+        };
+      }
+      case "exchangeRemoteDesktopIce": {
+        const value = await this.#requireRemoteDesktop().exchangeIce({
+          controllerDeviceId: command.controllerDeviceId,
+          leaseId: command.action.value.leaseId,
+          attemptId: command.action.value.attemptId,
+          candidates: command.action.value.candidates.map((candidate) =>
+            clone(RemoteDesktopIceCandidateSchema, candidate)),
+          after: command.action.value.after,
+          signal
+        });
+        validateRemoteDesktopIceExchange(value, command.action.value.attemptId, command.action.value.after);
+        return {
+          case: "remoteDesktopIce",
+          value: clone(RemoteDesktopIceExchangeResultSchema, value)
+        };
+      }
+      case "getRemoteDesktopFrame": {
+        const value = await this.#requireRemoteDesktop().getFrame({
+          controllerDeviceId: command.controllerDeviceId,
+          leaseId: command.action.value.leaseId,
+          signal
+        });
+        validateRemoteDesktopFrameResult(value);
+        return {
+          case: "remoteDesktopFrame",
+          value: clone(RemoteDesktopFrameResultSchema, value)
+        };
       }
       default:
         throw agentError(DevicePeerFailureCode.INVALID_REQUEST, false);
@@ -722,6 +913,13 @@ export class NodeDevicePeerAgentExecutor {
     }
   }
 
+  #requireRemoteDesktop(): DevicePeerRemoteDesktopHostPort {
+    if (this.#remoteDesktop === undefined) {
+      throw agentError(DevicePeerFailureCode.CAPABILITY_UNAVAILABLE, false);
+    }
+    return this.#remoteDesktop;
+  }
+
   #assertActive(): void {
     if (this.#retired) throw agentError(DevicePeerFailureCode.UNAVAILABLE, false);
   }
@@ -1000,6 +1198,21 @@ class AgentOutput {
       });
       return;
     }
+    if (error instanceof DevicePeerRemoteDesktopHostError && validRemoteDesktopFailureReason(error.reason)
+      && typeof error.retryable === "boolean") {
+      await this.emit(DevicePeerResponsePhase.FAILED, {
+        case: "failure",
+        value: create(DevicePeerFailureSchema, {
+          code: remoteDesktopFailureCode(error.reason),
+          retryable: error.retryable,
+          remoteDesktop: create(RemoteDesktopFailureSchema, {
+            reason: error.reason,
+            retryable: error.retryable
+          })
+        })
+      });
+      return;
+    }
     const failure = normalizeAgentError(error);
     await this.emit(
       failure.outcomeUnknown && admittedSideEffect
@@ -1050,7 +1263,11 @@ interface TerminalExit {
   readonly signal?: number;
 }
 
-function commandSpecification(command: DevicePeerCommand, terminalAvailable: boolean): CommandSpecification {
+function commandSpecification(
+  command: DevicePeerCommand,
+  terminalAvailable: boolean,
+  remoteDesktopAvailable: boolean
+): CommandSpecification {
   const byAction: Partial<Record<NonNullable<DevicePeerCommand["action"]["case"]>, CommandSpecification>> = {
     listRecentDirectories: readOnly(DevicePeerCapabilityKind.FILES),
     listDirectories: readOnly(DevicePeerCapabilityKind.FILES),
@@ -1078,13 +1295,25 @@ function commandSpecification(command: DevicePeerCommand, terminalAvailable: boo
     listenLoopbackForward: effect(DevicePeerCapabilityKind.FORWARDING),
     writeReverseForward: effect(DevicePeerCapabilityKind.FORWARDING),
     closeReverseForwardConnection: effect(DevicePeerCapabilityKind.FORWARDING),
-    closeLoopbackListener: effect(DevicePeerCapabilityKind.FORWARDING)
+    closeLoopbackListener: effect(DevicePeerCapabilityKind.FORWARDING),
+    getRemoteDesktopCapabilities: readOnly(DevicePeerCapabilityKind.REMOTE_DESKTOP),
+    getRemoteDesktopPermissions: readOnly(DevicePeerCapabilityKind.REMOTE_DESKTOP),
+    showRemoteDesktopPermissionGuide: effect(DevicePeerCapabilityKind.REMOTE_DESKTOP),
+    startRemoteDesktop: effect(DevicePeerCapabilityKind.REMOTE_DESKTOP),
+    heartbeatRemoteDesktop: effect(DevicePeerCapabilityKind.REMOTE_DESKTOP),
+    stopRemoteDesktop: effect(DevicePeerCapabilityKind.REMOTE_DESKTOP),
+    setRemoteDesktopControl: effect(DevicePeerCapabilityKind.REMOTE_DESKTOP),
+    sendRemoteDesktopInput: effect(DevicePeerCapabilityKind.REMOTE_DESKTOP),
+    createRemoteDesktopOffer: effect(DevicePeerCapabilityKind.REMOTE_DESKTOP),
+    exchangeRemoteDesktopIce: effect(DevicePeerCapabilityKind.REMOTE_DESKTOP),
+    getRemoteDesktopFrame: readOnly(DevicePeerCapabilityKind.REMOTE_DESKTOP)
   };
   const specification = command.action.case === undefined ? undefined : byAction[command.action.case];
+  const unavailable = specification?.capability === DevicePeerCapabilityKind.TERMINAL && !terminalAvailable
+    || specification?.capability === DevicePeerCapabilityKind.REMOTE_DESKTOP && !remoteDesktopAvailable;
   if (specification === undefined || command.capability !== specification.capability
-    || command.effect !== specification.effect
-    || (specification.capability === DevicePeerCapabilityKind.TERMINAL && !terminalAvailable)) {
-    throw agentError(specification?.capability === DevicePeerCapabilityKind.TERMINAL && !terminalAvailable
+    || command.effect !== specification.effect || unavailable) {
+    throw agentError(unavailable
       ? DevicePeerFailureCode.CAPABILITY_UNAVAILABLE
       : DevicePeerFailureCode.INVALID_REQUEST, false);
   }
@@ -1191,6 +1420,48 @@ function validateCommandInput(command: DevicePeerCommand): void {
     case "closeLoopbackListener":
       requireResourceId(command.action.value.listenerId);
       return;
+    case "getRemoteDesktopCapabilities":
+    case "getRemoteDesktopPermissions":
+    case "showRemoteDesktopPermissionGuide":
+      remoteDesktopControllerId(command.controllerDeviceId);
+      return;
+    case "startRemoteDesktop":
+      remoteDesktopControllerId(command.controllerDeviceId);
+      remoteDesktopDisplayId(command.action.value.displayId);
+      remoteDesktopStartMode(command.action.value.mode);
+      return;
+    case "heartbeatRemoteDesktop":
+    case "stopRemoteDesktop":
+    case "getRemoteDesktopFrame":
+      remoteDesktopControllerId(command.controllerDeviceId);
+      remoteDesktopLeaseId(command.action.value.leaseId);
+      return;
+    case "setRemoteDesktopControl":
+      remoteDesktopControllerId(command.controllerDeviceId);
+      remoteDesktopLeaseId(command.action.value.leaseId);
+      return;
+    case "sendRemoteDesktopInput":
+      remoteDesktopControllerId(command.controllerDeviceId);
+      remoteDesktopLeaseId(command.action.value.leaseId);
+      remoteDesktopSequence(command.action.value.sequence);
+      remoteDesktopInput(command.action.value);
+      return;
+    case "createRemoteDesktopOffer":
+      remoteDesktopControllerId(command.controllerDeviceId);
+      remoteDesktopLeaseId(command.action.value.leaseId);
+      remoteDesktopAttemptId(command.action.value.attemptId);
+      remoteDesktopSdp(command.action.value.offerSdp);
+      return;
+    case "exchangeRemoteDesktopIce":
+      remoteDesktopControllerId(command.controllerDeviceId);
+      remoteDesktopLeaseId(command.action.value.leaseId);
+      remoteDesktopAttemptId(command.action.value.attemptId);
+      remoteDesktopIceCandidates(command.action.value.candidates);
+      boundedInteger(command.action.value.after, 0, MAXIMUM_REMOTE_DESKTOP_ICE_TOTAL, "Remote Desktop ICE cursor");
+      if (command.action.value.after + command.action.value.candidates.length > MAXIMUM_REMOTE_DESKTOP_ICE_TOTAL) {
+        throw agentError(DevicePeerFailureCode.INVALID_REQUEST, false);
+      }
+      return;
     default:
       throw agentError(DevicePeerFailureCode.INVALID_REQUEST, false);
   }
@@ -1210,6 +1481,284 @@ function mutationResult(): AgentPayload {
 
 function acknowledgement(): AgentPayload {
   return { case: "acknowledgement", value: create(DevicePeerAcknowledgementSchema) };
+}
+
+function remoteDesktopControllerId(value: string): void {
+  if (!validResourceId(value)) throw agentError(DevicePeerFailureCode.INVALID_REQUEST, false);
+}
+
+function remoteDesktopDisplayId(value: string): void {
+  if (!validRemoteDesktopIdentifier(value, MAXIMUM_REMOTE_DESKTOP_DISPLAY_ID_CHARACTERS)) {
+    throw agentError(DevicePeerFailureCode.INVALID_REQUEST, false);
+  }
+}
+
+function remoteDesktopLeaseId(value: string): void {
+  if (!validRemoteDesktopIdentifier(value, MAXIMUM_REMOTE_DESKTOP_LEASE_ID_CHARACTERS)) {
+    throw agentError(DevicePeerFailureCode.INVALID_REQUEST, false);
+  }
+}
+
+function remoteDesktopAttemptId(value: string): void {
+  if (typeof value !== "string" || value.length > MAXIMUM_REMOTE_DESKTOP_ATTEMPT_ID_CHARACTERS
+    || !/^[A-Za-z0-9_-]{1,128}$/u.test(value)) {
+    throw agentError(DevicePeerFailureCode.INVALID_REQUEST, false);
+  }
+}
+
+function remoteDesktopStartMode(value: RemoteDesktopStartMode): void {
+  if (value !== RemoteDesktopStartMode.NEW && value !== RemoteDesktopStartMode.RESUME
+    && value !== RemoteDesktopStartMode.TAKEOVER) {
+    throw agentError(DevicePeerFailureCode.INVALID_REQUEST, false);
+  }
+}
+
+function remoteDesktopSequence(value: bigint): void {
+  if (typeof value !== "bigint" || value < 1n || value > BigInt(Number.MAX_SAFE_INTEGER)) {
+    throw agentError(DevicePeerFailureCode.INVALID_REQUEST, false);
+  }
+}
+
+function remoteDesktopInput(action: DevicePeerSendRemoteDesktopInputAction): void {
+  let bytes: Uint8Array;
+  try { bytes = toBinary(DevicePeerSendRemoteDesktopInputActionSchema, action); }
+  catch { throw agentError(DevicePeerFailureCode.INVALID_REQUEST, false); }
+  if (bytes.byteLength > MAXIMUM_REMOTE_DESKTOP_INPUT_BYTES) {
+    throw agentError(DevicePeerFailureCode.INVALID_REQUEST, false);
+  }
+  remoteDesktopInputEvents(action.events);
+}
+
+function remoteDesktopInputEvents(events: readonly RemoteDesktopInputEvent[]): void {
+  if (!Array.isArray(events) || events.length > MAXIMUM_REMOTE_DESKTOP_INPUT_EVENTS) {
+    throw agentError(DevicePeerFailureCode.INVALID_REQUEST, false);
+  }
+  for (const event of events) {
+    switch (event.event.case) {
+      case "move":
+        if (!remoteDesktopUnit(event.event.value.x) || !remoteDesktopUnit(event.event.value.y)) {
+          throw agentError(DevicePeerFailureCode.INVALID_REQUEST, false);
+        }
+        break;
+      case "button":
+        if ((event.event.value.button !== RemoteDesktopMouseButton.LEFT
+          && event.event.value.button !== RemoteDesktopMouseButton.MIDDLE
+          && event.event.value.button !== RemoteDesktopMouseButton.RIGHT)
+          || typeof event.event.value.down !== "boolean"
+          || !remoteDesktopUnit(event.event.value.x) || !remoteDesktopUnit(event.event.value.y)) {
+          throw agentError(DevicePeerFailureCode.INVALID_REQUEST, false);
+        }
+        break;
+      case "scroll":
+        if (!remoteDesktopDelta(event.event.value.deltaX) || !remoteDesktopDelta(event.event.value.deltaY)) {
+          throw agentError(DevicePeerFailureCode.INVALID_REQUEST, false);
+        }
+        break;
+      case "key":
+        if (!REMOTE_DESKTOP_KEY_CODES.has(event.event.value.code)
+          || typeof event.event.value.down !== "boolean") {
+          throw agentError(DevicePeerFailureCode.INVALID_REQUEST, false);
+        }
+        break;
+      case "text":
+        boundedText(event.event.value.text, 0, MAXIMUM_REMOTE_DESKTOP_TEXT_CHARACTERS, "Remote Desktop text input");
+        break;
+      case "release":
+        break;
+      case undefined:
+        throw agentError(DevicePeerFailureCode.INVALID_REQUEST, false);
+    }
+  }
+}
+
+function remoteDesktopIceCandidates(candidates: readonly RemoteDesktopIceCandidate[]): void {
+  if (!Array.isArray(candidates) || candidates.length > MAXIMUM_REMOTE_DESKTOP_ICE_CANDIDATES) {
+    throw agentError(DevicePeerFailureCode.INVALID_REQUEST, false);
+  }
+  for (const candidate of candidates) {
+    if (typeof candidate.candidate !== "string" || !candidate.candidate.startsWith("candidate:")
+      || candidate.candidate.length > MAXIMUM_REMOTE_DESKTOP_ICE_CANDIDATE_CHARACTERS
+      || (candidate.sdpMid !== undefined
+        && !validBoundedText(candidate.sdpMid, 0, MAXIMUM_REMOTE_DESKTOP_ICE_MID_CHARACTERS))
+      || (candidate.sdpMLineIndex !== undefined
+        && (!Number.isInteger(candidate.sdpMLineIndex) || candidate.sdpMLineIndex < 0
+          || candidate.sdpMLineIndex >= 32))
+      || (candidate.sdpMid === undefined && candidate.sdpMLineIndex === undefined)
+      || (candidate.usernameFragment !== undefined
+        && !validBoundedText(candidate.usernameFragment, 0, MAXIMUM_REMOTE_DESKTOP_ICE_USERNAME_FRAGMENT_CHARACTERS))) {
+      throw agentError(DevicePeerFailureCode.INVALID_REQUEST, false);
+    }
+  }
+}
+
+function validateRemoteDesktopCapabilities(value: RemoteDesktopCapabilities): void {
+  if (value.protocolVersion !== 1 || typeof value.enabled !== "boolean" || typeof value.canControl !== "boolean"
+    || !validBoundedText(value.platform, 1, MAXIMUM_REMOTE_DESKTOP_PLATFORM_CHARACTERS)
+    || !Array.isArray(value.displays) || value.displays.length > MAXIMUM_REMOTE_DESKTOP_DISPLAYS
+    || typeof value.automaticReconnect !== "boolean" || typeof value.connectionTakeover !== "boolean"
+    || typeof value.webrtcVideo !== "boolean" || typeof value.trickleIce !== "boolean"
+    || typeof value.jpegFallback !== "boolean" || value.permissions === undefined) {
+    throw invalidRemoteDesktopHostResult();
+  }
+  if (value.enabled && value.displays.length === 0) throw invalidRemoteDesktopHostResult();
+  validateRemoteDesktopPermissions(value.permissions);
+  const displayIds = new Set<string>();
+  for (const display of value.displays) {
+    validateRemoteDesktopDisplay(display);
+    if (displayIds.has(display.displayId)) throw invalidRemoteDesktopHostResult();
+    displayIds.add(display.displayId);
+  }
+}
+
+function validateRemoteDesktopPermissions(value: RemoteDesktopPermissions): void {
+  if (!validRemoteDesktopPermissionStatus(value.screenRecording)
+    || !validRemoteDesktopPermissionStatus(value.accessibility)) {
+    throw invalidRemoteDesktopHostResult();
+  }
+}
+
+function validateRemoteDesktopDisplay(value: RemoteDesktopDisplay | undefined): asserts value is RemoteDesktopDisplay {
+  if (value === undefined || !validRemoteDesktopIdentifier(value.displayId, MAXIMUM_REMOTE_DESKTOP_DISPLAY_ID_CHARACTERS)
+    || !validBoundedText(value.name, 1, MAXIMUM_REMOTE_DESKTOP_DISPLAY_NAME_CHARACTERS)
+    || !Number.isInteger(value.width) || value.width < 1 || value.width > MAXIMUM_REMOTE_DESKTOP_DIMENSION
+    || !Number.isInteger(value.height) || value.height < 1 || value.height > MAXIMUM_REMOTE_DESKTOP_DIMENSION) {
+    throw invalidRemoteDesktopHostResult();
+  }
+}
+
+function validateRemoteDesktopLease(value: RemoteDesktopLease): void {
+  if (!validRemoteDesktopIdentifier(value.leaseId, MAXIMUM_REMOTE_DESKTOP_LEASE_ID_CHARACTERS)
+    || typeof value.controlling !== "boolean") throw invalidRemoteDesktopHostResult();
+  validateRemoteDesktopDisplay(value.display);
+}
+
+function validateRemoteDesktopControlState(value: RemoteDesktopControlState): void {
+  if (typeof value.controlling !== "boolean") throw invalidRemoteDesktopHostResult();
+}
+
+function validateRemoteDesktopOffer(value: RemoteDesktopOfferResult, expectedAttemptId: string): void {
+  if (value.attemptId !== expectedAttemptId
+    || !validRemoteDesktopSdp(value.answerSdp)) {
+    throw invalidRemoteDesktopHostResult();
+  }
+}
+
+function validateRemoteDesktopIceExchange(
+  value: RemoteDesktopIceExchangeResult,
+  expectedAttemptId: string,
+  after: number
+): void {
+  try { remoteDesktopIceCandidates(value.candidates); }
+  catch { throw invalidRemoteDesktopHostResult(); }
+  if (value.attemptId !== expectedAttemptId
+    || !Number.isInteger(value.next) || value.next < 0 || value.next > MAXIMUM_REMOTE_DESKTOP_ICE_TOTAL
+    || value.next !== after + value.candidates.length || typeof value.complete !== "boolean") {
+    throw invalidRemoteDesktopHostResult();
+  }
+}
+
+function validateRemoteDesktopFrameResult(value: RemoteDesktopFrameResult): void {
+  if (value.frame === undefined) return;
+  if (!(value.frame.jpeg instanceof Uint8Array) || value.frame.jpeg.byteLength < 1
+    || value.frame.jpeg.byteLength > MAXIMUM_REMOTE_DESKTOP_FRAME_BYTES) {
+    throw invalidRemoteDesktopHostResult();
+  }
+}
+
+function validRemoteDesktopPermissionStatus(value: RemoteDesktopPermissionStatus): boolean {
+  return value === RemoteDesktopPermissionStatus.GRANTED
+    || value === RemoteDesktopPermissionStatus.MISSING
+    || value === RemoteDesktopPermissionStatus.UNKNOWN
+    || value === RemoteDesktopPermissionStatus.NOT_REQUIRED;
+}
+
+function validRemoteDesktopFailureReason(value: RemoteDesktopFailureReason): boolean {
+  return value === RemoteDesktopFailureReason.DISABLED
+    || value === RemoteDesktopFailureReason.BUSY
+    || value === RemoteDesktopFailureReason.STOPPED
+    || value === RemoteDesktopFailureReason.LEASE_EXPIRED
+    || value === RemoteDesktopFailureReason.DISPLAY_MISSING
+    || value === RemoteDesktopFailureReason.SCREEN_PERMISSION_REQUIRED
+    || value === RemoteDesktopFailureReason.ACCESSIBILITY_PERMISSION_REQUIRED
+    || value === RemoteDesktopFailureReason.INPUT_UNAVAILABLE
+    || value === RemoteDesktopFailureReason.INPUT_BUSY
+    || value === RemoteDesktopFailureReason.VIEW_ONLY
+    || value === RemoteDesktopFailureReason.VIDEO_UNAVAILABLE
+    || value === RemoteDesktopFailureReason.VIDEO_BUSY
+    || value === RemoteDesktopFailureReason.VIDEO_TIMEOUT
+    || value === RemoteDesktopFailureReason.AUTHORITY_CHANGED
+    || value === RemoteDesktopFailureReason.UNSUPPORTED
+    || value === RemoteDesktopFailureReason.LOCKED_SESSION_UNSUPPORTED;
+}
+
+function remoteDesktopFailureCode(reason: RemoteDesktopFailureReason): DevicePeerFailureCode {
+  switch (reason) {
+    case RemoteDesktopFailureReason.DISABLED:
+    case RemoteDesktopFailureReason.VIEW_ONLY:
+    case RemoteDesktopFailureReason.UNSUPPORTED:
+    case RemoteDesktopFailureReason.LOCKED_SESSION_UNSUPPORTED:
+      return DevicePeerFailureCode.CAPABILITY_UNAVAILABLE;
+    case RemoteDesktopFailureReason.BUSY:
+    case RemoteDesktopFailureReason.INPUT_BUSY:
+    case RemoteDesktopFailureReason.VIDEO_BUSY:
+    case RemoteDesktopFailureReason.AUTHORITY_CHANGED:
+      return DevicePeerFailureCode.CONFLICT;
+    case RemoteDesktopFailureReason.STOPPED:
+    case RemoteDesktopFailureReason.LEASE_EXPIRED:
+    case RemoteDesktopFailureReason.DISPLAY_MISSING:
+      return DevicePeerFailureCode.NOT_FOUND;
+    case RemoteDesktopFailureReason.SCREEN_PERMISSION_REQUIRED:
+    case RemoteDesktopFailureReason.ACCESSIBILITY_PERMISSION_REQUIRED:
+      return DevicePeerFailureCode.PERMISSION_DENIED;
+    case RemoteDesktopFailureReason.INPUT_UNAVAILABLE:
+    case RemoteDesktopFailureReason.VIDEO_UNAVAILABLE:
+      return DevicePeerFailureCode.UNAVAILABLE;
+    case RemoteDesktopFailureReason.VIDEO_TIMEOUT:
+      return DevicePeerFailureCode.TIMEOUT;
+    case RemoteDesktopFailureReason.UNSPECIFIED:
+      return DevicePeerFailureCode.INTERNAL;
+  }
+}
+
+function invalidRemoteDesktopHostResult(): DevicePeerAgentError {
+  return agentError(DevicePeerFailureCode.INTERNAL, false);
+}
+
+function validRemoteDesktopIdentifier(value: string, maximumCharacters: number): boolean {
+  return validBoundedText(value, 1, maximumCharacters) && value.trim() === value
+    && !/[\u0000-\u001f\u007f]/u.test(value);
+}
+
+function validBoundedText(value: string, minimumCharacters: number, maximumCharacters: number): boolean {
+  if (typeof value !== "string") return false;
+  return value.length >= minimumCharacters && value.length <= maximumCharacters && !value.includes("\u0000");
+}
+
+function remoteDesktopSdp(value: string): void {
+  if (!validRemoteDesktopSdp(value)) {
+    throw agentError(DevicePeerFailureCode.INVALID_REQUEST, false);
+  }
+}
+
+function validRemoteDesktopSdp(value: string): boolean {
+  return typeof value === "string" && value.length >= 1 && !value.includes("\u0000")
+    && Buffer.byteLength(value, "utf8") <= MAXIMUM_REMOTE_DESKTOP_SDP_BYTES;
+}
+
+function boundedText(value: string, minimumCharacters: number, maximumCharacters: number, _name: string): string {
+  if (!validBoundedText(value, minimumCharacters, maximumCharacters)) {
+    throw agentError(DevicePeerFailureCode.INVALID_REQUEST, false);
+  }
+  return value;
+}
+
+function remoteDesktopUnit(value: number): boolean {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 1;
+}
+
+function remoteDesktopDelta(value: number): boolean {
+  return typeof value === "number" && Number.isFinite(value)
+    && Math.abs(value) <= MAXIMUM_REMOTE_DESKTOP_SCROLL_DELTA;
 }
 
 function protoFileKind(kind: DevicePeerFileStat["kind"]): DevicePeerFileKind {

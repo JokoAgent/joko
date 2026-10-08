@@ -4,6 +4,7 @@ package joko.v1;
 
 import "google/protobuf/timestamp.proto";
 import "joko/v1/common.proto";
+import "joko/v1/remote_desktop_types.proto";
 import "joko/v1/runtime.proto";
 
 // Authenticated controller-facing catalog and filesystem projection, plus the
@@ -28,6 +29,7 @@ enum DevicePeerCapabilityKind {
   DEVICE_PEER_CAPABILITY_KIND_PROCESS = 2;
   DEVICE_PEER_CAPABILITY_KIND_TERMINAL = 3;
   DEVICE_PEER_CAPABILITY_KIND_FORWARDING = 4;
+  DEVICE_PEER_CAPABILITY_KIND_REMOTE_DESKTOP = 5;
 }
 
 // Exact authority snapshot selected by a controller. All unary peer requests
@@ -158,6 +160,9 @@ enum DevicePeerFailureCode {
 message DevicePeerFailure {
   DevicePeerFailureCode code = 1;
   bool retryable = 2;
+  // Present only for a Remote Desktop domain failure. Transport and route
+  // failures retain the capability-neutral code above.
+  RemoteDesktopFailure remote_desktop = 10;
 }
 
 message DevicePeerAgentHello {
@@ -350,9 +355,59 @@ message DevicePeerCloseLoopbackListenerAction {
   string listener_id = 1;
 }
 
+message DevicePeerGetRemoteDesktopCapabilitiesAction {}
+
+message DevicePeerGetRemoteDesktopPermissionsAction {}
+
+message DevicePeerShowRemoteDesktopPermissionGuideAction {}
+
+message DevicePeerStartRemoteDesktopAction {
+  string display_id = 1;
+  RemoteDesktopStartMode mode = 2;
+}
+
+message DevicePeerHeartbeatRemoteDesktopAction {
+  string lease_id = 1;
+}
+
+message DevicePeerStopRemoteDesktopAction {
+  string lease_id = 1;
+}
+
+message DevicePeerSetRemoteDesktopControlAction {
+  string lease_id = 1;
+  bool enabled = 2;
+}
+
+message DevicePeerSendRemoteDesktopInputAction {
+  string lease_id = 1;
+  uint64 sequence = 2;
+  repeated RemoteDesktopInputEvent events = 3;
+}
+
+message DevicePeerCreateRemoteDesktopOfferAction {
+  string lease_id = 1;
+  string attempt_id = 2;
+  string offer_sdp = 3;
+}
+
+message DevicePeerExchangeRemoteDesktopIceAction {
+  string lease_id = 1;
+  string attempt_id = 2;
+  repeated RemoteDesktopIceCandidate candidates = 3;
+  uint32 after = 4;
+}
+
+message DevicePeerGetRemoteDesktopFrameAction {
+  string lease_id = 1;
+}
+
 message DevicePeerCommand {
   DevicePeerCapabilityKind capability = 1;
   DevicePeerEffectKind effect = 2;
+  // Target-side only. The Orchestrator derives this from the authenticated
+  // Connection after exact route fencing; controller requests never set it.
+  string controller_device_id = 3;
   oneof action {
     DevicePeerListRecentDirectoriesAction list_recent_directories = 10;
     DevicePeerListDirectoriesAction list_directories = 11;
@@ -381,6 +436,17 @@ message DevicePeerCommand {
     DevicePeerWriteReverseForwardAction write_reverse_forward = 44;
     DevicePeerCloseReverseForwardConnectionAction close_reverse_forward_connection = 45;
     DevicePeerCloseLoopbackListenerAction close_loopback_listener = 46;
+    DevicePeerGetRemoteDesktopCapabilitiesAction get_remote_desktop_capabilities = 50;
+    DevicePeerGetRemoteDesktopPermissionsAction get_remote_desktop_permissions = 51;
+    DevicePeerShowRemoteDesktopPermissionGuideAction show_remote_desktop_permission_guide = 52;
+    DevicePeerStartRemoteDesktopAction start_remote_desktop = 53;
+    DevicePeerHeartbeatRemoteDesktopAction heartbeat_remote_desktop = 54;
+    DevicePeerStopRemoteDesktopAction stop_remote_desktop = 55;
+    DevicePeerSetRemoteDesktopControlAction set_remote_desktop_control = 56;
+    DevicePeerSendRemoteDesktopInputAction send_remote_desktop_input = 57;
+    DevicePeerCreateRemoteDesktopOfferAction create_remote_desktop_offer = 58;
+    DevicePeerExchangeRemoteDesktopIceAction exchange_remote_desktop_ice = 59;
+    DevicePeerGetRemoteDesktopFrameAction get_remote_desktop_frame = 60;
   }
 }
 
@@ -550,6 +616,13 @@ message DevicePeerAgentResult {
     DevicePeerReverseForwardDataResult reverse_forward_data = 33;
     DevicePeerReverseForwardConnectionClosedResult reverse_forward_connection_closed = 34;
     DevicePeerLoopbackListenerClosedResult loopback_listener_closed = 35;
+    RemoteDesktopCapabilities remote_desktop_capabilities = 40;
+    RemoteDesktopPermissions remote_desktop_permissions = 41;
+    RemoteDesktopLease remote_desktop_lease = 42;
+    RemoteDesktopControlState remote_desktop_control_state = 43;
+    RemoteDesktopOfferResult remote_desktop_offer = 44;
+    RemoteDesktopIceExchangeResult remote_desktop_ice = 45;
+    RemoteDesktopFrameResult remote_desktop_frame = 46;
     DevicePeerFailure failure = 30;
   }
 }

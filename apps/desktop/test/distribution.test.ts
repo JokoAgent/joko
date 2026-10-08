@@ -42,6 +42,9 @@ const config = JSON.parse(readFileSync(new URL("../electron-builder.json", impor
 const workspace = readFileSync(new URL("../../../pnpm-workspace.yaml", import.meta.url), "utf8");
 const packagedAudit = readFileSync(new URL("../scripts/audit-packaged.cjs", import.meta.url), "utf8");
 const nativeGamepadBuild = readFileSync(new URL("../scripts/build-native-gamepad.mjs", import.meta.url), "utf8");
+const nativeRemoteDesktopBuild = readFileSync(
+  new URL("../scripts/build-native-remote-desktop.mjs", import.meta.url), "utf8"
+);
 const nativeGamepadSwift = readFileSync(new URL("../native/gamepad/macos-gamepad-helper.swift", import.meta.url), "utf8");
 const nativeGamepadSwitch2 = readFileSync(new URL("../native/gamepad/switch2_usb.c", import.meta.url), "utf8");
 const packagedSmoke = readFileSync(new URL("../scripts/smoke-packaged.mjs", import.meta.url), "utf8");
@@ -108,6 +111,7 @@ describe("Desktop distribution", () => {
       { from: "dist/native-system-frontmost-input", to: "native-system-frontmost-input" },
       { from: "dist/native-hardware", to: "native-hardware" },
       { from: "dist/native-gamepad", to: "native-gamepad" },
+      { from: "dist/native-remote-desktop", to: "native-remote-desktop" },
       { from: "dist/native-simulator-hid", to: "native-simulator-hid" },
       { from: "dist/native-simulator-h264", to: "native-simulator-h264" },
       { from: "dist/orchestrator-runtime", to: "orchestrator-runtime" },
@@ -121,6 +125,9 @@ describe("Desktop distribution", () => {
     ]);
     expect(config.extraResources.find(item => item.to === "native-gamepad")?.filter).toEqual([
       "manifest.json", "joko-macos-gamepad-helper"
+    ]);
+    expect(config.extraResources.find(item => item.to === "native-remote-desktop")?.filter).toEqual([
+      "manifest.json", "joko-macos-remote-desktop-input", "joko-windows-remote-desktop-input.exe"
     ]);
     expect(config.extraResources.find(item => item.to === "native-simulator-h264")?.filter).toEqual([
       "manifest.json", "joko-simulator-h264"
@@ -199,6 +206,20 @@ describe("Desktop distribution", () => {
     );
     expect(packagedGamepadAudit.indexOf("info.size < 32"))
       .toBeLessThan(packagedGamepadAudit.indexOf("const bytes = await readFile(path)"));
+  });
+
+  it("builds and audits only the fixed Remote Desktop input helpers", () => {
+    expect(manifest.scripts?.["build:native-remote-desktop"])
+      .toBe("node scripts/build-native-remote-desktop.mjs");
+    expect(manifest.scripts?.build).toContain("pnpm build:native-remote-desktop");
+    expect(manifest.scripts?.["package:dir"]).toContain("node scripts/build-native-remote-desktop.mjs");
+    expect(manifest.scripts?.["package:artifacts"]).toContain("node scripts/build-native-remote-desktop.mjs");
+    expect(nativeRemoteDesktopBuild).toContain('const macHelper = "joko-macos-remote-desktop-input"');
+    expect(nativeRemoteDesktopBuild).toContain('const windowsHelper = "joko-windows-remote-desktop-input.exe"');
+    expect(nativeRemoteDesktopBuild).toContain("export function buildNativeRemoteDesktop(");
+    expect(packagedAudit).toContain("buildNativeRemoteDesktop({");
+    expect(packagedAudit).toContain('output: resolve(resourcesRoot, "native-remote-desktop")');
+    expect(packagedAudit).toContain("auditNativeRemoteDesktop(");
   });
 
   it("binds native gamepad ownership to preload occurrences and the shared complete-exit barrier", () => {

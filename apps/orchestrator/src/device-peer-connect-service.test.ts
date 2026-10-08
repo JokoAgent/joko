@@ -526,6 +526,7 @@ describe("DevicePeerService Connect boundary", () => {
     const lease = fixture.routes.getRoute(fixture.target.deviceId)!;
     const claim = fixture.routes.registerClaim({
       requestId: "mkdir-admission",
+      controllerDeviceId: fixture.controller.deviceId,
       targetDeviceId: fixture.target.deviceId,
       routeGeneration: lease.routeGeneration,
       capability: "files",

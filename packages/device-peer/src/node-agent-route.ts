@@ -350,11 +350,12 @@ async function assertAuthority(
 }
 
 function validateCapabilities(values: readonly DevicePeerCapabilityKind[]): void {
-  if (values.length < 1 || values.length > 4 || new Set(values).size !== values.length
+  if (values.length < 1 || values.length > 5 || new Set(values).size !== values.length
     || values.some((value) => value !== DevicePeerCapabilityKind.FILES
       && value !== DevicePeerCapabilityKind.PROCESS
       && value !== DevicePeerCapabilityKind.TERMINAL
-      && value !== DevicePeerCapabilityKind.FORWARDING)) throw routeFailure();
+      && value !== DevicePeerCapabilityKind.FORWARDING
+      && value !== DevicePeerCapabilityKind.REMOTE_DESKTOP)) throw routeFailure();
 }
 
 function validateDeviceKind(value: DeviceKind): void {

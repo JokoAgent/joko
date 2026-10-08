@@ -37,6 +37,7 @@ export interface DevicePeerRouteLease extends DevicePeerRouteAcceptedFrame {}
 
 export interface DevicePeerClaimInput {
   readonly requestId: string;
+  readonly controllerDeviceId: string;
   readonly targetDeviceId: string;
   readonly routeGeneration: number;
   readonly capability: DevicePeerCapability;
@@ -549,6 +550,7 @@ function requestFromInput(input: DevicePeerClaimInput): DevicePeerRequestFrame {
     protocolVersion: DEVICE_PEER_PROTOCOL_VERSION,
     kind: "request",
     requestId: input.requestId,
+    controllerDeviceId: input.controllerDeviceId,
     targetDeviceId: input.targetDeviceId,
     routeGeneration: input.routeGeneration,
     capability: input.capability,

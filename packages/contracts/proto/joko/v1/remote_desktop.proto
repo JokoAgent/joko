@@ -1,0 +1,159 @@
+syntax = "proto3";
+
+package joko.v1;
+
+import "joko/v1/common.proto";
+import "joko/v1/device_peer.proto";
+import "joko/v1/remote_desktop_types.proto";
+
+// Authenticated controller-facing Remote Desktop surface. Controller Device
+// identity is always derived from the current Connection and is never accepted
+// in a public request. Every target operation fences an exact DevicePeer route.
+service RemoteDesktopService {
+  rpc ListRemoteDesktopHosts(ListRemoteDesktopHostsRequest) returns (ListRemoteDesktopHostsResponse);
+  rpc GetRemoteDesktopCapabilities(GetRemoteDesktopCapabilitiesRequest) returns (GetRemoteDesktopCapabilitiesResponse);
+  rpc GetRemoteDesktopPermissions(GetRemoteDesktopPermissionsRequest) returns (GetRemoteDesktopPermissionsResponse);
+  rpc ShowRemoteDesktopPermissionGuide(ShowRemoteDesktopPermissionGuideRequest) returns (ShowRemoteDesktopPermissionGuideResponse);
+  rpc StartRemoteDesktop(StartRemoteDesktopRequest) returns (StartRemoteDesktopResponse);
+  rpc HeartbeatRemoteDesktop(HeartbeatRemoteDesktopRequest) returns (HeartbeatRemoteDesktopResponse);
+  rpc StopRemoteDesktop(StopRemoteDesktopRequest) returns (StopRemoteDesktopResponse);
+  rpc SetRemoteDesktopControl(SetRemoteDesktopControlRequest) returns (SetRemoteDesktopControlResponse);
+  rpc SendRemoteDesktopInput(SendRemoteDesktopInputRequest) returns (SendRemoteDesktopInputResponse);
+  rpc GetRemoteDesktopIceConfiguration(GetRemoteDesktopIceConfigurationRequest) returns (GetRemoteDesktopIceConfigurationResponse);
+  rpc CreateRemoteDesktopOffer(CreateRemoteDesktopOfferRequest) returns (CreateRemoteDesktopOfferResponse);
+  rpc ExchangeRemoteDesktopIce(ExchangeRemoteDesktopIceRequest) returns (ExchangeRemoteDesktopIceResponse);
+  rpc GetRemoteDesktopFrame(GetRemoteDesktopFrameRequest) returns (GetRemoteDesktopFrameResponse);
+}
+
+message ListRemoteDesktopHostsRequest {
+  PageRequest page = 1;
+}
+
+message ListRemoteDesktopHostsResponse {
+  repeated DevicePeerDescriptor hosts = 1;
+  PageInfo page = 2;
+}
+
+message GetRemoteDesktopCapabilitiesRequest {
+  DevicePeerRouteIdentity peer = 1;
+}
+
+message GetRemoteDesktopCapabilitiesResponse {
+  DevicePeerRouteIdentity peer = 1;
+  RemoteDesktopCapabilities capabilities = 2;
+}
+
+message GetRemoteDesktopPermissionsRequest {
+  DevicePeerRouteIdentity peer = 1;
+}
+
+message GetRemoteDesktopPermissionsResponse {
+  DevicePeerRouteIdentity peer = 1;
+  RemoteDesktopPermissions permissions = 2;
+}
+
+message ShowRemoteDesktopPermissionGuideRequest {
+  DevicePeerRouteIdentity peer = 1;
+}
+
+message ShowRemoteDesktopPermissionGuideResponse {
+  DevicePeerRouteIdentity peer = 1;
+  RemoteDesktopPermissions permissions = 2;
+}
+
+message StartRemoteDesktopRequest {
+  DevicePeerRouteIdentity peer = 1;
+  string display_id = 2;
+  RemoteDesktopStartMode mode = 3;
+}
+
+message StartRemoteDesktopResponse {
+  DevicePeerRouteIdentity peer = 1;
+  RemoteDesktopLease lease = 2;
+}
+
+message HeartbeatRemoteDesktopRequest {
+  DevicePeerRouteIdentity peer = 1;
+  string lease_id = 2;
+}
+
+message HeartbeatRemoteDesktopResponse {
+  DevicePeerRouteIdentity peer = 1;
+  RemoteDesktopControlState state = 2;
+}
+
+message StopRemoteDesktopRequest {
+  DevicePeerRouteIdentity peer = 1;
+  string lease_id = 2;
+}
+
+message StopRemoteDesktopResponse {
+  DevicePeerRouteIdentity peer = 1;
+}
+
+message SetRemoteDesktopControlRequest {
+  DevicePeerRouteIdentity peer = 1;
+  string lease_id = 2;
+  bool enabled = 3;
+}
+
+message SetRemoteDesktopControlResponse {
+  DevicePeerRouteIdentity peer = 1;
+  RemoteDesktopControlState state = 2;
+}
+
+message SendRemoteDesktopInputRequest {
+  DevicePeerRouteIdentity peer = 1;
+  string lease_id = 2;
+  uint64 sequence = 3;
+  repeated RemoteDesktopInputEvent events = 4;
+}
+
+message SendRemoteDesktopInputResponse {
+  DevicePeerRouteIdentity peer = 1;
+}
+
+message GetRemoteDesktopIceConfigurationRequest {
+  DevicePeerRouteIdentity peer = 1;
+  string lease_id = 2;
+}
+
+message GetRemoteDesktopIceConfigurationResponse {
+  DevicePeerRouteIdentity peer = 1;
+  repeated RemoteDesktopIceServer ice_servers = 2;
+}
+
+message CreateRemoteDesktopOfferRequest {
+  DevicePeerRouteIdentity peer = 1;
+  string lease_id = 2;
+  string attempt_id = 3;
+  string offer_sdp = 4;
+}
+
+message CreateRemoteDesktopOfferResponse {
+  DevicePeerRouteIdentity peer = 1;
+  RemoteDesktopOfferResult offer = 2;
+}
+
+message ExchangeRemoteDesktopIceRequest {
+  DevicePeerRouteIdentity peer = 1;
+  string lease_id = 2;
+  string attempt_id = 3;
+  repeated RemoteDesktopIceCandidate candidates = 4;
+  uint32 after = 5;
+}
+
+message ExchangeRemoteDesktopIceResponse {
+  DevicePeerRouteIdentity peer = 1;
+  RemoteDesktopIceExchangeResult exchange = 2;
+}
+
+message GetRemoteDesktopFrameRequest {
+  DevicePeerRouteIdentity peer = 1;
+  string lease_id = 2;
+}
+
+message GetRemoteDesktopFrameResponse {
+  DevicePeerRouteIdentity peer = 1;
+  RemoteDesktopFrameResult result = 2;
+}

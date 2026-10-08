@@ -145,6 +145,22 @@ interface JokoDesktopAutoRelaunchSettings {
   readonly defaultAutoRelaunchOnIdle: boolean;
 }
 
+type JokoDesktopRemoteDesktopPermissionStatus = "granted" | "missing" | "unknown" | "notRequired";
+
+interface JokoDesktopRemoteDesktopPermissions {
+  readonly screenRecording: JokoDesktopRemoteDesktopPermissionStatus;
+  readonly accessibility: JokoDesktopRemoteDesktopPermissionStatus;
+}
+
+interface JokoDesktopRemoteDesktopSnapshot {
+  readonly enabled: boolean;
+  readonly active: boolean;
+  readonly controlling: boolean;
+  readonly controllerDeviceId?: string;
+  readonly displayId?: string;
+  readonly permissions: JokoDesktopRemoteDesktopPermissions;
+}
+
 interface JokoDesktopUpdateChannelSettings {
   readonly enableBeta: boolean;
   readonly isCustomized: boolean;
@@ -246,6 +262,7 @@ type JokoDesktopCapability =
   | "provider.modelCatalogLifecycle"
   | "runtime.desktopProcessUsage"
   | "runtime.processMonitorWindow"
+  | "remote.desktopHost"
   | "selection.quote.contextMenu"
   | "session.windows"
   | "voice.globalDictation"
@@ -635,6 +652,14 @@ interface JokoDesktopApi {
     retry(): Promise<JokoDesktopManagedOrchestratorStatus>;
     adoptConnection(connection: JokoDesktopManagedOrchestratorConnection): Promise<JokoDesktopManagedOrchestratorStatus>;
     completeLogout(): Promise<JokoDesktopManagedOrchestratorStatus>;
+  };
+  readonly remoteDesktop: {
+    getState(): Promise<JokoDesktopRemoteDesktopSnapshot>;
+    setEnabled(enabled: boolean): Promise<JokoDesktopRemoteDesktopSnapshot>;
+    disconnect(): Promise<JokoDesktopRemoteDesktopSnapshot>;
+    getPermissions(): Promise<JokoDesktopRemoteDesktopPermissions>;
+    showPermissionGuide(): Promise<JokoDesktopRemoteDesktopPermissions>;
+    onStateChanged(listener: (state: JokoDesktopRemoteDesktopSnapshot) => void): () => void;
   };
   readonly credentials: {
     get(profileId: string): Promise<string | undefined>;

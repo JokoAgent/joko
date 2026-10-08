@@ -406,6 +406,8 @@ import type { RuntimeActivityTracker } from "./runtime-activity-tracker.js";
 import { createDevicePeerCapabilityPorts, DevicePeerExecutionError } from "./device-peer-capability-ports.js";
 import { createDevicePeerConnectService, fromProtoRouteIdentity } from "./device-peer-connect-service.js";
 import { DevicePeerAuthorityError, DevicePeerOwner } from "./device-peer-owner.js";
+import { createRemoteDesktopConnectService } from "./remote-desktop-connect-service.js";
+import { RemoteDesktopCoordinator } from "./remote-desktop-coordinator.js";
 import { createRemoteHostConnectService } from "./remote-host-connect-service.js";
 import { createSshKeyConnectService } from "./ssh-key-connect-service.js";
 import { createTerminalConnectService } from "./terminal-connect-service.js";
@@ -754,6 +756,7 @@ export interface ConnectServiceSet {
   readonly browser: ServiceImpl<typeof contract.BrowserService>;
   readonly remoteHost: ServiceImpl<typeof contract.RemoteHostService>;
   readonly devicePeer: ServiceImpl<typeof contract.DevicePeerService>;
+  readonly remoteDesktop: ServiceImpl<typeof contract.RemoteDesktopService>;
   readonly sshKey: ServiceImpl<typeof contract.SshKeyService>;
   readonly voiceInput: ServiceImpl<typeof contract.VoiceInputService>;
   readonly terminal: ServiceImpl<typeof contract.TerminalService>;
@@ -1168,6 +1171,7 @@ export function registerConnectServices(router: ConnectRouter, application: Orch
   router.service(contract.BrowserService, withConnectErrors(services.browser));
   router.service(contract.RemoteHostService, withConnectErrors(services.remoteHost));
   router.service(contract.DevicePeerService, withConnectErrors(services.devicePeer));
+  router.service(contract.RemoteDesktopService, withConnectErrors(services.remoteDesktop));
   router.service(contract.SshKeyService, withConnectErrors(services.sshKey));
   router.service(contract.VoiceInputService, withConnectErrors(services.voiceInput));
   router.service(contract.TerminalService, withConnectErrors(services.terminal));
@@ -1188,6 +1192,13 @@ export function createConnectServices(application: OrchestratorApplication, proj
   const devicePeers = application.devicePeers ?? new DevicePeerOwner({ store: application.store });
   if (application.devicePeers === undefined) {
     application.registerServiceCleanup?.(() => devicePeers.shutdown());
+  }
+  const remoteDesktopCoordinator = application.remoteDesktop ?? new RemoteDesktopCoordinator({
+    owner: devicePeers,
+    onRevoked: (connectionId, listener) => application.connections.onRevoked(connectionId, listener)
+  });
+  if (application.remoteDesktop === undefined) {
+    application.registerServiceCleanup?.(() => remoteDesktopCoordinator.close());
   }
   const dependencies: ConnectServiceDependencies = {
     connections: application.connections,
@@ -1380,6 +1391,11 @@ export function createConnectServices(application: OrchestratorApplication, proj
     owner: dependencies.devicePeers,
     connections: dependencies.connections,
     store: dependencies.store
+  });
+  const remoteDesktop = createRemoteDesktopConnectService({
+    coordinator: remoteDesktopCoordinator,
+    owner: dependencies.devicePeers,
+    connections: dependencies.connections
   });
   const voiceInput = createVoiceInputConnectService(dependencies.voiceInput, dependencies.voiceInputSettings, dependencies.voiceDictionary, (context) => ({
     connectionId: authenticate(context).id
@@ -5253,7 +5269,7 @@ export function createConnectServices(application: OrchestratorApplication, proj
     }
   } satisfies ServiceImpl<typeof contract.PiService>;
 
-  return { connection, event, operation, backend, target, session, objective, portableSession, run, subagent, review, queue, scheduler, interaction, workspace, worktree, artifact, historyMaintenance, credential, settings, messaging, contact, partner, collaborationGoal, managedModelRuntime, tool, extension, skill, browser, remoteHost, devicePeer, sshKey, voiceInput, terminal, simulatorViewer, pi };
+  return { connection, event, operation, backend, target, session, objective, portableSession, run, subagent, review, queue, scheduler, interaction, workspace, worktree, artifact, historyMaintenance, credential, settings, messaging, contact, partner, collaborationGoal, managedModelRuntime, tool, extension, skill, browser, remoteHost, devicePeer, remoteDesktop, sshKey, voiceInput, terminal, simulatorViewer, pi };
 }
 
 function requireAuthentication(dependencies: ConnectServiceDependencies, context: HandlerContext): ConnectionRecord {

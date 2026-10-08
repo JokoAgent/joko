@@ -675,7 +675,11 @@ class ConnectDevicePeerRouteTransport implements DevicePeerRouteTransport {
     request.dispatchTerminal = true;
     request.streamTerminal = true;
     this.#requests.delete(request.requestId);
-    request.resolve(responseFrame(this.#requireLease(), request.requestId, { outcome, errorCode }));
+    request.resolve(responseFrame(this.#requireLease(), request.requestId, {
+      outcome,
+      errorCode,
+      failure: result.payload.value
+    }));
   }
 
   #abort(request: PendingRequest, result: contract.DevicePeerAgentResult): void {
@@ -1027,7 +1031,7 @@ function requireCommand(frame: DevicePeerRequestFrame): contract.DevicePeerComma
   const command = frame.payload as contract.DevicePeerCommand;
   const metadata = commandMetadata(command);
   if (metadata.capability !== frame.capability || metadata.effectKind !== frame.effectKind
-    || command.action.case !== frame.action) {
+    || command.action.case !== frame.action || command.controllerDeviceId !== frame.controllerDeviceId) {
     throw protocolViolation("The Device peer command declarations do not match its action.");
   }
   return command;
@@ -1041,7 +1045,9 @@ function commandMetadata(command: contract.DevicePeerCommand): {
   if (action === undefined) throw protocolViolation("The Device peer command action is required.");
   const readOnly = action === "listRecentDirectories" || action === "listDirectories"
     || action === "inspectDirectory" || action === "realpath" || action === "statFile"
-    || action === "listFiles" || action === "readFile";
+    || action === "listFiles" || action === "readFile"
+    || action === "getRemoteDesktopCapabilities" || action === "getRemoteDesktopPermissions"
+    || action === "getRemoteDesktopFrame";
   const capability: DevicePeerCapability = action === "startProcess" || action === "writeProcess" || action === "signalProcess"
     ? "process"
     : action === "openTerminal" || action === "writeTerminal" || action === "resizeTerminal"
@@ -1052,7 +1058,14 @@ function commandMetadata(command: contract.DevicePeerCommand): {
         || action === "writeReverseForward" || action === "closeReverseForwardConnection"
         || action === "closeLoopbackListener"
         ? "forwarding"
-        : "files";
+        : action === "getRemoteDesktopCapabilities" || action === "getRemoteDesktopPermissions"
+          || action === "showRemoteDesktopPermissionGuide" || action === "startRemoteDesktop"
+          || action === "heartbeatRemoteDesktop" || action === "stopRemoteDesktop"
+          || action === "setRemoteDesktopControl" || action === "sendRemoteDesktopInput"
+          || action === "createRemoteDesktopOffer" || action === "exchangeRemoteDesktopIce"
+          || action === "getRemoteDesktopFrame"
+          ? "remote_desktop"
+          : "files";
   const effectKind: DevicePeerEffectKind = readOnly ? "read_only" : "side_effect";
   if (command.capability !== toProtoCapability(capability)
     || command.effect !== (readOnly ? contract.DevicePeerEffectKind.READ_ONLY : contract.DevicePeerEffectKind.SIDE_EFFECT)) {
@@ -1080,6 +1093,14 @@ function completedPayloadCase(
     case "openTerminal": return "terminalOpened";
     case "openLoopbackForward": return "loopbackForwardOpened";
     case "listenLoopbackForward": return "loopbackListenerOpened";
+    case "getRemoteDesktopCapabilities": return "remoteDesktopCapabilities";
+    case "getRemoteDesktopPermissions": return "remoteDesktopPermissions";
+    case "startRemoteDesktop": return "remoteDesktopLease";
+    case "heartbeatRemoteDesktop":
+    case "setRemoteDesktopControl": return "remoteDesktopControlState";
+    case "createRemoteDesktopOffer": return "remoteDesktopOffer";
+    case "exchangeRemoteDesktopIce": return "remoteDesktopIce";
+    case "getRemoteDesktopFrame": return "remoteDesktopFrame";
     case "writeProcess":
     case "signalProcess":
     case "writeTerminal":
@@ -1091,7 +1112,10 @@ function completedPayloadCase(
     case "closeLoopbackForward":
     case "writeReverseForward":
     case "closeReverseForwardConnection":
-    case "closeLoopbackListener": return "acknowledgement";
+    case "closeLoopbackListener":
+    case "showRemoteDesktopPermissionGuide":
+    case "stopRemoteDesktop":
+    case "sendRemoteDesktopInput": return "acknowledgement";
     case undefined: throw protocolViolation("The Device peer command action is required.");
   }
 }
@@ -1126,7 +1150,7 @@ function responseFrame(
   lease: DevicePeerRouteAcceptedFrame,
   requestId: string,
   outcome: { readonly outcome: "completed"; readonly value: unknown }
-    | { readonly outcome: "failed" | "outcome_unknown"; readonly errorCode: string }
+    | { readonly outcome: "failed" | "outcome_unknown"; readonly errorCode: string; readonly failure?: unknown }
     | { readonly outcome: "aborted" }
 ): DevicePeerResponseFrame {
   return Object.freeze({
@@ -1239,6 +1263,7 @@ function toProtoCapability(value: DevicePeerCapability): contract.DevicePeerCapa
     case "process": return contract.DevicePeerCapabilityKind.PROCESS;
     case "terminal": return contract.DevicePeerCapabilityKind.TERMINAL;
     case "forwarding": return contract.DevicePeerCapabilityKind.FORWARDING;
+    case "remote_desktop": return contract.DevicePeerCapabilityKind.REMOTE_DESKTOP;
   }
 }
 
@@ -1248,6 +1273,7 @@ function fromProtoCapability(value: contract.DevicePeerCapabilityKind): DevicePe
     case contract.DevicePeerCapabilityKind.PROCESS: return "process";
     case contract.DevicePeerCapabilityKind.TERMINAL: return "terminal";
     case contract.DevicePeerCapabilityKind.FORWARDING: return "forwarding";
+    case contract.DevicePeerCapabilityKind.REMOTE_DESKTOP: return "remote_desktop";
     default: throw new ConnectError("The Device peer capability is invalid.", Code.InvalidArgument);
   }
 }

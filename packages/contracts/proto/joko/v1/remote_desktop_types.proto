@@ -1,0 +1,168 @@
+syntax = "proto3";
+
+package joko.v1;
+
+import "google/protobuf/timestamp.proto";
+
+// Portable Remote Desktop values shared by the authenticated controller
+// service and the target-side DevicePeer command route. Screen, signaling,
+// input, and lease payloads are ephemeral and must never be persisted.
+enum RemoteDesktopPermissionStatus {
+  REMOTE_DESKTOP_PERMISSION_STATUS_UNSPECIFIED = 0;
+  REMOTE_DESKTOP_PERMISSION_STATUS_GRANTED = 1;
+  REMOTE_DESKTOP_PERMISSION_STATUS_MISSING = 2;
+  REMOTE_DESKTOP_PERMISSION_STATUS_UNKNOWN = 3;
+  REMOTE_DESKTOP_PERMISSION_STATUS_NOT_REQUIRED = 4;
+}
+
+message RemoteDesktopPermissions {
+  RemoteDesktopPermissionStatus screen_recording = 1;
+  RemoteDesktopPermissionStatus accessibility = 2;
+}
+
+message RemoteDesktopDisplay {
+  string display_id = 1;
+  string name = 2;
+  uint32 width = 3;
+  uint32 height = 4;
+}
+
+message RemoteDesktopCapabilities {
+  uint32 protocol_version = 1;
+  bool enabled = 2;
+  bool can_control = 3;
+  string platform = 4;
+  repeated RemoteDesktopDisplay displays = 5;
+  RemoteDesktopPermissions permissions = 6;
+  bool automatic_reconnect = 7;
+  bool connection_takeover = 8;
+  bool webrtc_video = 9;
+  bool trickle_ice = 10;
+  bool jpeg_fallback = 11;
+}
+
+enum RemoteDesktopStartMode {
+  REMOTE_DESKTOP_START_MODE_UNSPECIFIED = 0;
+  REMOTE_DESKTOP_START_MODE_NEW = 1;
+  REMOTE_DESKTOP_START_MODE_RESUME = 2;
+  REMOTE_DESKTOP_START_MODE_TAKEOVER = 3;
+}
+
+enum RemoteDesktopMouseButton {
+  REMOTE_DESKTOP_MOUSE_BUTTON_UNSPECIFIED = 0;
+  REMOTE_DESKTOP_MOUSE_BUTTON_LEFT = 1;
+  REMOTE_DESKTOP_MOUSE_BUTTON_MIDDLE = 2;
+  REMOTE_DESKTOP_MOUSE_BUTTON_RIGHT = 3;
+}
+
+message RemoteDesktopPointerMoveInput {
+  double x = 1;
+  double y = 2;
+}
+
+message RemoteDesktopPointerButtonInput {
+  RemoteDesktopMouseButton button = 1;
+  bool down = 2;
+  double x = 3;
+  double y = 4;
+}
+
+message RemoteDesktopScrollInput {
+  double delta_x = 1;
+  double delta_y = 2;
+}
+
+message RemoteDesktopKeyInput {
+  string code = 1;
+  bool down = 2;
+}
+
+message RemoteDesktopTextInput {
+  string text = 1;
+}
+
+message RemoteDesktopReleaseInput {}
+
+message RemoteDesktopInputEvent {
+  oneof event {
+    RemoteDesktopPointerMoveInput move = 1;
+    RemoteDesktopPointerButtonInput button = 2;
+    RemoteDesktopScrollInput scroll = 3;
+    RemoteDesktopKeyInput key = 4;
+    RemoteDesktopTextInput text = 5;
+    RemoteDesktopReleaseInput release = 6;
+  }
+}
+
+message RemoteDesktopIceCandidate {
+  string candidate = 1;
+  optional string sdp_mid = 2;
+  optional uint32 sdp_m_line_index = 3;
+  optional string username_fragment = 4;
+}
+
+// Credentials, when present, are short lived and returned only for an active
+// lease. They must not enter Settings, Event, Session, logs, or diagnostics.
+message RemoteDesktopIceServer {
+  repeated string urls = 1;
+  optional string username = 2;
+  optional string credential = 3;
+  google.protobuf.Timestamp expires_at = 4;
+}
+
+message RemoteDesktopLease {
+  string lease_id = 1;
+  RemoteDesktopDisplay display = 2;
+  bool controlling = 3;
+}
+
+message RemoteDesktopControlState {
+  bool controlling = 1;
+}
+
+message RemoteDesktopOfferResult {
+  string attempt_id = 1;
+  string answer_sdp = 2;
+}
+
+message RemoteDesktopIceExchangeResult {
+  string attempt_id = 1;
+  repeated RemoteDesktopIceCandidate candidates = 2;
+  uint32 next = 3;
+  bool complete = 4;
+}
+
+message RemoteDesktopFrame {
+  bytes jpeg = 1;
+}
+
+// An absent frame means the bounded JPEG fallback is throttled or already has
+// one capture in flight; it never means that an older frame may be replayed.
+message RemoteDesktopFrameResult {
+  RemoteDesktopFrame frame = 1;
+}
+
+enum RemoteDesktopFailureReason {
+  REMOTE_DESKTOP_FAILURE_REASON_UNSPECIFIED = 0;
+  REMOTE_DESKTOP_FAILURE_REASON_DISABLED = 1;
+  REMOTE_DESKTOP_FAILURE_REASON_BUSY = 2;
+  REMOTE_DESKTOP_FAILURE_REASON_STOPPED = 3;
+  REMOTE_DESKTOP_FAILURE_REASON_LEASE_EXPIRED = 4;
+  REMOTE_DESKTOP_FAILURE_REASON_DISPLAY_MISSING = 5;
+  REMOTE_DESKTOP_FAILURE_REASON_SCREEN_PERMISSION_REQUIRED = 6;
+  REMOTE_DESKTOP_FAILURE_REASON_ACCESSIBILITY_PERMISSION_REQUIRED = 7;
+  REMOTE_DESKTOP_FAILURE_REASON_INPUT_UNAVAILABLE = 8;
+  REMOTE_DESKTOP_FAILURE_REASON_INPUT_BUSY = 9;
+  REMOTE_DESKTOP_FAILURE_REASON_VIEW_ONLY = 10;
+  REMOTE_DESKTOP_FAILURE_REASON_VIDEO_UNAVAILABLE = 11;
+  REMOTE_DESKTOP_FAILURE_REASON_VIDEO_BUSY = 12;
+  REMOTE_DESKTOP_FAILURE_REASON_VIDEO_TIMEOUT = 13;
+  REMOTE_DESKTOP_FAILURE_REASON_AUTHORITY_CHANGED = 14;
+  REMOTE_DESKTOP_FAILURE_REASON_UNSUPPORTED = 15;
+  REMOTE_DESKTOP_FAILURE_REASON_LOCKED_SESSION_UNSUPPORTED = 16;
+}
+
+message RemoteDesktopFailure {
+  RemoteDesktopFailureReason reason = 1;
+  bool retryable = 2;
+}

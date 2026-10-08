@@ -55,6 +55,10 @@ import {
   type MobileConnectionProfile, type MobileStorage, type PendingOperation
 } from "./connection-storage";
 import type { MobileDiscovery } from "./connection-discovery";
+import {
+  MobileRemoteDesktopAuthorityError,
+  type MobileRemoteDesktopTransport
+} from "./remote-desktop-controller";
 import type { MobileHomeStatusFilter } from "./home-navigation";
 import {
   MOBILE_BLOB_PREVIEW_MAXIMUM_BYTES,
@@ -783,6 +787,59 @@ export class MobileClient {
   ) { this.#filesThumbnails = new MobileFilesThumbnailReader(filesThumbnailDisk); }
 
   get state(): MobileState { return this.#state; }
+
+  remoteDesktopTransport(): MobileRemoteDesktopTransport | undefined {
+    const credential = this.#credential;
+    const ownerKey = this.#remoteDesktopOwnerKey(false);
+    if (!credential || !ownerKey || !this.network.listRemoteDesktopHosts || !this.network.getRemoteDesktopCapabilities
+      || !this.network.getRemoteDesktopPermissions || !this.network.showRemoteDesktopPermissionGuide
+      || !this.network.startRemoteDesktop || !this.network.heartbeatRemoteDesktop || !this.network.stopRemoteDesktop
+      || !this.network.setRemoteDesktopControl || !this.network.sendRemoteDesktopInput
+      || !this.network.getRemoteDesktopIceConfiguration || !this.network.createRemoteDesktopOffer
+      || !this.network.exchangeRemoteDesktopIce || !this.network.getRemoteDesktopFrame) return undefined;
+    const authoritySame = (): boolean => !this.#disposed && this.#credential === credential
+      && this.#remoteDesktopOwnerKey(false) === ownerKey;
+    const current = (): boolean => authoritySame() && this.#foreground && this.#state.status === "connected";
+    const checked = async <T>(operation: () => Promise<T>): Promise<T> => {
+      if (!current()) throw new MobileRemoteDesktopAuthorityError();
+      const value = await operation();
+      if (!current()) throw new MobileRemoteDesktopAuthorityError();
+      return value;
+    };
+    const route = (host: Parameters<MobileRemoteDesktopTransport["capabilities"]>[0]) => {
+      if (!host.route) throw new Error("The selected Remote Desktop host has no current route.");
+      return host.route;
+    };
+    return {
+      ownerKey,
+      isCurrent: current,
+      canStop: authoritySame,
+      listHosts: (signal) => checked(() => this.network.listRemoteDesktopHosts!(credential, signal)),
+      capabilities: (host, signal) => checked(() => this.network.getRemoteDesktopCapabilities!(credential, route(host), signal)),
+      permissions: (host, signal) => checked(() => this.network.getRemoteDesktopPermissions!(credential, route(host), signal)),
+      showPermissionGuide: (host, signal) => checked(() => this.network.showRemoteDesktopPermissionGuide!(credential, route(host), signal)),
+      start: (host, displayId, mode, signal) => checked(() =>
+        this.network.startRemoteDesktop!(credential, route(host), displayId, mode, signal)),
+      heartbeat: (host, leaseId, signal) => checked(() =>
+        this.network.heartbeatRemoteDesktop!(credential, route(host), leaseId, signal)),
+      stop: async (host, leaseId, signal) => {
+        if (!authoritySame()) throw new MobileRemoteDesktopAuthorityError();
+        await this.network.stopRemoteDesktop!(credential, route(host), leaseId, signal);
+      },
+      control: (host, leaseId, enabled, signal) => checked(() =>
+        this.network.setRemoteDesktopControl!(credential, route(host), leaseId, enabled, signal)),
+      input: (host, leaseId, sequence, events, signal) => checked(() =>
+        this.network.sendRemoteDesktopInput!(credential, route(host), leaseId, sequence, events, signal)),
+      iceConfiguration: (host, leaseId, signal) => checked(() =>
+        this.network.getRemoteDesktopIceConfiguration!(credential, route(host), leaseId, signal)),
+      offer: (host, leaseId, attemptId, sdp, signal) => checked(() =>
+        this.network.createRemoteDesktopOffer!(credential, route(host), leaseId, attemptId, sdp, signal)),
+      ice: (host, leaseId, attemptId, candidates, after, signal) => checked(() =>
+        this.network.exchangeRemoteDesktopIce!(credential, route(host), leaseId, attemptId, candidates, after, signal)),
+      frame: (host, leaseId, signal) => checked(() =>
+        this.network.getRemoteDesktopFrame!(credential, route(host), leaseId, signal))
+    };
+  }
 
   mobilePushLifecycleScope(): MobilePushLifecycleScope {
     return {
@@ -3360,6 +3417,24 @@ export class MobileClient {
       entityVersionKey(device.version),
       owner.generation.toString(10)
     ].join("\u001f");
+  }
+
+  #remoteDesktopOwnerKey(requireForeground: boolean): string | undefined {
+    const credential = this.#credential;
+    const owner = this.#state.owner;
+    if (!credential || !owner || (requireForeground && !this.#foreground)
+      || this.#state.activeProfileId !== credential.profileId || this.#state.node?.serverId !== credential.serverId
+      || owner.server?.serverId !== credential.serverId || owner.generation < 1n) return undefined;
+    const connections = owner.connections.filter((connection) => connection.connectionId === credential.connectionId);
+    const devices = owner.devices.filter((device) => device.deviceId === credential.deviceId);
+    const connection = connections.length === 1 ? connections[0] : undefined;
+    const device = devices.length === 1 ? devices[0] : undefined;
+    if (!connection || !device || connection.connectionProfileId !== credential.profileId
+      || connection.deviceId !== credential.deviceId || connection.state !== ConnectionState.CONNECTED
+      || device.kind !== DeviceKind.MOBILE || device.revoked
+      || !device.connectionIds.includes(credential.connectionId)) return undefined;
+    return [mobileCredentialKey(credential), entityVersionKey(connection.version), entityVersionKey(device.version),
+      owner.generation.toString(10)].join("\u001f");
   }
 
   #automationRequestCurrent(generation: number, controller: AbortController, authorityKey: string): boolean {

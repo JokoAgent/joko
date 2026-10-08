@@ -1,5 +1,7 @@
 import { randomUUID } from "node:crypto";
 
+import { clone, isMessage } from "@bufbuild/protobuf";
+import { DevicePeerCommandSchema, type DevicePeerCommand } from "@joko/contracts";
 import {
   DevicePeerRegistryError,
   DevicePeerRouteRegistry,
@@ -109,15 +111,28 @@ export class DevicePeerOwner {
   }
 
   list(controller: ConnectionRecord): readonly DevicePeerSelectionView[] {
+    return this.listForCapabilities(controller, REQUIRED_SELECTION_CAPABILITIES);
+  }
+
+  /**
+   * Lists an independently scoped capability surface without weakening the
+   * files+process selection semantics of list().
+   */
+  listForCapabilities(
+    controller: ConnectionRecord,
+    requiredCapabilities: readonly DevicePeerCapability[],
+    options: { readonly kind?: "desktop" | "service" } = {}
+  ): readonly DevicePeerSelectionView[] {
     const current = this.#currentConnection(controller);
     const controllerDevice = this.#store.getDevice(current.deviceId);
     if (controllerDevice.state !== "active") throw accessRevoked();
     const views: DevicePeerSelectionView[] = [];
-    for (const route of this.#routes.listRoutes()) {
-      if (route.targetDeviceId === current.deviceId || !hasCapabilities(route.capabilities, REQUIRED_SELECTION_CAPABILITIES)) {
+    for (const route of this.#routes.listRoutes(requiredCapabilities)) {
+      if (route.targetDeviceId === current.deviceId) {
         continue;
       }
       const target = this.#store.getDevice(route.targetDeviceId);
+      if (options.kind !== undefined && target.kind !== options.kind) continue;
       const relation = this.#store.getDeviceControlRelation(current.deviceId, target.id);
       if (!relationIsEffective(controllerDevice, target, relation)) continue;
       views.push(Object.freeze({
@@ -216,12 +231,13 @@ export class DevicePeerOwner {
     authority.assertCurrent([input.capability]);
     const claim = this.#routes.registerClaim({
       requestId: input.requestId ?? randomUUID(),
+      controllerDeviceId: authority.controllerDeviceId,
       targetDeviceId: authority.identity.targetDeviceId,
       routeGeneration: authority.identity.routeGeneration,
       capability: input.capability,
       effectKind: input.effectKind,
       action: input.action,
-      payload: input.payload
+      payload: injectControllerIdentity(input.payload, authority.controllerDeviceId)
     });
     try {
       const response = await this.#routes.dispatch(claim, input.signal);
@@ -257,12 +273,13 @@ export class DevicePeerOwner {
     authority.assertCurrent([input.capability]);
     const claim = this.#routes.registerClaim({
       requestId: input.requestId ?? randomUUID(),
+      controllerDeviceId: authority.controllerDeviceId,
       targetDeviceId: authority.identity.targetDeviceId,
       routeGeneration: authority.identity.routeGeneration,
       capability: input.capability,
       effectKind: input.effectKind,
       action: input.action,
-      payload: input.payload
+      payload: injectControllerIdentity(input.payload, authority.controllerDeviceId)
     });
     let authorityLost = false;
     let subscription!: { dispose(): void };
@@ -362,6 +379,20 @@ export class DevicePeerOwner {
     }
     return current;
   }
+}
+
+function injectControllerIdentity(payload: unknown, controllerDeviceId: string): unknown {
+  if (!isMessage(payload, DevicePeerCommandSchema)) return payload;
+  const command = payload as DevicePeerCommand;
+  if (command.controllerDeviceId !== "") {
+    throw new DevicePeerAuthorityError(
+      "invalid_identity",
+      "A Device peer command cannot provide its controller Device identity."
+    );
+  }
+  const injected = clone(DevicePeerCommandSchema, command);
+  injected.controllerDeviceId = controllerDeviceId;
+  return injected;
 }
 
 function selectionIdentity(

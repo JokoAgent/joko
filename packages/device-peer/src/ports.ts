@@ -1,5 +1,19 @@
 import type { Duplex, Readable, Writable } from "node:stream";
 
+import {
+  RemoteDesktopFailureReason,
+  type RemoteDesktopCapabilities,
+  type RemoteDesktopControlState,
+  type RemoteDesktopFrameResult,
+  type RemoteDesktopIceCandidate,
+  type RemoteDesktopIceExchangeResult,
+  type RemoteDesktopInputEvent,
+  type RemoteDesktopLease,
+  type RemoteDesktopOfferResult,
+  type RemoteDesktopPermissions,
+  type RemoteDesktopStartMode
+} from "@joko/contracts";
+
 export type DevicePeerFileKind = "file" | "directory" | "symbolic_link" | "other";
 
 export interface DevicePeerFileStat {
@@ -113,6 +127,63 @@ export interface DevicePeerTerminalTransportPort {
   open(request: DevicePeerTerminalStartRequest): Promise<DevicePeerTerminalHandle>;
 }
 
+export interface DevicePeerRemoteDesktopHostRequest {
+  /** Authenticated controller Device injected by the service route owner. */
+  readonly controllerDeviceId: string;
+  readonly signal: AbortSignal;
+}
+
+export interface DevicePeerRemoteDesktopLeaseRequest extends DevicePeerRemoteDesktopHostRequest {
+  readonly leaseId: string;
+}
+
+/**
+ * Target-host Remote Desktop boundary. Implementations live only in a trusted
+ * Desktop Main process; screen, signaling, input, and lease values remain
+ * transient and must never be persisted or exposed to a renderer bridge.
+ */
+export interface DevicePeerRemoteDesktopHostPort {
+  getCapabilities(request: DevicePeerRemoteDesktopHostRequest): Promise<RemoteDesktopCapabilities>;
+  getPermissions(request: DevicePeerRemoteDesktopHostRequest): Promise<RemoteDesktopPermissions>;
+  showPermissionGuide(request: DevicePeerRemoteDesktopHostRequest): Promise<void>;
+  start(request: DevicePeerRemoteDesktopHostRequest & {
+    readonly displayId: string;
+    readonly mode: RemoteDesktopStartMode;
+  }): Promise<RemoteDesktopLease>;
+  heartbeat(request: DevicePeerRemoteDesktopLeaseRequest): Promise<RemoteDesktopControlState>;
+  stop(request: DevicePeerRemoteDesktopLeaseRequest): Promise<void>;
+  setControl(request: DevicePeerRemoteDesktopLeaseRequest & {
+    readonly enabled: boolean;
+  }): Promise<RemoteDesktopControlState>;
+  sendInput(request: DevicePeerRemoteDesktopLeaseRequest & {
+    readonly sequence: bigint;
+    readonly events: readonly RemoteDesktopInputEvent[];
+  }): Promise<void>;
+  createOffer(request: DevicePeerRemoteDesktopLeaseRequest & {
+    readonly attemptId: string;
+    readonly offerSdp: string;
+  }): Promise<RemoteDesktopOfferResult>;
+  exchangeIce(request: DevicePeerRemoteDesktopLeaseRequest & {
+    readonly attemptId: string;
+    readonly candidates: readonly RemoteDesktopIceCandidate[];
+    readonly after: number;
+  }): Promise<RemoteDesktopIceExchangeResult>;
+  getFrame(request: DevicePeerRemoteDesktopLeaseRequest): Promise<RemoteDesktopFrameResult>;
+  /** Route retirement is a hard media/input ownership boundary. */
+  retire(): Promise<void>;
+}
+
+/** A definitive, typed host-domain rejection; transport failures stay generic. */
+export class DevicePeerRemoteDesktopHostError extends Error {
+  constructor(
+    readonly reason: RemoteDesktopFailureReason,
+    readonly retryable: boolean
+  ) {
+    super("Remote Desktop host request failed.");
+    this.name = "DevicePeerRemoteDesktopHostError";
+  }
+}
+
 export type DevicePeerLoopbackHost = "127.0.0.1" | "::1" | "localhost";
 
 export interface DevicePeerForwardRequest {
@@ -147,4 +218,5 @@ export interface DevicePeerCapabilityPorts {
   readonly processes?: DevicePeerProcessTransportPort;
   readonly terminals?: DevicePeerTerminalTransportPort;
   readonly forwarding?: DevicePeerForwardingTransportPort;
+  readonly remoteDesktop?: DevicePeerRemoteDesktopHostPort;
 }

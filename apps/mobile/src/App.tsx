@@ -291,6 +291,8 @@ import { mobileFilesThumbnailCache } from "./mobile-files-thumbnail-cache";
 import { MobileFilesClipboard, type MobileFilesClipboardLease, type MobileFilesClipboardResult } from "./mobile-files-clipboard";
 import type { MobileFilesPreferences } from "./mobile-files-presentation";
 import { MobileSettingsScreen } from "./MobileSettingsScreen";
+import { MobileRemoteDesktopScreen } from "./MobileRemoteDesktopScreen";
+import { mobileRemoteDesktopCopy, mobileRemoteDesktopSessionDeviceId } from "./remote-desktop-presentation";
 import { MobileVoiceDictionaryReadOnlyController } from "./mobile-voice-dictionary-readonly-controller";
 import { mobileReadOnlyDictionarySources } from "./mobile-voice-dictionary-readonly";
 import {
@@ -360,7 +362,13 @@ const mobileUpdateActions: MobileUpdateActions = {
   onOpenUpdate: (target) => mobileUpdates.openUpdate(target),
   onRecheckForced: () => mobileUpdates.recheckForced()
 };
-type Page = "home" | "connection" | "new" | "task" | "files" | "automations" | "partners" | "settings" | "connections" | "devices" | "device";
+type Page = "home" | "connection" | "new" | "task" | "files" | "automations" | "partners" | "settings" | "connections" | "devices" | "device" | "remote-desktop";
+
+interface MobileRemoteDesktopEntry {
+  readonly ownerKey: string;
+  readonly returnPage: "device" | "task";
+  readonly preferredDeviceId?: string;
+}
 
 interface MobilePhotoLibraryLease {
   readonly controls: MobileAttachmentControls;
@@ -529,7 +537,9 @@ export function App() {
   const [nativeIntentRecovery, setNativeIntentRecovery] = useState<MobileNativeIntentRecovery>();
   const [nativeIntentMessageFocus, setNativeIntentMessageFocus] = useState<MobileNativeIntentMessageFocus>();
   const [deviceId, setDeviceId] = useState<string>();
+  const [remoteDesktopEntry, setRemoteDesktopEntry] = useState<MobileRemoteDesktopEntry>();
   const [foreground, setForeground] = useState(AppState.currentState === "active");
+  const [remoteDesktopForeground, setRemoteDesktopForeground] = useState(AppState.currentState === "active");
   const dictionaryTransport = client.voiceDictionaryTransport();
   useEffect(() => {
     readOnlyDictionary.setSources(mobileReadOnlyDictionarySources(state.saved));
@@ -614,7 +624,10 @@ export function App() {
       diagnosticsTick = performance.now();
       setForeground(foreground);
       mobilePush.handleAppStateChange(status);
-      if (transition.transportForeground !== undefined) client.setForeground(transition.transportForeground);
+      if (transition.transportForeground !== undefined) {
+        client.setForeground(transition.transportForeground);
+        setRemoteDesktopForeground(transition.transportForeground);
+      }
       void mobileUpdates.handleAppStateChange(status);
       mobileDiagnostics.record("app.lifecycle", { state: mobileDiagnosticAppState(status) });
       if (foreground) void mobileIncomingShare.refresh().catch(() => undefined);
@@ -782,6 +795,19 @@ export function App() {
 
   const common = { colors, state, locale: locale.effectiveLocale };
   const connectionRequired = !state.activeProfileId;
+  const remoteDesktopTransport = client.remoteDesktopTransport();
+  const openRemoteDesktop = (returnPage: MobileRemoteDesktopEntry["returnPage"], preferredDeviceId?: string): void => {
+    const transport = client.remoteDesktopTransport();
+    if (!transport || !foreground || state.status !== "connected") return;
+    setRemoteDesktopEntry({ ownerKey: transport.ownerKey, returnPage, ...(preferredDeviceId ? { preferredDeviceId } : {}) });
+    setPage("remote-desktop");
+  };
+  const closeRemoteDesktop = (): void => {
+    const target = remoteDesktopEntry?.returnPage;
+    setRemoteDesktopEntry(undefined);
+    setPage(target === "device" && deviceId && state.owner?.devices.some((device) => device.deviceId === deviceId)
+      ? "device" : target === "task" && state.selectedId ? "task" : "home");
+  };
   const queueHomeMenuAction = (action: () => void): void => {
     if (pendingHomeMenuActionRef.current) return;
     pendingHomeMenuActionRef.current = action;
@@ -840,7 +866,14 @@ export function App() {
                   }}
                   focusComposer={focusTaskComposer} onComposerFocused={handleComposerFocused}
                   onOpenDerivationOrigin={openDerivationOrigin}
+                  onRemoteDesktop={(targetDeviceId) => openRemoteDesktop("task", targetDeviceId)}
                   messageFocus={nativeIntentMessageFocus} /> :
+                page === "remote-desktop" && remoteDesktopEntry ? <MobileRemoteDesktopScreen
+                  transport={remoteDesktopTransport?.ownerKey === remoteDesktopEntry.ownerKey ? remoteDesktopTransport : undefined}
+                  preferredDeviceId={remoteDesktopEntry.preferredDeviceId} interactive={foreground}
+                  foreground={remoteDesktopForeground}
+                  online={state.status === "connected"} colors={colors} locale={locale.effectiveLocale}
+                  onClose={closeRemoteDesktop} /> :
                 page === "files" ? <FilesScreen {...common} initialSource={filesInitialSource} onBack={() => setPage("task")}
                   onAdded={() => {
                     setFocusTaskComposer(true);
@@ -897,7 +930,8 @@ export function App() {
                   onSwitch={() => setPage("connection")} /> :
                 page === "devices" ? <DevicesScreen {...common} onBack={() => setPage("home")}
                   onDevice={(id) => { setDeviceId(id); setPage("device"); }} /> :
-                page === "device" && deviceId ? <DeviceScreen {...common} deviceId={deviceId} onBack={() => setPage("devices")} /> :
+                page === "device" && deviceId ? <DeviceScreen {...common} deviceId={deviceId} onBack={() => setPage("devices")}
+                  onRemoteDesktop={() => openRemoteDesktop("device", deviceId)} /> :
                 <SessionsScreen {...common} onNew={() => setPage("new")} onSelect={() => setPage("task")}
                   incomingShare={incomingShare} onOpenShare={() => setPage("new")}
                   menuButtonRef={homeMenuButtonRef} searchFocusRequest={homeSearchFocusRequest}
@@ -1436,7 +1470,9 @@ function DevicesScreen({ colors, state, locale, onBack, onDevice }: ScreenProps 
   </View>;
 }
 
-function DeviceScreen({ colors, state, locale, deviceId, onBack }: ScreenProps & { deviceId: string; onBack: () => void }) {
+function DeviceScreen({ colors, state, locale, deviceId, onBack, onRemoteDesktop }: ScreenProps & {
+  deviceId: string; onBack: () => void; onRemoteDesktop: () => void;
+}) {
   const [localError, setLocalError] = useState("");
   const device = state.owner?.devices.find((candidate) => candidate.deviceId === deviceId);
   const activeDeviceId = state.saved.find((profile) => profile.profileId === state.activeProfileId)?.deviceId;
@@ -1464,6 +1500,8 @@ function DeviceScreen({ colors, state, locale, deviceId, onBack }: ScreenProps &
       <InformationRow label={mobileMessage(locale, "devices.lastSeen")} value={timestampLabel(device.lastSeenAt, locale)} colors={colors} />
       <InformationRow label={mobileMessage(locale, "settings.deviceId")} value={device.deviceId} colors={colors} selectable />
     </View>
+    {device.kind === DeviceKind.DESKTOP && !device.revoked && <Action label={mobileRemoteDesktopCopy(locale).title}
+      colors={colors} disabled={state.status !== "connected"} onPress={onRemoteDesktop} />}
     {device.deviceId === activeDeviceId
       ? <Text style={[styles.description, { color: colors.muted }]}>{mobileMessage(locale, "devices.currentConnection")}</Text>
       : !device.revoked && <Action label={mobileMessage(locale, "common.revokeDevice")} colors={colors} danger
@@ -2992,10 +3030,11 @@ function NewTaskScreen({ colors, state, locale, onBack, onCreated, onImportedExi
   </ScrollView>;
 }
 
-function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onOpenPartnerThread, focusComposer, onComposerFocused,
+function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onOpenPartnerThread, onRemoteDesktop, focusComposer, onComposerFocused,
   messageFocus, onOpenDerivationOrigin }: ScreenProps & {
   onBack: () => void; onHome: () => void; onNew: () => void; onFiles: (source?: MobileFilesComposerSource) => void;
   onOpenPartnerThread: (preview: NonNullable<TimelineRow["partnerPrivatePreview"]>) => void;
+  onRemoteDesktop: (targetDeviceId: string) => void;
   focusComposer: boolean; onComposerFocused: () => void;
   messageFocus?: MobileNativeIntentMessageFocus;
   onOpenDerivationOrigin: (authorityKey: string, signal: AbortSignal) => Promise<boolean>;
@@ -3189,6 +3228,9 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
   const pendingDrawerActionRef = useRef<(() => void) | undefined>(undefined);
   const session = state.detail?.sessions.find((item) => item.sessionId === state.selectedId)
     || state.owner?.sessions.find((item) => item.sessionId === state.selectedId);
+  const remoteDesktopControllerDeviceId = state.saved.find((profile) => profile.profileId === state.activeProfileId)?.deviceId;
+  const remoteDesktopDeviceId = mobileRemoteDesktopSessionDeviceId(session,
+    state.detail?.targets.length ? state.detail.targets : state.owner?.targets ?? [], remoteDesktopControllerDeviceId);
   const actualSessionStreaming = state.status === "connected" && session?.state === SessionState.RUNNING;
   const blockOwnerKey = JSON.stringify([state.activeProfileId ?? "", state.selectedId ?? "", session?.backendId ?? "",
     session?.targetId ?? "", session?.nativeBinding?.runtimeGeneration.toString() ?? ""]);
@@ -5352,6 +5394,9 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
         { id: "controls", label: mobileMessage(locale, "task.controls"),
           onPress: () => { setSessionMentionsVisible(false); setWorkspaceMentionsVisible(false); setCatalogMentionsVisible(false); setNativeTreeVisible(false); setContextVisible(false); setRuntimeControlsVisible(true); },
           disabled: state.status !== "connected" || !runtimeControlsAvailable || state.busy || attachmentBusy || voice.busy || interactions.length > 0 },
+        ...(remoteDesktopDeviceId ? [{ id: "remote-desktop" as const, label: mobileRemoteDesktopCopy(locale).title,
+          onPress: () => onRemoteDesktop(remoteDesktopDeviceId),
+          disabled: state.status !== "connected" || state.busy || attachmentBusy || voice.busy }] : []),
         { id: "copy-link", label: mobileMessage(locale, copyBusy ? "actions.copyingLink" : "actions.copyTaskLink"),
           onPress: () => void copyPublicTaskLink(),
           disabled: copyBusy || session === undefined || (state.status !== "connected" && state.status !== "offline") },

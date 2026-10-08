@@ -18,6 +18,8 @@ export * from "./gen/joko/v1/operation_pb.js";
 export * from "./gen/joko/v1/partner_pb.js";
 export * from "./gen/joko/v1/pi_pb.js";
 export * from "./gen/joko/v1/portable_session_pb.js";
+export * from "./gen/joko/v1/remote_desktop_pb.js";
+export * from "./gen/joko/v1/remote_desktop_types_pb.js";
 export * from "./gen/joko/v1/remote_host_pb.js";
 export * from "./gen/joko/v1/runtime_pb.js";
 export * from "./gen/joko/v1/review_pb.js";

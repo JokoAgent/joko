@@ -68,6 +68,7 @@ import { DedicatedHardwareSettings } from "./DedicatedHardwareSettings.js";
 import { DesktopAutoRelaunchSetting } from "./DesktopAutoRelaunchSetting.js";
 import { DesktopMainWindowCloseSetting } from "./DesktopMainWindowCloseSetting.js";
 import { DesktopBetaChannelSetting } from "./DesktopBetaChannelSetting.js";
+import { DesktopRemoteDesktopSettings } from "./DesktopRemoteDesktopSettings.js";
 import { PersonalizationMemorySettings } from "./PersonalizationMemorySettings.js";
 import { PromptRecommendationCell } from "./PromptRecommendationCell.js";
 import { SilentEncryptedRetryCell } from "./SilentEncryptedRetryCell.js";
@@ -119,7 +120,7 @@ export const SETTINGS_NAV_SECTION_IDS = [
   "about"
 ] as const;
 type SettingsSection = typeof SETTINGS_NAV_SECTION_IDS[number];
-type SettingsSubsection = "appearance" | "policy" | "pi" | "backends" | "credentials" | "remoteHosts" | "mcp" | "diagnostics" | "runtime";
+type SettingsSubsection = "appearance" | "policy" | "pi" | "backends" | "credentials" | "remoteDesktop" | "remoteHosts" | "mcp" | "diagnostics" | "runtime";
 interface SettingsLocation {
   readonly section: SettingsSection;
   readonly subsection?: SettingsSubsection;
@@ -155,6 +156,7 @@ const SETTINGS_SUBSECTION_PARENTS: Readonly<Record<SettingsSubsection, SettingsS
   pi: "general",
   backends: "about",
   credentials: "providers",
+  remoteDesktop: "connections",
   remoteHosts: "connections",
   mcp: "tools",
   diagnostics: "about",
@@ -301,7 +303,7 @@ export function SettingsPage({ controller, snapshot, activeTargetId, locale, t, 
             {section === "shortcuts" && <><AppShortcutsSettings controller={controller} overrides={controller.state.preferences.appShortcutOverrides} t={t} /><DedicatedHardwareSettings t={t} bridge={dedicatedHardwareBridge} listSkills={controller.listSkills} serverId={controller.state.activeProfile?.serverId} connected={controller.state.connectionState === "connected"} /><GamepadSettings t={t} listSkills={controller.listSkills} serverId={controller.state.activeProfile?.serverId} connected={controller.state.connectionState === "connected"} /></>}
             {section === "voice" && <VoiceInputSettings controller={controller} t={t} />}
             {section === "taskStatus" && <><SettingsHeading title={t("settings.nativeTaskStatus.title")} body={t("settings.nativeTaskStatus.body")} /><NativeTaskStatusSettings t={t} showHeading={false} /></>}
-            {section === "connections" && <><SettingsHeading title={t("settings.connections")} body={t("settings.connectionsBody")} /><SettingsPageSection id="connections"><ConnectionSettings controller={controller} snapshot={snapshot} locale={locale} t={t} runAction={runAction} showHeading={false} /></SettingsPageSection><SettingsPageSection id="remoteHosts"><RemoteHostsSettings controller={controller} snapshot={snapshot} activeTargetId={activeTargetId} runAction={runAction} t={t} /></SettingsPageSection><SshKeySettings controller={controller} t={t} /></>}
+            {section === "connections" && <><SettingsHeading title={t("settings.connections")} body={t("settings.connectionsBody")} /><SettingsPageSection id="remoteDesktop"><SettingsSectionHeading title={t("settings.remoteDesktop.title")} body={t("settings.remoteDesktop.body")} /><DesktopRemoteDesktopSettings t={t} /></SettingsPageSection><SettingsPageSection id="connections"><ConnectionSettings controller={controller} snapshot={snapshot} locale={locale} t={t} runAction={runAction} showHeading={false} /></SettingsPageSection><SettingsPageSection id="remoteHosts"><RemoteHostsSettings controller={controller} snapshot={snapshot} activeTargetId={activeTargetId} runAction={runAction} t={t} /></SettingsPageSection><SshKeySettings controller={controller} t={t} /></>}
             {section === "providers" && <SettingsPageSection id="providers"><ProviderSettings controller={controller} snapshot={snapshot} runAction={runAction} onSuccess={showSuccess} initialView={subsection === "credentials" ? "credentials" : undefined} t={t} /></SettingsPageSection>}
             {section === "tools" && <><SettingsHeading title={t("settings.toolPolicies.nav")} body={t("settings.toolsBody")} /><SettingsPageSection id="tools"><SettingsSectionHeading title={t("settings.toolPolicies.title")} body={t("settings.toolPolicies.body")} /><ToolPolicySettings controller={controller} snapshot={snapshot} activeTargetId={activeTargetId} runAction={runAction} showHeading={false} t={t} /></SettingsPageSection><SettingsPageSection id="mcp"><McpSettings controller={controller} snapshot={snapshot} runAction={runAction} t={t} /></SettingsPageSection></>}
             {section === "automation" && <AutomationSettings controller={controller} snapshot={snapshot} activeTargetId={activeTargetId} runAction={runAction} onSuccess={showSuccess} t={t} />}

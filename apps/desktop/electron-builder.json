@@ -101,6 +101,15 @@
       ]
     },
     {
+      "from": "dist/native-remote-desktop",
+      "to": "native-remote-desktop",
+      "filter": [
+        "manifest.json",
+        "joko-macos-remote-desktop-input",
+        "joko-windows-remote-desktop-input.exe"
+      ]
+    },
+    {
       "from": "dist/native-simulator-hid",
       "to": "native-simulator-hid",
       "filter": [

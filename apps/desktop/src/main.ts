@@ -52,6 +52,8 @@ import {
   type DesktopManagedOrchestratorConnection,
   type DesktopManagedOrchestratorRecoveryReason,
   type DesktopManagedOrchestratorStatus,
+  type DesktopRemoteDesktopPermissions,
+  type DesktopRemoteDesktopSnapshot,
   type DesktopMainWindowCloseSettings,
   type DesktopLocale,
   type DesktopSystemLocale,
@@ -343,6 +345,16 @@ import {
   resolveDesktopDevicePeerRuntimeRoot
 } from "./device-peer-runtime-executables.js";
 import {
+  createDesktopRemoteDesktopMainHost,
+  readDesktopRemoteDesktopPermissions,
+  showDesktopRemoteDesktopPermissionGuide
+} from "./remote-desktop-main.js";
+import type { DesktopRemoteDesktopHost } from "./remote-desktop-host.js";
+import {
+  createDesktopRemoteDesktopSettingsStore,
+  type DesktopRemoteDesktopSettingsStore
+} from "./remote-desktop-settings.js";
+import {
   atomicWritePrivateFile,
   atomicWriteUserSelectedFile,
   deletePrivateFile,
@@ -395,7 +407,10 @@ import { fetchDesktopUpdateManifestVersion } from "./update-manifest.js";
 import { createDesktopUpdateService, type DesktopUpdateService } from "./update-service.js";
 import { runDesktopUpdateStartupCheck } from "./update-startup.js";
 import { popUpDesktopTrayMenu, usesJavaScriptTrayMenuPopup } from "./tray-menu.js";
-import { resolveDesktopTrayMenuLabels } from "./i18n/tray-menu.js";
+import {
+  resolveDesktopRemoteDesktopTrayLabels,
+  resolveDesktopTrayMenuLabels
+} from "./i18n/tray-menu.js";
 import {
   desktopMainWindowCloseLabels,
   desktopRuntimeResourceWindowTitle,
@@ -703,6 +718,9 @@ let managedOrchestratorStatus: DesktopManagedOrchestratorStatus = process.env["J
   : { state: "starting" };
 let managedOrchestratorInitialization: Promise<DesktopManagedOrchestratorStatus> | undefined;
 let desktopDevicePeerAgentLifecycle: DesktopDevicePeerAgentLifecycle | undefined;
+let desktopRemoteDesktopSettings: DesktopRemoteDesktopSettingsStore | undefined;
+let desktopRemoteDesktopHost: DesktopRemoteDesktopHost | undefined;
+let desktopRemoteDesktopBroadcastGeneration = 0;
 const managedOrchestratorExitFence = createManagedExitFence({
   getInitialization: () => managedOrchestratorInitialization,
   clearInitialization: (initialization) => {
@@ -977,6 +995,10 @@ if (!app.requestSingleInstanceLock()) {
     await initializeDesktopKeepAwake();
     initializeNativeGamepad();
     await initializeDedicatedHardwareInput();
+    desktopRemoteDesktopSettings = createDesktopRemoteDesktopSettingsStore(
+      join(app.getPath("userData"), "remote-desktop-settings.json")
+    );
+    await desktopRemoteDesktopSettings.initialize();
     registerIpc();
     installMicrophoneLifecycle();
     installProviderModelPowerLifecycle();
@@ -5899,11 +5921,49 @@ function buildTrayContextMenu(): Menu {
     applicationMenuLocale,
     managedOrchestratorStatus.state !== "disabled" || managedOrchestratorRuntime !== undefined
   );
-  return Menu.buildFromTemplate([
+  const remoteDesktopLabels = resolveDesktopRemoteDesktopTrayLabels(applicationMenuLocale);
+  const remoteDesktopEnabled = desktopRemoteDesktopSettings?.get().enabled ?? false;
+  const remoteDesktopState = desktopRemoteDesktopHost?.state;
+  const template: Electron.MenuItemConstructorOptions[] = [
     { label: labels.open, click: showMainWindow },
     { type: "separator" },
+    {
+      label: remoteDesktopLabels.allow,
+      type: "checkbox",
+      checked: remoteDesktopEnabled,
+      enabled: desktopRemoteDesktopSettings !== undefined,
+      click: (item) => {
+        void setDesktopRemoteDesktopEnabled(item.checked).catch(() => {
+          void dialog.showMessageBox({
+            type: "error",
+            title: "Remote Desktop",
+            message: "Joko could not update the Remote Desktop setting.",
+            buttons: ["OK"],
+            noLink: true
+          });
+        });
+      }
+    },
+    ...(remoteDesktopState === undefined ? [] : [
+      {
+        label: remoteDesktopState.controlling
+          ? remoteDesktopLabels.controlling
+          : remoteDesktopLabels.viewing,
+        enabled: false
+      },
+      {
+        label: remoteDesktopLabels.disconnect,
+        click: () => {
+          desktopRemoteDesktopHost?.disconnect();
+          refreshTrayContextMenu();
+          void broadcastDesktopRemoteDesktopSnapshot();
+        }
+      }
+    ] satisfies Electron.MenuItemConstructorOptions[]),
+    { type: "separator" },
     { label: labels.quit, click: () => app.quit() }
-  ]);
+  ];
+  return Menu.buildFromTemplate(template);
 }
 
 function openTrayContextMenu(): void {
@@ -6760,6 +6820,49 @@ function sameManagedOrchestratorConnection(
     left.serverId === right.serverId && left.name === right.name && left.origin === right.origin;
 }
 
+function requireDesktopRemoteDesktopSettings(): DesktopRemoteDesktopSettingsStore {
+  const settings = desktopRemoteDesktopSettings;
+  if (settings === undefined) throw new Error("Desktop Remote Desktop settings are unavailable.");
+  return settings;
+}
+
+async function desktopRemoteDesktopSnapshot(): Promise<DesktopRemoteDesktopSnapshot> {
+  const permissions = await readDesktopRemoteDesktopPermissions() as DesktopRemoteDesktopPermissions;
+  const enabled = requireDesktopRemoteDesktopSettings().get().enabled;
+  const state = desktopRemoteDesktopHost?.state;
+  return state === undefined
+    ? Object.freeze({ enabled, active: false, controlling: false, permissions })
+    : Object.freeze({
+        enabled,
+        active: true,
+        controlling: state.controlling,
+        controllerDeviceId: state.controllerDeviceId,
+        displayId: state.displayId,
+        permissions
+      });
+}
+
+async function setDesktopRemoteDesktopEnabled(
+  enabled: boolean
+): Promise<DesktopRemoteDesktopSnapshot> {
+  if (!enabled) desktopRemoteDesktopHost?.disconnect();
+  await requireDesktopRemoteDesktopSettings().setEnabled(enabled);
+  refreshTrayContextMenu();
+  const snapshot = await desktopRemoteDesktopSnapshot();
+  void broadcastDesktopRemoteDesktopSnapshot();
+  return snapshot;
+}
+
+async function broadcastDesktopRemoteDesktopSnapshot(): Promise<void> {
+  const generation = ++desktopRemoteDesktopBroadcastGeneration;
+  const snapshot = await desktopRemoteDesktopSnapshot().catch(() => undefined);
+  if (snapshot === undefined || generation !== desktopRemoteDesktopBroadcastGeneration) return;
+  const window = mainWindow;
+  if (window === undefined || window.isDestroyed() || window.webContents.isDestroyed()) return;
+  try { window.webContents.send(DESKTOP_CHANNELS.remoteDesktopStateChanged, snapshot); }
+  catch { /* The main Document retired while permissions were being inspected. */ }
+}
+
 function initializeDesktopDevicePeerAgentLifecycle(): void {
   if (desktopDevicePeerAgentLifecycle !== undefined) return;
   let terminalPort: ReturnType<typeof createAuditedDesktopDevicePeerTerminalPort> | undefined;
@@ -6785,6 +6888,27 @@ function initializeDesktopDevicePeerAgentLifecycle(): void {
         environment: process.env
       });
       const [terminals, locatedExecutables] = await Promise.all([terminalPort, runtimeExecutables]);
+      const settings = requireDesktopRemoteDesktopSettings();
+      let remoteDesktop!: DesktopRemoteDesktopHost;
+      remoteDesktop = createDesktopRemoteDesktopMainHost({
+        sourceDirectory,
+        settings,
+        getMainWindow: () => mainWindow,
+        changed: () => {
+          if (desktopRemoteDesktopHost === remoteDesktop) {
+            void broadcastDesktopRemoteDesktopSnapshot();
+            refreshTrayContextMenu();
+          }
+        },
+        retired: () => {
+          if (desktopRemoteDesktopHost !== remoteDesktop) return;
+          desktopRemoteDesktopHost = undefined;
+          void broadcastDesktopRemoteDesktopSnapshot();
+          refreshTrayContextMenu();
+        }
+      });
+      desktopRemoteDesktopHost = remoteDesktop;
+      void broadcastDesktopRemoteDesktopSnapshot();
       return new DesktopDevicePeerAgentExecutor({
         recentDirectoriesPath: join(
           app.getPath("userData"),
@@ -6792,7 +6916,8 @@ function initializeDesktopDevicePeerAgentLifecycle(): void {
           "recent-directories.json"
         ),
         terminals,
-        runtimeExecutables: locatedExecutables
+        runtimeExecutables: locatedExecutables,
+        remoteDesktop
       });
     },
     readAuthKey: readCredential,
@@ -8215,6 +8340,40 @@ function registerIpc(): void {
     assertTrustedIpcSender(event);
     if (parameters.length !== 0) throw new TypeError("Managed Orchestrator logout completion does not accept parameters.");
     return completeCurrentManagedOrchestratorLogout();
+  });
+  ipcMain.handle(DESKTOP_CHANNELS.remoteDesktopGetState, async (event, ...parameters: unknown[]) => {
+    if (parameters.length !== 1) throw new TypeError("Remote Desktop state requires one Document occurrence.");
+    assertCurrentMainApplicationDocumentSender(event, parameters[0]);
+    return desktopRemoteDesktopSnapshot();
+  });
+  ipcMain.handle(DESKTOP_CHANNELS.remoteDesktopSetEnabled, async (event, ...parameters: unknown[]) => {
+    if (parameters.length !== 2 || typeof parameters[1] !== "boolean") {
+      throw new TypeError("Remote Desktop enabled state requires one Document occurrence and one boolean.");
+    }
+    assertCurrentMainApplicationDocumentSender(event, parameters[0]);
+    return setDesktopRemoteDesktopEnabled(parameters[1]);
+  });
+  ipcMain.handle(DESKTOP_CHANNELS.remoteDesktopDisconnect, async (event, ...parameters: unknown[]) => {
+    if (parameters.length !== 1) throw new TypeError("Remote Desktop disconnect requires one Document occurrence.");
+    assertCurrentMainApplicationDocumentSender(event, parameters[0]);
+    desktopRemoteDesktopHost?.disconnect();
+    refreshTrayContextMenu();
+    const snapshot = await desktopRemoteDesktopSnapshot();
+    void broadcastDesktopRemoteDesktopSnapshot();
+    return snapshot;
+  });
+  ipcMain.handle(DESKTOP_CHANNELS.remoteDesktopGetPermissions, async (event, ...parameters: unknown[]) => {
+    if (parameters.length !== 1) throw new TypeError("Remote Desktop permissions require one Document occurrence.");
+    assertCurrentMainApplicationDocumentSender(event, parameters[0]);
+    return readDesktopRemoteDesktopPermissions();
+  });
+  ipcMain.handle(DESKTOP_CHANNELS.remoteDesktopShowPermissionGuide, async (event, ...parameters: unknown[]) => {
+    if (parameters.length !== 1) throw new TypeError("Remote Desktop permission guide requires one Document occurrence.");
+    assertCurrentMainApplicationDocumentSender(event, parameters[0]);
+    await showDesktopRemoteDesktopPermissionGuide(mainWindow);
+    const permissions = await readDesktopRemoteDesktopPermissions();
+    void broadcastDesktopRemoteDesktopSnapshot();
+    return permissions;
   });
   ipcMain.handle(DESKTOP_CHANNELS.credentialGet, async (event, profileId: string) => {
     assertTrustedIpcSender(event);

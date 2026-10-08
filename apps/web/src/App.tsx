@@ -27,6 +27,7 @@ import { DesktopWindowControls } from "./components/DesktopWindowControls.js";
 import { DesktopPageSearchBar } from "./components/DesktopPageSearchBar.js";
 import { StartupUpdateOverlay } from "./components/StartupUpdateOverlay.js";
 import { NativeTaskStatusBridge } from "./components/NativeTaskStatusBridge.js";
+import { DesktopRemoteDesktopStatus } from "./components/DesktopRemoteDesktopStatus.js";
 import { DesktopGlobalVoiceBridge } from "./components/DesktopGlobalVoiceBridge.js";
 import { RuntimeProcessMonitorBroker } from "./components/RuntimeProcessMonitorBroker.js";
 import { RuntimeProcessMonitorWindow } from "./components/RuntimeProcessMonitorWindow.js";
@@ -2161,6 +2162,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
         ownsProjection={!auxiliaryApplicationWindow}
         visibleSessionIds={nativeTaskStatusVisibleSessionIds}
       />
+      <DesktopRemoteDesktopStatus t={t} />
       <a className="skip-link" href="#main-content">{t("app.skipToContent")}</a>
       <DesktopPageSearchBar overrides={shortcutOverrides} t={t} />
       {applicationMenuFeedback}

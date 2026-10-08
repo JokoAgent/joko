@@ -135,6 +135,12 @@ export const DESKTOP_CHANNELS = {
   managedOrchestratorRetry: "joko:managed-orchestrator:retry",
   managedOrchestratorAdoptConnection: "joko:managed-orchestrator:adopt-connection",
   managedOrchestratorCompleteLogout: "joko:managed-orchestrator:complete-logout",
+  remoteDesktopGetState: "joko:remote-desktop:get-state",
+  remoteDesktopSetEnabled: "joko:remote-desktop:set-enabled",
+  remoteDesktopDisconnect: "joko:remote-desktop:disconnect",
+  remoteDesktopGetPermissions: "joko:remote-desktop:get-permissions",
+  remoteDesktopShowPermissionGuide: "joko:remote-desktop:show-permission-guide",
+  remoteDesktopStateChanged: "joko:remote-desktop:state-changed",
   openExternal: "joko:external:open",
   updateGetStatus: "joko:update:get-status",
   updateStatus: "joko:update:status",
@@ -164,6 +170,26 @@ export function isInspectorWindowOpenRequest(url: unknown, frameName: unknown): 
 
 export type DesktopLocale = "en" | "zh-CN" | "en-XA";
 export type DesktopSystemLocale = Exclude<DesktopLocale, "en-XA">;
+
+export type DesktopRemoteDesktopPermissionStatus =
+  | "granted"
+  | "missing"
+  | "unknown"
+  | "notRequired";
+
+export interface DesktopRemoteDesktopPermissions {
+  readonly screenRecording: DesktopRemoteDesktopPermissionStatus;
+  readonly accessibility: DesktopRemoteDesktopPermissionStatus;
+}
+
+export interface DesktopRemoteDesktopSnapshot {
+  readonly enabled: boolean;
+  readonly active: boolean;
+  readonly controlling: boolean;
+  readonly controllerDeviceId?: string;
+  readonly displayId?: string;
+  readonly permissions: DesktopRemoteDesktopPermissions;
+}
 
 export const DESKTOP_PAGE_SEARCH_MAX_TEXT_LENGTH = 4_096;
 
