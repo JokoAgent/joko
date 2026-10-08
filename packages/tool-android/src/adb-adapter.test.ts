@@ -77,6 +77,20 @@ describe("ADB parsers and validators", () => {
     });
     expect(JSON.stringify(parsed)).not.toContain("hunter2");
   });
+
+  it("decodes complete UI text and descriptions once while preserving illegal XML character references", () => {
+    const invalid = "Invalid &#0; &#1; &#xD800; &#55296; &#xDFFF; &#xFFFE; &#x110000; &#1114112; end";
+    const xml = '<hierarchy><node text="Complete canonical music description&#10;第二段保留完整内容" '
+      + 'content-desc="Cover&#xA;封面 &#x1F3B5; &#128512; &quot;detail&quot; &apos;tag&apos; &lt;label&gt; '
+      + '&amp;#10; &#38;#10; &amp;#xA; &amp;amp;" bounds="[0,0][100,40]"/>'
+      + `<node text="${invalid}" bounds="[0,40][100,80]"/></hierarchy>`;
+
+    expect(parseAndroidUiNodes(xml).nodes).toMatchObject([
+      { text: "Complete canonical music description\n第二段保留完整内容",
+        contentDescription: "Cover\n封面 🎵 😀 \"detail\" 'tag' <label> &#10; &#10; &#xA; &amp;" },
+      { text: invalid }
+    ]);
+  });
 });
 
 describe("AdbCliAdapter", () => {

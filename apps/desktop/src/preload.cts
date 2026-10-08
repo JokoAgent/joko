@@ -40,6 +40,9 @@ import type {
   DesktopNativeTaskStatusSoundId,
   DesktopNativeTaskStatusSettings,
   DesktopNativeTaskStatusSnapshot,
+  DesktopNativeGamepadClientState,
+  DesktopNativeGamepadDevice,
+  DesktopNativeGamepadSnapshot,
   DesktopNotification,
   DesktopPageSearchRequest,
   DesktopPageSearchResult,
@@ -52,6 +55,9 @@ import type {
   DesktopCopyFileResult,
   DesktopOpenFileRequest,
   DesktopOpenFileResult,
+  DesktopListOpenWithAppsRequest,
+  DesktopListOpenWithAppsResult,
+  DesktopOpenFileWithAppRequest,
   DesktopRevealArtifactSourceRequest,
   DesktopRevealArtifactSourceResult,
   DesktopRuntimeProcessMonitorOpenResult,
@@ -189,6 +195,11 @@ const DESKTOP_CHANNELS = {
   dedicatedHardwareStateChanged: "joko:hardware-input:state:changed",
   dedicatedHardwareAction: "joko:hardware-input:action",
   dedicatedHardwarePreviewInput: "joko:hardware-input:preview:input",
+  nativeGamepadCaptureDocument: "joko:native-gamepad:document:capture",
+  nativeGamepadGetSnapshot: "joko:native-gamepad:snapshot:get",
+  nativeGamepadSetClientState: "joko:native-gamepad:client-state:set",
+  nativeGamepadProbe: "joko:native-gamepad:probe",
+  nativeGamepadSnapshot: "joko:native-gamepad:snapshot",
   chooseFiles: "joko:files:choose",
   choosePortableSessionFile: "joko:portable-session:choose",
   deepLinkTakePending: "joko:deep-link:take-pending",
@@ -199,6 +210,10 @@ const DESKTOP_CHANNELS = {
   cancelFileCopy: "joko:files:copy-cancel",
   openFile: "joko:files:open",
   cancelFileOpen: "joko:files:open-cancel",
+  openWithCaptureDocument: "joko:files:open-with:document:capture",
+  listOpenWithApps: "joko:files:open-with:list",
+  retireOpenWithApps: "joko:files:open-with:retire",
+  openFileWithApp: "joko:files:open-with:open",
   revealArtifactSource: "joko:files:reveal-artifact-source",
   cancelArtifactSourceReveal: "joko:files:reveal-artifact-source-cancel",
   credentialGet: "joko:credential:get",
@@ -237,6 +252,18 @@ const mainDocumentOccurrenceValue: unknown = ipcRenderer.sendSync(
 const mainDocumentOccurrence = isDesktopDeepLinkOccurrence(mainDocumentOccurrenceValue)
   ? mainDocumentOccurrenceValue
   : undefined;
+const openWithDocumentOccurrenceValue: unknown = process.platform === "win32"
+  ? ipcRenderer.sendSync(DESKTOP_CHANNELS.openWithCaptureDocument, mainDocumentPreloadClaim)
+  : undefined;
+const openWithDocumentOccurrence = isDesktopDeepLinkOccurrence(openWithDocumentOccurrenceValue)
+  ? openWithDocumentOccurrenceValue
+  : undefined;
+const nativeGamepadDocumentOccurrenceValue: unknown = process.platform === "darwin"
+  ? ipcRenderer.sendSync(DESKTOP_CHANNELS.nativeGamepadCaptureDocument, mainDocumentPreloadClaim)
+  : undefined;
+const nativeGamepadDocumentOccurrence = isDesktopDeepLinkOccurrence(nativeGamepadDocumentOccurrenceValue)
+  ? nativeGamepadDocumentOccurrenceValue
+  : undefined;
 
 function createMainDocumentPreloadClaim(): string {
   if (typeof globalThis.crypto.randomUUID === "function") return globalThis.crypto.randomUUID();
@@ -261,8 +288,10 @@ const desktopCapabilities = Object.freeze([
   "inspector.detach",
   ...((process.platform === "win32" || process.platform === "darwin") ? ["files.copy" as const] : []),
   "files.open",
+  ...(openWithDocumentOccurrence === undefined ? [] : ["files.openWith" as const]),
   "files.revealSource",
   "hardware.dedicatedInput",
+  ...(nativeGamepadDocumentOccurrence === undefined ? [] : ["hardware.nativeGamepad" as const]),
   "layout.reset",
   ...((process.platform === "win32" || process.platform === "linux") ? ["window.mainCloseBehavior" as const] : []),
   "microphone.lifecycle",
@@ -750,6 +779,45 @@ const desktopApi = Object.freeze({
       return () => ipcRenderer.removeListener(DESKTOP_CHANNELS.dedicatedHardwarePreviewInput, wrapped);
     }
   }),
+  nativeGamepad: Object.freeze({
+    getSnapshot: (): Promise<DesktopNativeGamepadSnapshot> => nativeGamepadDocumentOccurrence === undefined
+      ? Promise.reject(new Error("Native gamepad input is unavailable for this Document."))
+      : ipcRenderer.invoke(DESKTOP_CHANNELS.nativeGamepadGetSnapshot, nativeGamepadDocumentOccurrence)
+        .then(parseDesktopNativeGamepadSnapshot),
+    setClientState: (state: DesktopNativeGamepadClientState): Promise<DesktopNativeGamepadSnapshot> => {
+      let parsed: DesktopNativeGamepadClientState;
+      try {
+        parsed = parseDesktopNativeGamepadClientState(state);
+      } catch (error) {
+        return Promise.reject(error);
+      }
+      if (nativeGamepadDocumentOccurrence === undefined) {
+        return Promise.reject(new Error("Native gamepad input is unavailable for this Document."));
+      }
+      return ipcRenderer.invoke(
+        DESKTOP_CHANNELS.nativeGamepadSetClientState,
+        nativeGamepadDocumentOccurrence,
+        parsed
+      )
+        .then(parseDesktopNativeGamepadSnapshot);
+    },
+    probe: (): Promise<DesktopNativeGamepadSnapshot> => nativeGamepadDocumentOccurrence === undefined
+      ? Promise.reject(new Error("Native gamepad input is unavailable for this Document."))
+      : ipcRenderer.invoke(DESKTOP_CHANNELS.nativeGamepadProbe, nativeGamepadDocumentOccurrence)
+        .then(parseDesktopNativeGamepadSnapshot),
+    onSnapshot: (listener: (snapshot: DesktopNativeGamepadSnapshot) => void): (() => void) => {
+      if (typeof listener !== "function") throw new TypeError("Native gamepad snapshot listener must be a function.");
+      const wrapped = (_event: IpcRendererEvent, value: unknown): void => {
+        try {
+          listener(parseDesktopNativeGamepadSnapshot(value));
+        } catch {
+          // Ignore values that do not satisfy the exact Desktop bridge contract.
+        }
+      };
+      ipcRenderer.on(DESKTOP_CHANNELS.nativeGamepadSnapshot, wrapped);
+      return () => ipcRenderer.removeListener(DESKTOP_CHANNELS.nativeGamepadSnapshot, wrapped);
+    }
+  }),
   chooseFiles: (): Promise<readonly DesktopFile[]> => ipcRenderer.invoke(DESKTOP_CHANNELS.chooseFiles),
   choosePortableSessionFile: (): Promise<DesktopFile | undefined> =>
     ipcRenderer.invoke(DESKTOP_CHANNELS.choosePortableSessionFile),
@@ -794,9 +862,49 @@ const desktopApi = Object.freeze({
     if (typeof request !== "object" || request === null || Object.keys(request).sort().join(",") !== "file,requestId" || !isNativeFileActionId(request.requestId) || !isDesktopSaveFileRequest(request.file)) return Promise.reject(new TypeError("The file open request is invalid."));
     return ipcRenderer.invoke(DESKTOP_CHANNELS.openFile, request).then(parseFileOpenResult);
   },
+  listOpenWithApps: (request: DesktopListOpenWithAppsRequest): Promise<DesktopListOpenWithAppsResult> => {
+    if (openWithDocumentOccurrence === undefined) {
+      return Promise.reject(new Error("Desktop open-with application enumeration is unavailable."));
+    }
+    if (!isDesktopListOpenWithAppsRequest(request)) {
+      return Promise.reject(new TypeError("The open-with list request is invalid."));
+    }
+    return ipcRenderer.invoke(DESKTOP_CHANNELS.listOpenWithApps, {
+      ...request,
+      documentOccurrence: openWithDocumentOccurrence
+    }).then(parseListOpenWithAppsResult);
+  },
+  retireOpenWithApps: (listOccurrence: string): Promise<void> => {
+    if (openWithDocumentOccurrence === undefined) {
+      return Promise.reject(new Error("Desktop open-with application enumeration is unavailable."));
+    }
+    if (!isNativeFileActionId(listOccurrence)) {
+      return Promise.reject(new TypeError("The open-with list occurrence is invalid."));
+    }
+    return ipcRenderer.invoke(DESKTOP_CHANNELS.retireOpenWithApps, {
+      documentOccurrence: openWithDocumentOccurrence,
+      listOccurrence
+    }).then(() => undefined);
+  },
+  openFileWithApp: (request: DesktopOpenFileWithAppRequest): Promise<DesktopOpenFileResult> => {
+    if (openWithDocumentOccurrence === undefined) {
+      return Promise.reject(new Error("Desktop open-with application enumeration is unavailable."));
+    }
+    if (!isDesktopOpenFileWithAppRequest(request)) {
+      return Promise.reject(new TypeError("The file open-with request is invalid."));
+    }
+    return ipcRenderer.invoke(DESKTOP_CHANNELS.openFileWithApp, {
+      ...request,
+      documentOccurrence: openWithDocumentOccurrence
+    }).then(parseFileOpenResult);
+  },
   cancelFileOpen: (requestId: string): Promise<void> => {
     if (!isNativeFileActionId(requestId)) return Promise.reject(new TypeError("The file open identity is invalid."));
-    return ipcRenderer.invoke(DESKTOP_CHANNELS.cancelFileOpen, requestId).then(() => undefined);
+    return ipcRenderer.invoke(
+      DESKTOP_CHANNELS.cancelFileOpen,
+      requestId,
+      ...(openWithDocumentOccurrence === undefined ? [] : [openWithDocumentOccurrence])
+    ).then(() => undefined);
   },
   revealArtifactSource: (
     request: DesktopRevealArtifactSourceRequest
@@ -1743,8 +1851,91 @@ function isPortableExtensionLibraryPath(value: unknown): value is string {
 }
 
 function exactRecord(value: unknown, keys: readonly string[]): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value)
-    && Object.keys(value).sort().join(",") === [...keys].sort().join(",");
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const actual = Object.keys(value);
+  return actual.length === keys.length && keys.every((key) => Object.hasOwn(value, key));
+}
+
+function parseDesktopNativeGamepadClientState(value: unknown): DesktopNativeGamepadClientState {
+  if (!exactRecord(value, ["version", "enabled", "preview"]) || value["version"] !== 1 ||
+    typeof value["enabled"] !== "boolean" || typeof value["preview"] !== "boolean") {
+    throw new TypeError("Desktop native gamepad client state is invalid.");
+  }
+  return Object.freeze({ version: 1, enabled: value["enabled"], preview: value["preview"] });
+}
+
+function parseDesktopNativeGamepadSnapshot(value: unknown): DesktopNativeGamepadSnapshot {
+  if (!exactRecord(value, ["version", "revision", "status", "devices"]) || value["version"] !== 1 ||
+    !Number.isSafeInteger(value["revision"]) || (value["revision"] as number) < 0 ||
+    !isNativeGamepadStatus(value["status"]) || !Array.isArray(value["devices"]) || value["devices"].length > 4) {
+    throw new TypeError("Desktop native gamepad snapshot is invalid.");
+  }
+  const devices = value["devices"].map(parseDesktopNativeGamepadDevice);
+  if (new Set(devices.map((device) => device.family)).size !== devices.length) {
+    throw new TypeError("Desktop native gamepad snapshot is invalid.");
+  }
+  return Object.freeze({
+    version: 1,
+    revision: value["revision"] as number,
+    status: value["status"],
+    devices: Object.freeze(devices)
+  });
+}
+
+function parseDesktopNativeGamepadDevice(value: unknown): DesktopNativeGamepadDevice {
+  if (!exactRecord(value, [
+    "family", "name", "category", "transport", "batteryPercentage", "batteryState", "buttons", "axes"
+  ]) || !isNativeGamepadFamily(value["family"]) || !nativeGamepadText(value["name"]) ||
+    !nativeGamepadText(value["category"]) || !isNativeGamepadTransport(value["transport"]) ||
+    (value["batteryPercentage"] !== null && (typeof value["batteryPercentage"] !== "number" ||
+      !Number.isInteger(value["batteryPercentage"]) || value["batteryPercentage"] < 0 ||
+      value["batteryPercentage"] > 100)) || !isNativeGamepadBatteryState(value["batteryState"])) {
+    throw new TypeError("Desktop native gamepad device is invalid.");
+  }
+  return Object.freeze({
+    family: value["family"],
+    name: value["name"],
+    category: value["category"],
+    transport: value["transport"],
+    batteryPercentage: value["batteryPercentage"],
+    batteryState: value["batteryState"],
+    buttons: parseNativeGamepadValues(value["buttons"], 17, 0, 1),
+    axes: parseNativeGamepadValues(value["axes"], 4, -1, 1)
+  });
+}
+
+function parseNativeGamepadValues(
+  value: unknown,
+  length: number,
+  minimum: number,
+  maximum: number
+): readonly number[] {
+  if (!Array.isArray(value) || value.length !== length || !value.every((entry) =>
+    typeof entry === "number" && Number.isFinite(entry) && entry >= minimum && entry <= maximum)) {
+    throw new TypeError("Desktop native gamepad input values are invalid.");
+  }
+  return Object.freeze([...value] as number[]);
+}
+
+function nativeGamepadText(value: unknown): value is string | null {
+  return value === null || (typeof value === "string" && value.length <= 512 && !/[\u0000-\u001f\u007f]/u.test(value));
+}
+
+function isNativeGamepadFamily(value: unknown): value is DesktopNativeGamepadDevice["family"] {
+  return value === "xbox" || value === "playstation" || value === "nintendo" || value === "generic";
+}
+
+function isNativeGamepadTransport(value: unknown): value is DesktopNativeGamepadDevice["transport"] {
+  return value === "usb" || value === "bluetooth" || value === "unknown";
+}
+
+function isNativeGamepadBatteryState(value: unknown): value is DesktopNativeGamepadDevice["batteryState"] {
+  return value === "unknown" || value === "discharging" || value === "charging" || value === "full";
+}
+
+function isNativeGamepadStatus(value: unknown): value is DesktopNativeGamepadSnapshot["status"] {
+  return value === "idle" || value === "starting" || value === "waiting" || value === "connected" ||
+    value === "unavailable" || value === "error";
 }
 
 function parseDesktopWindowInteractionSettings(value: unknown): DesktopWindowInteractionSettings {
@@ -1793,6 +1984,72 @@ function parseDesktopBoolean(value: unknown): boolean {
 
 function isNativeFileActionId(value: unknown): value is string {
   return typeof value === "string" && /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/u.test(value);
+}
+
+function isDesktopListOpenWithAppsRequest(value: unknown): value is DesktopListOpenWithAppsRequest {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const request = value as Record<string, unknown>;
+  return Object.keys(request).sort().join(",") === "listOccurrence,name" &&
+    isNativeFileActionId(request["listOccurrence"]) && isDesktopOpenWithName(request["name"]);
+}
+
+function isDesktopOpenFileWithAppRequest(value: unknown): value is DesktopOpenFileWithAppRequest {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const request = value as Record<string, unknown>;
+  return Object.keys(request).sort().join(",") === "appId,file,listOccurrence,requestId" &&
+    isNativeFileActionId(request["requestId"]) && isNativeFileActionId(request["listOccurrence"]) &&
+    isNativeFileActionId(request["appId"]) && isDesktopSaveFileRequest(request["file"]);
+}
+
+function isDesktopOpenWithName(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0 && value.trim() === value &&
+    new TextEncoder().encode(value).byteLength <= 240 && !/[\u0000-\u001f\u007f<>:"/\\|?*]/u.test(value) &&
+    !/[. ]$/u.test(value) && value !== "." && value !== ".." &&
+    !/^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/iu.test(value);
+}
+
+function parseListOpenWithAppsResult(value: unknown): DesktopListOpenWithAppsResult {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new TypeError("Invalid open-with application list result.");
+  }
+  const result = value as Record<string, unknown>;
+  const keys = Object.keys(result).sort().join(",");
+  if (keys === "status" && (result["status"] === "cancelled" || result["status"] === "unavailable" ||
+    result["status"] === "failed")) return Object.freeze({ status: result["status"] });
+  if (keys !== "apps,listOccurrence,status" || result["status"] !== "listed" ||
+    !isNativeFileActionId(result["listOccurrence"]) || !Array.isArray(result["apps"]) ||
+    result["apps"].length > 12) {
+    throw new TypeError("Invalid open-with application list result.");
+  }
+  const apps = result["apps"].map((value: unknown) => {
+    if (typeof value !== "object" || value === null || Array.isArray(value)) {
+      throw new TypeError("Invalid open-with application result.");
+    }
+    const app = value as Record<string, unknown>;
+    const appKeys = Object.keys(app).sort().join(",");
+    if ((appKeys !== "appId,label" && appKeys !== "appId,iconDataUrl,label") ||
+      !isNativeFileActionId(app["appId"]) || typeof app["label"] !== "string" ||
+      app["label"].length < 1 || app["label"].length > 256 || app["label"].trim() !== app["label"] ||
+      /[\u0000-\u001f\u007f]/u.test(app["label"]) ||
+      (appKeys.includes("iconDataUrl") && (typeof app["iconDataUrl"] !== "string" ||
+        app["iconDataUrl"].length > 1024 * 1024 ||
+        !/^data:image\/png;base64,[A-Za-z0-9+/]+={0,2}$/u.test(app["iconDataUrl"])))) {
+      throw new TypeError("Invalid open-with application result.");
+    }
+    return Object.freeze({
+      appId: app["appId"] as string,
+      label: app["label"],
+      ...(appKeys.includes("iconDataUrl") ? { iconDataUrl: app["iconDataUrl"] as string } : {})
+    });
+  });
+  if (new Set(apps.map((app) => app.appId)).size !== apps.length) {
+    throw new TypeError("Invalid duplicate open-with application result.");
+  }
+  return Object.freeze({
+    status: "listed",
+    listOccurrence: result["listOccurrence"],
+    apps: Object.freeze(apps)
+  });
 }
 
 function parseFileCopyResult(value: unknown): DesktopCopyFileResult {

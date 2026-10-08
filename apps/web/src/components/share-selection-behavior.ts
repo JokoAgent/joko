@@ -1,4 +1,5 @@
 import type { TimelineItemView } from "../model.js";
+import { isInternalContinuationTimelineItem } from "../runtime-recovery.js";
 
 export interface ShareSelectionUpdate {
   readonly selectedIds: ReadonlySet<string>;
@@ -8,6 +9,7 @@ export interface ShareSelectionUpdate {
 export function shareableTimelineMessages(items: readonly TimelineItemView[]): readonly TimelineItemView[] {
   return items.filter((item) => (
     (item.kind === "user" || item.kind === "assistant")
+    && !isInternalContinuationTimelineItem(item)
     && item.streaming !== true
     && ((item.text?.trim().length ?? 0) > 0 || (item.attachments?.length ?? 0) > 0)
   ));

@@ -377,6 +377,8 @@ export interface RemoteHostView {
     readonly changedAt: number;
     readonly failure?: { readonly code: string; readonly retryable: boolean };
   };
+  readonly autoConnect: boolean;
+  readonly autoConnectRevision: bigint;
   readonly revision: bigint;
 }
 
@@ -1269,6 +1271,50 @@ export interface SessionView {
   readonly codeHostPullRequests?: readonly CodeHostPullRequestView[];
 }
 
+export type ObjectiveStatusView =
+  | "active"
+  | "paused"
+  | "blocked"
+  | "complete"
+  | "budgetLimited"
+  | "usageLimited"
+  | "dispatchUnknown";
+
+export interface ObjectiveLimitsView {
+  readonly tokenBudget?: number;
+  readonly maximumTurns?: number;
+  readonly noProgressTurnLimit?: number;
+}
+
+/** One durable autonomous objective owned by an exact Session generation. */
+export interface ObjectiveView extends ObjectiveLimitsView {
+  readonly sessionId: string;
+  readonly text: string;
+  readonly status: ObjectiveStatusView;
+  readonly turnsUsed: number;
+  readonly tokensUsed: number;
+  readonly noProgressTurns: number;
+  readonly lastReason?: string;
+  readonly ownerGeneration: bigint;
+  readonly sessionGeneration: bigint;
+  readonly pendingRunId?: string;
+  readonly pendingQueueItemId?: string;
+  readonly startedAt: number;
+  readonly usageResetAt?: number;
+  readonly revision: bigint;
+}
+
+export type ObjectiveWatchUpdateView =
+  | { readonly kind: "objective"; readonly objective: ObjectiveView }
+  | { readonly kind: "cleared" };
+
+export interface ObjectiveUpdatePatchView {
+  readonly text?: string;
+  readonly tokenBudget?: number | null;
+  readonly maximumTurns?: number | null;
+  readonly noProgressTurnLimit?: number | null;
+}
+
 export type NativeNavigationTargetView =
   | { readonly kind: "native_entry"; readonly entryId: string }
   | { readonly kind: "session_start" };
@@ -1335,6 +1381,7 @@ export interface TimelineItemView {
     | "compaction"
     | "contextRebuild"
     | "runtimeRecovery"
+    | "objective"
     | "interaction"
     | "background"
     | "review"
@@ -1371,6 +1418,11 @@ export interface TimelineItemView {
   readonly inputDelivery?: DeliveryMode | "scheduler";
   /** Service-owned continuation prompt; hidden in favor of its recovery activity row. */
   readonly automaticContinuation?: { readonly recoveryId: string };
+  /** Host-owned Objective continuation directive; never user-authored or user-visible. */
+  readonly objectiveContinuation?: {
+    readonly ownerGeneration: bigint;
+    readonly turn: number;
+  };
   readonly tool?: ToolCallView;
   /** Inline projection replacing one or more raw plan tool rows. */
   readonly inlinePlan?: TimelinePlanView;
@@ -1388,6 +1440,8 @@ export interface TimelineItemView {
   readonly contextRebuild?: TimelineContextRebuildView;
   /** Durable interrupted-turn recovery lifecycle. */
   readonly runtimeRecovery?: TimelineRuntimeRecoveryView;
+  /** Durable Objective lifecycle presentation; internal directives remain separate and hidden. */
+  readonly objectiveLifecycle?: TimelineObjectiveLifecycleView;
   readonly attachments?: readonly ArtifactView[];
   readonly workspaceDiff?: TimelineWorkspaceDiffView;
 }
@@ -2413,6 +2467,26 @@ export interface TimelineRuntimeRecoveryView {
   readonly delayMs?: number;
   readonly routeChanged?: boolean;
   readonly error: ErrorView;
+}
+
+export interface TimelineObjectiveLifecycleView {
+  readonly action:
+    | "started"
+    | "replaced"
+    | "paused"
+    | "resumed"
+    | "completed"
+    | "blocked"
+    | "limited"
+    | "dispatchUnknown"
+    | "cleared";
+  readonly status?: ObjectiveStatusView;
+  readonly ownerGeneration: bigint;
+  readonly turnsUsed: number;
+  readonly tokensUsed: number;
+  readonly elapsedMs: number;
+  readonly objectiveText?: string;
+  readonly reason?: string;
 }
 
 export interface ScheduleRunMoneyView {
@@ -3451,6 +3525,9 @@ export interface RemoteConnectionView {
 export interface DeviceView {
   readonly id: string;
   readonly name: string;
+  readonly defaultDisplayName: string;
+  readonly manualDisplayName?: string;
+  readonly revision: bigint;
   readonly kind: "web" | "desktop" | "service" | "mobile" | "unknown";
   readonly platform: string;
   readonly appVersion: string;
@@ -3775,6 +3852,19 @@ export interface McpEnvironmentVariableView {
   readonly value: string;
 }
 
+/** Optional author-supplied task entry. It is user content, not a capability
+ * grant or a model-system instruction. */
+export interface ExtensionRecommendationView {
+  readonly id: string;
+  readonly label: string;
+  readonly prompt: string;
+  readonly command?: string;
+  readonly locales?: Readonly<Partial<Record<"en" | "zh-CN", {
+    readonly label: string;
+    readonly prompt: string;
+  }>>>;
+}
+
 export interface ExtensionCatalogEntryView {
   readonly id: string;
   readonly revision: bigint;
@@ -3812,6 +3902,7 @@ export interface ExtensionCatalogEntryView {
     readonly granted: boolean;
   }[];
   readonly commands: readonly { readonly name: string; readonly description: string; readonly sessionId: string }[];
+  readonly recommendations?: readonly ExtensionRecommendationView[];
   readonly setup: {
     readonly state: "notRequired" | "required" | "inProgress" | "ready" | "cancelled" | "failed";
     readonly attemptId?: string;
@@ -4139,6 +4230,36 @@ export interface PendingExtensionUseView {
   readonly owner:
     | { readonly kind: "resource"; readonly resourceId: string; readonly discoveredRevision: string; readonly resourceRevision: string }
     | { readonly kind: "mcp"; readonly serverId: string; readonly serverRevision: string };
+}
+
+/** Owner-scoped durable one-shot handoff for an Extension-authored task
+ * recommendation. The original descriptor and the localized selection are
+ * both frozen so a later catalog refresh cannot silently replace user input. */
+export interface PendingExtensionSuggestionView {
+  readonly nonce: string;
+  readonly phase: "setup" | "ready";
+  readonly extensionId: string;
+  readonly extensionRevision: string;
+  readonly owner:
+    | { readonly kind: "resource"; readonly resourceId: string; readonly discoveredRevision: string; readonly resourceRevision: string }
+    | { readonly kind: "mcp"; readonly serverId: string; readonly serverRevision: string }
+    | {
+        readonly kind: "source";
+        readonly sourceId: string;
+        readonly sourceRevision: string;
+        readonly entryId: string;
+        readonly contentRevision: string;
+      };
+  /** Complete descriptor as selected, before localization. */
+  readonly recommendation: ExtensionRecommendationView;
+  readonly selectedLabel: string;
+  readonly selectedPrompt: string;
+  /** Stable owner/selection/runtime JSON tuple; process-local generations stay outside. */
+  readonly contextKey: string;
+  readonly runtimeSessionId?: string;
+  readonly draft: NewSessionLocalDraft;
+  readonly backendId: string;
+  readonly targetId?: string;
 }
 
 export interface BrowserSettingsView {
@@ -5831,7 +5952,14 @@ export interface OperationApi extends VoiceDictionaryPeerApi {
   startSkillPublication(preview: SkillPublicationPreviewView, metadata: SkillPublicationMetadataView, access: SkillPublicationAccessSelectionView, signal?: AbortSignal): Promise<void>;
   cancelSkillPublication(job: SkillPublicationJobView, signal?: AbortSignal): Promise<void>;
   retrySkillPublication(job: SkillPublicationJobView, signal?: AbortSignal): Promise<void>;
-  listCommands(sessionId: string): Promise<readonly RuntimeCommandView[]>;
+  listCommands(sessionId: string, signal?: AbortSignal): Promise<readonly RuntimeCommandView[]>;
+  getObjective(sessionId: string, signal?: AbortSignal): Promise<ObjectiveView | undefined>;
+  watchObjective(sessionId: string, afterRevision?: bigint, signal?: AbortSignal): AsyncIterable<ObjectiveWatchUpdateView>;
+  setObjective(sessionId: string, expectedSessionGeneration: bigint, text: string, limits?: ObjectiveLimitsView, signal?: AbortSignal): Promise<ObjectiveView>;
+  updateObjective(objective: ObjectiveView, patch: ObjectiveUpdatePatchView, signal?: AbortSignal): Promise<ObjectiveView>;
+  pauseObjective(objective: ObjectiveView, reason: string, signal?: AbortSignal): Promise<ObjectiveView>;
+  resumeObjective(objective: ObjectiveView, signal?: AbortSignal): Promise<ObjectiveView>;
+  clearObjective(objective: ObjectiveView, signal?: AbortSignal): Promise<void>;
   listSessionResources(sessionId: string, signal?: AbortSignal): Promise<readonly SessionResourceView[]>;
   listRuntimeProcesses(backendId: string, signal?: AbortSignal): Promise<RuntimeProcessUsageSnapshotView>;
   getUsageHistory(days?: number, backendId?: string, providerId?: string, signal?: AbortSignal): Promise<UsageHistoryView>;
@@ -5944,7 +6072,10 @@ export interface OperationApi extends VoiceDictionaryPeerApi {
   executeWorkspaceRewind(workspaceId: string, previewId: string, changeSetId: string, dialogueOnly: boolean): Promise<void>;
   restartBackend(backendId: string): Promise<void>;
   updateBackendSettings(backendId: string, patch: BackendSettingsUpdate): Promise<void>;
-  renameDevice(deviceId: string, name: string): Promise<void>;
+  renameDevice(deviceId: string, name: string, expectedRevision: bigint): Promise<DeviceView>;
+  resetDeviceName(deviceId: string, expectedRevision: bigint): Promise<DeviceView>;
+  checkDeviceNameUpdate(deviceId: string): Promise<DeviceView>;
+  hasPendingDeviceNameUpdate(deviceId: string): boolean;
   setDeviceRemoteControlEnabled(enabled: boolean): Promise<void>;
   setDeviceControlTargetEnabled(targetDeviceId: string, enabled: boolean): Promise<void>;
   setDeviceControllerAllowed(controllerDeviceId: string, allowed: boolean): Promise<void>;
@@ -6161,6 +6292,7 @@ export interface OperationApi extends VoiceDictionaryPeerApi {
   createRemoteHost(targetId: string, draft: RemoteHostDraft): Promise<RemoteHostView>;
   updateRemoteHost(targetId: string, hostId: string, expectedRevision: bigint, draft: RemoteHostDraft): Promise<RemoteHostView>;
   deleteRemoteHost(targetId: string, hostId: string, expectedRevision: bigint): Promise<void>;
+  setRemoteHostAutoConnect(targetId: string, hostId: string, expectedHostRevision: bigint, expectedAutoConnectRevision: bigint, enabled: boolean): Promise<RemoteHostView>;
   connectRemoteHost(targetId: string, hostId: string, expectedRevision: bigint): Promise<RemoteHostView>;
   disconnectRemoteHost(targetId: string, hostId: string, expectedRevision: bigint): Promise<RemoteHostView>;
   testRemoteHostConnection(targetId: string, hostId: string, expectedRevision: bigint): Promise<RemoteHostView>;
@@ -6241,6 +6373,14 @@ export interface OperationApi extends VoiceDictionaryPeerApi {
   downloadArtifact(blobId: string, fileName: string, context: ArtifactDownloadContext): Promise<ArtifactDownloadOutcome>;
   copyArtifactFile(blobId: string, fileName: string, byteSize: number, context: ArtifactDownloadContext): Promise<import("./native-file-actions.js").NativeFileCopyOutcome>;
   openArtifactFile(blobId: string, fileName: string, byteSize: number, context: ArtifactDownloadContext): Promise<import("./native-file-actions.js").NativeFileOpenOutcome>;
+  openArtifactFileWithApplication(
+    blobId: string,
+    fileName: string,
+    byteSize: number,
+    list: import("./native-file-actions.js").NativeFileOpenApplicationList,
+    application: import("./native-file-actions.js").NativeFileOpenApplication,
+    context: ArtifactDownloadContext
+  ): Promise<import("./native-file-actions.js").NativeFileOpenOutcome>;
   revealArtifactSource(sessionId: string, artifactId: string, context: ArtifactDownloadContext): Promise<import("./native-file-actions.js").NativeArtifactSourceRevealOutcome>;
 }
 

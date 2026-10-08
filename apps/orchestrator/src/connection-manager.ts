@@ -1,5 +1,5 @@
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
-import type { ConnectionRecord, CreateDeviceInput, DeviceRecord, OperationalStore, RevokedDeviceResult } from "@joko/store";
+import { normalizeDeviceName, type ConnectionRecord, type CreateDeviceInput, type DeviceRecord, type OperationalStore, type RevokedDeviceResult } from "@joko/store";
 
 export interface PairingChallengeRecord {
   readonly id: string;
@@ -19,7 +19,7 @@ export interface CompletedPairing {
 export interface TrustedDesktopConnectionInput {
   readonly desktopInstanceId: string;
   readonly desktopDeviceId: string;
-  readonly deviceName: string;
+  readonly defaultDeviceName: string;
   readonly platform: string;
   readonly appVersion: string;
   readonly previousConnectionId?: string;
@@ -157,7 +157,8 @@ export class ConnectionManager {
       label,
       device: {
         id: device?.id ?? randomUUID(),
-        name: device?.name.trim() || label?.trim() || "Unnamed device",
+        defaultName: normalizeDeviceName(device?.defaultName ?? "Joko Device"),
+        ...((device?.manualName ?? label?.trim()) ? { manualName: normalizeDeviceName(device?.manualName ?? label!) } : {}),
         kind: device?.kind ?? "unspecified",
         platform: device?.platform ?? "",
         appVersion: device?.appVersion ?? "",
@@ -196,8 +197,9 @@ export class ConnectionManager {
       connectionName: input.connectionName.trim() || "Unnamed device",
       ...(input.device === undefined ? {} : {
         device: {
-          id: input.device.id ?? randomUUID(),
-          name: input.device.name,
+          id: input.device.id ?? pairing.device?.id ?? randomUUID(),
+          defaultName: input.device.defaultName,
+          ...(input.device.manualName === undefined ? {} : { manualName: input.device.manualName }),
           kind: input.device.kind ?? "unspecified",
           platform: input.device.platform ?? "",
           appVersion: input.device.appVersion ?? ""
@@ -229,7 +231,7 @@ export class ConnectionManager {
   issueTrustedDesktopConnection(input: TrustedDesktopConnectionInput): CompletedPairing {
     const instanceId = boundedDesktopInstanceId(input.desktopInstanceId);
     const deviceId = boundedDesktopInstanceId(input.desktopDeviceId);
-    const deviceName = boundedDesktopText(input.deviceName, 128, "Desktop device name");
+    const defaultDeviceName = normalizeDeviceName(input.defaultDeviceName);
     const platform = boundedDesktopText(input.platform, 64, "Desktop platform");
     const appVersion = boundedDesktopText(input.appVersion, 64, "Desktop app version");
     const connectionId = `desktop-connection_${instanceId}`;
@@ -320,16 +322,17 @@ export class ConnectionManager {
         id: connectionId,
         deviceId,
         device: {
-          name: deviceName,
+          defaultName: defaultDeviceName,
           kind: "desktop",
           platform,
           appVersion,
           pairedAt: this.#now()
         },
-        name: `${deviceName} local instance`,
+        name: `${defaultDeviceName} local instance`,
         authKeyDigest: digestAuthKey(authKey),
         pairedAt: this.#now()
       });
+      store.refreshDeviceDefaultName(deviceId, defaultDeviceName);
       if (desktopHostAuthKey !== undefined) {
         store.putDesktopHostAuthorization({
           connectionId: created.id,
@@ -395,6 +398,18 @@ export class ConnectionManager {
     } catch {
       return false;
     }
+  }
+
+  /** Refresh only the Device owned by this still-authenticated Connection. */
+  refreshDeviceNameSource(connection: ConnectionRecord, defaultDisplayName: string): DeviceRecord {
+    const name = normalizeDeviceName(defaultDisplayName);
+    const authenticated = this.#store.authorizeConnection(connection.id, connection.authKeyDigest);
+    const observed = this.#store.getDevice(authenticated.deviceId);
+    if (observed.defaultName === name) return observed;
+    return this.#store.transaction((store) => {
+      const current = store.authorizeConnection(connection.id, connection.authKeyDigest);
+      return store.refreshDeviceDefaultName(current.deviceId, name);
+    });
   }
 
   authenticate(authorization: string | undefined): ConnectionRecord {

@@ -48,8 +48,8 @@ export interface DedicatedHardwareUtilityRequestHandler {
 
 export function createDedicatedHardwareUtilityRequestHandler(options: {
   readonly postMessage: (message: DedicatedHardwareUtilityMessage) => void;
-  readonly loadStagedAdapter: (
-    identity: Extract<DedicatedHardwareSdkIdentity, { kind: "staged" }>,
+  readonly loadAdapter: (
+    identity: Exclude<DedicatedHardwareSdkIdentity, { kind: "unavailable" }>,
     sink: DedicatedHardwareUtilityAdapterSink
   ) => Promise<DedicatedHardwareUtilityAdapter>;
   readonly openKeymapBackupStore: (directory: string) => Promise<DedicatedHardwareKeymapBackupStore>;
@@ -215,9 +215,9 @@ export function createDedicatedHardwareUtilityRequestHandler(options: {
         keymapBackupStore = undefined;
         retainedKeymapState = { phase: "error", backupAvailable: true, failure: "read" };
       }
-      if (request.sdk.kind === "staged") {
+      if (request.sdk.kind !== "unavailable") {
         try {
-          adapter = await options.loadStagedAdapter(request.sdk, sink);
+          adapter = await options.loadAdapter(request.sdk, sink);
           if (!isAdapter(adapter) || keymapBackupStore === undefined) {
             adapter = undefined;
           } else {

@@ -60,17 +60,21 @@ const MAXIMUM_INTERACTION_ID_CHARS = 256;
 const MAXIMUM_INTERACTION_TEXT_CHARS = 1_000;
 const MAXIMUM_INTERACTION_ANSWER_CHARS = 2_000;
 const MAXIMUM_TRACKED_TOOL_ITEMS = 2_048;
+const MAXIMUM_PLAN_INPUT_BYTES = 256 * 1024;
 
 export interface TranslatorState {
+  threadId?: string;
   activeTurnId?: string;
+  activePlan?: { readonly turnId: string; readonly input: string };
   usage?: UsageSnapshot;
   observedFastMode?: boolean;
   readonly itemNames: Map<string, string>;
   readonly terminalTurnIds: Set<string>;
 }
 
-export function createTranslatorState(): TranslatorState {
+export function createTranslatorState(threadId?: string): TranslatorState {
   return {
+    ...(threadId === undefined ? {} : { threadId }),
     itemNames: new Map(),
     terminalTurnIds: new Set()
   };
@@ -323,12 +327,14 @@ export class CodexEventTranslator {
         const turn = parseTurn(record["turn"]);
         if (state.terminalTurnIds.has(turn.id)) return [];
         if (state.activeTurnId !== undefined && state.activeTurnId !== turn.id) return [];
+        if (state.threadId === undefined && typeof record["threadId"] === "string") state.threadId = record["threadId"];
         state.activeTurnId = turn.id;
         return [];
       }
       case "turn/completed": {
         const record = objectValue(params, "turn completed");
         const turn = parseTurn(record["turn"]);
+        if (state.activePlan?.turnId === turn.id && record["threadId"] !== state.threadId) return [];
         if (state.terminalTurnIds.has(turn.id)) return [];
         if (state.activeTurnId !== undefined && state.activeTurnId !== turn.id) {
           rememberTerminal(state.terminalTurnIds, turn.id);
@@ -336,14 +342,23 @@ export class CodexEventTranslator {
         }
         if (state.activeTurnId === turn.id) state.activeTurnId = undefined;
         rememberTerminal(state.terminalTurnIds, turn.id);
+        const plan = state.activePlan?.turnId === turn.id ? state.activePlan : undefined;
+        if (plan !== undefined) state.activePlan = undefined;
         if (turn.status === "failed") {
           return [
             { type: "error", error: publicTurnError(turn.error), terminal: true },
             { type: "done", outcome: "failed" }
           ];
         }
-        return [{ type: "done", outcome: turn.status === "interrupted" ? "aborted" : "completed" }];
+        return [
+          ...(plan === undefined || turn.status !== "completed" ? [] : [{
+            type: "tool_result" as const, callId: `plan:${turn.id}`, name: "update_plan", output: "", isError: false
+          }]),
+          { type: "done", outcome: turn.status === "interrupted" ? "aborted" : "completed" }
+        ];
       }
+      case "turn/plan/updated":
+        return planUpdatedEvents(params, state);
       case "item/agentMessage/delta":
         return [deltaEvent("text_delta", params)];
       case "item/plan/delta":
@@ -1071,6 +1086,39 @@ function fileIntegrityError(): Error {
     phase: "dispatch",
     recovery: "Restore the original canonical Artifact and retry."
   });
+}
+
+function planUpdatedEvents(params: JsonValue, state: TranslatorState): readonly EventPayload[] {
+  if (!isJsonObject(params) || typeof params["threadId"] !== "string" || params["threadId"] !== state.threadId
+    || typeof params["turnId"] !== "string" || params["turnId"] !== state.activeTurnId
+    || state.terminalTurnIds.has(params["turnId"]) || !Array.isArray(params["plan"])) return [];
+  if (params["explanation"] !== undefined && params["explanation"] !== null
+    && typeof params["explanation"] !== "string") return [];
+  const plan: JsonObject[] = [];
+  for (const entry of params["plan"]) {
+    if (!isJsonObject(entry) || typeof entry["step"] !== "string") return [];
+    const status = entry["status"] === "pending" ? "pending"
+      : entry["status"] === "inProgress" ? "in_progress"
+        : entry["status"] === "completed" ? "completed" : undefined;
+    if (status === undefined) return [];
+    plan.push({ step: safeText(entry["step"], MAXIMUM_PLAN_INPUT_BYTES), status });
+  }
+  const serialized = JSON.stringify({
+    ...(typeof params["explanation"] === "string"
+      ? { explanation: safeText(params["explanation"], MAXIMUM_PLAN_INPUT_BYTES) } : {}),
+    plan
+  });
+  const bytes = Buffer.from(serialized, "utf8");
+  // Oversize snapshots remain bounded raw input rather than a misleading partial plan.
+  const input = bytes.length <= MAXIMUM_PLAN_INPUT_BYTES ? serialized
+    : `${bytes.subarray(0, MAXIMUM_PLAN_INPUT_BYTES - 32).toString("utf8")}\n[truncated]`;
+  const previous = state.activePlan?.turnId === params["turnId"] ? state.activePlan : undefined;
+  if (previous?.input === input) return [];
+  state.activePlan = { turnId: params["turnId"], input };
+  const callId = `plan:${params["turnId"]}`;
+  return previous === undefined
+    ? [{ type: "tool_start", callId, name: "update_plan", input }]
+    : [{ type: "tool_update", callId, name: "update_plan", input, output: "", outputMode: "replace" }];
 }
 
 export function safeText(value: string, limit: number): string {

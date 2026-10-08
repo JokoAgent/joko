@@ -170,7 +170,14 @@ describe("Pi package compatibility details", () => {
             schemaVersion: 1,
             extensions: [{
               entry: "extensions/index.ts",
-              mainView: { html: "ui/review/index.html", title: "Review", icon: "layout" }
+              mainView: { html: "ui/review/index.html", title: "Review", icon: "layout" },
+              recommendations: [{
+                id: "review-workspace",
+                label: "Review this workspace",
+                prompt: "Review this workspace for correctness.",
+                command: "review",
+                locales: { "zh-CN": { label: "审查工作区", prompt: "审查此工作区的正确性。" } }
+              }]
             }]
           }
         }
@@ -207,6 +214,13 @@ describe("Pi package compatibility details", () => {
     expect(result.resources[0]).toMatchObject({
       entryPath: "extensions/index.ts",
       mainView: { html: "ui/review/index.html", title: "Review", icon: "layout" },
+      recommendations: [{
+        id: "review-workspace",
+        label: "Review this workspace",
+        prompt: "Review this workspace for correctness.",
+        command: "review",
+        locales: { "zh-CN": { label: "审查工作区", prompt: "审查此工作区的正确性。" } }
+      }],
       compatibility: "partial",
       adaptedApis: ["setStatus"],
       unsupportedApis: ["setHeader"],
@@ -214,6 +228,28 @@ describe("Pi package compatibility details", () => {
     });
     expect(result.resources[3]).toMatchObject({ compatibility: "unsupported", compatibilityIssues: ["theme-control"] });
     expect(shouldShowPiPackageNotice(result, false)).toBe(true);
+  });
+
+  it("keeps a valid Extension when only its optional recommendations are invalid", async () => {
+    const root = await createFixture({
+      "package.json": JSON.stringify({
+        pi: { extensions: ["extensions/index.ts"] },
+        joko: {
+          extensionSurfaces: {
+            schemaVersion: 1,
+            extensions: [{
+              entry: "extensions/index.ts",
+              recommendations: [{ id: "task", label: "Task", prompt: "Do it", command: "bad/command" }]
+            }]
+          }
+        }
+      }),
+      "extensions/index.ts": "export default function setup() {}\n"
+    });
+    await expect(inspectPiPackageCompatibility(root)).resolves.toMatchObject({
+      resources: [{ kind: "extension", recommendations: [] }],
+      warnings: []
+    });
   });
 
   it("fails closed when a declared main view does not bind to the inspected package tree", async () => {

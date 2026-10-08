@@ -3,7 +3,8 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import { create } from "@bufbuild/protobuf";
-import { Code } from "@connectrpc/connect";
+import { Code, createClient } from "@connectrpc/connect";
+import { createConnectTransport } from "@connectrpc/connect-node";
 import {
   BlobDisposition, CapabilitySupport, CompactSessionOutcome, CompactionState, ConnectionState, DeviceKind,
   DismissInteractionMutationSchema, EntityKind, EntityRefSchema,
@@ -18,10 +19,12 @@ import {
   StartReviewMutationSchema,
   AppendVoiceAudioRequestSchema, GetVoiceInputCapabilitiesRequestSchema, GetVoiceInputSessionRequestSchema,
   StartVoiceInputRequestSchema, StopVoiceInputRequestSchema, VoiceInputState, VoiceInputTerminalOutcome,
-  capabilityNames, nativeSessionTreeRoots, type Interaction, type OperationMutation
+  SubagentService,
+  capabilityNames, nativeSessionTreeRoots, type Artifact, type BackgroundTask, type BlobRef, type Event, type EventCursor, type Snapshot,
+  type Interaction, type OperationMutation, type SubagentRun, type SubagentRunDetail, type SubagentTranscriptEntry
 } from "@joko/contracts";
 import { PI_LIKE_PROFILE } from "@joko/testkit";
-import type { AdapterContext, PromptInput } from "@joko/core";
+import type { AdapterContext, AudioArtifactMetadata as CoreAudioArtifactMetadata, PromptInput, SubagentRunDetail as CoreSubagentRunDetail } from "@joko/core";
 import { VoiceInputCoordinator, type VoiceInputProviderFactory } from "@joko/orchestrator";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { InstrumentedFakeAdapter, OrchestratorE2eFixture, waitFor } from "./fixture.js";
@@ -31,6 +34,15 @@ import {
   modelMutation, permissionMutation, planModeMutation, reorderQueuedInputBeforeMutation, resumeQueueMutation, sendInputMutation, sessionIdFrom,
   setQueueInteractionLockMutation, setQueueItemEditLockMutation, submit
 } from "./operations.js";
+
+vi.mock("expo-crypto", () => ({
+  CryptoDigestAlgorithm: { SHA256: "SHA-256" },
+  digest: async (_algorithm: string, bytes: Uint8Array) => Uint8Array.from(createHash("sha256").update(bytes).digest()).buffer
+}));
+vi.mock("../../mobile/node_modules/expo-crypto", () => ({
+  CryptoDigestAlgorithm: { SHA256: "SHA-256" },
+  digest: async (_algorithm: string, bytes: Uint8Array) => Uint8Array.from(createHash("sha256").update(bytes).digest()).buffer
+}));
 
 class MobileMessageFixtureAdapter extends InstrumentedFakeAdapter {
   override async send(input: PromptInput, context: AdapterContext): Promise<void> {
@@ -100,9 +112,227 @@ class MobileRuntimeCommandFixtureAdapter extends InstrumentedFakeAdapter {
   }
 }
 
+class MobileReadingFixtureAdapter extends InstrumentedFakeAdapter {
+  override async send(input: PromptInput, context: AdapterContext): Promise<void> {
+    this.sendCalls.push(input);
+    const messageId = `mobile-thinking-${context.sessionId}`;
+    await context.emit({ type: "thinking_delta", blockId: messageId, contentIndex: 0, delta: "Transient reasoning" });
+    const observedAt = Date.now();
+    for (const index of [1, 2]) {
+      const taskId = `mobile-background-${index}`;
+      await context.emit({ type: "background_task", taskId, title: `Background ${index}`, state: "completed",
+        detail: `Background result ${index}`, startedAt: observedAt, endedAt: observedAt + index });
+      const run: CoreSubagentRunDetail = {
+        id: `mobile-delegate-${index}`, sessionId: context.sessionId, parentTaskId: taskId,
+        logicalAgentId: `mobile-worker-${index}`, identityAliases: [`mobile-provider-${index}`],
+        providerRunIds: [`provider-run-${index}`], state: "completed", title: `Worker ${index}`,
+        assignment: `Read section ${index}`, summary: `Checked section ${index}`,
+        capabilities: { viewActivity: true, viewReturnedResult: true, viewFullTranscript: true,
+          stop: false, steer: false, followUp: false, resume: false, parentContext: "snapshot" },
+        startedAt: observedAt, updatedAt: observedAt + index, endedAt: observedAt + index,
+        activity: [{ sequence: 1, kind: "completed", state: "completed", summary: `Checked section ${index}`, occurredAt: observedAt + index }],
+        children: [{ id: `mobile-child-${index}`, identityAliases: [`provider-child-${index}`], role: "reader",
+          state: "completed", assignment: `Read section ${index}`, result: `Child result ${index}` }],
+        returnedResult: `Delegated result ${index}`
+      };
+      await context.emit({ type: "subagent_run", run });
+      for (const sequence of [1, 2, 3]) {
+        await context.emit({ type: "subagent_transcript", subagentRunId: run.id,
+          entry: { id: `mobile-entry-${index}-${sequence}`, sequence, role: "subagent",
+            content: `Section ${index} observation ${sequence}`, childId: `mobile-child-${index}`,
+            occurredAt: observedAt + sequence } });
+      }
+    }
+    await context.emit({ type: "message_complete", role: "assistant", nativeHistory: { identity: { entryId: messageId } },
+      blocks: [
+        { kind: "thinking", text: "Final ordered reasoning", redacted: false },
+        { kind: "text", text: "The sections are checked." },
+        { kind: "thinking", text: "", redacted: true },
+        { kind: "thinking", text: "Final second reasoning", redacted: false }
+      ] });
+    await context.emit({ type: "done", outcome: "completed" });
+  }
+}
+
+interface MobileReadCredential {
+  readonly origin: string;
+  readonly authKey: string;
+  readonly connectionId: string;
+  readonly deviceId: string;
+}
+
+interface MobileReadingNetwork {
+  readHistory(credential: MobileReadCredential, sessionId: string, before?: EventCursor): Promise<{ events: Event[]; before?: EventCursor }>;
+  listBackgroundTasks(credential: MobileReadCredential, sessionId: string, pageToken?: string): Promise<{ tasks: readonly BackgroundTask[]; nextPageToken: string }>;
+  listSubagentRuns(credential: MobileReadCredential, sessionId: string, pageToken?: string): Promise<{ runs: readonly SubagentRun[]; nextPageToken: string }>;
+  getSubagentRun(credential: MobileReadCredential, sessionId: string, runId: string): Promise<SubagentRunDetail>;
+  listSubagentTranscript(credential: MobileReadCredential, sessionId: string, runId: string, childId?: string, pageToken?: string):
+    Promise<{ entries: readonly SubagentTranscriptEntry[]; nextPageToken: string; tailPageToken: string }>;
+}
+
+interface AudioPreview {
+  readonly kind: "media";
+  readonly leaseId: string;
+  readonly uri: string;
+  readonly mediaKind: "audio" | "video";
+  readonly sha256Hex: string;
+  readonly audioMetadata?: {
+    readonly kind: "generic" | "music" | "sound_effect";
+    readonly title: string;
+    readonly description: string;
+    readonly durationSeconds?: number;
+    readonly artwork?: { readonly blob: BlobRef; readonly width: number; readonly height: number; readonly alt: string };
+  };
+}
+
+interface AudioMobileHarness {
+  readonly state: {
+    readonly status: string;
+    readonly detail?: Snapshot;
+    readonly timelinePreview?: AudioPreview | { readonly kind: "loading" | "error" | "unsupported"; readonly reason?: string };
+    readonly files: { readonly status: string; readonly artifacts: readonly Artifact[];
+      readonly preview?: AudioPreview | { readonly kind: "loading" | "error" | "unsupported" } };
+  };
+  start(): Promise<void>;
+  requestPairing(origin: string, name: string): Promise<string>;
+  pair(origin: string, code: string, name: string): Promise<void>;
+  select(sessionId: string): Promise<void>;
+  openFiles(): Promise<void>;
+  openGeneratedFiles(): void;
+  previewArtifact(artifact: Artifact): Promise<void>;
+  previewTimelineArtifact(selected: unknown): Promise<void>;
+  closeTimelinePreview(): void;
+  closeFiles(): void;
+  audioPreviewOwnerKey(preview: AudioPreview): string | undefined;
+  readAudioArtwork(preview: AudioPreview, signal: AbortSignal): Promise<{ readonly uri: string; readonly width: number; readonly height: number }>;
+  prepareAudioDescriptionCopy(preview: AudioPreview): { readonly kind: "source"; readonly text: string; assertCurrent(signal?: AbortSignal): void };
+  dispose(): void;
+}
+
 describe("native mobile device through the durable product chain", () => {
   let fixture: OrchestratorE2eFixture | undefined;
   afterEach(async () => { await fixture?.close(); fixture = undefined; });
+
+  it("reads canonical mobile music and its independent cover through authenticated HTTP and retires exact preview copy leases", async () => {
+    const { mobileNetwork } = await vi.importActual<{ mobileNetwork: unknown }>("../../mobile/src/network.js");
+    const { MobileClient } = await vi.importActual<{ MobileClient: new (...args: unknown[]) => AudioMobileHarness }>("../../mobile/src/mobile-client.js");
+    interface Driver { getItem(key: string): Promise<string | null>; setItem(key: string, value: string): Promise<void>; removeItem(key: string): Promise<void> }
+    const { createMobileStorage } = await vi.importActual<{
+      createMobileStorage(plain: Driver, secure: Driver & { isAvailable(): Promise<boolean> }): unknown
+    }>("../../mobile/src/connection-storage.js");
+    interface CacheFile { readonly uri: string; readonly fileName: string; readonly byteSize: number; readonly bytes: Uint8Array }
+    const { MobileMediaPreviewFiles } = await vi.importActual<{
+      MobileMediaPreviewFiles: new (driver: { prepare(): Promise<void>; write(fileName: string, bytes: Uint8Array): Promise<CacheFile>;
+        remove(file: Pick<CacheFile, "uri" | "fileName">): Promise<void> }, digest: (bytes: Uint8Array) => Promise<string>) => unknown
+    }>("../../mobile/src/mobile-media-preview.js");
+    const { mobileTimelineArtifacts } = await vi.importActual<{
+      mobileTimelineArtifacts(event: Event): readonly { readonly mediaType: string }[]
+    }>("../../mobile/src/mobile-timeline-artifacts.js");
+    const audio = Buffer.alloc(44 + 160);
+    audio.write("RIFF"); audio.writeUInt32LE(audio.length - 8, 4); audio.write("WAVEfmt ", 8); audio.writeUInt32LE(16, 16);
+    audio.writeUInt16LE(1, 20); audio.writeUInt16LE(1, 22); audio.writeUInt32LE(8000, 24); audio.writeUInt32LE(16000, 28);
+    audio.writeUInt16LE(2, 32); audio.writeUInt16LE(16, 34); audio.write("data", 36); audio.writeUInt32LE(160, 40);
+    const cover = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAACXBIWXMAAAPoAAAD6AG1e1JrAAAAFElEQVQImWP4P4Ph/wwGEP4/gwEAMI4GXTG6t9EAAAAASUVORK5CYII=", "base64");
+    const description = "Complete canonical music description\n第二段保留完整内容";
+    let canonicalAudioId = "";
+    const profile = { ...PI_LIKE_PROFILE, capabilities: [...PI_LIKE_PROFILE.capabilities,
+      { key: capabilityNames.workspaceFiles, supported: true as const }] };
+    fixture = await OrchestratorE2eFixture.start({ profiles: [profile], createAdapter: (entry) => new class extends InstrumentedFakeAdapter {
+      override async send(input: PromptInput, context: AdapterContext): Promise<void> {
+        this.sendCalls.push(input);
+        const audioPath = join(context.target.workspaceRoot, "music.wav");
+        const coverPath = join(context.target.workspaceRoot, "cover.png");
+        await writeFile(audioPath, audio); await writeFile(coverPath, cover);
+        const stagedAudio = await fixture!.application.artifacts.ingestPath(audioPath, { fileName: "music.wav", mimeType: "audio/wav", expiresAt: Date.now() + 60_000 });
+        const stagedCover = await fixture!.application.artifacts.ingestPath(coverPath, { fileName: "cover.png", mimeType: "image/png", expiresAt: Date.now() + 60_000 });
+        const adopted = fixture!.application.store.transaction((store) => {
+          const coverArtifact = store.adoptSessionArtifact({ blob: store.getArtifact(stagedCover.id).blob, sessionId: context.sessionId });
+          const audioMetadata: CoreAudioArtifactMetadata = { kind: "music", title: "Canonical music title", description, durationSeconds: 18,
+            artwork: { blob: coverArtifact.blob, width: 2, height: 2, alt: "Independent music cover" } };
+          const track = store.adoptSessionArtifact({ blob: store.getArtifact(stagedAudio.id).blob, sessionId: context.sessionId, audioMetadata });
+          store.appendEvent({ backendId: context.target.backendId, targetId: context.target.id, sessionId: context.sessionId,
+            generation: context.generation, traceId: "mobile-audio-publication",
+            payload: { type: "artifact", artifact: track.blob, purpose: "audio", audioMetadata } });
+          return { blob: track.blob, audioMetadata };
+        });
+        canonicalAudioId = adopted.blob.id;
+        await context.emit({ type: "message_complete", role: "assistant", nativeHistory: { identity: { entryId: "mobile-audio-message" } },
+          blocks: [{ kind: "artifact", blob: adopted.blob, label: "Generic file label", audioMetadata: adopted.audioMetadata }] });
+        await context.emit({ type: "done", outcome: "completed" });
+      }
+    }(entry) });
+    const manager = await fixture.pair("Audio fixture manager");
+    const owner = (await manager.clients.event.getSnapshot({ scope: { kind: { case: "owner", value: {} } } })).snapshot!;
+    const target = owner.targets.find((item) => item.targetId === fixture!.targetId())!;
+    await manager.clients.target.prepareTargetWorkspace({ targetId: target.targetId, expectedTargetRevision: target.version!.revision });
+    const created = await submit(manager.clients.operation, manager.connectionId,
+      createSessionMutation({ backendId: target.backendId, targetId: target.targetId }));
+    const sessionId = sessionIdFrom(created);
+    if (created.result?.payload.case !== "session") throw new Error("The music fixture has no created Session.");
+    const sent = await submit(manager.clients.operation, manager.connectionId,
+      sendInputMutation(sessionId, created.result.payload.value.nativeBinding!.runtimeGeneration, "Publish music"));
+    await waitFor(() => manager.clients.run.getRun({ runId: queueRunIdFrom(sent) }), (value) => value.run?.state === RunState.SUCCEEDED, "canonical music publication");
+    const memoryDriver = (): Driver => {
+      const values = new Map<string, string>();
+      return { getItem: async (key) => values.get(key) ?? null, setItem: async (key, value) => { values.set(key, value); },
+        removeItem: async (key) => { values.delete(key); } };
+    };
+    const cache = new Map<string, CacheFile>();
+    const mediaFiles = new MobileMediaPreviewFiles({ prepare: async () => undefined,
+      write: async (fileName, bytes) => { const file = { fileName, uri: `file:///controlled-cache/${fileName}`, byteSize: bytes.byteLength, bytes: bytes.slice() }; cache.set(fileName, file); return file; },
+      remove: async (file) => { cache.delete(file.fileName); } }, async (bytes) => createHash("sha256").update(bytes).digest("hex"));
+    const requests: { readonly path: string; readonly method: string; readonly authenticated: boolean }[] = [];
+    const actualFetch = globalThis.fetch;
+    const fetchProbe = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const request = new Request(input, init); const url = new URL(request.url);
+      if (url.origin === fixture!.baseUrl) requests.push({ path: url.pathname, method: request.method,
+        authenticated: request.headers.has("authorization") });
+      return actualFetch(input, init);
+    });
+    const phone = new MobileClient(mobileNetwork, createMobileStorage(memoryDriver(), { ...memoryDriver(), isAvailable: async () => true }),
+      { scan: async () => [] }, randomUUID, "android", undefined, undefined, undefined, undefined, undefined, mediaFiles);
+    try {
+      await phone.start();
+      const challenge = await phone.requestPairing(fixture.baseUrl, "Audio reading phone");
+      await phone.pair(fixture.baseUrl, fixture.pairingCode(challenge), "Audio reading phone");
+      await phone.select(sessionId);
+      expect(phone.state.status).toBe("connected");
+      const completed = phone.state.detail!.timeline.find((event) => event.payload?.kind.case === "messageCompleted"
+        && event.payload.kind.value.messageId === "mobile-audio-message")!;
+      const candidate = mobileTimelineArtifacts(completed).find((item) => item.mediaType === "audio/wav")!;
+      await phone.previewTimelineArtifact(candidate);
+      const timeline = phone.state.timelinePreview;
+      if (timeline?.kind !== "media") throw new Error(`The music Timeline preview did not load: ${timeline?.kind ?? "absent"} ${timeline?.reason ?? ""}`);
+      expect(timeline).toMatchObject({ mediaKind: "audio", sha256Hex: createHash("sha256").update(audio).digest("hex"),
+        audioMetadata: { kind: "music", title: "Canonical music title", description, durationSeconds: 18,
+          artwork: { width: 2, height: 2, alt: "Independent music cover", blob: { mediaType: "image/png", sha256Hex: createHash("sha256").update(cover).digest("hex") } } } });
+      expect([...cache.values()][0]?.bytes).toEqual(Uint8Array.from(audio));
+      expect(await phone.readAudioArtwork(timeline, new AbortController().signal)).toEqual({
+        uri: `data:image/png;base64,${cover.toString("base64")}`, width: 2, height: 2 });
+      const timelineCopy = phone.prepareAudioDescriptionCopy(timeline);
+      expect(timelineCopy.text).toBe(description); timelineCopy.assertCurrent();
+      phone.closeTimelinePreview();
+      expect(phone.audioPreviewOwnerKey(timeline)).toBeUndefined();
+      expect(() => timelineCopy.assertCurrent()).toThrow("source changed");
+      const beforeStaleRead = requests.length;
+      await expect(phone.readAudioArtwork(timeline, new AbortController().signal)).rejects.toThrow("current canonical source");
+      expect(requests).toHaveLength(beforeStaleRead);
+      await phone.openFiles(); phone.openGeneratedFiles();
+      const artifact = phone.state.files.artifacts.find((item) => item.artifactId === canonicalAudioId)!;
+      await phone.previewArtifact(artifact);
+      const generated = phone.state.files.preview;
+      if (generated?.kind !== "media") throw new Error("The Generated music preview did not load.");
+      expect(generated.audioMetadata).toEqual(timeline.audioMetadata);
+      expect(await phone.readAudioArtwork(generated, new AbortController().signal)).toEqual({
+        uri: `data:image/png;base64,${cover.toString("base64")}`, width: 2, height: 2 });
+      const generatedCopy = phone.prepareAudioDescriptionCopy(generated); expect(generatedCopy.text).toBe(description); generatedCopy.assertCurrent();
+      const tickets = requests.filter((request) => request.path.endsWith("/GetBlobDownloadTicket"));
+      expect(tickets).toHaveLength(4); expect(tickets.every((request) => request.authenticated)).toBe(true);
+      expect(requests.filter((request) => request.method === "GET")).toHaveLength(4);
+      phone.closeFiles(); expect(() => generatedCopy.assertCurrent()).toThrow("source changed");
+      await vi.waitFor(() => expect(cache.size).toBe(0));
+    } finally { phone.dispose(); fetchProbe.mockRestore(); }
+  });
 
   it("streams mobile PCM through the authenticated ephemeral Voice Input service without sending a task", async () => {
     let voice!: ReturnType<typeof createMobileVoiceHarness>;
@@ -114,7 +344,7 @@ describe("native mobile device through the durable product chain", () => {
     });
     const begun = await fixture.anonymous.connection.beginPairing({
       deviceDisplayName: "Joko voice phone",
-      deviceKind: DeviceKind.MOBILE,
+      deviceKind: DeviceKind.MOBILE, deviceNameSource: { defaultDisplayName: "Fixture phone" },
       platform: "android",
       appVersion: "0.1.0"
     });
@@ -123,7 +353,7 @@ describe("native mobile device through the durable product chain", () => {
       challengeId,
       humanCode: fixture.pairingCode(challengeId),
       deviceDisplayName: "Joko voice phone",
-      deviceKind: DeviceKind.MOBILE,
+      deviceKind: DeviceKind.MOBILE, deviceNameSource: { defaultDisplayName: "Fixture phone" },
       platform: "android",
       appVersion: "0.1.0"
     })).result!;
@@ -195,13 +425,13 @@ describe("native mobile device through the durable product chain", () => {
     const server = (await fixture.anonymous.connection.getServerInfo({})).server;
     expect(server?.serverId).toBeTruthy();
     const begun = await fixture.anonymous.connection.beginPairing({
-      deviceDisplayName: "Joko phone", deviceKind: DeviceKind.MOBILE, platform: "android", appVersion: "0.1.0"
+      deviceDisplayName: "Joko phone", deviceKind: DeviceKind.MOBILE, deviceNameSource: { defaultDisplayName: "Fixture phone" }, platform: "android", appVersion: "0.1.0"
     });
     const challengeId = begun.challenge?.challengeId;
     expect(challengeId).toBeTruthy();
     const result = (await fixture.anonymous.connection.completePairing({
       challengeId, humanCode: fixture.pairingCode(challengeId!), deviceDisplayName: "Joko phone",
-      deviceKind: DeviceKind.MOBILE, platform: "android", appVersion: "0.1.0"
+      deviceKind: DeviceKind.MOBILE, deviceNameSource: { defaultDisplayName: "Fixture phone" }, platform: "android", appVersion: "0.1.0"
     })).result;
     expect(result?.connection?.deviceId).toBe(result?.device?.deviceId);
     expect(result?.device?.kind).toBe(DeviceKind.MOBILE);
@@ -339,14 +569,14 @@ describe("native mobile device through the durable product chain", () => {
     expect((await ownerClient.clients.connection.getConnection({ connectionId })).connection?.state).toBe(ConnectionState.REVOKED);
 
     const logoutMobile = await fixture.anonymous.connection.beginPairing({
-      deviceDisplayName: "Joko tablet", deviceKind: DeviceKind.MOBILE, platform: "ios", appVersion: "0.1.0"
+      deviceDisplayName: "Joko tablet", deviceKind: DeviceKind.MOBILE, deviceNameSource: { defaultDisplayName: "Fixture phone" }, platform: "ios", appVersion: "0.1.0"
     });
     const logoutChallengeId = logoutMobile.challenge!.challengeId;
     const logoutResult = (await fixture.anonymous.connection.completePairing({
       challengeId: logoutChallengeId,
       humanCode: fixture.pairingCode(logoutChallengeId),
       deviceDisplayName: "Joko tablet",
-      deviceKind: DeviceKind.MOBILE,
+      deviceKind: DeviceKind.MOBILE, deviceNameSource: { defaultDisplayName: "Fixture phone" },
       platform: "ios",
       appVersion: "0.1.0"
     })).result!;
@@ -366,6 +596,116 @@ describe("native mobile device through the durable product chain", () => {
     await expect(logoutClients.event.getSnapshot({ scope: { kind: { case: "owner", value: {} } } })).rejects.toBeDefined();
   });
 
+  it("reads final ordered thinking and paged delegated activity through the mobile HTTP network and durable Session Host", async () => {
+    const { mobileNetwork } = await vi.importActual<{ mobileNetwork: MobileReadingNetwork }>("../../mobile/src/network.js");
+    const { mobileThinkingViews } = await vi.importActual<{
+      mobileThinkingViews(events: readonly Event[]): readonly {
+        sessionId: string; messageId: string; contentIndex: number; text: string;
+        redacted: boolean; completed: boolean; streaming: boolean
+      }[]
+    }>("../../mobile/src/mobile-thinking-projection.js");
+    const readingCapabilities = [capabilityNames.backgroundTasks, capabilityNames.subagentsList,
+      capabilityNames.subagentsDetail, capabilityNames.subagentsTranscript];
+    const readingProfile = {
+      ...PI_LIKE_PROFILE,
+      id: "mobile-reading",
+      displayName: "Mobile reading",
+      capabilities: [
+        ...PI_LIKE_PROFILE.capabilities.filter((capability) => !readingCapabilities.some((key) => key === capability.key)),
+        ...readingCapabilities.map((key) => ({ key, supported: true as const }))
+      ]
+    };
+    fixture = await OrchestratorE2eFixture.start({ profiles: [readingProfile], createAdapter: (profile) => new MobileReadingFixtureAdapter(profile) });
+    const begun = await fixture.anonymous.connection.beginPairing({
+      deviceDisplayName: "Joko reading phone", deviceKind: DeviceKind.MOBILE,
+      deviceNameSource: { defaultDisplayName: "Fixture reading phone" }, platform: "android", appVersion: "0.1.0"
+    });
+    const challengeId = begun.challenge?.challengeId;
+    if (!challengeId) throw new Error("The mobile reading fixture did not return a pairing challenge.");
+    const paired = (await fixture.anonymous.connection.completePairing({
+      challengeId, humanCode: fixture.pairingCode(challengeId), deviceDisplayName: "Joko reading phone",
+      deviceKind: DeviceKind.MOBILE, deviceNameSource: { defaultDisplayName: "Fixture reading phone" }, platform: "android", appVersion: "0.1.0"
+    })).result;
+    if (!paired?.authKey || !paired.connection || !paired.device) throw new Error("The mobile reading fixture did not pair.");
+    expect(paired.device.kind).toBe(DeviceKind.MOBILE);
+    expect(paired.connection.deviceId).toBe(paired.device.deviceId);
+    const credential: MobileReadCredential = { origin: fixture.baseUrl, authKey: paired.authKey,
+      connectionId: paired.connection.connectionId, deviceId: paired.device.deviceId };
+    const clients = fixture.clients(credential.authKey);
+    const owner = (await clients.event.getSnapshot({ scope: { kind: { case: "owner", value: {} } } })).snapshot!;
+    const target = owner.targets.find((item) => item.targetId === fixture!.targetId(readingProfile.id))!;
+    await clients.target.prepareTargetWorkspace({ targetId: target.targetId, expectedTargetRevision: target.version!.revision });
+    const created = await submit(clients.operation, credential.connectionId,
+      createSessionMutation({ backendId: target.backendId, targetId: target.targetId, displayName: "Read on the phone" }));
+    const sessionId = sessionIdFrom(created);
+    if (created.result?.payload.case !== "session") throw new Error("The mobile reading fixture did not create a Session.");
+    const sent = await submit(clients.operation, credential.connectionId,
+      sendInputMutation(sessionId, created.result.payload.value.nativeBinding!.runtimeGeneration, "Read the sections"));
+    const runId = queueRunIdFrom(sent);
+    await waitFor(async () => (await clients.run.getRun({ runId })).run,
+      (run) => run?.state === RunState.SUCCEEDED, "mobile reading run completion");
+
+    const history = await mobileNetwork.readHistory(credential, sessionId);
+    expect(history.events.every((event) => event.identity?.sessionId === sessionId)).toBe(true);
+    const messageId = `mobile-thinking-${sessionId}`;
+    const completed = history.events.find((event) => event.payload?.kind.case === "messageCompleted"
+      && event.payload.kind.value.messageId === messageId)!;
+    expect(completed.payload?.kind.case).toBe("messageCompleted");
+    if (completed.payload?.kind.case !== "messageCompleted") throw new Error("The final thinking message was not read from durable history.");
+    expect(completed.payload.kind.value.blocks.map((block) => block.content.case)).toEqual(["thinking", "text", "thinking", "thinking"]);
+    expect(history.events.some((event) => event.payload?.kind.case === "thinkingDelta"
+      && event.payload.kind.value.delta === "Transient reasoning")).toBe(true);
+    expect(mobileThinkingViews(history.events).map((view) => ({ sessionId: view.sessionId, messageId: view.messageId,
+      index: view.contentIndex, text: view.text, redacted: view.redacted, completed: view.completed, streaming: view.streaming }))).toEqual([
+      { sessionId, messageId, index: 0, text: "Final ordered reasoning", redacted: false, completed: true, streaming: false },
+      { sessionId, messageId, index: 2, text: "", redacted: true, completed: true, streaming: false },
+      { sessionId, messageId, index: 3, text: "Final second reasoning", redacted: false, completed: true, streaming: false }
+    ]);
+
+    const backgroundFirst = await clients.session.listBackgroundTasks({ sessionId, page: { pageSize: 1 } });
+    expect(backgroundFirst.backgroundTasks).toHaveLength(1);
+    expect(backgroundFirst.page?.nextPageToken).toBeTruthy();
+    const backgroundRest = await mobileNetwork.listBackgroundTasks(credential, sessionId, backgroundFirst.page!.nextPageToken);
+    expect(backgroundRest.tasks).toHaveLength(1);
+    expect(backgroundRest.nextPageToken).toBe("");
+    const background = [...backgroundFirst.backgroundTasks, ...backgroundRest.tasks];
+    expect(background.map((task) => task.backgroundTaskId).sort()).toEqual(["mobile-background-1", "mobile-background-2"]);
+    expect(background.every((task) => task.sessionId === sessionId && task.runId === runId && task.targetId === target.targetId)).toBe(true);
+
+    const subagents = createClient(SubagentService, createConnectTransport({ baseUrl: fixture.baseUrl,
+      httpVersion: "1.1", useBinaryFormat: true, defaultTimeoutMs: 10_000,
+      interceptors: [(next) => (request) => { request.header.set("authorization", `Bearer ${credential.authKey}`); return next(request); }] }));
+    const delegatedFirst = await subagents.listSubagentRuns({ sessionId, page: { pageSize: 1 } });
+    expect(delegatedFirst.runs).toHaveLength(1);
+    expect(delegatedFirst.page?.nextPageToken).toBeTruthy();
+    const delegatedRest = await mobileNetwork.listSubagentRuns(credential, sessionId, delegatedFirst.page!.nextPageToken);
+    expect(delegatedRest.runs).toHaveLength(1);
+    expect(delegatedRest.nextPageToken).toBe("");
+    const delegated = [...delegatedFirst.runs, ...delegatedRest.runs];
+    expect(delegated.map((run) => run.subagentRunId).sort()).toEqual(["mobile-delegate-1", "mobile-delegate-2"]);
+    expect(delegated.every((run) => run.sessionId === sessionId)).toBe(true);
+    const detail = await mobileNetwork.getSubagentRun(credential, sessionId, "mobile-delegate-1");
+    expect(detail.run).toMatchObject({ sessionId, subagentRunId: "mobile-delegate-1", parentTaskId: "mobile-background-1",
+      identityAliases: ["mobile-provider-1"], providerRunIds: ["provider-run-1"], assignment: "Read section 1" });
+    expect(detail.returnedResult).toBe("Delegated result 1");
+    expect(detail.children[0]).toMatchObject({ childId: "mobile-child-1", identityAliases: ["provider-child-1"], result: "Child result 1" });
+    const transcriptFirst = await subagents.listSubagentTranscript({ sessionId, subagentRunId: "mobile-delegate-1",
+      childId: "mobile-child-1", page: { pageSize: 1 } });
+    expect(transcriptFirst.entries).toHaveLength(1);
+    expect(transcriptFirst.page?.nextPageToken).toBeTruthy();
+    const transcriptRest = await mobileNetwork.listSubagentTranscript(credential, sessionId, "mobile-delegate-1",
+      "mobile-child-1", transcriptFirst.page!.nextPageToken);
+    expect(transcriptRest.nextPageToken).toBe("");
+    expect(transcriptRest.tailPageToken).toBeTruthy();
+    const transcript = [...transcriptFirst.entries, ...transcriptRest.entries];
+    expect(transcript.map((entry) => [entry.entryId, entry.sequence, entry.childId, entry.content])).toEqual([
+      ["mobile-entry-1-1", 1n, "mobile-child-1", "Section 1 observation 1"],
+      ["mobile-entry-1-2", 2n, "mobile-child-1", "Section 1 observation 2"],
+      ["mobile-entry-1-3", 3n, "mobile-child-1", "Section 1 observation 3"]
+    ]);
+    expect(fixture.adapter(readingProfile.id).sendCalls).toHaveLength(1);
+  });
+
   it("lists an exact mobile runtime command catalog and dispatches the selected slash through HTTP, SQLite, and the Session Host", async () => {
     const runtimeCommandProfile = {
       ...PI_LIKE_PROFILE,
@@ -382,7 +722,7 @@ describe("native mobile device through the durable product chain", () => {
     });
     const begun = await fixture.anonymous.connection.beginPairing({
       deviceDisplayName: "Joko command phone",
-      deviceKind: DeviceKind.MOBILE,
+      deviceKind: DeviceKind.MOBILE, deviceNameSource: { defaultDisplayName: "Fixture phone" },
       platform: "android",
       appVersion: "0.1.0"
     });
@@ -392,7 +732,7 @@ describe("native mobile device through the durable product chain", () => {
       challengeId,
       humanCode: fixture.pairingCode(challengeId),
       deviceDisplayName: "Joko command phone",
-      deviceKind: DeviceKind.MOBILE,
+      deviceKind: DeviceKind.MOBILE, deviceNameSource: { defaultDisplayName: "Fixture phone" },
       platform: "android",
       appVersion: "0.1.0"
     })).result;
@@ -618,7 +958,7 @@ describe("native mobile device through the durable product chain", () => {
     });
     const begunPairing = await fixture.anonymous.connection.beginPairing({
       deviceDisplayName: "Joko attachment phone",
-      deviceKind: DeviceKind.MOBILE,
+      deviceKind: DeviceKind.MOBILE, deviceNameSource: { defaultDisplayName: "Fixture phone" },
       platform: "android",
       appVersion: "0.1.0"
     });
@@ -628,7 +968,7 @@ describe("native mobile device through the durable product chain", () => {
       challengeId,
       humanCode: fixture.pairingCode(challengeId),
       deviceDisplayName: "Joko attachment phone",
-      deviceKind: DeviceKind.MOBILE,
+      deviceKind: DeviceKind.MOBILE, deviceNameSource: { defaultDisplayName: "Fixture phone" },
       platform: "android",
       appVersion: "0.1.0"
     })).result;
@@ -770,7 +1110,7 @@ describe("native mobile device through the durable product chain", () => {
     });
     const begun = await fixture.anonymous.connection.beginPairing({
       deviceDisplayName: "Joko structured-composer phone",
-      deviceKind: DeviceKind.MOBILE,
+      deviceKind: DeviceKind.MOBILE, deviceNameSource: { defaultDisplayName: "Fixture phone" },
       platform: "android",
       appVersion: "0.1.0"
     });
@@ -780,7 +1120,7 @@ describe("native mobile device through the durable product chain", () => {
       challengeId,
       humanCode: fixture.pairingCode(challengeId),
       deviceDisplayName: "Joko structured-composer phone",
-      deviceKind: DeviceKind.MOBILE,
+      deviceKind: DeviceKind.MOBILE, deviceNameSource: { defaultDisplayName: "Fixture phone" },
       platform: "android",
       appVersion: "0.1.0"
     })).result;
@@ -929,7 +1269,7 @@ describe("native mobile device through the durable product chain", () => {
     });
     const begun = await fixture.anonymous.connection.beginPairing({
       deviceDisplayName: "Joko reference phone",
-      deviceKind: DeviceKind.MOBILE,
+      deviceKind: DeviceKind.MOBILE, deviceNameSource: { defaultDisplayName: "Fixture phone" },
       platform: "android",
       appVersion: "0.1.0"
     });
@@ -939,7 +1279,7 @@ describe("native mobile device through the durable product chain", () => {
       challengeId,
       humanCode: fixture.pairingCode(challengeId),
       deviceDisplayName: "Joko reference phone",
-      deviceKind: DeviceKind.MOBILE,
+      deviceKind: DeviceKind.MOBILE, deviceNameSource: { defaultDisplayName: "Fixture phone" },
       platform: "android",
       appVersion: "0.1.0"
     })).result;
@@ -1055,7 +1395,7 @@ describe("native mobile device through the durable product chain", () => {
 
     const begun = await fixture.anonymous.connection.beginPairing({
       deviceDisplayName: "Joko Workspace phone",
-      deviceKind: DeviceKind.MOBILE,
+      deviceKind: DeviceKind.MOBILE, deviceNameSource: { defaultDisplayName: "Fixture phone" },
       platform: "android",
       appVersion: "0.1.0"
     });
@@ -1065,7 +1405,7 @@ describe("native mobile device through the durable product chain", () => {
       challengeId,
       humanCode: fixture.pairingCode(challengeId),
       deviceDisplayName: "Joko Workspace phone",
-      deviceKind: DeviceKind.MOBILE,
+      deviceKind: DeviceKind.MOBILE, deviceNameSource: { defaultDisplayName: "Fixture phone" },
       platform: "android",
       appVersion: "0.1.0"
     })).result;
@@ -1319,7 +1659,7 @@ describe("native mobile device through the durable product chain", () => {
     });
     const begun = await fixture.anonymous.connection.beginPairing({
       deviceDisplayName: "Joko interaction phone",
-      deviceKind: DeviceKind.MOBILE,
+      deviceKind: DeviceKind.MOBILE, deviceNameSource: { defaultDisplayName: "Fixture phone" },
       platform: "android",
       appVersion: "0.1.0"
     });
@@ -1329,7 +1669,7 @@ describe("native mobile device through the durable product chain", () => {
       challengeId,
       humanCode: fixture.pairingCode(challengeId),
       deviceDisplayName: "Joko interaction phone",
-      deviceKind: DeviceKind.MOBILE,
+      deviceKind: DeviceKind.MOBILE, deviceNameSource: { defaultDisplayName: "Fixture phone" },
       platform: "android",
       appVersion: "0.1.0"
     })).result;

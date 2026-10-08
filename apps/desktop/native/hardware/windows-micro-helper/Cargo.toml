@@ -1,0 +1,15 @@
+[package]
+name = "joko-windows-micro-helper"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+hidapi = { version = "2.6", default-features = false, features = ["windows-native"] }
+serde_json = "1"
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true

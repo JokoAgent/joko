@@ -3,6 +3,18 @@ import {
   nextConnectionArtworkGroupIndex as nextSharedConnectionArtworkGroupIndex,
   type ConnectionArtworkVariant
 } from "@joko/brand-assets/connection-artwork";
+import joggingLight from "../../../packages/brand-assets/src/landing-artwork/jogging-light.svg?url";
+import joggingDark from "../../../packages/brand-assets/src/landing-artwork/jogging-dark.svg?url";
+import joggingLightAlt from "../../../packages/brand-assets/src/landing-artwork/jogging-light-alt.svg?url";
+import joggingDarkAlt from "../../../packages/brand-assets/src/landing-artwork/jogging-dark-alt.svg?url";
+import acrobatLight from "../../../packages/brand-assets/src/landing-artwork/acrobat-light.svg?url";
+import acrobatDark from "../../../packages/brand-assets/src/landing-artwork/acrobat-dark.svg?url";
+import acrobatLightAlt from "../../../packages/brand-assets/src/landing-artwork/acrobat-light-alt.svg?url";
+import acrobatDarkAlt from "../../../packages/brand-assets/src/landing-artwork/acrobat-dark-alt.svg?url";
+import bikeLight from "../../../packages/brand-assets/src/landing-artwork/bike-light.svg?url";
+import bikeDark from "../../../packages/brand-assets/src/landing-artwork/bike-dark.svg?url";
+import bikeLightAlt from "../../../packages/brand-assets/src/landing-artwork/bike-light-alt.svg?url";
+import bikeDarkAlt from "../../../packages/brand-assets/src/landing-artwork/bike-dark-alt.svg?url";
 
 export type { ConnectionArtworkVariant } from "@joko/brand-assets/connection-artwork";
 
@@ -33,16 +45,24 @@ interface MutableConnectionArtworkGroup {
 const DEFAULT_CONNECTION_ARTWORK_GROUP = CONNECTION_ARTWORK_GROUP_IDS[0];
 const CONNECTION_ARTWORK_FILE = /^(?<group>[a-z0-9]+(?:-[a-z0-9]+)*)-(?<theme>light|dark)(?<alt>-alt)?\.svg$/u;
 
-const bundledConnectionArtwork = import.meta.glob("../../../packages/brand-assets/src/landing-artwork/*.svg", {
-  eager: true,
-  import: "default",
-  query: "?url"
-}) as Readonly<Record<string, string>>;
+const bundledConnectionArtwork: Readonly<Record<string, string>> = {
+  "jogging-light.svg": joggingLight,
+  "jogging-dark.svg": joggingDark,
+  "jogging-light-alt.svg": joggingLightAlt,
+  "jogging-dark-alt.svg": joggingDarkAlt,
+  "acrobat-light.svg": acrobatLight,
+  "acrobat-dark.svg": acrobatDark,
+  "acrobat-light-alt.svg": acrobatLightAlt,
+  "acrobat-dark-alt.svg": acrobatDarkAlt,
+  "bike-light.svg": bikeLight,
+  "bike-dark.svg": bikeDark,
+  "bike-light-alt.svg": bikeLightAlt,
+  "bike-dark-alt.svg": bikeDarkAlt
+};
 
 /**
- * Builds theme-paired base/alt groups from the landing-artwork directory.
- * Adding four consistently named SVGs is enough to add another group; tabs
- * only advance this sequence and are intentionally absent from the registry.
+ * Builds theme-paired base/alt groups from the canonical artwork imports.
+ * Tabs only advance this sequence and are intentionally absent from the registry.
  */
 export function buildConnectionArtworkGroups(
   modules: Readonly<Record<string, string>>,

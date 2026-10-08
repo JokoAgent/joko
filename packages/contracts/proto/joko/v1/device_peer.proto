@@ -162,6 +162,7 @@ message DevicePeerFailure {
 
 message DevicePeerAgentHello {
   repeated DevicePeerCapabilityKind capabilities = 1;
+  DeviceNameSource device_name_source = 2;
 }
 
 // After Hello, an otherwise-idle agent sends this marker at a bounded

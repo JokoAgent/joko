@@ -225,6 +225,7 @@ import type {
   BackendProviderCredentialSurface,
   BlobRef,
   Capability,
+  DeviceContentProjection,
   EventPayload,
   InlineTextRange as CoreInlineTextRange,
   InputMentionRange as CoreInputMentionRange,
@@ -2726,6 +2727,28 @@ export function fromProtoRuntimeCommand(item: contract.RuntimeCommand): CoreRunt
   };
 }
 
+export function toProtoDeviceContent(device: DeviceContentProjection): contract.Device {
+  return message<contract.Device>("joko.v1.Device", {
+    deviceId: device.id,
+    displayName: device.name,
+    defaultDisplayName: device.defaultName,
+    ...(device.manualName === undefined ? {} : { manualDisplayName: device.manualName }),
+    kind: device.kind === "web" ? contract.DeviceKind.WEB
+      : device.kind === "desktop" ? contract.DeviceKind.DESKTOP
+      : device.kind === "service" ? contract.DeviceKind.SERVICE
+      : device.kind === "mobile" ? contract.DeviceKind.MOBILE : contract.DeviceKind.UNSPECIFIED,
+    platform: device.platform,
+    appVersion: device.appVersion,
+    revoked: device.revoked,
+    pairedAt: toProtoTimestamp(device.pairedAt),
+    lastSeenAt: device.lastSeenAt === undefined ? undefined : toProtoTimestamp(device.lastSeenAt),
+    connectionIds: [...device.connectionIds],
+    remoteControlEnabled: device.remoteControlEnabled,
+    presence: device.online ? contract.DevicePresenceState.ONLINE : contract.DevicePresenceState.OFFLINE,
+    version: toProtoEntityVersion(BigInt(device.revision), 0, device.versionUpdatedAt)
+  });
+}
+
 export function toProtoEvent(event: PersistedEvent, context: EventMappingContext = {}): ProtoEvent {
   const identity = message<EventIdentity>("joko.v1.EventIdentity", {
     backendId: event.backendId,
@@ -2784,6 +2807,10 @@ export function fromProtoEvent(event: ProtoEvent): AppendEventInput {
 function toProtoEventPayload(event: PersistedEvent, context: EventMappingContext): ProtoEventPayload {
   const payload = event.payload;
   switch (payload.type) {
+    case "device_changed":
+      return protoPayload("deviceChanged", message<contract.DeviceChangedEvent>("joko.v1.DeviceChangedEvent", {
+        device: toProtoDeviceContent(payload.device)
+      }));
     case "run_state": {
       if (context.run === undefined) throw missingPayload("event.context.run");
       if (context.target === undefined) throw missingPayload("event.context.target");
@@ -2841,7 +2868,13 @@ function toProtoEventPayload(event: PersistedEvent, context: EventMappingContext
               }),
           nativeIdentity: toProtoNativeMessageIdentity(payload.nativeHistory?.identity),
           automaticContinuation: payload.automaticContinuation !== undefined,
-          runtimeRecoveryId: payload.automaticContinuation?.recoveryId ?? ""
+          runtimeRecoveryId: payload.automaticContinuation?.recoveryId ?? "",
+          objectiveContinuation: payload.objectiveContinuation === undefined
+            ? undefined
+            : message<contract.ObjectiveContinuation>("joko.v1.ObjectiveContinuation", {
+                ownerGeneration: BigInt(payload.objectiveContinuation.ownerGeneration),
+                turn: payload.objectiveContinuation.turn
+              })
         }));
       }
       return protoPayload("messageCompleted", message<MessageCompletedEvent>("joko.v1.MessageCompletedEvent", {
@@ -2867,6 +2900,17 @@ function toProtoEventPayload(event: PersistedEvent, context: EventMappingContext
         routeChanged: payload.routeChanged === true,
         error: toProtoErrorInfo(payload.error)
       }));
+    case "objective_lifecycle":
+      return protoPayload("objectiveLifecycle", message<contract.ObjectiveLifecycleEvent>("joko.v1.ObjectiveLifecycleEvent", {
+        action: toProtoObjectiveLifecycleAction(payload.action),
+        status: toProtoObjectiveLifecycleStatus(payload.status),
+        ownerGeneration: BigInt(payload.ownerGeneration),
+        turnsUsed: payload.turnsUsed,
+        reason: payload.reason ?? "",
+        objectiveText: payload.objectiveText ?? "",
+        tokensUsed: BigInt(payload.tokensUsed),
+        elapsedMs: BigInt(payload.elapsedMs)
+      }));
     case "status":
       return statusPayload(payload.key, payload.key, payload.text ?? "", false);
     case "extension_ui_effect":
@@ -2885,7 +2929,7 @@ function toProtoEventPayload(event: PersistedEvent, context: EventMappingContext
       }));
     case "tool_update":
       return protoPayload("toolCallUpdated", message<ToolCallUpdatedEvent>("joko.v1.ToolCallUpdatedEvent", {
-        toolCall: protoToolCall(event, payload.callId, payload.name, ToolCallState.RUNNING),
+        toolCall: protoToolCall(event, payload.callId, payload.name, ToolCallState.RUNNING, payload.input),
         incrementalResult: protoToolResult(payload.output, payload.artifact, payload.parts),
         outputMode: toProtoToolCallOutputMode(payload.outputMode)
       }));
@@ -3206,6 +3250,8 @@ function fromProtoEventPayload(
   occurredAt?: number
 ): EventPayload {
   switch (payload.kind.case) {
+    case "deviceChanged":
+      throw new ProtoMappingError("invalid_argument", "event.payload.device_changed", "Device content is owned by the Store and cannot be imported as a Session event.");
     case "sessionChanged":
       return { type: "session_changed" };
     case "runChanged": {
@@ -3259,6 +3305,18 @@ function fromProtoEventPayload(
             recoveryId: payload.kind.value.runtimeRecoveryId
           }
         } : {}),
+        ...(payload.kind.value.objectiveContinuation === undefined ? {} : {
+          objectiveContinuation: {
+            ownerGeneration: safeNumber(
+              payload.kind.value.objectiveContinuation.ownerGeneration,
+              "event.payload.message_started.objective_continuation.owner_generation"
+            ),
+            turn: positiveUnsignedInt32(
+              payload.kind.value.objectiveContinuation.turn,
+              "event.payload.message_started.objective_continuation.turn"
+            )
+          }
+        }),
         ...(fromProtoNativeMessageIdentity(payload.kind.value.nativeIdentity) === undefined
           ? {}
           : { nativeHistory: { identity: fromProtoNativeMessageIdentity(payload.kind.value.nativeIdentity)! } }),
@@ -3287,6 +3345,31 @@ function fromProtoEventPayload(
         ...(recovery.delayMs === 0 ? {} : { delayMs: unsignedInt32(recovery.delayMs, "event.payload.runtime_recovery_changed.delay_ms") }),
         ...(recovery.routeChanged ? { routeChanged: true } : {}),
         error: fromProtoErrorInfo(recovery.error)
+      };
+    }
+    case "objectiveLifecycle": {
+      const objective = payload.kind.value;
+      const action = fromProtoObjectiveLifecycleAction(objective.action);
+      const objectiveText = boundedObjectiveLifecycleText(objective.objectiveText, "event.payload.objective_lifecycle.objective_text", 32_000);
+      if ((action === "started" || action === "replaced") && objectiveText === "") {
+        throw new ProtoMappingError("invalid_argument", "event.payload.objective_lifecycle.objective_text", "Objective lifecycle start/replacement requires objective text.");
+      }
+      const reason = boundedObjectiveLifecycleText(objective.reason, "event.payload.objective_lifecycle.reason", 2_048);
+      return {
+        type: "objective_lifecycle",
+        action,
+        ...(objective.status === contract.ObjectiveStatus.UNSPECIFIED
+          ? {}
+          : { status: fromProtoObjectiveLifecycleStatus(objective.status) }),
+        ownerGeneration: safeNumber(
+          objective.ownerGeneration,
+          "event.payload.objective_lifecycle.owner_generation"
+        ),
+        turnsUsed: unsignedInt32(objective.turnsUsed, "event.payload.objective_lifecycle.turns_used"),
+        tokensUsed: safeNumber(objective.tokensUsed, "event.payload.objective_lifecycle.tokens_used"),
+        elapsedMs: safeNumber(objective.elapsedMs, "event.payload.objective_lifecycle.elapsed_ms"),
+        ...(objectiveText === "" ? {} : { objectiveText }),
+        ...(reason === "" ? {} : { reason })
       };
     }
     case "messageCompleted": {
@@ -3358,6 +3441,7 @@ function fromProtoEventPayload(
         type: "tool_update",
         callId: call.toolCallId,
         name: requireText(call.toolId, "event.payload.tool_call_updated.tool_call.tool_id"),
+        ...(call.arguments.length === 0 ? {} : { input: toolInput(call) }),
         output: toolOutput(result),
         ...(outputMode === undefined ? {} : { outputMode }),
         ...(parts.length === 0 ? {} : { parts }),
@@ -5109,6 +5193,69 @@ function fromProtoRuntimeRecoveryState(
         "event.payload.runtime_recovery_changed.state",
         "Runtime recovery state is required."
       );
+  }
+}
+
+function toProtoObjectiveLifecycleAction(
+  action: Extract<EventPayload, { readonly type: "objective_lifecycle" }>["action"]
+): contract.ObjectiveLifecycleAction {
+  switch (action) {
+    case "started": return contract.ObjectiveLifecycleAction.STARTED;
+    case "replaced": return contract.ObjectiveLifecycleAction.REPLACED;
+    case "paused": return contract.ObjectiveLifecycleAction.PAUSED;
+    case "resumed": return contract.ObjectiveLifecycleAction.RESUMED;
+    case "completed": return contract.ObjectiveLifecycleAction.COMPLETED;
+    case "blocked": return contract.ObjectiveLifecycleAction.BLOCKED;
+    case "limited": return contract.ObjectiveLifecycleAction.LIMITED;
+    case "dispatch_unknown": return contract.ObjectiveLifecycleAction.DISPATCH_UNKNOWN;
+    case "cleared": return contract.ObjectiveLifecycleAction.CLEARED;
+  }
+}
+
+function fromProtoObjectiveLifecycleAction(
+  action: contract.ObjectiveLifecycleAction
+): Extract<EventPayload, { readonly type: "objective_lifecycle" }>["action"] {
+  switch (action) {
+    case contract.ObjectiveLifecycleAction.STARTED: return "started";
+    case contract.ObjectiveLifecycleAction.REPLACED: return "replaced";
+    case contract.ObjectiveLifecycleAction.PAUSED: return "paused";
+    case contract.ObjectiveLifecycleAction.RESUMED: return "resumed";
+    case contract.ObjectiveLifecycleAction.COMPLETED: return "completed";
+    case contract.ObjectiveLifecycleAction.BLOCKED: return "blocked";
+    case contract.ObjectiveLifecycleAction.LIMITED: return "limited";
+    case contract.ObjectiveLifecycleAction.DISPATCH_UNKNOWN: return "dispatch_unknown";
+    case contract.ObjectiveLifecycleAction.CLEARED: return "cleared";
+    default: throw new ProtoMappingError("invalid_argument", "event.payload.objective_lifecycle.action", "Objective lifecycle action is required.");
+  }
+}
+
+function toProtoObjectiveLifecycleStatus(
+  status: Extract<EventPayload, { readonly type: "objective_lifecycle" }>["status"]
+): contract.ObjectiveStatus {
+  if (status === undefined) return contract.ObjectiveStatus.UNSPECIFIED;
+  switch (status) {
+    case "active": return contract.ObjectiveStatus.ACTIVE;
+    case "paused": return contract.ObjectiveStatus.PAUSED;
+    case "blocked": return contract.ObjectiveStatus.BLOCKED;
+    case "complete": return contract.ObjectiveStatus.COMPLETE;
+    case "budget_limited": return contract.ObjectiveStatus.BUDGET_LIMITED;
+    case "usage_limited": return contract.ObjectiveStatus.USAGE_LIMITED;
+    case "dispatch_unknown": return contract.ObjectiveStatus.DISPATCH_UNKNOWN;
+  }
+}
+
+function fromProtoObjectiveLifecycleStatus(
+  status: contract.ObjectiveStatus
+): NonNullable<Extract<EventPayload, { readonly type: "objective_lifecycle" }>["status"]> {
+  switch (status) {
+    case contract.ObjectiveStatus.ACTIVE: return "active";
+    case contract.ObjectiveStatus.PAUSED: return "paused";
+    case contract.ObjectiveStatus.BLOCKED: return "blocked";
+    case contract.ObjectiveStatus.COMPLETE: return "complete";
+    case contract.ObjectiveStatus.BUDGET_LIMITED: return "budget_limited";
+    case contract.ObjectiveStatus.USAGE_LIMITED: return "usage_limited";
+    case contract.ObjectiveStatus.DISPATCH_UNKNOWN: return "dispatch_unknown";
+    default: throw new ProtoMappingError("invalid_argument", "event.payload.objective_lifecycle.status", "Objective lifecycle status is invalid.");
   }
 }
 
@@ -6925,6 +7072,14 @@ function signedInt32(value: number, fieldPath: string): number {
 function boundedPiDiagnostic(value: string, _fieldPath: string, maximumCharacters: number): string {
   const sanitized = redactSecrets(value).replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/gu, "�");
   return [...sanitized].slice(0, maximumCharacters).join("");
+}
+
+function boundedObjectiveLifecycleText(value: string, fieldPath: string, maximumCharacters: number): string {
+  const normalized = value.normalize("NFC").replace(/\r\n?/gu, "\n").trim();
+  if (normalized.includes("\0") || [...normalized].length > maximumCharacters) {
+    throw new ProtoMappingError("invalid_argument", fieldPath, `${fieldPath} is not bounded safe text.`);
+  }
+  return normalized;
 }
 
 function requiredProtoTimestamp(value: ProtoTimestamp, fieldPath: string): number {

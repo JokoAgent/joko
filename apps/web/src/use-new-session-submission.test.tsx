@@ -3,7 +3,7 @@ import { act, useState } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeAll, expect, it, vi } from "vitest";
 import type { AppController, AppRoute } from "./controller.js";
-import type { ComposerDraft } from "./model.js";
+import type { ComposerDraft, ObjectiveView } from "./model.js";
 import { emptySnapshot } from "./model.js";
 import type { DelayedNewSessionDraft } from "./new-session-flow.js";
 import { useNewSessionSubmission } from "./use-new-session-submission.js";
@@ -24,7 +24,8 @@ function deferred<T>() {
 
 function api() {
   return {
-    state: { route: { kind: "newSession" }, connectionState: "connected", activeProfile: { id: "profile" }, navigationRevision: 0,
+    state: { route: { kind: "newSession" }, connectionState: "connected", connectionGeneration: 2,
+      activeProfile: { id: "profile", serverId: "server" }, navigationRevision: 0,
       snapshot: { ...emptySnapshot(), targets: [{ id: "target", workspaceId: "workspace", backendId: "backend", name: "Project",
         workspaceName: "Project", revision: 1n, trusted: true, pinned: false, archived: false }],
         workspaces: [{ id: "workspace", targetId: "target", name: "Project", kind: "userProject", serverPath: "/srv/project",
@@ -33,6 +34,15 @@ function api() {
     createTarget: vi.fn(async () => "dialogue-target"),
     refresh: vi.fn(async () => undefined),
     send: vi.fn(async () => undefined),
+    listCommands: vi.fn(async () => []),
+    getObjective: vi.fn(async () => undefined),
+    setObjective: vi.fn(async (sessionId: string, generation: bigint, text: string) => objectiveView(sessionId, generation, text)),
+    clearObjective: vi.fn(async () => undefined),
+    startSkillLearning: vi.fn(async () => ({
+      id: "skill_learning_0123456789abcdef0123456789abcdef", revision: 1n, state: "distilling",
+      sourceKind: "session", backendId: "backend", targetId: "target", sourceSessionId: "created",
+      distillationSessionId: "distilled", summary: "Learning", createdAt: 1, updatedAt: 1, expiresAt: 2
+    })),
     restoreFirstInputDraft: vi.fn(async () => undefined),
     clearNewSessionDraft: vi.fn(async () => undefined),
     recordRecentProject: vi.fn(async () => []),
@@ -40,7 +50,7 @@ function api() {
   } as unknown as AppController;
 }
 
-async function mount(controller: AppController) {
+async function mount(controller: AppController, onFirstInputAccepted?: Parameters<typeof useNewSessionSubmission>[4]) {
   let submit!: ReturnType<typeof useNewSessionSubmission>;
   let error: string | undefined;
   let busy: string | undefined;
@@ -49,7 +59,7 @@ async function mount(controller: AppController) {
     const [action, setAction] = useState<string>();
     error = message;
     busy = action;
-    submit = useNewSessionSubmission(value, setMessage, setAction, describe);
+    submit = useNewSessionSubmission(value, setMessage, setAction, describe, onFirstInputAccepted);
     return null;
   }
   root = createRoot(document.body.appendChild(document.createElement("div")));
@@ -57,6 +67,109 @@ async function mount(controller: AppController) {
   await render(controller);
   return { render, submit: (...args: Parameters<typeof submit>) => submit(...args), error: () => error, busy: () => busy };
 }
+
+it("forwards an exact bare /goal dialog handoff after revealing and installing the created task draft", async () => {
+  const original = api();
+  const shellAccepted = vi.fn();
+  const ownerAccepted = vi.fn();
+  const probe = await mount(original, shellAccepted);
+  const invocation: ComposerDraft = {
+    ...input,
+    text: "/goal",
+    attachments: [{ id: "goal-context", kind: "file", file: { name: "goal.txt" } as File }]
+  };
+
+  await act(async () => { await probe.submit(draft, invocation, {
+    ownerDocument: document,
+    signal: new AbortController().signal,
+    isCurrent: () => true,
+    firstInputDisposition: { kind: "objective", source: "slash", requestId: "home-goal-dialog", action: "open" },
+    onFirstInputAccepted: ownerAccepted
+  }); });
+
+  expect(original.navigate).toHaveBeenCalledExactlyOnceWith({ kind: "session", sessionId: "created" });
+  expect(original.clearNewSessionDraft).toHaveBeenCalledOnce();
+  expect(original.restoreFirstInputDraft).toHaveBeenCalledExactlyOnceWith("created", invocation);
+  expect(original.send).not.toHaveBeenCalled();
+  const acceptance = shellAccepted.mock.calls[0]![0];
+  expect(acceptance).toMatchObject({
+    kind: "objectiveDialog", requestId: "home-goal-dialog", sessionId: "created", sessionGeneration: 4n
+  });
+  expect(acceptance.kind === "objectiveDialog" && acceptance.expectedDraft).toBe(invocation);
+  expect(shellAccepted).toHaveBeenCalledWith(acceptance, {
+    serverId: "server", profileId: "profile", connectionGeneration: 2
+  });
+  expect(ownerAccepted).toHaveBeenCalledWith(acceptance);
+});
+
+it("keeps Home visible and restores the complete created-task draft once when explicit Objective set fails", async () => {
+  const original = api();
+  const failure = new Error("Objective service unavailable");
+  vi.mocked(original.setObjective).mockRejectedValue(failure);
+  const shellAccepted = vi.fn();
+  const probe = await mount(original, shellAccepted);
+  const recovery: ComposerDraft = { ...input, text: "/goal Keep the final dialog text" };
+  let result: unknown;
+
+  await act(async () => {
+    result = await probe.submit(draft, recovery, {
+      ownerDocument: document,
+      signal: new AbortController().signal,
+      isCurrent: () => true,
+      firstInputDisposition: {
+        kind: "objective", source: "dialog", requestId: "home-goal-set", action: "set",
+        text: "Keep the final dialog text", limits: { maximumTurns: 50 }
+      }
+    }).catch((error: unknown) => error);
+  });
+
+  expect(result).toBe(failure);
+  expect(original.listCommands).not.toHaveBeenCalled();
+  expect(original.navigate).not.toHaveBeenCalled();
+  expect(original.clearNewSessionDraft).not.toHaveBeenCalled();
+  expect(original.restoreFirstInputDraft).toHaveBeenCalledExactlyOnceWith("created", recovery);
+  expect(shellAccepted).not.toHaveBeenCalled();
+  expect(probe.error()).toBe("Objective service unavailable");
+});
+
+it("retires a pending Objective before dispatch when the exact connection owner changes", async () => {
+  const original = api();
+  const creation = deferred<{ sessionId: string; generation: bigint }>();
+  vi.mocked(original.createSession).mockReturnValue(creation.promise);
+  const shellAccepted = vi.fn();
+  const probe = await mount(original, shellAccepted);
+  let pending!: Promise<unknown>;
+  await act(async () => {
+    pending = probe.submit(draft, { ...input, text: "/goal Keep working" }, {
+      ownerDocument: document,
+      signal: new AbortController().signal,
+      isCurrent: () => true,
+      firstInputDisposition: {
+        kind: "objective", source: "slash", requestId: "retired-goal", action: "set",
+        text: "Keep working", limits: { noProgressTurnLimit: 3 }
+      }
+    }).catch((error: unknown) => error);
+  });
+  await probe.render({
+    ...original,
+    state: {
+      ...original.state,
+      activeProfile: { ...original.state.activeProfile!, id: "replacement-profile" },
+      connectionGeneration: 3
+    }
+  });
+  let result: unknown;
+  await act(async () => { creation.resolve({ sessionId: "retired-created", generation: 9n }); result = await pending; });
+
+  expect(result).toMatchObject({ name: "AbortError" });
+  expect(original.listCommands).not.toHaveBeenCalled();
+  expect(original.setObjective).not.toHaveBeenCalled();
+  expect(original.restoreFirstInputDraft).toHaveBeenCalledExactlyOnceWith(
+    "retired-created", expect.objectContaining({ text: "/goal Keep working" })
+  );
+  expect(original.navigate).not.toHaveBeenCalled();
+  expect(shellAccepted).not.toHaveBeenCalled();
+});
 
 it.each(["draft", "route", "pagehide"] as const)("keeps accepted creation on its original API while retiring %s presentation", async (cause) => {
   const original = api();
@@ -163,3 +276,146 @@ it("does not record a recent project before Session creation or for a managed di
   expect(original.createTarget).toHaveBeenCalledOnce();
   expect(original.recordRecentProject).not.toHaveBeenCalled();
 });
+
+it("forwards the first-runtime guard and records usage only after actual input acceptance", async () => {
+  const original = api();
+  const probe = await mount(original);
+  const beforeFirstInput = vi.fn(async (_sessionId: string) => { throw new Error("Runtime command changed"); });
+  const accepted = vi.fn(() => { throw new Error("Usage history failed"); });
+  const owner = { ownerDocument: document, signal: new AbortController().signal, isCurrent: () => true,
+    beforeFirstInput, onFirstInputAccepted: accepted };
+  await act(async () => { await expect(probe.submit(draft, input, owner)).rejects.toThrow("Runtime command changed"); });
+  expect(beforeFirstInput).toHaveBeenCalledExactlyOnceWith("created");
+  expect(original.navigate).toHaveBeenCalledExactlyOnceWith({ kind: "session", sessionId: "created" });
+  expect(original.send).not.toHaveBeenCalled();
+  expect(original.restoreFirstInputDraft).toHaveBeenCalledExactlyOnceWith("created", input);
+  expect(accepted).not.toHaveBeenCalled();
+  await act(async () => { await probe.submit(draft, input, { ...owner, beforeFirstInput: async () => undefined }); });
+  expect(original.send).toHaveBeenCalledOnce(); expect(accepted).toHaveBeenCalledOnce();
+});
+
+it("reveals the created task, accepts local learning without a message, then opens its distillation task", async () => {
+  const original = api();
+  const probe = await mount(original);
+  const accepted = vi.fn(() => { throw new Error("Usage history failed"); });
+  const draftLifetime = new AbortController();
+  const owner = {
+    ownerDocument: document,
+    signal: draftLifetime.signal,
+    isCurrent: () => true,
+    firstInputDisposition: {
+      kind: "learn" as const,
+      requestId: "new-task-learn",
+      backendId: "backend",
+      instruction: "",
+      evidence: "createdSession" as const,
+      application: { kind: "eligible" as const }
+    },
+    onFirstInputAccepted: accepted
+  };
+  vi.mocked(original.navigate).mockImplementation((route) => {
+    if (route.kind === "session" && route.sessionId === "created") draftLifetime.abort();
+  });
+
+  await act(async () => { await probe.submit(draft, { ...input, text: "/learn" }, owner); });
+
+  expect(original.navigate).toHaveBeenNthCalledWith(1, { kind: "session", sessionId: "created" });
+  expect(original.navigate).toHaveBeenNthCalledWith(2, { kind: "session", sessionId: "distilled" });
+  const commandSignal = vi.mocked(original.listCommands).mock.calls[0]?.[1];
+  expect(commandSignal).toBeInstanceOf(AbortSignal);
+  expect(commandSignal).not.toBe(owner.signal);
+  expect(original.listCommands).toHaveBeenCalledExactlyOnceWith("created", commandSignal);
+  expect(original.startSkillLearning).toHaveBeenCalledExactlyOnceWith({
+    requestId: "new-task-learn", targetId: "target", instruction: "", sourceSessionId: "created"
+  }, commandSignal);
+  expect(original.send).not.toHaveBeenCalled();
+  expect(original.restoreFirstInputDraft).not.toHaveBeenCalled();
+  expect(accepted).toHaveBeenCalledWith(expect.objectContaining({ kind: "learned", sessionId: "created" }));
+});
+
+it("does not re-dispatch local learning after its owner retires while durable creation is pending", async () => {
+  const original = api();
+  const creation = deferred<{ sessionId: string; generation: bigint }>();
+  vi.mocked(original.createSession).mockReturnValue(creation.promise);
+  const probe = await mount(original);
+  let current = true;
+  const lifetime = new AbortController();
+  let pending!: Promise<unknown>;
+  await act(async () => {
+    pending = probe.submit(draft, { ...input, text: "/learn keep this" }, {
+      ownerDocument: document,
+      signal: lifetime.signal,
+      isCurrent: () => current,
+      firstInputDisposition: {
+        kind: "learn", requestId: "retired-learn", backendId: "backend", instruction: "keep this", evidence: "freeText",
+        application: { kind: "eligible" }
+      }
+    }).catch((error: unknown) => error);
+  });
+  await act(async () => { current = false; lifetime.abort(); });
+  let result: unknown;
+  await act(async () => { creation.resolve({ sessionId: "created", generation: 4n }); result = await pending; });
+
+  expect(result).toMatchObject({ name: "AbortError" });
+  expect(original.listCommands).not.toHaveBeenCalled();
+  expect(original.startSkillLearning).not.toHaveBeenCalled();
+  expect(original.send).not.toHaveBeenCalled();
+  expect(original.restoreFirstInputDraft).toHaveBeenCalledExactlyOnceWith("created", expect.objectContaining({ text: "/learn keep this" }));
+  expect(original.navigate).not.toHaveBeenCalled();
+});
+
+it("aborts fresh runtime reconciliation on an unexpected route and restores the complete invocation", async () => {
+  const original = api();
+  const catalog = deferred<readonly []>();
+  vi.mocked(original.listCommands).mockImplementation(async (_sessionId, signal) => {
+    return await new Promise<readonly []>((resolve, reject) => {
+      const abort = (): void => reject(signal?.reason ?? new DOMException("Aborted", "AbortError"));
+      if (signal?.aborted === true) { abort(); return; }
+      signal?.addEventListener("abort", abort, { once: true });
+      void catalog.promise.then(resolve, reject);
+    });
+  });
+  const probe = await mount(original);
+  const invocation = { ...input, text: "/learn keep this" };
+  const owner = {
+    ownerDocument: document,
+    signal: new AbortController().signal,
+    isCurrent: () => true,
+    firstInputDisposition: {
+      kind: "learn" as const,
+      requestId: "route-retired-learn",
+      backendId: "backend",
+      instruction: "keep this",
+      evidence: "freeText" as const,
+      application: { kind: "eligible" as const }
+    }
+  };
+  let failure!: Promise<unknown>;
+  await act(async () => {
+    failure = probe.submit(draft, invocation, owner).catch((error: unknown) => error);
+  });
+  expect(original.navigate).toHaveBeenCalledWith({ kind: "session", sessionId: "created" });
+  await probe.render({ ...original, state: { ...original.state, route: { kind: "settings" }, navigationRevision: 1 } });
+  let result: unknown;
+  await act(async () => { result = await failure; });
+
+  expect(result).toMatchObject({ name: "AbortError" });
+  expect(original.startSkillLearning).not.toHaveBeenCalled();
+  expect(original.send).not.toHaveBeenCalled();
+  expect(original.restoreFirstInputDraft).toHaveBeenCalledExactlyOnceWith("created", invocation);
+});
+
+function objectiveView(sessionId: string, sessionGeneration: bigint, text: string): ObjectiveView {
+  return {
+    sessionId,
+    sessionGeneration,
+    text,
+    status: "active",
+    turnsUsed: 0,
+    tokensUsed: 0,
+    noProgressTurns: 0,
+    ownerGeneration: 1n,
+    startedAt: 1,
+    revision: 1n
+  };
+}

@@ -31,6 +31,7 @@ import {
   RefreshCw,
   Share,
   Sparkles,
+  Target,
   Terminal,
   Timer,
   Trash2,
@@ -92,7 +93,7 @@ import { TimelineTextAttachmentLightbox } from "./TimelineTextAttachmentLightbox
 import { timelineArtifactSupportsTextPreview } from "./timeline-text-attachment.js";
 import { TimelineArtifactMedia, timelineArtifactMediaKind } from "./TimelineArtifactMedia.js";
 import { TimelineArtifactModel, timelineArtifactModelKind } from "./TimelineArtifactModel.js";
-import { NativeFileActionsContext, NativeFileActionsMenu } from "./NativeFileCopyMenu.js";
+import { NativeArtifactFileActionsMenu, NativeFileActionsContext } from "./NativeFileCopyMenu.js";
 import { useTimelineArtifactUrlCache } from "./timeline-artifact-url-cache.js";
 import { AudioArtworkContext } from "./AudioArtwork.js";
 import { timelineErrorCopy } from "../timeline-error-copy.js";
@@ -120,6 +121,7 @@ import { SentMessageReferenceChips, SentMessageReferenceText, TimelineLinkSource
 import { validSentInputMentionRanges } from "./timeline-references.js";
 import { normalizeTimelineMathDelimiters, remarkStrictTimelineInlineMath } from "./timeline-markdown-math.js";
 import { TimelineMarkdownDocument } from "./TimelineMarkdownDocument.js";
+import { stripObjectiveVerdict } from "../objective-verdict.js";
 import { TimelineFadeElement } from "./TimelineFadeElement.js";
 import {
   commitTimelineWordFadeCandidate,
@@ -1201,6 +1203,7 @@ function TimelineBlock({ sessionId, sessionName, item, planAnimated = false, ret
     }
     case "contextRebuild": return <ContextRebuildCard item={item} t={t} />;
     case "runtimeRecovery": return <RuntimeRecoveryBlock item={item} t={t} />;
+    case "objective": return <ObjectiveLifecycleBlock item={item} locale={locale} t={t} />;
     case "interaction": return item.interaction?.kind === "question" && item.interaction.state === "resolved"
       ? <InteractionAnswerBlock item={item} t={t} />
       : <NoticeBlock item={item} icon={<ListChecks />} title={item.interaction?.state === "pending" ? t("timeline.inputRequired") : t("timeline.inputClosed")} locale={locale} accent />;
@@ -1351,6 +1354,7 @@ function MessageBlock({ sessionId, sessionName, item, role, locale, reducedMotio
     ...(personalization.onWorkspaceImageToComposer === undefined ? {} : { onWorkspaceImageToComposer: personalization.onWorkspaceImageToComposer })
   }), [item.id, item.sourceEventId, item.text, item.inputMentions, item.mentionRanges, onArtifactUrl, onArtifactDownload, personalization.ownerKey, personalization.workspaceId, personalization.onReadArtifact, personalization.onLoadWorkspaceAsset, personalization.onOpenHttpLink, personalization.onOpenWorkspaceHtml, personalization.onWorkspaceImageToComposer, sessionId, t]);
   const text = item.text ?? "";
+  const displayText = role === "assistant" && item.streaming !== true ? stripObjectiveVerdict(text) : text;
   const inputMentions = item.userInputAccepted === true ? item.inputMentions ?? [] : [];
   const inputRanges = validSentInputMentionRanges(text, inputMentions, item.userInputAccepted === true ? item.mentionRanges ?? [] : []);
   const sourceSegments = selectionQuoteTextSourceSegments(text, item.quotesEncoded === true);
@@ -1368,7 +1372,7 @@ function MessageBlock({ sessionId, sessionName, item, role, locale, reducedMotio
     : quotedUserMessage.body;
   const roleLabel = role === "user" ? t("timeline.you") : t("timeline.agent");
   const selectionActive = shareSelection !== undefined;
-  const shareable = item.streaming !== true && (text.trim().length > 0 || (item.attachments?.length ?? 0) > 0);
+  const shareable = item.streaming !== true && (displayText.trim().length > 0 || (item.attachments?.length ?? 0) > 0);
   const shareSelected = selectionActive && shareSelection.selectedIds.has(item.id);
   const selectionControl = selectionActive && shareable && onToggleShareMessage !== undefined
     ? <MessageSelectionControl item={item} selected={shareSelection.selectedIds.has(item.id)} roleLabel={roleLabel} t={t} onToggle={onToggleShareMessage} />
@@ -1424,9 +1428,9 @@ function MessageBlock({ sessionId, sessionName, item, role, locale, reducedMotio
     );
   }
   const assistantContent = <>
-    <div className="markdown message-assistant__body"><StreamingMarkdown text={text} streaming={item.streaming === true} streamFadeKey={`${sessionId}:${item.id}`} t={t} />{item.streaming && <span className={cx("streaming-cursor", reducedMotion && "streaming-cursor--reduced-motion")} aria-label={t("timeline.streaming")} />}</div>
+    <div className="markdown message-assistant__body"><StreamingMarkdown text={displayText} streaming={item.streaming === true} streamFadeKey={`${sessionId}:${item.id}`} t={t} />{item.streaming && <span className={cx("streaming-cursor", reducedMotion && "streaming-cursor--reduced-motion")} aria-label={t("timeline.streaming")} />}</div>
     {attachments}
-    {!selectionActive && !item.streaming && showActions && <MessageActions ownerKey={personalization.ownerKey} sessionId={sessionId} sessionName={sessionName} item={item} text={text} align="left" locale={locale} t={t} onAddMessageToComposer={onAddMessageToComposer} onFork={onForkMessage} forking={forking} onStartShareSelection={onStartShareSelection} editable={false} onPreviewMessageRewind={onPreviewMessageRewind} rewindToStartSupported={rewindToStartSupported} onDeleteMessage={onDeleteMessage} messageDeleteBlockedReason={messageDeleteBlockedReason} />}
+    {!selectionActive && !item.streaming && showActions && <MessageActions ownerKey={personalization.ownerKey} sessionId={sessionId} sessionName={sessionName} item={item} text={displayText} align="left" locale={locale} t={t} onAddMessageToComposer={onAddMessageToComposer === undefined ? undefined : () => onAddMessageToComposer({ ...item, text: displayText })} onFork={onForkMessage} forking={forking} onStartShareSelection={onStartShareSelection} editable={false} onPreviewMessageRewind={onPreviewMessageRewind} rewindToStartSupported={rewindToStartSupported} onDeleteMessage={onDeleteMessage} messageDeleteBlockedReason={messageDeleteBlockedReason} />}
   </>;
   return (
     <RenderedShareSelectionContext.Provider value={shareSelected}>
@@ -1634,6 +1638,7 @@ function MessageMoreMenu({ item, copying, onCopyLink, align, t, onAddMessageToCo
 export function MessageAttachment({ artifact, galleryId, t, onArtifactUrl, onArtifactDownload }: { readonly artifact: NonNullable<TimelineItemView["attachments"]>[number]; readonly galleryId?: string; readonly t: Translator; readonly onArtifactUrl: (blobId: string) => Promise<string>; readonly onArtifactDownload: OperationApi["downloadArtifact"] }): JSX.Element {
   const renderForShare = useRenderedShareSelection();
   const gallery = useContext(TimelineImageGalleryContext);
+  const fileActions = useContext(NativeFileActionsContext);
   const { ownerKey } = useContext(TimelinePersonalizationContext);
   const [textPreviewTrigger, setTextPreviewTrigger] = useState<HTMLElement>();
   const mediaKind = timelineArtifactMediaKind(artifact.mediaType);
@@ -1652,7 +1657,7 @@ export function MessageAttachment({ artifact, galleryId, t, onArtifactUrl, onArt
       ? <button className="message-attachment__preview" type="button" data-gallery-image-id={galleryId} aria-label={t("timeline.openImage", { name: artifact.title })} onClick={(event) => gallery.open(galleryId, event.currentTarget)}><img src={image.url} alt={artifact.title} loading={renderForShare ? "eager" : "lazy"} onError={markImageFailed} /></button>
       : <span {...(artifact.kind === "image" && image.status === "loading" ? { [RENDERED_SHARE_CONTENT_PENDING_ATTRIBUTE]: "" } : {})} className={cx("message-attachment__icon", image.status === "error" && "image-preview--failed")} aria-hidden="true">{image.status === "error" ? <ImageOff /> : <ImageIcon />}</span>;
   return <>
-    <article className={cx("message-attachment", mediaKind !== undefined && "message-attachment--media")}>{imagePreview}<span className="message-attachment__copy"><strong>{artifact.title}</strong><small>{artifact.fileName} · {formatBytes(artifact.byteSize)}</small>{mediaKind === undefined && image.status === "error" && <small className="image-preview__failure-label">{t("timeline.imageUnavailable")}</small>}</span><ArtifactDownloadButton iconOnly ownerKey={JSON.stringify([ownerKey, artifact.blobId, artifact.fileName])} connectionOwner={onArtifactUrl} label={t("timeline.downloadArtifact", { name: artifact.fileName })} errorLabel={t("workspace.downloadUnavailable")} action={(context) => onArtifactDownload(artifact.blobId, artifact.fileName, context)} /></article>
+    <article className={cx("message-attachment", mediaKind !== undefined && "message-attachment--media")}>{imagePreview}<span className="message-attachment__copy"><strong>{artifact.title}</strong><small>{artifact.fileName} · {formatBytes(artifact.byteSize)}</small>{mediaKind === undefined && image.status === "error" && <small className="image-preview__failure-label">{t("timeline.imageUnavailable")}</small>}</span><NativeArtifactFileActionsMenu actions={fileActions} artifact={artifact} ownerKey={JSON.stringify([ownerKey, artifact.id, artifact.blobId, "attachment-native-file"])} t={t} /><ArtifactDownloadButton iconOnly ownerKey={JSON.stringify([ownerKey, artifact.blobId, artifact.fileName])} connectionOwner={onArtifactUrl} label={t("timeline.downloadArtifact", { name: artifact.fileName })} errorLabel={t("workspace.downloadUnavailable")} action={(context) => onArtifactDownload(artifact.blobId, artifact.fileName, context)} /></article>
     {textPreviewTrigger !== undefined && <TimelineTextAttachmentLightbox
       ownerKey={JSON.stringify([ownerKey, artifact.id])}
       artifact={artifact}
@@ -1668,6 +1673,7 @@ export function MessageAttachment({ artifact, galleryId, t, onArtifactUrl, onArt
         close: t("common.close")
       }}
       returnFocus={textPreviewTrigger}
+      toolbarActions={<NativeArtifactFileActionsMenu actions={fileActions} artifact={artifact} ownerKey={JSON.stringify([ownerKey, artifact.id, artifact.blobId, "text-preview-native-file"])} t={t} />}
       loadUrl={onArtifactUrl}
       onDownload={onArtifactDownload}
       onClose={() => setTextPreviewTrigger(undefined)}
@@ -1684,8 +1690,10 @@ function TimelineArtifactReferencePreview({ artifact, trigger, ownerKey, t, onAr
   readonly onArtifactDownload: OperationApi["downloadArtifact"];
   readonly onClose: () => void;
 }): JSX.Element {
+  const fileActions = useContext(NativeFileActionsContext);
   if (timelineArtifactSupportsTextPreview(artifact)) return <TimelineTextAttachmentLightbox
     ownerKey={JSON.stringify([ownerKey, artifact.id])} artifact={artifact} returnFocus={trigger}
+    toolbarActions={<NativeArtifactFileActionsMenu actions={fileActions} artifact={artifact} ownerKey={JSON.stringify([ownerKey, artifact.id, artifact.blobId, "reference-text-native-file"])} t={t} />}
     loadUrl={onArtifactUrl} onDownload={onArtifactDownload} onClose={onClose}
     labels={{ preview: t("workspace.preview"), loading: t("workspace.loadingPreview"), unavailable: t("workspace.filePreviewUnavailable"),
       tooLarge: t("workspace.previewTruncated"), copy: t("timeline.copy"), copied: t("timeline.blockCopied"),
@@ -1908,6 +1916,7 @@ function toolFileChangePath(change: ToolFileChangeView): string {
 export function ArtifactBlock({ item, icon, locale, t, onArtifactUrl, onArtifactDownload }: { readonly item: TimelineItemView; readonly icon: JSX.Element; readonly locale: string; readonly t: Translator; readonly onArtifactUrl: (blobId: string) => Promise<string>; readonly onArtifactDownload: OperationApi["downloadArtifact"] }): JSX.Element {
   const artifact = item.artifact;
   const gallery = useContext(TimelineImageGalleryContext);
+  const fileActions = useContext(NativeFileActionsContext);
   const { ownerKey } = useContext(TimelinePersonalizationContext);
   const mediaKind = artifact === undefined ? undefined : timelineArtifactMediaKind(artifact.mediaType);
   const modelKind = artifact === undefined ? undefined : timelineArtifactModelKind(artifact);
@@ -1924,6 +1933,7 @@ export function ArtifactBlock({ item, icon, locale, t, onArtifactUrl, onArtifact
         <div><strong>{artifact?.title ?? item.title ?? t("timeline.artifact")}</strong><span>{artifact === undefined ? item.text : `${artifact.fileName} · ${formatBytes(artifact.byteSize)}`}</span></div>
         <time>{formatDateTime(item.createdAt, locale)}</time>
         {modelKind !== undefined && artifact !== undefined && <TimelineArtifactModel artifact={artifact} ownerKey={ownerKey} loadUrl={onArtifactUrl} onDownload={onArtifactDownload} t={t} />}
+        {artifact !== undefined && <NativeArtifactFileActionsMenu actions={fileActions} artifact={artifact} ownerKey={JSON.stringify([ownerKey, artifact.id, artifact.blobId, "artifact-native-file"])} t={t} />}
         {artifact !== undefined && <ArtifactDownloadButton iconOnly ownerKey={JSON.stringify([ownerKey, artifact.blobId, artifact.fileName])} connectionOwner={onArtifactUrl} label={t("timeline.downloadArtifact", { name: artifact.fileName })} errorLabel={t("workspace.downloadUnavailable")} action={(context) => onArtifactDownload(artifact.blobId, artifact.fileName, context)} />}
       </div>
     </article>
@@ -1970,17 +1980,14 @@ function TimelineImageLightbox({ images, startImageId, returnFocus, t, loadUrl, 
     gallery={{ index, total: images.length, onPrevious: showPrevious, onNext: showNext }}
     showZoomControls
     returnFocus={returnFocus}
-    toolbarActions={<NativeFileActionsMenu
-      actions={fileActions}
-      artifactId={current.artifactId}
-      blobId={current.blobId}
-      name={current.fileName}
-      byteSize={current.byteSize}
-      {...(current.sourceSessionId === undefined ? {} : { sourceSessionId: current.sourceSessionId })}
-      sourceRevealAvailable={current.sourceRevealAvailable}
-      ownerKey={JSON.stringify([ownerKey, current.id, current.blobId, "native-file"])}
-      t={t}
-    />}
+    toolbarActions={<NativeArtifactFileActionsMenu actions={fileActions} artifact={{
+      id: current.artifactId,
+      blobId: current.blobId,
+      ...(current.sourceSessionId === undefined ? {} : { sourceSessionId: current.sourceSessionId }),
+      sourceRevealAvailable: current.sourceRevealAvailable,
+      fileName: current.fileName,
+      byteSize: current.byteSize
+    }} ownerKey={JSON.stringify([ownerKey, current.id, current.blobId, "native-file"])} t={t} />}
     onClose={onClose}
     onDownload={(context) => onDownload(current.blobId, current.fileName, context)}
     onImageError={markImageFailed}
@@ -2189,6 +2196,63 @@ export function RuntimeRecoveryBlock({ item, t }: { readonly item: TimelineItemV
   );
 }
 
+const OBJECTIVE_LIFECYCLE_LABEL: Record<NonNullable<TimelineItemView["objectiveLifecycle"]>["action"], MessageKey> = {
+  started: "timeline.objective.started",
+  replaced: "timeline.objective.replaced",
+  paused: "timeline.objective.paused",
+  resumed: "timeline.objective.resumed",
+  completed: "timeline.objective.completed",
+  blocked: "timeline.objective.blocked",
+  limited: "timeline.objective.limited",
+  dispatchUnknown: "timeline.objective.dispatchUnknown",
+  cleared: "timeline.objective.cleared"
+};
+
+export function ObjectiveLifecycleBlock({ item, locale, t }: {
+  readonly item: TimelineItemView;
+  readonly locale: string;
+  readonly t: Translator;
+}): JSX.Element {
+  const lifecycle = item.objectiveLifecycle;
+  if (lifecycle === undefined) return <></>;
+  const label = t(OBJECTIVE_LIFECYCLE_LABEL[lifecycle.action]);
+  const attention = lifecycle.action === "blocked" || lifecycle.action === "limited" || lifecycle.action === "dispatchUnknown";
+  const success = lifecycle.action === "completed";
+  const showMetrics = !["started", "replaced"].includes(lifecycle.action)
+    || lifecycle.turnsUsed > 0
+    || lifecycle.tokensUsed > 0
+    || lifecycle.elapsedMs > 0;
+  return <article
+    className={cx("objective-lifecycle-row", attention && "objective-lifecycle-row--attention", success && "objective-lifecycle-row--success")}
+    data-action={lifecycle.action}
+    role="note"
+    aria-label={label}
+  >
+    <Target aria-hidden="true" />
+    <div className="objective-lifecycle-row__body">
+      <strong>{label}</strong>
+      {lifecycle.objectiveText !== undefined && <p className="objective-lifecycle-row__objective">{lifecycle.objectiveText}</p>}
+      {showMetrics && <div className="objective-lifecycle-row__meta">
+        <span>{t("timeline.objective.turns", { count: lifecycle.turnsUsed })}</span>
+        <span>{t("timeline.objective.tokens", { count: lifecycle.tokensUsed.toLocaleString(locale) })}</span>
+        <span>{t("timeline.objective.elapsed", { duration: formatObjectiveLifecycleElapsed(lifecycle.elapsedMs) })}</span>
+      </div>}
+      {lifecycle.reason !== undefined && <p className="objective-lifecycle-row__reason">{lifecycle.reason}</p>}
+    </div>
+    <time>{formatDateTime(item.createdAt, locale)}</time>
+  </article>;
+}
+
+function formatObjectiveLifecycleElapsed(milliseconds: number): string {
+  const total = Math.max(0, Math.floor(milliseconds / 1_000));
+  const seconds = total % 60;
+  const minutes = Math.floor(total / 60) % 60;
+  const hours = Math.floor(total / 3_600);
+  if (hours > 0) return `${hours}h ${String(minutes).padStart(2, "0")}m`;
+  if (minutes > 0) return `${minutes}m ${String(seconds).padStart(2, "0")}s`;
+  return `${seconds}s`;
+}
+
 function NoticeBlock({ item, icon, title, detail, locale, accent = false }: { readonly item: TimelineItemView; readonly icon: JSX.Element; readonly title: string; readonly detail?: string; readonly locale: string; readonly accent?: boolean }): JSX.Element {
   const body = detail ?? item.text;
   return <article className={cx("notice-block", accent && "notice-block--accent")}><span aria-hidden="true">{icon}</span><div><strong>{title}</strong>{body !== undefined && <p>{body}</p>}</div><time>{formatDateTime(item.createdAt, locale)}</time></article>;
@@ -2302,6 +2366,7 @@ function estimateRenderHeight(item: TimelineRenderItem | undefined): number {
 function estimateHeight(item: TimelineItemView | undefined): number {
   if (item === undefined) return 80;
   if (item.kind === "user" || item.kind === "assistant") return Math.min(420, 92 + (item.text?.length ?? 0) * 0.25);
+  if (item.kind === "objective") return Math.min(260, 76 + ((item.objectiveLifecycle?.objectiveText?.length ?? 0) + (item.objectiveLifecycle?.reason?.length ?? 0)) * 0.2);
   if (item.kind === "tool" || item.kind === "toolResult") return 112;
   if (item.kind === "image") return 300;
   return 76;

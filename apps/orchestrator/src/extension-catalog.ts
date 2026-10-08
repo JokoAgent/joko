@@ -4,7 +4,7 @@ import type { RuntimeCommand, RuntimeToolDescriptor } from "@joko/core";
 import type { OperationalStore } from "@joko/store";
 
 import type { CredentialKind, CredentialManager } from "./credential-manager.js";
-import type { ExtensionMainViewDescriptor } from "./extension-surface-manifest.js";
+import type { ExtensionMainViewDescriptor, ExtensionRecommendationDescriptor } from "./extension-surface-manifest.js";
 import type { ExtensionSourceDescriptor } from "./extension-source-manager.js";
 import type { McpServerDescriptor, McpServerInput } from "./mcp-router.js";
 import type { PiResourceDescriptor } from "./resource-manager.js";
@@ -88,6 +88,7 @@ export interface ExtensionCatalogDescriptor {
   readonly tools: readonly ExtensionToolDescriptor[];
   readonly permissions: readonly ExtensionPermissionDescriptor[];
   readonly commands: readonly ExtensionCommandDescriptor[];
+  readonly recommendations?: readonly ExtensionRecommendationDescriptor[];
   readonly setup: ExtensionSetupDescriptor;
   readonly useSupported: boolean;
   readonly error?: string;
@@ -159,6 +160,7 @@ interface ExtensionDefinition {
   readonly sidebarSupported: boolean;
   readonly tools: readonly ExtensionToolDescriptor[];
   readonly permissions: readonly Omit<ExtensionPermissionDescriptor, "granted">[];
+  readonly recommendations: readonly ExtensionRecommendationDescriptor[];
   readonly setupRequirements: readonly SetupRequirement[];
   readonly authorityIdentity: string;
   readonly projectionIdentity: string;
@@ -661,6 +663,7 @@ export class ExtensionCatalogManager {
         granted: setup.state === "ready" || setup.state === "not_required"
       })),
       commands,
+      recommendations: copyRecommendations(definition.recommendations),
       setup,
       useSupported: definition.enabled && definition.installed
         && (setup.state === "ready" || setup.state === "not_required")
@@ -769,6 +772,7 @@ function projectDefinitions(
         sidebarSupported: entry.mainView !== undefined,
         tools: [],
         permissions: [],
+        recommendations: copyRecommendations(entry.recommendations ?? []),
         setupRequirements: [],
         authorityIdentity,
         projectionIdentity: digest({
@@ -776,6 +780,7 @@ function projectDefinitions(
           sourceState: source.state,
           sourceContentRevision: source.contentRevision,
           library: entry.library ?? null,
+          recommendations: entry.recommendations ?? [],
           error: source.error
         }),
         ...(source.error === undefined ? {} : { error: source.error })
@@ -873,6 +878,7 @@ function projectDefinitions(
         sidebarSupported: detail.mainView !== undefined,
         tools: [],
         permissions,
+        recommendations: copyRecommendations(detail.recommendations ?? []),
         setupRequirements: [],
         authorityIdentity,
         projectionIdentity: digest({
@@ -881,6 +887,7 @@ function projectDefinitions(
           state: resource.state,
           enabled: resource.enabled,
           library: detail.library ?? null,
+          recommendations: detail.recommendations ?? [],
           update: updateIdentity,
           error: resource.error
         }),
@@ -982,6 +989,7 @@ function mcpDefinition(server: McpServerDescriptor): ExtensionDefinition {
     sidebarSupported: false,
     tools,
     permissions,
+    recommendations: [],
     setupRequirements: [...credentialRequirements, ...permissionRequirements],
     authorityIdentity,
     projectionIdentity: digest({
@@ -1139,6 +1147,22 @@ function setupCredentialFieldId(target: "header" | "environment", name: string):
 
 function extensionId(bindingKey: string): string {
   return `extension_${createHash("sha256").update(bindingKey).digest("hex").slice(0, 32)}`;
+}
+
+function copyRecommendations(
+  recommendations: readonly ExtensionRecommendationDescriptor[]
+): readonly ExtensionRecommendationDescriptor[] {
+  return recommendations.map((recommendation) => ({
+    ...recommendation,
+    ...(recommendation.locales === undefined
+      ? {}
+      : {
+          locales: Object.fromEntries(Object.entries(recommendation.locales).map(([locale, translation]) => [
+            locale,
+            { ...translation }
+          ])) as ExtensionRecommendationDescriptor["locales"]
+        })
+  }));
 }
 
 function digest(value: unknown): string {

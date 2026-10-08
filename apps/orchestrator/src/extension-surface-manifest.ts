@@ -26,11 +26,29 @@ export interface ExtensionLibraryDescriptor {
   readonly schemaVersion: 1;
 }
 
+export type ExtensionRecommendationLocale = "en" | "zh-CN";
+
+export interface ExtensionRecommendationTranslation {
+  readonly label: string;
+  readonly prompt: string;
+}
+
+/** Optional author content. It is never executable authority or a model
+ * system instruction; command only names an exact runtime command to verify. */
+export interface ExtensionRecommendationDescriptor {
+  readonly id: string;
+  readonly label: string;
+  readonly prompt: string;
+  readonly command?: string;
+  readonly locales?: Readonly<Partial<Record<ExtensionRecommendationLocale, ExtensionRecommendationTranslation>>>;
+}
+
 export interface ExtensionSurfaceBinding {
   /** Exact package-relative runtime Extension entry. */
   readonly entry: string;
   readonly mainView?: ExtensionMainViewDescriptor;
   readonly library?: ExtensionLibraryDescriptor;
+  readonly recommendations?: readonly ExtensionRecommendationDescriptor[];
 }
 
 const EXTENSION_SUFFIXES = new Set([".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"]);
@@ -38,9 +56,22 @@ const ICONS = new Set<string>(EXTENSION_MAIN_VIEW_ICONS);
 const MAXIMUM_SURFACES = 256;
 const MAXIMUM_PATH_CHARACTERS = 2_048;
 const MAXIMUM_TITLE_CHARACTERS = 80;
+const MAXIMUM_RECOMMENDATIONS = 24;
+const MAXIMUM_RECOMMENDATIONS_BYTES = 64 * 1_024;
+const MAXIMUM_RECOMMENDATION_LABEL_CHARACTERS = 120;
+const MAXIMUM_RECOMMENDATION_PROMPT_CHARACTERS = 8_000;
 // eslint-disable-next-line no-control-regex
 const FORBIDDEN_TEXT = /[\u0000-\u001f\u007f\u200e\u200f\u202a-\u202e\u2066-\u2069]/u;
+// eslint-disable-next-line no-control-regex
+const FORBIDDEN_RECOMMENDATION_LABEL = /[\u0000-\u001f\u007f-\u009f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/u;
+// Prompts may contain horizontal tabs and newlines, but no other control or
+// bidirectional formatting characters.
+// eslint-disable-next-line no-control-regex
+const FORBIDDEN_RECOMMENDATION_PROMPT = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/u;
 const PORTABLE_COMPONENT = /^(?![. ]+$)[A-Za-z0-9@][A-Za-z0-9@._+ -]*$/u;
+const RECOMMENDATION_ID = /^[a-z0-9][a-z0-9-]{0,63}$/u;
+const COMMAND_SLUG = /^[a-z0-9][a-z0-9-]{0,63}$/u;
+const RECOMMENDATION_LOCALES = new Set<ExtensionRecommendationLocale>(["en", "zh-CN"]);
 
 /**
  * Parses the only current-v1 Joko Extension surface declaration. The caller
@@ -68,14 +99,14 @@ export function parseExtensionSurfaceManifest(
   const result: ExtensionSurfaceBinding[] = [];
   for (const rawBinding of surfaces.extensions) {
     const binding = requirePlainObject(rawBinding, "Extension surface declaration");
-    requireExactKeys(binding, ["entry", "mainView", "library"], ["entry"], "Extension surface declaration");
+    requireExactKeys(binding, ["entry", "mainView", "library", "recommendations"], ["entry"], "Extension surface declaration");
     const entry = requirePortablePath(binding.entry, "Extension surface entry");
     if (!EXTENSION_SUFFIXES.has(extname(entry).toLowerCase())) throw new Error("Extension surface entry has an unsupported file type.");
     if (!discoveredEntries.has(entry)) throw new Error("Extension surface entry does not exactly match a discovered Extension.");
     if (seenEntries.has(entry)) throw new Error("Extension surface entry is declared more than once.");
     seenEntries.add(entry);
 
-    if (binding.mainView === undefined && binding.library === undefined) {
+    if (binding.mainView === undefined && binding.library === undefined && binding.recommendations === undefined) {
       throw new Error("Extension surface declaration must advertise at least one current capability.");
     }
     let mainView: ExtensionMainViewDescriptor | undefined;
@@ -102,13 +133,73 @@ export function parseExtensionSurfaceManifest(
       if (rawLibrary.schemaVersion !== 1) throw new Error("Extension Library schemaVersion must be 1.");
       library = { schemaVersion: 1 };
     }
+    const recommendations = binding.recommendations === undefined
+      ? undefined
+      : validateExtensionRecommendations(binding.recommendations).items;
     result.push({
       entry,
       ...(mainView === undefined ? {} : { mainView }),
-      ...(library === undefined ? {} : { library })
+      ...(library === undefined ? {} : { library }),
+      ...(recommendations === undefined ? {} : { recommendations })
     });
   }
   return result;
+}
+
+export function validateExtensionRecommendations(value: unknown):
+  | { readonly ok: true; readonly items: readonly ExtensionRecommendationDescriptor[] }
+  | { readonly ok: false; readonly items: readonly []; readonly reason: string } {
+  const failure = {
+    ok: false as const,
+    items: [] as const,
+    reason: "Extension recommendations must contain at most 24 unique bounded tasks in the current-v1 shape."
+  };
+  if (!Array.isArray(value) || value.length > MAXIMUM_RECOMMENDATIONS) return failure;
+  try {
+    if (new TextEncoder().encode(JSON.stringify(value)).length > MAXIMUM_RECOMMENDATIONS_BYTES) return failure;
+  } catch {
+    return failure;
+  }
+
+  const ids = new Set<string>();
+  const items: ExtensionRecommendationDescriptor[] = [];
+  try {
+    for (const raw of value) {
+      if (!isPlainObject(raw)) return failure;
+      requireExactKeys(raw, ["id", "label", "prompt", "command", "locales"], ["id", "label", "prompt"], "Extension recommendation");
+      if (typeof raw.id !== "string" || !RECOMMENDATION_ID.test(raw.id) || ids.has(raw.id)
+        || !recommendationText(raw.label, MAXIMUM_RECOMMENDATION_LABEL_CHARACTERS, FORBIDDEN_RECOMMENDATION_LABEL)
+        || !recommendationText(raw.prompt, MAXIMUM_RECOMMENDATION_PROMPT_CHARACTERS, FORBIDDEN_RECOMMENDATION_PROMPT)
+        || raw.command !== undefined && (typeof raw.command !== "string" || !COMMAND_SLUG.test(raw.command))) return failure;
+      ids.add(raw.id);
+
+      let locales: Partial<Record<ExtensionRecommendationLocale, ExtensionRecommendationTranslation>> | undefined;
+      if (raw.locales !== undefined) {
+        if (!isPlainObject(raw.locales)) return failure;
+        locales = {};
+        for (const [locale, rawTranslation] of Object.entries(raw.locales)) {
+          if (!RECOMMENDATION_LOCALES.has(locale as ExtensionRecommendationLocale) || !isPlainObject(rawTranslation)) return failure;
+          requireExactKeys(rawTranslation, ["label", "prompt"], ["label", "prompt"], "Extension recommendation translation");
+          if (!recommendationText(rawTranslation.label, MAXIMUM_RECOMMENDATION_LABEL_CHARACTERS, FORBIDDEN_RECOMMENDATION_LABEL)
+            || !recommendationText(rawTranslation.prompt, MAXIMUM_RECOMMENDATION_PROMPT_CHARACTERS, FORBIDDEN_RECOMMENDATION_PROMPT)) return failure;
+          locales[locale as ExtensionRecommendationLocale] = {
+            label: rawTranslation.label,
+            prompt: rawTranslation.prompt
+          };
+        }
+      }
+      items.push({
+        id: raw.id,
+        label: raw.label,
+        prompt: raw.prompt,
+        ...(raw.command === undefined ? {} : { command: raw.command }),
+        ...(locales === undefined ? {} : { locales })
+      });
+    }
+  } catch {
+    return failure;
+  }
+  return { ok: true, items };
 }
 
 export function isExtensionMainViewDescriptor(value: unknown): value is ExtensionMainViewDescriptor {
@@ -161,6 +252,10 @@ function requireTitle(value: unknown): string {
 function requireIcon(value: unknown): ExtensionMainViewIcon {
   if (typeof value !== "string" || !ICONS.has(value)) throw new Error("Extension main-view icon is invalid.");
   return value as ExtensionMainViewIcon;
+}
+
+function recommendationText(value: unknown, maximum: number, forbidden: RegExp): value is string {
+  return typeof value === "string" && value.trim().length > 0 && value.length <= maximum && !forbidden.test(value);
 }
 
 function requirePlainObject(value: unknown, label: string): Record<string, unknown> {

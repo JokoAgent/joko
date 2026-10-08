@@ -305,8 +305,8 @@ function pngDimensions(bytes: Uint8Array): { readonly width: number; readonly he
         || bytes[data + 24]! > 2 || bytes[data + 25]! > 1 || ++frames > animationFrames) return undefined;
       inFrame = true; frameData = false;
     } else if (type === "fdAT") {
-      if (!animationFrames || !inFrame || length <= 4 || readU32Be(bytes, data) !== sequence++) return undefined;
-      frameData = true;
+      if (!animationFrames || !inFrame || length < 4 || readU32Be(bytes, data) !== sequence++) return undefined;
+      if (length > 4) frameData = true;
     } else if (type === "IDAT") {
       imageData = true; if (inFrame) frameData = true;
     }
@@ -411,15 +411,22 @@ function webpDimensions(bytes: Uint8Array): { readonly width: number; readonly h
       const left = 2 * readU24Le(bytes, data); const top = 2 * readU24Le(bytes, data + 3);
       const width = 1 + readU24Le(bytes, data + 6); const height = 1 + readU24Le(bytes, data + 9);
       if (left + width > dimensions.width || top + height > dimensions.height || bytes[data + 15]! > 3) return undefined;
-      let frameOffset = data + 16; let frameBitmap = false;
+      let frameOffset = data + 16; let frameBitmap = false; let frameAlpha = false;
       while (frameOffset + 8 <= data + length) {
         const frameType = ascii(bytes, frameOffset, 4); const frameLength = readU32Le(bytes, frameOffset + 4)!;
         if (frameLength + frameLength % 2 > data + length - frameOffset - 8) return undefined;
         if (frameType === "VP8 " || frameType === "VP8L") {
           const frame = webpBitmapDimensions(bytes, frameOffset + 8, frameLength, frameType);
-          if (frameBitmap || !frame || frame.width !== width || frame.height !== height) return undefined;
+          if (frameBitmap || frameType === "VP8L" && frameAlpha
+            || !frame || frame.width !== width || frame.height !== height) return undefined;
           frameBitmap = true;
-        } else if (frameType !== "ALPH") return undefined;
+        } else if (frameType === "ALPH") {
+          if (frameAlpha || frameBitmap) return undefined;
+          frameAlpha = true;
+        } else {
+          // Extension chunks may only trail the complete frame bitstream.
+          if (!frameBitmap || ["VP8X", "ICCP", "ANIM", "ANMF", "EXIF", "XMP "].includes(frameType)) return undefined;
+        }
         frameOffset += 8 + frameLength + frameLength % 2;
       }
       if (!frameBitmap || frameOffset !== data + length) return undefined;

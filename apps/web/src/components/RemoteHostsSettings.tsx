@@ -14,7 +14,7 @@ import type {
 } from "../model.js";
 import { randomUuid } from "../web-crypto.js";
 import type { RunAction, Translator } from "./types.js";
-import { Button, ErrorBanner, IconButton, Modal, ModalBackButton, Pill, SelectControl } from "./ui.js";
+import { Button, ErrorBanner, IconButton, Modal, ModalBackButton, Pill, SelectControl, SwitchControl } from "./ui.js";
 import { RemoteHostKeySetup } from "./RemoteHostKeySetup.js";
 import type { KeyApi } from "./SshKeySettings.js";
 
@@ -31,7 +31,7 @@ const NO_CAPABILITIES: RemoteHostCapabilitiesView = {
   backendRuntimeSetup: false
 };
 
-type RemoteHostApi = KeyApi & Pick<AppController, "getRemoteHostCapabilities" | "watchRemoteHosts" | "listRemoteHostDirectories" | "refreshRemoteHostCatalog" | "createRemoteHost" | "updateRemoteHost" | "deleteRemoteHost" | "connectRemoteHost" | "disconnectRemoteHost" | "testRemoteHostConnection" | "clearRemoteHostTrust" | "probeRemoteBackendRuntime" | "installRemoteBackendRuntime" | "uninstallRemoteBackendRuntime" | "saveCredential" | "updateTarget">;
+type RemoteHostApi = KeyApi & Pick<AppController, "getRemoteHostCapabilities" | "watchRemoteHosts" | "listRemoteHostDirectories" | "refreshRemoteHostCatalog" | "createRemoteHost" | "updateRemoteHost" | "deleteRemoteHost" | "setRemoteHostAutoConnect" | "connectRemoteHost" | "disconnectRemoteHost" | "testRemoteHostConnection" | "clearRemoteHostTrust" | "probeRemoteBackendRuntime" | "installRemoteBackendRuntime" | "uninstallRemoteBackendRuntime" | "saveCredential" | "updateTarget">;
 interface CatalogScope {
   readonly id: string;
   readonly abort: AbortController;
@@ -87,6 +87,7 @@ export function RemoteHostsSettings({ controller, snapshot, activeTargetId, show
     createRemoteHost: controller.createRemoteHost,
     updateRemoteHost: controller.updateRemoteHost,
     deleteRemoteHost: controller.deleteRemoteHost,
+    setRemoteHostAutoConnect: controller.setRemoteHostAutoConnect,
     connectRemoteHost: controller.connectRemoteHost,
     disconnectRemoteHost: controller.disconnectRemoteHost,
     testRemoteHostConnection: controller.testRemoteHostConnection,
@@ -96,7 +97,7 @@ export function RemoteHostsSettings({ controller, snapshot, activeTargetId, show
     uninstallRemoteBackendRuntime: controller.uninstallRemoteBackendRuntime,
     saveCredential: controller.saveCredential,
     updateTarget: controller.updateTarget
-  }), [controller.listSshKeys, controller.generateSshKey, controller.addSshKeyToAgent, controller.readSshPublicKey, controller.getSshKeyInstallCommand, controller.getRemoteHostCapabilities, controller.watchRemoteHosts, controller.listRemoteHostDirectories, controller.refreshRemoteHostCatalog, controller.createRemoteHost, controller.updateRemoteHost, controller.deleteRemoteHost, controller.connectRemoteHost, controller.disconnectRemoteHost, controller.testRemoteHostConnection, controller.clearRemoteHostTrust, controller.probeRemoteBackendRuntime, controller.installRemoteBackendRuntime, controller.uninstallRemoteBackendRuntime, controller.saveCredential, controller.updateTarget]);
+  }), [controller.listSshKeys, controller.generateSshKey, controller.addSshKeyToAgent, controller.readSshPublicKey, controller.getSshKeyInstallCommand, controller.getRemoteHostCapabilities, controller.watchRemoteHosts, controller.listRemoteHostDirectories, controller.refreshRemoteHostCatalog, controller.createRemoteHost, controller.updateRemoteHost, controller.deleteRemoteHost, controller.setRemoteHostAutoConnect, controller.connectRemoteHost, controller.disconnectRemoteHost, controller.testRemoteHostConnection, controller.clearRemoteHostTrust, controller.probeRemoteBackendRuntime, controller.installRemoteBackendRuntime, controller.uninstallRemoteBackendRuntime, controller.saveCredential, controller.updateTarget]);
   const scope = useMemo<CatalogScope>(() => ({ id: randomUuid(), abort: new AbortController(), pending: new Set() }), [api, targetId, occurrence, controller.state.connectionState, controller.state.route, controller.state.navigationRevision]);
   const emptyCatalog = (): CatalogState => ({ scope, hosts: [], capabilities: NO_CAPABILITIES, capabilitiesReady: false, streamReady: false, loading: targetId !== "" && controller.state.connectionState === "connected" });
   const [catalog, setCatalog] = useState<CatalogState>(emptyCatalog);
@@ -222,7 +223,7 @@ export function RemoteHostsSettings({ controller, snapshot, activeTargetId, show
       t(!capabilities.management ? "settings.remoteHosts.managementUnavailable" : "settings.remoteHosts.catalogUnavailable")
     }</p>}
     <section className="settings-card settings-list remote-host-list" aria-busy={loading}>
-      {hosts.map((host) => <article key={host.id} className="remote-host-row">
+      {hosts.map((host) => <article key={host.id} className="remote-host-row" aria-busy={scope.pending.has(host.id)}>
         <div className="remote-host-row__identity">
           <Server aria-hidden="true" />
           <span>
@@ -233,6 +234,22 @@ export function RemoteHostsSettings({ controller, snapshot, activeTargetId, show
           </span>
         </div>
         <div className="remote-host-row__actions">
+          <span><strong>{t("settings.remoteHosts.autoConnect")}</strong><small>{t("settings.remoteHosts.autoConnectBody")}</small></span>
+          <SwitchControl
+            checked={host.autoConnect}
+            disabled={!ready || !capabilities.management || scope.pending.has(host.id)}
+            aria-label={t("settings.remoteHosts.autoConnect")}
+            onChange={(event) => perform(
+              host.id,
+              () => api.setRemoteHostAutoConnect(
+                targetId,
+                host.id,
+                host.revision,
+                host.autoConnectRevision,
+                event.target.checked
+              )
+            )}
+          />
           <Pill tone={host.status.state === "ready" ? "success" : host.status.state === "failed" ? "danger" : host.status.state === "connecting" || host.status.state === "authenticating" ? "warning" : "neutral"}>
             {t(`settings.remoteHosts.status.${host.status.state}`)}
           </Pill>

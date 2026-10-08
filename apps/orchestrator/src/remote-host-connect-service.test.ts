@@ -183,7 +183,9 @@ describe("RemoteHostService", () => {
       port: 22,
       credentialReferenceId: "agent:alpha",
       source: contract.RemoteHostSource.MANUAL,
-      status: { state: contract.RemoteHostStatus.DISCONNECTED }
+      status: { state: contract.RemoteHostStatus.DISCONNECTED },
+      autoConnect: false,
+      autoConnectRevision: { value: 1n }
     });
     const firstPage = await service.listRemoteHosts(create(contract.ListRemoteHostsRequestSchema, {
       targetId: "target-a",
@@ -235,6 +237,82 @@ describe("RemoteHostService", () => {
       hostId: "alpha"
     }), callContext)).rejects.toSatisfy(connectCode(Code.NotFound));
     expect(authenticate.mock.calls.length).toBeGreaterThanOrEqual(9);
+  });
+
+  it("requires explicit auto-connect state and both exact revisions without advancing the Host revision", async () => {
+    const fixture = createFixture();
+    const service = createRemoteHostConnectService(
+      fixture.registry,
+      () => ({ connectionId: "connection-auto-connect" }),
+      undefined,
+      fixture.now
+    );
+    const created = await service.createRemoteHost(create(contract.CreateRemoteHostRequestSchema, {
+      requestId: "request-auto-connect",
+      targetId: "target-a",
+      hostId: "build-box",
+      hostname: "build.example.test",
+      user: "maker",
+      authenticationMode: contract.RemoteHostAuthenticationMode.SYSTEM_AGENT
+    }), context());
+    expect(created.host).toMatchObject({
+      autoConnect: false,
+      autoConnectRevision: { value: 1n }
+    });
+
+    const baseRequest = {
+      targetId: "target-a",
+      hostId: "build-box",
+      expectedHostRevision: created.host?.revision,
+      expectedAutoConnectRevision: created.host?.autoConnectRevision
+    };
+    await expect(service.setRemoteHostAutoConnect(create(contract.SetRemoteHostAutoConnectRequestSchema, {
+      ...baseRequest
+    }), context())).rejects.toSatisfy(connectCode(Code.InvalidArgument));
+    await expect(service.setRemoteHostAutoConnect(create(contract.SetRemoteHostAutoConnectRequestSchema, {
+      targetId: "target-a",
+      hostId: "build-box",
+      expectedAutoConnectRevision: created.host?.autoConnectRevision,
+      enabled: true
+    }), context())).rejects.toSatisfy(connectCode(Code.InvalidArgument));
+    await expect(service.setRemoteHostAutoConnect(create(contract.SetRemoteHostAutoConnectRequestSchema, {
+      targetId: "target-a",
+      hostId: "build-box",
+      expectedHostRevision: created.host?.revision,
+      enabled: true
+    }), context())).rejects.toSatisfy(connectCode(Code.InvalidArgument));
+
+    const enabled = await service.setRemoteHostAutoConnect(create(contract.SetRemoteHostAutoConnectRequestSchema, {
+      ...baseRequest,
+      enabled: true
+    }), context());
+    expect(enabled.host).toEqual({
+      ...created.host,
+      autoConnect: true,
+      autoConnectRevision: toProtoRevision(2n)
+    });
+
+    await expect(service.setRemoteHostAutoConnect(create(contract.SetRemoteHostAutoConnectRequestSchema, {
+      ...baseRequest,
+      expectedHostRevision: toProtoRevision((created.host?.revision?.value ?? 0n) + 1n),
+      expectedAutoConnectRevision: enabled.host?.autoConnectRevision,
+      enabled: false
+    }), context())).rejects.toSatisfy(connectCode(Code.Aborted));
+    await expect(service.setRemoteHostAutoConnect(create(contract.SetRemoteHostAutoConnectRequestSchema, {
+      ...baseRequest,
+      enabled: false
+    }), context())).rejects.toSatisfy(connectCode(Code.Aborted));
+
+    const disabled = await service.setRemoteHostAutoConnect(create(contract.SetRemoteHostAutoConnectRequestSchema, {
+      ...baseRequest,
+      expectedAutoConnectRevision: enabled.host?.autoConnectRevision,
+      enabled: false
+    }), context());
+    expect(disabled.host).toEqual({
+      ...created.host,
+      autoConnect: false,
+      autoConnectRevision: toProtoRevision(3n)
+    });
   });
 
   it("fences revision before credential resolution and returns only bounded connection failures", async () => {
@@ -360,7 +438,7 @@ describe("RemoteHostService", () => {
       user: "maker",
       source: "manual"
     });
-    fixture.registry.create({
+    const observed = fixture.registry.create({
       targetId: "target-a",
       id: "observed",
       hostname: "observed.example.test",
@@ -375,6 +453,30 @@ describe("RemoteHostService", () => {
         value: {
           kind: contract.RemoteHostChangeKind.UPSERTED,
           host: { targetId: "target-a", hostId: "observed" }
+        }
+      }
+    });
+    await service.setRemoteHostAutoConnect(create(contract.SetRemoteHostAutoConnectRequestSchema, {
+      targetId: "target-a",
+      hostId: "observed",
+      expectedHostRevision: toProtoRevision(observed.revision),
+      expectedAutoConnectRevision: toProtoRevision(observed.autoConnectRevision),
+      enabled: true
+    }), context());
+    const preferenceChanged = await iterator.next();
+    expect(preferenceChanged.value).toMatchObject({
+      sequence: 3n,
+      update: {
+        case: "change",
+        value: {
+          kind: contract.RemoteHostChangeKind.UPSERTED,
+          host: {
+            targetId: "target-a",
+            hostId: "observed",
+            revision: { value: observed.revision },
+            autoConnect: true,
+            autoConnectRevision: { value: observed.autoConnectRevision + 1n }
+          }
         }
       }
     });

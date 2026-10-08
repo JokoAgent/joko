@@ -227,6 +227,8 @@ function createFixture(options: FixtureOptions) {
     remoteWorkspace
   };
   const host: RemoteHostRecord = {
+    autoConnect: false,
+    autoConnectRevision: 1n,
     ownerId: "owner-a",
     targetId: target.id,
     id: "host-a",

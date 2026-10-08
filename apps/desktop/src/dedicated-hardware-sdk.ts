@@ -17,8 +17,8 @@ const SDK_LOCK_FILE = "joko-dedicated-hardware-sdk.lock.json";
 const SDK_LOCK_MAX_BYTES = 64 * 1024;
 const SDK_DIRECTORY_DIGEST_DOMAIN = "joko-dedicated-hardware-sdk-directory-v1";
 
-// A lock is an integrity claim, not a redistribution grant. Production stays
-// unavailable until legal review adds one exact artifact to this Joko-owned list.
+// This list gates SDK redistribution only. Locally installed SDKs and the native
+// USB helper are resolved independently by the hardware runtime loader.
 export const APPROVED_DEDICATED_HARDWARE_SDK_ARTIFACTS: readonly DedicatedHardwareSdkLock[] = Object.freeze([]);
 
 export type DedicatedHardwareSdkLock = DedicatedHardwareSdkManifest;

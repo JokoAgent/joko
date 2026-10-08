@@ -105,6 +105,11 @@ export const DESKTOP_CHANNELS = {
   dedicatedHardwareStateChanged: "joko:hardware-input:state:changed",
   dedicatedHardwareAction: "joko:hardware-input:action",
   dedicatedHardwarePreviewInput: "joko:hardware-input:preview:input",
+  nativeGamepadCaptureDocument: "joko:native-gamepad:document:capture",
+  nativeGamepadGetSnapshot: "joko:native-gamepad:snapshot:get",
+  nativeGamepadSetClientState: "joko:native-gamepad:client-state:set",
+  nativeGamepadProbe: "joko:native-gamepad:probe",
+  nativeGamepadSnapshot: "joko:native-gamepad:snapshot",
   chooseFiles: "joko:files:choose",
   choosePortableSessionFile: "joko:portable-session:choose",
   deepLinkTakePending: "joko:deep-link:take-pending",
@@ -115,6 +120,10 @@ export const DESKTOP_CHANNELS = {
   cancelFileCopy: "joko:files:copy-cancel",
   openFile: "joko:files:open",
   cancelFileOpen: "joko:files:open-cancel",
+  openWithCaptureDocument: "joko:files:open-with:document:capture",
+  listOpenWithApps: "joko:files:open-with:list",
+  retireOpenWithApps: "joko:files:open-with:retire",
+  openFileWithApp: "joko:files:open-with:open",
   revealArtifactSource: "joko:files:reveal-artifact-source",
   cancelArtifactSourceReveal: "joko:files:reveal-artifact-source-cancel",
   credentialGet: "joko:credential:get",
@@ -329,6 +338,7 @@ export type DesktopUpdateRelaunchResult =
 
 export interface DesktopAppInfo {
   readonly name: string;
+  readonly defaultDeviceName: string;
   readonly version: string;
   readonly platform: NodeJS.Platform;
   readonly electronVersion: string;
@@ -672,6 +682,114 @@ export interface DesktopKeepAwakeSettings {
   readonly enabled: boolean;
 }
 
+export type DesktopNativeGamepadFamily = "xbox" | "playstation" | "nintendo" | "generic";
+export type DesktopNativeGamepadTransport = "usb" | "bluetooth" | "unknown";
+export type DesktopNativeGamepadBatteryState = "unknown" | "discharging" | "charging" | "full";
+export type DesktopNativeGamepadStatus = "idle" | "starting" | "waiting" | "connected" | "unavailable" | "error";
+
+export interface DesktopNativeGamepadDevice {
+  readonly family: DesktopNativeGamepadFamily;
+  readonly name: string | null;
+  readonly category: string | null;
+  readonly transport: DesktopNativeGamepadTransport;
+  readonly batteryPercentage: number | null;
+  readonly batteryState: DesktopNativeGamepadBatteryState;
+  readonly buttons: readonly number[];
+  readonly axes: readonly number[];
+}
+
+export interface DesktopNativeGamepadSnapshot {
+  readonly version: 1;
+  readonly revision: number;
+  readonly status: DesktopNativeGamepadStatus;
+  readonly devices: readonly DesktopNativeGamepadDevice[];
+}
+
+export interface DesktopNativeGamepadClientState {
+  readonly version: 1;
+  readonly enabled: boolean;
+  readonly preview: boolean;
+}
+
+export function parseDesktopNativeGamepadClientState(value: unknown): DesktopNativeGamepadClientState {
+  if (!plainRecordWithKeys(value, ["version", "enabled", "preview"]) || value.version !== 1 ||
+    typeof value.enabled !== "boolean" || typeof value.preview !== "boolean") {
+    throw new TypeError("Desktop native gamepad client state is invalid.");
+  }
+  return Object.freeze({ version: 1, enabled: value.enabled, preview: value.preview });
+}
+
+export function parseDesktopNativeGamepadSnapshot(value: unknown): DesktopNativeGamepadSnapshot {
+  if (!plainRecordWithKeys(value, ["version", "revision", "status", "devices"]) || value.version !== 1 ||
+    !Number.isSafeInteger(value.revision) || (value.revision as number) < 0 ||
+    !isDesktopNativeGamepadStatus(value.status) || !Array.isArray(value.devices) || value.devices.length > 4) {
+    throw new TypeError("Desktop native gamepad snapshot is invalid.");
+  }
+  const devices = value.devices.map(parseDesktopNativeGamepadDevice);
+  if (new Set(devices.map((device) => device.family)).size !== devices.length) {
+    throw new TypeError("Desktop native gamepad snapshot is invalid.");
+  }
+  return Object.freeze({
+    version: 1,
+    revision: value.revision as number,
+    status: value.status,
+    devices: Object.freeze(devices)
+  });
+}
+
+function parseDesktopNativeGamepadDevice(value: unknown): DesktopNativeGamepadDevice {
+  if (!plainRecordWithKeys(value, [
+    "family", "name", "category", "transport", "batteryPercentage", "batteryState", "buttons", "axes"
+  ]) || !isDesktopNativeGamepadFamily(value.family) || !boundedNativeGamepadText(value.name) ||
+    !boundedNativeGamepadText(value.category) || !isDesktopNativeGamepadTransport(value.transport) ||
+    (value.batteryPercentage !== null && (typeof value.batteryPercentage !== "number" ||
+      !Number.isInteger(value.batteryPercentage) || value.batteryPercentage < 0 || value.batteryPercentage > 100)) ||
+    !isDesktopNativeGamepadBatteryState(value.batteryState)) {
+    throw new TypeError("Desktop native gamepad device is invalid.");
+  }
+  const buttons = parseNativeGamepadNumberArray(value.buttons, 17, 0, 1);
+  const axes = parseNativeGamepadNumberArray(value.axes, 4, -1, 1);
+  return Object.freeze({
+    family: value.family,
+    name: value.name,
+    category: value.category,
+    transport: value.transport,
+    batteryPercentage: value.batteryPercentage,
+    batteryState: value.batteryState,
+    buttons,
+    axes
+  });
+}
+
+function parseNativeGamepadNumberArray(value: unknown, length: number, minimum: number, maximum: number): readonly number[] {
+  if (!Array.isArray(value) || value.length !== length || !value.every((entry) =>
+    typeof entry === "number" && Number.isFinite(entry) && entry >= minimum && entry <= maximum)) {
+    throw new TypeError("Desktop native gamepad input values are invalid.");
+  }
+  return Object.freeze([...value] as number[]);
+}
+
+function boundedNativeGamepadText(value: unknown): value is string | null {
+  return value === null || (typeof value === "string" && value.length <= 512 && !/[\u0000-\u001f\u007f]/u.test(value));
+}
+
+function isDesktopNativeGamepadFamily(value: unknown): value is DesktopNativeGamepadFamily {
+  return value === "xbox" || value === "playstation" || value === "nintendo" || value === "generic";
+}
+
+function isDesktopNativeGamepadTransport(value: unknown): value is DesktopNativeGamepadTransport {
+  return value === "usb" || value === "bluetooth" || value === "unknown";
+}
+
+function isDesktopNativeGamepadBatteryState(value: unknown): value is DesktopNativeGamepadBatteryState {
+  return value === "unknown" || value === "discharging" || value === "charging" || value === "full";
+}
+
+function isDesktopNativeGamepadStatus(value: unknown): value is DesktopNativeGamepadStatus {
+  return value === "idle" || value === "starting" || value === "waiting" || value === "connected" ||
+    value === "unavailable" || value === "error";
+}
+
 export type DesktopProviderModelRefreshLifecycleHint =
   | "system-resume"
   | "screen-unlock"
@@ -714,6 +832,43 @@ export interface DesktopOpenFileRequest {
 export type DesktopOpenFileResult =
   | { readonly status: "opened" | "cancelled" | "unknown" | "unavailable" }
   | { readonly status: "failed"; readonly reason: "capacity" | "storage" | "open" };
+
+export interface DesktopOpenWithApp {
+  readonly appId: string;
+  readonly label: string;
+  readonly iconDataUrl?: string;
+}
+
+export interface DesktopListOpenWithAppsRequest {
+  readonly listOccurrence: string;
+  readonly name: string;
+}
+
+export interface DesktopListOpenWithAppsIpcRequest extends DesktopListOpenWithAppsRequest {
+  readonly documentOccurrence: string;
+}
+
+export type DesktopListOpenWithAppsResult =
+  | {
+      readonly status: "listed";
+      readonly listOccurrence: string;
+      readonly apps: readonly DesktopOpenWithApp[];
+    }
+  | { readonly status: "cancelled" | "unavailable" | "failed" };
+
+export interface DesktopRetireOpenWithAppsIpcRequest {
+  readonly documentOccurrence: string;
+  readonly listOccurrence: string;
+}
+
+export interface DesktopOpenFileWithAppRequest extends DesktopOpenFileRequest {
+  readonly listOccurrence: string;
+  readonly appId: string;
+}
+
+export interface DesktopOpenFileWithAppIpcRequest extends DesktopOpenFileWithAppRequest {
+  readonly documentOccurrence: string;
+}
 
 export interface DesktopRevealArtifactSourceRequest {
   readonly requestId: string;

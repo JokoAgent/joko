@@ -1,9 +1,10 @@
 import { clone, create, fromBinary, toBinary } from "@bufbuild/protobuf";
+import { BackgroundTaskSchema, SubagentRunSchema, SubagentRunDetailSchema, SubagentTranscriptEntrySchema } from "@joko/contracts";
 import { Code } from "@connectrpc/connect";
 import { createHash } from "node:crypto";
 import sharp from "sharp";
 import {
-  AcknowledgementSchema, ArtifactKind, ArtifactSchema, BackendDescriptorSchema, BackendModelAccessSettingsSchema, BackendSettingsSchema, BlobDisposition, BlobRefSchema,
+  AcknowledgementSchema, ArtifactKind, ArtifactSchema, AudioArtifactKind, BackendDescriptorSchema, BackendModelAccessSettingsSchema, BackendSettingsSchema, BlobDisposition, BlobRefSchema,
   CapabilityManifestSchema, CapabilityOptionsSchema, CapabilitySchema, CapabilitySupport, CompactSessionOutcome, ConnectionSchema, ConnectionState,
   ContextUsageSchema, DeviceKind, DevicePresenceState, DeviceSchema, EntityKind, EntityVersionSchema,
   FileKind, FilePreviewSchema, FileRevisionSchema, TextFilePreviewSchema, TargetSchema, WorkspaceDescriptorSchema, WorkspaceEntrySchema, WorkspaceFileChangeKind, WorkspaceFileChangeSchema,
@@ -41,6 +42,7 @@ import {
   type PairedCredential
 } from "./network";
 import type { Event, Operation, Schedule, ScheduleInput, SessionMessageSearchMatch, Snapshot, WorkspaceEntry, WorkspaceFileChange } from "@joko/contracts";
+import { mobileDeviceNameSource, type MobileDeviceNameSourceProvider } from "./mobile-device-name";
 import type { MobileInteractionDraftIdentity } from "./interaction-draft-store";
 import { MobileComposerDraftStore } from "./composer-draft-store";
 import { MobileNewTaskDraftStore } from "./new-task-draft-store";
@@ -95,7 +97,7 @@ const connection = create(ConnectionSchema, {
   state: ConnectionState.CONNECTED, version: { revision: { value: 4n } }
 });
 const device = create(DeviceSchema, {
-  deviceId: credential.deviceId, displayName: "Phone", kind: DeviceKind.MOBILE, platform: "android",
+  deviceId: credential.deviceId, displayName: "Phone", defaultDisplayName: "Phone", kind: DeviceKind.MOBILE, platform: "android",
   connectionIds: [credential.connectionId], presence: DevicePresenceState.ONLINE, version: { revision: { value: 5n } }
 });
 const otherCredential: PairedCredential = {
@@ -112,7 +114,7 @@ const otherConnection = create(ConnectionSchema, {
   state: ConnectionState.CONNECTED, version: { revision: { value: 6n } }
 });
 const otherDevice = create(DeviceSchema, {
-  deviceId: otherCredential.deviceId, displayName: otherCredential.displayName, kind: DeviceKind.MOBILE,
+  deviceId: otherCredential.deviceId, displayName: otherCredential.displayName, defaultDisplayName: otherCredential.displayName, kind: DeviceKind.MOBILE,
   platform: "ios", connectionIds: [otherCredential.connectionId], presence: DevicePresenceState.OFFLINE,
   version: { revision: { value: 7n } }
 });
@@ -949,6 +951,10 @@ function fakeNetwork(): MobileNetwork {
     })),
     unregisterMobilePush: vi.fn(async () => undefined),
     readSession: vi.fn(async () => snapshot),
+    listBackgroundTasks: vi.fn(async () => ({ tasks: [], nextPageToken: "" })),
+    listSubagentRuns: vi.fn(async () => ({ runs: [], nextPageToken: "" })),
+    getSubagentRun: vi.fn(async () => { throw new Error("No delegated run fixture was configured."); }),
+    listSubagentTranscript: vi.fn(async () => ({ entries: [], nextPageToken: "", tailPageToken: "" })),
     readNativeSessionTree: vi.fn(async () => create(NativeSessionTreeSchema, {
       sessionId: "session",
       activeEntryId: "native-current",
@@ -1047,7 +1053,11 @@ function fakeNetwork(): MobileNetwork {
 
 function projectedNetwork(projected: Snapshot): MobileNetwork {
   const network = fakeNetwork();
-  network.readOwner = vi.fn(async () => ({ connection, device, snapshot: projected }));
+  network.readOwner = vi.fn(async () => ({
+    connection: projected.connections.find((item) => item.connectionId === credential.connectionId) ?? connection,
+    device: projected.devices.find((item) => item.deviceId === credential.deviceId) ?? device,
+    snapshot: projected
+  }));
   network.readSession = vi.fn(async () => projected);
   return network;
 }
@@ -1642,6 +1652,59 @@ function committedAttachment(attachment: MobileLocalComposerAttachment) {
   });
 }
 
+describe("mobile current task delegated reads", () => {
+  function delegatedNetwork() {
+    const network = fakeNetwork();
+    const owner = create(SnapshotSchema, { ...snapshot, scope: create(SnapshotScopeSchema, { kind: { case: "owner", value: create(OwnerSnapshotScopeSchema) } }),
+      backends: [create(BackendDescriptorSchema, { ...snapshot.backends[0]!, capabilities: create(CapabilityManifestSchema, { capabilities: [capabilityNames.backgroundTasks, capabilityNames.subagentsList,
+        capabilityNames.subagentsDetail, capabilityNames.subagentsTranscript].map((name) => create(CapabilitySchema, { name, support: CapabilitySupport.SUPPORTED })) }) })] });
+    const detail = create(SnapshotSchema, { ...owner, scope: create(SnapshotScopeSchema, { kind: { case: "session", value: create(SessionSnapshotScopeSchema, { sessionId: "session" }) } }) });
+    network.readOwner = vi.fn(async () => ({ connection, device, snapshot: owner }));
+    network.readSession = vi.fn(async () => detail);
+    return { network, owner, detail };
+  }
+
+  it("reads typed Session scoped background/run/detail/child pages only through the current authenticated owner", async () => {
+    const { network } = delegatedNetwork();
+    network.listBackgroundTasks = vi.fn(async () => ({ tasks: [create(BackgroundTaskSchema, { backgroundTaskId: "background", sessionId: "session" })], nextPageToken: "background-next" }));
+    network.listSubagentRuns = vi.fn(async () => ({ runs: [create(SubagentRunSchema, { subagentRunId: "run", sessionId: "session" })], nextPageToken: "runs-next" }));
+    network.getSubagentRun = vi.fn(async () => create(SubagentRunDetailSchema, { run: { subagentRunId: "run", sessionId: "session" } }));
+    network.listSubagentTranscript = vi.fn(async () => ({ entries: [create(SubagentTranscriptEntrySchema, { entryId: "entry", sequence: 2n })], nextPageToken: "more", tailPageToken: "tail" }));
+    const app = client(network, memoryStorage(credential).storage); await app.start();
+    const controls = app.taskDelegatedControls(); expect(controls).toBeDefined();
+    expect(await app.loadTaskBackgroundTasks(controls!.authorityKey, "background-token")).toMatchObject({ nextPageToken: "background-next" });
+    expect(await app.loadTaskDelegatedRuns(controls!.authorityKey, "run-token")).toMatchObject({ nextPageToken: "runs-next" });
+    await app.loadTaskDelegatedDetail(controls!.authorityKey, "run");
+    await app.loadTaskDelegatedTranscript(controls!.authorityKey, "run", "child", "page-token");
+    expect(network.listBackgroundTasks).toHaveBeenCalledExactlyOnceWith(credential, "session", "background-token", expect.any(AbortSignal));
+    expect(network.listSubagentRuns).toHaveBeenCalledExactlyOnceWith(credential, "session", "run-token", expect.any(AbortSignal));
+    expect(network.getSubagentRun).toHaveBeenCalledExactlyOnceWith(credential, "session", "run", expect.any(AbortSignal));
+    expect(network.listSubagentTranscript).toHaveBeenCalledExactlyOnceWith(credential, "session", "run", "child", "page-token", expect.any(AbortSignal));
+    await expect(app.loadTaskDelegatedRuns("other-owner")).rejects.toThrow("owner");
+    expect(network.listSubagentRuns).toHaveBeenCalledOnce();
+  });
+
+  it("cancels caller reads and rejects late responses after foreground retirement without granting unsupported detail", async () => {
+    const { network, owner, detail } = delegatedNetwork();
+    network.getSubagentRun = vi.fn(() => { throw new Error("must not read unsupported detail"); });
+    owner.backends[0]!.capabilities!.capabilities = owner.backends[0]!.capabilities!.capabilities.filter((value) => value.name !== capabilityNames.subagentsDetail);
+    detail.backends = owner.backends;
+    const app = client(network, memoryStorage(credential).storage); await app.start();
+    const controls = app.taskDelegatedControls()!; expect(controls.canReadDetail).toBe(false);
+    await expect(app.loadTaskDelegatedDetail(controls.authorityKey, "run")).rejects.toThrow("unavailable");
+    expect(network.getSubagentRun).not.toHaveBeenCalled();
+    let resolve!: (page: { runs: ReturnType<typeof create<typeof SubagentRunSchema>>[]; nextPageToken: string }) => void;
+    let signal!: AbortSignal;
+    network.listSubagentRuns = vi.fn((_credential, _sessionId, _token, activeSignal) => {
+      signal = activeSignal!; return new Promise<Awaited<ReturnType<MobileNetwork["listSubagentRuns"]>>>((finish) => { resolve = finish; });
+    });
+    const caller = new AbortController(); const pending = app.loadTaskDelegatedRuns(controls.authorityKey, "", caller.signal);
+    caller.abort(); expect(signal.aborted).toBe(true); app.setForeground(false);
+    expect(app.taskDelegatedControls()).toBeUndefined(); resolve({ runs: [], nextPageToken: "" });
+    await expect(pending).rejects.toThrow("owner changed");
+  });
+});
+
 const clients: MobileClient[] = [];
 function client(
   network: MobileNetwork,
@@ -1657,11 +1720,12 @@ function client(
   modelPreviewFiles?: MobileModelPreviewFiles,
   fileShare?: Pick<MobileFileShare, "perform">,
   offlineCache?: Pick<MobileOfflineCache, "load" | "save" | "clear">,
-  readOnlyDictionaryCache?: { clear(profileId: string): Promise<void> }
+  readOnlyDictionaryCache?: { clear(profileId: string): Promise<void> },
+  deviceNameSource: MobileDeviceNameSourceProvider = () => mobileDeviceNameSource(undefined, "android")
 ) {
   const instance = new MobileClient(network, storage, discovery ?? { scan: vi.fn(async () => []) }, newId, "android", now,
     clearInteractionDraft, drafts.newTask, drafts.composer, attachmentFiles, mediaPreviewFiles, pdfPreviewFiles,
-    modelPreviewFiles, fileShare, offlineCache, readOnlyDictionaryCache);
+    modelPreviewFiles, fileShare, offlineCache, readOnlyDictionaryCache, undefined, deviceNameSource);
   clients.push(instance);
   return instance;
 }
@@ -2685,7 +2749,7 @@ describe("native mobile connection and operation ownership", () => {
     expect(app.state.automaticProfileId).toBe(otherCredential.profileId);
     expect(saved.storage.loadCredential).toHaveBeenCalledWith(otherCredential.profileId);
     expect(saved.storage.loadCredential).not.toHaveBeenCalledWith(credential.profileId);
-    expect(network.readOwner).toHaveBeenCalledWith(otherCredential, expect.any(AbortSignal));
+    expect(network.readOwner).toHaveBeenCalledWith(otherCredential, expect.objectContaining({ defaultDisplayName: "Joko android" }), expect.any(AbortSignal));
   });
 
   it("restores a current-v1 task copy before anonymous inspection and retries into authoritative online state", async () => {
@@ -2929,7 +2993,7 @@ describe("native mobile connection and operation ownership", () => {
     vi.mocked(network.readOwner).mockImplementationOnce(() => new Promise((resolve) => { resolveCandidate = resolve; }));
 
     const switching = app.connectSaved(otherCredential.profileId, false);
-    await vi.waitFor(() => expect(network.readOwner).toHaveBeenCalledWith(otherCredential, expect.any(AbortSignal)));
+    await vi.waitFor(() => expect(network.readOwner).toHaveBeenCalledWith(otherCredential, expect.objectContaining({ defaultDisplayName: "Joko android" }), expect.any(AbortSignal)));
     expect(app.state).toMatchObject({
       status: "connected",
       activeProfileId: credential.profileId,
@@ -3131,7 +3195,7 @@ describe("native mobile connection and operation ownership", () => {
 
     await vi.waitFor(() => expect(network.readOwner).toHaveBeenCalledOnce());
     expect(network.inspect).toHaveBeenCalledWith(credential.origin, expect.any(AbortSignal));
-    expect(network.readOwner).toHaveBeenCalledWith(credential, expect.any(AbortSignal));
+    expect(network.readOwner).toHaveBeenCalledWith(credential, expect.objectContaining({ defaultDisplayName: "Joko android" }), expect.any(AbortSignal));
     expect(app.state.status).toBe("connected");
   });
 
@@ -3331,6 +3395,7 @@ describe("native mobile connection and operation ownership", () => {
       result: { payload: { case: "device", value: create(DeviceSchema, {
         ...device,
         displayName: "Field phone",
+        manualDisplayName: "Field phone",
         version: create(EntityVersionSchema, { revision: create(RevisionSchema, { value: 6n }) })
       }) } }
     }));
@@ -3369,7 +3434,10 @@ describe("native mobile connection and operation ownership", () => {
     vi.mocked(network.getOperation).mockResolvedValueOnce(create(OperationSchema, {
       operationId: "operation-1",
       connectionId: credential.connectionId,
-      state: OperationState.SUCCEEDED
+      state: OperationState.SUCCEEDED,
+      result: { payload: { case: "device", value: create(DeviceSchema, {
+        ...device, displayName: "Private phone label", manualDisplayName: "Private phone label"
+      }) } }
     }));
 
     await app.reconcile();
@@ -3379,6 +3447,124 @@ describe("native mobile connection and operation ownership", () => {
     expect(network.readOwner).toHaveBeenCalledTimes(2);
   });
 
+  it("reports a fresh current-device native source on Begin, Complete and owner reads", async () => {
+    const network = fakeNetwork();
+    const saved = memoryStorage();
+    let nativeName = "First native phone";
+    const app = client(network, saved.storage, undefined, undefined, undefined, undefined, undefined,
+      undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+      () => mobileDeviceNameSource(nativeName, "android"));
+    await app.start();
+    await app.requestPairing(credential.origin, "Manual phone");
+    expect(network.requestPairing).toHaveBeenLastCalledWith(credential.origin, "Manual phone", "android",
+      expect.objectContaining({ defaultDisplayName: "First native phone" }), expect.any(AbortSignal));
+    nativeName = "Second native phone";
+    await app.pair(credential.origin, "123456", "Manual phone");
+    expect(network.completePairing).toHaveBeenLastCalledWith(credential.origin, "challenge", "123456", "Manual phone", "android",
+      expect.objectContaining({ defaultDisplayName: "Second native phone" }), expect.any(AbortSignal));
+    nativeName = "Third native phone";
+    await app.refresh();
+    expect(network.readOwner).toHaveBeenLastCalledWith(credential,
+      expect.objectContaining({ defaultDisplayName: "Third native phone" }), expect.any(AbortSignal));
+  });
+
+  it.each([false, true])("preserves explicit current-device default-name overrides, existing override=%s", async (alreadyManual) => {
+    const current = create(DeviceSchema, { ...device, manualDisplayName: alreadyManual ? "Phone" : undefined });
+    const network = projectedNetwork(create(SnapshotSchema, { ...snapshot, devices: [current] }));
+    const saved = memoryStorage(credential);
+    const app = client(network, saved.storage);
+    await app.start();
+    vi.mocked(network.submit).mockImplementationOnce(async (_credential, operationId, mutation) => create(OperationSchema, {
+      operationId, connectionId: credential.connectionId, state: OperationState.SUCCEEDED, mutation,
+      result: { payload: { case: "device", value: create(DeviceSchema, { ...current, manualDisplayName: "Phone" }) } }
+    }));
+    expect(await app.renameCurrentDevice(credential.deviceId, "Phone")).toBe(true);
+    expect(network.submit).toHaveBeenCalledTimes(alreadyManual ? 0 : 1);
+  });
+
+  it("resets only the current-device manual name through CAS and the shared body-free receipt", async () => {
+    let current = create(DeviceSchema, { ...device, displayName: "Manual phone", manualDisplayName: "Manual phone" });
+    const network = fakeNetwork();
+    vi.mocked(network.readOwner).mockImplementation(async () => ({ connection, device: current,
+      snapshot: create(SnapshotSchema, { ...snapshot, devices: [current] }) }));
+    const saved = memoryStorage(credential);
+    const app = client(network, saved.storage);
+    await app.start();
+    vi.mocked(network.submit).mockImplementationOnce(async (_credential, operationId, mutation) => {
+      current = create(DeviceSchema, { ...device, version: create(EntityVersionSchema, { revision: { value: 6n } }) });
+      return create(OperationSchema, { operationId, connectionId: credential.connectionId, state: OperationState.SUCCEEDED, mutation,
+        result: { payload: { case: "device", value: current } } });
+    });
+    expect(await app.resetCurrentDevice(credential.deviceId)).toMatchObject({ defaultDisplayName: "Phone", displayName: "Phone" });
+    expect(vi.mocked(network.submit).mock.calls[0]?.[2]).toMatchObject({
+      preconditions: [{ entity: { kind: EntityKind.DEVICE, id: credential.deviceId }, expectedRevision: { value: 5n } }],
+      payload: { case: "resetDeviceName", value: { deviceId: credential.deviceId } }
+    });
+    expect(network.readOwner).toHaveBeenCalledTimes(2);
+    expect(app.state.error).toBeUndefined();
+    expect(app.state.owner?.devices[0]?.manualDisplayName).toBeUndefined();
+    expect(saved.pending()).toEqual([]);
+    await expect(app.resetCurrentDevice(otherCredential.deviceId)).rejects.toThrow(/Only the device/u);
+    expect(network.submit).toHaveBeenCalledOnce();
+  });
+
+  it("retains an unknown current-device reset across restart and blocks rename/reset replay", async () => {
+    const network = fakeNetwork();
+    const saved = memoryStorage(credential);
+    const app = client(network, saved.storage);
+    await app.start();
+    vi.mocked(network.submit).mockRejectedValueOnce(new Error("reply lost"));
+    expect(await app.resetCurrentDevice(credential.deviceId)).toBeUndefined();
+    expect(saved.pending()).toEqual([{ operationId: "operation-1", connectionId: credential.connectionId,
+      kind: "device-rename", targetDeviceId: credential.deviceId, state: "unknown" }]);
+    await expect(app.renameCurrentDevice(credential.deviceId, "Manual phone")).rejects.toThrow(/unresolved result/u);
+    await expect(app.resetCurrentDevice(credential.deviceId)).rejects.toThrow(/unresolved result/u);
+    app.dispose();
+    vi.mocked(network.getOperation).mockResolvedValue(create(OperationSchema, {
+      operationId: "operation-1", connectionId: credential.connectionId, state: OperationState.SUCCEEDED,
+      result: { payload: { case: "device", value: device } }
+    }));
+    const restarted = client(network, saved.storage);
+    await restarted.start();
+    expect(saved.pending()).toEqual([]);
+    expect(restarted.state.owner?.devices[0]?.displayName).toBe("Phone");
+    expect(network.submit).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    { invalid: "wrong Device", patch: { deviceId: "other-device" } },
+    { invalid: "manual still present", patch: { manualDisplayName: "Phone" } },
+    { invalid: "empty default", patch: { defaultDisplayName: "" } },
+    { invalid: "different effective name", patch: { displayName: "Different" } },
+    { invalid: "missing revision", patch: { version: undefined } }
+  ])("rejects a current-device reset with $invalid before consuming its receipt", async ({ patch }) => {
+    const network = fakeNetwork();
+    const saved = memoryStorage(credential);
+    const app = client(network, saved.storage);
+    await app.start();
+    vi.mocked(network.submit).mockImplementationOnce(async (_credential, operationId) => create(OperationSchema, {
+      operationId, connectionId: credential.connectionId, state: OperationState.SUCCEEDED,
+      result: { payload: { case: "device", value: create(DeviceSchema, { ...device, ...patch }) } }
+    }));
+    await expect(app.resetCurrentDevice(credential.deviceId)).rejects.toThrow(/expected Device result/u);
+    expect(saved.pending()).toMatchObject([{ kind: "device-rename", state: "unknown", targetDeviceId: credential.deviceId }]);
+    await expect(app.renameCurrentDevice(credential.deviceId, "Manual phone")).rejects.toThrow(/unresolved result/u);
+    expect(network.submit).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    { invalid: "revision", patch: { version: create(EntityVersionSchema, { revision: { value: 6n } }) } },
+    { invalid: "default source", patch: { defaultDisplayName: "Other source" } },
+    { invalid: "manual presence", patch: { manualDisplayName: "Phone" } }
+  ])("rejects a current-device owner read mixed with a different Snapshot $invalid", async ({ patch }) => {
+    const network = fakeNetwork();
+    vi.mocked(network.readOwner).mockResolvedValue({ connection, device: create(DeviceSchema, { ...device, ...patch }), snapshot });
+    const app = client(network, memoryStorage(credential).storage);
+    await app.start();
+    expect(app.state.status).not.toBe("connected");
+    expect(network.submit).not.toHaveBeenCalled();
+  });
+
   it("fails current-device rename closed for ambiguous owner identity or a missing Device revision", async () => {
     const ambiguous = projectedNetwork(create(SnapshotSchema, {
       ...snapshot,
@@ -3386,9 +3572,7 @@ describe("native mobile connection and operation ownership", () => {
     }));
     const ambiguousApp = client(ambiguous, memoryStorage(credential).storage);
     await ambiguousApp.start();
-    expect(ambiguousApp.state.status).toBe("connected");
-    await expect(ambiguousApp.renameCurrentDevice(credential.deviceId, "Renamed"))
-      .rejects.toThrow(/exact current profile, connection, mobile device, server/);
+    expect(ambiguousApp.state.status).not.toBe("connected");
     expect(ambiguous.submit).not.toHaveBeenCalled();
 
     const noRevision = projectedNetwork(create(SnapshotSchema, {
@@ -8720,6 +8904,41 @@ describe("native current-task Files ownership", () => {
     app.setForeground(false);
     await vi.waitFor(() => expect(media.removed).toEqual(["preview-media-lease-1.mp4"]));
     expect(app.state.files.preview).toBeUndefined();
+  });
+
+  it("reads canonical Generated audio metadata and an independent authenticated cover without replacing the player lease", async () => {
+    const network = fakeNetwork(); configureFiles(network);
+    const cover = Uint8Array.from(await sharp({ create: { width: 3, height: 2, channels: 4, background: "orange" } }).png().toBuffer());
+    const coverBlob = create(BlobRefSchema, { blobId: "audio-cover", fileName: "cover.png", mediaType: "image/png",
+      byteSize: BigInt(cover.length), sha256Hex: createHash("sha256").update(cover).digest("hex") });
+    const audio = create(ArtifactSchema, { artifactId: "audio-canonical", sessionId: "session", title: "Raw file title",
+      blob: { blobId: "audio-body", fileName: "music.wav", mediaType: "audio/wav", byteSize: BigInt(previewWavBytes.length), sha256Hex: "d".repeat(64) },
+      audioMetadata: { kind: AudioArtifactKind.MUSIC, title: "Canonical track", description: `Full ${"description ".repeat(400)}end`,
+        durationSeconds: 12.5, artwork: { blob: coverBlob, widthPixels: 3, heightPixels: 2, altText: "Track cover" } } });
+    vi.mocked(network.listSessionArtifacts).mockResolvedValue({ artifacts: [audio], revision: "audio-artifacts" });
+    vi.mocked(network.downloadBlob).mockImplementation(async (_credential, blob) => blob.blobId === coverBlob.blobId
+      ? { bytes: cover, mediaType: "image/png" } : { bytes: previewWavBytes, mediaType: "audio/wav" });
+    const media = mediaPreviewFixture("d".repeat(64));
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined, () => "audio-metadata-lease",
+      undefined, undefined, undefined, media.files);
+    await app.start(); await app.openFiles(); await app.previewArtifact(app.state.files.artifacts[0]!);
+    const preview = app.state.files.preview;
+    if (preview?.kind !== "media") throw new Error("Audio preview was not materialized.");
+    expect(preview).toMatchObject({ title: "Canonical track", audioMetadata: { kind: "music", durationSeconds: 12.5,
+      description: audio.audioMetadata!.description, artwork: { blob: { blobId: coverBlob.blobId }, width: 3, height: 2 } } });
+    const owner = app.audioPreviewOwnerKey(preview); expect(owner).toBeDefined();
+    expect(await app.readAudioArtwork(preview, new AbortController().signal)).toMatchObject({ uri: expect.stringMatching(/^data:image\/png;base64,/u), width: 3, height: 2 });
+    const copy = app.prepareAudioDescriptionCopy(preview); expect(copy.text).toBe(audio.audioMetadata!.description); copy.assertCurrent();
+    vi.mocked(network.downloadBlob).mockResolvedValue({ bytes: Uint8Array.from([...cover.slice(0, -1), cover.at(-1)! ^ 1]), mediaType: "image/png" });
+    await expect(app.readAudioArtwork(preview, new AbortController().signal)).rejects.toThrow(/bytes changed/u);
+    expect(app.state.files.preview).toBe(preview); expect(app.audioPreviewOwnerKey(preview)).toBe(owner);
+    expect(media.driver.write).toHaveBeenCalledTimes(1); expect(media.removed).toEqual([]);
+    expect(network.downloadBlob).toHaveBeenCalledWith(credential, expect.objectContaining({ blobId: coverBlob.blobId }), expect.any(AbortSignal));
+    let finish!: (value: { bytes: Uint8Array; mediaType: string }) => void;
+    vi.mocked(network.downloadBlob).mockImplementation(() => new Promise((resolve) => { finish = resolve; }));
+    const pending = app.readAudioArtwork(preview, new AbortController().signal);
+    app.closeFilesPreview(); finish({ bytes: cover, mediaType: "image/png" });
+    await expect(pending).rejects.toThrow(/source changed/u); expect(() => copy.assertCurrent()).toThrow(/source changed/u);
   });
 
   it("previews an exact Workspace audio Blob and rejects a mismatched container before cache write", async () => {

@@ -7,6 +7,7 @@ import "joko/v1/common.proto";
 import "joko/v1/interaction.proto";
 import "joko/v1/model.proto";
 import "joko/v1/operation.proto";
+import "joko/v1/objective.proto";
 import "joko/v1/pi.proto";
 import "joko/v1/runtime.proto";
 import "joko/v1/review.proto";
@@ -88,6 +89,7 @@ message EventPayload {
     RuntimeRecoveryChangedEvent runtime_recovery_changed = 71;
     HistoryPrunedEvent history_pruned = 72;
     ResourceUsageRecordedEvent resource_usage_recorded = 73;
+    ObjectiveLifecycleEvent objective_lifecycle = 74;
   }
 }
 
@@ -199,6 +201,40 @@ message MessageStartedEvent {
   // Only the Host may mark user_input as the canonical accepted Queue input.
   // False denotes native history without typed mention, quote, or paste authority.
   bool user_input_accepted = 11;
+  // Host-authored marker for one Objective-owned turn. This authority is not
+  // part of public InputContent and cannot be supplied by SendInput callers.
+  ObjectiveContinuation objective_continuation = 12;
+}
+
+message ObjectiveContinuation {
+  uint64 owner_generation = 1;
+  uint32 turn = 2;
+}
+
+enum ObjectiveLifecycleAction {
+  OBJECTIVE_LIFECYCLE_ACTION_UNSPECIFIED = 0;
+  OBJECTIVE_LIFECYCLE_ACTION_STARTED = 1;
+  OBJECTIVE_LIFECYCLE_ACTION_REPLACED = 2;
+  OBJECTIVE_LIFECYCLE_ACTION_PAUSED = 3;
+  OBJECTIVE_LIFECYCLE_ACTION_RESUMED = 4;
+  OBJECTIVE_LIFECYCLE_ACTION_COMPLETED = 5;
+  OBJECTIVE_LIFECYCLE_ACTION_BLOCKED = 6;
+  OBJECTIVE_LIFECYCLE_ACTION_LIMITED = 7;
+  OBJECTIVE_LIFECYCLE_ACTION_DISPATCH_UNKNOWN = 8;
+  OBJECTIVE_LIFECYCLE_ACTION_CLEARED = 9;
+}
+
+message ObjectiveLifecycleEvent {
+  ObjectiveLifecycleAction action = 1;
+  ObjectiveStatus status = 2;
+  uint64 owner_generation = 3;
+  uint32 turns_used = 4;
+  string reason = 5;
+  // Required for STARTED and REPLACED so Timeline history does not depend on
+  // the mutable current Objective row.
+  string objective_text = 6;
+  uint64 tokens_used = 7;
+  uint64 elapsed_ms = 8;
 }
 
 enum RuntimeRecoveryState {

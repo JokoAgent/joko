@@ -6,6 +6,7 @@ const path = require("node:path");
 const expoRequire = createRequire(require.resolve("expo/package.json"));
 const upstreamTransformer = expoRequire("@expo/metro-config/babel-transformer");
 const esbuild = require("esbuild");
+const { buildConnectionRuntimeModule, getConnectionRuntimeCacheKey } = require("./connection-runtime-transformer.cjs");
 
 const expectedStandardFonts = [
   "FoxitDingbats.pfb",
@@ -175,6 +176,10 @@ function buildRichMarkdownRuntimeModule(src, filename) {
 }
 
 module.exports.transform = ({ src, filename, options }) => {
+  if (filename.endsWith(".connjs")) {
+    return buildConnectionRuntimeModule(src, filename)
+      .then((transformed) => upstreamTransformer.transform({ src: transformed, filename, options }));
+  }
   const transformed = filename.endsWith(".svg")
     ? `module.exports = ${JSON.stringify(src)};`
     : filename.endsWith(".pdfjs") ? buildPdfJsRuntimeModule(src, filename)
@@ -184,3 +189,8 @@ module.exports.transform = ({ src, filename, options }) => {
 };
 
 module.exports.testing = { buildModelViewerRuntimeModule, buildPdfJsRuntimeModule, buildRichMarkdownRuntimeModule, expectedStandardFonts };
+
+module.exports.getCacheKey = (options) => crypto.createHash("sha256")
+  .update(upstreamTransformer.getCacheKey?.(options) ?? "")
+  .update(getConnectionRuntimeCacheKey())
+  .digest("hex");

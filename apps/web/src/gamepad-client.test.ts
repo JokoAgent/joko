@@ -2,10 +2,12 @@
 import { beforeEach, afterEach, describe, expect, it, vi } from "vitest";
 import { GamepadClient, createGamepadDomInput, GAMEPAD_SCROLL_EVENT, GAMEPAD_SKILL_EVENT, GAMEPAD_VOICE_EVENT } from "./gamepad-client.js";
 import { createDefaultGamepadPreferences, saveGamepadPreferences, type GamepadInputEffect } from "./gamepad-input.js";
+import { parseNativeGamepadSnapshot, type NativeGamepadBridge, type NativeGamepadSnapshot } from "./native-gamepad.js";
 
 let pads: Gamepad[];
 const cleanup: (() => void)[] = [];
 beforeEach(() => {
+  Reflect.deleteProperty(window, "jokoDesktop");
   pads = [pad()];
   window.localStorage.clear();
   vi.spyOn(document, "hasFocus").mockReturnValue(true);
@@ -14,7 +16,12 @@ beforeEach(() => {
   Object.defineProperty(navigator, "getGamepads", { configurable: true, value: () => pads });
   saveGamepadPreferences({ ...createDefaultGamepadPreferences(), enabled: true });
 });
-afterEach(() => { cleanup.splice(0).forEach((stop) => stop()); document.body.replaceChildren(); document.body.className = ""; vi.restoreAllMocks(); });
+afterEach(() => {
+  cleanup.splice(0).forEach((stop) => stop());
+  document.body.replaceChildren(); document.body.className = "";
+  Reflect.deleteProperty(window, "jokoDesktop");
+  vi.restoreAllMocks();
+});
 
 function pad(): Gamepad {
   return { index: 0, id: "Standard controller", mapping: "standard", connected: true,
@@ -29,8 +36,109 @@ function sampler(): { client: GamepadClient; effects: GamepadInputEffect[] } {
   cleanup.push(client.start((effect) => effects.push(effect)));
   return { client, effects };
 }
+function nativeSnapshot(revision: number, status: NativeGamepadSnapshot["status"] = "connected", down: number[] = []): NativeGamepadSnapshot {
+  return {
+    version: 1, revision, status,
+    devices: status === "connected" ? [{
+      family: "playstation", name: "Wireless Controller", category: "DualSense", transport: "bluetooth",
+      batteryPercentage: 75, batteryState: "charging",
+      buttons: Array.from({ length: 17 }, (_, index) => down.includes(index) ? 1 : 0), axes: [0, 0, 0, 0]
+    }] : []
+  };
+}
+function installNative(initial: unknown): { readonly bridge: NativeGamepadBridge; readonly push: (value: unknown) => void } {
+  let listener: ((value: unknown) => void) | undefined;
+  const bridge: NativeGamepadBridge = {
+    getSnapshot: vi.fn(async () => initial),
+    setClientState: vi.fn(async () => initial),
+    probe: vi.fn(async () => initial),
+    onSnapshot: vi.fn((next) => { listener = next; return () => { listener = undefined; }; })
+  };
+  Object.defineProperty(window, "jokoDesktop", {
+    configurable: true,
+    value: { capabilities: ["hardware.nativeGamepad"], nativeGamepad: bridge } as unknown as JokoDesktopApi
+  });
+  return { bridge, push: (value) => listener?.(value) };
+}
 
 describe("gamepad document sampler", () => {
+  it("strictly parses native frames and keeps the native helper as the single input source", async () => {
+    const getGamepads = vi.fn(() => pads);
+    Object.defineProperty(navigator, "getGamepads", { configurable: true, value: getGamepads });
+    const native = installNative(nativeSnapshot(1));
+    const { client, effects } = sampler();
+    await vi.waitFor(() => expect(client.getSnapshot().status).toBe("connected"));
+    expect(getGamepads).not.toHaveBeenCalled();
+    expect(client.getSnapshot().devices[0]).toMatchObject({
+      source: "native", family: "playstation", name: "Wireless Controller", category: "DualSense",
+      transport: "bluetooth", batteryPercentage: 75, batteryState: "charging"
+    });
+    native.push(nativeSnapshot(2, "connected", [0]));
+    expect(effects).toContainEqual({ kind: "action", action: "submit", phase: "press" });
+    expect(getGamepads).not.toHaveBeenCalled();
+    const replacement = nativeSnapshot(3, "connected", [0]);
+    native.push({ ...replacement, devices: replacement.devices.map((device) => ({ ...device, name: "Replacement Controller" })) });
+    expect(effects.at(-1)).toEqual({ kind: "action", action: "submit", phase: "cancel" });
+
+    const malformed = { ...nativeSnapshot(4), unexpected: true };
+    expect(parseNativeGamepadSnapshot(malformed)).toBeUndefined();
+    native.push(malformed);
+    expect(client.getSnapshot().nativeFallback).toBe("error");
+    expect(getGamepads).toHaveBeenCalled();
+  });
+  it("falls back to browser standard mapping with an explicit native warning", async () => {
+    const getGamepads = vi.fn(() => pads);
+    Object.defineProperty(navigator, "getGamepads", { configurable: true, value: getGamepads });
+    installNative(nativeSnapshot(1, "unavailable"));
+    const { client } = sampler();
+    await vi.waitFor(() => expect(client.getSnapshot()).toMatchObject({ status: "connected", nativeFallback: "unavailable" }));
+    expect(getGamepads).toHaveBeenCalled();
+    expect(client.getSnapshot().devices[0]?.source).toBe("browser");
+  });
+  it("publishes native interest for enabled input or preview and clears it on pagehide and stop", async () => {
+    const native = installNative(nativeSnapshot(1, "waiting"));
+    const client = new GamepadClient(window);
+    const stop = client.start(() => {});
+    await vi.waitFor(() => expect(native.bridge.setClientState).toHaveBeenCalledWith({ version: 1, enabled: true, preview: false }));
+    saveGamepadPreferences({ ...createDefaultGamepadPreferences(), enabled: false });
+    document.body.innerHTML = '<section data-gamepad-preview="true"></section>';
+    client.sample(16);
+    expect(native.bridge.setClientState).toHaveBeenCalledWith({ version: 1, enabled: false, preview: true });
+    window.dispatchEvent(new PageTransitionEvent("pagehide"));
+    expect(native.bridge.setClientState).toHaveBeenCalledWith({ version: 1, enabled: false, preview: false });
+    window.dispatchEvent(new PageTransitionEvent("pageshow"));
+    expect(native.bridge.setClientState).toHaveBeenLastCalledWith({ version: 1, enabled: false, preview: true });
+    stop();
+    expect(native.bridge.setClientState).toHaveBeenLastCalledWith({ version: 1, enabled: false, preview: false });
+  });
+  it("re-registers unchanged native interest after a rejected update and a successful probe", async () => {
+    const native = installNative(nativeSnapshot(1, "waiting"));
+    vi.mocked(native.bridge.setClientState).mockRejectedValueOnce(new Error("IPC unavailable"));
+    vi.mocked(native.bridge.probe).mockResolvedValue(nativeSnapshot(2, "waiting"));
+    const { client } = sampler();
+    await vi.waitFor(() => expect(client.getSnapshot().nativeFallback).toBe("error"));
+    expect(native.bridge.setClientState).toHaveBeenCalledTimes(1);
+    await client.probe();
+    await vi.waitFor(() => expect(native.bridge.setClientState).toHaveBeenCalledTimes(2));
+    expect(native.bridge.setClientState).toHaveBeenLastCalledWith({ version: 1, enabled: true, preview: false });
+    await vi.waitFor(() => expect(client.getSnapshot().nativeFallback).toBeUndefined());
+  });
+  it("retries a rejected pagehide clear without animation frames and forces clear again on stop", async () => {
+    const native = installNative(nativeSnapshot(1, "waiting"));
+    const setClientState = vi.mocked(native.bridge.setClientState);
+    setClientState.mockResolvedValueOnce(nativeSnapshot(1, "waiting"))
+      .mockRejectedValueOnce(new Error("IPC unavailable"))
+      .mockResolvedValue(nativeSnapshot(2, "idle"));
+    const client = new GamepadClient(window);
+    const stop = client.start(() => {});
+    await vi.waitFor(() => expect(setClientState).toHaveBeenCalledWith({ version: 1, enabled: true, preview: false }));
+    window.dispatchEvent(new PageTransitionEvent("pagehide"));
+    await vi.waitFor(() => expect(setClientState.mock.calls.filter(([state]) => !state.enabled && !state.preview)).toHaveLength(2), { timeout: 1_000 });
+    stop();
+    expect(setClientState.mock.calls.filter(([state]) => !state.enabled && !state.preview)).toHaveLength(3);
+    await new Promise((resolve) => window.setTimeout(resolve, 300));
+    expect(setClientState.mock.calls.filter(([state]) => !state.enabled && !state.preview)).toHaveLength(3);
+  });
   it("cancels immediately on blur and composition; held input is not replayed on return", () => {
     const { client, effects } = sampler(); client.sample(0); press(6); client.sample(16);
     expect(effects.at(-1)).toEqual({ kind: "action", action: "voice", phase: "press" });

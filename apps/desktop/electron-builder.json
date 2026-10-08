@@ -85,6 +85,22 @@
       ]
     },
     {
+      "from": "dist/native-hardware",
+      "to": "native-hardware",
+      "filter": [
+        "manifest.json",
+        "joko-windows-micro-helper.exe"
+      ]
+    },
+    {
+      "from": "dist/native-gamepad",
+      "to": "native-gamepad",
+      "filter": [
+        "manifest.json",
+        "joko-macos-gamepad-helper"
+      ]
+    },
+    {
       "from": "dist/native-simulator-hid",
       "to": "native-simulator-hid",
       "filter": [

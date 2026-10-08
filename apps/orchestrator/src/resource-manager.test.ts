@@ -33,7 +33,21 @@ class FakeAcquisition implements PiPackageAcquisition {
         ? {
             peerDependencies: { "@earendil-works/pi-coding-agent": "^0.84.0" },
             scripts: { postinstall: "node setup.js" },
-            pi: { extensions: ["extensions/index.ts"] }
+            pi: { extensions: ["extensions/index.ts"] },
+            joko: {
+              extensionSurfaces: {
+                schemaVersion: 1,
+                extensions: [{
+                  entry: "extensions/index.ts",
+                  recommendations: [{
+                    id: "review-package",
+                    label: "Review package",
+                    prompt: "Review this package for correctness.",
+                    command: "review"
+                  }]
+                }]
+              }
+            }
           }
         : { pi: { skills: ["skills"] } })
     }), "utf8");
@@ -1059,7 +1073,7 @@ describe("PiResourceManager", () => {
 
   it("requires a fresh installed-byte approval whenever an acquired extension package changes", async () => {
     const acquisition = new FakeAcquisition();
-    const { store, manager } = await fixture(acquisition, "0.84.2");
+    const { root, store, manager } = await fixture(acquisition, "0.84.2");
     const discovered = await manager.discoverPackage({
       id: "extension-package",
       backendId: "pi",
@@ -1081,11 +1095,20 @@ describe("PiResourceManager", () => {
     expect(installed.extensionContentFingerprint).toBe(installed.discoveredRevision);
     expect(installed.resourceDetails).toMatchObject([{
       kind: "extension",
+      recommendations: [{
+        id: "review-package",
+        label: "Review package",
+        prompt: "Review this package for correctness.",
+        command: "review"
+      }],
       compatibility: "partial",
       adaptedApis: ["setStatus"],
       unsupportedApis: ["setHeader"],
       compatibilityIssues: ["tui-layout"]
     }]);
+    const restarted = new PiResourceManager({ store, managedRoot: join(root, "managed") });
+    await restarted.initialize();
+    expect(restarted.get(installed.id).resourceDetails[0]?.recommendations).toEqual(installed.resourceDetails[0]?.recommendations);
     await expect(manager.setEnabled(installed.id, true)).rejects.toThrow(/fingerprint|approved/u);
 
     const contentApproved = await manager.approve(installed.id, installed.discoveredRevision, "owner-connection");
@@ -1100,6 +1123,27 @@ describe("PiResourceManager", () => {
     expect(updated.requiresExtensionApproval).toBe(true);
     expect(updated.extensionContentFingerprint).not.toBe(installed.extensionContentFingerprint);
     await expect(manager.setEnabled(updated.id, true)).rejects.toThrow(/fingerprint|approved/u);
+
+    const persisted = store.getSetting<{
+      readonly format: 1;
+      readonly records: readonly Record<string, unknown>[];
+    }>("service", "orchestrator", "pi_resource_catalog").value;
+    const extensionRecord = persisted.records.find((record) => record["id"] === installed.id)!;
+    const details = extensionRecord["resourceDetails"] as readonly Record<string, unknown>[];
+    store.setSetting("service", "orchestrator", "pi_resource_catalog", {
+      format: 1,
+      records: persisted.records.map((record) => record === extensionRecord
+        ? {
+            ...record,
+            resourceDetails: details.map((detail) => ({
+              ...detail,
+              recommendations: [{ id: "review-package", label: "Review package", prompt: "Review.", unknown: true }]
+            }))
+          }
+        : record)
+    });
+    const malformed = new PiResourceManager({ store, managedRoot: join(root, "managed") });
+    await expect(malformed.initialize()).rejects.toThrow(/recommendations/u);
     store.close();
   });
 

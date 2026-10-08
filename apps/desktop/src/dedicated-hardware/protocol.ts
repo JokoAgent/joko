@@ -128,6 +128,22 @@ export interface DedicatedHardwareSdkManifest {
 export type DedicatedHardwareSdkIdentity =
   | { readonly kind: "unavailable" }
   | {
+      readonly kind: "installed";
+      readonly packageDirectory: string;
+      readonly entryPath: string;
+      readonly packageVersion: string;
+      readonly entrySha256: string;
+      readonly platform: DedicatedHardwareSdkPlatform;
+      readonly architecture: DedicatedHardwareSdkArchitecture;
+    }
+  | {
+      readonly kind: "native-usb";
+      readonly executablePath: string;
+      readonly sha256: string;
+      readonly platform: "win32";
+      readonly architecture: DedicatedHardwareSdkArchitecture;
+    }
+  | {
       readonly kind: "staged";
       readonly stagingDirectory: string;
       readonly manifest: DedicatedHardwareSdkManifest;
@@ -505,6 +521,21 @@ export function canonicalDedicatedHardwareSdkManifestJson(
 
 export function parseDedicatedHardwareSdkIdentity(value: unknown): DedicatedHardwareSdkIdentity | undefined {
   if (hasExactKeys(value, ["kind"]) && value.kind === "unavailable") return { kind: "unavailable" };
+  if (hasExactKeys(value, ["kind", "packageDirectory", "entryPath", "packageVersion", "entrySha256", "platform", "architecture"]) &&
+      value.kind === "installed" && isBoundedPath(value.packageDirectory) && isBoundedPath(value.entryPath) &&
+      isPackageVersion(value.packageVersion) && isSha256(value.entrySha256) &&
+      isOption(value.platform, DEDICATED_HARDWARE_SDK_PLATFORMS) &&
+      isOption(value.architecture, DEDICATED_HARDWARE_SDK_ARCHITECTURES)) {
+    return { kind: "installed", packageDirectory: value.packageDirectory, entryPath: value.entryPath,
+      packageVersion: value.packageVersion, entrySha256: value.entrySha256,
+      platform: value.platform, architecture: value.architecture };
+  }
+  if (hasExactKeys(value, ["kind", "executablePath", "sha256", "platform", "architecture"]) &&
+      value.kind === "native-usb" && isBoundedPath(value.executablePath) && isSha256(value.sha256) &&
+      value.platform === "win32" && isOption(value.architecture, DEDICATED_HARDWARE_SDK_ARCHITECTURES)) {
+    return { kind: "native-usb", executablePath: value.executablePath, sha256: value.sha256,
+      platform: "win32", architecture: value.architecture };
+  }
   if (!hasExactKeys(value, ["kind", "stagingDirectory", "manifest"]) || value.kind !== "staged" ||
       !isBoundedPath(value.stagingDirectory)) return undefined;
   const manifest = parseDedicatedHardwareSdkManifest(value.manifest);
@@ -514,6 +545,10 @@ export function parseDedicatedHardwareSdkIdentity(value: unknown): DedicatedHard
     stagingDirectory: value.stagingDirectory,
     manifest
   };
+}
+
+function isSha256(value: unknown): value is string {
+  return typeof value === "string" && /^[a-f0-9]{64}$/u.test(value);
 }
 
 function decodeFrame<T>(frame: string | Uint8Array, maximum: number, parse: (value: unknown) => T | undefined): T | undefined {

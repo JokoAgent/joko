@@ -44,6 +44,63 @@ it("uses one authoritative catalog stream and keeps an edited root through snaps
   expect(root.value).toBe("/home/joko/unsaved");
 });
 
+it("submits the startup auto-connect preference once and waits for Watch truth", async () => {
+  const fixture = await mountSettings();
+  const current = host();
+  const mutation = deferred<RemoteHostView>();
+  vi.mocked(fixture.controller.setRemoteHostAutoConnect).mockReturnValueOnce(mutation.promise);
+  await fixture.publish([current]);
+
+  const toggle = button("Connect automatically when the service starts");
+  expect(toggle.getAttribute("aria-checked")).toBe("false");
+  await act(async () => toggle.click());
+  expect(fixture.controller.setRemoteHostAutoConnect).toHaveBeenCalledWith(
+    "target-one",
+    "build-box",
+    1n,
+    1n,
+    true
+  );
+  expect(toggle.disabled).toBe(true);
+  expect(toggle.getAttribute("aria-checked")).toBe("false");
+  expect(fixture.controller.connectRemoteHost).not.toHaveBeenCalled();
+  expect(fixture.controller.disconnectRemoteHost).not.toHaveBeenCalled();
+
+  await act(async () => mutation.resolve({ ...current, autoConnect: true, autoConnectRevision: 2n }));
+  expect(toggle.disabled).toBe(false);
+  expect(toggle.getAttribute("aria-checked")).toBe("false");
+  await fixture.publish([{ ...current, autoConnect: true, autoConnectRevision: 2n }]);
+  expect(toggle.getAttribute("aria-checked")).toBe("true");
+});
+
+it("keeps the watched auto-connect value after failure and retires errors from an old controller owner", async () => {
+  const fixture = await mountSettings();
+  const current = host();
+  const failed = deferred<RemoteHostView>();
+  vi.mocked(fixture.controller.setRemoteHostAutoConnect).mockReturnValueOnce(failed.promise);
+  await fixture.publish([current]);
+  const toggle = button("Connect automatically when the service starts");
+  await act(async () => toggle.click());
+  await act(async () => failed.reject(new Error("preference failed")));
+  expect(toggle.getAttribute("aria-checked")).toBe("false");
+  expect(toggle.disabled).toBe(false);
+  expect(document.body.textContent).toContain("The Remote Host action could not be confirmed");
+
+  await act(async () => document.querySelector<HTMLButtonElement>(".error-banner button")?.click());
+  const retired = deferred<RemoteHostView>();
+  vi.mocked(fixture.controller.setRemoteHostAutoConnect).mockReturnValueOnce(retired.promise);
+  await act(async () => toggle.click());
+  const replacement = {
+    ...fixture.controller,
+    setRemoteHostAutoConnect: (...args: Parameters<AppController["setRemoteHostAutoConnect"]>) => fixture.controller.setRemoteHostAutoConnect(...args)
+  } as AppController;
+  await fixture.render(replacement);
+  await fixture.publish([current]);
+  await act(async () => retired.reject(new Error("retired failure")));
+  expect(document.body.textContent).not.toContain("The Remote Host action could not be confirmed");
+  expect(button("Connect automatically when the service starts").getAttribute("aria-checked")).toBe("false");
+});
+
 it("keeps a source Host undeletable while another project is bound to it", async () => {
   const fixture = await mountSettings();
   const ready = { ...host(), trust: { algorithm: "ssh-ed25519", sha256Fingerprint: "SHA256:test", pinnedAt: 1 },
@@ -304,6 +361,8 @@ function host(): RemoteHostView {
     authentication: "privateKey",
     credentialReferenceId: "ssh-key-reference",
     status: { state: "disconnected", changedAt: 1 },
+    autoConnect: false,
+    autoConnectRevision: 1n,
     revision: 1n
   };
 }
@@ -527,6 +586,9 @@ async function mountSettings(options: {
     updateTarget: vi.fn(async () => undefined), saveCredential: options.saveCredential ?? vi.fn(async () => undefined),
     createRemoteHost: vi.fn(async () => host()), updateRemoteHost: vi.fn(async () => host()),
     deleteRemoteHost: vi.fn(async () => undefined), connectRemoteHost: vi.fn(async () => host()),
+    setRemoteHostAutoConnect: vi.fn(async (_targetId, _hostId, expectedHostRevision, expectedAutoConnectRevision, enabled) => ({
+      ...host(), revision: expectedHostRevision, autoConnectRevision: expectedAutoConnectRevision + 1n, autoConnect: enabled
+    })),
     disconnectRemoteHost: vi.fn(async () => host()), testRemoteHostConnection: vi.fn(async () => host()), clearRemoteHostTrust: vi.fn(async () => host()),
     probeRemoteBackendRuntime: vi.fn(async () => runtime("notInstalled")),
     installRemoteBackendRuntime: vi.fn(async function* (): AsyncGenerator<RemoteBackendRuntimeInstallEventView> {

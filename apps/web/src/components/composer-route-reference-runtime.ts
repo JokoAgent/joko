@@ -1,5 +1,6 @@
 import type { AppController } from "../controller.js";
 import type { NativeSessionTreeNodeView, TimelineItemView } from "../model.js";
+import { isInternalContinuationTimelineItem } from "../runtime-recovery.js";
 import type { ComposerRouteReferenceResolutionTarget } from "./composer-route-reference-resolution.js";
 
 /** Resolve chips from the freshest owner snapshot, then use bounded read APIs for history. */
@@ -49,6 +50,7 @@ export function referencedTimelineText(
     identities.has(candidate.id)
     || (candidate.sourceEventId !== undefined && identities.has(candidate.sourceEventId))
     || (candidate.nativeEntryId !== undefined && identities.has(candidate.nativeEntryId)));
+  if (item !== undefined && isInternalContinuationTimelineItem(item)) return null;
   if (item?.kind !== "user" && item?.kind !== "assistant") return null;
   return item.text?.trim() || null;
 }

@@ -18,14 +18,14 @@ describe("RemoteExecutionRouter", () => {
     const controller = store.createConnection({
       id: "controller-connection",
       deviceId: "controller-device",
-      device: { name: "Controller", kind: "web", platform: "web" },
+      device: { defaultName: "Controller", kind: "web", platform: "web" },
       name: "Controller",
       authKeyDigest: "controller-digest"
     });
     const target = store.createConnection({
       id: "target-connection",
       deviceId: "target-device",
-      device: { name: "Target", kind: "desktop", platform: "windows" },
+      device: { defaultName: "Target", kind: "desktop", platform: "windows" },
       name: "Target",
       authKeyDigest: "target-digest"
     });

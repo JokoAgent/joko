@@ -123,7 +123,22 @@ function replayingHost(
 
 describe("Connect Extension catalog boundary", () => {
   it("maps a filtered runtime-backed catalog and preserves its owner and revision identity", async () => {
-    const base = extensionEntry();
+    const base = extensionEntry({
+      recommendations: [{
+        id: "review-changes",
+        label: "Review changes",
+        prompt: "Review the current changes.",
+        command: "review",
+        locales: {
+          en: { label: "Review changes", prompt: "Review the current changes." },
+          "zh-CN": { label: "审查改动", prompt: "审查当前改动。" }
+        }
+      }, {
+        id: "plan-work",
+        label: "Plan work",
+        prompt: "Create an implementation plan."
+      }]
+    });
     const runtime = {
       ...base,
       commands: [{ name: "review", description: "Review changes", sessionId: "runtime-session" }],
@@ -162,6 +177,21 @@ describe("Connect Extension catalog boundary", () => {
       revision: { value: 7n },
       source: contract.ExtensionCatalogSource.LOCAL,
       commands: [{ name: "review", sessionId: "runtime-session" }],
+      recommendations: [{
+        id: "review-changes",
+        label: "Review changes",
+        prompt: "Review the current changes.",
+        command: "review",
+        locales: [
+          { locale: "en", label: "Review changes", prompt: "Review the current changes." },
+          { locale: "zh-CN", label: "审查改动", prompt: "审查当前改动。" }
+        ]
+      }, {
+        id: "plan-work",
+        label: "Plan work",
+        prompt: "Create an implementation plan.",
+        locales: []
+      }],
       useSupported: true,
       owner: {
         kind: {

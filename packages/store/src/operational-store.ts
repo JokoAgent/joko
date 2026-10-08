@@ -18,6 +18,7 @@ import type {
   ArtifactReferenceSnapshot,
   BackendDescriptor,
   Capability,
+  DeviceContentProjection,
   EventPayload,
   InteractionDecision,
   PromptInput,
@@ -234,6 +235,7 @@ import type {
   ScheduleRunRecord,
   SchedulerRuntimeOwnerRecord,
   SearchSessionMessagesInput,
+  SetRemoteHostAutoConnectInput,
   SetMessagingConnectionEnabledInput,
   SessionLifecycleCleanupPhase,
   SessionLifecycleCleanupRecord,
@@ -1785,7 +1787,8 @@ export class OperationalStore {
       if (device === undefined) {
         this.createDevice({
           id: deviceId,
-          name: input.device?.name ?? input.name,
+          defaultName: input.device?.defaultName ?? "Joko Device",
+          ...(input.device?.manualName === undefined ? {} : { manualName: input.device.manualName }),
           ...(input.device?.kind === undefined ? {} : { kind: input.device.kind }),
           ...(input.device?.platform === undefined ? {} : { platform: input.device.platform }),
           ...(input.device?.appVersion === undefined ? {} : { appVersion: input.device.appVersion }),
@@ -1808,11 +1811,12 @@ export class OperationalStore {
       const pairedAt = input.pairedAt ?? this.now();
       this.database.prepare(`
         INSERT INTO devices(
-          id, name, kind, platform, app_version, state, remote_control_enabled, paired_at, revision
-        ) VALUES (?, ?, ?, ?, ?, 'active', 0, ?, ?)
+          id, default_name, manual_name, kind, platform, app_version, state, remote_control_enabled, paired_at, revision
+        ) VALUES (?, ?, ?, ?, ?, ?, 'active', 0, ?, ?)
       `).run(
         nonBlank(input.id, "Device id"),
-        nonBlank(input.name, "Device name"),
+        normalizeDeviceName(input.defaultName),
+        input.manualName === undefined ? null : normalizeDeviceName(input.manualName),
         input.kind ?? "unspecified",
         input.platform ?? "",
         input.appVersion ?? "",
@@ -2376,15 +2380,16 @@ export class OperationalStore {
       if (input.expiresAt <= createdAt) throw new PairingError("Pairing expiry must be in the future.");
       this.database.prepare(`
         INSERT INTO pairings(
-          id, code_digest, label, device_id, device_name, device_kind,
+          id, code_digest, label, device_id, device_default_name, device_manual_name, device_kind,
           device_platform, device_app_version, expires_at, created_at, revision
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         input.id,
         nonBlank(input.codeDigest, "Pairing code digest"),
         input.label ?? null,
         input.device?.id ?? null,
-        input.device?.name ?? null,
+        input.device === undefined ? null : normalizeDeviceName(input.device.defaultName),
+        input.device?.manualName === undefined ? null : normalizeDeviceName(input.device.manualName),
         input.device === undefined ? null : input.device.kind ?? "unspecified",
         input.device === undefined ? null : input.device.platform ?? "",
         input.device === undefined ? null : input.device.appVersion ?? "",
@@ -2789,18 +2794,71 @@ export class OperationalStore {
       if (expectedRevision !== undefined && current.revision !== expectedRevision) {
         throw new RevisionConflictError("Device", id, expectedRevision, current.revision);
       }
-      const normalized = nonBlank(name, "Device name");
-      if (current.name === normalized) return current;
+      const normalized = normalizeDeviceName(name);
+      if (current.state !== "active") throw new AuthorizationError("The device has been revoked.");
+      if (current.manualName === normalized) return current;
       const result = this.database.prepare(`
-        UPDATE devices SET name = ?, revision = ?
+        UPDATE devices SET manual_name = ?, revision = ?
         WHERE id = ? AND revision = ?
       `).run(normalized, asSqlInteger(this.requireActiveRevision()), id, asSqlInteger(current.revision));
       if (result.changes !== 1) {
         const changed = this.getDevice(id);
         throw new RevisionConflictError("Device", id, current.revision, changed.revision);
       }
-      return this.getDevice(id);
+      const changed = this.getDevice(id);
+      this.appendDeviceContentEvent(changed);
+      return changed;
     });
+  }
+
+  resetDeviceName(id: string, expectedRevision?: bigint): DeviceRecord {
+    return this.write(() => {
+      const current = this.getDevice(id);
+      if (expectedRevision !== undefined && current.revision !== expectedRevision) {
+        throw new RevisionConflictError("Device", id, expectedRevision, current.revision);
+      }
+      if (current.state !== "active") throw new AuthorizationError("The device has been revoked.");
+      if (current.manualName === undefined) return current;
+      this.database.prepare("UPDATE devices SET manual_name = NULL, revision = ? WHERE id = ?")
+        .run(asSqlInteger(this.requireActiveRevision()), id);
+      const changed = this.getDevice(id);
+      this.appendDeviceContentEvent(changed);
+      return changed;
+    });
+  }
+
+  refreshDeviceDefaultName(id: string, name: string): DeviceRecord {
+    const normalized = normalizeDeviceName(name);
+    const observed = this.getDevice(id);
+    if (observed.state !== "active") throw new AuthorizationError("The device has been revoked.");
+    if (observed.defaultName === normalized) return observed;
+    return this.write(() => {
+      const current = this.getDevice(id);
+      if (current.state !== "active") throw new AuthorizationError("The device has been revoked.");
+      if (current.defaultName === normalized) return current;
+      this.database.prepare("UPDATE devices SET default_name = ?, revision = ? WHERE id = ?")
+        .run(normalized, asSqlInteger(this.requireActiveRevision()), id);
+      const changed = this.getDevice(id);
+      this.appendDeviceContentEvent(changed);
+      return changed;
+    });
+  }
+
+  private appendDeviceContentEvent(device: DeviceRecord): void {
+    const revision = this.requireActiveRevision();
+    const emittedAt = this.now();
+    const id = this.idFactory();
+    const traceId = `device-content:${device.id}`;
+    const payloadJson = serializeJson({ payload: { type: "device_changed",
+      device: deviceContentProjection(device, this.listDeviceConnections(device.id), emittedAt) } });
+    const payload = parseDeviceContentEvent(parseJson<{ payload: unknown }>(payloadJson).payload);
+    const inserted = this.database.prepare(`
+      INSERT INTO events(id, revision, session_sequence, emitted_at, backend_id, target_id, session_id,
+        generation, trace_id, payload_json)
+      VALUES (?, ?, 1, ?, NULL, NULL, NULL, 0, ?, ?)
+    `).run(id, asSqlInteger(revision), emittedAt, traceId, payloadJson);
+    this.currentFrame().events.push({ id, globalCursor: toBigInt(inserted.lastInsertRowid), sequence: 1n,
+      revision, emittedAt, backendId: "", targetId: "", sessionId: "", generation: 0, traceId, payload });
   }
 
   setDeviceRemoteControlEnabled(id: string, enabled: boolean, expectedRevision?: bigint): DeviceRecord {
@@ -2936,11 +2994,12 @@ export class OperationalStore {
       this.database.prepare(`
         INSERT INTO remote_hosts(
           owner_id, target_id, host_id, hostname, port, username, source,
+          auto_connect, auto_connect_revision,
           authentication_mode, credential_reference_id, node_key_id, node_key_fingerprint,
           trust_algorithm, trust_fingerprint, trust_pinned_at,
           status, status_changed_at, failure_code, failure_retryable,
           created_at, updated_at, revision
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, 'disconnected', ?, NULL, NULL, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, 1, ?, ?, ?, ?, NULL, NULL, NULL, 'disconnected', ?, NULL, NULL, ?, ?, ?)
       `).run(
         ownerId,
         targetId,
@@ -3055,6 +3114,55 @@ export class OperationalStore {
           current.id,
           current.revision,
           this.findRemoteHost(current.ownerId, current.targetId, current.id)?.revision ?? 0n
+        );
+      }
+      return this.getRemoteHost(current.ownerId, current.targetId, current.id);
+    });
+  }
+
+  setRemoteHostAutoConnect(input: SetRemoteHostAutoConnectInput): RemoteHostRecord {
+    return this.write(() => {
+      const current = this.getRemoteHost(input.ownerId, input.targetId, input.id);
+      assertRemoteHostRevision(current, input.expectedRevision);
+      if (current.autoConnectRevision !== input.expectedAutoConnectRevision) {
+        throw new RevisionConflictError(
+          "Remote Host auto-connect preference",
+          current.id,
+          input.expectedAutoConnectRevision,
+          current.autoConnectRevision
+        );
+      }
+      if (current.autoConnect === input.enabled) return current;
+      const nextAutoConnectRevision = current.autoConnectRevision + 1n;
+      const result = this.database.prepare(`
+        UPDATE remote_hosts SET
+          auto_connect = ?, auto_connect_revision = ?
+        WHERE owner_id = ? AND target_id = ? AND host_id = ?
+          AND revision = ? AND auto_connect_revision = ?
+      `).run(
+        boolInt(input.enabled),
+        asSqlInteger(nextAutoConnectRevision),
+        current.ownerId,
+        current.targetId,
+        current.id,
+        asSqlInteger(current.revision),
+        asSqlInteger(current.autoConnectRevision)
+      );
+      if (result.changes !== 1) {
+        const changed = this.getRemoteHost(current.ownerId, current.targetId, current.id);
+        if (changed.revision !== current.revision) {
+          throw new RevisionConflictError(
+            "Remote Host",
+            current.id,
+            current.revision,
+            changed.revision
+          );
+        }
+        throw new RevisionConflictError(
+          "Remote Host auto-connect preference",
+          current.id,
+          current.autoConnectRevision,
+          changed.autoConnectRevision
         );
       }
       return this.getRemoteHost(current.ownerId, current.targetId, current.id);
@@ -3609,13 +3717,14 @@ export class OperationalStore {
       const current = this.findObjective(input.sessionId);
       const at = objectiveTimestamp(input.updatedAt ?? this.now(), "update time");
       if (current === undefined) {
+        const ownerGeneration = this.advanceObjectiveOwnerGeneration(input.sessionId);
         this.database.prepare(`
           INSERT INTO session_objectives(
-            session_id, objective_text, status, token_budget, maximum_turns,
+            session_id, objective_text, status, usage_reset_at, token_budget, maximum_turns,
             no_progress_turn_limit, turns_used, tokens_used,
             no_progress_turns, dispatch_rejections, last_reason,
             owner_generation, session_generation, started_at, updated_at, revision
-          ) VALUES (?, ?, ?, ?, ?, ?, 0, 0, 0, 0, NULL, 1, ?, ?, ?, ?)
+          ) VALUES (?, ?, ?, NULL, ?, ?, ?, 0, 0, 0, 0, NULL, ?, ?, ?, ?, ?)
         `).run(
           input.sessionId,
           text,
@@ -3623,16 +3732,18 @@ export class OperationalStore {
           tokenBudget ?? null,
           maximumTurns ?? null,
           noProgressTurnLimit ?? null,
+          ownerGeneration,
           sessionGeneration,
           at,
           at,
           asSqlInteger(this.requireActiveRevision())
         );
       } else {
-        const ownerGeneration = nextObjectiveOwnerGeneration(current.ownerGeneration);
+        const ownerGeneration = this.advanceObjectiveOwnerGeneration(input.sessionId, current.ownerGeneration);
         this.database.prepare(`
           UPDATE session_objectives SET
-            objective_text = ?, status = ?, token_budget = ?, maximum_turns = ?,
+            objective_text = ?, status = ?, usage_reset_at = NULL,
+            token_budget = ?, maximum_turns = ?,
             no_progress_turn_limit = ?, turns_used = 0, tokens_used = 0,
             no_progress_turns = 0, dispatch_rejections = 0, last_reason = NULL,
             owner_generation = ?, session_generation = ?, started_at = ?,
@@ -3673,8 +3784,17 @@ export class OperationalStore {
         throw new StoreError("Objective pending work cannot be cleared and replaced together.");
       }
       const ownerGeneration = input.advanceOwnerGeneration === true
-        ? nextObjectiveOwnerGeneration(current.ownerGeneration)
+        ? this.advanceObjectiveOwnerGeneration(input.sessionId, current.ownerGeneration)
         : current.ownerGeneration;
+      const status = input.status === undefined ? current.status : objectiveStatus(input.status);
+      const usageResetAt = input.usageResetAt === undefined
+        ? current.usageResetAt
+        : input.usageResetAt === null
+          ? undefined
+          : objectiveTimestamp(input.usageResetAt, "usage reset time");
+      if (usageResetAt !== undefined && status !== "usage_limited") {
+        throw new StoreError("Objective usage reset time requires usage-limited status.");
+      }
       if (input.pending !== undefined) {
         if (input.pending.ownerGeneration !== ownerGeneration) {
           throw new StaleGenerationError(ownerGeneration, input.pending.ownerGeneration);
@@ -3688,7 +3808,8 @@ export class OperationalStore {
         values.push(value);
       };
       if (input.text !== undefined) set("objective_text", objectiveText(input.text));
-      if (input.status !== undefined) set("status", objectiveStatus(input.status));
+      if (input.status !== undefined) set("status", status);
+      if (input.usageResetAt !== undefined) set("usage_reset_at", usageResetAt ?? null);
       if (input.tokenBudget !== undefined) {
         set("token_budget", input.tokenBudget === null
           ? null
@@ -3771,6 +3892,34 @@ export class OperationalStore {
       );
       return current;
     });
+  }
+
+  private advanceObjectiveOwnerGeneration(sessionId: string, expectedCurrent?: number): number {
+    const row = this.database.prepare(`
+      SELECT owner_generation FROM session_objective_generations WHERE session_id = ?
+    `).get(sessionId) as Row | undefined;
+    if (row === undefined) {
+      if (expectedCurrent !== undefined) {
+        throw new StoreError("Objective owner generation checkpoint is missing.");
+      }
+      this.database.prepare(`
+        INSERT INTO session_objective_generations(session_id, owner_generation) VALUES (?, 1)
+      `).run(sessionId);
+      return 1;
+    }
+    const current = numberValue(row["owner_generation"]);
+    if (expectedCurrent !== undefined && current !== expectedCurrent) {
+      throw new StaleGenerationError(expectedCurrent, current);
+    }
+    const next = nextObjectiveOwnerGeneration(current);
+    const result = this.database.prepare(`
+      UPDATE session_objective_generations SET owner_generation = ?
+      WHERE session_id = ? AND owner_generation = ?
+    `).run(next, sessionId, current);
+    if (result.changes !== 1) {
+      throw new StoreError("Objective owner generation checkpoint changed concurrently.");
+    }
+    return next;
   }
 
   createCollaborationGoal(input: CreateCollaborationGoalInput): CollaborationGoalRecord {
@@ -7693,6 +7842,8 @@ export class OperationalStore {
         asSqlInteger(current.revision)
       );
       if (descriptor.deletedAt === undefined && patch.deletedAt !== undefined) {
+        this.database.prepare("DELETE FROM session_objectives WHERE session_id = ?").run(id);
+        this.database.prepare("DELETE FROM session_objective_generations WHERE session_id = ?").run(id);
         const vectorRows = this.database.prepare(`
           SELECT record.event_cursor
           FROM message_embedding_records AS record
@@ -8560,6 +8711,18 @@ export class OperationalStore {
       if (currentAttempt !== undefined && currentAttempt.descriptor.runId !== item.runId) {
         throw new StoreError("Queue item attempt does not belong to its run.");
       }
+      const objective = this.findObjective(item.sessionId);
+      if (objective?.pendingQueueItemId === item.id) {
+        const exactOwner = objective.status === "active" &&
+          objective.pendingOwnerGeneration === objective.ownerGeneration &&
+          objective.pendingOperationId === item.operationId &&
+          objective.pendingRunId === item.runId &&
+          objective.pendingAttemptId === currentAttempt?.descriptor.id &&
+          objective.sessionGeneration === input.generation;
+        if (!exactOwner || currentAttempt === undefined) {
+          throw new StoreError("Objective pending work does not exactly own the renewed Queue Attempt.");
+        }
+      }
       if (
         currentAttempt?.descriptor.generation === input.generation &&
         currentAttempt.descriptor.backendInstanceGeneration === item.backendInstanceGeneration
@@ -8595,6 +8758,38 @@ export class OperationalStore {
         asSqlInteger(this.requireActiveRevision()),
         item.id
       );
+      if (objective?.pendingQueueItemId === item.id) {
+        if (currentAttempt === undefined) throw new StoreError("Objective pending Queue Attempt is missing.");
+        const rebound = this.database.prepare(`
+          UPDATE session_objectives
+          SET pending_attempt_id = ?, session_generation = ?, updated_at = ?, revision = ?
+          WHERE session_id = ?
+            AND status = 'active'
+            AND revision = ?
+            AND owner_generation = ?
+            AND pending_owner_generation = ?
+            AND pending_operation_id = ?
+            AND pending_run_id = ?
+            AND pending_attempt_id = ?
+            AND pending_queue_item_id = ?
+        `).run(
+          input.attemptId,
+          input.generation,
+          Math.max(objective.updatedAt, at),
+          asSqlInteger(this.requireActiveRevision()),
+          objective.sessionId,
+          asSqlInteger(objective.revision),
+          objective.ownerGeneration,
+          objective.ownerGeneration,
+          item.operationId,
+          item.runId,
+          currentAttempt.descriptor.id,
+          item.id
+        );
+        if (rebound.changes !== 1) {
+          throw new StoreError("Objective pending Queue Attempt changed before it could be renewed.");
+        }
+      }
       return this.getQueueItem(item.id);
     });
   }
@@ -9459,6 +9654,9 @@ export class OperationalStore {
 
   appendEvent(input: AppendEventInput): PersistedEvent {
     return this.write(() => {
+      if (input.payload.type === "device_changed") {
+        throw new StoreError("Device content observations are owned by the Store, not Session adapters.");
+      }
       const session = this.getSession(input.sessionId);
       if (
         session.descriptor.backendId !== input.backendId ||
@@ -9488,6 +9686,7 @@ export class OperationalStore {
       const payload = parseCurrentResourceUsageEventPayload(
         parseCurrentInteractionEventPayload(redactSubagentEventPayload(input.payload))
       );
+      if (payload.type === "device_changed") throw new StoreError("Device content cannot use Session routing.");
       if (payload.type === "resource_usage" && (
         input.runId === undefined || payload.runtimeGeneration !== input.generation
       )) {
@@ -9546,7 +9745,7 @@ export class OperationalStore {
         ...(input.operationId === undefined ? {} : { operationId: input.operationId }),
         generation: input.generation,
         traceId,
-        payload: parseJson<{ payload: EventPayload }>(serializeJson({ payload })).payload,
+        payload: parseJson<{ payload: typeof payload }>(serializeJson({ payload })).payload,
         ...(input.pi === undefined
           ? {}
           : { pi: parseJson<{ pi: NonNullable<AppendEventInput["pi"]> }>(serializeJson({ pi: input.pi })).pi }),
@@ -9691,7 +9890,8 @@ export class OperationalStore {
       "event.session_id = ?",
       "tombstone.event_id IS NULL",
       "json_extract(event.payload_json, '$.payload.type') = 'message_complete'",
-      "json_extract(event.payload_json, '$.payload.automaticContinuation') IS NULL"
+      "json_extract(event.payload_json, '$.payload.automaticContinuation') IS NULL",
+      "json_extract(event.payload_json, '$.payload.objectiveContinuation') IS NULL"
     ];
     const params: Array<string | number | bigint | null> = [...(nativeVisibility?.params ?? []), sessionId];
     if (input.eventId !== undefined) {
@@ -10441,7 +10641,7 @@ export class OperationalStore {
 
   /**
    * Returns the latest surviving user-authored message time for a Session.
-   * Automatic service continuations are control traffic, not user activity.
+   * Service-owned continuations are control traffic, not user activity.
    */
   findLatestVisibleUserMessageAt(sessionId: string): number | undefined {
     this.assertOpen();
@@ -10456,6 +10656,7 @@ export class OperationalStore {
         AND json_extract(event.payload_json, '$.payload.type') = 'message_complete'
         AND json_extract(event.payload_json, '$.payload.role') = 'user'
         AND json_extract(event.payload_json, '$.payload.automaticContinuation') IS NULL
+        AND json_extract(event.payload_json, '$.payload.objectiveContinuation') IS NULL
       ORDER BY event.global_cursor DESC
       LIMIT 1
     `).get(normalizedSessionId) as Row | undefined;
@@ -12801,6 +13002,7 @@ export class OperationalStore {
         AND json_extract(event.payload_json, '$.payload.type') = 'message_complete'
         AND json_extract(event.payload_json, '$.payload.role') IN ('user', 'assistant')
         AND json_extract(event.payload_json, '$.payload.automaticContinuation') IS NULL
+        AND json_extract(event.payload_json, '$.payload.objectiveContinuation') IS NULL
         AND (
           (
             identity.entry_id IS NOT NULL
@@ -12970,6 +13172,7 @@ export class OperationalStore {
         AND json_extract(event.payload_json, '$.payload.type') = 'message_complete'
         AND json_extract(event.payload_json, '$.payload.role') = 'assistant'
         AND json_extract(event.payload_json, '$.payload.automaticContinuation') IS NULL
+        AND json_extract(event.payload_json, '$.payload.objectiveContinuation') IS NULL
         ${nativeVisibility.clause("event")}
       ORDER BY event.global_cursor DESC
       LIMIT 1
@@ -17877,7 +18080,8 @@ function escapeLikePattern(query: string): string {
 }
 
 function visibleMessageText(payload: EventPayload): string | undefined {
-  if (payload.type === "message_complete" && payload.automaticContinuation !== undefined) return undefined;
+  if (payload.type === "message_complete"
+    && (payload.automaticContinuation !== undefined || payload.objectiveContinuation !== undefined)) return undefined;
   let parts: readonly string[];
   if (payload.type === "message_complete" && (payload.role === "user" || payload.role === "assistant")) {
     parts = payload.blocks.flatMap((block) =>
@@ -17939,9 +18143,13 @@ function connectionFromRow(row: Row): ConnectionRecord {
 }
 
 function deviceFromRow(row: Row): DeviceRecord {
+  const defaultName = stringValue(row["default_name"]);
+  const manualName = optionalString("manualName", row["manual_name"]).manualName;
   return {
     id: stringValue(row["id"]),
-    name: stringValue(row["name"]),
+    name: manualName ?? defaultName,
+    defaultName,
+    ...(manualName === undefined ? {} : { manualName }),
     kind: enumValue(row["kind"], ["unspecified", "web", "desktop", "service", "mobile"] as const),
     platform: stringValue(row["platform"]),
     appVersion: stringValue(row["app_version"]),
@@ -18020,11 +18228,12 @@ function mobilePushDeliveryFromRow(row: Row): MobilePushDeliveryRecord {
 
 function pairingFromRow(row: Row): PairingRecord {
   const deviceId = optionalString("deviceId", row["device_id"]).deviceId;
-  const deviceName = optionalString("deviceName", row["device_name"]).deviceName;
+  const deviceDefaultName = optionalString("deviceDefaultName", row["device_default_name"]).deviceDefaultName;
+  const deviceManualName = optionalString("deviceManualName", row["device_manual_name"]).deviceManualName;
   const deviceKind = optionalString("deviceKind", row["device_kind"]).deviceKind;
   const devicePlatform = optionalString("devicePlatform", row["device_platform"]).devicePlatform;
   const deviceAppVersion = optionalString("deviceAppVersion", row["device_app_version"]).deviceAppVersion;
-  const deviceFields = [deviceId, deviceName, deviceKind, devicePlatform, deviceAppVersion];
+  const deviceFields = [deviceId, deviceDefaultName, deviceKind, devicePlatform, deviceAppVersion];
   if (deviceFields.some((value) => value === undefined) && deviceFields.some((value) => value !== undefined)) {
     throw new StoreError("Stored Pairing Device metadata is incomplete.");
   }
@@ -18035,7 +18244,8 @@ function pairingFromRow(row: Row): PairingRecord {
     ...(deviceId === undefined ? {} : {
       device: {
         id: deviceId,
-        name: deviceName!,
+        defaultName: deviceDefaultName!,
+        ...(deviceManualName === undefined ? {} : { manualName: deviceManualName }),
         kind: enumValue(deviceKind, ["unspecified", "web", "desktop", "service", "mobile"] as const),
         platform: devicePlatform!,
         appVersion: deviceAppVersion!
@@ -18258,6 +18468,8 @@ function remoteHostFromRow(row: Row): RemoteHostRecord {
     port: remoteHostPort(numberValue(row["port"])),
     user: remoteHostUser(stringValue(row["username"])),
     source: remoteHostSource(stringValue(row["source"])),
+    autoConnect: booleanValue(row["auto_connect"]),
+    autoConnectRevision: toBigInt(row["auto_connect_revision"]),
     authenticationMode,
     ...(credentialReferenceId === undefined ? {} : { credentialReferenceId }),
     ...(nodeKey === undefined ? {} : { nodeKey }),
@@ -18407,6 +18619,7 @@ function objectiveFromRow(row: Row): ObjectiveRecord {
     noProgressTurns: numberValue(row["no_progress_turns"]),
     dispatchRejections: numberValue(row["dispatch_rejections"]),
     ...optionalString("lastReason", row["last_reason"]),
+    ...optionalNumber("usageResetAt", row["usage_reset_at"]),
     ownerGeneration: numberValue(row["owner_generation"]),
     sessionGeneration: numberValue(row["session_generation"]),
     ...(pendingOwnerGeneration === undefined
@@ -19804,6 +20017,16 @@ function eventFromRow(row: Row): PersistedEvent {
     readonly pi?: NonNullable<AppendEventInput["pi"]> | null;
   }>(stringValue(row["payload_json"]));
   const payload = parseCurrentInteractionEventPayload(stored.payload);
+  if (payload.type === "device_changed") {
+    if (row["backend_id"] !== null || row["target_id"] !== null || row["session_id"] !== null
+      || row["run_id"] !== null || row["attempt_id"] !== null || row["operation_id"] !== null
+      || row["generation"] !== 0 || row["namespace"] !== null || row["metadata_json"] !== null
+      || stored.pi !== undefined) throw new StoreError("Stored Device event routing is invalid.");
+    return { id: stringValue(row["id"]), globalCursor: toBigInt(row["global_cursor"]),
+      sequence: toBigInt(row["session_sequence"]), revision: toBigInt(row["revision"]),
+      emittedAt: numberValue(row["emitted_at"]), backendId: "", targetId: "", sessionId: "", generation: 0,
+      traceId: stringValue(row["trace_id"]), payload: parseDeviceContentEvent(stored.payload) };
+  }
   return {
     id: stringValue(row["id"]),
     globalCursor: toBigInt(row["global_cursor"]),
@@ -21022,6 +21245,55 @@ function normalizeOffset(value: number | undefined): number {
     throw new RangeError("Query offset must be a non-negative safe integer.");
   }
   return normalized;
+}
+
+export function normalizeDeviceName(value: string): string {
+  const normalized = value.trim();
+  if (normalized === "" || normalized.length > 128 || /[\u0000-\u001f\u007f]/u.test(normalized)) {
+    throw new StoreError("Device display name is invalid.");
+  }
+  return normalized;
+}
+
+export function deviceContentProjection(
+  record: DeviceRecord,
+  connections: readonly ConnectionRecord[],
+  observedAt: number
+): DeviceContentProjection {
+  return { id: record.id, name: record.name, defaultName: record.defaultName,
+    ...(record.manualName === undefined ? {} : { manualName: record.manualName }),
+    kind: record.kind, platform: record.platform, appVersion: record.appVersion,
+    revoked: record.state === "revoked", remoteControlEnabled: record.remoteControlEnabled,
+    pairedAt: record.pairedAt, ...(record.lastSeenAt === undefined ? {} : { lastSeenAt: record.lastSeenAt }),
+    connectionIds: connections.map((connection) => connection.id),
+    online: record.state === "active" && connections.some((connection) => connection.state === "active"
+      && connection.lastSeenAt !== undefined && observedAt - connection.lastSeenAt <= 75_000),
+    revision: record.revision.toString(), versionUpdatedAt: record.lastSeenAt ?? record.revokedAt ?? record.pairedAt };
+}
+
+function parseDeviceContentEvent(value: unknown): Extract<EventPayload, { readonly type: "device_changed" }> {
+  const invalid = (): never => { throw new StoreError("Stored Device content does not match its current-v1 shape."); };
+  if (!isRecord(value) || value["type"] !== "device_changed" || Object.keys(value).length !== 2
+    || !isRecord(value["device"])) return invalid();
+  const device = value["device"];
+  const required = ["id", "name", "defaultName", "kind", "platform", "appVersion", "revoked", "remoteControlEnabled",
+    "pairedAt", "connectionIds", "online", "revision", "versionUpdatedAt"];
+  if (required.some((key) => !Object.hasOwn(device, key))
+    || Object.keys(device).some((key) => !required.includes(key) && key !== "manualName" && key !== "lastSeenAt")) return invalid();
+  for (const key of ["name", "defaultName", ...(Object.hasOwn(device, "manualName") ? ["manualName"] : [])]) {
+    const name = device[key];
+    if (typeof name !== "string" || normalizeDeviceName(name) !== name) return invalid();
+  }
+  if (device["name"] !== (device["manualName"] ?? device["defaultName"])
+    || typeof device["id"] !== "string" || device["id"].trim() === ""
+    || typeof device["kind"] !== "string" || !["unspecified", "web", "desktop", "service", "mobile"].includes(device["kind"])
+    || typeof device["platform"] !== "string" || typeof device["appVersion"] !== "string"
+    || typeof device["revision"] !== "string" || !/^[1-9][0-9]*$/u.test(device["revision"])
+    || ["revoked", "remoteControlEnabled", "online"].some((key) => typeof device[key] !== "boolean")
+    || ["pairedAt", "versionUpdatedAt", ...(Object.hasOwn(device, "lastSeenAt") ? ["lastSeenAt"] : [])]
+      .some((key) => typeof device[key] !== "number" || !Number.isSafeInteger(device[key]) || device[key] < 0)
+    || !Array.isArray(device["connectionIds"]) || device["connectionIds"].some((id) => typeof id !== "string" || id.trim() === "")) return invalid();
+  return value as unknown as Extract<EventPayload, { readonly type: "device_changed" }>;
 }
 
 function nonBlank(value: string, label: string): string {

@@ -1,7 +1,8 @@
 import { create } from "@bufbuild/protobuf";
-import { EventCursorSchema, EventIdentitySchema, EventSchema, MessageRole, ToolCallOutputMode, ToolCallState, ToolFileAction, ToolResultSchema } from "@joko/contracts";
+import { EventCursorSchema, EventIdentitySchema, EventSchema, MessageRole, QueueItemState, RunState, ToolCallOutputMode, ToolCallState, ToolFileAction, ToolResultSchema } from "@joko/contracts";
 import { describe, expect, it } from "vitest";
 import { timelineRows } from "./timeline";
+import { isWorkGroup, mobileWorkItems } from "./mobile-work-projection";
 import { producedArtifactEvent, producedImageEvent, toolMediaEvent } from "./test/timeline-media";
 
 function completed(blocks: any[], role = MessageRole.ASSISTANT) {
@@ -27,7 +28,20 @@ describe("mobile Timeline metadata events", () => {
         cursor: { generation: 1n, sequence: 10n },
         payload: { kind: { case: "runtimeCommandsChanged", value: { commands: [{
           commandId: "command-one", name: "Inspect", sessionId: "session-one", loaded: true
-        }] } } } })
+        }] } } } }),
+      create(EventSchema, { eventId: "run-projection", identity: { sessionId: "session-one", runId: "run-one" },
+        cursor: { generation: 1n, sequence: 11n },
+        payload: { kind: { case: "runChanged", value: { run: {
+          runId: "run-one", sessionId: "session-one", state: RunState.RUNNING,
+          version: { revision: { value: 2n } }
+        } } } } }),
+      create(EventSchema, { eventId: "queue-projection", identity: { sessionId: "session-one", runId: "run-one" },
+        cursor: { generation: 1n, sequence: 13n },
+        payload: { kind: { case: "queueItemChanged", value: { queueItem: {
+          queueItemId: "queue-one", sessionId: "session-one", runId: "run-one", state: QueueItemState.COMPLETED,
+          ordinal: 1n, input: { parts: [{ content: { case: "text", value: "Hello" } }] },
+          version: { revision: { value: 3n } }
+        } } } } })
     ];
   }
 
@@ -35,7 +49,7 @@ describe("mobile Timeline metadata events", () => {
     const events = metadataEvents(); const original = structuredClone(events);
     expect(timelineRows(events)).toEqual([]);
     expect(events).toEqual(original);
-    expect(events.at(-1)?.cursor?.sequence).toBe(10n);
+    expect(events.at(-1)?.cursor?.sequence).toBe(13n);
   });
 
   it("merges visible history and live content across metadata updates without using visible rows as the window edge", () => {
@@ -66,7 +80,9 @@ describe("mobile Timeline metadata events", () => {
         payload: { kind: { case: "runDone", value: { runId: "run-one" } } } }),
       create(EventSchema, { ...completed([{ content: { case: "text", value: "Finished." } }]),
         identity: create(EventIdentitySchema, { sessionId: "session-one" }),
-        cursor: create(EventCursorSchema, { generation: 1n, sequence: 9n }) }), metadata[1]!
+        cursor: create(EventCursorSchema, { generation: 1n, sequence: 9n }) }), metadata[1]!, metadata[2]!,
+      create(EventSchema, { eventId: "terminal-error", cursor: { generation: 1n, sequence: 12n },
+        payload: { kind: { case: "terminalError", value: { error: { message: "The task stopped." } } } } }), metadata[3]!
     ];
     expect(timelineRows([...history, live[0]!])[1]).toMatchObject({ text: "Working", sequence: 3n, completed: false });
     const events = [...history, ...live]; const original = structuredClone(events);
@@ -76,11 +92,12 @@ describe("mobile Timeline metadata events", () => {
       { kind: "tool", eventId: "tool-completed", sequence: 5n, completed: true },
       { kind: "error", eventId: "recoverable-error", text: "Try again", sequence: 6n },
       { kind: "status", eventId: "task-status", text: "Running · Checking", sequence: 7n },
-      { kind: "activity", eventId: "run-finished", text: "Run finished", sequence: 8n }
+      { kind: "activity", eventId: "run-finished", text: "Run finished", sequence: 8n },
+      { kind: "error", eventId: "terminal-error", text: "The task stopped.", sequence: 12n }
     ]);
     expect(events).toEqual(original);
-    expect(events.at(-1)?.cursor?.sequence).toBe(10n);
-    expect(timelineRows(events).at(-1)?.sequence).toBe(8n);
+    expect(events.at(-1)?.cursor?.sequence).toBe(13n);
+    expect(timelineRows(events).at(-1)?.sequence).toBe(12n);
   });
 });
 
@@ -143,6 +160,85 @@ describe("mobile Timeline quote source", () => {
       { source: { kind: "timeline", contentIndex: 1 }, title: "Large image" }
     ]);
     expect(row?.artifacts?.every((artifact) => artifact.previewKind === undefined)).toBe(true);
+  });
+});
+
+describe("ordered Thinking inside canonical Mobile messages", () => {
+  const scoped = (sequence: number, kind: string, value: unknown) => create(EventSchema, {
+    eventId: `thinking-event-${sequence}`, identity: { sessionId: "session", runId: "run", attemptId: "attempt", generation: 7n },
+    cursor: { generation: 3n, sequence: BigInt(sequence) }, occurredAt: { seconds: BigInt(sequence) },
+    payload: { kind: { case: kind, value } as any }
+  });
+
+  it("keeps stream/final ordered content in one original message with canonical media and fail-closed quote authority", () => {
+    const history = [scoped(1, "messageStarted", { messageId: "answer", role: MessageRole.ASSISTANT }),
+      scoped(2, "thinkingDelta", { messageId: "answer", contentIndex: 0, delta: "draft" }),
+      scoped(3, "textDelta", { messageId: "answer", contentIndex: 1, delta: "draft answer" }),
+      scoped(4, "thinkingDelta", { messageId: "answer", contentIndex: 3, delta: "second draft" })];
+    const streaming = timelineRows(history, true);
+    expect(streaming).toHaveLength(1);
+    expect(streaming[0]).toMatchObject({ id: "answer", text: "draft answer", completed: false, workActivity: false });
+    expect(streaming[0]?.messageParts?.map((part) => [part.contentIndex, part.kind])).toEqual([[0, "thinking"], [1, "text"], [3, "thinking"]]);
+    const firstKey = streaming[0]?.messageParts?.[0]?.kind === "thinking" ? streaming[0].messageParts[0].thinking.key : undefined;
+    const final = scoped(5, "messageCompleted", { messageId: "answer", role: MessageRole.ASSISTANT, blocks: [
+      { content: { case: "thinking", value: { text: "final first" } } },
+      { content: { case: "text", value: "Answer" } },
+      { content: { case: "image", value: { altText: "Image", blob: { blobId: "picture", fileName: "picture.png", mediaType: "image/png", byteSize: 128n, sha256Hex: "a".repeat(64) } } } },
+      { content: { case: "thinking", value: { text: "secret", redacted: true } } },
+      { content: { case: "artifact", value: { label: "Report", blob: { blobId: "report", fileName: "report.pdf", mediaType: "application/pdf", byteSize: 128n, sha256Hex: "b".repeat(64) } } } },
+      { content: { case: "text", value: "Tail" } }
+    ] });
+    const events = [...history, final, scoped(6, "thinkingDelta", { messageId: "answer", contentIndex: 0, delta: "late" }),
+      scoped(7, "textDelta", { messageId: "answer", contentIndex: 1, delta: "late answer" })];
+    const original = structuredClone(events);
+    const rows = timelineRows(events, true);
+    expect(rows).toHaveLength(1);
+    const row = rows[0]!;
+    expect(row).toMatchObject({ id: "answer", eventId: "thinking-event-5", sequence: 1n, completed: true });
+    expect(row.messageParts?.map((part) => part.kind)).toEqual(["thinking", "text", "image", "thinking", "artifact", "text"]);
+    expect(row.messageParts?.[0]).toMatchObject({ thinking: { key: firstKey, text: "final first", completed: true, streaming: false } });
+    expect(row.messageParts?.[2]).toMatchObject({ image: { pageId: row.images?.[0]?.pageId, sourceEventId: "thinking-event-5" } });
+    expect(row.messageParts?.[3]).toMatchObject({ thinking: { redacted: true, text: "" } });
+    expect(row.messageParts?.[4]).toMatchObject({ artifact: { artifactId: row.artifacts?.[0]?.artifactId, source: { contentIndex: 4 } } });
+    expect(row.text).not.toContain("late");
+    expect(row.quoteSource).toBeUndefined();
+    expect(events).toEqual(original);
+  });
+
+  it("restores redacted/thinking-only history as work without empty placeholders or fabricated streaming", () => {
+    const restored = timelineRows([scoped(1, "messageCompleted", { messageId: "history", role: MessageRole.ASSISTANT, blocks: [
+      { content: { case: "thinking", value: { text: "" } } },
+      { content: { case: "thinking", value: { text: "hidden", redacted: true } } },
+      { content: { case: "thinking", value: { text: "Historical body" } } }
+    ] })]);
+    expect(restored).toHaveLength(1);
+    expect(restored[0]).toMatchObject({ id: "history", workActivity: true, workStreaming: false });
+    expect(restored[0]?.messageParts?.map((part) => part.contentIndex)).toEqual([1, 2]);
+    expect(restored[0]?.messageParts?.every((part) => part.kind !== "thinking" || part.thinking.completed && !part.thinking.streaming)).toBe(true);
+    const empty = scoped(2, "messageCompleted", { messageId: "empty", role: MessageRole.ASSISTANT,
+      blocks: [{ content: { case: "thinking", value: { text: " " } } }] });
+    expect(timelineRows([empty])).toEqual([]);
+    expect(empty.cursor?.sequence).toBe(2n);
+    const middle = timelineRows([scoped(3, "thinkingDelta", { messageId: "inside", contentIndex: 0, delta: "Already started" })], false);
+    expect(middle).toMatchObject([{ id: "inside", messageParts: [{ thinking: { text: "Already started", streaming: false } }] }]);
+  });
+
+  it("places work before its completed answer without changing the canonical message start cursor or tool detail", () => {
+    const started = scoped(1, "messageStarted", { messageId: "answer", role: MessageRole.ASSISTANT });
+    const tool = scoped(2, "toolCallCompleted", { toolCall: { toolCallId: "call", toolId: "read_file", sessionId: "session",
+      runId: "run", attemptId: "attempt", state: ToolCallState.SUCCEEDED,
+      result: { parts: [{ content: { case: "text", value: "File body" } }] } } });
+    const final = scoped(3, "messageCompleted", { messageId: "answer", role: MessageRole.ASSISTANT,
+      blocks: [{ content: { case: "text", value: "Final answer" } }] });
+    const rows = timelineRows([started, tool, final]);
+    expect(rows[0]).toMatchObject({ id: "answer", sequence: 1n, answerSequence: 3n, text: "Final answer" });
+    const display = mobileWorkItems(rows, false);
+    expect(display.map((item) => item.kind)).toEqual(["work", "assistant"]);
+    expect(display[1]).toBe(rows[0]);
+    const group = display[0]!;
+    if (!isWorkGroup(group)) throw new Error("The work group is missing.");
+    expect(group.children[0]).toBe(rows[1]);
+    expect(rows[1]?.tool?.output).toBe("File body");
   });
 });
 

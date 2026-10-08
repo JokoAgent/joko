@@ -4,7 +4,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 import { translate } from "../i18n.js";
 import type { TimelineItemView } from "../model.js";
-import { AutomationOriginBadge, CollapsibleUserMessageContent, compactionTimelineCopy, windowedTextRows } from "./Timeline.js";
+import { AutomationOriginBadge, CollapsibleUserMessageContent, ObjectiveLifecycleBlock, compactionTimelineCopy, windowedTextRows } from "./Timeline.js";
 import { TimelineViewportStore, countUnreadTimelineItems, maximumTimelineSequence, mergeTimelineWindows, repairStreamingMarkdown, resolveTimelineFollowingOnScroll, resolveTimelineResizeScrollTop, shouldLoadEarlierTimeline, streamingMarkdownRenderValue, streamingMarkdownThrottleDelay, timelineJumpBehavior, timelineUnreadItemIds } from "./timeline-behavior.js";
 import { projectTimelineRenderItems } from "./timeline-render-items.js";
 
@@ -55,7 +55,8 @@ describe("timeline following", () => {
       { ...timelineItem("local", 10n), kind: "user", localUserInput: true },
       { ...timelineItem("external", 11n), kind: "user" },
       { ...timelineItem("automatic", 12n), kind: "user", automaticContinuation: { recoveryId: "recovery" } },
-      ...(["thinking", "tool", "toolResult", "status", "background", "review"] as const).map((kind, index) => ({ ...timelineItem(kind, BigInt(13 + index)), kind }))
+      { ...timelineItem("objective-continuation", 13n), kind: "user", objectiveContinuation: { ownerGeneration: 1n, turn: 2 } },
+      ...(["thinking", "tool", "toolResult", "status", "background", "review"] as const).map((kind, index) => ({ ...timelineItem(kind, BigInt(14 + index)), kind }))
     ];
     const previous = timelineUnreadItemIds(baseline);
     expect(countUnreadTimelineItems(previous, 2n, [...baseline, ...arrivals], false)).toBe(4);
@@ -87,6 +88,35 @@ describe("timeline following", () => {
       ["shared", "live"],
       ["new", "new"]
     ]);
+  });
+});
+
+describe("Objective lifecycle presentation", () => {
+  it("shows durable completion accounting without exposing continuation text", () => {
+    const markup = renderToStaticMarkup(createElement(ObjectiveLifecycleBlock, {
+      item: {
+        id: "objective-completed",
+        sequence: 1n,
+        kind: "objective",
+        createdAt: 1,
+        objectiveLifecycle: {
+          action: "completed",
+          status: "complete",
+          ownerGeneration: 2n,
+          turnsUsed: 4,
+          tokensUsed: 12_345,
+          elapsedMs: 65_000,
+          reason: "All acceptance checks passed."
+        }
+      },
+      locale: "en",
+      t: (key, values) => `${key}${values === undefined ? "" : `:${JSON.stringify(values)}`}`
+    }));
+    expect(markup).toContain("timeline.objective.completed");
+    expect(markup).toContain("12,345");
+    expect(markup).toContain("1m 05s");
+    expect(markup).toContain("All acceptance checks passed.");
+    expect(markup).not.toContain("Internal objective directive");
   });
 });
 

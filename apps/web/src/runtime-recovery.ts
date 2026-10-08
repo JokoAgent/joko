@@ -26,6 +26,11 @@ export function activeRuntimeRecovery(
   return active?.runtimeRecovery;
 }
 
+/** A host-owned continuation is product bookkeeping, never authored history. */
+export function isInternalContinuationTimelineItem(item: TimelineItemView): boolean {
+  return item.automaticContinuation !== undefined || item.objectiveContinuation !== undefined;
+}
+
 /**
  * Internal continuation prompts and their claimed terminal errors are product
  * bookkeeping. The durable recovery row is the single user-facing owner.
@@ -41,7 +46,7 @@ export function projectRuntimeRecoveryTimeline(
     }
   }
   return items.filter((item) => {
-    if (item.automaticContinuation !== undefined) return false;
+    if (isInternalContinuationTimelineItem(item)) return false;
     if (item.runtimeRecovery?.state === "cancelled") return false;
     return item.kind !== "error" || item.runId === undefined || !claimedErrorRunIds.has(item.runId);
   });

@@ -21,6 +21,8 @@ import { Button, CheckboxControl, formatBytes, Modal, Pill, SelectControl } from
 export interface ExtensionPackageIntent {
   readonly extension: ExtensionCatalogEntryView;
   readonly backendId: string;
+  /** A suggestion continuation is fenced to its original backend. */
+  readonly fixedBackendId?: string;
 }
 
 export function ExtensionPackageDialog({
@@ -40,7 +42,7 @@ export function ExtensionPackageDialog({
   readonly t: Translator;
   readonly runAction: RunAction;
   readonly onClose: () => void;
-  readonly onChanged: (extensionId: string) => Promise<void>;
+  readonly onChanged: (extensionId: string, preview: ExtensionPackagePreviewView) => Promise<void>;
 }): JSX.Element {
   const [backendId, setBackendId] = useState("");
   const [preview, setPreview] = useState<ExtensionPackagePreviewView>();
@@ -52,9 +54,9 @@ export function ExtensionPackageDialog({
   const requestGeneration = useRef(0);
   const mutationGeneration = useRef(0);
   const ownerResourceId = intent?.extension.owner.kind === "resource" ? intent.extension.owner.resourceId : undefined;
-  const selectedFixedBackendId = ownerResourceId === undefined
+  const selectedFixedBackendId = intent?.fixedBackendId ?? (ownerResourceId === undefined
     ? undefined
-    : resources.find((resource) => resource.id === ownerResourceId)?.backendId;
+    : resources.find((resource) => resource.id === ownerResourceId)?.backendId);
 
   useEffect(() => {
     requestGeneration.current += 1;
@@ -68,7 +70,7 @@ export function ExtensionPackageDialog({
   }, [intent, selectedFixedBackendId]);
 
   useEffect(() => {
-    if (intent === undefined || backendId === "") return;
+    if (intent === undefined || backendId === "" || busy || result === "success") return;
     const abort = new AbortController();
     const generation = ++requestGeneration.current;
     setLoading(true);
@@ -88,7 +90,7 @@ export function ExtensionPackageDialog({
       if (!abort.signal.aborted && generation === requestGeneration.current) setLoading(false);
     });
     return () => abort.abort();
-  }, [backendId, controller, intent, t]);
+  }, [backendId, busy, controller, intent, result, t]);
 
   const close = (): void => {
     if (busy) return;
@@ -114,7 +116,7 @@ export function ExtensionPackageDialog({
         throw cause;
       }
       if (generation === mutationGeneration.current) setResult("success");
-      await onChanged(preview.extensionId).catch(() => undefined);
+      await onChanged(preview.extensionId, preview).catch(() => undefined);
       if (generation === mutationGeneration.current) setBusy(false);
     });
   };

@@ -91,10 +91,10 @@ describe("durable voice dictionary through authenticated generated RPCs", () => 
     const { MobileVoiceDictionaryController } = await import(new URL("../../mobile/src/mobile-voice-dictionary-controller.ts", import.meta.url).href);
     const { MobileVoicePreferencesStore } = await import(new URL("../../mobile/src/mobile-voice-preferences-store.ts", import.meta.url).href);
     fixture = await OrchestratorE2eFixture.start({ keepRoot: true });
-    const begun = await fixture.anonymous.connection.beginPairing({ deviceDisplayName: "Dictionary phone", deviceKind: DeviceKind.MOBILE, platform: "android", appVersion: "0.1.0" });
+    const begun = await fixture.anonymous.connection.beginPairing({ deviceDisplayName: "Dictionary phone", deviceKind: DeviceKind.MOBILE, deviceNameSource: { defaultDisplayName: "Fixture phone" }, platform: "android", appVersion: "0.1.0" });
     const challengeId = begun.challenge!.challengeId;
     const paired = (await fixture.anonymous.connection.completePairing({ challengeId, humanCode: fixture.pairingCode(challengeId),
-      deviceDisplayName: "Dictionary phone", deviceKind: DeviceKind.MOBILE, platform: "android", appVersion: "0.1.0" })).result!;
+      deviceDisplayName: "Dictionary phone", deviceKind: DeviceKind.MOBILE, deviceNameSource: { defaultDisplayName: "Fixture phone" }, platform: "android", appVersion: "0.1.0" })).result!;
     const identity = await mobileNetwork.inspect(fixture.baseUrl);
     const credential = { profileId: "dictionary-phone", origin: fixture.baseUrl, serverId: identity.serverId,
       connectionId: paired.connection!.connectionId, deviceId: paired.device!.deviceId, displayName: "Dictionary phone", authKey: paired.authKey };
@@ -257,8 +257,9 @@ describe("durable voice dictionary through authenticated generated RPCs", () => 
     streamCleanups.push(async () => { fetchProbe.mockRestore(); });
     await expect(fixture.anonymous.voiceInput.getVoiceInputDictionaryReadOnly({})).rejects.toMatchObject({ code: Code.Unauthenticated });
     const pairPhone = async (source: OrchestratorE2eFixture) => {
-      const begun = await mobileNetwork.requestPairing(source.baseUrl, "Readonly phone", "android");
-      return (await mobileNetwork.completePairing(source.baseUrl, begun.challengeId, source.pairingCode(begun.challengeId), "Readonly phone", "android")).credential;
+      const deviceNameSource = { defaultDisplayName: "Fixture readonly phone" };
+      const begun = await mobileNetwork.requestPairing(source.baseUrl, "Readonly phone", "android", deviceNameSource);
+      return (await mobileNetwork.completePairing(source.baseUrl, begun.challengeId, source.pairingCode(begun.challengeId), "Readonly phone", "android", deviceNameSource)).credential;
     };
     const a = await pairPhone(fixture); const b = await pairPhone(peerFixture);
     for (const [credential, terms] of [[a, ["OfficeTerm", "DeleteMe"]], [b, ["PhoneTerm"]]] as const) {
@@ -780,13 +781,13 @@ class ProductionDictionaryNode {
 
   async pair(displayName: string): Promise<PairedClient> {
     const anonymous = createE2eClients(this.baseUrl);
-    const begun = await anonymous.connection.beginPairing({ deviceDisplayName: displayName, deviceKind: DeviceKind.MOBILE,
+    const begun = await anonymous.connection.beginPairing({ deviceDisplayName: displayName, deviceKind: DeviceKind.MOBILE, deviceNameSource: { defaultDisplayName: "Fixture phone" },
       platform: "android", appVersion: "dictionary-product-e2e" });
     const challengeId = begun.challenge?.challengeId;
     const humanCode = challengeId === undefined ? undefined : this.#pairingCodes.get(challengeId);
     if (challengeId === undefined || humanCode === undefined) throw new Error("Production dictionary pairing did not issue its trusted challenge.");
     const completed = await anonymous.connection.completePairing({ challengeId, humanCode, deviceDisplayName: displayName,
-      deviceKind: DeviceKind.MOBILE, platform: "android", appVersion: "dictionary-product-e2e" });
+      deviceKind: DeviceKind.MOBILE, deviceNameSource: { defaultDisplayName: "Fixture phone" }, platform: "android", appVersion: "dictionary-product-e2e" });
     const authKey = completed.result?.authKey;
     const connectionId = completed.result?.connection?.connectionId;
     const deviceId = completed.result?.device?.deviceId;

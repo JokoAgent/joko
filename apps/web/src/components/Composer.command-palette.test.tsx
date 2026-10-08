@@ -8,9 +8,10 @@ import { remapComposerInlineMentionReplacement } from "../composer-mention-range
 import { appendQuoteToComposerDocument, composerDocumentPlainText, composerDocumentQuotes, plainTextToComposerDocument } from "../composer-quote-document.js";
 import { DEFAULT_UI_PREFERENCES } from "../local-state.js";
 import { GAMEPAD_SKILL_EVENT } from "../gamepad-client.js";
-import { emptySnapshot, type BackendView, type ComposerDraft, type ComposerInlineMentionRange, type RuntimeCommandView, type SessionView } from "../model.js";
+import { emptySnapshot, type BackendView, type ComposerDraft, type ComposerInlineMentionRange, type ObjectiveView, type RuntimeCommandView, type SessionView } from "../model.js";
 import { replaceComposerDocumentTextRange } from "./composer-inline-mention.js";
 import { Composer } from "./Composer.js";
+import type { ObjectiveDialogHandoffRequest } from "./ObjectiveIndicator.js";
 import { WORKSPACE_ENTRY_DRAG_MIME, encodeWorkspaceEntryDragPayload } from "./workspace-tree-state.js";
 
 const editorHarness = vi.hoisted(() => ({
@@ -118,6 +119,17 @@ const baseSession: SessionView = {
   planMode: false,
   updatedAt: 0
 };
+const baseTarget = {
+  id: baseSession.targetId,
+  revision: 1n,
+  backendId: baseSession.backendId,
+  name: "Target one",
+  workspaceId: "workspace-one",
+  workspaceName: "Workspace",
+  trusted: true,
+  pinned: false,
+  archived: false
+};
 const commands: readonly RuntimeCommandView[] = [{
   id: "deploy",
   name: "deploy",
@@ -161,6 +173,377 @@ it("inserts a bound skill only from the current task runtime catalog without sen
   await act(async () => { target!.dispatchEvent(new CustomEvent(GAMEPAD_SKILL_EVENT, { detail: binding })); await Promise.resolve(); });
   await vi.waitFor(() => expect(document.querySelector("[role='alert']")?.textContent).toContain("settings.gamepad.skillInputUnavailable"));
   expect(view.editor().value).toBe("Please /deploy");
+});
+
+it("starts application-owned learning from the current task or free text without sending a user message", async () => {
+  const fromTask = await mount(draft("/learn"));
+  await act(async () => fromTask.send().click());
+  await settleActions(fromTask.actions);
+
+  expect(fromTask.api.listCommands).toHaveBeenCalledExactlyOnceWith(baseSession.id, expect.any(AbortSignal));
+  expect(fromTask.api.startSkillLearning).toHaveBeenCalledExactlyOnceWith({
+    requestId: expect.any(String),
+    targetId: baseSession.targetId,
+    sourceSessionId: baseSession.id,
+    instruction: ""
+  }, expect.any(AbortSignal));
+  expect(fromTask.api.send).not.toHaveBeenCalled();
+  expect(fromTask.api.navigate).toHaveBeenCalledWith({ kind: "session", sessionId: "distillation-task" });
+  expect(fromTask.editor().value).toBe("");
+  expect(fromTask.drafts.get(baseSession.id)?.text).toBe("");
+
+  const fromText = await mount(draft("/learn  turn this checklist into a skill "));
+  await act(async () => fromText.send().click());
+  await settleActions(fromText.actions);
+  expect(fromText.api.startSkillLearning).toHaveBeenCalledExactlyOnceWith({
+    requestId: expect.any(String),
+    targetId: baseSession.targetId,
+    instruction: "turn this checklist into a skill"
+  }, expect.any(AbortSignal));
+  expect(fromText.api.send).not.toHaveBeenCalled();
+});
+
+it("refreshes command ownership at dispatch and sends a loaded runtime /learn exactly once", async () => {
+  const view = await mount(draft("/learn runtime evidence"));
+  const runtimeLearn: RuntimeCommandView = {
+    id: "runtime-learn",
+    name: "learn",
+    description: "Runtime learning skill",
+    source: "skill",
+    resourceId: "runtime-learn-resource",
+    loaded: true
+  };
+  vi.mocked(view.api.listCommands).mockResolvedValueOnce([...commands, runtimeLearn]);
+
+  await act(async () => view.send().click());
+  await settleActions(view.actions);
+
+  expect(view.api.listCommands).toHaveBeenCalledExactlyOnceWith(baseSession.id, expect.any(AbortSignal));
+  expect(view.api.startSkillLearning).not.toHaveBeenCalled();
+  expect(view.api.send).toHaveBeenCalledTimes(1);
+  expect(view.api.send).toHaveBeenCalledWith(baseSession.id, expect.objectContaining({
+    text: "/learn runtime evidence"
+  }), { expectedGeneration: baseSession.generation });
+
+  const pinned = await mount(draft("/learn pinned runtime"));
+  let finishCommands!: (value: readonly RuntimeCommandView[]) => void;
+  vi.mocked(pinned.api.listCommands).mockImplementationOnce(() => new Promise((resolve) => { finishCommands = resolve; }));
+  await act(async () => pinned.send().click());
+  await vi.waitFor(() => expect(finishCommands).toBeTypeOf("function"));
+  const replacementSend = vi.fn(async () => undefined);
+  const replacementController = { ...pinned.api, send: replacementSend } as unknown as AppController;
+  await pinned.render(baseSession, replacementController);
+  await act(async () => finishCommands([...commands, runtimeLearn]));
+  await settleActions(pinned.actions);
+  expect(pinned.api.send).toHaveBeenCalledTimes(1);
+  expect(replacementSend).not.toHaveBeenCalled();
+  expect(pinned.api.startSkillLearning).not.toHaveBeenCalled();
+});
+
+it("clears only the accepted /learn invocation and preserves edits made while learning starts", async () => {
+  const view = await mount(draft("/learn original evidence"));
+  let finishLearning!: () => void;
+  vi.mocked(view.api.startSkillLearning).mockImplementationOnce((input: { readonly sourceSessionId?: string }) => new Promise((resolve) => {
+    finishLearning = () => resolve({
+      id: "delayed-learning-run",
+      revision: 1n,
+      state: "distilling",
+      sourceKind: input.sourceSessionId === undefined ? "text" : "session",
+      backendId: baseSession.backendId,
+      targetId: baseSession.targetId,
+      ...(input.sourceSessionId === undefined ? {} : { sourceSessionId: input.sourceSessionId }),
+      distillationSessionId: "delayed-distillation-task",
+      summary: "Learning",
+      createdAt: 1,
+      updatedAt: 1,
+      expiresAt: 2
+    });
+  }));
+  await act(async () => view.send().click());
+  await vi.waitFor(() => expect(finishLearning).toBeTypeOf("function"));
+  await input(view.editor(), "A newer unrelated draft", 23);
+  await act(async () => finishLearning());
+  await settleActions(view.actions);
+  expect(view.editor().value).toBe("A newer unrelated draft");
+  expect(view.drafts.get(baseSession.id)?.text).toBe("A newer unrelated draft");
+  expect(view.api.navigate).toHaveBeenCalledWith({ kind: "session", sessionId: "delayed-distillation-task" });
+  expect(view.api.send).not.toHaveBeenCalled();
+});
+
+it("sets, clears, and opens the application-owned /goal with fresh ownership and draft fences", async () => {
+  const setView = await mount(draft("/goal Ship the complete feature"), document, true);
+  await act(async () => setView.send().click());
+  await settleActions(setView.actions);
+  expect(setView.api.listCommands).toHaveBeenCalledExactlyOnceWith(baseSession.id, expect.any(AbortSignal));
+  expect(setView.api.setObjective).toHaveBeenCalledExactlyOnceWith(
+    baseSession.id,
+    baseSession.generation,
+    "Ship the complete feature",
+    { noProgressTurnLimit: 3 },
+    expect.any(AbortSignal)
+  );
+  expect(setView.api.send).not.toHaveBeenCalled();
+  expect(setView.editor().value).toBe("");
+
+  const clearView = await mount(draft("/goal clear"), document, true);
+  const currentObjective = objective("Current objective", baseSession.generation);
+  vi.mocked(clearView.api.getObjective).mockResolvedValueOnce(currentObjective);
+  await act(async () => clearView.send().click());
+  await settleActions(clearView.actions);
+  expect(clearView.api.getObjective).toHaveBeenCalledWith(baseSession.id, expect.any(AbortSignal));
+  expect(clearView.api.clearObjective).toHaveBeenCalledWith(currentObjective, expect.any(AbortSignal));
+  expect(clearView.editor().value).toBe("");
+
+  const openView = await mount(draft("/goal"), document, true);
+  await act(async () => openView.send().click());
+  await settleActions(openView.actions);
+  expect(openView.openObjective).toHaveBeenCalledTimes(1);
+  expect(openView.editor().value).toBe("/goal");
+  await act(async () => openView.completeObjectiveDialog());
+  await vi.waitFor(() => expect(openView.editor().value).toBe(""));
+
+  const failed = await mount(draft("/goal Keep this draft"), document, true);
+  vi.mocked(failed.api.setObjective).mockRejectedValueOnce(new Error("Objective busy"));
+  await act(async () => failed.send().click());
+  await settleActions(failed.actions);
+  expect(failed.editor().value).toBe("/goal Keep this draft");
+  expect(failed.actionErrors).toEqual([expect.objectContaining({ message: "Objective busy" })]);
+});
+
+it("opens a fenced Home /goal handoff after hydration and consumes only its unchanged durable draft", async () => {
+  const attachment = { id: "home-goal-file", file: new File(["evidence"], "evidence.txt", { type: "text/plain" }), kind: "file" as const };
+  const expectedDraft = { ...draft("/goal"), attachments: [attachment] };
+  const handoff: ObjectiveDialogHandoffRequest = {
+    id: "home-goal-request",
+    serverId: "server-one",
+    profileId: "profile-one",
+    connectionGeneration: 1,
+    sessionId: baseSession.id,
+    sessionGeneration: baseSession.generation,
+    expectedDraft
+  };
+  const view = await mount(expectedDraft, document, true, handoff);
+  await vi.waitFor(() => expect(view.openObjective).toHaveBeenCalledWith(expect.any(Function), handoff));
+  expect(view.editor().value).toBe("/goal");
+  expect(view.drafts.get(baseSession.id)?.attachments).toEqual([attachment]);
+
+  await act(async () => view.completeObjectiveDialog());
+  await vi.waitFor(() => expect(view.editor().value).toBe(""));
+  await vi.waitFor(() => expect(view.drafts.get(baseSession.id)?.text).toBe(""));
+  expect(view.drafts.get(baseSession.id)?.attachments).toEqual([]);
+
+  const changed = await mount(expectedDraft, document, true, { ...handoff, id: "changed-home-goal" });
+  await vi.waitFor(() => expect(changed.openObjective).toHaveBeenCalledTimes(1));
+  await input(changed.editor(), "A newer draft", 13);
+  await act(async () => changed.completeObjectiveDialog());
+  expect(changed.editor().value).toBe("A newer draft");
+
+  const raced = await mount(draft(""), document, true, { ...handoff, id: "raced-home-goal" });
+  await vi.waitFor(() => expect(raced.openObjective).toHaveBeenCalledTimes(1));
+  expect(raced.editor().value).toBe("/goal");
+  expect(raced.drafts.get(baseSession.id)?.attachments).toEqual([attachment]);
+});
+
+it("waits for the matching rejected first-input recovery before opening a Home /goal handoff", async () => {
+  const attachment = { id: "restored-home-goal-file", file: new File(["evidence"], "evidence.txt", { type: "text/plain" }), kind: "file" as const };
+  const expectedDraft = { ...draft("/goal"), attachments: [attachment] };
+  const handoff: ObjectiveDialogHandoffRequest = {
+    id: "restored-home-goal-request",
+    serverId: "server-one",
+    profileId: "profile-one",
+    connectionGeneration: 1,
+    sessionId: baseSession.id,
+    sessionGeneration: baseSession.generation,
+    expectedDraft
+  };
+  const recovery = {
+    eventId: 1,
+    sessionId: baseSession.id,
+    input: expectedDraft,
+    draft: expectedDraft,
+    revision: 2
+  } satisfies NonNullable<AppController["state"]["rejectedFirstInputRecovery"]>;
+  const view = await mount(draft(""), document, true);
+  view.drafts.set(baseSession.id, expectedDraft);
+  await view.render(baseSession, {
+    ...view.api,
+    state: { ...view.api.state, rejectedFirstInputRecovery: recovery }
+  }, view.backend, handoff);
+
+  await vi.waitFor(() => expect(view.openObjective).toHaveBeenCalledWith(expect.any(Function), handoff));
+  expect(view.rejectObjectiveDialogHandoff).not.toHaveBeenCalled();
+  expect(view.editor().value).toBe("/goal");
+  expect(view.drafts.get(baseSession.id)?.attachments).toEqual([attachment]);
+});
+
+it("hands a freshly loaded runtime /goal Skill the complete invocation exactly once", async () => {
+  const view = await mount(draft("/goal runtime owned"), document, true);
+  vi.mocked(view.api.listCommands).mockResolvedValueOnce([...commands, {
+    id: "runtime-goal",
+    name: "goal",
+    description: "Runtime goal Skill",
+    source: "skill",
+    resourceId: "runtime-goal-resource",
+    loaded: true
+  }]);
+  await act(async () => view.send().click());
+  await settleActions(view.actions);
+  expect(view.api.setObjective).not.toHaveBeenCalled();
+  expect(view.api.send).toHaveBeenCalledTimes(1);
+  expect(view.api.send).toHaveBeenCalledWith(baseSession.id, expect.objectContaining({ text: "/goal runtime owned" }), {
+    expectedGeneration: baseSession.generation
+  });
+});
+
+it("retains an application-owned /goal draft across catalog, structured-input, and changed-draft outcomes", async () => {
+  const catalogFailure = await mount(draft("/goal keep catalog failure"), document, true);
+  vi.mocked(catalogFailure.api.listCommands).mockRejectedValueOnce(new Error("Command catalog unavailable"));
+  await act(async () => catalogFailure.send().click());
+  await settleActions(catalogFailure.actions);
+  expect(catalogFailure.api.setObjective).not.toHaveBeenCalled();
+  expect(catalogFailure.editor().value).toBe("/goal keep catalog failure");
+  expect(catalogFailure.actionErrors).toEqual([expect.objectContaining({ message: "Command catalog unavailable" })]);
+
+  const attachment = { id: "objective-file", file: new File(["evidence"], "evidence.txt", { type: "text/plain" }), kind: "file" as const };
+  const structured = await mount({ ...draft("/goal structured"), attachments: [attachment] }, document, true);
+  await act(async () => structured.send().click());
+  await settleActions(structured.actions);
+  expect(structured.api.setObjective).not.toHaveBeenCalled();
+  expect(structured.editor().value).toBe("/goal structured");
+  expect(structured.drafts.get(baseSession.id)?.attachments).toEqual([attachment]);
+
+  const changed = await mount(draft("/goal original"), document, true);
+  let finishSet!: () => void;
+  vi.mocked(changed.api.setObjective).mockImplementationOnce((_sessionId, generation, text) => new Promise((resolve) => {
+    finishSet = () => resolve(objective(text, generation));
+  }));
+  await act(async () => changed.send().click());
+  await vi.waitFor(() => expect(finishSet).toBeTypeOf("function"));
+  await input(changed.editor(), "A newer unrelated draft", 23);
+  await act(async () => finishSet());
+  await settleActions(changed.actions);
+  expect(changed.editor().value).toBe("A newer unrelated draft");
+  await act(async () => changed.add().focus());
+  await vi.waitFor(() => expect(changed.drafts.get(baseSession.id)?.text).toBe("A newer unrelated draft"));
+  expect(changed.actionErrors).toEqual([]);
+});
+
+it("keeps /learn drafts on hub, structured-input, busy, and owner-retirement failures", async () => {
+  const catalogFailure = await mount(draft("/learn keep catalog failure"));
+  vi.mocked(catalogFailure.api.listCommands).mockRejectedValueOnce(new Error("Command catalog unavailable"));
+  await act(async () => catalogFailure.send().click());
+  await settleActions(catalogFailure.actions);
+  expect(catalogFailure.editor().value).toBe("/learn keep catalog failure");
+  expect(catalogFailure.api.startSkillLearning).not.toHaveBeenCalled();
+  expect(catalogFailure.actionErrors).toEqual([expect.objectContaining({ message: "Command catalog unavailable" })]);
+
+  const hub = await mount(draft("/learn hub:shared-skill"));
+  await act(async () => hub.send().click());
+  await settleActions(hub.actions);
+  expect(hub.api.startSkillLearning).not.toHaveBeenCalled();
+  expect(hub.api.send).not.toHaveBeenCalled();
+  expect(hub.editor().value).toBe("/learn hub:shared-skill");
+  expect(hub.actionErrors).toEqual([expect.objectContaining({ message: expect.stringContaining("Skill hub") })]);
+
+  const attachment = { id: "evidence-file", file: new File(["evidence"], "evidence.txt", { type: "text/plain" }), kind: "file" as const };
+  const structured = await mount({ ...draft("/learn"), attachments: [attachment] });
+  await act(async () => structured.send().click());
+  await settleActions(structured.actions);
+  expect(structured.api.startSkillLearning).not.toHaveBeenCalled();
+  expect(structured.editor().value).toBe("/learn");
+  expect(structured.drafts.get(baseSession.id)?.attachments).toEqual([attachment]);
+
+  const mention = { id: "notes", kind: "workspace" as const, reference: "notes.md", label: "notes", token: "@notes", workspaceId: "workspace-one" };
+  const mentioned = await mount({
+    ...draft("/learn @notes"),
+    mentions: [mention],
+    inlineMentionRanges: [{ mentionId: mention.id, from: 7, to: 13 }]
+  });
+  await act(async () => mentioned.send().click());
+  await settleActions(mentioned.actions);
+  expect(mentioned.api.startSkillLearning).not.toHaveBeenCalled();
+  expect(mentioned.editor().value).toBe("/learn @notes");
+  expect(mentioned.drafts.get(baseSession.id)?.mentions).toEqual([mention]);
+
+  const busy = await mount(draft("/learn keep this"));
+  vi.mocked(busy.api.startSkillLearning).mockRejectedValueOnce(new Error("Learning is busy"));
+  await act(async () => busy.send().click());
+  await settleActions(busy.actions);
+  expect(busy.editor().value).toBe("/learn keep this");
+  expect(busy.actionErrors).toEqual([expect.objectContaining({ message: "Learning is busy" })]);
+
+  const failedRun = await mount(draft("/learn keep failed evidence"));
+  vi.mocked(failedRun.api.startSkillLearning).mockResolvedValueOnce({
+    id: "failed-learning-run",
+    revision: 2n,
+    state: "failed",
+    sourceKind: "text",
+    backendId: baseSession.backendId,
+    targetId: baseSession.targetId,
+    distillationSessionId: "orphaned-distillation-task",
+    summary: "Failed learning",
+    error: "Learning could not start",
+    createdAt: 1,
+    updatedAt: 2,
+    expiresAt: 3
+  });
+  await act(async () => failedRun.send().click());
+  await settleActions(failedRun.actions);
+  expect(failedRun.editor().value).toBe("/learn keep failed evidence");
+  expect(failedRun.api.navigate).not.toHaveBeenCalled();
+  expect(failedRun.actionErrors).toEqual([expect.objectContaining({ message: "Learning could not start" })]);
+
+  const retired = await mount(draft("/learn"));
+  let finishCommands!: (value: readonly RuntimeCommandView[]) => void;
+  vi.mocked(retired.api.listCommands).mockImplementationOnce(() => new Promise((resolve) => { finishCommands = resolve; }));
+  await act(async () => retired.send().click());
+  await vi.waitFor(() => expect(finishCommands).toBeTypeOf("function"));
+  await retired.render({ ...baseSession, id: "task-two", generation: 2n });
+  await act(async () => finishCommands(commands));
+  await settleActions(retired.actions);
+  expect(retired.api.startSkillLearning).not.toHaveBeenCalled();
+  expect(retired.api.send).not.toHaveBeenCalled();
+  await retired.render(baseSession);
+  await vi.waitFor(() => expect(retired.editor().value).toBe("/learn"));
+
+  const aborted = await mount(draft("/learn abort with owner"));
+  let catalogSignal: AbortSignal | undefined;
+  vi.mocked(aborted.api.listCommands).mockImplementationOnce((_sessionId, signal) => new Promise((_resolve, reject) => {
+    catalogSignal = signal;
+    signal?.addEventListener("abort", () => reject(new DOMException("Retired", "AbortError")), { once: true });
+  }));
+  await act(async () => aborted.send().click());
+  await vi.waitFor(() => expect(catalogSignal).toBeInstanceOf(AbortSignal));
+  await aborted.render({ ...baseSession, id: "task-three", generation: 3n });
+  await settleActions(aborted.actions);
+  expect(catalogSignal?.aborted).toBe(true);
+  expect(aborted.actionErrors).toEqual([]);
+
+  const lateFailure = await mount(draft("/learn retire before failed result"));
+  let finishFailedLearning!: () => void;
+  vi.mocked(lateFailure.api.startSkillLearning).mockImplementationOnce(() => new Promise((resolve) => {
+    finishFailedLearning = () => resolve({
+      id: "retired-failed-learning-run",
+      revision: 1n,
+      state: "failed",
+      sourceKind: "text",
+      backendId: baseSession.backendId,
+      targetId: baseSession.targetId,
+      distillationSessionId: "retired-orphaned-task",
+      summary: "Retired failure",
+      error: "This old failure must stay hidden",
+      createdAt: 1,
+      updatedAt: 2,
+      expiresAt: 3
+    });
+  }));
+  await act(async () => lateFailure.send().click());
+  await vi.waitFor(() => expect(finishFailedLearning).toBeTypeOf("function"));
+  await lateFailure.render({ ...baseSession, id: "task-four", generation: 4n });
+  await act(async () => finishFailedLearning());
+  await settleActions(lateFailure.actions);
+  expect(lateFailure.actionErrors).toEqual([]);
+  expect(lateFailure.api.navigate).not.toHaveBeenCalled();
 });
 
 it("discards a skill catalog response after the composer changes task", async () => {
@@ -229,7 +612,7 @@ it("keeps keyboard ownership in the editor and leaves add-menu command search in
   await act(async () => document.dispatchEvent(new Event("selectionchange")));
 
   expect(document.activeElement).toBe(editor);
-  expect(optionLabels(typedPalette()!)).toEqual(["/help", "/jump-session", "/cmd", "/clear", "/review", "/deploy"]);
+  expect(optionLabels(typedPalette()!)).toEqual(["/help", "/learn", "/jump-session", "/cmd", "/clear", "/review", "/deploy"]);
   await input(editor, "/bui", 4);
   expect(document.activeElement).toBe(editor);
   expect(optionLabels(typedPalette()!)).toEqual(["/deploy"]);
@@ -251,7 +634,7 @@ it("keeps keyboard ownership in the editor and leaves add-menu command search in
   expect(await press(editor, "ArrowDown")).toBe(true);
   expect(await press(editor, "Tab")).toBe(true);
   await flushAnimationFrames();
-  expect(editor.value).toBe("/jump-session");
+  expect(editor.value).toBe("/learn");
   expect(document.activeElement).toBe(editor);
 
   await input(editor, "/nothing-matches", 16);
@@ -279,6 +662,42 @@ it("keeps keyboard ownership in the editor and leaves add-menu command search in
   const addPalette = search!.closest(".composer-palette");
   expect(optionLabels(addPalette!)).toEqual(["/deploy"]);
   expect(typedPalette()).toBeNull();
+});
+
+it("advertises /learn only for the connected writable task's exact Skill-capable Target", async () => {
+  const view = await mount(draft("/"));
+  const editor = view.editor();
+  editor.focus();
+  editorHarness.caret = 1;
+  await act(async () => document.dispatchEvent(new Event("selectionchange")));
+  expect(optionLabels(required(typedPalette()))).toContain("/learn");
+
+  const withoutTarget = {
+    ...view.api,
+    state: { ...view.api.state, snapshot: { ...view.api.state.snapshot, targets: [] } }
+  } as unknown as AppController;
+  await view.render(baseSession, withoutTarget);
+  expect(optionLabels(required(typedPalette()))).not.toContain("/learn");
+
+  const withoutSkill = {
+    ...view.backend,
+    capabilities: new Map([...view.backend.capabilities].filter(([name]) => name !== "runtime.resources"))
+  };
+  await view.render(baseSession, view.api, withoutSkill);
+  expect(optionLabels(required(typedPalette()))).not.toContain("/learn");
+
+  await view.render(baseSession, view.api, { ...view.backend, health: "unavailable" });
+  expect(optionLabels(required(typedPalette()))).not.toContain("/learn");
+
+  await view.render({ ...baseSession, archived: true }, view.api, view.backend);
+  expect(optionLabels(required(typedPalette()))).not.toContain("/learn");
+
+  const disconnected = {
+    ...view.api,
+    state: { ...view.api.state, connectionState: "disconnected" as const }
+  } as unknown as AppController;
+  await view.render(baseSession, disconnected, view.backend);
+  expect(optionLabels(required(typedPalette()))).not.toContain("/learn");
 });
 
 it("never opens the typed command palette for IME composition or shell mode and retires it with its task owner", async () => {
@@ -323,7 +742,7 @@ it("keeps selection ownership, command navigation, focus, and caret restoration 
   await act(async () => ownerDocument.dispatchEvent(new (ownerWindow as Window & typeof globalThis).Event("selectionchange")));
   expect(ownerDocument.activeElement).toBe(editor);
   expect(document.activeElement).not.toBe(editor);
-  expect(optionLabels(required(typedPalette(ownerDocument)))).toEqual(["/help", "/jump-session", "/cmd", "/clear", "/review", "/deploy"]);
+  expect(optionLabels(required(typedPalette(ownerDocument)))).toEqual(["/help", "/learn", "/jump-session", "/cmd", "/clear", "/review", "/deploy"]);
   expect(ownerTimer).toHaveBeenCalledWith(expect.any(Function), 420);
 
   expect(await press(editor, "End")).toBe(true);
@@ -509,17 +928,44 @@ it("does not clear a new mounted owner after the old reset completes", async () 
   expect(view.editor().value).toBe("Fresh draft");
 });
 
-async function mount(initialDraft: ComposerDraft, ownerDocument: Document = document) {
+async function mount(
+  initialDraft: ComposerDraft,
+  ownerDocument: Document = document,
+  objectiveEnabled = false,
+  objectiveDialogHandoff?: ObjectiveDialogHandoffRequest,
+  rejectedFirstInputRecovery?: NonNullable<AppController["state"]["rejectedFirstInputRecovery"]>
+) {
   const drafts = new Map<string, ComposerDraft>([
     [baseSession.id, initialDraft],
     ["task-two", draft("second task")]
   ]);
   const api = {
-    state: { connectionState: "connected", activeProfile: { serverId: "server-one", id: "profile-one" }, snapshot: emptySnapshot(), preferences: DEFAULT_UI_PREFERENCES },
+    state: { connectionState: "connected", connectionGeneration: 1, activeProfile: { serverId: "server-one", id: "profile-one" }, snapshot: { ...emptySnapshot(), targets: [baseTarget] }, preferences: DEFAULT_UI_PREFERENCES, ...(rejectedFirstInputRecovery === undefined ? {} : { rejectedFirstInputRecovery }) },
     readDraft: vi.fn(async (sessionId: string) => drafts.get(sessionId)),
     readDraftSnapshot: vi.fn(async (sessionId: string) => ({ revision: 1, draft: drafts.get(sessionId) })),
     saveDraft: vi.fn(async (sessionId: string, draftValue: ComposerDraft) => { drafts.set(sessionId, draftValue); }),
     send: vi.fn(async () => undefined),
+    startSkillLearning: vi.fn(async (input: { readonly sourceSessionId?: string }) => ({
+      id: "learning-run",
+      revision: 1n,
+      state: "distilling" as const,
+      sourceKind: input.sourceSessionId === undefined ? "text" as const : "session" as const,
+      backendId: baseSession.backendId,
+      targetId: baseSession.targetId,
+      ...(input.sourceSessionId === undefined ? {} : { sourceSessionId: input.sourceSessionId }),
+      distillationSessionId: "distillation-task",
+      summary: "Learning",
+      createdAt: 1,
+      updatedAt: 1,
+      expiresAt: 2
+    })),
+    getObjective: vi.fn(async () => undefined),
+    setObjective: vi.fn(async (_sessionId: string, generation: bigint, text: string) => objective(text, generation)),
+    updateObjective: vi.fn(async (current) => current),
+    pauseObjective: vi.fn(async (current) => current),
+    resumeObjective: vi.fn(async (current) => current),
+    clearObjective: vi.fn(async () => undefined),
+    navigate: vi.fn(() => undefined),
     resetSession: vi.fn(async () => undefined),
     getVoiceInputCapabilities: vi.fn(async () => ({})),
     listCommands: vi.fn(async () => commands),
@@ -537,7 +983,8 @@ async function mount(initialDraft: ComposerDraft, ownerDocument: Document = docu
       ["input.file", { name: "input.file", supported: true, options: [], maximumItems: 5 }],
       ["runtime.user_shell", { name: "runtime.user_shell", supported: true, options: [] }],
       ["session.reset", { name: "session.reset", supported: true, options: [] }],
-      ["review.isolated", { name: "review.isolated", supported: true, options: [] }]
+      ["review.isolated", { name: "review.isolated", supported: true, options: [] }],
+      ["runtime.resources", { name: "runtime.resources", supported: true, options: ["skill"] }]
     ])
   };
   const workspace = { id: "workspace-one", targetId: baseSession.targetId, name: "Workspace", kind: "userProject" as const, serverPath: "/workspace", trusted: true, dirty: false, entries: [] };
@@ -545,13 +992,24 @@ async function mount(initialDraft: ComposerDraft, ownerDocument: Document = docu
   const root = createRoot(host);
   roots.push(root);
   const actions: Promise<unknown>[] = [];
+  const actionErrors: unknown[] = [];
+  let completeObjectiveDialog = (): void => undefined;
+  const openObjective = vi.fn((onSaved: () => void) => { completeObjectiveDialog = onSaved; });
+  const rejectObjectiveDialogHandoff = vi.fn();
   let activeController = api;
-  const render = async (session: SessionView, nextController: AppController = activeController) => {
+  let activeObjectiveDialogHandoff = objectiveDialogHandoff;
+  const render = async (
+    session: SessionView,
+    nextController: AppController = activeController,
+    nextBackend: BackendView = backend,
+    nextObjectiveDialogHandoff: ObjectiveDialogHandoffRequest | undefined = activeObjectiveDialogHandoff
+  ) => {
     activeController = nextController;
+    activeObjectiveDialogHandoff = nextObjectiveDialogHandoff;
     await act(async () => root.render(<Composer
       controller={activeController}
       session={session}
-      backend={backend}
+      backend={nextBackend}
       autoFocus={false}
       queue={[]}
       workspace={workspace}
@@ -566,17 +1024,25 @@ async function mount(initialDraft: ComposerDraft, ownerDocument: Document = docu
         runtimeGeneration: 1
       }]}
       commands={commands}
+      objectiveDialogHandoff={activeObjectiveDialogHandoff}
       messageHistory={[]}
       t={(key) => key}
-      runAction={(_key, action) => { actions.push(action().catch(() => undefined)); }}
+      runAction={(_key, action) => { actions.push(action().catch((error: unknown) => { actionErrors.push(error); })); }}
       onLocalSend={() => undefined}
+      onOpenObjective={objectiveEnabled ? openObjective : undefined}
+      onObjectiveDialogHandoffRejected={rejectObjectiveDialogHandoff}
     />));
   };
   await render(baseSession);
   return {
     api,
+    backend,
     drafts,
     actions,
+    actionErrors,
+    openObjective,
+    rejectObjectiveDialogHandoff,
+    completeObjectiveDialog: () => completeObjectiveDialog(),
     render,
     hide: async () => { await act(async () => root.render(null)); },
     editor: () => host.querySelector<HTMLTextAreaElement>('[data-mock-composer-editor="true"]')!,
@@ -588,6 +1054,22 @@ async function mount(initialDraft: ComposerDraft, ownerDocument: Document = docu
 
 function draft(text: string): ComposerDraft {
   return { text, editorDocument: plainTextToComposerDocument(text), attachments: [], mentions: [], inlineMentionRanges: [], deliveryMode: "prompt" };
+}
+
+function objective(text: string, sessionGeneration: bigint): ObjectiveView {
+  return {
+    sessionId: baseSession.id,
+    text,
+    status: "active",
+    noProgressTurnLimit: 3,
+    turnsUsed: 0,
+    tokensUsed: 0,
+    noProgressTurns: 0,
+    ownerGeneration: 1n,
+    sessionGeneration,
+    startedAt: 1,
+    revision: 1n
+  };
 }
 
 async function input(element: HTMLTextAreaElement | HTMLInputElement, value: string, caret: number, isComposing = false): Promise<void> {
@@ -613,6 +1095,15 @@ async function flushAnimationFrames(): Promise<void> {
   await act(async () => {
     for (const callback of rafCallbacks.splice(0)) callback(0);
   });
+}
+
+async function settleActions(actions: readonly Promise<unknown>[]): Promise<void> {
+  let index = 0;
+  while (index < actions.length) {
+    const action = actions[index];
+    index += 1;
+    await act(async () => { await action; });
+  }
 }
 
 function typedPalette(ownerDocument: Document = document): HTMLElement | null {

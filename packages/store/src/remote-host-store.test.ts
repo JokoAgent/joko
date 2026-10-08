@@ -53,6 +53,8 @@ describe("owner-scoped Remote Host persistence", () => {
       port: 22,
       user: "maker",
       source: "manual",
+      autoConnect: false,
+      autoConnectRevision: 1n,
       credentialReferenceId: "agent:key-a",
       status: { state: "disconnected" }
     });
@@ -68,6 +70,84 @@ describe("owner-scoped Remote Host persistence", () => {
     expect(() => createHost(fixture.store, { targetId: "missing-target" })).toThrow(NotFoundError);
     expect(() => createHost(fixture.store, { id: "*.example.test" })).toThrow(StoreError);
     expect(() => createHost(fixture.store, { credentialReferenceId: "../private-key" })).toThrow(StoreError);
+  });
+
+  it("persists owner-scoped auto-connect preferences without changing Host authority", () => {
+    const fixture = createFixture();
+    const primary = createHost(fixture.store, { ownerId: "owner-a", targetId: "target-a", id: "shared" });
+    const otherOwner = createHost(fixture.store, {
+      ownerId: "owner-b",
+      targetId: "target-a",
+      id: "shared",
+      hostname: "owner-b.example.test"
+    });
+    const otherTarget = createHost(fixture.store, {
+      ownerId: "owner-a",
+      targetId: "target-b",
+      id: "shared",
+      hostname: "target-b.example.test"
+    });
+    const connecting = fixture.store.updateRemoteHostStatus({
+      ownerId: primary.ownerId,
+      targetId: primary.targetId,
+      id: primary.id,
+      expectedRevision: primary.revision,
+      state: "connecting"
+    });
+
+    const enabled = fixture.store.setRemoteHostAutoConnect({
+      ownerId: connecting.ownerId,
+      targetId: connecting.targetId,
+      id: connecting.id,
+      expectedRevision: connecting.revision,
+      expectedAutoConnectRevision: connecting.autoConnectRevision,
+      enabled: true
+    });
+
+    expect(enabled).toMatchObject({
+      autoConnect: true,
+      autoConnectRevision: 2n,
+      revision: connecting.revision,
+      updatedAt: connecting.updatedAt,
+      status: { state: "connecting" }
+    });
+    expect(fixture.store.getRemoteHost(otherOwner.ownerId, otherOwner.targetId, otherOwner.id))
+      .toMatchObject({ autoConnect: false, autoConnectRevision: 1n });
+    expect(fixture.store.getRemoteHost(otherTarget.ownerId, otherTarget.targetId, otherTarget.id))
+      .toMatchObject({ autoConnect: false, autoConnectRevision: 1n });
+    expect(() => fixture.store.setRemoteHostAutoConnect({
+      ownerId: enabled.ownerId,
+      targetId: enabled.targetId,
+      id: enabled.id,
+      expectedRevision: enabled.revision,
+      expectedAutoConnectRevision: 1n,
+      enabled: false
+    })).toThrow(RevisionConflictError);
+    expect(() => fixture.store.setRemoteHostAutoConnect({
+      ownerId: enabled.ownerId,
+      targetId: enabled.targetId,
+      id: enabled.id,
+      expectedRevision: primary.revision,
+      expectedAutoConnectRevision: enabled.autoConnectRevision,
+      enabled: false
+    })).toThrow(RevisionConflictError);
+
+    const authenticating = fixture.store.updateRemoteHostStatus({
+      ownerId: enabled.ownerId,
+      targetId: enabled.targetId,
+      id: enabled.id,
+      expectedRevision: enabled.revision,
+      state: "authenticating"
+    });
+    expect(authenticating).toMatchObject({ autoConnect: true, autoConnectRevision: 2n });
+
+    const restarted = fixture.reopen();
+    expect(restarted.getRemoteHost("owner-a", "target-a", "shared"))
+      .toMatchObject({ autoConnect: true, autoConnectRevision: 2n, status: { state: "authenticating" } });
+    expect(restarted.getRemoteHost("owner-b", "target-a", "shared"))
+      .toMatchObject({ autoConnect: false, autoConnectRevision: 1n });
+    expect(restarted.getRemoteHost("owner-a", "target-b", "shared"))
+      .toMatchObject({ autoConnect: false, autoConnectRevision: 1n });
   });
 
   it("retains a shared Host's source identity and blocks deletion while another Target or Session uses it", () => {
@@ -550,6 +630,7 @@ describe("owner-scoped Remote Host persistence", () => {
         .map((row) => String(row["name"]));
       expect(columns).toEqual([
         "owner_id", "target_id", "host_id", "hostname", "port", "username", "source",
+        "auto_connect", "auto_connect_revision",
         "credential_reference_id", "node_key_id", "node_key_fingerprint", "trust_algorithm", "trust_fingerprint", "trust_pinned_at",
         "status", "status_changed_at", "failure_code", "failure_retryable",
         "created_at", "updated_at", "revision", "authentication_mode"

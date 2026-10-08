@@ -67,7 +67,7 @@ it("keeps resource and auxiliary operations bound to the controller snapshot's g
   vi.mocked(probeOrchestratorOrigin).mockImplementation(async (origin) => ({ serverId: origin === first.origin ? first.serverId : second.serverId, displayName: "Test", version: "1", apiVersion: "1", pairingEnabled: false }));
   let finishFirst!: () => void;
   const pendingFirst = new Promise<void>((resolve) => { finishFirst = resolve; });
-  const inputCalls = new Map<string, Record<"send" | "createSession" | "createTarget" | "prepareTargetWorkspace" | "refresh" | "readSessionArtifact", ReturnType<typeof vi.fn>>>();
+  const inputCalls = new Map<string, Record<"send" | "createSession" | "createTarget" | "prepareTargetWorkspace" | "refresh" | "readSessionArtifact" | "listCommands" | "startSkillLearning", ReturnType<typeof vi.fn>>>();
   const browserCalls = new Map<string, ReturnType<typeof vi.fn>>();
   const htmlCalls = new Map<string, ReturnType<typeof vi.fn>>();
   const reloadCalls = new Map<string, ReturnType<typeof vi.fn>>();
@@ -119,7 +119,16 @@ it("keeps resource and auxiliary operations bound to the controller snapshot's g
       createSession: vi.fn(async () => { if (disposed) throw new Error("Input owner disconnected"); return { sessionId: "created", generation: 1n }; }),
       createTarget: vi.fn(async () => { if (disposed) throw new Error("Input owner disconnected"); return "target"; }),
       prepareTargetWorkspace: vi.fn(async () => { if (disposed) throw new Error("Input owner disconnected"); }),
-      refresh: vi.fn(async () => { if (disposed) throw new Error("Input owner disconnected"); })
+      refresh: vi.fn(async () => { if (disposed) throw new Error("Input owner disconnected"); }),
+      listCommands: vi.fn(async () => { if (disposed) throw new Error("Input owner disconnected"); return []; }),
+      startSkillLearning: vi.fn(async () => {
+        if (disposed) throw new Error("Input owner disconnected");
+        return {
+          id: "skill_learning_0123456789abcdef0123456789abcdef", revision: 1n, state: "distilling" as const,
+          sourceKind: "text" as const, backendId: "backend", targetId: "target", distillationSessionId: "distilled",
+          summary: "Learning", createdAt: 1, updatedAt: 1, expiresAt: 2
+        };
+      })
     };
     inputCalls.set(owner!.id, inputOperations);
     const voiceOperations = Object.fromEntries(voiceMethods.map(method => [method, vi.fn(async () => { if (disposed) throw new Error("Voice owner disconnected"); })]));
@@ -161,7 +170,7 @@ it("keeps resource and auxiliary operations bound to the controller snapshot's g
       ...inputOperations, ...workspaceOperations, ...voiceOperations, ...queueOperations, ...remoteOperations, ...loginOperations, ...sshOperations,
       watchRemoteHosts: async function* () { if (disposed) throw new Error("Remote workspace owner disconnected"); yield []; },
       readWorkspaceFile: read, readWorkspaceHtmlSnapshot, performBrowserTakeoverAction, getArtifactUrl: get, releaseArtifactUrl: release,
-      navigateSessionBranch: navigate, copyArtifactFile: download, openArtifactFile: download, downloadArtifact: download, exportSession: download, exportPortableSession: download,
+      navigateSessionBranch: navigate, copyArtifactFile: download, openArtifactFile: download, openArtifactFileWithApplication: download, downloadArtifact: download, exportSession: download, exportPortableSession: download,
       updateAuxiliaryTextSettings: save, predictNextPrompt: predict, openBrowserPage
     } as unknown as OrchestratorGateway;
   });
@@ -198,12 +207,13 @@ it("keeps resource and auxiliary operations bound to the controller snapshot's g
   await firstController.createSession(attachedTaskDraft);
   expect(inputCalls.get(first.id)!.createSession.mock.lastCall?.[0]).not.toHaveProperty("appendSystemPrompt");
   expect(current.openArtifactFile).toBe(firstController.openArtifactFile);
+  expect(current.openArtifactFileWithApplication).toBe(firstController.openArtifactFileWithApplication);
   expect(current.openHttpLink).toBe(firstController.openHttpLink);
   expect(current.navigateSessionBranch).toBe(firstController.navigateSessionBranch);
   expect(current.readDraft).toBe(firstController.readDraft);
   expect(current.saveDraft).toBe(firstController.saveDraft);
   for (const method of ["readDraftSnapshot", "saveDraftIfRevision", "restoreFirstInputDraft", ...newDraftMethods, ...workspaceMethods] as const) expect(current[method]).toBe(firstController[method]);
-  for (const method of ["send", "createSession", "createTarget", "prepareTargetWorkspace", "refresh", "readSessionArtifact"] as const) {
+  for (const method of ["send", "createSession", "createTarget", "prepareTargetWorkspace", "refresh", "readSessionArtifact", "listCommands", "startSkillLearning"] as const) {
     expect(current[method]).toBe(firstController[method]);
   }
   for (const method of voiceMethods) expect(current[method]).toBe(firstController[method]);
@@ -360,7 +370,7 @@ it("keeps resource and auxiliary operations bound to the controller snapshot's g
     await expect(call("workspace", "preview", "change", false)).rejects.toThrow("Workspace owner disconnected");
     expect(workspaceCalls.get(second.id)![method]).not.toHaveBeenCalled();
   }
-  for (const method of ["send", "createSession", "createTarget", "prepareTargetWorkspace", "refresh", "readSessionArtifact"] as const) {
+  for (const method of ["send", "createSession", "createTarget", "prepareTargetWorkspace", "refresh", "readSessionArtifact", "listCommands", "startSkillLearning"] as const) {
     expect(secondController[method]).not.toBe(firstController[method]);
   }
   for (const method of voiceMethods) expect(secondController[method]).not.toBe(firstController[method]);
@@ -381,6 +391,10 @@ it("keeps resource and auxiliary operations bound to the controller snapshot's g
   await expect(firstController.prepareTargetWorkspace("target", 1n)).rejects.toThrow("Input owner disconnected");
   await expect(firstController.refresh()).rejects.toThrow("Input owner disconnected");
   await expect(firstController.readSessionArtifact("shared-session", "artifact", new AbortController().signal)).rejects.toThrow("Input owner disconnected");
+  await expect(firstController.listCommands("shared-session", new AbortController().signal)).rejects.toThrow("Input owner disconnected");
+  await expect(firstController.startSkillLearning({
+    requestId: "learn", targetId: "target", instruction: "Learn this"
+  }, new AbortController().signal)).rejects.toThrow("Input owner disconnected");
   for (const call of Object.values(inputCalls.get(second.id)!)) expect(call).not.toHaveBeenCalled();
   await secondController.send("shared-session", inputDraft, { expectedGeneration: 1n });
   expect(inputCalls.get(second.id)!.send).toHaveBeenCalledExactlyOnceWith("shared-session", inputDraft, { expectedGeneration: 1n });

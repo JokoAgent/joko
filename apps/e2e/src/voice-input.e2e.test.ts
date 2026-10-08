@@ -716,7 +716,7 @@ async function startVoiceHost(directory: string) {
   return { application, baseUrl,
     async pair(): Promise<PairedClient> {
       const anonymous = createE2eClients(baseUrl);
-      const device = { deviceDisplayName: "Voice client", deviceKind: DeviceKind.MOBILE, platform: "android", appVersion: "voice-product-e2e" };
+      const device = { deviceDisplayName: "Voice client", deviceKind: DeviceKind.MOBILE, deviceNameSource: { defaultDisplayName: "Fixture phone" }, platform: "android", appVersion: "voice-product-e2e" };
       const begun = await anonymous.connection.beginPairing(device);
       const challengeId = begun.challenge!.challengeId;
       const completed = (await anonymous.connection.completePairing({ ...device, challengeId, humanCode: codes.get(challengeId)! })).result!;

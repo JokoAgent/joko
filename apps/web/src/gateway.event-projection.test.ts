@@ -29,6 +29,8 @@ import {
   MessageRole,
   ModelInputModality,
   ModelOutputModality,
+  ObjectiveLifecycleAction,
+  ObjectiveStatus,
   ProviderApiCompatibility,
   ProviderKind,
   ProviderLoginMethod,
@@ -2176,6 +2178,21 @@ describe("incremental event projection", () => {
     expect(projectedPrompt.snapshot.timelineBySession.get("session-1")?.find((item) => item.id === "message-continuation"))
       .toMatchObject({ automaticContinuation: { recoveryId: "recovery-1" } });
 
+    const objectivePrompt = create(EventSchema, {
+      eventId: "objective-prompt",
+      cursor: { generation: 1n, sequence: 3n },
+      identity: { sessionId: "session-1", runId: "run-objective" },
+      payload: { kind: { case: "messageStarted", value: {
+        messageId: "message-objective-continuation",
+        role: MessageRole.USER,
+        userInput: { parts: [{ content: { case: "text", value: "Internal objective directive" } }] },
+        objectiveContinuation: { ownerGeneration: 7n, turn: 2 }
+      } } }
+    });
+    const projectedObjectivePrompt = projectSnapshotEvent(projectedPrompt.rawSnapshot, projectedPrompt.snapshot, objectivePrompt);
+    expect(projectedObjectivePrompt.snapshot.timelineBySession.get("session-1")?.find((item) => item.id === "message-objective-continuation"))
+      .toMatchObject({ objectiveContinuation: { ownerGeneration: 7n, turn: 2 } });
+
     const succeeded = create(EventSchema, {
       eventId: "runtime-recovery-succeeded",
       cursor: { generation: 1n, sequence: 3n },
@@ -2205,6 +2222,110 @@ describe("incremental event projection", () => {
       state: "succeeded",
       continuationRunId: "run-continuation"
     });
+  });
+
+  it("projects strict Objective lifecycle events into dedicated Timeline rows", () => {
+    const raw = create(SnapshotSchema, { generation: 1n, resumeCursor: { generation: 1n, sequence: 0n } });
+    const started = create(EventSchema, {
+      eventId: "objective-started",
+      cursor: { generation: 1n, sequence: 1n },
+      identity: { sessionId: "session-1" },
+      payload: { kind: { case: "objectiveLifecycle", value: {
+        action: ObjectiveLifecycleAction.STARTED,
+        status: ObjectiveStatus.ACTIVE,
+        ownerGeneration: 4n,
+        turnsUsed: 0,
+        objectiveText: "Ship the complete feature",
+        tokensUsed: 0n,
+        elapsedMs: 0n
+      } } }
+    });
+    const projected = projectSnapshotEvent(raw, mapSnapshot(raw), started);
+    expect(projected.snapshot.timelineBySession.get("session-1")?.[0]).toMatchObject({
+      kind: "objective",
+      objectiveLifecycle: {
+        action: "started",
+        status: "active",
+        ownerGeneration: 4n,
+        turnsUsed: 0,
+        tokensUsed: 0,
+        elapsedMs: 0,
+        objectiveText: "Ship the complete feature"
+      }
+    });
+
+    const invalid = create(EventSchema, {
+      eventId: "objective-invalid",
+      cursor: { generation: 1n, sequence: 2n },
+      identity: { sessionId: "session-1" },
+      payload: { kind: { case: "objectiveLifecycle", value: {
+        action: ObjectiveLifecycleAction.COMPLETED,
+        status: ObjectiveStatus.ACTIVE,
+        ownerGeneration: 4n,
+        turnsUsed: 2,
+        tokensUsed: 1_000n,
+        elapsedMs: 30_000n
+      } } }
+    });
+    expect(() => projectSnapshotEvent(projected.rawSnapshot, projected.snapshot, invalid))
+      .toThrow("invalid Objective lifecycle event");
+  });
+
+  it.each([
+    [ObjectiveStatus.ACTIVE, "active"],
+    [ObjectiveStatus.PAUSED, "paused"],
+    [ObjectiveStatus.BLOCKED, "blocked"],
+    [ObjectiveStatus.COMPLETE, "complete"],
+    [ObjectiveStatus.BUDGET_LIMITED, "budgetLimited"],
+    [ObjectiveStatus.USAGE_LIMITED, "usageLimited"],
+    [ObjectiveStatus.DISPATCH_UNKNOWN, "dispatchUnknown"]
+  ] as const)("accepts replaced Objective lifecycle status %s", (status, expectedStatus) => {
+    const raw = create(SnapshotSchema, { generation: 1n, resumeCursor: { generation: 1n, sequence: 0n } });
+    const event = create(EventSchema, {
+      eventId: `objective-replaced-${expectedStatus}`,
+      cursor: { generation: 1n, sequence: 1n },
+      identity: { sessionId: "session-1" },
+      payload: { kind: { case: "objectiveLifecycle", value: {
+        action: ObjectiveLifecycleAction.REPLACED,
+        status,
+        ownerGeneration: 5n,
+        turnsUsed: 2,
+        objectiveText: "Ship the replacement",
+        tokensUsed: 1_000n,
+        elapsedMs: 30_000n
+      } } }
+    });
+
+    expect(projectSnapshotEvent(raw, mapSnapshot(raw), event).snapshot.timelineBySession.get("session-1")?.[0])
+      .toMatchObject({
+        kind: "objective",
+        objectiveLifecycle: {
+          action: "replaced",
+          status: expectedStatus,
+          objectiveText: "Ship the replacement"
+        }
+      });
+  });
+
+  it("rejects a replaced Objective lifecycle event without a status", () => {
+    const raw = create(SnapshotSchema, { generation: 1n, resumeCursor: { generation: 1n, sequence: 0n } });
+    const event = create(EventSchema, {
+      eventId: "objective-replaced-without-status",
+      cursor: { generation: 1n, sequence: 1n },
+      identity: { sessionId: "session-1" },
+      payload: { kind: { case: "objectiveLifecycle", value: {
+        action: ObjectiveLifecycleAction.REPLACED,
+        status: ObjectiveStatus.UNSPECIFIED,
+        ownerGeneration: 5n,
+        turnsUsed: 2,
+        objectiveText: "Ship the replacement",
+        tokensUsed: 1_000n,
+        elapsedMs: 30_000n
+      } } }
+    });
+
+    expect(() => projectSnapshotEvent(raw, mapSnapshot(raw), event))
+      .toThrow("invalid Objective lifecycle event");
   });
 
   it("projects only typed scheduler origin metadata onto user timeline rows", () => {

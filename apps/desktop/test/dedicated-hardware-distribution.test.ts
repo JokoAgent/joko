@@ -58,6 +58,8 @@ type AuditDedicatedHardwareSdkDirectory = (
 
 const require = createRequire(import.meta.url);
 const packagedAudit = require("../scripts/audit-packaged.cjs") as {
+  readonly auditNativeGamepad: (root: string, platform: "win32" | "darwin" | "linux", targetArch: string) => Promise<void>;
+  readonly auditNativeHardware: (root: string, platform: "win32" | "darwin" | "linux", targetArch: string) => Promise<void>;
   readonly auditNativeSystemFrontmostInput: (root: string, platform: "win32" | "darwin" | "linux", targetArch: string) => Promise<void>;
   readonly auditDedicatedHardwareSdkDirectory: AuditDedicatedHardwareSdkDirectory;
   readonly createDedicatedHardwareSdkDirectoryIntegrity: (entries: readonly Readonly<{
@@ -81,6 +83,114 @@ const runtimeTarget: DedicatedHardwareSdkRuntimeTarget = {
 
 afterEach(() => {
   for (const path of cleanups.splice(0).reverse()) rmSync(path, { recursive: true, force: true });
+});
+
+describe("packaged native USB hardware audit", () => {
+  it("requires the target binary and integrity in the packaged resource", async () => {
+    const root = temporaryDirectory();
+    const bytes = Buffer.alloc(128);
+    bytes.writeUInt16LE(0x5a4d, 0);
+    bytes.writeUInt32LE(64, 0x3c);
+    bytes.writeUInt32LE(0x4550, 64);
+    bytes.writeUInt16LE(0x8664, 68);
+    const helper = "joko-windows-micro-helper.exe";
+    writeFileSync(join(root, helper), bytes);
+    writeFileSync(join(root, "manifest.json"), JSON.stringify({ protocolVersion: 1,
+      platform: "win32", architecture: "x64", helper, sha256: createHash("sha256").update(bytes).digest("hex") }));
+    await expect(packagedAudit.auditNativeHardware(root, "win32", "x64")).resolves.toBeUndefined();
+    await expect(packagedAudit.auditNativeHardware(root, "win32", "arm64")).rejects.toThrow("artifact target");
+    bytes[100] = 1;
+    writeFileSync(join(root, helper), bytes);
+    await expect(packagedAudit.auditNativeHardware(root, "win32", "x64")).rejects.toThrow("does not match its identity");
+  });
+});
+
+describe("packaged native gamepad audit", () => {
+  it("builds a strict non-macOS manifest for an explicit package target", async () => {
+    // The production build module is JavaScript because electron-builder imports it from afterPack.
+    // @ts-expect-error The build script intentionally has no public TypeScript declaration surface.
+    const nativeBuild = await import("../scripts/build-native-gamepad.mjs") as {
+      readonly buildNativeGamepad: (options: {
+        platform: string;
+        architecture: string;
+        output: string;
+      }) => void;
+      readonly nativeGamepadCompilerTarget: (architecture: string) => Readonly<{
+        compilerArchitecture: string;
+        triple: string;
+      }>;
+    };
+    const root = temporaryDirectory();
+    nativeBuild.buildNativeGamepad({ platform: "linux", architecture: "arm64", output: root });
+    expect(JSON.parse(readFileSync(join(root, "manifest.json"), "utf8"))).toEqual({
+      protocolVersion: 1,
+      platform: "linux",
+      architecture: "arm64",
+      helper: null,
+      sha256: null
+    });
+    expect(nativeBuild.nativeGamepadCompilerTarget("x64")).toEqual({
+      compilerArchitecture: "x86_64",
+      triple: "x86_64-apple-macos11.0"
+    });
+    expect(nativeBuild.nativeGamepadCompilerTarget("arm64")).toEqual({
+      compilerArchitecture: "arm64",
+      triple: "arm64-apple-macos11.0"
+    });
+    await expect(packagedAudit.auditNativeGamepad(root, "linux", "arm64")).resolves.toBeUndefined();
+  });
+
+  it.each(["x64", "arm64"] as const)("requires a strict %s Mach-O identity and digest", async (architecture) => {
+    const root = temporaryDirectory();
+    const helper = "joko-macos-gamepad-helper";
+    const bytes = Buffer.alloc(64);
+    bytes.writeUInt32LE(0xfeedfacf, 0);
+    bytes.writeUInt32LE(architecture === "arm64" ? 0x0100000c : 0x01000007, 4);
+    writeFileSync(join(root, helper), bytes, { mode: 0o755 });
+    writeFileSync(join(root, "manifest.json"), JSON.stringify({
+      protocolVersion: 1,
+      platform: "darwin",
+      architecture,
+      helper,
+      sha256: createHash("sha256").update(bytes).digest("hex")
+    }));
+
+    await expect(packagedAudit.auditNativeGamepad(root, "darwin", architecture)).resolves.toBeUndefined();
+    await expect(packagedAudit.auditNativeGamepad(root, "darwin", architecture === "x64" ? "arm64" : "x64"))
+      .rejects.toThrow("does not match the artifact target");
+    bytes[32] = 1;
+    writeFileSync(join(root, helper), bytes, { mode: 0o755 });
+    await expect(packagedAudit.auditNativeGamepad(root, "darwin", architecture))
+      .rejects.toThrow("does not match its identity");
+
+    bytes[32] = 0;
+    bytes.writeUInt32LE(architecture === "arm64" ? 0x01000007 : 0x0100000c, 4);
+    writeFileSync(join(root, helper), bytes, { mode: 0o755 });
+    writeFileSync(join(root, "manifest.json"), JSON.stringify({
+      protocolVersion: 1,
+      platform: "darwin",
+      architecture,
+      helper,
+      sha256: createHash("sha256").update(bytes).digest("hex")
+    }));
+    await expect(packagedAudit.auditNativeGamepad(root, "darwin", architecture))
+      .rejects.toThrow("does not match its identity");
+  });
+
+  it.each(["win32", "linux"] as const)("admits only a null %s manifest", async (platform) => {
+    const root = temporaryDirectory();
+    writeFileSync(join(root, "manifest.json"), JSON.stringify({
+      protocolVersion: 1,
+      platform,
+      architecture: "x64",
+      helper: null,
+      sha256: null
+    }));
+    await expect(packagedAudit.auditNativeGamepad(root, platform, "x64")).resolves.toBeUndefined();
+    writeFileSync(join(root, "unexpected-helper"), "not admitted\n");
+    await expect(packagedAudit.auditNativeGamepad(root, platform, "x64"))
+      .rejects.toThrow("incomplete or contains unexpected files");
+  });
 });
 
 describe("packaged native foreground input audit", () => {

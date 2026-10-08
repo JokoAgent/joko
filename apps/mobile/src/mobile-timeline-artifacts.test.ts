@@ -1,9 +1,12 @@
 import { create } from "@bufbuild/protobuf";
 import {
+  AudioArtifactKind,
+  AudioArtifactMetadataSchema,
   BlobRefSchema,
   EventPayloadSchema,
   EventCursorSchema,
   EventSchema,
+  ImageRefSchema,
   MessageArtifactBlockSchema,
   MessageBlockSchema,
   MessageCompletedEventSchema,
@@ -24,6 +27,41 @@ import {
 } from "./mobile-timeline-artifacts";
 
 describe("mobile Timeline preview artifacts", () => {
+  it("keeps canonical audio information complete and retires its selected occurrence when metadata changes", () => {
+    const metadata = () => create(AudioArtifactMetadataSchema, { kind: AudioArtifactKind.MUSIC, title: "x".repeat(513),
+      description: "Full description\n".repeat(400), durationSeconds: 12,
+      artwork: create(ImageRefSchema, { widthPixels: 2, heightPixels: 3, altText: "Cover",
+        blob: create(BlobRefSchema, { blobId: "cover", sha256Hex: "b".repeat(64), byteSize: 24n, mediaType: "image/png", fileName: "cover.png" }) }) });
+    const audioBlock = () => {
+      const block = artifactBlock("song.mp3", "audio/mpeg", "File label");
+      if (block.content.case !== "artifact") throw new Error("fixture");
+      block.content.value.audioMetadata = metadata();
+      return block;
+    };
+    const original = completedEvent([audioBlock()]);
+    const selected = mobileTimelinePreviewArtifacts(original)[0]!;
+    expect(selected).toMatchObject({ title: "x".repeat(513), audioMetadata: { kind: "music", title: "x".repeat(513),
+      description: "Full description\n".repeat(400), durationSeconds: 12, artwork: { blob: { blobId: "cover" }, width: 2, height: 3, alt: "Cover" } } });
+    expect(resolveMobileTimelinePreviewArtifact([completedEvent([audioBlock()])], selected)).toBeDefined();
+    const changes = [
+      { title: "New title" }, { description: "Updated description" }, { durationSeconds: 13 },
+      { artwork: create(ImageRefSchema, { ...metadata().artwork!, blob: create(BlobRefSchema, { ...metadata().artwork!.blob!, sha256Hex: "c".repeat(64) }) }) }
+    ];
+    for (const change of changes) {
+      const block = audioBlock();
+      if (block.content.case !== "artifact") throw new Error("fixture");
+      block.content.value.audioMetadata = create(AudioArtifactMetadataSchema, { ...metadata(), ...change });
+      const changed = completedEvent([block]);
+      expect(resolveMobileTimelinePreviewArtifact([changed], selected)).toBeUndefined();
+      expect(mobileTimelinePreviewWindowKey([changed])).not.toBe(mobileTimelinePreviewWindowKey([original]));
+      expect(mobileTimelineArtifactWindowKey([changed])).not.toBe(mobileTimelineArtifactWindowKey([original]));
+    }
+    const withoutMetadata = completedEvent([artifactBlock("song.mp3", "audio/mpeg", "File label")]);
+    expect(resolveMobileTimelinePreviewArtifact([withoutMetadata], selected)).toBeUndefined();
+    expect(mobileTimelinePreviewArtifacts(withoutMetadata)[0]).toMatchObject({ title: "File label", previewKind: "media" });
+    expect(mobileTimelinePreviewArtifacts(withoutMetadata)[0]?.audioMetadata).toBeUndefined();
+  });
+
   it("resolves exact typed tool and produced occurrences and retires replaced or foreign scope", () => {
     const original = completedEvent([artifactBlock("clip.mp4", "video/mp4", "Clip")]);
     const tool = toolMediaEvent(original, "toolCallUpdated");

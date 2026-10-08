@@ -20,6 +20,20 @@ describe("historical task reference visibility", () => {
     appendNativeMessage(store, "root-event", "root", undefined, "user", "root prompt");
     appendNativeMessage(store, "branch-a-event", "branch-a", "root", "assistant", "accepted branch");
     appendNativeMessage(store, "branch-b-event", "branch-b", "root", "assistant", "hidden sibling");
+    store.appendEvent({
+      id: "objective-continuation-event",
+      backendId: "backend",
+      targetId: "target",
+      sessionId: "source",
+      generation: 0,
+      traceId: "test:objective-continuation-event",
+      payload: {
+        type: "message_complete",
+        role: "user",
+        blocks: [{ kind: "text", text: "internal objective directive" }],
+        objectiveContinuation: { ownerGeneration: 1, turn: 1 }
+      }
+    });
     appendMarker(store, "marker-a", "branch-a");
 
     const snapshot = store.captureSessionReferenceSnapshot("source", 3);

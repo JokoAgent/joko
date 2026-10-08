@@ -16,6 +16,7 @@ export interface DesktopDevicePeerAgentRouteOptions {
   readonly executor: Pick<DesktopDevicePeerAgentExecutor, "capabilities" | "execute" | "retire">;
   readonly signal: AbortSignal;
   readonly readAuthKey: (profileId: string) => Promise<string | undefined>;
+  readonly readDefaultDeviceName: () => string;
   readonly readRouteAuthorization: (profileId: string) => Promise<string | undefined>;
   readonly isAuthorityCurrent: (
     connection: DesktopManagedOrchestratorConnection
@@ -40,6 +41,7 @@ export function runDesktopDevicePeerAgentRoute(
     executor: options.executor,
     signal: options.signal,
     readAuthKey: options.readAuthKey,
+    readDefaultDeviceName: options.readDefaultDeviceName,
     readRouteAuthorization: options.readRouteAuthorization,
     isAuthorityCurrent: async (candidate) => sameNodeConnection(candidate, connection)
       && await options.isAuthorityCurrent(options.connection),

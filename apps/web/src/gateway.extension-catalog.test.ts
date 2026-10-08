@@ -71,6 +71,84 @@ describe("Extension catalog gateway", () => {
     gateway.disconnect();
   });
 
+  it("maps bounded recommendation descriptors and preserves optional commands and unique locales", async () => {
+    const value = protoExtension(1) as any;
+    value.recommendations = [{
+      id: "review-mail",
+      label: "Review mail",
+      prompt: "Review the messages that need attention.\nSummarize the next actions.",
+      command: "review",
+      locales: [{ locale: "zh-CN", label: "检查邮件", prompt: "检查需要处理的邮件。" }]
+    }];
+    const gateway = await mount(async (method) => method === "getSnapshot" ? { snapshot: {} } : {
+      extensions: [value],
+      catalogRevision: { value: 7n },
+      recoveredFromCorruption: false,
+      page: { totalSize: 1n, nextPageToken: "" }
+    });
+
+    await expect(gateway.listExtensions()).resolves.toMatchObject({
+      extensions: [{
+        recommendations: [{
+          id: "review-mail",
+          label: "Review mail",
+          prompt: "Review the messages that need attention.\nSummarize the next actions.",
+          command: "review",
+          locales: { "zh-CN": { label: "检查邮件", prompt: "检查需要处理的邮件。" } }
+        }]
+      }]
+    });
+    gateway.disconnect();
+  });
+
+  it.each([
+    ["more than 24 entries", Array.from({ length: 25 }, (_, index) => ({
+      id: `task-${index}`, label: "Task", prompt: "Do the task.", locales: []
+    }))],
+    ["duplicate identities", [
+      { id: "same", label: "First", prompt: "First task", locales: [] },
+      { id: "same", label: "Second", prompt: "Second task", locales: [] }
+    ]],
+    ["more than 64 KiB", Array.from({ length: 9 }, (_, index) => ({
+      id: `large-${index}`, label: "Large", prompt: "界".repeat(8_000), locales: []
+    }))],
+    ["duplicate locales", [{
+      id: "localized", label: "Task", prompt: "Do the task.",
+      locales: [
+        { locale: "en", label: "One", prompt: "First" },
+        { locale: "en", label: "Two", prompt: "Second" }
+      ]
+    }]],
+    ["unknown locales", [{
+      id: "localized", label: "Task", prompt: "Do the task.",
+      locales: [{ locale: "fr", label: "Tâche", prompt: "Faire la tâche." }]
+    }]],
+    ["label controls", [{
+      id: "controlled", label: "Task\nname", prompt: "Do the task.", locales: []
+    }]],
+    ["bidirectional label controls", [{
+      id: "controlled", label: "Task\u202ename", prompt: "Do the task.", locales: []
+    }]],
+    ["prompt controls other than tabs and newlines", [{
+      id: "controlled", label: "Task", prompt: "Do\rthe task.", locales: []
+    }]],
+    ["invalid optional commands", [{
+      id: "command", label: "Task", prompt: "Do the task.", command: "bad command", locales: []
+    }]]
+  ])("rejects recommendation wire data with %s", async (_case, recommendations) => {
+    const value = protoExtension(1) as any;
+    value.recommendations = recommendations;
+    const gateway = await mount(async (method) => method === "getSnapshot" ? { snapshot: {} } : {
+      extensions: [value],
+      catalogRevision: { value: 7n },
+      recoveredFromCorruption: false,
+      page: { totalSize: 1n, nextPageToken: "" }
+    });
+
+    await expect(gateway.listExtensions()).rejects.toThrow(/Extension recommendation/u);
+    gateway.disconnect();
+  });
+
   it("keeps every setup mutation revision-fenced and uploads a secret only through its one-shot ticket", async () => {
     const requests: Array<{ readonly method: string; readonly input: any }> = [];
     const uploaded: string[] = [];

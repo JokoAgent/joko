@@ -23,6 +23,7 @@ import {
   RemoteHostFailureCode,
   RemoteHostSource,
   RemoteHostStatus,
+  SetRemoteHostAutoConnectResponseSchema,
   SnapshotSchema,
   SubmitOperationResponseSchema,
   TestRemoteHostConnectionResponseSchema,
@@ -165,6 +166,9 @@ describe("Remote Host gateway", () => {
         return create(ListRemoteHostsResponseSchema, { hosts: [host()], page: { totalSize: 1n } });
       }
       if (method === "createRemoteHost") return create(CreateRemoteHostResponseSchema, { host: host() });
+      if (method === "setRemoteHostAutoConnect") return create(SetRemoteHostAutoConnectResponseSchema, {
+        host: host({ autoConnect: input.enabled, autoConnectRevision: { value: 3n } })
+      });
       if (method === "testRemoteHostConnection") {
         return create(TestRemoteHostConnectionResponseSchema, { result: { outcome: 1, host: host() } });
       }
@@ -224,6 +228,8 @@ describe("Remote Host gateway", () => {
         changedAt: 11_000,
         failure: { code: "hostKeyChanged", retryable: false }
       },
+      autoConnect: false,
+      autoConnectRevision: 2n,
       revision: 4n
     }]);
     await gateway.createRemoteHost("target-one", {
@@ -235,6 +241,12 @@ describe("Remote Host gateway", () => {
       credentialReferenceId: "ssh-key-reference"
     });
     await gateway.testRemoteHostConnection("target-one", "build-box", 4n);
+    await expect(gateway.setRemoteHostAutoConnect("target-one", "build-box", 4n, 2n, false)).resolves.toMatchObject({
+      id: "build-box",
+      autoConnect: false,
+      autoConnectRevision: 3n,
+      revision: 4n
+    });
     await gateway.updateTarget("target-one", {
       workspaceLocation: { kind: "remote", hostId: "build-box", workspaceRoot: "  /srv/project  " }
     }, 7n);
@@ -255,6 +267,13 @@ describe("Remote Host gateway", () => {
       targetId: "target-one",
       hostId: "build-box",
       expectedRevision: { value: 4n }
+    });
+    expect(requests.find((request) => request.method === "setRemoteHostAutoConnect")?.input).toEqual({
+      targetId: "target-one",
+      hostId: "build-box",
+      expectedHostRevision: { value: 4n },
+      expectedAutoConnectRevision: { value: 2n },
+      enabled: false
     });
     expect(requests.find((request) => request.method === "submitOperation")?.input.mutation.payload).toMatchObject({
       case: "updateTarget",
@@ -548,6 +567,42 @@ describe("Remote Host gateway", () => {
     gateway.disconnect();
   });
 
+  it.each([undefined, { value: 0n }])("fails closed without a current auto-connect revision (%s)", async (autoConnectRevision) => {
+    const gateway = createOrchestratorGateway(
+      { id: "remote-auto-connect-malformed", deviceId: "device-test", name: "Browser", origin: "https://orchestrator.example", serverId: "server-test" },
+      "auth-key",
+      {},
+      () => remoteTransport((method) => {
+        if (method !== "listRemoteHosts") throw new Error(`Unexpected method: ${method}`);
+        return create(ListRemoteHostsResponseSchema, {
+          hosts: [host({ autoConnectRevision })],
+          page: { totalSize: 1n }
+        });
+      })
+    );
+    await gateway.connect();
+    await expect(gateway.listRemoteHosts("target-one")).rejects.toThrow("incomplete Remote Host");
+    gateway.disconnect();
+  });
+
+  it("fails closed without an explicit auto-connect value", async () => {
+    const gateway = createOrchestratorGateway(
+      { id: "remote-auto-connect-value-malformed", deviceId: "device-test", name: "Browser", origin: "https://orchestrator.example", serverId: "server-test" },
+      "auth-key",
+      {},
+      () => remoteTransport((method) => {
+        if (method !== "listRemoteHosts") throw new Error(`Unexpected method: ${method}`);
+        return create(ListRemoteHostsResponseSchema, {
+          hosts: [host({ autoConnect: undefined })],
+          page: { totalSize: 1n }
+        });
+      })
+    );
+    await gateway.connect();
+    await expect(gateway.listRemoteHosts("target-one")).rejects.toThrow("incomplete Remote Host");
+    gateway.disconnect();
+  });
+
   it("collects every Remote Host page and rejects a cyclic cursor without publishing a partial catalog", async () => {
     const pageTokens: string[] = [];
     const transport = remoteTransport((method, input) => {
@@ -647,6 +702,8 @@ function host(patch: Record<string, unknown> = {}): any {
       changedAt: { seconds: 11n, nanos: 0 },
       failure: { code: RemoteHostFailureCode.HOST_KEY_CHANGED, retryable: false }
     },
+    autoConnect: false,
+    autoConnectRevision: { value: 2n },
     revision: { value: 4n },
     ...patch
   };
