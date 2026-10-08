@@ -81,10 +81,13 @@ import {
   type MobilePartnerResourceTransport
 } from "./mobile-partner-resources";
 import {
+  assertMobileExtensionMainViewSurface,
   mobileExtensionKey,
+  sameMobileExtensionMainViewSurface,
   type MobileExtension,
   type MobileExtensionCommand,
   type MobileExtensionCredentialKind,
+  type MobileExtensionMainViewSurface,
   type MobileExtensionMutationResult,
   type MobileExtensionPendingMutationKind,
   type MobileExtensionTransport,
@@ -1356,6 +1359,45 @@ export class MobileClient {
         return { kind: "task", sessionId: destination.sessionId };
       })();
     };
+    const openMainView = async (
+      expected: MobileExtension,
+      signal: AbortSignal
+    ): Promise<MobileExtensionMainViewSurface> => {
+      let opened: MobileExtensionMainViewSurface | undefined;
+      try {
+        return await owned(signal, async (current) => {
+          if (pendingForExtension(expected.extensionId)) {
+            throw new Error("A previous change to this Extension still has an unresolved result. Check its operation receipt first.");
+          }
+          const extension = await readExactDetail(expected, current);
+          opened = await this.network.openExtensionMainView(
+            context.credential,
+            extension.extensionId,
+            extension.revision,
+            current
+          );
+          requireCurrent(current);
+          assertMobileExtensionMainViewSurface(extension, opened);
+          return opened;
+        });
+      } catch (error) {
+        if (opened !== undefined) {
+          await this.network.closeExtensionMainView(context.credential, opened.surfaceId).catch(() => undefined);
+        }
+        throw error;
+      }
+    };
+    const probeMainView = (
+      expected: MobileExtensionMainViewSurface,
+      signal: AbortSignal
+    ): Promise<MobileExtensionMainViewSurface> => owned(signal, async (current) => {
+      const surface = await this.network.getExtensionMainViewSurface(context.credential, expected.surfaceId, current);
+      requireCurrent(current);
+      if (!sameMobileExtensionMainViewSurface(expected, surface) || surface.expiresAt <= Date.now()) {
+        throw new Error("The Extension main-view surface changed or expired.");
+      }
+      return surface;
+    });
     const exactPending = (operationId: string) => {
       const matches = this.#state.pending.filter((receipt) => receipt.operationId === operationId
         && receipt.connectionId === context.credential.connectionId
@@ -1383,6 +1425,12 @@ export class MobileClient {
       revokeSetup,
       tasks: (expected) => isCurrent() ? projectMobileExtensionTaskChoices(this.#state.owner, expected) : [],
       useCommand,
+      openMainView,
+      probeMainView,
+      closeMainView: (expected) => this.network.closeExtensionMainView(
+        context.credential,
+        expected.surfaceId
+      ),
       reconcile: (operationId, signal) => owned(signal, async (current) => {
         exactPending(operationId);
         await this.reconcile();

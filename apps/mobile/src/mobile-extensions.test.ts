@@ -1,4 +1,5 @@
 import { create } from "@bufbuild/protobuf";
+import { TimestampSchema } from "@bufbuild/protobuf/wkt";
 import {
   ExtensionCatalogEntrySchema,
   ExtensionCatalogSource,
@@ -6,6 +7,7 @@ import {
   ExtensionLibraryDescriptorSchema,
   ExtensionMainViewDescriptorSchema,
   ExtensionMainViewIcon,
+  ExtensionMainViewSurfaceSchema,
   ExtensionOwnerSchema,
   ExtensionPermissionDescriptorSchema,
   ExtensionResourceOwnerSchema,
@@ -21,9 +23,14 @@ import {
 import { describe, expect, it } from "vitest";
 import {
   collectMobileExtensionCatalog,
+  allowMobileExtensionMainViewNavigation,
+  assertMobileExtensionMainViewSurface,
   filterMobileExtensions,
   mobileExtensionKey,
+  mobileExtensionMainViewReady,
   projectMobileExtension,
+  projectMobileExtensionMainViewSurface,
+  sameMobileExtensionMainViewSurface,
   type MobileExtensionCatalogPage
 } from "./mobile-extensions";
 
@@ -87,6 +94,47 @@ describe("mobile Extension catalog projection", () => {
 
     expect(mobileExtensionKey(first)).not.toBe(mobileExtensionKey(changed));
     expect(mobileExtensionKey(first)).not.toBe(mobileExtensionKey(setupChanged));
+  });
+});
+
+describe("mobile Extension main-view authority", () => {
+  it("projects an opaque surface, binds it to the exact Resource generation, and fences navigation", () => {
+    const extension = projectMobileExtension(fixture(1));
+    const surface = projectMobileExtensionMainViewSurface(mainViewSurface(), "https://node.example");
+
+    expect(mobileExtensionMainViewReady(extension)).toBe(true);
+    expect(surface).toMatchObject({
+      surfaceId: "extension_surface_11111111111111111111111111111111",
+      extensionId: extension.extensionId,
+      owner: extension.owner,
+      backendId: "backend-1",
+      backendRevision: 7n,
+      backendGeneration: 9,
+      url: expect.stringMatching(/^https:\/\/node\.example\/v1\/extensions\/main-views\//u),
+      title: "Mail",
+      icon: "layout"
+    });
+    expect(() => assertMobileExtensionMainViewSurface(extension, surface, 1_900_000_000_000)).not.toThrow();
+    expect(sameMobileExtensionMainViewSurface(surface, { ...surface })).toBe(true);
+    expect(allowMobileExtensionMainViewNavigation(surface, surface.url)).toBe(true);
+    expect(allowMobileExtensionMainViewNavigation(surface, surface.url.replace("index.html", "assets/app.js#ready"))).toBe(true);
+    expect(allowMobileExtensionMainViewNavigation(surface, `${surface.url}?debug=1`)).toBe(false);
+    expect(allowMobileExtensionMainViewNavigation(surface, "https://other.example/index.html")).toBe(false);
+    expect(allowMobileExtensionMainViewNavigation(surface, "joko://task/session")).toBe(false);
+  });
+
+  it("rejects malformed endpoints, mismatched owners, expired leases, and non-ready Extensions", () => {
+    const extension = projectMobileExtension(fixture(1));
+    const malformed = mainViewSurface();
+    malformed.endpoint = "/v1/extensions/main-views/not-a-surface/token/index.html";
+    expect(() => projectMobileExtensionMainViewSurface(malformed, "https://node.example")).toThrow(/main-view surface/u);
+
+    const surface = projectMobileExtensionMainViewSurface(mainViewSurface(), "https://node.example");
+    expect(() => assertMobileExtensionMainViewSurface({ ...extension, enabled: false }, surface, 1_900_000_000_000))
+      .toThrow(/Resource authority/u);
+    expect(() => assertMobileExtensionMainViewSurface(extension, { ...surface,
+      owner: { ...surface.owner, resourceRevision: 99n } }, 1_900_000_000_000)).toThrow(/Resource authority/u);
+    expect(() => assertMobileExtensionMainViewSurface(extension, surface, surface.expiresAt)).toThrow(/Resource authority/u);
   });
 });
 
@@ -217,5 +265,25 @@ function fixture(index: number, name = "Review Mail"): ExtensionCatalogEntry {
       })]
     }),
     useSupported: true
+  });
+}
+
+function mainViewSurface() {
+  const surfaceId = "extension_surface_11111111111111111111111111111111";
+  return create(ExtensionMainViewSurfaceSchema, {
+    surfaceId,
+    extensionId: "extension_00000000000000000000000000000001",
+    owner: create(ExtensionResourceOwnerSchema, {
+      resourceId: "resource-1",
+      discoveredRevision: `sha256:${"1".padStart(64, "0")}`,
+      resourceVersion: create(RevisionSchema, { value: 3n })
+    }),
+    endpoint: `/v1/extensions/main-views/${surfaceId}/${"a".repeat(64)}/index.html`,
+    title: "Mail",
+    icon: ExtensionMainViewIcon.LAYOUT,
+    expiresAt: create(TimestampSchema, { seconds: 2_000_000_000n }),
+    backendId: "backend-1",
+    backendRevision: create(RevisionSchema, { value: 7n }),
+    backendGeneration: 9n
   });
 }

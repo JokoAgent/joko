@@ -84,7 +84,7 @@ import {
 } from "./mobile-composer-document";
 import { createMobileAutomationDraft } from "./mobile-automation-authoring";
 import { parseMobileNativeIntent } from "./mobile-native-intent";
-import type { MobileExtension } from "./mobile-extensions";
+import type { MobileExtension, MobileExtensionMainViewSurface } from "./mobile-extensions";
 
 const credential: PairedCredential = {
   profileId: "mobile-profile", origin: "http://192.168.1.20:4318", serverId: "node-1", connectionId: "mobile-connection",
@@ -952,6 +952,9 @@ function fakeNetwork(): MobileNetwork {
     listExtensions: vi.fn(async () => ({ revision: 1n, recoveredFromCorruption: false, extensions: [] })),
     getExtension: vi.fn(async () => { throw new Error("No Extension fixture was configured."); }),
     getExtensionForRuntime: vi.fn(async () => { throw new Error("No runtime-scoped Extension fixture was configured."); }),
+    openExtensionMainView: vi.fn(async () => { throw new Error("No Extension main-view fixture was configured."); }),
+    getExtensionMainViewSurface: vi.fn(async () => { throw new Error("No Extension main-view fixture was configured."); }),
+    closeExtensionMainView: vi.fn(async () => true),
     uploadExtensionSetupCredential: vi.fn(async () => { throw new Error("No Extension credential fixture was configured."); }),
     listPartnerPrivateThreads: vi.fn(async () => []),
     getPartnerPrivateThread: vi.fn(async () => { throw new Error("No private thread fixture was configured."); }),
@@ -2412,6 +2415,70 @@ describe("mobile Extension catalog authority", () => {
     expect(await drafts.composer.read(identity)).toEqual(original);
     expect(network.submit).not.toHaveBeenCalled();
   });
+
+  it("opens, probes, and closes a main-view lease only for the exact ready Resource authority", async () => {
+    const network = fakeNetwork();
+    const extension: MobileExtension = {
+      ...mobileExtensionFixture(),
+      sidebarSupported: true,
+      sidebarVisible: true,
+      mainView: { title: "Mail", icon: "layout" }
+    };
+    const surface = mobileExtensionMainViewSurface(extension);
+    network.getExtension = vi.fn(async () => extension);
+    network.openExtensionMainView = vi.fn(async () => surface);
+    network.getExtensionMainViewSurface = vi.fn(async () => surface);
+    const app = client(network, memoryStorage(credential).storage);
+    await app.start();
+    const transport = app.extensionCatalogTransport()!;
+
+    const opened = await transport.openMainView(extension, new AbortController().signal);
+    expect(opened).toEqual(surface);
+    expect(network.openExtensionMainView).toHaveBeenCalledWith(
+      credential,
+      extension.extensionId,
+      extension.revision,
+      expect.any(AbortSignal)
+    );
+    await expect(transport.probeMainView(opened, new AbortController().signal)).resolves.toEqual(surface);
+    await expect(transport.closeMainView(opened)).resolves.toBe(true);
+    expect(network.closeExtensionMainView).toHaveBeenCalledWith(credential, surface.surfaceId);
+
+    network.getExtension = vi.fn(async () => ({ ...extension, enabled: false }));
+    await expect(app.extensionCatalogTransport()!.openMainView(extension, new AbortController().signal))
+      .rejects.toThrow(/changed/u);
+    expect(network.openExtensionMainView).toHaveBeenCalledTimes(1);
+  });
+
+  it("closes a late main-view lease after owner retirement and rejects a changed probe", async () => {
+    const network = fakeNetwork();
+    const extension: MobileExtension = {
+      ...mobileExtensionFixture(),
+      sidebarSupported: true,
+      sidebarVisible: true,
+      mainView: { title: "Mail", icon: "layout" }
+    };
+    const surface = mobileExtensionMainViewSurface(extension);
+    network.getExtension = vi.fn(async () => extension);
+    let finish!: (surface: MobileExtensionMainViewSurface) => void;
+    network.openExtensionMainView = vi.fn(() => new Promise<MobileExtensionMainViewSurface>(
+      (resolve) => { finish = resolve; }
+    ));
+    const app = client(network, memoryStorage(credential).storage);
+    await app.start();
+    const opening = app.extensionCatalogTransport()!.openMainView(extension, new AbortController().signal);
+    await vi.waitFor(() => expect(network.openExtensionMainView).toHaveBeenCalledOnce());
+    app.setForeground(false);
+    finish(surface);
+    await expect(opening).rejects.toThrow(/owner changed|cancelled/u);
+    expect(network.closeExtensionMainView).toHaveBeenCalledWith(credential, surface.surfaceId);
+
+    app.setForeground(true);
+    await app.refresh();
+    network.getExtensionMainViewSurface = vi.fn(async () => ({ ...surface, backendGeneration: 8 }));
+    await expect(app.extensionCatalogTransport()!.probeMainView(surface, new AbortController().signal))
+      .rejects.toThrow(/changed|expired/u);
+  });
 });
 
 describe("mobile Partner private authority", () => {
@@ -2591,6 +2658,23 @@ function mobileExtensionFixture(): MobileExtension {
     setup: { state: "notRequired", revision: 0n, fields: [] },
     useSupported: true,
     updateAvailable: false
+  };
+}
+
+function mobileExtensionMainViewSurface(extension: MobileExtension): MobileExtensionMainViewSurface {
+  if (extension.owner.kind !== "resource") throw new Error("Resource Extension fixture required.");
+  const surfaceId = "extension_surface_11111111111111111111111111111111";
+  return {
+    surfaceId,
+    extensionId: extension.extensionId,
+    owner: extension.owner,
+    backendId: "backend",
+    backendRevision: 4n,
+    backendGeneration: 7,
+    url: `${credential.origin}/v1/extensions/main-views/${surfaceId}/${"b".repeat(64)}/index.html`,
+    ...(extension.mainView?.title === undefined ? {} : { title: extension.mainView.title }),
+    ...(extension.mainView?.icon === undefined ? {} : { icon: extension.mainView.icon }),
+    expiresAt: Date.now() + 60_000
   };
 }
 

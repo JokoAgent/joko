@@ -75,6 +75,16 @@ vi.mock("react-native", async () => {
   };
 });
 
+vi.mock("./MobileExtensionMainView", async () => {
+  const React = await import("react");
+  return {
+    MobileExtensionMainView: ({ extension, onBack }: { readonly extension: MobileExtension; readonly onBack: () => void }) =>
+      React.createElement("section", { "data-testid": "main-view" },
+        React.createElement("span", {}, `Surface ${extension.name}`),
+        React.createElement("button", { "aria-label": "Back to Extension details", onClick: onBack }, "Back"))
+  };
+});
+
 const colors: MobileExtensionsScreenProps["colors"] = {
   background: "#fafafa", surface: "#fff", ink: "#111", muted: "#666",
   border: "#ddd", accent: "#f90", negative: "#b00", brandBackground: "#fff0d0"
@@ -125,6 +135,9 @@ function transport(ownerKey = "owner-a", value = catalog()): MobileExtensionTran
     useCommand: vi.fn(async (_expected, _command, destination) => destination.kind === "newTask"
       ? { kind: "newTask" as const }
       : { kind: "task" as const, sessionId: destination.sessionId }),
+    openMainView: vi.fn(async () => { throw new Error("No main-view fixture was configured."); }),
+    probeMainView: vi.fn(async () => { throw new Error("No main-view fixture was configured."); }),
+    closeMainView: vi.fn(async () => true),
     reconcile: vi.fn(async () => undefined),
     dismiss: vi.fn(async () => undefined)
   };
@@ -212,6 +225,37 @@ describe("MobileExtensionsScreen", () => {
     });
     expect(container.textContent).not.toContain("Review Mail");
     expect(container.textContent).toContain("Calendar");
+  });
+
+  it("opens a ready Resource main view in the narrow detail pane and returns without losing detail", async () => {
+    const active = transport();
+    await render(active);
+    await press("View Mail");
+
+    await press("Open main view");
+    expect(container.querySelector('[data-testid="main-view"]')?.textContent).toContain("Surface Mail");
+    act(() => expect(native.back?.()).toBe(true));
+    expect(container.querySelector('[data-testid="main-view"]')).toBeNull();
+    expect(container.textContent).toContain("Review messages that need attention");
+
+    const unavailable = transport("owner-disabled", catalog([{ ...mail, enabled: false }]));
+    await render(unavailable);
+    await press("View Mail");
+    expect((container.querySelector('[testid="extensions.mainView.open"]') as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("keeps the Extension directory available beside a wide main view and retires it on another selection", async () => {
+    native.width = 900;
+    const active = transport();
+    await render(active);
+    await press("View Mail");
+    await press("Open main view");
+
+    expect(container.querySelector('[data-testid="main-view"]')).not.toBeNull();
+    expect(container.querySelector('[testid="extensions.directory"]')).not.toBeNull();
+    await press("View Calendar");
+    expect(container.querySelector('[data-testid="main-view"]')).toBeNull();
+    expect(container.textContent).toContain("Plan meetings");
   });
 
   it("keeps the authoritative descriptor visible while enabled and sidebar changes are pending", async () => {

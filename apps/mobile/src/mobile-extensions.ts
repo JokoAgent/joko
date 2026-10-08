@@ -4,7 +4,8 @@ import {
   ExtensionMainViewIcon,
   ExtensionSetupFieldKind,
   ExtensionSetupState,
-  type ExtensionCatalogEntry
+  type ExtensionCatalogEntry,
+  type ExtensionMainViewSurface
 } from "@joko/contracts";
 
 const EXTENSION_ID = /^extension_[a-f0-9]{32}$/u;
@@ -126,6 +127,20 @@ export interface MobileExtensionMutationResult {
   readonly extension: MobileExtension;
 }
 
+export interface MobileExtensionMainViewSurface {
+  readonly surfaceId: string;
+  readonly extensionId: string;
+  readonly owner: Extract<MobileExtensionOwner, { readonly kind: "resource" }>;
+  readonly backendId: string;
+  readonly backendRevision: bigint;
+  readonly backendGeneration: number;
+  /** Absolute opaque URL for this process-local lease. Never persist it as Extension identity. */
+  readonly url: string;
+  readonly title?: string;
+  readonly icon?: NonNullable<MobileExtension["mainView"]>["icon"];
+  readonly expiresAt: number;
+}
+
 export interface MobileExtensionCommand {
   readonly name: string;
   readonly description: string;
@@ -177,6 +192,9 @@ export interface MobileExtensionTransport {
     destination: MobileExtensionUseDestination,
     signal: AbortSignal
   ): Promise<MobileExtensionUseResult>;
+  openMainView(expected: MobileExtension, signal: AbortSignal): Promise<MobileExtensionMainViewSurface>;
+  probeMainView(expected: MobileExtensionMainViewSurface, signal: AbortSignal): Promise<MobileExtensionMainViewSurface>;
+  closeMainView(expected: MobileExtensionMainViewSurface): Promise<boolean>;
   reconcile(operationId: string, signal: AbortSignal): Promise<void>;
   dismiss(operationId: string, signal: AbortSignal): Promise<void>;
 }
@@ -222,6 +240,104 @@ export function mobileExtensionOwnerKey(owner: MobileExtensionOwner): string {
         owner.entryId,
         owner.contentRevision
       ].join("\u001f");
+  }
+}
+
+export function mobileExtensionMainViewReady(extension: MobileExtension | undefined): extension is MobileExtension & {
+  readonly owner: Extract<MobileExtensionOwner, { readonly kind: "resource" }>;
+  readonly mainView: NonNullable<MobileExtension["mainView"]>;
+} {
+  return extension !== undefined && extension.owner.kind === "resource" && extension.mainView !== undefined
+    && extension.installed && extension.enabled && extension.sidebarSupported
+    && (extension.installState === "installed" || extension.installState === "updateAvailable")
+    && (extension.setup.state === "ready" || extension.setup.state === "notRequired");
+}
+
+export function projectMobileExtensionMainViewSurface(
+  value: ExtensionMainViewSurface,
+  rawOrigin: string
+): MobileExtensionMainViewSurface {
+  const base = new URL(rawOrigin);
+  if ((base.protocol !== "http:" && base.protocol !== "https:") || base.username || base.password
+    || base.search || base.hash || (base.pathname !== "/" && base.pathname !== "")) {
+    invalid("Extension main-view origin");
+  }
+  if (!/^extension_surface_[a-f0-9]{32}$/u.test(value.surfaceId)
+    || !EXTENSION_ID.test(value.extensionId) || value.owner === undefined
+    || !CONTENT_REVISION.test(value.owner.discoveredRevision)
+    || !validMainViewEndpoint(value.endpoint, value.surfaceId)) {
+    invalid("Extension main-view surface");
+  }
+  const backendGeneration = value.backendGeneration <= BigInt(Number.MAX_SAFE_INTEGER)
+    ? Number(value.backendGeneration)
+    : undefined;
+  const expiresAt = timestampMilliseconds(value.expiresAt);
+  if (backendGeneration === undefined || backendGeneration < 0 || expiresAt === undefined) {
+    invalid("Extension main-view authority");
+  }
+  const title = value.title === undefined ? undefined : requiredText(value.title, 80, "Extension main-view title");
+  const icon = projectMainViewIcon(value.icon);
+  return {
+    surfaceId: value.surfaceId,
+    extensionId: value.extensionId,
+    owner: {
+      kind: "resource",
+      resourceId: identity(value.owner.resourceId, 256, "Extension Resource identity"),
+      discoveredRevision: value.owner.discoveredRevision,
+      resourceRevision: positiveRevision(value.owner.resourceVersion?.value, "Extension Resource revision")
+    },
+    backendId: identity(value.backendId, 256, "Extension Backend identity"),
+    backendRevision: positiveRevision(value.backendRevision?.value, "Extension Backend revision"),
+    backendGeneration,
+    url: `${base.origin}${value.endpoint}`,
+    ...(title === undefined ? {} : { title }),
+    ...(icon === undefined ? {} : { icon }),
+    expiresAt
+  };
+}
+
+export function assertMobileExtensionMainViewSurface(
+  extension: MobileExtension,
+  surface: MobileExtensionMainViewSurface,
+  now = Date.now()
+): void {
+  if (!mobileExtensionMainViewReady(extension)
+    || surface.extensionId !== extension.extensionId
+    || surface.owner.resourceId !== extension.owner.resourceId
+    || surface.owner.resourceRevision !== extension.owner.resourceRevision
+    || surface.owner.discoveredRevision !== extension.owner.discoveredRevision
+    || surface.title !== extension.mainView.title || surface.icon !== extension.mainView.icon
+    || !Number.isSafeInteger(now) || surface.expiresAt <= now) {
+    throw new Error("The Extension main-view surface no longer matches its current Resource authority.");
+  }
+}
+
+export function sameMobileExtensionMainViewSurface(
+  left: MobileExtensionMainViewSurface,
+  right: MobileExtensionMainViewSurface
+): boolean {
+  return left.surfaceId === right.surfaceId && left.extensionId === right.extensionId
+    && left.owner.resourceId === right.owner.resourceId
+    && left.owner.discoveredRevision === right.owner.discoveredRevision
+    && left.owner.resourceRevision === right.owner.resourceRevision
+    && left.backendId === right.backendId && left.backendRevision === right.backendRevision
+    && left.backendGeneration === right.backendGeneration && left.url === right.url
+    && left.title === right.title && left.icon === right.icon && left.expiresAt === right.expiresAt;
+}
+
+export function allowMobileExtensionMainViewNavigation(
+  surface: MobileExtensionMainViewSurface,
+  candidateUrl: string
+): boolean {
+  try {
+    const expected = new URL(surface.url);
+    const candidate = new URL(candidateUrl);
+    const root = expected.pathname.slice(0, expected.pathname.lastIndexOf("/") + 1);
+    return (candidate.protocol === "http:" || candidate.protocol === "https:")
+      && candidate.origin === expected.origin && candidate.username === "" && candidate.password === ""
+      && candidate.search === "" && candidate.pathname.startsWith(root);
+  } catch {
+    return false;
   }
 }
 
@@ -623,6 +739,33 @@ function positiveRevision(value: bigint | undefined, label: string): bigint {
 function nonNegativeRevision(value: bigint | undefined, label: string): bigint {
   if (value === undefined || value < 0n) invalid(label);
   return value;
+}
+
+function timestampMilliseconds(value: {
+  readonly seconds: bigint;
+  readonly nanos: number;
+} | undefined): number | undefined {
+  if (value === undefined || value.seconds < 0n
+    || value.seconds > BigInt(Math.floor(Number.MAX_SAFE_INTEGER / 1_000))
+    || !Number.isSafeInteger(value.nanos) || value.nanos < 0 || value.nanos > 999_999_999) return undefined;
+  const milliseconds = Number(value.seconds) * 1_000 + Math.floor(value.nanos / 1_000_000);
+  return Number.isSafeInteger(milliseconds) ? milliseconds : undefined;
+}
+
+function validMainViewEndpoint(value: string, surfaceId: string): boolean {
+  const prefix = `/v1/extensions/main-views/${surfaceId}/`;
+  if (!value.startsWith(prefix) || value.includes("?") || value.includes("#")) return false;
+  const suffix = value.slice(prefix.length);
+  const separator = suffix.indexOf("/");
+  if (separator !== 64 || !/^[a-f0-9]{64}$/u.test(suffix.slice(0, separator))) return false;
+  const encodedEntry = suffix.slice(separator + 1);
+  if (encodedEntry === "" || encodedEntry.includes("/")) return false;
+  try {
+    const entry = decodeURIComponent(encodedEntry);
+    return entry !== "." && entry !== ".." && !entry.includes("/") && !entry.includes("\\") && !entry.includes("\0");
+  } catch {
+    return false;
+  }
 }
 
 function recommendationText(value: string, maximum: number, forbidden: RegExp, label: string): void {

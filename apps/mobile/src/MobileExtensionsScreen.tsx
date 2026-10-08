@@ -17,6 +17,7 @@ import type { MobileSupportedLocale } from "./mobile-locale-preference";
 import { mobileMessage } from "./mobile-messages";
 import {
   filterMobileExtensions,
+  mobileExtensionMainViewReady,
   type MobileExtension,
   type MobileExtensionCatalog,
   type MobileExtensionCommand,
@@ -26,6 +27,7 @@ import {
   type MobileExtensionUseDestination
 } from "./mobile-extensions";
 import { mobileExtensionUseReady } from "./mobile-extension-use-handoff";
+import { MobileExtensionMainView } from "./MobileExtensionMainView";
 import type { MobilePartnersColors } from "./MobilePartnersScreen";
 
 export interface MobileExtensionsScreenProps {
@@ -64,6 +66,11 @@ type UseSelection = {
   readonly ownerKey: string;
   readonly extension: MobileExtension;
   readonly command: MobileExtensionCommand;
+};
+
+type MainViewSelection = {
+  readonly ownerKey: string;
+  readonly extension: MobileExtension;
 };
 
 function errorText(error: unknown): string {
@@ -163,7 +170,10 @@ export function MobileExtensionsScreen({
   const [taskQuery, setTaskQuery] = useState("");
   const [useBusy, setUseBusy] = useState(false);
   const [useError, setUseError] = useState<string | undefined>();
+  const [mainView, setMainView] = useState<MainViewSelection | undefined>();
   const ownerKey = transport?.ownerKey;
+
+  useEffect(() => { setMainView(undefined); }, [ownerKey]);
 
   useEffect(() => {
     setSetupValues({});
@@ -220,6 +230,7 @@ export function MobileExtensionsScreen({
   }, []);
 
   const closeDetail = () => {
+    setMainView(undefined);
     detailAbort.current?.abort();
     detailOccurrence.current = undefined;
     setDetail(emptyDetail);
@@ -241,16 +252,19 @@ export function MobileExtensionsScreen({
     const subscription = BackHandler.addEventListener("hardwareBackPress", () => {
       if (useSelection) {
         if (!useBusy) closeUseSelection();
+      } else if (mainView?.ownerKey === ownerKey) {
+        setMainView(undefined);
       } else if (detail.extensionId && !wide) closeDetail();
       else onBack();
       return true;
     });
     return () => subscription.remove();
-  }, [detail.extensionId, onBack, useBusy, useSelection, wide]);
+  }, [detail.extensionId, mainView, onBack, ownerKey, useBusy, useSelection, wide]);
 
   const openDetail = (expected: MobileExtension) => {
     const currentTransport = transportRef.current;
     if (!currentTransport) return;
+    setMainView(undefined);
     detailAbort.current?.abort();
     const controller = new AbortController();
     const occurrence = Symbol("extension-detail");
@@ -416,6 +430,7 @@ export function MobileExtensionsScreen({
 
   const visibleDirectory = directory.ownerKey === ownerKey ? directory : emptyDirectory;
   const visibleDetail = detail.ownerKey === ownerKey ? detail : emptyDetail;
+  const visibleMainView = mainView?.ownerKey === ownerKey ? mainView : undefined;
   const extensions = visibleDirectory.catalog?.extensions ?? [];
   const filtered = useMemo(() => filterMobileExtensions(extensions, query), [extensions, query]);
   const selected = visibleDetail.extensionId
@@ -539,6 +554,31 @@ export function MobileExtensionsScreen({
             {extension.setup.error && <Text accessibilityRole="alert" style={[styles.body, { color: colors.negative }]}>
               {mobileMessage(locale, "extension.setupError", { error: extension.setup.error })}
             </Text>}
+
+            {extension.mainView !== undefined && <>
+              <Text style={[styles.section, { color: colors.muted }]}>{mobileMessage(locale, "extension.mainView")}</Text>
+              <View style={[styles.card, { backgroundColor: colors.surface, borderColor: colors.border }]}
+                testID="extensions.mainView.entry">
+                <View style={styles.controlRow}>
+                  <View style={styles.grow}>
+                    <Text style={[styles.label, { color: colors.ink }]}>{extension.mainView.title
+                      ?? mobileMessage(locale, "extension.mainView")}</Text>
+                    <Text style={[styles.caption, { color: colors.muted }]}>{mobileMessage(locale,
+                      mobileExtensionMainViewReady(extension)
+                        ? "extension.mainViewReadyBody"
+                        : "extension.mainViewNotReadyBody")}</Text>
+                  </View>
+                  <Action label={mobileMessage(locale, "extension.mainViewOpen")} colors={colors}
+                    disabled={!mobileExtensionMainViewReady(extension) || selectedBusy
+                      || mutation !== undefined || pending.length > 0}
+                    onPress={() => {
+                      const currentTransport = transportRef.current;
+                      if (!currentTransport || !mobileExtensionMainViewReady(extension)) return;
+                      setMainView({ ownerKey: currentTransport.ownerKey, extension });
+                    }} testID="extensions.mainView.open" />
+                </View>
+              </View>
+            </>}
 
             <Text style={[styles.section, { color: colors.muted }]}>{mobileMessage(locale, "extension.controls")}</Text>
             <View style={[styles.card, { backgroundColor: colors.surface, borderColor: colors.border }]}>
@@ -784,8 +824,14 @@ export function MobileExtensionsScreen({
 
   return <>
     <View style={[styles.screen, { backgroundColor: colors.background }]}>
-      {wide ? <View style={styles.wide}>{directoryPane}{detailPane}</View>
-        : visibleDetail.extensionId ? detailPane : directoryPane}
+      {wide ? <View style={styles.wide}>{directoryPane}{visibleMainView && transport
+        ? <MobileExtensionMainView colors={colors} extension={visibleMainView.extension} locale={locale}
+          transport={transport} onBack={() => setMainView(undefined)} />
+        : detailPane}</View>
+        : visibleMainView && transport
+          ? <MobileExtensionMainView colors={colors} extension={visibleMainView.extension} locale={locale}
+            transport={transport} onBack={() => setMainView(undefined)} />
+          : visibleDetail.extensionId ? detailPane : directoryPane}
     </View>
     <Modal visible={visibleUseSelection !== undefined} transparent animationType="fade"
       onRequestClose={() => { if (!useBusy) closeUseSelection(); }}>

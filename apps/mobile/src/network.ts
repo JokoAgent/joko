@@ -64,9 +64,11 @@ import {
 import {
   collectMobileExtensionCatalog,
   projectMobileExtension,
+  projectMobileExtensionMainViewSurface,
   type MobileExtension,
   type MobileExtensionCatalog,
-  type MobileExtensionCredentialKind
+  type MobileExtensionCredentialKind,
+  type MobileExtensionMainViewSurface
 } from "./mobile-extensions";
 
 export interface PairedCredential {
@@ -174,6 +176,22 @@ export interface MobileNetwork {
     sessionId: string,
     signal?: AbortSignal
   ): Promise<MobileExtension>;
+  openExtensionMainView(
+    credential: PairedCredential,
+    extensionId: string,
+    expectedRevision: bigint,
+    signal?: AbortSignal
+  ): Promise<MobileExtensionMainViewSurface>;
+  getExtensionMainViewSurface(
+    credential: PairedCredential,
+    surfaceId: string,
+    signal?: AbortSignal
+  ): Promise<MobileExtensionMainViewSurface>;
+  closeExtensionMainView(
+    credential: PairedCredential,
+    surfaceId: string,
+    signal?: AbortSignal
+  ): Promise<boolean>;
   uploadExtensionSetupCredential(
     credential: PairedCredential,
     extensionId: string,
@@ -1455,6 +1473,39 @@ export const mobileNetwork: MobileNetwork = {
     const extension = projectMobileExtension(response.extension);
     if (!extension.installed) throw new Error("The selected Extension is no longer installed on this Joko node.");
     return extension;
+  },
+  async openExtensionMainView(credential, extensionId, expectedRevision, signal) {
+    if (!/^extension_[a-f0-9]{32}$/u.test(extensionId) || expectedRevision < 1n) {
+      throw new Error("A current Extension main view is required.");
+    }
+    const response = await createClient(ExtensionService, transport(credential.origin, credential.authKey))
+      .openExtensionMainView({ extensionId, expectedRevision: { value: expectedRevision } }, options(signal));
+    signal?.throwIfAborted();
+    if (response.surface === undefined) throw new Error("The Joko node returned an empty Extension main-view surface.");
+    const surface = projectMobileExtensionMainViewSurface(response.surface, credential.origin);
+    if (surface.extensionId !== extensionId) throw new Error("The Joko node returned a mismatched Extension main-view surface.");
+    return surface;
+  },
+  async getExtensionMainViewSurface(credential, surfaceId, signal) {
+    if (!/^extension_surface_[a-f0-9]{32}$/u.test(surfaceId)) {
+      throw new Error("A current Extension main-view surface is required.");
+    }
+    const response = await createClient(ExtensionService, transport(credential.origin, credential.authKey))
+      .getExtensionMainViewSurface({ surfaceId }, options(signal));
+    signal?.throwIfAborted();
+    if (response.surface === undefined) throw new Error("The Joko node returned an empty Extension main-view probe.");
+    const surface = projectMobileExtensionMainViewSurface(response.surface, credential.origin);
+    if (surface.surfaceId !== surfaceId) throw new Error("The Joko node returned a mismatched Extension main-view probe.");
+    return surface;
+  },
+  async closeExtensionMainView(credential, surfaceId, signal) {
+    if (!/^extension_surface_[a-f0-9]{32}$/u.test(surfaceId)) {
+      throw new Error("A current Extension main-view surface is required.");
+    }
+    const response = await createClient(ExtensionService, transport(credential.origin, credential.authKey))
+      .closeExtensionMainView({ surfaceId }, options(signal));
+    signal?.throwIfAborted();
+    return response.closed;
   },
   async uploadExtensionSetupCredential(credential, extensionId, attemptId, fieldId, kind, secret, signal) {
     signal?.throwIfAborted();

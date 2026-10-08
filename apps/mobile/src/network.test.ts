@@ -10,9 +10,13 @@ import {
   BeginPairingRequestSchema, BeginPairingResponseSchema,
   CompletePairingRequestSchema, CompletePairingResponseSchema,
   ConnectionSchema, ConnectionState, CredentialKind, DeviceKind, DeviceSchema,
-  ExtensionCatalogEntrySchema, ExtensionCatalogSource, ExtensionInstallState, ExtensionOwnerSchema,
-  ExtensionResourceOwnerSchema, ExtensionSetupDescriptorSchema, ExtensionSetupState,
+  ExtensionCatalogEntrySchema, ExtensionCatalogSource, ExtensionInstallState, ExtensionMainViewIcon,
+  ExtensionMainViewSurfaceSchema, ExtensionOwnerSchema, ExtensionResourceOwnerSchema,
+  ExtensionSetupDescriptorSchema, ExtensionSetupState,
   BeginExtensionSetupCredentialUploadRequestSchema, BeginExtensionSetupCredentialUploadResponseSchema,
+  OpenExtensionMainViewRequestSchema, OpenExtensionMainViewResponseSchema,
+  GetExtensionMainViewSurfaceRequestSchema, GetExtensionMainViewSurfaceResponseSchema,
+  CloseExtensionMainViewRequestSchema, CloseExtensionMainViewResponseSchema,
   GetExtensionRequestSchema, GetExtensionResponseSchema, ListExtensionsRequestSchema, ListExtensionsResponseSchema,
   RevisionSchema,
   GetServerInfoResponseSchema, GetSnapshotRequestSchema, GetSnapshotResponseSchema, SnapshotSchema,
@@ -286,6 +290,61 @@ describe("mobile Extension network", () => {
     } finally {
       fetcher.mockRestore();
     }
+  });
+
+  it("opens, probes, and closes an exact opaque main-view surface through generated RPCs", async () => {
+    const credential: PairedCredential = { profileId: "profile", origin: "https://node.example", serverId: "server",
+      connectionId: "connection", deviceId: "phone", displayName: "Phone", authKey: "extension-fixture-key" };
+    const extensionId = "extension_0123456789abcdef0123456789abcdef";
+    const surfaceId = "extension_surface_11111111111111111111111111111111";
+    const surface = create(ExtensionMainViewSurfaceSchema, {
+      surfaceId,
+      extensionId,
+      owner: create(ExtensionResourceOwnerSchema, {
+        resourceId: "resource-main",
+        discoveredRevision: `sha256:${"1".repeat(64)}`,
+        resourceVersion: create(RevisionSchema, { value: 5n })
+      }),
+      endpoint: `/v1/extensions/main-views/${surfaceId}/${"a".repeat(64)}/index.html`,
+      title: "Review",
+      icon: ExtensionMainViewIcon.LAYOUT,
+      expiresAt: create(TimestampSchema, { seconds: BigInt(Math.ceil(Date.now() / 1_000) + 60) }),
+      backendId: "backend-main",
+      backendRevision: create(RevisionSchema, { value: 8n }),
+      backendGeneration: 4n
+    });
+    const methods: string[] = [];
+    const fetcher = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      expect(new Headers(init?.headers).get("authorization")).toBe(`Bearer ${credential.authKey}`);
+      const method = new URL(String(input)).pathname.split("/").at(-1)!;
+      const body = new Uint8Array(init?.body as Uint8Array);
+      methods.push(method);
+      const headers = { "content-type": "application/proto" };
+      if (method === "OpenExtensionMainView") {
+        expect(fromBinary(OpenExtensionMainViewRequestSchema, body)).toMatchObject({
+          extensionId,
+          expectedRevision: { value: 3n }
+        });
+        return new Response(toBinary(OpenExtensionMainViewResponseSchema,
+          create(OpenExtensionMainViewResponseSchema, { surface })), { headers });
+      }
+      if (method === "GetExtensionMainViewSurface") {
+        expect(fromBinary(GetExtensionMainViewSurfaceRequestSchema, body)).toMatchObject({ surfaceId });
+        return new Response(toBinary(GetExtensionMainViewSurfaceResponseSchema,
+          create(GetExtensionMainViewSurfaceResponseSchema, { surface })), { headers });
+      }
+      expect(method).toBe("CloseExtensionMainView");
+      expect(fromBinary(CloseExtensionMainViewRequestSchema, body)).toMatchObject({ surfaceId });
+      return new Response(toBinary(CloseExtensionMainViewResponseSchema,
+        create(CloseExtensionMainViewResponseSchema, { closed: true })), { headers });
+    });
+    try {
+      const opened = await mobileNetwork.openExtensionMainView(credential, extensionId, 3n);
+      expect(opened).toMatchObject({ surfaceId, extensionId, url: expect.stringContaining(surfaceId) });
+      await expect(mobileNetwork.getExtensionMainViewSurface(credential, surfaceId)).resolves.toEqual(opened);
+      await expect(mobileNetwork.closeExtensionMainView(credential, surfaceId)).resolves.toBe(true);
+      expect(methods).toEqual(["OpenExtensionMainView", "GetExtensionMainViewSurface", "CloseExtensionMainView"]);
+    } finally { fetcher.mockRestore(); }
   });
 });
 
