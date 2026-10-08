@@ -391,7 +391,7 @@ function PartnerDefaultsDialog({ open, directory, snapshot, controller, ownerKey
   return <Modal open={open} title={t("partners.defaultsTitle")} description={t("partners.defaultsBody")} size="large" onClose={saving ? () => undefined : onClose}><div className="partner-editor"><CapabilitiesEditor value={value} snapshot={snapshot} disabled={saving} t={t} onChange={setValue} />{error !== undefined && <p className="partner-editor__error" role="alert">{error}</p>}<div className="modal__actions"><Button onClick={onClose} disabled={saving}>{t("common.cancel")}</Button><Button tone="primary" disabled={saving || !validPartnerCapabilities(value)} onClick={() => void save()}>{saving ? t("common.working") : t("common.save")}</Button></div></div></Modal>;
 }
 
-function PartnerSettingsDialog({ partner, partners, directory, snapshot, controller, ownerKey, t, onClose, onUpdated, onActivityUpdated }: {
+export function PartnerSettingsDialog({ partner, partners, directory, snapshot, controller, ownerKey, t, initialSection = "activity", showClose = false, onClose, onUpdated, onActivityUpdated }: {
   readonly partner: PartnerProfileView;
   readonly partners: readonly PartnerProfileView[];
   readonly directory: PartnerDirectoryView;
@@ -399,6 +399,8 @@ function PartnerSettingsDialog({ partner, partners, directory, snapshot, control
   readonly controller: AppController;
   readonly ownerKey: string;
   readonly t: Translator;
+  readonly initialSection?: "profile" | "activity";
+  readonly showClose?: boolean;
   readonly onClose: () => void;
   readonly onUpdated: (result: PartnerMutationView) => void;
   readonly onActivityUpdated: (partner: PartnerProfileView) => void;
@@ -411,7 +413,7 @@ function PartnerSettingsDialog({ partner, partners, directory, snapshot, control
   const [saved, setSaved] = useState(true);
   const [saveError, setSaveError] = useState<string>();
   const [conflict, setConflict] = useState(false);
-  const [section, setSection] = useState<"profile" | "activity">("activity");
+  const [section, setSection] = useState<"profile" | "activity">(initialSection);
   const tabsId = useId();
   const ownerRef = useRef(ownerKey);
   ownerRef.current = ownerKey;
@@ -464,7 +466,7 @@ function PartnerSettingsDialog({ partner, partners, directory, snapshot, control
     }
   };
   const status = conflict ? t("partners.conflict") : saveError !== undefined ? t("partners.notSaved") : saving ? t("partners.saving") : dirty ? t("partners.unsaved") : saved ? t("partners.saved") : t("partners.unsaved");
-  return <Modal open title={t("partners.workspaceTitle", { name: partner.displayName })} description={section === "profile" ? t("partners.settingsBody") : t("partners.workspaceBody")} size="large" onClose={onClose}>
+  return <Modal open title={t(initialSection === "profile" ? "partners.settingsTitle" : "partners.workspaceTitle", { name: partner.displayName })} description={section === "profile" ? t("partners.settingsBody") : t("partners.workspaceBody")} size="large" onClose={onClose} showClose={showClose} closeLabel={t("common.close")}>
     <div className="partner-workspace">
       <div className="segmented partner-workspace__tabs" role="tablist" aria-label={t("partners.workspaceSections")} onKeyDown={(event) => {
         if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
@@ -862,7 +864,7 @@ function AvatarPicker({ value, options, disabled = false, t, onChange }: { reado
   return <fieldset className="partner-avatar-picker" disabled={disabled}><legend>{t("partners.avatar")}</legend><div>{options.map((option) => <button type="button" key={option} className={cx(value === option && "is-selected")} aria-label={t("partners.avatarOption", { name: option })} aria-pressed={value === option} onClick={() => onChange(option)}><PartnerAvatar preset={option} /></button>)}</div></fieldset>;
 }
 
-function PartnerAvatar({ preset }: { readonly preset: string }): JSX.Element {
+export function PartnerAvatar({ preset }: { readonly preset: string }): JSX.Element {
   return <span className={`partner-avatar partner-avatar--${safeCssToken(preset)}`} aria-hidden="true"><span /></span>;
 }
 

@@ -161,7 +161,11 @@ function controllerFor(methods: {
     effectiveLocale: "en",
     extensionNotifications: []
   };
-  return { state, ...methods } as unknown as AppController;
+  return {
+    state, ...methods,
+    getPortableReplacementCleanup: vi.fn(async () => undefined),
+    listPartners: vi.fn(async () => ({ partners: [], directory: { revision: 1n, activeCount: 0, archivedCount: 0, errorCount: 0, updatedAt: 0, templates: [], avatarPresets: [] } }))
+  } as unknown as AppController;
 }
 
 function backend(): BackendView {

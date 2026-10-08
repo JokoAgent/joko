@@ -296,5 +296,9 @@ function controllerFor(
     effectiveLocale: "en",
     extensionNotifications: []
   };
-  return { state, listSessionResources, listSessionArtifacts, listArtifactReferenceCatalog } as unknown as AppController;
+  return {
+    state, listSessionResources, listSessionArtifacts, listArtifactReferenceCatalog,
+    getPortableReplacementCleanup: vi.fn(async () => undefined),
+    listPartners: vi.fn(async () => ({ partners: [], directory: { revision: 1n, activeCount: 0, archivedCount: 0, errorCount: 0, updatedAt: 0, templates: [], avatarPresets: [] } }))
+  } as unknown as AppController;
 }

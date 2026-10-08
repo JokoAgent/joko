@@ -71,6 +71,7 @@ import {
   type UsageLimitRecoveryHint
 } from "../usage-limit-recovery.js";
 import { SessionHeaderActionsMenu } from "./SessionHeaderActionsMenu.js";
+import { PartnerConversationHeader } from "./PartnerConversationHeader.js";
 import { TaskTagDots } from "./TaskTags.js";
 import { codeHostDisplayBranch } from "./CodeHostPullRequestSummary.js";
 import { openCodeHostPullRequestExternal } from "../code-host-pull-request.js";
@@ -1804,7 +1805,7 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
         return;
       }
     }}>
-      {presentation !== "filesRail" && <header className="session-header">
+      {presentation !== "filesRail" && <PartnerConversationHeader controller={controller} session={session} navigationOpen={navigationOpen} onOpenNavigation={onOpenNavigation} t={t}><header className="session-header">
         <div className="session-header__leading">
           {!navigationOpen && <IconButton className="mobile-panel-toggle" label={t("a11y.openNavigation")} onClick={onOpenNavigation}><Menu aria-hidden="true" /></IconButton>}
           <div className="session-heading">
@@ -1876,7 +1877,7 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
           />
           {!reviewReadOnly && inspectorAvailable && !inspectorOpen && <IconButton label={t("a11y.openInspector")} onClick={onOpenInspector}><PanelRight aria-hidden="true" /></IconButton>}
         </div>
-      </header>}
+      </header></PartnerConversationHeader>}
 
       {session.worktree?.state === "preserved" && <div className="session-worktree-warning" role="alert"><GitBranch aria-hidden="true" /><span><strong>{t("worktree.preservedTitle")}</strong><small>{t("worktree.preservedDescription", { branch: session.worktree.branch })}</small></span></div>}
       {!reviewReadOnly && <PortableReplacementCleanupNotice controller={controller} sessionId={session.id} t={t} />}
