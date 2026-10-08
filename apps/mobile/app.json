@@ -80,6 +80,7 @@
         "enableBackgroundPlayback": false,
         "enableBackgroundRecording": false
       }],
+      "./with-joko-remote-desktop-presentation.cjs",
       ["expo-image-picker", {
         "photosPermission": false,
         "cameraPermission": "Allow Joko to use your camera only when you choose Take photo for a task attachment.",

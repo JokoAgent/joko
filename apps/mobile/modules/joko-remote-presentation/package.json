@@ -1,0 +1,8 @@
+{
+  "name": "@joko/mobile-remote-presentation",
+  "version": "0.1.0",
+  "description": "Joko-owned iOS Remote Desktop presentation and portable clipboard boundary.",
+  "private": true,
+  "main": "src/index.ts",
+  "peerDependencies": { "expo": "*" }
+}

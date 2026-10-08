@@ -36,6 +36,7 @@ describe("settings section navigation", () => {
       ["general", "pi"],
       ["about", "backends"],
       ["providers", "credentials"],
+      ["connections", "remoteDesktop"],
       ["connections", "remoteHosts"],
       ["tools", "mcp"],
       ["about", "diagnostics"],

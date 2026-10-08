@@ -1,3 +1,9 @@
+import { create } from "@bufbuild/protobuf";
+import {
+  DevicePeerCapabilityKind,
+  DevicePeerCommandSchema,
+  DevicePeerEffectKind
+} from "@joko/contracts";
 import {
   createInProcessDevicePeerHarness,
   type DevicePeerAgentOutcome,
@@ -15,6 +21,90 @@ afterEach(() => {
 });
 
 describe("DevicePeerOwner", () => {
+  it("keeps Remote Desktop-only routes out of the existing catalog and exposes the exact Desktop capability catalog", () => {
+    const fixture = setup();
+    const harness = createInProcessDevicePeerHarness({
+      targetDeviceId: fixture.target.deviceId,
+      capabilities: ["remote_desktop"],
+      agent: { handle: async () => ({ outcome: "completed", value: undefined }) }
+    });
+    const lease = fixture.owner.registerRoute(fixture.target, harness.transport);
+
+    expect(fixture.owner.list(fixture.controller)).toEqual([]);
+    expect(fixture.owner.listForCapabilities(
+      fixture.controller,
+      ["remote_desktop"],
+      { kind: "desktop" }
+    )).toEqual([
+      expect.objectContaining({
+        targetDeviceId: fixture.target.deviceId,
+        routeGeneration: lease.routeGeneration,
+        kind: "desktop",
+        capabilities: ["remote_desktop"]
+      })
+    ]);
+    expect(fixture.owner.listForCapabilities(
+      fixture.controller,
+      ["remote_desktop"],
+      { kind: "service" }
+    )).toEqual([]);
+  });
+
+  it("rejects caller-supplied controller identity and injects the authenticated Connection identity", async () => {
+    const fixture = setup();
+    const received: DevicePeerRequestFrame[] = [];
+    const harness = createInProcessDevicePeerHarness({
+      targetDeviceId: fixture.target.deviceId,
+      capabilities: ["remote_desktop"],
+      agent: {
+        handle: async (frame) => {
+          received.push(frame);
+          return { outcome: "completed", value: undefined };
+        }
+      }
+    });
+    fixture.owner.registerRoute(fixture.target, harness.transport);
+    const selected = fixture.owner.listForCapabilities(
+      fixture.controller,
+      ["remote_desktop"],
+      { kind: "desktop" }
+    )[0]!;
+    const authority = fixture.owner.capture(fixture.controller, selected, ["remote_desktop"]);
+    const forged = create(DevicePeerCommandSchema, {
+      capability: DevicePeerCapabilityKind.REMOTE_DESKTOP,
+      effect: DevicePeerEffectKind.READ_ONLY,
+      controllerDeviceId: "forged-controller",
+      action: { case: "getRemoteDesktopCapabilities", value: {} }
+    });
+
+    await expect(fixture.owner.dispatch(authority, {
+      capability: "remote_desktop",
+      effectKind: "read_only",
+      action: "getRemoteDesktopCapabilities",
+      payload: forged
+    })).rejects.toMatchObject({ code: "invalid_identity" });
+    expect(received).toEqual([]);
+
+    const command = create(DevicePeerCommandSchema, {
+      capability: DevicePeerCapabilityKind.REMOTE_DESKTOP,
+      effect: DevicePeerEffectKind.READ_ONLY,
+      action: { case: "getRemoteDesktopCapabilities", value: {} }
+    });
+    await expect(fixture.owner.dispatch(authority, {
+      capability: "remote_desktop",
+      effectKind: "read_only",
+      action: "getRemoteDesktopCapabilities",
+      payload: command
+    })).resolves.toMatchObject({ outcome: "completed" });
+
+    expect(command.controllerDeviceId).toBe("");
+    expect(received).toHaveLength(1);
+    expect(received[0]).toMatchObject({
+      controllerDeviceId: fixture.controller.deviceId,
+      payload: { controllerDeviceId: fixture.controller.deviceId }
+    });
+  });
+
   it("lists only a live, exact, authorized non-self route and fences replacement generations", async () => {
     const fixture = setup();
     const first = createInProcessDevicePeerHarness({

@@ -101,6 +101,16 @@
       ]
     },
     {
+      "from": "dist/native-remote-desktop",
+      "to": "native-remote-desktop",
+      "filter": [
+        "manifest.json",
+        "joko-macos-remote-desktop-capture",
+        "joko-macos-remote-desktop-input",
+        "joko-windows-remote-desktop-input.exe"
+      ]
+    },
+    {
       "from": "dist/native-simulator-hid",
       "to": "native-simulator-hid",
       "filter": [
@@ -165,7 +175,8 @@
     "identity": null,
     "hardenedRuntime": false,
     "extendInfo": {
-      "NSMicrophoneUsageDescription": "Joko uses the microphone only while you choose to dictate into the composer."
+      "NSMicrophoneUsageDescription": "Joko uses the microphone only while you choose to dictate into the composer.",
+      "NSAudioCaptureUsageDescription": "Joko shares computer audio only when you enable audio in Remote Desktop."
     },
     "target": [
       "dmg",

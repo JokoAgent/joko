@@ -77,6 +77,8 @@ export * from "./runtime-governance-settings.js";
 export * from "./remote-host-connect-service.js";
 export * from "./remote-host-registry.js";
 export * from "./remote-host-tool-provider.js";
+export * from "./remote-desktop-connect-service.js";
+export * from "./remote-desktop-coordinator.js";
 export * from "./remote-execution-router.js";
 export * from "./remote-workspace-service.js";
 export * from "./scheduler.js";

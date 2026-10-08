@@ -3,6 +3,40 @@ export interface DesktopTrayMenuLabels {
   readonly quit: string;
 }
 
+export interface DesktopRemoteDesktopTrayLabels {
+  readonly allow: string;
+  readonly viewing: string;
+  readonly controlling: string;
+  readonly disconnect: string;
+}
+
+export function resolveDesktopRemoteDesktopTrayLabels(
+  locale: string
+): DesktopRemoteDesktopTrayLabels {
+  const normalized = locale.trim().toLowerCase();
+  const labels = normalized === "zh" || normalized.startsWith("zh-cn") || normalized.startsWith("zh-hans")
+    ? {
+        allow: "允许远程桌面",
+        viewing: "远程桌面：正在查看",
+        controlling: "远程桌面：正在控制",
+        disconnect: "断开远程桌面"
+      }
+    : {
+        allow: "Allow Remote Desktop",
+        viewing: "Remote Desktop: Viewing",
+        controlling: "Remote Desktop: Controlling",
+        disconnect: "Disconnect Remote Desktop"
+      };
+  return normalized === "en-xa"
+    ? {
+        allow: pseudoLocalizeTrayLabel(labels.allow),
+        viewing: pseudoLocalizeTrayLabel(labels.viewing),
+        controlling: pseudoLocalizeTrayLabel(labels.controlling),
+        disconnect: pseudoLocalizeTrayLabel(labels.disconnect)
+      }
+    : labels;
+}
+
 export function resolveDesktopTrayMenuLabels(
   locale: string,
   managesLocalOrchestrator: boolean

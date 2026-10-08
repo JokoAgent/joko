@@ -206,6 +206,10 @@ import { ContactToolBridgeProvider } from "./contact-tool-provider.js";
 import { PartnerManager, partnerSessionRuntimeFallback } from "./partner-manager.js";
 import { PartnerToolBridgeProvider } from "./partner-tool-provider.js";
 import { DevicePeerOwner } from "./device-peer-owner.js";
+import {
+  RemoteDesktopCoordinator,
+  type RemoteDesktopIceConfigurationProvider
+} from "./remote-desktop-coordinator.js";
 import { RemoteHostRegistry } from "./remote-host-registry.js";
 import { RemoteExecutionRouter } from "./remote-execution-router.js";
 import {
@@ -364,6 +368,8 @@ export interface OrchestratorApplication {
   readonly reviewCoordinator?: ReviewCoordinator;
   /** Authenticated reverse routes for exact controller-to-Device execution. */
   readonly devicePeers?: DevicePeerOwner;
+  /** Ephemeral, peer-fenced Remote Desktop lease and signaling authority. */
+  readonly remoteDesktop?: RemoteDesktopCoordinator;
   /** Capability-neutral location switch shared by every remote runtime owner. */
   readonly remoteExecution?: RemoteExecutionRouter;
   readonly remoteHosts?: RemoteHostRegistry;
@@ -479,6 +485,8 @@ export interface OrchestratorApplicationDependencies {
   /** Optional service-owned SSH catalog port. Requests can never select its path. */
   readonly remoteSshConfig?: SshConfigFilePort;
   readonly defaultSshUser?: string;
+  /** Optional short-lived ICE credential source; production otherwise uses public STUN only. */
+  readonly remoteDesktopIceConfiguration?: RemoteDesktopIceConfigurationProvider;
   /** Optional secure provider composition. Raw credentials never cross this port. */
   readonly codeHostProviders?: readonly CodeHostProvider[];
   /** Test-only transport seam; production uses the host fetch implementation. */
@@ -711,6 +719,13 @@ export async function createOrchestratorApplication(
     connector: dependencies.remoteSshConnector ?? new Ssh2ResolvedAgentAuthConnector()
   });
   const devicePeers = new DevicePeerOwner({ store });
+  const remoteDesktop = new RemoteDesktopCoordinator({
+    owner: devicePeers,
+    onRevoked: (connectionId, listener) => connections.onRevoked(connectionId, listener),
+    ...(dependencies.remoteDesktopIceConfiguration === undefined
+      ? {}
+      : { iceConfiguration: dependencies.remoteDesktopIceConfiguration })
+  });
   const remoteExecution = new RemoteExecutionRouter({ hosts: remoteHosts, peers: devicePeers });
   const remotePiProcesses = new RemotePiProcessFactory({
     remoteExecution,
@@ -2507,6 +2522,7 @@ export async function createOrchestratorApplication(
     await attempt(() => voiceInput.close());
     await attempt(() => sshKeys.close());
     await attempt(() => workspaces.close());
+    await attempt(() => remoteDesktop.close());
     await attempt(() => devicePeers.shutdown());
     await attempt(() => remoteBackendRuntimeSetup.close());
     await attempt(() => remoteHosts.close());
@@ -2553,6 +2569,7 @@ export async function createOrchestratorApplication(
     scheduler,
     reviewCoordinator,
     devicePeers,
+    remoteDesktop,
     remoteExecution,
     remoteHosts,
     remoteBackendRuntimeSetup,
@@ -2707,6 +2724,7 @@ export async function createOrchestratorApplication(
         await attempt(() => voiceInput.close());
         sshKeys.close();
         await attempt(() => workspaces.close());
+        await attempt(() => remoteDesktop.close());
         await attempt(() => devicePeers.shutdown());
         await attempt(() => remoteBackendRuntimeSetup.close());
         await attempt(() => remoteHosts.close());
@@ -2745,6 +2763,7 @@ export async function createOrchestratorApplication(
     await attempt(() => providerAuth.close());
     await attempt(() => mcpRouter.dispose());
     await attempt(() => voiceInput.close());
+    await attempt(() => remoteDesktop.close());
     await attempt(() => devicePeers.shutdown());
     await attempt(() => remoteBackendRuntimeSetup.close());
     await attempt(() => remoteHosts.close());
