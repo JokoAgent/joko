@@ -1,5 +1,5 @@
 import { create } from "@bufbuild/protobuf";
-import { Code } from "@connectrpc/connect";
+import { Code, ConnectError } from "@connectrpc/connect";
 import * as contract from "@joko/contracts";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -62,6 +62,8 @@ describe("Connect Extension Library boundary", () => {
     let entry = extensionEntry();
     const resource = extensionResource();
     let revoked: (() => void) | undefined;
+    let surfaceCurrent = true;
+    const surfaceId = `extension_surface_${"3".repeat(32)}`;
     const fence = vi.fn();
     const services = createConnectServices(stubApplication({
       store: {
@@ -88,6 +90,17 @@ describe("Connect Extension Library boundary", () => {
         get: () => entry
       },
       extensionLibraries: manager,
+      extensionMainViews: {
+        getSurface: async (id: string, connectionId: string) => {
+          if (!surfaceCurrent || id !== surfaceId || connectionId !== CONNECTION_ID) throw new ConnectError("Surface was revoked.", Code.NotFound);
+          return { id: surfaceId, extensionId: EXTENSION_ID, expiresAt: Date.now() + 600_000,
+            authority: { extensionId: EXTENSION_ID, resourceId: resource.id, resourceRevision: resource.versionNumber,
+              discoveredRevision: resource.discoveredRevision, backendId: resource.backendId, backendRevision: 9n,
+              backendGeneration: 3, extensionEntry: entry.library!.extensionEntry, library: { schemaVersion: 1 } } };
+        },
+        closeSurface: async () => { surfaceCurrent = false; return true; },
+        closeConnection: async () => { surfaceCurrent = false; }
+      },
       sessionHost: {}
     }));
 
@@ -105,6 +118,7 @@ describe("Connect Extension Library boundary", () => {
 
     const opened = await invoke<contract.OpenExtensionLibraryResponse>(services.extension.openExtensionLibrary, {
       extensionId: EXTENSION_ID,
+      surfaceId,
       expectedRevision: { value: 7n }
     });
     const sessionId = opened.library?.sessionId;
@@ -193,11 +207,23 @@ describe("Connect Extension Library boundary", () => {
 
     const reopened = await invoke<contract.OpenExtensionLibraryResponse>(services.extension.openExtensionLibrary, {
       extensionId: EXTENSION_ID,
+      surfaceId,
       expectedRevision: { value: 8n }
+    });
+    await expect(invoke(services.extension.openExtensionLibrary, {
+      extensionId: EXTENSION_ID, expectedRevision: { value: 8n }, surfaceId: `extension_surface_${"4".repeat(32)}`
+    })).rejects.toMatchObject({ code: Code.NotFound });
+    await invoke(services.extension.closeExtensionMainView, { surfaceId });
+    await expect(libraryCall(services.extension.callExtensionLibrary, reopened.library!.sessionId, {
+      case: "write", value: { path: "notes/late.txt", content: new TextEncoder().encode("late") }
+    })).rejects.toMatchObject({ code: Code.NotFound });
+    surfaceCurrent = true;
+    const connectionSession = await invoke<contract.OpenExtensionLibraryResponse>(services.extension.openExtensionLibrary, {
+      extensionId: EXTENSION_ID, expectedRevision: { value: 8n }, surfaceId
     });
     revoked?.();
     await vi.waitFor(async () => {
-      await expect(manager.closeSession(reopened.library!.sessionId, CONNECTION_ID)).resolves.toBe(false);
+      await expect(manager.closeSession(connectionSession.library!.sessionId, CONNECTION_ID)).resolves.toBe(false);
     });
   });
 });

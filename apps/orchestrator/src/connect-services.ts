@@ -4360,8 +4360,10 @@ export function createConnectServices(application: OrchestratorApplication, proj
     closeExtensionMainView: async (request, context) => {
       const connection = authenticate(context);
       if (dependencies.extensionMainViews === undefined) return { closed: false };
+      const surfaceId = nonBlankRequest(request.surfaceId, "surface_id");
+      await extensionLibraryEffect(async () => dependencies.extensionLibraries?.closeSurface(surfaceId, connection.id));
       const closed = await extensionMainViewEffect(() => dependencies.extensionMainViews!.closeSurface(
-        nonBlankRequest(request.surfaceId, "surface_id"),
+        surfaceId,
         connection.id
       ));
       return { closed };
@@ -4511,11 +4513,29 @@ export function createConnectServices(application: OrchestratorApplication, proj
       const connection = authenticate(context);
       const manager = requireExtensionLibraryManager(dependencies);
       const authority = requestExtensionLibraryAuthority(dependencies, request.extensionId, request.expectedRevision, "open_extension_library");
+      if (dependencies.extensionMainViews === undefined) throw new ConnectError("Extension main views are unavailable.", Code.Unimplemented);
+      const surfaceId = nonBlankRequest(request.surfaceId, "surface_id");
+      const surfaceFence = async (): Promise<NativeExtensionMainViewSurface> => {
+        extensionLibraryAuthorityFence(dependencies, connection, authority)();
+        const surface = await extensionMainViewEffect(() => dependencies.extensionMainViews!.getSurface(surfaceId, connection.id));
+        const current = surface.authority;
+        if (surface.extensionId !== authority.extensionId || current.resourceId !== authority.resourceId
+          || current.resourceRevision !== authority.resourceRevision || current.discoveredRevision !== authority.discoveredRevision
+          || current.backendId !== authority.backendId || current.backendRevision !== authority.backendRevision
+          || current.backendGeneration !== authority.backendGeneration || current.extensionEntry !== authority.library.extensionEntry
+          || current.library?.schemaVersion !== authority.library.schemaVersion) {
+          throw new ConnectError("Extension Library surface authority changed.", Code.FailedPrecondition);
+        }
+        return surface;
+      };
+      const surface = await surfaceFence();
       ensureExtensionSurfaceRevocation(connection.id);
       const library = await extensionLibraryEffect(() => manager.openSession({
         authority,
         connectionId: connection.id,
-        assertAuthorityCurrent: extensionLibraryAuthorityFence(dependencies, connection, authority)
+        surfaceId,
+        surfaceExpiresAt: surface.expiresAt,
+        assertAuthorityCurrent: async () => { await surfaceFence(); }
       }));
       return { library: mapExtensionLibrarySession(library) };
     },

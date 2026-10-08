@@ -143,6 +143,7 @@ describe("Extension main view", () => {
     }));
     await settle();
     expect(openExtensionLibrary).toHaveBeenCalledTimes(1);
+    expect(openExtensionLibrary).toHaveBeenCalledWith(extension.id, extension.revision, surface.id, expect.any(AbortSignal));
     expect(callExtensionLibrary).not.toHaveBeenCalled();
 
     const statusResponse = postedResponse(postMessage, "status-1");

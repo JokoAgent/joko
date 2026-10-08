@@ -286,6 +286,8 @@ import { mobileOfflineAgeLabel } from "./mobile-offline-cache";
 import { MobileOfflineNotice } from "./MobileOfflineNotice";
 import { MobileAutomationsScreen } from "./MobileAutomationsScreen";
 import { MobilePartnersScreen } from "./MobilePartnersScreen";
+import { MobilePartnerResourcesScreen } from "./MobilePartnerResourcesScreen";
+import { MobileExtensionsScreen } from "./MobileExtensionsScreen";
 import { MobileFilesToolbar } from "./MobileFilesToolbar";
 import { MobileFilesBrowser } from "./MobileFilesBrowser";
 import { mobileFilesThumbnailCache } from "./mobile-files-thumbnail-cache";
@@ -363,7 +365,7 @@ const mobileUpdateActions: MobileUpdateActions = {
   onOpenUpdate: (target) => mobileUpdates.openUpdate(target),
   onRecheckForced: () => mobileUpdates.recheckForced()
 };
-type Page = "home" | "connection" | "new" | "task" | "files" | "automations" | "partners" | "settings" | "connections" | "devices" | "device" | "remote-desktop";
+type Page = "home" | "connection" | "new" | "task" | "files" | "automations" | "extensions" | "partner-resources" | "partners" | "settings" | "connections" | "devices" | "device" | "remote-desktop";
 
 interface MobileRemoteDesktopEntry {
   readonly ownerKey: string;
@@ -883,6 +885,17 @@ export function App() {
                 page === "automations" ? <MobileAutomationsScreen colors={colors} state={state} client={client}
                   locale={locale.effectiveLocale}
                   onBack={() => setPage("home")} onOpenTask={() => setPage("task")} /> :
+                page === "extensions" ? <MobileExtensionsScreen colors={colors}
+                  locale={locale.effectiveLocale} transport={client.extensionCatalogTransport()}
+                  onBack={() => setPage("home")}
+                  onOpenNewTask={() => setPage("new")}
+                  onOpenTask={() => {
+                    setFocusTaskComposer(true);
+                    setPage("task");
+                  }} /> :
+                page === "partner-resources" ? <MobilePartnerResourcesScreen colors={colors}
+                  locale={locale.effectiveLocale} transport={client.partnerResourceTransport()}
+                  onBack={() => setPage("home")} onOpenTask={() => setPage("task")} /> :
                 page === "partners" ? <MobilePartnersScreen colors={colors} locale={locale.effectiveLocale}
                   view={state.partnerPrivate}
                   onBack={() => {
@@ -952,6 +965,8 @@ export function App() {
           }}
           onSearch={() => queueHomeMenuAction(() => setHomeSearchFocusRequest((value) => value + 1))}
           onAutomations={() => queueHomeMenuAction(() => setPage("automations"))}
+          onExtensions={() => queueHomeMenuAction(() => setPage("extensions"))}
+          onPartnerResources={() => queueHomeMenuAction(() => setPage("partner-resources"))}
           onPartners={() => queueHomeMenuAction(() => {
             setPartnerReturnPage("home");
             void client.openPartnerDirectory();
@@ -1336,9 +1351,10 @@ function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu, incomi
 
 type SessionOption = "rename" | "copy-link" | "pin" | "archive" | "delete" | "tags" | `tag:${string}`;
 
-function HomeMenu({ visible, colors, state, locale, onClose, onClosed, onMountedChange, onSearch, onAutomations, onPartners, onSwitch, onSettings, onDevices }: ScreenProps & {
+function HomeMenu({ visible, colors, state, locale, onClose, onClosed, onMountedChange, onSearch, onAutomations, onExtensions, onPartnerResources, onPartners, onSwitch, onSettings, onDevices }: ScreenProps & {
   visible: boolean; onClose: () => void; onClosed: () => void; onMountedChange: (mounted: boolean) => void;
-  onSearch: () => void; onAutomations: () => void; onPartners: () => void; onSwitch: () => void; onSettings: () => void; onDevices: () => void;
+  onSearch: () => void; onAutomations: () => void; onExtensions: () => void; onPartnerResources: () => void; onPartners: () => void;
+  onSwitch: () => void; onSettings: () => void; onDevices: () => void;
 }) {
   const { width } = useWindowDimensions();
   const closeRef = useRef<View>(null);
@@ -1361,6 +1377,10 @@ function HomeMenu({ visible, colors, state, locale, onClose, onClosed, onMounted
           onPress={onSearch} colors={colors} />
         <MenuRow label={mobileMessage(locale, "home.menu.automations")}
           description={mobileMessage(locale, "home.menu.automationsDescription")} onPress={onAutomations} colors={colors} />
+        <MenuRow label={mobileMessage(locale, "extension.title")}
+          description={mobileMessage(locale, "extension.menuDescription")} onPress={onExtensions} colors={colors} />
+        <MenuRow label={mobileMessage(locale, "partnerResource.title")}
+          description={mobileMessage(locale, "partnerResource.menuDescription")} onPress={onPartnerResources} colors={colors} />
         <MenuRow label={mobileMessage(locale, "partner.title")}
           description={mobileMessage(locale, "partner.menuDescription")} onPress={onPartners} colors={colors} />
         <MenuRow label={mobileMessage(locale, "home.menu.switch")} description={mobileMessage(locale, "home.menu.switchDescription")}

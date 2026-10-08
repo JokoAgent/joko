@@ -51,6 +51,27 @@ function currentAuthority(expected = authority) {
 }
 
 describe("ExtensionLibraryManager", () => {
+  it("bounds session expiry to its surface and retires only that surface's streams and database handles", async () => {
+    const { manager } = await fixture();
+    const firstSurface = `extension_surface_${"1".repeat(32)}`, secondSurface = `extension_surface_${"2".repeat(32)}`;
+    const first = await manager.openSession({ authority, connectionId: "web-surface", surfaceId: firstSurface,
+      surfaceExpiresAt: Date.now() + 15_000, assertAuthorityCurrent: currentAuthority() });
+    expect(first.expiresAt).toBeLessThanOrEqual(Date.now() + 15_000);
+    const second = await manager.openSession({ authority, connectionId: "web-surface", surfaceId: secondSurface,
+      surfaceExpiresAt: 8_640_000_000_000_000, assertAuthorityCurrent: currentAuthority() });
+    await manager.write(second.sessionId, "web-surface", { path: "mail", bytes: Buffer.from("mail") });
+    const stream = await manager.writeBegin(first.sessionId, "web-surface", { path: "pending", totalBytes: 4 });
+    const database = await manager.databaseOpen(first.sessionId, "web-surface", { path: "mail.sqlite", create: true });
+    await manager.closeSurface(firstSurface, "foreign-connection");
+    await expect(manager.read(first.sessionId, "web-surface", { path: "mail" })).resolves.toMatchObject({ bytes: Buffer.from("mail") });
+    const closing = manager.closeSurface(firstSurface, "web-surface");
+    await closing;
+    await expect(manager.writeChunk(first.sessionId, "web-surface", { streamId: stream.streamId, sequence: 0, bytes: Buffer.from("late") }))
+      .rejects.toMatchObject({ code: "NOT_FOUND" });
+    await expect(manager.databaseExecute(first.sessionId, "web-surface", database.handleId, "SELECT 1"))
+      .rejects.toMatchObject({ code: "NOT_FOUND" });
+    await expect(manager.read(second.sessionId, "web-surface", { path: "mail" })).resolves.toMatchObject({ bytes: Buffer.from("mail") });
+  });
   it("fences file, stream, and SQLite handles to the exact connection, authority, and binding generation", async () => {
     const { manager } = await fixture();
     await expect(manager.overview({ authority, assertAuthorityCurrent: currentAuthority() })).resolves.toMatchObject({
@@ -58,7 +79,7 @@ describe("ExtensionLibraryManager", () => {
       usage: { files: 0, bytes: 0 }
     });
     let currentRevision = 1n;
-    const opened = await manager.openSession({
+    const opened = await manager.openSession({ surfaceId: `extension_surface_${"0".repeat(32)}`, surfaceExpiresAt: 8_640_000_000_000_000,
       authority,
       connectionId: "web-1",
       assertAuthorityCurrent: () => {
@@ -106,7 +127,7 @@ describe("ExtensionLibraryManager", () => {
 
   it("holds catalog authority changes across commit, retires sessions, and marks uninstall data orphaned", async () => {
     const { manager } = await fixture();
-    const opened = await manager.openSession({
+    const opened = await manager.openSession({ surfaceId: `extension_surface_${"0".repeat(32)}`, surfaceExpiresAt: 8_640_000_000_000_000,
       authority,
       connectionId: "web-authority-change",
       assertAuthorityCurrent: currentAuthority()
@@ -133,7 +154,7 @@ describe("ExtensionLibraryManager", () => {
   it("rolls back an in-flight SQLite mutation when its connection is revoked", async () => {
     const { manager } = await fixture();
     const connectionId = "web-sql-revocation";
-    const opened = await manager.openSession({ authority, connectionId, assertAuthorityCurrent: currentAuthority() });
+    const opened = await manager.openSession({ surfaceId: `extension_surface_${"0".repeat(32)}`, surfaceExpiresAt: 8_640_000_000_000_000, authority, connectionId, assertAuthorityCurrent: currentAuthority() });
     const database = await manager.databaseOpen(opened.sessionId, connectionId, { path: "revoked.sqlite", create: true });
     await manager.databaseExecute(opened.sessionId, connectionId, database.handleId, "CREATE TABLE values_table(value INTEGER)");
     const mutation = manager.databaseExecute(opened.sessionId, connectionId, database.handleId, `
@@ -146,7 +167,7 @@ describe("ExtensionLibraryManager", () => {
 
     await expect(mutation).rejects.toMatchObject({ code: "UNAVAILABLE" });
     await closing;
-    const replacement = await manager.openSession({ authority, connectionId: "web-after-revocation", assertAuthorityCurrent: currentAuthority() });
+    const replacement = await manager.openSession({ surfaceId: `extension_surface_${"0".repeat(32)}`, surfaceExpiresAt: 8_640_000_000_000_000, authority, connectionId: "web-after-revocation", assertAuthorityCurrent: currentAuthority() });
     const readonly = await manager.databaseOpen(replacement.sessionId, "web-after-revocation", {
       path: "revoked.sqlite",
       readonly: true
@@ -157,7 +178,7 @@ describe("ExtensionLibraryManager", () => {
 
   it("relocates with verified copies and 14-day grace, rolls back, detects drift, and explicitly rebinds or unbinds", async () => {
     const { temporaryPath, manager } = await fixture();
-    const opened = await manager.openSession({ authority, connectionId: "web-2", assertAuthorityCurrent: currentAuthority() });
+    const opened = await manager.openSession({ surfaceId: `extension_surface_${"0".repeat(32)}`, surfaceExpiresAt: 8_640_000_000_000_000, authority, connectionId: "web-2", assertAuthorityCurrent: currentAuthority() });
     await manager.write(opened.sessionId, "web-2", { path: "projects/alpha.txt", bytes: Buffer.from("alpha") });
     const database = await manager.databaseOpen(opened.sessionId, "web-2", { path: "projects/state.sqlite", create: true });
     await manager.databaseExecute(opened.sessionId, "web-2", database.handleId, "CREATE TABLE state(value TEXT)");
@@ -173,7 +194,7 @@ describe("ExtensionLibraryManager", () => {
     expect(manager.listGrace(EXTENSION_ID)).toHaveLength(1);
     await expect(manager.read(opened.sessionId, "web-2", { path: "projects/alpha.txt" }))
       .rejects.toMatchObject({ code: "NOT_FOUND" });
-    const customSession = await manager.openSession({ authority, connectionId: "web-2", assertAuthorityCurrent: currentAuthority() });
+    const customSession = await manager.openSession({ surfaceId: `extension_surface_${"0".repeat(32)}`, surfaceExpiresAt: 8_640_000_000_000_000, authority, connectionId: "web-2", assertAuthorityCurrent: currentAuthority() });
     await expect(manager.read(customSession.sessionId, "web-2", { path: "projects/alpha.txt" }))
       .resolves.toMatchObject({ bytes: Buffer.from("alpha") });
 
@@ -199,7 +220,7 @@ describe("ExtensionLibraryManager", () => {
     expect(unbound.detachedPath).toBe(join(recoveredParent, EXTENSION_ID));
     await expect(manager.overview({ authority, assertAuthorityCurrent: currentAuthority() }))
       .resolves.toMatchObject({ state: "ready", usage: { files: 0, bytes: 0 } });
-    const reset = await manager.openSession({ authority, connectionId: "web-2", assertAuthorityCurrent: currentAuthority() });
+    const reset = await manager.openSession({ surfaceId: `extension_surface_${"0".repeat(32)}`, surfaceExpiresAt: 8_640_000_000_000_000, authority, connectionId: "web-2", assertAuthorityCurrent: currentAuthority() });
     expect(reset.bindingGeneration).toBe(7n);
   });
 
@@ -207,14 +228,14 @@ describe("ExtensionLibraryManager", () => {
     const { temporaryPath, manager } = await fixture();
     const ownerRoot = join(temporaryPath, "owner");
     const control = join(ownerRoot, "library-state.json");
-    const first = await manager.openSession({ authority, connectionId: "web-rollback-crash", assertAuthorityCurrent: currentAuthority() });
+    const first = await manager.openSession({ surfaceId: `extension_surface_${"0".repeat(32)}`, surfaceExpiresAt: 8_640_000_000_000_000, authority, connectionId: "web-rollback-crash", assertAuthorityCurrent: currentAuthority() });
     await manager.write(first.sessionId, "web-rollback-crash", { path: "before.txt", bytes: Buffer.from("before") });
     const moved = await manager.relocate({
       authority,
       destination: { kind: "custom", candidate: join(temporaryPath, "rollback-custom") },
       assertAuthorityCurrent: currentAuthority()
     });
-    const currentSession = await manager.openSession({
+    const currentSession = await manager.openSession({ surfaceId: `extension_surface_${"0".repeat(32)}`, surfaceExpiresAt: 8_640_000_000_000_000,
       authority,
       connectionId: "web-rollback-crash",
       assertAuthorityCurrent: currentAuthority()
@@ -263,7 +284,7 @@ describe("ExtensionLibraryManager", () => {
       state: "ready",
       location: { kind: "default", generation: BigInt(current["generation"] as string) + 1n }
     });
-    const restored = await recovered.openSession({
+    const restored = await recovered.openSession({ surfaceId: `extension_surface_${"0".repeat(32)}`, surfaceExpiresAt: 8_640_000_000_000_000,
       authority,
       connectionId: "web-rollback-crash",
       assertAuthorityCurrent: currentAuthority()
@@ -291,7 +312,7 @@ describe("ExtensionLibraryManager", () => {
         return copyExtensionLibrary(input);
       }
     });
-    const session = await manager.openSession({ authority, connectionId: "web-relocating", assertAuthorityCurrent: currentAuthority() });
+    const session = await manager.openSession({ surfaceId: `extension_surface_${"0".repeat(32)}`, surfaceExpiresAt: 8_640_000_000_000_000, authority, connectionId: "web-relocating", assertAuthorityCurrent: currentAuthority() });
     await manager.write(session.sessionId, "web-relocating", { path: "stable.txt", bytes: Buffer.from("stable") });
     const relocation = manager.relocate({
       authority,
@@ -325,7 +346,7 @@ describe("ExtensionLibraryManager", () => {
         throw new Error("verification interrupted");
       }
     });
-    const session = await manager.openSession({ authority, connectionId: "web-relocation-failure", assertAuthorityCurrent: currentAuthority() });
+    const session = await manager.openSession({ surfaceId: `extension_surface_${"0".repeat(32)}`, surfaceExpiresAt: 8_640_000_000_000_000, authority, connectionId: "web-relocation-failure", assertAuthorityCurrent: currentAuthority() });
     await manager.write(session.sessionId, "web-relocation-failure", { path: "kept.txt", bytes: Buffer.from("kept") });
     await expect(manager.relocate({
       authority,
@@ -352,7 +373,7 @@ describe("ExtensionLibraryManager", () => {
         return copyExtensionLibrary(input);
       }
     });
-    const session = await manager.openSession({ authority, connectionId: "web-close", assertAuthorityCurrent: currentAuthority() });
+    const session = await manager.openSession({ surfaceId: `extension_surface_${"0".repeat(32)}`, surfaceExpiresAt: 8_640_000_000_000_000, authority, connectionId: "web-close", assertAuthorityCurrent: currentAuthority() });
     await manager.write(session.sessionId, "web-close", { path: "stable.txt", bytes: Buffer.from("stable") });
     const relocation = manager.relocate({
       authority,
@@ -378,7 +399,7 @@ describe("ExtensionLibraryManager", () => {
       throw Object.assign(new Error("cross volume"), { code: "EXDEV" });
     };
     const { manager } = await fixture({ now: () => now, renameDirectory: crossVolumeRename });
-    const opened = await manager.openSession({ authority, connectionId: "web-3", assertAuthorityCurrent: currentAuthority() });
+    const opened = await manager.openSession({ surfaceId: `extension_surface_${"0".repeat(32)}`, surfaceExpiresAt: 8_640_000_000_000_000, authority, connectionId: "web-3", assertAuthorityCurrent: currentAuthority() });
     await manager.write(opened.sessionId, "web-3", { path: "work/product.txt", bytes: Buffer.from("persistent") });
     await manager.revokeExtension(EXTENSION_ID, authority.name);
     await expect(manager.overview({ authority, assertAuthorityCurrent: currentAuthority() }))
@@ -389,7 +410,7 @@ describe("ExtensionLibraryManager", () => {
     expect(trashed).toMatchObject({ extensionId: EXTENSION_ID, files: 1, bytes: 10, deletedAt: now });
     expect(manager.listTrash(EXTENSION_ID)).toEqual([trashed]);
     await manager.restoreTrash({ trashId: trashed.trashId, confirmation: authority.name });
-    const restored = await manager.openSession({ authority, connectionId: "web-3", assertAuthorityCurrent: currentAuthority() });
+    const restored = await manager.openSession({ surfaceId: `extension_surface_${"0".repeat(32)}`, surfaceExpiresAt: 8_640_000_000_000_000, authority, connectionId: "web-3", assertAuthorityCurrent: currentAuthority() });
     expect(restored.bindingGeneration).toBe(2n);
     await expect(manager.read(restored.sessionId, "web-3", { path: "work/product.txt" }))
       .resolves.toMatchObject({ bytes: Buffer.from("persistent") });
@@ -398,7 +419,7 @@ describe("ExtensionLibraryManager", () => {
     now += 31 * 24 * 60 * 60_000;
     await expect(manager.purgeExpired()).resolves.toMatchObject({ trash: 1 });
     expect(manager.listTrash()).not.toContainEqual(trashedAgain);
-    const recreated = await manager.openSession({ authority, connectionId: "web-3", assertAuthorityCurrent: currentAuthority() });
+    const recreated = await manager.openSession({ surfaceId: `extension_surface_${"0".repeat(32)}`, surfaceExpiresAt: 8_640_000_000_000_000, authority, connectionId: "web-3", assertAuthorityCurrent: currentAuthority() });
     expect(recreated.bindingGeneration).toBe(3n);
   });
 
@@ -406,7 +427,7 @@ describe("ExtensionLibraryManager", () => {
     const { temporaryPath, manager } = await fixture();
     const ownerRoot = join(temporaryPath, "owner");
     const control = join(ownerRoot, "library-state.json");
-    const opened = await manager.openSession({ authority, connectionId: "web-crash", assertAuthorityCurrent: currentAuthority() });
+    const opened = await manager.openSession({ surfaceId: `extension_surface_${"0".repeat(32)}`, surfaceExpiresAt: 8_640_000_000_000_000, authority, connectionId: "web-crash", assertAuthorityCurrent: currentAuthority() });
     await manager.write(opened.sessionId, "web-crash", { path: "kept.txt", bytes: Buffer.from("kept") });
     const trashed = await manager.trashLibrary({ authority, confirmation: authority.name, assertAuthorityCurrent: currentAuthority() });
     await manager.close();
@@ -445,7 +466,7 @@ describe("ExtensionLibraryManager", () => {
     expect(restored.listTrash()).toEqual([]);
     await expect(restored.overview({ authority, assertAuthorityCurrent: currentAuthority() }))
       .resolves.toMatchObject({ state: "ready", location: { kind: "custom", path: targetRoot } });
-    const restoredSession = await restored.openSession({
+    const restoredSession = await restored.openSession({ surfaceId: `extension_surface_${"0".repeat(32)}`, surfaceExpiresAt: 8_640_000_000_000_000,
       authority,
       connectionId: "web-crash",
       assertAuthorityCurrent: currentAuthority()
@@ -479,7 +500,7 @@ describe("ExtensionLibraryManager", () => {
     const { temporaryPath, manager } = await fixture();
     const ownerRoot = join(temporaryPath, "owner");
     const control = join(ownerRoot, "library-state.json");
-    const opened = await manager.openSession({ authority, connectionId: "web-grace-crash", assertAuthorityCurrent: currentAuthority() });
+    const opened = await manager.openSession({ surfaceId: `extension_surface_${"0".repeat(32)}`, surfaceExpiresAt: 8_640_000_000_000_000, authority, connectionId: "web-grace-crash", assertAuthorityCurrent: currentAuthority() });
     await manager.write(opened.sessionId, "web-grace-crash", { path: "active.txt", bytes: Buffer.from("active") });
     const moved = await manager.relocate({
       authority,
@@ -505,14 +526,14 @@ describe("ExtensionLibraryManager", () => {
     expect(recovered.listGrace()).toEqual([]);
     await expect(recovered.overview({ authority, assertAuthorityCurrent: currentAuthority() }))
       .resolves.toMatchObject({ state: "ready", location: { kind: "custom", path: moved.location.path } });
-    const session = await recovered.openSession({ authority, connectionId: "web-grace-crash", assertAuthorityCurrent: currentAuthority() });
+    const session = await recovered.openSession({ surfaceId: `extension_surface_${"0".repeat(32)}`, surfaceExpiresAt: 8_640_000_000_000_000, authority, connectionId: "web-grace-crash", assertAuthorityCurrent: currentAuthority() });
     await expect(recovered.read(session.sessionId, "web-grace-crash", { path: "active.txt" }))
       .resolves.toMatchObject({ bytes: Buffer.from("active") });
   });
 
   it("fails closed on control corruption and explicitly recovers prior state plus untracked default data", async () => {
     const { temporaryPath, manager } = await fixture();
-    const opened = await manager.openSession({ authority, connectionId: "web-4", assertAuthorityCurrent: currentAuthority() });
+    const opened = await manager.openSession({ surfaceId: `extension_surface_${"0".repeat(32)}`, surfaceExpiresAt: 8_640_000_000_000_000, authority, connectionId: "web-4", assertAuthorityCurrent: currentAuthority() });
     await manager.write(opened.sessionId, "web-4", { path: "safe.txt", bytes: Buffer.from("safe") });
     await manager.close();
     const control = join(temporaryPath, "owner", "library-state.json");
@@ -527,7 +548,7 @@ describe("ExtensionLibraryManager", () => {
     await expect(recovered.overview({ authority, assertAuthorityCurrent: currentAuthority() }))
       .resolves.toMatchObject({ state: "unavailable", reason: "state_corrupt" });
     await expect(recovered.repairState()).resolves.toMatchObject({ recoveredFromPrevious: true, bindings: 1 });
-    const session = await recovered.openSession({ authority, connectionId: "web-4", assertAuthorityCurrent: currentAuthority() });
+    const session = await recovered.openSession({ surfaceId: `extension_surface_${"0".repeat(32)}`, surfaceExpiresAt: 8_640_000_000_000_000, authority, connectionId: "web-4", assertAuthorityCurrent: currentAuthority() });
     await expect(recovered.read(session.sessionId, "web-4", { path: "safe.txt" }))
       .resolves.toMatchObject({ bytes: Buffer.from("safe") });
     expect(JSON.parse(await readFile(control, "utf8"))).toMatchObject({ format: 1, bindings: [{ extensionId: EXTENSION_ID }] });

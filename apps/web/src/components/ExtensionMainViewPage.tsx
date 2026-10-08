@@ -164,7 +164,7 @@ export function ExtensionMainViewPage({
         libraryRef.current = undefined;
         await controller.closeExtensionLibrary(existing.session.id).catch(() => undefined);
       }
-      const promise = controller.openExtensionLibrary(state.extension.id, state.extension.revision, abort.signal).then((opened) => {
+      const promise = controller.openExtensionLibrary(state.extension.id, state.extension.revision, state.surface.id, abort.signal).then((opened) => {
         if (!current()) {
           void controller.closeExtensionLibrary(opened.id).catch(() => undefined);
           throw new Error("Extension Library bridge was revoked.");
