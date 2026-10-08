@@ -225,6 +225,9 @@ function fixtureTransport(surface: MobileExtensionMainViewSurface): MobileExtens
     openMainView: vi.fn(async () => surface),
     probeMainView: vi.fn(async () => surface),
     closeMainView: vi.fn(async () => true),
+    loadLibrary: vi.fn(async () => ({ trash: [], grace: [] })),
+    validateLibraryLocation: vi.fn(async () => { throw new Error("unused"); }),
+    mutateLibrary: vi.fn(async (_expected, snapshot) => snapshot),
     reconcile: vi.fn(async () => undefined),
     dismiss: vi.fn(async () => undefined)
   };

@@ -85,6 +85,12 @@ import {
 import { createMobileAutomationDraft } from "./mobile-automation-authoring";
 import { parseMobileNativeIntent } from "./mobile-native-intent";
 import type { MobileExtension, MobileExtensionMainViewSurface } from "./mobile-extensions";
+import type {
+  MobileExtensionLibraryLocationValidation,
+  MobileExtensionLibraryOverview,
+  MobileExtensionLibrarySnapshot,
+  MobileExtensionLibraryTrashEntry
+} from "./mobile-extension-library";
 
 const credential: PairedCredential = {
   profileId: "mobile-profile", origin: "http://192.168.1.20:4318", serverId: "node-1", connectionId: "mobile-connection",
@@ -955,6 +961,19 @@ function fakeNetwork(): MobileNetwork {
     openExtensionMainView: vi.fn(async () => { throw new Error("No Extension main-view fixture was configured."); }),
     getExtensionMainViewSurface: vi.fn(async () => { throw new Error("No Extension main-view fixture was configured."); }),
     closeExtensionMainView: vi.fn(async () => true),
+    getExtensionLibraryOverview: vi.fn(async () => { throw new Error("No Extension Library fixture was configured."); }),
+    validateExtensionLibraryLocation: vi.fn(async () => { throw new Error("No Extension Library fixture was configured."); }),
+    relocateExtensionLibrary: vi.fn(async () => { throw new Error("No Extension Library fixture was configured."); }),
+    rebindExtensionLibrary: vi.fn(async () => { throw new Error("No Extension Library fixture was configured."); }),
+    unbindExtensionLibrary: vi.fn(async () => { throw new Error("No Extension Library fixture was configured."); }),
+    repairExtensionLibraryState: vi.fn(async () => { throw new Error("No Extension Library fixture was configured."); }),
+    repairExtensionLibraryMetadata: vi.fn(async () => { throw new Error("No Extension Library fixture was configured."); }),
+    trashExtensionLibrary: vi.fn(async () => { throw new Error("No Extension Library fixture was configured."); }),
+    listExtensionLibraryTrash: vi.fn(async () => []),
+    restoreExtensionLibraryTrash: vi.fn(async () => { throw new Error("No Extension Library fixture was configured."); }),
+    purgeExtensionLibraryTrash: vi.fn(async () => { throw new Error("No Extension Library fixture was configured."); }),
+    listExtensionLibraryGrace: vi.fn(async () => []),
+    rollbackExtensionLibrary: vi.fn(async () => { throw new Error("No Extension Library fixture was configured."); }),
     uploadExtensionSetupCredential: vi.fn(async () => { throw new Error("No Extension credential fixture was configured."); }),
     listPartnerPrivateThreads: vi.fn(async () => []),
     getPartnerPrivateThread: vi.fn(async () => { throw new Error("No private thread fixture was configured."); }),
@@ -2479,6 +2498,169 @@ describe("mobile Extension catalog authority", () => {
     await expect(app.extensionCatalogTransport()!.probeMainView(surface, new AbortController().signal))
       .rejects.toThrow(/changed|expired/u);
   });
+
+  it("loads active Library state only when ready while retaining exact recovery records", async () => {
+    const network = fakeNetwork();
+    const extension = { ...mobileExtensionFixture(), library: { schemaVersion: 1 as const } };
+    const overview = mobileExtensionLibraryOverview(extension);
+    const trash = mobileExtensionLibraryTrash(extension);
+    network.getExtension = vi.fn(async () => extension);
+    network.getExtensionLibraryOverview = vi.fn(async () => overview);
+    network.listExtensionLibraryTrash = vi.fn(async () => [trash]);
+    network.listExtensionLibraryGrace = vi.fn(async () => []);
+    const app = client(network, memoryStorage(credential).storage);
+    await app.start();
+
+    await expect(app.extensionCatalogTransport()!.loadLibrary(extension, new AbortController().signal))
+      .resolves.toEqual({ overview, trash: [trash], grace: [] });
+    expect(network.getExtensionLibraryOverview).toHaveBeenCalledExactlyOnceWith(
+      credential,
+      extension.extensionId,
+      extension.revision,
+      expect.any(AbortSignal)
+    );
+
+    const disabled = { ...extension, enabled: false };
+    network.getExtension = vi.fn(async () => disabled);
+    await expect(app.extensionCatalogTransport()!.loadLibrary(disabled, new AbortController().signal))
+      .resolves.toEqual({ trash: [trash], grace: [] });
+    expect(network.getExtensionLibraryOverview).toHaveBeenCalledTimes(1);
+  });
+
+  it("revalidates a custom Library destination and complete snapshot before a non-optimistic move", async () => {
+    const network = fakeNetwork();
+    const extension = { ...mobileExtensionFixture(), library: { schemaVersion: 1 as const } };
+    const overview = mobileExtensionLibraryOverview(extension);
+    const snapshot: MobileExtensionLibrarySnapshot = { overview, trash: [], grace: [] };
+    const validation: MobileExtensionLibraryLocationValidation = {
+      libraryRoot: "E:\\Libraries\\mail",
+      warnings: ["cloud_sync_location"],
+      diskFreeBytes: 8_192n
+    };
+    network.getExtension = vi.fn(async () => extension);
+    network.getExtensionLibraryOverview = vi.fn(async () => overview);
+    network.listExtensionLibraryTrash = vi.fn(async () => []);
+    network.listExtensionLibraryGrace = vi.fn(async () => []);
+    network.validateExtensionLibraryLocation = vi.fn(async () => validation);
+    network.relocateExtensionLibrary = vi.fn(async () => undefined);
+    const app = client(network, memoryStorage(credential).storage);
+    await app.start();
+    const transport = app.extensionCatalogTransport()!;
+
+    await expect(transport.validateLibraryLocation(extension, " E:\\Libraries ", new AbortController().signal))
+      .resolves.toBe(validation);
+    await expect(transport.mutateLibrary(extension, snapshot, {
+      kind: "relocate",
+      destination: { kind: "custom", candidate: "E:\\Libraries", validation }
+    }, new AbortController().signal)).resolves.toEqual(snapshot);
+    expect(network.validateExtensionLibraryLocation).toHaveBeenLastCalledWith(
+      credential,
+      extension.extensionId,
+      extension.revision,
+      "E:\\Libraries",
+      expect.any(AbortSignal)
+    );
+    expect(network.relocateExtensionLibrary).toHaveBeenCalledExactlyOnceWith(
+      credential,
+      extension.extensionId,
+      extension.revision,
+      { kind: "custom", candidate: "E:\\Libraries" },
+      expect.any(AbortSignal)
+    );
+
+    await expect(transport.mutateLibrary(extension, snapshot, {
+      kind: "relocate",
+      destination: { kind: "custom", candidate: "E:\\Libraries", validation: { ...validation, warnings: [] } }
+    }, new AbortController().signal)).rejects.toThrow(/validation changed/u);
+    expect(network.relocateExtensionLibrary).toHaveBeenCalledTimes(1);
+
+    network.getExtensionLibraryOverview = vi.fn(async () => ({ ...overview, bytes: 99n }));
+    await expect(transport.mutateLibrary(extension, snapshot, {
+      kind: "relocate",
+      destination: { kind: "default" }
+    }, new AbortController().signal)).rejects.toThrow(/changed/u);
+    expect(network.relocateExtensionLibrary).toHaveBeenCalledTimes(1);
+  });
+
+  it("restores only an exact current trash record and retires a late Library action with its owner", async () => {
+    const network = fakeNetwork();
+    const extension = { ...mobileExtensionFixture(), library: { schemaVersion: 1 as const } };
+    const overview = mobileExtensionLibraryOverview(extension);
+    const trash = mobileExtensionLibraryTrash(extension);
+    let trashRecords: readonly MobileExtensionLibraryTrashEntry[] = [trash];
+    network.getExtension = vi.fn(async () => extension);
+    network.getExtensionLibraryOverview = vi.fn(async () => overview);
+    network.listExtensionLibraryTrash = vi.fn(async () => trashRecords);
+    network.listExtensionLibraryGrace = vi.fn(async () => []);
+    network.restoreExtensionLibraryTrash = vi.fn(async () => { trashRecords = []; });
+    const app = client(network, memoryStorage(credential).storage);
+    await app.start();
+    const transport = app.extensionCatalogTransport()!;
+    const snapshot: MobileExtensionLibrarySnapshot = { overview, trash: [trash], grace: [] };
+
+    await expect(transport.mutateLibrary(extension, snapshot, {
+      kind: "restore",
+      entry: trash,
+      confirmation: trash.name,
+      destination: "original"
+    }, new AbortController().signal)).resolves.toEqual({ overview, trash: [], grace: [] });
+    expect(network.restoreExtensionLibraryTrash).toHaveBeenCalledExactlyOnceWith(
+      credential,
+      extension.extensionId,
+      trash.id,
+      trash.name,
+      "original",
+      expect.any(AbortSignal)
+    );
+
+    trashRecords = [trash];
+    let finish!: () => void;
+    network.relocateExtensionLibrary = vi.fn(() => new Promise<void>((resolve) => { finish = resolve; }));
+    const pending = app.extensionCatalogTransport()!.mutateLibrary(extension, snapshot, {
+      kind: "relocate",
+      destination: { kind: "default" }
+    }, new AbortController().signal);
+    await vi.waitFor(() => expect(network.relocateExtensionLibrary).toHaveBeenCalledOnce());
+    app.setForeground(false);
+    finish();
+    await expect(pending).rejects.toThrow(/owner changed|cancelled|not confirmed/u);
+    expect(network.relocateExtensionLibrary).toHaveBeenCalledTimes(1);
+  });
+
+  it("marks a dispatched Library action unknown when authoritative refresh fails but preserves local precondition errors", async () => {
+    const network = fakeNetwork();
+    const extension = { ...mobileExtensionFixture(), library: { schemaVersion: 1 as const } };
+    const overview = mobileExtensionLibraryOverview(extension);
+    const snapshot: MobileExtensionLibrarySnapshot = { overview, trash: [], grace: [] };
+    network.getExtension = vi.fn(async () => extension);
+    network.getExtensionLibraryOverview = vi.fn()
+      .mockResolvedValueOnce(overview)
+      .mockRejectedValueOnce(new Error("refresh offline"));
+    network.listExtensionLibraryTrash = vi.fn(async () => []);
+    network.listExtensionLibraryGrace = vi.fn(async () => []);
+    network.relocateExtensionLibrary = vi.fn(async () => undefined);
+    const app = client(network, memoryStorage(credential).storage);
+    await app.start();
+    const transport = app.extensionCatalogTransport()!;
+
+    await expect(transport.mutateLibrary(extension, snapshot, {
+      kind: "relocate",
+      destination: { kind: "default" }
+    }, new AbortController().signal)).rejects.toThrow(/could not be confirmed.*not resent.*refresh offline/u);
+    expect(network.relocateExtensionLibrary).toHaveBeenCalledOnce();
+
+    const unavailable = {
+      ...overview,
+      state: "unavailable" as const,
+      unavailableReason: "io" as const
+    };
+    network.getExtensionLibraryOverview = vi.fn(async () => unavailable);
+    await expect(transport.mutateLibrary(extension, { ...snapshot, overview: unavailable }, {
+      kind: "relocate",
+      destination: { kind: "default" }
+    }, new AbortController().signal)).rejects.toThrow(/^Repair or rebind/u);
+    expect(network.relocateExtensionLibrary).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe("mobile Partner private authority", () => {
@@ -2675,6 +2857,35 @@ function mobileExtensionMainViewSurface(extension: MobileExtension): MobileExten
     ...(extension.mainView?.title === undefined ? {} : { title: extension.mainView.title }),
     ...(extension.mainView?.icon === undefined ? {} : { icon: extension.mainView.icon }),
     expiresAt: Date.now() + 60_000
+  };
+}
+
+function mobileExtensionLibraryOverview(extension: MobileExtension): MobileExtensionLibraryOverview {
+  return {
+    extensionId: extension.extensionId,
+    name: extension.name,
+    state: "ready",
+    location: { kind: "default", path: "D:\\Joko\\Libraries\\mail", generation: 1n },
+    files: 2,
+    bytes: 12n,
+    diskFreeBytes: 8_192n,
+    softLimitBytes: 1_024n,
+    softLimitExceeded: false,
+    orphaned: false,
+    trashCount: 1,
+    graceCount: 0
+  };
+}
+
+function mobileExtensionLibraryTrash(extension: MobileExtension): MobileExtensionLibraryTrashEntry {
+  return {
+    id: `library_trash_${"c".repeat(32)}`,
+    extensionId: extension.extensionId,
+    name: extension.name,
+    deletedAt: 1_000,
+    expiresAt: 2_000,
+    files: 2,
+    bytes: 12n
   };
 }
 

@@ -27,6 +27,8 @@ import {
   type MobileExtensionUseDestination
 } from "./mobile-extensions";
 import { mobileExtensionUseReady } from "./mobile-extension-use-handoff";
+import { mobileExtensionLibraryReady, mobileExtensionLibrarySupported } from "./mobile-extension-library";
+import { MobileExtensionLibrary } from "./MobileExtensionLibrary";
 import { MobileExtensionMainView } from "./MobileExtensionMainView";
 import type { MobilePartnersColors } from "./MobilePartnersScreen";
 
@@ -69,6 +71,11 @@ type UseSelection = {
 };
 
 type MainViewSelection = {
+  readonly ownerKey: string;
+  readonly extension: MobileExtension;
+};
+
+type LibrarySelection = {
   readonly ownerKey: string;
   readonly extension: MobileExtension;
 };
@@ -171,9 +178,13 @@ export function MobileExtensionsScreen({
   const [useBusy, setUseBusy] = useState(false);
   const [useError, setUseError] = useState<string | undefined>();
   const [mainView, setMainView] = useState<MainViewSelection | undefined>();
+  const [libraryView, setLibraryView] = useState<LibrarySelection | undefined>();
   const ownerKey = transport?.ownerKey;
 
-  useEffect(() => { setMainView(undefined); }, [ownerKey]);
+  useEffect(() => {
+    setMainView(undefined);
+    setLibraryView(undefined);
+  }, [ownerKey]);
 
   useEffect(() => {
     setSetupValues({});
@@ -231,6 +242,7 @@ export function MobileExtensionsScreen({
 
   const closeDetail = () => {
     setMainView(undefined);
+    setLibraryView(undefined);
     detailAbort.current?.abort();
     detailOccurrence.current = undefined;
     setDetail(emptyDetail);
@@ -252,6 +264,8 @@ export function MobileExtensionsScreen({
     const subscription = BackHandler.addEventListener("hardwareBackPress", () => {
       if (useSelection) {
         if (!useBusy) closeUseSelection();
+      } else if (libraryView?.ownerKey === ownerKey) {
+        setLibraryView(undefined);
       } else if (mainView?.ownerKey === ownerKey) {
         setMainView(undefined);
       } else if (detail.extensionId && !wide) closeDetail();
@@ -259,12 +273,13 @@ export function MobileExtensionsScreen({
       return true;
     });
     return () => subscription.remove();
-  }, [detail.extensionId, mainView, onBack, ownerKey, useBusy, useSelection, wide]);
+  }, [detail.extensionId, libraryView, mainView, onBack, ownerKey, useBusy, useSelection, wide]);
 
   const openDetail = (expected: MobileExtension) => {
     const currentTransport = transportRef.current;
     if (!currentTransport) return;
     setMainView(undefined);
+    setLibraryView(undefined);
     detailAbort.current?.abort();
     const controller = new AbortController();
     const occurrence = Symbol("extension-detail");
@@ -431,6 +446,7 @@ export function MobileExtensionsScreen({
   const visibleDirectory = directory.ownerKey === ownerKey ? directory : emptyDirectory;
   const visibleDetail = detail.ownerKey === ownerKey ? detail : emptyDetail;
   const visibleMainView = mainView?.ownerKey === ownerKey ? mainView : undefined;
+  const visibleLibrary = libraryView?.ownerKey === ownerKey ? libraryView : undefined;
   const extensions = visibleDirectory.catalog?.extensions ?? [];
   const filtered = useMemo(() => filterMobileExtensions(extensions, query), [extensions, query]);
   const selected = visibleDetail.extensionId
@@ -574,8 +590,34 @@ export function MobileExtensionsScreen({
                     onPress={() => {
                       const currentTransport = transportRef.current;
                       if (!currentTransport || !mobileExtensionMainViewReady(extension)) return;
+                      setLibraryView(undefined);
                       setMainView({ ownerKey: currentTransport.ownerKey, extension });
                     }} testID="extensions.mainView.open" />
+                </View>
+              </View>
+            </>}
+
+            {extension.library !== undefined && <>
+              <Text style={[styles.section, { color: colors.muted }]}>{mobileMessage(locale, "extension.library")}</Text>
+              <View style={[styles.card, { backgroundColor: colors.surface, borderColor: colors.border }]}
+                testID="extensions.library.entry">
+                <View style={styles.controlRow}>
+                  <View style={styles.grow}>
+                    <Text style={[styles.label, { color: colors.ink }]}>{mobileMessage(locale, "extension.libraryTitle")}</Text>
+                    <Text style={[styles.caption, { color: colors.muted }]}>{mobileMessage(locale,
+                      mobileExtensionLibraryReady(extension)
+                        ? "extension.libraryReadyBody"
+                        : "extension.libraryNotReadyBody")}</Text>
+                  </View>
+                  <Action label={mobileMessage(locale, "extension.libraryManage")} colors={colors}
+                    disabled={!mobileExtensionLibrarySupported(extension) || selectedBusy
+                      || mutation !== undefined || pending.length > 0}
+                    onPress={() => {
+                      const currentTransport = transportRef.current;
+                      if (!currentTransport || !mobileExtensionLibrarySupported(extension)) return;
+                      setMainView(undefined);
+                      setLibraryView({ ownerKey: currentTransport.ownerKey, extension });
+                    }} testID="extensions.library.open" />
                 </View>
               </View>
             </>}
@@ -824,14 +866,20 @@ export function MobileExtensionsScreen({
 
   return <>
     <View style={[styles.screen, { backgroundColor: colors.background }]}>
-      {wide ? <View style={styles.wide}>{directoryPane}{visibleMainView && transport
-        ? <MobileExtensionMainView colors={colors} extension={visibleMainView.extension} locale={locale}
-          transport={transport} onBack={() => setMainView(undefined)} />
-        : detailPane}</View>
+      {wide ? <View style={styles.wide}>{directoryPane}{visibleLibrary && transport
+        ? <MobileExtensionLibrary colors={colors} extension={visibleLibrary.extension} locale={locale}
+          transport={transport} onBack={() => setLibraryView(undefined)} />
         : visibleMainView && transport
           ? <MobileExtensionMainView colors={colors} extension={visibleMainView.extension} locale={locale}
             transport={transport} onBack={() => setMainView(undefined)} />
-          : visibleDetail.extensionId ? detailPane : directoryPane}
+          : detailPane}</View>
+        : visibleLibrary && transport
+          ? <MobileExtensionLibrary colors={colors} extension={visibleLibrary.extension} locale={locale}
+            transport={transport} onBack={() => setLibraryView(undefined)} />
+          : visibleMainView && transport
+            ? <MobileExtensionMainView colors={colors} extension={visibleMainView.extension} locale={locale}
+              transport={transport} onBack={() => setMainView(undefined)} />
+            : visibleDetail.extensionId ? detailPane : directoryPane}
     </View>
     <Modal visible={visibleUseSelection !== undefined} transparent animationType="fade"
       onRequestClose={() => { if (!useBusy) closeUseSelection(); }}>

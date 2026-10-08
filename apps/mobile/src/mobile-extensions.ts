@@ -7,6 +7,11 @@ import {
   type ExtensionCatalogEntry,
   type ExtensionMainViewSurface
 } from "@joko/contracts";
+import type {
+  MobileExtensionLibraryLocationValidation,
+  MobileExtensionLibraryMutation,
+  MobileExtensionLibrarySnapshot
+} from "./mobile-extension-library";
 
 const EXTENSION_ID = /^extension_[a-f0-9]{32}$/u;
 const SOURCE_ID = /^extension_source_[a-f0-9]{32}$/u;
@@ -195,6 +200,18 @@ export interface MobileExtensionTransport {
   openMainView(expected: MobileExtension, signal: AbortSignal): Promise<MobileExtensionMainViewSurface>;
   probeMainView(expected: MobileExtensionMainViewSurface, signal: AbortSignal): Promise<MobileExtensionMainViewSurface>;
   closeMainView(expected: MobileExtensionMainViewSurface): Promise<boolean>;
+  loadLibrary(expected: MobileExtension, signal: AbortSignal): Promise<MobileExtensionLibrarySnapshot>;
+  validateLibraryLocation(
+    expected: MobileExtension,
+    candidate: string,
+    signal: AbortSignal
+  ): Promise<MobileExtensionLibraryLocationValidation>;
+  mutateLibrary(
+    expected: MobileExtension,
+    snapshot: MobileExtensionLibrarySnapshot,
+    mutation: MobileExtensionLibraryMutation,
+    signal: AbortSignal
+  ): Promise<MobileExtensionLibrarySnapshot>;
   reconcile(operationId: string, signal: AbortSignal): Promise<void>;
   dismiss(operationId: string, signal: AbortSignal): Promise<void>;
 }

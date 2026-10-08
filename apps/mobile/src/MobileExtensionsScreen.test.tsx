@@ -85,6 +85,16 @@ vi.mock("./MobileExtensionMainView", async () => {
   };
 });
 
+vi.mock("./MobileExtensionLibrary", async () => {
+  const React = await import("react");
+  return {
+    MobileExtensionLibrary: ({ extension, onBack }: { readonly extension: MobileExtension; readonly onBack: () => void }) =>
+      React.createElement("section", { "data-testid": "library-view" },
+        React.createElement("span", {}, `Library ${extension.name}`),
+        React.createElement("button", { "aria-label": "Back", onClick: onBack }, "Back"))
+  };
+});
+
 const colors: MobileExtensionsScreenProps["colors"] = {
   background: "#fafafa", surface: "#fff", ink: "#111", muted: "#666",
   border: "#ddd", accent: "#f90", negative: "#b00", brandBackground: "#fff0d0"
@@ -138,6 +148,9 @@ function transport(ownerKey = "owner-a", value = catalog()): MobileExtensionTran
     openMainView: vi.fn(async () => { throw new Error("No main-view fixture was configured."); }),
     probeMainView: vi.fn(async () => { throw new Error("No main-view fixture was configured."); }),
     closeMainView: vi.fn(async () => true),
+    loadLibrary: vi.fn(async () => ({ trash: [], grace: [] })),
+    validateLibraryLocation: vi.fn(async () => { throw new Error("No Library fixture was configured."); }),
+    mutateLibrary: vi.fn(async (_expected, snapshot) => snapshot),
     reconcile: vi.fn(async () => undefined),
     dismiss: vi.fn(async () => undefined)
   };
@@ -255,6 +268,28 @@ describe("MobileExtensionsScreen", () => {
     expect(container.querySelector('[testid="extensions.directory"]')).not.toBeNull();
     await press("View Calendar");
     expect(container.querySelector('[data-testid="main-view"]')).toBeNull();
+    expect(container.textContent).toContain("Plan meetings");
+  });
+
+  it("opens Library management in narrow detail and keeps the directory available in wide mode", async () => {
+    const active = transport();
+    await render(active);
+    await press("View Mail");
+    await press("Manage Library");
+
+    expect(container.querySelector('[data-testid="library-view"]')?.textContent).toContain("Library Mail");
+    act(() => expect(native.back?.()).toBe(true));
+    expect(container.querySelector('[data-testid="library-view"]')).toBeNull();
+    expect(container.textContent).toContain("Review messages that need attention");
+
+    native.width = 900;
+    await render(active);
+    await press("Manage Library");
+    expect(container.querySelector('[data-testid="library-view"]')).not.toBeNull();
+    expect(container.querySelector('[testid="extensions.directory"]')).not.toBeNull();
+
+    await press("View Calendar");
+    expect(container.querySelector('[data-testid="library-view"]')).toBeNull();
     expect(container.textContent).toContain("Plan meetings");
   });
 

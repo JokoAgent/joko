@@ -12,11 +12,27 @@ import {
   ConnectionSchema, ConnectionState, CredentialKind, DeviceKind, DeviceSchema,
   ExtensionCatalogEntrySchema, ExtensionCatalogSource, ExtensionInstallState, ExtensionMainViewIcon,
   ExtensionMainViewSurfaceSchema, ExtensionOwnerSchema, ExtensionResourceOwnerSchema,
+  ExtensionLibraryGraceEntrySchema, ExtensionLibraryLocationKind, ExtensionLibraryLocationSchema,
+  ExtensionLibraryLocationValidationSchema, ExtensionLibraryOverviewSchema, ExtensionLibraryState,
+  ExtensionLibraryTrashEntrySchema, ExtensionLibraryUnavailableReason,
   ExtensionSetupDescriptorSchema, ExtensionSetupState,
   BeginExtensionSetupCredentialUploadRequestSchema, BeginExtensionSetupCredentialUploadResponseSchema,
   OpenExtensionMainViewRequestSchema, OpenExtensionMainViewResponseSchema,
   GetExtensionMainViewSurfaceRequestSchema, GetExtensionMainViewSurfaceResponseSchema,
   CloseExtensionMainViewRequestSchema, CloseExtensionMainViewResponseSchema,
+  GetExtensionLibraryOverviewRequestSchema, GetExtensionLibraryOverviewResponseSchema,
+  ValidateExtensionLibraryLocationRequestSchema, ValidateExtensionLibraryLocationResponseSchema,
+  RelocateExtensionLibraryRequestSchema, RelocateExtensionLibraryResponseSchema,
+  RebindExtensionLibraryRequestSchema, RebindExtensionLibraryResponseSchema,
+  UnbindExtensionLibraryRequestSchema, UnbindExtensionLibraryResponseSchema,
+  RepairExtensionLibraryStateRequestSchema, RepairExtensionLibraryStateResponseSchema,
+  RepairExtensionLibraryMetadataRequestSchema, RepairExtensionLibraryMetadataResponseSchema,
+  TrashExtensionLibraryRequestSchema, TrashExtensionLibraryResponseSchema,
+  ListExtensionLibraryTrashRequestSchema, ListExtensionLibraryTrashResponseSchema,
+  RestoreExtensionLibraryTrashRequestSchema, RestoreExtensionLibraryTrashResponseSchema,
+  PurgeExtensionLibraryTrashRequestSchema, PurgeExtensionLibraryTrashResponseSchema,
+  ListExtensionLibraryGraceRequestSchema, ListExtensionLibraryGraceResponseSchema,
+  RollbackExtensionLibraryRequestSchema, RollbackExtensionLibraryResponseSchema,
   GetExtensionRequestSchema, GetExtensionResponseSchema, ListExtensionsRequestSchema, ListExtensionsResponseSchema,
   RevisionSchema,
   GetServerInfoResponseSchema, GetSnapshotRequestSchema, GetSnapshotResponseSchema, SnapshotSchema,
@@ -344,6 +360,191 @@ describe("mobile Extension network", () => {
       await expect(mobileNetwork.getExtensionMainViewSurface(credential, surfaceId)).resolves.toEqual(opened);
       await expect(mobileNetwork.closeExtensionMainView(credential, surfaceId)).resolves.toBe(true);
       expect(methods).toEqual(["OpenExtensionMainView", "GetExtensionMainViewSurface", "CloseExtensionMainView"]);
+    } finally { fetcher.mockRestore(); }
+  });
+
+  it("uses every generated Extension Library management RPC and rejects mismatched authority", async () => {
+    const credential: PairedCredential = { profileId: "profile", origin: "https://node.example", serverId: "server",
+      connectionId: "connection", deviceId: "phone", displayName: "Phone", authKey: "library-fixture-key" };
+    const extensionId = `extension_${"7".repeat(32)}`;
+    const trashId = `library_trash_${"8".repeat(32)}`;
+    const graceId = `library_grace_${"9".repeat(32)}`;
+    const defaultLocation = create(ExtensionLibraryLocationSchema, {
+      kind: ExtensionLibraryLocationKind.DEFAULT,
+      path: "D:\\Joko\\Libraries\\notes",
+      generation: create(RevisionSchema, { value: 4n })
+    });
+    const customLocation = create(ExtensionLibraryLocationSchema, {
+      kind: ExtensionLibraryLocationKind.CUSTOM,
+      path: "E:\\Libraries\\notes",
+      generation: create(RevisionSchema, { value: 5n })
+    });
+    let overview = create(ExtensionLibraryOverviewSchema, {
+      extensionId,
+      name: "Notes",
+      state: ExtensionLibraryState.READY,
+      unavailableReason: ExtensionLibraryUnavailableReason.UNSPECIFIED,
+      location: defaultLocation,
+      files: 2,
+      bytes: 12n,
+      diskFreeBytes: 8_192n,
+      softLimitBytes: 1_024n,
+      trashCount: 1,
+      graceCount: 1
+    });
+    const validation = create(ExtensionLibraryLocationValidationSchema, {
+      libraryRoot: "E:\\Libraries\\notes",
+      warnings: ["cloud_sync_location"],
+      diskFreeBytes: 4_096n
+    });
+    const trash = create(ExtensionLibraryTrashEntrySchema, {
+      trashId,
+      extensionId,
+      name: "Notes",
+      deletedAt: create(TimestampSchema, { seconds: 10n }),
+      expiresAt: create(TimestampSchema, { seconds: 20n }),
+      files: 2,
+      bytes: 12n
+    });
+    const grace = create(ExtensionLibraryGraceEntrySchema, {
+      graceId,
+      extensionId,
+      name: "Notes",
+      createdAt: create(TimestampSchema, { seconds: 30n }),
+      expiresAt: create(TimestampSchema, { seconds: 40n }),
+      files: 2,
+      bytes: 12n
+    });
+    const methods: string[] = [];
+    const fetcher = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      expect(new Headers(init?.headers).get("authorization")).toBe(`Bearer ${credential.authKey}`);
+      const method = new URL(String(input)).pathname.split("/").at(-1)!;
+      const body = new Uint8Array(init!.body as Uint8Array);
+      const headers = { "content-type": "application/proto" };
+      methods.push(method);
+      if (method === "GetExtensionLibraryOverview") {
+        expect(fromBinary(GetExtensionLibraryOverviewRequestSchema, body)).toMatchObject({
+          extensionId,
+          expectedRevision: { value: 3n }
+        });
+        return new Response(toBinary(GetExtensionLibraryOverviewResponseSchema,
+          create(GetExtensionLibraryOverviewResponseSchema, { library: overview })), { headers });
+      }
+      if (method === "ValidateExtensionLibraryLocation") {
+        expect(fromBinary(ValidateExtensionLibraryLocationRequestSchema, body)).toMatchObject({
+          extensionId,
+          expectedRevision: { value: 3n },
+          candidate: "E:\\Libraries"
+        });
+        return new Response(toBinary(ValidateExtensionLibraryLocationResponseSchema,
+          create(ValidateExtensionLibraryLocationResponseSchema, { validation })), { headers });
+      }
+      if (method === "RelocateExtensionLibrary") {
+        expect(fromBinary(RelocateExtensionLibraryRequestSchema, body)).toMatchObject({
+          extensionId,
+          expectedRevision: { value: 3n },
+          destinationKind: ExtensionLibraryLocationKind.CUSTOM,
+          candidate: "E:\\Libraries"
+        });
+        return new Response(toBinary(RelocateExtensionLibraryResponseSchema,
+          create(RelocateExtensionLibraryResponseSchema, {
+            changed: true,
+            migrationId: `library_migration_${"a".repeat(32)}`,
+            location: customLocation,
+            files: 2,
+            bytes: 12n,
+            warnings: ["cloud_sync_location"],
+            graceId
+          })), { headers });
+      }
+      if (method === "RebindExtensionLibrary") {
+        expect(fromBinary(RebindExtensionLibraryRequestSchema, body)).toMatchObject({
+          extensionId,
+          expectedRevision: { value: 3n },
+          candidate: "E:\\Libraries"
+        });
+        return new Response(toBinary(RebindExtensionLibraryResponseSchema,
+          create(RebindExtensionLibraryResponseSchema, { location: customLocation, warnings: [] })), { headers });
+      }
+      if (method === "UnbindExtensionLibrary") {
+        expect(fromBinary(UnbindExtensionLibraryRequestSchema, body)).toMatchObject({ extensionId });
+        return new Response(toBinary(UnbindExtensionLibraryResponseSchema,
+          create(UnbindExtensionLibraryResponseSchema, { detachedPath: customLocation.path })), { headers });
+      }
+      if (method === "RepairExtensionLibraryState") {
+        expect(fromBinary(RepairExtensionLibraryStateRequestSchema, body)).toBeTruthy();
+        return new Response(toBinary(RepairExtensionLibraryStateResponseSchema,
+          create(RepairExtensionLibraryStateResponseSchema, { recoveredFromPrevious: true, bindings: 1, trash: 1 })),
+        { headers });
+      }
+      if (method === "RepairExtensionLibraryMetadata") {
+        expect(fromBinary(RepairExtensionLibraryMetadataRequestSchema, body)).toMatchObject({ extensionId });
+        return new Response(toBinary(RepairExtensionLibraryMetadataResponseSchema,
+          create(RepairExtensionLibraryMetadataResponseSchema, { library: overview })), { headers });
+      }
+      if (method === "TrashExtensionLibrary") {
+        expect(fromBinary(TrashExtensionLibraryRequestSchema, body)).toMatchObject({ extensionId, confirmation: "Notes" });
+        return new Response(toBinary(TrashExtensionLibraryResponseSchema,
+          create(TrashExtensionLibraryResponseSchema, { trash })), { headers });
+      }
+      if (method === "ListExtensionLibraryTrash") {
+        expect(fromBinary(ListExtensionLibraryTrashRequestSchema, body)).toMatchObject({ extensionId });
+        return new Response(toBinary(ListExtensionLibraryTrashResponseSchema,
+          create(ListExtensionLibraryTrashResponseSchema, { trash: [trash] })), { headers });
+      }
+      if (method === "RestoreExtensionLibraryTrash") {
+        expect(fromBinary(RestoreExtensionLibraryTrashRequestSchema, body)).toMatchObject({
+          trashId,
+          confirmation: "Notes",
+          destinationKind: ExtensionLibraryLocationKind.DEFAULT
+        });
+        return new Response(toBinary(RestoreExtensionLibraryTrashResponseSchema,
+          create(RestoreExtensionLibraryTrashResponseSchema, { extensionId, location: defaultLocation })), { headers });
+      }
+      if (method === "PurgeExtensionLibraryTrash") {
+        expect(fromBinary(PurgeExtensionLibraryTrashRequestSchema, body)).toMatchObject({ trashId, confirmation: "Notes" });
+        return new Response(toBinary(PurgeExtensionLibraryTrashResponseSchema,
+          create(PurgeExtensionLibraryTrashResponseSchema, { purged: true })), { headers });
+      }
+      if (method === "ListExtensionLibraryGrace") {
+        expect(fromBinary(ListExtensionLibraryGraceRequestSchema, body)).toMatchObject({ extensionId });
+        return new Response(toBinary(ListExtensionLibraryGraceResponseSchema,
+          create(ListExtensionLibraryGraceResponseSchema, { grace: [grace] })), { headers });
+      }
+      expect(method).toBe("RollbackExtensionLibrary");
+      expect(fromBinary(RollbackExtensionLibraryRequestSchema, body)).toMatchObject({ extensionId, graceId });
+      return new Response(toBinary(RollbackExtensionLibraryResponseSchema,
+        create(RollbackExtensionLibraryResponseSchema, { location: defaultLocation, graceId })), { headers });
+    });
+    try {
+      await expect(mobileNetwork.getExtensionLibraryOverview(credential, extensionId, 3n)).resolves
+        .toMatchObject({ extensionId, state: "ready", location: { kind: "default" } });
+      await expect(mobileNetwork.validateExtensionLibraryLocation(credential, extensionId, 3n, " E:\\Libraries "))
+        .resolves.toMatchObject({ libraryRoot: validation.libraryRoot, warnings: ["cloud_sync_location"] });
+      await mobileNetwork.relocateExtensionLibrary(credential, extensionId, 3n,
+        { kind: "custom", candidate: "E:\\Libraries" });
+      await mobileNetwork.rebindExtensionLibrary(credential, extensionId, 3n, "E:\\Libraries");
+      await mobileNetwork.unbindExtensionLibrary(credential, extensionId, 3n);
+      await mobileNetwork.repairExtensionLibraryState(credential);
+      await mobileNetwork.repairExtensionLibraryMetadata(credential, extensionId, 3n);
+      await mobileNetwork.trashExtensionLibrary(credential, extensionId, 3n, "Notes");
+      await expect(mobileNetwork.listExtensionLibraryTrash(credential, extensionId)).resolves
+        .toMatchObject([{ id: trashId, extensionId }]);
+      await mobileNetwork.restoreExtensionLibraryTrash(credential, extensionId, trashId, "Notes", "default");
+      await mobileNetwork.purgeExtensionLibraryTrash(credential, extensionId, trashId, "Notes");
+      await expect(mobileNetwork.listExtensionLibraryGrace(credential, extensionId)).resolves
+        .toMatchObject([{ id: graceId, extensionId }]);
+      await mobileNetwork.rollbackExtensionLibrary(credential, extensionId, 3n, graceId);
+      expect(methods).toEqual([
+        "GetExtensionLibraryOverview", "ValidateExtensionLibraryLocation", "RelocateExtensionLibrary",
+        "RebindExtensionLibrary", "UnbindExtensionLibrary", "RepairExtensionLibraryState",
+        "RepairExtensionLibraryMetadata", "TrashExtensionLibrary", "ListExtensionLibraryTrash",
+        "RestoreExtensionLibraryTrash", "PurgeExtensionLibraryTrash", "ListExtensionLibraryGrace",
+        "RollbackExtensionLibrary"
+      ]);
+
+      overview = { ...overview, extensionId: `extension_${"f".repeat(32)}` };
+      await expect(mobileNetwork.getExtensionLibraryOverview(credential, extensionId, 3n)).rejects.toThrow(/invalid/u);
     } finally { fetcher.mockRestore(); }
   });
 });

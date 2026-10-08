@@ -95,6 +95,18 @@ import {
   type MobileExtensionUseResult
 } from "./mobile-extensions";
 import {
+  mobileExtensionLibraryReady,
+  mobileExtensionLibrarySupported,
+  normalizeMobileExtensionLibraryCandidate,
+  sameMobileExtensionLibraryGraceEntry,
+  sameMobileExtensionLibrarySnapshot,
+  sameMobileExtensionLibraryTrashEntry,
+  sameMobileExtensionLibraryValidation,
+  type MobileExtensionLibraryLocationValidation,
+  type MobileExtensionLibraryMutation,
+  type MobileExtensionLibrarySnapshot
+} from "./mobile-extension-library";
+import {
   applyMobileExtensionUseCommand,
   assertMobileExtensionTaskChoice,
   mobileExtensionNewTaskTarget,
@@ -1398,6 +1410,269 @@ export class MobileClient {
       }
       return surface;
     });
+    const readLibrarySnapshot = async (
+      expected: MobileExtension,
+      signal: AbortSignal
+    ): Promise<{ readonly extension: MobileExtension; readonly snapshot: MobileExtensionLibrarySnapshot }> => {
+      const extension = await readExactDetail(expected, signal);
+      if (!mobileExtensionLibrarySupported(extension)) {
+        throw new Error("This Extension does not own a current Resource Library.");
+      }
+      const overview = mobileExtensionLibraryReady(extension)
+        ? this.network.getExtensionLibraryOverview(
+          context.credential,
+          extension.extensionId,
+          extension.revision,
+          signal
+        )
+        : Promise.resolve(undefined);
+      const [currentOverview, trash, grace] = await Promise.all([
+        overview,
+        this.network.listExtensionLibraryTrash(context.credential, extension.extensionId, signal),
+        this.network.listExtensionLibraryGrace(context.credential, extension.extensionId, signal)
+      ]);
+      requireCurrent(signal);
+      return {
+        extension,
+        snapshot: {
+          ...(currentOverview === undefined ? {} : { overview: currentOverview }),
+          trash,
+          grace
+        }
+      };
+    };
+    const loadLibrary = (
+      expected: MobileExtension,
+      signal: AbortSignal
+    ): Promise<MobileExtensionLibrarySnapshot> => owned(signal, async (current) =>
+      (await readLibrarySnapshot(expected, current)).snapshot);
+    const validateLibraryLocation = (
+      expected: MobileExtension,
+      candidate: string,
+      signal: AbortSignal
+    ): Promise<MobileExtensionLibraryLocationValidation> => owned(signal, async (current) => {
+      const extension = await readExactDetail(expected, current);
+      if (!mobileExtensionLibraryReady(extension)) {
+        throw new Error("Enable and finish setting up this Extension before changing its Library location.");
+      }
+      if (pendingForExtension(extension.extensionId)) {
+        throw new Error("A previous change to this Extension still has an unresolved result. Check its operation receipt first.");
+      }
+      const exactCandidate = normalizeMobileExtensionLibraryCandidate(candidate);
+      const validation = await this.network.validateExtensionLibraryLocation(
+        context.credential,
+        extension.extensionId,
+        extension.revision,
+        exactCandidate,
+        current
+      );
+      requireCurrent(current);
+      return validation;
+    });
+    const mutateLibrary = (
+      expected: MobileExtension,
+      snapshot: MobileExtensionLibrarySnapshot,
+      mutation: MobileExtensionLibraryMutation,
+      signal: AbortSignal
+    ): Promise<MobileExtensionLibrarySnapshot> => owned(signal, async (current) => {
+      const fresh = await readLibrarySnapshot(expected, current);
+      const extension = fresh.extension;
+      if (!sameMobileExtensionLibrarySnapshot(snapshot, fresh.snapshot)) {
+        throw new Error("The Extension Library changed; refresh it before performing this action.");
+      }
+      if (pendingForExtension(extension.extensionId)) {
+        throw new Error("A previous change to this Extension still has an unresolved result. Check its operation receipt first.");
+      }
+      const overview = fresh.snapshot.overview;
+      const requireReadyOverview = (): NonNullable<MobileExtensionLibrarySnapshot["overview"]> => {
+        if (!mobileExtensionLibraryReady(extension) || overview === undefined) {
+          throw new Error("Enable and finish setting up this Extension before changing its Library.");
+        }
+        return overview;
+      };
+      let customValidation: MobileExtensionLibraryLocationValidation | undefined;
+      if (mutation.kind === "relocate" && mutation.destination.kind === "custom") {
+        requireReadyOverview();
+        const candidate = normalizeMobileExtensionLibraryCandidate(mutation.destination.candidate);
+        customValidation = await this.network.validateExtensionLibraryLocation(
+          context.credential,
+          extension.extensionId,
+          extension.revision,
+          candidate,
+          current
+        );
+        requireCurrent(current);
+        if (!sameMobileExtensionLibraryValidation(mutation.destination.validation, customValidation)) {
+          throw new Error("The Extension Library location validation changed; validate the path again.");
+        }
+      } else if (mutation.kind === "rebind") {
+        const currentOverview = requireReadyOverview();
+        if (currentOverview.state !== "unavailable"
+          || currentOverview.unavailableReason !== "diskMissing"
+            && currentOverview.unavailableReason !== "bindingMoved") {
+          throw new Error("This Extension Library can no longer be rebound from its current state.");
+        }
+        const candidate = normalizeMobileExtensionLibraryCandidate(mutation.candidate);
+        customValidation = await this.network.validateExtensionLibraryLocation(
+          context.credential,
+          extension.extensionId,
+          extension.revision,
+          candidate,
+          current
+        );
+        requireCurrent(current);
+        if (!sameMobileExtensionLibraryValidation(mutation.validation, customValidation)) {
+          throw new Error("The Extension Library location validation changed; validate the path again.");
+        }
+      }
+
+      const action = this.#claimMutation();
+      let dispatched = false;
+      try {
+        try {
+          switch (mutation.kind) {
+            case "relocate": {
+              const currentOverview = requireReadyOverview();
+              if (currentOverview.state === "unavailable") {
+                throw new Error("Repair or rebind this unavailable Extension Library before moving it.");
+              }
+              dispatched = true;
+              await this.network.relocateExtensionLibrary(
+                context.credential,
+                extension.extensionId,
+                extension.revision,
+                mutation.destination.kind === "default"
+                  ? { kind: "default" }
+                  : {
+                      kind: "custom",
+                      candidate: normalizeMobileExtensionLibraryCandidate(mutation.destination.candidate)
+                    },
+                current
+              );
+              break;
+            }
+            case "rebind":
+              dispatched = true;
+              await this.network.rebindExtensionLibrary(
+                context.credential,
+                extension.extensionId,
+                extension.revision,
+                normalizeMobileExtensionLibraryCandidate(mutation.candidate),
+                current
+              );
+              break;
+            case "unbind": {
+              const currentOverview = requireReadyOverview();
+              if (currentOverview.location === undefined) throw new Error("This Extension Library is already unbound.");
+              dispatched = true;
+              await this.network.unbindExtensionLibrary(
+                context.credential,
+                extension.extensionId,
+                extension.revision,
+                current
+              );
+              break;
+            }
+            case "repairState": {
+              const currentOverview = requireReadyOverview();
+              if (currentOverview.state !== "unavailable" || currentOverview.unavailableReason !== "stateCorrupt") {
+                throw new Error("The Extension Library state no longer requires repair.");
+              }
+              dispatched = true;
+              await this.network.repairExtensionLibraryState(context.credential, current);
+              break;
+            }
+            case "repairMetadata": {
+              const currentOverview = requireReadyOverview();
+              if (currentOverview.state !== "unavailable" || currentOverview.unavailableReason !== "metadataCorrupt") {
+                throw new Error("The Extension Library metadata no longer requires repair.");
+              }
+              dispatched = true;
+              await this.network.repairExtensionLibraryMetadata(
+                context.credential,
+                extension.extensionId,
+                extension.revision,
+                current
+              );
+              break;
+            }
+            case "trash": {
+              const currentOverview = requireReadyOverview();
+              if (currentOverview.state === "unavailable" || currentOverview.location === undefined
+                || mutation.confirmation !== extension.name) {
+                throw new Error("Enter the exact current Extension name before moving its Library to trash.");
+              }
+              dispatched = true;
+              await this.network.trashExtensionLibrary(
+                context.credential,
+                extension.extensionId,
+                extension.revision,
+                mutation.confirmation,
+                current
+              );
+              break;
+            }
+            case "restore": {
+              const entries = fresh.snapshot.trash.filter((entry) => entry.id === mutation.entry.id);
+              if (entries.length !== 1 || !sameMobileExtensionLibraryTrashEntry(entries[0]!, mutation.entry)
+                || mutation.confirmation !== mutation.entry.name) {
+                throw new Error("The Extension Library trash record changed; refresh before restoring it.");
+              }
+              dispatched = true;
+              await this.network.restoreExtensionLibraryTrash(
+                context.credential,
+                extension.extensionId,
+                mutation.entry.id,
+                mutation.confirmation,
+                mutation.destination,
+                current
+              );
+              break;
+            }
+            case "purge": {
+              const entries = fresh.snapshot.trash.filter((entry) => entry.id === mutation.entry.id);
+              if (entries.length !== 1 || !sameMobileExtensionLibraryTrashEntry(entries[0]!, mutation.entry)
+                || mutation.confirmation !== mutation.entry.name) {
+                throw new Error("The Extension Library trash record changed; refresh before purging it.");
+              }
+              dispatched = true;
+              await this.network.purgeExtensionLibraryTrash(
+                context.credential,
+                extension.extensionId,
+                mutation.entry.id,
+                mutation.confirmation,
+                current
+              );
+              break;
+            }
+            case "rollback": {
+              requireReadyOverview();
+              const entries = fresh.snapshot.grace.filter((entry) => entry.id === mutation.entry.id);
+              if (entries.length !== 1 || !sameMobileExtensionLibraryGraceEntry(entries[0]!, mutation.entry)) {
+                throw new Error("The Extension Library grace record changed; refresh before rolling it back.");
+              }
+              dispatched = true;
+              await this.network.rollbackExtensionLibrary(
+                context.credential,
+                extension.extensionId,
+                extension.revision,
+                mutation.entry.id,
+                current
+              );
+              break;
+            }
+          }
+          requireCurrent(current);
+          return (await readLibrarySnapshot(expected, current)).snapshot;
+        } catch (cause) {
+          if (!dispatched) throw cause;
+          const detail = cause instanceof Error && cause.message.trim().length > 0 ? ` ${cause.message}` : "";
+          throw new Error(`The Extension Library action could not be confirmed. Refresh before trying another action; it was not resent.${detail}`);
+        }
+      } finally {
+        this.#releaseMutation(action);
+      }
+    });
     const exactPending = (operationId: string) => {
       const matches = this.#state.pending.filter((receipt) => receipt.operationId === operationId
         && receipt.connectionId === context.credential.connectionId
@@ -1431,6 +1706,9 @@ export class MobileClient {
         context.credential,
         expected.surfaceId
       ),
+      loadLibrary,
+      validateLibraryLocation,
+      mutateLibrary,
       reconcile: (operationId, signal) => owned(signal, async (current) => {
         exactPending(operationId);
         await this.reconcile();
