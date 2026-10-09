@@ -2710,6 +2710,74 @@ describe("mobile Extension catalog authority", () => {
 });
 
 describe("mobile Partner private authority", () => {
+  const initializationFailed: typeof profilePartner = { ...profilePartner, initializationState: "error",
+    invitationStage: "failed", initializationErrorCode: "sessionUnavailable", canonicalSessionId: undefined };
+  const initializationCatalog = (partner: typeof profilePartner) => ({ directory: { revision: 4n,
+    activeCount: partner.lifecycle === "active" ? 1 : 0, archivedCount: partner.lifecycle === "archived" ? 1 : 0,
+    errorCount: partner.initializationState === "error" ? 1 : 0, updatedAt: 2_000 }, partners: [partner] });
+
+  it("recovers the same failed Partner and observes its new task before canonical navigation without marking it read", async () => {
+    const network = fakeNetwork(); let current = initializationFailed;
+    const emptyOwner = create(SnapshotSchema, { ...runtimeControlProjection(), sessions: [] });
+    network.readOwner = vi.fn(async () => ({ connection, device,
+      snapshot: current.initializationState === "ready" ? runtimeControlProjection() : emptyOwner }));
+    network.readSession = vi.fn(async () => runtimeControlProjection(runtimeSession, true));
+    network.listPartnerCatalog = vi.fn(async () => initializationCatalog(current));
+    network.retryPartnerInitialization = vi.fn(async (_credential, partnerId, expectedRevision) => {
+      expect(partnerId).toBe(current.partnerId); expect(expectedRevision).toBe(current.revision);
+      current = { ...profilePartner, revision: 5n }; return current;
+    });
+    network.listPartnerSessions = vi.fn(async () => create(ListPartnerSessionsResponseSchema, { sessions: [{
+      partnerId: current.partnerId, sessionId: "session", role: PartnerSessionRole.CANONICAL,
+      profileVersion: 1n, available: true, displayName: "Ada task", createdAt: { seconds: 1n }
+    }] }));
+    network.markPartnerRead = vi.fn();
+    const app = client(network, memoryStorage(credential).storage); await app.start();
+    const active = app.partnerInitializationTransport()!;
+    expect(await active.load(current.partnerId, new AbortController().signal)).toEqual(initializationFailed);
+    expect(app.state.owner?.sessions).toHaveLength(0);
+    const confirmed = await active.retry(current, new AbortController().signal);
+    expect(network.retryPartnerInitialization).toHaveBeenCalledWith(credential, "partner-a", 2n, expect.any(AbortSignal));
+    expect(confirmed.profileVersion).toBe(initializationFailed.profileVersion);
+    await expect(active.open(confirmed, new AbortController().signal)).resolves.toMatchObject({ sessionId: "session" });
+    expect(app.state.selectedId).toBe("session"); expect(app.state.owner?.sessions).toHaveLength(1);
+    expect(network.markPartnerRead).not.toHaveBeenCalled(); expect(app.state.pending).toHaveLength(0);
+  });
+
+  it("rejects changed initialization snapshots before dispatch and treats mismatched or lost retry results as unconfirmed", async () => {
+    const network = fakeNetwork(); let current = { ...initializationFailed, revision: 3n };
+    network.listPartnerCatalog = vi.fn(async () => initializationCatalog(current));
+    network.retryPartnerInitialization = vi.fn(async () => ({ ...profilePartner, revision: 4n, homeTargetId: "wrong" }));
+    const app = client(network, memoryStorage(credential).storage); await app.start();
+    const active = app.partnerInitializationTransport()!;
+    await expect(active.retry(initializationFailed, new AbortController().signal)).rejects.toThrow(/changed/u);
+    expect(network.retryPartnerInitialization).not.toHaveBeenCalled();
+    await expect(active.retry(current, new AbortController().signal)).rejects.toThrow(/may have been applied/u);
+    expect(network.retryPartnerInitialization).toHaveBeenCalledOnce();
+    vi.mocked(network.retryPartnerInitialization).mockRejectedValueOnce(new Error("response lost"));
+    await expect(active.retry(current, new AbortController().signal)).rejects.toThrow(/may have been applied/u);
+    expect(network.retryPartnerInitialization).toHaveBeenCalledTimes(2); expect(app.state.busy).toBe(false);
+    current = { ...current, lifecycle: "archived" };
+    await expect(active.load(current.partnerId, new AbortController().signal)).rejects.toThrow(/no longer available/u);
+    expect(network.retryPartnerInitialization).toHaveBeenCalledTimes(2);
+  });
+
+  it("serializes initialization retries and refuses a late acknowledgement after foreground retirement", async () => {
+    const network = fakeNetwork();
+    network.listPartnerCatalog = vi.fn(async () => initializationCatalog(initializationFailed));
+    let finish!: (partner: typeof profilePartner) => void;
+    network.retryPartnerInitialization = vi.fn(() => new Promise<typeof profilePartner>((resolve) => { finish = resolve; }));
+    const app = client(network, memoryStorage(credential).storage); await app.start();
+    const active = app.partnerInitializationTransport()!;
+    const first = active.retry(initializationFailed, new AbortController().signal);
+    await vi.waitFor(() => expect(network.retryPartnerInitialization).toHaveBeenCalledOnce());
+    await expect(active.retry(initializationFailed, new AbortController().signal)).rejects.toThrow(/in progress/u);
+    app.setForeground(false); finish({ ...profilePartner, revision: 4n });
+    await expect(first).rejects.toThrow(/may have been applied/u);
+    await expect(active.load("partner-a", new AbortController().signal)).rejects.toThrow(/owner changed/u);
+    expect(network.retryPartnerInitialization).toHaveBeenCalledOnce(); expect(network.listPartnerSessions).not.toHaveBeenCalled();
+  });
+
   it("saves canonical profile settings with fresh CAS, confirms them and does not replay unknown updates", async () => {
     const network = fakeNetwork();
     let currentPartner = profilePartner; let directoryRevision = 4n;

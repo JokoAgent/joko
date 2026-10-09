@@ -902,6 +902,7 @@ export function App() {
                   }} /> :
                 page === "partner-directory" ? <MobilePartnerDirectoryScreen colors={colors}
                   locale={locale.effectiveLocale} transport={client.partnerDirectoryTransport()}
+                  initializationTransport={client.partnerInitializationTransport()}
                   onBack={() => setPage("home")} onOpenTask={() => setPage("task")} /> :
                 page === "partner-resources" ? <MobilePartnerResourcesScreen colors={colors}
                   locale={locale.effectiveLocale} transport={client.partnerResourceTransport()}

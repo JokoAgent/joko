@@ -11,6 +11,7 @@ import {
   CompletePairingRequestSchema, CompletePairingResponseSchema,
   ListPartnersRequestSchema, ListPartnersResponseSchema, MarkPartnerReadRequestSchema, MarkPartnerReadResponseSchema,
   GetPartnerDirectoryResponseSchema, UpdatePartnerRequestSchema, UpdatePartnerResponseSchema,
+  RetryPartnerInitializationRequestSchema, RetryPartnerInitializationResponseSchema,
   PermissionMode, type UpdatePartnerRequest,
   ConnectionSchema, ConnectionState, CredentialKind, DeviceKind, DeviceSchema,
   ExtensionCatalogEntrySchema, ExtensionCatalogSource, ExtensionInstallState, ExtensionMainViewIcon,
@@ -114,6 +115,30 @@ import { mobilePartnerProfileDraft } from "./mobile-partner-profile";
 import { profilePartner, profilePartnerWire } from "./test/mobile-partner-profile";
 
 describe("mobile Partner catalog network", () => {
+  it("uses the generated initialization CAS and rejects missing, mismatched or non-advancing results", async () => {
+    const credential: PairedCredential = { profileId: "profile", origin: "https://node.example", serverId: "server",
+      connectionId: "connection", deviceId: "phone", displayName: "Joko node", authKey: "partner-fixture-key" };
+    let returned = profilePartnerWire({ ...profilePartner, revision: 3n });
+    const fetcher = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      expect(new URL(String(input)).pathname).toBe("/joko.v1.PartnerService/RetryPartnerInitialization");
+      const request = fromBinary(RetryPartnerInitializationRequestSchema, new Uint8Array(init?.body as Uint8Array));
+      expect(request).toMatchObject({ partnerId: "partner-a", expectedRevision: { value: 2n } });
+      return new Response(toBinary(RetryPartnerInitializationResponseSchema, create(RetryPartnerInitializationResponseSchema, {
+        partner: returned, directory: { revision: { value: 5n }, avatarPresets: ["orbit"] }
+      })), { headers: { "content-type": "application/proto" } });
+    });
+    try {
+      await expect(mobileNetwork.retryPartnerInitialization!(credential, "partner-a", 2n))
+        .resolves.toMatchObject({ partnerId: "partner-a", revision: 3n, canonicalSessionId: "session" });
+      returned = profilePartnerWire({ ...profilePartner, revision: 2n });
+      await expect(mobileNetwork.retryPartnerInitialization!(credential, "partner-a", 2n)).rejects.toThrow(/mismatched/u);
+      returned = profilePartnerWire({ ...profilePartner, partnerId: "another", revision: 3n });
+      await expect(mobileNetwork.retryPartnerInitialization!(credential, "partner-a", 2n)).rejects.toThrow(/mismatched/u);
+      const calls = fetcher.mock.calls.length;
+      await expect(mobileNetwork.retryPartnerInitialization!(credential, "partner-a", 0n)).rejects.toThrow(/current Partner/u);
+      expect(fetcher).toHaveBeenCalledTimes(calls);
+    } finally { fetcher.mockRestore(); }
+  });
   it("uses generated profile options and CAS patches without dual-writing inherited capabilities", async () => {
     const credential: PairedCredential = { profileId: "profile", origin: "https://node.example", serverId: "server",
       connectionId: "connection", deviceId: "phone", displayName: "Joko node", authKey: "partner-fixture-key" };

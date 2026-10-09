@@ -70,6 +70,7 @@ import {
 } from "./mobile-partner-directory";
 import { projectMobilePartnerProfileOptions, projectMobilePartnerProfileUpdate,
   type MobilePartnerProfileDraft, type MobilePartnerProfileOptions } from "./mobile-partner-profile";
+import { projectMobilePartnerInitializationRetry } from "./mobile-partner-initialization";
 import type { MobilePartnerDirectoryProfile } from "./mobile-partner-directory";
 import {
   collectMobileExtensionCatalog,
@@ -204,6 +205,8 @@ export interface MobileNetwork {
   getPartnerProfileOptions?(credential: PairedCredential, signal?: AbortSignal): Promise<MobilePartnerProfileOptions>;
   updatePartnerProfile?(credential: PairedCredential, partnerId: string, expectedRevision: bigint,
     draft: MobilePartnerProfileDraft, signal?: AbortSignal): Promise<MobilePartnerDirectoryProfile>;
+  retryPartnerInitialization?(credential: PairedCredential, partnerId: string, expectedRevision: bigint,
+    signal?: AbortSignal): Promise<MobilePartnerDirectoryProfile>;
   markPartnerRead?(credential: PairedCredential, partnerId: string, throughCursor: bigint,
     signal?: AbortSignal): Promise<MobilePartnerActivity>;
   listPartnerSessions(credential: PairedCredential, partnerId: string, signal?: AbortSignal): Promise<ListPartnerSessionsResponse>;
@@ -1590,6 +1593,12 @@ export const mobileNetwork: MobileNetwork = {
     if (!validMobilePartnerId(partnerId)) throw new Error("A valid Partner is required.");
     return createClient(PartnerService, transport(credential.origin, credential.authKey))
       .listPartnerSessions({ partnerId }, options(signal));
+  },
+  async retryPartnerInitialization(credential, partnerId, expectedRevision, signal) {
+    if (!validMobilePartnerId(partnerId) || expectedRevision < 1n) throw new Error("Select a current Partner initialization.");
+    const response = await createClient(PartnerService, transport(credential.origin, credential.authKey))
+      .retryPartnerInitialization({ partnerId, expectedRevision: { value: expectedRevision } }, options(signal));
+    return projectMobilePartnerInitializationRetry(partnerId, expectedRevision, response);
   },
   async listExtensions(credential, signal) {
     const client = createClient(ExtensionService, transport(credential.origin, credential.authKey));

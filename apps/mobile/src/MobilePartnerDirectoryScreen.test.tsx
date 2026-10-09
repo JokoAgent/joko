@@ -11,6 +11,7 @@ import type {
   MobilePartnerDirectoryProfile,
   MobilePartnerDirectoryTransport
 } from "./mobile-partner-directory";
+import type { MobilePartnerInitializationTransport } from "./mobile-partner-initialization";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -130,7 +131,7 @@ let root: Root;
 const onBack = vi.fn();
 const onOpenTask = vi.fn();
 
-async function render(active?: MobilePartnerDirectoryTransport) {
+async function render(active?: MobilePartnerDirectoryTransport, initializationTransport?: MobilePartnerInitializationTransport) {
   if (!root) {
     container = document.createElement("div");
     document.body.append(container);
@@ -138,7 +139,7 @@ async function render(active?: MobilePartnerDirectoryTransport) {
   }
   await act(async () => {
     root.render(createElement(MobilePartnerDirectoryScreen, {
-      colors, locale: "en", transport: active, onBack, onOpenTask
+      colors, locale: "en", transport: active, initializationTransport, onBack, onOpenTask
     }));
   });
 }
@@ -160,6 +161,19 @@ afterEach(() => {
 });
 
 describe("MobilePartnerDirectoryScreen", () => {
+  it("opens pending setup through the matching node owner and returns to the roster on Android back", async () => {
+    const active = transport();
+    const initialization: MobilePartnerInitializationTransport = { ownerKey: active.ownerKey,
+      load: vi.fn(async () => pending), retry: vi.fn(async () => ada), open: vi.fn(async () => ({ sessionId: "session-ada" })) };
+    await render(active, initialization); await press("View Pending's setup");
+    expect(initialization.load).toHaveBeenCalledWith("pending", expect.any(AbortSignal));
+    expect(container.textContent).toContain("Getting Pending ready"); expect(active.open).not.toHaveBeenCalled();
+    await act(async () => { expect(native.back?.()).toBe(true); });
+    expect(container.querySelector('[data-testid="partnerDirectory.item.ada"]')).toBeTruthy();
+    expect(onBack).not.toHaveBeenCalled(); expect(onOpenTask).not.toHaveBeenCalled();
+    await render(active, { ...initialization, ownerKey: "another-node" });
+    expect((container.querySelector('[aria-label="Open Pending\'s task"]') as HTMLButtonElement).disabled).toBe(true);
+  });
   it("shows activity, disables unavailable entries, searches and opens an exact Partner task", async () => {
     const active = transport();
     await render(active);

@@ -21,11 +21,14 @@ import {
 } from "./mobile-partner-directory";
 import type { MobilePartnersColors } from "./MobilePartnersScreen";
 import { MobilePartnerAvatar } from "./MobilePartnerAvatar";
+import { MobilePartnerInitializationScreen } from "./MobilePartnerInitializationScreen";
+import type { MobilePartnerInitializationTransport } from "./mobile-partner-initialization";
 
 export interface MobilePartnerDirectoryScreenProps {
   readonly colors: MobilePartnersColors;
   readonly locale: MobileSupportedLocale;
   readonly transport?: MobilePartnerDirectoryTransport;
+  readonly initializationTransport?: MobilePartnerInitializationTransport;
   readonly onBack: () => void;
   readonly onOpenTask: (sessionId: string) => void;
 }
@@ -67,11 +70,12 @@ function Action({ label, colors, onPress, disabled = false, testID }: {
   </Pressable>;
 }
 
-function PartnerRow({ partner, colors, locale, opening, last, onOpen }: {
+function PartnerRow({ partner, colors, locale, opening, recoverable, last, onOpen }: {
   readonly partner: MobilePartnerDirectoryProfile;
   readonly colors: MobilePartnersColors;
   readonly locale: MobileSupportedLocale;
   readonly opening: boolean;
+  readonly recoverable: boolean;
   readonly last: boolean;
   readonly onOpen: () => void;
 }) {
@@ -82,12 +86,14 @@ function PartnerRow({ partner, colors, locale, opening, last, onOpen }: {
     artifacts: partner.activity.artifactCount, delegations: partner.activity.activeDelegationCount
   });
   return <Pressable accessibilityRole="button"
-    accessibilityLabel={mobileMessage(locale, "partnerDirectory.openAccessibility", { name: partner.displayName })}
+    accessibilityLabel={mobileMessage(locale, recoverable ? "partnerInitialization.openAccessibility"
+      : "partnerDirectory.openAccessibility", { name: partner.displayName })}
     accessibilityHint={[statusLabel(partner, locale), identity, activity,
-      mobileMessage(locale, available ? "partnerDirectory.openTask" : "partnerDirectory.unavailable")].join(" · ")}
-    accessibilityState={{ disabled: !available || opening }} disabled={!available || opening}
+      recoverable ? mobileMessage(locale, "partnerInitialization.openAccessibility", { name: partner.displayName })
+        : mobileMessage(locale, available ? "partnerDirectory.openTask" : "partnerDirectory.unavailable")].join(" · ")}
+    accessibilityState={{ disabled: !available && !recoverable || opening }} disabled={!available && !recoverable || opening}
     onPress={onOpen} testID={`partnerDirectory.item.${partner.partnerId}`}
-    style={[styles.row, { backgroundColor: colors.surface }, !available && styles.unavailable]}>
+    style={[styles.row, { backgroundColor: colors.surface }, !available && !recoverable && styles.unavailable]}>
     <MobilePartnerAvatar preset={partner.avatar} colors={colors} />
     <View style={[styles.rowBody, !last && { borderBottomColor: colors.border, borderBottomWidth: StyleSheet.hairlineWidth }]}>
       <View style={styles.titleRow}>
@@ -111,7 +117,7 @@ function PartnerRow({ partner, colors, locale, opening, last, onOpen }: {
   </Pressable>;
 }
 
-export function MobilePartnerDirectoryScreen({ colors, locale, transport, onBack, onOpenTask }:
+export function MobilePartnerDirectoryScreen({ colors, locale, transport, initializationTransport, onBack, onOpenTask }:
   MobilePartnerDirectoryScreenProps) {
   const [state, setState] = useState<DirectoryState>(() => transport
     ? { ownerKey: transport.ownerKey, status: "loading", refreshing: false }
@@ -120,6 +126,7 @@ export function MobilePartnerDirectoryScreen({ colors, locale, transport, onBack
   const [query, setQuery] = useState("");
   const [openingId, setOpeningId] = useState<string>();
   const [actionError, setActionError] = useState<string>();
+  const [initialization, setInitialization] = useState<{ readonly ownerKey: string; readonly partnerId: string }>();
   const transportRef = useRef(transport);
   const requestRef = useRef<AbortController | undefined>(undefined);
   const openRef = useRef<AbortController | undefined>(undefined);
@@ -165,13 +172,14 @@ export function MobilePartnerDirectoryScreen({ colors, locale, transport, onBack
     };
   }, [transport?.ownerKey]);
 
+  const leaveInitialization = (): void => { setInitialization(undefined); load(); };
   useEffect(() => {
     const subscription = BackHandler.addEventListener("hardwareBackPress", () => {
-      onBack();
+      if (initialization) leaveInitialization(); else onBack();
       return true;
     });
     return () => subscription.remove();
-  }, [onBack]);
+  }, [onBack, initialization]);
 
   const currentOwner = transport !== undefined && state.ownerKey === transport.ownerKey;
   const catalog = currentOwner ? state.catalog : undefined;
@@ -200,6 +208,9 @@ export function MobilePartnerDirectoryScreen({ colors, locale, transport, onBack
 
   const emptyKey = query.trim() !== "" ? "partnerDirectory.noResults"
     : lifecycle === "active" ? "partnerDirectory.emptyActive" : "partnerDirectory.emptyArchived";
+  if (initialization) return <MobilePartnerInitializationScreen partnerId={initialization.partnerId}
+    transport={initializationTransport?.ownerKey === initialization.ownerKey ? initializationTransport : undefined}
+    colors={colors} locale={locale} onBack={leaveInitialization} onOpenTask={onOpenTask} />;
   return <View style={[styles.screen, { backgroundColor: colors.background }]} testID="partnerDirectory.screen">
     <View style={styles.header}>
       <Action label={mobileMessage(locale, "common.back")} colors={colors} onPress={onBack} />
@@ -264,8 +275,15 @@ export function MobilePartnerDirectoryScreen({ colors, locale, transport, onBack
       ListEmptyComponent={<Text style={[styles.body, styles.emptyText, { color: colors.muted }]}>
         {mobileMessage(locale, emptyKey)}
       </Text>}
-      renderItem={({ item, index }) => <PartnerRow partner={item} colors={colors} locale={locale}
-        last={index === visible.length - 1} opening={openingId === item.partnerId} onOpen={() => open(item)} />} />}
+      renderItem={({ item, index }) => {
+        const recoverable = item.lifecycle === "active" && item.initializationState !== "ready"
+          && initializationTransport !== undefined && initializationTransport.ownerKey === transport?.ownerKey;
+        return <PartnerRow partner={item} colors={colors} locale={locale} recoverable={recoverable}
+          last={index === visible.length - 1} opening={openingId === item.partnerId} onOpen={() => {
+            if (recoverable && transport) setInitialization({ ownerKey: transport.ownerKey, partnerId: item.partnerId });
+            else open(item);
+          }} />;
+      }} />}
   </View>;
 }
 

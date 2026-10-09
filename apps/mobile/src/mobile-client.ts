@@ -89,6 +89,7 @@ import {
 } from "./mobile-partner-directory";
 import { mobilePartnerVisibleReply, type MobilePartnerConversationTransport } from "./mobile-partner-conversation";
 import { validateMobilePartnerProfileDraft, type MobilePartnerProfileTransport } from "./mobile-partner-profile";
+import type { MobilePartnerInitializationTransport } from "./mobile-partner-initialization";
 import {
   assertMobileExtensionMainViewSurface,
   mobileExtensionKey,
@@ -925,6 +926,77 @@ export class MobileClient {
         return { sessionId };
       }
     };
+  }
+
+  partnerInitializationTransport(): MobilePartnerInitializationTransport | undefined {
+    const directory = this.partnerDirectoryTransport();
+    const context = this.#partnerPrivateContext();
+    const retryInitialization = this.network.retryPartnerInitialization;
+    if (!directory || !context || !retryInitialization) return undefined;
+    const ownerKey = directory.ownerKey;
+    const requireCurrent = (signal: AbortSignal): void => {
+      signal.throwIfAborted();
+      if (this.#credential !== context.credential || this.#partnerPrivateAuthorityKey(this.#state) !== ownerKey) {
+        throw new Error("The Partner initialization owner changed.");
+      }
+    };
+    const load: MobilePartnerInitializationTransport["load"] = async (partnerId, signal) => {
+      if (!validMobilePartnerId(partnerId)) throw new Error("Select a current Partner initialization.");
+      const catalog = await directory.list(signal);
+      requireCurrent(signal);
+      const matches = catalog.partners.filter((partner) => partner.partnerId === partnerId);
+      if (matches.length !== 1 || matches[0]!.lifecycle !== "active") {
+        throw new Error("The Partner initialization is no longer available.");
+      }
+      return matches[0]!;
+    };
+    return { ownerKey, load, retry: async (selected, signal) => {
+      requireCurrent(signal);
+      const current = await load(selected.partnerId, signal);
+      if (mobilePartnerDirectoryIdentity(current) !== mobilePartnerDirectoryIdentity(selected)
+        || current.initializationState !== "error") {
+        throw new Error("The Partner initialization changed; refresh before retrying.");
+      }
+      const action = this.#claimMutation();
+      try {
+        const updated = await retryInitialization.call(this.network, context.credential, current.partnerId,
+          current.revision, signal);
+        requireCurrent(signal);
+        const sameProfile = (value: MobilePartnerDirectoryProfile): boolean => value.partnerId === current.partnerId
+          && value.lifecycle === "active" && value.homeTargetId === current.homeTargetId
+          && value.profileVersion === current.profileVersion
+          && value.capabilities.modelChain[0]?.backendId === current.capabilities.modelChain[0]?.backendId
+          && (current.canonicalSessionId === undefined || value.canonicalSessionId === current.canonicalSessionId);
+        if (!sameProfile(updated) || updated.revision <= current.revision) {
+          throw new Error("The initialization result belongs to another Partner profile.");
+        }
+        const confirmed = await load(current.partnerId, signal);
+        if (!sameProfile(confirmed) || confirmed.revision < updated.revision) {
+          throw new Error("The Partner initialization result could not be confirmed.");
+        }
+        return confirmed;
+      } catch (error) {
+        signal.throwIfAborted();
+        throw new Error("The Partner initialization retry may have been applied. Refresh before another retry.", { cause: error });
+      } finally { this.#releaseMutation(action); }
+    }, open: async (selected, signal) => {
+      requireCurrent(signal);
+      const current = await load(selected.partnerId, signal);
+      if (mobilePartnerDirectoryIdentity(current) !== mobilePartnerDirectoryIdentity(selected)
+        || current.initializationState !== "ready") throw new Error("The initialized Partner changed before opening.");
+      // A just-initialized home may not be in the last task snapshot yet. Observe it without reconnecting
+      // or retiring the recovery page's owner, then use the existing canonical navigation checks.
+      const node = this.#state.node!;
+      const observed = await this.network.readOwner(context.credential, this.deviceNameSource(), signal);
+      requireCurrent(signal);
+      this.#assertOwner(context.credential, observed, node);
+      if (this.#partnerPrivateAuthorityKey({ ...this.#state, owner: observed.snapshot }) !== ownerKey) {
+        throw new Error("The Partner initialization task directory owner changed.");
+      }
+      this.#set({ owner: observed.snapshot });
+      requireCurrent(signal);
+      return directory.open(current, signal);
+    } };
   }
 
   partnerConversationTransport(): MobilePartnerConversationTransport | undefined {
