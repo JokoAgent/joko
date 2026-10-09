@@ -209,6 +209,16 @@ message MessageStartedEvent {
   // Host-authored marker for one Objective-owned turn. This authority is not
   // part of public InputContent and cannot be supplied by SendInput callers.
   ObjectiveContinuation objective_continuation = 12;
+  // Host-owned provenance; absent from public InputContent.
+  PartnerPrivateMessageOrigin partner_private_origin = 13;
+}
+
+message PartnerPrivateMessageOrigin {
+  string message_id = 1;
+  string thread_id = 2;
+  string sender_partner_id = 3;
+  string recipient_partner_id = 4;
+  string sender_display_name = 5;
 }
 
 message ObjectiveContinuation {
@@ -325,6 +335,7 @@ message MessageCompletedEvent {
   // Authoritative, Backend-neutral final message content. Stream deltas are
   // transient hints only; clients reconcile them against these ordered blocks.
   repeated MessageBlock blocks = 9;
+  PartnerPrivateMessageOrigin partner_private_origin = 10;
 }
 
 message MessageBlock {

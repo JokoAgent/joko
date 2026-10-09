@@ -1677,6 +1677,27 @@ describe("SessionHost", () => {
     });
   });
 
+  it("keeps failed private delivery provenance on the service recovery boundary", async () => {
+    const adapter = new RuntimeRecoveryFakeAdapter();
+    const fixture = await createFixture(adapter, { sessionRuntimeFallbackEnabled: () => true,
+      sessionRuntimeFallbackContext: () => ({ availableProviderIds: new Set(["provider-a", "provider-b"]) }), sessionRuntimeRecoveryDelayMs: () => 0 });
+    const create = (operationId: string) => fixture.host.createSession({ operationId, connection: fixture.connection, targetId: "target-one", title: "Private recovery",
+      providerId: "provider-a", modelId: "reasoner", effort: "medium", fastMode: false, permissionMode: "ask", planMode: false });
+    const recipient = (await create("private-recovery-recipient")).value.sessionId;
+    const sender = (await create("private-recovery-sender")).value.sessionId;
+    const partnerPrivateOrigin = { messageId: "private", threadId: "thread", senderPartnerId: "sender", recipientPartnerId: "recipient", senderDisplayName: "Sender" };
+    fixture.host.enqueueServiceInput({ operationId: "private-recovery-input", sessionId: recipient, source: "system", originSessionId: sender, partnerPrivateOrigin,
+      prompt: { text: "Recover a private delivery", images: [], files: [], mentions: [], disposition: "prompt" } });
+    await eventually(() => fixture.store.listRuns({ sessionId: recipient, states: ["failed"], limit: 10 }).length === 1, 5_000);
+    const events = fixture.store.listEvents({ sessionId: recipient, order: "asc", limit: 1_000 });
+    const messages = events.filter((event) => event.payload.type === "message_complete");
+    expect(messages).toHaveLength(1);
+    for (const event of messages) expect(event.payload).toMatchObject({ partnerPrivateOrigin });
+    expect(events.some((event) => event.payload.type === "runtime_recovery")).toBe(false);
+    expect(adapter.prompts).toEqual(["Recover a private delivery"]);
+    expect(fixture.store.getOperation("private-recovery-input").body).toMatchObject({ originSessionId: sender, partnerPrivateOrigin });
+  });
+
   it("keeps a temporary route when the owner changes only effort and Fast", async () => {
     const adapter = new RuntimeRecoveryFakeAdapter();
     const fixture = await createFixture(adapter);

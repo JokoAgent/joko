@@ -72,6 +72,7 @@ import {
 } from "../usage-limit-recovery.js";
 import { SessionHeaderActionsMenu } from "./SessionHeaderActionsMenu.js";
 import { PartnerConversationHeader } from "./PartnerConversationHeader.js";
+import { PartnerConversationProvider, usePartnerConversation } from "./PartnerConversation.js";
 import { TaskTagDots } from "./TaskTags.js";
 import { codeHostDisplayBranch } from "./CodeHostPullRequestSummary.js";
 import { openCodeHostPullRequestExternal } from "../code-host-pull-request.js";
@@ -142,7 +143,15 @@ interface ActiveMessageFork {
 
 export type SessionPanePresentation = "standard" | "filesRail";
 
-export function SessionPane({ controller, session, target, backend, reviewReadOnly = false, presentation = "standard", composerAutoFocus = true, models, timeline, timelineHasEarlier, timelineHistoryLoading, timelineHistoryError, onLoadEarlierTimeline, timelineFocusRequest, extensionWidgets, extensionStatuses, queue, queueControl, workspace, extraDirectories, resources, commandRefreshSignal, interaction, remainingInteractions, navigationOpen, inspectorOpen, inspectorAvailable = true, selectionQuoteInsertion, attachmentInsertion, objectiveDialogHandoff, onObjectiveDialogHandoffHandled, t, runAction, onOpenNavigation, onOpenInspector, onOpenSubagent, onOpenTurnReview, onRename, onManageTaskTags = () => undefined, onPin, onArchive, onPrefetchRemoval, onDelete, onMoveSessionProject, movingSessionProject = false, onCopyTaskLink, onExportPortableSession, onSplitSession, onOpenSessionWindow }: {
+export function SessionPane(props: Parameters<typeof SessionPaneContent>[0]): JSX.Element {
+  const route = props.controller.state.route;
+  return <PartnerConversationProvider controller={props.controller} session={props.session}
+    active={route?.kind === "session" && route.sessionId === props.session.id} t={props.t}>
+    <SessionPaneContent {...props} />
+  </PartnerConversationProvider>;
+}
+
+function SessionPaneContent({ controller, session, target, backend, reviewReadOnly = false, presentation = "standard", composerAutoFocus = true, models, timeline, timelineHasEarlier, timelineHistoryLoading, timelineHistoryError, onLoadEarlierTimeline, timelineFocusRequest, extensionWidgets, extensionStatuses, queue, queueControl, workspace, extraDirectories, resources, commandRefreshSignal, interaction, remainingInteractions, navigationOpen, inspectorOpen, inspectorAvailable = true, selectionQuoteInsertion, attachmentInsertion, objectiveDialogHandoff, onObjectiveDialogHandoffHandled, t, runAction, onOpenNavigation, onOpenInspector, onOpenSubagent, onOpenTurnReview, onRename, onManageTaskTags = () => undefined, onPin, onArchive, onPrefetchRemoval, onDelete, onMoveSessionProject, movingSessionProject = false, onCopyTaskLink, onExportPortableSession, onSplitSession, onOpenSessionWindow }: {
   readonly controller: AppController;
   readonly session: SessionView;
   readonly target?: TargetView;
@@ -194,6 +203,8 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
   readonly onOpenSessionWindow?: () => void;
 }): JSX.Element {
   const exportDownload = useArtifactDownload(session.id, controller.exportSession);
+  const partnerConversation = usePartnerConversation();
+  const partnerRuntimeLocked = partnerConversation?.kind !== "task";
   const timelineResourceOwnerKey = useMemo(() => randomUuid(), [controller.getArtifactUrl, controller.releaseArtifactUrl, controller.state.activeProfile?.serverId, controller.state.activeProfile?.id, session.id, workspace?.id]);
   const timelineResourceOwnerRef = useRef<string | undefined>(undefined);
   useLayoutEffect(() => {
@@ -460,11 +471,11 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
   const canAbort = backend?.capabilities.get("turn.abort")?.supported === true;
   const canAbortRetry = backend?.capabilities.get("context.auto_retry")?.supported === true;
   const canStop = session.state === "retrying" ? canAbortRetry && activeRetry?.source === "auto" : canAbort;
-  const canSwitchModel = !reviewReadOnly && backend?.capabilities.get("model.switch")?.supported === true;
-  const canSetEffort = !reviewReadOnly && backend?.capabilities.get("model.effort")?.supported === true;
-  const canSetFast = !reviewReadOnly && backend?.capabilities.get("model.fast_mode")?.supported === true;
+  const canSwitchModel = !reviewReadOnly && !partnerRuntimeLocked && backend?.capabilities.get("model.switch")?.supported === true;
+  const canSetEffort = !reviewReadOnly && !partnerRuntimeLocked && backend?.capabilities.get("model.effort")?.supported === true;
+  const canSetFast = !reviewReadOnly && !partnerRuntimeLocked && backend?.capabilities.get("model.fast_mode")?.supported === true;
   const allowedPermissions = advertisedPermissionModes(backend);
-  const canSetPermission = !reviewReadOnly && permissionChangeSupported(backend);
+  const canSetPermission = !reviewReadOnly && !partnerRuntimeLocked && permissionChangeSupported(backend);
   const canListRuntimeCommands = !reviewReadOnly && backend?.capabilities.get("runtime.commands")?.supported === true;
   const objectiveAccess = objectiveSessionAccess(session, backend, {
     connected: controller.state.connectionState === "connected",
@@ -500,7 +511,7 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
     && controller.state.connectionState === "connected"
     && backend?.capabilities.get("input.mention")?.supported === true
     && backend.capabilities.get("input.mention")?.options.includes("artifact") === true;
-  const canSetPlanMode = !reviewReadOnly && planModeSupported(backend);
+  const canSetPlanMode = !reviewReadOnly && !partnerRuntimeLocked && planModeSupported(backend);
   const canContactOwner = controller.state.activeProfile !== undefined && controller.state.snapshot.revision > 0n;
   const canListSubagents = backend?.capabilities.get("subagents.list")?.supported === true
     && backend.capabilities.get("subagents.detail")?.supported === true;
@@ -699,7 +710,7 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
   };
   const permissionCycleOptions = permissionModesForShortcut(backend, target, controller.state.snapshot.settings.policy.projectTrustRequired);
   const messageHistory = useMemo(() => recoveryPresentationTimeline.flatMap((item): readonly ComposerHistoryEntry[] => {
-    if (item.kind !== "user" || !item.text?.trim()) return [];
+    if (item.kind !== "user" || item.partnerPrivateOrigin !== undefined || !item.text?.trim()) return [];
     const editorDocument = composerDocumentFromMessage(item.text, item.quotesEncoded === true, {
         sessionId: session.id,
         messageId: item.id,
@@ -1709,7 +1720,7 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
     } : {})
   });
 
-  const composerControls = (
+  const composerControls = partnerRuntimeLocked ? undefined : (
     <div className="composer__controls" aria-label={t("session.controls")}>
       {canSetPermission && <PermissionSelector
         value={session.permissionMode}
@@ -1805,7 +1816,7 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
         return;
       }
     }}>
-      {presentation !== "filesRail" && <PartnerConversationHeader controller={controller} session={session} navigationOpen={navigationOpen} onOpenNavigation={onOpenNavigation} t={t}><header className="session-header">
+      {presentation !== "filesRail" && <PartnerConversationHeader session={session} navigationOpen={navigationOpen} onOpenNavigation={onOpenNavigation} t={t}><header className="session-header">
         <div className="session-header__leading">
           {!navigationOpen && <IconButton className="mobile-panel-toggle" label={t("a11y.openNavigation")} onClick={onOpenNavigation}><Menu aria-hidden="true" /></IconButton>}
           <div className="session-heading">

@@ -302,6 +302,25 @@ describe("browser takeover projection", () => {
 });
 
 describe("incremental event projection", () => {
+  it("keeps the message's start position while preserving its completion global cursor and private origin", () => {
+    const raw = create(SnapshotSchema, { generation: 1n, resumeCursor: { generation: 1n, sequence: 0n } });
+    const start = create(EventSchema, { eventId: "start", cursor: { generation: 1n, sequence: 12n }, identity: { sessionId: "session", sequence: 2n, runId: "run" },
+      payload: { kind: { case: "textDelta", value: { messageId: "message", delta: "Draft", contentIndex: 0 } } } });
+    const projected = projectSnapshotEvent(raw, mapSnapshot(raw), start);
+    const partnerPrivateOrigin = { messageId: "private", threadId: "thread", senderPartnerId: "sender", recipientPartnerId: "recipient", senderDisplayName: "Sender" };
+    const completed = create(EventSchema, { eventId: "completed", cursor: { generation: 1n, sequence: 91n }, identity: { sessionId: "session", sequence: 3n, runId: "run" },
+      payload: { kind: { case: "messageCompleted", value: { messageId: "message", role: MessageRole.ASSISTANT,
+        blocks: [{ content: { case: "text", value: "Final" } }], partnerPrivateOrigin } } } });
+    const result = projectSnapshotEvent(projected.rawSnapshot, projected.snapshot, completed).snapshot.timelineBySession.get("session");
+    expect(result?.[0]).toMatchObject({ sequence: 12n, completionCursor: 91n, sourceEventId: "completed", text: "Final", partnerPrivateOrigin, streaming: false });
+  });
+
+  it("does not invent a read cursor from a per-Session sequence when a completion has no global cursor", () => {
+    const raw = create(SnapshotSchema, { generation: 1n });
+    const event = create(EventSchema, { eventId: "unscoped-completion", identity: { sessionId: "session", sequence: 9n },
+      payload: { kind: { case: "messageCompleted", value: { messageId: "message", role: MessageRole.ASSISTANT, blocks: [{ content: { case: "text", value: "Final" } }] } } } });
+    expect(projectSnapshotEvent(raw, mapSnapshot(raw), event).snapshot.timelineBySession.get("session")?.[0]?.completionCursor).toBeUndefined();
+  });
   it("reconciles loaded Session labels from one bounded owner catalog event", () => {
     const work = {
       taskTagId: "preset:work",

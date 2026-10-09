@@ -2980,6 +2980,8 @@ function toProtoEventPayload(event: PersistedEvent, context: EventMappingContext
           nativeIdentity: toProtoNativeMessageIdentity(payload.nativeHistory?.identity),
           automaticContinuation: payload.automaticContinuation !== undefined,
           runtimeRecoveryId: payload.automaticContinuation?.recoveryId ?? "",
+          partnerPrivateOrigin: payload.partnerPrivateOrigin === undefined ? undefined
+            : message<contract.PartnerPrivateMessageOrigin>("joko.v1.PartnerPrivateMessageOrigin", payload.partnerPrivateOrigin),
           objectiveContinuation: payload.objectiveContinuation === undefined
             ? undefined
             : message<contract.ObjectiveContinuation>("joko.v1.ObjectiveContinuation", {
@@ -2996,6 +2998,8 @@ function toProtoEventPayload(event: PersistedEvent, context: EventMappingContext
         usage: payload.usage === undefined ? undefined : toProtoUsage(payload.usage),
         stopReason: "",
         nativeIdentity: toProtoNativeMessageIdentity(payload.nativeHistory?.identity),
+        partnerPrivateOrigin: payload.partnerPrivateOrigin === undefined ? undefined
+          : message<contract.PartnerPrivateMessageOrigin>("joko.v1.PartnerPrivateMessageOrigin", payload.partnerPrivateOrigin),
         ...toProtoMessageGenerationTiming(payload)
       }));
     case "runtime_recovery":
@@ -3415,6 +3419,9 @@ function fromProtoEventPayload(
           ...input.files.map((file) => ({ kind: "artifact" as const, blob: file.blob, label: file.blob.fileName ?? "file" }))
         ],
         ...(payload.kind.value.userInputAccepted ? { acceptedInput: input } : {}),
+        ...(payload.kind.value.partnerPrivateOrigin === undefined ? {} : {
+          partnerPrivateOrigin: fromProtoPartnerPrivateOrigin(payload.kind.value.partnerPrivateOrigin)
+        }),
         ...(inputDelivery === undefined ? {} : { inputDelivery }),
         ...(payload.kind.value.automaticContinuation && payload.kind.value.runtimeRecoveryId.trim().length > 0 ? {
           automaticContinuation: {
@@ -3501,6 +3508,9 @@ function fromProtoEventPayload(
         type: "message_complete",
         role: payload.kind.value.role === MessageRole.USER ? "user" : "assistant",
         blocks: payload.kind.value.blocks.map(fromProtoMessageBlock),
+        ...(payload.kind.value.partnerPrivateOrigin === undefined ? {} : {
+          partnerPrivateOrigin: fromProtoPartnerPrivateOrigin(payload.kind.value.partnerPrivateOrigin)
+        }),
         ...(payload.kind.value.usage === undefined
           ? {}
           : { usage: fromProtoUsage(payload.kind.value.usage) }),
@@ -4398,6 +4408,17 @@ function safeNumber(value: bigint, fieldPath: string): number {
     throw new ProtoMappingError("out_of_range", fieldPath, `${fieldPath} is outside the supported integer range.`);
   }
   return Number(value);
+}
+
+function fromProtoPartnerPrivateOrigin(value: contract.PartnerPrivateMessageOrigin): NonNullable<Extract<EventPayload, { type: "message_complete" }>["partnerPrivateOrigin"]> {
+  const { messageId, threadId, senderPartnerId, recipientPartnerId, senderDisplayName } = value;
+  const origin = { messageId, threadId, senderPartnerId, recipientPartnerId, senderDisplayName };
+  for (const [key, text] of Object.entries(origin)) {
+    requireText(text, `event.payload.partner_private_origin.${key}`);
+    if (text.length > 256) throw new ProtoMappingError("invalid_argument", `event.payload.partner_private_origin.${key}`, "Private message provenance is too long.");
+  }
+  if (senderPartnerId === recipientPartnerId) throw new ProtoMappingError("invalid_argument", "event.payload.partner_private_origin", "A private message requires two Partners.");
+  return origin;
 }
 
 function requireText(value: string, fieldPath: string): string {

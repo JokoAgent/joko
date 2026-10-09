@@ -27,6 +27,17 @@ afterEach(() => {
 });
 
 describe("OperationalStore visible message search", () => {
+  it("keeps private control prompts out of search, human activity and public message operations", () => {
+    const fixture = createFixture();
+    const partnerPrivateOrigin = { messageId: "private", threadId: "thread", senderPartnerId: "sender", recipientPartnerId: "recipient", senderDisplayName: "Sender" };
+    appendMessage(fixture.store, "public-input", "session-a", 10, { type: "message_complete", role: "user", blocks: [{ kind: "text", text: "Public question" }] });
+    appendMessage(fixture.store, "private-input", "session-a", 20, { type: "message_complete", role: "user", blocks: [{ kind: "text", text: "privatecontrolmarker" }], partnerPrivateOrigin });
+    appendMessage(fixture.store, "private-reply", "session-a", 30, { type: "message_complete", role: "assistant", blocks: [{ kind: "text", text: "Visible private answer" }], partnerPrivateOrigin });
+    expect(fixture.store.searchSessionMessages({ scope: { sessionId: "session-a" }, query: "privatecontrolmarker" }).matches).toEqual([]);
+    expect(fixture.store.searchSessionMessages({ scope: { sessionId: "session-a" }, query: "Visible private answer" }).matches).toHaveLength(1);
+    expect(fixture.store.findLatestVisibleUserMessageAt("session-a")).toBe(10);
+    expect(fixture.store.findVisibleSessionMessageOrigin({ sessionId: "session-a", eventId: "private-input" })).toBeUndefined();
+  });
   it("keeps imported messages in the same native binding across activation and hides them after rebind", () => {
     const fixture = createFixture();
     const initial = fixture.store.getSession("session-a");

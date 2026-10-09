@@ -10253,7 +10253,8 @@ export class OperationalStore {
       "tombstone.event_id IS NULL",
       "json_extract(event.payload_json, '$.payload.type') = 'message_complete'",
       "json_extract(event.payload_json, '$.payload.automaticContinuation') IS NULL",
-      "json_extract(event.payload_json, '$.payload.objectiveContinuation') IS NULL"
+      "json_extract(event.payload_json, '$.payload.objectiveContinuation') IS NULL",
+      "(json_extract(event.payload_json, '$.payload.role') <> 'user' OR json_extract(event.payload_json, '$.payload.partnerPrivateOrigin') IS NULL)"
     ];
     const params: Array<string | number | bigint | null> = [...(nativeVisibility?.params ?? []), sessionId];
     if (input.eventId !== undefined) {
@@ -11019,6 +11020,7 @@ export class OperationalStore {
         AND json_extract(event.payload_json, '$.payload.role') = 'user'
         AND json_extract(event.payload_json, '$.payload.automaticContinuation') IS NULL
         AND json_extract(event.payload_json, '$.payload.objectiveContinuation') IS NULL
+        AND json_extract(event.payload_json, '$.payload.partnerPrivateOrigin') IS NULL
       ORDER BY event.global_cursor DESC
       LIMIT 1
     `).get(normalizedSessionId) as Row | undefined;
@@ -13365,6 +13367,7 @@ export class OperationalStore {
         AND json_extract(event.payload_json, '$.payload.role') IN ('user', 'assistant')
         AND json_extract(event.payload_json, '$.payload.automaticContinuation') IS NULL
         AND json_extract(event.payload_json, '$.payload.objectiveContinuation') IS NULL
+        AND (json_extract(event.payload_json, '$.payload.role') <> 'user' OR json_extract(event.payload_json, '$.payload.partnerPrivateOrigin') IS NULL)
         AND (
           (
             identity.entry_id IS NOT NULL
@@ -18443,7 +18446,8 @@ function escapeLikePattern(query: string): string {
 
 function visibleMessageText(payload: EventPayload): string | undefined {
   if (payload.type === "message_complete"
-    && (payload.automaticContinuation !== undefined || payload.objectiveContinuation !== undefined)) return undefined;
+    && (payload.automaticContinuation !== undefined || payload.objectiveContinuation !== undefined
+      || payload.role === "user" && payload.partnerPrivateOrigin !== undefined)) return undefined;
   let parts: readonly string[];
   if (payload.type === "message_complete" && (payload.role === "user" || payload.role === "assistant")) {
     parts = payload.blocks.flatMap((block) =>

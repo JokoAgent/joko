@@ -21,7 +21,7 @@ export function messageForkBlocked(
   item: TimelineItemView,
   sessionActive: boolean
 ): boolean {
-  if (isInternalContinuationTimelineItem(item)) return true;
+  if (isInternalContinuationTimelineItem(item) || item.kind === "user" && item.partnerPrivateOrigin !== undefined) return true;
   if (!sessionActive) return false;
   if (item.kind === "user") return item.inputDelivery === "steer";
   return item.kind === "assistant" && assistantForkBlockedMessageIds(items, true).has(item.id);
@@ -55,6 +55,7 @@ export function assistantForkBlockedMessageIds(
 export function resolveMessageDeleteTarget(item: TimelineItemView): MessageDeleteTarget | undefined {
   if (
     isInternalContinuationTimelineItem(item)
+    || item.kind === "user" && item.partnerPrivateOrigin !== undefined
     ||
     (item.kind !== "user" && item.kind !== "assistant")
     || item.streaming === true
@@ -67,7 +68,7 @@ export function resolveMessageDeleteTarget(item: TimelineItemView): MessageDelet
 
 /** Resolve only forks whose native boundary is exact. */
 export function resolveMessageForkTarget(item: TimelineItemView): MessageForkTarget | undefined {
-  if (isInternalContinuationTimelineItem(item)) return undefined;
+  if (isInternalContinuationTimelineItem(item) || item.kind === "user" && item.partnerPrivateOrigin !== undefined) return undefined;
   if (item.kind === "assistant" && item.nativeEntryId !== undefined) {
     return { entryId: item.nativeEntryId };
   }
@@ -93,6 +94,7 @@ export function createMessageComposerMention(
 ): ComposerMessageMentionDraft | undefined {
   if (
     isInternalContinuationTimelineItem(item)
+    || item.kind === "user" && item.partnerPrivateOrigin !== undefined
     ||
     (item.kind !== "user" && item.kind !== "assistant")
     || !boundedIdentity(sessionId)

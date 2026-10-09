@@ -107,6 +107,16 @@ export interface DeviceContentProjection {
   readonly versionUpdatedAt: number;
 }
 
+/** Host-authored provenance of a private message delivered to a canonical
+ * Partner task. This marker is never accepted from public input or an Adapter. */
+export interface PartnerPrivateMessageOrigin {
+  readonly messageId: string;
+  readonly threadId: string;
+  readonly senderPartnerId: string;
+  readonly recipientPartnerId: string;
+  readonly senderDisplayName: string;
+}
+
 export type EventPayload =
   | { readonly type: "run_state"; readonly state: RunState; readonly error?: PublicError }
   /** Store-owned observation; never emitted by a Session adapter. */
@@ -123,6 +133,7 @@ export type EventPayload =
       readonly blocks: readonly MessageBlock[];
       /** Host-owned accepted Queue input for canonical user presentation, independent of the native echo. */
       readonly acceptedInput?: PromptInput;
+      readonly partnerPrivateOrigin?: PartnerPrivateMessageOrigin;
       /** Per-message provider accounting when authoritatively reported. */
       readonly usage?: UsageSnapshot;
       /** Generation-only time for this assistant message, never turn wall-clock time. */

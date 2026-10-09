@@ -10590,6 +10590,7 @@ function projectTimelineEvent(
         ...(kind.value.role === 1 && pastedTextRanges.length > 0 ? { pastedTextRanges } : {}),
         ...(kind.value.role === 1 && automationOrigin !== undefined ? { automationOrigin } : {}),
         ...(kind.value.role === 1 && inputDelivery !== undefined ? { inputDelivery } : {}),
+        ...timelinePrivateMessageOrigin(kind.value.partnerPrivateOrigin),
         ...(kind.value.role === 1 && kind.value.automaticContinuation && kind.value.runtimeRecoveryId.trim().length > 0
           ? { automaticContinuation: { recoveryId: kind.value.runtimeRecoveryId } }
           : {}),
@@ -11088,6 +11089,8 @@ function reconcileCompletedAssistantMessage(
           kind: "assistant",
           createdAt: existing?.createdAt ?? createdAt,
           text: finalText,
+          ...(event.cursor !== undefined && event.cursor.sequence > 0n ? { completionCursor: event.cursor.sequence } : {}),
+          ...timelinePrivateMessageOrigin(completed.partnerPrivateOrigin),
           streaming: false,
           ...(attachments.length > 0 ? { attachments } : {}),
           ...(usage === undefined ? {} : { usage })
@@ -11196,6 +11199,8 @@ function reconcileCompletedAssistantMessage(
         text: "",
         streaming: false,
         attachments,
+        ...(event.cursor !== undefined && event.cursor.sequence > 0n ? { completionCursor: event.cursor.sequence } : {}),
+        ...timelinePrivateMessageOrigin(completed.partnerPrivateOrigin),
         ...(usage === undefined ? {} : { usage })
       }
     });
@@ -12627,6 +12632,14 @@ function withTimelineHistoryInvalidation(
   const timelineHistoryRevisionBySession = new Map(snapshot.timelineHistoryRevisionBySession);
   timelineHistoryRevisionBySession.set(sessionId, nextRevision);
   return { ...snapshot, timelineHistoryRevisionBySession };
+}
+
+function timelinePrivateMessageOrigin(value: ProtoMessageCompletedEvent["partnerPrivateOrigin"]): Pick<TimelineItemView, "partnerPrivateOrigin"> {
+  if (value === undefined) return {};
+  const { messageId, threadId, senderPartnerId, recipientPartnerId, senderDisplayName } = value;
+  if ([messageId, threadId, senderPartnerId, recipientPartnerId, senderDisplayName].some((text) => text.trim() === "" || text.length > 256)
+    || senderPartnerId === recipientPartnerId) throw new GatewayError("Orchestrator returned invalid private message provenance.");
+  return { partnerPrivateOrigin: { messageId, threadId, senderPartnerId, recipientPartnerId, senderDisplayName } };
 }
 
 function timelineNativeMessageIdentity(

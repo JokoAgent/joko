@@ -391,7 +391,7 @@ function PartnerDefaultsDialog({ open, directory, snapshot, controller, ownerKey
   return <Modal open={open} title={t("partners.defaultsTitle")} description={t("partners.defaultsBody")} size="large" onClose={saving ? () => undefined : onClose}><div className="partner-editor"><CapabilitiesEditor value={value} snapshot={snapshot} disabled={saving} t={t} onChange={setValue} />{error !== undefined && <p className="partner-editor__error" role="alert">{error}</p>}<div className="modal__actions"><Button onClick={onClose} disabled={saving}>{t("common.cancel")}</Button><Button tone="primary" disabled={saving || !validPartnerCapabilities(value)} onClick={() => void save()}>{saving ? t("common.working") : t("common.save")}</Button></div></div></Modal>;
 }
 
-export function PartnerSettingsDialog({ partner, partners, directory, snapshot, controller, ownerKey, t, initialSection = "activity", showClose = false, onClose, onUpdated, onActivityUpdated }: {
+export function PartnerSettingsDialog({ partner, partners, directory, snapshot, controller, ownerKey, t, initialSection = "activity", initialPrivateThreadId, showClose = false, onClose, onUpdated, onActivityUpdated }: {
   readonly partner: PartnerProfileView;
   readonly partners: readonly PartnerProfileView[];
   readonly directory: PartnerDirectoryView;
@@ -400,6 +400,7 @@ export function PartnerSettingsDialog({ partner, partners, directory, snapshot, 
   readonly ownerKey: string;
   readonly t: Translator;
   readonly initialSection?: "profile" | "activity";
+  readonly initialPrivateThreadId?: string;
   readonly showClose?: boolean;
   readonly onClose: () => void;
   readonly onUpdated: (result: PartnerMutationView) => void;
@@ -414,6 +415,7 @@ export function PartnerSettingsDialog({ partner, partners, directory, snapshot, 
   const [saveError, setSaveError] = useState<string>();
   const [conflict, setConflict] = useState(false);
   const [section, setSection] = useState<"profile" | "activity">(initialSection);
+  useEffect(() => setSection(initialSection), [initialSection]);
   const tabsId = useId();
   const ownerRef = useRef(ownerKey);
   ownerRef.current = ownerKey;
@@ -487,7 +489,7 @@ export function PartnerSettingsDialog({ partner, partners, directory, snapshot, 
       <label className="check-row"><CheckboxControl checked={draft.usesDirectoryDefaults} disabled={directory.defaultCapabilities === undefined} onChange={(event) => setDraft((current) => ({ ...current, usesDirectoryDefaults: event.target.checked, capabilities: event.target.checked ? directory.defaultCapabilities ?? current.capabilities : current.capabilities }))} /><span><strong>{t("partners.useDefaults")}</strong><small>{directory.defaultCapabilities === undefined ? t("partners.defaultsMissing") : t("partners.useDefaultsHelp")}</small></span></label>
       {!draft.usesDirectoryDefaults && <CapabilitiesEditor value={draft.capabilities} snapshot={snapshot} disabled={saving} t={t} onChange={(capabilities) => setDraft((current) => ({ ...current, capabilities }))} />}
       <div className="partner-editor__footer"><span>{t("partners.updatedAt", { time: new Date(baseline.updatedAt).toLocaleString() })}</span>{baseline.canonicalSessionId !== undefined && <Button onClick={() => controller.navigate({ kind: "session", sessionId: baseline.canonicalSessionId })}><MessageSquare aria-hidden="true" />{t("partners.openTask")}</Button>}</div>
-      </div> : <div id={`${tabsId}-activity-panel`} role="tabpanel" aria-labelledby={`${tabsId}-activity-tab`}><PartnerActivityPanel partner={partner} partners={partners} controller={controller} ownerKey={ownerKey} t={t} onPartnerUpdated={onActivityUpdated} /></div>}
+      </div> : <div id={`${tabsId}-activity-panel`} role="tabpanel" aria-labelledby={`${tabsId}-activity-tab`}><PartnerActivityPanel key={initialPrivateThreadId ?? "activity"} partner={partner} partners={partners} controller={controller} ownerKey={ownerKey} t={t} initialThreadId={initialPrivateThreadId} onPartnerUpdated={onActivityUpdated} /></div>}
     </div>
   </Modal>;
 }
@@ -506,18 +508,19 @@ interface PartnerActivityData {
   readonly artifactFailures: number;
 }
 
-function PartnerActivityPanel({ partner, partners, controller, ownerKey, t, onPartnerUpdated }: {
+function PartnerActivityPanel({ partner, partners, controller, ownerKey, t, initialThreadId, onPartnerUpdated }: {
   readonly partner: PartnerProfileView;
   readonly partners: readonly PartnerProfileView[];
   readonly controller: AppController;
   readonly ownerKey: string;
   readonly t: Translator;
+  readonly initialThreadId?: string;
   readonly onPartnerUpdated: (partner: PartnerProfileView) => void;
 }): JSX.Element {
   const [data, setData] = useState<PartnerActivityData>();
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string>();
-  const [selectedThreadId, setSelectedThreadId] = useState<string>();
+  const [selectedThreadId, setSelectedThreadId] = useState(initialThreadId);
   const [threadDetail, setThreadDetail] = useState<PartnerPrivateThreadDetailView>();
   const [threadLoading, setThreadLoading] = useState(false);
   const [threadError, setThreadError] = useState<string>();
@@ -569,9 +572,9 @@ function PartnerActivityPanel({ partner, partners, controller, ownerKey, t, onPa
         artifactFailures: artifactGroups.filter((group) => group.artifacts === undefined).length
       };
       setData(next);
-      setSelectedThreadId((current) => current !== undefined && threads.some((thread) => thread.id === current)
+      setSelectedThreadId((current) => current !== undefined && (current === initialThreadId || threads.some((thread) => thread.id === current))
         ? current
-        : threads[0]?.id);
+        : initialThreadId ?? threads[0]?.id);
       onPartnerUpdated(profile);
     }).catch((caught: unknown) => {
       if (externalSignal?.aborted === true || request !== requestRef.current || expectedOwner !== ownerRef.current) return;
@@ -721,7 +724,7 @@ function PartnerActivityPanel({ partner, partners, controller, ownerKey, t, onPa
 
     <section className="partner-activity__section" aria-labelledby="partner-private-heading">
       <header><div><h3 id="partner-private-heading">{t("partners.privateConversations")}</h3><p>{t("partners.privateConversationsBody")}</p></div></header>
-      {data.threads.length === 0 ? <p className="partner-activity__empty">{t("partners.noPrivateConversations")}</p> : <div className="partner-private-layout">
+      {data.threads.length === 0 && initialThreadId === undefined ? <p className="partner-activity__empty">{t("partners.noPrivateConversations")}</p> : <div className="partner-private-layout">
         <div className="partner-private-list" role="list">{data.threads.map((thread) => {
           const other = partnerById(partners, thread.firstPartnerId === partner.id ? thread.secondPartnerId : thread.firstPartnerId);
           return <button type="button" role="listitem" key={thread.id} className={cx(selectedThreadId === thread.id && "is-selected")} onClick={() => setSelectedThreadId(thread.id)}>

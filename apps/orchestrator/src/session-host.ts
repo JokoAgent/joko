@@ -30,6 +30,7 @@ import type {
   MessageAutomationOrigin,
   MessageBlock,
   MessageInputDelivery,
+  PartnerPrivateMessageOrigin,
   PermissionMode,
   PromptInput,
   ProviderModel,
@@ -660,6 +661,8 @@ export interface EnqueueServiceInput {
   readonly parentRunId?: string;
   /** Durable non-secret ownership fence for cross-Session helper messages. */
   readonly originSessionId?: string;
+  /** Trusted Partner service authority, persisted on the admitting Operation. */
+  readonly partnerPrivateOrigin?: PartnerPrivateMessageOrigin;
   readonly overrides?: TurnExecutionOverrides;
   /** Runs inside the same Store transaction after Queue admission and before
    * dispatch can start. Trusted service owners use this to bind their durable
@@ -2459,6 +2462,12 @@ export class SessionHost {
       const origin = this.#store.getSession(input.originSessionId).descriptor;
       if (origin.deletedAt !== undefined) throw new StoreError("The origin task is deleted.");
     }
+    if (input.partnerPrivateOrigin !== undefined) {
+      if (input.source !== "system" || input.originSessionId === undefined || input.originSessionId === input.sessionId) {
+        throw new StoreError("Private message provenance requires a trusted system handoff between two tasks.");
+      }
+      readPartnerPrivateOrigin(input.partnerPrivateOrigin);
+    }
     this.assertSessionNotPendingScheduleDeletion(input.sessionId);
     this.assertMessageDeletionAdmission(input.sessionId);
     this.validateTurnOverrides(input.sessionId, input.overrides);
@@ -2476,6 +2485,7 @@ export class SessionHost {
           source: input.source,
           ...(input.parentRunId === undefined ? {} : { parentRunId: input.parentRunId }),
           ...(input.originSessionId === undefined ? {} : { originSessionId: input.originSessionId }),
+          ...(input.partnerPrivateOrigin === undefined ? {} : { partnerPrivateOrigin: input.partnerPrivateOrigin }),
           ...(input.overrides === undefined ? {} : { overrides: input.overrides })
         }
       },
@@ -13382,6 +13392,7 @@ export class SessionHost {
       readonly objectiveContinuation: Extract<EventPayload, { readonly type: "message_complete" }>["objectiveContinuation"];
     };
     const acceptedUserMetadata = new Map<string, AcceptedUserMetadata>();
+    const privateMessageMetadata = new Map<string, PartnerPrivateMessageOrigin>();
     const acceptedQueueInputs = new Map<string, QueueItemRecord>();
     const nativeIdentityAdapter = adapter as BackendAdapter & {
       readonly nativeUserEntryIdForOperation?: (operationId: string) => string;
@@ -13401,6 +13412,11 @@ export class SessionHost {
       }
     }
     visitVisibleSessionEvents(store, session.id, (event) => {
+      const privateEntryId = nativeHistoryEventContext(event.payload)?.identity?.entryId;
+      if (event.payload.type === "message_complete" && event.payload.partnerPrivateOrigin !== undefined
+        && privateEntryId !== undefined && event.metadata?.fields[NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD] === bindingFingerprint) {
+        privateMessageMetadata.set(privateEntryId, event.payload.partnerPrivateOrigin);
+      }
       if (
         event.payload.type === "message_complete"
         && event.payload.role === "user"
@@ -13454,7 +13470,7 @@ export class SessionHost {
           blocks: promptInputMessageBlocks(queueItem.body)
         }, session.id, queueItem.runId);
       }
-      const payload = canonicalQueuePayload ?? (acceptedMetadata === undefined
+      const projectedPayload = canonicalQueuePayload ?? (acceptedMetadata === undefined
         ? projection.payload
         : {
             ...projection.payload,
@@ -13473,6 +13489,10 @@ export class SessionHost {
               ? {}
               : { objectiveContinuation: acceptedMetadata.objectiveContinuation })
           });
+      const privateOrigin = projectionEntryId === undefined ? undefined : privateMessageMetadata.get(projectionEntryId);
+      const payload = projectedPayload.type === "message_complete" && privateOrigin !== undefined
+        ? { ...projectedPayload, partnerPrivateOrigin: privateOrigin }
+        : projectedPayload;
       store.appendEventIfAbsent({
         id: projection.id,
         ...(projection.emittedAt === undefined ? {} : { emittedAt: projection.emittedAt }),
@@ -13549,10 +13569,15 @@ export class SessionHost {
     sessionId: string,
     runId?: string
   ): EventPayload {
-    if (payload.type !== "message_complete" || payload.role !== "user" || runId === undefined) return payload;
+    if (payload.type !== "message_complete") return payload;
+    const { partnerPrivateOrigin: _untrustedPrivateOrigin, ...messagePayload } = payload;
+    if (runId === undefined) return messagePayload;
     const queued = this.#store.findQueueItemByRunId(sessionId, runId);
-    if (queued === undefined) return payload;
+    if (queued === undefined) return messagePayload;
     const operation = this.#store.findOperation(queued.operationId);
+    const privateOrigin = this.privateServiceInputOrigin(sessionId, queued.operationId).partnerPrivateOrigin;
+    const ownedPayload = { ...messagePayload, ...(privateOrigin === undefined ? {} : { partnerPrivateOrigin: privateOrigin }) };
+    if (payload.role !== "user") return ownedPayload;
     const operationBody = operation?.kind === "schedule_dispatch" && isRecord(operation.body)
       ? operation.body
       : undefined;
@@ -13571,7 +13596,7 @@ export class SessionHost {
       quotesEncoded: _legacyQuotesEncoded,
       pastedTextRanges: _legacyPastedTextRanges,
       ...nativePayload
-    } = payload as typeof payload & {
+    } = ownedPayload as typeof ownedPayload & {
       readonly quotesEncoded?: unknown;
       readonly pastedTextRanges?: unknown;
     };
@@ -13601,6 +13626,17 @@ export class SessionHost {
       recovery: "Refresh Backend status or select another available instance."
     });
     return adapter;
+  }
+
+  private privateServiceInputOrigin(sessionId: string, operationId: string): Pick<EnqueueServiceInput, "partnerPrivateOrigin" | "originSessionId"> {
+    const operation = this.#store.findOperation(operationId);
+    if (operation?.kind !== "service_send_input" || !isRecord(operation.body)
+      || operation.body["source"] !== "system" || operation.body["sessionId"] !== sessionId) return {};
+    const partnerPrivateOrigin = readPartnerPrivateOrigin(operation.body["partnerPrivateOrigin"]);
+    if (partnerPrivateOrigin === undefined) return {};
+    const originSessionId = operation.body["originSessionId"];
+    if (typeof originSessionId !== "string" || originSessionId.trim() === "" || originSessionId === sessionId) throw new StoreError("Private message origin task is invalid.");
+    return { partnerPrivateOrigin, originSessionId };
   }
 
   private requireAdapterGeneration(backendId: string, adapter: BackendAdapter): number {
@@ -14091,6 +14127,21 @@ interface ArtifactSourceAuthoritySnapshot {
   readonly fingerprint: string;
 }
 
+function readPartnerPrivateOrigin(value: unknown): PartnerPrivateMessageOrigin | undefined {
+  if (value === undefined) return undefined;
+  const fields = ["messageId", "threadId", "senderPartnerId", "recipientPartnerId", "senderDisplayName"] as const;
+  if (!isRecord(value) || Object.keys(value).some((key) => !fields.includes(key as typeof fields[number]))
+    || fields.some((key) => typeof value[key] !== "string" || value[key].trim() === "" || value[key].length > 256)
+    || value["senderPartnerId"] === value["recipientPartnerId"]) {
+    throw new StoreError("Private message provenance is invalid.");
+  }
+  return {
+    messageId: value["messageId"] as string, threadId: value["threadId"] as string,
+    senderPartnerId: value["senderPartnerId"] as string, recipientPartnerId: value["recipientPartnerId"] as string,
+    senderDisplayName: value["senderDisplayName"] as string
+  };
+}
+
 function promptInputMessageBlocks(input: PromptInput): readonly MessageBlock[] {
   const blocks: MessageBlock[] = [];
   if (input.text.length > 0) blocks.push({ kind: "text", text: input.text });
@@ -14187,6 +14238,7 @@ function userMessageClassifier(
     if (
       event.payload.automaticContinuation === undefined
       && event.payload.objectiveContinuation === undefined
+      && event.payload.partnerPrivateOrigin === undefined
       && (disposition === undefined || disposition === "prompt")
     ) continue;
     hiddenEventIds.add(event.id);
@@ -15754,6 +15806,7 @@ function sessionReferenceMessage(
   if (event.payload.type !== "message_complete"
     || event.payload.automaticContinuation !== undefined
     || event.payload.objectiveContinuation !== undefined
+    || event.payload.role === "user" && event.payload.partnerPrivateOrigin !== undefined
     || (event.payload.role !== "user" && event.payload.role !== "assistant")) return undefined;
   const acceptedText = event.payload.role === "user" ? event.payload.acceptedInput?.text : undefined;
   const text = acceptedText !== undefined && acceptedText.trim() !== ""

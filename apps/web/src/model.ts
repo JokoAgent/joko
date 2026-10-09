@@ -1397,6 +1397,8 @@ export interface TimelineItemView {
   /** Terminal outcome carried only by durable run-terminal timeline events. */
   readonly runTerminal?: "completed" | "aborted" | "failed";
   readonly sequence: bigint;
+  /** Global cursor of authoritative message completion, independent of sort position. */
+  readonly completionCursor?: bigint;
   readonly kind:
     | "user"
     | "assistant"
@@ -1443,6 +1445,13 @@ export interface TimelineItemView {
   readonly usage?: TimelineMessageUsageView;
   /** Durable host-authored identity for a scheduler-injected user prompt. */
   readonly automationOrigin?: TimelineAutomationOriginView;
+  readonly partnerPrivateOrigin?: {
+    readonly messageId: string;
+    readonly threadId: string;
+    readonly senderPartnerId: string;
+    readonly recipientPartnerId: string;
+    readonly senderDisplayName: string;
+  };
   /** Typed accepted-input semantics; absent only for untyped imported history. */
   readonly inputDelivery?: DeliveryMode | "scheduler";
   /** Service-owned continuation prompt; hidden in favor of its recovery activity row. */

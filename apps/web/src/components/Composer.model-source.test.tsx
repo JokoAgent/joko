@@ -7,11 +7,12 @@ import type { AppController } from "../controller.js";
 import { composerDocumentPlainText, plainTextToComposerDocument } from "../composer-quote-document.js";
 import { dispatchGamepadOwnedAction } from "../gamepad-actions.js";
 import { DEFAULT_UI_PREFERENCES } from "../local-state.js";
-import { emptySnapshot, type BackendView, type ModelView, type ProviderRuntimeView, type SessionView } from "../model.js";
+import { emptySnapshot, type BackendView, type ModelView, type PartnerProfileView, type ProviderRuntimeView, type SessionView } from "../model.js";
 import { Composer } from "./Composer.js";
+import { PartnerConversationProvider } from "./PartnerConversation.js";
 
 vi.mock("./ComposerRichTextEditor.js", () => ({
-  ComposerRichTextEditor: ({ document }: { document: JSONContent }) => <textarea aria-label="Draft" readOnly value={composerDocumentPlainText(document)} />
+  ComposerRichTextEditor: ({ document, placeholder }: { document: JSONContent; placeholder: string }) => <textarea aria-label="Draft" placeholder={placeholder} readOnly value={composerDocumentPlainText(document)} />
 }));
 const roots: Root[] = [];
 const model: ModelView = {
@@ -38,6 +39,23 @@ afterEach(async () => {
 });
 
 describe("Composer model authorization", () => {
+  it("keeps canonical Partner input, draft and Stop while profile settings own runtime and workspace controls", async () => {
+    const partnerProfile: PartnerProfileView = { id: "partner", canonicalSessionId: session.id, homeTargetId: session.targetId, displayName: "Aster", avatar: "orbit",
+      revision: 1n, profileVersion: 1n, lifecycle: "active", initializationState: "ready", invitationStage: "ready", identitySource: "Aster", templateId: "general",
+      capabilities: { modelChain: [{ backendId: model.backendId, providerId: model.providerId, modelId: model.modelId, fastMode: false }], permissionMode: "ask", planMode: false },
+      usesDirectoryDefaults: false, createdAt: 1, updatedAt: 1, activity: { partnerId: "partner", readThroughCursor: 0n, readUpdatedAt: 0, unreadReplyCount: 0, artifactCount: 0, activeDelegationCount: 0 } };
+    const view = await mount(partnerProfile);
+    const editor = view.host.querySelector("textarea");
+    expect(editor?.getAttribute("placeholder")).toBe("partners.messagePlaceholder");
+    expect(view.host.querySelector(".composer-statusbar")).toBeNull();
+    expect(view.host.querySelector("[data-runtime-controls]")).toBeNull();
+    expect(view.draft()).toBe("Keep this draft");
+    expect(view.send().disabled).toBe(false);
+    await view.render([provider], { ...session, state: "running", activeRunId: "run-one" });
+    expect(view.host.querySelector("textarea")).toBe(editor);
+    expect(view.draft()).toBe("Keep this draft");
+    expect(view.host.querySelector("[aria-label='common.stop']")).not.toBeNull();
+  });
   it("routes gamepad commands through the live composer, preserves attachment policy, and sends a draft only once", async () => {
     const view = await mount();
     view.host.className = "new-task-page";
@@ -184,22 +202,28 @@ describe("Composer model authorization", () => {
   });
 });
 
-async function mount() {
+async function mount(partnerProfile?: PartnerProfileView) {
   const initial = emptySnapshot();
   const api = { state: { connectionState: "connected", snapshot: { ...initial, providers: [provider] }, preferences: DEFAULT_UI_PREFERENCES },
     readDraft: vi.fn(async () => ({ text: "Keep this draft" })),
     readDraftSnapshot: vi.fn(async () => ({ revision: 1, draft: { text: "Keep this draft", attachments: [], mentions: [], deliveryMode: "prompt" as const } })),
     saveDraft: vi.fn(async () => undefined), send: vi.fn(async () => undefined),
-    getVoiceInputCapabilities: vi.fn(async () => ({}))
+    getVoiceInputCapabilities: vi.fn(async () => ({})),
+    listPartners: vi.fn(async () => ({ partners: partnerProfile === undefined ? [] : [partnerProfile], directory: { revision: 1n, activeCount: 1, archivedCount: 0, errorCount: 0, updatedAt: 1, templates: [], avatarPresets: ["orbit"] } })),
+    listPartnerSessions: vi.fn(async () => [{ partnerId: "partner", sessionId: session.id, role: "canonical", available: true, deleted: false, profileVersion: 1n }])
   } as unknown as AppController;
   const host = document.body.appendChild(document.createElement("div"));
   const root = createRoot(host); roots.push(root);
   const actions: Promise<unknown>[] = []; const stop = vi.fn();
-  const render = async (providers: readonly ProviderRuntimeView[], currentSession = session, currentBackend = backend, readOnly = false, rejectedFirstInputRecovery?: AppController["state"]["rejectedFirstInputRecovery"], connectionState: AppController["state"]["connectionState"] = "connected") => act(async () => root.render(<Composer
-    controller={{ ...api, state: { ...api.state, connectionState, snapshot: { ...api.state.snapshot, providers }, ...(rejectedFirstInputRecovery === undefined ? {} : { rejectedFirstInputRecovery }) } }} session={currentSession} backend={currentBackend}
+  const render = async (providers: readonly ProviderRuntimeView[], currentSession = session, currentBackend = backend, readOnly = false, rejectedFirstInputRecovery?: AppController["state"]["rejectedFirstInputRecovery"], connectionState: AppController["state"]["connectionState"] = "connected") => act(async () => {
+    const controller: AppController = { ...api, state: { ...api.state, ready: true, connectionState, snapshot: { ...api.state.snapshot, providers }, ...(rejectedFirstInputRecovery === undefined ? {} : { rejectedFirstInputRecovery }) } };
+    const content = <Composer controller={controller} session={currentSession} backend={currentBackend}
     readOnly={readOnly}
     autoFocus={false} queue={[]} extraDirectories={[]} resources={[]} commands={[]} messageHistory={[]}
-    t={(key) => key} runAction={(_key, action) => { actions.push(action().catch(() => undefined)); }} onLocalSend={() => undefined} onStop={stop} />));
+    controls={<span data-runtime-controls>Runtime controls</span>}
+    t={(key) => key} runAction={(_key, action) => { actions.push(action().catch(() => undefined)); }} onLocalSend={() => undefined} onStop={stop} />;
+    root.render(partnerProfile === undefined ? content : <PartnerConversationProvider controller={controller} session={currentSession} active t={(key) => key}>{content}</PartnerConversationProvider>);
+  });
   await render([provider]);
   return { api, host, render, actions, stop,
     send: () => host.querySelector<HTMLButtonElement>('.send-button')!, draft: () => host.querySelector<HTMLTextAreaElement>('textarea')!.value };

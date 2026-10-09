@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AppController } from "../controller.js";
 import { emptySnapshot, type PartnerListView, type PartnerProfileView, type PartnerSessionView, type SessionView } from "../model.js";
 import { PartnerConversationHeader } from "./PartnerConversationHeader.js";
+import { PartnerConversationProvider } from "./PartnerConversation.js";
 
 const roots: Root[] = [];
 beforeEach(() => vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true));
@@ -170,9 +171,9 @@ async function mount(app: AppController, initialSession = session()) {
   const host = document.body.appendChild(document.createElement("main"));
   const root = createRoot(host); roots.push(root);
   const render = async (current: AppController, task = initialSession): Promise<void> => act(async () => {
-    root.render(<><PartnerConversationHeader controller={current} session={task} navigationOpen onOpenNavigation={() => undefined} t={translate}>
+    root.render(<PartnerConversationProvider controller={current} session={task} active t={translate}><PartnerConversationHeader session={task} navigationOpen onOpenNavigation={() => undefined} t={translate}>
       <header data-task-controls>Rename · Pin · Archive · Export</header>
-    </PartnerConversationHeader><input data-composer /></>);
+    </PartnerConversationHeader><input data-composer /></PartnerConversationProvider>);
     await settle();
   });
   await render(app);

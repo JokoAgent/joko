@@ -21,6 +21,7 @@ import type { ComposerSendShortcutPreference } from "../local-state.js";
 import { modelSourceAccess } from "../model-source-access.js";
 import { remapComposerInlineMentionReplacement } from "../composer-mention-ranges.js";
 import { ModelSourceNotice } from "./ModelSourceNotice.js";
+import { usePartnerConversation } from "./PartnerConversation.js";
 import type { ArtifactReferenceCatalogItemView, AttachmentDraft, BackendView, BrowserCommentDraftItem, ComposerDraft, ComposerMentionDraft, ComposerMessageMentionDraft, ComposerSelectionQuoteDraft, DeliveryMode, ExtraDirectoryView, QueueControlView, QueueItemView, RuntimeCommandView, SessionResourceView, SessionView, UsageTokensView, WorkspaceView } from "../model.js";
 import { browserCommentPreviewTag, removeBrowserCommentAndRepairChains } from "../browser-comment-draft.js";
 import { mergeRejectedComposerDraft } from "../composer-draft-recovery.js";
@@ -130,6 +131,8 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
   readonly onCompact?: () => void;
 }): JSX.Element {
   const [text, setText] = useState("");
+  const partnerConversation = usePartnerConversation();
+  const partnerPresentation = partnerConversation !== undefined && partnerConversation.kind !== "task";
   const [gamepadSkillError, setGamepadSkillError] = useState<string>();
   const [editorDocument, setEditorDocument] = useState<JSONContent>(emptyComposerDocument);
   const [attachments, setAttachments] = useState<readonly AttachmentDraft[]>([]);
@@ -477,7 +480,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
   });
   const voiceUpdate = voice.update;
   const voiceActive = voice.active;
-  const composerLocked = readOnly || submissionKind !== undefined || voiceActive;
+  const composerLocked = readOnly || partnerConversation !== undefined && !partnerConversation.confirmed || submissionKind !== undefined || voiceActive;
   const composerEditorLocked = readOnly || (submissionKind !== undefined && submissionKind !== "send") || voiceActive;
   const cancelVoiceInput = voice.cancel;
   const stopVoiceInput = (): void => { void voice.finish(); };
@@ -2553,7 +2556,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
             document={editorDocument}
             editable={!composerEditorLocked}
             disabled={!effectiveBashMode && supportedModes.length === 0}
-            placeholder={effectiveBashMode ? t("composer.shellPlaceholder") : supportedModes.length === 0 ? t("composer.inputUnavailable") : t("composer.placeholder")}
+            placeholder={effectiveBashMode ? t("composer.shellPlaceholder") : supportedModes.length === 0 ? t("composer.inputUnavailable") : partnerConversation?.partner === undefined ? t("composer.placeholder") : t("partners.messagePlaceholder", { name: partnerConversation.partner.displayName })}
             onDocumentChange={updateDocument}
             onKeyDown={(event, activeDocument) => {
               if (captureTypedCommandKey(event)) return true;
@@ -2692,7 +2695,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
             {effectiveBashMode && <label className="composer__bash-option"><CheckboxControl checked={shellDraft?.excludeFromContext ?? bashExcluded} disabled={composerLocked || shellDraft?.prefix === "exclude"} onChange={(event) => setBashExcluded(event.target.checked)} />{t("composer.shellExclude")}</label>}
             {saved && <span className="draft-saved" role="status"><CircleCheck aria-hidden="true" />{t("composer.saved")}</span>}
           </div>
-          {!effectiveBashMode && controls}
+          {!effectiveBashMode && !partnerPresentation && controls}
           <div className="composer__send">
             {!effectiveBashMode && showSecondaryStop && <ComposerStopButton label={t("common.stop")} disabled={stopInFlight} onStop={onStop} />}
             {!effectiveBashMode && supportedModes.length > 1 && (
@@ -2729,7 +2732,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
           </div>
         </div>
       </div>
-      <div className="composer-statusbar">
+      {!partnerPresentation && <div className="composer-statusbar">
         <span className="composer-statusbar__workspace" title={workspace?.serverPath}>{workspace?.serverPath ?? ""}</span>
         <SessionUsageChip
           usage={sessionUsage}
@@ -2738,7 +2741,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
           t={t}
         />
         <ContextCapacityRing context={session.context} modelContextWindow={session.model?.contextWindow} onCompact={onCompact} t={t} />
-      </div>
+      </div>}
     </div>
     <ComposerPastedTextDialog
       target={pastedTextTarget}

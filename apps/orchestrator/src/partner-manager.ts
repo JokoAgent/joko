@@ -247,7 +247,8 @@ export class PartnerManager {
       for (;;) {
         const page = this.#operationalStore.listEvents({ sessionId, afterCursor, limit: 1_000 });
         for (const event of page) {
-          if (event.payload.type === "message_complete" && event.payload.role === "assistant") {
+          if (event.payload.type === "message_complete" && event.payload.role === "assistant"
+            && event.payload.partnerPrivateOrigin === undefined) {
             unreadReplyCount += 1;
             latestReply = event;
           }
@@ -255,7 +256,7 @@ export class PartnerManager {
         if (page.length < 1_000) break;
         afterCursor = page.at(-1)!.globalCursor;
       }
-      if (latestReply === undefined) latestReply = this.#latestAssistantReply(sessionId);
+      if (latestReply === undefined) latestReply = this.#latestAssistantReply(sessionId, true);
     }
     const artifactCount = this.#store.listSessionLinks(partner.id)
       .reduce((count, link) => count + this.#operationalStore.countArtifacts({ sessionId: link.sessionId }), 0);
@@ -590,7 +591,12 @@ export class PartnerManager {
       sessionId: message.recipientSessionId,
       prompt: servicePrompt(prompt),
       source: "system",
-      originSessionId: message.senderSessionId
+      originSessionId: message.senderSessionId,
+      partnerPrivateOrigin: {
+        messageId: message.id, threadId: message.threadId,
+        senderPartnerId: message.senderPartnerId, recipientPartnerId: message.recipientPartnerId,
+        senderDisplayName: sender.displayName
+      }
     });
     return this.#store.markPrivateMessageDelivered(message.id, execution.value.runId);
   }
@@ -741,7 +747,7 @@ export class PartnerManager {
     return text || "The delegated task completed without a text summary.";
   }
 
-  #latestAssistantReply(sessionId: string): PersistedEvent | undefined {
+  #latestAssistantReply(sessionId: string, publicOnly = false): PersistedEvent | undefined {
     let beforeCursor: bigint | undefined;
     for (;;) {
       const page = this.#operationalStore.listEvents({
@@ -751,7 +757,8 @@ export class PartnerManager {
         limit: 1_000
       });
       const reply = page.find((event) =>
-        event.payload.type === "message_complete" && event.payload.role === "assistant");
+        event.payload.type === "message_complete" && event.payload.role === "assistant"
+        && (!publicOnly || event.payload.partnerPrivateOrigin === undefined));
       if (reply !== undefined || page.length < 1_000) return reply;
       beforeCursor = page.at(-1)!.globalCursor;
     }

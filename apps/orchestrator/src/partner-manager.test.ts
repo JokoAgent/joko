@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { FakeBackendAdapter, PI_LIKE_PROFILE } from "@joko/testkit";
+import type { AdapterContext, PromptInput } from "@joko/core";
 import {
   OperationalStore,
   PartnerStore,
@@ -40,6 +41,21 @@ const EFFORTLESS_PARTNER_PROFILE = {
 class OffSentinelFakeBackendAdapter extends FakeBackendAdapter {
   override async inspectSession(...args: Parameters<FakeBackendAdapter["inspectSession"]>) {
     return { ...await super.inspectSession(...args), effort: "off" };
+  }
+}
+
+class UserEchoFakeBackendAdapter extends FakeBackendAdapter {
+  override async send(input: PromptInput, context: AdapterContext): Promise<void> {
+    await context.emit({ type: "message_complete", role: "user", blocks: [{ kind: "text", text: input.text }] });
+    await super.send(input, context);
+  }
+}
+
+class PrivateOriginSpoofAdapter extends UserEchoFakeBackendAdapter {
+  override async send(input: PromptInput, context: AdapterContext): Promise<void> {
+    await super.send(input, { ...context, emit: (payload, options) => context.emit(payload.type !== "message_complete" ? payload : {
+      ...payload, partnerPrivateOrigin: { messageId: "spoof", threadId: "spoof", senderPartnerId: "spoof-sender", recipientPartnerId: "spoof-recipient", senderDisplayName: "Spoof" }
+    }, options) });
   }
 }
 
@@ -309,7 +325,7 @@ describe("PartnerManager", () => {
   });
 
   it("delivers bounded private messages through canonical tasks and owns unread state", async () => {
-    const fixture = await createFixture();
+    const fixture = await createFixture(undefined, new UserEchoFakeBackendAdapter(PARTNER_PROFILE));
     const sender = await fixture.manager.createPartner(createInput(fixture.partnerStore, "Aster"));
     const recipient = await fixture.manager.createPartner(createInput(fixture.partnerStore, "Beryl"));
 
@@ -325,9 +341,20 @@ describe("PartnerManager", () => {
     });
     expect(delivered.reservation.remainingMessages).toBe(11);
 
-    await vi.waitFor(() => {
-      expect(fixture.manager.activity(recipient.id).unreadReplyCount).toBe(1);
-    });
+    await vi.waitFor(() => expect(fixture.operationalStore.listEvents({ sessionId: recipient.canonicalSessionId! })
+      .filter((event) => event.payload.type === "message_complete" && event.payload.role === "assistant")).toHaveLength(1));
+    const privateMessages = fixture.operationalStore.listEvents({ sessionId: recipient.canonicalSessionId! })
+      .filter((event) => event.payload.type === "message_complete");
+    expect(privateMessages).toHaveLength(2);
+    for (const event of privateMessages) expect(event.payload).toMatchObject({ partnerPrivateOrigin: {
+      messageId: delivered.message.id, threadId: delivered.reservation.thread.id,
+      senderPartnerId: sender.id, recipientPartnerId: recipient.id, senderDisplayName: "Aster"
+    } });
+    expect(fixture.manager.activity(recipient.id).unreadReplyCount).toBe(0);
+    expect(fixture.manager.activity(recipient.id).latestReplyCursor).toBeUndefined();
+    fixture.sessionHost.enqueueServiceInput({ operationId: "public-canonical-input", sessionId: recipient.canonicalSessionId!, source: "system",
+      prompt: { text: "A public canonical question", images: [], files: [], mentions: [], disposition: "prompt" } });
+    await vi.waitFor(() => expect(fixture.manager.activity(recipient.id).unreadReplyCount).toBe(1));
     const activity = fixture.manager.activity(recipient.id);
     expect(activity.latestReplyCursor).toBeDefined();
     expect(activity.artifactCount).toBe(0);
@@ -376,6 +403,18 @@ describe("PartnerManager", () => {
       })
     ]);
     expect(fixture.operationalStore.getOperation(reserved.message.operationId).status).toBe("completed");
+  });
+
+  it("strips Adapter-forged private provenance from accepted public input and its reply", async () => {
+    const fixture = await createFixture(undefined, new PrivateOriginSpoofAdapter(PARTNER_PROFILE));
+    const recipient = await fixture.manager.createPartner(createInput(fixture.partnerStore, "Beryl"));
+    fixture.sessionHost.enqueueServiceInput({ operationId: "public-spoof-test", sessionId: recipient.canonicalSessionId!, source: "system",
+      prompt: { text: "Public question", images: [], files: [], mentions: [], disposition: "prompt" } });
+    await vi.waitFor(() => expect(fixture.manager.activity(recipient.id).unreadReplyCount).toBe(1));
+    const events = fixture.operationalStore.listEvents({ sessionId: recipient.canonicalSessionId! });
+    const messages = events.filter((event) => event.payload.type === "message_complete");
+    expect(messages).toHaveLength(2);
+    for (const event of messages) if (event.payload.type === "message_complete") expect(event.payload.partnerPrivateOrigin).toBeUndefined();
   });
 
   it("recovers a persisted delegation into a distinct target-owned task", async () => {

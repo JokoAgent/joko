@@ -41,6 +41,20 @@ import {
 } from "./proto-mapper.js";
 
 describe("proto mapper", () => {
+  it.each(["user", "assistant"] as const)("round-trips Host-authored %s private provenance and independent global cursors", (role) => {
+    const partnerPrivateOrigin = { messageId: "private", threadId: "thread", senderPartnerId: "sender", recipientPartnerId: "recipient", senderDisplayName: "Sender" };
+    const event: PersistedEvent = { id: "private-event", sequence: 3n, globalCursor: 91n, revision: 3n, emittedAt: 1_000,
+      backendId: "backend", targetId: "target", sessionId: "session", generation: 1, traceId: "private-test", runId: "run",
+      payload: { type: "message_complete", role, blocks: [{ kind: "text", text: "Useful content" }], partnerPrivateOrigin } };
+    const proto = toProtoEvent(event);
+    expect(proto.identity?.sequence).toBe(3n);
+    expect(proto.cursor?.sequence).toBe(91n);
+    expect(fromProtoEvent(fromBinary(EventSchema, toBinary(EventSchema, proto))).payload).toMatchObject({ role, partnerPrivateOrigin });
+    if (proto.payload?.kind.case === "messageStarted" || proto.payload?.kind.case === "messageCompleted") {
+      proto.payload.kind.value.partnerPrivateOrigin!.senderPartnerId = "recipient";
+      expect(() => fromProtoEvent(proto)).toThrow(ProtoMappingError);
+    }
+  });
   it("maps every current workspace location explicitly and rejects an absent or unspecified kind", () => {
     expect(toProtoWorkspaceLocation(undefined).kind.case).toBe("serviceNode");
     expect(() => fromProtoWorkspaceLocation(undefined)).toThrow(/location and its kind are required/u);
