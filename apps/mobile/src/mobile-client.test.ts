@@ -86,6 +86,8 @@ import {
 import { createMobileAutomationDraft } from "./mobile-automation-authoring";
 import { parseMobileNativeIntent } from "./mobile-native-intent";
 import type { MobileExtension, MobileExtensionMainViewSurface } from "./mobile-extensions";
+import { mobilePartnerProfileDraft } from "./mobile-partner-profile";
+import { profilePartner, profileSnapshot } from "./test/mobile-partner-profile";
 import type {
   MobileExtensionLibraryLocationValidation,
   MobileExtensionLibraryOverview,
@@ -2708,6 +2710,46 @@ describe("mobile Extension catalog authority", () => {
 });
 
 describe("mobile Partner private authority", () => {
+  it("saves canonical profile settings with fresh CAS, confirms them and does not replay unknown updates", async () => {
+    const network = fakeNetwork();
+    let currentPartner = profilePartner; let directoryRevision = 4n;
+    network.readOwner = vi.fn(async () => ({ connection, device, snapshot: runtimeControlProjection() }));
+    network.readSession = vi.fn(async () => runtimeControlProjection(runtimeSession, true));
+    network.listPartnerCatalog = vi.fn(async () => ({ directory: { revision: directoryRevision, activeCount: 1,
+      archivedCount: 0, errorCount: 0, updatedAt: 2_000 }, partners: [currentPartner] }));
+    network.getPartnerProfileOptions = vi.fn(async () => ({ ...profileSnapshot.options, revision: directoryRevision }));
+    network.listPartners = vi.fn(async () => [{ ...currentPartner, profileVersion: Number(currentPartner.profileVersion) }]);
+    network.listSessionArtifacts = vi.fn(async () => ({ artifacts: [], revision: "edited-profile-artifacts" }));
+    network.listPartnerSessions = vi.fn(async () => create(ListPartnerSessionsResponseSchema, { sessions: [{
+      partnerId: currentPartner.partnerId, sessionId: "session", role: PartnerSessionRole.CANONICAL,
+      profileVersion: 1n, available: true, displayName: "Ada task", createdAt: { seconds: 1n }
+    }] }));
+    network.updatePartnerProfile = vi.fn(async (_credential, _partnerId, expectedRevision, draft) => {
+      expect(expectedRevision).toBe(currentPartner.revision);
+      currentPartner = { ...currentPartner, ...draft, revision: currentPartner.revision + 1n, profileVersion: currentPartner.profileVersion + 1n };
+      directoryRevision += 1n; return currentPartner;
+    });
+    const app = client(network, memoryStorage(credential).storage); await app.start(); await app.select("session");
+    const transport = app.partnerProfileTransport()!;
+    const initial = await transport.load(currentPartner, new AbortController().signal);
+    const draft = { ...mobilePartnerProfileDraft(currentPartner), displayName: "Ada Two" };
+    await expect(transport.save(initial, draft, new AbortController().signal)).resolves.toMatchObject({ displayName: "Ada Two", profileVersion: 4n });
+    expect(network.updatePartnerProfile).toHaveBeenCalledOnce();
+    await expect(app.partnerResourceTransport()!.preview("partner-a", new AbortController().signal)).resolves.toMatchObject({
+      partner: { displayName: "Ada Two", profileVersion: 4 }, session: { sessionId: "session", profileVersion: 4 }
+    });
+    await expect(transport.save(initial, draft, new AbortController().signal)).rejects.toThrow(/changed/u);
+    expect(network.updatePartnerProfile).toHaveBeenCalledOnce();
+    const fresh = await transport.load(currentPartner, new AbortController().signal);
+    vi.mocked(network.updatePartnerProfile).mockRejectedValueOnce(new Error("response lost"));
+    await expect(transport.save(fresh, { ...draft, displayName: "Ada Three" }, new AbortController().signal)).rejects.toThrow(/may have been applied/u);
+    expect(network.updatePartnerProfile).toHaveBeenCalledTimes(2);
+    expect(app.state.busy).toBe(false);
+    app.setForeground(false);
+    await expect(transport.save(fresh, draft, new AbortController().signal)).rejects.toThrow(/owner changed/u);
+    expect(network.updatePartnerProfile).toHaveBeenCalledTimes(2);
+  });
+
   it("opens a roster Partner only after exact profile and canonical Session revalidation", async () => {
     const network = fakeNetwork();
     const partner = {

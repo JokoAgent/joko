@@ -75,8 +75,11 @@ describe("mobile Partner Resource projection", () => {
     });
   });
 
-  it("rejects stale profile ownership and malformed or cross-task Artifacts", () => {
-    expect(() => projectMobilePartnerResourcePreview(partner, sessions(2n), {
+  it("accepts older canonical links but rejects future ownership and malformed or cross-task Artifacts", () => {
+    expect(projectMobilePartnerResourcePreview(partner, sessions(2n), {
+      artifacts: [], revision: "artifacts-r1"
+    }).session.profileVersion).toBe(3);
+    expect(() => projectMobilePartnerResourcePreview(partner, sessions(4n), {
       artifacts: [], revision: "artifacts-r1"
     })).toThrow(/canonical Session|Resource/u);
     expect(() => projectMobilePartnerResourcePreview(partner, sessions(), {

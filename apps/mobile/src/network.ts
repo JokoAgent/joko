@@ -3,7 +3,7 @@ import { createConnectTransport } from "@connectrpc/connect-web";
 import {
   ArtifactKind, ArtifactService, BlobDisposition, ConnectionService, DeviceKind, EventService, FileKind, ImageThumbnailUnavailableReason,
   MobilePushEnvironment as WireMobilePushEnvironment, MobilePushLocale as WireMobilePushLocale,
-  MobilePushProvider, OperationService, OperationState, PartnerService, RemoteDesktopService, ExtensionService,
+  MobilePushProvider, OperationService, OperationState, PartnerService, PermissionMode, RemoteDesktopService, ExtensionService,
   ExtensionLibraryLocationKind,
   ResourceKind, SchedulerService, SessionService, TargetService, VoiceInputService, SettingsService, CredentialService, CredentialKind,
   type VoiceInputServiceSettings, type TestVoiceInputConnectionResponse,
@@ -68,6 +68,9 @@ import {
   type MobilePartnerActivity,
   type MobilePartnerCatalog
 } from "./mobile-partner-directory";
+import { projectMobilePartnerProfileOptions, projectMobilePartnerProfileUpdate,
+  type MobilePartnerProfileDraft, type MobilePartnerProfileOptions } from "./mobile-partner-profile";
+import type { MobilePartnerDirectoryProfile } from "./mobile-partner-directory";
 import {
   collectMobileExtensionCatalog,
   projectMobileExtension,
@@ -198,6 +201,9 @@ export interface MobileNetwork {
     transfer: RemoteDesktopClipboardContentRequest, signal?: AbortSignal): Promise<RemoteDesktopClipboardContentResult>;
   listPartners(credential: PairedCredential, signal?: AbortSignal): Promise<readonly MobilePartner[]>;
   listPartnerCatalog?(credential: PairedCredential, signal?: AbortSignal): Promise<MobilePartnerCatalog>;
+  getPartnerProfileOptions?(credential: PairedCredential, signal?: AbortSignal): Promise<MobilePartnerProfileOptions>;
+  updatePartnerProfile?(credential: PairedCredential, partnerId: string, expectedRevision: bigint,
+    draft: MobilePartnerProfileDraft, signal?: AbortSignal): Promise<MobilePartnerDirectoryProfile>;
   markPartnerRead?(credential: PairedCredential, partnerId: string, throughCursor: bigint,
     signal?: AbortSignal): Promise<MobilePartnerActivity>;
   listPartnerSessions(credential: PairedCredential, partnerId: string, signal?: AbortSignal): Promise<ListPartnerSessionsResponse>;
@@ -1562,6 +1568,23 @@ export const mobileNetwork: MobileNetwork = {
     const response = await createClient(PartnerService, transport(credential.origin, credential.authKey))
       .markPartnerRead({ partnerId, throughCursor: { value: throughCursor } }, options(signal));
     return projectMobilePartnerReadResponse(partnerId, throughCursor, response);
+  },
+  async getPartnerProfileOptions(credential, signal) {
+    const response = await createClient(PartnerService, transport(credential.origin, credential.authKey))
+      .getPartnerDirectory({}, options(signal));
+    return projectMobilePartnerProfileOptions(response.directory);
+  },
+  async updatePartnerProfile(credential, partnerId, expectedRevision, draft, signal) {
+    if (!validMobilePartnerId(partnerId) || expectedRevision < 1n) throw new Error("Select a current Partner profile.");
+    const response = await createClient(PartnerService, transport(credential.origin, credential.authKey))
+      .updatePartner({ partnerId, expectedRevision: { value: expectedRevision }, patch: {
+        displayName: draft.displayName, avatar: draft.avatar, identitySource: draft.identitySource,
+        usesDirectoryDefaults: draft.usesDirectoryDefaults,
+        ...(draft.usesDirectoryDefaults ? {} : { modelChain: { routes: [...draft.capabilities.modelChain] },
+          permissionMode: draft.capabilities.permissionMode === "ask" ? PermissionMode.ASK : PermissionMode.AUTO,
+          planMode: draft.capabilities.planMode })
+      } }, options(signal));
+    return projectMobilePartnerProfileUpdate(partnerId, expectedRevision, response);
   },
   async listPartnerSessions(credential, partnerId, signal) {
     if (!validMobilePartnerId(partnerId)) throw new Error("A valid Partner is required.");

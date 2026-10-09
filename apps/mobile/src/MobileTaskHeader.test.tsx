@@ -47,6 +47,22 @@ vi.mock("react-native", async () => {
 vi.mock("react-native-safe-area-context", () => ({ useSafeAreaInsets: () => ({ top: 24, bottom: 16, left: 0, right: 0 }) }));
 vi.mock("./MobileDrawer", () => ({ useReducedMotion: () => false }));
 
+it("opens the same Partner profile from its identity and settings button", () => {
+  const container = document.createElement("div"); const root = createRoot(container); const open = vi.fn();
+  try {
+    act(() => root.render(createElement(MobileTaskHeader, {
+      title: "Ada", subtitle: "Joko node", navigationLabel: "Back", drawerNavigation: false, onNavigate: vi.fn(),
+      actions: [], disabled: false, locale: "en", onMenuVisibilityChange: vi.fn(),
+      identity: { mark: createElement("span", {}, "avatar"), label: "Ada", settingsLabel: "Open Ada settings", disabled: false, onOpen: open },
+      colors: { background: "#fff", surface: "#fff", ink: "#111", muted: "#666", border: "#ddd", negative: "#b00" }
+    })));
+    expect(container.querySelector('[role="header"]')?.textContent).toBe("Ada");
+    act(() => container.querySelector<HTMLButtonElement>('button[aria-label="Ada"]')!.click());
+    act(() => container.querySelector<HTMLButtonElement>('button[aria-label="Open Ada settings"]')!.click());
+    expect(open).toHaveBeenCalledTimes(2);
+  } finally { act(() => root.unmount()); }
+});
+
 it("keeps navigation and title in the header while task actions cancel, revalidate, and retire with their owner", () => {
   const container = document.createElement("div");
   const root = createRoot(container);

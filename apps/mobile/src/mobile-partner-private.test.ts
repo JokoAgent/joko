@@ -1,14 +1,14 @@
 import { create } from "@bufbuild/protobuf";
 import {
   GetPartnerPrivateThreadResponseSchema, ListPartnerPrivateThreadsResponseSchema,
-  ListPartnersResponseSchema, MarkPartnerPrivateThreadReadResponseSchema,
+  ListPartnersResponseSchema, ListPartnerSessionsResponseSchema, MarkPartnerPrivateThreadReadResponseSchema,
   PartnerInitializationState, PartnerLifecycle, PartnerPrivateMessageDeliveryStatus,
-  PartnerPrivateThreadStatus
+  PartnerPrivateThreadStatus, PartnerSessionRole
 } from "@joko/contracts";
 import { describe, expect, it } from "vitest";
 import {
   projectMobilePartners, projectMobilePrivateDetail, projectMobilePrivateReadResponse,
-  projectMobilePrivateThreads
+  projectMobilePrivateThreads, assertMobileCanonicalPartnerSession
 } from "./mobile-partner-private";
 
 const at = (seconds: bigint) => ({ seconds, nanos: 0 });
@@ -35,6 +35,27 @@ const messages = [{
 }];
 
 describe("mobile Partner private projections", () => {
+  it("keeps the immutable canonical link valid after profile edits but rejects future or unavailable links", () => {
+    const current = projectMobilePartners(create(ListPartnersResponseSchema, {
+      directory: { activeCount: 1 }, partners: [{ ...partner("partner-a", "session-a"), profileVersion: 4n }]
+    }))[0]!;
+    const response = create(ListPartnerSessionsResponseSchema, { sessions: [{
+      partnerId: "partner-a", sessionId: "session-a", role: PartnerSessionRole.CANONICAL,
+      profileVersion: 1n, available: true
+    }] });
+    expect(() => assertMobileCanonicalPartnerSession(current, "session-a", response)).not.toThrow();
+    for (const invalidVersion of [0n, 5n]) {
+      response.sessions[0]!.profileVersion = invalidVersion;
+      expect(() => assertMobileCanonicalPartnerSession(current, "session-a", response)).toThrow(/available/u);
+    }
+    response.sessions[0]!.profileVersion = 1n;
+    response.sessions[0]!.readOnly = true;
+    expect(() => assertMobileCanonicalPartnerSession(current, "session-a", response)).toThrow(/available/u);
+    response.sessions[0]!.readOnly = false;
+    response.sessions[0]!.partnerId = "partner-b";
+    expect(() => assertMobileCanonicalPartnerSession(current, "session-a", response)).toThrow(/available/u);
+  });
+
   it("accepts exact current-v1 participants, ordered live messages, safe sequences and read state", () => {
     const directory = create(ListPartnersResponseSchema, {
       directory: { activeCount: 2, archivedCount: 0 },

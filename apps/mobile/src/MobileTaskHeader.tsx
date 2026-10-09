@@ -13,7 +13,7 @@ export interface MobileTaskHeaderAction {
 }
 
 export function MobileTaskHeader({ title, subtitle, navigationLabel, navigationRef, drawerNavigation,
-  onNavigate, actions, titleAccessory, disabled, colors, locale, onMenuVisibilityChange }: {
+  onNavigate, actions, titleAccessory, identity, disabled, colors, locale, onMenuVisibilityChange }: {
   readonly title: string;
   readonly subtitle: string;
   readonly navigationLabel: string;
@@ -22,6 +22,8 @@ export function MobileTaskHeader({ title, subtitle, navigationLabel, navigationR
   readonly onNavigate: () => void;
   readonly actions: readonly MobileTaskHeaderAction[];
   readonly titleAccessory?: ReactNode;
+  readonly identity?: { readonly mark: ReactNode; readonly label: string; readonly settingsLabel: string;
+    readonly disabled: boolean; readonly onOpen: () => void };
   readonly disabled: boolean;
   readonly colors: { readonly background: string; readonly surface: string; readonly ink: string;
     readonly muted: string; readonly border: string; readonly negative: string };
@@ -53,11 +55,23 @@ export function MobileTaskHeader({ title, subtitle, navigationLabel, navigationR
           {drawerNavigation ? "☰" : "‹"}
         </Text>
       </Pressable>
-      <View style={styles.heading}>
+      {identity ? <Pressable accessibilityRole="button" accessibilityLabel={identity.label}
+        accessibilityHint={identity.settingsLabel} accessibilityState={{ disabled: identity.disabled }} disabled={identity.disabled}
+        onPress={identity.onOpen} style={[styles.heading, styles.identity]} testID="partner.header.identity">
+        {identity.mark}<View style={styles.heading}>
+          <Text accessibilityRole="header" numberOfLines={1} style={[styles.identityTitle, { color: colors.ink }]}>{title}</Text>
+          <Text numberOfLines={1} style={[styles.subtitle, { color: colors.muted }]}>{subtitle}</Text>
+        </View>
+      </Pressable> : <View style={styles.heading}>
         <View style={styles.titleRow}><Text accessibilityRole="header" numberOfLines={1} ellipsizeMode="tail"
           style={[styles.title, { color: colors.ink }]}>{title}</Text>{titleAccessory}</View>
         <Text numberOfLines={1} style={[styles.subtitle, { color: colors.muted }]}>{subtitle}</Text>
-      </View>
+      </View>}
+      {identity && <Pressable accessibilityRole="button" accessibilityLabel={identity.settingsLabel}
+        accessibilityState={{ disabled: identity.disabled }} disabled={identity.disabled} onPress={identity.onOpen}
+        style={[styles.iconButton, identity.disabled && styles.disabled]} testID="partner.header.settings">
+        <Text style={[styles.menuIcon, { color: colors.ink }]}>⚙</Text>
+      </Pressable>}
       <Pressable accessibilityRole="button" accessibilityLabel={mobileMessage(locale, "task.openActions")}
         accessibilityState={{ disabled, expanded: menuVisible }} disabled={disabled}
         onPress={() => { if (AppState.currentState === "active") setMenuVisible(true); }}
@@ -80,6 +94,8 @@ const styles = StyleSheet.create({
     gap: 8, borderBottomWidth: StyleSheet.hairlineWidth },
   iconButton: { width: 44, minHeight: 44, flexShrink: 0, alignItems: "center", justifyContent: "center", borderRadius: 22 },
   heading: { flex: 1, minWidth: 0 },
+  identity: { flexDirection: "row", alignItems: "center", gap: 10, minHeight: 44 },
+  identityTitle: { fontSize: 16, lineHeight: 22, fontWeight: "600" },
   titleRow: { minWidth: 0, flexDirection: "row", alignItems: "center", gap: 6 },
   title: { minWidth: 0, flexShrink: 1, fontSize: 17, lineHeight: 23, fontWeight: "700" },
   subtitle: { fontSize: 12, lineHeight: 17 },

@@ -288,6 +288,8 @@ import { MobileAutomationsScreen } from "./MobileAutomationsScreen";
 import { MobilePartnersScreen } from "./MobilePartnersScreen";
 import { MobilePartnerDirectoryScreen } from "./MobilePartnerDirectoryScreen";
 import { useMobilePartnerRead } from "./use-mobile-partner-read";
+import { MobilePartnerAvatar } from "./MobilePartnerAvatar";
+import { MobilePartnerProfileSheet } from "./MobilePartnerProfileSheet";
 import { MobilePartnerResourcesScreen } from "./MobilePartnerResourcesScreen";
 import { MobileExtensionsScreen } from "./MobileExtensionsScreen";
 import { MobileFilesToolbar } from "./MobileFilesToolbar";
@@ -3130,6 +3132,7 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
   const [selectedInteractionId, setSelectedInteractionId] = useState<string | undefined>(initialInteractions[0]?.interactionId);
   const [interactionVisible, setInteractionVisible] = useState(initialInteractions.length > 0);
   const [runtimeControlsVisible, setRuntimeControlsVisible] = useState(false);
+  const [partnerSettingsOwner, setPartnerSettingsOwner] = useState<string>();
   const [taskTagsVisible, setTaskTagsVisible] = useState(false);
   const [contextVisible, setContextVisible] = useState(false);
   const [nativeTreeVisible, setNativeTreeVisible] = useState(false);
@@ -3783,7 +3786,26 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
     setComposerSelection({ start: next.text.length, end: next.text.length });
     setDraftReady(true);
   }, [state.restoredComposerDraft]);
-  const composerOwnerReady = loadedDraftKey === draftIdentityKey && draftReady;
+  const partnerSettingsVisible = partnerSettingsOwner !== undefined && partnerSettingsOwner === partnerConversationTransport?.ownerKey;
+  const partnerRead = useMobilePartnerRead(partnerConversationTransport, state.window ?? taskTimelineEvents,
+    state.owner?.generation ?? 0n,
+    visiblePartnerRows.ownerKey === partnerConversationTransport?.ownerKey ? visiblePartnerRows.ids : new Set<string>(),
+    state.status === "connected" && !state.busy && !attachmentBusy && !fileShareBusy && !galleryOpening
+      && imageGallery.view === undefined && state.timelinePreview === undefined && queueEdit === undefined
+      && !conversationShare.busy && !conversationShare.active && !partnerSettingsVisible && !drawerOpen && !drawerMounted
+      && !messageActionsVisible && !taskActionsVisible && !interactionVisible && !contextVisible
+      && !cloneVisible && forkEventId === undefined && rewindEventId === undefined && !nativeTreeVisible
+      && !runtimeControlsVisible && !sessionMentionsVisible && !workspaceMentionsVisible && !catalogMentionsVisible
+      && photoLibraryLease === undefined && imageEditorLease === undefined && quoteSelection === undefined
+      && commandHelpItems === undefined && !runtimeCommandCommitting
+      && (session?.state === SessionState.IDLE || session?.state === SessionState.ERROR));
+  const partnerProfileTransport = client.partnerProfileTransport();
+  const openRuntimeControls = (): void => {
+    if (!partnerRead.ready) return;
+    if (partnerRead.partner && partnerProfileTransport) setPartnerSettingsOwner(partnerConversationTransport!.ownerKey);
+    else if (!partnerRead.partner) setRuntimeControlsVisible(true);
+  };
+  const composerOwnerReady = loadedDraftKey === draftIdentityKey && draftReady && partnerRead.ready && !partnerSettingsVisible;
   useEffect(() => {
     if (!composerOwnerReady || !focusComposer) return;
     const timer = setTimeout(() => {
@@ -3911,16 +3933,6 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
   const conversationShareDisabled = state.status !== "connected" || state.busy || attachmentBusy || voice.busy
     || fileShareBusy || galleryOpening || imageGallery.view !== undefined || state.timelinePreview !== undefined
     || queueEdit !== undefined || conversationShare.busy;
-  const partnerRead = useMobilePartnerRead(partnerConversationTransport, state.window ?? taskTimelineEvents,
-    state.owner?.generation ?? 0n,
-    visiblePartnerRows.ownerKey === partnerConversationTransport?.ownerKey ? visiblePartnerRows.ids : new Set<string>(),
-    !conversationShareDisabled && !conversationShare.active && !drawerOpen && !drawerMounted
-      && !messageActionsVisible && !taskActionsVisible && !interactionVisible && !contextVisible
-      && !cloneVisible && forkEventId === undefined && rewindEventId === undefined && !nativeTreeVisible
-      && !runtimeControlsVisible && !sessionMentionsVisible && !workspaceMentionsVisible && !catalogMentionsVisible
-      && photoLibraryLease === undefined && imageEditorLease === undefined && quoteSelection === undefined
-      && commandHelpItems === undefined && !runtimeCommandCommitting
-      && (session?.state === SessionState.IDLE || session?.state === SessionState.ERROR));
   const messageActionItems = messageAction
     ? buildMobileMessageActions(messageAction.row, {
       canDelete: client.canDeleteMessage(messageAction.row.eventId), locale, copyDisabled: copyBusy,
@@ -5444,7 +5456,12 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
       behavior={Platform.OS === "android" ? "height" : undefined}
       accessibilityElementsHidden={drawerMounted} importantForAccessibility={drawerMounted ? "no-hide-descendants" : "auto"}>
     <MobileTaskHeader key={`${state.activeProfileId}/${state.selectedId}/${session?.backendId}/${session?.targetId}/${session?.nativeBinding?.runtimeGeneration}`}
-      title={session?.displayName || mobileMessage(locale, "task.titleFallback")}
+      title={partnerRead.partner?.displayName ?? (partnerRead.ready ? session?.displayName || mobileMessage(locale, "task.titleFallback")
+        : mobileMessage(locale, "task.loading"))}
+      identity={partnerRead.partner ? { mark: <MobilePartnerAvatar preset={partnerRead.partner.avatar} colors={colors} size={32} />,
+        label: partnerRead.partner.displayName, settingsLabel: mobileMessage(locale, "partnerProfile.open", { name: partnerRead.partner.displayName }),
+        disabled: !partnerProfileTransport || state.busy || attachmentBusy || voice.busy,
+        onOpen: openRuntimeControls } : undefined}
       titleAccessory={<MobileTaskTagDots tags={session?.taskTags} locale={locale} dark={colors.dark} />}
       subtitle={session ? sessionState(session.state, locale) : mobileMessage(locale, "task.loading")}
       navigationRef={drawerMenuRef} drawerNavigation={wideNavigation.enabled}
@@ -5476,9 +5493,10 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
         { id: "context", label: contextControls?.usage ? mobileMessage(locale, "task.contextPercent", { percent: contextControls.usage.percent }) : mobileMessage(locale, "task.context"),
           onPress: () => { setSessionMentionsVisible(false); setWorkspaceMentionsVisible(false); setCatalogMentionsVisible(false); setNativeTreeVisible(false); setRuntimeControlsVisible(false); setContextVisible(true); },
           disabled: state.status !== "connected" || contextControls === undefined || state.busy || attachmentBusy || voice.busy || interactions.length > 0 },
-        { id: "controls", label: mobileMessage(locale, "task.controls"),
-          onPress: () => { setSessionMentionsVisible(false); setWorkspaceMentionsVisible(false); setCatalogMentionsVisible(false); setNativeTreeVisible(false); setContextVisible(false); setRuntimeControlsVisible(true); },
-          disabled: state.status !== "connected" || !runtimeControlsAvailable || state.busy || attachmentBusy || voice.busy || interactions.length > 0 },
+        { id: "controls", label: mobileMessage(locale, partnerRead.partner ? "partnerProfile.title" : "task.controls"),
+          onPress: () => { setSessionMentionsVisible(false); setWorkspaceMentionsVisible(false); setCatalogMentionsVisible(false); setNativeTreeVisible(false); setContextVisible(false); openRuntimeControls(); },
+          disabled: state.status !== "connected" || !partnerRead.ready || (partnerRead.partner ? !partnerProfileTransport : !runtimeControlsAvailable)
+            || state.busy || attachmentBusy || voice.busy || interactions.length > 0 },
         ...(remoteDesktopDeviceId ? [{ id: "remote-desktop" as const, label: mobileRemoteDesktopCopy(locale).title,
           onPress: () => onRemoteDesktop(remoteDesktopDeviceId),
           disabled: state.status !== "connected" || state.busy || attachmentBusy || voice.busy }] : []),
@@ -5623,6 +5641,11 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
       <Action label={mobileMessage(locale, "task.openRequest")} colors={colors} compact disabled={interactionMutationPending}
         onPress={() => setInteractionVisible(true)} />
     </View> : <View style={[styles.composer, { borderColor: colors.border, backgroundColor: colors.surface }]}>
+      {partnerRead.partner && <Action label={[partnerRead.partner.capabilities.modelChain[0]?.modelId,
+        mobileMessage(locale, partnerRead.partner.capabilities.permissionMode === "ask" ? "partnerProfile.ask" : "partnerProfile.auto"),
+        ...(partnerRead.partner.capabilities.planMode ? [mobileMessage(locale, "partnerProfile.plan")] : [])].filter(Boolean).join(" · ")}
+        colors={colors} compact disabled={!partnerProfileTransport || state.busy || attachmentBusy || voice.busy}
+        onPress={openRuntimeControls} />}
       <View accessible accessibilityRole="adjustable" accessibilityLabel={mobileMessage(locale, "composer.heightLabel")}
         accessibilityHint={mobileMessage(locale, "composer.heightHint")}
         accessibilityActions={[{ name: "increment", label: mobileMessage(locale, "composer.heightIncrease") },
@@ -5947,7 +5970,9 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
         return completed;
       }}
       onError={setLocalError} />
-    <MobileRuntimeControlsSheet visible={runtimeControlsVisible && runtimeControls !== undefined} locale={locale}
+    <MobilePartnerProfileSheet visible={partnerSettingsVisible} partner={partnerRead.partner} transport={partnerProfileTransport}
+      colors={colors} locale={locale} onClose={() => setPartnerSettingsOwner(undefined)} onSaved={() => partnerRead.retry()} />
+    <MobileRuntimeControlsSheet visible={runtimeControlsVisible && runtimeControls !== undefined && partnerRead.ready && !partnerRead.partner} locale={locale}
       controls={runtimeControls} busy={state.busy || runtimeControlPending || modelFavoritePending || attachmentBusy} colors={colors}
       onClose={() => setRuntimeControlsVisible(false)}
       onSetModel={(authorityKey, selection) => client.setTaskModel(authorityKey, selection)}

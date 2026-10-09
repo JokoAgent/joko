@@ -88,6 +88,7 @@ import {
   type MobilePartnerDirectoryTransport
 } from "./mobile-partner-directory";
 import { mobilePartnerVisibleReply, type MobilePartnerConversationTransport } from "./mobile-partner-conversation";
+import { validateMobilePartnerProfileDraft, type MobilePartnerProfileTransport } from "./mobile-partner-profile";
 import {
   assertMobileExtensionMainViewSurface,
   mobileExtensionKey,
@@ -986,6 +987,73 @@ export class MobileClient {
         throw new Error("The Partner read acknowledgement is invalid.");
       }
       return activity;
+    } };
+  }
+
+  partnerProfileTransport(): MobilePartnerProfileTransport | undefined {
+    const conversation = this.partnerConversationTransport();
+    const directory = this.partnerDirectoryTransport();
+    const context = this.#partnerPrivateContext();
+    if (!conversation || !directory || !context || !this.network.getPartnerProfileOptions || !this.network.updatePartnerProfile) return undefined;
+    const ownerKey = conversation.ownerKey;
+    const requireCurrent = (signal: AbortSignal): void => {
+      signal.throwIfAborted();
+      if (this.partnerConversationTransport()?.ownerKey !== ownerKey || this.#credential !== context.credential) {
+        throw new Error("The Partner profile owner changed.");
+      }
+    };
+    const load: MobilePartnerProfileTransport["load"] = async (selected, signal) => {
+      requireCurrent(signal);
+      const partner = await conversation.resolve(signal);
+      requireCurrent(signal);
+      if (!partner || partner.partnerId !== selected.partnerId) throw new Error("The Partner profile is no longer canonical.");
+      const options = await this.network.getPartnerProfileOptions!(context.credential, signal);
+      const catalog = await directory.list(signal);
+      requireCurrent(signal);
+      const final = catalog.partners.find((candidate) => candidate.partnerId === partner.partnerId);
+      if (!final || mobilePartnerDirectoryIdentity(final) !== mobilePartnerDirectoryIdentity(partner)
+        || options.revision !== catalog.directory.revision) throw new Error("The Partner profile changed while its settings were loading.");
+      const controls = this.taskRuntimeControls();
+      const models = controls?.models ?? [];
+      return { ownerKey, partner: final, options,
+        names: catalog.partners.map(({ partnerId, displayName }) => ({ partnerId, displayName })),
+        models: models.filter((model) => model.backendId === final.capabilities.modelChain[0]?.backendId),
+        canSwitchModel: controls?.canSwitchModel === true, canSetEffort: controls?.canSetEffort === true,
+        canSetFastMode: controls?.canSetFastMode === true, canSetPlanMode: controls?.canSetPlanMode === true,
+        permissionModes: (controls?.permissionModes ?? []).filter((mode) => mode === PermissionMode.ASK || mode === PermissionMode.AUTO)
+          .map((mode) => mode === PermissionMode.ASK ? "ask" as const : "auto" as const) };
+    };
+    return { ownerKey, load, save: async (snapshot, draft, signal) => {
+      requireCurrent(signal);
+      if (snapshot.ownerKey !== ownerKey) throw new Error("The Partner profile draft belongs to another owner.");
+      const fresh = await load(snapshot.partner, signal);
+      if (mobilePartnerDirectoryIdentity(fresh.partner) !== mobilePartnerDirectoryIdentity(snapshot.partner)
+        || fresh.options.revision !== snapshot.options.revision) {
+        throw new Error("The Partner profile changed; refresh settings before saving this draft.");
+      }
+      const validated = validateMobilePartnerProfileDraft(fresh, draft);
+      requireCurrent(signal);
+      const action = this.#claimMutation();
+      try {
+        const updated = await this.network.updatePartnerProfile!(context.credential, fresh.partner.partnerId,
+          fresh.partner.revision, validated, signal);
+        requireCurrent(signal);
+        if (updated.partnerId !== fresh.partner.partnerId || updated.canonicalSessionId !== conversation.sessionId
+          || updated.homeTargetId !== fresh.partner.homeTargetId || updated.revision < fresh.partner.revision) {
+          throw new Error("The Partner update returned a different canonical identity.");
+        }
+        const confirmed = (await load(updated, signal)).partner;
+        if (confirmed.revision < updated.revision || confirmed.displayName !== validated.displayName
+          || confirmed.avatar !== validated.avatar || confirmed.identitySource !== validated.identitySource
+          || confirmed.usesDirectoryDefaults !== validated.usesDirectoryDefaults
+          || !validated.usesDirectoryDefaults && JSON.stringify(confirmed.capabilities) !== JSON.stringify(validated.capabilities)) {
+          throw new Error("The saved Partner profile could not be confirmed by the current node.");
+        }
+        return confirmed;
+      } catch (error) {
+        signal.throwIfAborted();
+        throw new Error("The Partner update may have been applied. Refresh settings before another save.", { cause: error });
+      } finally { this.#releaseMutation(action); }
     } };
   }
 

@@ -10,6 +10,8 @@ import {
   BeginPairingRequestSchema, BeginPairingResponseSchema,
   CompletePairingRequestSchema, CompletePairingResponseSchema,
   ListPartnersRequestSchema, ListPartnersResponseSchema, MarkPartnerReadRequestSchema, MarkPartnerReadResponseSchema,
+  GetPartnerDirectoryResponseSchema, UpdatePartnerRequestSchema, UpdatePartnerResponseSchema,
+  PermissionMode, type UpdatePartnerRequest,
   ConnectionSchema, ConnectionState, CredentialKind, DeviceKind, DeviceSchema,
   ExtensionCatalogEntrySchema, ExtensionCatalogSource, ExtensionInstallState, ExtensionMainViewIcon,
   ExtensionMainViewSurfaceSchema, ExtensionOwnerSchema, ExtensionResourceOwnerSchema,
@@ -108,8 +110,41 @@ import {
   type PairedCredential
 } from "./network";
 import { mobileDeviceNameSource } from "./mobile-device-name";
+import { mobilePartnerProfileDraft } from "./mobile-partner-profile";
+import { profilePartner, profilePartnerWire } from "./test/mobile-partner-profile";
 
 describe("mobile Partner catalog network", () => {
+  it("uses generated profile options and CAS patches without dual-writing inherited capabilities", async () => {
+    const credential: PairedCredential = { profileId: "profile", origin: "https://node.example", serverId: "server",
+      connectionId: "connection", deviceId: "phone", displayName: "Joko node", authKey: "partner-fixture-key" };
+    const directory = { revision: { value: 4n }, avatarPresets: ["orbit", "spark"] };
+    const patches: UpdatePartnerRequest[] = [];
+    const fetcher = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const path = new URL(String(input)).pathname;
+      const headers = { "content-type": "application/proto" };
+      if (path.endsWith("/GetPartnerDirectory")) return new Response(toBinary(GetPartnerDirectoryResponseSchema,
+        create(GetPartnerDirectoryResponseSchema, { directory })), { headers });
+      expect(path).toBe("/joko.v1.PartnerService/UpdatePartner");
+      const request = fromBinary(UpdatePartnerRequestSchema, new Uint8Array(init?.body as Uint8Array)); patches.push(request);
+      expect(request).toMatchObject({ partnerId: "partner-a", expectedRevision: { value: 2n } });
+      return new Response(toBinary(UpdatePartnerResponseSchema, create(UpdatePartnerResponseSchema, {
+        partner: profilePartnerWire({ ...profilePartner, displayName: "Ada Two", revision: 3n, profileVersion: 4n }), directory
+      })), { headers });
+    });
+    try {
+      await expect(mobileNetwork.getPartnerProfileOptions!(credential)).resolves.toMatchObject({ revision: 4n });
+      const draft = { ...mobilePartnerProfileDraft(profilePartner), displayName: "Ada Two" };
+      await expect(mobileNetwork.updatePartnerProfile!(credential, "partner-a", 2n, draft))
+        .resolves.toMatchObject({ revision: 3n, profileVersion: 4n });
+      await mobileNetwork.updatePartnerProfile!(credential, "partner-a", 2n, { ...draft, usesDirectoryDefaults: true });
+      expect(patches[0]?.patch).toMatchObject({ modelChain: { routes: [{ providerId: "alpha", modelId: "a", effort: "low" }] },
+        permissionMode: PermissionMode.ASK, planMode: false, usesDirectoryDefaults: false });
+      expect(patches[1]?.patch).toMatchObject({ usesDirectoryDefaults: true });
+      expect(patches[1]?.patch?.modelChain).toBeUndefined(); expect(patches[1]?.patch?.permissionMode).toBeUndefined();
+      await expect(mobileNetwork.updatePartnerProfile!(credential, "partner-a", 0n, draft)).rejects.toThrow(/current Partner/u);
+    } finally { fetcher.mockRestore(); }
+  });
+
   it("uses generated node-local directory and monotonic read RPCs and rejects a mismatched acknowledgement", async () => {
     const credential: PairedCredential = { profileId: "profile", origin: "https://node.example", serverId: "server",
       connectionId: "connection", deviceId: "phone", displayName: "Joko node", authKey: "partner-fixture-key" };

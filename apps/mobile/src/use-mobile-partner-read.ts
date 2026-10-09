@@ -7,6 +7,7 @@ import { mobilePartnerVisibleReply, type MobilePartnerConversationTransport,
 interface ReadState {
   readonly ownerKey?: string;
   readonly partner?: MobilePartnerDirectoryProfile;
+  readonly resolved?: boolean;
   readonly failed: boolean;
 }
 
@@ -41,7 +42,7 @@ export function useMobilePartnerRead(transport: MobilePartnerConversationTranspo
     const ownerKey = transport.ownerKey;
     void transport.resolve(controller.signal).then((resolved) => {
       if (controller.signal.aborted || contextRef.current.transport?.ownerKey !== ownerKey) return;
-      setState({ ownerKey, partner: resolved, failed: false });
+      setState({ ownerKey, partner: resolved, failed: false, resolved: true });
     }).catch(() => {
       if (!controller.signal.aborted && contextRef.current.transport?.ownerKey === ownerKey) {
         setState({ ownerKey, failed: true });
@@ -98,6 +99,7 @@ export function useMobilePartnerRead(transport: MobilePartnerConversationTranspo
     });
   }, [enabled, partner, pulse, reply, state.failed, transport?.ownerKey]);
 
-  return { partner, failed: state.ownerKey === transport?.ownerKey && state.failed,
+  return { partner, ready: transport === undefined || state.ownerKey === transport.ownerKey && state.resolved === true,
+    failed: state.ownerKey === transport?.ownerKey && state.failed,
     retry: () => setAttempt((value) => value + 1) };
 }

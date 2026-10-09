@@ -123,7 +123,7 @@ export function projectMobilePartnerCatalog(response: ListPartnersResponse): Mob
   const ids = new Set<string>();
   const sessions = new Set<string>();
   const partners = response.partners.map((wire) => {
-    const partner = projectProfile(wire);
+    const partner = projectMobilePartnerProfile(wire);
     if (ids.has(partner.partnerId)
       || partner.canonicalSessionId !== undefined && sessions.has(partner.canonicalSessionId)) {
       throw new Error("The Joko node returned duplicate Partner identities.");
@@ -173,7 +173,7 @@ export function projectMobilePartnerReadResponse(
   return activity;
 }
 
-function projectProfile(value: PartnerProfile): MobilePartnerDirectoryProfile {
+export function projectMobilePartnerProfile(value: PartnerProfile): MobilePartnerDirectoryProfile {
   const partnerId = id(value.partnerId, "Partner ID");
   const lifecycle = value.lifecycle === PartnerLifecycle.ACTIVE ? "active" as const
     : value.lifecycle === PartnerLifecycle.ARCHIVED ? "archived" as const : undefined;
@@ -217,7 +217,7 @@ function projectProfile(value: PartnerProfile): MobilePartnerDirectoryProfile {
     ...(initializationErrorCode === undefined ? {} : { initializationErrorCode }),
     homeTargetId: id(value.homeTargetId, "Partner home target ID"),
     ...(canonicalSessionId === undefined ? {} : { canonicalSessionId }),
-    capabilities: projectCapabilities(value.capabilities),
+    capabilities: projectMobilePartnerCapabilities(value.capabilities),
     usesDirectoryDefaults: value.usesDirectoryDefaults,
     createdAt: timestamp(value.createdAt, "Partner creation time"),
     updatedAt: timestamp(value.updatedAt, "Partner update time"),
@@ -239,7 +239,7 @@ function projectDirectory(value: PartnerDirectory): MobilePartnerDirectorySummar
   };
 }
 
-function projectCapabilities(value: PartnerCapabilities | undefined): MobilePartnerCapabilities {
+export function projectMobilePartnerCapabilities(value: PartnerCapabilities | undefined): MobilePartnerCapabilities {
   if (!value || value.modelChain.length < 1 || value.modelChain.length > 3) {
     throw new Error("The Joko node returned an invalid Partner model chain.");
   }
