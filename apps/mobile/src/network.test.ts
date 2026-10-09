@@ -9,6 +9,7 @@ import {
   BlobTransferTicketSchema,
   BeginPairingRequestSchema, BeginPairingResponseSchema,
   CompletePairingRequestSchema, CompletePairingResponseSchema,
+  ListPartnersRequestSchema, ListPartnersResponseSchema, MarkPartnerReadRequestSchema, MarkPartnerReadResponseSchema,
   ConnectionSchema, ConnectionState, CredentialKind, DeviceKind, DeviceSchema,
   ExtensionCatalogEntrySchema, ExtensionCatalogSource, ExtensionInstallState, ExtensionMainViewIcon,
   ExtensionMainViewSurfaceSchema, ExtensionOwnerSchema, ExtensionResourceOwnerSchema,
@@ -107,6 +108,39 @@ import {
   type PairedCredential
 } from "./network";
 import { mobileDeviceNameSource } from "./mobile-device-name";
+
+describe("mobile Partner catalog network", () => {
+  it("uses generated node-local directory and monotonic read RPCs and rejects a mismatched acknowledgement", async () => {
+    const credential: PairedCredential = { profileId: "profile", origin: "https://node.example", serverId: "server",
+      connectionId: "connection", deviceId: "phone", displayName: "Joko node", authKey: "partner-fixture-key" };
+    let wrongOwner = false;
+    const fetcher = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const path = new URL(String(input)).pathname;
+      const body = new Uint8Array(init?.body as Uint8Array);
+      const headers = { "content-type": "application/proto" };
+      expect(new Headers(init?.headers).get("authorization")).toBe("Bearer partner-fixture-key");
+      if (path.endsWith("/ListPartners")) {
+        expect(fromBinary(ListPartnersRequestSchema, body).lifecycle).toBeUndefined();
+        return new Response(toBinary(ListPartnersResponseSchema, create(ListPartnersResponseSchema, {
+          directory: { revision: { value: 1n }, updatedAt: { seconds: 1n } }
+        })), { headers });
+      }
+      expect(path).toBe("/joko.v1.PartnerService/MarkPartnerRead");
+      expect(fromBinary(MarkPartnerReadRequestSchema, body)).toMatchObject({ partnerId: "ada", throughCursor: { value: 5n } });
+      return new Response(toBinary(MarkPartnerReadResponseSchema, create(MarkPartnerReadResponseSchema, {
+        activity: { partnerId: wrongOwner ? "bea" : "ada", readThroughCursor: { value: 5n }, readUpdatedAt: { seconds: 2n } }
+      })), { headers });
+    });
+    try {
+      await expect(mobileNetwork.listPartnerCatalog!(credential)).resolves.toMatchObject({ partners: [], directory: { revision: 1n } });
+      await expect(mobileNetwork.markPartnerRead!(credential, "ada", 5n)).resolves.toMatchObject({ readThroughCursor: 5n });
+      wrongOwner = true;
+      await expect(mobileNetwork.markPartnerRead!(credential, "ada", 5n)).rejects.toThrow(/mismatched/u);
+      await expect(mobileNetwork.markPartnerRead!(credential, "ada", -1n)).rejects.toThrow(/valid Partner/u);
+      expect(fetcher).toHaveBeenCalledTimes(3);
+    } finally { fetcher.mockRestore(); }
+  });
+});
 
 describe("mobile device name handshake", () => {
   const credential: PairedCredential = { profileId: "profile", origin: "https://node.example", serverId: "server",

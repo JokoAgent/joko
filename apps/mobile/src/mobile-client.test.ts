@@ -2708,6 +2708,90 @@ describe("mobile Extension catalog authority", () => {
 });
 
 describe("mobile Partner private authority", () => {
+  it("opens a roster Partner only after exact profile and canonical Session revalidation", async () => {
+    const network = fakeNetwork();
+    const partner = {
+      partnerId: "partner-a", revision: 2n, profileVersion: 3n, displayName: "A", avatar: "standard",
+      identitySource: "A handles product work.", templateId: "general", lifecycle: "active" as const,
+      initializationState: "ready" as const, invitationStage: "ready" as const, homeTargetId: "target",
+      canonicalSessionId: "session", capabilities: { modelChain: [{ backendId: "backend", providerId: "provider",
+        modelId: "model", fastMode: false }], permissionMode: "ask" as const, planMode: false },
+      usesDirectoryDefaults: true, createdAt: 1_000, updatedAt: 2_000,
+      activity: { partnerId: "partner-a", unreadReplyCount: 1, latestReplyCursor: 4n, latestReplyAt: 2_000,
+        artifactCount: 0, activeDelegationCount: 0, readThroughCursor: 3n, readUpdatedAt: 1_500 }
+    };
+    const catalog = { directory: { revision: 4n, activeCount: 1, archivedCount: 0, errorCount: 0,
+      updatedAt: 2_000 }, partners: [partner] };
+    network.listPartnerCatalog = vi.fn(async () => catalog);
+    network.listPartnerSessions = vi.fn(async () => create(ListPartnerSessionsResponseSchema, {
+      sessions: [{ partnerId: "partner-a", sessionId: "session", role: PartnerSessionRole.CANONICAL,
+        profileVersion: 3n, displayName: "A task", available: true, readOnly: false, deleted: false,
+        archived: false, createdAt: { seconds: 1n } }]
+    }));
+    network.markPartnerRead = vi.fn(async () => ({ ...partner.activity, unreadReplyCount: 0,
+      readThroughCursor: 4n }));
+    const completedReply = clone(EventSchema, messageEvent);
+    completedReply.cursor!.sequence = 4n;
+    network.readSession = vi.fn(async () => create(SnapshotSchema, { ...snapshot, timeline: [completedReply] }));
+    const app = client(network, memoryStorage(credential).storage);
+    await app.start();
+
+    const transport = app.partnerDirectoryTransport()!;
+    expect(await transport.list(new AbortController().signal)).toEqual(catalog);
+    await expect(transport.open(partner, new AbortController().signal)).resolves.toMatchObject({
+      sessionId: "session"
+    });
+    expect(app.state.selectedId).toBe("session");
+    expect(network.listPartnerSessions).toHaveBeenCalledTimes(2);
+    expect(network.markPartnerRead).not.toHaveBeenCalled();
+    const conversation = app.partnerConversationTransport()!;
+    expect(await conversation.resolve(new AbortController().signal)).toEqual(partner);
+    const reply = { eventId: completedReply.eventId, messageId: "message-1", cursor: 4n };
+    await expect(conversation.acknowledge(partner, reply, new AbortController().signal, () => false))
+      .rejects.toThrow(/no longer visible/u);
+    expect(network.markPartnerRead).not.toHaveBeenCalled();
+    await expect(conversation.acknowledge(partner, { ...reply, cursor: 5n }, new AbortController().signal, () => true))
+      .rejects.toThrow(/current completed public/u);
+    expect(network.markPartnerRead).not.toHaveBeenCalled();
+    await expect(conversation.acknowledge(partner, reply, new AbortController().signal, () => true))
+      .resolves.toMatchObject({ readThroughCursor: 4n });
+    expect(network.markPartnerRead).toHaveBeenCalledWith(credential, "partner-a", 4n, expect.any(AbortSignal));
+    vi.mocked(network.markPartnerRead).mockClear();
+    let finish!: (value: typeof catalog) => void;
+    vi.mocked(network.listPartnerCatalog).mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+    const late = conversation.acknowledge(partner, reply, new AbortController().signal, () => true);
+    app.setForeground(false);
+    finish(catalog);
+    await expect(late).rejects.toThrow(/owner changed/u);
+    expect(network.markPartnerRead).not.toHaveBeenCalled();
+  });
+
+  it("refuses a roster profile that changed before selection", async () => {
+    const network = fakeNetwork();
+    const partner = {
+      partnerId: "partner-a", revision: 2n, profileVersion: 3n, displayName: "A", avatar: "standard",
+      identitySource: "A handles product work.", templateId: "general", lifecycle: "active" as const,
+      initializationState: "ready" as const, invitationStage: "ready" as const, homeTargetId: "target",
+      canonicalSessionId: "session", capabilities: { modelChain: [{ backendId: "backend", providerId: "provider",
+        modelId: "model", fastMode: false }], permissionMode: "ask" as const, planMode: false },
+      usesDirectoryDefaults: true, createdAt: 1_000, updatedAt: 2_000,
+      activity: { partnerId: "partner-a", unreadReplyCount: 0, artifactCount: 0, activeDelegationCount: 0,
+        readThroughCursor: 0n, readUpdatedAt: 1_500 }
+    };
+    network.listPartnerCatalog = vi.fn(async () => ({
+      directory: { revision: 5n, activeCount: 1, archivedCount: 0, errorCount: 0, updatedAt: 3_000 },
+      partners: [{ ...partner, revision: 3n }]
+    }));
+    const app = client(network, memoryStorage(credential).storage);
+    await app.start();
+    const select = vi.spyOn(app, "select");
+
+    await expect(app.partnerDirectoryTransport()!.open(partner, new AbortController().signal))
+      .rejects.toThrow(/changed/u);
+    expect(select).not.toHaveBeenCalled();
+    expect(network.listPartnerSessions).not.toHaveBeenCalled();
+  });
+
   it("previews authorized Partner Artifacts and opens only the revalidated canonical task", async () => {
     const network = fakeNetwork();
     const partner = { partnerId: "partner-a", displayName: "A", avatar: "standard",

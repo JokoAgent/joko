@@ -286,6 +286,8 @@ import { mobileOfflineAgeLabel } from "./mobile-offline-cache";
 import { MobileOfflineNotice } from "./MobileOfflineNotice";
 import { MobileAutomationsScreen } from "./MobileAutomationsScreen";
 import { MobilePartnersScreen } from "./MobilePartnersScreen";
+import { MobilePartnerDirectoryScreen } from "./MobilePartnerDirectoryScreen";
+import { useMobilePartnerRead } from "./use-mobile-partner-read";
 import { MobilePartnerResourcesScreen } from "./MobilePartnerResourcesScreen";
 import { MobileExtensionsScreen } from "./MobileExtensionsScreen";
 import { MobileFilesToolbar } from "./MobileFilesToolbar";
@@ -365,7 +367,7 @@ const mobileUpdateActions: MobileUpdateActions = {
   onOpenUpdate: (target) => mobileUpdates.openUpdate(target),
   onRecheckForced: () => mobileUpdates.recheckForced()
 };
-type Page = "home" | "connection" | "new" | "task" | "files" | "automations" | "extensions" | "partner-resources" | "partners" | "settings" | "connections" | "devices" | "device" | "remote-desktop";
+type Page = "home" | "connection" | "new" | "task" | "files" | "automations" | "extensions" | "partner-directory" | "partner-resources" | "partners" | "settings" | "connections" | "devices" | "device" | "remote-desktop";
 
 interface MobileRemoteDesktopEntry {
   readonly ownerKey: string;
@@ -893,6 +895,9 @@ export function App() {
                     setFocusTaskComposer(true);
                     setPage("task");
                   }} /> :
+                page === "partner-directory" ? <MobilePartnerDirectoryScreen colors={colors}
+                  locale={locale.effectiveLocale} transport={client.partnerDirectoryTransport()}
+                  onBack={() => setPage("home")} onOpenTask={() => setPage("task")} /> :
                 page === "partner-resources" ? <MobilePartnerResourcesScreen colors={colors}
                   locale={locale.effectiveLocale} transport={client.partnerResourceTransport()}
                   onBack={() => setPage("home")} onOpenTask={() => setPage("task")} /> :
@@ -967,7 +972,8 @@ export function App() {
           onAutomations={() => queueHomeMenuAction(() => setPage("automations"))}
           onExtensions={() => queueHomeMenuAction(() => setPage("extensions"))}
           onPartnerResources={() => queueHomeMenuAction(() => setPage("partner-resources"))}
-          onPartners={() => queueHomeMenuAction(() => {
+          onPartners={() => queueHomeMenuAction(() => setPage("partner-directory"))}
+          onPartnerChats={() => queueHomeMenuAction(() => {
             setPartnerReturnPage("home");
             void client.openPartnerDirectory();
             setPage("partners");
@@ -1351,9 +1357,9 @@ function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu, incomi
 
 type SessionOption = "rename" | "copy-link" | "pin" | "archive" | "delete" | "tags" | `tag:${string}`;
 
-function HomeMenu({ visible, colors, state, locale, onClose, onClosed, onMountedChange, onSearch, onAutomations, onExtensions, onPartnerResources, onPartners, onSwitch, onSettings, onDevices }: ScreenProps & {
+function HomeMenu({ visible, colors, state, locale, onClose, onClosed, onMountedChange, onSearch, onAutomations, onExtensions, onPartnerResources, onPartners, onPartnerChats, onSwitch, onSettings, onDevices }: ScreenProps & {
   visible: boolean; onClose: () => void; onClosed: () => void; onMountedChange: (mounted: boolean) => void;
-  onSearch: () => void; onAutomations: () => void; onExtensions: () => void; onPartnerResources: () => void; onPartners: () => void;
+  onSearch: () => void; onAutomations: () => void; onExtensions: () => void; onPartnerResources: () => void; onPartners: () => void; onPartnerChats: () => void;
   onSwitch: () => void; onSettings: () => void; onDevices: () => void;
 }) {
   const { width } = useWindowDimensions();
@@ -1381,8 +1387,10 @@ function HomeMenu({ visible, colors, state, locale, onClose, onClosed, onMounted
           description={mobileMessage(locale, "extension.menuDescription")} onPress={onExtensions} colors={colors} />
         <MenuRow label={mobileMessage(locale, "partnerResource.title")}
           description={mobileMessage(locale, "partnerResource.menuDescription")} onPress={onPartnerResources} colors={colors} />
+        <MenuRow label={mobileMessage(locale, "partnerDirectory.title")}
+          description={mobileMessage(locale, "partnerDirectory.menuDescription")} onPress={onPartners} colors={colors} />
         <MenuRow label={mobileMessage(locale, "partner.title")}
-          description={mobileMessage(locale, "partner.menuDescription")} onPress={onPartners} colors={colors} />
+          description={mobileMessage(locale, "partner.menuDescription")} onPress={onPartnerChats} colors={colors} />
         <MenuRow label={mobileMessage(locale, "home.menu.switch")} description={mobileMessage(locale, "home.menu.switchDescription")}
           onPress={onSwitch} colors={colors} />
         <MenuRow label={mobileMessage(locale, "common.devices")} description={mobileMessage(locale, "home.menu.devicesDescription")}
@@ -3166,14 +3174,21 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
   const copyInFlightRef = useRef(false);
   const timelineListRef = useRef<FlatList<MobileWorkItem<TimelineRow>>>(null);
   const timelineViewportRef = useRef<View>(null);
+  const partnerConversationTransport = client.partnerConversationTransport();
+  const [visiblePartnerRows, setVisiblePartnerRows] = useState<{
+    readonly ownerKey?: string; readonly ids: ReadonlySet<string>;
+  }>({ ids: new Set() });
   const [imageViewportPulse, setImageViewportPulse] = useState(0);
   const [visibleImageRows, setVisibleImageRows] = useState<ReadonlySet<string>>(new Set());
   const imageViewability = useRef({ itemVisiblePercentThreshold: 1, minimumViewTime: 80 }).current;
-  const onImageRowsVisible = useRef(({ viewableItems }: { readonly viewableItems: readonly { readonly item: MobileWorkItem<TimelineRow>; readonly isViewable: boolean }[] }) => {
+  const onImageRowsVisible = useMemo(() => ({ viewableItems }: { readonly viewableItems: readonly { readonly item: MobileWorkItem<TimelineRow>; readonly isViewable: boolean }[] }) => {
     const rowIds = (item: MobileWorkItem<TimelineRow>): string[] => isWorkGroup(item) ? item.children.flatMap(rowIds) : [item.id];
     const next = new Set(viewableItems.filter((item) => item.isViewable).flatMap((item) => rowIds(item.item)));
     setVisibleImageRows((previous) => previous.size === next.size && [...next].every((id) => previous.has(id)) ? previous : next);
-  }).current;
+    setVisiblePartnerRows((previous) => previous.ownerKey === partnerConversationTransport?.ownerKey
+      && previous.ids.size === next.size && [...next].every((id) => previous.ids.has(id)) ? previous
+      : { ownerKey: partnerConversationTransport?.ownerKey, ids: next });
+  }, [partnerConversationTransport?.ownerKey]);
   const screenshotMessageViewsRef = useRef(new Map<string, View>());
   const messageFocusRetryRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const messageFocusRetryKeyRef = useRef<string | undefined>(undefined);
@@ -3896,6 +3911,16 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
   const conversationShareDisabled = state.status !== "connected" || state.busy || attachmentBusy || voice.busy
     || fileShareBusy || galleryOpening || imageGallery.view !== undefined || state.timelinePreview !== undefined
     || queueEdit !== undefined || conversationShare.busy;
+  const partnerRead = useMobilePartnerRead(partnerConversationTransport, state.window ?? taskTimelineEvents,
+    state.owner?.generation ?? 0n,
+    visiblePartnerRows.ownerKey === partnerConversationTransport?.ownerKey ? visiblePartnerRows.ids : new Set<string>(),
+    !conversationShareDisabled && !conversationShare.active && !drawerOpen && !drawerMounted
+      && !messageActionsVisible && !taskActionsVisible && !interactionVisible && !contextVisible
+      && !cloneVisible && forkEventId === undefined && rewindEventId === undefined && !nativeTreeVisible
+      && !runtimeControlsVisible && !sessionMentionsVisible && !workspaceMentionsVisible && !catalogMentionsVisible
+      && photoLibraryLease === undefined && imageEditorLease === undefined && quoteSelection === undefined
+      && commandHelpItems === undefined && !runtimeCommandCommitting
+      && (session?.state === SessionState.IDLE || session?.state === SessionState.ERROR));
   const messageActionItems = messageAction
     ? buildMobileMessageActions(messageAction.row, {
       canDelete: client.canDeleteMessage(messageAction.row.eventId), locale, copyDisabled: copyBusy,
@@ -5472,13 +5497,17 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
     {state.status === "offline" && state.offlineSnapshotAt !== undefined
       && <MobileOfflineNotice cachedAt={state.offlineSnapshotAt} locale={locale} colors={colors} />}
     {state.error && <Banner text={state.error} colors={colors} />}
+    {partnerRead.failed && <View accessibilityLiveRegion="polite" style={styles.connectionNotice}>
+      <Text style={[styles.caption, styles.fill, { color: colors.muted }]}>{mobileMessage(locale, "partnerDirectory.readFailed")}</Text>
+      <Action label={mobileMessage(locale, "common.retry")} colors={colors} onPress={partnerRead.retry} />
+    </View>}
     {fileShareBusy && <View accessibilityLiveRegion="polite" style={[styles.connectionNotice, { backgroundColor: colors.surface, borderColor: colors.border }]}>
       <ActivityIndicator color={colors.accent} />
       <Text style={[styles.caption, styles.fill, { color: colors.muted }]}>{formatMobileFileShareProgress(fileShareProgress, locale)}</Text>
     </View>}
     {conversationShare.notice && <Banner text={conversationShare.notice} colors={colors} />}
     <View ref={timelineViewportRef} collapsable={false} style={styles.fill} onLayout={() => setImageViewportPulse((value) => value + 1)}>
-    <FlatList key={draftIdentityKey} ref={timelineListRef} data={displayRows}
+    <FlatList key={`${draftIdentityKey ?? ""}\u001f${partnerConversationTransport?.ownerKey ?? ""}`} ref={timelineListRef} data={displayRows}
       extraData={{ selection: conversationShare.selectedIds, visibleImageRows, imageViewportPulse }} keyExtractor={(row) => row.id} style={styles.fill} contentContainerStyle={styles.list}
       viewabilityConfig={imageViewability} onViewableItemsChanged={onImageRowsVisible}
       scrollEventThrottle={100} onScroll={() => setImageViewportPulse((value) => value + 1)}

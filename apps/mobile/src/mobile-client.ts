@@ -81,6 +81,14 @@ import {
   type MobilePartnerResourceTransport
 } from "./mobile-partner-resources";
 import {
+  assertMobilePartnerDirectorySession,
+  mobilePartnerDirectoryIdentity,
+  type MobilePartnerCatalog,
+  type MobilePartnerDirectoryProfile,
+  type MobilePartnerDirectoryTransport
+} from "./mobile-partner-directory";
+import { mobilePartnerVisibleReply, type MobilePartnerConversationTransport } from "./mobile-partner-conversation";
+import {
   assertMobileExtensionMainViewSurface,
   mobileExtensionKey,
   sameMobileExtensionMainViewSurface,
@@ -863,6 +871,123 @@ export class MobileClient {
   ) { this.#filesThumbnails = new MobileFilesThumbnailReader(filesThumbnailDisk); }
 
   get state(): MobileState { return this.#state; }
+
+  partnerDirectoryTransport(): MobilePartnerDirectoryTransport | undefined {
+    const context = this.#partnerPrivateContext();
+    const listPartnerCatalog = this.network.listPartnerCatalog;
+    if (!context || !listPartnerCatalog) return undefined;
+    const ownerKey = context.authorityKey;
+    const current = (): boolean => this.#partnerPrivateAuthorityKey(this.#state) === ownerKey
+      && this.#credential === context.credential;
+    const requireCurrent = (signal: AbortSignal): void => {
+      signal.throwIfAborted();
+      if (!current()) throw new Error("The Partner directory owner changed.");
+    };
+    const list = async (signal: AbortSignal): Promise<MobilePartnerCatalog> => {
+      requireCurrent(signal);
+      const catalog = await listPartnerCatalog.call(this.network, context.credential, signal);
+      requireCurrent(signal);
+      return catalog;
+    };
+    const exact = (catalog: MobilePartnerCatalog, selected: MobilePartnerDirectoryProfile): MobilePartnerDirectoryProfile => {
+      const matches = catalog.partners.filter((partner) => partner.partnerId === selected.partnerId);
+      if (matches.length !== 1 || mobilePartnerDirectoryIdentity(matches[0]!) !== mobilePartnerDirectoryIdentity(selected)) {
+        throw new Error("The selected Partner changed; refresh the directory and try again.");
+      }
+      return matches[0]!;
+    };
+    return {
+      ownerKey,
+      list,
+      open: async (selected, signal) => {
+        const initial = exact(await list(signal), selected);
+        const initialSessions = await this.network.listPartnerSessions(context.credential, initial.partnerId, signal);
+        requireCurrent(signal);
+        const sessionId = assertMobilePartnerDirectorySession(initial, initialSessions);
+        const visible = this.#state.owner?.sessions.filter((session) => session.sessionId === sessionId) ?? [];
+        if (visible.length !== 1 || visible[0]!.targetId !== initial.homeTargetId
+          || visible[0]!.backendId !== initial.capabilities.modelChain[0]?.backendId || visible[0]!.archived
+          || visible[0]!.state === SessionState.ARCHIVED || visible[0]!.state === SessionState.CLOSED) {
+          throw new Error("The Partner canonical task is not available in the current task directory.");
+        }
+        await this.select(sessionId);
+        requireCurrent(signal);
+        if (this.#state.selectedId !== sessionId) {
+          throw new Error("The Partner canonical task was not selected by the current owner.");
+        }
+        const finalPartner = exact(await list(signal), initial);
+        const finalSessions = await this.network.listPartnerSessions(context.credential, finalPartner.partnerId, signal);
+        requireCurrent(signal);
+        if (assertMobilePartnerDirectorySession(finalPartner, finalSessions) !== sessionId) {
+          throw new Error("The Partner canonical task changed while it was opening.");
+        }
+        return { sessionId };
+      }
+    };
+  }
+
+  partnerConversationTransport(): MobilePartnerConversationTransport | undefined {
+    const directory = this.partnerDirectoryTransport();
+    const presentationKey = this.taskPresentationOwnerKey();
+    const credential = this.#credential;
+    const sessionId = this.#state.selectedId;
+    if (!directory || !presentationKey || !credential || !sessionId) return undefined;
+    const ownerKey = `${directory.ownerKey}\u001f${presentationKey}`;
+    const requireCurrent = (signal: AbortSignal): Session => {
+      signal.throwIfAborted();
+      if (this.#credential !== credential || this.#partnerPrivateAuthorityKey(this.#state) !== directory.ownerKey
+        || this.taskPresentationOwnerKey() !== presentationKey || this.#state.selectedId !== sessionId) {
+        throw new Error("The Partner conversation owner changed.");
+      }
+      return this.#selectedSession()!;
+    };
+    const resolve = async (signal: AbortSignal): Promise<MobilePartnerDirectoryProfile | undefined> => {
+      const catalog = await directory.list(signal);
+      const session = requireCurrent(signal);
+      const matches = catalog.partners.filter((partner) => partner.canonicalSessionId === sessionId);
+      if (matches.length === 0) return undefined;
+      const partner = matches[0]!;
+      if (matches.length !== 1 || partner.homeTargetId !== session.targetId
+        || partner.capabilities.modelChain[0]?.backendId !== session.backendId) {
+        throw new Error("The Partner conversation identity is inconsistent.");
+      }
+      const sessions = await this.network.listPartnerSessions(credential, partner.partnerId, signal);
+      requireCurrent(signal);
+      if (assertMobilePartnerDirectorySession(partner, sessions) !== sessionId) {
+        throw new Error("The Partner conversation is no longer canonical.");
+      }
+      return partner;
+    };
+    return { ownerKey, sessionId, resolve, acknowledge: async (partner, reply, signal, stillVisible) => {
+      const requireVisible = (): void => {
+        const session = requireCurrent(signal);
+        if (!stillVisible() || session.archived || ![SessionState.IDLE, SessionState.ERROR].includes(session.state)) {
+          throw new Error("The completed Partner reply is no longer visible in an idle conversation.");
+        }
+        const events = this.#state.window
+          ?? [...this.#state.older, ...(this.#state.detail?.timeline ?? []), ...this.#state.live];
+        const actual = mobilePartnerVisibleReply(events, sessionId, this.#state.owner!.generation,
+          new Set([reply.messageId]));
+        if (!actual || actual.eventId !== reply.eventId || actual.cursor !== reply.cursor) {
+          throw new Error("The Partner read cursor is not a current completed public reply.");
+        }
+      };
+      requireVisible();
+      const current = await resolve(signal);
+      requireVisible();
+      if (!current || mobilePartnerDirectoryIdentity(current) !== mobilePartnerDirectoryIdentity(partner)) {
+        throw new Error("The Partner profile changed before read acknowledgement.");
+      }
+      if (reply.cursor <= current.activity.readThroughCursor) return current.activity;
+      if (!this.network.markPartnerRead) throw new Error("Partner read acknowledgement is unavailable.");
+      const activity = await this.network.markPartnerRead(credential, partner.partnerId, reply.cursor, signal);
+      requireCurrent(signal);
+      if (activity.partnerId !== partner.partnerId || activity.readThroughCursor < reply.cursor) {
+        throw new Error("The Partner read acknowledgement is invalid.");
+      }
+      return activity;
+    } };
+  }
 
   partnerResourceTransport(): MobilePartnerResourceTransport | undefined {
     const context = this.#partnerPrivateContext();

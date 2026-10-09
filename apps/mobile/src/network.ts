@@ -63,6 +63,12 @@ import {
   type MobilePrivateThread
 } from "./mobile-partner-private";
 import {
+  projectMobilePartnerCatalog,
+  projectMobilePartnerReadResponse,
+  type MobilePartnerActivity,
+  type MobilePartnerCatalog
+} from "./mobile-partner-directory";
+import {
   collectMobileExtensionCatalog,
   projectMobileExtension,
   projectMobileExtensionMainViewSurface,
@@ -191,6 +197,9 @@ export interface MobileNetwork {
   transferRemoteDesktopClipboardContent?(credential: PairedCredential, peer: DevicePeerRouteIdentity,
     transfer: RemoteDesktopClipboardContentRequest, signal?: AbortSignal): Promise<RemoteDesktopClipboardContentResult>;
   listPartners(credential: PairedCredential, signal?: AbortSignal): Promise<readonly MobilePartner[]>;
+  listPartnerCatalog?(credential: PairedCredential, signal?: AbortSignal): Promise<MobilePartnerCatalog>;
+  markPartnerRead?(credential: PairedCredential, partnerId: string, throughCursor: bigint,
+    signal?: AbortSignal): Promise<MobilePartnerActivity>;
   listPartnerSessions(credential: PairedCredential, partnerId: string, signal?: AbortSignal): Promise<ListPartnerSessionsResponse>;
   listExtensions(credential: PairedCredential, signal?: AbortSignal): Promise<MobileExtensionCatalog>;
   getExtension(credential: PairedCredential, extensionId: string, signal?: AbortSignal): Promise<MobileExtension>;
@@ -1540,6 +1549,19 @@ export const mobileNetwork: MobileNetwork = {
     const response = await createClient(PartnerService, transport(credential.origin, credential.authKey))
       .listPartners({}, options(signal));
     return projectMobilePartners(response);
+  },
+  async listPartnerCatalog(credential, signal) {
+    const response = await createClient(PartnerService, transport(credential.origin, credential.authKey))
+      .listPartners({}, options(signal));
+    return projectMobilePartnerCatalog(response);
+  },
+  async markPartnerRead(credential, partnerId, throughCursor, signal) {
+    if (!validMobilePartnerId(partnerId) || throughCursor < 0n) {
+      throw new Error("A valid Partner and read cursor are required.");
+    }
+    const response = await createClient(PartnerService, transport(credential.origin, credential.authKey))
+      .markPartnerRead({ partnerId, throughCursor: { value: throughCursor } }, options(signal));
+    return projectMobilePartnerReadResponse(partnerId, throughCursor, response);
   },
   async listPartnerSessions(credential, partnerId, signal) {
     if (!validMobilePartnerId(partnerId)) throw new Error("A valid Partner is required.");
