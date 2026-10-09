@@ -28,6 +28,7 @@ import {
   type NativeSessionCandidate,
   type NativeSessionCatalogEntry,
   type NativeSessionCatalogResult,
+  type NativeSessionPreview,
   type NativeSessionForkResult,
   type NativeSessionNavigation,
   type NativeSessionNavigationResult,
@@ -66,6 +67,7 @@ import {
   type NativeTurn
 } from "./protocol.js";
 import { projectCodexNativeHistory } from "./native-history.js";
+import { readCodexNativeSessionPreview } from "./native-session-preview.js";
 import {
   inspectCodexCatalogMaterialization,
   materializeCodexCatalogSession,
@@ -1589,6 +1591,18 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       entries,
       rejectedCount: scan.rejectedCount
     };
+  }
+
+  async scanNativeSessionPreviewCatalog(): Promise<NativeSessionCatalogResult> {
+    return this.scanNativeSessionCatalog();
+  }
+
+  async readNativeSessionPreview(entry: NativeSessionCatalogEntry): Promise<NativeSessionPreview> {
+    this.#assertOpen();
+    const source = this.#catalogEntrySources.get(entry);
+    const nativeId = parseNativeReference(entry.nativeReference).threadId;
+    if (source === undefined || entry.nativeSessionId !== nativeId) throw expiredCatalogReference();
+    return readCodexNativeSessionPreview(source, nativeId);
   }
 
   async bindCatalogSession(
@@ -5202,6 +5216,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     const supported = new Set<KnownCapability>([
       "session.discovery",
       "session.catalog",
+      "session.preview",
       "session.ai_rename",
       "session.resume",
       "session.detach",
@@ -5255,7 +5270,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     for (const capability of this.#hostCapabilities) supported.add(capability);
     return new Map(CAPABILITIES.map((key): [string, Capability] => {
       const implemented = supported.has(key);
-      const available = key === "session.catalog" || (installed && implemented);
+      const available = key === "session.catalog" || key === "session.preview" || (installed && implemented);
       return [key, {
         key,
         supported: available,

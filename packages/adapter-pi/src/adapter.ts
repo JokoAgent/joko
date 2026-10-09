@@ -25,6 +25,9 @@ import {
   type DurableNativeDispatchPreparation,
   type NativeSessionBinding,
   type NativeSessionCandidate,
+  type NativeSessionCatalogEntry,
+  type NativeSessionCatalogResult,
+  type NativeSessionPreview,
   type NativeSessionDerivation,
   type NativeSessionDerivationLifecycle,
   type NativeSessionForkResult,
@@ -138,6 +141,7 @@ import {
   type ProjectSkillCandidate
 } from "./resources.js";
 import { PiSessionStore, type PiExternalSessionSource } from "./session-store.js";
+import { PiNativePreviewCatalog } from "./native-session-preview.js";
 import { projectPiNativeState } from "./state-projection.js";
 import {
   provisionManagedSilentEncryptedRetry,
@@ -714,6 +718,7 @@ export class PiBackendAdapter implements
   readonly #sessionStore: PiSessionStore;
   readonly #externalSessionRoots: readonly string[];
   readonly #externalSessionReferences = new Map<string, PiExternalSessionSource>();
+  readonly #nativePreviewCatalog: PiNativePreviewCatalog;
   readonly #runtimes = new Map<string, PiRuntime>();
   readonly #runtimeStarts = new Map<string, Promise<PiRuntime>>();
   readonly #spawnProfiles = new Map<string, SessionSpawnProfile>();
@@ -750,6 +755,7 @@ export class PiBackendAdapter implements
       assertContained(sessionRoot, generationsRoot, "Pi generations root");
     }
     this.#externalSessionRoots = externalSessionRoots;
+    this.#nativePreviewCatalog = new PiNativePreviewCatalog([join(sessionRoot, "sessions"), ...externalSessionRoots]);
     this.#options = copyAdapterOptions({ ...options, externalSessionRoots }, this.#agentHome, sessionRoot);
     this.#silentEncryptedRetryEnabled = this.#options.silentEncryptedRetryEnabled
       ?? SILENT_ENCRYPTED_RETRY_DEFAULT_ENABLED;
@@ -4188,6 +4194,16 @@ export class PiBackendAdapter implements
     });
   }
 
+  async scanNativeSessionPreviewCatalog(projectDirectories: readonly string[]): Promise<NativeSessionCatalogResult> {
+    this.#assertNotDisposed();
+    return this.#nativePreviewCatalog.scan(projectDirectories);
+  }
+
+  async readNativeSessionPreview(entry: NativeSessionCatalogEntry): Promise<NativeSessionPreview> {
+    this.#assertNotDisposed();
+    return this.#nativePreviewCatalog.read(entry);
+  }
+
   async listNativeSessions(targetOrWorkspace?: TargetDescriptor | string): Promise<readonly NativeSessionCandidate[]> {
     await this.#initialize();
     const workspaceRoot = typeof targetOrWorkspace === "string"
@@ -6099,6 +6115,7 @@ export class PiBackendAdapter implements
 
   #capabilities(compatibility: PiCompatibilityOutcome): ReadonlyMap<string, Capability> {
     const supported = new Set<string>(compatibility.status === "compatible" ? [
+      "session.preview",
       "session.discovery",
       "session.resume",
       "session.detach",
@@ -6167,7 +6184,7 @@ export class PiBackendAdapter implements
     for (const capability of this.#options.hostCapabilities ?? []) supported.add(capability);
     for (const capability of this.#options.hostToolCapabilities ?? []) supported.add(capability);
     const entries: Array<readonly [string, Capability]> = CAPABILITIES.map((key): readonly [string, Capability] => {
-        if (supported.has(key)) {
+        if (key === "session.preview" || supported.has(key)) {
           return [key, {
             key,
             supported: true,

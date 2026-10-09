@@ -144,6 +144,8 @@ interface ActiveMessageFork {
 export type SessionPanePresentation = "standard" | "filesRail";
 
 export function SessionPane(props: Parameters<typeof SessionPaneContent>[0]): JSX.Element {
+  const conversation = usePartnerConversation();
+  if (conversation?.sessionId === props.session.id) return <SessionPaneContent {...props} />;
   const route = props.controller.state.route;
   return <PartnerConversationProvider controller={props.controller} session={props.session}
     active={route?.kind === "session" && route.sessionId === props.session.id} t={props.t}>

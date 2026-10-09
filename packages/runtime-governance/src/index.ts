@@ -4,3 +4,4 @@ export * from "./process-policy.js";
 export * from "./process-owner.js";
 export * from "./settings.js";
 export * from "./worker-capacity.js";
+export * from "./native-transcript-window.js";

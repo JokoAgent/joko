@@ -27,16 +27,20 @@ import {
   type PartnerSessionView
 } from "./partner-manager.js";
 import { fromProtoRevision, toProtoRevision, toProtoTimestamp } from "./proto-mapper.js";
+import { createPartnerWorkbenchConnectMethods } from "./partner-workbench-connect-service.js";
+import type { PartnerWorkbenchManager } from "./partner-workbench-manager.js";
 
 export function createPartnerConnectService(
   manager: PartnerManager | undefined,
-  authenticate: (context: HandlerContext) => unknown
+  authenticate: (context: HandlerContext) => unknown,
+  workbench?: PartnerWorkbenchManager
 ): ServiceImpl<typeof contract.PartnerService> {
   const owner = (): PartnerManager => {
     if (manager === undefined) throw new ConnectError("Partners are unavailable.", Code.Unimplemented);
     return manager;
   };
   return {
+    ...createPartnerWorkbenchConnectMethods(workbench, authenticate),
     getPartnerDirectory: (_request, context) => {
       authenticate(context);
       return partnerRpc(() => create(contract.GetPartnerDirectoryResponseSchema, {

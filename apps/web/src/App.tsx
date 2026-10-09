@@ -130,6 +130,7 @@ import {
   summarizeWorktreeRemovalPreflights,
   type WorktreeRemovalPreflightSummary
 } from "./worktree-removal-preflight.js";
+import { PartnerConversationScope } from "./components/PartnerConversation.js";
 
 const SessionPane = lazy(async () => ({ default: (await import("./components/SessionPane.js")).SessionPane }));
 
@@ -2154,6 +2155,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
   };
 
   return (
+    <PartnerConversationScope controller={controller} session={activeSession} active={state.route.kind === "session"} t={t}>
     <div
       className={cx("app", shellNavigationOpen && "has-navigation", settingsRoute ? "navigation-hidden" : `navigation-${navigationMode}`, formalFilesMode && "workspace-files-mode", navigationDrag !== undefined && !settingsRoute && "is-navigation-resizing", inspectorAttached && "has-inspector")}
       style={{
@@ -2558,6 +2560,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
         onFile={openPortableSessionImportFile}
       />}
     </div>
+    </PartnerConversationScope>
   );
 }
 

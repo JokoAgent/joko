@@ -7273,6 +7273,18 @@ export class OperationalStore {
     ).changes));
   }
 
+  /** Exact creation provenance excludes service workers from ordinary project
+   * aggregation without inferring ownership from titles or prompt text. */
+  sessionCreationServiceKind(sessionId: string): "partner" | "collaboration" | "messaging" | "learning" | undefined {
+    this.assertOpen();
+    const row = this.database.prepare(`SELECT kind FROM operations
+      WHERE status = 'completed' AND json_extract(response_json, '$.sessionId') = ?
+        AND kind IN ('create_partner_session', 'create_collaboration_worker_session', 'create_messaging_session', 'create_learning_session')
+      ORDER BY created_at LIMIT 1`).get(nonBlank(sessionId, "Session ID")) as Row | undefined;
+    return row === undefined ? undefined : row["kind"] === "create_partner_session" ? "partner"
+      : row["kind"] === "create_collaboration_worker_session" ? "collaboration" : row["kind"] === "create_messaging_session" ? "messaging" : "learning";
+  }
+
   listSessions(options: { readonly targetId?: string; readonly includeArchived?: boolean; readonly includeDeleted?: boolean } = {}): StoredSession[] {
     this.assertOpen();
     const clauses: string[] = [];
@@ -14444,8 +14456,10 @@ export class OperationalStore {
     readonly operationId: string;
     readonly requestOperationId?: string;
     readonly operationBodyHash: string;
-    readonly connectionId: string;
-    readonly authKeyDigest: string;
+    readonly connectionId?: string;
+    readonly authKeyDigest?: string;
+    readonly serviceOriginSessionId?: string;
+    readonly serviceOriginGeneration?: number;
     readonly sessionId: string;
     readonly backendId: string;
     readonly targetId: string;
@@ -14461,10 +14475,20 @@ export class OperationalStore {
     const at = input.at ?? this.now();
     if (!Number.isSafeInteger(at) || at < 0) throw new StoreError("Native catalog adoption time is invalid.");
     return this.write(() => {
-      this.authorizeConnection(input.connectionId, input.authKeyDigest);
       const operation = this.getOperation(input.operationId);
-      if (operation.connectionId !== input.connectionId || operation.kind !== "create_session"
-        || operation.bodyHash !== input.operationBodyHash || operation.status !== "started") {
+      if (input.connectionId !== undefined && input.authKeyDigest !== undefined && input.serviceOriginSessionId === undefined) {
+        this.authorizeConnection(input.connectionId, input.authKeyDigest);
+        if (operation.connectionId !== input.connectionId || operation.kind !== "create_session") throw new StoreError("Native catalog adoption lost its original connection.");
+      } else if (input.connectionId === undefined && input.authKeyDigest === undefined && input.serviceOriginSessionId !== undefined) {
+        const origin = this.getSession(input.serviceOriginSessionId).descriptor;
+        if (operation.connectionId !== undefined || operation.kind !== "create_partner_session" || input.requestOperationId !== undefined
+          || !isRecord(operation.body) || operation.body["serviceKind"] !== "partner"
+          || operation.body["originSessionId"] !== origin.id || operation.body["originSessionGeneration"] !== input.serviceOriginGeneration
+          || origin.binding.generation !== input.serviceOriginGeneration || origin.archived || origin.deletedAt !== undefined || origin.remoteWorkspace !== undefined) {
+          throw new StoreError("Native catalog adoption lost its original service owner.");
+        }
+      } else throw new StoreError("Native catalog adoption requires one exact effect owner.");
+      if (operation.bodyHash !== input.operationBodyHash || operation.status !== "started") {
         throw new StoreError("Native catalog adoption lost its original Operation.");
       }
       if (input.requestOperationId !== undefined) {
@@ -14591,7 +14615,16 @@ export class OperationalStore {
       const target = this.getTarget(current.targetId);
       const request = current.requestOperationId === undefined
         ? undefined : this.getOperation(current.requestOperationId);
-      if (operation.kind !== "create_session" || operation.status !== "started"
+      const body = isRecord(operation.body) ? operation.body : undefined;
+      const serviceOrigin = operation.kind === "create_partner_session" && operation.connectionId === undefined
+        && body?.["serviceKind"] === "partner" && typeof body["originSessionId"] === "string"
+        && typeof body["originSessionGeneration"] === "number"
+        ? this.getSession(body["originSessionId"]).descriptor : undefined;
+      const ownsOperation = operation.kind === "create_session" && operation.connectionId !== undefined
+        || serviceOrigin !== undefined && request === undefined
+          && serviceOrigin.binding.generation === body?.["originSessionGeneration"]
+          && !serviceOrigin.archived && serviceOrigin.deletedAt === undefined && serviceOrigin.remoteWorkspace === undefined;
+      if (!ownsOperation || operation.status !== "started"
         || (request !== undefined && (request.kind !== "createSession" || request.status !== "started"
           || request.connectionId !== operation.connectionId))
         || target.revision !== current.targetRevision || target.descriptor.backendId !== current.backendId

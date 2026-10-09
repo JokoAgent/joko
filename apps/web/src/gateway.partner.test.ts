@@ -14,9 +14,40 @@ import {
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { createOrchestratorGateway } from "./gateway.js";
+import * as contract from "@joko/contracts";
 
 describe("Partner gateway", () => {
   afterEach(() => vi.restoreAllMocks());
+
+  it("uses generated workbench RPCs and rejects stale owners, revisions, details and unknown states", async () => {
+    const owner = { partnerId: "partner-one", profileVersion: 2n, sessionId: "session-one", sessionGeneration: 1n, targetId: "home-one" };
+    let mismatch: "owner" | "revision" | "task" | "state" | undefined;
+    const task = () => ({ id: mismatch === "task" ? "task:other" : "task:one", kind: contract.PartnerWorkbenchTaskKind.SESSION, project: "D:/project", title: "Draft",
+      state: mismatch === "state" ? contract.PartnerWorkbenchTaskState.UNSPECIFIED : contract.PartnerWorkbenchTaskState.STOPPED, group: contract.PartnerWorkbenchGroup.WAITING, updatedAt: timestamp(3n), sourceLabel: "Task" });
+    const workbench = () => ({ owner: { ...owner, profileVersion: mismatch === "owner" ? 3n : owner.profileVersion }, revision: revision(mismatch === "revision" ? 1n : 2n), tasks: [task()], projects: [{ path: "D:/project", name: "project", exists: true }] });
+    const requests: Array<{ method: string; input: any; signal?: AbortSignal }> = [];
+    const gateway = connectedGateway(partnerTransport((method) => {
+      if (method === "getPartnerWorkbenchDetail") return { detail: { task: task(), transcript: [{ role: "assistant", text: "Private reply", privateMessageOrigin: { messageId: "message", threadId: "thread", senderPartnerId: "sender", recipientPartnerId: owner.partnerId, senderDisplayName: "Sender" } }] } };
+      if (method === "resolvePartnerWorkbenchReference") return { kind: "file", value: "D:/project/README.md", workspaceId: "read-only", relativePath: "README.md" };
+      if (method === "readPartnerWorkbenchDocument") return { path: "D:/project/README.md", text: "Context" };
+      if (method.includes("Workbench")) return { workbench: workbench(), acceptedProject: "D:/project" };
+      return partnerResponse(method);
+    }, requests));
+    await gateway.connect();
+    expect((await gateway.getPartnerWorkbench(owner.partnerId)).tasks[0]).toMatchObject({ state: "stopped", group: "waiting" });
+    expect(await gateway.addPartnerWorkbenchProject(owner, 1n, "D:/project")).toMatchObject({ acceptedProject: "D:/project" });
+    await gateway.removePartnerWorkbenchProject(owner, 1n, "D:/project");
+    await gateway.setPartnerWorkbenchJudgment(owner, 1n, { taskId: "task:one", project: "D:/project", title: "Draft", verdict: "unfinished", next: "Finish" });
+    expect((await gateway.getPartnerWorkbenchDetail(owner, "task:one")).transcript[0]?.privateMessageOrigin).toMatchObject({ threadId: "thread", senderDisplayName: "Sender" });
+    expect(await gateway.resolvePartnerWorkbenchReference(owner, "D:/project/README.md")).toMatchObject({ workspaceId: "read-only" });
+    expect(await gateway.readPartnerWorkbenchDocument(owner, "D:/project/README.md")).toMatchObject({ text: "Context" });
+    expect(requests.filter((request) => request.method.includes("Workbench")).map((request) => request.method)).toEqual(["getPartnerWorkbench", "addPartnerWorkbenchProject", "removePartnerWorkbenchProject", "setPartnerWorkbenchJudgment", "getPartnerWorkbenchDetail", "resolvePartnerWorkbenchReference", "readPartnerWorkbenchDocument"]);
+    mismatch = "owner"; await expect(gateway.addPartnerWorkbenchProject(owner, 1n, "D:/project")).rejects.toThrow();
+    mismatch = "revision"; await expect(gateway.removePartnerWorkbenchProject(owner, 2n, "D:/project")).rejects.toThrow();
+    mismatch = "task"; await expect(gateway.getPartnerWorkbenchDetail(owner, "task:one")).rejects.toThrow();
+    mismatch = "state"; await expect(gateway.getPartnerWorkbench(owner.partnerId)).rejects.toThrow();
+    gateway.disconnect();
+  });
 
   it("uses every generated Partner RPC and preserves revisions, inheritance, and model axes", async () => {
     const requests: Array<{ readonly method: string; readonly input: any; readonly signal?: AbortSignal }> = [];

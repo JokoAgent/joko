@@ -1,0 +1,235 @@
+syntax = "proto3";
+
+package joko.v1;
+
+import "google/protobuf/timestamp.proto";
+import "joko/v1/common.proto";
+import "joko/v1/event.proto";
+
+enum PartnerWorkbenchVerdict {
+  PARTNER_WORKBENCH_VERDICT_UNSPECIFIED = 0;
+  PARTNER_WORKBENCH_VERDICT_UNFINISHED = 1;
+  PARTNER_WORKBENCH_VERDICT_IDEA = 2;
+  PARTNER_WORKBENCH_VERDICT_DONE = 3;
+}
+
+enum PartnerWorkbenchTaskKind {
+  PARTNER_WORKBENCH_TASK_KIND_UNSPECIFIED = 0;
+  PARTNER_WORKBENCH_TASK_KIND_SESSION = 1;
+  PARTNER_WORKBENCH_TASK_KIND_EXTERNAL = 2;
+  PARTNER_WORKBENCH_TASK_KIND_ITEM = 3;
+  PARTNER_WORKBENCH_TASK_KIND_AUTOMATION = 4;
+}
+
+enum PartnerWorkbenchTaskState {
+  PARTNER_WORKBENCH_TASK_STATE_UNSPECIFIED = 0;
+  PARTNER_WORKBENCH_TASK_STATE_RUNNING = 1;
+  PARTNER_WORKBENCH_TASK_STATE_WAITING = 2;
+  PARTNER_WORKBENCH_TASK_STATE_QUEUED = 3;
+  PARTNER_WORKBENCH_TASK_STATE_STOPPED = 4;
+  PARTNER_WORKBENCH_TASK_STATE_AUTOMATION = 5;
+  PARTNER_WORKBENCH_TASK_STATE_DONE = 6;
+}
+
+enum PartnerWorkbenchGroup {
+  PARTNER_WORKBENCH_GROUP_UNSPECIFIED = 0;
+  PARTNER_WORKBENCH_GROUP_WAITING = 1;
+  PARTNER_WORKBENCH_GROUP_RUNNING = 2;
+  PARTNER_WORKBENCH_GROUP_TODO = 3;
+  PARTNER_WORKBENCH_GROUP_DONE = 4;
+}
+
+message PartnerWorkbenchOwner {
+  string partner_id = 1;
+  uint64 profile_version = 2;
+  string session_id = 3;
+  uint64 session_generation = 4;
+  string target_id = 5;
+}
+
+message PartnerWorkbenchProject {
+  string path = 1;
+  string name = 2;
+  google.protobuf.Timestamp added_at = 3;
+  bool exists = 4;
+}
+
+message PartnerWorkbenchJudgment {
+  string task_id = 1;
+  string project = 2;
+  string title = 3;
+  PartnerWorkbenchVerdict verdict = 4;
+  optional string next = 5;
+  optional string ref = 6;
+  google.protobuf.Timestamp updated_at = 7;
+}
+
+message PartnerWorkbenchText {
+  string role = 1;
+  string text = 2;
+  google.protobuf.Timestamp at = 3;
+  optional PartnerPrivateMessageOrigin private_message_origin = 4;
+}
+
+message PartnerWorkbenchDigest {
+  optional string purpose = 1;
+  repeated PartnerWorkbenchText recent = 2;
+}
+
+message PartnerWorkbenchTask {
+  string id = 1;
+  PartnerWorkbenchTaskKind kind = 2;
+  string project = 3;
+  string title = 4;
+  PartnerWorkbenchTaskState state = 5;
+  PartnerWorkbenchGroup group = 6;
+  google.protobuf.Timestamp updated_at = 7;
+  optional string session_id = 8;
+  optional string schedule_id = 9;
+  string source_label = 10;
+  bool owned_background = 11;
+  bool unread = 12;
+  optional PartnerWorkbenchJudgment judgment = 13;
+  PartnerWorkbenchDigest digest = 14;
+  optional google.protobuf.Timestamp started_at = 15;
+  optional string schedule_summary = 16;
+}
+
+message PartnerWorkbenchProjectOption {
+  string path = 1;
+  string name = 2;
+  uint32 task_count = 3;
+  uint32 native_count = 4;
+  uint32 automation_count = 5;
+  bool repository = 6;
+  bool granted = 7;
+}
+
+message PartnerWorkbenchRecentFile {
+  string path = 1;
+  google.protobuf.Timestamp modified_at = 2;
+}
+
+message PartnerWorkbenchCommit {
+  string sha = 1;
+  string date = 2;
+  string author = 3;
+  string subject = 4;
+}
+
+message PartnerWorkbenchBranch {
+  string name = 1;
+  string date = 2;
+}
+
+message PartnerWorkbenchGitBrief {
+  optional string branch = 1;
+  optional uint32 changes = 2;
+  repeated PartnerWorkbenchCommit commits = 3;
+  repeated PartnerWorkbenchBranch branches = 4;
+  repeated string remotes = 5;
+}
+
+message PartnerWorkbenchCodeHostItem {
+  uint32 number = 1;
+  string title = 2;
+  string url = 3;
+  google.protobuf.Timestamp updated_at = 4;
+}
+
+message PartnerWorkbenchCodeHostBrief {
+  optional string repository = 1;
+  repeated PartnerWorkbenchCodeHostItem pull_requests = 2;
+  repeated PartnerWorkbenchCodeHostItem issues = 3;
+  optional string unavailable = 4;
+}
+
+message PartnerWorkbenchProjectBrief {
+  string project = 1;
+  repeated string docs = 2;
+  repeated PartnerWorkbenchRecentFile recent = 3;
+  optional PartnerWorkbenchGitBrief git = 4;
+  PartnerWorkbenchCodeHostBrief code_host = 5;
+}
+
+message PartnerWorkbenchSnapshot {
+  PartnerWorkbenchOwner owner = 1;
+  Revision revision = 2;
+  repeated PartnerWorkbenchProject projects = 3;
+  repeated PartnerWorkbenchJudgment judgments = 4;
+  repeated PartnerWorkbenchProjectOption project_options = 5;
+  repeated PartnerWorkbenchTask tasks = 6;
+  repeated PartnerWorkbenchTask candidates = 7;
+  repeated PartnerWorkbenchProjectBrief briefs = 8;
+  uint32 older_count = 9;
+  bool truncated = 10;
+  repeated string unavailable_sources = 11;
+  repeated PartnerWorkbenchArtifact outputs = 12;
+}
+
+message PartnerWorkbenchArtifact {
+  string id = 1;
+  string title = 2;
+  string mime_type = 3;
+  uint64 byte_size = 4;
+  string session_id = 5;
+}
+
+message PartnerWorkbenchDetail {
+  PartnerWorkbenchTask task = 1;
+  repeated PartnerWorkbenchText transcript = 2;
+  bool truncated = 3;
+  repeated PartnerWorkbenchArtifact artifacts = 4;
+}
+
+message GetPartnerWorkbenchRequest { string partner_id = 1; }
+message GetPartnerWorkbenchResponse { PartnerWorkbenchSnapshot workbench = 1; }
+
+message AddPartnerWorkbenchProjectRequest {
+  PartnerWorkbenchOwner owner = 1;
+  Revision expected_revision = 2;
+  string path = 3;
+}
+message AddPartnerWorkbenchProjectResponse { PartnerWorkbenchSnapshot workbench = 1; string accepted_project = 2; }
+
+message RemovePartnerWorkbenchProjectRequest {
+  PartnerWorkbenchOwner owner = 1;
+  Revision expected_revision = 2;
+  string path = 3;
+}
+message RemovePartnerWorkbenchProjectResponse { PartnerWorkbenchSnapshot workbench = 1; }
+
+message SetPartnerWorkbenchJudgmentRequest {
+  PartnerWorkbenchOwner owner = 1;
+  Revision expected_revision = 2;
+  PartnerWorkbenchJudgment judgment = 3;
+}
+message SetPartnerWorkbenchJudgmentResponse { PartnerWorkbenchSnapshot workbench = 1; }
+
+message GetPartnerWorkbenchDetailRequest {
+  PartnerWorkbenchOwner owner = 1;
+  string task_id = 2;
+}
+message GetPartnerWorkbenchDetailResponse { PartnerWorkbenchDetail detail = 1; }
+
+message ResolvePartnerWorkbenchReferenceRequest {
+  PartnerWorkbenchOwner owner = 1;
+  string ref = 2;
+}
+message ResolvePartnerWorkbenchReferenceResponse {
+  string kind = 1;
+  string value = 2;
+  optional string workspace_id = 3;
+  optional string relative_path = 4;
+  bool directory = 5;
+}
+
+message ReadPartnerWorkbenchDocumentRequest {
+  PartnerWorkbenchOwner owner = 1;
+  string path = 2;
+}
+message ReadPartnerWorkbenchDocumentResponse {
+  string path = 1;
+  string text = 2;
+  bool truncated = 3;
+}

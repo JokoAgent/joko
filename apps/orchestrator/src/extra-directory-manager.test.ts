@@ -15,6 +15,24 @@ afterEach(() => {
 });
 
 describe("ExtraDirectoryManager", () => {
+  it("derives all 50 workbench grants without consuming ordinary approvals, and revokes them with their owner", async () => {
+    const fixture = createFixture(); const manager = new ExtraDirectoryManager(fixture.store); let current = true;
+    const directories = Array.from({ length: 50 }, (_, index) => ({ path: join(fixture.root, `project-${index}`), addedAt: index + 1 }));
+    for (const entry of directories) mkdirSync(entry.path);
+    manager.replaceWorkbenchGrant({ targetId: "target-one", revision: 2n, directories, current: () => current });
+    expect(manager.resolveSelection("target-one", undefined)).toHaveLength(50);
+    expect(fixture.store.listSettings("target")).toEqual([]);
+    const ordinary = join(fixture.root, "ordinary"); mkdirSync(ordinary);
+    await manager.add({ workspaceId: "workspace-one", serverPath: ordinary, access: "read_only" });
+    expect(manager.listForTarget("target-one")).toHaveLength(51);
+    const selected = manager.listForTarget("target-one").find((row) => row.path === directories[0]!.path)!;
+    manager.replaceWorkbenchGrant({ targetId: "target-one", revision: 3n, directories: directories.slice(1), current: () => current });
+    await expect(async () => manager.resolveSelection("target-one", [selected.id])).rejects.toMatchObject({ publicError: { code: "EXTRA_DIRECTORY_NOT_APPROVED" } });
+    manager.replaceWorkbenchGrant({ targetId: "target-one", revision: 2n, directories, current: () => current });
+    expect(manager.listForTarget("target-one")).toHaveLength(50);
+    current = false;
+    expect(manager.listForTarget("target-one")).toHaveLength(1);
+  });
   it("projects only canonical explicit approvals and removes them by authoritative ID", async () => {
     const fixture = createFixture();
     const directory = join(fixture.root, "reference");

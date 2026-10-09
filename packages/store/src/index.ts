@@ -1,4 +1,5 @@
 export * from "./errors.js";
+export * from "./partner-workbench-store.js";
 export * from "./voice-dictionary-peer-store.js";
 export {
   CONTACT_SCHEMA_BASELINE_ID,

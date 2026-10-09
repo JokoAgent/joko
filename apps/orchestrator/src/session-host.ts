@@ -20,6 +20,7 @@ import type {
   NativeSessionCandidate,
   NativeSessionCatalogEntry,
   NativeSessionCatalogResult,
+  NativeSessionPreview,
   NativeSessionDerivation,
   NativeSessionDerivationLifecycle,
   NativeSessionForkResult,
@@ -506,8 +507,13 @@ export interface CreateServiceSessionInput {
   readonly planMode: boolean;
   /** Private, bounded identity snapshot for service-owned partner creation. */
   readonly appendSystemPrompt?: string;
-  readonly nativeStart?: undefined;
-  readonly catalogImport?: undefined;
+  readonly nativeStart?: NativeSessionStart;
+  readonly catalogImport?: CreateSessionInput["catalogImport"];
+  readonly initialPlacement?: "project" | "dialogue";
+  /** Trusted Partner workbench caller; never supplied by a public create request. */
+  readonly originSessionId?: string;
+  readonly originSessionGeneration?: number;
+  readonly assertServiceScope?: () => void;
   readonly worktree?: { readonly sourceRef?: string; readonly refreshRemote: boolean };
 }
 
@@ -755,6 +761,7 @@ export class SessionHost {
   readonly #artifactStore: ArtifactStore;
   readonly #adapters = new Map<string, BackendAdapter>();
   readonly #adapterGenerations = new Map<string, number>();
+  readonly #nativePreviewOwners = new WeakMap<NativeSessionCatalogEntry, { readonly backendId: string; readonly adapter: BackendAdapter; readonly generation: number }>();
   readonly #initialBackendDescriptors = new Map<string, BackendDescriptor>();
   readonly #initialBackendDescriptorsAlreadyPublished: boolean;
   readonly #active = new Map<string, ActiveSession>();
@@ -1279,6 +1286,38 @@ export class SessionHost {
     }
   }
 
+  /** Project-scoped read-only sources retain their exact Adapter generation.
+   * Preview support alone never advertises catalog import in task navigation. */
+  async scanNativeSessionPreviews(backendId: string, projects: readonly string[]): Promise<{
+    readonly entries: readonly NativeSessionCatalogEntry[];
+    readonly snapshotToken?: string;
+  }> {
+    this.#assertOpen();
+    const adapter = this.requireAdapter(backendId);
+    const generation = this.requireAdapterGeneration(backendId, adapter);
+    const capabilities = this.#store.getBackend(backendId).descriptor.capabilities;
+    if (capabilities.get("session.preview")?.supported !== true || adapter.readNativeSessionPreview === undefined) {
+      throw new StoreError("Read-only native previews are unavailable for this backend.");
+    }
+    const importable = capabilities.get("session.catalog")?.supported === true && adapter.scanNativeSessionCatalog !== undefined && adapter.bindCatalogSession !== undefined;
+    const snapshot = importable ? await this.scanNativeSessionCatalogSnapshot(backendId) : undefined;
+    const result = snapshot?.result ?? await adapter.scanNativeSessionPreviewCatalog?.(projects);
+    if (result === undefined) throw new StoreError("Read-only native discovery is unavailable for this backend.");
+    if (this.#adapters.get(backendId) !== adapter || this.#adapterGenerations.get(backendId) !== generation) throw new StoreError("The native preview owner changed. Refresh its sources.");
+    for (const entry of result.entries) this.#nativePreviewOwners.set(entry, { backendId, adapter, generation });
+    return { entries: result.entries, ...(snapshot === undefined ? {} : { snapshotToken: snapshot.token }) };
+  }
+
+  async readNativeSessionPreview(backendId: string, entry: NativeSessionCatalogEntry): Promise<NativeSessionPreview> {
+    this.#assertOpen();
+    const owner = this.#nativePreviewOwners.get(entry);
+    if (owner === undefined || owner.backendId !== backendId || this.#adapters.get(backendId) !== owner.adapter
+      || this.#adapterGenerations.get(backendId) !== owner.generation || owner.adapter.readNativeSessionPreview === undefined) throw new StoreError("The native preview owner changed. Refresh its sources.");
+    const result = await owner.adapter.readNativeSessionPreview(entry);
+    if (this.#adapters.get(backendId) !== owner.adapter || this.#adapterGenerations.get(backendId) !== owner.generation) throw new StoreError("The native preview owner changed. Refresh its sources.");
+    return result;
+  }
+
   async scanNativeSessionCatalog(backendId: string, force = false): Promise<NativeSessionCatalogResult> {
     return (await this.scanNativeSessionCatalogSnapshot(backendId, force)).result;
   }
@@ -1619,6 +1658,9 @@ export class SessionHost {
    * idempotent across retries. */
   async createServiceSession(input: CreateServiceSessionInput): Promise<OperationExecution<{ readonly sessionId: string }>> {
     this.#assertOpen();
+    input.assertServiceScope?.();
+    if (input.catalogImport !== undefined && (input.serviceKind !== "partner" || input.originSessionId === undefined
+      || input.originSessionGeneration === undefined || input.assertServiceScope === undefined)) throw new StoreError("A service catalog import requires its exact Partner scope.");
     validateAppendSystemPrompt(input.appendSystemPrompt);
     if (input.serviceKind === "session_handoff" && input.appendSystemPrompt !== undefined) {
       throw new StoreError("A handed-off task cannot supply a private system prompt.");
@@ -6730,10 +6772,40 @@ export class SessionHost {
   }): Promise<NativeCatalogAdoptionResolution> {
     this.#assertOpen();
     this.#store.authorizeConnection(input.connection.id, input.connection.authKeyDigest);
+    return this.reconcileNativeCatalogAdoption(input);
+  }
+
+  async reconcileServiceNativeCatalogAdoption(input: {
+    readonly operationId: string;
+    readonly originSessionId: string;
+    readonly originSessionGeneration: number;
+    readonly assertServiceScope: () => void;
+  }): Promise<NativeCatalogAdoptionResolution> {
+    this.#assertOpen();
+    const assertOwner = (): void => {
+      input.assertServiceScope();
+      const operation = this.#store.getOperation(input.operationId);
+      const body = operation.body as { readonly serviceKind?: unknown; readonly originSessionId?: unknown; readonly originSessionGeneration?: unknown };
+      const origin = this.#store.getSession(input.originSessionId).descriptor;
+      if (operation.connectionId !== undefined || operation.kind !== "create_partner_session" || body.serviceKind !== "partner"
+        || body.originSessionId !== input.originSessionId || body.originSessionGeneration !== input.originSessionGeneration
+        || origin.archived || origin.deletedAt !== undefined || origin.remoteWorkspace !== undefined || origin.binding.generation !== input.originSessionGeneration) {
+        throw new AuthorizationError("The native adoption lost its service owner.");
+      }
+    };
+    assertOwner();
+    return this.reconcileNativeCatalogAdoption({ operationId: input.operationId, assertServiceScope: assertOwner });
+  }
+
+  private async reconcileNativeCatalogAdoption(input: {
+    readonly operationId: string;
+    readonly connection?: ConnectionRecord;
+    readonly assertServiceScope?: () => void;
+  }): Promise<NativeCatalogAdoptionResolution> {
     const original = this.#store.findNativeCatalogAdoptionForRequest(input.operationId)
       ?? this.#store.getNativeCatalogAdoption(input.operationId);
     const operation = this.#store.getOperation(original.operationId);
-    if (operation.connectionId !== input.connection.id) {
+    if (input.connection === undefined ? operation.connectionId !== undefined || input.assertServiceScope === undefined : operation.connectionId !== input.connection.id) {
       throw new AuthorizationError("Native catalog adoption belongs to another connection.");
     }
     if (original.state === "adopted" || original.state === "absent"
@@ -6749,6 +6821,7 @@ export class SessionHost {
       let inspection: "present" | "absent" | "unknown" = "unknown";
       let releaseAdmission: (() => void) | undefined;
       try {
+        input.assertServiceScope?.();
         const adapter = this.requireAdapter(current.backendId);
         const generation = this.requireAdapterGeneration(current.backendId, adapter);
         const request = current.requestOperationId === undefined
@@ -6768,16 +6841,17 @@ export class SessionHost {
           current.binding, current.recoveryReference
         ) ?? "unknown";
         this.assertCurrentAdapterGeneration(current.backendId, adapter, generation);
+        input.assertServiceScope?.();
         if (inspection === "present") {
           this.#store.transaction((store) => {
-            store.completeAuthorizedDeferredEffectOperation(
-              input.connection.id,
-              input.connection.authKeyDigest,
-              operation.id,
-              operation.bodyHash,
-              (transaction) => this.adoptNativeCatalogSession(transaction, current, Date.now())
-            );
-            this.completeRequestingCatalogOperation(store, current, input.connection);
+            input.assertServiceScope?.();
+            if (input.connection === undefined) {
+              store.completeDeferredEffectOperation(operation.id, operation.bodyHash, (transaction) => this.adoptNativeCatalogSession(transaction, current, Date.now()));
+            } else {
+              store.completeAuthorizedDeferredEffectOperation(input.connection.id, input.connection.authKeyDigest, operation.id,
+                operation.bodyHash, (transaction) => this.adoptNativeCatalogSession(transaction, current, Date.now()));
+              this.completeRequestingCatalogOperation(store, current, input.connection);
+            }
           });
           this.invalidateNativeSessionCatalog(current.backendId);
         } else if (inspection === "absent") {
@@ -9746,13 +9820,13 @@ export class SessionHost {
           : await (async () => {
               if (adapter.bindCatalogSession === undefined) throw nativeStartUnsupported("attach");
               return adapter.bindCatalogSession(catalogEntry, context.generation, async ({ binding, recoveryReference }) => {
-                if (!("connection" in input)) throw new StoreError("Catalog materialization requires its original connection.");
+                if ("assertServiceScope" in input) input.assertServiceScope?.();
                 this.#store.claimNativeCatalogAdoption({
                   operationId: claim.operation.id,
-                  ...(input.requestOperationId === undefined ? {} : { requestOperationId: input.requestOperationId }),
+                  ...("requestOperationId" in input && input.requestOperationId !== undefined ? { requestOperationId: input.requestOperationId } : {}),
                   operationBodyHash: claim.operation.bodyHash,
-                  connectionId: input.connection.id,
-                  authKeyDigest: input.connection.authKeyDigest,
+                  ...("connection" in input ? { connectionId: input.connection.id, authKeyDigest: input.connection.authKeyDigest }
+                    : "originSessionId" in input ? { serviceOriginSessionId: input.originSessionId, serviceOriginGeneration: input.originSessionGeneration } : {}),
                   sessionId,
                   backendId: target.descriptor.backendId,
                   targetId: target.descriptor.id,
@@ -9780,6 +9854,7 @@ export class SessionHost {
       }
 
       const execute = async (): Promise<OperationExecution<{ readonly sessionId: string }>> => {
+        if ("assertServiceScope" in input) input.assertServiceScope?.();
         if (nativeStart.kind === "attach") {
           const duplicate = this.#store.findLiveSessionByNativeBinding(
             target.descriptor.backendId,
@@ -9838,6 +9913,7 @@ export class SessionHost {
         if (operationBodyHash(createSessionOperationBody(input)) !== claim.operation.bodyHash) {
           throw new Error("Create task input changed during execution.");
         }
+        if ("assertServiceScope" in input) input.assertServiceScope?.();
         this.assertCurrentAdapterGeneration(
           target.descriptor.backendId,
           adapter,
@@ -15449,8 +15525,8 @@ function createSessionOperationBody(input: SessionCreationInput): unknown {
     planMode: input.planMode,
     nativeStart: input.nativeStart ?? { kind: "new" },
     worktree: input.worktree,
-    ...("connection" in input ? { initialPlacement: input.initialPlacement ?? "project" } : {}),
-    ...("connection" in input && input.catalogImport !== undefined
+    ...("connection" in input || "initialPlacement" in input ? { initialPlacement: input.initialPlacement ?? "project" } : {}),
+    ...(input.catalogImport !== undefined
       ? { catalogImport: input.catalogImport }
       : {}),
     ...("automationOrigin" in input ? {
@@ -15460,6 +15536,9 @@ function createSessionOperationBody(input: SessionCreationInput): unknown {
       }
     } : {}),
     ...("serviceKind" in input ? { serviceKind: input.serviceKind } : {}),
+    ...("originSessionId" in input && input.originSessionId !== undefined ? {
+      originSessionId: input.originSessionId, originSessionGeneration: input.originSessionGeneration
+    } : {}),
     ...("worktreeOwner" in input && input.worktreeOwner !== undefined
       ? { worktreeOwner: input.worktreeOwner }
       : {}),

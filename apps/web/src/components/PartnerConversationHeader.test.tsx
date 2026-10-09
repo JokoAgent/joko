@@ -18,6 +18,21 @@ afterEach(async () => {
 });
 
 describe("canonical Partner conversation header", () => {
+  it("opens the local trusted workbench from the canonical header and retires its entry for a remote owner", async () => {
+    const base = controller(); const setInspectorOpen = vi.fn(async () => undefined);
+    const local = { ...base, setInspectorOpen, state: { ...base.state, activeProfile: { ...base.state.activeProfile, origin: "http://127.0.0.1" },
+      snapshot: { ...base.state.snapshot, targets: [{ id: "home-one", backendId: "backend-one", trusted: true, workspaceRoot: "D:/home" }] } } } as unknown as AppController;
+    const view = await mount(local);
+    const trigger = required(view.host.querySelector<HTMLButtonElement>("button[aria-label='workbench.title']"));
+    expect(trigger.disabled).toBe(false);
+    await act(async () => { trigger.click(); await settle(); });
+    await act(async () => { trigger.click(); await settle(); });
+    expect(setInspectorOpen).toHaveBeenCalledTimes(2);
+    expect(setInspectorOpen).toHaveBeenCalledWith(true);
+    await view.render(base);
+    expect(view.host.querySelector("button[aria-label='workbench.title']")).toBeNull();
+  });
+
   it("opens the same profile settings from name and gear, saves authoritative identity, and preserves the conversation", async () => {
     vi.useFakeTimers();
     const updated = partner({ displayName: "Aster updated", avatar: "spark", revision: 9n, profileVersion: 3n });

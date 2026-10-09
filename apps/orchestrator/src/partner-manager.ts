@@ -6,6 +6,7 @@ import type { PromptInput, SessionDescriptor, TargetDescriptor } from "@joko/cor
 import {
   NotFoundError,
   PartnerStoreError,
+  partnerHomeDirectoryName,
   type CreatePartnerInput,
   type OperationalStore,
   type PersistedEvent,
@@ -965,7 +966,7 @@ export class PartnerManager {
   async #writeHome(profile: PartnerProfileRecord): Promise<string> {
     await mkdir(this.#homesRoot, { recursive: true });
     const root = await realpath(this.#homesRoot);
-    const directoryName = `partner-${createHash("sha256").update(profile.id, "utf8").digest("hex").slice(0, 32)}`;
+    const directoryName = partnerHomeDirectoryName(profile.id);
     const homePath = join(root, directoryName);
     await mkdir(homePath).catch((error: unknown) => {
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;

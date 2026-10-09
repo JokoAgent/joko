@@ -2950,6 +2950,13 @@ export function useAppController(): AppController {
       gateway().getPartnerDelegation(partnerId, delegationId, signal),
     cancelPartnerDelegation: (partnerId, delegationId, expectedRevision, signal) =>
       gateway().cancelPartnerDelegation(partnerId, delegationId, expectedRevision, signal),
+    getPartnerWorkbench: (partnerId, signal) => gateway().getPartnerWorkbench(partnerId, signal),
+    addPartnerWorkbenchProject: (owner, expectedRevision, path, signal) => gateway().addPartnerWorkbenchProject(owner, expectedRevision, path, signal),
+    removePartnerWorkbenchProject: (owner, expectedRevision, path, signal) => gateway().removePartnerWorkbenchProject(owner, expectedRevision, path, signal),
+    setPartnerWorkbenchJudgment: (owner, expectedRevision, judgment, signal) => gateway().setPartnerWorkbenchJudgment(owner, expectedRevision, judgment, signal),
+    getPartnerWorkbenchDetail: (owner, taskId, signal) => gateway().getPartnerWorkbenchDetail(owner, taskId, signal),
+    resolvePartnerWorkbenchReference: (owner, ref, signal) => gateway().resolvePartnerWorkbenchReference(owner, ref, signal),
+    readPartnerWorkbenchDocument: (owner, path, signal) => gateway().readPartnerWorkbenchDocument(owner, path, signal),
     listCollaborationGoals: (sessionId, includeArchived, signal) =>
       gateway().listCollaborationGoals(sessionId, includeArchived, signal),
     getCollaborationGoal: (goalId, viewerSessionId, signal) =>

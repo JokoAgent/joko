@@ -10,6 +10,8 @@ import { nextVoiceDictionaryWatchSequence, projectVoiceDictionaryPeerStatus, rea
 import { SshKeyService, SshAgentState, SshAgentHostPlatform, SshKeyPassphrasePurpose, SshInstallShell, type SshKey, type CredentialUploadTicket } from "@joko/contracts";
 import type { SshKeyView, SshKeyCatalogView, SshKeyGenerateDraft, SshKeyInstallCommandDraft } from "./model.js";
 import type { UsageReportQueryView, UsageReportView } from "./model.js";
+import type { PartnerWorkbenchView, PartnerWorkbenchOwnerView, PartnerWorkbenchJudgmentView, PartnerWorkbenchDetailView } from "./model.js";
+import { mapPartnerWorkbench, mapPartnerWorkbenchDetail, protoWorkbenchOwner, protoWorkbenchJudgment, sameWorkbenchOwner } from "./partner-workbench-wire.js";
 import {
   ArtifactKind,
   AudioArtifactKind,
@@ -7441,6 +7443,68 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
       throw new GatewayError("Orchestrator returned a mismatched Partner delegation cancellation.");
     }
     return delegation;
+  }
+
+  async getPartnerWorkbench(partnerId: string, signal?: AbortSignal): Promise<PartnerWorkbenchView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(PartnerService, scope.transport).getPartnerWorkbench({ partnerId }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    const view = mapPartnerWorkbench(response.workbench);
+    if (view.owner.partnerId !== partnerId) throw new GatewayError("Orchestrator returned a mismatched workbench owner.");
+    return view;
+  }
+
+  async addPartnerWorkbenchProject(owner: PartnerWorkbenchOwnerView, expectedRevision: bigint, path: string, signal?: AbortSignal): Promise<PartnerWorkbenchView & { readonly acceptedProject: string }> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(PartnerService, scope.transport).addPartnerWorkbenchProject({ owner: protoWorkbenchOwner(owner), expectedRevision: { value: expectedRevision }, path }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    const view = mapPartnerWorkbench(response.workbench);
+    if (!sameWorkbenchOwner(view.owner, owner) || view.revision < expectedRevision) throw new GatewayError("The workbench owner changed.");
+    if (!view.projects.some((project) => project.path === response.acceptedProject)) throw new GatewayError("The handed-over project is unavailable.");
+    return { ...view, acceptedProject: response.acceptedProject };
+  }
+
+  async removePartnerWorkbenchProject(owner: PartnerWorkbenchOwnerView, expectedRevision: bigint, path: string, signal?: AbortSignal): Promise<PartnerWorkbenchView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(PartnerService, scope.transport).removePartnerWorkbenchProject({ owner: protoWorkbenchOwner(owner), expectedRevision: { value: expectedRevision }, path }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    const view = mapPartnerWorkbench(response.workbench);
+    if (!sameWorkbenchOwner(view.owner, owner) || view.revision < expectedRevision) throw new GatewayError("The workbench owner changed.");
+    return view;
+  }
+
+  async setPartnerWorkbenchJudgment(owner: PartnerWorkbenchOwnerView, expectedRevision: bigint, judgment: Omit<PartnerWorkbenchJudgmentView, "updatedAt">, signal?: AbortSignal): Promise<PartnerWorkbenchView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(PartnerService, scope.transport).setPartnerWorkbenchJudgment({ owner: protoWorkbenchOwner(owner), expectedRevision: { value: expectedRevision }, judgment: protoWorkbenchJudgment(judgment) }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    const view = mapPartnerWorkbench(response.workbench);
+    if (!sameWorkbenchOwner(view.owner, owner) || view.revision < expectedRevision) throw new GatewayError("The workbench owner changed.");
+    return view;
+  }
+
+  async getPartnerWorkbenchDetail(owner: PartnerWorkbenchOwnerView, taskId: string, signal?: AbortSignal): Promise<PartnerWorkbenchDetailView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(PartnerService, scope.transport).getPartnerWorkbenchDetail({ owner: protoWorkbenchOwner(owner), taskId }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    const detail = mapPartnerWorkbenchDetail(response.detail);
+    if (detail.task.id !== taskId) throw new GatewayError("Orchestrator returned a mismatched workbench task.");
+    return detail;
+  }
+
+  async resolvePartnerWorkbenchReference(owner: PartnerWorkbenchOwnerView, ref: string, signal?: AbortSignal): Promise<{ readonly kind: "https" | "file"; readonly value: string; readonly workspaceId?: string; readonly relativePath?: string; readonly directory: boolean }> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(PartnerService, scope.transport).resolvePartnerWorkbenchReference({ owner: protoWorkbenchOwner(owner), ref }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    if (response.kind !== "https" && response.kind !== "file" || response.value === "") throw new GatewayError("The workbench reference is unavailable.");
+    if (response.kind === "file" && (response.workspaceId === undefined || response.workspaceId === "" || response.relativePath === undefined)) throw new GatewayError("The project file authority is unavailable.");
+    return { kind: response.kind, value: response.value, workspaceId: response.workspaceId, relativePath: response.relativePath, directory: response.directory };
+  }
+
+  async readPartnerWorkbenchDocument(owner: PartnerWorkbenchOwnerView, path: string, signal?: AbortSignal): Promise<{ readonly path: string; readonly text: string; readonly truncated: boolean }> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(PartnerService, scope.transport).readPartnerWorkbenchDocument({ owner: protoWorkbenchOwner(owner), path }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return { path: response.path, text: response.text, truncated: response.truncated };
   }
 
   async listCollaborationGoals(

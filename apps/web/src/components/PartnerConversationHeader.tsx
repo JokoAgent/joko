@@ -1,4 +1,4 @@
-import { Menu, RefreshCcw, Settings2 } from "lucide-react";
+import { ListTodo, Menu, RefreshCcw, Settings2 } from "lucide-react";
 import type { JSX, ReactNode } from "react";
 
 import type { SessionView } from "../model.js";
@@ -27,6 +27,8 @@ export function PartnerConversationHeader({ session, navigationOpen, onOpenNavig
         : <span className="partner-conversation-placeholder">{!failed && <Spinner />}{failed ? session.name : t("partners.loading")}</span>}
     </div>
     <div className="session-header__actions">
+      {conversation.workbenchOpenFailed && <span role="alert" className="partner-conversation-error">{t("workbench.openFailed")}</span>}
+      {conversation.workbenchAvailable && <IconButton label={t("workbench.title")} disabled={!editable} onClick={conversation.openWorkbench}><ListTodo aria-hidden="true" /></IconButton>}
       {failed && <span className="partner-conversation-error" role="status">{t("partners.reloadFailed")}</span>}
       {failed && conversation.connected && <IconButton label={t("common.retry")} onClick={conversation.refresh}><RefreshCcw aria-hidden="true" /></IconButton>}
       {partner !== undefined && <IconButton label={t("partners.profileSettings")} onClick={() => openSettings()} disabled={!editable} aria-haspopup="dialog"><Settings2 aria-hidden="true" /></IconButton>}

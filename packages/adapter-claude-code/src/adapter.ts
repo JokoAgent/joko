@@ -44,6 +44,7 @@ import {
   type NativeNavigationTarget,
   type NativeSessionCatalogEntry,
   type NativeSessionCatalogResult,
+  type NativeSessionPreview,
   type NativeSessionCandidate,
   type NativeSessionState,
   type PermissionMode,
@@ -106,6 +107,7 @@ import {
   scanClaudeSessionCatalog,
   type ClaudeCatalogSource
 } from "./session-catalog.js";
+import { readClaudeNativeSessionPreview } from "./native-session-preview.js";
 import {
   ClaudeCodeOAuthAccount,
   type ClaudeCodeAccountSnapshot,
@@ -1214,6 +1216,17 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
       entries,
       rejectedCount: scan.rejectedCount
     };
+  }
+
+  async scanNativeSessionPreviewCatalog(): Promise<NativeSessionCatalogResult> {
+    return this.scanNativeSessionCatalog();
+  }
+
+  async readNativeSessionPreview(entry: NativeSessionCatalogEntry): Promise<NativeSessionPreview> {
+    this.#assertUsable();
+    const source = this.#catalogSources.get(entry);
+    if (source === undefined || !catalogEntryMatches(entry, source.entry)) throw catalogSourceChanged();
+    return readClaudeNativeSessionPreview(source.source, (text) => this.#projection.text(text, 1_200));
   }
 
   async bindCatalogSession(
@@ -6723,6 +6736,7 @@ function capabilityManifest(
     "session.detach",
     "session.discovery",
     "session.catalog",
+    "session.preview",
     "turn.stream",
     "turn.abort",
     "input.text",
@@ -6768,7 +6782,7 @@ function capabilityManifest(
   for (const capability of hostCapabilities) supported.add(capability);
   return new Map(CAPABILITIES.map((key): [string, Capability] => {
     const implemented = supported.has(key);
-    const available = key === "session.catalog" || (installed && implemented);
+    const available = key === "session.catalog" || key === "session.preview" || (installed && implemented);
     const options = key === "session.rewind_to_start" && freshContextSupported && !remoteFreshContextSupported
       ? [SESSION_REWIND_SERVICE_NODE_ONLY_OPTION]
       : key === "provider.login" && supportsLogin

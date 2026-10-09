@@ -2,6 +2,7 @@ import { createContext, useCallback, useContext, useEffect, useMemo, useRef, use
 
 import type { AppController } from "../controller.js";
 import type { PartnerListView, PartnerMutationView, PartnerProfileView, SessionView } from "../model.js";
+import { isLoopbackHostname } from "../connection-origin.js";
 import { PartnerSettingsDialog } from "./PartnersPage.js";
 import type { Translator } from "./types.js";
 
@@ -17,6 +18,7 @@ interface IdentityProjection {
 }
 
 export interface PartnerConversationView {
+  readonly sessionId: string;
   readonly ownerKey: string;
   readonly kind?: "task" | "partner";
   readonly partner?: PartnerProfileView;
@@ -32,10 +34,18 @@ export interface PartnerConversationView {
   readonly refresh: () => void;
   readonly openSettings: (section?: "profile" | "activity") => void;
   readonly openPrivateThread: (threadId: string) => void;
+  readonly workbenchAvailable: boolean;
+  readonly workbenchRequest?: number;
+  readonly workbenchOpenFailed: boolean;
+  readonly openWorkbench: () => void;
 }
 
 const PartnerConversationContext = createContext<PartnerConversationView | undefined>(undefined);
 export function usePartnerConversation(): PartnerConversationView | undefined { return useContext(PartnerConversationContext); }
+
+export function PartnerConversationScope({ session, ...props }: Omit<Parameters<typeof PartnerConversationProvider>[0], "session"> & { readonly session?: SessionView }): JSX.Element {
+  return session === undefined ? <>{props.children}</> : <PartnerConversationProvider {...props} session={session} />;
+}
 
 /** One authenticated view owner supplies identity to the header, messages and
  * input without remounting the conversation or moving its frozen entry cursor. */
@@ -65,6 +75,8 @@ export function PartnerConversationProvider({ controller, session, active, t, ch
   const entryReadRef = useRef<{ readonly owner: object; readonly partnerId: string; readonly cursor: bigint } | undefined>(undefined);
   const [readRetry, setReadRetry] = useState(0);
   const [readFailure, setReadFailure] = useState<object>();
+  const [workbenchRequest, setWorkbenchRequest] = useState<{ readonly owner: string; readonly sequence: number }>();
+  const [workbenchOpenFailure, setWorkbenchOpenFailure] = useState<object>();
   const readFlightRef = useRef<{ readonly owner: object; readonly abort: AbortController; pending: bigint; committed: bigint; running: boolean; failed: boolean } | undefined>(undefined);
   if (readFlightRef.current?.owner !== conversationOwner) {
     readFlightRef.current?.abort.abort();
@@ -193,11 +205,23 @@ export function PartnerConversationProvider({ controller, session, active, t, ch
   };
   const openSettings = (section: "profile" | "activity" = "profile"): void => { if (editable) setSettings({ owner: conversationOwner, section }); };
   const openPrivateThread = (threadId: string): void => { if (editable) setSettings({ owner: conversationOwner, section: "activity", threadId }); };
+  const target = controller.state.snapshot.targets.find((item) => item.id === session.targetId);
+  const workbenchAvailable = partnerIdentity !== undefined && target?.trusted === true && target.remoteWorkspace === undefined && isLocalOrigin(profile?.origin);
+  const openWorkbench = (): void => {
+    if (!workbenchAvailable || !editable) return;
+    setWorkbenchOpenFailure(undefined);
+    setWorkbenchRequest((previous) => ({ owner: ownerKey, sequence: (previous?.sequence ?? 0) + 1 }));
+    void controllerRef.current.setInspectorOpen(true).catch(() => {
+      if (conversationOwnerRef.current === conversationOwner) setWorkbenchOpenFailure(conversationOwner);
+    });
+  };
   const view: PartnerConversationView = {
-    ownerKey, kind: identity?.kind, partner: partnerIdentity?.partner, confirmed, editable, failed, connected,
+    sessionId: session.id, ownerKey, kind: identity?.kind, partner: partnerIdentity?.partner, confirmed, editable, failed, connected,
     entryReadCursor: entryReadRef.current?.owner === conversationOwner ? entryReadRef.current.cursor : undefined,
     readFailed: readFailure === conversationOwner, readRetry, acknowledge, retryRead,
-    refresh: () => setRefresh((value) => value + 1), openSettings, openPrivateThread
+    refresh: () => setRefresh((value) => value + 1), openSettings, openPrivateThread,
+    workbenchAvailable, workbenchRequest: workbenchRequest?.owner === ownerKey ? workbenchRequest.sequence : undefined,
+    workbenchOpenFailed: workbenchOpenFailure === conversationOwner, openWorkbench
   };
   return <PartnerConversationContext.Provider value={view}>
     {children}
@@ -209,6 +233,10 @@ export function PartnerConversationProvider({ controller, session, active, t, ch
       onActivityUpdated={(partner) => acceptMutation({ partner, directory: partnerIdentity.catalog.directory })}
     />}
   </PartnerConversationContext.Provider>;
+}
+
+function isLocalOrigin(origin: string | undefined): boolean {
+  try { return origin !== undefined && isLoopbackHostname(new URL(origin).hostname); } catch { return false; }
 }
 
 function ownsConversation(partner: PartnerProfileView, session: SessionView): boolean {

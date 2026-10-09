@@ -1,4 +1,6 @@
 import { ArtifactDownloadButton } from "./ArtifactDownloadButton.js";
+import { usePartnerConversation } from "./PartnerConversation.js";
+import { PartnerWorkbench, type PartnerWorkbenchDrafts } from "./PartnerWorkbench.js";
 import { readTerminalAppearance } from "../terminal-appearance.js";
 import type { TerminalPaletteView } from "../model.js";
 import { lazy, Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
@@ -163,6 +165,12 @@ export function Inspector({ controller, snapshot, session, workspace, timeline, 
   readonly onSelectionQuote: (sessionId: string, quote: ComposerFileSelectionQuoteDraft) => void;
 }): JSX.Element {
   const reducedMotion = useReducedMotionPreference();
+  const partnerConversation = usePartnerConversation();
+  const canWorkbench = partnerConversation?.sessionId === session.id && partnerConversation.workbenchAvailable;
+  const workbenchOwner = canWorkbench ? JSON.stringify([controller.state.activeProfile?.id, controller.state.activeProfile?.serverId,
+    controller.state.activeProfile?.origin, session.id, partnerConversation.partner?.id]) : undefined;
+  const consumedWorkbenchRequest = useRef<string | undefined>(undefined);
+  const workbenchDrafts = useRef(new Map<string, PartnerWorkbenchDrafts>());
   const [tabBuckets, setTabBuckets] = useState<InspectorTabBuckets>(readInspectorTabBuckets);
   const [panelSide, setPanelSide] = useState<InspectorSide>(readInspectorSide);
   const [maximized, setMaximized] = useState(false);
@@ -271,6 +279,7 @@ export function Inspector({ controller, snapshot, session, workspace, timeline, 
   const detached = activeDetachedHost !== undefined;
   const availableKinds = useMemo(() => new Set<InspectorTabKind>([
     "context",
+    ...(canWorkbench ? ["workbench" as const] : []),
     ...(canTree ? ["branches" as const] : []),
     ...(canFiles ? ["files" as const] : []),
     ...(canDiff || canRewind ? ["changes" as const] : []),
@@ -281,7 +290,7 @@ export function Inspector({ controller, snapshot, session, workspace, timeline, 
     "simulator",
     "tools",
     ...(canBrowser ? ["browser" as const] : [])
-  ]), [canBackgroundTasks, canBrowser, canDiff, canFiles, canRewind, canSubagents, canTree, canUserShell]);
+  ]), [canWorkbench, canBackgroundTasks, canBrowser, canDiff, canFiles, canRewind, canSubagents, canTree, canUserShell]);
   const storedBucket = tabBuckets[session.id] ?? createInitialInspectorTabBucket();
   const bucket = useMemo(() => projectInspectorTabBucket(storedBucket, availableKinds), [availableKinds, storedBucket]);
   const activeTabIdRef = useRef(bucket.activeTabId);
@@ -426,6 +435,17 @@ export function Inspector({ controller, snapshot, session, workspace, timeline, 
   const setSessionBucket = useCallback((next: InspectorTabBucket): void => {
     setTabBuckets((current) => ({ ...current, [session.id]: next }));
   }, [session.id]);
+
+  useEffect(() => {
+    if (!canWorkbench || !partnerConversation.editable || workbenchOwner === undefined) return;
+    const first = storedBucket.workbenchInitialized !== true || storedBucket.workbenchOwner !== workbenchOwner;
+    const request = partnerConversation.workbenchRequest === undefined ? undefined : `${partnerConversation.ownerKey}:${partnerConversation.workbenchRequest}`;
+    if (!first && (request === undefined || request === consumedWorkbenchRequest.current)) return;
+    if (request !== undefined) consumedWorkbenchRequest.current = request;
+    setSessionBucket({ ...addInspectorTab(storedBucket, "workbench"), workbenchInitialized: true, workbenchOwner,
+      ...(first ? { workbenchTaskId: undefined, workbenchProject: undefined } : {}) });
+    if (first) partnerConversation.openWorkbench();
+  }, [canWorkbench, partnerConversation?.editable, partnerConversation?.workbenchRequest, workbenchOwner, storedBucket, setSessionBucket]);
 
   useEffect(() => {
     if (!canSubagents || subagentFocusRequest === undefined || subagentFocusRequest.sessionId !== session.id) return;
@@ -1090,6 +1110,15 @@ export function Inspector({ controller, snapshot, session, workspace, timeline, 
         {bucket.tabs.length === 0 && <div className="inspector-empty"><Gauge aria-hidden="true" /><h2>{t("inspector.emptyTitle")}</h2><p>{t("inspector.emptyBody")}</p>{addableKinds.length > 0 && <Button onClick={() => setMenu("add")}><Plus aria-hidden="true" />{t("inspector.addTab")}</Button>}</div>}
         {bucket.tabs.map((tab) => <div id={`inspector-panel-${tab.id}`} key={`${session.id}:${tab.id}`} className={cx("inspector-tab-panel", tab.id === bucket.activeTabId && "is-active")} data-tab-kind={tab.kind} role="tabpanel" aria-labelledby={`inspector-tab-${tab.id}`} aria-hidden={tab.id !== bucket.activeTabId} hidden={tab.id !== bucket.activeTabId} tabIndex={0}><InspectorTabErrorBoundary resetKey={`${session.id}:${tab.id}:${tab.kind}`} t={t}>
           {tab.kind === "context" && <ContextPanel controller={controller} backend={backend} session={session} queue={sessionQueue} tasks={tasks} t={t} runAction={runAction} />}
+          {tab.kind === "workbench" && canWorkbench && <PartnerWorkbench controller={controller} session={session} conversation={partnerConversation}
+            active={open && tab.id === bucket.activeTabId} ownerDocument={activeDetachedHost?.window.document ?? document} t={t}
+            selectedTaskId={storedBucket.workbenchOwner === workbenchOwner ? storedBucket.workbenchTaskId : undefined}
+            selectedProject={storedBucket.workbenchOwner === workbenchOwner ? storedBucket.workbenchProject : undefined}
+            onSelectTask={(taskId) => setSessionBucket({ ...storedBucketRef.current, workbenchTaskId: taskId })}
+            onSelectProject={(project) => setSessionBucket({ ...storedBucketRef.current, workbenchProject: project })}
+            drafts={workbenchDrafts.current.get(partnerConversation.ownerKey) ?? (() => {
+              const drafts: PartnerWorkbenchDrafts = { messages: new Map() }; workbenchDrafts.current.set(partnerConversation.ownerKey, drafts); return drafts;
+            })()} />}
           {tab.kind === "branches" && canTree && <BranchesPanel controller={controller} backend={backend} session={session} t={t} runAction={runAction} />}
           {tab.kind === "files" && canFiles && <FilesPanel controller={controller} workspace={workspace} sessionId={session.id} canWrite={canWriteFiles} t={t} onSelectionQuote={onSelectionQuote} />}
           {tab.kind === "changes" && (canDiff || canRewind) && <ChangesPanel controller={controller} session={session} workspace={workspace} {...(turnReviewFocusRequest === undefined ? {} : { focusRequest: turnReviewFocusRequest })} canDiff={canDiff} canDiffImagePreview={canDiffImagePreview} canStageDiff={canStageDiff} canUnstageDiff={canUnstageDiff} canRevertDiff={canRevertDiff} canCommitDiff={canCommitDiff} canPushDiff={canPushDiff} canRewind={canRewind} gitWriteDisabledReason={gitWriteDisabledReason} t={t} runAction={runAction} />}
@@ -1176,6 +1205,7 @@ function inspectorTabKindsInMenuOrder(): readonly InspectorTabKind[] {
 function inspectorTabLabel(kind: InspectorTabKind, t: Translator): string {
   switch (kind) {
     case "context": return t("context.title");
+    case "workbench": return t("workbench.title");
     case "branches": return t("session.branch");
     case "files": return t("workspace.files");
     case "changes": return t("workspace.diff");
@@ -1192,6 +1222,7 @@ function inspectorTabLabel(kind: InspectorTabKind, t: Translator): string {
 function inspectorTabIcon(kind: InspectorTabKind): JSX.Element {
   switch (kind) {
     case "context": return <Gauge aria-hidden="true" />;
+    case "workbench": return <ListTodo aria-hidden="true" />;
     case "branches": return <GitBranch aria-hidden="true" />;
     case "files": return <Folder aria-hidden="true" />;
     case "changes": return <FileDiff aria-hidden="true" />;

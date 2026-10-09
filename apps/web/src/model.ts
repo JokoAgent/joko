@@ -647,6 +647,80 @@ export interface PartnerListView {
   readonly directory: PartnerDirectoryView;
 }
 
+export interface PartnerWorkbenchOwnerView {
+  readonly partnerId: string;
+  readonly profileVersion: bigint;
+  readonly sessionId: string;
+  readonly sessionGeneration: bigint;
+  readonly targetId: string;
+}
+export interface PartnerWorkbenchJudgmentView {
+  readonly taskId: string;
+  readonly project: string;
+  readonly title: string;
+  readonly verdict: "unfinished" | "idea" | "done";
+  readonly next: string | null;
+  readonly ref?: string;
+  readonly updatedAt: number;
+}
+export interface PartnerWorkbenchTextView {
+  readonly role: "user" | "assistant";
+  readonly text: string;
+  readonly at: number;
+  readonly privateMessageOrigin?: { readonly messageId: string; readonly threadId: string; readonly senderPartnerId: string; readonly recipientPartnerId: string; readonly senderDisplayName: string };
+}
+export interface PartnerWorkbenchTaskView {
+  readonly id: string;
+  readonly kind: "session" | "external" | "item" | "automation";
+  readonly project: string;
+  readonly title: string;
+  readonly state: "running" | "waiting" | "queued" | "stopped" | "automation" | "done";
+  readonly group: "waiting" | "running" | "todo" | "done";
+  readonly updatedAt: number;
+  readonly sessionId?: string;
+  readonly scheduleId?: string;
+  readonly startedAt?: number;
+  readonly scheduleSummary?: string;
+  readonly sourceLabel: string;
+  readonly ownedBackground: boolean;
+  readonly unread: boolean;
+  readonly judgment?: PartnerWorkbenchJudgmentView;
+  readonly digest: { readonly purpose: string | null; readonly recent: readonly { readonly role: "user" | "assistant"; readonly text: string }[] };
+}
+export interface PartnerWorkbenchProjectBriefView {
+  readonly project: string;
+  readonly docs: readonly string[];
+  readonly recent: readonly { readonly path: string; readonly modifiedAt: number }[];
+  readonly git?: { readonly branch?: string; readonly changes?: number;
+    readonly commits: readonly { readonly sha: string; readonly date: string; readonly author: string; readonly subject: string }[];
+    readonly branches: readonly { readonly name: string; readonly date: string }[]; readonly remotes: readonly string[] };
+  readonly codeHost: { readonly repository?: string;
+    readonly pullRequests: readonly { readonly number: number; readonly title: string; readonly url: string; readonly updatedAt: number }[];
+    readonly issues: readonly { readonly number: number; readonly title: string; readonly url: string; readonly updatedAt: number }[];
+    readonly unavailable?: "not_supported" | "no_credential" | "unavailable" };
+}
+export interface PartnerWorkbenchView {
+  readonly owner: PartnerWorkbenchOwnerView;
+  readonly revision: bigint;
+  readonly projects: readonly { readonly path: string; readonly name: string; readonly addedAt: number; readonly exists: boolean }[];
+  readonly judgments: readonly PartnerWorkbenchJudgmentView[];
+  readonly projectOptions: readonly { readonly path: string; readonly name: string; readonly taskCount: number; readonly nativeCount: number; readonly automationCount: number; readonly repository: boolean; readonly granted: boolean }[];
+  readonly tasks: readonly PartnerWorkbenchTaskView[];
+  readonly candidates: readonly PartnerWorkbenchTaskView[];
+  readonly briefs: readonly PartnerWorkbenchProjectBriefView[];
+  readonly olderCount: number;
+  readonly truncated: boolean;
+  readonly unavailableSources: readonly string[];
+  readonly outputs: readonly PartnerWorkbenchArtifactView[];
+}
+export interface PartnerWorkbenchArtifactView { readonly id: string; readonly title: string; readonly mimeType: string; readonly byteSize: number; readonly sessionId: string }
+export interface PartnerWorkbenchDetailView {
+  readonly task: PartnerWorkbenchTaskView;
+  readonly transcript: readonly PartnerWorkbenchTextView[];
+  readonly truncated: boolean;
+  readonly artifacts: readonly PartnerWorkbenchArtifactView[];
+}
+
 export interface PartnerMutationView {
   readonly partner: PartnerProfileView;
   readonly directory: PartnerDirectoryView;
@@ -6302,6 +6376,13 @@ export interface OperationApi extends VoiceDictionaryPeerApi {
   listPartnerDelegations(partnerId: string, signal?: AbortSignal): Promise<readonly PartnerDelegationView[]>;
   getPartnerDelegation(partnerId: string, delegationId: string, signal?: AbortSignal): Promise<PartnerDelegationView>;
   cancelPartnerDelegation(partnerId: string, delegationId: string, expectedRevision: bigint, signal?: AbortSignal): Promise<PartnerDelegationView>;
+  getPartnerWorkbench(partnerId: string, signal?: AbortSignal): Promise<PartnerWorkbenchView>;
+  addPartnerWorkbenchProject(owner: PartnerWorkbenchOwnerView, expectedRevision: bigint, path: string, signal?: AbortSignal): Promise<PartnerWorkbenchView & { readonly acceptedProject: string }>;
+  removePartnerWorkbenchProject(owner: PartnerWorkbenchOwnerView, expectedRevision: bigint, path: string, signal?: AbortSignal): Promise<PartnerWorkbenchView>;
+  setPartnerWorkbenchJudgment(owner: PartnerWorkbenchOwnerView, expectedRevision: bigint, judgment: Omit<PartnerWorkbenchJudgmentView, "updatedAt">, signal?: AbortSignal): Promise<PartnerWorkbenchView>;
+  getPartnerWorkbenchDetail(owner: PartnerWorkbenchOwnerView, taskId: string, signal?: AbortSignal): Promise<PartnerWorkbenchDetailView>;
+  resolvePartnerWorkbenchReference(owner: PartnerWorkbenchOwnerView, ref: string, signal?: AbortSignal): Promise<{ readonly kind: "https" | "file"; readonly value: string; readonly workspaceId?: string; readonly relativePath?: string; readonly directory: boolean }>;
+  readPartnerWorkbenchDocument(owner: PartnerWorkbenchOwnerView, path: string, signal?: AbortSignal): Promise<{ readonly path: string; readonly text: string; readonly truncated: boolean }>;
   listCollaborationGoals(sessionId: string, includeArchived?: boolean, signal?: AbortSignal): Promise<readonly CollaborationGoalView[]>;
   getCollaborationGoal(goalId: string, viewerSessionId: string, signal?: AbortSignal): Promise<CollaborationGoalTreeView>;
   createCollaborationGoal(leadSessionId: string, expectedSessionGeneration: bigint, title: string, objective: string, maximumWorkers?: number, signal?: AbortSignal): Promise<CollaborationGoalTreeView>;

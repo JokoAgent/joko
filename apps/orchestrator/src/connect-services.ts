@@ -1430,7 +1430,8 @@ export function createConnectServices(application: OrchestratorApplication, proj
   );
   const partner = createPartnerConnectService(
     application.partners,
-    (context) => authenticate(context)
+    (context) => authenticate(context),
+    application.partnerWorkbenches
   );
   const collaborationGoal = createCollaborationConnectService(
     application.collaborationGoals,

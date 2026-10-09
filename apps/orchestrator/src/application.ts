@@ -53,7 +53,7 @@ import {
 } from "@joko/remote-ssh";
 import { createCommandConcurrencyGate } from "@joko/runtime-governance";
 import { createSocks5Dispatcher } from "@joko/outbound-network";
-import { ContactStore, OperationalStore, PartnerStore, VoiceDictionaryPeerStore } from "@joko/store";
+import { ContactStore, OperationalStore, PartnerStore, PartnerWorkbenchStore, VoiceDictionaryPeerStore } from "@joko/store";
 import { GitSafetyCoordinator, NodeGitCommandRunner } from "@joko/git-safety";
 import { AndroidAutomationRuntimeFactory } from "@joko/tool-android";
 import { BrowserProvider, type BrowserActivity } from "@joko/tool-browser";
@@ -205,6 +205,10 @@ import { ContactManager } from "./contact-manager.js";
 import { ContactSyncManager } from "./contact-sync-manager.js";
 import { ContactToolBridgeProvider } from "./contact-tool-provider.js";
 import { PartnerManager, partnerSessionRuntimeFallback } from "./partner-manager.js";
+import { PartnerWorkbenchManager } from "./partner-workbench-manager.js";
+import { PartnerWorkbenchBriefReader } from "./partner-workbench-brief.js";
+import { PartnerWorkbenchToolProvider } from "./partner-workbench-tool-provider.js";
+import { CodeHostProjectProvider } from "@joko/code-host";
 import { PartnerToolBridgeProvider } from "./partner-tool-provider.js";
 import { DevicePeerOwner } from "./device-peer-owner.js";
 import {
@@ -427,6 +431,7 @@ export interface OrchestratorApplication {
   readonly contactSync?: ContactSyncManager;
   /** Node-local authority for long-lived partner profiles and their canonical Sessions. */
   readonly partners?: PartnerManager;
+  readonly partnerWorkbenches?: PartnerWorkbenchManager;
   readonly extensionCatalog?: ExtensionCatalogManager;
   readonly extensionLibraries?: ExtensionLibraryManager;
   readonly extensionMainViews?: ExtensionMainViewManager;
@@ -1680,6 +1685,9 @@ export async function createOrchestratorApplication(
     workspaceService: workspaces,
     homesRoot: join(config.dataDirectory, "partner-homes")
   });
+  const partnerWorkbenches = new PartnerWorkbenchManager({ partners, partnerStore, store, host: sessionHost, workspaces,
+    workbenches: new PartnerWorkbenchStore(join(config.dataDirectory, "partner-homes")), managedDataDirectory: config.dataDirectory,
+    briefs: new PartnerWorkbenchBriefReader(new CodeHostProjectProvider()) });
   const collaborationGoals = new CollaborationGoalManager({
     store,
     sessionHost,
@@ -1691,6 +1699,7 @@ export async function createOrchestratorApplication(
   const unregisterPartnerTools = mcpRouter.registerBridgeToolProvider(
     new PartnerToolBridgeProvider({ store, partners })
   );
+  const unregisterPartnerWorkbenchTools = mcpRouter.registerBridgeToolProvider(new PartnerWorkbenchToolProvider({ store, partners, workbench: partnerWorkbenches }));
   let backendLifecycleTail: Promise<void> = Promise.resolve();
   const runBackendLifecycle = <T>(action: () => Promise<T>): Promise<T> => {
     const result = backendLifecycleTail.catch(() => undefined).then(action);
@@ -2242,6 +2251,7 @@ export async function createOrchestratorApplication(
     }
     await reviewCoordinator.reconcileStartup();
     await sessionWorktrees.initialize();
+    await partnerWorkbenches.initialize();
     await sessionHost.initialize();
     await historyMaintenance.initialize();
     await skillLearning.initialize();
@@ -2510,6 +2520,7 @@ export async function createOrchestratorApplication(
     await attempt(() => unregisterContactTools());
     await attempt(() => unregisterCollaborationGoalTools());
     await attempt(() => unregisterPartnerTools());
+    await attempt(() => unregisterPartnerWorkbenchTools());
     await attempt(() => unregisterLspBridge());
     await attempt(() => unregisterRemoteHostTools());
     await attempt(() => unregisterDocumentTools());
@@ -2615,6 +2626,7 @@ export async function createOrchestratorApplication(
     contacts,
     contactSync,
     partners,
+    partnerWorkbenches,
     extensionCatalog,
     extensionLibraries,
     extensionMainViews,
@@ -2714,6 +2726,7 @@ export async function createOrchestratorApplication(
         await attempt(() => unregisterContactTools());
         await attempt(() => unregisterCollaborationGoalTools());
         await attempt(() => unregisterPartnerTools());
+        await attempt(() => unregisterPartnerWorkbenchTools());
         await attempt(() => unregisterLspBridge());
         await attempt(() => unregisterRemoteHostTools());
         await attempt(() => unregisterDocumentTools());

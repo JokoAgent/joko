@@ -13,6 +13,22 @@ afterEach(async () => {
 });
 
 describe("Claude Code local task catalog", () => {
+  test("reads exact native text with redaction and retires changed or forged preview entries", async () => {
+    const fixture = await catalogFixture(); const id = randomUUID();
+    const path = await writeTranscript(fixture, "preview", id, 10, [
+      { type: "user", sessionId: id, cwd: fixture.fallbackWorkspace, message: { content: "Project purpose" } },
+      { type: "assistant", sessionId: id, message: { content: [{ type: "text", text: "private-marker result" }, { type: "thinking", thinking: "Private reasoning" }] } },
+      { type: "user", sessionId: id, isMeta: true, message: { content: "Internal context" } }
+    ]);
+    const adapter = new ClaudeCodeAdapter({ instanceGeneration: 1, environment: { CLAUDE_CONFIG_DIR: fixture.configDirectory }, redactValues: ["private-marker"] });
+    const entry = (await adapter.scanNativeSessionCatalog()).entries[0]!;
+    const preview = await adapter.readNativeSessionPreview(entry);
+    expect(preview.messages.map((item) => item.text)).toEqual(["Project purpose", "[REDACTED] result"]);
+    await expect(adapter.readNativeSessionPreview({ ...entry })).rejects.toThrow();
+    await appendFile(path, "{}\n");
+    await expect(adapter.readNativeSessionPreview(entry)).rejects.toThrow();
+  });
+
   test("groups normalized worktrees, falls back to profile project roots, and counts only rejected tasks", async () => {
     const fixture = await catalogFixture();
     const ids = {
