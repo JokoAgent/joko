@@ -287,8 +287,11 @@ import { MobileOfflineNotice } from "./MobileOfflineNotice";
 import { MobileAutomationsScreen } from "./MobileAutomationsScreen";
 import { MobilePartnersScreen } from "./MobilePartnersScreen";
 import { MobilePartnerDirectoryScreen } from "./MobilePartnerDirectoryScreen";
-import { useMobilePartnerRead } from "./use-mobile-partner-read";
+import { useMobilePartnerIdentity, useMobilePartnerRead } from "./use-mobile-partner-read";
 import { MobilePartnerAvatar } from "./MobilePartnerAvatar";
+import { MobilePartnerConversationRow } from "./MobilePartnerConversationRow";
+import { mobilePartnerConversationRows, mobilePartnerTimeGroups, mobilePublicConversationInputs } from "./mobile-partner-presentation";
+import { useMobileHiddenHistory } from "./use-mobile-hidden-history";
 import { MobilePartnerProfileSheet } from "./MobilePartnerProfileSheet";
 import { MobilePartnerResourcesScreen } from "./MobilePartnerResourcesScreen";
 import { MobileExtensionsScreen } from "./MobileExtensionsScreen";
@@ -3178,6 +3181,7 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
   const timelineListRef = useRef<FlatList<MobileWorkItem<TimelineRow>>>(null);
   const timelineViewportRef = useRef<View>(null);
   const partnerConversationTransport = client.partnerConversationTransport();
+  const partnerIdentity = useMobilePartnerIdentity(partnerConversationTransport);
   const [visiblePartnerRows, setVisiblePartnerRows] = useState<{
     readonly ownerKey?: string; readonly ids: ReadonlySet<string>;
   }>({ ids: new Set() });
@@ -3337,11 +3341,12 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
         state.selectedId ?? ""
       ), [observedRows, optimisticOwnerKey, ownerOptimisticRows, state.selectedId, state.status, state.window]);
   const rows = useMemo(() => {
-    const rawRows = messageRows.flatMap((row) => {
+    const rawRows = mobilePublicConversationInputs(messageRows, partnerIdentity.partner?.partnerId).flatMap((row) => {
       const attached = delegatedAffinity.byEventId.get(row.eventId);
       if (delegatedAffinity.suppressedMetadataEventIds.has(row.eventId) && !attached?.length) return [];
       const persistentTask = attached?.some((entry) => ["queued", "running", "waiting"].includes(projectMobileDelegated(entry).state));
-      return [persistentTask ? { ...row, persistentTask: true } : row];
+      return [persistentTask || attached?.length ? { ...row, ...(persistentTask ? { persistentTask: true } : {}),
+        partnerDelivery: true } : row];
     });
     const sourceRows = new Map(rawRows.map((row) => [row.id, row]));
     const planRows = inlinePlans.cards.map((plan): TimelineRow => {
@@ -3353,9 +3358,25 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
         ...(source?.runScope === undefined ? {} : { runScope: source.runScope }) };
     });
     return [...rawRows, ...planRows];
-  }, [delegatedAffinity, inlinePlans, locale, messageRows]);
-  const displayRows = useMemo(() => mobileWorkItems(rows, actualSessionStreaming && state.window === undefined),
+  }, [delegatedAffinity, inlinePlans, locale, messageRows, partnerIdentity.partner?.partnerId]);
+  const workRows = useMemo(() => mobileWorkItems(rows, actualSessionStreaming && state.window === undefined),
     [actualSessionStreaming, rows, state.window]);
+  const partnerWorking = state.status === "connected" && session !== undefined
+    && [SessionState.RUNNING, SessionState.WAITING, SessionState.RECOVERING].includes(session.state);
+  const partnerRows = useMemo(() => partnerIdentity.partner
+    ? mobilePartnerConversationRows(workRows, partnerWorking && state.window === undefined, partnerIdentity.partner.partnerId)
+    : undefined, [partnerWorking, partnerIdentity.partner?.partnerId, state.window, workRows]);
+  const displayRows = !partnerIdentity.ready ? [] : partnerRows ?? workRows;
+  const partnerTimeGroups = useMemo(() => mobilePartnerTimeGroups(partnerRows ?? []), [partnerRows]);
+  const chasingHiddenHistory = useMobileHiddenHistory({ scope: `${partnerConversationTransport?.ownerKey ?? ""}\u001f${state.window === undefined ? "latest" : `window/${state.window.at(-1)?.eventId ?? ""}`}`,
+    enabled: partnerIdentity.ready && partnerRows !== undefined && state.status === "connected" && !state.busy
+      && !drawerMounted && !partnerSettingsOwner && !imageGallery.view,
+    visibleCount: displayRows.length, hasEarlier: !state.historyEnd, loading: state.historyBusy,
+    cursor: state.before ? `${state.before.generation}/${state.before.sequence}/${state.before.opaqueToken}` : undefined
+  }, async () => {
+    try { await client.older(); }
+    catch (error) { if (taskMountedRef.current) setLocalError(errorText(error)); throw error; }
+  });
   const activeOptimisticOperationIds = useMemo(() => new Set([
     ...state.pending.filter((item) => item.kind === "send" && item.sessionId === state.selectedId
       && item.state === "accepted").map((item) => item.operationId),
@@ -3503,7 +3524,7 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
     || runtimeControls.canSetPermission || runtimeControls.canSetPlanMode);
   const queueMutationPending = state.pending.some((item) => item.sessionId === state.selectedId
     && ["queue-cancel", "queue-edit-lock", "queue-edit", "queue-interaction-lock", "queue-reorder"].includes(item.kind));
-  const conversationShare = useMobileConversationShare({ client, rows, locale,
+  const conversationShare = useMobileConversationShare({ client, rows: partnerRows ?? rows, locale,
     onNativeActivityChange: (active) => { attachmentNativeActivityRef.current = active; } });
   const conversationShareColors = useMemo(() => ({ background: colors.background, surfaceElevated: colors.surface,
     textPrimary: colors.ink, textSecondary: colors.muted, textTertiary: colors.muted }), [colors]);
@@ -3787,7 +3808,7 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
     setDraftReady(true);
   }, [state.restoredComposerDraft]);
   const partnerSettingsVisible = partnerSettingsOwner !== undefined && partnerSettingsOwner === partnerConversationTransport?.ownerKey;
-  const partnerRead = useMobilePartnerRead(partnerConversationTransport, state.window ?? taskTimelineEvents,
+  const partnerRead = useMobilePartnerRead(partnerConversationTransport, partnerIdentity, state.window ?? taskTimelineEvents,
     state.owner?.generation ?? 0n,
     visiblePartnerRows.ownerKey === partnerConversationTransport?.ownerKey ? visiblePartnerRows.ids : new Set<string>(),
     state.status === "connected" && !state.busy && !attachmentBusy && !fileShareBusy && !galleryOpening
@@ -5367,13 +5388,15 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
             if (view && mobileMessageShareable(item)) screenshotMessageViewsRef.current.set(item.id, view);
             else screenshotMessageViewsRef.current.delete(item.id);
           }}
-          style={[styles.message, linked && styles.messageFocused,
+          style={[styles.message, partnerIdentity.partner && item.kind === "assistant" && styles.partnerReply,
+            linked && styles.messageFocused,
             { backgroundColor: linked ? colors.brandBackground : colors.surface,
-              borderColor: linked ? colors.accent : colors.border }]}>
+              borderColor: linked ? colors.accent : colors.border },
+            partnerIdentity.partner && item.kind === "assistant" && !linked && { backgroundColor: "transparent" }]}>
         {linked && <Text style={[styles.caption, { color: colors.accent }]}>
           {mobileMessage(locale, "intent.linkedMessage", { label: item.label })}
         </Text>}
-        {!delegatedOnly && <View style={styles.statusTitle}>
+        {!delegatedOnly && (!partnerIdentity.partner || item.kind !== "user" && item.kind !== "assistant" || item.optimistic) && <View style={styles.statusTitle}>
           <Text style={[styles.caption, { color: colors.muted }]}>{item.label}{item.optimistic
             ? ` · ${mobileMessage(locale, "common.sending")}` : ""}</Text>
           {item.optimistic && <ActivityIndicator size="small" color={colors.accent} />}
@@ -5386,6 +5409,9 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
           </Pressable>}
         </View>}
         <View pointerEvents={conversationShare.active ? "none" : "auto"}>
+        {partnerIdentity.partner && item.partnerPrivateOrigin && item.kind === "assistant" && <Text style={[styles.caption, { color: colors.muted }]}>
+          {mobileMessage(locale, "partnerConversation.privateReply")}
+        </Text>}
         {delegatedOnly ? undefined : item.messageParts ? item.messageParts.map((part) => {
           if (part.kind === "thinking") return <MobileThinkingCard key={part.thinking.key} thinking={part.thinking}
             ownerKey={blockOwnerKey} colors={colors} locale={locale} enabled={state.status === "connected" || state.status === "offline"}
@@ -5404,7 +5430,8 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
           ownerKey={markdownOwnerKey} resourceClient={client} messageId={item.id}
           resourceOwnerKey={item.completed && !item.optimistic ? client.markdownResourceOwnerKey() : undefined}
           onOpenImage={openMarkdownImage} onOpenPath={openMarkdownPath} />
-          : <Text selectable={!item.optimistic} style={[styles.body, { color: colors.ink }]}>{item.text}</Text>}
+          : <Text selectable={!item.optimistic} style={[styles.body, { color: colors.ink }]}>{partnerIdentity.partner && item.runStopped
+            ? mobileMessage(locale, "partnerConversation.stopped") : item.text}</Text>}
         {delegatedCards.map(renderDelegatedCard)}
         {item.partnerPrivatePreview && <Pressable accessibilityRole="button"
           accessibilityLabel={`${mobileMessage(locale, "partner.openThread")} · ${item.partnerPrivatePreview.targetName}`}
@@ -5552,8 +5579,8 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
           onPress={() => void client.older().catch((error) => setLocalError(errorText(error)))} />}
         </View>
       </View>}
-      ListEmptyComponent={<Centered label={mobileMessage(locale, state.status === "offline"
-        ? state.detail ? "task.offlineEmpty" : "task.offlineMissing" : "task.empty")} colors={colors} />}
+      ListEmptyComponent={<Centered label={mobileMessage(locale, !partnerIdentity.ready ? "task.loading" : chasingHiddenHistory
+        ? "task.loadingHistory" : state.status === "offline" ? state.detail ? "task.offlineEmpty" : "task.offlineMissing" : "task.empty")} colors={colors} />}
       ListFooterComponent={delegatedControls ? <View style={styles.list} pointerEvents={conversationShare.active ? "none" : "auto"}>
         {delegatedAffinity.orphanEntries.map(renderDelegatedCard)}
         {delegated.phase === "loading" && <View accessibilityLiveRegion="polite" style={styles.connectionNotice}>
@@ -5567,7 +5594,11 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
           <Action label={mobileDelegatedTaskMessage(locale, "retry")} colors={colors} compact onPress={delegated.retry} />
         </View>}
       </View> : undefined}
-      renderItem={({ item }) => renderTimelineItem(item)} />
+      renderItem={({ item }) => partnerIdentity.partner && !isWorkGroup(item) ? <MobilePartnerConversationRow row={item}
+        ownerKey={partnerConversationTransport!.ownerKey} preset={partnerIdentity.partner.avatar} timestamp={partnerTimeGroups.get(item.id)}
+        colors={colors} locale={locale} animate={state.status === "connected" && state.window === undefined && !state.historyBusy}>
+        {renderTimelineItem(item)}
+      </MobilePartnerConversationRow> : renderTimelineItem(item)} />
     </View>
     {queueItems.length > 0 && <View style={styles.queueRegion}>
       <Text style={[styles.section, { color: colors.muted }]}>{mobileMessage(locale, "task.queue")}</Text>
@@ -7272,6 +7303,7 @@ const styles = StyleSheet.create({
   devices: { flexGrow: 0, maxHeight: 50 }, deviceList: { paddingHorizontal: 16, gap: 8 },
   deviceChip: { borderWidth: 1, borderRadius: 18, overflow: "hidden", paddingHorizontal: 12, paddingVertical: 8 },
   message: { borderWidth: 1, borderRadius: 14, padding: 14, gap: 6, marginBottom: 8 },
+  partnerReply: { borderWidth: 0, padding: 0, borderRadius: 0 },
   messageFocused: { borderWidth: 2 },
   messageImages: { gap: 8, paddingTop: 4 },
   messageImageTile: { minHeight: 58, borderWidth: 1, borderRadius: 12, paddingHorizontal: 12, paddingVertical: 8,

@@ -6,7 +6,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { MobilePartnerDirectoryProfile } from "./mobile-partner-directory";
 import { mobilePartnerVisibleReply, type MobilePartnerConversationTransport } from "./mobile-partner-conversation";
-import { useMobilePartnerRead } from "./use-mobile-partner-read";
+import { useMobilePartnerIdentity, useMobilePartnerRead } from "./use-mobile-partner-read";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -39,7 +39,8 @@ let root: Root;
 let reading: ReturnType<typeof useMobilePartnerRead>;
 function Harness({ active, visible, enabled }: { active?: MobilePartnerConversationTransport;
   visible: ReadonlySet<string>; enabled: boolean }) {
-  reading = useMobilePartnerRead(active, events, 1n, visible, enabled);
+  const identity = useMobilePartnerIdentity(active);
+  reading = useMobilePartnerRead(active, identity, events, 1n, visible, enabled);
   return createElement("span", {}, reading.partner?.displayName ?? "none");
 }
 async function render(active: MobilePartnerConversationTransport | undefined, visible: readonly string[], enabled = true) {
@@ -54,6 +55,17 @@ afterEach(() => {
 });
 
 describe("mobile Partner visible reads", () => {
+  it("does not expose an identity or read until metadata is confirmed, and recovers only on explicit retry", async () => {
+    const active = transport();
+    vi.mocked(active.resolve).mockRejectedValueOnce(new Error("metadata unavailable"));
+    await render(active, ["latest"]);
+    expect(reading.ready).toBe(false); expect(reading.partner).toBeUndefined(); expect(reading.failed).toBe(true);
+    expect(active.acknowledge).not.toHaveBeenCalled();
+    await act(async () => reading.retry());
+    expect(reading.ready).toBe(true); expect(reading.partner?.displayName).toBe("Ada");
+    expect(reading.partner?.activity.readThroughCursor).toBe(6n);
+  });
+
   it("takes a cursor only from a visible completed public reply in the exact session generation", () => {
     expect(mobilePartnerVisibleReply(events, "session", 1n, new Set(["first", "private"])))
       .toEqual({ eventId: "event-first", messageId: "first", cursor: 4n });

@@ -1,4 +1,4 @@
-import { MessageRole, ToolCallState, type Event, type ToolCall } from "@joko/contracts";
+import { MessageInputDelivery, MessageRole, ToolCallState, type Event, type PartnerPrivateMessageOrigin, type ToolCall } from "@joko/contracts";
 import { mobileInputSummary } from "./mobile-composer-document";
 import { mobileTimelineContent, mobileTimelineContentSourceKey, mobileTimelineToolMediaEvents } from "./mobile-timeline-content";
 import { projectMobileToolCall, mobileToolCallScopeKey, mobileToolCallCompleted, type MobileToolCallView } from "./mobile-tool-call";
@@ -62,6 +62,14 @@ export interface TimelineRow {
   readonly workStreaming?: boolean;
   readonly persistentTask?: boolean;
   readonly answerSequence?: bigint;
+  readonly completionCursor?: bigint;
+  readonly internalInput?: boolean;
+  readonly partnerPrivateOrigin?: PartnerPrivateMessageOrigin;
+  /** A durable Run outcome, distinct from a completed message segment. */
+  readonly runOutcome?: "completed" | "failed" | "stopped";
+  /** Retain an owned collaboration delivery even when its technical tool is hidden. */
+  readonly partnerDelivery?: boolean;
+  readonly runStopped?: boolean;
   /** The exact latest plan edge places its structural card without changing this row's raw cursor. */
   readonly planSequence?: bigint;
   readonly plan?: MobileInlinePlan;
@@ -101,6 +109,11 @@ export function timelineRows(events: readonly Event[], sessionStreaming = false)
         byId.set(message.messageId, { id: message.messageId, label: roleLabel(message.role),
           text: mobileInputSummary(message.userInput, message.userInputAccepted) || "…", sequence, eventId: event.eventId,
           kind: roleKind(message.role), completed: message.role === MessageRole.USER && message.userInputAccepted,
+          ...(message.role !== MessageRole.USER ? {} : {
+            internalInput: message.automaticContinuation || message.objectiveContinuation !== undefined
+              || message.automationOrigin !== undefined || message.inputDelivery === MessageInputDelivery.SCHEDULER
+          }),
+          ...(message.partnerPrivateOrigin === undefined ? {} : { partnerPrivateOrigin: message.partnerPrivateOrigin }),
           ...(message.role === MessageRole.USER && message.userInputAccepted && event.identity?.operationId
             ? { operationId: event.identity.operationId }
             : {}),
@@ -136,6 +149,10 @@ export function timelineRows(events: readonly Event[], sessionStreaming = false)
         byId.set(message.messageId, { id: message.messageId, label: previous?.label || roleLabel(message.role),
           text: acceptedInput || blocks.join("\n") || previous?.text || "Completed", sequence: previous?.sequence ?? sequence,
           eventId: event.eventId, kind: roleKind(message.role), completed: true,
+          completionCursor: sequence,
+          ...(previous?.internalInput === undefined ? {} : { internalInput: previous.internalInput }),
+          ...((message.partnerPrivateOrigin ?? previous?.partnerPrivateOrigin) === undefined ? {}
+            : { partnerPrivateOrigin: message.partnerPrivateOrigin ?? previous?.partnerPrivateOrigin }),
           ...(previous?.operationId === undefined ? {} : { operationId: previous.operationId }),
           ...(quoteText?.trim() ? { quoteSource: {
             sourceMessageId: message.messageId,
@@ -175,6 +192,10 @@ export function timelineRows(events: readonly Event[], sessionStreaming = false)
       }
       case "runDone":
         byId.set(event.eventId, { id: event.eventId, label: "Run", text: "Run finished", sequence, eventId: event.eventId, kind: "activity", completed: false });
+        break;
+      case "runAborted":
+        byId.set(event.eventId, { id: event.eventId, label: "Run", text: "Run stopped", sequence, eventId: event.eventId,
+          kind: "activity", completed: true, runStopped: true });
         break;
       case "artifactProduced":
       case "imageProduced": {
@@ -218,6 +239,7 @@ function attachThinkingParts(rows: Map<string, TimelineRow>, ordered: readonly E
   const textParts = new Map<string, Map<number, string>>();
   const starts = new Map<string, number>();
   const stoppedRuns = new Set<string>();
+  const outcomes = new Map<string, NonNullable<TimelineRow["runOutcome"]>>();
   const sealedMessages = new Set<string>();
   for (const view of views) byMessage.set(view.messageScope, [...(byMessage.get(view.messageScope) ?? []), view]);
   for (const event of ordered) {
@@ -225,7 +247,10 @@ function attachThinkingParts(rows: Map<string, TimelineRow>, ordered: readonly E
     const kind = event.payload?.kind;
     if (!scope || !kind?.case) continue;
     if (kind.case === "runDone" || kind.case === "runAborted" || kind.case === "terminalError") {
-      if (event.identity?.runId) stoppedRuns.add(scope.runScope);
+      if (event.identity?.runId) {
+        stoppedRuns.add(scope.runScope);
+        outcomes.set(scope.runScope, kind.case === "runDone" ? "completed" : kind.case === "runAborted" ? "stopped" : "failed");
+      }
     }
     if (kind.case === "messageStarted") {
       const at = mobileEventTimestamp(event);
@@ -283,6 +308,7 @@ function attachThinkingParts(rows: Map<string, TimelineRow>, ordered: readonly E
     const startedAtMs = starts.get(messageKey) ?? row.tool?.startedAtMs ?? mobileEventTimestamp(event);
     const thoughtOnly = parts.length > 0 && parts.every((part) => part.kind === "thinking" || part.kind === "text" && part.text.trim() === "");
     rows.set(id, { ...row, ownerScope: scope.ownerScope, runScope: scope.runScope,
+      ...(outcomes.has(scope.runScope) ? { runOutcome: outcomes.get(scope.runScope)! } : {}),
       ...(startedAtMs === undefined ? {} : { startedAtMs }),
       ...(mobileEventTimestamp(event) === undefined ? {} : { lastActivityAtMs: mobileEventTimestamp(event) }),
       ...(row.kind === "assistant" && row.completed && stoppedRuns.has(scope.runScope) ? { turnFinal: true } : {}),

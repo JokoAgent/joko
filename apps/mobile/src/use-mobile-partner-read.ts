@@ -20,22 +20,13 @@ interface ReadFlight {
   failed: boolean;
 }
 
-export function useMobilePartnerRead(transport: MobilePartnerConversationTransport | undefined,
-  events: readonly Event[], generation: bigint, visibleMessageIds: ReadonlySet<string>, enabled: boolean) {
+export function useMobilePartnerIdentity(transport: MobilePartnerConversationTransport | undefined) {
   const [state, setState] = useState<ReadState>({ failed: false });
   const [attempt, setAttempt] = useState(0);
-  const [pulse, setPulse] = useState(0);
-  const flightRef = useRef<ReadFlight | undefined>(undefined);
-  const contextRef = useRef({ transport, enabled, visibleMessageIds, partner: state.partner });
+  const contextRef = useRef({ transport }); contextRef.current = { transport };
   const partner = state.ownerKey === transport?.ownerKey ? state.partner : undefined;
-  contextRef.current = { transport, enabled, visibleMessageIds, partner };
-  const reply = useMemo(() => transport === undefined ? undefined
-    : mobilePartnerVisibleReply(events, transport.sessionId, generation, visibleMessageIds),
-  [events, generation, transport?.sessionId, visibleMessageIds]);
 
   useEffect(() => {
-    flightRef.current?.controller.abort();
-    flightRef.current = undefined;
     setState({ ownerKey: transport?.ownerKey, failed: false });
     if (!transport) return;
     const controller = new AbortController();
@@ -48,8 +39,33 @@ export function useMobilePartnerRead(transport: MobilePartnerConversationTranspo
         setState({ ownerKey, failed: true });
       }
     });
-    return () => { controller.abort(); flightRef.current?.controller.abort(); };
+    return () => { controller.abort(); };
   }, [transport?.ownerKey, attempt]);
+
+  return { partner, ready: transport === undefined || state.ownerKey === transport.ownerKey && state.resolved === true,
+    failed: state.ownerKey === transport?.ownerKey && state.failed, retrySequence: attempt,
+    retry: () => setAttempt((value) => value + 1) };
+}
+
+export function useMobilePartnerRead(transport: MobilePartnerConversationTransport | undefined,
+  identity: ReturnType<typeof useMobilePartnerIdentity>, events: readonly Event[], generation: bigint,
+  visibleMessageIds: ReadonlySet<string>, enabled: boolean) {
+  const [state, setState] = useState<ReadState>({ failed: false });
+  const [pulse, setPulse] = useState(0);
+  const flightRef = useRef<ReadFlight | undefined>(undefined);
+  const partner = state.ownerKey === transport?.ownerKey && state.partner?.revision === identity.partner?.revision
+    ? state.partner ?? identity.partner : identity.partner;
+  const failed = identity.failed || state.ownerKey === transport?.ownerKey && state.failed;
+  const contextRef = useRef({ transport, enabled, visibleMessageIds, partner });
+  contextRef.current = { transport, enabled, visibleMessageIds, partner };
+  const reply = useMemo(() => transport === undefined ? undefined
+    : mobilePartnerVisibleReply(events, transport.sessionId, generation, visibleMessageIds),
+  [events, generation, transport?.sessionId, visibleMessageIds]);
+  useEffect(() => {
+    flightRef.current?.controller.abort(); flightRef.current = undefined;
+    setState({ ownerKey: transport?.ownerKey, failed: false });
+    return () => { flightRef.current?.controller.abort(); };
+  }, [transport?.ownerKey, identity.retrySequence]);
 
   useEffect(() => {
     if (!enabled || !transport) {
@@ -57,7 +73,7 @@ export function useMobilePartnerRead(transport: MobilePartnerConversationTranspo
       flightRef.current = undefined;
       return;
     }
-    if (!partner || !reply || state.failed) return;
+    if (!partner || !reply || failed || !identity.ready) return;
     let flight = flightRef.current;
     if (!flight || flight.ownerKey !== transport.ownerKey || flight.controller.signal.aborted) {
       flight = { ownerKey: transport.ownerKey, controller: new AbortController(),
@@ -84,8 +100,8 @@ export function useMobilePartnerRead(transport: MobilePartnerConversationTranspo
         if (!visible(requested)) return;
         currentFlight.committed = activity.readThroughCursor > currentFlight.committed
           ? activity.readThroughCursor : currentFlight.committed;
-        setState((previous) => previous.ownerKey !== currentFlight.ownerKey || !previous.partner ? previous
-          : { ...previous, failed: false, partner: { ...previous.partner, activity } });
+        setState((previous) => previous.ownerKey !== currentFlight.ownerKey ? previous
+          : { ...previous, failed: false, partner: { ...(previous.partner ?? current.partner!), activity } });
       }
     })().catch(() => {
       if (currentFlight.pending && visible(currentFlight.pending)) {
@@ -97,9 +113,7 @@ export function useMobilePartnerRead(transport: MobilePartnerConversationTranspo
       if (!currentFlight.failed && currentFlight.pending && visible(currentFlight.pending)
         && currentFlight.pending.cursor > currentFlight.committed) setPulse((value) => value + 1);
     });
-  }, [enabled, partner, pulse, reply, state.failed, transport?.ownerKey]);
+  }, [enabled, partner, pulse, reply, failed, identity.ready, transport?.ownerKey]);
 
-  return { partner, ready: transport === undefined || state.ownerKey === transport.ownerKey && state.resolved === true,
-    failed: state.ownerKey === transport?.ownerKey && state.failed,
-    retry: () => setAttempt((value) => value + 1) };
+  return { partner, ready: identity.ready, failed, retry: identity.retry };
 }

@@ -10,6 +10,8 @@ type MobilePartnerMessageRow = readonly [
 ];
 
 const rows = [
+  ["partnerConversation.stopped", "Stopped", "已停止", "已停止", "停止しました", "중지됨"],
+  ["partnerConversation.privateReply", "Private reply", "私聊回复", "私聊回覆", "プライベート返信", "비공개 답장"],
   ["partnerResource.title", "Partner Resources", "伙伴资源", "夥伴資源", "パートナーリソース", "파트너 리소스"],
   ["partnerResource.menuDescription", "Browse Partners and open their canonical tasks", "浏览伙伴并打开其 canonical 任务", "瀏覽夥伴並開啟其 canonical 任務", "パートナーを参照して canonical タスクを開く", "파트너를 탐색하고 canonical 작업 열기"],
   ["partnerResource.search", "Search Partner Resources", "搜索伙伴资源", "搜尋夥伴資源", "パートナーリソースを検索", "파트너 리소스 검색"],
