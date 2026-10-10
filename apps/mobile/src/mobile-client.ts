@@ -91,6 +91,9 @@ import {
 import { mobilePartnerVisibleReply, type MobilePartnerConversationTransport } from "./mobile-partner-conversation";
 import { validateMobilePartnerProfileDraft, type MobilePartnerProfileTransport } from "./mobile-partner-profile";
 import type { MobilePartnerInitializationTransport } from "./mobile-partner-initialization";
+import { MobilePartnerCreationRejected, mobilePartnerCreationBackends, validateMobilePartnerCreationDraft,
+  type MobilePartnerCreationTransport, type MobilePartnerCreationResult } from "./mobile-partner-creation";
+import type { MobilePartnerCreationReceipts } from "./mobile-partner-creation-receipts";
 import {
   assertMobileExtensionMainViewSurface,
   mobileExtensionKey,
@@ -844,6 +847,8 @@ export class MobileClient {
   #partnerPrivateRefreshTimer?: ReturnType<typeof setTimeout>;
   #partnerPrivateSourceSessionId?: string;
   #partnerPrivateSourceTargetId?: string;
+  #partnerCreationFlight?: { readonly ownerKey: string; readonly token: symbol };
+  #partnerCreationKnown?: { readonly ownerKey: string; readonly requestId: string };
   #partnerPrivateResume?: {
     readonly credentialKey: string;
     readonly selectedPartnerId?: string;
@@ -870,10 +875,112 @@ export class MobileClient {
     private readonly offlineCache?: Pick<MobileOfflineCache, "load" | "save" | "clear">,
     private readonly readOnlyDictionaryCache?: Pick<MobileVoiceDictionaryReadOnlyCache, "clear">,
     filesThumbnailDisk?: Pick<MobileFilesThumbnailCache, "get" | "put" | "remove">,
-    private readonly deviceNameSource: MobileDeviceNameSourceProvider = () => mobileDeviceNameSource(undefined, platform)
+    private readonly deviceNameSource: MobileDeviceNameSourceProvider = () => mobileDeviceNameSource(undefined, platform),
+    private readonly partnerCreationReceipts?: MobilePartnerCreationReceipts
   ) { this.#filesThumbnails = new MobileFilesThumbnailReader(filesThumbnailDisk); }
 
   get state(): MobileState { return this.#state; }
+
+  partnerCreationTransport(): MobilePartnerCreationTransport | undefined {
+    const context = this.#partnerPrivateContext();
+    const directory = this.partnerDirectoryTransport();
+    const receipts = this.partnerCreationReceipts;
+    if (!context || !directory || !receipts || !this.network.getPartnerCreationOptions || !this.network.createPartner
+      || !this.network.getPartnerCreation || !this.network.retirePartnerCreation) return undefined;
+    const ownerKey = context.authorityKey;
+    const requireCurrent = (signal: AbortSignal): void => {
+      signal.throwIfAborted();
+      if (this.#partnerPrivateAuthorityKey(this.#state) !== ownerKey || this.#credential !== context.credential) {
+        throw new Error("The Partner creation owner changed.");
+      }
+    };
+    const pending = async (signal: AbortSignal): Promise<string | undefined> => {
+      requireCurrent(signal);
+      const stored = await receipts.load(context.credential, signal);
+      requireCurrent(signal);
+      if (stored) {
+        this.#partnerCreationKnown = { ownerKey, requestId: stored };
+        return stored;
+      }
+      return this.#partnerCreationKnown?.ownerKey === ownerKey ? this.#partnerCreationKnown.requestId : undefined;
+    };
+    const load: MobilePartnerCreationTransport["load"] = async (signal) => {
+      requireCurrent(signal);
+      const options = await this.network.getPartnerCreationOptions!(context.credential, signal);
+      const catalog = await directory.list(signal);
+      const observed = await this.network.readOwner(context.credential, this.deviceNameSource(), signal);
+      requireCurrent(signal);
+      this.#assertOwner(context.credential, observed, this.#state.node!);
+      if (this.#partnerPrivateAuthorityKey({ ...this.#state, owner: observed.snapshot }) !== ownerKey
+        || options.revision !== catalog.directory.revision) throw new Error("The Partner creation options changed. Refresh this form.");
+      return { ownerKey, options, names: catalog.partners.map(({ partnerId, displayName }) => ({ partnerId, displayName })),
+        backends: mobilePartnerCreationBackends(observed.snapshot) };
+    };
+    const action = async <T,>(signal: AbortSignal, perform: () => Promise<T>): Promise<T> => {
+      requireCurrent(signal);
+      if (this.#partnerCreationFlight?.ownerKey === ownerKey) throw new Error("A Partner creation action is already in flight.");
+      const token = Symbol("partner-create"); this.#partnerCreationFlight = { ownerKey, token };
+      try { return await perform(); }
+      finally { if (this.#partnerCreationFlight?.token === token) this.#partnerCreationFlight = undefined; }
+    };
+    const resolve = async (requestId: string, result: MobilePartnerCreationResult, signal: AbortSignal): Promise<MobilePartnerCreationResult> => {
+      requireCurrent(signal);
+      if (result.kind !== "absent") {
+        await receipts.resolve(context.credential, requestId, signal);
+        requireCurrent(signal);
+        if (this.#partnerCreationKnown?.ownerKey === ownerKey && this.#partnerCreationKnown.requestId === requestId) {
+          this.#partnerCreationKnown = undefined;
+        }
+      }
+      return result;
+    };
+    const requirePending = async (requestId: string, signal: AbortSignal): Promise<void> => {
+      if (await pending(signal) !== requestId) throw new Error("Select the current retained Partner creation request.");
+      requireCurrent(signal);
+    };
+    return { ownerKey, pending, load,
+      create: (snapshot, draft, signal) => action(signal, async () => {
+        if (snapshot.ownerKey !== ownerKey) throw new Error("The Partner creation draft belongs to another owner.");
+        if (await pending(signal)) throw new Error("Check the retained Partner creation result before creating again.");
+        const fresh = await load(signal);
+        if (fresh.options.revision !== snapshot.options.revision) throw new Error("Refresh the Partner form before creating.");
+        const validated = validateMobilePartnerCreationDraft(fresh, draft);
+        const frozen = { ...validated, avatar: typeof validated.avatar === "string" ? validated.avatar : { base64: validated.avatar.base64 },
+          capabilities: { ...validated.capabilities, modelChain: validated.capabilities.modelChain.map((route) => ({ ...route })) } };
+        const requestId = this.newId();
+        await receipts.claim(context.credential, requestId, signal);
+        requireCurrent(signal);
+        this.#partnerCreationKnown = { ownerKey, requestId };
+        try {
+          const returned = await this.network.createPartner!(context.credential, requestId, fresh.options.revision, frozen, signal);
+          requireCurrent(signal);
+          const confirmed = await this.network.getPartnerCreation!(context.credential, requestId, signal);
+          requireCurrent(signal);
+          if (confirmed.kind === "absent" || confirmed.kind === "retired" || returned.kind === "found"
+            && confirmed.kind === "found" && returned.partner.partnerId !== confirmed.partner.partnerId) {
+            throw new Error("The created Partner could not be confirmed.");
+          }
+          return await resolve(requestId, confirmed, signal);
+        } catch (error) {
+          requireCurrent(signal);
+          if (error instanceof MobilePartnerCreationRejected) await resolve(requestId, { kind: "retired" }, signal);
+          throw error;
+        }
+      }),
+      lookup: (requestId, signal) => action(signal, async () => {
+        await requirePending(requestId, signal);
+        const result = await this.network.getPartnerCreation!(context.credential, requestId, signal);
+        requireCurrent(signal);
+        return resolve(requestId, result, signal);
+      }),
+      retire: (requestId, signal) => action(signal, async () => {
+        await requirePending(requestId, signal);
+        const result = await this.network.retirePartnerCreation!(context.credential, requestId, signal);
+        requireCurrent(signal);
+        if (result.kind === "absent") throw new Error("The original Partner intent could not be retired.");
+        return resolve(requestId, result, signal);
+      }) };
+  }
 
   partnerDirectoryTransport(): MobilePartnerDirectoryTransport | undefined {
     const context = this.#partnerPrivateContext();

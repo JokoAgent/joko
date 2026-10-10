@@ -67,6 +67,7 @@ import {
   mobileLocalePreferences,
   mobilePushDeviceStore,
   mobileStorage,
+  mobilePartnerCreationReceipts,
   mobileThemePreferences,
   mobileFilesPreferences,
   mobileVoicePreferences,
@@ -342,7 +343,8 @@ const client = new MobileClient(
   mobileOfflineCache,
   mobileReadOnlyDictionaryCache,
   mobileFilesThumbnailCache,
-  () => mobileDeviceNameSource(Constants.deviceName, Platform.OS)
+  () => mobileDeviceNameSource(Constants.deviceName, Platform.OS),
+  mobilePartnerCreationReceipts
 );
 const readOnlyDictionary = new MobileVoiceDictionaryReadOnlyController(mobileReadOnlyDictionaryCache,
   (profileId, signal) => client.voiceDictionaryReadOnlyTransport(profileId, signal));
@@ -904,6 +906,7 @@ export function App() {
                 page === "partner-directory" ? <MobilePartnerDirectoryScreen colors={colors}
                   locale={locale.effectiveLocale} transport={client.partnerDirectoryTransport()}
                   initializationTransport={client.partnerInitializationTransport()}
+                  creationTransport={client.partnerCreationTransport()}
                   onBack={() => setPage("home")} onOpenTask={() => setPage("task")} /> :
                 page === "partner-resources" ? <MobilePartnerResourcesScreen colors={colors}
                   locale={locale.effectiveLocale} transport={client.partnerResourceTransport()}

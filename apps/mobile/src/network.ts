@@ -1,6 +1,8 @@
 import { Code, ConnectError, createClient, type Interceptor, type Transport } from "@connectrpc/connect";
 import { base64Decode, base64Encode } from "@bufbuild/protobuf/wire";
 import { protoMobilePartnerAvatar, type MobilePartnerAvatarIdentity } from "./mobile-partner-avatar";
+import { MobilePartnerCreationRejected, projectMobilePartnerCreationOptions, projectMobilePartnerCreationResult,
+  type MobilePartnerCreationOptions, type MobilePartnerCreationDraft, type MobilePartnerCreationResult } from "./mobile-partner-creation";
 import { createConnectTransport } from "@connectrpc/connect-web";
 import {
   ArtifactKind, ArtifactService, BlobDisposition, ConnectionService, DeviceKind, EventService, FileKind, ImageThumbnailUnavailableReason,
@@ -208,6 +210,11 @@ export interface MobileNetwork {
   updatePartnerProfile?(credential: PairedCredential, partnerId: string, expectedRevision: bigint,
     draft: MobilePartnerProfileDraft, signal?: AbortSignal): Promise<MobilePartnerDirectoryProfile>;
   readPartnerAvatar?(credential: PairedCredential, partner: MobilePartnerAvatarIdentity, signal?: AbortSignal): Promise<string>;
+  getPartnerCreationOptions?(credential: PairedCredential, signal?: AbortSignal): Promise<MobilePartnerCreationOptions>;
+  createPartner?(credential: PairedCredential, requestId: string, expectedDirectoryRevision: bigint,
+    draft: MobilePartnerCreationDraft, signal?: AbortSignal): Promise<MobilePartnerCreationResult>;
+  getPartnerCreation?(credential: PairedCredential, requestId: string, signal?: AbortSignal): Promise<MobilePartnerCreationResult>;
+  retirePartnerCreation?(credential: PairedCredential, requestId: string, signal?: AbortSignal): Promise<MobilePartnerCreationResult>;
   retryPartnerInitialization?(credential: PairedCredential, partnerId: string, expectedRevision: bigint,
     signal?: AbortSignal): Promise<MobilePartnerDirectoryProfile>;
   markPartnerRead?(credential: PairedCredential, partnerId: string, throughCursor: bigint,
@@ -1561,6 +1568,53 @@ export const mobileNetwork: MobileNetwork = {
     const response = await createClient(PartnerService, transport(credential.origin, credential.authKey))
       .listPartners({}, options(signal));
     return projectMobilePartners(response);
+  },
+  async getPartnerCreationOptions(credential, signal) {
+    const response = await createClient(PartnerService, transport(credential.origin, credential.authKey)).getPartnerDirectory({}, options(signal));
+    signal?.throwIfAborted();
+    return projectMobilePartnerCreationOptions(response.directory);
+  },
+  async createPartner(credential, requestId, expectedDirectoryRevision, draft, signal) {
+    signal?.throwIfAborted();
+    if (!/^[A-Za-z0-9_-]{16,80}$/u.test(requestId) || expectedDirectoryRevision < 1n) throw new Error("A current Partner creation identity is required.");
+    try {
+      const capabilities = draft.capabilities;
+      const response = await createClient(PartnerService, transport(credential.origin, credential.authKey)).createPartner({ requestId,
+        expectedDirectoryRevision: { value: expectedDirectoryRevision }, draft: { displayName: draft.displayName,
+          avatar: protoMobilePartnerAvatar(draft.avatar), identitySource: draft.identitySource, templateId: draft.templateId,
+          usesDirectoryDefaults: draft.usesDirectoryDefaults, ...(draft.usesDirectoryDefaults ? {} : { capabilities: {
+            modelChain: [...capabilities.modelChain], permissionMode: capabilities.permissionMode === "ask" ? PermissionMode.ASK : PermissionMode.AUTO,
+            planMode: capabilities.planMode } }) } }, options(signal));
+      signal?.throwIfAborted();
+      projectMobilePartnerCreationOptions(response.directory);
+      return projectMobilePartnerCreationResult(response.partner);
+    } catch (error) {
+      if (error instanceof ConnectError && [Code.InvalidArgument, Code.AlreadyExists].includes(error.code)) {
+        throw new MobilePartnerCreationRejected("The Partner creation was rejected. Check the name and fields.");
+      }
+      throw error;
+    }
+  },
+  async getPartnerCreation(credential, requestId, signal) {
+    signal?.throwIfAborted();
+    if (!/^[A-Za-z0-9_-]{16,80}$/u.test(requestId)) throw new Error("A retained Partner creation identity is required.");
+    try {
+      const response = await createClient(PartnerService, transport(credential.origin, credential.authKey)).getPartnerCreation({ requestId }, options(signal));
+      signal?.throwIfAborted();
+      return projectMobilePartnerCreationResult(response.partner);
+    } catch (error) {
+      if (error instanceof ConnectError && error.code === Code.NotFound) return { kind: "absent" };
+      throw error;
+    }
+  },
+  async retirePartnerCreation(credential, requestId, signal) {
+    signal?.throwIfAborted();
+    if (!/^[A-Za-z0-9_-]{16,80}$/u.test(requestId)) throw new Error("A retained Partner creation identity is required.");
+    const response = await createClient(PartnerService, transport(credential.origin, credential.authKey)).retirePartnerCreation({ requestId }, options(signal));
+    signal?.throwIfAborted();
+    if (response.retired && !response.partner) return { kind: "retired" };
+    if (!response.retired && response.partner) return projectMobilePartnerCreationResult(response.partner);
+    throw new Error("The Joko node returned an ambiguous Partner creation retirement.");
   },
   async listPartnerCatalog(credential, signal) {
     const response = await createClient(PartnerService, transport(credential.origin, credential.authKey))

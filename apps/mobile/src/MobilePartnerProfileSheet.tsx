@@ -1,11 +1,11 @@
 import { useEffect, useRef, useState } from "react";
-import { ActivityIndicator, Alert, Modal, Pressable, ScrollView, StyleSheet, Switch, Text, TextInput, View } from "react-native";
+import { ActivityIndicator, Alert, Modal, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
 import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
 import { MobileKeyboardAvoidingView, useMobileKeyboardState } from "./MobileKeyboardAvoidingView";
-import { MobilePartnerPhotoPicker } from "./MobilePartnerPhotoPicker";
+import { MobilePartnerProfileForm } from "./MobilePartnerProfileForm";
 import type { MobileSupportedLocale } from "./mobile-locale-preference";
 import { mobileMessage } from "./mobile-messages";
-import type { MobilePartnerDirectoryProfile, MobilePartnerModelRoute } from "./mobile-partner-directory";
+import type { MobilePartnerDirectoryProfile } from "./mobile-partner-directory";
 import { MobilePartnerProfileValidationError, mobilePartnerProfileDraft, validateMobilePartnerProfileDraft,
   type MobilePartnerProfileDraft, type MobilePartnerProfileSnapshot, type MobilePartnerProfileTransport } from "./mobile-partner-profile";
 import type { MobilePartnersColors } from "./MobilePartnersScreen";
@@ -29,7 +29,6 @@ export function MobilePartnerProfileSheet({ visible, partner, transport, colors,
   const [avatarPreparing, setAvatarPreparing] = useState(false);
   const avatarPreparingRef = useRef(false);
   const preparingAvatar = (value: boolean): void => { avatarPreparingRef.current = value; setAvatarPreparing(value); };
-  const [modelIndex, setModelIndex] = useState<number>();
   const busyRef = useRef(false);
   const requestRef = useRef<AbortController | undefined>(undefined);
   const generationRef = useRef(0);
@@ -39,7 +38,6 @@ export function MobilePartnerProfileSheet({ visible, partner, transport, colors,
   const draft = snapshot ? state.draft : undefined;
   const dirty = !!snapshot && !!draft && JSON.stringify(mobilePartnerProfileDraft(snapshot.partner)) !== JSON.stringify(draft);
   const editable = !!snapshot && !!draft && !busy && !state.requiresRefresh;
-  const capabilitiesEditable = editable && !draft?.usesDirectoryDefaults;
 
   const load = (): void => {
     const selected = propsRef.current.partner; const current = propsRef.current.transport;
@@ -48,7 +46,6 @@ export function MobilePartnerProfileSheet({ visible, partner, transport, colors,
     requestRef.current?.abort();
     const controller = new AbortController(); requestRef.current = controller;
     const generation = ++generationRef.current;
-    setModelIndex(undefined);
     setState({ binding: expected, phase: "loading" });
     void current.load(selected, controller.signal).then((next) => {
       if (controller.signal.aborted || generationRef.current !== generation || bindingRef.current !== expected) return;
@@ -61,7 +58,7 @@ export function MobilePartnerProfileSheet({ visible, partner, transport, colors,
     });
   };
   useEffect(() => {
-    busyRef.current = false; setBusy(false); setModelIndex(undefined);
+    busyRef.current = false; setBusy(false);
     setState({ binding, phase: "loading" }); load();
     return () => { generationRef.current += 1; requestRef.current?.abort(); };
   }, [binding]);
@@ -76,11 +73,6 @@ export function MobilePartnerProfileSheet({ visible, partner, transport, colors,
   };
   const change = (next: MobilePartnerProfileDraft): void => {
     if (editable) setState((previous) => ({ ...previous, draft: next, error: undefined }));
-  };
-  const updateRoute = (index: number, route: MobilePartnerModelRoute): void => {
-    if (!draft || !capabilitiesEditable) return;
-    change({ ...draft, capabilities: { ...draft.capabilities,
-      modelChain: draft.capabilities.modelChain.map((candidate, position) => position === index ? route : candidate) } });
   };
   const save = (): void => {
     const current = propsRef.current.transport; const expected = bindingRef.current;
@@ -119,9 +111,6 @@ export function MobilePartnerProfileSheet({ visible, partner, transport, colors,
       backgroundColor: selected ? colors.brandBackground : colors.surface }, disabled && styles.disabled]}>
     <Text style={[styles.body, { color: colors.ink }]}>{label}</Text>
   </Pressable>;
-  const caption = (key: "name" | "avatar" | "identity" | "models" | "permission" | "effort") => <Text
-    style={[styles.label, { color: colors.ink }]}>{mobileMessage(locale, `partnerProfile.${key}`)}</Text>;
-  const effective = draft?.usesDirectoryDefaults ? snapshot?.options.defaultCapabilities : draft?.capabilities;
   return <Modal visible={visible} animationType="slide" presentationStyle="pageSheet" onRequestClose={close}>
     <SafeAreaView style={[styles.screen, { backgroundColor: colors.background }]} edges={["top", "bottom"]}>
       <MobileKeyboardAvoidingView style={styles.screen} keyboard={keyboard} consumedBottomInset={insets.bottom}>
@@ -140,86 +129,8 @@ export function MobilePartnerProfileSheet({ visible, partner, transport, colors,
               <Text style={[styles.body, { color: colors.negative }]}>{state.error}</Text>
               {state.requiresRefresh && action(mobileMessage(locale, "partnerProfile.reload"), load, busy)}
             </View>}
-            {caption("name")}
-            <TextInput accessibilityLabel={mobileMessage(locale, "partnerProfile.name")} value={draft.displayName} editable={editable}
-              onChangeText={(displayName) => change({ ...draft, displayName })} maxLength={200} autoCorrect={false}
-              style={[styles.input, { borderColor: colors.border, color: colors.ink, backgroundColor: colors.surface }]} />
-            {caption("avatar")}
-            <MobilePartnerPhotoPicker key={binding} value={draft.avatar} presets={snapshot.options.avatarPresets} partner={snapshot.partner}
-              colors={colors} locale={locale} disabled={!editable} onPreparing={preparingAvatar}
-              onChange={(avatar) => change({ ...draft, avatar })} />
-            {caption("identity")}
-            <TextInput accessibilityLabel={mobileMessage(locale, "partnerProfile.identity")} value={draft.identitySource}
-              editable={editable} multiline maxLength={8_000} onChangeText={(identitySource) => change({ ...draft, identitySource })}
-              style={[styles.input, styles.identity, { borderColor: colors.border, color: colors.ink, backgroundColor: colors.surface }]} />
-            <View style={styles.toggle}>
-              <Text style={[styles.body, styles.grow, { color: colors.ink }]}>{mobileMessage(locale, "partnerProfile.defaults")}</Text>
-              <Switch accessibilityLabel={mobileMessage(locale, "partnerProfile.defaults")} value={draft.usesDirectoryDefaults}
-                disabled={!editable || !snapshot.options.defaultCapabilities && !draft.usesDirectoryDefaults}
-                onValueChange={(usesDirectoryDefaults) => change({ ...draft, usesDirectoryDefaults })} />
-            </View>
-            {caption("models")}
-            {effective?.modelChain.map((route, index) => {
-              const model = snapshot.models.find((candidate) => candidate.backendId === route.backendId
-                && candidate.providerId === route.providerId && candidate.modelId === route.modelId);
-              return <View key={index} style={[styles.section, { borderColor: colors.border }]}>
-                <Text style={[styles.label, { color: colors.muted }]}>{mobileMessage(locale, "partnerProfile.model", { index: index + 1 })}</Text>
-                {action(`${model?.displayName ?? route.modelId} · ${model?.providerName ?? route.providerId}`,
-                  () => setModelIndex(modelIndex === index ? undefined : index), !capabilitiesEditable)}
-                {modelIndex === index && snapshot.models.map((choice) => {
-                  const duplicate = effective.modelChain.some((candidate, position) => position !== index
-                    && candidate.providerId === choice.providerId && candidate.modelId === choice.modelId);
-                  return <View key={choice.key}>{action(`${choice.displayName} · ${choice.providerName}`, () => {
-                    const effort = choice.efforts.find((candidate) => candidate.default)?.id ?? choice.efforts[0]?.id;
-                    updateRoute(index, { backendId: choice.backendId, providerId: choice.providerId, modelId: choice.modelId,
-                      fastMode: false, ...(effort === undefined ? {} : { effort }) });
-                    setModelIndex(undefined);
-                  }, !capabilitiesEditable || duplicate, choice.modelId === route.modelId && choice.providerId === route.providerId)}</View>;
-                })}
-                {caption("effort")}
-                <View style={styles.choices}>
-                  {(model?.efforts.length ?? 0) === 0 && action(mobileMessage(locale, "partnerProfile.automatic"), () => {
-                    const { effort: _effort, ...automatic } = route; updateRoute(index, automatic);
-                  }, !capabilitiesEditable, route.effort === undefined)}
-                  {model?.efforts.map((effort) => <View key={effort.id}>{action(effort.label,
-                    () => updateRoute(index, { ...route, effort: effort.id }), !capabilitiesEditable || !snapshot.canSetEffort, route.effort === effort.id)}</View>)}
-                </View>
-                <View style={styles.toggle}>
-                  <Text style={[styles.body, styles.grow, { color: colors.ink }]}>{mobileMessage(locale, "partnerProfile.fast")}</Text>
-                  <Switch accessibilityLabel={`${mobileMessage(locale, "partnerProfile.fast")} ${index + 1}`} value={route.fastMode}
-                    disabled={!capabilitiesEditable || (!model?.supportsFastMode || !snapshot.canSetFastMode) && !route.fastMode}
-                    onValueChange={(fastMode) => updateRoute(index, { ...route, fastMode })} />
-                </View>
-                {effective.modelChain.length > 1 && action(mobileMessage(locale, "partnerProfile.removeModel", { index: index + 1 }), () => {
-                  change({ ...draft, capabilities: { ...draft.capabilities,
-                    modelChain: draft.capabilities.modelChain.filter((_candidate, position) => position !== index) } }); setModelIndex(undefined);
-                }, !capabilitiesEditable)}
-              </View>;
-            })}
-            {action(mobileMessage(locale, "partnerProfile.addModel"), () => {
-              const available = snapshot.models.find((model) => !draft.capabilities.modelChain.some((route) =>
-                route.providerId === model.providerId && route.modelId === model.modelId));
-              if (available) {
-                const effort = available.efforts.find((candidate) => candidate.default)?.id ?? available.efforts[0]?.id;
-                change({ ...draft, capabilities: { ...draft.capabilities, modelChain: [...draft.capabilities.modelChain,
-                  { backendId: available.backendId, providerId: available.providerId, modelId: available.modelId,
-                    fastMode: false, ...(effort === undefined ? {} : { effort }) }] } });
-              }
-            }, !capabilitiesEditable || !snapshot.canSwitchModel || (effective?.modelChain.length ?? 0) >= 3 || !snapshot.models.some((model) =>
-              !draft.capabilities.modelChain.some((route) => route.providerId === model.providerId && route.modelId === model.modelId)))}
-            {caption("permission")}
-            <View style={styles.choices}>
-              {(["ask", "auto"] as const).map((permissionMode) => <View key={permissionMode}>{action(mobileMessage(locale,
-                permissionMode === "ask" ? "partnerProfile.ask" : "partnerProfile.auto"), () => change({ ...draft,
-                  capabilities: { ...draft.capabilities, permissionMode } }), !capabilitiesEditable || !snapshot.permissionModes.includes(permissionMode),
-              effective?.permissionMode === permissionMode)}</View>)}
-            </View>
-            <View style={styles.toggle}>
-              <Text style={[styles.body, styles.grow, { color: colors.ink }]}>{mobileMessage(locale, "partnerProfile.plan")}</Text>
-              <Switch accessibilityLabel={mobileMessage(locale, "partnerProfile.plan")} value={effective?.planMode ?? false}
-                disabled={!capabilitiesEditable || !snapshot.canSetPlanMode && !effective?.planMode} onValueChange={(planMode) => change({ ...draft,
-                  capabilities: { ...draft.capabilities, planMode } })} />
-            </View>
+            <MobilePartnerProfileForm fields={snapshot} original={snapshot.partner} draft={draft} disabled={!editable}
+              avatarKey={binding!} onChange={change} onPreparing={preparingAvatar} colors={colors} locale={locale} />
             {busy && <ActivityIndicator color={colors.accent} />}
             {action(mobileMessage(locale, "partnerProfile.save"), save, !editable || !dirty || avatarPreparing)}
           </ScrollView>}

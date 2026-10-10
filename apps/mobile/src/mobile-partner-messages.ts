@@ -10,6 +10,17 @@ type MobilePartnerMessageRow = readonly [
 ];
 
 const rows = [
+  ["partnerCreation.title", "Invite a Partner", "邀请伙伴", "邀請夥伴", "パートナーを招待", "파트너 초대"],
+  ["partnerCreation.create", "Invite Partner", "邀请伙伴", "邀請夥伴", "パートナーを招待", "파트너 초대"],
+  ["partnerCreation.backend", "Execution environment", "执行环境", "執行環境", "実行環境", "실행 환경"],
+  ["partnerCreation.template", "Identity template", "身份模板", "身分範本", "アイデンティティテンプレート", "정체성 템플릿"],
+  ["partnerCreation.failed", "Creation could not be confirmed. Your draft is preserved; refresh or check the retained result.", "无法确认创建结果。草稿已保留，请刷新或查询保留的请求。", "無法確認建立結果。草稿已保留，請重新整理或查詢保留的請求。", "作成結果を確認できません。下書きは保持されています。更新するか保存された結果を確認してください。", "생성 결과를 확인할 수 없습니다. 초안은 유지됩니다. 새로고침하거나 보관된 결과를 확인하세요."],
+  ["partnerCreation.unknown", "This request may already have created a Partner. Check its result; it will not be resent.", "此请求可能已创建伙伴。请查询结果，不会重新发送。", "此請求可能已建立夥伴。請查詢結果，不會重新傳送。", "このリクエストですでにパートナーが作成された可能性があります。結果を確認してください。再送信はしません。", "이 요청으로 파트너가 이미 생성되었을 수 있습니다. 결과를 확인하세요. 재전송하지 않습니다."],
+  ["partnerCreation.check", "Check creation result", "查询创建结果", "查詢建立結果", "作成結果を確認", "생성 결과 확인"],
+  ["partnerCreation.absent", "No result is recorded yet; the original request may still arrive. A new intent will permanently retire it first.", "尚无已保存的结果，原请求仍可能迟到。新意图会先永久封存原请求。", "尚無已儲存的結果，原請求仍可能晚到。新意圖會先永久封存原請求。", "結果はまだ記録されていません。元のリクエストが遅れて届く可能性があります。新しい作成前に元のリクエストを永久に無効化します。", "아직 기록된 결과가 없으며 원래 요청이 늦게 도착할 수 있습니다. 새 생성 전에 원래 요청을 영구 폐기합니다."],
+  ["partnerCreation.newIntent", "Retire request and start a new invite", "封存请求并开始新邀请", "封存請求並開始新邀請", "リクエストを無効化して新規招待", "요청 폐기 후 새 초대 시작"],
+  ["partnerCreation.inactive", "The original Partner is archived or deleted and will not be restored. Refresh before starting a new invite.", "原伙伴已归档或删除，不会恢复。开始新邀请前请刷新。", "原夥伴已封存或刪除，不會還原。開始新邀請前請重新整理。", "元のパートナーはアーカイブまたは削除済みで復元されません。新規招待前に更新してください。", "원래 파트너는 보관되었거나 삭제되어 복원되지 않습니다. 새 초대 전에 새로고침하세요."],
+  ["partnerCreation.unavailable", "No current model and permission combination can create a Partner. Configure this Joko node, then refresh.", "当前没有可用于创建伙伴的模型和权限组合。请配置此 Joko 节点后刷新。", "目前沒有可用於建立夥伴的模型與權限組合。請設定此 Joko 節點後重新整理。", "パートナーを作成できるモデルと権限の組み合わせがありません。Joko ノードを設定して更新してください。", "파트너를 생성할 수 있는 모델 및 권한 조합이 없습니다. Joko 노드를 설정한 후 새로고침하세요."],
   ["partnerInitialization.title", "Partner setup", "伙伴初始化", "夥伴初始化", "パートナーの準備", "파트너 설정"],
   ["partnerInitialization.openAccessibility", "View {name}'s setup", "查看{name}的初始化", "查看{name}的初始化", "{name}の準備状況を表示", "{name}의 설정 확인"],
   ["partnerInitialization.loading", "Checking Partner setup…", "正在检查伙伴初始化…", "正在檢查夥伴初始化…", "パートナーの準備状況を確認中…", "파트너 설정 확인 중…"],

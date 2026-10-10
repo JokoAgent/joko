@@ -29,6 +29,9 @@ import {
 } from "@joko/contracts";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MobileClient, type MobileStorage, type PendingOperation } from "./mobile-client";
+import { MobilePartnerCreationReceipts } from "./mobile-partner-creation-receipts";
+import { mobilePartnerCreationDraft, MobilePartnerCreationRejected, type MobilePartnerCreationResult } from "./mobile-partner-creation";
+import { creationSnapshot } from "./test/mobile-partner-creation";
 import { MobileCredentialStorageError, profileFromCredential } from "./connection-storage";
 import { producedArtifactEvent, producedImageEvent, toolMediaEvent } from "./test/timeline-media";
 import { animatedPngBytes, gifBytes, svgBytes, bmpBytes, tiffBytes, isoImageBytes, iconBytes, iconDibBytes } from "./test/image-formats";
@@ -1772,11 +1775,12 @@ function client(
   fileShare?: Pick<MobileFileShare, "perform">,
   offlineCache?: Pick<MobileOfflineCache, "load" | "save" | "clear">,
   readOnlyDictionaryCache?: { clear(profileId: string): Promise<void> },
-  deviceNameSource: MobileDeviceNameSourceProvider = () => mobileDeviceNameSource(undefined, "android")
+  deviceNameSource: MobileDeviceNameSourceProvider = () => mobileDeviceNameSource(undefined, "android"),
+  creationReceipts?: MobilePartnerCreationReceipts
 ) {
   const instance = new MobileClient(network, storage, discovery ?? { scan: vi.fn(async () => []) }, newId, "android", now,
     clearInteractionDraft, drafts.newTask, drafts.composer, attachmentFiles, mediaPreviewFiles, pdfPreviewFiles,
-    modelPreviewFiles, fileShare, offlineCache, readOnlyDictionaryCache, undefined, deviceNameSource);
+    modelPreviewFiles, fileShare, offlineCache, readOnlyDictionaryCache, undefined, deviceNameSource, creationReceipts);
   clients.push(instance);
   return instance;
 }
@@ -2706,6 +2710,86 @@ describe("mobile Extension catalog authority", () => {
       destination: { kind: "default" }
     }, new AbortController().signal)).rejects.toThrow(/^Repair or rebind/u);
     expect(network.relocateExtensionLibrary).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("mobile Partner creation authority", () => {
+  function fixture() {
+    const network = fakeNetwork(); const data = new Map<string, string>();
+    const driver = { getItem: vi.fn(async (key: string) => data.get(key) ?? null),
+      setItem: vi.fn(async (key: string, value: string) => { data.set(key, value); }),
+      removeItem: vi.fn(async (key: string) => { data.delete(key); }) };
+    const receipts = new MobilePartnerCreationReceipts(driver);
+    network.readOwner = vi.fn(async () => ({ connection, device, snapshot: runtimeControlProjection() }));
+    network.getPartnerCreationOptions = vi.fn(async () => creationSnapshot.options);
+    network.listPartnerCatalog = vi.fn(async () => ({ directory: { revision: 4n, activeCount: 0, archivedCount: 0, errorCount: 0, updatedAt: 2000 }, partners: [] }));
+    const created = { ...profilePartner, displayName: "Nova" };
+    network.createPartner = vi.fn(async (_credential, requestId) => {
+      expect(await receipts.load(credential, new AbortController().signal)).toBe(requestId);
+      return { kind: "found" as const, partner: created };
+    });
+    network.getPartnerCreation = vi.fn(async () => ({ kind: "found" as const, partner: created }));
+    network.retirePartnerCreation = vi.fn(async () => ({ kind: "retired" as const }));
+    const storage = memoryStorage(credential).storage;
+    const makeClient = () => client(network, storage, undefined, undefined, () => "creation-request-native-client",
+      undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+      new MobilePartnerCreationReceipts(driver));
+    return { network, driver, receipts, data, created, makeClient };
+  }
+  it("persists before dispatch, confirms the original result and clears only its owned receipt", async () => {
+    const f = fixture(); const app = f.makeClient(); await app.start();
+    const active = app.partnerCreationTransport()!; const signal = new AbortController().signal;
+    const snapshot = await active.load(signal);
+    const draft = { ...mobilePartnerCreationDraft(snapshot)!, displayName: "Nova", avatar: { base64: "/9j/2w==" } };
+    expect(await active.create(snapshot, draft, signal)).toEqual({ kind: "found", partner: f.created });
+    expect(f.network.createPartner).toHaveBeenCalledOnce(); expect(f.network.getPartnerCreation).toHaveBeenCalledOnce();
+    expect(f.data.size).toBe(0); expect(await active.pending(signal)).toBeUndefined();
+  });
+  it("recovers unknown across a new Client, never resends and preserves the current edited Partner", async () => {
+    const f = fixture(); const app = f.makeClient(); await app.start();
+    f.network.createPartner = vi.fn(async () => { throw new Error("lost acknowledgement"); });
+    const active = app.partnerCreationTransport()!; const signal = new AbortController().signal; const snapshot = await active.load(signal);
+    const draft = { ...mobilePartnerCreationDraft(snapshot)!, displayName: "Nova" };
+    await expect(active.create(snapshot, draft, signal)).rejects.toThrow(/lost/u);
+    expect([...f.data.values()]).toEqual(["creation-request-native-client"]);
+    app.dispose(); const reloaded = f.makeClient(); await reloaded.start(); const recovered = reloaded.partnerCreationTransport()!;
+    const requestId = await recovered.pending(signal); expect(requestId).toBe("creation-request-native-client");
+    await expect(recovered.create(await recovered.load(signal), draft, signal)).rejects.toThrow(/retained/u);
+    f.network.getPartnerCreation = vi.fn(async () => ({ kind: "found" as const, partner: { ...f.created, displayName: "Nova edited", revision: 9n } }));
+    expect(await recovered.lookup(requestId!, signal)).toMatchObject({ kind: "found", partner: { displayName: "Nova edited", revision: 9n } });
+    expect(f.network.createPartner).toHaveBeenCalledOnce(); expect(f.data.size).toBe(0);
+  });
+  it("keeps absence ambiguous, atomically retires it and treats only a typed rejection as uncreated", async () => {
+    const f = fixture(); const app = f.makeClient(); await app.start(); const active = app.partnerCreationTransport()!;
+    const signal = new AbortController().signal; const snapshot = await active.load(signal);
+    const draft = { ...mobilePartnerCreationDraft(snapshot)!, displayName: "Nova" };
+    f.network.createPartner = vi.fn(async () => { throw new Error("lost"); });
+    await expect(active.create(snapshot, draft, signal)).rejects.toThrow();
+    f.network.getPartnerCreation = vi.fn(async () => ({ kind: "absent" as const })); const requestId = (await active.pending(signal))!;
+    expect(await active.lookup(requestId, signal)).toEqual({ kind: "absent" }); expect(f.data.size).toBe(1);
+    expect(await active.retire(requestId, signal)).toEqual({ kind: "retired" }); expect(f.data.size).toBe(0);
+    f.network.createPartner = vi.fn(async () => { throw new MobilePartnerCreationRejected("Rejected"); });
+    await expect(active.create(snapshot, draft, signal)).rejects.toBeInstanceOf(MobilePartnerCreationRejected); expect(f.data.size).toBe(0);
+  });
+  it("prevents duplicate dispatch and ignores a late owner result without clearing its receipt", async () => {
+    const f = fixture(); const app = f.makeClient(); await app.start(); const active = app.partnerCreationTransport()!;
+    const signal = new AbortController().signal; const snapshot = await active.load(signal);
+    const draft = { ...mobilePartnerCreationDraft(snapshot)!, displayName: "Nova" };
+    let finish!: (result: MobilePartnerCreationResult) => void;
+    f.network.createPartner = vi.fn(() => new Promise<MobilePartnerCreationResult>((resolve) => { finish = resolve; }));
+    const first = active.create(snapshot, draft, signal); await vi.waitFor(() => expect(f.network.createPartner).toHaveBeenCalledOnce());
+    await expect(active.create(snapshot, draft, signal)).rejects.toThrow(/in flight/u);
+    app.setForeground(false); finish({ kind: "found", partner: f.created });
+    await expect(first).rejects.toThrow(/owner changed/u); expect(f.data.size).toBe(1); expect(f.network.getPartnerCreation).not.toHaveBeenCalled();
+  });
+  it("does not dispatch when receipt persistence or the fresh directory CAS fails", async () => {
+    const f = fixture(); const app = f.makeClient(); await app.start(); const active = app.partnerCreationTransport()!;
+    const signal = new AbortController().signal; const snapshot = await active.load(signal);
+    const draft = { ...mobilePartnerCreationDraft(snapshot)!, displayName: "Nova" };
+    f.driver.setItem.mockRejectedValueOnce(new Error("disk unavailable"));
+    await expect(active.create(snapshot, draft, signal)).rejects.toThrow(/unavailable/u); expect(f.network.createPartner).not.toHaveBeenCalled();
+    await expect(active.create({ ...snapshot, options: { ...snapshot.options, revision: 3n } }, draft, signal)).rejects.toThrow(/Refresh/u);
+    expect(f.network.createPartner).not.toHaveBeenCalled(); expect(f.data.size).toBe(0);
   });
 });
 

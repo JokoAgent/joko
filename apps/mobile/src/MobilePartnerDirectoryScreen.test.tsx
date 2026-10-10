@@ -12,10 +12,15 @@ import type {
   MobilePartnerDirectoryTransport
 } from "./mobile-partner-directory";
 import type { MobilePartnerInitializationTransport } from "./mobile-partner-initialization";
+import type { MobilePartnerCreationTransport } from "./mobile-partner-creation";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
 const native = vi.hoisted(() => ({ back: undefined as undefined | (() => boolean) }));
+vi.mock("./MobilePartnerCreateSheet", async () => {
+  const React = await import("react");
+  return { MobilePartnerCreateSheet: ({ visible }: { visible: boolean }) => visible ? React.createElement("div", { "data-testid": "partnerCreation.sheet" }) : null };
+});
 
 vi.mock("react-native", async () => {
   const React = await import("react");
@@ -131,7 +136,8 @@ let root: Root;
 const onBack = vi.fn();
 const onOpenTask = vi.fn();
 
-async function render(active?: MobilePartnerDirectoryTransport, initializationTransport?: MobilePartnerInitializationTransport) {
+async function render(active?: MobilePartnerDirectoryTransport, initializationTransport?: MobilePartnerInitializationTransport,
+  creationTransport?: MobilePartnerCreationTransport) {
   if (!root) {
     container = document.createElement("div");
     document.body.append(container);
@@ -139,7 +145,7 @@ async function render(active?: MobilePartnerDirectoryTransport, initializationTr
   }
   await act(async () => {
     root.render(createElement(MobilePartnerDirectoryScreen, {
-      colors, locale: "en", transport: active, initializationTransport, onBack, onOpenTask
+      colors, locale: "en", transport: active, initializationTransport, creationTransport, onBack, onOpenTask
     }));
   });
 }
@@ -161,6 +167,17 @@ afterEach(() => {
 });
 
 describe("MobilePartnerDirectoryScreen", () => {
+  it("offers creation through the matching node header and empty-state CTA without bypassing an offline owner", async () => {
+    const active = transport(); vi.mocked(active.list).mockResolvedValue({ ...catalog, partners: [], directory: { ...catalog.directory, activeCount: 0 } });
+    const creation = { ownerKey: active.ownerKey } as MobilePartnerCreationTransport;
+    await render(active, undefined, creation);
+    const header = container.querySelector<HTMLButtonElement>('[data-testid="partnerDirectory.create"]')!;
+    const empty = container.querySelector<HTMLButtonElement>('[data-testid="partnerDirectory.emptyCreate"]')!;
+    expect(header.disabled).toBe(false); expect(empty.disabled).toBe(false);
+    await act(async () => empty.click()); expect(container.querySelector('[data-testid="partnerCreation.sheet"]')).not.toBeNull();
+    await render(active, undefined, { ...creation, ownerKey: "other-owner" });
+    expect(container.querySelector<HTMLButtonElement>('[data-testid="partnerDirectory.create"]')!.disabled).toBe(true);
+  });
   it("opens pending setup through the matching node owner and returns to the roster on Android back", async () => {
     const active = transport();
     const initialization: MobilePartnerInitializationTransport = { ownerKey: active.ownerKey,

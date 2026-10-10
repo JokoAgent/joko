@@ -62,12 +62,20 @@ export function mobilePartnerProfileDraft(partner: MobilePartnerDirectoryProfile
 
 export function validateMobilePartnerProfileDraft(snapshot: MobilePartnerProfileSnapshot,
   draft: MobilePartnerProfileDraft): MobilePartnerProfileDraft {
+  return validateMobilePartnerDraftFields(snapshot, draft, snapshot.partner.capabilities.modelChain[0]?.backendId,
+    snapshot.partner);
+}
+
+export type MobilePartnerDraftFields = Omit<MobilePartnerProfileSnapshot, "partner">;
+
+export function validateMobilePartnerDraftFields(snapshot: MobilePartnerDraftFields, draft: MobilePartnerProfileDraft,
+  backendId: string | undefined, original?: MobilePartnerDirectoryProfile): MobilePartnerProfileDraft {
   const displayName = draft.displayName.normalize("NFKC").trim().replace(/\s+/gu, " ");
   const identitySource = draft.identitySource.trim();
   if (displayName.length < 1 || displayName.length > 200 || !LABEL.test(displayName)) {
     throw new MobilePartnerProfileValidationError("name", "Enter a Partner name of 1–200 characters without control characters.");
   }
-  if (snapshot.names.some((candidate) => candidate.partnerId !== snapshot.partner.partnerId
+  if (snapshot.names.some((candidate) => candidate.partnerId !== original?.partnerId
     && normalizedName(candidate.displayName) === normalizedName(displayName))) {
     throw new MobilePartnerProfileValidationError("nameTaken", "Another Partner on this node already has that name.");
   }
@@ -76,7 +84,7 @@ export function validateMobilePartnerProfileDraft(snapshot: MobilePartnerProfile
   }
   if (typeof draft.avatar === "string" ? !snapshot.options.avatarPresets.includes(draft.avatar)
     : "base64" in draft.avatar ? !mobilePartnerPhotoValid(draft.avatar.base64)
-      : JSON.stringify(draft.avatar) !== JSON.stringify(snapshot.partner.avatar)) {
+      : !original || JSON.stringify(draft.avatar) !== JSON.stringify(original.avatar)) {
     throw new MobilePartnerProfileValidationError("avatar", "Select a current Partner avatar.");
   }
   const capabilities = draft.usesDirectoryDefaults ? snapshot.options.defaultCapabilities : draft.capabilities;
@@ -91,7 +99,7 @@ export function validateMobilePartnerProfileDraft(snapshot: MobilePartnerProfile
   for (const route of chain) {
     const model = snapshot.models.find((candidate) => candidate.backendId === route.backendId
       && candidate.providerId === route.providerId && candidate.modelId === route.modelId);
-    if (route.backendId !== snapshot.partner.capabilities.modelChain[0]?.backendId || !model
+    if (route.backendId !== backendId || !model
       || route.effort !== undefined && !model.efforts.some((effort) => effort.id === route.effort)
       || (model.efforts.length > 0) !== (route.effort !== undefined) || route.effort !== undefined && !snapshot.canSetEffort
       || route.fastMode && (!model.supportsFastMode || !snapshot.canSetFastMode)) {

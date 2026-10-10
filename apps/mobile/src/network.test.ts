@@ -13,6 +13,8 @@ import {
   GetPartnerDirectoryResponseSchema, UpdatePartnerRequestSchema, UpdatePartnerResponseSchema,
   RetryPartnerInitializationRequestSchema, RetryPartnerInitializationResponseSchema,
   ReadPartnerAvatarRequestSchema, ReadPartnerAvatarResponseSchema,
+  CreatePartnerRequestSchema, CreatePartnerResponseSchema, GetPartnerCreationRequestSchema, GetPartnerCreationResponseSchema,
+  RetirePartnerCreationRequestSchema, RetirePartnerCreationResponseSchema,
   PermissionMode, type UpdatePartnerRequest,
   ConnectionSchema, ConnectionState, CredentialKind, DeviceKind, DeviceSchema,
   ExtensionCatalogEntrySchema, ExtensionCatalogSource, ExtensionInstallState, ExtensionMainViewIcon,
@@ -114,6 +116,71 @@ import {
 import { mobileDeviceNameSource } from "./mobile-device-name";
 import { mobilePartnerProfileDraft } from "./mobile-partner-profile";
 import { profilePartner, profilePartnerWire } from "./test/mobile-partner-profile";
+import { creationSnapshot } from "./test/mobile-partner-creation";
+import { mobilePartnerCreationDraft, MobilePartnerCreationRejected } from "./mobile-partner-creation";
+
+describe("mobile Partner creation network", () => {
+  const credential: PairedCredential = { profileId: "profile", origin: "https://node.example", serverId: "server",
+    connectionId: "connection", deviceId: "phone", displayName: "Joko node", authKey: "partner-fixture-key" };
+  const requestId = "creation-request-native-network";
+  it("maps all typed creation fields and never dual-writes inherited capabilities", async () => {
+    const drafts: ReturnType<typeof fromBinary<typeof CreatePartnerRequestSchema>>[] = [];
+    const fetcher = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      expect(new URL(String(input)).pathname).toBe("/joko.v1.PartnerService/CreatePartner");
+      const request = fromBinary(CreatePartnerRequestSchema, new Uint8Array(init?.body as Uint8Array)); drafts.push(request);
+      expect(request).toMatchObject({ requestId, expectedDirectoryRevision: { value: 4n }, draft: { displayName: "Nova",
+        avatar: { value: { case: "imageBase64", value: "/9j/2w==" } }, templateId: "general", identitySource: "Product work" } });
+      return new Response(toBinary(CreatePartnerResponseSchema, create(CreatePartnerResponseSchema, {
+        partner: profilePartnerWire(), directory: { revision: { value: 5n }, templates: [...creationSnapshot.options.templates],
+          avatarPresets: [...creationSnapshot.options.avatarPresets] }
+      })), { headers: { "content-type": "application/proto" } });
+    });
+    try {
+      const draft = { ...mobilePartnerCreationDraft(creationSnapshot)!, displayName: "Nova", avatar: { base64: "/9j/2w==" } };
+      await expect(mobileNetwork.createPartner!(credential, requestId, 4n, draft)).resolves.toMatchObject({ kind: "found", partner: { partnerId: "partner-a" } });
+      expect(drafts[0]?.draft?.capabilities).toBeUndefined();
+      await mobileNetwork.createPartner!(credential, requestId, 4n, { ...draft, usesDirectoryDefaults: false });
+      expect(drafts[1]?.draft?.capabilities).toMatchObject({ permissionMode: PermissionMode.ASK, modelChain: [{ providerId: "alpha", modelId: "a", effort: "low" }] });
+    } finally { fetcher.mockRestore(); }
+  });
+  it("distinguishes typed rejection from unknown and typed lookup absence without matching error text", async () => {
+    let code = "invalid_argument";
+    const fetcher = vi.spyOn(globalThis, "fetch").mockImplementation(async (_input, init) => {
+      expect(new Headers(init?.headers).get("authorization")).toBe("Bearer partner-fixture-key");
+      return new Response(JSON.stringify({ code, message: "Request not confirmed" }), { status: 400, headers: { "content-type": "application/json" } });
+    });
+    try {
+      const draft = { ...mobilePartnerCreationDraft(creationSnapshot)!, displayName: "Nova" };
+      await expect(mobileNetwork.createPartner!(credential, requestId, 4n, draft)).rejects.toBeInstanceOf(MobilePartnerCreationRejected);
+      code = "aborted"; await expect(mobileNetwork.createPartner!(credential, requestId, 4n, draft)).rejects.not.toBeInstanceOf(MobilePartnerCreationRejected);
+      code = "not_found"; await expect(mobileNetwork.getPartnerCreation!(credential, requestId)).resolves.toEqual({ kind: "absent" });
+      const abort = new AbortController(); abort.abort(); const calls = fetcher.mock.calls.length;
+      await expect(mobileNetwork.createPartner!(credential, requestId, 4n, draft, abort.signal)).rejects.toThrow();
+      expect(fetcher).toHaveBeenCalledTimes(calls);
+    } finally { fetcher.mockRestore(); }
+  });
+  it("uses only generated lookup/atomic retirement and rejects an ambiguous retirement result", async () => {
+    let retired = true; let ambiguous = false;
+    const fetcher = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const path = new URL(String(input)).pathname; const body = new Uint8Array(init?.body as Uint8Array);
+      if (path.endsWith("/GetPartnerCreation")) {
+        expect(fromBinary(GetPartnerCreationRequestSchema, body).requestId).toBe(requestId);
+        return new Response(toBinary(GetPartnerCreationResponseSchema, create(GetPartnerCreationResponseSchema, { partner: profilePartnerWire() })),
+          { headers: { "content-type": "application/proto" } });
+      }
+      expect(path).toBe("/joko.v1.PartnerService/RetirePartnerCreation");
+      expect(fromBinary(RetirePartnerCreationRequestSchema, body).requestId).toBe(requestId);
+      return new Response(toBinary(RetirePartnerCreationResponseSchema, create(RetirePartnerCreationResponseSchema, { retired,
+        ...(!retired || ambiguous ? { partner: profilePartnerWire() } : {}) })), { headers: { "content-type": "application/proto" } });
+    });
+    try {
+      await expect(mobileNetwork.getPartnerCreation!(credential, requestId)).resolves.toMatchObject({ kind: "found" });
+      await expect(mobileNetwork.retirePartnerCreation!(credential, requestId)).resolves.toEqual({ kind: "retired" });
+      retired = false; await expect(mobileNetwork.retirePartnerCreation!(credential, requestId)).resolves.toMatchObject({ kind: "found" });
+      retired = true; ambiguous = true; await expect(mobileNetwork.retirePartnerCreation!(credential, requestId)).rejects.toThrow(/ambiguous/u);
+    } finally { fetcher.mockRestore(); }
+  });
+});
 
 describe("mobile Partner catalog network", () => {
   it("sends typed photo patches, omits unchanged image bodies and verifies exact image responses", async () => {

@@ -23,12 +23,15 @@ import type { MobilePartnersColors } from "./MobilePartnersScreen";
 import { MobilePartnerAvatar } from "./MobilePartnerAvatar";
 import { MobilePartnerInitializationScreen } from "./MobilePartnerInitializationScreen";
 import type { MobilePartnerInitializationTransport } from "./mobile-partner-initialization";
+import type { MobilePartnerCreationTransport } from "./mobile-partner-creation";
+import { MobilePartnerCreateSheet } from "./MobilePartnerCreateSheet";
 
 export interface MobilePartnerDirectoryScreenProps {
   readonly colors: MobilePartnersColors;
   readonly locale: MobileSupportedLocale;
   readonly transport?: MobilePartnerDirectoryTransport;
   readonly initializationTransport?: MobilePartnerInitializationTransport;
+  readonly creationTransport?: MobilePartnerCreationTransport;
   readonly onBack: () => void;
   readonly onOpenTask: (sessionId: string) => void;
 }
@@ -117,7 +120,7 @@ function PartnerRow({ partner, colors, locale, opening, recoverable, last, onOpe
   </Pressable>;
 }
 
-export function MobilePartnerDirectoryScreen({ colors, locale, transport, initializationTransport, onBack, onOpenTask }:
+export function MobilePartnerDirectoryScreen({ colors, locale, transport, initializationTransport, creationTransport, onBack, onOpenTask }:
   MobilePartnerDirectoryScreenProps) {
   const [state, setState] = useState<DirectoryState>(() => transport
     ? { ownerKey: transport.ownerKey, status: "loading", refreshing: false }
@@ -127,6 +130,7 @@ export function MobilePartnerDirectoryScreen({ colors, locale, transport, initia
   const [openingId, setOpeningId] = useState<string>();
   const [actionError, setActionError] = useState<string>();
   const [initialization, setInitialization] = useState<{ readonly ownerKey: string; readonly partnerId: string }>();
+  const [creation, setCreation] = useState(false);
   const transportRef = useRef(transport);
   const requestRef = useRef<AbortController | undefined>(undefined);
   const openRef = useRef<AbortController | undefined>(undefined);
@@ -221,6 +225,8 @@ export function MobilePartnerDirectoryScreen({ colors, locale, transport, initia
       <Action label={mobileMessage(locale, "common.refresh")} colors={colors}
         disabled={status === "loading" || state.refreshing} onPress={load}
         testID="partnerDirectory.refresh" />
+      <Action label={mobileMessage(locale, "partnerCreation.create")} colors={colors} onPress={() => setCreation(true)}
+        disabled={!creationTransport || creationTransport.ownerKey !== transport?.ownerKey} testID="partnerDirectory.create" />
     </View>
     {catalog && <View style={styles.summary} accessibilityLabel={mobileMessage(locale, "partnerDirectory.summary", {
       active: catalog.directory.activeCount, archived: catalog.directory.archivedCount,
@@ -272,9 +278,11 @@ export function MobilePartnerDirectoryScreen({ colors, locale, transport, initia
       contentContainerStyle={[styles.list, visible.length === 0 && styles.emptyList]}
       keyboardShouldPersistTaps="handled" keyboardDismissMode="on-drag"
       refreshControl={<RefreshControl refreshing={state.refreshing} onRefresh={load} tintColor={colors.accent} />}
-      ListEmptyComponent={<Text style={[styles.body, styles.emptyText, { color: colors.muted }]}>
+      ListEmptyComponent={<View style={styles.center}><Text style={[styles.body, styles.emptyText, { color: colors.muted }]}>
         {mobileMessage(locale, emptyKey)}
-      </Text>}
+      </Text>{!query.trim() && lifecycle === "active" && <Action label={mobileMessage(locale, "partnerCreation.create")}
+        colors={colors} onPress={() => setCreation(true)} disabled={!creationTransport || creationTransport.ownerKey !== transport?.ownerKey}
+        testID="partnerDirectory.emptyCreate" />}</View>}
       renderItem={({ item, index }) => {
         const recoverable = item.lifecycle === "active" && item.initializationState !== "ready"
           && initializationTransport !== undefined && initializationTransport.ownerKey === transport?.ownerKey;
@@ -284,6 +292,12 @@ export function MobilePartnerDirectoryScreen({ colors, locale, transport, initia
             else open(item);
           }} />;
       }} />}
+    <MobilePartnerCreateSheet visible={creation} transport={creationTransport?.ownerKey === transport?.ownerKey ? creationTransport : undefined}
+      colors={colors} locale={locale} onClose={() => { setCreation(false); load(); }} onCreated={(partner) => {
+        if (creationTransport && creationTransport.ownerKey === transportRef.current?.ownerKey && initializationTransport?.ownerKey === creationTransport.ownerKey) {
+          setInitialization({ ownerKey: creationTransport.ownerKey, partnerId: partner.partnerId });
+        }
+      }} />
   </View>;
 }
 
