@@ -9,12 +9,86 @@ import { PartnerStore } from "./partner-store.js";
 import { PartnerStoreError, type PartnerCapabilitiesRecord } from "./partner-types.js";
 
 const cleanups: Array<() => Promise<void>> = [];
+let creationSequence = 0;
 
 afterEach(async () => {
   for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
 });
 
 describe("PartnerStore", () => {
+  it("replays a durable creation intent across edits and reopen without replacing the current profile", async () => {
+    const fixture = await fileStore();
+    const input = { expectedDirectoryRevision: 1n, ...draft("Aster") };
+    const created = fixture.store.createPartner(input);
+    const updated = fixture.store.updatePartner(created.id, created.revision, { displayName: "Aster updated", identitySource: "Keep the newer identity." });
+    const revision = fixture.store.directoryState().revision;
+    expect(fixture.store.createPartner(input)).toEqual(updated);
+    expect(fixture.store.directoryState().revision).toBe(revision);
+    expect(fixture.store.getPartnerCreation(input.requestId)).toEqual(updated);
+    fixture.store.close();
+    const reopened = new PartnerStore(fixture.path);
+    cleanups.push(async () => reopened.close());
+    expect(reopened.createPartner(input)).toEqual(updated);
+    expect(reopened.listPartners()).toHaveLength(1);
+    expect(reopened.listProfileVersions(created.id)).toHaveLength(2);
+  });
+
+  it("fences a creation request body and original directory identity before admitting a new intent", () => {
+    const store = memoryStore(["one", "two"]);
+    const input = { expectedDirectoryRevision: 1n, ...draft("Aster") };
+    const created = store.createPartner(input);
+    expectStoreError(() => store.createPartner({ ...input, displayName: "Beryl" }), "PARTNER_CREATION_CONFLICT");
+    expectStoreError(() => store.createPartner({ ...input, expectedDirectoryRevision: 2n }), "PARTNER_CREATION_CONFLICT");
+    expectStoreError(() => store.createPartner({ ...input, id: "other-id" }), "PARTNER_CREATION_CONFLICT");
+    expectStoreError(() => store.createPartner({ ...input, requestId: "invalid" }), "PARTNER_INVALID");
+    expectStoreError(() => store.createPartner({ ...input, requestId: "creation-request-stale" }), "PARTNER_DIRECTORY_CHANGED");
+    expect(store.getPartnerCreation("creation-request-absent")).toBeUndefined();
+    expect(store.getPartnerCreation(input.requestId)).toEqual(created);
+    expect(store.directoryState().revision).toBe(2n);
+  });
+
+  it("replays inherited creation intent after directory defaults change without reverting capabilities", () => {
+    const store = memoryStore(["one"]);
+    store.setDirectoryDefaults(1n, capabilities());
+    const input = { expectedDirectoryRevision: 2n, ...draft("Aster"), usesDirectoryDefaults: true };
+    const created = store.createPartner(input);
+    const next = { ...capabilities(), planMode: true };
+    store.setDirectoryDefaults(3n, next);
+    const current = store.getPartner(created.id);
+    expect(store.createPartner({ ...input, capabilities: next })).toEqual(current);
+    expect(current.capabilities.planMode).toBe(true);
+    expect(store.directoryState().revision).toBe(4n);
+  });
+
+  it("durably retires an absent creation ID before a delayed create and never retires an existing result", async () => {
+    const fixture = await fileStore();
+    const input = { expectedDirectoryRevision: 1n, ...draft("Aster") };
+    expect(fixture.store.retirePartnerCreation(input.requestId)).toBeUndefined();
+    fixture.store.close();
+    const reopened = new PartnerStore(fixture.path);
+    cleanups.push(async () => reopened.close());
+    expectStoreError(() => reopened.createPartner(input), "PARTNER_CREATION_RETIRED");
+    expect(reopened.retirePartnerCreation(input.requestId)).toBeUndefined();
+    const next = { ...input, requestId: "creation-request-replacement" };
+    const created = reopened.createPartner(next);
+    expect(reopened.retirePartnerCreation(next.requestId)).toEqual(created);
+    expect(reopened.createPartner(next)).toEqual(created);
+    expect(reopened.listPartners()).toHaveLength(1);
+  });
+
+  it("keeps deleted creation identities retired even when a new intent reuses the display name", () => {
+    const store = memoryStore(["one", "two"]);
+    const input = { expectedDirectoryRevision: 1n, ...draft("Aster") };
+    const created = store.createPartner(input);
+    const deleted = store.setLifecycle(created.id, created.revision, "deleted");
+    expect(store.getPartnerCreation(input.requestId)).toEqual(deleted);
+    expect(store.retirePartnerCreation(input.requestId)).toEqual(deleted);
+    expectStoreError(() => store.createPartner(input), "PARTNER_CREATION_RETIRED");
+    const replacement = store.createPartner({ ...input, requestId: "creation-request-new-partner", expectedDirectoryRevision: 3n });
+    expect(replacement.id).not.toBe(deleted.id);
+    expect(store.getPartner(deleted.id).lifecycle).toBe("deleted");
+  });
+
   it("persists a strict profile, immutable versions, and directory counts across reopen", async () => {
     const fixture = await fileStore();
     const created = fixture.store.createPartner({
@@ -367,6 +441,7 @@ function route(backendId: string, providerId: string, modelId: string) {
 
 function draft(displayName: string) {
   return {
+    requestId: `creation-request-${++creationSequence}`,
     displayName,
     avatar: "orbit",
     identitySource: `You are ${displayName.trim()}, a long-lived work partner.`,

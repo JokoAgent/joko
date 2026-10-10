@@ -71,7 +71,9 @@ describe("Partner gateway", () => {
       identitySource: "You are Aster.",
       templateId: "general",
       usesDirectoryDefaults: true
-    }, signal);
+    }, "creation-request-gateway", signal);
+    await expect(gateway.getPartnerCreation("creation-request-gateway", signal)).resolves.toMatchObject({ partner: { id: "partner-one" } });
+    await expect(gateway.retirePartnerCreation("creation-request-gateway", signal)).resolves.toMatchObject({ partner: { id: "partner-one" } });
     await gateway.updatePartner("partner-one", 8n, {
       displayName: "Aster Prime",
       modelChain: [{ backendId: "backend-1", providerId: "provider-1", modelId: "model-2", effort: "high", fastMode: true }],
@@ -111,7 +113,7 @@ describe("Partner gateway", () => {
       .resolves.toMatchObject({ id: "delegation-one" });
 
     const methods = [
-      "getPartnerDirectory", "listPartners", "getPartner", "createPartner", "updatePartner",
+      "getPartnerDirectory", "listPartners", "getPartner", "createPartner", "getPartnerCreation", "retirePartnerCreation", "updatePartner",
       "setPartnerLifecycle", "retryPartnerInitialization", "updatePartnerDefaults",
       "listPartnerSessions", "markPartnerRead", "listPartnerPrivateThreads", "getPartnerPrivateThread",
       "markPartnerPrivateThreadRead", "listPartnerDelegations", "getPartnerDelegation", "cancelPartnerDelegation"
@@ -119,6 +121,7 @@ describe("Partner gateway", () => {
     expect(requests.filter((entry) => methods.includes(entry.method)).map((entry) => entry.method)).toEqual(methods);
     expect(requests.find((entry) => entry.method === "listPartners")?.input).toEqual({ lifecycle: PartnerLifecycle.ACTIVE });
     expect(requests.find((entry) => entry.method === "createPartner")?.input).toMatchObject({
+      requestId: "creation-request-gateway",
       expectedDirectoryRevision: { value: 4n },
       draft: { displayName: "Aster", usesDirectoryDefaults: true }
     });
@@ -137,6 +140,27 @@ describe("Partner gateway", () => {
     expect(requests.find((entry) => entry.method === "setPartnerLifecycle")?.input.lifecycle).toBe(PartnerLifecycle.ARCHIVED);
     expect(requests.filter((entry) => methods.includes(entry.method)).every((entry) => entry.signal instanceof AbortSignal && !entry.signal.aborted)).toBe(true);
     gateway.disconnect();
+  });
+
+  it("rejects inconsistent creation retirement receipts and retires late lookup results on disconnect", async () => {
+    let mode: "inconsistent" | "absent" | "late" = "inconsistent";
+    let release!: (value: ReturnType<typeof partnerResponse>) => void;
+    const pending = new Promise<ReturnType<typeof partnerResponse>>((resolve) => { release = resolve; });
+    const gateway = connectedGateway(partnerTransport((method) => {
+      if (method === "retirePartnerCreation") return { retired: true, directory: directory(), ...(mode === "inconsistent" ? { partner: profile() } : {}) };
+      if (method === "getPartnerCreation" && mode === "late") return pending;
+      return partnerResponse(method);
+    }));
+    await gateway.connect();
+    await expect(gateway.retirePartnerCreation("creation-request-gateway")).rejects.toThrow(/inconsistent/iu);
+    mode = "absent";
+    await expect(gateway.retirePartnerCreation("creation-request-gateway")).resolves.toMatchObject({ directory: { revision: 4n } });
+    mode = "late";
+    const lookup = gateway.getPartnerCreation("creation-request-gateway");
+    const assertion = expect(lookup).rejects.toThrow();
+    gateway.disconnect();
+    release(partnerResponse("getPartnerCreation"));
+    await assertion;
   });
 
   it("fails closed for unknown enums and duplicate model-chain identities", async () => {
@@ -212,13 +236,13 @@ function connectedGateway(transport: Transport) {
 }
 
 function partnerTransport(
-  value: (method: string) => object,
+  value: (method: string) => object | Promise<object>,
   requests: Array<{ readonly method: string; readonly input: any; readonly signal?: AbortSignal }> = []
 ): Transport {
   return {
     unary: vi.fn(async (method: any, signal: AbortSignal | undefined, _timeout: unknown, _headers: unknown, input: any) => {
       requests.push({ method: method.localName, input, signal });
-      return response(method, create(method.output, value(method.localName)));
+      return response(method, create(method.output, await value(method.localName)));
     }),
     stream: vi.fn(async (method: any) => response(method, idleStream(), true))
   } as unknown as Transport;
@@ -229,6 +253,7 @@ function partnerResponse(method: string): object {
   if (method === "getPartnerDirectory") return { directory: directory() };
   if (method === "listPartners") return { partners: [profile()], directory: directory() };
   if (method === "getPartner") return { partner: profile() };
+  if (method === "retirePartnerCreation") return { retired: false, partner: profile(), directory: directory() };
   if (method === "updatePartnerDefaults") return { directory: directory(), affectedPartners: [profile()] };
   if (method === "listPartnerSessions") return { sessions: [partnerSession()] };
   if (method === "markPartnerRead") return { activity: activity(12n, 0n) };
@@ -239,7 +264,7 @@ function partnerResponse(method: string): object {
   if (method === "markPartnerPrivateThreadRead") return { readState: privateReadState() };
   if (method === "listPartnerDelegations") return { delegations: [delegation()] };
   if (method === "getPartnerDelegation" || method === "cancelPartnerDelegation") return { delegation: delegation() };
-  if (["createPartner", "updatePartner", "setPartnerLifecycle", "retryPartnerInitialization"].includes(method)) {
+  if (["createPartner", "getPartnerCreation", "updatePartner", "setPartnerLifecycle", "retryPartnerInitialization"].includes(method)) {
     return { partner: profile(), directory: directory() };
   }
   throw new Error(`Unexpected RPC ${method}`);

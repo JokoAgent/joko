@@ -1,5 +1,7 @@
-import { create } from "@bufbuild/protobuf";
+import { create, fromBinary } from "@bufbuild/protobuf";
+import { Code } from "@connectrpc/connect";
 import {
+  CreatePartnerRequestSchema,
   PartnerCapabilitiesSchema,
   PartnerDelegationStatus,
   PartnerDraftSchema,
@@ -46,6 +48,97 @@ describe("mounted Partner collaboration product chain", () => {
     await fixture?.close({ removeRoot: true });
     fixture = undefined;
   });
+
+  mountedIt("recovers a lost creation receipt after edits, service restart and narrow Web reload without duplicate initialization", async () => {
+    const executablePath = requiredEnvironment("JOKO_BROWSER_EXECUTABLE");
+    const webDirectory = requiredEnvironment("JOKO_MOUNTED_WEB_DIR");
+    fixture = await RealPiSystemFixture.start({ webDirectory, keepRoot: true, enableInternalServer: true });
+    const rootDirectory = fixture.rootDirectory;
+    const port = Number(new URL(fixture.baseUrl).port);
+    const internalPort = fixture.application.config.internalPort;
+    const manager = await fixture.pair("Partner creation manager");
+    const challenge = required((await fixture.anonymous.connection.beginPairing({ deviceDisplayName: "Partner creation Web" })).challenge, "the pairing challenge");
+    const pairingCode = fixture.pairingCode(challenge.challengeId);
+    browser = await chromium.launch({ executablePath, headless: true });
+    const page = await browser.newPage({ viewport: { width: 1440, height: 960 }, locale: "en-US" });
+    const pageErrors: string[] = [];
+    page.on("pageerror", (error) => pageErrors.push(error.message));
+    await page.goto(`${fixture.baseUrl}/#/partners`, { waitUntil: "domcontentloaded" });
+    await page.locator(".connection-tabs > button").nth(2).click();
+    const pairForm = page.locator("form.pair-form");
+    try { await pairForm.waitFor({ state: "visible", timeout: 3_000 }); }
+    catch { throw new Error(`The pairing form is unavailable: ${JSON.stringify(await page.locator(".connection-card").evaluateAll((nodes) => nodes.map((node) => ({
+      buttons: Array.from(node.querySelectorAll("button")).map((button) => button.textContent), labels: Array.from(node.querySelectorAll("label span")).map((span) => span.textContent)
+    }))))}`); }
+    await pairForm.locator("input[type=url]").fill(fixture.baseUrl);
+    await page.getByLabel("Pairing code").fill(pairingCode);
+    await page.getByLabel("Device name").fill("Partner creation Web");
+    await page.locator("form.pair-form button[type=submit]").click();
+    await page.locator(".partners-page .route-header").getByRole("button", { name: "Invite partner", exact: true }).waitFor({ state: "visible", timeout: 30_000 });
+    let sent = 0;
+    let captured: ReturnType<typeof create<typeof CreatePartnerRequestSchema>> | undefined;
+    let interceptionError: Error | undefined;
+    await page.route("**/joko.v1.PartnerService/CreatePartner", async (route) => {
+      sent += 1;
+      try {
+        captured = fromBinary(CreatePartnerRequestSchema, required(route.request().postDataBuffer(), "the binary creation request"));
+        if (captured.draft?.capabilities?.modelChain[0]?.backendId !== "pi") throw new Error("The creation fixture must use its local provider.");
+        const response = await route.fetch();
+        if (response.status() !== 200) throw new Error("The original creation was not confirmed by the service.");
+      } catch { interceptionError = new Error("The binary creation fixture could not confirm its local service response."); }
+      finally { await route.abort("failed"); }
+    });
+    await page.locator(".partners-page .route-header").getByRole("button", { name: "Invite partner", exact: true }).click();
+    const invite = page.getByRole("dialog", { name: "Invite a partner", exact: true });
+    await invite.getByLabel("Name", { exact: true }).fill("Nova");
+    await invite.getByRole("combobox", { name: "Primary model", exact: true }).click();
+    await page.getByRole("option", { name: /Joko real Pi E2E model/u }).click();
+    await invite.getByRole("button", { name: "Invite partner", exact: true }).click();
+    await invite.getByRole("button", { name: "Check creation result", exact: true }).waitFor({ state: "visible" });
+    await waitFor(() => invite.getByRole("button", { name: "Check creation result", exact: true }).isEnabled(), (value) => value, "the unconfirmed creation state");
+    expect(sent).toBe(1);
+    expect(interceptionError).toBeUndefined();
+    expect(await invite.getByLabel("Name", { exact: true }).isDisabled()).toBe(true);
+    expect(await overflow(page)).toBeLessThanOrEqual(1);
+    const request = required(captured, "the original creation request");
+    const original = required((await manager.clients.partner.getPartnerCreation({ requestId: request.requestId })).partner, "the original Partner");
+    const updated = required((await manager.clients.partner.updatePartner({
+      partnerId: original.partnerId, expectedRevision: original.revision, patch: { displayName: "Nova updated" }
+    })).partner, "the updated Partner");
+    expect((await manager.clients.partner.createPartner(request)).partner).toMatchObject({ partnerId: original.partnerId, displayName: "Nova updated", revision: updated.revision });
+    const authKey = manager.authKey;
+    await fixture.close({ removeRoot: false });
+    fixture = undefined;
+    fixture = await RealPiSystemFixture.start({ rootDirectory, webDirectory, port, internalPort, enableInternalServer: true });
+    const restarted = fixture.clients(authKey);
+    const replayed = required((await restarted.partner.createPartner(request)).partner, "the replayed Partner");
+    expect(replayed).toMatchObject({ partnerId: original.partnerId, canonicalSessionId: original.canonicalSessionId, displayName: "Nova updated", revision: updated.revision });
+    expect((await restarted.partner.listPartners({})).partners).toHaveLength(1);
+    await page.unroute("**/joko.v1.PartnerService/CreatePartner");
+    await page.setViewportSize({ width: 390, height: 844 });
+    await page.reload({ waitUntil: "domcontentloaded" });
+    await page.getByRole("button", { name: "Saved nodes", exact: true }).click();
+    await page.locator(".connection-card .profile-card").filter({ hasText: fixture.baseUrl }).getByRole("button", { name: "Connect", exact: true }).click();
+    await page.locator(partnerCard(original.partnerId)).waitFor({ state: "visible", timeout: 30_000 });
+    const navigationScrim = page.locator(".panel-scrim--navigation");
+    if (await navigationScrim.isVisible()) await page.locator(".sidebar").getByRole("button", { name: "Close navigation", exact: true }).click();
+    await page.locator(".partners-page .route-header").getByRole("button", { name: "Invite partner", exact: true }).click();
+    const recovery = page.getByRole("dialog", { name: "Invite a partner", exact: true });
+    expect(await recovery.getByLabel("Name", { exact: true }).isDisabled()).toBe(true);
+    await recovery.getByRole("button", { name: "Check creation result", exact: true }).click();
+    await waitFor(async () => page.url(), (value) => value.includes(`#/partners/${original.partnerId}`), "the recovered original Partner route");
+    expect(sent).toBe(1);
+    expect(await overflow(page)).toBeLessThanOrEqual(1);
+    expect(await page.evaluate(() => Object.keys(localStorage).filter((key) => key.startsWith("joko.partner.creation.v1:")).length)).toBe(0);
+    const lateId = "creation-request-delayed-e3";
+    await expect(restarted.partner.getPartnerCreation({ requestId: lateId })).rejects.toMatchObject({ code: Code.NotFound });
+    expect((await restarted.partner.retirePartnerCreation({ requestId: lateId })).retired).toBe(true);
+    const latestDirectory = required((await restarted.partner.getPartnerDirectory({})).directory?.revision, "the directory revision");
+    await expect(restarted.partner.createPartner({ ...request, requestId: lateId, expectedDirectoryRevision: latestDirectory, draft: { ...request.draft!, displayName: "Delayed" } }))
+      .rejects.toMatchObject({ code: Code.FailedPrecondition });
+    expect((await restarted.partner.listPartners({})).partners).toHaveLength(1);
+    expect(pageErrors).toEqual([]);
+  }, 120_000);
 
   mountedIt("persists private collaboration, delegation cards, cancellation, files, and restart state in wide and narrow production Web", async () => {
     const executablePath = requiredEnvironment("JOKO_BROWSER_EXECUTABLE");
@@ -290,6 +383,7 @@ async function createPartner(
 ): Promise<{ readonly partnerId: string; readonly canonicalSessionId: string }> {
   const directory = await manager.clients.partner.getPartnerDirectory({});
   const response = await manager.clients.partner.createPartner({
+    requestId: `creation-request-${displayName}`,
     expectedDirectoryRevision: required(directory.directory?.revision, "Partner directory revision"),
     draft: create(PartnerDraftSchema, {
       displayName,

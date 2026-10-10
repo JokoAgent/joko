@@ -6363,7 +6363,9 @@ export interface OperationApi extends VoiceDictionaryPeerApi {
   getPartnerDirectory(signal?: AbortSignal): Promise<PartnerDirectoryView>;
   listPartners(lifecycle?: PartnerLifecycleView, signal?: AbortSignal): Promise<PartnerListView>;
   getPartner(partnerId: string, signal?: AbortSignal): Promise<PartnerProfileView>;
-  createPartner(expectedDirectoryRevision: bigint, draft: PartnerDraftView, signal?: AbortSignal): Promise<PartnerMutationView>;
+  createPartner(expectedDirectoryRevision: bigint, draft: PartnerDraftView, requestId: string, signal?: AbortSignal): Promise<PartnerMutationView>;
+  getPartnerCreation(requestId: string, signal?: AbortSignal): Promise<PartnerMutationView>;
+  retirePartnerCreation(requestId: string, signal?: AbortSignal): Promise<{ readonly directory: PartnerDirectoryView; readonly partner?: PartnerProfileView }>;
   updatePartner(partnerId: string, expectedRevision: bigint, patch: PartnerPatchView, signal?: AbortSignal): Promise<PartnerMutationView>;
   setPartnerLifecycle(partnerId: string, expectedRevision: bigint, lifecycle: PartnerLifecycleView, signal?: AbortSignal): Promise<PartnerMutationView>;
   retryPartnerInitialization(partnerId: string, expectedRevision: bigint, signal?: AbortSignal): Promise<PartnerMutationView>;

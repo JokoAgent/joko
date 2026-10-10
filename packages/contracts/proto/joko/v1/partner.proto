@@ -260,11 +260,31 @@ message GetPartnerResponse {
 message CreatePartnerRequest {
   Revision expected_directory_revision = 1;
   PartnerDraft draft = 2;
+  string request_id = 3;
 }
 
 message CreatePartnerResponse {
   PartnerProfile partner = 1;
   PartnerDirectory directory = 2;
+}
+
+message GetPartnerCreationRequest {
+  string request_id = 1;
+}
+
+message GetPartnerCreationResponse {
+  PartnerProfile partner = 1;
+  PartnerDirectory directory = 2;
+}
+
+message RetirePartnerCreationRequest {
+  string request_id = 1;
+}
+
+message RetirePartnerCreationResponse {
+  bool retired = 1;
+  PartnerProfile partner = 2;
+  PartnerDirectory directory = 3;
 }
 
 message UpdatePartnerRequest {

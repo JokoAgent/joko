@@ -155,6 +155,7 @@ async function createPartner(
   const revision = directory.directory?.revision;
   if (!revision) throw new Error("The Partner directory revision is required.");
   const response = await manager.clients.partner.createPartner({
+    requestId: `creation-request-${displayName}`,
     expectedDirectoryRevision: revision,
     draft: create(PartnerDraftSchema, {
       displayName, avatar,

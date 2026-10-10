@@ -43,6 +43,7 @@ export interface PartnerListOptions {
 
 export interface CreatePartnerInput extends PartnerDraft {
   readonly expectedDirectoryRevision: bigint;
+  readonly requestId: string;
   readonly id?: string;
   readonly homeTargetId?: string;
 }
@@ -87,6 +88,7 @@ const MAX_DELEGATION_OBJECTIVE = 12_000;
 const MAX_DELEGATION_RESULT = 12_000;
 const MAX_ERROR_TEXT = 2_000;
 const ENTITY_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/u;
+const CREATION_REQUEST_ID = /^[A-Za-z0-9_-]{16,80}$/u;
 const AVATAR_ID = /^[a-z][a-z0-9-]{0,31}$/u;
 const TEMPLATE_ID = /^[a-z][a-z0-9-]{0,31}$/u;
 const FORBIDDEN_INLINE_TEXT = /[\u0000-\u001f\u007f\u200e\u200f\u202a-\u202e\u2066-\u2069]/u;
@@ -114,6 +116,8 @@ CREATE TABLE partner_directory (
 
 CREATE TABLE partners (
   id TEXT PRIMARY KEY,
+  creation_request_id TEXT NOT NULL UNIQUE,
+  creation_fingerprint TEXT NOT NULL CHECK (length(creation_fingerprint) = 64),
   revision INTEGER NOT NULL CHECK (revision BETWEEN 1 AND 9007199254740991),
   profile_version INTEGER NOT NULL CHECK (profile_version BETWEEN 1 AND 9007199254740991),
   display_name TEXT NOT NULL,
@@ -139,6 +143,11 @@ CREATE UNIQUE INDEX partners_live_name_unique
   ON partners(normalized_name)
   WHERE lifecycle <> 'deleted';
 CREATE INDEX partners_lifecycle_updated_idx ON partners(lifecycle, updated_at DESC, id);
+
+CREATE TABLE retired_partner_creations (
+  request_id TEXT PRIMARY KEY,
+  retired_at INTEGER NOT NULL CHECK (retired_at >= 0)
+) STRICT;
 
 CREATE TABLE partner_profile_versions (
   partner_id TEXT NOT NULL REFERENCES partners(id) ON DELETE CASCADE,
@@ -386,6 +395,25 @@ export class PartnerStore {
     return this.#profile(row);
   }
 
+  getPartnerCreation(requestId: string): PartnerProfileRecord | undefined {
+    this.#assertOpen();
+    const row = this.#database.prepare("SELECT * FROM partners WHERE creation_request_id = ?")
+      .get(creationRequestId(requestId)) as Row | undefined;
+    return row === undefined ? undefined : this.#profile(row);
+  }
+
+  /** Fence an absent request against delayed dispatch without deleting an existing profile. */
+  retirePartnerCreation(requestId: string): PartnerProfileRecord | undefined {
+    return this.#write(() => {
+      const id = creationRequestId(requestId);
+      const existing = this.getPartnerCreation(id);
+      if (existing !== undefined) return existing;
+      this.#database.prepare("INSERT INTO retired_partner_creations(request_id, retired_at) VALUES (?, ?) ON CONFLICT(request_id) DO NOTHING")
+        .run(id, this.#now());
+      return undefined;
+    });
+  }
+
   findPartnerByCanonicalSession(sessionId: string): PartnerProfileRecord | undefined {
     this.#assertOpen();
     const id = entityId(sessionId, "Canonical Session ID");
@@ -455,6 +483,24 @@ export class PartnerStore {
 
   createPartner(input: CreatePartnerInput): PartnerProfileRecord {
     return this.#write(() => {
+      const requestId = creationRequestId(input.requestId);
+      if (this.#database.prepare("SELECT request_id FROM retired_partner_creations WHERE request_id = ?").get(requestId) !== undefined) {
+        throw new PartnerStoreError("PARTNER_CREATION_RETIRED", "This partner creation request was retired.");
+      }
+      const requestedDraft = partnerDraft(input);
+      const fingerprint = creationFingerprint(input, requestedDraft);
+      const existing = this.#database.prepare("SELECT * FROM partners WHERE creation_request_id = ?")
+        .get(requestId) as Row | undefined;
+      if (existing !== undefined) {
+        if (existing["creation_fingerprint"] !== fingerprint) {
+          throw new PartnerStoreError("PARTNER_CREATION_CONFLICT", "This creation request already belongs to another intent.");
+        }
+        const partner = this.#profile(existing);
+        if (partner.lifecycle === "deleted") {
+          throw new PartnerStoreError("PARTNER_CREATION_RETIRED", "The partner created by this request was deleted.");
+        }
+        return partner;
+      }
       const directory = this.directoryState();
       if (directory.revision !== input.expectedDirectoryRevision) {
         throw new PartnerStoreError("PARTNER_DIRECTORY_CHANGED", "The partner directory changed; read it again and retry.");
@@ -463,7 +509,6 @@ export class PartnerStore {
       if (count >= MAX_PARTNERS) throw new PartnerStoreError("PARTNER_INVALID", "The partner directory reached its current-v1 limit.");
       const id = entityId(input.id ?? this.#idFactory(), "Partner ID");
       const homeTargetId = entityId(input.homeTargetId ?? `partner:${id}`, "Partner home Target ID");
-      const requestedDraft = partnerDraft(input);
       const capabilities = requestedDraft.usesDirectoryDefaults
         ? this.directoryState().defaultCapabilities
         : requestedDraft.capabilities;
@@ -474,12 +519,12 @@ export class PartnerStore {
       const at = this.#now();
       this.#database.prepare(`
         INSERT INTO partners(
-          id, revision, profile_version, display_name, normalized_name, avatar, identity_source, template_id,
+          id, creation_request_id, creation_fingerprint, revision, profile_version, display_name, normalized_name, avatar, identity_source, template_id,
           lifecycle, initialization_state, invitation_stage, initialization_error_code,
           home_target_id, canonical_session_id, model_chain_json, permission_mode, plan_mode,
           uses_directory_defaults, created_at, updated_at
-        ) VALUES (?, 1, 1, ?, ?, ?, ?, ?, 'active', 'pending', 'home', NULL, ?, NULL, ?, ?, ?, ?, ?, ?)
-      `).run(id, draft.displayName, normalizedPartnerName(draft.displayName), draft.avatar,
+        ) VALUES (?, ?, ?, 1, 1, ?, ?, ?, ?, ?, 'active', 'pending', 'home', NULL, ?, NULL, ?, ?, ?, ?, ?, ?)
+      `).run(id, requestId, fingerprint, draft.displayName, normalizedPartnerName(draft.displayName), draft.avatar,
         draft.identitySource, draft.templateId, homeTargetId, modelChainJson(draft.capabilities.modelChain),
         draft.capabilities.permissionMode, draft.capabilities.planMode ? 1 : 0,
         draft.usesDirectoryDefaults ? 1 : 0, at, at);
@@ -1574,6 +1619,32 @@ function partnerPair(left: string, right: string): readonly [string, string] {
 
 function stablePartnerOperationId(prefix: string, ...parts: readonly string[]): string {
   return `${prefix}:${createHash("sha256").update(parts.join("\0"), "utf8").digest("hex")}`;
+}
+
+function creationRequestId(value: unknown): string {
+  if (typeof value !== "string" || !CREATION_REQUEST_ID.test(value)) {
+    throw new PartnerStoreError("PARTNER_INVALID", "Partner creation request ID must contain 16–80 letters, digits, underscores or hyphens.");
+  }
+  return value;
+}
+
+function creationFingerprint(input: CreatePartnerInput, draft: PartnerDraft): string {
+  const revision = revisionNumber(input.expectedDirectoryRevision, "Partner directory revision");
+  return createHash("sha256").update(JSON.stringify({
+    expectedDirectoryRevision: revision,
+    id: input.id === undefined ? null : entityId(input.id, "Partner ID"),
+    homeTargetId: input.homeTargetId === undefined ? null : entityId(input.homeTargetId, "Partner home Target ID"),
+    displayName: draft.displayName,
+    avatar: draft.avatar,
+    identitySource: draft.identitySource,
+    templateId: draft.templateId,
+    usesDirectoryDefaults: draft.usesDirectoryDefaults,
+    capabilities: draft.usesDirectoryDefaults ? null : {
+      modelChain: modelChainJson(draft.capabilities.modelChain),
+      permissionMode: draft.capabilities.permissionMode,
+      planMode: draft.capabilities.planMode
+    }
+  })).digest("hex");
 }
 
 function partnerDraft(input: PartnerDraft): PartnerDraft {

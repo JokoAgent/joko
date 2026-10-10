@@ -64,6 +64,45 @@ afterEach(async () => {
 });
 
 describe("PartnerManager", () => {
+  it("returns the original creation result after edits without preparing another home or Session", async () => {
+    const prepareAvatar = vi.fn(async () => undefined);
+    const fixture = await createFixture(prepareAvatar);
+    const input = createInput(fixture.partnerStore, "Aster");
+    const first = await fixture.manager.createPartner(input);
+    const updated = await fixture.manager.updatePartner(first.id, first.revision, { displayName: "Aster updated" });
+    const effects = prepareAvatar.mock.calls.length;
+    const homes = fixture.registerWorkspace.mock.calls.length;
+    const sessions = fixture.operationalStore.getSnapshot().sessions.length;
+    expect(await fixture.manager.createPartner(input)).toEqual(updated);
+    expect(fixture.manager.getPartnerCreation(input.requestId)).toEqual(updated);
+    expect(fixture.manager.retirePartnerCreation(input.requestId)).toEqual(updated);
+    expect(prepareAvatar).toHaveBeenCalledTimes(effects);
+    expect(fixture.registerWorkspace).toHaveBeenCalledTimes(homes);
+    expect(fixture.operationalStore.getSnapshot().sessions).toHaveLength(sessions);
+  });
+
+  it("keeps concurrent replay attached to the pending creation and seals absent requests before effects", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const prepareAvatar = vi.fn(async () => gate);
+    const fixture = await createFixture(prepareAvatar);
+    const input = createInput(fixture.partnerStore, "Aster");
+    const creating = fixture.manager.createPartner(input);
+    const pending = await fixture.manager.createPartner(input);
+    expect(pending.initializationState).toBe("pending");
+    expect(fixture.manager.getPartnerCreation(input.requestId).id).toBe(pending.id);
+    expect(fixture.manager.retirePartnerCreation(input.requestId)?.id).toBe(pending.id);
+    release();
+    const ready = await creating;
+    expect(ready.id).toBe(pending.id);
+    expect(prepareAvatar).toHaveBeenCalledTimes(1);
+    const absentInput = createInput(fixture.partnerStore, "Beryl");
+    expect(fixture.manager.retirePartnerCreation(absentInput.requestId)).toBeUndefined();
+    await expect(fixture.manager.createPartner(absentInput)).rejects.toMatchObject({ code: "PARTNER_CREATION_RETIRED" });
+    expect(prepareAvatar).toHaveBeenCalledTimes(1);
+    expect(fixture.partnerStore.listPartners()).toHaveLength(1);
+  });
+
   it("creates a durable home Target and exactly one canonical Session", async () => {
     const fixture = await createFixture();
     const created = await fixture.manager.createPartner(createInput(fixture.partnerStore, "Aster"));
@@ -143,6 +182,7 @@ describe("PartnerManager", () => {
     };
     const created = await fixture.manager.createPartner({
       expectedDirectoryRevision: fixture.partnerStore.directoryState().revision,
+      requestId: "creation-request-plain",
       displayName: "Plain partner",
       avatar: "orbit",
       identitySource: "You are a durable plain-model partner.",
@@ -517,6 +557,7 @@ async function createFixture(
 
 function createInput(store: PartnerStore, displayName: string) {
   return {
+    requestId: `creation-request-${store.directoryState().revision}`,
     expectedDirectoryRevision: store.directoryState().revision,
     displayName,
     avatar: "orbit",

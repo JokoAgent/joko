@@ -214,6 +214,18 @@ export class PartnerManager {
     return this.#store.getPartner(partnerId);
   }
 
+  getPartnerCreation(requestId: string): PartnerProfileRecord {
+    const partner = this.#store.getPartnerCreation(requestId);
+    if (partner === undefined) {
+      throw new PartnerStoreError("PARTNER_NOT_FOUND", "This partner creation request was not found.");
+    }
+    return partner;
+  }
+
+  retirePartnerCreation(requestId: string): PartnerProfileRecord | undefined {
+    return this.#store.retirePartnerCreation(requestId);
+  }
+
   partnerForHomeTarget(targetId: string): PartnerProfileRecord | undefined {
     return this.#store.findPartnerByHomeTarget(targetId);
   }
@@ -466,7 +478,9 @@ export class PartnerManager {
 
   async createPartner(input: CreatePartnerInput): Promise<PartnerProfileRecord> {
     assertPresentation(input.templateId, input.avatar);
+    const existing = this.#store.getPartnerCreation(input.requestId);
     const created = this.#store.createPartner(input);
+    if (existing !== undefined) return created;
     return this.#serialized(created.id, () => this.#initializeCurrent(created.id));
   }
 

@@ -21,11 +21,13 @@ import { PartnersPage } from "./PartnersPage.js";
 
 const roots: Root[] = [];
 
-beforeEach(() => vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true));
+beforeEach(() => { vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true); localStorage.clear(); });
 afterEach(async () => {
   vi.useRealTimers();
   await act(async () => { for (const root of roots.splice(0)) root.unmount(); });
   document.body.replaceChildren();
+  vi.restoreAllMocks();
+  localStorage.clear();
   vi.unstubAllGlobals();
 });
 
@@ -58,7 +60,7 @@ describe("PartnersPage", () => {
     });
     expect(createPartner).toHaveBeenCalledWith(4n, expect.objectContaining({
       displayName: "Nova", templateId: "general", usesDirectoryDefaults: true
-    }));
+    }), expect.stringMatching(/^[A-Za-z0-9_-]{16,80}$/u), expect.any(AbortSignal));
     expect(view.navigate).toHaveBeenCalledWith({ kind: "partners", partnerId: "partner-two" });
 
     const firstCard = required(view.host.querySelector<HTMLElement>('[data-partner-id="partner-one"]'));
@@ -68,6 +70,150 @@ describe("PartnersPage", () => {
     const archivedCard = required(view.host.querySelector<HTMLElement>('[data-partner-id="partner-one"]'));
     await act(async () => { button(archivedCard, "partners.restore").click(); await settle(); });
     expect(setPartnerLifecycle).toHaveBeenLastCalledWith("partner-one", 9n, "active");
+  });
+
+  it("keeps an ambiguous creation locked across directory refresh and recovers the same request without resending", async () => {
+    const createPartner = vi.fn<AppController["createPartner"]>(async () => { throw new Error("Lost response"); });
+    const getPartnerCreation = vi.fn()
+      .mockRejectedValueOnce(new ConnectError("Temporarily unavailable", Code.Unavailable))
+      .mockResolvedValueOnce({ partner: partner({ id: "created-one", displayName: "Nova" }), directory: directory() });
+    let catalog = directory();
+    const view = await mount({ partners: [], createPartner, controllerOverrides: {
+      getPartnerCreation, listPartners: vi.fn(async () => ({ partners: [], directory: catalog }))
+    } });
+    await fillInvite("Nova");
+    let dialog = required(document.body.querySelector<HTMLElement>("[role='dialog']"));
+    await act(async () => {
+      const form = required(dialog.querySelector("form"));
+      form.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+      form.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+      await settle();
+    });
+    expect(createPartner).toHaveBeenCalledTimes(1);
+    const requestId = createPartner.mock.calls[0]![2];
+    expect(required(dialog.querySelector<HTMLInputElement>("input[required]")).disabled).toBe(true);
+    expect(required(dialog.querySelector<HTMLInputElement>("input[type=checkbox]")).disabled).toBe(true);
+    catalog = { ...catalog, revision: 5n };
+    await act(async () => { button(view.host, "common.refresh").click(); await settle(); });
+    dialog = required(document.body.querySelector<HTMLElement>("[role='dialog']"));
+    expect(required(dialog.querySelector<HTMLInputElement>("input[required]")).value).toBe("Nova");
+    await act(async () => { button(dialog, "partners.creationCheck").click(); await settle(); });
+    expect(dialog.textContent).toContain("partners.creationLookupFailed");
+    expect(createPartner).toHaveBeenCalledTimes(1);
+    expect(localStorage.length).toBe(1);
+    await act(async () => { button(dialog, "partners.creationCheck").click(); await settle(); });
+    expect(getPartnerCreation).toHaveBeenLastCalledWith(requestId, expect.any(AbortSignal));
+    expect(view.navigate).toHaveBeenCalledWith({ kind: "partners", partnerId: "created-one" });
+    expect(localStorage.length).toBe(0);
+  });
+
+  it("recovers a body-free creation receipt after unmount and remount", async () => {
+    const createPartner = vi.fn<AppController["createPartner"]>(async () => { throw new Error("Lost response"); });
+    const first = await mount({ partners: [], createPartner });
+    await fillInvite("Private draft name");
+    await act(async () => { button(required(document.body.querySelector<HTMLElement>("[role='dialog']")), "partners.invite").click(); await settle(); });
+    const requestId = createPartner.mock.calls[0]![2];
+    expect(localStorage.getItem(localStorage.key(0)!)).toBe(requestId);
+    await act(async () => first.root.unmount());
+    roots.splice(roots.indexOf(first.root), 1);
+    const getPartnerCreation = vi.fn(async () => ({ partner: partner({ id: "original-partner" }), directory: directory() }));
+    const second = await mount({ partners: [], controllerOverrides: { getPartnerCreation } });
+    await act(async () => button(second.host, "partners.invite").click());
+    const dialog = required(document.body.querySelector<HTMLElement>("[role='dialog']"));
+    expect(required(dialog.querySelector<HTMLInputElement>("input[required]")).disabled).toBe(true);
+    expect(dialog.textContent).not.toContain("Private draft name");
+    await act(async () => { button(dialog, "partners.creationCheck").click(); await settle(); });
+    expect(getPartnerCreation).toHaveBeenCalledWith(requestId, expect.any(AbortSignal));
+    expect(second.navigate).toHaveBeenCalledWith({ kind: "partners", partnerId: "original-partner" });
+    expect(createPartner).toHaveBeenCalledTimes(1);
+  });
+
+  it("requires an explicit server retirement before admitting a new intent after NotFound", async () => {
+    const createPartner = vi.fn<AppController["createPartner"]>(async () => { throw new Error("Lost response"); });
+    const getPartnerCreation = vi.fn(async () => { throw new ConnectError("No result yet", Code.NotFound); });
+    const retirePartnerCreation = vi.fn(async () => ({ directory: { ...directory(), revision: 7n } }));
+    const getPartnerDirectory = vi.fn(async () => ({ ...directory(), revision: 7n }));
+    await mount({ partners: [], createPartner, controllerOverrides: { getPartnerCreation, retirePartnerCreation, getPartnerDirectory } });
+    await fillInvite("Nova");
+    let dialog = required(document.body.querySelector<HTMLElement>("[role='dialog']"));
+    await act(async () => { button(dialog, "partners.invite").click(); await settle(); });
+    const firstId = createPartner.mock.calls[0]![2];
+    await act(async () => { button(dialog, "partners.creationCheck").click(); await settle(); });
+    expect(createPartner).toHaveBeenCalledTimes(1);
+    expect(retirePartnerCreation).not.toHaveBeenCalled();
+    await act(async () => { button(dialog, "partners.creationNewIntent").click(); await settle(); });
+    expect(retirePartnerCreation).toHaveBeenCalledWith(firstId, expect.any(AbortSignal));
+    dialog = required(document.body.querySelector<HTMLElement>("[role='dialog']"));
+    expect(required(dialog.querySelector<HTMLInputElement>("input[required]")).disabled).toBe(false);
+    await act(async () => { button(dialog, "partners.invite").click(); await settle(); });
+    expect(createPartner).toHaveBeenLastCalledWith(7n, expect.objectContaining({ displayName: "Nova" }), expect.any(String), expect.any(AbortSignal));
+    expect(createPartner.mock.calls[1]![2]).not.toBe(firstId);
+  });
+
+  it("recovers an original create that won the absence-retirement race instead of creating again", async () => {
+    const createPartner = vi.fn<AppController["createPartner"]>(async () => { throw new Error("Lost response"); });
+    const retirePartnerCreation = vi.fn(async () => ({ partner: partner({ id: "won-race" }), directory: directory() }));
+    const view = await mount({ partners: [], createPartner, controllerOverrides: {
+      getPartnerCreation: vi.fn(async () => { throw new ConnectError("Not found yet", Code.NotFound); }), retirePartnerCreation
+    } });
+    await fillInvite("Nova");
+    const dialog = required(document.body.querySelector<HTMLElement>("[role='dialog']"));
+    await act(async () => { button(dialog, "partners.invite").click(); await settle(); });
+    await act(async () => { button(dialog, "partners.creationCheck").click(); await settle(); });
+    await act(async () => { button(dialog, "partners.creationNewIntent").click(); await settle(); });
+    expect(view.navigate).toHaveBeenCalledWith({ kind: "partners", partnerId: "won-race" });
+    expect(createPartner).toHaveBeenCalledTimes(1);
+  });
+
+  it("retires late create presentation on pagehide and retains its receipt for explicit recovery", async () => {
+    let release!: (value: PartnerMutationView) => void;
+    const pending = new Promise<PartnerMutationView>((resolve) => { release = resolve; });
+    const createPartner = vi.fn<AppController["createPartner"]>(() => pending);
+    const view = await mount({ partners: [], createPartner });
+    await fillInvite("Nova");
+    await act(async () => { button(required(document.body.querySelector<HTMLElement>("[role='dialog']")), "partners.invite").click(); await settle(); });
+    const signal = createPartner.mock.calls[0]![3];
+    await act(async () => { window.dispatchEvent(new Event("pagehide")); release({ partner: partner(), directory: directory() }); await settle(); });
+    expect(required(signal).aborted).toBe(true);
+    expect(view.navigate).not.toHaveBeenCalled();
+    expect(localStorage.length).toBe(1);
+    await act(async () => { window.dispatchEvent(new Event("pageshow")); await settle(); });
+    expect(button(document.body, "partners.creationCheck").disabled).toBe(false);
+    expect(createPartner).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not dispatch a create when its local receipt cannot be persisted", async () => {
+    const createPartner = vi.fn();
+    await mount({ partners: [], createPartner });
+    await fillInvite("Nova");
+    vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => { throw new Error("Storage unavailable"); });
+    await act(async () => { button(required(document.body.querySelector<HTMLElement>("[role='dialog']")), "partners.invite").click(); await settle(); });
+    expect(document.body.textContent).toContain("partners.creationReceiptFailed");
+    expect(createPartner).not.toHaveBeenCalled();
+  });
+
+  it("keeps recovery available without usable models and retires late creation on connection replacement", async () => {
+    let release!: (value: PartnerMutationView) => void;
+    const pending = new Promise<PartnerMutationView>((resolve) => { release = resolve; });
+    const createPartner = vi.fn<AppController["createPartner"]>(() => pending);
+    const view = await mount({ partners: [], createPartner });
+    await fillInvite("Nova");
+    const dialog = required(document.body.querySelector<HTMLElement>("[role='dialog']"));
+    await act(async () => { button(dialog, "partners.invite").click(); await settle(); });
+    const next = controller({}, "owner-two");
+    await act(async () => { view.root.render(page(next, snapshot())); await settle(); });
+    await act(async () => { release({ partner: partner(), directory: directory() }); await settle(); });
+    expect(view.navigate).not.toHaveBeenCalled();
+    expect(localStorage.length).toBe(1);
+    const getPartnerCreation = vi.fn(async () => ({ partner: partner({ id: "recovered-owner-one" }), directory: directory() }));
+    const original = controller({ getPartnerCreation });
+    await act(async () => { view.root.render(page(original, { ...snapshot(), models: [] })); await settle(); });
+    if (document.body.querySelector("[role='dialog']") === null) await act(async () => button(view.host, "partners.invite").click());
+    const recovery = required(document.body.querySelector<HTMLElement>("[role='dialog']"));
+    await act(async () => { button(recovery, "partners.creationCheck").click(); await settle(); });
+    expect(getPartnerCreation).toHaveBeenCalledTimes(1);
+    expect(original.navigate).toHaveBeenCalledWith({ kind: "partners", partnerId: "recovered-owner-one" });
+    expect(createPartner).toHaveBeenCalledTimes(1);
   });
 
   it("preserves an autosave draft on a revision conflict and can reload the authoritative profile", async () => {
@@ -260,14 +406,14 @@ async function mount(overrides: {
     ...overrides.controllerOverrides
   });
   await act(async () => { root.render(page(app, snapshot(), overrides.focusPartnerId)); await settle(); });
-  return { host, navigate };
+  return { host, navigate, root, app };
 }
 
 function controller(overrides: Record<string, unknown> = {}, owner = "owner-one"): AppController {
   return {
     state: {
       connectionState: "connected",
-      activeProfile: { id: `profile-${owner}`, serverId: owner },
+      activeProfile: { id: `profile-${owner}`, serverId: owner, deviceId: `device-${owner}`, origin: "https://node.example", name: "Work node" },
       preferences: DEFAULT_UI_PREFERENCES
     },
     navigate: vi.fn(),
@@ -275,6 +421,9 @@ function controller(overrides: Record<string, unknown> = {}, owner = "owner-one"
     createPartner: vi.fn(),
     updatePartner: vi.fn(),
     getPartner: vi.fn(async () => partner()),
+    getPartnerDirectory: vi.fn(async () => directory()),
+    getPartnerCreation: vi.fn(),
+    retirePartnerCreation: vi.fn(),
     setPartnerLifecycle: vi.fn(),
     retryPartnerInitialization: vi.fn(),
     updatePartnerDefaults: vi.fn(),
@@ -293,6 +442,13 @@ function controller(overrides: Record<string, unknown> = {}, owner = "owner-one"
     revealArtifactSource: vi.fn(),
     ...overrides
   } as unknown as AppController;
+}
+
+async function fillInvite(name: string): Promise<void> {
+  await act(async () => button(document.body, "partners.invite").click());
+  const dialog = required(document.body.querySelector<HTMLElement>("[role='dialog']"));
+  const input = required(dialog.querySelector<HTMLInputElement>("input[required]"));
+  await act(async () => { setNativeValue(input, name); input.dispatchEvent(new Event("input", { bubbles: true })); });
 }
 
 function page(app: AppController, value: AppSnapshot, focusPartnerId?: string): JSX.Element {

@@ -287,6 +287,8 @@ service PartnerService {
   rpc ListPartners(ListPartnersRequest) returns (ListPartnersResponse);
   rpc GetPartner(GetPartnerRequest) returns (GetPartnerResponse);
   rpc CreatePartner(CreatePartnerRequest) returns (CreatePartnerResponse);
+  rpc GetPartnerCreation(GetPartnerCreationRequest) returns (GetPartnerCreationResponse);
+  rpc RetirePartnerCreation(RetirePartnerCreationRequest) returns (RetirePartnerCreationResponse);
   rpc UpdatePartner(UpdatePartnerRequest) returns (UpdatePartnerResponse);
   rpc SetPartnerLifecycle(SetPartnerLifecycleRequest) returns (SetPartnerLifecycleResponse);
   rpc RetryPartnerInitialization(RetryPartnerInitializationRequest) returns (RetryPartnerInitializationResponse);

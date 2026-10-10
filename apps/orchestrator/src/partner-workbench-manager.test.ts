@@ -201,7 +201,7 @@ async function fixture() {
   const adapter = new CatalogAdapter(PROFILE); const host = new SessionHost(store, artifacts, [adapter]); await host.initialize();
   const homesRoot = join(managed, "partner-homes"); const workspace = { register: vi.fn(async (input: { id: string; root: string; displayName: string; trusted: boolean }) => input), unregister: vi.fn() };
   const partners = new PartnerManager({ store: partnerStore, operationalStore: store, sessionHost: host, workspaceService: workspace, homesRoot });
-  const partner = await partners.createPartner({ expectedDirectoryRevision: partnerStore.directoryState().revision, displayName: "Aster", avatar: "orbit", identitySource: "You help with ongoing projects.", templateId: "general", usesDirectoryDefaults: false,
+  const partner = await partners.createPartner({ requestId: "creation-request-workbench", expectedDirectoryRevision: partnerStore.directoryState().revision, displayName: "Aster", avatar: "orbit", identitySource: "You help with ongoing projects.", templateId: "general", usesDirectoryDefaults: false,
     capabilities: { modelChain: [{ backendId: adapter.id, providerId: "test", modelId: "text", effort: "medium", fastMode: false }], permissionMode: "ask", planMode: false } });
   const workbench = new PartnerWorkbenchManager({ partners, partnerStore, store, host, workspaces: workspace, workbenches: new PartnerWorkbenchStore(homesRoot), managedDataDirectory: managed, homeDirectory: home,
     briefs: { read: async (path, assertScope) => { assertScope(); return { project: path, docs: [], recent: [], codeHost: { pullRequests: [], issues: [] } }; } } });

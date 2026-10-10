@@ -662,6 +662,8 @@ test("Partners exposes revision-fenced durable profiles without private home or 
     "listPartners",
     "getPartner",
     "createPartner",
+    "getPartnerCreation",
+    "retirePartnerCreation",
     "updatePartner",
     "setPartnerLifecycle",
     "retryPartnerInitialization",
@@ -673,7 +675,14 @@ test("Partners exposes revision-fenced durable profiles without private home or 
     "markPartnerPrivateThreadRead",
     "listPartnerDelegations",
     "getPartnerDelegation",
-    "cancelPartnerDelegation"
+    "cancelPartnerDelegation",
+    "getPartnerWorkbench",
+    "addPartnerWorkbenchProject",
+    "removePartnerWorkbenchProject",
+    "setPartnerWorkbenchJudgment",
+    "getPartnerWorkbenchDetail",
+    "resolvePartnerWorkbenchReference",
+    "readPartnerWorkbenchDocument"
   ]);
   assertNoFields([
     contract.PartnerDirectorySchema,
@@ -693,6 +702,9 @@ test("Partners exposes revision-fenced durable profiles without private home or 
     "sender_session_id", "recipient_session_id"
   ]);
   assert.equal(field(contract.PartnerProfileSchema, "canonical_session_id").proto.proto3Optional, true);
+  assert.equal(field(contract.CreatePartnerRequestSchema, "request_id").number, 3);
+  assert.equal(roundTrip(contract.CreatePartnerRequestSchema, { requestId: "creation-request-contract" }).requestId, "creation-request-contract");
+  assert.equal(roundTrip(contract.RetirePartnerCreationResponseSchema, { retired: true }).retired, true);
   assert.equal(field(contract.PartnerPatchSchema, "display_name").proto.proto3Optional, true);
   assert.equal(field(contract.PartnerPatchSchema, "permission_mode").proto.proto3Optional, true);
   assert.equal(field(contract.PartnerPatchSchema, "uses_directory_defaults").proto.proto3Optional, true);

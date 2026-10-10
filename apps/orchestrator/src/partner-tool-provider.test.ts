@@ -169,6 +169,7 @@ async function createFixture() {
 
 function input(store: PartnerStore, displayName: string) {
   return {
+    requestId: `creation-request-${store.directoryState().revision}`,
     expectedDirectoryRevision: store.directoryState().revision,
     displayName,
     avatar: "orbit",

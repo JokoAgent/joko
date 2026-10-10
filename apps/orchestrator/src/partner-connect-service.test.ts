@@ -31,6 +31,45 @@ afterEach(async () => {
 });
 
 describe("PartnerService", () => {
+  it("authenticates stable creation lookup and atomically retires absent intents against late creates", async () => {
+    const fixture = await createFixture();
+    const authenticate = vi.fn(() => ({ connectionId: "connection-1" }));
+    const service = createPartnerConnectService(fixture.manager, authenticate);
+    const callContext = context();
+    const request = create(contract.CreatePartnerRequestSchema, {
+      requestId: "creation-request-rpc",
+      expectedDirectoryRevision: revision(1n),
+      draft: { displayName: "Aster", avatar: "orbit", identitySource: "You help with ongoing work.", templateId: "general", capabilities: protoCapabilities() }
+    });
+    const created = await service.createPartner(request, callContext);
+    const found = await service.getPartnerCreation(create(contract.GetPartnerCreationRequestSchema, { requestId: request.requestId }), callContext);
+    expect(found.partner).toEqual(created.partner);
+    expect((await service.createPartner(request, callContext)).partner).toEqual(created.partner);
+    await expect(service.createPartner(create(contract.CreatePartnerRequestSchema, { ...request, draft: { ...request.draft!, displayName: "Changed intent" } }), callContext))
+      .rejects.toMatchObject({ code: Code.Aborted });
+    await expect(service.createPartner(create(contract.CreatePartnerRequestSchema, { ...request, requestId: "", expectedDirectoryRevision: create(contract.RevisionSchema, created.directory!.revision) }), callContext))
+      .rejects.toMatchObject({ code: Code.InvalidArgument });
+    await expect(service.createPartner(create(contract.CreatePartnerRequestSchema, { ...request, draft: { ...request.draft!, usesDirectoryDefaults: true } }), callContext))
+      .rejects.toMatchObject({ code: Code.InvalidArgument });
+    const absent = "creation-request-absent-rpc";
+    expect(() => service.getPartnerCreation(create(contract.GetPartnerCreationRequestSchema, { requestId: absent }), callContext))
+      .toThrow(expect.objectContaining({ code: Code.NotFound }));
+    const retired = await service.retirePartnerCreation(create(contract.RetirePartnerCreationRequestSchema, { requestId: absent }), callContext);
+    expect(retired.retired).toBe(true);
+    expect(retired.partner).toBeUndefined();
+    await expect(service.createPartner(create(contract.CreatePartnerRequestSchema, { ...request, requestId: absent, expectedDirectoryRevision: create(contract.RevisionSchema, created.directory!.revision) }), callContext))
+      .rejects.toMatchObject({ code: Code.FailedPrecondition });
+    expect(await service.retirePartnerCreation(create(contract.RetirePartnerCreationRequestSchema, { requestId: request.requestId }), callContext))
+      .toMatchObject({ retired: false, partner: created.partner });
+    expect(authenticate).toHaveBeenCalledTimes(10);
+    const denied = createPartnerConnectService(fixture.manager, () => { throw new ConnectError("Denied", Code.Unauthenticated); });
+    expect(() => denied.getPartnerCreation(create(contract.GetPartnerCreationRequestSchema, { requestId: request.requestId }), callContext))
+      .toThrow(expect.objectContaining({ code: Code.Unauthenticated }));
+    expect(() => denied.retirePartnerCreation(create(contract.RetirePartnerCreationRequestSchema, { requestId: absent }), callContext))
+      .toThrow(expect.objectContaining({ code: Code.Unauthenticated }));
+    expect(fixture.partnerStore.listPartners()).toHaveLength(1);
+  });
+
   it("authenticates and maps defaults, creation, autosave fencing, and lifecycle", async () => {
     const fixture = await createFixture();
     const authenticate = vi.fn(() => ({ connectionId: "connection-1" }));
@@ -56,6 +95,7 @@ describe("PartnerService", () => {
     expect(defaults.directory).toMatchObject({ defaultCapabilities: protoCapabilities() });
 
     const created = await service.createPartner(create(contract.CreatePartnerRequestSchema, {
+      requestId: "creation-request-first",
       expectedDirectoryRevision: defaults.directory!.revision,
       draft: create(contract.PartnerDraftSchema, {
         displayName: "Aster",
@@ -250,6 +290,7 @@ async function createFixture(streamDelayMs = 0) {
 
 function partnerInput(store: PartnerStore, displayName: string) {
   return {
+    requestId: `creation-request-${store.directoryState().revision}`,
     expectedDirectoryRevision: store.directoryState().revision,
     displayName,
     avatar: "orbit",

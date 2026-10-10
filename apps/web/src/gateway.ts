@@ -7207,10 +7207,12 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
   async createPartner(
     expectedDirectoryRevision: bigint,
     draft: PartnerDraftView,
+    requestId: string,
     signal?: AbortSignal
   ): Promise<PartnerMutationView> {
     const scope = this.captureActionScope(signal);
     const response = await createClient(PartnerService, scope.transport).createPartner({
+      requestId,
       expectedDirectoryRevision: { value: expectedDirectoryRevision },
       draft: {
         displayName: draft.displayName,
@@ -7223,6 +7225,24 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     }, { signal: scope.signal });
     scope.signal.throwIfAborted();
     return mapPartnerMutation(response.partner, response.directory);
+  }
+
+  async getPartnerCreation(requestId: string, signal?: AbortSignal): Promise<PartnerMutationView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(PartnerService, scope.transport).getPartnerCreation({ requestId }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return mapPartnerMutation(response.partner, response.directory);
+  }
+
+  async retirePartnerCreation(requestId: string, signal?: AbortSignal): Promise<{ readonly directory: PartnerDirectoryView; readonly partner?: PartnerProfileView }> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(PartnerService, scope.transport).retirePartnerCreation({ requestId }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    if (response.retired !== (response.partner === undefined)) throw new GatewayError("The partner creation retirement result is inconsistent.");
+    return {
+      directory: mapPartnerDirectory(response.directory),
+      ...(response.partner === undefined ? {} : { partner: mapPartnerProfile(response.partner) })
+    };
   }
 
   async updatePartner(

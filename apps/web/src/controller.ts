@@ -2928,8 +2928,10 @@ export function useAppController(): AppController {
     getPartnerDirectory: (signal) => gateway().getPartnerDirectory(signal),
     listPartners: (lifecycle, signal) => gateway().listPartners(lifecycle, signal),
     getPartner: (partnerId, signal) => gateway().getPartner(partnerId, signal),
-    createPartner: (expectedDirectoryRevision, draft, signal) =>
-      gateway().createPartner(expectedDirectoryRevision, draft, signal),
+    createPartner: (expectedDirectoryRevision, draft, requestId, signal) =>
+      gateway().createPartner(expectedDirectoryRevision, draft, requestId, signal),
+    getPartnerCreation: (requestId, signal) => gateway().getPartnerCreation(requestId, signal),
+    retirePartnerCreation: (requestId, signal) => gateway().retirePartnerCreation(requestId, signal),
     updatePartner: (partnerId, expectedRevision, patch, signal) =>
       gateway().updatePartner(partnerId, expectedRevision, patch, signal),
     setPartnerLifecycle: (partnerId, expectedRevision, lifecycle, signal) =>

@@ -73,6 +73,12 @@ export function createPartnerConnectService(
       return partnerRpc(async () => {
         const active = owner();
         const draft = required(request.draft, "draft");
+        if (draft.usesDirectoryDefaults && draft.capabilities !== undefined) {
+          throw new ConnectError("Capability overrides cannot accompany uses_directory_defaults=true.", Code.InvalidArgument);
+        }
+        if (!draft.usesDirectoryDefaults && draft.capabilities === undefined) {
+          throw new ConnectError("draft.capabilities are required for an explicit override.", Code.InvalidArgument);
+        }
         const capabilities = draft.capabilities === undefined
           ? active.directory().state.defaultCapabilities
           : fromProtoCapabilities(draft.capabilities);
@@ -80,6 +86,7 @@ export function createPartnerConnectService(
           throw new ConnectError("draft.capabilities or configured directory defaults are required.", Code.FailedPrecondition);
         }
         const partner = await active.createPartner({
+          requestId: request.requestId,
           expectedDirectoryRevision: fromProtoRevision(request.expectedDirectoryRevision, "expected_directory_revision"),
           displayName: draft.displayName,
           avatar: draft.avatar,
@@ -90,6 +97,29 @@ export function createPartnerConnectService(
         });
         return create(contract.CreatePartnerResponseSchema, {
           partner: toProtoProfile(partner, active.activity(partner.id)),
+          directory: toProtoDirectory(active.directory())
+        });
+      });
+    },
+    getPartnerCreation: (request, context) => {
+      authenticate(context);
+      return partnerRpc(() => {
+        const active = owner();
+        const partner = active.getPartnerCreation(request.requestId);
+        return create(contract.GetPartnerCreationResponseSchema, {
+          partner: toProtoProfile(partner, active.activity(partner.id)),
+          directory: toProtoDirectory(active.directory())
+        });
+      });
+    },
+    retirePartnerCreation: (request, context) => {
+      authenticate(context);
+      return partnerRpc(() => {
+        const active = owner();
+        const partner = active.retirePartnerCreation(request.requestId);
+        return create(contract.RetirePartnerCreationResponseSchema, {
+          retired: partner === undefined,
+          ...(partner === undefined ? {} : { partner: toProtoProfile(partner, active.activity(partner.id)) }),
           directory: toProtoDirectory(active.directory())
         });
       });
@@ -522,9 +552,9 @@ function partnerConnectError(error: unknown): ConnectError {
     const code = error.code === "PARTNER_INVALID" ? Code.InvalidArgument
       : error.code === "PARTNER_NOT_FOUND" ? Code.NotFound
         : error.code === "PARTNER_CHANGED" || error.code === "PARTNER_DIRECTORY_CHANGED"
-          || error.code === "PARTNER_DELEGATION_CHANGED" ? Code.Aborted
+          || error.code === "PARTNER_DELEGATION_CHANGED" || error.code === "PARTNER_CREATION_CONFLICT" ? Code.Aborted
           : error.code === "PARTNER_NAME_CONFLICT" ? Code.AlreadyExists
-            : error.code === "PARTNER_SESSION_CONFLICT" ? Code.FailedPrecondition
+            : error.code === "PARTNER_SESSION_CONFLICT" || error.code === "PARTNER_CREATION_RETIRED" ? Code.FailedPrecondition
               : error.code === "PARTNER_PRIVATE_LIMIT" ? Code.ResourceExhausted
                 : error.code === "PARTNER_PRIVATE_WAIT" ? Code.FailedPrecondition
               : Code.Unavailable;

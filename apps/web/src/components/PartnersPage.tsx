@@ -16,6 +16,8 @@ import {
 import { useEffect, useId, useMemo, useRef, useState } from "react";
 import type { JSX } from "react";
 
+import { PartnerCreationReceipts } from "../partner-creation-receipts.js";
+
 import type { AppController } from "../controller.js";
 import type {
   AppSnapshot,
@@ -68,6 +70,7 @@ export function PartnersPage({ controller, snapshot, focusPartnerId, t, onOpenNa
   const ownerRef = useRef(ownerKey);
   ownerRef.current = ownerKey;
   const [catalog, setCatalog] = useState<PartnerCatalogState>();
+  const catalogOwnerRef = useRef<string | undefined>(undefined);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string>();
   const [showArchived, setShowArchived] = useState(false);
@@ -85,6 +88,7 @@ export function PartnersPage({ controller, snapshot, focusPartnerId, t, onOpenNa
     setLoadError(undefined);
     void latestControllerRef.current.listPartners(undefined, signal).then((result) => {
       if (generation !== loadGenerationRef.current || expectedOwner !== ownerRef.current) return;
+      catalogOwnerRef.current = expectedOwner;
       setCatalog(result);
       if (focusPartnerId !== undefined) {
         const focused = result.partners.find((partner) => partner.id === focusPartnerId);
@@ -176,6 +180,7 @@ export function PartnersPage({ controller, snapshot, focusPartnerId, t, onOpenNa
   const selected = catalog?.partners.find((partner) => partner.id === focusPartnerId);
   const visible = catalog?.partners.filter((partner) => partner.lifecycle === (showArchived ? "archived" : "active")) ?? [];
   const usableModels = useMemo(() => partnerModels(snapshot), [snapshot.backends, snapshot.models]);
+  const creationCatalogCurrent = catalog !== undefined && catalogOwnerRef.current === ownerKey;
 
   return <main className="route-page partners-page">
     <header className="route-header">
@@ -183,7 +188,7 @@ export function PartnersPage({ controller, snapshot, focusPartnerId, t, onOpenNa
       <div><p className="eyebrow">{t("partners.eyebrow")}</p><h1>{t("nav.partners")}</h1><p>{t("partners.subtitle")}</p></div>
       <div className="route-header__actions">
         <Button onClick={() => setEditingDefaults(true)} disabled={catalog === undefined || usableModels.length === 0}><Settings2 aria-hidden="true" />{t("partners.defaults")}</Button>
-        <Button tone="primary" onClick={() => setCreating(true)} disabled={catalog === undefined || usableModels.length === 0}><UserRoundPlus aria-hidden="true" />{t("partners.invite")}</Button>
+        <Button tone="primary" onClick={() => setCreating(true)} disabled={!creationCatalogCurrent || loading}><UserRoundPlus aria-hidden="true" />{t("partners.invite")}</Button>
       </div>
     </header>
     {catalog !== undefined && <section className="partner-summary" aria-label={t("partners.summary")}>
@@ -212,7 +217,8 @@ export function PartnersPage({ controller, snapshot, focusPartnerId, t, onOpenNa
           onArchive={() => void mutateLifecycle(partner, partner.lifecycle === "archived" ? "active" : "archived")}
           onDelete={() => setDeletePartner(partner)}
         />)}{visible.length === 0 && <div className="partner-empty"><Bot aria-hidden="true" /><h2>{showArchived ? t("partners.noArchived") : t("partners.empty")}</h2><p>{t("partners.emptyBody")}</p>{!showArchived && <Button tone="primary" onClick={() => setCreating(true)}>{t("partners.invite")}</Button>}</div>}</section>}
-    {catalog !== undefined && <PartnerInviteDialog
+    {catalog !== undefined && creationCatalogCurrent && <PartnerInviteDialog
+      key={ownerKey}
       open={creating}
       directory={catalog.directory}
       snapshot={snapshot}
@@ -310,30 +316,167 @@ function PartnerInviteDialog({ open, directory, snapshot, controller, ownerKey, 
 }): JSX.Element {
   const initial = (): PartnerDraftView => inviteDraft(directory, snapshot);
   const [draft, setDraft] = useState<PartnerDraftView>(initial);
+  const [formDirectory, setFormDirectory] = useState(directory);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string>();
+  const [receipts, setReceipts] = useState<readonly string[]>([]);
+  const [receiptUnavailable, setReceiptUnavailable] = useState(true);
+  const [resolution, setResolution] = useState<"absent" | "retired">();
+  const formRef = useRef<HTMLFormElement>(null);
+  const flightRef = useRef(false);
+  const epochRef = useRef(0);
+  const abortRef = useRef<AbortController | undefined>(undefined);
+  const receiptStoreRef = useRef<PartnerCreationReceipts | undefined>(undefined);
+  const inputRef = useRef({ directory, snapshot });
+  inputRef.current = { directory, snapshot };
   const ownerRef = useRef(ownerKey);
   ownerRef.current = ownerKey;
+  const controllerRef = useRef(controller);
+  controllerRef.current = controller;
   useEffect(() => {
     if (!open) return;
-    setDraft(initial());
-    setSubmitting(false);
-    setError(undefined);
-  }, [open, directory.revision, ownerKey]);
-  const valid = validPartnerDraft(draft);
-  const submit = async (): Promise<void> => {
-    if (!valid || submitting) return;
-    const expectedOwner = ownerRef.current;
+    const ownerDocument = formRef.current?.ownerDocument;
+    const ownerWindow = ownerDocument?.defaultView;
+    if (ownerWindow === null || ownerWindow === undefined) return;
+    const activate = (): void => {
+      epochRef.current += 1;
+      abortRef.current = new AbortController();
+      flightRef.current = false;
+      setSubmitting(false);
+      setResolution(undefined);
+      setError(undefined);
+      try {
+        const store = new PartnerCreationReceipts(ownerWindow.localStorage, controller.state.activeProfile);
+        const pending = store.list();
+        receiptStoreRef.current = store;
+        setReceipts(pending);
+        setReceiptUnavailable(false);
+        if (pending.length === 0) setDraft(inviteDraft(inputRef.current.directory, inputRef.current.snapshot));
+      } catch {
+        receiptStoreRef.current = undefined;
+        setReceiptUnavailable(true);
+        setError(t("partners.creationReceiptFailed"));
+      }
+      setFormDirectory(inputRef.current.directory);
+    };
+    const retire = (): void => {
+      epochRef.current += 1;
+      abortRef.current?.abort();
+      flightRef.current = false;
+    };
+    activate();
+    ownerWindow.addEventListener("pagehide", retire);
+    ownerWindow.addEventListener("pageshow", activate);
+    return () => {
+      retire();
+      ownerWindow.removeEventListener("pagehide", retire);
+      ownerWindow.removeEventListener("pageshow", activate);
+    };
+  }, [open, ownerKey, controller]);
+  useEffect(() => {
+    if (directory.revision > formDirectory.revision) setFormDirectory(directory);
+  }, [directory, formDirectory.revision]);
+  const modelsAvailable = partnerModels(snapshot).length > 0;
+  const valid = validPartnerDraft(draft) && modelsAvailable;
+  const locked = submitting || receiptUnavailable || receipts.length > 0;
+  const begin = (): { readonly signal: AbortSignal; readonly current: () => boolean } | undefined => {
+    const abort = abortRef.current;
+    if (flightRef.current || abort === undefined || abort.signal.aborted || !open) return undefined;
+    flightRef.current = true;
+    const epoch = epochRef.current;
+    const activeController = controller;
     setSubmitting(true);
     setError(undefined);
+    return { signal: abort.signal, current: () => !abort.signal.aborted && epoch === epochRef.current
+      && ownerRef.current === ownerKey && controllerRef.current === activeController };
+  };
+  const finish = (action: { readonly current: () => boolean }): void => {
+    if (!action.current()) return;
+    flightRef.current = false;
+    setSubmitting(false);
+  };
+  const submit = async (): Promise<void> => {
+    const store = receiptStoreRef.current;
+    if (!valid || locked || store === undefined) return;
+    const action = begin();
+    if (action === undefined) return;
+    let requestId: string | undefined;
+    let dispatched = false;
     try {
-      const result = await controller.createPartner(directory.revision, draft);
-      if (ownerRef.current === expectedOwner) onCreated(result);
+      const pending = store.list();
+      if (pending.length > 0) { setReceipts(pending); return; }
+      requestId = crypto.randomUUID();
+      store.claim(requestId);
+      setReceipts([requestId]);
+      const capturedDraft = draft;
+      dispatched = true;
+      const result = await controller.createPartner(formDirectory.revision, capturedDraft, requestId, action.signal);
+      if (!action.current()) return;
+      store.resolve(requestId);
+      setReceipts(store.list());
+      onCreated(result);
     } catch (caught) {
-      if (ownerRef.current === expectedOwner) setError(errorMessage(caught, t("partners.inviteFailed")));
+      if (!action.current()) return;
+      if (dispatched && requestId !== undefined && caught instanceof ConnectError
+        && (caught.code === Code.InvalidArgument || caught.code === Code.AlreadyExists)) {
+        try { store.resolve(requestId); setReceipts(store.list()); }
+        catch { setReceiptUnavailable(true); }
+        setError(errorMessage(caught, t("partners.inviteFailed")));
+      } else {
+        if (!dispatched) setReceiptUnavailable(true);
+        setError(t(dispatched ? "partners.creationUnknown" : "partners.creationReceiptFailed"));
+      }
     } finally {
-      if (ownerRef.current === expectedOwner) setSubmitting(false);
+      finish(action);
     }
+  };
+  const recover = async (): Promise<void> => {
+    const store = receiptStoreRef.current;
+    const requestId = receipts[0];
+    if (store === undefined || requestId === undefined) return;
+    const action = begin();
+    if (action === undefined) return;
+    setResolution(undefined);
+    try {
+      const result = await controller.getPartnerCreation(requestId, action.signal);
+      if (!action.current()) return;
+      if (result.partner.lifecycle !== "active") { setResolution("retired"); return; }
+      store.resolve(requestId);
+      setReceipts(store.list());
+      onCreated(result);
+    } catch (caught) {
+      if (!action.current()) return;
+      if (caught instanceof ConnectError && caught.code === Code.NotFound) setResolution("absent");
+      else setError(t("partners.creationLookupFailed"));
+    } finally { finish(action); }
+  };
+  const newIntent = async (): Promise<void> => {
+    const store = receiptStoreRef.current;
+    const requestId = receipts[0];
+    if (store === undefined || requestId === undefined || resolution === undefined) return;
+    const action = begin();
+    if (action === undefined) return;
+    try {
+      const retired = await controller.retirePartnerCreation(requestId, action.signal);
+      if (!action.current()) return;
+      if (retired.partner?.lifecycle === "active") {
+        store.resolve(requestId);
+        setReceipts(store.list());
+        onCreated({ partner: retired.partner, directory: retired.directory });
+        return;
+      }
+      const fresh = await controller.getPartnerDirectory(action.signal);
+      if (!action.current()) return;
+      store.resolve(requestId);
+      const pending = store.list();
+      setReceipts(pending);
+      setResolution(undefined);
+      setFormDirectory(fresh);
+      if (pending.length === 0 && (!fresh.templates.some((template) => template.id === draft.templateId)
+        || !fresh.avatarPresets.includes(draft.avatar))) setDraft(inviteDraft(fresh, snapshot));
+    } catch {
+      if (action.current()) setError(t("partners.creationLookupFailed"));
+    } finally { finish(action); }
   };
   const selectTemplate = (template: PartnerTemplateView): void => setDraft((current) => ({
     ...current,
@@ -341,14 +484,16 @@ function PartnerInviteDialog({ open, directory, snapshot, controller, ownerKey, 
     identitySource: template.identitySource
   }));
   return <Modal open={open} title={t("partners.inviteTitle")} description={t("partners.inviteBody")} size="large" onClose={submitting ? () => undefined : onClose}>
-    <form className="partner-editor" onSubmit={(event) => { event.preventDefault(); void submit(); }}>
-      <fieldset disabled={submitting}><legend>{t("partners.template")}</legend><div className="partner-template-grid">{directory.templates.map((template) => <button type="button" key={template.id} className={cx(draft.templateId === template.id && "is-selected")} aria-pressed={draft.templateId === template.id} onClick={() => selectTemplate(template)}><strong>{template.displayName}</strong><span>{template.description}</span></button>)}</div></fieldset>
-      <div className="partner-editor__identity-row"><label className="field"><span>{t("partners.name")}</span><input required maxLength={100} value={draft.displayName} onChange={(event) => setDraft((current) => ({ ...current, displayName: event.target.value }))} /></label><AvatarPicker value={draft.avatar} options={directory.avatarPresets} disabled={submitting} t={t} onChange={(avatar) => setDraft((current) => ({ ...current, avatar }))} /></div>
-      <label className="field"><span>{t("partners.identity")}</span><textarea required rows={8} maxLength={8_000} value={draft.identitySource} onChange={(event) => setDraft((current) => ({ ...current, identitySource: event.target.value }))} /><small>{t("partners.identityHelp")}</small></label>
-      {directory.defaultCapabilities !== undefined && <label className="check-row"><CheckboxControl checked={draft.usesDirectoryDefaults} onChange={(event) => setDraft((current) => ({ ...current, usesDirectoryDefaults: event.target.checked, capabilities: event.target.checked ? undefined : current.capabilities ?? directory.defaultCapabilities }))} /><span><strong>{t("partners.useDefaults")}</strong><small>{t("partners.useDefaultsHelp")}</small></span></label>}
-      {!draft.usesDirectoryDefaults && draft.capabilities !== undefined && <CapabilitiesEditor value={draft.capabilities} snapshot={snapshot} disabled={submitting} t={t} onChange={(capabilities) => setDraft((current) => ({ ...current, capabilities }))} />}
+    <form ref={formRef} className="partner-editor" onSubmit={(event) => { event.preventDefault(); void submit(); }}>
+      <fieldset disabled={locked}><legend>{t("partners.template")}</legend><div className="partner-template-grid">{formDirectory.templates.map((template) => <button type="button" key={template.id} className={cx(draft.templateId === template.id && "is-selected")} aria-pressed={draft.templateId === template.id} onClick={() => selectTemplate(template)}><strong>{template.displayName}</strong><span>{template.description}</span></button>)}</div></fieldset>
+      <div className="partner-editor__identity-row"><label className="field"><span>{t("partners.name")}</span><input required disabled={locked} maxLength={100} value={draft.displayName} onChange={(event) => setDraft((current) => ({ ...current, displayName: event.target.value }))} /></label><AvatarPicker value={draft.avatar} options={formDirectory.avatarPresets} disabled={locked} t={t} onChange={(avatar) => setDraft((current) => ({ ...current, avatar }))} /></div>
+      <label className="field"><span>{t("partners.identity")}</span><textarea required disabled={locked} rows={8} maxLength={8_000} value={draft.identitySource} onChange={(event) => setDraft((current) => ({ ...current, identitySource: event.target.value }))} /><small>{t("partners.identityHelp")}</small></label>
+      {formDirectory.defaultCapabilities !== undefined && <label className="check-row"><CheckboxControl disabled={locked} checked={draft.usesDirectoryDefaults} onChange={(event) => setDraft((current) => ({ ...current, usesDirectoryDefaults: event.target.checked, capabilities: event.target.checked ? undefined : current.capabilities ?? formDirectory.defaultCapabilities }))} /><span><strong>{t("partners.useDefaults")}</strong><small>{t("partners.useDefaultsHelp")}</small></span></label>}
+      {!draft.usesDirectoryDefaults && draft.capabilities !== undefined && <CapabilitiesEditor value={draft.capabilities} snapshot={snapshot} disabled={locked} t={t} onChange={(capabilities) => setDraft((current) => ({ ...current, capabilities }))} />}
+      {receipts.length > 0 && <p role="status">{t(resolution === "absent" ? "partners.creationAbsent" : resolution === "retired" ? "partners.creationRetired" : "partners.creationUnknown")}</p>}
+      {!modelsAvailable && receipts.length === 0 && <p role="status">{t("partners.error.modelUnavailable")}</p>}
       {error !== undefined && <p className="partner-editor__error" role="alert">{error}</p>}
-      <div className="modal__actions"><Button onClick={onClose} disabled={submitting}>{t("common.cancel")}</Button><Button type="submit" tone="primary" disabled={!valid || submitting}>{submitting ? t("partners.preparing") : t("partners.invite")}</Button></div>
+      <div className="modal__actions"><Button onClick={onClose} disabled={submitting}>{t(receipts.length > 0 ? "common.close" : "common.cancel")}</Button>{receipts.length > 0 ? <Button tone="primary" disabled={submitting} onClick={() => void (resolution === undefined ? recover() : newIntent())}>{submitting ? t("common.working") : t(resolution === undefined ? "partners.creationCheck" : "partners.creationNewIntent")}</Button> : <Button type="submit" tone="primary" disabled={!valid || locked}>{submitting ? t("partners.preparing") : t("partners.invite")}</Button>}</div>
     </form>
   </Modal>;
 }
