@@ -291,6 +291,8 @@ import { MobilePartnerDirectoryScreen } from "./MobilePartnerDirectoryScreen";
 import { useMobilePartnerIdentity, useMobilePartnerRead } from "./use-mobile-partner-read";
 import { MobilePartnerAvatar, MobilePartnerAvatarProvider } from "./MobilePartnerAvatar";
 import { MobilePartnerConversationRow } from "./MobilePartnerConversationRow";
+import { MobilePartnerWorkingStatus } from "./MobilePartnerWorkingStatus";
+import { mobilePartnerWorkingStatus } from "./mobile-partner-working";
 import { mobilePartnerConversationRows, mobilePartnerTimeGroups, mobilePublicConversationInputs } from "./mobile-partner-presentation";
 import { useMobileHiddenHistory } from "./use-mobile-hidden-history";
 import { MobilePartnerProfileSheet } from "./MobilePartnerProfileSheet";
@@ -3828,6 +3830,13 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
       && commandHelpItems === undefined && !runtimeCommandCommitting
       && (session?.state === SessionState.IDLE || session?.state === SessionState.ERROR));
   const partnerProfileTransport = client.partnerProfileTransport();
+  const partnerWorkingStatus = useMemo(() => {
+    const snapshot = state.detail ?? state.owner;
+    return !partnerConversationTransport || !partnerRead.ready || !snapshot ? undefined
+      : mobilePartnerWorkingStatus(partnerRead.partner, { ownerKey: partnerConversationTransport.ownerKey,
+        online: state.status === "connected", snapshot }, taskTimelineEvents);
+  }, [partnerConversationTransport?.ownerKey, partnerRead.partner, partnerRead.ready, state.detail, state.owner,
+    state.status, taskTimelineEvents]);
   const openRuntimeControls = (): void => {
     if (!partnerRead.ready) return;
     if (partnerRead.partner && partnerProfileTransport) setPartnerSettingsOwner(partnerConversationTransport!.ownerKey);
@@ -5664,6 +5673,11 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
       <Action label={mobileMessage(locale, "composer.cancelEdit")} colors={colors} compact disabled={state.status !== "connected" || state.busy}
         onPress={cancelQueueEdit} />
     </View>}
+    {partnerRead.partner && partnerWorkingStatus && !conversationShare.active && interactions.length === 0
+      && <View style={[styles.partnerWorkingFrame, { backgroundColor: colors.surface }]}>
+        <MobilePartnerWorkingStatus key={partnerWorkingStatus.turnKey} status={partnerWorkingStatus}
+          partner={partnerRead.partner} locale={locale} colors={colors} />
+      </View>}
     {conversationShare.active ? <MobileConversationShareBar count={conversationShare.selectedIds.length}
       allSelected={conversationShare.allSelected} busy={conversationShare.busy} locale={locale} colors={colors}
       screenshotTriggered={conversationShare.screenshotTriggered}
@@ -7329,6 +7343,7 @@ const styles = StyleSheet.create({
   interactionAwaiting: { minHeight: 68, borderTopWidth: 1, paddingHorizontal: 14, paddingVertical: 9, flexDirection: "row", alignItems: "center", gap: 12 },
   pendingReceipt: { gap: 4, paddingVertical: 4 },
   composer: { borderTopWidth: 1, paddingHorizontal: 12, paddingBottom: 8 },
+  partnerWorkingFrame: { paddingHorizontal: 12 },
   composerResizeHandle: { minHeight: 44, alignItems: "center", justifyContent: "center" },
   composerGrabber: { width: 88, height: 4, borderRadius: 2 },
   composerTools: { minHeight: 44, flexDirection: "row", alignItems: "center", gap: 8, paddingBottom: 6 },

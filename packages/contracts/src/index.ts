@@ -38,6 +38,7 @@ export * from "./gen/joko/v1/workspace_pb.js";
 export * from "./well-known.js";
 export * from "./file-preview.js";
 export * from "./tool-presentation.js";
+export * from "./working-status.js";
 export * from "./tool-file-change.js";
 export * from "./tool-payload.js";
 export * from "./lan-discovery.js";
